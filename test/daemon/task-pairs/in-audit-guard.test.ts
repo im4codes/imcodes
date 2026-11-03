@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
 /**
  * An executor's STARTED/WORKING while its pair is in audit must not take the
  * pair out of audit (it voided the auditor's pending PASS/REWORK), and the same
@@ -53,7 +54,7 @@ function pairState(status: TaskPairStatus, over: Partial<TaskPairState> = {}): T
   } as TaskPairState;
 }
 
-const savePair = (status: TaskPairStatus, over: Partial<TaskPairState> = {}) => getTaskPairStore().savePair(PROJECT, pairState(status, over));
+const savePair = (status: TaskPairStatus, over: Partial<TaskPairState> = {}) => putTaskPairFixture(getTaskPairStore(), PROJECT, pairState(status, over));
 const pair = () => getTaskPairStore().getPair(PROJECT, TASK)!.state;
 const events = () => getTaskPairStore().listEvents(PROJECT, TASK, 200);
 const flush = () => new Promise((resolve) => setTimeout(resolve, 30));

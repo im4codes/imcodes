@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../helpers/task-pair-fixture.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { ProviderError, ProviderStatusUpdate, ProviderUsageUpdate, ToolCallEvent, TransportProvider } from '../../src/agent/transport-provider.js';
@@ -653,7 +654,7 @@ describe('Pair pause during asynchronous pre-provider assembly', () => {
     const session = 'deck_e2e_pause_transport';
     const brain = 'deck_e2e_pause_transport_brain';
     const store = getTaskPairStore();
-    store.savePair('pause-runtime', { taskId: 'pause-runtime-task', brain, executor: session, auditor: 'none', status: 'working', flags: [], flagSides: {}, round: 0, blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: 1, updatedAt: 1 });
+    putTaskPairFixture(store, 'pause-runtime', { taskId: 'pause-runtime-task', brain, executor: session, auditor: 'none', status: 'working', flags: [], flagSides: {}, round: 0, blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: 1, updatedAt: 1 });
     let messageId = '';
     setTaskPairDeliveryDepsForTests({ send: async (_target, _text, id) => { messageId = id; } });
     await sendTaskPairMessage(session, 'pause-runtime-task', 'nudge-executor', 'obsolete pair wake');

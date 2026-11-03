@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../helpers/task-pair-fixture.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createMemoryMcpServer } from '../../src/daemon/memory-mcp-server.js';
@@ -7,7 +8,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
-import { TaskPairStore, getTaskPairStore, setTaskPairStoreForTests } from '../../src/daemon/task-pairs/store.js';
+import { TaskPairWriteConflictError, TaskPairStore, getTaskPairStore, setTaskPairStoreForTests } from '../../src/daemon/task-pairs/store.js';
 import { setTaskPairDeliveryDepsForTests } from '../../src/daemon/task-pairs/delivery.js';
 import { taskPairService } from '../../src/daemon/task-pairs/service.js';
 import { taskPairDecisionReminderDue, checkTaskPairMissingExplanation, TaskPairAutomation } from '../../src/daemon/task-pairs/scheduler.js';
@@ -32,7 +33,7 @@ const sessions = (['brain', 'exec', 'audit'] as const).map((name) => ({
 } as unknown as SessionRecord));
 
 describe('pair decision MCP', () => {
-  beforeEach(() => { const store = new TaskPairStore(':memory:'); setTaskPairStoreForTests(store); store.savePair('p', state); });
+  beforeEach(() => { const store = new TaskPairStore(':memory:'); setTaskPairStoreForTests(store); putTaskPairFixture(store, 'p', state); });
   afterEach(async () => { await taskPairService.waitForIdle(); setTaskPairDeliveryDepsForTests(undefined); setTaskPairStoreForTests(undefined); });
 
   it('writes final Brain decisions idempotently and reads bounded stable history', async () => {
@@ -93,7 +94,7 @@ describe('pair decision MCP', () => {
     const path = join(dir, 'pairs.sqlite');
     try {
       const first = new TaskPairStore(path);
-      first.savePair('p', state);
+      putTaskPairFixture(first, 'p', state);
       const results = await Promise.all(Array.from({ length: 8 }, () => Promise.resolve(first.recordDecision({
         project: 'p', taskId: state.taskId, round: 1, kind: 'decision', conclusion: 'PASS', summary: 'same', author: 'brain', at: 10, idempotencyKey: 'same-key',
       }))));
@@ -144,7 +145,7 @@ describe('pair decision MCP', () => {
         round: 1,
         deliveryRound: 1,
       } as unknown as TaskPairState;
-      first.savePair('p', blockedState);
+      putTaskPairFixture(first, 'p', blockedState);
       setTaskPairStoreForTests(first);
 
       const stored = first.getPair('p', 'unexplained-1')!;
@@ -204,7 +205,7 @@ describe('pair decision MCP', () => {
     const path = join(dir, 'pairs.sqlite');
     try {
       const store = new TaskPairStore(path);
-      store.savePair('p', state);
+      putTaskPairFixture(store, 'p', state);
 
       const reqA = {
         id: 'q-a', project: 'p', taskId: state.taskId, round: 1, deliveryRound: 1,
@@ -280,7 +281,7 @@ describe('pair decision MCP', () => {
         previousAuditors: [],
       } as unknown as TaskPairState;
 
-      store.savePair('p', blockedBase);
+      putTaskPairFixture(store, 'p', blockedBase);
 
       // Step 1: Initial automation tick enqueues notification and attempts delivery (which fails)
       const firstTick = checkTaskPairMissingExplanation(store.getPair('p', 'tsk-e2e')!, 200);
@@ -309,7 +310,7 @@ describe('pair decision MCP', () => {
       expect(store.listPendingDecisionNotifications()).toHaveLength(1);
 
       // Step 4: Old delivery request does not suppress missing-explanation notice in new delivery round
-      store.savePair('p', { ...blockedBase, deliveryRound: 2 });
+      putTaskPairFixture(store, 'p', { ...blockedBase, deliveryRound: 2 });
       store.recordDecision({
         id: 'old-request',
         project: 'p',
@@ -330,7 +331,7 @@ describe('pair decision MCP', () => {
       sent.length = 0;
       failDelivery = false;
       // Add blockedNote to resolve the blocker
-      store.savePair('p', { ...blockedBase, blockedNote: 'Database migration in progress' });
+      putTaskPairFixture(store, 'p', { ...blockedBase, blockedNote: 'Database migration in progress' });
       await taskPairService.retryDecisionNotifications(400);
 
       // The obsolete notification for delivery 1 was retired without sending anything!
@@ -341,23 +342,23 @@ describe('pair decision MCP', () => {
 
       // Step 6: Negative controls
       // Ordinary completed acceptance (passed, no blocker flags)
-      store.savePair('p', { ...blockedBase, status: 'passed', flags: [] });
+      putTaskPairFixture(store, 'p', { ...blockedBase, status: 'passed', flags: [] });
       expect(checkTaskPairMissingExplanation(store.getPair('p', 'tsk-e2e')!, 500)).toBe(false);
 
       // Capacity wait
-      store.savePair('p', { ...blockedBase, flags: ['waiting_for_capacity'] as any });
+      putTaskPairFixture(store, 'p', { ...blockedBase, flags: ['waiting_for_capacity'] as any });
       expect(checkTaskPairMissingExplanation(store.getPair('p', 'tsk-e2e')!, 510)).toBe(false);
 
       // Manual pause
-      store.savePair('p', { ...blockedBase, flags: [], scheduling: { manual: true, note: 'Paused for maintenance' } as any });
+      putTaskPairFixture(store, 'p', { ...blockedBase, flags: [], scheduling: { manual: true, note: 'Paused for maintenance' } as any });
       expect(checkTaskPairMissingExplanation(store.getPair('p', 'tsk-e2e')!, 520)).toBe(false);
 
       // Dependency wait
-      store.savePair('p', { ...blockedBase, flags: [], scheduling: { dependsOn: ['tsk-dep-1'], note: 'Waiting' } as any });
+      putTaskPairFixture(store, 'p', { ...blockedBase, flags: [], scheduling: { dependsOn: ['tsk-dep-1'], note: 'Waiting' } as any });
       expect(checkTaskPairMissingExplanation(store.getPair('p', 'tsk-e2e')!, 530)).toBe(false);
 
       // Post-PASS unknown blocker is a positive control
-      store.savePair('p', {
+      putTaskPairFixture(store, 'p', {
         ...blockedBase,
         status: 'passed',
         round: 3,
@@ -377,7 +378,7 @@ describe('pair decision MCP', () => {
           status: i % 3 === 0 ? 'passed' : 'working',
           blockedNote: i % 4 === 0 ? 'Has note' : undefined,
         } as unknown as TaskPairState;
-        store.savePair('p', cardState);
+        putTaskPairFixture(store, 'p', cardState);
         checkTaskPairMissingExplanation(store.getPair('p', `card-${i}`)!, 600 + i);
       }
       const elapsed = Date.now() - t0;
@@ -406,7 +407,7 @@ describe('pair decision MCP', () => {
       createdAt: 100,
       updatedAt: 100,
     } as unknown as TaskPairState;
-    store.savePair('p', pairState);
+    putTaskPairFixture(store, 'p', pairState);
 
     expect(checkTaskPairMissingExplanation(store.getPair('p', 'f3-liveness')!, 100)).toBe(true);
     await taskPairService.retryDecisionNotifications(100);
@@ -439,13 +440,13 @@ describe('pair decision MCP', () => {
     const cleared = applyTaskPairMarker(store.getPair('p', 'f3-liveness')!.state, {
       knownVerb: 'WORKING', taskId: 'f3-liveness', attrs: {},
     }, { writer: 'exec', fallbackBrain: 'brain', now: 300, source: 'marker' } as any);
-    store.savePair('p', cleared.pair!);
+    putTaskPairFixture(store, 'p', cleared.pair!);
     expect(checkTaskPairMissingExplanation(store.getPair('p', 'f3-liveness')!, 301)).toBe(false);
 
     const reentered = applyTaskPairMarker(store.getPair('p', 'f3-liveness')!.state, {
       knownVerb: 'BLOCKED', taskId: 'f3-liveness', attrs: {},
     }, { writer: 'exec', fallbackBrain: 'brain', now: 350, source: 'marker' } as any);
-    store.savePair('p', reentered.pair!);
+    putTaskPairFixture(store, 'p', reentered.pair!);
 
     const genuineNewEpisode = checkTaskPairMissingExplanation(store.getPair('p', 'f3-liveness')!, 351);
     await taskPairService.retryDecisionNotifications(351);
@@ -475,14 +476,14 @@ describe('pair decision MCP', () => {
       createdAt: 100,
       updatedAt: 100,
     } as unknown as TaskPairState;
-    store.savePair('p', pairState);
+    putTaskPairFixture(store, 'p', pairState);
 
     expect(checkTaskPairMissingExplanation(store.getPair('p', 'f3-cross-delivery')!, 100)).toBe(true);
     await taskPairService.retryDecisionNotifications(100);
     expect(store.listPendingDecisionNotifications().filter((n) => n.taskId === 'f3-cross-delivery')).toHaveLength(1);
 
     // Advances to delivery 2
-    store.savePair('p', { ...pairState, deliveryRound: 2, updatedAt: 200 });
+    putTaskPairFixture(store, 'p', { ...pairState, deliveryRound: 2, updatedAt: 200 });
     expect(checkTaskPairMissingExplanation(store.getPair('p', 'f3-cross-delivery')!, 201)).toBe(true);
     await taskPairService.retryDecisionNotifications(201);
 
@@ -527,7 +528,7 @@ describe('pair decision MCP', () => {
         createdAt: 1000,
         updatedAt: 1000,
       } as unknown as TaskPairState;
-      store.savePair('p', pairState);
+      putTaskPairFixture(store, 'p', pairState);
 
       const explanationNotices = () => sent.filter((s) => s.id.includes('f3-tick-projection') && s.id.includes('missing-explanation-request'));
 
@@ -549,7 +550,7 @@ describe('pair decision MCP', () => {
         blockedNote: 'Root cause identified: missing auth header',
         updatedAt: clock,
       };
-      store.savePair('p', updatedState);
+      putTaskPairFixture(store, 'p', updatedState);
 
       // Next tick retires outbox row without re-sending
       clock += 6 * 60_000;
@@ -595,13 +596,14 @@ describe('pair decision MCP', () => {
       updatedAt: 100,
       previousAuditors: [],
     } as unknown as TaskPairState;
-    store.savePair('p', taskBase);
+    putTaskPairFixture(store, 'p', taskBase);
 
+    const beforeBlocked = store.getPair('p', taskBase.taskId)!;
     // Initial transition into BLOCKED
     const initial = applyTaskPairMarker(taskBase, {
       knownVerb: 'BLOCKED', taskId: 'f3-episode-stability', attrs: {},
     }, { writer: 'exec', fallbackBrain: 'brain', now: 100, source: 'marker' } as any);
-    store.savePair('p', initial.pair!);
+    putTaskPairFixture(store, 'p', initial.pair!);
 
     expect(checkTaskPairMissingExplanation(store.getPair('p', 'f3-episode-stability')!, 100)).toBe(true);
     await taskPairService.retryDecisionNotifications(100);
@@ -611,7 +613,7 @@ describe('pair decision MCP', () => {
     const repeated = applyTaskPairMarker(store.getPair('p', 'f3-episode-stability')!.state, {
       knownVerb: 'BLOCKED', taskId: 'f3-episode-stability', attrs: {},
     }, { writer: 'exec', fallbackBrain: 'brain', now: 150, source: 'marker' } as any);
-    store.savePair('p', repeated.pair!);
+    putTaskPairFixture(store, 'p', repeated.pair!);
     expect(checkTaskPairMissingExplanation(store.getPair('p', 'f3-episode-stability')!, 151)).toBe(false);
     await taskPairService.retryDecisionNotifications(151);
     expect(sent).toHaveLength(1);
@@ -644,20 +646,20 @@ describe('pair decision MCP', () => {
       ...current.state,
       episodeGeneration: 0,
     };
-    store.savePair('p', staleState);
+    expect(() => store.savePair('p', staleState, { expectedRevision: beforeBlocked.revision })).toThrow(TaskPairWriteConflictError);
     expect(store.getPair('p', 'f3-episode-stability')!.state.episodeGeneration).toBe(current.state.episodeGeneration);
 
     // 5. Clear via WORKING then re-enter BLOCKED DOES create a new episode
     const cleared = applyTaskPairMarker(store.getPair('p', 'f3-episode-stability')!.state, {
       knownVerb: 'WORKING', taskId: 'f3-episode-stability', attrs: {},
     }, { writer: 'exec', fallbackBrain: 'brain', now: 450, source: 'marker' } as any);
-    store.savePair('p', cleared.pair!);
+    putTaskPairFixture(store, 'p', cleared.pair!);
     expect(checkTaskPairMissingExplanation(store.getPair('p', 'f3-episode-stability')!, 451)).toBe(false);
 
     const reenter = applyTaskPairMarker(store.getPair('p', 'f3-episode-stability')!.state, {
       knownVerb: 'BLOCKED', taskId: 'f3-episode-stability', attrs: {},
     }, { writer: 'exec', fallbackBrain: 'brain', now: 500, source: 'marker' } as any);
-    store.savePair('p', reenter.pair!);
+    putTaskPairFixture(store, 'p', reenter.pair!);
     expect(checkTaskPairMissingExplanation(store.getPair('p', 'f3-episode-stability')!, 501)).toBe(true);
     await taskPairService.retryDecisionNotifications(501);
     expect(sent).toHaveLength(2);
@@ -689,20 +691,21 @@ describe('pair decision MCP', () => {
       capCounts: {},
       resourceClaims: [],
     } as unknown as TaskPairState;
-    store.savePair('p', taskBase);
+    putTaskPairFixture(store, 'p', taskBase);
 
     // 1. Initial BLOCKED without note (gen 1)
     const initial = applyTaskPairMarker(taskBase, {
       knownVerb: 'BLOCKED', taskId: 'f3-stale-writer-slice', attrs: {},
     }, { writer: 'exec', fallbackBrain: 'brain', now: 100, source: 'marker' } as any);
-    store.savePair('p', initial.pair!);
+    putTaskPairFixture(store, 'p', initial.pair!);
+    const staleSnapshotRevision = store.getPair('p', taskBase.taskId)!.revision;
     const staleSnapshot = structuredClone(store.getPair('p', 'f3-stale-writer-slice')!.state);
 
     // 2. Authoritative note arrives (gen 2)
     const explained = applyTaskPairMarker(store.getPair('p', 'f3-stale-writer-slice')!.state, {
       knownVerb: 'BLOCKED', taskId: 'f3-stale-writer-slice', attrs: { note: 'Current authoritative explanation' },
     }, { writer: 'exec', fallbackBrain: 'brain', now: 200, source: 'marker' } as any);
-    store.savePair('p', explained.pair!);
+    putTaskPairFixture(store, 'p', explained.pair!);
 
     const current = store.getPair('p', 'f3-stale-writer-slice')!;
     const currentKey = taskPairMissingExplanationKey(current);
@@ -710,7 +713,7 @@ describe('pair decision MCP', () => {
     expect(checkTaskPairMissingExplanation(current, 201)).toBe(false);
 
     // 3. Stale full-state writer writes back older gen 1 snapshot with unrelated housekeeping changes
-    store.savePair('p', { ...staleSnapshot, brief: 'housekeeping checklist progress', updatedAt: 300 });
+    expect(() => store.savePair('p', { ...staleSnapshot, brief: 'housekeeping checklist progress', updatedAt: 300 }, { expectedRevision: staleSnapshotRevision })).toThrow(TaskPairWriteConflictError);
 
     const after = store.getPair('p', 'f3-stale-writer-slice')!;
     expect(after.state.episodeGeneration).toBe(current.state.episodeGeneration);
@@ -750,17 +753,18 @@ describe('pair decision MCP', () => {
       capCounts: {},
       resourceClaims: [],
     } as unknown as TaskPairState;
-    store.savePair('p', taskBase);
+    putTaskPairFixture(store, 'p', taskBase);
 
     function advance(verb: string, writer: string, at: number) {
       const prior = store.getPair('p', 'f3-r7-lifecycle-guard')!.state;
       const r = applyTaskPairMarker(prior, { knownVerb: verb, taskId: 'f3-r7-lifecycle-guard', attrs: {} } as any, { writer, fallbackBrain: taskBase.brain, now: at, source: 'marker' } as any);
       expect(r.pair, verb + ' must actually apply').toBeTruthy();
-      store.savePair('p', r.pair!);
+      putTaskPairFixture(store, 'p', r.pair!);
       return store.getPair('p', 'f3-r7-lifecycle-guard')!.state;
     }
 
     advance('BLOCKED', taskBase.executor, 100);
+    const staleRevision = store.getPair('p', taskBase.taskId)!.revision;
     const stale = structuredClone(store.getPair('p', 'f3-r7-lifecycle-guard')!.state);
     expect(checkTaskPairMissingExplanation(store.getPair('p', 'f3-r7-lifecycle-guard')!, 101)).toBe(true);
     await taskPairService.retryDecisionNotifications(101);
@@ -786,7 +790,7 @@ describe('pair decision MCP', () => {
     expect(sent).toHaveLength(2);
 
     // Model a previously captured full-state copy completing workspace/housekeeping work.
-    store.savePair('p', { ...stale, brief: 'finished unrelated housekeeping', updatedAt: 700 });
+    expect(() => store.savePair('p', { ...stale, brief: 'finished unrelated housekeeping', updatedAt: 700 }, { expectedRevision: staleRevision })).toThrow(TaskPairWriteConflictError);
     const after = store.getPair('p', 'f3-r7-lifecycle-guard')!;
     expect(after.state.episodeGeneration).toBe(current.state.episodeGeneration);
     expect(after.state.flags).toEqual(current.state.flags);
@@ -798,6 +802,148 @@ describe('pair decision MCP', () => {
     expect(checkTaskPairMissingExplanation(after, 701)).toBe(false);
     await taskPairService.retryDecisionNotifications(701);
     expect(sent).toHaveLength(2);
+  });
+
+  it('F3-R8: same-generation stale write must not roll back an audit context and re-authorize an old explanation wake', async () => {
+    const store = getTaskPairStore();
+    const ids: string[] = [];
+    setTaskPairDeliveryDepsForTests({
+      send: async (_target, _text, id) => {
+        ids.push(id);
+      },
+    });
+
+    const taskBase: TaskPairState = {
+      taskId: 'f3-r8-same-gen',
+      title: 'fixture',
+      brain: 'deck_test_brain',
+      executor: 'deck_test_exec',
+      auditor: 'deck_test_audit',
+      status: 'working',
+      workspaceKind: 'none',
+      round: 1,
+      deliveryRound: 1,
+      flags: [],
+      flagSides: {},
+      blocking: ['P0'],
+      createdAt: 1,
+      updatedAt: 1,
+      previousAuditors: [],
+      capCounts: {},
+      resourceClaims: [],
+    } as unknown as TaskPairState;
+    putTaskPairFixture(store, 'p', taskBase);
+
+    function advance(verb: string, writer: string, at: number) {
+      const prior = store.getPair('p', 'f3-r8-same-gen')!.state;
+      const r = applyTaskPairMarker(prior, { knownVerb: verb, taskId: 'f3-r8-same-gen', attrs: {} } as any, { writer, fallbackBrain: taskBase.brain, now: at, source: 'marker' } as any);
+      expect(r.pair, verb + ' must actually apply').toBeTruthy();
+      putTaskPairFixture(store, 'p', r.pair!);
+      return store.getPair('p', 'f3-r8-same-gen')!.state;
+    }
+
+    // Auditor has a current unknown blocker before the executor completes work.
+    const old = advance('BLOCKED', taskBase.auditor, 100);
+    const staleRevision = store.getPair('p', taskBase.taskId)!.revision;
+    const stale = structuredClone(old);
+    expect(checkTaskPairMissingExplanation(store.getPair('p', 'f3-r8-same-gen')!, 101)).toBe(true);
+    await taskPairService.retryDecisionNotifications(101);
+    expect(ids).toHaveLength(1);
+    const oldWakeId = ids[0];
+    expect(queuedPairWakeAllowed(taskBase.auditor, oldWakeId)).toBe(true);
+
+    // Legal executor READY does not clear another participant's blocker and does not advance its generation.
+    const ready = advance('READY_FOR_AUDIT', taskBase.executor, 200);
+    expect(ready.status).toBe('in_audit');
+    expect(ready.round).toBe(2);
+    expect(ready.episodeGeneration).toBe(stale.episodeGeneration);
+    expect(ready.flags).toContain('blocked');
+    expect(ready.flagSides.blocked).toBe('auditor');
+    const current = store.getPair('p', 'f3-r8-same-gen')!;
+    const currentKey = taskPairMissingExplanationKey(current);
+    expect(queuedPairWakeAllowed(taskBase.auditor, oldWakeId)).toBe(false);
+    expect(checkTaskPairMissingExplanation(current, 201)).toBe(true);
+    await taskPairService.retryDecisionNotifications(201);
+    expect(ids).toHaveLength(2);
+    const currentWakeId = ids[1];
+    expect(queuedPairWakeAllowed(taskBase.auditor, currentWakeId)).toBe(true);
+
+    // A delayed unrelated full-state operation uses an equal-generation but obsolete lifecycle snapshot.
+    expect(() => store.savePair('p', { ...stale, brief: 'completed unrelated operation', updatedAt: 300 }, { expectedRevision: staleRevision })).toThrow(TaskPairWriteConflictError);
+    const after = store.getPair('p', 'f3-r8-same-gen')!;
+    expect(after.state.episodeGeneration).toBe(current.state.episodeGeneration);
+    expect(after.state.round).toBe(2);
+    expect(after.state.status).toBe('in_audit');
+    expect(taskPairMissingExplanationKey(after)).toBe(currentKey);
+    expect(queuedPairWakeAllowed(taskBase.auditor, oldWakeId)).toBe(false);
+    expect(queuedPairWakeAllowed(taskBase.auditor, currentWakeId)).toBe(true);
+  });
+
+  it('F3-R8: an older generation cannot replace the current responsible auditor and send its explanation wake to the old one', async () => {
+    const store = getTaskPairStore();
+    const sent: Array<{ target: string; id: string }> = [];
+    setTaskPairDeliveryDepsForTests({
+      send: async (target, _text, id) => {
+        sent.push({ target, id });
+      },
+    });
+
+    const taskBase: TaskPairState = {
+      taskId: 'f3-r8-target-resp',
+      title: 'fixture',
+      brain: 'deck_test_brain',
+      executor: 'deck_test_exec',
+      auditor: 'deck_test_audit',
+      status: 'working',
+      workspaceKind: 'none',
+      round: 1,
+      deliveryRound: 1,
+      flags: [],
+      flagSides: {},
+      blocking: ['P0'],
+      createdAt: 1,
+      updatedAt: 1,
+      previousAuditors: [],
+      capCounts: {},
+      resourceClaims: [],
+    } as unknown as TaskPairState;
+    putTaskPairFixture(store, 'p', taskBase);
+
+    function advance(verb: string, writer: string, at: number, attrs: Record<string, string> = {}) {
+      const prior = store.getPair('p', 'f3-r8-target-resp')!.state;
+      const r = applyTaskPairMarker(prior, { knownVerb: verb, taskId: 'f3-r8-target-resp', attrs } as any, { writer, fallbackBrain: taskBase.brain, now: at, source: 'marker' } as any);
+      expect(r.pair, verb + ' must actually apply').toBeTruthy();
+      putTaskPairFixture(store, 'p', r.pair!);
+      return store.getPair('p', 'f3-r8-target-resp')!.state;
+    }
+
+    advance('BLOCKED', taskBase.auditor, 100);
+    const staleRevision = store.getPair('p', taskBase.taskId)!.revision;
+    const stale = structuredClone(store.getPair('p', 'f3-r8-target-resp')!.state);
+    const nextAuditor = 'deck_test_audit_new';
+    advance('REASSIGN', taskBase.brain, 200, { auditor: nextAuditor });
+    expect(store.getPair('p', 'f3-r8-target-resp')!.state.auditor).toBe(nextAuditor);
+    advance('BLOCKED', nextAuditor, 300);
+
+    const current = store.getPair('p', 'f3-r8-target-resp')!;
+    const currentKey = taskPairMissingExplanationKey(current);
+    expect(current.state.episodeGeneration).toBeGreaterThan(stale.episodeGeneration!);
+    expect(checkTaskPairMissingExplanation(current, 301)).toBe(true);
+    await taskPairService.retryDecisionNotifications(301);
+    expect(sent).toHaveLength(1);
+    expect(sent[0].target).toBe(nextAuditor);
+    expect(queuedPairWakeAllowed(nextAuditor, sent[0].id)).toBe(true);
+
+    expect(() => store.savePair('p', { ...stale, brief: 'completed unrelated housekeeping', updatedAt: 400 }, { expectedRevision: staleRevision })).toThrow(TaskPairWriteConflictError);
+    const after = store.getPair('p', 'f3-r8-target-resp')!;
+    expect(after.state.episodeGeneration).toBe(current.state.episodeGeneration);
+    expect(taskPairMissingExplanationKey(after)).toBe(currentKey);
+    expect(after.state.auditor).toBe(nextAuditor);
+    expect(queuedPairWakeAllowed(nextAuditor, sent[0].id)).toBe(true);
+    expect(checkTaskPairMissingExplanation(after, 401)).toBe(false);
+    await taskPairService.retryDecisionNotifications(401);
+    expect(sent).toHaveLength(1);
+    expect(sent.at(-1)?.target).toBe(nextAuditor);
   });
 
   it('F3-R4: queued explanation notification is admitted while missing and rejected after note arrives', async () => {
@@ -825,7 +971,7 @@ describe('pair decision MCP', () => {
       updatedAt: 100,
       previousAuditors: [],
     } as unknown as TaskPairState;
-    store.savePair('p', taskBase);
+    putTaskPairFixture(store, 'p', taskBase);
 
     expect(checkTaskPairMissingExplanation(store.getPair('p', 'f3-queue-admission')!, 100)).toBe(true);
     await taskPairService.retryDecisionNotifications(100);
@@ -835,7 +981,7 @@ describe('pair decision MCP', () => {
     expect(queuedPairWakeAllowed('exec', ids[0])).toBe(true);
 
     // Blocker note arrives: context is now explained
-    store.savePair('p', { ...taskBase, blockedNote: 'Waiting for external approval' });
+    putTaskPairFixture(store, 'p', { ...taskBase, blockedNote: 'Waiting for external approval' });
 
     // Now rejected at queue consumption!
     expect(queuedPairWakeAllowed('exec', ids[0])).toBe(false);

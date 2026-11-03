@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../helpers/task-pair-fixture.js';
 /**
  * The transport runtime hands an open pair's executor/auditor turn its pair
  * workspace (tsk_cd_executor_default_cwd): as the turn's cwd for a provider that
@@ -70,7 +71,7 @@ function session(name: string, role: SessionRecord['role']): SessionRecord {
 
 function savePair(status: TaskPairStatus): void {
   const now = Date.now();
-  getTaskPairStore().savePair(PROJECT, {
+  putTaskPairFixture(getTaskPairStore(), PROJECT, {
     taskId: 'T1', status, brain: BRAIN, executor: EXEC, auditor: 'deck_sub_rtcwdaud', round: 1, blocking: ['P0'], title: 'demo',
     workspace: { kind: 'worktree', path: workspace, createdAt: now, status: 'active' },
     createdAt: now, updatedAt: now,
@@ -158,7 +159,7 @@ describe('transport runtime: pair participant turn cwd', () => {
     const taskDir = join(root, 'works', PROJECT, 'T1');
     mkdirSync(taskDir, { recursive: true });
     const now = Date.now();
-    getTaskPairStore().savePair(PROJECT, {
+    putTaskPairFixture(getTaskPairStore(), PROJECT, {
       taskId: 'T1', status: 'working', brain: BRAIN, executor: EXEC, auditor: 'deck_sub_rtcwdaud', round: 1, blocking: ['P0'], title: 'demo',
       workspaceKind: 'dir',
       workspace: { kind: 'dir', path: taskDir, createdAt: now, status: 'active' },

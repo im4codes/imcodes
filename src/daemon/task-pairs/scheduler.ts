@@ -1503,7 +1503,8 @@ export class TaskPairAutomation implements TaskPairScheduler {
       && !this.#rateLimited(pair.auditor) && !this.#capacityLimited(pair.auditor)
     ) {
       pair = { ...pair, flags: pair.flags.filter((flag) => flag !== 'needs_auditor'), updatedAt: now };
-      store.savePair(stored.project, pair);
+      stored = store.savePair(stored.project, pair, { expectedRevision: stored.revision });
+      pair = stored.state;
     }
     const side = taskPairSideToAct(pair);
     const liveness: TaskPairLiveness = { ...stored.liveness, notified: [...stored.liveness.notified] };
@@ -1553,6 +1554,11 @@ export class TaskPairAutomation implements TaskPairScheduler {
     // running, deduped via liveness.bothIdleNudgedAt so the two never both
     // fire for the same idle spell.
     if (await this.#maybeNudgeBothQuietSinceTick(stored, pair, liveness, previousTick, now)) return;
+    // Even a resolved async helper yields to markers/reassignment. An obsolete
+    // tick applies no state/liveness or role-dependent actions; next tick recomputes.
+    const afterAwait = store.getPair(stored.project, pair.taskId);
+    if (!afterAwait || afterAwait.revision !== stored.revision) return;
+    Object.assign(liveness, afterAwait.liveness, { lastTickAt: Math.max(now, afterAwait.liveness.lastTickAt) });
 
     const progressAt = side === 'executor' ? liveness.progressExecutorAt : liveness.progressAuditorAt;
     const activityAt = side === 'executor'
@@ -1561,10 +1567,12 @@ export class TaskPairAutomation implements TaskPairScheduler {
     // An escalated executor that is working on this pair again can be escalated
     // again if it later goes silent.
     if (side === 'executor' && progressAt > previousTick && pair.flags.includes('executor_silent')) {
-      store.savePair(stored.project, { ...pair, flags: pair.flags.filter((flag) => flag !== 'executor_silent'), updatedAt: now }, { liveness });
+      stored = store.savePair(stored.project, { ...pair, flags: pair.flags.filter((flag) => flag !== 'executor_silent'), updatedAt: now }, { expectedRevision: stored.revision, liveness });
+      pair = stored.state;
     }
     if (side === 'auditor' && progressAt > previousTick && pair.flags.includes('auditor_capacity_hold')) {
-      store.savePair(stored.project, { ...pair, flags: pair.flags.filter((flag) => flag !== 'auditor_capacity_hold'), updatedAt: now }, { liveness });
+      stored = store.savePair(stored.project, { ...pair, flags: pair.flags.filter((flag) => flag !== 'auditor_capacity_hold'), updatedAt: now }, { expectedRevision: stored.revision, liveness });
+      pair = stored.state;
     }
     if (this.#busy(session) || progressAt > previousTick || activityAt > previousTick) {
       store.saveLiveness(stored.project, pair.taskId, liveness);
@@ -1782,7 +1790,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const stored = store.getPair(project, taskId);
     if (!stored || stored.state.flags.includes('auditor_capacity_hold')) return;
     const state = { ...stored.state, flags: [...stored.state.flags, 'auditor_capacity_hold' as TaskPairFlag], updatedAt: this.#now() };
-    store.savePair(project, state);
+    store.savePair(project, state, { expectedRevision: stored.revision });
     this.#queueNotice(state, 'auditor_capacity_hold', `auditor ${state.auditor} hit a provider capacity error for ${TASK_PAIR_SILENCE_LIMIT} heartbeats; retrying on the same session`);
   }
 
@@ -1812,7 +1820,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     if (!stored || stored.state.flags.includes('executor_silent')) return;
     const now = this.#now();
     const state = { ...stored.state, flags: [...stored.state.flags, 'executor_silent' as TaskPairFlag], updatedAt: now };
-    store.savePair(project, state, {
+    store.savePair(project, state, { expectedRevision: stored.revision,
       liveness: {
         ...stored.liveness,
         executorEscalationAt: now,
@@ -1856,7 +1864,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     // legitimate replacements of an existing auditor and are unaffected.
     if (!opts.dueToLimit && (reason === 'no auditor' || reason === 'no auditor named') && hadRealAuditor) {
       if (pair.flags.includes('needs_auditor')) {
-        store.savePair(project, { ...pair, flags: pair.flags.filter((flag) => flag !== 'needs_auditor'), updatedAt: this.#now() });
+        store.savePair(project, { ...pair, flags: pair.flags.filter((flag) => flag !== 'needs_auditor'), updatedAt: this.#now() }, { expectedRevision: stored.revision });
       }
       return true;
     }
@@ -1867,7 +1875,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     if (!pair.auditor && pair.status === 'in_audit'
       && this.#activeAudits(project, pair.brain, taskId) >= resolveTaskPairMaxConcurrency(pair.brain)) {
       if (!pair.flags.includes('waiting_for_capacity')) {
-        store.savePair(project, { ...pair, flags: [...pair.flags, 'waiting_for_capacity'], updatedAt: this.#now() });
+        store.savePair(project, { ...pair, flags: [...pair.flags, 'waiting_for_capacity'], updatedAt: this.#now() }, { expectedRevision: stored.revision });
       }
       return false;
     }
@@ -1889,7 +1897,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const pickInput = { brain: pair.brain, role: 'auditor' as const, pool: 'primary' as const, exclude, project, requestedModel, avoidProviderFamily };
     const picked = this.#pick(pickInput);
     const next = picked ?? await this.#provision({ ...pickInput, taskId });
-    if (!this.#scheduleStillCurrent(project, pair)) return false;
+    if (!this.#scheduleStillCurrent(project, pair) || store.getPair(project, taskId)?.revision !== stored.revision) return false;
     // Injectable pickers are used by tests and integrations, so enforce the
     // same idle/non-reserved contract here as the default pool picker.
     if (next && (exclude.has(next) || this.#busy(next))) {
@@ -1910,7 +1918,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
           const key = `all_providers_limited:${pair.round}`;
           if (stored.liveness.notified.includes(key)) return false;
           const state = pair.flags.includes('all_providers_limited') ? pair : { ...pair, flags: [...pair.flags, 'all_providers_limited' as TaskPairFlag], updatedAt: this.#now() };
-          store.savePair(project, state, { liveness: { ...stored.liveness, notified: [...stored.liveness.notified, key] } });
+          store.savePair(project, state, { expectedRevision: stored.revision, liveness: { ...stored.liveness, notified: [...stored.liveness.notified, key] } });
           this.#queueNotice(state, 'all_providers_limited', `auditor ${pair.auditor} limited; no cross-family replacement available (${limited.text})`);
           return false;
         }
@@ -1918,7 +1926,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
       const key = `needs_auditor:${pair.round}`;
       if (stored.liveness.notified.includes(key)) return false;
       const state = pair.flags.includes('needs_auditor') ? pair : { ...pair, flags: [...pair.flags, 'needs_auditor' as TaskPairFlag], updatedAt: this.#now() };
-      store.savePair(project, state, { liveness: { ...stored.liveness, notified: [...stored.liveness.notified, key] } });
+      store.savePair(project, state, { expectedRevision: stored.revision, liveness: { ...stored.liveness, notified: [...stored.liveness.notified, key] } });
       // Owner rule (design D-pool-sync): an explicitly named auditor model
       // bypasses pool roles entirely, so a miss here is a pool-config gap,
       // not a role gap -- name the requested model instead of guessing.
@@ -1937,15 +1945,16 @@ export class TaskPairAutomation implements TaskPairScheduler {
       now: this.#now(),
       eventId: `heartbeat:${project}:${taskId}:reassign:${next}:${this.#now()}`,
     });
-    const updated = result.pair ?? store.getPair(project, taskId)?.state;
-    if (!updated) return false;
+    const updatedStored = store.getPair(project, taskId);
+    const updated = updatedStored?.state;
+    if (!updated || !result.pair) return false;
     const auditorPool = this.#poolOf(updated.brain, next);
     if (auditorPool || updated.flags.includes('waiting_for_capacity') || updated.flags.includes('all_providers_limited')) {
       store.savePair(project, {
         ...updated,
         ...(auditorPool ? { auditorPool } : {}),
         flags: updated.flags.filter((flag) => flag !== 'waiting_for_capacity' && flag !== 'all_providers_limited'),
-      });
+      }, { expectedRevision: updatedStored?.revision });
     }
     await sendTaskPairMessage(next, taskId, 'handoff', buildAuditorHandoffMessage(updated), undefined, [{ project, taskId: updated.taskId, epoch: updated.scheduling?.epoch ?? 0 }]);
     if (updated.executor) await sendTaskPairMessage(updated.executor, taskId, 'resend', buildExecutorResendMessage(updated, previousAuditor), undefined, [{ project, taskId: updated.taskId, epoch: updated.scheduling?.epoch ?? 0 }]);
@@ -1972,7 +1981,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const avoidProviderFamily = opts.dueToLimit ? providerFamilyOfSession(pair.executor!) : undefined;
     const pickInput = { brain: pair.brain, role: 'executor' as const, pool, exclude, project, requestedModel, avoidProviderFamily };
     const next = this.#pick(pickInput) ?? await this.#provision({ ...pickInput, taskId });
-    if (!this.#scheduleStillCurrent(project, pair)) return false;
+    if (!this.#scheduleStillCurrent(project, pair) || store.getPair(project, taskId)?.revision !== stored.revision) return false;
     if (!next) {
       if (opts.dueToLimit) {
         // See replaceAuditor: the limited executor itself must stay IN this
@@ -1983,7 +1992,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
           const key = `all_providers_limited:${pair.round}`;
           if (stored.liveness.notified.includes(key)) return false;
           const state = pair.flags.includes('all_providers_limited') ? pair : { ...pair, flags: [...pair.flags, 'all_providers_limited' as TaskPairFlag], updatedAt: this.#now() };
-          store.savePair(project, state, { liveness: { ...stored.liveness, notified: [...stored.liveness.notified, key] } });
+          store.savePair(project, state, { expectedRevision: stored.revision, liveness: { ...stored.liveness, notified: [...stored.liveness.notified, key] } });
           this.#queueNotice(state, 'all_providers_limited', `executor ${pair.executor} limited; no cross-family replacement available (${limited.text})`);
           return false;
         }
@@ -2000,15 +2009,16 @@ export class TaskPairAutomation implements TaskPairScheduler {
       now: this.#now(),
       eventId: `heartbeat:${project}:${taskId}:reassign-executor:${next}:${this.#now()}`,
     });
-    const updated = result.pair ?? store.getPair(project, taskId)?.state;
-    if (!updated) return false;
+    const updatedStored = store.getPair(project, taskId);
+    const updated = updatedStored?.state;
+    if (!updated || !result.pair) return false;
     const executorPool = this.#poolOf(updated.brain, next);
     if (executorPool || updated.flags.includes('all_providers_limited')) {
       store.savePair(project, {
         ...updated,
         ...(executorPool ? { executorPool } : {}),
         flags: updated.flags.filter((flag) => flag !== 'all_providers_limited'),
-      });
+      }, { expectedRevision: updatedStored?.revision });
     }
     await sendTaskPairMessage(next, taskId, 'executor-handoff', buildExecutorHandoffMessage(updated, previousExecutor, reason), undefined, [{ project, taskId: updated.taskId, epoch: updated.scheduling?.epoch ?? 0 }]);
     await sendTaskPairMessage(updated.brain, taskId, 'brain-line-reassign', buildBrainLine(updated, `executor ${previousExecutor ?? '(none)'} → ${next}: ${reason}.`), undefined, [{ project, taskId: updated.taskId, epoch: updated.scheduling?.epoch ?? 0 }]);
@@ -2040,7 +2050,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const exclude = new Set<string>([pair.brain, ...(pair.auditor ? [pair.auditor] : [])]);
     const next = this.#pick({ brain: pair.brain, role: 'executor', pool, exclude, project, requestedModel })
       ?? await this.#provision({ brain: pair.brain, role: 'executor', pool, project, taskId, requestedModel });
-    if (!this.#scheduleStillCurrent(project, pair)) return;
+    if (!this.#scheduleStillCurrent(project, pair) || store.getPair(project, taskId)?.revision !== stored.revision) return;
     if (!next) {
       this.#flagOnce(
         project, taskId, 'waiting_for_capacity',
@@ -2067,7 +2077,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const stored = store.getPair(project, taskId);
     if (!stored || stored.state.flags.includes(flag)) return;
     const state = { ...stored.state, flags: [...stored.state.flags, flag], updatedAt: this.#now() };
-    store.savePair(project, state);
+    store.savePair(project, state, { expectedRevision: stored.revision });
     this.#queueNotice(state, flag, detail);
   }
 
@@ -2091,7 +2101,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
       ...(flag === 'waiting_for_capacity' && detail !== undefined ? { capacityWaitReason: detail } : {}),
       updatedAt: this.#now(),
     };
-    store.savePair(project, next);
+    store.savePair(project, next, { expectedRevision: stored.revision });
   }
 
   /**
@@ -2199,7 +2209,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
       const pool = this.#poolOf(pair.brain, pair.auditor);
       if (pool) { next.auditorPool = pool; changed = true; }
     }
-    if (changed) store.savePair(project, next);
+    if (changed) store.savePair(project, next, { expectedRevision: stored.revision });
   }
 
   /** Called after a PASS is applied: economy work passed outside the primary pool is flagged once. */
@@ -2241,7 +2251,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
         this.#flagQuiet(project, stored.state.taskId, 'waiting_for_capacity', `waiting for concurrency capacity (${open}/${max} open pairs)`);
         return;
       }
-      const pair = stored.state;
+      let pair = stored.state;
       if (!this.#scheduleStillCurrent(project, pair)) continue;
       // A brief-less pair imported from legacy supervision has no real work to
       // start: park it (one batched Brain notice) until Brain adds a brief.
@@ -2296,20 +2306,23 @@ export class TaskPairAutomation implements TaskPairScheduler {
         this.#logQueueSkip(project, pair, 'no execution pool configured');
         continue;
       }
-      const pool = pair.executorPool === 'economy' ? 'economy' : 'primary';
       if (!pair.executor || !pair.auditor) {
         this.#flagQuiet(project, pair.taskId, 'waiting_for_capacity');
       }
+      const expected = store.getPair(project, pair.taskId);
+      if (!expected || expected.state.brain !== brain || expected.state.status !== 'queued' || isTaskPairSuspended(expected.state)) continue;
+      pair = expected.state;
+      const pool = pair.executorPool === 'economy' ? 'economy' : 'primary';
       const executor = pair.executor
         ?? this.#pick({ brain, role: 'executor', pool, exclude: new Set([brain, ...(pair.auditor ? [pair.auditor] : [])]), project, requestedModel: pair.executorModel })
         ?? await this.#queueProvision({ brain, role: 'executor', pool, project, taskId: pair.taskId, requestedModel: pair.executorModel });
-      if (!this.#scheduleStillCurrent(project, pair)) continue;
+      if (!this.#scheduleStillCurrent(project, pair) || store.getPair(project, pair.taskId)?.revision !== expected?.revision) continue;
       const auditor = pair.auditor
         ?? (executor
           ? this.#pick({ brain, role: 'auditor', pool: 'primary', exclude: new Set([brain, executor]), project, requestedModel: pair.auditorModel })
             ?? await this.#queueProvision({ brain, role: 'auditor', pool: 'primary', project, taskId: pair.taskId, requestedModel: pair.auditorModel })
           : undefined);
-      if (!this.#scheduleStillCurrent(project, pair)) continue;
+      if (!this.#scheduleStillCurrent(project, pair) || store.getPair(project, pair.taskId)?.revision !== expected?.revision) continue;
       if (!executor || !auditor || executor === auditor) {
         // No per-pair notice here (owner correction): a queue miss is common
         // and self-resolving as soon as a matching session frees up or is
@@ -2329,7 +2342,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
         this.#logQueueSkip(project, pair, detail);
         continue;
       }
-      if (!this.#scheduleStillCurrent(project, pair)) continue;
+      if (!this.#scheduleStillCurrent(project, pair) || store.getPair(project, pair.taskId)?.revision !== expected?.revision) continue;
       const result = taskPairService.applyMarker({
         project,
         writer: 'daemon',
@@ -2338,10 +2351,11 @@ export class TaskPairAutomation implements TaskPairScheduler {
         now: this.#now(),
         eventId: `queue:${project}:${pair.taskId}:dispatch:${this.#now()}`,
       });
-      const dispatched = result.pair ?? store.getPair(project, pair.taskId)?.state;
-      if (!dispatched) continue;
+      const dispatchedStored = store.getPair(project, pair.taskId);
+      const dispatched = dispatchedStored?.state;
+      if (!dispatched || !result.pair) continue;
       const cleaned = { ...dispatched, flags: dispatched.flags.filter((flag) => flag !== 'waiting_for_capacity' && flag !== 'no_pool_configured'), capacityWaitReason: undefined };
-      store.savePair(project, cleaned);
+      store.savePair(project, cleaned, { expectedRevision: dispatchedStored?.revision });
       open += 1;
       if (pair.brief !== undefined) {
         // The executor's worktree exists before the brief that names it is sent.

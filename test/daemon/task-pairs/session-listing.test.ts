@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { SessionRecord } from '../../../src/store/session-store.js';
 import { listSendTargets } from '../../../src/daemon/send-tool.js';
@@ -52,7 +53,7 @@ describe('one-call sub-session status projection', () => {
     setTaskPairStoreForTests(new TaskPairStore(':memory:'));
     resetSessionActivityForTests();
     for (const record of [session(BRAIN, 'brain'), session(EXEC, 'w1'), session(AUD, 'w2'), session('deck_sub_stopped', 'w3', 'stopped')]) upsertSession(record);
-    getTaskPairStore().savePair(PROJECT, pair);
+    putTaskPairFixture(getTaskPairStore(), PROJECT, pair);
   });
 
   afterEach(() => {

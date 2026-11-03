@@ -13,7 +13,6 @@ import { createRequire } from 'node:module';
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
-  isTerminalTaskPairStatus,
   TASK_PAIR_BRAIN_NOTICE_STATUSES,
   TASK_PAIR_DEFAULT_MAX_CONCURRENCY,
   TASK_PAIR_PARTICIPANT_STATUSES,
@@ -21,7 +20,6 @@ import {
   type TaskPairBrainNoticeStatus,
   type TaskPairEngine,
   type TaskPairEventSource,
-  type TaskPairFlag,
   type TaskPairRole,
   type TaskPairState,
   type TaskPairStatus,
@@ -136,7 +134,17 @@ export interface StoredTaskPair {
   state: TaskPairState;
   liveness: TaskPairLiveness;
   queueOrder: number;
+  /** Opaque, store-local CAS token: the exact persisted state_json, never a wire field. */
+  revision?: string;
   legacyTaskId?: string;
+}
+
+/** A full-state write was based on an authority snapshot that no longer exists. */
+export class TaskPairWriteConflictError extends Error {
+  constructor(readonly project: string, readonly taskId: string) {
+    super(`Task pair changed while applying update: ${project}/${taskId}`);
+    this.name = 'TaskPairWriteConflictError';
+  }
 }
 
 export interface TaskPairEventRecord {
@@ -634,50 +642,29 @@ export class TaskPairStore {
     ));
   }
 
-  savePair(project: string, state: TaskPairState, options: { liveness?: TaskPairLiveness; legacyTaskId?: string } = {}): StoredTaskPair {
+  /** Full-state compare-and-update. No token means INSERT ONLY, never an unguarded overwrite. */
+  savePair(project: string, state: TaskPairState, options: {
+    expectedRevision?: string;
+    liveness?: TaskPairLiveness;
+    legacyTaskId?: string;
+    /** Lifecycle marker receipt and its state transition commit together. */
+    event?: TaskPairEventRecord;
+  } = {}): StoredTaskPair {
     const existing = this.getPair(project, state.taskId);
-    const existingGen = existing?.state.episodeGeneration ?? 0;
-    const incomingGen = state.episodeGeneration ?? 0;
-
-    if (existing && incomingGen < existingGen) {
-      state.episodeGeneration = existing.state.episodeGeneration;
-      state.blockedNote = existing.state.blockedNote;
-      state.lastWaitResolution = existing.state.lastWaitResolution;
-      const preserveBlocked = existing.state.flags.includes('blocked');
-      const preserveNeedsInput = existing.state.flags.includes('needs_input');
-      const incomingFlags: TaskPairFlag[] = (state.flags ?? []).filter((f) => f !== 'blocked' && f !== 'needs_input');
-      if (preserveBlocked) incomingFlags.push('blocked');
-      if (preserveNeedsInput) incomingFlags.push('needs_input');
-      state.flags = incomingFlags;
-      state.flagSides = {
-        ...state.flagSides,
-        ...existing.state.flagSides,
-      };
-      if (!existing.state.flagSides?.blocked) delete state.flagSides.blocked;
-      if (!existing.state.flagSides?.needs_input) delete state.flagSides.needs_input;
-      state.deliveryRound = existing.state.deliveryRound;
-      state.round = existing.state.round;
-      state.status = existing.state.status;
-      state.passRound = existing.state.passRound;
-      state.lastVerdict = existing.state.lastVerdict;
-      if (existing.state.material) {
-        state.material = existing.state.material;
-      }
-      if (existing.state.roundBase) {
-        state.roundBase = existing.state.roundBase;
-      }
-    } else if (existing?.state.episodeGeneration !== undefined) {
-      state.episodeGeneration = Math.max(incomingGen, existingGen);
-    }
     const liveness = options.liveness ?? existing?.liveness ?? emptyLiveness(state.updatedAt);
     const queueOrder = existing?.queueOrder ?? this.#nextQueueOrder();
     const legacyTaskId = options.legacyTaskId ?? existing?.legacyTaskId;
     const titleState = `CASE WHEN json_type(task_pairs.state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}') IS NOT NULL
       THEN json_set(excluded.state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}', json_extract(task_pairs.state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}'))
       ELSE json_remove(excluded.state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}') END`;
-    const saved = this.#db.prepare(`
+    const expected = options.expectedRevision ?? null;
+    if (options.event) this.#db.exec('BEGIN IMMEDIATE');
+    let saved: Record<string, unknown>;
+    try {
+      const row = this.#db.prepare(`
       INSERT INTO task_pairs (project, task_id, status, brain, executor, auditor, queue_order, legacy_task_id, state_json, liveness_json, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      WHERE ? IS NULL OR EXISTS (SELECT 1 FROM task_pairs WHERE project = ? AND task_id = ? AND state_json = ?)
       ON CONFLICT (project, task_id) DO UPDATE SET
         status = excluded.status, brain = excluded.brain, executor = excluded.executor, auditor = excluded.auditor,
         legacy_task_id = excluded.legacy_task_id,
@@ -686,23 +673,29 @@ export class TaskPairStore {
           THEN json_set(${titleState}, '$.${TASK_PAIR_SCHEDULING_FIELD}', json_extract(task_pairs.state_json, '$.${TASK_PAIR_SCHEDULING_FIELD}'))
           ELSE json_remove(${titleState}, '$.${TASK_PAIR_SCHEDULING_FIELD}') END,
         liveness_json = excluded.liveness_json, updated_at = excluded.updated_at
-      RETURNING json_quote(json_extract(state_json, '$.${TASK_PAIR_TITLE_ACCESS_FIELD}')) AS title_access_json, json_quote(json_extract(state_json, '$.${TASK_PAIR_SCHEDULING_FIELD}')) AS scheduling_json
+      WHERE task_pairs.state_json = ?
+      RETURNING *
     `).get(
       project, state.taskId, state.status, state.brain, state.executor ?? null, state.auditor ?? null,
       queueOrder, legacyTaskId ?? null, JSON.stringify(state), JSON.stringify(liveness), state.updatedAt,
-    ) as { title_access_json: string | null; scheduling_json: string | null };
-    const savedState = { ...state };
-    if (!saved.scheduling_json || saved.scheduling_json === 'null') delete savedState.scheduling;
-    else savedState.scheduling = JSON.parse(saved.scheduling_json) as TaskPairScheduling;
-    if (saved.title_access_json === null || saved.title_access_json === 'null') delete savedState.titleAccess;
-    else savedState.titleAccess = JSON.parse(saved.title_access_json) as TaskPairTitleAccess;
+      expected, project, state.taskId, expected, expected,
+    ) as Record<string, unknown> | undefined;
+      if (!row || (options.event && !this.recordEvent(options.event))) {
+        throw new TaskPairWriteConflictError(project, state.taskId);
+      }
+      saved = row;
+      if (options.event) this.#db.exec('COMMIT');
+    } catch (error) {
+      if (options.event) this.#db.exec('ROLLBACK');
+      throw error;
+    }
     this.#pendingLiveness.delete(pairKey(project, state.taskId));
     this.#livenessDbWriteAt.delete(pairKey(project, state.taskId));
     this.#refreshIndexEntry(project, state.taskId);
     for (const listener of this.#listeners) {
       try { listener(project, state.taskId); } catch { /* observers never break a write */ }
     }
-    return { project, state: savedState, liveness, queueOrder, ...(legacyTaskId ? { legacyTaskId } : {}) };
+    return rowToPair(saved);
   }
 
   /** Atomic metadata patch: never replace lifecycle, liveness or another MCP writer's unrelated fields. */
@@ -1035,6 +1028,7 @@ function rowToPair(row: Record<string, unknown>): StoredTaskPair {
   };
   return {
     project: String(row.project),
+    revision: String(row.state_json),
     state: JSON.parse(String(row.state_json)) as TaskPairState,
     liveness,
     queueOrder: Number(row.queue_order),

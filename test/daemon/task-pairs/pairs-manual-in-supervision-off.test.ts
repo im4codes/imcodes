@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
 /**
  * Supervision mode `off` never stops a Brain from creating and running pairs by hand (tsk_fb01f25f17). It only means the daemon sends no
  * heartbeat: no nudges, escalations, reminders, queue sweeps or follow-ups.
@@ -196,7 +197,7 @@ describe('manual pairs in supervision mode off', () => {
 
       // executor / auditor markers, as the daemon ingests them from a turn: READY_FOR_AUDIT then the structured verdict
       const store = getTaskPairStore();
-      store.savePair(PROJECT, { ...stateOf(taskId)!, status: 'in_audit', material: { path: '/tmp/manualproj', head: 'abcdef1', at: 30 }, updatedAt: now });
+      putTaskPairFixture(store, PROJECT, { ...stateOf(taskId)!, status: 'in_audit', material: { path: '/tmp/manualproj', head: 'abcdef1', at: 30 }, updatedAt: now });
       expect(await tool(MEMORY_MCP_TOOL_NAMES.PAIR_VERDICT, { taskId, verdict: 'PASS' }, AUD)).toMatchObject({ status: 'ok', state: 'passed' });
       expect(await tool(MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND, { taskId, base: 'abcdef1', note: 'round two' })).toMatchObject({ status: 'ok', state: 'working', effect: 'next_round' });
       expect(await tool(MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE, { taskId, action: 'done', force: true })).toMatchObject({ status: 'ok', state: 'done' });
@@ -213,7 +214,7 @@ describe('manual pairs in supervision mode off', () => {
     it('the daemon sends the Brain its PASS notice by itself (an event-driven lifecycle notice, not a heartbeat)', async () => {
       const first = await tool(MEMORY_MCP_TOOL_NAMES.PAIR_CREATE, { brief: '# pass notice', executor: EXEC, auditor: AUD, idempotencyKey: 'pass-notice-1' });
       const taskId = String(first.taskId);
-      getTaskPairStore().savePair(PROJECT, { ...stateOf(taskId)!, status: 'in_audit', material: { path: '/tmp/manualproj', head: 'abcdef1', at: 30 }, updatedAt: now });
+      putTaskPairFixture(getTaskPairStore(), PROJECT, { ...stateOf(taskId)!, status: 'in_audit', material: { path: '/tmp/manualproj', head: 'abcdef1', at: 30 }, updatedAt: now });
       sent = [];
       await tool(MEMORY_MCP_TOOL_NAMES.PAIR_VERDICT, { taskId, verdict: 'PASS' }, AUD);
       await taskPairService.dispose();

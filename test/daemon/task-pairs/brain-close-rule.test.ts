@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
 /**
  * Owner rule: "when Brain has dealt with a task it closes the task itself -- the contract must say so, or there is
  * always a pile of stale reminders." The contract states the rule and the way to close for each outcome; every
@@ -164,8 +165,8 @@ describe('a notice about a pair that has ALREADY ended advises only calls that s
   it('the advised call shapes work against the real pair_close guard, and the old advice did not', async () => {
     setTaskPairStoreForTests(new TaskPairStore(':memory:'));
     try {
-      getTaskPairStore().savePair(MCP_PROJECT, pair({ taskId: 'ended_done', status: 'done', brain: MCP_BRAIN }));
-      getTaskPairStore().savePair(MCP_PROJECT, pair({ taskId: 'ended_cancelled', status: 'cancelled', brain: MCP_BRAIN }));
+      putTaskPairFixture(getTaskPairStore(), MCP_PROJECT, pair({ taskId: 'ended_done', status: 'done', brain: MCP_BRAIN }));
+      putTaskPairFixture(getTaskPairStore(), MCP_PROJECT, pair({ taskId: 'ended_cancelled', status: 'cancelled', brain: MCP_BRAIN }));
       const brainSession = { name: MCP_BRAIN, projectName: MCP_PROJECT, role: 'brain', agentType: 'codex-sdk', projectDir: '/tmp/brain-close-rule', state: 'idle', restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 2 } as SessionRecord;
       upsertSession(brainSession);
       const handlers = createMemoryMcpToolHandlers(mcpCaller, { sendDeps: { listSessions: () => [brainSession] } });

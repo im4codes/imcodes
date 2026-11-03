@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
 import { Session } from 'node:inspector';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { writeFileSync } from 'node:fs';
@@ -122,8 +123,8 @@ describe(`timeline event path (${LABEL}, ${DURATION_SEC}s)`, () => {
     registry.updateAssignment({ assignmentId: 'asg_perfliveonly', identity: liveIdentity, status: 'implementing', now: Date.now() - 58_000 });
     // Task pairs: open pairs owned by the Brain plus terminal history.
     const store = getTaskPairStore();
-    for (let i = 0; i < 150; i += 1) store.savePair(PROJECT, pairState(i));
-    for (let i = 150; i < 450; i += 1) store.savePair(PROJECT, pairState(i, 'done'));
+    for (let i = 0; i < 150; i += 1) putTaskPairFixture(store, PROJECT, pairState(i));
+    for (let i = 150; i < 450; i += 1) putTaskPairFixture(store, PROJECT, pairState(i, 'done'));
     setTaskPairDeliveryDepsForTests({ send: async () => undefined });
     taskPairService = new TaskPairService();
     pairsHeartbeat = new TaskPairAutomation({

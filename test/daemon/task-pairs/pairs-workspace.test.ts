@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
 /**
  * Pair workspace lifecycle (owner requirements):
  * - a code task in a git project gets a daemon-created worktree under
@@ -114,7 +115,7 @@ async function endedAt(taskId: string): Promise<number> {
 /** Move a pair's end back in time (the worktree GC reads the wall clock). */
 function backdate(taskId: string, ms: number) {
   const state = pair(taskId);
-  getTaskPairStore().savePair(PROJECT, { ...state, workspace: { ...state.workspace!, endedAt: state.workspace!.endedAt! - ms } });
+  putTaskPairFixture(getTaskPairStore(), PROJECT, { ...state, workspace: { ...state.workspace!, endedAt: state.workspace!.endedAt! - ms } });
 }
 function sentTo(target: string, reason: string) {
   return sent.filter((entry) => entry.target === target && entry.id.includes(`:${reason}:`));
@@ -351,7 +352,7 @@ describe('pair workspaces', () => {
     const result = await releaseTaskPairWorkspace(state, {
       beforeRemove: () => {
         // Model the reopen winning the race immediately before rm().
-        getTaskPairStore().savePair(PROJECT, {
+        putTaskPairFixture(getTaskPairStore(), PROJECT, {
           ...state,
           status: 'working',
           workspace: { ...state.workspace!, status: 'active', endedAt: undefined },
@@ -364,7 +365,7 @@ describe('pair workspaces', () => {
     expect(pair('RACE').workspace?.status).toBe('active');
     // Keep the fixture's state coherent for teardown and prove a valid old
     // terminal workspace is still removable after the reopen has ended it.
-    getTaskPairStore().savePair(PROJECT, {
+    putTaskPairFixture(getTaskPairStore(), PROJECT, {
       ...pair('RACE'),
       status: 'cancelled',
       workspace: { ...pair('RACE').workspace!, status: 'ended', endedAt: at },
@@ -448,7 +449,7 @@ describe('pair workspaces', () => {
       await endedAt(id);
     }
     // One pair belongs to ANOTHER Brain (another project's pair in the same daemon): its budget is its own.
-    getTaskPairStore().savePair(PROJECT, { ...pair('B8'), brain: OTHER_BRAIN });
+    putTaskPairFixture(getTaskPairStore(), PROJECT, { ...pair('B8'), brain: OTHER_BRAIN });
     const at = Math.max(...await Promise.all(ids.map((id) => endedAt(id)))) + TASK_PAIR_WORKSPACE_RETENTION_MS;
     const kept = (target: string) => sentTo(target, 'brain-workspace-kept');
     const digests = (target: string) => sentTo(target, 'brain-workspace-kept-digest');
@@ -596,7 +597,7 @@ describe('pair workspaces', () => {
       git(path, 'checkout', '-qb', branch);
       const branchHead = commitOn(path, 'work.txt', 'executor work');
       const state = pair('R1');
-      getTaskPairStore().savePair(PROJECT, { ...state, workspace: { ...state.workspace!, branch } });
+      putTaskPairFixture(getTaskPairStore(), PROJECT, { ...state, workspace: { ...state.workspace!, branch } });
 
       rmSync(path, { recursive: true, force: true });
       const provision = await provisionTaskPairWorkspace(PROJECT, pair('R1'));
@@ -612,7 +613,7 @@ describe('pair workspaces', () => {
       commitOn(path, 'b.txt', 'b');
       rmSync(path, { recursive: true, force: true });
       const state = pair('R2');
-      getTaskPairStore().savePair(PROJECT, { ...state, workspace: { ...state.workspace!, branch: 'no-such-branch-xyz', lastHead: midCommit } });
+      putTaskPairFixture(getTaskPairStore(), PROJECT, { ...state, workspace: { ...state.workspace!, branch: 'no-such-branch-xyz', lastHead: midCommit } });
 
       const provision = await provisionTaskPairWorkspace(PROJECT, pair('R2'));
       expect(provision).toMatchObject({ ok: true, source: 'lastHead', path });
@@ -626,7 +627,7 @@ describe('pair workspaces', () => {
       const materialHead = commitOn(project, 'later.txt', 'later on project');
       rmSync(path, { recursive: true, force: true });
       const state = pair('R3');
-      getTaskPairStore().savePair(PROJECT, {
+      putTaskPairFixture(getTaskPairStore(), PROJECT, {
         ...state,
         workspace: { ...state.workspace!, branch: undefined, lastHead: undefined },
         material: { head: materialHead, at: Date.now() },
@@ -642,7 +643,7 @@ describe('pair workspaces', () => {
       const base = pair('R4').workspace!.base!;
       rmSync(path, { recursive: true, force: true });
       const state = pair('R4');
-      getTaskPairStore().savePair(PROJECT, { ...state, workspace: { ...state.workspace!, branch: undefined, lastHead: undefined, base } });
+      putTaskPairFixture(getTaskPairStore(), PROJECT, { ...state, workspace: { ...state.workspace!, branch: undefined, lastHead: undefined, base } });
 
       const provision = await provisionTaskPairWorkspace(PROJECT, pair('R4'));
       expect(provision).toMatchObject({ ok: true, source: 'base', path });
@@ -653,7 +654,7 @@ describe('pair workspaces', () => {
       const path = await opened('R5');
       rmSync(path, { recursive: true, force: true });
       const state = pair('R5');
-      getTaskPairStore().savePair(PROJECT, { ...state, workspace: { ...state.workspace!, branch: undefined, lastHead: undefined, base: undefined } });
+      putTaskPairFixture(getTaskPairStore(), PROJECT, { ...state, workspace: { ...state.workspace!, branch: undefined, lastHead: undefined, base: undefined } });
       const projectHead = git(project, 'rev-parse', 'HEAD');
 
       const provision = await provisionTaskPairWorkspace(PROJECT, pair('R5'));
@@ -669,7 +670,7 @@ describe('pair workspaces', () => {
       // A branch name that looks set but no longer resolves -- the pre-fix
       // notice logic labelled this 'branch' on truthiness alone, even though
       // provisioning never actually used it.
-      getTaskPairStore().savePair(PROJECT, { ...state, workspace: { ...state.workspace!, branch: 'stale-branch-gone', lastHead } });
+      putTaskPairFixture(getTaskPairStore(), PROJECT, { ...state, workspace: { ...state.workspace!, branch: 'stale-branch-gone', lastHead } });
 
       await ensureTaskPairWorkspaceAvailable(PROJECT, 'R6');
       expect(pair('R6').workspace).toMatchObject({ status: 'active', path });
@@ -746,7 +747,7 @@ describe('pair workspaces', () => {
     const oldHead = git(path, 'rev-parse', 'HEAD');
     git(path, 'branch', '-f', 'dev', oldHead);
     const state = pair('R10');
-    getTaskPairStore().savePair(PROJECT, { ...state, workspace: { ...state.workspace!, base: original, lastHead: oldHead } });
+    putTaskPairFixture(getTaskPairStore(), PROJECT, { ...state, workspace: { ...state.workspace!, base: original, lastHead: oldHead } });
     git(path, 'reset', '-q', '--hard', original);
     writeFileSync(join(path, 'rebase.txt'), 'rewritten change\n');
     git(path, 'add', '-A');
@@ -768,7 +769,7 @@ describe('pair workspaces', () => {
     git(path, '-c', 'user.email=t@e.invalid', '-c', 'user.name=T', 'commit', '-qm', 'foreign fix: preserve state');
     const oldHead = git(path, 'rev-parse', 'HEAD');
     const state = pair('R10-delay');
-    getTaskPairStore().savePair(PROJECT, { ...state, workspace: { ...state.workspace!, base: original, lastHead: oldHead } });
+    putTaskPairFixture(getTaskPairStore(), PROJECT, { ...state, workspace: { ...state.workspace!, base: original, lastHead: oldHead } });
     git(path, 'reset', '-q', '--hard', original);
     writeFileSync(join(path, 'rebase.txt'), 'rewritten change\n');
     git(path, 'add', '-A');
@@ -803,7 +804,7 @@ describe('pair workspaces', () => {
     // The integration branch does not contain the pair-only commit.
     git(path, 'branch', '-f', 'dev', original);
     const state = pair('R11');
-    getTaskPairStore().savePair(PROJECT, { ...state, workspace: { ...state.workspace!, base: original, lastHead: oldHead } });
+    putTaskPairFixture(getTaskPairStore(), PROJECT, { ...state, workspace: { ...state.workspace!, base: original, lastHead: oldHead } });
     git(path, 'reset', '-q', '--hard', original);
     writeFileSync(join(path, 'rebase.txt'), 'rewritten implementation\n');
     git(path, 'add', '-A');

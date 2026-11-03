@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../helpers/task-pair-fixture.js';
 /**
  * tsk_a800294cfa: a project with a long pair history and a few open pairs
  * (the shape of a busy real project: dozens of finished pairs, three working,
@@ -47,7 +48,7 @@ let clock: number;
 const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
 
 function save(entry: { project: string; brain: string }, taskId: string, status: string, updatedAt: number) {
-  return store.savePair(entry.project, {
+  return putTaskPairFixture(store, entry.project, {
     taskId, brain: entry.brain, executor: `deck_sub_${taskId}_x`, auditor: `deck_sub_${taskId}_a`,
     title: `Pair ${taskId}`, status, flags: [], flagSides: {}, round: 0, blocking: ['P0'],
     previousAuditors: [], createdAt: 1, updatedAt, brief: '- [ ][ ] one', executorPool: 'primary',

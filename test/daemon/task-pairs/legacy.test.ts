@@ -1,3 +1,4 @@
+import { putTaskPairFixture } from '../../helpers/task-pair-fixture.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SessionRecord } from '../../../src/store/session-store.js';
 import { removeSession, upsertSession } from '../../../src/store/session-store.js';
@@ -114,7 +115,7 @@ describe('legacy supervision tools and migration on the pairs engine', () => {
     // A queued DISPATCH naming a held executor stays queued (participant markers no longer start it),
     // so the second open pair is seeded from the first, the way an older daemon left it.
     const l1 = getTaskPairStore().getPair(PROJECT, 'L1')!;
-    getTaskPairStore().savePair(PROJECT, { ...l1.state, taskId: 'L2', title: 'L2', createdAt: l1.state.createdAt + 1, updatedAt: l1.state.updatedAt + 1 });
+    putTaskPairFixture(getTaskPairStore(), PROJECT, { ...l1.state, taskId: 'L2', title: 'L2', createdAt: l1.state.createdAt + 1, updatedAt: l1.state.updatedAt + 1 });
     // Owner rule: a PASS must close a real material-backed audit round.
     marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT L2 path=/workspace -->');
     marker(AUD, '<!-- IMCODES_TASK PASS L2 blocking=P0 -->');
