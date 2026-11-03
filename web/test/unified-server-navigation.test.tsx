@@ -237,7 +237,6 @@ describe('Chromium responsive layout and interaction verification', () => {
     if (!existsSync(artifactDir)) {
       mkdirSync(artifactDir, { recursive: true });
     }
-    const brainDir = '/home/k/.gemini/antigravity-cli/brain/e0bca12b-f252-43dc-831a-cb50a2902641';
 
     // 60 servers (30 owned + 30 shared with mix of pinned, active, Chinese/English names)
     const ownedList = Array.from({ length: 30 }, (_, i) => ({
@@ -478,9 +477,6 @@ describe('Chromium responsive layout and interaction verification', () => {
           // Save portable screenshot
           const screenshotPath = resolve(artifactDir, `nav-viewport-${vp.width}.png`);
           await page.screenshot({ path: screenshotPath });
-          if (existsSync(brainDir)) {
-            try { await page.screenshot({ path: resolve(brainDir, `nav-viewport-${vp.width}.png`) }); } catch {}
-          }
 
           // 1. Mobile bar must be visible
           const mobileBarDisplay = await page.locator('.mobile-server-bar').evaluate((el) => getComputedStyle(el).display);
@@ -596,9 +592,6 @@ describe('Chromium responsive layout and interaction verification', () => {
           // Save portable screenshot
           const screenshotPath = resolve(artifactDir, `nav-viewport-${vp.width}.png`);
           await page.screenshot({ path: screenshotPath });
-          if (existsSync(brainDir)) {
-            try { await page.screenshot({ path: resolve(brainDir, `nav-viewport-${vp.width}.png`) }); } catch {}
-          }
 
           // 1. Mobile bar must be completely hidden on desktop
           const mobileBarDisplay = await page.locator('.mobile-server-bar').evaluate((el) => getComputedStyle(el).display);
