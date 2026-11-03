@@ -249,11 +249,12 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
       window.removeEventListener('resize', syncAnchor);
     };
   }, [Boolean(hoverPreviewAnchor)]);
-  const sessionLabel = (id: unknown, label: unknown) => {
+  const sessionLabel = (id: unknown, label: unknown, compact = false) => {
     if (typeof id !== 'string' || !id || id === 'none') return null;
     const name = taskPairResolveDisplaySessionLabel(id, label, sessions?.find((entry) => entry.name === id));
-    const text = name ? `${name} (${id})` : id;
-    return <button type="button" class="task-pair-chip-session" onClick={(click) => {
+    const fullName = name ? `${name} (${id})` : id;
+    const text = compact && name ? name : fullName;
+    return <button type="button" class="task-pair-chip-session" title={fullName} aria-label={fullName} onClick={(click) => {
       click.stopPropagation();
       window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: id } }));
     }}>{text}</button>;
@@ -264,8 +265,8 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
     const session = sessions?.find((entry) => entry.name === id);
     return session?.activeModel?.trim() || session?.requestedModel?.trim() || undefined;
   };
-  const roleLabel = (id: unknown, label: unknown, modelValue: unknown, _thinking: unknown, role: 'executor' | 'auditor') => {
-    const session = sessionLabel(id, label);
+  const roleLabel = (id: unknown, label: unknown, modelValue: unknown, _thinking: unknown, role: 'executor' | 'auditor', compact = false) => {
+    const session = sessionLabel(id, label, compact);
     const model = resolveModel(id, modelValue);
     return <span class="task-pair-card-role">
       <span class="task-pair-card-role-label">{t(`taskPair.card_${role}`)}</span>
@@ -377,7 +378,7 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
             {eventTime && <time class="task-pair-card-time" dateTime={new Date(timestamp!).toISOString()}>{eventTime}</time>}
             <span class={`task-pair-card-chevron${expanded ? ' is-expanded' : ''}`} aria-hidden="true">⌄</span>
           </span>
-          <span class="task-pair-chip-task">
+          <span class="task-pair-chip-task" title={title}>
             <strong>{title}</strong>
           </span>
           {brainNoticeText && <span class={`task-pair-card-brain-notice is-${brainNotice!.status}`} data-brain-notice={brainNotice!.status}>{brainNoticeText}</span>}
@@ -386,11 +387,11 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
       {!isMobile && <div class="task-pair-card-overview">
         <span class="task-pair-card-event-meta">{verb}</span>
         <div class="task-pair-card-overview-roles">
-          {roleLabel(event.executor, event.executorLabel, event.executorModel, event.executorThinking, 'executor')}
-          {roleLabel(event.auditor, event.auditorLabel, event.auditorModel, event.auditorThinking, 'auditor')}
+          {roleLabel(event.executor, event.executorLabel, event.executorModel, event.executorThinking, 'executor', !expanded)}
+          {roleLabel(event.auditor, event.auditorLabel, event.auditorModel, event.auditorThinking, 'auditor', !expanded)}
         </div>
-        {!expanded && overviewNoticeText && <p class="task-pair-card-overview-note">{overviewNoticeText}{noticeText.length > 320 ? '…' : ''}</p>}
-        {!expanded && isCancelledEvent && <p class="task-pair-card-overview-note">{t('taskPair.card_cancel_reason', { value: cancelReason })}</p>}
+        {!expanded && overviewNoticeText && <p class="task-pair-card-overview-note" title={overviewNoticeText}>{overviewNoticeText}{noticeText.length > 320 ? '…' : ''}</p>}
+        {!expanded && isCancelledEvent && <p class="task-pair-card-overview-note" title={cancelReason}>{t('taskPair.card_cancel_reason', { value: cancelReason })}</p>}
       </div>}
       {expanded && <>
         <div class="task-pair-card-body">

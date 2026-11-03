@@ -20,7 +20,8 @@ describe('event decision details are on demand and read only', () => {
   it('shows desktop role/model overview before opening and does not eagerly fetch history', async () => {
     const send = vi.fn(); unbind = bindTaskPairDecisions(send);
     const { container } = render(<TaskPairEventChip eventId="desktop" payload={payload} />);
-    expect(container.querySelector('.task-pair-card-overview')?.textContent).toContain('Worker (exec)');
+    expect(container.querySelector('.task-pair-card-overview')?.textContent).toContain('Worker');
+    expect(container.querySelector('.task-pair-card-overview .task-pair-chip-session')?.getAttribute('title')).toBe('Worker (exec)');
     expect(container.textContent).toContain('taskPair.card_model');
     await act(async () => {});
     expect(send).not.toHaveBeenCalled();
