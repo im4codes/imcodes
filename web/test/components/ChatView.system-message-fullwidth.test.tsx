@@ -136,9 +136,11 @@ describe('System message full-width card layout in ChatView', () => {
     expect(css).toMatch(/\.chat-user\.chat-user-supervision-prompt\.chat-user-origin-system\s*\{[^}]*width:\s*fit-content;/);
     expect(css).toMatch(/\.chat-user\.chat-user-supervision-prompt\.chat-user-origin-system\s*\{[^}]*align-self:\s*flex-start;/);
 
-    // Cron run retains fit-content
+    // Cron run retains fit-content and 80% max-width ceiling (exact base invariant)
     expect(css).toMatch(/\.chat-user\.chat-user-cron-run/);
-    expect(css).toMatch(/width:\s*fit-content;/);
+    expect(css).toMatch(/\.chat-user\.chat-user-cron-run[^{]*\{[^}]*align-self:\s*flex-start;/);
+    expect(css).toMatch(/\.chat-user\.chat-user-cron-run[^{]*\{[^}]*width:\s*fit-content;/);
+    expect(css).toMatch(/\.chat-user\.chat-user-cron-run[^{]*\{[^}]*max-width:\s*80%;/);
 
     // Human user messages still right-aligned and fit-content
     expect(css).toMatch(/\.chat-user\s*\{[^}]*align-self:\s*flex-end;/);
