@@ -1,6 +1,6 @@
 import { useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import { isServerOnline } from '../server-selection.js';
+import { getServerPresence } from '../unified-server-projection.js';
 import type { SharedStateSummary } from '../tab-sharing-ui.js';
 import type { SharedEntrySummary } from '../api.js';
 import { SharedStateIndicator } from './SharedStateIndicator.js';
@@ -72,7 +72,13 @@ export function ServerIconBar({
       {servers.map((server, index) => {
         const label = labels[index]!;
         const isActive = server.id === activeServerId;
-        const isOnline = isServerOnline(server);
+        const presence = getServerPresence(server);
+        const presenceColor = presence === 'online' ? '#4ade80' : presence === 'offline' ? '#475569' : '#94a3b8';
+        const presenceLabel = presence === 'online'
+          ? t('server.online', { defaultValue: 'Online' })
+          : presence === 'offline'
+            ? t('server.offline', { defaultValue: 'Offline' })
+            : t('server.status_unknown', { defaultValue: 'Status unknown' });
         const sharedState = sharedServerStates?.get(server.id) ?? null;
         const isPinned = pinnedServerIds?.has(server.id) ?? false;
         const isSharedIn = Boolean(server.isSharedIn);
@@ -136,9 +142,10 @@ export function ServerIconBar({
               <span class="server-icon-upgrade" aria-label={t('server.daemon_upgrade_available')} title={t('server.daemon_upgrade_available')}>↥</span>
             )}
             <span
-              class="server-icon-dot"
-              style={{ background: isOnline ? '#4ade80' : '#475569' }}
-              aria-hidden="true"
+              class={`server-icon-dot server-icon-dot-${presence}`}
+              style={{ background: presenceColor }}
+              title={presenceLabel}
+              aria-label={presenceLabel}
             />
           </button>
         );

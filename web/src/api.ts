@@ -1101,7 +1101,7 @@ function shareTargetFallbackLabel(target: ShareTarget): string {
   return target.subSessionDisplayName || `deck_sub_${target.subSessionId}`;
 }
 
-function normalizeSharedEntrySummary(value: unknown): SharedEntrySummary {
+export function normalizeSharedEntrySummary(value: unknown): SharedEntrySummary {
   const raw = value && typeof value === 'object' ? value as Partial<SharedEntrySummary> & Record<string, unknown> : {};
   const fallbackTarget: ShareTarget = { kind: 'server', serverId: typeof raw.serverId === 'string' ? raw.serverId : '' };
   const target: ShareTarget = raw.target && typeof raw.target === 'object'
@@ -1122,12 +1122,15 @@ function normalizeSharedEntrySummary(value: unknown): SharedEntrySummary {
     target,
     targetLabel,
     serverStatus: typeof raw.serverStatus === 'string' ? raw.serverStatus : null,
-    lastHeartbeatAt: typeof raw.lastHeartbeatAt === 'number' && Number.isFinite(raw.lastHeartbeatAt) ? raw.lastHeartbeatAt : null,
+    lastHeartbeatAt: typeof raw.lastHeartbeatAt === 'number' && Number.isFinite(raw.lastHeartbeatAt) && raw.lastHeartbeatAt > 0 ? raw.lastHeartbeatAt : null,
   };
 }
 
-export async function discoverSharedEntries(): Promise<SharedEntrySummary[]> {
-  const res = await apiFetch<{ shares?: SharedEntrySummary[]; entries?: SharedEntrySummary[] }>('/api/shares');
+export async function discoverSharedEntries(options?: { signal?: AbortSignal }): Promise<SharedEntrySummary[]> {
+  const res = await apiFetch<{ shares?: SharedEntrySummary[]; entries?: SharedEntrySummary[] }>(
+    '/api/shares',
+    { signal: options?.signal },
+  );
   const entries = res.shares ?? res.entries;
   return Array.isArray(entries) ? entries.map(normalizeSharedEntrySummary) : [];
 }

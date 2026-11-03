@@ -5,10 +5,13 @@ import { resolve } from 'node:path';
 import { cleanup, fireEvent, render, screen } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MobileServerMenu } from '../src/components/MobileServerMenu.js';
+import { MobileServerMenuToolbar } from '../src/components/MobileServerMenuToolbar.js';
 import { MobileSharedEntriesMenu } from '../src/components/MobileSharedEntriesMenu.js';
 import type { SharedEntrySummary } from '../src/api.js';
 
-vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({ t: (key: string, opt?: { defaultValue?: string }) => opt?.defaultValue ?? key }),
+}));
 const require = createRequire(import.meta.url);
 const css = readFileSync(resolve(__dirname, '../src/styles.css'), 'utf8');
 const entries: SharedEntrySummary[] = Array.from({ length: 36 }, (_, index) => ({
@@ -48,34 +51,27 @@ function menu(
         <div class="mobile-server-switcher-wrap">
           <button class="mobile-server-btn">Servers</button>
           <MobileServerMenu footer={<button>Language</button>}>
-            <div class="mobile-server-menu-top-row">
-              <button class="mobile-server-menu-item mobile-server-menu-home" onClick={onClose}>← Home</button>
-              {isNative && (
+            <MobileServerMenuToolbar
+              onHome={onClose}
+              onChangeServer={onChangeServer}
+              onOpenControlledNodes={onOpenControlledNodes}
+              isNativeApp={isNative}
+            />
+            {servers.map((s) => {
+              const presence = (s as any).presence ?? (s.online ? 'online' : 'offline');
+              const color = presence === 'online' ? '#4ade80' : presence === 'offline' ? '#475569' : '#94a3b8';
+              const symbol = presence === 'online' ? '●' : presence === 'offline' ? '○' : '◌';
+              return (
                 <button
-                  class="mobile-server-menu-item mobile-server-menu-change"
-                  onClick={onChangeServer}
+                  key={s.id}
+                  class={`mobile-server-menu-item mobile-server-menu-server${s.isSharedIn ? ' mobile-shared-in' : ''}`}
+                  onClick={() => onSelectServer(s.id)}
                 >
-                  ⇄ Switch Cloud Server
+                  <span class={`mobile-server-menu-dot mobile-server-menu-dot-${presence}`} style={{ color }}>{symbol}</span>
+                  <span class="mobile-server-menu-name">{s.name}</span>
                 </button>
-              )}
-            </div>
-            <button
-              class="mobile-server-menu-item mobile-server-menu-controlled-nodes"
-              onClick={onOpenControlledNodes}
-            >
-              <span>🖥</span>
-              <span>AI Desk</span>
-            </button>
-            {servers.map((s) => (
-              <button
-                key={s.id}
-                class={`mobile-server-menu-item mobile-server-menu-server${s.isSharedIn ? ' mobile-shared-in' : ''}`}
-                onClick={() => onSelectServer(s.id)}
-              >
-                <span style={{ color: s.online ? '#4ade80' : '#475569' }}>{s.online ? '●' : '○'}</span>
-                <span class="mobile-server-menu-name">{s.name}</span>
-              </button>
-            ))}
+              );
+            })}
             <MobileSharedEntriesMenu entries={entries} onOpen={onOpen} onRefresh={vi.fn()} />
           </MobileServerMenu>
         </div>
@@ -176,17 +172,18 @@ describe('mobile server menu shared-entry reachability', () => {
     expect(aiDesk.previousElementSibling).toBe(topRow);
   });
 
-  it('renders authoritative online (●) and offline (○) dots with consistent color coding across owned and shared servers', () => {
+  it('renders authoritative online (●), offline (○), and unknown (◌) dots with consistent color coding across owned and shared servers', () => {
     const servers = [
-      { id: 'owned-1', name: 'Owned Online', online: true, isSharedIn: false },
-      { id: 'owned-2', name: 'Owned Offline', online: false, isSharedIn: false },
-      { id: 'shared-1', name: 'Shared Online', online: true, isSharedIn: true },
-      { id: 'shared-2', name: 'Shared Offline', online: false, isSharedIn: true },
+      { id: 'owned-1', name: 'Owned Online', online: true, isSharedIn: false, presence: 'online' },
+      { id: 'owned-2', name: 'Owned Offline', online: false, isSharedIn: false, presence: 'offline' },
+      { id: 'shared-1', name: 'Shared Online', online: true, isSharedIn: true, presence: 'online' },
+      { id: 'shared-2', name: 'Shared Offline', online: false, isSharedIn: true, presence: 'offline' },
+      { id: 'shared-3', name: 'Shared Unknown', online: false, isSharedIn: true, presence: 'unknown' },
     ];
     const view = menu(vi.fn(), vi.fn(), vi.fn(), { servers });
 
     const serverBtns = view.container.querySelectorAll('.mobile-server-menu-server');
-    expect(serverBtns).toHaveLength(4);
+    expect(serverBtns).toHaveLength(5);
 
     expect(serverBtns[0].textContent).toContain('●');
     expect(serverBtns[0].textContent).toContain('Owned Online');
@@ -205,6 +202,11 @@ describe('mobile server menu shared-entry reachability', () => {
     expect(serverBtns[3].textContent).toContain('Shared Offline');
     expect(serverBtns[3].classList.contains('mobile-shared-in')).toBe(true);
     expect(serverBtns[3].querySelector('span')!.style.color).toBe('rgb(71, 85, 105)'); // #475569
+
+    expect(serverBtns[4].textContent).toContain('◌');
+    expect(serverBtns[4].textContent).toContain('Shared Unknown');
+    expect(serverBtns[4].classList.contains('mobile-shared-in')).toBe(true);
+    expect(serverBtns[4].querySelector('span')!.style.color).toBe('rgb(148, 163, 184)'); // #94a3b8
   });
 
   it('runs desktop smoke verifying mobile bar is hidden and sidebar shared entries are interactive', async () => {

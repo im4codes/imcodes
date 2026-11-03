@@ -1,6 +1,14 @@
 import type { SharedEntrySummary } from './api.js';
-import { isServerOnline, type OnlineServerInfo } from './server-selection.js';
+import type { OnlineServerInfo } from './server-selection.js';
 import { sortServersByPreference, type ServerOrderEntry } from './server-order.js';
+import {
+  classifyServerPresence,
+  type SharedPresenceState,
+  type SharedPresencePayload,
+} from '@shared/tab-sharing.js';
+
+export type { SharedPresenceState, SharedPresencePayload };
+export { classifyServerPresence };
 
 export interface UnifiedServerItem extends ServerOrderEntry {
   id: string;
@@ -14,6 +22,85 @@ export interface UnifiedServerItem extends ServerOrderEntry {
   sharedEntry?: SharedEntrySummary;
   server?: OnlineServerInfo;
   online: boolean;
+  presence: SharedPresenceState;
+}
+
+export interface ServerPresenceObservation {
+  status: string;
+  lastHeartbeatAt: number | null;
+  source: 'grant' | 'daemon' | 'pod-pong' | 'fallback';
+}
+
+/**
+ * Coherently select the authoritative presence observation between a cached visited server
+ * snapshot and an active shared grant.
+ *
+ * Rules:
+ * 1. Status and heartbeat are kept TOGETHER as a coherent observation, never mixing
+ *    an offline status from one source with a heartbeat timestamp from another.
+ * 2. An authoritative DB grant presence wins over an older cached offline snapshot when
+ *    grant.lastHeartbeatAt >= (server.lastHeartbeatAt ?? 0), permitting fresh recovery.
+ * 3. WS pod-pong pings on visited servers are NOT daemon liveness and must not override
+ *    authoritative DB grant presence.
+ * 4. Newer genuine daemon disconnection / offline events from the visited session take
+ *    precedence if their timestamp is strictly newer than the grant's heartbeat.
+ * 5. If neither source carries a verified numeric heartbeat, the status falls back safely
+ *    and classifies as 'unknown' rather than asserting offline.
+ */
+export function resolveCoherentPresenceObservation(
+  server: OnlineServerInfo | null | undefined,
+  grant: SharedEntrySummary | null | undefined,
+): ServerPresenceObservation {
+  const grantHeartbeat = typeof grant?.lastHeartbeatAt === 'number' && Number.isFinite(grant.lastHeartbeatAt) && grant.lastHeartbeatAt > 0
+    ? grant.lastHeartbeatAt
+    : null;
+  const grantStatus = grant?.serverStatus ?? 'active';
+
+  const serverHeartbeat = typeof server?.lastHeartbeatAt === 'number' && Number.isFinite(server.lastHeartbeatAt) && server.lastHeartbeatAt > 0
+    ? server.lastHeartbeatAt
+    : null;
+  const serverStatus = server?.status ?? 'active';
+  const serverIsPodPong = (server as { heartbeatSource?: string })?.heartbeatSource === 'pod-pong';
+
+  // 1. Grant carries authoritative heartbeat from DB
+  if (grantHeartbeat !== null) {
+    if (serverIsPodPong || serverHeartbeat === null || grantHeartbeat >= serverHeartbeat) {
+      return {
+        status: grantStatus,
+        lastHeartbeatAt: grantHeartbeat,
+        source: 'grant',
+      };
+    }
+    // Visited server has a newer genuine daemon event
+    return {
+      status: serverStatus,
+      lastHeartbeatAt: serverHeartbeat,
+      source: 'daemon',
+    };
+  }
+
+  // 2. Grant has no heartbeat, but visited server has genuine daemon heartbeat
+  if (serverHeartbeat !== null && !serverIsPodPong) {
+    return {
+      status: serverStatus,
+      lastHeartbeatAt: serverHeartbeat,
+      source: 'daemon',
+    };
+  }
+
+  // 3. Neither carries an authoritative heartbeat (legacy peer or missing presence)
+  return {
+    status: grant?.serverStatus ?? server?.status ?? 'active',
+    lastHeartbeatAt: null,
+    source: 'fallback',
+  };
+}
+
+export function getServerPresence(
+  server: { status?: string | null; lastHeartbeatAt?: number | null; presence?: SharedPresenceState; heartbeatSource?: string | null } | null | undefined,
+  now = Date.now(),
+): SharedPresenceState {
+  return classifyServerPresence(server, now);
 }
 
 function compareGrants(a: SharedEntrySummary, b: SharedEntrySummary): number {
@@ -29,7 +116,7 @@ function compareGrants(a: SharedEntrySummary, b: SharedEntrySummary): number {
  * Project a unified server list combining owned/opened servers with active whole-server shared entries.
  * Deduplicates by serverId: owned servers take precedence and never downgrade ownership.
  * Non-owned servers in inventory retain their active shared grant to preserve scoped navigation proof.
- * Discovered whole-server shared entries without prior verified heartbeat default to online: false.
+ * Shared entries without prior verified heartbeat classify distinctly as presence: 'unknown'.
  */
 export function projectUnifiedServerList<T extends OnlineServerInfo>(
   servers: readonly T[],
@@ -37,6 +124,7 @@ export function projectUnifiedServerList<T extends OnlineServerInfo>(
   ownedServerIds: ReadonlySet<string>,
   serverOrder: readonly string[] = [],
   serverPinned: readonly string[] = [],
+  now = Date.now(),
 ): UnifiedServerItem[] {
   // 1. Group active grants by serverId
   const activeGrants = sharedEntries.filter((entry) => entry.status === 'active');
@@ -64,6 +152,7 @@ export function projectUnifiedServerList<T extends OnlineServerInfo>(
     const isOwned = ownedServerIds.has(server.id);
     if (isOwned) {
       seenServerIds.add(server.id);
+      const presence = classifyServerPresence(server, now);
       unifiedItems.push({
         id: server.id,
         name: server.name,
@@ -75,7 +164,8 @@ export function projectUnifiedServerList<T extends OnlineServerInfo>(
         isSharedIn: false,
         sharedEntry: undefined,
         server,
-        online: isServerOnline(server),
+        presence,
+        online: presence === 'online',
       });
     } else {
       // Non-owned server in inventory: only project if an active grant exists,
@@ -87,23 +177,14 @@ export function projectUnifiedServerList<T extends OnlineServerInfo>(
           ? grant.targetLabel.trim()
           : (server.name || grant.serverName);
 
-        // Effective heartbeat: prefer freshest authoritative timestamp between cached server snapshot and active grant
-        const effectiveHeartbeat = typeof grant.lastHeartbeatAt === 'number'
-          ? (typeof server.lastHeartbeatAt === 'number' ? Math.max(server.lastHeartbeatAt, grant.lastHeartbeatAt) : grant.lastHeartbeatAt)
-          : server.lastHeartbeatAt;
-
-        // Effective status: if explicitly offline, keep offline; else prefer grant status, fallback to server status
-        const effectiveStatus = (server.status === 'offline' || grant.serverStatus === 'offline')
-          ? 'offline'
-          : (grant.serverStatus ?? server.status ?? 'active');
-
-        const effectiveOnline = isServerOnline({ status: effectiveStatus, lastHeartbeatAt: effectiveHeartbeat });
+        const observation = resolveCoherentPresenceObservation(server, grant);
+        const presence = classifyServerPresence(observation, now);
 
         unifiedItems.push({
           id: server.id,
           name: displayName,
-          status: effectiveStatus,
-          lastHeartbeatAt: effectiveHeartbeat,
+          status: observation.status,
+          lastHeartbeatAt: observation.lastHeartbeatAt,
           daemonVersion: (server as { daemonVersion?: string | null }).daemonVersion,
           latestDaemonVersion: (server as { latestDaemonVersion?: string | null }).latestDaemonVersion,
           createdAt: server.createdAt,
@@ -111,10 +192,11 @@ export function projectUnifiedServerList<T extends OnlineServerInfo>(
           sharedEntry: grant,
           server: {
             ...server,
-            status: effectiveStatus,
-            lastHeartbeatAt: effectiveHeartbeat,
+            status: observation.status,
+            lastHeartbeatAt: observation.lastHeartbeatAt,
           },
-          online: effectiveOnline,
+          presence,
+          online: presence === 'online',
         });
       }
     }
@@ -130,18 +212,18 @@ export function projectUnifiedServerList<T extends OnlineServerInfo>(
       ? grant.targetLabel.trim()
       : grant.serverName;
 
-    const effectiveStatus = grant.serverStatus ?? 'active';
-    const effectiveHeartbeat = typeof grant.lastHeartbeatAt === 'number' ? grant.lastHeartbeatAt : null;
-    const effectiveOnline = isServerOnline({ status: effectiveStatus, lastHeartbeatAt: effectiveHeartbeat });
+    const observation = resolveCoherentPresenceObservation(null, grant);
+    const presence = classifyServerPresence(observation, now);
 
     unifiedItems.push({
       id: grant.serverId,
       name: displayName,
-      status: effectiveStatus,
-      lastHeartbeatAt: effectiveHeartbeat,
+      status: observation.status,
+      lastHeartbeatAt: observation.lastHeartbeatAt,
       isSharedIn: true,
       sharedEntry: grant,
-      online: effectiveOnline,
+      presence,
+      online: presence === 'online',
     });
   }
 

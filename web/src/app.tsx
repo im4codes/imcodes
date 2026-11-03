@@ -76,10 +76,12 @@ import {
 import { ShareSessionDialog } from './components/ShareSessionDialog.js';
 import { SharedEntriesPanel } from './components/SharedEntriesPanel.js';
 import { MobileSharedEntriesMenu } from './components/MobileSharedEntriesMenu.js';
+import { MobileServerMenuToolbar } from './components/MobileServerMenuToolbar.js';
 import { SharedStateIndicator } from './components/SharedStateIndicator.js';
 import {
   projectUnifiedServerList,
   filterRestrictedSharedEntries,
+  getServerPresence,
   type UnifiedServerItem,
 } from './unified-server-projection.js';
 import { applyGlobalFontPrefs, DEFAULT_CHAT_FONT, useFontPrefs } from './components/FontPrefsDropdown.js';
@@ -735,6 +737,8 @@ type SharedOpenResultStatus = 'opened' | 'superseded' | 'denied' | 'duplicate';
 export function App() {
   recordPerfRender('App');
   const { t: trans } = useTranslation();
+  const transRef = useRef(trans);
+  transRef.current = trans;
   const remoteDesktopConnectionManagerRef = useRef<RemoteDesktopConnectionManager | null>(null);
   if (!remoteDesktopConnectionManagerRef.current) {
     remoteDesktopConnectionManagerRef.current = new RemoteDesktopConnectionManager();
@@ -779,6 +783,16 @@ export function App() {
       return null;
     }
   });
+  const authRef = useRef(auth);
+  authRef.current = auth;
+  const sharedDiscoveryAbortRef = useRef<AbortController | null>(null);
+  const sharedDiscoveryGenerationRef = useRef(0);
+  useEffect(() => {
+    return () => {
+      sharedDiscoveryAbortRef.current?.abort();
+      sharedDiscoveryAbortRef.current = null;
+    };
+  }, []);
   const [daemonUpgradeRequests, setDaemonUpgradeRequests] = useState<Record<string, DaemonUpgradeRequestState>>({});
   const [daemonUpgradeConfirmTarget, setDaemonUpgradeConfirmTarget] = useState<ServerInfo | 'all' | null>(null);
   const supervisionCacheUserRef = useRef<string | null>(auth?.userId ?? null);
@@ -881,6 +895,9 @@ export function App() {
     sharedOpenAbortRef.current = null;
     sharedOpenGenerationRef.current += 1;
     sharedOpenIntentRef.current = null;
+    sharedDiscoveryAbortRef.current?.abort();
+    sharedDiscoveryAbortRef.current = null;
+    sharedDiscoveryGenerationRef.current += 1;
     externalRouteGenerationRef.current += 1;
     externalRouteInFlightKeyRef.current = null;
     setOpeningSharedEntryId(null);
@@ -896,6 +913,8 @@ export function App() {
     // A shared hash is only a navigation intent. Everything learned under the
     // expired identity is discarded before asynchronous credential cleanup.
     setAuth(null);
+    authRef.current = null;
+    setSharedEntries([]);
     setServers([]);
     ownedServerIdsRef.current = new Set();
     sharedNavigationServerIdsRef.current = new Set();
@@ -1745,16 +1764,27 @@ export function App() {
   const lastSharedAuthUserIdRef = useRef<string | null>(null);
 
   const refreshSharedEntries = useCallback(async (options?: { silent?: boolean }) => {
-    if (!auth) {
+    // Abort any prior in-flight discovery
+    sharedDiscoveryAbortRef.current?.abort();
+    const abortController = new AbortController();
+    sharedDiscoveryAbortRef.current = abortController;
+
+    const currentDiscoveryGen = ++sharedDiscoveryGenerationRef.current;
+    const currentAuthGen = authMutationGenerationRef.current;
+    const currentUserId = authRef.current?.userId ?? null;
+    const currentBaseUrl = authRef.current?.baseUrl ?? null;
+
+    if (!authRef.current || !currentUserId) {
       lastSharedAuthUserIdRef.current = null;
       setSharedEntries([]);
       setSharedEntriesError(null);
       setSharedEntriesLoaded(false);
+      setSharedEntriesLoading(false);
       return;
     }
     // Account switch boundary: if switching users, immediately clear prior user's shared entries
-    if (lastSharedAuthUserIdRef.current !== auth.userId) {
-      lastSharedAuthUserIdRef.current = auth.userId;
+    if (lastSharedAuthUserIdRef.current !== currentUserId) {
+      lastSharedAuthUserIdRef.current = currentUserId;
       setSharedEntries([]);
     }
     if (!options?.silent) {
@@ -1762,8 +1792,20 @@ export function App() {
       setSharedEntriesLoaded(false);
       setSharedEntriesError(null);
     }
+
+    const isCurrentValidRequest = () => (
+      !abortController.signal.aborted &&
+      sharedDiscoveryGenerationRef.current === currentDiscoveryGen &&
+      authMutationGenerationRef.current === currentAuthGen &&
+      authRef.current?.userId === currentUserId &&
+      authRef.current?.baseUrl === currentBaseUrl
+    );
+
     try {
-      const entries = await discoverSharedEntries();
+      const entries = await discoverSharedEntries({ signal: abortController.signal });
+
+      if (!isCurrentValidRequest()) return;
+
       const activeIds = new Set(entries.filter((entry) => entry.status === 'active').map((entry) => entry.serverId));
       sharedNavigationServerIdsRef.current = activeIds;
       setSharedEntries(entries);
@@ -1784,7 +1826,7 @@ export function App() {
         if (ownedServerIdsRef.current.has(server.id)) return server;
         const grant = grantMap.get(server.id);
         if (!grant || typeof grant.lastHeartbeatAt !== 'number') return server;
-        if (!server.lastHeartbeatAt || grant.lastHeartbeatAt > server.lastHeartbeatAt) {
+        if (!server.lastHeartbeatAt || grant.lastHeartbeatAt >= server.lastHeartbeatAt) {
           return {
             ...server,
             status: grant.serverStatus ?? server.status,
@@ -1794,17 +1836,20 @@ export function App() {
         return server;
       }).filter((server) => ownedServerIdsRef.current.has(server.id) || activeIds.has(server.id)));
     } catch (err) {
+      if (!isCurrentValidRequest()) return;
       // On network failure during refresh: preserve existing entries; do not clear to []
       if (!options?.silent) {
-        setSharedEntriesError(formatSharedAccessError(err, trans));
+        setSharedEntriesError(formatSharedAccessError(err, transRef.current));
       }
     } finally {
-      if (!options?.silent) {
-        setSharedEntriesLoading(false);
-        setSharedEntriesLoaded(true);
+      if (isCurrentValidRequest()) {
+        if (!options?.silent) {
+          setSharedEntriesLoading(false);
+          setSharedEntriesLoaded(true);
+        }
       }
     }
-  }, [auth, trans]);
+  }, [auth]);
 
   useEffect(() => {
     if (!auth) return;
@@ -3180,6 +3225,9 @@ export function App() {
     sharedOpenAbortRef.current = null;
     sharedOpenGenerationRef.current += 1;
     sharedOpenIntentRef.current = null;
+    sharedDiscoveryAbortRef.current?.abort();
+    sharedDiscoveryAbortRef.current = null;
+    sharedDiscoveryGenerationRef.current += 1;
     externalRouteGenerationRef.current += 1;
     externalRouteInFlightKeyRef.current = null;
     setOpeningSharedEntryId(null);
@@ -3315,9 +3363,6 @@ export function App() {
   const wsRef = useRef<WsClient | null>(null);
 
   // ── Classic discussion startup feedback (optimistic launch + failure UX) ──
-  // Always read the latest translator inside stable callbacks.
-  const transRef = useRef(trans);
-  transRef.current = trans;
   // requestIds this tab dispatched — gates initiator-only failure toasts.
   const initiatedRequestIdsRef = useRef<Set<string>>(new Set());
   // Backstop timers keyed by requestId (send OK but no started/error).
@@ -5287,7 +5332,11 @@ export function App() {
       // client sends a message and the daemon broadcasts back). Use
       // `touchServerHeartbeat` so a server that was explicitly marked offline
       // via MSG_DAEMON_OFFLINE doesn't get accidentally promoted back online.
-      setServers((prev) => touchServerHeartbeat(prev, selectedServerId));
+      // Only touch heartbeat for owned servers; shared server presence is
+      // authoritatively tracked by daemon DB heartbeats via discoverSharedEntries.
+      if (selectedServerId && ownedServerIdsRef.current.has(selectedServerId)) {
+        setServers((prev) => touchServerHeartbeat(prev, selectedServerId));
+      }
     });
     const unsubStats = ws.onMessage((msg) => {
       // A liveness frame (link-worker heartbeat) proves the daemon is alive just
@@ -5684,6 +5733,9 @@ export function App() {
     sharedOpenAbortRef.current = null;
     sharedOpenGenerationRef.current += 1;
     sharedOpenIntentRef.current = null;
+    sharedDiscoveryAbortRef.current?.abort();
+    sharedDiscoveryAbortRef.current = null;
+    sharedDiscoveryGenerationRef.current += 1;
     externalRouteGenerationRef.current += 1;
     externalRouteInFlightKeyRef.current = null;
     setOpeningSharedEntryId(null);
@@ -5715,6 +5767,8 @@ export function App() {
     clearMessagePinNavigation();
     configureExpectedUserId(null);
     setAuth(null);
+    authRef.current = null;
+    setSharedEntries([]);
     setServers([]);
     ownedServerIdsRef.current = new Set();
     sharedNavigationServerIdsRef.current = new Set();
@@ -5742,6 +5796,9 @@ export function App() {
     sharedOpenAbortRef.current = null;
     sharedOpenGenerationRef.current += 1;
     sharedOpenIntentRef.current = null;
+    sharedDiscoveryAbortRef.current?.abort();
+    sharedDiscoveryAbortRef.current = null;
+    sharedDiscoveryGenerationRef.current += 1;
     externalRouteGenerationRef.current += 1;
     externalRouteInFlightKeyRef.current = null;
     setOpeningSharedEntryId(null);
@@ -5771,6 +5828,9 @@ export function App() {
     sharedOpenAbortRef.current = null;
     sharedOpenGenerationRef.current += 1;
     sharedOpenIntentRef.current = null;
+    sharedDiscoveryAbortRef.current?.abort();
+    sharedDiscoveryAbortRef.current = null;
+    sharedDiscoveryGenerationRef.current += 1;
     externalRouteGenerationRef.current += 1;
     externalRouteInFlightKeyRef.current = null;
     setOpeningSharedEntryId(null);
@@ -6346,6 +6406,9 @@ export function App() {
     sharedOpenAbortRef.current = null;
     sharedOpenGenerationRef.current += 1;
     sharedOpenIntentRef.current = null;
+    sharedDiscoveryAbortRef.current?.abort();
+    sharedDiscoveryAbortRef.current = null;
+    sharedDiscoveryGenerationRef.current += 1;
     externalRouteGenerationRef.current += 1;
     externalRouteInFlightKeyRef.current = null;
     setOpeningSharedEntryId(null);
@@ -7218,7 +7281,15 @@ export function App() {
         </div>
         <div class="server-list">
           {orderedServers.map((server) => {
-            const online = isServerOnline(server);
+            const presence = getServerPresence(server);
+            const online = presence === 'online';
+            const presenceColor = online ? '#4ade80' : presence === 'offline' ? '#475569' : '#94a3b8';
+            const presenceSymbol = online ? '●' : presence === 'offline' ? '○' : '◌';
+            const presenceLabel = online
+              ? trans('server.online', { defaultValue: 'Online' })
+              : presence === 'offline'
+                ? trans('server.offline', { defaultValue: 'Offline' })
+                : trans('server.status_unknown', { defaultValue: 'Status unknown' });
             return (
               <button
                 key={server.id}
@@ -7226,8 +7297,13 @@ export function App() {
                 onClick={() => handleSelectServer(server.id, server.name)}
                 onContextMenu={(e) => { e.preventDefault(); setServerCtxMenu({ server, x: e.clientX, y: e.clientY }); }}
               >
-                <span class="server-item-dot" style={{ color: online ? '#4ade80' : '#475569' }}>
-                  {online ? '●' : '○'}
+                <span
+                  class={`server-item-dot server-item-dot-${presence}`}
+                  style={{ color: presenceColor }}
+                  title={presenceLabel}
+                  aria-label={presenceLabel}
+                >
+                  {presenceSymbol}
                 </span>
                 {pinnedServerIds.has(server.id) && (
                   <span
@@ -7373,34 +7449,30 @@ export function App() {
                 {showMobileServerMenu && (
                   <>
                   <MobileServerMenu footer={<LanguageSwitcher />}>
-                    <div class="mobile-server-menu-top-row">
-                      <button
-                        class="mobile-server-menu-item mobile-server-menu-home"
-                        onClick={() => { setShowMobileServerMenu(false); handleBackToDashboard(); }}
-                      >
-                        ← Home
-                      </button>
-                      {isNative() && (
-                        <button
-                          class="mobile-server-menu-item mobile-server-menu-change"
-                          onClick={() => { setShowMobileServerMenu(false); handleChangeServer(); }}
-                        >
-                          ⇄ Switch Cloud Server
-                        </button>
-                      )}
-                    </div>
-                    <button
-                      class="mobile-server-menu-item mobile-server-menu-controlled-nodes"
-                      onClick={() => {
+                    <MobileServerMenuToolbar
+                      onHome={() => {
+                        setShowMobileServerMenu(false);
+                        handleBackToDashboard();
+                      }}
+                      onChangeServer={() => {
+                        setShowMobileServerMenu(false);
+                        handleChangeServer();
+                      }}
+                      onOpenControlledNodes={() => {
                         setShowMobileServerMenu(false);
                         openControlledNodes();
                       }}
-                    >
-                      <span aria-hidden="true">🖥</span>
-                      <span>{trans('controlled_nodes.title')}</span>
-                    </button>
+                    />
                     {unifiedServers.map((s) => {
-                      const online = s.online;
+                      const presence = getServerPresence(s);
+                      const online = presence === 'online';
+                      const presenceColor = online ? '#4ade80' : presence === 'offline' ? '#475569' : '#94a3b8';
+                      const presenceSymbol = online ? '●' : presence === 'offline' ? '○' : '◌';
+                      const presenceLabel = online
+                        ? trans('server.online', { defaultValue: 'Online' })
+                        : presence === 'offline'
+                          ? trans('server.offline', { defaultValue: 'Offline' })
+                          : trans('server.status_unknown', { defaultValue: 'Status unknown' });
                       return (
                         <button
                           key={s.id}
@@ -7413,7 +7485,14 @@ export function App() {
                             if (ownedServer) setServerCtxMenu({ server: ownedServer as ServerInfo, x: e.clientX, y: e.clientY });
                           }}
                         >
-                          <span style={{ color: online ? '#4ade80' : '#475569' }}>{online ? '●' : '○'}</span>
+                          <span
+                            class={`mobile-server-menu-dot mobile-server-menu-dot-${presence}`}
+                            style={{ color: presenceColor }}
+                            title={presenceLabel}
+                            aria-label={presenceLabel}
+                          >
+                            {presenceSymbol}
+                          </span>
                           <span class="mobile-server-menu-name">{s.name}</span>
                           {s.isSharedIn ? (
                             <SharedStateIndicator variant="shared-in" iconOnly />
@@ -7976,7 +8055,15 @@ export function App() {
               {(unifiedServers.length > 0 || sharedEntriesLoading || sharedEntriesError !== null || restrictedSharedEntries.length > 0) && !mobileHideServerBar && (
                 <div style={{ padding: '8px 12px', borderBottom: '1px solid #1e293b' }}>
                   {unifiedServers.map((s) => {
-                    const online = s.online;
+                    const presence = getServerPresence(s);
+                    const online = presence === 'online';
+                    const presenceColor = online ? '#4ade80' : presence === 'offline' ? '#475569' : '#94a3b8';
+                    const presenceSymbol = online ? '●' : presence === 'offline' ? '○' : '◌';
+                    const presenceLabel = online
+                      ? trans('server.online', { defaultValue: 'Online' })
+                      : presence === 'offline'
+                        ? trans('server.offline', { defaultValue: 'Offline' })
+                        : trans('server.status_unknown', { defaultValue: 'Status unknown' });
                     return (
                       <button
                         key={s.id}
@@ -7989,8 +8076,13 @@ export function App() {
                           if (ownedServer) setServerCtxMenu({ server: ownedServer as ServerInfo, x: e.clientX, y: e.clientY });
                         }}
                       >
-                        <span class="server-item-dot" style={{ color: online ? '#4ade80' : '#475569' }}>
-                          {online ? '●' : '○'}
+                        <span
+                          class={`server-item-dot server-item-dot-${presence}`}
+                          style={{ color: presenceColor }}
+                          title={presenceLabel}
+                          aria-label={presenceLabel}
+                        >
+                          {presenceSymbol}
                         </span>
                         {pinnedServerIds.has(s.id) && (
                           <span

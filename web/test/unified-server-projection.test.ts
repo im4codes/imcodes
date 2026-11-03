@@ -466,6 +466,130 @@ describe('projectUnifiedServerList', () => {
     expect(item.online).toBe(true);
     expect(item.lastHeartbeatAt).toBe(now - 2_000);
   });
+
+  it('fresh online grant recovers an older offline visited snapshot', () => {
+    const now = Date.now();
+    const visited = {
+      id: 'audit-presence-server',
+      name: 'Presence Server',
+      status: 'offline',
+      lastHeartbeatAt: now - 120_000,
+    };
+    const grant: SharedEntrySummary = {
+      id: 'audit-presence-grant',
+      serverId: visited.id,
+      serverName: visited.name,
+      role: 'viewer',
+      status: 'active',
+      targetLabel: 'Presence Server',
+      target: { kind: 'server', serverId: visited.id },
+      serverStatus: 'online',
+      lastHeartbeatAt: now - 1_000,
+    };
+    const projected = projectUnifiedServerList([visited], [grant], new Set());
+    expect(projected[0].online, 'fresh authoritative recovery must not be latched offline by an older cached status').toBe(true);
+    expect(projected[0].presence).toBe('online');
+    expect(projected[0].status).toBe('online');
+    expect(projected[0].lastHeartbeatAt).toBe(now - 1_000);
+  });
+
+  it('legacy peer without heartbeat classifies distinctly as unknown rather than asserting offline', () => {
+    const grant: SharedEntrySummary = {
+      id: 'legacy-grant',
+      serverId: 'legacy-server',
+      serverName: 'Legacy Server',
+      role: 'viewer',
+      status: 'active',
+      targetLabel: 'Legacy Server',
+      target: { kind: 'server', serverId: 'legacy-server' },
+      serverStatus: null,
+      lastHeartbeatAt: null,
+    };
+    const projected = projectUnifiedServerList([], [grant], new Set());
+    expect(projected[0].presence).toBe('unknown');
+    expect(projected[0].online).toBe(false);
+  });
+
+  it('pod-pong touch on visited server does not promote to daemon presence over DB grant', () => {
+    const now = Date.now();
+    // Visited server received a WS pong touch (pod reachable), but daemon is dead (grant heartbeat expired)
+    const visitedPodPong = {
+      id: 'shared-pod-pong',
+      name: 'Pod Pong Server',
+      status: 'online',
+      lastHeartbeatAt: now - 500,
+      heartbeatSource: 'pod-pong',
+    };
+    const grant: SharedEntrySummary = {
+      id: 'grant-pod-pong',
+      serverId: visitedPodPong.id,
+      serverName: visitedPodPong.name,
+      role: 'viewer',
+      status: 'active',
+      targetLabel: 'Pod Pong Server',
+      target: { kind: 'server', serverId: visitedPodPong.id },
+      serverStatus: 'offline',
+      lastHeartbeatAt: now - 120_000,
+    };
+    const projected = projectUnifiedServerList([visitedPodPong], [grant], new Set());
+    expect(projected[0].online).toBe(false);
+    expect(projected[0].presence).toBe('offline');
+    expect(projected[0].status).toBe('offline');
+  });
+
+  it('newer offline event from visited daemon takes precedence over older grant heartbeat', () => {
+    const now = Date.now();
+    // Visited server just disconnected with MSG_DAEMON_OFFLINE at now - 500ms
+    const visitedOffline = {
+      id: 'recent-offline-server',
+      name: 'Recent Offline',
+      status: 'offline',
+      lastHeartbeatAt: now - 500,
+    };
+    // Active grant was fetched 10s ago when it was still online
+    const olderGrant: SharedEntrySummary = {
+      id: 'older-grant',
+      serverId: visitedOffline.id,
+      serverName: visitedOffline.name,
+      role: 'viewer',
+      status: 'active',
+      targetLabel: 'Recent Offline',
+      target: { kind: 'server', serverId: visitedOffline.id },
+      serverStatus: 'online',
+      lastHeartbeatAt: now - 10_000,
+    };
+    const projected = projectUnifiedServerList([visitedOffline], [olderGrant], new Set());
+    expect(projected[0].online).toBe(false);
+    expect(projected[0].presence).toBe('offline');
+    expect(projected[0].status).toBe('offline');
+  });
+
+  it('benchmark: 60-server projection completes 10,000 iterations in bounded time (<1000ms)', () => {
+    const servers = Array.from({ length: 30 }, (_, i) => ({
+      id: `dev-${i}`,
+      name: `Server-${i}`,
+      status: 'online',
+      lastHeartbeatAt: Date.now(),
+    }));
+    const grants: SharedEntrySummary[] = Array.from({ length: 30 }, (_, i) => ({
+      id: `grant-${i}`,
+      serverId: `shared-${i}`,
+      serverName: `Shared-${i}`,
+      role: 'viewer' as const,
+      status: 'active' as const,
+      target: { kind: 'server' as const, serverId: `shared-${i}` },
+      serverStatus: 'online',
+      lastHeartbeatAt: Date.now(),
+    }));
+    const owned = new Set(servers.map((s) => s.id));
+    const start = performance.now();
+    for (let i = 0; i < 10_000; i++) {
+      projectUnifiedServerList(servers, grants, owned, ['dev-0']);
+    }
+    const elapsed = performance.now() - start;
+    console.log(`[benchmark] 60-server projection 10000 iterations: ${elapsed.toFixed(2)}ms (${(elapsed / 10000).toFixed(4)}ms/iter)`);
+    expect(elapsed).toBeLessThan(1000);
+  });
 });
 
 describe('filterRestrictedSharedEntries', () => {

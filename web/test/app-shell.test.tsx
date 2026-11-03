@@ -118,10 +118,11 @@ function textComponent(name: string) {
   return () => name;
 }
 
+const auditStableT = vi.hoisted(() => (key: string) => key);
 vi.mock('react-i18next', () => ({
   initReactI18next: { type: '3rdParty', init: vi.fn() },
   useTranslation: () => ({
-    t: (key: string) => key,
+    t: auditStableT,
     i18n: { language: 'en', changeLanguage: vi.fn() },
   }),
 }));
@@ -7016,4 +7017,149 @@ describe('App shell', () => {
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
     }
   }, 20_000);
+
+  it('audit-presence: fresh online grant recovers an older offline visited snapshot', async () => {
+    const { projectUnifiedServerList } = await import('../src/unified-server-projection.js');
+    const now = Date.now();
+    const visited = { id: 'audit-presence-server', name: 'Presence Server', status: 'offline', lastHeartbeatAt: now - 120000 };
+    const grant = { id: 'audit-presence-grant', serverId: visited.id, serverName: visited.name, role: 'viewer', status: 'active', targetLabel: 'Presence Server', target: { kind: 'server', serverId: visited.id }, serverStatus: 'online', lastHeartbeatAt: now - 1000 } as const;
+    expect(projectUnifiedServerList([visited], [grant], new Set())[0].online, 'fresh authoritative recovery must not be latched offline by an older cached status').toBe(true);
+  });
+
+  it('audit-presence: an older poll cannot resurrect a grant removed by a later poll', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1'); localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const grant = { id: 'audit-poll-grant', serverId: 'audit-shared-server', serverName: 'Audit Poll Shared', targetLabel: 'Audit Poll Shared', role: 'viewer', status: 'active', target: { kind: 'server', serverId: 'audit-shared-server' }, serverStatus: 'online', lastHeartbeatAt: Date.now() } as const;
+    discoverSharedEntriesMock.mockResolvedValue([grant]);
+    const intervals = vi.spyOn(globalThis, 'setInterval');
+    const { App } = await importApp(); render(<App />);
+    await screen.findByText('Audit Poll Shared');
+    let resolveOld!: (entries: any[]) => void;
+    const oldPromise = new Promise<any[]>((resolve) => { resolveOld = resolve; });
+    discoverSharedEntriesMock.mockImplementationOnce(() => oldPromise).mockResolvedValue([]);
+    const refresh = intervals.mock.calls.find(([fn, ms]) => ms === 30000 && String(fn).includes('refreshSharedEntries'))?.[0] as () => void;
+    expect(refresh).toBeTruthy();
+    await act(async () => { refresh(); await Promise.resolve(); });
+    await act(async () => { refresh(); await Promise.resolve(); });
+    await waitFor(() => expect(screen.queryByText('Audit Poll Shared')).toBeNull());
+    await act(async () => { resolveOld([grant]); await oldPromise; await Promise.resolve(); });
+    expect(screen.queryByText('Audit Poll Shared'), 'late old active-grant response must not undo the newer revoke result').toBeNull();
+  }, 15000);
+
+  it('audit-presence: pending discovery from account A cannot populate account B', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1'); localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    let resolveOld!: (entries: any[]) => void;
+    const oldPromise = new Promise<any[]>((resolve) => { resolveOld = resolve; });
+    discoverSharedEntriesMock.mockImplementationOnce(() => oldPromise).mockResolvedValue([]);
+    const { App } = await importApp(); render(<App />);
+    await screen.findByTestId('session-pane-deck_alpha_brain');
+    fireEvent.click(screen.getByRole('button', { name: 'Log Out' }));
+    const login = await screen.findByRole('button', { name: 'login-page' });
+    loginState.userId = 'audit-user-B';
+    fetchMeMock.mockResolvedValue({ id: 'audit-user-B', is_admin: false });
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'audit-user-B' };
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] }; return {};
+    });
+    fireEvent.click(login);
+    await waitFor(() => expect(JSON.parse(localStorage.getItem('rcc_auth')!).userId).toBe('audit-user-B'));
+    await waitFor(() => expect(discoverSharedEntriesMock.mock.calls.length).toBeGreaterThanOrEqual(2));
+    const grant = { id: 'audit-A-private', serverId: 'audit-A-private-server', serverName: 'Account A Private Share', targetLabel: 'Account A Private Share', role: 'viewer', status: 'active', target: { kind: 'server', serverId: 'audit-A-private-server' } };
+    await act(async () => { resolveOld([grant]); await oldPromise; await Promise.resolve(); });
+    expect(screen.queryByText('Account A Private Share'), 'old account response must not leak its share name and navigation into the new account').toBeNull();
+  }, 15000);
+
+  it('audit-presence: transient discovery network failure preserves last known good shared entries', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1'); localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const grant = { id: 'audit-resilient-grant', serverId: 'audit-resilient-server', serverName: 'Audit Resilient Shared', targetLabel: 'Audit Resilient Shared', role: 'viewer', status: 'active', target: { kind: 'server', serverId: 'audit-resilient-server' }, serverStatus: 'online', lastHeartbeatAt: Date.now() } as const;
+    discoverSharedEntriesMock.mockResolvedValue([grant]);
+    const intervals = vi.spyOn(globalThis, 'setInterval');
+    const { App } = await importApp(); render(<App />);
+    await screen.findByText('Audit Resilient Shared');
+
+    // Subsequent background poll fails with network error
+    discoverSharedEntriesMock.mockRejectedValueOnce(new Error('network error'));
+    const refresh = intervals.mock.calls.find(([fn, ms]) => ms === 30000 && String(fn).includes('refreshSharedEntries'))?.[0] as () => void;
+    expect(refresh).toBeTruthy();
+    await act(async () => { refresh(); await Promise.resolve(); });
+
+    // Server must still be present and not wiped to empty
+    expect(screen.queryByText('Audit Resilient Shared')).toBeTruthy();
+  }, 15000);
+
+  it('audit-presence: mobile server menu toolbar binds real callbacks and respects native platform gating', async () => {
+    const originalUserAgent = navigator.userAgent;
+    const originalInnerWidth = window.innerWidth;
+    try {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)' });
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: 375 });
+
+      // 1. Non-native web mode: Switch Cloud Server is suppressed, Home and AI Desk function
+      nativeState.value = false;
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      const view = render(<App />);
+
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+      const mobileBtn = view.container.querySelector('.mobile-server-btn');
+      expect(mobileBtn).toBeTruthy();
+      fireEvent.click(mobileBtn!);
+
+      // Menu is open
+      expect(view.container.querySelector('.mobile-server-menu')).toBeTruthy();
+      expect(view.container.querySelector('.mobile-server-menu-home')).toBeTruthy();
+      expect(view.container.querySelector('.mobile-server-menu-change')).toBeNull(); // suppressed in non-native
+      const aiDeskBtn = view.container.querySelector('.mobile-server-menu-controlled-nodes');
+      expect(aiDeskBtn).toBeTruthy();
+
+      // Tap AI Desk closes menu and opens controlled nodes floating panel
+      fireEvent.click(aiDeskBtn!);
+      expect(view.container.querySelector('.mobile-server-menu')).toBeNull();
+      expect(await screen.findByTestId('floating-panel-controlled-nodes')).toBeTruthy();
+
+      // Open menu again, test Home button closes menu and navigates to dashboard
+      fireEvent.click(mobileBtn!);
+      expect(view.container.querySelector('.mobile-server-menu')).toBeTruthy();
+      const homeBtn = view.container.querySelector('.mobile-server-menu-home');
+      expect(homeBtn).toBeTruthy();
+      fireEvent.click(homeBtn!);
+      expect(view.container.querySelector('.mobile-server-menu')).toBeNull();
+      expect(localStorage.getItem('rcc_server')).toBeNull(); // cleared by handleBackToDashboard
+
+      cleanup();
+
+      // 2. Native mode: Switch Cloud Server is present and executes real credential/picker reset
+      nativeState.value = true;
+      getServerUrlMock.mockResolvedValue('http://localhost');
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const nativeView = render(<App />);
+      await waitFor(() => expect(nativeView.container.querySelector('.mobile-server-btn')).toBeTruthy());
+      const nativeMobileBtn = nativeView.container.querySelector('.mobile-server-btn');
+      fireEvent.click(nativeMobileBtn!);
+
+      expect(nativeView.container.querySelector('.mobile-server-menu')).toBeTruthy();
+      const changeServerBtn = nativeView.container.querySelector('.mobile-server-menu-change');
+      expect(changeServerBtn).toBeTruthy();
+
+      // Tap Switch Cloud Server closes menu and triggers change server
+      fireEvent.click(changeServerBtn!);
+      expect(nativeView.container.querySelector('.mobile-server-menu')).toBeNull();
+      await waitFor(() => expect(clearServerUrlMock).toHaveBeenCalled());
+    } finally {
+      nativeState.value = false;
+      getServerUrlMock.mockResolvedValue(null);
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalInnerWidth });
+    }
+  }, 20000);
 });

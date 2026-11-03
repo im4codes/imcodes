@@ -283,6 +283,7 @@ describe('Chromium responsive layout and interaction verification', () => {
           import { useState } from 'preact/hooks';
           import { ServerIconBar } from './src/components/ServerIconBar.js';
           import { MobileServerMenu } from './src/components/MobileServerMenu.js';
+          import { MobileServerMenuToolbar } from './src/components/MobileServerMenuToolbar.js';
           import { MobileSharedEntriesMenu } from './src/components/MobileSharedEntriesMenu.js';
           import { SharedEntriesPanel } from './src/components/SharedEntriesPanel.js';
           import { SharedStateIndicator } from './src/components/SharedStateIndicator.js';
@@ -329,7 +330,7 @@ describe('Chromium responsive layout and interaction verification', () => {
             );
           }
 
-          export function MobileNavApp({ servers, sharedGrants, restrictedGrants }) {
+          export function MobileNavApp({ servers, sharedGrants, restrictedGrants, isNative }) {
             const [activeServerId, setActiveServerId] = useState('dev-0');
             const [lang, setLang] = useState('English');
             const [serverCtxMenu, setServerCtxMenu] = useState(null);
@@ -356,52 +357,46 @@ describe('Chromium responsive layout and interaction verification', () => {
                       }
                     }, lang)
                   },
-                    h('div', { class: 'mobile-server-menu-top-row' },
-                      h('button', {
-                        id: 'mobile-home-btn',
-                        class: 'mobile-server-menu-item mobile-server-menu-home',
-                        onClick: () => log('click-home', null)
-                      }, '← Home'),
-                      h('button', {
-                        id: 'mobile-change-btn',
-                        class: 'mobile-server-menu-item mobile-server-menu-change',
-                        onClick: () => log('click-change-server', null)
-                      }, '⇄ Switch Cloud Server')
-                    ),
-                    h('button', {
-                      id: 'mobile-ai-desk-btn',
-                      class: 'mobile-server-menu-item mobile-server-menu-controlled-nodes',
-                      onClick: () => log('click-ai-desk', null)
-                    }, '🖥 AI Desk'),
-                    unified.map(s => h('button', {
-                      key: s.id,
-                      'data-server-id': s.id,
-                      'data-shared-in': s.isSharedIn ? 'true' : 'false',
-                      class: 'mobile-server-menu-item mobile-server-menu-server' + (s.id === activeServerId ? ' active' : '') + (s.isSharedIn ? ' mobile-shared-in' : ''),
-                      onClick: () => {
-                        if (s.isSharedIn) {
-                          if (s.sharedEntry) log('open-shared-entry', s.sharedEntry);
-                          return;
+                    h(MobileServerMenuToolbar, {
+                      onHome: () => log('click-home', null),
+                      onChangeServer: () => log('click-change-server', null),
+                      onOpenControlledNodes: () => log('click-ai-desk', null),
+                      isNativeApp: typeof isNative === 'boolean' ? isNative : true,
+                    }),
+                    unified.map(s => {
+                      const presence = s.presence || (s.online ? 'online' : 'offline');
+                      const color = presence === 'online' ? '#4ade80' : presence === 'offline' ? '#475569' : '#94a3b8';
+                      const symbol = presence === 'online' ? '●' : presence === 'offline' ? '○' : '◌';
+                      return h('button', {
+                        key: s.id,
+                        'data-server-id': s.id,
+                        'data-shared-in': s.isSharedIn ? 'true' : 'false',
+                        class: 'mobile-server-menu-item mobile-server-menu-server' + (s.id === activeServerId ? ' active' : '') + (s.isSharedIn ? ' mobile-shared-in' : ''),
+                        onClick: () => {
+                          if (s.isSharedIn) {
+                            if (s.sharedEntry) log('open-shared-entry', s.sharedEntry);
+                            return;
+                          }
+                          setActiveServerId(s.id);
+                          log('select-server', { id: s.id, name: s.name });
+                        },
+                        onContextMenu: s.isSharedIn ? (e) => {
+                          e.preventDefault();
+                          log('suppressed-shared-contextmenu', s.id);
+                        } : (e) => {
+                          e.preventDefault();
+                          const ownedServer = s.server || servers.find(srv => srv.id === s.id && ownedIds.has(srv.id));
+                          if (ownedServer) {
+                            setServerCtxMenu(ownedServer);
+                            log('open-owned-contextmenu', s.id);
+                          }
                         }
-                        setActiveServerId(s.id);
-                        log('select-server', { id: s.id, name: s.name });
                       },
-                      onContextMenu: s.isSharedIn ? (e) => {
-                        e.preventDefault();
-                        log('suppressed-shared-contextmenu', s.id);
-                      } : (e) => {
-                        e.preventDefault();
-                        const ownedServer = s.server || servers.find(srv => srv.id === s.id && ownedIds.has(srv.id));
-                        if (ownedServer) {
-                          setServerCtxMenu(ownedServer);
-                          log('open-owned-contextmenu', s.id);
-                        }
-                      }
-                    },
-                      h('span', { style: { color: s.online ? '#4ade80' : '#475569' } }, s.online ? '●' : '○'),
-                      h('span', { class: 'mobile-server-menu-name' }, s.name),
-                      s.isSharedIn && h(SharedStateIndicator, { variant: 'shared-in', iconOnly: true })
-                    )),
+                        h('span', { class: 'mobile-server-menu-dot mobile-server-menu-dot-' + presence, style: { color: color } }, symbol),
+                        h('span', { class: 'mobile-server-menu-name' }, s.name),
+                        s.isSharedIn && h(SharedStateIndicator, { variant: 'shared-in', iconOnly: true })
+                      );
+                    }),
                     restricted.length > 0 && h(MobileSharedEntriesMenu, {
                       entries: restricted,
                       onOpen: (entry) => log('open-restricted-shared', entry),
@@ -468,10 +463,14 @@ describe('Chromium responsive layout and interaction verification', () => {
         if (vp.mode === 'mobile') {
           await page.setContent(
             `<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${css}</style></head><body><div id="root"></div><script>${clientBundle}</script><script>
+              window.__servers = ${JSON.stringify(ownedList)};
+              window.__sharedGrants = ${JSON.stringify(sharedGrants)};
+              window.__restrictedGrants = ${JSON.stringify(restrictedGrants)};
               window.mountMobileNav({
-                servers: ${JSON.stringify(ownedList)},
-                sharedGrants: ${JSON.stringify(sharedGrants)},
-                restrictedGrants: ${JSON.stringify(restrictedGrants)}
+                servers: window.__servers,
+                sharedGrants: window.__sharedGrants,
+                restrictedGrants: window.__restrictedGrants,
+                isNative: true,
               });
             </script></body></html>`,
           );
@@ -506,9 +505,9 @@ describe('Chromium responsive layout and interaction verification', () => {
           expect(footerBox!.y + footerBox!.height).toBeLessThanOrEqual(vp.height);
 
           // Top row layout: Home on left, Switch Cloud Server on right
-          const homeBox = await page.locator('#mobile-home-btn').boundingBox();
-          const changeBox = await page.locator('#mobile-change-btn').boundingBox();
-          const aiDeskBox = await page.locator('#mobile-ai-desk-btn').boundingBox();
+          const homeBox = await page.locator('.mobile-server-menu-home').boundingBox();
+          const changeBox = await page.locator('.mobile-server-menu-change').boundingBox();
+          const aiDeskBox = await page.locator('.mobile-server-menu-controlled-nodes').boundingBox();
           expect(homeBox).not.toBeNull();
           expect(changeBox).not.toBeNull();
           expect(aiDeskBox).not.toBeNull();
@@ -520,9 +519,31 @@ describe('Chromium responsive layout and interaction verification', () => {
           expect(aiDeskBox!.y).toBeGreaterThanOrEqual(homeBox!.y + homeBox!.height - 2);
 
           // Taps on Home, Switch Cloud Server, AI Desk
-          await page.locator('#mobile-home-btn').tap({ timeout: 2000 });
-          await page.locator('#mobile-change-btn').tap({ timeout: 2000 });
-          await page.locator('#mobile-ai-desk-btn').tap({ timeout: 2000 });
+          await page.locator('.mobile-server-menu-home').tap({ timeout: 2000 });
+          await page.locator('.mobile-server-menu-change').tap({ timeout: 2000 });
+          await page.locator('.mobile-server-menu-controlled-nodes').tap({ timeout: 2000 });
+
+          // Non-native check: switch cloud server is suppressed
+          await page.evaluate(() => {
+            (window as any).mountMobileNav({
+              servers: (window as any).__servers,
+              sharedGrants: (window as any).__sharedGrants,
+              restrictedGrants: (window as any).__restrictedGrants,
+              isNative: false,
+            });
+          });
+          expect(await page.locator('.mobile-server-menu-change').count()).toBe(0);
+          expect(await page.locator('.mobile-server-menu-home').count()).toBe(1);
+          expect(await page.locator('.mobile-server-menu-controlled-nodes').count()).toBe(1);
+          // Restore native mode for remaining interactions
+          await page.evaluate(() => {
+            (window as any).mountMobileNav({
+              servers: (window as any).__servers,
+              sharedGrants: (window as any).__sharedGrants,
+              restrictedGrants: (window as any).__restrictedGrants,
+              isNative: true,
+            });
+          });
 
           // 4. Perform genuine vertical scrolling inside the container
           await page.locator('.mobile-server-menu-body').evaluate((el) => { el.scrollTop = 300; });
