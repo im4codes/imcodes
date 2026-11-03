@@ -33,6 +33,34 @@ export type ShareTargetInput =
       subSessionDisplayName?: string;
     };
 
+export type SharedPresenceState = 'online' | 'offline' | 'unknown';
+
+export interface SharedPresencePayload {
+  status?: string | null;
+  lastHeartbeatAt?: number | null;
+  statusObservedAt?: number | null;
+  source?: 'grant' | 'daemon' | 'pod-pong' | 'fallback';
+}
+
+/**
+ * Authoritative presence classifier for shared and inventory servers.
+ * - Explicit 'offline' status -> 'offline'
+ * - Missing or invalid heartbeat -> 'unknown'
+ * - Heartbeat within 60s freshness window -> 'online'
+ * - Heartbeat older than 60s -> 'offline'
+ */
+export function classifyServerPresence(
+  server: { status?: string | null; lastHeartbeatAt?: number | null; heartbeatSource?: string | null } | null | undefined,
+  now = Date.now(),
+): SharedPresenceState {
+  if (!server) return 'unknown';
+  if (server.status === 'offline') return 'offline';
+  if (typeof server.lastHeartbeatAt !== 'number' || !Number.isFinite(server.lastHeartbeatAt) || server.lastHeartbeatAt <= 0) {
+    return 'unknown';
+  }
+  return (now - server.lastHeartbeatAt < 60_000) ? 'online' : 'offline';
+}
+
 export interface ShareAuthorizationSnapshot {
   target: ShareTarget;
   effectiveRole: ShareRole;

@@ -1075,6 +1075,7 @@
     "devices": "裝置",
     "online": "在線",
     "offline": "離線",
+    "status_unknown": "狀態未知",
     "added_on": "新增於 {{date}}",
     "list_empty": "尚無裝置，可使用以下命令新增：",
     "delete_error": "刪除伺服器失敗：{{error}}",
@@ -1125,6 +1126,10 @@
     "daemon_auto_upgrade_reason_toolchain_unavailable": "daemon 主機缺少 Node",
     "daemon_auto_upgrade_reason_unknown": "daemon 暫時無法升級",
     "daemon_offline": "Daemon 離線"
+  },
+  "mobile_menu": {
+    "home": "← 首頁",
+    "change_server": "⇄ 切換雲端伺服器"
   },
   "quick_input": {
     "title": "快速輸入",

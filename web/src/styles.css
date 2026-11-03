@@ -3452,8 +3452,10 @@ html.native-ios-mac .chat-dl-btn {
 .mobile-server-menu-server.pinned { position: relative; color: #d1fae5; background: linear-gradient(110deg, rgb(34 197 94 / 12%), rgb(34 211 238 / 5%) 58%, transparent); box-shadow: inset 2px 0 0 rgb(74 222 128 / 76%), inset 0 0 14px rgb(34 211 238 / 6%); }
 .mobile-server-menu-server.pinned::after { content: ''; position: absolute; left: 14px; right: 14px; bottom: 0; height: 1px; background: linear-gradient(90deg, rgb(74 222 128 / 72%), rgb(34 211 238 / 42%), transparent); pointer-events: none; }
 .mobile-server-menu-server.pinned.active { color: #ecfdf5; background: linear-gradient(110deg, rgb(34 197 94 / 18%), rgb(34 211 238 / 8%) 58%, transparent); }
-.mobile-server-menu-controlled-nodes { color: #67e8f9; border-top: 1px solid #334155; border-bottom: 1px solid #334155; }
-.mobile-server-menu-change { color: #f59e0b !important; border-top: 1px solid #334155; }
+.mobile-server-menu-top-row { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; width: 100%; min-width: 0; border-bottom: 1px solid #334155; }
+.mobile-server-menu-home { flex: 0 0 auto; width: auto; border: none; white-space: nowrap; }
+.mobile-server-menu-change { flex: 1 1 auto; min-width: 0; width: auto; margin-left: auto; color: #f59e0b !important; border: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: right; }
+.mobile-server-menu-controlled-nodes { color: #67e8f9; border-top: none; border-bottom: 1px solid #334155; }
 .mobile-server-menu-body { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); grid-auto-rows: max-content; align-content: start; flex: 1 1 auto; min-height: 0; overflow-x: hidden; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: rgba(125, 211, 252, 0.28) transparent; }
 .mobile-server-menu-language { flex: 0 0 auto; min-width: 0; padding: 10px 12px; border-top: 1px solid #334155; background: #1e293b; }
 .controls-task-pair-title { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; color: #e2e8f0; }

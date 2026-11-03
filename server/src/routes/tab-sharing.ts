@@ -108,9 +108,11 @@ function fallbackTargetLabel(share: Awaited<ReturnType<typeof listActiveSharesFo
 async function recipientShareEntry(db: Env['DB'], share: Awaited<ReturnType<typeof listActiveSharesForUser>>[number]) {
   let serverName: string | null = null;
   let targetLabel: string | null = null;
+  let serverStatus: string | null = null;
+  let lastHeartbeatAt: number | null = null;
   if (share.target.kind === 'server') {
-    const row = await db.queryOne<{ name: string; node_role: string | null }>(
-      'SELECT name, node_role FROM servers WHERE id = $1',
+    const row = await db.queryOne<{ name: string; node_role: string | null; status: string | null; last_heartbeat_at: number | null }>(
+      'SELECT name, node_role, status, last_heartbeat_at FROM servers WHERE id = $1',
       [share.serverId],
     );
     // A controlled server uses the same FK-backed grant store, but is consumed
@@ -118,9 +120,11 @@ async function recipientShareEntry(db: Env['DB'], share: Awaited<ReturnType<type
     if (row?.node_role === NODE_ROLE.CONTROLLED) return null;
     serverName = row?.name ?? null;
     targetLabel = row?.name ?? null;
+    serverStatus = row?.status ?? null;
+    lastHeartbeatAt = row?.last_heartbeat_at ?? null;
   } else if (share.target.kind === 'main') {
-    const row = await db.queryOne<{ server_name: string; label: string | null; project_name: string | null }>(
-      `SELECT sv.name AS server_name, s.label, s.project_name
+    const row = await db.queryOne<{ server_name: string; label: string | null; project_name: string | null; status: string | null; last_heartbeat_at: number | null }>(
+      `SELECT sv.name AS server_name, s.label, s.project_name, sv.status, sv.last_heartbeat_at
          FROM sessions s
          JOIN servers sv ON sv.id = s.server_id
         WHERE s.server_id = $1 AND s.name = $2`,
@@ -128,9 +132,11 @@ async function recipientShareEntry(db: Env['DB'], share: Awaited<ReturnType<type
     );
     serverName = row?.server_name ?? null;
     targetLabel = row?.label?.trim() || row?.project_name?.trim() || null;
+    serverStatus = row?.status ?? null;
+    lastHeartbeatAt = row?.last_heartbeat_at ?? null;
   } else {
-    const row = await db.queryOne<{ server_name: string; label: string | null; type: string | null }>(
-      `SELECT sv.name AS server_name, ss.label, ss.type
+    const row = await db.queryOne<{ server_name: string; label: string | null; type: string | null; status: string | null; last_heartbeat_at: number | null }>(
+      `SELECT sv.name AS server_name, ss.label, ss.type, sv.status, sv.last_heartbeat_at
          FROM sub_sessions ss
          JOIN servers sv ON sv.id = ss.server_id
         WHERE ss.server_id = $1 AND ss.id = $2`,
@@ -138,6 +144,8 @@ async function recipientShareEntry(db: Env['DB'], share: Awaited<ReturnType<type
     );
     serverName = row?.server_name ?? null;
     targetLabel = row?.label?.trim() || row?.type?.trim() || null;
+    serverStatus = row?.status ?? null;
+    lastHeartbeatAt = row?.last_heartbeat_at ?? null;
   }
   return {
     id: share.id,
@@ -152,6 +160,8 @@ async function recipientShareEntry(db: Env['DB'], share: Awaited<ReturnType<type
     targetLabel: targetLabel ?? fallbackTargetLabel(share),
     historyCutoffAt: 0,
     expiresAt: share.expiresAt,
+    serverStatus: serverStatus ?? null,
+    lastHeartbeatAt: lastHeartbeatAt ?? null,
   };
 }
 

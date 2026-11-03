@@ -1,12 +1,21 @@
 import type { SharedEntrySummary } from './api.js';
-import { isServerOnline, type OnlineServerInfo } from './server-selection.js';
+import type { OnlineServerInfo } from './server-selection.js';
 import { sortServersByPreference, type ServerOrderEntry } from './server-order.js';
+import {
+  classifyServerPresence,
+  type SharedPresenceState,
+  type SharedPresencePayload,
+} from '@shared/tab-sharing.js';
+
+export type { SharedPresenceState, SharedPresencePayload };
+export { classifyServerPresence };
 
 export interface UnifiedServerItem extends ServerOrderEntry {
   id: string;
   name: string;
   status: string;
   lastHeartbeatAt: number | null;
+  statusObservedAt?: number | null;
   daemonVersion?: string | null;
   latestDaemonVersion?: string | null;
   createdAt?: number;
@@ -14,6 +23,116 @@ export interface UnifiedServerItem extends ServerOrderEntry {
   sharedEntry?: SharedEntrySummary;
   server?: OnlineServerInfo;
   online: boolean;
+  presence: SharedPresenceState;
+}
+
+export interface ServerPresenceObservation {
+  status: string;
+  lastHeartbeatAt: number | null;
+  statusObservedAt?: number | null;
+  source: 'grant' | 'daemon' | 'pod-pong' | 'fallback';
+}
+
+/**
+ * Coherently select the authoritative presence observation between a cached visited server
+ * snapshot and an active shared grant.
+ *
+ * Rules:
+ * 1. Status and heartbeat are kept TOGETHER as a coherent observation, never mixing
+ *    an offline status from one source with a heartbeat timestamp from another.
+ * 2. An authoritative DB grant presence wins over an older cached offline snapshot when
+ *    grantObservedAt > serverObservedAt, permitting fresh recovery.
+ * 3. WS pod-pong pings on visited servers are NOT daemon liveness and must not override
+ *    authoritative DB grant presence.
+ * 4. Genuine daemon disconnection / offline events from the visited session take
+ *    precedence if their statusObservedAt is equal or newer than the grant's observation.
+ * 5. If neither source carries a verified numeric heartbeat, the status falls back safely
+ *    and classifies as 'unknown' rather than asserting offline.
+ */
+export function resolveCoherentPresenceObservation(
+  server: OnlineServerInfo | null | undefined,
+  grant: SharedEntrySummary | null | undefined,
+): ServerPresenceObservation {
+  const grantHeartbeat = typeof grant?.lastHeartbeatAt === 'number' && Number.isFinite(grant.lastHeartbeatAt) && grant.lastHeartbeatAt > 0
+    ? grant.lastHeartbeatAt
+    : null;
+  const grantStatus = grant?.serverStatus ?? 'active';
+
+  const serverHeartbeat = typeof server?.lastHeartbeatAt === 'number' && Number.isFinite(server.lastHeartbeatAt) && server.lastHeartbeatAt > 0
+    ? server.lastHeartbeatAt
+    : null;
+  const serverStatus = server?.status ?? 'active';
+  const serverIsPodPong = (server as { heartbeatSource?: string })?.heartbeatSource === 'pod-pong';
+
+  const serverObservedAt = typeof (server as any)?.statusObservedAt === 'number' && Number.isFinite((server as any).statusObservedAt)
+    ? (server as any).statusObservedAt as number
+    : (serverHeartbeat ?? 0);
+  const grantObservedAt = typeof (grant as any)?.statusObservedAt === 'number' && Number.isFinite((grant as any).statusObservedAt)
+    ? (grant as any).statusObservedAt as number
+    : (grantHeartbeat ?? 0);
+
+  // 1. Visited server has a genuine offline event that has NOT been superseded by a strictly newer grant
+  if (serverStatus === 'offline' && !serverIsPodPong) {
+    if (grantHeartbeat === null || serverObservedAt >= grantObservedAt) {
+      return {
+        status: 'offline',
+        lastHeartbeatAt: serverHeartbeat ?? grantHeartbeat,
+        statusObservedAt: serverObservedAt,
+        source: 'daemon',
+      };
+    }
+    // grantObservedAt > serverObservedAt: a fresh authoritative grant arrived AFTER the offline event!
+    return {
+      status: grantStatus,
+      lastHeartbeatAt: grantHeartbeat,
+      statusObservedAt: grantObservedAt,
+      source: 'grant',
+    };
+  }
+
+  // 2. Grant carries authoritative heartbeat from DB
+  if (grantHeartbeat !== null) {
+    if (serverIsPodPong || serverHeartbeat === null || grantHeartbeat > serverHeartbeat || (grantHeartbeat === serverHeartbeat && grantObservedAt >= serverObservedAt)) {
+      return {
+        status: grantStatus,
+        lastHeartbeatAt: grantHeartbeat,
+        statusObservedAt: grantObservedAt,
+        source: 'grant',
+      };
+    }
+    // Visited server has a newer genuine daemon event
+    return {
+      status: serverStatus,
+      lastHeartbeatAt: serverHeartbeat,
+      statusObservedAt: serverObservedAt,
+      source: 'daemon',
+    };
+  }
+
+  // 3. Grant has no heartbeat, but visited server has genuine daemon heartbeat
+  if (serverHeartbeat !== null && !serverIsPodPong) {
+    return {
+      status: serverStatus,
+      lastHeartbeatAt: serverHeartbeat,
+      statusObservedAt: serverObservedAt,
+      source: 'daemon',
+    };
+  }
+
+  // 4. Neither carries an authoritative heartbeat (legacy peer or missing presence)
+  return {
+    status: grant?.serverStatus ?? server?.status ?? 'active',
+    lastHeartbeatAt: null,
+    statusObservedAt: null,
+    source: 'fallback',
+  };
+}
+
+export function getServerPresence(
+  server: { status?: string | null; lastHeartbeatAt?: number | null; presence?: SharedPresenceState; heartbeatSource?: string | null } | null | undefined,
+  now = Date.now(),
+): SharedPresenceState {
+  return classifyServerPresence(server, now);
 }
 
 function compareGrants(a: SharedEntrySummary, b: SharedEntrySummary): number {
@@ -29,7 +148,7 @@ function compareGrants(a: SharedEntrySummary, b: SharedEntrySummary): number {
  * Project a unified server list combining owned/opened servers with active whole-server shared entries.
  * Deduplicates by serverId: owned servers take precedence and never downgrade ownership.
  * Non-owned servers in inventory retain their active shared grant to preserve scoped navigation proof.
- * Discovered whole-server shared entries without prior verified heartbeat default to online: false.
+ * Shared entries without prior verified heartbeat classify distinctly as presence: 'unknown'.
  */
 export function projectUnifiedServerList<T extends OnlineServerInfo>(
   servers: readonly T[],
@@ -37,6 +156,7 @@ export function projectUnifiedServerList<T extends OnlineServerInfo>(
   ownedServerIds: ReadonlySet<string>,
   serverOrder: readonly string[] = [],
   serverPinned: readonly string[] = [],
+  now = Date.now(),
 ): UnifiedServerItem[] {
   // 1. Group active grants by serverId
   const activeGrants = sharedEntries.filter((entry) => entry.status === 'active');
@@ -64,18 +184,21 @@ export function projectUnifiedServerList<T extends OnlineServerInfo>(
     const isOwned = ownedServerIds.has(server.id);
     if (isOwned) {
       seenServerIds.add(server.id);
+      const presence = classifyServerPresence(server, now);
       unifiedItems.push({
         id: server.id,
         name: server.name,
         status: server.status,
         lastHeartbeatAt: server.lastHeartbeatAt,
+        statusObservedAt: (server as { statusObservedAt?: number | null }).statusObservedAt,
         daemonVersion: (server as { daemonVersion?: string | null }).daemonVersion,
         latestDaemonVersion: (server as { latestDaemonVersion?: string | null }).latestDaemonVersion,
         createdAt: server.createdAt,
         isSharedIn: false,
         sharedEntry: undefined,
         server,
-        online: isServerOnline(server),
+        presence,
+        online: presence === 'online',
       });
     } else {
       // Non-owned server in inventory: only project if an active grant exists,
@@ -86,17 +209,29 @@ export function projectUnifiedServerList<T extends OnlineServerInfo>(
         const displayName = (grant.target.kind === 'server' && grant.targetLabel && grant.targetLabel.trim())
           ? grant.targetLabel.trim()
           : (server.name || grant.serverName);
+
+        const observation = resolveCoherentPresenceObservation(server, grant);
+        const presence = classifyServerPresence(observation, now);
+
         unifiedItems.push({
           id: server.id,
           name: displayName,
-          status: server.status,
-          lastHeartbeatAt: server.lastHeartbeatAt,
+          status: observation.status,
+          lastHeartbeatAt: observation.lastHeartbeatAt,
+          statusObservedAt: observation.statusObservedAt,
           daemonVersion: (server as { daemonVersion?: string | null }).daemonVersion,
           latestDaemonVersion: (server as { latestDaemonVersion?: string | null }).latestDaemonVersion,
           createdAt: server.createdAt,
           isSharedIn: true,
           sharedEntry: grant,
-          online: isServerOnline(server),
+          server: {
+            ...server,
+            status: observation.status,
+            lastHeartbeatAt: observation.lastHeartbeatAt,
+            statusObservedAt: observation.statusObservedAt,
+          },
+          presence,
+          online: presence === 'online',
         });
       }
     }
@@ -111,14 +246,20 @@ export function projectUnifiedServerList<T extends OnlineServerInfo>(
     const displayName = (grant.targetLabel && grant.targetLabel.trim())
       ? grant.targetLabel.trim()
       : grant.serverName;
+
+    const observation = resolveCoherentPresenceObservation(null, grant);
+    const presence = classifyServerPresence(observation, now);
+
     unifiedItems.push({
       id: grant.serverId,
       name: displayName,
-      status: 'active',
-      lastHeartbeatAt: null,
+      status: observation.status,
+      lastHeartbeatAt: observation.lastHeartbeatAt,
+      statusObservedAt: observation.statusObservedAt,
       isSharedIn: true,
       sharedEntry: grant,
-      online: false, // Unknown heartbeat, do not fake green dot
+      presence,
+      online: presence === 'online',
     });
   }
 

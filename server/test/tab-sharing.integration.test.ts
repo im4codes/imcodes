@@ -528,6 +528,58 @@ describe('tab sharing APIs', () => {
     })]));
   });
 
+  it('includes authoritative serverStatus and lastHeartbeatAt presence in share discovery for server, main, and subsession targets', async () => {
+    const app = makeApp();
+    const { ownerId, recipientId, serverId, sessionName, subSessionId } = await seedShareTarget();
+    await createOrUpdateShare(db, {
+      id: id('share-server'),
+      target: { kind: 'server', serverId },
+      targetUserId: recipientId,
+      role: 'viewer',
+      createdBy: ownerId,
+      now: 5_000,
+    });
+    await createOrUpdateShare(db, {
+      id: id('share-main'),
+      target: { kind: 'main', serverId, sessionName },
+      targetUserId: recipientId,
+      role: 'viewer',
+      createdBy: ownerId,
+      now: 5_000,
+    });
+    await createOrUpdateShare(db, {
+      id: id('share-subsession'),
+      target: { kind: 'subsession', serverId, subSessionId },
+      targetUserId: recipientId,
+      role: 'viewer',
+      createdBy: ownerId,
+      now: 5_000,
+    });
+
+    // Initial state: server has status 'offline' and null heartbeat
+    let discover = await app.request('/api/shares', { headers: authHeaders(recipientId) });
+    expect(discover.status).toBe(200);
+    let body = await discover.json() as { shares: Array<{ id: string; target: { kind: string }; serverStatus: string | null; lastHeartbeatAt: number | null }> };
+    expect(body.shares).toHaveLength(3);
+    for (const share of body.shares) {
+      expect(share.serverStatus).toBe('offline');
+      expect(share.lastHeartbeatAt).toBeNull();
+    }
+
+    // Server daemon reports active heartbeat
+    const heartbeatTimestamp = Date.now();
+    await db.execute('UPDATE servers SET status = $1, last_heartbeat_at = $2 WHERE id = $3', ['online', heartbeatTimestamp, serverId]);
+
+    discover = await app.request('/api/shares', { headers: authHeaders(recipientId) });
+    expect(discover.status).toBe(200);
+    body = await discover.json() as { shares: Array<{ id: string; target: { kind: string }; serverStatus: string | null; lastHeartbeatAt: number | null }> };
+    expect(body.shares).toHaveLength(3);
+    for (const share of body.shares) {
+      expect(share.serverStatus).toBe('online');
+      expect(share.lastHeartbeatAt).toBe(heartbeatTimestamp);
+    }
+  });
+
   it('opens a shared sub-session with its parent main session for tree rendering', async () => {
     const app = makeApp();
     const { ownerId, recipientId, serverId, sessionName, subSessionId } = await seedShareTarget();

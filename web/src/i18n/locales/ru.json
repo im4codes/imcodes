@@ -1075,6 +1075,7 @@
     "devices": "Устройства",
     "online": "В сети",
     "offline": "Не в сети",
+    "status_unknown": "Статус неизвестен",
     "added_on": "Добавлено {{date}}",
     "list_empty": "Устройств пока нет. Добавьте с помощью",
     "delete_error": "Не удалось удалить сервер: {{error}}",
@@ -1125,6 +1126,10 @@
     "daemon_auto_upgrade_reason_toolchain_unavailable": "на хосте daemon отсутствует Node",
     "daemon_auto_upgrade_reason_unknown": "daemon пока не может обновиться",
     "daemon_offline": "Daemon отключён"
+  },
+  "mobile_menu": {
+    "home": "← Главная",
+    "change_server": "⇄ Сменить облачный сервер"
   },
   "quick_input": {
     "title": "Быстрый ввод",

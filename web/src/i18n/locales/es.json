@@ -1075,6 +1075,7 @@
     "devices": "Dispositivos",
     "online": "En línea",
     "offline": "Sin conexión",
+    "status_unknown": "Estado desconocido",
     "added_on": "Añadido {{date}}",
     "list_empty": "Aún no hay dispositivos. Añade uno con",
     "delete_error": "No se pudo eliminar el servidor: {{error}}",
@@ -1125,6 +1126,10 @@
     "daemon_auto_upgrade_reason_toolchain_unavailable": "falta Node en el host del daemon",
     "daemon_auto_upgrade_reason_unknown": "el daemon no puede actualizarse por ahora",
     "daemon_offline": "Daemon desconectado"
+  },
+  "mobile_menu": {
+    "home": "← Inicio",
+    "change_server": "⇄ Cambiar servidor en la nube"
   },
   "quick_input": {
     "title": "Entrada rápida",

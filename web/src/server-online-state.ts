@@ -2,22 +2,23 @@ type ServerLike = {
   id: string;
   status: string;
   lastHeartbeatAt: number | null;
+  statusObservedAt?: number | null;
 };
 
 export function markServerLive<T extends ServerLike>(servers: T[], serverId: string | null | undefined, now = Date.now()): T[] {
   if (!serverId) return servers;
   return servers.map((server) => (
     server.id === serverId
-      ? { ...server, status: 'online', lastHeartbeatAt: now }
+      ? { ...server, status: 'online', lastHeartbeatAt: now, statusObservedAt: now }
       : server
   ));
 }
 
-export function markServerOffline<T extends ServerLike>(servers: T[], serverId: string | null | undefined): T[] {
+export function markServerOffline<T extends ServerLike>(servers: T[], serverId: string | null | undefined, now = Date.now()): T[] {
   if (!serverId) return servers;
   return servers.map((server) => (
     server.id === serverId
-      ? { ...server, status: 'offline' }
+      ? { ...server, status: 'offline', statusObservedAt: now }
       : server
   ));
 }

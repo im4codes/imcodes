@@ -1091,6 +1091,9 @@ export interface SharedEntrySummary {
   status: 'active' | 'revoked' | 'expired' | 'target-unavailable';
   target: ShareTarget;
   targetLabel: string;
+  serverStatus?: string | null;
+  lastHeartbeatAt?: number | null;
+  statusObservedAt?: number | null;
 }
 
 function shareTargetFallbackLabel(target: ShareTarget): string {
@@ -1099,7 +1102,7 @@ function shareTargetFallbackLabel(target: ShareTarget): string {
   return target.subSessionDisplayName || `deck_sub_${target.subSessionId}`;
 }
 
-function normalizeSharedEntrySummary(value: unknown): SharedEntrySummary {
+export function normalizeSharedEntrySummary(value: unknown): SharedEntrySummary {
   const raw = value && typeof value === 'object' ? value as Partial<SharedEntrySummary> & Record<string, unknown> : {};
   const fallbackTarget: ShareTarget = { kind: 'server', serverId: typeof raw.serverId === 'string' ? raw.serverId : '' };
   const target: ShareTarget = raw.target && typeof raw.target === 'object'
@@ -1119,11 +1122,19 @@ function normalizeSharedEntrySummary(value: unknown): SharedEntrySummary {
     status: typeof raw.status === 'string' ? raw.status as SharedEntrySummary['status'] : 'active',
     target,
     targetLabel,
+    serverStatus: typeof raw.serverStatus === 'string' ? raw.serverStatus : null,
+    lastHeartbeatAt: typeof raw.lastHeartbeatAt === 'number' && Number.isFinite(raw.lastHeartbeatAt) && raw.lastHeartbeatAt > 0 ? raw.lastHeartbeatAt : null,
+    statusObservedAt: typeof raw.statusObservedAt === 'number' && Number.isFinite(raw.statusObservedAt)
+      ? raw.statusObservedAt
+      : (typeof raw.lastHeartbeatAt === 'number' && Number.isFinite(raw.lastHeartbeatAt) ? raw.lastHeartbeatAt : null),
   };
 }
 
-export async function discoverSharedEntries(): Promise<SharedEntrySummary[]> {
-  const res = await apiFetch<{ shares?: SharedEntrySummary[]; entries?: SharedEntrySummary[] }>('/api/shares');
+export async function discoverSharedEntries(options?: { signal?: AbortSignal }): Promise<SharedEntrySummary[]> {
+  const res = await apiFetch<{ shares?: SharedEntrySummary[]; entries?: SharedEntrySummary[] }>(
+    '/api/shares',
+    { signal: options?.signal },
+  );
   const entries = res.shares ?? res.entries;
   return Array.isArray(entries) ? entries.map(normalizeSharedEntrySummary) : [];
 }
