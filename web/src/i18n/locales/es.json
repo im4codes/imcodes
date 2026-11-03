@@ -4780,6 +4780,7 @@
       "history": "Historial de decisiones",
       "ruling": "Decisión de Brain",
       "resolved": "Resuelto",
+      "time": "Fecha de decisión",
       "upgrade": "Actualiza o reconecta el daemon antes de enviar.",
       "kind": {
         "request": "Solicitud de decisión",

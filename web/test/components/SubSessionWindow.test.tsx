@@ -255,7 +255,7 @@ describe('SubSessionWindow metadata wiring', () => {
     }
   });
 
-  it('shows task-pair details by default and suppresses them for the split executor window', () => {
+  it('always scopes task pairs to its canonical session and forwards a separate split visit key', () => {
     const baseProps = {
       sub: makeSubSession({ type: 'codex-sdk' }),
       ws,
@@ -272,8 +272,8 @@ describe('SubSessionWindow metadata wiring', () => {
     };
     const view = render(<SubSessionWindow {...baseProps} />);
     expect(chatViewPropsSpy.mock.calls.at(-1)?.[0].scopeTaskPairs).toBe(true);
-    view.rerender(<SubSessionWindow {...baseProps} showTaskPairPanel={false} />);
-    expect(chatViewPropsSpy.mock.calls.at(-1)?.[0].scopeTaskPairs).toBe(false);
+    view.rerender(<SubSessionWindow {...baseProps} taskPairPanelVisitKey="split-task" />);
+    expect(chatViewPropsSpy.mock.calls.at(-1)?.[0]).toMatchObject({ scopeTaskPairs: true, sessionId: baseProps.sub.sessionName, taskPairPanelVisitKey: 'split-task' });
   });
 
   it('projects canonical peer-audit identity/model metadata into SessionControls', () => {

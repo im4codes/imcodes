@@ -206,4 +206,63 @@ describe('everything that is not a phone sub-session is unchanged', () => {
     cleanup();
     expect(isCollapsed(render(<TaskPairStatusPanel events={live} serverId="srv" />).container)).toBe(false);
   });
+  it.each(['timeline', 'snapshot'])('split visits isolate canonical session tasks from %s while keeping right/third/main behavior', (source) => {
+    setDevice('desktop');
+    window.localStorage.setItem('imcodes.task-pair-status-panel.collapsed:srv:desktop', '0');
+    const rows = [
+      { taskId: 'left', title: 'Left task', toStatus: 'working', executor: 'deck_sub_a', auditor: 'deck_sub_b' },
+      { taskId: 'third', title: 'Third task', toStatus: 'working', executor: 'deck_sub_c', auditor: 'deck_sub_b' },
+      { taskId: 'unrelated', title: 'Unrelated task', toStatus: 'working', executor: 'other', auditor: 'another' },
+    ];
+    const events = source === 'timeline' ? rows.map((payload) => ({ eventId: payload.taskId, type: 'task_pair.event', ts: 1000, payload })) as never[] : [];
+    if (source === 'snapshot') (window as any).__imcodesTaskPairSnapshot = { tasks: rows.map((row) => ({ taskId: row.taskId, title: row.title, pair: { ...row, status: row.toStatus } })) };
+    const sessions = ['deck_sub_a', 'deck_sub_b', 'deck_sub_c'].map((name) => ({ name, label: 'Same label' }));
+    const view = render(<div>
+      <div data-window="left"><TaskPairStatusPanel events={events} sessions={sessions} serverId="srv" scopeSessionId="deck_sub_a" collapsedVisitKey="split-A" /></div>
+      <div data-window="right"><TaskPairStatusPanel events={events} sessions={sessions} serverId="srv" scopeSessionId="deck_sub_b" /></div>
+      <div data-window="third"><TaskPairStatusPanel events={events} sessions={sessions} serverId="srv" scopeSessionId="deck_sub_c" /></div>
+      <div data-window="main"><TaskPairStatusPanel events={events} sessions={sessions} serverId="srv" /></div>
+    </div>);
+    const pane = (name: string) => view.container.querySelector(`[data-window="${name}"]`) as HTMLElement;
+    const titles = (name: string) => [...pane(name).querySelectorAll('.task-pair-status-row-title')].map((el) => el.textContent);
+    expect(isCollapsed(pane('left'))).toBe(true);
+    expect(pane('left').querySelector('.task-pair-status-icon--working b')?.textContent).toBe('1');
+    openIt(pane('left'));
+    expect(titles('left')).toEqual(['Left task']);
+    expect(titles('right')).toEqual(['Left task', 'Third task']);
+    expect(titles('third')).toEqual(['Third task']);
+    expect(titles('main')).toEqual(['Left task', 'Third task', 'Unrelated task']);
+    openIt(pane('left'));
+    expect(window.localStorage.getItem('imcodes.task-pair-status-panel.collapsed:srv:desktop')).toBe('0');
+    expect(isCollapsed(pane('main'))).toBe(false);
+  });
+
+  it('keeps a split visit choice across desktop/phone resizes but resets on task/server/session/exit/re-entry', () => {
+    setDevice('desktop');
+    window.localStorage.setItem('imcodes.task-pair-status-panel.collapsed:srv:desktop', '0');
+    window.localStorage.setItem('imcodes.task-pair-status-panel.collapsed:srv:mobile', '0');
+    const both = [pairEvent('ta', 'working', 'deck_sub_a'), pairEvent('tb', 'working', 'deck_sub_b')] as never[];
+    const panel = (key: string | undefined, serverId = 'srv', scopeSessionId = 'deck_sub_a') => <TaskPairStatusPanel events={both} serverId={serverId} scopeSessionId={scopeSessionId} collapsedVisitKey={key} />;
+    const view = render(panel('A'));
+    openIt(view.container); expect(isCollapsed(view.container)).toBe(false);
+    setDevice('phone'); act(() => window.dispatchEvent(new Event('resize')));
+    expect(isCollapsed(view.container)).toBe(false);
+    setDevice('desktop'); act(() => window.dispatchEvent(new Event('resize')));
+    expect(isCollapsed(view.container)).toBe(false);
+    view.rerender(panel('B')); expect(isCollapsed(view.container)).toBe(true);
+    openIt(view.container);
+    view.rerender(panel('A')); expect(isCollapsed(view.container)).toBe(true);
+    openIt(view.container);
+    view.rerender(panel(undefined)); expect(isCollapsed(view.container)).toBe(false); // exit restores server default
+    view.rerender(panel('A')); expect(isCollapsed(view.container)).toBe(true);
+    openIt(view.container);
+    view.rerender(panel('A', 'new-server')); expect(isCollapsed(view.container)).toBe(true);
+    openIt(view.container);
+    view.rerender(panel('A', 'new-server', 'deck_sub_b')); expect(isCollapsed(view.container)).toBe(true);
+    openIt(view.container);
+    expect(view.container.querySelector('.task-pair-status-row-title')?.textContent).toBe('Task tb');
+    expect(window.localStorage.getItem('imcodes.task-pair-status-panel.collapsed:srv:desktop')).toBe('0');
+    expect(window.localStorage.getItem('imcodes.task-pair-status-panel.collapsed:new-server:desktop')).toBeNull();
+  });
+
 });

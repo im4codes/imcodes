@@ -4792,6 +4792,7 @@
       "history": "Decision history",
       "ruling": "Brain ruling",
       "resolved": "Resolved",
+      "time": "Decision time",
       "upgrade": "Upgrade or reconnect the daemon before sending feedback.",
       "kind": {
         "request": "Decision request",

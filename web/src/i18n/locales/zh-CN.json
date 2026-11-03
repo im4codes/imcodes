@@ -4792,6 +4792,7 @@
       "history": "决策记录",
       "ruling": "Brain 裁决",
       "resolved": "已裁决",
+      "time": "裁决时间",
       "upgrade": "请升级或重连 daemon 后再提交反馈。",
       "kind": {
         "request": "待决策问题",
