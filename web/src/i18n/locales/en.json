@@ -4101,6 +4101,9 @@
     "work_state": "Work state"
   },
   "remote_desktop": {
+    "traffic_usage": "This connection: ↑ {{sent}} · ↓ {{received}} · Total {{total}}",
+    "traffic_definition": "Measured WebRTC bytes for direct AND TURN-relayed connections, including media and data channels. Excludes IP and TURN overhead; not billing traffic.",
+    "traffic_pending": "Traffic: waiting for measurement",
     "open": "Remote Desktop",
     "quick_input": "Quick input",
     "workspace_title": "aiDesk.to Remote Desktop Workspace",

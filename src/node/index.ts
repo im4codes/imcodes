@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { dirname, join } from 'node:path';
+import { REMOTE_DESKTOP_TRAFFIC } from '../../shared/remote-desktop-traffic.js';
 import { CONTROLLED_NODE_ABI_GLIBC217, CONTROLLED_NODE_RUNTIME_ABI_PROFILE } from '../../shared/controlled-node-abi.js';
 import { AIDESK_UI_LOG } from '../../shared/aidesk-ui-log.js';
 import { execFileSync } from 'node:child_process';
@@ -364,6 +366,7 @@ async function main(): Promise<void> {
       log: logger,
     });
   const runtime = createControlledNodeRuntime(bootstrap.credential, undefined, {
+    remoteDesktopTrafficStorePath: join(dirname(defaultCredentialPath()), REMOTE_DESKTOP_TRAFFIC.STORE_FILE),
     macosRemoteDesktopWorker,
     remoteDesktopSignedShell: signedShellArtifact ? {
       available: () => true,

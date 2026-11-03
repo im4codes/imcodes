@@ -189,6 +189,19 @@ describe('aiDesk local IPC server', () => {
     expect(JSON.stringify(welcome)).not.toContain(persisted.bootstrapSecret);
   });
 
+  it('keeps strict native IPC v1 snapshots unchanged when the WebView panel gains traffic', async () => {
+    const { server, bootstrapPath } = await fixture({ status: () => ({
+      paused: false,
+      traffic: { total: { bytesSent: 123, bytesReceived: 456 }, connections: [] },
+      connections: [{ id: 'connection_A1', label: '#1', connectedAt: 1_700_000_000_000,
+        mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW, traffic: { bytesSent: 123, bytesReceived: 456 } }],
+    }) });
+    const { welcome } = await authenticate(server, bootstrapPath);
+    const snapshot = welcome.snapshot as { connections: Array<Record<string, unknown>> };
+    expect(snapshot).not.toHaveProperty('traffic');
+    expect(Object.keys(snapshot.connections[0]!).sort()).toEqual(['connectedAt', 'durationMs', 'id', 'label', 'mode']);
+  });
+
   it('rejects a peer before hello when the native peer-identity seam refuses it', async () => {
     const { server } = await fixture({ authorizePeer: () => false });
     const { frames } = await connect(server);

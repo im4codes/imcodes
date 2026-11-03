@@ -1,3 +1,4 @@
+#include "../remote-desktop-common/traffic_stats.h"
 #ifndef IMCODES_MACOS_REMOTE_DESKTOP_MACOS_TRANSPORT_SESSION_ADAPTER_H_
 #define IMCODES_MACOS_REMOTE_DESKTOP_MACOS_TRANSPORT_SESSION_ADAPTER_H_
 
@@ -99,6 +100,7 @@ class MacosPeerConnectionBackend {
                             std::uint32_t start_bps,
                             std::uint32_t max_bps) = 0;
   virtual void CloseDataChannel(common::DataChannelKind channel) noexcept = 0;
+  virtual std::vector<imcodes::rd::TrafficSample> SampleTraffic() { return {}; }
   virtual void Close() noexcept = 0;
 };
 

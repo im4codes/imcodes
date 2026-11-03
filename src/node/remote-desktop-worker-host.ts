@@ -264,6 +264,7 @@ interface VirtualDisplayControllerProcess {
 }
 
 export interface RemoteDesktopWorkerHostOptions {
+  trafficStorePath?: string;
   platform?: NodeJS.Platform;
   artifact?: VerifiedRemoteDesktopWorkerArtifact | null;
   pipePath?: string;
@@ -376,6 +377,7 @@ export class RemoteDesktopWorkerHost {
     this.lifecycleEvent = options.onLifecycleEvent
       ?? (diagnostics ? (event) => diagnostics.write(event) : undefined);
     this.core = new RemoteDesktopWorkerHostCore({
+      trafficStorePath: options.trafficStorePath,
       nonce: this.nonce,
       prepareReadyTimeoutMs: options.prepareReadyTimeoutMs,
       offerAnswerTimeoutMs: options.offerAnswerTimeoutMs,
@@ -579,6 +581,8 @@ export class RemoteDesktopWorkerHost {
     });
     return exitCode === 0;
   }
+
+  trafficStatus() { return this.core.traffic.snapshot(); }
 
   activeConnections() {
     return activeLocalRemoteDesktopConnections(this.core);

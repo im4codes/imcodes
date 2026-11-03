@@ -71,12 +71,12 @@ describe.skipIf(!chromium)('the panel page lays out in a real browser', () => {
   beforeAll(async () => {
     panel = await startRemoteDesktopLocalPanel({
       publicNodeId: '1234567890', serverUrl: 'https://example.test/',
-      status: () => (scenario === 'paused'
+      status: () => ({ traffic: { total: { bytesSent: 1048576, bytesReceived: 2048 }, connections: [{ id: 'history-one', label: '#1', connectedAt: now - 9000, endedAt: now - 1000, bytesSent: 1048576, bytesReceived: 2048, measured: true }] }, ...(scenario === 'paused'
         ? { paused: true, connections: [] }
         : { paused: false, connections: [
           { id: 'a', label: '12', connectedAt: now - 3_700_000, mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL },
           { id: 'b', label: '2', connectedAt: now - 61_000, mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW },
-        ] }),
+        ] }) }),
       extras: () => ({
         deviceName: 'Konstantinopolitanskaya-workstation-with-a-very-long-host-name.example.internal',
         version: '2026.10.5590',
@@ -110,7 +110,7 @@ describe.skipIf(!chromium)('the panel page lays out in a real browser', () => {
           }
           // Settings and About too, once per language.
           if (state === 'active' && scheme === 'light') {
-            for (const name of ['settings', 'about']) {
+            for (const name of ['traffic', 'settings', 'about']) {
               await page.click(`.nav[data-page="${name}"]`);
               for (const [width, height] of SIZES) {
                 await page.setViewportSize({ width, height });
@@ -124,6 +124,21 @@ describe.skipIf(!chromium)('the panel page lays out in a real browser', () => {
     }
     expect(problems).toEqual([]);
   }, 180_000);
+
+  it('shows cumulative traffic, retained connection details, and keeps the current connection controls usable', async () => {
+    scenario = 'active';
+    const context = await browser.newContext({ locale: 'en-US', viewport: { width: 960, height: 640 } });
+    try {
+      const page = await context.newPage();
+      await page.goto(panel.url);
+      await page.waitForFunction("document.getElementById('trafficHomeTotal').textContent.includes('1.0 MiB')");
+      await page.click('.nav[data-page="traffic"]');
+      expect(await page.evaluate<string>("document.getElementById('trafficHistory').textContent")).toContain('1.0 MiB');
+      expect(await page.evaluate<string>("document.getElementById('trafficHistory').textContent")).toContain('Disconnected');
+      await page.click('.nav[data-page="home"]');
+      expect(await page.evaluate<number>("document.querySelectorAll('#list button').length")).toBe(2);
+    } finally { await context.close(); }
+  });
 
   it('the audit itself catches overflow and clipping (so a pass above means something)', async () => {
     scenario = 'active';

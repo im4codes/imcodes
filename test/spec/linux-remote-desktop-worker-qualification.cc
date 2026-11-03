@@ -36,6 +36,7 @@
 #include "rtc_base/ssl_adapter.h"
 
 #include "../../native/remote-desktop-common/json_protocol.h"
+#include "../../native/remote-desktop-common/traffic_stats.h"
 
 namespace {
 
@@ -260,6 +261,9 @@ int main(int argc, char** argv) {
 
   std::mutex done_mutex;
   std::condition_variable done_cv;
+  bool got_traffic = false;
+  std::uint64_t sent_bytes = 0;
+  std::uint64_t received_bytes = 0;
   bool got_answer = false;
   bool got_answer_ok = false;
 
@@ -297,6 +301,16 @@ int main(int argc, char** argv) {
             });
           }
         });
+      } else if (type == imcodes::rd::kTrafficType) {
+        if (message["sessionId"].asString() == kSessionId &&
+            message["capability"].asString() == kCapability &&
+            message["bytesSent"].isUInt64() && message["bytesReceived"].isUInt64()) {
+          std::lock_guard<std::mutex> lock(done_mutex);
+          sent_bytes = message["bytesSent"].asUInt64();
+          received_bytes = message["bytesReceived"].asUInt64();
+          got_traffic = sent_bytes > 0 && received_bytes > 0;
+          done_cv.notify_all();
+        }
       } else if (type == imcodes::rd::kStatusType) {
         std::fprintf(stderr, "worker status: state=%s peerConnected=%s mediaStarted=%s\n",
                      message["state"].isString() ? message["state"].asCString() : "?",
@@ -379,6 +393,15 @@ int main(int argc, char** argv) {
               "linux remote desktop WORKER (out-of-process, real stdin/stdout protocol): ok -- received %dx%d\n",
               width, height);
 
+  {
+    std::unique_lock<std::mutex> lock(done_mutex);
+    if (!done_cv.wait_for(lock, std::chrono::seconds(8), [&] { return got_traffic; })) {
+      std::fprintf(stderr, "FAILED: native worker did not report measured bidirectional transport traffic\n");
+      return 8;
+    }
+    std::fprintf(stderr, "native measured traffic: sent=%llu received=%llu\n",
+        static_cast<unsigned long long>(sent_bytes), static_cast<unsigned long long>(received_bytes));
+  }
   // --- STOP, then clean shutdown ---
   Json::Value stop(Json::objectValue);
   stop["type"] = imcodes::rd::kStopType;

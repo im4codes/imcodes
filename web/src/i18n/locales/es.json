@@ -4098,6 +4098,9 @@
     "work_state": "Estado del trabajo"
   },
   "remote_desktop": {
+    "traffic_usage": "Esta conexión: ↑ {{sent}} · ↓ {{received}} · Total {{total}}",
+    "traffic_definition": "Bytes WebRTC medidos en conexiones directas y mediante TURN, incluidos medios y datos. Excluye la sobrecarga IP y TURN; no es tráfico facturable.",
+    "traffic_pending": "Tráfico: esperando medición",
     "open": "Escritorio remoto",
     "quick_input": "Entrada rápida",
     "workspace_title": "Espacio de escritorios remotos de aiDesk.to",

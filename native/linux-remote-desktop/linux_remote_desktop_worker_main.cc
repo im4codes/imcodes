@@ -339,6 +339,8 @@ class WorkerSession {
   // exactly the cadence Windows' worker_main.cc uses for its own
   // PeerSession::CheckMediaProgress() call.
   void CheckMediaProgress() { session_->CheckMediaProgress(); }
+  auto traffic_stats() const { return session_->traffic_stats(); }
+  const std::string traffic_peer_id = imcodes::rd::NewTrafficPeerId();
 
  private:
   imcodes::rd::Authority authority_;
@@ -472,6 +474,9 @@ class Worker {
         continue;
       }
       it->second->CheckMediaProgress();
+      for (const auto& sample : it->second->traffic_stats()) {
+        WriteLine(imcodes::rd::TrafficEnvelope(it->second->authority(), sample, it->second->traffic_peer_id));
+      }
       const common::TransportDiagnostics diagnostics = it->second->diagnostics();
       Json::Value status = imcodes::rd::BaseEnvelope(
           imcodes::rd::kStatusType, it->second->authority());

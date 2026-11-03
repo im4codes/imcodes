@@ -4097,6 +4097,9 @@
     "work_state": "작업 상태"
   },
   "remote_desktop": {
+    "traffic_usage": "현재 연결: ↑ {{sent}} · ↓ {{received}} · 합계 {{total}}",
+    "traffic_definition": "직접 연결과 TURN 중계 모두 포함하며, 미디어 및 데이터 채널의 WebRTC 바이트를 측정합니다. IP 및 TURN 오버헤드는 제외되며 과금용 통계가 아닙니다.",
+    "traffic_pending": "트래픽: 측정 대기 중",
     "open": "원격 데스크톱",
     "quick_input": "빠른 입력",
     "workspace_title": "aiDesk.to 원격 데스크톱 작업 공간",

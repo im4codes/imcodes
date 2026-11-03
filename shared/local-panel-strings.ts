@@ -7,6 +7,7 @@ import { UI_LOCALES, type UiLocale } from './ui-locale.js';
  * and embedded into the page. `{{name}}` marks a value filled in at display.
  */
 export const LOCAL_PANEL_STRING_KEYS = [
+  'trafficTitle', 'trafficNote', 'trafficTotal', 'trafficUsage', 'trafficPending', 'trafficEnded', 'trafficActive', 'trafficError',
   'navHome', 'navSettings', 'navAbout', 'navLabel',
   'thisComputer', 'myId', 'copy', 'copied', 'copyId',
   'statusOnline', 'statusBusy', 'statusPaused', 'statusOffline',
@@ -37,6 +38,15 @@ export const UI_LOCALE_AUTONYMS: Readonly<Record<UiLocale, string>> = {
 };
 
 const en: LocalPanelStrings = {
+  trafficTitle: 'Connection traffic',
+  trafficNote: 'Direct and TURN-relayed WebRTC bytes, not billing traffic. Latest 200 connections; lifetime totals retained. IP/TURN overhead excluded.',
+  trafficTotal: 'Total recorded traffic',
+  trafficUsage: '↑ {{sent}} · ↓ {{received}} · Total {{total}}',
+  trafficPending: 'Waiting for traffic measurement',
+  trafficEnded: 'Disconnected',
+  trafficActive: 'Connected',
+  trafficError: 'Traffic history could not be saved or loaded. Totals may be incomplete.',
+
   navHome: 'This device', navSettings: 'Settings', navAbout: 'About', navLabel: 'Sections',
   thisComputer: 'This computer', myId: 'Your ID', copy: 'Copy', copied: 'Copied', copyId: 'Copy ID',
   statusOnline: 'Online', statusBusy: 'In use', statusPaused: 'Paused', statusOffline: 'Offline',
@@ -68,6 +78,15 @@ const en: LocalPanelStrings = {
 };
 
 const zhCN: LocalPanelStrings = {
+  trafficTitle: '连接流量记录',
+  trafficNote: '直连和 TURN 中转流量均计入，非计费流量；保留最近 200 条连接，总量持续累计。不含 IP/TURN 等额外开销。',
+  trafficTotal: '累计流量',
+  trafficUsage: '↑ {{sent}} · ↓ {{received}} · 合计 {{total}}',
+  trafficPending: '等待流量统计',
+  trafficEnded: '断开于',
+  trafficActive: '连接中',
+  trafficError: '流量记录无法保存或读取，累计数据可能不完整。',
+
   navHome: '本机', navSettings: '设置', navAbout: '关于', navLabel: '导航',
   thisComputer: '这台电脑', myId: '本机 ID', copy: '复制', copied: '已复制', copyId: '复制 ID',
   statusOnline: '在线', statusBusy: '使用中', statusPaused: '已暂停', statusOffline: '离线',
@@ -99,6 +118,15 @@ const zhCN: LocalPanelStrings = {
 };
 
 const zhTW: LocalPanelStrings = {
+  trafficTitle: '連線流量紀錄',
+  trafficNote: '直連和 TURN 中轉流量均計入，非計費流量；保留最近 200 條連線，總量持續累計。不含 IP/TURN 等額外開銷。',
+  trafficTotal: '累計流量',
+  trafficUsage: '↑ {{sent}} · ↓ {{received}} · 合計 {{total}}',
+  trafficPending: '等待流量統計',
+  trafficEnded: '中斷於',
+  trafficActive: '連線中',
+  trafficError: '流量紀錄無法儲存或讀取，累計資料可能不完整。',
+
   navHome: '本機', navSettings: '設定', navAbout: '關於', navLabel: '導覽',
   thisComputer: '這台電腦', myId: '本機 ID', copy: '複製', copied: '已複製', copyId: '複製 ID',
   statusOnline: '上線', statusBusy: '使用中', statusPaused: '已暫停', statusOffline: '離線',
@@ -130,6 +158,15 @@ const zhTW: LocalPanelStrings = {
 };
 
 const es: LocalPanelStrings = {
+  trafficTitle: 'Tráfico de conexiones',
+  trafficNote: 'Bytes WebRTC directos y mediante TURN, no facturables. Últimas 200 conexiones; se conserva el total acumulado. Sin sobrecarga IP/TURN.',
+  trafficTotal: 'Tráfico acumulado',
+  trafficUsage: '↑ {{sent}} · ↓ {{received}} · Total {{total}}',
+  trafficPending: 'Esperando medición',
+  trafficEnded: 'Desconectado',
+  trafficActive: 'Conectado',
+  trafficError: 'No se pudo guardar o leer el historial. Los totales pueden estar incompletos.',
+
   navHome: 'Este equipo', navSettings: 'Ajustes', navAbout: 'Acerca de', navLabel: 'Secciones',
   thisComputer: 'Este equipo', myId: 'Tu ID', copy: 'Copiar', copied: 'Copiado', copyId: 'Copiar ID',
   statusOnline: 'En línea', statusBusy: 'En uso', statusPaused: 'En pausa', statusOffline: 'Sin conexión',
@@ -161,6 +198,15 @@ const es: LocalPanelStrings = {
 };
 
 const ru: LocalPanelStrings = {
+  trafficTitle: 'Трафик соединений',
+  trafficNote: 'Байты WebRTC прямых соединений и через TURN, не для тарификации. Последние 200 соединений; общий итог сохраняется. Без накладных расходов IP/TURN.',
+  trafficTotal: 'Общий трафик',
+  trafficUsage: '↑ {{sent}} · ↓ {{received}} · Всего {{total}}',
+  trafficPending: 'Ожидание измерения',
+  trafficEnded: 'Отключено',
+  trafficActive: 'Подключено',
+  trafficError: 'Не удалось сохранить или прочитать историю. Итоги могут быть неполными.',
+
   navHome: 'Это устройство', navSettings: 'Настройки', navAbout: 'О программе', navLabel: 'Разделы',
   thisComputer: 'Этот компьютер', myId: 'Ваш ID', copy: 'Копировать', copied: 'Скопировано', copyId: 'Копировать ID',
   statusOnline: 'В сети', statusBusy: 'Используется', statusPaused: 'Пауза', statusOffline: 'Не в сети',
@@ -192,6 +238,15 @@ const ru: LocalPanelStrings = {
 };
 
 const ja: LocalPanelStrings = {
+  trafficTitle: '接続ごとの通信量',
+  trafficNote: '直接接続・TURN 中継の WebRTC バイト数（課金用ではありません）。直近200件と累計を保存。IP/TURN の追加通信量は除外します。',
+  trafficTotal: '累計通信量',
+  trafficUsage: '↑ {{sent}} · ↓ {{received}} · 合計 {{total}}',
+  trafficPending: '計測待ち',
+  trafficEnded: '切断',
+  trafficActive: '接続中',
+  trafficError: '履歴の保存または読み込みに失敗しました。累計が不完全な可能性があります。',
+
   navHome: 'このデバイス', navSettings: '設定', navAbout: '情報', navLabel: 'セクション',
   thisComputer: 'このコンピュータ', myId: 'あなたの ID', copy: 'コピー', copied: 'コピー済み', copyId: 'ID をコピー',
   statusOnline: 'オンライン', statusBusy: '使用中', statusPaused: '一時停止中', statusOffline: 'オフライン',
@@ -223,6 +278,15 @@ const ja: LocalPanelStrings = {
 };
 
 const ko: LocalPanelStrings = {
+  trafficTitle: '연결별 트래픽',
+  trafficNote: '직접 연결과 TURN 중계의 WebRTC 바이트이며 과금용이 아닙니다. 최근 200개 연결과 누적 합계를 보관하며 IP/TURN 오버헤드는 제외합니다.',
+  trafficTotal: '누적 트래픽',
+  trafficUsage: '↑ {{sent}} · ↓ {{received}} · 합계 {{total}}',
+  trafficPending: '측정 대기 중',
+  trafficEnded: '연결 종료',
+  trafficActive: '연결 중',
+  trafficError: '기록을 저장하거나 읽지 못했습니다. 합계가 불완전할 수 있습니다.',
+
   navHome: '이 기기', navSettings: '설정', navAbout: '정보', navLabel: '섹션',
   thisComputer: '이 컴퓨터', myId: '내 ID', copy: '복사', copied: '복사됨', copyId: 'ID 복사',
   statusOnline: '온라인', statusBusy: '사용 중', statusPaused: '일시 중지됨', statusOffline: '오프라인',

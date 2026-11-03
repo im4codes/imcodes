@@ -214,6 +214,9 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
       meta.appendChild(duration);
       main.appendChild(name);
       main.appendChild(meta);
+      var traffic = el('div', 'meta');
+      traffic.setAttribute('data-traffic-id', c.id);
+      main.appendChild(traffic);
       var button = el('button', 'btn danger', T('disconnect'));
       button.type = 'button';
       button.onclick = ask.bind(null, B.actions.DISCONNECT, c.id);
@@ -224,10 +227,41 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
     tick();
   }
 
+  function trafficText(value) {
+    return T('trafficUsage', { sent: formatRemoteDesktopBytes(value.bytesSent), received: formatRemoteDesktopBytes(value.bytesReceived), total: formatRemoteDesktopBytes(Math.min(Number.MAX_SAFE_INTEGER, value.bytesSent + value.bytesReceived)) });
+  }
+  function renderTraffic() {
+    var traffic = state && state.traffic;
+    $('trafficTotal').textContent = traffic ? T('trafficTotal') + ' · ' + trafficText(traffic.total) : T('trafficPending');
+    $('trafficHomeTotal').textContent = $('trafficTotal').textContent;
+    $('trafficError').hidden = !traffic || !traffic.persistenceError;
+    var active = state ? state.connections : [];
+    var labels = document.querySelectorAll('[data-traffic-id]');
+    for (var i = 0; i < labels.length; i += 1) {
+      var id = labels[i].getAttribute('data-traffic-id');
+      var connection = active.find(function (c) { return c.id === id; });
+      labels[i].textContent = connection && connection.traffic ? trafficText(connection.traffic) : T('trafficPending');
+    }
+    var history = $('trafficHistory');
+    history.textContent = '';
+    if (!traffic) return;
+    for (var j = 0; j < traffic.connections.length; j += 1) {
+      var record = traffic.connections[j];
+      var row = el('div', 'conn');
+      var main = el('div', 'main');
+      main.appendChild(el('div', 'name', record.label + ' · ' + new Date(record.connectedAt).toLocaleString(locale)));
+      main.appendChild(el('div', 'meta', record.measured ? trafficText(record) : T('trafficPending')));
+      main.appendChild(el('div', 'meta', record.endedAt ? T('trafficEnded') + ' ' + new Date(record.endedAt).toLocaleString(locale) : T('trafficActive')));
+      row.appendChild(main);
+      history.appendChild(row);
+    }
+  }
+
   function renderAll() {
     renderStatus();
     renderPermissions();
     renderConnections();
+    renderTraffic();
   }
   function tick() {
     if (!document || !document.body) return;

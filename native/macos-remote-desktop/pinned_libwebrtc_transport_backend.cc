@@ -1,3 +1,5 @@
+#include "../remote-desktop-common/webrtc_traffic_stats.h"
+#include "api/stats/rtc_stats_collector_callback.h"
 #include "pinned_libwebrtc_transport_backend.h"
 
 #include <algorithm>
@@ -809,11 +811,45 @@ void ApplyRawCodecAnswerOrder(webrtc::PeerConnectionInterface& peer,
 // hold the single-threaded worker dispatch indefinitely.
 inline constexpr int kNegotiationTimeoutMs = 10'000;
 
+// A late stats callback owns only its isolated sample state, never the backend.
+struct TrafficState {
+  std::mutex mutex;
+  bool in_flight = false;
+  std::vector<imcodes::rd::TrafficSample> samples;
+};
+class TrafficObserver : public webrtc::RTCStatsCollectorCallback {
+ public:
+  explicit TrafficObserver(std::shared_ptr<TrafficState> state) : state_(std::move(state)) {}
+  void OnStatsDelivered(const webrtc::scoped_refptr<const webrtc::RTCStatsReport>& report) override {
+    std::lock_guard lock(state_->mutex);
+    if (report) state_->samples = imcodes::rd::ReadTrafficStats(*report);
+    state_->in_flight = false;
+  }
+ private:
+  const std::shared_ptr<TrafficState> state_;
+};
+
 class PinnedLibwebrtcTransportBackend final
     : public MacosPeerConnectionBackend,
       public webrtc::PeerConnectionObserver {
  public:
   PinnedLibwebrtcTransportBackend() = default;
+  std::vector<imcodes::rd::TrafficSample> SampleTraffic() override {
+    webrtc::scoped_refptr<webrtc::PeerConnectionInterface> peer;
+    std::shared_ptr<TrafficState> state;
+    { std::lock_guard lock(mutex_); peer = peer_; state = traffic_; }
+    if (!peer) return {};
+    std::vector<imcodes::rd::TrafficSample> samples;
+    bool collect = false;
+    {
+      std::lock_guard lock(state->mutex);
+      samples = state->samples;
+      if (!state->in_flight) { state->in_flight = true; collect = true; }
+    }
+    if (collect) peer->GetStats(webrtc::make_ref_counted<TrafficObserver>(state).get());
+    return samples;
+  }
+
 
   ~PinnedLibwebrtcTransportBackend() override { Close(); }
 
@@ -832,6 +868,7 @@ class PinnedLibwebrtcTransportBackend final
     if (adapter_ == nullptr || peer_ != nullptr)
       return false;
 
+    traffic_ = std::make_shared<TrafficState>();
     signaling_thread_ = webrtc::Thread::Create();
     if (signaling_thread_ == nullptr || !signaling_thread_->Start()) {
       return false;
@@ -1277,6 +1314,7 @@ class PinnedLibwebrtcTransportBackend final
   std::mutex mutex_;
   std::unique_ptr<webrtc::Thread> signaling_thread_;
   webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory_;
+  std::shared_ptr<TrafficState> traffic_ = std::make_shared<TrafficState>();
   webrtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_;
   std::vector<ChannelEntry> channels_;
 };

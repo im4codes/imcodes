@@ -2310,6 +2310,7 @@ std::optional<std::string> ReadSmallRegularFile(const std::string& path) {
 // the command seam and session first, then the transport, then the sink and
 // the socket emitter the transport reports through.
 struct WorkerRoute {
+  const std::string traffic_peer_id = imcodes::rd::NewTrafficPeerId();
   std::unique_ptr<WorkerSocketEmitter> emitter;
   std::unique_ptr<WorkerTransportSink> sink;
   std::unique_ptr<macos::MacosTransportSessionAdapter> adapter;
@@ -2317,6 +2318,7 @@ struct WorkerRoute {
   std::unique_ptr<macos::MacosRemoteDesktopSession> session;
   // Owned by the session; sampled for media progress.
   const macos::MacosMediaSenderBinder* media_binder = nullptr;
+  macos::MacosPeerConnectionBackend* backend = nullptr;
   std::unique_ptr<SessionSeamAdapter> seam;
   std::int64_t negotiation_started_ms = 0;
   std::int64_t last_media_sample_ms = 0;
@@ -2914,6 +2916,7 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
     }
     WorkerSocketEmitter* emitter = route->emitter.get();
     macos::MacosPeerConnectionBackend* backend_view = backend.get();
+    route->backend = backend_view;
     route->adapter = std::make_unique<macos::MacosTransportSessionAdapter>(
         std::move(backend), *route->sink,
         std::vector<macos::MacosTransportIceServer>{},
@@ -3259,6 +3262,12 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
         if (now.monotonic_ms - route->last_media_sample_ms < 1'000)
           continue;
         route->last_media_sample_ms = now.monotonic_ms;
+        const auto traffic_authority = route->emitter->SnapshotAuthority();
+        if (traffic_authority && route->backend) {
+          for (const auto& sample : route->backend->SampleTraffic()) {
+            (void)route->emitter->Emit(imcodes::rd::TrafficEnvelope(*traffic_authority, sample, route->traffic_peer_id));
+          }
+        }
         const std::uint64_t bytes = route->media_binder->accepted_bytes();
         (void)route->session->RecordMediaProgress(bytes, now);
         if (bytes > 0 && !route->media_status_sent) {

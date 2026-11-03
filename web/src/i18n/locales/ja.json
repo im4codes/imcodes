@@ -4097,6 +4097,9 @@
     "work_state": "作業状態"
   },
   "remote_desktop": {
+    "traffic_usage": "今回の通信量：↑ {{sent}} · ↓ {{received}} · 合計 {{total}}",
+    "traffic_definition": "直接接続と TURN 中継の両方を計測。メディアとデータチャネルを含む WebRTC 転送バイト数。IP・TURN の追加通信量は含まず、課金用ではありません。",
+    "traffic_pending": "通信量：計測待ち",
     "open": "リモートデスクトップ",
     "quick_input": "クイック入力",
     "workspace_title": "aiDesk.to リモートデスクトップ ワークスペース",

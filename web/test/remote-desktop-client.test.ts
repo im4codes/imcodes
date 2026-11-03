@@ -3763,3 +3763,33 @@ it('keeps the contract open to an end-of-candidates marker from any client', () 
     type: REMOTE_DESKTOP_MSG.ICE, ...correlation, candidate: '', mid: '0',
   }).ok).toBe(true);
 });
+
+
+describe('remote desktop transport traffic', () => {
+  it('uses transport bytes only, keeps duplicates/ICE stable and isolates old peer results', async () => {
+    const snapshots: Array<{ traffic?: { bytesSent: number; bytesReceived: number } }> = [];
+    const client = new RemoteDesktopClient('traffic-fixture', { onSnapshot: (snapshot) => snapshots.push(snapshot) });
+    const internal = client as unknown as { peer: RTCPeerConnection; collectStats(peer: RTCPeerConnection): Promise<void> };
+    const peer = new FakePeer();
+    internal.peer = peer as unknown as RTCPeerConnection;
+    peer.stats = [
+      { id: 'dtls', type: 'transport', bytesSent: 50, bytesReceived: 1000 },
+      { id: 'rtp', type: 'inbound-rtp', kind: 'video', bytesReceived: 900, timestamp: 1 },
+      { id: 'ice', type: 'candidate-pair', bytesReceived: 1000 },
+      { id: 'data', type: 'data-channel', bytesReceived: 100 },
+    ];
+    await internal.collectStats(internal.peer);
+    await internal.collectStats(internal.peer);
+    expect(snapshots.at(-1)?.traffic).toEqual({ bytesSent: 50, bytesReceived: 1000 });
+    peer.stats = [{ id: 'dtls', type: 'transport', bytesSent: 60, bytesReceived: 1500 }];
+    await internal.collectStats(internal.peer);
+    expect(snapshots.at(-1)?.traffic).toEqual({ bytesSent: 60, bytesReceived: 1500 });
+    const next = new FakePeer();
+    next.stats = [{ id: 'dtls', type: 'transport', bytesSent: 5, bytesReceived: 10 }];
+    internal.peer = next as unknown as RTCPeerConnection;
+    await internal.collectStats(internal.peer);
+    await internal.collectStats(peer as unknown as RTCPeerConnection);
+    expect(snapshots.at(-1)?.traffic).toEqual({ bytesSent: 65, bytesReceived: 1510 });
+    client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+  });
+});

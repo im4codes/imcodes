@@ -1,3 +1,4 @@
+#include "../remote-desktop-common/webrtc_traffic_stats.h"
 #include "third_party/imcodes_remote_desktop/peer_session.h"
 
 #include <algorithm>
@@ -231,7 +232,7 @@ class PeerMediaStatsObserver : public webrtc::RTCStatsCollectorCallback {
     }
     if (auto session = session_.lock()) {
       session->HandleMediaStats(generation_, has_outbound_video,
-                                outbound_bytes);
+                                outbound_bytes, report ? imcodes::rd::ReadTrafficStats(*report) : std::vector<imcodes::rd::TrafficSample>{});
     }
   }
 
@@ -689,20 +690,22 @@ void PeerSession::CheckMediaProgress() {
 
 void PeerSession::HandleMediaStats(uint64_t generation,
                                    bool has_outbound_video,
-                                   uint64_t outbound_bytes) {
+                                   uint64_t outbound_bytes,
+                                   std::vector<imcodes::rd::TrafficSample> traffic) {
   if (signaling_thread_ && !signaling_thread_->IsCurrent()) {
     std::weak_ptr<PeerSession> weak = weak_from_this();
     signaling_thread_->PostTask(
-        [weak, generation, has_outbound_video, outbound_bytes] {
+        [weak, generation, has_outbound_video, outbound_bytes, traffic = std::move(traffic)] {
           if (auto session = weak.lock()) {
             session->HandleMediaStats(generation, has_outbound_video,
-                                      outbound_bytes);
+                                      outbound_bytes, std::move(traffic));
           }
         });
     return;
   }
   if (closed_ || generation != media_stats_generation_) return;
   media_stats_in_flight_ = false;
+  for (const auto& sample : traffic) emit_(imcodes::rd::TrafficEnvelope(authority_, sample, traffic_peer_id_));
   if (!has_outbound_video || !source_) return;
   const uint64_t source_frames = source_->captured_frames();
   const bool media_started =

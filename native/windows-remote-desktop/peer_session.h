@@ -1,3 +1,4 @@
+#include "../remote-desktop-common/traffic_stats.h"
 #ifndef IMCODES_REMOTE_DESKTOP_PEER_SESSION_H_
 #define IMCODES_REMOTE_DESKTOP_PEER_SESSION_H_
 
@@ -105,7 +106,8 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
   void ActivateVideoIfReady();
   void HandleMediaStats(uint64_t generation,
                         bool has_outbound_video,
-                        uint64_t outbound_bytes);
+                        uint64_t outbound_bytes,
+                        std::vector<imcodes::rd::TrafficSample> traffic = {});
 
   void HandleData(const std::string& label,
                   const webrtc::DataBuffer& buffer);
@@ -229,6 +231,7 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
   bool reported_input_ready_ = false;
   webrtc::Thread* const signaling_thread_;
   const EmitJson emit_;
+  const std::string traffic_peer_id_ = imcodes::rd::NewTrafficPeerId();
   webrtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_;
   webrtc::scoped_refptr<webrtc::CreateSessionDescriptionObserver>
       answer_observer_;

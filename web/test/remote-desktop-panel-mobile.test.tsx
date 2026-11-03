@@ -1194,6 +1194,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       inputEpoch: 1,
       inputEnabled: true,
       route: 'relay',
+      traffic: { bytesSent: 1024, bytesReceived: 2048 },
       displays: [{
         id: 'display-primary', label: 'Display 1', primary: true, available: true,
         width: 1920, height: 1080, dpiScale: 1.5, rotation: 0,
@@ -1218,6 +1219,10 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     // Resolution, frame rate and bitrate are always on: they are how you tell a
     // usable session from a bad one, so they must not need a toggle first.
     const stats = container.querySelector('.remote-desktop-stats');
+    const traffic = stats?.querySelector('[data-remote-desktop-traffic]');
+    expect(traffic?.getAttribute('data-bytes-sent')).toBe('1024');
+    expect(traffic?.getAttribute('data-bytes-received')).toBe('2048');
+    expect(traffic?.textContent).toContain('remote_desktop.traffic_usage');
     expect(stats?.textContent).toContain('1920×1080');
     expect(stats?.textContent).toContain('29 FPS');
     expect(stats?.textContent).toContain('4.2 Mbps · 24 ms');

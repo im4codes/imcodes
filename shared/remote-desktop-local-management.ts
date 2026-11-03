@@ -1,3 +1,4 @@
+import type { RemoteDesktopTraffic, RemoteDesktopTrafficHistory } from './remote-desktop-traffic.js';
 import { CONTROLLED_NODE_FAILURE_CLASS, type ControlledNodeFailureClass } from './controlled-node-endpoints.js';
 import { REMOTE_DESKTOP_ACCESS_MODE, type RemoteDesktopAccessMode } from './remote-desktop.js';
 
@@ -137,10 +138,12 @@ export interface RemoteDesktopLocalConnection {
   label: string;
   connectedAt: number;
   mode: RemoteDesktopAccessMode;
+  traffic?: RemoteDesktopTraffic;
 }
 
 export interface RemoteDesktopLocalStatus {
   publicNodeId: string;
+  traffic?: RemoteDesktopTrafficHistory;
   paused: boolean;
   connections: readonly RemoteDesktopLocalConnection[];
 }

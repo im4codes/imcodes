@@ -1,3 +1,4 @@
+import { formatRemoteDesktopBytes, addTrafficBytes } from '@shared/remote-desktop-traffic.js';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
@@ -4489,6 +4490,13 @@ export function RemoteDesktopPanel({
                 </>
               )}
               <span>{t('remote_desktop.duration', { seconds: Math.floor((snapshot.durationMs ?? 0) / 1000) })}</span>
+              <span data-remote-desktop-traffic data-bytes-sent={snapshot.traffic?.bytesSent} data-bytes-received={snapshot.traffic?.bytesReceived} title={t('remote_desktop.traffic_definition')}>
+                {snapshot.traffic ? t('remote_desktop.traffic_usage', {
+                  sent: formatRemoteDesktopBytes(snapshot.traffic.bytesSent),
+                  received: formatRemoteDesktopBytes(snapshot.traffic.bytesReceived),
+                  total: formatRemoteDesktopBytes(addTrafficBytes(snapshot.traffic.bytesSent, snapshot.traffic.bytesReceived)),
+                }) : t('remote_desktop.traffic_pending')}
+              </span>
             </div>
             <button
               type="button"

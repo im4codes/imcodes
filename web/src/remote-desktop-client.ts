@@ -1,3 +1,4 @@
+import { RemoteDesktopTrafficCounter, isTrafficCounter, type RemoteDesktopTraffic } from '@shared/remote-desktop-traffic.js';
 import type { RemoteDesktopEncoderSummary } from './remote-desktop-encoder-label.js';
 import {
   DecodeTimeMonitor,
@@ -128,6 +129,8 @@ const LATENCY_GUARD = {
 const CLIPBOARD_REQUEST_TIMEOUT_MS = 2_000;
 
 export interface RemoteDesktopSnapshot {
+  /** Measured WebRTC transport bytes for this viewer connection. */
+  traffic?: RemoteDesktopTraffic;
   state: RemoteDesktopState;
   mode: RemoteDesktopAccessMode;
   inputEpoch: number;
@@ -586,6 +589,8 @@ export class RemoteDesktopClient {
   private mediaStarted = false;
   private firstMediaWaitStartedAt: number | null = null;
   private aggregateBytesReceived = 0;
+  private readonly trafficCounter = new RemoteDesktopTrafficCounter();
+  private trafficPeer: RTCPeerConnection | null = null;
   private pendingInputAckSequence: number | null = null;
   private inputAckTimer: ReturnType<typeof setTimeout> | null = null;
   private layoutTransitionTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1942,6 +1947,18 @@ export class RemoteDesktopClient {
           rttMs = Math.max(0, Math.min(3_600_000, value.currentRoundTripTime * 1_000));
         }
       });
+      if (this.trafficPeer !== peer) {
+        this.trafficPeer = peer;
+        this.trafficCounter.nextPeer();
+      }
+      let measuredTraffic = false;
+      for (const entry of entries) {
+        if (entry.type !== 'transport' || typeof entry.id !== 'string'
+          || !isTrafficCounter(entry.bytesSent) || !isTrafficCounter(entry.bytesReceived)) continue;
+        this.trafficCounter.observe(entry.id, { bytesSent: entry.bytesSent, bytesReceived: entry.bytesReceived }, typeof entry.timestamp === 'number' ? entry.timestamp : undefined);
+        measuredTraffic = true;
+      }
+      const traffic = measuredTraffic ? { traffic: { ...this.trafficCounter.total } } : {};
       const inbound = entries.find((value) => value.type === 'inbound-rtp'
         && (value.kind === 'video' || value.mediaType === 'video'));
       if (inbound) this.observeDecodeTime(entries, inbound);
@@ -1982,6 +1999,7 @@ export class RemoteDesktopClient {
         // there is a picture to measure -- "is anything being sent at all" --
         // so they must not ride along with the quality publish alone.
         this.publish({
+          ...traffic,
           durationMs,
           pointerMovesSent: this.pointerMovesSent,
           pointerMovesMirrored: this.pointerMovesMirrored,
@@ -2072,6 +2090,7 @@ export class RemoteDesktopClient {
         if (visible && this.mediaStarted) this.observeLatency(rttMs, jitterBufferMs, bitrateBps, fps);
       }
       this.publish({
+        ...traffic,
         pointerMovesSent: this.pointerMovesSent,
         pointerMovesMirrored: this.pointerMovesMirrored,
         pointerMoveCalls: this.pointerMoveCalls,

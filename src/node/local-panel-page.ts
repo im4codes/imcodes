@@ -1,3 +1,4 @@
+import { formatRemoteDesktopBytes, isTrafficCounter } from '../../shared/remote-desktop-traffic.js';
 import { LOCAL_PANEL_EXTERNAL_PATH, LOCAL_PANEL_WINDOW_TITLE } from '../../shared/local-panel-window.js';
 import { localPanelStringsEmbedSource } from '../../shared/local-panel-strings.js';
 import { REMOTE_DESKTOP_ACCESS_MODE } from '../../shared/remote-desktop.js';
@@ -36,6 +37,7 @@ function pageBody(): string {
   return `<div class="app"><nav class="rail" data-t-label="navLabel">
 <div class="logo" aria-hidden="true">ai</div>
 <button class="nav" type="button" data-page="home" aria-current="page">${ICON.monitor}<span data-t="navHome"></span><span class="badge" id="navBadge" hidden></span></button>
+<button class="nav" type="button" data-page="traffic">${ICON.info}<span data-t="trafficTitle"></span></button>
 <button class="nav" type="button" data-page="settings">${ICON.gear}<span data-t="navSettings"></span></button>
 <button class="nav" type="button" data-page="about">${ICON.info}<span data-t="navAbout"></span></button>
 </nav><main>
@@ -56,8 +58,11 @@ function pageBody(): string {
 <section class="card perms" id="permsCard" hidden aria-labelledby="permsTitle"><h2 id="permsTitle" data-t="permissions"></h2><div id="permRows"></div></section>
 </div>
 <section class="section" aria-labelledby="connectionsTitle"><div class="section-head"><h2 id="connectionsTitle" data-t="connections"></h2><span class="count" id="count">0</span><span class="grow"></span><button class="btn danger" id="stopAll" type="button" data-t="stopAll"></button></div>
-<div class="list" id="list"></div></section>
+<p class="meta" id="trafficHomeTotal"></p><div class="list" id="list"></div></section>
 </section>
+<section class="page" data-page="traffic" hidden aria-labelledby="trafficTitle"><div class="section-head"><h2 id="trafficTitle" data-t="trafficTitle"></h2></div>
+<p class="hint" data-t="trafficNote"></p><p class="meta" id="trafficTotal"></p><p class="hint" id="trafficError" data-t="trafficError" hidden></p>
+<div class="list" id="trafficHistory"></div></section>
 <section class="page" data-page="settings" hidden><h1 class="about-brand" data-t="settingsTitle"></h1>
 <div class="form"><div class="field"><label for="langSelect" data-t="language"></label><select id="langSelect"></select><span class="hint" data-t="languageHelp"></span></div>
 <p class="hint" data-t="appearanceNote" style="margin:0;color:var(--muted)"></p></div></section>
@@ -89,6 +94,8 @@ export function renderLocalPanelPage(input: LocalPanelPageInput): string {
 var B=${bootstrap};
 ${uiLocaleEmbedSource()}
 ${localPanelStringsEmbedSource()}
+${isTrafficCounter.toString()}
+${formatRemoteDesktopBytes.toString()}
 ${LOCAL_PANEL_PAGE_SCRIPT}
 </script></body></html>`;
 }

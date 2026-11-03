@@ -1,3 +1,5 @@
+import { REMOTE_DESKTOP_TRAFFIC, isRemoteDesktopTraffic } from '../../shared/remote-desktop-traffic.js';
+import { RemoteDesktopTrafficLedger } from './remote-desktop-traffic-ledger.js';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import {
   REMOTE_DESKTOP_MSG,
@@ -76,6 +78,7 @@ export interface RemoteDesktopWorkerWatchdogEvent<Metadata> {
 
 export interface RemoteDesktopWorkerHostCoreOptions<Metadata> {
   nonce: string;
+  trafficStorePath?: string;
   prepareReadyTimeoutMs?: number;
   offerAnswerTimeoutMs?: number;
   maxLineBytes?: number;
@@ -124,7 +127,18 @@ export class RemoteDesktopWorkerHostCore<Metadata> {
   }>();
   private nextAnonymousConnection = 0;
 
-  constructor(private readonly options: RemoteDesktopWorkerHostCoreOptions<Metadata>) {}
+  readonly traffic: RemoteDesktopTrafficLedger;
+  constructor(private readonly options: RemoteDesktopWorkerHostCoreOptions<Metadata>) {
+    this.traffic = new RemoteDesktopTrafficLedger(options.trafficStorePath);
+  }
+  finishLocalConnections(): void {
+    for (const id of this.connected.keys()) this.endLocalConnection(id);
+  }
+  private endLocalConnection(sessionId: string): void {
+    const entry = this.connected.get(sessionId);
+    if (entry) this.traffic.end(entry.publicId);
+    this.connected.delete(sessionId);
+  }
 
   get size(): number {
     return this.tracked.size;
@@ -174,6 +188,7 @@ export class RemoteDesktopWorkerHostCore<Metadata> {
   ): RemoteDesktopTrackedAuthority<Metadata> {
     const previous = this.tracked.get(prepare.sessionId);
     if (previous) {
+      this.endLocalConnection(prepare.sessionId);
       this.clearTrackedTimers(previous);
       previous.capability.fill(0);
     }
@@ -217,7 +232,7 @@ export class RemoteDesktopWorkerHostCore<Metadata> {
     this.clearTrackedTimers(authority);
     authority.capability.fill(0);
     this.tracked.delete(sessionId);
-    this.connected.delete(sessionId);
+    this.endLocalConnection(sessionId);
     this.options.onAuthorityRemoved?.();
   }
 
@@ -234,7 +249,7 @@ export class RemoteDesktopWorkerHostCore<Metadata> {
       authority.capability.fill(0);
     }
     this.tracked.clear();
-    this.connected.clear();
+    this.finishLocalConnections();
     this.options.onAuthorityRemoved?.();
   }
 
@@ -321,6 +336,22 @@ export class RemoteDesktopWorkerHostCore<Metadata> {
         }
         continue;
       }
+      // Local telemetry is deliberately not forwarded to the signaling server.
+      // Older hosts ignore this separate frame; STATUS remains byte-compatible.
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        const frame = value as Record<string, unknown>;
+        if (frame.type === REMOTE_DESKTOP_TRAFFIC.WORKER_MESSAGE) {
+          const authority = typeof frame.sessionId === 'string' ? this.tracked.get(frame.sessionId) : undefined;
+          if (authority && frame.requestId === authority.requestId
+            && typeof frame.capability === 'string' && this.capabilityMatches(authority, frame.capability)
+            && typeof frame.transportId === 'string' && frame.transportId.length > 0 && frame.transportId.length <= 256
+            && isRemoteDesktopTraffic(frame)) {
+            const entry = this.connected.get(authority.sessionId);
+            if (entry) this.traffic.observe(entry.publicId, frame, frame.transportId as string);
+          }
+          continue;
+        }
+      }
       const parsed = validateRemoteDesktopDaemonMessage(value);
       if (!parsed.ok) continue;
       const authority = this.tracked.get(parsed.value.sessionId);
@@ -346,7 +377,7 @@ export class RemoteDesktopWorkerHostCore<Metadata> {
       if (parsed.value.type === REMOTE_DESKTOP_MSG.STATUS) {
         this.observeStatus(parsed.value);
       } else if (parsed.value.type === REMOTE_DESKTOP_MSG.TERMINAL) {
-        this.connected.delete(parsed.value.sessionId);
+        this.endLocalConnection(parsed.value.sessionId);
       }
       events.push({ kind: 'message', value: parsed.value, authority });
     }
@@ -355,13 +386,19 @@ export class RemoteDesktopWorkerHostCore<Metadata> {
 
   /** Real native peer_state=Connected routes only; no PREPARE-derived counts. */
   activeConnections(): readonly RemoteDesktopLocalConnection[] {
+    const history = this.traffic.snapshot();
     return [...this.connected.values()]
+      .filter((entry) => entry.status.peerConnected === true)
       .sort((left, right) => left.connectedAt - right.connectedAt)
       .map((entry) => ({
         id: entry.publicId,
         label: entry.label,
         connectedAt: entry.connectedAt,
         mode: entry.status.mode,
+        ...(() => {
+          const record = history.connections.find((row) => row.id === entry.publicId);
+          return record?.measured ? { traffic: { bytesSent: record.bytesSent, bytesReceived: record.bytesReceived } } : {};
+        })(),
       }));
   }
 
@@ -374,20 +411,20 @@ export class RemoteDesktopWorkerHostCore<Metadata> {
   }
 
   private observeStatus(status: RemoteDesktopStatus): void {
-    if (status.peerConnected !== true) {
-      this.connected.delete(status.sessionId);
-      return;
-    }
     const existing = this.connected.get(status.sessionId);
+    if (status.peerConnected !== true && !existing) return;
     if (existing) {
       existing.status = status;
       return;
     }
     this.nextAnonymousConnection += 1;
+    const publicId = randomBytes(18).toString('base64url');
+    const connectedAt = Date.now();
+    this.traffic.start(publicId, `#${this.nextAnonymousConnection}`, connectedAt);
     this.connected.set(status.sessionId, {
-      publicId: randomBytes(18).toString('base64url'),
+      publicId,
       label: `#${this.nextAnonymousConnection}`,
-      connectedAt: Date.now(),
+      connectedAt,
       status,
     });
   }

@@ -4101,6 +4101,9 @@
     "work_state": "工作状态"
   },
   "remote_desktop": {
+    "traffic_usage": "本次流量：↑ {{sent}} · ↓ {{received}} · 合计 {{total}}",
+    "traffic_definition": "直连和 TURN 中转均计入 WebRTC 实测流量，含音视频和数据通道；不含 IP、TURN 等额外开销，非计费流量。",
+    "traffic_pending": "流量：等待统计",
     "open": "远程桌面",
     "quick_input": "快捷输入",
     "workspace_title": "aiDesk.to 远程桌面工作区",

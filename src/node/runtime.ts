@@ -1,3 +1,4 @@
+import type { RemoteDesktopTrafficHistory } from '../../shared/remote-desktop-traffic.js';
 import {
   CONTROLLED_NODE_ABI_GLIBC217, CONTROLLED_NODE_ABI_MODERN, CONTROLLED_NODE_ABI_PROFILE_FIELD, normalizeControlledNodeAbiProfile,
 } from '../../shared/controlled-node-abi.js';
@@ -224,6 +225,7 @@ export interface ControlledNodeRemoteDesktopWorker {
   onPrivacyFrame?(handler: (frame: WorkerPrivacyInboundFrame) => void): () => void;
   supportsDefaultShieldedRoute?(): boolean;
   handle(message: RemoteDesktopDaemonCommand): Promise<boolean>;
+  trafficStatus?(): RemoteDesktopTrafficHistory;
   activeConnections?(): readonly RemoteDesktopLocalConnection[];
   stopConnection?(publicId: string): Promise<boolean>;
   stopAllConnections?(): Promise<void>;
@@ -268,10 +270,11 @@ export function createPlatformRemoteDesktopWorkerHost(input: {
   macos?: MacosRemoteDesktopWorkerHostOptions;
   linux?: LinuxRemoteDesktopWorkerHostOptions;
   headless?: boolean;
+  trafficStorePath?: string;
 }): PlatformRemoteDesktopWorkerSelection {
   if (input.headless) return { worker: new UnavailableRemoteDesktopWorkerHost() };
   if (input.platform === 'win32') {
-    const worker = new RemoteDesktopWorkerHost(input.onMessage, input.windows);
+    const worker = new RemoteDesktopWorkerHost(input.onMessage, { ...input.windows, trafficStorePath: input.trafficStorePath ?? input.windows?.trafficStorePath });
     return worker.available()
       ? { worker, startup: () => worker.start() }
       : { worker };
@@ -281,12 +284,13 @@ export function createPlatformRemoteDesktopWorkerHost(input: {
     && input.macos) {
     const worker = new MacosRemoteDesktopWorkerHost(input.onMessage, {
       ...input.macos,
+      trafficStorePath: input.trafficStorePath ?? input.macos.trafficStorePath,
       runtime: { platform: input.platform, arch: input.arch },
     });
     return { worker, startup: () => worker.start() };
   }
   if (input.platform === 'linux' && input.arch === 'x64') {
-    const worker = new LinuxRemoteDesktopWorkerHost(input.onMessage, input.linux);
+    const worker = new LinuxRemoteDesktopWorkerHost(input.onMessage, { ...input.linux, trafficStorePath: input.trafficStorePath ?? input.linux?.trafficStorePath });
     return worker.available()
       ? {
         worker,
@@ -349,6 +353,7 @@ class FinalizingAuthenticatedWebSocketClient extends AuthenticatedWebSocketClien
 }
 
 export interface ControlledNodeRuntimeOptions {
+  remoteDesktopTrafficStorePath?: string;
   /**
    * Injected so the install path can be exercised without a server, a notary
    * and four signed binaries. The default implementation downloads this
@@ -447,7 +452,7 @@ export interface ControlledNodeRuntimeOptions {
 }
 
 export interface ControlledNodeRuntimeClient extends AuthenticatedWebSocketClient {
-  remoteDesktopAccessStatus(): { paused: boolean; connections: readonly RemoteDesktopLocalConnection[] };
+  remoteDesktopAccessStatus(): { paused: boolean; connections: readonly RemoteDesktopLocalConnection[]; traffic?: RemoteDesktopTrafficHistory };
   /** Host name and (macOS) permission state for the local panel; read off state the node already keeps, never probed. */
   remoteDesktopLocalExtras(): RemoteDesktopLocalExtras;
   /** Which server address the node dials and, when it cannot reach it, why. No secret. */
@@ -499,6 +504,7 @@ export function createControlledNodeRuntime(
   const platformWorker: PlatformRemoteDesktopWorkerSelection = headlessProfile ? { worker: new UnavailableRemoteDesktopWorkerHost() } : options.remoteDesktopWorker
     ? { worker: options.remoteDesktopWorker }
     : createPlatformRemoteDesktopWorkerHost({
+      trafficStorePath: options.remoteDesktopTrafficStorePath,
       platform,
       arch,
       onMessage: (message) => {
@@ -2257,6 +2263,7 @@ export function createControlledNodeRuntime(
   runtimeClient.connectionStatus = () => connection.status();
   runtimeClient.remoteDesktopAccessStatus = () => ({
     paused: remoteDesktopAccessPaused,
+    traffic: remoteDesktopWorker.trafficStatus?.(),
     connections: remoteDesktopWorker.activeConnections?.() ?? [],
   });
   runtimeClient.remoteDesktopLocalExtras = () => buildLocalPanelExtras({
