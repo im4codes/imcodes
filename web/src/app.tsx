@@ -77,6 +77,11 @@ import { ShareSessionDialog } from './components/ShareSessionDialog.js';
 import { SharedEntriesPanel } from './components/SharedEntriesPanel.js';
 import { MobileSharedEntriesMenu } from './components/MobileSharedEntriesMenu.js';
 import { SharedStateIndicator } from './components/SharedStateIndicator.js';
+import {
+  projectUnifiedServerList,
+  filterRestrictedSharedEntries,
+  type UnifiedServerItem,
+} from './unified-server-projection.js';
 import { applyGlobalFontPrefs, DEFAULT_CHAT_FONT, useFontPrefs } from './components/FontPrefsDropdown.js';
 import { useQuickData } from './components/QuickInputPanel.js';
 import { NewSessionDialog } from './components/NewSessionDialog.js';
@@ -2211,6 +2216,14 @@ export function App() {
   const pinnedServerIds = useMemo(
     () => new Set(normalizePinnedServers(servers, serverPinned)),
     [servers, serverPinned],
+  );
+  const unifiedServers = useMemo(
+    () => projectUnifiedServerList(servers, sharedEntries, ownedServerIdsRef.current, serverOrder, serverPinned),
+    [servers, sharedEntries, serverOrder, serverPinned],
+  );
+  const restrictedSharedEntries = useMemo(
+    () => filterRestrictedSharedEntries(sharedEntries),
+    [sharedEntries],
   );
   useEffect(() => {
     if (!serversLoaded || !serverOrderHydrated || !serverPinnedHydrated) return;
@@ -5773,6 +5786,22 @@ export function App() {
     window.location.reload();
   }, [setActiveSession]);
 
+  const handleUnifiedServerSelect = useCallback((item: UnifiedServerItem) => {
+    if (item.isSharedIn) {
+      if (item.sharedEntry) {
+        void handleOpenSharedEntry(item.sharedEntry);
+      }
+      return;
+    }
+    handleSelectServer(item.id, item.name);
+  }, [handleOpenSharedEntry, handleSelectServer]);
+
+  const selectedServerIsSharedIn = useMemo(() => {
+    if (!selectedServerId) return false;
+    if (selectedShareTarget !== null) return true;
+    return !ownedServerIdsRef.current.has(selectedServerId) && unifiedServers.some((s) => s.id === selectedServerId && s.isSharedIn);
+  }, [selectedServerId, selectedShareTarget, unifiedServers]);
+
   /**
    * The single consumer of route changes this document did not initiate.
    *
@@ -6968,10 +6997,11 @@ export function App() {
       {!isMobile && (
         <>
           <ServerIconBar
-            servers={orderedServers}
+            servers={unifiedServers}
             activeServerId={selectedServerId}
             onSelectServer={handleSelectServer}
-            onServerContextMenu={(server, x, y) => setServerCtxMenu({ server, x, y })}
+            onOpenSharedEntry={(entry) => void handleOpenSharedEntry(entry)}
+            onServerContextMenu={(server, x, y) => setServerCtxMenu({ server: server as ServerInfo, x, y })}
             sidebarCollapsed={sidebarCollapsed}
             onToggleSidebar={handleToggleSidebar}
             onSettings={() => setShowSettingsPage(true)}
@@ -7040,7 +7070,7 @@ export function App() {
               >⊞</button>
             </div>
             <SharedEntriesPanel
-              entries={sharedEntries}
+              entries={restrictedSharedEntries}
               loading={sharedEntriesLoading}
               error={sharedEntriesError}
               openingEntryId={openingSharedEntryId}
@@ -7270,7 +7300,7 @@ export function App() {
                 onLogout={handleLogout}
                 onOpenUsageSummary={() => setShowUsageSummaryPage(true)}
                 onServersLoaded={applyServerInventory}
-                sharedEntries={sharedEntries}
+                sharedEntries={restrictedSharedEntries}
                 sharedEntriesLoading={sharedEntriesLoading}
                 sharedEntriesLoaded={sharedEntriesLoaded}
                 sharedEntriesError={sharedEntriesError}
@@ -7293,7 +7323,11 @@ export function App() {
                 >
                   <span class="mobile-server-btn-icon" aria-hidden="true">☁</span>
                   <span class="mobile-server-btn-name">{resolvedSelectedServerName ?? 'Server'}</span>
-                  <SharedStateIndicator state={selectedServerSharedOutState} iconOnly variant="shared-out" />
+                  {selectedServerIsSharedIn ? (
+                    <SharedStateIndicator variant="shared-in" iconOnly />
+                  ) : (
+                    <SharedStateIndicator state={selectedServerSharedOutState} iconOnly variant="shared-out" />
+                  )}
                   <span class="mobile-server-btn-chevron" aria-hidden="true">▾</span>
                 </button>
                 {showMobileServerMenu && (
@@ -7317,24 +7351,33 @@ export function App() {
                         ⇄ Switch Cloud Server
                       </button>
                     )}
-                    {orderedServers.map((s) => {
-                      const online = isServerOnline(s);
+                    {unifiedServers.map((s) => {
+                      const online = s.online;
                       return (
                         <button
                           key={s.id}
                           class={`mobile-server-menu-item mobile-server-menu-server${s.id === selectedServerId ? ' active' : ''}${pinnedServerIds.has(s.id) ? ' pinned' : ''}${showSharedReturnGuide && s.id === sharedReturnServer?.id ? ' server-return-hint' : ''}`}
-                          onClick={() => { handleSelectServer(s.id, s.name); setShowMobileServerMenu(false); }}
-                          onContextMenu={(e) => { e.preventDefault(); setShowMobileServerMenu(false); setServerCtxMenu({ server: s, x: e.clientX, y: e.clientY }); }}
+                          onClick={() => { handleUnifiedServerSelect(s); setShowMobileServerMenu(false); }}
+                          onContextMenu={s.isSharedIn ? (e) => e.preventDefault() : (e) => {
+                            e.preventDefault();
+                            setShowMobileServerMenu(false);
+                            const ownedServer = s.server || servers.find((srv) => srv.id === s.id && ownedServerIdsRef.current.has(srv.id));
+                            if (ownedServer) setServerCtxMenu({ server: ownedServer as ServerInfo, x: e.clientX, y: e.clientY });
+                          }}
                         >
                           <span style={{ color: online ? '#4ade80' : '#475569' }}>{online ? '●' : '○'}</span>
                           <span class="mobile-server-menu-name">{s.name}</span>
-                          <SharedStateIndicator state={managedSharedServerStateById.get(s.id) ?? null} iconOnly variant="shared-out" />
+                          {s.isSharedIn ? (
+                            <SharedStateIndicator variant="shared-in" iconOnly />
+                          ) : (
+                            <SharedStateIndicator state={managedSharedServerStateById.get(s.id) ?? null} iconOnly variant="shared-out" />
+                          )}
                         </button>
                       );
                     })}
-                    {sharedEntries.length > 0 && (
+                    {(restrictedSharedEntries.length > 0 || sharedEntriesError !== null) && (
                       <MobileSharedEntriesMenu
-                        entries={sharedEntries}
+                        entries={restrictedSharedEntries}
                         loading={sharedEntriesLoading}
                         error={sharedEntriesError}
                         openingEntryId={openingSharedEntryId}
@@ -7862,7 +7905,7 @@ export function App() {
                     title={trans('sharedContext.management.title')}
                   >CTX</button>
                 )}
-                {(servers.length > 0 || sharedEntriesLoading || sharedEntriesError !== null || sharedEntries.length > 0) && (
+                {(unifiedServers.length > 0 || sharedEntriesLoading || sharedEntriesError !== null || restrictedSharedEntries.length > 0) && (
                   <button
                     class={`mobile-sidebar-hdr-btn${mobileHideServerBar ? '' : ' active'}`}
                     onClick={() => setMobileHideServerBar((p) => { const v = !p; localStorage.setItem('mobile_hide_server_bar', v ? '1' : ''); return v; })}
@@ -7882,16 +7925,21 @@ export function App() {
             <div class="mobile-sidebar-body">
               <ErrorBoundary>
               {/* Server switcher — collapsible via sidebar toggle */}
-              {(servers.length > 0 || sharedEntriesLoading || sharedEntriesError !== null || sharedEntries.length > 0) && !mobileHideServerBar && (
+              {(unifiedServers.length > 0 || sharedEntriesLoading || sharedEntriesError !== null || restrictedSharedEntries.length > 0) && !mobileHideServerBar && (
                 <div style={{ padding: '8px 12px', borderBottom: '1px solid #1e293b' }}>
-                  {orderedServers.map((s) => {
-                    const online = isServerOnline(s);
+                  {unifiedServers.map((s) => {
+                    const online = s.online;
                     return (
                       <button
                         key={s.id}
                         class={`server-item${s.id === selectedServerId ? ' active' : ''}${online ? '' : ' offline'}${showSharedReturnGuide && s.id === sharedReturnServer?.id ? ' server-return-hint' : ''}`}
-                        onClick={() => { handleSelectServer(s.id, s.name); closeSidebar(); }}
-                        onContextMenu={(e) => { e.preventDefault(); closeSidebar(); setServerCtxMenu({ server: s, x: e.clientX, y: e.clientY }); }}
+                        onClick={() => { handleUnifiedServerSelect(s); closeSidebar(); }}
+                        onContextMenu={s.isSharedIn ? (e) => e.preventDefault() : (e) => {
+                          e.preventDefault();
+                          closeSidebar();
+                          const ownedServer = s.server || servers.find((srv) => srv.id === s.id && ownedServerIdsRef.current.has(srv.id));
+                          if (ownedServer) setServerCtxMenu({ server: ownedServer as ServerInfo, x: e.clientX, y: e.clientY });
+                        }}
                       >
                         <span class="server-item-dot" style={{ color: online ? '#4ade80' : '#475569' }}>
                           {online ? '●' : '○'}
@@ -7906,11 +7954,16 @@ export function App() {
                           </span>
                         )}
                         <span class="server-item-name">{s.name}</span>
+                        {s.isSharedIn ? (
+                          <SharedStateIndicator variant="shared-in" iconOnly />
+                        ) : (
+                          <SharedStateIndicator state={managedSharedServerStateById.get(s.id) ?? null} iconOnly variant="shared-out" />
+                        )}
                       </button>
                     );
                   })}
                   <SharedEntriesPanel
-                    entries={sharedEntries}
+                    entries={restrictedSharedEntries}
                     loading={sharedEntriesLoading}
                     error={sharedEntriesError}
                     openingEntryId={openingSharedEntryId}

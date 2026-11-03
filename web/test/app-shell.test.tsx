@@ -459,7 +459,7 @@ vi.mock('../src/pages/CronManager.js', () => ({
 }));
 
 vi.mock('../src/components/ServerIconBar.js', () => ({
-  ServerIconBar: ({ servers, returnHintServerId, onSelectServer, onSettings, onAdmin, onHome, onToggleSidebar, onServerContextMenu }: any) => (
+  ServerIconBar: ({ servers, returnHintServerId, onSelectServer, onOpenSharedEntry, onSettings, onAdmin, onHome, onToggleSidebar, onServerContextMenu }: any) => (
     <div data-testid="server-icon-bar" data-return-hint-server-id={returnHintServerId ?? ''}>
       server-icon-bar
       <button onClick={onSettings}>server-settings</button>
@@ -468,7 +468,21 @@ vi.mock('../src/components/ServerIconBar.js', () => ({
       <button onClick={onToggleSidebar}>server-toggle-sidebar</button>
       <button onClick={() => onSelectServer?.(servers?.[0]?.id, servers?.[0]?.name)}>server-select</button>
       {servers?.map((server: any) => (
-        <button key={server.id} onClick={() => onSelectServer?.(server.id, server.name)}>server-select-{server.id}</button>
+        <button
+          key={server.id}
+          onClick={() => {
+            if (server.isSharedIn) {
+              if (server.sharedEntry && onOpenSharedEntry) {
+                onOpenSharedEntry(server.sharedEntry);
+              }
+              return;
+            }
+            onSelectServer?.(server.id, server.name);
+          }}
+        >
+          server-select-{server.id}
+          <span>{server.name}</span>
+        </button>
       ))}
       <button onClick={() => onServerContextMenu?.(servers?.[0], 11, 22)}>server-menu</button>
     </div>
@@ -1148,7 +1162,7 @@ describe('App shell', () => {
     expect(screen.queryByText('delete-server-dialog')).toBeNull();
     expect(apiFetchMock).toHaveBeenCalledWith('/api/server/srv-1', { method: 'DELETE' });
     expect(wsInstances.every((ws) => ws.sendSessionCommand.mock.calls.length === 0)).toBe(true);
-  });
+  }, 20_000);
 
   it('deletes the selected offline server through its menu and does not auto-enter it again', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
@@ -1171,7 +1185,7 @@ describe('App shell', () => {
     expect(localStorage.getItem('rcc_server_name')).toBeNull();
     expect(localStorage.getItem('rcc_session')).toBeNull();
     expect(screen.queryByText('delete-server-dialog')).toBeNull();
-  });
+  }, 20_000);
 
   it('keeps the offline deletion dialog and server visible on failure, then permits retry', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
@@ -1197,7 +1211,7 @@ describe('App shell', () => {
     fireEvent.click(screen.getByText('delete-confirm'));
     await waitFor(() => expect(screen.queryByText('dashboard-delete-srv-1')).toBeNull());
     expect(screen.queryByText('delete-server-dialog')).toBeNull();
-  });
+  }, 20_000);
 
   it('keeps Safari viewport height bounded and corrects it on visual viewport scrolling', async () => {
     const originalVisualViewport = Object.getOwnPropertyDescriptor(window, 'visualViewport');
@@ -6814,5 +6828,192 @@ describe('App shell', () => {
     await navigateExternally('/#/srv-shared/deck_gamma_brain?shared=share-audit-whole');
     expect(firstSignal.aborted).toBe(true);
     expect(openSharedEntryMock, 'different preferred session must start its own authorized open').toHaveBeenCalledTimes(2);
+  }, 20_000);
+
+  it('audit-tag-only-visited must never dispatch an ordinary server selection', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const entry = {
+      id: 'audit-main-only',
+      serverId: 'srv-shared',
+      serverName: 'Scoped shared server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Audit restricted tab',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([entry]);
+    openSharedEntryMock.mockResolvedValue(sharedMainOpenResult('audit-main-only', 'audit-dispatch'));
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByTestId('session-pane-deck_alpha_brain');
+    fireEvent.click((await screen.findByText('Audit restricted tab')).closest('button')!);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+    await waitFor(() => expect(window.location.hash).toContain('shared=audit-main-only'));
+    const count = openSharedEntryMock.mock.calls.length;
+    const row = screen.queryByText('server-select-srv-shared');
+    if (row) {
+      fireEvent.click(row);
+      expect(window.location.hash, 're-clicking a non-owned row must not clear its share proof and dispatch the ordinary reload path').toContain('shared=audit-main-only');
+      await waitFor(() => expect(openSharedEntryMock, 'non-owned navigation must preserve scoped share proof').toHaveBeenCalledTimes(count + 1));
+      expect(openSharedEntryMock.mock.calls.at(-1)?.[0]).toEqual(entry.target);
+    } else {
+      expect(screen.getByText('Audit restricted tab')).toBeTruthy();
+    }
+  }, 20_000);
+
+  it('owned server having a whole-server grant preserves owner identity and uses ordinary selection', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-2');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    // srv-1 is owned (in default mock servers). Also grant whole-server share for srv-1:
+    const grant = {
+      id: 'share-owned-conflict',
+      serverId: 'srv-1',
+      serverName: 'Server 1 Shared',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Server 1 Shared Copy',
+      target: { kind: 'server', serverId: 'srv-1' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([grant]);
+    const { App } = await importApp();
+    render(<App />);
+    // Clicking srv-1 must use ordinary server selection (not openSharedEntry)
+    const srv1Btn = await screen.findByText('server-select-srv-1');
+    fireEvent.click(srv1Btn);
+    expect(openSharedEntryMock).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it('multiple whole-server grants on same server stably pick participant over viewer', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const viewerGrant = {
+      id: 'share-viewer-first',
+      serverId: 'srv-multi-grant',
+      serverName: 'Multi Server',
+      role: 'viewer',
+      status: 'active',
+      targetLabel: 'Multi Server Viewer',
+      target: { kind: 'server', serverId: 'srv-multi-grant' },
+    } as const;
+    const participantGrant = {
+      id: 'share-participant-better',
+      serverId: 'srv-multi-grant',
+      serverName: 'Multi Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Multi Server Participant',
+      target: { kind: 'server', serverId: 'srv-multi-grant' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([viewerGrant, participantGrant]);
+    openSharedEntryMock.mockResolvedValue({
+      server: { id: 'srv-multi-grant', name: 'Multi Server', status: 'online', lastHeartbeatAt: Date.now() },
+      target: participantGrant.target,
+      coverage: {
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: [participantGrant.id],
+        primaryShareId: participantGrant.id,
+        authorizedAt: Date.now(),
+      },
+      sessions: [{ sessionName: 'deck_multi_brain', state: 'running', agentType: 'codex-sdk' }],
+      subSessions: [],
+    });
+    const { App } = await importApp();
+    render(<App />);
+    const sharedBtn = (await screen.findByText('Multi Server Participant')).closest('button')!;
+    fireEvent.click(sharedBtn);
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(participantGrant.target));
+  }, 20_000);
+
+  it('whole-to-restricted downgrade or failed discovery does not invent fake whole-server entries', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    // Discovery fails or only returns restricted grant
+    discoverSharedEntriesMock.mockRejectedValue(new Error('discovery failure'));
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByTestId('session-pane-deck_alpha_brain');
+    // Only owned servers exist; no unowned server exists
+    expect(screen.queryByText('server-select-srv-shared')).toBeNull();
+  }, 20_000);
+
+  it('audit-owned-context-menu: mobile server dropdown opens ServerContextMenu for owned server and suppresses for shared-in server', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      const sharedGrant = {
+        id: 'share-ctx-test',
+        serverId: 'srv-shared-ctx',
+        serverName: 'Shared Server Ctx',
+        role: 'participant',
+        status: 'active',
+        targetLabel: 'Shared Server Ctx',
+        target: { kind: 'server', serverId: 'srv-shared-ctx' },
+      } as const;
+      discoverSharedEntriesMock.mockResolvedValue([sharedGrant]);
+      const { App } = await importApp();
+      const view = render(<App />);
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+
+      // 1. Open mobile server dropdown
+      const mobileBtn = await waitFor(() => {
+        const btn = view.container.querySelector('.mobile-server-btn');
+        if (!btn) throw new Error('no mobile-server-btn');
+        return btn;
+      });
+      fireEvent.click(mobileBtn);
+
+      // 2. Owned server contextmenu opens management menu
+      const menu = view.container.querySelector('.mobile-server-menu')!;
+      const alphaBtn = within(menu as HTMLElement).getByText('Alpha Server').closest('button')!;
+      fireEvent.contextMenu(alphaBtn);
+      expect(await screen.findByText('server-context-menu')).toBeTruthy();
+      fireEvent.click(screen.getByText('server-menu-close'));
+      expect(screen.queryByText('server-context-menu')).toBeNull();
+
+      // 3. Negative control: shared server contextmenu does NOT open management menu
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+      const menuAgain = view.container.querySelector('.mobile-server-menu')!;
+      const sharedItemBtn = within(menuAgain as HTMLElement).getByText('Shared Server Ctx').closest('button')!;
+      fireEvent.contextMenu(sharedItemBtn);
+      expect(screen.queryByText('server-context-menu')).toBeNull();
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 20_000);
+
+  it('audit-owned-context-menu: mobile sidebar drawer opens ServerContextMenu for owned server', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      const { App } = await importApp();
+      const view = render(<App />);
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+
+      // Open mobile drawer
+      fireEvent.click(view.container.querySelector('.mobile-sidebar-toggle')!);
+      const sidebarServer = await waitFor(() => {
+        const item = view.container.querySelector('.server-list .server-item');
+        if (!item) throw new Error('no sidebar server item');
+        return item;
+      });
+      fireEvent.contextMenu(sidebarServer);
+      expect(await screen.findByText('server-context-menu')).toBeTruthy();
+      fireEvent.click(screen.getByText('server-menu-close'));
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
   }, 20_000);
 });

@@ -218,6 +218,7 @@
     "indicator": "{{scope}} compartido como {{role}} · {{status}}",
     "indicatorCompact": "Compartido como {{role}} · {{status}}",
     "indicatorSharedOut": "Compartido con otros",
+    "indicatorSharedIn": "Compartido conmigo",
     "actorLabel": "{{name}} · {{role}}",
     "status": {
       "active": "Activo",

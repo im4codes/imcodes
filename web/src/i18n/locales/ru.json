@@ -218,6 +218,7 @@
     "indicator": "{{scope}} предоставлена как {{role}} · {{status}}",
     "indicatorCompact": "Доступ как {{role}} · {{status}}",
     "indicatorSharedOut": "Доступ открыт другим",
+    "indicatorSharedIn": "Доступ предоставлен мне",
     "actorLabel": "{{name}} · {{role}}",
     "status": {
       "active": "Активен",
