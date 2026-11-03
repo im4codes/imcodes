@@ -24,6 +24,13 @@ export function resolveDecisionCategory(
   if (question && !resolved) {
     return 'request';
   }
+  if (pair.blockedNote) {
+    return 'blocked';
+  }
+  const isBlocked = pair.flags?.some((flag) => flag === 'blocked' || flag === 'needs_input');
+  if (isBlocked) {
+    return 'legacy_unknown';
+  }
   if (pair.flags?.some((flag) => flag === 'waiting_for_capacity' || flag === 'needs_auditor')) {
     return 'waiting_capacity';
   }
@@ -34,16 +41,12 @@ export function resolveDecisionCategory(
   if (wait === 'paused') {
     return 'paused';
   }
-  const isBlocked = pair.flags?.some((flag) => flag === 'blocked' || flag === 'needs_input');
   if (
     pair.status === 'passed' ||
     pair.lastVerdict === 'PASS' ||
-    (pair.status === 'awaiting_brain_decision' && !isBlocked)
+    pair.status === 'awaiting_brain_decision'
   ) {
     return 'completed_awaiting_brain';
-  }
-  if (isBlocked && pair.blockedNote) {
-    return 'blocked';
   }
   return 'legacy_unknown';
 }
@@ -73,12 +76,15 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
   useEffect(() => () => { active.current = false; }, []);
   const question = pair.decisionRequest;
   const latest = (readOnly ? history?.find((entry) => entry.kind === TASK_PAIR_DECISION_KIND.DECISION) : history?.[0]) ?? pair.latestDecision;
-  const resolved = !!question && latest?.kind === TASK_PAIR_DECISION_KIND.DECISION && (latest.requestId === question.id || latest.round === question.round && latest.at >= question.at);
+  const resolved = !!question && latest?.kind === TASK_PAIR_DECISION_KIND.DECISION && (
+    latest.requestId ? latest.requestId === question.id : (latest.round === question.round && latest.at >= question.at)
+  );
   const waiting = !TASK_PAIR_TERMINAL_STATUSES.includes(pair.status) && !!(
     taskPairWaitKind(pair)
     || (question && !resolved)
     || pair.status === 'awaiting_brain_decision'
     || pair.status === 'passed'
+    || !!pair.blockedNote
     || pair.flags?.some((flag) => flag === 'blocked' || flag === 'needs_input' || flag === 'waiting_for_capacity' || flag === 'needs_auditor')
   );
 
@@ -164,7 +170,7 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
     reason,
     responsible,
     question?.recommendation ? `${t('taskPair.decision.recommendation')}: ${question.recommendation}` : '',
-    latest?.kind === TASK_PAIR_DECISION_KIND.DECISION ? `${t('taskPair.decision.ruling')}: ${latest.conclusion} — ${latest.summary}` : '',
+    latest?.kind === TASK_PAIR_DECISION_KIND.DECISION && (!question || (latest.requestId ? latest.requestId === question.id : resolved)) ? `${t('taskPair.decision.ruling')}: ${latest.conclusion} — ${latest.summary}` : '',
   ].filter(Boolean).join('\n');
 
   if (!waiting && !question && !latest) return null;

@@ -586,13 +586,17 @@ export class TaskPairService {
 
   async #flushDecisionNotifications(now: number): Promise<void> {
     const store = getTaskPairStore();
-    for (const pending of store.listPendingDecisionNotifications(100)) {
-      store.markDecisionNotificationAttempt(pending.id, now);
+    let pendingList: ReturnType<typeof store.listPendingDecisionNotifications> = [];
+    try { pendingList = store.listPendingDecisionNotifications(100); } catch { return; }
+    for (const pending of pendingList) {
+      try { store.markDecisionNotificationAttempt(pending.id, now); } catch { return; }
       let status: TaskPairDeliveryResult = 'failed';
       try { status = await sendTaskPairMessage(pending.target, pending.taskId, pending.reason, pending.text, pending.decisionId); } catch { /* retain the row for the next heartbeat */ }
       // skipped_pending can be only the process-local in-flight gate; the
       // original send may still fail, so keep this row pending for retry.
-      if (status === 'sent' || status === 'queued') store.markDecisionNotificationDelivered(pending.id, now);
+      if (status === 'sent' || status === 'queued') {
+        try { store.markDecisionNotificationDelivered(pending.id, now); } catch { return; }
+      }
     }
   }
 

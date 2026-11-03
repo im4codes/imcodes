@@ -334,5 +334,70 @@ describe('TaskPairDecisionPanel', () => {
       expect(screen.getByRole('button', { name: 'taskPair.decision.ready' })).toBeTruthy();
       expect(screen.getByRole('button', { name: 'taskPair.decision.wait' })).toBeTruthy();
     });
+
+    it('a current BLOCKED note after PASS must not become completed-awaiting-Brain (F1)', () => {
+      render(
+        <TaskPairDecisionPanel
+          taskId="task"
+          pair={{
+            status: 'passed',
+            round: 1,
+            lastVerdict: 'PASS',
+            flags: ['blocked'],
+            flagSides: { blocked: 'executor' },
+            blockedNote: 'Current merge conflict needs input',
+            executor: 'Ag1',
+            brain: 'BrainChief',
+            decisionRevision: 'rev-1',
+          }}
+        />,
+      );
+      expect(screen.getByTestId('expandable-task-objective-text').textContent).toContain('Current merge conflict needs input');
+      expect(screen.queryByText('taskPair.decision.title_completed')).toBeNull();
+      expect(screen.getByText('taskPair.decision.title_blocked')).toBeTruthy();
+    });
+
+    it('a pair with only an authoritative blockedNote still explains the blocker (F1)', () => {
+      render(
+        <TaskPairDecisionPanel
+          taskId="task"
+          pair={{
+            status: 'working',
+            round: 1,
+            flags: [],
+            blockedNote: 'Approval source has not been provided',
+            decisionRevision: 'rev-1',
+          }}
+        />,
+      );
+      const copy = screen.queryByTestId('expandable-task-objective-text');
+      expect(copy).not.toBeNull();
+      expect(copy!.textContent).toContain('Approval source has not been provided');
+      expect(screen.getByText('taskPair.decision.title_blocked')).toBeTruthy();
+    });
+
+    it('a late ruling for old question A must not resolve new same-round question B (F2)', () => {
+      const a: any = {
+        id: 'a', project: 'p', taskId: 'task', round: 1, kind: 'request',
+        conclusion: 'Old', summary: 'Old issue', question: 'Old issue?', author: 'exec', at: 10,
+      };
+      const b: any = { ...a, id: 'b', question: 'Current issue B?', summary: 'Current issue B', at: 20 };
+      render(
+        <TaskPairDecisionPanel
+          taskId="task"
+          pair={{
+            status: 'working',
+            round: 1,
+            flags: ['needs_input'],
+            decisionRevision: 'rev-1',
+            decisionRequest: b,
+            latestDecision: { ...a, id: 'ruling-a', kind: 'decision', requestId: 'a', conclusion: 'Resolved A', at: 30 },
+          }}
+        />,
+      );
+      expect(screen.queryByText('taskPair.decision.resolved')).toBeNull();
+      expect(screen.getByTestId('expandable-task-objective-text').textContent).toContain('Current issue B?');
+      expect(screen.getByText('taskPair.decision.title_request')).toBeTruthy();
+    });
   });
 });

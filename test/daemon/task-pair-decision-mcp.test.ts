@@ -10,7 +10,7 @@ import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.j
 import { TaskPairStore, getTaskPairStore, setTaskPairStoreForTests } from '../../src/daemon/task-pairs/store.js';
 import { setTaskPairDeliveryDepsForTests } from '../../src/daemon/task-pairs/delivery.js';
 import { taskPairService } from '../../src/daemon/task-pairs/service.js';
-import { taskPairDecisionReminderDue } from '../../src/daemon/task-pairs/scheduler.js';
+import { taskPairDecisionReminderDue, checkTaskPairMissingExplanation } from '../../src/daemon/task-pairs/scheduler.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import type { TaskPairState } from '../../shared/task-pair.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
@@ -128,5 +128,120 @@ describe('pair decision MCP', () => {
     expect(taskPairDecisionReminderDue({ status: 'working', now: base + 600_000, pairUpdatedAt: base })).toBe(false);
   });
 
+  it('durably requests explanation for unknown blocked tasks once per context and survives restart (F3)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'explain-store-'));
+    const path = join(dir, 'pairs.sqlite');
+    try {
+      const first = new TaskPairStore(path);
+      const blockedState = {
+        ...state,
+        taskId: 'unexplained-1',
+        status: 'working',
+        flags: ['blocked'],
+        round: 1,
+        deliveryRound: 1,
+      } as unknown as TaskPairState;
+      first.savePair('p', blockedState);
+      setTaskPairStoreForTests(first);
+
+      const stored = first.getPair('p', 'unexplained-1')!;
+      // First check: enqueues durable notification into SQLite
+      const enqueued = checkTaskPairMissingExplanation(stored, 100);
+      expect(enqueued).toBe(true);
+
+      const pending = first.listPendingDecisionNotifications();
+      expect(pending).toHaveLength(1);
+      expect(pending[0].reason).toBe('missing-explanation-request');
+      expect(pending[0].decisionId).toContain('missing-explanation:p:unexplained-1:1:1:blocked');
+
+      // Repeated tick with same context: deduped by SQLite primary key, does NOT re-enqueue
+      const secondCheck = checkTaskPairMissingExplanation(stored, 200);
+      expect(secondCheck).toBe(false);
+      expect(first.listPendingDecisionNotifications()).toHaveLength(1);
+
+      // Reopen store across restart: notification remains in SQLite and dedup holds
+      await taskPairService.waitForIdle();
+      first.close();
+      const reopened = new TaskPairStore(path);
+      setTaskPairStoreForTests(reopened);
+      expect(reopened.listPendingDecisionNotifications()).toHaveLength(1);
+
+      const reopenedStored = reopened.getPair('p', 'unexplained-1')!;
+      const thirdCheck = checkTaskPairMissingExplanation(reopenedStored, 300);
+      expect(thirdCheck).toBe(false);
+      expect(reopened.listPendingDecisionNotifications()).toHaveLength(1);
+
+      // Exclusions: completed task awaiting Brain does not enqueue
+      const completedStored = { ...reopenedStored, state: { ...reopenedStored.state, status: 'passed' as const, flags: [] } };
+      expect(checkTaskPairMissingExplanation(completedStored, 400)).toBe(false);
+
+      // Exclusions: task with existing blockedNote does not enqueue
+      const notedStored = { ...reopenedStored, state: { ...reopenedStored.state, blockedNote: 'Actual note' } };
+      expect(checkTaskPairMissingExplanation(notedStored, 400)).toBe(false);
+
+      // Exclusions: capacity wait does not enqueue
+      const capacityStored = { ...reopenedStored, state: { ...reopenedStored.state, blockedNote: undefined, flags: ['waiting_for_capacity'] as any } };
+      expect(checkTaskPairMissingExplanation(capacityStored, 400)).toBe(false);
+
+      // Advancing to round 2 with unexplained blocker: allows exactly one notification for new round
+      const round2Stored = { ...reopenedStored, state: { ...reopenedStored.state, round: 2, blockedNote: undefined, flags: ['blocked'] as any } };
+      const round2Enqueued = checkTaskPairMissingExplanation(round2Stored, 500);
+      expect(round2Enqueued).toBe(true);
+      expect(reopened.listPendingDecisionNotifications()).toHaveLength(2);
+
+      await taskPairService.waitForIdle();
+      reopened.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('distinguishes late ruling for question A from new same-round question B in isDecisionResolved (F2)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'resolve-store-'));
+    const path = join(dir, 'pairs.sqlite');
+    try {
+      const store = new TaskPairStore(path);
+      store.savePair('p', state);
+
+      const reqA = {
+        id: 'q-a', project: 'p', taskId: state.taskId, round: 1, deliveryRound: 1,
+        kind: 'request' as const, conclusion: 'A', summary: 'Question A', author: 'exec', at: 10,
+      };
+      const reqB = {
+        id: 'q-b', project: 'p', taskId: state.taskId, round: 1, deliveryRound: 1,
+        kind: 'request' as const, conclusion: 'B', summary: 'Question B', author: 'exec', at: 20,
+      };
+
+      store.recordDecision(reqA);
+      store.recordDecision(reqB);
+
+      // Prior to any decision: both unresolved
+      expect(store.isDecisionResolved(reqA)).toBe(false);
+      expect(store.isDecisionResolved(reqB)).toBe(false);
+
+      // Ruling explicitly for A at 30
+      store.recordDecision({
+        id: 'ruling-a', project: 'p', taskId: state.taskId, round: 1, deliveryRound: 1,
+        kind: 'decision' as const, conclusion: 'PASS A', summary: 'Approved A', author: 'brain', at: 30,
+        requestId: 'q-a',
+      });
+
+      // Question A is resolved; Question B is NOT resolved despite ruling.at >= reqB.at!
+      expect(store.isDecisionResolved(reqA)).toBe(true);
+      expect(store.isDecisionResolved(reqB)).toBe(false);
+
+      // Ruling explicitly for B resolves B
+      store.recordDecision({
+        id: 'ruling-b', project: 'p', taskId: state.taskId, round: 1, deliveryRound: 1,
+        kind: 'decision' as const, conclusion: 'PASS B', summary: 'Approved B', author: 'brain', at: 40,
+        requestId: 'q-b',
+      });
+      expect(store.isDecisionResolved(reqB)).toBe(true);
+
+      store.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 

@@ -829,8 +829,17 @@ export class TaskPairStore {
   }
 
   isDecisionResolved(question: TaskPairDecisionRecord): boolean {
-    return !!this.#db.prepare("SELECT id FROM task_pair_decisions WHERE project = ? AND task_id = ? AND kind = 'decision' AND COALESCE(json_extract(details_json, '$.deliveryRound'), 1) = ? AND (json_extract(details_json, '$.requestId') = ? OR (round = ? AND at >= ?)) LIMIT 1")
-      .get(question.project, question.taskId, question.deliveryRound ?? 1, question.id, question.round, question.at);
+    return !!this.#db.prepare(`
+      SELECT id FROM task_pair_decisions
+      WHERE project = ? AND task_id = ? AND kind = 'decision'
+        AND COALESCE(json_extract(details_json, '$.deliveryRound'), 1) = ?
+        AND round = ?
+        AND (
+          json_extract(details_json, '$.requestId') = ?
+          OR (json_extract(details_json, '$.requestId') IS NULL AND at >= ?)
+        )
+      LIMIT 1
+    `).get(question.project, question.taskId, question.deliveryRound ?? 1, question.round, question.id, question.at);
   }
 
   latestDecision(project: string, taskId: string, round?: number): TaskPairDecisionRecord | undefined {
@@ -850,13 +859,13 @@ export class TaskPairStore {
     return rows.map(decisionFromRow);
   }
 
-  enqueueDecisionNotification(input: Omit<TaskPairDecisionNotification, 'id' | 'attempts' | 'lastAttemptAt' | 'deliveredAt'>): TaskPairDecisionNotification {
+  enqueueDecisionNotification(input: Omit<TaskPairDecisionNotification, 'id' | 'attempts' | 'lastAttemptAt' | 'deliveredAt'>): TaskPairDecisionNotification & { inserted: boolean } {
     const id = `${input.decisionId}:${input.target}`;
-    this.#db.prepare(`INSERT OR IGNORE INTO task_pair_decision_notifications (id, project, task_id, decision_id, target, reason, text, attempts) VALUES (?, ?, ?, ?, ?, ?, ?, 0)`).run(
+    const result = this.#db.prepare(`INSERT OR IGNORE INTO task_pair_decision_notifications (id, project, task_id, decision_id, target, reason, text, attempts) VALUES (?, ?, ?, ?, ?, ?, ?, 0)`).run(
       id, input.project, input.taskId, input.decisionId, input.target, input.reason, input.text,
     );
     const row = this.#db.prepare('SELECT * FROM task_pair_decision_notifications WHERE id = ?').get(id) as Record<string, unknown>;
-    return decisionNotificationFromRow(row);
+    return Object.assign(decisionNotificationFromRow(row), { inserted: result.changes > 0 });
   }
 
   listPendingDecisionNotifications(limit = 100): TaskPairDecisionNotification[] {
@@ -1043,6 +1052,6 @@ export function flushTaskPairStoreLiveness(): void {
 }
 
 export function setTaskPairStoreForTests(store: TaskPairStore | undefined): void {
-  singleton?.close?.();
+  try { singleton?.close?.(); } catch { /* database may already be closed */ }
   singleton = store;
 }
