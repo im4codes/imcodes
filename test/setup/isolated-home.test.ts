@@ -46,6 +46,18 @@ function realDaemonLog(): string {
   }
 }
 
+/** Observe the async destination instead of assuming a fixed sleep flushed it. */
+async function isolatedLogContaining(marker: string): Promise<string> {
+  const isolatedLog = join(process.env.HOME!, '.imcodes', 'logs', 'daemon.log');
+  let contents = '';
+  await vi.waitFor(() => {
+    expect(existsSync(isolatedLog), 'the logger did not write inside the isolated home').toBe(true);
+    contents = readFileSync(isolatedLog, 'utf8');
+    expect(contents).toContain(marker);
+  }, { timeout: 2_000, interval: 20 });
+  return contents;
+}
+
 describe('daemon test workers run in an isolated home', () => {
   afterEach(() => {
     vi.useRealTimers();
@@ -73,18 +85,12 @@ describe('daemon test workers run in an isolated home', () => {
     // daemon.log. A RED that pollutes the file it is protecting is not a RED.
     expect(process.env.HOME, 'refusing to log: HOME is the real user home').not.toBe(REAL_HOME);
 
-    const isolatedHome = process.env.HOME!;
     const marker = `isolated-home-guard-${randomUUID()}`;
     const before = realDaemonLog();
 
     const { default: logger } = await import('../../src/util/logger.js');
     logger.info({ marker }, 'isolated home guard');
-    // pino's file destination is async; flush before reading.
-    await new Promise((resolve) => setTimeout(resolve, 50));
-
-    const isolatedLog = join(isolatedHome, '.imcodes', 'logs', 'daemon.log');
-    expect(existsSync(isolatedLog), 'the logger did not write inside the isolated home').toBe(true);
-    expect(readFileSync(isolatedLog, 'utf8')).toContain(marker);
+    await isolatedLogContaining(marker);
 
     // The real log gained nothing: not the marker, and not any new bytes from us.
     const after = realDaemonLog();
@@ -106,11 +112,7 @@ describe('daemon test workers run in an isolated home', () => {
     const { default: logger } = await import('../../src/util/logger.js');
     logger.info({ marker }, 'mocked clock guard');
     vi.useRealTimers();
-    await new Promise((resolve) => setTimeout(resolve, 50));
-
-    const isolatedLog = join(process.env.HOME!, '.imcodes', 'logs', 'daemon.log');
-    const isolated = readFileSync(isolatedLog, 'utf8');
-    expect(isolated).toContain(marker);
+    const isolated = await isolatedLogContaining(marker);
     // The fake timestamp is real evidence of the mechanism: it landed in the
     // isolated log, which is exactly where such a line belongs.
     expect(isolated).toContain(`"time":${frozen.getTime()}`);
@@ -126,10 +128,7 @@ describe('daemon test workers run in an isolated home', () => {
     // production log.
     const marker = `static-import-guard-${randomUUID()}`;
     staticallyImportedLogger.info({ marker }, 'static import guard');
-    await new Promise((resolve) => setTimeout(resolve, 50));
-
-    const isolatedLog = join(process.env.HOME!, '.imcodes', 'logs', 'daemon.log');
-    expect(readFileSync(isolatedLog, 'utf8')).toContain(marker);
+    await isolatedLogContaining(marker);
     expect(realDaemonLog()).not.toContain(marker);
   });
 
