@@ -313,6 +313,9 @@ export interface ProviderConfig {
 
 /** Parameters for creating a new session on the provider. */
 export interface SessionConfig {
+  /** Local-only AG lifecycle barrier. Must persist start evidence before a native
+   * process can be spawned; never serialized to a provider protocol. */
+  beforeNativeSessionStart?: () => Promise<void>;
   /** Local session key used by the daemon to identify this session. */
   sessionKey: string;
   /** Exact IM.codes session name whose identity is injected into managed MCP servers. */

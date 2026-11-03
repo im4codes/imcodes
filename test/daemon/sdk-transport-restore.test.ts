@@ -1,5 +1,7 @@
+import { AGY_NATIVE_SESSION_STATE as AG } from '../../shared/agy-agent.js';
+import { AgySdkProvider } from '../../src/agent/providers/agy-sdk.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdir, symlink } from 'node:fs/promises';
+import { mkdir, symlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 import { writeProcessedProjection } from '../../src/store/context-store.js';
@@ -15,7 +17,7 @@ const mocks = vi.hoisted(() => {
   // Whether the mock app-server reports the IM delegation MCP server as
   // connected. Default true so ordinary Brain turns may start; a control test
   // flips it to prove the production gate actually blocks the turn.
-  return { store, claudeRuns, codexRuns, claudeFailures, mcpDelegationConnected: true, claudeSessionIdOverride: undefined as string | undefined };
+  return { store, realStore: undefined as any, claudeRuns, codexRuns, claudeFailures, mcpDelegationConnected: true, claudeSessionIdOverride: undefined as string | undefined };
 });
 
 const reassignSessionFileMock = vi.hoisted(() => vi.fn());
@@ -167,11 +169,13 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
-  listSessions: vi.fn(() => [...mocks.store.values()]),
-  getSession: vi.fn((name: string) => mocks.store.get(name) ?? null),
-  upsertSession: vi.fn((record: Record<string, any>) => { if (record.name) mocks.store.set(record.name, record); }),
-  removeSession: vi.fn((name: string) => { mocks.store.delete(name); }),
+  flushStore: vi.fn(async (options?: any) => { if (mocks.realStore) await mocks.realStore.flushStore(options); }),
+  listSessions: vi.fn(() => mocks.realStore ? mocks.realStore.listSessions() : [...mocks.store.values()]),
+  getSession: vi.fn((name: string) => mocks.realStore ? mocks.realStore.getSession(name) : mocks.store.get(name) ?? null),
+  upsertSession: vi.fn((record: Record<string, any>) => { if (mocks.realStore) mocks.realStore.upsertSession(record); else if (record.name) mocks.store.set(record.name, record); }),
+  removeSession: vi.fn((name: string) => { if (mocks.realStore) mocks.realStore.removeSession(name); else mocks.store.delete(name); }),
   updateSessionState: vi.fn((name: string, state: string) => {
+    if (mocks.realStore) { mocks.realStore.updateSessionState(name, state); return; }
     const existing = mocks.store.get(name);
     if (existing) mocks.store.set(name, { ...existing, state });
   }),
@@ -233,6 +237,7 @@ import {
   launchTransportSession,
   relaunchSessionWithSettings,
   restoreTransportSessions,
+  stopTransportRuntimeSession,
   setSessionEventCallback,
   setSessionPersistCallback,
 } from '../../src/agent/session-manager.js';
@@ -493,12 +498,19 @@ describe('sdk transport session restore', () => {
 
   beforeEach(async () => {
     tempDir = await createIsolatedSharedContextDb('sdk-transport-restore');
+    // The app-server is mocked; an explicitly scoped CODEX_HOME must not turn
+    // this fixture into a dependency on the developer's real login.
+    const codexHome = path.join(tempDir, 'codex');
+    await mkdir(codexHome, { recursive: true });
+    await writeFile(path.join(codexHome, 'auth.json'), JSON.stringify({ OPENAI_API_KEY: 'fixture-only-not-a-real-key' }));
+    vi.stubEnv('CODEX_HOME', codexHome);
   });
 
   afterEach(async () => {
     await disconnectAll();
     openCodeSdkRuntimeHooks.start = originalOpenCodeStart;
     await cleanupIsolatedSharedContextDb(tempDir);
+    vi.unstubAllEnvs();
   });
 
   it('preserves an explicit effort when a restore launch omits the optional field', async () => {
@@ -622,6 +634,238 @@ describe('sdk transport session restore', () => {
     } finally {
       resetProcessRoleForTests();
     }
+  });
+
+  it('restores a newly launched unused AG route after daemon state is lost', async () => {
+    const name = 'deck_sdk_ag_unused_brain';
+    await launchTransportSession({ name, projectName: 'sdk-ag-unused', role: 'brain', agentType: 'agy-sdk', projectDir: tempDir });
+    const record = { ...mocks.store.get(name)! };
+    expect(record.providerResumeId).toBeUndefined();
+    // No send: the adapter has not spawned the native conversation at all.
+    await stopTransportRuntimeSession(name);
+    await disconnectAll();
+    mocks.store.set(name, record);
+    await connectProvider('agy-sdk', {});
+    await restoreTransportSessions('agy-sdk', { sessionName: name });
+    expect(getTransportRuntime(name)?.providerSessionId).toBeTruthy();
+  });
+
+  it.each([undefined, AG.STARTED])('keeps an AG record with %s creation evidence and no id unbound', async state => {
+    const name = 'deck_sdk_ag_unknown_brain';
+    mocks.store.set(name, { name, projectName: 'sdk-ag-unknown', role: 'brain', agentType: 'agy-sdk',
+      providerId: 'agy-sdk', providerSessionId: 'legacy-route', projectDir: tempDir, state: 'idle',
+      createdAt: 1, updatedAt: 1, restarts: 0, restartTimestamps: [], runtimeType: 'transport',
+      ...(state ? { agyNativeSessionState: state } : {}) });
+    await connectProvider('agy-sdk', {});
+    await restoreTransportSessions('agy-sdk', { sessionName: name });
+    expect(getTransportRuntime(name)).toBeUndefined();
+    expect(mocks.store.get(name)?.providerSessionId).toBe('legacy-route');
+    await expect(launchTransportSession({ name, projectName: 'sdk-ag-unknown', role: 'brain', agentType: 'agy-sdk', projectDir: tempDir }))
+      .rejects.toThrow('refusing an implicit fresh launch');
+  });
+
+  it.each(['brain', 'w1'])('persists AG late init for a %s and resumes only its native id', async role => {
+    const name = `deck_sdk_ag_info_${role}`;
+    let config: any;
+    const createSpy = vi.spyOn(AgySdkProvider.prototype, 'createSession').mockImplementation(async c => { config = c; return c.sessionKey; });
+    await launchTransportSession({ name, projectName: 'sdk-ag-info', role, agentType: 'agy-sdk', projectDir: tempDir });
+    expect(mocks.store.get(name)?.agyNativeSessionState).toBe(AG.UNSTARTED);
+    await config.beforeNativeSessionStart();
+    expect(mocks.store.get(name)?.agyNativeSessionState).toBe(AG.STARTED);
+    const provider = (await import('../../src/agent/provider-registry.js')).getProvider('agy-sdk')!;
+    (provider as any).emitSessionInfo(getTransportRuntime(name)!.providerSessionId, { resumeId: 'native-'+role });
+    expect(mocks.store.get(name)?.providerResumeId).toBe('native-'+role);
+    const saved = { ...mocks.store.get(name)! };
+    await stopTransportRuntimeSession(name);
+    await disconnectAll();
+    mocks.store.set(name, saved);
+    await connectProvider('agy-sdk', {});
+    await restoreTransportSessions('agy-sdk', { sessionName: name });
+    expect(config.resumeId).toBe('native-'+role);
+    expect(config.sessionKey).not.toBe(config.resumeId);
+    expect(getTransportRuntime(name)?.providerSessionId).toBeTruthy();
+    createSpy.mockRestore();
+  });
+
+  it('restores two unused same-cwd AG owners, drains each queue once and never replays accepted ids', async () => {
+    const configs = new Map<string, any>(); const sent: Array<{ owner: string; text: string }> = [];
+    const createSpy = vi.spyOn(AgySdkProvider.prototype, 'createSession').mockImplementation(async c => { configs.set(c.sessionKey,c); return c.sessionKey; });
+    const sendSpy = vi.spyOn(AgySdkProvider.prototype, 'send').mockImplementation(async function(this: AgySdkProvider, sid, payload) {
+      await configs.get(sid).beforeNativeSessionStart();
+      const record = [...mocks.store.values()].find(r=>r.providerSessionId===sid)!;
+      expect(record.agyNativeSessionState).toBe(AG.STARTED);
+      const text = typeof payload==='string'?payload:payload.userMessage;
+      sent.push({owner:record.name,text});
+      (this as any).emitSessionInfo(sid,{resumeId:'native-'+record.name});
+      setTimeout(()=>{ for(const cb of (this as any).completeCallbacks) cb(sid,{id:'done-'+sent.length,content:'ok',role:'assistant',timestamp:Date.now()}); },0);
+    });
+    try {
+      const names=['deck_sdk_ag_queue_brain','deck_sdk_ag_queue_w1'];
+      const ids: Record<string,string[]> = {};
+      for(const [i,name] of names.entries()) {
+        await launchTransportSession({name,projectName:'sdk-ag-queue',role:i?'w1':'brain',agentType:'agy-sdk',projectDir:tempDir});
+        if(i)mocks.store.set(name,{...mocks.store.get(name),parentSession:names[0]});
+        await stopTransportRuntimeSession(name);
+        const {sessionInstanceId,runtimeEpoch}=mocks.store.get(name)!;
+        const recipient={sessionInstanceId,runtimeEpoch};
+        expect(enqueueResend(name,{recipient,text:name+'-one',commandId:name+'-one',queuedAt:Date.now()}).accepted).toBe(true);
+        expect(enqueueResend(name,{recipient,text:name+'-two',commandId:name+'-two',queuedAt:Date.now()}).accepted).toBe(true);
+        ids[name]=getResendEntries(name).map(e=>e.clientMessageId!);
+      }
+      await disconnectAll();await connectProvider('agy-sdk',{});
+      await restoreTransportSessions('agy-sdk',{concurrency:2,interSessionDelayMs:0});
+      await vi.waitFor(()=>expect(sent).toHaveLength(4));
+      for(const name of names) {
+        expect(sent.filter(s=>s.owner===name).map(s=>s.text)).toEqual([name+'-one',name+'-two']);
+        await vi.waitFor(()=>expect(getTransportQueueStore().readSnapshot(name).pendingMessageEntries).toEqual([]));
+        for(const id of ids[name])expect(getTransportQueueStore().hasDeliveryTombstone(name,id)).toBe(true);
+      }
+      await restoreTransportSessions('agy-sdk');expect(sent).toHaveLength(4);
+      expect(mocks.store.get(names[1])?.parentSession).toBe(names[0]);
+    } finally { sendSpy.mockRestore();createSpy.mockRestore(); }
+  });
+
+  it('keeps both unaccepted AG queue entries when the start commit fails without auto-relaunch', async () => {
+    let config: any; let effects=0;
+    const createSpy=vi.spyOn(AgySdkProvider.prototype,'createSession').mockImplementation(async c=>{config=c;return c.sessionKey;});
+    const sendSpy=vi.spyOn(AgySdkProvider.prototype,'send').mockImplementation(async()=>{await config.beforeNativeSessionStart();effects++;});
+    const storeModule=await import('../../src/store/session-store.js');
+    const flush=vi.mocked(storeModule.flushStore);
+    const originalFlush=flush.getMockImplementation()!;
+    try {
+      const name='deck_sdk_ag_writefail_brain';
+      await launchTransportSession({name,projectName:'sdk-ag-writefail',role:'brain',agentType:'agy-sdk',projectDir:tempDir});
+      await stopTransportRuntimeSession(name);await disconnectAll();
+      const {sessionInstanceId,runtimeEpoch}=mocks.store.get(name)!;
+      const recipient={sessionInstanceId,runtimeEpoch};
+      expect(enqueueResend(name,{recipient,text:'one',commandId:'ag-fail-one',queuedAt:Date.now()}).accepted).toBe(true);
+      expect(enqueueResend(name,{recipient,text:'two',commandId:'ag-fail-two',queuedAt:Date.now()}).accepted).toBe(true);
+      flush.mockRejectedValue(new Error('fixture disk full'));
+      await connectProvider('agy-sdk',{});await restoreTransportSessions('agy-sdk',{sessionName:name});
+      await vi.waitFor(()=>expect(getTransportRuntime(name)?.getStatus()).toBe('error'));
+      await vi.waitFor(()=>expect(getTransportQueueStore().readSnapshot(name).pendingMessageEntries).toHaveLength(2));
+      expect(effects).toBe(0);expect(createSpy).toHaveBeenCalledTimes(2);
+      expect(mocks.store.get(name)?.agyNativeSessionState).toBe(AG.STARTED);
+    } finally { flush.mockImplementation(originalFlush);sendSpy.mockRestore();createSpy.mockRestore(); }
+  });
+
+  it.each(['stop','delete','recreate','rebind'])('does not commit a late AG launch after %s', async action => {
+    const name='deck_sdk_ag_init_brain';
+    await launchTransportSession({name,projectName:'sdk-ag-init',role:'brain',agentType:'agy-sdk',projectDir:tempDir});
+    await stopTransportRuntimeSession(name);
+    const saved={...mocks.store.get(name)!};
+    const gate=deferred<string>();let config:any;
+    const createSpy=vi.spyOn(AgySdkProvider.prototype,'createSession').mockImplementation(async c=>{config=c;return gate.promise;});
+    try {
+      const launch=launchTransportSession({name,projectName:'sdk-ag-init',role:'brain',agentType:'agy-sdk',projectDir:tempDir});
+      const rejected=expect(launch).rejects.toMatchObject({code:PROVIDER_ERROR_CODES.CANCELLED});
+      await vi.waitFor(()=>expect(config).toBeDefined());
+      if(action==='stop')await stopTransportRuntimeSession(name);
+      else if(action==='delete')mocks.store.delete(name);
+      else if(action==='recreate')mocks.store.set(name,{...saved,sessionInstanceId:'new-owner',providerResumeId:'good-native'});
+      else mocks.store.set(name,{...saved,providerSessionId:'new-route',providerResumeId:'good-native'});
+      const after=mocks.store.get(name);
+      gate.resolve(config.sessionKey);await rejected;
+      expect(getTransportRuntime(name)).toBeUndefined();expect(mocks.store.get(name)).toEqual(after);
+    } finally {createSpy.mockRestore();}
+  });
+
+  it.each(['stop','delete','recreate','rebind'])('does not commit a late AG restore after %s', async action => {
+    const name='deck_sdk_ag_restorelate_brain';
+    await launchTransportSession({name,projectName:'sdk-ag-restorelate',role:'brain',agentType:'agy-sdk',projectDir:tempDir});
+    await stopTransportRuntimeSession(name);await disconnectAll();await connectProvider('agy-sdk',{});
+    const saved={...mocks.store.get(name)!};const gate=deferred<string>();let config:any;
+    const createSpy=vi.spyOn(AgySdkProvider.prototype,'createSession').mockImplementation(async c=>{config=c;return gate.promise;});
+    try {
+      const restore=restoreTransportSessions('agy-sdk',{sessionName:name});
+      await vi.waitFor(()=>expect(config).toBeDefined());
+      if(action==='stop')await stopTransportRuntimeSession(name);
+      else if(action==='delete')mocks.store.delete(name);
+      else if(action==='recreate')mocks.store.set(name,{...saved,sessionInstanceId:'new-owner'});
+      else mocks.store.set(name,{...saved,providerSessionId:'new-route',providerResumeId:'new-native'});
+      const after=mocks.store.get(name);gate.resolve(config.sessionKey);await restore;
+      expect(getTransportRuntime(name)).toBeUndefined();expect(mocks.store.get(name)).toEqual(after);
+    } finally {createSpy.mockRestore();}
+  });
+
+  it('coalesces concurrent AG launches instead of creating two native owners', async () => {
+    const name='deck_sdk_ag_concurrent_brain';const gate=deferred<string>();let config:any;
+    const createSpy=vi.spyOn(AgySdkProvider.prototype,'createSession').mockImplementation(async c=>{config=c;return gate.promise;});
+    try {
+      const opts={name,projectName:'sdk-ag-concurrent',role:'brain',agentType:'agy-sdk' as const,projectDir:tempDir};
+      const first=launchTransportSession(opts);const second=launchTransportSession(opts);
+      await vi.waitFor(()=>expect(config).toBeDefined());gate.resolve(config.sessionKey);await Promise.all([first,second]);
+      expect(createSpy).toHaveBeenCalledTimes(1);expect(getTransportRuntime(name)?.providerSessionId).toBe(config.sessionKey);
+    } finally {createSpy.mockRestore();}
+  });
+
+  it.each(['brain','w1'])('keeps a trusted AG native binding through a skipStore %s relaunch', async role => {
+    const name=`deck_sdk_ag_skip_${role}`;
+    const createSpy=vi.spyOn(AgySdkProvider.prototype,'createSession').mockImplementation(async c=>c.sessionKey);
+    try {
+      await launchTransportSession({name,projectName:'sdk-ag-skip',role,agentType:'agy-sdk',projectDir:tempDir});
+      const saved={...mocks.store.get(name)!,providerResumeId:'trusted-native'};
+      mocks.store.set(name,saved);await stopTransportRuntimeSession(name);
+      await launchTransportSession({name,projectName:'sdk-ag-skip',role,agentType:'agy-sdk',projectDir:tempDir,skipStore:true});
+      expect(mocks.store.get(name)?.providerResumeId).toBe('trusted-native');
+      expect(mocks.store.get(name)?.providerSessionId).toBe(getTransportRuntime(name)?.providerSessionId);
+      expect(mocks.store.get(name)?.agyNativeSessionState).toBe(AG.STARTED);
+    } finally {createSpy.mockRestore();}
+  });
+
+  it('runs AG manager restore, native-id capture and queue ownership across a real SQLite reload', async () => {
+    const actual = await vi.importActual<typeof import('../../src/store/session-store.js')>('../../src/store/session-store.js');
+    const { persistedSessions } = await import('../helpers/session-store-db.js');
+    const home=path.join(tempDir,'real-home');await mkdir(home);
+    vi.stubEnv('HOME',home);vi.stubEnv('USERPROFILE',home);vi.stubEnv('IMCODES_HOME',path.join(home,'.imcodes'));
+    mocks.realStore=actual;actual.resetSessionStoreAuthorityForTests();await actual.loadStore({probe:false});
+    const name='deck_realproj_ag_sqlite_w1';const configs=new Map<string,any>();const sent:string[]=[];
+    const native='11111111-2222-4333-8444-555555555555';
+    const createSpy=vi.spyOn(AgySdkProvider.prototype,'createSession').mockImplementation(async c=>{configs.set(c.sessionKey,c);return c.sessionKey;});
+    const sendSpy=vi.spyOn(AgySdkProvider.prototype,'send').mockImplementation(async function(this:AgySdkProvider,sid,payload){
+      await configs.get(sid).beforeNativeSessionStart();
+      const record=actual.getSession(name)!;
+      expect(persistedSessions(home)[name].agyNativeSessionState).toBe(AG.STARTED);
+      expect(record.runtimeEpoch).toBe(configs.get(sid).runtimeEpoch);
+      sent.push(typeof payload==='string'?payload:payload.userMessage);
+      (this as any).emitSessionInfo(sid,{resumeId:native});
+      setTimeout(()=>{for(const cb of (this as any).completeCallbacks)cb(sid,{id:'sqlite-result-'+sent.length,content:'ok',role:'assistant',timestamp:Date.now()});},0);
+    });
+    try {
+      await launchTransportSession({name,projectName:'realproj',role:'w1',agentType:'agy-sdk',projectDir:tempDir});
+      actual.upsertSession({...actual.getSession(name)!,parentSession:'deck_realproj_brain'});await actual.flushStore();
+      const before={...actual.getSession(name)!};
+      await stopTransportRuntimeSession(name);await disconnectAll();
+      const recipient={sessionInstanceId:before.sessionInstanceId!,runtimeEpoch:before.runtimeEpoch!};
+      for(const text of ['one','two'])expect(enqueueResend(name,{recipient,text,commandId:'real-ag-'+text,queuedAt:Date.now()}).accepted).toBe(true);
+      actual.resetSessionStoreAuthorityForTests();await actual.loadStore({probe:false});await connectProvider('agy-sdk',{});
+      await restoreTransportSessions('agy-sdk',{sessionName:name});
+      await vi.waitFor(()=>expect(sent).toEqual(['one','two']));
+      await vi.waitFor(()=>expect(getTransportQueueStore().readSnapshot(name).pendingMessageEntries).toEqual([]));
+      await actual.flushStore();
+      expect(persistedSessions(home)[name]).toMatchObject({providerResumeId:native,agyNativeSessionState:AG.STARTED,parentSession:'deck_realproj_brain'});
+      expect(actual.getSession(name)?.runtimeEpoch).not.toBe(before.runtimeEpoch);
+      await stopTransportRuntimeSession(name);await disconnectAll();
+      actual.resetSessionStoreAuthorityForTests();await actual.loadStore({probe:false});await connectProvider('agy-sdk',{});
+      await restoreTransportSessions('agy-sdk',{sessionName:name});
+      const current=getTransportRuntime(name)!;
+      expect(configs.get(current.providerSessionId!).resumeId).toBe(native);expect(sent).toHaveLength(2);
+    } finally {
+      await stopTransportRuntimeSession(name);await disconnectAll();
+      await actual.flushStore();await actual.waitForSessionStoreSnapshotForTests();actual.resetSessionStoreAuthorityForTests();
+      mocks.realStore=undefined;sendSpy.mockRestore();createSpy.mockRestore();
+    }
+  });
+
+  it('rejects an old AG runtime info callback after owner replacement', async () => {
+    const name = 'deck_sdk_ag_late_brain';
+    await launchTransportSession({ name, projectName: 'sdk-ag-late', role: 'brain', agentType: 'agy-sdk', projectDir: tempDir });
+    const old = getTransportRuntime(name)!;
+    const callback = (old as any)._onSessionInfoChange;
+    const saved = { ...mocks.store.get(name)! };
+    mocks.store.set(name, { ...saved, runtimeEpoch: 'replacement', providerSessionId: 'other-route', providerResumeId: 'good-native' });
+    callback({ resumeId: 'late-old-id' });
+    expect(mocks.store.get(name)?.providerResumeId).toBe('good-native');
   });
 
   it('does not restore a stale Muse record while restoring a different provider', async () => {

@@ -94,6 +94,9 @@ interface AgySessionState {
   model?: string;
   /** agy conversation id; durable resume handle (persisted by the daemon as providerResumeId). */
   conversationId?: string;
+  beforeNativeSessionStart?: () => Promise<void>;
+  nativeStartInFlight?: Promise<void>;
+  cancelGeneration: number;
   child: ChildProcess | null;
   /** User turns written to stdin that have not produced a `result` yet. */
   inflightTurns: number;
@@ -339,6 +342,8 @@ export class AgySdkProvider implements TransportProvider {
         || (typeof (config as { model?: string }).model === 'string' && (config as { model?: string }).model)
         || existing?.model || AGY_DEFAULT_MODEL_ID,
       conversationId: config.resumeId ?? existing?.conversationId,
+      beforeNativeSessionStart: config.beforeNativeSessionStart ?? existing?.beforeNativeSessionStart,
+      cancelGeneration: (prior?.cancelGeneration ?? 0) + 1,
       child: existing?.child ?? null,
       inflightTurns: existing?.inflightTurns ?? 0,
       cancelled: false,
@@ -364,6 +369,7 @@ export class AgySdkProvider implements TransportProvider {
       existing.cwd = state.cwd;
       existing.env = state.env;
       existing.mcpEnv = state.mcpEnv;
+      existing.beforeNativeSessionStart = state.beforeNativeSessionStart;
       existing.model = state.model;
       return routeId;
     }
@@ -413,6 +419,18 @@ export class AgySdkProvider implements TransportProvider {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Cannot send an empty message to agy', false);
     }
 
+    // The daemon must durably invalidate its unused proof BEFORE spawn or
+    // stdin. Awaiting may race Stop/end/rebind, so re-check the captured owner.
+    state.cancelled = false;
+    const generation = state.cancelGeneration;
+    if ((!state.child || state.child.killed || state.child.exitCode !== null) && state.beforeNativeSessionStart) {
+      const pending = state.nativeStartInFlight ??= state.beforeNativeSessionStart();
+      try { await pending; }
+      finally { if (state.nativeStartInFlight === pending) state.nativeStartInFlight = undefined; }
+      if (this.sessions.get(sessionId) !== state || state.cancelGeneration !== generation || state.cancelled) {
+        throw this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'AG start was superseded', false);
+      }
+    }
     const child = this.ensureChild(sessionId, state);
     if (!child.stdin || child.stdin.destroyed || !child.stdin.writable) {
       state.child = null;
@@ -439,6 +457,7 @@ export class AgySdkProvider implements TransportProvider {
     const state = this.sessions.get(sessionId);
     if (!state) return;
     state.cancelled = true;
+    state.cancelGeneration += 1;
     if (!state.child || state.child.killed) return;
     this.emitStatus(sessionId, state, { status: null, label: null });
     await this.terminateChild(state);
@@ -453,6 +472,7 @@ export class AgySdkProvider implements TransportProvider {
     if (!capturedChild || capturedChild.exitCode != null) {
       // A physical exit does not authorize a late asynchronous history result.
       state.cancelled = true;
+      state.cancelGeneration += 1;
       state.child = null;
       this.resetTurnState(state);
       this.emitStatus(sessionId, state, { status: null, label: null });

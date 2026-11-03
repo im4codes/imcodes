@@ -1,3 +1,4 @@
+import { AGY_SDK_PROVIDER_ID, AGY_NATIVE_START_NOT_ATTEMPTED } from '../../shared/agy-agent.js';
 import { queuedPairWakeAllowed } from '../daemon/task-pairs/wake-authority.js';
 import { withMemoryMcpSessionEnv } from './providers/getDefaultMcpServers.js';
 import { onConfirmedProviderStop } from './provider-stop-confirmation.js';
@@ -2920,6 +2921,16 @@ export class TransportSessionRuntime implements SessionRuntime {
       return 'queued';
     }
 
+    // AG may await its durable native-start barrier before any process/input.
+    // Transfer a resend lease through the existing queued-dispatch path: a
+    // local idle receipt is not native acceptance and must not finalize it.
+    if (this.provider.id === AGY_SDK_PROVIDER_ID && entry.queueHandoff) {
+      this._pendingMessages.push(entry);
+      this._pendingVersion++;
+      this._drainPending();
+      return 'queued';
+    }
+
     // Direct sends are rendered by command-handler / resend-drain after
     // runtime.send() returns 'sent'. If this provider-side send later fails
     // recoverably and gets retried from the queue, do not render the same
@@ -5061,6 +5072,15 @@ export class TransportSessionRuntime implements SessionRuntime {
         }
         if (this.handleSdkTurnLostRecovery(providerError)) {
           return;
+        }
+        // AG's local commit barrier can reject inside send() before even
+        // spawning the CLI. Do not turn that explicit no-start proof into a
+        // provider-side-effect tombstone and silently consume queued messages.
+        if (this.provider.id === AGY_SDK_PROVIDER_ID && !this._activeDispatchProviderAccepted
+          && !this._activeDispatchHasSideEffectEvidence
+          && providerError.details && typeof providerError.details === 'object'
+          && (providerError.details as Record<string, unknown>)[AGY_NATIVE_START_NOT_ATTEMPTED] === true) {
+          this._activeDispatchProviderStarted = false;
         }
         this.recordProviderError(providerError);
         const capacityRetryEligible = this.canRetryBeforeProviderBoundary(providerError)

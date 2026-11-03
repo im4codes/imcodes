@@ -1,3 +1,4 @@
+import { AGY_SDK_PROVIDER_ID, AGY_NATIVE_SESSION_STATE, type AgyNativeSessionState } from '../../shared/agy-agent.js';
 import { statSync } from 'node:fs';
 import { Worker } from 'node:worker_threads';
 import { mkdir, readFile, rename, rm } from 'node:fs/promises';
@@ -236,6 +237,8 @@ export interface SessionRecord extends SessionContextBootstrapState {
   providerSessionId?: string;
   /** Provider-side durable resume/session identifier for shared local-sdk providers. */
   providerResumeId?: string;
+  /** AG lazy-create evidence; absent legacy state is unknown, never implicitly fresh. */
+  agyNativeSessionState?: AgyNativeSessionState;
   /** Session description — used for persona/system prompt injection. */
   description?: string;
   /**
@@ -974,15 +977,21 @@ async function findChangedSessions(): Promise<Set<string>> {
  * an in-place mutation is never lost -- the sweep is what an explicit
  * flushStore() (shutdown) and the periodic full check use.
  */
-async function writeStoreToDisk(bestEffort: boolean, targetPath = dbPath(), forceSweep = false): Promise<void> {
+async function writeStoreToDisk(bestEffort: boolean, targetPath = dbPath(), forceSweep = false, requireWrite = false): Promise<void> {
   // Outside the best-effort catch on purpose: a test reaching the real store
   // must fail loudly, never be swallowed as a lost write.
-  if (!hasWriteAuthority(targetPath)) return;
+  if (!hasWriteAuthority(targetPath)) {
+    if (requireWrite) throw new Error('session store write authority unavailable');
+    return;
+  }
   const sweep = forceSweep || fullSweepRequested || Date.now() - lastFullSweepAt >= FULL_SWEEP_INTERVAL_MS;
   const drained = new Set<string>();
   try {
     const handle = writerHandle(targetPath);
     const swept = sweep ? await findChangedSessions() : new Set<string>();
+    // A strict native-start barrier must not mistake a queued/skipped write
+    // for a commit. The sweep can yield while the daemon loses its lock.
+    if (requireWrite && !hasWriteAuthority(targetPath)) throw new Error('session store write authority changed before commit');
 
     // From here to the commit nothing awaits: the rows reflect one instant, and a
     // mutation made while the sweep yielded is in `dirtyNames` and is included.
@@ -1042,7 +1051,7 @@ async function writeStoreToDisk(bestEffort: boolean, targetPath = dbPath(), forc
   } catch (error) {
     if (error instanceof EmptyStoreRefusal) {
       logger.error({ targetPath, sessions: committedPayloads.size }, 'Refusing to overwrite a non-empty session store with an empty snapshot');
-      return;
+      if (!requireWrite) return;
     }
     // Nothing was committed: keep the rows dirty so the next flush retries them.
     for (const name of drained) dirtyNames.add(name);
@@ -1328,10 +1337,10 @@ async function waitForSessionStoreSnapshot(): Promise<void> {
   while (backupInFlight) await backupInFlight;
 }
 
-function enqueueWrite(bestEffort: boolean, targetPath = dbPath(), forceSweep = false): Promise<void> {
+function enqueueWrite(bestEffort: boolean, targetPath = dbPath(), forceSweep = false, requireWrite = false): Promise<void> {
   const queued = writeQueue.then(
-    () => writeStoreToDisk(bestEffort, targetPath, forceSweep),
-    () => writeStoreToDisk(bestEffort, targetPath, forceSweep),
+    () => writeStoreToDisk(bestEffort, targetPath, forceSweep, requireWrite),
+    () => writeStoreToDisk(bestEffort, targetPath, forceSweep, requireWrite),
   );
   const tracked = queued.finally(() => {
     if (pendingWrite === tracked) pendingWrite = null;
@@ -1450,8 +1459,20 @@ export function upsertSession(record: SessionRecord): void {
   const nativeAgentLaunchFence = [record.nativeAgentLaunchFence, existing?.nativeAgentLaunchFence]
     .find((proof) => proof?.sessionInstanceId === sessionInstanceId && proof.runtimeEpoch === runtimeEpoch);
   const { nativeAgentFenceRequired: _requestedMarker, nativeAgentLaunchFence: _requestedProof, ...incoming } = record;
+  const sameAgyRoute = record.agentType === AGY_SDK_PROVIDER_ID
+    && existing?.agentType === AGY_SDK_PROVIDER_ID
+    && !!record.providerSessionId && record.providerSessionId === existing.providerSessionId;
+  // A metadata rebuild must never resurrect an unused proof after native start
+  // or erase its learned id. A new/fresh route is a different conversation.
+  const agyResumeId = sameAgyRoute ? record.providerResumeId || existing.providerResumeId : record.providerResumeId;
+  const agyNativeSessionState = record.agentType === AGY_SDK_PROVIDER_ID
+    ? agyResumeId || (sameAgyRoute && existing.agyNativeSessionState === AGY_NATIVE_SESSION_STATE.STARTED)
+      ? AGY_NATIVE_SESSION_STATE.STARTED
+      : record.agyNativeSessionState ?? (sameAgyRoute ? existing.agyNativeSessionState : undefined)
+    : undefined;
   store.sessions[record.name] = {
     ...incoming,
+    ...(record.agentType === AGY_SDK_PROVIDER_ID ? { providerResumeId: agyResumeId, agyNativeSessionState } : {}),
     sessionInstanceId,
     runtimeEpoch,
     ...(nativeAgentFenceRequired ? { nativeAgentFenceRequired } : {}),
@@ -1587,18 +1608,22 @@ export function updateSessionState(name: string, state: SessionState, error?: st
   scheduleWrite();
 }
 
-export async function flushStore(): Promise<void> {
+export async function flushStore(options: { requireWrite?: boolean } = {}): Promise<void> {
   // A CLI stop/status process can import lifecycle.shutdown without ever
   // loading the daemon store or acquiring its lock. It must not flush the
   // initial empty in-memory value over the live daemon's sessions.
-  if (!storeLoaded && !isUnderTestRunner()) return;
+  if (!storeLoaded && !isUnderTestRunner()) {
+    if (options.requireWrite) throw new Error('session store is not loaded');
+    return;
+  }
   const targetPath = writeTimerPath ?? dbPath();
+  if (options.requireWrite && !hasWriteAuthority(targetPath)) throw new Error('session store write authority unavailable');
   if (writeTimer) {
     clearTimeout(writeTimer);
     writeTimer = null;
     writeTimerPath = null;
   }
-  await enqueueWrite(false, targetPath, true);
+  await enqueueWrite(false, targetPath, true, options.requireWrite);
   await flushCompatExport(targetPath);
   // flushStore() is the explicit lifecycle barrier used by shutdown and test
   // teardown. Do not return while the snapshot started by the write is still
