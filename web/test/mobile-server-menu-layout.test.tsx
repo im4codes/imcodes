@@ -231,6 +231,70 @@ describe('mobile server menu shared-entry reachability', () => {
     }
   });
 
+  it('bounds mobile server menu top-row at 320px and 390px across all 7 locales with zero horizontal overflow in chromium', async () => {
+    const browserType = (require('playwright') as typeof import('playwright')).chromium;
+    if (!require('node:fs').existsSync(browserType.executablePath())) {
+      return;
+    }
+    const locales = ['en', 'es', 'ja', 'ko', 'ru', 'zh-CN', 'zh-TW'];
+    const browser = await browserType.launch({ headless: true });
+    try {
+      for (const loc of locales) {
+        const localeJson = JSON.parse(readFileSync(resolve(__dirname, `../src/i18n/locales/${loc}.json`), 'utf8'));
+        const homeText = localeJson.mobile_menu?.home ?? '← Home';
+        const changeText = localeJson.mobile_menu?.change_server ?? '⇄ Switch Cloud Server';
+        const aiDeskText = localeJson.controlled_nodes?.title ?? 'AI Desk';
+
+        for (const viewport of [{ width: 320, height: 640 }, { width: 390, height: 844 }]) {
+          const page = await browser.newPage({ viewport, hasTouch: true });
+          const html = `<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${css}</style></head><body>
+            <div class="layout-mobile" style="width: ${viewport.width}px;">
+              <div class="mobile-server-bar">
+                <div class="mobile-server-switcher-wrap" style="position: relative;">
+                  <div class="mobile-server-menu" style="display: flex;">
+                    <div class="mobile-server-menu-top-row">
+                      <button type="button" class="mobile-server-menu-item mobile-server-menu-home">${homeText}</button>
+                      <button type="button" class="mobile-server-menu-item mobile-server-menu-change" title="${changeText}">${changeText}</button>
+                    </div>
+                    <button type="button" class="mobile-server-menu-item mobile-server-menu-controlled-nodes">
+                      <span>🖥</span><span>${aiDeskText}</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </body></html>`;
+          await page.setContent(html);
+
+          const metrics = await page.evaluate(() => {
+            const menu = document.querySelector('.mobile-server-menu')!;
+            const topRow = document.querySelector('.mobile-server-menu-top-row')!;
+            const home = document.querySelector('.mobile-server-menu-home')!;
+            const change = document.querySelector('.mobile-server-menu-change')!;
+            return {
+              menuOverflow: menu.scrollWidth - menu.clientWidth,
+              topRowOverflow: topRow.scrollWidth - topRow.clientWidth,
+              menuRight: menu.getBoundingClientRect().right,
+              changeRight: change.getBoundingClientRect().right,
+              homeVisible: home.getBoundingClientRect().width > 0,
+              changeVisible: change.getBoundingClientRect().width > 0,
+            };
+          });
+
+          expect(metrics.menuOverflow, `${loc} at ${viewport.width}px menu horizontal overflow`).toBeLessThanOrEqual(1);
+          expect(metrics.topRowOverflow, `${loc} at ${viewport.width}px top-row horizontal overflow`).toBeLessThanOrEqual(1);
+          expect(metrics.changeRight, `${loc} at ${viewport.width}px change button right edge`).toBeLessThanOrEqual(metrics.menuRight + 1);
+          expect(metrics.homeVisible).toBe(true);
+          expect(metrics.changeVisible).toBe(true);
+
+          await page.close();
+        }
+      }
+    } finally {
+      await browser.close();
+    }
+  });
+
   for (const engine of ['chromium', 'webkit'] as const) {
     it(`keeps three columns and scrolls the entire shared list up/down with backdrop in ${engine}`, async (context) => {
       const browserType = (require('playwright') as typeof import('playwright'))[engine];

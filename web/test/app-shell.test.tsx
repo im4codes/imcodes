@@ -7239,4 +7239,82 @@ describe('App shell', () => {
     expect(projected[0].presence).toBe('online');
     expect(projected[0].online).toBe(true);
   });
+
+  it('audit-r3-legacy: opening a share with missing presence does not invent a daemon heartbeat', async () => {
+    const originalUA = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      const grant = {
+        id: 'legacy-open',
+        serverId: 'srv-shared',
+        serverName: 'Legacy Shared',
+        targetLabel: 'Legacy Shared',
+        role: 'viewer',
+        status: 'active',
+        target: { kind: 'server', serverId: 'srv-shared' },
+      } as const;
+      discoverSharedEntriesMock.mockResolvedValue([grant]);
+      openSharedEntryMock.mockResolvedValue({
+        ...sharedMainOpenResult(grant.id, 'legacy-open-dispatch', 'viewer'),
+        server: { id: 'srv-shared', name: 'Legacy Shared', status: null, lastHeartbeatAt: null },
+        target: grant.target,
+      });
+      const { App } = await importApp();
+      const view = render(<App />);
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+      const initialRow = within(view.container.querySelector('.mobile-server-menu')! as HTMLElement).getByText('Legacy Shared').closest('button')!;
+      expect(initialRow.querySelector('.mobile-server-menu-dot-unknown')).toBeTruthy();
+      fireEvent.click(initialRow);
+      await screen.findByTestId('session-pane-deck_beta_brain');
+      expect(openSharedEntryMock).toHaveBeenCalledWith(grant.target);
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+      const visitedRow = within(view.container.querySelector('.mobile-server-menu')! as HTMLElement).getByText('Legacy Shared').closest('button')!;
+      expect(visitedRow.querySelector('.mobile-server-menu-dot-unknown'), 'a successful share authorization with null presence is not a daemon heartbeat and must remain unknown').toBeTruthy();
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUA });
+    }
+  }, 15000);
+
+  it('audit-r3-positive: opening a share with genuine heartbeat transitions to online', async () => {
+    const originalUA = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      const grant = {
+        id: 'live-open',
+        serverId: 'srv-shared-live',
+        serverName: 'Live Shared',
+        targetLabel: 'Live Shared',
+        role: 'viewer',
+        status: 'active',
+        target: { kind: 'server', serverId: 'srv-shared-live' },
+      } as const;
+      discoverSharedEntriesMock.mockResolvedValue([grant]);
+      openSharedEntryMock.mockResolvedValue({
+        ...sharedMainOpenResult(grant.id, 'live-open-dispatch', 'viewer'),
+        server: { id: 'srv-shared-live', name: 'Live Shared', status: 'online', lastHeartbeatAt: Date.now() },
+        target: grant.target,
+      });
+      const { App } = await importApp();
+      const view = render(<App />);
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+      const initialRow = within(view.container.querySelector('.mobile-server-menu')! as HTMLElement).getByText('Live Shared').closest('button')!;
+      expect(initialRow.querySelector('.mobile-server-menu-dot-unknown')).toBeTruthy();
+      fireEvent.click(initialRow);
+      await screen.findByTestId('session-pane-deck_beta_brain');
+      expect(openSharedEntryMock).toHaveBeenCalledWith(grant.target);
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+      const visitedRow = within(view.container.querySelector('.mobile-server-menu')! as HTMLElement).getByText('Live Shared').closest('button')!;
+      expect(visitedRow.querySelector('.mobile-server-menu-dot-online'), 'a successful share authorization with genuine heartbeat transitions to online').toBeTruthy();
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUA });
+    }
+  }, 15000);
 });

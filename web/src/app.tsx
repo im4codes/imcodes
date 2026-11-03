@@ -564,6 +564,7 @@ interface ServerInfo {
   name: string;
   status: string;
   lastHeartbeatAt: number | null;
+  statusObservedAt?: number | null;
   daemonVersion?: string | null;
   latestDaemonVersion?: string | null;
   createdAt: number;
@@ -3681,11 +3682,22 @@ export function App() {
     try {
       const opened = await openSharedEntry(entry.target, { signal: abortController.signal });
       if (openGeneration !== sharedOpenGenerationRef.current) return 'superseded';
+      const openedHeartbeat = typeof opened.server.lastHeartbeatAt === 'number'
+        && Number.isFinite(opened.server.lastHeartbeatAt)
+        && opened.server.lastHeartbeatAt > 0
+        ? opened.server.lastHeartbeatAt
+        : null;
+      const openedObservedAt = typeof (opened.server as any).statusObservedAt === 'number'
+        && Number.isFinite((opened.server as any).statusObservedAt)
+        && (opened.server as any).statusObservedAt > 0
+        ? (opened.server as any).statusObservedAt
+        : null;
       const nextServer: ServerInfo = {
         id: opened.server.id,
         name: opened.server.name,
-        status: opened.server.status ?? 'online',
-        lastHeartbeatAt: opened.server.lastHeartbeatAt ?? Date.now(),
+        status: opened.server.status ?? 'active',
+        lastHeartbeatAt: openedHeartbeat,
+        statusObservedAt: openedObservedAt,
         createdAt: Date.now(),
       };
       const mappedSessions: SessionInfo[] = opened.sessions.map((session) => {
@@ -3725,7 +3737,16 @@ export function App() {
       setSelectedServerName(opened.server.name);
       setServers((prev) => (
         prev.some((server) => server.id === nextServer.id)
-          ? prev.map((server) => server.id === nextServer.id ? { ...server, ...nextServer } : server)
+          ? prev.map((server) => {
+              if (server.id !== nextServer.id) return server;
+              return {
+                ...server,
+                ...nextServer,
+                status: nextServer.status !== 'active' ? nextServer.status : (server.status ?? 'active'),
+                lastHeartbeatAt: nextServer.lastHeartbeatAt ?? server.lastHeartbeatAt,
+                statusObservedAt: nextServer.statusObservedAt ?? server.statusObservedAt,
+              };
+            })
           : [nextServer, ...prev]
       ));
       setServersLoaded(true);

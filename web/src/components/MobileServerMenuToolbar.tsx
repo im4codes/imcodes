@@ -33,6 +33,7 @@ export function MobileServerMenuToolbar({
             type="button"
             class="mobile-server-menu-item mobile-server-menu-change"
             onClick={onChangeServer}
+            title={t('mobile_menu.change_server', { defaultValue: '⇄ Switch Cloud Server' })}
           >
             {t('mobile_menu.change_server', { defaultValue: '⇄ Switch Cloud Server' })}
           </button>
