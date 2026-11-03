@@ -1200,25 +1200,102 @@ describe('SubSessionBar', () => {
   });
 
 
-  function renderTouchReorderBar() {
+  function touchReorderSessions() {
+    return [
+      makeSubSession({ id: 'sub-a', sessionName: 'deck_sub_sub-a', label: 'a' }),
+      makeSubSession({ id: 'sub-b', sessionName: 'deck_sub_sub-b', label: 'b' }),
+    ];
+  }
+
+  function renderTouchReorderBar(subSessions = touchReorderSessions()) {
     const onOpen = vi.fn();
-    const view = render(
-      <SubSessionBar
-        subSessions={[
-          makeSubSession({ id: 'sub-a', sessionName: 'deck_sub_sub-a', label: 'a' }),
-          makeSubSession({ id: 'sub-b', sessionName: 'deck_sub_sub-b', label: 'b' }),
-        ]}
-        openIds={new Set()} collapsed desktopLayoutCapable={false} serverId="srv-1"
-        onOpen={onOpen} onClose={vi.fn()} onRestart={vi.fn()} onNew={vi.fn()}
-        ws={null} connected onDiff={vi.fn()} onHistory={vi.fn()}
-      />,
-    );
+    const props = {
+      subSessions, openIds: new Set<string>(), collapsed: true, desktopLayoutCapable: false,
+      serverId: 'srv-1', onOpen, onClose: vi.fn(), onRestart: vi.fn(), onNew: vi.fn(),
+      ws: null, connected: true, onDiff: vi.fn(), onHistory: vi.fn(),
+    };
+    const view = render(<SubSessionBar {...props} />);
     return {
       ...view, onOpen,
+      updateSessions: (next: SubSession[], serverId = props.serverId) =>
+        view.rerender(<SubSessionBar {...props} subSessions={next} serverId={serverId} />),
       first: view.container.querySelector('[data-sub-id="sub-a"]') as HTMLElement,
       bar: view.container.querySelector('.subsession-bar') as HTMLElement,
     };
   }
+
+  it.each([true, false])('binds long-press reorder when the compact bar mounts after loading or removal (initially empty: %s)', (initiallyEmpty) => {
+    vi.useFakeTimers();
+    const view = renderTouchReorderBar(initiallyEmpty ? [] : touchReorderSessions());
+    if (!initiallyEmpty) {
+      fireEvent.touchStart(view.first, { touches: [{ clientX: 10, clientY: 10 }] });
+      act(() => { vi.advanceTimersByTime(200); });
+      view.updateSessions([]);
+    }
+    act(() => { vi.advanceTimersByTime(500); });
+    if (view.first) expect(view.first.style.transform).toBe('');
+
+    view.updateSessions(touchReorderSessions());
+    const first = view.container.querySelector('[data-sub-id="sub-a"]') as HTMLElement;
+    const second = view.container.querySelector('[data-sub-id="sub-b"]') as HTMLElement;
+    const bar = view.container.querySelector('.subsession-bar') as HTMLElement;
+    if (view.bar) expect(bar).not.toBe(view.bar);
+    Object.defineProperty(bar, 'scrollWidth', { configurable: true, value: 600 });
+    Object.defineProperty(bar, 'clientWidth', { configurable: true, value: 200 });
+    bar.scrollLeft = 200;
+
+    // A newly mounted bar must still allow an ordinary swipe, never reorder it.
+    fireEvent.touchStart(first, { touches: [{ clientX: 10, clientY: 10 }] });
+    const swipe = new Event('touchmove', { bubbles: true, cancelable: true });
+    Object.defineProperty(swipe, 'touches', { value: [{ clientX: 60, clientY: 10 }] });
+    fireEvent(first, swipe);
+    expect(swipe.defaultPrevented).toBe(false);
+    act(() => { vi.advanceTimersByTime(500); });
+    expect(first.style.transform).toBe('');
+    fireEvent.touchEnd(first);
+    fireEvent.click(first);
+    expect(view.onOpen).not.toHaveBeenCalled();
+
+    const originalElementFromPoint = document.elementFromPoint;
+    Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: vi.fn(() => second) });
+    try {
+      fireEvent.touchStart(first, { touches: [{ clientX: 10, clientY: 10 }] });
+      act(() => { vi.advanceTimersByTime(399); });
+      expect(first.style.transform).toBe('');
+      act(() => { vi.advanceTimersByTime(1); });
+      expect(first.style.transform).toBe('scale(1.18)');
+      expect(first.style.borderColor).toBe('rgb(245, 158, 11)');
+      expect(bar.style.overflowX).toBe('hidden');
+      fireEvent.touchMove(first, { touches: [{ clientX: 20, clientY: 10 }] });
+      expect(Array.from(bar.querySelectorAll<HTMLElement>('[data-sub-id]')).map((el) => el.dataset.subId))
+        .toEqual(['sub-b', 'sub-a']);
+      fireEvent.touchEnd(first);
+      fireEvent.click(first);
+      act(() => { vi.advanceTimersByTime(151); });
+      expect(vi.mocked(reorderSubSessions)).toHaveBeenCalledExactlyOnceWith('srv-1', ['sub-b', 'sub-a']);
+      expect(view.onOpen).not.toHaveBeenCalled();
+      expect(first.style.transform).toBe('');
+      expect(bar.style.overflowX).toBe('');
+    } finally {
+      Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: originalElementFromPoint });
+    }
+  });
+
+  it('keeps a pending hold across status updates but cancels it when switching server', () => {
+    vi.useFakeTimers();
+    const view = renderTouchReorderBar();
+    fireEvent.touchStart(view.first, { touches: [{ clientX: 10, clientY: 10 }] });
+    act(() => { vi.advanceTimersByTime(200); });
+    view.updateSessions(touchReorderSessions().map((sub) => ({ ...sub, state: 'running' })));
+    act(() => { vi.advanceTimersByTime(200); });
+    expect(view.first.style.transform).toBe('scale(1.18)');
+    view.updateSessions(touchReorderSessions(), 'srv-2');
+    expect(view.first.style.transform).toBe('');
+    expect(view.bar.style.overflowX).toBe('');
+    act(() => { vi.advanceTimersByTime(500); });
+    expect(view.first.style.transform).toBe('');
+    expect(vi.mocked(reorderSubSessions)).not.toHaveBeenCalled();
+  });
 
   it.each([[70, 10], [-70, 10], [10, 70]])('keeps a pre-hold swipe scrollable without reorder or a ghost click (%s,%s)', (x, y) => {
     vi.useFakeTimers();

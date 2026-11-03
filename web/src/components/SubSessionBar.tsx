@@ -875,7 +875,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     onRestore,
     onRestoreThenClose,
   };
-  const collapsedBarRef = useRef<HTMLDivElement | null>(null);
+  const [collapsedBarElement, setCollapsedBarElement] = useState<HTMLDivElement | null>(null);
   const expandedScrollRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => () => {
@@ -1228,7 +1228,9 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   // Touch-based reorder for collapsed bar — desktop collapsed buttons use HTML5 drag events below.
   // The touch path must use addEventListener({ passive: false }) so touchmove can preventDefault.
   useEffect(() => {
-    const el = collapsedBarRef.current;
+    // The bar can mount after an initially empty session list or be replaced.
+    // Follow the actual element, not an unrelated callback changing identity.
+    const el = collapsedBarElement;
     if (!el) return;
     const td = touchDragRef.current;
 
@@ -1373,7 +1375,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       el.removeEventListener('scroll', onScroll);
       el.removeEventListener('contextmenu', onContext);
     };
-  }, [collapsed, getEntryGestureController, isVerticalRail, moveSubSessionInDragOrder, syncOrderToServer]);
+  }, [collapsedBarElement, collapsed, getEntryGestureController, isVerticalRail, moveSubSessionInDragOrder, syncOrderToServer]);
 
   useEffect(() => {
     const installHorizontalEdgeGuard = (el: HTMLDivElement | null) => {
@@ -1414,13 +1416,13 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       };
     };
 
-    const cleanupCollapsed = installHorizontalEdgeGuard(collapsedBarRef.current);
+    const cleanupCollapsed = installHorizontalEdgeGuard(collapsedBarElement);
     const cleanupExpanded = installHorizontalEdgeGuard(expandedScrollRef.current);
     return () => {
       cleanupCollapsed();
       cleanupExpanded();
     };
-  }, [collapsed, isVerticalRail, layout, orderedSessions.length]);
+  }, [collapsedBarElement, collapsed, isVerticalRail, layout, orderedSessions.length]);
 
   useEffect(() => {
     // Another server (or socket) never inherits this one's disks, embedding,
@@ -1585,7 +1587,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         <div
           class="subsession-vertical-rail-scroll"
           data-testid="subsession-vertical-rail-scroll"
-          ref={collapsedBarRef}
+          ref={setCollapsedBarElement}
         >
           {renderCompactSubSessionButtons('vertical')}
         </div>
@@ -2018,7 +2020,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       {!isVerticalRail && collapsed && subSessions.length > 0 && (
         <div class="subsession-row-with-close">
           {renderQuickSubWindowControl()}
-          <div class="subsession-bar" style={{ borderTop: 'none' }} ref={collapsedBarRef}>
+          <div class="subsession-bar" style={{ borderTop: 'none' }} ref={setCollapsedBarElement}>
             {renderCompactSubSessionButtons('horizontal')}
           </div>
         </div>
