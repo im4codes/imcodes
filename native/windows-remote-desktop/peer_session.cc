@@ -1,5 +1,5 @@
-#include "../remote-desktop-common/webrtc_traffic_stats.h"
 #include "third_party/imcodes_remote_desktop/peer_session.h"
+#include "third_party/imcodes_remote_desktop/common/webrtc_traffic_stats.h"
 
 #include <algorithm>
 #include <cmath>

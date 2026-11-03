@@ -44,6 +44,18 @@ describe('macOS remote-desktop transport session adapter', () => {
     expect(adapter).not.toMatch(/webrtc::/);
   });
 
+  it('keeps traffic samples independent of JSON and uses SDK overlay include paths on Windows', () => {
+    const sample = read('native/remote-desktop-common/traffic_stats.h');
+    expect(sample).not.toContain('json_protocol.h');
+    expect(sample).not.toContain('Json::');
+    expect(read('native/remote-desktop-common/json_protocol.h')).toContain('inline Json::Value TrafficEnvelope');
+    for (const [file, dependency] of [['peer_session.h', 'traffic_stats.h'], ['peer_session.cc', 'webrtc_traffic_stats.h']]) {
+      const windows = read(`native/windows-remote-desktop/${file}`);
+      expect(windows).toContain(`#include "third_party/imcodes_remote_desktop/common/${dependency}"`);
+      expect(windows).not.toContain('../remote-desktop-common/');
+    }
+  });
+
   it('routes the real peer through pinned upstream libwebrtc only', async () => {
     expect(backend).toContain('#include "api/peer_connection_interface.h"');
     expect(backend).toContain('#include "api/data_channel_interface.h"');

@@ -1,4 +1,3 @@
-#include "../remote-desktop-common/traffic_stats.h"
 #ifndef IMCODES_REMOTE_DESKTOP_PEER_SESSION_H_
 #define IMCODES_REMOTE_DESKTOP_PEER_SESSION_H_
 
@@ -19,6 +18,7 @@
 #include "api/scoped_refptr.h"
 #include "rtc_base/thread.h"
 #include "third_party/imcodes_remote_desktop/common/transport_session_core.h"
+#include "third_party/imcodes_remote_desktop/common/traffic_stats.h"
 #include "third_party/imcodes_remote_desktop/common/clipboard_paste_assembler.h"
 #include "third_party/imcodes_remote_desktop/display_capture.h"
 #include "third_party/imcodes_remote_desktop/input_injector.h"
