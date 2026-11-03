@@ -13,6 +13,7 @@ import { createRequire } from 'node:module';
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
+  isTerminalTaskPairStatus,
   TASK_PAIR_BRAIN_NOTICE_STATUSES,
   TASK_PAIR_DEFAULT_MAX_CONCURRENCY,
   TASK_PAIR_PARTICIPANT_STATUSES,
@@ -20,6 +21,7 @@ import {
   type TaskPairBrainNoticeStatus,
   type TaskPairEngine,
   type TaskPairEventSource,
+  type TaskPairFlag,
   type TaskPairRole,
   type TaskPairState,
   type TaskPairStatus,
@@ -636,20 +638,34 @@ export class TaskPairStore {
     const existing = this.getPair(project, state.taskId);
     const existingGen = existing?.state.episodeGeneration ?? 0;
     const incomingGen = state.episodeGeneration ?? 0;
+
     if (existing && incomingGen < existingGen) {
       state.episodeGeneration = existing.state.episodeGeneration;
       state.blockedNote = existing.state.blockedNote;
       state.lastWaitResolution = existing.state.lastWaitResolution;
-      const nonBlockerFlags = (state.flags ?? []).filter((f) => f !== 'blocked' && f !== 'needs_input');
-      const existingBlockerFlags = existing.state.flags.filter((f) => f === 'blocked' || f === 'needs_input');
-      state.flags = [...nonBlockerFlags, ...existingBlockerFlags];
+      const preserveBlocked = existing.state.flags.includes('blocked');
+      const preserveNeedsInput = existing.state.flags.includes('needs_input');
+      const incomingFlags: TaskPairFlag[] = (state.flags ?? []).filter((f) => f !== 'blocked' && f !== 'needs_input');
+      if (preserveBlocked) incomingFlags.push('blocked');
+      if (preserveNeedsInput) incomingFlags.push('needs_input');
+      state.flags = incomingFlags;
       state.flagSides = {
         ...state.flagSides,
-        ...(existing.state.flagSides?.blocked ? { blocked: existing.state.flagSides.blocked } : {}),
-        ...(existing.state.flagSides?.needs_input ? { needs_input: existing.state.flagSides.needs_input } : {}),
+        ...existing.state.flagSides,
       };
       if (!existing.state.flagSides?.blocked) delete state.flagSides.blocked;
       if (!existing.state.flagSides?.needs_input) delete state.flagSides.needs_input;
+      state.deliveryRound = existing.state.deliveryRound;
+      state.round = existing.state.round;
+      state.status = existing.state.status;
+      state.passRound = existing.state.passRound;
+      state.lastVerdict = existing.state.lastVerdict;
+      if (existing.state.material) {
+        state.material = existing.state.material;
+      }
+      if (existing.state.roundBase) {
+        state.roundBase = existing.state.roundBase;
+      }
     } else if (existing?.state.episodeGeneration !== undefined) {
       state.episodeGeneration = Math.max(incomingGen, existingGen);
     }

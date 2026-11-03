@@ -722,6 +722,84 @@ describe('pair decision MCP', () => {
     expect(sent).toHaveLength(0);
   });
 
+  it('F3-R7: stale housekeeping cannot roll back the canonical delivery/audit context or re-notify it', async () => {
+    const store = getTaskPairStore();
+    const sent: string[] = [];
+    setTaskPairDeliveryDepsForTests({
+      send: async (_target, text) => {
+        sent.push(text);
+      },
+    });
+
+    const taskBase: TaskPairState = {
+      taskId: 'f3-r7-lifecycle-guard',
+      title: 'fixture',
+      brain: 'deck_test_brain',
+      executor: 'deck_test_exec',
+      auditor: 'deck_test_audit',
+      status: 'working',
+      workspaceKind: 'none',
+      round: 1,
+      deliveryRound: 1,
+      flags: [],
+      flagSides: {},
+      blocking: ['P0'],
+      createdAt: 1,
+      updatedAt: 1,
+      previousAuditors: [],
+      capCounts: {},
+      resourceClaims: [],
+    } as unknown as TaskPairState;
+    store.savePair('p', taskBase);
+
+    function advance(verb: string, writer: string, at: number) {
+      const prior = store.getPair('p', 'f3-r7-lifecycle-guard')!.state;
+      const r = applyTaskPairMarker(prior, { knownVerb: verb, taskId: 'f3-r7-lifecycle-guard', attrs: {} } as any, { writer, fallbackBrain: taskBase.brain, now: at, source: 'marker' } as any);
+      expect(r.pair, verb + ' must actually apply').toBeTruthy();
+      store.savePair('p', r.pair!);
+      return store.getPair('p', 'f3-r7-lifecycle-guard')!.state;
+    }
+
+    advance('BLOCKED', taskBase.executor, 100);
+    const stale = structuredClone(store.getPair('p', 'f3-r7-lifecycle-guard')!.state);
+    expect(checkTaskPairMissingExplanation(store.getPair('p', 'f3-r7-lifecycle-guard')!, 101)).toBe(true);
+    await taskPairService.retryDecisionNotifications(101);
+    expect(sent).toHaveLength(1);
+
+    // Real legal transitions: READY_FOR_AUDIT -> PASS -> NEXT_ROUND -> READY_FOR_AUDIT -> BLOCKED
+    const audit1 = advance('READY_FOR_AUDIT', taskBase.executor, 200);
+    expect(audit1.status).toBe('in_audit');
+    const passed = advance('PASS', taskBase.auditor, 300);
+    expect(passed.status).toBe('passed');
+    const next = advance('NEXT_ROUND', taskBase.brain, 400);
+    expect(next.deliveryRound).toBe(2);
+    const audit2 = advance('READY_FOR_AUDIT', taskBase.executor, 500);
+    expect(audit2.status).toBe('in_audit');
+    advance('BLOCKED', taskBase.auditor, 600);
+
+    const current = store.getPair('p', 'f3-r7-lifecycle-guard')!;
+    const currentKey = taskPairMissingExplanationKey(current);
+    expect(current.state.round).toBeGreaterThan(stale.round);
+    expect(current.state.episodeGeneration).toBeGreaterThan(stale.episodeGeneration!);
+    expect(checkTaskPairMissingExplanation(current, 601)).toBe(true);
+    await taskPairService.retryDecisionNotifications(601);
+    expect(sent).toHaveLength(2);
+
+    // Model a previously captured full-state copy completing workspace/housekeeping work.
+    store.savePair('p', { ...stale, brief: 'finished unrelated housekeeping', updatedAt: 700 });
+    const after = store.getPair('p', 'f3-r7-lifecycle-guard')!;
+    expect(after.state.episodeGeneration).toBe(current.state.episodeGeneration);
+    expect(after.state.flags).toEqual(current.state.flags);
+    expect(after.state.flagSides).toEqual(current.state.flagSides);
+    expect(after.state.deliveryRound).toBe(current.state.deliveryRound);
+    expect(after.state.round).toBe(current.state.round);
+    expect(after.state.status).toBe(current.state.status);
+    expect(taskPairMissingExplanationKey(after)).toBe(currentKey);
+    expect(checkTaskPairMissingExplanation(after, 701)).toBe(false);
+    await taskPairService.retryDecisionNotifications(701);
+    expect(sent).toHaveLength(2);
+  });
+
   it('F3-R4: queued explanation notification is admitted while missing and rejected after note arrives', async () => {
     const store = getTaskPairStore();
     const ids: string[] = [];

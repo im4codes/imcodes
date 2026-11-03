@@ -1889,15 +1889,16 @@ export class TaskPairService {
         const branch = result.action === 'moved' ? result.branch : await gitBranchOf(result.to);
         const moved = { ...latest.workspace, path: result.to, previousPaths, movedAt: now, ...(branch ? { branch } : {}) };
         const siblings = await listTaskPairSiblingWorktrees({ ...latest, workspace: moved }).catch(() => [] as string[]);
+        const currentAuthoritative = store.getPair(project, taskId)?.state ?? latest;
         const next: TaskPairState = {
-          ...latest,
+          ...currentAuthoritative,
           workspace: { ...moved, ...(siblings.length ? { duplicatePaths: siblings } : { duplicatePaths: undefined }) },
-          ...(latest.material ? { material: {
-            ...latest.material,
-            ...(latest.material.worktree ? { worktree: redirectTaskPairWorkspacePath(moved, latest.material.worktree) } : {}),
-            ...(latest.material.path ? { path: redirectTaskPairWorkspacePath(moved, latest.material.path) } : {}),
+          ...(currentAuthoritative.material ? { material: {
+            ...currentAuthoritative.material,
+            ...(currentAuthoritative.material.worktree ? { worktree: redirectTaskPairWorkspacePath(moved, currentAuthoritative.material.worktree) } : {}),
+            ...(currentAuthoritative.material.path ? { path: redirectTaskPairWorkspacePath(moved, currentAuthoritative.material.path) } : {}),
           } } : {}),
-          updatedAt: Math.max(latest.updatedAt, now),
+          updatedAt: Math.max(currentAuthoritative.updatedAt, now),
         };
         store.savePair(project, next);
         this.#recordWorkspaceEvent(project, next, result.action === 'moved' ? TASK_PAIR_WORKSPACE_EFFECTS.MOVED : TASK_PAIR_WORKSPACE_EFFECTS.ADOPTED, { from: result.from, to: result.to }, {}, false);
