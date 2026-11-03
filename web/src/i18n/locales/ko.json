@@ -1075,6 +1075,7 @@
     "devices": "기기",
     "online": "온라인",
     "offline": "오프라인",
+    "status_unknown": "상태 알 수 없음",
     "added_on": "추가 날짜 {{date}}",
     "list_empty": "기기가 없습니다. 다음 명령으로 추가하세요:",
     "delete_error": "서버를 삭제하지 못했습니다: {{error}}",
@@ -1125,6 +1126,10 @@
     "daemon_auto_upgrade_reason_toolchain_unavailable": "daemon 호스트에 Node가 없습니다",
     "daemon_auto_upgrade_reason_unknown": "daemon이 지금은 업그레이드할 수 없습니다",
     "daemon_offline": "데몬 오프라인"
+  },
+  "mobile_menu": {
+    "home": "← 홈",
+    "change_server": "⇄ 클라우드 서버 전환"
   },
   "quick_input": {
     "title": "빠른 입력",

@@ -8,6 +8,7 @@ export interface SelectableServerInfo {
 export interface OnlineServerInfo extends SelectableServerInfo {
   status: string;
   lastHeartbeatAt: number | null;
+  statusObservedAt?: number | null;
   createdAt?: number;
 }
 

@@ -1093,6 +1093,7 @@ export interface SharedEntrySummary {
   targetLabel: string;
   serverStatus?: string | null;
   lastHeartbeatAt?: number | null;
+  statusObservedAt?: number | null;
 }
 
 function shareTargetFallbackLabel(target: ShareTarget): string {
@@ -1123,6 +1124,9 @@ export function normalizeSharedEntrySummary(value: unknown): SharedEntrySummary 
     targetLabel,
     serverStatus: typeof raw.serverStatus === 'string' ? raw.serverStatus : null,
     lastHeartbeatAt: typeof raw.lastHeartbeatAt === 'number' && Number.isFinite(raw.lastHeartbeatAt) && raw.lastHeartbeatAt > 0 ? raw.lastHeartbeatAt : null,
+    statusObservedAt: typeof raw.statusObservedAt === 'number' && Number.isFinite(raw.statusObservedAt)
+      ? raw.statusObservedAt
+      : (typeof raw.lastHeartbeatAt === 'number' && Number.isFinite(raw.lastHeartbeatAt) ? raw.lastHeartbeatAt : null),
   };
 }
 

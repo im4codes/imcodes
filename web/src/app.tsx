@@ -1060,6 +1060,7 @@ export function App() {
   const [sharedEntriesLoading, setSharedEntriesLoading] = useState(false);
   const [sharedEntriesLoaded, setSharedEntriesLoaded] = useState(false);
   const [sharedEntriesError, setSharedEntriesError] = useState<string | null>(null);
+  const [presenceTick, setPresenceTick] = useState(0);
   const [openingSharedEntryId, setOpeningSharedEntryId] = useState<string | null>(null);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [mobileHideServerBar, setMobileHideServerBar] = useState(() => localStorage.getItem('mobile_hide_server_bar') === '1');
@@ -1740,6 +1741,7 @@ export function App() {
       // considered resolved so the UI can escape the initial connecting gate.
     } finally {
       setServersLoaded(true);
+      setPresenceTick((t) => (t + 1) % 1_000_000);
     }
   }, [auth, applyServerInventory]);
 
@@ -1793,8 +1795,19 @@ export function App() {
       setSharedEntriesError(null);
     }
 
+    const timeoutTimer = setTimeout(() => {
+      abortController.abort(new Error('Shared discovery timed out after 15s'));
+    }, 15_000);
+
     const isCurrentValidRequest = () => (
       !abortController.signal.aborted &&
+      sharedDiscoveryGenerationRef.current === currentDiscoveryGen &&
+      authMutationGenerationRef.current === currentAuthGen &&
+      authRef.current?.userId === currentUserId &&
+      authRef.current?.baseUrl === currentBaseUrl
+    );
+
+    const isCurrentGeneration = () => (
       sharedDiscoveryGenerationRef.current === currentDiscoveryGen &&
       authMutationGenerationRef.current === currentAuthGen &&
       authRef.current?.userId === currentUserId &&
@@ -1826,27 +1839,37 @@ export function App() {
         if (ownedServerIdsRef.current.has(server.id)) return server;
         const grant = grantMap.get(server.id);
         if (!grant || typeof grant.lastHeartbeatAt !== 'number') return server;
-        if (!server.lastHeartbeatAt || grant.lastHeartbeatAt >= server.lastHeartbeatAt) {
+        const grantObservedAt = grant.statusObservedAt ?? grant.lastHeartbeatAt;
+        const serverObservedAt = (server as any).statusObservedAt ?? server.lastHeartbeatAt ?? 0;
+        // If the server was explicitly marked offline, an old or same-heartbeat grant must not overwrite it
+        if (server.status === 'offline' && grantObservedAt <= serverObservedAt && grant.lastHeartbeatAt <= (server.lastHeartbeatAt ?? 0)) {
+          return server;
+        }
+        if (!server.lastHeartbeatAt || grant.lastHeartbeatAt > server.lastHeartbeatAt || (grant.lastHeartbeatAt === server.lastHeartbeatAt && server.status !== 'offline')) {
           return {
             ...server,
             status: grant.serverStatus ?? server.status,
             lastHeartbeatAt: grant.lastHeartbeatAt,
+            statusObservedAt: grantObservedAt,
           };
         }
         return server;
       }).filter((server) => ownedServerIdsRef.current.has(server.id) || activeIds.has(server.id)));
     } catch (err) {
-      if (!isCurrentValidRequest()) return;
+      if (!isCurrentGeneration()) return;
       // On network failure during refresh: preserve existing entries; do not clear to []
       if (!options?.silent) {
         setSharedEntriesError(formatSharedAccessError(err, transRef.current));
       }
     } finally {
-      if (isCurrentValidRequest()) {
-        if (!options?.silent) {
-          setSharedEntriesLoading(false);
-          setSharedEntriesLoaded(true);
-        }
+      clearTimeout(timeoutTimer);
+      if (sharedDiscoveryAbortRef.current === abortController) {
+        sharedDiscoveryAbortRef.current = null;
+      }
+      if (isCurrentGeneration()) {
+        setSharedEntriesLoading(false);
+        setSharedEntriesLoaded(true);
+        setPresenceTick((t) => (t + 1) % 1_000_000);
       }
     }
   }, [auth]);
@@ -2304,7 +2327,7 @@ export function App() {
   );
   const unifiedServers = useMemo(
     () => projectUnifiedServerList(servers, sharedEntries, ownedServerIdsRef.current, serverOrder, serverPinned),
-    [servers, sharedEntries, serverOrder, serverPinned],
+    [servers, sharedEntries, serverOrder, serverPinned, presenceTick],
   );
   const restrictedSharedEntries = useMemo(
     () => filterRestrictedSharedEntries(sharedEntries),
@@ -3225,9 +3248,6 @@ export function App() {
     sharedOpenAbortRef.current = null;
     sharedOpenGenerationRef.current += 1;
     sharedOpenIntentRef.current = null;
-    sharedDiscoveryAbortRef.current?.abort();
-    sharedDiscoveryAbortRef.current = null;
-    sharedDiscoveryGenerationRef.current += 1;
     externalRouteGenerationRef.current += 1;
     externalRouteInFlightKeyRef.current = null;
     setOpeningSharedEntryId(null);
@@ -6406,9 +6426,6 @@ export function App() {
     sharedOpenAbortRef.current = null;
     sharedOpenGenerationRef.current += 1;
     sharedOpenIntentRef.current = null;
-    sharedDiscoveryAbortRef.current?.abort();
-    sharedDiscoveryAbortRef.current = null;
-    sharedDiscoveryGenerationRef.current += 1;
     externalRouteGenerationRef.current += 1;
     externalRouteInFlightKeyRef.current = null;
     setOpeningSharedEntryId(null);

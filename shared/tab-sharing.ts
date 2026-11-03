@@ -38,6 +38,7 @@ export type SharedPresenceState = 'online' | 'offline' | 'unknown';
 export interface SharedPresencePayload {
   status?: string | null;
   lastHeartbeatAt?: number | null;
+  statusObservedAt?: number | null;
   source?: 'grant' | 'daemon' | 'pod-pong' | 'fallback';
 }
 

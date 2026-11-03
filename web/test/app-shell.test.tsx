@@ -118,7 +118,11 @@ function textComponent(name: string) {
   return () => name;
 }
 
-const auditStableT = vi.hoisted(() => (key: string) => key);
+const auditStableT = vi.hoisted(() => (key: string, opt?: { defaultValue?: string }) => {
+  if (key === 'mobile_menu.change_server') return opt?.defaultValue ?? '⇄ Switch Cloud Server';
+  if (key === 'mobile_menu.home') return opt?.defaultValue ?? '← Home';
+  return key;
+});
 vi.mock('react-i18next', () => ({
   initReactI18next: { type: '3rdParty', init: vi.fn() },
   useTranslation: () => ({
@@ -7162,4 +7166,77 @@ describe('App shell', () => {
       Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalInnerWidth });
     }
   }, 20000);
+
+  it('audit-r2: actual markServerOffline event must beat the preceding grant observation', async () => {
+    const { projectUnifiedServerList } = await import('../src/unified-server-projection.js');
+    const { markServerOffline } = await import('../src/server-online-state.js');
+    const now = Date.now();
+    const live = { id: 'audit-r2-shared', name: 'R2 Shared', status: 'online', lastHeartbeatAt: now - 5000 };
+    const grant = {
+      id: 'r2-grant',
+      serverId: live.id,
+      serverName: live.name,
+      targetLabel: live.name,
+      role: 'viewer',
+      status: 'active',
+      target: { kind: 'server', serverId: live.id },
+      serverStatus: 'online',
+      lastHeartbeatAt: live.lastHeartbeatAt,
+    } as const;
+    const offline = markServerOffline([live], live.id)[0];
+    expect(offline.status).toBe('offline');
+    expect(
+      projectUnifiedServerList([offline], [grant], new Set())[0].presence,
+      'a real explicit offline event cannot be hidden by the prior same-heartbeat grant',
+    ).toBe('offline');
+  });
+
+  it('audit-r2: a silent replacement must finish an aborted foreground discovery loading lifecycle', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    let finishOld!: (entries: any[]) => void;
+    const oldPromise = new Promise<any[]>((resolve) => { finishOld = resolve; });
+    discoverSharedEntriesMock.mockResolvedValue([]);
+    const intervals = vi.spyOn(globalThis, 'setInterval');
+    const { App } = await importApp();
+    const view = render(<App />);
+    await screen.findByTestId('session-pane-deck_alpha_brain');
+    await waitFor(() => expect(view.container.querySelector<HTMLButtonElement>('.shared-entries-refresh')?.disabled).toBe(false));
+    discoverSharedEntriesMock.mockImplementationOnce(() => oldPromise).mockResolvedValue([]);
+    fireEvent.click(view.container.querySelector('.shared-entries-refresh')!);
+    await waitFor(() => expect(view.container.querySelector<HTMLButtonElement>('.shared-entries-refresh')?.disabled).toBe(true));
+    const refresh = intervals.mock.calls.find(([fn, ms]) => ms === 30000 && String(fn).includes('refreshSharedEntries'))?.[0] as () => void;
+    expect(refresh).toBeTruthy();
+    expect(view.container.querySelector<HTMLButtonElement>('.shared-entries-refresh')?.disabled).toBe(true);
+    await act(async () => { refresh(); await Promise.resolve(); });
+    await act(async () => { finishOld([]); await oldPromise; await Promise.resolve(); });
+    await waitFor(() => expect(
+      view.container.querySelector<HTMLButtonElement>('.shared-entries-refresh')?.disabled,
+      'latest valid silent completion must release loading/loaded state inherited from its foreground predecessor',
+    ).toBe(false));
+  }, 15000);
+
+  it('audit-r2: fresh online grant recovers offline server after markServerOffline', async () => {
+    const { projectUnifiedServerList } = await import('../src/unified-server-projection.js');
+    const { markServerOffline } = await import('../src/server-online-state.js');
+    const now = Date.now();
+    const live = { id: 'audit-recover-shared', name: 'Recover Shared', status: 'online', lastHeartbeatAt: now - 10000 };
+    const offline = markServerOffline([live], live.id, now - 5000)[0];
+    const freshGrant = {
+      id: 'fresh-grant',
+      serverId: live.id,
+      serverName: live.name,
+      targetLabel: live.name,
+      role: 'viewer',
+      status: 'active',
+      target: { kind: 'server', serverId: live.id },
+      serverStatus: 'online',
+      lastHeartbeatAt: now - 1000,
+      statusObservedAt: now - 1000,
+    } as const;
+    const projected = projectUnifiedServerList([offline], [freshGrant], new Set());
+    expect(projected[0].presence).toBe('online');
+    expect(projected[0].online).toBe(true);
+  });
 });

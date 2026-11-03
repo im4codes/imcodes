@@ -1075,6 +1075,7 @@
     "devices": "设备",
     "online": "在线",
     "offline": "离线",
+    "status_unknown": "状态未知",
     "added_on": "添加于 {{date}}",
     "list_empty": "暂无设备，可使用以下命令添加：",
     "delete_error": "删除服务器失败：{{error}}",
@@ -1125,6 +1126,10 @@
     "daemon_auto_upgrade_reason_toolchain_unavailable": "daemon 主机缺少 Node",
     "daemon_auto_upgrade_reason_unknown": "daemon 暂时无法升级",
     "daemon_offline": "Daemon 离线"
+  },
+  "mobile_menu": {
+    "home": "← 首页",
+    "change_server": "⇄ 切换云服务器"
   },
   "quick_input": {
     "title": "快捷输入",

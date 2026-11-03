@@ -15,6 +15,7 @@ export interface UnifiedServerItem extends ServerOrderEntry {
   name: string;
   status: string;
   lastHeartbeatAt: number | null;
+  statusObservedAt?: number | null;
   daemonVersion?: string | null;
   latestDaemonVersion?: string | null;
   createdAt?: number;
@@ -28,6 +29,7 @@ export interface UnifiedServerItem extends ServerOrderEntry {
 export interface ServerPresenceObservation {
   status: string;
   lastHeartbeatAt: number | null;
+  statusObservedAt?: number | null;
   source: 'grant' | 'daemon' | 'pod-pong' | 'fallback';
 }
 
@@ -39,11 +41,11 @@ export interface ServerPresenceObservation {
  * 1. Status and heartbeat are kept TOGETHER as a coherent observation, never mixing
  *    an offline status from one source with a heartbeat timestamp from another.
  * 2. An authoritative DB grant presence wins over an older cached offline snapshot when
- *    grant.lastHeartbeatAt >= (server.lastHeartbeatAt ?? 0), permitting fresh recovery.
+ *    grantObservedAt > serverObservedAt, permitting fresh recovery.
  * 3. WS pod-pong pings on visited servers are NOT daemon liveness and must not override
  *    authoritative DB grant presence.
- * 4. Newer genuine daemon disconnection / offline events from the visited session take
- *    precedence if their timestamp is strictly newer than the grant's heartbeat.
+ * 4. Genuine daemon disconnection / offline events from the visited session take
+ *    precedence if their statusObservedAt is equal or newer than the grant's observation.
  * 5. If neither source carries a verified numeric heartbeat, the status falls back safely
  *    and classifies as 'unknown' rather than asserting offline.
  */
@@ -62,12 +64,39 @@ export function resolveCoherentPresenceObservation(
   const serverStatus = server?.status ?? 'active';
   const serverIsPodPong = (server as { heartbeatSource?: string })?.heartbeatSource === 'pod-pong';
 
-  // 1. Grant carries authoritative heartbeat from DB
+  const serverObservedAt = typeof (server as any)?.statusObservedAt === 'number' && Number.isFinite((server as any).statusObservedAt)
+    ? (server as any).statusObservedAt as number
+    : (serverHeartbeat ?? 0);
+  const grantObservedAt = typeof (grant as any)?.statusObservedAt === 'number' && Number.isFinite((grant as any).statusObservedAt)
+    ? (grant as any).statusObservedAt as number
+    : (grantHeartbeat ?? 0);
+
+  // 1. Visited server has a genuine offline event that has NOT been superseded by a strictly newer grant
+  if (serverStatus === 'offline' && !serverIsPodPong) {
+    if (grantHeartbeat === null || serverObservedAt >= grantObservedAt) {
+      return {
+        status: 'offline',
+        lastHeartbeatAt: serverHeartbeat ?? grantHeartbeat,
+        statusObservedAt: serverObservedAt,
+        source: 'daemon',
+      };
+    }
+    // grantObservedAt > serverObservedAt: a fresh authoritative grant arrived AFTER the offline event!
+    return {
+      status: grantStatus,
+      lastHeartbeatAt: grantHeartbeat,
+      statusObservedAt: grantObservedAt,
+      source: 'grant',
+    };
+  }
+
+  // 2. Grant carries authoritative heartbeat from DB
   if (grantHeartbeat !== null) {
-    if (serverIsPodPong || serverHeartbeat === null || grantHeartbeat >= serverHeartbeat) {
+    if (serverIsPodPong || serverHeartbeat === null || grantHeartbeat > serverHeartbeat || (grantHeartbeat === serverHeartbeat && grantObservedAt >= serverObservedAt)) {
       return {
         status: grantStatus,
         lastHeartbeatAt: grantHeartbeat,
+        statusObservedAt: grantObservedAt,
         source: 'grant',
       };
     }
@@ -75,23 +104,26 @@ export function resolveCoherentPresenceObservation(
     return {
       status: serverStatus,
       lastHeartbeatAt: serverHeartbeat,
+      statusObservedAt: serverObservedAt,
       source: 'daemon',
     };
   }
 
-  // 2. Grant has no heartbeat, but visited server has genuine daemon heartbeat
+  // 3. Grant has no heartbeat, but visited server has genuine daemon heartbeat
   if (serverHeartbeat !== null && !serverIsPodPong) {
     return {
       status: serverStatus,
       lastHeartbeatAt: serverHeartbeat,
+      statusObservedAt: serverObservedAt,
       source: 'daemon',
     };
   }
 
-  // 3. Neither carries an authoritative heartbeat (legacy peer or missing presence)
+  // 4. Neither carries an authoritative heartbeat (legacy peer or missing presence)
   return {
     status: grant?.serverStatus ?? server?.status ?? 'active',
     lastHeartbeatAt: null,
+    statusObservedAt: null,
     source: 'fallback',
   };
 }
@@ -158,6 +190,7 @@ export function projectUnifiedServerList<T extends OnlineServerInfo>(
         name: server.name,
         status: server.status,
         lastHeartbeatAt: server.lastHeartbeatAt,
+        statusObservedAt: (server as { statusObservedAt?: number | null }).statusObservedAt,
         daemonVersion: (server as { daemonVersion?: string | null }).daemonVersion,
         latestDaemonVersion: (server as { latestDaemonVersion?: string | null }).latestDaemonVersion,
         createdAt: server.createdAt,
@@ -185,6 +218,7 @@ export function projectUnifiedServerList<T extends OnlineServerInfo>(
           name: displayName,
           status: observation.status,
           lastHeartbeatAt: observation.lastHeartbeatAt,
+          statusObservedAt: observation.statusObservedAt,
           daemonVersion: (server as { daemonVersion?: string | null }).daemonVersion,
           latestDaemonVersion: (server as { latestDaemonVersion?: string | null }).latestDaemonVersion,
           createdAt: server.createdAt,
@@ -194,6 +228,7 @@ export function projectUnifiedServerList<T extends OnlineServerInfo>(
             ...server,
             status: observation.status,
             lastHeartbeatAt: observation.lastHeartbeatAt,
+            statusObservedAt: observation.statusObservedAt,
           },
           presence,
           online: presence === 'online',
@@ -220,6 +255,7 @@ export function projectUnifiedServerList<T extends OnlineServerInfo>(
       name: displayName,
       status: observation.status,
       lastHeartbeatAt: observation.lastHeartbeatAt,
+      statusObservedAt: observation.statusObservedAt,
       isSharedIn: true,
       sharedEntry: grant,
       presence,

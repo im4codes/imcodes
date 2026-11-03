@@ -1075,6 +1075,7 @@
     "devices": "Devices",
     "online": "Online",
     "offline": "Offline",
+    "status_unknown": "Status unknown",
     "added_on": "Added {{date}}",
     "list_empty": "No devices yet. Add one with",
     "delete_error": "Failed to delete server: {{error}}",
@@ -1125,6 +1126,10 @@
     "daemon_auto_upgrade_reason_toolchain_unavailable": "Node is missing on the daemon host",
     "daemon_auto_upgrade_reason_unknown": "the daemon is temporarily not able to upgrade",
     "daemon_offline": "Daemon offline"
+  },
+  "mobile_menu": {
+    "home": "← Home",
+    "change_server": "⇄ Switch Cloud Server"
   },
   "quick_input": {
     "title": "Quick input",

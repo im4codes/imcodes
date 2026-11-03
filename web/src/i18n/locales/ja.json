@@ -1075,6 +1075,7 @@
     "devices": "デバイス",
     "online": "オンライン",
     "offline": "オフライン",
+    "status_unknown": "ステータス不明",
     "added_on": "追加日 {{date}}",
     "list_empty": "デバイスはまだありません。次のコマンドで追加：",
     "delete_error": "サーバーを削除できませんでした：{{error}}",
@@ -1125,6 +1126,10 @@
     "daemon_auto_upgrade_reason_toolchain_unavailable": "daemon ホストに Node がありません",
     "daemon_auto_upgrade_reason_unknown": "daemon は現在アップグレードできません",
     "daemon_offline": "daemon はオフラインです"
+  },
+  "mobile_menu": {
+    "home": "← ホーム",
+    "change_server": "⇄ クラウドサーバー切り替え"
   },
   "quick_input": {
     "title": "クイック入力",
