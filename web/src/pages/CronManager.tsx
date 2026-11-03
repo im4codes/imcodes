@@ -874,8 +874,58 @@ export function ExecDetailView({
       setCanExpand(false);
       return;
     }
-    setCanExpand(el.scrollHeight > 140 || lineCount > 5);
-  }, [exec.detail, lineCount]);
+
+    const checkOverflow = () => {
+      const target = bodyRef.current;
+      if (!target) return;
+
+      // In jsdom without layout engine, clientHeight and scrollHeight are 0
+      const isZeroLayout = target.scrollHeight === 0 && target.clientHeight === 0;
+      if (isZeroLayout) {
+        setCanExpand(lineCount > 5);
+        return;
+      }
+
+      const style = window.getComputedStyle(target);
+      const fontSize = parseFloat(style.fontSize) || 13;
+      // 5 lines max height defined in CSS: calc(5 * 1.65em + 24px)
+      const collapsedMaxHeight = 5 * 1.65 * fontSize + 24;
+
+      // In collapsed mode, check if scrollHeight overflows visible clientHeight.
+      // In expanded mode, check if scrollHeight still overflows collapsedMaxHeight.
+      const threshold = isExpanded ? (collapsedMaxHeight + 1) : (target.clientHeight + 1);
+      const overflows = target.scrollHeight > threshold;
+
+      setCanExpand(overflows);
+
+      // If container resized wider such that content naturally fits in <= 5 lines, reset expanded
+      if (!overflows && isExpanded) {
+        setIsExpanded(false);
+      }
+    };
+
+    checkOverflow();
+    const rafId = requestAnimationFrame(checkOverflow);
+
+    let observer: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== 'undefined') {
+      observer = new ResizeObserver(() => {
+        checkOverflow();
+      });
+      observer.observe(el);
+    } else {
+      window.addEventListener('resize', checkOverflow);
+    }
+
+    return () => {
+      cancelAnimationFrame(rafId);
+      if (observer) {
+        observer.disconnect();
+      } else {
+        window.removeEventListener('resize', checkOverflow);
+      }
+    };
+  }, [exec.detail, exec.id, exec.created_at, isExpanded, lineCount]);
 
   return (
     <div class="cron-execution-detail">

@@ -184,6 +184,73 @@ describe('ExecDetailView — 5/15 lines height & responsive presentation', () =>
     fireEvent.click(actionBtn);
     expect(onNavigateSession).toHaveBeenCalledTimes(1);
   });
+
+  it('uses ResizeObserver and dynamically handles narrow/wide resize and expand reset', async () => {
+    let observerCallback: (() => void) | null = null;
+    const observeMock = vi.fn();
+    const disconnectMock = vi.fn();
+
+    // Mock ResizeObserver
+    class MockResizeObserver {
+      constructor(callback: () => void) {
+        observerCallback = callback;
+      }
+      observe = observeMock;
+      disconnect = disconnectMock;
+      unobserve = vi.fn();
+    }
+    vi.stubGlobal('ResizeObserver', MockResizeObserver);
+
+    const exec = {
+      id: 'exec-resize-causal',
+      status: 'dispatched',
+      detail: 'word '.repeat(35),
+      created_at: 1730000000000,
+    };
+
+    const { unmount } = render(
+      <ExecDetailView
+        jobName="Resize Test"
+        exec={exec}
+        t={(key: string) => key}
+      />
+    );
+
+    expect(observeMock).toHaveBeenCalled();
+
+    const outputBody = screen.getByTestId('cron-execution-output-body');
+
+    // Simulate initial wide render (scrollHeight 100 <= clientHeight 123)
+    Object.defineProperty(outputBody, 'clientHeight', { configurable: true, value: 123 });
+    Object.defineProperty(outputBody, 'scrollHeight', { configurable: true, value: 100 });
+    observerCallback!();
+    await waitFor(() => expect(outputBody.getAttribute('data-overflows')).toBe('false'));
+
+    // Simulate resizing to narrow (scrollHeight 220 > clientHeight 123)
+    Object.defineProperty(outputBody, 'scrollHeight', { configurable: true, value: 220 });
+    observerCallback!();
+    await waitFor(() => expect(outputBody.getAttribute('data-overflows')).toBe('true'));
+
+    // Expand
+    const expandBtn = await screen.findByText('cron.expand_view');
+    fireEvent.click(expandBtn);
+    await waitFor(() => expect(outputBody.getAttribute('data-expanded')).toBe('true'));
+
+    // Simulate resizing back to wide (scrollHeight 100 <= collapsedMaxHeight ~131)
+    Object.defineProperty(outputBody, 'scrollHeight', { configurable: true, value: 100 });
+    observerCallback!();
+    // Must reset isExpanded and data-overflows
+    await waitFor(() => {
+      expect(outputBody.getAttribute('data-overflows')).toBe('false');
+      expect(outputBody.getAttribute('data-expanded')).toBe('false');
+    });
+
+    // Unmount cleans up observer
+    unmount();
+    expect(disconnectMock).toHaveBeenCalled();
+
+    vi.unstubAllGlobals();
+  });
 });
 
 describe('AutoResizeTextarea — 5 to 15 lines auto-adaptation', () => {
