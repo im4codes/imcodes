@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   CAPABILITY_CANONICAL_INSTALL_POLICY,
+  CAPABILITY_AI_SYSTEM_INSTRUCTIONS,
   CAPABILITY_AUTHORIZATION_ALGORITHM,
   CAPABILITY_AUTHORITY_STATE,
   CAPABILITY_INSTALL_STATE,
@@ -38,12 +39,26 @@ describe('capability management shared contract', () => {
       }
     }
     expect(CAPABILITY_MCP_TOOL_CONTRACTS[CAPABILITY_MCP_TOOL.INSTALL].description).toContain("every agent\'s own MCP config");
-    expect(CAPABILITY_MCP_TOOL_CONTRACTS[CAPABILITY_MCP_TOOL.INSTALL].description).toContain('~/.agents/skills');
-    expect(CAPABILITY_CANONICAL_INSTALL_POLICY).toContain('~/.agents/skills');
+    expect(CAPABILITY_MCP_TOOL_CONTRACTS[CAPABILITY_MCP_TOOL.INSTALL].description).toContain('npx skills add');
     expect(CAPABILITY_CANONICAL_INSTALL_POLICY).toContain('IM.codes MCP tab');
     expect(CAPABILITY_CANONICAL_INSTALL_POLICY).toContain('source.kind=mcp_config');
     expect(CAPABILITY_CANONICAL_INSTALL_POLICY).toContain('do not require an installer URL');
     expect(JSON.stringify(CAPABILITY_MCP_TOOL_CONTRACTS)).not.toMatch(/capability_(?:draft|commit|audit_start|request_approval)/);
+  });
+
+  it('defaults Agent Skills to the upstream CLI without a competing IM.codes installer', () => {
+    expect(CAPABILITY_CANONICAL_INSTALL_POLICY).toContain('npx skills add <source>');
+    expect(CAPABILITY_CANONICAL_INSTALL_POLICY).toContain('project-local');
+    expect(CAPABILITY_CANONICAL_INSTALL_POLICY).toContain('--global');
+    expect(CAPABILITY_CANONICAL_INSTALL_POLICY).toContain('npx skills list');
+    expect(CAPABILITY_CANONICAL_INSTALL_POLICY).toContain('npx skills update');
+    expect(CAPABILITY_CANONICAL_INSTALL_POLICY).toContain('npx skills remove');
+    expect(CAPABILITY_AI_SYSTEM_INSTRUCTIONS).not.toContain('MCP service or Agent Skill, use the capability_');
+    expect(CAPABILITY_AI_SYSTEM_INSTRUCTIONS).not.toContain('Manage MCP services and Agent Skills only through');
+    expect(CAPABILITY_AI_SYSTEM_INSTRUCTIONS).not.toContain('install one with capability_install kind=skill');
+    for (const name of CAPABILITY_MCP_TOOL_NAMES) {
+      expect(CAPABILITY_MCP_TOOL_CONTRACTS[name].description).toContain('skills');
+    }
   });
 
   it('advertises direct AI-composed MCP configuration instead of an installer download', () => {

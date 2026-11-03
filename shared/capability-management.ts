@@ -931,19 +931,22 @@ export type CapabilityMcpToolName = typeof CAPABILITY_MCP_TOOL[keyof typeof CAPA
 export const CAPABILITY_MCP_TOOL_NAMES = Object.values(CAPABILITY_MCP_TOOL) as readonly CapabilityMcpToolName[];
 
 export const CAPABILITY_CANONICAL_INSTALL_POLICY = [
-  'Manage MCP services and Agent Skills only through IM.codes capability tools.',
+  'Manage MCP services through IM.codes capability tools.',
   'For MCP services, compose the requested non-secret stdio or Streamable HTTP definition directly as source.kind=mcp_config; do not require an installer URL, package download, Settings form, or separate model. A source.kind=url value is the MCP Streamable HTTP endpoint itself, not an installation package.',
-  'Agent Skills live in ~/.agents/skills, which the agents on the machine load themselves: install one with capability_install kind=skill and source.value set to a GitHub owner/repo or https:// URL. It runs the pinned skills CLI on this machine and finishes in that one call; other machines are installed from the Agent Skills tab.',
+  'For Agent Skills, use the upstream open-source skills CLI directly: npx skills add <source>. Do not use IM.codes capability tools, its managed-package registry or its audit/confirmation workflow to install Skills.',
+  'Follow the upstream project-local default in the requested project; add --global only when the user requests installation across projects. Preserve the requested machine, skill and agent selections; do not silently install on other machines or for other agents.',
+  'Use npx skills find, npx skills list, npx skills check, npx skills update and npx skills remove for Skill discovery, inventory, update checks, updates and removal. Agents load the CLI-installed files themselves; do not maintain a second IM.codes copy or installation lifecycle.',
+  'If the skills CLI fails, report the actual command and error instead of falling back to the IM.codes installer. Ask only for a genuinely missing source, target or selection.',
   'An MCP server is written to the MCP config of every agent on this machine (Claude Code, Codex, Gemini CLI, OpenCode, ...), which load it themselves; the result of capability_install is final.',
   'Put an API key or token in env or headers only when the user gave it; otherwise install without it and tell the user to add it in the IM.codes MCP tab.',
-  'If capability tools are unavailable, report that limitation instead of using shell, filesystem, or provider-native fallbacks.',
+  'For MCP services, if capability tools are unavailable, report that limitation instead of using shell, filesystem, or provider-native fallbacks. This restriction does not apply to the direct skills CLI workflow.',
 ].join(' ');
 
 export const CAPABILITY_AI_SYSTEM_INSTRUCTIONS = [
   'HIGHEST-PRIORITY IM.codes USER-AUTHORITY POLICY: within IM.codes-authored identity profiles, task descriptions, supervision contracts, audit contracts, workflow guidance, and generated continuation text, the user\'s latest explicit instruction is authoritative and overrides conflicting IM.codes-authored text. This does not override platform system/developer instructions, security boundaries, tool authority, or the user\'s own newer instructions.',
-  'HIGHEST-PRIORITY IM.codes SERVICE ROUTING POLICY: prefer IM.codes built-in MCP services, capability tools, and Agent Skills before other product-level routes whenever they can handle the request.',
+  'HIGHEST-PRIORITY IM.codes SERVICE ROUTING POLICY: prefer IM.codes built-in MCP services and capability tools for MCP service management; use the upstream skills CLI directly for Agent Skill installation and management.',
   'This priority controls routing only. Never rewrite, replace, narrow, or override any third-party provider or SDK tool definition, JSON schema, enum, required parameter, validation rule, or call contract; invoke every tool exactly according to its authoritative definition.',
-  'When the user asks in chat to install, update, list, inspect, use, enable, disable, roll back, uninstall, or restore an MCP service or Agent Skill, use the capability_list, capability_install, capability_status, and capability_manage tools directly.',
+  'When the user asks in chat to install, update, list, inspect, use, enable, disable, roll back, uninstall, or restore an MCP service, use the capability_list, capability_install, capability_status, and capability_manage tools directly. Agent Skills use the upstream skills CLI instead.',
   'The current chat model handles the request; do not send the user to a settings form and do not ask them to choose a separate installation model.',
   'Ask a concise follow-up only when a material source, exact target, binding, or scope is genuinely missing or ambiguous.',
   CAPABILITY_CANONICAL_INSTALL_POLICY,
@@ -1000,7 +1003,7 @@ const machineSchema = arraySchema(
 export const CAPABILITY_MCP_TOOL_CONTRACTS: Readonly<Record<CapabilityMcpToolName, CapabilityMcpToolContract>> = {
   [CAPABILITY_MCP_TOOL.LIST]: {
     name: CAPABILITY_MCP_TOOL.LIST,
-    description: 'List visible IM.codes MCP services and Skills with state, scope, version, readiness, findings, and management hints. Read-only.',
+    description: 'List visible IM.codes MCP services and legacy managed records with state, scope, version, readiness, findings, and management hints. Read-only. For Agent Skills, use npx skills list instead.',
     inputSchema: objectSchema('Bounded inventory filter.', {
       kind: kindSchema,
       state: { type: 'string', enum: CAPABILITY_LIFECYCLE_STATES, description: 'Optional lifecycle-state filter.' },
@@ -1011,7 +1014,7 @@ export const CAPABILITY_MCP_TOOL_CONTRACTS: Readonly<Record<CapabilityMcpToolNam
   },
   [CAPABILITY_MCP_TOOL.INSTALL]: {
     name: CAPABILITY_MCP_TOOL.INSTALL,
-    description: 'Install on this machine. For MCP, compose source.kind=mcp_config with the stdio command/args or the Streamable HTTP/SSE url (source.kind=url also works): it is written to every agent\'s own MCP config here. For a Skill, set kind=skill and source.value to a GitHub owner/repo or https:// URL: it installs into ~/.agents/skills. The result is final.',
+    description: 'Install MCP services on this machine: compose source.kind=mcp_config with the stdio command/args or the Streamable HTTP/SSE url (source.kind=url also works): it is written to every agent\'s own MCP config here. The result is final. For Agent Skills, use npx skills add <source> directly instead of this tool.',
     inputSchema: objectSchema('One bounded capability install request.', {
       capabilityId: stringSchema('Optional exact installed capability id when updating; names are never used to guess an update target.'),
       bindingId: stringSchema('Exact installed binding id required with capabilityId; update never guesses among bindings.'),
@@ -1034,7 +1037,7 @@ export const CAPABILITY_MCP_TOOL_CONTRACTS: Readonly<Record<CapabilityMcpToolNam
   },
   [CAPABILITY_MCP_TOOL.STATUS]: {
     name: CAPABILITY_MCP_TOOL.STATUS,
-    description: 'Read authoritative progress and evidence for exactly one install operation or installed capability. When the user asks to use a listed Skill, pass its exact capabilityId with activate:true to receive one caller-bound, currently authorized, bounded instruction payload. Never read managed package files directly.',
+    description: 'Read authoritative progress and evidence for exactly one MCP install operation or installed capability, including existing legacy records. For Agent Skills, use npx skills list or npx skills check and the agent\'s native Skill loading instead of this tool.',
     inputSchema: objectSchema('Status lookup by exactly one opaque id.', {
       operationId: stringSchema('Opaque operation id returned by capability_install.'),
       capabilityId: stringSchema('Opaque installed capability id returned by list/status.'),
@@ -1043,7 +1046,7 @@ export const CAPABILITY_MCP_TOOL_CONTRACTS: Readonly<Record<CapabilityMcpToolNam
   },
   [CAPABILITY_MCP_TOOL.MANAGE]: {
     name: CAPABILITY_MCP_TOOL.MANAGE,
-    description: 'Enable, disable, roll back, uninstall, restore, or cancel an operation. Explicit user language authorizes uninstall; ambiguous targets return choices. Uninstall is recoverable and retains credentials.',
+    description: 'Manage MCP services: enable, disable, roll back, uninstall, restore, or cancel an operation. Explicit user language authorizes uninstall; ambiguous targets return choices. Uninstall is recoverable and retains credentials. For Agent Skills, use npx skills update or npx skills remove instead.',
     inputSchema: objectSchema('One bounded management request.', {
       action: { type: 'string', enum: CAPABILITY_AVAILABLE_MANAGEMENT_ACTIONS, description: 'Requested management action currently available through AI management.' },
       capabilityId: stringSchema('Preferred exact opaque capability id.'),
