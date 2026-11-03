@@ -108,7 +108,7 @@ async function deliverTaskPairMessage(
   if (!pairWakeAllowed(bindings, reason, target)) return 'suspended';
   // Empty aggregate means every covered pair is paused: there is no work to chase.
   if (taskId.startsWith('__') && getTaskPairStore().pairsForSession(target).some((p) => p.state.brain === target) && !bindings.length) return 'suspended';
-  const binding = bindings.length ? encodePairWake(bindings, reason) : '';
+  const binding = bindings.length ? encodePairWake(bindings, reason, dedupeScope) : '';
   const messageId = `${taskPairMessageIdPrefix(taskId, reason, dedupeScope)}${binding}${reason === TASK_PAIR_RESUME_REASON ? 'resume' : randomUUID()}`;
   // Most reasons are once-pending per pair.  A few state-machine notices are
   // explicitly once per lifecycle scope (for example, one in-audit warning

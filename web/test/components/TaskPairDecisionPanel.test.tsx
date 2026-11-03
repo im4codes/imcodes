@@ -586,5 +586,69 @@ describe('TaskPairDecisionPanel', () => {
         feedback: 'Credentials are now available',
       });
     });
+
+    it('F1-R4: current free feedback ACK does not resurrect old resolved question/options, and live reload/projection suppresses resolved request', async () => {
+      const questionOld: any = {
+        id: 'q-old', project: 'p', taskId: 'task', round: 1, deliveryRound: 1,
+        kind: 'request', conclusion: 'Old conclusion', summary: 'Old question summary',
+        question: 'Old question?', options: [{ id: 'old-opt', label: 'OLD CHOICE' }],
+        author: 'executor', at: 10,
+      };
+      const rulingOld: any = {
+        ...questionOld,
+        id: 'ruling-old', kind: 'decision', requestId: questionOld.id,
+        author: 'brain', conclusion: 'Approved Old', at: 20,
+      };
+      const current: SupervisionConsolePairInfo = {
+        status: 'working',
+        round: 1,
+        deliveryRound: 1,
+        flags: ['blocked'],
+        blocking: ['P0'],
+        blockedNote: 'NEW blocker: credentials unavailable',
+        decisionRevision: 'rev-current',
+        decisionRequest: questionOld,
+        latestDecision: rulingOld,
+        brain: 'brain',
+      };
+
+      unbind = bindTaskPairDecisions((frame) => {
+        const feedbackRecord = {
+          id: 'feedback-1', project: 'p', taskId: 'task', round: 1, deliveryRound: 1,
+          kind: 'feedback' as const, summary: 'Feedback text', author: 'brain', at: 30,
+        };
+        receiveTaskPairDecision(frame.requestId, {
+          ok: true,
+          decisions: [feedbackRecord, rulingOld, questionOld],
+        });
+      });
+
+      render(<TaskPairDecisionPanel taskId="task" pair={current} />);
+
+      expect(screen.queryByRole('button', { name: 'OLD CHOICE' })).toBeNull();
+      expect(screen.getByTestId('expandable-task-objective-text').textContent).toContain('NEW blocker: credentials unavailable');
+
+      fireEvent.input(screen.getByRole('textbox'), { target: { value: 'Current credentials are now available' } });
+      fireEvent.click(screen.getByRole('button', { name: 'taskPair.decision.send' }));
+
+      await waitFor(() => expect(screen.getByRole('status')).toBeTruthy());
+
+      expect(screen.queryByRole('button', { name: 'OLD CHOICE' })).toBeNull();
+      expect(screen.getByTestId('expandable-task-objective-text').textContent).toContain('NEW blocker: credentials unavailable');
+
+      cleanup();
+      const reloadedPair: SupervisionConsolePairInfo = {
+        ...current,
+        decisionRequest: undefined,
+        latestDecision: {
+          id: 'feedback-1', project: 'p', taskId: 'task', round: 1, deliveryRound: 1,
+          kind: 'feedback' as const, summary: 'Feedback text', author: 'brain', at: 30,
+        },
+      };
+      render(<TaskPairDecisionPanel taskId="task" pair={reloadedPair} />);
+
+      expect(screen.queryByRole('button', { name: 'OLD CHOICE' })).toBeNull();
+      expect(screen.getByTestId('expandable-task-objective-text').textContent).toContain('NEW blocker: credentials unavailable');
+    });
   });
 });

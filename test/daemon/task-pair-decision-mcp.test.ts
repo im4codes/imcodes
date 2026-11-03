@@ -12,6 +12,7 @@ import { setTaskPairDeliveryDepsForTests } from '../../src/daemon/task-pairs/del
 import { taskPairService } from '../../src/daemon/task-pairs/service.js';
 import { taskPairDecisionReminderDue, checkTaskPairMissingExplanation, TaskPairAutomation } from '../../src/daemon/task-pairs/scheduler.js';
 import { buildPairConsoleRow } from '../../src/daemon/supervision-console-pair-projection.js';
+import { queuedPairWakeAllowed } from '../../src/daemon/task-pairs/wake-authority.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import type { TaskPairState } from '../../shared/task-pair.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
@@ -570,6 +571,118 @@ describe('pair decision MCP', () => {
       if (prevEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
       else process.env.IMCODES_SUPERVISION_ENGINE = prevEngine;
     }
+  });
+
+  it('F3-R4: stable episode across CHECK progress, auto checklist, and 51+ heartbeats; true transition with same flags creates new episode', async () => {
+    const store = getTaskPairStore();
+    const sent: string[] = [];
+    setTaskPairDeliveryDepsForTests({
+      send: async (_target, text) => {
+        sent.push(text);
+      },
+    });
+
+    const taskBase: TaskPairState = {
+      taskId: 'f3-episode-stability',
+      title: 'stability test',
+      brain: 'brain',
+      executor: 'exec',
+      auditor: 'audit',
+      status: 'working',
+      round: 1,
+      deliveryRound: 1,
+      flags: ['blocked'],
+      flagSides: { blocked: 'executor' },
+      blocking: ['P0'],
+      createdAt: 100,
+      updatedAt: 100,
+      previousAuditors: [],
+    } as unknown as TaskPairState;
+    store.savePair('p', taskBase);
+
+    // Initial transition event
+    store.recordEvent({
+      id: 'origin-blocked', project: 'p', taskId: 'f3-episode-stability',
+      writer: 'exec', role: 'executor', verb: 'BLOCKED', attrs: {}, effect: 'blocked',
+      unusual: false, source: 'marker', fromStatus: 'working', toStatus: 'working', at: 100,
+    });
+
+    expect(checkTaskPairMissingExplanation(store.getPair('p', 'f3-episode-stability')!, 100)).toBe(true);
+    await taskPairService.retryDecisionNotifications(100);
+    expect(sent).toHaveLength(1);
+
+    // 1. Checklist progress marker (CHECK) does NOT create a new episode
+    store.recordEvent({
+      id: 'check-1', project: 'p', taskId: 'f3-episode-stability',
+      writer: 'exec', role: 'executor', verb: 'CHECK', attrs: {}, effect: 'checklist',
+      unusual: false, source: 'marker', fromStatus: 'working', toStatus: 'working', at: 200,
+    });
+    expect(checkTaskPairMissingExplanation(store.getPair('p', 'f3-episode-stability')!, 201)).toBe(false);
+    await taskPairService.retryDecisionNotifications(201);
+    expect(sent).toHaveLength(1);
+
+    // 2. 51+ heartbeat NUDGE events do NOT evict the episode or create a new one
+    for (let i = 0; i < 55; i++) {
+      store.recordEvent({
+        id: `hb-${i}`, project: 'p', taskId: 'f3-episode-stability',
+        writer: 'daemon', role: 'daemon', verb: 'NUDGE', attrs: {}, effect: 'nudge',
+        unusual: false, source: 'heartbeat', fromStatus: 'working', toStatus: 'working', at: 300 + i,
+      });
+    }
+    expect(checkTaskPairMissingExplanation(store.getPair('p', 'f3-episode-stability')!, 400)).toBe(false);
+    await taskPairService.retryDecisionNotifications(400);
+    expect(sent).toHaveLength(1);
+
+    // 3. True new transition event with the same flags DOES create a new episode
+    store.recordEvent({
+      id: 'new-blocked-event', project: 'p', taskId: 'f3-episode-stability',
+      writer: 'exec', role: 'executor', verb: 'BLOCKED', attrs: {}, effect: 'blocked',
+      unusual: false, source: 'marker', fromStatus: 'working', toStatus: 'working', at: 500,
+    });
+    expect(checkTaskPairMissingExplanation(store.getPair('p', 'f3-episode-stability')!, 501)).toBe(true);
+    await taskPairService.retryDecisionNotifications(501);
+    expect(sent).toHaveLength(2);
+  });
+
+  it('F3-R4: queued explanation notification is admitted while missing and rejected after note arrives', async () => {
+    const store = getTaskPairStore();
+    const ids: string[] = [];
+    setTaskPairDeliveryDepsForTests({
+      send: async (_target, _text, id) => {
+        ids.push(id);
+      },
+    });
+
+    const taskBase: TaskPairState = {
+      taskId: 'f3-queue-admission',
+      title: 'queue admission test',
+      brain: 'brain',
+      executor: 'exec',
+      auditor: 'audit',
+      status: 'working',
+      round: 1,
+      deliveryRound: 1,
+      flags: ['blocked'],
+      flagSides: { blocked: 'executor' },
+      blocking: ['P0'],
+      createdAt: 100,
+      updatedAt: 100,
+      previousAuditors: [],
+    } as unknown as TaskPairState;
+    store.savePair('p', taskBase);
+
+    expect(checkTaskPairMissingExplanation(store.getPair('p', 'f3-queue-admission')!, 100)).toBe(true);
+    await taskPairService.retryDecisionNotifications(100);
+    expect(ids).toHaveLength(1);
+
+    // Admitted while explanation is missing
+    expect(queuedPairWakeAllowed('exec', ids[0])).toBe(true);
+
+    // Blocker note arrives: context is now explained
+    store.savePair('p', { ...taskBase, blockedNote: 'Waiting for external approval' });
+
+    // Now rejected at queue consumption!
+    expect(queuedPairWakeAllowed('exec', ids[0])).toBe(false);
   });
 });
 

@@ -758,6 +758,20 @@ export class TaskPairStore {
     return Number(result.changes) > 0;
   }
 
+  latestBlockerEventId(project: string, taskId: string): string | undefined {
+    const row = this.#db.prepare(`
+      SELECT id FROM task_pair_events
+      WHERE project = ? AND task_id = ?
+        AND (
+          verb IN ('BLOCKED', 'NEEDS_INPUT')
+          OR (from_status IS NOT NULL AND to_status IS NOT NULL AND from_status != to_status)
+        )
+      ORDER BY at DESC, id DESC
+      LIMIT 1
+    `).get(project, taskId) as { id?: string } | undefined;
+    return row?.id;
+  }
+
   hasEvent(id: string): boolean {
     return !!this.#db.prepare('SELECT 1 FROM task_pair_events WHERE id = ?').get(id);
   }

@@ -81,8 +81,13 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
   const active = useRef(true);
   useEffect(() => () => { active.current = false; }, []);
   const question = pair.decisionRequest;
-  const latest = (readOnly ? history?.find((entry) => entry.kind === TASK_PAIR_DECISION_KIND.DECISION) : history?.[0]) ?? pair.latestDecision;
-  const resolved = isDecisionResolvingQuestion(latest, question);
+  const latest = history?.[0] ?? pair.latestDecision;
+  const relevantRuling = (
+    history?.find((entry) => isDecisionResolvingQuestion(entry, question))
+    ?? (isDecisionResolvingQuestion(pair.latestDecision, question) ? pair.latestDecision : undefined)
+  );
+  const resolved = !!relevantRuling;
+  const rulingToShow = relevantRuling ?? (latest?.kind === TASK_PAIR_DECISION_KIND.DECISION ? latest : undefined);
   const hasActiveQuestion = !!(question && !resolved);
   const hasNewBlocker = !!(
     pair.blockedNote
@@ -113,7 +118,7 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
     ? 'taskPair.decision.title_capacity'
     : category === 'completed_awaiting_brain'
     ? 'taskPair.decision.title_completed'
-    : (!waiting && (resolved || latest?.kind === TASK_PAIR_DECISION_KIND.DECISION))
+    : (!waiting && (resolved || rulingToShow !== undefined))
     ? 'taskPair.decision.resolved'
     : 'taskPair.decision.title';
 
@@ -184,8 +189,8 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
     reason,
     responsible,
     hasActiveQuestion && question?.recommendation ? `${t('taskPair.decision.recommendation')}: ${question.recommendation}` : '',
-    latest?.kind === TASK_PAIR_DECISION_KIND.DECISION && (resolved || (!question && (latest.deliveryRound ?? 1) === (pair.deliveryRound ?? 1) && latest.round === pair.round))
-      ? `${t('taskPair.decision.ruling')}: ${latest.conclusion} — ${latest.summary}`
+    !hasNewBlocker && rulingToShow && (resolved || (!question && (rulingToShow.deliveryRound ?? 1) === (pair.deliveryRound ?? 1) && rulingToShow.round === pair.round))
+      ? `${t('taskPair.decision.ruling')}: ${rulingToShow.conclusion} — ${rulingToShow.summary}`
       : '',
   ].filter(Boolean).join('\n');
 
@@ -222,8 +227,8 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
 
   return <section class="task-pair-decision" aria-label={t('taskPair.decision.title')}>
     <strong>{t(titleKey)}</strong>
-    {latest?.kind === TASK_PAIR_DECISION_KIND.DECISION && <small class="task-pair-decision-time">
-      {t('taskPair.decision.time')}: <time dateTime={new Date(latest.at).toISOString()}>{new Date(latest.at).toLocaleString()}</time>
+    {!hasNewBlocker && rulingToShow && <small class="task-pair-decision-time">
+      {t('taskPair.decision.time')}: <time dateTime={new Date(rulingToShow.at).toISOString()}>{new Date(rulingToShow.at).toLocaleString()}</time>
     </small>}
     <ExpandableTaskObjective key={`${context}:${latest?.id ?? ''}`} text={decisionText} className="task-pair-decision-copy" scrollLabel={t('taskPair.decision.title')} />
     {!readOnly && waiting && <>
