@@ -235,6 +235,46 @@ describe('projectUnifiedServerList', () => {
     expect(result).toHaveLength(0);
   });
 
+  it('retains visited unowned servers with their active scoped grant, and excludes them once the grant is revoked', () => {
+    const ownedIds = new Set(['server-owned-1']);
+    const visitedTabServer: OnlineServerInfo = {
+      id: 'server-restricted-visited',
+      name: 'Restricted Tab Machine',
+      status: 'online',
+      lastHeartbeatAt: Date.now(),
+      createdAt: baseTimestamp + 3000,
+    };
+    const tabShare: SharedEntrySummary = {
+      id: 'share-tab-scoped',
+      serverId: 'server-restricted-visited',
+      serverName: 'Restricted Tab Machine',
+      role: 'viewer',
+      status: 'active',
+      target: { kind: 'main', serverId: 'server-restricted-visited', sessionName: 'deck_tab' },
+      targetLabel: 'Restricted Tab',
+    };
+    // With active grant: retained with isSharedIn: true and its active sharedEntry
+    const withGrant = projectUnifiedServerList(
+      [mockOwnedServer1, visitedTabServer],
+      [tabShare],
+      ownedIds,
+    );
+    expect(withGrant).toHaveLength(2);
+    const projectedVisited = withGrant.find((s) => s.id === 'server-restricted-visited')!;
+    expect(projectedVisited.isSharedIn).toBe(true);
+    expect(projectedVisited.name).toBe('Restricted Tab Machine');
+    expect(projectedVisited.sharedEntry).toEqual(tabShare);
+
+    // Once grant is revoked (not in active sharedEntries): visited unowned server is excluded
+    const withoutGrant = projectUnifiedServerList(
+      [mockOwnedServer1, visitedTabServer],
+      [],
+      ownedIds,
+    );
+    expect(withoutGrant).toHaveLength(1);
+    expect(withoutGrant[0].id).toBe('server-owned-1');
+  });
+
   it('marks previously opened shared servers in inventory with isSharedIn: true and real heartbeat', () => {
     const ownedIds = new Set(['server-owned-1']); // server-shared-visited is NOT in ownedIds
     const visitedSharedServer: OnlineServerInfo = {

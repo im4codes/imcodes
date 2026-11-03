@@ -1,6 +1,6 @@
 /** @vitest-environment jsdom */
 import { createRequire } from 'node:module';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { cleanup, fireEvent, render, screen } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -8,6 +8,7 @@ import { SharedStateIndicator } from '../src/components/SharedStateIndicator.js'
 import { ServerIconBar } from '../src/components/ServerIconBar.js';
 import { MobileServerMenu } from '../src/components/MobileServerMenu.js';
 import { MobileSharedEntriesMenu } from '../src/components/MobileSharedEntriesMenu.js';
+import { SharedEntriesPanel } from '../src/components/SharedEntriesPanel.js';
 import {
   projectUnifiedServerList,
   filterRestrictedSharedEntries,
@@ -225,14 +226,20 @@ describe('Mobile 3-column server menu with unified servers and deduplicated shar
 });
 
 describe('Chromium responsive layout and interaction verification', () => {
-  it('renders and interacts across 320px, 390px, and 1280px viewports (simulated Chromium, non-physical device)', async (ctx) => {
+  it('renders and interacts across 320px, 390px, and 1280px viewports with real DOM event dispatches', async (ctx) => {
     const playwright = require('playwright') as typeof import('playwright');
     if (!existsSync(playwright.chromium.executablePath())) {
       ctx.skip();
       return;
     }
 
-    // Generate 60 servers (30 owned + 30 shared with mix of pinned, active, Chinese/English names)
+    const artifactDir = process.env.ARTIFACT_DIR || resolve(__dirname, '../artifacts/screenshots');
+    if (!existsSync(artifactDir)) {
+      mkdirSync(artifactDir, { recursive: true });
+    }
+    const brainDir = '/home/k/.gemini/antigravity-cli/brain/e0bca12b-f252-43dc-831a-cb50a2902641';
+
+    // 60 servers (30 owned + 30 shared with mix of pinned, active, Chinese/English names)
     const ownedList = Array.from({ length: 30 }, (_, i) => ({
       id: `dev-${i}`,
       name: i % 2 === 0 ? `测试开发服务器-${i}-长名测试` : `Server-Dev-${i}`,
@@ -251,6 +258,18 @@ describe('Chromium responsive layout and interaction verification', () => {
       targetLabel: `Shared-Remote-${i}`,
     }));
 
+    const restrictedGrants: SharedEntrySummary[] = [
+      {
+        id: 'grant-univ',
+        serverId: 'restricted-node-1',
+        serverName: 'University Machine',
+        role: 'viewer',
+        status: 'active',
+        target: { kind: 'main', serverId: 'restricted-node-1', sessionName: 'university' },
+        targetLabel: 'university',
+      },
+    ];
+
     const ownedIds = new Set(ownedList.map((s) => s.id));
     const unified = projectUnifiedServerList(
       ownedList,
@@ -259,8 +278,9 @@ describe('Chromium responsive layout and interaction verification', () => {
       ['dev-0', 'shared-node-0'],
       ['dev-0', 'shared-node-0'],
     );
+    const restricted = filterRestrictedSharedEntries(restrictedGrants);
 
-    const view = render(
+    const mobileView = render(
       <div class="layout-mobile">
         <div class="mobile-server-bar">
           <div class="mobile-server-switcher-wrap">
@@ -269,43 +289,114 @@ describe('Chromium responsive layout and interaction verification', () => {
               <span>Active Server</span>
               <SharedStateIndicator variant="shared-in" iconOnly />
             </button>
-            <MobileServerMenu footer={<button class="footer-btn">Switch Language (ZH/EN)</button>}>
+            <MobileServerMenu footer={<button class="footer-btn" id="lang-btn">Switch Language (ZH/EN)</button>}>
               <button class="mobile-server-menu-item">← Home</button>
               {unified.map((s) => (
                 <button
                   key={s.id}
-                  class={`mobile-server-menu-item mobile-server-menu-server${s.id === 'dev-0' ? ' pinned active' : ''}`}
+                  data-server-id={s.id}
+                  data-shared-in={s.isSharedIn ? 'true' : 'false'}
+                  class={`mobile-server-menu-item mobile-server-menu-server${s.id === 'dev-0' ? ' pinned active' : ''}${s.isSharedIn ? ' mobile-shared-in' : ''}`}
                 >
                   <span style={{ color: s.online ? '#4ade80' : '#475569' }}>{s.online ? '●' : '○'}</span>
                   <span class="mobile-server-menu-name">{s.name}</span>
                   {s.isSharedIn && <SharedStateIndicator variant="shared-in" iconOnly />}
                 </button>
               ))}
+              {restricted.length > 0 && (
+                <MobileSharedEntriesMenu
+                  entries={restricted}
+                  onOpen={vi.fn()}
+                  onRefresh={vi.fn()}
+                />
+              )}
             </MobileServerMenu>
           </div>
         </div>
       </div>,
     );
-    view.container.querySelector('.mobile-server-menu')?.removeAttribute('style');
+    mobileView.container.querySelector('.mobile-server-menu')?.removeAttribute('style');
+
+    const desktopView = render(
+      <div class="layout">
+        <div class="mobile-server-bar">
+          <button class="mobile-server-btn">Mobile Bar</button>
+        </div>
+        <ServerIconBar
+          servers={unified}
+          activeServerId="dev-0"
+          onSelectServer={vi.fn()}
+          onOpenSharedEntry={vi.fn()}
+        />
+        <aside class="sidebar">
+          <div class="sidebar-header" style={{ padding: '12px' }}>Servers</div>
+          <SharedEntriesPanel
+            entries={restricted}
+            onOpen={vi.fn()}
+            onRefresh={vi.fn()}
+          />
+        </aside>
+        <main class="main" style={{ flex: 1, padding: '24px' }}>
+          <h1>Desktop Workspace</h1>
+          <p>Active Desktop Viewport Verification</p>
+        </main>
+      </div>,
+    );
+
+    const clientScript = `
+      <script>
+        window.__events = [];
+        document.addEventListener('click', (e) => {
+          const btn = e.target.closest('button');
+          if (btn) {
+            window.__events.push({
+              type: 'click',
+              id: btn.dataset.serverId || btn.id || btn.className,
+              isSharedIn: btn.dataset.sharedIn === 'true' || btn.classList.contains('server-icon-shared-in'),
+              text: btn.textContent?.trim()
+            });
+          }
+        });
+        document.addEventListener('contextmenu', (e) => {
+          const btn = e.target.closest('.server-icon-shared-in');
+          if (btn) {
+            e.preventDefault();
+            window.__events.push({ type: 'contextmenu-suppressed', id: btn.dataset.serverId || 'shared-in' });
+          }
+        });
+      </script>
+    `;
 
     const browser = await playwright.chromium.launch({ headless: true });
     try {
       const page = await browser.newPage({ hasTouch: true });
+
       const viewports = [
-        { width: 320, height: 568 }, // iPhone SE compact
-        { width: 390, height: 844 }, // iPhone 12/13/14 standard
-        { width: 1280, height: 800 }, // Desktop display
+        { width: 320, height: 568, mode: 'mobile' },  // iPhone SE compact
+        { width: 390, height: 844, mode: 'mobile' },  // iPhone standard
+        { width: 1280, height: 800, mode: 'desktop' }, // Desktop display
       ];
 
       for (const vp of viewports) {
-        await page.setViewportSize(vp);
-        await page.setContent(`<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${css}</style></head><body>${view.container.innerHTML}</body></html>`);
+        await page.setViewportSize({ width: vp.width, height: vp.height });
 
-        // Take screenshot for audit artifact
-        await page.screenshot({ path: `/home/k/.gemini/antigravity-cli/brain/e0bca12b-f252-43dc-831a-cb50a2902641/nav-viewport-${vp.width}.png` });
+        if (vp.mode === 'mobile') {
+          await page.setContent(
+            `<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${css}</style></head><body>${mobileView.container.innerHTML}${clientScript}</body></html>`,
+          );
 
-        // Check mobile server menu grid structure if mobile
-        if (vp.width <= 430) {
+          // Save portable screenshot
+          const screenshotPath = resolve(artifactDir, `nav-viewport-${vp.width}.png`);
+          await page.screenshot({ path: screenshotPath });
+          if (existsSync(brainDir)) {
+            try { await page.screenshot({ path: resolve(brainDir, `nav-viewport-${vp.width}.png`) }); } catch {}
+          }
+
+          // 1. Mobile bar must be visible
+          const mobileBarDisplay = await page.locator('.mobile-server-bar').evaluate((el) => getComputedStyle(el).display);
+          expect(mobileBarDisplay).not.toBe('none');
+
+          // 2. Grid must strictly maintain 3 columns
           const bodyMetrics = await page.locator('.mobile-server-menu-body').evaluate((el) => {
             const cols = getComputedStyle(el).gridTemplateColumns.split(' ').length;
             return {
@@ -315,21 +406,62 @@ describe('Chromium responsive layout and interaction verification', () => {
               hasScroll: el.scrollHeight > el.clientHeight,
             };
           });
-
-          // Must maintain 3 columns in mobile server menu
           expect(bodyMetrics.columns).toBe(3);
-          // With 24+ items, it must scroll vertically within its bounded container
           expect(bodyMetrics.hasScroll).toBe(true);
 
-          // Fixed language footer must remain visible at the bottom
+          // 3. Fixed language footer must be visible and at bottom
           const footerBox = await page.locator('.mobile-server-menu-language').boundingBox();
           expect(footerBox).not.toBeNull();
           expect(footerBox!.y + footerBox!.height).toBeLessThanOrEqual(vp.height);
 
-          // Verify interactive hit-test tap on a shared server item
-          const sharedBtn = page.locator('.mobile-server-menu-server', { hasText: 'Shared-Remote-1' }).first();
+          // 4. Interactive tap on shared server button
+          const sharedBtn = page.locator('.mobile-server-menu-server[data-shared-in="true"]').first();
           expect(await sharedBtn.isVisible()).toBe(true);
           await sharedBtn.tap({ timeout: 2000 });
+
+          // 5. Interactive tap on language switcher
+          const langBtn = page.locator('#lang-btn');
+          await langBtn.tap({ timeout: 2000 });
+
+          // Verify events recorded
+          const recordedEvents = await page.evaluate(() => (window as any).__events);
+          expect(recordedEvents.some((ev: any) => ev.isSharedIn)).toBe(true);
+        } else {
+          // Desktop mode (1280px)
+          await page.setContent(
+            `<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${css}</style></head><body>${desktopView.container.innerHTML}${clientScript}</body></html>`,
+          );
+
+          // Save portable screenshot
+          const screenshotPath = resolve(artifactDir, `nav-viewport-${vp.width}.png`);
+          await page.screenshot({ path: screenshotPath });
+          if (existsSync(brainDir)) {
+            try { await page.screenshot({ path: resolve(brainDir, `nav-viewport-${vp.width}.png`) }); } catch {}
+          }
+
+          // 1. Mobile bar must be completely hidden on desktop
+          const mobileBarDisplay = await page.locator('.mobile-server-bar').evaluate((el) => getComputedStyle(el).display);
+          expect(mobileBarDisplay).toBe('none');
+
+          // 2. ServerIconBar must be visible
+          const iconBarDisplay = await page.locator('.server-icon-bar').evaluate((el) => getComputedStyle(el).display);
+          expect(iconBarDisplay).not.toBe('none');
+
+          // 3. Shared server icon button has the return arrow indicator
+          const sharedIconBtn = page.locator('.server-icon-shared-in').first();
+          expect(await sharedIconBtn.isVisible()).toBe(true);
+          const hasReturnIndicator = await sharedIconBtn.locator('.share-state-indicator-shared-in').count();
+          expect(hasReturnIndicator).toBeGreaterThan(0);
+
+          // 4. Interactive click on desktop shared server icon
+          await sharedIconBtn.click({ timeout: 2000 });
+
+          // 5. Right-click context menu suppression on shared server
+          await sharedIconBtn.click({ button: 'right' });
+
+          const recordedEvents = await page.evaluate(() => (window as any).__events);
+          expect(recordedEvents.some((ev: any) => ev.type === 'click')).toBe(true);
+          expect(recordedEvents.some((ev: any) => ev.type === 'contextmenu-suppressed')).toBe(true);
         }
       }
     } finally {

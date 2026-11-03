@@ -16,17 +16,20 @@ export interface UnifiedServerItem extends ServerOrderEntry {
   online: boolean;
 }
 
-function compareWholeServerGrants(a: SharedEntrySummary, b: SharedEntrySummary): number {
+function compareGrants(a: SharedEntrySummary, b: SharedEntrySummary): number {
+  const kindScore = (kind: string) => (kind === 'server' ? 10 : 0);
   const roleScore = (role: string) => (role === 'participant' ? 2 : 1);
-  const scoreDiff = roleScore(b.role) - roleScore(a.role);
-  if (scoreDiff !== 0) return scoreDiff;
+  const scoreA = kindScore(a.target.kind) + roleScore(a.role);
+  const scoreB = kindScore(b.target.kind) + roleScore(b.role);
+  if (scoreB !== scoreA) return scoreB - scoreA;
   return a.id.localeCompare(b.id);
 }
 
 /**
  * Project a unified server list combining owned/opened servers with active whole-server shared entries.
  * Deduplicates by serverId: owned servers take precedence and never downgrade ownership.
- * Discovered shared entries without prior verified heartbeat default to online: false.
+ * Non-owned servers in inventory retain their active shared grant to preserve scoped navigation proof.
+ * Discovered whole-server shared entries without prior verified heartbeat default to online: false.
  */
 export function projectUnifiedServerList<T extends OnlineServerInfo>(
   servers: readonly T[],
@@ -35,14 +38,10 @@ export function projectUnifiedServerList<T extends OnlineServerInfo>(
   serverOrder: readonly string[] = [],
   serverPinned: readonly string[] = [],
 ): UnifiedServerItem[] {
-  // 1. Group active whole-server grants by serverId
-  const activeServerGrants = sharedEntries.filter(
-    (entry): entry is SharedEntrySummary & { target: { kind: 'server' } } =>
-      entry.status === 'active' && entry.target.kind === 'server',
-  );
-
+  // 1. Group active grants by serverId
+  const activeGrants = sharedEntries.filter((entry) => entry.status === 'active');
   const grantsByServerId = new Map<string, SharedEntrySummary[]>();
-  for (const grant of activeServerGrants) {
+  for (const grant of activeGrants) {
     const existing = grantsByServerId.get(grant.serverId);
     if (existing) {
       existing.push(grant);
@@ -53,7 +52,7 @@ export function projectUnifiedServerList<T extends OnlineServerInfo>(
 
   const bestGrantByServerId = new Map<string, SharedEntrySummary>();
   for (const [serverId, list] of grantsByServerId.entries()) {
-    list.sort(compareWholeServerGrants);
+    list.sort(compareGrants);
     bestGrantByServerId.set(serverId, list[0]);
   }
 
@@ -62,31 +61,49 @@ export function projectUnifiedServerList<T extends OnlineServerInfo>(
 
   // 2. Existing servers in inventory
   for (const server of servers) {
-    seenServerIds.add(server.id);
     const isOwned = ownedServerIds.has(server.id);
-    const isSharedIn = !isOwned;
-    const sharedEntry = isSharedIn ? bestGrantByServerId.get(server.id) : undefined;
-    const displayName = (isSharedIn && sharedEntry?.targetLabel?.trim())
-      ? sharedEntry.targetLabel.trim()
-      : server.name;
-    unifiedItems.push({
-      id: server.id,
-      name: displayName,
-      status: server.status,
-      lastHeartbeatAt: server.lastHeartbeatAt,
-      daemonVersion: (server as { daemonVersion?: string | null }).daemonVersion,
-      latestDaemonVersion: (server as { latestDaemonVersion?: string | null }).latestDaemonVersion,
-      createdAt: server.createdAt,
-      isSharedIn,
-      sharedEntry,
-      server: isOwned ? server : server,
-      online: isServerOnline(server),
-    });
+    if (isOwned) {
+      seenServerIds.add(server.id);
+      unifiedItems.push({
+        id: server.id,
+        name: server.name,
+        status: server.status,
+        lastHeartbeatAt: server.lastHeartbeatAt,
+        daemonVersion: (server as { daemonVersion?: string | null }).daemonVersion,
+        latestDaemonVersion: (server as { latestDaemonVersion?: string | null }).latestDaemonVersion,
+        createdAt: server.createdAt,
+        isSharedIn: false,
+        sharedEntry: undefined,
+        online: isServerOnline(server),
+      });
+    } else {
+      // Non-owned server in inventory: only project if an active grant exists,
+      // and carry its exact grant to preserve recheckable scoped share authority.
+      const grant = bestGrantByServerId.get(server.id);
+      if (grant) {
+        seenServerIds.add(server.id);
+        const displayName = (grant.target.kind === 'server' && grant.targetLabel && grant.targetLabel.trim())
+          ? grant.targetLabel.trim()
+          : (server.name || grant.serverName);
+        unifiedItems.push({
+          id: server.id,
+          name: displayName,
+          status: server.status,
+          lastHeartbeatAt: server.lastHeartbeatAt,
+          daemonVersion: (server as { daemonVersion?: string | null }).daemonVersion,
+          latestDaemonVersion: (server as { latestDaemonVersion?: string | null }).latestDaemonVersion,
+          createdAt: server.createdAt,
+          isSharedIn: true,
+          sharedEntry: grant,
+          online: isServerOnline(server),
+        });
+      }
+    }
   }
 
   // 3. Newly discovered whole-server shares not yet in servers inventory
   for (const [serverId, grant] of bestGrantByServerId.entries()) {
-    if (seenServerIds.has(serverId) || ownedServerIds.has(serverId)) {
+    if (grant.target.kind !== 'server' || seenServerIds.has(serverId) || ownedServerIds.has(serverId)) {
       continue;
     }
     seenServerIds.add(serverId);

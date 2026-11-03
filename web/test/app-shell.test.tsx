@@ -471,11 +471,13 @@ vi.mock('../src/components/ServerIconBar.js', () => ({
         <button
           key={server.id}
           onClick={() => {
-            if (server.isSharedIn && server.sharedEntry && onOpenSharedEntry) {
-              onOpenSharedEntry(server.sharedEntry);
-            } else {
-              onSelectServer?.(server.id, server.name);
+            if (server.isSharedIn) {
+              if (server.sharedEntry && onOpenSharedEntry) {
+                onOpenSharedEntry(server.sharedEntry);
+              }
+              return;
             }
+            onSelectServer?.(server.id, server.name);
           }}
         >
           server-select-{server.id}
@@ -6826,5 +6828,118 @@ describe('App shell', () => {
     await navigateExternally('/#/srv-shared/deck_gamma_brain?shared=share-audit-whole');
     expect(firstSignal.aborted).toBe(true);
     expect(openSharedEntryMock, 'different preferred session must start its own authorized open').toHaveBeenCalledTimes(2);
+  }, 20_000);
+
+  it('audit-tag-only-visited must never dispatch an ordinary server selection', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const entry = {
+      id: 'audit-main-only',
+      serverId: 'srv-shared',
+      serverName: 'Scoped shared server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Audit restricted tab',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([entry]);
+    openSharedEntryMock.mockResolvedValue(sharedMainOpenResult('audit-main-only', 'audit-dispatch'));
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByTestId('session-pane-deck_alpha_brain');
+    fireEvent.click((await screen.findByText('Audit restricted tab')).closest('button')!);
+    await screen.findByTestId('session-pane-deck_beta_brain');
+    await waitFor(() => expect(window.location.hash).toContain('shared=audit-main-only'));
+    const count = openSharedEntryMock.mock.calls.length;
+    const row = screen.queryByText('server-select-srv-shared');
+    if (row) {
+      fireEvent.click(row);
+      expect(window.location.hash, 're-clicking a non-owned row must not clear its share proof and dispatch the ordinary reload path').toContain('shared=audit-main-only');
+      await waitFor(() => expect(openSharedEntryMock, 'non-owned navigation must preserve scoped share proof').toHaveBeenCalledTimes(count + 1));
+      expect(openSharedEntryMock.mock.calls.at(-1)?.[0]).toEqual(entry.target);
+    } else {
+      expect(screen.getByText('Audit restricted tab')).toBeTruthy();
+    }
+  }, 20_000);
+
+  it('owned server having a whole-server grant preserves owner identity and uses ordinary selection', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-2');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    // srv-1 is owned (in default mock servers). Also grant whole-server share for srv-1:
+    const grant = {
+      id: 'share-owned-conflict',
+      serverId: 'srv-1',
+      serverName: 'Server 1 Shared',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Server 1 Shared Copy',
+      target: { kind: 'server', serverId: 'srv-1' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([grant]);
+    const { App } = await importApp();
+    render(<App />);
+    // Clicking srv-1 must use ordinary server selection (not openSharedEntry)
+    const srv1Btn = await screen.findByText('server-select-srv-1');
+    fireEvent.click(srv1Btn);
+    expect(openSharedEntryMock).not.toHaveBeenCalled();
+  }, 20_000);
+
+  it('multiple whole-server grants on same server stably pick participant over viewer', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const viewerGrant = {
+      id: 'share-viewer-first',
+      serverId: 'srv-multi-grant',
+      serverName: 'Multi Server',
+      role: 'viewer',
+      status: 'active',
+      targetLabel: 'Multi Server Viewer',
+      target: { kind: 'server', serverId: 'srv-multi-grant' },
+    } as const;
+    const participantGrant = {
+      id: 'share-participant-better',
+      serverId: 'srv-multi-grant',
+      serverName: 'Multi Server',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Multi Server Participant',
+      target: { kind: 'server', serverId: 'srv-multi-grant' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([viewerGrant, participantGrant]);
+    openSharedEntryMock.mockResolvedValue({
+      server: { id: 'srv-multi-grant', name: 'Multi Server', status: 'online', lastHeartbeatAt: Date.now() },
+      target: participantGrant.target,
+      coverage: {
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: [participantGrant.id],
+        primaryShareId: participantGrant.id,
+        authorizedAt: Date.now(),
+      },
+      sessions: [{ sessionName: 'deck_multi_brain', state: 'running', agentType: 'codex-sdk' }],
+      subSessions: [],
+    });
+    const { App } = await importApp();
+    render(<App />);
+    const sharedBtn = (await screen.findByText('Multi Server Participant')).closest('button')!;
+    fireEvent.click(sharedBtn);
+    await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(participantGrant.target));
+  }, 20_000);
+
+  it('whole-to-restricted downgrade or failed discovery does not invent fake whole-server entries', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    // Discovery fails or only returns restricted grant
+    discoverSharedEntriesMock.mockRejectedValue(new Error('discovery failure'));
+    const { App } = await importApp();
+    render(<App />);
+    await screen.findByTestId('session-pane-deck_alpha_brain');
+    // Only owned servers exist; no unowned server exists
+    expect(screen.queryByText('server-select-srv-shared')).toBeNull();
   }, 20_000);
 });

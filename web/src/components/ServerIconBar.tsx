@@ -84,11 +84,13 @@ export function ServerIconBar({
             aria-label={server.name}
             aria-pressed={isActive}
             onClick={() => {
-              if (isSharedIn && server.sharedEntry && onOpenSharedEntry) {
-                onOpenSharedEntry(server.sharedEntry);
-              } else {
-                onSelectServer(server.id, server.name);
+              if (isSharedIn) {
+                if (server.sharedEntry && onOpenSharedEntry) {
+                  onOpenSharedEntry(server.sharedEntry);
+                }
+                return;
               }
+              onSelectServer(server.id, server.name);
             }}
             onContextMenu={(e: MouseEvent) => {
               e.preventDefault();

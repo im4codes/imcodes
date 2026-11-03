@@ -5787,11 +5787,13 @@ export function App() {
   }, [setActiveSession]);
 
   const handleUnifiedServerSelect = useCallback((item: UnifiedServerItem) => {
-    if (item.isSharedIn && item.sharedEntry) {
-      void handleOpenSharedEntry(item.sharedEntry);
-    } else {
-      handleSelectServer(item.id, item.name);
+    if (item.isSharedIn) {
+      if (item.sharedEntry) {
+        void handleOpenSharedEntry(item.sharedEntry);
+      }
+      return;
     }
+    handleSelectServer(item.id, item.name);
   }, [handleOpenSharedEntry, handleSelectServer]);
 
   const selectedServerIsSharedIn = useMemo(() => {
