@@ -5225,6 +5225,7 @@ html.native-ios-mac .chat-dl-btn {
    in the incoming-bubble tone. */
 .chat-user.chat-user-origin-agent,
 .chat-user.chat-user-origin-system { align-self: flex-start; background: #161b22; border: 1px solid rgba(148, 163, 184, 0.16); }
+.chat-user.chat-user-origin-agent { align-self: stretch; width: 100%; max-width: 100%; box-sizing: border-box; }
 .chat-user.chat-user-supervision-prompt.chat-user-origin-system { background: transparent; border: 0; }
 .chat-user.chat-pending { background: #1e3a5f80; color: #94a3b8; }
 .chat-user.chat-failed { background: #3a1a1a; color: #fca5a5; border: 1px solid #7f1d1d; }
@@ -5241,14 +5242,22 @@ html.native-ios-mac .chat-dl-btn {
 .chat-user-message-fold-content { line-height: 1.45; }
 .chat-user-message-fold-content.is-folded,
 .chat-user-message-fold-content.is-measuring { max-height: calc(1.45em * 10); overflow: hidden; }
+.chat-user.chat-user-origin-agent .chat-user-message-fold-content.is-folded,
+.chat-user.chat-user-origin-agent .chat-user-message-fold-content.is-measuring { max-height: calc(1.45em * 7); }
 .chat-user-message-fold.is-folded::after { content: ''; position: absolute; left: 0; right: 0; bottom: 28px; height: 28px; background: linear-gradient(transparent, #1e3a5f); pointer-events: none; border-radius: 0 0 8px 8px; }
 .chat-user.chat-user-origin-agent .chat-user-message-fold.is-folded::after,
 .chat-user.chat-user-origin-system .chat-user-message-fold.is-folded::after { background: linear-gradient(transparent, #161b22); }
+.chat-user.chat-user-origin-agent .chat-user-message-fold.is-folded::after { bottom: 24px; }
 .chat-user.chat-pending .chat-user-message-fold.is-folded::after { background: linear-gradient(transparent, rgba(30, 58, 95, 0.5)); }
 .chat-user.chat-failed .chat-user-message-fold.is-folded::after { background: linear-gradient(transparent, #3a1a1a); }
 .chat-user-message-fold-toggle { position: relative; z-index: 1; display: inline-flex; align-items: center; justify-content: center; margin-top: 6px; padding: 2px 8px; border: 1px solid rgba(147, 197, 253, 0.35); border-radius: 999px; background: rgba(15, 23, 42, 0.18); color: #bfdbfe; font-family: inherit; font-size: 11px; line-height: 1.4; cursor: pointer; -webkit-tap-highlight-color: transparent; }
 .chat-user-message-fold-toggle:hover { background: rgba(15, 23, 42, 0.32); border-color: rgba(147, 197, 253, 0.6); color: #e0f2fe; }
 .chat-user-message-fold-toggle:active { transform: translateY(1px); }
+.chat-user-footer { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+.chat-user-footer .chat-user-message-fold-toggle { margin-top: 0; flex: 0 0 auto; }
+.chat-user-footer .chat-bubble-time,
+.chat-user-footer .chat-user-status { margin-left: auto; margin-top: 0; flex: 0 0 auto; white-space: nowrap; }
+.chat-user-footer .chat-user-status-pending { margin-top: 0; margin-left: auto; }
 .chat-assistant { padding: 6px 10px; word-break: break-word; overflow-wrap: break-word; line-height: 1.5; background: #161b22; border-radius: 8px; border: 0; }
 /* Consecutive assistant.text events are one visual answer. The old per-event
    margins exposed the blue chat backdrop as horizontal separator lines, and

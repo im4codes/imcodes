@@ -43,7 +43,7 @@ import {
   setDownloadTransferRetry,
 } from '../download-transfer-store.js';
 import { createDownloadTransferWiring } from '../download-transfer-wiring.js';
-import { h } from 'preact';
+import { h, type ComponentChildren } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from 'preact/hooks';
 import { useCoalescedFrame } from '../hooks/useCoalescedFrame.js';
 import { memo, createPortal } from 'preact/compat';
@@ -291,6 +291,7 @@ interface AssistantBlockProps {
 }
 
 const USER_MESSAGE_COLLAPSE_LINE_LIMIT = 10;
+const AGENT_MESSAGE_COLLAPSE_LINE_LIMIT = 7;
 const CHAT_LOCAL_IMAGE_PREVIEW_CACHE_LIMIT = 256;
 /**
  * tsk_5rf R2: a streamed preview caches a download-handle URL, and that handle
@@ -5967,30 +5968,11 @@ const ChatEvent = memo(function ChatEvent({
       const commandId = typeof event.payload.commandId === 'string' ? event.payload.commandId : undefined;
       const stateClass = isPending ? ' chat-pending' : isFailed ? ' chat-failed' : '';
       const sharedActorLabel = formatSharedActorLabel(t, event.payload.sharedActor);
-      return (
-        // data-event-id lets the pinned-last-message banner target this bubble
-        // with an IntersectionObserver so the banner only shows when the real
-        // bubble has scrolled off the top of the viewport.
-        <div class={`chat-event chat-user${originClass}${stateClass}`} data-event-id={event.eventId} data-message-origin={origin}>
-          {sharedActorLabel && (
-            <div class="chat-shared-actor-label" title={sharedActorLabel}>
-              {sharedActorLabel}
-            </div>
-          )}
-          {attachments && serverId && attachments.map((att) => (
-            <AttachmentDownloadButton key={att.id} att={att} serverId={serverId} sessionName={sessionName} onPathClick={onPathClick} onHtmlPreview={onHtmlPreview} />
-          ))}
-          {userText && (
-            <UserMessageText
-              text={userText}
-              onPathClick={onPathClick}
-              onUrlClick={onUrlClick}
-              onDownload={onDownload}
-              onHtmlPreview={onHtmlPreview}
-              onImagePreview={onImagePreview}
-              onOpenLocalWebPreview={onOpenLocalWebPreview}
-            />
-          )}
+      const isAgent = origin === CHAT_MESSAGE_ORIGINS.AGENT;
+      const hasTime = typeof event.ts === 'number' && Number.isFinite(event.ts) && event.ts > 0;
+      const hasStatusOrTime = isPending || isQueued || isFailed || (!isPending && !isFailed && hasTime);
+      const timeAndStatus = hasStatusOrTime ? (
+        <>
           {isPending && (
             <span
               class="chat-user-status chat-user-status-pending"
@@ -6023,7 +6005,36 @@ const ChatEvent = memo(function ChatEvent({
               )}
             </div>
           )}
-          {!isPending && !isFailed && <ChatTime ts={event.ts} />}
+          {!isPending && !isFailed && hasTime && <ChatTime ts={event.ts} />}
+        </>
+      ) : null;
+      return (
+        // data-event-id lets the pinned-last-message banner target this bubble
+        // with an IntersectionObserver so the banner only shows when the real
+        // bubble has scrolled off the top of the viewport.
+        <div class={`chat-event chat-user${originClass}${stateClass}`} data-event-id={event.eventId} data-message-origin={origin}>
+          {sharedActorLabel && (
+            <div class="chat-shared-actor-label" title={sharedActorLabel}>
+              {sharedActorLabel}
+            </div>
+          )}
+          {attachments && serverId && attachments.map((att) => (
+            <AttachmentDownloadButton key={att.id} att={att} serverId={serverId} sessionName={sessionName} onPathClick={onPathClick} onHtmlPreview={onHtmlPreview} />
+          ))}
+          {userText && (
+            <UserMessageText
+              text={userText}
+              onPathClick={onPathClick}
+              onUrlClick={onUrlClick}
+              onDownload={onDownload}
+              onHtmlPreview={onHtmlPreview}
+              onImagePreview={onImagePreview}
+              onOpenLocalWebPreview={onOpenLocalWebPreview}
+              isAgent={isAgent}
+              footerRight={isAgent ? timeAndStatus : undefined}
+            />
+          )}
+          {(!isAgent || !userText) && timeAndStatus}
         </div>
       );
     }
@@ -6841,6 +6852,8 @@ function UserMessageText({
   onHtmlPreview,
   onImagePreview,
   onOpenLocalWebPreview,
+  isAgent,
+  footerRight,
 }: {
   text: string;
   onPathClick?: (p: string) => void;
@@ -6849,11 +6862,14 @@ function UserMessageText({
   onHtmlPreview?: (path: string) => void;
   onImagePreview?: ChatLocalImagePreviewLoader;
   onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
+  isAgent?: boolean;
+  footerRight?: ComponentChildren;
 }) {
   const { t } = useTranslation();
   const contentRef = useRef<HTMLDivElement>(null);
   const { prose, leadingSender, trailingReply } = parseDelegationProtocolMessage(text);
-  const hardLineOverflow = countHardLines(prose) > USER_MESSAGE_COLLAPSE_LINE_LIMIT;
+  const lineLimit = isAgent ? AGENT_MESSAGE_COLLAPSE_LINE_LIMIT : USER_MESSAGE_COLLAPSE_LINE_LIMIT;
+  const hardLineOverflow = countHardLines(prose) > lineLimit;
   const [renderedOverflow, setRenderedOverflow] = useState<boolean | null>(
     hardLineOverflow ? true : null,
   );
@@ -6867,7 +6883,7 @@ function UserMessageText({
     if (!content) return;
     let active = true;
     const measure = () => {
-      const measured = renderedUserMessageExceedsLineLimit(content);
+      const measured = renderedUserMessageExceedsLineLimit(content, lineLimit);
       const next = hardLineOverflow || measured;
       if (!active || next === null) return;
       setRenderedOverflow((current) => current === next ? current : next);
@@ -6891,7 +6907,7 @@ function UserMessageText({
       window.removeEventListener('resize', measure);
       fonts?.removeEventListener?.('loadingdone', measure);
     };
-  }, [hardLineOverflow, prose]);
+  }, [hardLineOverflow, prose, lineLimit]);
 
   return (
     <div class={`chat-user-message-fold${shouldFold ? ' is-foldable' : ''}${folded ? ' is-folded' : ''}${measuring ? ' is-measuring' : ''}`}>
@@ -6902,15 +6918,33 @@ function UserMessageText({
       >
         {splitPathsAndUrls(prose, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}
       </div>
-      {shouldFold && (
-        <button
-          type="button"
-          class="chat-user-message-fold-toggle"
-          aria-expanded={expanded}
-          onClick={() => setExpanded((value) => !value)}
-        >
-          {expanded ? t('chat.user_message_collapse') : t('chat.user_message_expand')}
-        </button>
+      {isAgent ? (
+        (shouldFold || footerRight) && (
+          <div class="chat-user-footer">
+            {shouldFold && (
+              <button
+                type="button"
+                class="chat-user-message-fold-toggle"
+                aria-expanded={expanded}
+                onClick={() => setExpanded((value) => !value)}
+              >
+                {expanded ? t('chat.user_message_collapse') : t('chat.user_message_expand')}
+              </button>
+            )}
+            {footerRight}
+          </div>
+        )
+      ) : (
+        shouldFold && (
+          <button
+            type="button"
+            class="chat-user-message-fold-toggle"
+            aria-expanded={expanded}
+            onClick={() => setExpanded((value) => !value)}
+          >
+            {expanded ? t('chat.user_message_collapse') : t('chat.user_message_expand')}
+          </button>
+        )
       )}
       {trailingReply && <DelegationReplyInstructionCardView card={trailingReply} />}
     </div>
