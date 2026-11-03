@@ -459,7 +459,7 @@ vi.mock('../src/pages/CronManager.js', () => ({
 }));
 
 vi.mock('../src/components/ServerIconBar.js', () => ({
-  ServerIconBar: ({ servers, returnHintServerId, onSelectServer, onSettings, onAdmin, onHome, onToggleSidebar, onServerContextMenu }: any) => (
+  ServerIconBar: ({ servers, returnHintServerId, onSelectServer, onOpenSharedEntry, onSettings, onAdmin, onHome, onToggleSidebar, onServerContextMenu }: any) => (
     <div data-testid="server-icon-bar" data-return-hint-server-id={returnHintServerId ?? ''}>
       server-icon-bar
       <button onClick={onSettings}>server-settings</button>
@@ -468,7 +468,19 @@ vi.mock('../src/components/ServerIconBar.js', () => ({
       <button onClick={onToggleSidebar}>server-toggle-sidebar</button>
       <button onClick={() => onSelectServer?.(servers?.[0]?.id, servers?.[0]?.name)}>server-select</button>
       {servers?.map((server: any) => (
-        <button key={server.id} onClick={() => onSelectServer?.(server.id, server.name)}>server-select-{server.id}</button>
+        <button
+          key={server.id}
+          onClick={() => {
+            if (server.isSharedIn && server.sharedEntry && onOpenSharedEntry) {
+              onOpenSharedEntry(server.sharedEntry);
+            } else {
+              onSelectServer?.(server.id, server.name);
+            }
+          }}
+        >
+          server-select-{server.id}
+          <span>{server.name}</span>
+        </button>
       ))}
       <button onClick={() => onServerContextMenu?.(servers?.[0], 11, 22)}>server-menu</button>
     </div>

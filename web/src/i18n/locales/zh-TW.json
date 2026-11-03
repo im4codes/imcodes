@@ -218,6 +218,7 @@
     "indicator": "{{scope}} 以 {{role}} 分享 · {{status}}",
     "indicatorCompact": "以 {{role}} 分享 · {{status}}",
     "indicatorSharedOut": "已分享給別人",
+    "indicatorSharedIn": "分享給我",
     "actorLabel": "{{name}} · {{role}}",
     "status": {
       "active": "有效",
