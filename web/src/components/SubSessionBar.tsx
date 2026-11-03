@@ -230,6 +230,8 @@ const P2P_DESKTOP_COMPACT_STORAGE_KEY = 'rcc_subcard_p2p_desktop_compact';
 const EXPANDED_PREVIEW_INITIAL_COUNT = 2;
 const EXPANDED_PREVIEW_BATCH_SIZE = 4;
 const EXPANDED_PREVIEW_BATCH_DELAY_MS = 32;
+const COMPACT_REORDER_HOLD_MS = 400;
+const COMPACT_REORDER_MOVE_CANCEL_PX = 8;
 
 function load<T>(key: string, fallback: T): T {
   try {
@@ -1087,7 +1089,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   }, []);
 
   const handleCollapsedEntryDragStart = useCallback((id: string, event: JSX.TargetedDragEvent<HTMLElement>) => {
-    if (!desktopLayoutCapableRef.current) {
+    if (!desktopLayoutCapableRef.current || touchDragRef.current.id) {
       event.preventDefault();
       return;
     }
@@ -1230,6 +1232,12 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     if (!el) return;
     const td = touchDragRef.current;
 
+    let holdTimer: ReturnType<typeof setTimeout> | null = null;
+    const clearHold = () => {
+      if (holdTimer !== null) clearTimeout(holdTimer);
+      holdTimer = null;
+    };
+
     const findBtnId = (target: EventTarget | null): string | null => {
       let node = target as HTMLElement | null;
       while (node && node !== el) { if (node.dataset.subId) return node.dataset.subId; node = node.parentElement; }
@@ -1237,19 +1245,24 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     };
 
     const onStart = (e: TouchEvent) => {
+      onCancel();
       const id = findBtnId(e.target);
-      if (!id) return;
       const touch = e.touches[0];
+      if (!id || !touch || e.touches.length !== 1) return;
       td.id = id;
-      td.active = false;
-      td.moved = false;
-      td.startX = touch?.clientX ?? 0;
-      td.startY = touch?.clientY ?? 0;
+      td.startX = touch.clientX;
+      td.startY = touch.clientY;
+      holdTimer = setTimeout(() => {
+        holdTimer = null;
+        if (td.id === id && !td.moved && el.isConnected
+          && orderedSessionsRef.current.some((sub) => sub.id === id)) activateDrag(id);
+      }, COMPACT_REORDER_HOLD_MS);
     };
 
     const activateDrag = (id: string) => {
       td.id = id;
       td.active = true;
+      getEntryGestureController(id).cancelTouchSequence();
       const initialOrder = orderedSessionsRef.current.map((s) => s.id);
       dragOrderRef.current = initialOrder;
       setDragOrder(initialOrder);
@@ -1260,15 +1273,21 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     };
 
     const onMove = (e: TouchEvent) => {
+      if (e.touches.length !== 1) {
+        onCancel();
+        return;
+      }
       const touch = e.touches[0];
-      if (touch) {
-        const dx = touch.clientX - td.startX;
-        const dy = touch.clientY - td.startY;
-        if (Math.hypot(dx, dy) > 8) td.moved = true;
+      const dx = touch.clientX - td.startX;
+      const dy = touch.clientY - td.startY;
+      if (Math.hypot(dx, dy) > COMPACT_REORDER_MOVE_CANCEL_PX) {
+        td.moved = true;
+        if (!td.active) {
+          clearHold();
+          if (td.id) getEntryGestureController(td.id).cancelTouchSequence();
+        }
       }
-      if (!td.active && td.moved && td.id) {
-        activateDrag(td.id!);
-      }
+      // A swipe never promotes itself to reorder, even if the finger stops.
       if (!td.active || !td.id) return;
       e.preventDefault(); // works because { passive: false }
       if (!touch) return;
@@ -1277,11 +1296,13 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         : null;
       const overId = findBtnId(targetEl);
       if (overId && overId !== td.id) {
+        td.moved = true;
         moveSubSessionInDragOrder(td.id, overId);
       }
     };
 
     const resetTouchDrag = () => {
+      clearHold();
       td.id = null;
       td.active = false;
       td.moved = false;
@@ -1290,6 +1311,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     };
 
     const onEnd = (e: TouchEvent) => {
+      clearHold();
       const endedId = td.id ?? findBtnId(e.target);
       const wasActive = td.active;
       const moved = td.moved;
@@ -1299,8 +1321,11 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         const btn = el.querySelector(`[data-sub-id="${td.id}"]`) as HTMLElement | null;
         if (btn) { btn.style.transform = ''; btn.style.boxShadow = ''; btn.style.borderColor = ''; btn.style.zIndex = ''; }
         el.style.overflowX = '';
-        if (dragOrderRef.current) syncOrderToServer(dragOrderRef.current);
-      } else if (endedId && !moved) {
+        getEntryGestureController(td.id).cancelTouchSequence();
+        if (moved && dragOrderRef.current) syncOrderToServer(dragOrderRef.current);
+      } else if (endedId && moved) {
+        getEntryGestureController(endedId).cancelTouchSequence();
+      } else if (endedId) {
         const btn = el.querySelector(`[data-sub-id="${endedId}"]`) as HTMLElement | null;
         getEntryGestureController(endedId).handleTouchEndFallback(e, btn);
       }
@@ -1308,6 +1333,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     };
 
     const onCancel = () => {
+      clearHold();
       if (td.active && td.id) {
         const btn = el.querySelector(`[data-sub-id="${td.id}"]`) as HTMLElement | null;
         if (btn) { btn.style.transform = ''; btn.style.boxShadow = ''; btn.style.borderColor = ''; btn.style.zIndex = ''; }
@@ -1331,6 +1357,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     el.addEventListener('scroll', onScroll, { passive: true });
     el.addEventListener('contextmenu', onContext);
     return () => {
+      clearHold();
       if (td.active && td.id) {
         const btn = el.querySelector(`[data-sub-id="${td.id}"]`) as HTMLElement | null;
         if (btn) { btn.style.transform = ''; btn.style.boxShadow = ''; btn.style.borderColor = ''; btn.style.zIndex = ''; }

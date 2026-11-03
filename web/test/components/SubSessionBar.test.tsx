@@ -1199,6 +1199,97 @@ describe('SubSessionBar', () => {
     });
   });
 
+
+  function renderTouchReorderBar() {
+    const onOpen = vi.fn();
+    const view = render(
+      <SubSessionBar
+        subSessions={[
+          makeSubSession({ id: 'sub-a', sessionName: 'deck_sub_sub-a', label: 'a' }),
+          makeSubSession({ id: 'sub-b', sessionName: 'deck_sub_sub-b', label: 'b' }),
+        ]}
+        openIds={new Set()} collapsed desktopLayoutCapable={false} serverId="srv-1"
+        onOpen={onOpen} onClose={vi.fn()} onRestart={vi.fn()} onNew={vi.fn()}
+        ws={null} connected onDiff={vi.fn()} onHistory={vi.fn()}
+      />,
+    );
+    return {
+      ...view, onOpen,
+      first: view.container.querySelector('[data-sub-id="sub-a"]') as HTMLElement,
+      bar: view.container.querySelector('.subsession-bar') as HTMLElement,
+    };
+  }
+
+  it.each([[70, 10], [-70, 10], [10, 70]])('keeps a pre-hold swipe scrollable without reorder or a ghost click (%s,%s)', (x, y) => {
+    vi.useFakeTimers();
+    const { first, bar, onOpen, container } = renderTouchReorderBar();
+    Object.defineProperty(bar, 'scrollWidth', { configurable: true, value: 600 });
+    Object.defineProperty(bar, 'clientWidth', { configurable: true, value: 200 });
+    bar.scrollLeft = 200; // Neither edge: the separate overscroll guard must not intercept.
+    fireEvent.touchStart(first, { touches: [{ clientX: 10, clientY: 10 }] });
+    const move = new Event('touchmove', { bubbles: true, cancelable: true });
+    Object.defineProperty(move, 'touches', { value: [{ clientX: x, clientY: y }] });
+    fireEvent(first, move);
+    expect(move.defaultPrevented).toBe(false);
+    act(() => { vi.advanceTimersByTime(1000); });
+    expect(bar.style.overflowX).toBe('');
+    expect(first.style.transform).toBe('');
+    fireEvent.touchEnd(first);
+    fireEvent.click(first);
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(Array.from(container.querySelectorAll('.subsession-card')).map((el) => (el as HTMLElement).dataset.subId))
+      .toEqual(['sub-a', 'sub-b']);
+    expect(vi.mocked(reorderSubSessions)).not.toHaveBeenCalled();
+  });
+
+  it('arms reorder only after a stationary hold and tolerates small finger jitter', () => {
+    vi.useFakeTimers();
+    const { first, bar, onOpen } = renderTouchReorderBar();
+    fireEvent.touchStart(first, { touches: [{ clientX: 10, clientY: 10 }] });
+    fireEvent.touchMove(first, { touches: [{ clientX: 12, clientY: 12 }] });
+    act(() => { vi.advanceTimersByTime(399); });
+    expect(bar.style.overflowX).toBe('');
+    act(() => { vi.advanceTimersByTime(1); });
+    expect(bar.style.overflowX).toBe('hidden');
+    fireEvent.touchEnd(first);
+    act(() => { vi.advanceTimersByTime(1); });
+    fireEvent.click(first);
+    expect(bar.style.overflowX).toBe('');
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(vi.mocked(reorderSubSessions)).not.toHaveBeenCalled();
+  });
+
+  it.each(['cancel', 'scroll', 'unmount', 'multitouch'])('cancels pending reorder on %s', (reason) => {
+    vi.useFakeTimers();
+    const { first, bar, onOpen, unmount } = renderTouchReorderBar();
+    fireEvent.touchStart(first, { touches: [{ clientX: 10, clientY: 10 }] });
+    act(() => { vi.advanceTimersByTime(200); });
+    if (reason === 'cancel') fireEvent.touchCancel(first);
+    if (reason === 'scroll') fireEvent.scroll(bar);
+    if (reason === 'unmount') unmount();
+    if (reason === 'multitouch') fireEvent.touchStart(first, { touches: [
+      { clientX: 10, clientY: 10 }, { clientX: 20, clientY: 20 },
+    ] });
+    act(() => { vi.advanceTimersByTime(1000); });
+    expect(bar.style.overflowX).toBe('');
+    expect(first.style.transform).toBe('');
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(vi.mocked(reorderSubSessions)).not.toHaveBeenCalled();
+  });
+
+  it('keeps a short tap opening the sub-session and clears its hold timer', () => {
+    vi.useFakeTimers();
+    const { first, bar, onOpen } = renderTouchReorderBar();
+    fireEvent.touchStart(first, { touches: [{ clientX: 10, clientY: 10 }] });
+    act(() => { vi.advanceTimersByTime(150); });
+    fireEvent.touchEnd(first);
+    act(() => { vi.advanceTimersByTime(500); });
+    expect(onOpen).toHaveBeenCalledOnce();
+    expect(onOpen).toHaveBeenCalledWith('sub-a');
+    expect(bar.style.overflowX).toBe('');
+    expect(vi.mocked(reorderSubSessions)).not.toHaveBeenCalled();
+  });
+
   it('keeps mobile long-press drag reorder working without opening the sub-session', async () => {
     vi.useFakeTimers();
     const onOpen = vi.fn();
@@ -1237,10 +1328,8 @@ describe('SubSessionBar', () => {
 
     try {
       fireEvent.touchStart(first, { touches: [{ clientX: 10, clientY: 10 }] });
+      act(() => { vi.advanceTimersByTime(401); });
       fireEvent.touchMove(first, { touches: [{ clientX: 20, clientY: 10 }] });
-      act(() => {
-        vi.advanceTimersByTime(401);
-      });
 
       await act(async () => { await Promise.resolve(); });
       expect(Array.from(view.container.querySelectorAll('.subsession-card')).map((node) => (node as HTMLElement).dataset.subId)).toEqual(['sub-b', 'sub-a']);
@@ -1292,8 +1381,8 @@ describe('SubSessionBar', () => {
     Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: undefined });
     try {
       fireEvent.touchStart(first, { touches: [{ clientX: 10, clientY: 10 }] });
-      fireEvent.touchMove(first, { touches: [{ clientX: 20, clientY: 10 }] });
       act(() => { vi.advanceTimersByTime(401); });
+      fireEvent.touchMove(first, { touches: [{ clientX: 20, clientY: 10 }] });
       await act(async () => { await Promise.resolve(); });
       fireEvent.touchEnd(first);
       act(() => { vi.advanceTimersByTime(151); });
@@ -1333,7 +1422,8 @@ describe('SubSessionBar', () => {
     act(() => { vi.advanceTimersByTime(401); });
     expect(document.body.querySelector('[data-testid="subsession-context-menu"]')).toBeNull();
     fireEvent.touchEnd(button);
-    expect(onOpen).toHaveBeenCalledWith('sub-a');
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(vi.mocked(reorderSubSessions)).not.toHaveBeenCalled();
   });
 
   it('does not open a mobile context menu from a contextmenu event', () => {
