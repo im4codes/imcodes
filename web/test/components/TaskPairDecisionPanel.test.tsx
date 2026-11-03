@@ -650,5 +650,97 @@ describe('TaskPairDecisionPanel', () => {
       expect(screen.queryByRole('button', { name: 'OLD CHOICE' })).toBeNull();
       expect(screen.getByTestId('expandable-task-objective-text').textContent).toContain('NEW blocker: credentials unavailable');
     });
+
+    it('F1-R5: live feedback before ACK retains new-note submission lock after an older ruling, and settling ACK releases lock and clears draft', async () => {
+      const oldRuling: any = {
+        id: 'old-ruling',
+        project: 'p',
+        taskId: 'task',
+        round: 1,
+        deliveryRound: 1,
+        kind: 'decision',
+        conclusion: 'Old ruling',
+        summary: 'Old summary',
+        author: 'brain',
+        at: 20,
+      };
+      const current: SupervisionConsolePairInfo = {
+        status: 'working',
+        round: 1,
+        deliveryRound: 1,
+        flags: ['blocked'],
+        blocking: ['P0'],
+        blockedNote: 'Current NEW blocker',
+        decisionRevision: 'rev-current-2',
+        decisionRequest: undefined,
+        latestDecision: oldRuling,
+        brain: 'brain',
+      };
+
+      const capturedFrames: any[] = [];
+      unbind = bindTaskPairDecisions((frame) => {
+        capturedFrames.push(frame);
+      });
+
+      const view = render(<TaskPairDecisionPanel taskId="task" pair={current} />);
+      const textbox = screen.getByRole('textbox') as HTMLTextAreaElement;
+      expect(textbox.disabled).toBe(false);
+
+      // Submit new-note feedback
+      fireEvent.input(textbox, { target: { value: 'Current explanation response' } });
+      fireEvent.click(screen.getByRole('button', { name: 'taskPair.decision.send' }));
+
+      await waitFor(() => expect(capturedFrames).toHaveLength(1));
+      expect((screen.getByRole('textbox') as HTMLTextAreaElement).disabled).toBe(true);
+
+      // Live projection arrives before ACK: latestDecision becomes FEEDBACK
+      view.rerender(
+        <TaskPairDecisionPanel
+          taskId="task"
+          pair={{
+            ...current,
+            latestDecision: {
+              id: 'live-feedback',
+              project: 'p',
+              taskId: 'task',
+              round: 1,
+              deliveryRound: 1,
+              kind: 'feedback',
+              conclusion: 'Human feedback',
+              summary: 'Current explanation response',
+              author: 'human',
+              at: 30,
+            },
+          }}
+        />
+      );
+
+      // Submission lock and draft text MUST be retained
+      const liveTextbox = screen.getByRole('textbox') as HTMLTextAreaElement;
+      expect(liveTextbox.disabled).toBe(true);
+      expect(liveTextbox.value).toBe('Current explanation response');
+
+      // Now settle the ACK: form cleans up and clears text
+      receiveTaskPairDecision(capturedFrames[0].requestId, {
+        ok: true,
+        decisions: [
+          {
+            id: 'live-feedback',
+            project: 'p',
+            taskId: 'task',
+            round: 1,
+            deliveryRound: 1,
+            kind: 'feedback',
+            conclusion: 'Human feedback',
+            summary: 'Current explanation response',
+            author: 'human',
+            at: 30,
+          },
+        ],
+      });
+
+      await waitFor(() => expect(liveTextbox.disabled).toBe(false));
+      expect(liveTextbox.value).toBe('');
+    });
   });
 });

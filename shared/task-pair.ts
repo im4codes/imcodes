@@ -1253,6 +1253,8 @@ export interface TaskPairState {
   blockingSource?: TaskPairBlockingSource;
   lastVerdict?: TaskPairLastVerdict;
   previousAuditors: string[];
+  /** Blocker / decision explanation episode generation. Monotonically advanced on genuine entry or context change. */
+  episodeGeneration?: number;
   /** Auditor explicitly selected by Brain; heartbeat replacement must keep it
    * unless the session is genuinely unavailable. */
   auditorPinned?: string;
@@ -2318,10 +2320,16 @@ export function applyTaskPairMarker(
       if (terminal) return recorded(existing, false);
       if (roleAuthority) return done('brain_resolved');
       const flag = verb === 'BLOCKED' ? 'blocked' : 'needs_input';
+      const priorNote = pair.blockedNote;
+      const nextNote = attrs.note?.trim() || undefined;
       const freshlyFlagged = !pair.flags.includes(flag) || pair.flagSides[flag] !== role;
+      const noteChanged = priorNote !== nextNote;
+      if (freshlyFlagged || noteChanged) {
+        pair.episodeGeneration = (pair.episodeGeneration ?? 0) + 1;
+      }
       addFlag(pair, flag);
       pair.flagSides[flag] = role;
-      pair.blockedNote = attrs.note?.trim() || undefined;
+      pair.blockedNote = nextNote;
       pair.lastWaitResolution = undefined;
       // Owner evidence: an executor's question left only in its own reply,
       // never sent anywhere, stalled a pair until the owner happened to

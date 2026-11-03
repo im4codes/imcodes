@@ -57,13 +57,37 @@ export function resolveDecisionCategory(
   return 'legacy_unknown';
 }
 
+const activeRulingCache = new Map<string, string>();
+
+export function resetActiveRulingCacheForTests(): void {
+  activeRulingCache.clear();
+}
+
+export function getScopedRulingId(
+  taskId: string,
+  revision: string | undefined,
+  questionId: string | undefined,
+  latestDecision?: TaskPairDecisionRecord | null,
+): string | undefined {
+  const scopeKey = `${taskId}:${revision ?? ''}:${questionId ?? ''}`;
+  if (latestDecision?.kind === TASK_PAIR_DECISION_KIND.DECISION) {
+    if (activeRulingCache.size > 200) {
+      const oldestKey = activeRulingCache.keys().next().value;
+      if (oldestKey) activeRulingCache.delete(oldestKey);
+    }
+    activeRulingCache.set(scopeKey, latestDecision.id);
+    return latestDecision.id;
+  }
+  return activeRulingCache.get(scopeKey);
+}
+
 /** A reply is persisted feedback to Brain, never PASS, resume or a lifecycle transition. */
 export function TaskPairDecisionPanel(props: { taskId: string; pair: SupervisionConsolePairInfo; readOnly?: boolean }) {
   const { taskId, pair } = props;
   // Remount all local state on a new task/question/ruling. A string comparison
   // alone cannot isolate late replies when navigation goes A → B → A.
   // A live feedback event may precede its ack: keep that in-flight reply locked.
-  const rulingId = pair.latestDecision?.kind === TASK_PAIR_DECISION_KIND.DECISION ? pair.latestDecision.id : undefined;
+  const rulingId = getScopedRulingId(taskId, pair.decisionRevision, pair.decisionRequest?.id, pair.latestDecision);
   const context = JSON.stringify([taskId, pair.decisionRevision, pair.decisionRequest?.id, rulingId]);
   return <DecisionPanel key={context} {...props} context={context} />;
 }
@@ -180,7 +204,11 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
     }
     case 'legacy_unknown':
     default: {
-      reason = readOnly ? '' : t('taskPair.decision.missing');
+      reason = (resolved && !hasNewBlocker && (question?.question || question?.summary))
+        || (readOnly ? '' : t('taskPair.decision.missing'));
+      if (resolved && !hasNewBlocker && question?.author) {
+        responsible = t('taskPair.decision.responsible_executor', { name: question.author });
+      }
       break;
     }
   }
@@ -188,7 +216,9 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
   const decisionText = [
     reason,
     responsible,
-    hasActiveQuestion && question?.recommendation ? `${t('taskPair.decision.recommendation')}: ${question.recommendation}` : '',
+    (hasActiveQuestion || (!hasNewBlocker && resolved)) && question?.recommendation
+      ? `${t('taskPair.decision.recommendation')}: ${question.recommendation}`
+      : '',
     !hasNewBlocker && rulingToShow && (resolved || (!question && (rulingToShow.deliveryRound ?? 1) === (pair.deliveryRound ?? 1) && rulingToShow.round === pair.round))
       ? `${t('taskPair.decision.ruling')}: ${rulingToShow.conclusion} — ${rulingToShow.summary}`
       : '',

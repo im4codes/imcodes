@@ -14,7 +14,7 @@ import { taskPairDecisionReminderDue, checkTaskPairMissingExplanation, TaskPairA
 import { buildPairConsoleRow } from '../../src/daemon/supervision-console-pair-projection.js';
 import { queuedPairWakeAllowed } from '../../src/daemon/task-pairs/wake-authority.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
-import type { TaskPairState } from '../../shared/task-pair.js';
+import { applyTaskPairMarker, type TaskPairState } from '../../shared/task-pair.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
 
 const caller: McpRuntimeCaller = {
@@ -23,7 +23,7 @@ const caller: McpRuntimeCaller = {
 };
 const state = {
   taskId: 'decision-task', title: 'decision', status: 'in_audit', brain: 'brain', executor: 'exec', auditor: 'audit', round: 1,
-  flags: [], blocking: [], brief: '- [ ][ ] item', createdAt: 1, updatedAt: 1,
+  flags: [], flagSides: {}, blocking: [], previousAuditors: [], capCounts: {}, resourceClaims: [], brief: '- [ ][ ] item', createdAt: 1, updatedAt: 1,
 } as unknown as TaskPairState;
 const sessions = (['brain', 'exec', 'audit'] as const).map((name) => ({
   name, projectName: 'p', role: name === 'brain' ? 'brain' : name === 'exec' ? 'w1' : 'w2', agentType: 'claude-code-sdk',
@@ -434,24 +434,20 @@ describe('pair decision MCP', () => {
     expect(insertedAgain).toBe(false);
     expect(sent).toHaveLength(1);
 
-    // A genuine new episode transition (e.g. participant BLOCKED marker event) triggers a new notification
-    store.recordEvent({
-      id: 'marker:blocked:p:f3-liveness:300',
-      project: 'p',
-      taskId: 'f3-liveness',
-      writer: 'exec',
-      role: 'executor',
-      verb: 'BLOCKED',
-      attrs: {},
-      effect: 'blocked',
-      unusual: false,
-      source: 'marker',
-      fromStatus: 'working',
-      toStatus: 'working',
-      at: 300,
-    });
-    const genuineNewEpisode = checkTaskPairMissingExplanation(store.getPair('p', 'f3-liveness')!, 301);
-    await taskPairService.retryDecisionNotifications(301);
+    // A genuine new episode transition (clear via WORKING then reenter BLOCKED) triggers a new notification
+    const cleared = applyTaskPairMarker(store.getPair('p', 'f3-liveness')!.state, {
+      knownVerb: 'WORKING', taskId: 'f3-liveness', attrs: {},
+    }, { writer: 'exec', fallbackBrain: 'brain', now: 300, source: 'marker' } as any);
+    store.savePair('p', cleared.pair!);
+    expect(checkTaskPairMissingExplanation(store.getPair('p', 'f3-liveness')!, 301)).toBe(false);
+
+    const reentered = applyTaskPairMarker(store.getPair('p', 'f3-liveness')!.state, {
+      knownVerb: 'BLOCKED', taskId: 'f3-liveness', attrs: {},
+    }, { writer: 'exec', fallbackBrain: 'brain', now: 350, source: 'marker' } as any);
+    store.savePair('p', reentered.pair!);
+
+    const genuineNewEpisode = checkTaskPairMissingExplanation(store.getPair('p', 'f3-liveness')!, 351);
+    await taskPairService.retryDecisionNotifications(351);
     expect(genuineNewEpisode).toBe(true);
     expect(sent).toHaveLength(2);
   });
@@ -573,7 +569,7 @@ describe('pair decision MCP', () => {
     }
   });
 
-  it('F3-R4: stable episode across CHECK progress, auto checklist, and 51+ heartbeats; true transition with same flags creates new episode', async () => {
+  it('F3-R4: episode key stability across events, repeat markers, and clear/reenter lifecycle', async () => {
     const store = getTaskPairStore();
     const sent: string[] = [];
     setTaskPairDeliveryDepsForTests({
@@ -591,8 +587,8 @@ describe('pair decision MCP', () => {
       status: 'working',
       round: 1,
       deliveryRound: 1,
-      flags: ['blocked'],
-      flagSides: { blocked: 'executor' },
+      flags: [],
+      flagSides: {},
       blocking: ['P0'],
       createdAt: 100,
       updatedAt: 100,
@@ -600,18 +596,26 @@ describe('pair decision MCP', () => {
     } as unknown as TaskPairState;
     store.savePair('p', taskBase);
 
-    // Initial transition event
-    store.recordEvent({
-      id: 'origin-blocked', project: 'p', taskId: 'f3-episode-stability',
-      writer: 'exec', role: 'executor', verb: 'BLOCKED', attrs: {}, effect: 'blocked',
-      unusual: false, source: 'marker', fromStatus: 'working', toStatus: 'working', at: 100,
-    });
+    // Initial transition into BLOCKED
+    const initial = applyTaskPairMarker(taskBase, {
+      knownVerb: 'BLOCKED', taskId: 'f3-episode-stability', attrs: {},
+    }, { writer: 'exec', fallbackBrain: 'brain', now: 100, source: 'marker' } as any);
+    store.savePair('p', initial.pair!);
 
     expect(checkTaskPairMissingExplanation(store.getPair('p', 'f3-episode-stability')!, 100)).toBe(true);
     await taskPairService.retryDecisionNotifications(100);
     expect(sent).toHaveLength(1);
 
-    // 1. Checklist progress marker (CHECK) does NOT create a new episode
+    // 1. Repeated identical BLOCKED marker without clearing does NOT notify twice
+    const repeated = applyTaskPairMarker(store.getPair('p', 'f3-episode-stability')!.state, {
+      knownVerb: 'BLOCKED', taskId: 'f3-episode-stability', attrs: {},
+    }, { writer: 'exec', fallbackBrain: 'brain', now: 150, source: 'marker' } as any);
+    store.savePair('p', repeated.pair!);
+    expect(checkTaskPairMissingExplanation(store.getPair('p', 'f3-episode-stability')!, 151)).toBe(false);
+    await taskPairService.retryDecisionNotifications(151);
+    expect(sent).toHaveLength(1);
+
+    // 2. Checklist progress marker (CHECK) does NOT create a new episode
     store.recordEvent({
       id: 'check-1', project: 'p', taskId: 'f3-episode-stability',
       writer: 'exec', role: 'executor', verb: 'CHECK', attrs: {}, effect: 'checklist',
@@ -621,7 +625,7 @@ describe('pair decision MCP', () => {
     await taskPairService.retryDecisionNotifications(201);
     expect(sent).toHaveLength(1);
 
-    // 2. 51+ heartbeat NUDGE events do NOT evict the episode or create a new one
+    // 3. 51+ heartbeat NUDGE events do NOT evict the episode or create a new one
     for (let i = 0; i < 55; i++) {
       store.recordEvent({
         id: `hb-${i}`, project: 'p', taskId: 'f3-episode-stability',
@@ -633,12 +637,26 @@ describe('pair decision MCP', () => {
     await taskPairService.retryDecisionNotifications(400);
     expect(sent).toHaveLength(1);
 
-    // 3. True new transition event with the same flags DOES create a new episode
-    store.recordEvent({
-      id: 'new-blocked-event', project: 'p', taskId: 'f3-episode-stability',
-      writer: 'exec', role: 'executor', verb: 'BLOCKED', attrs: {}, effect: 'blocked',
-      unusual: false, source: 'marker', fromStatus: 'working', toStatus: 'working', at: 500,
-    });
+    // 4. Stale writer / CAS cannot regress episodeGeneration
+    const current = store.getPair('p', 'f3-episode-stability')!;
+    const staleState: TaskPairState = {
+      ...current.state,
+      episodeGeneration: 0,
+    };
+    store.savePair('p', staleState);
+    expect(store.getPair('p', 'f3-episode-stability')!.state.episodeGeneration).toBe(current.state.episodeGeneration);
+
+    // 5. Clear via WORKING then re-enter BLOCKED DOES create a new episode
+    const cleared = applyTaskPairMarker(store.getPair('p', 'f3-episode-stability')!.state, {
+      knownVerb: 'WORKING', taskId: 'f3-episode-stability', attrs: {},
+    }, { writer: 'exec', fallbackBrain: 'brain', now: 450, source: 'marker' } as any);
+    store.savePair('p', cleared.pair!);
+    expect(checkTaskPairMissingExplanation(store.getPair('p', 'f3-episode-stability')!, 451)).toBe(false);
+
+    const reenter = applyTaskPairMarker(store.getPair('p', 'f3-episode-stability')!.state, {
+      knownVerb: 'BLOCKED', taskId: 'f3-episode-stability', attrs: {},
+    }, { writer: 'exec', fallbackBrain: 'brain', now: 500, source: 'marker' } as any);
+    store.savePair('p', reenter.pair!);
     expect(checkTaskPairMissingExplanation(store.getPair('p', 'f3-episode-stability')!, 501)).toBe(true);
     await taskPairService.retryDecisionNotifications(501);
     expect(sent).toHaveLength(2);

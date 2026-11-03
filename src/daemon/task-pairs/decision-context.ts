@@ -10,7 +10,7 @@ export function taskPairDecisionRevision(pair: TaskPairState): string {
   const flagsKey = pair.flags.filter((flag) => flag === 'blocked' || flag === 'needs_input').sort().join(',') || pair.status;
   return createHash('sha256').update(JSON.stringify([
     pair.taskId, pair.deliveryRound ?? 1, pair.round, pair.status, pair.blockedNote ?? '',
-    flagsKey, wait?.manual, wait?.note, wait?.dependsOn,
+    flagsKey, wait?.manual, wait?.note, wait?.dependsOn, pair.episodeGeneration ?? 0,
   ])).digest('hex').slice(0, 24);
 }
 
@@ -46,20 +46,13 @@ export function isTaskPairMissingExplanation(stored: StoredTaskPair): boolean {
 
 /**
  * Canonical context key for a missing-explanation episode.
- * Derived from semantic state (project, task, delivery round, round, flags, revision, persistent blocker transition event);
+ * Derived from semantic state (project, task, delivery round, round, flags, revision, episode generation);
  * routine heartbeats, checklist progress, and liveness sweeps never mutate the key.
  */
 export function taskPairMissingExplanationKey(stored: StoredTaskPair): string {
   const pair = stored.state;
   const flagsKey = pair.flags.filter((flag) => flag === 'blocked' || flag === 'needs_input').sort().join(',') || pair.status;
   const rev = taskPairDecisionRevision(pair);
-  let blockerEventId = '';
-  try {
-    const store = getTaskPairStore();
-    blockerEventId = store.latestBlockerEventId?.(stored.project, pair.taskId) ?? '';
-  } catch {
-    // ignore
-  }
-  return `missing-explanation:${stored.project}:${pair.taskId}:${pair.deliveryRound ?? 1}:${pair.round}:${flagsKey}:${rev}${blockerEventId ? ':' + blockerEventId : ''}`;
+  return `missing-explanation:${stored.project}:${pair.taskId}:${pair.deliveryRound ?? 1}:${pair.round}:${flagsKey}:${rev}:${pair.episodeGeneration ?? 0}`;
 }
 

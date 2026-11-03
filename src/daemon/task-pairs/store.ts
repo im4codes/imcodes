@@ -634,6 +634,13 @@ export class TaskPairStore {
 
   savePair(project: string, state: TaskPairState, options: { liveness?: TaskPairLiveness; legacyTaskId?: string } = {}): StoredTaskPair {
     const existing = this.getPair(project, state.taskId);
+    const existingBlocked = existing?.state.flags.some((f) => f === 'blocked' || f === 'needs_input') ?? false;
+    const nextBlocked = state.flags?.some((f) => f === 'blocked' || f === 'needs_input') ?? false;
+    if (!existingBlocked && nextBlocked) {
+      state.episodeGeneration = Math.max(state.episodeGeneration ?? 0, (existing?.state.episodeGeneration ?? 0) + 1);
+    } else if (existing?.state.episodeGeneration !== undefined) {
+      state.episodeGeneration = Math.max(state.episodeGeneration ?? 0, existing.state.episodeGeneration);
+    }
     const liveness = options.liveness ?? existing?.liveness ?? emptyLiveness(state.updatedAt);
     const queueOrder = existing?.queueOrder ?? this.#nextQueueOrder();
     const legacyTaskId = options.legacyTaskId ?? existing?.legacyTaskId;
@@ -756,20 +763,6 @@ export class TaskPairStore {
       event.effect, event.unusual ? 1 : 0, event.source, event.fromStatus ?? null, event.toStatus ?? null, event.at,
     );
     return Number(result.changes) > 0;
-  }
-
-  latestBlockerEventId(project: string, taskId: string): string | undefined {
-    const row = this.#db.prepare(`
-      SELECT id FROM task_pair_events
-      WHERE project = ? AND task_id = ?
-        AND (
-          verb IN ('BLOCKED', 'NEEDS_INPUT')
-          OR (from_status IS NOT NULL AND to_status IS NOT NULL AND from_status != to_status)
-        )
-      ORDER BY at DESC, id DESC
-      LIMIT 1
-    `).get(project, taskId) as { id?: string } | undefined;
-    return row?.id;
   }
 
   hasEvent(id: string): boolean {
