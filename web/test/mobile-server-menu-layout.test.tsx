@@ -25,7 +25,7 @@ function menu(onOpen = vi.fn(), onSelectServer = vi.fn(), onClose = vi.fn()) {
       <div class="mobile-server-bar">
         <div class="mobile-server-switcher-wrap">
           <button class="mobile-server-btn">Servers</button>
-          <MobileServerMenu>
+          <MobileServerMenu footer={<button>Language</button>}>
             <button class="mobile-server-menu-item" onClick={onClose}>Home</button>
             {Array.from({ length: 12 }, (_, index) => (
               <button
@@ -37,7 +37,6 @@ function menu(onOpen = vi.fn(), onSelectServer = vi.fn(), onClose = vi.fn()) {
               </button>
             ))}
             <MobileSharedEntriesMenu entries={entries} onOpen={onOpen} onRefresh={vi.fn()} />
-            <div class="mobile-server-menu-language"><button>Language</button></div>
           </MobileServerMenu>
         </div>
       </div>
@@ -132,7 +131,7 @@ describe('mobile server menu shared-entry reachability', () => {
         for (const viewport of viewports) {
           await page.setViewportSize(viewport);
           await page.setContent(`<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${css}</style></head><body>${view.container.innerHTML}</body></html>`);
-          const metrics = await page.locator('.mobile-server-menu').evaluate((element) => {
+          const metrics = await page.locator('.mobile-server-menu-body').evaluate((element) => {
             const shared = element.querySelector('.shared-entries-list')!;
             return {
               scrollHeight: element.scrollHeight, height: element.clientHeight,
@@ -148,6 +147,9 @@ describe('mobile server menu shared-entry reachability', () => {
           expect(metrics.horizontalOverflow).toBeLessThanOrEqual(1);
           expect(metrics.bottom).toBeLessThanOrEqual(viewport.height);
 
+          const footerBefore = await page.locator('.mobile-server-menu-language').boundingBox();
+          const menuBox = await page.locator('.mobile-server-menu').boundingBox();
+          expect(footerBefore!.y + footerBefore!.height).toBeGreaterThan(menuBox!.y + menuBox!.height - 40);
           // Verify owned server button is clickable through native tap without backdrop obstruction
           const ownedBtn = page.getByRole('button', { name: 'Owned 0', exact: false });
           expect(await ownedBtn.isVisible()).toBe(true);
@@ -156,30 +158,31 @@ describe('mobile server menu shared-entry reachability', () => {
           const bounds = await page.locator('.mobile-server-menu').boundingBox();
           await page.mouse.move(bounds!.x + bounds!.width / 2, bounds!.y + bounds!.height / 2);
           await page.mouse.wheel(0, 10000);
-          await vi.waitFor(async () => expect(await page.locator('.mobile-server-menu').evaluate((element) => element.scrollTop)).toBeGreaterThan(0));
+          await vi.waitFor(async () => expect(await page.locator('.mobile-server-menu-body').evaluate((element) => element.scrollTop)).toBeGreaterThan(0));
 
           // Native hit-testing must reach the actual last entry, not hidden overflow inside a shrunken shared section
           const last = page.locator('.shared-entry-row').last();
           await last.tap({ timeout: 2000 });
           await page.getByRole('button', { name: 'Language', exact: true }).tap();
+          expect(await page.locator('.mobile-server-menu-language').boundingBox()).toEqual(footerBefore);
 
           if (engine === 'chromium' && viewport.width === 393) {
             const session = await page.context().newCDPSession(page);
             const x = bounds!.x + bounds!.width / 2;
             const y = bounds!.y + 80;
-            const before = await page.locator('.mobile-server-menu').evaluate((element) => element.scrollTop);
+            const before = await page.locator('.mobile-server-menu-body').evaluate((element) => element.scrollTop);
             await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] });
             for (let step = 1; step <= 6; step++) {
               await session.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x, y: y + step * 35 }] });
               await new Promise((resolve) => setTimeout(resolve, 20));
             }
             await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
-            await vi.waitFor(async () => expect(await page.locator('.mobile-server-menu').evaluate((element) => element.scrollTop)).toBeLessThan(before));
+            await vi.waitFor(async () => expect(await page.locator('.mobile-server-menu-body').evaluate((element) => element.scrollTop)).toBeLessThan(before));
             await session.detach();
           }
 
           await page.mouse.wheel(0, -10000);
-          await vi.waitFor(async () => expect(await page.locator('.mobile-server-menu').evaluate((element) => element.scrollTop)).toBe(0));
+          await vi.waitFor(async () => expect(await page.locator('.mobile-server-menu-body').evaluate((element) => element.scrollTop)).toBe(0));
           await page.getByRole('button', { name: 'Owned 0', exact: false }).tap();
         }
       } finally { await browser.close(); }

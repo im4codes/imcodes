@@ -7298,7 +7298,7 @@ export function App() {
                 </button>
                 {showMobileServerMenu && (
                   <>
-                  <MobileServerMenu>
+                  <MobileServerMenu footer={<LanguageSwitcher />}>
                     <button class="mobile-server-menu-item" onClick={() => { setShowMobileServerMenu(false); handleBackToDashboard(); }}>
                       ← Home
                     </button>
@@ -7345,9 +7345,6 @@ export function App() {
                         onRefresh={() => void refreshSharedEntries()}
                       />
                     )}
-                    <div class="mobile-server-menu-language" style={{ padding: '6px 12px', borderTop: '1px solid #334155' }}>
-                      <LanguageSwitcher />
-                    </div>
                   </MobileServerMenu>
                   </>
                 )}

@@ -2,7 +2,7 @@ import type { ComponentChildren } from 'preact';
 import { useLayoutEffect, useRef } from 'preact/hooks';
 
 /** Fill the visible space below the trigger, including after keyboard/rotation changes. */
-export function MobileServerMenu({ children }: { children: ComponentChildren }) {
+export function MobileServerMenu({ children, footer }: { children: ComponentChildren; footer?: ComponentChildren }) {
   const menuRef = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     const menu = menuRef.current;
@@ -25,5 +25,8 @@ export function MobileServerMenu({ children }: { children: ComponentChildren }) 
       viewport?.removeEventListener('scroll', updateHeight);
     };
   }, []);
-  return <div class="mobile-server-menu" ref={menuRef}>{children}</div>;
+  return <div class="mobile-server-menu" ref={menuRef}>
+    <div class="mobile-server-menu-body">{children}</div>
+    {footer && <div class="mobile-server-menu-language">{footer}</div>}
+  </div>;
 }

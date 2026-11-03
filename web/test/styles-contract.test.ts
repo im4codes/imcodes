@@ -1007,8 +1007,10 @@ describe('styles.css regression contracts', () => {
 
     const menuRule = css.match(/\.mobile-server-menu\s*\{[^}]*\}/);
     expect(menuRule).not.toBeNull();
-    expect(menuRule![0]).toMatch(/display:\s*grid/);
-    expect(menuRule![0]).toMatch(/grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/);
+    expect(menuRule![0]).toMatch(/display:\s*flex/);
+    const bodyRule = css.match(/\.mobile-server-menu-body\s*\{[^}]*\}/);
+    expect(bodyRule).not.toBeNull();
+    expect(bodyRule![0]).toMatch(/grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/);
     expect(menuRule![0]).toMatch(/max-height:\s*calc\(var\(--vvh,\s*100dvh\)\s*-\s*var\(--sat,\s*0px\)\s*-\s*68px\s*-\s*env\(safe-area-inset-bottom,\s*0px\)\)/);
     expect(menuRule![0]).not.toMatch(/max-height:\s*min\(60vh/);
     expect(menuRule![0]).toMatch(/padding-bottom:\s*max\(16px,\s*env\(safe-area-inset-bottom,\s*0px\)\)/);
@@ -1032,9 +1034,9 @@ describe('styles.css regression contracts', () => {
     expect(menuNameRule![0]).toMatch(/text-overflow:\s*ellipsis/);
     expect(menuNameRule![0]).toMatch(/white-space:\s*nowrap/);
 
-    expect(menuRule![0]).toMatch(/grid-auto-rows:\s*max-content/);
-    expect(menuRule![0]).toMatch(/align-content:\s*start/);
-    expect(menuRule![0]).toMatch(/overflow-y:\s*auto/);
+    expect(bodyRule![0]).toMatch(/grid-auto-rows:\s*max-content/);
+    expect(bodyRule![0]).toMatch(/align-content:\s*start/);
+    expect(bodyRule![0]).toMatch(/overflow-y:\s*auto/);
     expect(sharedEntriesRule![0]).toMatch(/overflow:\s*visible/);
     const sharedGrid = css.match(/\.mobile-server-menu-shared \.shared-entries-list\s*\{[^}]*\}/);
     expect(sharedGrid?.[0]).toMatch(/grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/);
@@ -1043,7 +1045,7 @@ describe('styles.css regression contracts', () => {
 
     const app = readFileSync(resolve(__dirname, '../src/app.tsx'), 'utf8');
     expect(app).toContain('mobile-server-menu-server');
-    expect(app).toContain('mobile-server-menu-language');
+    expect(app).toContain('footer={<LanguageSwitcher />}');
     expect(app).toContain('server-item-pin');
     expect(app).not.toContain('mobile-server-menu-pin');
     expect(app).toContain("? ' pinned'");
