@@ -55,7 +55,10 @@ import { useEffect, useState } from 'preact/hooks';
 import '../../styles.css';
 import '../../i18n/index.js';
 import { ChatView, __buildViewItemsForTests } from '../../components/ChatView.js';
-import type { TimelineEvent } from '../../ws-client.js';
+import { WsClient, type TimelineEvent } from '../../ws-client.js';
+import { bindTaskPairDecisions, receiveTaskPairDecision } from '../../task-pair-decisions.js';
+import type { TaskPairDecisionRecord } from '@shared/task-pair-decision.js';
+import { ingestSessionRepoContext } from '../../session-repo-context-store.js';
 import {
   CHAT_TIMELINE_FIXTURE_DEFAULT_BASE_TS,
   CHAT_TIMELINE_FIXTURE_DEFAULT_SEED,
@@ -122,6 +125,8 @@ export interface ChatTimelineHarnessApi {
   eventCount(): number;
   /** Replaces the live event list (used by deterministic integration probes). */
   setEvents(events: TimelineEvent[]): void;
+  /** In-memory IO boundary for the real lazy decision consumer (never a daemon). */
+  setDecisionRecords(records: TaskPairDecisionRecord[]): void;
   /** Appends one new event under a fresh `eventId`. Returns that id. */
   appendEvent(options?: { type?: string; text?: string }): string;
   /**
@@ -154,6 +159,17 @@ const fixturePinsEnabled = query.get('pins') === '1';
  * measure against the elements a chat overlay must never reach.
  */
 const fixtureChromeEnabled = query.get('chrome') === '1';
+// Opt-in real titlebar/portal controls for responsive pair-card regression tests.
+// This client is deliberately never connected; browser tests own the IO boundary.
+const pairControls = query.get('pairControls') === '1';
+const fixtureWs = pairControls ? new WsClient('', 'fixture-server') : undefined;
+const fixtureWorkdir = pairControls && query.has('branch') ? '/scoped-fixture-project' : undefined;
+if (fixtureWorkdir) for (let i = 0; i < windowCount; i++) ingestSessionRepoContext({ sessionId: `fixture-window-${i}`, projectDir: fixtureWorkdir, context: { currentBranch: query.get('branch') } });
+let decisionRecords: TaskPairDecisionRecord[] = [];
+if (pairControls) bindTaskPairDecisions(({ requestId }) => {
+  window.dispatchEvent(new CustomEvent('fixture:decision-request'));
+  setTimeout(() => receiveTaskPairDecision(requestId, { ok: true, decisions: decisionRecords, revision: 'fixture' }), 50);
+});
 /** Live events array. Replaced (never mutated) on every harness update. */
 let currentEvents: TimelineEvent[] = initialEvents;
 let publishEvents: ((next: TimelineEvent[]) => void) | null = null;
@@ -228,6 +244,7 @@ const harness: ChatTimelineHarnessApi = {
   setEvents(events) {
     publish([...events]);
   },
+  setDecisionRecords(records) { decisionRecords = records; },
   appendEvent(options = {}) {
     const type = options.type ?? 'assistant.text';
     const text = options.text ?? `Harness appended message ${harnessCounter + 1}.`;
@@ -340,6 +357,12 @@ function FixtureHarness() {
                 sessionId={`fixture-window-${i}`}
                 serverId={fixturePinsEnabled ? 'fixture-server' : undefined}
                 messagePinsEnabled={fixturePinsEnabled}
+                scopeTaskPairs={query.get('scope') === '1'}
+                taskPairPanelVisitKey={query.get('visit') ?? undefined}
+                ws={fixtureWs}
+                workdir={fixtureWorkdir}
+                onViewRepo={pairControls ? () => window.dispatchEvent(new CustomEvent('fixture:repo')) : undefined}
+                onForceSync={pairControls ? () => window.dispatchEvent(new CustomEvent('fixture:sync')) : undefined}
               />
             </div>
           ) : (
@@ -352,6 +375,12 @@ function FixtureHarness() {
               sessionId={`fixture-window-${i}`}
               serverId={fixturePinsEnabled ? 'fixture-server' : undefined}
               messagePinsEnabled={fixturePinsEnabled}
+              scopeTaskPairs={query.get('scope') === '1'}
+              taskPairPanelVisitKey={query.get('visit') ?? undefined}
+              ws={fixtureWs}
+              workdir={fixtureWorkdir}
+              onViewRepo={pairControls ? () => window.dispatchEvent(new CustomEvent('fixture:repo')) : undefined}
+              onForceSync={pairControls ? () => window.dispatchEvent(new CustomEvent('fixture:sync')) : undefined}
             />
           )}
           {fixtureChromeEnabled && <FixtureBottomChrome />}

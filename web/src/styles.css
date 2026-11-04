@@ -14970,6 +14970,7 @@ button.quick-agent-delegation-preset.active {
   opacity: 1;
   overflow-wrap: anywhere;
 }
+.task-pair-event-card.is-expanded { flex-wrap: nowrap; }
 .task-pair-card-hover-preview {
   position: fixed;
   z-index: 10020;
@@ -15076,7 +15077,14 @@ button.quick-agent-delegation-preset.active {
   .task-pair-card-toggle { align-items: center; gap: 7px; }
   .task-pair-card-heading { gap: 4px 6px; }
   .task-pair-event-card .task-pair-chip-status { align-self: flex-start; }
-  .task-pair-card-body { align-items: flex-start; flex-direction: column; gap: 5px; }
+}
+/* The body changes main axis on compact layouts. Row-sized 100% bases must
+   not become percentage heights, or a wrapping column lays audit/notice and
+   subsequent siblings beside the writer with a content-sized blank column. */
+@media (max-width: 720px) {
+  .task-pair-card-body { align-items: stretch; flex-direction: column; flex-wrap: nowrap; gap: 5px; }
+  .task-pair-card-body > * { flex: 0 0 auto; min-width: 0; max-width: 100%; box-sizing: border-box; }
+  .task-pair-card-role { flex-wrap: wrap; }
 }
 @media (prefers-reduced-motion: reduce) {
   .task-pair-event-card { transition: none; }
@@ -15151,7 +15159,7 @@ button.quick-agent-delegation-preset.active {
      expanded rows remain positioned below the titlebar by the rule above. */
   position: static; z-index: 13; flex: 0 1 auto; min-width: 0;
   height: auto; max-height: none; overflow: visible;
-  display: inline-flex; width: auto; max-width: calc(48% - var(--chat-top-actions-reserve, 56px));
+  display: inline-flex; width: auto; max-width: 100%;
   margin: 0 0 0 auto; border: 1px solid color-mix(in srgb, var(--chrome-accent, #38bdf8) 35%, transparent);
   border-radius: 8px; background: color-mix(in srgb, var(--chrome-panel, #0f172a) 88%, transparent);
   box-shadow: 0 3px 12px color-mix(in srgb, #000 25%, transparent);
@@ -15214,7 +15222,7 @@ button.quick-agent-delegation-preset.active {
   border: 0; background: transparent; align-items: center; line-height: inherit;
 }
 .task-pair-status-panel.is-mobile.is-collapsed .task-pair-status-compact::before {
-  content: ''; position: absolute; inset: -10px -4px;
+  content: ''; position: absolute; inset: -7px 0;
 }
 .task-pair-status-panel.is-mobile.is-collapsed .task-pair-status-compact .task-pair-status-icons {
   min-height: 0; align-items: center;
@@ -15234,7 +15242,7 @@ button.quick-agent-delegation-preset.active {
     padding-right: max(8px, var(--chat-top-actions-reserve, 56px)) !important;
   }
   .chat-titlebar > .task-pair-status-panel.is-mobile.is-collapsed {
-    position: static; flex: 0 1 auto; min-width: 0; max-width: calc(48% - var(--chat-top-actions-reserve, 56px));
+    position: static; flex: 0 0 auto; min-width: 0; max-width: 100%;
     width: auto; margin: 0 0 0 auto; display: inline-flex; align-self: center;
   }
   .chat-titlebar > .task-pair-status-panel.is-mobile.is-collapsed .task-pair-status-compact {
@@ -15249,6 +15257,10 @@ button.quick-agent-delegation-preset.active {
   .chat-titlebar > .task-pair-status-panel.is-mobile.is-collapsed .task-pair-status-mobile-label {
     flex: 1 1 auto;
   }
+  /* Counts are the compact label, not disposable overflow. Let the adjacent
+     branch name ellipsize first; retain the full accessible task name. */
+  .chat-titlebar > .task-pair-status-panel.is-mobile.is-collapsed .task-pair-status-mobile-content:has(.task-pair-status-icon:not(.is-zero)) .task-pair-status-mobile-label { display: none; }
+  .chat-titlebar:has(> .task-pair-status-panel.is-mobile.is-collapsed) .session-repo-branch-summary { padding-inline: 3px !important; gap: 2px !important; }
   .chat-titlebar > .task-pair-status-panel.is-mobile:not(.is-collapsed) {
     position: absolute; top: max(calc(100% + 4px), 40px); left: 8px; right: 8px; bottom: auto;
     width: auto; max-width: none; height: auto;
@@ -15257,9 +15269,10 @@ button.quick-agent-delegation-preset.active {
     box-shadow: 0 8px 28px color-mix(in srgb, #000 35%, transparent);
   }
   @media (max-width: 350px) {
-    .chat-titlebar > .task-pair-status-panel.is-mobile.is-collapsed {
-      max-width: calc(100% - var(--chat-top-actions-reserve, 56px));
-    }
+    .chat-titlebar:has(> .task-pair-status-panel.is-mobile.is-collapsed) { gap: 3px !important; }
+    .chat-titlebar:has(> .task-pair-status-panel.is-mobile.is-collapsed) .message-pins-summary { padding-inline: 3px; }
+    .chat-view-wrap:has(.task-pair-status-panel.is-mobile.is-collapsed) .chat-top-actions { gap: 3px; }
+    .chat-view-wrap:has(.task-pair-status-panel.is-mobile.is-collapsed) .chat-top-actions > .chat-panel-toggle { width: 24px; min-width: 24px; padding-inline: 0; }
     .chat-titlebar > .task-pair-status-panel.is-mobile.is-collapsed .task-pair-status-mobile-label {
       max-width: 54px;
     }
