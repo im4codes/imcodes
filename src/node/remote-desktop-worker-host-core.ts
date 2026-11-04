@@ -1,4 +1,4 @@
-import { REMOTE_DESKTOP_TRAFFIC, isRemoteDesktopTraffic } from '../../shared/remote-desktop-traffic.js';
+import { REMOTE_DESKTOP_TRAFFIC, isRemoteDesktopWorkerTraffic } from '../../shared/remote-desktop-traffic.js';
 import { RemoteDesktopTrafficLedger } from './remote-desktop-traffic-ledger.js';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import {
@@ -344,8 +344,7 @@ export class RemoteDesktopWorkerHostCore<Metadata> {
           const authority = typeof frame.sessionId === 'string' ? this.tracked.get(frame.sessionId) : undefined;
           if (authority && frame.requestId === authority.requestId
             && typeof frame.capability === 'string' && this.capabilityMatches(authority, frame.capability)
-            && typeof frame.transportId === 'string' && frame.transportId.length > 0 && frame.transportId.length <= 256
-            && isRemoteDesktopTraffic(frame)) {
+            && isRemoteDesktopWorkerTraffic(frame)) {
             const entry = this.connected.get(authority.sessionId);
             if (entry) this.traffic.observe(entry.publicId, frame, frame.transportId as string);
           }

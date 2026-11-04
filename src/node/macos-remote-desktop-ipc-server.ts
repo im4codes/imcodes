@@ -1,3 +1,4 @@
+import { REMOTE_DESKTOP_TRAFFIC } from '../../shared/remote-desktop-traffic.js';
 import { isUtf8 } from 'node:buffer';
 import {
   chmod,
@@ -14,7 +15,6 @@ import {
 } from '../../shared/remote-desktop-worker.js';
 import type {
   RemoteDesktopDaemonCommand,
-  RemoteDesktopDaemonMessage,
 } from '../../shared/remote-desktop.js';
 import {
   MACOS_REMOTE_DESKTOP_IPC_MAX_FRAME_BYTES,
@@ -25,6 +25,7 @@ import {
   macosRemoteDesktopIpcPrincipalBinding,
   macosRemoteDesktopIpcPrincipalPaths,
   type MacosRemoteDesktopAcceptedPrivacyReply,
+  type MacosRemoteDesktopWorkerMessage,
   type MacosRemoteDesktopExpectedCodeIdentity,
   type MacosRemoteDesktopFilesystemEntry,
   type MacosRemoteDesktopIpcLaunch,
@@ -121,7 +122,7 @@ interface MacosRemoteDesktopIpcServerCommonOptions {
     socket: Socket,
     expected: MacosRemoteDesktopExpectedCodeIdentity,
   ): Promise<MacosRemoteDesktopVerifiedCodeIdentity>;
-  onWorkerMessage(message: RemoteDesktopDaemonMessage): void | Promise<void>;
+  onWorkerMessage(message: MacosRemoteDesktopWorkerMessage): void | Promise<void>;
   /**
    * The agent lease this daemon currently holds, or null.
    *
@@ -779,6 +780,16 @@ export class MacosRemoteDesktopIpcServer {
           continue;
         }
         const message = this.options.authority.acceptWorkerFrame(session, line, this.now());
+        if (!message) continue;
+        if (message.type === REMOTE_DESKTOP_TRAFFIC.WORKER_MESSAGE) {
+          // Optional local statistics must never hold the control queue, even
+          // if an asynchronous consumer never settles. Neither rejection nor
+          // a synchronous consumer error is a media/IPC failure.
+          try {
+            void Promise.resolve(this.options.onWorkerMessage(message)).catch(() => {});
+          } catch { /* discard this measurement, keep the authenticated route */ }
+          continue;
+        }
         try {
           await withDeadline(
             Promise.resolve(this.options.onWorkerMessage(message)),

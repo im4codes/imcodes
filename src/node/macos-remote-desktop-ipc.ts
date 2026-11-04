@@ -1,3 +1,4 @@
+import { REMOTE_DESKTOP_TRAFFIC, isRemoteDesktopWorkerTraffic, type RemoteDesktopWorkerTraffic } from '../../shared/remote-desktop-traffic.js';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { dirname } from 'node:path';
 import {
@@ -144,11 +145,13 @@ export interface MacosRemoteDesktopIpcHostCommand {
   command: RemoteDesktopDaemonCommand;
 }
 
+export type MacosRemoteDesktopWorkerMessage = RemoteDesktopDaemonMessage | RemoteDesktopWorkerTraffic;
+
 export interface MacosRemoteDesktopIpcWorkerMessage {
   type: typeof MACOS_REMOTE_DESKTOP_IPC_MESSAGE.WORKER_MESSAGE;
   ipcVersion: typeof REMOTE_DESKTOP_WORKER_IPC_VERSION;
   workerGeneration: number;
-  message: RemoteDesktopDaemonMessage;
+  message: MacosRemoteDesktopWorkerMessage | null;
 }
 
 export interface MacosRemoteDesktopIpcVirtualDisplayRequest {
@@ -510,6 +513,12 @@ function parseWorkerMessage(value: unknown): MacosRemoteDesktopIpcWorkerMessage 
     || value.type !== MACOS_REMOTE_DESKTOP_IPC_MESSAGE.WORKER_MESSAGE
     || value.ipcVersion !== REMOTE_DESKTOP_WORKER_IPC_VERSION
     || !isSafePositiveInteger(value.workerGeneration)) return null;
+  if (isRemoteDesktopRecord(value.message)
+    && value.message.type === REMOTE_DESKTOP_TRAFFIC.WORKER_MESSAGE) {
+    // Optional measurements have no control-plane effects. Invalid counters or
+    // unknown telemetry fields are discarded, not a worker protocol failure.
+    return { ...value, message: isRemoteDesktopWorkerTraffic(value.message) ? value.message : null } as MacosRemoteDesktopIpcWorkerMessage;
+  }
   const message = validateRemoteDesktopDaemonMessage(value.message);
   if (!message.ok) return null;
   return { ...value, message: message.value } as MacosRemoteDesktopIpcWorkerMessage;
@@ -803,16 +812,18 @@ export class MacosRemoteDesktopIpcAuthorityHost {
     session: MacosRemoteDesktopIpcSession,
     frame: string,
     now = Date.now(),
-  ): RemoteDesktopDaemonMessage {
+  ): MacosRemoteDesktopWorkerMessage | null {
     this.assertActiveSession(session);
     const envelope = parseWorkerMessage(decodeMacosRemoteDesktopIpcFrame(frame));
     if (!envelope || envelope.workerGeneration !== session.workerGeneration) {
       fail('macos_remote_desktop_ipc_invalid_worker_frame');
     }
     const message = envelope.message;
+    if (!message) return null;
     const route = this.routes.get(message.sessionId);
     if (!route || !routeMatches(message, route)
       || route.expiresAt <= now || route.leaseExpiresAt <= now) {
+      if (message.type === REMOTE_DESKTOP_TRAFFIC.WORKER_MESSAGE) return null;
       fail('macos_remote_desktop_ipc_route_authority_rejected');
     }
     if (message.type === REMOTE_DESKTOP_MSG.TERMINAL) {

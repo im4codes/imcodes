@@ -1,3 +1,4 @@
+import type { MacosRemoteDesktopWorkerMessage } from './macos-remote-desktop-ipc.js';
 import { randomBytes } from 'node:crypto';
 import type { MacosRemoteDesktopUnlockSecretStore } from './macos-remote-desktop-unlock-secret.js';
 import type { Socket } from 'node:net';
@@ -1346,7 +1347,7 @@ export class MacosRemoteDesktopWorkerHost {
     this.readinessTimer = null;
   }
 
-  private onWorkerMessage(message: RemoteDesktopDaemonMessage, generation: number): void {
+  private onWorkerMessage(message: MacosRemoteDesktopWorkerMessage, generation: number): void {
     if (!this.isCurrent(generation) || !this.authenticated || this.connectionGeneration === 0) return;
     const result = this.core.pushInbound(
       this.core.frameOutbound(message),

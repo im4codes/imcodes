@@ -1,3 +1,5 @@
+import { hasExactRemoteDesktopKeys, isRemoteDesktopId, isRemoteDesktopRecord } from './remote-desktop-contract-primitives.js';
+
 /** Endpoint WebRTC transport bytes (media, retransmissions and data channels),
  * not IP/TURN billing bytes. Never sum RTP/candidate/data-channel stats too. */
 export const REMOTE_DESKTOP_TRAFFIC = {
@@ -10,6 +12,26 @@ export interface RemoteDesktopTraffic {
   bytesSent: number;
   bytesReceived: number;
 }
+/** Local authenticated worker telemetry, never a signaling-server message. */
+export interface RemoteDesktopWorkerTraffic extends RemoteDesktopTraffic {
+  type: typeof REMOTE_DESKTOP_TRAFFIC.WORKER_MESSAGE;
+  requestId: string;
+  sessionId: string;
+  capability: string;
+  transportId: string;
+}
+export function isRemoteDesktopWorkerTraffic(value: unknown): value is RemoteDesktopWorkerTraffic {
+  return isRemoteDesktopRecord(value)
+    && hasExactRemoteDesktopKeys(value, [
+      'type', 'requestId', 'sessionId', 'capability', 'transportId', 'bytesSent', 'bytesReceived',
+    ])
+    && value.type === REMOTE_DESKTOP_TRAFFIC.WORKER_MESSAGE
+    && isRemoteDesktopId(value.requestId) && isRemoteDesktopId(value.sessionId)
+    && isRemoteDesktopId(value.capability)
+    && typeof value.transportId === 'string' && value.transportId.length > 0 && value.transportId.length <= 256
+    && isRemoteDesktopTraffic(value);
+}
+
 export interface RemoteDesktopTrafficRecord extends RemoteDesktopTraffic {
   id: string;
   label: string;

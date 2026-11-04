@@ -1,3 +1,4 @@
+import { REMOTE_DESKTOP_TRAFFIC } from '../../shared/remote-desktop-traffic.js';
 import { describe, expect, it } from 'vitest';
 import {
   REMOTE_DESKTOP_ACCESS_MODE,
@@ -418,6 +419,37 @@ describe('macOS remote-desktop authenticated local IPC contract', () => {
       }),
       NOW,
     )).toThrow('macos_remote_desktop_ipc_invalid_host_frame');
+  });
+
+  it('accepts authorized optional traffic without retiring the control route', () => {
+    const { authority, launch, session } = authorizeRoute();
+    const traffic = {
+      type: REMOTE_DESKTOP_TRAFFIC.WORKER_MESSAGE,
+      requestId: REQUEST_ID, sessionId: SESSION_ID, capability: CAPABILITY,
+      transportId: 'peer:T01', bytesSent: 1234, bytesReceived: 567,
+    };
+    const wire = (message: unknown, generation = launch.workerGeneration) => frame({
+      type: MACOS_REMOTE_DESKTOP_IPC_MESSAGE.WORKER_MESSAGE,
+      ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+      workerGeneration: generation, message,
+    });
+    expect(authority.acceptWorkerFrame(session, wire(traffic), NOW)).toEqual(traffic);
+    for (const patch of [
+      { bytesSent: -1 }, { bytesReceived: Number.MAX_SAFE_INTEGER + 1 },
+      { transportId: '' }, { transportId: 'x'.repeat(257) },
+      { capability: 'wrong' }, { requestId: 'wrong' }, { sessionId: 'other' },
+      { extra: 'unknown' },
+    ]) {
+      expect(authority.acceptWorkerFrame(session, wire({ ...traffic, ...patch }), NOW)).toBeNull();
+    }
+    expect(authority.acceptWorkerFrame(session, wire(traffic), NOW + 61_000)).toBeNull();
+    expect(authority.acceptWorkerFrame(session, wire(traffic), NOW)).toEqual(traffic);
+    expect(() => authority.acceptWorkerFrame(session, wire(traffic, launch.workerGeneration + 1), NOW))
+      .toThrow('macos_remote_desktop_ipc_invalid_worker_frame');
+    expect(authority.acceptHostFrame(session, hostCommand(launch, {
+      type: REMOTE_DESKTOP_MSG.STOP,
+      requestId: REQUEST_ID, sessionId: SESSION_ID, capability: CAPABILITY,
+    }), NOW)).toBeDefined();
   });
 
   it('binds every later command and worker response to the exact authorized route', () => {
