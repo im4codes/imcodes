@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useEffect, useId, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { parseTaskPairChecklist } from '@shared/task-pair-checklist.js';
 import {
@@ -10,7 +10,7 @@ import {
 } from '../task-pair-brief-store.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
 
-/** Remove checklist rows from the markdown body: they are rendered below in a
+/** Remove checklist rows from the markdown body: the separate checklist uses a
  * two-column implemented/audited view so both boxes remain understandable. */
 function markdownWithoutChecklist(brief: string): string {
   let fenced = false;
@@ -54,7 +54,7 @@ function useLazyBrief(taskId: string, revision: string, wanted: boolean): { text
     : { text: undefined, status: 'idle' };
 }
 
-export function TaskPairBrief(props: {
+type TaskPairBriefProps = {
   /** Full text (legacy payloads). Absent when the row only carries a revision. */
   brief?: string;
   /** Content hash of the brief the daemon holds; the text is fetched on demand. */
@@ -64,15 +64,25 @@ export function TaskPairBrief(props: {
   taskId: string;
   className?: string;
   defaultOpen?: boolean;
-}) {
+};
+
+export function TaskPairBrief(props: TaskPairBriefProps) {
+  return <TaskPairBriefView key={props.taskId} {...props} />;
+}
+
+function TaskPairBriefView(props: TaskPairBriefProps) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(() => props.defaultOpen === true);
+  const [checklistOpen, setChecklistOpen] = useState(false);
+  const contentId = useId();
+  const checklistId = useId();
   const [copied, setCopied] = useState(false);
   const [copyRequested, setCopyRequested] = useState(false);
   const inline = typeof props.brief === 'string' ? props.brief.trim() : '';
   const revision = !inline && typeof props.briefRevision === 'string' ? props.briefRevision : '';
-  const lazy = useLazyBrief(props.taskId, revision, open || copyRequested);
+  const lazy = useLazyBrief(props.taskId, revision, open || checklistOpen || copyRequested);
   const brief = inline || (lazy.text ?? '').trim();
+  const available = !!inline || lazy.text !== undefined;
   const copy = async (text: string) => {
     try {
       if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text);
@@ -92,41 +102,46 @@ export function TaskPairBrief(props: {
     if (lazy.text !== undefined) { setCopyRequested(false); void copy(lazy.text.trim()); }
     else if (lazy.status === 'failed') setCopyRequested(false);
   }, [copyRequested, lazy.text, lazy.status]);
+  const parsed = useMemo(() => brief ? parseTaskPairChecklist(brief) : [], [brief]);
+  const markdown = useMemo(() => open ? markdownWithoutChecklist(brief) : '', [brief, open]);
+  const parsedCounts = useMemo(() => ({ total: parsed.length, implemented: parsed.filter((item) => item.implemented).length, audited: parsed.filter((item) => item.audited).length }), [parsed]);
   if (!inline && !revision) return null;
-  const parsed = brief ? parseTaskPairChecklist(brief) : [];
-  const counts = brief
-    ? { total: parsed.length, implemented: parsed.filter((item) => item.implemented).length, audited: parsed.filter((item) => item.audited).length }
-    : props.checklist ?? { total: 0, implemented: 0, audited: 0 };
+  const counts = available ? parsedCounts : props.checklist ?? { total: 0, implemented: 0, audited: 0 };
   const checklist = parsed;
   const implementedCount = counts.implemented;
   const auditedCount = counts.audited;
-  const loading = !brief && (lazy.status === 'loading' || lazy.status === 'idle');
+  const loading = !available && (lazy.status === 'loading' || lazy.status === 'idle');
   return (
-    <section class={`task-pair-brief${props.className ? ` ${props.className}` : ''}`} data-testid={`task-pair-brief-${props.taskId}`}>
+    <section onClick={(event) => event.stopPropagation()} class={`task-pair-brief${props.className ? ` ${props.className}` : ''}`} data-testid={`task-pair-brief-${props.taskId}`}>
       <div class="task-pair-brief-actions">
-        <button type="button" class="task-pair-brief-toggle" aria-expanded={open} aria-controls={`task-pair-brief-content-${props.taskId}`} onClick={() => setOpen((value) => !value)}>
+        <button type="button" class="task-pair-brief-toggle" aria-expanded={open} aria-controls={contentId} onClick={() => { if (!open && revision && lazy.status === 'failed') requestTaskPairBrief(props.taskId, revision); setOpen((value) => !value); }}>
           {t(open ? 'taskPair.brief_collapse' : 'taskPair.brief_expand')}
         </button>
         <button type="button" class="task-pair-brief-copy" onClick={() => { if (brief) void copy(brief); else setCopyRequested(true); }} aria-label={t('taskPair.brief_copy')}>
           {copied ? t('taskPair.brief_copied') : t('taskPair.brief_copy')}
         </button>
-        {counts.total > 0 && <span class="task-pair-brief-checklist-summary" aria-label={`${t('taskPair.implemented')} ${implementedCount}/${counts.total}, ${t('taskPair.audited')} ${auditedCount}/${counts.total}`}>
-          {t('taskPair.implemented')}: {implementedCount}/{counts.total} · {t('taskPair.audited')}: {auditedCount}/{counts.total}
-        </span>}
+        <button type="button" class="task-pair-brief-checklist-toggle" aria-label={t('taskPair.checklist_toggle')} title={t('taskPair.checklist_toggle')} aria-expanded={checklistOpen} aria-controls={checklistId} onClick={() => { if (!checklistOpen && revision && lazy.status === 'failed') requestTaskPairBrief(props.taskId, revision); setChecklistOpen((value) => !value); }}>
+          <span class="task-pair-brief-checklist-label">{t('taskPair.checklist_toggle')}</span>
+          {counts.total > 0 && <span class="task-pair-brief-checklist-summary" aria-label={`${t('taskPair.implemented')} ${implementedCount}/${counts.total}, ${t('taskPair.audited')} ${auditedCount}/${counts.total}`}>
+            {t('taskPair.implemented')}: {implementedCount}/{counts.total} · {t('taskPair.audited')}: {auditedCount}/{counts.total}
+          </span>}
+        </button>
       </div>
-      {open && !brief && <div id={`task-pair-brief-content-${props.taskId}`} class="task-pair-brief-content" role="region" aria-label={t('taskPair.brief_content')} aria-busy={loading}>
-        <span class="task-pair-brief-status">{loading ? t('taskPair.brief_loading') : t('taskPair.brief_unavailable')}</span>
-      </div>}
-      {open && brief && <div id={`task-pair-brief-content-${props.taskId}`} class="task-pair-brief-content" role="region" aria-label={t('taskPair.brief_content')}>
-        {markdownWithoutChecklist(brief) && <ChatMarkdown text={markdownWithoutChecklist(brief)} cacheKey={`task-pair-brief:${props.taskId}`} />}
+      {checklistOpen && <div id={checklistId} class="task-pair-brief-checklist-panel task-pair-brief-content" role="region" aria-label={t('taskPair.checklist_toggle')} aria-busy={!available && loading} tabIndex={0}>
+        {!available && <span class="task-pair-brief-status">{loading ? t('taskPair.brief_loading') : t('taskPair.brief_unavailable')}</span>}
+        {available && checklist.length === 0 && <span class="task-pair-brief-status">{t('taskPair.checklist_empty')}</span>}
         {checklist.length > 0 && <div class="task-pair-brief-checklist">
-          <div class="task-pair-brief-checklist-heading"><span>{t('taskPair.implemented')}</span><span>{t('taskPair.audited')}</span><span>{t('taskPair.brief_checklist')}</span></div>
-          {checklist.map((item) => <div class="task-pair-brief-checklist-row" key={`${props.taskId}-${item.index}`}>
-            <input type="checkbox" checked={item.implemented} readOnly aria-label={t('taskPair.implemented')} />
-            <input type="checkbox" checked={item.audited} readOnly aria-label={t('taskPair.audited')} />
-            <span>{item.text}</span>
+          <div class="task-pair-brief-checklist-heading"><span title={t('taskPair.implemented')}>{t('taskPair.implemented')}</span><span title={t('taskPair.audited')}>{t('taskPair.audited')}</span><span>{t('taskPair.brief_checklist')}</span></div>
+          {checklist.map((item) => <div class="task-pair-brief-checklist-row" key={item.index}>
+            <input type="checkbox" checked={item.implemented} readOnly disabled aria-label={t('taskPair.implemented')} />
+            {item.hasAuditBox ? <input type="checkbox" checked={item.audited} readOnly disabled aria-label={t('taskPair.audited')} /> : <span title={t('taskPair.checklist_no_audit')} aria-label={t('taskPair.checklist_no_audit')}>—</span>}
+            <span>{item.index}. {item.text}</span>
           </div>)}
         </div>}
+      </div>}
+      {open && <div id={contentId} class="task-pair-brief-content" role="region" aria-label={t('taskPair.brief_content')} aria-busy={!available && loading} tabIndex={0}>
+        {!available && <span class="task-pair-brief-status">{loading ? t('taskPair.brief_loading') : t('taskPair.brief_unavailable')}</span>}
+        {markdown && <ChatMarkdown text={markdown} cacheKey={`task-pair-brief:${props.taskId}`} />}
       </div>}
     </section>
   );

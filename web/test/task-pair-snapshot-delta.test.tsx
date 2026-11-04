@@ -397,7 +397,8 @@ describe('TaskPairBrief (lazy)', () => {
     expect(view.container.querySelector('.task-pair-brief-content')?.textContent).toContain('taskPair.brief_loading');
     receiveTaskPairBrief('t1', 'rev-a', BRIEF('t1'));
     await waitFor(() => expect(view.container.querySelector('.task-pair-brief-content')?.textContent).toContain('Details matter for t1.'));
-    expect(view.container.querySelector('.task-pair-brief-content')?.textContent).toContain('Implement t1');
+    fireEvent.click(screen.getByRole('button', { name: 'taskPair.checklist_toggle' }));
+    expect(view.container.querySelector('.task-pair-brief-checklist-panel')?.textContent).toContain('Implement t1');
     expect(view.container.querySelectorAll('.task-pair-brief-checklist-row')).toHaveLength(2);
     // Collapse/expand again: served from cache, no second request.
     fireEvent.click(screen.getByRole('button', { name: 'taskPair.brief_collapse' }));
@@ -408,12 +409,13 @@ describe('TaskPairBrief (lazy)', () => {
   it('renders exactly what the inline (legacy) brief renders once the text is fetched', async () => {
     setTaskPairBriefRequester(() => {});
     const inline = render(<TaskPairBrief taskId="t1" brief={BRIEF('t1')} defaultOpen />);
-    const inlineHtml = inline.container.querySelector('.task-pair-brief')!.innerHTML;
+    const withoutIds = (html: string) => html.replace(/\s(?:id|aria-controls)="[^"]*"/gu, '');
+    const inlineHtml = withoutIds(inline.container.querySelector('.task-pair-brief')!.innerHTML);
     inline.unmount();
     receiveTaskPairBrief('t1', 'rev-a', BRIEF('t1'));
     const lazy = render(<TaskPairBrief taskId="t1" briefRevision="rev-a" checklist={{ total: 2, implemented: 1, audited: 0 }} defaultOpen />);
     await waitFor(() => expect(lazy.container.querySelector('.task-pair-brief-content')?.textContent).toContain('Details matter'));
-    expect(lazy.container.querySelector('.task-pair-brief')!.innerHTML).toBe(inlineHtml);
+    expect(withoutIds(lazy.container.querySelector('.task-pair-brief')!.innerHTML)).toBe(inlineHtml);
   });
 
   it('copies after fetching when the copy button is used before the text arrived', async () => {
@@ -459,7 +461,8 @@ describe('TaskPairStatusPanel with revision-only briefs', () => {
     expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('taskPair.implemented: 1/1');
     await waitFor(() => expect(requests).toEqual(['mine']));
     receiveTaskPairBrief('mine', 'rev-m', '- [x][ ] Mine it');
-    await waitFor(() => expect(view.container.querySelector('.task-pair-brief-content')?.textContent).toContain('Mine it'));
+    fireEvent.click(screen.getByRole('button', { name: 'taskPair.checklist_toggle' }));
+    await waitFor(() => expect(view.container.querySelector('.task-pair-brief-checklist-panel')?.textContent).toContain('Mine it'));
     delete (window as any).__imcodesTaskPairSnapshot;
   });
 });

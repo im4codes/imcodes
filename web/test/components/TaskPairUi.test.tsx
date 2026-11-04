@@ -443,7 +443,8 @@ describe('TaskPairStatusPanel', () => {
     expect(screen.queryByText('Details matter.')).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: 'taskPair.brief_expand' }));
     expect(view.container.querySelector('.task-pair-brief-content')?.textContent).toContain('Details matter.');
-    expect(view.container.querySelector('.task-pair-brief-content')?.textContent).toContain('Implement it');
+    fireEvent.click(screen.getByRole('button', { name: 'taskPair.checklist_toggle' }));
+    expect(view.container.querySelector('.task-pair-brief-checklist-panel')?.textContent).toContain('Implement it');
     expect(screen.getAllByRole('checkbox')).toHaveLength(2);
     expect(screen.getByRole('button', { name: 'taskPair.brief_copy' })).toBeTruthy();
     expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('taskPair.implemented: 1/1');

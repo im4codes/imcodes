@@ -503,6 +503,7 @@ function TaskCard(props: {
 }
 
 export function SupervisionTaskConsoleView(props: {
+  scopeKey?: string;
   state: SupervisionTaskConsoleReducerState;
   mobile: boolean;
   readOnly?: boolean;
@@ -657,7 +658,7 @@ export function SupervisionTaskConsoleView(props: {
           class="supervision-task-console-grid" data-tab={activeTab} tabIndex={0}
         >
           {visibleTasks.map((task) => <TaskCard
-            key={task.taskId} task={task} assignments={assignmentsByTask.get(task.taskId) ?? []}
+            key={JSON.stringify([props.scopeKey, props.state.scope, task.taskId])} task={task} assignments={assignmentsByTask.get(task.taskId) ?? []}
             events={props.state.eventsByTask[task.taskId] ?? []} expanded={expanded.has(task.taskId)}
             onToggle={() => setExpanded((previous) => { const next = new Set(previous); if (next.has(task.taskId)) next.delete(task.taskId); else next.add(task.taskId); return next; })}
             onNavigateSession={props.onNavigateSession} language={language} now={now}
@@ -721,6 +722,7 @@ export function SupervisionTaskConsole(props: {
     event.preventDefault(); persistWidth(width + (event.key === 'ArrowLeft' ? 24 : -24));
   };
   return <SupervisionTaskConsoleView
+    scopeKey={JSON.stringify([props.serverId, props.projectName, props.coordinatorSessionName])}
     state={state} mobile={props.mobile} readOnly={props.readOnly} width={width}
     maxWidth={supervisionConsoleMaxWidth(viewportWidth)} onResizeStart={startResize}
     onResizeKeyDown={resizeWithKeyboard} onRetry={retry} onClose={props.onClose}

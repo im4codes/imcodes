@@ -15325,22 +15325,29 @@ button.quick-agent-delegation-preset.active {
 .task-pair-status-row-meta-icon { font-size: 9px; opacity: .85; }
 .task-pair-status-row-roles { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
 .task-pair-brief { min-width: 0; margin-top: 2px; }
-.task-pair-brief-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.task-pair-brief-actions { display: flex; align-items: center; gap: 6px; flex-wrap: nowrap; min-width: 0; }
 .task-pair-brief-actions button { border: 0; background: transparent; color: var(--chrome-accent, #67e8f9); padding: 1px 3px; font: inherit; font-size: 10px; cursor: pointer; }
 .task-pair-brief-actions button:hover { text-decoration: underline; }
+.task-pair-brief-actions button { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .task-pair-brief-copy { opacity: .78; }
+.task-pair-brief-actions .task-pair-brief-checklist-toggle { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.task-pair-brief-checklist-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task-pair-brief-checklist-toggle .task-pair-brief-checklist-summary { overflow: hidden; text-overflow: ellipsis; }
+.task-pair-brief-checklist-panel:focus-visible { outline: 2px solid var(--chrome-accent, #67e8f9); outline-offset: 1px; }
 .task-pair-brief-checklist-summary { font-size: 9px; opacity: .8; white-space: nowrap; }
 .task-pair-brief-content { max-height: min(38vh, 420px); overflow: auto; overscroll-behavior-y: auto; margin-top: 4px; padding: 7px 8px; border: 1px solid color-mix(in srgb, currentColor 18%, transparent); border-radius: 7px; background: color-mix(in srgb, var(--chrome-panel, #0d1422) 78%, transparent); font-size: 11px; line-height: 1.4; }
 .task-pair-brief-content .chat-rich-text { min-width: 0; }
 .task-pair-brief-content .chat-rich-text > :first-child { margin-top: 0; }
 .task-pair-brief-content .chat-rich-text > :last-child { margin-bottom: 0; }
-.task-pair-brief-checklist { display: grid; gap: 3px; margin-top: 8px; padding-top: 7px; border-top: 1px solid color-mix(in srgb, currentColor 16%, transparent); }
-.task-pair-brief-checklist-heading, .task-pair-brief-checklist-row { display: grid; grid-template-columns: 1.2rem 1.2rem minmax(0, 1fr); align-items: start; gap: 5px; }
+.task-pair-brief-checklist { display: grid; gap: 3px; }
+.task-pair-brief-checklist-heading, .task-pair-brief-checklist-row { display: grid; grid-template-columns: 3rem 3rem minmax(0, 1fr); align-items: start; gap: 5px; }
+.task-pair-brief-checklist-heading > span { min-width: 0; overflow-wrap: anywhere; }
 .task-pair-brief-checklist-heading { font-size: 9px; text-transform: uppercase; letter-spacing: .05em; opacity: .7; }
 .task-pair-brief-checklist-row span { overflow-wrap: anywhere; }
 .task-pair-brief-checklist input { margin: 1px 0 0; }
 .supervision-task-console-brief { margin: 6px 0 2px; }
 .supervision-task-console-brief .task-pair-brief-content { max-height: min(44vh, 520px); }
+.task-pair-brief .task-pair-brief-checklist-panel { overscroll-behavior: contain; max-height: min(38vh, 38dvh, 420px); scroll-margin-block: 8px; }
 
 /* Pill status badge: one colour per pair status, sourced from the same
    --task-pair-status-text/border/bg custom properties the event-chip
@@ -15372,7 +15379,7 @@ button.quick-agent-delegation-preset.active {
 .task-pair-split-icon { font-size: 10px; line-height: 1; }
 
 .supervision-task-console-checklist { display: grid; gap: 3px; margin-top: 4px; }
-.supervision-task-console-checklist-row { display: grid; grid-template-columns: 1.2rem 1.2rem minmax(0, 1fr); align-items: center; gap: 4px; }
+.supervision-task-console-checklist-row { display: grid; grid-template-columns: 3rem 3rem minmax(0, 1fr); align-items: center; gap: 4px; }
 .supervision-task-console-checklist-row span { overflow-wrap: anywhere; }
 .supervision-task-console-checklist-progress { font-size: 0.8em; opacity: 0.8; }
 
