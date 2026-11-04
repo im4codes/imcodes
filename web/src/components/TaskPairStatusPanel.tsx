@@ -340,13 +340,14 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
               : <span class="task-pair-role-chip" role="group" aria-label={t('taskPair.panel_auditor')}><span class={`task-pair-status-dot ${payload.auditorState === 'running' ? 'is-running' : ''}`} />{session(payload.auditor, payload.auditorLabel, payload.auditorModel, payload.auditorThinking, 'auditor') ?? unassigned(payload.auditorModel, payload.auditorThinking)}</span>}
             {!isMobile && typeof payload.executor === 'string' && payload.executor && payload.executor !== 'none' && typeof payload.auditor === 'string' && payload.auditor && payload.auditor !== 'none' && (() => {
               const taskIdStr = String(payload.taskId);
-              const isSplitOpen = activeSplitTaskId === taskIdStr;
+              // The active pair exits from either window's titlebar.
+              if (activeSplitTaskId === taskIdStr) return null;
               return (
                 <button
                   type="button"
-                  class={`task-pair-split-btn${isSplitOpen ? ' is-active' : ''}`}
-                  title={isSplitOpen ? t('taskPair.panel_close_split') : t('taskPair.panel_open_split')}
-                  aria-label={isSplitOpen ? t('taskPair.panel_close_split') : t('taskPair.panel_open_split')}
+                  class="task-pair-split-btn"
+                  title={t('taskPair.panel_open_split')}
+                  aria-label={t('taskPair.panel_open_split')}
                   onClick={(e) => {
                     e.stopPropagation();
                     window.dispatchEvent(new CustomEvent('deck:pair-split', {
@@ -354,13 +355,13 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
                         taskId: taskIdStr,
                         executor: payload.executor,
                         auditor: payload.auditor,
-                        action: isSplitOpen ? 'close' : 'open',
+                        action: 'open',
                       },
                     }));
                   }}
                 >
                   <span class="task-pair-split-icon" aria-hidden="true">◫</span>
-                  <span class="task-pair-split-text">{isSplitOpen ? t('taskPair.panel_close_split') : t('taskPair.panel_open_split')}</span>
+                  <span class="task-pair-split-text">{t('taskPair.panel_open_split')}</span>
                 </button>
               );
             })()}

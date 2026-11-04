@@ -408,13 +408,14 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
           {isStatus(event.toStatus) && <TaskPairEventDecisions key={taskId} taskId={taskId} status={event.toStatus} />}
           {!isMobile && typeof event.executor === 'string' && event.executor && event.executor !== 'none' && typeof event.auditor === 'string' && event.auditor && event.auditor !== 'none' && (() => {
             const taskIdStr = String(taskId);
-            const isSplitOpen = activeSplitTaskId === taskIdStr;
+            // The active pair exits from either window's titlebar.
+            if (activeSplitTaskId === taskIdStr) return null;
             return (
               <button
                 type="button"
-                class={`task-pair-split-btn${isSplitOpen ? ' is-active' : ''}`}
-                title={isSplitOpen ? t('taskPair.panel_close_split') : t('taskPair.panel_open_split')}
-                aria-label={isSplitOpen ? t('taskPair.panel_close_split') : t('taskPair.panel_open_split')}
+                class="task-pair-split-btn"
+                title={t('taskPair.panel_open_split')}
+                aria-label={t('taskPair.panel_open_split')}
                 onClick={(e) => {
                   e.stopPropagation();
                   window.dispatchEvent(new CustomEvent('deck:pair-split', {
@@ -422,13 +423,13 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
                       taskId: taskIdStr,
                       executor: event.executor,
                       auditor: event.auditor,
-                      action: isSplitOpen ? 'close' : 'open',
+                      action: 'open',
                     },
                   }));
                 }}
               >
                 <span class="task-pair-split-icon" aria-hidden="true">◫</span>
-                <span class="task-pair-split-text">{isSplitOpen ? t('taskPair.panel_close_split') : t('taskPair.panel_open_split')}</span>
+                <span class="task-pair-split-text">{t('taskPair.panel_open_split')}</span>
               </button>
             );
           })()}

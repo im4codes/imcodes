@@ -735,7 +735,7 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
   ),
 }));
 vi.mock('../src/components/SubSessionWindow.js', () => ({
-  SubSessionWindow: ({ sub, ws, active, visible, zIndex, maximized, onToggleMaximized, onFocus, onViewRepo, onShareSession, onSettings, sharedState, taskPairPanelVisitKey }: any) => {
+  SubSessionWindow: ({ sub, ws, active, visible, zIndex, maximized, onToggleMaximized, onFocus, onViewRepo, onShareSession, onSettings, sharedState, taskPairPanelVisitKey, onClosePairSplit }: any) => {
     const incomingViewer = !!sharedState
       && sharedState.outgoing !== true
       && sharedState.effectiveRole !== 'participant';
@@ -752,6 +752,7 @@ vi.mock('../src/components/SubSessionWindow.js', () => ({
       onMouseDown={onFocus}
     >
       sub-session-window
+      {onClosePairSplit && <button onClick={onClosePairSplit}>sub-window-close-split-{sub?.id}</button>}
       <button onClick={onToggleMaximized}>sub-window-toggle-max-{sub?.id}</button>
       <button onClick={onViewRepo}>sub-window-repo-{sub?.id}</button>
       <button onClick={() => onSettings?.({ surface: 'session' })}>sub-window-settings-{sub?.id}</button>
@@ -4909,9 +4910,20 @@ describe('App shell', () => {
       act(() => window.dispatchEvent(new Event('resize')));
       expect(visit('sub-1')).toBe(taskId);
     }
-    split('task-A', 'close');
-    await waitFor(() => expect(visit('sub-1')).toBe(''));
-    expect(visit('sub-2')).toBe(''); expect(visit('sub-3')).toBe('');
+    for (const roleId of ['sub-1', 'sub-2']) {
+      split('task-A');
+      await waitFor(() => expect(visit('sub-1')).toBe('task-A'));
+      expect(screen.getByText('sub-window-close-split-sub-1')).toBeTruthy();
+      expect(screen.getByText('sub-window-close-split-sub-2')).toBeTruthy();
+      expect(screen.queryByText('sub-window-close-split-sub-3')).toBeNull();
+      fireEvent.click(screen.getByText(`sub-window-close-split-${roleId}`));
+      await waitFor(() => expect(visit('sub-1')).toBe(''));
+      expect(screen.getByTestId('sub-session-window-sub-1').getAttribute('data-visible')).toBe('false');
+      expect(screen.getByTestId('sub-session-window-sub-2').getAttribute('data-visible')).toBe('false');
+      expect(screen.getByTestId('sub-session-window-sub-3').getAttribute('data-visible')).toBe('true');
+      expect(screen.queryByText('sub-window-close-split-sub-1')).toBeNull();
+      expect(visit('sub-2')).toBe(''); expect(visit('sub-3')).toBe('');
+    }
   });
 
   it('marks the most-recently opened sub-session window active, regardless of how many are open', async () => {

@@ -83,6 +83,8 @@ interface Props {
   onDiff: (sessionName: string, apply: (d: TerminalDiff) => void) => void | (() => void);
   onHistory: (sessionName: string, apply: (c: string) => void) => void;
   onMinimize: () => void;
+  /** Leave this task's paired layout without stopping either session. */
+  onClosePairSplit?: () => void;
   onClose: () => void;
   maximized?: boolean;
   onToggleMaximized?: () => void;
@@ -284,7 +286,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, visible = true, taskPairPanelVisitKey, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onLiveSessionStateChange, onPreviewFile, onOpenLocalWebPreview, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop, remoteDesktopCanSetUp = true,
+  sub, ws, connected, active, visible = true, taskPairPanelVisitKey, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClosePairSplit, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onLiveSessionStateChange, onPreviewFile, onOpenLocalWebPreview, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop, remoteDesktopCanSetUp = true,
 }: Props) {
   recordPerfRender(visible ? 'SubSessionWindow:visible' : 'SubSessionWindow:hidden');
   const { t } = useTranslation();
@@ -1001,6 +1003,17 @@ export function SubSessionWindow({
         {inP2p && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
         {sub.ccPresetId && <span style={{ fontSize: 11, color: '#f59e0b' }} title={`Custom API: ${sub.ccPresetId}`}>◉</span>}
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 10 }}>
+          {!isMobile && onClosePairSplit && <button
+            type="button"
+            class="subsession-minimize-btn subsession-close-split-btn"
+            title={t('taskPair.panel_close_split')}
+            aria-label={t('taskPair.panel_close_split')}
+            onMouseDown={(event) => { focusInactiveDesktopWindow(event, { suppressFollowingClick: true }); }}
+            onClick={(event) => {
+              event.stopPropagation();
+              if (!consumeFocusOnlyWindowCommandClick(event) && !focusInactiveDesktopWindow(event)) onClosePairSplit();
+            }}
+          ><span aria-hidden="true">◫×</span></button>}
           {!isShell && !isTransport && <button class="subsession-mode-btn" onClick={() => { const next = viewMode === 'chat' ? 'terminal' : 'chat'; setViewMode(next); if (next === 'chat') requestAnimationFrame(() => chatScrollRef.current?.()); }} title={viewMode === 'chat' ? 'Switch to terminal' : 'Switch to chat'}>{viewMode === 'chat' ? '⌨' : '💬'}</button>}
           {/* Left of the file-manager button, on purpose — same convention
               as the main-session toolbar's DaemonRemoteDesktopControl: it

@@ -8749,6 +8749,19 @@ export function App() {
               active={windowVisible && (isMobile || focusedSubId === sub.id)}
               visible={windowVisible}
               taskPairPanelVisitKey={activeSplitPairRef.current?.executorSubId === sub.id ? activeSplitPairTaskId ?? undefined : undefined}
+              onClosePairSplit={activeSplitPairTaskId && (
+                activeSplitPairRef.current?.executorSubId === sub.id
+                || activeSplitPairRef.current?.auditorSubId === sub.id
+              ) ? () => {
+                const pair = activeSplitPairRef.current;
+                if (!pair || pair.taskId !== activeSplitPairTaskId) return;
+                handlePairSplit({
+                  taskId: pair.taskId,
+                  executor: pair.executorSubId,
+                  auditor: pair.auditorSubId,
+                  action: 'close',
+                });
+              } : undefined}
               onPendingQuestion={surfaceAskQuestionFromHistory}
               idleFlashToken={idleFlashTokens.get(sub.sessionName) ?? 0}
               onDiff={registerDiffApplyer}

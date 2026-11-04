@@ -167,6 +167,26 @@ describe('SubSessionWindow maximize integration', () => {
     localStorage.clear();
   });
 
+  it('places close split in the titlebar without closing or stopping either session', () => {
+    const onClosePairSplit = vi.fn();
+    const onClose = vi.fn();
+    const onMinimize = vi.fn();
+    const onToggleMaximized = vi.fn();
+    const first = renderWindow();
+    expect(screen.queryByRole('button', { name: 'taskPair.panel_close_split' })).toBeNull();
+    first.unmount();
+    const { container } = renderWindow({ onClosePairSplit, onClose, onMinimize, onToggleMaximized });
+    const closeSplit = screen.getByRole('button', { name: 'taskPair.panel_close_split' });
+    expect(closeSplit.closest('.subsession-header')).toBe(container.querySelector('.subsession-header'));
+    fireEvent.mouseDown(closeSplit);
+    fireEvent.click(closeSplit);
+    expect(onClosePairSplit).toHaveBeenCalledTimes(1);
+    fireEvent.dblClick(closeSplit);
+    expect(onToggleMaximized).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(onMinimize).not.toHaveBeenCalled();
+  });
+
   it('places an accessible maximize control immediately before minimize', async () => {
     const onToggleMaximized = vi.fn();
     const { container } = renderWindow({ onToggleMaximized });

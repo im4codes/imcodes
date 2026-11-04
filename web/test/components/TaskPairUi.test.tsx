@@ -1316,25 +1316,34 @@ describe('TaskPairStatusPanel', () => {
         action: 'open',
       });
 
-      // When deck:pair-split-state broadcasts activeTaskId, button updates to active / close
+      // Closing belongs to the split windows' titlebars, not this card.
       act(() => {
         window.dispatchEvent(new CustomEvent('deck:pair-split-state', { detail: { activeTaskId: 'task-split-1' } }));
       });
-      expect(splitBtn.classList.contains('is-active')).toBe(true);
-      expect(splitBtn.textContent).toContain('taskPair.panel_close_split');
-
-      // Clicking when active dispatches action: 'close'
-      fireEvent.click(splitBtn);
-      expect(onSplit).toHaveBeenCalledWith({
-        taskId: 'task-split-1',
-        executor: 'exec-sub',
-        auditor: 'audit-sub',
-        action: 'close',
+      expect(rows[0].querySelector('.task-pair-split-btn')).toBeNull();
+      act(() => {
+        window.dispatchEvent(new CustomEvent('deck:pair-split-state', { detail: { activeTaskId: null } }));
       });
+      expect(rows[0].querySelector('.task-pair-split-btn')?.textContent).toContain('taskPair.panel_open_split');
     } finally {
       window.removeEventListener('deck:pair-split', handler);
       localStorage.clear();
     }
+  });
+
+  it('leaves closing an active split to the titlebar instead of the expanded event body', () => {
+    const { container } = render(<TaskPairEventChip eventId="split-titlebar" payload={{
+      taskId: 'task-split-header', title: 'Split', verb: 'WORKING', toStatus: 'working',
+      executor: 'exec-sub', auditor: 'audit-sub',
+    }} />);
+    fireEvent.click(container.querySelector('.task-pair-card-toggle')!);
+    expect(container.querySelector('.task-pair-split-btn')).toBeTruthy();
+    act(() => window.dispatchEvent(new CustomEvent('deck:pair-split-state', {
+      detail: { activeTaskId: 'task-split-header' },
+    })));
+    expect(container.querySelector('.task-pair-split-btn')).toBeNull();
+    act(() => window.dispatchEvent(new CustomEvent('deck:pair-split-state', { detail: { activeTaskId: null } })));
+    expect(container.querySelector('.task-pair-split-btn')).toBeTruthy();
   });
 
   it('has panel_open_split and panel_close_split i18n keys across all seven locales', () => {
