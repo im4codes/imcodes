@@ -1,7 +1,8 @@
+import { nextHistoryCleanupAt } from './history-retention-clock.mjs';
 import type { TimelineTextTailOptions } from './timeline-projection-types.js';
 import { parentPort, workerData } from 'node:worker_threads';
 import { createRequire } from 'node:module';
-import { mkdirSync, statSync, existsSync, readFileSync, openSync, readSync, closeSync } from 'node:fs';
+import { mkdirSync, statSync, existsSync, readFileSync, openSync, readSync, closeSync, watch, type FSWatcher } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { TimelineEvent, TimelineEventType } from './timeline-event.js';
 import type {
@@ -43,6 +44,16 @@ let db: DatabaseSyncInstance | null = null;
 const rebuildPromises = new Map<string, Promise<boolean>>();
 const sessionMutationGenerations = new Map<string, number>();
 let writesSinceCheckpoint = 0;
+// Runtime constants are supplied by the client; this raw-TS entry has no runtime local imports.
+const retention = workerData?.retention as { configPath: string; dayMs: number; maxDays: number; retryMs: number; batchSize: number } | undefined;
+let retentionCutoff: number | null = null;
+let retentionRunning = false;
+let retentionRetryAfter = 0;
+let retentionTimer: NodeJS.Timeout | undefined;
+let retentionStopped = false;
+let retentionWatcher: FSWatcher | undefined;
+let retentionDebounce: NodeJS.Timeout | undefined;
+let retentionWatchRetry: NodeJS.Timeout | undefined;
 
 function sessionFilePath(sessionId: string): string {
   const safe = sessionId.replace(/[^a-zA-Z0-9_-]/g, '_');
@@ -98,6 +109,19 @@ function ensureDb(): DatabaseSyncInstance {
       last_rebuilt_at INTEGER
     );
   `);
+  instance.exec(`
+    CREATE TABLE IF NOT EXISTS timeline_projection_cursors (
+      session_id TEXT PRIMARY KEY, epoch INTEGER NOT NULL, seq INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS timeline_retention (
+      id INTEGER PRIMARY KEY CHECK(id = 1), cutoff INTEGER,
+      last_success INTEGER, enabled_at INTEGER, next_run INTEGER, retry_after INTEGER NOT NULL DEFAULT 0,
+      runs INTEGER NOT NULL DEFAULT 0, batches INTEGER NOT NULL DEFAULT 0,
+      deleted INTEGER NOT NULL DEFAULT 0, last_error TEXT
+    );
+    INSERT OR IGNORE INTO timeline_retention(id) VALUES (1);
+  `);
+  retentionCutoff = (instance.prepare('SELECT cutoff FROM timeline_retention WHERE id = 1').get() as { cutoff: number | null }).cutoff;
   db = instance;
   return instance;
 }
@@ -170,6 +194,7 @@ function deleteSessionRows(sessionId: string): void {
   const database = ensureDb();
   database.prepare('DELETE FROM timeline_projection_events WHERE session_id = ?').run(sessionId);
   database.prepare('DELETE FROM timeline_projection_sessions WHERE session_id = ?').run(sessionId);
+  database.prepare('DELETE FROM timeline_projection_cursors WHERE session_id = ?').run(sessionId);
 }
 
 function currentFileMeta(sessionId: string): { exists: boolean; size: number; mtimeMs: number } {
@@ -243,6 +268,15 @@ function extractTextAndStreaming(event: TimelineEvent): { text: string | null; s
 }
 
 function insertProjectedEvent(database: DatabaseSyncInstance, sessionId: string, appendOrdinal: number, event: TimelineEvent): void {
+  database.prepare(`
+    INSERT INTO timeline_projection_cursors(session_id, epoch, seq) VALUES (?, ?, ?)
+    ON CONFLICT(session_id) DO UPDATE SET epoch = excluded.epoch, seq = excluded.seq
+    WHERE excluded.epoch > epoch OR (excluded.epoch = epoch AND excluded.seq > seq)
+  `).run(sessionId, event.epoch, event.seq);
+  // Invalid/missing timestamps are retained conservatively, never coerced to zero.
+  const validTs = Number.isSafeInteger(event.ts) && event.ts >= 0 && event.ts <= 8.64e15;
+  if (validTs && retentionCutoff !== null && event.ts < retentionCutoff) return;
+  const storedTs = validTs ? event.ts : 'invalid';
   const { text, streaming } = extractTextAndStreaming(event);
   database.prepare(`
     INSERT INTO timeline_projection_events (
@@ -252,7 +286,7 @@ function insertProjectedEvent(database: DatabaseSyncInstance, sessionId: string,
     sessionId,
     appendOrdinal,
     event.eventId,
-    event.ts,
+    storedTs,
     event.seq,
     event.epoch,
     event.type,
@@ -262,7 +296,7 @@ function insertProjectedEvent(database: DatabaseSyncInstance, sessionId: string,
     event.hidden === true ? 1 : 0,
     text,
     JSON.stringify(event.payload),
-    event.ts,
+    storedTs,
     Date.now(),
   );
 }
@@ -274,7 +308,9 @@ async function rebuildSessionInternal(sessionId: string): Promise<boolean> {
     const database = ensureDb();
     const fileMeta = currentFileMeta(sessionId);
     if (!fileMeta.exists) {
-      deleteSessionRows(sessionId);
+      // A SQLite-only projection remains readable after retention. Explicit
+      // session deletion / the existing JSONL cleanup still delete via deleteSession.
+      if (retentionCutoff === null) deleteSessionRows(sessionId);
       return true;
     }
     upsertSessionMeta(sessionId, {
@@ -338,8 +374,8 @@ function markSessionReady(
 async function syncSessionDelta(sessionId: string, meta: ProjectionSessionMeta): Promise<boolean> {
   const fileMeta = currentFileMeta(sessionId);
   if (!fileMeta.exists) {
-    deleteSessionRows(sessionId);
-    return false;
+    if (retentionCutoff === null) deleteSessionRows(sessionId);
+    return retentionCutoff !== null && readSessionMeta(sessionId) !== null;
   }
 
   if (fileMeta.size === meta.sourceFileSizeBytes) {
@@ -391,8 +427,8 @@ function prepareSqliteRead(sessionId: string): boolean {
   const meta = readSessionMeta(sessionId);
   const fileMeta = currentFileMeta(sessionId);
   if (!fileMeta.exists) {
-    deleteSessionRows(sessionId);
-    return false;
+    if (retentionCutoff === null) deleteSessionRows(sessionId);
+    return retentionCutoff !== null && readSessionMeta(sessionId) !== null;
   }
   if (!meta) {
     scheduleSessionRebuild(sessionId);
@@ -517,6 +553,8 @@ async function handleQueryHistory(sessionId: string, afterTs?: number, afterSeq?
 
 async function handleQueryLatest(sessionId: string): Promise<{ epoch: number; seq: number } | null> {
   if (!prepareSqliteRead(sessionId)) return null;
+  const cursor = ensureDb().prepare('SELECT epoch, seq FROM timeline_projection_cursors WHERE session_id = ?').get(sessionId) as { epoch: number; seq: number } | undefined;
+  if (cursor) return cursor;
   const row = ensureDb().prepare(`
     SELECT epoch, seq
     FROM timeline_projection_events
@@ -594,7 +632,7 @@ async function handlePruneSessionToAuthoritative(sessionId: string, keepLast: nu
       LIMIT 1
     `).get(sessionId) as Record<string, unknown> | undefined;
     upsertSessionMeta(sessionId, {
-      lastProjectedAppendOrdinal: latestRow ? Number(latestRow.append_ordinal) : 0,
+      lastProjectedAppendOrdinal: Math.max(meta.lastProjectedAppendOrdinal, latestRow ? Number(latestRow.append_ordinal) : 0),
       sourceFileSizeBytes: fileMeta.size,
       sourceFileMtimeMs: fileMeta.mtimeMs,
       status: fileMeta.exists ? 'ready' : 'missing',
@@ -618,7 +656,141 @@ async function handleCheckpointIfNeeded(): Promise<boolean> {
   return true;
 }
 
+/** Config changes are observed via directory notifications (atomic rename), not polling. */
+function readRetentionConfig(): { days: number; enabledAt: number } | null {
+  if (!retention) return null;
+  try {
+    const raw = JSON.parse(readFileSync(retention.configPath, 'utf8'));
+    if (raw.keepDays === null) return null;
+    if (!Number.isSafeInteger(raw.keepDays) || raw.keepDays < 1 || raw.keepDays > retention.maxDays
+      || !Number.isSafeInteger(raw.enabledAt) || raw.enabledAt < 0 || raw.enabledAt > 8.64e15 - retention.dayMs) {
+      throw new Error('Invalid history retention config; SQLite cleanup suspended');
+    }
+    return { days: raw.keepDays, enabledAt: raw.enabledAt };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw err;
+  }
+}
+
+/** Retention never holds up the writer for the normal 5s lock timeout. */
+function retentionWrite<T>(work: () => T): T {
+  const database = ensureDb();
+  database.exec('PRAGMA busy_timeout = 50');
+  try { return work(); } finally { database.exec('PRAGMA busy_timeout = 5000'); }
+}
+
+function retentionState(): Record<string, unknown> {
+  return ensureDb().prepare('SELECT * FROM timeline_retention WHERE id = 1').get() as Record<string, unknown>;
+}
+
+function prepareRetentionSchedule(enabledAt: number): Record<string, unknown> {
+  const state = retentionState();
+  if (state.enabled_at !== enabledAt || state.next_run === null) {
+    retentionWrite(() => ensureDb().prepare('UPDATE timeline_retention SET enabled_at = ?, next_run = ?, retry_after = 0 WHERE id = 1')
+      .run(enabledAt, nextHistoryCleanupAt(enabledAt)));
+  }
+  return retentionState();
+}
+
+async function runRetention(now = Date.now()): Promise<Record<string, unknown>> {
+  if (!retention || retentionRunning || retentionStopped) return { skipped: true };
+  if (!Number.isSafeInteger(now) || now < 0 || now > 8.64e15 - retention.dayMs) throw new Error('Invalid retention clock');
+  retentionRunning = true;
+  try {
+    const config = readRetentionConfig();
+    if (!config) return { skipped: true };
+    const { days, enabledAt } = config;
+    const database = ensureDb();
+    const state = prepareRetentionSchedule(enabledAt);
+    if (now < Number(state.next_run) || now < Math.max(Number(state.retry_after), retentionRetryAfter)) return { ...state, skipped: true };
+    const cutoff = Math.max(retentionCutoff ?? 0, now - days * retention.dayMs);
+    // Fence imports before deletion, including a partially completed run. The
+    // tombstone is monotonic: increasing days/off cannot resurrect purged ranges.
+    retentionWrite(() => database.prepare('UPDATE timeline_retention SET cutoff = ? WHERE id = 1').run(cutoff));
+    retentionCutoff = cutoff;
+    const stillCurrent = (): boolean => {
+      const current = readRetentionConfig();
+      return !retentionStopped && current?.days === days && current.enabledAt === enabledAt;
+    };
+    let afterSession: string | null = null;
+    while (stillCurrent()) {
+      const session = (afterSession === null
+        ? database.prepare('SELECT session_id FROM timeline_projection_sessions ORDER BY session_id LIMIT 1').get()
+        : database.prepare('SELECT session_id FROM timeline_projection_sessions WHERE session_id > ? ORDER BY session_id LIMIT 1').get(afterSession)) as { session_id: string } | undefined;
+      if (!session) break;
+      let changed: number;
+      do {
+        if (!stillCurrent()) return { ...retentionState(), interrupted: true };
+        changed = 0;
+        // Short synchronous transactions finish before yielding to queued
+        // appends/reads/rebuilds. The existing session+ts index bounds each batch.
+        retentionWrite(() => runInTransaction(() => {
+          database.prepare(`INSERT OR IGNORE INTO timeline_projection_cursors(session_id, epoch, seq)
+            SELECT session_id, epoch, seq FROM timeline_projection_events
+            WHERE session_id = ? ORDER BY append_ordinal DESC LIMIT 1`).run(session.session_id);
+          changed = Number(database.prepare(`DELETE FROM timeline_projection_events WHERE rowid IN (
+            SELECT rowid FROM timeline_projection_events WHERE session_id = ?
+              AND ts >= 0 AND ts < ? AND ts <= 8640000000000000
+              AND typeof(ts) IN ('integer', 'real') AND ts = CAST(ts AS INTEGER)
+            ORDER BY ts LIMIT ?
+          )`).run(session.session_id, cutoff, retention.batchSize).changes);
+          database.prepare('UPDATE timeline_retention SET batches = batches + 1, deleted = deleted + ? WHERE id = 1').run(changed);
+        }));
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      } while (changed === retention.batchSize);
+      afterSession = session.session_id;
+    }
+    if (!stillCurrent()) return { ...retentionState(), interrupted: true };
+    // Downtime catches up ONCE; next run returns to the next local 03:00.
+    retentionWrite(() => database.prepare(`UPDATE timeline_retention SET last_success = ?, next_run = ?, retry_after = 0,
+      runs = runs + 1, last_error = NULL WHERE id = 1`).run(now, nextHistoryCleanupAt(now)));
+    return retentionState();
+  } catch (err) {
+    retentionRetryAfter = now + retention.retryMs;
+    try {
+      retentionWrite(() => ensureDb().prepare('UPDATE timeline_retention SET retry_after = ?, last_error = ? WHERE id = 1')
+        .run(now + retention.retryMs, err instanceof Error ? err.message : String(err)));
+    } catch { /* a locked/unavailable database may prevent even the progress write */ }
+    throw err;
+  } finally {
+    retentionRunning = false;
+  }
+}
+
+function scheduleRetention(): void {
+  if (!retention || retentionStopped || retentionRunning) return;
+  clearTimeout(retentionTimer);
+  try {
+    const config = readRetentionConfig();
+    if (!config) return; // Off means no cleanup timer and no new SQLite work.
+    const state = prepareRetentionSchedule(config.enabledAt);
+    const due = Math.max(Number(state.next_run), Number(state.retry_after), retentionRetryAfter);
+    // Timer cap also tolerates a system-clock rollback. Recheck the wall clock
+    // on wake, never run a future slot early.
+    const delay = Math.min(2_147_483_647, Math.max(1, due - Date.now()));
+    retentionTimer = setTimeout(() => {
+      void runRetention().then(scheduleRetention, (err) => {
+        console.warn('SQLite history retention failed; will retry:', err instanceof Error ? err.message : String(err));
+        clearTimeout(retentionTimer);
+        retentionTimer = setTimeout(scheduleRetention, retention.retryMs);
+        retentionTimer.unref();
+      });
+    }, delay);
+    retentionTimer.unref();
+  } catch (err) {
+    console.warn('SQLite history retention schedule failed; will retry:', err instanceof Error ? err.message : String(err));
+    retentionTimer = setTimeout(scheduleRetention, retention.retryMs);
+    retentionTimer.unref();
+  }
+}
+
 async function handleShutdown(): Promise<true> {
+  retentionStopped = true;
+  if (retentionTimer) clearTimeout(retentionTimer);
+  clearTimeout(retentionDebounce);
+  clearTimeout(retentionWatchRetry);
+  retentionWatcher?.close();
   parentPort?.close();
   return true;
 }
@@ -651,6 +823,8 @@ async function handleRequest(message: WorkerRequest): Promise<unknown> {
       return handleDeleteSession(message.payload.sessionId);
     case 'checkpointIfNeeded':
       return handleCheckpointIfNeeded();
+    case 'retentionTick':
+      return runRetention(message.payload.now);
     case 'shutdown':
       return handleShutdown();
   }
@@ -675,3 +849,30 @@ parentPort.on('message', async (message: WorkerRequest) => {
     parentPort?.postMessage(response);
   }
 });
+
+// Watch the directory, not the inode: CLI settings are atomically renamed.
+// No cron, poll loop, per-event expiry scan, or separate writer process.
+function watchRetentionSettings(): void {
+  if (!retention || retentionStopped) return;
+  const retry = (err: Error): void => {
+    console.warn('SQLite history retention settings watcher failed; will retry:', err.message);
+    retentionWatcher?.close();
+    clearTimeout(retentionWatchRetry);
+    retentionWatchRetry = setTimeout(watchRetentionSettings, retention.retryMs);
+    retentionWatchRetry.unref();
+  };
+  try {
+    mkdirSync(dirname(retention.configPath), { recursive: true });
+    retentionWatcher = watch(dirname(retention.configPath), { persistent: false }, (_event, name) => {
+      if (name !== null && name.toString() !== retention.configPath.split(/[\\/]/).pop()) return;
+      clearTimeout(retentionDebounce);
+      retentionDebounce = setTimeout(scheduleRetention, 50);
+      retentionDebounce.unref();
+    });
+    retentionWatcher.on('error', retry);
+    scheduleRetention();
+  } catch (err) {
+    retry(err instanceof Error ? err : new Error(String(err)));
+  }
+}
+watchRetentionSettings();

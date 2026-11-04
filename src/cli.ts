@@ -1298,6 +1298,23 @@ program
     console.log(JSON.stringify(outcome));
   });
 
+// SQLite chat retention only. JSONL/native CLI history keep their existing policies.
+program.command('history').description('Manage local SQLite chat history')
+  .command('keep [days-or-off]')
+  .description('Show retention, keep N days, or turn daily SQLite cleanup off')
+  .allowExcessArguments(false)
+  .addHelpText('after', '\nExamples: imcodes history keep 3 | imcodes history keep | imcodes history keep off\n' +
+    'Default: off. Cleanup runs at 03:00 in the daemon server local timezone; first enable waits until the next 03:00.\n' +
+    'JSONL cleanup is unchanged. Purged ranges are not restored from JSONL, even after off.\n' +
+    'Invalid/missing event timestamps are kept conservatively. No VACUUM is run.')
+  .action(async (value?: string) => {
+    const { getHistoryKeep, setHistoryKeep } = await import('./store/history-retention.js');
+    const keepDays = value === undefined ? getHistoryKeep() : setHistoryKeep(value);
+    console.log(JSON.stringify({ keepDays, note: value === undefined
+      ? 'SQLite chat retention; null means off. JSONL cleanup is unchanged.'
+      : 'Saved. A running daemon applies the schedule automatically; otherwise at next start. Cleanup is at server-local 03:00; purged ranges are not restored.' }));
+  });
+
 // ── Memory search CLI ────────────────────────────────────────────────────────
 
 const memoryCmd = program

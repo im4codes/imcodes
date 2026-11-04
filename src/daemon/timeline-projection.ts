@@ -1,3 +1,4 @@
+import { HISTORY_RETENTION, historyRetentionPath } from '../store/history-retention.js';
 import { Worker } from 'node:worker_threads';
 import { fileURLToPath } from 'node:url';
 import { extname, join } from 'node:path';
@@ -86,6 +87,8 @@ class TimelineProjectionClient {
   // that JSONL is no longer a read fallback.
   private consecutiveFailures = 0;
   private cooldownUntil = 0;
+  private retentionStarted = false;
+  private retentionRespawn?: NodeJS.Timeout;
 
   private ensureWorker(): Worker | null {
     if (this.worker) return this.worker;
@@ -94,7 +97,7 @@ class TimelineProjectionClient {
     if (this.cooldownUntil > Date.now()) return null;
     try {
       const worker = new Worker(getWorkerModuleUrl(), {
-        workerData: { dbPath: getProjectionDbPath(), stateDir: resolveImcodesHome() },
+        workerData: { dbPath: getProjectionDbPath(), stateDir: resolveImcodesHome(), retention: { ...HISTORY_RETENTION, configPath: historyRetentionPath() } },
         // Suppress the node:sqlite ExperimentalWarning at the worker boundary
         // (it fires on first node:sqlite load in every worker thread and floods
         // the log). Done via execArgv rather than a module-level emitWarning
@@ -106,12 +109,14 @@ class TimelineProjectionClient {
       worker.unref();
       worker.on('message', (message: ProjectionWorkerResponse) => this.handleWorkerMessage(message));
       worker.on('error', (err) => {
+        if (this.worker !== worker) return;
         logger.warn({ err }, 'TimelineProjection: worker failed');
         this.failAllPending(err instanceof Error ? err : new Error(String(err)));
         this.worker = null;
         this.scheduleWorkerCooldown();
       });
       worker.on('exit', (code) => {
+        if (this.worker !== worker) return;
         if (code !== 0) {
           logger.warn({ code }, 'TimelineProjection: worker exited unexpectedly');
         }
@@ -136,6 +141,11 @@ class TimelineProjectionClient {
       WORKER_RESPAWN_BASE_BACKOFF_MS * 2 ** (this.consecutiveFailures - 1),
     );
     this.cooldownUntil = Date.now() + backoff;
+    if (this.retentionStarted) {
+      clearTimeout(this.retentionRespawn);
+      this.retentionRespawn = setTimeout(() => this.ensureWorker(), backoff + 1);
+      this.retentionRespawn.unref();
+    }
   }
 
   private handleWorkerMessage(message: ProjectionWorkerResponse): void {
@@ -177,6 +187,12 @@ class TimelineProjectionClient {
       const request: ProjectionWorkerEnvelope<TOp> = { id, type, payload };
       worker.postMessage(request);
     });
+  }
+
+  /** Own the daily scheduler in the existing writer, including when no chat is active. */
+  startRetention(): void {
+    this.retentionStarted = true;
+    this.ensureWorker();
   }
 
   async recordAppendedEvent(event: TimelineEvent): Promise<void> {
@@ -300,6 +316,8 @@ class TimelineProjectionClient {
   }
 
   async shutdown(): Promise<void> {
+    this.retentionStarted = false;
+    clearTimeout(this.retentionRespawn);
     const worker = this.worker;
     this.worker = null;
     if (!worker) return;

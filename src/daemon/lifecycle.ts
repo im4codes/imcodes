@@ -702,6 +702,10 @@ export async function startup(): Promise<DaemonContext> {
     if (loaded > 0) logger.info({ loaded }, 'Memory short-ref index warmed');
   })().catch(() => { /* non-fatal: handles are a pure function of the id */ });
 
+  // Independent opt-in SQLite policy. The writer owns its timer and durable daily progress.
+  const { timelineProjection: retentionProjection } = await import('./timeline-projection.js');
+  retentionProjection.startRetention();
+
   // Clean up old timeline files (>7 days) and truncate oversized ones.
   //
   // Both calls walk every JSONL file in ~/.imcodes/timeline. With a backlog
