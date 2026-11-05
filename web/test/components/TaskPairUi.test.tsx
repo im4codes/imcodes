@@ -368,7 +368,7 @@ describe('TaskPairEventChip', () => {
 
       const splitBtn = container.querySelector('.task-pair-split-btn') as HTMLButtonElement;
       expect(splitBtn).toBeTruthy();
-      expect(splitBtn.textContent).toContain('taskPair.panel_open_split');
+      expect(splitBtn.getAttribute('aria-label')).toBe('taskPair.panel_open_split');
 
       fireEvent.click(splitBtn);
       expect(onSplit).toHaveBeenCalledWith({

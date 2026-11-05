@@ -15015,6 +15015,8 @@ button.quick-agent-delegation-preset.active {
 .task-pair-card-body,
 .task-pair-card-flags { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
 .task-pair-card-head { align-items: stretch; width: 100%; max-width: 100%; }
+.task-pair-card-head.has-split { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 8px; }
+.task-pair-card-head > .task-pair-split-btn { align-self: center; justify-content: center; width: 24px; height: 18px; padding: 0; box-sizing: border-box; line-height: 1; }
 .task-pair-card-toggle { display: flex; width: 100%; min-width: 0; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 0; border: 0; color: inherit; background: transparent; font: inherit; text-align: left; cursor: pointer; }
 .task-pair-card-toggle:hover .task-pair-card-heading strong { color: #ecfeff; }
 .task-pair-card-toggle:focus-visible { outline: 2px solid var(--chrome-accent); outline-offset: 3px; border-radius: 5px; }

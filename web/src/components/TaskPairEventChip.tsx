@@ -95,6 +95,10 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
   const hoverPreviewId = hoverPreviewIdRef.current;
   const event = payload as Partial<TaskPairEventPayload>;
   const taskId = typeof event.taskId === 'string' ? event.taskId : '—';
+  const canOpenSplit = !isMobile
+    && typeof event.executor === 'string' && !!event.executor && event.executor !== 'none'
+    && typeof event.auditor === 'string' && !!event.auditor && event.auditor !== 'none'
+    && activeSplitTaskId !== String(taskId);
   const writer = typeof event.writer === 'string' ? event.writer.trim() : '';
   const isCancelledEvent = event.toStatus === 'cancelled';
   const cancelActor = typeof event.cancelActor === 'string' && event.cancelActor.trim()
@@ -355,7 +359,7 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
       data-event-id={eventId}
       data-task-id={taskId}
     >
-      <header class="task-pair-card-head">
+      <header class={`task-pair-card-head${canOpenSplit ? ' has-split' : ''}`}>
         <button
           ref={toggleRef}
           type="button"
@@ -392,6 +396,21 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
           </span>
           {brainNoticeText && <span class={`task-pair-card-brain-notice is-${brainNotice!.status}`} data-brain-notice={brainNotice!.status}>{brainNoticeText}</span>}
         </button>
+        {canOpenSplit && <button
+          type="button"
+          class="task-pair-split-btn"
+          title={t('taskPair.panel_open_split')}
+          aria-label={t('taskPair.panel_open_split')}
+          onPointerEnter={closeHoverPreview}
+          onFocus={closeHoverPreview}
+          onClick={(e) => {
+            e.stopPropagation();
+            closeHoverPreview();
+            window.dispatchEvent(new CustomEvent('deck:pair-split', {
+              detail: { taskId: String(taskId), executor: event.executor, auditor: event.auditor, action: 'open' },
+            }));
+          }}
+        ><span class="task-pair-split-icon" aria-hidden="true">◫</span></button>}
       </header>
       {!isMobile && <div class="task-pair-card-overview">
         {verb && <span class="task-pair-card-event-meta">{verb}</span>}
@@ -414,33 +433,6 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
           {isMobile && roleLabel(event.executor, event.executorLabel, event.executorModel, event.executorThinking, 'executor')}
           {isMobile && roleLabel(event.auditor, event.auditorLabel, event.auditorModel, event.auditorThinking, 'auditor')}
           {isStatus(event.toStatus) && <TaskPairEventDecisions key={taskId} taskId={taskId} status={event.toStatus} />}
-          {!isMobile && typeof event.executor === 'string' && event.executor && event.executor !== 'none' && typeof event.auditor === 'string' && event.auditor && event.auditor !== 'none' && (() => {
-            const taskIdStr = String(taskId);
-            // The active pair exits from either window's titlebar.
-            if (activeSplitTaskId === taskIdStr) return null;
-            return (
-              <button
-                type="button"
-                class="task-pair-split-btn"
-                title={t('taskPair.panel_open_split')}
-                aria-label={t('taskPair.panel_open_split')}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  window.dispatchEvent(new CustomEvent('deck:pair-split', {
-                    detail: {
-                      taskId: taskIdStr,
-                      executor: event.executor,
-                      auditor: event.auditor,
-                      action: 'open',
-                    },
-                  }));
-                }}
-              >
-                <span class="task-pair-split-icon" aria-hidden="true">◫</span>
-                <span class="task-pair-split-text">{t('taskPair.panel_open_split')}</span>
-              </button>
-            );
-          })()}
           {isCancelledEvent && <div class="task-pair-card-cancel-meta" data-cancel-provenance="true">
             <span>{t('taskPair.card_cancel_actor', { value: cancelActor || t('taskPair.card_cancel_unknown') })}</span>
             <span>{t('taskPair.card_cancel_source', { value: cancelSource ? t(`taskPair.cancel_source.${cancelSource}`, { defaultValue: cancelSource }) : t('taskPair.card_cancel_unknown') })}</span>
