@@ -4764,6 +4764,7 @@
     "audited": "감사",
     "panel_collapse": "작업 상태 접기",
     "panel_expand": "작업 상태 펼치기",
+    "panel_resize": "드래그하여 작업 패널 너비 조절",
     "brief_expand": "작업 내용 표시",
     "brief_collapse": "작업 내용 숨기기",
     "brief_copy": "작업 내용 복사",

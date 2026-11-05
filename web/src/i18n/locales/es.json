@@ -4765,6 +4765,7 @@
     "audited": "Auditado",
     "panel_collapse": "Contraer estado de tareas",
     "panel_expand": "Expandir estado de tareas",
+    "panel_resize": "Arrastra para ajustar el ancho de tareas",
     "brief_expand": "Mostrar contenido",
     "brief_collapse": "Ocultar contenido",
     "brief_copy": "Copiar resumen",

@@ -4775,6 +4775,7 @@
     "audited": "Audited",
     "panel_collapse": "Collapse task status",
     "panel_expand": "Expand task status",
+    "panel_resize": "Drag to resize task status",
     "brief_expand": "Show task content",
     "brief_collapse": "Hide task content",
     "brief_copy": "Copy brief",

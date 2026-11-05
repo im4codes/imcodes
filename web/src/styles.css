@@ -15134,6 +15134,8 @@ button.quick-agent-delegation-preset.active {
   flex-direction: column;
   min-height: 0;
 }
+.task-pair-status-resize { position: absolute; inset: 0 auto 0 0; width: 8px; z-index: 2; cursor: col-resize; touch-action: none; }
+.task-pair-status-resize:hover, .task-pair-status-resize:focus-visible { background: color-mix(in srgb, var(--chrome-accent) 35%, transparent); outline: none; }
 .task-pair-status-panel.is-collapsed {
   position: static; inset: auto; width: auto; max-width: none; height: auto; max-height: none;
   margin: 0; border: 0; background: transparent; box-shadow: none;

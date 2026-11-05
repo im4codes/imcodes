@@ -916,6 +916,8 @@ export type TaskPairVerb = typeof TASK_PAIR_VERBS[number];
 export const TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION = 'awaiting_brain_decision' as const;
 /** Display-only failure status used by task reference projections. */
 export const TASK_PAIR_STATUS_FAILED = 'failed' as const;
+/** Browser-local desktop width, shared by all servers and sessions on this device. */
+export const TASK_PAIR_STATUS_PANEL_WIDTH_STORAGE_KEY = 'imcodes.task-pair-panel-width.v1';
 /** Local-storage namespace for the web task-pair status panel (layout suffix is added by the UI). */
 export const TASK_PAIR_STATUS_PANEL_STORAGE_KEY = 'imcodes.task-pair-status-panel.collapsed' as const;
 export const TASK_PAIR_STATUSES = [

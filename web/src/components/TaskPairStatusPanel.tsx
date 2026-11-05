@@ -4,6 +4,7 @@ import { taskPairWaitKind, readPairScheduling, TASK_PAIR_WAIT_KINDS, type TaskPa
 import { taskPairDisplayTitle, taskPairResolveDisplaySessionLabel } from '@shared/task-pair-display.js';
 import { isMobileLayout } from '../mobile-device.js';
 import { bindTaskPairPanelFit } from '../task-pair-panel-fit.js';
+import { useTaskPairPanelWidth } from '../task-pair-panel-width.js';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
@@ -254,10 +255,11 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     else if (value === 'queued') result.queued += 1;
     return result;
   }, { working: 0, audit: 0, queued: 0, awaitingBrain: 0, waiting: 0 });
-  if (latest.size === 0 || allRows.length === 0) return null;
   // What is shown: the user's own choice if there is one, else the default (a phone sub-session: closed); too little room on a phone
   // shows the strip without touching the choice.
   const collapsed = resolveTaskPairPanelCollapsed({ choice, mobile: isMobile, phone, scopeSessionId, collapsedVisitKey }) || (isMobile && cramped);
+  const panelWidth = useTaskPairPanelWidth(panelRef, !isMobile && !collapsed && allRows.length > 0);
+  if (latest.size === 0 || allRows.length === 0) return null;
   const toggle = () => persistCollapsed(!collapsed);
   const toggleWithKeyboard = (event: KeyboardEvent) => {
     if (event.key !== 'Enter' && event.key !== ' ') return;
@@ -306,6 +308,10 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
       <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--awaiting_brain_decision">{t('taskPair.status.awaiting_brain_decision')} ({counts.awaitingBrain})</span>
     </span><span class="task-pair-status-collapse-icon" aria-hidden="true">⌃</span></>;
   return <aside ref={panelRef} class={`task-pair-status-panel${collapsed ? ' is-collapsed' : ''}${isMobile ? ' is-mobile' : ' is-desktop'}`} data-testid="task-pair-status-panel">
+    {!isMobile && !collapsed && <div class="task-pair-status-resize" role="separator" tabIndex={0}
+      aria-label={t('taskPair.panel_resize')} title={t('taskPair.panel_resize')} aria-orientation="vertical"
+      aria-valuemin={panelWidth.min} aria-valuemax={panelWidth.max} aria-valuenow={panelWidth.width}
+      onPointerDown={panelWidth.onPointerDown} onKeyDown={panelWidth.onKeyDown} />}
     {isMobile && collapsed ? <div class="task-pair-status-toggle task-pair-status-compact" role="button" tabIndex={0} aria-expanded={false} aria-label={toggleLabel} title={t('taskPair.panel_expand')} onClick={toggle} onKeyDown={toggleWithKeyboard}>
       {toggleContent}
     </div> : <button type="button" class="task-pair-status-toggle" aria-expanded={!collapsed} aria-label={toggleLabel} title={t(collapsed ? 'taskPair.panel_expand' : 'taskPair.panel_collapse')} onClick={toggle}>
