@@ -1,6 +1,7 @@
 /** @vitest-environment jsdom */
 import { act, cleanup, fireEvent, render } from '@testing-library/preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { TASK_PAIR_STATUS_PANEL_SECONDARY_WIDTH_STORAGE_KEY } from '@shared/task-pair.js';
 import { TaskPairStatusPanel } from '../../src/components/TaskPairStatusPanel.js';
 import { TASK_PAIR_PANEL_WIDTH_KEY, readTaskPairPanelWidth, taskPairPanelWidthBounds } from '../../src/task-pair-panel-width.js';
 import { resetTaskPairPanelMemoryForTests } from '../../src/task-pair-panel-state.js';
@@ -12,9 +13,10 @@ class TestPointerEvent extends MouseEvent {
   pointerId: number;
   constructor(type: string, init: PointerEventInit = {}) { super(type, init); this.pointerId = init.pointerId ?? 1; }
 }
-function mount() {
-  return render(<div class="chat-view-wrap"><TaskPairStatusPanel events={events} serverId="width-server" /></div>);
+function markup(secondary = false, split = false) {
+  return <div class="chat-view-wrap"><TaskPairStatusPanel events={events} serverId="width-server" scopeSessionId={secondary ? 'deck_sub_width' : undefined} collapsedVisitKey={split ? 'split-task' : undefined} /></div>;
 }
+function mount(secondary = false, split = false) { return render(markup(secondary, split)); }
 const separator = (container: HTMLElement) => container.querySelector('[role="separator"]') as HTMLElement;
 const pointer = (target: EventTarget, type: string, x: number, id = 1) => act(() => { target.dispatchEvent(new TestPointerEvent(type, { bubbles: true, clientX: x, pointerId: id, button: 0 })); });
 const width = (container: HTMLElement) => container.querySelector<HTMLElement>('.chat-view-wrap')!.style.getPropertyValue('--task-pair-panel-width');
@@ -100,8 +102,48 @@ describe('desktop pair panel width', () => {
   it.each(['', 'garbage', 'null', 'Infinity', '-10', '0'])('safely defaults invalid storage %j', (raw) => {
     localStorage.setItem(TASK_PAIR_PANEL_WIDTH_KEY, raw); expect(readTaskPairPanelWidth()).toBe(300);
   });
+  it.each([false, true])('caps sub/split windows at 40%% and keeps their local preference separate (split=%s)', (split) => {
+    localStorage.setItem(TASK_PAIR_PANEL_WIDTH_KEY, '700');
+    const main = mount(); const child = mount(true, split);
+    if (!separator(child.container)) fireEvent.click(child.container.querySelector('.task-pair-status-toggle')!);
+    expect(width(main.container)).toBe('700px');
+    expect(width(child.container)).toBe('300px');
+    fireEvent.keyDown(separator(child.container), { key: 'End' });
+    expect(width(child.container)).toBe('512px'); expect(width(main.container)).toBe('700px');
+    expect(localStorage.getItem(TASK_PAIR_PANEL_WIDTH_KEY)).toBe('700');
+    expect(localStorage.getItem(TASK_PAIR_STATUS_PANEL_SECONDARY_WIDTH_STORAGE_KEY)).toBe('512');
+    available = 500; act(() => { window.dispatchEvent(new Event('resize')); });
+    expect(width(child.container)).toBe('200px');
+    expect(localStorage.getItem(TASK_PAIR_PANEL_WIDTH_KEY)).toBe('700');
+    available = 1280; act(() => { window.dispatchEvent(new Event('resize')); });
+    expect(width(main.container)).toBe('700px'); expect(width(child.container)).toBe('512px');
+    fireEvent.keyDown(separator(main.container), { key: 'End' });
+    expect(width(main.container)).toBe('720px'); expect(width(child.container)).toBe('512px');
+    child.unmount(); const restored = mount(true, split);
+    if (!separator(restored.container)) fireEvent.click(restored.container.querySelector('.task-pair-status-toggle')!);
+    expect(width(restored.container)).toBe('512px');
+  });
+  it('switching main/sub scope retires an in-flight drag without writing either preference', () => {
+    localStorage.setItem(TASK_PAIR_PANEL_WIDTH_KEY, '700');
+    localStorage.setItem(TASK_PAIR_STATUS_PANEL_SECONDARY_WIDTH_STORAGE_KEY, '300');
+    const view = mount(); pointer(separator(view.container), 'pointerdown', 900); pointer(window, 'pointermove', 800);
+    view.rerender(markup(true)); pointer(window, 'pointerup', 700);
+    expect(width(view.container)).toBe('300px');
+    expect(localStorage.getItem(TASK_PAIR_PANEL_WIDTH_KEY)).toBe('700');
+    expect(localStorage.getItem(TASK_PAIR_STATUS_PANEL_SECONDARY_WIDTH_STORAGE_KEY)).toBe('300');
+    view.rerender(markup()); expect(width(view.container)).toBe('700px');
+  });
+  it('applies storage events only to the matching width scope', () => {
+    localStorage.setItem(TASK_PAIR_PANEL_WIDTH_KEY, '700');
+    const main = mount(); const child = mount(true);
+    localStorage.setItem(TASK_PAIR_STATUS_PANEL_SECONDARY_WIDTH_STORAGE_KEY, '400');
+    act(() => { window.dispatchEvent(new StorageEvent('storage', { key: TASK_PAIR_STATUS_PANEL_SECONDARY_WIDTH_STORAGE_KEY })); });
+    expect(width(main.container)).toBe('700px'); expect(width(child.container)).toBe('400px');
+  });
   it('keeps minimum/maximum bounded even in a very narrow split pane', () => {
     expect(taskPairPanelWidthBounds(100)).toEqual({ min: 65, max: 65 });
     expect(taskPairPanelWidthBounds(1280)).toEqual({ min: 240, max: 720 });
+    expect(taskPairPanelWidthBounds(500, true)).toEqual({ min: 200, max: 200 });
+    expect(taskPairPanelWidthBounds(1280, true)).toEqual({ min: 240, max: 512 });
   });
 });

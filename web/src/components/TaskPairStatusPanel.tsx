@@ -258,7 +258,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
   // What is shown: the user's own choice if there is one, else the default (a phone sub-session: closed); too little room on a phone
   // shows the strip without touching the choice.
   const collapsed = resolveTaskPairPanelCollapsed({ choice, mobile: isMobile, phone, scopeSessionId, collapsedVisitKey }) || (isMobile && cramped);
-  const panelWidth = useTaskPairPanelWidth(panelRef, !isMobile && !collapsed && allRows.length > 0);
+  const panelWidth = useTaskPairPanelWidth(panelRef, !isMobile && !collapsed && allRows.length > 0, Boolean(scopeSessionId || collapsedVisitKey));
   if (latest.size === 0 || allRows.length === 0) return null;
   const toggle = () => persistCollapsed(!collapsed);
   const toggleWithKeyboard = (event: KeyboardEvent) => {

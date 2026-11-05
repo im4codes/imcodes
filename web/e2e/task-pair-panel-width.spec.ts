@@ -1,5 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
-import { TASK_PAIR_STATUS_PANEL_WIDTH_STORAGE_KEY as TASK_PAIR_PANEL_WIDTH_KEY } from '../../shared/task-pair.js';
+import { TASK_PAIR_STATUS_PANEL_WIDTH_STORAGE_KEY as TASK_PAIR_PANEL_WIDTH_KEY, TASK_PAIR_STATUS_PANEL_SECONDARY_WIDTH_STORAGE_KEY } from '../../shared/task-pair.js';
 const URL = '/src/fixtures/chat-timeline/index.html?size=smoke&rows=1&pairControls=1';
 async function publish(page: Page) {
   await page.evaluate(() => (window as any).__chatTimelineHarness.setEvents([{ eventId: 'width-event', sessionId: 'fixture-window-0', type: 'task_pair.event', ts: 1700000000000, seq: 1, epoch: 0, source: 'daemon', confidence: 'high', payload: { taskId: 'width-task', title: 'Synthetic resizable task', writer: 'daemon', verb: 'WORKING', toStatus: 'working', executor: 'fixture-window-0', auditor: 'fixture-auditor' } }]));
@@ -54,3 +54,25 @@ test('phone keeps its original layout and never offers resizing', async ({ page 
   expect(await page.evaluate(key => localStorage.getItem(key), TASK_PAIR_PANEL_WIDTH_KEY)).toBeNull();
   expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
 });
+
+for (const extra of ['&scope=1', '&scope=1&visit=split-task']) {
+  test(`sub/split task sidebar stays below 40% without altering main width (${extra})`, async ({ page }) => {
+    await open(page);
+    await panel(page).getByRole('separator').focus(); await page.keyboard.press('End');
+    expect((await dimensions(page)).width).toBeCloseTo(720, 0);
+    await page.goto(URL + extra); await page.waitForFunction(() => (window as any).__chatTimelineHarness?.ready); await publish(page);
+    if (await panel(page).locator('.task-pair-status-toggle').getAttribute('aria-expanded') === 'false') await panel(page).locator('.task-pair-status-toggle').click();
+    const handle = panel(page).getByRole('separator');
+    await handle.focus(); await page.keyboard.press('End');
+    let size = await dimensions(page); expect(size.width).toBeLessThanOrEqual(size.wrap * 0.4); expect(size.width).toBeCloseTo(512, 0);
+    await page.locator('.chat-timeline-fixture-window').evaluate(e => { e.style.width = '500px'; });
+    await expect.poll(async () => (await dimensions(page)).width).toBeCloseTo(200, 0);
+    const h = (await handle.boundingBox())!;
+    await page.mouse.move(h.x + 3, h.y + 60); await page.mouse.down(); await page.mouse.move(h.x - 200, h.y + 60, { steps: 4 }); await page.mouse.up();
+    size = await dimensions(page); expect(size.width).toBeLessThanOrEqual(size.wrap * 0.4); expect(size.padding).toBeCloseTo(size.width + 12, 0);
+    expect(await page.evaluate(key => localStorage.getItem(key), TASK_PAIR_PANEL_WIDTH_KEY)).toBe('720');
+    expect(await page.evaluate(key => localStorage.getItem(key), TASK_PAIR_STATUS_PANEL_SECONDARY_WIDTH_STORAGE_KEY)).toBe('200');
+    await page.goto(URL); await page.waitForFunction(() => (window as any).__chatTimelineHarness?.ready); await publish(page);
+    await expect.poll(async () => (await dimensions(page)).width).toBeCloseTo(720, 0);
+  });
+}

@@ -918,6 +918,8 @@ export const TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION = 'awaiting_brain_decision
 export const TASK_PAIR_STATUS_FAILED = 'failed' as const;
 /** Browser-local desktop width, shared by all servers and sessions on this device. */
 export const TASK_PAIR_STATUS_PANEL_WIDTH_STORAGE_KEY = 'imcodes.task-pair-panel-width.v1';
+/** Split/sub-window widths must never overwrite the main chat's preference. */
+export const TASK_PAIR_STATUS_PANEL_SECONDARY_WIDTH_STORAGE_KEY = `${TASK_PAIR_STATUS_PANEL_WIDTH_STORAGE_KEY}.secondary`;
 /** Local-storage namespace for the web task-pair status panel (layout suffix is added by the UI). */
 export const TASK_PAIR_STATUS_PANEL_STORAGE_KEY = 'imcodes.task-pair-status-panel.collapsed' as const;
 export const TASK_PAIR_STATUSES = [

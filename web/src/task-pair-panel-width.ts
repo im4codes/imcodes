@@ -2,53 +2,59 @@ import { useLayoutEffect, useRef, useState } from 'preact/hooks';
 import type { RefObject } from 'preact';
 
 // Browser-local presentation preference, deliberately independent of server/session.
-import { TASK_PAIR_STATUS_PANEL_WIDTH_STORAGE_KEY as TASK_PAIR_PANEL_WIDTH_KEY } from '@shared/task-pair.js';
+import { TASK_PAIR_STATUS_PANEL_WIDTH_STORAGE_KEY as TASK_PAIR_PANEL_WIDTH_KEY, TASK_PAIR_STATUS_PANEL_SECONDARY_WIDTH_STORAGE_KEY } from '@shared/task-pair.js';
 export { TASK_PAIR_PANEL_WIDTH_KEY };
-const WIDTH_CHANGED = `${TASK_PAIR_PANEL_WIDTH_KEY}:changed`;
 const WIDTH_VAR = '--task-pair-panel-width';
 const DEFAULT_WIDTH = 300;
 const MIN_WIDTH = 240;
 const MAX_WIDTH = 720;
 
-export function taskPairPanelWidthBounds(available: number) {
-  const max = Math.max(1, Math.min(MAX_WIDTH, Math.floor(available * 0.65)));
+export function taskPairPanelWidthBounds(available: number, secondary = false) {
+  const max = Math.max(1, Math.min(MAX_WIDTH, Math.floor(available * (secondary ? 0.4 : 0.65))));
   return { min: Math.min(MIN_WIDTH, max), max };
 }
 
-export function readTaskPairPanelWidth(): number {
+export function readTaskPairPanelWidth(key = TASK_PAIR_PANEL_WIDTH_KEY): number {
   try {
-    const raw = window.localStorage.getItem(TASK_PAIR_PANEL_WIDTH_KEY);
+    const raw = window.localStorage.getItem(key);
     const value = raw === null ? NaN : Number(raw);
-    return Number.isFinite(value) && value > 0 ? Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, value)) : DEFAULT_WIDTH;
+    return Number.isFinite(value) && value > 0 ? Math.min(MAX_WIDTH, value) : DEFAULT_WIDTH;
   } catch { return DEFAULT_WIDTH; }
 }
 
 /** One local width drives both the panel and its chat/pinned-message reservation. */
-export function useTaskPairPanelWidth(panelRef: RefObject<HTMLElement>, enabled: boolean) {
-  const [preferred, setPreferred] = useState(readTaskPairPanelWidth);
+export function useTaskPairPanelWidth(panelRef: RefObject<HTMLElement>, enabled: boolean, secondary = false) {
+  const storageKey = secondary ? TASK_PAIR_STATUS_PANEL_SECONDARY_WIDTH_STORAGE_KEY : TASK_PAIR_PANEL_WIDTH_KEY;
+  const changedEvent = `${storageKey}:changed`;
+  const [preference, setPreference] = useState(() => ({ key: storageKey, width: readTaskPairPanelWidth(storageKey) }));
+  // Scope can change without a remount. Never temporarily reuse the other
+  // scope's width or let a pointer gesture commit into its storage key.
+  const preferred = preference.key === storageKey ? preference.width : readTaskPairPanelWidth(storageKey);
+  const setPreferred = (next: number) => setPreference({ key: storageKey, width: next });
   const [available, setAvailable] = useState(() => window.innerWidth);
   const stopDrag = useRef<(() => void) | null>(null);
-  const bounds = taskPairPanelWidthBounds(available);
+  const bounds = taskPairPanelWidthBounds(available, secondary);
   const clamp = (value: number) => Math.min(bounds.max, Math.max(bounds.min, Math.round(value)));
   const width = clamp(preferred);
   const persist = (next: number) => {
     setPreferred(next);
-    try { window.localStorage.setItem(TASK_PAIR_PANEL_WIDTH_KEY, String(next)); } catch { /* current panel remains usable */ }
-    window.dispatchEvent(new CustomEvent<number>(WIDTH_CHANGED, { detail: next }));
+    try { window.localStorage.setItem(storageKey, String(next)); } catch { /* current panel remains usable */ }
+    window.dispatchEvent(new CustomEvent<number>(changedEvent, { detail: next }));
   };
   useLayoutEffect(() => {
+    setPreferred(readTaskPairPanelWidth(storageKey));
     const sync = (event: Event) => {
       if (event instanceof StorageEvent) {
-        if (event.key !== TASK_PAIR_PANEL_WIDTH_KEY && event.key !== null) return;
-        setPreferred(readTaskPairPanelWidth());
+        if (event.key !== storageKey && event.key !== null) return;
+        setPreferred(readTaskPairPanelWidth(storageKey));
       } else {
         setPreferred((event as CustomEvent<number>).detail);
       }
     };
     window.addEventListener('storage', sync);
-    window.addEventListener(WIDTH_CHANGED, sync);
-    return () => { window.removeEventListener('storage', sync); window.removeEventListener(WIDTH_CHANGED, sync); };
-  }, []);
+    window.addEventListener(changedEvent, sync);
+    return () => { stopDrag.current?.(); window.removeEventListener('storage', sync); window.removeEventListener(changedEvent, sync); };
+  }, [storageKey, changedEvent]);
   useLayoutEffect(() => {
     if (!enabled) return;
     const panel = panelRef.current;
