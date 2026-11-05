@@ -4672,10 +4672,20 @@
       "reassign": "reassigned",
       "cancel": "cancelled",
       "next_round": "next round opened",
-      "send": "sent materials",
+      "send": "Task message sent",
       "import": "imported",
       "notice": "notice",
-      "other": "recorded"
+      "other": "recorded",
+      "claim": "Resource claim updated",
+      "check": "Checklist updated",
+      "title": "Task title updated",
+      "material": "Audit material updated",
+      "checklist_auto_tick": "Checklist automatically updated",
+      "brain_resolved": "Brain reply received",
+      "decision": "Decision submitted",
+      "decision_request": "Decision information updated",
+      "brief_updated": "Task brief updated",
+      "correct": "Imported status corrected"
     },
     "status": {
       "queued": "Queued",
@@ -4834,6 +4844,26 @@
         "feedback": "Human feedback",
         "decision": "Brain ruling"
       }
+    },
+    "action": {
+      "output_saved": "Deliverable saved",
+      "output_failed": "Deliverable save failed",
+      "workspace_moved": "Workspace moved",
+      "workspace_adopted": "Existing workspace adopted",
+      "workspace_duplicate": "Duplicate workspace detected",
+      "workspace_move_deferred": "Workspace move deferred",
+      "workspace_move_failed": "Workspace move failed",
+      "non_git_mode": "Workspace mode selected",
+      "apply_back_applied": "Workspace changes applied",
+      "apply_back_noop": "No workspace changes to apply",
+      "apply_back_conflict": "Workspace changes conflicted",
+      "apply_back_failed": "Workspace changes failed",
+      "apply_back_undone": "Applied workspace changes undone",
+      "workspace_provisioned_late": "Workspace provisioned",
+      "material_held": "Audit material held",
+      "delivery_updated": "Message delivery updated",
+      "brain_notice_updated": "Brain notification updated",
+      "dispatch_updated": "Task dispatch updated"
     }
   }
 }

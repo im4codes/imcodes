@@ -297,3 +297,105 @@ test('separate tasks with equal role labels do not share expansion or navigation
   await expect(page.locator('.task-pair-card-body')).toHaveCount(0);
   await page.locator('.task-pair-card-toggle').click(); await expectContained(page);
 });
+
+for (const width of [320, 390, 1280]) {
+  test(`concrete Pair actions and absent unknown rows at ${width}px`, async ({ page }, info) => {
+    await open(page, width, 'zh-CN');
+    await page.evaluate(() => {
+      (window as any).__actionRequests = 0;
+      window.addEventListener('fixture:decision-request', () => (window as any).__actionRequests++);
+    });
+    const samples = [
+      { verb: 'CHECK', label: '验收项已更新' },
+      { verb: 'CLAIM', label: '资源占用已更新' },
+      { verb: 'SEND', label: '任务消息已发送' },
+      { verb: 'TITLE', label: '任务标题已更新' },
+      { verb: 'DECISION_REQUEST', label: '决策信息已更新' },
+      { verb: 'WORKSPACE', effect: 'output_failed', label: '产物保存失败' },
+      { verb: 'FUTURE_EVENT', label: undefined },
+      { verb: undefined, label: undefined },
+    ];
+    const measurements: unknown[] = [];
+    for (const sample of samples) {
+      const { label, ...fields } = sample;
+      const input = pair({ ...fields, writer: '', summary: undefined, toStatus: 'working', password: 'fixture-secret', diagnostic: 'Safe <&> detail', executorModel:'fixture-model', auditorModel:'fixture-model' });
+      await publish(page, [input]);
+      const toggle = page.locator('.task-pair-card-toggle');
+      if (await toggle.getAttribute('aria-expanded') === 'true') await toggle.click();
+      const compact = (await page.locator('.task-pair-event-card').boundingBox())!.height;
+      // Capture before action assertions, so the exact-base control records
+      // identical-payload dimensions even when old labels fail.
+      measurements.push({ verb: fields.verb ?? null, compact });
+      await info.attach(`compact-${fields.verb || 'missing'}`, { body:JSON.stringify({width,verb:fields.verb ?? null,compact}), contentType:'application/json' });
+      if (width === 1280) {
+        await page.mouse.move(1,1);
+        await toggle.hover();
+        await expect(page.locator('.task-pair-card-hover-preview')).toBeVisible();
+        await expect(page.locator('.task-pair-card-hover-preview')).toHaveCSS('opacity','1');
+        const row = page.locator('.task-pair-card-hover-preview-event');
+        if (label) await expect(row).toHaveText(label);
+        else await expect(row).toHaveCount(0);
+        await page.screenshot({path:info.outputPath(`hover-${fields.verb || 'missing'}.png`)});
+        await page.locator('.task-pair-card-hover-preview .task-pair-chip-session').first().focus();
+        await page.keyboard.press('Escape');
+        await expect(page.locator('.task-pair-card-hover-preview')).toHaveCount(0);
+        await toggle.focus();
+        await expect(page.locator('.task-pair-card-hover-preview')).toBeVisible();
+        await expect(page.locator('.task-pair-card-hover-preview')).toHaveCSS('opacity','1');
+        await page.locator('.task-pair-card-hover-preview .task-pair-chip-session').first().focus();
+        await page.keyboard.press('Escape');
+      }
+      if (width > 720) {
+        const overview = page.locator('.task-pair-card-overview > .task-pair-card-event-meta');
+        if (label) await expect(overview).toHaveText(label);
+        else await expect(overview).toHaveCount(0);
+      }
+      await page.screenshot({path:info.outputPath(`compact-${fields.verb || 'missing'}.png`)});
+      await toggle.click();
+      if (label) {
+        await expect(page.locator('.task-pair-chip-text')).toContainText(fields.verb === 'WORKSPACE' ? '成果未保存' : label);
+        await expect(page.locator('.task-pair-card-body > .task-pair-card-event-meta')).toContainText(label);
+      } else {
+        await expect(page.locator('.task-pair-chip-text')).toHaveCount(0);
+        await expect(page.locator('.task-pair-card-body > .task-pair-card-event-meta')).toHaveCount(0);
+      }
+      await expect(page.locator('.task-pair-event-card')).not.toContainText(/taskPair\.verb|已记录|undefined/);
+      await expect(page.locator('.task-pair-chip-status')).toContainText('执行中');
+      await expect(page.locator('.task-pair-card-role')).toHaveCount(2);
+      if (width <= 720) await expectContained(page);
+      await page.locator('.task-pair-card-payload summary').click();
+      const payload = page.locator('.task-pair-card-payload pre');
+      await expect(payload).toContainText('Safe <&> detail');
+      await expect(payload).not.toContainText('fixture-secret');
+      await page.screenshot({path:info.outputPath(`expanded-${fields.verb || 'missing'}.png`)});
+      const requests = await page.evaluate(() => (window as any).__actionRequests);
+      for (let i = 0; i < 3; i++) await publish(page, [{...input,payload:{...input.payload,diagnostic:`Safe redraw ${i}`}}]);
+      expect(await page.evaluate(() => (window as any).__actionRequests)).toBe(requests);
+      await toggle.click();
+      expect((await page.locator('.task-pair-event-card').boundingBox())!.height).toBeCloseTo(compact, 0);
+    }
+    await info.attach('action-dimensions', { body:JSON.stringify(measurements), contentType:'application/json' });
+  });
+}
+
+test('Pair action compact dimensions remain bounded for identical payloads', async ({ page }, info) => {
+  const dimensions: unknown[] = [];
+  for (const width of [320,390,1280]) {
+    await open(page,width,'zh-CN');
+    for (const verb of ['CHECK','CLAIM','SEND','TITLE','DECISION_REQUEST','WORKSPACE','FUTURE_EVENT',null]) {
+      await publish(page,[pair({verb,effect:'output_failed',writer:'',summary:undefined,toStatus:'working',executorModel:'fixture-model',auditorModel:'fixture-model'})]);
+      const card = page.locator('.task-pair-event-card');
+      dimensions.push({width,verb,compact:(await card.boundingBox())!.height});
+      if (width <= 720) expect((await card.boundingBox())!.height).toBeLessThanOrEqual(width === 320 ? 97 : 65);
+      if (width === 1280) {
+        await page.locator('.task-pair-card-toggle').hover();
+        await expect(page.locator('.task-pair-card-hover-preview')).toBeVisible();
+        await expect(page.locator('.task-pair-card-hover-preview')).toHaveCSS('opacity','1');
+        dimensions.push({width,verb,hover:(await page.locator('.task-pair-card-hover-preview').boundingBox())!.height});
+        await page.mouse.move(1,1);
+        await expect(page.locator('.task-pair-card-hover-preview')).toHaveCount(0);
+      }
+    }
+  }
+  await info.attach('identical-payload-dimensions',{body:JSON.stringify(dimensions),contentType:'application/json'});
+});

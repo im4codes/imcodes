@@ -4662,10 +4662,20 @@
       "reassign": "reasignada",
       "cancel": "cancelada",
       "next_round": "siguiente ronda abierta",
-      "send": "materiales enviados",
+      "send": "Mensaje de tarea enviado",
       "import": "importada",
       "notice": "aviso",
-      "other": "registrada"
+      "other": "registrada",
+      "claim": "Reserva de recurso actualizada",
+      "check": "Lista de verificación actualizada",
+      "title": "Título de tarea actualizado",
+      "material": "Material de auditoría actualizado",
+      "checklist_auto_tick": "Lista actualizada automáticamente",
+      "brain_resolved": "Respuesta de Brain recibida",
+      "decision": "Decisión presentada",
+      "decision_request": "Información de decisión actualizada",
+      "brief_updated": "Descripción de tarea actualizada",
+      "correct": "Estado importado corregido"
     },
     "status": {
       "queued": "En cola",
@@ -4824,6 +4834,26 @@
         "feedback": "Comentarios humanos",
         "decision": "Decisión de Brain"
       }
+    },
+    "action": {
+      "output_saved": "Resultado guardado",
+      "output_failed": "Error al guardar el resultado",
+      "workspace_moved": "Espacio de trabajo movido",
+      "workspace_adopted": "Espacio existente adoptado",
+      "workspace_duplicate": "Espacio duplicado detectado",
+      "workspace_move_deferred": "Movimiento del espacio aplazado",
+      "workspace_move_failed": "Error al mover el espacio",
+      "non_git_mode": "Modo del espacio seleccionado",
+      "apply_back_applied": "Cambios del espacio aplicados",
+      "apply_back_noop": "Sin cambios del espacio que aplicar",
+      "apply_back_conflict": "Conflicto en cambios del espacio",
+      "apply_back_failed": "Error al aplicar cambios del espacio de trabajo",
+      "apply_back_undone": "Cambios del espacio deshechos",
+      "workspace_provisioned_late": "Espacio de trabajo preparado",
+      "material_held": "Material de auditoría retenido",
+      "delivery_updated": "Entrega del mensaje actualizada",
+      "brain_notice_updated": "Notificación de Brain actualizada",
+      "dispatch_updated": "Envío de tarea actualizado"
     }
   }
 }

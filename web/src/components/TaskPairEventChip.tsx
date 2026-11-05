@@ -1,3 +1,4 @@
+import { normalizeTaskPairEventVerb, taskPairEventAction } from '../task-pair-event-action.js';
 import { TaskPairEventDecisions } from './TaskPairEventDecisions.js';
 import { taskPairDisplayTitle, taskPairResolveDisplaySessionLabel } from '@shared/task-pair-display.js';
 import { useTranslation } from 'react-i18next';
@@ -9,8 +10,6 @@ import {
   TASK_PAIR_BRAIN_NOTICE_STATUSES,
   TASK_PAIR_NOTICE_VERB,
   TASK_PAIR_STATUSES,
-  TASK_PAIR_VERBS,
-  TASK_PAIR_WORKSPACE_EFFECTS,
   TASK_PAIR_WORKSPACE_EVENT_VERB,
   type TaskPairEventPayload,
   type TaskPairStatus,
@@ -25,11 +24,6 @@ let hoverPreviewSequence = 0;
 
 function isStatus(value: unknown): value is TaskPairStatus {
   return typeof value === 'string' && (TASK_PAIR_STATUSES as readonly string[]).includes(value);
-}
-
-function verbKey(verb: unknown): string {
-  if (verb === TASK_PAIR_NOTICE_VERB) return 'notice';
-  return typeof verb === 'string' && (TASK_PAIR_VERBS as readonly string[]).includes(verb) ? verb.toLowerCase() : 'other';
 }
 
 // Diagnostic text is still a display surface; protocol IDs and role runtime
@@ -60,20 +54,6 @@ function safePayloadValue(value: unknown, key?: string): unknown {
       .map(([entryKey, entryValue]) => [entryKey, safePayloadValue(entryValue, entryKey)]));
   }
   return value;
-}
-
-/** Text of a daemon workspace event: where a kept deliverable went, or what happened to the workspace. */
-function workspaceText(t: (key: string, options?: Record<string, unknown>) => string, event: Partial<TaskPairEventPayload>): string {
-  switch (event.effect) {
-    case TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_SAVED:
-      return t('taskPair.output_saved', { path: event.outputPath ?? '' });
-    case TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_FAILED:
-      return t('taskPair.output_failed', { reason: event.outputError ?? '' });
-    case TASK_PAIR_WORKSPACE_EFFECTS.KEPT:
-      return t('taskPair.workspace_kept');
-    default:
-      return t('taskPair.workspace_removed');
-  }
 }
 
 /** Compact chat chip for one task-pair marker event (it replaces the hidden marker line). */
@@ -112,7 +92,7 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
   const hoverPreviewId = hoverPreviewIdRef.current;
   const event = payload as Partial<TaskPairEventPayload>;
   const taskId = typeof event.taskId === 'string' ? event.taskId : '—';
-  const writer = typeof event.writer === 'string' ? event.writer : '';
+  const writer = typeof event.writer === 'string' ? event.writer.trim() : '';
   const isCancelledEvent = event.toStatus === 'cancelled';
   const cancelActor = typeof event.cancelActor === 'string' && event.cancelActor.trim()
     ? event.cancelActor.trim()
@@ -123,11 +103,13 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
   const cancelReason = typeof event.cancelReason === 'string' && event.cancelReason.trim()
     ? event.cancelReason.trim()
     : t('taskPair.card_cancel_reason_unknown');
-  const verb = t(`taskPair.verb.${verbKey(event.verb)}`);
+  const normalizedVerb = normalizeTaskPairEventVerb(event.verb);
+  const action = taskPairEventAction(t, event);
+  const verb = action?.label;
   // A notice that states no lifecycle shows a neutral badge, never a guessed status.
   const status = isStatus(event.toStatus)
     ? t(`taskPair.status.${event.toStatus}`)
-    : event.verb === TASK_PAIR_NOTICE_VERB ? t('taskPair.card_notice_status') : t('taskPair.card_unknown_status');
+    : normalizedVerb === TASK_PAIR_NOTICE_VERB ? t('taskPair.card_notice_status') : t('taskPair.card_unknown_status');
   const counts = event.severityCounts
     ? AUDIT_SEVERITY_LEVELS
       .filter((level) => (event.severityCounts?.[level] ?? 0) > 0)
@@ -188,7 +170,7 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
     && findings.length === 0
     && (event.severityCounts ? blockingLevels.every((level) => (event.severityCounts?.[level] ?? 0) === 0) : true);
   const previewNoticeText = safeDetailText(noticeText).slice(0, 320);
-  const overviewNoticeText = writer === 'daemon' && (event.verb === 'DISPATCH' || event.verb === 'QUEUE') ? safeDetailText(auditDetails?.reason).slice(0, 320) : previewNoticeText;
+  const overviewNoticeText = writer === 'daemon' && (normalizedVerb === 'DISPATCH' || normalizedVerb === 'QUEUE') ? safeDetailText(auditDetails?.reason).slice(0, 320) : previewNoticeText;
   // One colour per status (styles.css `.task-pair-chip--<status>`).
   const statusClass = isStatus(event.toStatus) ? ` task-pair-chip--${event.toStatus}` : '';
   const statusBadgeClass = isStatus(event.toStatus) ? event.toStatus : 'unknown';
@@ -312,7 +294,7 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
         {eventTime && <time dateTime={new Date(timestamp!).toISOString()}>{eventTime}</time>}
       </div>
       <div class="task-pair-card-hover-preview-body">
-        <span class="task-pair-card-hover-preview-event">{verb}</span>
+        {verb && <span class="task-pair-card-hover-preview-event">{verb}</span>}
         {previewRole(event.executor, event.executorLabel, event.executorModel, event.executorThinking, 'executor')}
         {previewRole(event.auditor, event.auditorLabel, event.auditorModel, event.auditorThinking, 'auditor')}
         {previewNoticeText && <p>{previewNoticeText}{noticeText.length > 320 ? '…' : ''}</p>}
@@ -321,7 +303,7 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
       </div>
     </div>, document.body);
   };
-  const isVerdictEvent = event.verb === 'PASS' || event.verb === 'REWORK';
+  const isVerdictEvent = normalizedVerb === 'PASS' || normalizedVerb === 'REWORK';
   const renderAuditDetails = () => {
     if (!hasAuditDetails && !noBlockingFindings && !isVerdictEvent) return null;
     return <section class="task-pair-card-audit-details" aria-label={t('taskPair.card_audit_details')}>
@@ -385,7 +367,7 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
         </button>
       </header>
       {!isMobile && <div class="task-pair-card-overview">
-        <span class="task-pair-card-event-meta">{verb}</span>
+        {verb && <span class="task-pair-card-event-meta">{verb}</span>}
         <div class="task-pair-card-overview-roles">
           {roleLabel(event.executor, event.executorLabel, event.executorModel, event.executorThinking, 'executor', !expanded)}
           {roleLabel(event.auditor, event.auditorLabel, event.auditorModel, event.auditorThinking, 'auditor', !expanded)}
@@ -395,14 +377,13 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
       </div>}
       {expanded && <>
         <div class="task-pair-card-body">
-          <span class="task-pair-chip-text">
-            {event.verb === TASK_PAIR_WORKSPACE_EVENT_VERB
-              ? workspaceText(t, event)
-              : t('taskPair.chip', { writer: writer === 'daemon' ? t('taskPair.daemon') : writer, verb })}
-          </span>
+          {verb && <span class="task-pair-chip-text">
+            {normalizedVerb === TASK_PAIR_WORKSPACE_EVENT_VERB ? (action?.detail ?? verb)
+              : writer ? t('taskPair.chip', { writer: writer === 'daemon' ? t('taskPair.daemon') : writer, verb }) : verb}
+          </span>}
           {renderAuditDetails()}
           {noticeText && <pre class="task-pair-card-notice">{safeDetailText(noticeText)}</pre>}
-          <span class="task-pair-card-event-meta"><span>{t('taskPair.card_event')}</span>{verb}</span>
+          {verb && <span class="task-pair-card-event-meta"><span>{t('taskPair.card_event')}</span>{verb}</span>}
           {isMobile && roleLabel(event.executor, event.executorLabel, event.executorModel, event.executorThinking, 'executor')}
           {isMobile && roleLabel(event.auditor, event.auditorLabel, event.auditorModel, event.auditorThinking, 'auditor')}
           {isStatus(event.toStatus) && <TaskPairEventDecisions key={taskId} taskId={taskId} status={event.toStatus} />}

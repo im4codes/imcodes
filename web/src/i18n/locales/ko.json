@@ -4661,10 +4661,20 @@
       "reassign": "재배정",
       "cancel": "취소",
       "next_round": "다음 라운드 시작",
-      "send": "자료 전송",
+      "send": "작업 메시지 전송됨",
       "import": "가져옴",
       "notice": "알림",
-      "other": "기록됨"
+      "other": "기록됨",
+      "claim": "리소스 점유 갱신됨",
+      "check": "확인 항목 갱신됨",
+      "title": "작업 제목 갱신됨",
+      "material": "감사 자료 갱신됨",
+      "checklist_auto_tick": "확인 항목 자동 갱신됨",
+      "brain_resolved": "Brain 답변 수신됨",
+      "decision": "판정 제출됨",
+      "decision_request": "결정 정보 갱신됨",
+      "brief_updated": "작업 설명 갱신됨",
+      "correct": "가져온 상태 수정됨"
     },
     "status": {
       "queued": "대기 중",
@@ -4823,6 +4833,26 @@
         "feedback": "사용자 피드백",
         "decision": "Brain 결정"
       }
+    },
+    "action": {
+      "output_saved": "결과물 저장됨",
+      "output_failed": "결과물 저장 실패",
+      "workspace_moved": "작업 공간 이동됨",
+      "workspace_adopted": "기존 작업 공간 인계됨",
+      "workspace_duplicate": "중복 작업 공간 감지됨",
+      "workspace_move_deferred": "작업 공간 이동 연기됨",
+      "workspace_move_failed": "작업 공간 이동 실패",
+      "non_git_mode": "작업 공간 모드 선택됨",
+      "apply_back_applied": "작업 공간 변경 적용됨",
+      "apply_back_noop": "적용할 작업 공간 변경 없음",
+      "apply_back_conflict": "작업 공간 변경 충돌",
+      "apply_back_failed": "작업 공간 변경 적용 실패",
+      "apply_back_undone": "작업 공간 변경 취소됨",
+      "workspace_provisioned_late": "작업 공간 생성됨",
+      "material_held": "감사 자료 보류됨",
+      "delivery_updated": "메시지 전달 정보 갱신됨",
+      "brain_notice_updated": "Brain 알림 정보 갱신됨",
+      "dispatch_updated": "작업 전달 업데이트됨"
     }
   }
 }

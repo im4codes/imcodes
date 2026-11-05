@@ -4661,10 +4661,20 @@
       "reassign": "再割り当て",
       "cancel": "キャンセル",
       "next_round": "次のラウンドを開始",
-      "send": "資料送付",
+      "send": "タスクメッセージを送信",
       "import": "インポート",
       "notice": "通知",
-      "other": "記録"
+      "other": "記録",
+      "claim": "リソース確保を更新",
+      "check": "チェック項目を更新",
+      "title": "タスク名を更新",
+      "material": "監査資料を更新",
+      "checklist_auto_tick": "チェック項目を自動更新",
+      "brain_resolved": "Brainの返信を受信",
+      "decision": "判断を提出",
+      "decision_request": "判断情報を更新",
+      "brief_updated": "タスク説明を更新",
+      "correct": "取込状態を修正"
     },
     "status": {
       "queued": "キュー中",
@@ -4823,6 +4833,26 @@
         "feedback": "ユーザーの回答",
         "decision": "Brain の判断"
       }
+    },
+    "action": {
+      "output_saved": "成果物を保存",
+      "output_failed": "成果物の保存に失敗",
+      "workspace_moved": "ワークスペースを移動",
+      "workspace_adopted": "既存ワークスペースを採用",
+      "workspace_duplicate": "重複ワークスペースを検出",
+      "workspace_move_deferred": "ワークスペース移動を延期",
+      "workspace_move_failed": "ワークスペース移動に失敗",
+      "non_git_mode": "ワークスペース方式を選択",
+      "apply_back_applied": "ワークスペース変更を適用",
+      "apply_back_noop": "適用するワークスペース変更なし",
+      "apply_back_conflict": "ワークスペース変更が競合",
+      "apply_back_failed": "作業領域の変更適用に失敗",
+      "apply_back_undone": "ワークスペース変更を元に戻した",
+      "workspace_provisioned_late": "ワークスペースを用意",
+      "material_held": "監査資料を保留",
+      "delivery_updated": "メッセージ配信情報を更新",
+      "brain_notice_updated": "Brain通知情報を更新",
+      "dispatch_updated": "タスクの割り当てを更新"
     }
   }
 }

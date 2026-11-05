@@ -106,6 +106,11 @@ export const TASK_PAIR_NOTICE_VERB = 'NOTICE' as const;
 /** Brain-only: opens the next delivery round on a passed (not yet done) pair. */
 export const TASK_PAIR_NEXT_ROUND_VERB = 'NEXT_ROUND' as const;
 export const TASK_PAIR_CHECKLIST_AUTO_TICK_VERB = 'CHECKLIST_AUTO_TICK' as const;
+/** Recorded daemon/legacy events, not marker commands or lifecycle states. */
+export const TASK_PAIR_RECORDED_EVENT_VERBS = [
+  'SEND', 'IMPORT', 'CORRECT', 'BRIEF_UPDATED', 'BRAIN_RESOLVED', 'DECISION', 'DECISION_REQUEST',
+] as const;
+
 export const TASK_PAIR_CHECKLIST_BOXES = ['implemented', 'audited'] as const;
 export type TaskPairChecklistBox = typeof TASK_PAIR_CHECKLIST_BOXES[number];
 

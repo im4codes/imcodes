@@ -22,6 +22,7 @@ import { TaskPairSettingsSection, type TaskPairSettingsValue } from '../../src/c
 import { SUPERVISION_CONSOLE_UNAVAILABLE_REASONS } from '../../../shared/supervision-task-console.js';
 import {
   TASK_PAIR_STATUSES,
+  TASK_PAIR_VERBS,
   TASK_PAIR_TERMINAL_STATUSES,
   TASK_PAIR_TIMELINE_EVENT,
   TASK_PAIR_WORKSPACE_EFFECTS,
@@ -1651,4 +1652,62 @@ describe('TaskPairSettingsSection', () => {
     fireEvent.input(reselected);
     expect(value.pairEngine).toBeUndefined();
   });
+});
+
+
+describe('Pair concrete event actions', () => {
+  afterEach(cleanup);
+  it.each(['SEND', 'TITLE', 'MATERIAL', 'CHECKLIST_AUTO_TICK', 'BRAIN_RESOLVED', 'DECISION', 'DECISION_REQUEST', 'BRIEF_UPDATED', 'IMPORT', 'CORRECT', 'CLAIM', 'CHECK'])('labels known %s instead of a generic record', (verb) => {
+    const { container } = render(<TaskPairEventChip eventId="action" payload={{ taskId: 'action-task', title: 'Action title', verb, toStatus: 'working' }} />);
+    expect(container.querySelector('.task-pair-card-overview > .task-pair-card-event-meta')?.textContent).toBe(`taskPair.verb.${verb.toLowerCase()}`);
+  });
+  it.each([undefined, null, 17, {}, 'FUTURE_EVENT'])('omits unknown %j action rows without losing state or safe diagnostics', (verb) => {
+    const { container } = render(<TaskPairEventChip eventId="unknown" payload={{ taskId: 'action-task', title: 'Kept title', verb, toStatus: 'rework', writer: 'daemon', executor: 'exec-real', executorLabel: 'Executor', executorModel: 'model-x', noticeText: 'Safe reason', password: 'private-secret' }} />);
+    expect(container.querySelectorAll('.task-pair-card-event-meta')).toHaveLength(0);
+    expect(container.textContent).toContain('Kept title');
+    expect(container.textContent).toContain('taskPair.status.rework');
+    const toggle = container.querySelector<HTMLButtonElement>('.task-pair-card-toggle')!;
+    act(() => toggle.focus());
+    const preview = document.body.querySelector('.task-pair-card-hover-preview')!;
+    expect(preview.querySelector('.task-pair-card-hover-preview-event')).toBeNull();
+    expect(preview.textContent).toContain('exec-real');
+    fireEvent.click(toggle);
+    expect(container.querySelector('.task-pair-chip-text')).toBeNull();
+    expect(container.querySelectorAll('.task-pair-card-event-meta')).toHaveLength(0);
+    const raw = container.querySelector('.task-pair-card-payload pre')!.textContent!;
+    expect(raw).toContain('Safe reason');
+    expect(raw).not.toContain('private-secret');
+    expect(container.textContent).not.toContain('taskPair.verb.other');
+  });
+  it('normalizes legacy case, omits missing writers, and preserves ordinary verdict status', () => {
+    const { container } = render(<TaskPairEventChip eventId="legacy" payload={{ taskId: 'legacy', title: 'Legacy title', verb: ' pAsS ', toStatus: 'passed' }} />);
+    expect(container.querySelector('.task-pair-card-event-meta')!.textContent).toBe('taskPair.verb.pass');
+    fireEvent.click(container.querySelector('.task-pair-card-toggle')!);
+    expect(container.querySelector('.task-pair-chip-text')!.textContent).toBe('taskPair.verb.pass');
+    expect(container.textContent).toContain('taskPair.status.passed');
+  });
+  it('does not infer a removed workspace from an unknown effect', () => {
+    const { container } = render(<TaskPairEventChip eventId="future-workspace" payload={{ taskId: 'future', verb: TASK_PAIR_WORKSPACE_EVENT_VERB, effect: 'future_workspace_effect', toStatus: 'working' }} />);
+    fireEvent.click(container.querySelector('.task-pair-card-toggle')!);
+    expect(container.querySelector('.task-pair-chip-text')).toBeNull();
+    expect(container.querySelector('.task-pair-card-event-meta')).toBeNull();
+    expect(container.querySelector('.task-pair-card-payload pre')!.textContent).toContain('future_workspace_effect');
+  });
+  it.each(Object.values(TASK_PAIR_WORKSPACE_EFFECTS))('uses an explicit action for workspace %s', (effect) => {
+    const { container } = render(<TaskPairEventChip eventId="workspace-action" payload={{ taskId: 'workspace', verb: TASK_PAIR_WORKSPACE_EVENT_VERB, effect }} />);
+    const label = container.querySelector('.task-pair-card-event-meta')!.textContent!;
+    expect(label).not.toContain('taskPair.verb.other');
+    expect(label).not.toBe('');
+  });
+});
+
+
+describe('standard Pair verb translations', () => {
+  for (const locale of ['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko']) {
+    it.each(TASK_PAIR_VERBS)(`${locale} has a concrete label for %s`, (verb) => {
+      const web = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
+      const taskPair = JSON.parse(readFileSync(join(web, 'src/i18n/locales', `${locale}.json`), 'utf8')).taskPair;
+      expect(taskPair.verb[verb.toLowerCase()]).toBeTruthy();
+    });
+  }
 });

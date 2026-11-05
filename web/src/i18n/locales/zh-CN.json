@@ -4672,10 +4672,20 @@
       "reassign": "已改派",
       "cancel": "已取消",
       "next_round": "开启下一轮",
-      "send": "已发送材料",
+      "send": "任务消息已发送",
       "import": "已导入",
       "notice": "通知",
-      "other": "已记录"
+      "other": "已记录",
+      "claim": "资源占用已更新",
+      "check": "验收项已更新",
+      "title": "任务标题已更新",
+      "material": "审计材料已更新",
+      "checklist_auto_tick": "验收项已自动勾选",
+      "brain_resolved": "已收到Brain回复",
+      "decision": "裁决已提交",
+      "decision_request": "决策信息已更新",
+      "brief_updated": "任务说明已更新",
+      "correct": "导入状态已纠正"
     },
     "status": {
       "queued": "排队中",
@@ -4834,6 +4844,26 @@
         "feedback": "人工反馈",
         "decision": "Brain 裁决"
       }
+    },
+    "action": {
+      "output_saved": "产物已保存",
+      "output_failed": "产物保存失败",
+      "workspace_moved": "工作区已移动",
+      "workspace_adopted": "已接管现有工作区",
+      "workspace_duplicate": "检测到重复工作区",
+      "workspace_move_deferred": "工作区移动已延后",
+      "workspace_move_failed": "工作区移动失败",
+      "non_git_mode": "工作区模式已选定",
+      "apply_back_applied": "工作区改动已应用",
+      "apply_back_noop": "工作区无改动可应用",
+      "apply_back_conflict": "工作区改动存在冲突",
+      "apply_back_failed": "工作区改动应用失败",
+      "apply_back_undone": "工作区改动已撤销",
+      "workspace_provisioned_late": "工作区已补建",
+      "material_held": "审计材料已暂存",
+      "delivery_updated": "消息投递信息已更新",
+      "brain_notice_updated": "Brain通知信息已更新",
+      "dispatch_updated": "任务派发已更新"
     }
   }
 }
