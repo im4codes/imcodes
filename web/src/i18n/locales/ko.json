@@ -4853,6 +4853,7 @@
       "delivery_updated": "메시지 전달 정보 갱신됨",
       "brain_notice_updated": "Brain 알림 정보 갱신됨",
       "dispatch_updated": "작업 전달 업데이트됨"
-    }
+    },
+    "card_preview_hint": "제목에 마우스를 올리거나 ↓ 키로 미리보기, Esc 키로 닫기"
   }
 }

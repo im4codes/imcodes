@@ -4864,6 +4864,7 @@
       "delivery_updated": "消息投递信息已更新",
       "brain_notice_updated": "Brain通知信息已更新",
       "dispatch_updated": "任务派发已更新"
-    }
+    },
+    "card_preview_hint": "悬停标题或按↓预览，按Esc关闭预览"
   }
 }

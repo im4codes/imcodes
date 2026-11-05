@@ -4854,6 +4854,7 @@
       "delivery_updated": "Entrega del mensaje actualizada",
       "brain_notice_updated": "Notificación de Brain actualizada",
       "dispatch_updated": "Envío de tarea actualizado"
-    }
+    },
+    "card_preview_hint": "Pasa sobre el título o pulsa ↓ para previsualizar; Esc cierra la vista"
   }
 }

@@ -15012,13 +15012,17 @@ button.quick-agent-delegation-preset.active {
 .task-pair-card-head,
 .task-pair-card-body,
 .task-pair-card-flags { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
-.task-pair-card-head { align-items: stretch; }
+.task-pair-card-head { align-items: stretch; width: 100%; max-width: 100%; }
 .task-pair-card-toggle { display: flex; width: 100%; min-width: 0; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 0; border: 0; color: inherit; background: transparent; font: inherit; text-align: left; cursor: pointer; }
 .task-pair-card-toggle:hover .task-pair-card-heading strong { color: #ecfeff; }
 .task-pair-card-toggle:focus-visible { outline: 2px solid var(--chrome-accent); outline-offset: 3px; border-radius: 5px; }
 .task-pair-card-heading { display: contents; }
 .task-pair-card-kicker { color: var(--chrome-accent); font-size: 9px; font-weight: 800; letter-spacing: .12em; line-height: 1.2; text-transform: uppercase; }
 .task-pair-event-card .task-pair-chip-task { display: flex; min-width: min(100%, 12rem); max-width: 100%; flex: 1 1 15rem; align-items: baseline; gap: 5px 8px; order: 3; }
+/* Keep the original direct flex child/ellipsis. Only the text and eye,
+   never the flexible title cell's trailing whitespace, own hover handlers. */
+.task-pair-event-card .task-pair-chip-task { column-gap: 5px; }
+.task-pair-title-preview-icon { flex: 0 0 12px; align-self: center; color: #67e8f9; opacity: .8; }
 .task-pair-event-card .task-pair-chip-task strong { min-width: 0; color: #f0f9ff; font-size: 13px; overflow-wrap: anywhere; }
 .task-pair-event-card:not(.is-expanded) .task-pair-chip-task strong {
   display: -webkit-box;

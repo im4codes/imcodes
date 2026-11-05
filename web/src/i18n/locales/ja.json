@@ -4853,6 +4853,7 @@
       "delivery_updated": "メッセージ配信情報を更新",
       "brain_notice_updated": "Brain通知情報を更新",
       "dispatch_updated": "タスクの割り当てを更新"
-    }
+    },
+    "card_preview_hint": "タイトルにカーソルを合わせるか↓でプレビュー、Escで閉じる"
   }
 }

@@ -85,6 +85,9 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
   }, []);
   const [hoverPreviewAnchor, setHoverPreviewAnchor] = useState<DOMRect | null>(null);
   const cardRef = useRef<HTMLElement | null>(null);
+  const toggleRef = useRef<HTMLButtonElement | null>(null);
+  const keyboardPreviewRef = useRef(false);
+  const focusPreviewRef = useRef(false);
   const hoverOpenTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hoverCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hoverPreviewIdRef = useRef<string | null>(null);
@@ -182,16 +185,19 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
   };
   const closeHoverPreview = () => {
     clearHoverTimers();
+    keyboardPreviewRef.current = false;
+    focusPreviewRef.current = false;
     setHoverPreviewAnchor(null);
   };
   const supportsDesktopHover = () => typeof window !== 'undefined'
     && typeof window.matchMedia === 'function'
     && window.matchMedia('(hover: hover) and (pointer: fine)').matches;
   const scheduleHoverPreview = (pointerType?: string) => {
-    // Pointer hover is deliberately restricted to a fine hover-capable device;
-    // focus still calls this without a pointer type for keyboard accessibility.
+    // Only the shrink-wrapped title/icon calls this. Keyboard preview is an
+    // explicit shortcut, never a side effect of mouse/touch focus.
     if (pointerType && pointerType !== 'mouse' && pointerType !== 'pen') return;
-    if (pointerType && !supportsDesktopHover()) return;
+    if (!supportsDesktopHover()) return;
+    keyboardPreviewRef.current = false;
     if (!cardRef.current || expanded) return;
     if (hoverCloseTimerRef.current) clearTimeout(hoverCloseTimerRef.current);
     hoverCloseTimerRef.current = null;
@@ -209,24 +215,36 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
     if (hoverCloseTimerRef.current) clearTimeout(hoverCloseTimerRef.current);
     hoverCloseTimerRef.current = setTimeout(() => {
       hoverCloseTimerRef.current = null;
-      if (document.getElementById(hoverPreviewId)?.contains(document.activeElement)) return;
+      if (keyboardPreviewRef.current && document.getElementById(hoverPreviewId)?.contains(document.activeElement)) return;
       setHoverPreviewAnchor(null);
     }, HOVER_PREVIEW_CLOSE_DELAY_MS);
   };
-  const showHoverPreviewForFocus = () => {
+  const showHoverPreviewForKeyboard = () => {
     if (!cardRef.current || expanded) return;
     clearHoverTimers();
+    keyboardPreviewRef.current = true;
+    focusPreviewRef.current = true;
     setHoverPreviewAnchor(cardRef.current.getBoundingClientRect());
   };
   useEffect(() => () => clearHoverTimers(), []);
+  useEffect(() => { closeHoverPreview(); }, [eventId, taskId, expanded]);
+  useEffect(() => {
+    if (hoverPreviewAnchor && focusPreviewRef.current) {
+      focusPreviewRef.current = false;
+      document.getElementById(hoverPreviewId)?.focus({ preventScroll: true });
+    }
+  }, [hoverPreviewAnchor]);
   useEffect(() => {
     if (!hoverPreviewAnchor) return;
     const syncAnchor = () => {
       if (cardRef.current) setHoverPreviewAnchor(cardRef.current.getBoundingClientRect());
     };
+    const onEscape = (key: KeyboardEvent) => { if (key.key === 'Escape') closeHoverPreview(); };
+    window.addEventListener('keydown', onEscape);
     window.addEventListener('scroll', syncAnchor, true);
     window.addEventListener('resize', syncAnchor);
     return () => {
+      window.removeEventListener('keydown', onEscape);
       window.removeEventListener('scroll', syncAnchor, true);
       window.removeEventListener('resize', syncAnchor);
     };
@@ -280,12 +298,13 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
       id={hoverPreviewId}
       class="task-pair-card-hover-preview"
       role="dialog"
+      tabIndex={-1}
       aria-label={title}
       onFocusIn={() => { if (hoverCloseTimerRef.current) clearTimeout(hoverCloseTimerRef.current); hoverCloseTimerRef.current = null; }}
       onFocusOut={(focus) => { if (!focus.currentTarget.contains(focus.relatedTarget as Node | null)) scheduleHoverPreviewClose(); }}
-      onKeyDown={(key) => { if (key.key === 'Escape') closeHoverPreview(); }}
+      onKeyDown={(key) => { if (key.key === 'Escape') { key.preventDefault(); closeHoverPreview(); toggleRef.current?.focus({ preventScroll: true }); } }}
       style={{ left: `${left}px`, width: `${width}px`, maxHeight: `${maxHeight}px`, ...position }}
-      onPointerEnter={() => { if (hoverCloseTimerRef.current) clearTimeout(hoverCloseTimerRef.current); hoverCloseTimerRef.current = null; }}
+      onPointerEnter={() => { keyboardPreviewRef.current = false; if (hoverCloseTimerRef.current) clearTimeout(hoverCloseTimerRef.current); hoverCloseTimerRef.current = null; }}
       onPointerLeave={scheduleHoverPreviewClose}
     >
       <div class="task-pair-card-hover-preview-head">
@@ -335,19 +354,22 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
       data-task-status={isStatus(event.toStatus) ? event.toStatus : undefined}
       data-event-id={eventId}
       data-task-id={taskId}
-      onPointerEnter={(pointer) => scheduleHoverPreview(pointer.pointerType)}
-      onPointerLeave={scheduleHoverPreviewClose}
     >
       <header class="task-pair-card-head">
         <button
+          ref={toggleRef}
           type="button"
           class="task-pair-card-toggle"
           aria-label={expanded ? t('taskPair.card_collapse') : t('taskPair.card_expand')}
           title={expanded ? t('taskPair.card_collapse') : t('taskPair.card_expand')}
           aria-expanded={expanded}
           aria-describedby={hoverPreviewAnchor ? hoverPreviewId : undefined}
-          onFocus={showHoverPreviewForFocus}
-          onFocusIn={showHoverPreviewForFocus}
+          aria-description={`${title}. ${t('taskPair.card_preview_hint')}`}
+          aria-keyshortcuts="ArrowDown"
+          onKeyDown={(key) => {
+            if (key.key === 'ArrowDown' && !expanded) { key.preventDefault(); showHoverPreviewForKeyboard(); }
+            else if (key.key === 'Escape') closeHoverPreview();
+          }}
           onBlur={scheduleHoverPreviewClose}
           onFocusOut={scheduleHoverPreviewClose}
           onClick={() => { closeHoverPreview(); setExpanded((value) => !value); }}
@@ -361,7 +383,12 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
             <span class={`task-pair-card-chevron${expanded ? ' is-expanded' : ''}`} aria-hidden="true">⌄</span>
           </span>
           <span class="task-pair-chip-task" title={title}>
-            <strong>{title}</strong>
+            <svg class="task-pair-title-preview-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"
+              onPointerEnter={(pointer) => scheduleHoverPreview(pointer.pointerType)} onPointerLeave={scheduleHoverPreviewClose}>
+              <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z" /><circle cx="12" cy="12" r="3" />
+            </svg>
+            <strong class="task-pair-title-preview-trigger"
+              onPointerEnter={(pointer) => scheduleHoverPreview(pointer.pointerType)} onPointerLeave={scheduleHoverPreviewClose}>{title}</strong>
           </span>
           {brainNoticeText && <span class={`task-pair-card-brain-notice is-${brainNotice!.status}`} data-brain-notice={brainNotice!.status}>{brainNoticeText}</span>}
         </button>

@@ -274,7 +274,6 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     return <button type="button" class="task-pair-status-session" data-session-name={id} onClick={() => window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: id } }))}>
       <span class="task-pair-status-session-main">
         <span class="task-pair-status-session-label">{text}</span>
-        <small class="task-pair-status-session-id">{id}</small>
         {resolvedModel && <small class="task-pair-status-session-model">{resolvedModel}</small>}
       </span>
     </button>;

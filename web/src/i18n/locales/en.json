@@ -4864,6 +4864,7 @@
       "delivery_updated": "Message delivery updated",
       "brain_notice_updated": "Brain notification updated",
       "dispatch_updated": "Task dispatch updated"
-    }
+    },
+    "card_preview_hint": "Hover the title or press ↓ to preview; Esc closes the preview"
   }
 }

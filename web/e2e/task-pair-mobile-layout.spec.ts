@@ -205,12 +205,25 @@ test('retained virtual chat, lazy decisions, scrolling and canonical role clicks
   await notice.evaluate(e => { e.scrollTop = e.scrollHeight; });
   expect(await notice.evaluate(e => e.scrollTop + e.clientHeight >= e.scrollHeight - 1)).toBe(true);
   await notice.hover(); const outer = page.locator('.chat-view');
-  await outer.evaluate(e => { e.scrollTop = 0; });
-  // Scroll the outer chat outside the local viewport rather than trapping it.
-  await outer.hover({ position: { x: 2, y: 100 } }); await page.mouse.wheel(0, 500);
-  await expect.poll(() => outer.evaluate(e => e.scrollTop)).toBeGreaterThan(0);
+  // Stay in the mounted virtual range. A jump to zero can unmount the card;
+  // at the tail, merely checking scrollTop > 0 does not prove a wheel moved.
+  await page.evaluate(() => { (window as any).__retainedPairCard = document.querySelector('.task-pair-event-card'); });
+  await outer.hover({ position: { x: 2, y: 100 } });
+  const tail = await outer.evaluate(e => e.scrollTop);
+  await page.mouse.wheel(0, -80);
+  await expect.poll(() => outer.evaluate(e => e.scrollTop)).toBeLessThan(tail - 20);
+  const wheelBefore = await outer.evaluate(e => e.scrollTop);
+  await page.mouse.wheel(0, 50);
+  await expect.poll(() => outer.evaluate(e => e.scrollTop)).toBeGreaterThan(wheelBefore + 20);
+  const wheelAfter = await outer.evaluate(e => e.scrollTop);
+  const retained = () => page.evaluate(() => {
+    const old = (window as any).__retainedPairCard;
+    return Boolean(old?.isConnected && old === document.querySelector('.task-pair-event-card') && old.classList.contains('is-expanded'));
+  });
+  expect(await retained()).toBe(true);
+  await info.attach('real-outer-wheel', { body: JSON.stringify({ tail, wheelBefore, wheelAfter, delta: wheelAfter - wheelBefore }), contentType: 'application/json' });
   for (const viewport of [{ width: 640, height: 390 }, { width: 390, height: 420 }, { width: 720, height: 500 }, { width: 390, height: 844 }]) {
-    await page.setViewportSize(viewport); await expectContained(page);
+    await page.setViewportSize(viewport); await expectContained(page); expect(await retained()).toBe(true);
   }
   // Browser-style 200% page zoom has half the CSS viewport width; additionally
   // exercise CSS zoom at the production root (including controls and content).
@@ -329,7 +342,7 @@ for (const width of [320, 390, 1280]) {
       await info.attach(`compact-${fields.verb || 'missing'}`, { body:JSON.stringify({width,verb:fields.verb ?? null,compact}), contentType:'application/json' });
       if (width === 1280) {
         await page.mouse.move(1,1);
-        await toggle.hover();
+        await page.locator('.task-pair-title-preview-trigger').hover();
         await expect(page.locator('.task-pair-card-hover-preview')).toBeVisible();
         await expect(page.locator('.task-pair-card-hover-preview')).toHaveCSS('opacity','1');
         const row = page.locator('.task-pair-card-hover-preview-event');
@@ -340,6 +353,7 @@ for (const width of [320, 390, 1280]) {
         await page.keyboard.press('Escape');
         await expect(page.locator('.task-pair-card-hover-preview')).toHaveCount(0);
         await toggle.focus();
+        await page.keyboard.press('ArrowDown');
         await expect(page.locator('.task-pair-card-hover-preview')).toBeVisible();
         await expect(page.locator('.task-pair-card-hover-preview')).toHaveCSS('opacity','1');
         await page.locator('.task-pair-card-hover-preview .task-pair-chip-session').first().focus();
@@ -388,7 +402,7 @@ test('Pair action compact dimensions remain bounded for identical payloads', asy
       dimensions.push({width,verb,compact:(await card.boundingBox())!.height});
       if (width <= 720) expect((await card.boundingBox())!.height).toBeLessThanOrEqual(width === 320 ? 97 : 65);
       if (width === 1280) {
-        await page.locator('.task-pair-card-toggle').hover();
+        await page.locator('.task-pair-title-preview-trigger').hover();
         await expect(page.locator('.task-pair-card-hover-preview')).toBeVisible();
         await expect(page.locator('.task-pair-card-hover-preview')).toHaveCSS('opacity','1');
         dimensions.push({width,verb,hover:(await page.locator('.task-pair-card-hover-preview').boundingBox())!.height});
@@ -399,3 +413,129 @@ test('Pair action compact dimensions remain bounded for identical payloads', asy
   }
   await info.attach('identical-payload-dimensions',{body:JSON.stringify(dimensions),contentType:'application/json'});
 });
+
+test('title-only preview rejects non-title hover and mouse focus, supports portal and keyboard', async ({ page }, info) => {
+  await open(page,1280,'en');
+  await publish(page,[pair({title:'Short title',summary:undefined})]);
+  await page.evaluate(()=>{(window as any).__titlePreviewQueries=0;window.addEventListener('fixture:decision-request',()=>{(window as any).__titlePreviewQueries++;});});
+  const toggle=page.locator('.task-pair-card-toggle');
+  for(const selector of ['.task-pair-card-kicker','.task-pair-chip-status','.task-pair-card-time','.task-pair-card-chevron','.task-pair-card-overview','.task-pair-card-role']) {
+    await page.locator(selector).first().hover();await page.waitForTimeout(250);
+    await expect(page.locator('.task-pair-card-hover-preview')).toHaveCount(0);
+  }
+  await toggle.focus();await page.waitForTimeout(250);
+  await expect(page.locator('.task-pair-card-hover-preview')).toHaveCount(0);
+  const cell=await page.locator('.task-pair-chip-task').boundingBox();
+  const title=page.locator('.task-pair-title-preview-trigger');const tb=await title.boundingBox();
+  expect(cell!.width).toBeGreaterThan(tb!.width+20);
+  await page.mouse.move(cell!.x+cell!.width-2,cell!.y+cell!.height/2);await page.waitForTimeout(250);
+  await expect(page.locator('.task-pair-card-hover-preview')).toHaveCount(0);
+  expect(await page.evaluate(()=>(window as any).__titlePreviewQueries)).toBe(0);
+  await page.locator('.task-pair-title-preview-icon').hover();
+  const preview=page.locator('.task-pair-card-hover-preview');
+  await expect(preview).toBeVisible();await expect(preview).toHaveCSS('opacity','1');
+  await page.screenshot({path:info.outputPath('title-icon-preview.png')});
+  await page.evaluate(()=>{if(document.activeElement instanceof HTMLElement)document.activeElement.blur();});
+  await page.keyboard.press('Escape');await expect(preview).toHaveCount(0);
+  await page.mouse.move(1,1);await title.hover();await expect(preview).toBeVisible();
+  await preview.hover();await page.waitForTimeout(200);await expect(preview).toBeVisible();
+  await page.evaluate(()=>{(window as any).__previewNav=[];window.addEventListener('deck:navigate',(e:any)=>(window as any).__previewNav.push(e.detail.session));});
+  await preview.locator('.task-pair-chip-session').first().click();
+  expect(await page.evaluate(()=>(window as any).__previewNav)).toEqual(['deck_fixture_executor']);
+  await page.mouse.move(1,1);await expect(preview).toHaveCount(0);
+  await toggle.focus();await page.keyboard.press('ArrowDown');await expect(preview).toBeFocused();
+  await page.keyboard.press('Tab');await expect(preview.locator('.task-pair-chip-session').first()).toBeFocused();
+  await page.keyboard.press('Escape');await expect(preview).toHaveCount(0);await expect(toggle).toBeFocused();
+  const intentionalRequests=await page.evaluate(()=>(window as any).__titlePreviewQueries);
+  expect(intentionalRequests).toBeLessThanOrEqual(3);
+  for(let i=0;i<5;i++)await publish(page,[pair({title:'Short title',summary:`Stream ${i}`})]);
+  expect(await page.evaluate(()=>(window as any).__titlePreviewQueries)).toBe(intentionalRequests);
+  await page.keyboard.press('Enter');await expect(toggle).toHaveAttribute('aria-expanded','true');
+  await page.locator('.task-pair-card-body').hover();await page.waitForTimeout(250);await expect(preview).toHaveCount(0);
+  await page.keyboard.press('Escape'); // expanded card must not collapse
+  await expect(toggle).toHaveAttribute('aria-expanded','true');await toggle.click();
+  await page.mouse.move(1,1);await title.hover();await page.mouse.move(1,1);await page.waitForTimeout(300);await expect(preview).toHaveCount(0);
+  await title.hover();await toggle.click();await page.waitForTimeout(300);await expect(preview).toHaveCount(0);
+  await toggle.click();await page.mouse.move(1,1);await title.hover();
+  await publish(page,[]);await page.waitForTimeout(300);await expect(preview).toHaveCount(0);
+});
+
+test('non-title card padding does not preview on the exact base causal control', async ({page})=>{
+  await open(page,1280,'en');await publish(page,[pair()]);
+  const card=await page.locator('.task-pair-event-card').boundingBox();
+  await page.mouse.move(card!.x+2,card!.y+card!.height/2);await page.waitForTimeout(300);
+  await expect(page.locator('.task-pair-card-hover-preview')).toHaveCount(0);
+});
+
+test('touch title tap expands without preview or an extra interactive descendant', async ({browser,baseURL})=>{
+  const context=await browser.newContext({baseURL,hasTouch:true,isMobile:true,viewport:{width:390,height:844}});
+  const page=await context.newPage();
+  try {
+    await open(page,390,'zh-CN');await publish(page,[pair()]);
+    await expect(page.locator('.task-pair-card-toggle button, .task-pair-card-toggle [tabindex]')).toHaveCount(0);
+    await page.locator('.task-pair-title-preview-icon').tap();
+    await expect(page.locator('.task-pair-card-toggle')).toHaveAttribute('aria-expanded','true');
+    await page.waitForTimeout(300);await expect(page.locator('.task-pair-card-hover-preview')).toHaveCount(0);
+    await page.locator('.task-pair-chip-task strong').tap();
+    await expect(page.locator('.task-pair-card-toggle')).toHaveAttribute('aria-expanded','false');
+  } finally {await context.close();}
+});
+
+test('title preview geometry for short, long, fallback and normal titles', async ({page},info)=>{
+  const dimensions:unknown[]=[];
+  for(const width of [320,390,1280]) {
+    await open(page,width,'zh-CN');
+    for(const [kind,title] of [['short','Short title'],['fallback',undefined],['normal','Synthetic review and input controls'],['long','超长标题 Longer title <&> '.repeat(20)]] as const) {
+      await publish(page,[pair({title,summary:undefined})]);
+      const card=page.locator('.task-pair-event-card');
+      const size=await card.boundingBox();
+      dimensions.push({width,kind,height:size!.height});
+      await info.attach(`title-dimension-${width}-${kind}`,{body:JSON.stringify({width,kind,height:size!.height}),contentType:'application/json'});
+      const bounds=await card.evaluate(e=>({scroll:e.scrollWidth,client:e.clientWidth,title:[...e.querySelectorAll('.task-pair-chip-task,.task-pair-chip-task strong')].map(n=>({width:n.getBoundingClientRect().width,css:getComputedStyle(n).cssText,flex:getComputedStyle(n).flex,min:getComputedStyle(n).minWidth,max:getComputedStyle(n).maxWidth,overflow:getComputedStyle(n).overflow}))}));
+      expect(bounds.scroll<=bounds.client+1,JSON.stringify({width,kind,bounds})).toBe(true);
+      expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+      await page.screenshot({path:info.outputPath(`${width}-${kind}.png`)});
+    }
+  }
+  await info.attach('title-default-dimensions',{body:JSON.stringify(dimensions),contentType:'application/json'});
+});
+
+for (const width of [320, 390, 1280]) {
+  test(`status role pills show labels and models without internal IDs at ${width}px`, async ({ page }, info) => {
+    await open(page, width, 'en');
+    await page.evaluate(() => {
+      (window as any).__statusNavigated = [];
+      window.addEventListener('deck:navigate', (e: any) => (window as any).__statusNavigated.push(e.detail.session));
+    });
+    const executor = 'deck_sub_fixture_status_executor';
+    const auditor = 'deck_sub_fixture_status_auditor';
+    await publish(page, [pair({ verb: 'WORKING', toStatus: 'working', executor, auditor, executorLabel: 'Same display', auditorLabel: 'Same display', executorModel: 'Model E', auditorModel: 'Model A', executorState: 'running', auditorState: 'running' })]);
+    const panel = page.locator('.task-pair-status-panel');
+    if (await panel.evaluate(e => e.classList.contains('is-collapsed'))) await page.locator('.task-pair-status-compact').click();
+    const buttons = panel.locator('.task-pair-status-session');
+    await expect(buttons).toHaveCount(2);
+    const pills = await panel.locator('.task-pair-role-chip').evaluateAll(elements => elements.map(e => {
+      const r = e.getBoundingClientRect(); return { text: e.textContent, height: r.height, width: r.width };
+    }));
+    await info.attach(`status-pill-dimensions-${width}`, { body: JSON.stringify(pills), contentType: 'application/json' });
+    for (const [i, id] of [executor, auditor].entries()) {
+      const button = buttons.nth(i);
+      await expect(button).toHaveText(`Same displayModel ${i ? 'A' : 'E'}`);
+      await expect(button).toHaveAttribute('data-session-name', id);
+      expect(await button.getAttribute('title') || '').not.toContain(id);
+      expect(await button.getAttribute('aria-label') || '').not.toContain(id);
+      await button.click();
+    }
+    expect(await page.evaluate(() => (window as any).__statusNavigated)).toEqual([executor, auditor]);
+    await expect(panel.locator('.task-pair-status-session-id')).toHaveCount(0);
+    await expect(panel.locator('.task-pair-status-dot.is-running')).toHaveCount(2);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
+    await page.screenshot({ path: info.outputPath(`status-label-model-${width}.png`) });
+    await publish(page, [pair({ verb: 'WORKING', toStatus: 'working', executor: 'deck_sub_unlabeled_status', auditor: 'none', executorLabel: undefined, auditorLabel: undefined, executorModel: undefined, auditorModel: undefined }, 'status-unlabeled')]);
+    const fallback = panel.locator('.task-pair-status-session');
+    await expect(fallback).toHaveCount(1);
+    await expect(fallback).toHaveText('Executor');
+    await expect(fallback).toHaveAttribute('data-session-name', 'deck_sub_unlabeled_status');
+    await expect(fallback.locator('.task-pair-status-session-model')).toHaveCount(0);
+  });
+}

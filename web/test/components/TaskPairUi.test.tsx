@@ -77,7 +77,7 @@ describe('TaskPairEventChip', () => {
       executor: 'exec-session', executorLabel: 'Executor', noticeText: 'Readable human summary for the hover preview.',
     }} />);
     const card = container.querySelector('.task-pair-event-card')!;
-    fireEvent.pointerEnter(card, { pointerType: 'mouse' });
+    fireEvent.pointerEnter(card.querySelector('.task-pair-title-preview-trigger')!, { pointerType: 'mouse' });
     expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
     act(() => vi.advanceTimersByTime(179));
     expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
@@ -90,7 +90,7 @@ describe('TaskPairEventChip', () => {
     expect(preview.textContent).not.toContain('taskPair.card_thinking');
     expect(preview.textContent).toContain('Readable human summary');
     expect(preview.textContent).not.toContain('"taskId"');
-    fireEvent.pointerLeave(card, { pointerType: 'mouse' });
+    fireEvent.pointerLeave(card.querySelector('.task-pair-title-preview-trigger')!, { pointerType: 'mouse' });
     act(() => vi.advanceTimersByTime(139));
     expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeTruthy();
     act(() => vi.advanceTimersByTime(1));
@@ -106,9 +106,9 @@ describe('TaskPairEventChip', () => {
       taskId: 'touch-task', title: 'Touch task', writer: 'daemon', verb: 'DISPATCH', toStatus: 'queued',
     }} />);
     const card = container.querySelector('.task-pair-event-card')!;
-    const touchEnter = createEvent.pointerEnter(card);
+    const touchEnter = createEvent.pointerEnter(card.querySelector('.task-pair-title-preview-trigger')!);
     Object.defineProperty(touchEnter, 'pointerType', { value: 'touch' });
-    fireEvent(card, touchEnter);
+    fireEvent(card.querySelector('.task-pair-title-preview-trigger')!, touchEnter);
     act(() => vi.advanceTimersByTime(500));
     expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
     fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
@@ -327,12 +327,12 @@ describe('TaskPairEventChip', () => {
       authorization: 'Bearer super-secret',
     }} />);
     const card = container.querySelector('.task-pair-event-card')!;
-    fireEvent.pointerEnter(card, { pointerType: 'mouse' });
+    fireEvent.pointerEnter(card.querySelector('.task-pair-title-preview-trigger')!, { pointerType: 'mouse' });
     act(() => vi.advanceTimersByTime(180));
     const preview = document.body.querySelector('.task-pair-card-hover-preview')!;
     expect(preview.textContent).toContain('<user-home>');
     expect(preview.textContent).not.toContain('alice');
-    fireEvent.pointerLeave(card, { pointerType: 'mouse' });
+    fireEvent.pointerLeave(card.querySelector('.task-pair-title-preview-trigger')!, { pointerType: 'mouse' });
     act(() => vi.advanceTimersByTime(140));
     fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
     const details = card.querySelector('.task-pair-card-audit-details')!;
@@ -1009,13 +1009,14 @@ describe('TaskPairStatusPanel', () => {
         payload: { taskId: 'store-task', title: 'Store label', toStatus: 'working', executor: 'deck_sub_store' },
       }] as never} />);
       expect(screen.getByText('Store Cx')).toBeTruthy();
-      expect(screen.getByText('deck_sub_store')).toBeTruthy();
+      expect(screen.queryByText('deck_sub_store')).toBeNull();
+      expect(document.querySelector('[data-session-name="deck_sub_store"]')).toBeTruthy();
     } finally {
       watchProjectionStore.setSnapshotStatus('switching');
     }
   });
 
-  it('shows live names, exact ids, and models, and navigates roles', () => {
+  it('shows live names and models, keeps exact routing ids, and navigates roles', () => {
     const navigate = vi.fn();
     const listener = (event: Event) => navigate((event as CustomEvent).detail.session);
     window.addEventListener('deck:navigate', listener);
@@ -1024,10 +1025,11 @@ describe('TaskPairStatusPanel', () => {
       payload: { taskId: 'model-task', title: 'Models', toStatus: 'working', executor: 'deck_sub_exec', executorLabel: 'Executor', executorModel: 'gpt-6-sol', auditor: 'deck_sub_aud' },
     }] as never} />);
     expect(screen.getByText('Cx1')).toBeTruthy();
-    expect(screen.getByText('deck_sub_exec')).toBeTruthy();
+    expect(screen.queryByText('deck_sub_exec')).toBeNull();
+    expect(document.querySelector('[data-session-name="deck_sub_exec"]')).toBeTruthy();
     expect(screen.getByText('gpt-6-sol')).toBeTruthy();
     expect(screen.getByText('gpt-6-astra')).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: /Cx1.*deck_sub_exec/ }));
+    fireEvent.click(screen.getByRole('button', { name: /Cx1.*gpt-6-sol/ }));
     expect(navigate).toHaveBeenCalledWith('deck_sub_exec');
     window.removeEventListener('deck:navigate', listener);
   });
@@ -1044,13 +1046,15 @@ describe('TaskPairStatusPanel', () => {
       },
     }] as never} />);
     expect(screen.queryByText(/taskPair.card_thinking/)).toBeNull();
-    expect(screen.getByText('deck_sub_exec')).toBeTruthy();
+    expect(screen.queryByText('deck_sub_exec')).toBeNull();
+    expect(document.querySelector('[data-session-name="deck_sub_exec"]')).toBeTruthy();
   });
 
   it('uses localized neutral role fallbacks when labels are missing', () => {
     render(<TaskPairStatusPanel events={[{ eventId: 'fallback', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'fallback-task', title: 'Fallback', toStatus: 'working', executor: 'deck_sub_exec' } }] as never} />);
     expect(screen.getByText('taskPair.panel_executor')).toBeTruthy();
-    expect(screen.getByText('deck_sub_exec')).toBeTruthy();
+    expect(screen.queryByText('deck_sub_exec')).toBeNull();
+    expect(document.querySelector('[data-session-name="deck_sub_exec"]')).toBeTruthy();
   });
 
   const readCss = () => {
@@ -1668,6 +1672,7 @@ describe('Pair concrete event actions', () => {
     expect(container.textContent).toContain('taskPair.status.rework');
     const toggle = container.querySelector<HTMLButtonElement>('.task-pair-card-toggle')!;
     act(() => toggle.focus());
+    fireEvent.keyDown(toggle, { key: 'ArrowDown' });
     const preview = document.body.querySelector('.task-pair-card-hover-preview')!;
     expect(preview.querySelector('.task-pair-card-hover-preview-event')).toBeNull();
     expect(preview.textContent).toContain('exec-real');
@@ -1710,4 +1715,81 @@ describe('standard Pair verb translations', () => {
       expect(taskPair.verb[verb.toLowerCase()]).toBeTruthy();
     });
   }
+});
+
+describe('intentional title-only Pair preview', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.stubGlobal('matchMedia', (media: string) => ({ matches: media.includes('hover: hover'), media, addEventListener() {}, removeEventListener() {} }));
+  });
+  afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); });
+  const payload = { taskId:'title-only', title:'Intentional preview', verb:'CHECK', toStatus:'working', executor:'canonical-exec', auditor:'canonical-audit' };
+  it.each(['.task-pair-event-card','.task-pair-card-kicker','.task-pair-chip-status','.task-pair-card-time','.task-pair-card-role','.task-pair-card-chevron','.task-pair-card-overview'])('non-title %s never starts a preview', selector => {
+    const {container}=render(<TaskPairEventChip eventId="title-only" timestamp={1700000000000} payload={payload} />);
+    fireEvent.pointerEnter(container.querySelector(selector)!,{pointerType:'mouse'});
+    act(()=>vi.advanceTimersByTime(500));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+  });
+  it('ordinary toggle focus never opens a preview', () => {
+    const {container}=render(<TaskPairEventChip eventId="mouse-focus" payload={payload} />);
+    act(()=>container.querySelector<HTMLButtonElement>('.task-pair-card-toggle')!.focus());
+    act(()=>vi.advanceTimersByTime(500));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+  });
+  it('keeps title→portal operations usable and closes after mouse leaves even after a click', () => {
+    const navigate=vi.fn();window.addEventListener('deck:navigate',navigate);
+    const {container}=render(<TaskPairEventChip eventId="handoff" payload={payload} />);
+    const title=container.querySelector('.task-pair-title-preview-trigger')!;
+    fireEvent.pointerEnter(title,{pointerType:'mouse'});act(()=>vi.advanceTimersByTime(100));
+    fireEvent.pointerLeave(title);act(()=>vi.advanceTimersByTime(500));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+    fireEvent.pointerEnter(title,{pointerType:'mouse'});act(()=>vi.advanceTimersByTime(180));
+    fireEvent.keyDown(window,{key:'Escape'});
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+    fireEvent.pointerEnter(title,{pointerType:'mouse'});act(()=>vi.advanceTimersByTime(180));
+    const preview=document.body.querySelector('.task-pair-card-hover-preview')!;
+    fireEvent.pointerLeave(title);fireEvent.pointerEnter(preview);act(()=>vi.advanceTimersByTime(200));
+    expect(document.body.contains(preview)).toBe(true);
+    const role=preview.querySelector<HTMLButtonElement>('.task-pair-chip-session')!;
+    act(()=>role.focus());fireEvent.click(role);
+    expect(navigate.mock.calls[0][0].detail.session).toBe('canonical-exec');
+    fireEvent.pointerLeave(preview);act(()=>vi.advanceTimersByTime(140));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+    window.removeEventListener('deck:navigate',navigate);
+  });
+  it('uses one existing tab stop with deliberate keyboard preview, Escape return and normal expansion', () => {
+    const {container}=render(<TaskPairEventChip eventId="keyboard-preview" payload={payload} />);
+    const toggle=container.querySelector<HTMLButtonElement>('.task-pair-card-toggle')!;
+    expect(toggle.querySelector('button,[tabindex]')).toBeNull();
+    expect(toggle.getAttribute('aria-keyshortcuts')).toBe('ArrowDown');
+    expect(toggle.getAttribute('aria-description')).toContain('taskPair.card_preview_hint');
+    act(()=>toggle.focus());fireEvent.keyDown(toggle,{key:'ArrowDown'});
+    const preview=document.body.querySelector<HTMLElement>('.task-pair-card-hover-preview')!;
+    expect(document.activeElement).toBe(preview);
+    fireEvent.keyDown(preview,{key:'Escape'});act(()=>vi.advanceTimersByTime(500));
+    expect(document.activeElement).toBe(toggle);
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+    fireEvent.click(toggle);fireEvent.keyDown(toggle,{key:'ArrowDown'});act(()=>vi.advanceTimersByTime(500));
+    expect(container.querySelector('.task-pair-card-body')).toBeTruthy();
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+  });
+  it('cancels pending opens on expansion, event replacement and unmount', () => {
+    const view=render(<TaskPairEventChip eventId="pending-1" payload={payload} />);
+    const enter=()=>fireEvent.pointerEnter(view.container.querySelector('.task-pair-title-preview-trigger')!,{pointerType:'mouse'});
+    enter();fireEvent.click(view.container.querySelector('.task-pair-card-toggle')!);act(()=>vi.advanceTimersByTime(500));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+    fireEvent.click(view.container.querySelector('.task-pair-card-toggle')!);enter();
+    view.rerender(<TaskPairEventChip eventId="pending-2" payload={{...payload,taskId:'other'}} />);act(()=>vi.advanceTimersByTime(500));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+    enter();view.unmount();act(()=>vi.advanceTimersByTime(500));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+  });
+  it('keeps a translated preview hint in all seven locales', () => {
+    const root=process.cwd().endsWith('/web')?process.cwd():join(process.cwd(),'web');
+    for(const locale of ['en','zh-CN','zh-TW','ja','ko','es','ru']) {
+      const d=JSON.parse(readFileSync(join(root,'src/i18n/locales',`${locale}.json`),'utf8'));
+      expect(d.taskPair.card_preview_hint).toBeTruthy();
+    }
+  });
+
 });

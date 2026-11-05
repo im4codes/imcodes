@@ -4854,6 +4854,7 @@
       "delivery_updated": "訊息投遞資訊已更新",
       "brain_notice_updated": "Brain通知資訊已更新",
       "dispatch_updated": "任務派發已更新"
-    }
+    },
+    "card_preview_hint": "懸停標題或按↓預覽，按Esc關閉預覽"
   }
 }
