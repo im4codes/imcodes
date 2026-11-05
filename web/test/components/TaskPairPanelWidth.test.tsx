@@ -6,6 +6,7 @@ import { TASK_PAIR_PANEL_WIDTH_KEY, readTaskPairPanelWidth, taskPairPanelWidthBo
 import { resetTaskPairPanelMemoryForTests } from '../../src/task-pair-panel-state.js';
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 const events = [{ eventId: 'width-event', type: 'task_pair.event', ts: 1, payload: { taskId: 'width-task', title: 'Width task', toStatus: 'working', executor: 'deck_sub_width' } }] as never[];
+const pointerDownDescriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'onpointerdown');
 let available = 1280;
 class TestPointerEvent extends MouseEvent {
   pointerId: number;
@@ -21,12 +22,19 @@ beforeEach(() => {
   localStorage.clear(); resetTaskPairPanelMemoryForTests(); available = 1280;
   delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
   vi.stubGlobal('PointerEvent', TestPointerEvent);
+  // Older jsdom has no pointer event handler property. Preact uses this native
+  // capability to normalize onPointerDown to the browser's lowercase event.
+  Object.defineProperty(HTMLElement.prototype, 'onpointerdown', { configurable: true, writable: true, value: null });
   vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} });
   vi.spyOn(window, 'innerWidth', 'get').mockReturnValue(1280);
   vi.spyOn(window, 'matchMedia').mockReturnValue({ matches: false, addEventListener() {}, removeEventListener() {} } as unknown as MediaQueryList);
   vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(() => ({ width: available, height: 800, x: 0, y: 0, top: 0, left: 0, right: available, bottom: 800, toJSON() {} }));
 });
-afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+afterEach(() => {
+  cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals();
+  if (pointerDownDescriptor) Object.defineProperty(HTMLElement.prototype, 'onpointerdown', pointerDownDescriptor);
+  else delete (HTMLElement.prototype as unknown as Record<string, unknown>).onpointerdown;
+});
 
 describe('desktop pair panel width', () => {
   it('drags left to grow, writes only on release and remembers across server/session remounts', () => {
