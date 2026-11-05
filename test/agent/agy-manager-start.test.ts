@@ -143,11 +143,11 @@ describe('AG manager start ownership (real runtime, SQLite and SDK child)', () =
     expect(store.getSession(names[0])?.providerResumeId).not.toBe(store.getSession(names[1])?.providerResumeId);
   });
 
-  it('keeps a live AG owner across an older provider/type projection, while normal explicit relaunch still works', async () => {
+  it.each(['codex-sdk', 'claude-code'])('keeps a live AG owner across older %s projections, while explicit relaunch still works', async oldType => {
     const name = names[1]; const options = { name, projectName: 'realproj', role: 'w1' as const, agentType: AGY_SDK_PROVIDER_ID, projectDir: home, identityPrompt: 'fixture' };
     await launchTransportSession({ ...options, fresh: true });
     const before = { ...store.getSession(name)! };
-    await rebuildSubSessions([{ id: name.slice('deck_sub_'.length), type: 'codex-sdk', providerId: 'codex-sdk', cwd: home, providerSessionId: 'prior-provider-route', providerResumeId: 'foreign-native' }]);
+    await rebuildSubSessions([{ id: name.slice('deck_sub_'.length), type: oldType, providerId: oldType, cwd: home, providerSessionId: 'prior-provider-route', providerResumeId: 'foreign-native' }]);
     expect(store.getSession(name)).toMatchObject({ agentType: AGY_SDK_PROVIDER_ID, providerId: AGY_SDK_PROVIDER_ID, runtimeEpoch: before.runtimeEpoch, providerSessionId: before.providerSessionId });
     const first = getTransportRuntime(name)!;
     first.send('first native turn', 'owned-first');
