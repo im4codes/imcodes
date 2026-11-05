@@ -192,6 +192,32 @@ describe('SubSessionBar', () => {
     });
   });
 
+  it('caps compact model labels without shortening the identity or context', () => {
+    const sub = makeSubSession({ type: 'gemini', activeModel: 'gemini-4-argon-high' });
+    const props = {
+      subSessions: [sub], openIds: new Set<string>(), collapsed: true,
+      desktopLayoutCapable: false, onOpen: vi.fn(), onClose: vi.fn(),
+      onRestart: vi.fn(), onNew: vi.fn(), ws: null, connected: true,
+      onDiff: vi.fn(), onHistory: vi.fn(),
+      subUsages: new Map([[sub.sessionName, { inputTokens: 100_000, cacheTokens: 0, contextWindow: 1_000_000, model: 'gemini-4-argon-high' }]]),
+    };
+    const view = render(<SubSessionBar {...props} />);
+    expect(view.container.querySelector('.subsession-card-model')?.textContent).toBe('argon-high');
+    expect(view.container.querySelector('.subsession-card-model')?.getAttribute('title')).toContain('gemini-4-argon-high');
+    expect((view.container.querySelector('.subsession-card') as HTMLButtonElement).title).toContain('gemini-4-argon-high');
+    expect((view.container.querySelector('.subsession-card') as HTMLButtonElement).title).toContain('ctx 10%');
+    expect(sub.activeModel).toBe('gemini-4-argon-high');
+    view.rerender(<SubSessionBar {...props} subSessions={[{ ...sub, activeModel: 'gpt-6.1-sol' }]} />);
+    expect(view.container.querySelector('.subsession-card-model')?.textContent).toBe('6.1-sol');
+    view.rerender(<SubSessionBar {...props} subSessions={[{ ...sub, activeModel: 'opus[1M]' }]} subUsages={new Map([[sub.sessionName, { inputTokens: 100_000, cacheTokens: 0, contextWindow: 1_000_000, model: 'claude-opus-4-8' }]])} />);
+    expect(view.container.querySelector('.subsession-card-model')?.textContent).toBe('opus-4.8');
+    expect(view.container.querySelector('.subsession-card-model')?.getAttribute('title')).toContain('claude-opus-4-8');
+    view.rerender(<SubSessionBar {...props} subSessions={[{ ...sub, activeModel: null }]} subUsages={undefined} />);
+    expect(view.container.querySelector('.subsession-card-model')).toBeNull();
+    view.rerender(<SubSessionBar {...props} subSessions={[{ ...sub, activeModel: null }]} />);
+    expect(view.container.querySelector('.subsession-card-model')?.textContent).toBe('argon-high');
+  });
+
   it('shows gray, green, and yellow daemon-bar connection states from the live broker', async () => {
     const statsWs = makeStatsWs();
     const view = render(

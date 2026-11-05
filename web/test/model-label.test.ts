@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { shortModelLabel, bestModelLabel } from '../src/model-label.js';
+import { shortModelLabel, bestModelLabel, subSessionModelPresentation } from '../src/model-label.js';
 
 describe('shortModelLabel', () => {
   it('shows the last two parts of any GPT/Codex id, so version and variant both survive', () => {
@@ -70,5 +70,31 @@ describe('bestModelLabel', () => {
     expect(bestModelLabel('opus[1M]', undefined)).toBe('opus');
     expect(bestModelLabel(null, 'opus[1M]')).toBe('opus');
     expect(bestModelLabel(null, undefined)).toBeNull();
+  });
+});
+
+describe('subSessionModelPresentation', () => {
+  it.each([
+    [undefined, null], [null, null], ['', null], ['   ', null],
+    ['opus', 'opus'], ['opus-4.8', 'opus-4.8'], ['flash', 'flash'],
+    ['gemini-4-argon-high', 'argon-high'], ['gpt-6.1-sol', '6.1-sol'],
+    ['gemini-3-flash-preview', 'flash'], ['gpt-4o', 'gpt-4o'],
+    ['qwen3-coder-next', 'coder-next'], ['glm-4.7', 'glm-4.7'],
+    ['kimi-k2.5', 'kimi-k2.5'], ['minimax-m2.5-high', 'm2.5-high'],
+  ])('caps only the final display label for %s', (model, label) => {
+    expect(subSessionModelPresentation(model).label).toBe(label);
+  });
+
+  it('keeps full candidates in the tooltip and leaves existing labels/priority unchanged', () => {
+    expect(subSessionModelPresentation('opus[1M]', 'claude-opus-4-8')).toEqual({
+      label: 'opus-4.8', title: 'opus[1M] · claude-opus-4-8',
+    });
+    expect(subSessionModelPresentation(' gemini-4-argon-high ', 'gemini-4-argon-high').title).toBe('gemini-4-argon-high');
+    expect(subSessionModelPresentation(null, 'gemini-4-argon-high').label).toBe('argon-high');
+    expect(subSessionModelPresentation('gpt-6.1-sol', 'gpt-5.4-mini').label).toBe('6.1-sol');
+    expect(subSessionModelPresentation(null, '')).toEqual({ label: null, title: undefined });
+    // Non-sub-session consumers still get the original full Gemini label.
+    expect(bestModelLabel('gemini-4-argon-high')).toBe('gemini-4-argon-high');
+    expect(bestModelLabel('qwen3-coder-next')).toBe('qwen3-coder-next');
   });
 });

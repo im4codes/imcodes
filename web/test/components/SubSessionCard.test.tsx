@@ -108,6 +108,22 @@ describe('SubSessionCard', () => {
     localStorage.clear();
   });
 
+  it('caps expanded model labels without shortening the control identity', () => {
+    const sub = makeSubSession({ type: 'gemini', activeModel: 'gemini-4-argon-high' });
+    const props = { sub, ws: null, connected: true, isOpen: false,
+      quickData: { data: [], recordHistory: vi.fn() } as any,
+      onOpen: vi.fn(), onDiff: vi.fn(), onHistory: vi.fn() };
+    const view = render(<SubSessionCard {...props} />);
+    expect(view.container.querySelector('.subcard-model')?.textContent).toBe('argon-high');
+    expect(view.container.querySelector('.subcard-model')?.getAttribute('title')).toBe('gemini-4-argon-high');
+    expect(sessionControlsSpy.mock.calls.at(-1)?.[0].activeSession.activeModel).toBe('gemini-4-argon-high');
+    view.rerender(<SubSessionCard {...props} sub={{ ...sub, activeModel: 'gpt-6.1-sol' }} />);
+    expect(view.container.querySelector('.subcard-model')?.textContent).toBe('6.1-sol');
+    expect(sessionControlsSpy.mock.calls.at(-1)?.[0].activeSession.activeModel).toBe('gpt-6.1-sol');
+    view.rerender(<SubSessionCard {...props} sub={{ ...sub, activeModel: null }} />);
+    expect(view.container.querySelector('.subcard-model')).toBeNull();
+  });
+
   it('projects canonical peer-audit identity/model metadata into compact SessionControls', () => {
     render(
       <SubSessionCard

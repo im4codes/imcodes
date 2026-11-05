@@ -33,7 +33,7 @@ import { reorderSubSessions } from '../api.js';
 import { formatLabel } from '../format-label.js';
 import { getAgentBadgeLabel } from '../agent-display.js';
 import { resolveContextWindow } from '../model-context.js';
-import { bestModelLabel } from '../model-label.js';
+import { subSessionModelPresentation } from '../model-label.js';
 import { P2pProgressCard } from './P2pProgressCard.js';
 import type { P2pProgressDiscussion } from './P2pProgressCard.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
@@ -368,7 +368,7 @@ function CollapsedSubSessionButtonImpl({ sub, accentColor, isOpen, isFocused, id
   const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
   const abbr = getAgentBadgeLabel(sub.type);
   const effectiveModel = resolveQuickAgentDelegationModel(sub, detectedModel, usage?.model);
-  const model = bestModelLabel(effectiveModel, usage?.model);
+  const { label: model, title: modelTitle } = subSessionModelPresentation(effectiveModel, usage?.model);
   let ctxPct = 0;
   if (usage) {
     const ctx = resolveContextWindow(
@@ -394,7 +394,7 @@ function CollapsedSubSessionButtonImpl({ sub, accentColor, isOpen, isFocused, id
       onDragOver={(event) => onEntryDragOver(sub.id, event)}
       onDragEnd={(event) => onEntryDragEnd(sub.id, event)}
       onContextMenu={(event) => onContextMenu(sub.id, event)}
-      title={label + (model ? ` · ${model}` : '') + (ctxPct > 0 ? ` · ctx ${ctxPct.toFixed(0)}%` : '')}
+      title={label + (modelTitle ? ` · ${modelTitle}` : '') + (ctxPct > 0 ? ` · ctx ${ctxPct.toFixed(0)}%` : '')}
       style={{ '--subsession-accent-color': accentColor } as JSX.CSSProperties}
     >
       {activeIdleFlashToken ? <IdleFlashLayer key={`subbutton-idle-${activeIdleFlashToken}`} variant="frame" /> : null}
@@ -402,7 +402,7 @@ function CollapsedSubSessionButtonImpl({ sub, accentColor, isOpen, isFocused, id
       <span class="subsession-card-label">{sub.label ? formatLabel(sub.label).slice(0, 12) : agentTag.slice(0, 6)}</span>
       {inP2p && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
       <SharedStateIndicator state={sharedState} iconOnly />
-      {model && <span class="subsession-card-model">{model}</span>}
+      {model && <span class="subsession-card-model" title={modelTitle}>{model}</span>}
       {sub.ccPresetId && <span class="subsession-card-custom-api" title={`Custom API: ${sub.ccPresetId}`}>◉</span>}
       {/* tsk_5zv: a static running mark so the running state never depends on the
           bottom marquee alone - it survives prefers-reduced-motion and reads at a
