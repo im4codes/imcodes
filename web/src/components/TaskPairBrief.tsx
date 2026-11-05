@@ -110,6 +110,12 @@ function TaskPairBriefView(props: TaskPairBriefProps) {
   const checklist = parsed;
   const implementedCount = counts.implemented;
   const auditedCount = counts.audited;
+  const countsKnown = (available || !!props.checklist)
+    && [counts.total, implementedCount, auditedCount].every(value => Number.isSafeInteger(value) && value >= 0)
+    && implementedCount <= counts.total && auditedCount <= counts.total;
+  const checklistLabel = countsKnown
+    ? `${t('taskPair.checklist_toggle')}: ${t('taskPair.implemented')} ${implementedCount}/${counts.total}, ${t('taskPair.audited')} ${auditedCount}/${counts.total}`
+    : t('taskPair.checklist_toggle');
   const loading = !available && (lazy.status === 'loading' || lazy.status === 'idle');
   return (
     <section onClick={(event) => event.stopPropagation()} class={`task-pair-brief${props.className ? ` ${props.className}` : ''}`} data-testid={`task-pair-brief-${props.taskId}`}>
@@ -117,14 +123,15 @@ function TaskPairBriefView(props: TaskPairBriefProps) {
         <button type="button" class="task-pair-brief-toggle" aria-expanded={open} aria-controls={contentId} onClick={() => { if (!open && revision && lazy.status === 'failed') requestTaskPairBrief(props.taskId, revision); setOpen((value) => !value); }}>
           {t(open ? 'taskPair.brief_collapse' : 'taskPair.brief_expand')}
         </button>
-        <button type="button" class="task-pair-brief-copy" onClick={() => { if (brief) void copy(brief); else setCopyRequested(true); }} aria-label={t('taskPair.brief_copy')}>
-          {copied ? t('taskPair.brief_copied') : t('taskPair.brief_copy')}
+        <button type="button" class="task-pair-brief-copy" onClick={() => { if (brief) void copy(brief); else setCopyRequested(true); }} aria-label={t(copied ? 'taskPair.brief_copied' : 'taskPair.brief_copy')} title={t(copied ? 'taskPair.brief_copied' : 'taskPair.brief_copy')}>
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+            {copied ? <path d="m5 12 4 4L19 6" /> : <><rect x="8" y="8" width="12" height="13" rx="2" /><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3" /></>}
+          </svg>
         </button>
-        <button type="button" class="task-pair-brief-checklist-toggle" aria-label={t('taskPair.checklist_toggle')} title={t('taskPair.checklist_toggle')} aria-expanded={checklistOpen} aria-controls={checklistId} onClick={() => { if (!checklistOpen && revision && lazy.status === 'failed') requestTaskPairBrief(props.taskId, revision); setChecklistOpen((value) => !value); }}>
-          <span class="task-pair-brief-checklist-label">{t('taskPair.checklist_toggle')}</span>
-          {counts.total > 0 && <span class="task-pair-brief-checklist-summary" aria-label={`${t('taskPair.implemented')} ${implementedCount}/${counts.total}, ${t('taskPair.audited')} ${auditedCount}/${counts.total}`}>
-            {t('taskPair.implemented')}: {implementedCount}/{counts.total} · {t('taskPair.audited')}: {auditedCount}/{counts.total}
-          </span>}
+        <button type="button" class="task-pair-brief-checklist-toggle" aria-label={checklistLabel} title={checklistLabel} aria-expanded={checklistOpen} aria-controls={checklistId} onClick={() => { if (!checklistOpen && revision && lazy.status === 'failed') requestTaskPairBrief(props.taskId, revision); setChecklistOpen((value) => !value); }}>
+          <span class="task-pair-brief-checklist-summary" aria-hidden="true">
+            {countsKnown ? `${implementedCount}/${counts.total} : ${auditedCount}/${counts.total}` : '— : —'}
+          </span>
         </button>
       </div>
       {checklistOpen && <div id={checklistId} class="task-pair-brief-checklist-panel task-pair-brief-content" role="region" aria-label={t('taskPair.checklist_toggle')} aria-busy={!available && loading} tabIndex={0}>

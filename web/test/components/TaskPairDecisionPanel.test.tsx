@@ -81,9 +81,10 @@ describe('TaskPairDecisionPanel', () => {
     expect(frames).toHaveLength(1);
     expect(frames[0]).toMatchObject({ taskId: 'task', round: 1, questionId: 'question', optionId: 'test', feedback: 'No production writes' });
   });
-  it('makes a missing blocker explicit and accepts free text for older paused tasks', () => {
+  it('accepts free text for older paused tasks without inventing blocker details', () => {
     render(<TaskPairDecisionPanel taskId="task" pair={{ ...pair, decisionRequest: undefined, flags: ['blocked'] }} />);
-    expect(screen.getByText('taskPair.decision.missing')).toBeTruthy();
+    expect(screen.queryByText('taskPair.decision.missing')).toBeNull();
+    expect(document.querySelector('.task-pair-decision-copy')).toBeNull();
     expect(screen.getByRole('textbox')).toBeTruthy();
   });
   it('keeps feedback and final rulings distinct and removes choices after a ruling', () => {
@@ -318,7 +319,7 @@ describe('TaskPairDecisionPanel', () => {
       expect(screen.getByRole('button', { name: 'taskPair.decision.wait' })).toBeTruthy();
     });
 
-    it('shows legacy_unknown with missing notice and ask button for truly unrecorded blocker', () => {
+    it('keeps legacy_unknown actions without a placeholder for an unrecorded blocker', () => {
       const unknownPair: SupervisionConsolePairInfo = {
         status: 'working',
         round: 1,
@@ -329,7 +330,8 @@ describe('TaskPairDecisionPanel', () => {
       render(<TaskPairDecisionPanel taskId="task" pair={unknownPair} />);
 
       expect(screen.getByText('taskPair.decision.title')).toBeTruthy();
-      expect(screen.getByText('taskPair.decision.missing')).toBeTruthy();
+      expect(screen.queryByText('taskPair.decision.missing')).toBeNull();
+    expect(document.querySelector('.task-pair-decision-copy')).toBeNull();
       expect(screen.getByRole('button', { name: 'taskPair.decision.ask' })).toBeTruthy();
       expect(screen.getByRole('button', { name: 'taskPair.decision.ready' })).toBeTruthy();
       expect(screen.getByRole('button', { name: 'taskPair.decision.wait' })).toBeTruthy();

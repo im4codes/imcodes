@@ -15346,7 +15346,7 @@ button.quick-agent-delegation-preset.active {
 .task-pair-brief-actions button { border: 0; background: transparent; color: var(--chrome-accent, #67e8f9); padding: 1px 3px; font: inherit; font-size: 10px; cursor: pointer; }
 .task-pair-brief-actions button:hover { text-decoration: underline; }
 .task-pair-brief-actions button { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.task-pair-brief-copy { opacity: .78; }
+.task-pair-brief-actions .task-pair-brief-copy { opacity: .78; display: inline-flex; align-items: center; justify-content: center; align-self: stretch; flex: 0 0 26px; }
 .task-pair-brief-actions .task-pair-brief-checklist-toggle { display: flex; align-items: center; gap: 4px; min-width: 0; }
 .task-pair-brief-checklist-label { flex: 0 0 auto; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .task-pair-brief-checklist-toggle .task-pair-brief-checklist-summary { overflow: hidden; text-overflow: ellipsis; }

@@ -214,7 +214,7 @@ describe('SupervisionTaskConsole', () => {
     expect(screen.getByText('Pair title')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'taskPair.brief_expand' }));
     expect(view.container.querySelector('.task-pair-brief-content')?.textContent).toContain('Full brief text.');
-    fireEvent.click(screen.getByRole('button', { name: 'taskPair.checklist_toggle' }));
+    fireEvent.click(screen.getByRole('button', { name: /^taskPair\.checklist_toggle/ }));
     expect(view.container.querySelector('.task-pair-brief-checklist-panel')?.textContent).toContain('Ship it');
     expect(screen.getAllByRole('checkbox')).toHaveLength(2);
   });

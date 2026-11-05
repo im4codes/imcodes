@@ -54,6 +54,10 @@ import { render } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import '../../styles.css';
 import '../../i18n/index.js';
+import { SupervisionTaskConsoleView } from '../../components/SupervisionTaskConsole.js';
+import { createSupervisionTaskConsoleState, SUPERVISION_TASK_CONSOLE_PHASE, SUPERVISION_TASK_CONSOLE_SYNC_STATE } from '../../supervision-task-console-reducer.js';
+import { TASK_PAIR_TIMELINE_EVENT } from '@shared/task-pair.js';
+import type { SupervisionConsolePairInfo } from '@shared/supervision-task-console.js';
 import { ChatView, __buildViewItemsForTests } from '../../components/ChatView.js';
 import { WsClient, type TimelineEvent } from '../../ws-client.js';
 import { bindTaskPairDecisions, receiveTaskPairDecision } from '../../task-pair-decisions.js';
@@ -336,6 +340,19 @@ function FixtureHarness() {
   const containerStyle = windowCount === 4
     ? { display: 'flex', flexWrap: 'wrap' as const, width: '100vw', height: '100vh' }
     : { width: '100vw', height: '100vh' };
+
+  // Opt-in real console consumer, sharing the same synthetic event IO seam.
+  // This fixture-only module is excluded from normal production builds.
+  if (query.get('console') === '1') {
+    const event = events.find(entry => entry.type === TASK_PAIR_TIMELINE_EVENT);
+    const payload = event?.payload as (SupervisionConsolePairInfo & { taskId: string; title: string }) | undefined;
+    const state = createSupervisionTaskConsoleState({ projectName: 'fixture', coordinatorSessionName: 'fixture-brain' });
+    return <div style={{ display: 'flex', height: '100vh', width: '100vw' }}>
+      <SupervisionTaskConsoleView mobile={window.innerWidth <= 720} width={Math.min(window.innerWidth, 720)} onClose={() => {}} onNavigateSession={session => window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session } }))}
+        state={{ ...state, phase: SUPERVISION_TASK_CONSOLE_PHASE.READY, hasAuthoritativeSnapshot: true, syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.SYNCED,
+          tasks: payload ? { [payload.taskId]: { taskId: payload.taskId, title: payload.title, status: 'implementing', phase: 'active', validationState: 'pending', updatedAt: event!.ts, lastEventId: 1, pair: payload } } : {} }} />
+    </div>;
+  }
 
   return (
     <div

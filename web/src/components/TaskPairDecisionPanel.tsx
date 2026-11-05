@@ -40,7 +40,7 @@ export function resolveDecisionCategory(
   if (pair.flags?.some((flag) => flag === 'waiting_for_capacity' || flag === 'needs_auditor')) {
     return 'waiting_capacity';
   }
-  if (pair.blockedNote) {
+  if (pair.blockedNote?.trim()) {
     return 'blocked';
   }
   const isBlocked = pair.flags?.some((flag) => flag === 'blocked' || flag === 'needs_input');
@@ -134,7 +134,7 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
   const rulingToShow = relevantRuling ?? (latest?.kind === TASK_PAIR_DECISION_KIND.DECISION ? latest : undefined);
   const hasActiveQuestion = !!(question && !resolved);
   const hasNewBlocker = !!(
-    pair.blockedNote
+    pair.blockedNote?.trim()
     || taskPairWaitKind(pair)
     || pair.flags?.some((flag) => flag === 'waiting_for_capacity' || flag === 'needs_auditor')
     || pair.status === 'awaiting_brain_decision'
@@ -171,7 +171,7 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
 
   switch (category) {
     case 'request': {
-      reason = question?.question || question?.summary || '';
+      reason = question?.question?.trim() || question?.summary?.trim() || '';
       if (question?.author) {
         responsible = t('taskPair.decision.responsible_executor', { name: question.author });
       }
@@ -224,8 +224,7 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
     }
     case 'legacy_unknown':
     default: {
-      reason = (resolved && !hasNewBlocker && (question?.question || question?.summary))
-        || (readOnly ? '' : t('taskPair.decision.missing'));
+      reason = (resolved && !hasNewBlocker && (question?.question?.trim() || question?.summary?.trim())) || pair.waitingReason?.trim() || '';
       if (resolved && !hasNewBlocker && question?.author) {
         responsible = t('taskPair.decision.responsible_executor', { name: question.author });
       }
@@ -233,18 +232,19 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
     }
   }
 
+  const rulingText = [rulingToShow?.conclusion?.trim(), rulingToShow?.summary?.trim()].filter(Boolean).join(' — ');
   const decisionText = [
     reason,
-    responsible,
-    (hasActiveQuestion || (!hasNewBlocker && resolved)) && question?.recommendation
-      ? `${t('taskPair.decision.recommendation')}: ${question.recommendation}`
+    reason.trim() ? responsible : '',
+    (hasActiveQuestion || (!hasNewBlocker && resolved)) && question?.recommendation?.trim()
+      ? `${t('taskPair.decision.recommendation')}: ${question.recommendation.trim()}`
       : '',
-    !hasNewBlocker && rulingToShow && (resolved || (!question && (rulingToShow.deliveryRound ?? 1) === (pair.deliveryRound ?? 1) && rulingToShow.round === pair.round))
-      ? `${t('taskPair.decision.ruling')}: ${rulingToShow.conclusion} — ${rulingToShow.summary}`
+    !hasNewBlocker && rulingToShow && rulingText && (resolved || (!question && (rulingToShow.deliveryRound ?? 1) === (pair.deliveryRound ?? 1) && rulingToShow.round === pair.round))
+      ? `${t('taskPair.decision.ruling')}: ${rulingText}`
       : '',
-  ].filter(Boolean).join('\n');
+  ].map(part => part.trim()).filter(Boolean).join('\n');
 
-  if (!waiting && !question && !latest) return null;
+  if (!error && !sent && (!waiting || (readOnly && !decisionText)) && !question && !latest) return null;
 
   const showFallbackOptions = category === 'legacy_unknown' || category === 'blocked' || category === 'paused' || category === 'wait_dependencies';
   const showAskButton = category === 'legacy_unknown';
@@ -280,7 +280,7 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
     {!hasNewBlocker && rulingToShow && <small class="task-pair-decision-time">
       {t('taskPair.decision.time')}: <time dateTime={new Date(rulingToShow.at).toISOString()}>{new Date(rulingToShow.at).toLocaleString()}</time>
     </small>}
-    <ExpandableTaskObjective key={`${context}:${latest?.id ?? ''}`} text={decisionText} className="task-pair-decision-copy" scrollLabel={t('taskPair.decision.title')} />
+    {decisionText && <ExpandableTaskObjective key={`${context}:${latest?.id ?? ''}`} text={decisionText} className="task-pair-decision-copy" scrollLabel={t('taskPair.decision.title')} />}
     {!readOnly && waiting && <>
       {hasActiveQuestion && question?.options && question.options.length > 0 && (
         <div class="task-pair-decision-options">
@@ -378,8 +378,8 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
       <summary>{t('taskPair.decision.history')}</summary>
       <ol class="task-pair-decision-records">{history?.map((entry, index) => <li key={entry.id} value={index + 1}><article><b>{t(`taskPair.decision.kind.${entry.kind}`)}</b>
         <small> {entry.author} · <time dateTime={new Date(entry.at).toISOString()}>{new Date(entry.at).toLocaleString()}</time> · {t('taskPair.round', { round: entry.round })}</small>
-        <p>{entry.conclusion} — {entry.summary}</p>
-        {entry.question && <p>{entry.question}</p>}
+        {(entry.conclusion?.trim() || entry.summary?.trim()) && <p>{[entry.conclusion?.trim(), entry.summary?.trim()].filter(Boolean).join(' — ')}</p>}
+        {entry.question?.trim() && <p>{entry.question}</p>}
       </article></li>)}</ol>
     </details>
   </section>;

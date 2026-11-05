@@ -5,7 +5,7 @@ import { receiveTaskPairBrief, requestTaskPairBrief, resetTaskPairBriefStoreForT
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 vi.mock('../../src/components/ChatMarkdown.js', () => ({ ChatMarkdown: ({ text }: { text: string }) => <div class="markdown">{text}</div> }));
 const brief = `${'Long explanation\n'.repeat(100)}\n- [x][ ] First\n- [x][x] Second\n- [ ] Legacy\n\`\`\`md\n- [x][x] not a real item\n\`\`\``;
-const toggle = (container: HTMLElement) => within(container).getByRole('button', { name: 'taskPair.checklist_toggle' });
+const toggle = (container: HTMLElement) => within(container).getByRole('button', { name: /^taskPair\.checklist_toggle/ });
 beforeEach(() => resetTaskPairBriefStoreForTests());
 afterEach(() => { cleanup(); resetTaskPairBriefStoreForTests(); vi.restoreAllMocks(); });
 describe('independent pair checklist', () => {
@@ -99,7 +99,7 @@ describe('independent pair checklist', () => {
   it('has unique controlled IDs for repeated task mounts and stops click navigation', () => {
     const navigate = vi.fn();
     const v = render(<div onClick={navigate}><TaskPairBrief taskId="a" brief={brief} /><TaskPairBrief taskId="a" brief={brief} /></div>);
-    const buttons = within(v.container).getAllByRole('button', { name: 'taskPair.checklist_toggle' });
+    const buttons = within(v.container).getAllByRole('button', { name: /^taskPair\.checklist_toggle/ });
     expect(new Set(buttons.map(el => el.getAttribute('aria-controls'))).size).toBe(2);
     buttons.forEach(el => fireEvent.click(el));
     expect(v.container.querySelectorAll('.task-pair-brief-checklist-panel')).toHaveLength(2);

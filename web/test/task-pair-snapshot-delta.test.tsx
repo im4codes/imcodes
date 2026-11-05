@@ -390,14 +390,14 @@ describe('TaskPairBrief (lazy)', () => {
     const requests: string[] = [];
     setTaskPairBriefRequester((taskId) => requests.push(taskId));
     const view = render(<TaskPairBrief taskId="t1" briefRevision="rev-a" checklist={counts} />);
-    expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('taskPair.implemented: 1/2');
+    expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('1/2 :');
     expect(requests).toEqual([]); // collapsed: nothing fetched
     fireEvent.click(screen.getByRole('button', { name: 'taskPair.brief_expand' }));
     expect(requests).toEqual(['t1']);
     expect(view.container.querySelector('.task-pair-brief-content')?.textContent).toContain('taskPair.brief_loading');
     receiveTaskPairBrief('t1', 'rev-a', BRIEF('t1'));
     await waitFor(() => expect(view.container.querySelector('.task-pair-brief-content')?.textContent).toContain('Details matter for t1.'));
-    fireEvent.click(screen.getByRole('button', { name: 'taskPair.checklist_toggle' }));
+    fireEvent.click(screen.getByRole('button', { name: /^taskPair\.checklist_toggle/ }));
     expect(view.container.querySelector('.task-pair-brief-checklist-panel')?.textContent).toContain('Implement t1');
     expect(view.container.querySelectorAll('.task-pair-brief-checklist-row')).toHaveLength(2);
     // Collapse/expand again: served from cache, no second request.
@@ -458,10 +458,10 @@ describe('TaskPairStatusPanel with revision-only briefs', () => {
       assignments: [],
     };
     const view = render(<TaskPairStatusPanel events={[]} serverId="lazy-panel" scopeSessionId="sub-window" />);
-    expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('taskPair.implemented: 1/1');
+    expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('1/1 :');
     await waitFor(() => expect(requests).toEqual(['mine']));
     receiveTaskPairBrief('mine', 'rev-m', '- [x][ ] Mine it');
-    fireEvent.click(screen.getByRole('button', { name: 'taskPair.checklist_toggle' }));
+    fireEvent.click(screen.getByRole('button', { name: /^taskPair\.checklist_toggle/ }));
     await waitFor(() => expect(view.container.querySelector('.task-pair-brief-checklist-panel')?.textContent).toContain('Mine it'));
     delete (window as any).__imcodesTaskPairSnapshot;
   });
