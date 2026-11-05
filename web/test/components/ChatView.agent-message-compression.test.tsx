@@ -34,7 +34,7 @@ vi.mock('../../src/hooks/usePref.js', () => ({
   }),
 }));
 
-import { ChatView } from '../../src/components/ChatView.js';
+import { ChatView, __ChatEventForTests as ChatEvent } from '../../src/components/ChatView.js';
 import type { TimelineEvent } from '../../src/ws-client.js';
 import { AGENT_DELEGATION_SENDER_MARKER } from '../../../shared/agent-delegation.js';
 import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../../shared/chat-message-origin.js';
@@ -205,8 +205,92 @@ describe('Incoming agent message card compression & footer merge', () => {
     // Mask offset
     expect(css).toMatch(/\.chat-user\.chat-user-origin-agent\s+\.chat-user-message-fold\.is-folded::after\s*\{[^}]*bottom:\s*24px;/);
 
+    // Narrow/zoomed controls stay in one flex row without reducing the font.
+    expect(css).toMatch(/\.chat-user-footer \.chat-user-message-fold-toggle\s*\{[^}]*flex:\s*0 1 auto;/);
+    expect(css).toMatch(/\.chat-user-footer-right \.chat-bubble-time\s*\{[^}]*white-space:\s*normal;/);
+
     // Merged footer flex styles
     expect(css).toMatch(/\.chat-user-footer\s*\{[^}]*display:\s*flex;/);
     expect(css).toMatch(/\.chat-user-footer\s+\.chat-bubble-time,\s*\.chat-user-footer\s+\.chat-user-status\s*\{[^}]*margin-left:\s*auto;/);
+  });
+});
+
+
+const footerOrigins = [
+  { name: 'human', payload: { [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.USER }, origin: CHAT_MESSAGE_ORIGINS.USER, limit: 10 },
+  { name: 'legacy missing stamp', payload: {}, origin: CHAT_MESSAGE_ORIGINS.USER, limit: 10 },
+  { name: 'agent', payload: { [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.AGENT }, origin: CHAT_MESSAGE_ORIGINS.AGENT, limit: 7 },
+  { name: 'system', payload: { [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.SYSTEM }, origin: CHAT_MESSAGE_ORIGINS.SYSTEM, limit: 10 },
+];
+const lines = (n: number) => Array.from({ length: n }, (_, i) => `Unmodified line ${i + 1}`).join('\n');
+
+describe.each(footerOrigins)('Shared message footer: $name', ({ payload, origin, limit }) => {
+  it('keeps Show full and collapse with the single timestamp, without changing origin or content', () => {
+    const { container } = render(<ChatEvent event={makeMessage({ ...payload, text: lines(11) })} showTime />);
+    const bubble = container.querySelector('.chat-user')!;
+    expect(bubble.getAttribute('data-message-origin')).toBe(origin);
+    const footer = bubble.querySelector('.chat-user-footer');
+    expect(footer).toBeTruthy();
+    expect(footer?.querySelector('.chat-user-message-fold-toggle')).toBeTruthy();
+    expect(footer?.querySelector('.chat-bubble-time')).toBeTruthy();
+    expect(bubble.querySelectorAll('.chat-bubble-time')).toHaveLength(1);
+    expect(bubble.querySelector('.chat-bubble-content')?.textContent).toBe(lines(11));
+    const toggle = footer!.querySelector('button')!;
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(footer?.querySelector('.chat-bubble-time')).toBeTruthy();
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(bubble.querySelectorAll('.chat-user-footer')).toHaveLength(1);
+  });
+  it.each([0, 1, 7, 8, 10, 11])('preserves the hard-line threshold for %i lines', n => {
+    const { container } = render(<ChatEvent event={makeMessage({ ...payload, text: lines(n) })} />);
+    expect(container.querySelector('.chat-user-message-fold-toggle') !== null).toBe(n > limit);
+    expect(container.querySelectorAll('.chat-bubble-time')).toHaveLength(1);
+    if (n === 0) expect(container.querySelector('.chat-user-footer')).toBeNull();
+  });
+  it.each([
+    { showTime: false, ts: 1_700_000_000_000 },
+    { showTime: true, ts: 0 },
+    { showTime: true, ts: -1 },
+    { showTime: true, ts: Number.NaN },
+    { showTime: true, ts: Number.POSITIVE_INFINITY },
+    { showTime: true, ts: undefined },
+  ])('does not fabricate time or an empty footer for $showTime/$ts', ({ showTime, ts }) => {
+    const short = { ...makeMessage({ ...payload, text: 'Short' }), ts } as TimelineEvent;
+    const view = render(<ChatEvent event={short} showTime={showTime} />);
+    expect(view.container.querySelector('.chat-bubble-time')).toBeNull();
+    expect(view.container.querySelector('.chat-user-footer')).toBeNull();
+    view.rerender(<ChatEvent event={{ ...short, payload: { ...short.payload, text: lines(11) } }} showTime={showTime} />);
+    expect(view.container.querySelector('.chat-bubble-time')).toBeNull();
+    expect(view.container.querySelector('.chat-user-footer button')).toBeTruthy();
+    expect(view.container.querySelector('.chat-user-footer-right')).toBeNull();
+  });
+  it('preserves pending/queued/failed priority, retry payload and attachment-only time', () => {
+    const retry = vi.fn();
+    const text = lines(11);
+    const event = makeMessage({ ...payload, text, pending: true, queued: true });
+    const view = render(<ChatEvent event={event} onResendFailed={retry} />);
+    expect(view.container.querySelector('.chat-user-footer .chat-user-status-pending')).toBeTruthy();
+    expect(view.container.querySelector('.chat-user-status-queued')).toBeNull();
+    expect(view.container.querySelector('.chat-bubble-time')).toBeNull();
+    view.rerender(<ChatEvent event={{ ...event, payload: { ...payload, text, queued: true } }} onResendFailed={retry} />);
+    expect(view.container.querySelector('.chat-user-footer-right .chat-user-status-queued')).toBeTruthy();
+    expect(view.container.querySelectorAll('.chat-bubble-time')).toHaveLength(1);
+    view.rerender(<ChatEvent event={{ ...event, payload: { ...payload, text, failed: true, queued: true, commandId: 'footer-retry' } }} onResendFailed={retry} />);
+    expect(view.container.querySelector('.chat-user-status-queued')).toBeNull();
+    expect(view.container.querySelector('.chat-bubble-time')).toBeNull();
+    fireEvent.click(view.container.querySelector('.chat-user-footer .chat-user-retry-btn')!);
+    expect(retry).toHaveBeenCalledWith('footer-retry', text);
+    const attachments = [{ id: 'fixture-attachment', originalName: 'report.txt', mime: 'text/plain', daemonPath: '/fixture/report.txt' }];
+    view.rerender(<ChatEvent event={{ ...event, payload: { ...payload, text: '', attachments } }} serverId="fixture-server" />);
+    expect(view.container.querySelector('.chat-user-message-fold')).toBeNull();
+    expect(view.container.querySelector('.chat-user-footer')).toBeNull();
+    expect(view.container.querySelectorAll('.chat-bubble-time')).toHaveLength(1);
+    expect(view.container.textContent).toContain('report.txt');
+    view.rerender(<ChatEvent event={{ ...event, payload: { ...payload, text: 'With attachment', attachments } }} serverId="fixture-server" />);
+    expect(view.container.querySelectorAll('.chat-bubble-time')).toHaveLength(1);
+    expect(view.container.querySelector('.chat-user-footer') !== null).toBe(origin === CHAT_MESSAGE_ORIGINS.AGENT);
+    expect(view.container.textContent).toContain('report.txt');
   });
 });

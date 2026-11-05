@@ -6031,10 +6031,10 @@ const ChatEvent = memo(function ChatEvent({
               onImagePreview={onImagePreview}
               onOpenLocalWebPreview={onOpenLocalWebPreview}
               isAgent={isAgent}
-              footerRight={isAgent ? timeAndStatus : undefined}
+              footerRight={timeAndStatus}
             />
           )}
-          {(!isAgent || !userText) && timeAndStatus}
+          {!userText && timeAndStatus}
         </div>
       );
     }
@@ -6910,16 +6910,16 @@ function UserMessageText({
   }, [hardLineOverflow, prose, lineLimit]);
 
   return (
-    <div class={`chat-user-message-fold${shouldFold ? ' is-foldable' : ''}${folded ? ' is-folded' : ''}${measuring ? ' is-measuring' : ''}`}>
-      {leadingSender && <DelegationSenderCardView card={leadingSender} />}
-      <div
-        ref={contentRef}
-        class={`chat-bubble-content chat-user-message-fold-content${folded ? ' is-folded' : ''}${measuring ? ' is-measuring' : ''}`}
-      >
-        {splitPathsAndUrls(prose, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}
-      </div>
-      {isAgent ? (
-        (shouldFold || footerRight) && (
+    <>
+      <div class={`chat-user-message-fold${shouldFold ? ' is-foldable' : ''}${folded ? ' is-folded' : ''}${measuring ? ' is-measuring' : ''}`}>
+        {leadingSender && <DelegationSenderCardView card={leadingSender} />}
+        <div
+          ref={contentRef}
+          class={`chat-bubble-content chat-user-message-fold-content${folded ? ' is-folded' : ''}${measuring ? ' is-measuring' : ''}`}
+        >
+          {splitPathsAndUrls(prose, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}
+        </div>
+        {(isAgent || shouldFold) && (shouldFold || footerRight) && (
           <div class="chat-user-footer">
             {shouldFold && (
               <button
@@ -6931,27 +6931,14 @@ function UserMessageText({
                 {expanded ? t('chat.user_message_collapse') : t('chat.user_message_expand')}
               </button>
             )}
-            {footerRight && (
-              <span class="chat-user-footer-right">
-                {footerRight}
-              </span>
-            )}
+            {footerRight && <span class="chat-user-footer-right">{footerRight}</span>}
           </div>
-        )
-      ) : (
-        shouldFold && (
-          <button
-            type="button"
-            class="chat-user-message-fold-toggle"
-            aria-expanded={expanded}
-            onClick={() => setExpanded((value) => !value)}
-          >
-            {expanded ? t('chat.user_message_collapse') : t('chat.user_message_expand')}
-          </button>
-        )
-      )}
-      {trailingReply && <DelegationReplyInstructionCardView card={trailingReply} />}
-    </div>
+        )}
+        {trailingReply && <DelegationReplyInstructionCardView card={trailingReply} />}
+      </div>
+      {/* Keep the non-foldable, non-Agent timestamp/status DOM and height unchanged. */}
+      {!isAgent && !shouldFold && footerRight}
+    </>
   );
 }
 

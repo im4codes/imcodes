@@ -5312,14 +5312,16 @@ html.native-ios-mac .chat-dl-btn {
 .chat-user-message-fold-toggle:hover { background: rgba(15, 23, 42, 0.32); border-color: rgba(147, 197, 253, 0.6); color: #e0f2fe; }
 .chat-user-message-fold-toggle:active { transform: translateY(1px); }
 .chat-user-footer { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
-.chat-user-footer .chat-user-message-fold-toggle { margin-top: 0; flex: 0 0 auto; }
+.chat-user-footer .chat-user-message-fold-toggle { margin-top: 0; flex: 0 1 auto; min-width: 0; }
 .chat-user-footer .chat-bubble-time,
 .chat-user-footer .chat-user-status { margin-left: auto; margin-top: 0; flex: 0 0 auto; white-space: nowrap; }
 .chat-user-footer .chat-user-status-pending { margin-top: 0; margin-left: auto; }
-.chat-user-footer-right { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; margin-top: 0; flex: 0 0 auto; white-space: nowrap; }
+.chat-user-footer-right { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; margin-top: 0; flex: 0 1 auto; min-width: 0; white-space: nowrap; }
 .chat-user-footer-right .chat-bubble-time,
 .chat-user-footer-right .chat-user-status { margin: 0; }
 .chat-user-footer-right .chat-user-status-pending { margin: 0; }
+/* Keep one footer flex row at narrow/zoomed widths without shrinking its font or losing time text. */
+.chat-user-footer-right .chat-bubble-time { min-width: 0; flex: 0 1 auto; white-space: normal; overflow-wrap: anywhere; }
 .chat-assistant { padding: 6px 10px; word-break: break-word; overflow-wrap: break-word; line-height: 1.5; background: #161b22; border-radius: 8px; border: 0; }
 /* Consecutive assistant.text events are one visual answer. The old per-event
    margins exposed the blue chat backdrop as horizontal separator lines, and
