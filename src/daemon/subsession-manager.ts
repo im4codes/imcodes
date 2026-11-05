@@ -610,6 +610,16 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
       : existing?.ccPreset;
     if (isTransportAgent(sub.type)) {
       const existingRuntime = getTransportRuntime(sessionName);
+      const runtimeOwner = existingRuntime?.recipientIdentity;
+      // A reconnect DTO is a projection, not a runtime-replacement command.
+      // AG's local route and learned native handle belong to this exact live
+      // owner. Replaying an older route would rotate the store epoch behind
+      // the runtime and make its next lazy native start look foreign.
+      const ownsLiveAgy = existing?.agentType === AGY_SDK_PROVIDER_ID
+        && !!runtimeOwner
+        && existing.sessionInstanceId === runtimeOwner.sessionInstanceId
+        && existing.runtimeEpoch === runtimeOwner.runtimeEpoch
+        && existing.providerSessionId === existingRuntime?.providerSessionId;
       const now = Date.now();
       const nextRecord: SessionRecord = {
         ...existing,
@@ -637,6 +647,12 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         transportConfig: sub.transportConfig ?? existing?.transportConfig,
         description: sub.description ?? existing?.description,
         ccPreset: rebuildCcPreset,
+        ...(ownsLiveAgy ? {
+          agentType: existing.agentType,
+          providerId: existing.providerId,
+          providerSessionId: existing.providerSessionId,
+          providerResumeId: existing.providerResumeId,
+        } : {}),
       };
       // Rebuild is REPLAYED, not one-shot: the server re-sends it on every
       // reconnect. Writing all of them unconditionally made a reconnect cost a

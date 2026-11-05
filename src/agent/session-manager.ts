@@ -1,5 +1,5 @@
 import { AGY_NATIVE_SESSION_STATE, AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
-import { persistAgyNativeSessionStart } from './agy-session-persistence.js';
+import { agyNativeStartNotAttemptedError, persistAgyNativeSessionStart } from './agy-session-persistence.js';
 import { queuedUserMessageAttribution } from './transport-queued-user-message.js';
 import { paceByEventLoopHealth } from '../util/event-loop-backpressure.js';
 import { RESTORE_PACING_MIN_GAP_MS, RESTORE_PACING_TOTAL_WAIT_BUDGET_MS } from '../../shared/event-loop-backpressure.js';
@@ -2348,7 +2348,12 @@ function agyNativeStartBarrier(runtime: TransportSessionRuntime, sessionName: st
     const owner = runtime.recipientIdentity;
     if (!record || (owner && (record.sessionInstanceId !== owner.sessionInstanceId || record.runtimeEpoch !== owner.runtimeEpoch))
       || record.providerSessionId !== runtime.providerSessionId) {
-      throw Object.assign(new Error('AG start owner changed'), { code: PROVIDER_ERROR_CODES.CANCELLED, recoverable: false });
+      logger.warn({ session: sessionName, recordPresent: !!record,
+        instanceMatches: !!record && (!owner || record.sessionInstanceId === owner.sessionInstanceId),
+        epochMatches: !!record && (!owner || record.runtimeEpoch === owner.runtimeEpoch),
+        routeMatches: !!record && record.providerSessionId === runtime.providerSessionId,
+      }, 'AG native start owner guard rejected before native start');
+      throw agyNativeStartNotAttemptedError('AG start owner changed', PROVIDER_ERROR_CODES.CANCELLED);
     }
     await persistAgyNativeSessionStart(sessionName, { ...record }, () => transportRuntimes.get(sessionName) === runtime);
   };

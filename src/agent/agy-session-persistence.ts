@@ -2,7 +2,7 @@ import { AGY_NATIVE_SESSION_STATE, AGY_SDK_PROVIDER_ID, AGY_NATIVE_START_NOT_ATT
 import { PROVIDER_ERROR_CODES } from '../../shared/provider-error-codes.js';
 import { flushStore, getSession, upsertSession, listSessions, type SessionRecord } from '../store/session-store.js';
 
-function startFailure(message: string, code: string): Error {
+export function agyNativeStartNotAttemptedError(message: string, code: string): Error {
   return Object.assign(new Error(message), { code, recoverable: false,
     details: { [AGY_NATIVE_START_NOT_ATTEMPTED]: true } });
 }
@@ -19,24 +19,24 @@ export async function persistAgyNativeSessionStart(
       || record.sessionInstanceId !== expected.sessionInstanceId || record.runtimeEpoch !== expected.runtimeEpoch
       || record.createdAt !== expected.createdAt || record.providerSessionId !== expected.providerSessionId
       || record.providerResumeId !== expected.providerResumeId) {
-      throw startFailure('AG start owner changed', PROVIDER_ERROR_CODES.CANCELLED);
+      throw agyNativeStartNotAttemptedError('AG start owner changed', PROVIDER_ERROR_CODES.CANCELLED);
     }
     return record;
   };
   const record = current();
   if (record.providerResumeId && listSessions().some((other) => other.name !== name
     && other.agentType === AGY_SDK_PROVIDER_ID && other.providerResumeId === record.providerResumeId)) {
-    throw startFailure('AG resume id belongs to another local session', PROVIDER_ERROR_CODES.CONFIG_ERROR);
+    throw agyNativeStartNotAttemptedError('AG resume id belongs to another local session', PROVIDER_ERROR_CODES.CONFIG_ERROR);
   }
   if (!record.providerResumeId && record.agyNativeSessionState !== AGY_NATIVE_SESSION_STATE.UNSTARTED) {
-    throw startFailure('AG conversation has no trusted resume id or unused proof', PROVIDER_ERROR_CODES.CONFIG_ERROR);
+    throw agyNativeStartNotAttemptedError('AG conversation has no trusted resume id or unused proof', PROVIDER_ERROR_CODES.CONFIG_ERROR);
   }
   upsertSession({ ...record, agyNativeSessionState: AGY_NATIVE_SESSION_STATE.STARTED });
   try {
     // Strict: a helper/unloaded store or a failed transaction is NOT a commit.
     await flushStore({ requireWrite: true });
   } catch {
-    throw startFailure('Cannot persist AG native start; no process was started', PROVIDER_ERROR_CODES.CONFIG_ERROR);
+    throw agyNativeStartNotAttemptedError('Cannot persist AG native start; no process was started', PROVIDER_ERROR_CODES.CONFIG_ERROR);
   }
   current(); // Stop/delete/recreate/rebind wins over a late commit completion.
 }
