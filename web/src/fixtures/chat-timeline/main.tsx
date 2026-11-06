@@ -58,6 +58,8 @@ import { SupervisionTaskConsoleView } from '../../components/SupervisionTaskCons
 import { createSupervisionTaskConsoleState, SUPERVISION_TASK_CONSOLE_PHASE, SUPERVISION_TASK_CONSOLE_SYNC_STATE } from '../../supervision-task-console-reducer.js';
 import { TASK_PAIR_TIMELINE_EVENT } from '@shared/task-pair.js';
 import type { SupervisionConsolePairInfo } from '@shared/supervision-task-console.js';
+import { SubSessionWindow } from '../../components/SubSessionWindow.js';
+import type { SubSession } from '../../hooks/useSubSessions.js';
 import { ChatView, __buildViewItemsForTests } from '../../components/ChatView.js';
 import { WsClient, type TimelineEvent } from '../../ws-client.js';
 import { bindTaskPairDecisions, receiveTaskPairDecision } from '../../task-pair-decisions.js';
@@ -322,6 +324,16 @@ function FixtureBottomChrome() {
   );
 }
 
+// Opt-in production sub-window header fixture; no live socket or daemon session.
+function FixtureSubWindow() {
+  const [maximized, setMaximized] = useState(false);
+  const sub: SubSession = { id: 'fixture-header', serverId: 'fixture-server', type: 'codex-sdk', runtimeType: 'transport', shellBin: null, cwd: null, ccSessionId: null, geminiSessionId: null, parentSession: 'fixture-brain', label: 'Fixture worker', ccPresetId: null, sessionName: 'fixture-window-0', state: 'idle', createdAt: 1700000000000, updatedAt: 1700000000000 };
+  return <SubSessionWindow sub={sub} ws={null} connected={false} active serverId="fixture-server" zIndex={10}
+    onDiff={() => {}} onHistory={() => {}} onMinimize={() => {}} onClose={() => {}} onRestart={() => {}} onRename={() => {}} onFocus={() => {}}
+    onPin={() => {}} maximized={maximized} onToggleMaximized={() => setMaximized(value => !value)}
+    getMaximizeBounds={() => ({ x: 0, y: 0, w: innerWidth, h: innerHeight })} />;
+}
+
 function FixtureHarness() {
   const [events, setEvents] = useState<TimelineEvent[]>(initialEvents);
   publishEvents = setEvents;
@@ -332,6 +344,8 @@ function FixtureHarness() {
     document.documentElement.setAttribute('data-chat-timeline-harness', 'ready');
     return () => { publishEvents = null; publishOlderState = null; };
   }, []);
+
+  if (query.get('subWindow') === '1') return <FixtureSubWindow />;
 
   const cellStyle = windowCount === 4
     ? { height: '50vh', width: '50vw', display: 'flex', flexDirection: 'column' as const, overflow: 'hidden', boxSizing: 'border-box' as const, border: '1px solid #222' }

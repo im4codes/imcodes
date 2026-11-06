@@ -54,6 +54,8 @@ export const TASK_PAIR_TERMINAL_FLUSH_FIELD = 'taskPairTerminalFlush' as const;
 export const TASK_PAIR_BRIEF_END_TAG = 'IMCODES_TASK_END' as const;
 /** Timeline event carrying every applied or recorded marker event. */
 export const TASK_PAIR_TIMELINE_EVENT = 'task_pair.event' as const;
+/** Browser-local bridge event carrying the current authoritative pair projection. */
+export const TASK_PAIR_SNAPSHOT_EVENT = 'supervision:task-pairs' as const;
 /** Every daemon-authored pair message id starts with this prefix plus the task id. */
 export const TASK_PAIR_NUDGE_ID_PREFIX = 'task-pair-nudge:' as const;
 /** Hook path through which MCP child processes hand legacy supervision tool calls to the daemon. */

@@ -187,13 +187,14 @@ describe('SubSessionWindow maximize integration', () => {
     expect(onMinimize).not.toHaveBeenCalled();
   });
 
-  it('places an accessible maximize control immediately before minimize', async () => {
+  it('keeps maximize accessible while the auxiliary minimize control is hidden', async () => {
     const onToggleMaximized = vi.fn();
     const { container } = renderWindow({ onToggleMaximized });
 
     const buttons = Array.from(container.querySelectorAll('.subsession-header button'));
     const maximize = screen.getByRole('button', { name: 'window.maximize' });
-    const minimize = screen.getByRole('button', { name: 'window.minimize' });
+    const minimize = container.querySelector('button[aria-label="window.minimize"]')!;
+    expect(minimize.hasAttribute('hidden')).toBe(true);
 
     expect(maximize.getAttribute('title')).toBe('window.maximize');
     expect(buttons.indexOf(maximize as HTMLButtonElement)).toBe(buttons.indexOf(minimize as HTMLButtonElement) - 1);
@@ -217,7 +218,6 @@ describe('SubSessionWindow maximize integration', () => {
 
     // Controls keep their own behaviour.
     fireEvent.dblClick(screen.getByRole('button', { name: 'window.maximize' }));
-    fireEvent.dblClick(screen.getByRole('button', { name: 'window.minimize' }));
     fireEvent.dblClick(screen.getByRole('button', { name: 'window.hide' }));
     expect(onToggleMaximized).toHaveBeenCalledTimes(2);
 
@@ -280,7 +280,7 @@ describe('SubSessionWindow maximize integration', () => {
     expect(panel.style.height).toBe('640px');
     expect(screen.getByRole('button', { name: 'window.restore' }).getAttribute('title')).toBe('window.restore');
     expect(screen.getByText('worker · claude-code-sdk')).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'picker.files' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'picker.files', hidden: true })).toBeTruthy();
 
     view.rerender(
       <SubSessionWindow
@@ -407,7 +407,7 @@ describe('SubSessionWindow maximize integration', () => {
     expect(panel.style.top).toBe('9px');
   });
 
-  it('clears maximized state before minimize, hide, and stop close paths', async () => {
+  it('clears maximized state before hide and stop close paths', async () => {
     const calls: string[] = [];
     const { container } = renderWindow({
       maximized: true,
@@ -418,10 +418,6 @@ describe('SubSessionWindow maximize integration', () => {
       getMaximizeBounds: () => ({ x: 0, y: 0, w: 800, h: 600 }),
     });
 
-    fireEvent.click(screen.getByRole('button', { name: 'window.minimize' }));
-    expect(calls).toEqual(['restore', 'minimize']);
-
-    calls.length = 0;
     fireEvent.click(screen.getByRole('button', { name: 'window.hide' }));
     expect(calls).toEqual(['restore', 'minimize']);
 

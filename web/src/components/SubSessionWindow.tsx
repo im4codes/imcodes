@@ -12,6 +12,7 @@ import { resolveTimelineBackedSessionState } from '../session-live-status.js';
 import { formatLabel } from '../format-label.js';
 import { TerminalView } from './TerminalView.js';
 import { ChatView } from './ChatView.js';
+import { SubSessionTaskTitle } from './SubSessionTaskTitle.js';
 import { FileBrowser, type FileBrowserPreviewRequest } from './FileBrowser.js';
 import { StableSessionControls as SessionControls } from './StableSessionControls.js';
 import { UsageFooter } from './UsageFooter.js';
@@ -999,7 +1000,7 @@ export function SubSessionWindow({
         onDragStart={handleDragStart}
       >
         <span class="subsession-drag-icon">⠿</span>
-        <span class="subsession-title">{typeLabel}</span>
+        <span class="subsession-title"><SubSessionTaskTitle sessionName={sub.sessionName} serverId={serverId ?? sub.serverId} fallback={typeLabel} /></span>
         {inP2p && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
         {sub.ccPresetId && <span style={{ fontSize: 11, color: '#f59e0b' }} title={`Custom API: ${sub.ccPresetId}`}>◉</span>}
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 10 }}>
@@ -1019,6 +1020,7 @@ export function SubSessionWindow({
               as the main-session toolbar's DaemonRemoteDesktopControl: it
               targets the exact same `serverId` (and so the exact same
               machine) this window's own FileBrowser below is rooted on. */}
+          <div class="subsession-hidden-actions" hidden style={{ display: 'none' }}>
           <DaemonRemoteDesktopControl
             compact
             offerLoginScreenSetup={false}
@@ -1045,6 +1047,7 @@ export function SubSessionWindow({
             {(gitChangesCount ?? 0) > 0 && <span class="file-badge">{gitChangesCount}</span>}
           </button>
           {isPinnable && <button class="subsession-minimize-btn" onClick={() => onPin?.(viewMode)} title={t('sidebar.pin_to_sidebar')}>📌</button>}
+          </div>
           {desktopLayoutCapable && onToggleMaximized && (
             <DesktopWindowMaximizeButton
               maximized={isDesktopMaximized}
@@ -1060,6 +1063,7 @@ export function SubSessionWindow({
             onClick={(event) => { if (!consumeFocusOnlyWindowCommandClick(event) && !focusInactiveDesktopWindow(event)) handleMinimize(); }}
             title={t('window.minimize')}
             aria-label={t('window.minimize')}
+            hidden style={{ display: 'none' }}
           >▾</button>
           <button
             class="subsession-close-btn"

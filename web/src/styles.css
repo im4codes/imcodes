@@ -15854,3 +15854,8 @@ button.quick-agent-delegation-preset.active {
   }
   .task-pair-event-card:not(.is-expanded) .task-pair-card-chevron { order: 5; flex: 0 0 auto; margin-left: auto; }
 }
+
+/* Shared sub-session title: one existing header line, status remains visible. */
+.subsession-task-title { display: inline-flex; width: 100%; min-width: 0; max-width: 100%; align-items: center; gap: 6px; vertical-align: middle; }
+.subsession-task-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.subsession-task-state { flex: 0 1 auto; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #67e8f9; font-size: 10px; }

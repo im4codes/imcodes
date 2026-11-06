@@ -10,6 +10,7 @@ import type { JSX } from 'preact';
 import { useTranslation } from 'react-i18next';
 import { resizeHandleHoverEvents } from './window-resize.js';
 import { ChatView } from './ChatView.js';
+import { SubSessionTaskTitle } from './SubSessionTaskTitle.js';
 import { resolveContextWindow } from '../model-context.js';
 import { subSessionModelPresentation } from '../model-label.js';
 import { TerminalView } from './TerminalView.js';
@@ -454,7 +455,7 @@ function SubSessionCardImpl({ sub, ws, connected, isOpen, isFocused, idleFlashTo
       {/* Header */}
       <div class="subcard-header">
         <span class="subcard-icon">{icon}</span>
-        <span class="subcard-label">{label}</span>
+        <span class="subcard-label"><SubSessionTaskTitle sessionName={sub.sessionName} serverId={serverId ?? sub.serverId} fallback={label} /></span>
         {inP2p && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
         <SharedStateIndicator state={sharedState} iconOnly />
         {badge && <span class="subcard-badge">{badge}</span>}

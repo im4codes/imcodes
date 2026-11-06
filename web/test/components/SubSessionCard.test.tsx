@@ -108,6 +108,16 @@ describe('SubSessionCard', () => {
     localStorage.clear();
   });
 
+  it('shows its canonical task name/status in the preview-card title', () => {
+    const sub = makeSubSession();
+    (window as any).__imcodesTaskPairSnapshot = { authoritative: true, serverId: sub.serverId, tasks: [{ taskId: 'header-task', title: 'Current card task', pair: { status: 'in_audit', executor: sub.sessionName } }] };
+    try {
+      const view = render(<SubSessionCard sub={sub} ws={null} connected isOpen={false} onOpen={vi.fn()} onDiff={vi.fn()} onHistory={vi.fn()} />);
+      expect(view.container.querySelector('.subcard-label')?.textContent).toContain('Current card task');
+      expect(view.container.querySelector('.subsession-task-state')?.textContent).toBe('taskPair.status.in_audit');
+    } finally { delete (window as any).__imcodesTaskPairSnapshot; }
+  });
+
   it('caps expanded model labels without shortening the control identity', () => {
     const sub = makeSubSession({ type: 'gemini', activeModel: 'gemini-4-argon-high' });
     const props = { sub, ws: null, connected: true, isOpen: false,
