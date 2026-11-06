@@ -6,6 +6,7 @@ import {
   RETIRED_SUPERVISION_MCP_TOOL_SET,
 } from '../../shared/memory-mcp-contracts.js';
 import {
+  MCP_RESOURCE_PREFIX,
   SESSION_RESOURCE_HANDLE_TYPE,
   SESSION_RESOURCE_KIND,
   SESSION_RESOURCE_OWNER_ENV,
@@ -168,7 +169,7 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
       : null;
   })();
   const resourceRegistry = owner ? new SessionResourceRegistry() : null;
-  const resourceId = owner ? `mcp-bootstrap:${owner.runtimeEpoch}:${process.pid}` : null;
+  const resourceId = owner ? `${MCP_RESOURCE_PREFIX.BOOTSTRAP}:${owner.runtimeEpoch}:${process.pid}` : null;
   const lifetime = sessionResourceLifetimeFromEnv(process.env);
   const lifecycleFields = {
     session: owner?.sessionName ?? process.env.IMCODES_SESSION?.trim() ?? process.env.IMCODES_DAEMON_SESSION_NAME?.trim(),

@@ -63,6 +63,7 @@ import { MEMORY_MCP_ENV_KEYS } from '../../shared/memory-mcp-env.js';
 import { parseMcpToolCatalogMode, type McpToolCatalogMode } from '../../shared/mcp-tool-discovery.js';
 import { MemoryMcpResourceGuard } from './memory-mcp-resource-guard.js';
 import {
+  MCP_RESOURCE_PREFIX,
   TASK_ADMISSION,
   TASK_ADMISSION_HOOK_PATH,
   TASK_ADMISSION_OPERATION,
@@ -1093,7 +1094,7 @@ export async function runMemoryMcpServer(options: MemoryMcpServerOptions = {}): 
     // lightweight parent preserves stdio and starts a clean generation. Keep
     // legacy direct generations distinguishable so rollout never kills a
     // transport that has no reconnect owner.
-    const resourcePrefix = env[IMCODES_MEMORY_MCP_BACKEND_ENV] === '1' ? 'mcp-backend' : 'mcp';
+    const resourcePrefix = env[IMCODES_MEMORY_MCP_BACKEND_ENV] === '1' ? MCP_RESOURCE_PREFIX.BACKEND : MCP_RESOURCE_PREFIX.DIRECT;
     // A provider-hosted generation (see SESSION_RESOURCE_LIFETIME) shares its
     // bootstrap's lifetime: owner-based reaping must skip the backend too.
     const resourceId = owner
@@ -1120,17 +1121,25 @@ export async function runMemoryMcpServer(options: MemoryMcpServerOptions = {}): 
     // Idempotent: a signal, an EOF and a parent-loss tick can all land in the
     // same turn of the loop. Whoever arrives first owns the teardown; everyone
     // else awaits that same promise instead of racing a second release/close.
+    let releaseOwnResource = true;
     const { release: activeCleanup, shutdown } = createIdempotentShutdown({
       release: async () => {
         clearInterval(cpuTimer);
-        if (owner && resourceId) await releaseSessionResource(resourceId, owner).catch(() => {});
+        if (releaseOwnResource && owner && resourceId) await releaseSessionResource(resourceId, owner).catch(() => {});
       },
       close: () => server.close(),
     });
     cleanup = activeCleanup;
     process.once('beforeExit', () => { void activeCleanup(); });
     for (const signal of ['SIGINT', 'SIGTERM'] as const) {
-      process.once(signal, () => { void shutdown().finally(() => process.exit(0)); });
+      process.once(signal, () => {
+        // The reaper holds the registry lock while signalling this PID. Like
+        // the bootstrap, leave row removal to it instead of waiting for its
+        // SIGKILL deadline. After an external signal the dead-PID sweep can
+        // safely retire the row.
+        releaseOwnResource = false;
+        void shutdown().finally(() => process.exit(0));
+      });
     }
     activeShutdown = shutdown;
     await server.connect(new StdioServerTransport());

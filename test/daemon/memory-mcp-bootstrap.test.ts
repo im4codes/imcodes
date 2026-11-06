@@ -7,6 +7,9 @@ import { createInterface } from 'node:readline';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { afterEach, describe, expect, it } from 'vitest';
+import { SessionResourceRegistry } from '../../src/daemon/session-resource-registry.js';
+import { SESSION_RESOURCE_LIFETIME, SESSION_RESOURCE_RELEASE_REASON } from '../../shared/session-resource-lifecycle.js';
+import { IMCODES_MEMORY_MCP_BACKEND_ENV } from '../../src/daemon/mcp-stdio-lifecycle.js';
 
 const openClients: Client[] = [];
 const openProcesses: ChildProcessWithoutNullStreams[] = [];
@@ -233,6 +236,57 @@ describe('memory MCP lightweight bootstrap', () => {
     }, 30_000);
     expect(record.resourceId).toMatch(/^mcp-backend:epoch-backend-owned:/);
     expect(record.handle?.pid).not.toBe(transport.pid);
+  }, 45_000);
+
+  it.runIf(process.platform !== 'win32')('a reaped real backend exits gracefully instead of waiting for the reaper registry lock', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'memory-mcp-signal-'));
+    const owner = { sessionName: 'deck_e2e_mcpsignal_w1', sessionInstanceId: 'signal-instance', runtimeEpoch: 'signal-epoch' };
+    const registry = new SessionResourceRegistry({ directory: join(home, 'session-resources') });
+    const { child, messages } = rawBootstrap({
+      HOME: home, IMCODES_HOME: home,
+      [IMCODES_MEMORY_MCP_BACKEND_ENV]: '1',
+      IMCODES_DAEMON_SESSION_NAME: owner.sessionName,
+      IMCODES_RESOURCE_SESSION_INSTANCE_ID: owner.sessionInstanceId,
+      IMCODES_RESOURCE_RUNTIME_EPOCH: owner.runtimeEpoch,
+    });
+    child.stderr.resume();
+    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize',
+      params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'signal-test', version: '1' } },
+    })}\n`);
+    await waitFor(() => messages.find((message) => message.id === 1), 30_000);
+    const exit = new Promise((resolveExit) => child.once('exit', (code, signal) => resolveExit({ code, signal })));
+    expect(await registry.releaseOwner(owner, SESSION_RESOURCE_RELEASE_REASON.SESSION_COMPLETED)).toEqual({ released: 1, failed: 0 });
+    expect(await exit).toEqual({ code: 0, signal: null });
+    expect(await registry.list()).toEqual([]);
+  }, 40_000);
+
+  it.runIf(process.platform !== 'win32')('reset stops supervisors before their real backends without reconnecting or force-killing them', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'memory-mcp-reset-'));
+    const owner = { sessionName: 'deck_e2e_mcpreset_w1', sessionInstanceId: 'reset-instance', runtimeEpoch: 'old-a' };
+    const registry = new SessionResourceRegistry({ directory: join(home, 'session-resources') });
+    // Two old thread generations reproduce the production batch. Alphabetic
+    // resource order puts BOTH backends before either live supervisor.
+    for (const epoch of ['old-a', 'old-b']) {
+      const { client, transport } = connect({
+        HOME: home, IMCODES_HOME: home,
+        IMCODES_MEMORY_MCP_TEST_BACKEND_ENTRY: '',
+        IMCODES_DAEMON_SESSION_NAME: owner.sessionName,
+        IMCODES_RESOURCE_SESSION_INSTANCE_ID: owner.sessionInstanceId,
+        IMCODES_RESOURCE_RUNTIME_EPOCH: epoch,
+        IMCODES_MCP_HOST_LIFETIME: SESSION_RESOURCE_LIFETIME.PROVIDER_HOST,
+      });
+      await client.connect(transport);
+      await waitFor(async () => (await registry.list()).find((row) => row.resourceId.startsWith(`mcp-backend:${epoch}:`)), 30_000);
+    }
+    expect(await registry.list()).toHaveLength(4);
+    const result = await registry.releaseOwner(owner, SESSION_RESOURCE_RELEASE_REASON.SESSION_COMPLETED);
+    expect(result).toEqual({ released: 4, failed: 0 });
+    await new Promise((resolveWait) => setTimeout(resolveWait, 600));
+    const events = (await readFile(join(home, 'logs', 'mcp-lifecycle.log'), 'utf8'))
+      .trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(events.filter((event) => event.event === 'backend_exit' && event.expected === false),
+      'intentional reset must not look like a crash and start a replacement').toEqual([]);
+    expect(await registry.list(), 'no backend may re-register after the reset snapshot').toEqual([]);
   }, 45_000);
 
   it('keeps increasing reconnect backoff while a ready backend flaps before the stable window', async () => {

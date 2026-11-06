@@ -14,6 +14,13 @@ export const SESSION_RESOURCE_KIND = {
   AGENT: 'agent',
 } as const;
 
+/** Stable resource-id namespaces shared by MCP producers and the reaper. */
+export const MCP_RESOURCE_PREFIX = {
+  DIRECT: 'mcp',
+  BOOTSTRAP: 'mcp-bootstrap',
+  BACKEND: 'mcp-backend',
+} as const;
+
 export type SessionResourceKind = typeof SESSION_RESOURCE_KIND[keyof typeof SESSION_RESOURCE_KIND];
 
 export interface SessionResourceOwnerIdentity {

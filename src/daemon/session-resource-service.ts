@@ -1,6 +1,7 @@
 import { readProcessCpuMillis } from '../util/process-start.js';
 import type { SessionRecord } from '../store/session-store.js';
 import {
+  MCP_RESOURCE_PREFIX,
   SESSION_RESOURCE_DEFAULTS,
   SESSION_RESOURCE_HANDLE_TYPE,
   SESSION_RESOURCE_KIND,
@@ -104,7 +105,7 @@ export async function registerMcpProcessResource(
   owner: SessionResourceOwner,
   pid = process.pid,
   killTree = false,
-  resourcePrefix = 'mcp',
+  resourcePrefix: string = MCP_RESOURCE_PREFIX.DIRECT,
   lifetime?: SessionResourceLifetime,
 ): Promise<string> {
   const resourceId = `${resourcePrefix}:${owner.runtimeEpoch}:${pid}`;
@@ -321,7 +322,7 @@ export async function sweepMemoryMcpCpu(
       cpuMs, sampledAt: now, strikes, pressureReported,
     });
     if (pressureReported && !previous.pressureReported) {
-      if (record.resourceId.startsWith('mcp-backend:')) {
+      if (record.resourceId.startsWith(`${MCP_RESOURCE_PREFIX.BACKEND}:`)) {
         // The stable bootstrap owns this generation and will replace it while
         // keeping the SDK's stdio transport/catalog alive. This is the first
         // safe point at which the observed CPU spinner can be terminated
