@@ -9782,7 +9782,27 @@ html.native-ios-mac .chat-dl-btn {
   font-weight: 700;
   line-height: 1.25;
 }
+.external-link-url-row { display: flex; align-items: flex-start; gap: 8px; min-width: 0; }
+.external-link-copy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 40px;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border: 1px solid rgba(100,116,139,0.55);
+  border-radius: 8px;
+  color: #bfdbfe;
+  background: #1e293b;
+  cursor: pointer;
+}
+.external-link-copy:hover { background: #253348; }
+.external-link-copy:focus-visible { outline: 2px solid #60a5fa; outline-offset: 2px; }
+.external-link-copy.copied { color: #4ade80; }
 .external-link-url {
+  flex: 1;
+  min-width: 0;
   max-height: 108px;
   overflow: auto;
   padding: 10px 12px;

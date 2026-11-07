@@ -23,6 +23,7 @@ import {
 import { localizeDaemonUserNoticeEvent } from '../daemon-user-notice-i18n.js';
 import { recordPerfRender } from '../perf-render-debug.js';
 import { localizeChatDownloadError } from '../chat-download-error.js';
+import { copyToClipboard } from '../util/clipboard.js';
 /**
  * ChatView — renders TimelineEvent[] as a chat-style view.
  * Merges consecutive streaming assistant.text events into single blocks.
@@ -2728,6 +2729,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   const selMenuRef = useRef<HTMLDivElement>(null);
   const [copied, setCopied] = useState(false);
   const [pendingUrl, setPendingUrl] = useState<string | null>(null);
+  const [copiedExternalUrl, setCopiedExternalUrl] = useState<string | null>(null);
   const [htmlFullscreenPreview, setHtmlFullscreenPreview] = useState<ChatHtmlFullscreenPreviewState | null>(null);
   const [highlightEl, setHighlightEl] = useState<HTMLElement | null>(null);
   const highlightElRef = useRef(highlightEl);
@@ -3002,6 +3004,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   }, [t, ws]);
 
   const handleUrlClick = useCallback((url: string) => {
+    setCopiedExternalUrl(null);
     setPendingUrl(url);
   }, []);
 
@@ -5061,7 +5064,25 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
               <span class="external-link-icon" aria-hidden="true">↗</span>
               <div class="external-link-title" id="external-link-dialog-title">{t('chat.external_link_title')}</div>
             </div>
-            <div class="external-link-url" title={pendingUrl}>{pendingUrl}</div>
+            <div class="external-link-url-row">
+              <div class="external-link-url" title={pendingUrl}>{pendingUrl}</div>
+              <button
+                type="button"
+                class={`external-link-copy${copiedExternalUrl === pendingUrl ? ' copied' : ''}`}
+                title={t(copiedExternalUrl === pendingUrl ? 'common.copied' : 'common.copy')}
+                aria-label={t(copiedExternalUrl === pendingUrl ? 'common.copied' : 'common.copy')}
+                onClick={() => {
+                  const url = pendingUrl;
+                  copyToClipboard(url, () => setCopiedExternalUrl(url));
+                }}
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+                  {copiedExternalUrl === pendingUrl
+                    ? <path d="m5 12 4 4L19 6" />
+                    : <><rect x="8" y="8" width="12" height="12" rx="2" /><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3" /></>}
+                </svg>
+              </button>
+            </div>
             <div class="external-link-warning">{t('chat.external_link_warning')}</div>
             <div class="external-link-actions">
               <button class="external-link-btn" onClick={() => setPendingUrl(null)}>{t('chat.external_link_cancel')}</button>

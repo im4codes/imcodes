@@ -2751,6 +2751,55 @@ describe('ChatView', () => {
     expect(container.querySelector('.external-link-url')?.textContent).toBe('https://example.com/release-notes');
   });
 
+  it('copies the complete external URL using only an icon without opening or closing the dialog', async () => {
+    const url = 'https://example.com/%E6%96%87%E4%BB%B6.zip?X-Amz-Signature=' + 'abc123'.repeat(80) + '&key=a%2Bb#download';
+    const open = vi.spyOn(window, 'open').mockImplementation(() => null);
+    try {
+      const { container } = render(<ChatView events={[{
+        eventId: 'copy-external-url', type: 'assistant.text', ts: 1000, payload: { text: url },
+      }] as any} loading={false} sessionId="deck_main_brain" />);
+      fireEvent.click(container.querySelector('.chat-external-link')!);
+      const button = container.querySelector('.external-link-copy') as HTMLButtonElement;
+      expect(button).toBeTruthy();
+      expect(button.getAttribute('aria-label')).toBe('common.copy');
+      expect(button.textContent).toBe('');
+      expect(button.querySelector('svg')).toBeTruthy();
+      fireEvent.click(button);
+      await waitFor(() => expect(button.getAttribute('aria-label')).toBe('common.copied'));
+      expect(clipboardWriteText).toHaveBeenCalledWith(url);
+      expect(open).not.toHaveBeenCalled();
+      expect(container.querySelector('.external-link-dialog')).toBeTruthy();
+      expect(container.querySelector('.external-link-warning')).toBeTruthy();
+      const cancel = [...container.querySelectorAll('.external-link-btn')].find(el => el.textContent === 'chat.external_link_cancel')!;
+      fireEvent.click(cancel);
+      expect(container.querySelector('.external-link-dialog')).toBeNull();
+      fireEvent.click(container.querySelector('.chat-external-link')!);
+      expect(container.querySelector('.external-link-copy')?.getAttribute('aria-label')).toBe('common.copy');
+    } finally { open.mockRestore(); }
+  });
+
+  it('does not claim a failed clipboard write succeeded or navigate away', async () => {
+    const originalExecCommand = document.execCommand;
+    const fallback = vi.fn().mockReturnValue(false);
+    Object.defineProperty(document, 'execCommand', { configurable: true, value: fallback });
+    clipboardWriteText.mockRejectedValueOnce(new Error('clipboard denied'));
+    try {
+      const { container } = render(<ChatView events={[{
+        eventId: 'failed-external-copy', type: 'assistant.text', ts: 1000, payload: { text: 'https://example.com/retry' },
+      }] as any} loading={false} sessionId="deck_main_brain" />);
+      fireEvent.click(container.querySelector('.chat-external-link')!);
+      const button = container.querySelector('.external-link-copy') as HTMLButtonElement;
+      fireEvent.click(button);
+      await waitFor(() => expect(fallback).toHaveBeenCalledWith('copy'));
+      expect(button.getAttribute('aria-label')).toBe('common.copy');
+      expect(container.querySelector('.external-link-dialog')).toBeTruthy();
+      fireEvent.click(button);
+      await waitFor(() => expect(button.getAttribute('aria-label')).toBe('common.copied'));
+    } finally {
+      Object.defineProperty(document, 'execCommand', { configurable: true, value: originalExecCommand });
+    }
+  });
+
   it('restores mobile keyboard scroll position from bottom offset instead of snapping to top', async () => {
     const initialEvents = [
       {
