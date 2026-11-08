@@ -9,7 +9,7 @@ import { taskPairService } from '../../src/daemon/task-pairs/service.js';
 import { setTaskPairDeliveryDepsForTests } from '../../src/daemon/task-pairs/delivery.js';
 import { taskPairDecisionApi } from '../../src/daemon/task-pairs/decision-api.js';
 import { taskPairDecisionRevision } from '../../src/daemon/task-pairs/decision-context.js';
-import { TASK_PAIR_DECISION_BRAIN_NOTICE_REASON, TASK_PAIR_DECISION_MSG } from '../../shared/task-pair-decision.js';
+import { TASK_PAIR_DECISION_BRAIN_NOTICE_REASON, TASK_PAIR_DECISION_MSG, TASK_PAIR_DECISION_ERROR } from '../../shared/task-pair-decision.js';
 import { encodePairWake, pairWakeBindings, queuedPairWakeAllowed } from '../../src/daemon/task-pairs/wake-authority.js';
 import { TASK_PAIR_NUDGE_ID_PREFIX } from '../../shared/task-pair.js';
 import type { TaskPairState } from '../../shared/task-pair.js';
@@ -126,5 +126,32 @@ describe('durable task decisions and human feedback', () => {
   });
   it('validates duplicate, excessive and oversized options', () => {
     expect(() => taskPairService.recordDecision({ ...ask(), idempotencyKey: 'invalid', options: [{ id: 'same', label: 'A' }, { id: 'same', label: 'B' }] })).toThrow();
+  });
+});
+
+
+describe('stale decision recovery snapshot', () => {
+  it('distinguishes a same-revision new question conflict and returns the active question on history', () => {
+    const before = taskPairDecisionApi(scope, { type: TASK_PAIR_DECISION_MSG.HISTORY, taskId: state.taskId });
+    const question = ask();
+    // Recording a question does not alter the lifecycle revision.
+    expect(before.revision).toBe(taskPairDecisionRevision(state));
+    let error: any;
+    try { taskPairDecisionApi(scope, reply({ questionId: null, optionId: undefined })); } catch (cause) { error = cause; }
+    expect(error?.code).toBe(TASK_PAIR_DECISION_ERROR.CONTEXT_CHANGED);
+    const fresh = taskPairDecisionApi(scope, { type: TASK_PAIR_DECISION_MSG.HISTORY, taskId: state.taskId }) as any;
+    expect(fresh.pair).toMatchObject({ decisionRevision: before.revision, decisionRequest: { id: question.id }, status: state.status });
+    expect(fresh.decisions.filter((r: any) => r.kind === 'feedback')).toHaveLength(0);
+    expect(getTaskPairStore().getPair(scope.projectName, state.taskId)!.state.flags).toEqual(state.flags);
+  });
+  it('does not revive resolved round-one questions in a round-zero legacy task snapshot', () => {
+    putTaskPairFixture(getTaskPairStore(), scope.projectName, { ...state, round: 0 });
+    const question = ask();
+    taskPairService.recordDecision({ project: scope.projectName, taskId: state.taskId, round: 1, kind: 'decision',
+      conclusion: 'Continue safely', summary: 'Approved fixture', author: state.brain, at: question.at + 1 });
+    const fresh = taskPairDecisionApi(scope, { type: TASK_PAIR_DECISION_MSG.HISTORY, taskId: state.taskId }) as any;
+    expect(fresh.pair?.round).toBe(0);
+    expect(fresh.pair?.decisionRequest).toBeUndefined();
+    expect(fresh.pair?.latestDecision?.kind).toBe('decision');
   });
 });

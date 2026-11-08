@@ -4792,6 +4792,7 @@
     "card_no_blocking": "No blocking findings.",
     "waiting_for_tasks": "Ожидание: {{tasks}}",
     "decision": {
+      "context_refreshed": "Задача обновлена, ваш текст сохранён. Проверьте текущий вопрос перед повторной отправкой.",
       "title_request": "Требуется решение",
       "title_blocked": "Блокировка",
       "title_dependencies": "Ожидание зависимостей",

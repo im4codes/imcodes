@@ -4803,6 +4803,7 @@
     "card_no_blocking": "No blocking findings.",
     "waiting_for_tasks": "等待任务：{{tasks}}",
     "decision": {
+      "context_refreshed": "任务已刷新，输入已保留。请确认当前问题后再发送。",
       "title_request": "待决策问题",
       "title_blocked": "卡点待解除",
       "title_dependencies": "等待依赖任务",

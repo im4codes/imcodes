@@ -4792,6 +4792,7 @@
     "card_no_blocking": "No blocking findings.",
     "waiting_for_tasks": "待機中: {{tasks}}",
     "decision": {
+      "context_refreshed": "タスクを更新し、入力内容を保持しました。現在の質問を確認してから再送信してください。",
       "title_request": "決定待ちの質問",
       "title_blocked": "ブロック中",
       "title_dependencies": "依存タスク待ち",

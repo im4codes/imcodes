@@ -1,3 +1,5 @@
+export const TASK_PAIR_DECISION_ERROR = { CONTEXT_CHANGED: 'decision_context_changed' } as const;
+
 /** Durable task questions, human feedback and Brain rulings. Feedback never changes lifecycle. */
 export const TASK_PAIR_DECISION_BRAIN_NOTICE_REASON = 'decision-brain-notice' as const;
 export const TASK_PAIR_DECISION_KIND = { REQUEST: 'request', FEEDBACK: 'feedback', DECISION: 'decision' } as const;

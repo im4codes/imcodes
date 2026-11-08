@@ -4792,6 +4792,7 @@
     "card_no_blocking": "No blocking findings.",
     "waiting_for_tasks": "대기 중: {{tasks}}",
     "decision": {
+      "context_refreshed": "작업을 새로고침하고 입력 내용을 보존했습니다. 현재 질문을 확인한 후 다시 보내세요.",
       "title_request": "결정 대기 항목",
       "title_blocked": "차단됨",
       "title_dependencies": "의존 작업 대기",

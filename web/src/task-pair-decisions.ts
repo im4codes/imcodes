@@ -1,8 +1,12 @@
+import type { SupervisionConsolePairInfo } from '@shared/supervision-task-console.js';
 import { TASK_PAIR_DECISION_MSG, type TaskPairDecisionRecord } from '@shared/task-pair-decision.js';
-export interface TaskPairDecisionReply { decisions: TaskPairDecisionRecord[]; revision: string; }
+export interface TaskPairDecisionReply { decisions: TaskPairDecisionRecord[]; revision: string; pair?: SupervisionConsolePairInfo; }
 export interface TaskPairDecisionInput {
   taskId: string; type: typeof TASK_PAIR_DECISION_MSG.HISTORY | typeof TASK_PAIR_DECISION_MSG.FEEDBACK;
   round?: number; revision?: string; questionId?: string | null; optionId?: string; feedback?: string;
+}
+export class TaskPairDecisionError extends Error {
+  constructor(message: string, readonly code?: string) { super(message); }
 }
 let send: ((input: TaskPairDecisionInput & { requestId: string }) => void) | undefined;
 const pending = new Map<string, { resolve: (reply: TaskPairDecisionReply) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();
@@ -29,7 +33,7 @@ export function receiveTaskPairDecision(requestId: string, result: unknown): voi
   const item = pending.get(requestId);
   if (!item) return;
   clearTimeout(item.timer); pending.delete(requestId);
-  const reply = result as { ok?: boolean; error?: string } & TaskPairDecisionReply;
-  if (!reply?.ok || !Array.isArray(reply.decisions)) item.reject(new Error(reply?.error || 'Invalid decision response'));
+  const reply = result as { ok?: boolean; error?: string; code?: string } & TaskPairDecisionReply;
+  if (!reply?.ok || !Array.isArray(reply.decisions)) item.reject(new TaskPairDecisionError(reply?.error || 'Invalid decision response', reply?.code));
   else item.resolve(reply);
 }

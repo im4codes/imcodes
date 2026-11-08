@@ -4793,6 +4793,7 @@
     "card_no_blocking": "No blocking findings.",
     "waiting_for_tasks": "Esperando: {{tasks}}",
     "decision": {
+      "context_refreshed": "La tarea se ha actualizado. Se conserva tu texto; revisa la pregunta actual antes de volver a enviarlo.",
       "title_request": "Decisión pendiente",
       "title_blocked": "Bloqueado",
       "title_dependencies": "Esperando dependencias",

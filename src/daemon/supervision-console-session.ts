@@ -472,11 +472,12 @@ export class SupervisionConsoleSessionRegistry {
     if (!this.#deps.authorize(scope)) { this.#refused += 1; return true; }
     const active = this.#findSubscription(scope, record.subscriptionId);
     if (!active || record.sessionName !== scope.coordinatorSessionName) return true;
-    void import('./task-pairs/decision-api.js').then(({ taskPairDecisionApi }) => {
+    void import('./task-pairs/decision-api.js').then(({ taskPairDecisionApi, TaskPairDecisionContextError }) => {
       if (!this.#findSubscription(scope, active.subscriptionId) || !this.#deps.authorize(scope)) return;
       let result: unknown;
       try { result = { ok: true, ...taskPairDecisionApi(scope, record) }; }
-      catch (error) { result = { ok: false, error: error instanceof Error ? error.message : String(error) }; }
+      catch (error) { result = { ok: false, error: error instanceof Error ? error.message : String(error),
+        ...(error instanceof TaskPairDecisionContextError ? { code: error.code } : {}) }; }
       this.#deps.send({ type: TASK_PAIR_DECISION_MSG.RESPONSE, scope,
         subscriptionId: active.subscriptionId, requestId: record.requestId, taskId: record.taskId, result });
     }).catch((error) => { this.#deps.onError?.(error); });

@@ -1,3 +1,4 @@
+import { TASK_PAIR_DECISION_ERROR, TASK_PAIR_DECISION_MSG } from '@shared/task-pair-decision.js';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { TaskPairDecisionPanel } from '../../src/components/TaskPairDecisionPanel.js';
@@ -857,5 +858,130 @@ describe('TaskPairDecisionPanel', () => {
       await waitFor(() => expect(liveTextbox.disabled).toBe(false));
       expect(liveTextbox.value).toBe('');
     });
+  });
+});
+
+
+describe('stale question recovery', () => {
+  it('refreshes a rejected question once, keeps the draft, and only submits the new choice after confirmation', async () => {
+    const frames: any[] = [];
+    const next = { ...question, id: 'new-question', question: 'Choose the current source?', options: [{ id: 'new', label: 'Use current fixture' }] };
+    unbind = bindTaskPairDecisions((frame) => {
+      frames.push(frame);
+      if (frame.type === TASK_PAIR_DECISION_MSG.HISTORY) {
+        receiveTaskPairDecision(frame.requestId, { ok: true, revision: 'revision', decisions: [next], pair: { ...pair, decisionRequest: next } });
+      } else if (frame.questionId === next.id) {
+        receiveTaskPairDecision(frame.requestId, { ok: true, revision: 'revision', decisions: [{ ...next, kind: 'feedback', id: 'new-feedback' }] });
+      } else {
+        receiveTaskPairDecision(frame.requestId, { ok: false, code: TASK_PAIR_DECISION_ERROR.CONTEXT_CHANGED, error: 'The decision question changed; refresh before replying' });
+      }
+    });
+    render(<TaskPairDecisionPanel taskId="task" pair={{ ...pair, decisionRequest: undefined }} />);
+    fireEvent.input(screen.getByRole('textbox'), { target: { value: 'Keep my typed evidence' } });
+    fireEvent.click(screen.getByRole('button', { name: 'taskPair.decision.send' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Use current fixture' })).toBeTruthy());
+    expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('Keep my typed evidence');
+    expect(frames).toHaveLength(2);
+    expect(frames.map((f) => f.type)).toEqual([TASK_PAIR_DECISION_MSG.FEEDBACK, TASK_PAIR_DECISION_MSG.HISTORY]);
+    expect(screen.getByRole('alert').textContent).toContain('taskPair.decision.context_refreshed');
+    fireEvent.click(screen.getByRole('button', { name: 'Use current fixture' }));
+    await waitFor(() => expect(screen.getByRole('status')).toBeTruthy());
+    expect(frames[2]).toMatchObject({ questionId: next.id, optionId: 'new', feedback: 'Keep my typed evidence' });
+    expect(frames[2].requestId).not.toBe(frames[0].requestId);
+  });
+
+  it('does not reintroduce historical questions when the fresh task has already continued', async () => {
+    const ruling = { ...question, kind: 'decision', id: 'ruling', requestId: question.id, at: 100 };
+    const frames: any[] = [];
+    unbind = bindTaskPairDecisions((frame) => {
+      frames.push(frame);
+      receiveTaskPairDecision(frame.requestId, frame.type === TASK_PAIR_DECISION_MSG.HISTORY
+        ? { ok: true, revision: 'new', decisions: [ruling, question], pair: { ...pair, flags: [], decisionRevision: 'new', decisionRequest: undefined, latestDecision: ruling } }
+        : { ok: false, code: TASK_PAIR_DECISION_ERROR.CONTEXT_CHANGED, error: 'Question resolved' });
+    });
+    render(<TaskPairDecisionPanel taskId="task" pair={pair} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Use test data' }));
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Use test data' })).toBeNull());
+    expect(screen.queryByRole('textbox')).toBeNull();
+    expect(screen.queryByText('taskPair.decision.sent')).toBeNull();
+    expect(frames).toHaveLength(2);
+  });
+
+  it('bounds refresh failure and preserves the original draft and retry identity', async () => {
+    const frames: any[] = [];
+    unbind = bindTaskPairDecisions((frame) => {
+      frames.push(frame);
+      receiveTaskPairDecision(frame.requestId, frame.type === TASK_PAIR_DECISION_MSG.HISTORY
+        ? { ok: false, error: 'History unavailable' }
+        : { ok: false, code: TASK_PAIR_DECISION_ERROR.CONTEXT_CHANGED, error: 'Question changed' });
+    });
+    render(<TaskPairDecisionPanel taskId="task" pair={pair} />);
+    fireEvent.input(screen.getByRole('textbox'), { target: { value: 'Preserved draft' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Use test data' }));
+    await waitFor(() => expect(frames).toHaveLength(2));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Use test data' }).hasAttribute('disabled')).toBe(false));
+    expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('Preserved draft');
+    expect(screen.getByRole('alert').textContent).toContain('Question changed');
+    fireEvent.click(screen.getByRole('button', { name: 'Use test data' }));
+    await waitFor(() => expect(frames).toHaveLength(4));
+    expect(frames[2].requestId).toBe(frames[0].requestId);
+  });
+});
+
+
+describe('stale refresh ownership and version skew', () => {
+  it('does not apply a late recovery snapshot across task A to B to A', async () => {
+    const frames: any[] = [];
+    unbind = bindTaskPairDecisions(frame => {
+      frames.push(frame);
+      if (frame.type === TASK_PAIR_DECISION_MSG.FEEDBACK) receiveTaskPairDecision(frame.requestId,
+        { ok: false, code: TASK_PAIR_DECISION_ERROR.CONTEXT_CHANGED, error: 'Question changed' });
+    });
+    const view = render(<TaskPairDecisionPanel taskId="task" pair={pair} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Use test data' }));
+    await waitFor(() => expect(frames).toHaveLength(2));
+    view.rerender(<TaskPairDecisionPanel taskId="other" pair={pair} />);
+    view.rerender(<TaskPairDecisionPanel taskId="task" pair={pair} />);
+    fireEvent.input(screen.getByRole('textbox'), { target: { value: 'New current input' } });
+    await act(async () => receiveTaskPairDecision(frames[1].requestId, { ok: true, revision: 'late', decisions: [],
+      pair: { ...pair, decisionRevision: 'late', decisionRequest: { ...question, id: 'late-question', question: 'OLD LATE' } } }));
+    expect(screen.queryByText(/OLD LATE/)).toBeNull();
+    expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('New current input');
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('keeps an older-peer failure safe when its history reply has no live snapshot', async () => {
+    const frames: any[] = [];
+    unbind = bindTaskPairDecisions(frame => {
+      frames.push(frame);
+      receiveTaskPairDecision(frame.requestId, frame.type === TASK_PAIR_DECISION_MSG.HISTORY
+        ? { ok: true, revision: 'old', decisions: [] }
+        : { ok: false, code: TASK_PAIR_DECISION_ERROR.CONTEXT_CHANGED, error: 'Question changed' });
+    });
+    render(<TaskPairDecisionPanel taskId="task" pair={pair} />);
+    fireEvent.input(screen.getByRole('textbox'), { target: { value: 'Kept on old daemon' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Use test data' }));
+    await waitFor(() => expect(frames).toHaveLength(2));
+    expect(screen.getByRole('alert').textContent).toContain('Question changed');
+    expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('Kept on old daemon');
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+});
+
+
+describe('recovery reconciles with the live console', () => {
+  it('preserves the draft when the live projection catches up to the refreshed question', async () => {
+    const next = { ...question, id: 'new-current', question: 'New current question?' };
+    const fresh = { ...pair, decisionRevision: 'fresh-revision', decisionRequest: next };
+    unbind = bindTaskPairDecisions(frame => receiveTaskPairDecision(frame.requestId,
+      frame.type === TASK_PAIR_DECISION_MSG.HISTORY
+        ? { ok: true, revision: fresh.decisionRevision, pair: fresh, decisions: [next] }
+        : { ok: false, code: TASK_PAIR_DECISION_ERROR.CONTEXT_CHANGED, error: 'Question changed' }));
+    const view = render(<TaskPairDecisionPanel taskId="task" pair={pair} />);
+    fireEvent.input(screen.getByRole('textbox'), { target: { value: 'Keep draft through live catch-up' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Use test data' }));
+    await waitFor(() => expect(screen.getByTestId('expandable-task-objective-text').textContent).toContain('New current question'));
+    view.rerender(<TaskPairDecisionPanel taskId="task" pair={fresh} />);
+    expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('Keep draft through live catch-up');
   });
 });

@@ -4793,6 +4793,7 @@
     "card_no_blocking": "No blocking findings.",
     "waiting_for_tasks": "等待任務：{{tasks}}",
     "decision": {
+      "context_refreshed": "任務已重新整理，輸入已保留。請確認目前問題後再傳送。",
       "title_request": "待決策問題",
       "title_blocked": "卡點待解除",
       "title_dependencies": "等待相依任務",

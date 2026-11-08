@@ -4803,6 +4803,7 @@
     "card_no_blocking": "No blocking findings.",
     "waiting_for_tasks": "Waiting for: {{tasks}}",
     "decision": {
+      "context_refreshed": "The task has been refreshed. Your draft is preserved; check the current question before sending again.",
       "title_request": "Decision needed",
       "title_blocked": "Blocked",
       "title_dependencies": "Waiting for dependencies",

@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { TASK_PAIR_TERMINAL_STATUSES } from '@shared/task-pair.js';
 import { readPairScheduling, taskPairWaitKind } from '@shared/task-pair-suspension.js';
 import {
+  TASK_PAIR_DECISION_ERROR,
   TASK_PAIR_DECISION_KIND,
   TASK_PAIR_DECISION_MSG,
   TASK_PAIR_DECISION_LIMITS,
@@ -10,7 +11,7 @@ import {
   isDecisionResolvingQuestion,
 } from '@shared/task-pair-decision.js';
 import type { SupervisionConsolePairInfo } from '@shared/supervision-task-console.js';
-import { requestTaskPairDecision } from '../task-pair-decisions.js';
+import { requestTaskPairDecision, TaskPairDecisionError } from '../task-pair-decisions.js';
 import { ExpandableTaskObjective } from './ExpandableTaskObjective.js';
 
 export type TaskPairDecisionCategory =
@@ -84,6 +85,10 @@ export function getScopedRulingId(
 /** A reply is persisted feedback to Brain, never PASS, resume or a lifecycle transition. */
 export function TaskPairDecisionPanel(props: { taskId: string; pair: SupervisionConsolePairInfo; readOnly?: boolean }) {
   const { taskId, pair } = props;
+  const [recovery, setRecovery] = useState<{
+    basis: string; context: string; pair: SupervisionConsolePairInfo;
+    decisions: TaskPairDecisionRecord[]; text: string;
+  } | null>(null);
   // Remount all local state on a new task/question/ruling. A string comparison
   // alone cannot isolate late replies when navigation goes A → B → A.
   // A live feedback event may precede its ack: keep that in-flight reply locked.
@@ -109,15 +114,34 @@ export function TaskPairDecisionPanel(props: { taskId: string; pair: Supervision
   }
 
   const context = JSON.stringify([taskId, pair.decisionRevision, pair.decisionRequest?.id, rulingId]);
-  return <DecisionPanel key={context} {...props} context={context} />;
+  useEffect(() => {
+    // Retire a recovery on real navigation/question changes, but not when the
+    // live projection simply catches up to this same recovered context.
+    if (recovery && context !== recovery.basis && context !== recovery.context) setRecovery(null);
+  }, [context, recovery]);
+  const recovered = recovery?.basis === context ? recovery : undefined;
+  const effectiveContext = recovered?.context ?? context;
+  // When the live stream catches up to the authoritative refresh, keep the
+  // same keyed form (and its draft) rather than mounting an empty second form.
+  return <DecisionPanel key={effectiveContext} {...props} pair={recovered?.pair ?? pair} context={effectiveContext}
+    initialRecovery={recovery?.context === effectiveContext ? recovery : undefined}
+    onRecover={(snapshot, decisions, text) => {
+      const ruling = getScopedRulingId(taskId, snapshot.decisionRevision, snapshot.decisionRequest?.id, snapshot.latestDecision);
+      setRecovery({ basis: context, context: JSON.stringify([taskId, snapshot.decisionRevision, snapshot.decisionRequest?.id, ruling]),
+        pair: snapshot, decisions, text });
+    }} />;
 }
 
-function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pair: SupervisionConsolePairInfo; context: string; readOnly?: boolean }) {
+function DecisionPanel({ taskId, pair, context, readOnly, initialRecovery, onRecover }: {
+  taskId: string; pair: SupervisionConsolePairInfo; context: string; readOnly?: boolean;
+  initialRecovery?: { text: string; decisions: TaskPairDecisionRecord[] };
+  onRecover(pair: SupervisionConsolePairInfo, decisions: TaskPairDecisionRecord[], text: string): void;
+}) {
   const { t } = useTranslation();
-  const [text, setText] = useState('');
-  const [history, setHistory] = useState<TaskPairDecisionRecord[] | null>(null);
+  const [text, setText] = useState(initialRecovery?.text ?? '');
+  const [history, setHistory] = useState<TaskPairDecisionRecord[] | null>(initialRecovery?.decisions ?? null);
   const [pending, setPending] = useState(false);
-  const [error, setError] = useState('');
+  const [error, setError] = useState(initialRecovery ? t('taskPair.decision.context_refreshed') : '');
   const [sent, setSent] = useState(false);
   const busy = useRef(false);
   const retrySignature = useRef('');
@@ -254,7 +278,7 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
     const feedback = feedbackOverride ? [feedbackOverride, text].filter(Boolean).join('\n') : text;
     if (busy.current) return;
     busy.current = true; setPending(true); setError('');
-    const signature = JSON.stringify([context, optionId, feedback]);
+    const signature = JSON.stringify([context, pair.decisionRevision, pair.decisionRequest?.id, optionId, feedback]);
     if (retrySignature.current !== signature) { retryId.current = null; retrySignature.current = signature; }
     retryId.current ??= crypto.randomUUID();
     try {
@@ -263,7 +287,22 @@ function DecisionPanel({ taskId, pair, context, readOnly }: { taskId: string; pa
         questionId: hasActiveQuestion ? (question?.id ?? null) : null, ...(optionId ? { optionId } : {}), feedback }, retryId.current);
       if (!active.current) return;
       setHistory(result.decisions); setSent(true); setText(''); retryId.current = null;
-    } catch (cause) { if (active.current) setError(String(cause)); }
+    } catch (cause) {
+      if (!active.current) return;
+      setError(String(cause));
+      // One read-only refresh per rejected stale submission, never an automatic
+      // resend of a choice to a different question. Ordinary delivery failures
+      // keep their retry ID so a lost ACK cannot duplicate persisted feedback.
+      if (cause instanceof TaskPairDecisionError && cause.code === TASK_PAIR_DECISION_ERROR.CONTEXT_CHANGED) {
+        try {
+          const fresh = await requestTaskPairDecision({ type: TASK_PAIR_DECISION_MSG.HISTORY, taskId });
+          if (!active.current || !fresh.pair) return;
+          retryId.current = null;
+          retrySignature.current = '';
+          onRecover(fresh.pair, fresh.decisions, text);
+        } catch { /* Keep the original failure and draft; no retry loop. */ }
+      }
+    }
     finally { if (active.current) { busy.current = false; setPending(false); } }
   };
 

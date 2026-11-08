@@ -1,10 +1,16 @@
 import { TASK_PAIR_TERMINAL_STATUSES } from '../../../shared/task-pair.js';
-import { TASK_PAIR_DECISION_KIND, TASK_PAIR_DECISION_MSG, TASK_PAIR_DECISION_LIMITS } from '../../../shared/task-pair-decision.js';
+import { TASK_PAIR_DECISION_KIND, TASK_PAIR_DECISION_MSG, TASK_PAIR_DECISION_LIMITS, TASK_PAIR_DECISION_ERROR } from '../../../shared/task-pair-decision.js';
 import { readPairScheduling } from '../../../shared/task-pair-suspension.js';
 import type { SupervisionTaskConsoleScope } from '../../../shared/supervision-task-console.js';
 import { getTaskPairStore } from './store.js';
 import { taskPairService } from './service.js';
+import { buildPairConsoleRow } from '../supervision-console-pair-projection.js';
 import { taskPairDecisionRevision } from './decision-context.js';
+
+/** A rejected write must remain rejected; clients can refresh before confirming again. */
+export class TaskPairDecisionContextError extends Error {
+  readonly code = TASK_PAIR_DECISION_ERROR.CONTEXT_CHANGED;
+}
 
 /** Called only behind the authenticated, active console scope; never accepts a caller-supplied Brain. */
 export function taskPairDecisionApi(scope: SupervisionTaskConsoleScope, input: Record<string, unknown>) {
@@ -18,15 +24,15 @@ export function taskPairDecisionApi(scope: SupervisionTaskConsoleScope, input: R
     const retry = store.decisionByRetryKey(scope.projectName, taskId, `human:${input.requestId}`);
     if (!retry) {
       if (TASK_PAIR_TERMINAL_STATUSES.includes(pair.status) || input.round !== Math.max(1, pair.round)
-        || input.revision !== taskPairDecisionRevision(pair)) throw new Error('The task question changed; refresh before replying');
+        || input.revision !== taskPairDecisionRevision(pair)) throw new TaskPairDecisionContextError('The task question changed; refresh before replying');
       const rawQuestion = store.latestDecisionRequest(scope.projectName, taskId, Math.max(1, pair.round), pair.deliveryRound ?? 1);
       const isResolved = rawQuestion ? store.isDecisionResolved(rawQuestion) : false;
       if (rawQuestion && input.questionId === rawQuestion.id) {
-        if (isResolved) throw new Error('This question is already resolved');
+        if (isResolved) throw new TaskPairDecisionContextError('This question is already resolved');
       } else if (input.questionId !== null && input.questionId !== undefined) {
-        throw new Error('The decision question changed; refresh before replying');
+        throw new TaskPairDecisionContextError('The decision question changed; refresh before replying');
       } else if (rawQuestion && !isResolved) {
-        throw new Error('The decision question changed; refresh before replying');
+        throw new TaskPairDecisionContextError('The decision question changed; refresh before replying');
       }
       const activeQuestion = (rawQuestion && !isResolved) ? rawQuestion : undefined;
       const feedback = typeof input.feedback === 'string' ? input.feedback.trim() : '';
@@ -44,5 +50,17 @@ export function taskPairDecisionApi(scope: SupervisionTaskConsoleScope, input: R
       });
     }
   }
-  return { decisions: store.listDecisions(scope.projectName, [taskId], TASK_PAIR_DECISION_LIMITS.HISTORY), revision: taskPairDecisionRevision(pair) };
+  const current = store.getPair(scope.projectName, taskId)!;
+  if (current.state.brain !== scope.coordinatorSessionName) throw new Error('Task is not in this Brain scope');
+  const rawQuestion = store.latestDecisionRequest(scope.projectName, taskId, Math.max(1, current.state.round), current.state.deliveryRound ?? 1);
+  const activeQuestion = rawQuestion && !store.isDecisionResolved(rawQuestion) ? rawQuestion : undefined;
+  // Reuse the live console projection rather than reconstructing a question
+  // from a bounded history page (which may contain only historical requests).
+  const snapshot = buildPairConsoleRow(current, {
+    inlineBrief: false, decisionRequest: activeQuestion,
+    latestDecision: store.latestDecision(scope.projectName, taskId),
+  }).task.pair;
+  return { decisions: store.listDecisions(scope.projectName, [taskId], TASK_PAIR_DECISION_LIMITS.HISTORY),
+    revision: taskPairDecisionRevision(current.state), pair: snapshot };
+
 }
