@@ -1,3 +1,4 @@
+import { MachineGroupTabs } from './MachineGroupTabs.js';
 import { CONTROLLED_NODE_ABI_GLIBC217 } from '@shared/controlled-node-abi.js';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
@@ -54,8 +55,6 @@ import { RemoteDesktopInstallEntry } from './RemoteDesktopInstallEntry.js';
 import { RemoteDesktopReadiness } from './RemoteDesktopReadiness.js';
 import { TeamManagementPanel } from './TeamManagementPanel.js';
 import {
-  MACHINE_GROUP_DIRECT,
-  machineGroupTabs,
   machineGroupsOf,
   machinesInGroup,
   resolveMachineGroup,
@@ -1125,22 +1124,7 @@ export function ControlledNodesPanel({
         )}
         {machineTeams.length > 0 && (
           <div class="controlled-nodes-group-filter" role="tablist" aria-label={t('controlled_nodes.group_filter_label')}>
-            {machineGroupTabs(machines).map(({ id, name, count }) => (
-              <button
-                key={id}
-                type="button"
-                role="tab"
-                aria-selected={machineGroup === id}
-                class={`controlled-nodes-team-chip${machineGroup === id ? ' is-active' : ''}`}
-                data-testid={`controlled-nodes-group-${id}`}
-                onClick={() => setMachineGroup(id)}
-              >
-                {name ?? t(id === MACHINE_GROUP_DIRECT ? 'controlled_nodes.group_direct' : 'controlled_nodes.group_all')}
-                {/* Superscript count: which tabs are worth opening, without
-                    opening them. */}
-                <span class="controlled-nodes-team-chip-count">{count}</span>
-              </button>
-            ))}
+            <MachineGroupTabs machines={machines} group={machineGroup} onSelect={setMachineGroup} testIdPrefix="controlled-nodes-group" />
           </div>
         )}
         {loaded && visibleMachines.length === 0 && (

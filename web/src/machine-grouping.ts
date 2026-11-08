@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'preact/hooks';
+import { useCallback, useEffect, useState } from 'preact/hooks';
 import type { MachineListItem } from './api/machines.js';
 
 /**
@@ -124,8 +124,14 @@ export function resolveMachineGroup(group: string, machines: readonly MachineLis
 }
 
 /** The chosen group, remembered in this browser across closing and reopening. */
-export function useRememberedMachineGroup(): [string, (group: string) => void] {
+export function useRememberedMachineGroup(active = true): [string, (group: string) => void] {
   const [group, setGroupState] = useState<string>(() => loadMachineGroup() ?? MACHINE_GROUP_DIRECT);
+  // A long-lived composer can stay mounted while the desktop picker changes
+  // the shared preference. Re-read on entry, without overwriting a remembered
+  // group during an empty/partial machine load or failed storage access.
+  useEffect(() => {
+    if (active) setGroupState((current) => loadMachineGroup() ?? current);
+  }, [active]);
   const setGroup = useCallback((next: string) => {
     setGroupState(next);
     saveMachineGroup(next);
