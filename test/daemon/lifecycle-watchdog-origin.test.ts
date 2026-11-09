@@ -57,27 +57,17 @@ function activeRuntime(send: ReturnType<typeof vi.fn>) {
   };
 }
 
-function expectSystemContinue(emit: { mock: { calls: unknown[][] } }, send: ReturnType<typeof vi.fn>) {
-  const row = emit.mock.calls.find(([session, type]) => session === SESSION && type === 'user.message');
-  const payload = row?.[2] as Record<string, unknown>;
-  expect(payload).toMatchObject({ text: 'continue', [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.SYSTEM });
-  expect(classifyUserMessageOrigin(payload)).toBe(CHAT_MESSAGE_ORIGINS.SYSTEM);
-  expect(send).toHaveBeenCalledWith('continue', expect.any(String), undefined, undefined,
-    expect.objectContaining({ messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM }));
-}
-
 describe('watchdog continue origin', () => {
-  it('does not auto-continue a stale memory-compression turn', async () => {
+  it('does not auto-continue a memory-compression turn even after the stale threshold while automatic compaction is disabled', async () => {
     const send = vi.fn(() => 'sent' as const);
-    runtimeRef.current = activeRuntime(send);
+    const runtime = activeRuntime(send);
+    runtimeRef.current = runtime;
     const emit = vi.spyOn(timelineEmitter, 'emit');
     expect(await recoverMemoryCompressionStalledSession(SESSION, 7 * 60_000)).toBe(false);
+    expect(await recoverMemoryCompressionStalledSession(SESSION, 13 * 60_000)).toBe(false);
     expect(send).not.toHaveBeenCalled();
+    expect(runtime.cancel).not.toHaveBeenCalled();
     expect(emit).not.toHaveBeenCalled();
-    expect(await recoverMemoryCompressionStalledSession(SESSION, 13 * 60_000)).toBe(true);
-    const notice = emit.mock.calls.find(([session, type]) => session === SESSION && type === 'assistant.text');
-    expect((notice?.[2] as Record<string, unknown>).text).toContain('12 minutes');
-    expectSystemContinue(emit, send);
   });
 
   it('stamps the Codex stale-turn continue as a system message on the row and the queued copy', async () => {

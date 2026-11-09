@@ -21,7 +21,7 @@ it('opens the canonical pair directly from the collapsed header without toggling
     expect(button).not.toBeNull(); expect(toggle.contains(button)).toBe(false);
     expect(button.getAttribute('aria-label')).toBe('taskPair.panel_open_split'); expect(button.title).toBe('taskPair.panel_open_split');
     fireEvent.focus(button); fireEvent.click(button);
-    expect(split.mock.calls).toEqual([[{ taskId: payload.taskId, executor: payload.executor, auditor: payload.auditor, action: 'open' }]]);
+    expect(split.mock.calls).toEqual([[{ taskId: payload.taskId, title: payload.title, executor: payload.executor, auditor: payload.auditor, action: 'open' }]]);
     expect(toggle.getAttribute('aria-expanded')).toBe('false'); expect(view.container.querySelector('.task-pair-card-body')).toBeNull();
     expect(view.container.querySelector('.task-pair-card-hover-preview')).toBeNull();
     expect(outer).not.toHaveBeenCalled(); expect(reads).not.toHaveBeenCalled();

@@ -1014,8 +1014,15 @@ describe('styles.css regression contracts', () => {
     expect(menuRule![0]).toMatch(/max-height:\s*calc\(var\(--vvh,\s*100dvh\)\s*-\s*var\(--sat,\s*0px\)\s*-\s*68px\s*-\s*env\(safe-area-inset-bottom,\s*0px\)\)/);
     expect(menuRule![0]).not.toMatch(/max-height:\s*min\(60vh/);
     expect(menuRule![0]).toMatch(/padding-bottom:\s*max\(16px,\s*env\(safe-area-inset-bottom,\s*0px\)\)/);
-    expect(menuRule![0]).toMatch(/scroll-padding-bottom:\s*max\(16px,\s*env\(safe-area-inset-bottom,\s*0px\)\)/);
-    expect(menuRule![0]).toMatch(/overflow-y:\s*auto/);
+    // Only the body scrolls; the language footer stays outside that scrollport.
+    expect(menuRule![0]).toMatch(/overflow-y:\s*hidden/);
+    expect(bodyRule![0]).toMatch(/flex:\s*1\s+1\s+auto/);
+    expect(bodyRule![0]).toMatch(/min-height:\s*0/);
+    expect(bodyRule![0]).toMatch(/overflow-y:\s*auto/);
+    expect(bodyRule![0]).toMatch(/overscroll-behavior:\s*contain/);
+    const languageRule = css.match(/\.mobile-server-menu-language\s*\{[^}]*\}/);
+    expect(languageRule).not.toBeNull();
+    expect(languageRule![0]).toMatch(/flex:\s*0\s+0\s+auto/);
 
     const menuItemRule = css.match(/\.mobile-server-menu-item\s*\{[^}]*\}/);
     expect(menuItemRule).not.toBeNull();
