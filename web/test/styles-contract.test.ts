@@ -1340,6 +1340,17 @@ describe('styles.css regression contracts', () => {
     expect(ringRule).toMatch(/-webkit-user-drag:\s*none/);
   });
 
+  it('keeps the touch cursor handle inside the stage independently of its remote click point', () => {
+    const ring = css.match(/\.remote-desktop-touch-ring\s*\{[^}]*\}/)?.[0];
+    expect(ring).toBeTruthy();
+    expect(ring).toContain('--touch-ring-radius: 32px');
+    expect(ring).toMatch(/left:\s*clamp\(min\(var\(--touch-ring-radius\),\s*50%\),\s*var\(--touch-ring-x\)/);
+    expect(ring).toMatch(/top:\s*clamp\(min\(var\(--touch-ring-radius\),\s*50%\),\s*var\(--touch-ring-y\)/);
+    expect(ring).toMatch(/max\(50%,\s*calc\(100%\s*-\s*var\(--touch-ring-radius\)\)\)/);
+    expect(ring).toMatch(/width:\s*calc\(var\(--touch-ring-radius\)\s*\*\s*2\)/);
+    expect(ring).toMatch(/height:\s*calc\(var\(--touch-ring-radius\)\s*\*\s*2\)/);
+  });
+
   // Transport sessions zero the toolbar's left padding, and they are the only
   // sessions that render a Stop button -- so matching `.shortcuts` alone would
   // leave the exact case this alignment exists for still misaligned.

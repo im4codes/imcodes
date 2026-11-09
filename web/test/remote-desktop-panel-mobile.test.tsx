@@ -2334,8 +2334,8 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     // completes the same initial-centre pass that ResizeObserver performs in
     // a browser.
     act(() => { window.dispatchEvent(new Event('resize')); });
-    expect(ring.style.left).toBe('200px');
-    expect(ring.style.top).toBe(`${150 + 72}px`);
+    expect(ring.style.getPropertyValue('--touch-ring-x')).toBe('200px');
+    expect(ring.style.getPropertyValue('--touch-ring-y')).toBe(`${150 + 72}px`);
 
     // Move the ring away from centre, then resize without changing display,
     // layout, scale or input mode. The position must survive unchanged.
@@ -2343,8 +2343,8 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       pointer(stage, 'pointerdown', { pointerId: 301, clientX: 320, clientY: 120 });
       pointer(stage, 'pointerup', { pointerId: 301, clientX: 320, clientY: 120 });
     });
-    expect(ring.style.left).toBe('320px');
-    expect(ring.style.top).toBe(`${120 + 72}px`);
+    expect(ring.style.getPropertyValue('--touch-ring-x')).toBe('320px');
+    expect(ring.style.getPropertyValue('--touch-ring-y')).toBe(`${120 + 72}px`);
 
     // Minimizing a floating panel can briefly report a zero-sized stage. That
     // transient geometry must not overwrite the last usable ring coordinate;
@@ -2354,24 +2354,24 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       clientHeight: { value: 0, configurable: true },
     });
     act(() => { window.dispatchEvent(new Event('resize')); });
-    expect(ring.style.left).toBe('320px');
-    expect(ring.style.top).toBe(`${120 + 72}px`);
+    expect(ring.style.getPropertyValue('--touch-ring-x')).toBe('320px');
+    expect(ring.style.getPropertyValue('--touch-ring-y')).toBe(`${120 + 72}px`);
 
     Object.defineProperties(stage, {
       clientWidth: { value: 400, configurable: true },
       clientHeight: { value: 300, configurable: true },
     });
     act(() => { window.dispatchEvent(new Event('resize')); });
-    expect(ring.style.left).toBe('320px');
-    expect(ring.style.top).toBe(`${120 + 72}px`);
+    expect(ring.style.getPropertyValue('--touch-ring-x')).toBe('320px');
+    expect(ring.style.getPropertyValue('--touch-ring-y')).toBe(`${120 + 72}px`);
 
     Object.defineProperties(stage, {
       clientWidth: { value: 240, configurable: true },
       clientHeight: { value: 180, configurable: true },
     });
     act(() => { window.dispatchEvent(new Event('resize')); });
-    expect(ring.style.left).toBe('240px');
-    expect(ring.style.top).toBe(`${120 + 72}px`);
+    expect(ring.style.getPropertyValue('--touch-ring-x')).toBe('240px');
+    expect(ring.style.getPropertyValue('--touch-ring-y')).toBe(`${120 + 72}px`);
 
     // A still smaller stage clamps both coordinates, and growing it again
     // does not recenter the user's ring.
@@ -2380,16 +2380,16 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       clientHeight: { value: 80, configurable: true },
     });
     act(() => { window.dispatchEvent(new Event('resize')); });
-    expect(ring.style.left).toBe('100px');
-    expect(ring.style.top).toBe(`${80 + 72}px`);
+    expect(ring.style.getPropertyValue('--touch-ring-x')).toBe('100px');
+    expect(ring.style.getPropertyValue('--touch-ring-y')).toBe(`${80 + 72}px`);
 
     Object.defineProperties(stage, {
       clientWidth: { value: 600, configurable: true },
       clientHeight: { value: 500, configurable: true },
     });
     act(() => { window.dispatchEvent(new Event('resize')); });
-    expect(ring.style.left).toBe('100px');
-    expect(ring.style.top).toBe(`${80 + 72}px`);
+    expect(ring.style.getPropertyValue('--touch-ring-x')).toBe('100px');
+    expect(ring.style.getPropertyValue('--touch-ring-y')).toBe(`${80 + 72}px`);
   });
 
   it('remembers a new zoom ratio for this machine once it settles, without saving on every intermediate change', async () => {
@@ -2425,8 +2425,8 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     // use of the same base class.
     expect(cursor.classList.contains('is-touch-ring-marker')).toBe(true);
     const ring = getByLabelText('remote_desktop.touch_ring');
-    expect(ring.style.left).toBe('300px');
-    expect(ring.style.top).toBe(`${150 + 72}px`);
+    expect(ring.style.getPropertyValue('--touch-ring-x')).toBe('300px');
+    expect(ring.style.getPropertyValue('--touch-ring-y')).toBe(`${150 + 72}px`);
 
     pointerClick.mockClear();
     act(() => {
@@ -2457,7 +2457,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     // The cursor marker and the ring are bound to the same underlying
     // position -- dragging the ring carries the marker along with it.
     expect(cursor.style.left).toBe('250px');
-    expect(ring.style.left).toBe('250px');
+    expect(ring.style.getPropertyValue('--touch-ring-x')).toBe('250px');
     act(() => { pointer(ring, 'pointerup', { pointerId: 9, clientX: 250, clientY: 150 }); });
     // The drag itself moved the cursor; release must not additionally click.
     expect(pointerClick).not.toHaveBeenCalled();

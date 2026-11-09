@@ -3812,8 +3812,11 @@ export function RemoteDesktopPanel({
                 aria-label={t('remote_desktop.touch_ring')}
                 draggable={false}
                 style={{
-                  left: `${virtualMouse.x}px`,
-                  top: `${virtualMouse.y + TOUCH_RING_OFFSET_Y_PX}px`,
+                  // The handle may move inward at an edge; the cursor and
+                  // its remote click point must not. CSS also re-clamps on
+                  // restore before a ResizeObserver callback can arrive.
+                  '--touch-ring-x': `${virtualMouse.x}px`,
+                  '--touch-ring-y': `${virtualMouse.y + TOUCH_RING_OFFSET_Y_PX}px`,
                 }}
                 // iOS can still synthesize its magnifying loupe from a native
                 // TouchEvent even though the PointerEvent was prevented and
