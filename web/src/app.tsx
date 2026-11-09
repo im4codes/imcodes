@@ -2225,7 +2225,7 @@ export function App() {
   );
   const openSubIdsRef = useRef(openSubIds);
   openSubIdsRef.current = openSubIds;
-  const activeSplitPairRef = useRef<{ taskId: string; executorSubId: string; auditorSubId: string } | null>(null);
+  const activeSplitPairRef = useRef<{ taskId: string; title: string; executorSubId: string; auditorSubId: string } | null>(null);
   const [activeSplitPairTaskId, setActiveSplitPairTaskId] = useState<string | null>(null);
   const persistOpenSubIds = useCallback((next: Set<string>) => {
     const mainSession = openSubPersistenceSessionRef.current;
@@ -6281,12 +6281,14 @@ export function App() {
 
   const handlePairSplit = useCallback((detail: {
     taskId: string;
+    title?: string;
     executor: string;
     auditor: string;
     action?: 'open' | 'close' | 'toggle';
   }) => {
     if (isMobileRef.current) return;
     const { taskId, executor, auditor, action = 'toggle' } = detail;
+    const title = typeof detail.title === 'string' && detail.title.trim() ? detail.title.trim() : taskId;
     if (!taskId || !executor || !auditor || auditor === 'none') return;
 
     const resolveSub = (nameOrId: string) => {
@@ -6378,7 +6380,7 @@ export function App() {
     ensureDesktopWindow(DESKTOP_WINDOW_IDS.subSession(executorSubId), getSubSessionDesktopWindowMeta(executorSubId), { bringToFront: true });
     activateSubId(executorSubId);
 
-    activeSplitPairRef.current = { taskId, executorSubId, auditorSubId };
+    activeSplitPairRef.current = { taskId, title, executorSubId, auditorSubId };
     setActiveSplitPairTaskId(taskId);
     (window as Window & { __imcodesActiveSplitTaskId?: string | null }).__imcodesActiveSplitTaskId = taskId;
     window.dispatchEvent(new CustomEvent('deck:pair-split-state', { detail: { activeTaskId: taskId } }));
@@ -8733,6 +8735,8 @@ export function App() {
       {/* Sub-session windows (floating) — only show if not pinned */}
       {retainedWindowSubs.slice(0, mountedWindowCount).map((sub) => {
         const windowVisible = visibleOpenWindowIds.has(sub.id) && !mobileRemoteSurfaceActive;
+        const activePair = activeSplitPairRef.current?.taskId === activeSplitPairTaskId ? activeSplitPairRef.current : null;
+        const pairRole = activePair?.executorSubId === sub.id ? 'executor' : activePair?.auditorSubId === sub.id ? 'auditor' : null;
         return (
           <div
             key={sub.id}
@@ -8748,6 +8752,9 @@ export function App() {
               remoteDesktopCanSetUp={!selectedShareTarget}
               active={windowVisible && (isMobile || focusedSubId === sub.id)}
               visible={windowVisible}
+              showTaskPairPanel={pairRole !== 'executor'}
+              pairTaskTitle={pairRole ? activePair?.title : null}
+              pairRole={pairRole}
               taskPairPanelVisitKey={activeSplitPairRef.current?.executorSubId === sub.id ? activeSplitPairTaskId ?? undefined : undefined}
               onClosePairSplit={activeSplitPairTaskId && (
                 activeSplitPairRef.current?.executorSubId === sub.id

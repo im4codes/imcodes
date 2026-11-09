@@ -373,6 +373,7 @@ describe('TaskPairEventChip', () => {
       fireEvent.click(splitBtn);
       expect(onSplit).toHaveBeenCalledWith({
         taskId: 'task-chip-split',
+        title: 'Event Chip Task',
         executor: 'exec-sub-1',
         auditor: 'audit-sub-1',
         action: 'open',
@@ -1317,6 +1318,7 @@ describe('TaskPairStatusPanel', () => {
       fireEvent.click(splitBtn);
       expect(onSplit).toHaveBeenCalledWith({
         taskId: 'task-split-1',
+        title: 'Split View Task',
         executor: 'exec-sub',
         auditor: 'audit-sub',
         action: 'open',

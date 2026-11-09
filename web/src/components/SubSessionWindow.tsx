@@ -78,6 +78,11 @@ interface Props {
   visible?: boolean;
   /** Split executor visit: start collapsed without changing session filtering or saved preferences. */
   taskPairPanelVisitKey?: string;
+  /** Render task-pair details in this window; split pairs show them only on the auditor side. */
+  showTaskPairPanel?: boolean;
+  /** Pair split metadata; absent for ordinary sub-session windows. */
+  pairTaskTitle?: string | null;
+  pairRole?: 'executor' | 'auditor' | null;
   /** Report the trailing pending ask.question (or null) for dialog re-surface. */
   onPendingQuestion?: (sessionName: string, q: TrailingAskQuestion | null) => void;
   idleFlashToken?: number;
@@ -287,7 +292,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, visible = true, taskPairPanelVisitKey, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClosePairSplit, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onLiveSessionStateChange, onPreviewFile, onOpenLocalWebPreview, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop, remoteDesktopCanSetUp = true,
+  sub, ws, connected, active, visible = true, taskPairPanelVisitKey, showTaskPairPanel = true, pairTaskTitle = null, pairRole = null, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClosePairSplit, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onLiveSessionStateChange, onPreviewFile, onOpenLocalWebPreview, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop, remoteDesktopCanSetUp = true,
 }: Props) {
   recordPerfRender(visible ? 'SubSessionWindow:visible' : 'SubSessionWindow:hidden');
   const { t } = useTranslation();
@@ -751,6 +756,9 @@ export function SubSessionWindow({
 
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
   const typeLabel = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
+  const pairWindow = pairTaskTitle !== null && pairRole !== null;
+  const titleText = pairWindow ? (pairTaskTitle || t('taskPair.panel_untitled')) : typeLabel;
+  const subtitleText = pairWindow ? (typeLabel || sub.sessionName || agentTag) : null;
 
   // Only non-terminal (chat) sub-sessions can be pinned to sidebar
   const isPinnable = !!onPin;
@@ -1000,7 +1008,19 @@ export function SubSessionWindow({
         onDragStart={handleDragStart}
       >
         <span class="subsession-drag-icon">⠿</span>
-        <span class="subsession-title"><SubSessionTaskTitle sessionName={sub.sessionName} serverId={serverId ?? sub.serverId} fallback={typeLabel} /></span>
+        {pairWindow ? (
+          <>
+            <div class={`subsession-title-group is-pair`}>
+              <span class="subsession-title" title={titleText}>{titleText}</span>
+              {subtitleText && <small class="subsession-subtitle" title={subtitleText}>{subtitleText}</small>}
+            </div>
+            <span class={`subsession-pair-role is-${pairRole}`} title={t(pairRole === 'executor' ? 'taskPair.panel_executor' : 'taskPair.panel_auditor')} aria-label={t(pairRole === 'executor' ? 'taskPair.panel_executor' : 'taskPair.panel_auditor')}>
+              {t(pairRole === 'executor' ? 'taskPair.panel_executor' : 'taskPair.panel_auditor')}
+            </span>
+          </>
+        ) : (
+          <span class="subsession-title"><SubSessionTaskTitle sessionName={sub.sessionName} serverId={serverId ?? sub.serverId} fallback={typeLabel} /></span>
+        )}
         {inP2p && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
         {sub.ccPresetId && <span style={{ fontSize: 11, color: '#f59e0b' }} title={`Custom API: ${sub.ccPresetId}`}>◉</span>}
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 10 }}>
@@ -1113,7 +1133,7 @@ export function SubSessionWindow({
             onPreviewFile={stableOnPreviewFile}
             onOpenLocalWebPreview={onOpenLocalWebPreview ? stableOnOpenLocalWebPreview : undefined}
             serverId={serverId}
-            scopeTaskPairs
+            scopeTaskPairs={showTaskPairPanel}
             taskPairPanelVisitKey={taskPairPanelVisitKey}
             onQuote={addQuote}
             agentType={sessionInfo?.agentType ?? sub.type}

@@ -407,7 +407,7 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
             e.stopPropagation();
             closeHoverPreview();
             window.dispatchEvent(new CustomEvent('deck:pair-split', {
-              detail: { taskId: String(taskId), executor: event.executor, auditor: event.auditor, action: 'open' },
+              detail: { taskId: String(taskId), title: typeof event.title === 'string' ? event.title : undefined, executor: event.executor, auditor: event.auditor, action: 'open' },
             }));
           }}
         ><span class="task-pair-split-icon" aria-hidden="true">◫</span></button>}

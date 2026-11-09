@@ -276,6 +276,48 @@ describe('SubSessionWindow metadata wiring', () => {
     expect(chatViewPropsSpy.mock.calls.at(-1)?.[0]).toMatchObject({ scopeTaskPairs: true, sessionId: baseProps.sub.sessionName, taskPairPanelVisitKey: 'split-task' });
   });
 
+  it('shows the pair task title as the main heading and keeps the session subtitle and role visible', () => {
+    const view = render(
+      <SubSessionWindow
+        sub={makeSubSession({ label: 'Executor window' })}
+        ws={ws}
+        connected={true}
+        active={true}
+        pairTaskTitle="Investigate the long-running handoff"
+        pairRole="executor"
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+    expect(view.container.querySelector('.subsession-title')?.textContent).toBe('Investigate the long-running handoff');
+    expect(view.container.querySelector('.subsession-subtitle')?.textContent).toContain('Executor window');
+    expect(view.container.querySelector('.subsession-pair-role')?.textContent).toBe('taskPair.panel_executor');
+    view.rerender(
+      <SubSessionWindow
+        sub={makeSubSession({ label: 'Executor window' })}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+    expect(view.container.querySelector('.subsession-subtitle')).toBeNull();
+    expect(view.container.querySelector('.subsession-pair-role')).toBeNull();
+  });
+
   it('projects canonical peer-audit identity/model metadata into SessionControls', () => {
     render(
       <SubSessionWindow

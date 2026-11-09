@@ -7177,7 +7177,12 @@ html.native-ios-mac .chat-dl-btn {
 .subsession-window-maximized { border: 2px solid var(--subsession-accent-color, #38bdf8); box-shadow: 0 0 0 1px rgba(15,23,42,0.75), 0 8px 32px rgba(0,0,0,0.6), 0 0 24px rgba(34,211,238,0.12); box-sizing: border-box; }
 .subsession-header { display: flex; align-items: center; gap: 8px; padding: 7px 10px; background: linear-gradient(180deg, rgba(17,27,45,0.98), rgba(10,16,27,0.98)); border-bottom: 1px solid rgba(125,211,252,0.16); cursor: move; user-select: none; flex-shrink: 0; box-shadow: inset 0 1px 0 rgba(255,255,255,0.04); }
 .subsession-drag-icon { color: rgba(34,211,238,0.48); font-size: 16px; cursor: grab; text-shadow: 0 0 8px rgba(34,211,238,0.16); }
-.subsession-title { font-size: 12px; color: #dbeafe; font-weight: 700; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.subsession-title-group { min-width: 0; flex: 1; display: flex; align-items: baseline; gap: 6px; overflow: hidden; }
+.subsession-title-group.is-pair { display: flex; flex-direction: column; align-items: flex-start; gap: 0; line-height: 1.15; }
+.subsession-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: #dbeafe; font-weight: 700; }
+.subsession-subtitle { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: rgba(191,219,254,0.68); font-size: 9px; font-weight: 500; }
+.subsession-pair-role { flex: 0 0 auto; border: 1px solid rgba(125,211,252,0.4); border-radius: 999px; padding: 1px 6px; color: #bae6fd; font-size: 9px; font-weight: 700; line-height: 1.3; white-space: nowrap; }
+.subsession-pair-role.is-auditor { border-color: rgba(196,181,253,0.5); color: #ddd6fe; }
 .subsession-mode-btn { background: rgba(15,23,42,0.55); border: 1px solid rgba(125,211,252,0.14); border-radius: 6px; color: #7b8797; cursor: pointer; font-size: 13px; padding: 2px 6px; transition: color 0.15s, border-color 0.15s, background 0.15s, box-shadow 0.15s; }
 .subsession-mode-btn:hover { border-color: rgba(34,211,238,0.42); color: #dbeafe; background: rgba(8,145,178,0.14); }
 .subsession-mode-btn.active { border-color: rgba(34,211,238,0.6); color: var(--chrome-accent); background: rgba(8,145,178,0.22); box-shadow: 0 0 12px rgba(34,211,238,0.14); }

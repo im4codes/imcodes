@@ -358,6 +358,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
                     window.dispatchEvent(new CustomEvent('deck:pair-split', {
                       detail: {
                         taskId: taskIdStr,
+                        title,
                         executor: payload.executor,
                         auditor: payload.auditor,
                         action: 'open',
