@@ -7627,7 +7627,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                   }}
                   onMouseEnter={() => setTaskPairHighlightIdx(idx)}
                 >
-                  <span class="controls-task-pair-title">{task.title}</span>
                   <span
                     class="controls-task-pair-status-badge"
                     data-task-pair-status={task.status}
@@ -7636,6 +7635,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                   >
                     {t(taskPairReferenceStatusKey(task.status))}
                   </span>
+                  <span class="controls-task-pair-title">{task.title}</span>
                 </div>
               );
             })}

@@ -827,3 +827,22 @@ it('hydrates percent task status badges from an already-published snapshot and c
     expect(view.container.querySelector('[data-task-pair-status]')).toBeNull();
   } finally { delete (window as any).__imcodesTaskPairSnapshot; }
 });
+
+it('puts each percent picker status before its title without changing reference insertion', () => {
+  cleanup();
+  (window as any).__imcodesTaskPairSnapshot = { serverId: 'srv-1', authoritative: true, tasks: [
+    { taskId: 'left-status', title: 'Long task title with punctuation!', pair: { status: 'working' } },
+  ] };
+  try {
+    const view = render(<SessionControls ws={{ connected: true, send: vi.fn(), onMessage: vi.fn(() => () => {}) } as any}
+      activeSession={makeSession()} quickData={makeQuickData()} sessions={[]} subSessions={[]} serverId="srv-1" />);
+    const input = screen.getByRole('textbox'); input.textContent = '%'; fireEvent.input(input);
+    const option = view.container.querySelector('[data-task-pair-id="left-status"]')!;
+    expect(option.firstElementChild?.classList.contains('controls-task-pair-status-badge')).toBe(true);
+    expect(option.children[1]?.classList.contains('controls-task-pair-title')).toBe(true);
+    expect(option.firstElementChild?.getAttribute('title')).toBe('working');
+    fireEvent.mouseDown(option.firstElementChild!);
+    expect(input.textContent).toBe('%Long task title with punctuation! ');
+    expect(view.container.querySelector('.controls-task-pair-picker')).toBeNull();
+  } finally { cleanup(); delete (window as any).__imcodesTaskPairSnapshot; }
+});

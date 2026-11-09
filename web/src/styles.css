@@ -3459,7 +3459,7 @@ html.native-ios-mac .chat-dl-btn {
 .mobile-server-menu-body { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); grid-auto-rows: max-content; align-content: start; flex: 1 1 auto; min-height: 0; overflow-x: hidden; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: rgba(125, 211, 252, 0.28) transparent; }
 .mobile-server-menu-language { flex: 0 0 auto; min-width: 0; padding: 10px 12px; border-top: 1px solid #334155; background: #1e293b; }
 .controls-task-pair-title { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; color: #e2e8f0; }
-.controls-task-pair-status-badge { flex: 0 1 auto; min-width: 0; max-width: 42%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 1px 6px; border: 1px solid rgb(125 211 252 / 28%); border-radius: 999px; background: rgb(15 23 42 / 64%); color: #bae6fd; font-size: 10px; line-height: 1.35; }
+.controls-task-pair-status-badge { box-sizing: border-box; flex: 0 0 80px; width: 80px; min-width: 0; text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 1px 6px; border: 1px solid rgb(125 211 252 / 28%); border-radius: 999px; background: rgb(15 23 42 / 64%); color: #bae6fd; font-size: 10px; line-height: 1.35; }
 .layout-mobile .sidebar { display: none; }
 .layout-mobile .mobile-server-bar { display: flex; }
 .layout-mobile .mobile-sidebar-toggle { display: block; }
