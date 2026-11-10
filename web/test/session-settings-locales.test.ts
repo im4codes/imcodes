@@ -13,6 +13,9 @@ describe('independent session settings locale coverage', () => {
   it('ships supervision and model settings labels in every locale', () => {
     for (const [locale, messages] of Object.entries(LOCALES)) {
       const session = (messages as any).session;
+      for (const role of ['executor', 'auditor', 'both']) {
+        expect(session?.supervision?.[`poolEntryRole_${role}`], `${locale}:${role}`).toBeTruthy();
+      }
       expect(session?.supervision?.settingsTitle, locale).toBeTruthy();
       for (const key of ['label', 'help', 'current', 'default', 'apply', 'applying', 'applied', 'confirmationTimeout', 'disconnected', 'failed', 'loading', 'unsupported']) {
         expect(session?.modelSettings?.[key], `${locale}:${key}`).toBeTruthy();

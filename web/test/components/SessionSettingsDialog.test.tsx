@@ -1147,6 +1147,54 @@ describe('SessionSettingsDialog supervision', () => {
     expect(config).toMatchObject({ role: 'executor' });
   });
 
+  it.each(['executor', 'auditor', 'both'] as const)('reopens the live grouped candidate with the saved %s role', async (role) => {
+    const props = {
+      surface: 'supervision' as const, canControlAutomaticSupervision: true,
+      serverId: 'srv-1', sessionName: 'deck_proj_brain', label: 'Brain', description: '', cwd: '/proj',
+      type: 'codex-sdk', activeModel: CODEX_MODEL_IDS[0], transportConfig: null,
+      peerAuditSessions: [makePeerAuditSession(), makePeerAuditSession({ sessionName: 'deck_sub_peer2' })],
+      onClose: vi.fn(), onSaved: vi.fn(),
+    };
+    const capabilityId = 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6';
+    const { unmount } = render(<SessionSettingsDialog {...props} />);
+    const primary = screen.getByTestId('supervision-execution-pool-primary');
+    fireEvent.click(within(primary).getByLabelText('primary:deck_sub_peer,deck_sub_peer2'));
+    act(() => {
+      const select = within(primary).getByTestId(`supervision-execution-pool-role-${capabilityId}`) as HTMLSelectElement;
+      select.value = role;
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() => expect(saveSupervisorDefaultsMock).toHaveBeenCalled());
+    const saved = saveSupervisorDefaultsMock.mock.calls.at(-1)?.[0];
+    unmount();
+    fetchSupervisorDefaultsMock.mockResolvedValue(saved);
+    render(<SessionSettingsDialog {...props} />);
+    await waitFor(() => expect((screen.getByTestId(`supervision-execution-pool-role-${capabilityId}`) as HTMLSelectElement).value).toBe(role));
+    const economy = screen.getByTestId('supervision-execution-pool-economy');
+    fireEvent.click(within(economy).getByLabelText('economy:deck_sub_peer,deck_sub_peer2'));
+    fireEvent.click(within(screen.getByTestId('supervision-execution-pool-primary')).getByLabelText('primary:deck_sub_peer,deck_sub_peer2'));
+    expect((screen.getByTestId(`supervision-execution-pool-role-${capabilityId}`) as HTMLSelectElement).value).toBe(role);
+  });
+
+  it.each(['executor', 'auditor', 'both'] as const)('renders a configured-only %s entry without fabricating a live candidate', async (role) => {
+    const capabilityId = 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6';
+    fetchSupervisorDefaultsMock.mockResolvedValue({ executionPools: {
+      state: 'configured', primaryDevelopmentPool: { configs: [{
+        capabilityId, agentType: 'codex-sdk', runtimeType: 'transport', providerFamily: 'openai', model: 'gpt-5.6', role,
+      }] }, economyTaskPool: { configs: [{
+        capabilityId, agentType: 'codex-sdk', runtimeType: 'transport', providerFamily: 'openai', model: 'gpt-5.6', role: 'both',
+      }] },
+    } });
+    render(<SupervisionSettingsDialog serverId="srv-1" sessionName="deck_proj_brain" label="" description="" cwd="/proj"
+      type="codex-sdk" activeModel={CODEX_MODEL_IDS[0]} transportConfig={null} onClose={vi.fn()} onSaved={vi.fn()} />);
+    await waitFor(() => expect((screen.getByTestId(`supervision-execution-pool-role-${capabilityId}`) as HTMLSelectElement).value).toBe(role));
+    const checkbox = screen.getByLabelText('primary:configured:codex-sdk:gpt-5.6');
+    expect((checkbox as HTMLInputElement).checked).toBe(true);
+    fireEvent.click(checkbox);
+    expect(screen.queryByTestId(`supervision-execution-pool-role-${capabilityId}`)).toBeNull();
+  });
+
   it('persists a CC preset constraint without binding it to a live session', async () => {
     render(
       <SessionSettingsDialog

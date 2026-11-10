@@ -16,6 +16,7 @@ const {
   getSupervisorDefaultsCacheAgeMs,
   overlayCachedExecutionPools,
   refreshSupervisorDefaultsCache,
+  updateSupervisorDefaultsCache,
 } = await import('../../src/daemon/supervisor-defaults-cache.js');
 
 describe('supervisor defaults cache', () => {
@@ -68,6 +69,98 @@ describe('supervisor defaults cache', () => {
       backupModel: 'gpt-5.3-codex-spark',
       timeoutMs: 45_000,
     });
+  });
+
+  it('does not roll back a saved role when an older poll finishes late, including on disk', async () => {
+    let resolveOld!: (value: unknown) => void;
+    const old = new Promise((r) => { resolveOld = r; });
+    const fetchMock = vi.fn().mockReturnValueOnce(old).mockResolvedValueOnce({
+      ok: true, json: async () => ({ defaults: { model: 'new' } }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const poll = refreshSupervisorDefaultsCache();
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    const normalized = (await import('../../shared/supervision-config.js')).normalizeSupervisorDefaultConfig({ model: 'new' });
+    await updateSupervisorDefaultsCache(normalized);
+    resolveOld({ ok: true, json: async () => ({ defaults: { model: 'old' } }) });
+    await poll;
+    expect(getCachedSupervisorDefaults()?.model).toBe('new');
+    __setCachedSupervisorDefaultsForTests(null);
+    __reloadSupervisorDefaultsCacheFromDiskForTests();
+    expect(getCachedSupervisorDefaults()?.model).toBe('new');
+  });
+
+  it('does not poll a pre-commit snapshot during an outstanding write', async () => {
+    let resolveWrite!: (value: unknown) => void;
+    vi.stubGlobal('fetch', vi.fn().mockReturnValue(new Promise((r) => { resolveWrite = r; })));
+    const normalized = (await import('../../shared/supervision-config.js')).normalizeSupervisorDefaultConfig({ model: 'saved' });
+    const write = updateSupervisorDefaultsCache(normalized);
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+    await refreshSupervisorDefaultsCache();
+    expect(fetch).toHaveBeenCalledOnce();
+    resolveWrite({ ok: true, json: async () => ({ defaults: normalized }) });
+    await write;
+    expect(getCachedSupervisorDefaults()?.model).toBe('saved');
+  });
+
+  it('orders overlapping writes so an older response cannot replace the newer preference', async () => {
+    let resolveFirst!: (value: unknown) => void;
+    const first = new Promise((r) => { resolveFirst = r; });
+    const fetchMock = vi.fn().mockReturnValueOnce(first).mockResolvedValueOnce({ ok: true, json: async () => ({ defaults: { model: 'new' } }) });
+    vi.stubGlobal('fetch', fetchMock);
+    const { normalizeSupervisorDefaultConfig: normalize } = await import('../../shared/supervision-config.js');
+    const older = updateSupervisorDefaultsCache(normalize({ model: 'old' }));
+    const newer = updateSupervisorDefaultsCache(normalize({ model: 'new' }));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    resolveFirst({ ok: true, json: async () => ({ defaults: { model: 'old' } }) });
+    await Promise.all([older, newer]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(getCachedSupervisorDefaults()?.model).toBe('new');
+    __setCachedSupervisorDefaultsForTests(null);
+    __reloadSupervisorDefaultsCacheFromDiskForTests();
+    expect(getCachedSupervisorDefaults()?.model).toBe('new');
+  });
+
+  it('accepts a slow poll despite a newer in-flight poll, but never a superseded response', async () => {
+    const resolves: Array<(value: unknown) => void> = [];
+    const fetchMock = vi.fn(() => new Promise((r) => resolves.push(r)));
+    vi.stubGlobal('fetch', fetchMock);
+    const first = refreshSupervisorDefaultsCache();
+    const second = refreshSupervisorDefaultsCache();
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    resolves[0]({ ok: true, json: async () => ({ defaults: { model: 'first-slow' } }) });
+    await first;
+    expect(getCachedSupervisorDefaults()?.model).toBe('first-slow');
+    resolves[1]({ ok: true, json: async () => ({ defaults: { model: 'second' } }) });
+    await second;
+    const older = refreshSupervisorDefaultsCache();
+    const newer = refreshSupervisorDefaultsCache();
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+    resolves[3]({ ok: true, json: async () => ({ defaults: { model: 'newer' } }) });
+    await newer;
+    resolves[2]({ ok: true, json: async () => ({ defaults: { model: 'superseded' } }) });
+    await older;
+    expect(getCachedSupervisorDefaults()?.model).toBe('newer');
+  });
+
+  it('bounds a stuck write and releases the queue for the next preference', async () => {
+    const controller = new AbortController();
+    const timeout = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(controller.signal);
+    const fetchMock = vi.fn()
+      .mockImplementationOnce((_url, init) => new Promise((_resolve, reject) => init.signal.addEventListener('abort', () => reject(new Error('timeout')))))
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ defaults: { model: 'recovered' } }) });
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const { normalizeSupervisorDefaultConfig: normalize } = await import('../../shared/supervision-config.js');
+      const stalled = updateSupervisorDefaultsCache(normalize({ model: 'stalled' }));
+      const next = updateSupervisorDefaultsCache(normalize({ model: 'recovered' }));
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+      expect(timeout).toHaveBeenCalledWith(15000);
+      controller.abort();
+      expect(await stalled).toBeNull();
+      expect((await next)?.model).toBe('recovered');
+      expect(getCachedSupervisorDefaults()?.model).toBe('recovered');
+    } finally { timeout.mockRestore(); }
   });
 
   describe('local SQLite mirror (survives a daemon restart)', () => {

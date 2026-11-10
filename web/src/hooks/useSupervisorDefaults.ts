@@ -4,7 +4,7 @@ import {
   parseSupervisorDefaultConfig,
   type SupervisorDefaultConfig,
 } from '@shared/supervision-config.js';
-import { useCallback, useEffect, useState } from 'preact/hooks';
+import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import {
   fetchSessionSupervisorDefaults,
   saveSessionSupervisorDefaults,
@@ -53,18 +53,26 @@ export function useSupervisorDefaults(
   const sessionName = scope?.sessionName.trim() ?? '';
   const scopeKey = `${serverId}\0${sessionName}`;
 
+  // One authority token for reads and writes. A late load/save from this or a
+  // previous covered session must not replace the newest local result.
+  const authority = useRef({ scopeKey, enabled, version: 0 });
+  if (authority.current.scopeKey !== scopeKey || authority.current.enabled !== enabled) {
+    authority.current = { scopeKey, enabled, version: authority.current.version + 1 };
+  }
   const reloadScoped = useCallback(async (): Promise<SupervisorDefaultConfig | null> => {
     if (!enabled || !serverId || !sessionName) return null;
+    const version = ++authority.current.version;
+    const current = () => authority.current.version === version && authority.current.scopeKey === scopeKey;
     setScopedState({ scopeKey, value: null, loaded: false, loading: true, error: null, executionPoolSessions: [] });
     try {
       const [value, executionPoolSessions] = await Promise.all([
         fetchSessionSupervisorDefaults(serverId, sessionName),
         fetchExecutionPoolCatalog(serverId, sessionName),
       ]);
-      setScopedState({ scopeKey, value, loaded: true, loading: false, error: null, executionPoolSessions });
+      if (current()) setScopedState({ scopeKey, value, loaded: true, loading: false, error: null, executionPoolSessions });
       return value;
     } catch (error) {
-      setScopedState({ scopeKey, value: null, loaded: true, loading: false, error, executionPoolSessions: [] });
+      if (current()) setScopedState({ scopeKey, value: null, loaded: true, loading: false, error, executionPoolSessions: [] });
       throw error;
     }
   }, [enabled, scopeKey, serverId, sessionName]);
@@ -72,23 +80,11 @@ export function useSupervisorDefaults(
   useEffect(() => {
     if (!enabled || !hasScope) {
       setScopedState({ scopeKey: '', value: null, loaded: false, loading: false, error: null, executionPoolSessions: [] });
-      return;
+    } else {
+      void reloadScoped().catch(() => undefined);
     }
-    let active = true;
-    setScopedState({ scopeKey, value: null, loaded: false, loading: true, error: null, executionPoolSessions: [] });
-    void Promise.all([
-      fetchSessionSupervisorDefaults(serverId, sessionName),
-      fetchExecutionPoolCatalog(serverId, sessionName),
-    ]).then(
-      ([value, executionPoolSessions]) => {
-        if (active) setScopedState({ scopeKey, value, loaded: true, loading: false, error: null, executionPoolSessions });
-      },
-      (error) => {
-        if (active) setScopedState({ scopeKey, value: null, loaded: true, loading: false, error, executionPoolSessions: [] });
-      },
-    );
-    return () => { active = false; };
-  }, [enabled, hasScope, scopeKey, serverId, sessionName]);
+    return () => { authority.current.version++; };
+  }, [enabled, hasScope, reloadScoped]);
 
   if (hasScope) {
     // Scope changes render before effects run. Never expose the previous
@@ -98,6 +94,7 @@ export function useSupervisorDefaults(
       ? scopedState
       : { scopeKey, value: null, loaded: false, loading: true, error: null, executionPoolSessions: [] };
     const set = (config: Partial<SupervisorDefaultConfig> | null | undefined): void => {
+      authority.current.version++;
       setScopedState({
         scopeKey,
         value: normalizeSupervisorDefaultConfig(config),
@@ -108,9 +105,12 @@ export function useSupervisorDefaults(
       });
     };
     const save = async (config: Partial<SupervisorDefaultConfig> | null | undefined): Promise<SupervisorDefaultConfig> => {
+      const version = ++authority.current.version;
       const normalized = normalizeSupervisorDefaultConfig(config);
       const value = await saveSessionSupervisorDefaults(serverId, sessionName, normalized);
-      setScopedState({ scopeKey, value, loaded: true, loading: false, error: null, executionPoolSessions: current.executionPoolSessions });
+      if (authority.current.version === version && authority.current.scopeKey === scopeKey) {
+        setScopedState({ scopeKey, value, loaded: true, loading: false, error: null, executionPoolSessions: current.executionPoolSessions });
+      }
       return value;
     };
     return {

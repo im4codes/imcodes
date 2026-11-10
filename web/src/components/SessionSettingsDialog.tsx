@@ -676,19 +676,29 @@ function SupervisionExecutionPoolsEditor({
   const setRole = (capabilityId: string, role: SupervisionExecutionPoolRole): void => {
     onChange(updateExecutionPoolRole(pools, capabilityId, role));
   };
-  const renderRoleSelect = (config: SupervisionExecutionConfig) => (
-    <select
-      aria-label={t('session.supervision.poolEntryRole', { model: config.model })}
-      data-testid={`supervision-execution-pool-role-${config.capabilityId}`}
-      value={supervisionExecutionConfigRole(config)}
-      disabled={saving}
-      onChange={(e) => setRole(config.capabilityId, (e.target as HTMLSelectElement).value as SupervisionExecutionPoolRole)}
-    >
-      {SUPERVISION_EXECUTION_POOL_ROLES.map((role) => (
-        <option key={role} value={role}>{t(`session.supervision.poolEntryRole_${role}`)}</option>
-      ))}
-    </select>
-  );
+  const configuredByCapability = new Map([
+    ...pools.economyTaskPool.configs,
+    ...pools.primaryDevelopmentPool.configs,
+  ].map((config) => [config.capabilityId, config]));
+  const renderRoleSelect = (candidate: SupervisionExecutionConfig) => {
+    // Live candidates describe capability identity, not the user's saved role.
+    // Resolve the draft entry across both pools so moving it cannot reset role.
+    // Primary wins if an imported config contains the capability in both pools.
+    const config = configuredByCapability.get(candidate.capabilityId) ?? candidate;
+    return (
+      <select
+        aria-label={t('session.supervision.poolEntryRole', { model: config.model })}
+        data-testid={`supervision-execution-pool-role-${config.capabilityId}`}
+        value={supervisionExecutionConfigRole(config)}
+        disabled={saving || !configuredByCapability.has(config.capabilityId)}
+        onChange={(e) => setRole(config.capabilityId, (e.target as HTMLSelectElement).value as SupervisionExecutionPoolRole)}
+      >
+        {SUPERVISION_EXECUTION_POOL_ROLES.map((role) => (
+          <option key={role} value={role}>{t(`session.supervision.poolEntryRole_${role}`)}</option>
+        ))}
+      </select>
+    );
+  };
   const renderPool = (pool: SupervisionExecutionPoolKind) => {
     const primary = pool === 'primary';
     const eligibleCandidates = primary
