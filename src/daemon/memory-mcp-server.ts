@@ -455,7 +455,7 @@ export function createMemoryMcpServer(
       await refreshSupervisorDefaultsCache();
       return getCachedSupervisorDefaults();
     }),
-    setDefaults: executionPoolToolDeps.setDefaults ?? ((runtimeCaller, defaults) => updateSupervisorDefaultsCache(defaults)),
+    setDefaults: executionPoolToolDeps.setDefaults ?? ((runtimeCaller, mutate) => updateSupervisorDefaultsCache(mutate)),
     isProjectBrain: executionPoolToolDeps.isProjectBrain ?? supervisionToolDeps.isProjectBrain,
   })) registered.set(name, tool);
   // Withheld tools are gone from this connection: not listed, not discoverable

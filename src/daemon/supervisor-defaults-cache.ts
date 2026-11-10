@@ -174,8 +174,15 @@ export async function refreshSupervisorDefaultsCache(): Promise<void> {
   }
 }
 
-/** Persist an MCP/web pool change through the server's owner-authenticated route. */
-export async function updateSupervisorDefaultsCache(value: SupervisorDefaultConfig): Promise<SupervisorDefaultConfig | null> {
+export type SupervisorDefaultsMutation = (current: SupervisorDefaultConfig) => SupervisorDefaultConfig;
+
+/**
+ * Serialize complete mutations, not snapshots merged before entering the queue.
+ * The callback reads current server authority when its turn starts, so another
+ * MCP handler's independent pool/policy patch cannot resurrect an old role.
+ * Full-value callers retain their existing explicit replacement semantics.
+ */
+export async function updateSupervisorDefaultsCache(update: SupervisorDefaultConfig | SupervisorDefaultsMutation): Promise<SupervisorDefaultConfig | null> {
   ++cacheRequestVersion;
   pendingUpdates++;
   const previous = updateQueue;
@@ -185,9 +192,20 @@ export async function updateSupervisorDefaultsCache(value: SupervisorDefaultConf
   try {
     const creds = await loadCredentials();
     if (!creds) return null;
-    const response = await fetch(`${creds.workerUrl}/api/server/${creds.serverId}/supervision/user-defaults/daemon`, {
+    const endpoint = `${creds.workerUrl}/api/server/${creds.serverId}/supervision/user-defaults/daemon`;
+    const signal = AbortSignal.timeout(SUPERVISOR_DEFAULTS_UPDATE_TIMEOUT_MS);
+    let value: SupervisorDefaultConfig;
+    if (typeof update === 'function') {
+      const response = await fetch(endpoint, { method: 'GET', signal, headers: { Authorization: `Bearer ${creds.token}` } });
+      if (!response.ok) return null;
+      const body = await response.json() as { defaults?: Partial<SupervisorDefaultConfig> | null };
+      value = update(normalizeSupervisorDefaultConfig(body.defaults ?? null));
+    } else {
+      value = update;
+    }
+    const response = await fetch(endpoint, {
       method: 'PUT',
-      signal: AbortSignal.timeout(SUPERVISOR_DEFAULTS_UPDATE_TIMEOUT_MS),
+      signal,
       headers: { Authorization: `Bearer ${creds.token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ defaults: value }),
     });

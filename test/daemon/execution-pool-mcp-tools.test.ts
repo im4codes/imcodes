@@ -19,7 +19,7 @@ describe('execution pool MCP tools', () => {
   });
   it('sets entries and policy through the Brain-only gate', async () => {
     let saved = defaults();
-    const setDefaults = vi.fn(async (_caller, next) => { saved = next; return next; });
+    const setDefaults = vi.fn(async (_caller, mutate) => { saved = mutate(saved); return saved; });
     const handlers = createExecutionPoolMcpToolHandlers(caller, { getDefaults: () => saved, setDefaults, isProjectBrain: () => true });
     const result = await handlers.execution_pool_set({ entries: [{ model: 'gpt-5.4', provider: 'codex', role: 'auditor' }], autoPairingEnabled: true, auditByDefault: true, concurrencyCap: 4 });
     expect(result).toMatchObject({ status: 'ok', entries: [{ role: 'auditor' }], auditByDefault: true, concurrencyCap: 4 });

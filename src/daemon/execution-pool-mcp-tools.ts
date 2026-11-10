@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { McpServer, RegisteredTool } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import type { SupervisorDefaultsMutation } from './supervisor-defaults-cache.js';
 import type { McpRuntimeCaller } from './memory-mcp-caller.js';
 import {
   EXECUTION_POOL_MCP_TOOLS,
@@ -23,7 +24,8 @@ type ToolHandler = (input?: unknown) => Promise<ToolResult>;
 
 export interface ExecutionPoolMcpToolDeps {
   getDefaults?: (caller: McpRuntimeCaller) => Promise<SupervisorDefaultConfig | null> | SupervisorDefaultConfig | null;
-  setDefaults?: (caller: McpRuntimeCaller, defaults: SupervisorDefaultConfig) => Promise<SupervisorDefaultConfig | null> | SupervisorDefaultConfig | null;
+  /** Must serialize read → mutate → persist across handler instances. */
+  setDefaults?: (caller: McpRuntimeCaller, mutate: SupervisorDefaultsMutation) => Promise<SupervisorDefaultConfig | null> | SupervisorDefaultConfig | null;
   isProjectBrain?: (caller: McpRuntimeCaller) => boolean;
 }
 
@@ -102,9 +104,8 @@ export function createExecutionPoolMcpToolHandlers(caller: McpRuntimeCaller, dep
       if (!authorized()) return error('execution pool changes require the project Brain/owner session', MCP_ERROR_REASONS.SCOPE_FORBIDDEN);
       const parsed = validateExecutionPoolMcpPatch(input);
       if ('error' in parsed) return error(parsed.error);
-      const current = await getDefaults(caller);
-      if (!current) return error('execution pool defaults are unavailable', MCP_ERROR_REASONS.INTERNAL_ERROR);
-      const saved = await setDefaults(caller, applyPatch(current, parsed));
+      // The persistence boundary must read + merge inside its shared queue.
+      const saved = await setDefaults(caller, (current) => applyPatch(current, parsed));
       if (!saved) return error('execution pool persistence could not be confirmed; read the current preferences before retrying', MCP_ERROR_REASONS.INTERNAL_ERROR);
       return poolOutput(saved);
     },
