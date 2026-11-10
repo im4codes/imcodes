@@ -19,6 +19,7 @@ import { TIMELINE_MESSAGES, TIMELINE_PROTOCOL_CAPABILITY, TIMELINE_PROTOCOL_REVI
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { SESSION_SEND_DELIVERY_MODES } from '../../shared/session-send-delivery.js';
+import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 
 const ROOT = path.resolve(import.meta.dirname, '../..');
 const MAIN = 'deck_e2e_cross_client_brain';
@@ -69,6 +70,8 @@ describe('one stable send across independent desktop and phone clients', () => {
     // receiver-only bug (the sender already has an optimistic row).
     off = timelineEmitter.on((event) => {
       if (![MAIN, SUB].includes(event.sessionId)) return;
+      if (event.type === 'user.message') console.info('primary send identity', JSON.stringify({ session: event.sessionId, eventId: event.eventId,
+        commandId: event.payload.commandId, clientMessageId: event.payload.clientMessageId, actor: event.payload.sharedActor }));
       if (event.type !== 'user.message') {
         // Reproduce a cold subscriber receiving legacy history before the live
         // stream. Hold independent live state frames until bootstrap completed;
@@ -136,7 +139,15 @@ describe('one stable send across independent desktop and phone clients', () => {
           if (command.type === 'session.send') {
             dispatches[command.commandId] = (dispatches[command.commandId] ?? 0) + 1;
             // Synthetic authenticated participant stamp; not client-authored.
-            command.sharedActor = { actorUserId: peers.get(peer), actorDisplayName: 'Synthetic Participant', effectiveActorRole: 'participant', actionId: command.commandId, authorizedAt: Date.now() };
+            const now = Date.now();
+            const actor: SharedActorEnvelope = {
+              actorUserId: peers.get(peer)!, actorDisplayName: 'Synthetic Participant', effectiveActorRole: 'participant',
+              actionId: command.commandId, authorizedAt: now, origin: 'shared-server', primaryShareId: 'synthetic-share',
+              snapshot: { target: { kind: 'server', serverId: 'synthetic-server' }, effectiveRole: 'participant',
+                historyCutoffAt: 0, nextCoverageRecheckAt: null, coveringShareIds: ['synthetic-share'], primaryShareId: 'synthetic-share', authorizedAt: now },
+            };
+            command.sharedActor = actor;
+            console.info('dispatch send identity', JSON.stringify({ session: command.sessionName, commandId: command.commandId, actor: peers.get(peer) }));
             handleWebCommand(command, link);
           } else if (command.type === TIMELINE_MESSAGES.HISTORY_REQUEST) {
             send(peer, { type: TIMELINE_MESSAGES.HISTORY, sessionName: command.sessionName, requestId: command.requestId,
@@ -162,7 +173,7 @@ describe('one stable send across independent desktop and phone clients', () => {
     rmSync(temp, { recursive: true, force: true });
   });
 
-  it('keeps one receiver bubble through fallback/live/replay/reload and preserves distinct sends, including busy append', async () => {
+  it('keeps one receiver bubble through fallback/live/replay/reload and preserves distinct sends, including busy append', { timeout: 60_000, retry: 0 }, async () => {
     const desktop = await browser.newContext({ viewport: { width: 1280, height: 800 } });
     const phone = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
     const sender = await desktop.newPage();
@@ -232,25 +243,35 @@ describe('one stable send across independent desktop and phone clients', () => {
       // Same user intentionally sends the SAME body with another stable command.
       await sender.evaluate(({ body, id }: any) => (window as any).sendIdentityFixture.send(body, id), { body, id: `${id}-again` });
       await vi.waitFor(async () => expect(await receiver.locator('.chat-user').count()).toBe(2));
+      await vi.waitFor(() => expect(getTransportRuntime(session)?.getStatus()).toBe('idle'));
       // Another authenticated synthetic participant deliberately sends the same
       // body. Different command and actor remain a distinct bubble on both ends.
       await receiver.evaluate(({ body, id }: any) => (window as any).sendIdentityFixture.send(body, id), { body, id: `${id}-other-participant` });
+      // The receiver can show its own optimistic third row before this actor's
+      // authoritative echo reaches either page. Count is not a delivery ACK.
+      await sender.waitForFunction((id: string) => (window as any).sendIdentityFixture.events.some((e: any) =>
+        e.payload.commandId === id && e.payload.sharedActor?.actorUserId === 'receiver'), `${id}-other-participant`);
+      await receiver.waitForFunction((id: string) => (window as any).sendIdentityFixture.events.some((e: any) =>
+        e.payload.commandId === id && !e.payload.pending && e.payload.sharedActor?.actorUserId === 'receiver'), `${id}-other-participant`);
       await vi.waitFor(async () => {
         expect(await sender.locator('.chat-user').count()).toBe(3);
         expect(await receiver.locator('.chat-user').count()).toBe(3);
       });
       const actors = await sender.evaluate(() => (window as any).sendIdentityFixture.events.filter((e: any) => e.type === 'user.message').map((e: any) => e.payload.sharedActor?.actorUserId));
       expect(new Set(actors)).toEqual(new Set(['sender', 'receiver']));
+      await vi.waitFor(() => expect(getTransportRuntime(session)?.getStatus()).toBe('idle'));
     }
     // Real Codex app-server steer into a held turn (not a duplicate model turn).
     await sender.evaluate(() => (window as any).sendIdentityFixture.send('HOLD synthetic foreground', 'hold-1'));
     await vi.waitFor(() => expect(inputs().some((row) => row.text.includes('HOLD synthetic foreground'))).toBe(true));
-    await sender.evaluate((mode: string) => (window as any).sendIdentityFixture.send('Synthetic active append', 'append-1', mode), SESSION_SEND_DELIVERY_MODES.APPEND);
+    await receiver.evaluate((mode: string) => (window as any).sendIdentityFixture.send('Synthetic active append', 'append-1', mode), SESSION_SEND_DELIVERY_MODES.APPEND);
     await vi.waitFor(() => expect(inputs().some((row) => row.method === 'turn/steer' && row.text.includes('Synthetic active append'))).toBe(true));
+    await sender.waitForFunction(() => (window as any).sendIdentityFixture.events.some((e: any) =>
+      e.payload.commandId === 'append-1' && e.payload.sharedActor?.actorUserId === 'receiver'));
     await vi.waitFor(async () => expect(await receiver.locator('.chat-user').count()).toBe(5));
     expect(inputs().filter((row) => row.text.includes('Synthetic active append'))).toHaveLength(1);
     expect(frames.some((frame) => frame.role === 'receiver' && frame.type === TRANSPORT_MSG.CHAT_HISTORY)).toBe(true);
     console.info('send-identity layered counts', JSON.stringify({ initialCounts, dispatches, providerInputs: inputs().map((row) => ({ method: row.method, threadId: row.threadId })), receiverBubbles: 5, frames: frames.length }));
     await desktop.close(); await phone.close();
-  }, 60_000);
+  });
 });
