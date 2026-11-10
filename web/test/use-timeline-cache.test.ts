@@ -1035,6 +1035,111 @@ describe('useTimeline window-isolated cache bounds', () => {
     expect(screen.getByTestId('visible-cold-bound-probe').textContent).toBe('200');
   });
 
+  it.each(['scoped', 'raw-fallback', 'split'].flatMap((segment) =>
+    ['cache-first', 'live-first'].map((order) => ({ segment, order })),
+  ))('restores $segment IDB send identity in $order order without changing disk scope', async ({ segment, order }) => {
+    const sessionName = `deck_restore_identity_${segment}_${order}`;
+    const cacheKey = `srv:${sessionName}`;
+    const old: TimelineEvent = {
+      eventId: 'transport-history:old-projection', sessionId: segment === 'scoped' ? cacheKey : sessionName,
+      ts: 100, epoch: 0, seq: 1, type: 'user.message', source: 'daemon', confidence: 'high',
+      payload: { text: 'Synthetic restored send', commandId: 'one-command', allowDuplicate: true,
+        attachments: [{ name: 'synthetic.png' }] },
+    };
+    const primary: TimelineEvent = { ...old, eventId: 'primary-live', sessionId: sessionName, epoch: 1, seq: 2,
+      payload: { text: 'Synthetic restored send', commandId: 'one-command', allowDuplicate: true } };
+    const header = makeEvents(cacheKey, 1);
+    let release!: (events: TimelineEvent[]) => void;
+    const held = new Promise<TimelineEvent[]>((resolve) => { release = resolve; });
+    const heldKey = segment === 'scoped' ? cacheKey : sessionName;
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue({ epoch: 0, seq: 1 });
+    const reads = vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockImplementation(async (key) => {
+      if (key === heldKey) return held;
+      return key === cacheKey && segment === 'split' ? header : [];
+    });
+    const migrate = vi.spyOn(TimelineDB.prototype, 'migrateRawToScoped').mockResolvedValue();
+    let handler: ((msg: ServerMessage) => void) | undefined;
+    const ws = { connected: true, onMessage: (fn: typeof handler) => { handler = fn; return () => { handler = undefined; }; },
+      sendTimelineHistoryRequest: () => 'identity-history' } as unknown as WsClient;
+    let seen: TimelineEvent[] = [];
+    function Probe() { seen = useTimeline(sessionName, ws, 'srv').events; return null; }
+    render(h(Probe));
+    await waitFor(() => expect(reads).toHaveBeenCalledWith(heldKey, { limit: 300 }));
+    if (order === 'live-first') act(() => handler?.({ type: TIMELINE_MESSAGES.EVENT, event: primary } as ServerMessage));
+    await act(async () => { release([old]); await flushMicrotasks(); });
+    await waitFor(() => expect(seen.some((event) => event.payload.attachments)).toBe(true));
+    act(() => handler?.({ type: TIMELINE_MESSAGES.EVENT, event: primary } as ServerMessage));
+    expect(seen.filter((event) => event.type === 'user.message')).toHaveLength(1);
+    expect(seen.every((event) => event.sessionId === sessionName)).toBe(true);
+    expect(old.sessionId).toBe(segment === 'scoped' ? cacheKey : sessionName);
+    if (segment !== 'scoped') expect(migrate).toHaveBeenCalledWith(sessionName, cacheKey, [old]);
+  });
+
+  it.each(['session', 'local'] as const)('merges scoped %s snapshot with actual HTTP catchup and manual local reload', async (tier) => {
+    const sessionName = `deck_snapshot_http_${tier}`;
+    const cacheKey = `srv:${sessionName}`;
+    const old: TimelineEvent = { ...makeEvents(cacheKey, 1)[0], type: 'user.message',
+      eventId: 'transport-history:old-http', payload: { text: 'Synthetic HTTP send', commandId: 'http-command', allowDuplicate: true } };
+    (tier === 'session' ? sessionStorage : localStorage).setItem(`rcc_timeline_snapshot:${cacheKey}`, JSON.stringify([old]));
+    const primary = { ...old, sessionId: sessionName, eventId: 'http-primary', epoch: 2, seq: 2 };
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([old]);
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    fetchHistorySpy.mockResolvedValue({ events: [primary], epoch: 2, hasMore: false });
+    let seen: TimelineEvent[] = [];
+    let refresh = () => {};
+    function Probe() { const t = useTimeline(sessionName, null, 'srv'); seen = t.events; refresh = t.forceRefresh; return null; }
+    render(h(Probe));
+    act(() => refresh());
+    await waitFor(() => expect(fetchHistorySpy).toHaveBeenCalled());
+    await waitFor(() => expect(seen.some((event) => event.eventId === 'http-primary')).toBe(true));
+    expect(seen).toHaveLength(1);
+    expect(seen[0].sessionId).toBe(sessionName);
+  });
+
+  it('ignores a late old-owner IDB restore after switching server with the same raw session and command', async () => {
+    const sessionName = 'deck_restore_old_owner';
+    const row = (server: string): TimelineEvent => ({ ...makeEvents(`${server}:${sessionName}`, 1)[0],
+      type: 'user.message', payload: { text: server, commandId: 'same-command', allowDuplicate: true } });
+    let release!: (rows: TimelineEvent[]) => void;
+    const held = new Promise<TimelineEvent[]>((resolve) => { release = resolve; });
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    const reads = vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockImplementation(async (key) => {
+      if (key === `server-A:${sessionName}`) return held;
+      return key === `server-B:${sessionName}` ? [row('server-B')] : [];
+    });
+    let seen: TimelineEvent[] = [];
+    function Probe({ server }: { server: string }) { seen = useTimeline(sessionName, null, server).events; return null; }
+    const view = render(h(Probe, { server: 'server-A' }));
+    await waitFor(() => expect(reads).toHaveBeenCalledWith(`server-A:${sessionName}`, { limit: 300 }));
+    view.rerender(h(Probe, { server: 'server-B' }));
+    await waitFor(() => expect(seen[0]?.payload.text).toBe('server-B'));
+    await act(async () => { release([row('server-A')]); await flushMicrotasks(); });
+    expect(seen).toHaveLength(1);
+    expect(seen[0].payload.text).toBe('server-B');
+    expect(seen[0].sessionId).toBe(sessionName);
+    expect(__getTimelineCacheForTests(`server-A:${sessionName}`)).toBeUndefined();
+  });
+
+  it.each(['deck_owner_identity', 'deck_owner:variant'])('restores only exact known owners and never joins command across servers (%s)', (sessionName) => {
+    for (const server of ['server-A', 'server-B']) {
+      const key = `${server}:${sessionName}`;
+      const own: TimelineEvent = { ...makeEvents(key, 1)[0], type: 'user.message',
+        payload: { text: server, commandId: 'same-command', allowDuplicate: true } };
+      const foreign = { ...own, eventId: `${server}-foreign`, sessionId: `other-server:${sessionName}` };
+      sessionStorage.setItem(`rcc_timeline_snapshot:${key}`, JSON.stringify([own, foreign]));
+    }
+    const seen = new Map<string, TimelineEvent[]>();
+    function Probe({ server }: { server: string }) { seen.set(server, useTimeline(sessionName, null, server).events); return null; }
+    render(h('div', null, h(Probe, { server: 'server-A' }), h(Probe, { server: 'server-B' })));
+    expect(seen.get('server-A')).toHaveLength(1);
+    expect(seen.get('server-B')).toHaveLength(1);
+    expect(seen.get('server-A')![0].payload.text).toBe('server-A');
+    expect(seen.get('server-B')![0].payload.text).toBe('server-B');
+  });
+
   it('falls back to raw sessionId IDB key when the scoped read is empty (cacheKey scope drift)', async () => {
     // Regression for the scope-drift bug — PR-4 in
     // .imc/discussions/e9dbc48c-dda.md. When the app mounts before

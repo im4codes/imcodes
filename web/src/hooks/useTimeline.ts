@@ -1023,9 +1023,30 @@ function getTimelineSnapshotStorageKey(cacheKey: string): string {
   return `${TIMELINE_SNAPSHOT_STORAGE_PREFIX}${cacheKey}`;
 }
 
-function loadTimelineSnapshotFromStorage(storage: Storage, cacheKey: string): TimelineEvent[] {
+/** Disk keys are server-scoped; wire events and in-memory merge identities are
+ * raw session names. Only unwrap the EXACT owner known by this restore, never
+ * parse prefixes or coalesce unrelated servers/sessions by their send id. */
+function restoreTimelineSessionOwner(
+  events: TimelineEvent[],
+  cacheKey: string,
+  rawSessionId = cacheKey,
+): TimelineEvent[] {
+  const restored: TimelineEvent[] = [];
+  for (const event of events) {
+    if (event.sessionId === rawSessionId) restored.push(event);
+    else if (event.sessionId === cacheKey) restored.push({ ...event, sessionId: rawSessionId });
+  }
+  return restored;
+}
+
+function loadTimelineSnapshotFromStorage(
+  storage: Storage,
+  storageKey: string,
+  cacheKey: string,
+  rawSessionId: string | undefined,
+): TimelineEvent[] {
   try {
-    const raw = storage.getItem(getTimelineSnapshotStorageKey(cacheKey));
+    const raw = storage.getItem(getTimelineSnapshotStorageKey(storageKey));
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
@@ -1042,7 +1063,8 @@ function loadTimelineSnapshotFromStorage(storage: Storage, cacheKey: string): Ti
     // Old builds may have persisted alternate ids for one remote send. Heal
     // that cold seed before its FIRST paint, even offline. No snapshot writes,
     // text-based dedup, or extra per-streamed-event scan is introduced here.
-    return mergeTimelineEvents(events, [], events.length);
+    const restored = restoreTimelineSessionOwner(events, cacheKey, rawSessionId);
+    return mergeTimelineEvents(restored, [], restored.length);
   } catch {
     return [];
   }
@@ -1067,10 +1089,10 @@ function loadPersistedTimelineSnapshotWithFallback(
   try { storages.push(sessionStorage); } catch { /* unavailable */ }
   try { storages.push(localStorage); } catch { /* unavailable */ }
   for (const storage of storages) {
-    const scoped = loadTimelineSnapshotFromStorage(storage, cacheKey);
+    const scoped = loadTimelineSnapshotFromStorage(storage, cacheKey, cacheKey, rawSessionId);
     if (scoped.length > 0) return scoped;
     if (!rawSessionId || rawSessionId === cacheKey) continue;
-    const raw = loadTimelineSnapshotFromStorage(storage, rawSessionId);
+    const raw = loadTimelineSnapshotFromStorage(storage, rawSessionId, cacheKey, rawSessionId);
     if (raw.length === 0) continue;
     // Best-effort same-tier migration. Only remove the source after the target
     // write succeeds; quota/private-mode failure keeps the sole readable copy.
@@ -1595,15 +1617,13 @@ async function readLocalTimelineMerged(
   rawSessionId: string | undefined,
   limit: number,
 ): Promise<{ stored: TimelineEvent[]; cursor: { epoch: number; seq: number } | null; rawAlreadyRead: boolean }> {
-  let stored = await db.getRecentEvents(cacheKey, { limit });
+  let stored = restoreTimelineSessionOwner(await db.getRecentEvents(cacheKey, { limit }), cacheKey, rawSessionId);
   let rawAlreadyRead = false;
   if (stored.length === 0 && rawSessionId) {
     rawAlreadyRead = true;
     const rawStored = await db.getRecentEvents(rawSessionId, { limit });
     if (rawStored.length > 0) {
-      stored = rawStored.map((event) => (
-        event.sessionId === cacheKey ? event : { ...event, sessionId: cacheKey }
-      ));
+      stored = restoreTimelineSessionOwner(rawStored, cacheKey, rawSessionId);
       // Consolidate the orphaned bare-key rows into the scoped key. Idempotent,
       // no delete (see migrateRawToScoped — the old delete destroyed history).
       db.migrateRawToScoped(rawSessionId, cacheKey, rawStored).catch(() => { /* best-effort */ });
@@ -1640,7 +1660,7 @@ function maxLocalCursor(
 
 /**
  * Phase 2 of local restore (split-key heal): read the bare-sessionId key,
- * restamp to the scoped key, and report events + cursor so the caller can
+ * restore the raw in-memory owner, and report events + cursor so the caller can
  * idempotently merge them. Used only when phase 1's scoped read was non-empty
  * (a session whose history is split across both keys). Read on its own so the
  * caller can run it fire-and-forget — it must never block the scoped first paint.
@@ -1650,12 +1670,10 @@ async function readRawSegment(
   rawSessionId: string,
   cacheKey: string,
   limit: number,
-): Promise<{ rawStored: TimelineEvent[]; rawRestamped: TimelineEvent[]; cursor: { epoch: number; seq: number } | null }> {
+): Promise<{ rawStored: TimelineEvent[]; rawRestored: TimelineEvent[]; cursor: { epoch: number; seq: number } | null }> {
   const rawStored = await db.getRecentEvents(rawSessionId, { limit });
-  const rawRestamped = rawStored.map((event) => (
-    event.sessionId === cacheKey ? event : { ...event, sessionId: cacheKey }
-  ));
-  return { rawStored, rawRestamped, cursor: deriveLocalCursor(rawRestamped) };
+  const rawRestored = restoreTimelineSessionOwner(rawStored, cacheKey, rawSessionId);
+  return { rawStored, rawRestored, cursor: deriveLocalCursor(rawRestored) };
 }
 
 export function __getSharedTimelineBaseForTests(
@@ -3966,7 +3984,7 @@ export function useTimeline(
   }, []);
 
   // Phase-2 split-key heal: read the bare-sessionId segment in the background
-  // and idempotently merge it (raw → restamped → mergeEvents). Fire-and-forget
+  // and idempotently merge it under the raw in-memory owner. Fire-and-forget
   // so it NEVER blocks the scoped first paint (this is also why the dual read
   // survives single-promise test mocks). Only invoked when phase 1's scoped read
   // was non-empty (a session split across both keys). Bumps the cursor to the
@@ -3974,12 +3992,12 @@ export function useTimeline(
   const mergeRawSegmentLater = useCallback((db: TimelineDB, rawSessionId: string, key: string) => {
     void readRawSegment(db, rawSessionId, key, MAX_MEMORY_EVENTS).then((raw) => {
       if (cacheKeyRef.current !== key || raw.rawStored.length === 0) return;
-      mergeEvents(raw.rawRestamped);
+      mergeEvents(raw.rawRestored);
       // The bare segment is a LOCAL restore like any other, so it must enter the
       // ledger. Without this the strip reported only the scoped count while the
       // view showed both segments — the number contradicting what is on screen,
       // which is exactly what the ledger exists to prevent.
-      updateHistoryStep('cache', 'done', undefined, recordLocalRestore(raw.rawRestamped));
+      updateHistoryStep('cache', 'done', undefined, recordLocalRestore(raw.rawRestored));
       const bumped = maxLocalCursor({ epoch: epochRef.current, seq: seqRef.current }, raw.cursor);
       if (bumped) { epochRef.current = bumped.epoch; seqRef.current = bumped.seq; }
       setLoading(false);

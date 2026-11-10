@@ -15,6 +15,7 @@ import { h } from 'preact';
 import { useEffect } from 'preact/hooks';
 import i18next from 'i18next';
 import type { ServerMessage, WsClient } from '../src/ws-client.js';
+import { TIMELINE_MESSAGES } from '../../shared/timeline-protocol.js';
 import { SESSION_SEND_DELIVERY_MODES } from '../../shared/session-send-delivery.js';
 
 // Mock api.js so tests can control whether the HTTP-send fallback "succeeds"
@@ -114,6 +115,29 @@ describe('useTimeline optimistic send flow', () => {
     vi.runOnlyPendingTimers();
     vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  it.each(['session', 'local'] as const)('reconciles scoped %s snapshot rows with raw live and history identities', (tier) => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    const sessionId = `deck_opt_scoped_replay_${tier}`;
+    const old = {
+      eventId: 'transport-history:cached-legacy', sessionId: `srv:${sessionId}`,
+      ts: 123, epoch: 0, seq: 1, source: 'daemon', confidence: 'high', type: 'user.message',
+      payload: { text: 'One scoped cached send', commandId: 'stable-command', allowDuplicate: true },
+    };
+    (tier === 'session' ? sessionStorage : localStorage).setItem(`rcc_timeline_snapshot:srv:${sessionId}`, JSON.stringify([old]));
+    render(h(Probe, { sessionId }));
+    expect(ref.current!.events).toHaveLength(1);
+    const primary = { ...old, eventId: 'primary-live-id', sessionId, epoch: 1, seq: 2 };
+    act(() => handlerBox.fn?.({ type: TIMELINE_MESSAGES.EVENT, event: primary } as unknown as ServerMessage));
+    expect(ref.current!.events).toHaveLength(1);
+    act(() => handlerBox.fn?.({ type: TIMELINE_MESSAGES.HISTORY, sessionName: sessionId, events: [primary], epoch: 1 } as unknown as ServerMessage));
+    expect(ref.current!.events).toHaveLength(1);
+    expect(ref.current!.events[0].sessionId).toBe(sessionId);
+    // Normalization is immutable: neither the on-disk nor input row is restamped in place.
+    expect(old.sessionId).toBe(`srv:${sessionId}`);
   });
 
   it('reconciles authoritative replays on a receiver with no local optimistic send', () => {

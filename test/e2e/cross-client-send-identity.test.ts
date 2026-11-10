@@ -222,6 +222,66 @@ describe('one stable send across independent desktop and phone clients', () => {
       await receiver.reload();
       await receiver.locator('.chat-user').first().waitFor();
       expect(await receiver.locator('.chat-user').count()).toBe(1);
+      if (session === MAIN) {
+        // Old builds persisted a scoped session and a different JSONL eventId.
+        // Use genuinely cold independent receivers and real IndexedDB, not a
+        // mocked read or the sender's optimistic cache. Gate catchup so first
+        // prove the old rows themselves restored before replaying the primary.
+        canonicalReady.delete(session);
+        for (const seed of ['scoped-idb', 'raw-idb', 'split-idb', 'snapshot'] as const) {
+          const cold = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+          try {
+            const page = await cold.newPage();
+            await page.goto(`http://127.0.0.1:${PORT}/not-a-fixture.html`);
+            await page.evaluate(async ({ seed, primary, session }: any) => {
+              const { TimelineDB } = await new Function('return import("/src/timeline-db.ts")')();
+              const db = new TimelineDB();
+              await db.open();
+              const key = `synthetic-server:${session}`;
+              const old = { ...primary, eventId: `transport-history:old-${seed}`, epoch: 0, seq: 1,
+                sessionId: seed === 'raw-idb' || seed === 'split-idb' ? session : key };
+              if (seed === 'snapshot') {
+                sessionStorage.setItem(`rcc_timeline_snapshot:${key}`, JSON.stringify([old, { ...primary, epoch: 0 }]));
+              } else {
+                await db.putEvents([old]);
+                if (seed === 'split-idb') await db.putEvents([{ ...old, sessionId: key,
+                  eventId: 'synthetic-split-marker', type: 'assistant.text', payload: { text: 'Synthetic split marker' } }]);
+              }
+              db.close();
+            }, { seed, primary, session });
+            await page.goto(url('receiver', session));
+            await page.waitForFunction(() => (window as any).sendIdentityFixture?.connected
+              && (window as any).sendIdentityFixture.events.some((e: any) => e.type === 'user.message'));
+            expect(await page.locator('.chat-user').count()).toBe(1);
+            if (seed !== 'snapshot') {
+              await page.waitForFunction(async ({ session }: any) => {
+                const { TimelineDB } = await new Function('return import("/src/timeline-db.ts")')();
+                const db = new TimelineDB();
+                const rows = await db.getRecentEvents(`synthetic-server:${session}`);
+                db.close();
+                return rows.some((e: any) => e.type === 'user.message')
+                  && rows.every((e: any) => e.sessionId === `synthetic-server:${session}`);
+              }, { session });
+            }
+            broadcast({ type: TIMELINE_MESSAGES.EVENT, event: primary });
+            await page.waitForFunction((id: string) => (window as any).sendIdentityFixture.received
+              .some((message: any) => message.event?.eventId === id), primary.eventId);
+            await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+            expect(await page.locator('.chat-user').count()).toBe(1);
+            expect(await page.evaluate((session: string) => (window as any).sendIdentityFixture.events
+              .every((e: any) => e.sessionId === session), session)).toBe(true);
+            await page.reload();
+            await page.locator('.chat-user').first().waitFor();
+            expect(await page.locator('.chat-user').count()).toBe(1);
+            console.info('old cache receiver identity', JSON.stringify({ seed, session, receiverBubbles: 1, diskOwner: `synthetic-server:${session}` }));
+          } finally { await cold.close(); }
+        }
+        canonicalReady.add(session);
+        // Closing cold contexts must not let the reconnect check accidentally
+        // select a socket whose close event is still queued.
+        await vi.waitFor(() => expect([...peers.values()].filter((role) => role === 'receiver')).toHaveLength(1));
+        await receiver.bringToFront();
+      }
       // Reconnect plus browser resume use the production socket/history/cache
       // path. This is synthetic lifecycle delivery, not a physical iOS claim.
       const receiverPeer = [...peers].find(([, role]) => role === 'receiver')![0];
@@ -231,6 +291,7 @@ describe('one stable send across independent desktop and phone clients', () => {
         window.dispatchEvent(new Event('pageshow'));
         document.dispatchEvent(new Event('visibilitychange'));
       });
+      await receiver.waitForFunction(() => (window as any).sendIdentityFixture.ws.connected);
       await receiver.setViewportSize({ width: 320, height: 568 });
       expect(await receiver.locator('.chat-user').count()).toBe(1);
       // A repeated delivery of the SAME command must not cause a second model
@@ -242,6 +303,8 @@ describe('one stable send across independent desktop and phone clients', () => {
       expect((await userRows(session)).filter((row: any) => row.commandId === id)).toHaveLength(1);
       // Same user intentionally sends the SAME body with another stable command.
       await sender.evaluate(({ body, id }: any) => (window as any).sendIdentityFixture.send(body, id), { body, id: `${id}-again` });
+      await receiver.waitForFunction((id: string) => (window as any).sendIdentityFixture.received
+        .some((message: any) => message.event?.payload?.commandId === id), `${id}-again`);
       await vi.waitFor(async () => expect(await receiver.locator('.chat-user').count()).toBe(2));
       await vi.waitFor(() => expect(getTransportRuntime(session)?.getStatus()).toBe('idle'));
       // Another authenticated synthetic participant deliberately sends the same
