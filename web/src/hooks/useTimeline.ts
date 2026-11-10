@@ -713,10 +713,13 @@ function notifyLocalHistoryPruneComplete(cacheKey: string): void {
 async function refreshCachedWindowAfterDrain(
   cacheKey: string,
   deletedIds: readonly string[],
+  rawSessionId: string | undefined,
 ): Promise<boolean> {
-  const refreshed = await sharedDb
-    .getRecentEvents(cacheKey, { limit: MAX_MEMORY_EVENTS })
-    .catch(() => [] as TimelineEvent[]);
+  const refreshed = restoreTimelineSessionOwner(
+    await sharedDb.getRecentEvents(cacheKey, { limit: MAX_MEMORY_EVENTS }).catch(() => [] as TimelineEvent[]),
+    cacheKey,
+    rawSessionId,
+  );
 
   const existing = getCachedEvents(cacheKey) ?? [];
   // Drop exactly the rows the drain deleted — nothing else.
@@ -748,7 +751,7 @@ async function refreshCachedWindowAfterDrain(
   return merged.some((event) => isGuaranteedVisibleTimelineEvent(event));
 }
 
-function runLocalHistoryPrune(cacheKey: string): Promise<void> {
+function runLocalHistoryPrune(cacheKey: string, rawSessionId: string | undefined): Promise<void> {
   const run = localPruneChain.then(async () => {
     // Drain first. Retention alone cannot fix a window full of last-value rows:
     // `pruneOldEvents` keeps the newest N by timestamp with no idea what a row
@@ -783,6 +786,7 @@ function runLocalHistoryPrune(cacheKey: string): Promise<void> {
         paneHasRenderableContent = await refreshCachedWindowAfterDrain(
           cacheKey,
           drained.deletedIds ?? [],
+          rawSessionId,
         );
       }
       if (drained.done) break;
@@ -830,6 +834,7 @@ function scheduleLocalHistoryPrune(
   writtenEvents: number,
   force = false,
   immediate = false,
+  rawSessionId?: string,
 ): void {
   if (!cacheKey || sharedDb.memoryOnly) return;
   if (force) {
@@ -851,7 +856,7 @@ function scheduleLocalHistoryPrune(
   // the work has a deadline the ordinary space-reclaim does not.
   const timer = setTimeout(
     () => {
-      void runLocalHistoryPrune(cacheKey)
+      void runLocalHistoryPrune(cacheKey, rawSessionId)
         .finally(() => notifyLocalHistoryPruneComplete(cacheKey));
     },
     immediate ? 0 : LOCAL_PRUNE_START_DELAY_MS,
@@ -1484,7 +1489,7 @@ function persistTimelineEvents(cacheKey: string, events: TimelineEvent[]): void 
   const signals = scoped.filter((event) => isLastValueTimelineEventType(event.type));
   if (conversation.length > 0) sharedDb.putEvents(conversation).catch(() => {});
   if (signals.length > 0) signalWriteBatcher.push(signals);
-  scheduleLocalHistoryPrune(cacheKey, persistable.length);
+  scheduleLocalHistoryPrune(cacheKey, persistable.length, false, false, persistable[0]?.sessionId);
 }
 
 // Persist events to IDB WITHOUT the streaming filter — used only by the
@@ -1492,7 +1497,7 @@ function persistTimelineEvents(cacheKey: string, events: TimelineEvent[]): void 
 function persistTimelineEventsIncludingStreaming(cacheKey: string, events: TimelineEvent[]): void {
   if (events.length === 0) return;
   sharedDb.putEvents(scopeEventsForDb(cacheKey, events)).catch(() => {});
-  scheduleLocalHistoryPrune(cacheKey, events.length);
+  scheduleLocalHistoryPrune(cacheKey, events.length, false, false, events[0]?.sessionId);
 }
 
 function shouldPersistTimelineEvent(event: TimelineEvent): boolean {
@@ -3167,7 +3172,7 @@ export function useTimeline(
         // renders empty, and would otherwise have waited out the idle delay.
         const restoreIsAllSignals = restored.length > 0
           && !restored.some((event) => isGuaranteedVisibleTimelineEvent(event));
-        scheduleLocalHistoryPrune(cacheKey!, 0, true, restoreIsAllSignals);
+        scheduleLocalHistoryPrune(cacheKey!, 0, true, restoreIsAllSignals, sessionId);
         requestDaemonHistory(false, MAX_MEMORY_EVENTS, restored);
         // Background HTTP backfill — IDB is authoritative only up to the last
         // WS event; reopening after a mid-chat close may leave a gap. A
