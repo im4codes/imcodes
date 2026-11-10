@@ -660,4 +660,52 @@ describe('ChatView compact tool activity', () => {
     fireEvent.click(chip);
     expect(container.querySelector('.chat-tool-activity-details')).not.toBeNull();
   });
+
+  it('renders compact tool descriptor with tool name, long command input, and duration on mobile viewports', () => {
+    const call = makeEvent(
+      'long-cmd-call',
+      'tool.call',
+      {
+        tool: 'python3',
+        input: { command: 'python3 -c "import os, sys, json; print(\'multiline python here-doc execution with long arguments\')"' },
+        detail: { kind: 'execute' },
+      },
+      1,
+    );
+    (call as { ts: number }).ts = 10_000;
+    const result = makeEvent(
+      'long-cmd-result',
+      'tool.result',
+      {
+        output: 'multiline python here-doc execution with long arguments\n',
+        detail: { durationMs: 2400 },
+      },
+      2,
+    );
+    (result as { ts: number }).ts = 12_400;
+
+    const { container } = render(
+      <div style={{ width: '320px', fontSize: '20px' }}>
+        <ChatView events={[call, result]} loading={false} />
+      </div>,
+    );
+
+    const chip = container.querySelector('.chat-tool-activity');
+    expect(chip).not.toBeNull();
+
+    const name = container.querySelector('.chat-tool-activity-last-name');
+    expect(name?.textContent).toBe('python3');
+
+    const input = container.querySelector('.chat-tool-activity-last-input');
+    expect(input?.textContent).toContain('multiline python here-doc');
+
+    const time = container.querySelector('.chat-tool-activity-time');
+    expect(time?.textContent).toBe('2.4s');
+
+    // Details expand upon click
+    fireEvent.click(chip!);
+    expect(container.querySelector('.chat-tool-activity-details')).not.toBeNull();
+    const collapseLabel = container.querySelector('.chat-tool-activity-collapse-label');
+    expect(collapseLabel).not.toBeNull();
+  });
 });

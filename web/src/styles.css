@@ -336,6 +336,19 @@ html.native-ios-mac .chat-tool-name,
 html.native-ios-mac .chat-tool-input {
   font-size: 15px;
 }
+html.native-ios-mac .chat-tool-activity,
+html.native-ios-mac .chat-tool-activity-label,
+html.native-ios-mac .chat-tool-activity-total,
+html.native-ios-mac .chat-tool-activity-stats,
+html.native-ios-mac .chat-tool-activity-stat,
+html.native-ios-mac .chat-tool-activity-time,
+html.native-ios-mac .chat-tool-activity-last,
+html.native-ios-mac .chat-tool-activity-last-name,
+html.native-ios-mac .chat-tool-activity-last-input,
+html.native-ios-mac .chat-tool-activity-collapse-label {
+  font-size: 10px;
+  line-height: 1;
+}
 html.native-ios-mac .chat-code-block pre,
 html.native-ios-mac .chat-tool-result-preview,
 html.native-ios-mac .chat-file-change-title,
@@ -5718,7 +5731,7 @@ html.native-ios-mac .chat-dl-btn {
 }
 .chat-tool-activity.is-running .chat-tool-activity-core { animation: chat-tool-activity-core 1.25s ease-in-out infinite; }
 .chat-tool-activity.has-error .chat-tool-activity-core { border-color: #fb7185; background: rgba(225, 29, 72, 0.48); box-shadow: 0 0 7px rgba(251, 113, 133, 0.52); }
-.chat-tool-activity-label { color: #a5f3fc; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+.chat-tool-activity-label { color: #a5f3fc; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; font-size: 10px; line-height: 1; }
 .chat-tool-activity-total {
   display: inline-flex;
   align-items: center;
@@ -5733,9 +5746,10 @@ html.native-ios-mac .chat-dl-btn {
   font-size: 10px;
   font-weight: 800;
   font-variant-numeric: tabular-nums;
+  line-height: 1;
 }
-.chat-tool-activity-stats { display: inline-flex; align-items: center; gap: 5px; font-variant-numeric: tabular-nums; }
-.chat-tool-activity-stat { opacity: 0.88; }
+.chat-tool-activity-stats { display: inline-flex; align-items: center; gap: 5px; font-variant-numeric: tabular-nums; font-size: 10px; line-height: 1; }
+.chat-tool-activity-stat { opacity: 0.88; font-size: 10px; line-height: 1; }
 .chat-tool-activity-stat.is-complete { color: #6ee7b7; }
 .chat-tool-activity-stat.is-running { color: #67e8f9; }
 .chat-tool-activity-stat.is-failed { color: #fda4af; }
@@ -5762,6 +5776,8 @@ html.native-ios-mac .chat-dl-btn {
   color: #7dd3fc;
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.02em;
+  font-size: 10px;
+  line-height: 1;
 }
 /* A running timer changes every second; tabular figures above stop the chip
    from twitching as digit widths change. */
@@ -5774,12 +5790,20 @@ html.native-ios-mac .chat-dl-btn {
   flex: 1 1 auto;
   min-width: 0;
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 5px;
   overflow: hidden;
   white-space: nowrap;
+  font-size: 10px;
+  line-height: 1;
 }
-.chat-tool-activity-last-name { flex: 0 0 auto; color: #cbd5e1; font-weight: 600; }
+.chat-tool-activity-last-name {
+  flex: 0 0 auto;
+  color: #cbd5e1;
+  font-weight: 600;
+  font-size: 10px;
+  line-height: 1;
+}
 .chat-tool-activity-last-input {
   flex: 0 1 auto;
   min-width: 0;
@@ -5788,6 +5812,9 @@ html.native-ios-mac .chat-dl-btn {
   white-space: nowrap;
   color: #94a3b8;
   opacity: 0.9;
+  font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+  font-size: 10px;
+  line-height: 1;
 }
 .chat-tool-activity-chevron { flex: 0 0 auto; color: #64748b; font-size: 13px; transform: translateY(-1px); transition: transform 0.15s, color 0.15s; }
 .chat-tool-activity-wrap.is-expanded .chat-tool-activity-chevron { color: #67e8f9; transform: rotate(180deg) translateY(1px); }
@@ -5961,7 +5988,7 @@ html.native-ios-mac .chat-dl-btn {
   background: rgba(16, 185, 129, 0.38);
   box-shadow: 0 0 7px rgba(52, 211, 153, 0.48);
 }
-.chat-tool-activity-collapse-label { color: #a7f3d0; font-weight: 600; }
+.chat-tool-activity-collapse-label { color: #a7f3d0; font-weight: 600; font-size: 10px; line-height: 1; }
 .chat-tool-activity-collapse-chevron { color: #6ee7b7; font-size: 13px; transform: translateY(1px); }
 .chat-tool-activity-live {
   position: absolute;
