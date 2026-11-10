@@ -207,6 +207,7 @@ export function normalizeAssistantTextForDisplay(text: unknown): string {
 
 export function isGuaranteedVisibleTimelineEvent(
   event: { type: string; hidden?: boolean; payload?: Record<string, unknown> },
+  assistantProjection?: AssistantTextDisplayProjection,
 ): boolean {
   if (event.hidden) return false;
   if (isLastValueTimelineEventType(event.type)) return false;
@@ -216,7 +217,7 @@ export function isGuaranteedVisibleTimelineEvent(
   // dropped by buildViewItems, so counting it as content stops the repair loop
   // while the pane shows nothing.
   if (event.type === 'assistant.text') {
-    const projection = projectAssistantTextForDisplay(event.payload?.text);
+    const projection = assistantProjection ?? projectAssistantTextForDisplay(event.payload?.text);
     return projection.text.length > 0 || (
       projection.executionState !== null
       && event.payload?.streaming !== true

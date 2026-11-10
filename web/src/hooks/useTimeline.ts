@@ -1,7 +1,7 @@
+import { isGuaranteedVisibleTimelineEventCached as isGuaranteedVisibleTimelineEvent } from '../timeline/display-projection-cache.js';
 import { createSignalWriteBatcher } from '../signal-write-batcher.js';
 import {
   TIMELINE_PREFERENCE_DEPENDENT_TYPES,
-  isGuaranteedVisibleTimelineEvent,
   isLastValueTimelineEventType,
 } from '../../../src/shared/timeline/types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
@@ -626,7 +626,7 @@ const TERMINAL_TAIL_IDLE_RECONCILE_MS = 5000;
 // peer window's recent chat.
 const MAX_PERSISTED_SNAPSHOT_EVENTS_PER_CLASS = 300;
 const MAX_PERSISTED_SNAPSHOT_BYTES = 256 * 1024;
-const PERSISTED_SNAPSHOT_SELF_BUDGETS = [256, 128, 64, 32, 16, 8].map((kib) => kib * 1024);
+const PERSISTED_SNAPSHOT_SELF_BUDGETS = [MAX_PERSISTED_SNAPSHOT_BYTES, ...[128, 64, 32, 16, 8].map((kib) => kib * 1024)];
 const timelineSnapshotTextEncoder = new TextEncoder();
 // A local IndexedDB read is an optimization, never a gate in front of the
 // authoritative history sources. Safari can leave an IDB request pending after
@@ -1143,42 +1143,57 @@ function serializeCompactTimelineTextPreview(event: TimelineEvent): string {
   return JSON.stringify({ ...event, payload });
 }
 
-function serializeTimelineSnapshotTail(tail: TimelineEvent[], maxBytes = MAX_PERSISTED_SNAPSHOT_BYTES): string {
-  if (tail.length === 0) return '[]';
+function prepareTimelineSnapshotTail(tail: TimelineEvent[]) {
+  return tail.map((event, index) => {
+    const textEvent = isTimelineSnapshotTextEvent(event);
+    // UTF-8 JSON cannot use fewer bytes than its text's UTF-16 length. Reject
+    // an obviously oversized candidate before copying/encoding its whole body.
+    const minimumBytes = textEvent && typeof event.payload.text === 'string' ? event.payload.text.length : 0;
+    let full: { value: string; bytes: number } | undefined;
+    let compact: { value: string; bytes: number } | undefined;
+    return {
+      index, textEvent, minimumBytes,
+      full() {
+        if (!full) {
+          const value = JSON.stringify(event);
+          full = { value, bytes: timelineSnapshotTextEncoder.encode(value).byteLength };
+        }
+        return full;
+      },
+      preview() {
+        if (!textEvent) return undefined;
+        if (!compact) {
+          const value = serializeCompactTimelineTextPreview(event);
+          compact = { value, bytes: timelineSnapshotTextEncoder.encode(value).byteLength };
+        }
+        return compact;
+      },
+    };
+  });
+}
 
-  const serialized = tail.map((event, index) => ({
-    index,
-    event,
-    value: JSON.stringify(event),
-    compactValue: isTimelineSnapshotTextEvent(event)
-      ? serializeCompactTimelineTextPreview(event)
-      : undefined,
-  }));
+function serializeTimelineSnapshotTail(
+  serialized: ReturnType<typeof prepareTimelineSnapshotTail>,
+  maxBytes: number,
+): string {
   const selected = new Map<number, string>();
   let serializedBytes = 2; // []
-  const selectNewest = (candidates: typeof serialized): void => {
-    for (let index = candidates.length - 1; index >= 0; index -= 1) {
-      const candidate = candidates[index]!;
+  const selectNewest = (textEvents: boolean): void => {
+    for (let index = serialized.length - 1; index >= 0; index -= 1) {
+      const candidate = serialized[index]!;
+      if (candidate.textEvent !== textEvents) continue;
       const commaBytes = selected.size > 0 ? 1 : 0;
-      const fullBytes = timelineSnapshotTextEncoder.encode(candidate.value).byteLength;
-      const value = serializedBytes + fullBytes + commaBytes <= maxBytes
-        ? candidate.value
-        : candidate.compactValue;
-      if (value === undefined) continue;
-      const valueBytes = timelineSnapshotTextEncoder.encode(value).byteLength;
-      const addedBytes = valueBytes + commaBytes;
-      if (serializedBytes + addedBytes > maxBytes) continue;
-      selected.set(candidate.index, value);
-      serializedBytes += addedBytes;
+      const available = maxBytes - serializedBytes - commaBytes;
+      const full = candidate.minimumBytes <= available ? candidate.full() : undefined;
+      const chosen = full && full.bytes <= available ? full : candidate.preview();
+      if (!chosen || serializedBytes + chosen.bytes + commaBytes > maxBytes) continue;
+      selected.set(candidate.index, chosen.value);
+      serializedBytes += chosen.bytes + commaBytes;
     }
   };
-
-  // Conversation text gets first claim on the budget, newest first. Tool rows
-  // are already distinct timeline events, so they use only the remaining room
-  // instead of displacing the text the user needs to see immediately.
-  selectNewest(serialized.filter(({ event }) => isTimelineSnapshotTextEvent(event)));
-  selectNewest(serialized.filter(({ event }) => !isTimelineSnapshotTextEvent(event)));
-
+  // Text retains first claim; only this window self-shrinks on quota failure.
+  selectNewest(true);
+  selectNewest(false);
   const ordered = [...selected.entries()]
     .sort(([left], [right]) => left - right)
     .map(([, value]) => value);
@@ -1207,10 +1222,11 @@ function persistTimelineSnapshotTail(cacheKey: string, tail: TimelineEvent[]): v
     // seeds resident. Each retry spends only this window's smaller budget; the
     // storage helper never evicts another window's timeline/file/terminal cache.
     const storageKey = getTimelineSnapshotStorageKey(cacheKey);
+    const serialized = prepareTimelineSnapshotTail(tail);
     let durableWritten = false;
     let windowWritten = false;
     for (let index = 0; index < PERSISTED_SNAPSHOT_SELF_BUDGETS.length; index += 1) {
-      const value = serializeTimelineSnapshotTail(tail, PERSISTED_SNAPSHOT_SELF_BUDGETS[index]);
+      const value = serializeTimelineSnapshotTail(serialized, PERSISTED_SNAPSHOT_SELF_BUDGETS[index]!);
       if (!windowWritten) {
         try { sessionStorage.setItem(storageKey, value); windowWritten = true; } catch { /* self-shrink */ }
       }

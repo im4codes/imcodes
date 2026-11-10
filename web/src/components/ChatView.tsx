@@ -1,8 +1,8 @@
+import { projectAssistantEventForDisplay } from '../timeline/display-projection-cache.js';
 import { itemKeysUnchanged, snapshotItemKeys, type ItemKeySnapshot } from './chat-view-item-keys.js';
 import { HISTORY_GAP_MARKER_KEY, insertHistoryGapMarker, placeHistoryGapMarker } from './chat-history-gap.js';
 import {
   isNeverRenderedTimelineEventType,
-  projectAssistantTextForDisplay,
 } from '../../../src/shared/timeline/types.js';
 import {
   SUPERVISION_AUTOMATION_KIND_PREFIX,
@@ -1031,24 +1031,24 @@ const mergedToolEventCache = new WeakMap<TimelineEvent, WeakMap<TimelineEvent, T
 // Stable source identities let the incremental view-model preserve unaffected
 // items across an append/update. The expensive group is rebuilt only when one
 // of its source event objects changes; Preact then skips those unchanged rows.
-const timelineObjectIds = new WeakMap<object, number>();
-let nextTimelineObjectId = 1;
-const incrementalViewItemCache = new Map<string, { signature: string; item: ViewItem }>();
-function timelineObjectId(value: object): number {
-  const hit = timelineObjectIds.get(value);
-  if (hit) return hit;
-  const id = nextTimelineObjectId++;
-  timelineObjectIds.set(value, id);
-  return id;
+const incrementalViewItemCache = new Map<string, ViewItem>();
+function sameViewItem(left: ViewItem, right: ViewItem): boolean {
+  const keys = Object.keys(left) as Array<keyof ViewItem>;
+  if (keys.length !== Object.keys(right).length) return false;
+  return keys.every((key) => {
+    const a = left[key];
+    const b = right[key];
+    // Compare source references/small id lists without copying a potentially
+    // megabyte-sized text into a new signature on every unrelated update.
+    return a === b || (Array.isArray(a) && Array.isArray(b)
+      && a.length === b.length && a.every((value, index) => value === b[index]));
+  });
 }
 function stabilizeViewItems(items: ViewItem[]): ViewItem[] {
   const next = items.map((item) => {
-    const sources = item.toolEvents ?? (item.event ? [item.event] : []);
-    const sourceIds = sources.map((event) => timelineObjectId(event)).join(',');
-    const signature = [item.type, item.text ?? '', item.lastTs ?? item.ts ?? '', item.executionState ?? '', item.eventIds?.join(',') ?? '', sourceIds, item.heartbeatCount ?? ''].join('|');
     const cached = incrementalViewItemCache.get(item.key);
-    if (cached?.signature === signature) return cached.item;
-    incrementalViewItemCache.set(item.key, { signature, item });
+    if (cached && sameViewItem(cached, item)) return cached;
+    incrementalViewItemCache.set(item.key, item);
     return item;
   });
   while (incrementalViewItemCache.size > 4096) {
@@ -1233,6 +1233,18 @@ function deduplicateTaskPairViewItems(items: ViewItem[]): ViewItem[] {
     }
   }
   return result;
+}
+
+const taskNoticeProjectionCache = new WeakMap<object, {
+  text: unknown; value: ReturnType<typeof parseTaskPairNotification>;
+}>();
+function parseTaskPairEventNotification(event: TimelineEvent) {
+  const text = event.payload.text;
+  const cached = taskNoticeProjectionCache.get(event.payload);
+  if (cached && cached.text === text) return cached.value;
+  const value = parseTaskPairNotification(text);
+  taskNoticeProjectionCache.set(event.payload, { text, value });
+  return value;
 }
 
 function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewItem[] {
@@ -1506,8 +1518,8 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
       // single live activity rail instead of many tiny rows.
       if (showToolCalls) flushTools();
       // Trim and collapse 3+ consecutive blank lines to 1 (CC output often has many trailing newlines)
-      const rawNotification = parseTaskPairNotification(event.payload.text);
-      const projection = projectAssistantTextForDisplay(event.payload.text);
+      const rawNotification = parseTaskPairEventNotification(event);
+      const projection = projectAssistantEventForDisplay(event);
       const text = projection.text;
       const executionState = event.payload.streaming === true || event.payload.pending === true
         ? null

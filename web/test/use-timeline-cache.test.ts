@@ -1670,6 +1670,51 @@ describe('useTimeline window-isolated cache bounds', () => {
     expect(snapshot[0]?.payload.historyPayloadTruncated).toBe(true);
   });
 
+  it('never stringifies an already oversized text body just to discard it for a preview', async () => {
+    vi.useFakeTimers();
+    const sessionName = 'deck_snapshot_oversized_work_brain';
+    const cacheKey = `srv:${sessionName}`;
+    const [event] = makeEvents(sessionName, 1);
+    const oversized = { ...event!, payload: { text: '中'.repeat(300_000) } };
+    const stringify = JSON.stringify;
+    let fullCopies = 0;
+    const spy = vi.spyOn(JSON, 'stringify').mockImplementation((value, ...args) => {
+      if (value === oversized) fullCopies++;
+      return stringify(value, ...args);
+    });
+    try {
+      __setTimelineCacheForTests(cacheKey, [oversized]);
+      await act(async () => { await vi.advanceTimersByTimeAsync(750); });
+    } finally { spy.mockRestore(); }
+    expect(fullCopies).toBe(0);
+    const stored = JSON.parse(sessionStorage.getItem(`rcc_timeline_snapshot:${cacheKey}`) ?? '[]');
+    expect(stored[0].payload.text).toBe('中'.repeat(1_024) + '…');
+  });
+
+  it('serializes each source only once while shrinking its own quota budget', async () => {
+    vi.useFakeTimers();
+    const sessionName = 'deck_snapshot_retry_work_brain';
+    const cacheKey = `srv:${sessionName}`;
+    const events = makeEvents(sessionName, 2);
+    const stringify = JSON.stringify;
+    const setItem = Storage.prototype.setItem;
+    let fullCopies = 0;
+    const jsonSpy = vi.spyOn(JSON, 'stringify').mockImplementation((value, ...args) => {
+      if (events.includes(value as TimelineEvent)) fullCopies++;
+      return stringify(value, ...args);
+    });
+    const storageSpy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (this: Storage, key: string, value: string) {
+      if (this === localStorage && key === `rcc_timeline_snapshot:${cacheKey}`) throw new DOMException('synthetic full store', 'QuotaExceededError');
+      return setItem.call(this, key, value);
+    });
+    try {
+      __setTimelineCacheForTests(cacheKey, events);
+      await act(async () => { await vi.advanceTimersByTimeAsync(750); });
+    } finally { jsonSpy.mockRestore(); storageSpy.mockRestore(); }
+    expect(fullCopies).toBe(events.length);
+    expect(JSON.parse(sessionStorage.getItem(`rcc_timeline_snapshot:${cacheKey}`) ?? '[]')).toEqual(events);
+  });
+
   it('bounds each independent synchronous snapshot to 256 KiB without borrowing from peer windows', async () => {
     vi.useFakeTimers();
     const sessionName = `deck_snapshot_budget_${Date.now()}`;

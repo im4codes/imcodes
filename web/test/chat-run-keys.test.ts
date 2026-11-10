@@ -75,3 +75,78 @@ describe('merged-run keys stay stable', () => {
     expect(second).toBe('y');
   });
 });
+
+
+describe('unchanged completed text does not get recopied on an unrelated tail update', () => {
+  it('reuses the display projection without rescanning stable answer text', () => {
+    const text = 'stable long answer\n\n\n'.repeat(6_000);
+    const events = [event(9000, 'user.message'), event(9001, 'assistant.text', { text })];
+    const first = __buildViewItemsForTests(events, true);
+    expect(first).toHaveLength(2);
+    expect(first[1]?.text).toContain('stable long answer');
+    const replace = String.prototype.replace;
+    let rescans = 0;
+    const spy = vi.spyOn(String.prototype, 'replace').mockImplementation(function (this: string, ...args: Parameters<typeof replace>) {
+      if (String(this).length > 100_000 && String(this).startsWith('stable long answer')) rescans++;
+      return replace.apply(this, args);
+    });
+    try {
+      for (let i = 0; i < 3; i++) __buildViewItemsForTests([...events, event(9010 + i, 'tool.call')], true);
+    } finally { spy.mockRestore(); }
+    expect(rescans).toBe(0);
+  });
+
+  it('does not build a full-text signature to stabilize an unchanged row', () => {
+    const text = 'stable long answer '.repeat(6_000);
+    const events = [event(9100, 'user.message'), event(9101, 'assistant.text', { text })];
+    const initial = __buildViewItemsForTests(events, true);
+    expect(initial).toHaveLength(2);
+    expect(initial[1]?.text).toBe(text.trim());
+    const join = Array.prototype.join;
+    let signatures = 0;
+    const spy = vi.spyOn(Array.prototype, 'join').mockImplementation(function (this: unknown[], separator?: string) {
+      if (separator === '|' && this.includes(text.trim())) signatures++;
+      return join.call(this, separator);
+    });
+    try {
+      for (let i = 0; i < 3; i++) {
+        const next = __buildViewItemsForTests([...events, event(9110 + i, 'tool.call')], true);
+        expect(next[1]).toBe(initial[1]);
+      }
+    } finally { spy.mockRestore(); }
+    expect(signatures).toBe(0);
+  });
+});
+
+describe('incremental item invalidation', () => {
+  it('keeps unrelated rows but updates final/streaming and automation', () => {
+    const stable = event(9200, 'user.message');
+    const row = event(9201, 'assistant.text', { text: 'same answer', streaming: true });
+    const before = __buildViewItemsForTests([stable, row], true);
+    const final = { ...row, payload: { ...row.payload, streaming: false } };
+    const next = __buildViewItemsForTests([stable, final], true);
+    expect(next[0]).toBe(before[0]);
+    expect(next[1]).not.toBe(before[1]);
+    expect(next[1].assistantStreaming).toBe(false);
+    const automated = { ...final, payload: { ...final.payload, automation: true } };
+    expect(__buildViewItemsForTests([stable, automated], true)[1].assistantAutomation).toBe(true);
+    const edited = { ...final, payload: { ...final.payload, text: 'edited answer' } };
+    expect(__buildViewItemsForTests([stable, edited], true)[1].text).toBe('edited answer');
+    expect(__buildViewItemsForTests([stable, final], true)[1].text).toBe('same answer');
+  });
+
+  it('invalidates tool replacement/order and preserves preference boundaries', () => {
+    const call = event(9300, 'tool.call', { toolCallId: 'cache-tool', tool: 'shell', input: 'before' });
+    const result = event(9301, 'tool.result', { toolCallId: 'cache-tool', tool: 'shell', output: 'before' });
+    const initial = __buildViewItemsForTests([call, result], true);
+    const replacement = { ...result, payload: { ...result.payload, output: 'after' } };
+    const changed = __buildViewItemsForTests([call, replacement], true);
+    expect(changed[0]).not.toBe(initial[0]);
+    expect(changed[0].event?.payload._resultPayloadOutput).toBe('after');
+    const simple = __buildViewItemsForTests([call, replacement], false);
+    expect(simple[0].type).toBe('tool-activity');
+    const reordered = __buildViewItemsForTests([replacement, call], true);
+    expect(reordered[0].event).toBe(replacement);
+    expect(__buildViewItemsForTests([call, replacement], true)[0].event?.payload._resultPayloadOutput).toBe('after');
+  });
+});
