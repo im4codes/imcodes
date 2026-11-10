@@ -105,6 +105,22 @@ function rawBootstrap(env: Record<string, string>): {
 }
 
 describe('memory MCP lightweight bootstrap', () => {
+  it.each([{ method: 'server/discover', id: 0 }, { method: 'future/unknown', id: 'probe' }])('rejects pre-initialize protocol probe $method promptly so legacy negotiation can continue', async ({ method, id }) => {
+    const { child, messages } = rawBootstrap({ IMCODES_MEMORY_MCP_TEST_DELAY_MS: '6000' });
+    const started = Date.now();
+    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params: {} })}\n`);
+    const reply = await waitFor(() => messages.find(message => message.id === id), 2_000);
+    expect(reply).toMatchObject({ error: { code: -32601, message: 'Method not found' } });
+    expect(Date.now() - started).toBeLessThan(2_000);
+    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'future/notification', params: {} })}\n`);
+    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 'initialize', method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'probe-fallback', version: '1' } } })}\n`);
+    expect(await waitFor(() => messages.find(message => message.id === 'initialize'))).toHaveProperty('result.serverInfo.name', 'imcodes-memory');
+    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`);
+    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} })}\n`);
+    expect(await waitFor(() => messages.find(message => message.id === 2))).toHaveProperty('result.tools');
+    expect(messages.filter(message => message.error)).toHaveLength(1);
+  });
+
   it('dispatches before the daemon CLI graph and serves initialize/catalog while backend import is delayed', async () => {
     const source = await readFile(resolve('src/index.ts'), 'utf8');
     expect(/^import .*commander/m.test(source)).toBe(false);

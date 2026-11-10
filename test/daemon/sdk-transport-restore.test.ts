@@ -57,6 +57,20 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+// These restore scenarios exercise the legacy stream-json contract. Keep the
+// CLI-version probe explicit instead of relying on an incomplete execFile mock
+// (Node's real promisified execFile returns { stdout, stderr }, not a string).
+vi.mock('../../src/util/exec-helper.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/util/exec-helper.js')>();
+  return {
+    ...actual,
+    execFileOffMain: vi.fn((...args: Parameters<typeof actual.execFileOffMain>) => {
+      if (args[1]?.includes('--version')) return Promise.resolve({ stdout: '1.4.12\n', stderr: '' });
+      return actual.execFileOffMain(...args);
+    }),
+  };
+});
+
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
   const { EventEmitter } = await import('node:events');

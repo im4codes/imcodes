@@ -568,6 +568,14 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
       }
       return;
     }
+    // Newer clients may probe an unsupported protocol before initialize
+    // (e.g. server/discover). Reply immediately so they can negotiate MCP's
+    // supported initialize path instead of timing out on the heavy backend.
+    // Known tools/call retains its existing queued-startup contract.
+    if (!clientInitialized && id !== undefined && message.method !== 'tools/call') {
+      writeMessage(errorResponse(id, -32601, 'Method not found'));
+      return;
+    }
     const child = backend;
     if (backendReady && child && sendBackend(message)) {
       if (id !== undefined) trackInFlight(id, message, child, generation);
