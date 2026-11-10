@@ -41,9 +41,12 @@ describe('cross-vendor handoff contract', () => {
     });
     expect(normalizeCrossVendorHandoffConfig({ maxTokens: 99_999, recentTurns: 0, timeoutMs: 1 })).toMatchObject({
       maxTokens: CROSS_VENDOR_HANDOFF_DEFAULTS.hardMaxTokens,
-      recentTurns: 30,
+      recentTurns: 1,
       timeoutMs: 250,
     });
+    expect(normalizeCrossVendorHandoffConfig().maxTokens).toBe(50_000);
+    expect(normalizeCrossVendorHandoffConfig().recentTurns).toBe(100);
+    expect(normalizeCrossVendorHandoffConfig({ maxTokens: 50_001, recentTurns: 999 })).toMatchObject({ maxTokens: 50_000, recentTurns: 100 });
   });
 
   it('triggers only for a non-fresh family or runtime-kind switch', () => {
@@ -90,7 +93,7 @@ describe('cross-vendor handoff contract', () => {
       event('user.message', { text: 'delta' }, 9, 100),
     ]);
     await buildCrossVendorHandoffPack(record('codex-sdk'), { epoch: 7, seq: 20, ts: 200 }, 'claude-code-sdk', 'transport', undefined, { epoch: 7, seq: 8, ts: 99 });
-    expect(read).toHaveBeenCalledWith('handoff-test', 30, { visibleOnly: true, through: { epoch: 7, seq: 20, ts: 200 } });
+    expect(read).toHaveBeenCalledWith('handoff-test', 100, { visibleOnly: true, through: { epoch: 7, seq: 20, ts: 200 } });
   });
 
   it('disables generation explicitly and preserves the one-shot configuration bounds', async () => {
@@ -131,13 +134,15 @@ describe('cross-vendor handoff contract', () => {
 
 
 describe('reported lost provider-switch context counterexamples', () => {
-  it.each([undefined, 3000])('upgrades the old ten-message setting and preserves all thirty messages (budget=%s)', async (maxTokens) => {
-    expect(normalizeCrossVendorHandoffConfig({ recentTurns: 10 }).recentTurns).toBe(30);
+  it.each([undefined, 3000])('upgrades the old ten-message setting and preserves the newest messages first (budget=%s)', async (maxTokens) => {
+    expect(normalizeCrossVendorHandoffConfig({ recentTurns: 10 }).recentTurns).toBe(10);
     const rows = Array.from({ length: 30 }, (_, i) => event(i % 2 ? 'assistant.text' : 'user.message', { text: `消息${i}开始：${'这是需要保留的历史正文。'.repeat(120)}` }, i + 1, i + 1));
     vi.spyOn(timelineStore, 'readCompletedTextTail').mockResolvedValue(rows);
     const pack = await buildCrossVendorHandoffPack(record('codex-sdk'), { epoch: 7, seq: 30, ts: 30 }, 'agy-sdk', 'transport', { maxTokens });
     expect(pack).toBeDefined();
-    for (let i = 0; i < 30; i++) expect(pack!.text).toContain(`消息${i}开始`);
+    expect(pack!.text).toContain('消息29开始');
+    if (maxTokens === undefined) expect(pack!.text).toContain('消息0开始');
+    else expect(pack!.text).not.toContain('消息0开始');
     expect(pack!.tokenCount).toBeLessThanOrEqual(maxTokens ?? CROSS_VENDOR_HANDOFF_DEFAULTS.maxTokens);
   });
   it('includes the user message that is itself the frozen cutoff', async () => {
@@ -153,5 +158,25 @@ describe('reported lost provider-switch context counterexamples', () => {
     const pack = await buildCrossVendorHandoffPack(record('codex-sdk'), { epoch: 7, seq: 202, ts: 202 }, 'agy-sdk', 'transport');
     expect(pack?.text).toContain('CURRENT_GOAL_8C');
     expect(pack?.text).toContain('CONFIRMED_DECISION_8C');
+  });
+  it('keeps the newest completed messages when the handoff token budget is tight', async () => {
+    const rows = Array.from({ length: 100 }, (_, i) => event(
+      i % 2 ? 'assistant.text' : 'user.message',
+      { text: `${i === 99 ? 'NEWEST_GOAL_9D' : `OLD_GOAL_${i}`} ${'context '.repeat(300)}` },
+      i + 1,
+      i + 1,
+    ));
+    vi.spyOn(timelineStore, 'readCompletedTextTail').mockResolvedValue(rows);
+    const pack = await buildCrossVendorHandoffPack(
+      record('codex-sdk'),
+      { epoch: 7, seq: 100, ts: 100 },
+      'agy-sdk',
+      'transport',
+      { recentTurns: 100, maxTokens: 120 },
+    );
+    expect(pack).toBeDefined();
+    expect(pack!.text).toContain('NEWEST_GOAL_9D');
+    expect(pack!.text).not.toContain('OLD_GOAL_0');
+    expect(pack!.tokenCount).toBeLessThanOrEqual(120);
   });
 });
