@@ -5,15 +5,25 @@ import { AGY_ACP_AGENT_NAME } from '../../shared/agy-agent.js';
 import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { connectProvider, disconnectAll, getProvider } from '../../src/agent/provider-registry.js';
 import { launchTransportSession, getTransportRuntime, stopTransportRuntimeSession } from '../../src/agent/session-manager.js';
-import { getSession, flushStore, removeSession } from '../../src/store/session-store.js';
+import { getSession, flushStore, removeSession, authorizeEmptySessionStoreWrite } from '../../src/store/session-store.js';
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
 import type { TimelineEvent } from '../../src/daemon/timeline-event.js';
 import { AGY_NATIVE_SESSION_STATE, AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 import { getTransportQueueStore } from '../../src/daemon/transport-queue-store.js';
+import { imcodesStateDir } from '../../src/util/imcodes-state-dir.js';
+import { isRealImcodesPath } from '../../src/util/test-home-guard.js';
+import { getActiveThinkingTs, getActiveStatusText, getTailSessionStateInfo, hasActiveToolCall } from '../../web/src/thinking-utils.js';
+import { hasActiveTimelineTurn, hasPendingUserSend } from '../../web/src/timeline-running.js';
+import { getLatestTransportActivityDetail } from '../../web/src/transport-activity-status.js';
+import { deriveSessionLiveStatus, resolveTimelineBackedSessionState } from '../../web/src/session-live-status.js';
+
+vi.mock('@shared/session-control-commands.js', () => import('../../shared/session-control-commands.js'));
+vi.mock('@shared/capacity-retry.js', () => import('../../shared/capacity-retry.js'));
 
 const NAME = 'deck_e2e_agy_acp_brain';
 const PROJECT = 'e2e_agy_acp';
@@ -125,5 +135,223 @@ describe('real AG ACP SDK/runtime/durable store/relay', () => {
     const rows = await requests(); expect(rows.filter(x => x.method === 'session/new')).toHaveLength(1);
     expect(rows.filter(x => x.method === 'session/resume').map(x => x.params.sessionId)).toEqual([native]);
     expect(done.mock.calls[0]?.[1].metadata.resumeId).toBe(native);
+  });
+  it('automatically drives persisted SQLite state, relay timeline events, and frontend live-status projection across A + steered B/C without manual store writes', async () => {
+    const persistedDir = await mkdtemp(path.join(tmpdir(), 'imcodes-ag-prodchain-'));
+    const persistedName = 'deck_ag_prodchain_brain';
+    const persistedProject = 'ag_prodchain';
+    const persistedEvents: TimelineEvent[] = [];
+    const offPersisted = timelineEmitter.on(e => { if (e.sessionId === persistedName) persistedEvents.push(e); });
+    const dbPath = path.join(imcodesStateDir(), 'sessions.sqlite');
+    const readPersistedSqliteRow = () => {
+      const db = new DatabaseSync(dbPath, { readOnly: true });
+      try {
+        const row = db.prepare('SELECT state, payload, updated_at FROM sessions WHERE name = ?').get(persistedName) as
+          | { state: string; payload: string; updated_at: number }
+          | undefined;
+        return row ? { state: row.state, updatedAt: row.updated_at, record: JSON.parse(row.payload) as Record<string, unknown> } : null;
+      } finally {
+        db.close();
+      }
+    };
+    const projectLiveStatus = (sqliteState: string | null) => {
+      const activeThinkingTs = getActiveThinkingTs(persistedEvents);
+      const statusText = getActiveStatusText(persistedEvents);
+      const activeToolCall = hasActiveToolCall(persistedEvents);
+      const pendingUserSend = hasPendingUserSend(persistedEvents);
+      const transportActivityDetail = getLatestTransportActivityDetail(persistedEvents);
+      const tailState = getTailSessionStateInfo(persistedEvents);
+      const timelineLastEventTs = persistedEvents.length > 0 ? (persistedEvents[persistedEvents.length - 1]?.ts ?? null) : null;
+      const activeTransportTurn = hasActiveTimelineTurn(persistedEvents);
+      const resolvedSessionState = resolveTimelineBackedSessionState({
+        timelineState: tailState.state,
+        sessionState: sqliteState,
+        activeThinking: !!activeThinkingTs,
+        activeToolCall,
+        activeTransportTurn,
+        timelineStateTs: tailState.ts,
+        timelineLastEventTs,
+      });
+      const liveStatus = deriveSessionLiveStatus({
+        sessionState: resolvedSessionState,
+        activeThinking: !!activeThinkingTs,
+        activeToolCall,
+        activeTransportTurn,
+        pendingUserSend,
+        statusText,
+        transportActivityDetail,
+      });
+      return {
+        activeThinking: !!activeThinkingTs,
+        activeToolCall,
+        activeTransportTurn,
+        statusText,
+        tailTimelineState: tailState.state,
+        sqliteState,
+        resolvedSessionState,
+        liveStatus,
+      };
+    };
+
+    try {
+      expect(isRealImcodesPath(imcodesStateDir())).toBe(false);
+      expect(isKnownTestSessionLike({ name: persistedName, projectName: persistedProject, projectDir: persistedDir })).toBe(false);
+      const provider = getProvider(AGY_SDK_PROVIDER_ID)!;
+      await provider.connect({
+        binaryPath: path.join(root, 'agy'),
+        env: {
+          HOME: root,
+          AGY_ACP_FIXTURE_AGENT_NAME: AGY_ACP_AGENT_NAME,
+          AGY_ACP_FIXTURE_LOG: log,
+          AGY_ACP_FIXTURE_SCENARIO: 'reordered',
+          AGY_ACP_FIXTURE_REPLY_GAP_MS: '120',
+        },
+      });
+      await launchTransportSession({
+        name: persistedName,
+        projectName: persistedProject,
+        projectDir: persistedDir,
+        role: 'brain',
+        agentType: AGY_SDK_PROVIDER_ID,
+      });
+      const runtime = getTransportRuntime(persistedName)!;
+      await flushStore();
+
+      // Stage 1: Initial idle before any prompt is sent
+      const stage1Sqlite = readPersistedSqliteRow();
+      expect(runtime.getStatus()).toBe('idle');
+      expect(stage1Sqlite?.state).toBe('idle');
+      expect(stage1Sqlite?.record.agyNativeSessionState).toBe(AGY_NATIVE_SESSION_STATE.UNSTARTED);
+      const stage1Projection = projectLiveStatus(stage1Sqlite?.state ?? null);
+      expect(stage1Projection.resolvedSessionState).toBe('idle');
+      expect(stage1Projection.liveStatus.busy).toBe(false);
+      expect(stage1Projection.liveStatus.visualMode).toBe('idle');
+
+      // Stage 2: Send RUN_A, wait for native tool.call, steer HUMAN_B and MCP_C while in-flight
+      runtime.send('RUN_A', 'prodchain-a');
+      await vi.waitFor(() => expect(persistedEvents.some(e => e.type === 'tool.call' && e.payload.toolCallId === 'sleep')).toBe(true));
+      runtime.send('HUMAN_B', 'prodchain-b');
+      const appendB = await runtime.appendPendingMessagesToActiveTurn(['prodchain-b'], 'prodchain-append-b');
+      expect(appendB.status).toBe('delivered');
+      const appendC = await runtime.appendExternalMessageToActiveTurn('MCP_C', 'prodchain-c');
+      expect(appendC).toBe('queued');
+      await vi.waitFor(async () => expect((await requests()).filter(x => x.method === 'session/prompt')).toHaveLength(3));
+      expect(getTransportQueueStore().hasDeliveryTombstone(persistedName, 'prodchain-b')).toBe(true);
+      expect(getTransportQueueStore().hasDeliveryTombstone(persistedName, 'prodchain-c')).toBe(true);
+      await flushStore();
+
+      const stage2RuntimeStatus = runtime.getStatus();
+      const stage2Sqlite = readPersistedSqliteRow();
+      expect(stage2RuntimeStatus).not.toBe('idle');
+      expect(stage2Sqlite?.state).toBe('running');
+      expect(stage2Sqlite?.record.agyNativeSessionState).toBe(AGY_NATIVE_SESSION_STATE.STARTED);
+      const stage2Projection = projectLiveStatus(stage2Sqlite?.state ?? null);
+      expect(stage2Projection.activeToolCall).toBe(true);
+      expect(stage2Projection.activeTransportTurn).toBe(true);
+      expect(stage2Projection.resolvedSessionState).toBe('running');
+      expect(stage2Projection.liveStatus.busy).toBe(true);
+      expect(stage2Projection.liveStatus.sweep).toBe(true);
+      expect(stage2Projection.liveStatus.mode).toBe('tool');
+
+      // Stage 3: Post tool.result window while aggregated turn is still settling (openToolCount === 0, runtime still running)
+      await vi.waitFor(() => expect(persistedEvents.some(e => e.type === 'tool.result' && e.payload.toolCallId === 'sleep')).toBe(true));
+      const stage3RuntimeStatus = runtime.getStatus();
+      const stage3Sqlite = readPersistedSqliteRow();
+      const stage3Projection = projectLiveStatus(stage3Sqlite?.state ?? null);
+      expect(stage3Projection.activeToolCall).toBe(false);
+      expect(stage3Sqlite?.state).toBe('running');
+      expect(stage3Projection.resolvedSessionState).toBe('running');
+      expect(stage3Projection.liveStatus.busy).toBe(true);
+      expect(stage3Projection.liveStatus.sweep).toBe(true);
+
+      // Stage 4: Final aggregated turn settlement -> automatic idle persistence in SQLite + authoritative idle timeline event
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'));
+      await flushStore();
+      const stage4Sqlite = readPersistedSqliteRow();
+      expect(stage4Sqlite?.state).toBe('idle');
+      expect(stage4Sqlite?.record.providerResumeId).toBe('native-1');
+      expect(stage4Sqlite?.record.agyNativeSessionState).toBe(AGY_NATIVE_SESSION_STATE.STARTED);
+      const finalTexts = persistedEvents.filter(e => e.type === 'assistant.text' && e.payload.streaming === false);
+      expect(finalTexts).toHaveLength(1);
+      expect(finalTexts[0]?.payload.text).toContain('RUN_A');
+      expect(finalTexts[0]?.payload.text).toContain('HUMAN_B');
+      expect(finalTexts[0]?.payload.text).toContain('MCP_C');
+      expect(persistedEvents.some(e => e.type === 'usage.update')).toBe(true);
+      expect(persistedEvents.some(e => e.type === 'session.state' && e.payload.state === 'idle' && e.payload.authoritative === true)).toBe(true);
+
+      const stage4Projection = projectLiveStatus(stage4Sqlite?.state ?? null);
+      expect(stage4Projection.activeToolCall).toBe(false);
+      expect(stage4Projection.activeTransportTurn).toBe(false);
+      expect(stage4Projection.resolvedSessionState).toBe('idle');
+      expect(stage4Projection.liveStatus.busy).toBe(false);
+      expect(stage4Projection.liveStatus.sweep).toBe(false);
+      expect(stage4Projection.liveStatus.mode).toBe('idle');
+      expect(stage4Projection.liveStatus.visualMode).toBe('idle');
+
+      const evidencePath = process.env.IMCODES_SAVE_AGY_FULLCHAIN_EVIDENCE?.trim();
+      if (evidencePath) {
+        const rpcRows = await requests();
+        await writeFile(evidencePath, JSON.stringify({
+          testFile: 'test/e2e/agy-acp-flow.test.ts',
+          testName: 'automatically drives persisted SQLite state, relay timeline events, and frontend live-status projection across A + steered B/C without manual store writes',
+          peerClassification: 'controllable_acp_fixture (test/fixtures/agy-acp.mjs via real @agentclientprotocol/sdk ClientSideConnection)',
+          manualStoreWritesInTest: 0,
+          statePersistenceDriver: 'TransportSessionRuntime.onStatusChange -> session-manager.wireTransportCallbacks -> persistTransportState -> upsertSession -> flushStore -> sessions.sqlite (sessions table)',
+          isolatedImcodesHome: imcodesStateDir(),
+          sqliteDbPath: dbPath,
+          sessionName: persistedName,
+          projectName: persistedProject,
+          stages: {
+            stage1_initial_idle: {
+              runtimeStatus: 'idle',
+              sqlitePersistedState: stage1Sqlite?.state,
+              agyNativeSessionState: stage1Sqlite?.record.agyNativeSessionState,
+              frontendProjection: stage1Projection,
+            },
+            stage2_in_flight_a_with_tool_and_steered_b_c: {
+              runtimeStatus: stage2RuntimeStatus,
+              sqlitePersistedState: stage2Sqlite?.state,
+              agyNativeSessionState: stage2Sqlite?.record.agyNativeSessionState,
+              frontendProjection: stage2Projection,
+            },
+            stage3_post_tool_result_before_turn_settle: {
+              runtimeStatus: stage3RuntimeStatus,
+              sqlitePersistedState: stage3Sqlite?.state,
+              frontendProjection: stage3Projection,
+            },
+            stage4_terminal_settled_idle: {
+              runtimeStatus: runtime.getStatus(),
+              sqlitePersistedState: stage4Sqlite?.state,
+              providerResumeId: stage4Sqlite?.record.providerResumeId,
+              agyNativeSessionState: stage4Sqlite?.record.agyNativeSessionState,
+              frontendProjection: stage4Projection,
+            },
+          },
+          rpcMethodCounts: rpcRows.reduce<Record<string, number>>((acc, r) => {
+            acc[r.method] = (acc[r.method] ?? 0) + 1;
+            return acc;
+          }, {}),
+          timelineEventSummary: persistedEvents.map(e => ({
+            type: e.type,
+            ts: e.ts,
+            state: e.payload.state,
+            authoritative: e.payload.authoritative,
+            status: e.payload.status,
+            label: e.payload.label,
+            toolCallId: e.payload.toolCallId,
+            terminalStatus: e.payload.terminalStatus,
+            streaming: e.payload.streaming,
+            textPreview: typeof e.payload.text === 'string' ? e.payload.text.slice(0, 80) : undefined,
+          })),
+        }, null, 2));
+      }
+    } finally {
+      offPersisted();
+      await stopTransportRuntimeSession(persistedName);
+      removeSession(persistedName);
+      authorizeEmptySessionStoreWrite();
+      await flushStore();
+      await rm(persistedDir, { recursive: true, force: true });
+    }
   });
 });
