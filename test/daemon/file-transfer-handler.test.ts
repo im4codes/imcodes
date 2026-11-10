@@ -680,10 +680,11 @@ describe('file-transfer local handle hardening', () => {
 
   it('resumes a broken relay upload fetch from the bytes already written', async () => {
     const transfer = await loadFileTransferHandler(fakeHome);
+    let breakConnection!: () => void;
     const broken = new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(new TextEncoder().encode('he'));
-        setTimeout(() => controller.error(new TypeError('link_lost')), 20);
+        breakConnection = () => controller.error(new TypeError('link_lost'));
       },
     });
     const fetchMock = vi.fn()
@@ -695,7 +696,7 @@ describe('file-transfer local handle hardening', () => {
     vi.stubGlobal('fetch', fetchMock);
     const done = createServerLinkMock();
 
-    await transfer.handleFileUploadFetch({
+    const upload = transfer.handleFileUploadFetch({
       type: 'file.upload_fetch',
       uploadId: 'upload-fetch-resume',
       filename: 'resume.txt',
@@ -704,6 +705,18 @@ describe('file-transfer local handle hardening', () => {
       size: 5,
       downloadUrl: 'https://relay.example/upload-staged/upload-fetch-resume?token=reusable',
     }, done.serverLink as never);
+
+    // Break only after the prefix really reached disk. A wall-clock delay
+    // races initialization/IO on a loaded runner and can discard the queued
+    // stream chunk before the handler has even attached its reader.
+    try {
+      await vi.waitFor(async () => {
+        await expect(readFile(path.join(fakeHome, '.imcodes', 'uploads', 'resume.txt'), 'utf8')).resolves.toBe('he');
+      });
+    } finally {
+      breakConnection();
+      await upload;
+    }
 
     expect(fetchMock).toHaveBeenNthCalledWith(2, expect.any(String), expect.objectContaining({
       headers: { Range: 'bytes=2-' },
