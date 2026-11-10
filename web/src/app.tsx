@@ -7022,7 +7022,11 @@ export function App() {
     };
     const pulse = () => {
       if (!shouldPulse()) return;
-      wsRef.current?.reconnectNow(true);
+      const ws = wsRef.current;
+      // Do not abort a slow but still bounded ticket/open attempt every 5s.
+      // WsClient owns its 30s ticket and 15s open deadlines and retry backoff.
+      if (!ws || ws.connectionAttemptInFlight) return;
+      ws.reconnectNow(true);
     };
     const initial = setTimeout(pulse, DAEMON_ONLINE_WS_RECOVERY_INITIAL_MS);
     const interval = setInterval(pulse, DAEMON_ONLINE_WS_RECOVERY_INTERVAL_MS);

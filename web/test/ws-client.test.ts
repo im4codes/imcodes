@@ -298,6 +298,38 @@ describe('WsClient', () => {
     vi.useRealTimers();
   });
 
+  it.each(['probe', 'resume', 'forced-resume'] as const)('preserves a slow ticket across repeated %s nudges', async (nudge) => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => resolve({ ok: true, json: async () => ({ ticket: 'slow-ticket' }) }), 8_000);
+      init?.signal?.addEventListener('abort', () => {
+        clearTimeout(timer);
+        reject(new DOMException('Aborted', 'AbortError'));
+      });
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    try {
+      client.connect();
+      await vi.advanceTimersByTimeAsync(5_000);
+      if (nudge === 'probe') client.probeConnection();
+      else client.resumeConnection(nudge === 'forced-resume');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(lastWs?.url).toContain('slow-ticket');
+      const opening = lastWs!;
+      // A subsequent focus must also leave the in-progress socket alone.
+      client.probeConnection();
+      client.resumeConnection(true);
+      expect(lastWs).toBe(opening);
+      expect(opening.readyState).toBe(MockWebSocket.CONNECTING);
+      opening.emit('open');
+      expect(client.connected).toBe(true);
+    } finally {
+      client.disconnect();
+    }
+  });
+
   it('times out a hung ws-ticket request and retries instead of staying connecting forever', async () => {
     vi.useFakeTimers();
     const fetchMock = vi.fn((_url: string, init?: RequestInit) => new Promise((_resolve, reject) => {
@@ -313,7 +345,11 @@ describe('WsClient', () => {
     client.connect();
     expect(client.connecting).toBe(true);
 
-    await vi.advanceTimersByTimeAsync(30_000);
+    for (let i = 0; i < 6; i++) {
+      client.resumeConnection(true);
+      client.probeConnection();
+      await vi.advanceTimersByTimeAsync(5_000);
+    }
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(client.connected).toBe(false);
     // The first hung ticket attempt has yielded to a reconnect timer.
@@ -334,7 +370,11 @@ describe('WsClient', () => {
     const firstWs = lastWs!;
 
     expect(firstWs.readyState).toBe(MockWebSocket.CONNECTING);
-    await vi.advanceTimersByTimeAsync(15_000);
+    for (let i = 0; i < 3; i++) {
+      client.resumeConnection(true);
+      client.probeConnection();
+      await vi.advanceTimersByTimeAsync(5_000);
+    }
 
     expect(firstWs.readyState).toBe(MockWebSocket.CLOSED);
     expect(client.connected).toBe(false);
@@ -347,6 +387,26 @@ describe('WsClient', () => {
 
     client.disconnect();
     vi.useRealTimers();
+  });
+
+  it('still resumes immediately from retry backoff when no attempt is in flight', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    try {
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      const previous = lastWs;
+      previous!.emit('close');
+      expect(client.connecting).toBe(true);
+      expect(client.connectionAttemptInFlight).toBe(false);
+      client.resumeConnection(true);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(lastWs).not.toBe(previous);
+      expect(client.connectionAttemptInFlight).toBe(true);
+    } finally {
+      client.disconnect();
+    }
   });
 
   it('does not stack multiple reconnect timers for the same outage', async () => {

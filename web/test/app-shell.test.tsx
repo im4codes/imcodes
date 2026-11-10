@@ -65,6 +65,7 @@ const {
   openSharedEntryOptionsMock: vi.fn(),
   wsInstances: [] as Array<{
     connected: boolean;
+    connectionAttemptInFlight: boolean;
     options?: { shareTarget?: unknown };
     messageHandlers: Array<(message: any) => void>;
     latencyHandler: ((ms: number) => void) | null;
@@ -212,6 +213,7 @@ vi.mock('../src/push-notifications.js', () => ({
 vi.mock('../src/ws-client.js', () => ({
   WsClient: class MockWsClient {
     connected = false;
+    connectionAttemptInFlight = false;
     options?: { shareTarget?: unknown };
     messageHandlers: Array<(message: any) => void> = [];
     latencyHandler: ((ms: number) => void) | null = null;
@@ -3748,6 +3750,17 @@ describe('App shell', () => {
       expect(wsInstances.some((instance) => instance.reconnectNow.mock.calls.some((call) => call[0] === true))).toBe(true);
 
       const activeWs = wsInstances.find((instance) => instance.reconnectNow.mock.calls.length > 0) ?? ws;
+      const callsBeforeSlowHandshake = activeWs.reconnectNow.mock.calls.length;
+      activeWs.connectionAttemptInFlight = true;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10_000);
+      });
+      expect(activeWs.reconnectNow).toHaveBeenCalledTimes(callsBeforeSlowHandshake);
+      activeWs.connectionAttemptInFlight = false;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      expect(activeWs.reconnectNow.mock.calls.length).toBeGreaterThan(callsBeforeSlowHandshake);
       act(() => {
         activeWs.emit({ type: 'session.event', event: 'connected', session: '', state: 'connected' });
       });

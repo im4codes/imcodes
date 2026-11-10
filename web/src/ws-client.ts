@@ -669,9 +669,13 @@ export class WsClient {
   }
 
   get connecting(): boolean {
-    return this._connecting
-      || this.ws?.readyState === WebSocket.CONNECTING
+    return this.connectionAttemptInFlight
       || (!this._connected && !this._destroyed && this.reconnectTimer !== null);
+  }
+
+  /** An actual bounded ticket/open attempt, not a scheduled backoff retry. */
+  get connectionAttemptInFlight(): boolean {
+    return this._connecting || this.ws?.readyState === WebSocket.CONNECTING;
   }
 
   get pingLatency(): number | null {
@@ -854,7 +858,9 @@ export class WsClient {
    *      verified.
    */
   probeConnection(timeoutMs = RESUME_PROBE_TIMEOUT_MS): void {
-    if (this._destroyed) return;
+    // Ticket acquisition and socket opening already have bounded watchdogs.
+    // Resume/focus must not restart them before they can finish.
+    if (this._destroyed || this.connectionAttemptInFlight) return;
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       this.reconnectNow(false);
       return;
@@ -912,7 +918,7 @@ export class WsClient {
    * mobile WebView zombie states that otherwise require killing the app.
    */
   resumeConnection(forceIfStale = false): void {
-    if (this._destroyed) return;
+    if (this._destroyed || this.connectionAttemptInFlight) return;
     if (!forceIfStale) {
       this.probeConnection();
       return;
