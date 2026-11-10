@@ -576,10 +576,6 @@ jobs:
   e2e-tests:
     name: E2E Tests
     runs-on: ubuntu-latest
-    env:
-      # Test HOME is isolated per file; keep the shared read-only browser
-      # binaries outside those disposable homes and outside the checkout.
-      PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/imcodes-playwright
     # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 2.2 min, max 2.7).
     timeout-minutes: 15
     # Self-contained runner: no unit-test artifacts are consumed. Release jobs
@@ -653,6 +649,10 @@ jobs:
       - run: ./scripts/ci-npm-ci.sh .
       - name: Install web deps (active timeline refresh e2e wrapper invokes web vitest)
         run: ./scripts/ci-npm-ci.sh web
+      - name: Configure shared Playwright browser path
+        run: |
+          # Test HOME is isolated per file; keep browsers outside it and the checkout.
+          echo "PLAYWRIGHT_BROWSERS_PATH=$RUNNER_TEMP/imcodes-playwright" >> "$GITHUB_ENV"
       - name: Install Chromium for cross-client timeline E2E (bounded)
         timeout-minutes: 15
         run: |

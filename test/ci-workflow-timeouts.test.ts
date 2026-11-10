@@ -21,14 +21,23 @@ const GITHUB_MAX_JOB_MINUTES = 360;
 /** The slack a job needs on top of a deliberate wait before it may be cut off. */
 const WAIT_SLACK_MINUTES = 10;
 
-type Step = { name?: string; run?: string; 'timeout-minutes'?: unknown };
-type Job = { 'timeout-minutes'?: unknown; steps?: Step[]; needs?: string | string[] };
+type Step = { name?: string; run?: string; env?: Record<string, unknown>; 'timeout-minutes'?: unknown };
+type Job = { 'timeout-minutes'?: unknown; env?: Record<string, unknown>; steps?: Step[]; needs?: string | string[] };
 type Workflow = { jobs: Record<string, Job> };
 
 function loadWorkflows(): Array<{ file: string; workflow: Workflow }> {
   return readdirSync(WORKFLOW_DIR)
     .filter((file) => /\.ya?ml$/.test(file))
     .map((file) => ({ file, workflow: parse(readFileSync(join(WORKFLOW_DIR, file), 'utf8')) as Workflow }));
+}
+
+// GitHub validates job env before assigning a runner. Step env/run may use
+// runner, but jobs.<id>.env may not (GitHub's context-availability table).
+function jobsUsingRunnerInEnv(workflow: Workflow): string[] {
+  return Object.entries(workflow.jobs)
+    .filter(([, job]) => Object.values(job.env ?? {}).some((value) =>
+      typeof value === 'string' && /\$\{\{[^}]*\brunner\s*(?:\.|\[)/.test(value)))
+    .map(([name]) => name);
 }
 
 /** Jobs with no usable limit: missing, not a whole number, or not below GitHub's own 6 h ceiling. */
@@ -77,6 +86,23 @@ describe('every CI job ends itself', () => {
   it('flags a limit shorter than the deliberate wait it contains (counterexample)', () => {
     const workflow: Workflow = { jobs: { waits: { 'timeout-minutes': 30, steps: [{ run: 'node scripts/resolve-libwebrtc-sdk-release.mjs --wait-seconds 15000' }] } } };
     expect(jobsCutOffBeforeTheirWait(workflow)).toEqual(['waits']);
+  });
+});
+
+describe('runner context is only used where a runner exists', () => {
+  it.each(loadWorkflows().map(({ file, workflow }) => [file, workflow] as const))(
+    '%s: job env does not reference runner context', (_file, workflow) => {
+      expect(jobsUsingRunnerInEnv(workflow)).toEqual([]);
+    },
+  );
+
+  it('rejects job env dot/index access without rejecting legal step env/run', () => {
+    const workflow: Workflow = { jobs: {
+      badDot: { env: { BROWSERS: '${{ runner.temp }}/browsers' } },
+      badIndex: { env: { BROWSERS: "${{ runner['temp'] }}/browsers" } },
+      step: { steps: [{ env: { BROWSERS: '${{ runner.temp }}/browsers' }, run: 'echo "$RUNNER_TEMP"' }] },
+    } };
+    expect(jobsUsingRunnerInEnv(workflow)).toEqual(['badDot', 'badIndex']);
   });
 });
 
@@ -160,6 +186,40 @@ describe.skipIf(!RUN_SCRIPTS)('ci-retry.sh and ci-apt-hardening.sh', () => {
   it('rejects arguments that are not whole numbers', async () => {
     const failure = await run('bash', ['scripts/ci-retry.sh', 'x', '5', 'true'], { env }).catch((error) => error as { code: number });
     expect((failure as { code: number }).code).toBe(2);
+  });
+
+  it('exports one runner browser path before install and both E2E steps, independent of child HOME', async () => {
+    const workflow = parse(readFileSync(join(WORKFLOW_DIR, 'ci.yml'), 'utf8')) as Workflow;
+    const job = workflow.jobs['e2e-tests']!;
+    const steps = job.steps ?? [];
+    const setup = steps.findIndex((step) => /PLAYWRIGHT_BROWSERS_PATH/.test(step.run ?? '') && /GITHUB_ENV/.test(step.run ?? ''));
+    const install = steps.findIndex((step) => /playwright install/.test(step.run ?? ''));
+    const tests = steps.map((step, index) => /pipe-pane-stream|npm run test:e2e/.test(step.run ?? '') ? index : -1).filter((index) => index >= 0);
+    expect(setup).toBeGreaterThanOrEqual(0);
+    expect(install).toBeGreaterThan(setup);
+    expect(tests).toHaveLength(2);
+    expect(tests.every((index) => index > install)).toBe(true);
+    for (const step of steps) expect(step.env?.PLAYWRIGHT_BROWSERS_PATH).toBeUndefined();
+    expect(job.env?.PLAYWRIGHT_BROWSERS_PATH).toBeUndefined();
+    expect(steps[install]!['timeout-minutes']).toBe(15);
+    expect(steps[install]!.run).toContain('./scripts/ci-apt-hardening.sh');
+    expect(steps[install]!.run).toContain('ci-retry.sh 3 240 npx playwright install --with-deps chromium');
+
+    const dir = scratch();
+    const runnerTemp = join(dir, 'runner temp');
+    const githubEnv = join(dir, 'github-env');
+    await run('bash', ['-e', '-c', steps[setup]!.run!], { env: { ...env, RUNNER_TEMP: runnerTemp, GITHUB_ENV: githubEnv } });
+    const browserPath = join(runnerTemp, 'imcodes-playwright');
+    expect(readFileSync(githubEnv, 'utf8')).toBe(`PLAYWRIGHT_BROWSERS_PATH=${browserPath}\n`);
+    // Simulate the runner importing GITHUB_ENV for subsequent steps; native
+    // child processes inherit it even when each test uses a different HOME.
+    const inherited = { ...env, PLAYWRIGHT_BROWSERS_PATH: browserPath };
+    for (const home of ['install-home', 'pipe-pane-home', 'e2e-home']) {
+      const result = await run(process.execPath, ['-e',
+        'const {execFileSync}=require("node:child_process"); process.stdout.write(execFileSync(process.execPath,["-e","process.stdout.write(process.env.PLAYWRIGHT_BROWSERS_PATH)"],{env:{...process.env,HOME:process.env.HOME+"/child"}}));',
+      ], { env: { ...inherited, HOME: join(dir, home) } });
+      expect(result.stdout).toBe(browserPath);
+    }
   });
 
   it('writes the apt network timeouts to the configured directory', async () => {
