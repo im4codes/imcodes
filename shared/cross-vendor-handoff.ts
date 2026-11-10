@@ -2,7 +2,7 @@
 export const CROSS_VENDOR_HANDOFF_DEFAULTS = {
   enabled: true,
   maxTokens: 9000,
-  hardMaxTokens: 18000,
+  hardMaxTokens: 50000,
   recentTurns: 30,
   maxTextChars: 1200,
   timeoutMs: 3000,

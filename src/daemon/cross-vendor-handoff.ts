@@ -51,24 +51,36 @@ export async function buildCrossVendorHandoffPack(record: SessionRecord, cutoff:
   }
   // Identity/system instructions are reapplied by the normal launch bootstrap.
   // The handoff is conversation text only, never tools or processed memory.
-  const render = (maxTextChars: number) => redactSensitiveText([
+  const render = (rows: typeof messages, maxTextChars: number) => redactSensitiveText([
     CROSS_VENDOR_HANDOFF_HEADINGS.title,
     CROSS_VENDOR_HANDOFF_HEADINGS.notice,
-    ...messages.map((message) => `${message.role === 'user' ? 'User' : 'Assistant'}: ${message.text.slice(0, maxTextChars)}${message.text.length > maxTextChars ? '…' : ''}`),
+    ...rows.map((message) => `${message.role === 'user' ? 'User' : 'Assistant'}: ${message.text.slice(0, maxTextChars)}${message.text.length > maxTextChars ? '…' : ''}`),
   ].join('\n\n'));
   const hardCap = CROSS_VENDOR_HANDOFF_DEFAULTS.hardMaxTokens;
   const maxTokens = Math.min(config.maxTokens, hardCap);
-  // Shorten each message fairly rather than dropping the newest messages
-  // from the end of the pack. Keep tokenizer worker round-trips bounded.
-  let maxTextChars = Math.min(CROSS_VENDOR_HANDOFF_DEFAULTS.maxTextChars, Math.max(0, ...messages.map((message) => message.text.length)));
-  let bounded = render(maxTextChars);
+  // Keep tokenizer worker round-trips bounded. When the budget is tight,
+  // discard the oldest rows first so the newest completed messages win.
+  let selectedMessages = messages;
+  let maxTextChars = Math.min(CROSS_VENDOR_HANDOFF_DEFAULTS.maxTextChars, Math.max(0, ...selectedMessages.map((message) => message.text.length)));
+  let bounded = render(selectedMessages, maxTextChars);
   let tokenCount = await countTokensAsync(bounded);
-  for (let attempt = 0; tokenCount > maxTokens && bounded.length > 1 && attempt < 4; attempt += 1) {
+  for (let attempt = 0; tokenCount > maxTokens && bounded.length > 1 && attempt < 12; attempt += 1) {
+    if (selectedMessages.length > 1) {
+      // Keep the newest completed messages when the handoff budget is tight.
+      const dropCount = Math.min(
+        selectedMessages.length - 1,
+        Math.max(1, Math.ceil(selectedMessages.length * (1 - maxTokens / tokenCount))),
+      );
+      selectedMessages = selectedMessages.slice(dropCount);
+      bounded = render(selectedMessages, maxTextChars);
+      tokenCount = await countTokensAsync(bounded);
+      continue;
+    }
     const ratio = (maxTokens / tokenCount) * 0.85;
     const nextTextChars = Math.floor(maxTextChars * ratio);
     if (attempt < 3 && nextTextChars > 0 && nextTextChars < maxTextChars) {
       maxTextChars = nextTextChars;
-      bounded = render(maxTextChars);
+      bounded = render(selectedMessages, maxTextChars);
     } else {
       // An explicitly tiny custom budget may not even fit the headings/roles.
       maxTextChars = 0;
