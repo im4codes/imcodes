@@ -25,6 +25,14 @@ describe('execution pool MCP tools', () => {
     expect(result).toMatchObject({ status: 'ok', entries: [{ role: 'auditor' }], auditByDefault: true, concurrencyCap: 4 });
     expect(setDefaults).toHaveBeenCalledOnce();
   });
+  it('reports persistence failure rather than projecting an unsaved role as success', async () => {
+    const handlers = createExecutionPoolMcpToolHandlers(caller, {
+      getDefaults: defaults, setDefaults: async () => null, isProjectBrain: () => true,
+    });
+    await expect(handlers.execution_pool_set({ entries: [{ model: 'gpt-5.4', provider: 'codex', role: 'auditor' }] }))
+      .resolves.toMatchObject({ status: 'error', reason: 'internal_error' });
+    await expect(handlers.execution_pool_get()).resolves.toMatchObject({ entries: [{ role: 'executor' }] });
+  });
   it('refuses mutation from a non-Brain and reports unconfigured pools', async () => {
     const handlers = createExecutionPoolMcpToolHandlers(caller, { getDefaults: () => null, isProjectBrain: () => true });
     await expect(handlers.execution_pool_get()).resolves.toMatchObject({ status: 'ok', configured: false, askUser: expect.stringContaining('Ask the user') });

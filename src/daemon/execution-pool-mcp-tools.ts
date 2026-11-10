@@ -105,7 +105,8 @@ export function createExecutionPoolMcpToolHandlers(caller: McpRuntimeCaller, dep
       const current = await getDefaults(caller);
       if (!current) return error('execution pool defaults are unavailable', MCP_ERROR_REASONS.INTERNAL_ERROR);
       const saved = await setDefaults(caller, applyPatch(current, parsed));
-      return poolOutput(saved ?? applyPatch(current, parsed));
+      if (!saved) return error('execution pool persistence could not be confirmed; read the current preferences before retrying', MCP_ERROR_REASONS.INTERNAL_ERROR);
+      return poolOutput(saved);
     },
   };
 }

@@ -105,6 +105,7 @@ let cachedSupervisorDefaults: SupervisorDefaultConfig | null = loadCachedSupervi
 let lastFetchedAt = 0;
 let refreshTimer: ReturnType<typeof setInterval> | null = null;
 const SUPERVISOR_DEFAULTS_REFRESH_INTERVAL_MS = 5_000;
+const SUPERVISOR_DEFAULTS_UPDATE_TIMEOUT_MS = 15_000;
 
 /**
  * True from the first failed/non-ok fetch until the next successful one.
@@ -112,9 +113,20 @@ const SUPERVISOR_DEFAULTS_REFRESH_INTERVAL_MS = 5_000;
  * logs at debug, so a prolonged outage does not spam the log.
  */
 let fetchFailing = false;
+// Invalidate snapshots requested before a newer applied read or mutation. Poll/reconnect
+// responses must not roll back a role that an MCP write just persisted.
+let cacheRequestVersion = 0;
+let refreshRequestVersion = 0;
+let lastAppliedRefresh = 0;
+let pendingUpdates = 0;
+let updateQueue: Promise<void> = Promise.resolve();
 
 /** Exported for tests and for the WS-reconnect hook. */
 export async function refreshSupervisorDefaultsCache(): Promise<void> {
+  if (pendingUpdates > 0) return;
+  const version = cacheRequestVersion;
+  const request = ++refreshRequestVersion;
+  const current = () => version === cacheRequestVersion && request > lastAppliedRefresh && pendingUpdates === 0;
   const creds = await loadCredentials();
   if (!creds) {
     // Unbound daemon — nothing to fetch against.
@@ -128,6 +140,7 @@ export async function refreshSupervisorDefaultsCache(): Promise<void> {
         headers: { Authorization: `Bearer ${creds.token}` },
       },
     );
+    if (!current()) return;
     if (!response.ok) {
       const log = fetchFailing ? logger.debug.bind(logger) : logger.warn.bind(logger);
       log({ status: response.status }, 'supervisor-defaults-cache: fetch non-ok — keeping previous value');
@@ -135,6 +148,7 @@ export async function refreshSupervisorDefaultsCache(): Promise<void> {
       return;
     }
     const body = await response.json() as { defaults?: Partial<SupervisorDefaultConfig> | null };
+    if (!current()) return;
     const next = normalizeSupervisorDefaultConfig(body?.defaults ?? null);
     if (JSON.stringify(next) !== JSON.stringify(cachedSupervisorDefaults)) {
       logger.info({
@@ -149,9 +163,11 @@ export async function refreshSupervisorDefaultsCache(): Promise<void> {
       persistCachedSupervisorDefaultsToDisk(next);
     }
     cachedSupervisorDefaults = next;
+    lastAppliedRefresh = request;
     lastFetchedAt = Date.now();
     fetchFailing = false;
   } catch (err) {
+    if (!current()) return;
     const log = fetchFailing ? logger.debug.bind(logger) : logger.warn.bind(logger);
     log({ err }, 'supervisor-defaults-cache: fetch failed — keeping previous value');
     fetchFailing = true;
@@ -160,11 +176,18 @@ export async function refreshSupervisorDefaultsCache(): Promise<void> {
 
 /** Persist an MCP/web pool change through the server's owner-authenticated route. */
 export async function updateSupervisorDefaultsCache(value: SupervisorDefaultConfig): Promise<SupervisorDefaultConfig | null> {
-  const creds = await loadCredentials();
-  if (!creds) return null;
+  ++cacheRequestVersion;
+  pendingUpdates++;
+  const previous = updateQueue;
+  let release!: () => void;
+  updateQueue = new Promise<void>((resolve) => { release = resolve; });
+  await previous;
   try {
+    const creds = await loadCredentials();
+    if (!creds) return null;
     const response = await fetch(`${creds.workerUrl}/api/server/${creds.serverId}/supervision/user-defaults/daemon`, {
       method: 'PUT',
+      signal: AbortSignal.timeout(SUPERVISOR_DEFAULTS_UPDATE_TIMEOUT_MS),
       headers: { Authorization: `Bearer ${creds.token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ defaults: value }),
     });
@@ -178,6 +201,10 @@ export async function updateSupervisorDefaultsCache(value: SupervisorDefaultConf
   } catch (err) {
     logger.debug({ err }, 'supervisor-defaults-cache: update failed');
     return null;
+  } finally {
+    pendingUpdates--;
+    ++cacheRequestVersion;
+    release();
   }
 }
 
@@ -257,6 +284,8 @@ export function __resetSupervisorDefaultsCacheForTests(): void {
   cachedSupervisorDefaults = null;
   lastFetchedAt = 0;
   fetchFailing = false;
+  ++cacheRequestVersion;
+  pendingUpdates = 0;
   try {
     db?.prepare('DELETE FROM supervisor_defaults_cache').run();
   } catch {
