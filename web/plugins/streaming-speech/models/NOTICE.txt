@@ -1,0 +1,19 @@
+IM.codes offline bilingual speech third-party notices
+
+sherpa-onnx runtime v2.0.1
+https://github.com/k2-fsa/sherpa-onnx
+Apache License 2.0; see LICENSE.sherpa.txt.
+
+Streaming Paraformer bilingual Chinese/English model (INT8)
+https://huggingface.co/csukuangfj/sherpa-onnx-streaming-paraformer-bilingual-zh-en
+Revision 8e40c43232a1c5c66c82111efc5820d3accca11b.
+The provider's model card declares Apache License 2.0; see LICENSE.sherpa.txt.
+Converted from Alibaba DAMO's online Paraformer:
+https://www.modelscope.cn/models/damo/speech_paraformer_asr_nat-zh-cn-16k-common-vocab8404-online
+
+ONNX Runtime
+https://github.com/microsoft/onnxruntime
+MIT License; see LICENSE.onnxruntime.txt.
+
+The bundled ONNX model bytes are unchanged from the above pinned export.
+This application supplies its own microphone and Capacitor adapters.
