@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import { isGuaranteedVisibleTimelineEvent, projectAssistantTextForDisplay } from '../../src/shared/timeline/types.js';
-import { isGuaranteedVisibleTimelineEventCached, projectAssistantEventForDisplay } from '../src/timeline/display-projection-cache.js';
+import { createTimelineDisplayProjectionCache } from '../src/timeline/display-projection-cache.js';
+const { isGuaranteedVisibleTimelineEventCached, projectAssistantEventForDisplay } = createTimelineDisplayProjectionCache(
+  projectAssistantTextForDisplay, isGuaranteedVisibleTimelineEvent,
+);
 import type { TimelineEvent } from '../src/ws-client.js';
 
 const event = (text: unknown): TimelineEvent => ({ eventId: 'display', sessionId: 'display', type: 'assistant.text',
@@ -58,7 +61,8 @@ it('keeps the safe per-payload path when WeakRef is unavailable', async () => {
   vi.stubGlobal('WeakRef', undefined);
   vi.resetModules();
   try {
-    const cache = await import('../src/timeline/display-projection-cache.js');
+    const { createTimelineDisplayProjectionCache } = await import('../src/timeline/display-projection-cache.js');
+    const cache = createTimelineDisplayProjectionCache(projectAssistantTextForDisplay, isGuaranteedVisibleTimelineEvent);
     const row = event('fallback');
     const value = cache.projectAssistantEventForDisplay(row);
     expect(cache.projectAssistantEventForDisplay(row)).toBe(value);

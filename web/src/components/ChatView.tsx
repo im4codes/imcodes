@@ -1,8 +1,10 @@
-import { projectAssistantEventForDisplay } from '../timeline/display-projection-cache.js';
+import { createTimelineDisplayProjectionCache } from '../timeline/display-projection-cache.js';
 import { itemKeysUnchanged, snapshotItemKeys, type ItemKeySnapshot } from './chat-view-item-keys.js';
 import { HISTORY_GAP_MARKER_KEY, insertHistoryGapMarker, placeHistoryGapMarker } from './chat-history-gap.js';
 import {
   isNeverRenderedTimelineEventType,
+  projectAssistantTextForDisplay,
+  isGuaranteedVisibleTimelineEvent,
 } from '../../../src/shared/timeline/types.js';
 import {
   SUPERVISION_AUTOMATION_KIND_PREFIX,
@@ -227,6 +229,10 @@ interface Props {
 function parseMessagePinPreviewMode(raw: unknown): MessagePinPreviewMode | null {
   return raw === 'rendered' || raw === 'text' ? raw : null;
 }
+
+const { projectAssistantEventForDisplay } = createTimelineDisplayProjectionCache(
+  projectAssistantTextForDisplay, isGuaranteedVisibleTimelineEvent,
+);
 
 /** A merged view item — a single event, assistant text, or a tool presentation. */
 interface ViewItem {

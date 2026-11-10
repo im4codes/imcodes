@@ -1,7 +1,9 @@
-import { isGuaranteedVisibleTimelineEventCached as isGuaranteedVisibleTimelineEvent } from '../timeline/display-projection-cache.js';
+import { createTimelineDisplayProjectionCache } from '../timeline/display-projection-cache.js';
 import { createSignalWriteBatcher } from '../signal-write-batcher.js';
 import {
   TIMELINE_PREFERENCE_DEPENDENT_TYPES,
+  isGuaranteedVisibleTimelineEvent as sharedIsGuaranteedVisibleTimelineEvent,
+  projectAssistantTextForDisplay,
   isLastValueTimelineEventType,
 } from '../../../src/shared/timeline/types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
@@ -57,6 +59,10 @@ import {
   safeLocalStorageRemoveItem,
   safeLocalStorageSetItem,
 } from '../local-storage-quota.js';
+
+const { isGuaranteedVisibleTimelineEventCached: isGuaranteedVisibleTimelineEvent } = createTimelineDisplayProjectionCache(
+  projectAssistantTextForDisplay, sharedIsGuaranteedVisibleTimelineEvent,
+);
 
 /** Map an AckFailureReason to a localized message suitable for failureReason payload. */
 function localizedAckFailureReason(reason: AckFailureReason): string {
