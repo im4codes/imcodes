@@ -206,6 +206,23 @@ describe('useTimeline window-isolated cache bounds', () => {
     expect(screen.getByTestId('window-local-seed').textContent).toBe('this window snapshot');
   });
 
+  it.each(['session', 'local'])('heals stable send duplicates on the first offline %s snapshot paint, without collapsing intentional repeats', (tier) => {
+    const sessionName = `deck_cached_identity_${tier}`;
+    const cacheKey = `srv:${sessionName}`;
+    const rows = makeEvents(sessionName, 4).map((event, index) => ({
+      ...event, type: 'user.message' as const,
+      payload: { text: 'Intentional same body', allowDuplicate: true, commandId: index < 3 ? 'one-send' : 'another-send' },
+    }));
+    (tier === 'session' ? sessionStorage : localStorage).setItem(`rcc_timeline_snapshot:${cacheKey}`, JSON.stringify(rows));
+    function Probe() {
+      const timeline = useTimeline(sessionName, null, 'srv');
+      return h('div', { 'data-testid': 'cold-identity' }, String(timeline.events.length));
+    }
+    render(h(Probe));
+    // No socket, awaited request or effect flush may be needed to heal first paint.
+    expect(screen.getByTestId('cold-identity').textContent).toBe('2');
+  });
+
   it('prefers this window raw-key seed over another window durable scoped seed', () => {
     const sessionName = `deck_window_scope_${Date.now()}`;
     const cacheKey = `srv:${sessionName}`;

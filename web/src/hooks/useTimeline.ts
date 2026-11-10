@@ -97,6 +97,7 @@ import { TimelineDB, type DrainCursor } from '../timeline-db.js';
 import { getTimelineStore, __resetTimelineStoresForTests } from '../stores/timeline-store.js';
 import {
   TIMELINE_DETAIL_FIELD_PATHS,
+  mergeTimelineEvents,
   mergeTimelineEventsWithTextPriority,
   preferTimelineEvent,
   type TimelineDetailFieldPath,
@@ -1028,7 +1029,7 @@ function loadTimelineSnapshotFromStorage(storage: Storage, cacheKey: string): Ti
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter((event): event is TimelineEvent => (
+    const events = parsed.filter((event): event is TimelineEvent => (
       !!event
       && typeof event === 'object'
       && typeof (event as TimelineEvent).eventId === 'string'
@@ -1036,7 +1037,12 @@ function loadTimelineSnapshotFromStorage(storage: Storage, cacheKey: string): Ti
       && typeof (event as TimelineEvent).sessionId === 'string'
       && typeof (event as TimelineEvent).ts === 'number'
       && typeof (event as TimelineEvent).payload === 'object'
+      && (event as TimelineEvent).payload !== null
     ));
+    // Old builds may have persisted alternate ids for one remote send. Heal
+    // that cold seed before its FIRST paint, even offline. No snapshot writes,
+    // text-based dedup, or extra per-streamed-event scan is introduced here.
+    return mergeTimelineEvents(events, [], events.length);
   } catch {
     return [];
   }
