@@ -1277,13 +1277,12 @@ describe('styles.css regression contracts', () => {
     expect(css).toMatch(/@media\s*\(pointer:\s*coarse\)[\s\S]*?\.remote-desktop-footer\s*\{[\s\S]*?height:\s*44px;[\s\S]*?min-height:\s*44px;[\s\S]*?max-height:\s*44px;[\s\S]*?overflow-y:\s*auto/);
   });
 
-  it('keeps the touch hint dismiss action interactive without enabling the overlay itself', () => {
+  it('keeps the remote-desktop hint overlay non-interactive and display:none when hidden', () => {
     const hintRule = css.match(/\.remote-desktop-touch-hint\s*\{[^}]*\}/)?.[0];
+    expect(hintRule).toBeTruthy();
     expect(hintRule).toMatch(/pointer-events:\s*none/);
-    const dismissRule = css.match(/\.remote-desktop-touch-hint-dismiss\s*\{[^}]*\}/)?.[0];
-    expect(dismissRule).toBeTruthy();
-    expect(dismissRule).toMatch(/pointer-events:\s*auto/);
-    expect(dismissRule).toMatch(/white-space:\s*nowrap/);
+    expect(css).toMatch(/\.remote-desktop-touch-hint\[hidden\],[\s\S]*?\.remote-desktop-footer\[hidden\]\s*\{[^}]*display:\s*none/);
+    expect(css).not.toMatch(/\.remote-desktop-touch-hint-dismiss\b/);
   });
 
   it('keeps the mobile collapsed task strip in normal titlebar flow', () => {

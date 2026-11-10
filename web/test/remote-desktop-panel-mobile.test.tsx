@@ -1757,8 +1757,13 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       resolve(dirname(fileURLToPath(import.meta.url)), '../src/styles.css'),
       'utf8',
     );
-    expect(container.querySelector('.remote-desktop-touch-hint')).not.toBeNull();
+    expect((container.querySelector('.remote-desktop-touch-hint') as HTMLElement).hidden).toBe(true);
     expect(container.querySelector('.remote-desktop-stats')).not.toBeNull();
+
+    act(() => {
+      (getByRole('button', { name: 'remote_desktop.mouse_mode' }) as HTMLButtonElement).click();
+    });
+    expect((container.querySelector('.remote-desktop-touch-hint') as HTMLElement).hidden).toBe(false);
 
     act(() => {
       (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click();
@@ -3353,33 +3358,50 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(queryByRole('button', { name: 'remote_desktop.touch_right_click' })).toBeNull();
   });
 
-  it('dismisses the touch hint per account and keeps the mouse hint behavior unchanged', async () => {
+  it('keeps the touch hint and Got it button hidden in touch mode across legacy prefs, resizes, and keyboard toggles while preserving mouse hint', async () => {
     const first = await renderPanel();
-    const hint = first.container.querySelector('.remote-desktop-touch-hint') as HTMLElement;
-    const dismiss = first.getByRole('button', { name: 'remote_desktop.touch_hint_dismiss' });
-    expect(hint.hidden).toBe(false);
-
-    await act(async () => {
-      fireEvent.click(dismiss);
-      await Promise.resolve();
-    });
-    expect(hint.hidden).toBe(true);
-    expect(localStorage.getItem('rcc_sync_remote_desktop_touch_hint_dismissed')).toContain('"v":true');
-    expect(fileApiMocks.saveUserPref).toHaveBeenCalledWith(
-      'remote_desktop_touch_hint_dismissed',
-      expect.stringContaining('"v":true'),
-    );
-
+    const firstHint = first.container.querySelector('.remote-desktop-touch-hint') as HTMLElement;
+    expect(firstHint.hidden).toBe(true);
+    expect(firstHint.textContent).toBe('');
+    expect(first.queryByRole('button', { name: 'remote_desktop.touch_hint_dismiss' })).toBeNull();
     first.unmount();
-    const reopened = await renderPanel();
-    expect((reopened.container.querySelector('.remote-desktop-touch-hint') as HTMLElement).hidden).toBe(true);
-    act(() => {
-      fireEvent.click(reopened.getByRole('button', { name: 'remote_desktop.mouse_mode' }));
-    });
-    const mouseHint = reopened.container.querySelector('.remote-desktop-touch-hint') as HTMLElement;
-    expect(mouseHint.hidden).toBe(false);
-    expect(reopened.queryByRole('button', { name: 'remote_desktop.touch_hint_dismiss' })).toBeNull();
-    expect(mouseHint.textContent).toContain('remote_desktop.mouse_hint');
+
+    for (const storedValue of ['{"v":false,"t":1}', '{"v":true,"t":1}']) {
+      localStorage.setItem('rcc_sync_remote_desktop_touch_hint_dismissed', storedValue);
+      fileApiMocks.getUserPref.mockResolvedValueOnce(storedValue as never);
+      const reopened = await renderPanel();
+      const hint = reopened.container.querySelector('.remote-desktop-touch-hint') as HTMLElement;
+      expect(hint.hidden).toBe(true);
+      expect(hint.textContent).toBe('');
+      expect(reopened.queryByRole('button', { name: 'remote_desktop.touch_hint_dismiss' })).toBeNull();
+
+      act(() => {
+        window.dispatchEvent(new Event('resize'));
+        window.dispatchEvent(new Event('remote-desktop-touch-hint-dismissed'));
+        (reopened.getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click();
+      });
+      expect(hint.hidden).toBe(true);
+      act(() => {
+        (reopened.getByRole('button', { name: 'remote_desktop.close_mobile_keyboard' }) as HTMLButtonElement).click();
+      });
+      expect(hint.hidden).toBe(true);
+      expect(reopened.queryByRole('button', { name: 'remote_desktop.touch_hint_dismiss' })).toBeNull();
+
+      act(() => {
+        fireEvent.click(reopened.getByRole('button', { name: 'remote_desktop.mouse_mode' }));
+      });
+      expect(hint.hidden).toBe(false);
+      expect(reopened.queryByRole('button', { name: 'remote_desktop.touch_hint_dismiss' })).toBeNull();
+      expect(hint.textContent).toContain('remote_desktop.mouse_hint');
+
+      act(() => {
+        fireEvent.click(reopened.getByRole('button', { name: 'remote_desktop.touch_mode' }));
+      });
+      expect(hint.hidden).toBe(true);
+      expect(hint.textContent).toBe('');
+      reopened.unmount();
+    }
+    expect(fileApiMocks.saveUserPref).not.toHaveBeenCalled();
   });
 
   it('provides a readable auto-zoomed virtual mouse with buttons, wheel, and edge pan', async () => {

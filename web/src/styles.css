@@ -12861,25 +12861,6 @@ button.quick-agent-delegation-preset.active {
   overflow-wrap: anywhere;
 }
 
-.remote-desktop-touch-hint-dismiss {
-  flex: 0 0 auto;
-  min-height: 22px;
-  padding: 2px 7px;
-  color: #dff4ff;
-  background: rgb(99 201 255 / 14%);
-  border: 1px solid rgb(99 201 255 / 32%);
-  border-radius: 999px;
-  font-size: 10px;
-  line-height: 1.2;
-  white-space: nowrap;
-  cursor: pointer;
-  pointer-events: auto;
-}
-
-.remote-desktop-touch-hint-dismiss:hover {
-  background: rgb(99 201 255 / 24%);
-}
-
 /* The phone keyboard already takes the lower half of the viewport. Remove
    secondary guidance and telemetry from layout while it is open so the stage
    receives every remaining pixel; the native hidden attribute also keeps
