@@ -1,6 +1,7 @@
 import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
 import { handleWebCommand, runWithProcessSessionSendLock, switchSessionModelNow } from '../../src/daemon/command-handler.js';
-import { SESSION_MODEL_APPLIED } from '../../shared/session-model-control.js';
+import { DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
+import { SESSION_MODEL_CONTROL_ERROR, SESSION_MODEL_APPLIED } from '../../shared/session-model-control.js';
 import { SESSION_MODEL_COMMAND } from '../../shared/session-control-commands.js';
 import { AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES } from '../../shared/agent-delegation.js';
 import { AGY_ACP_AGENT_NAME } from '../../shared/agy-agent.js';
@@ -105,6 +106,42 @@ describe('real AG ACP SDK/runtime/durable store/relay', () => {
     expect(getSession(NAME)).toMatchObject({ requestedModel: 'model-c', activeModel: 'model-c' });
     await vi.waitFor(() => expect(events.filter(event => event.type === 'usage.update' && typeof event.payload.model === 'string').at(-1)?.payload.model).toBe('model-c'));
     expect((await requests()).filter(row => row.fixture === 'prompt-model').at(-1).model).toBe('model-c');
+  });
+
+  it.each(['model-error', 'model-unsupported', 'model-timeout'])('keeps busy model refusal nonterminal through natural completion and the next send (%s)', async scenario => {
+    const runtime = getTransportRuntime(NAME)!, provider = getProvider(AGY_SDK_PROVIDER_ID)!;
+    await provider.connect({ binaryPath: path.join(root, 'agy'), env: { HOME: root, AGY_ACP_FIXTURE_AGENT_NAME: AGY_ACP_AGENT_NAME, AGY_ACP_FIXTURE_LOG: log, AGY_ACP_FIXTURE_SCENARIO: scenario } });
+    await writeFile(log + '.hold', 'hold');
+    try {
+      runtime.send('RUN_A', `model-refusal-${scenario}`);
+      await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/prompt')).toBe(true));
+      const nativeId = getSession(NAME)?.providerResumeId;
+      const result = await switchSessionModelNow(NAME, 'model-b');
+      expect(result).toMatchObject({ ok: false, code: SESSION_MODEL_CONTROL_ERROR.MODEL_SWITCH_FAILED });
+      expect(runtime.sending).toBe(true);
+      expect(getSession(NAME)).toMatchObject({ activeModel: 'model-a', providerResumeId: nativeId });
+      expect(getSession(NAME)?.requestedModel).not.toBe('model-b');
+      // The visible refusal is control feedback, not the still-running A's
+      // terminal. Exercise the real producer, not a handwritten timeline row.
+      expect(hasActiveTimelineTurn(events as any)).toBe(true);
+      expect(events.filter(event => event.type === 'assistant.text' && event.payload.noticeCode === DAEMON_USER_NOTICE_CODE.SESSION_INLINE_ERROR)).toEqual([
+        expect.objectContaining({ payload: expect.objectContaining({ streaming: false, automation: true, memoryExcluded: true, text: expect.any(String), noticeParams: expect.objectContaining({ detail: expect.any(String) }) }) }),
+      ]);
+      expect(finalized()).toHaveLength(0);
+    } finally { await unlink(log + '.hold'); }
+    await vi.waitFor(() => expect(runtime.sending).toBe(false), { timeout: 5000 });
+    expect(finalized()).toHaveLength(1);
+    expect(hasActiveTimelineTurn(events as any)).toBe(false);
+    runtime.send('AFTER_REFUSAL', `after-model-refusal-${scenario}`);
+    await vi.waitFor(() => expect(finalized()).toHaveLength(2), { timeout: 5000 });
+    await vi.waitFor(() => expect(runtime.sending).toBe(false));
+    expect(hasActiveTimelineTurn(events as any)).toBe(false);
+    expect(getSession(NAME)?.activeModel).toBe('model-a');
+    const rows = await requests();
+    expect(rows.filter(row => row.method === 'session/new')).toHaveLength(1);
+    expect(rows.some(row => row.method === 'session/cancel')).toBe(false);
+    expect(rows.filter(row => row.fixture === 'prompt-model').map(row => row.model)).toEqual(['model-a', 'model-a']);
+    expect(new Set(rows.filter(row => row.method === 'session/prompt').map(row => row.params.sessionId)).size).toBe(1);
   });
 
   it('rejects an older model intent whose catalogue lookup finishes after C', async () => {

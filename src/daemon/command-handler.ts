@@ -1236,6 +1236,7 @@ async function applyTransportEffortSwitch(
         { level: requested, supported, detail: `Supported: ${supported}` },
       ),
       streaming: false,
+      automation: true,
       memoryExcluded: true,
     }, { source: 'daemon', confidence: 'high' });
     return {
@@ -2939,9 +2940,11 @@ function isModelSwitchAgent(agentType: string | undefined): boolean {
 }
 
 function emitModelSwitchRefusal(sessionName: string, code: typeof DAEMON_USER_NOTICE_CODE[keyof typeof DAEMON_USER_NOTICE_CODE], text: string, model: string, detail?: string): void {
+  // A failed out-of-band control is not the native turn's terminal.
   timelineEmitter.emit(sessionName, 'assistant.text', {
     ...attachDaemonUserNotice(code, text, { model, ...(detail ? { detail } : {}) }),
     streaming: false,
+    automation: true,
     memoryExcluded: true,
   }, { source: 'daemon', confidence: 'high' });
 }
@@ -5396,6 +5399,7 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
         timelineEmitter.emit(sessionName, 'assistant.text', {
           ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.THINKING_LEVEL_UNSUPPORTED, `⚠️ ${errMsg}`, { level: nextEffort }),
           streaming: false,
+          automation: true,
           memoryExcluded: true,
         }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });

@@ -5301,6 +5301,9 @@ describe('handleWebCommand transport queue behavior', () => {
       getSessionMock.mockReturnValue({ name: 'deck_sub_bad_effort', projectName: 'p', role: 'w1', agentType: 'codex-sdk', runtimeType: 'transport', state: 'idle' });
       getTransportRuntimeMock.mockReturnValue(undefined);
       await expect(switchSessionThinkingNow('deck_sub_bad_effort', 'adaptive')).resolves.toMatchObject({ ok: false, code: 'unknown_thinking_level', availableThinkingLevels: ['low', 'medium', 'high', 'xhigh', 'max'] });
+      expect(emitMock).toHaveBeenCalledWith('deck_sub_bad_effort', 'assistant.text', expect.objectContaining({
+        noticeCode: DAEMON_USER_NOTICE_CODE.THINKING_LEVEL_UNSUPPORTED, streaming: false, automation: true, memoryExcluded: true,
+      }), expect.any(Object));
     });
 
     it('uses the selected Codex model metadata instead of accepting a global effort level', async () => {
@@ -6847,6 +6850,9 @@ describe('handleWebCommand transport queue behavior', () => {
       'command.ack',
       expect.objectContaining({ status: 'error', error: 'Unknown Grok model: invented-model' }),
     );
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'assistant.text', expect.objectContaining({
+      noticeCode: DAEMON_USER_NOTICE_CODE.UNKNOWN_MODEL, streaming: false, automation: true, memoryExcluded: true,
+    }), expect.any(Object));
   });
 
   it('switches model for cursor-headless transport sessions via /model', async () => {
@@ -6924,6 +6930,9 @@ describe('handleWebCommand transport queue behavior', () => {
       status: 'error',
       error: expect.stringContaining('Qoder model switching is proof-gated'),
     }));
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'assistant.text', expect.objectContaining({
+      noticeCode: DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PROOF_GATED, streaming: false, automation: true, memoryExcluded: true,
+    }), expect.any(Object));
   });
 
   it('rejects qoder-sdk thinking controls without forwarding them as prompts', async () => {
@@ -6962,6 +6971,9 @@ describe('handleWebCommand transport queue behavior', () => {
         error: expect.stringContaining('Qoder thinking/effort controls are proof-gated'),
       }),
     );
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'assistant.text', expect.objectContaining({
+      noticeCode: DAEMON_USER_NOTICE_CODE.THINKING_LEVEL_UNSUPPORTED, streaming: false, automation: true, memoryExcluded: true,
+    }), expect.any(Object));
   });
 
   it('reports effective daemon memory feature states including server runtime override and fallback config', async () => {
