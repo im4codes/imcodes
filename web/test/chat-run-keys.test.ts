@@ -146,7 +146,7 @@ describe('incremental item invalidation', () => {
     const simple = __buildViewItemsForTests([call, replacement], false);
     expect(simple[0].type).toBe('tool-activity');
     const reordered = __buildViewItemsForTests([replacement, call], true);
-    expect(reordered[0].event).toBe(replacement);
+    expect(reordered[0].toolEvents).toEqual([replacement, call]);
     expect(__buildViewItemsForTests([call, replacement], true)[0].event?.payload._resultPayloadOutput).toBe('after');
   });
 });
