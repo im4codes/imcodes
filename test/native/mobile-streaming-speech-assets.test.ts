@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
+import { STREAMING_SPEECH_PLUGIN_NAME } from '../../shared/voice-recognition.js';
 // Build tooling is intentionally plain ESM so Gradle/CI do not require tsx.
 // @ts-ignore plain build script
 import { matchesAsset, prepareSpeechAssets, SPEECH_ASSETS } from '../../web/scripts/prepare-streaming-speech.mjs';
@@ -14,6 +15,13 @@ const bytes = Buffer.from('offline-model');
 const digest = createHash('sha256').update(bytes).digest('hex');
 const asset = ['models/test.onnx', 'https://example.invalid/pinned/model', digest, bytes.length];
 describe('shared mobile model preparation', () => {
+  it('binds both native registrations to the shared Capacitor name', async () => {
+    const base = new URL('../../web/plugins/streaming-speech/', import.meta.url);
+    const android = await readFile(new URL('android/src/main/java/com/imcodes/speech/StreamingSpeechPlugin.java', base), 'utf8');
+    const ios = await readFile(new URL('ios/Sources/StreamingSpeechPlugin/StreamingSpeechPlugin.swift', base), 'utf8');
+    expect(android).toContain(`@CapacitorPlugin(name = "${STREAMING_SPEECH_PLUGIN_NAME}"`);
+    expect(ios).toContain(`jsName = "${STREAMING_SPEECH_PLUGIN_NAME}"`);
+  });
   it('pins exact INT8 bytes/version and never downloads the 1GB full archive', () => {
     expect(SPEECH_ASSETS).toHaveLength(4);
     expect(SPEECH_ASSETS.every((a: any) => /^[a-f\d]{64}$/.test(a[2]) && a[1].startsWith('https://'))).toBe(true);
