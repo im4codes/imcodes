@@ -40,6 +40,7 @@ import {
 } from '@shared/session-group-clone.js';
 import {
   TIMELINE_MESSAGES,
+  TIMELINE_ASSISTANT_TEXT_EVENT_TYPE,
   TIMELINE_PROTOCOL_CAPABILITY,
   TIMELINE_PROTOCOL_REVISION,
   TIMELINE_TERMINAL_SESSION_STATES,
@@ -546,6 +547,11 @@ export class WsClient {
    * snapshots, not durable content; retaining every intermediate frame while
    * a reconnect backlog drains turns a burst into a render storm. */
   private pendingTimelineCoalesced = new Map<string, TimelineEventMessage>();
+  /** Only the current undelivered stream segment for each session. Its text
+   * is cumulative, so retaining every intermediate copy can consume hundreds
+   * of MB while background timers are suspended. Any same-session content or
+   * lifecycle boundary retires the segment; durable event ordering is kept. */
+  private pendingTimelineStreams = new Map<string, TimelineEventMessage>();
   private timelineEventFlushTimer: ReturnType<typeof setTimeout> | null = null;
   private timelineEventsSinceYield = 0;
   private _pingLatency: number | null = null;
@@ -720,6 +726,7 @@ export class WsClient {
     this.timelineEventFlushTimer = null;
     this.pendingTimelineEvents = [];
     this.pendingTimelineCoalesced.clear();
+    this.pendingTimelineStreams.clear();
     this.timelineEventsSinceYield = 0;
     this._connecting = false;
     this.clearTimers();
@@ -2741,6 +2748,30 @@ export class WsClient {
       this.timelineEventsSinceYield += 1;
       return false;
     }
+    const event = msg.event;
+    const sessionId = typeof event?.sessionId === 'string' ? event.sessionId : '';
+    const streamSnapshot = event?.type === TIMELINE_ASSISTANT_TEXT_EVENT_TYPE
+      && event.payload?.streaming === true && typeof event.payload.text === 'string'
+      // Only the daemon's plain cumulative text shape is replaceable. Partial,
+      // hydrated, hidden or metadata-bearing revisions retain normal delivery.
+      && Object.keys(event.payload).every(key => key === 'text' || key === 'streaming')
+      && !event.completeness && !event.timelineCompleteness && !event.detailRefs?.length
+      && event.summary !== true && event.hidden !== true
+      && !!sessionId && typeof event.eventId === 'string' && !!event.eventId
+      && Number.isFinite(event.epoch) && Number.isFinite(event.seq);
+    const previousStream = this.pendingTimelineStreams.get(sessionId);
+    if (streamSnapshot && previousStream
+      && previousStream.event.eventId === event.eventId
+      && previousStream.event.epoch === event.epoch
+      && previousStream.event.seq < event.seq) {
+      // This queue node has never been dispatched. Replace its complete
+      // snapshot in O(1), not its text as a delta. Other sessions are unrelated;
+      // a different message/epoch or a durable event in this session is a barrier.
+      previousStream.event = event;
+      return true;
+    }
+    this.pendingTimelineStreams.delete(sessionId);
+    if (streamSnapshot) this.pendingTimelineStreams.set(sessionId, msg);
     const eventType = msg.event?.type;
     const terminalSessionState = eventType === 'session.state'
       && TIMELINE_TERMINAL_SESSION_STATES.includes(
@@ -2778,11 +2809,15 @@ export class WsClient {
     if (this._destroyed) {
       this.pendingTimelineEvents = [];
       this.pendingTimelineCoalesced.clear();
+      this.pendingTimelineStreams.clear();
       this.timelineEventsSinceYield = 0;
       return;
     }
     const batch = this.pendingTimelineEvents.splice(0, TIMELINE_EVENT_FLUSH_BATCH);
     for (const event of batch) {
+      if (this.pendingTimelineStreams.get(event.event.sessionId) === event) {
+        this.pendingTimelineStreams.delete(event.event.sessionId);
+      }
       const eventType = event.event?.type;
       const terminalSessionState = eventType === 'session.state'
         && TIMELINE_TERMINAL_SESSION_STATES.includes(

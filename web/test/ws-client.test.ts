@@ -5,7 +5,7 @@ import { P2P_WORKFLOW_MSG, isP2pWorkflowRequestId } from '@shared/p2p-workflow-m
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import { ASK_ANSWER_ACK_CAPABILITY_V1 } from '@shared/ask-answer.js';
 import { REPO_MSG } from '@shared/repo-types.js';
-import { TIMELINE_MESSAGES, TIMELINE_PROTOCOL_CAPABILITY } from '@shared/timeline-protocol.js';
+import { TIMELINE_MESSAGES, TIMELINE_PROTOCOL_CAPABILITY, TIMELINE_ASSISTANT_TEXT_EVENT_TYPE } from '@shared/timeline-protocol.js';
 import { FS_TRANSPORT_MSG } from '@shared/fs-transport-messages.js';
 import { FS_GENERIC_ERROR_CODES } from '@shared/fs-error-codes.js';
 import { FS_WRITE_MAX_BYTES } from '@shared/fs-write-limits.js';
@@ -938,6 +938,107 @@ describe('WsClient', () => {
 
     client.disconnect();
     vi.useRealTimers();
+  });
+
+  describe('queued cumulative stream snapshots', () => {
+    async function start() {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      const delivered: Array<Record<string, any>> = [];
+      client.onMessage(msg => { if (msg.type === TIMELINE_MESSAGES.EVENT) delivered.push(msg.event); });
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      const socket = lastWs!;
+      socket.emit('open');
+      const send = (seq: number, changes: Record<string, unknown> = {}) => {
+        socket.emit('message', { data: JSON.stringify({ type: TIMELINE_MESSAGES.EVENT, event: {
+          sessionId: 's1', eventId: 'stream', epoch: 1, seq,
+          type: TIMELINE_ASSISTANT_TEXT_EVENT_TYPE,
+          payload: { text: `snapshot-${seq}`, streaming: true }, ...changes,
+        } }) });
+      };
+      return { client, delivered, send };
+    }
+
+    it('retains one undelivered snapshot, without mutating a previously delivered one', async () => {
+      const { client, delivered, send } = await start();
+      try {
+        for (let i = 0; i < 1_500; i++) send(i);
+        expect((client as unknown as { pendingTimelineEvents: unknown[] }).pendingTimelineEvents).toHaveLength(1);
+        expect(delivered).toHaveLength(1);
+        expect(delivered[0].payload.text).toBe('snapshot-0');
+        await vi.advanceTimersByTimeAsync(10);
+        expect(delivered.map(event => event.payload.text)).toEqual(['snapshot-0', 'snapshot-1499']);
+        send(1500);
+        await vi.advanceTimersByTimeAsync(10);
+        expect(delivered.map(event => event.payload.text)).toEqual(['snapshot-0', 'snapshot-1499', 'snapshot-1500']);
+      } finally { client.disconnect(); }
+    });
+
+    it('coalesces interleaved sessions independently, including identical message IDs', async () => {
+      const { client, delivered, send } = await start();
+      try {
+        send(0, { type: 'user.message', payload: { text: 'bootstrap' } });
+        send(1); send(1, { sessionId: 's2' }); send(2); send(2, { sessionId: 's2' });
+        await vi.advanceTimersByTimeAsync(10);
+        expect(delivered.slice(1).map(event => [event.sessionId, event.seq])).toEqual([['s1', 2], ['s2', 2]]);
+      } finally { client.disconnect(); }
+    });
+
+    it('keeps every snapshot live when the consumer is keeping up', async () => {
+      const { client, delivered, send } = await start();
+      try {
+        for (let i = 0; i < 10; i++) {
+          send(i);
+          await vi.advanceTimersByTimeAsync(10);
+        }
+        expect(delivered.map(event => event.seq)).toEqual(Array.from({ length: 10 }, (_, i) => i));
+      } finally { client.disconnect(); }
+    });
+
+    it.each(['tool.call', 'tool.result', 'user.message', 'session.state'])('preserves the %s barrier and final text/metadata', async (type) => {
+      const { client, delivered, send } = await start();
+      try {
+        send(0, { type: 'user.message', payload: { text: 'bootstrap' } });
+        send(1); send(2);
+        send(3, { type, eventId: 'boundary', payload: { state: 'idle', text: 'durable' } });
+        send(4); send(5);
+        send(6, { payload: { text: 'FINAL', streaming: false, retainedMetadata: 'yes' } });
+        await vi.advanceTimersByTimeAsync(20);
+        expect(delivered.map(event => event.seq)).toEqual([0, 2, 3, 5, 6]);
+        expect(delivered.at(-1)?.payload).toEqual({ text: 'FINAL', streaming: false, retainedMetadata: 'yes' });
+      } finally { client.disconnect(); }
+    });
+
+    it('does not merge epochs, distinct messages or backwards sequence revisions', async () => {
+      const { client, delivered, send } = await start();
+      try {
+        send(0, { type: 'user.message', payload: { text: 'bootstrap' } });
+        send(10); send(11, { epoch: 2 }); send(12, { eventId: 'other' });
+        send(12, { eventId: 'other', ts: 1 }); send(9, { eventId: 'other' });
+        await vi.advanceTimersByTimeAsync(20);
+        expect(delivered.map(event => event.seq)).toEqual([0, 10, 11, 12, 12, 9]);
+      } finally { client.disconnect(); }
+    });
+
+    it.each([{ eventId: '' }, { sessionId: '' }, { epoch: undefined }, { seq: undefined }, { payload: { streaming: true, delta: 'not a complete text snapshot' } }, { completeness: 'preview' }, { payload: { streaming: true, text: 'partial', payloadTruncated: true } }, { summary: true }, { hidden: true }])('keeps legacy or non-snapshot data unmodified: %j', async (changes) => {
+      const { client, delivered, send } = await start();
+      try {
+        send(0, { type: 'user.message', payload: { text: 'bootstrap' } });
+        send(1, changes); send(2, changes);
+        await vi.advanceTimersByTimeAsync(10);
+        expect(delivered).toHaveLength(3);
+      } finally { client.disconnect(); }
+    });
+
+    it('drops both the queue and its stream references on disconnect', async () => {
+      const { client, delivered, send } = await start();
+      send(0); send(1);
+      client.disconnect();
+      await vi.advanceTimersByTimeAsync(10);
+      expect(delivered).toHaveLength(1);
+      expect((client as unknown as { pendingTimelineStreams: Map<string, unknown> }).pendingTimelineStreams.size).toBe(0);
+    });
   });
 
   it('keeps full-mode transient status frames live', async () => {
