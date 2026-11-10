@@ -48,6 +48,7 @@ describe('AGY historical error multi-turn E2E (TransportSessionRuntime -> wirePr
 const fs = require('node:fs');
 const args = process.argv.slice(2);
 const logFile = ${JSON.stringify(logPath)};
+if (args[0] === '--version') { process.stdout.write('1.4.12\\n'); process.exit(0); }
 if (args[0] === '--help') {
   process.stdout.write('Usage of agy:\\n');
   process.exit(0);

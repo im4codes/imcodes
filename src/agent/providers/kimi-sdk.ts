@@ -172,6 +172,12 @@ export interface AcpCliProviderProfile {
    *  an implicit queue entry. Omitted for agents whose busy-prompt contract
    *  accepts the text directly. */
   activePromptPrefix?: `/${string} `;
+  /** Another prompt steers the SAME run. Superseded RPC replies are not turns. */
+  steeringPrompts?: boolean;
+  /** Prefer session/resume (no history replay) over session/load. */
+  resumeWithoutReplay?: boolean;
+  /** Defer model selection until idle, and fail rather than run a wrong model. */
+  strictModelSelection?: boolean;
   runtimeSubagent?: {
     provider: SdkSubagentProvider;
     providerKind: SdkSubagentProviderKind;
@@ -208,6 +214,12 @@ interface KimiSdkSessionState {
   env?: Record<string, string>;
   contextNamespace?: SessionConfig['contextNamespace'];
   model?: string;
+  confirmedModel?: string;
+  beforeNativeSessionStart?: SessionConfig['beforeNativeSessionStart'];
+  /** Highest steering RPC's terminal wins even if replies arrive out of order. */
+  steeringTerminal?: { generation: number; stopReason: StopReason };
+  steeringFailure?: unknown;
+  steeringUsage?: Record<string, number>;
   /** ACP-level session identifier returned by `newSession` or supplied for
    *  resume. Undefined until the first send actually creates/loads a session. */
   acpSessionId?: string;
@@ -333,6 +345,14 @@ export class KimiSdkProvider implements TransportProvider {
     };
   }
 
+  getCachedModels(): ProviderModelList | null {
+    return this.cachedModels?.length ? {
+      models: this.cachedModels,
+      ...(this.cachedDefaultModel ? { defaultModel: this.cachedDefaultModel } : {}),
+      isAuthenticated: true,
+    } : null;
+  }
+
   async connect(config: ProviderConfig): Promise<void> {
     await this.startAcpServer(config);
     this.config = config;
@@ -418,7 +438,14 @@ export class KimiSdkProvider implements TransportProvider {
 
   async createSession(config: SessionConfig): Promise<string> {
     const routeId = config.bindExistingKey ?? config.sessionKey;
-    const existing = config.fresh ? undefined : this.sessions.get(routeId);
+    const prior = this.sessions.get(routeId);
+    const existing = config.fresh ? undefined : prior;
+    if (this.profile.steeringPrompts && existing
+      && (!config.resumeId || config.resumeId === existing.acpSessionId)) {
+      existing.model = typeof config.agentId === 'string' ? config.agentId : existing.model;
+      existing.beforeNativeSessionStart = config.beforeNativeSessionStart ?? existing.beforeNativeSessionStart;
+      return routeId;
+    }
     const state: KimiSdkSessionState = {
       routeId,
       sessionName: config.sessionName ?? existing?.sessionName,
@@ -428,6 +455,8 @@ export class KimiSdkProvider implements TransportProvider {
       env: config.env ?? existing?.env,
       contextNamespace: config.contextNamespace ?? existing?.contextNamespace,
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
+      confirmedModel: existing?.confirmedModel,
+      beforeNativeSessionStart: config.beforeNativeSessionStart ?? existing?.beforeNativeSessionStart,
       acpSessionId: config.resumeId ?? existing?.acpSessionId,
       loaded: false,
       modeApplied: false,
@@ -446,8 +475,8 @@ export class KimiSdkProvider implements TransportProvider {
       lastStatusSignature: null,
       sessionSystemTextInjected: existing?.sessionSystemTextInjected,
     };
-    if (existing?.acpSessionId && existing.acpSessionId !== state.acpSessionId) {
-      this.releaseAcpRoute(existing.acpSessionId, routeId);
+    if (prior?.acpSessionId && prior.acpSessionId !== state.acpSessionId) {
+      this.releaseAcpRoute(prior.acpSessionId, routeId);
     }
     this.sessions.set(routeId, state);
     if (state.acpSessionId) {
@@ -587,6 +616,7 @@ export class KimiSdkProvider implements TransportProvider {
     const state = this.sessions.get(sessionId);
     if (!state) return;
     state.model = agentId;
+    if (this.profile.strictModelSelection) return;
     // If session already loaded, best-effort push the model change via the
     // experimental RPC. Swallow errors: if the CLI version predates it,
     // subsequent prompts still use the original model — still correct, just
@@ -632,6 +662,8 @@ export class KimiSdkProvider implements TransportProvider {
     }
 
     state.cancelled = false;
+    state.steeringUsage = undefined;
+    state.lastTurnUsage = undefined;
     // NOTE: currentText/currentMessageId are cleared AFTER ensureSessionReady
     // inside startTurn — not here. `loadSession` replays the full conversation
     // history as `agent_message_chunk` notifications, and if we cleared before
@@ -663,8 +695,9 @@ export class KimiSdkProvider implements TransportProvider {
 
   async cancel(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
-    if (!state?.acpSessionId || !state.promptInFlight || !this.connection) return;
+    if (!state || !state.promptInFlight) return;
     state.cancelled = true;
+    if (!state.acpSessionId || !this.connection) return;
     this.cancelPendingApprovals(sessionId);
     // `cancel` is a one-shot notification; the pending prompt() Promise will
     // then resolve with stopReason='cancelled' (or occasionally the agent
@@ -771,6 +804,8 @@ export class KimiSdkProvider implements TransportProvider {
       });
       this.promptTerminals.set(state, queuedPrompt);
       void queuedPrompt.then((result) => {
+        if (this.profile.steeringPrompts && !state.activePromptGenerations?.has(queuedGeneration)) return;
+        this.capturePromptUsage(state, result);
         if (result.stopReason === 'cancelled') {
           logger.debug({ provider: this.id, sessionId }, 'ACP active-turn queued prompt later settled as cancelled');
         }
@@ -802,7 +837,11 @@ export class KimiSdkProvider implements TransportProvider {
         }
         return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
       }
-      state.promptSubmittedGeneration = queuedGeneration;
+      if (this.sessions.get(sessionId) !== state || state.cancelled || this.connection !== connection) {
+        // The write is already native-visible: never return STALE and replay it.
+        return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
+      }
+      if (state.promptInFlight) state.promptSubmittedGeneration = queuedGeneration;
       return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
     } catch (error) {
       logger.debug({
@@ -863,7 +902,7 @@ export class KimiSdkProvider implements TransportProvider {
     });
 
     child.on('exit', (code, signal) => {
-      if (this.isDisconnecting) return;
+      if (this.isDisconnecting || this.child !== child) return;
       const err = new Error(`${this.profile.displayName} ACP server exited with code=${code} signal=${signal}`);
       this.cancelPendingApprovals();
       const sessions = [...this.sessions.keys()];
@@ -880,7 +919,7 @@ export class KimiSdkProvider implements TransportProvider {
       this.sessionListSupported = false;
     });
     child.on('error', (err) => {
-      if (this.isDisconnecting) return;
+      if (this.isDisconnecting || this.child !== child) return;
       logger.error(
         { provider: this.id, errorCode: (err as NodeJS.ErrnoException).code ?? 'spawn_failed' },
         `${this.profile.displayName} ACP spawn error`,
@@ -923,7 +962,7 @@ export class KimiSdkProvider implements TransportProvider {
     // Construct the ACP connection. The callback receives the Agent handle we
     // can use to call RPC methods; we return a Client impl that handles
     // reverse RPC (requestPermission + session notifications).
-    this.connection = new ClientSideConnection(() => this.createClientImpl(), stream);
+    this.connection = new ClientSideConnection(() => this.createClientImpl(child), stream);
 
     // Kick off initialize once; all subsequent calls await the same promise.
     this.initPromise = (async () => {
@@ -979,11 +1018,12 @@ export class KimiSdkProvider implements TransportProvider {
 
   /** Build the Client impl passed to ClientSideConnection. The SDK invokes
    *  these methods when the agent sends us requests/notifications. */
-  private createClientImpl(): AcpClient {
+  private createClientImpl(child?: ChildProcessWithoutNullStreams): AcpClient {
     return {
       requestPermission: async (
         params: RequestPermissionRequest,
       ): Promise<RequestPermissionResponse> => {
+        if (child && this.child !== child) return { outcome: { outcome: 'cancelled' } };
         if (this.profile.approval === 'bridge') {
           return this.bridgePermissionRequest(params);
         }
@@ -1006,7 +1046,7 @@ export class KimiSdkProvider implements TransportProvider {
         return { outcome: { outcome: 'cancelled' } };
       },
       sessionUpdate: async (params: SessionNotification): Promise<void> => {
-        this.handleSessionUpdate(params);
+        if (!child || this.child === child) this.handleSessionUpdate(params);
       },
       extNotification: async (method: string, _params: Record<string, unknown>): Promise<void> => {
         if (method === '_x.ai/models/update' && _params && typeof _params === 'object') {
@@ -1051,6 +1091,7 @@ export class KimiSdkProvider implements TransportProvider {
     (state.activePromptGenerations ??= new Set()).add(generation);
     try {
       await this.ensureSessionReady(sessionId, state);
+      this.assertCurrentSession(sessionId, state);
       // Start the turn's delta buffer clean. (During loadSession the replay
       // flag already suppresses accumulation; this belt-and-suspenders reset
       // also catches any stray state left by a prior turn that errored out
@@ -1077,6 +1118,8 @@ export class KimiSdkProvider implements TransportProvider {
       });
       this.promptTerminals.set(state, turn);
       void turn.then((result: PromptResponse) => {
+        if (this.profile.steeringPrompts && !state.activePromptGenerations?.has(generation)) return;
+        this.capturePromptUsage(state, result);
         this.settleTurn(
           sessionId,
           state,
@@ -1100,11 +1143,27 @@ export class KimiSdkProvider implements TransportProvider {
         && state.settledGeneration !== generation
         && state.promptInFlight) {
         state.promptSubmittedGeneration = generation;
+        if (this.profile.strictModelSelection && state.confirmedModel) {
+          this.emitSessionInfo(sessionId, { model: state.confirmedModel });
+        }
       }
     } catch (err) {
       this.failTurn(sessionId, state, generation, err);
       throw this.normalizeError(err);
     }
+  }
+
+  private capturePromptUsage(state: KimiSdkSessionState, result: PromptResponse): void {
+    if (!this.profile.steeringPrompts || !result.usage) return;
+    const usage = result.usage as unknown as Record<string, unknown>;
+    const total = state.steeringUsage ??= {};
+    // Superseded AG RPCs can carry the tokens spent BEFORE steering. The
+    // latest RPC accounts only its continuation, not the entire run.
+    for (const field of ['inputTokens', 'outputTokens', 'cachedReadTokens', 'cachedWriteTokens', 'thoughtTokens', 'totalTokens']) {
+      const value = usage[field];
+      if (typeof value === 'number' && Number.isFinite(value) && value >= 0) total[field] = (total[field] ?? 0) + value;
+    }
+    state.lastTurnUsage = total;
   }
 
   private failTurn(
@@ -1113,7 +1172,18 @@ export class KimiSdkProvider implements TransportProvider {
     generation: number,
     error: unknown,
   ): void {
-    if (state.settledGeneration >= generation) return;
+    if (this.sessions.get(sessionId) !== state) return;
+    if (this.profile.steeringPrompts) {
+      if (!state.activePromptGenerations?.delete(generation)) return;
+      state.steeringFailure ??= error;
+      // A rejected steering request is NOT proof that the original task or
+      // another admitted prompt stopped. Retain busy/text/tools until all
+      // native RPCs settle (connection death rejects them all as well).
+      if (state.activePromptGenerations.size > 0) return;
+      error = state.steeringFailure;
+      state.steeringFailure = undefined;
+      state.steeringTerminal = undefined;
+    } else if (state.settledGeneration >= generation) return;
     state.settledGeneration = state.turnGeneration;
     state.activePromptGenerations?.clear();
     state.promptInFlight = false;
@@ -1128,23 +1198,35 @@ export class KimiSdkProvider implements TransportProvider {
     this.emitError(sessionId, this.normalizeError(error));
   }
 
+  private assertCurrentSession(sessionId: string, state: KimiSdkSessionState, connection = this.connection): void {
+    if (this.sessions.get(sessionId) !== state || state.cancelled || !connection || this.connection !== connection) {
+      throw this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'ACP session owner changed or stopped', true);
+    }
+  }
+
   /** Create the session on the agent if it doesn't exist yet, otherwise
    *  resume it. Applies Kimi's `default` mode once per session. */
   private async ensureSessionReady(
     sessionId: string,
     state: KimiSdkSessionState,
   ): Promise<void> {
-    if (!this.connection) {
+    const connection = this.connection;
+    if (!connection) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, `${this.profile.displayName} ACP connection not ready`, false);
     }
     await this.initPromise;
+    this.assertCurrentSession(sessionId, state, connection);
 
     if (!state.loaded) {
+      await state.beforeNativeSessionStart?.();
+      this.assertCurrentSession(sessionId, state, connection);
       if (state.acpSessionId) {
         // Resume an existing session (survives across CLI restarts via
         // ~/.kimi/tmp/<project>/chats/<id>.json).
         try {
-          const loader = (this.connection as AcpAgent).loadSession;
+          const loader = this.profile.resumeWithoutReplay
+            ? (this.connection as AcpAgent).resumeSession
+            : (this.connection as AcpAgent).loadSession;
           if (typeof loader !== 'function') {
             throw new Error('Agent does not implement loadSession (capability mismatch)');
           }
@@ -1163,6 +1245,7 @@ export class KimiSdkProvider implements TransportProvider {
           } finally {
             state.replaying = false;
           }
+          this.assertCurrentSession(sessionId, state, connection);
           state.loaded = true;
           this.cacheModelsFromSessionResponse(loadResult);
           this.applySessionMetadata(sessionId, state, loadResult);
@@ -1201,33 +1284,49 @@ export class KimiSdkProvider implements TransportProvider {
           }, 'setSessionMode(default) failed (non-fatal)');
         });
       }
+      this.assertCurrentSession(sessionId, state, connection);
       state.modeApplied = true;
     }
 
-    // If the caller specified a model, push it once per turn so we follow
-    // setSessionAgentId calls that happened before the session was loaded.
-    if (state.model && state.acpSessionId && this.connection) {
+    if (this.profile.strictModelSelection) {
+      // Capture the selection for this idle-to-running transition. A concurrent
+      // selection remains pending for the NEXT native turn, never mislabeled.
+      const requested = state.model;
+      if (requested && requested !== state.confirmedModel) {
+        const setter = this.connection?.unstable_setSessionModel;
+        if (!setter) throw this.makeError(PROVIDER_ERROR_CODES.CONFIG_ERROR, 'ACP model selection unsupported', false);
+        await setter.call(this.connection, { sessionId: state.acpSessionId!, modelId: requested });
+        this.assertCurrentSession(sessionId, state, connection);
+        state.confirmedModel = requested;
+      }
+    } else if (state.model && state.acpSessionId && this.connection) {
       const modelSetter = (this.connection as AcpAgent).unstable_setSessionModel;
       if (typeof modelSetter === 'function') {
         await modelSetter.call(this.connection, {
           sessionId: state.acpSessionId,
           modelId: state.model,
         }).catch((err: unknown) => {
-          logger.debug({
-            provider: this.id,
-            sessionId,
-            ...this.errorLogFields(err, 'err'),
-          }, 'unstable_setSessionModel pre-turn failed (non-fatal)');
+          logger.debug({ provider: this.id, sessionId, ...this.errorLogFields(err, 'err') },
+            'unstable_setSessionModel pre-turn failed (non-fatal)');
         });
       }
     }
+    this.assertCurrentSession(sessionId, state, connection);
   }
 
   private async createFreshAcpSession(sessionId: string, state: KimiSdkSessionState): Promise<void> {
-    const result: NewSessionResponse = await this.connection!.newSession({
+    this.assertCurrentSession(sessionId, state);
+    const connection = this.connection!;
+    const result: NewSessionResponse = await connection.newSession({
       cwd: state.cwd,
       mcpServers: this.mcpServersForState(state),
     });
+    if (this.sessions.get(sessionId) !== state || state.cancelled || this.connection !== connection) {
+      // session/new crossed the native boundary before Stop/rebind. Release
+      // only this newly created worker, never publish its ID to a newer owner.
+      void connection.closeSession({ sessionId: result.sessionId }).catch(() => {});
+      throw this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'ACP new session owner changed or stopped', true);
+    }
     state.acpSessionId = result.sessionId;
     state.loaded = true;
     state.modeApplied = false;
@@ -1339,6 +1438,9 @@ export class KimiSdkProvider implements TransportProvider {
   ): void {
     if (!info) return;
     const currentModel = info.models?.currentModelId;
+    if (this.profile.strictModelSelection && typeof currentModel === 'string') {
+      state.confirmedModel = currentModel;
+    }
     if (typeof currentModel === 'string' && !state.model) {
       state.model = currentModel;
       this.emitSessionInfo(sessionId, { model: currentModel });
@@ -1379,15 +1481,35 @@ export class KimiSdkProvider implements TransportProvider {
     sessionSystemTextToCommit?: string,
     compactControl = false,
   ): void {
-    if (state.settledGeneration >= generation) return;
-    state.settledGeneration = generation;
-    state.activePromptGenerations?.delete(generation);
-    const hasRemainingPrompts = (state.activePromptGenerations?.size ?? 0) > 0;
-    if (!hasRemainingPrompts) {
+    if (this.sessions.get(sessionId) !== state) return;
+    let steeringFailure: unknown;
+    if (this.profile.steeringPrompts) {
+      if (!state.activePromptGenerations?.delete(generation)) return;
+      if (!state.steeringTerminal || generation > state.steeringTerminal.generation) {
+        state.steeringTerminal = { generation, stopReason };
+      }
+      state.settledGeneration = Math.max(state.settledGeneration, generation);
+      if (sessionSystemTextToCommit) state.sessionSystemTextInjected = sessionSystemTextToCommit;
+      // AG retires superseded prompt RPCs immediately. They are NOT assistant
+      // completions and must not clear streamed text/tools or drain the FIFO.
+      if (state.activePromptGenerations.size > 0) return;
+      stopReason = state.steeringTerminal.stopReason;
+      state.steeringTerminal = undefined;
+      steeringFailure = state.steeringFailure;
+      state.steeringFailure = undefined;
       state.promptInFlight = false;
       state.promptSubmittedGeneration = null;
     } else {
-      state.promptSubmittedGeneration = state.turnGeneration;
+      if (state.settledGeneration >= generation) return;
+      state.settledGeneration = generation;
+      state.activePromptGenerations?.delete(generation);
+      const hasRemainingPrompts = (state.activePromptGenerations?.size ?? 0) > 0;
+      if (!hasRemainingPrompts) {
+        state.promptInFlight = false;
+        state.promptSubmittedGeneration = null;
+      } else {
+        state.promptSubmittedGeneration = state.turnGeneration;
+      }
     }
     this.clearStatus(sessionId, state);
     const text = state.currentText;
@@ -1398,6 +1520,10 @@ export class KimiSdkProvider implements TransportProvider {
     state.emittedToolSignatures.clear();
     this.cancelPendingApprovals(sessionId);
 
+    if (steeringFailure !== undefined) {
+      this.emitError(sessionId, this.normalizeError(steeringFailure));
+      return;
+    }
     if (stopReason === 'cancelled' || state.cancelled) {
       state.cancelled = false;
       state.activePromptGenerations?.clear();
@@ -1438,7 +1564,8 @@ export class KimiSdkProvider implements TransportProvider {
         status: 'complete',
         metadata: {
           stopReason,
-          ...(state.model ? { model: state.model } : {}),
+          ...((this.profile.strictModelSelection ? state.confirmedModel : state.model)
+            ? { model: this.profile.strictModelSelection ? state.confirmedModel : state.model } : {}),
           ...(state.acpSessionId ? { resumeId: state.acpSessionId } : {}),
           ...(turnUsage ? { usage: turnUsage } : {}),
         },
@@ -1459,7 +1586,8 @@ export class KimiSdkProvider implements TransportProvider {
       status: 'complete',
       metadata: {
         ...(compactControl ? { [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact' } : {}),
-        ...(state.model ? { model: state.model } : {}),
+        ...((this.profile.strictModelSelection ? state.confirmedModel : state.model)
+            ? { model: this.profile.strictModelSelection ? state.confirmedModel : state.model } : {}),
         ...(state.acpSessionId ? { resumeId: state.acpSessionId } : {}),
         ...(turnUsage ? { usage: turnUsage } : {}),
       },
@@ -1473,7 +1601,7 @@ export class KimiSdkProvider implements TransportProvider {
     const routeId = this.acpToRoute.get(params.sessionId);
     if (!routeId) return;
     const state = this.sessions.get(routeId);
-    if (!state) return;
+    if (!state || state.acpSessionId !== params.sessionId) return;
 
     const update = params.update as SessionUpdate;
     // While loadSession is replaying history, drop every turn-scoped event.
@@ -1911,7 +2039,11 @@ export class KimiSdkProvider implements TransportProvider {
     state.activePromptGenerations?.clear();
     state.promptInFlight = false;
     state.promptSubmittedGeneration = null;
-    state.activePromptAdmissions.clear();
+    if (!this.profile.steeringPrompts) state.activePromptAdmissions.clear();
+    state.loaded = false;
+    state.modeApplied = false;
+    state.steeringTerminal = undefined;
+    state.steeringFailure = undefined;
     state.replaying = false;
     state.cancelled = false;
     state.currentMessageId = null;

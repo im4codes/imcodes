@@ -1,6 +1,9 @@
 /** Canonical transport/provider identity for the Google Antigravity (`agy`) CLI stream-json transport. */
 export const AGY_SDK_PROVIDER_ID = 'agy-sdk' as const;
 
+export const AGY_ACP_COMMAND = 'acp' as const;
+export const AGY_ACP_AGENT_NAME = 'Antigravity ACP Server' as const;
+
 /** Name of the `agy` executable resolved from PATH (override with `AGY_CLI_PATH` or `ProviderConfig.binaryPath`). */
 export const AGY_CLI_BINARY = 'agy' as const;
 

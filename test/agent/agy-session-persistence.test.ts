@@ -1,3 +1,4 @@
+import { AGY_ACP_AGENT_NAME } from '../../shared/agy-agent.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -5,6 +6,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { AGY_NATIVE_SESSION_STATE as AG } from '../../shared/agy-agent.js';
 import { PROVIDER_ERROR_CODES } from '../../shared/provider-error-codes.js';
+import { AgyAcpProvider } from '../../src/agent/providers/agy-acp.js';
 import { AgySdkProvider } from '../../src/agent/providers/agy-sdk.js';
 import { persistAgyNativeSessionStart } from '../../src/agent/agy-session-persistence.js';
 import * as store from '../../src/store/session-store.js';
@@ -50,6 +52,33 @@ afterEach(async () => {
 });
 
 describe('AG native start durable evidence (real SQLite and SDK child fixture)',()=>{
+  it.each(['brain', 'w1'])('ACP commits before session/new and disk roundtrips the exact native handle for %s', async role => {
+    // Production-shaped records ONLY in isolated SQLite; never live user sessions.
+    store.upsertSession(record(main, { role, ...(role === 'w1' ? { parentSession: 'deck_realproj_brain' } : {}) }));
+    await store.flushStore();
+    const executable = path.join(home, 'agy-acp');
+    writeFileSync(executable, `#!/bin/sh\nexec '${process.execPath}' '${path.resolve('test/fixtures/agy-acp.mjs')}' "$@"\n`, { mode: 0o700 });
+    const acp = new AgyAcpProvider();
+    let completed = 0;
+    try {
+      await acp.connect({ binaryPath: executable, env: { HOME: home, AGY_ACP_FIXTURE_AGENT_NAME: AGY_ACP_AGENT_NAME } });
+      acp.onSessionInfo((_sid, info) => { if (info.resumeId) store.upsertSession({ ...store.getSession(main)!, providerResumeId: info.resumeId }); });
+      acp.onComplete(() => { completed++; });
+      const sid = await acp.createSession({ sessionKey: 'route-' + main, cwd: home, beforeNativeSessionStart: async () => {
+        await start(); expect(persistedSessions(home)[main].agyNativeSessionState).toBe(AG.STARTED);
+      } });
+      await acp.send(sid, 'A'); await waitFor(() => completed === 1); await store.flushStore();
+      const native = persistedSessions(home)[main].providerResumeId as string;
+      expect(native).toBeTruthy();
+      await acp.disconnect(); store.resetSessionStoreAuthorityForTests(); await store.loadStore({ probe: false });
+      expect(store.getSession(main)?.providerResumeId).toBe(native);
+      await acp.connect({ binaryPath: executable, env: { HOME: home, AGY_ACP_FIXTURE_AGENT_NAME: AGY_ACP_AGENT_NAME } });
+      const resumed = await acp.createSession({ sessionKey: 'restored-route', cwd: home, resumeId: native });
+      await acp.send(resumed, 'after-restart'); await waitFor(() => completed === 2);
+      expect(store.getSession(main)?.providerResumeId).toBe(native);
+    } finally { await acp.disconnect(); }
+  });
+
   it.each(['brain','w1'])('commits before spawn and reloads the exact learned native handle for %s',async role=>{
     store.upsertSession(record(main,{role,...(role==='w1'?{parentSession:'deck_realproj_brain'}:{})}));
     await store.flushStore();
