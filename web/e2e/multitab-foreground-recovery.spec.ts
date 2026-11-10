@@ -2,6 +2,10 @@ import { expect, test, type Page, type WebSocketRoute } from '@playwright/test';
 import { generateChatTimelineFixture } from '../src/fixtures/chat-timeline/generators.js';
 import { TIMELINE_MESSAGES, TIMELINE_ASSISTANT_TEXT_EVENT_TYPE } from '@shared/timeline-protocol.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '@shared/timeline-payload-budget.js';
+import { DAEMON_COMMAND_TYPES } from '@shared/daemon-command-types.js';
+import { SHARE_BROWSER_COMMANDS, SHARE_DAEMON_MESSAGE_TYPES } from '@shared/tab-sharing.js';
+import { MSG_COMMAND_ACK } from '@shared/ack-protocol.js';
+import { MESSAGE_PIN_EVENT_TYPES } from '@shared/message-pins.js';
 import type { TimelineEvent } from '../src/ws-client.js';
 
 type Tab = {
@@ -78,33 +82,33 @@ async function openTab(page: Page, index: number): Promise<Tab> {
       const msg = JSON.parse(raw);
       tab.counts[`ws:${msg.type}`] = (tab.counts[`ws:${msg.type}`] ?? 0) + 1;
       if (msg.type === 'ping' && tab.ping) socket.send(JSON.stringify({ type: 'pong' }));
-      if (msg.type === 'get_sessions') socket.send(JSON.stringify({ type: 'session_list', sessions: [{ name: tab.name,
+      if (msg.type === 'get_sessions') socket.send(JSON.stringify({ type: SHARE_DAEMON_MESSAGE_TYPES.SESSION_LIST, sessions: [{ name: tab.name,
         project: 'e2e_multitab', role: 'brain', agentType: 'codex-sdk', state: 'idle', runtimeType: 'transport' }] }));
       if (msg.type === TIMELINE_MESSAGES.HISTORY_REQUEST) socket.send(JSON.stringify({ type: TIMELINE_MESSAGES.HISTORY,
         sessionName: tab.name, requestId: msg.requestId, status: 'ok', source: 'worker_sqlite', epoch: 1,
         events: [...initial, ...tab.durable], hasMore: false }));
-      if (msg.type === 'session.send' || msg.type === 'session.cancel') {
+      if (msg.type === SHARE_BROWSER_COMMANDS.SESSION_SEND || msg.type === DAEMON_COMMAND_TYPES.SESSION_CANCEL) {
         tab.received.push(msg.type);
-        socket.send(JSON.stringify({ type: 'command.ack', commandId: msg.commandId, sessionName: tab.name, status: 'accepted' }));
+        socket.send(JSON.stringify({ type: MSG_COMMAND_ACK, commandId: msg.commandId, sessionName: tab.name, status: 'accepted' }));
       }
     });
   });
   await page.goto(`/?identityTestHooks=1#/${tab.server}`);
   await expect(page.locator('.controls-input')).toBeVisible();
   await page.waitForFunction(() => !!(window as any).__identityTestWs__?.connected);
-  await page.evaluate(() => {
+  await page.evaluate((timelineEventType) => {
     const root = window as any;
     root.__identityTestWs__.onMessage((msg: any) => {
-      if (msg.type === 'timeline.event') root.__multitabProbe.delivered.push({ id: msg.event.eventId, streaming: msg.event.payload.streaming === true });
+      if (msg.type === timelineEventType) root.__multitabProbe.delivered.push({ id: msg.event.eventId, streaming: msg.event.payload.streaming === true });
     });
-  });
+  }, TIMELINE_MESSAGES.EVENT);
   // Equivalent to many completed, individually legal native outputs, NOT a
   // giant history envelope. Only four tabs use the heaviest 32-answer shape.
   const answers = index % 4 === 0 ? 32 : index % 4 === 1 ? 8 : 0;
   for (let i = 0; i < answers; i++) {
     const seq = 1_000_000 + i * 4;
     for (const row of [
-      event(tab, `question-${index}-${i}`, seq, 'user.message', { text: `isolated question ${i}` }),
+      event(tab, `question-${index}-${i}`, seq, MESSAGE_PIN_EVENT_TYPES.USER, { text: `isolated question ${i}` }),
       event(tab, `answer-${index}-${i}`, seq + 1, TIMELINE_ASSISTANT_TEXT_EVENT_TYPE,
         { text: `COMPLETED-HISTORY-${index}-${i}:` + 'synthetic completed output. '.repeat(12_000), streaming: false }),
       event(tab, `call-${index}-${i}`, seq + 2, 'tool.call', { tool: 'shell', toolCallId: `c-${i}`, input: 'isolated' }),
@@ -226,9 +230,9 @@ test('sixteen same-origin App tabs recover three times without rescanning unchan
     const first = tabs[0];
     await first.page.locator('.controls-input').fill('isolated post-recovery send');
     await first.page.locator('.controls-input').press('Enter');
-    await expect.poll(() => first.received.filter(type => type === 'session.send').length).toBe(1);
+    await expect.poll(() => first.received.filter(type => type === SHARE_BROWSER_COMMANDS.SESSION_SEND).length).toBe(1);
     await first.page.getByRole('button', { name: 'Stop', exact: true }).click();
-    await expect.poll(() => first.received.filter(type => type === 'session.cancel').length).toBe(1);
+    await expect.poll(() => first.received.filter(type => type === DAEMON_COMMAND_TYPES.SESSION_CANCEL).length).toBe(1);
   } finally {
     await info.attach('multitab-metrics.json', { body: JSON.stringify({ browser: context.browser()?.version(),
       background: 'CDP frozen/active + controlled visibility; virtual 180s on stale/offline rounds, 250ms real freeze', results }, null, 2), contentType: 'application/json' });
