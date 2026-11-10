@@ -1644,6 +1644,32 @@ describe('useTimeline window-isolated cache bounds', () => {
     expect(text?.payload.historyPayloadTruncated).toBe(true);
   });
 
+  it('reads only the Unicode preview prefix of an oversized answer during snapshot persistence', async () => {
+    vi.useFakeTimers();
+    const sessionName = `deck_snapshot_prefix_cost_${Date.now()}`;
+    const cacheKey = `srv:${sessionName}`;
+    const rawText = '😀'.repeat(1_024) + '中'.repeat(300_000);
+    const [event] = makeEvents(sessionName, 1);
+    const original = String.prototype[Symbol.iterator];
+    let consumed = 0;
+    const spy = vi.spyOn(String.prototype, Symbol.iterator).mockImplementation(function* (this: string) {
+      for (const char of original.call(this)) {
+        if (String(this) === rawText) consumed++;
+        yield char;
+      }
+    });
+    try {
+      __setTimelineCacheForTests(cacheKey, [{ ...event!, payload: { text: rawText } }]);
+      await act(async () => { await vi.advanceTimersByTimeAsync(750); });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(consumed).toBe(1_025);
+    const snapshot = JSON.parse(sessionStorage.getItem(`rcc_timeline_snapshot:${cacheKey}`) ?? '[]') as TimelineEvent[];
+    expect(snapshot[0]?.payload.text).toBe('😀'.repeat(1_024) + '…');
+    expect(snapshot[0]?.payload.historyPayloadTruncated).toBe(true);
+  });
+
   it('bounds each independent synchronous snapshot to 256 KiB without borrowing from peer windows', async () => {
     vi.useFakeTimers();
     const sessionName = `deck_snapshot_budget_${Date.now()}`;

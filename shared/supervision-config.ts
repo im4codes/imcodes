@@ -1922,6 +1922,9 @@ function scanAssistantAuthoredExecutionLines(text: string): {
   matches: Array<{ marker: string; lineIndex: number }>;
   retiredExecutionMarker: boolean;
 } {
+  // Both current and retired execution markers require an HTML comment.
+  // Do not split/walk whole retained completions just to reject plain text.
+  if (!text.includes('<!--')) return { matches: [], retiredExecutionMarker: false };
   const matches: Array<{ marker: string; lineIndex: number }> = [];
   let retiredExecutionMarker = false;
   let fence: MarkdownFenceState | undefined;

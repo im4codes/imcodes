@@ -1121,10 +1121,15 @@ function serializeCompactTimelineTextPreview(event: TimelineEvent): string {
   // comfortably inside the smallest 8 KiB self-budget even for CJK/emoji, so
   // one oversized answer can never turn the synchronous cache into tool-only
   // rows. The authoritative full payload remains in IndexedDB/daemon history.
-  const chars = Array.from(rawText);
-  const text = chars.length > 1_024
-    ? `${chars.slice(0, 1_024).join('')}…`
-    : rawText;
+  const chars: string[] = [];
+  let truncated = false;
+  // Only the preview prefix is needed. Array.from(rawText) walked/allocated
+  // the entire answer for every retained row during a synchronous freeze flush.
+  for (const char of rawText) {
+    if (chars.length === 1_024) { truncated = true; break; }
+    chars.push(char);
+  }
+  const text = truncated ? `${chars.join('')}…` : rawText;
   const payload: TimelineEvent['payload'] = {
     text,
     historyPayloadTruncated: true,

@@ -1072,6 +1072,9 @@ function knownVerb(verb: string): TaskPairVerb | undefined {
  * code, inline in prose, or inside a QUEUE brief are not protocol.
  */
 export function scanTaskPairMarkers(text: string): TaskPairMarkerScan {
+  // Timeline rendering/snapshots revisit retained text on resume. Ordinary
+  // completions need no line allocation or Markdown-fence walk at all.
+  if (!mayContainTaskPairMarker(text)) return { markers: [], markerLineIndexes: [] };
   const lines = text.split(/\r?\n/u);
   const markers: TaskPairMarker[] = [];
   const markerLineIndexes: number[] = [];
