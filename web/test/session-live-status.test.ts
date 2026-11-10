@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { deriveSessionLiveStatus, isActiveTurnFinishedError, isRunningSessionState, resolveTimelineBackedSessionState } from '../src/session-live-status.js';
+import { hasActiveTimelineTurn } from '../src/timeline-running.js';
 import { SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL } from '@shared/session-control-commands.js';
 import {
   createTransportQueueReducerState,
@@ -225,5 +226,34 @@ describe('session-live-status', () => {
     expect(afterDrain.busy).toBe(true);
     expect(afterDrain.sweep).toBe(true);
     expect(afterDrain.visualMode).toBe('running');
+  });
+
+  it('completed tail must not revive stale running over authoritative idle snapshot', () => {
+    const events: any[] = [
+      { type: 'session.state', ts: 1000, payload: { state: 'running' } },
+      { type: 'user.message', ts: 2000, payload: { text: 'synthetic' } },
+      { type: 'tool.call', ts: 3000, payload: { toolCallId: 'A', tool: 'synthetic' } },
+      { type: 'tool.result', ts: 55000, payload: { toolCallId: 'A', terminalStatus: 'succeeded' } },
+    ];
+    const active = hasActiveTimelineTurn(events);
+    expect(active).toBe(false);
+    const resolvedState = resolveTimelineBackedSessionState({
+      timelineState: 'running',
+      sessionState: 'idle',
+      activeThinking: false,
+      activeToolCall: false,
+      activeTransportTurn: active,
+      timelineStateTs: 1000,
+      timelineLastEventTs: 55000,
+      now: 60000,
+    });
+    expect(resolvedState).toBe('idle');
+    const liveStatus = deriveSessionLiveStatus({
+      sessionState: resolvedState,
+      activeTransportTurn: active,
+      activeToolCall: false,
+      activeThinking: false,
+    });
+    expect(liveStatus.visualMode).toBe('idle');
   });
 });

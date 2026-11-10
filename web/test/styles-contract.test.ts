@@ -1185,6 +1185,33 @@ describe('styles.css regression contracts', () => {
     expect(rule).toMatch(/width:\s*100%/);
     expect(rule).not.toMatch(/width:\s*fit-content/);
   });
+
+  it('tool-activity child elements keep explicit compact font-size and line-height constraints', () => {
+    const lastNameRule = cssWithoutComments.match(/\.chat-tool-activity-last-name\s*\{[^}]*\}/)?.[0];
+    expect(lastNameRule, '.chat-tool-activity-last-name rule missing').toBeTruthy();
+    expect(lastNameRule).toMatch(/font-size:\s*10px/);
+    expect(lastNameRule).toMatch(/line-height:\s*1/);
+
+    const lastInputRule = cssWithoutComments.match(/\.chat-tool-activity-last-input\s*\{[^}]*\}/)?.[0];
+    expect(lastInputRule, '.chat-tool-activity-last-input rule missing').toBeTruthy();
+    expect(lastInputRule).toMatch(/font-size:\s*10px/);
+    expect(lastInputRule).toMatch(/line-height:\s*1/);
+
+    const timeRule = cssWithoutComments.match(/\.chat-tool-activity-time\s*\{[^}]*\}/)?.[0];
+    expect(timeRule, '.chat-tool-activity-time rule missing').toBeTruthy();
+    expect(timeRule).toMatch(/font-size:\s*10px/);
+    expect(timeRule).toMatch(/line-height:\s*1/);
+
+    const labelRule = cssWithoutComments.match(/\.chat-tool-activity-label\s*\{[^}]*\}/)?.[0];
+    expect(labelRule, '.chat-tool-activity-label rule missing').toBeTruthy();
+    expect(labelRule).toMatch(/font-size:\s*10px/);
+    expect(labelRule).toMatch(/line-height:\s*1/);
+
+    const iosRule = cssWithoutComments.match(/html\.native-ios-mac\s+\.chat-tool-activity(?:[^{]*)\{[^}]*\}/)?.[0];
+    expect(iosRule, 'html.native-ios-mac .chat-tool-activity rule missing').toBeTruthy();
+    expect(iosRule).toMatch(/font-size:\s*10px/);
+    expect(iosRule).toMatch(/line-height:\s*1/);
+  });
   it('the collapsed tool fold must not carry a grid texture', () => {
     // User reported "多余的线" between messages twice. Root cause: the fold's
     // background stacked a 12x12 grid, whose first layer is a horizontal rule
