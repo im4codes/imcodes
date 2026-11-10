@@ -48,7 +48,7 @@ describe('AG native ACP', () => {
     await provider.send(id, 'A');
     await Promise.all([provider.notifyActiveDelegation(id, notification('B')), provider.notifyActiveDelegation(id, notification('B'))]);
     await provider.notifyActiveDelegation(id, notification('B'));
-    expect((await requests()).filter(x => x.method === 'session/prompt')).toHaveLength(2);
+    await vi.waitFor(async () => expect((await requests()).filter(x => x.method === 'session/prompt')).toHaveLength(2));
   });
   it('does not clear an active A/tool when only B RPC is rejected', async () => {
     const { provider } = await setup('reject-b'); const id = await route(provider), complete = vi.fn(), errors = vi.fn(); provider.onComplete(complete); provider.onError(errors);
@@ -113,7 +113,7 @@ describe('AG native ACP', () => {
     await provider.send(id, 'A'); await provider.notifyActiveDelegation(id, notification('B'));
     await vi.waitFor(() => expect(errors).toHaveBeenCalledTimes(1));
     expect(complete).not.toHaveBeenCalled(); expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
-    expect((await requests()).filter(x => x.method === 'session/prompt')).toHaveLength(2);
+    await vi.waitFor(async () => expect((await requests()).filter(x => x.method === 'session/prompt')).toHaveLength(2));
     expect(await provider.notifyActiveDelegation(id, notification('C'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
   });
   it('replaces a pending startup owner even when the canonical route is unchanged', async () => {
@@ -127,7 +127,7 @@ describe('AG native ACP', () => {
       await expect(provider.send(id, 'new-owner')).resolves.toBeUndefined();
     } finally { release(); }
     expect(await oldSend).toBe(PROVIDER_ERROR_CODES.CANCELLED);
-    expect((await requests()).filter(x => x.method === 'session/prompt').map(x => x.params.prompt[0].text)).toEqual(['new-owner']);
+    await vi.waitFor(async () => expect((await requests()).filter(x => x.method === 'session/prompt').map(x => x.params.prompt[0].text)).toEqual(['new-owner']));
   });
   it('ignores old native-session updates and terminals after delete/recreate of the route', async () => {
     const { provider } = await setup(); const id = await route(provider); const complete = vi.fn(), deltas = vi.fn(); provider.onComplete(complete); provider.onDelta(deltas);
@@ -151,6 +151,8 @@ describe('AG native ACP', () => {
     await provider.send(id, input); await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1));
     await provider.send(id, input); await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2));
     provider.refreshSessionSystemText(id); await provider.send(id, input);
+    // send resolves at native write, before the peer necessarily logs receipt.
+    await vi.waitFor(async () => expect((await requests()).filter(x => x.method === 'session/prompt')).toHaveLength(3));
     const text = (await requests()).filter(x => x.method === 'session/prompt').map(x => x.params.prompt[0].text);
     expect(text.map(x => x.includes('IDENTITY_TEST_334'))).toEqual([true, false, true]);
   });
