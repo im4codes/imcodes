@@ -1,0 +1,47 @@
+name: iOS Offline Speech Build
+on:
+  workflow_dispatch:
+  push:
+    branches: [dev, master]
+    paths:
+      - 'web/plugins/streaming-speech/**'
+      - 'web/scripts/prepare-streaming-speech.mjs'
+      - 'web/ios/**'
+      - 'web/package*.json'
+      - '.github/workflows/mobile-speech.yml'
+  pull_request:
+    paths:
+      - 'web/plugins/streaming-speech/**'
+      - 'web/scripts/prepare-streaming-speech.mjs'
+      - 'web/ios/**'
+      - 'web/package*.json'
+      - '.github/workflows/mobile-speech.yml'
+permissions:
+  contents: read
+jobs:
+  ios-simulator:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+      - uses: actions/cache@v4
+        with:
+          path: |
+            web/plugins/streaming-speech/models
+            web/plugins/streaming-speech/android/libs
+          key: speech-assets-${{ hashFiles('web/scripts/prepare-streaming-speech.mjs') }}
+      - run: npm run prepare:speech && npm run build && npx cap sync ios
+        working-directory: web
+      - name: Compile native plugin in the real app (unsigned simulator)
+        run: >-
+          xcodebuild -project web/ios/App/App.xcodeproj -scheme App
+          -configuration Debug -destination 'generic/platform=iOS Simulator'
+          -derivedDataPath "$RUNNER_TEMP/imcodes-speech-ios"
+          CODE_SIGNING_ALLOWED=NO build

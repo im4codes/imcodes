@@ -1,0 +1,6 @@
+models/*
+!models/.gitkeep
+android/libs/
+android/build/
+.build/
+.swiftpm/

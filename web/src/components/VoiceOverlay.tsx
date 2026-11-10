@@ -80,6 +80,8 @@ export function VoiceOverlay({
   const voiceLenRef = useRef(0);
   // Session token: monotonic counter — partials with stale token are discarded
   const sessionTokenRef = useRef(0);
+  const flushingTokenRef = useRef<number | null>(null);
+  const voiceSendPendingRef = useRef(false);
   // Track listening state in a ref so event handlers always see current value
   const listeningRef = useRef(false);
   // Guard: true while a programmatic write (partial callback) is in progress
@@ -332,7 +334,7 @@ export function VoiceOverlay({
         setListeningState(next);
         // A stop with a still-current token was not requested by the user
         // (user stops bump the token first): the recognizer ended a segment.
-        if (!next && notepadRef.current && openRef.current) scheduleNotepadRestart();
+        if (!next && flushingTokenRef.current !== token && notepadRef.current && openRef.current) scheduleNotepadRestart();
       });
       // Check guards after async — overlay may have closed or session may have changed
       if (ok && sessionTokenRef.current === token && openRef.current) {
@@ -373,14 +375,22 @@ export function VoiceOverlay({
   }
 
   /** Stop current session and commit voice zone */
-  const commitAndStop = useCallback(async () => {
-    sessionTokenRef.current++;
+  const commitAndStop = useCallback(async (flush = false) => {
+    const token = sessionTokenRef.current;
+    if (flush) flushingTokenRef.current = token;
+    else { flushingTokenRef.current = null; sessionTokenRef.current++; }
     await VoiceInput.stopListening();
+    if (sessionTokenRef.current !== token + (flush ? 0 : 1)) return false;
+    if (flush) {
+      sessionTokenRef.current++;
+      flushingTokenRef.current = null;
+    }
     setListeningState(false);
     // Commit: advance insertPos past the committed voice text
     recordCommittedSegment();
     insertPosRef.current += voiceLenRef.current;
     voiceLenRef.current = 0;
+    return true;
   }, [recordCommittedSegment, setListeningState]);
 
   /**
@@ -389,8 +399,7 @@ export function VoiceOverlay({
    */
   const openReview = useCallback(async () => {
     clearRestartTimer();
-    await commitAndStop();
-    if (!openRef.current) return;
+    if (!await commitAndStop(true) || !openRef.current) return;
     setBars(Array(BAR_COUNT).fill(2));
     barsRef.current = Array(BAR_COUNT).fill(2);
     setNotepadSendFailed(false);
@@ -403,7 +412,7 @@ export function VoiceOverlay({
 
   /** Stop, commit, then restart at new cursor position */
   const restartAtCursor = useCallback(async (newPos: number) => {
-    await commitAndStop();
+    if (!await commitAndStop()) return;
     await startSession(newPos);
   }, [commitAndStop, startSession]);
 
@@ -414,7 +423,7 @@ export function VoiceOverlay({
     }
     if (listeningRef.current || restartTimerRef.current) {
       clearRestartTimer();
-      await commitAndStop();
+      if (!await commitAndStop(true)) return;
       setBars(Array(BAR_COUNT).fill(2));
       barsRef.current = Array(BAR_COUNT).fill(2);
     } else {
@@ -490,24 +499,24 @@ export function VoiceOverlay({
     };
   }, [open, notepad, reviewing, saveDraft]);
 
-  const handleSend = useCallback(() => {
-    const transcript = (taRef.current?.value ?? '').trim();
-    if (!transcript) return;
+  const handleSend = useCallback(async () => {
+    if (voiceSendPendingRef.current) return;
     if (notepadRef.current) {
       void openReview();
       return;
     }
-    clearRestartTimer();
-    sessionTokenRef.current++;
-    VoiceInput.stopListening();
-    setListeningState(false);
-    if (onSend(transcript) === 'accepted') {
-      // Notepad switched off and its text sent as ordinary dictation: that
-      // transcript has left, so it must not be offered again.
-      if (draftActiveRef.current) settleDraft();
-      onClose();
-    }
-  }, [onSend, onClose, openReview, setListeningState, clearRestartTimer, settleDraft]);
+    voiceSendPendingRef.current = true;
+    try {
+      clearRestartTimer();
+      if (!await commitAndStop(true) || !openRef.current) return;
+      const transcript = (taRef.current?.value ?? '').trim();
+      if (!transcript) return;
+      if (onSend(transcript) === 'accepted') {
+        if (draftActiveRef.current) settleDraft();
+        onClose();
+      }
+    } finally { voiceSendPendingRef.current = false; }
+  }, [onSend, onClose, openReview, commitAndStop, clearRestartTimer, settleDraft]);
 
   const handleReviewSend = useCallback(async () => {
     const current = reviewRef.current;

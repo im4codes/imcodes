@@ -12,6 +12,8 @@ const speechApi = vi.hoisted(() => ({
   stop: vi.fn(),
 }));
 
+vi.mock('@capacitor/core', () => ({ registerPlugin: vi.fn() }));
+
 vi.mock('@capgo/capacitor-speech-recognition', () => ({
   SpeechRecognition: speechApi,
 }));
@@ -69,6 +71,15 @@ describe('VoiceInput', () => {
     expect(firstResult).not.toHaveBeenCalled();
     expect(latestResult).toHaveBeenCalledWith('hello', false);
     expect(VoiceInput.isListening()).toBe(true);
+  });
+
+  it('keeps full cumulative bilingual results and the offline final marker', async () => {
+    const onResult = vi.fn();
+    await VoiceInput.startListening(onResult);
+    listeners.partialResults({ matches: ['你好 hello'], isFinal: false });
+    listeners.partialResults({ matches: ['你好 hello world'], isFinal: true });
+    expect(onResult.mock.calls).toEqual([['你好 hello', false], ['你好 hello world', true]]);
+    await VoiceInput.stopListening();
   });
 
   it('syncs native stopped events back to the listening state callback', async () => {

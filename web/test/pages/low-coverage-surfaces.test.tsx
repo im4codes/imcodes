@@ -339,6 +339,7 @@ describe('low-coverage page and component surfaces', () => {
     await vi.advanceTimersByTimeAsync(0);
     fireEvent.click(screen.getByText('voice.send'));
 
+    await vi.advanceTimersByTimeAsync(0);
     expect(onSend).toHaveBeenCalledWith('hello world');
     expect(onClose).toHaveBeenCalled();
   });
@@ -357,26 +358,26 @@ describe('low-coverage page and component surfaces', () => {
     expect(onClose).toHaveBeenCalled();
   });
 
-  it('VoiceOverlay keeps the transcript open when the parent rejects the send', () => {
+  it('VoiceOverlay keeps the transcript open when the parent rejects the send', async () => {
     const onSend = vi.fn(() => 'rejected' as const);
     const onClose = vi.fn();
     render(<VoiceOverlay open initialText="retry this" onSend={onSend} onClose={onClose} />);
 
     fireEvent.click(screen.getByText('voice.send'));
 
-    expect(onSend).toHaveBeenCalledWith('retry this');
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith('retry this'));
     expect(onClose).not.toHaveBeenCalled();
     expect((document.querySelector('.voice-overlay-text') as HTMLTextAreaElement).value).toBe('retry this');
   });
 
-  it('VoiceOverlay keeps the transcript open while parent confirmation is pending', () => {
+  it('VoiceOverlay keeps the transcript open while parent confirmation is pending', async () => {
     const onSend = vi.fn(() => 'pending' as const);
     const onClose = vi.fn();
     render(<VoiceOverlay open initialText="confirm this" onSend={onSend} onClose={onClose} />);
 
     fireEvent.click(screen.getByText('voice.send'));
 
-    expect(onSend).toHaveBeenCalledWith('confirm this');
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith('confirm this'));
     expect(onClose).not.toHaveBeenCalled();
     expect((document.querySelector('.voice-overlay-text') as HTMLTextAreaElement).value).toBe('confirm this');
   });

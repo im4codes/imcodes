@@ -1,14 +1,14 @@
 /**
  * VoiceInput — speech recognition wrapper.
- * On native (Capacitor) it uses the platform's SFSpeechRecognizer via the
- * @capgo plugin. On desktop browsers (Chrome / Edge / Safari) it falls back to
+ * Native Android/iOS use our shared offline streaming bridge when installed;
+ * older shells retain the existing @capgo platform recognizer. On desktop browsers (Chrome / Edge / Safari) it falls back to
  * the Web Speech API (window.SpeechRecognition / webkitSpeechRecognition).
  * Firefox has no Web Speech API, so the button is hidden there.
  * Both paths share the same callback contract: onResult receives the FULL
  * cumulative transcript of the current session each time (the overlay replaces
  * the prior voice segment with it), plus an isFinal flag.
  */
-import { SpeechRecognition } from '@capgo/capacitor-speech-recognition';
+import { getNativeSpeechRecognition } from '../voice-recognition-backend.js';
 import type { PluginListenerHandle } from '@capacitor/core';
 
 /** Native (Capacitor) speech-recognition locale tags. */
@@ -103,31 +103,31 @@ async function startListeningInternal(generation: number): Promise<boolean> {
   if (generation !== _generation) return false;
 
   try {
-    const perms = await SpeechRecognition.requestPermissions();
+    const perms = await getNativeSpeechRecognition().requestPermissions();
     if (perms.speechRecognition !== 'granted') return false;
     if (generation !== _generation) return false;
 
-    const available = await SpeechRecognition.available();
+    const available = await getNativeSpeechRecognition().available();
     if (!available.available) return false;
     if (generation !== _generation) return false;
 
     const locale = pickLocale();
 
     // Partial results listener
-    const h1 = await SpeechRecognition.addListener('partialResults', (data) => {
+    const h1 = await getNativeSpeechRecognition().addListener('partialResults', (data) => {
       if (data.matches?.length) {
-        _onResult?.(data.matches[0], false);
+        _onResult?.(data.matches[0], (data as { isFinal?: boolean }).isFinal === true);
       }
     });
     _removePartial = () => removeHandle(h1);
 
     // Audio level listener (emitted from native at ~15fps)
-    const h2 = await SpeechRecognition.addListener('audioLevel' as any, (data: any) => {
+    const h2 = await getNativeSpeechRecognition().addListener('audioLevel' as any, (data: any) => {
       _onLevel?.(data.level ?? 0);
     });
     _removeLevel = () => removeHandle(h2);
 
-    const h3 = await SpeechRecognition.addListener('listeningState', (data) => {
+    const h3 = await getNativeSpeechRecognition().addListener('listeningState', (data) => {
       if (data.status === 'started') {
         setListening(true);
         return;
@@ -138,7 +138,7 @@ async function startListeningInternal(generation: number): Promise<boolean> {
     });
     _removeListeningState = () => removeHandle(h3);
 
-    await SpeechRecognition.start({
+    await getNativeSpeechRecognition().start({
       language: locale,
       partialResults: true,
       popup: false,
@@ -147,7 +147,7 @@ async function startListeningInternal(generation: number): Promise<boolean> {
 
     if (generation !== _generation) {
       try {
-        await SpeechRecognition.stop();
+        await getNativeSpeechRecognition().stop();
       } catch { /* stale start cleanup */ }
       await removeRecognitionListeners();
       setListening(false);
@@ -353,7 +353,7 @@ export async function stopListening(): Promise<void> {
 
   const stopPromise = (async () => {
     try {
-      await SpeechRecognition.stop();
+      await getNativeSpeechRecognition().stop();
     } catch (err) {
       console.warn('[voice] stop failed:', err);
     }

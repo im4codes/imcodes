@@ -178,7 +178,69 @@ describe('VoiceOverlay notepad mode', () => {
     await vi.advanceTimersByTimeAsync(150);
     voiceApi.partialHandler?.('just a message');
     fireEvent.click(screen.getByText('voice.send'));
+    await vi.advanceTimersByTimeAsync(0);
     expect(onSend).toHaveBeenCalledWith('just a message');
+  });
+
+  it('flushes the native last syllables before plain send, without duplicate sends', async () => {
+    const onSend = vi.fn(() => 'accepted' as const);
+    render(<VoiceOverlay open initialText="" onSend={onSend} onClose={vi.fn()} />);
+    await vi.advanceTimersByTimeAsync(150);
+    voiceApi.partialHandler?.('你好 hello');
+    let finish!: () => void;
+    voiceApi.stopListening.mockImplementationOnce(async () => {
+      voiceApi.listeningHandler?.(false);
+      await new Promise<void>(resolve => { finish = resolve; });
+      voiceApi.partialHandler?.('你好 hello world');
+    });
+    fireEvent.click(screen.getByText('voice.send'));
+    fireEvent.click(screen.getByText('voice.send'));
+    expect(onSend).not.toHaveBeenCalled();
+    finish(); await vi.advanceTimersByTimeAsync(0);
+    expect(onSend.mock.calls).toEqual([['你好 hello world']]);
+  });
+
+  it('flushes final notepad text into review without auto-restarting', async () => {
+    await openNotepad();
+    voiceApi.partialHandler?.('agenda');
+    voiceApi.stopListening.mockImplementationOnce(async () => {
+      voiceApi.listeningHandler?.(false);
+      voiceApi.partialHandler?.('agenda final');
+    });
+    fireEvent.click(document.querySelector('.voice-overlay-mic') as HTMLElement);
+    await vi.advanceTimersByTimeAsync(NOTEPAD_RESTART_DELAY_MS * 3);
+    expect((document.querySelector('.voice-notepad-review-transcript') as HTMLTextAreaElement)?.value ?? document.body.textContent).toContain('agenda final');
+    expect(voiceApi.startListening).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not send or overwrite a newly opened voice window after an older flush', async () => {
+    const onSend = vi.fn(() => 'accepted' as const);
+    const props = { initialText: '', onSend, onClose: vi.fn() };
+    const view = render(<VoiceOverlay open {...props} />);
+    await vi.advanceTimersByTimeAsync(150);
+    voiceApi.partialHandler?.('old text');
+    const oldPartial = voiceApi.partialHandler;
+    let finish!: () => void;
+    voiceApi.stopListening.mockImplementationOnce(async () => {
+      await new Promise<void>(resolve => { finish = resolve; });
+      oldPartial?.('old text final');
+    });
+    fireEvent.click(screen.getByText('voice.send'));
+    view.rerender(<VoiceOverlay open={false} {...props} />);
+    view.rerender(<VoiceOverlay open initialText="new draft" onSend={onSend} onClose={props.onClose} />);
+    finish(); await vi.advanceTimersByTimeAsync(0);
+    expect(onSend).not.toHaveBeenCalled();
+    expect(textarea().value).toBe('new draft');
+  });
+
+  it('does not apply a late flush over text the user manually edited', async () => {
+    render(<VoiceOverlay open initialText="" onSend={vi.fn()} onClose={vi.fn()} />);
+    await vi.advanceTimersByTimeAsync(150);
+    voiceApi.partialHandler?.('before');
+    voiceApi.stopListening.mockImplementationOnce(async () => { voiceApi.partialHandler?.('before final'); });
+    fireEvent.input(textarea(), { target: { value: 'user edit' } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(textarea().value).toBe('user edit');
   });
 
   it('keeps the screen awake only while notepad mode is on', async () => {
