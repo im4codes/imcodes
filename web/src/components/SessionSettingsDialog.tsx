@@ -677,12 +677,13 @@ function SupervisionExecutionPoolsEditor({
     onChange(updateExecutionPoolRole(pools, capabilityId, role));
   };
   const configuredByCapability = new Map([
-    ...pools.primaryDevelopmentPool.configs,
     ...pools.economyTaskPool.configs,
+    ...pools.primaryDevelopmentPool.configs,
   ].map((config) => [config.capabilityId, config]));
   const renderRoleSelect = (candidate: SupervisionExecutionConfig) => {
     // Live candidates describe capability identity, not the user's saved role.
     // Resolve the draft entry across both pools so moving it cannot reset role.
+    // Primary wins if an imported config contains the capability in both pools.
     const config = configuredByCapability.get(candidate.capabilityId) ?? candidate;
     return (
       <select

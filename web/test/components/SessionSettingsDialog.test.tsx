@@ -1182,7 +1182,9 @@ describe('SessionSettingsDialog supervision', () => {
     fetchSupervisorDefaultsMock.mockResolvedValue({ executionPools: {
       state: 'configured', primaryDevelopmentPool: { configs: [{
         capabilityId, agentType: 'codex-sdk', runtimeType: 'transport', providerFamily: 'openai', model: 'gpt-5.6', role,
-      }] }, economyTaskPool: { configs: [] },
+      }] }, economyTaskPool: { configs: [{
+        capabilityId, agentType: 'codex-sdk', runtimeType: 'transport', providerFamily: 'openai', model: 'gpt-5.6', role: 'both',
+      }] },
     } });
     render(<SupervisionSettingsDialog serverId="srv-1" sessionName="deck_proj_brain" label="" description="" cwd="/proj"
       type="codex-sdk" activeModel={CODEX_MODEL_IDS[0]} transportConfig={null} onClose={vi.fn()} onSaved={vi.fn()} />);
