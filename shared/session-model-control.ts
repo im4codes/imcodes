@@ -6,6 +6,7 @@
  */
 export const SESSION_MODEL_CONTROL_ERROR = {
   SESSION_NOT_FOUND: 'session_not_found',
+  SESSION_CHANGED: 'session_changed',
   UNSUPPORTED_RUNTIME: 'unsupported_runtime',
   UNKNOWN_MODEL: 'unknown_model',
   UNKNOWN_THINKING_LEVEL: 'unknown_thinking_level',
@@ -35,8 +36,8 @@ export type SessionModelSwitchResult =
       thinking?: string;
       previousThinking?: string;
       thinkingApplied?: typeof SESSION_MODEL_APPLIED[keyof typeof SESSION_MODEL_APPLIED];
-      /** `live`: the running runtime switched now. `next_start`: the session is
-       *  idle and not loaded; it starts on this model the next time it runs. */
+      /** `live`: the running runtime switched now. `next_start`: saved for
+       * the next native start, including CLI-only switches after a busy turn. */
       applied: typeof SESSION_MODEL_APPLIED[keyof typeof SESSION_MODEL_APPLIED];
     }
   | { ok: false; sessionName: string; code: SessionModelControlError; error: string; availableModels?: string[]; availableThinkingLevels?: string[] };

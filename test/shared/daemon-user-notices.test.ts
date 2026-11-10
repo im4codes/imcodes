@@ -12,6 +12,14 @@ import {
 const LOCALES = ['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko'] as const;
 
 describe('daemon user notice contract', () => {
+  it('describes saved CLI model selection as pending instead of already live', () => {
+    expect(createDaemonUserNoticePayload(DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PENDING, { model: 'fixture-B' })).toEqual({
+      text: '⚠️ Saved model fixture-B; it will apply to the next turn after the current turn finishes.',
+      noticeCode: DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PENDING,
+      noticeParams: { model: 'fixture-B' },
+    });
+  });
+
   it('keeps every code translated in all seven locales', () => {
     const codes = Object.values(DAEMON_USER_NOTICE_CODE);
     expect(new Set(codes).size).toBe(codes.length);

@@ -329,6 +329,7 @@
       "fast_mode_off": "このセッションの高速モードを無効にしました。",
       "unknown_model": "⚠️ このプロバイダーではモデル {{model}} を利用できません。",
       "model_switched": "モデルを {{model}} に切り替えました。",
+      "model_switch_pending": "モデル {{model}} を保存しました。現在のターン終了後、次のターンから適用されます。",
       "model_switch_proof_gated": "⚠️ プロバイダー機能の検証が終わるまでモデル {{model}} に切り替えられません。",
       "thinking_level_unsupported": "⚠️ このプロバイダーは思考レベル {{level}} をサポートしていません。",
       "thinking_level_switched": "思考レベルを {{level}} に切り替えました。",

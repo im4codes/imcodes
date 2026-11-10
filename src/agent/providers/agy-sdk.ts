@@ -41,6 +41,7 @@ import {
   AGY_CLI_FLAG,
   AGY_CLI_PATH_ENV,
   AGY_DEFAULT_MODEL_ID,
+  AGY_NATIVE_START_NOT_ATTEMPTED,
   isAgyHistoricalErrorCandidate,
   AGY_RESULT_STATUS,
   AGY_SDK_PROVIDER_ID,
@@ -92,6 +93,8 @@ interface AgySessionState {
   env?: Record<string, string>;
   mcpEnv?: Record<string, string>;
   model?: string;
+  /** Launch model of the captured child; model above is the next selection. */
+  childModel?: string;
   /** agy conversation id; durable resume handle (persisted by the daemon as providerResumeId). */
   conversationId?: string;
   beforeNativeSessionStart?: () => Promise<void>;
@@ -345,6 +348,7 @@ export class AgySdkProvider implements TransportProvider {
       beforeNativeSessionStart: config.beforeNativeSessionStart ?? existing?.beforeNativeSessionStart,
       cancelGeneration: (prior?.cancelGeneration ?? 0) + 1,
       child: existing?.child ?? null,
+      childModel: existing?.childModel,
       inflightTurns: existing?.inflightTurns ?? 0,
       cancelled: false,
       currentMessageId: null,
@@ -375,7 +379,7 @@ export class AgySdkProvider implements TransportProvider {
     }
     this.sessions.set(routeId, state);
     if (state.conversationId) {
-      this.emitSessionInfo(routeId, { resumeId: state.conversationId, ...(state.model ? { model: state.model } : {}) });
+      this.emitSessionInfo(routeId, { resumeId: state.conversationId });
     }
     return routeId;
   }
@@ -423,12 +427,18 @@ export class AgySdkProvider implements TransportProvider {
     // stdin. Awaiting may race Stop/end/rebind, so re-check the captured owner.
     state.cancelled = false;
     const generation = state.cancelGeneration;
+    if (state.child && state.inflightTurns === 0 && state.childModel !== state.model) {
+      await this.terminateChild(state);
+      if (this.sessions.get(sessionId) !== state || state.cancelGeneration !== generation || state.cancelled) {
+        throw this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'AG model restart was superseded', false, { [AGY_NATIVE_START_NOT_ATTEMPTED]: true });
+      }
+    }
     if ((!state.child || state.child.killed || state.child.exitCode !== null) && state.beforeNativeSessionStart) {
       const pending = state.nativeStartInFlight ??= state.beforeNativeSessionStart();
       try { await pending; }
       finally { if (state.nativeStartInFlight === pending) state.nativeStartInFlight = undefined; }
       if (this.sessions.get(sessionId) !== state || state.cancelGeneration !== generation || state.cancelled) {
-        throw this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'AG start was superseded', false);
+        throw this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'AG start was superseded', false, { [AGY_NATIVE_START_NOT_ATTEMPTED]: true });
       }
     }
     const child = this.ensureChild(sessionId, state);
@@ -487,7 +497,6 @@ export class AgySdkProvider implements TransportProvider {
     state.model = agentId;
     // --model is a launch flag: drop an idle process so the next send resumes with the new model.
     if (state.child && state.inflightTurns === 0) void this.terminateChild(state);
-    if (state.conversationId) this.emitSessionInfo(sessionId, { resumeId: state.conversationId, model: agentId });
   }
 
   refreshSessionSystemText(sessionId: string): void {
@@ -657,6 +666,7 @@ export class AgySdkProvider implements TransportProvider {
       detached: process.platform !== 'win32',
     });
     state.child = child;
+    state.childModel = state.model;
     state.stderrTail = '';
     // A restarted agy process cannot be assumed to retain the contract marker;
     // force the next turn to carry the current session-level instructions.
@@ -822,11 +832,17 @@ export class AgySdkProvider implements TransportProvider {
   private noteConversationId(sessionId: string, state: AgySessionState, id: string | undefined): void {
     if (!id || state.conversationId === id) return;
     state.conversationId = id;
-    this.emitSessionInfo(sessionId, { resumeId: id, ...(state.model ? { model: state.model } : {}) });
+    const model = state.childModel ?? state.model;
+    this.emitSessionInfo(sessionId, { resumeId: id, ...(model ? { model } : {}) });
   }
 
   private handleInit(sessionId: string, state: AgySessionState, event: Record<string, unknown>): void {
-    this.noteConversationId(sessionId, state, asString(event.conversation_id));
+    const id = asString(event.conversation_id);
+    const alreadyKnown = !!id && state.conversationId === id;
+    this.noteConversationId(sessionId, state, id);
+    // A resumed process keeps its ID, but its newly acknowledged launch model
+    // still needs publishing. Never publish a model before native init.
+    if (alreadyKnown) this.emitSessionInfo(sessionId, { resumeId: id, model: state.childModel ?? state.model });
   }
 
   private syncAgyManagedSubagents(sessionId: string, state: AgySessionState, output: string): void {
@@ -1226,7 +1242,7 @@ export class AgySdkProvider implements TransportProvider {
       timestamp: Date.now(),
       status: 'complete',
       metadata: {
-        ...(state.model ? { model: state.model } : {}),
+        ...((state.childModel ?? state.model) ? { model: state.childModel ?? state.model } : {}),
         ...(state.conversationId ? { conversationId: state.conversationId } : {}),
         usage: {
           input_tokens: turnUsage.input_tokens,
@@ -1259,7 +1275,7 @@ export class AgySdkProvider implements TransportProvider {
         output_tokens: usage.output_tokens,
         cache_read_input_tokens: usage.cache_read_tokens,
       },
-      ...(state.model ? { model: state.model } : {}),
+      ...((state.childModel ?? state.model) ? { model: state.childModel ?? state.model } : {}),
     };
     for (const cb of this.usageCallbacks) cb(sessionId, update);
   }

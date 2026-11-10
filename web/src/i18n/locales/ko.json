@@ -329,6 +329,7 @@
       "fast_mode_off": "이 세션의 빠른 모드를 껐습니다.",
       "unknown_model": "⚠️ 이 공급자에서는 모델 {{model}}을 사용할 수 없습니다.",
       "model_switched": "모델을 {{model}}(으)로 전환했습니다.",
+      "model_switch_pending": "모델 {{model}}을(를) 저장했습니다. 현재 턴이 끝나면 다음 턴부터 적용됩니다.",
       "model_switch_proof_gated": "⚠️ 공급자 기능 검증 전에는 모델 {{model}}로 전환할 수 없습니다.",
       "thinking_level_unsupported": "⚠️ 이 공급자는 사고 수준 {{level}}을 지원하지 않습니다.",
       "thinking_level_switched": "사고 수준을 {{level}}(으)로 전환했습니다.",

@@ -329,6 +329,7 @@
       "fast_mode_off": "此会话已关闭快速模式。",
       "unknown_model": "⚠️ 此提供商不支持模型 {{model}}。",
       "model_switched": "已切换到模型 {{model}}。",
+      "model_switch_pending": "已保存模型 {{model}}；当前轮结束后，将在下一轮使用。",
       "model_switch_proof_gated": "⚠️ 提供商能力验证前不可切换到模型 {{model}}。",
       "thinking_level_unsupported": "⚠️ 此提供商不支持思考级别 {{level}}。",
       "thinking_level_switched": "已切换到思考级别 {{level}}。",

@@ -3024,6 +3024,12 @@ async function applyTransportModelSwitch(
   let contextWindow: number | undefined;
 
   const validated = await resolveValidatedModelList(record);
+  if (agentType === AGY_SDK_PROVIDER_ID) {
+    if (!isCurrentAgyModelOwner(record, transportRuntime)) return modelOwnerChanged(sessionName);
+    // Validation yielded. Preserve native-start/info/queue updates from the
+    // current owner rather than writing back the pre-await record snapshot.
+    record = getSession(sessionName)!;
+  }
   if (agentType === 'qwen') {
     const runtimeConfig = validated?.qwenRuntime ?? null;
     const sessionModels = record.qwenAvailableModels ?? [];
@@ -3136,6 +3142,12 @@ async function applyTransportModelSwitch(
       `Qoder model switching is proof-gated in IM.codes v1: ${requestedModel}`,
       DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PROOF_GATED,
     );
+  } else if (agentType === AGY_SDK_PROVIDER_ID) {
+    transportRuntime?.setAgentId(requestedModel);
+    // AG's model is a process launch flag, not a live model RPC. The actual
+    // child's spawn/info publishes activeModel; a busy old turn remains on A.
+    nextRecord = { ...getSession(sessionName)!, requestedModel, updatedAt: Date.now() };
+    contextWindow = resolveContextWindow(undefined, requestedModel);
   } else if (isGenericModelSwitchAgent(agentType)) {
     if (agentType === 'grok-sdk') {
       const availableModels = validated?.models ?? [];
@@ -3172,9 +3184,12 @@ async function applyTransportModelSwitch(
     await handleGetSessions(serverLink);
     syncSubSessionIfNeeded(sessionName, serverLink);
   }
-  timelineEmitter.emit(sessionName, 'usage.update', { model: requestedModel, contextWindow }, { source: 'daemon', confidence: 'high' });
+  if (agentType === AGY_SDK_PROVIDER_ID && !isCurrentAgyModelOwner(nextRecord, transportRuntime)) return modelOwnerChanged(sessionName);
+  const deferred = agentType === AGY_SDK_PROVIDER_ID;
+  if (!deferred) timelineEmitter.emit(sessionName, 'usage.update', { model: requestedModel, contextWindow }, { source: 'daemon', confidence: 'high' });
   timelineEmitter.emit(sessionName, 'assistant.text', {
-    ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.MODEL_SWITCHED, `Switched model to ${requestedModel}`, { model: requestedModel }),
+    ...attachDaemonUserNotice(deferred ? DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PENDING : DAEMON_USER_NOTICE_CODE.MODEL_SWITCHED,
+      deferred ? `Saved model ${requestedModel}; it will apply to the next turn after the current turn finishes.` : `Switched model to ${requestedModel}`, { model: requestedModel }),
     streaming: false,
     automation: true,
     memoryExcluded: true,
@@ -3185,8 +3200,26 @@ async function applyTransportModelSwitch(
     agentType: agentType ?? '',
     model: requestedModel,
     ...(previousModel ? { previousModel } : {}),
-    applied: transportRuntime ? SESSION_MODEL_APPLIED.LIVE : SESSION_MODEL_APPLIED.NEXT_START,
+    applied: transportRuntime && !deferred ? SESSION_MODEL_APPLIED.LIVE : SESSION_MODEL_APPLIED.NEXT_START,
   };
+}
+
+function isCurrentAgyModelOwner(expected: SessionRecord, runtime: TransportSessionRuntime | undefined): boolean {
+  const current = getSession(expected.name);
+  return !!current && current.agentType === expected.agentType
+    && current.sessionInstanceId === expected.sessionInstanceId
+    && current.runtimeEpoch === expected.runtimeEpoch
+    && current.providerSessionId === expected.providerSessionId
+    && getTransportRuntime(expected.name) === runtime
+    && (!runtime || (current.providerSessionId === runtime.providerSessionId
+      && (!runtime.recipientIdentity || (current.sessionInstanceId === runtime.recipientIdentity.sessionInstanceId
+        && current.runtimeEpoch === runtime.recipientIdentity.runtimeEpoch))));
+}
+
+function modelOwnerChanged(sessionName: string): SessionModelSwitchResult {
+  // A stale operation must not post a notice into the replacement's timeline.
+  return { ok: false, sessionName, code: SESSION_MODEL_CONTROL_ERROR.SESSION_CHANGED,
+    error: 'Session changed while switching model; retry against the current session' };
 }
 
 function resolveModelControlTarget(sessionName: string):
@@ -3225,6 +3258,7 @@ export async function switchSessionModelNow(sessionName: string, model?: string,
   if (!target.ok) return { ok: false, sessionName, code: target.code, error: target.error };
   const release = await getMutex(sessionName).acquire();
   try {
+    if (target.record.agentType === AGY_SDK_PROVIDER_ID && !isCurrentAgyModelOwner(target.record, target.runtime)) return modelOwnerChanged(sessionName);
     const latest = getSession(sessionName) ?? target.record;
     const switched = await applyTransportModelSwitch(latest, target.runtime, requested);
     if (!switched.ok) return switched;

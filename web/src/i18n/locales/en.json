@@ -329,6 +329,7 @@
       "fast_mode_off": "Fast mode is off for this session.",
       "unknown_model": "⚠️ Model {{model}} is not available for this provider.",
       "model_switched": "Switched model to {{model}}.",
+      "model_switch_pending": "Saved model {{model}}; it will apply to the next turn after the current turn finishes.",
       "model_switch_proof_gated": "⚠️ Model switching for {{model}} is unavailable until the provider capability is verified.",
       "thinking_level_unsupported": "⚠️ Thinking level {{level}} is not supported by this provider.",
       "thinking_level_switched": "Switched thinking level to {{level}}.",

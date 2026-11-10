@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
+import { switchSessionModelNow } from '../../src/daemon/command-handler.js';
+import { SESSION_MODEL_APPLIED } from '../../shared/session-model-control.js';
 import { AgySdkProvider } from '../../src/agent/providers/agy-sdk.js';
 import * as store from '../../src/store/session-store.js';
 import { getTransportRuntime, launchTransportSession, stopTransportRuntimeSession } from '../../src/agent/session-manager.js';
@@ -32,8 +34,9 @@ beforeEach(async () => {
   mkdirSync(path.join(home, '.imcodes'));
   vi.stubEnv('HOME', home); vi.stubEnv('USERPROFILE', home); vi.stubEnv('IMCODES_HOME', path.join(home, '.imcodes'));
   resetTransportQueueStoreForTests(); store.resetSessionStoreAuthorityForTests(); await store.loadStore({ probe: false });
-  const bin = writeAgyNativeChildFixture(home);
+  const bin = writeAgyNativeChildFixture(home, { controlledTurns: true });
   provider = new AgySdkProvider(); await provider.connect({ binaryPath: bin });
+  vi.spyOn(provider, 'listModels').mockResolvedValue({ models: [] });
 });
 afterEach(async () => {
   for (const name of names) await stopTransportRuntimeSession(name).catch(() => {});
@@ -167,8 +170,168 @@ describe('AG manager start ownership (real runtime, SQLite and SDK child)', () =
   it('never turns legacy unknown without a native ID into an implicit fresh launch', async () => {
     const name = names[0];
     store.upsertSession({ name, projectName: 'realproj', role: 'brain', agentType: AGY_SDK_PROVIDER_ID, providerId: AGY_SDK_PROVIDER_ID, projectDir: home, state: 'idle', restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1 });
+    const legacy = store.getSession(name)!;
+    getTransportQueueStore().enqueue({ sessionName: name, recipient: { sessionInstanceId: legacy.sessionInstanceId!, runtimeEpoch: legacy.runtimeEpoch! }, text: 'keep legacy pending', clientMessageId: 'legacy-pending' });
     await expect(launchTransportSession({ name, projectName: 'realproj', role: 'brain', agentType: AGY_SDK_PROVIDER_ID, projectDir: home, identityPrompt: 'fixture' })).rejects.toThrow('trusted resume id');
+    expect(getTransportQueueStore().hasDurableQueueAdmission(name, 'legacy-pending')).toBe(true);
     expect(readFileSync(path.join(home, 'launches'), 'utf8')).toBe('');
   });
 
+  it.each(names)('keeps %s pre-native model choice through disk and one first spawn', async name => {
+    const options = { name, projectName: 'realproj', role: name === names[0] ? 'brain' as const : 'w1' as const,
+      agentType: AGY_SDK_PROVIDER_ID, projectDir: home, requestedModel: 'fixture-A', identityPrompt: 'fixture' };
+    await launchTransportSession({ ...options, fresh: true });
+    await expect(switchSessionModelNow(name, 'fixture-B')).resolves.toMatchObject({ ok: true, model: 'fixture-B' });
+    await store.flushStore({ requireWrite: true });
+    await stopTransportRuntimeSession(name);
+    await store.loadStore({ probe: false });
+    expect(store.getSession(name)?.requestedModel).toBe('fixture-B');
+    await launchTransportSession({ ...options, requestedModel: undefined });
+    const runtime = getTransportRuntime(name)!;
+    runtime.send('after model choice', 'model-first');
+    await vi.waitFor(() => expect(runtime.sending).toBe(false), { timeout: 5000 });
+    expect(readFileSync(path.join(home, 'models'), 'utf8').trim().split('\n').map(s => JSON.parse(s))).toEqual(['fixture-B']);
+  });
+
+  it('uses the selected model on the next native process after a busy turn finishes', async () => {
+    const name = names[1];
+    await launchTransportSession({ name, projectName: 'realproj', role: 'w1', agentType: AGY_SDK_PROVIDER_ID,
+      projectDir: home, requestedModel: 'fixture-A', identityPrompt: 'fixture', fresh: true });
+    const runtime = getTransportRuntime(name)!;
+    runtime.send('fixture-hold', 'model-hold');
+    await vi.waitFor(() => expect(readFileSync(path.join(home, 'inputs'), 'utf8')).toContain('fixture-hold'));
+    await vi.waitFor(() => expect(store.getSession(name)?.providerResumeId).toBeTruthy());
+    const native = store.getSession(name)!.providerResumeId;
+    const completedModels: unknown[] = [];
+    const off = provider.onComplete((_sid, message) => completedModels.push(message.metadata?.model));
+    const result = await switchSessionModelNow(name, 'fixture-B');
+    expect(store.getSession(name)).toMatchObject({ requestedModel: 'fixture-B', activeModel: 'fixture-A' });
+    writeFileSync(path.join(home, 'release'), 'go');
+    await vi.waitFor(() => expect(runtime.sending).toBe(false), { timeout: 5000 });
+    runtime.send('next model turn', 'model-next');
+    await vi.waitFor(() => expect(runtime.sending).toBe(false), { timeout: 5000 });
+    expect(readFileSync(path.join(home, 'models'), 'utf8').trim().split('\n').map(s => JSON.parse(s))).toEqual(['fixture-A', 'fixture-B']);
+    expect(store.getSession(name)?.providerResumeId).toBe(native);
+    expect(result).toMatchObject({ ok: true, applied: SESSION_MODEL_APPLIED.NEXT_START });
+    expect(completedModels).toEqual(['fixture-A', 'fixture-B']);
+    off();
+  });
+
+  it('does not restore a stale owner after asynchronous model validation', async () => {
+    const name = names[1];
+    const options = { name, projectName: 'realproj', role: 'w1' as const, agentType: AGY_SDK_PROVIDER_ID,
+      projectDir: home, requestedModel: 'fixture-A', identityPrompt: 'fixture', fresh: true };
+    await launchTransportSession(options);
+    let release!: (value: { models: [] }) => void;
+    const validation = vi.spyOn(provider, 'listModels').mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const switching = switchSessionModelNow(name, 'fixture-B');
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    await stopTransportRuntimeSession(name);
+    await launchTransportSession({ ...options, requestedModel: 'fixture-C' });
+    const next = { ...store.getSession(name)! };
+    release({ models: [] });
+    const switched = await switching;
+    expect.soft(store.getSession(name)).toEqual(next);
+    expect.soft(switched).toMatchObject({ ok: false });
+    validation.mockRestore();
+    const runtime = getTransportRuntime(name)!;
+    runtime.send('valid new owner', 'model-valid');
+    await vi.waitFor(() => expect(runtime.sending).toBe(false), { timeout: 5000 });
+    expect.soft(runtime.lastProviderError?.message).not.toBe('AG start owner changed');
+    expect(readFileSync(path.join(home, 'models'), 'utf8').trim()).toBe(JSON.stringify('fixture-C'));
+  });
+
+  it.each(names)('keeps owned native context across idle A-B-A and reload for %s', async name => {
+    const options = { name, projectName: 'realproj', role: name === names[0] ? 'brain' as const : 'w1' as const,
+      agentType: AGY_SDK_PROVIDER_ID, projectDir: home, requestedModel: 'fixture-A', identityPrompt: 'fixture' };
+    await launchTransportSession({ ...options, fresh: true });
+    const runtime = getTransportRuntime(name)!;
+    runtime.send('first model', 'aba-first');
+    await vi.waitFor(() => expect(runtime.sending).toBe(false), { timeout: 5000 });
+    await vi.waitFor(() => expect(store.getSession(name)?.providerResumeId).toBeTruthy());
+    const native = store.getSession(name)!.providerResumeId;
+    for (const [model, id] of [['fixture-B', 'aba-second'], ['fixture-A', 'aba-third']]) {
+      await expect(switchSessionModelNow(name, model)).resolves.toMatchObject({ ok: true, applied: SESSION_MODEL_APPLIED.NEXT_START });
+      runtime.send('turn on ' + model, id);
+      await vi.waitFor(() => expect(runtime.sending).toBe(false), { timeout: 5000 });
+      expect(store.getSession(name)?.activeModel).toBe(model);
+    }
+    await store.flushStore({ requireWrite: true });
+    await stopTransportRuntimeSession(name);
+    await store.loadStore({ probe: false });
+    expect(store.getSession(name)).toMatchObject({ providerResumeId: native, requestedModel: 'fixture-A', activeModel: 'fixture-A' });
+    expect(readFileSync(path.join(home, 'models'), 'utf8').trim().split('\n').map(s => JSON.parse(s))).toEqual(['fixture-A', 'fixture-B', 'fixture-A']);
+    const launches = readFileSync(path.join(home, 'launches'), 'utf8').trim().split('\n').map(s => JSON.parse(s));
+    expect(launches).toEqual([{ id: native, resumed: false }, { id: native, resumed: true }, { id: native, resumed: true }]);
+  });
+
+  it('keeps a queued next turn on the saved model without replay', async () => {
+    const name = names[1];
+    await launchTransportSession({ name, projectName: 'realproj', role: 'w1', agentType: AGY_SDK_PROVIDER_ID,
+      projectDir: home, requestedModel: 'fixture-A', identityPrompt: 'fixture', fresh: true });
+    const runtime = getTransportRuntime(name)!;
+    runtime.send('fixture-hold', 'queued-old');
+    await vi.waitFor(() => expect(readFileSync(path.join(home, 'inputs'), 'utf8')).toContain('fixture-hold'));
+    await switchSessionModelNow(name, 'fixture-B');
+    expect(runtime.send('queued next model', 'queued-new')).toBe('queued');
+    writeFileSync(path.join(home, 'release'), 'go');
+    await vi.waitFor(() => expect(readFileSync(path.join(home, 'inputs'), 'utf8')).toContain('queued next model'), { timeout: 5000 });
+    await vi.waitFor(() => expect(runtime.sending).toBe(false), { timeout: 5000 });
+    for (let i = 0; i < 3; i++) { runtime.rehydratePendingFromStore(); runtime.drainPendingIfIdle(); }
+    expect(readFileSync(path.join(home, 'inputs'), 'utf8').trim().split('\n')).toHaveLength(2);
+    expect(readFileSync(path.join(home, 'models'), 'utf8').trim().split('\n').map(s => JSON.parse(s))).toEqual(['fixture-A', 'fixture-B']);
+  });
+
+  it('refuses a model operation queued behind an owner replacement, then accepts a fresh retry', async () => {
+    const name = names[1];
+    const options = { name, projectName: 'realproj', role: 'w1' as const, agentType: AGY_SDK_PROVIDER_ID,
+      projectDir: home, requestedModel: 'fixture-A', identityPrompt: 'fixture', fresh: true };
+    await launchTransportSession(options);
+    let release!: (value: { models: [] }) => void;
+    vi.spyOn(provider, 'listModels').mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const first = switchSessionModelNow(name, 'fixture-B');
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    const queued = switchSessionModelNow(name, 'fixture-D');
+    await stopTransportRuntimeSession(name);
+    await launchTransportSession({ ...options, requestedModel: 'fixture-C' });
+    const next = { ...store.getSession(name)! };
+    release({ models: [] });
+    await expect(first).resolves.toMatchObject({ ok: false });
+    await expect(queued).resolves.toMatchObject({ ok: false });
+    expect(store.getSession(name)).toEqual(next);
+    await expect(switchSessionModelNow(name, 'fixture-B')).resolves.toMatchObject({ ok: true });
+    const runtime = getTransportRuntime(name)!;
+    runtime.send('fresh retry', 'retry-new');
+    await vi.waitFor(() => expect(runtime.sending).toBe(false), { timeout: 5000 });
+    expect(readFileSync(path.join(home, 'models'), 'utf8').trim()).toBe(JSON.stringify('fixture-B'));
+  });
+
+  it('refuses an already mismatched runtime and invalid whitespace without touching current authority', async () => {
+    const name = names[1];
+    await launchTransportSession({ name, projectName: 'realproj', role: 'w1', agentType: AGY_SDK_PROVIDER_ID,
+      projectDir: home, requestedModel: 'fixture-A', identityPrompt: 'fixture', fresh: true });
+    store.upsertSession({ ...store.getSession(name)!, runtimeEpoch: 'next-model-owner' });
+    const current = { ...store.getSession(name)! };
+    await expect(switchSessionModelNow(name, 'fixture-B')).resolves.toMatchObject({ ok: false });
+    await expect(switchSessionModelNow(name, 'invalid model')).resolves.toMatchObject({ ok: false });
+    expect(store.getSession(name)).toEqual(current);
+    expect(readFileSync(path.join(home, 'launches'), 'utf8')).toBe('');
+  });
+
+  it('keeps the pending selection and native ID after cancelling the active old-model turn', async () => {
+    const name = names[1];
+    await launchTransportSession({ name, projectName: 'realproj', role: 'w1', agentType: AGY_SDK_PROVIDER_ID,
+      projectDir: home, requestedModel: 'fixture-A', identityPrompt: 'fixture', fresh: true });
+    const runtime = getTransportRuntime(name)!;
+    runtime.send('fixture-hold', 'cancel-old');
+    await vi.waitFor(() => expect(store.getSession(name)?.providerResumeId).toBeTruthy());
+    const native = store.getSession(name)!.providerResumeId;
+    await switchSessionModelNow(name, 'fixture-B');
+    await runtime.cancel({ waitForProvider: true });
+    runtime.send('after cancel', 'cancel-new');
+    await vi.waitFor(() => expect(runtime.sending).toBe(false), { timeout: 5000 });
+    expect(store.getSession(name)).toMatchObject({ providerResumeId: native, requestedModel: 'fixture-B', activeModel: 'fixture-B' });
+    expect(readFileSync(path.join(home, 'models'), 'utf8').trim().split('\n').map(s => JSON.parse(s))).toEqual(['fixture-A', 'fixture-B']);
+    expect(readFileSync(path.join(home, 'inputs'), 'utf8').trim().split('\n')).toHaveLength(2);
+  });
 });

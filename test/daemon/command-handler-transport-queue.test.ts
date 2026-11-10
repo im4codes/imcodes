@@ -6755,9 +6755,15 @@ describe('handleWebCommand transport queue behavior', () => {
       runtimeType: 'transport',
       state: 'running',
       requestedModel: 'gemini-2.5-pro',
+      activeModel: 'gemini-2.5-pro',
+      modelDisplay: 'gemini-2.5-pro',
+      providerSessionId: 'provider-route-agy',
+      sessionInstanceId: 'agy-instance',
+      runtimeEpoch: 'agy-epoch',
     });
     getTransportRuntimeMock.mockReturnValue({
       providerSessionId: 'provider-route-agy',
+      recipientIdentity: { sessionInstanceId: 'agy-instance', runtimeEpoch: 'agy-epoch' },
       setAgentId,
     });
 
@@ -6772,9 +6778,12 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(setAgentId).toHaveBeenCalledWith('gemini-2.5-flash');
     expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
       requestedModel: 'gemini-2.5-flash',
-      activeModel: 'gemini-2.5-flash',
-      modelDisplay: 'gemini-2.5-flash',
+      activeModel: 'gemini-2.5-pro',
+      modelDisplay: 'gemini-2.5-pro',
     }));
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'assistant.text', expect.objectContaining({
+      noticeCode: DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PENDING,
+    }), expect.any(Object));
   });
 
   it('switches model for muse-code-sdk transport sessions via /model', async () => {

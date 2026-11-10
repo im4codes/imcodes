@@ -329,6 +329,7 @@
       "fast_mode_off": "El modo rápido está desactivado.",
       "unknown_model": "⚠️ El modelo {{model}} no está disponible para este proveedor.",
       "model_switched": "Modelo cambiado a {{model}}.",
+      "model_switch_pending": "Se guardó el modelo {{model}}; se aplicará al siguiente turno cuando termine el actual.",
       "model_switch_proof_gated": "⚠️ El cambio al modelo {{model}} no está disponible hasta verificar la capacidad del proveedor.",
       "thinking_level_unsupported": "⚠️ El nivel de razonamiento {{level}} no es compatible con este proveedor.",
       "thinking_level_switched": "Nivel de razonamiento cambiado a {{level}}.",

@@ -329,6 +329,7 @@
       "fast_mode_off": "此工作階段已關閉快速模式。",
       "unknown_model": "⚠️ 此提供者不支援模型 {{model}}。",
       "model_switched": "已切換至模型 {{model}}。",
+      "model_switch_pending": "已儲存模型 {{model}}；目前回合結束後，將於下一回合使用。",
       "model_switch_proof_gated": "⚠️ 提供者能力驗證前不可切換到模型 {{model}}。",
       "thinking_level_unsupported": "⚠️ 此提供者不支援思考層級 {{level}}。",
       "thinking_level_switched": "已切換至思考層級 {{level}}。",
