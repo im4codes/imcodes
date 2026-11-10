@@ -116,6 +116,19 @@ describe('AG native ACP', () => {
     expect((await requests()).filter(x => x.method === 'session/prompt')).toHaveLength(2);
     expect(await provider.notifyActiveDelegation(id, notification('C'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
   });
+  it('replaces a pending startup owner even when the canonical route is unchanged', async () => {
+    const { provider, requests } = await setup(); let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const id = await route(provider, 'deck_test_agy_owner', { beforeNativeSessionStart: () => gate });
+    const oldSend = provider.send(id, 'old-owner').then(() => 'sent', error => error.code);
+    await new Promise(resolve => setTimeout(resolve, 15));
+    try {
+      await route(provider, id, { beforeNativeSessionStart: async () => {} });
+      await expect(provider.send(id, 'new-owner')).resolves.toBeUndefined();
+    } finally { release(); }
+    expect(await oldSend).toBe(PROVIDER_ERROR_CODES.CANCELLED);
+    expect((await requests()).filter(x => x.method === 'session/prompt').map(x => x.params.prompt[0].text)).toEqual(['new-owner']);
+  });
   it('ignores old native-session updates and terminals after delete/recreate of the route', async () => {
     const { provider } = await setup(); const id = await route(provider); const complete = vi.fn(), deltas = vi.fn(); provider.onComplete(complete); provider.onDelta(deltas);
     await provider.send(id, 'A');

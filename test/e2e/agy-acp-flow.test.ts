@@ -1,3 +1,4 @@
+import { AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES } from '../../shared/agent-delegation.js';
 import { AGY_ACP_AGENT_NAME } from '../../shared/agy-agent.js';
 import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -31,6 +32,7 @@ afterEach(async () => { off?.(); await stopTransportRuntimeSession(NAME); remove
 describe('real AG ACP SDK/runtime/durable store/relay', () => {
   it('admits human Append and MCP append during A, no premature completion/FIFO replay, persists exact native identity', async () => {
     const runtime = getTransportRuntime(NAME)!;
+    expect(getProvider(AGY_SDK_PROVIDER_ID)?.capabilities.activeDelegationNotification).toBe(AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE);
     expect(getSession(NAME)?.agyNativeSessionState).toBe(AGY_NATIVE_SESSION_STATE.UNSTARTED);
     runtime.send('RUN_A', 'e2e-agy-acp-a');
     await vi.waitFor(async () => expect((await requests()).some(x => x.method === 'session/prompt')).toBe(true));

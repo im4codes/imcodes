@@ -440,12 +440,6 @@ export class KimiSdkProvider implements TransportProvider {
     const routeId = config.bindExistingKey ?? config.sessionKey;
     const prior = this.sessions.get(routeId);
     const existing = config.fresh ? undefined : prior;
-    if (this.profile.steeringPrompts && existing
-      && (!config.resumeId || config.resumeId === existing.acpSessionId)) {
-      existing.model = typeof config.agentId === 'string' ? config.agentId : existing.model;
-      existing.beforeNativeSessionStart = config.beforeNativeSessionStart ?? existing.beforeNativeSessionStart;
-      return routeId;
-    }
     const state: KimiSdkSessionState = {
       routeId,
       sessionName: config.sessionName ?? existing?.sessionName,
@@ -465,7 +459,9 @@ export class KimiSdkProvider implements TransportProvider {
       activePromptAdmissions: existing?.activePromptAdmissions ?? new Map(),
       turnGeneration: existing?.turnGeneration ?? 0,
       settledGeneration: existing?.settledGeneration ?? 0,
-      activePromptGenerations: existing?.activePromptGenerations ?? new Set(),
+      // A new initializer is a new authority even for the same route. Do not
+      // inherit the old owner's unresolved RPC generations into its successor.
+      activePromptGenerations: this.profile.steeringPrompts ? new Set() : existing?.activePromptGenerations ?? new Set(),
       replaying: false,
       cancelled: false,
       currentMessageId: null,
