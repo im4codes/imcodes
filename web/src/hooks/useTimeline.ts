@@ -6,6 +6,7 @@ import {
 } from '../../../src/shared/timeline/types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
+import { getTimelineSendId, TIMELINE_OPTIMISTIC_EVENT_ID_PREFIX as OPTIMISTIC_EVENT_ID_PREFIX, TIMELINE_SEND_METADATA_FIELDS } from '@shared/timeline-send-identity.js';
 import {
   TIMELINE_CURSOR_DIRECTIONS,
   TIMELINE_DETAIL_FIELD_PATHS as SHARED_TIMELINE_DETAIL_FIELD_PATHS,
@@ -603,7 +604,6 @@ const TIMELINE_HISTORY_AFTER_TS_OVERLAP_MS = 1;
 // 5s is enough to catch the JSONL delay without hiding legitimate repeated messages.
 const USER_MSG_DEDUP_WINDOW_MS = 5_000;
 const PROVISIONAL_TRANSPORT_HISTORY_PREFIX = 'transport-history:';
-const OPTIMISTIC_EVENT_ID_PREFIX = 'optimistic:';
 const TIMELINE_SNAPSHOT_WRITE_DELAY_MS = 750;
 // Streaming assistant.text deltas are NOT written to IDB per-tick (too frequent —
 // see shouldPersistTimelineEvent). Instead, persist the LATEST streaming text to
@@ -1312,14 +1312,7 @@ function isProvisionalTransportHistoryEvent(event: TimelineEvent): boolean {
 
 function getUserMessageCommandId(event: TimelineEvent): string | undefined {
   if (event.type !== 'user.message') return undefined;
-  const commandId = typeof event.payload.commandId === 'string'
-    ? event.payload.commandId.trim()
-    : '';
-  if (commandId) return commandId;
-  const clientMessageId = typeof event.payload.clientMessageId === 'string'
-    ? event.payload.clientMessageId.trim()
-    : '';
-  return clientMessageId || undefined;
+  return getTimelineSendId(event.payload);
 }
 
 function isLocalOptimisticUserMessage(event: TimelineEvent): boolean {
@@ -1389,6 +1382,11 @@ function convertTransportHistoryRecordToTimelineEvent(
 
   if (rawType === 'user.message' && typeof record.text === 'string') {
     const payload: Record<string, unknown> = { text: record.text };
+    for (const key of TIMELINE_SEND_METADATA_FIELDS) {
+      // Keep the existing validation of legacy identifier/queue fields below.
+      if (key === 'commandId' || key === 'clientMessageId' || key === 'queueAppended' || key === 'pendingMessageVersion') continue;
+      if (Object.prototype.hasOwnProperty.call(record, key)) payload[key] = record[key];
+    }
     const commandId = typeof record.commandId === 'string' ? record.commandId.trim() : '';
     const clientMessageId = typeof record.clientMessageId === 'string' ? record.clientMessageId.trim() : '';
     if (commandId) payload.commandId = commandId;
@@ -1400,6 +1398,7 @@ function convertTransportHistoryRecordToTimelineEvent(
     }
     return {
       ...base,
+      ...(typeof record.eventId === 'string' && record.eventId.trim() ? { eventId: record.eventId } : {}),
       type: 'user.message',
       payload,
     };
@@ -5249,19 +5248,15 @@ export function useTimeline(
         // user.message: remove matching optimistic (pending) event, then dedup
         // against already-confirmed events (JSONL watcher re-emits same text ~2s later).
         let userMessageAlreadyMerged = false;
-        if (event.type === 'user.message' && event.payload.text) {
-          const text = String(event.payload.text).trim();
+        if (event.type === 'user.message' && (event.payload.text || getTimelineSendId(event.payload))) {
+          const text = String(event.payload.text ?? '').trim();
           const normalizedText = normalizeForEcho(text);
           const allowDuplicate = event.payload.allowDuplicate === true;
           // Transport path already attaches the originating commandId as
           // `clientMessageId` in the payload; prefer that for reconciliation
           // since text-based matching loses when the agent echoes a normalized
           // or retried version of the prompt.
-          const echoCommandId = typeof event.payload.commandId === 'string'
-            ? event.payload.commandId
-            : typeof event.payload.clientMessageId === 'string'
-              ? event.payload.clientMessageId
-              : undefined;
+          const echoCommandId = getTimelineSendId(event.payload);
           let skipAppend = false;
           setEvents((prev) => {
             const base = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
@@ -5300,7 +5295,9 @@ export function useTimeline(
             const optimisticTextIdx = base.findIndex(
               (e) =>
                 e.type === 'user.message'
+                && normalizedText.length > 0
                 && (e.payload.pending || e.payload.failed || isLocalOptimisticUserMessage(e))
+                && (!echoCommandId || !getUserMessageCommandId(e))
                 && normalizeForEcho(String(e.payload.text ?? '')) === normalizedText,
             );
             if (optimisticTextIdx >= 0) {
@@ -5337,7 +5334,7 @@ export function useTimeline(
               return withoutPending;
             }
             // No pending event — check for confirmed dedup (JSONL re-emit)
-            const isDup = !allowDuplicate && base.some(
+            const isDup = text.length > 0 && !echoCommandId && !allowDuplicate && base.some(
               (e) =>
                 e.type === 'user.message' &&
                 e.payload.allowDuplicate !== true &&

@@ -4398,7 +4398,7 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
       ...(requestedUiLocale ? { uiLocale: requestedUiLocale } : {}),
     };
     const payload = { ...base, ...(extra ?? {}) };
-    timelineEmitter.emit(
+    const emitted = timelineEmitter.emit(
       sessionName,
       'user.message',
       payload,
@@ -4413,7 +4413,7 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
         eventId: eventId ?? `transport-user:${effectiveId}`,
       },
     );
-    persistTransportUserMessage(sessionName, payloadText, payload);
+    persistTransportUserMessage(sessionName, payloadText, payload, emitted?.eventId);
   };
 
   const emitDelegationError = (error: AgentDelegationErrorCode | 'delegation_dispatch_failed', detail?: string, targetSession?: string): void => {
@@ -6052,7 +6052,7 @@ function emitActiveQueueAppendResult(sessionName: string, result: Extract<import
       payload,
       { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.clientMessageId}` },
     );
-    persistTransportUserMessage(sessionName, entry.text, payload);
+    persistTransportUserMessage(sessionName, entry.text, payload, `transport-user:${entry.clientMessageId}`);
   }
   for (const fact of result.projectionCommitted ? [] : result.deliveryFacts) {
     timelineEmitter.emit(sessionName, 'transport.queue.delivery', { ...fact }, {
