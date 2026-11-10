@@ -9,6 +9,7 @@ export const SESSION_MODEL_CONTROL_ERROR = {
   SESSION_CHANGED: 'session_changed',
   UNSUPPORTED_RUNTIME: 'unsupported_runtime',
   UNKNOWN_MODEL: 'unknown_model',
+  MODEL_SWITCH_FAILED: 'model_switch_failed',
   UNKNOWN_THINKING_LEVEL: 'unknown_thinking_level',
   THINKING_UNSUPPORTED: 'thinking_unsupported',
   PROOF_GATED: 'model_switch_proof_gated',
@@ -18,6 +19,11 @@ export const SESSION_MODEL_APPLIED = {
   LIVE: 'live',
   NEXT_START: 'next_start',
 } as const;
+
+export type SessionModelApplied = typeof SESSION_MODEL_APPLIED[keyof typeof SESSION_MODEL_APPLIED];
+
+/** A native model RPC must not hold model controls indefinitely. */
+export const SESSION_MODEL_APPLY_TIMEOUT_MS = 5000;
 
 export type SessionModelControlError =
   typeof SESSION_MODEL_CONTROL_ERROR[keyof typeof SESSION_MODEL_CONTROL_ERROR];
@@ -36,8 +42,9 @@ export type SessionModelSwitchResult =
       thinking?: string;
       previousThinking?: string;
       thinkingApplied?: typeof SESSION_MODEL_APPLIED[keyof typeof SESSION_MODEL_APPLIED];
-      /** `live`: the running runtime switched now. `next_start`: saved for
-       * the next native start, including CLI-only switches after a busy turn. */
+      /** `live`: effective now (or already the current model). `next_start`:
+       * selected for the next native turn/start; an in-flight turn stays on
+       * its captured model even if a session-config RPC acknowledged it. */
       applied: typeof SESSION_MODEL_APPLIED[keyof typeof SESSION_MODEL_APPLIED];
     }
   | { ok: false; sessionName: string; code: SessionModelControlError; error: string; availableModels?: string[]; availableThinkingLevels?: string[] };

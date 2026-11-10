@@ -800,6 +800,11 @@ export interface TransportProvider {
    */
   setSessionAgentId?(sessionId: string, agentId: string): void;
 
+  /** Confirm native model selection. LIVE means effective now; NEXT_START
+   * includes an ACKed selection pending behind the current captured turn.
+   * Absence keeps the existing next-start setter contract. */
+  applySessionModel?(sessionId: string, agentId: string): Promise<import('../../shared/session-model-control.js').SessionModelApplied>;
+
   /**
    * Update provider-side reasoning/thinking effort for an existing session record.
    * Used by local-sdk providers that apply the effort on subsequent turns.

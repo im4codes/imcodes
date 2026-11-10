@@ -1,3 +1,4 @@
+import { SESSION_MODEL_APPLIED } from '../../shared/session-model-control.js';
 import { AGY_SDK_PROVIDER_ID, AGY_NATIVE_START_NOT_ATTEMPTED } from '../../shared/agy-agent.js';
 import { queuedPairWakeAllowed } from '../daemon/task-pairs/wake-authority.js';
 import { withMemoryMcpSessionEnv } from './providers/getDefaultMcpServers.js';
@@ -1336,6 +1337,21 @@ export class TransportSessionRuntime implements SessionRuntime {
       this.provider.setSessionAgentId?.(this._providerSessionId, agentId);
     }
   }
+  get supportsConfirmedModelSelection(): boolean { return typeof this.provider.applySessionModel === 'function'; }
+
+  async applyAgentId(agentId: string): Promise<import('../../shared/session-model-control.js').SessionModelApplied> {
+    const sid = this._providerSessionId;
+    if (!sid || !this.provider.applySessionModel) {
+      this.setAgentId(agentId);
+      return SESSION_MODEL_APPLIED.NEXT_START;
+    }
+    const applied = await this.provider.applySessionModel(sid, agentId);
+    // The caller rechecks the complete durable runtime owner after this await.
+    if (this._providerSessionId !== sid) throw new Error('Model selection owner changed');
+    this._agentId = agentId;
+    return applied;
+  }
+
   setEffort(effort: TransportEffortLevel): void {
     this._effort = effort;
     if (this._providerSessionId) {

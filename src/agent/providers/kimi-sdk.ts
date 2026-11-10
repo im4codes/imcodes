@@ -129,6 +129,9 @@ import {
 } from '../../../shared/sdk-subagent-status.js';
 import { NATIVE_AGENT_ADMISSION_MODES } from '../../../shared/native-collaboration-policy.js';
 
+import { SESSION_MODEL_APPLIED, SESSION_MODEL_APPLY_TIMEOUT_MS, type SessionModelApplied } from '../../../shared/session-model-control.js';
+import { withTimeoutOutcome } from '../../util/timeout-outcome.js';
+
 const KIMI_BIN = 'kimi';
 /** Kimi ACP currently advertises one mode named `default`. */
 const KIMI_DEFAULT_MODE = 'default';
@@ -215,6 +218,12 @@ interface KimiSdkSessionState {
   contextNamespace?: SessionConfig['contextNamespace'];
   model?: string;
   confirmedModel?: string;
+  modelRevision: number;
+  modelControlIntent?: { previous?: string };
+  modelApplyTail?: Promise<void>;
+  modelApplyRequest?: { model: string; revision: number; promise: Promise<void> };
+  /** Model captured by the current native executor; steering keeps this turn. */
+  turnModel?: string;
   beforeNativeSessionStart?: SessionConfig['beforeNativeSessionStart'];
   /** Highest steering RPC's terminal wins even if replies arrive out of order. */
   steeringTerminal?: { generation: number; stopReason: StopReason };
@@ -450,6 +459,7 @@ export class KimiSdkProvider implements TransportProvider {
       contextNamespace: config.contextNamespace ?? existing?.contextNamespace,
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
       confirmedModel: existing?.confirmedModel,
+      modelRevision: 0,
       beforeNativeSessionStart: config.beforeNativeSessionStart ?? existing?.beforeNativeSessionStart,
       acpSessionId: config.resumeId ?? existing?.acpSessionId,
       loaded: false,
@@ -517,6 +527,9 @@ export class KimiSdkProvider implements TransportProvider {
     if (state.loaded) return true;
     try {
       await this.ensureSessionReady(state.routeId, state);
+      if (this.profile.strictModelSelection && !state.promptInFlight && state.confirmedModel) {
+        this.emitSessionInfo(state.routeId, { model: state.confirmedModel });
+      }
       return true;
     } catch {
       return false;
@@ -611,7 +624,7 @@ export class KimiSdkProvider implements TransportProvider {
   setSessionAgentId(sessionId: string, agentId: string): void {
     const state = this.sessions.get(sessionId);
     if (!state) return;
-    state.model = agentId;
+    if (state.model !== agentId) { state.model = agentId; state.modelRevision++; state.modelControlIntent = undefined; }
     if (this.profile.strictModelSelection) return;
     // If session already loaded, best-effort push the model change via the
     // experimental RPC. Swallow errors: if the CLI version predates it,
@@ -632,6 +645,81 @@ export class KimiSdkProvider implements TransportProvider {
         });
       }
     }
+  }
+
+  /** Only AG exposes this confirmed selection contract. Other ACP profiles
+   * retain their existing best-effort setSessionAgentId behavior. */
+  protected async applyStrictSessionModel(sessionId: string, model: string): Promise<SessionModelApplied> {
+    const state = this.sessions.get(sessionId);
+    if (!state) throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, 'ACP model session not found', false);
+    const previous = state.modelControlIntent ? state.modelControlIntent.previous : state.model;
+    this.setSessionAgentId(sessionId, model);
+    if (!state.loaded || !state.acpSessionId || !this.connection || state.cancelled) return SESSION_MODEL_APPLIED.NEXT_START;
+    const intent = { previous };
+    state.modelControlIntent = intent;
+    try {
+      await this.confirmStrictSessionModel(sessionId, state);
+      // Native AG updates its session selection immediately, but an existing
+      // executor keeps its captured model until the next ordinary turn.
+      const pending = state.promptInFlight && state.turnModel !== model;
+      if (!pending) this.emitSessionInfo(sessionId, { model });
+      return pending ? SESSION_MODEL_APPLIED.NEXT_START : SESSION_MODEL_APPLIED.LIVE;
+    } catch (error) {
+      if (this.sessions.get(sessionId) === state && state.modelControlIntent === intent) {
+        state.model = previous;
+        state.modelRevision++;
+        // Explicit RPC rejection retains the last confirmed model. A timeout
+        // has already invalidated it below: that uncertain write needs a
+        // reconfirmation before another prompt.
+      }
+      throw this.normalizeError(error);
+    } finally {
+      if (state.modelControlIntent === intent) state.modelControlIntent = undefined;
+    }
+  }
+
+  private async confirmStrictSessionModel(sessionId: string, state: KimiSdkSessionState): Promise<void> {
+    const model = state.model;
+    if (!model) return;
+    const revision = state.modelRevision;
+    const connection = this.connection;
+    const nativeId = state.acpSessionId;
+    const assertOwner = () => {
+      this.assertCurrentSession(sessionId, state, connection);
+      if (state.acpSessionId !== nativeId || state.modelRevision !== revision || state.model !== model) {
+        throw this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'ACP model selection superseded', true);
+      }
+    };
+    assertOwner();
+    let request = state.modelApplyRequest;
+    if (!request || request.revision !== revision || request.model !== model) {
+      // Order native writes, not merely their callbacks. A late B ACK must not
+      // run after/publish over C; obsolete queued operations retire unwritten.
+      const promise = (state.modelApplyTail ?? Promise.resolve()).catch(() => {}).then(async () => {
+        assertOwner();
+        if (state.confirmedModel !== model) {
+          const setter = connection?.unstable_setSessionModel;
+          if (!setter || !nativeId) throw this.makeError(PROVIDER_ERROR_CODES.CONFIG_ERROR, 'ACP model selection unsupported', false);
+          await setter.call(connection, { sessionId: nativeId, modelId: model });
+          // Even a superseded successful RPC changed native state. Invalidate
+          // the old cached model before the intent check (A→B→A must reapply A).
+          if (this.sessions.get(sessionId) === state && this.connection === connection && state.acpSessionId === nativeId) {
+            state.confirmedModel = undefined;
+          }
+          assertOwner();
+          state.confirmedModel = model;
+        }
+      });
+      request = { model, revision, promise };
+      state.modelApplyRequest = request;
+      state.modelApplyTail = promise.catch(() => {});
+    }
+    const outcome = await withTimeoutOutcome(request.promise, SESSION_MODEL_APPLY_TIMEOUT_MS);
+    if (outcome.timedOut) {
+      if (state.modelRevision === revision) { state.modelRevision++; state.confirmedModel = undefined; }
+      throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'ACP model selection was not confirmed before its deadline', true);
+    }
+    assertOwner();
   }
 
   refreshSessionSystemText(sessionId: string): void {
@@ -704,7 +792,14 @@ export class KimiSdkProvider implements TransportProvider {
 
   async cancel(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
-    if (!state || !state.promptInFlight) return;
+    if (!state) return;
+    if (state.modelControlIntent) {
+      state.model = state.modelControlIntent.previous;
+      state.confirmedModel = undefined;
+      state.modelControlIntent = undefined;
+    }
+    state.modelRevision++;
+    if (!state.promptInFlight) return;
     state.cancelled = true;
     if (!state.acpSessionId || !this.connection) return;
     this.cancelPendingApprovals(sessionId);
@@ -1120,6 +1215,7 @@ export class KimiSdkProvider implements TransportProvider {
       // before settleTurn ran.)
       state.currentText = '';
       state.currentMessageId = null;
+      state.turnModel = this.profile.strictModelSelection ? state.confirmedModel : undefined;
       const sessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
       const sessionContractKey = sessionSystemContractKey(sessionSystemText);
       const includeSessionSystemText = shouldInjectSessionSystemContract(
@@ -1165,8 +1261,8 @@ export class KimiSdkProvider implements TransportProvider {
         && state.settledGeneration !== generation
         && state.promptInFlight) {
         state.promptSubmittedGeneration = generation;
-        if (this.profile.strictModelSelection && state.confirmedModel) {
-          this.emitSessionInfo(sessionId, { model: state.confirmedModel });
+        if (this.profile.strictModelSelection && state.turnModel) {
+          this.emitSessionInfo(sessionId, { model: state.turnModel });
         }
       }
     } catch (err) {
@@ -1313,16 +1409,7 @@ export class KimiSdkProvider implements TransportProvider {
     }
 
     if (this.profile.strictModelSelection) {
-      // Capture the selection for this idle-to-running transition. A concurrent
-      // selection remains pending for the NEXT native turn, never mislabeled.
-      const requested = state.model;
-      if (requested && requested !== state.confirmedModel) {
-        const setter = this.connection?.unstable_setSessionModel;
-        if (!setter) throw this.makeError(PROVIDER_ERROR_CODES.CONFIG_ERROR, 'ACP model selection unsupported', false);
-        await setter.call(this.connection, { sessionId: state.acpSessionId!, modelId: requested });
-        this.assertCurrentSession(sessionId, state, connection);
-        state.confirmedModel = requested;
-      }
+      await this.confirmStrictSessionModel(sessionId, state);
     } else if (state.model && state.acpSessionId && this.connection) {
       const modelSetter = (this.connection as AcpAgent).unstable_setSessionModel;
       if (typeof modelSetter === 'function') {
@@ -1592,8 +1679,8 @@ export class KimiSdkProvider implements TransportProvider {
         status: 'complete',
         metadata: {
           stopReason,
-          ...((this.profile.strictModelSelection ? state.confirmedModel : state.model)
-            ? { model: this.profile.strictModelSelection ? state.confirmedModel : state.model } : {}),
+          ...((this.profile.strictModelSelection ? state.turnModel : state.model)
+            ? { model: this.profile.strictModelSelection ? state.turnModel : state.model } : {}),
           ...(state.acpSessionId ? { resumeId: state.acpSessionId } : {}),
           ...(turnUsage ? { usage: turnUsage } : {}),
         },
@@ -1614,8 +1701,8 @@ export class KimiSdkProvider implements TransportProvider {
       status: 'complete',
       metadata: {
         ...(compactControl ? { [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact' } : {}),
-        ...((this.profile.strictModelSelection ? state.confirmedModel : state.model)
-            ? { model: this.profile.strictModelSelection ? state.confirmedModel : state.model } : {}),
+        ...((this.profile.strictModelSelection ? state.turnModel : state.model)
+            ? { model: this.profile.strictModelSelection ? state.turnModel : state.model } : {}),
         ...(state.acpSessionId ? { resumeId: state.acpSessionId } : {}),
         ...(turnUsage ? { usage: turnUsage } : {}),
       },

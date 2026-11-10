@@ -13,7 +13,12 @@ if (process.argv.includes('--help')) { console.log('Usage: agy'); process.exit(0
 if (process.argv.includes('--version')) { console.log(process.env.AGY_ACP_FIXTURE_VERSION || '1.5.4'); process.exit(0); }
 const models = { currentModelId: 'model-a', availableModels: [{ modelId: 'model-a', name: 'Model A' }, { modelId: 'model-b', name: 'Model B' }] };
 function finish(sid, state) {
+  // Explicit process-fixture handshake, not a timing assumption about CI CPU.
+  if (logPath && fs.existsSync(logPath + '.hold')) {
+    state.timer = setTimeout(() => finish(sid, state), 10); return;
+  }
   state.timer = undefined;
+  record({ fixture: 'completed-model', sessionId: sid, model: state.turnModel });
   note(sid, { sessionUpdate: 'tool_call_update', toolCallId: 'sleep', status: 'completed', rawOutput: 'done' });
   note(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: state.inputs.join(' ') } });
   const pending = state.pending.splice(0);
@@ -35,7 +40,12 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       if (scenario === 'resume-history') note(p.sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'OLD_ERROR from history' } });
       return ok(req.id, { sessionId: p.sessionId, models });
     }
-    case 'session/set_model': return p.modelId === 'invalid' ? error(req.id, 'Unknown model') : ok(req.id);
+    case 'session/set_model': {
+      if (p.modelId === 'invalid' || scenario === 'model-error') return error(req.id, 'Unknown model');
+      if (scenario === 'model-unsupported') return error(req.id, 'Method unavailable');
+      const respond = () => { const state = sessions.get(p.sessionId); if (state) state.model = p.modelId; ok(req.id); };
+      return setTimeout(respond, p.modelId === 'model-b' && scenario === 'model-late' ? 180 : p.modelId === 'model-b' && scenario === 'model-timeout' ? 5500 : 0);
+    }
     case 'session/set_mode': return ok(req.id);
     case 'session/close': {
       const state = sessions.get(p.sessionId); if (state) { clearTimeout(state.timer); for (const id of state.pending) ok(id, { stopReason: 'cancelled' }); }
@@ -52,6 +62,8 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       if (text === 'B' && scenario === 'reject-b') return error(req.id, 'B was rejected');
       clearTimeout(state.timer);
       if (scenario !== 'reordered' && state.pending.length) for (const id of state.pending.splice(0)) ok(id, { stopReason: 'end_turn' });
+      if (!state.inputs.length) state.turnModel = state.model || models.currentModelId;
+      record({ fixture: 'prompt-model', sessionId: p.sessionId, model: state.turnModel, text });
       state.pending.push(req.id); state.inputs.push(text);
       note(p.sessionId, { sessionUpdate: 'user_message_chunk', content: { type: 'text', text } });
       if (state.inputs.length === 1) note(p.sessionId, { sessionUpdate: 'tool_call', toolCallId: 'sleep', title: 'Test sleep', kind: 'execute', status: 'in_progress', rawInput: { command: 'fixture-only' } });

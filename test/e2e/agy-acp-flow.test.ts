@@ -1,8 +1,10 @@
 import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
+import { handleWebCommand, runWithProcessSessionSendLock, switchSessionModelNow } from '../../src/daemon/command-handler.js';
+import { SESSION_MODEL_APPLIED } from '../../shared/session-model-control.js';
 import { SESSION_MODEL_COMMAND } from '../../shared/session-control-commands.js';
 import { AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES } from '../../shared/agent-delegation.js';
 import { AGY_ACP_AGENT_NAME } from '../../shared/agy-agent.js';
-import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile, rm, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -30,8 +32,11 @@ const PROJECT = 'e2e_agy_acp';
 let root: string, log: string, off: (() => void) | undefined;
 let events: TimelineEvent[];
 const requests = async () => (await readFile(log, 'utf8')).trim().split('\n').map(x => JSON.parse(x));
-const finalized = () => events.filter(e => e.type === 'assistant.text' && e.payload.streaming === false);
+const finalized = () => events.filter(e => e.type === 'assistant.text' && e.payload.streaming === false && !e.payload.automation);
 beforeEach(async () => {
+  // Each case creates a new session owner with this synthetic name. Retire the
+  // prior owner's latest-value dedupe snapshots before asserting new frames.
+  timelineEmitter.forgetSession(NAME);
   root = await mkdtemp(path.join(tmpdir(), 'imcodes-e2e-agy-acp-')); log = path.join(root, 'rpc.jsonl'); events = [];
   expect(isKnownTestSessionLike({ name: NAME, projectName: PROJECT, projectDir: root })).toBe(true);
   const binary = path.join(root, 'agy');
@@ -42,6 +47,87 @@ beforeEach(async () => {
 });
 afterEach(async () => { off?.(); await stopTransportRuntimeSession(NAME); removeSession(NAME); await disconnectAll(); await rm(root, { recursive: true, force: true }); });
 describe('real AG ACP SDK/runtime/durable store/relay', () => {
+  it.each(['model-b', 'model-a'])('applies loaded idle ACP model %s now instead of unconditional next-start', async model => {
+    const runtime = getTransportRuntime(NAME)!;
+    runtime.send('WARM_MODEL', 'e2e-agy-model-warm');
+    await vi.waitFor(() => expect(runtime.sending).toBe(false), { timeout: 5000 });
+    expect(getSession(NAME)?.activeModel).toBe('model-a');
+    const before = (await requests()).filter(row => row.method === 'session/prompt').length;
+    const result = await switchSessionModelNow(NAME, model);
+    expect(result).toMatchObject({ ok: true, model, applied: SESSION_MODEL_APPLIED.LIVE });
+    expect(getSession(NAME)).toMatchObject({ requestedModel: model, activeModel: model });
+    expect((await requests()).filter(row => row.method === 'session/prompt')).toHaveLength(before);
+  });
+
+  it('selects pending B then C during A without the send mutex, keeps actual A through append/completion, and uses C next', async () => {
+    const runtime = getTransportRuntime(NAME)!;
+    const nativeCompletions: unknown[] = [];
+    getProvider(AGY_SDK_PROVIDER_ID)!.onComplete((_sid, message) => nativeCompletions.push(message.metadata));
+    await writeFile(log + '.hold', 'hold');
+    runtime.send('RUN_A', 'e2e-agy-live-model-a');
+    await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/prompt')).toBe(true));
+    let unlock!: () => void;
+    const held = new Promise<void>(resolve => { unlock = resolve; });
+    let locked!: () => void;
+    const entered = new Promise<void>(resolve => { locked = resolve; });
+    const lock = runWithProcessSessionSendLock(NAME, async () => { locked(); await held; });
+    await entered;
+    try {
+      const link = { send: vi.fn(), daemonVersion: 'fixture' };
+      handleWebCommand({ type: 'session.send', session: NAME, text: '/model model-b', commandId: 'e2e-agy-browser-model-b' }, link as any);
+      await vi.waitFor(() => expect(events.some(event => event.type === 'command.ack' && event.payload.commandId === 'e2e-agy-browser-model-b' && event.payload.status === 'accepted')).toBe(true), { timeout: 5000 });
+      for (const model of ['model-b', 'model-c']) {
+        const result = await Promise.race([
+          switchSessionModelNow(NAME, model),
+          new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error('model queued behind send mutex')), 350)),
+        ]);
+        expect(result).toMatchObject({ ok: true, model, applied: SESSION_MODEL_APPLIED.NEXT_START });
+        expect(runtime.sending).toBe(true);
+        expect(getSession(NAME)).toMatchObject({ requestedModel: model, activeModel: 'model-a', modelDisplay: 'model-a' });
+        expect(events.some(event => event.type === 'usage.update' && event.payload.model === model)).toBe(false);
+      }
+      expect(await switchSessionModelNow(NAME, 'model-c')).toMatchObject({ ok: true, applied: SESSION_MODEL_APPLIED.NEXT_START });
+      await runtime.appendExternalMessageToActiveTurn('APPEND_STAYS_A', 'model-selection-append');
+      expect(finalized()).toHaveLength(0);
+    } finally { unlock(); await lock; await unlink(log + '.hold'); }
+    const rows = await requests();
+    expect(rows.filter(row => row.method === 'session/set_model').map(row => row.params.modelId)).toEqual(['model-b', 'model-c']);
+    expect(new Set(rows.filter(row => row.method === 'session/set_model' || row.method === 'session/prompt').map(row => row.params.sessionId)).size).toBe(1);
+    expect(rows.some(row => row.method === 'session/cancel')).toBe(false);
+    await vi.waitFor(() => expect(runtime.sending).toBe(false), { timeout: 5000 });
+    expect(finalized()).toHaveLength(1);
+    expect(nativeCompletions).toEqual([expect.objectContaining({ model: 'model-a' })]);
+    expect(getSession(NAME)).toMatchObject({ requestedModel: 'model-c', activeModel: 'model-a' });
+    await vi.waitFor(() => expect(events.filter(event => event.type === 'usage.update' && typeof event.payload.model === 'string').at(-1)?.payload.model, 'current turn usage keeps A').toBe('model-a'));
+    expect(rows.filter(row => row.fixture === 'prompt-model').map(row => row.model)).toEqual(['model-a', 'model-a']);
+    runtime.send('NEXT_WITH_C', 'e2e-agy-next-selected-c');
+    await vi.waitFor(() => expect(finalized()).toHaveLength(2), { timeout: 5000 });
+    expect(getSession(NAME)).toMatchObject({ requestedModel: 'model-c', activeModel: 'model-c' });
+    await vi.waitFor(() => expect(events.filter(event => event.type === 'usage.update' && typeof event.payload.model === 'string').at(-1)?.payload.model).toBe('model-c'));
+    expect((await requests()).filter(row => row.fixture === 'prompt-model').at(-1).model).toBe('model-c');
+  });
+
+  it('rejects an older model intent whose catalogue lookup finishes after C', async () => {
+    const runtime = getTransportRuntime(NAME)!;
+    runtime.send('WARM_MODEL', 'e2e-agy-model-catalogue');
+    await vi.waitFor(() => expect(runtime.sending).toBe(false), { timeout: 5000 });
+    const provider = getProvider(AGY_SDK_PROVIDER_ID)!;
+    let release!: () => void, entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const observed = new Promise<void>(resolve => { entered = resolve; });
+    const original = provider.listModels!.bind(provider);
+    const probe = vi.spyOn(provider, 'listModels').mockImplementationOnce(async () => { entered(); await gate; return original(); });
+    const old = switchSessionModelNow(NAME, 'model-b');
+    await observed;
+    try {
+      expect(await switchSessionModelNow(NAME, 'model-c')).toMatchObject({ ok: true, applied: SESSION_MODEL_APPLIED.LIVE });
+    } finally { release(); }
+    expect(await old).toMatchObject({ ok: false });
+    expect(getSession(NAME)).toMatchObject({ activeModel: 'model-c', requestedModel: 'model-c' });
+    expect((await requests()).filter(row => row.method === 'session/set_model').map(row => row.params.modelId)).toEqual(['model-c']);
+    probe.mockRestore();
+  });
+
   it('admits human Append and MCP append during A, no premature completion/FIFO replay, persists exact native identity', async () => {
     const runtime = getTransportRuntime(NAME)!;
     expect(getProvider(AGY_SDK_PROVIDER_ID)?.capabilities.activeDelegationNotification).toBe(AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE);
@@ -230,6 +316,7 @@ describe('real AG ACP SDK/runtime/durable store/relay', () => {
       // Stage 2: Send RUN_A, wait for native tool.call, steer HUMAN_B and MCP_C while in-flight
       runtime.send('RUN_A', 'prodchain-a');
       await vi.waitFor(() => expect(persistedEvents.some(e => e.type === 'tool.call' && e.payload.toolCallId === 'sleep')).toBe(true));
+      expect(await switchSessionModelNow(persistedName, 'model-b')).toMatchObject({ ok: true, applied: SESSION_MODEL_APPLIED.NEXT_START });
       runtime.send('HUMAN_B', 'prodchain-b');
       const appendB = await runtime.appendPendingMessagesToActiveTurn(['prodchain-b'], 'prodchain-append-b');
       expect(appendB.status).toBe('delivered');
@@ -244,6 +331,7 @@ describe('real AG ACP SDK/runtime/durable store/relay', () => {
       const stage2Sqlite = readPersistedSqliteRow();
       expect(stage2RuntimeStatus).not.toBe('idle');
       expect(stage2Sqlite?.state).toBe('running');
+      expect(stage2Sqlite?.record).toMatchObject({ requestedModel: 'model-b', activeModel: 'model-a', modelDisplay: 'model-a' });
       expect(stage2Sqlite?.record.agyNativeSessionState).toBe(AGY_NATIVE_SESSION_STATE.STARTED);
       const stage2Projection = projectLiveStatus(stage2Sqlite?.state ?? null);
       expect(stage2Projection.activeToolCall).toBe(true);
@@ -269,9 +357,11 @@ describe('real AG ACP SDK/runtime/durable store/relay', () => {
       await flushStore();
       const stage4Sqlite = readPersistedSqliteRow();
       expect(stage4Sqlite?.state).toBe('idle');
+      expect(stage4Sqlite?.record).toMatchObject({ requestedModel: 'model-b', activeModel: 'model-a' });
+      expect(persistedEvents.filter(e => e.type === 'usage.update' && typeof e.payload.model === 'string').at(-1)?.payload.model).toBe('model-a');
       expect(stage4Sqlite?.record.providerResumeId).toBe('native-1');
       expect(stage4Sqlite?.record.agyNativeSessionState).toBe(AGY_NATIVE_SESSION_STATE.STARTED);
-      const finalTexts = persistedEvents.filter(e => e.type === 'assistant.text' && e.payload.streaming === false);
+      const finalTexts = persistedEvents.filter(e => e.type === 'assistant.text' && e.payload.streaming === false && !e.payload.automation);
       expect(finalTexts).toHaveLength(1);
       expect(finalTexts[0]?.payload.text).toContain('RUN_A');
       expect(finalTexts[0]?.payload.text).toContain('HUMAN_B');
@@ -345,6 +435,12 @@ describe('real AG ACP SDK/runtime/durable store/relay', () => {
           })),
         }, null, 2));
       }
+      runtime.send('NEXT_MODEL_B', 'prodchain-next-model-b');
+      await vi.waitFor(() => expect(persistedEvents.filter(e => e.type === 'assistant.text' && e.payload.streaming === false && !e.payload.automation)).toHaveLength(2));
+      await flushStore();
+      expect(readPersistedSqliteRow()?.record).toMatchObject({ requestedModel: 'model-b', activeModel: 'model-b', modelDisplay: 'model-b' });
+      expect(persistedEvents.filter(e => e.type === 'usage.update' && typeof e.payload.model === 'string').at(-1)?.payload.model).toBe('model-b');
+
     } finally {
       offPersisted();
       await stopTransportRuntimeSession(persistedName);

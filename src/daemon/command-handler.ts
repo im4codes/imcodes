@@ -3000,15 +3000,22 @@ async function resolveValidatedModelList(record: SessionRecord): Promise<{ model
  * runtime, persists the record and posts the switched/refused notice into the
  * session's own timeline. The caller owns the per-session mutex and acks.
  */
+// Model intent is independent of the ordinary send/process mutex. A slow
+// catalogue lookup must not let an older selection overwrite a newer one.
+const liveModelIntents = new WeakMap<TransportSessionRuntime, object>();
+
 async function applyTransportModelSwitch(
   record: SessionRecord,
   /** Absent for an idle session not loaded yet: the stored model applies at its next start. */
   transportRuntime: TransportSessionRuntime | undefined,
   requestedModel: string,
   serverLink?: ServerLink,
+  modelIntent?: object,
 ): Promise<SessionModelSwitchResult> {
   const sessionName = record.name;
   const agentType = record.agentType;
+  const currentOwner = () => isCurrentAgyModelOwner(record, transportRuntime)
+    && (!modelIntent || (!!transportRuntime && liveModelIntents.get(transportRuntime) === modelIntent));
   const previousModel = record.activeModel ?? record.requestedModel;
   const refuse = (
     code: SessionModelControlError,
@@ -3022,10 +3029,11 @@ async function applyTransportModelSwitch(
   };
   let nextRecord: SessionRecord;
   let contextWindow: number | undefined;
+  let deferred = false;
 
   const validated = await resolveValidatedModelList(record);
   if (agentType === AGY_SDK_PROVIDER_ID) {
-    if (!isCurrentAgyModelOwner(record, transportRuntime)) return modelOwnerChanged(sessionName);
+    if (!currentOwner()) return modelOwnerChanged(sessionName);
     // Validation yielded. Preserve native-start/info/queue updates from the
     // current owner rather than writing back the pre-await record snapshot.
     record = getSession(sessionName)!;
@@ -3143,10 +3151,25 @@ async function applyTransportModelSwitch(
       DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PROOF_GATED,
     );
   } else if (agentType === AGY_SDK_PROVIDER_ID) {
-    transportRuntime?.setAgentId(requestedModel);
-    // AG's model is a process launch flag, not a live model RPC. The actual
-    // child's spawn/info publishes activeModel; a busy old turn remains on A.
-    nextRecord = { ...getSession(sessionName)!, requestedModel, updatedAt: Date.now() };
+    try {
+      let applied: typeof SESSION_MODEL_APPLIED[keyof typeof SESSION_MODEL_APPLIED] = SESSION_MODEL_APPLIED.NEXT_START;
+      if (transportRuntime?.supportsConfirmedModelSelection) {
+        applied = await transportRuntime.applyAgentId(requestedModel);
+      } else {
+        transportRuntime?.setAgentId(requestedModel);
+      }
+      if (!currentOwner()) return modelOwnerChanged(sessionName);
+      deferred = applied !== SESSION_MODEL_APPLIED.LIVE;
+      // Merge native-info/queue updates which arrived during the confirmed RPC;
+      // only an idle/effective confirmation may advance actual model/UI.
+      nextRecord = { ...getSession(sessionName)!, requestedModel,
+        ...(!deferred ? { activeModel: requestedModel, modelDisplay: requestedModel } : {}), updatedAt: Date.now() };
+    } catch (error) {
+      if (!currentOwner()) return modelOwnerChanged(sessionName);
+      const detail = typeof error === 'object' && error !== null && 'message' in error
+        ? String(error.message) : 'Native model selection was not confirmed';
+      return refuse(SESSION_MODEL_CONTROL_ERROR.MODEL_SWITCH_FAILED, detail, DAEMON_USER_NOTICE_CODE.SESSION_INLINE_ERROR, undefined, detail);
+    }
     contextWindow = resolveContextWindow(undefined, requestedModel);
   } else if (isGenericModelSwitchAgent(agentType)) {
     if (agentType === 'grok-sdk') {
@@ -3184,8 +3207,7 @@ async function applyTransportModelSwitch(
     await handleGetSessions(serverLink);
     syncSubSessionIfNeeded(sessionName, serverLink);
   }
-  if (agentType === AGY_SDK_PROVIDER_ID && !isCurrentAgyModelOwner(nextRecord, transportRuntime)) return modelOwnerChanged(sessionName);
-  const deferred = agentType === AGY_SDK_PROVIDER_ID;
+  if (agentType === AGY_SDK_PROVIDER_ID && !currentOwner()) return modelOwnerChanged(sessionName);
   if (!deferred) timelineEmitter.emit(sessionName, 'usage.update', { model: requestedModel, contextWindow }, { source: 'daemon', confidence: 'high' });
   timelineEmitter.emit(sessionName, 'assistant.text', {
     ...attachDaemonUserNotice(deferred ? DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PENDING : DAEMON_USER_NOTICE_CODE.MODEL_SWITCHED,
@@ -3247,7 +3269,7 @@ function resolveModelControlTarget(sessionName: string):
  * another session never matched. Deliberately no caller/ownership check: the
  * exact session name is the only requirement.
  */
-export async function switchSessionModelNow(sessionName: string, model?: string, thinking?: string): Promise<SessionModelSwitchResult | SessionThinkingSwitchResult> {
+export async function switchSessionModelNow(sessionName: string, model?: string, thinking?: string, serverLink?: ServerLink): Promise<SessionModelSwitchResult | SessionThinkingSwitchResult> {
   const requested = model?.trim();
   const target = resolveModelControlTarget(sessionName);
   if (requested && !target.ok) return { ok: false, sessionName, code: target.code, error: target.error };
@@ -3256,11 +3278,16 @@ export async function switchSessionModelNow(sessionName: string, model?: string,
   }
   if (!requested) return switchSessionThinkingNow(sessionName, thinking ?? '');
   if (!target.ok) return { ok: false, sessionName, code: target.code, error: target.error };
-  const release = await getMutex(sessionName).acquire();
+  const live = target.record.agentType === AGY_SDK_PROVIDER_ID && target.runtime?.supportsConfirmedModelSelection;
+  const modelIntent = live ? {} : undefined;
+  if (modelIntent && target.runtime) liveModelIntents.set(target.runtime, modelIntent);
+  // ACP model control is not a prompt: never wait for a send/turn lock. The
+  // provider orders native model writes and checks its captured owner/intent.
+  const release = live ? () => {} : await getMutex(sessionName).acquire();
   try {
     if (target.record.agentType === AGY_SDK_PROVIDER_ID && !isCurrentAgyModelOwner(target.record, target.runtime)) return modelOwnerChanged(sessionName);
     const latest = getSession(sessionName) ?? target.record;
-    const switched = await applyTransportModelSwitch(latest, target.runtime, requested);
+    const switched = await applyTransportModelSwitch(latest, target.runtime, requested, serverLink, modelIntent);
     if (!switched.ok) return switched;
     if (!thinking?.trim()) {
       const switchedRecord = getSession(sessionName) ?? { ...latest, requestedModel: switched.model, activeModel: switched.model };
@@ -5295,9 +5322,18 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
     // to an SDK RPC, forwarded as a verified slash command, or rejected visibly.
     // Falling through preserves the ordinary receipt-ack contract while keeping
     // provider-specific compact semantics at the SDK boundary.
+    const modelMatch = trimmedText.match(/^\/model\s+(\S+)(?:\s+.*)?$/);
+    if (record?.agentType === AGY_SDK_PROVIDER_ID && transportRuntime.supportsConfirmedModelSelection && modelMatch) {
+      emitTransportUserMessage(text);
+      const result = await switchSessionModelNow(sessionName, modelMatch[1], undefined, serverLink);
+      const status = result.ok ? (isLegacy ? 'accepted_legacy' : 'accepted') : 'error';
+      const failure = result.ok ? {} : { error: result.error };
+      timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status, ...failure });
+      emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status, ...failure });
+      return;
+    }
     const release = await getMutex(sessionName).acquire();
     try {
-      const modelMatch = trimmedText.match(/^\/model\s+(\S+)(?:\s+.*)?$/);
       const effortMatch = trimmedText.match(/^\/(?:thinking|effort)\s+(\S+)\s*$/);
       // `/fast on|off` is this product's switch, not Codex's own toggle: bare
       // `/fast` stays untouched so it still reaches the agent unchanged.

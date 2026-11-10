@@ -1,6 +1,6 @@
 import { AGY_ACP_AGENT_NAME, AGY_CLI_PATH_ENV } from '../../shared/agy-agent.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, writeFile, readFile, rm, mkdir } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile, rm, mkdir, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { AgyAcpProvider, createAgyProvider, supportsAgyAcp } from '../../src/agent/providers/agy-acp.js';
@@ -8,6 +8,7 @@ import { AgySdkProvider, resolveAgyBinary } from '../../src/agent/providers/agy-
 import { AGENT_DELEGATION_NOTIFICATION_RESULTS } from '../../shared/agent-delegation.js';
 import { PROVIDER_ERROR_CODES, normalizeProviderPayload } from '../../src/agent/transport-provider.js';
 import { AGY_NATIVE_START_NOT_ATTEMPTED } from '../../shared/agy-agent.js';
+import { SESSION_MODEL_APPLIED } from '../../shared/session-model-control.js';
 import { onConfirmedProviderStop } from '../../src/agent/provider-stop-confirmation.js';
 import type { SessionInfoUpdate } from '../../src/agent/transport-provider.js';
 
@@ -133,6 +134,134 @@ describe('AG native ACP', () => {
     provider.setSessionAgentId(id, 'model-a'); await provider.send(id, 'A');
     expect((await requests()).filter(x => x.method === 'session/set_model').map(x => x.params.modelId)).toEqual(['model-b', 'model-a']);
   });
+  it('ACKs busy selection without changing captured actual or steering, then uses B on the next turn', async () => {
+    const { provider, requests, root } = await setup('model-late'); const id = await route(provider);
+    const hold = path.join(root, 'rpc.jsonl.hold');
+    await writeFile(hold, 'hold');
+    const complete = vi.fn(), info = vi.fn(); provider.onComplete(complete); provider.onSessionInfo(info);
+    try {
+      await provider.send(id, 'A');
+      const switching = provider.applySessionModel(id, 'model-b');
+      await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/set_model')).toBe(true));
+      expect(info.mock.calls.some(call => call[1].model === 'model-b')).toBe(false);
+      expect(complete).not.toHaveBeenCalled();
+      const repeated = provider.applySessionModel(id, 'model-b');
+      expect(await switching).toBe(SESSION_MODEL_APPLIED.NEXT_START);
+      expect(await repeated).toBe(SESSION_MODEL_APPLIED.NEXT_START);
+      expect(await provider.applySessionModel(id, 'model-b')).toBe(SESSION_MODEL_APPLIED.NEXT_START);
+      expect((await requests()).filter(row => row.method === 'session/set_model')).toHaveLength(1);
+      expect(info.mock.calls.some(call => call[1].model === 'model-b')).toBe(false);
+      await provider.notifyActiveDelegation(id, notification('STEER_AFTER_SELECTION'));
+      await vi.waitFor(async () => expect((await requests()).filter(row => row.fixture === 'prompt-model').map(row => row.model)).toEqual(['model-a', 'model-a']));
+    } finally { await unlink(hold); }
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1));
+    expect(complete.mock.calls[0][1].metadata.model).toBe('model-a');
+    await provider.send(id, 'NEXT_TURN');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2));
+    expect(complete.mock.calls[1][1].metadata.model).toBe('model-b');
+    expect(info.mock.calls.some(call => call[1].model === 'model-b')).toBe(true);
+    expect((await requests()).filter(row => row.fixture === 'prompt-model').at(-1).model).toBe('model-b');
+  });
+
+  it('orders C after a delayed B but never publishes the superseded B ACK', async () => {
+    const { provider, requests } = await setup('model-late'); const id = await route(provider); const info = vi.fn();
+    await provider.send(id, 'warm'); await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false));
+    provider.onSessionInfo(info);
+    const first = provider.applySessionModel(id, 'model-b'); const rejected = expect(first).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CANCELLED });
+    await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/set_model')).toBe(true));
+    expect(await provider.applySessionModel(id, 'model-c')).toBe(SESSION_MODEL_APPLIED.LIVE); await rejected;
+    expect(info.mock.calls.map(call => call[1].model)).toEqual(['model-c']);
+    expect((await requests()).filter(row => row.method === 'session/set_model').map(row => row.params.modelId)).toEqual(['model-b', 'model-c']);
+  });
+  it.each(['cancel', 'replace', 'disconnect'])('rejects a delayed model ACK after %s without stale actual', async action => {
+    const { provider, requests } = await setup('model-late'); const id = await route(provider); const info = vi.fn();
+    await provider.send(id, 'A'); provider.onSessionInfo(info);
+    const switching = provider.applySessionModel(id, 'model-b'); const rejected = expect(switching).rejects.toBeTruthy();
+    await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/set_model')).toBe(true));
+    if (action === 'cancel') await provider.cancel(id);
+    else if (action === 'replace') await route(provider, id, { fresh: true });
+    else await provider.disconnect();
+    await rejected;
+    expect(info.mock.calls.some(call => call[1].model === 'model-b')).toBe(false);
+  });
+  it.each(['model-error', 'model-unsupported'])('does not report false model success on %s', async scenario => {
+    const { provider } = await setup(scenario); const id = await route(provider); const info = vi.fn();
+    await provider.send(id, 'warm'); await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false));
+    provider.onSessionInfo(info);
+    await expect(provider.applySessionModel(id, 'model-b')).rejects.toBeTruthy();
+    expect(info.mock.calls.some(call => call[1].model === 'model-b')).toBe(false);
+    await provider.send(id, 'after-rejection');
+    await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false));
+  });
+  it('reapplies A after a delayed superseded B instead of trusting the old A cache', async () => {
+    const { provider, requests } = await setup('model-late'); const id = await route(provider);
+    await provider.send(id, 'warm'); await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false));
+    const first = provider.applySessionModel(id, 'model-b'); const rejected = expect(first).rejects.toBeTruthy();
+    await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/set_model')).toBe(true));
+    expect(await provider.applySessionModel(id, 'model-a')).toBe(SESSION_MODEL_APPLIED.LIVE); await rejected;
+    expect((await requests()).filter(row => row.method === 'session/set_model').map(row => row.params.modelId)).toEqual(['model-b', 'model-a']);
+  });
+  it('returns to the retained selection if C fails after superseding a pending B', async () => {
+    const { provider, requests } = await setup('model-late'); const id = await route(provider); const info = vi.fn();
+    await provider.send(id, 'warm'); await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false));
+    provider.onSessionInfo(info);
+    const old = provider.applySessionModel(id, 'model-b'); const rejected = expect(old).rejects.toBeTruthy();
+    await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/set_model')).toBe(true));
+    await expect(provider.applySessionModel(id, 'invalid')).rejects.toBeTruthy(); await rejected;
+    await provider.send(id, 'after-failed-c');
+    await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false));
+    expect((await requests()).filter(row => row.method === 'session/set_model').map(row => row.params.modelId)).toEqual(['model-b', 'invalid', 'model-a']);
+    expect(info.mock.calls.some(call => call[1].model === 'model-b')).toBe(false);
+  });
+
+  it('bounds a model RPC timeout, rejects its late ACK, and recovers on a new confirmed selection', async () => {
+    const { provider } = await setup('model-timeout'); const id = await route(provider); const info = vi.fn();
+    await provider.send(id, 'warm'); await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false));
+    provider.onSessionInfo(info);
+    await expect(provider.applySessionModel(id, 'model-b')).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.PROVIDER_ERROR });
+    expect(info.mock.calls.some(call => call[1].model === 'model-b')).toBe(false);
+    expect(await provider.applySessionModel(id, 'model-c')).toBe(SESSION_MODEL_APPLIED.LIVE);
+    expect(info.mock.calls.map(call => call[1].model)).toEqual(['model-c']);
+    await provider.send(id, 'after-timeout');
+    await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false));
+  }, 10000);
+
+  it('keeps an unloaded selection next-start without creating native work', async () => {
+    const { provider, requests } = await setup(); const id = await route(provider);
+    expect(await provider.applySessionModel(id, 'model-b')).toBe(SESSION_MODEL_APPLIED.NEXT_START);
+    expect((await requests()).some(row => row.method === 'session/new' || row.method === 'session/set_model')).toBe(false);
+  });
+
+  it.each(['deck_test_agy_main', 'deck_test_agy_sub'])('confirms a pending unloaded choice when restoring %s without native creation', async name => {
+    const { provider, requests } = await setup();
+    const id = await route(provider, name, { resumeId: 'owned-native' }); const info = vi.fn();
+    provider.onSessionInfo(info);
+    expect(await provider.applySessionModel(id, 'model-b')).toBe(SESSION_MODEL_APPLIED.NEXT_START);
+    expect(await provider.restoreSession(id)).toBe(true);
+    expect(info.mock.calls.some(call => call[1].model === 'model-b')).toBe(true);
+    expect((await requests()).some(row => row.method === 'session/new')).toBe(false);
+    expect((await requests()).find(row => row.method === 'session/set_model').params).toEqual({ sessionId: 'owned-native', modelId: 'model-b' });
+    expect(await provider.applySessionModel(id, 'model-b')).toBe(SESSION_MODEL_APPLIED.LIVE);
+    expect((await requests()).filter(row => row.method === 'session/set_model')).toHaveLength(1);
+  });
+
+  it('passes combined native base-model/thought IDs unchanged and captures the original executor choice', async () => {
+    const { provider, requests, root } = await setup();
+    const id = await route(provider, undefined, { agentId: 'gemini-3.8-flash-low' }); const done = vi.fn(); provider.onComplete(done);
+    await provider.send(id, 'warm'); await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(1));
+    expect(await provider.applySessionModel(id, 'gemini-3.8-flash-high')).toBe(SESSION_MODEL_APPLIED.LIVE);
+    const hold = path.join(root, 'rpc.jsonl.hold'); await writeFile(hold, 'hold');
+    try {
+      await provider.send(id, 'A');
+      expect(await provider.applySessionModel(id, 'gemini-4-carbon-medium')).toBe(SESSION_MODEL_APPLIED.NEXT_START);
+    } finally { await unlink(hold); }
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2));
+    expect(done.mock.calls[1][1].metadata.model).toBe('gemini-3.8-flash-high');
+    await provider.send(id, 'next'); await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(3));
+    expect(done.mock.calls[2][1].metadata.model).toBe('gemini-4-carbon-medium');
+    expect((await requests()).filter(row => row.method === 'session/set_model').map(row => row.params.modelId)).toEqual(['gemini-3.8-flash-low', 'gemini-3.8-flash-high', 'gemini-4-carbon-medium']);
+  });
+
   it('does not submit a prompt if native model selection fails', async () => {
     const { provider, requests } = await setup(); const id = await route(provider, undefined, { agentId: 'invalid' });
     await expect(provider.send(id, 'A')).rejects.toBeTruthy(); expect((await requests()).some(x => x.method === 'session/prompt')).toBe(false);

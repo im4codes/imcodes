@@ -85,6 +85,10 @@ export class AgyAcpProvider extends KimiSdkProvider {
     } : {}) });
   }
 
+  applySessionModel(sessionId: string, model: string) {
+    return this.applyStrictSessionModel(sessionId, model);
+  }
+
   notifyActiveDelegation(sessionId: string, notification: ProviderDelegationNotification): Promise<AgentDelegationNotificationResult> {
     return this.queueActiveAcpPrompt(sessionId, notification);
   }
