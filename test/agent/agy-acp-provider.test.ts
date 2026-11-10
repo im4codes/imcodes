@@ -1,17 +1,18 @@
-import { AGY_ACP_AGENT_NAME } from '../../shared/agy-agent.js';
+import { AGY_ACP_AGENT_NAME, AGY_CLI_PATH_ENV } from '../../shared/agy-agent.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile, rm, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { AgyAcpProvider, createAgyProvider, supportsAgyAcp } from '../../src/agent/providers/agy-acp.js';
-import { AgySdkProvider } from '../../src/agent/providers/agy-sdk.js';
+import { AgySdkProvider, resolveAgyBinary } from '../../src/agent/providers/agy-sdk.js';
 import { AGENT_DELEGATION_NOTIFICATION_RESULTS } from '../../shared/agent-delegation.js';
 import { PROVIDER_ERROR_CODES, normalizeProviderPayload } from '../../src/agent/transport-provider.js';
 import { AGY_NATIVE_START_NOT_ATTEMPTED } from '../../shared/agy-agent.js';
+import { onConfirmedProviderStop } from '../../src/agent/provider-stop-confirmation.js';
 import type { SessionInfoUpdate } from '../../src/agent/transport-provider.js';
 
 const resources: Array<{ provider: AgyAcpProvider; root: string }> = [];
-afterEach(async () => { for (const { provider, root } of resources.splice(0)) { await provider.disconnect(); await rm(root, { recursive: true, force: true }); } });
+afterEach(async () => { for (const { provider, root } of resources.splice(0)) { await provider.disconnect(); await rm(root, { recursive: true, force: true }); } vi.unstubAllEnvs(); });
 async function setup(scenario = '') {
   const root = await mkdtemp(path.join(tmpdir(), 'imcodes-test-agy-acp-'));
   const binary = path.join(root, 'agy');
@@ -62,6 +63,47 @@ describe('AG native ACP', () => {
     await provider.send(id, 'A'); await provider.notifyActiveDelegation(id, notification('B')); await provider.cancelAndWait(id);
     await vi.waitFor(() => expect(errors).toHaveBeenCalledTimes(1)); expect(complete).not.toHaveBeenCalled();
     expect(await provider.notifyActiveDelegation(id, notification('C'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
+  });
+  it.each(['reordered', 'reject-b'])('Stop waits for all RPCs even after the last one settled (%s)', async scenario => {
+    const { provider } = await setup(scenario), id = await route(provider), errors = vi.fn();
+    provider.onError(errors);
+    await provider.send(id, 'A'); await provider.notifyActiveDelegation(id, notification('B'));
+    const state = (provider as any).sessions.get(id);
+    // The last RPC has ended/rejected but the original native A is still live.
+    await (provider as any).promptTerminals.get(state).catch(() => {});
+    expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true);
+    const stopping = provider.cancelAndWait(id), confirmed = vi.fn();
+    const off = onConfirmedProviderStop(stopping, confirmed);
+    try {
+      await expect(Promise.race([stopping.then(() => 'stopped'), new Promise(resolve => setTimeout(() => resolve('timeout'), 300))])).resolves.toBe('stopped');
+      expect(confirmed).toHaveBeenCalledTimes(1);
+      expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
+      expect(errors).toHaveBeenCalledTimes(1);
+      await expect(provider.send(id, 'AFTER_STOP')).resolves.toBeUndefined();
+    } finally { off(); }
+  });
+  it('confirms an aggregate Stop on captured child death, not a single RPC rejection', async () => {
+    const { provider } = await setup('crash-on-cancel'), id = await route(provider), errors = vi.fn();
+    provider.onError(errors); await provider.send(id, 'A');
+    await provider.notifyActiveDelegation(id, notification('B'));
+    await expect(provider.cancelAndWait(id)).resolves.toBeUndefined();
+    expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
+    expect(errors).toHaveBeenCalledTimes(1);
+  });
+  it('never cancels or confirms a replacement owner through a captured old Stop', async () => {
+    const { provider, requests } = await setup(), id = await route(provider), complete = vi.fn();
+    provider.onComplete(complete); await provider.send(id, 'A');
+    const stopping = provider.cancelAndWait(id), confirmed = vi.fn();
+    const rejected = expect(stopping).rejects.toThrow('changed');
+    const off = onConfirmedProviderStop(stopping, confirmed);
+    try {
+      await route(provider, id, { fresh: true });
+      await provider.send(id, 'NEW_OWNER'); await rejected;
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1));
+      expect(complete.mock.calls[0]?.[1].content).toBe('NEW_OWNER');
+      expect(confirmed).not.toHaveBeenCalled();
+      expect((await requests()).some(x => x.method === 'session/cancel')).toBe(false);
+    } finally { off(); }
   });
   it('holds session/new behind durable ownership and preserves queued no-start evidence', async () => {
     const { provider, requests } = await setup(); const id = await route(provider, undefined, { beforeNativeSessionStart: async () => { throw new Error('disk failed'); } });
@@ -155,6 +197,45 @@ describe('AG native ACP', () => {
     await vi.waitFor(async () => expect((await requests()).filter(x => x.method === 'session/prompt')).toHaveLength(3));
     const text = (await requests()).filter(x => x.method === 'session/prompt').map(x => x.params.prompt[0].text);
     expect(text.map(x => x.includes('IDENTITY_TEST_334'))).toEqual([true, false, true]);
+  });
+  it.each(['env', 'home'])('probes and initializes the same CLI without binaryPath on sparse PATH (%s)', async source => {
+    const root = await mkdtemp(path.join(tmpdir(), 'imcodes-test-agy-path-'));
+    const binary = path.join(root, source === 'home' ? '.local/bin/agy' : 'chosen-agy');
+    await mkdir(path.dirname(binary), { recursive: true });
+    const argvLog = path.join(root, 'argv.log'), rpcLog = path.join(root, 'rpc.jsonl');
+    await writeFile(binary, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${argvLog}'\nexec '${process.execPath}' '${path.resolve('test/fixtures/agy-acp.mjs')}' "$@"\n`, { mode: 0o700 });
+    vi.stubEnv('HOME', root); vi.stubEnv('PATH', '/usr/bin:/bin');
+    vi.stubEnv(AGY_CLI_PATH_ENV, source === 'env' ? binary : '');
+    const config = { env: { HOME: root, PATH: '/usr/bin:/bin', AGY_ACP_FIXTURE_AGENT_NAME: AGY_ACP_AGENT_NAME, AGY_ACP_FIXTURE_LOG: rpcLog } };
+    const provider = await createAgyProvider(config) as AgyAcpProvider;
+    resources.push({ provider, root });
+    // Resolution is frozen at the version probe, not repeated against changed env.
+    vi.stubEnv(AGY_CLI_PATH_ENV, path.join(root, 'not-the-probed-cli'));
+    await provider.connect(config);
+    expect(provider).toBeInstanceOf(AgyAcpProvider);
+    expect((await readFile(argvLog, 'utf8')).trim().split('\n')).toEqual(['--version', 'acp --process-per-session']);
+    const rows = (await readFile(rpcLog, 'utf8')).trim().split('\n').map(x => JSON.parse(x));
+    expect(rows.some(x => x.method === 'initialize')).toBe(true);
+  });
+  it('keeps the Windows shim entrypoint/prepend args, not just node.exe', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'imcodes-test-agy-shim-'));
+    const platform = process.platform;
+    try {
+      const scriptDir = path.join(root, 'node_modules', 'test-agy');
+      await mkdir(scriptDir, { recursive: true });
+      const script = path.join(scriptDir, 'cli.js'), shim = path.join(root, 'agy.cmd');
+      await writeFile(script, '#!/usr/bin/env node\n');
+      await writeFile(shim, '@ECHO off\r\n"%_prog%" "%dp0%\\node_modules\\test-agy\\cli.js" %*\r\n');
+      Object.defineProperty(process, 'platform', { value: 'win32' });
+      const config = { binaryPath: shim }, provider = new AgyAcpProvider();
+      const spawned = (provider as any).resolveAcpExecutable(config);
+      expect(spawned).toEqual(resolveAgyBinary(config));
+      expect(spawned.prependArgs).toEqual([script]);
+      expect(spawned.executable).toBe(process.execPath);
+    } finally {
+      Object.defineProperty(process, 'platform', { value: platform });
+      await rm(root, { recursive: true, force: true });
+    }
   });
   it('uses version-only selection, preserving unsupported CLI stream FIFO without retrying ACP errors', async () => {
     const { root, binary } = await setup();

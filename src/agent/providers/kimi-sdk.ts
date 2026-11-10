@@ -679,9 +679,22 @@ export class KimiSdkProvider implements TransportProvider {
   }
 
   private readonly promptTerminals = new WeakMap<KimiSdkSessionState, Promise<unknown>>();
+  // A steering RPC can retire before the native run ends (or reject while A
+  // keeps running). Stop proof belongs to the captured aggregate, not that RPC.
+  private readonly steeringRunTerminals = new WeakMap<KimiSdkSessionState, {
+    terminal: Promise<void>; complete: () => void;
+  }>();
 
   cancelAndWait(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
+    const run = state && this.steeringRunTerminals.get(state);
+    if (this.profile.steeringPrompts && state && run) {
+      const isCurrent = () => this.sessions.get(sessionId) === state && this.steeringRunTerminals.get(state) === run;
+      return confirmPromiseStop(run, run.terminal, () => {
+        if (!isCurrent()) return Promise.reject(new Error('ACP session owner changed during Stop'));
+        return this.cancel(sessionId);
+      }, isCurrent);
+    }
     const terminal = state && this.promptTerminals.get(state);
     if (!state || !terminal) return Promise.reject(new Error('ACP prompt terminal unavailable'));
     const generation = state.turnGeneration;
@@ -777,6 +790,7 @@ export class KimiSdkProvider implements TransportProvider {
   ): Promise<AgentDelegationNotificationResult> {
     const connection = this.connection;
     if (!connection) return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+    let queuedGeneration: number | undefined;
     try {
       // ACP's response is the queued prompt's *turn completion*, not a short
       // admission ACK.  Calling prompt() submits the request to the live ACP
@@ -786,8 +800,9 @@ export class KimiSdkProvider implements TransportProvider {
       const activePromptText = this.profile.activePromptPrefix
         ? `${this.profile.activePromptPrefix}${notification.text}`
         : notification.text;
-      const queuedGeneration = ++state.turnGeneration;
-      (state.activePromptGenerations ??= new Set()).add(queuedGeneration);
+      const generation = ++state.turnGeneration;
+      queuedGeneration = generation;
+      (state.activePromptGenerations ??= new Set()).add(generation);
       const queuedPrompt = connection.prompt({
         sessionId: state.acpSessionId,
         prompt: [{ type: 'text', text: activePromptText }],
@@ -800,7 +815,7 @@ export class KimiSdkProvider implements TransportProvider {
       });
       this.promptTerminals.set(state, queuedPrompt);
       void queuedPrompt.then((result) => {
-        if (this.profile.steeringPrompts && !state.activePromptGenerations?.has(queuedGeneration)) return;
+        if (this.profile.steeringPrompts && !state.activePromptGenerations?.has(generation)) return;
         this.capturePromptUsage(state, result);
         if (result.stopReason === 'cancelled') {
           logger.debug({ provider: this.id, sessionId }, 'ACP active-turn queued prompt later settled as cancelled');
@@ -808,7 +823,7 @@ export class KimiSdkProvider implements TransportProvider {
         this.settleTurn(
           sessionId,
           state,
-          queuedGeneration,
+          generation,
           result.stopReason,
         );
       }).catch((error: unknown) => {
@@ -817,7 +832,7 @@ export class KimiSdkProvider implements TransportProvider {
           sessionId,
           ...this.errorLogFields(error),
         }, 'ACP active-turn queued prompt failed after submission');
-        this.failTurn(sessionId, state, queuedGeneration, error);
+        this.failTurn(sessionId, state, generation, error);
       });
       // ClientSideConnection.prompt() resolves at the end of the queued turn,
       // while sendRequest() writes through an internal serialized writeQueue.
@@ -826,10 +841,16 @@ export class KimiSdkProvider implements TransportProvider {
       // the connection and the abort signal is authoritative.
       const writeOk = await this.waitForAcpWrite(connection, true);
       if (!writeOk) {
-        state.activePromptGenerations?.delete(queuedGeneration);
-        if ((state.activePromptGenerations?.size ?? 0) === 0) {
-          state.promptInFlight = false;
-          state.promptSubmittedGeneration = null;
+        if (this.profile.steeringPrompts) {
+          this.failTurn(sessionId, state, generation, this.makeError(
+            PROVIDER_ERROR_CODES.CONNECTION_LOST, 'ACP active prompt write failed', true,
+          ));
+        } else {
+          state.activePromptGenerations?.delete(generation);
+          if ((state.activePromptGenerations?.size ?? 0) === 0) {
+            state.promptInFlight = false;
+            state.promptSubmittedGeneration = null;
+          }
         }
         return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
       }
@@ -837,9 +858,10 @@ export class KimiSdkProvider implements TransportProvider {
         // The write is already native-visible: never return STALE and replay it.
         return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
       }
-      if (state.promptInFlight) state.promptSubmittedGeneration = queuedGeneration;
+      if (state.promptInFlight) state.promptSubmittedGeneration = generation;
       return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
     } catch (error) {
+      if (this.profile.steeringPrompts && queuedGeneration !== undefined) this.failTurn(sessionId, state, queuedGeneration, error);
       logger.debug({
         provider: this.id,
         sessionId,
@@ -871,8 +893,7 @@ export class KimiSdkProvider implements TransportProvider {
   private async startAcpServer(config: ProviderConfig): Promise<void> {
     await this.teardownChild();
 
-    const binaryPath = this.resolveBinaryPath(config);
-    const resolved = resolveExecutableForSpawn(binaryPath);
+    const resolved = this.resolveAcpExecutable(config);
     const args = [...resolved.prependArgs, ...this.buildAcpArgs(config)];
     const child = spawn(resolved.executable, args, {
       // Own process group and session on POSIX. A reparented descendant keeps
@@ -1082,6 +1103,11 @@ export class KimiSdkProvider implements TransportProvider {
     payload: ProviderContextPayload,
     generation: number,
   ): Promise<void> {
+    if (this.profile.steeringPrompts) {
+      let complete!: () => void;
+      const terminal = new Promise<void>(resolve => { complete = resolve; });
+      this.steeringRunTerminals.set(state, { terminal, complete });
+    }
     state.promptInFlight = true;
     state.promptSubmittedGeneration = null;
     (state.activePromptGenerations ??= new Set()).add(generation);
@@ -1128,7 +1154,7 @@ export class KimiSdkProvider implements TransportProvider {
         this.failTurn(sessionId, state, generation, err);
       });
       if (!await this.waitForAcpWrite(connection, true)) {
-        state.activePromptGenerations?.delete(generation);
+        if (!this.profile.steeringPrompts) state.activePromptGenerations?.delete(generation);
         throw this.makeError(
           PROVIDER_ERROR_CODES.CONNECTION_LOST,
           `${this.profile.displayName} ACP prompt write failed`,
@@ -1169,6 +1195,7 @@ export class KimiSdkProvider implements TransportProvider {
     error: unknown,
   ): void {
     if (this.sessions.get(sessionId) !== state) return;
+    const run = this.steeringRunTerminals.get(state);
     if (this.profile.steeringPrompts) {
       if (!state.activePromptGenerations?.delete(generation)) return;
       state.steeringFailure ??= error;
@@ -1190,6 +1217,7 @@ export class KimiSdkProvider implements TransportProvider {
     state.sessionSystemTextInjected = undefined;
     this.cancelPendingApprovals(sessionId);
     this.clearStatus(sessionId, state);
+    run?.complete();
     if (this.isDisconnecting) return;
     this.emitError(sessionId, this.normalizeError(error));
   }
@@ -1478,6 +1506,7 @@ export class KimiSdkProvider implements TransportProvider {
     compactControl = false,
   ): void {
     if (this.sessions.get(sessionId) !== state) return;
+    const run = this.steeringRunTerminals.get(state);
     let steeringFailure: unknown;
     if (this.profile.steeringPrompts) {
       if (!state.activePromptGenerations?.delete(generation)) return;
@@ -1515,6 +1544,9 @@ export class KimiSdkProvider implements TransportProvider {
     state.toolCalls.clear();
     state.emittedToolSignatures.clear();
     this.cancelPendingApprovals(sessionId);
+    // All native RPCs are now terminal and busy/text/tools are cleared. Resolve
+    // only this captured run; callbacks may already have started a successor.
+    run?.complete();
 
     if (steeringFailure !== undefined) {
       this.emitError(sessionId, this.normalizeError(steeringFailure));
@@ -1883,6 +1915,10 @@ export class KimiSdkProvider implements TransportProvider {
     for (const cb of this.errorCallbacks) cb(sessionId, error);
   }
 
+  protected resolveAcpExecutable(config: ProviderConfig): ReturnType<typeof resolveExecutableForSpawn> {
+    return resolveExecutableForSpawn(this.resolveBinaryPath(config));
+  }
+
   protected resolveBinaryPath(config: ProviderConfig | null): string {
     return typeof config?.binaryPath === 'string' && config.binaryPath.trim()
       ? config.binaryPath
@@ -2030,6 +2066,7 @@ export class KimiSdkProvider implements TransportProvider {
   private clearSessionWorkAfterFailure(routeId: string): boolean {
     const state = this.sessions.get(routeId);
     if (!state) return false;
+    const run = this.steeringRunTerminals.get(state);
     const hadActiveWork = state.promptInFlight || state.replaying || state.toolCalls.size > 0;
     if (hadActiveWork) state.settledGeneration = state.turnGeneration;
     state.activePromptGenerations?.clear();
@@ -2047,6 +2084,7 @@ export class KimiSdkProvider implements TransportProvider {
     state.toolCalls.clear();
     state.emittedToolSignatures.clear();
     this.clearStatus(routeId, state);
+    run?.complete();
     return hadActiveWork;
   }
 }

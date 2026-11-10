@@ -247,6 +247,12 @@ export function resolveAgyBinary(config?: ProviderConfig | { binaryPath?: string
   const direct = typeof config?.binaryPath === 'string' ? config.binaryPath.trim() : '';
   const raw = direct || process.env[AGY_CLI_PATH_ENV]?.trim() || AGY_CLI_BINARY;
   const resolved = resolveAgyPathForSdk(raw);
+  // The AG Windows path resolver already unwraps npm shims to their JS entry.
+  // Keep that entry as an argument when spawning Node, never lose it by
+  // treating node.exe alone (or a .js file) as the original CLI executable.
+  if (process.platform === 'win32' && /\.[cm]?js$/i.test(resolved)) {
+    return { executable: process.execPath, prependArgs: [resolved] };
+  }
   return resolveExecutableForSpawn(resolved);
 }
 

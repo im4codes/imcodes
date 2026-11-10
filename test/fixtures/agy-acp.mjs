@@ -18,7 +18,7 @@ function finish(sid, state) {
   note(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: state.inputs.join(' ') } });
   const pending = state.pending.splice(0);
   if (scenario === 'reordered') pending.reverse();
-  for (const [i, id] of pending.entries()) setTimeout(() => ok(id, { stopReason: 'end_turn', usage: { inputTokens: 10, outputTokens: 5 } }), i * 20);
+  for (const [i, id] of pending.entries()) setTimeout(() => ok(id, { stopReason: 'end_turn', usage: { inputTokens: 10, outputTokens: 5 } }), i * (Number(process.env.AGY_ACP_FIXTURE_REPLY_GAP_MS) || 20));
   state.inputs = [];
 }
 readline.createInterface({ input: process.stdin }).on('line', line => {
@@ -42,6 +42,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       sessions.delete(p.sessionId); return ok(req.id);
     }
     case 'session/cancel': {
+      if (scenario === 'crash-on-cancel') return process.exit(12);
       const state = sessions.get(p.sessionId); if (!state) return;
       clearTimeout(state.timer); for (const id of state.pending.splice(0)) ok(id, { stopReason: 'cancelled' }); state.inputs = []; return;
     }

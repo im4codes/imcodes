@@ -44,9 +44,16 @@ export function supportsAgyAcp(version: string): boolean {
 /** Official AG ACP. Older stream-json stays a separate implementation, never
  * a retry after ACP authentication, resume, network or prompt failures. */
 export class AgyAcpProvider extends KimiSdkProvider {
-  constructor() {
+  constructor(private readonly probedBinary?: ReturnType<typeof resolveAgyBinary>) {
     super(PROFILE);
     this.capabilities.nativeAgentAdmission = NATIVE_AGENT_ADMISSION_MODES.SESSION_FENCE;
+  }
+
+  protected override resolveAcpExecutable(config: ProviderConfig): ReturnType<typeof resolveAgyBinary> {
+    // Freeze the complete entrypoint/argv chosen for --version, including any
+    // Windows shim's Node script argument. Direct adapter use shares AG's
+    // existing env/HOME candidate resolver as well.
+    return this.probedBinary ?? resolveAgyBinary(config);
   }
 
   protected override async validateConnectedAgent(result: Record<string, unknown>): Promise<void> {
@@ -90,7 +97,7 @@ export async function createAgyProvider(config: ProviderConfig): Promise<Transpo
   const { stdout } = await execFileOffMain(binary.executable, [...binary.prependArgs, '--version'], {
     timeout: 15_000, env: { ...process.env, ...(config.env as Record<string, string> | undefined) },
   });
-  if (supportsAgyAcp(stdout)) return new AgyAcpProvider();
+  if (supportsAgyAcp(stdout)) return new AgyAcpProvider(binary);
   logger.warn({ provider: AGY_SDK_PROVIDER_ID }, 'Antigravity CLI has no verified ACP steering support; retaining stream-json FIFO');
   return new AgySdkProvider();
 }
