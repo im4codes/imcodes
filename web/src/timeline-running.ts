@@ -103,25 +103,7 @@ export function hasActiveTimelineTurn(
       continue;
     }
     if (userMessageTailRequiresSessionState && isRunningTimelineEvent(event)) continue;
-    if (event.type === 'tool.result') {
-      if (hasActiveWorkThrough(events, i)) return true;
-      // All tools through i are completed. Check whether the enclosing turn
-      // is still actively running or already completed/idle.
-      for (let j = i - 1; j >= 0; j--) {
-        const prev = events[j];
-        if (isIdleSessionStateTimelineEvent(prev)) return false;
-        if (prev.type === 'session.state') {
-          return isWorkingSessionState(String(prev.payload?.state ?? ''));
-        }
-        if (prev.type === 'assistant.text' && prev.payload?.streaming !== true) {
-          return false;
-        }
-        if (prev.type === 'user.message') {
-          continue;
-        }
-      }
-      return false;
-    }
+    if (event.type === 'tool.result') return hasActiveWorkThrough(events, i);
     if (isRunningTimelineEvent(event)) return true;
     if (NEUTRAL_TAIL_EVENT_TYPES.has(event.type)) continue;
     return false;

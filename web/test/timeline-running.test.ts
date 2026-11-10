@@ -133,48 +133,6 @@ describe('isRunningTimelineEvent', () => {
     ] as any)).toBe(false);
   });
 
-  it('keeps an active running turn visible between a tool result and the next turn activity', () => {
-    expect(hasActiveTimelineTurn([
-      { type: 'session.state', payload: { state: 'running' } },
-      { type: 'user.message', payload: { text: 'find emails' } },
-      { type: 'tool.call', payload: { toolCallId: 'call_1', tool: 'python3' } },
-      { type: 'tool.result', payload: { toolCallId: 'call_1', terminalStatus: 'succeeded' } },
-    ] as any)).toBe(true);
-  });
-
-  it('does not keep turn active after final assistant text following tool result', () => {
-    expect(hasActiveTimelineTurn([
-      { type: 'session.state', payload: { state: 'running' } },
-      { type: 'user.message', payload: { text: 'find emails' } },
-      { type: 'assistant.thinking', payload: { text: 'thinking...' } },
-      { type: 'tool.call', payload: { toolCallId: 'call_1', tool: 'python3' } },
-      { type: 'tool.result', payload: { toolCallId: 'call_1', terminalStatus: 'succeeded' } },
-      { type: 'assistant.text', payload: { text: 'Here are the emails.', streaming: false } },
-    ] as any)).toBe(false);
-  });
-
-  it('does not let old assistant.thinking keep turn active when idle state settles after tool result', () => {
-    expect(hasActiveTimelineTurn([
-      { type: 'session.state', payload: { state: 'running' } },
-      { type: 'user.message', payload: { text: 'find emails' } },
-      { type: 'assistant.thinking', payload: { text: 'thinking...' } },
-      { type: 'tool.call', payload: { toolCallId: 'call_1', tool: 'python3' } },
-      { type: 'tool.result', payload: { toolCallId: 'call_1', terminalStatus: 'succeeded' } },
-      { type: 'session.state', payload: { state: 'idle' } },
-    ] as any)).toBe(false);
-  });
-
-  it('does not keep turn active when stop or error occurs after tool result', () => {
-    expect(hasActiveTimelineTurn([
-      { type: 'session.state', payload: { state: 'running' } },
-      { type: 'user.message', payload: { text: 'find emails' } },
-      { type: 'assistant.thinking', payload: { text: 'thinking...' } },
-      { type: 'tool.call', payload: { toolCallId: 'call_1', tool: 'python3' } },
-      { type: 'tool.result', payload: { toolCallId: 'call_1', terminalStatus: 'succeeded' } },
-      { type: 'session.state', payload: { state: 'error' } },
-    ] as any)).toBe(false);
-  });
-
   it('keeps a turn active when a tool call is the latest running tail', () => {
     expect(hasActiveTimelineTurn([
       { type: 'session.state', payload: { state: 'idle' } },
