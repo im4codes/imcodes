@@ -415,7 +415,8 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
   const [localFonts, setLocalFonts] = useState<LocalFontsState>({ kind: 'idle' });
   const [showAllSystemCJK, setShowAllSystemCJK] = useState(false);
   const wrapRef = useRef<HTMLDivElement>(null);
-  const suppressNextSizeClickRef = useRef(false);
+  const latestPrefsRef = useRef(prefs);
+  latestPrefsRef.current = prefs;
   const lastSelectEventRef = useRef('');
 
   // Filter the curated preset list down to families actually installed on
@@ -617,29 +618,21 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
   } as const;
 
   const setSize = useCallback((delta: number) => {
-    const next = clampSize(prefs.size + delta);
-    if (next !== prefs.size) onChange({ ...prefs, size: next });
-  }, [onChange, prefs]);
-
-  const handleSizePointerDown = useCallback((delta: number) => (e: JSX.TargetedPointerEvent<HTMLButtonElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
-    suppressNextSizeClickRef.current = true;
-    setSize(delta);
-    window.setTimeout(() => { suppressNextSizeClickRef.current = false; }, 0);
-  }, [setSize]);
+    // More than one activation can arrive before the parent commits a render
+    // (e.g. assistive clicks). Advance the pending value, not a stale closure.
+    const current = latestPrefsRef.current;
+    const next = clampSize(current.size + delta);
+    if (next !== current.size) {
+      latestPrefsRef.current = { ...current, size: next };
+      onChange(latestPrefsRef.current);
+    }
+  }, [onChange]);
 
   const handleSizeClick = useCallback((delta: number) => (e: JSX.TargetedMouseEvent<HTMLButtonElement>) => {
     e.preventDefault();
     e.stopPropagation();
-    if (suppressNextSizeClickRef.current) return;
-    setSize(delta);
-  }, [setSize]);
-
-  const handleSizeKeyDown = useCallback((delta: number) => (e: JSX.TargetedKeyboardEvent<HTMLButtonElement>) => {
-    if (e.key !== 'Enter' && e.key !== ' ') return;
-    e.preventDefault();
-    e.stopPropagation();
+    // Native button activation unifies mouse, touch, keyboard and AT. Updating
+    // on press as well would double-count the later click and commit cancels.
     setSize(delta);
   }, [setSize]);
 
@@ -737,9 +730,7 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
           <div style={sizeRowStyle}>
             <button
               type="button"
-              onPointerDown={handleSizePointerDown(-1)}
               onClick={handleSizeClick(-1)}
-              onKeyDown={handleSizeKeyDown(-1)}
               disabled={prefs.size <= MIN_SIZE}
               aria-label="−"
               style={sizeBtnStyle(prefs.size <= MIN_SIZE)}
@@ -749,9 +740,7 @@ export function FontPrefsDropdown({ prefs, onChange, variant = 'default' }: Prop
             <div style={sizeReadoutStyle}>{prefs.size}</div>
             <button
               type="button"
-              onPointerDown={handleSizePointerDown(1)}
               onClick={handleSizeClick(1)}
-              onKeyDown={handleSizeKeyDown(1)}
               disabled={prefs.size >= MAX_SIZE}
               aria-label="+"
               style={sizeBtnStyle(prefs.size >= MAX_SIZE)}
