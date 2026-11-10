@@ -8,6 +8,7 @@ import {
 } from '../../../src/shared/timeline/types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
+import { getTimelineSendId, TIMELINE_OPTIMISTIC_EVENT_ID_PREFIX as OPTIMISTIC_EVENT_ID_PREFIX, TIMELINE_SEND_METADATA_FIELDS } from '@shared/timeline-send-identity.js';
 import {
   TIMELINE_CURSOR_DIRECTIONS,
   TIMELINE_DETAIL_FIELD_PATHS as SHARED_TIMELINE_DETAIL_FIELD_PATHS,
@@ -102,6 +103,7 @@ import { TimelineDB, type DrainCursor } from '../timeline-db.js';
 import { getTimelineStore, __resetTimelineStoresForTests } from '../stores/timeline-store.js';
 import {
   TIMELINE_DETAIL_FIELD_PATHS,
+  mergeTimelineEvents,
   mergeTimelineEventsWithTextPriority,
   preferTimelineEvent,
   type TimelineDetailFieldPath,
@@ -609,7 +611,6 @@ const TIMELINE_HISTORY_AFTER_TS_OVERLAP_MS = 1;
 // 5s is enough to catch the JSONL delay without hiding legitimate repeated messages.
 const USER_MSG_DEDUP_WINDOW_MS = 5_000;
 const PROVISIONAL_TRANSPORT_HISTORY_PREFIX = 'transport-history:';
-const OPTIMISTIC_EVENT_ID_PREFIX = 'optimistic:';
 const TIMELINE_SNAPSHOT_WRITE_DELAY_MS = 750;
 // Streaming assistant.text deltas are NOT written to IDB per-tick (too frequent —
 // see shouldPersistTimelineEvent). Instead, persist the LATEST streaming text to
@@ -718,10 +719,13 @@ function notifyLocalHistoryPruneComplete(cacheKey: string): void {
 async function refreshCachedWindowAfterDrain(
   cacheKey: string,
   deletedIds: readonly string[],
+  rawSessionId: string | undefined,
 ): Promise<boolean> {
-  const refreshed = await sharedDb
-    .getRecentEvents(cacheKey, { limit: MAX_MEMORY_EVENTS })
-    .catch(() => [] as TimelineEvent[]);
+  const refreshed = restoreTimelineSessionOwner(
+    await sharedDb.getRecentEvents(cacheKey, { limit: MAX_MEMORY_EVENTS }).catch(() => [] as TimelineEvent[]),
+    cacheKey,
+    rawSessionId,
+  );
 
   const existing = getCachedEvents(cacheKey) ?? [];
   // Drop exactly the rows the drain deleted — nothing else.
@@ -753,7 +757,7 @@ async function refreshCachedWindowAfterDrain(
   return merged.some((event) => isGuaranteedVisibleTimelineEvent(event));
 }
 
-function runLocalHistoryPrune(cacheKey: string): Promise<void> {
+function runLocalHistoryPrune(cacheKey: string, rawSessionId: string | undefined): Promise<void> {
   const run = localPruneChain.then(async () => {
     // Drain first. Retention alone cannot fix a window full of last-value rows:
     // `pruneOldEvents` keeps the newest N by timestamp with no idea what a row
@@ -788,6 +792,7 @@ function runLocalHistoryPrune(cacheKey: string): Promise<void> {
         paneHasRenderableContent = await refreshCachedWindowAfterDrain(
           cacheKey,
           drained.deletedIds ?? [],
+          rawSessionId,
         );
       }
       if (drained.done) break;
@@ -835,6 +840,7 @@ function scheduleLocalHistoryPrune(
   writtenEvents: number,
   force = false,
   immediate = false,
+  rawSessionId?: string,
 ): void {
   if (!cacheKey || sharedDb.memoryOnly) return;
   if (force) {
@@ -856,7 +862,7 @@ function scheduleLocalHistoryPrune(
   // the work has a deadline the ordinary space-reclaim does not.
   const timer = setTimeout(
     () => {
-      void runLocalHistoryPrune(cacheKey)
+      void runLocalHistoryPrune(cacheKey, rawSessionId)
         .finally(() => notifyLocalHistoryPruneComplete(cacheKey));
     },
     immediate ? 0 : LOCAL_PRUNE_START_DELAY_MS,
@@ -1028,13 +1034,34 @@ function getTimelineSnapshotStorageKey(cacheKey: string): string {
   return `${TIMELINE_SNAPSHOT_STORAGE_PREFIX}${cacheKey}`;
 }
 
-function loadTimelineSnapshotFromStorage(storage: Storage, cacheKey: string): TimelineEvent[] {
+/** Disk keys are server-scoped; wire events and in-memory merge identities are
+ * raw session names. Only unwrap the EXACT owner known by this restore, never
+ * parse prefixes or coalesce unrelated servers/sessions by their send id. */
+function restoreTimelineSessionOwner(
+  events: TimelineEvent[],
+  cacheKey: string,
+  rawSessionId = cacheKey,
+): TimelineEvent[] {
+  const restored: TimelineEvent[] = [];
+  for (const event of events) {
+    if (event.sessionId === rawSessionId) restored.push(event);
+    else if (event.sessionId === cacheKey) restored.push({ ...event, sessionId: rawSessionId });
+  }
+  return restored;
+}
+
+function loadTimelineSnapshotFromStorage(
+  storage: Storage,
+  storageKey: string,
+  cacheKey: string,
+  rawSessionId: string | undefined,
+): TimelineEvent[] {
   try {
-    const raw = storage.getItem(getTimelineSnapshotStorageKey(cacheKey));
+    const raw = storage.getItem(getTimelineSnapshotStorageKey(storageKey));
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter((event): event is TimelineEvent => (
+    const events = parsed.filter((event): event is TimelineEvent => (
       !!event
       && typeof event === 'object'
       && typeof (event as TimelineEvent).eventId === 'string'
@@ -1042,7 +1069,13 @@ function loadTimelineSnapshotFromStorage(storage: Storage, cacheKey: string): Ti
       && typeof (event as TimelineEvent).sessionId === 'string'
       && typeof (event as TimelineEvent).ts === 'number'
       && typeof (event as TimelineEvent).payload === 'object'
+      && (event as TimelineEvent).payload !== null
     ));
+    // Old builds may have persisted alternate ids for one remote send. Heal
+    // that cold seed before its FIRST paint, even offline. No snapshot writes,
+    // text-based dedup, or extra per-streamed-event scan is introduced here.
+    const restored = restoreTimelineSessionOwner(events, cacheKey, rawSessionId);
+    return mergeTimelineEvents(restored, [], restored.length);
   } catch {
     return [];
   }
@@ -1067,10 +1100,10 @@ function loadPersistedTimelineSnapshotWithFallback(
   try { storages.push(sessionStorage); } catch { /* unavailable */ }
   try { storages.push(localStorage); } catch { /* unavailable */ }
   for (const storage of storages) {
-    const scoped = loadTimelineSnapshotFromStorage(storage, cacheKey);
+    const scoped = loadTimelineSnapshotFromStorage(storage, cacheKey, cacheKey, rawSessionId);
     if (scoped.length > 0) return scoped;
     if (!rawSessionId || rawSessionId === cacheKey) continue;
-    const raw = loadTimelineSnapshotFromStorage(storage, rawSessionId);
+    const raw = loadTimelineSnapshotFromStorage(storage, rawSessionId, cacheKey, rawSessionId);
     if (raw.length === 0) continue;
     // Best-effort same-tier migration. Only remove the source after the target
     // write succeeds; quota/private-mode failure keeps the sole readable copy.
@@ -1334,14 +1367,7 @@ function isProvisionalTransportHistoryEvent(event: TimelineEvent): boolean {
 
 function getUserMessageCommandId(event: TimelineEvent): string | undefined {
   if (event.type !== 'user.message') return undefined;
-  const commandId = typeof event.payload.commandId === 'string'
-    ? event.payload.commandId.trim()
-    : '';
-  if (commandId) return commandId;
-  const clientMessageId = typeof event.payload.clientMessageId === 'string'
-    ? event.payload.clientMessageId.trim()
-    : '';
-  return clientMessageId || undefined;
+  return getTimelineSendId(event.payload);
 }
 
 function isLocalOptimisticUserMessage(event: TimelineEvent): boolean {
@@ -1411,6 +1437,11 @@ function convertTransportHistoryRecordToTimelineEvent(
 
   if (rawType === 'user.message' && typeof record.text === 'string') {
     const payload: Record<string, unknown> = { text: record.text };
+    for (const key of TIMELINE_SEND_METADATA_FIELDS) {
+      // Keep the existing validation of legacy identifier/queue fields below.
+      if (key === 'commandId' || key === 'clientMessageId' || key === 'queueAppended' || key === 'pendingMessageVersion') continue;
+      if (Object.prototype.hasOwnProperty.call(record, key)) payload[key] = record[key];
+    }
     const commandId = typeof record.commandId === 'string' ? record.commandId.trim() : '';
     const clientMessageId = typeof record.clientMessageId === 'string' ? record.clientMessageId.trim() : '';
     if (commandId) payload.commandId = commandId;
@@ -1422,6 +1453,7 @@ function convertTransportHistoryRecordToTimelineEvent(
     }
     return {
       ...base,
+      ...(typeof record.eventId === 'string' && record.eventId.trim() ? { eventId: record.eventId } : {}),
       type: 'user.message',
       payload,
     };
@@ -1479,7 +1511,7 @@ function persistTimelineEvents(cacheKey: string, events: TimelineEvent[]): void 
   const signals = scoped.filter((event) => isLastValueTimelineEventType(event.type));
   if (conversation.length > 0) sharedDb.putEvents(conversation).catch(() => {});
   if (signals.length > 0) signalWriteBatcher.push(signals);
-  scheduleLocalHistoryPrune(cacheKey, persistable.length);
+  scheduleLocalHistoryPrune(cacheKey, persistable.length, false, false, persistable[0]?.sessionId);
 }
 
 // Persist events to IDB WITHOUT the streaming filter — used only by the
@@ -1487,7 +1519,7 @@ function persistTimelineEvents(cacheKey: string, events: TimelineEvent[]): void 
 function persistTimelineEventsIncludingStreaming(cacheKey: string, events: TimelineEvent[]): void {
   if (events.length === 0) return;
   sharedDb.putEvents(scopeEventsForDb(cacheKey, events)).catch(() => {});
-  scheduleLocalHistoryPrune(cacheKey, events.length);
+  scheduleLocalHistoryPrune(cacheKey, events.length, false, false, events[0]?.sessionId);
 }
 
 function shouldPersistTimelineEvent(event: TimelineEvent): boolean {
@@ -1612,15 +1644,13 @@ async function readLocalTimelineMerged(
   rawSessionId: string | undefined,
   limit: number,
 ): Promise<{ stored: TimelineEvent[]; cursor: { epoch: number; seq: number } | null; rawAlreadyRead: boolean }> {
-  let stored = await db.getRecentEvents(cacheKey, { limit });
+  let stored = restoreTimelineSessionOwner(await db.getRecentEvents(cacheKey, { limit }), cacheKey, rawSessionId);
   let rawAlreadyRead = false;
   if (stored.length === 0 && rawSessionId) {
     rawAlreadyRead = true;
     const rawStored = await db.getRecentEvents(rawSessionId, { limit });
     if (rawStored.length > 0) {
-      stored = rawStored.map((event) => (
-        event.sessionId === cacheKey ? event : { ...event, sessionId: cacheKey }
-      ));
+      stored = restoreTimelineSessionOwner(rawStored, cacheKey, rawSessionId);
       // Consolidate the orphaned bare-key rows into the scoped key. Idempotent,
       // no delete (see migrateRawToScoped — the old delete destroyed history).
       db.migrateRawToScoped(rawSessionId, cacheKey, rawStored).catch(() => { /* best-effort */ });
@@ -1657,7 +1687,7 @@ function maxLocalCursor(
 
 /**
  * Phase 2 of local restore (split-key heal): read the bare-sessionId key,
- * restamp to the scoped key, and report events + cursor so the caller can
+ * restore the raw in-memory owner, and report events + cursor so the caller can
  * idempotently merge them. Used only when phase 1's scoped read was non-empty
  * (a session whose history is split across both keys). Read on its own so the
  * caller can run it fire-and-forget — it must never block the scoped first paint.
@@ -1667,12 +1697,10 @@ async function readRawSegment(
   rawSessionId: string,
   cacheKey: string,
   limit: number,
-): Promise<{ rawStored: TimelineEvent[]; rawRestamped: TimelineEvent[]; cursor: { epoch: number; seq: number } | null }> {
+): Promise<{ rawStored: TimelineEvent[]; rawRestored: TimelineEvent[]; cursor: { epoch: number; seq: number } | null }> {
   const rawStored = await db.getRecentEvents(rawSessionId, { limit });
-  const rawRestamped = rawStored.map((event) => (
-    event.sessionId === cacheKey ? event : { ...event, sessionId: cacheKey }
-  ));
-  return { rawStored, rawRestamped, cursor: deriveLocalCursor(rawRestamped) };
+  const rawRestored = restoreTimelineSessionOwner(rawStored, cacheKey, rawSessionId);
+  return { rawStored, rawRestored, cursor: deriveLocalCursor(rawRestored) };
 }
 
 export function __getSharedTimelineBaseForTests(
@@ -3166,7 +3194,7 @@ export function useTimeline(
         // renders empty, and would otherwise have waited out the idle delay.
         const restoreIsAllSignals = restored.length > 0
           && !restored.some((event) => isGuaranteedVisibleTimelineEvent(event));
-        scheduleLocalHistoryPrune(cacheKey!, 0, true, restoreIsAllSignals);
+        scheduleLocalHistoryPrune(cacheKey!, 0, true, restoreIsAllSignals, sessionId);
         requestDaemonHistory(false, MAX_MEMORY_EVENTS, restored);
         // Background HTTP backfill — IDB is authoritative only up to the last
         // WS event; reopening after a mid-chat close may leave a gap. A
@@ -3983,7 +4011,7 @@ export function useTimeline(
   }, []);
 
   // Phase-2 split-key heal: read the bare-sessionId segment in the background
-  // and idempotently merge it (raw → restamped → mergeEvents). Fire-and-forget
+  // and idempotently merge it under the raw in-memory owner. Fire-and-forget
   // so it NEVER blocks the scoped first paint (this is also why the dual read
   // survives single-promise test mocks). Only invoked when phase 1's scoped read
   // was non-empty (a session split across both keys). Bumps the cursor to the
@@ -3991,12 +4019,12 @@ export function useTimeline(
   const mergeRawSegmentLater = useCallback((db: TimelineDB, rawSessionId: string, key: string) => {
     void readRawSegment(db, rawSessionId, key, MAX_MEMORY_EVENTS).then((raw) => {
       if (cacheKeyRef.current !== key || raw.rawStored.length === 0) return;
-      mergeEvents(raw.rawRestamped);
+      mergeEvents(raw.rawRestored);
       // The bare segment is a LOCAL restore like any other, so it must enter the
       // ledger. Without this the strip reported only the scoped count while the
       // view showed both segments — the number contradicting what is on screen,
       // which is exactly what the ledger exists to prevent.
-      updateHistoryStep('cache', 'done', undefined, recordLocalRestore(raw.rawRestamped));
+      updateHistoryStep('cache', 'done', undefined, recordLocalRestore(raw.rawRestored));
       const bumped = maxLocalCursor({ epoch: epochRef.current, seq: seqRef.current }, raw.cursor);
       if (bumped) { epochRef.current = bumped.epoch; seqRef.current = bumped.seq; }
       setLoading(false);
@@ -5271,19 +5299,15 @@ export function useTimeline(
         // user.message: remove matching optimistic (pending) event, then dedup
         // against already-confirmed events (JSONL watcher re-emits same text ~2s later).
         let userMessageAlreadyMerged = false;
-        if (event.type === 'user.message' && event.payload.text) {
-          const text = String(event.payload.text).trim();
+        if (event.type === 'user.message' && (event.payload.text || getTimelineSendId(event.payload))) {
+          const text = String(event.payload.text ?? '').trim();
           const normalizedText = normalizeForEcho(text);
           const allowDuplicate = event.payload.allowDuplicate === true;
           // Transport path already attaches the originating commandId as
           // `clientMessageId` in the payload; prefer that for reconciliation
           // since text-based matching loses when the agent echoes a normalized
           // or retried version of the prompt.
-          const echoCommandId = typeof event.payload.commandId === 'string'
-            ? event.payload.commandId
-            : typeof event.payload.clientMessageId === 'string'
-              ? event.payload.clientMessageId
-              : undefined;
+          const echoCommandId = getTimelineSendId(event.payload);
           let skipAppend = false;
           setEvents((prev) => {
             const base = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
@@ -5322,7 +5346,9 @@ export function useTimeline(
             const optimisticTextIdx = base.findIndex(
               (e) =>
                 e.type === 'user.message'
+                && normalizedText.length > 0
                 && (e.payload.pending || e.payload.failed || isLocalOptimisticUserMessage(e))
+                && (!echoCommandId || !getUserMessageCommandId(e))
                 && normalizeForEcho(String(e.payload.text ?? '')) === normalizedText,
             );
             if (optimisticTextIdx >= 0) {
@@ -5359,7 +5385,7 @@ export function useTimeline(
               return withoutPending;
             }
             // No pending event — check for confirmed dedup (JSONL re-emit)
-            const isDup = !allowDuplicate && base.some(
+            const isDup = text.length > 0 && !echoCommandId && !allowDuplicate && base.some(
               (e) =>
                 e.type === 'user.message' &&
                 e.payload.allowDuplicate !== true &&

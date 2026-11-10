@@ -1491,6 +1491,7 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(event.clientMessageId).toBe('queued-1');
       expect(event.queueAppended).toBe(true);
       expect(event.pendingMessageVersion).toBe(7);
+      expect(event.eventId).toBe('transport-user:queued-1');
 
       expect(emitMock).toHaveBeenCalledWith(
         'sess-u',

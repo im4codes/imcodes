@@ -4,7 +4,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, cleanup, act } from '@testing-library/preact';
 import { h } from 'preact';
-import type { TimelineEvent } from '../src/ws-client.js';
+import type { TimelineEvent, WsClient, ServerMessage } from '../src/ws-client.js';
+import { TIMELINE_MESSAGES } from '../../shared/timeline-protocol.js';
 import { TimelineDB } from '../src/timeline-db.js';
 
 vi.mock('../src/api.js', () => ({
@@ -31,10 +32,10 @@ import {
  * thing that can turn this pane green is local storage being re-read.
  */
 
-function signal(i: number): TimelineEvent {
+function signal(sessionId: string, i: number): TimelineEvent {
   return {
     eventId: `sig-${i}`,
-    sessionId: 's',
+    sessionId,
     ts: 1_000 + i,
     epoch: 1,
     seq: i,
@@ -45,10 +46,10 @@ function signal(i: number): TimelineEvent {
   } as unknown as TimelineEvent;
 }
 
-function message(text: string): TimelineEvent {
+function message(sessionId: string, text: string): TimelineEvent {
   return {
     eventId: `msg-${text}`,
-    sessionId: 's',
+    sessionId,
     ts: 500,
     epoch: 1,
     seq: 1,
@@ -83,7 +84,7 @@ describe('a pane whose window is all signals recovers on the SAME mount', () => 
     // A FULL window. 8 rows would sit under the 300-row retention bound and
     // never exercise the trim that decides which events survive the merge —
     // which is exactly where the stale signals win.
-    const starved = Array.from({ length: 300 }, (_, i) => signal(i));
+    const starved = Array.from({ length: 300 }, (_, i) => signal(scopedKey, i));
     let windowFreed = false;
     // Record what each scoped read SAW. Asserting on the sequence is robust to
     // how fast the repair lands; asserting "still blank at T milliseconds"
@@ -93,7 +94,7 @@ describe('a pane whose window is all signals recovers on the SAME mount', () => 
       .mockImplementation(async (key: string) => {
         if (key !== scopedKey) return [];
         reads.push(windowFreed ? 'freed' : 'starved');
-        return windowFreed ? [message('recovered by the drain')] : starved;
+        return windowFreed ? [message(scopedKey, 'recovered by the drain')] : starved;
       });
 
     vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
@@ -141,6 +142,39 @@ describe('a pane whose window is all signals recovers on the SAME mount', () => 
       .toBeGreaterThan(1);
   });
 
+  it('normalizes a scoped post-drain send before a raw live replay on the same mount', async () => {
+    const sessionName = 'deck_blank_send_identity';
+    const scopedKey = `srv:${sessionName}`;
+    const starved = Array.from({ length: 300 }, (_, i) => signal(scopedKey, i));
+    const old: TimelineEvent = { ...message(scopedKey, 'Synthetic post-drain send'),
+      type: 'user.message', eventId: 'transport-history:drained-cache',
+      payload: { text: 'Synthetic post-drain send', commandId: 'drained-command', allowDuplicate: true } };
+    let freed = false;
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'memoryOnly', 'get').mockReturnValue(false);
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockImplementation(async (key) =>
+      key === scopedKey ? (freed ? [old] : starved) : []);
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue({ epoch: 1, seq: 1 });
+    vi.spyOn(TimelineDB.prototype, 'pruneOldEvents').mockResolvedValue({ deleted: 0, done: true });
+    vi.spyOn(TimelineDB.prototype, 'drainLegacySignals').mockImplementation(async () => {
+      freed = true;
+      return { deleted: starved.length, done: true, deletedIds: starved.map((row) => row.eventId) };
+    });
+    let handler: ((msg: ServerMessage) => void) | undefined;
+    const ws = { connected: true, onMessage: (fn: typeof handler) => { handler = fn; return () => { handler = undefined; }; },
+      sendTimelineHistoryRequest: () => 'drain-history' } as unknown as WsClient;
+    let seen: TimelineEvent[] = [];
+    function Probe() { seen = useTimeline(sessionName, ws, 'srv', { isActiveSession: false }).events; return null; }
+    render(h(Probe));
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(seen.filter((event) => event.type === 'user.message')).toHaveLength(1);
+    act(() => handler?.({ type: TIMELINE_MESSAGES.EVENT, event: { ...old, sessionId: sessionName,
+      eventId: 'primary-after-drain', epoch: 2, seq: 2 } } as ServerMessage));
+    expect(seen.filter((event) => event.type === 'user.message')).toHaveLength(1);
+    expect(seen[0].sessionId).toBe(sessionName);
+    expect(old.sessionId).toBe(scopedKey);
+  });
+
   it('keeps current signals when the refreshed window carries none', async () => {
     // `getRecentEvents` deliberately returns conversation with an EMPTY signal
     // set when the signals sub-read fails, and a live signal can also arrive
@@ -151,14 +185,14 @@ describe('a pane whose window is all signals recovers on the SAME mount', () => 
     const serverId = 'srv-signal';
     const scopedKey = `${serverId}:${sessionName}`;
 
-    const legacy = Array.from({ length: 300 }, (_, i) => signal(i));
-    const live = signal(9_999); // current value, NOT part of the drained batch
+    const legacy = Array.from({ length: 300 }, (_, i) => signal(scopedKey, i));
+    const live = signal(scopedKey, 9_999); // current value, NOT part of the drained batch
     let windowFreed = false;
     vi.spyOn(TimelineDB.prototype, 'getRecentEvents')
       .mockImplementation(async (key: string) => {
         if (key !== scopedKey) return [];
         // After the drain the window carries conversation but NO signals.
-        return windowFreed ? [message('back again')] : [...legacy, live];
+        return windowFreed ? [message(scopedKey, 'back again')] : [...legacy, live];
       });
     vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
     vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue({ seq: 1, epoch: 1 });
@@ -198,12 +232,12 @@ describe('a pane whose window is all signals recovers on the SAME mount', () => 
     const sessionName = 'deck_unknown_drain_ids';
     const serverId = 'srv-unknown-drain-ids';
     const scopedKey = `${serverId}:${sessionName}`;
-    const live = signal(9_998);
+    const live = signal(scopedKey, 9_998);
     let windowFreed = false;
     vi.spyOn(TimelineDB.prototype, 'getRecentEvents')
       .mockImplementation(async (key: string) => {
         if (key !== scopedKey) return [];
-        return windowFreed ? [message('conversation returned')] : [live];
+        return windowFreed ? [message(scopedKey, 'conversation returned')] : [live];
       });
     vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
     vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue({ seq: 1, epoch: 1 });
@@ -240,7 +274,7 @@ describe('a pane whose window is all signals recovers on the SAME mount', () => 
     const serverId = 'srv-empty-refresh';
     const scopedKey = `${serverId}:${sessionName}`;
 
-    const legacy = Array.from({ length: 300 }, (_, i) => signal(i));
+    const legacy = Array.from({ length: 300 }, (_, i) => signal(scopedKey, i));
     let windowFreed = false;
     vi.spyOn(TimelineDB.prototype, 'getRecentEvents')
       .mockImplementation(async (key: string) => {
@@ -280,7 +314,7 @@ describe('a pane whose window is all signals recovers on the SAME mount', () => 
     const scopedKey = `${serverId}:${sessionName}`;
     const getRecent = vi.spyOn(TimelineDB.prototype, 'getRecentEvents')
       .mockImplementation(async (key: string) => (
-        key === scopedKey ? [message('already fine')] : []
+        key === scopedKey ? [message(scopedKey, 'already fine')] : []
       ));
     vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
     vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue({ seq: 1, epoch: 1 });

@@ -15,6 +15,7 @@ import { h } from 'preact';
 import { useEffect } from 'preact/hooks';
 import i18next from 'i18next';
 import type { ServerMessage, WsClient } from '../src/ws-client.js';
+import { TIMELINE_MESSAGES } from '../../shared/timeline-protocol.js';
 import { SESSION_SEND_DELIVERY_MODES } from '../../shared/session-send-delivery.js';
 
 // Mock api.js so tests can control whether the HTTP-send fallback "succeeds"
@@ -114,6 +115,115 @@ describe('useTimeline optimistic send flow', () => {
     vi.runOnlyPendingTimers();
     vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  it.each(['session', 'local'] as const)('reconciles scoped %s snapshot rows with raw live and history identities', (tier) => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    const sessionId = `deck_opt_scoped_replay_${tier}`;
+    const old = {
+      eventId: 'transport-history:cached-legacy', sessionId: `srv:${sessionId}`,
+      ts: 123, epoch: 0, seq: 1, source: 'daemon', confidence: 'high', type: 'user.message',
+      payload: { text: 'One scoped cached send', commandId: 'stable-command', allowDuplicate: true },
+    };
+    (tier === 'session' ? sessionStorage : localStorage).setItem(`rcc_timeline_snapshot:srv:${sessionId}`, JSON.stringify([old]));
+    render(h(Probe, { sessionId }));
+    expect(ref.current!.events).toHaveLength(1);
+    const primary = { ...old, eventId: 'primary-live-id', sessionId, epoch: 1, seq: 2 };
+    act(() => handlerBox.fn?.({ type: TIMELINE_MESSAGES.EVENT, event: primary } as unknown as ServerMessage));
+    expect(ref.current!.events).toHaveLength(1);
+    act(() => handlerBox.fn?.({ type: TIMELINE_MESSAGES.HISTORY, sessionName: sessionId, events: [primary], epoch: 1 } as unknown as ServerMessage));
+    expect(ref.current!.events).toHaveLength(1);
+    expect(ref.current!.events[0].sessionId).toBe(sessionId);
+    // Normalization is immutable: neither the on-disk nor input row is restamped in place.
+    expect(old.sessionId).toBe(`srv:${sessionId}`);
+  });
+
+  it('reconciles authoritative replays on a receiver with no local optimistic send', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    const sessionId = 'deck_opt_remote_identity';
+    render(h(Probe, { sessionId }));
+    for (let index = 0; index < 4; index += 1) {
+      act(() => {
+        handlerBox.fn?.({
+          type: 'timeline.event',
+          event: {
+            eventId: `remote-projection-${index}`, sessionId, ts: Date.now(),
+            epoch: 1, seq: index + 1, source: 'daemon', confidence: 'high',
+            type: 'user.message',
+            payload: { text: 'One intentional remote send', commandId: 'remote-command-1', allowDuplicate: true },
+          },
+        } as unknown as ServerMessage);
+      });
+    }
+    expect(ref.current!.events.filter((event) => event.type === 'user.message')).toHaveLength(1);
+  });
+
+  it('does not replace another pending send or deduplicate distinct commands just because their text matches', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    const sessionId = 'deck_opt_distinct_identity';
+    render(h(Probe, { sessionId }));
+    act(() => ref.current!.addOptimisticUserMessage('Same intentional text', 'local-command'));
+    for (let index = 0; index < 2; index += 1) act(() => handlerBox.fn?.({
+      type: 'timeline.event', event: {
+        eventId: `remote-${index}`, sessionId, ts: Date.now(), epoch: 1, seq: index + 1,
+        source: 'daemon', confidence: 'high', type: 'user.message',
+        payload: { text: 'Same intentional text', commandId: `other-command-${index}` },
+      },
+    } as unknown as ServerMessage));
+    expect(ref.current!.events).toHaveLength(3);
+    expect(ref.current!.events.find((event) => event.payload.commandId === 'local-command')?.payload.pending).toBe(true);
+  });
+
+  it.each([true, false])('folds legacy fallback with live/history identity without losing attribution (eventId supplied=%s)', (withEventId) => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    const sessionId = 'deck_opt_fallback_identity';
+    render(h(Probe, { sessionId }));
+    const sharedActor = { actorUserId: 'synthetic-participant', actorDisplayName: 'Synthetic Participant' };
+    act(() => handlerBox.fn?.({ type: 'chat.history', sessionId, events: [{
+      type: 'user.message', text: '', _ts: 123, commandId: 'remote-command',
+      ...(withEventId ? { eventId: 'primary-id' } : {}), sharedActor,
+      attachments: [{ name: 'synthetic.png' }], allowDuplicate: true,
+    }] } as unknown as ServerMessage));
+    expect(ref.current!.events[0].payload.sharedActor).toEqual(sharedActor);
+    if (withEventId) expect(ref.current!.events[0].eventId).toBe('primary-id');
+    for (const type of ['timeline.event', 'timeline.history']) {
+      const event = { eventId: 'primary-id', sessionId, ts: 123, epoch: 1, seq: 1,
+        source: 'daemon', confidence: 'high', type: 'user.message',
+        payload: { text: '', commandId: 'remote-command', allowDuplicate: true } };
+      act(() => handlerBox.fn?.(type === 'timeline.event' ? { type, event } as unknown as ServerMessage
+        : { type, sessionName: sessionId, events: [event], epoch: 1 } as unknown as ServerMessage));
+    }
+    expect(ref.current!.events).toHaveLength(1);
+    expect(ref.current!.events[0].payload.sharedActor).toEqual(sharedActor);
+    expect(ref.current!.events[0].payload.attachments).toEqual([{ name: 'synthetic.png' }]);
+  });
+
+  it('reconciles an attachment-only empty-body echo by identity without consuming another pending send', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    const sessionId = 'deck_opt_empty_identity';
+    render(h(Probe, { sessionId }));
+    act(() => {
+      ref.current!.addOptimisticUserMessage('', 'empty-one');
+      ref.current!.addOptimisticUserMessage('', 'empty-two');
+    });
+    act(() => handlerBox.fn?.({ type: 'timeline.event', event: {
+      eventId: 'empty-primary', sessionId, ts: Date.now(), epoch: 1, seq: 1,
+      source: 'daemon', confidence: 'high', type: 'user.message',
+      payload: { text: '', commandId: 'empty-one', attachments: [{ name: 'test.png' }] },
+    } } as unknown as ServerMessage));
+    expect(ref.current!.events).toHaveLength(2);
+    expect(ref.current!.events.find((e) => e.payload.commandId === 'empty-one')?.payload.pending).toBeUndefined();
+    expect(ref.current!.events.find((e) => e.payload.commandId === 'empty-two')?.payload.pending).toBe(true);
   });
 
   it('injects a pending user.message bubble keyed by commandId', () => {

@@ -1022,13 +1022,13 @@ export function emitTransportUserMessage(
   eventId?: string,
 ): void {
   const payload = { text, allowDuplicate: true, ...extra };
-  timelineEmitter.emit(
+  const emitted = timelineEmitter.emit(
     sessionId,
     'user.message',
     payload,
     { source: 'daemon', confidence: 'high', ...(eventId ? { eventId } : {}) },
   );
-  persistTransportUserMessage(sessionId, text, payload);
+  persistTransportUserMessage(sessionId, text, payload, emitted?.eventId || eventId);
 }
 
 /** Persist the fallback copy for a user.message already emitted elsewhere. */
@@ -1036,12 +1036,14 @@ export function persistTransportUserMessage(
   sessionId: string,
   text: string,
   extra: Record<string, unknown> = {},
+  eventId?: string,
 ): void {
   void appendTransportEvent(sessionId, {
     type: 'user.message',
     sessionId,
     text,
     ...extra,
+    ...(eventId ? { eventId } : {}),
   });
 }
 

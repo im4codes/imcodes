@@ -11,6 +11,7 @@ import {
 } from '../../../shared/usage-context-window.js';
 import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from '../../../shared/agent-delegation.js';
 import { isPeerAuditVerdict } from '../../../shared/peer-audit.js';
+import { getTimelineSendId, TIMELINE_OPTIMISTIC_EVENT_ID_PREFIX, TIMELINE_SEND_METADATA_FIELDS } from '../../../shared/timeline-send-identity.js';
 
 export const TIMELINE_DETAIL_FIELD_PATHS = Object.values(SHARED_TIMELINE_DETAIL_FIELD_PATHS) as TimelineDetailFieldPath[];
 export type { TimelineDetailFieldPath };
@@ -258,24 +259,55 @@ export function mergeTimelineEvents(
   incomingEvents: TimelineEvent[],
   maxEvents = 300,
 ): TimelineEvent[] {
-  const incomingById = new Map<string, TimelineEvent>();
-  for (const event of incomingEvents) {
-    const prev = incomingById.get(event.eventId);
-    incomingById.set(event.eventId, prev ? preferTimelineEvent(prev, event) : event);
-  }
-
+  // A remote viewer has no optimistic row to reconcile. Primary timeline,
+  // fallback history and older cached projections can name ONE send with
+  // different eventIds. Index its explicit send identity alongside eventId;
+  // never infer identity from text/time or override intentional repeated sends.
+  // Fold in the same O(n+m) pass, retaining the ordered-base/two-pointer merge.
+  type Slot = { event: TimelineEvent };
+  const byId = new Map<string, Slot>();
+  const bySend = new Map<string, Slot>();
+  const baseSlots: Slot[] = [];
+  const newSlots: Slot[] = [];
   let changed = false;
-  const replaced = existingEvents.map((event) => {
-    const next = incomingById.get(event.eventId);
-    if (!next) return event;
-    incomingById.delete(event.eventId);
-    const preferred = preferTimelineEvent(event, next);
-    if (preferred !== event) changed = true;
-    return preferred;
-  });
+  const ingest = (event: TimelineEvent, existing: boolean): void => {
+    const sendId = event.type === 'user.message' && !event.eventId.startsWith(TIMELINE_OPTIMISTIC_EVENT_ID_PREFIX)
+      ? getTimelineSendId(event.payload) : undefined;
+    const sendKey = sendId ? JSON.stringify([event.sessionId, sendId]) : undefined;
+    const slot = byId.get(event.eventId) ?? (sendKey ? bySend.get(sendKey) : undefined);
+    if (!slot) {
+      const created = { event };
+      (existing ? baseSlots : newSlots).push(created);
+      byId.set(event.eventId, created);
+      if (sendKey) bySend.set(sendKey, created);
+      if (!existing) changed = true;
+      return;
+    }
+    const previous = slot.event;
+    const preferred = preferTimelineEvent(previous, event);
+    // Projection previews may omit attribution/attachments. Carry missing
+    // fields only; the preferred authoritative values (including tombstones)
+    // still win. This is confined to a proven identical send.
+    let payload: TimelineEvent['payload'] | undefined;
+    if (sendKey) {
+      const alternate = preferred === previous ? event : previous;
+      for (const key of TIMELINE_SEND_METADATA_FIELDS) {
+        if (hasOwn(preferred.payload, key) || !hasOwn(alternate.payload, key)) continue;
+        payload ??= { ...preferred.payload };
+        payload[key] = alternate.payload[key];
+      }
+    }
+    slot.event = payload ? { ...preferred, payload } : preferred;
+    byId.set(event.eventId, slot);
+    if (sendKey) bySend.set(sendKey, slot);
+    if (existing || slot.event !== previous) changed = true;
+  };
+  for (const event of existingEvents) ingest(event, true);
+  for (const event of incomingEvents) ingest(event, false);
 
-  const newEvents = [...incomingById.values()].sort((a, b) => a.ts - b.ts || a.seq - b.seq);
-  if (!changed && newEvents.length === 0) return existingEvents;
+  if (!changed) return existingEvents;
+  const replaced = baseSlots.map((slot) => slot.event);
+  const newEvents = newSlots.map((slot) => slot.event).sort((a, b) => a.ts - b.ts || a.seq - b.seq);
 
   const merged: TimelineEvent[] = [];
   let i = 0;
