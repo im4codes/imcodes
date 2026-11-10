@@ -953,6 +953,9 @@ export class AgySdkProvider implements TransportProvider {
       if (stepType === AGY_STEP_TYPE.SYSTEM_ERROR || /^(ERROR|FAILED|CANCELLED)$/i.test(stepState ?? '') || hasErrorDetails) {
         evidence.sawError = true;
       }
+      if (stepType === AGY_STEP_TYPE.SYSTEM_ERROR && isAgyHistoricalErrorCandidate(asString(step.text_delta) ?? '')) {
+        state.mayHaveHistoricalError = true;
+      }
       if (stepIndex === undefined || !Number.isInteger(stepIndex) || stepIndex <= evidence.userStepIndex) {
         evidence.completedResponseStepIndex = undefined;
       } else if (stepIndex >= evidence.latestStepIndex) {

@@ -62,11 +62,18 @@ process.stdin.on('data', (d) => {
       return;
     }
     if (text.includes('HANG')) return;
-    const scenario = text.replace(/^API_/, 'QUOTA_');
+    const scenario = text.replace(/^(?:API_RETRY_|API_|STREAM_)/, 'QUOTA_');
     if (text.includes('NATIVE_LOST')) {
       const fixture = require(process.env.FAKE_AGY_NATIVE_FIXTURE);
-      const error = text.includes('NATIVE_LOST_API') ? fixture.API_ERROR : fixture.ERROR;
-      fixture.persist(process.env.HOME, text, { currentError: text.includes('REAL_ERROR'), answer: text, error, ...(text.includes('NATIVE_LOST_API') ? { historicalStatus: 3 } : {}) });
+      const error = text.includes('NATIVE_LOST_STREAM')
+        ? fixture.STREAM_ERROR
+        : text.includes('NATIVE_LOST_API_RETRY')
+          ? fixture.API_RETRY_ERROR
+          : text.includes('NATIVE_LOST_API')
+            ? fixture.API_ERROR
+            : fixture.ERROR;
+      const isAppendErrorStep = text.includes('NATIVE_LOST_API') || text.includes('NATIVE_LOST_STREAM');
+      fixture.persist(process.env.HOME, text, { currentError: text.includes('REAL_ERROR'), answer: text, error, ...(isAppendErrorStep ? { historicalStatus: 3 } : {}) });
       emit({ event:'result', result:{ conversation_id:convId, status:'ERROR', response:'', error } });
       continue;
     }
@@ -77,7 +84,13 @@ process.stdin.on('data', (d) => {
       emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: step++, state: 'DONE', step_type: 'user_input' } });
     }
     if (scenario.includes('QUOTA_')) {
-      const quota = text.startsWith('API_') ? 'API error (attempt 1): request failed: Post https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse: EOF' : 'Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 50m15s.';
+      const quota = text.startsWith('STREAM_')
+        ? 'The stream was interrupted. Please continue the task you were working on.'
+        : text.startsWith('API_RETRY_')
+          ? 'API error (attempt 2): stream error: stream ID 1; INTERNAL_ERROR; received from peer'
+          : text.startsWith('API_')
+            ? 'API error (attempt 1): request failed: Post https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse: EOF'
+            : 'Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 50m15s.';
       const hasResponse = !scenario.includes('QUOTA_EMPTY') && !scenario.includes('QUOTA_OLD_RESPONSE');
       if (scenario.includes('QUOTA_MULTISTEP')) {
         emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: step++, state: 'DONE', step_type: 'agent_response', text_delta: 'Before\\n' } });
@@ -530,6 +543,89 @@ describe('AgySdkProvider (fake agy process)', () => {
     await waitFor(() => completes.length+errors.length===1);
     expect(completes).toHaveLength(0);
     expect(errors[0][1].code).toBe(PROVIDER_ERROR_CODES.RATE_LIMITED);
+  });
+
+  it('closes the 3-turn stream-interrupted replay class: Turn 1 real failure visible, Turn 2 and Turn 3 complete cleanly without replaying old error', async () => {
+    const sid = await provider.createSession({ sessionKey: 'stream-interrupted-3turn', cwd: dir, fresh: true });
+    // Turn 1: real mid-stream interruption after partial output
+    await provider.send(sid, 'STREAM_PARTIAL');
+    await waitFor(() => errors.length === 1);
+    expect(completes).toHaveLength(0);
+    expect(errors[0][1].message).toBe('The stream was interrupted. Please continue the task you were working on.');
+
+    // Turn 2: complete DONE response carrying historical stream-interrupted error in result.error
+    await provider.send(sid, 'STREAM_STALE');
+    await waitFor(() => completes.length + errors.length === 2);
+    expect(errors).toHaveLength(1);
+    expect(completes).toHaveLength(1);
+    expect(completes[0][1].content).toBe('Hello');
+
+    // Turn 3: subsequent complete turn (with completed tool call) still carrying historical stream-interrupted error
+    await provider.send(sid, 'STREAM_COMPLETED_TOOL');
+    await waitFor(() => completes.length + errors.length === 3);
+    expect(errors).toHaveLength(1);
+    expect(completes.map(([, m]) => m.content)).toEqual(['Hello', 'Hello']);
+    expect(launches()).toHaveLength(1);
+    expect(inputs()).toHaveLength(3);
+    expect(provider.getSessionDiagnostics(sid)).toMatchObject({ inflightTurns: 0 });
+  });
+
+  it('closes the 3-turn non-request-failed API error replay class: Turn 1 real failure visible, Turn 2 and Turn 3 complete cleanly', async () => {
+    const sid = await provider.createSession({ sessionKey: 'api-retry-3turn', cwd: dir, fresh: true });
+    await provider.send(sid, 'API_RETRY_EMPTY');
+    await waitFor(() => errors.length === 1);
+    expect(completes).toHaveLength(0);
+    expect(errors[0][1].message).toContain('API error (attempt 2): stream error:');
+
+    await provider.send(sid, 'API_RETRY_STALE');
+    await waitFor(() => completes.length + errors.length === 2);
+    expect(errors).toHaveLength(1);
+    expect(completes).toHaveLength(1);
+    expect(completes[0][1].content).toBe('Hello');
+
+    await provider.send(sid, 'API_RETRY_MULTISTEP');
+    await waitFor(() => completes.length + errors.length === 3);
+    expect(errors).toHaveLength(1);
+    expect(completes.map(([, m]) => m.content)).toEqual(['Hello', 'Hello']);
+    expect(launches()).toHaveLength(1);
+  });
+
+  it('recovers DB-only stream-interrupted and non-request-failed API answers with DONE system_error history while preserving genuine current failures', async () => {
+    await provider.disconnect();
+    await provider.connect({ binaryPath: path.join(dir, 'agy'), env: { HOME: dir, FAKE_AGY_ARGS_FILE: argsFile,
+      FAKE_AGY_NATIVE_FIXTURE: path.resolve('test/fixtures/agy-native-history/fixture.cjs') } });
+    const sid = await provider.createSession({ sessionKey: 'stream-native', cwd: dir, resumeId: '11111111-1111-4111-8111-111111111111' });
+    await provider.send(sid, 'NATIVE_LOST_STREAM first');
+    await waitFor(() => completes.length + errors.length === 1);
+    expect(errors).toHaveLength(0);
+    await provider.send(sid, 'NATIVE_LOST_STREAM second');
+    await waitFor(() => completes.length + errors.length === 2);
+    expect(errors).toHaveLength(0);
+    await provider.send(sid, 'NATIVE_LOST_STREAM_REAL_ERROR');
+    await waitFor(() => completes.length + errors.length === 3);
+    expect(completes.map(([, m]) => m.content)).toEqual(['NATIVE_LOST_STREAM first', 'NATIVE_LOST_STREAM second']);
+    expect(errors).toHaveLength(1);
+    expect(errors[0][1].message).toBe('The stream was interrupted. Please continue the task you were working on.');
+  });
+
+  it.each([
+    'STREAM_EMPTY', 'STREAM_PARTIAL', 'STREAM_TOOL', 'STREAM_CURRENT_ERROR', 'STREAM_DETAILS',
+    'STREAM_MISMATCH', 'STREAM_ACTIVE_AFTER_DONE', 'STREAM_NO_BOUNDARY', 'STREAM_NO_INDEX',
+    'STREAM_OLD_RESPONSE', 'STREAM_NEW_FAILURE', 'STREAM_CURRENT_ERROR_NO_INDEX_ERROR',
+    'API_RETRY_EMPTY', 'API_RETRY_PARTIAL', 'API_RETRY_CURRENT_ERROR',
+  ])('does not conceal a real or unproven stream-interrupted or retry API failure: %s', async (prompt) => {
+    const sid = await provider.createSession({ sessionKey: prompt, cwd: dir, resumeId: 'existing-conversation' });
+    await provider.send(sid, prompt);
+    await waitFor(() => completes.length + errors.length === 1);
+    expect(completes).toHaveLength(0);
+    expect(errors).toHaveLength(1);
+    expect(errors[0][1].message).toContain(
+      prompt === 'STREAM_NEW_FAILURE'
+        ? 'unauthorized'
+        : prompt.startsWith('API_RETRY_')
+          ? 'API error (attempt 2)'
+          : 'The stream was interrupted.',
+    );
   });
 
   it('clears failed-process input bindings before the next user turn resumes the conversation', async () => {

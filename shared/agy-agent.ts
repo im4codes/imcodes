@@ -42,12 +42,16 @@ export const AGY_RESULT_STATUS = {
 /** Native individual-quota diagnostic that can leak from AG conversation history. */
 export const AGY_INDIVIDUAL_QUOTA_ERROR_PREFIX = 'Individual quota reached.';
 
+/** Native stream-interruption diagnostic written by `core.appendErrorStep` after partial output. */
+export const AGY_STREAM_INTERRUPTED_ERROR = 'The stream was interrupted. Please continue the task you were working on.';
+
 /** AG may copy these diagnostics from an earlier system_error into later results.
  * Classification alone is NEVER sufficient to discard an error: callers must
  * prove a complete, clean current turn in the same conversation. */
 export function isAgyHistoricalErrorCandidate(error: string): boolean {
-  return error.startsWith(AGY_INDIVIDUAL_QUOTA_ERROR_PREFIX)
-    || /^API error \(attempt [1-9]\d*\): request failed: /u.test(error);
+  return error === AGY_STREAM_INTERRUPTED_ERROR
+    || error.startsWith(AGY_INDIVIDUAL_QUOTA_ERROR_PREFIX)
+    || /^API error \(attempt [1-9]\d*\): \S/u.test(error);
 }
 
 /** `agy` CLI flags used by the transport. */

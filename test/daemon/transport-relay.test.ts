@@ -64,6 +64,10 @@ import {
   isSdkTurnLostRecovery,
   type TransportProvider,
 } from '../../src/agent/transport-provider.js';
+import { AgySdkProvider } from '../../src/agent/providers/agy-sdk.js';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
 import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
@@ -2392,5 +2396,146 @@ describe('tool-execution guard seam (pair participants and the main checkout)', 
     expect(guard('deck_sub_exec', { toolName: 'Bash', input: { command: 'git reset --hard' }, cwd: '/p' })).toEqual({ allow: false, reason: 'refused' });
     expect(evaluator).toHaveBeenCalledWith('deck_sub_exec', { toolName: 'Bash', input: { command: 'git reset --hard' }, cwd: '/p' });
     expect(guard('deck_sub_exec', { toolName: 'Bash', input: { command: 'git status' } })).toEqual({ allow: true });
+  });
+});
+
+describe('AgySdkProvider -> transport-relay -> timeline multi-turn historical error E2E', () => {
+  let dir: string;
+  let agyProvider: AgySdkProvider;
+  let emitMock: ReturnType<typeof vi.fn>;
+  let appendMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(async () => {
+    relayTesting.resetRelayState();
+    setTransportRelaySend(vi.fn());
+    emitMock = vi.mocked(timelineEmitter.emit);
+    emitMock.mockClear();
+    appendMock = vi.mocked(appendTransportEvent);
+    appendMock.mockClear();
+    dir = mkdtempSync(path.join(tmpdir(), 'imcodes-agy-relay-e2e-'));
+    const fakeCli = `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === '--help') { process.stdout.write('Usage of agy:\\n'); process.exit(0); }
+const resumeIdx = args.indexOf('--conversation');
+const convId = resumeIdx >= 0 ? args[resumeIdx + 1] : '11111111-1111-4111-8111-111111111111';
+const emit = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
+emit({ event: 'init', conversation_id: convId, init: { cwd: process.cwd(), tools: [], permission_mode: 'always-proceed' } });
+let step = 0;
+let buf = '';
+const STREAM_ERR = 'The stream was interrupted. Please continue the task you were working on.';
+process.stdin.on('data', (d) => {
+  buf += d.toString();
+  let i;
+  while ((i = buf.indexOf('\\n')) >= 0) {
+    const line = buf.slice(0, i); buf = buf.slice(i + 1);
+    if (!line.trim()) continue;
+    const text = JSON.parse(line).message.content;
+    emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: step++, state: 'DONE', step_type: 'user_input' } });
+    const idx = step++;
+    if (text.includes('TURN1_INTERRUPTED')) {
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'Partial turn 1 output' } });
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: step++, state: 'DONE', step_type: 'system_error', text_delta: STREAM_ERR } });
+      emit({ event: 'result', result: { conversation_id: convId, status: 'ERROR', response: 'Partial turn 1 output', error: STREAM_ERR, num_turns: 1, usage: {} } });
+      continue;
+    }
+    if (text.includes('TURN2_COMPLETE_WITH_STALE_ERR')) {
+      const reply = 'Turn 2 complete reply without error';
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'ACTIVE', step_type: 'agent_response', text_delta: reply } });
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'DONE', step_type: 'agent_response', text_delta: '\\n' } });
+      emit({ event: 'result', result: { conversation_id: convId, status: 'ERROR', response: reply + '\\n', error: STREAM_ERR, num_turns: 1, usage: {} } });
+      continue;
+    }
+    if (text.includes('TURN3_COMPLETE_WITH_QUOTED_ERR')) {
+      const reply = 'Turn 3 normal text quoting Error: The stream was interrupted. Please continue the task you were working on.';
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'ACTIVE', step_type: 'agent_response', text_delta: reply } });
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'DONE', step_type: 'agent_response', text_delta: '\\n' } });
+      emit({ event: 'result', result: { conversation_id: convId, status: 'ERROR', response: reply + '\\n', error: STREAM_ERR, num_turns: 1, usage: {} } });
+      continue;
+    }
+    if (text.includes('TURN4_GENUINE_EMPTY_FAIL')) {
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: step++, state: 'DONE', step_type: 'system_error', text_delta: STREAM_ERR } });
+      emit({ event: 'result', result: { conversation_id: convId, status: 'ERROR', response: '', error: STREAM_ERR, num_turns: 1, usage: {} } });
+      continue;
+    }
+  }
+});
+`;
+    const binPath = path.join(dir, 'agy');
+    writeFileSync(binPath, fakeCli);
+    chmodSync(binPath, 0o755);
+    agyProvider = new AgySdkProvider();
+    await agyProvider.connect({ binaryPath: binPath, env: { HOME: dir } });
+    wireProviderToRelay(agyProvider);
+  });
+
+  afterEach(async () => {
+    await agyProvider.disconnect();
+    rmSync(dir, { recursive: true, force: true });
+    setTransportRelaySend(() => {});
+  });
+
+  it('appends warning on Turn 1 real stream interruption, omits stale warning on Turn 2 & Turn 3 complete replies, and still emits session.error on Turn 4 genuine failure', async () => {
+    const sid = await agyProvider.createSession({ sessionKey: 'deck_agy_e2e', cwd: dir, fresh: true });
+
+    // Turn 1: real stream interruption after partial text -> finalized assistant.text has ⚠️ Error suffix
+    await agyProvider.send(sid, 'TURN1_INTERRUPTED');
+    await vi.waitFor(() => {
+      const finals = emitMock.mock.calls.filter(([, type, payload]) => type === 'assistant.text' && payload.streaming === false);
+      expect(finals).toHaveLength(1);
+    });
+    const turn1Final = emitMock.mock.calls.find(([, type, payload]) => type === 'assistant.text' && payload.streaming === false)!;
+    expect(turn1Final[2].text).toBe(
+      'Partial turn 1 output\n\n⚠️ Error: The stream was interrupted. Please continue the task you were working on.',
+    );
+    expect(appendMock.mock.calls.some(([, evt]) => evt?.type === 'session.error')).toBe(true);
+
+    emitMock.mockClear();
+    appendMock.mockClear();
+
+    // Turn 2: complete DONE reply carrying historical stream-interrupted error -> finalized assistant.text has NO ⚠️ Error suffix
+    await agyProvider.send(sid, 'TURN2_COMPLETE_WITH_STALE_ERR');
+    await vi.waitFor(() => {
+      const finals = emitMock.mock.calls.filter(([, type, payload]) => type === 'assistant.text' && payload.streaming === false);
+      expect(finals).toHaveLength(1);
+    });
+    const turn2Final = emitMock.mock.calls.find(([, type, payload]) => type === 'assistant.text' && payload.streaming === false)!;
+    expect(turn2Final[2].text).toBe('Turn 2 complete reply without error');
+    expect(appendMock.mock.calls.some(([, evt]) => evt?.type === 'session.error')).toBe(false);
+
+    emitMock.mockClear();
+    appendMock.mockClear();
+
+    // Turn 3: complete DONE reply whose own assistant text quotes the error string -> preserved verbatim without extra ⚠️ Error suffix
+    await agyProvider.send(sid, 'TURN3_COMPLETE_WITH_QUOTED_ERR');
+    await vi.waitFor(() => {
+      const finals = emitMock.mock.calls.filter(([, type, payload]) => type === 'assistant.text' && payload.streaming === false);
+      expect(finals).toHaveLength(1);
+    });
+    const turn3Final = emitMock.mock.calls.find(([, type, payload]) => type === 'assistant.text' && payload.streaming === false)!;
+    expect(turn3Final[2].text).toBe(
+      'Turn 3 normal text quoting Error: The stream was interrupted. Please continue the task you were working on.',
+    );
+    expect(appendMock.mock.calls.some(([, evt]) => evt?.type === 'session.error')).toBe(false);
+
+    emitMock.mockClear();
+    appendMock.mockClear();
+
+    // Turn 4: genuine current failure with no partial output -> emits ⚠️ Error bubble and session.error transport event
+    await agyProvider.send(sid, 'TURN4_GENUINE_EMPTY_FAIL');
+    await vi.waitFor(() => {
+      const finals = emitMock.mock.calls.filter(([, type, payload]) => type === 'assistant.text' && payload.streaming === false);
+      expect(finals).toHaveLength(1);
+    });
+    const turn4Final = emitMock.mock.calls.find(([, type, payload]) => type === 'assistant.text' && payload.streaming === false)!;
+    expect(turn4Final[2].text).toBe('⚠️ Error: The stream was interrupted. Please continue the task you were working on.');
+    expect(turn4Final[2].memoryExcluded).toBe(true);
+    const turn4SessionErr = appendMock.mock.calls.find(([, evt]) => evt?.type === 'session.error');
+    expect(turn4SessionErr).toBeDefined();
+    expect(turn4SessionErr![1]).toMatchObject({
+      type: 'session.error',
+      sessionId: 'deck_agy_e2e',
+      error: 'The stream was interrupted. Please continue the task you were working on.',
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+    });
   });
 });

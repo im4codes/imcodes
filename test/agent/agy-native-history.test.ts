@@ -41,6 +41,17 @@ describe('AG native completed-turn proof (read-only)', () => {
     expect(recoverAgyResponseSync(request)?.text).toBe('The actual current answer');
     expect(recoverAgyResponseSync({ ...request, error:fixture.API_ERROR + ' different' })).toBeUndefined();
   });
+  it.each([3, 5])('recovers historical stream-interrupted and non-request-failed API errors from native system_error with status %s', historicalStatus => {
+    for (const err of [fixture.STREAM_ERROR, fixture.API_RETRY_ERROR]) {
+      const request = { ...setup({ error: err, historicalStatus }), error: err };
+      expect(recoverAgyResponseSync(request)?.text).toBe('The actual current answer');
+      expect(recoverAgyResponseSync({ ...request, error: err + ' different' })).toBeUndefined();
+    }
+  });
+  it.each(['partial','currentError','laterTool','errorDetails','mismatch','noHistory'])('preserves stream-interrupted failure when native proof is missing: %s', key => {
+    const request = { ...setup({ error:fixture.STREAM_ERROR, historicalStatus:3, [key]:true }), error:fixture.STREAM_ERROR };
+    expect(recoverAgyResponseSync(request)).toBeUndefined();
+  });
   it.each(['partial','currentError','laterTool','errorDetails','mismatch','noHistory'])('preserves API failure when native proof is missing: %s', key => {
     const request = { ...setup({ error:fixture.API_ERROR, historicalStatus:3, [key]:true }), error:fixture.API_ERROR };
     expect(recoverAgyResponseSync(request)).toBeUndefined();

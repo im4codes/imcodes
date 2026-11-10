@@ -4,6 +4,8 @@ const path = require('node:path');
 const CONVERSATION = '11111111-1111-4111-8111-111111111111';
 const ERROR = 'Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 50m15s.';
 const API_ERROR = 'API error (attempt 1): request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": EOF';
+const API_RETRY_ERROR = 'API error (attempt 2): stream error: stream ID 1; INTERNAL_ERROR; received from peer';
+const STREAM_ERROR = 'The stream was interrupted. Please continue the task you were working on.';
 function varint(n) {
   const out = [];
   do { const b = n % 128; n = Math.floor(n / 128); out.push(b | (n ? 128 : 0)); } while (n);
@@ -36,9 +38,11 @@ function insert(db, idx, type, status, at, body, error = null) {
 function persist(home, prompt, opts = {}) {
   const db = open(home);
   const at = opts.at ?? Date.now();
-  // API errors observed on 215 use system_error.error_details.message, whereas
-  // the original quota fixture uses its legacy direct text form.
-  const diagnostic = opts.error === API_ERROR ? field(3,field(2,opts.error)) : field(1,opts.error ?? ERROR);
+  // API and stream-interrupted errors produced by core.appendErrorStep use
+  // system_error.error_details.short_error (field 3 -> field 2), whereas the
+  // original quota fixture uses its legacy direct text form.
+  const usesErrorDetails = opts.error === API_ERROR || opts.error === API_RETRY_ERROR || opts.error === STREAM_ERROR;
+  const diagnostic = usesErrorDetails ? field(3,field(2,opts.error)) : field(1,opts.error ?? ERROR);
   if (!db.prepare('SELECT idx FROM steps WHERE idx=11927').get() && !opts.noHistory) {
     insert(db,11927,17,opts.historicalStatus ?? 5,at-86400000,payload(17,diagnostic,opts.historicalStatus ?? 5));
   }
@@ -52,4 +56,4 @@ function persist(home, prompt, opts = {}) {
   db.close();
   return {idx,at,answer};
 }
-module.exports = { CONVERSATION, ERROR, API_ERROR, field, message, payload, metadata, open, insert, persist };
+module.exports = { CONVERSATION, ERROR, API_ERROR, API_RETRY_ERROR, STREAM_ERROR, field, message, payload, metadata, open, insert, persist };
