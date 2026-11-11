@@ -5652,15 +5652,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     await uploadAttachmentFiles(Array.from(files));
   }, [closeQuickSuggestions, uploadAttachmentFiles]);
 
-  const consumedSharedUploadIdRef = useRef<string | null>(null);
+  const consumedSharedUploadIdsRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     if (!pendingSharedUpload || !divRef.current) return;
-    if (consumedSharedUploadIdRef.current === pendingSharedUpload.id) return;
+    if (consumedSharedUploadIdsRef.current.has(pendingSharedUpload.id)) return;
     if (!activeSession || activeSession.name !== pendingSharedUpload.sessionName) return;
     if (!serverId || serverId !== pendingSharedUpload.serverId) return;
     if (attachmentDraftKey && hydratedAttachmentDraftKey !== attachmentDraftKey) return;
 
-    consumedSharedUploadIdRef.current = pendingSharedUpload.id;
+    consumedSharedUploadIdsRef.current.add(pendingSharedUpload.id);
     onPendingSharedUploadConsumed?.(pendingSharedUpload.id);
 
     const sharedText = typeof pendingSharedUpload.text === 'string' ? pendingSharedUpload.text.trim() : '';

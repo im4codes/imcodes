@@ -1279,12 +1279,16 @@ export function App() {
     };
   }, []);
 
-  const [pendingSharedPayload, setPendingSharedPayload] = useState<SharedPayload | null>(null);
-  const [pendingSharedUpload, setPendingSharedUpload] = useState<PendingSharedSessionUpload | null>(null);
+  const [pendingSharedPayloads, setPendingSharedPayloads] = useState<SharedPayload[]>([]);
+  const [pendingSharedUploads, setPendingSharedUploads] = useState<PendingSharedSessionUpload[]>([]);
+  const pendingSharedPayload = pendingSharedPayloads[0] ?? null;
+  const pendingSharedUpload = pendingSharedUploads[0] ?? null;
 
   useEffect(() => {
     return subscribeShareReceiver((payload) => {
-      setPendingSharedPayload(payload);
+      setPendingSharedPayloads((prev) => (
+        prev.some((item) => item.id === payload.id) ? prev : [...prev, payload]
+      ));
     });
   }, []);
 
@@ -5982,26 +5986,50 @@ export function App() {
     writeHashState(serverId, null);
   }, [servers, setActiveSession]);
 
+  const handleDismissSharedPayload = useCallback((payloadId: string) => {
+    setPendingSharedPayloads((prev) => prev.filter((item) => item.id !== payloadId));
+  }, []);
+
   const handleConfirmShareTargetSession = useCallback((targetServerId: string, targetSessionName: string) => {
     if (!pendingSharedPayload || !targetServerId || !targetSessionName) return;
     const payload = pendingSharedPayload;
-    setPendingSharedPayload(null);
-    if (targetServerId !== selectedServerIdRef.current) {
-      handleSelectServerForShare(targetServerId);
-    }
-    selectMainSessionTab(targetSessionName);
-    setPendingSharedUpload({
+    const nextUpload: PendingSharedSessionUpload = {
       id: payload.id,
       serverId: targetServerId,
       sessionName: targetSessionName,
       files: payload.files,
       ...(payload.text ? { text: payload.text } : {}),
-    });
-  }, [handleSelectServerForShare, pendingSharedPayload, selectMainSessionTab]);
+    };
+    setPendingSharedPayloads((prev) => prev.filter((item) => item.id !== payload.id));
+    setPendingSharedUploads((prev) => (
+      prev.some((item) => item.id === nextUpload.id) ? prev : [...prev, nextUpload]
+    ));
+    if (pendingSharedUploads.length === 0) {
+      if (targetServerId !== selectedServerIdRef.current) {
+        handleSelectServerForShare(targetServerId);
+      }
+      selectMainSessionTab(targetSessionName);
+    }
+  }, [handleSelectServerForShare, pendingSharedPayload, pendingSharedUploads.length, selectMainSessionTab]);
 
   const handlePendingSharedUploadConsumed = useCallback((id: string) => {
-    setPendingSharedUpload((prev) => (prev?.id === id ? null : prev));
+    setPendingSharedUploads((prev) => prev.filter((item) => item.id !== id));
   }, []);
+
+  const activeSharedUploadId = pendingSharedUpload?.id ?? null;
+  const hasPendingSharedModal = pendingSharedPayload !== null;
+  useEffect(() => {
+    if (!pendingSharedUpload) return;
+    if (pendingSharedUpload.serverId !== selectedServerIdRef.current) {
+      if (hasPendingSharedModal) return;
+      handleSelectServerForShare(pendingSharedUpload.serverId);
+      selectMainSessionTab(pendingSharedUpload.sessionName);
+      return;
+    }
+    if (pendingSharedUpload.sessionName !== activeSession) {
+      selectMainSessionTab(pendingSharedUpload.sessionName);
+    }
+  }, [activeSession, activeSharedUploadId, handleSelectServerForShare, hasPendingSharedModal, pendingSharedUpload, selectMainSessionTab]);
 
   const handleUnifiedServerSelect = useCallback((item: UnifiedServerItem) => {
     if (item.isSharedIn) {
@@ -9176,7 +9204,7 @@ export function App() {
           sessionsLoading={!sessionsLoaded && visibleMainSessions.length === 0 && Boolean(selectedServerId)}
           onSelectServer={handleSelectServerForShare}
           onSelectSession={handleConfirmShareTargetSession}
-          onClose={() => setPendingSharedPayload(null)}
+          onClose={() => handleDismissSharedPayload(pendingSharedPayload.id)}
         />
       )}
 
