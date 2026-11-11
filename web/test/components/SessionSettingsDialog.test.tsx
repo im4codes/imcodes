@@ -9,6 +9,8 @@ import {
   CODEX_MODEL_IDS,
   DEFAULT_CODEX_AUTOMATION_MODEL,
 } from '../../../src/shared/models/options.js';
+import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
+import { __clearTransportModelCacheForTests } from '../../src/hooks/useTransportModels.js';
 import { DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS } from '../../../shared/supervision-execution-pool.js';
 import { hasInvalidSessionSupervisionSnapshot } from '../../../shared/supervision-config.js';
 
@@ -147,6 +149,7 @@ function makeIdentityAckWs() {
 describe('SessionSettingsDialog supervision', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    __clearTransportModelCacheForTests();
     fetchSupervisorDefaultsMock.mockRejectedValue(new Error('no defaults'));
     fetchExecutionPoolCatalogMock.mockResolvedValue([]);
     saveSupervisorDefaultsMock.mockResolvedValue(undefined);
@@ -2446,15 +2449,96 @@ describe('SessionSettingsDialog supervision', () => {
       expect(CLAUDE_CODE_MODEL_IDS.includes(modelSelect.value as typeof CLAUDE_CODE_MODEL_IDS[number])).toBe(true);
     });
 
-    // Apply must dispatch the /model command using the new Claude model (not a Codex model)
+    // A provider switch is committed by Save, not a separate /model command.
     const applyButton = await screen.findByRole('button', { name: 'apply' });
-    expect((applyButton as HTMLButtonElement).disabled).toBe(false);
-    fireEvent.click(applyButton);
-    await waitFor(() =>
-      expect(ws.sendSessionMessage).toHaveBeenCalledWith(
-        'deck_proj_brain',
-        `/model ${CLAUDE_CODE_MODEL_IDS[0]}`,
-      ),
-    );
+    expect((applyButton as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() => expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', {
+      agentType: 'claude-code-sdk', requestedModel: CLAUDE_CODE_MODEL_IDS[0], activeModel: null,
+    }));
+    expect(ws.sendSessionMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, 'sub-1'])('saves Codex to AGY once for %s and clears the old active display', async (subSessionId) => {
+    const onSaved = vi.fn();
+    const onClose = vi.fn();
+    render(<SessionSettingsDialog
+      serverId="srv-1" sessionName="deck_proj_brain" subSessionId={subSessionId}
+      label="Brain" description="" cwd="/proj" type="codex-sdk"
+      activeModel={CODEX_MODEL_IDS[0]} requestedModel={CODEX_MODEL_IDS[0]} modelDisplay={CODEX_MODEL_IDS[0]}
+      transportConfig={null} surface="session" onClose={onClose} onSaved={onSaved}
+    />);
+    changeSelect(screen.getByTestId('session-agent-type'), AGY_SDK_PROVIDER_ID);
+    await waitFor(() => expect((screen.getByLabelText('label') as HTMLSelectElement).value).toBe(AGY_DEFAULT_MODEL_ID));
+    expect(onSaved).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    const patch = subSessionId ? patchSubSessionMock : patchSessionMock;
+    await waitFor(() => expect(patch).toHaveBeenCalledWith('srv-1', subSessionId ?? 'deck_proj_brain', {
+      [subSessionId ? 'type' : 'agentType']: AGY_SDK_PROVIDER_ID,
+      requestedModel: AGY_DEFAULT_MODEL_ID,
+      activeModel: null,
+    }));
+    expect(onSaved).toHaveBeenCalledWith(expect.objectContaining({
+      type: AGY_SDK_PROVIDER_ID, requestedModel: AGY_DEFAULT_MODEL_ID, activeModel: null, modelDisplay: null,
+    }));
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it('uses a late AGY live default but does not override a later manual selection', async () => {
+    const handlers = new Set<(message: unknown) => void>();
+    const ws = { connected: true, onMessage: (cb: (message: unknown) => void) => { handlers.add(cb); return () => handlers.delete(cb); }, requestTransportModels: () => 'agy-switch' };
+    render(<SessionSettingsDialog serverId="srv-1" sessionName="deck_proj_brain" label="Brain" description="" cwd="/proj"
+      type="codex-sdk" activeModel={CODEX_MODEL_IDS[0]} requestedModel={CODEX_MODEL_IDS[0]}
+      transportConfig={null} surface="session" ws={ws as any} onClose={vi.fn()} onSaved={vi.fn()} />);
+    changeSelect(screen.getByTestId('session-agent-type'), AGY_SDK_PROVIDER_ID);
+    await waitFor(() => expect((screen.getByLabelText('label') as HTMLSelectElement).value).toBe(AGY_DEFAULT_MODEL_ID));
+    act(() => handlers.forEach((handler) => handler({ type: 'transport.models_response', agentType: AGY_SDK_PROVIDER_ID,
+      sessionName: 'deck_proj_brain', requestId: 'agy-switch', models: [{ id: AGY_DEFAULT_MODEL_ID }, { id: 'live-default' }, { id: 'manual-choice' }], defaultModel: 'live-default' })));
+    await waitFor(() => expect((screen.getByLabelText('label') as HTMLSelectElement).value).toBe('live-default'));
+    changeSelect(screen.getByLabelText('label'), 'manual-choice');
+    act(() => handlers.forEach((handler) => handler({ type: 'transport.models_response', agentType: AGY_SDK_PROVIDER_ID,
+      sessionName: 'deck_proj_brain', requestId: 'agy-switch', models: [{ id: AGY_DEFAULT_MODEL_ID }, { id: 'manual-choice' }, { id: 'later-default' }], defaultModel: 'later-default' })));
+    expect((screen.getByLabelText('label') as HTMLSelectElement).value).toBe('manual-choice');
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() => expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', {
+      agentType: AGY_SDK_PROVIDER_ID, requestedModel: 'manual-choice', activeModel: null,
+    }));
+  });
+
+  it.each([
+    { from: AGY_SDK_PROVIDER_ID, to: 'codex-sdk', expected: CODEX_MODEL_IDS[0] },
+    { from: 'codex-sdk', to: 'shell', expected: null },
+  ])('uses the target default or clears models for $from to $to', async ({ from, to, expected }) => {
+    const oldModel = from === AGY_SDK_PROVIDER_ID ? AGY_DEFAULT_MODEL_ID : CODEX_MODEL_IDS[0];
+    const onSaved = vi.fn();
+    render(<SessionSettingsDialog serverId="srv-1" sessionName="deck_proj_brain" label="Brain" description="" cwd="/proj"
+      type={from} activeModel={oldModel} requestedModel={oldModel} transportConfig={null}
+      surface="session" onClose={vi.fn()} onSaved={onSaved} />);
+    changeSelect(screen.getByTestId('session-agent-type'), to);
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() => expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', {
+      agentType: to, requestedModel: expected, activeModel: null,
+    }));
+    expect(onSaved).toHaveBeenCalledWith(expect.objectContaining({
+      requestedModel: expected, activeModel: null, modelDisplay: null,
+    }));
+  });
+
+  it('does not change model for metadata-only saves or publish a failed provider save', async () => {
+    const onSaved = vi.fn();
+    const onClose = vi.fn();
+    patchSessionMock.mockRejectedValueOnce(new Error('offline'));
+    render(<SessionSettingsDialog serverId="srv-1" sessionName="deck_proj_brain" label="Brain" description="" cwd="/proj"
+      type="codex-sdk" activeModel={CODEX_MODEL_IDS[0]} requestedModel={CODEX_MODEL_IDS[0]}
+      transportConfig={null} surface="session" onClose={onClose} onSaved={onSaved} />);
+    changeSelect(screen.getByTestId('session-agent-type'), AGY_SDK_PROVIDER_ID);
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() => expect(document.querySelector('.session-settings-error')?.textContent).toContain('offline'));
+    expect(onSaved).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    changeSelect(screen.getByTestId('session-agent-type'), 'codex-sdk');
+    fireEvent.input(inputForLabel('label'), { target: { value: 'New Brain' } });
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() => expect(patchSessionMock).toHaveBeenLastCalledWith('srv-1', 'deck_proj_brain', { label: 'New Brain' }));
   });
 });

@@ -7,7 +7,7 @@ import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import { patchSession, patchSubSession } from '../api.js';
 import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
-import { supportsDynamicTransportModels, useTransportModels } from '../hooks/useTransportModels.js';
+import { readCachedTransportModels, supportsDynamicTransportModels, useTransportModels } from '../hooks/useTransportModels.js';
 import type { WsClient } from '../ws-client.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, SESSION_AGENT_TYPES, TRANSPORT_SESSION_AGENT_TYPES, getSessionRuntimeType, type SessionAgentType } from '@shared/agent-types.js';
@@ -126,7 +126,7 @@ interface Props {
    */
   ws?: WsClient | null;
   onClose: () => void;
-  onSaved: (fields: { label?: string; description?: string; cwd?: string; type?: string; transportConfig?: Record<string, unknown> | null; requestedModel?: string; activeModel?: string; modelDisplay?: string }) => void;
+  onSaved: (fields: { label?: string; description?: string; cwd?: string; type?: string; transportConfig?: Record<string, unknown> | null; requestedModel?: string | null; activeModel?: string | null; modelDisplay?: string | null }) => void;
 }
 
 export const SESSION_MODEL_CONFIRMATION_TIMEOUT_MS = 15_000;
@@ -850,6 +850,7 @@ export function SessionSettingsDialog({
   const [supervision, setSupervision] = useState<SupervisionDraft>(initialSupervision);
   const ccPresetListRequestIdRef = useRef<string | null>(null);
   const agentTypeMountedRef = useRef(false);
+  const providerModelManuallySelectedRef = useRef(false);
   const [supervisorDefaults, setSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
   const [initialSupervisorDefaults, setInitialSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
   const supervisorDefaultsDirtyRef = useRef(false);
@@ -880,23 +881,31 @@ export function SessionSettingsDialog({
     setPendingSessionModel(null);
   }, [sessionName, subSessionId, type]);
 
-  // When the user switches provider (agentType), reset sessionModel to the new
-  // provider's static default. Skips on initial mount and on session-switch
-  // resets (where agentType is set back to equal type).
+  const providerDefaultModel = (nextType: string): string | null => {
+    if (nextType === 'claude-code') return CLAUDE_CODE_MODEL_IDS[0] ?? null;
+    if (nextType === 'codex') return CODEX_MODEL_IDS[0] ?? null;
+    if (nextType === 'qwen') return getKnownQwenModelOptions()[0]?.id ?? null;
+    const catalog = readCachedTransportModels(`${sessionName.trim()}\0${nextType}\0`, nextType);
+    return catalog?.models.some((model) => model.id === catalog.defaultModel)
+      ? catalog.defaultModel ?? null
+      : catalog?.models[0]?.id ?? null;
+  };
+
+  // A provider change selects that provider's default, never the previous
+  // provider's active model. The catalog hook may still hold the old provider
+  // during this render, so read the target-scoped cache/fallback directly.
   useEffect(() => {
     if (!agentTypeMountedRef.current) {
       agentTypeMountedRef.current = true;
       return;
     }
-    if (agentType === type) return;
-    const newDefault = agentType === 'claude-code' || agentType === 'claude-code-sdk' || agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE
-      ? (CLAUDE_CODE_MODEL_IDS[0] ?? '')
-      : agentType === 'codex' || agentType === 'codex-sdk'
-        ? (CODEX_MODEL_IDS[0] ?? '')
-        : agentType === 'qwen'
-          ? (getKnownQwenModelOptions()[0]?.id ?? '')
-          : '';
-    setSessionModel(newDefault);
+    if (agentType === type) {
+      providerModelManuallySelectedRef.current = false;
+      setSessionModel(initialSessionModel);
+      return;
+    }
+    providerModelManuallySelectedRef.current = false;
+    setSessionModel(providerDefaultModel(agentType) ?? '');
   }, [agentType, type]);
 
   useEffect(() => {
@@ -943,13 +952,19 @@ export function SessionSettingsDialog({
     undefined,
     sessionName,
   );
+  useEffect(() => {
+    if (agentType === type || providerModelManuallySelectedRef.current) return;
+    // A late live catalog may replace the fallback default, but never a
+    // subsequent explicit model selection made by the user.
+    setSessionModel(providerDefaultModel(agentType) ?? '');
+  }, [agentType, type, sessionDynamicModels.defaultModel, sessionDynamicModels.models]);
   const sessionModelOptions = useMemo(() => {
     if (agentType === AGY_SDK_PROVIDER_ID && sessionDynamicModels.models.length > 0) {
       // The hook already supplies fallback options until a real catalog arrives.
       // Keep an explicit current selection visible, but do not append stale
       // hardcoded catalog entries to the provider's newer model list.
       return mergeModelSuggestions(
-        [sessionModel, initialSessionModel].filter((value): value is string => !!value),
+        [sessionModel, agentType === type ? initialSessionModel : null].filter((value): value is string => !!value),
         sessionDynamicModels.models.map((entry) => entry.id),
       );
     }
@@ -965,10 +980,10 @@ export function SessionSettingsDialog({
               ? [...AGY_MODEL_IDS]
               : [];
     return mergeModelSuggestions(
-      [sessionModel, initialSessionModel, sessionDynamicModels.defaultModel, ...staticOptions].filter((value): value is string => !!value),
+      [sessionModel, agentType === type ? initialSessionModel : null, sessionDynamicModels.defaultModel, ...staticOptions].filter((value): value is string => !!value),
       sessionDynamicModels.models.map((entry) => entry.id),
     );
-  }, [agentType, initialSessionModel, sessionDynamicModels.defaultModel, sessionDynamicModels.models, sessionModel]);
+  }, [agentType, type, initialSessionModel, sessionDynamicModels.defaultModel, sessionDynamicModels.models, sessionModel]);
   const sessionModelSwitchSupported = agentType === 'claude-code'
     || agentType === 'codex'
     || supportsDynamicTransportModels(agentType);
@@ -1495,20 +1510,28 @@ export function SessionSettingsDialog({
         });
       }
 
+      const providerChanged = surface === 'session' && agentType !== type;
+      const nextProviderModel = providerChanged
+        ? (providerModelManuallySelectedRef.current ? sessionModel.trim() || null : providerDefaultModel(agentType))
+        : null;
       const fields: {
         label?: string | null;
         description?: string | null;
         cwd?: string | null;
         agentType?: string | null;
         type?: string | null;
+        requestedModel?: string | null;
+        activeModel?: string | null;
         transportConfig?: Record<string, unknown> | null;
       } = {};
       if (surface !== 'supervision') {
         if (label !== initLabel) fields.label = label || null;
         if (description !== initDesc) fields.description = description || null;
-        if (agentType !== type) {
+        if (providerChanged) {
           if (subSessionId) fields.type = agentType;
           else fields.agentType = agentType;
+          fields.requestedModel = nextProviderModel;
+          fields.activeModel = null;
         }
       }
       if (surface !== 'session' && JSON.stringify(nextTransportConfig ?? null) !== JSON.stringify(transportConfig ?? null)) {
@@ -1530,6 +1553,11 @@ export function SessionSettingsDialog({
           label: label || undefined,
           description: description || undefined,
           type: agentType || undefined,
+          ...(providerChanged ? {
+            requestedModel: nextProviderModel,
+            activeModel: null,
+            modelDisplay: null,
+          } : {}),
         } : {}),
         ...(surface !== 'session' ? { transportConfig: nextTransportConfig } : {}),
       });
@@ -2102,6 +2130,7 @@ export function SessionSettingsDialog({
                   value={sessionModel}
                   disabled={saving || modelApplyState === 'applying'}
                   onInput={(event) => {
+                    providerModelManuallySelectedRef.current = true;
                     setSessionModel((event.target as HTMLSelectElement).value);
                     setModelApplyState('idle');
                     setModelApplyError('');
@@ -2123,7 +2152,7 @@ export function SessionSettingsDialog({
                     type="button"
                     class="btn btn-secondary"
                     onClick={() => { void handleApplySessionModel(); }}
-                    disabled={!ws || !sessionModelDirty || !sessionModel.trim() || modelApplyState === 'applying'}
+                    disabled={!ws || agentType !== type || !sessionModelDirty || !sessionModel.trim() || modelApplyState === 'applying'}
                   >
                     {modelApplyState === 'applying'
                       ? t('session.modelSettings.applying')

@@ -157,6 +157,7 @@ export function mergeSessionListEntry(
         ? existing?.activityGeneration
         : undefined;
   const isCodexFamily = incoming.agentType === 'codex' || incoming.agentType === 'codex-sdk';
+  const providerChanged = existing != null && incoming.agentType !== existing.agentType;
   // Codex AND claude-code-sdk AND agy-sdk AND grok-sdk surface provider quota that the daemon may omit on
   // a given session_list pass (idle / 30-min throttle / a transient B failure);
   // preserve the last known value so the footer doesn't flicker blank between
@@ -217,14 +218,14 @@ export function mergeSessionListEntry(
     userCreated: incoming.userCreated ?? existing?.userCreated,
     description: incoming.description ?? existing?.description,
     ccPreset: incoming.ccPreset !== undefined ? incoming.ccPreset : existing?.ccPreset,
-    qwenModel: incoming.qwenModel ?? existing?.qwenModel,
-    requestedModel: incoming.requestedModel ?? existing?.requestedModel,
-    activeModel: incoming.activeModel ?? existing?.activeModel,
+    qwenModel: incoming.qwenModel ?? (providerChanged ? undefined : existing?.qwenModel),
+    requestedModel: incoming.requestedModel ?? (providerChanged ? undefined : existing?.requestedModel),
+    activeModel: incoming.activeModel ?? (providerChanged ? undefined : existing?.activeModel),
     qwenAuthType: incoming.qwenAuthType ?? existing?.qwenAuthType,
     qwenAuthLimit: incoming.qwenAuthLimit ?? existing?.qwenAuthLimit,
     qwenAvailableModels: incoming.qwenAvailableModels ?? existing?.qwenAvailableModels,
     codexAvailableModels: incoming.codexAvailableModels ?? existing?.codexAvailableModels,
-    modelDisplay: incoming.modelDisplay ?? incoming.activeModel ?? existing?.modelDisplay,
+    modelDisplay: incoming.modelDisplay ?? incoming.activeModel ?? (providerChanged ? undefined : existing?.modelDisplay),
     planLabel: incoming.planLabel ?? (preservesProviderQuota ? existing?.planLabel : undefined),
     quotaLabel: incoming.quotaLabel ?? (preservesProviderQuota ? existing?.quotaLabel : undefined),
     quotaUsageLabel: incoming.quotaUsageLabel ?? (preservesProviderQuota ? existing?.quotaUsageLabel : undefined),

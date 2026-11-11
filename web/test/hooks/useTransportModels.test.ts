@@ -262,14 +262,14 @@ describe('useTransportModels caching and fallbacks', () => {
     expect(result.current.models.every((model) => model.id.trim().length > 0)).toBe(true);
   });
 
-  it('updates old persisted catalog defaults to Flash High without losing model options', () => {
+  it('preserves a valid catalog default even when the AGY fallback is also available', () => {
     window.sessionStorage.setItem('imcodes:transport-models:old-session\0agy-sdk\0', JSON.stringify({
       models: [{ id: 'gemini-4-argon-medium' }, { id: 'gemini-3.8-flash-high' }],
       defaultModel: 'gemini-4-argon-medium',
     }));
     const { result } = renderHook(() => useTransportModels(null, AGY_SDK_PROVIDER_ID, null, 'old-session'));
     expect(result.current.models).toHaveLength(2);
-    expect(result.current.defaultModel).toBe('gemini-3.8-flash-high');
+    expect(result.current.defaultModel).toBe('gemini-4-argon-medium');
   });
 
   it('fully overwrites memory and stored catalogs with newer models and reuses the cache on remount', () => {

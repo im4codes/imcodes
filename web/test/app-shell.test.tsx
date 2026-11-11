@@ -576,6 +576,9 @@ vi.mock('../src/components/SessionPane.js', () => ({
       data-supervision-mode={session.supervisionMode ?? ''}
       data-share-target-kind={session.sharedState?.targetKind ?? ''}
       data-can-share={String(Boolean(onShareSession))}
+      data-requested-model={session.requestedModel ?? ''}
+      data-active-model={session.activeModel ?? ''}
+      data-model-display={session.modelDisplay ?? ''}
     >
       session-pane:{session.name}
       <button onClick={() => onFitFn?.(vi.fn())}>pane-fit-ref</button>
@@ -821,6 +824,7 @@ vi.mock('../src/components/SessionSettingsDialog.js', () => ({
       <button onClick={() => onAddPoolSession?.('economy')}>settings-pool-add</button>
       <button onClick={() => onSaved?.({ label: 'Saved', type: 'codex-sdk', cwd: '/work/saved', transportConfig: {} })}>settings-save</button>
       <button onClick={() => onSaved?.({ requestedModel: 'gpt-5.6', activeModel: 'gpt-5.6', modelDisplay: 'gpt-5.6' })}>settings-model-confirmed</button>
+      <button onClick={() => onSaved?.({ type: 'agy-sdk', requestedModel: 'gemini-3.8-flash-high', activeModel: null, modelDisplay: null })}>settings-provider-switched</button>
       <button onClick={onClose}>settings-close</button>
     </div>
   ),
@@ -2492,6 +2496,40 @@ describe('App shell', () => {
       requestedModel: 'gpt-5.6',
       activeModel: 'gpt-5.6',
       modelDisplay: 'gpt-5.6',
+    }));
+  }, 20_000);
+
+  it('clears the old main and sub-session active model as soon as a provider save succeeds', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.subSessions = [{
+      id: 'sub-model', sessionName: 'deck_sub_model_worker', parentSession: 'deck_alpha_brain',
+      label: 'Model Worker', description: '', cwd: '/work/alpha', type: 'codex-sdk',
+      runtimeType: 'transport', requestedModel: 'gpt-5.4', activeModel: 'gpt-5.4',
+      modelDisplay: 'gpt-5.4', state: 'idle', serverId: 'srv-1',
+    }];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+    const { App } = await importApp();
+    render(<App />);
+    const ws = await getActiveWsClient();
+    await act(async () => ws.emit({
+      type: 'session_list', sessions: [{ ...sessionList().sessions[0], agentType: 'codex-sdk',
+        project: 'Alpha', activeModel: 'gpt-5.4', requestedModel: 'gpt-5.4', modelDisplay: 'gpt-5.4' }],
+    }));
+    const pane = await screen.findByTestId('session-pane-deck_alpha_brain');
+    expect(pane.getAttribute('data-active-model')).toBe('gpt-5.4');
+    fireEvent.click(within(pane).getByRole('button', { name: 'pane-settings' }));
+    fireEvent.click(within(await screen.findByTestId('session-settings-dialog')).getByRole('button', { name: 'settings-provider-switched' }));
+    await waitFor(() => expect(pane.getAttribute('data-requested-model')).toBe('gemini-3.8-flash-high'));
+    expect(pane.getAttribute('data-active-model')).toBe('');
+    expect(pane.getAttribute('data-model-display')).toBe('');
+    fireEvent.click(within(screen.getByTestId('session-settings-dialog')).getByRole('button', { name: 'settings-close' }));
+    fireEvent.click(screen.getByText('subbar-open-sub-model'));
+    fireEvent.click(await screen.findByText('sub-window-settings-sub-model'));
+    fireEvent.click(within(await screen.findByTestId('session-settings-dialog')).getByRole('button', { name: 'settings-provider-switched' }));
+    expect(updateSubLocalMock).toHaveBeenCalledWith('sub-model', expect.objectContaining({
+      requestedModel: 'gemini-3.8-flash-high', activeModel: null, modelDisplay: null,
     }));
   }, 20_000);
 

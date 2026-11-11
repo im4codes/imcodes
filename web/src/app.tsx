@@ -9050,14 +9050,18 @@ export function App() {
                 if (fields.type !== undefined) {
                   updated.agentType = fields.type;
                   updated.runtimeType = getSessionRuntimeType(fields.type);
+                  if (fields.type !== s.agentType) delete updated.qwenModel;
                 }
                 if (fields.label !== undefined) updated.label = fields.label ?? null;
                 if (fields.description !== undefined) updated.description = fields.description ?? null;
                 if (fields.cwd !== undefined) updated.projectDir = fields.cwd ?? updated.projectDir;
                 if (fields.transportConfig !== undefined) updated.transportConfig = fields.transportConfig;
-                if (fields.requestedModel !== undefined) updated.requestedModel = fields.requestedModel;
-                if (fields.activeModel !== undefined) updated.activeModel = fields.activeModel;
-                if (fields.modelDisplay !== undefined) updated.modelDisplay = fields.modelDisplay;
+                if (fields.requestedModel === null) delete updated.requestedModel;
+                else if (fields.requestedModel !== undefined) updated.requestedModel = fields.requestedModel;
+                if (fields.activeModel === null) delete updated.activeModel;
+                else if (fields.activeModel !== undefined) updated.activeModel = fields.activeModel;
+                if (fields.modelDisplay === null) delete updated.modelDisplay;
+                else if (fields.modelDisplay !== undefined) updated.modelDisplay = fields.modelDisplay;
                 return updated;
               }));
             }

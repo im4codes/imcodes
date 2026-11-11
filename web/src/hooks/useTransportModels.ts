@@ -142,9 +142,11 @@ function normalizeCatalog(entry: CachedTransportModelCatalog | null | undefined,
     models,
     ...(typeof entry.defaultModel === 'string' ? { defaultModel: entry.defaultModel } : {}),
     ...(typeof entry.isAuthenticated === 'boolean' ? { isAuthenticated: entry.isAuthenticated } : {}),
-    // Old stored catalogs can still carry the previous Antigravity default.
-    // Model selections live in session settings, not this catalog default.
-    ...(agentType === AGY_SDK_PROVIDER_ID && models.some((model) => model.id === AGY_DEFAULT_MODEL_ID)
+    // Repair stale cached defaults only when they are absent from the actual
+    // catalog. A valid live default must take precedence over our fallback.
+    ...(agentType === AGY_SDK_PROVIDER_ID
+      && !models.some((model) => model.id === entry.defaultModel)
+      && models.some((model) => model.id === AGY_DEFAULT_MODEL_ID)
       ? { defaultModel: AGY_DEFAULT_MODEL_ID }
       : {}),
   };
