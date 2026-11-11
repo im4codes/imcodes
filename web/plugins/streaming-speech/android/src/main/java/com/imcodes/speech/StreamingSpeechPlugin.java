@@ -178,17 +178,17 @@ public class StreamingSpeechPlugin extends Plugin {
                     samples[i] = pcm[i] / 32768.0f;
                     power += samples[i] * samples[i];
                 }
-                if (!session.offerSamples(samples)) {
+                double levelValue = Math.min(1, Math.sqrt(power / count) * 3);
+                if (!session.offerSamples(samples, () -> {
+                    JSObject level = new JSObject();
+                    level.put("level", levelValue);
+                    notifyListeners("audioLevel", level);
+                })) {
                     session.markFirstPassDone();
                     session.stopIntake();
                     break;
                 }
                 session.markFirstPassDone();
-                if (!session.isStopRequested() && !session.isDiscarded()) {
-                    JSObject level = new JSObject();
-                    level.put("level", Math.min(1, Math.sqrt(power / count) * 3));
-                    notifyListeners("audioLevel", level);
-                }
             }
         } catch (Exception e) {
             session.markFirstPassDone();
@@ -318,7 +318,7 @@ public class StreamingSpeechPlugin extends Plugin {
             return discarded;
         }
 
-        synchronized boolean offerSamples(float[] samples) {
+        synchronized boolean offerSamples(float[] samples, Runnable onAccepted) {
             if (discarded) return false;
             if (pcmQueue.size() >= MAX_BUFFERED_CHUNKS) {
                 overflowed = true;
@@ -326,6 +326,7 @@ public class StreamingSpeechPlugin extends Plugin {
                 notifyAll();
                 return false;
             }
+            onAccepted.run();
             pcmQueue.addLast(samples);
             notifyAll();
             return true;

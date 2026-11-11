@@ -57,6 +57,7 @@ describe('shared mobile model preparation', () => {
     expect(android).toContain('Math.max(min * 2, SAMPLE_RATE * 2 * 6)');
     expect(android).toContain('worker.execute(() -> capture(call, owner, audio, session));');
     expect(android).toContain('private void stopCapture(boolean discard)');
+    expect(android).toMatch(/onAccepted\.run\(\);\s*\n\s*pcmQueue\.addLast\(samples\);/);
     expect(android).toMatch(/stream\.acceptWaveform\(new float\[SAMPLE_RATE \/ 2\], SAMPLE_RATE\);\s*\n\s*decodeAvailable\(recognizer, stream\);/);
     expect(android).toMatch(/next\.acceptWaveform\(new float\[SAMPLE_RATE \/ 2\], SAMPLE_RATE\);\s*\n\s*decodeAvailable\(recognizer, next\);/);
     expect(android).toMatch(/handleOnDestroy\(\)[\s\S]*recognizer\.release\(\);/);
