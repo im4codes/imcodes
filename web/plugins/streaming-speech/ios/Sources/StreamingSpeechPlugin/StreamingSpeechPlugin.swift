@@ -312,6 +312,11 @@ struct SpeechWindow {
     private(set) var partial = ""
     private var anchor = ""
     private var rolling = false
+    // Frozen at each acoustic roll, never fed back from intermediate snapshots.
+    private var seamTail = ""
+    private var overlapText: String?
+    private var hypothesis: String?
+    private var previousHypothesis: String?
     private var newSamples = 0
     private var silentSamples = 0
     private var lastEmitted = ""
@@ -355,35 +360,65 @@ struct SpeechWindow {
 
     private mutating func evaluate(_ decode: ([Float]) -> String?) throws {
         guard let decoded = decode(samples) else { throw Failure.decode }
-        let hypothesis = decoded.trimmingCharacters(in: .whitespacesAndNewlines)
-        if anchor.isEmpty {
-            partial = hypothesis
-        } else if let remainder = Self.removingOverlap(anchor, hypothesis) {
-            partial = remainder
+        let next = decoded.trimmingCharacters(in: .whitespacesAndNewlines)
+        previousHypothesis = hypothesis
+        hypothesis = next
+        if !rolling {
+            partial = next
         } else {
-            // If the model revises the entire acoustic seam, no trustworthy
-            // alignment exists. Preserve the unfixed tail rather than deleting
-            // unseen words. This conservative fallback can repeat a seam; text
-            // overlap is a heuristic, not a claim of lossless forced alignment.
-            partial = Self.joinOverlapping(partial, hypothesis)
+            // Empty anchor is NOT a new segment: retired PCM may still own the
+            // entire <=5 Character tail. Reconcile against the frozen roll seam,
+            // not the last partial (which also contains this window's new words).
+            let size: Int
+            if let overlapText = overlapText, next.hasPrefix(overlapText) {
+                size = overlapText.count
+            } else {
+                size = Self.overlapCount(anchor + seamTail, next)
+            }
+            if size > seamTail.count {
+                // The shared acoustic text extends into the committed prefix.
+                partial = String(next.dropFirst(size - seamTail.count))
+            } else if size > 0 {
+                // Preserve text whose audio has retired, even if no characters
+                // could be committed at the preceding roll. The seam may be one
+                // CJK Character or a cut inside an ASCII word: concatenate exact
+                // slices, do not insert/trim a synthetic boundary space.
+                partial = String(seamTail.dropLast(size)) + next
+            } else {
+                // Uncertain model revisions: preserve the frozen unfixed tail.
+                // This can repeat a seam, but cannot recursively re-append new
+                // words already included by an earlier decode of this window.
+                partial = Self.join(seamTail, next)
+            }
         }
         newSamples = 0
     }
 
     private mutating func rollWindow() {
+        // When successive raw hypotheses extend exactly, their delta describes
+        // the retained final stride. Prefer that acoustic seam over a longest
+        // suffix match: identical repeated words can otherwise over-match.
+        if let prior = previousHypothesis, let current = hypothesis, current.hasPrefix(prior) {
+            overlapText = String(current.dropFirst(prior.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        } else {
+            overlapText = nil
+        }
+        hypothesis = nil; previousHypothesis = nil
         let tail = String(partial.suffix(Self.rollbackCharacters))
         let stable = String(partial.dropLast(tail.count))
         committed = rolling ? committed + stable : Self.join(committed, stable)
         rolling = true
         anchor = String((anchor + stable).suffix(48))
         partial = tail
+        seamTail = tail
         samples = Array(samples.suffix(Self.overlap))
         // Keep the silence clock: a pause crossing a roll still commits once.
     }
 
     private mutating func commitSentence() {
         committed = text
-        partial = ""; anchor = ""; rolling = false
+        partial = ""; anchor = ""; rolling = false; seamTail = ""
+        overlapText = nil; hypothesis = nil; previousHypothesis = nil
         samples.removeAll(keepingCapacity: true)
         newSamples = 0; silentSamples = 0
     }
@@ -393,29 +428,23 @@ struct SpeechWindow {
         return "。！？.!?".contains(last)
     }
 
-    private static func removingOverlap(_ previous: String, _ next: String) -> String? {
-        // Bounded (<=48 Character) anchor work, only across overlapping audio.
-        // Never deduplicate whole sentences after VAD: repeated speech is valid.
-        let left = Array(previous.suffix(48)), right = Array(next.prefix(48))
+    private static func overlapCount(_ previous: String, _ next: String) -> Int {
+        // Only across known overlapping PCM, never across a VAD commit. One
+        // Character matters for short CJK; all work uses a bounded seam anchor.
+        let left = Array(previous.suffix(48 + rollbackCharacters)), right = Array(next.prefix(48 + rollbackCharacters))
         let limit = min(left.count, right.count)
-        guard limit >= 2 else { return nil }
-        for size in Swift.stride(from: limit, through: 2, by: -1) {
-            if left.suffix(size).elementsEqual(right.prefix(size)) {
-                return String(next.dropFirst(size))
-            }
+        guard limit > 0 else { return 0 }
+        for size in Swift.stride(from: limit, through: 1, by: -1) {
+            if left.suffix(size).elementsEqual(right.prefix(size)) { return size }
         }
-        return nil
-    }
-
-    private static func joinOverlapping(_ previous: String, _ next: String) -> String {
-        if let remainder = removingOverlap(previous, next) { return join(previous, remainder) }
-        return join(previous, next)
+        return 0
     }
 
     private static func join(_ previous: String, _ next: String) -> String {
         if previous.isEmpty { return next }
         if next.isEmpty { return previous }
         let ascii = previous.unicodeScalars.last!.value < 128 && next.unicodeScalars.first!.value < 128
-        return previous + (ascii ? " " : "") + next
+        let separated = previous.last!.isWhitespace || next.first!.isWhitespace
+        return previous + (ascii && !separated ? " " : "") + next
     }
 }

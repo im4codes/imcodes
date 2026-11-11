@@ -219,7 +219,7 @@ it.skipIf(!swiftCompiler)('executes the actual Swift bounded window through roll
   await writeFile(file, 'import Foundation\n' + state + '\n' + swiftWindowCases);
   execFileSync(swiftCompiler!, ['-swift-version', '5', file, '-o', executable], { encoding: 'utf8', timeout: 60000 });
   const result = execFileSync(executable, [], { encoding: 'utf8', timeout: 30000 });
-  for (const name of ['TAIL', 'ROLLBACK', 'VAD', 'PUNCTUATION', 'REPEATED_SENTENCE', 'LONG_CONTINUOUS', 'VARIABLE_TAP', 'FAILURE', 'UNICODE', 'EMPTY', 'IN_FLIGHT_STOP', 'LONG_TRANSCRIPT']) {
+  for (const name of ['TAIL', 'ROLLBACK', 'VAD', 'PUNCTUATION', 'REPEATED_SENTENCE', 'LONG_CONTINUOUS', 'VARIABLE_TAP', 'FAILURE', 'UNICODE', 'EMPTY', 'IN_FLIGHT_STOP', 'LONG_TRANSCRIPT', 'SHORT_CJK', 'SHORT_ASCII', 'REPEATED_OVERLAP']) {
     expect(result).toContain(name + ':PASS');
   }
 }, 95000);
@@ -241,6 +241,27 @@ final class InFlightCapture {
         if lengths.count == 1 { entered.signal(); release.wait() }
         return samples.count == 16000 ? "before tail" : "before tail last word"
     }
+}
+func labelledSeams(_ words: [String], separator: String) throws {
+    var window = SpeechWindow()
+    let decode: ([Float]) -> String? = { samples in
+        var previous = -1, result: [String] = []
+        for sample in samples {
+            let id = Int(sample)
+            if id != previous { result.append(words[id]); previous = id }
+        }
+        return result.joined(separator: separator)
+    }
+    for id in 0..<words.count {
+        let expected = words.prefix(id + 1).joined(separator: separator)
+        try window.append(Array(repeating: Float(id), count: 16000), speech: true, decode: decode) { snapshot in
+            check(snapshot == expected, "seam corrupted an intermediate snapshot: " + snapshot + " != " + expected)
+        }
+        check(window.text == expected, "window lost previously recognised text")
+        check(window.samples.count <= 48000, "labelled input grew the PCM window")
+    }
+    let final = try window.finish(decode: decode)
+    check(final == words.joined(separator: separator), "seam corrupted final text")
 }
 func run() throws {
     var window = SpeechWindow(), calls: [Int] = [], emitted: [String] = []
@@ -265,6 +286,22 @@ func run() throws {
     _ = try window.finish(decode: rollingDecode)
     check(calls.count == 4, "overlap-only stop reran audio")
     print("ROLLBACK:PASS")
+
+    // Full short tails (including <=5 Character windows) can outlive their PCM.
+    // Check EVERY cumulative snapshot, not just a convenient long-word final.
+    for count in [3, 5, 8] {
+        try labelledSeams(Array(["你", "好", "吗", "我", "们", "来", "了", "啊"].prefix(count)), separator: "")
+    }
+    try labelledSeams((0..<120).map { String(UnicodeScalar(0x4e00 + $0)!) }, separator: "")
+    print("SHORT_CJK:PASS")
+    try labelledSeams(["a", "be", "see", "dog", "eel", "fox", "go", "hi"], separator: " ")
+    try labelledSeams((0..<120).map { ["a", "be", "see", "dog", "eel", "fox", "go", "hi"][$0 % 8] }, separator: " ")
+    print("SHORT_ASCII:PASS")
+    // Longest text overlap alone over-matches legitimate consecutive repeats.
+    try labelledSeams(Array(repeating: "a", count: 12), separator: " ")
+    try labelledSeams(Array(repeating: "哈", count: 12), separator: "")
+    try labelledSeams(["go", "go", "now", "go", "now", "go", "go", "now"], separator: " ")
+    print("REPEATED_OVERLAP:PASS")
 
     window = SpeechWindow(); calls = []
     try window.append(pcm(8000), speech: true, decode: decode) { _ in }
