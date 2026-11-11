@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, readFile, rm, writeFile, readdir } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile, readdir } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { dirname, join, join as pathJoin } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 import { STREAMING_SPEECH_PLUGIN_NAME } from '../../shared/voice-recognition.js';
 // Build tooling is intentionally plain ESM so Gradle/CI do not require tsx.
@@ -54,7 +55,8 @@ describe('shared mobile model preparation', () => {
     expect(android).toContain('private OnlineRecognizer ensureRecognizer()');
     expect(android).toContain('warmStream.release();');
     expect(android).toContain('Math.max(min * 2, SAMPLE_RATE * 2 * 6)');
-    expect(android).toContain('worker.execute(() -> capture(call, owner, audio));');
+    expect(android).toContain('worker.execute(() -> capture(call, owner, audio, session));');
+    expect(android).toContain('private void stopCapture(boolean discard)');
     expect(android).toMatch(/stream\.acceptWaveform\(new float\[SAMPLE_RATE \/ 2\], SAMPLE_RATE\);\s*\n\s*decodeAvailable\(recognizer, stream\);/);
     expect(android).toMatch(/next\.acceptWaveform\(new float\[SAMPLE_RATE \/ 2\], SAMPLE_RATE\);\s*\n\s*decodeAvailable\(recognizer, next\);/);
     expect(android).toMatch(/handleOnDestroy\(\)[\s\S]*recognizer\.release\(\);/);
@@ -393,5 +395,222 @@ describe('native stream segment concatenation and lifecycle semantics', () => {
       'worker:decode(你好)->喂你好',
       'worker:decode(听得到吗)->喂你好听得到吗',
     ]);
+  });
+
+  it('compiles and executes production StreamingSpeechPlugin.java across cold stop-before-warmup, warm reuse, bounded overflow, and destroy', async () => {
+    await setup();
+    const srcDir = pathJoin(root, 'src');
+    const classesDir = pathJoin(root, 'classes');
+    await mkdir(classesDir, { recursive: true });
+
+    const files: Record<string, string> = {
+      'android/Manifest.java': `package android; public class Manifest { public static class permission { public static final String RECORD_AUDIO="mic"; } }`,
+      'android/media/AudioFormat.java': `package android.media; public class AudioFormat { public static final int CHANNEL_IN_MONO=1, ENCODING_PCM_16BIT=2; }`,
+      'android/media/MediaRecorder.java': `package android.media; public class MediaRecorder { public static class AudioSource { public static final int VOICE_RECOGNITION=1; } }`,
+      'android/media/AudioRecord.java': `package android.media;
+public class AudioRecord {
+  public static final int STATE_INITIALIZED=1, RECORDSTATE_RECORDING=3, READ_BLOCKING=0;
+  public static volatile AudioRecord latest;
+  public static volatile int chunksPerStart=1;
+  public static int reads=0;
+  private boolean recording;
+  private int remaining;
+  public AudioRecord(int a,int b,int c,int d,int e){ latest=this; remaining=chunksPerStart; }
+  public static int getMinBufferSize(int a,int b,int c){ return 3200; }
+  public int getState(){ return STATE_INITIALIZED; }
+  public synchronized int getRecordingState(){ return recording ? RECORDSTATE_RECORDING : 0; }
+  public synchronized void startRecording(){ recording=true; }
+  public synchronized void stop(){ recording=false; notifyAll(); }
+  public void release(){}
+  public synchronized int read(short[] out,int off,int n,int mode){
+    reads++;
+    while (remaining <= 0 && recording) {
+      try { wait(); } catch (InterruptedException e) { return -1; }
+    }
+    if (!recording || remaining <= 0) return 0;
+    remaining--;
+    java.util.Arrays.fill(out, (short) 1000);
+    return n;
+  }
+}`,
+      'androidx/lifecycle/Lifecycle.java': `package androidx.lifecycle; public class Lifecycle { public enum State { RESUMED; public boolean isAtLeast(State other){ return true; } } public State getCurrentState(){ return State.RESUMED; } }`,
+      'com/getcapacitor/JSArray.java': `package com.getcapacitor; public class JSArray extends java.util.ArrayList<Object>{ public JSArray put(Object x){ add(x); return this; } }`,
+      'com/getcapacitor/JSObject.java': `package com.getcapacitor; public class JSObject extends java.util.TreeMap<String,Object>{}`,
+      'com/getcapacitor/PermissionState.java': `package com.getcapacitor; public enum PermissionState{ GRANTED }`,
+      'com/getcapacitor/PluginCall.java': `package com.getcapacitor; public class PluginCall { public final java.util.concurrent.CountDownLatch done=new java.util.concurrent.CountDownLatch(1); public String error; public void resolve(){ done.countDown(); } public void resolve(JSObject o){ resolve(); } public void reject(String e){ error=e; done.countDown(); } public void reject(String e,Exception x){ reject(e); } }`,
+      'com/getcapacitor/Plugin.java': `package com.getcapacitor;
+public class Plugin {
+  public final java.util.List<String> events=java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+  public void load(){}
+  protected void handleOnPause(){}
+  protected void handleOnDestroy(){}
+  public void notifyListeners(String key,JSObject value){ events.add(key+":"+value); }
+  public PermissionState getPermissionState(String p){ return PermissionState.GRANTED; }
+  public void requestPermissionForAlias(String a,PluginCall c,String callback){}
+  public Context getContext(){ return new Context(); }
+  public Activity getActivity(){ return new Activity(); }
+  public static class Context { public Assets getAssets(){ return new Assets(); } }
+  public static class Assets { public java.io.InputStream open(String path) throws java.io.IOException { return new java.io.ByteArrayInputStream(new byte[]{1}); } }
+  public static class Activity { public androidx.lifecycle.Lifecycle getLifecycle(){ return new androidx.lifecycle.Lifecycle(); } }
+}`,
+      'com/getcapacitor/PluginMethod.java': `package com.getcapacitor; public @interface PluginMethod{}`,
+      'com/getcapacitor/annotation/CapacitorPlugin.java': `package com.getcapacitor.annotation; public @interface CapacitorPlugin{ String name(); Permission[] permissions(); }`,
+      'com/getcapacitor/annotation/Permission.java': `package com.getcapacitor.annotation; public @interface Permission{ String alias(); String[] strings(); }`,
+      'com/getcapacitor/annotation/PermissionCallback.java': `package com.getcapacitor.annotation; public @interface PermissionCallback{}`,
+      'com/k2fsa/sherpa/onnx/OnlineRecognizerConfig.java': `package com.k2fsa.sherpa.onnx;
+public class OnlineRecognizerConfig {
+  public Model getModelConfig(){ return new Model(); }
+  public Endpoint getEndpointConfig(){ return new Endpoint(); }
+  public void setDecodingMethod(String x){}
+  public void setHotwordsFile(String x){}
+  public void setHotwordsScore(float x){}
+  public static class Model { public Transducer getTransducer(){ return new Transducer(); } public void setTokens(String x){} public void setModelType(String x){} public void setModelingUnit(String x){} public void setBpeVocab(String x){} public void setNumThreads(int n){} }
+  public static class Transducer { public void setEncoder(String x){} public void setDecoder(String x){} public void setJoiner(String x){} }
+  public static class Endpoint { public Rule getRule2(){ return new Rule(); } public Rule getRule3(){ return new Rule(); } }
+  public static class Rule { public void setMinTrailingSilence(float x){} public void setMinUtteranceLength(float x){} }
+}`,
+      'com/k2fsa/sherpa/onnx/OnlineStream.java': `package com.k2fsa.sherpa.onnx;
+public class OnlineStream {
+  public String text="";
+  public static volatile int spokenSamples=0;
+  public static volatile java.util.concurrent.CountDownLatch speech=new java.util.concurrent.CountDownLatch(1);
+  public void acceptWaveform(float[] data,int rate){
+    for (float f : data) {
+      if (f != 0) {
+        spokenSamples += data.length;
+        text = "synthetic utterance";
+        speech.countDown();
+        break;
+      }
+    }
+  }
+  public void inputFinished(){}
+  public void release(){}
+}`,
+      'com/k2fsa/sherpa/onnx/OnlineRecognizer.java': `package com.k2fsa.sherpa.onnx;
+public class OnlineRecognizer {
+  public static volatile java.util.concurrent.CountDownLatch entered=new java.util.concurrent.CountDownLatch(1);
+  public static volatile java.util.concurrent.CountDownLatch release=new java.util.concurrent.CountDownLatch(1);
+  public static volatile int creations=0;
+  public static volatile int releases=0;
+  public OnlineRecognizer(Object assets,OnlineRecognizerConfig config){
+    creations++;
+    entered.countDown();
+    try { release.await(); } catch (InterruptedException e) { throw new RuntimeException(e); }
+  }
+  public OnlineStream createStream(String s){ return new OnlineStream(); }
+  public boolean isReady(OnlineStream s){ return false; }
+  public void decode(OnlineStream s){}
+  public boolean isEndpoint(OnlineStream s){ return false; }
+  public void release(){ releases++; }
+  public Result getResult(OnlineStream stream){ return new Result(stream.text); }
+  public record Result(String text){ public String getText(){ return text; } }
+}`,
+      'Harness.java': `import com.imcodes.speech.StreamingSpeechPlugin;
+import com.getcapacitor.PluginCall;
+import com.k2fsa.sherpa.onnx.*;
+import android.media.AudioRecord;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+
+public class Harness {
+  static class Subject extends StreamingSpeechPlugin { void destroy(){ super.handleOnDestroy(); } }
+  static void await(CountDownLatch latch){
+    try {
+      if (!latch.await(2, TimeUnit.SECONDS)) throw new AssertionError("timeout");
+    } catch (InterruptedException e) {
+      throw new RuntimeException(e);
+    }
+  }
+  public static void main(String[] args) {
+    // 1. Cold stop-before-warmup: utterance recorded while warmup is held must be drained and decoded after stop
+    Subject p = new Subject();
+    try {
+      p.load();
+      await(OnlineRecognizer.entered);
+      PluginCall start = new PluginCall();
+      p.start(start);
+      await(start.done);
+      boolean startedDuringWarmup = AudioRecord.latest.getRecordingState() == AudioRecord.RECORDSTATE_RECORDING;
+      PluginCall stop = new PluginCall();
+      p.stop(stop);
+      boolean micStoppedOnStop = AudioRecord.latest.getRecordingState() == 0;
+      OnlineRecognizer.release.countDown();
+      await(stop.done);
+      if (!startedDuringWarmup || !micStoppedOnStop || OnlineStream.spokenSamples != 1600) {
+        throw new AssertionError("COLD_STOP failed: started=" + startedDuringWarmup + " micStopped=" + micStoppedOnStop + " spoken=" + OnlineStream.spokenSamples);
+      }
+      System.out.println("COLD_STOP:" + OnlineStream.spokenSamples + ":" + p.events);
+
+      // 2. Warm positive control: reuses resident recognizer without recreating
+      p.events.clear();
+      OnlineStream.speech = new CountDownLatch(1);
+      PluginCall warmStart = new PluginCall();
+      p.start(warmStart);
+      await(warmStart.done);
+      await(OnlineStream.speech);
+      PluginCall warmStop = new PluginCall();
+      p.stop(warmStop);
+      await(warmStop.done);
+      if (OnlineRecognizer.creations != 1 || OnlineStream.spokenSamples != 3200) {
+        throw new AssertionError("WARM_POSITIVE failed: creations=" + OnlineRecognizer.creations + " spoken=" + OnlineStream.spokenSamples);
+      }
+      System.out.println("WARM_POSITIVE:" + OnlineRecognizer.creations + ":" + OnlineStream.spokenSamples + ":" + p.events);
+    } finally {
+      p.destroy();
+    }
+    // Wait briefly for worker shutdown after destroy
+    for (int i = 0; i < 20 && OnlineRecognizer.releases == 0; i++) {
+      try { Thread.sleep(10); } catch (InterruptedException ignored) {}
+    }
+    if (OnlineRecognizer.releases != 1) {
+      throw new AssertionError("Expected resident recognizer release on destroy, got " + OnlineRecognizer.releases);
+    }
+
+    // 3. Bounded overflow during held warmup: >64 chunks stops mic and reports explicit error
+    OnlineRecognizer.entered = new CountDownLatch(1);
+    OnlineRecognizer.release = new CountDownLatch(1);
+    AudioRecord.chunksPerStart = 70;
+    Subject p2 = new Subject();
+    try {
+      p2.load();
+      await(OnlineRecognizer.entered);
+      PluginCall s2 = new PluginCall();
+      p2.start(s2);
+      await(s2.done);
+      for (int i = 0; i < 100 && AudioRecord.latest.getRecordingState() == AudioRecord.RECORDSTATE_RECORDING; i++) {
+        try { Thread.sleep(5); } catch (InterruptedException ignored) {}
+      }
+      OnlineRecognizer.release.countDown();
+      PluginCall stop2 = new PluginCall();
+      p2.stop(stop2);
+      await(stop2.done);
+      System.out.println("OVERFLOW:" + p2.events);
+    } finally {
+      p2.destroy();
+    }
+  }
+}`,
+    };
+
+    const javaSources: string[] = [];
+    for (const [rel, content] of Object.entries(files)) {
+      const full = pathJoin(srcDir, rel);
+      await mkdir(dirname(full), { recursive: true });
+      await writeFile(full, content, 'utf8');
+      javaSources.push(full);
+    }
+    const pluginSource = fileURLToPath(
+      new URL('../../web/plugins/streaming-speech/android/src/main/java/com/imcodes/speech/StreamingSpeechPlugin.java', import.meta.url),
+    );
+    javaSources.push(pluginSource);
+
+    execFileSync('javac', ['-d', classesDir, ...javaSources], { stdio: 'pipe', timeout: 30000 });
+    const output = execFileSync('java', ['-cp', classesDir, 'Harness'], { encoding: 'utf8', timeout: 10000 }).trim().split('\n');
+
+    expect(output[0]).toContain('COLD_STOP:1600:[listeningState:{status=started}, audioLevel:{level=0.091552734375}, partialResults:{isFinal=false, matches=[synthetic utterance]}, partialResults:{isFinal=true, matches=[synthetic utterance]}, listeningState:{status=stopped}]');
+    expect(output[1]).toContain('WARM_POSITIVE:1:3200:[listeningState:{status=started}, audioLevel:{level=0.091552734375}, partialResults:{isFinal=false, matches=[synthetic utterance]}, partialResults:{isFinal=true, matches=[synthetic utterance]}, listeningState:{status=stopped}]');
+    expect(output[2]).toContain('recognitionError:{message=Offline speech processing overloaded}');
+    expect(output[2]).toContain('listeningState:{status=stopped}');
   });
 });

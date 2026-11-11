@@ -18,8 +18,11 @@ import com.k2fsa.sherpa.onnx.OnlineRecognizer;
 import com.k2fsa.sherpa.onnx.OnlineRecognizerConfig;
 import com.k2fsa.sherpa.onnx.OnlineStream;
 import java.io.IOException;
+import java.util.ArrayDeque;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 /** Audio never leaves this device. One serial worker owns all native decoder state. */
@@ -28,10 +31,12 @@ import java.util.concurrent.atomic.AtomicLong;
 })
 public class StreamingSpeechPlugin extends Plugin {
     private static final int SAMPLE_RATE = 16000;
+    private static final int MAX_BUFFERED_CHUNKS = 64; // ~6.4s at 100ms/chunk (matches iOS slots = 64)
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final AtomicLong generation = new AtomicLong();
     private final Object captureLock = new Object();
     private OnlineRecognizer recognizer;
+    private CaptureSession activeSession;
     private volatile AudioRecord recorder;
     private volatile boolean listening;
 
@@ -141,36 +146,82 @@ public class StreamingSpeechPlugin extends Plugin {
                 return;
             }
             long owner = generation.incrementAndGet();
+            CaptureSession session = new CaptureSession(owner, audio);
+            activeSession = session;
             recorder = audio;
             listening = true;
             state("started");
+            Thread reader = new Thread(() -> runReader(session), "imcodes-speech-audio-" + owner);
+            reader.setDaemon(true);
+            reader.start();
+            session.awaitReaderStart();
             call.resolve();
-            worker.execute(() -> capture(call, owner, audio));
+            worker.execute(() -> capture(call, owner, audio, session));
         }
     }
 
-    private void capture(PluginCall call, long owner, AudioRecord audio) {
+    private void runReader(CaptureSession session) {
+        short[] pcm = new short[1600]; // 100ms chunks; bounded in-memory queue survives stop-before-warmup.
+        session.markReaderStarted();
+        try {
+            while (!session.isDiscarded()) {
+                int count = session.audio.read(pcm, 0, pcm.length, AudioRecord.READ_BLOCKING);
+                if (count <= 0) {
+                    session.markFirstPassDone();
+                    if (session.isStopRequested() || session.isDiscarded()) break;
+                    session.failRead(new IOException("Microphone read failed: " + count));
+                    break;
+                }
+                float[] samples = new float[count];
+                double power = 0;
+                for (int i = 0; i < count; i++) {
+                    samples[i] = pcm[i] / 32768.0f;
+                    power += samples[i] * samples[i];
+                }
+                if (!session.offerSamples(samples)) {
+                    session.markFirstPassDone();
+                    session.stopIntake();
+                    break;
+                }
+                session.markFirstPassDone();
+                if (!session.isStopRequested() && !session.isDiscarded()) {
+                    JSObject level = new JSObject();
+                    level.put("level", Math.min(1, Math.sqrt(power / count) * 3));
+                    notifyListeners("audioLevel", level);
+                }
+            }
+        } catch (Exception e) {
+            session.markFirstPassDone();
+            if (!session.isStopRequested() && !session.isDiscarded()) {
+                session.failRead(e);
+            }
+        } finally {
+            session.markFirstPassDone();
+            synchronized (captureLock) {
+                try { session.audio.stop(); } catch (IllegalStateException ignored) { }
+                session.audio.release();
+                if (recorder == session.audio) recorder = null;
+            }
+            session.finishReader();
+        }
+    }
+
+    private void capture(PluginCall call, long owner, AudioRecord audio, CaptureSession session) {
         OnlineRecognizer recognizer = null;
         OnlineStream stream = null;
         String committed = "", last = "";
+        boolean failed = false;
         try {
-            if (generation.get() != owner) return;
+            if (session.isDiscarded() || generation.get() != owner) return;
             recognizer = ensureRecognizer();
+            if (session.isDiscarded() || generation.get() != owner) return;
             stream = recognizer.createStream("");
             // Half-second left-context padding establishes the acoustic alignment baseline.
             stream.acceptWaveform(new float[SAMPLE_RATE / 2], SAMPLE_RATE);
             decodeAvailable(recognizer, stream);
-            short[] pcm = new short[1600]; // 100ms chunks; drains buffered warmup audio at CPU speed.
-            while (generation.get() == owner) {
-                int count = audio.read(pcm, 0, pcm.length, AudioRecord.READ_BLOCKING);
-                if (count <= 0) {
-                    if (generation.get() != owner) break;
-                    throw new IOException("Microphone read failed: " + count);
-                }
-                float[] samples = new float[count]; double power = 0;
-                for (int i = 0; i < count; i++) { samples[i] = pcm[i] / 32768.0f; power += samples[i] * samples[i]; }
-                JSObject level = new JSObject(); level.put("level", Math.min(1, Math.sqrt(power / count) * 3));
-                notifyListeners("audioLevel", level);
+            while (!session.isDiscarded() && generation.get() == owner) {
+                float[] samples = session.pollSamples(generation);
+                if (samples == null) break;
                 stream.acceptWaveform(samples, SAMPLE_RATE);
                 decodeAvailable(recognizer, stream);
                 String text = recognizer.getResult(stream).getText().trim();
@@ -189,13 +240,19 @@ public class StreamingSpeechPlugin extends Plugin {
                 }
             }
         } catch (Exception | LinkageError e) {
-            if (generation.get() == owner) {
-                JSObject error = new JSObject(); error.put("message", "Offline speech interrupted");
+            failed = true;
+            session.stopIntake();
+            if (!session.isDiscarded() && generation.get() == owner) {
+                String message = "Offline speech processing overloaded".equals(e.getMessage())
+                    ? "Offline speech processing overloaded"
+                    : "Offline speech interrupted";
+                JSObject error = new JSObject(); error.put("message", message);
                 notifyListeners("recognitionError", error);
             }
         } finally {
-            // Stop may interrupt a blocking read: drain text even on that path.
-            if (stream != null && recognizer != null) {
+            session.stopIntake();
+            // Normal stop before or after warmup drains all accepted PCM and flushes the final right-context window.
+            if (!failed && !session.isDiscarded() && generation.get() == owner && stream != null && recognizer != null) {
                 try {
                     // One second covers the transducer's final right-context window.
                     stream.acceptWaveform(new float[SAMPLE_RATE], SAMPLE_RATE);
@@ -210,10 +267,128 @@ public class StreamingSpeechPlugin extends Plugin {
                     audio.release();
                 }
                 if (recorder == audio) recorder = null;
-                listening = false;
+                if (activeSession == session) {
+                    activeSession = null;
+                    listening = false;
+                }
             }
             if (stream != null) stream.release();
-            state("stopped");
+            if (!session.isDiscarded() && generation.get() == owner) state("stopped");
+        }
+    }
+
+    private static final class CaptureSession {
+        final long owner;
+        final AudioRecord audio;
+        private final ArrayDeque<float[]> pcmQueue = new ArrayDeque<>();
+        private final CountDownLatch readerStarted = new CountDownLatch(1);
+        private final CountDownLatch firstPassDone = new CountDownLatch(1);
+        private boolean stopRequested;
+        private boolean discarded;
+        private boolean readerDone;
+        private boolean overflowed;
+        private Exception readError;
+
+        CaptureSession(long owner, AudioRecord audio) {
+            this.owner = owner;
+            this.audio = audio;
+        }
+
+        void markReaderStarted() {
+            readerStarted.countDown();
+        }
+
+        void markFirstPassDone() {
+            firstPassDone.countDown();
+        }
+
+        void awaitReaderStart() {
+            try {
+                readerStarted.await(200, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        synchronized boolean isStopRequested() {
+            return stopRequested;
+        }
+
+        synchronized boolean isDiscarded() {
+            return discarded;
+        }
+
+        synchronized boolean offerSamples(float[] samples) {
+            if (discarded) return false;
+            if (pcmQueue.size() >= MAX_BUFFERED_CHUNKS) {
+                overflowed = true;
+                stopRequested = true;
+                notifyAll();
+                return false;
+            }
+            pcmQueue.addLast(samples);
+            notifyAll();
+            return true;
+        }
+
+        synchronized void failRead(Exception error) {
+            if (readError == null) readError = error;
+            stopRequested = true;
+            notifyAll();
+        }
+
+        synchronized void finishReader() {
+            readerDone = true;
+            notifyAll();
+        }
+
+        synchronized float[] pollSamples(AtomicLong generation) throws Exception {
+            while (pcmQueue.isEmpty() && !readerDone && !discarded && generation.get() == owner) {
+                wait();
+            }
+            if (discarded || generation.get() != owner) return null;
+            if (overflowed) {
+                throw new IOException("Offline speech processing overloaded");
+            }
+            if (!pcmQueue.isEmpty()) {
+                return pcmQueue.removeFirst();
+            }
+            if (readError != null) {
+                throw readError;
+            }
+            return null;
+        }
+
+        void stopIntake() {
+            try {
+                firstPassDone.await(50, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            synchronized (this) {
+                if (!stopRequested) {
+                    stopRequested = true;
+                    notifyAll();
+                }
+            }
+            try {
+                audio.stop();
+            } catch (IllegalStateException ignored) {
+            }
+        }
+
+        void discard() {
+            firstPassDone.countDown();
+            synchronized (this) {
+                discarded = true;
+                stopRequested = true;
+                pcmQueue.clear();
+                notifyAll();
+            }
+            try {
+                audio.stop();
+            } catch (IllegalStateException ignored) {
+            }
         }
     }
 
@@ -230,20 +405,30 @@ public class StreamingSpeechPlugin extends Plugin {
     private void state(String status) {
         JSObject result = new JSObject(); result.put("status", status); notifyListeners("listeningState", result);
     }
-    private void cancelCapture() {
-        generation.incrementAndGet();
+    private void stopCapture(boolean discard) {
+        CaptureSession session;
         synchronized (captureLock) {
-            if (recorder != null) try { recorder.stop(); } catch (IllegalStateException ignored) { }
+            if (discard) generation.incrementAndGet();
+            session = activeSession;
+            activeSession = null;
+            listening = false;
+            if (discard && recorder != null) {
+                try { recorder.stop(); } catch (IllegalStateException ignored) { }
+            }
+        }
+        if (session != null) {
+            if (discard) session.discard();
+            else session.stopIntake();
         }
     }
     @PluginMethod
     public void stop(PluginCall call) {
-        cancelCapture();
+        stopCapture(false);
         worker.execute(call::resolve); // Capture finally/decoder release precede acknowledgement.
     }
-    @Override protected void handleOnPause() { cancelCapture(); }
+    @Override protected void handleOnPause() { stopCapture(false); }
     @Override protected void handleOnDestroy() {
-        cancelCapture();
+        stopCapture(true);
         worker.execute(() -> {
             if (recognizer != null) {
                 recognizer.release();
