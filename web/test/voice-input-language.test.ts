@@ -1,5 +1,5 @@
 /** @vitest-environment jsdom */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 const bridges = vi.hoisted(() => {
   const make = () => ({
     available: vi.fn(), requestPermissions: vi.fn(), start: vi.fn(), stop: vi.fn(), addListener: vi.fn(),
@@ -9,7 +9,10 @@ const bridges = vi.hoisted(() => {
 });
 vi.mock('@capacitor/core', () => ({ registerPlugin: () => bridges.streaming }));
 vi.mock('@capgo/capacitor-speech-recognition', () => ({ SpeechRecognition: bridges.platform }));
-import { readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import * as backend from '../src/voice-recognition-backend.js';
 import * as input from '../src/components/VoiceInput.js';
 
@@ -105,9 +108,144 @@ describe('iOS localized Action extension and shared Inbox handoff', () => {
     const app = read('../ios/App/App/AppDelegate.swift'), receiver = read('../ios/App/App/AuthSessionPlugin.swift');
     expect(app).toContain('url.host?.lowercased() == "share-inbox"');
     expect(app.match(/drainInboxFilesIfNeeded\(\)/g)!.length).toBeGreaterThanOrEqual(4);
-    for (const text of ['appendingPathComponent("Inbox"', 'appendingPathComponent("SharedInbox"', 'inboxScanScheduled', 'info.isSymbolicLink != true', 'isManagedInboxFile(url)', 'var consumed = false', 'drainInboxFilesIfNeeded()']) expect(receiver).toContain(text);
+    for (const text of ['appendingPathComponent("Inbox"', 'appendingPathComponent("SharedInbox"', 'inboxScanScheduled', 'info.isSymbolicLink != true', 'isManagedInboxFile(url)', 'var consumed = false', 'drainInboxFilesIfNeeded(retryFailures:']) expect(receiver).toContain(text);
     expect(receiver).not.toContain('.skipsHiddenFiles'); // Hidden attachments such as .env must survive.
     for (const text of ['root.lastPathComponent == "SharedInbox"', 'info.isDirectory == true', 'file.deletingLastPathComponent().standardizedFileURL == root.standardizedFileURL', 'file.lastPathComponent.hasPrefix(".pending-")', 'files.skipDescendants()']) expect(receiver).toContain(text);
     expect(receiver).toContain('if full { return }'); expect(receiver).toContain('call.resolve(["items": items])');
   });
 });
+
+// Execute the production receiver, not a JS reimplementation of admission/cleanup.
+// Linux uses an explicitly supplied Swift toolchain; macOS uses Apple's wrapper.
+const swiftCompiler = process.env.SWIFTC || (existsSync('/usr/bin/swiftc') ? '/usr/bin/swiftc' : '');
+describe.skipIf(!swiftCompiler)('native Inbox capacity and progress protocol', () => {
+  let root: string, executable: string;
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), 'voice-share-inbox-'));
+    executable = join(root, 'inbox-tests');
+    const source = process.env.VOICE_INBOX_SOURCE ? readFileSync(process.env.VOICE_INBOX_SOURCE, 'utf8') : read('../ios/App/App/AuthSessionPlugin.swift');
+    const receiver = source.slice(source.indexOf('@objc(ShareReceiverPlugin)'))
+      .replace(/@objc\([^)]*\)\s*/g, '').replace(/@objc\s+/g, '')
+      // Platform-directory and file-read adapters only: the receiver's lock,
+      // admission, scan, enqueue, consume, dedupe and cleanup code is unchanged.
+      .replace('FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)', '[URL(fileURLWithPath: fixtureRoot + "/Documents")]')
+      .replace('FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: "group.com.im.codes")', 'Optional(URL(fileURLWithPath: fixtureRoot + "/group"))')
+      .replace('try? Data(contentsOf: url, options: [.mappedIfSafe])', 'try? fixtureRead(url)');
+    const file = join(root, 'Inbox.swift');
+    writeFileSync(file, swiftPeers + receiver + swiftCases);
+    execFileSync(swiftCompiler, ['-swift-version', '5', file, '-o', executable], { encoding: 'utf8', timeout: 60000 });
+  }, 65000);
+  afterAll(() => { if (root) rmSync(root, { recursive: true, force: true }); });
+  it.each(['oversize-progress', 'read-failure-progress', 'concurrent-admission', 'ordinary-overflow', 'bridge-not-ready', 'error-only-bounded-retry', 'hidden-and-staging'])('%s', (scenario) => {
+    const directory = mkdtempSync(join(root, scenario + '-'));
+    expect(execFileSync(executable, [scenario, directory], { encoding: 'utf8', timeout: 10000 }).trim()).toBe(scenario + ':PASS');
+  });
+});
+
+const swiftPeers = `
+import Foundation
+public let CAPPluginReturnPromise = "promise"
+public protocol CAPBridgedPlugin {}
+public struct CAPPluginMethod { public init(name: String, returnType: String) {} }
+public class WebView { public func evaluateJavaScript(_ code: String, completionHandler: ((Any?, Error?) -> Void)? = nil) {} }
+public class Bridge { public var webView: WebView? = nil }
+public class CAPPlugin { public var bridge: Bridge? = nil; public func notifyListeners(_ name: String, data: [String: Any]) {} }
+public class CAPPluginCall { public var value: [String: Any] = [:]; public func resolve(_ value: [String: Any]) { self.value = value } }
+public struct UTType { public init?(filenameExtension: String) {}; public var preferredMIMEType: String? { "application/octet-stream" } }
+#if os(Linux)
+extension URL { func startAccessingSecurityScopedResource() -> Bool { false }; func stopAccessingSecurityScopedResource() {} }
+#endif
+let fixtureRoot = CommandLine.arguments[2]
+let readLock = NSLock(), readEntered = DispatchSemaphore(value: 0), readReleased = DispatchSemaphore(value: 0)
+var gatedPath = "", readCounts: [String: Int] = [:]
+func fixtureRead(_ url: URL) throws -> Data {
+    readLock.lock(); readCounts[url.path, default: 0] += 1; let gate = url.path == gatedPath; readLock.unlock()
+    if gate { readEntered.signal(); guard readReleased.wait(timeout: .now() + 3) == .success else { throw NSError(domain: "read gate timeout", code: 1) } }
+    if url.lastPathComponent.hasPrefix("unreadable-") { throw NSError(domain: "injected read fault", code: 1) }
+    return try Data(contentsOf: url, options: [.mappedIfSafe])
+}
+`;
+const swiftCases = `
+func require(_ value: Bool, _ message: String) {
+    if !value { FileHandle.standardError.write(Data((message + "\\n").utf8)); exit(1) }
+}
+let fm = FileManager.default
+let docs = URL(fileURLWithPath: fixtureRoot + "/Documents/Inbox", isDirectory: true)
+let group = URL(fileURLWithPath: fixtureRoot + "/group/SharedInbox", isDirectory: true)
+try fm.createDirectory(at: docs, withIntermediateDirectories: true)
+try fm.createDirectory(at: group, withIntermediateDirectories: true)
+func create(_ name: String, in directory: URL = docs, oversized: Bool = false) throws -> URL {
+    try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+    let file = directory.appendingPathComponent(name)
+    try Data("retained content".utf8).write(to: file)
+    if oversized { let handle = try FileHandle(forWritingTo: file); try handle.truncate(atOffset: UInt64(ShareReceiverPlugin.maxShareBytes + 1)); try handle.close() }
+    return file
+}
+func settle(_ receiver: ShareReceiverPlugin) {
+    let queue = Mirror(reflecting: receiver).children.first { $0.label == "inboxWorker" }!.value as! DispatchQueue
+    queue.sync {}; queue.sync {}
+}
+func consume(_ receiver: ShareReceiverPlugin) -> [[String: Any]] {
+    let call = CAPPluginCall(); receiver.consumePendingShares(call); settle(receiver)
+    return call.value["items"] as! [[String: Any]]
+}
+func names(_ items: [[String: Any]]) -> Set<String> {
+    Set(items.flatMap { ($0["files"] as? [[String: Any]] ?? []).compactMap { $0["name"] as? String } })
+}
+let receiver = ShareReceiverPlugin(), scenario = CommandLine.arguments[1]
+switch scenario {
+case "oversize-progress":
+    for i in 0..<20 { require(receiver.handleIncomingFileURL(try create("large-" + String(i), oversized: true)), "oversize rejected") }
+    let valid = try create("valid.txt"); receiver.drainInboxFilesIfNeeded(); settle(receiver)
+    let errors = consume(receiver); require(errors.count == 20 && errors.allSatisfy { $0["error"] as? String == "file_too_large" }, "oversize notices lost")
+    require(names(consume(receiver)) == ["valid.txt"], "error-only oversize consumption did not refill valid backlog")
+    require(!fm.fileExists(atPath: valid.path), "accepted valid source not cleaned")
+case "read-failure-progress":
+    for i in 0..<20 { require(receiver.handleIncomingFileURL(try create("unreadable-" + String(i))), "read failure not reported") }
+    _ = try create("valid-after-fault.txt"); receiver.drainInboxFilesIfNeeded(); settle(receiver)
+    require(consume(receiver).count == 20, "missing read errors")
+    require(names(consume(receiver)) == ["valid-after-fault.txt"], "retained read errors blocked later valid file")
+    require((try fm.contentsOfDirectory(atPath: docs.path)).count == 20, "read failure sources were deleted")
+case "concurrent-admission":
+    for i in 0..<19 { require(receiver.handleIncomingFileURL(try create("seed-" + String(i))), "seed not admitted") }
+    let scan = try create("scan.txt"); readLock.lock(); gatedPath = scan.path; readLock.unlock()
+    receiver.drainInboxFilesIfNeeded(); require(readEntered.wait(timeout: .now() + 3) == .success, "scanner did not reach read gate")
+    let outside = URL(fileURLWithPath: fixtureRoot + "/external", isDirectory: true)
+    let direct = try create("direct.txt", in: outside)
+    let accepted = receiver.handleIncomingFileURL(direct)
+    readReleased.signal(); settle(receiver)
+    let batch = consume(receiver)
+    require(batch.count == 20 && names(batch).contains("seed-0") && names(batch).contains("scan.txt"), "concurrent producer evicted accepted payload")
+    require(!accepted && fm.fileExists(atPath: direct.path), "full temporary URL must be explicitly refused with source intact")
+    require(receiver.handleIncomingFileURL(direct), "refused URL cannot retry after capacity release")
+    require(names(consume(receiver)) == ["direct.txt"], "retry payload lost")
+case "ordinary-overflow":
+    for i in 0..<21 { _ = try create("ordinary-" + String(i)) }
+    receiver.drainInboxFilesIfNeeded(); settle(receiver)
+    let first = consume(receiver), second = consume(receiver)
+    require(first.count == 20 && second.count == 1 && names(first + second).count == 21, "21 files not delivered in bounded batches")
+    require((try fm.contentsOfDirectory(atPath: docs.path)).isEmpty, "accepted sources remain")
+case "bridge-not-ready":
+    for i in 0..<20 { require(receiver.handleIncomingFileURL(try create("held-" + String(i))), "held payload not admitted") }
+    let overflow = try create("held-20")
+    require(!receiver.handleIncomingFileURL(overflow) && fm.fileExists(atPath: overflow.path), "overflow lost before bridge was ready")
+    let first = consume(receiver), second = consume(receiver)
+    require(first.count == 20 && names(first).contains("held-0") && names(second) == ["held-20"], "unconsumed payload was evicted or backlog lost")
+case "error-only-bounded-retry":
+    let failed = try create("unreadable-one"); require(receiver.handleIncomingFileURL(failed), "error not admitted")
+    require(consume(receiver).count == 1, "missing error")
+    for _ in 0..<4 { require(consume(receiver).isEmpty, "automatic repeated read error") }
+    require(readCounts[failed.path] == 1 && fm.fileExists(atPath: failed.path), "error-only consumption spun or deleted source")
+    receiver.drainInboxFilesIfNeeded(); settle(receiver)
+    require(consume(receiver).count == 1 && readCounts[failed.path] == 2, "explicit activation cannot retry read failure")
+case "hidden-and-staging":
+    let pending = group.appendingPathComponent(".pending-unpublished", isDirectory: true)
+    _ = try create("unpublished.txt", in: pending)
+    _ = try create(".env", in: group); _ = try create(".pending-regular-file", in: group)
+    receiver.drainInboxFilesIfNeeded(); settle(receiver)
+    require(names(consume(receiver)) == [".env", ".pending-regular-file"], "hidden files skipped or staging exposed")
+    require(fm.fileExists(atPath: pending.appendingPathComponent("unpublished.txt").path), "unpublished staging consumed")
+default: fatalError("unknown scenario")
+}
+print(scenario + ":PASS")
+`;
