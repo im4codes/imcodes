@@ -249,3 +249,49 @@ default: fatalError("unknown scenario")
 }
 print(scenario + ":PASS")
 `;
+
+describe('bounded offline cumulative committed + unfixed snapshots', () => {
+  it('replaces corrections, suppresses duplicate partials, and accepts the identical final once', async () => {
+    const result = vi.fn();
+    await input.startListening(result);
+    const partial = bridges.streaming.listeners.partialResults;
+    partial({ matches: ['第一句。第二句结尾错'] });
+    partial({ matches: ['第一句。第二句结尾错'] });
+    partial({ matches: ['第一句。第二句结尾'] }); // rollback may shorten the unfixed suffix
+    partial({ matches: ['第一句。第二句结尾'], isFinal: true });
+    partial({ matches: ['late stale hypothesis'] });
+    partial({ matches: ['duplicate final'], isFinal: true });
+    expect(result.mock.calls).toEqual([
+      ['第一句。第二句结尾错', false], ['第一句。第二句结尾', false], ['第一句。第二句结尾', true],
+    ]);
+  });
+  it('holds a restart behind stop flush, then rejects old partial/final callbacks', async () => {
+    const previous = vi.fn(), next = vi.fn();
+    await input.startListening(previous);
+    const oldPartial = bridges.streaming.listeners.partialResults;
+    let release!: () => void;
+    bridges.streaming.stop.mockImplementationOnce(async () => {
+      await new Promise<void>(resolve => { release = resolve; });
+      oldPartial({ matches: ['locked sentence. final short tail'], isFinal: true });
+    });
+    const stop = input.stopListening();
+    const restart = input.startListening(next);
+    await Promise.resolve();
+    expect(bridges.streaming.start).toHaveBeenCalledTimes(1);
+    oldPartial({ matches: ['locked sentence. final shor'] });
+    release(); await stop; expect(await restart).toBe(true);
+    expect(previous).toHaveBeenLastCalledWith('locked sentence. final short tail', true);
+    expect(next).not.toHaveBeenCalled();
+    oldPartial({ matches: ['old capture'], isFinal: true });
+    bridges.streaming.listeners.partialResults({ matches: ['new capture'] });
+    expect(next.mock.calls).toEqual([['new capture', false]]);
+  });
+  it('delivers an empty final and ignores malformed snapshots without poisoning the session', async () => {
+    const result = vi.fn(); await input.startListening(result);
+    const partial = bridges.streaming.listeners.partialResults;
+    partial({ matches: [null], isFinal: true });
+    partial({ matches: [] });
+    partial({ matches: [''], isFinal: true });
+    expect(result.mock.calls).toEqual([['', true]]);
+  });
+});

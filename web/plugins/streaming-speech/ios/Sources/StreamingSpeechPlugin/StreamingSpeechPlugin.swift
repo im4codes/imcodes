@@ -19,6 +19,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     private let lock = NSLock()
     private var generation: UInt64 = 0
     private var abortedOwner: UInt64 = 0
+    private var eventOwner: UInt64 = 0
     // Bounded audio work: buffer up to ~6.4s while the model finishes cold warmup.
     private let slots = DispatchSemaphore(value: 64)
     private var engine: AVAudioEngine?
@@ -28,13 +29,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     // Only accessed on worker; queued PCM drains before the stop/final barrier.
     private var decoder: SpeechDecoder?
     private var decoderOwner: UInt64 = 0
-    private var committed = ""
-    private var lastText = ""
-    private var utteranceSamples: [Float] = []
-    private var lastDecodedCount = 0
-    private var unchangedSilentChunks = 0
-    private let maxUtteranceSamples = 20 * 16000
-    private let partialIntervalSamples = 9600 // 0.6s, not a latency guarantee
+    private var window = SpeechWindow()
 
     public override func load() {
         NotificationCenter.default.addObserver(self, selector: #selector(interrupted(_:)), name: UIApplication.willResignActiveNotification, object: nil)
@@ -96,6 +91,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                 call.reject("Offline speech model missing"); return
             }
             let owner = self.nextOwner()
+            self.lock.lock(); self.eventOwner = owner; self.lock.unlock()
             // Enqueue decoder setup on the serial worker queue BEFORE starting AVAudioEngine
             // so any audio buffers captured while the model finishes warming up are queued
             // strictly behind this setup block and decoded in order without losing the first words.
@@ -118,9 +114,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                 }
                 self.decoder = decoder
                 self.decoderOwner = owner
-                self.committed = ""; self.lastText = ""
-                self.utteranceSamples.removeAll(keepingCapacity: true)
-                self.lastDecodedCount = 0; self.unchangedSilentChunks = 0
+                self.window = SpeechWindow()
             }
             do {
                 let session = AVAudioSession.sharedInstance()
@@ -154,7 +148,11 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
     private func consume(_ buffer: AVAudioPCMBuffer, owner: UInt64, converter: AVAudioConverter, format: AVAudioFormat) {
-        guard isCurrent(owner) else { return }
+        // Admission and worker enqueue are atomic with the stop barrier. A tap
+        // already converting when stop begins must enqueue its tail before flush.
+        lock.lock()
+        defer { lock.unlock() }
+        guard generation == owner else { return }
         guard slots.wait(timeout: .now()) == .success else {
             // Fail visibly, instead of silently dropping audio or growing memory.
             DispatchQueue.main.async {
@@ -188,49 +186,29 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         worker.async {
             defer { self.slots.signal() }
             guard self.decoderOwner == owner, let decoder = self.decoder else { return }
-            let speech = level >= 0.01
-            if self.utteranceSamples.isEmpty && !speech { return }
-            var offset = 0
-            while offset < samples.count {
-                let count = min(samples.count - offset, self.maxUtteranceSamples - self.utteranceSamples.count)
-                self.utteranceSamples.append(contentsOf: samples[offset..<(offset + count)])
-                offset += count
-                self.unchangedSilentChunks = speech ? 0 : self.unchangedSilentChunks + 1
-                let endpoint = self.utteranceSamples.count == self.maxUtteranceSamples || self.unchangedSilentChunks >= 6
-                if endpoint || (speech && self.utteranceSamples.count - self.lastDecodedCount >= self.partialIntervalSamples) {
-                    guard let text = decoder.decode(samples: self.utteranceSamples) else {
-                        self.decoder = nil; self.decoderOwner = 0
-                        self.utteranceSamples.removeAll(keepingCapacity: true)
-                        DispatchQueue.main.async {
-                            if self.isCurrent(owner) {
-                                self.notifyListeners("recognitionError", data: ["message": "Offline speech decoding failed"])
-                                self.endCapture(nil)
-                            }
-                        }
-                        return
-                    }
-                    let full = self.join(self.committed, text)
-                    if full != self.lastText { self.emitText(full, final: false); self.lastText = full }
-                    self.lastDecodedCount = self.utteranceSamples.count
-                    if endpoint {
-                        self.committed = full
-                        self.utteranceSamples.removeAll(keepingCapacity: true)
-                        self.lastDecodedCount = 0; self.unchangedSilentChunks = 0
+            do {
+                try self.window.append(samples, speech: level >= 0.01, decode: decoder.decode) { text in
+                    self.emitText(text, final: false, owner: owner)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    if self.isCurrent(owner) {
+                        self.notifyListeners("recognitionError", data: ["message": "Offline speech decoding failed"])
+                        self.endCapture(nil)
                     }
                 }
             }
         }
     }
 
-    private func join(_ previous: String, _ text: String) -> String {
-        if previous.isEmpty { return text }
-        if text.isEmpty { return previous }
-        let ascii = previous.unicodeScalars.last!.value < 128 && text.unicodeScalars.first!.value < 128
-        return previous + (ascii ? " " : "") + text
+    private func emitText(_ text: String, final: Bool, owner: UInt64) {
+        DispatchQueue.main.async {
+            self.lock.lock(); let current = self.eventOwner == owner; self.lock.unlock()
+            guard current else { return }
+            self.notifyListeners("partialResults", data: ["matches": [text], "isFinal": final])
+        }
     }
-    private func emitText(_ text: String, final: Bool) {
-        notifyListeners("partialResults", data: ["matches": [text], "isFinal": final])
-    }
+
     @objc private func interrupted(_ notification: Notification) {
         if notification.name == AVAudioSession.interruptionNotification,
            let value = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
@@ -245,15 +223,24 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         engine?.stop(); engine = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         worker.async {
+            let owner = self.decoderOwner
             if let decoder = self.decoder {
-                if let text = decoder.decode(samples: self.utteranceSamples) {
-                    self.emitText(self.join(self.committed, text), final: true)
-                } else {
-                    self.notifyListeners("recognitionError", data: ["message": "Offline speech final decoding failed"])
+                do {
+                    let text = try self.window.finish(decode: decoder.decode)
+                    self.emitText(text, final: true, owner: owner)
+                } catch {
+                    // Preserve the last successful hypothesis on a visible error;
+                    // never silently replace the full transcript with an empty tail.
+                    self.emitText(self.window.text, final: true, owner: owner)
+                    DispatchQueue.main.async {
+                        self.lock.lock(); let current = self.eventOwner == owner; self.lock.unlock()
+                        if current { self.notifyListeners("recognitionError", data: ["message": "Offline speech final decoding failed"]) }
+                    }
                 }
             }
-            self.utteranceSamples.removeAll(keepingCapacity: true)
+            self.window = SpeechWindow()
             self.decoder = nil
+            self.decoderOwner = 0
             DispatchQueue.main.async {
                 if self.isCurrent(stoppingOwner) { self.notifyListeners("listeningState", data: ["status": "stopped"]) }
                 call?.resolve()
@@ -275,7 +262,7 @@ private final class SpeechRecognizer {
         let strings = values.map { strdup($0) }
         defer { strings.forEach { free($0) } }
         guard strings.allSatisfy({ $0 != nil }) else { return nil }
-        var qwen = sherpaOnnxOfflineQwen3ASRModelConfig(maxTotalLen: 768, maxNewTokens: 128, temperature: 1e-6, topP: 0.8, seed: 42)
+        var qwen = sherpaOnnxOfflineQwen3ASRModelConfig(maxTotalLen: 768, maxNewTokens: 32, temperature: 1e-6, topP: 0.8, seed: 42)
         qwen.conv_frontend = UnsafePointer(strings[0]!)
         qwen.encoder = UnsafePointer(strings[1]!)
         qwen.decoder = UnsafePointer(strings[2]!)
@@ -302,5 +289,133 @@ private final class SpeechDecoder {
         defer { SherpaOnnxDestroyOfflineRecognizerResult(result) }
         guard let text = result.pointee.text else { return "" }
         return String(cString: text).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+// MARK: - Bounded offline segmentation
+// This is local acoustic/text overlap reconciliation, NOT model-prefix/KV-cache
+// continuation. sherpa's offline Qwen API does not accept an assistant prefix or
+// previous-sentence context. Only the transcript grows with recording duration;
+// PCM, overlap anchors and each decode input stay bounded.
+struct SpeechWindow {
+    static let sampleRate = 16000
+    static let stride = sampleRate // 1 second of NEW audio per partial decode
+    static let capacity = 3 * sampleRate
+    static let overlap = sampleRate
+    static let rollbackCharacters = 5
+    static let punctuationPause = sampleRate * 4 / 10
+    static let vadPause = sampleRate * 7 / 10
+    enum Failure: Error { case decode }
+
+    private(set) var samples: [Float] = []
+    private(set) var committed = ""
+    private(set) var partial = ""
+    private var anchor = ""
+    private var rolling = false
+    private var newSamples = 0
+    private var silentSamples = 0
+    private var lastEmitted = ""
+    var text: String { rolling ? committed + partial : Self.join(committed, partial) }
+
+    mutating func append(_ input: [Float], speech: Bool,
+                         decode: ([Float]) -> String?, emit: (String) -> Void) throws {
+        var offset = 0
+        while offset < input.count {
+            if samples.isEmpty && !speech { return }
+            // Split even a large tap at exact scheduler boundaries, not just at
+            // capacity: cost and silence thresholds do not depend on tap size.
+            let pause = Self.endsSentence(partial) ? Self.punctuationPause : Self.vadPause
+            let untilPause = speech ? Self.capacity : max(1, pause - silentSamples)
+            let count = min(input.count - offset, Self.capacity - samples.count,
+                            Self.stride - newSamples, untilPause)
+            samples.append(contentsOf: input[offset..<(offset + count)])
+            offset += count
+            newSamples += count
+            silentSamples = speech ? 0 : silentSamples + count
+            let endpoint = silentSamples >= pause
+            if endpoint || newSamples >= Self.stride || samples.count == Self.capacity {
+                try evaluate(decode)
+                if endpoint {
+                    commitSentence()
+                } else if samples.count == Self.capacity {
+                    rollWindow()
+                }
+                if text != lastEmitted { lastEmitted = text; emit(text) }
+            }
+        }
+    }
+
+    mutating func finish(decode: ([Float]) -> String?) throws -> String {
+        // Accepted PCM drains on the serial worker before this call. A sub-stride
+        // tail must be decoded; overlap-only audio must NOT be decoded twice.
+        if newSamples > 0 { try evaluate(decode) }
+        commitSentence()
+        return text
+    }
+
+    private mutating func evaluate(_ decode: ([Float]) -> String?) throws {
+        guard let decoded = decode(samples) else { throw Failure.decode }
+        let hypothesis = decoded.trimmingCharacters(in: .whitespacesAndNewlines)
+        if anchor.isEmpty {
+            partial = hypothesis
+        } else if let remainder = Self.removingOverlap(anchor, hypothesis) {
+            partial = remainder
+        } else {
+            // If the model revises the entire acoustic seam, no trustworthy
+            // alignment exists. Preserve the unfixed tail rather than deleting
+            // unseen words. This conservative fallback can repeat a seam; text
+            // overlap is a heuristic, not a claim of lossless forced alignment.
+            partial = Self.joinOverlapping(partial, hypothesis)
+        }
+        newSamples = 0
+    }
+
+    private mutating func rollWindow() {
+        let tail = String(partial.suffix(Self.rollbackCharacters))
+        let stable = String(partial.dropLast(tail.count))
+        committed = rolling ? committed + stable : Self.join(committed, stable)
+        rolling = true
+        anchor = String((anchor + stable).suffix(48))
+        partial = tail
+        samples = Array(samples.suffix(Self.overlap))
+        // Keep the silence clock: a pause crossing a roll still commits once.
+    }
+
+    private mutating func commitSentence() {
+        committed = text
+        partial = ""; anchor = ""; rolling = false
+        samples.removeAll(keepingCapacity: true)
+        newSamples = 0; silentSamples = 0
+    }
+
+    private static func endsSentence(_ text: String) -> Bool {
+        guard let last = text.last else { return false }
+        return "。！？.!?".contains(last)
+    }
+
+    private static func removingOverlap(_ previous: String, _ next: String) -> String? {
+        // Bounded (<=48 Character) anchor work, only across overlapping audio.
+        // Never deduplicate whole sentences after VAD: repeated speech is valid.
+        let left = Array(previous.suffix(48)), right = Array(next.prefix(48))
+        let limit = min(left.count, right.count)
+        guard limit >= 2 else { return nil }
+        for size in Swift.stride(from: limit, through: 2, by: -1) {
+            if left.suffix(size).elementsEqual(right.prefix(size)) {
+                return String(next.dropFirst(size))
+            }
+        }
+        return nil
+    }
+
+    private static func joinOverlapping(_ previous: String, _ next: String) -> String {
+        if let remainder = removingOverlap(previous, next) { return join(previous, remainder) }
+        return join(previous, next)
+    }
+
+    private static func join(_ previous: String, _ next: String) -> String {
+        if previous.isEmpty { return next }
+        if next.isEmpty { return previous }
+        let ascii = previous.unicodeScalars.last!.value < 128 && next.unicodeScalars.first!.value < 128
+        return previous + (ascii ? " " : "") + next
     }
 }

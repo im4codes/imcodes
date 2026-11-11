@@ -101,7 +101,7 @@ async function removeRecognitionListeners(): Promise<void> {
 
 async function startListeningInternal(generation: number): Promise<boolean> {
   const locale = pickLocale();
-  const session = { recognition: getNativeSpeechRecognition() };
+  const session = { recognition: getNativeSpeechRecognition(), text: null as string | null, final: false };
   const recognition = session.recognition;
   await removeRecognitionListeners();
   if (generation !== _generation) return false;
@@ -118,9 +118,16 @@ async function startListeningInternal(generation: number): Promise<boolean> {
 
     // Partial results listener
     const h1 = await recognition.addListener('partialResults', (data) => {
-      if (_nativeSession === session && data.matches?.length) {
-        _onResult?.(data.matches[0], (data as { isFinal?: boolean }).isFinal === true);
-      }
+      if (_nativeSession !== session || session.final || !data.matches?.length) return;
+      const text = data.matches[0];
+      const final = (data as { isFinal?: boolean }).isFinal === true;
+      // Native owns committed + unfixed text and emits a cumulative snapshot,
+      // not an append-only delta. Corrections may shorten the unfixed tail.
+      // Keep this listener through stop ACK so its final short tail is retained.
+      if (typeof text !== 'string' || (!final && session.text === text)) return;
+      session.text = text;
+      session.final = final;
+      _onResult?.(text, final);
     });
     _removePartial = () => removeHandle(h1);
 
