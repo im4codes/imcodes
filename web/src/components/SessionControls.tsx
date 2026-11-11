@@ -168,6 +168,7 @@ import {
 import {
   type SessionSettingsOpenIntent,
 } from '../session-settings-open-intent.js';
+import type { PendingSharedSessionUpload } from '../services/share-receiver.js';
 import { recordPerfRender } from '../perf-render-debug.js';
 
 export const COMPOSER_HEIGHT_STORAGE_KEY = 'imcodes_composer_height_v1';
@@ -371,6 +372,10 @@ interface Props {
   pendingPrefillText?: string | null;
   /** Called after pendingPrefillText has been applied. */
   onPendingPrefillApplied?: () => void;
+  /** Pending shared files/text from external app share target modal. */
+  pendingSharedUpload?: PendingSharedSessionUpload | null;
+  /** Called after pendingSharedUpload has been consumed by the target session composer. */
+  onPendingSharedUploadConsumed?: (id: string) => void;
   /** Compact mode for sub-session cards — only input, @, ⚡, 📎, send. */
   compact?: boolean;
   /** Whether this full control surface is the active keyboard target for window-level shortcuts. */
@@ -1236,7 +1241,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onRemoveOptimisticMessage, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, transportTimelineEvents, timelineSettledQueuedIds: timelineSettledQueuedIdsProp, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange }: Props) {
+export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onRemoveOptimisticMessage, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, transportTimelineEvents, timelineSettledQueuedIds: timelineSettledQueuedIdsProp, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, pendingSharedUpload, onPendingSharedUploadConsumed, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange }: Props) {
   recordPerfRender(activeSession?.name?.startsWith('deck_sub_') ? 'SessionControls:sub' : 'SessionControls:main');
   const { t, i18n } = useTranslation();
   const deliveryModePref = usePref<SessionSendDeliveryMode>(SESSION_SEND_DELIVERY_USER_PREF_KEY, {
@@ -5646,6 +5651,59 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     closeQuickSuggestions();
     await uploadAttachmentFiles(Array.from(files));
   }, [closeQuickSuggestions, uploadAttachmentFiles]);
+
+  const consumedSharedUploadIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!pendingSharedUpload || !divRef.current) return;
+    if (consumedSharedUploadIdRef.current === pendingSharedUpload.id) return;
+    if (!activeSession || activeSession.name !== pendingSharedUpload.sessionName) return;
+    if (!serverId || serverId !== pendingSharedUpload.serverId) return;
+    if (attachmentDraftKey && hydratedAttachmentDraftKey !== attachmentDraftKey) return;
+
+    consumedSharedUploadIdRef.current = pendingSharedUpload.id;
+    onPendingSharedUploadConsumed?.(pendingSharedUpload.id);
+
+    const sharedText = typeof pendingSharedUpload.text === 'string' ? pendingSharedUpload.text.trim() : '';
+    if (sharedText) {
+      const currentText = readComposerElementText(divRef.current);
+      const nextText = currentText.trim().length === 0
+        ? sharedText
+        : `${currentText}${currentText.endsWith('\n') || currentText.endsWith(' ') ? '' : '\n'}${sharedText}`;
+      quickPhraseInputSuppressRef.current = true;
+      closeQuickSuggestions();
+      setComposerElementText(divRef.current, nextText);
+      setHasText(!!nextText.trim());
+      publishComposerText(nextText);
+      if (draftKey) safeSessionStorageSetItem(draftKey, nextText);
+      divRef.current.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    if (pendingSharedUpload.files.length > 0) {
+      closeQuickSuggestions();
+      void uploadAttachmentFiles(pendingSharedUpload.files);
+    }
+
+    divRef.current.focus();
+    try {
+      const sel = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(divRef.current);
+      range.collapse(false);
+      sel?.removeAllRanges();
+      sel?.addRange(range);
+    } catch { /* ignore selection API failures */ }
+  }, [
+    activeSession,
+    attachmentDraftKey,
+    closeQuickSuggestions,
+    draftKey,
+    hydratedAttachmentDraftKey,
+    onPendingSharedUploadConsumed,
+    pendingSharedUpload,
+    publishComposerText,
+    serverId,
+    uploadAttachmentFiles,
+  ]);
 
   const handleFileDragEnter = useCallback((e: DragEvent) => {
     if (inputDisabled || !dataTransferHasFiles(e.dataTransfer)) return;

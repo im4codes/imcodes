@@ -2,6 +2,23 @@
   "task_pair": {
     "reference_picker": "ペアタスク"
   },
+  "shareTarget": {
+    "title": "セッションに共有",
+    "files_summary": "共有ファイル ({{count}})",
+    "server_label": "サーバー",
+    "no_servers": "利用可能なサーバーがありません",
+    "main_sessions_label": "メインセッションを選択",
+    "loading_sessions": "メインセッションを読み込み中…",
+    "no_sessions": "このサーバーにはメインセッションがありません",
+    "current_session": "現在",
+    "composer_hint": "選択するとファイルが入力欄に添付され、送信前にメッセージを追加できます。",
+    "error": {
+      "file_too_large": "共有ファイルが {{max}} MB の上限を超えています。",
+      "read_failed": "共有ファイルの読み取りに失敗しました。",
+      "partial_files_skipped": "一部の共有ファイルはサイズ制限超過または読み取り失敗のためスキップされました。",
+      "generic": "共有コンテンツの処理に失敗しました。"
+    }
+  },
   "alias": {
     "feature_label": "エイリアス",
     "category": "エイリアス",

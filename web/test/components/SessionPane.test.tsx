@@ -727,4 +727,44 @@ describe('SessionPane', () => {
 
     expect(screen.getByTestId('usage-footer')).toBeDefined();
   });
+
+  it('forwards pendingSharedUpload and onConsumePendingSharedUpload to SessionControls', () => {
+    const onConsume = vi.fn();
+    const sharedUpload = {
+      id: 'share-pane-1',
+      serverId: 's1',
+      sessionName: 'deck_test_brain',
+      files: [new File(['x'], 'note.txt', { type: 'text/plain' })],
+      text: 'caption',
+    };
+
+    render(
+      <SessionPane
+        serverId="s1"
+        session={{
+          name: 'deck_test_brain',
+          project: 'test',
+          role: 'brain',
+          agentType: 'codex-sdk',
+          state: 'idle',
+          runtimeType: 'transport',
+          projectDir: '/tmp/test',
+        } as any}
+        sessions={[]}
+        subSessions={[]}
+        ws={null}
+        connected={true}
+        isActive={true}
+        viewMode="chat"
+        quickData={{} as any}
+        pendingSharedUpload={sharedUpload}
+        onPendingSharedUploadConsumed={onConsume}
+      />,
+    );
+
+    const calledProps = sessionControlsSpy.mock.calls.at(-1)?.[0];
+    expect(calledProps?.pendingSharedUpload).toBe(sharedUpload);
+    calledProps?.onPendingSharedUploadConsumed?.('share-pane-1');
+    expect(onConsume).toHaveBeenCalledWith('share-pane-1');
+  });
 });

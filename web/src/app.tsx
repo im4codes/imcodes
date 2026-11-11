@@ -270,6 +270,12 @@ import {
 } from './terminal-subscribe-mode.js';
 import { onWatchCommand } from './watch-bridge.js';
 import { watchProjectionStore } from './watch-projection.js';
+import {
+  subscribeShareReceiver,
+  type PendingSharedSessionUpload,
+  type SharedPayload,
+} from './services/share-receiver.js';
+import { ShareTargetModal } from './components/ShareTargetModal.js';
 import { isIdleSessionStateTimelineEvent, noteLiveIdleSignal, isRunningTimelineEvent } from './timeline-running.js';
 import { isOlderActivityGeneration, isWorkingSessionState, type ActivityGenerationLike } from '@shared/session-activity-types.js';
 import { isP2pDiscussionVisibleInSubSessionBar } from './p2p-discussion-scope.js';
@@ -1271,6 +1277,15 @@ export function App() {
     return () => {
       cleanup();
     };
+  }, []);
+
+  const [pendingSharedPayload, setPendingSharedPayload] = useState<SharedPayload | null>(null);
+  const [pendingSharedUpload, setPendingSharedUpload] = useState<PendingSharedSessionUpload | null>(null);
+
+  useEffect(() => {
+    return subscribeShareReceiver((payload) => {
+      setPendingSharedPayload(payload);
+    });
   }, []);
 
   // Keep layout height within visual viewport on mobile (keyboard-aware)
@@ -5927,6 +5942,67 @@ export function App() {
     window.location.reload();
   }, [setActiveSession]);
 
+  const handleSelectServerForShare = useCallback((serverId: string) => {
+    if (!serverId || serverId === selectedServerIdRef.current) return;
+    const serverName = servers.find((s) => s.id === serverId)?.name ?? null;
+    sharedOpenAbortRef.current?.abort();
+    sharedOpenAbortRef.current = null;
+    sharedOpenGenerationRef.current += 1;
+    sharedOpenIntentRef.current = null;
+    externalRouteGenerationRef.current += 1;
+    externalRouteInFlightKeyRef.current = null;
+    setOpeningSharedEntryId(null);
+    autoEntryRunRef.current++;
+    setManualDashboard(false);
+    setSelectedShareTarget(null);
+    setSelectedSharedEntryId(null);
+    clearSharedTabRestoreMarker();
+    setShowSharedReturnGuide(false);
+
+    const prevServer = selectedServerIdRef.current ?? localStorage.getItem('rcc_server');
+    const currentSession = activeSessionRef.current;
+    if (prevServer && currentSession && rememberIntentRef.current === currentSession) {
+      writeServerSession(prevServer, currentSession);
+    }
+
+    localStorage.setItem('rcc_server', serverId);
+    if (serverName) localStorage.setItem('rcc_server_name', serverName);
+
+    const nextRoute = { serverId, sessionName: null, sharedEntryId: null };
+    initialHashStateRef.current = nextRoute;
+    initialSharedTabRestoreRef.current = null;
+    sharedHashRestoreStartedRef.current = true;
+    setSharedHashRestorePending(false);
+    selectedServerIdRef.current = serverId;
+    setSessions([]);
+    setSessionsLoaded(false);
+    setSelectedServerId(serverId);
+    setSelectedServerName(serverName);
+    setActiveSession(null, { remember: false });
+    writeHashState(serverId, null);
+  }, [servers, setActiveSession]);
+
+  const handleConfirmShareTargetSession = useCallback((targetServerId: string, targetSessionName: string) => {
+    if (!pendingSharedPayload || !targetServerId || !targetSessionName) return;
+    const payload = pendingSharedPayload;
+    setPendingSharedPayload(null);
+    if (targetServerId !== selectedServerIdRef.current) {
+      handleSelectServerForShare(targetServerId);
+    }
+    selectMainSessionTab(targetSessionName);
+    setPendingSharedUpload({
+      id: payload.id,
+      serverId: targetServerId,
+      sessionName: targetSessionName,
+      files: payload.files,
+      ...(payload.text ? { text: payload.text } : {}),
+    });
+  }, [handleSelectServerForShare, pendingSharedPayload, selectMainSessionTab]);
+
+  const handlePendingSharedUploadConsumed = useCallback((id: string) => {
+    setPendingSharedUpload((prev) => (prev?.id === id ? null : prev));
+  }, []);
+
   const handleUnifiedServerSelect = useCallback((item: UnifiedServerItem) => {
     if (item.isSharedIn) {
       if (item.sharedEntry) {
@@ -6760,6 +6836,7 @@ export function App() {
     || shareDialogTarget !== null
     || deleteTarget !== null
     || pendingQuestion !== null
+    || pendingSharedPayload !== null
     || appUpdateNotice?.required === true;
   const showTeamDiscussionGuide = shouldShowTeamDiscussionGuide(
     teamDiscussionGuidePref,
@@ -6984,7 +7061,7 @@ export function App() {
   // A confirmed offline daemon cannot satisfy the initial connection gate.
   // Keep server management (including deletion) available without waiting for WS.
   const selectedServerKnownOffline = serversLoaded && selectedServerInfo !== null && !isServerOnline(selectedServerInfo);
-  const showInitialConnectingGate = initialAuthVerificationPending || (!selectedServerKnownOffline && shouldShowInitialConnectingGate(
+  const showInitialConnectingGate = initialAuthVerificationPending || (!selectedServerKnownOffline && !pendingSharedPayload && shouldShowInitialConnectingGate(
     Boolean(auth),
     selectedServerId,
     connected,
@@ -7798,6 +7875,14 @@ export function App() {
                   delete next[s.name];
                   return next;
                 })}
+                pendingSharedUpload={
+                  pendingSharedUpload
+                  && pendingSharedUpload.serverId === selectedServerId
+                  && pendingSharedUpload.sessionName === s.name
+                    ? pendingSharedUpload
+                    : null
+                }
+                onPendingSharedUploadConsumed={handlePendingSharedUploadConsumed}
                 onVersionSensitiveAction={runVersionSensitiveAction}
               />
               </ErrorBoundary>
@@ -9078,6 +9163,20 @@ export function App() {
           sessions={sessions}
           subSessions={subSessions}
           onClose={() => setCloneSessionTarget(null)}
+        />
+      )}
+
+      {pendingSharedPayload && (
+        <ShareTargetModal
+          payload={pendingSharedPayload}
+          servers={orderedServers.map((s) => ({ id: s.id, name: s.name }))}
+          selectedServerId={selectedServerId}
+          sessions={visibleMainSessions}
+          activeSession={activeSession}
+          sessionsLoading={!sessionsLoaded && visibleMainSessions.length === 0 && Boolean(selectedServerId)}
+          onSelectServer={handleSelectServerForShare}
+          onSelectSession={handleConfirmShareTargetSession}
+          onClose={() => setPendingSharedPayload(null)}
         />
       )}
 

@@ -2,6 +2,23 @@
   "task_pair": {
     "reference_picker": "Pair tasks"
   },
+  "shareTarget": {
+    "title": "Share to Session",
+    "files_summary": "Shared files ({{count}})",
+    "server_label": "Server",
+    "no_servers": "No servers available",
+    "main_sessions_label": "Select Main Session",
+    "loading_sessions": "Loading main sessions…",
+    "no_sessions": "No main sessions available on this server",
+    "current_session": "Current",
+    "composer_hint": "Files will be attached to the session input so you can type a message before sending.",
+    "error": {
+      "file_too_large": "Shared file exceeds the {{max}} MB size limit.",
+      "read_failed": "Could not read one or more shared files.",
+      "partial_files_skipped": "Some shared files could not be read or exceeded the size limit and were skipped.",
+      "generic": "Failed to process shared content."
+    }
+  },
   "alias": {
     "feature_label": "Alias",
     "category": "Alias",

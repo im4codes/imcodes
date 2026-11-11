@@ -35,6 +35,7 @@ import type { FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 import type { SessionSettingsOpenIntent } from '../session-settings-open-intent.js';
 import type { ChatLocalWebPreviewOpenHandler } from './ChatLoopbackLink.js';
+import type { PendingSharedSessionUpload } from '../services/share-receiver.js';
 
 function isExecutionCloneTemplateLike(sub: { executionCloneKind?: string | null; parentRunId?: string | null }): boolean {
   return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
@@ -126,6 +127,10 @@ export interface SessionPaneProps {
   pendingPrefillText?: string | null;
   /** Called after pendingPrefillText has been consumed by the input. */
   onPendingPrefillApplied?: () => void;
+  /** Pending shared files/text from external app share target modal. */
+  pendingSharedUpload?: PendingSharedSessionUpload | null;
+  /** Called after pendingSharedUpload has been consumed by the target session composer. */
+  onPendingSharedUploadConsumed?: (id: string) => void;
   /** Gate version-sensitive panels when the loaded frontend is stale. */
   onVersionSensitiveAction?: (featureLabel: string, action: () => void) => void;
 }
@@ -167,6 +172,8 @@ export function SessionPane({
   onMobileFileBrowserClose,
   pendingPrefillText,
   onPendingPrefillApplied,
+  pendingSharedUpload,
+  onPendingSharedUploadConsumed,
   onVersionSensitiveAction,
 }: SessionPaneProps) {
   recordPerfRender(isActive ? 'SessionPane:active' : 'SessionPane:hidden');
@@ -591,6 +598,8 @@ export function SessionPane({
           onRemoveQuote={removeQuote}
           pendingPrefillText={pendingPrefillText}
           onPendingPrefillApplied={onPendingPrefillApplied}
+          pendingSharedUpload={pendingSharedUpload}
+          onPendingSharedUploadConsumed={onPendingSharedUploadConsumed}
           onVersionSensitiveAction={onVersionSensitiveAction}
           onComposerTextChange={setComposerText}
         />

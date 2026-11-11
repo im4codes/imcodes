@@ -2,6 +2,23 @@
   "task_pair": {
     "reference_picker": "Tareas de pares"
   },
+  "shareTarget": {
+    "title": "Compartir en sesión",
+    "files_summary": "Archivos compartidos ({{count}})",
+    "server_label": "Servidor",
+    "no_servers": "No hay servidores disponibles",
+    "main_sessions_label": "Seleccionar sesión principal",
+    "loading_sessions": "Cargando sesiones principales…",
+    "no_sessions": "No hay sesiones principales en este servidor",
+    "current_session": "Actual",
+    "composer_hint": "Los archivos se adjuntarán al cuadro de entrada para que pueda escribir un mensaje antes de enviar.",
+    "error": {
+      "file_too_large": "El archivo compartido supera el límite de {{max}} MB.",
+      "read_failed": "No se pudo leer uno o más archivos compartidos.",
+      "partial_files_skipped": "Algunos archivos compartidos no se pudieron leer o superaron el límite de tamaño y se omitieron.",
+      "generic": "Error al procesar el contenido compartido."
+    }
+  },
   "alias": {
     "feature_label": "Alias",
     "category": "Alias",

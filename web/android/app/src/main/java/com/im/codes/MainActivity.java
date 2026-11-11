@@ -15,6 +15,7 @@ public class MainActivity extends BridgeActivity {
     protected void onCreate(Bundle savedInstanceState) {
         // Register custom plugins before super.onCreate (which initializes the bridge)
         registerPlugin(AuthSessionPlugin.class);
+        registerPlugin(ShareReceiverPlugin.class);
         // JPushPlugin only exists in the `china` flavor source set. Load it via
         // reflection so the `global` flavor compiles and runs without any JPush
         // class dependency. (BuildConfig.HAS_JPUSH is set per-flavor in app/build.gradle.)
@@ -31,12 +32,17 @@ public class MainActivity extends BridgeActivity {
             }
         }
         super.onCreate(savedInstanceState);
+        ShareReceiverPlugin.handleShareIntent(this, getIntent());
     }
 
     @Override
     protected void onNewIntent(Intent intent) {
         setIntent(intent);
         super.onNewIntent(intent);
+        // Forward external file/text shares to ShareReceiverPlugin
+        if (ShareReceiverPlugin.handleShareIntent(this, intent)) {
+            return;
+        }
         // Forward deep link callbacks to AuthSessionPlugin
         if (intent == null) {
             return;

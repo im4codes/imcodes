@@ -2,6 +2,23 @@
   "task_pair": {
     "reference_picker": "페어 작업"
   },
+  "shareTarget": {
+    "title": "세션으로 공유",
+    "files_summary": "공유된 파일 ({{count}})",
+    "server_label": "서버",
+    "no_servers": "사용 가능한 서버 없음",
+    "main_sessions_label": "메인 세션 선택",
+    "loading_sessions": "메인 세션을 불러오는 중…",
+    "no_sessions": "이 서버에 사용 가능한 메인 세션이 없습니다",
+    "current_session": "현재",
+    "composer_hint": "선택하면 파일이 입력창에 첨부되며 전송 전에 추가 메시지를 입력할 수 있습니다.",
+    "error": {
+      "file_too_large": "공유 파일이 {{max}} MB 제한을 초과했습니다.",
+      "read_failed": "공유된 파일을 읽을 수 없습니다.",
+      "partial_files_skipped": "일부 공유 파일이 용량 제한을 초과했거나 읽을 수 없어 건너뛰었습니다.",
+      "generic": "공유 콘텐츠를 처리하지 못했습니다."
+    }
+  },
   "alias": {
     "feature_label": "별칭",
     "category": "별칭",
