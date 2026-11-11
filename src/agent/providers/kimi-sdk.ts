@@ -251,6 +251,10 @@ interface KimiSdkSessionState {
   settledGeneration: number;
   /** Active and queued prompt generations currently in flight on the ACP session. */
   activePromptGenerations?: Set<number>;
+  /** Generation allocated for an autonomous provider-initiated wakeup turn. */
+  autonomousTurnGeneration?: number;
+  /** True after user cancel or turn failure until the next send(). */
+  stoppedByCancel?: boolean;
   /** Set while `loadSession` is actively streaming history replay updates.
    *  During this window we drop `agent_message_chunk` / `tool_call` events so
    *  prior-turn content doesn't leak into the current turn's delta stream. */
@@ -763,6 +767,8 @@ export class KimiSdkProvider implements TransportProvider {
     }
 
     state.cancelled = false;
+    state.stoppedByCancel = false;
+    state.autonomousTurnGeneration = undefined;
     state.steeringUsage = undefined;
     state.lastTurnUsage = undefined;
     // NOTE: currentText/currentMessageId are cleared AFTER ensureSessionReady
@@ -816,8 +822,12 @@ export class KimiSdkProvider implements TransportProvider {
       state.modelControlIntent = undefined;
     }
     state.modelRevision++;
+    state.stoppedByCancel = true;
     if (!state.promptInFlight) return;
     state.cancelled = true;
+    if ((state.activePromptGenerations?.size ?? 0) > 0) {
+      state.autonomousTurnGeneration = undefined;
+    }
     if (!state.acpSessionId || !this.connection) return;
     this.cancelPendingApprovals(sessionId);
     // `cancel` is a one-shot notification; the pending prompt() Promise will
@@ -830,6 +840,15 @@ export class KimiSdkProvider implements TransportProvider {
         ...this.errorLogFields(err, 'err'),
       }, 'ACP cancel notification failed (non-fatal)');
     });
+    if (this.profile.steeringPrompts
+      && this.sessions.get(sessionId) === state
+      && state.autonomousTurnGeneration !== undefined
+      && (state.activePromptGenerations?.size ?? 0) === 0) {
+      const autoGen = state.autonomousTurnGeneration;
+      state.autonomousTurnGeneration = undefined;
+      (state.activePromptGenerations ??= new Set()).add(autoGen);
+      this.settleTurn(sessionId, state, autoGen, 'cancelled');
+    }
   }
 
   /**
@@ -1086,7 +1105,24 @@ export class KimiSdkProvider implements TransportProvider {
         }
       }),
     ) as ReadableStream<Uint8Array>;
-    const stream = ndJsonStream(writable, readable);
+    const rawStream = ndJsonStream(writable, readable);
+    // `@agentclientprotocol/sdk` validates `session/update` against a strict
+    // Zod union that rejects non-standard `sessionUpdate` types (`turn_completed`,
+    // runtime subagent events) and strips `usage_update.tokens`. Route
+    // `session/update` notifications through `extNotification` so custom ACP
+    // update payloads reach `handleSessionUpdate` intact.
+    const stream = {
+      writable: rawStream.writable,
+      readable: rawStream.readable.pipeThrough(new TransformStream({
+        transform(message, controller) {
+          if (message && typeof message === 'object' && !('id' in message) && (message as { method?: unknown }).method === 'session/update') {
+            controller.enqueue({ ...(message as Record<string, unknown>), method: '_imcodes/session/update' });
+            return;
+          }
+          controller.enqueue(message);
+        },
+      })),
+    };
 
     // Construct the ACP connection. The callback receives the Agent handle we
     // can use to call RPC methods; we return a Client impl that handles
@@ -1182,8 +1218,8 @@ export class KimiSdkProvider implements TransportProvider {
           this.cacheModelsFromSessionResponse({ models: _params as any } as NewSessionResponse);
           return;
         }
-        if (method === '_x.ai/session/update' && _params && typeof _params === 'object') {
-          this.handleSessionUpdate(_params as unknown as SessionNotification);
+        if ((method === '_x.ai/session/update' || method === '_imcodes/session/update') && _params && typeof _params === 'object') {
+          if (!child || this.child === child) this.handleSessionUpdate(_params as unknown as SessionNotification);
           return;
         }
         // Grok publishes MCP catalog refreshes through an xAI extension. The
@@ -1315,16 +1351,18 @@ export class KimiSdkProvider implements TransportProvider {
       // A rejected steering request is NOT proof that the original task or
       // another admitted prompt stopped. Retain busy/text/tools until all
       // native RPCs settle (connection death rejects them all as well).
-      if (state.activePromptGenerations.size > 0) return;
+      if (state.activePromptGenerations.size > 0 || state.autonomousTurnGeneration !== undefined) return;
       error = state.steeringFailure;
       state.steeringFailure = undefined;
       state.steeringTerminal = undefined;
     } else if (state.settledGeneration >= generation) return;
     state.settledGeneration = state.turnGeneration;
     state.activePromptGenerations?.clear();
+    state.autonomousTurnGeneration = undefined;
     state.promptInFlight = false;
     state.promptSubmittedGeneration = null;
     state.cancelled = false;
+    state.stoppedByCancel = true;
     state.toolCalls.clear();
     state.emittedToolSignatures.clear();
     state.sessionSystemTextInjected = undefined;
@@ -1626,6 +1664,7 @@ export class KimiSdkProvider implements TransportProvider {
       state.steeringTerminal = undefined;
       steeringFailure = state.steeringFailure;
       state.steeringFailure = undefined;
+      state.autonomousTurnGeneration = undefined;
       state.promptInFlight = false;
       state.promptSubmittedGeneration = null;
     } else {
@@ -1634,6 +1673,7 @@ export class KimiSdkProvider implements TransportProvider {
       state.activePromptGenerations?.delete(generation);
       const hasRemainingPrompts = (state.activePromptGenerations?.size ?? 0) > 0;
       if (!hasRemainingPrompts) {
+        state.autonomousTurnGeneration = undefined;
         state.promptInFlight = false;
         state.promptSubmittedGeneration = null;
       } else {
@@ -1653,12 +1693,15 @@ export class KimiSdkProvider implements TransportProvider {
     run?.complete();
 
     if (steeringFailure !== undefined) {
+      state.stoppedByCancel = true;
       this.emitError(sessionId, this.normalizeError(steeringFailure));
       return;
     }
     if (stopReason === 'cancelled' || state.cancelled) {
       state.cancelled = false;
+      state.stoppedByCancel = true;
       state.activePromptGenerations?.clear();
+      state.autonomousTurnGeneration = undefined;
       state.promptInFlight = false;
       state.promptSubmittedGeneration = null;
       state.settledGeneration = state.turnGeneration;
@@ -1730,6 +1773,7 @@ export class KimiSdkProvider implements TransportProvider {
   // ── sessionUpdate dispatch ──────────────────────────────────────────────
 
   private handleSessionUpdate(params: SessionNotification): void {
+    if (!params || typeof params !== 'object' || typeof params.sessionId !== 'string' || !params.update || typeof params.update !== 'object') return;
     const routeId = this.acpToRoute.get(params.sessionId);
     if (!routeId) return;
     const state = this.sessions.get(routeId);
@@ -1749,6 +1793,15 @@ export class KimiSdkProvider implements TransportProvider {
       return;
     }
     if (updateRecord.sessionUpdate === 'turn_completed') {
+      if (this.profile.steeringPrompts && state.autonomousTurnGeneration !== undefined) {
+        this.capturePromptUsage(state, updateRecord as unknown as PromptResponse);
+        const autoGen = state.autonomousTurnGeneration;
+        state.autonomousTurnGeneration = undefined;
+        if ((state.activePromptGenerations?.size ?? 0) === 0) {
+          (state.activePromptGenerations ??= new Set()).add(autoGen);
+          this.settleTurn(routeId, state, autoGen, state.cancelled ? 'cancelled' : 'end_turn');
+        }
+      }
       return;
     }
     const turnScopedUpdate = update.sessionUpdate === 'agent_message_chunk'
@@ -1757,6 +1810,15 @@ export class KimiSdkProvider implements TransportProvider {
       || update.sessionUpdate === 'tool_call_update'
       || update.sessionUpdate === 'usage_update'
       || update.sessionUpdate === 'plan';
+    if (turnScopedUpdate
+      && this.profile.steeringPrompts
+      && !state.promptInFlight
+      && state.loaded
+      && !state.replaying
+      && !state.cancelled
+      && !state.stoppedByCancel) {
+      this.startAutonomousTurn(routeId, state);
+    }
     if (turnScopedUpdate && (!state.promptInFlight || state.cancelled)) {
       return;
     }
@@ -1819,6 +1881,35 @@ export class KimiSdkProvider implements TransportProvider {
           'Unhandled ACP session update',
         );
         return;
+    }
+  }
+
+  private startAutonomousTurn(sessionId: string, state: KimiSdkSessionState): void {
+    const generation = ++state.turnGeneration;
+    state.autonomousTurnGeneration = generation;
+    state.promptInFlight = true;
+    state.promptSubmittedGeneration = generation;
+    state.cancelled = false;
+    state.stoppedByCancel = false;
+    state.steeringUsage = undefined;
+    state.lastTurnUsage = undefined;
+    state.steeringTerminal = undefined;
+    state.steeringFailure = undefined;
+    state.currentText = '';
+    state.currentMessageId = null;
+    state.toolCalls.clear();
+    state.emittedToolSignatures.clear();
+    state.lastStatusSignature = null;
+    state.turnModel = this.profile.strictModelSelection ? (state.confirmedModel ?? state.model) : undefined;
+    (state.activePromptGenerations ??= new Set()).clear();
+    let completeRun!: () => void;
+    const run = {
+      terminal: new Promise<void>((r) => { completeRun = r; }),
+      complete: () => completeRun(),
+    };
+    this.steeringRunTerminals.set(state, run);
+    if (this.profile.strictModelSelection && state.turnModel) {
+      this.emitSessionInfo(sessionId, { model: state.turnModel });
     }
   }
 
@@ -2174,6 +2265,7 @@ export class KimiSdkProvider implements TransportProvider {
     const hadActiveWork = state.promptInFlight || state.replaying || state.toolCalls.size > 0;
     if (hadActiveWork) state.settledGeneration = state.turnGeneration;
     state.activePromptGenerations?.clear();
+    state.autonomousTurnGeneration = undefined;
     state.promptInFlight = false;
     state.promptSubmittedGeneration = null;
     if (!this.profile.steeringPrompts) state.activePromptAdmissions.clear();
@@ -2183,6 +2275,7 @@ export class KimiSdkProvider implements TransportProvider {
     state.steeringFailure = undefined;
     state.replaying = false;
     state.cancelled = false;
+    state.stoppedByCancel = true;
     state.currentMessageId = null;
     state.currentText = '';
     state.toolCalls.clear();

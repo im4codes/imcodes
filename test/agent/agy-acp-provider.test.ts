@@ -10,7 +10,8 @@ import { PROVIDER_ERROR_CODES, normalizeProviderPayload } from '../../src/agent/
 import { AGY_NATIVE_START_NOT_ATTEMPTED } from '../../shared/agy-agent.js';
 import { SESSION_MODEL_APPLIED } from '../../shared/session-model-control.js';
 import { onConfirmedProviderStop } from '../../src/agent/provider-stop-confirmation.js';
-import type { SessionInfoUpdate } from '../../src/agent/transport-provider.js';
+import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
+import type { SessionInfoUpdate, ToolCallEvent } from '../../src/agent/transport-provider.js';
 
 const resources: Array<{ provider: AgyAcpProvider; root: string }> = [];
 afterEach(async () => { for (const { provider, root } of resources.splice(0)) { await provider.disconnect(); await rm(root, { recursive: true, force: true }); } vi.unstubAllEnvs(); });
@@ -352,9 +353,119 @@ describe('AG native ACP', () => {
     vi.stubEnv(AGY_CLI_PATH_ENV, path.join(root, 'not-the-probed-cli'));
     await provider.connect(config);
     expect(provider).toBeInstanceOf(AgyAcpProvider);
-    expect((await readFile(argvLog, 'utf8')).trim().split('\n')).toEqual(['--version', 'acp --process-per-session']);
+    expect((await readFile(argvLog, 'utf8')).trim().split('\n')).toEqual(['--version', 'acp --process-per-session --dangerously-skip-permissions']);
     const rows = (await readFile(rpcLog, 'utf8')).trim().split('\n').map(x => JSON.parse(x));
     expect(rows.some(x => x.method === 'initialize')).toBe(true);
+  });
+  it('forwards autonomous wakeup turn stream, maintains provider/runtime busy state, and settles on turn_completed', async () => {
+    const { provider, root } = await setup();
+    const id = 'deck_test_agy_auto_wakeup';
+    const runtime = new TransportSessionRuntime(provider, id);
+    const statuses: string[] = [];
+    runtime.onStatusChange = s => statuses.push(s);
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    const deltas: string[] = [], tools: ToolCallEvent[] = [], completed: any[] = [];
+    provider.onDelta((sid, d) => { if (sid === id) deltas.push(d.delta); });
+    provider.onToolCall((sid, t) => { if (sid === id) tools.push(t); });
+    provider.onComplete((sid, m) => { if (sid === id) completed.push(m); });
+
+    const startHold = path.join(root, 'rpc.jsonl.auto-start-hold');
+    const thoughtHold = path.join(root, 'rpc.jsonl.auto-thought-hold');
+    const autoHold = path.join(root, 'rpc.jsonl.auto-hold');
+    await writeFile(startHold, 'hold');
+    await writeFile(thoughtHold, 'hold');
+    await writeFile(autoHold, 'hold');
+    try {
+      runtime.send('SCHEDULE_WAKEUP');
+      await vi.waitFor(() => expect(completed).toHaveLength(1));
+      expect(runtime.getStatus()).toBe('idle');
+
+      // Release startHold so autonomous wakeup turn begins with agent_thought_chunk while thoughtHold is held.
+      await unlink(startHold);
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('thinking'));
+      expect(provider.getActiveWorkSnapshot(id)).toMatchObject({
+        activeWorkCount: 1,
+        busyReasons: ['provider_wait'],
+      });
+
+      // Release thoughtHold so tool_call (in_progress) is emitted while autoHold is held.
+      await unlink(thoughtHold);
+      await vi.waitFor(() => expect(tools.some(t => t.id === 'edit-1' && t.status === 'running')).toBe(true));
+      expect(provider.getActiveWorkSnapshot(id)).toMatchObject({
+        activeWorkCount: 1,
+        activeToolCount: 1,
+        busyReasons: ['provider_wait', 'open_tool_call'],
+      });
+      expect(runtime.getActivitySnapshot()).toMatchObject({
+        activeToolCount: 1,
+        busyReasons: expect.arrayContaining(['provider_wait', 'open_tool_call']),
+      });
+      expect((runtime as any)._openTools.get('edit-1')).toMatchObject({
+        name: 'edit_file',
+        status: 'running',
+      });
+    } finally {
+      await unlink(startHold).catch(() => {});
+      await unlink(thoughtHold).catch(() => {});
+      await unlink(autoHold).catch(() => {});
+    }
+
+    await vi.waitFor(() => expect(completed).toHaveLength(2));
+    expect(runtime.getStatus()).toBe('idle');
+    expect(provider.getActiveWorkSnapshot(id)).toMatchObject({
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
+    expect(deltas).toContain('AUTONOMOUS_WAKEUP_DONE');
+    expect(tools.some(t => t.id === 'edit-1' && t.status === 'complete')).toBe(true);
+    expect(completed[1]).toMatchObject({
+      content: 'AUTONOMOUS_WAKEUP_DONE',
+      metadata: {
+        model: 'model-a',
+        usage: { inputTokens: 22, outputTokens: 11 },
+      },
+    });
+    await runtime.kill();
+  });
+  it('converges auto -> external steering to a single terminal and prevents delayed frames after Stop from reviving an autonomous turn', async () => {
+    const { provider, root } = await setup('late-after-cancel');
+    const id = await route(provider);
+    const complete = vi.fn(), errors = vi.fn(), deltas = vi.fn();
+    provider.onComplete(complete); provider.onError(errors); provider.onDelta(deltas);
+
+    // 1. auto -> external steering converges to a single terminal onComplete.
+    const autoHold = path.join(root, 'rpc.jsonl.auto-hold');
+    await writeFile(autoHold, 'hold');
+    try {
+      await provider.send(id, 'SCHEDULE_WAKEUP');
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1));
+      await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true));
+      expect(await provider.notifyActiveDelegation(id, notification('STEER_IN_AUTO'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    } finally {
+      await unlink(autoHold).catch(() => {});
+    }
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2));
+    expect(complete.mock.calls[1]?.[1].content).toBe('AUTONOMOUS_WAKEUP_DONE STEER_IN_AUTO');
+    expect(errors).not.toHaveBeenCalled();
+
+    // 2. Stop / cancelAndWait during an autonomous turn settles once as CANCELLED and ignores delayed post-Stop frames.
+    await writeFile(autoHold, 'hold');
+    try {
+      await provider.send(id, 'SCHEDULE_WAKEUP');
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(3));
+      await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true));
+      await expect(provider.cancelAndWait(id)).resolves.toBeUndefined();
+      expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
+      expect(errors).toHaveBeenCalledTimes(1);
+      expect(errors.mock.calls[0]?.[1].code).toBe(PROVIDER_ERROR_CODES.CANCELLED);
+      await new Promise(resolve => setTimeout(resolve, 40));
+      expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
+      expect(complete).toHaveBeenCalledTimes(3);
+      expect(deltas.mock.calls.some(c => c[1].delta.includes('LATE_AFTER_STOP'))).toBe(false);
+    } finally {
+      await unlink(autoHold).catch(() => {});
+    }
   });
   it('keeps the Windows shim entrypoint/prepend args, not just node.exe', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'imcodes-test-agy-shim-'));

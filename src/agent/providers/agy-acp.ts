@@ -7,7 +7,7 @@ import {
   type AgentDelegationNotificationResult,
 } from '../../../shared/agent-delegation.js';
 import {
-  AGY_SDK_PROVIDER_ID, AGY_CLI_BINARY, AGY_NATIVE_START_NOT_ATTEMPTED,
+  AGY_SDK_PROVIDER_ID, AGY_CLI_BINARY, AGY_CLI_FLAG, AGY_NATIVE_START_NOT_ATTEMPTED,
   AGY_ACP_AGENT_NAME, AGY_ACP_COMMAND,
 } from '../../../shared/agy-agent.js';
 import { NATIVE_AGENT_ADMISSION_MODES } from '../../../shared/native-collaboration-policy.js';
@@ -20,7 +20,7 @@ const PROFILE: AcpCliProviderProfile = {
   id: AGY_SDK_PROVIDER_ID,
   displayName: 'Antigravity',
   binary: AGY_CLI_BINARY,
-  args: [AGY_ACP_COMMAND, '--process-per-session'],
+  args: [AGY_ACP_COMMAND, '--process-per-session', AGY_CLI_FLAG.SKIP_PERMISSIONS],
   approval: 'auto-allow',
   loadFailure: 'error',
   resumeWithoutReplay: true,

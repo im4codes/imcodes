@@ -12,12 +12,43 @@ const record = data => { if (logPath) fs.appendFileSync(logPath, JSON.stringify(
 if (process.argv.includes('--help')) { console.log('Usage: agy'); process.exit(0); }
 if (process.argv.includes('--version')) { console.log(process.env.AGY_ACP_FIXTURE_VERSION || '1.5.4'); process.exit(0); }
 const models = { currentModelId: 'model-a', availableModels: [{ modelId: 'model-a', name: 'Model A' }, { modelId: 'model-b', name: 'Model B' }] };
+function startAutoWakeup(sid, state) {
+  if (logPath && fs.existsSync(logPath + '.auto-start-hold')) {
+    state.autoTimer = setTimeout(() => startAutoWakeup(sid, state), 10); return;
+  }
+  state.inAutoWakeup = true;
+  state.autoToolStarted = false;
+  state.inputs = ['AUTONOMOUS_WAKEUP_DONE'];
+  state.turnModel = state.model || models.currentModelId;
+  note(sid, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'waking up...' } });
+  state.autoTimer = setTimeout(() => continueAutoWakeup(sid, state), 10);
+}
+function continueAutoWakeup(sid, state) {
+  if (logPath && fs.existsSync(logPath + '.auto-thought-hold')) {
+    state.autoTimer = setTimeout(() => continueAutoWakeup(sid, state), 10); return;
+  }
+  if (!state.autoToolStarted) {
+    state.autoToolStarted = true;
+    note(sid, { sessionUpdate: 'tool_call', toolCallId: 'edit-1', title: 'edit_file', kind: 'edit', status: 'in_progress', rawInput: { path: 'src/a.ts' } });
+  }
+  if (logPath && fs.existsSync(logPath + '.auto-hold')) {
+    state.autoTimer = setTimeout(() => continueAutoWakeup(sid, state), 10); return;
+  }
+  state.inAutoWakeup = false; state.autoToolStarted = false; state.autoTimer = undefined;
+  note(sid, { sessionUpdate: 'tool_call_update', toolCallId: 'edit-1', status: 'completed', rawOutput: 'edited' });
+  note(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: state.inputs.join(' ') } });
+  note(sid, { sessionUpdate: 'usage_update', tokens: { inputTokens: 22, outputTokens: 11 } });
+  note(sid, { sessionUpdate: 'turn_completed' });
+  for (const id of state.pending.splice(0)) ok(id, { stopReason: 'end_turn', usage: { inputTokens: 22, outputTokens: 11 } });
+  state.inputs = [];
+}
 function finish(sid, state) {
   // Explicit process-fixture handshake, not a timing assumption about CI CPU.
   if (logPath && fs.existsSync(logPath + '.hold')) {
     state.timer = setTimeout(() => finish(sid, state), 10); return;
   }
   state.timer = undefined;
+  const shouldScheduleWakeup = state.inputs.some(x => x.includes('SCHEDULE_WAKEUP'));
   record({ fixture: 'completed-model', sessionId: sid, model: state.turnModel });
   note(sid, { sessionUpdate: 'tool_call_update', toolCallId: 'sleep', status: 'completed', rawOutput: 'done' });
   note(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: state.inputs.join(' ') } });
@@ -25,6 +56,7 @@ function finish(sid, state) {
   if (scenario === 'reordered') pending.reverse();
   for (const [i, id] of pending.entries()) setTimeout(() => ok(id, { stopReason: 'end_turn', usage: { inputTokens: 10, outputTokens: 5 } }), i * (Number(process.env.AGY_ACP_FIXTURE_REPLY_GAP_MS) || 20));
   state.inputs = [];
+  if (shouldScheduleWakeup) state.autoTimer = setTimeout(() => startAutoWakeup(sid, state), 20);
 }
 readline.createInterface({ input: process.stdin }).on('line', line => {
   const req = JSON.parse(line); const p = req.params || {}; record(req);
@@ -52,18 +84,32 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     }
     case 'session/set_mode': return ok(req.id);
     case 'session/close': {
-      const state = sessions.get(p.sessionId); if (state) { clearTimeout(state.timer); for (const id of state.pending) ok(id, { stopReason: 'cancelled' }); }
+      const state = sessions.get(p.sessionId); if (state) { clearTimeout(state.timer); clearTimeout(state.autoTimer); for (const id of state.pending) ok(id, { stopReason: 'cancelled' }); }
       sessions.delete(p.sessionId); return ok(req.id);
     }
     case 'session/cancel': {
       if (scenario === 'crash-on-cancel') return process.exit(12);
       const state = sessions.get(p.sessionId); if (!state) return;
-      clearTimeout(state.timer); for (const id of state.pending.splice(0)) ok(id, { stopReason: 'cancelled' }); state.inputs = []; return;
+      clearTimeout(state.timer); clearTimeout(state.autoTimer); state.inAutoWakeup = false; state.autoToolStarted = false;
+      for (const id of state.pending.splice(0)) ok(id, { stopReason: 'cancelled' }); state.inputs = [];
+      if (scenario === 'late-after-cancel') {
+        setTimeout(() => {
+          note(p.sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'LATE_AFTER_STOP' } });
+          note(p.sessionId, { sessionUpdate: 'turn_completed' });
+        }, 15);
+      }
+      return;
     }
     case 'session/prompt': {
       const state = sessions.get(p.sessionId); if (!state) return error(req.id, 'Missing session');
       const text = p.prompt.map(x => x.text || '').join('');
       if (text === 'B' && scenario === 'reject-b') return error(req.id, 'B was rejected');
+      if (state.inAutoWakeup) {
+        record({ fixture: 'prompt-model', sessionId: p.sessionId, model: state.turnModel, text });
+        state.pending.push(req.id); state.inputs.push(text);
+        note(p.sessionId, { sessionUpdate: 'turn_completed' });
+        return;
+      }
       clearTimeout(state.timer);
       if (scenario !== 'reordered' && state.pending.length) for (const id of state.pending.splice(0)) ok(id, { stopReason: 'end_turn' });
       if (!state.inputs.length) state.turnModel = state.model || models.currentModelId;

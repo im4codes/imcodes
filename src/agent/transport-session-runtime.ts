@@ -1177,6 +1177,9 @@ export class TransportSessionRuntime implements SessionRuntime {
         // compact_boundary, Codex's inline auto-compaction). Remember it so the
         // turn's completion re-injects what compaction may have summarized.
         if (status?.status === 'compacting') this._compactionObservedInTurn = true;
+        if (!this._activeDispatchCancelled && this._status === 'idle' && status?.status && this.hasActiveTurnWork()) {
+          this.setStatus('thinking');
+        }
       })] : []),
       ...(this.provider.onUsage ? [this.provider.onUsage((sid: string, _update: ProviderUsageUpdate) => {
         if (sid !== this._providerSessionId) return;
@@ -1189,6 +1192,9 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._lastProviderOutputAt = this._lastActivityAt;
       const backgroundedSubagent = isBackgroundedSdkSubagentTool(tool);
       this.recordToolActivity(tool);
+      if (!this._activeDispatchCancelled && this._status === 'idle' && this.hasActiveTurnWork()) {
+        this.setStatus('streaming');
+      }
       if (!backgroundedSubagent) this._activeDispatchHasSideEffectEvidence = true;
       if (this._activeDispatchId === null || !this._activeTurn) return;
       // Provider-visible tool events mean the SDK has already accepted work,
@@ -2594,7 +2600,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       // send the end event -- and `open_tool_call` would pin the session-level
       // queue forever, while the next dispatch (whose generation rollover is
       // what would clear it) could never start. So it is never opened.
-      if (!this.hasLocalTurnInFlight()) {
+      if (!this.hasLocalTurnInFlight() && !this.hasActiveTurnWork()) {
         this.rejectLateToolOpen(tool, generation);
         return;
       }
