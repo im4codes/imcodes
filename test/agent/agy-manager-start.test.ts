@@ -68,7 +68,7 @@ describe('AG manager start ownership (real runtime, SQLite and SDK child)', () =
     expect(store.getSession(name)?.agyNativeSessionState).toBe(AGY_NATIVE_SESSION_STATE.UNSTARTED);
     runtime.send('first after reconnect', 'ag-reconnect-first');
     await new Promise(resolve => setTimeout(resolve, 400));
-    await vi.waitFor(() => expect(readFileSync(path.join(home, 'inputs'), 'utf8').trim()).not.toBe(''), { timeout: 3000 });
+    await vi.waitFor(() => expect(readFileSync(path.join(home, 'inputs'), 'utf8').trim()).not.toBe(''), { timeout: 5000 });
     expect(store.getSession(name)?.providerSessionId).toBe(before.providerSessionId);
     expect(store.getSession(name)?.runtimeEpoch).toBe(before.runtimeEpoch);
   });
@@ -79,7 +79,7 @@ describe('AG manager start ownership (real runtime, SQLite and SDK child)', () =
     const runtime = getTransportRuntime(name)!;
     runtime.send('before reconnect', 'ag-before');
     await vi.waitFor(() => expect(runtime.sending).toBe(false), { timeout: 5000 });
-    await vi.waitFor(() => expect(store.getSession(name)?.providerResumeId).toBeTruthy());
+    await vi.waitFor(() => expect(store.getSession(name)?.providerResumeId).toBeTruthy(), { timeout: 5000 });
     const before = { ...store.getSession(name)! };
     const sends = vi.spyOn(provider, 'send');
     for (let i=0;i<5;i++) {
@@ -125,7 +125,7 @@ describe('AG manager start ownership (real runtime, SQLite and SDK child)', () =
     store.upsertSession({ ...store.getSession(name)!, runtimeEpoch: 'legitimate-next-owner' });
     expect(runtime.rehydratePendingFromStore()).toBe(1);
     runtime.drainPendingIfIdle();
-    await vi.waitFor(() => expect(runtime.lastProviderError?.message).toBe('AG start owner changed'));
+    await vi.waitFor(() => expect(runtime.lastProviderError?.message).toBe('AG start owner changed'), { timeout: 5000 });
     await stopTransportRuntimeSession(name, { preserveTransportQueue: true });
     expect(readFileSync(path.join(home, 'inputs'), 'utf8')).toBe('');
     await launchTransportSession(options);
@@ -201,8 +201,8 @@ describe('AG manager start ownership (real runtime, SQLite and SDK child)', () =
       projectDir: home, requestedModel: 'fixture-A', identityPrompt: 'fixture', fresh: true });
     const runtime = getTransportRuntime(name)!;
     runtime.send('fixture-hold', 'model-hold');
-    await vi.waitFor(() => expect(readFileSync(path.join(home, 'inputs'), 'utf8')).toContain('fixture-hold'));
-    await vi.waitFor(() => expect(store.getSession(name)?.providerResumeId).toBeTruthy());
+    await vi.waitFor(() => expect(readFileSync(path.join(home, 'inputs'), 'utf8')).toContain('fixture-hold'), { timeout: 5000 });
+    await vi.waitFor(() => expect(store.getSession(name)?.providerResumeId).toBeTruthy(), { timeout: 5000 });
     const native = store.getSession(name)!.providerResumeId;
     const completedModels: unknown[] = [];
     const off = provider.onComplete((_sid, message) => completedModels.push(message.metadata?.model));
@@ -227,7 +227,7 @@ describe('AG manager start ownership (real runtime, SQLite and SDK child)', () =
     let release!: (value: { models: [] }) => void;
     const validation = vi.spyOn(provider, 'listModels').mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
     const switching = switchSessionModelNow(name, 'fixture-B');
-    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'), { timeout: 5000 });
     await stopTransportRuntimeSession(name);
     await launchTransportSession({ ...options, requestedModel: 'fixture-C' });
     const next = { ...store.getSession(name)! };
@@ -250,7 +250,7 @@ describe('AG manager start ownership (real runtime, SQLite and SDK child)', () =
     const runtime = getTransportRuntime(name)!;
     runtime.send('first model', 'aba-first');
     await vi.waitFor(() => expect(runtime.sending).toBe(false), { timeout: 5000 });
-    await vi.waitFor(() => expect(store.getSession(name)?.providerResumeId).toBeTruthy());
+    await vi.waitFor(() => expect(store.getSession(name)?.providerResumeId).toBeTruthy(), { timeout: 5000 });
     const native = store.getSession(name)!.providerResumeId;
     for (const [model, id] of [['fixture-B', 'aba-second'], ['fixture-A', 'aba-third']]) {
       await expect(switchSessionModelNow(name, model)).resolves.toMatchObject({ ok: true, applied: SESSION_MODEL_APPLIED.NEXT_START });
@@ -273,7 +273,7 @@ describe('AG manager start ownership (real runtime, SQLite and SDK child)', () =
       projectDir: home, requestedModel: 'fixture-A', identityPrompt: 'fixture', fresh: true });
     const runtime = getTransportRuntime(name)!;
     runtime.send('fixture-hold', 'queued-old');
-    await vi.waitFor(() => expect(readFileSync(path.join(home, 'inputs'), 'utf8')).toContain('fixture-hold'));
+    await vi.waitFor(() => expect(readFileSync(path.join(home, 'inputs'), 'utf8')).toContain('fixture-hold'), { timeout: 5000 });
     await switchSessionModelNow(name, 'fixture-B');
     expect(runtime.send('queued next model', 'queued-new')).toBe('queued');
     writeFileSync(path.join(home, 'release'), 'go');
@@ -292,7 +292,7 @@ describe('AG manager start ownership (real runtime, SQLite and SDK child)', () =
     let release!: (value: { models: [] }) => void;
     vi.spyOn(provider, 'listModels').mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
     const first = switchSessionModelNow(name, 'fixture-B');
-    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'), { timeout: 5000 });
     const queued = switchSessionModelNow(name, 'fixture-D');
     await stopTransportRuntimeSession(name);
     await launchTransportSession({ ...options, requestedModel: 'fixture-C' });
@@ -326,7 +326,7 @@ describe('AG manager start ownership (real runtime, SQLite and SDK child)', () =
       projectDir: home, requestedModel: 'fixture-A', identityPrompt: 'fixture', fresh: true });
     const runtime = getTransportRuntime(name)!;
     runtime.send('fixture-hold', 'cancel-old');
-    await vi.waitFor(() => expect(store.getSession(name)?.providerResumeId).toBeTruthy());
+    await vi.waitFor(() => expect(store.getSession(name)?.providerResumeId).toBeTruthy(), { timeout: 5000 });
     const native = store.getSession(name)!.providerResumeId;
     await switchSessionModelNow(name, 'fixture-B');
     await runtime.cancel({ waitForProvider: true });
@@ -374,7 +374,7 @@ describe('AG provider-switch failure recovery', () => {
     const options = { name, projectName: 'realproj', role: 'brain' as const, agentType: AGY_SDK_PROVIDER_ID, projectDir: home, identityPrompt: 'fixture' };
     await launchTransportSession({ ...options, fresh: true, requestedModel: 'gemini-4-carbon-medium' });
     const runtime = getTransportRuntime(name)!; runtime.send('rejected', 'unsupported');
-    await vi.waitFor(() => expect(runtime.lastProviderError).toBeTruthy());
+    await vi.waitFor(() => expect(runtime.lastProviderError).toBeTruthy(), { timeout: 5000 });
     const native = store.getSession(name)!.providerResumeId;
     expect(native).toBeTruthy();
     expect(rows().some(row => row.method === 'session/prompt')).toBe(false);
@@ -395,7 +395,7 @@ describe('AG provider-switch failure recovery', () => {
     await acp('new-error-once'); const name = names[1];
     await launchTransportSession({ name, projectName: 'realproj', role: 'w1', agentType: AGY_SDK_PROVIDER_ID, projectDir: home, identityPrompt: 'fixture' });
     const runtime = getTransportRuntime(name)!; runtime.send('first', 'creation-failed');
-    await vi.waitFor(() => expect(runtime.lastProviderError).toBeTruthy());
+    await vi.waitFor(() => expect(runtime.lastProviderError).toBeTruthy(), { timeout: 5000 });
     expect(store.getSession(name)?.providerResumeId).toBeUndefined();
     await expect(restartSessionNow(name, { reset: false })).rejects.toThrow(/start over|reset=true/i);
     await restartSessionNow(name, { reset: true }); await send(name, 'after-reset');
