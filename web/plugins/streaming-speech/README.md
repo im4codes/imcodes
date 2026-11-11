@@ -2,7 +2,9 @@
 
 One Capacitor plugin/event contract for the existing VoiceInput/VoiceOverlay,
 with small Android AudioRecord and iOS AVAudioEngine adapters. Recognizes Mandarin
-and English with the **same** INT8 streaming Paraformer model (237 MB decimal).
+and English with the **same** streaming Zipformer transducer (INT8 encoder and
+joiner, FP32 decoder; 199 MB decimal). A small shared hotword file biases
+`COMMIT`, `GITHUB`, and `ENGLISH` during decoding rather than rewriting text.
 No audio upload, desktop process, cloud key, or language-switching UI.
 
 Before native sync/build run `npm --prefix web run prepare:speech`. The build-time
@@ -21,7 +23,7 @@ backgrounding stops capture; recognition never restarts the microphone silently.
 Old installed shells and web browsers retain their previous recognition path.
 
 Upstream runtime: https://github.com/k2-fsa/sherpa-onnx (Apache-2.0).
-Model: https://huggingface.co/csukuangfj/sherpa-onnx-streaming-paraformer-bilingual-zh-en
+Model: https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20
 See the model provider's terms before redistributing modified model assets. Do
 not claim hallucination-free transcription, automatic punctuation, or a fixed
 100ms recognition latency; chunk duration is not end-to-end latency.

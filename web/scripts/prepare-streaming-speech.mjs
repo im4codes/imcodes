@@ -7,12 +7,15 @@ import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-export const MODEL_REVISION = '8e40c43232a1c5c66c82111efc5820d3accca11b';
-const modelBase = `https://huggingface.co/csukuangfj/sherpa-onnx-streaming-paraformer-bilingual-zh-en/resolve/${MODEL_REVISION}`;
+export const MODEL_REVISION = '98590b7ed6443e77b714204da2757d75e1a642f4';
+const modelBase = `https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/resolve/${MODEL_REVISION}`;
 export const SPEECH_ASSETS = [
-  ['models/encoder.int8.onnx', `${modelBase}/encoder.int8.onnx`, '81a70226a8934e6ed92aa1d4fc486b428b5398e2f2619ed4897b7294cab90e9a', 165462184],
-  ['models/decoder.int8.onnx', `${modelBase}/decoder.int8.onnx`, 'f3cca9f77bb9d93c8fcbfb63ae617b6b1ee96818df3aa3b151c40658fe38594f', 71664561],
-  ['models/tokens.txt', `${modelBase}/tokens.txt`, '59aba8873a2ed1e122c25fee421e25f283b63290efbde85c1f01a853d83cb6e6', 75756],
+  ['models/encoder.int8.onnx', `${modelBase}/encoder-epoch-99-avg-1.int8.onnx`, '8fa764187a261844f859d7143ebaa563af5d10adfece4c18a8f414c88cba2a9b', 181895032],
+  ['models/decoder.onnx', `${modelBase}/decoder-epoch-99-avg-1.onnx`, '2e3b5ec371f8899ee6acd829fd753ba45772df57a91bdf37cde3136354e7db7d', 13876452],
+  ['models/joiner.int8.onnx', `${modelBase}/joiner-epoch-99-avg-1.int8.onnx`, '1ed689c5ed19dbaa725d9d191bb4822b5f4855a39e1ffd28cbc1f340d25b2ee0', 3228404],
+  ['models/tokens.txt', `${modelBase}/tokens.txt`, 'a8e0e4ec53810e433789b54a5c0134a7eaa2ffca595a6334d54c00da858841d3', 56317],
+  ['models/bpe.vocab', `${modelBase}/bpe.vocab`, 'd0b642f3a2eacd5fadefdeff9e0e1358cab729647cbb7fe58cf738e1f7407029', 12564],
+  ['models/hotwords.txt', null, '990d0485b3c31da0d514f1f420c403caf34c581707ee9dd47c56e02d0ee7474b', 22],
   ['android/libs/sherpa-onnx-2.0.1.aar', 'https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/sherpa-onnx-2.0.1.aar', 'a8d09d1d32f3eb8520482c6d3d43fae674681c5b050385967c70a3c2c9bf0ee7', 49441341],
 ];
 export async function matchesAsset(file, hash, size) {
@@ -27,6 +30,7 @@ export async function prepareSpeechAssets(root, download = fetch, assets = SPEEC
   for (const [relative, url, hash, size] of assets) {
     const file = new URL(relative, root);
     if (await matchesAsset(file, hash, size)) continue;
+    if (!url) throw new Error(`Bundled speech asset missing/corrupt: ${relative}`);
     await mkdir(new URL('.', file), { recursive: true });
     // Per-process staging allows parallel CI platforms; only verified bytes publish.
     const pending = new URL(`${relative}.${process.pid}.part`, root);
@@ -44,6 +48,10 @@ export async function prepareSpeechAssets(root, download = fetch, assets = SPEEC
         await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
       }
     }
+  }
+  // A cached old decoder would otherwise be copied into both app packages.
+  if (assets.some(([relative]) => relative === 'models/decoder.onnx')) {
+    await rm(new URL('models/decoder.int8.onnx', root), { force: true });
   }
 }
 if (process.argv[1] && fileURLToPath(import.meta.url) === fileURLToPath(pathToFileURL(process.argv[1]))) {

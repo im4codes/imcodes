@@ -7,3 +7,4 @@ android/build/
 !models/NOTICE.txt
 !models/LICENSE.sherpa.txt
 !models/LICENSE.onnxruntime.txt
+!models/hotwords.txt

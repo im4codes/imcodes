@@ -37,7 +37,7 @@ public class StreamingSpeechPlugin extends Plugin {
     @PluginMethod
     public void available(PluginCall call) {
         boolean ready = true;
-        for (String name : new String[] { "encoder.int8.onnx", "decoder.int8.onnx", "tokens.txt" }) {
+        for (String name : new String[] { "encoder.int8.onnx", "decoder.onnx", "joiner.int8.onnx", "tokens.txt", "bpe.vocab", "hotwords.txt" }) {
             try (java.io.InputStream input = getContext().getAssets().open(name)) {
                 if (input.read() < 0) ready = false;
             } catch (IOException e) { ready = false; }
@@ -80,10 +80,17 @@ public class StreamingSpeechPlugin extends Plugin {
         try {
             if (generation.get() != owner) { call.reject("Speech start cancelled"); return; }
             OnlineRecognizerConfig config = new OnlineRecognizerConfig();
-            config.getModelConfig().getParaformer().setEncoder("encoder.int8.onnx");
-            config.getModelConfig().getParaformer().setDecoder("decoder.int8.onnx");
+            config.getModelConfig().getTransducer().setEncoder("encoder.int8.onnx");
+            config.getModelConfig().getTransducer().setDecoder("decoder.onnx");
+            config.getModelConfig().getTransducer().setJoiner("joiner.int8.onnx");
             config.getModelConfig().setTokens("tokens.txt");
+            config.getModelConfig().setModelType("zipformer");
+            config.getModelConfig().setModelingUnit("cjkchar+bpe");
+            config.getModelConfig().setBpeVocab("bpe.vocab");
             config.getModelConfig().setNumThreads(2);
+            config.setDecodingMethod("modified_beam_search");
+            config.setHotwordsFile("hotwords.txt");
+            config.setHotwordsScore(2.0f);
             config.getEndpointConfig().getRule2().setMinTrailingSilence(1.2f);
             config.getEndpointConfig().getRule3().setMinUtteranceLength(30.0f);
             recognizer = new OnlineRecognizer(getContext().getAssets(), config);
@@ -133,7 +140,8 @@ public class StreamingSpeechPlugin extends Plugin {
             // Stop may interrupt a blocking read: drain text even on that path.
             if (started && stream != null && recognizer != null) {
                 try {
-                    stream.acceptWaveform(new float[8000], SAMPLE_RATE);
+                    // One second covers the transducer's final right-context window.
+                    stream.acceptWaveform(new float[SAMPLE_RATE], SAMPLE_RATE);
                     stream.inputFinished();
                     while (recognizer.isReady(stream)) recognizer.decode(stream);
                     partial(join(committed, recognizer.getResult(stream).getText().trim()), true);

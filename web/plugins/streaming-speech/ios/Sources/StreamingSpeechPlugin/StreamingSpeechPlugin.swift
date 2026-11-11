@@ -45,7 +45,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     private var modelRoot: URL? { Bundle.module.resourceURL?.appendingPathComponent("models", isDirectory: true) }
     private var modelAvailable: Bool {
         guard let root = modelRoot else { return false }
-        return ["encoder.int8.onnx", "decoder.int8.onnx", "tokens.txt"].allSatisfy {
+        return ["encoder.int8.onnx", "decoder.onnx", "joiner.int8.onnx", "tokens.txt", "bpe.vocab", "hotwords.txt"].allSatisfy {
             FileManager.default.isReadableFile(atPath: root.appendingPathComponent($0).path)
         }
     }
@@ -72,12 +72,17 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                 guard self.isCurrent(owner) else { call.reject("Speech start cancelled"); return }
                 let model = sherpaOnnxOnlineModelConfig(
                     tokens: root.appendingPathComponent("tokens.txt").path,
-                    paraformer: sherpaOnnxOnlineParaformerModelConfig(
+                    transducer: sherpaOnnxOnlineTransducerModelConfig(
                         encoder: root.appendingPathComponent("encoder.int8.onnx").path,
-                        decoder: root.appendingPathComponent("decoder.int8.onnx").path),
-                    numThreads: 2)
+                        decoder: root.appendingPathComponent("decoder.onnx").path,
+                        joiner: root.appendingPathComponent("joiner.int8.onnx").path),
+                    numThreads: 2, modelType: "zipformer", modelingUnit: "cjkchar+bpe",
+                    bpeVocab: root.appendingPathComponent("bpe.vocab").path)
                 var config = sherpaOnnxOnlineRecognizerConfig(
-                    featConfig: sherpaOnnxFeatureConfig(), modelConfig: model, enableEndpoint: true)
+                    featConfig: sherpaOnnxFeatureConfig(), modelConfig: model, enableEndpoint: true,
+                    decodingMethod: "modified_beam_search",
+                    hotwordsFile: root.appendingPathComponent("hotwords.txt").path,
+                    hotwordsScore: 2.0)
                 guard let decoder = SpeechDecoder(config: &config) else {
                     call.reject("Offline speech model initialization failed"); return
                 }
@@ -188,7 +193,8 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         worker.async {
             if let decoder = self.decoder {
-                decoder.acceptWaveform(samples: [Float](repeating: 0, count: 8000))
+                // One second covers the transducer's final right-context window.
+                decoder.acceptWaveform(samples: [Float](repeating: 0, count: 16000))
                 decoder.inputFinished()
                 self.decodeAvailable(decoder)
                 self.emitText(self.join(self.committed, decoder.text.trimmingCharacters(in: .whitespacesAndNewlines)), final: true)

@@ -82,6 +82,20 @@ describe('VoiceInput', () => {
     await VoiceInput.stopListening();
   });
 
+  it('keeps the final listener until native stop has drained the last word', async () => {
+    const stopped = deferred<void>();
+    speechApi.stop.mockReturnValueOnce(stopped.promise);
+    const onResult = vi.fn();
+    await VoiceInput.startListening(onResult);
+    const stopping = VoiceInput.stopListening();
+    listeners.partialResults({ matches: ['请上传 GitHub'], isFinal: true });
+    expect(onResult).toHaveBeenLastCalledWith('请上传 GitHub', true);
+    stopped.resolve();
+    await stopping;
+    listeners.partialResults({ matches: ['stale'], isFinal: true });
+    expect(onResult).toHaveBeenCalledTimes(1);
+  });
+
   it('syncs native stopped events back to the listening state callback', async () => {
     const onListeningChange = vi.fn();
 
