@@ -1,4 +1,5 @@
 import { registerPlugin, type Plugin, type PluginListenerHandle } from '@capacitor/core';
+import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
 import { isNative } from '../native.js';
 
 export interface RawSharedFileItem {
@@ -12,14 +13,14 @@ export interface RawSharedPayload {
   id?: string;
   files?: RawSharedFileItem[];
   text?: string;
-  error?: 'file_too_large' | 'read_failed' | string;
+  error?: typeof FS_READ_ERROR_CODES.FILE_TOO_LARGE | 'read_failed' | string;
 }
 
 export interface SharedPayload {
   id: string;
   files: File[];
   text?: string;
-  error?: 'file_too_large' | 'read_failed' | string;
+  error?: typeof FS_READ_ERROR_CODES.FILE_TOO_LARGE | 'read_failed' | string;
 }
 
 export interface PendingSharedSessionUpload {
