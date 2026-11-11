@@ -1,3 +1,5 @@
+import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
+import { readFileSync } from 'node:fs';
 import { AGY_ACP_AGENT_NAME, AGY_CLI_PATH_ENV } from '../../shared/agy-agent.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, writeFile, readFile, rm, mkdir, unlink } from 'node:fs/promises';
@@ -108,6 +110,38 @@ describe('AG native ACP', () => {
     provider.refreshSessionSystemText(id); await send('after clear',true); await send('post clear ordinary',false);
     id=await route(provider,id,{fresh:true}); await send('after initialize',true); await send('post initialize ordinary',false);
   });
+  it('keeps registered originals through real runtime fresh initialization, injects once and withdraws without resurrection',async()=>{
+    const {provider,requests,root}=await setup();const key='deck_test_agy_reset_contract';
+    vi.stubEnv('IMCODES_TRANSPORT_QUEUE_DB_PATH',path.join(root,'contracts-queue.sqlite'));resetTransportQueueStoreForTests();
+    let runtime=new TransportSessionRuntime(provider,key);const config={sessionKey:key,sessionInstanceId:'logical-owner',cwd:root,agentId:'model-a',systemPrompt:'Original system'};
+    let n=0;
+    const send=async(body?:string)=>{
+      const before=(await requests()).filter(r=>r.method==='session/prompt').length;
+      runtime.send('ordinary-'+(++n),'id-'+n,undefined,undefined,body===undefined?undefined:{registeredSystemContract:{contractId:'dynamic',signature:body,body}});
+      await vi.waitFor(async()=>expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(before+1));
+      await vi.waitFor(()=>expect(runtime.getStatus()).toBe('idle'));
+      return (await requests()).filter(r=>r.method==='session/prompt').at(-1).params.prompt.map((b:any)=>b.text??'').join('');
+    };
+    try {
+      await runtime.initialize(config);
+      expect(await send('COMPLETE ORIGINAL REGISTERED BODY')).toContain('COMPLETE ORIGINAL REGISTERED BODY');
+      expect(await send()).not.toContain('COMPLETE ORIGINAL REGISTERED BODY');
+      for(const extra of [{fresh:true},{startupMemoryAlreadyInjected:true},{runtimeEpoch:'next-runtime'}]) {
+        await runtime.initialize({...config,...extra});
+        expect(await send()).toContain('COMPLETE ORIGINAL REGISTERED BODY');
+        expect(await send()).not.toContain('COMPLETE ORIGINAL REGISTERED BODY');
+      }
+      // Real /clear creates a new Runtime object; closing/reopening the
+      // private store also models daemon restore, not module-global retention.
+      await runtime.kill();resetTransportQueueStoreForTests();runtime=new TransportSessionRuntime(provider,key);
+      await runtime.initialize({...config,fresh:true,runtimeEpoch:'restored-epoch'});
+      expect(await send()).toContain('COMPLETE ORIGINAL REGISTERED BODY');
+      expect(await send()).not.toContain('COMPLETE ORIGINAL REGISTERED BODY');
+      await send('');await runtime.kill();resetTransportQueueStoreForTests();runtime=new TransportSessionRuntime(provider,key);
+      await runtime.initialize({...config,fresh:true,runtimeEpoch:'after-withdrawal'});
+      expect(await send()).not.toContain('COMPLETE ORIGINAL REGISTERED BODY');
+    } finally {await runtime.kill();resetTransportQueueStoreForTests();}
+  });
   it.each(['usage-missing','usage-zero','usage-used'])('reports positive current ACP occupancy (%s)', async scenario => {
     const {provider}=await setup(scenario); const id=await route(provider); const done=vi.fn(),usage=vi.fn(); provider.onComplete(done);provider.onUsage(usage);
     const p=normalizeProviderPayload('hello');p.sessionSystemText='full system contract '.repeat(100);
@@ -126,8 +160,16 @@ describe('AG native ACP', () => {
     const a=child.filter(t=>t.detail?.meta?.agentPath==='child-a'); expect(new Set(a.map(t=>t.id)).size).toBe(1);
     expect(a.at(-1)?.detail?.meta?.terminal).toBe(true);
     expect(child.some(t=>t.detail?.input?.description==='find info')).toBe(true);
+    const one=child.filter(t=>t.detail?.meta?.agentName==='MultiOne');
+    const two=child.filter(t=>t.detail?.meta?.agentName==='MultiTwo');
+    expect(one.length).toBeGreaterThan(2);expect(two.length).toBeGreaterThan(2);
+    expect(new Set(one.map(t=>t.id)).size).toBe(1);expect(new Set(two.map(t=>t.id)).size).toBe(1);
+    expect(one[0].id).not.toBe(two[0].id);
+    expect(one.at(-1)?.detail?.meta?.normalizedStatus).toBe('complete');
+    expect(two.at(-1)?.detail?.meta?.normalizedStatus).toBe('error');
+
   });
-  it.each(['native-child-log','native-child-both','native-child-rpc-late'])('bridges real-shaped native child results/reactive parent completion once without another RPC (%s)', async scenario => {
+  it.each(['native-child-log','native-child-both','native-child-rpc-late','native-child-late','native-child-late-chunks'])('bridges real-shaped native child results/reactive parent completion once without another RPC (%s)', async scenario => {
     const {provider,requests}=await setup(scenario);const id=await route(provider),done=vi.fn(),events:ToolCallEvent[]=[];
     provider.onComplete(done);provider.onToolCall((_,t)=>events.push(t));
     await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2),{timeout:6000});
@@ -137,8 +179,47 @@ describe('AG native ACP', () => {
     expect(children.some(t=>t.detail?.meta?.agentPath==='native-child-fixture')).toBe(true);
     await vi.waitFor(()=>expect(events.some(t=>t.detail?.meta?.normalizedStatus==='complete')).toBe(true));
     expect(new Set(children.filter(t=>t.detail?.meta?.agentPath==='native-child-fixture').map(t=>t.id)).size).toBe(1);
-    await new Promise(r=>setTimeout(r,100));expect(done).toHaveBeenCalledTimes(2);
+    await new Promise(r=>setTimeout(r,500));expect(done).toHaveBeenCalledTimes(2);
     const state=(provider as any).sessions.get(id);await provider.endSession(id);expect(state.agyBridges.size).toBe(0);
+  });
+  it('pairs native-first duplicate streams once per native step, not permanently by response text',async()=>{
+    const {provider,requests}=await setup('native-child-same-twice');const id=await route(provider),done=vi.fn();provider.onComplete(done);
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(3),{timeout:5000});
+    await new Promise(r=>setTimeout(r,500));
+    expect(done.mock.calls.map(([,m])=>m.content)).toEqual(['PARENT-STARTED','PARENT-WOKE CHILD-PONG','PARENT-WOKE CHILD-PONG']);
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(1);
+  });
+  it('does not mistake a previous late ACP reply for a new foreground successor child wake',async()=>{
+    const {provider,root,requests}=await setup('native-child-late');const id=await route(provider),messages:string[]=[],nativeSteps:number[]=[];
+    provider.onComplete((_,m)=>{
+      messages.push(m.content??'');
+      if(m.content==='PARENT-WOKE CHILD-PONG') {
+        const file=path.join(root,'.gemini/antigravity-cli/brain/native-1/.system_generated/logs/transcript_full.jsonl');
+        nativeSteps.push(Math.max(...readFileSync(file,'utf8').trim().split('\n').map(line=>JSON.parse(line).step_index)));
+      }
+    });
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(messages).toHaveLength(2));
+    await provider.send(id,'immediate successor');await vi.waitFor(()=>expect(messages).toHaveLength(4));
+    await new Promise(r=>setTimeout(r,500));
+    expect(nativeSteps).toEqual([5,11]);
+    expect(messages).toHaveLength(4);expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(2);
+  });
+  it('releases divergent ACP streaming and retains repeated independent responses after consuming an old receipt',async()=>{
+    const {provider}=await setup('native-child-log');const id=await route(provider),done=vi.fn(),deltas=vi.fn();provider.onComplete(done);provider.onDelta(deltas);
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2));
+    const native=(provider as any).sessions.get(id).acpSessionId;
+    const update=(update:any)=>(provider as any).handleSessionUpdate({sessionId:native,update});
+    update({sessionUpdate:'agent_message_chunk',content:{type:'text',text:'Different response'}});
+    expect(deltas.mock.calls.at(-1)[1].delta).toBe('Different response');
+    update({sessionUpdate:'turn_completed'});expect(done).toHaveBeenCalledTimes(3);
+    update({sessionUpdate:'agent_message_chunk',content:{type:'text',text:'PARENT-WOKE CHILD-PONG'}});
+    update({sessionUpdate:'turn_completed'});expect(done).toHaveBeenCalledTimes(4);
+  });
+  it.each(['stop','rebind'])('discards native-first late ACP receipts across %s',async action=>{
+    const {provider}=await setup('native-child-late');const id=await route(provider),done=vi.fn();provider.onComplete(done);
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2));
+    if(action==='stop') await provider.cancel(id);else await route(provider,id,{fresh:true});
+    await new Promise(r=>setTimeout(r,600));expect(done).toHaveBeenCalledTimes(2);
   });
   it('reuses a completed native child cursor after send_message without replaying its old terminal',async()=>{
     const {provider,requests}=await setup('native-child-reuse');const id=await route(provider),done=vi.fn(),events:ToolCallEvent[]=[];

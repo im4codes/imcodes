@@ -165,6 +165,9 @@ process.stdin.on('data', (d) => {
         ['send_message', {conversationId:'child-b',prompt:'try again'}, {}],
         ['manage_subagents', {action:'kill',conversationId:'child-b'}, {}],
         ['browser_subagent', {prompt:'inspect local page'}, {conversationId:'browser-c',status:'completed'}],
+        ['invoke_subagent', {Subagents:[{Role:'MultiOne',Prompt:'first member'},{Role:'MultiTwo',Prompt:'second member'}]}, {subagents:[{conversationId:'multi-one',status:'running',role:'MultiOne'},{conversationId:'multi-two',status:'running',role:'MultiTwo'}]}],
+        ['manage_subagents', {action:'list'}, {subagents:[{conversationId:'multi-one',status:'completed',role:'MultiOne'},{conversationId:'multi-two',status:'failed',role:'MultiTwo'}]}],
+
       ];
       for (const [name,parameters,output] of ops) {
         const idx=step++;
@@ -1009,6 +1012,14 @@ describe('AgySdkProvider (fake agy process)', () => {
     const child=events.filter(t=>t.detail?.meta?.agentPath==='child-a');
     expect(new Set(child.map(t=>t.id)).size).toBe(1); expect(child.at(-1)?.detail?.meta?.terminal).toBe(true);
     expect(events.some(t=>t.detail?.input?.description==='find info')).toBe(true);
+    const one=events.filter(t=>t.detail?.meta?.agentName==='MultiOne');
+    const two=events.filter(t=>t.detail?.meta?.agentName==='MultiTwo');
+    expect(one.length).toBeGreaterThan(2);expect(two.length).toBeGreaterThan(2);
+    expect(new Set(one.map(t=>t.id)).size).toBe(1);expect(new Set(two.map(t=>t.id)).size).toBe(1);
+    expect(one[0].id).not.toBe(two[0].id);
+    expect(one.at(-1)?.detail?.meta?.normalizedStatus).toBe(SDK_SUBAGENT_STATUS.COMPLETE);
+    expect(two.at(-1)?.detail?.meta?.normalizedStatus).toBe(SDK_SUBAGENT_STATUS.ERROR);
+
   });
   it('emits subagent tool call with normalized SdkSubagentDetail for invoke_subagent', async () => {
     const sid = await provider.createSession({ sessionKey: 'subagent-sess', cwd: dir });

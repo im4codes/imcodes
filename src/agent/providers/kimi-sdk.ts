@@ -291,7 +291,13 @@ interface KimiSdkSessionState {
   agyNativeToolOrder?: Array<{name:string;input:unknown;step:number;index:number}>;
   agyReactive?: boolean;
   agyPendingResponses?: Map<number, AgyTranscriptRow>;
-  agyNativeAcks?: string[];
+  // One-use, owner-local turn receipts. Text is a matching check within the
+  // ordered turn ledger, never a permanent/global content identity.
+  agyNativeAcks?: Array<{generation:number;text:string}>;
+  agyNativeDelivered?: Array<{step:number;text:string}>;
+  agyLateAcpUpdates?: SessionUpdate[];
+  agyLateAcpText?: string;
+  agyReplayingLateAcp?: boolean;
   agyBridging?: boolean;
   agyNativeTurnGeneration?: number;
 }
@@ -636,6 +642,7 @@ export class KimiSdkProvider implements TransportProvider {
     for (const bridge of state.agyBridges?.values() ?? []) bridge.close();
     state.agyBridges?.clear(); state.agyReactive = false;
     state.agyPendingResponses?.clear(); state.agyNativeAcks = [];
+    state.agyNativeDelivered = []; state.agyLateAcpUpdates = undefined; state.agyLateAcpText = undefined;
     state.agyPendingNativeTools?.clear(); state.agyConsumedNativeTools?.clear(); state.agyNativeToolOrder = [];
   }
 
@@ -704,7 +711,8 @@ export class KimiSdkProvider implements TransportProvider {
       // response, not every row read while a foreground RPC was pending. This
       // preserves a new child wakeup that beats the PREVIOUS RPC's delayed ack.
       const ack = state.agyNativeAcks?.[0];
-      if (ack !== undefined && ack === row.content!.trimEnd()) { state.agyNativeAcks!.shift(); continue; }
+      if (ack !== undefined && ack.text === row.content!.trimEnd()) { state.agyNativeAcks!.shift(); continue; }
+      (state.agyNativeDelivered ??= []).push({step,text:row.content!.trimEnd()});
       state.agyBridging = true;
       try {
         this.startAutonomousTurn(sessionId,state);
@@ -1388,6 +1396,9 @@ export class KimiSdkProvider implements TransportProvider {
       const terminal = new Promise<void>(resolve => { complete = resolve; });
       this.steeringRunTerminals.set(state, { terminal, complete });
     }
+    // Outstanding native receipts may still get their ACP half AFTER this
+    // foreground request. Retain them until matched or owner teardown.
+    state.agyLateAcpUpdates = undefined; state.agyLateAcpText = undefined;
     state.promptInFlight = true;
     state.promptSubmittedGeneration = null;
     (state.activePromptGenerations ??= new Set()).add(generation);
@@ -1822,7 +1833,7 @@ export class KimiSdkProvider implements TransportProvider {
     }
     this.clearStatus(sessionId, state);
     if (this.id === AGY_SDK_PROVIDER_ID && state.agyBridges?.size) {
-      if (nativeAutonomous && state.currentText.trim()) (state.agyNativeAcks ??= []).push(state.currentText.trimEnd());
+      if (nativeAutonomous && state.currentText.trim()) (state.agyNativeAcks ??= []).push({generation,text:state.currentText.trimEnd()});
       const bridge = state.agyBridges.get(state.acpSessionId!);
       void bridge?.flush().finally(() => this.deliverAgyPendingResponses(sessionId,state));
     }
@@ -1923,6 +1934,44 @@ export class KimiSdkProvider implements TransportProvider {
     for (const cb of this.completeCallbacks) cb(sessionId, msg);
   }
 
+  /** Native-first counterpart to agyNativeAcks. A late ACP stream may be
+   * the SAME already-delivered native step. Buffer only while such a receipt
+   * exists; release immediately if its chunks diverge, or consume one receipt
+   * at turn_completed. ACP-first ordinary streaming is unchanged. */
+  private captureAgyLateAutonomousUpdate(state: KimiSdkSessionState, params: SessionNotification): boolean {
+    if (this.id !== AGY_SDK_PROVIDER_ID || state.agyReplayingLateAcp || state.cancelled || state.stoppedByCancel) return false;
+    const update = params.update as SessionUpdate;
+    const kind = (update as {sessionUpdate:string}).sessionUpdate;
+    const scoped = ['agent_message_chunk','agent_thought_chunk','tool_call','tool_call_update','usage_update','plan'].includes(kind);
+    if (!state.agyLateAcpUpdates) {
+      if (!scoped || state.promptInFlight || !state.agyNativeDelivered?.length) return false;
+      state.agyLateAcpUpdates = []; state.agyLateAcpText = '';
+    }
+    if (!scoped && kind !== 'turn_completed') return false;
+    if (scoped) state.agyLateAcpUpdates.push(update);
+    const chunk = update.sessionUpdate === 'agent_message_chunk' ? extractTextFromContent(update.content) : '';
+    const offset = state.agyLateAcpText?.length ?? 0;
+    const text = state.agyLateAcpText = (state.agyLateAcpText ?? '') + chunk;
+    const receipt = state.agyNativeDelivered?.[0];
+    if (kind === 'turn_completed' && receipt?.text === text.trimEnd()) {
+      state.agyNativeDelivered!.shift(); state.agyLateAcpUpdates = undefined; state.agyLateAcpText = undefined;
+      return true; // No second generation, delta, completion or prompt.
+    }
+    if (kind !== 'turn_completed' && receipt && (receipt.text.startsWith(chunk,offset)
+      || text.length >= receipt.text.length && text.trimEnd() === receipt.text)) return true;
+    const buffered = state.agyLateAcpUpdates;
+    state.agyLateAcpUpdates = undefined; state.agyLateAcpText = undefined;
+    // A different ordered ACP turn supersedes unmatched old receipts. Do not
+    // suppress a later independent turn merely because it repeats old text.
+    state.agyNativeDelivered = [];
+    state.agyReplayingLateAcp = true;
+    try {
+      for (const item of buffered) this.handleSessionUpdate({...params,update:item});
+      if (kind === 'turn_completed') this.handleSessionUpdate(params);
+    } finally { state.agyReplayingLateAcp = false; }
+    return true;
+  }
+
   // ── sessionUpdate dispatch ──────────────────────────────────────────────
 
   private handleSessionUpdate(params: SessionNotification): void {
@@ -1940,6 +1989,7 @@ export class KimiSdkProvider implements TransportProvider {
     if (state.replaying) {
       return;
     }
+    if (this.captureAgyLateAutonomousUpdate(state, params)) return;
     const updateRecord = update as unknown as Record<string, unknown>;
     if (this.id === AGY_SDK_PROVIDER_ID && isSdkRuntimeSubagentEventName(updateRecord.sessionUpdate)) {
       for (const event of (state.agySubagents ??= new AgySubagentTracker(state.acpSessionId ?? routeId)).snapshot(updateRecord)) {

@@ -349,6 +349,17 @@ export class TransportQueueStore {
         PRIMARY KEY (session_name, client_message_id)
       );
 
+      -- Logical system registrations survive native/runtime replacement. They
+      -- are private material, never a queue projection or public session DTO.
+      CREATE TABLE IF NOT EXISTS session_system_contracts (
+        session_name TEXT NOT NULL,
+        session_instance_id TEXT NOT NULL,
+        owner_key TEXT NOT NULL,
+        contract_id TEXT NOT NULL,
+        body TEXT NOT NULL,
+        PRIMARY KEY (session_name, session_instance_id, owner_key, contract_id)
+      );
+
       CREATE TABLE IF NOT EXISTS queue_private_material (
         session_name TEXT NOT NULL,
         client_message_id TEXT NOT NULL,
@@ -514,6 +525,39 @@ export class TransportQueueStore {
         diagnostic,
       };
     }
+  }
+
+  /** The native runtime epoch is intentionally NOT a read key: /clear and
+   * daemon restore recreate it. Logical instance + known scope are the owner. */
+  readSessionSystemContracts(sessionName: string, instance: string, owner: string): Map<string,string> {
+    const live = getSession(sessionName);
+    if (live?.sessionInstanceId && live.sessionInstanceId !== instance) return new Map();
+    const rows = this.db.prepare(`SELECT contract_id AS id, body FROM session_system_contracts
+      WHERE session_name = ? AND session_instance_id = ? AND owner_key = ?`).all(sessionName,instance,owner) as Array<{id:string;body:string}>;
+    return new Map(rows.map(row => [row.id,row.body]));
+  }
+
+  /** Registration/replacement/withdrawal is atomic and durable BEFORE provider
+   * admission. An old runtime may not resurrect a withdrawn registration. */
+  writeSessionSystemContracts(sessionName: string, instance: string, owner: string,
+    epoch: string | undefined, contracts: ReadonlyArray<{contractId:string;body:string}>): void {
+    const live = getSession(sessionName);
+    if (live && (live.sessionInstanceId !== instance || epoch && live.runtimeEpoch !== epoch)) {
+      throw new Error('System contract registration belongs to a replaced session runtime');
+    }
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const contract of contracts) {
+        if (contract.body.trim()) this.db.prepare(`INSERT INTO session_system_contracts
+          (session_name,session_instance_id,owner_key,contract_id,body) VALUES (?,?,?,?,?)
+          ON CONFLICT(session_name,session_instance_id,owner_key,contract_id) DO UPDATE SET body=excluded.body`)
+          .run(sessionName,instance,owner,contract.contractId,contract.body);
+        else this.db.prepare(`DELETE FROM session_system_contracts WHERE session_name = ?
+          AND session_instance_id = ? AND owner_key = ? AND contract_id = ?`)
+          .run(sessionName,instance,owner,contract.contractId);
+      }
+      this.db.exec('COMMIT');
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
 
   private deleteSessionQueueStateRows(sessionName: string): Omit<DiscardTransportQueueStateResult, 'rebound'> {

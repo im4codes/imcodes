@@ -146,11 +146,19 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
           const childDir=`${process.env.HOME}/.gemini/antigravity-cli/brain/${childId}/.system_generated/logs`;fs.mkdirSync(childDir,{recursive:true});
           if(pass===1) fs.writeFileSync(childDir+'/transcript_full.jsonl',row(0,'PLANNER_RESPONSE','CHILD-PONG'));
           else fs.appendFileSync(childDir+'/transcript_full.jsonl',row(1,'USER_INPUT','next assignment')+row(2,'PLANNER_RESPONSE','REUSE-PONG'));
-          if(scenario==='native-child-both') {
-            note(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'PARENT-WOKE CHILD-PONG'}});
+          if(scenario==='native-child-both' || scenario==='native-child-late' || scenario==='native-child-late-chunks' || scenario==='native-child-same-twice') {
+            if(scenario==='native-child-both') note(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'PARENT-WOKE CHILD-PONG'}});
+            else setTimeout(()=>{
+              note(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'PARENT-WOKE '}});
+              setTimeout(()=>{note(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'CHILD-PONG'}});note(p.sessionId,{sessionUpdate:'turn_completed'});},scenario==='native-child-late-chunks'?80:0);
+            },200);
           }
           fs.appendFileSync(file,row(offset+4,'SYSTEM_MESSAGE','[Message] sender='+childId+' content=CHILD-PONG')+row(offset+5,'PLANNER_RESPONSE','PARENT-WOKE CHILD-PONG',{input_tokens:120,cache_read_tokens:80,output_tokens:3}));
           if(scenario==='native-child-both') note(p.sessionId,{sessionUpdate:'turn_completed'});
+          if(scenario==='native-child-same-twice') setTimeout(()=>{
+            fs.appendFileSync(file,row(offset+6,'SYSTEM_MESSAGE','[Message] sender='+childId+' content=another result')+row(offset+7,'PLANNER_RESPONSE','PARENT-WOKE CHILD-PONG'));
+            setTimeout(()=>{note(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'PARENT-WOKE CHILD-PONG'}});note(p.sessionId,{sessionUpdate:'turn_completed'});},200);
+          },500);
         },180);
         return;
       }
@@ -164,6 +172,9 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
         ['send_message', {conversationId:'child-b',prompt:'try again'}, {}],
         ['manage_subagents', {action:'kill',conversationId:'child-b'}, {}],
         ['browser_subagent', {prompt:'inspect local page'}, {conversationId:'browser-c',status:'completed'}],
+        ['invoke_subagent', {Subagents:[{Role:'MultiOne',Prompt:'first member'},{Role:'MultiTwo',Prompt:'second member'}]}, {subagents:[{conversationId:'multi-one',status:'running',role:'MultiOne'},{conversationId:'multi-two',status:'running',role:'MultiTwo'}]}],
+        ['manage_subagents', {action:'list'}, {subagents:[{conversationId:'multi-one',status:'completed',role:'MultiOne'},{conversationId:'multi-two',status:'failed',role:'MultiTwo'}]}],
+
       ];
         for (const [i,[title,rawInput,rawOutput]] of ops.entries()) {
           note(p.sessionId, {sessionUpdate:'tool_call',toolCallId:`child-tool-${i}`,title,kind:'other',status:'in_progress',rawInput});

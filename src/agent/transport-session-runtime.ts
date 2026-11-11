@@ -644,6 +644,9 @@ export class TransportSessionRuntime implements SessionRuntime {
   // Message-side AG has no native system slot: keep the full registered body
   // stable as assembly input, while the adapter transmits it only on invalidation.
   private _agyRegisteredSystemContracts = new Map<string, string>();
+  private _agySystemContractOwner?: string;
+  private _agySystemContractInstance?: string;
+  private _agySystemContractEpoch?: string;
   private _agentId: string | undefined;
   private _effort: TransportEffortLevel | undefined;
   private _contextNamespace: ContextNamespace | undefined;
@@ -1282,6 +1285,14 @@ export class TransportSessionRuntime implements SessionRuntime {
   ): void {
     const exact = sessionName.trim();
     if (!exact) return;
+    if (this._sessionIdentity && this._sessionIdentity.sessionName !== exact) {
+      if (this._agyRegisteredSystemContracts.size && this._agySystemContractInstance && this._agySystemContractOwner) {
+        getTransportQueueStore().writeSessionSystemContracts(this.sessionKey,this._agySystemContractInstance,
+          this._agySystemContractOwner,this._agySystemContractEpoch,
+          [...this._agyRegisteredSystemContracts.keys()].map(contractId => ({contractId,body:''})));
+      }
+      this._agyRegisteredSystemContracts.clear();
+    }
     // `role` is the authoritative session-record value. It gates the per-turn
     // Brain delegation contract, so it must never be derived from sessionName.
     this._sessionIdentity = {
@@ -2741,7 +2752,23 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._initializingProviderSessionId = config.bindExistingKey ?? config.sessionKey;
     try {
       this._providerSessionId = await this.provider.createSession(config);
-      this._agyRegisteredSystemContracts.clear();
+      // The bodies belong to the logical owner, not the native conversation.
+      // clear/reset/restart replace the latter and invalidate only injection.
+      const ns = config.contextNamespace;
+      const owner = JSON.stringify([this.sessionKey, config.sessionName, config.sessionInstanceId,
+        config.serverId, config.projectName, config.cwd, ns?.scope, ns?.localTenant,
+        ns?.userId, ns?.projectId, ns?.workspaceId, ns?.enterpriseId, ns?.canonicalRepoId]);
+      if (this._agySystemContractOwner !== owner) this._agyRegisteredSystemContracts.clear();
+      // Set the canonical identity before hydrating the new owner's bodies;
+      // switching identities must not withdraw that new owner's saved source.
+      if (config.sessionName) this.setSessionIdentity(config.sessionName,config.label);
+      this._agySystemContractOwner = owner;
+      this._agySystemContractInstance = this.provider.id === AGY_SDK_PROVIDER_ID ? config.sessionInstanceId : undefined;
+      this._agySystemContractEpoch = config.runtimeEpoch;
+      if (this._agySystemContractInstance) {
+        this._agyRegisteredSystemContracts = getTransportQueueStore().readSessionSystemContracts(
+          this.sessionKey,this._agySystemContractInstance,owner);
+      }
       if (this.provider.id === AGY_SDK_PROVIDER_ID) this.provider.refreshSessionSystemText?.(this._providerSessionId);
       this._brainContractRegisteredVariant = null;
       this._registeredSystemContractSignatures.clear();
@@ -2756,9 +2783,6 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._identityPrompt = config.identityPrompt?.trim() || undefined;
     // Capture identity for assembly-time injection. Daemon-injected and
     // NOT subject to the user-authored cap — see p2p audit 37bfbb85-430 N-A.
-    if (config.sessionName) {
-      this.setSessionIdentity(config.sessionName, config.label);
-    }
     this._projectDir = config.cwd;
     this._agentId = config.agentId;
     this._effort = config.effort;
@@ -4896,7 +4920,17 @@ export class TransportSessionRuntime implements SessionRuntime {
         ))
         ;
       if (this.provider.id === AGY_SDK_PROVIDER_ID) {
-        for (const contract of activeContracts) this._agyRegisteredSystemContracts.set(contract.contractId, contract.body);
+        const changes = activeContracts.filter(contract => this._agyRegisteredSystemContracts.get(contract.contractId) !== contract.body);
+        if (changes.length && this._agySystemContractInstance && this._agySystemContractOwner) {
+          getTransportQueueStore().writeSessionSystemContracts(this.sessionKey,this._agySystemContractInstance,
+            this._agySystemContractOwner,this._agySystemContractEpoch,changes);
+        }
+        for (const contract of activeContracts) {
+          // Explicit empty replacement withdraws this registration; reset must
+          // not resurrect its previous body.
+          if (contract.body.trim()) this._agyRegisteredSystemContracts.set(contract.contractId, contract.body);
+          else this._agyRegisteredSystemContracts.delete(contract.contractId);
+        }
       }
       const registeredSystemContractText = this.provider.id === AGY_SDK_PROVIDER_ID
         ? [...this._agyRegisteredSystemContracts.values()].join('\n\n') || undefined

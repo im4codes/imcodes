@@ -33,4 +33,27 @@ describe('AG native child lifecycle adapter', () => {
     const another=new AgySubagentTracker('other-parent');
     expect(another.tool({id:'add',name:'swarm',input:{action:'add',conversationId:'worker'},status:'running'})[0].id).not.toBe(started.id);
   });
+  it.each(['batch','split','reverse roles'])('keeps multi-member launch slots unique through %s results and independent terminals', mode=>{
+    const t=new AgySubagentTracker('parent');
+    const launch={id:'multi',name:'invoke_subagent',status:'running' as const,input:{Subagents:[{Role:'One',Prompt:'task-one'},{Role:'Two',Prompt:'task-two'},{Role:'Three',Prompt:'task-three'}]}};
+    const started=t.tool(launch);const keys=started.map(e=>e.id);expect(new Set(keys).size).toBe(3);
+    expect(t.tool(launch).map(e=>e.id)).toEqual(keys);
+    const rows=[{conversationId:'one',role:'One',status:'running'},{conversationId:'two',role:'Two',status:'running'},{conversationId:'three',role:'Three',status:'running'}];
+    if(mode==='batch') expect(t.tool({...launch,status:'complete',output:JSON.stringify({subagents:rows})}).map(e=>e.id)).toEqual(keys);
+    else for(const row of mode==='reverse roles'?[...rows].reverse():rows) {
+      const index=rows.indexOf(row);expect(t.tool({...launch,status:'complete',output:JSON.stringify(row)})[0].id).toBe(keys[index]);
+    }
+    expect(t.tool(launch).map(e=>e.id)).toEqual(keys);
+    expect(t.snapshot({conversationId:'one',status:'completed'})[0].id).toBe(keys[0]);
+    expect(t.snapshot({conversationId:'two',status:'error'})[0]).toMatchObject({id:keys[1],status:'error'});
+    expect(t.interrupt().map(e=>e.id)).toEqual([keys[2]]);
+    expect(t.snapshot({conversationId:'three',status:'running'})).toEqual([]);
+  });
+  it('binds split anonymous native results in unbound slot order without overwriting members',()=>{
+    const t=new AgySubagentTracker('parent');const input={Subagents:[{Role:'One'},{Role:'Two'}]};
+    const start=t.tool({id:'m',name:'invoke_subagent',status:'running',input});
+    for(const [i,id] of ['native-one','native-two'].entries()) expect(t.tool({id:'m',name:'invoke_subagent',status:'complete',input,output:JSON.stringify({conversationId:id,status:'running'})})[0].id).toBe(start[i].id);
+    expect(t.interrupt().map(e=>e.id)).toEqual(start.map(e=>e.id));
+  });
+
 });

@@ -159,6 +159,29 @@ describe('TransportSessionRuntime memory provenance', () => {
       compact=true;expect(await next()).toBe(first);expect(provider.refreshSessionSystemText).toHaveBeenCalledTimes(before+1);
       runtime.setAgentId('b');expect(await next()).toBe(first);
       expect(provider.checkSessionCompaction).toHaveBeenCalledTimes(5);
+      for (const extra of [{},{fresh:true},{fresh:true,startupMemoryAlreadyInjected:false},{startupMemoryAlreadyInjected:true},{runtimeEpoch:"new-native-runtime"}]) {
+        await runtime.initialize({sessionKey:'deck_ag_contract',systemPrompt:'Full original system',agentId:'b',...extra});
+        expect(await next()).toBe(first);expect(await next()).toBe(first);
+      }
+      // Updating/withdrawing a logical registration must survive the same
+      // initialize path, without resurrecting old bodies or leaking owners.
+      vi.mocked(provider.send).mockClear();
+      runtime.send('withdraw', 'withdraw-id',undefined,undefined,{registeredSystemContract:{contractId:'dynamic',signature:'revoked',body:''}});
+      await waitForProviderSend(provider);
+      complete?.('provider-session-1',{id:'withdraw-done',sessionId:'provider-session-1',kind:'text',role:'assistant',content:'ok',timestamp:Date.now(),status:'complete'});
+      await vi.waitFor(()=>expect(runtime.getStatus()).toBe('idle'));
+      await runtime.initialize({sessionKey:'deck_ag_contract',systemPrompt:'Full original system',agentId:'b'});
+      expect(await next()).not.toContain('ORIGINAL DYNAMIC CONTRACT');
+      await next(true);
+      await runtime.initialize({sessionKey:'deck_ag_contract',sessionInstanceId:'different-owner',systemPrompt:'Full original system',agentId:'b'});
+      expect(await next()).not.toContain('ORIGINAL DYNAMIC CONTRACT');
+      for (const owner of [{serverId:'server-b'},{contextNamespace:{scope:'project' as const,userId:'another-user',projectId:'another-project'}}]) {
+        await next(true);await runtime.initialize({sessionKey:'deck_ag_contract',systemPrompt:'Full original system',agentId:'b',...owner});
+        expect((runtime as any)._agyRegisteredSystemContracts.size).toBe(0);
+      }
+      await runtime.initialize({sessionKey:'deck_ag_contract',systemPrompt:'Full original system',agentId:'b'});
+      await next(true);runtime.setSessionIdentity('deck_other_owner',null);
+      expect(await next()).not.toContain('ORIGINAL DYNAMIC CONTRACT');
     } finally {await runtime.kill();}
   });
 

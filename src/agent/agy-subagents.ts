@@ -27,7 +27,7 @@ interface Child { key: string; id: string; name?: string; model?: string; prompt
  * Definition/list operations do not invent an active execution. */
 export class AgySubagentTracker {
   private children = new Map<string, Child>();
-  private toolChild = new Map<string, string>();
+  private unbound = new Set<string>();
   private toolChildren = new Map<string, string[]>();
   constructor(private parent: string) {}
 
@@ -75,7 +75,15 @@ export class AgySubagentTracker {
       if (!id) continue;
       const normalized = status(row.state ?? row.status ?? row.Status) ?? defaultState;
       if (!normalized) continue;
-      const placeholder = toolId ? this.toolChildren.get(toolId)?.[index] ?? (rows.length === 1 ? this.toolChild.get(toolId) : undefined) : undefined;
+      const slots = toolId ? this.toolChildren.get(toolId) : undefined;
+      const role = string(row.role, row.Role, row.name, row.TypeName);
+      // Prefer native identity, then role, then complete batch position, then
+      // the next unbound launch slot (single-result updates may arrive apart).
+      let slot = slots?.indexOf(id) ?? -1;
+      if (slot < 0 && role) slot = slots?.findIndex(key => this.unbound.has(key) && this.children.get(key)?.name === role) ?? -1;
+      if (slot < 0 && slots?.length === rows.length && this.unbound.has(slots[index])) slot = index;
+      if (slot < 0) slot = slots?.findIndex(key => this.unbound.has(key)) ?? -1;
+      const placeholder = slot >= 0 ? slots?.[slot] : undefined;
       const previous = this.children.get(id) ?? (placeholder ? this.children.get(placeholder) : undefined);
       // Unversioned late list snapshots must not revive a terminal child. A
       // new explicit send/add/invoke is handled by tool() and can start work.
@@ -85,8 +93,9 @@ export class AgySubagentTracker {
         model: string(row.model, row.Model) ?? previous?.model, prompt: previous?.prompt,
         started: previous?.started ?? Date.now(), state: normalized, toolId: previous?.toolId ?? toolId };
       if (placeholder && placeholder !== id) this.children.delete(placeholder);
+      if (placeholder) this.unbound.delete(placeholder);
+      if (slots && slot >= 0) slots[slot] = id;
       this.children.set(id, child);
-      if (toolId) this.toolChild.set(toolId, id);
       result.push(this.emit(child, action, string(row.stateDetail, row.state_detail)));
     }
     return result;
@@ -110,7 +119,8 @@ export class AgySubagentTracker {
       const kill = /^(kill|stop|cancel|terminate)$/.test(action);
       if (!launch && !definition && !target) continue;
       if (definition && tool.status === 'running') continue;
-      const id = target ?? this.toolChild.get(tool.id) ?? `${definition ? 'definition:' : ''}${tool.id}${candidates.length > 1 ? `:${i}` : ''}`;
+      const id = target ?? this.toolChildren.get(tool.id)?.[i] ?? `${definition ? 'definition:' : ''}${tool.id}${candidates.length > 1 ? `:${i}` : ''}`;
+      if (!target && !this.toolChildren.get(tool.id)?.[i]) this.unbound.add(id);
       const previous = this.children.get(id);
       const child: Child = { key: previous?.key ?? makeAgySubagentCanonicalKey(this.parent, id), id,
         name: string(row.Role, row.role, row.name, row.TypeName, row.type) ?? previous?.name,
@@ -121,7 +131,7 @@ export class AgySubagentTracker {
           : definition || (name === 'browsersubagent' && tool.status === 'complete') ? SDK_SUBAGENT_STATUS.COMPLETE
           : previous?.state ?? SDK_SUBAGENT_STATUS.RUNNING, toolId: tool.id };
       if (tool.status === 'running' && (launch || name === 'sendmessage')) child.state = SDK_SUBAGENT_STATUS.RUNNING;
-      this.children.set(id, child); this.toolChild.set(tool.id, id);
+      this.children.set(id, child);
       const ids = this.toolChildren.get(tool.id) ?? []; ids[i] = id; this.toolChildren.set(tool.id, ids);
       result.push(this.emit(child, action, tool.output));
     }
