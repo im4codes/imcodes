@@ -2,422 +2,83 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdir, mkdtemp, readFile, rm, writeFile, readdir } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { dirname, join, join as pathJoin } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 import { STREAMING_SPEECH_PLUGIN_NAME } from '../../shared/voice-recognition.js';
-// Build tooling is intentionally plain ESM so Gradle/CI do not require tsx.
 // @ts-ignore plain build script
-import { matchesAsset, prepareSpeechAssets, SPEECH_ASSETS, MODEL_REVISION, PUNCT_MODEL_REVISION } from '../../web/scripts/prepare-streaming-speech.mjs';
+import { matchesAsset, prepareSpeechAssets, SPEECH_ASSETS, MODEL_REVISION } from '../../web/scripts/prepare-streaming-speech.mjs';
 let root: string;
-afterEach(async () => { vi.useRealTimers(); if (root) await rm(root, { recursive: true, force: true }); });
+afterEach(async () => { if (root) await rm(root, { recursive: true, force: true }); });
 async function setup() { root = await mkdtemp(join(tmpdir(), 'imcodes-test-speech-')); return pathToFileURL(root + '/'); }
 const bytes = Buffer.from('offline-model');
 const digest = createHash('sha256').update(bytes).digest('hex');
 const asset = ['models/test.onnx', 'https://example.invalid/pinned/model', digest, bytes.length];
-describe('shared mobile model preparation', () => {
-  it('binds both native registrations to the shared Capacitor name', async () => {
+const modelFiles = ['conv_frontend.onnx', 'encoder.int4.onnx', 'encoder.int4.weights', 'decoder.int4.onnx', 'decoder.int4.weights', 'tokenizer/vocab.json', 'tokenizer/merges.txt', 'tokenizer/tokenizer_config.json', 'hotwords.txt'];
+
+describe('Qwen3-ASR mobile assets', () => {
+  it('pins the complete INT4 model/external weights/tokenizer/hotwords and AAR without a punctuator', async () => {
+    expect(MODEL_REVISION).toBe('9012f07ac1ce43c7e9fbd3afd8cad90fe147f88e');
+    expect(SPEECH_ASSETS).toHaveLength(10);
+    expect(SPEECH_ASSETS.map((a: any) => a[2])).toEqual([
+      'd22dc4423e0940e49884e903d2ea2f7e5567c14fc1aed97e4e26d6b8f208ef9e', '774e997d23a2f06c3f544666625c93a3b824fdd83d04c6acd88ee25f4e3b6e2e',
+      'dc66975d9be10fbd31f89c76d33dd0bf4a8059ef14da4abf545bbf9895a5293d', 'c588d2a89460315f51ca8c65dbe85a0619891500fc853e5b673e3c914c25b2d3',
+      '126c8e16074cc87250dacbf07602315e3bc5239c93ea414773b6e3a6fd4bf466', 'ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910',
+      '8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5', '4942d005604266809309cabc9f4e9cb89ce855d59b14681fdc0e1cc62ea26c4c',
+      '26feefe92ea440b2cd286ace1b4d386db86990bd6f6a95e921cdbe0c1af79b49', 'a8d09d1d32f3eb8520482c6d3d43fae674681c5b050385967c70a3c2c9bf0ee7',
+    ]);
+    expect(SPEECH_ASSETS.map((a: any) => a[0])).toEqual([...modelFiles.map(x => 'models/' + x), 'android/libs/sherpa-onnx-2.0.1.aar']);
+    expect(SPEECH_ASSETS.every((a: any) => /^[a-f\d]{64}$/.test(a[2]) && a[3] > 0)).toBe(true);
+    expect(SPEECH_ASSETS.slice(0, 8).every((a: any) => a[1].includes('/goodpixelltd/qwen3-asr-0.6b-int4-sherpa-onnx/resolve/' + MODEL_REVISION))).toBe(true);
+    expect(SPEECH_ASSETS.map((a: any) => a[3])).toEqual([44148281, 5622024, 110308864, 891837, 469962752, 2776833, 1671853, 12487, 53, 49441341]);
+    expect(await matchesAsset(new URL('../../web/plugins/streaming-speech/models/hotwords.txt', import.meta.url), SPEECH_ASSETS[8][2], 53)).toBe(true);
+  });
+  it('publishes verified files atomically, reuses them, and repairs a corrupt cached file', async () => {
+    const url = await setup(), fetcher = vi.fn(async () => new Response(bytes));
+    await prepareSpeechAssets(url, fetcher, [asset]); await prepareSpeechAssets(url, fetcher, [asset]);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    await writeFile(join(root, 'models/test.onnx'), Buffer.alloc(bytes.length));
+    await prepareSpeechAssets(url, fetcher, [asset]); expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(await matchesAsset(join(root, 'models/test.onnx'), digest, bytes.length)).toBe(true);
+  });
+  it('keeps last good files on a failed checksum and removes partial downloads', async () => {
+    const url = await setup(); await prepareSpeechAssets(url, async () => new Response(bytes), [asset]);
+    const mismatch = [...asset]; mismatch[2] = '0'.repeat(64);
+    await expect(prepareSpeechAssets(url, async () => new Response(bytes), [mismatch])).rejects.toThrow('checksum/size mismatch');
+    expect(await readFile(join(root, 'models/test.onnx'))).toEqual(bytes);
+    expect(await readdir(join(root, 'models'))).toEqual(['test.onnx']);
+  });
+  it('fails visibly on missing bundled hotwords and HTTP failure', async () => {
+    const url = await setup();
+    await expect(prepareSpeechAssets(url, vi.fn(), [['models/hotwords.txt', null, digest, bytes.length]])).rejects.toThrow('Bundled speech asset');
+    await expect(prepareSpeechAssets(url, async () => new Response('', { status: 503 }), [asset])).rejects.toThrow('HTTP 503');
+  });
+  it('retires all obsolete transducer/punctuation assets only after the replacement verifies', async () => {
+    const url = await setup(); await mkdir(join(root, 'models'));
+    const obsolete = ['encoder.int8.onnx', 'decoder.onnx', 'decoder.int8.onnx', 'joiner.int8.onnx', 'punct.int8.onnx', 'tokens.txt', 'bpe.vocab'];
+    for (const name of [...obsolete, 'unrelated.keep']) await writeFile(join(root, 'models', name), bytes);
+    await prepareSpeechAssets(url, async () => new Response(bytes), [['models/conv_frontend.onnx', 'https://example.invalid/pinned', digest, bytes.length]]);
+    expect((await readdir(join(root, 'models'))).sort()).toEqual(['conv_frontend.onnx', 'unrelated.keep']);
+  });
+  it('keeps both native contracts, bounded 20s segments, and offline API ownership aligned', async () => {
     const base = new URL('../../web/plugins/streaming-speech/', import.meta.url);
     const android = await readFile(new URL('android/src/main/java/com/imcodes/speech/StreamingSpeechPlugin.java', base), 'utf8');
     const ios = await readFile(new URL('ios/Sources/StreamingSpeechPlugin/StreamingSpeechPlugin.swift', base), 'utf8');
     expect(android).toContain(`@CapacitorPlugin(name = "${STREAMING_SPEECH_PLUGIN_NAME}"`);
     expect(ios).toContain(`jsName = "${STREAMING_SPEECH_PLUGIN_NAME}"`);
-    for (const name of ['encoder.int8.onnx', 'decoder.onnx', 'joiner.int8.onnx', 'tokens.txt', 'bpe.vocab', 'hotwords.txt', 'punct.int8.onnx']) {
-      expect(android).toContain(`"${name}"`);
-      expect(ios).toContain(`"${name}"`);
-    }
-    expect(android).toContain('setDecodingMethod("modified_beam_search")');
-    expect(ios).toContain('decodingMethod: "modified_beam_search"');
-    expect(android).toContain('setHotwordsScore(2.0f)');
-    expect(ios).toContain('hotwordsScore: 2.0');
-    expect(android).toContain('new float[SAMPLE_RATE]');
-    expect(ios).toContain('count: 16000');
-    expect(android).toContain('new float[SAMPLE_RATE / 2]');
-    expect(ios).toContain('count: 8000');
-    expect(android).not.toContain('startsWith(previous)');
-    expect(ios).not.toContain('hasPrefix(previous)');
-    expect(android).toContain('OnlineStream next = recognizer.createStream("")');
-    expect(android).not.toContain('recognizer.reset(stream)');
-    expect(ios).toContain('func startNextStream() -> Bool');
-    expect(ios).not.toContain('SherpaOnnxOnlineStreamReset(');
-    expect(android).not.toContain('getParaformer()');
-    expect(ios).not.toContain('sherpaOnnxOnlineParaformerModelConfig(');
-    // Resident recognizer + async load() warmup + immediate left-padding decodeAvailable + iOS 64 slots
-    expect(ios).toContain('DispatchSemaphore(value: 64)');
-    expect(ios).not.toContain('DispatchSemaphore(value: 8)');
-    expect(ios).toContain('private var recognizer: SpeechRecognizer?');
-    expect(ios).toContain('_ = self.ensureRecognizer()');
-    expect(ios).toContain('private final class SpeechRecognizer');
-    expect(ios).toContain('SherpaOnnxDestroyOnlineStream(warmStream)');
-    expect(ios).toMatch(/acceptWaveform\(samples: \[Float\]\(repeating: 0, count: 8000\)\)\s*\n\s*decodeAvailable\(\)/);
-    expect(ios).toMatch(/notifyListeners\("audioLevel", data: \["level": level\]\)\s*\n\s*worker\.async/);
-    expect(ios).toContain('sherpaOnnxOfflinePunctuationModelConfig');
-    expect(ios).toContain('SherpaOnnxCreateOfflinePunctuation');
-    expect(ios).toContain('SherpaOfflinePunctuationAddPunct');
-    expect(ios).toContain('SherpaOfflinePunctuationFreeText');
-    expect(ios).toContain('SherpaOnnxDestroyOfflinePunctuation');
-    expect(ios).toContain('self.unchangedSilentChunks >= 3');
-    expect(android).toContain('private OnlineRecognizer recognizer;');
-    expect(android).toContain('private OfflinePunctuation punctuator;');
-    expect(android).toContain('private OnlineRecognizer ensureRecognizer()');
-    expect(android).toContain('private OfflinePunctuation ensurePunctuator()');
-    expect(android).toContain('unchangedSilentChunks >= 3');
-    expect(android).toContain('warmStream.release();');
-    expect(android).toContain('Math.max(min * 2, SAMPLE_RATE * 2 * 6)');
-    expect(android).toContain('worker.execute(() -> capture(call, owner, audio, session));');
-    expect(android).toContain('private void stopCapture(boolean discard)');
-    expect(android).toMatch(/onAccepted\.run\(\);\s*\n\s*pcmQueue\.addLast\(samples\);/);
-    expect(android).toMatch(/stream\.acceptWaveform\(new float\[SAMPLE_RATE \/ 2\], SAMPLE_RATE\);\s*\n\s*decodeAvailable\(recognizer, stream\);/);
-    expect(android).toMatch(/next\.acceptWaveform\(new float\[SAMPLE_RATE \/ 2\], SAMPLE_RATE\);\s*\n\s*decodeAvailable\(recognizer, next\);/);
-    expect(android).toMatch(/handleOnDestroy\(\)[\s\S]*punctuator\.release\(\);[\s\S]*recognizer\.release\(\);/);
-    expect(ios).toMatch(/private func stripPunctuation\([\s\S]*?\.lowercased\(\)/);
-    expect(android).toContain('.toLowerCase(java.util.Locale.ROOT)');
+    for (const name of modelFiles) { expect(android).toContain('"' + name + '"'); expect(ios).toContain('"' + name + '"'); }
+    for (const name of ['listeningState', 'audioLevel', 'partialResults', 'recognitionError']) { expect(android).toContain('"' + name + '"'); expect(ios).toContain('"' + name + '"'); }
+    expect(ios).toContain('sherpaOnnxOfflineQwen3ASRModelConfig(maxTotalLen: 768');
+    expect(ios).toContain('SherpaOnnxDestroyOfflineStream(stream)'); expect(ios).toContain('SherpaOnnxDestroyOfflineRecognizerResult(result)');
+    expect(android).toContain('qwen.setMaxTotalLen(768)'); expect(android).toContain('new OfflineRecognizer(null, config)');
+    expect(android).toContain('getNoBackupFilesDir()'); expect(android).toContain('finally { stream.release(); }');
+    expect(ios).toContain('20 * 16000'); expect(android).toContain('20 * SAMPLE_RATE');
+    expect(ios).toContain('DispatchSemaphore(value: 64)'); expect(android).toContain('MAX_BUFFERED_CHUNKS = 64');
+    expect(ios).not.toContain('OfflinePunctuation'); expect(android).not.toContain('OfflinePunctuation');
+    expect(ios).not.toContain('OnlineStream'); expect(android).not.toContain('OnlineStream');
   });
-  it('pins the mixed-precision transducer bytes and locally maintained hotwords', async () => {
-    expect(MODEL_REVISION).toBe('98590b7ed6443e77b714204da2757d75e1a642f4');
-    expect(PUNCT_MODEL_REVISION).toBe('5cccf43af83e4fc50d1d55b8410312e87709be70');
-    expect(SPEECH_ASSETS).toHaveLength(8);
-    expect(SPEECH_ASSETS.every((a: any) => /^[a-f\d]{64}$/.test(a[2]) && (a[1] === null || a[1].startsWith('https://')))).toBe(true);
-    expect(SPEECH_ASSETS.map((a: any) => a[0])).toEqual(['models/encoder.int8.onnx', 'models/decoder.onnx', 'models/joiner.int8.onnx', 'tokens.txt'.replace(/^/, 'models/'), 'models/bpe.vocab', 'models/hotwords.txt', 'models/punct.int8.onnx', 'android/libs/sherpa-onnx-2.0.1.aar']);
-    expect(SPEECH_ASSETS[6][2]).toBe('65a3fb9f5ad7bfb96bf69e0dc4481df97f6ee60513c1d94ce981ba6effd524b1');
-    expect(SPEECH_ASSETS[6][3]).toBe(75519198);
-    expect(SPEECH_ASSETS.slice(0, 5).reduce((n: number, a: any) => n + a[3], 0)).toBe(199068769);
-    const base = new URL('../../web/plugins/streaming-speech/', import.meta.url);
-    expect(await matchesAsset(new URL('models/hotwords.txt', base), SPEECH_ASSETS[5][2], SPEECH_ASSETS[5][3])).toBe(true);
-    expect(await readFile(new URL('models/hotwords.txt', base), 'utf8')).toBe('COMMIT\nGITHUB\nGITLAB\nREACT\nTYPESCRIPT\nDOCKER\nENGLISH\n');
-  });
-  it('publishes verified files atomically, reuses them, and repairs a corrupt cached file', async () => {
-    const url = await setup(); const fetcher = vi.fn(async () => new Response(bytes));
-    await prepareSpeechAssets(url, fetcher, [asset]);
-    expect(await readFile(join(root, 'models/test.onnx'))).toEqual(bytes);
-    await prepareSpeechAssets(url, fetcher, [asset]); expect(fetcher).toHaveBeenCalledTimes(1);
-    await writeFile(join(root, 'models/test.onnx'), Buffer.alloc(bytes.length));
-    await prepareSpeechAssets(url, fetcher, [asset]); expect(fetcher).toHaveBeenCalledTimes(2);
-    expect(await matchesAsset(join(root, 'models/test.onnx'), digest, bytes.length)).toBe(true);
-  });
-  it('fails closed on corrupt downloads without overwriting the last file or retaining partials', async () => {
-    const url = await setup(); await prepareSpeechAssets(url, async () => new Response(bytes), [asset]);
-    const mismatch = [...asset]; mismatch[2] = '0'.repeat(64);
-    const result = prepareSpeechAssets(url, async () => new Response(bytes), [mismatch]);
-    const failure = expect(result).rejects.toThrow('checksum/size mismatch');
-    await failure;
-    expect(await readFile(join(root, 'models/test.onnx'))).toEqual(bytes);
-    expect(await readdir(join(root, 'models'))).toEqual(['test.onnx']);
-  });
-  it('fails visibly if bundled hotwords are missing', async () => {
-    const url = await setup();
-    await expect(prepareSpeechAssets(url, vi.fn(), [['models/hotwords.txt', null, digest, bytes.length]])).rejects.toThrow('Bundled speech asset missing/corrupt');
-  });
-  it('removes only the obsolete cached decoder when preparing the replacement', async () => {
-    const url = await setup();
-    await (await import('node:fs/promises')).mkdir(join(root, 'models'));
-    await writeFile(join(root, 'models/decoder.int8.onnx'), bytes);
-    await prepareSpeechAssets(url, async () => new Response(bytes), [['models/decoder.onnx', 'https://example.invalid/model', digest, bytes.length]]);
-    expect(await readdir(join(root, 'models'))).toEqual(['decoder.onnx']);
-  });
-});
-
-describe('native stream segment concatenation and lifecycle semantics', () => {
-  function join(previous: string, text: string): string {
-    if (!previous) return text;
-    if (!text) return previous;
-    const asciiBoundary = previous.charCodeAt(previous.length - 1) < 128 && text.charCodeAt(0) < 128;
-    return previous + (asciiBoundary ? ' ' : '') + text;
-  }
-
-  it('correctly handles exact identical repeated segments without swallow', () => {
-    expect(join('你好', '你好')).toBe('你好你好');
-    expect(join('COMMIT', 'COMMIT')).toBe('COMMIT COMMIT');
-  });
-
-  it('correctly joins prefix overlap across endpoints without dropping earlier segment', () => {
-    expect(join('COMMIT', 'COMMIT TO GITHUB')).toBe('COMMIT COMMIT TO GITHUB');
-    expect(join('你好', '你好世界')).toBe('你好你好世界');
-  });
-
-  it('preserves ASCII boundary spacing between English and non-ASCII Chinese', () => {
-    expect(join('HELLO', 'WORLD')).toBe('HELLO WORLD');
-    expect(join('你好', '世界')).toBe('你好世界');
-    expect(join('你好', 'world')).toBe('你好world');
-    expect(join('hello', '世界')).toBe('hello世界');
-    expect(join('COMMIT', 'TO GITHUB')).toBe('COMMIT TO GITHUB');
-  });
-
-  it('handles empty segments, empty previous, and stop transitions cleanly', () => {
-    expect(join('', '')).toBe('');
-    expect(join('', 'hello')).toBe('hello');
-    expect(join('hello', '')).toBe('hello');
-  });
-
-  it('simulates multi-stream speech session without duplicate partials or swallowed repeated utterances', () => {
-    let committed = '';
-    let last = '';
-    const emittedPartials: string[] = [];
-
-    function onPartial(activeStreamText: string) {
-      const full = join(committed, activeStreamText.trim());
-      if (full !== last) {
-        emittedPartials.push(full);
-        last = full;
-      }
-      return full;
-    }
-
-    function onEndpoint(activeStreamFinalText: string) {
-      const full = join(committed, activeStreamFinalText.trim());
-      committed = full;
-    }
-
-    // Stream 1: User says "你好"
-    onPartial('你');
-    onPartial('你好');
-    onEndpoint('你好');
-    expect(committed).toBe('你好');
-
-    // Stream 2: After a pause, user says "你好" again
-    onPartial('你');
-    expect(last).toBe('你好你');
-    onPartial('你好');
-    expect(last).toBe('你好你好');
-    onEndpoint('你好');
-    expect(committed).toBe('你好你好');
-
-    // Stream 3: User says "COMMIT"
-    onPartial('COM');
-    onPartial('COMMIT');
-    onEndpoint('COMMIT');
-    expect(committed).toBe('你好你好COMMIT');
-
-    // Stream 4: User says "COMMIT TO GITHUB"
-    onPartial('COMMIT');
-    expect(last).toBe('你好你好COMMIT COMMIT');
-    onPartial('COMMIT TO GITHUB');
-    expect(last).toBe('你好你好COMMIT COMMIT TO GITHUB');
-    // Stop called: final stop flushes and commits final segment
-    const finalResult = join(committed, 'COMMIT TO GITHUB');
-    expect(finalResult).toBe('你好你好COMMIT COMMIT TO GITHUB');
-  });
-
-  it('reuses a single resident recognizer across sessions, drains 0.5s left-padding before capture, and releases recognizer only on destroy', () => {
-    const events: string[] = [];
-    let recognizerCount = 0;
-    let recognizerReleased = 0;
-    let streamSeq = 0;
-
-    interface MockStream {
-      id: number;
-      pendingSamples: number;
-      released: boolean;
-      acceptWaveform(samplesCount: number): void;
-      isReady(): boolean;
-      decode(): void;
-      release(): void;
-    }
-
-    class MockRecognizer {
-      readonly id = ++recognizerCount;
-      released = false;
-      constructor() {
-        events.push(`recognizer.create#${this.id}`);
-      }
-      createStream(): MockStream {
-        const id = ++streamSeq;
-        events.push(`stream.create#${id}`);
-        return {
-          id,
-          pendingSamples: 0,
-          released: false,
-          acceptWaveform(samplesCount: number) {
-            this.pendingSamples += samplesCount;
-            events.push(`stream#${id}.accept(${samplesCount})`);
-          },
-          isReady() {
-            return this.pendingSamples >= 4000;
-          },
-          decode() {
-            this.pendingSamples = Math.max(0, this.pendingSamples - 4000);
-            events.push(`stream#${id}.decode`);
-          },
-          release() {
-            if (!this.released) {
-              this.released = true;
-              events.push(`stream.release#${id}`);
-            }
-          },
-        };
-      }
-      release() {
-        if (!this.released) {
-          this.released = true;
-          recognizerReleased++;
-          events.push(`recognizer.release#${this.id}`);
-        }
-      }
-    }
-
-    let resident: MockRecognizer | null = null;
-    let activeStream: MockStream | null = null;
-
-    function decodeAvailable(stream: MockStream) {
-      while (stream.isReady()) stream.decode();
-    }
-
-    function ensureRecognizer(): MockRecognizer {
-      if (resident) return resident;
-      const created = new MockRecognizer();
-      const warmStream = created.createStream();
-      warmStream.acceptWaveform(8000);
-      decodeAvailable(warmStream);
-      warmStream.release();
-      resident = created;
-      return resident;
-    }
-
-    function load() {
-      ensureRecognizer();
-    }
-
-    function startCapture() {
-      const rec = ensureRecognizer();
-      const stream = rec.createStream();
-      stream.acceptWaveform(8000);
-      decodeAvailable(stream);
-      events.push('audioEngine.start');
-      activeStream = stream;
-    }
-
-    function endCapture() {
-      if (activeStream) {
-        activeStream.acceptWaveform(16000);
-        decodeAvailable(activeStream);
-        activeStream.release();
-        activeStream = null;
-      }
-    }
-
-    function destroyPlugin() {
-      endCapture();
-      if (resident) {
-        resident.release();
-        resident = null;
-      }
-    }
-
-    // 1. Plugin load() preloads and warms up recognizer before user taps mic
-    load();
-    expect(recognizerCount).toBe(1);
-    expect(recognizerReleased).toBe(0);
-    expect(events).toEqual([
-      'recognizer.create#1',
-      'stream.create#1',
-      'stream#1.accept(8000)',
-      'stream#1.decode',
-      'stream#1.decode',
-      'stream.release#1',
-    ]);
-
-    // 2. First mic start reuses recognizer#1, drains 8000 left-padding BEFORE audioEngine.start, and endCapture keeps recognizer#1 alive
-    events.length = 0;
-    startCapture();
-    expect(recognizerCount).toBe(1);
-    expect(activeStream?.pendingSamples).toBe(0);
-    expect(events).toEqual([
-      'stream.create#2',
-      'stream#2.accept(8000)',
-      'stream#2.decode',
-      'stream#2.decode',
-      'audioEngine.start',
-    ]);
-    endCapture();
-    expect(recognizerReleased).toBe(0);
-
-    // 3. Second mic start still reuses recognizer#1 without reloading 198MB model
-    events.length = 0;
-    startCapture();
-    expect(recognizerCount).toBe(1);
-    endCapture();
-    expect(recognizerReleased).toBe(0);
-
-    // 4. Plugin destroy releases resident recognizer#1
-    destroyPlugin();
-    expect(recognizerReleased).toBe(1);
-  });
-
-  it('captures and buffers initial speech immediately while model warmup is still in flight on the serial worker', () => {
-    const timeline: string[] = [];
-    const workerQueue: Array<() => void> = [];
-    const emittedPartials: string[] = [];
-    let decoderReady = false;
-    const decodedChunks: string[] = [];
-
-    function enqueueWorker(task: () => void) {
-      workerQueue.push(task);
-    }
-
-    function drainWorker() {
-      while (workerQueue.length > 0) {
-        const next = workerQueue.shift()!;
-        next();
-      }
-    }
-
-    // 1. Plugin load() enqueues async model warmup on serial worker (not yet drained when user taps mic)
-    enqueueWorker(() => {
-      timeline.push('worker:load.ensureRecognizer+warmup');
-    });
-
-    // 2. User immediately taps start() before load() finishes:
-    //    start() enqueues session decoder setup on serial worker AND immediately starts mic capture on main thread
-    enqueueWorker(() => {
-      timeline.push('worker:start.sessionStream+drainLeftPadding');
-      decoderReady = true;
-    });
-    timeline.push('main:AVAudioEngine.start+listeningState:started');
-
-    // 3. User speaks "喂" -> "你好" -> "听得到吗" while worker is STILL busy warming up the model:
-    for (const chunk of ['喂', '你好', '听得到吗']) {
-      // consume() emits audioLevel immediately on tap thread and queues PCM onto serial worker
-      timeline.push(`tap:audioLevel(${chunk})`);
-      enqueueWorker(() => {
-        expect(decoderReady).toBe(true);
-        decodedChunks.push(chunk);
-        const cumulative = decodedChunks.join('');
-        emittedPartials.push(cumulative);
-        timeline.push(`worker:decode(${chunk})->${cumulative}`);
-      });
-    }
-
-    // Before worker finishes warmup, mic has already started and emitted all 3 audioLevels without dropping any buffer
-    expect(timeline).toEqual([
-      'main:AVAudioEngine.start+listeningState:started',
-      'tap:audioLevel(喂)',
-      'tap:audioLevel(你好)',
-      'tap:audioLevel(听得到吗)',
-    ]);
-    expect(emittedPartials).toEqual([]);
-
-    // 4. Serial worker finishes warmup and drains queued setup + all buffered speech chunks in exact FIFO order
-    drainWorker();
-    expect(emittedPartials).toEqual(['喂', '喂你好', '喂你好听得到吗']);
-    expect(timeline).toEqual([
-      'main:AVAudioEngine.start+listeningState:started',
-      'tap:audioLevel(喂)',
-      'tap:audioLevel(你好)',
-      'tap:audioLevel(听得到吗)',
-      'worker:load.ensureRecognizer+warmup',
-      'worker:start.sessionStream+drainLeftPadding',
-      'worker:decode(喂)->喂',
-      'worker:decode(你好)->喂你好',
-      'worker:decode(听得到吗)->喂你好听得到吗',
-    ]);
-  });
-
-  it('compiles and executes production StreamingSpeechPlugin.java across cold stop-before-warmup, warm reuse, bounded overflow, and destroy', async () => {
-    await setup();
-    const srcDir = pathJoin(root, 'src');
-    const classesDir = pathJoin(root, 'classes');
-    await mkdir(classesDir, { recursive: true });
-
+  it('compiles and executes the production Android plugin through cold/warm/stop/segmentation/overflow/destroy', async () => {
+    await setup(); const srcDir = join(root, 'src'), classesDir = join(root, 'classes'); await mkdir(classesDir, { recursive: true });
     const files: Record<string, string> = {
       'android/Manifest.java': `package android; public class Manifest { public static class permission { public static final String RECORD_AUDIO="mic"; } }`,
       'android/media/AudioFormat.java': `package android.media; public class AudioFormat { public static final int CHANNEL_IN_MONO=1, ENCODING_PCM_16BIT=2; }`,
@@ -429,10 +90,11 @@ public class AudioRecord {
   public static volatile int chunksPerStart=1;
   public static volatile int silentChunksPerStart=0;
   public static int reads=0;
+  public static volatile java.util.concurrent.CountDownLatch delivered;
   private boolean recording;
   private int remaining;
   private int silentRemaining;
-  public AudioRecord(int a,int b,int c,int d,int e){ latest=this; remaining=chunksPerStart; silentRemaining=silentChunksPerStart; }
+  public AudioRecord(int a,int b,int c,int d,int e){ latest=this; remaining=chunksPerStart; silentRemaining=silentChunksPerStart; delivered=new java.util.concurrent.CountDownLatch(remaining+silentRemaining); }
   public static int getMinBufferSize(int a,int b,int c){ return 3200; }
   public int getState(){ return STATE_INITIALIZED; }
   public synchronized int getRecordingState(){ return recording ? RECORDSTATE_RECORDING : 0; }
@@ -440,7 +102,7 @@ public class AudioRecord {
   public synchronized void stop(){ recording=false; notifyAll(); }
   public void release(){}
   public synchronized int read(short[] out,int off,int n,int mode){
-    reads++;
+    reads++; try { wait(1); } catch (InterruptedException ignored) {}
     while (remaining <= 0 && silentRemaining <= 0 && recording) {
       try { wait(); } catch (InterruptedException e) { return -1; }
     }
@@ -452,7 +114,7 @@ public class AudioRecord {
       silentRemaining--;
       java.util.Arrays.fill(out, (short) 0);
     }
-    return n;
+    delivered.countDown(); return n;
   }
 }`,
       'androidx/lifecycle/Lifecycle.java': `package androidx.lifecycle; public class Lifecycle { public enum State { RESUMED; public boolean isAtLeast(State other){ return true; } } public State getCurrentState(){ return State.RESUMED; } }`,
@@ -471,229 +133,75 @@ public class Plugin {
   public void requestPermissionForAlias(String a,PluginCall c,String callback){}
   public Context getContext(){ return new Context(); }
   public Activity getActivity(){ return new Activity(); }
-  public static class Context { public Assets getAssets(){ return new Assets(); } }
-  public static class Assets { public java.io.InputStream open(String path) throws java.io.IOException { return new java.io.ByteArrayInputStream(new byte[]{1}); } }
+  public static class Context { public Assets getAssets(){ return new Assets(); } public java.io.File getNoBackupFilesDir(){ return new java.io.File(System.getProperty("java.io.tmpdir"),"speech-private"); } }
+  public static class Assets { public java.io.InputStream open(String path) throws java.io.IOException { return new java.io.ByteArrayInputStream(path.equals("hotwords.txt") ? "COMMIT\\nGITHUB\\nENGLISH\\n".getBytes(java.nio.charset.StandardCharsets.UTF_8) : new byte[]{1}); } }
   public static class Activity { public androidx.lifecycle.Lifecycle getLifecycle(){ return new androidx.lifecycle.Lifecycle(); } }
 }`,
       'com/getcapacitor/PluginMethod.java': `package com.getcapacitor; public @interface PluginMethod{}`,
       'com/getcapacitor/annotation/CapacitorPlugin.java': `package com.getcapacitor.annotation; public @interface CapacitorPlugin{ String name(); Permission[] permissions(); }`,
       'com/getcapacitor/annotation/Permission.java': `package com.getcapacitor.annotation; public @interface Permission{ String alias(); String[] strings(); }`,
       'com/getcapacitor/annotation/PermissionCallback.java': `package com.getcapacitor.annotation; public @interface PermissionCallback{}`,
-      'com/k2fsa/sherpa/onnx/OnlineRecognizerConfig.java': `package com.k2fsa.sherpa.onnx;
-public class OnlineRecognizerConfig {
-  public Model getModelConfig(){ return new Model(); }
-  public Endpoint getEndpointConfig(){ return new Endpoint(); }
-  public void setDecodingMethod(String x){}
-  public void setHotwordsFile(String x){}
-  public void setHotwordsScore(float x){}
-  public static class Model { public Transducer getTransducer(){ return new Transducer(); } public void setTokens(String x){} public void setModelType(String x){} public void setModelingUnit(String x){} public void setBpeVocab(String x){} public void setNumThreads(int n){} }
-  public static class Transducer { public void setEncoder(String x){} public void setDecoder(String x){} public void setJoiner(String x){} }
-  public static class Endpoint { public Rule getRule2(){ return new Rule(); } public Rule getRule3(){ return new Rule(); } }
-  public static class Rule { public void setMinTrailingSilence(float x){} public void setMinUtteranceLength(float x){} }
+      'com/k2fsa/sherpa/onnx/OfflineRecognizerConfig.java': `package com.k2fsa.sherpa.onnx;
+public class OfflineRecognizerConfig {
+  private final Model model=new Model(); public Model getModelConfig(){return model;}
+  public static class Model { public void setNumThreads(int n){if(n!=2)throw new AssertionError();} public void setProvider(String p){} public Qwen getQwen3Asr(){return new Qwen();} }
+  public static class Qwen { public void setConvFrontend(String p){} public void setEncoder(String p){} public void setDecoder(String p){} public void setTokenizer(String p){} public void setMaxTotalLen(int n){if(n!=768)throw new AssertionError();} public void setMaxNewTokens(int n){} public void setTemperature(float n){} public void setTopP(float n){} public void setSeed(int n){} public void setHotwords(String s){if(!s.equals("COMMIT,GITHUB,ENGLISH"))throw new AssertionError(s);} }
 }`,
-      'com/k2fsa/sherpa/onnx/OnlineStream.java': `package com.k2fsa.sherpa.onnx;
-public class OnlineStream {
-  public String text="";
-  public static volatile String nextTranscript="synthetic utterance";
-  public static volatile int spokenSamples=0;
-  public static volatile int silentChunksAccepted=0;
-  public static volatile java.util.concurrent.CountDownLatch speech=new java.util.concurrent.CountDownLatch(1);
-  public static volatile java.util.concurrent.CountDownLatch pauseDone=new java.util.concurrent.CountDownLatch(1);
-  public void acceptWaveform(float[] data,int rate){
-    boolean nonZero = false;
-    for (float f : data) {
-      if (f != 0) {
-        nonZero = true;
-        break;
-      }
-    }
-    if (nonZero) {
-      spokenSamples += data.length;
-      text = nextTranscript;
-      speech.countDown();
-    } else if (data.length == 1600 && !text.isEmpty()) {
-      silentChunksAccepted++;
-      if (silentChunksAccepted >= 4) pauseDone.countDown();
-    }
-  }
-  public void inputFinished(){}
-  public void release(){}
+      'com/k2fsa/sherpa/onnx/OfflineStream.java': `package com.k2fsa.sherpa.onnx;
+public class OfflineStream { public float[] samples; public static int created=0,released=0,maxSamples=0; public OfflineStream(){created++;} public void acceptWaveform(float[] s,int rate){if(samples!=null||rate!=16000)throw new AssertionError(); samples=s;maxSamples=Math.max(maxSamples,s.length);} public void release(){released++;} }`,
+      'com/k2fsa/sherpa/onnx/OfflineRecognizer.java': `package com.k2fsa.sherpa.onnx;
+public class OfflineRecognizer {
+ public static java.util.concurrent.CountDownLatch entered=new java.util.concurrent.CountDownLatch(1),release=new java.util.concurrent.CountDownLatch(1),decoded=new java.util.concurrent.CountDownLatch(1);
+ public static volatile int creations=0,releases=0; public static volatile int lastSamples=0; public static volatile boolean holdDecode=false; public static java.util.concurrent.CountDownLatch decoding=new java.util.concurrent.CountDownLatch(1),decodeRelease=new java.util.concurrent.CountDownLatch(1);
+ public OfflineRecognizer(Object assets,OfflineRecognizerConfig config){if(assets!=null)throw new AssertionError("external weights require files");creations++;entered.countDown();try{release.await();}catch(InterruptedException e){throw new RuntimeException(e);}}
+ public OfflineStream createStream(){return new OfflineStream();}
+ public void decode(OfflineStream stream){lastSamples=stream.samples.length;decoded.countDown();if(holdDecode){decoding.countDown();try{decodeRelease.await();}catch(InterruptedException e){throw new RuntimeException(e);}}}
+ public Result getResult(OfflineStream stream){return new Result();}
+ public static class Result {public String getText(){return "你好 Hello.";}}
+ public void release(){releases++;}
 }`,
-      'com/k2fsa/sherpa/onnx/OnlineRecognizer.java': `package com.k2fsa.sherpa.onnx;
-public class OnlineRecognizer {
-  public static volatile java.util.concurrent.CountDownLatch entered=new java.util.concurrent.CountDownLatch(1);
-  public static volatile java.util.concurrent.CountDownLatch release=new java.util.concurrent.CountDownLatch(1);
-  public static volatile int creations=0;
-  public static volatile int releases=0;
-  public OnlineRecognizer(Object assets,OnlineRecognizerConfig config){
-    creations++;
-    entered.countDown();
-    try { release.await(); } catch (InterruptedException e) { throw new RuntimeException(e); }
-  }
-  public OnlineStream createStream(String s){ return new OnlineStream(); }
-  public boolean isReady(OnlineStream s){ return false; }
-  public void decode(OnlineStream s){}
-  public boolean isEndpoint(OnlineStream s){ return false; }
-  public void release(){ releases++; }
-  public Result getResult(OnlineStream stream){ return new Result(stream.text); }
-  public record Result(String text){ public String getText(){ return text; } }
-}`,
-      'com/k2fsa/sherpa/onnx/OfflinePunctuationModelConfig.java': `package com.k2fsa.sherpa.onnx;
-public class OfflinePunctuationModelConfig {
-  public void setCtTransformer(String x){}
-  public void setNumThreads(int n){}
-  public void setDebug(boolean b){}
-  public void setProvider(String x){}
-}`,
-      'com/k2fsa/sherpa/onnx/OfflinePunctuationConfig.java': `package com.k2fsa.sherpa.onnx;
-public class OfflinePunctuationConfig {
-  public OfflinePunctuationConfig(OfflinePunctuationModelConfig model){}
-}`,
-      'com/k2fsa/sherpa/onnx/OfflinePunctuation.java': `package com.k2fsa.sherpa.onnx;
-public class OfflinePunctuation {
-  public static volatile int creations=0;
-  public static volatile int releases=0;
-  public static volatile int calls=0;
-  public OfflinePunctuation(Object assets, OfflinePunctuationConfig config){
-    creations++;
-  }
-  public String addPunctuation(String text){
-    calls++;
-    if ("你好今天天气真好".equals(text)) return "你好，今天天气真好。";
-    return text + "。";
-  }
-  public void release(){ releases++; }
-}`,
-      'Harness.java': `import com.imcodes.speech.StreamingSpeechPlugin;
-import com.getcapacitor.PluginCall;
-import com.k2fsa.sherpa.onnx.*;
-import android.media.AudioRecord;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
-
+      'Harness.java': `import com.imcodes.speech.StreamingSpeechPlugin; import com.getcapacitor.PluginCall; import com.k2fsa.sherpa.onnx.*; import android.media.AudioRecord; import java.util.concurrent.*;
 public class Harness {
-  static class Subject extends StreamingSpeechPlugin { void destroy(){ super.handleOnDestroy(); } }
-  static void await(CountDownLatch latch){
-    try {
-      if (!latch.await(2, TimeUnit.SECONDS)) throw new AssertionError("timeout");
-    } catch (InterruptedException e) {
-      throw new RuntimeException(e);
-    }
-  }
-  public static void main(String[] args) {
-    // 1. Cold stop-before-warmup: utterance recorded while warmup is held must be drained and decoded after stop
-    Subject p = new Subject();
-    try {
-      p.load();
-      await(OnlineRecognizer.entered);
-      PluginCall start = new PluginCall();
-      p.start(start);
-      await(start.done);
-      boolean startedDuringWarmup = AudioRecord.latest.getRecordingState() == AudioRecord.RECORDSTATE_RECORDING;
-      PluginCall stop = new PluginCall();
-      p.stop(stop);
-      boolean micStoppedOnStop = AudioRecord.latest.getRecordingState() == 0;
-      OnlineRecognizer.release.countDown();
-      await(stop.done);
-      if (!startedDuringWarmup || !micStoppedOnStop || OnlineStream.spokenSamples != 1600) {
-        throw new AssertionError("COLD_STOP failed: started=" + startedDuringWarmup + " micStopped=" + micStoppedOnStop + " spoken=" + OnlineStream.spokenSamples);
-      }
-      System.out.println("COLD_STOP:" + OnlineStream.spokenSamples + ":" + p.events);
-
-      // 2. Warm positive control: reuses resident recognizer & punctuator without recreating, and normalizes uppercase BPE English tokens ("你好 HELLO WORLD") to lowercase
-      p.events.clear();
-      OnlineStream.nextTranscript = "你好 HELLO WORLD";
-      OnlineStream.speech = new CountDownLatch(1);
-      PluginCall warmStart = new PluginCall();
-      p.start(warmStart);
-      await(warmStart.done);
-      await(OnlineStream.speech);
-      PluginCall warmStop = new PluginCall();
-      p.stop(warmStop);
-      await(warmStop.done);
-      if (OnlineRecognizer.creations != 1 || OfflinePunctuation.creations != 1 || OnlineStream.spokenSamples != 3200) {
-        throw new AssertionError("WARM_POSITIVE failed: creations=" + OnlineRecognizer.creations + "/" + OfflinePunctuation.creations + " spoken=" + OnlineStream.spokenSamples);
-      }
-      System.out.println("WARM_POSITIVE:" + OnlineRecognizer.creations + ":" + OnlineStream.spokenSamples + ":" + p.events);
-
-      // 3. >=240ms (3 silent 100ms chunks) pause segmentation + same-cleanInput cache (0 extra inferences during silence)
-      p.events.clear();
-      OnlineStream.nextTranscript = "你好，今天天气真好";
-      OnlineStream.silentChunksAccepted = 0;
-      OnlineStream.pauseDone = new CountDownLatch(1);
-      AudioRecord.chunksPerStart = 1;
-      AudioRecord.silentChunksPerStart = 4;
-      int callsBeforePauseRun = OfflinePunctuation.calls;
-      PluginCall pauseStart = new PluginCall();
-      p.start(pauseStart);
-      await(pauseStart.done);
-      await(OnlineStream.pauseDone);
-      int callsDuringSilence = OfflinePunctuation.calls - callsBeforePauseRun;
-      PluginCall pauseStop = new PluginCall();
-      p.stop(pauseStop);
-      await(pauseStop.done);
-      int totalCallsForPauseRun = OfflinePunctuation.calls - callsBeforePauseRun;
-      System.out.println("PAUSE_SEGMENT:calls=" + callsDuringSilence + "/" + totalCallsForPauseRun + ":" + p.events);
-    } finally {
-      p.destroy();
-    }
-    // Wait briefly for worker shutdown after destroy
-    for (int i = 0; i < 20 && (OnlineRecognizer.releases == 0 || OfflinePunctuation.releases == 0); i++) {
-      try { Thread.sleep(10); } catch (InterruptedException ignored) {}
-    }
-    if (OnlineRecognizer.releases != 1 || OfflinePunctuation.releases != 1) {
-      throw new AssertionError("Expected resident recognizer & punctuator release on destroy, got " + OnlineRecognizer.releases + "/" + OfflinePunctuation.releases);
-    }
-
-    // 4. Bounded overflow during held warmup: >64 chunks stops mic and reports explicit error
-    OnlineRecognizer.entered = new CountDownLatch(1);
-    OnlineRecognizer.release = new CountDownLatch(1);
-    AudioRecord.chunksPerStart = 70;
-    AudioRecord.silentChunksPerStart = 0;
-    Subject p2 = new Subject();
-    try {
-      p2.load();
-      await(OnlineRecognizer.entered);
-      PluginCall s2 = new PluginCall();
-      p2.start(s2);
-      await(s2.done);
-      for (int i = 0; i < 100 && AudioRecord.latest.getRecordingState() == AudioRecord.RECORDSTATE_RECORDING; i++) {
-        try { Thread.sleep(5); } catch (InterruptedException ignored) {}
-      }
-      OnlineRecognizer.release.countDown();
-      PluginCall stop2 = new PluginCall();
-      p2.stop(stop2);
-      await(stop2.done);
-      System.out.println("OVERFLOW:" + p2.events);
-    } finally {
-      p2.destroy();
-    }
-  }
+ static class Subject extends StreamingSpeechPlugin {void destroy(){handleOnDestroy();}}
+ static void await(CountDownLatch l)throws Exception{if(!l.await(4,TimeUnit.SECONDS))throw new AssertionError("timeout");}
+ static void check(boolean b,Object message){if(!b)throw new AssertionError(message);}
+ static long finals(Subject p){return p.events.stream().filter(x->x.contains("isFinal=true")).count();}
+ public static void main(String[] args)throws Exception {
+  Subject p=new Subject();
+  try {
+   p.load();await(OfflineRecognizer.entered);
+   PluginCall start=new PluginCall();p.start(start);await(start.done);await(AudioRecord.delivered);
+   PluginCall stop=new PluginCall();p.stop(stop);OfflineRecognizer.release.countDown();await(stop.done);
+   check(OfflineRecognizer.lastSamples==1600,p.events); check(finals(p)==1,p.events);check(p.events.get(p.events.size()-1).contains("status=stopped"),p.events);
+   System.out.println("COLD_STOP_OK");
+   p.events.clear();AudioRecord.chunksPerStart=12;OfflineRecognizer.decoded=new CountDownLatch(1);
+   p.start(new PluginCall());await(OfflineRecognizer.decoded);await(AudioRecord.delivered);PluginCall stop2=new PluginCall();p.stop(stop2);await(stop2.done);
+   check(OfflineRecognizer.creations==1,p.events);check(finals(p)==1,p.events);check(p.events.stream().anyMatch(x->x.contains("isFinal=false")),p.events);System.out.println("WARM_REUSE_OK");
+   p.events.clear();AudioRecord.chunksPerStart=6;AudioRecord.silentChunksPerStart=6;OfflineRecognizer.decoded=new CountDownLatch(1);
+   p.start(new PluginCall());await(OfflineRecognizer.decoded);await(AudioRecord.delivered);PluginCall stop3=new PluginCall();p.stop(stop3);await(stop3.done);
+   check(p.events.stream().filter(x->x.contains("isFinal=true")).anyMatch(x->x.contains("你好 Hello.")&&!x.contains("你好 Hello.你好")),p.events);System.out.println("SILENCE_SEGMENT_OK");
+   p.events.clear();AudioRecord.chunksPerStart=205;AudioRecord.silentChunksPerStart=0;OfflineRecognizer.decoded=new CountDownLatch(1);
+   p.start(new PluginCall());await(AudioRecord.delivered);PluginCall stop4=new PluginCall();p.stop(stop4);await(stop4.done);
+   check(OfflineStream.maxSamples==320000,OfflineStream.maxSamples);check(finals(p)==1,p.events);check(p.events.stream().anyMatch(x->x.contains("你好 Hello.你好 Hello.")),p.events);check(OfflineStream.created==OfflineStream.released,p.events);System.out.println("WINDOW_AND_RELEASE_OK");
+  } finally {p.destroy();}
+  for(int i=0;i<100&&OfflineRecognizer.releases==0;i++)Thread.sleep(5);check(OfflineRecognizer.releases==1,OfflineRecognizer.releases);
+  OfflineRecognizer.entered=new CountDownLatch(1);OfflineRecognizer.release=new CountDownLatch(1);AudioRecord.chunksPerStart=70;
+  Subject overflow=new Subject();try{overflow.load();await(OfflineRecognizer.entered);overflow.start(new PluginCall());for(int i=0;i<800&&AudioRecord.latest.getRecordingState()==AudioRecord.RECORDSTATE_RECORDING;i++)Thread.sleep(5);check(AudioRecord.latest.getRecordingState()!=AudioRecord.RECORDSTATE_RECORDING,"overflow did not stop intake");OfflineRecognizer.release.countDown();PluginCall end=new PluginCall();overflow.stop(end);await(end.done);check(overflow.events.stream().anyMatch(x->x.contains("processing overloaded")),overflow.events);System.out.println("OVERFLOW_OK");}finally{overflow.destroy();}
+  for(int i=0;i<100&&OfflineRecognizer.releases<2;i++)Thread.sleep(5);
+  OfflineRecognizer.holdDecode=true;AudioRecord.chunksPerStart=6;
+  Subject retired=new Subject();retired.load();retired.start(new PluginCall());await(OfflineRecognizer.decoding);
+  retired.destroy();OfflineRecognizer.decodeRelease.countDown();
+  for(int i=0;i<100&&OfflineRecognizer.releases<3;i++)Thread.sleep(5);
+  check(retired.events.stream().noneMatch(x->x.contains("partialResults")),retired.events);
+  check(OfflineStream.created==OfflineStream.released,retired.events);System.out.println("OWNER_RETIRE_OK");
+ }
 }`,
     };
-
-    const javaSources: string[] = [];
-    for (const [rel, content] of Object.entries(files)) {
-      const full = pathJoin(srcDir, rel);
-      await mkdir(dirname(full), { recursive: true });
-      await writeFile(full, content, 'utf8');
-      javaSources.push(full);
-    }
-    const pluginSource = fileURLToPath(
-      new URL('../../web/plugins/streaming-speech/android/src/main/java/com/imcodes/speech/StreamingSpeechPlugin.java', import.meta.url),
-    );
-    javaSources.push(pluginSource);
-
-    execFileSync('javac', ['-d', classesDir, ...javaSources], { stdio: 'pipe', timeout: 30000 });
-    const output = execFileSync('java', ['-cp', classesDir, 'Harness'], { encoding: 'utf8', timeout: 10000 }).trim().split('\n');
-
-    expect(output[0]).toContain('COLD_STOP:1600:[listeningState:{status=started}, audioLevel:{level=0.091552734375}, partialResults:{isFinal=false, matches=[synthetic utterance]}, partialResults:{isFinal=true, matches=[synthetic utterance.]}, listeningState:{status=stopped}]');
-    expect(output[1]).toContain('WARM_POSITIVE:1:3200:[listeningState:{status=started}, audioLevel:{level=0.091552734375}, partialResults:{isFinal=false, matches=[你好 hello world]}, partialResults:{isFinal=true, matches=[你好 hello world.]}, listeningState:{status=stopped}]');
-    expect(output[2]).toContain('PAUSE_SEGMENT:calls=1/1:');
-    expect(output[2]).toContain('partialResults:{isFinal=false, matches=[你好，今天天气真好]}');
-    expect(output[2]).toContain('partialResults:{isFinal=false, matches=[你好，今天天气真好。]}');
-    expect(output[2]).toContain('partialResults:{isFinal=true, matches=[你好，今天天气真好。]}');
-    expect(output[3]).toContain('recognitionError:{message=Offline speech processing overloaded}');
-    expect(output[3]).toContain('listeningState:{status=stopped}');
+    const sources: string[] = [];
+    for (const [relative, content] of Object.entries(files)) { const full=join(srcDir, relative); await mkdir(dirname(full),{recursive:true});await writeFile(full,content);sources.push(full); }
+    sources.push(fileURLToPath(new URL('../../web/plugins/streaming-speech/android/src/main/java/com/imcodes/speech/StreamingSpeechPlugin.java',import.meta.url)));
+    execFileSync('javac',['-d',classesDir,...sources],{stdio:'pipe',timeout:30000});
+    const output=execFileSync('java',['-Djava.io.tmpdir='+root,'-cp',classesDir,'Harness'],{encoding:'utf8',timeout:15000}).trim().split('\n');
+    expect(output).toEqual(['COLD_STOP_OK','WARM_REUSE_OK','SILENCE_SEGMENT_OK','WINDOW_AND_RELEASE_OK','OVERFLOW_OK','OWNER_RETIRE_OK']);
   });
 });

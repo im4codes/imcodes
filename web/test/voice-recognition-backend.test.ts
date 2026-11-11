@@ -11,11 +11,11 @@ describe('shared native voice bridge', () => {
     expect(getNativeSpeechRecognition()).toBe(bridges.streaming);
     expect(bridges.register).toHaveBeenCalledWith('StreamingSpeech');
   });
-  it('preserves existing non-bilingual recognition locales', async () => {
-    vi.stubGlobal('navigator', { language: 'ja-JP' });
+  it.each(['en-US', 'ja-JP', 'zh-TW', 'fr-FR', 'ru-RU'])('uses multilingual offline recognition for %s', async language => {
+    vi.stubGlobal('navigator', { language });
     vi.stubGlobal('Capacitor', { isPluginAvailable: () => true });
     const { getNativeSpeechRecognition } = await import('../src/voice-recognition-backend.js');
-    expect(getNativeSpeechRecognition()).toBe(bridges.legacy);
+    expect(getNativeSpeechRecognition()).toBe(bridges.streaming);
   });
   it('keeps an old native binary functional after a web-only update', async () => {
     vi.stubGlobal('Capacitor', { isPluginAvailable: () => false });

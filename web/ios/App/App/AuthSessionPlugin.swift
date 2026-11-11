@@ -80,14 +80,83 @@ public class ShareReceiverPlugin: CAPPlugin, CAPBridgedPlugin {
     private let lock = NSLock()
     private var pendingShares: [[String: Any]] = []
     private var recentHandledPaths: [String: TimeInterval] = [:]
+    // Reservations and pending paths share the same lock/capacity protocol for
+    // direct URL callbacks and the disk scanner. Accepted payloads never evict.
+    private var inFlightPaths = Set<String>()
+    private var pendingPaths = Set<String>()
+    private var failedInboxPaths = Set<String>()
+    private let inboxWorker = DispatchQueue(label: "com.imcodes.share-inbox", qos: .userInitiated)
+    private var inboxScanScheduled = false
+    private var inboxRescanRequested = false
+
+    private var inboxRoots: [URL] {
+        var roots = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).map { $0.appendingPathComponent("Inbox", isDirectory: true) }
+        if let group = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: "group.com.im.codes") {
+            roots.append(group.appendingPathComponent("SharedInbox", isDirectory: true))
+        }
+        return roots
+    }
+
+    private func isManagedInboxFile(_ url: URL) -> Bool {
+        let path = url.resolvingSymlinksInPath().standardizedFileURL.path
+        return inboxRoots.contains { path.hasPrefix($0.resolvingSymlinksInPath().standardizedFileURL.path + "/") }
+    }
+
+    public func drainInboxFilesIfNeeded(retryFailures: Bool = true) {
+        lock.lock()
+        // A real activation/open may retry a retained read failure. Automatic
+        // capacity refills skip it so it cannot starve later files or spin.
+        if retryFailures { failedInboxPaths.formIntersection(pendingPaths) }
+        guard !inboxScanScheduled else { inboxRescanRequested = true; lock.unlock(); return }
+        inboxScanScheduled = true
+        lock.unlock()
+        inboxWorker.async {
+            defer {
+                self.lock.lock()
+                self.inboxScanScheduled = false
+                let rescan = self.inboxRescanRequested
+                self.inboxRescanRequested = false
+                self.lock.unlock()
+                if rescan { self.drainInboxFilesIfNeeded(retryFailures: false) }
+            }
+            for root in self.inboxRoots {
+                guard let files = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .isDirectoryKey], options: []) else { continue }
+                for case let file as URL in files {
+                    self.lock.lock(); let full = self.pendingShares.count + self.inFlightPaths.count >= Self.maxPendingShares; self.lock.unlock()
+                    if full { return } // Leave overflow on disk for consumePendingShares' next pass.
+                    guard let info = try? file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .isDirectoryKey]) else { continue }
+                    // Only unpublished extension batches are reserved; a shared .env
+                    // or another hidden regular file is still a legitimate attachment.
+                    if root.lastPathComponent == "SharedInbox", info.isDirectory == true,
+                       file.deletingLastPathComponent().standardizedFileURL == root.standardizedFileURL,
+                       file.lastPathComponent.hasPrefix(".pending-") {
+                        files.skipDescendants()
+                        continue
+                    }
+                    guard self.isManagedInboxFile(file), info.isRegularFile == true,
+                          info.isSymbolicLink != true else { continue }
+                    _ = self.handleIncomingFileURL(file, retryFailures: false)
+                }
+            }
+        }
+    }
 
     @discardableResult
-    public func handleIncomingFileURL(_ url: URL) -> Bool {
+    public func handleIncomingFileURL(_ url: URL, retryFailures: Bool = true) -> Bool {
         guard url.isFileURL else { return false }
 
         let normalizedPath = url.standardizedFileURL.path
         let now = Date().timeIntervalSince1970
         lock.lock()
+        if inFlightPaths.contains(normalizedPath) || pendingPaths.contains(normalizedPath) {
+            lock.unlock()
+            return true
+        }
+        if retryFailures { failedInboxPaths.remove(normalizedPath) }
+        if failedInboxPaths.contains(normalizedPath) {
+            lock.unlock()
+            return true
+        }
         recentHandledPaths = recentHandledPaths.filter { (_, timestamp) in
             (now - timestamp) < Self.duplicatePathDebounceInterval
         }
@@ -96,15 +165,21 @@ public class ShareReceiverPlugin: CAPPlugin, CAPBridgedPlugin {
             lock.unlock()
             return true
         }
-        recentHandledPaths[normalizedPath] = now
+        guard pendingShares.count + inFlightPaths.count < Self.maxPendingShares else {
+            lock.unlock()
+            // Managed files remain on disk for the next consume/scan. A direct
+            // external temporary URL is explicitly refused, never falsely accepted.
+            return false
+        }
+        inFlightPaths.insert(normalizedPath)
         lock.unlock()
-
         let accessed = url.startAccessingSecurityScopedResource()
+        var consumed = false
         defer {
             if accessed {
                 url.stopAccessingSecurityScopedResource()
             }
-            if url.path.contains("/Documents/Inbox/") || url.path.contains("-Inbox/") {
+            if consumed && (url.path.contains("/Documents/Inbox/") || url.path.contains("-Inbox/") || url.path.contains("/SharedInbox/")) && isManagedInboxFile(url) {
                 try? FileManager.default.removeItem(at: url)
             }
         }
@@ -118,11 +193,12 @@ public class ShareReceiverPlugin: CAPPlugin, CAPBridgedPlugin {
         if let resourceValues = try? url.resourceValues(forKeys: [.fileSizeKey]),
            let fileSize = resourceValues.fileSize,
            fileSize > Self.maxShareBytes {
+            consumed = true
             dispatchOrEnqueue([
                 "id": payloadId,
                 "files": [],
                 "error": "file_too_large"
-            ])
+            ], path: normalizedPath)
             return true
         }
 
@@ -131,16 +207,17 @@ public class ShareReceiverPlugin: CAPPlugin, CAPBridgedPlugin {
                 "id": payloadId,
                 "files": [],
                 "error": "read_failed"
-            ])
+            ], path: normalizedPath, readFailed: true)
             return true
         }
 
         if data.count > Self.maxShareBytes {
+            consumed = true
             dispatchOrEnqueue([
                 "id": payloadId,
                 "files": [],
                 "error": "file_too_large"
-            ])
+            ], path: normalizedPath)
             return true
         }
 
@@ -150,23 +227,23 @@ public class ShareReceiverPlugin: CAPPlugin, CAPBridgedPlugin {
             "size": data.count,
             "base64": data.base64EncodedString()
         ]
+        consumed = true
         dispatchOrEnqueue([
             "id": payloadId,
             "files": [fileEntry]
-        ])
+        ], path: normalizedPath)
         return true
     }
 
-    private func dispatchOrEnqueue(_ payload: [String: Any]) {
+    private func dispatchOrEnqueue(_ payload: [String: Any], path normalizedPath: String, readFailed: Bool = false) {
+        let now = Date().timeIntervalSince1970
         self.lock.lock()
-        let payloadId = payload["id"] as? String
-        if let payloadId = payloadId {
-            self.pendingShares.removeAll { ($0["id"] as? String) == payloadId }
-        }
+        // The reservation already owns this slot; release+publish is atomic.
+        self.inFlightPaths.remove(normalizedPath)
+        self.pendingPaths.insert(normalizedPath)
         self.pendingShares.append(payload)
-        if self.pendingShares.count > Self.maxPendingShares {
-            self.pendingShares.removeFirst(self.pendingShares.count - Self.maxPendingShares)
-        }
+        if readFailed { self.failedInboxPaths.insert(normalizedPath) }
+        else { self.recentHandledPaths[normalizedPath] = now }
         self.lock.unlock()
 
         let deliverAction = { [weak self] in
@@ -197,8 +274,13 @@ public class ShareReceiverPlugin: CAPPlugin, CAPBridgedPlugin {
         lock.lock()
         let items = pendingShares
         pendingShares.removeAll()
+        pendingPaths.removeAll()
         lock.unlock()
         call.resolve(["items": items])
+        // Errors can also represent real disk progress (oversize was consumed).
+        // Retry the remaining disk backlog whenever slots are released; retained
+        // read failures are skipped until an explicit activation/open retries them.
+        if !items.isEmpty { drainInboxFilesIfNeeded(retryFailures: false) }
     }
 
     private static func inferMimeType(for url: URL) -> String {

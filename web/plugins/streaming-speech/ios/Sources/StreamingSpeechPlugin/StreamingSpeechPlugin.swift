@@ -30,10 +30,11 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     private var decoderOwner: UInt64 = 0
     private var committed = ""
     private var lastText = ""
-    private var prevClean = ""
-    private var lastCleanInput = ""
-    private var lastPunctuatedFull = ""
+    private var utteranceSamples: [Float] = []
+    private var lastDecodedCount = 0
     private var unchangedSilentChunks = 0
+    private let maxUtteranceSamples = 20 * 16000
+    private let partialIntervalSamples = 9600 // 0.6s, not a latency guarantee
 
     public override func load() {
         NotificationCenter.default.addObserver(self, selector: #selector(interrupted(_:)), name: UIApplication.willResignActiveNotification, object: nil)
@@ -72,7 +73,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     private var modelRoot: URL? { Bundle.module.resourceURL?.appendingPathComponent("models", isDirectory: true) }
     private var modelAvailable: Bool {
         guard let root = modelRoot else { return false }
-        return ["encoder.int8.onnx", "decoder.onnx", "joiner.int8.onnx", "tokens.txt", "bpe.vocab", "hotwords.txt", "punct.int8.onnx"].allSatisfy {
+        return ["conv_frontend.onnx", "encoder.int4.onnx", "encoder.int4.weights", "decoder.int4.onnx", "decoder.int4.weights", "tokenizer/vocab.json", "tokenizer/merges.txt", "tokenizer/tokenizer_config.json", "hotwords.txt"].allSatisfy {
             FileManager.default.isReadableFile(atPath: root.appendingPathComponent($0).path)
         }
     }
@@ -118,8 +119,8 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                 self.decoder = decoder
                 self.decoderOwner = owner
                 self.committed = ""; self.lastText = ""
-                self.prevClean = ""; self.lastCleanInput = ""; self.lastPunctuatedFull = ""
-                self.unchangedSilentChunks = 0
+                self.utteranceSamples.removeAll(keepingCapacity: true)
+                self.lastDecodedCount = 0; self.unchangedSilentChunks = 0
             }
             do {
                 let session = AVAudioSession.sharedInstance()
@@ -187,79 +188,40 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         worker.async {
             defer { self.slots.signal() }
             guard self.decoderOwner == owner, let decoder = self.decoder else { return }
-            decoder.acceptWaveform(samples: samples)
-            self.decodeAvailable(decoder)
-            let rawText = self.join(self.committed, decoder.text.trimmingCharacters(in: .whitespacesAndNewlines))
-            let clean = self.stripPunctuation(rawText)
-            let endpoint = decoder.isEndpoint()
-            if clean.isEmpty {
-                self.unchangedSilentChunks = 0
-            } else if clean != self.prevClean {
-                self.prevClean = clean
-                self.unchangedSilentChunks = endpoint ? 3 : 0
-            } else if endpoint {
-                self.unchangedSilentChunks = max(self.unchangedSilentChunks, 3)
-            } else if level < 0.08 {
-                self.unchangedSilentChunks += 1
-            } else if self.unchangedSilentChunks < 3 {
-                self.unchangedSilentChunks = 0
-            }
-            let allowTrailingPeriod = endpoint || self.unchangedSilentChunks >= 3
-            let text = self.punctuate(rawText, recognizer: decoder.recognizer, allowTrailingPeriod: allowTrailingPeriod)
-            if text != self.lastText { self.emitText(text, final: false); self.lastText = text }
-            if endpoint {
-                if decoder.startNextStream() {
-                    self.committed = rawText
-                    self.prevClean = clean
-                    self.unchangedSilentChunks = max(self.unchangedSilentChunks, 3)
-                } else {
-                    DispatchQueue.main.async {
-                        if self.isCurrent(owner) {
-                            self.notifyListeners("recognitionError", data: ["message": "Offline speech could not continue"])
-                            self.endCapture(nil)
+            let speech = level >= 0.01
+            if self.utteranceSamples.isEmpty && !speech { return }
+            var offset = 0
+            while offset < samples.count {
+                let count = min(samples.count - offset, self.maxUtteranceSamples - self.utteranceSamples.count)
+                self.utteranceSamples.append(contentsOf: samples[offset..<(offset + count)])
+                offset += count
+                self.unchangedSilentChunks = speech ? 0 : self.unchangedSilentChunks + 1
+                let endpoint = self.utteranceSamples.count == self.maxUtteranceSamples || self.unchangedSilentChunks >= 6
+                if endpoint || (speech && self.utteranceSamples.count - self.lastDecodedCount >= self.partialIntervalSamples) {
+                    guard let text = decoder.decode(samples: self.utteranceSamples) else {
+                        self.decoder = nil; self.decoderOwner = 0
+                        self.utteranceSamples.removeAll(keepingCapacity: true)
+                        DispatchQueue.main.async {
+                            if self.isCurrent(owner) {
+                                self.notifyListeners("recognitionError", data: ["message": "Offline speech decoding failed"])
+                                self.endCapture(nil)
+                            }
                         }
+                        return
+                    }
+                    let full = self.join(self.committed, text)
+                    if full != self.lastText { self.emitText(full, final: false); self.lastText = full }
+                    self.lastDecodedCount = self.utteranceSamples.count
+                    if endpoint {
+                        self.committed = full
+                        self.utteranceSamples.removeAll(keepingCapacity: true)
+                        self.lastDecodedCount = 0; self.unchangedSilentChunks = 0
                     }
                 }
             }
         }
     }
-    private func decodeAvailable(_ decoder: SpeechDecoder) {
-        decoder.decodeAvailable()
-    }
-    private func stripPunctuation(_ text: String) -> String {
-        return text.replacingOccurrences(of: "[，。？！、；：,.?!;:…—\\-]+", with: "", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-    }
-    private func formatBilingualPunctuation(_ text: String) -> String {
-        var out = text
-        out = out.replacingOccurrences(of: "([。？！?!])([，,、]+)", with: "$1", options: .regularExpression)
-        out = out.replacingOccurrences(of: "([，,、]+)([。？！?!])", with: "$2", options: .regularExpression)
-        out = out.replacingOccurrences(of: "[，,、]{2,}", with: "，", options: .regularExpression)
-        out = out.replacingOccurrences(of: "[。]{2,}", with: "。", options: .regularExpression)
-        out = out.replacingOccurrences(of: "[？?]{2,}", with: "？", options: .regularExpression)
-        out = out.replacingOccurrences(of: "([A-Za-z0-9])。", with: "$1.", options: .regularExpression)
-        out = out.replacingOccurrences(of: "([A-Za-z0-9])，", with: "$1, ", options: .regularExpression)
-        out = out.replacingOccurrences(of: "([A-Za-z0-9])？", with: "$1?", options: .regularExpression)
-        out = out.replacingOccurrences(of: "([A-Za-z0-9])！", with: "$1!", options: .regularExpression)
-        return out
-    }
-    private func punctuate(_ rawText: String, recognizer: SpeechRecognizer, allowTrailingPeriod: Bool) -> String {
-        let clean = stripPunctuation(rawText)
-        if clean.isEmpty { return "" }
-        let punctuated: String
-        if clean == lastCleanInput {
-            punctuated = lastPunctuatedFull
-        } else {
-            punctuated = formatBilingualPunctuation(recognizer.addRawPunctuation(clean))
-            lastCleanInput = clean
-            lastPunctuatedFull = punctuated
-        }
-        if allowTrailingPeriod {
-            return punctuated.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        return punctuated.replacingOccurrences(of: "[。\\.\\s]+$", with: "", options: .regularExpression)
-    }
+
     private func join(_ previous: String, _ text: String) -> String {
         if previous.isEmpty { return text }
         if text.isEmpty { return previous }
@@ -278,119 +240,67 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     @objc public func stop(_ call: CAPPluginCall) { DispatchQueue.main.async { self.endCapture(call) } }
     // Main-thread capture teardown; serial decoder flush precedes stopped and ACK.
     private func endCapture(_ call: CAPPluginCall?) {
-        _ = nextOwner()
+        let stoppingOwner = nextOwner()
         if tapInstalled { engine?.inputNode.removeTap(onBus: 0); tapInstalled = false }
         engine?.stop(); engine = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         worker.async {
             if let decoder = self.decoder {
-                // One second covers the transducer's final right-context window.
-                decoder.acceptWaveform(samples: [Float](repeating: 0, count: 16000))
-                decoder.inputFinished()
-                self.decodeAvailable(decoder)
-                let rawFinal = self.join(self.committed, decoder.text.trimmingCharacters(in: .whitespacesAndNewlines))
-                self.emitText(self.punctuate(rawFinal, recognizer: decoder.recognizer, allowTrailingPeriod: true), final: true)
+                if let text = decoder.decode(samples: self.utteranceSamples) {
+                    self.emitText(self.join(self.committed, text), final: true)
+                } else {
+                    self.notifyListeners("recognitionError", data: ["message": "Offline speech final decoding failed"])
+                }
             }
+            self.utteranceSamples.removeAll(keepingCapacity: true)
             self.decoder = nil
             DispatchQueue.main.async {
-                self.notifyListeners("listeningState", data: ["status": "stopped"])
+                if self.isCurrent(stoppingOwner) { self.notifyListeners("listeningState", data: ["status": "stopped"]) }
                 call?.resolve()
             }
         }
     }
 }
 
-// Resident ONNX recognizer & CT-Transformer punctuator graphs owned by the plugin's serial worker queue.
+// Resident Qwen3 recognizer. Each partial/final uses a fresh bounded offline stream;
+// all access stays on the plugin's serial worker, including destruction.
 private final class SpeechRecognizer {
     let pointer: OpaquePointer
-    let punctuator: OpaquePointer
     init?(root: URL) {
-        let model = sherpaOnnxOnlineModelConfig(
-            tokens: root.appendingPathComponent("tokens.txt").path,
-            transducer: sherpaOnnxOnlineTransducerModelConfig(
-                encoder: root.appendingPathComponent("encoder.int8.onnx").path,
-                decoder: root.appendingPathComponent("decoder.onnx").path,
-                joiner: root.appendingPathComponent("joiner.int8.onnx").path),
-            numThreads: 2, modelType: "zipformer", modelingUnit: "cjkchar+bpe",
-            bpeVocab: root.appendingPathComponent("bpe.vocab").path)
-        var config = sherpaOnnxOnlineRecognizerConfig(
-            featConfig: sherpaOnnxFeatureConfig(), modelConfig: model, enableEndpoint: true,
-            decodingMethod: "modified_beam_search",
-            hotwordsFile: root.appendingPathComponent("hotwords.txt").path,
-            hotwordsScore: 2.0)
-        guard let recognizer = SherpaOnnxCreateOnlineRecognizer(&config) else { return nil }
-        let punctModel = sherpaOnnxOfflinePunctuationModelConfig(
-            ctTransformer: root.appendingPathComponent("punct.int8.onnx").path,
-            numThreads: 2, debug: 0, provider: "cpu")
-        var punctConfig = sherpaOnnxOfflinePunctuationConfig(model: punctModel)
-        guard let punctuator = SherpaOnnxCreateOfflinePunctuation(&punctConfig) else {
-            SherpaOnnxDestroyOnlineRecognizer(recognizer)
-            return nil
-        }
-        self.pointer = recognizer
-        self.punctuator = punctuator
-        if let warmStream = SherpaOnnxCreateOnlineStream(recognizer) {
-            let silence = [Float](repeating: 0, count: 8000)
-            SherpaOnnxOnlineStreamAcceptWaveform(warmStream, 16000, silence, Int32(silence.count))
-            while SherpaOnnxIsOnlineStreamReady(recognizer, warmStream) != 0 {
-                SherpaOnnxDecodeOnlineStream(recognizer, warmStream)
-            }
-            SherpaOnnxDestroyOnlineStream(warmStream)
-        }
-        _ = addRawPunctuation("你好世界")
+        let hotwords = ((try? String(contentsOf: root.appendingPathComponent("hotwords.txt"), encoding: .utf8)) ?? "")
+            .split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }.joined(separator: ",")
+        // Own dynamic C strings until the native constructor has consumed config.
+        let values = ["conv_frontend.onnx", "encoder.int4.onnx", "decoder.int4.onnx", "tokenizer"].map { root.appendingPathComponent($0).path } + [hotwords]
+        let strings = values.map { strdup($0) }
+        defer { strings.forEach { free($0) } }
+        guard strings.allSatisfy({ $0 != nil }) else { return nil }
+        var qwen = sherpaOnnxOfflineQwen3ASRModelConfig(maxTotalLen: 768, maxNewTokens: 128, temperature: 1e-6, topP: 0.8, seed: 42)
+        qwen.conv_frontend = UnsafePointer(strings[0]!)
+        qwen.encoder = UnsafePointer(strings[1]!)
+        qwen.decoder = UnsafePointer(strings[2]!)
+        qwen.tokenizer = UnsafePointer(strings[3]!)
+        qwen.hotwords = UnsafePointer(strings[4]!)
+        let model = sherpaOnnxOfflineModelConfig(tokens: "", numThreads: 2, qwen3Asr: qwen)
+        var config = sherpaOnnxOfflineRecognizerConfig(featConfig: sherpaOnnxFeatureConfig(), modelConfig: model)
+        guard let pointer = SherpaOnnxCreateOfflineRecognizer(&config) else { return nil }
+        self.pointer = pointer
     }
-    func addRawPunctuation(_ cleanText: String) -> String {
-        guard !cleanText.isEmpty else { return "" }
-        guard let cText = SherpaOfflinePunctuationAddPunct(punctuator, (cleanText as NSString).utf8String) else {
-            return cleanText
-        }
-        defer { SherpaOfflinePunctuationFreeText(cText) }
-        return String(cString: cText)
-    }
-    deinit {
-        SherpaOnnxDestroyOfflinePunctuation(punctuator)
-        SherpaOnnxDestroyOnlineRecognizer(pointer)
-    }
+    deinit { SherpaOnnxDestroyOfflineRecognizer(pointer) }
 }
 
-// Unlike the upstream convenience wrapper, reject a failed native allocation
-// instead of force-unwrapping it and crashing the app. Worker-thread owned.
 private final class SpeechDecoder {
     let recognizer: SpeechRecognizer
-    private(set) var stream: OpaquePointer
-    init?(recognizer: SpeechRecognizer) {
-        guard let stream = SherpaOnnxCreateOnlineStream(recognizer.pointer) else { return nil }
-        self.recognizer = recognizer; self.stream = stream
-        // Half-second left-context padding establishes the acoustic alignment baseline.
-        acceptWaveform(samples: [Float](repeating: 0, count: 8000))
-        decodeAvailable()
-    }
-    deinit {
-        SherpaOnnxDestroyOnlineStream(stream)
-    }
-    func acceptWaveform(samples: [Float]) {
-        SherpaOnnxOnlineStreamAcceptWaveform(stream, 16000, samples, Int32(samples.count))
-    }
-    func inputFinished() { SherpaOnnxOnlineStreamInputFinished(stream) }
-    func isReady() -> Bool { SherpaOnnxIsOnlineStreamReady(recognizer.pointer, stream) != 0 }
-    func decode() { SherpaOnnxDecodeOnlineStream(recognizer.pointer, stream) }
-    func decodeAvailable() {
-        while isReady() { decode() }
-    }
-    func startNextStream() -> Bool {
-        guard let next = SherpaOnnxCreateOnlineStream(recognizer.pointer) else { return false }
-        SherpaOnnxDestroyOnlineStream(stream)
-        stream = next
-        // Half-second left-context padding establishes the acoustic alignment baseline.
-        acceptWaveform(samples: [Float](repeating: 0, count: 8000))
-        decodeAvailable()
-        return true
-    }
-    func isEndpoint() -> Bool { SherpaOnnxOnlineStreamIsEndpoint(recognizer.pointer, stream) != 0 }
-    var text: String {
-        guard let result = SherpaOnnxGetOnlineStreamResult(recognizer.pointer, stream) else { return "" }
-        defer { SherpaOnnxDestroyOnlineRecognizerResult(result) }
+    init?(recognizer: SpeechRecognizer) { self.recognizer = recognizer }
+    func decode(samples: [Float]) -> String? {
+        if samples.isEmpty { return "" }
+        guard let stream = SherpaOnnxCreateOfflineStream(recognizer.pointer) else { return nil }
+        defer { SherpaOnnxDestroyOfflineStream(stream) }
+        SherpaOnnxAcceptWaveformOffline(stream, 16000, samples, Int32(samples.count))
+        SherpaOnnxDecodeOfflineStream(recognizer.pointer, stream)
+        guard let result = SherpaOnnxGetOfflineStreamResult(stream) else { return nil }
+        defer { SherpaOnnxDestroyOfflineRecognizerResult(result) }
         guard let text = result.pointee.text else { return "" }
-        return String(cString: text)
+        return String(cString: text).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

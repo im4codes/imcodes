@@ -1,0 +1,4 @@
+"CFBundleDisplayName" = "Send to IM.codes";
+"share.openApp" = "Files saved. Open IM.codes to choose a server and session.";
+"share.done" = "Done";
+"share.error" = "Could not import the shared files. Please try again.";
