@@ -42,6 +42,20 @@ function continueAutoWakeup(sid, state) {
   for (const id of state.pending.splice(0)) ok(id, { stopReason: 'end_turn', usage: { inputTokens: 22, outputTokens: 11 } });
   state.inputs = [];
 }
+function finishAutoCancel(sid, state) {
+  if (logPath && fs.existsSync(logPath + '.auto-cancel-hold')) {
+    state.autoTimer = setTimeout(() => finishAutoCancel(sid, state), 10); return;
+  }
+  state.inAutoWakeup = false; state.autoToolStarted = false; state.autoTimer = undefined; state.inputs = [];
+  record({ fixture: 'auto-cancel-stopped', sessionId: sid, inAutoWakeup: false });
+  note(sid, { sessionUpdate: 'turn_completed' });
+  if (scenario === 'late-after-cancel') {
+    setTimeout(() => {
+      note(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'LATE_AFTER_STOP' } });
+      note(sid, { sessionUpdate: 'turn_completed' });
+    }, 15);
+  }
+}
 function finish(sid, state) {
   // Explicit process-fixture handshake, not a timing assumption about CI CPU.
   if (logPath && fs.existsSync(logPath + '.hold')) {
@@ -88,9 +102,19 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       sessions.delete(p.sessionId); return ok(req.id);
     }
     case 'session/cancel': {
+      if (scenario === 'ignore-auto-cancel') {
+        record({ fixture: 'cancel-ignored', sessionId: p.sessionId, inAutoWakeup: sessions.get(p.sessionId)?.inAutoWakeup });
+        return;
+      }
       if (scenario === 'crash-on-cancel') return process.exit(12);
       const state = sessions.get(p.sessionId); if (!state) return;
-      clearTimeout(state.timer); clearTimeout(state.autoTimer); state.inAutoWakeup = false; state.autoToolStarted = false;
+      clearTimeout(state.timer); clearTimeout(state.autoTimer);
+      if (state.inAutoWakeup && state.pending.length === 0) {
+        record({ fixture: 'auto-cancel-requested', sessionId: p.sessionId, inAutoWakeup: true });
+        finishAutoCancel(p.sessionId, state);
+        return;
+      }
+      state.inAutoWakeup = false; state.autoToolStarted = false;
       for (const id of state.pending.splice(0)) ok(id, { stopReason: 'cancelled' }); state.inputs = [];
       if (scenario === 'late-after-cancel') {
         setTimeout(() => {

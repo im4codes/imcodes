@@ -429,13 +429,14 @@ describe('AG native ACP', () => {
     await runtime.kill();
   });
   it('converges auto -> external steering to a single terminal and prevents delayed frames after Stop from reviving an autonomous turn', async () => {
-    const { provider, root } = await setup('late-after-cancel');
+    const { provider, root, requests } = await setup('late-after-cancel');
     const id = await route(provider);
     const complete = vi.fn(), errors = vi.fn(), deltas = vi.fn();
     provider.onComplete(complete); provider.onError(errors); provider.onDelta(deltas);
 
     // 1. auto -> external steering converges to a single terminal onComplete.
     const autoHold = path.join(root, 'rpc.jsonl.auto-hold');
+    const autoCancelHold = path.join(root, 'rpc.jsonl.auto-cancel-hold');
     await writeFile(autoHold, 'hold');
     try {
       await provider.send(id, 'SCHEDULE_WAKEUP');
@@ -449,22 +450,88 @@ describe('AG native ACP', () => {
     expect(complete.mock.calls[1]?.[1].content).toBe('AUTONOMOUS_WAKEUP_DONE STEER_IN_AUTO');
     expect(errors).not.toHaveBeenCalled();
 
-    // 2. Stop / cancelAndWait during an autonomous turn settles once as CANCELLED and ignores delayed post-Stop frames.
+    // 2. Stop / cancelAndWait during an autonomous turn waits for native turn_completed before confirming, then ignores delayed post-Stop frames.
     await writeFile(autoHold, 'hold');
+    await writeFile(autoCancelHold, 'hold');
     try {
       await provider.send(id, 'SCHEDULE_WAKEUP');
       await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(3));
       await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true));
-      await expect(provider.cancelAndWait(id)).resolves.toBeUndefined();
+      let proof = false, resolved = false;
+      const stopping = provider.cancelAndWait(id);
+      stopping.then(() => { resolved = true; }, () => {});
+      const off = onConfirmedProviderStop(stopping, () => { proof = true; });
+      try {
+        await vi.waitFor(async () => expect((await requests()).some(r => r.fixture === 'auto-cancel-requested')).toBe(true));
+        expect(proof).toBe(false);
+        expect(resolved).toBe(false);
+        expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true);
+        await unlink(autoCancelHold);
+        await expect(stopping).resolves.toBeUndefined();
+        expect(proof).toBe(true);
+        expect(resolved).toBe(true);
+      } finally {
+        off();
+      }
       expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
       expect(errors).toHaveBeenCalledTimes(1);
       expect(errors.mock.calls[0]?.[1].code).toBe(PROVIDER_ERROR_CODES.CANCELLED);
       await new Promise(resolve => setTimeout(resolve, 40));
       expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
       expect(complete).toHaveBeenCalledTimes(3);
+      expect(errors).toHaveBeenCalledTimes(1);
       expect(deltas.mock.calls.some(c => c[1].delta.includes('LATE_AFTER_STOP'))).toBe(false);
     } finally {
       await unlink(autoHold).catch(() => {});
+      await unlink(autoCancelHold).catch(() => {});
+    }
+  });
+  it('requires native terminal proof for Stop of an autonomous turn, retains queued work while cancel is ignored, and recovers once native terminal arrives', async () => {
+    const { provider, root, requests } = await setup('ignore-auto-cancel');
+    const id = 'deck_test_agy_auto_stop_proof';
+    const runtime = new TransportSessionRuntime(provider, id);
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    const completed: any[] = [], errors: any[] = [];
+    provider.onComplete((sid, m) => { if (sid === id) completed.push(m); });
+    provider.onError((sid, e) => { if (sid === id) errors.push(e); });
+
+    const autoHold = path.join(root, 'rpc.jsonl.auto-hold');
+    await writeFile(autoHold, 'hold');
+    let off = () => {};
+    try {
+      runtime.send('SCHEDULE_WAKEUP');
+      await vi.waitFor(() => expect(completed).toHaveLength(1));
+      await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true));
+      expect(runtime.send('QUEUED_SUCCESSOR', 'msg-after-auto-stop')).toBe('queued');
+
+      let proof = false, resolved = false;
+      const stop = provider.cancelAndWait(id);
+      stop.then(() => { resolved = true; }, () => {});
+      off = onConfirmedProviderStop(stop, () => { proof = true; });
+      await runtime.cancel();
+
+      await vi.waitFor(async () => expect((await requests()).some(row => row.fixture === 'cancel-ignored')).toBe(true));
+      const ignored = (await requests()).find(row => row.fixture === 'cancel-ignored');
+      expect(ignored?.inAutoWakeup).toBe(true);
+      expect(proof, 'cancel request is not native terminal proof').toBe(false);
+      expect(resolved).toBe(false);
+      expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true);
+      expect((await requests()).filter(row => row.method === 'session/prompt')).toHaveLength(1);
+
+      await unlink(autoHold);
+      await expect(stop).resolves.toBeUndefined();
+      expect(proof).toBe(true);
+      expect(resolved).toBe(true);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]?.code).toBe(PROVIDER_ERROR_CODES.CANCELLED);
+
+      await vi.waitFor(() => expect(completed).toHaveLength(2));
+      expect(completed[1]?.content).toBe('QUEUED_SUCCESSOR');
+      expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
+    } finally {
+      off();
+      await unlink(autoHold).catch(() => {});
+      await runtime.kill();
     }
   });
   it('keeps the Windows shim entrypoint/prepend args, not just node.exe', async () => {

@@ -825,14 +825,11 @@ export class KimiSdkProvider implements TransportProvider {
     state.stoppedByCancel = true;
     if (!state.promptInFlight) return;
     state.cancelled = true;
-    if ((state.activePromptGenerations?.size ?? 0) > 0) {
-      state.autonomousTurnGeneration = undefined;
-    }
     if (!state.acpSessionId || !this.connection) return;
     this.cancelPendingApprovals(sessionId);
-    // `cancel` is a one-shot notification; the pending prompt() Promise will
-    // then resolve with stopReason='cancelled' (or occasionally the agent
-    // settles with the partial turn — we handle both in startTurn).
+    // `cancel` is a one-shot notification; the pending prompt() Promise or
+    // autonomous `turn_completed` terminal will settle the captured run when
+    // native work actually stops. Never fabricate physical stop proof locally.
     await this.connection.cancel({ sessionId: state.acpSessionId }).catch((err: unknown) => {
       logger.debug({
         provider: this.id,
@@ -840,15 +837,6 @@ export class KimiSdkProvider implements TransportProvider {
         ...this.errorLogFields(err, 'err'),
       }, 'ACP cancel notification failed (non-fatal)');
     });
-    if (this.profile.steeringPrompts
-      && this.sessions.get(sessionId) === state
-      && state.autonomousTurnGeneration !== undefined
-      && (state.activePromptGenerations?.size ?? 0) === 0) {
-      const autoGen = state.autonomousTurnGeneration;
-      state.autonomousTurnGeneration = undefined;
-      (state.activePromptGenerations ??= new Set()).add(autoGen);
-      this.settleTurn(sessionId, state, autoGen, 'cancelled');
-    }
   }
 
   /**
@@ -1693,6 +1681,7 @@ export class KimiSdkProvider implements TransportProvider {
     run?.complete();
 
     if (steeringFailure !== undefined) {
+      state.cancelled = false;
       state.stoppedByCancel = true;
       this.emitError(sessionId, this.normalizeError(steeringFailure));
       return;

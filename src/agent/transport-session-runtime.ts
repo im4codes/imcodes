@@ -1034,6 +1034,9 @@ export class TransportSessionRuntime implements SessionRuntime {
             if (this._drainPending()) return;
             if (this.isInProgressStatus(this._status)) this.setStatus('idle');
           }
+          if (!this.hasActiveTurnWork() && this.isInProgressStatus(this._status)) {
+            this.setStatus('idle');
+          }
           return;
         }
         if (this.handleSdkTurnLostRecovery(error)) {
