@@ -31,6 +31,10 @@ describe('shared mobile model preparation', () => {
     expect(ios).toContain('hotwordsScore: 2.0');
     expect(android).toContain('new float[SAMPLE_RATE]');
     expect(ios).toContain('count: 16000');
+    expect(android).toContain('new float[SAMPLE_RATE / 2]');
+    expect(ios).toContain('count: 8000');
+    expect(android).toContain('if (text.startsWith(previous)) return text;');
+    expect(ios).toContain('if text.hasPrefix(previous) { return text }');
     expect(android).toContain('OnlineStream next = recognizer.createStream("")');
     expect(android).not.toContain('recognizer.reset(stream)');
     expect(ios).toContain('func startNextStream() -> Bool');
@@ -46,7 +50,7 @@ describe('shared mobile model preparation', () => {
     expect(SPEECH_ASSETS.slice(0, 5).reduce((n: number, a: any) => n + a[3], 0)).toBe(199068769);
     const base = new URL('../../web/plugins/streaming-speech/', import.meta.url);
     expect(await matchesAsset(new URL('models/hotwords.txt', base), SPEECH_ASSETS[5][2], SPEECH_ASSETS[5][3])).toBe(true);
-    expect(await readFile(new URL('models/hotwords.txt', base), 'utf8')).toBe('COMMIT\nGITHUB\nENGLISH\n');
+    expect(await readFile(new URL('models/hotwords.txt', base), 'utf8')).toBe('COMMIT\nGITHUB\nGITLAB\nREACT\nTYPESCRIPT\nDOCKER\nENGLISH\n');
   });
   it('publishes verified files atomically, reuses them, and repairs a corrupt cached file', async () => {
     const url = await setup(); const fetcher = vi.fn(async () => new Response(bytes));

@@ -182,6 +182,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     private func join(_ previous: String, _ text: String) -> String {
         if previous.isEmpty { return text }
         if text.isEmpty { return previous }
+        if text.hasPrefix(previous) { return text }
         let ascii = previous.unicodeScalars.last!.value < 128 && text.unicodeScalars.first!.value < 128
         return previous + (ascii ? " " : "") + text
     }
@@ -229,6 +230,8 @@ private final class SpeechDecoder {
             SherpaOnnxDestroyOnlineRecognizer(recognizer); return nil
         }
         self.recognizer = recognizer; self.stream = stream
+        // Half-second left-context padding establishes the acoustic alignment baseline.
+        acceptWaveform(samples: [Float](repeating: 0, count: 8000))
     }
     deinit {
         SherpaOnnxDestroyOnlineStream(stream)
@@ -244,6 +247,8 @@ private final class SpeechDecoder {
         guard let next = SherpaOnnxCreateOnlineStream(recognizer) else { return false }
         SherpaOnnxDestroyOnlineStream(stream)
         stream = next
+        // Half-second left-context padding establishes the acoustic alignment baseline.
+        acceptWaveform(samples: [Float](repeating: 0, count: 8000))
         return true
     }
     func isEndpoint() -> Bool { SherpaOnnxOnlineStreamIsEndpoint(recognizer, stream) != 0 }

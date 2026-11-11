@@ -95,6 +95,8 @@ public class StreamingSpeechPlugin extends Plugin {
             config.getEndpointConfig().getRule3().setMinUtteranceLength(30.0f);
             recognizer = new OnlineRecognizer(getContext().getAssets(), config);
             stream = recognizer.createStream("");
+            // Half-second left-context padding establishes the acoustic alignment baseline.
+            stream.acceptWaveform(new float[SAMPLE_RATE / 2], SAMPLE_RATE);
             int min = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
             if (min <= 0) throw new IOException("Microphone format unavailable");
             synchronized (captureLock) {
@@ -129,6 +131,8 @@ public class StreamingSpeechPlugin extends Plugin {
                     // Reset keeps transducer encoder context; a fresh stream prevents
                     // the next utterance from losing its first words after a pause.
                     OnlineStream next = recognizer.createStream("");
+                    // Half-second left-context padding establishes the acoustic alignment baseline.
+                    next.acceptWaveform(new float[SAMPLE_RATE / 2], SAMPLE_RATE);
                     stream.release();
                     stream = next;
                     committed = full;
@@ -168,6 +172,7 @@ public class StreamingSpeechPlugin extends Plugin {
     private static String join(String previous, String text) {
         if (previous.isEmpty()) return text;
         if (text.isEmpty()) return previous;
+        if (text.startsWith(previous)) return text;
         boolean asciiBoundary = previous.charAt(previous.length() - 1) < 128 && text.charAt(0) < 128;
         return previous + (asciiBoundary ? " " : "") + text;
     }

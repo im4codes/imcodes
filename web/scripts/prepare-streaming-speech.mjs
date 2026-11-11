@@ -15,7 +15,7 @@ export const SPEECH_ASSETS = [
   ['models/joiner.int8.onnx', `${modelBase}/joiner-epoch-99-avg-1.int8.onnx`, '1ed689c5ed19dbaa725d9d191bb4822b5f4855a39e1ffd28cbc1f340d25b2ee0', 3228404],
   ['models/tokens.txt', `${modelBase}/tokens.txt`, 'a8e0e4ec53810e433789b54a5c0134a7eaa2ffca595a6334d54c00da858841d3', 56317],
   ['models/bpe.vocab', `${modelBase}/bpe.vocab`, 'd0b642f3a2eacd5fadefdeff9e0e1358cab729647cbb7fe58cf738e1f7407029', 12564],
-  ['models/hotwords.txt', null, '990d0485b3c31da0d514f1f420c403caf34c581707ee9dd47c56e02d0ee7474b', 22],
+  ['models/hotwords.txt', null, '26feefe92ea440b2cd286ace1b4d386db86990bd6f6a95e921cdbe0c1af79b49', 53],
   ['android/libs/sherpa-onnx-2.0.1.aar', 'https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/sherpa-onnx-2.0.1.aar', 'a8d09d1d32f3eb8520482c6d3d43fae674681c5b050385967c70a3c2c9bf0ee7', 49441341],
 ];
 export async function matchesAsset(file, hash, size) {
