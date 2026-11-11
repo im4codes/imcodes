@@ -30,6 +30,10 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     private var decoderOwner: UInt64 = 0
     private var committed = ""
     private var lastText = ""
+    private var prevClean = ""
+    private var lastCleanInput = ""
+    private var lastPunctuatedFull = ""
+    private var unchangedSilentChunks = 0
 
     public override func load() {
         NotificationCenter.default.addObserver(self, selector: #selector(interrupted(_:)), name: UIApplication.willResignActiveNotification, object: nil)
@@ -68,7 +72,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     private var modelRoot: URL? { Bundle.module.resourceURL?.appendingPathComponent("models", isDirectory: true) }
     private var modelAvailable: Bool {
         guard let root = modelRoot else { return false }
-        return ["encoder.int8.onnx", "decoder.onnx", "joiner.int8.onnx", "tokens.txt", "bpe.vocab", "hotwords.txt"].allSatisfy {
+        return ["encoder.int8.onnx", "decoder.onnx", "joiner.int8.onnx", "tokens.txt", "bpe.vocab", "hotwords.txt", "punct.int8.onnx"].allSatisfy {
             FileManager.default.isReadableFile(atPath: root.appendingPathComponent($0).path)
         }
     }
@@ -114,6 +118,8 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                 self.decoder = decoder
                 self.decoderOwner = owner
                 self.committed = ""; self.lastText = ""
+                self.prevClean = ""; self.lastCleanInput = ""; self.lastPunctuatedFull = ""
+                self.unchangedSilentChunks = 0
             }
             do {
                 let session = AVAudioSession.sharedInstance()
@@ -183,11 +189,30 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
             guard self.decoderOwner == owner, let decoder = self.decoder else { return }
             decoder.acceptWaveform(samples: samples)
             self.decodeAvailable(decoder)
-            let text = self.join(self.committed, decoder.text.trimmingCharacters(in: .whitespacesAndNewlines))
+            let rawText = self.join(self.committed, decoder.text.trimmingCharacters(in: .whitespacesAndNewlines))
+            let clean = self.stripPunctuation(rawText)
+            let endpoint = decoder.isEndpoint()
+            if clean.isEmpty {
+                self.unchangedSilentChunks = 0
+            } else if clean != self.prevClean {
+                self.prevClean = clean
+                self.unchangedSilentChunks = endpoint ? 3 : 0
+            } else if endpoint {
+                self.unchangedSilentChunks = max(self.unchangedSilentChunks, 3)
+            } else if level < 0.08 {
+                self.unchangedSilentChunks += 1
+            } else if self.unchangedSilentChunks < 3 {
+                self.unchangedSilentChunks = 0
+            }
+            let allowTrailingPeriod = endpoint || self.unchangedSilentChunks >= 3
+            let text = self.punctuate(rawText, recognizer: decoder.recognizer, allowTrailingPeriod: allowTrailingPeriod)
             if text != self.lastText { self.emitText(text, final: false); self.lastText = text }
-            if decoder.isEndpoint() {
-                if decoder.startNextStream() { self.committed = text }
-                else {
+            if endpoint {
+                if decoder.startNextStream() {
+                    self.committed = rawText
+                    self.prevClean = clean
+                    self.unchangedSilentChunks = max(self.unchangedSilentChunks, 3)
+                } else {
                     DispatchQueue.main.async {
                         if self.isCurrent(owner) {
                             self.notifyListeners("recognitionError", data: ["message": "Offline speech could not continue"])
@@ -200,6 +225,39 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     }
     private func decodeAvailable(_ decoder: SpeechDecoder) {
         decoder.decodeAvailable()
+    }
+    private func stripPunctuation(_ text: String) -> String {
+        return text.replacingOccurrences(of: "[，。？！、；：,.?!;:…—\\-]+", with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    private func formatBilingualPunctuation(_ text: String) -> String {
+        var out = text
+        out = out.replacingOccurrences(of: "([。？！?!])([，,、]+)", with: "$1", options: .regularExpression)
+        out = out.replacingOccurrences(of: "([，,、]+)([。？！?!])", with: "$2", options: .regularExpression)
+        out = out.replacingOccurrences(of: "[，,、]{2,}", with: "，", options: .regularExpression)
+        out = out.replacingOccurrences(of: "[。]{2,}", with: "。", options: .regularExpression)
+        out = out.replacingOccurrences(of: "[？?]{2,}", with: "？", options: .regularExpression)
+        out = out.replacingOccurrences(of: "([A-Za-z0-9])。", with: "$1.", options: .regularExpression)
+        out = out.replacingOccurrences(of: "([A-Za-z0-9])，", with: "$1, ", options: .regularExpression)
+        out = out.replacingOccurrences(of: "([A-Za-z0-9])？", with: "$1?", options: .regularExpression)
+        out = out.replacingOccurrences(of: "([A-Za-z0-9])！", with: "$1!", options: .regularExpression)
+        return out
+    }
+    private func punctuate(_ rawText: String, recognizer: SpeechRecognizer, allowTrailingPeriod: Bool) -> String {
+        let clean = stripPunctuation(rawText)
+        if clean.isEmpty { return "" }
+        let punctuated: String
+        if clean == lastCleanInput {
+            punctuated = lastPunctuatedFull
+        } else {
+            punctuated = formatBilingualPunctuation(recognizer.addRawPunctuation(clean))
+            lastCleanInput = clean
+            lastPunctuatedFull = punctuated
+        }
+        if allowTrailingPeriod {
+            return punctuated.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return punctuated.replacingOccurrences(of: "[。\\.\\s]+$", with: "", options: .regularExpression)
     }
     private func join(_ previous: String, _ text: String) -> String {
         if previous.isEmpty { return text }
@@ -229,7 +287,8 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                 decoder.acceptWaveform(samples: [Float](repeating: 0, count: 16000))
                 decoder.inputFinished()
                 self.decodeAvailable(decoder)
-                self.emitText(self.join(self.committed, decoder.text.trimmingCharacters(in: .whitespacesAndNewlines)), final: true)
+                let rawFinal = self.join(self.committed, decoder.text.trimmingCharacters(in: .whitespacesAndNewlines))
+                self.emitText(self.punctuate(rawFinal, recognizer: decoder.recognizer, allowTrailingPeriod: true), final: true)
             }
             self.decoder = nil
             DispatchQueue.main.async {
@@ -240,9 +299,10 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 }
 
-// Resident ONNX recognizer graph owned by the plugin's serial worker queue.
+// Resident ONNX recognizer & CT-Transformer punctuator graphs owned by the plugin's serial worker queue.
 private final class SpeechRecognizer {
     let pointer: OpaquePointer
+    let punctuator: OpaquePointer
     init?(root: URL) {
         let model = sherpaOnnxOnlineModelConfig(
             tokens: root.appendingPathComponent("tokens.txt").path,
@@ -258,7 +318,16 @@ private final class SpeechRecognizer {
             hotwordsFile: root.appendingPathComponent("hotwords.txt").path,
             hotwordsScore: 2.0)
         guard let recognizer = SherpaOnnxCreateOnlineRecognizer(&config) else { return nil }
+        let punctModel = sherpaOnnxOfflinePunctuationModelConfig(
+            ctTransformer: root.appendingPathComponent("punct.int8.onnx").path,
+            numThreads: 2, debug: 0, provider: "cpu")
+        var punctConfig = sherpaOnnxOfflinePunctuationConfig(model: punctModel)
+        guard let punctuator = SherpaOnnxCreateOfflinePunctuation(&punctConfig) else {
+            SherpaOnnxDestroyOnlineRecognizer(recognizer)
+            return nil
+        }
         self.pointer = recognizer
+        self.punctuator = punctuator
         if let warmStream = SherpaOnnxCreateOnlineStream(recognizer) {
             let silence = [Float](repeating: 0, count: 8000)
             SherpaOnnxOnlineStreamAcceptWaveform(warmStream, 16000, silence, Int32(silence.count))
@@ -267,8 +336,18 @@ private final class SpeechRecognizer {
             }
             SherpaOnnxDestroyOnlineStream(warmStream)
         }
+        _ = addRawPunctuation("你好世界")
+    }
+    func addRawPunctuation(_ cleanText: String) -> String {
+        guard !cleanText.isEmpty else { return "" }
+        guard let cText = SherpaOfflinePunctuationAddPunct(punctuator, (cleanText as NSString).utf8String) else {
+            return cleanText
+        }
+        defer { SherpaOfflinePunctuationFreeText(cText) }
+        return String(cString: cText)
     }
     deinit {
+        SherpaOnnxDestroyOfflinePunctuation(punctuator)
         SherpaOnnxDestroyOnlineRecognizer(pointer)
     }
 }

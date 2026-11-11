@@ -8,7 +8,7 @@ import { createHash } from 'node:crypto';
 import { STREAMING_SPEECH_PLUGIN_NAME } from '../../shared/voice-recognition.js';
 // Build tooling is intentionally plain ESM so Gradle/CI do not require tsx.
 // @ts-ignore plain build script
-import { matchesAsset, prepareSpeechAssets, SPEECH_ASSETS, MODEL_REVISION } from '../../web/scripts/prepare-streaming-speech.mjs';
+import { matchesAsset, prepareSpeechAssets, SPEECH_ASSETS, MODEL_REVISION, PUNCT_MODEL_REVISION } from '../../web/scripts/prepare-streaming-speech.mjs';
 let root: string;
 afterEach(async () => { vi.useRealTimers(); if (root) await rm(root, { recursive: true, force: true }); });
 async function setup() { root = await mkdtemp(join(tmpdir(), 'imcodes-test-speech-')); return pathToFileURL(root + '/'); }
@@ -22,7 +22,7 @@ describe('shared mobile model preparation', () => {
     const ios = await readFile(new URL('ios/Sources/StreamingSpeechPlugin/StreamingSpeechPlugin.swift', base), 'utf8');
     expect(android).toContain(`@CapacitorPlugin(name = "${STREAMING_SPEECH_PLUGIN_NAME}"`);
     expect(ios).toContain(`jsName = "${STREAMING_SPEECH_PLUGIN_NAME}"`);
-    for (const name of ['encoder.int8.onnx', 'decoder.onnx', 'joiner.int8.onnx', 'tokens.txt', 'bpe.vocab', 'hotwords.txt']) {
+    for (const name of ['encoder.int8.onnx', 'decoder.onnx', 'joiner.int8.onnx', 'tokens.txt', 'bpe.vocab', 'hotwords.txt', 'punct.int8.onnx']) {
       expect(android).toContain(`"${name}"`);
       expect(ios).toContain(`"${name}"`);
     }
@@ -51,8 +51,17 @@ describe('shared mobile model preparation', () => {
     expect(ios).toContain('SherpaOnnxDestroyOnlineStream(warmStream)');
     expect(ios).toMatch(/acceptWaveform\(samples: \[Float\]\(repeating: 0, count: 8000\)\)\s*\n\s*decodeAvailable\(\)/);
     expect(ios).toMatch(/notifyListeners\("audioLevel", data: \["level": level\]\)\s*\n\s*worker\.async/);
+    expect(ios).toContain('sherpaOnnxOfflinePunctuationModelConfig');
+    expect(ios).toContain('SherpaOnnxCreateOfflinePunctuation');
+    expect(ios).toContain('SherpaOfflinePunctuationAddPunct');
+    expect(ios).toContain('SherpaOfflinePunctuationFreeText');
+    expect(ios).toContain('SherpaOnnxDestroyOfflinePunctuation');
+    expect(ios).toContain('self.unchangedSilentChunks >= 3');
     expect(android).toContain('private OnlineRecognizer recognizer;');
+    expect(android).toContain('private OfflinePunctuation punctuator;');
     expect(android).toContain('private OnlineRecognizer ensureRecognizer()');
+    expect(android).toContain('private OfflinePunctuation ensurePunctuator()');
+    expect(android).toContain('unchangedSilentChunks >= 3');
     expect(android).toContain('warmStream.release();');
     expect(android).toContain('Math.max(min * 2, SAMPLE_RATE * 2 * 6)');
     expect(android).toContain('worker.execute(() -> capture(call, owner, audio, session));');
@@ -60,13 +69,16 @@ describe('shared mobile model preparation', () => {
     expect(android).toMatch(/onAccepted\.run\(\);\s*\n\s*pcmQueue\.addLast\(samples\);/);
     expect(android).toMatch(/stream\.acceptWaveform\(new float\[SAMPLE_RATE \/ 2\], SAMPLE_RATE\);\s*\n\s*decodeAvailable\(recognizer, stream\);/);
     expect(android).toMatch(/next\.acceptWaveform\(new float\[SAMPLE_RATE \/ 2\], SAMPLE_RATE\);\s*\n\s*decodeAvailable\(recognizer, next\);/);
-    expect(android).toMatch(/handleOnDestroy\(\)[\s\S]*recognizer\.release\(\);/);
+    expect(android).toMatch(/handleOnDestroy\(\)[\s\S]*punctuator\.release\(\);[\s\S]*recognizer\.release\(\);/);
   });
   it('pins the mixed-precision transducer bytes and locally maintained hotwords', async () => {
     expect(MODEL_REVISION).toBe('98590b7ed6443e77b714204da2757d75e1a642f4');
-    expect(SPEECH_ASSETS).toHaveLength(7);
+    expect(PUNCT_MODEL_REVISION).toBe('5cccf43af83e4fc50d1d55b8410312e87709be70');
+    expect(SPEECH_ASSETS).toHaveLength(8);
     expect(SPEECH_ASSETS.every((a: any) => /^[a-f\d]{64}$/.test(a[2]) && (a[1] === null || a[1].startsWith('https://')))).toBe(true);
-    expect(SPEECH_ASSETS.map((a: any) => a[0])).toEqual(['models/encoder.int8.onnx', 'models/decoder.onnx', 'models/joiner.int8.onnx', 'models/tokens.txt', 'models/bpe.vocab', 'models/hotwords.txt', 'android/libs/sherpa-onnx-2.0.1.aar']);
+    expect(SPEECH_ASSETS.map((a: any) => a[0])).toEqual(['models/encoder.int8.onnx', 'models/decoder.onnx', 'models/joiner.int8.onnx', 'tokens.txt'.replace(/^/, 'models/'), 'models/bpe.vocab', 'models/hotwords.txt', 'models/punct.int8.onnx', 'android/libs/sherpa-onnx-2.0.1.aar']);
+    expect(SPEECH_ASSETS[6][2]).toBe('65a3fb9f5ad7bfb96bf69e0dc4481df97f6ee60513c1d94ce981ba6effd524b1');
+    expect(SPEECH_ASSETS[6][3]).toBe(75519198);
     expect(SPEECH_ASSETS.slice(0, 5).reduce((n: number, a: any) => n + a[3], 0)).toBe(199068769);
     const base = new URL('../../web/plugins/streaming-speech/', import.meta.url);
     expect(await matchesAsset(new URL('models/hotwords.txt', base), SPEECH_ASSETS[5][2], SPEECH_ASSETS[5][3])).toBe(true);
@@ -413,10 +425,12 @@ public class AudioRecord {
   public static final int STATE_INITIALIZED=1, RECORDSTATE_RECORDING=3, READ_BLOCKING=0;
   public static volatile AudioRecord latest;
   public static volatile int chunksPerStart=1;
+  public static volatile int silentChunksPerStart=0;
   public static int reads=0;
   private boolean recording;
   private int remaining;
-  public AudioRecord(int a,int b,int c,int d,int e){ latest=this; remaining=chunksPerStart; }
+  private int silentRemaining;
+  public AudioRecord(int a,int b,int c,int d,int e){ latest=this; remaining=chunksPerStart; silentRemaining=silentChunksPerStart; }
   public static int getMinBufferSize(int a,int b,int c){ return 3200; }
   public int getState(){ return STATE_INITIALIZED; }
   public synchronized int getRecordingState(){ return recording ? RECORDSTATE_RECORDING : 0; }
@@ -425,12 +439,17 @@ public class AudioRecord {
   public void release(){}
   public synchronized int read(short[] out,int off,int n,int mode){
     reads++;
-    while (remaining <= 0 && recording) {
+    while (remaining <= 0 && silentRemaining <= 0 && recording) {
       try { wait(); } catch (InterruptedException e) { return -1; }
     }
-    if (!recording || remaining <= 0) return 0;
-    remaining--;
-    java.util.Arrays.fill(out, (short) 1000);
+    if (!recording || (remaining <= 0 && silentRemaining <= 0)) return 0;
+    if (remaining > 0) {
+      remaining--;
+      java.util.Arrays.fill(out, (short) 1000);
+    } else {
+      silentRemaining--;
+      java.util.Arrays.fill(out, (short) 0);
+    }
     return n;
   }
 }`,
@@ -473,16 +492,26 @@ public class OnlineRecognizerConfig {
       'com/k2fsa/sherpa/onnx/OnlineStream.java': `package com.k2fsa.sherpa.onnx;
 public class OnlineStream {
   public String text="";
+  public static volatile String nextTranscript="synthetic utterance";
   public static volatile int spokenSamples=0;
+  public static volatile int silentChunksAccepted=0;
   public static volatile java.util.concurrent.CountDownLatch speech=new java.util.concurrent.CountDownLatch(1);
+  public static volatile java.util.concurrent.CountDownLatch pauseDone=new java.util.concurrent.CountDownLatch(1);
   public void acceptWaveform(float[] data,int rate){
+    boolean nonZero = false;
     for (float f : data) {
       if (f != 0) {
-        spokenSamples += data.length;
-        text = "synthetic utterance";
-        speech.countDown();
+        nonZero = true;
         break;
       }
+    }
+    if (nonZero) {
+      spokenSamples += data.length;
+      text = nextTranscript;
+      speech.countDown();
+    } else if (data.length == 1600 && !text.isEmpty()) {
+      silentChunksAccepted++;
+      if (silentChunksAccepted >= 4) pauseDone.countDown();
     }
   }
   public void inputFinished(){}
@@ -506,6 +535,32 @@ public class OnlineRecognizer {
   public void release(){ releases++; }
   public Result getResult(OnlineStream stream){ return new Result(stream.text); }
   public record Result(String text){ public String getText(){ return text; } }
+}`,
+      'com/k2fsa/sherpa/onnx/OfflinePunctuationModelConfig.java': `package com.k2fsa.sherpa.onnx;
+public class OfflinePunctuationModelConfig {
+  public void setCtTransformer(String x){}
+  public void setNumThreads(int n){}
+  public void setDebug(boolean b){}
+  public void setProvider(String x){}
+}`,
+      'com/k2fsa/sherpa/onnx/OfflinePunctuationConfig.java': `package com.k2fsa.sherpa.onnx;
+public class OfflinePunctuationConfig {
+  public OfflinePunctuationConfig(OfflinePunctuationModelConfig model){}
+}`,
+      'com/k2fsa/sherpa/onnx/OfflinePunctuation.java': `package com.k2fsa.sherpa.onnx;
+public class OfflinePunctuation {
+  public static volatile int creations=0;
+  public static volatile int releases=0;
+  public static volatile int calls=0;
+  public OfflinePunctuation(Object assets, OfflinePunctuationConfig config){
+    creations++;
+  }
+  public String addPunctuation(String text){
+    calls++;
+    if ("你好今天天气真好".equals(text)) return "你好，今天天气真好。";
+    return text + "。";
+  }
+  public void release(){ releases++; }
 }`,
       'Harness.java': `import com.imcodes.speech.StreamingSpeechPlugin;
 import com.getcapacitor.PluginCall;
@@ -543,7 +598,7 @@ public class Harness {
       }
       System.out.println("COLD_STOP:" + OnlineStream.spokenSamples + ":" + p.events);
 
-      // 2. Warm positive control: reuses resident recognizer without recreating
+      // 2. Warm positive control: reuses resident recognizer & punctuator without recreating
       p.events.clear();
       OnlineStream.speech = new CountDownLatch(1);
       PluginCall warmStart = new PluginCall();
@@ -553,25 +608,45 @@ public class Harness {
       PluginCall warmStop = new PluginCall();
       p.stop(warmStop);
       await(warmStop.done);
-      if (OnlineRecognizer.creations != 1 || OnlineStream.spokenSamples != 3200) {
-        throw new AssertionError("WARM_POSITIVE failed: creations=" + OnlineRecognizer.creations + " spoken=" + OnlineStream.spokenSamples);
+      if (OnlineRecognizer.creations != 1 || OfflinePunctuation.creations != 1 || OnlineStream.spokenSamples != 3200) {
+        throw new AssertionError("WARM_POSITIVE failed: creations=" + OnlineRecognizer.creations + "/" + OfflinePunctuation.creations + " spoken=" + OnlineStream.spokenSamples);
       }
       System.out.println("WARM_POSITIVE:" + OnlineRecognizer.creations + ":" + OnlineStream.spokenSamples + ":" + p.events);
+
+      // 3. >=240ms (3 silent 100ms chunks) pause segmentation + same-cleanInput cache (0 extra inferences during silence)
+      p.events.clear();
+      OnlineStream.nextTranscript = "你好，今天天气真好";
+      OnlineStream.silentChunksAccepted = 0;
+      OnlineStream.pauseDone = new CountDownLatch(1);
+      AudioRecord.chunksPerStart = 1;
+      AudioRecord.silentChunksPerStart = 4;
+      int callsBeforePauseRun = OfflinePunctuation.calls;
+      PluginCall pauseStart = new PluginCall();
+      p.start(pauseStart);
+      await(pauseStart.done);
+      await(OnlineStream.pauseDone);
+      int callsDuringSilence = OfflinePunctuation.calls - callsBeforePauseRun;
+      PluginCall pauseStop = new PluginCall();
+      p.stop(pauseStop);
+      await(pauseStop.done);
+      int totalCallsForPauseRun = OfflinePunctuation.calls - callsBeforePauseRun;
+      System.out.println("PAUSE_SEGMENT:calls=" + callsDuringSilence + "/" + totalCallsForPauseRun + ":" + p.events);
     } finally {
       p.destroy();
     }
     // Wait briefly for worker shutdown after destroy
-    for (int i = 0; i < 20 && OnlineRecognizer.releases == 0; i++) {
+    for (int i = 0; i < 20 && (OnlineRecognizer.releases == 0 || OfflinePunctuation.releases == 0); i++) {
       try { Thread.sleep(10); } catch (InterruptedException ignored) {}
     }
-    if (OnlineRecognizer.releases != 1) {
-      throw new AssertionError("Expected resident recognizer release on destroy, got " + OnlineRecognizer.releases);
+    if (OnlineRecognizer.releases != 1 || OfflinePunctuation.releases != 1) {
+      throw new AssertionError("Expected resident recognizer & punctuator release on destroy, got " + OnlineRecognizer.releases + "/" + OfflinePunctuation.releases);
     }
 
-    // 3. Bounded overflow during held warmup: >64 chunks stops mic and reports explicit error
+    // 4. Bounded overflow during held warmup: >64 chunks stops mic and reports explicit error
     OnlineRecognizer.entered = new CountDownLatch(1);
     OnlineRecognizer.release = new CountDownLatch(1);
     AudioRecord.chunksPerStart = 70;
+    AudioRecord.silentChunksPerStart = 0;
     Subject p2 = new Subject();
     try {
       p2.load();
@@ -609,9 +684,13 @@ public class Harness {
     execFileSync('javac', ['-d', classesDir, ...javaSources], { stdio: 'pipe', timeout: 30000 });
     const output = execFileSync('java', ['-cp', classesDir, 'Harness'], { encoding: 'utf8', timeout: 10000 }).trim().split('\n');
 
-    expect(output[0]).toContain('COLD_STOP:1600:[listeningState:{status=started}, audioLevel:{level=0.091552734375}, partialResults:{isFinal=false, matches=[synthetic utterance]}, partialResults:{isFinal=true, matches=[synthetic utterance]}, listeningState:{status=stopped}]');
-    expect(output[1]).toContain('WARM_POSITIVE:1:3200:[listeningState:{status=started}, audioLevel:{level=0.091552734375}, partialResults:{isFinal=false, matches=[synthetic utterance]}, partialResults:{isFinal=true, matches=[synthetic utterance]}, listeningState:{status=stopped}]');
-    expect(output[2]).toContain('recognitionError:{message=Offline speech processing overloaded}');
-    expect(output[2]).toContain('listeningState:{status=stopped}');
+    expect(output[0]).toContain('COLD_STOP:1600:[listeningState:{status=started}, audioLevel:{level=0.091552734375}, partialResults:{isFinal=false, matches=[synthetic utterance]}, partialResults:{isFinal=true, matches=[synthetic utterance.]}, listeningState:{status=stopped}]');
+    expect(output[1]).toContain('WARM_POSITIVE:1:3200:[listeningState:{status=started}, audioLevel:{level=0.091552734375}, partialResults:{isFinal=false, matches=[synthetic utterance]}, partialResults:{isFinal=true, matches=[synthetic utterance.]}, listeningState:{status=stopped}]');
+    expect(output[2]).toContain('PAUSE_SEGMENT:calls=1/1:');
+    expect(output[2]).toContain('partialResults:{isFinal=false, matches=[你好，今天天气真好]}');
+    expect(output[2]).toContain('partialResults:{isFinal=false, matches=[你好，今天天气真好。]}');
+    expect(output[2]).toContain('partialResults:{isFinal=true, matches=[你好，今天天气真好。]}');
+    expect(output[3]).toContain('recognitionError:{message=Offline speech processing overloaded}');
+    expect(output[3]).toContain('listeningState:{status=stopped}');
   });
 });

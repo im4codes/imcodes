@@ -14,6 +14,9 @@ import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import com.getcapacitor.annotation.Permission;
 import com.getcapacitor.annotation.PermissionCallback;
+import com.k2fsa.sherpa.onnx.OfflinePunctuation;
+import com.k2fsa.sherpa.onnx.OfflinePunctuationConfig;
+import com.k2fsa.sherpa.onnx.OfflinePunctuationModelConfig;
 import com.k2fsa.sherpa.onnx.OnlineRecognizer;
 import com.k2fsa.sherpa.onnx.OnlineRecognizerConfig;
 import com.k2fsa.sherpa.onnx.OnlineStream;
@@ -24,6 +27,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Pattern;
 
 /** Audio never leaves this device. One serial worker owns all native decoder state. */
 @CapacitorPlugin(name = "StreamingSpeech", permissions = {
@@ -32,10 +36,24 @@ import java.util.concurrent.atomic.AtomicLong;
 public class StreamingSpeechPlugin extends Plugin {
     private static final int SAMPLE_RATE = 16000;
     private static final int MAX_BUFFERED_CHUNKS = 64; // ~6.4s at 100ms/chunk (matches iOS slots = 64)
+    private static final Pattern PUNCT_STRIP = Pattern.compile("[，。？！、；：,.?!;:…—\\-]+");
+    private static final Pattern PUNCT_END_BEFORE_COMMA = Pattern.compile("([。？！?!])([，,、]+)");
+    private static final Pattern PUNCT_COMMA_BEFORE_END = Pattern.compile("([，,、]+)([。？！?!])");
+    private static final Pattern PUNCT_DUP_COMMA = Pattern.compile("[，,、]{2,}");
+    private static final Pattern PUNCT_DUP_PERIOD = Pattern.compile("[。]{2,}");
+    private static final Pattern PUNCT_DUP_QUESTION = Pattern.compile("[？?]{2,}");
+    private static final Pattern PUNCT_ASCII_PERIOD = Pattern.compile("([A-Za-z0-9])。");
+    private static final Pattern PUNCT_ASCII_COMMA = Pattern.compile("([A-Za-z0-9])，");
+    private static final Pattern PUNCT_ASCII_QUESTION = Pattern.compile("([A-Za-z0-9])？");
+    private static final Pattern PUNCT_ASCII_EXCLAM = Pattern.compile("([A-Za-z0-9])！");
+    private static final Pattern PUNCT_TRAILING_PERIOD = Pattern.compile("[。\\.\\s]+$");
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final AtomicLong generation = new AtomicLong();
     private final Object captureLock = new Object();
     private OnlineRecognizer recognizer;
+    private OfflinePunctuation punctuator;
+    private String lastCleanInput = "";
+    private String lastPunctuatedFull = "";
     private CaptureSession activeSession;
     private volatile AudioRecord recorder;
     private volatile boolean listening;
@@ -45,6 +63,7 @@ public class StreamingSpeechPlugin extends Plugin {
         worker.execute(() -> {
             try {
                 ensureRecognizer();
+                ensurePunctuator();
             } catch (Exception | LinkageError ignored) {
                 // Deferred to start() where initialization errors surface to the caller.
             }
@@ -79,6 +98,20 @@ public class StreamingSpeechPlugin extends Plugin {
         return recognizer;
     }
 
+    private OfflinePunctuation ensurePunctuator() {
+        if (punctuator != null) return punctuator;
+        OfflinePunctuationModelConfig model = new OfflinePunctuationModelConfig();
+        model.setCtTransformer("punct.int8.onnx");
+        model.setNumThreads(2);
+        model.setDebug(false);
+        model.setProvider("cpu");
+        OfflinePunctuationConfig config = new OfflinePunctuationConfig(model);
+        OfflinePunctuation created = new OfflinePunctuation(getContext().getAssets(), config);
+        created.addPunctuation("你好世界");
+        punctuator = created;
+        return punctuator;
+    }
+
     private void decodeAvailable(OnlineRecognizer recognizer, OnlineStream stream) {
         while (recognizer.isReady(stream)) recognizer.decode(stream);
     }
@@ -86,7 +119,7 @@ public class StreamingSpeechPlugin extends Plugin {
     @PluginMethod
     public void available(PluginCall call) {
         boolean ready = true;
-        for (String name : new String[] { "encoder.int8.onnx", "decoder.onnx", "joiner.int8.onnx", "tokens.txt", "bpe.vocab", "hotwords.txt" }) {
+        for (String name : new String[] { "encoder.int8.onnx", "decoder.onnx", "joiner.int8.onnx", "tokens.txt", "bpe.vocab", "hotwords.txt", "punct.int8.onnx" }) {
             try (java.io.InputStream input = getContext().getAssets().open(name)) {
                 if (input.read() < 0) ready = false;
             } catch (IOException e) { ready = false; }
@@ -208,12 +241,18 @@ public class StreamingSpeechPlugin extends Plugin {
 
     private void capture(PluginCall call, long owner, AudioRecord audio, CaptureSession session) {
         OnlineRecognizer recognizer = null;
+        OfflinePunctuation punctuator = null;
         OnlineStream stream = null;
-        String committed = "", last = "";
+        String committed = "", last = "", prevClean = "";
+        int unchangedSilentChunks = 0;
+        lastCleanInput = "";
+        lastPunctuatedFull = "";
         boolean failed = false;
         try {
             if (session.isDiscarded() || generation.get() != owner) return;
             recognizer = ensureRecognizer();
+            if (session.isDiscarded() || generation.get() != owner) return;
+            punctuator = ensurePunctuator();
             if (session.isDiscarded() || generation.get() != owner) return;
             stream = recognizer.createStream("");
             // Half-second left-context padding establishes the acoustic alignment baseline.
@@ -222,12 +261,29 @@ public class StreamingSpeechPlugin extends Plugin {
             while (!session.isDiscarded() && generation.get() == owner) {
                 float[] samples = session.pollSamples(generation);
                 if (samples == null) break;
+                double level = computeLevel(samples);
                 stream.acceptWaveform(samples, SAMPLE_RATE);
                 decodeAvailable(recognizer, stream);
                 String text = recognizer.getResult(stream).getText().trim();
-                String full = join(committed, text);
+                String rawFull = join(committed, text);
+                String clean = stripPunctuation(rawFull);
+                boolean endpoint = recognizer.isEndpoint(stream);
+                if (clean.isEmpty()) {
+                    unchangedSilentChunks = 0;
+                } else if (!clean.equals(prevClean)) {
+                    prevClean = clean;
+                    unchangedSilentChunks = endpoint ? 3 : 0;
+                } else if (endpoint) {
+                    unchangedSilentChunks = Math.max(unchangedSilentChunks, 3);
+                } else if (level < 0.08) {
+                    unchangedSilentChunks++;
+                } else if (unchangedSilentChunks < 3) {
+                    unchangedSilentChunks = 0;
+                }
+                boolean allowTrailingPeriod = endpoint || unchangedSilentChunks >= 3;
+                String full = punctuate(rawFull, punctuator, allowTrailingPeriod);
                 if (!full.equals(last)) { partial(full, false); last = full; }
-                if (recognizer.isEndpoint(stream)) {
+                if (endpoint) {
                     // Reset keeps transducer encoder context; a fresh stream prevents
                     // the next utterance from losing its first words after a pause.
                     OnlineStream next = recognizer.createStream("");
@@ -236,7 +292,9 @@ public class StreamingSpeechPlugin extends Plugin {
                     decodeAvailable(recognizer, next);
                     stream.release();
                     stream = next;
-                    committed = full;
+                    committed = rawFull;
+                    prevClean = clean;
+                    unchangedSilentChunks = Math.max(unchangedSilentChunks, 3);
                 }
             }
         } catch (Exception | LinkageError e) {
@@ -258,7 +316,8 @@ public class StreamingSpeechPlugin extends Plugin {
                     stream.acceptWaveform(new float[SAMPLE_RATE], SAMPLE_RATE);
                     stream.inputFinished();
                     decodeAvailable(recognizer, stream);
-                    partial(join(committed, recognizer.getResult(stream).getText().trim()), true);
+                    String rawFinal = join(committed, recognizer.getResult(stream).getText().trim());
+                    partial(punctuate(rawFinal, punctuator, true), true);
                 } catch (Exception | LinkageError ignored) { /* still release microphone/stream */ }
             }
             synchronized (captureLock) {
@@ -275,6 +334,51 @@ public class StreamingSpeechPlugin extends Plugin {
             if (stream != null) stream.release();
             if (!session.isDiscarded() && generation.get() == owner) state("stopped");
         }
+    }
+
+    private static double computeLevel(float[] samples) {
+        if (samples.length == 0) return 0;
+        double power = 0;
+        for (float s : samples) power += s * s;
+        return Math.min(1, Math.sqrt(power / samples.length) * 3);
+    }
+
+    private static String stripPunctuation(String text) {
+        if (text == null || text.isEmpty()) return "";
+        return PUNCT_STRIP.matcher(text).replaceAll("").trim();
+    }
+
+    private static String formatBilingualPunctuation(String text) {
+        if (text == null || text.isEmpty()) return "";
+        String out = PUNCT_END_BEFORE_COMMA.matcher(text).replaceAll("$1");
+        out = PUNCT_COMMA_BEFORE_END.matcher(out).replaceAll("$2");
+        out = PUNCT_DUP_COMMA.matcher(out).replaceAll("，");
+        out = PUNCT_DUP_PERIOD.matcher(out).replaceAll("。");
+        out = PUNCT_DUP_QUESTION.matcher(out).replaceAll("？");
+        out = PUNCT_ASCII_PERIOD.matcher(out).replaceAll("$1.");
+        out = PUNCT_ASCII_COMMA.matcher(out).replaceAll("$1, ");
+        out = PUNCT_ASCII_QUESTION.matcher(out).replaceAll("$1?");
+        out = PUNCT_ASCII_EXCLAM.matcher(out).replaceAll("$1!");
+        return out;
+    }
+
+    private String punctuate(String rawText, OfflinePunctuation punctuator, boolean allowTrailingPeriod) {
+        String clean = stripPunctuation(rawText);
+        if (clean.isEmpty()) return "";
+        if (punctuator == null) return clean;
+        String punctuated;
+        if (clean.equals(lastCleanInput)) {
+            punctuated = lastPunctuatedFull;
+        } else {
+            String rawPunct = punctuator.addPunctuation(clean);
+            punctuated = formatBilingualPunctuation(rawPunct != null ? rawPunct : clean);
+            lastCleanInput = clean;
+            lastPunctuatedFull = punctuated;
+        }
+        if (allowTrailingPeriod) {
+            return punctuated.trim();
+        }
+        return PUNCT_TRAILING_PERIOD.matcher(punctuated).replaceAll("");
     }
 
     private static final class CaptureSession {
@@ -431,6 +535,10 @@ public class StreamingSpeechPlugin extends Plugin {
     @Override protected void handleOnDestroy() {
         stopCapture(true);
         worker.execute(() -> {
+            if (punctuator != null) {
+                punctuator.release();
+                punctuator = null;
+            }
             if (recognizer != null) {
                 recognizer.release();
                 recognizer = null;
