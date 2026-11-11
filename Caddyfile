@@ -1,3 +1,10 @@
 {$DOMAIN} {
+	handle_path /onlyoffice/* {
+		reverse_proxy onlyoffice:80 {
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-Host {host}
+			header_up X-Forwarded-Prefix /onlyoffice
+		}
+	}
 	reverse_proxy server:19138
 }

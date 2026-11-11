@@ -13,11 +13,12 @@
 
 import { randomBytes, createHash } from 'node:crypto';
 import { writeFile, readFile, mkdir, chmod, unlink } from 'node:fs/promises';
-import { existsSync, writeFileSync, readFileSync, mkdtempSync, rmSync, readdirSync} from 'node:fs';
+import { existsSync, writeFileSync, readFileSync, mkdtempSync, rmSync, readdirSync } from 'node:fs';
 import { execSync, execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { dirname, join } from 'node:path';
 import { homedir, hostname, tmpdir } from 'node:os';
+import { parse, stringify } from 'yaml';
 import {
   dockerComposeTemplate,
   caddyfileTemplate,
@@ -25,9 +26,18 @@ import {
   turnEntrypointTemplate,
   turnserverConfigTemplate,
   type TurnDeploymentTemplateConfig,
+  type OnlyOfficeDeploymentTemplateConfig,
   NODE_EXE_VERSION_VOLUME,
   NODE_EXE_VERSION_DIR,
+  ONLYOFFICE_DATA_VOLUME,
+  ONLYOFFICE_LOGS_VOLUME,
 } from './templates.js';
+import {
+  ONLYOFFICE_SERVICE_DEFAULTS,
+  ONLYOFFICE_SERVICE_ENV,
+  defaultOnlyOfficePublicUrl,
+  isOnlyOfficeEnabledValue,
+} from '../../shared/onlyoffice-service.js';
 import {
   TURN_RELAY_CAPACITY,
   TURN_RELAY_NETWORK,
@@ -285,7 +295,7 @@ export function validateTurnDnsOnly(
 
 // ── Config generation ────────────────────────────────────────────────────────
 
-interface SetupSecrets {
+export interface SetupSecrets {
   postgresPassword: string;
   jwtSigningKey: string;
   adminPassword: string;
@@ -294,10 +304,12 @@ interface SetupSecrets {
   apiKeyRaw: string;
   apiKeyId: string;
   turnSharedSecret?: string;
+  onlyofficeJwtSecret?: string;
 }
 
-interface SetupFlowOptions {
+export interface SetupFlowOptions {
   force?: boolean;
+  onlyoffice?: boolean;
   turn?: boolean;
   turnHost?: string;
   turnPort?: string | number;
@@ -323,7 +335,7 @@ function generateSecrets(): SetupSecrets {
 }
 
 /** Parse existing .env to recover secrets that were generated in a previous run. */
-function parseEnvFile(content: string): Record<string, string> {
+export function parseEnvFile(content: string): Record<string, string> {
   const env: Record<string, string> = {};
   for (const line of content.split('\n')) {
     const trimmed = line.trim();
@@ -333,6 +345,19 @@ function parseEnvFile(content: string): Record<string, string> {
     env[trimmed.slice(0, eqIdx)] = trimmed.slice(eqIdx + 1);
   }
   return env;
+}
+
+/** Read DOMAIN from an existing .env file in `dir` if present. */
+export function recoverDomainFromEnv(dir: string): string | undefined {
+  const envPath = join(dir, '.env');
+  if (!existsSync(envPath)) return undefined;
+  try {
+    const env = parseEnvFile(readFileSync(envPath, 'utf8'));
+    const domain = env['DOMAIN']?.trim().replace(/^['"]|['"]$/g, '');
+    return domain || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Read existing .env + setup-secrets.json to recover all secrets for resume. */
@@ -359,6 +384,7 @@ async function recoverSecrets(dir: string): Promise<SetupSecrets | null> {
       apiKeyRaw: raw.apiKeyRaw,
       apiKeyId: raw.apiKeyId,
       turnSharedSecret: env[TURN_SERVICE_ENV.SHARED_SECRET],
+      onlyofficeJwtSecret: env[ONLYOFFICE_SERVICE_ENV.JWT_SECRET] || raw.onlyofficeJwtSecret,
     };
   } catch {
     return null;
@@ -376,8 +402,83 @@ async function persistSecrets(dir: string, secrets: SetupSecrets): Promise<void>
     serverId: secrets.serverId,
     apiKeyRaw: secrets.apiKeyRaw,
     apiKeyId: secrets.apiKeyId,
+    ...(secrets.onlyofficeJwtSecret ? { onlyofficeJwtSecret: secrets.onlyofficeJwtSecret } : {}),
   }, null, 2), { encoding: 'utf8', mode: 0o600 });
   await chmod(secretsPath, 0o600);
+}
+
+export interface RecoveredOnlyOfficeDeployment {
+  enabled: boolean;
+  enabledExplicit: boolean;
+  jwtSecret?: string;
+  publicUrl?: string;
+  internalUrl?: string;
+  domain?: string;
+}
+
+export function recoverOnlyOfficeDeployment(dir: string): RecoveredOnlyOfficeDeployment | undefined {
+  const envPath = join(dir, '.env');
+  if (!existsSync(envPath)) return undefined;
+  const env = parseEnvFile(readFileSync(envPath, 'utf8'));
+  const rawEnabled = env[ONLYOFFICE_SERVICE_ENV.ENABLED];
+  const enabledExplicit = rawEnabled !== undefined && rawEnabled.trim() !== '';
+  const enabled = isOnlyOfficeEnabledValue(rawEnabled);
+  return {
+    enabled,
+    enabledExplicit,
+    jwtSecret: env[ONLYOFFICE_SERVICE_ENV.JWT_SECRET]?.trim() || undefined,
+    publicUrl: env[ONLYOFFICE_SERVICE_ENV.PUBLIC_URL]?.trim() || undefined,
+    internalUrl: env[ONLYOFFICE_SERVICE_ENV.INTERNAL_URL]?.trim() || undefined,
+    domain: env['DOMAIN']?.trim() || undefined,
+  };
+}
+
+export function resolveOnlyOfficeDeployment(
+  domain: string,
+  dir: string,
+  secrets: Partial<SetupSecrets>,
+  opts: SetupFlowOptions = {},
+): OnlyOfficeDeploymentTemplateConfig {
+  const recovered = recoverOnlyOfficeDeployment(dir);
+  let enabled: boolean;
+  if (opts.onlyoffice === false) {
+    enabled = false;
+  } else if (opts.onlyoffice === true) {
+    enabled = true;
+  } else if (recovered) {
+    enabled = recovered.enabled;
+  } else {
+    enabled = true;
+  }
+
+  const defaultPublicUrl = defaultOnlyOfficePublicUrl(domain);
+  const recoveredDomainDefaultUrl = recovered?.domain ? defaultOnlyOfficePublicUrl(recovered.domain) : undefined;
+  const publicUrl = recovered?.publicUrl && recovered.publicUrl !== recoveredDomainDefaultUrl
+    ? recovered.publicUrl
+    : defaultPublicUrl;
+  const internalUrl = recovered?.internalUrl || ONLYOFFICE_SERVICE_DEFAULTS.INTERNAL_URL;
+
+  if (!enabled) {
+    secrets.onlyofficeJwtSecret = undefined;
+    return {
+      enabled: false,
+      jwtSecret: '',
+      publicUrl,
+      internalUrl,
+    };
+  }
+
+  const jwtSecret = recovered?.jwtSecret
+    || secrets.onlyofficeJwtSecret
+    || randomHex(ONLYOFFICE_SERVICE_DEFAULTS.JWT_SECRET_BYTES);
+  secrets.onlyofficeJwtSecret = jwtSecret;
+
+  return {
+    enabled: true,
+    jwtSecret,
+    publicUrl,
+    internalUrl,
+  };
 }
 
 function parsePortOption(value: string | number | undefined, fallback?: number): number | undefined {
@@ -784,12 +885,201 @@ async function resolveTurnDeployment(
   };
 }
 
+/**
+ * Non-destructively upsert ONLYOFFICE_* keys (and DOMAIN if changed/missing)
+ * into an existing .env file content while preserving all other variables,
+ * comments, and ordering.
+ */
+export function upsertOnlyOfficeEnvContent(
+  existingContent: string,
+  domain: string,
+  onlyoffice: OnlyOfficeDeploymentTemplateConfig,
+): string {
+  const updates: Record<string, string> = {
+    DOMAIN: domain,
+    [ONLYOFFICE_SERVICE_ENV.ENABLED]: onlyoffice.enabled ? 'true' : 'false',
+    [ONLYOFFICE_SERVICE_ENV.JWT_SECRET]: onlyoffice.jwtSecret ?? '',
+    [ONLYOFFICE_SERVICE_ENV.PUBLIC_URL]: onlyoffice.publicUrl ?? defaultOnlyOfficePublicUrl(domain),
+    [ONLYOFFICE_SERVICE_ENV.INTERNAL_URL]: onlyoffice.internalUrl ?? ONLYOFFICE_SERVICE_DEFAULTS.INTERNAL_URL,
+  };
+  const seen = new Set<string>();
+  const lines = existingContent.replace(/\r\n/g, '\n').split('\n');
+  const updatedLines: string[] = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) {
+      updatedLines.push(line);
+      continue;
+    }
+    const eqIdx = trimmed.indexOf('=');
+    if (eqIdx === -1) {
+      updatedLines.push(line);
+      continue;
+    }
+    const key = trimmed.slice(0, eqIdx).trim();
+    if (key in updates) {
+      if (!seen.has(key)) {
+        updatedLines.push(`${key}=${updates[key]}`);
+        seen.add(key);
+      }
+      // Drop any duplicate occurrences of the same managed key
+    } else {
+      updatedLines.push(line);
+    }
+  }
+
+  while (updatedLines.length > 0 && updatedLines[updatedLines.length - 1] === '') {
+    updatedLines.pop();
+  }
+
+  for (const [key, val] of Object.entries(updates)) {
+    if (!seen.has(key)) {
+      updatedLines.push(`${key}=${val}`);
+    }
+  }
+
+  return `${updatedLines.join('\n')}\n`;
+}
+
+/**
+ * Ensure an existing docker-compose.yml content includes the `onlyoffice`
+ * service, `server.environment` ONLYOFFICE_* variables, and `onlyoffice_data`
+ * / `onlyoffice_logs` volumes without losing existing services (such as TURN)
+ * or custom server environment variables.
+ */
+export function ensureComposeHasOnlyOffice(
+  existingComposeContent: string | undefined,
+  onlyoffice: OnlyOfficeDeploymentTemplateConfig,
+  mirrorMode = false,
+): string {
+  if (!existingComposeContent || !existingComposeContent.trim()) {
+    return dockerComposeTemplate({
+      ...(mirrorMode ? {
+        ghcrPrefix: GHCR_MIRROR_PREFIX,
+        turnImage: TURN_SERVICE_DEFAULTS.MIRROR_IMAGE,
+      } : {}),
+      onlyoffice,
+    });
+  }
+
+  const doc = parse(existingComposeContent) as {
+    services?: Record<string, Record<string, unknown>>;
+    volumes?: Record<string, unknown>;
+  } | null;
+
+  if (!doc || typeof doc !== 'object' || !doc.services || typeof doc.services !== 'object') {
+    return dockerComposeTemplate({
+      ...(mirrorMode ? {
+        ghcrPrefix: GHCR_MIRROR_PREFIX,
+        turnImage: TURN_SERVICE_DEFAULTS.MIRROR_IMAGE,
+      } : {}),
+      onlyoffice,
+    });
+  }
+
+  const server = doc.services.server ?? {};
+  const rawEnv = server.environment;
+  const envObj: Record<string, string> = {};
+  if (Array.isArray(rawEnv)) {
+    for (const entry of rawEnv) {
+      const str = String(entry);
+      const eq = str.indexOf('=');
+      if (eq !== -1) envObj[str.slice(0, eq)] = str.slice(eq + 1);
+    }
+  } else if (rawEnv && typeof rawEnv === 'object') {
+    for (const [k, v] of Object.entries(rawEnv)) {
+      envObj[k] = String(v ?? '');
+    }
+  }
+
+  envObj[ONLYOFFICE_SERVICE_ENV.ENABLED] = `\${${ONLYOFFICE_SERVICE_ENV.ENABLED}:-true}`;
+  envObj[ONLYOFFICE_SERVICE_ENV.JWT_SECRET] = `\${${ONLYOFFICE_SERVICE_ENV.JWT_SECRET}:-}`;
+  envObj[ONLYOFFICE_SERVICE_ENV.PUBLIC_URL] = `\${${ONLYOFFICE_SERVICE_ENV.PUBLIC_URL}:-https://\${DOMAIN}${ONLYOFFICE_SERVICE_DEFAULTS.SUBPATH}}`;
+  envObj[ONLYOFFICE_SERVICE_ENV.INTERNAL_URL] = `\${${ONLYOFFICE_SERVICE_ENV.INTERNAL_URL}:-${ONLYOFFICE_SERVICE_DEFAULTS.INTERNAL_URL}}`;
+  if (!envObj['IMCODES_NODE_EXE_VERSION_DIR']) {
+    envObj['IMCODES_NODE_EXE_VERSION_DIR'] = NODE_EXE_VERSION_DIR;
+  }
+  server.environment = envObj;
+
+  const serverVolumes = Array.isArray(server.volumes) ? server.volumes.map(String) : [];
+  const versionMount = `${NODE_EXE_VERSION_VOLUME}:${NODE_EXE_VERSION_DIR}`;
+  if (!serverVolumes.includes(versionMount)) {
+    serverVolumes.push(versionMount);
+  }
+  server.volumes = serverVolumes;
+  doc.services.server = server;
+
+  if (onlyoffice.enabled) {
+    doc.services.onlyoffice = {
+      image: onlyoffice.image ?? ONLYOFFICE_SERVICE_DEFAULTS.IMAGE,
+      restart: 'unless-stopped',
+      environment: {
+        JWT_ENABLED: 'true',
+        JWT_SECRET: `\${${ONLYOFFICE_SERVICE_ENV.JWT_SECRET}}`,
+        JWT_HEADER: 'Authorization',
+        JWT_IN_BODY: 'true',
+        WOPI_ENABLED: 'false',
+      },
+      volumes: [
+        `${ONLYOFFICE_DATA_VOLUME}:/var/www/onlyoffice/Data`,
+        `${ONLYOFFICE_LOGS_VOLUME}:/var/log/onlyoffice`,
+      ],
+    };
+  } else {
+    delete doc.services.onlyoffice;
+  }
+
+  doc.volumes = doc.volumes && typeof doc.volumes === 'object' ? doc.volumes : {};
+  if (!(ONLYOFFICE_DATA_VOLUME in doc.volumes)) doc.volumes[ONLYOFFICE_DATA_VOLUME] = null;
+  if (!(ONLYOFFICE_LOGS_VOLUME in doc.volumes)) doc.volumes[ONLYOFFICE_LOGS_VOLUME] = null;
+  if (!(NODE_EXE_VERSION_VOLUME in doc.volumes)) doc.volumes[NODE_EXE_VERSION_VOLUME] = null;
+
+  return stringify(doc, { lineWidth: 0 });
+}
+
+/**
+ * Ensure an existing Caddyfile includes the `handle_path /onlyoffice/*` reverse
+ * proxy block while preserving existing site address (`{$DOMAIN}` or literal
+ * domain) and custom directives.
+ */
+export function ensureCaddyfileHasOnlyOffice(
+  existingCaddyfile: string | undefined,
+  domain: string,
+  enabled = true,
+): string {
+  if (!existingCaddyfile || !existingCaddyfile.trim()) {
+    return caddyfileTemplate(domain, { onlyoffice: enabled });
+  }
+  if (!enabled) {
+    return caddyfileTemplate(domain, { onlyoffice: false });
+  }
+  if (existingCaddyfile.includes(`handle_path ${ONLYOFFICE_SERVICE_DEFAULTS.SUBPATH}/*`)) {
+    return existingCaddyfile;
+  }
+  const handleBlock = `\thandle_path ${ONLYOFFICE_SERVICE_DEFAULTS.SUBPATH}/* {\n`
+    + `\t\treverse_proxy onlyoffice:80 {\n`
+    + `\t\t\theader_up X-Forwarded-Proto {scheme}\n`
+    + `\t\t\theader_up X-Forwarded-Host {host}\n`
+    + `\t\t\theader_up X-Forwarded-Prefix ${ONLYOFFICE_SERVICE_DEFAULTS.SUBPATH}\n`
+    + `\t\t}\n`
+    + `\t}\n`;
+  if (existingCaddyfile.includes('reverse_proxy server:19138')) {
+    return existingCaddyfile.replace(
+      /(\t*reverse_proxy\s+server:19138)/,
+      `${handleBlock}$1`,
+    );
+  }
+  return caddyfileTemplate(domain, { onlyoffice: true });
+}
+
 async function writeConfigs(
   dir: string,
   domain: string,
   secrets: SetupSecrets,
   mirrorMode: boolean,
   turn: EnabledTurnDeployment | undefined,
+  onlyoffice: OnlyOfficeDeploymentTemplateConfig,
 ): Promise<void> {
   await writeFile(join(dir, '.env'), envTemplate({
     domain,
@@ -797,6 +1087,7 @@ async function writeConfigs(
     jwtSigningKey: secrets.jwtSigningKey,
     adminPassword: secrets.adminPassword,
     turn,
+    onlyoffice,
   }), { encoding: 'utf8', mode: 0o600 });
   await chmod(join(dir, '.env'), 0o600);
 
@@ -807,9 +1098,10 @@ async function writeConfigs(
         turnImage: TURN_SERVICE_DEFAULTS.MIRROR_IMAGE,
       } : {}),
       turn,
+      onlyoffice,
     },
   ));
-  await writeFile(join(dir, 'Caddyfile'), caddyfileTemplate(domain));
+  await writeFile(join(dir, 'Caddyfile'), caddyfileTemplate(domain, { onlyoffice: onlyoffice.enabled }));
   const turnConfigPath = join(dir, 'turnserver.conf');
   const turnEntrypointPath = join(dir, 'turn-entrypoint.sh');
   // The bridge-address entrypoint belongs to bridge mode only. In host mode
@@ -832,6 +1124,70 @@ async function writeConfigs(
   } else if (existsSync(turnEntrypointPath)) {
     await unlink(turnEntrypointPath);
   }
+}
+
+async function runIncrementalOnlyOfficeAddon(
+  compose: string,
+  dir: string,
+  domain: string,
+  opts: SetupFlowOptions,
+): Promise<void> {
+  log('Existing .env detected without .setup-secrets.json — running non-destructive ONLYOFFICE add-on setup...');
+
+  log('Detecting network...');
+  const mirrorMode = detectMirrorMode();
+  if (mirrorMode) {
+    log('Mirror mode: hub.docker.com unreachable, using registry mirrors.');
+    setupDaemonMirrors(true);
+  } else {
+    log('Direct mode: hub.docker.com reachable.');
+  }
+
+  // Stage retained artifacts BEFORE writing config files or replacing `server`.
+  const stagedVersions = stageRetainedArtifactVersions(compose, dir);
+  assertRetainedArtifactStagingSafe(stagedVersions);
+  if (stagedVersions.kind === 'staged') {
+    log('Preserving retained Windows installers from the previous container...');
+  }
+
+  const onlyoffice = resolveOnlyOfficeDeployment(domain, dir, {}, { ...opts, onlyoffice: true });
+  const envPath = join(dir, '.env');
+  const existingEnvContent = await readFile(envPath, 'utf8');
+  const updatedEnvContent = upsertOnlyOfficeEnvContent(existingEnvContent, domain, onlyoffice);
+  await writeFile(envPath, updatedEnvContent, { encoding: 'utf8', mode: 0o600 });
+  await chmod(envPath, 0o600);
+
+  const composePath = join(dir, 'docker-compose.yml');
+  const existingCompose = existsSync(composePath) ? await readFile(composePath, 'utf8') : undefined;
+  await writeFile(composePath, ensureComposeHasOnlyOffice(existingCompose, onlyoffice, mirrorMode), 'utf8');
+
+  const caddyPath = join(dir, 'Caddyfile');
+  const existingCaddy = existsSync(caddyPath) ? await readFile(caddyPath, 'utf8') : undefined;
+  await writeFile(caddyPath, ensureCaddyfileHasOnlyOffice(existingCaddy, domain, true), 'utf8');
+
+  log('Updated .env, docker-compose.yml, and Caddyfile with ONLYOFFICE configuration.');
+  log('Starting ONLYOFFICE Document Server and updating server + Caddy...');
+  composeCmd(compose, dir, 'up -d onlyoffice server caddy');
+  if (!isServiceHealthy(compose, dir, 'server')) {
+    await waitForService(compose, dir, 'server');
+  }
+  log('ONLYOFFICE Document Server, server, and Caddy updated.');
+
+  if (stagedVersions.kind === 'staged') {
+    const outcome = finalizeRetainedArtifactMigration(compose, dir, stagedVersions.dir);
+    log(outcome.restored
+      ? 'Retained Windows installers migrated into the durable volume.'
+      : `Could not migrate retained Windows installers. The only copy is preserved at ${outcome.retainedStagingDir}; `
+        + `copy it into the server's ${NODE_EXE_VERSION_DIR} to keep existing install codes resolvable.`);
+  }
+
+  console.log(`
+  ┌──────────────────────────────────────────────────────┐
+  │  ONLYOFFICE Document Server added to https://${domain}
+  │
+  │  Document server: https://${domain}/onlyoffice (ONLYOFFICE enabled)
+  └──────────────────────────────────────────────────────┘
+`);
 }
 
 
@@ -859,16 +1215,6 @@ export const LEGACY_NODE_EXE_VERSION_DIR = '/app/controlled-node-executables/ver
  */
 export const LEGACY_ABSENT_SENTINEL = '__imcodes_legacy_versions_absent__';
 
-/**
- * Copy the pre-fix retained tree OUT of the running container, before anything
- * replaces it.
- *
- * Returns the staging directory, or null when there is nothing to migrate —
- * a fresh install, an already-migrated deployment (the container already has
- * the volume mounted at the new path), or an empty legacy tree. Every failure
- * is non-fatal: an upgrade must not be blocked by a best-effort copy, and the
- * caller logs rather than throws.
- */
 /**
  * Outcome of staging, as three states rather than two.
  *
@@ -1263,8 +1609,12 @@ WantedBy=default.target
 
 // ── Main flow ───────────────────────────────────────────────────────────────
 
-export async function setupFlow(domain: string, opts: SetupFlowOptions = {}): Promise<void> {
+export async function setupFlow(domainInput?: string, opts: SetupFlowOptions = {}): Promise<void> {
   const dir = process.cwd();
+  const domain = domainInput?.trim() || recoverDomainFromEnv(dir);
+  if (!domain) {
+    fatal('Domain is required. Pass --domain <domain> or run in a directory with an existing .env containing DOMAIN.');
+  }
 
   console.log('\n  IM.codes Setup\n');
 
@@ -1298,7 +1648,11 @@ export async function setupFlow(domain: string, opts: SetupFlowOptions = {}): Pr
       resumed = true;
       log('Resuming previous setup (existing .env + secrets found).');
     } else if (existsSync(join(dir, '.env'))) {
-      // .env exists but no .setup-secrets.json — can't safely resume
+      if (opts.onlyoffice === true) {
+        await runIncrementalOnlyOfficeAddon(compose, dir, domain, opts);
+        return;
+      }
+      // .env exists but no .setup-secrets.json — can't safely resume full setup
       fatal('Incomplete setup state: .env exists but secrets file is missing. Use --force to start fresh.');
     } else {
       secrets = generateSecrets();
@@ -1308,6 +1662,7 @@ export async function setupFlow(domain: string, opts: SetupFlowOptions = {}): Pr
   }
 
   const turn = await resolveTurnDeployment(domain, dir, secrets, opts);
+  const onlyoffice = resolveOnlyOfficeDeployment(domain, dir, secrets, opts);
 
   // 3. Detect mirror mode (hub.docker.com unreachable → use mirrors)
   log('Detecting network...');
@@ -1332,9 +1687,9 @@ export async function setupFlow(domain: string, opts: SetupFlowOptions = {}): Pr
   // rewritten or recreated, leaving the existing deployment intact.
   assertRetainedArtifactStagingSafe(stagedVersions);
   if (stagedVersions.kind === 'staged') log('Preserving retained Windows installers from the previous container...');
-  await writeConfigs(dir, domain, secrets, mirrorMode, turn);
+  await writeConfigs(dir, domain, secrets, mirrorMode, turn, onlyoffice);
   await persistSecrets(dir, secrets);
-  log(`Created .env, docker-compose.yml, Caddyfile${turn ? ', TURN config' : ''}${mirrorMode ? ' (mirror mode)' : ''}`);
+  log(`Created .env, docker-compose.yml, Caddyfile${turn ? ', TURN config' : ''}${onlyoffice.enabled ? ', ONLYOFFICE config' : ''}${mirrorMode ? ' (mirror mode)' : ''}`);
 
   // 4. Start PostgreSQL (skip if already healthy)
   if (isServiceHealthy(compose, dir, 'postgres')) {
@@ -1356,6 +1711,15 @@ export async function setupFlow(domain: string, opts: SetupFlowOptions = {}): Pr
     log('TURN ready.');
   }
 
+  if (onlyoffice.enabled) {
+    if (isServiceHealthy(compose, dir, 'onlyoffice')) {
+      log('ONLYOFFICE Document Server already running.');
+    } else {
+      log('Starting ONLYOFFICE Document Server...');
+      composeCmd(compose, dir, 'up -d onlyoffice');
+    }
+  }
+
   // 6. Start server (skip if already healthy)
   if (isServiceHealthy(compose, dir, 'server')) {
     log('Server already running.');
@@ -1374,7 +1738,7 @@ export async function setupFlow(domain: string, opts: SetupFlowOptions = {}): Pr
   log('Database bootstrapped.');
 
   // 8. Start remaining services
-  log(`Starting Caddy${turn ? ', TURN' : ''} and Watchtower...`);
+  log(`Starting Caddy${turn ? ', TURN' : ''}${onlyoffice.enabled ? ', ONLYOFFICE' : ''} and Watchtower...`);
   composeCmd(compose, dir, 'up -d');
   log('All services running.');
 
@@ -1402,7 +1766,7 @@ export async function setupFlow(domain: string, opts: SetupFlowOptions = {}): Pr
   │
   │  Admin login:    admin / ${secrets.adminPassword}
   │  Bind URL:       ${bindUrl}
-${turn ? `  │  TURN relay:     turn:${turn.host}:${turn.port} (DNS only)\n` : ''}  │
+${onlyoffice.enabled ? `  │  Document server: https://${domain}/onlyoffice (ONLYOFFICE enabled)\n` : ''}${turn ? `  │  TURN relay:     turn:${turn.host}:${turn.port} (DNS only)\n` : ''}  │
 ${turn ? `  │  TURN capacity:   ${describeTurnRelayCapacity(turn.relayMinPort, turn.relayMaxPort)} (${turn.networkMode} networking)\n` : ''}${turn ? `  │  Firewall:       TCP/UDP ${turn.port}; UDP ${turn.relayMinPort}-${turn.relayMaxPort}${turn.networkMode === 'host' ? ' (host networking: Docker does NOT open these, the host firewall must)' : ''}\n  │\n` : ''}  │  Installer retention: docker volume ${NODE_EXE_VERSION_VOLUME} (keeps superseded
   │                        Windows installers; do not prune it or existing
   │                        install codes stop resolving)

@@ -1,6 +1,12 @@
 /** Embedded deployment templates for `imcodes setup`. */
 
 import {
+  ONLYOFFICE_SERVICE_DEFAULTS,
+  ONLYOFFICE_SERVICE_ENV,
+  ONLYOFFICE_VOLUME_NAMES,
+  defaultOnlyOfficePublicUrl,
+} from '../../shared/onlyoffice-service.js';
+import {
   TURN_RELAY_CAPACITY,
   TURN_SERVICE_DEFAULTS,
   TURN_SERVICE_DENIED_PEER_RANGES,
@@ -29,6 +35,14 @@ export interface TurnDeploymentTemplateConfig {
    * container can never describe different shapes.
    */
   networkMode?: TurnRelayNetworkMode;
+}
+
+export interface OnlyOfficeDeploymentTemplateConfig {
+  enabled: boolean;
+  jwtSecret?: string;
+  publicUrl?: string;
+  internalUrl?: string;
+  image?: string;
 }
 
 /**
@@ -61,14 +75,20 @@ function deploymentNetworkMode(turn: TurnDeploymentTemplateConfig | undefined): 
  */
 export const NODE_EXE_VERSION_VOLUME = 'node_exe_versions';
 export const NODE_EXE_VERSION_DIR = '/var/lib/imcodes/node-exe-versions';
+export const ONLYOFFICE_DATA_VOLUME = ONLYOFFICE_VOLUME_NAMES.DATA;
+export const ONLYOFFICE_LOGS_VOLUME = ONLYOFFICE_VOLUME_NAMES.LOGS;
 
 export function dockerComposeTemplate(opts?: {
   ghcrPrefix?: string;
   turn?: TurnDeploymentTemplateConfig;
   turnImage?: string;
+  onlyoffice?: OnlyOfficeDeploymentTemplateConfig;
+  onlyofficeImage?: string;
 }): string {
   const ghcr = opts?.ghcrPrefix ?? 'ghcr.io';
   const turnImage = opts?.turnImage ?? TURN_SERVICE_DEFAULTS.IMAGE;
+  const onlyofficeEnabled = opts?.onlyoffice === undefined || opts.onlyoffice.enabled;
+  const onlyofficeImage = opts?.onlyoffice?.image ?? opts?.onlyofficeImage ?? ONLYOFFICE_SERVICE_DEFAULTS.IMAGE;
   // Same relay range either way. Bridge mode publishes it; host mode cannot,
   // because Docker turns a published RANGE into one mapping, one proxy and its
   // own DNAT rules PER PORT. See turnRelayNetworkMode for the measured rule.
@@ -127,6 +147,22 @@ ${turnSharedService}
   const turnService = opts?.turn?.enabled
     ? (turnNetworkMode === 'host' ? turnHostService : turnBridgeService)
     : '';
+  const onlyofficeService = onlyofficeEnabled
+    ? `
+  onlyoffice:
+    image: ${onlyofficeImage}
+    restart: unless-stopped
+    environment:
+      JWT_ENABLED: "true"
+      JWT_SECRET: "\${${ONLYOFFICE_SERVICE_ENV.JWT_SECRET}}"
+      JWT_HEADER: "Authorization"
+      JWT_IN_BODY: "true"
+      WOPI_ENABLED: "false"
+    volumes:
+      - ${ONLYOFFICE_DATA_VOLUME}:/var/www/onlyoffice/Data
+      - ${ONLYOFFICE_LOGS_VOLUME}:/var/log/onlyoffice
+`
+    : '';
   return `services:
   postgres:
     image: pgvector/pgvector:pg18
@@ -166,6 +202,10 @@ ${turnSharedService}
       TURN_CREDENTIAL_TTL_SECONDS: "\${TURN_CREDENTIAL_TTL_SECONDS:-}"
       TURN_RELAY_MIN_PORT: "\${TURN_RELAY_MIN_PORT:-}"
       TURN_RELAY_MAX_PORT: "\${TURN_RELAY_MAX_PORT:-}"
+      ${ONLYOFFICE_SERVICE_ENV.ENABLED}: "\${${ONLYOFFICE_SERVICE_ENV.ENABLED}:-true}"
+      ${ONLYOFFICE_SERVICE_ENV.JWT_SECRET}: "\${${ONLYOFFICE_SERVICE_ENV.JWT_SECRET}:-}"
+      ${ONLYOFFICE_SERVICE_ENV.PUBLIC_URL}: "\${${ONLYOFFICE_SERVICE_ENV.PUBLIC_URL}:-https://\${DOMAIN}${ONLYOFFICE_SERVICE_DEFAULTS.SUBPATH}}"
+      ${ONLYOFFICE_SERVICE_ENV.INTERNAL_URL}: "\${${ONLYOFFICE_SERVICE_ENV.INTERNAL_URL}:-${ONLYOFFICE_SERVICE_DEFAULTS.INTERNAL_URL}}"
       # Retained superseded artifacts live on a named volume, not in the image.
       IMCODES_NODE_EXE_VERSION_DIR: ${NODE_EXE_VERSION_DIR}
     volumes:
@@ -175,7 +215,7 @@ ${turnSharedService}
     depends_on:
       postgres:
         condition: service_healthy
-
+${onlyofficeService}
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
@@ -210,6 +250,8 @@ volumes:
   pgdata:
   caddy_data:
   caddy_config:
+  ${ONLYOFFICE_DATA_VOLUME}:
+  ${ONLYOFFICE_LOGS_VOLUME}:
   # Declared explicitly so an upgrade neither renames nor drops it; existing
   # named volumes above are untouched.
   ${NODE_EXE_VERSION_VOLUME}:
@@ -219,8 +261,22 @@ volumes:
 /** @deprecated Use dockerComposeTemplate() instead. */
 export const DOCKER_COMPOSE_TEMPLATE = dockerComposeTemplate();
 
-export function caddyfileTemplate(domain: string): string {
+export function caddyfileTemplate(domain: string, opts?: { onlyoffice?: boolean }): string {
+  const onlyofficeEnabled = opts?.onlyoffice !== false;
+  if (!onlyofficeEnabled) {
+    return `${domain} {
+\treverse_proxy server:19138
+}
+`;
+  }
   return `${domain} {
+\thandle_path ${ONLYOFFICE_SERVICE_DEFAULTS.SUBPATH}/* {
+\t\treverse_proxy onlyoffice:80 {
+\t\t\theader_up X-Forwarded-Proto {scheme}
+\t\t\theader_up X-Forwarded-Host {host}
+\t\t\theader_up X-Forwarded-Prefix ${ONLYOFFICE_SERVICE_DEFAULTS.SUBPATH}
+\t\t}
+\t}
 \treverse_proxy server:19138
 }
 `;
@@ -232,6 +288,7 @@ export function envTemplate(vars: {
   jwtSigningKey: string;
   adminPassword: string;
   turn?: TurnDeploymentTemplateConfig;
+  onlyoffice?: OnlyOfficeDeploymentTemplateConfig;
 }): string {
   const turn = vars.turn?.enabled ? `TURN_ENABLED=true
 TURN_HOST=${vars.turn.host}
@@ -243,12 +300,20 @@ TURN_RELAY_MIN_PORT=${vars.turn.relayMinPort}
 TURN_RELAY_MAX_PORT=${vars.turn.relayMaxPort}
 ${TURN_SERVICE_ENV.RELAY_NETWORK_MODE}=${deploymentNetworkMode(vars.turn)}
 ` : 'TURN_ENABLED=false\n';
+  const onlyofficeEnabled = vars.onlyoffice === undefined ? true : vars.onlyoffice.enabled;
+  const onlyofficeJwtSecret = vars.onlyoffice?.jwtSecret ?? '';
+  const onlyofficePublicUrl = vars.onlyoffice?.publicUrl ?? defaultOnlyOfficePublicUrl(vars.domain);
+  const onlyofficeInternalUrl = vars.onlyoffice?.internalUrl ?? ONLYOFFICE_SERVICE_DEFAULTS.INTERNAL_URL;
+  const onlyoffice = `${ONLYOFFICE_SERVICE_ENV.ENABLED}=${onlyofficeEnabled ? 'true' : 'false'}
+${ONLYOFFICE_SERVICE_ENV.JWT_SECRET}=${onlyofficeJwtSecret}
+${ONLYOFFICE_SERVICE_ENV.PUBLIC_URL}=${onlyofficePublicUrl}
+${ONLYOFFICE_SERVICE_ENV.INTERNAL_URL}=${onlyofficeInternalUrl}
+`;
   return `DOMAIN=${vars.domain}
 POSTGRES_PASSWORD=${vars.postgresPassword}
 JWT_SIGNING_KEY=${vars.jwtSigningKey}
 DEFAULT_ADMIN_PASSWORD=${vars.adminPassword}
-${turn}
-`;
+${turn}${onlyoffice}`;
 }
 
 export function turnserverConfigTemplate(

@@ -872,8 +872,10 @@ program
 program
   .command('setup')
   .description('Deploy IM.codes server + daemon on this machine (Docker required)')
-  .requiredOption('--domain <domain>', 'Domain name for HTTPS (e.g. imc.example.com)')
+  .option('--domain <domain>', 'Domain name for HTTPS (e.g. imc.example.com; auto-detected from .env when running --onlyoffice)')
   .option('--force', 'Overwrite existing setup')
+  .option('--onlyoffice', 'Enable ONLYOFFICE Document Server (default on fresh install, or add non-destructively to an existing deployment)')
+  .option('--no-onlyoffice', 'Disable ONLYOFFICE Document Server')
   .option('--turn', 'Enable an authenticated coturn relay for WebRTC file transfer')
   .option('--no-turn', 'Disable a previously configured TURN relay')
   .option('--turn-host <host>', 'Separate DNS-only TURN hostname (default: turn.<domain>; never orange-cloud proxied)')
@@ -887,8 +889,9 @@ program
   .option('--turn-relay-max-port <port>', 'Last TURN relay UDP port (explicit override; needs --turn-relay-min-port)')
   .option('--turn-dns-only', 'Confirm the TURN hostname is not proxied by Cloudflare or another HTTP proxy')
   .action(async (opts: {
-    domain: string;
+    domain?: string;
     force?: boolean;
+    onlyoffice?: boolean;
     turn?: boolean;
     turnHost?: string;
     turnPort?: string;
@@ -897,11 +900,21 @@ program
     turnRelayMinPort?: string;
     turnRelayMaxPort?: string;
     turnDnsOnly?: boolean;
-  }) => {
-    const { setupFlow } = await import('./setup/setup-flow.js');
-    await setupFlow(opts.domain, {
+  }, cmd: Command) => {
+    const { setupFlow, recoverDomainFromEnv } = await import('./setup/setup-flow.js');
+    const onlyofficeSource = cmd.getOptionValueSource('onlyoffice');
+    const onlyoffice = onlyofficeSource === 'cli' ? opts.onlyoffice : undefined;
+    const turnSource = cmd.getOptionValueSource('turn');
+    const turn = turnSource === 'cli' ? opts.turn : undefined;
+    const resolvedDomain = opts.domain?.trim() || (onlyoffice === true ? recoverDomainFromEnv(process.cwd()) : undefined);
+    if (!resolvedDomain) {
+      console.error("error: required option '--domain <domain>' not specified (or run 'imcodes setup --onlyoffice' in a directory with an existing .env containing DOMAIN)");
+      process.exit(1);
+    }
+    await setupFlow(resolvedDomain, {
       force: opts.force,
-      turn: opts.turn,
+      onlyoffice,
+      turn,
       turnHost: opts.turnHost,
       turnPort: opts.turnPort,
       turnExternalIp: opts.turnExternalIp,
