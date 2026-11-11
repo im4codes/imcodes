@@ -288,7 +288,10 @@ interface KimiSdkSessionState {
   agyBridges?: Map<string, AgyTranscriptBridge>;
   agyPendingLaunches?: string[];
   agyReactive?: boolean;
-  agySuppressBridgeResponses?: boolean;
+  agyPendingResponses?: Map<number, AgyTranscriptRow>;
+  agyNativeAcks?: string[];
+  agyBridging?: boolean;
+  agyNativeTurnGeneration?: number;
 }
 
 interface ActivePromptAdmission {
@@ -630,6 +633,7 @@ export class KimiSdkProvider implements TransportProvider {
   private closeAgyBridges(state: KimiSdkSessionState): void {
     for (const bridge of state.agyBridges?.values() ?? []) bridge.close();
     state.agyBridges?.clear(); state.agyReactive = false;
+    state.agyPendingResponses?.clear(); state.agyNativeAcks = [];
   }
 
   private async startAgyBridge(sessionId: string, state: KimiSdkSessionState, childId?: string): Promise<void> {
@@ -672,20 +676,36 @@ export class KimiSdkProvider implements TransportProvider {
         } catch { /* not a native child creation result */ }
       }
     }
+    if (row.type === 'USER_INPUT') state.agyReactive = false;
     if (row.type === 'SYSTEM_MESSAGE' && /\[Message\].*sender=/.test(row.content ?? '')) state.agyReactive = true;
     if (row.type !== 'PLANNER_RESPONSE' || !row.content?.trim() || row.tool_calls?.length || !state.agyReactive) return;
     state.agyReactive = false;
-    // Native stdout already owns an active turn. Its boundary flush above
-    // consumes these same steps without replaying a second completion.
-    if (state.promptInFlight || state.agySuppressBridgeResponses) return;
-    this.startAutonomousTurn(sessionId,state);
-    const generation = state.autonomousTurnGeneration!;
-    state.currentMessageId = `${nativeId}:step:${row.step_index}`; state.currentText = row.content;
-    state.lastTurnUsage = {input_tokens:row.input_tokens,output_tokens:row.output_tokens,cache_read_input_tokens:row.cache_read_tokens};
-    this.emitStatus(sessionId,state,{status:'streaming',label:null});
-    for (const cb of this.deltaCallbacks) cb(sessionId,{messageId:state.currentMessageId,type:'text',delta:row.content,role:'assistant'});
-    (state.activePromptGenerations ??= new Set()).add(generation);
-    this.settleTurn(sessionId,state,generation,'end_turn');
+    (state.agyPendingResponses ??= new Map()).set(row.step_index, row);
+    this.deliverAgyPendingResponses(sessionId,state);
+  }
+
+  private deliverAgyPendingResponses(sessionId: string, state: KimiSdkSessionState): void {
+    if (this.sessions.get(sessionId) !== state || state.cancelled || state.stoppedByCancel || state.promptInFlight) return;
+    for (const [step, row] of state.agyPendingResponses ?? []) {
+      if (state.promptInFlight || this.sessions.get(sessionId) !== state) return;
+      state.agyPendingResponses!.delete(step);
+      // A native ACP autonomous completion acknowledges one ordered reactive
+      // response, not every row read while a foreground RPC was pending. This
+      // preserves a new child wakeup that beats the PREVIOUS RPC's delayed ack.
+      const ack = state.agyNativeAcks?.[0];
+      if (ack !== undefined && ack === row.content!.trimEnd()) { state.agyNativeAcks!.shift(); continue; }
+      state.agyBridging = true;
+      try {
+        this.startAutonomousTurn(sessionId,state);
+        const generation = state.autonomousTurnGeneration!;
+        state.currentMessageId = `${state.acpSessionId}:step:${row.step_index}`; state.currentText = row.content!;
+        state.lastTurnUsage = {input_tokens:row.input_tokens,output_tokens:row.output_tokens,cache_read_input_tokens:row.cache_read_tokens};
+        this.emitStatus(sessionId,state,{status:'streaming',label:null});
+        for (const cb of this.deltaCallbacks) cb(sessionId,{messageId:state.currentMessageId,type:'text',delta:row.content!,role:'assistant'});
+        (state.activePromptGenerations ??= new Set()).add(generation);
+        this.settleTurn(sessionId,state,generation,'end_turn');
+      } finally { state.agyBridging = false; }
+    }
   }
 
   async checkSessionCompaction(sessionId: string): Promise<boolean> {
@@ -1756,6 +1776,7 @@ export class KimiSdkProvider implements TransportProvider {
     compactControl = false,
   ): void {
     if (this.sessions.get(sessionId) !== state) return;
+    const nativeAutonomous = state.agyNativeTurnGeneration === generation && !state.agyBridging;
     const run = this.steeringRunTerminals.get(state);
     let steeringFailure: unknown;
     if (this.profile.steeringPrompts) {
@@ -1790,11 +1811,9 @@ export class KimiSdkProvider implements TransportProvider {
     }
     this.clearStatus(sessionId, state);
     if (this.id === AGY_SDK_PROVIDER_ID && state.agyBridges?.size) {
-      state.agySuppressBridgeResponses = true;
+      if (nativeAutonomous && state.currentText.trim()) (state.agyNativeAcks ??= []).push(state.currentText.trimEnd());
       const bridge = state.agyBridges.get(state.acpSessionId!);
-      void bridge?.flush().finally(() => {
-        if (this.sessions.get(sessionId) === state) { state.agyReactive = false; state.agySuppressBridgeResponses = false; }
-      });
+      void bridge?.flush().finally(() => this.deliverAgyPendingResponses(sessionId,state));
     }
     const text = state.currentText;
     const messageId = state.currentMessageId ?? `${sessionId}:${randomUUID()}`;
@@ -2022,6 +2041,7 @@ export class KimiSdkProvider implements TransportProvider {
   private startAutonomousTurn(sessionId: string, state: KimiSdkSessionState): void {
     const generation = ++state.turnGeneration;
     state.autonomousTurnGeneration = generation;
+    if (this.id === AGY_SDK_PROVIDER_ID) state.agyNativeTurnGeneration = generation;
     state.promptInFlight = true;
     state.promptSubmittedGeneration = generation;
     state.cancelled = false;

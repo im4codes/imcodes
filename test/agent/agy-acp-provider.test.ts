@@ -127,7 +127,7 @@ describe('AG native ACP', () => {
     expect(a.at(-1)?.detail?.meta?.terminal).toBe(true);
     expect(child.some(t=>t.detail?.input?.description==='find info')).toBe(true);
   });
-  it.each(['native-child-log','native-child-both'])('bridges real-shaped native child results/reactive parent completion once without another RPC (%s)', async scenario => {
+  it.each(['native-child-log','native-child-both','native-child-rpc-late'])('bridges real-shaped native child results/reactive parent completion once without another RPC (%s)', async scenario => {
     const {provider,requests}=await setup(scenario);const id=await route(provider),done=vi.fn(),events:ToolCallEvent[]=[];
     provider.onComplete(done);provider.onToolCall((_,t)=>events.push(t));
     await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2),{timeout:6000});

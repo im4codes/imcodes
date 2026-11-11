@@ -139,7 +139,8 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
         note(p.sessionId,{sessionUpdate:'tool_call_update',toolCallId:'launch',status:'completed'});
         fs.appendFileSync(file,row(1,'PLANNER_RESPONSE','',{tool_calls:[{name:'invoke_subagent',args:{Role:'WakeProbe'}}]})+row(2,'GENERIC','Created the following subagent:\n'+JSON.stringify({conversationId:childId}))+row(3,'PLANNER_RESPONSE','PARENT-STARTED'));
         note(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'PARENT-STARTED'}});
-        ok(req.id,{stopReason:'end_turn',usage:{inputTokens:100,outputTokens:2}});
+        const finishFirst=()=>ok(req.id,{stopReason:'end_turn',usage:{inputTokens:100,outputTokens:2}});
+        if(scenario==='native-child-rpc-late') setTimeout(finishFirst,300);else finishFirst();
         setTimeout(()=>{
           const childDir=`${process.env.HOME}/.gemini/antigravity-cli/brain/${childId}/.system_generated/logs`;fs.mkdirSync(childDir,{recursive:true});
           fs.writeFileSync(childDir+'/transcript_full.jsonl',row(0,'PLANNER_RESPONSE','CHILD-PONG'));
