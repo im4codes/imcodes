@@ -105,7 +105,9 @@ describe('iOS localized Action extension and shared Inbox handoff', () => {
     const app = read('../ios/App/App/AppDelegate.swift'), receiver = read('../ios/App/App/AuthSessionPlugin.swift');
     expect(app).toContain('url.host?.lowercased() == "share-inbox"');
     expect(app.match(/drainInboxFilesIfNeeded\(\)/g)!.length).toBeGreaterThanOrEqual(4);
-    for (const text of ['appendingPathComponent("Inbox"', 'appendingPathComponent("SharedInbox"', '.skipsHiddenFiles', 'inboxScanScheduled', 'info.isSymbolicLink != true', 'isManagedInboxFile(url)', 'var consumed = false', 'drainInboxFilesIfNeeded()']) expect(receiver).toContain(text);
+    for (const text of ['appendingPathComponent("Inbox"', 'appendingPathComponent("SharedInbox"', 'inboxScanScheduled', 'info.isSymbolicLink != true', 'isManagedInboxFile(url)', 'var consumed = false', 'drainInboxFilesIfNeeded()']) expect(receiver).toContain(text);
+    expect(receiver).not.toContain('.skipsHiddenFiles'); // Hidden attachments such as .env must survive.
+    for (const text of ['root.lastPathComponent == "SharedInbox"', 'info.isDirectory == true', 'file.deletingLastPathComponent().standardizedFileURL == root.standardizedFileURL', 'file.lastPathComponent.hasPrefix(".pending-")', 'files.skipDescendants()']) expect(receiver).toContain(text);
     expect(receiver).toContain('if full { return }'); expect(receiver).toContain('call.resolve(["items": items])');
   });
 });

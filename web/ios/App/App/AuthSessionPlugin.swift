@@ -112,13 +112,21 @@ public class ShareReceiverPlugin: CAPPlugin, CAPBridgedPlugin {
                 if rescan { self.drainInboxFilesIfNeeded() }
             }
             for root in self.inboxRoots {
-                guard let files = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey], options: [.skipsHiddenFiles]) else { continue }
+                guard let files = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .isDirectoryKey], options: []) else { continue }
                 for case let file as URL in files {
                     self.lock.lock(); let full = self.pendingShares.count >= Self.maxPendingShares; self.lock.unlock()
                     if full { return } // Leave overflow on disk for consumePendingShares' next pass.
-                    guard self.isManagedInboxFile(file),
-                          let info = try? file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
-                          info.isRegularFile == true, info.isSymbolicLink != true else { continue }
+                    guard let info = try? file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .isDirectoryKey]) else { continue }
+                    // Only unpublished extension batches are reserved; a shared .env
+                    // or another hidden regular file is still a legitimate attachment.
+                    if root.lastPathComponent == "SharedInbox", info.isDirectory == true,
+                       file.deletingLastPathComponent().standardizedFileURL == root.standardizedFileURL,
+                       file.lastPathComponent.hasPrefix(".pending-") {
+                        files.skipDescendants()
+                        continue
+                    }
+                    guard self.isManagedInboxFile(file), info.isRegularFile == true,
+                          info.isSymbolicLink != true else { continue }
                     _ = self.handleIncomingFileURL(file)
                 }
             }
