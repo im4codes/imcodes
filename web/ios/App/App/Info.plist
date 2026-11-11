@@ -59,6 +59,16 @@
 	<string>IM.codes needs camera access to take photos for upload.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>IM.codes needs photo library access to select files for upload.</string>
+	<key>CFBundleLocalizations</key>
+	<array>
+		<string>en</string>
+		<string>zh-Hans</string>
+		<string>zh-Hant</string>
+		<string>ja</string>
+		<string>ko</string>
+		<string>es</string>
+		<string>ru</string>
+	</array>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
@@ -75,6 +85,8 @@
 		<dict>
 			<key>CFBundleTypeName</key>
 			<string>All Files</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
 			<key>LSHandlerRank</key>
 			<string>Alternate</string>
 			<key>LSItemContentTypes</key>

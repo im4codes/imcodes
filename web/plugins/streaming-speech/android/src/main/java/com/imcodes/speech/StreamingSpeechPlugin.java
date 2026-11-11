@@ -14,20 +14,22 @@ import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import com.getcapacitor.annotation.Permission;
 import com.getcapacitor.annotation.PermissionCallback;
-import com.k2fsa.sherpa.onnx.OfflinePunctuation;
-import com.k2fsa.sherpa.onnx.OfflinePunctuationConfig;
-import com.k2fsa.sherpa.onnx.OfflinePunctuationModelConfig;
-import com.k2fsa.sherpa.onnx.OnlineRecognizer;
-import com.k2fsa.sherpa.onnx.OnlineRecognizerConfig;
-import com.k2fsa.sherpa.onnx.OnlineStream;
+import com.k2fsa.sherpa.onnx.OfflineRecognizer;
+import com.k2fsa.sherpa.onnx.OfflineRecognizerConfig;
+import com.k2fsa.sherpa.onnx.OfflineStream;
 import java.io.IOException;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.ArrayDeque;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.regex.Pattern;
 
 /** Audio never leaves this device. One serial worker owns all native decoder state. */
 @CapacitorPlugin(name = "StreamingSpeech", permissions = {
@@ -36,24 +38,13 @@ import java.util.regex.Pattern;
 public class StreamingSpeechPlugin extends Plugin {
     private static final int SAMPLE_RATE = 16000;
     private static final int MAX_BUFFERED_CHUNKS = 64; // ~6.4s at 100ms/chunk (matches iOS slots = 64)
-    private static final Pattern PUNCT_STRIP = Pattern.compile("[，。？！、；：,.?!;:…—\\-]+");
-    private static final Pattern PUNCT_END_BEFORE_COMMA = Pattern.compile("([。？！?!])([，,、]+)");
-    private static final Pattern PUNCT_COMMA_BEFORE_END = Pattern.compile("([，,、]+)([。？！?!])");
-    private static final Pattern PUNCT_DUP_COMMA = Pattern.compile("[，,、]{2,}");
-    private static final Pattern PUNCT_DUP_PERIOD = Pattern.compile("[。]{2,}");
-    private static final Pattern PUNCT_DUP_QUESTION = Pattern.compile("[？?]{2,}");
-    private static final Pattern PUNCT_ASCII_PERIOD = Pattern.compile("([A-Za-z0-9])。");
-    private static final Pattern PUNCT_ASCII_COMMA = Pattern.compile("([A-Za-z0-9])，");
-    private static final Pattern PUNCT_ASCII_QUESTION = Pattern.compile("([A-Za-z0-9])？");
-    private static final Pattern PUNCT_ASCII_EXCLAM = Pattern.compile("([A-Za-z0-9])！");
-    private static final Pattern PUNCT_TRAILING_PERIOD = Pattern.compile("[。\\.\\s]+$");
+    private static final int MAX_UTTERANCE_SAMPLES = 20 * SAMPLE_RATE;
+    private static final int PARTIAL_INTERVAL_SAMPLES = 9600; // 0.6s, not a latency guarantee
+    private static final String[] MODEL_FILES = { "conv_frontend.onnx", "encoder.int4.onnx", "encoder.int4.weights", "decoder.int4.onnx", "decoder.int4.weights", "tokenizer/vocab.json", "tokenizer/merges.txt", "tokenizer/tokenizer_config.json", "hotwords.txt" };
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final AtomicLong generation = new AtomicLong();
     private final Object captureLock = new Object();
-    private OnlineRecognizer recognizer;
-    private OfflinePunctuation punctuator;
-    private String lastCleanInput = "";
-    private String lastPunctuatedFull = "";
+    private OfflineRecognizer recognizer;
     private CaptureSession activeSession;
     private volatile AudioRecord recorder;
     private volatile boolean listening;
@@ -63,63 +54,64 @@ public class StreamingSpeechPlugin extends Plugin {
         worker.execute(() -> {
             try {
                 ensureRecognizer();
-                ensurePunctuator();
             } catch (Exception | LinkageError ignored) {
                 // Deferred to start() where initialization errors surface to the caller.
             }
         });
     }
 
-    private OnlineRecognizer ensureRecognizer() {
+    private OfflineRecognizer ensureRecognizer() throws IOException {
         if (recognizer != null) return recognizer;
-        OnlineRecognizerConfig config = new OnlineRecognizerConfig();
-        config.getModelConfig().getTransducer().setEncoder("encoder.int8.onnx");
-        config.getModelConfig().getTransducer().setDecoder("decoder.onnx");
-        config.getModelConfig().getTransducer().setJoiner("joiner.int8.onnx");
-        config.getModelConfig().setTokens("tokens.txt");
-        config.getModelConfig().setModelType("zipformer");
-        config.getModelConfig().setModelingUnit("cjkchar+bpe");
-        config.getModelConfig().setBpeVocab("bpe.vocab");
-        config.getModelConfig().setNumThreads(2);
-        config.setDecodingMethod("modified_beam_search");
-        config.setHotwordsFile("hotwords.txt");
-        config.setHotwordsScore(2.0f);
-        config.getEndpointConfig().getRule2().setMinTrailingSilence(1.2f);
-        config.getEndpointConfig().getRule3().setMinUtteranceLength(30.0f);
-        OnlineRecognizer created = new OnlineRecognizer(getContext().getAssets(), config);
-        OnlineStream warmStream = created.createStream("");
-        try {
-            warmStream.acceptWaveform(new float[SAMPLE_RATE / 2], SAMPLE_RATE);
-            decodeAvailable(created, warmStream);
-        } finally {
-            warmStream.release();
+        // ORT cannot resolve external .weights from an in-memory Android asset.
+        // Publish complete files into this model revision's private no-backup cache.
+        File root = new File(getContext().getNoBackupFilesDir(), "qwen3-asr-9012f07ac1ce43c7e9fbd3afd8cad90fe147f88e");
+        for (String name : MODEL_FILES) {
+            File file = new File(root, name);
+            if (!file.getParentFile().isDirectory() && !file.getParentFile().mkdirs()) throw new IOException("Speech cache directory unavailable");
+            try (java.io.InputStream input = getContext().getAssets().open(name)) {
+                if (file.isFile() && file.length() == input.available() && file.length() > 0) continue;
+                File pending = new File(file.getPath() + ".part");
+                try {
+                    try (FileOutputStream output = new FileOutputStream(pending)) {
+                        byte[] buffer = new byte[65536]; int count;
+                        while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
+                    }
+                    if (!pending.renameTo(file)) throw new IOException("Speech cache publish failed");
+                } finally { pending.delete(); }
+            }
         }
-        recognizer = created;
+        OfflineRecognizerConfig config = new OfflineRecognizerConfig();
+        var model = config.getModelConfig();
+        model.setNumThreads(2);
+        model.setProvider("cpu");
+        var qwen = model.getQwen3Asr();
+        qwen.setConvFrontend(new File(root, "conv_frontend.onnx").getPath());
+        qwen.setEncoder(new File(root, "encoder.int4.onnx").getPath());
+        qwen.setDecoder(new File(root, "decoder.int4.onnx").getPath());
+        qwen.setTokenizer(new File(root, "tokenizer").getPath());
+        qwen.setMaxTotalLen(768); qwen.setMaxNewTokens(128);
+        qwen.setTemperature(1e-6f); qwen.setTopP(0.8f); qwen.setSeed(42);
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(getContext().getAssets().open("hotwords.txt"), StandardCharsets.UTF_8))) {
+            qwen.setHotwords(String.join(",", reader.lines().map(String::trim).filter(line -> !line.isEmpty()).toArray(String[]::new)));
+        }
+        recognizer = new OfflineRecognizer(null, config);
         return recognizer;
     }
 
-    private OfflinePunctuation ensurePunctuator() {
-        if (punctuator != null) return punctuator;
-        OfflinePunctuationModelConfig model = new OfflinePunctuationModelConfig();
-        model.setCtTransformer("punct.int8.onnx");
-        model.setNumThreads(2);
-        model.setDebug(false);
-        model.setProvider("cpu");
-        OfflinePunctuationConfig config = new OfflinePunctuationConfig(model);
-        OfflinePunctuation created = new OfflinePunctuation(getContext().getAssets(), config);
-        created.addPunctuation("你好世界");
-        punctuator = created;
-        return punctuator;
-    }
-
-    private void decodeAvailable(OnlineRecognizer recognizer, OnlineStream stream) {
-        while (recognizer.isReady(stream)) recognizer.decode(stream);
+    private String decodeSamples(OfflineRecognizer recognizer, float[] samples, int count) {
+        if (count == 0) return "";
+        OfflineStream stream = recognizer.createStream();
+        try {
+            stream.acceptWaveform(Arrays.copyOf(samples, count), SAMPLE_RATE);
+            recognizer.decode(stream);
+            return recognizer.getResult(stream).getText().trim();
+        } finally { stream.release(); }
     }
 
     @PluginMethod
     public void available(PluginCall call) {
         boolean ready = true;
-        for (String name : new String[] { "encoder.int8.onnx", "decoder.onnx", "joiner.int8.onnx", "tokens.txt", "bpe.vocab", "hotwords.txt", "punct.int8.onnx" }) {
+        for (String name : MODEL_FILES) {
             try (java.io.InputStream input = getContext().getAssets().open(name)) {
                 if (input.read() < 0) ready = false;
             } catch (IOException e) { ready = false; }
@@ -240,61 +232,34 @@ public class StreamingSpeechPlugin extends Plugin {
     }
 
     private void capture(PluginCall call, long owner, AudioRecord audio, CaptureSession session) {
-        OnlineRecognizer recognizer = null;
-        OfflinePunctuation punctuator = null;
-        OnlineStream stream = null;
-        String committed = "", last = "", prevClean = "";
-        int unchangedSilentChunks = 0;
-        lastCleanInput = "";
-        lastPunctuatedFull = "";
+        OfflineRecognizer recognizer = null;
+        float[] utteranceSamples = new float[MAX_UTTERANCE_SAMPLES];
+        int sampleCount = 0, lastDecodedCount = 0, unchangedSilentChunks = 0;
+        String committed = "", last = "";
         boolean failed = false;
         try {
             if (session.isDiscarded() || generation.get() != owner) return;
             recognizer = ensureRecognizer();
             if (session.isDiscarded() || generation.get() != owner) return;
-            punctuator = ensurePunctuator();
-            if (session.isDiscarded() || generation.get() != owner) return;
-            stream = recognizer.createStream("");
-            // Half-second left-context padding establishes the acoustic alignment baseline.
-            stream.acceptWaveform(new float[SAMPLE_RATE / 2], SAMPLE_RATE);
-            decodeAvailable(recognizer, stream);
             while (!session.isDiscarded() && generation.get() == owner) {
                 float[] samples = session.pollSamples(generation);
                 if (samples == null) break;
-                double level = computeLevel(samples);
-                stream.acceptWaveform(samples, SAMPLE_RATE);
-                decodeAvailable(recognizer, stream);
-                String text = recognizer.getResult(stream).getText().trim();
-                String rawFull = join(committed, text);
-                String clean = stripPunctuation(rawFull);
-                boolean endpoint = recognizer.isEndpoint(stream);
-                if (clean.isEmpty()) {
-                    unchangedSilentChunks = 0;
-                } else if (!clean.equals(prevClean)) {
-                    prevClean = clean;
-                    unchangedSilentChunks = endpoint ? 3 : 0;
-                } else if (endpoint) {
-                    unchangedSilentChunks = Math.max(unchangedSilentChunks, 3);
-                } else if (level < 0.08) {
-                    unchangedSilentChunks++;
-                } else if (unchangedSilentChunks < 3) {
-                    unchangedSilentChunks = 0;
-                }
-                boolean allowTrailingPeriod = endpoint || unchangedSilentChunks >= 3;
-                String full = punctuate(rawFull, punctuator, allowTrailingPeriod);
-                if (!full.equals(last)) { partial(full, false); last = full; }
-                if (endpoint) {
-                    // Reset keeps transducer encoder context; a fresh stream prevents
-                    // the next utterance from losing its first words after a pause.
-                    OnlineStream next = recognizer.createStream("");
-                    // Half-second left-context padding establishes the acoustic alignment baseline.
-                    next.acceptWaveform(new float[SAMPLE_RATE / 2], SAMPLE_RATE);
-                    decodeAvailable(recognizer, next);
-                    stream.release();
-                    stream = next;
-                    committed = rawFull;
-                    prevClean = clean;
-                    unchangedSilentChunks = Math.max(unchangedSilentChunks, 3);
+                boolean speech = computeLevel(samples) >= 0.01;
+                if (sampleCount == 0 && !speech) continue; // Don't hallucinate from leading silence.
+                for (int offset = 0; offset < samples.length;) {
+                    int count = Math.min(samples.length - offset, MAX_UTTERANCE_SAMPLES - sampleCount);
+                    System.arraycopy(samples, offset, utteranceSamples, sampleCount, count);
+                    sampleCount += count; offset += count;
+                    unchangedSilentChunks = speech ? 0 : unchangedSilentChunks + 1;
+                    boolean endpoint = sampleCount == MAX_UTTERANCE_SAMPLES || unchangedSilentChunks >= 6;
+                    if (endpoint || (speech && sampleCount - lastDecodedCount >= PARTIAL_INTERVAL_SAMPLES)) {
+                        String text = decodeSamples(recognizer, utteranceSamples, sampleCount);
+                        if (session.isDiscarded() || generation.get() != owner) break;
+                        String full = join(committed, text);
+                        if (!full.equals(last)) { partial(full, false); last = full; }
+                        lastDecodedCount = sampleCount;
+                        if (endpoint) { committed = full; sampleCount = 0; lastDecodedCount = 0; unchangedSilentChunks = 0; }
+                    }
                 }
             }
         } catch (Exception | LinkageError e) {
@@ -309,16 +274,15 @@ public class StreamingSpeechPlugin extends Plugin {
             }
         } finally {
             session.stopIntake();
-            // Normal stop before or after warmup drains all accepted PCM and flushes the final right-context window.
-            if (!failed && !session.isDiscarded() && generation.get() == owner && stream != null && recognizer != null) {
+            // Normal stop drains every accepted PCM chunk before the final barrier.
+            if (!failed && !session.isDiscarded() && generation.get() == owner && recognizer != null) {
                 try {
-                    // One second covers the transducer's final right-context window.
-                    stream.acceptWaveform(new float[SAMPLE_RATE], SAMPLE_RATE);
-                    stream.inputFinished();
-                    decodeAvailable(recognizer, stream);
-                    String rawFinal = join(committed, recognizer.getResult(stream).getText().trim());
-                    partial(punctuate(rawFinal, punctuator, true), true);
-                } catch (Exception | LinkageError ignored) { /* still release microphone/stream */ }
+                    String full = join(committed, decodeSamples(recognizer, utteranceSamples, sampleCount));
+                    if (!session.isDiscarded() && generation.get() == owner) partial(full, true);
+                } catch (Exception | LinkageError error) {
+                    JSObject failure = new JSObject(); failure.put("message", "Offline speech final decoding failed");
+                    notifyListeners("recognitionError", failure);
+                }
             }
             synchronized (captureLock) {
                 if (audio != null) {
@@ -331,7 +295,6 @@ public class StreamingSpeechPlugin extends Plugin {
                     listening = false;
                 }
             }
-            if (stream != null) stream.release();
             if (!session.isDiscarded() && generation.get() == owner) state("stopped");
         }
     }
@@ -341,44 +304,6 @@ public class StreamingSpeechPlugin extends Plugin {
         double power = 0;
         for (float s : samples) power += s * s;
         return Math.min(1, Math.sqrt(power / samples.length) * 3);
-    }
-
-    private static String stripPunctuation(String text) {
-        if (text == null || text.isEmpty()) return "";
-        return PUNCT_STRIP.matcher(text).replaceAll("").trim().toLowerCase(java.util.Locale.ROOT);
-    }
-
-    private static String formatBilingualPunctuation(String text) {
-        if (text == null || text.isEmpty()) return "";
-        String out = PUNCT_END_BEFORE_COMMA.matcher(text).replaceAll("$1");
-        out = PUNCT_COMMA_BEFORE_END.matcher(out).replaceAll("$2");
-        out = PUNCT_DUP_COMMA.matcher(out).replaceAll("，");
-        out = PUNCT_DUP_PERIOD.matcher(out).replaceAll("。");
-        out = PUNCT_DUP_QUESTION.matcher(out).replaceAll("？");
-        out = PUNCT_ASCII_PERIOD.matcher(out).replaceAll("$1.");
-        out = PUNCT_ASCII_COMMA.matcher(out).replaceAll("$1, ");
-        out = PUNCT_ASCII_QUESTION.matcher(out).replaceAll("$1?");
-        out = PUNCT_ASCII_EXCLAM.matcher(out).replaceAll("$1!");
-        return out;
-    }
-
-    private String punctuate(String rawText, OfflinePunctuation punctuator, boolean allowTrailingPeriod) {
-        String clean = stripPunctuation(rawText);
-        if (clean.isEmpty()) return "";
-        if (punctuator == null) return clean;
-        String punctuated;
-        if (clean.equals(lastCleanInput)) {
-            punctuated = lastPunctuatedFull;
-        } else {
-            String rawPunct = punctuator.addPunctuation(clean);
-            punctuated = formatBilingualPunctuation(rawPunct != null ? rawPunct : clean);
-            lastCleanInput = clean;
-            lastPunctuatedFull = punctuated;
-        }
-        if (allowTrailingPeriod) {
-            return punctuated.trim();
-        }
-        return PUNCT_TRAILING_PERIOD.matcher(punctuated).replaceAll("");
     }
 
     private static final class CaptureSession {
@@ -535,10 +460,6 @@ public class StreamingSpeechPlugin extends Plugin {
     @Override protected void handleOnDestroy() {
         stopCapture(true);
         worker.execute(() -> {
-            if (punctuator != null) {
-                punctuator.release();
-                punctuator = null;
-            }
             if (recognizer != null) {
                 recognizer.release();
                 recognizer = null;

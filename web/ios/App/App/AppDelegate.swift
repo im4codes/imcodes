@@ -16,6 +16,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
         WatchBridge.shared.activate()
 
         self.registerLocalPluginsIfNeeded()
+        ShareReceiverPlugin.shared.drainInboxFilesIfNeeded()
         if let launchURL = launchOptions?[.url] as? URL, launchURL.isFileURL {
             _ = ShareReceiverPlugin.shared.handleIncomingFileURL(launchURL)
         }
@@ -60,6 +61,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
         WatchBridge.shared.activate()
 
         self.registerLocalPluginsIfNeeded()
+        ShareReceiverPlugin.shared.drainInboxFilesIfNeeded()
 
         DispatchQueue.main.async {
             self.registerLocalPluginsIfNeeded()
@@ -96,7 +98,14 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
     func application(_ app: UIApplication, open url: URL, options: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool {
         self.registerLocalPluginsIfNeeded()
         if url.isFileURL {
-            return ShareReceiverPlugin.shared.handleIncomingFileURL(url)
+            let handled = ShareReceiverPlugin.shared.handleIncomingFileURL(url)
+            ShareReceiverPlugin.shared.drainInboxFilesIfNeeded()
+            return handled
+        }
+        if url.scheme?.lowercased() == "imcodes", url.host?.lowercased() == "share-inbox" {
+            ShareReceiverPlugin.shared.drainInboxFilesIfNeeded()
+            ShareReceiverPlugin.shared.flushToWebView()
+            return true
         }
         // Called when the app was launched with a url. Feel free to add additional processing here,
         // but if you want the App API to support tracking app url opens, make sure to keep this call

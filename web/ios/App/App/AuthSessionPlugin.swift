@@ -80,6 +80,50 @@ public class ShareReceiverPlugin: CAPPlugin, CAPBridgedPlugin {
     private let lock = NSLock()
     private var pendingShares: [[String: Any]] = []
     private var recentHandledPaths: [String: TimeInterval] = [:]
+    private let inboxWorker = DispatchQueue(label: "com.imcodes.share-inbox", qos: .userInitiated)
+    private var inboxScanScheduled = false
+    private var inboxRescanRequested = false
+
+    private var inboxRoots: [URL] {
+        var roots = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).map { $0.appendingPathComponent("Inbox", isDirectory: true) }
+        if let group = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: "group.com.im.codes") {
+            roots.append(group.appendingPathComponent("SharedInbox", isDirectory: true))
+        }
+        return roots
+    }
+
+    private func isManagedInboxFile(_ url: URL) -> Bool {
+        let path = url.resolvingSymlinksInPath().standardizedFileURL.path
+        return inboxRoots.contains { path.hasPrefix($0.resolvingSymlinksInPath().standardizedFileURL.path + "/") }
+    }
+
+    public func drainInboxFilesIfNeeded() {
+        lock.lock()
+        guard !inboxScanScheduled else { inboxRescanRequested = true; lock.unlock(); return }
+        inboxScanScheduled = true
+        lock.unlock()
+        inboxWorker.async {
+            defer {
+                self.lock.lock()
+                self.inboxScanScheduled = false
+                let rescan = self.inboxRescanRequested
+                self.inboxRescanRequested = false
+                self.lock.unlock()
+                if rescan { self.drainInboxFilesIfNeeded() }
+            }
+            for root in self.inboxRoots {
+                guard let files = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey], options: [.skipsHiddenFiles]) else { continue }
+                for case let file as URL in files {
+                    self.lock.lock(); let full = self.pendingShares.count >= Self.maxPendingShares; self.lock.unlock()
+                    if full { return } // Leave overflow on disk for consumePendingShares' next pass.
+                    guard self.isManagedInboxFile(file),
+                          let info = try? file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+                          info.isRegularFile == true, info.isSymbolicLink != true else { continue }
+                    _ = self.handleIncomingFileURL(file)
+                }
+            }
+        }
+    }
 
     @discardableResult
     public func handleIncomingFileURL(_ url: URL) -> Bool {
@@ -100,11 +144,12 @@ public class ShareReceiverPlugin: CAPPlugin, CAPBridgedPlugin {
         lock.unlock()
 
         let accessed = url.startAccessingSecurityScopedResource()
+        var consumed = false
         defer {
             if accessed {
                 url.stopAccessingSecurityScopedResource()
             }
-            if url.path.contains("/Documents/Inbox/") || url.path.contains("-Inbox/") {
+            if consumed && (url.path.contains("/Documents/Inbox/") || url.path.contains("-Inbox/") || url.path.contains("/SharedInbox/")) && isManagedInboxFile(url) {
                 try? FileManager.default.removeItem(at: url)
             }
         }
@@ -118,6 +163,7 @@ public class ShareReceiverPlugin: CAPPlugin, CAPBridgedPlugin {
         if let resourceValues = try? url.resourceValues(forKeys: [.fileSizeKey]),
            let fileSize = resourceValues.fileSize,
            fileSize > Self.maxShareBytes {
+            consumed = true
             dispatchOrEnqueue([
                 "id": payloadId,
                 "files": [],
@@ -136,6 +182,7 @@ public class ShareReceiverPlugin: CAPPlugin, CAPBridgedPlugin {
         }
 
         if data.count > Self.maxShareBytes {
+            consumed = true
             dispatchOrEnqueue([
                 "id": payloadId,
                 "files": [],
@@ -150,6 +197,7 @@ public class ShareReceiverPlugin: CAPPlugin, CAPBridgedPlugin {
             "size": data.count,
             "base64": data.base64EncodedString()
         ]
+        consumed = true
         dispatchOrEnqueue([
             "id": payloadId,
             "files": [fileEntry]
@@ -199,6 +247,9 @@ public class ShareReceiverPlugin: CAPPlugin, CAPBridgedPlugin {
         pendingShares.removeAll()
         lock.unlock()
         call.resolve(["items": items])
+        // Refill capacity after successful delivery, but don't turn an
+        // unreadable retained file into an automatic error/retry loop.
+        if items.contains(where: { $0["error"] == nil }) { drainInboxFilesIfNeeded() }
     }
 
     private static func inferMimeType(for url: URL) -> String {

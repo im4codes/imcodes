@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Build-time only: one checksum-pinned INT8 model shared by Android and iOS.
+// Build-time only: one checksum-pinned Qwen3-ASR-0.6B INT4 model shared by Android and iOS.
 import { createHash } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { mkdir, rename, rm, stat } from 'node:fs/promises';
@@ -7,18 +7,18 @@ import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-export const MODEL_REVISION = '98590b7ed6443e77b714204da2757d75e1a642f4';
-export const PUNCT_MODEL_REVISION = '5cccf43af83e4fc50d1d55b8410312e87709be70';
-const modelBase = `https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/resolve/${MODEL_REVISION}`;
-const punctModelBase = `https://huggingface.co/ranger810/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8/resolve/${PUNCT_MODEL_REVISION}`;
+export const MODEL_REVISION = '9012f07ac1ce43c7e9fbd3afd8cad90fe147f88e';
+const modelBase = `https://huggingface.co/goodpixelltd/qwen3-asr-0.6b-int4-sherpa-onnx/resolve/${MODEL_REVISION}`;
 export const SPEECH_ASSETS = [
-  ['models/encoder.int8.onnx', `${modelBase}/encoder-epoch-99-avg-1.int8.onnx`, '8fa764187a261844f859d7143ebaa563af5d10adfece4c18a8f414c88cba2a9b', 181895032],
-  ['models/decoder.onnx', `${modelBase}/decoder-epoch-99-avg-1.onnx`, '2e3b5ec371f8899ee6acd829fd753ba45772df57a91bdf37cde3136354e7db7d', 13876452],
-  ['models/joiner.int8.onnx', `${modelBase}/joiner-epoch-99-avg-1.int8.onnx`, '1ed689c5ed19dbaa725d9d191bb4822b5f4855a39e1ffd28cbc1f340d25b2ee0', 3228404],
-  ['models/tokens.txt', `${modelBase}/tokens.txt`, 'a8e0e4ec53810e433789b54a5c0134a7eaa2ffca595a6334d54c00da858841d3', 56317],
-  ['models/bpe.vocab', `${modelBase}/bpe.vocab`, 'd0b642f3a2eacd5fadefdeff9e0e1358cab729647cbb7fe58cf738e1f7407029', 12564],
+  ['models/conv_frontend.onnx', `${modelBase}/conv_frontend.onnx`, 'd22dc4423e0940e49884e903d2ea2f7e5567c14fc1aed97e4e26d6b8f208ef9e', 44148281],
+  ['models/encoder.int4.onnx', `${modelBase}/encoder.int4.onnx`, '774e997d23a2f06c3f544666625c93a3b824fdd83d04c6acd88ee25f4e3b6e2e', 5622024],
+  ['models/encoder.int4.weights', `${modelBase}/encoder.int4.weights`, 'dc66975d9be10fbd31f89c76d33dd0bf4a8059ef14da4abf545bbf9895a5293d', 110308864],
+  ['models/decoder.int4.onnx', `${modelBase}/decoder.int4.onnx`, 'c588d2a89460315f51ca8c65dbe85a0619891500fc853e5b673e3c914c25b2d3', 891837],
+  ['models/decoder.int4.weights', `${modelBase}/decoder.int4.weights`, '126c8e16074cc87250dacbf07602315e3bc5239c93ea414773b6e3a6fd4bf466', 469962752],
+  ['models/tokenizer/vocab.json', `${modelBase}/tokenizer/vocab.json`, 'ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910', 2776833],
+  ['models/tokenizer/merges.txt', `${modelBase}/tokenizer/merges.txt`, '8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5', 1671853],
+  ['models/tokenizer/tokenizer_config.json', `${modelBase}/tokenizer/tokenizer_config.json`, '4942d005604266809309cabc9f4e9cb89ce855d59b14681fdc0e1cc62ea26c4c', 12487],
   ['models/hotwords.txt', null, '26feefe92ea440b2cd286ace1b4d386db86990bd6f6a95e921cdbe0c1af79b49', 53],
-  ['models/punct.int8.onnx', `${punctModelBase}/model.int8.onnx`, '65a3fb9f5ad7bfb96bf69e0dc4481df97f6ee60513c1d94ce981ba6effd524b1', 75519198],
   ['android/libs/sherpa-onnx-2.0.1.aar', 'https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/sherpa-onnx-2.0.1.aar', 'a8d09d1d32f3eb8520482c6d3d43fae674681c5b050385967c70a3c2c9bf0ee7', 49441341],
 ];
 export async function matchesAsset(file, hash, size) {
@@ -52,9 +52,11 @@ export async function prepareSpeechAssets(root, download = fetch, assets = SPEEC
       }
     }
   }
-  // A cached old decoder would otherwise be copied into both app packages.
-  if (assets.some(([relative]) => relative === 'models/decoder.onnx')) {
-    await rm(new URL('models/decoder.int8.onnx', root), { force: true });
+  // Retire only known obsolete assets, and only after the new model verifies.
+  if (assets.some(([relative]) => relative === 'models/conv_frontend.onnx')) {
+    for (const name of ['encoder.int8.onnx', 'decoder.onnx', 'decoder.int8.onnx', 'joiner.int8.onnx', 'punct.int8.onnx', 'tokens.txt', 'bpe.vocab']) {
+      await rm(new URL(`models/${name}`, root), { force: true });
+    }
   }
 }
 if (process.argv[1] && fileURLToPath(import.meta.url) === fileURLToPath(pathToFileURL(process.argv[1]))) {
