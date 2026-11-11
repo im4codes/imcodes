@@ -44,7 +44,7 @@ describe('AG native ACP', () => {
     const prompts = (await requests()).filter(x => x.method === 'session/prompt');
     expect(prompts.map(x => x.params.sessionId)).toEqual(['native-1', 'native-1', 'native-1']);
     expect((await requests()).some(x => x.method === 'session/cancel')).toBe(false);
-    expect(complete.mock.calls[0]?.[1].metadata.usage).toEqual({ inputTokens: scenario === 'reordered' ? 30 : 10, outputTokens: scenario === 'reordered' ? 15 : 5 });
+    expect(complete.mock.calls[0]?.[1].metadata.usage).toMatchObject({ inputTokens: scenario === 'reordered' ? 30 : 10, outputTokens: scenario === 'reordered' ? 15 : 5 });
   });
   it('deduplicates durable ids, including retries after the superseded A response', async () => {
     const { provider, requests } = await setup(); const id = await route(provider);
@@ -65,6 +65,86 @@ describe('AG native ACP', () => {
     await provider.send(id, 'A'); await provider.notifyActiveDelegation(id, notification('B')); await provider.cancelAndWait(id);
     await vi.waitFor(() => expect(errors).toHaveBeenCalledTimes(1)); expect(complete).not.toHaveBeenCalled();
     expect(await provider.notifyActiveDelegation(id, notification('C'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
+  });
+  it('keeps one stable ACP prefix and normalizes native usage for relay', async () => {
+    const { provider, requests } = await setup(); const id = await route(provider);
+    const complete = vi.fn(); provider.onComplete(complete);
+    const text = 'UNCOMPRESSED Brain role; user/project/pair/session identity; MCP policy 完整 😀';
+    for (const message of ['ordinary one', 'after silent compaction']) {
+      const payload = normalizeProviderPayload(message);
+      payload.sessionSystemText = text;
+      await provider.send(id, payload);
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(message === 'ordinary one' ? 1 : 2));
+    }
+    const prompts = (await requests()).filter(x => x.method === 'session/prompt');
+    expect(prompts[0].params.prompt[0].text).toContain(text);
+    expect(prompts[1].params.prompt[0].text).not.toContain(text);
+    expect(complete.mock.calls[1][1].metadata.usage).toMatchObject({ input_tokens: 10, output_tokens: 5 });
+  });
+  it('reasserts byte-identical ACP contracts once after summary/model/compact/clear/initialize', async () => {
+    const {provider,requests,root}=await setup('usage-missing'); let id=await route(provider);
+    const done=vi.fn(); provider.onComplete(done); let count=0;
+    const contract='UNCOMPRESSED Brain-only delegation; USER/PROJECT/PAIR/SESSION identity; MCP guidance 完整 😀';
+    const send=async(label:string, injected:boolean) => {
+      const payload=normalizeProviderPayload(label); payload.sessionSystemText=contract;
+      await provider.send(id,payload); count++;
+      await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(count));
+      const prompt=(await requests()).filter(x=>x.method==='session/prompt').at(-1).params.prompt[0].text;
+      expect(prompt.split(contract).length-1).toBe(injected?1:0);
+      if(label!=='/compact') expect(Number(done.mock.calls.at(-1)![1].metadata.usage.input_tokens)).toBeGreaterThan(0);
+      return prompt;
+    };
+    const first=await send('ordinary one',true);
+    await send('ordinary two',false); await send('ordinary three',false); await send('ordinary four',false);
+    const native=(await requests()).find(x=>x.method==='session/prompt').params.sessionId;
+    const logs=path.join(root,'.gemini/antigravity-cli/brain',native,'.system_generated/logs'); await mkdir(logs,{recursive:true});
+    await writeFile(path.join(logs,'transcript.jsonl'),JSON.stringify({step_index:10,source:'USER_EXPLICIT',type:'USER_INPUT',status:'DONE',created_at:'2026-11-12T00:00:00Z',content:'<CONTEXT_SUMMARY>summary</CONTEXT_SUMMARY>'})+'\n');
+    const restored=await send('after summary',true);
+    expect(restored.slice(0,restored.indexOf('after summary'))).toBe(first.slice(0,first.indexOf('ordinary one')));
+    await send('post summary ordinary',false);
+    provider.setSessionAgentId(id,'model-b'); await send('after set model',true); await send('post set ordinary',false);
+    await provider.applySessionModel(id,'model-a'); await send('after apply model',true); await send('post apply ordinary',false);
+    await send('/compact',false); await send('after compact',true); await send('post compact ordinary',false);
+    provider.refreshSessionSystemText(id); await send('after clear',true); await send('post clear ordinary',false);
+    id=await route(provider,id,{fresh:true}); await send('after initialize',true); await send('post initialize ordinary',false);
+  });
+  it.each(['usage-missing','usage-zero','usage-used'])('reports positive current ACP occupancy (%s)', async scenario => {
+    const {provider}=await setup(scenario); const id=await route(provider); const done=vi.fn(),usage=vi.fn(); provider.onComplete(done);provider.onUsage(usage);
+    const p=normalizeProviderPayload('hello');p.sessionSystemText='full system contract '.repeat(100);
+    await provider.send(id,p); await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1));
+    const value=done.mock.calls[0][1].metadata.usage;
+    if(scenario==='usage-used') expect(value).toMatchObject({input_tokens:45000,model_context_window:1000000});
+    else { expect(value.input_tokens).toBeGreaterThan(100);expect(value.context_usage_estimated).toBe(true); }
+    expect(usage.mock.calls.some(([,u])=>u.usage.input_tokens>0)).toBe(true);
+  });
+  it('synchronizes real ACP tool calls and native snapshots into canonical Agent lifecycles', async () => {
+    const {provider}=await setup('subagents');const id=await route(provider),done=vi.fn(),events:ToolCallEvent[]=[];
+    provider.onComplete(done);provider.onToolCall((_,t)=>events.push(t));
+    await provider.send(id,'children');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1));
+    const child=events.filter(t=>t.name==='Agent');expect(child.length).toBeGreaterThan(8);
+    for(const normalizedStatus of ['running','complete','error','interrupted']) expect(child.some(t=>t.detail?.meta?.normalizedStatus===normalizedStatus)).toBe(true);
+    const a=child.filter(t=>t.detail?.meta?.agentPath==='child-a'); expect(new Set(a.map(t=>t.id)).size).toBe(1);
+    expect(a.at(-1)?.detail?.meta?.terminal).toBe(true);
+    expect(child.some(t=>t.detail?.input?.description==='find info')).toBe(true);
+  });
+  it.each(['native-child-log','native-child-both'])('bridges real-shaped native child results/reactive parent completion once without another RPC (%s)', async scenario => {
+    const {provider,requests}=await setup(scenario);const id=await route(provider),done=vi.fn(),events:ToolCallEvent[]=[];
+    provider.onComplete(done);provider.onToolCall((_,t)=>events.push(t));
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2),{timeout:6000});
+    expect(done.mock.calls.map(([,m])=>m.content)).toEqual(['PARENT-STARTED','PARENT-WOKE CHILD-PONG']);
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(1);
+    const children=events.filter(t=>t.name==='Agent');
+    expect(children.some(t=>t.detail?.meta?.agentPath==='native-child-fixture')).toBe(true);
+    await vi.waitFor(()=>expect(events.some(t=>t.detail?.meta?.normalizedStatus==='complete')).toBe(true));
+    expect(new Set(children.filter(t=>t.detail?.meta?.agentPath==='native-child-fixture').map(t=>t.id)).size).toBe(1);
+    await new Promise(r=>setTimeout(r,100));expect(done).toHaveBeenCalledTimes(2);
+    const state=(provider as any).sessions.get(id);await provider.endSession(id);expect(state.agyBridges.size).toBe(0);
+  });
+  it('closes native log observers on Stop and never revives the stopped parent',async()=>{
+    const {provider}=await setup('native-child-log');const id=await route(provider),done=vi.fn();provider.onComplete(done);
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1));
+    const state=(provider as any).sessions.get(id);await provider.cancel(id);
+    expect(state.agyBridges.size).toBe(0);await new Promise(r=>setTimeout(r,300));expect(done).toHaveBeenCalledTimes(1);
   });
   it.each(['reordered', 'reject-b'])('Stop waits for all RPCs even after the last one settled (%s)', async scenario => {
     const { provider } = await setup(scenario), id = await route(provider), errors = vi.fn();

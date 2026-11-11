@@ -66,9 +66,10 @@ function finish(sid, state) {
   record({ fixture: 'completed-model', sessionId: sid, model: state.turnModel });
   note(sid, { sessionUpdate: 'tool_call_update', toolCallId: 'sleep', status: 'completed', rawOutput: 'done' });
   note(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: state.inputs.join(' ') } });
+  if (scenario === 'usage-used') note(sid,{sessionUpdate:'usage_update',used:45000,size:1000000});
   const pending = state.pending.splice(0);
   if (scenario === 'reordered') pending.reverse();
-  for (const [i, id] of pending.entries()) setTimeout(() => ok(id, { stopReason: 'end_turn', usage: { inputTokens: 10, outputTokens: 5 } }), i * (Number(process.env.AGY_ACP_FIXTURE_REPLY_GAP_MS) || 20));
+  for (const [i, id] of pending.entries()) setTimeout(() => ok(id, { stopReason: 'end_turn', usage: scenario === 'usage-missing' ? {} : scenario === 'usage-zero' ? {inputTokens:0,outputTokens:0} : { inputTokens: 10, outputTokens: 5 } }), i * (Number(process.env.AGY_ACP_FIXTURE_REPLY_GAP_MS) || 20));
   state.inputs = [];
   if (shouldScheduleWakeup) state.autoTimer = setTimeout(() => startAutoWakeup(sid, state), 20);
 }
@@ -127,6 +128,47 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     case 'session/prompt': {
       const state = sessions.get(p.sessionId); if (!state) return error(req.id, 'Missing session');
       const text = p.prompt.map(x => x.text || '').join('');
+      if (scenario.startsWith('native-child-')) {
+        const dir = `${process.env.HOME}/.gemini/antigravity-cli/brain/${p.sessionId}/.system_generated/logs`;
+        fs.mkdirSync(dir,{recursive:true});
+        const file=dir+'/transcript_full.jsonl';
+        const row=(step_index,type,content,extra={})=>JSON.stringify({step_index,type,status:'DONE',source:type==='USER_INPUT'?'USER_EXPLICIT':'MODEL',created_at:'2026-11-12T00:00:00Z',content,...extra})+'\n';
+        const childId='native-child-fixture';
+        fs.writeFileSync(file,row(0,'USER_INPUT',text));
+        note(p.sessionId,{sessionUpdate:'tool_call',toolCallId:'launch',title:'Run invoke_subagent',kind:'other',status:'in_progress',rawInput:{Role:'WakeProbe',Prompt:'return result',Model:'model-a'}});
+        note(p.sessionId,{sessionUpdate:'tool_call_update',toolCallId:'launch',status:'completed'});
+        fs.appendFileSync(file,row(1,'PLANNER_RESPONSE','',{tool_calls:[{name:'invoke_subagent',args:{Role:'WakeProbe'}}]})+row(2,'GENERIC','Created the following subagent:\n'+JSON.stringify({conversationId:childId}))+row(3,'PLANNER_RESPONSE','PARENT-STARTED'));
+        note(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'PARENT-STARTED'}});
+        ok(req.id,{stopReason:'end_turn',usage:{inputTokens:100,outputTokens:2}});
+        setTimeout(()=>{
+          const childDir=`${process.env.HOME}/.gemini/antigravity-cli/brain/${childId}/.system_generated/logs`;fs.mkdirSync(childDir,{recursive:true});
+          fs.writeFileSync(childDir+'/transcript_full.jsonl',row(0,'PLANNER_RESPONSE','CHILD-PONG'));
+          if(scenario==='native-child-both') {
+            note(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'PARENT-WOKE CHILD-PONG'}});
+          }
+          fs.appendFileSync(file,row(4,'SYSTEM_MESSAGE','[Message] sender='+childId+' content=CHILD-PONG')+row(5,'PLANNER_RESPONSE','PARENT-WOKE CHILD-PONG',{input_tokens:120,cache_read_tokens:80,output_tokens:3}));
+          if(scenario==='native-child-both') note(p.sessionId,{sessionUpdate:'turn_completed'});
+        },180);
+        return;
+      }
+      if (scenario === 'subagents') {
+      const ops = [
+        ['define_subagent', {name:'Researcher',prompt:'definition only'}, {}],
+        ['invoke_subagent', {Subagents:[{Role:'Researcher',Prompt:'find info',Model:'model-a'}]}, {conversationId:'child-a',status:'running'}],
+        ['manage_subagents', {action:'list'}, {subagents:[{conversationId:'child-a',status:'completed',role:'Researcher'}]}],
+        ['swarm', {action:'add',conversationId:'child-b',prompt:'work'}, {conversationId:'child-b',status:'running'}],
+        ['swarm', {action:'status'}, {agents:[{conversationId:'child-b',status:'error'}]}],
+        ['send_message', {conversationId:'child-b',prompt:'try again'}, {}],
+        ['manage_subagents', {action:'kill',conversationId:'child-b'}, {}],
+        ['browser_subagent', {prompt:'inspect local page'}, {conversationId:'browser-c',status:'completed'}],
+      ];
+        for (const [i,[title,rawInput,rawOutput]] of ops.entries()) {
+          note(p.sessionId, {sessionUpdate:'tool_call',toolCallId:`child-tool-${i}`,title,kind:'other',status:'in_progress',rawInput});
+          note(p.sessionId, {sessionUpdate:'tool_call_update',toolCallId:`child-tool-${i}`,status:'completed',rawOutput});
+        }
+        note(p.sessionId, {sessionUpdate:'agent_message_chunk',content:{type:'text',text:'children synced'}});
+        return ok(req.id,{stopReason:'end_turn',usage:{inputTokens:50,outputTokens:2}});
+      }
       if (text === 'B' && scenario === 'reject-b') return error(req.id, 'B was rejected');
       if (state.inAutoWakeup) {
         record({ fixture: 'prompt-model', sessionId: p.sessionId, model: state.turnModel, text });

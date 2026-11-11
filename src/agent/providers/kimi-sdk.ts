@@ -1,3 +1,8 @@
+import { AgyTranscriptBridge, agyTranscriptFile, type AgyTranscriptRow } from '../agy-transcript-bridge.js';
+import { AgySubagentTracker } from '../agy-subagents.js';
+import { AgyCompactionWatermark } from '../agy-compaction-watermark.js';
+import { AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
+import { AgyContextUsage } from '../agy-context-usage.js';
 import { confirmPromiseStop } from '../provider-stop-confirmation.js';
 /**
  * KimiSdkProvider — TransportProvider that drives `kimi acp` over the
@@ -86,6 +91,7 @@ import type {
   SessionConfig,
   SessionInfoUpdate,
   ProviderStatusUpdate,
+  ProviderUsageUpdate,
   ToolCallEvent,
   ApprovalRequest,
   ProviderCompactCapability,
@@ -276,6 +282,13 @@ interface KimiSdkSessionState {
    *  the onComplete `metadata.usage` can carry per-turn token counts to the
    *  daemon's transport-relay. */
   lastTurnUsage?: Record<string, unknown>;
+  agyContextUsage?: AgyContextUsage;
+  agyCompactionWatermark?: AgyCompactionWatermark;
+  agySubagents?: AgySubagentTracker;
+  agyBridges?: Map<string, AgyTranscriptBridge>;
+  agyPendingLaunches?: string[];
+  agyReactive?: boolean;
+  agySuppressBridgeResponses?: boolean;
 }
 
 interface ActivePromptAdmission {
@@ -315,6 +328,7 @@ export class KimiSdkProvider implements TransportProvider {
   private toolCallCallbacks: Array<(sessionId: string, tool: ToolCallEvent) => void> = [];
   private sessionInfoCallbacks: Array<(sessionId: string, info: SessionInfoUpdate) => void> = [];
   private statusCallbacks: Array<(sessionId: string, status: ProviderStatusUpdate) => void> = [];
+  private usageCallbacks = new Set<(sessionId: string, usage: ProviderUsageUpdate) => void>();
   private approvalCallbacks: Array<(sessionId: string, request: ApprovalRequest) => void> = [];
   private pendingApprovals = new Map<string, {
     routeId: string;
@@ -347,7 +361,7 @@ export class KimiSdkProvider implements TransportProvider {
       attachments: profile.resourceLinkAttachments === true,
       reasoningEffort: false,
       contextSupport: 'degraded-message-side-context-mapping',
-      backgroundSubagentWake: profile.runtimeSubagent
+      backgroundSubagentWake: profile.id === AGY_SDK_PROVIDER_ID ? BACKGROUND_SUBAGENT_WAKE_MODES.NATIVE : profile.runtimeSubagent
         ? BACKGROUND_SUBAGENT_WAKE_MODES.RUNTIME
         : BACKGROUND_SUBAGENT_WAKE_MODES.UNSUPPORTED,
       // ACP exposes no per-call veto and no per-session disable for the
@@ -438,6 +452,7 @@ export class KimiSdkProvider implements TransportProvider {
       await this.teardownChild();
       this.acpToRoute.clear();
       this.acpRouteOrder.clear();
+      for (const state of this.sessions.values()) this.closeAgyBridges(state);
       this.sessions.clear();
       this.config = null;
       this.initPromise = null;
@@ -452,6 +467,7 @@ export class KimiSdkProvider implements TransportProvider {
   async createSession(config: SessionConfig): Promise<string> {
     const routeId = config.bindExistingKey ?? config.sessionKey;
     const prior = this.sessions.get(routeId);
+    if (prior) this.closeAgyBridges(prior);
     const existing = config.fresh ? undefined : prior;
     const state: KimiSdkSessionState = {
       routeId,
@@ -500,6 +516,7 @@ export class KimiSdkProvider implements TransportProvider {
     const state = this.sessions.get(sessionId);
     if (!state) return;
     this.cancelPendingApprovals(sessionId);
+    this.closeAgyBridges(state);
     this.sessions.delete(state.routeId);
     const removedSoleAcpRoute = state.acpSessionId
       ? this.releaseAcpRoute(state.acpSessionId, state.routeId)
@@ -520,6 +537,7 @@ export class KimiSdkProvider implements TransportProvider {
     const state = this.sessions.get(sessionId);
     if (!state) return;
     this.cancelPendingApprovals(sessionId);
+    this.closeAgyBridges(state);
     this.sessions.delete(state.routeId);
     if (state.acpSessionId) this.releaseAcpRoute(state.acpSessionId, state.routeId);
   }
@@ -607,6 +625,96 @@ export class KimiSdkProvider implements TransportProvider {
 
   onToolCall(cb: (sessionId: string, tool: ToolCallEvent) => void): void {
     this.toolCallCallbacks.push(cb);
+  }
+
+  private closeAgyBridges(state: KimiSdkSessionState): void {
+    for (const bridge of state.agyBridges?.values() ?? []) bridge.close();
+    state.agyBridges?.clear(); state.agyReactive = false;
+  }
+
+  private async startAgyBridge(sessionId: string, state: KimiSdkSessionState, childId?: string): Promise<void> {
+    if (this.id !== AGY_SDK_PROVIDER_ID || !state.acpSessionId) return;
+    const id = childId ?? state.acpSessionId;
+    const bridges = state.agyBridges ??= new Map();
+    if (bridges.has(id)) return;
+    const env = { ...process.env, ...(this.config?.env as Record<string,string> | undefined), ...state.env };
+    const file = agyTranscriptFile(env.HOME || env.USERPROFILE || '', id);
+    if (!file) return;
+    const bridge = new AgyTranscriptBridge(file, row => {
+      if (this.sessions.get(sessionId) !== state || state.cancelled || state.stoppedByCancel) return;
+      this.handleAgyTranscriptRow(sessionId, state, id, row);
+    });
+    bridges.set(id, bridge);
+    await bridge.start(!!childId);
+    if (this.sessions.get(sessionId) !== state || state.cancelled) bridge.close();
+  }
+
+  private handleAgyTranscriptRow(sessionId: string, state: KimiSdkSessionState, nativeId: string, row: AgyTranscriptRow): void {
+    const tracker = state.agySubagents ??= new AgySubagentTracker(state.acpSessionId ?? sessionId);
+    const publish = (events: ToolCallEvent[]) => { for (const event of events) for (const cb of this.toolCallCallbacks) cb(sessionId, event); };
+    if (nativeId !== state.acpSessionId) {
+      if (row.type === 'PLANNER_RESPONSE' && row.content?.trim() && !row.tool_calls?.length) {
+        publish(tracker.snapshot({conversationId:nativeId,status:'completed',stateDetail:row.content}, 'native_completion'));
+        state.agyBridges?.get(nativeId)?.close(); state.agyBridges?.delete(nativeId);
+      }
+      return;
+    }
+    if (row.type === 'GENERIC' && row.content?.includes('Created the following subagent:')) {
+      // Real AG ACP omits rawOutput; this native tool-result supplies the id.
+      for (const match of row.content.matchAll(/\{[^{}]*"conversationId"[^{}]*\}/g)) {
+        try {
+          const child = JSON.parse(match[0]) as {conversationId?:string};
+          if (!child.conversationId || !agyTranscriptFile('/scoped',child.conversationId)) continue;
+          const toolId = state.agyPendingLaunches?.shift();
+          if (!toolId) continue; // Never replay another launch/history as ours.
+          publish(tracker.snapshot({...child,status:'running'}, 'native_launch', toolId));
+          void this.startAgyBridge(sessionId,state,child.conversationId);
+        } catch { /* not a native child creation result */ }
+      }
+    }
+    if (row.type === 'SYSTEM_MESSAGE' && /\[Message\].*sender=/.test(row.content ?? '')) state.agyReactive = true;
+    if (row.type !== 'PLANNER_RESPONSE' || !row.content?.trim() || row.tool_calls?.length || !state.agyReactive) return;
+    state.agyReactive = false;
+    // Native stdout already owns an active turn. Its boundary flush above
+    // consumes these same steps without replaying a second completion.
+    if (state.promptInFlight || state.agySuppressBridgeResponses) return;
+    this.startAutonomousTurn(sessionId,state);
+    const generation = state.autonomousTurnGeneration!;
+    state.currentMessageId = `${nativeId}:step:${row.step_index}`; state.currentText = row.content;
+    state.lastTurnUsage = {input_tokens:row.input_tokens,output_tokens:row.output_tokens,cache_read_input_tokens:row.cache_read_tokens};
+    this.emitStatus(sessionId,state,{status:'streaming',label:null});
+    for (const cb of this.deltaCallbacks) cb(sessionId,{messageId:state.currentMessageId,type:'text',delta:row.content,role:'assistant'});
+    (state.activePromptGenerations ??= new Set()).add(generation);
+    this.settleTurn(sessionId,state,generation,'end_turn');
+  }
+
+  async checkSessionCompaction(sessionId: string): Promise<boolean> {
+    if (this.id !== AGY_SDK_PROVIDER_ID) return false;
+    const state = this.sessions.get(sessionId);
+    if (!state || !state.acpSessionId) return false;
+    const env = { ...process.env, ...(this.config?.env as Record<string, string> | undefined), ...state.env };
+    const watermark = state.agyCompactionWatermark ??= new AgyCompactionWatermark();
+    const changed = await watermark.check(env.HOME || env.USERPROFILE, state.acpSessionId);
+    if (this.sessions.get(sessionId) !== state || state.cancelled) return false;
+    if (changed) {
+      state.sessionSystemTextInjected = undefined;
+      (state.agyContextUsage ??= new AgyContextUsage()).resetToSummary(watermark.summaryTokens);
+    }
+    return changed;
+  }
+
+  onUsage(cb: (sessionId: string, usage: ProviderUsageUpdate) => void): () => void {
+    this.usageCallbacks.add(cb);
+    return () => { this.usageCallbacks.delete(cb); };
+  }
+
+  private emitAgyUsage(sessionId: string, state: KimiSdkSessionState, raw: Record<string, unknown> = {}, finalized = false): void {
+    if (this.id !== AGY_SDK_PROVIDER_ID) return;
+    const usage = (state.agyContextUsage ??= new AgyContextUsage()).normalize(raw);
+    for (const cb of this.usageCallbacks) cb(sessionId, {
+      messageId: state.currentMessageId ?? undefined, finalized, usage,
+      model: this.profile.strictModelSelection ? (state.turnModel ?? state.confirmedModel) : state.model,
+    });
   }
 
   onSessionInfo(cb: (sessionId: string, info: SessionInfoUpdate) => void): () => void {
@@ -721,6 +829,7 @@ export class KimiSdkProvider implements TransportProvider {
           }
           assertOwner();
           state.confirmedModel = model;
+          state.sessionSystemTextInjected = undefined;
         }
       });
       request = { model, revision, promise };
@@ -823,6 +932,7 @@ export class KimiSdkProvider implements TransportProvider {
     }
     state.modelRevision++;
     state.stoppedByCancel = true;
+    this.closeAgyBridges(state);
     if (!state.promptInFlight) return;
     state.cancelled = true;
     if (!state.acpSessionId || !this.connection) return;
@@ -919,6 +1029,9 @@ export class KimiSdkProvider implements TransportProvider {
       const activePromptText = this.profile.activePromptPrefix
         ? `${this.profile.activePromptPrefix}${notification.text}`
         : notification.text;
+      // Preserve native steering semantics: the runtime supplies current policy
+      // for ordinary turns; never synthesize a second provider turn here.
+      state.agyContextUsage?.addText(activePromptText);
       const generation = ++state.turnGeneration;
       queuedGeneration = generation;
       (state.activePromptGenerations ??= new Set()).add(generation);
@@ -1250,6 +1363,9 @@ export class KimiSdkProvider implements TransportProvider {
     try {
       await this.ensureSessionReady(sessionId, state);
       this.assertCurrentSession(sessionId, state);
+      await this.startAgyBridge(sessionId, state);
+      await this.checkSessionCompaction(sessionId);
+      this.assertCurrentSession(sessionId, state);
       // Start the turn's delta buffer clean. (During loadSession the replay
       // flag already suppresses accumulation; this belt-and-suspenders reset
       // also catches any stray state left by a prior turn that errored out
@@ -1265,6 +1381,10 @@ export class KimiSdkProvider implements TransportProvider {
       );
       const compactControl = isSessionControlCommandText(payload.userMessage, 'compact');
       const promptBlocks = this.buildPromptContent(payload, includeSessionSystemText);
+      if (this.id === AGY_SDK_PROVIDER_ID) {
+        const meter = state.agyContextUsage ??= new AgyContextUsage();
+        meter.beginPrompt(composeMessageSideProviderPrompt(payload, { includeSessionSystemText }));
+      }
 
       // Long-lived call — invoking it submits A; its Promise resolves only
       // when the turn ends.  Publish the generation-scoped admission boundary
@@ -1669,6 +1789,13 @@ export class KimiSdkProvider implements TransportProvider {
       }
     }
     this.clearStatus(sessionId, state);
+    if (this.id === AGY_SDK_PROVIDER_ID && state.agyBridges?.size) {
+      state.agySuppressBridgeResponses = true;
+      const bridge = state.agyBridges.get(state.acpSessionId!);
+      void bridge?.flush().finally(() => {
+        if (this.sessions.get(sessionId) === state) { state.agyReactive = false; state.agySuppressBridgeResponses = false; }
+      });
+    }
     const text = state.currentText;
     const messageId = state.currentMessageId ?? `${sessionId}:${randomUUID()}`;
     state.currentText = '';
@@ -1687,6 +1814,10 @@ export class KimiSdkProvider implements TransportProvider {
       return;
     }
     if (stopReason === 'cancelled' || state.cancelled) {
+      this.closeAgyBridges(state);
+      for (const event of state.agySubagents?.interrupt() ?? []) {
+        for (const cb of this.toolCallCallbacks) cb(sessionId, event);
+      }
       state.cancelled = false;
       state.stoppedByCancel = true;
       state.activePromptGenerations?.clear();
@@ -1711,8 +1842,11 @@ export class KimiSdkProvider implements TransportProvider {
     // OWN token counts (not the previous turn's). Transport-relay's
     // normalizeUsageUpdatePayload reads `metadata.usage` to emit usage.update
     // → recorded in context_turn_usage with the turn's eventId.
-    const turnUsage = state.lastTurnUsage;
+    const turnUsage = this.id === AGY_SDK_PROVIDER_ID
+      ? { ...state.lastTurnUsage, ...(state.agyContextUsage ??= new AgyContextUsage()).normalize(state.lastTurnUsage) }
+      : state.lastTurnUsage;
     state.lastTurnUsage = undefined;
+    this.emitAgyUsage(sessionId, state, turnUsage, true);
     if (sessionSystemTextToCommit) state.sessionSystemTextInjected = sessionSystemTextToCommit;
 
     if (stopReason === 'max_tokens' || stopReason === 'max_turn_requests') {
@@ -1777,6 +1911,12 @@ export class KimiSdkProvider implements TransportProvider {
       return;
     }
     const updateRecord = update as unknown as Record<string, unknown>;
+    if (this.id === AGY_SDK_PROVIDER_ID && isSdkRuntimeSubagentEventName(updateRecord.sessionUpdate)) {
+      for (const event of (state.agySubagents ??= new AgySubagentTracker(state.acpSessionId ?? routeId)).snapshot(updateRecord)) {
+        for (const cb of this.toolCallCallbacks) cb(routeId, event);
+      }
+      return;
+    }
     if (this.profile.runtimeSubagent && isSdkRuntimeSubagentEventName(updateRecord.sessionUpdate)) {
       this.emitRuntimeSubagentNotification(routeId, state, updateRecord);
       return;
@@ -1839,6 +1979,12 @@ export class KimiSdkProvider implements TransportProvider {
         // Map ACP's usage update onto our generic quota/session-info signal.
         // ACP's `UsageUpdate` is experimental; guard every field.
         const u = update as Record<string, unknown>;
+        if (this.id === AGY_SDK_PROVIDER_ID) {
+          const meter = state.agyContextUsage ??= new AgyContextUsage();
+          const snapshot = meter.normalize(u);
+          this.emitAgyUsage(routeId, state, u);
+          state.lastTurnUsage = { ...state.lastTurnUsage, ...snapshot };
+        }
         const tokens = (typeof u.tokens === 'object' && u.tokens)
           ? (u.tokens as Record<string, unknown>)
           : undefined;
@@ -1909,6 +2055,16 @@ export class KimiSdkProvider implements TransportProvider {
   ): void {
     const chunkText = extractTextFromContent(update.content);
     if (!chunkText) return;
+    if (this.id === AGY_SDK_PROVIDER_ID) {
+      const child = parseSdkRuntimeSubagentTag(chunkText);
+      if (child) {
+        for (const event of (state.agySubagents ??= new AgySubagentTracker(state.acpSessionId ?? sessionId)).snapshot(child)) {
+          for (const cb of this.toolCallCallbacks) cb(sessionId, event);
+        }
+        return;
+      }
+      if (startsWithSdkRuntimeSubagentTag(chunkText)) return;
+    }
     const runtimeSubagentPayload = this.profile.runtimeSubagent
       ? parseSdkRuntimeSubagentTag(chunkText)
       : null;
@@ -1931,6 +2087,8 @@ export class KimiSdkProvider implements TransportProvider {
     }
 
     state.currentText += chunkText;
+    state.agyContextUsage?.addText(chunkText);
+    this.emitAgyUsage(sessionId, state);
     const delta: MessageDelta = {
       messageId: state.currentMessageId,
       type: 'text',
@@ -2048,6 +2206,21 @@ export class KimiSdkProvider implements TransportProvider {
         raw: merged,
       },
     };
+    if (this.id === AGY_SDK_PROVIDER_ID) {
+      const tracker = state.agySubagents ??= new AgySubagentTracker(state.acpSessionId ?? sessionId);
+      const outputValue = merged.rawOutput !== undefined ? (typeof merged.rawOutput === 'string' ? merged.rawOutput : JSON.stringify(merged.rawOutput)) : evt.output;
+      const nativeName = merged.title.toLowerCase().replace(/^run\s+/, '').replace(/[-_\s]/g, '');
+      if (evt.status === 'running' && /^(invokesubagent|browsersubagent)$/.test(nativeName)) {
+        const pending = state.agyPendingLaunches ??= [];
+        if (!pending.includes(evt.id)) pending.push(evt.id);
+      }
+      const children = tracker.tool({ ...evt, ...(outputValue !== undefined ? { output: outputValue } : {}) });
+      if (children.some(child => child.detail?.meta?.agentPath !== evt.id)) state.agyPendingLaunches = state.agyPendingLaunches?.filter(id => id !== evt.id);
+      if (children.length) {
+        for (const child of children) for (const cb of this.toolCallCallbacks) cb(sessionId, child);
+        return;
+      }
+    }
     const signature = JSON.stringify({
       status: evt.status,
       name: evt.name,
@@ -2250,6 +2423,7 @@ export class KimiSdkProvider implements TransportProvider {
   private clearSessionWorkAfterFailure(routeId: string): boolean {
     const state = this.sessions.get(routeId);
     if (!state) return false;
+    this.closeAgyBridges(state);
     const run = this.steeringRunTerminals.get(state);
     const hadActiveWork = state.promptInFlight || state.replaying || state.toolCalls.size > 0;
     if (hadActiveWork) state.settledGeneration = state.turnGeneration;

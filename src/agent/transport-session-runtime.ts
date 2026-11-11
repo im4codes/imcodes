@@ -641,6 +641,9 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _supervisionSnapshotResolver:
     (() => Pick<SessionSupervisionSnapshot, 'mode'> | null | undefined) | null = null;
   private _registeredSystemContractSignatures = new Map<string, string>();
+  // Message-side AG has no native system slot: keep the full registered body
+  // stable as assembly input, while the adapter transmits it only on invalidation.
+  private _agyRegisteredSystemContracts = new Map<string, string>();
   private _agentId: string | undefined;
   private _effort: TransportEffortLevel | undefined;
   private _contextNamespace: ContextNamespace | undefined;
@@ -1265,7 +1268,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._identityPrompt = prompt?.trim() || undefined;
   }
   refreshIdentityPrompt(): void {
-    if (this._providerSessionId) this.provider.refreshSessionSystemText?.(this._providerSessionId);
+    this.reinjectAfterCompaction();
   }
   /**
    * Update the session-stable IM.codes identity injected into every
@@ -1341,7 +1344,9 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
   }
   setAgentId(agentId: string): void {
+    const changed = this._agentId !== agentId;
     this._agentId = agentId;
+    if (changed) this.reinjectAfterCompaction();
     if (this._providerSessionId) {
       this.provider.setSessionAgentId?.(this._providerSessionId, agentId);
     }
@@ -1357,7 +1362,9 @@ export class TransportSessionRuntime implements SessionRuntime {
     const applied = await this.provider.applySessionModel(sid, agentId);
     // The caller rechecks the complete durable runtime owner after this await.
     if (this._providerSessionId !== sid) throw new Error('Model selection owner changed');
+    const changed = this._agentId !== agentId;
     this._agentId = agentId;
+    if (changed) this.reinjectAfterCompaction();
     return applied;
   }
 
@@ -2734,6 +2741,8 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._initializingProviderSessionId = config.bindExistingKey ?? config.sessionKey;
     try {
       this._providerSessionId = await this.provider.createSession(config);
+      this._agyRegisteredSystemContracts.clear();
+      if (this.provider.id === AGY_SDK_PROVIDER_ID) this.provider.refreshSessionSystemText?.(this._providerSessionId);
       this._brainContractRegisteredVariant = null;
       this._registeredSystemContractSignatures.clear();
     } finally {
@@ -4809,6 +4818,15 @@ export class TransportSessionRuntime implements SessionRuntime {
         const pack = await Promise.race([ready.catch(() => undefined), timeout]);
         if (pack && !this._pendingHandoff) this._pendingHandoff = pack;
       }
+      if (!isTransportSlashControl(message) && this._providerSessionId && this.provider.checkSessionCompaction) {
+        const owner = this._providerSessionId;
+        const changed = await this.provider.checkSessionCompaction(owner);
+        if (this._providerSessionId !== owner || this.isDispatchLocallyCancelled(dispatchId)) {
+          this.cancelActiveDispatchLocally(dispatchId);
+          return;
+        }
+        if (changed) this.reinjectAfterCompaction();
+      }
       await this.refreshContextBootstrap({ phase: 'dispatch' });
       if (this.isDispatchLocallyCancelled(dispatchId)) {
         this.cancelActiveDispatchLocally(dispatchId);
@@ -4870,17 +4888,20 @@ export class TransportSessionRuntime implements SessionRuntime {
       const messagePreamble = isSlashControl
         ? undefined
         : this.mergeMessagePreambles(dispatchedEntries, message, handoffPreamble);
-      const registeredSystemContractText = this._activeDispatchEntries
+      const activeContracts = this._activeDispatchEntries
         .map((entry) => entry.registeredSystemContract)
         .filter((contract): contract is NonNullable<typeof contract> => !!contract)
         .filter((contract, index, contracts) => (
           contracts.findIndex((candidate) => candidate.contractId === contract.contractId) === index
         ))
-        .filter((contract) => (
-          this._registeredSystemContractSignatures.get(contract.contractId) !== contract.signature
-        ))
-        .map((contract) => contract.body)
-        .join('\n\n') || undefined;
+        ;
+      if (this.provider.id === AGY_SDK_PROVIDER_ID) {
+        for (const contract of activeContracts) this._agyRegisteredSystemContracts.set(contract.contractId, contract.body);
+      }
+      const registeredSystemContractText = this.provider.id === AGY_SDK_PROVIDER_ID
+        ? [...this._agyRegisteredSystemContracts.values()].join('\n\n') || undefined
+        : activeContracts.filter(contract => this._registeredSystemContractSignatures.get(contract.contractId) !== contract.signature)
+          .map(contract => contract.body).join('\n\n') || undefined;
       if (this.isDispatchLocallyCancelled(dispatchId)) {
         rollbackSummarySyncReservation(summarySyncReservation);
         summarySyncReservation = undefined;
@@ -4937,7 +4958,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         ...(this._sessionIdentity ? { sessionIdentity: this._sessionIdentity } : {}),
         automaticSupervisionEnabled,
         taskPairEngine,
-        brainContractRegistered: this._brainContractRegisteredVariant === brainContractVariant,
+        brainContractRegistered: this.provider.id !== AGY_SDK_PROVIDER_ID && this._brainContractRegisteredVariant === brainContractVariant,
         registeredSystemContractText,
         ...(startupMemory ? { startupMemory } : {}),
         ...(memoryRecall ? { memoryRecall } : {}),
