@@ -18,10 +18,13 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     private let worker = DispatchQueue(label: "com.imcodes.streaming-speech", qos: .userInitiated)
     private let lock = NSLock()
     private var generation: UInt64 = 0
-    // Bounded audio work: do not accumulate hundreds of chunks behind a slow device.
-    private let slots = DispatchSemaphore(value: 8)
+    private var abortedOwner: UInt64 = 0
+    // Bounded audio work: buffer up to ~6.4s while the model finishes cold warmup.
+    private let slots = DispatchSemaphore(value: 64)
     private var engine: AVAudioEngine?
     private var tapInstalled = false
+    // Resident recognizer model kept across sessions on worker; stream is per-capture.
+    private var recognizer: SpeechRecognizer?
     // Only accessed on worker; queued PCM drains before the stop/final barrier.
     private var decoder: SpeechDecoder?
     private var decoderOwner: UInt64 = 0
@@ -31,8 +34,28 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     public override func load() {
         NotificationCenter.default.addObserver(self, selector: #selector(interrupted(_:)), name: UIApplication.willResignActiveNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(interrupted(_:)), name: AVAudioSession.interruptionNotification, object: nil)
+        worker.async { [weak self] in
+            guard let self = self else { return }
+            _ = self.ensureRecognizer()
+        }
     }
-    deinit { NotificationCenter.default.removeObserver(self) }
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+        let retainedDecoder = decoder
+        let retainedRecognizer = recognizer
+        if retainedDecoder != nil || retainedRecognizer != nil {
+            worker.async {
+                _ = retainedDecoder
+                _ = retainedRecognizer
+            }
+        }
+    }
+    private func ensureRecognizer() -> SpeechRecognizer? {
+        if let existing = recognizer { return existing }
+        guard modelAvailable, let root = modelRoot, let created = SpeechRecognizer(root: root) else { return nil }
+        recognizer = created
+        return created
+    }
     private func nextOwner() -> UInt64 {
         lock.lock(); defer { lock.unlock() }
         generation &+= 1
@@ -64,63 +87,62 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
             guard AVAudioSession.sharedInstance().recordPermission == .granted else {
                 call.reject("Microphone permission denied"); return
             }
-            guard self.modelAvailable, let root = self.modelRoot else {
+            guard self.modelAvailable else {
                 call.reject("Offline speech model missing"); return
             }
             let owner = self.nextOwner()
+            // Enqueue decoder setup on the serial worker queue BEFORE starting AVAudioEngine
+            // so any audio buffers captured while the model finishes warming up are queued
+            // strictly behind this setup block and decoded in order without losing the first words.
             self.worker.async {
-                guard self.isCurrent(owner) else { call.reject("Speech start cancelled"); return }
-                let model = sherpaOnnxOnlineModelConfig(
-                    tokens: root.appendingPathComponent("tokens.txt").path,
-                    transducer: sherpaOnnxOnlineTransducerModelConfig(
-                        encoder: root.appendingPathComponent("encoder.int8.onnx").path,
-                        decoder: root.appendingPathComponent("decoder.onnx").path,
-                        joiner: root.appendingPathComponent("joiner.int8.onnx").path),
-                    numThreads: 2, modelType: "zipformer", modelingUnit: "cjkchar+bpe",
-                    bpeVocab: root.appendingPathComponent("bpe.vocab").path)
-                var config = sherpaOnnxOnlineRecognizerConfig(
-                    featConfig: sherpaOnnxFeatureConfig(), modelConfig: model, enableEndpoint: true,
-                    decodingMethod: "modified_beam_search",
-                    hotwordsFile: root.appendingPathComponent("hotwords.txt").path,
-                    hotwordsScore: 2.0)
-                guard let decoder = SpeechDecoder(config: &config) else {
-                    call.reject("Offline speech model initialization failed"); return
+                self.lock.lock()
+                let aborted = self.abortedOwner == owner
+                self.lock.unlock()
+                guard !aborted else { return }
+                guard let recognizer = self.ensureRecognizer(),
+                      let decoder = SpeechDecoder(recognizer: recognizer) else {
+                    self.decoder = nil
+                    self.decoderOwner = 0
+                    DispatchQueue.main.async {
+                        if self.isCurrent(owner) {
+                            self.notifyListeners("recognitionError", data: ["message": "Offline speech model initialization failed"])
+                            self.endCapture(nil)
+                        }
+                    }
+                    return
                 }
                 self.decoder = decoder
                 self.decoderOwner = owner
                 self.committed = ""; self.lastText = ""
-                DispatchQueue.main.async {
-                    guard self.isCurrent(owner) else {
-                        self.worker.async { if self.decoderOwner == owner { self.decoder = nil } }
-                        call.reject("Speech start cancelled"); return
-                    }
-                    do {
-                        let session = AVAudioSession.sharedInstance()
-                        try session.setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker, .allowBluetooth])
-                        try session.setActive(true)
-                        let engine = AVAudioEngine()
-                        let input = engine.inputNode
-                        let format = input.outputFormat(forBus: 0)
-                        guard format.sampleRate > 0, format.channelCount > 0 else {
-                            throw NSError(domain: "StreamingSpeech", code: 1, userInfo: [NSLocalizedDescriptionKey: "Microphone format unavailable"])
-                        }
-                        guard let mono = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false),
-                              let converter = AVAudioConverter(from: format, to: mono) else {
-                            throw NSError(domain: "StreamingSpeech", code: 2, userInfo: nil)
-                        }
-                        self.engine = engine
-                        input.installTap(onBus: 0, bufferSize: AVAudioFrameCount(format.sampleRate / 10), format: nil) { [weak self] buffer, _ in
-                            self?.consume(buffer, owner: owner, converter: converter, format: mono)
-                        }
-                        self.tapInstalled = true
-                        try engine.start()
-                        self.notifyListeners("listeningState", data: ["status": "started"])
-                        call.resolve()
-                    } catch {
-                        self.endCapture(nil)
-                        call.reject("Offline speech could not start", nil, error)
-                    }
+            }
+            do {
+                let session = AVAudioSession.sharedInstance()
+                try session.setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker, .allowBluetooth])
+                try session.setActive(true)
+                let engine = AVAudioEngine()
+                let input = engine.inputNode
+                let format = input.outputFormat(forBus: 0)
+                guard format.sampleRate > 0, format.channelCount > 0 else {
+                    throw NSError(domain: "StreamingSpeech", code: 1, userInfo: [NSLocalizedDescriptionKey: "Microphone format unavailable"])
                 }
+                guard let mono = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false),
+                      let converter = AVAudioConverter(from: format, to: mono) else {
+                    throw NSError(domain: "StreamingSpeech", code: 2, userInfo: nil)
+                }
+                self.engine = engine
+                input.installTap(onBus: 0, bufferSize: AVAudioFrameCount(format.sampleRate / 10), format: nil) { [weak self] buffer, _ in
+                    self?.consume(buffer, owner: owner, converter: converter, format: mono)
+                }
+                self.tapInstalled = true
+                try engine.start()
+                self.notifyListeners("listeningState", data: ["status": "started"])
+                call.resolve()
+            } catch {
+                self.lock.lock()
+                self.abortedOwner = owner
+                self.lock.unlock()
+                self.endCapture(nil)
+                call.reject("Offline speech could not start", nil, error)
             }
         }
     }
@@ -155,10 +177,10 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         let samples = Array(UnsafeBufferPointer(start: channel, count: count))
         let power = samples.reduce(Float(0)) { $0 + $1 * $1 }
         let level = min(1, sqrt(power / Float(max(count, 1))) * 3)
+        notifyListeners("audioLevel", data: ["level": level])
         worker.async {
             defer { self.slots.signal() }
             guard self.decoderOwner == owner, let decoder = self.decoder else { return }
-            self.notifyListeners("audioLevel", data: ["level": level])
             decoder.acceptWaveform(samples: samples)
             self.decodeAvailable(decoder)
             let text = self.join(self.committed, decoder.text.trimmingCharacters(in: .whitespacesAndNewlines))
@@ -177,7 +199,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
     private func decodeAvailable(_ decoder: SpeechDecoder) {
-        while decoder.isReady() { decoder.decode() }
+        decoder.decodeAvailable()
     }
     private func join(_ previous: String, _ text: String) -> String {
         if previous.isEmpty { return text }
@@ -218,41 +240,75 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 }
 
+// Resident ONNX recognizer graph owned by the plugin's serial worker queue.
+private final class SpeechRecognizer {
+    let pointer: OpaquePointer
+    init?(root: URL) {
+        let model = sherpaOnnxOnlineModelConfig(
+            tokens: root.appendingPathComponent("tokens.txt").path,
+            transducer: sherpaOnnxOnlineTransducerModelConfig(
+                encoder: root.appendingPathComponent("encoder.int8.onnx").path,
+                decoder: root.appendingPathComponent("decoder.onnx").path,
+                joiner: root.appendingPathComponent("joiner.int8.onnx").path),
+            numThreads: 2, modelType: "zipformer", modelingUnit: "cjkchar+bpe",
+            bpeVocab: root.appendingPathComponent("bpe.vocab").path)
+        var config = sherpaOnnxOnlineRecognizerConfig(
+            featConfig: sherpaOnnxFeatureConfig(), modelConfig: model, enableEndpoint: true,
+            decodingMethod: "modified_beam_search",
+            hotwordsFile: root.appendingPathComponent("hotwords.txt").path,
+            hotwordsScore: 2.0)
+        guard let recognizer = SherpaOnnxCreateOnlineRecognizer(&config) else { return nil }
+        self.pointer = recognizer
+        if let warmStream = SherpaOnnxCreateOnlineStream(recognizer) {
+            let silence = [Float](repeating: 0, count: 8000)
+            SherpaOnnxOnlineStreamAcceptWaveform(warmStream, 16000, silence, Int32(silence.count))
+            while SherpaOnnxIsOnlineStreamReady(recognizer, warmStream) != 0 {
+                SherpaOnnxDecodeOnlineStream(recognizer, warmStream)
+            }
+            SherpaOnnxDestroyOnlineStream(warmStream)
+        }
+    }
+    deinit {
+        SherpaOnnxDestroyOnlineRecognizer(pointer)
+    }
+}
+
 // Unlike the upstream convenience wrapper, reject a failed native allocation
 // instead of force-unwrapping it and crashing the app. Worker-thread owned.
 private final class SpeechDecoder {
-    let recognizer: OpaquePointer
+    let recognizer: SpeechRecognizer
     private(set) var stream: OpaquePointer
-    init?(config: UnsafePointer<SherpaOnnxOnlineRecognizerConfig>) {
-        guard let recognizer = SherpaOnnxCreateOnlineRecognizer(config) else { return nil }
-        guard let stream = SherpaOnnxCreateOnlineStream(recognizer) else {
-            SherpaOnnxDestroyOnlineRecognizer(recognizer); return nil
-        }
+    init?(recognizer: SpeechRecognizer) {
+        guard let stream = SherpaOnnxCreateOnlineStream(recognizer.pointer) else { return nil }
         self.recognizer = recognizer; self.stream = stream
         // Half-second left-context padding establishes the acoustic alignment baseline.
         acceptWaveform(samples: [Float](repeating: 0, count: 8000))
+        decodeAvailable()
     }
     deinit {
         SherpaOnnxDestroyOnlineStream(stream)
-        SherpaOnnxDestroyOnlineRecognizer(recognizer)
     }
     func acceptWaveform(samples: [Float]) {
         SherpaOnnxOnlineStreamAcceptWaveform(stream, 16000, samples, Int32(samples.count))
     }
     func inputFinished() { SherpaOnnxOnlineStreamInputFinished(stream) }
-    func isReady() -> Bool { SherpaOnnxIsOnlineStreamReady(recognizer, stream) != 0 }
-    func decode() { SherpaOnnxDecodeOnlineStream(recognizer, stream) }
+    func isReady() -> Bool { SherpaOnnxIsOnlineStreamReady(recognizer.pointer, stream) != 0 }
+    func decode() { SherpaOnnxDecodeOnlineStream(recognizer.pointer, stream) }
+    func decodeAvailable() {
+        while isReady() { decode() }
+    }
     func startNextStream() -> Bool {
-        guard let next = SherpaOnnxCreateOnlineStream(recognizer) else { return false }
+        guard let next = SherpaOnnxCreateOnlineStream(recognizer.pointer) else { return false }
         SherpaOnnxDestroyOnlineStream(stream)
         stream = next
         // Half-second left-context padding establishes the acoustic alignment baseline.
         acceptWaveform(samples: [Float](repeating: 0, count: 8000))
+        decodeAvailable()
         return true
     }
-    func isEndpoint() -> Bool { SherpaOnnxOnlineStreamIsEndpoint(recognizer, stream) != 0 }
+    func isEndpoint() -> Bool { SherpaOnnxOnlineStreamIsEndpoint(recognizer.pointer, stream) != 0 }
     var text: String {
-        guard let result = SherpaOnnxGetOnlineStreamResult(recognizer, stream) else { return "" }
+        guard let result = SherpaOnnxGetOnlineStreamResult(recognizer.pointer, stream) else { return "" }
         defer { SherpaOnnxDestroyOnlineRecognizerResult(result) }
         guard let text = result.pointee.text else { return "" }
         return String(cString: text)

@@ -41,6 +41,23 @@ describe('shared mobile model preparation', () => {
     expect(ios).not.toContain('SherpaOnnxOnlineStreamReset(');
     expect(android).not.toContain('getParaformer()');
     expect(ios).not.toContain('sherpaOnnxOnlineParaformerModelConfig(');
+    // Resident recognizer + async load() warmup + immediate left-padding decodeAvailable + iOS 64 slots
+    expect(ios).toContain('DispatchSemaphore(value: 64)');
+    expect(ios).not.toContain('DispatchSemaphore(value: 8)');
+    expect(ios).toContain('private var recognizer: SpeechRecognizer?');
+    expect(ios).toContain('_ = self.ensureRecognizer()');
+    expect(ios).toContain('private final class SpeechRecognizer');
+    expect(ios).toContain('SherpaOnnxDestroyOnlineStream(warmStream)');
+    expect(ios).toMatch(/acceptWaveform\(samples: \[Float\]\(repeating: 0, count: 8000\)\)\s*\n\s*decodeAvailable\(\)/);
+    expect(ios).toMatch(/notifyListeners\("audioLevel", data: \["level": level\]\)\s*\n\s*worker\.async/);
+    expect(android).toContain('private OnlineRecognizer recognizer;');
+    expect(android).toContain('private OnlineRecognizer ensureRecognizer()');
+    expect(android).toContain('warmStream.release();');
+    expect(android).toContain('Math.max(min * 2, SAMPLE_RATE * 2 * 6)');
+    expect(android).toContain('worker.execute(() -> capture(call, owner, audio));');
+    expect(android).toMatch(/stream\.acceptWaveform\(new float\[SAMPLE_RATE \/ 2\], SAMPLE_RATE\);\s*\n\s*decodeAvailable\(recognizer, stream\);/);
+    expect(android).toMatch(/next\.acceptWaveform\(new float\[SAMPLE_RATE \/ 2\], SAMPLE_RATE\);\s*\n\s*decodeAvailable\(recognizer, next\);/);
+    expect(android).toMatch(/handleOnDestroy\(\)[\s\S]*recognizer\.release\(\);/);
   });
   it('pins the mixed-precision transducer bytes and locally maintained hotwords', async () => {
     expect(MODEL_REVISION).toBe('98590b7ed6443e77b714204da2757d75e1a642f4');
@@ -162,5 +179,219 @@ describe('native stream segment concatenation and lifecycle semantics', () => {
     // Stop called: final stop flushes and commits final segment
     const finalResult = join(committed, 'COMMIT TO GITHUB');
     expect(finalResult).toBe('你好你好COMMIT COMMIT TO GITHUB');
+  });
+
+  it('reuses a single resident recognizer across sessions, drains 0.5s left-padding before capture, and releases recognizer only on destroy', () => {
+    const events: string[] = [];
+    let recognizerCount = 0;
+    let recognizerReleased = 0;
+    let streamSeq = 0;
+
+    interface MockStream {
+      id: number;
+      pendingSamples: number;
+      released: boolean;
+      acceptWaveform(samplesCount: number): void;
+      isReady(): boolean;
+      decode(): void;
+      release(): void;
+    }
+
+    class MockRecognizer {
+      readonly id = ++recognizerCount;
+      released = false;
+      constructor() {
+        events.push(`recognizer.create#${this.id}`);
+      }
+      createStream(): MockStream {
+        const id = ++streamSeq;
+        events.push(`stream.create#${id}`);
+        return {
+          id,
+          pendingSamples: 0,
+          released: false,
+          acceptWaveform(samplesCount: number) {
+            this.pendingSamples += samplesCount;
+            events.push(`stream#${id}.accept(${samplesCount})`);
+          },
+          isReady() {
+            return this.pendingSamples >= 4000;
+          },
+          decode() {
+            this.pendingSamples = Math.max(0, this.pendingSamples - 4000);
+            events.push(`stream#${id}.decode`);
+          },
+          release() {
+            if (!this.released) {
+              this.released = true;
+              events.push(`stream.release#${id}`);
+            }
+          },
+        };
+      }
+      release() {
+        if (!this.released) {
+          this.released = true;
+          recognizerReleased++;
+          events.push(`recognizer.release#${this.id}`);
+        }
+      }
+    }
+
+    let resident: MockRecognizer | null = null;
+    let activeStream: MockStream | null = null;
+
+    function decodeAvailable(stream: MockStream) {
+      while (stream.isReady()) stream.decode();
+    }
+
+    function ensureRecognizer(): MockRecognizer {
+      if (resident) return resident;
+      const created = new MockRecognizer();
+      const warmStream = created.createStream();
+      warmStream.acceptWaveform(8000);
+      decodeAvailable(warmStream);
+      warmStream.release();
+      resident = created;
+      return resident;
+    }
+
+    function load() {
+      ensureRecognizer();
+    }
+
+    function startCapture() {
+      const rec = ensureRecognizer();
+      const stream = rec.createStream();
+      stream.acceptWaveform(8000);
+      decodeAvailable(stream);
+      events.push('audioEngine.start');
+      activeStream = stream;
+    }
+
+    function endCapture() {
+      if (activeStream) {
+        activeStream.acceptWaveform(16000);
+        decodeAvailable(activeStream);
+        activeStream.release();
+        activeStream = null;
+      }
+    }
+
+    function destroyPlugin() {
+      endCapture();
+      if (resident) {
+        resident.release();
+        resident = null;
+      }
+    }
+
+    // 1. Plugin load() preloads and warms up recognizer before user taps mic
+    load();
+    expect(recognizerCount).toBe(1);
+    expect(recognizerReleased).toBe(0);
+    expect(events).toEqual([
+      'recognizer.create#1',
+      'stream.create#1',
+      'stream#1.accept(8000)',
+      'stream#1.decode',
+      'stream#1.decode',
+      'stream.release#1',
+    ]);
+
+    // 2. First mic start reuses recognizer#1, drains 8000 left-padding BEFORE audioEngine.start, and endCapture keeps recognizer#1 alive
+    events.length = 0;
+    startCapture();
+    expect(recognizerCount).toBe(1);
+    expect(activeStream?.pendingSamples).toBe(0);
+    expect(events).toEqual([
+      'stream.create#2',
+      'stream#2.accept(8000)',
+      'stream#2.decode',
+      'stream#2.decode',
+      'audioEngine.start',
+    ]);
+    endCapture();
+    expect(recognizerReleased).toBe(0);
+
+    // 3. Second mic start still reuses recognizer#1 without reloading 198MB model
+    events.length = 0;
+    startCapture();
+    expect(recognizerCount).toBe(1);
+    endCapture();
+    expect(recognizerReleased).toBe(0);
+
+    // 4. Plugin destroy releases resident recognizer#1
+    destroyPlugin();
+    expect(recognizerReleased).toBe(1);
+  });
+
+  it('captures and buffers initial speech immediately while model warmup is still in flight on the serial worker', () => {
+    const timeline: string[] = [];
+    const workerQueue: Array<() => void> = [];
+    const emittedPartials: string[] = [];
+    let decoderReady = false;
+    const decodedChunks: string[] = [];
+
+    function enqueueWorker(task: () => void) {
+      workerQueue.push(task);
+    }
+
+    function drainWorker() {
+      while (workerQueue.length > 0) {
+        const next = workerQueue.shift()!;
+        next();
+      }
+    }
+
+    // 1. Plugin load() enqueues async model warmup on serial worker (not yet drained when user taps mic)
+    enqueueWorker(() => {
+      timeline.push('worker:load.ensureRecognizer+warmup');
+    });
+
+    // 2. User immediately taps start() before load() finishes:
+    //    start() enqueues session decoder setup on serial worker AND immediately starts mic capture on main thread
+    enqueueWorker(() => {
+      timeline.push('worker:start.sessionStream+drainLeftPadding');
+      decoderReady = true;
+    });
+    timeline.push('main:AVAudioEngine.start+listeningState:started');
+
+    // 3. User speaks "喂" -> "你好" -> "听得到吗" while worker is STILL busy warming up the model:
+    for (const chunk of ['喂', '你好', '听得到吗']) {
+      // consume() emits audioLevel immediately on tap thread and queues PCM onto serial worker
+      timeline.push(`tap:audioLevel(${chunk})`);
+      enqueueWorker(() => {
+        expect(decoderReady).toBe(true);
+        decodedChunks.push(chunk);
+        const cumulative = decodedChunks.join('');
+        emittedPartials.push(cumulative);
+        timeline.push(`worker:decode(${chunk})->${cumulative}`);
+      });
+    }
+
+    // Before worker finishes warmup, mic has already started and emitted all 3 audioLevels without dropping any buffer
+    expect(timeline).toEqual([
+      'main:AVAudioEngine.start+listeningState:started',
+      'tap:audioLevel(喂)',
+      'tap:audioLevel(你好)',
+      'tap:audioLevel(听得到吗)',
+    ]);
+    expect(emittedPartials).toEqual([]);
+
+    // 4. Serial worker finishes warmup and drains queued setup + all buffered speech chunks in exact FIFO order
+    drainWorker();
+    expect(emittedPartials).toEqual(['喂', '喂你好', '喂你好听得到吗']);
+    expect(timeline).toEqual([
+      'main:AVAudioEngine.start+listeningState:started',
+      'tap:audioLevel(喂)',
+      'tap:audioLevel(你好)',
+      'tap:audioLevel(听得到吗)',
+      'worker:load.ensureRecognizer+warmup',
+      'worker:start.sessionStream+drainLeftPadding',
+      'worker:decode(喂)->喂',
+      'worker:decode(你好)->喂你好',
+      'worker:decode(听得到吗)->喂你好听得到吗',
+    ]);
   });
 });
