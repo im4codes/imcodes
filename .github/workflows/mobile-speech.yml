@@ -18,6 +18,9 @@ on:
       - '.github/workflows/mobile-speech.yml'
 permissions:
   contents: read
+concurrency:
+  group: mobile-speech-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   ios-simulator:
     runs-on: macos-26
