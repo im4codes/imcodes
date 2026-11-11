@@ -315,6 +315,8 @@ struct SpeechWindow {
     // Frozen at each acoustic roll, never fed back from intermediate snapshots.
     private var seamTail = ""
     private var overlapText: String?
+    private var overlapHint: String?
+    private var lastGrowth: String?
     private var hypothesis: String?
     private var previousHypothesis: String?
     private var newSamples = 0
@@ -363,6 +365,7 @@ struct SpeechWindow {
         let next = decoded.trimmingCharacters(in: .whitespacesAndNewlines)
         previousHypothesis = hypothesis
         hypothesis = next
+        var matched = 0
         if !rolling {
             partial = next
         } else {
@@ -370,11 +373,14 @@ struct SpeechWindow {
             // entire <=5 Character tail. Reconcile against the frozen roll seam,
             // not the last partial (which also contains this window's new words).
             let size: Int
-            if let overlapText = overlapText, next.hasPrefix(overlapText) {
+            if let overlapText = overlapText, !overlapText.isEmpty, next.hasPrefix(overlapText) {
                 size = overlapText.count
+            } else if let hint = overlapHint, !hint.isEmpty, next.hasPrefix(hint) {
+                size = hint.count
             } else {
                 size = Self.overlapCount(anchor + seamTail, next)
             }
+            matched = size
             if size > seamTail.count {
                 // The shared acoustic text extends into the committed prefix.
                 partial = String(next.dropFirst(size - seamTail.count))
@@ -391,6 +397,22 @@ struct SpeechWindow {
                 partial = Self.join(seamTail, next)
             }
         }
+        // Remember only the most recent nonempty local growth, not a history.
+        // A word may span several strides: equal hypotheses do not prove that
+        // the retained audio contains no text. This hint also disambiguates
+        // stable a/a -> a/a/a, where longest textual overlap would eat a word.
+        if let prior = previousHypothesis {
+            if next != prior {
+                lastGrowth = nil
+                if next.hasPrefix(prior) {
+                    let added = String(next.dropFirst(prior.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !added.isEmpty { lastGrowth = added }
+                }
+            }
+        } else {
+            let added = String(next.dropFirst(matched)).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !added.isEmpty { lastGrowth = added }
+        }
         newSamples = 0
     }
 
@@ -398,10 +420,18 @@ struct SpeechWindow {
         // When successive raw hypotheses extend exactly, their delta describes
         // the retained final stride. Prefer that acoustic seam over a longest
         // suffix match: identical repeated words can otherwise over-match.
-        if let prior = previousHypothesis, let current = hypothesis, current.hasPrefix(prior) {
-            overlapText = String(current.dropFirst(prior.count)).trimmingCharacters(in: .whitespacesAndNewlines)
-        } else {
-            overlapText = nil
+        overlapText = nil
+        if let prior = previousHypothesis, let current = hypothesis,
+           current.count > prior.count, current.hasPrefix(prior) {
+            let added = String(current.dropFirst(prior.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            // Stable/no-progress or whitespace-only hypotheses prove no new
+            // text, NOT zero acoustic overlap. Fall back to a nonempty local
+            // hint/anchor; an empty candidate would match every hypothesis.
+            if !added.isEmpty { overlapText = added }
+        }
+        overlapHint = nil
+        if let growth = lastGrowth, !growth.isEmpty, let current = hypothesis, current.hasSuffix(growth) {
+            overlapHint = growth
         }
         hypothesis = nil; previousHypothesis = nil
         let tail = String(partial.suffix(Self.rollbackCharacters))
@@ -418,7 +448,8 @@ struct SpeechWindow {
     private mutating func commitSentence() {
         committed = text
         partial = ""; anchor = ""; rolling = false; seamTail = ""
-        overlapText = nil; hypothesis = nil; previousHypothesis = nil
+        overlapText = nil; overlapHint = nil; lastGrowth = nil
+        hypothesis = nil; previousHypothesis = nil
         samples.removeAll(keepingCapacity: true)
         newSamples = 0; silentSamples = 0
     }

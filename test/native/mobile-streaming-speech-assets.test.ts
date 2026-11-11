@@ -219,7 +219,7 @@ it.skipIf(!swiftCompiler)('executes the actual Swift bounded window through roll
   await writeFile(file, 'import Foundation\n' + state + '\n' + swiftWindowCases);
   execFileSync(swiftCompiler!, ['-swift-version', '5', file, '-o', executable], { encoding: 'utf8', timeout: 60000 });
   const result = execFileSync(executable, [], { encoding: 'utf8', timeout: 30000 });
-  for (const name of ['TAIL', 'ROLLBACK', 'VAD', 'PUNCTUATION', 'REPEATED_SENTENCE', 'LONG_CONTINUOUS', 'VARIABLE_TAP', 'FAILURE', 'UNICODE', 'EMPTY', 'IN_FLIGHT_STOP', 'LONG_TRANSCRIPT', 'SHORT_CJK', 'SHORT_ASCII', 'REPEATED_OVERLAP']) {
+  for (const name of ['TAIL', 'ROLLBACK', 'VAD', 'PUNCTUATION', 'REPEATED_SENTENCE', 'LONG_CONTINUOUS', 'VARIABLE_TAP', 'FAILURE', 'UNICODE', 'EMPTY', 'IN_FLIGHT_STOP', 'LONG_TRANSCRIPT', 'SHORT_CJK', 'SHORT_ASCII', 'REPEATED_OVERLAP', 'STABLE_HYPOTHESIS', 'NO_PROGRESS_THEN_GROWTH']) {
     expect(result).toContain(name + ':PASS');
   }
 }, 95000);
@@ -242,7 +242,7 @@ final class InFlightCapture {
         return samples.count == 16000 ? "before tail" : "before tail last word"
     }
 }
-func labelledSeams(_ words: [String], separator: String) throws {
+func labelledSeams(_ words: [String], separator: String, holds: [Int] = []) throws {
     var window = SpeechWindow()
     let decode: ([Float]) -> String? = { samples in
         var previous = -1, result: [String] = []
@@ -254,11 +254,13 @@ func labelledSeams(_ words: [String], separator: String) throws {
     }
     for id in 0..<words.count {
         let expected = words.prefix(id + 1).joined(separator: separator)
-        try window.append(Array(repeating: Float(id), count: 16000), speech: true, decode: decode) { snapshot in
-            check(snapshot == expected, "seam corrupted an intermediate snapshot: " + snapshot + " != " + expected)
+        for _ in 0..<(holds.isEmpty ? 1 : holds[id]) {
+            try window.append(Array(repeating: Float(id), count: 16000), speech: true, decode: decode) { snapshot in
+                check(snapshot == expected, "seam corrupted an intermediate snapshot: " + snapshot + " != " + expected)
+            }
+            check(window.text == expected, "window lost previously recognised text")
+            check(window.samples.count <= 48000, "labelled input grew the PCM window")
         }
-        check(window.text == expected, "window lost previously recognised text")
-        check(window.samples.count <= 48000, "labelled input grew the PCM window")
     }
     let final = try window.finish(decode: decode)
     check(final == words.joined(separator: separator), "seam corrupted final text")
@@ -302,6 +304,21 @@ func run() throws {
     try labelledSeams(Array(repeating: "哈", count: 12), separator: "")
     try labelledSeams(["go", "go", "now", "go", "now", "go", "go", "now"], separator: " ")
     print("REPEATED_OVERLAP:PASS")
+    // One acoustic word can span several stride ticks: unchanged text must not
+    // manufacture an empty "known overlap" candidate and duplicate that word.
+    try labelledSeams(["hello", "world", "again"], separator: " ", holds: [3, 3, 3])
+    try labelledSeams(["你", "好", "吗"], separator: "", holds: [3, 3, 3])
+    print("STABLE_HYPOTHESIS:PASS")
+    try labelledSeams(["hello", "world", "again", "last", "word"], separator: " ", holds: [4, 1, 3, 2, 4])
+    try labelledSeams(["你", "好", "吗", "我", "们"], separator: "", holds: [4, 1, 3, 2, 4])
+    // Zero-progress intervals and genuinely distinct repeated words coexist.
+    try labelledSeams(["a", "a", "a", "be", "be"], separator: " ", holds: [3, 1, 3, 1, 3])
+    try labelledSeams(["哈", "哈", "哈", "好", "好"], separator: "", holds: [3, 1, 3, 1, 3])
+    try labelledSeams(["a", "a", "a"], separator: " ", holds: [1, 2, 1])
+    try labelledSeams(["哈", "哈", "哈"], separator: "", holds: [1, 2, 1])
+    try labelledSeams(["aaaa", "bbbb", "aaaa"], separator: " ", holds: [3, 3, 3])
+    try labelledSeams(["哈哈", "你好", "哈哈"], separator: "", holds: [3, 3, 3])
+    print("NO_PROGRESS_THEN_GROWTH:PASS")
 
     window = SpeechWindow(); calls = []
     try window.append(pcm(8000), speech: true, decode: decode) { _ in }
