@@ -40,7 +40,13 @@ describe('share-receiver service', () => {
     expect(file!.name).toBe('notes.txt');
     expect(file!.type).toBe('text/plain');
     expect(file!.size).toBe(content.length);
-    const bytes = new Uint8Array(await file!.arrayBuffer());
+    const buffer = await new Promise<ArrayBuffer>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as ArrayBuffer);
+      reader.onerror = () => reject(reader.error);
+      reader.readAsArrayBuffer(file!);
+    });
+    const bytes = new Uint8Array(buffer);
     expect(Buffer.from(bytes).toString('utf8')).toBe(content);
   });
 

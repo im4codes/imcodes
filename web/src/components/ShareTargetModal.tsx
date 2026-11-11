@@ -1,5 +1,6 @@
 import { useEffect, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
+import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
 import type { SessionInfo } from '../types.js';
 import type { SharedPayload } from '../services/share-receiver.js';
 import { formatLabel } from '../format-label.js';
@@ -57,7 +58,7 @@ export function ShareTargetModal({
 
   const errorMessage = useMemo(() => {
     if (!payload.error) return null;
-    if (payload.error === 'file_too_large') {
+    if (payload.error === FS_READ_ERROR_CODES.FILE_TOO_LARGE) {
       return t('shareTarget.error.file_too_large', { max: 50 });
     }
     if (payload.error === 'read_failed') {
