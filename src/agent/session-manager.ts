@@ -3638,7 +3638,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   if (agentType === AGY_SDK_PROVIDER_ID && existing?.agentType === AGY_SDK_PROVIDER_ID
     && !opts.fresh && !opts.providerResumeId && !existing.providerResumeId
     && existing.agyNativeSessionState !== AGY_NATIVE_SESSION_STATE.UNSTARTED) {
-    throw new Error('AG conversation requires a trusted resume id; use Start over (session_restart reset=true) to explicitly create a new conversation. Restart cannot safely resume this session.');
+    throw new Error('AG conversation requires a trusted resume id; refusing an implicit fresh launch. Use Start over (session_restart reset=true) to explicitly create a new conversation. Restart cannot safely resume this session.');
   }
   const storedRequestedModel = !opts.fresh
     && (agentType !== AGY_SDK_PROVIDER_ID || existing?.agentType === AGY_SDK_PROVIDER_ID)
