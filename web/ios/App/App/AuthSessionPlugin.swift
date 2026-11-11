@@ -68,6 +68,8 @@ extension AuthSessionPlugin: ASWebAuthenticationPresentationContextProviding {
 public class ShareReceiverPlugin: CAPPlugin, CAPBridgedPlugin {
     public static let shared = ShareReceiverPlugin()
     public static let maxShareBytes = 50 * 1024 * 1024
+    public static let maxPendingShares = 20
+    private static let duplicatePathDebounceInterval: TimeInterval = 2.0
 
     public let identifier = "ShareReceiverPlugin"
     public let jsName = "ShareReceiver"
@@ -77,17 +79,32 @@ public class ShareReceiverPlugin: CAPPlugin, CAPBridgedPlugin {
 
     private let lock = NSLock()
     private var pendingShares: [[String: Any]] = []
+    private var lastHandledPath: String?
+    private var lastHandledAt: TimeInterval = 0
 
     @discardableResult
     public func handleIncomingFileURL(_ url: URL) -> Bool {
         guard url.isFileURL else { return false }
+
+        let normalizedPath = url.standardizedFileURL.path
+        let now = Date().timeIntervalSince1970
+        lock.lock()
+        if let lastPath = lastHandledPath,
+           lastPath == normalizedPath,
+           (now - lastHandledAt) < Self.duplicatePathDebounceInterval {
+            lock.unlock()
+            return true
+        }
+        lastHandledPath = normalizedPath
+        lastHandledAt = now
+        lock.unlock()
 
         let accessed = url.startAccessingSecurityScopedResource()
         defer {
             if accessed {
                 url.stopAccessingSecurityScopedResource()
             }
-            if url.path.contains("/Documents/Inbox/") {
+            if url.path.contains("/Documents/Inbox/") || url.path.contains("-Inbox/") {
                 try? FileManager.default.removeItem(at: url)
             }
         }
@@ -141,20 +158,38 @@ public class ShareReceiverPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     private func dispatchOrEnqueue(_ payload: [String: Any]) {
+        self.lock.lock()
+        let payloadId = payload["id"] as? String
+        if let payloadId = payloadId {
+            self.pendingShares.removeAll { ($0["id"] as? String) == payloadId }
+        }
+        self.pendingShares.append(payload)
+        if self.pendingShares.count > Self.maxPendingShares {
+            self.pendingShares.removeFirst(self.pendingShares.count - Self.maxPendingShares)
+        }
+        self.lock.unlock()
+
         let deliverAction = { [weak self] in
-            guard let self = self else { return }
-            if self.bridge != nil && self.hasListeners("sharedPayload") {
-                self.notifyListeners("sharedPayload", data: payload)
-            } else {
-                self.lock.lock()
-                self.pendingShares.append(payload)
-                self.lock.unlock()
-            }
+            guard let self = self, self.bridge != nil else { return }
+            self.notifyListeners("sharedPayload", data: payload)
+            self.bridge?.webView?.evaluateJavaScript("window.__imcodesConsumePendingShares?.()", completionHandler: nil)
         }
         if Thread.isMainThread {
             deliverAction()
         } else {
             DispatchQueue.main.async(execute: deliverAction)
+        }
+    }
+
+    public func flushToWebView() {
+        let flushAction = { [weak self] in
+            guard let self = self else { return }
+            self.bridge?.webView?.evaluateJavaScript("window.__imcodesConsumePendingShares?.()", completionHandler: nil)
+        }
+        if Thread.isMainThread {
+            flushAction()
+        } else {
+            DispatchQueue.main.async(execute: flushAction)
         }
     }
 

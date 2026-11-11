@@ -229,6 +229,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     private func stripPunctuation(_ text: String) -> String {
         return text.replacingOccurrences(of: "[，。？！、；：,.?!;:…—\\-]+", with: "", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
     }
     private func formatBilingualPunctuation(_ text: String) -> String {
         var out = text

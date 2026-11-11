@@ -35,6 +35,7 @@ export default defineConfig(({ mode }) => ({
           source: `${JSON.stringify({
             buildId: webBuildId,
             builtAt: buildTime,
+            buildTime,
             packageVersion: process.env.npm_package_version ?? null,
             pushRegion,
           }, null, 2)}\n`,

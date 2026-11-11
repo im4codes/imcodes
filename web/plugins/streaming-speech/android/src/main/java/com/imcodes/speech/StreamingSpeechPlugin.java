@@ -345,7 +345,7 @@ public class StreamingSpeechPlugin extends Plugin {
 
     private static String stripPunctuation(String text) {
         if (text == null || text.isEmpty()) return "";
-        return PUNCT_STRIP.matcher(text).replaceAll("").trim();
+        return PUNCT_STRIP.matcher(text).replaceAll("").trim().toLowerCase(java.util.Locale.ROOT);
     }
 
     private static String formatBilingualPunctuation(String text) {

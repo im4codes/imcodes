@@ -19,6 +19,11 @@ interface UpdateManifest {
   buildTime: string;  // ISO 8601
 }
 
+interface LocalAppBuildInfo {
+  buildTime?: string;
+  builtAt?: string;
+}
+
 const PREFS_OTA_VERSION_KEY = 'deck_ota_version';
 
 let initialized = false;
@@ -64,6 +69,29 @@ async function checkForUpdate(applyNow: boolean): Promise<void> {
   const { value: storedStr } = await Preferences.get({ key: PREFS_OTA_VERSION_KEY });
   const storedVersion = storedStr ? parseInt(storedStr, 10) : 0;
   if (manifest.version <= storedVersion) return;
+
+  // Compare against local bundled /app-build.json buildTime so an older server OTA
+  // snapshot never overwrites a newer native build.
+  try {
+    const localRes = await fetch('/app-build.json', { cache: 'no-cache' });
+    if (localRes.ok) {
+      const localBuild = await localRes.json() as LocalAppBuildInfo;
+      const localBuildTime = typeof localBuild?.buildTime === 'string' && localBuild.buildTime.trim()
+        ? localBuild.buildTime.trim()
+        : (typeof localBuild?.builtAt === 'string' && localBuild.builtAt.trim()
+          ? localBuild.builtAt.trim()
+          : '');
+      if (localBuildTime && typeof manifest.buildTime === 'string' && manifest.buildTime.trim()) {
+        const localMs = Date.parse(localBuildTime);
+        const remoteMs = Date.parse(manifest.buildTime);
+        if (!Number.isNaN(localMs) && !Number.isNaN(remoteMs) && remoteMs <= localMs) {
+          return;
+        }
+      }
+    }
+  } catch {
+    // Missing or unreadable /app-build.json — fall back to version comparison
+  }
 
   // Build absolute download URL
   const bundleUrl = manifest.url.startsWith('http')

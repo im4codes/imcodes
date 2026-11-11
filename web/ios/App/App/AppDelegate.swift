@@ -15,9 +15,15 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
 
         WatchBridge.shared.activate()
 
+        self.registerLocalPluginsIfNeeded()
+        if let launchURL = launchOptions?[.url] as? URL, launchURL.isFileURL {
+            _ = ShareReceiverPlugin.shared.handleIncomingFileURL(launchURL)
+        }
+
         // Register local Capacitor plugins after the bridge initializes
         DispatchQueue.main.async {
             self.registerLocalPluginsIfNeeded()
+            ShareReceiverPlugin.shared.flushToWebView()
         }
         return true
     }
@@ -53,12 +59,16 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
 
         WatchBridge.shared.activate()
 
+        self.registerLocalPluginsIfNeeded()
+
         DispatchQueue.main.async {
             self.registerLocalPluginsIfNeeded()
+            ShareReceiverPlugin.shared.flushToWebView()
         }
 
         // Notify server to reset badge counter
         self.resetBadgeOnServer()
+        ShareReceiverPlugin.shared.flushToWebView()
     }
 
     private func resetBadgeOnServer() {
@@ -84,6 +94,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
     }
 
     func application(_ app: UIApplication, open url: URL, options: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool {
+        self.registerLocalPluginsIfNeeded()
         if url.isFileURL {
             return ShareReceiverPlugin.shared.handleIncomingFileURL(url)
         }

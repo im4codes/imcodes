@@ -38,6 +38,12 @@ export interface ShareReceiverPluginContract extends Plugin {
   ): Promise<PluginListenerHandle>;
 }
 
+declare global {
+  interface Window {
+    __imcodesConsumePendingShares?: () => void;
+  }
+}
+
 const ShareReceiver = registerPlugin<ShareReceiverPluginContract>('ShareReceiver');
 
 const consumedPayloadIds = new Set<string>();
@@ -150,6 +156,8 @@ export function subscribeShareReceiver(
   const plugin = options?.plugin ?? ShareReceiver;
   let disposed = false;
   let listenerHandle: PluginListenerHandle | null = null;
+  let polling = false;
+  let pollQueued = false;
 
   const deliver = (raw: unknown) => {
     if (disposed) return;
@@ -159,35 +167,82 @@ export function subscribeShareReceiver(
     handler(parsed);
   };
 
-  void (async () => {
-    try {
-      const handle = await plugin.addListener('sharedPayload', (payload) => {
-        deliver(payload);
-      });
-      if (disposed) {
-        void handle.remove().catch(() => {});
-        return;
-      }
-      listenerHandle = handle;
-    } catch {
-      // Plugin not available on this platform
-    }
-
+  const pollPendingShares = async (): Promise<void> => {
     if (disposed) return;
-    try {
-      const pending = await plugin.consumePendingShares();
-      if (disposed) return;
-      const items = Array.isArray(pending?.items) ? pending.items : [];
-      for (const item of items) {
-        deliver(item);
-      }
-    } catch {
-      // Ignore if plugin is unavailable
+    if (polling) {
+      pollQueued = true;
+      return;
     }
-  })();
+    polling = true;
+    try {
+      do {
+        pollQueued = false;
+        if (disposed) return;
+        if (!listenerHandle) {
+          try {
+            const handle = await plugin.addListener('sharedPayload', (payload) => {
+              deliver(payload);
+            });
+            if (disposed) {
+              void handle.remove().catch(() => {});
+              return;
+            }
+            listenerHandle = handle;
+          } catch {
+            // Plugin not available yet — will retry on next poll/wakeup
+          }
+        }
+
+        if (disposed) return;
+        try {
+          const pending = await plugin.consumePendingShares();
+          if (disposed) return;
+          const items = Array.isArray(pending?.items) ? pending.items : [];
+          for (const item of items) {
+            deliver(item);
+          }
+        } catch {
+          // Ignore if plugin is unavailable
+        }
+      } while (pollQueued && !disposed);
+    } finally {
+      polling = false;
+    }
+  };
+
+  const consumeHook = () => {
+    void pollPendingShares();
+  };
+  const onVisibilityChange = () => {
+    if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+      void pollPendingShares();
+    }
+  };
+  const onFocus = () => {
+    void pollPendingShares();
+  };
+
+  if (typeof window !== 'undefined') {
+    window.__imcodesConsumePendingShares = consumeHook;
+    window.addEventListener('focus', onFocus);
+  }
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', onVisibilityChange);
+  }
+
+  void pollPendingShares();
 
   return () => {
     disposed = true;
+    if (typeof window !== 'undefined') {
+      if (window.__imcodesConsumePendingShares === consumeHook) {
+        delete window.__imcodesConsumePendingShares;
+      }
+      window.removeEventListener('focus', onFocus);
+    }
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    }
     if (listenerHandle) {
       void listenerHandle.remove().catch(() => {});
       listenerHandle = null;

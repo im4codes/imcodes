@@ -148,6 +148,134 @@ describe('share-receiver service', () => {
 
     dispose();
     expect(removeSpy).toHaveBeenCalledTimes(1);
+    expect(window.__imcodesConsumePendingShares).toBeUndefined();
+  });
+
+  it('retries addListener on wakeup, polls pendingShares via __imcodesConsumePendingShares / visibilitychange / focus, and cleans up on unsubscribe', async () => {
+    const listeners: Array<(payload: RawSharedPayload) => void> = [];
+    const removeSpy = vi.fn(async () => {});
+    let shouldFailAddListener = true;
+    const pendingQueue: RawSharedPayload[] = [
+      {
+        id: 'pending-after-retry-1',
+        files: [
+          {
+            name: 'inbox.pdf',
+            mimeType: 'application/pdf',
+            base64: Buffer.from('%PDF-1.7', 'utf8').toString('base64'),
+          },
+        ],
+      },
+    ];
+
+    const mockPlugin: ShareReceiverPluginContract = {
+      addListener: vi.fn(async (_event, cb) => {
+        if (shouldFailAddListener) {
+          throw new Error('UNIMPLEMENTED');
+        }
+        listeners.push(cb);
+        return { remove: removeSpy };
+      }),
+      consumePendingShares: vi.fn(async () => {
+        if (shouldFailAddListener) {
+          throw new Error('UNIMPLEMENTED');
+        }
+        const items = pendingQueue.splice(0, pendingQueue.length);
+        return { items };
+      }),
+    };
+
+    const received: SharedPayload[] = [];
+    const dispose = subscribeShareReceiver((payload) => {
+      received.push(payload);
+    }, {
+      plugin: mockPlugin,
+      native: true,
+    });
+
+    await vi.waitFor(() => {
+      expect(mockPlugin.addListener).toHaveBeenCalledTimes(1);
+    });
+    expect(received).toHaveLength(0);
+    expect(typeof window.__imcodesConsumePendingShares).toBe('function');
+
+    // Now native local plugin finishes registering and flushes via window.__imcodesConsumePendingShares()
+    shouldFailAddListener = false;
+    window.__imcodesConsumePendingShares?.();
+    // Overlapping focus wakeup while poll is in flight should not register duplicate listeners
+    window.dispatchEvent(new Event('focus'));
+
+    await vi.waitFor(() => {
+      expect(received).toHaveLength(1);
+    });
+    expect(received[0]!.id).toBe('pending-after-retry-1');
+    expect(listeners).toHaveLength(1);
+
+    // Dual-channel notification (notifyListeners + pendingShares flush with same id) is idempotent
+    const dualItem: RawSharedPayload = {
+      id: 'dual-channel-2',
+      files: [
+        {
+          name: 'photo.jpg',
+          mimeType: 'image/jpeg',
+          base64: Buffer.from('jpg', 'utf8').toString('base64'),
+        },
+      ],
+    };
+    pendingQueue.push(dualItem);
+    listeners[0]?.(dualItem);
+    window.__imcodesConsumePendingShares?.();
+
+    await vi.waitFor(() => {
+      expect(pendingQueue).toHaveLength(0);
+    });
+    expect(received).toHaveLength(2);
+    expect(received[1]!.id).toBe('dual-channel-2');
+
+    // visibilitychange to visible polls newly queued background share
+    pendingQueue.push({
+      id: 'visibility-share-3',
+      files: [
+        {
+          name: 'resume.txt',
+          mimeType: 'text/plain',
+          base64: Buffer.from('resume', 'utf8').toString('base64'),
+        },
+      ],
+    });
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true,
+      get: () => 'visible',
+    });
+    document.dispatchEvent(new Event('visibilitychange'));
+
+    await vi.waitFor(() => {
+      expect(received).toHaveLength(3);
+    });
+    expect(received[2]!.id).toBe('visibility-share-3');
+
+    // Unsubscribe cleans up hook, DOM listeners, and plugin listener
+    dispose();
+    expect(window.__imcodesConsumePendingShares).toBeUndefined();
+    expect(removeSpy).toHaveBeenCalledTimes(1);
+
+    const callsBeforePostDisposeEvents = vi.mocked(mockPlugin.consumePendingShares).mock.calls.length;
+    window.dispatchEvent(new Event('focus'));
+    document.dispatchEvent(new Event('visibilitychange'));
+    expect(vi.mocked(mockPlugin.consumePendingShares).mock.calls.length).toBe(callsBeforePostDisposeEvents);
+  });
+
+  it('keeps iOS AppDelegate and ShareReceiverPlugin native bridge contracts aligned', () => {
+    const appDelegate = readFileSync(join(WEB_ROOT, 'ios/App/App/AppDelegate.swift'), 'utf8');
+    const authPlugin = readFileSync(join(WEB_ROOT, 'ios/App/App/AuthSessionPlugin.swift'), 'utf8');
+
+    expect(appDelegate).toContain('launchOptions?[.url] as? URL');
+    expect(appDelegate).toContain('ShareReceiverPlugin.shared.flushToWebView()');
+    expect(authPlugin).toContain('url.path.contains("/Documents/Inbox/") || url.path.contains("-Inbox/")');
+    expect(authPlugin).toContain('duplicatePathDebounceInterval: TimeInterval = 2.0');
+    expect(authPlugin).toContain('maxPendingShares = 20');
+    expect(authPlugin).toContain('self.pendingShares.append(payload)');
+    expect(authPlugin).toContain('window.__imcodesConsumePendingShares?.()');
   });
 
   it('ships complete shareTarget i18n keys across all 7 locales', () => {

@@ -1,5 +1,9 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { waitFor } from '@testing-library/preact';
+
+const WEB_ROOT = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
 
 const isNativeMock = vi.fn();
 const getServerUrlMock = vi.fn();
@@ -47,15 +51,28 @@ describe('update manager', () => {
     setBundleMock.mockResolvedValue(undefined);
     preferencesGetMock.mockResolvedValue({ value: '1' });
     preferencesSetMock.mockResolvedValue(undefined);
-    vi.stubGlobal('fetch', vi.fn(async () => ({
-      ok: true,
-      json: async () => ({
-        version: 2,
-        sha256: 'abc',
-        url: '/api/updates/bundle.zip',
-        buildTime: '2026-05-11T00:00:00.000Z',
-      }),
-    })));
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/app-build.json') {
+        return {
+          ok: true,
+          json: async () => ({
+            buildId: 'local-1',
+            buildTime: '2026-05-10T00:00:00.000Z',
+            builtAt: '2026-05-10T00:00:00.000Z',
+          }),
+        };
+      }
+      return {
+        ok: true,
+        json: async () => ({
+          version: 2,
+          sha256: 'abc',
+          url: '/api/updates/bundle.zip',
+          buildTime: '2026-05-11T00:00:00.000Z',
+        }),
+      };
+    }));
   });
 
   afterEach(() => {
@@ -127,5 +144,96 @@ describe('update manager', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     resume({ isActive: true });
     await waitFor(() => expect(warn).toHaveBeenCalledWith('[OTA] Download failed:', expect.any(Error)));
+  });
+
+  it('skips OTA download when local /app-build.json buildTime is newer than or equal to remote manifest.buildTime, and falls back safely when missing or invalid', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/app-build.json') {
+        return {
+          ok: true,
+          json: async () => ({
+            buildId: 'native-newer',
+            buildTime: '2026-11-11T20:44:00.000Z',
+          }),
+        };
+      }
+      return {
+        ok: true,
+        json: async () => ({
+          version: 5,
+          sha256: 'stale-ota',
+          url: '/api/updates/bundle.zip',
+          buildTime: '2026-11-11T12:33:09.000Z',
+        }),
+      };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { initUpdateManager } = await import('../src/update-manager.js');
+    await initUpdateManager();
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/app-build.json', { cache: 'no-cache' }));
+    expect(downloadMock).not.toHaveBeenCalled();
+    expect(setBundleMock).not.toHaveBeenCalled();
+
+    const resume = addListenerMock.mock.calls[0]?.[1] as (state: { isActive: boolean }) => void;
+
+    // Equal timestamp (via builtAt fallback) must also skip OTA download
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/app-build.json') {
+        return {
+          ok: true,
+          json: async () => ({
+            buildId: 'native-equal',
+            builtAt: '2026-11-11T20:44:00.000Z',
+          }),
+        };
+      }
+      return {
+        ok: true,
+        json: async () => ({
+          version: 5,
+          sha256: 'equal-ota',
+          url: '/api/updates/bundle.zip',
+          buildTime: '2026-11-11T20:44:00.000Z',
+        }),
+      };
+    });
+    resume({ isActive: true });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(downloadMock).not.toHaveBeenCalled();
+
+    // Missing /app-build.json (404) or invalid timestamp falls back safely and allows newer version download
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/app-build.json') {
+        return {
+          ok: true,
+          json: async () => ({
+            buildId: 'invalid-date',
+            buildTime: 'not-a-valid-timestamp',
+          }),
+        };
+      }
+      return {
+        ok: true,
+        json: async () => ({
+          version: 5,
+          sha256: 'valid-ota',
+          url: '/api/updates/bundle.zip',
+          buildTime: '2026-11-11T21:00:00.000Z',
+        }),
+      };
+    });
+    resume({ isActive: true });
+    await waitFor(() => expect(downloadMock).toHaveBeenCalledTimes(1));
+
+    const pbxproj = readFileSync(join(WEB_ROOT, 'ios/App/App.xcodeproj/project.pbxproj'), 'utf8');
+    expect(pbxproj.match(/CURRENT_PROJECT_VERSION = 1\.2;/g)).toHaveLength(2);
+    expect(pbxproj.match(/MARKETING_VERSION = 1\.2;/g)).toHaveLength(2);
+    expect(pbxproj).not.toContain('CURRENT_PROJECT_VERSION = 1.1;');
+    expect(pbxproj).not.toContain('MARKETING_VERSION = 1.1;');
   });
 });

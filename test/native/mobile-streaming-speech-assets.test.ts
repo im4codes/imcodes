@@ -70,6 +70,8 @@ describe('shared mobile model preparation', () => {
     expect(android).toMatch(/stream\.acceptWaveform\(new float\[SAMPLE_RATE \/ 2\], SAMPLE_RATE\);\s*\n\s*decodeAvailable\(recognizer, stream\);/);
     expect(android).toMatch(/next\.acceptWaveform\(new float\[SAMPLE_RATE \/ 2\], SAMPLE_RATE\);\s*\n\s*decodeAvailable\(recognizer, next\);/);
     expect(android).toMatch(/handleOnDestroy\(\)[\s\S]*punctuator\.release\(\);[\s\S]*recognizer\.release\(\);/);
+    expect(ios).toMatch(/private func stripPunctuation\([\s\S]*?\.lowercased\(\)/);
+    expect(android).toContain('.toLowerCase(java.util.Locale.ROOT)');
   });
   it('pins the mixed-precision transducer bytes and locally maintained hotwords', async () => {
     expect(MODEL_REVISION).toBe('98590b7ed6443e77b714204da2757d75e1a642f4');
@@ -598,8 +600,9 @@ public class Harness {
       }
       System.out.println("COLD_STOP:" + OnlineStream.spokenSamples + ":" + p.events);
 
-      // 2. Warm positive control: reuses resident recognizer & punctuator without recreating
+      // 2. Warm positive control: reuses resident recognizer & punctuator without recreating, and normalizes uppercase BPE English tokens ("你好 HELLO WORLD") to lowercase
       p.events.clear();
+      OnlineStream.nextTranscript = "你好 HELLO WORLD";
       OnlineStream.speech = new CountDownLatch(1);
       PluginCall warmStart = new PluginCall();
       p.start(warmStart);
@@ -685,7 +688,7 @@ public class Harness {
     const output = execFileSync('java', ['-cp', classesDir, 'Harness'], { encoding: 'utf8', timeout: 10000 }).trim().split('\n');
 
     expect(output[0]).toContain('COLD_STOP:1600:[listeningState:{status=started}, audioLevel:{level=0.091552734375}, partialResults:{isFinal=false, matches=[synthetic utterance]}, partialResults:{isFinal=true, matches=[synthetic utterance.]}, listeningState:{status=stopped}]');
-    expect(output[1]).toContain('WARM_POSITIVE:1:3200:[listeningState:{status=started}, audioLevel:{level=0.091552734375}, partialResults:{isFinal=false, matches=[synthetic utterance]}, partialResults:{isFinal=true, matches=[synthetic utterance.]}, listeningState:{status=stopped}]');
+    expect(output[1]).toContain('WARM_POSITIVE:1:3200:[listeningState:{status=started}, audioLevel:{level=0.091552734375}, partialResults:{isFinal=false, matches=[你好 hello world]}, partialResults:{isFinal=true, matches=[你好 hello world.]}, listeningState:{status=stopped}]');
     expect(output[2]).toContain('PAUSE_SEGMENT:calls=1/1:');
     expect(output[2]).toContain('partialResults:{isFinal=false, matches=[你好，今天天气真好]}');
     expect(output[2]).toContain('partialResults:{isFinal=false, matches=[你好，今天天气真好。]}');
