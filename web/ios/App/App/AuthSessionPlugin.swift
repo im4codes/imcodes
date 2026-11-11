@@ -79,8 +79,7 @@ public class ShareReceiverPlugin: CAPPlugin, CAPBridgedPlugin {
 
     private let lock = NSLock()
     private var pendingShares: [[String: Any]] = []
-    private var lastHandledPath: String?
-    private var lastHandledAt: TimeInterval = 0
+    private var recentHandledPaths: [String: TimeInterval] = [:]
 
     @discardableResult
     public func handleIncomingFileURL(_ url: URL) -> Bool {
@@ -89,14 +88,15 @@ public class ShareReceiverPlugin: CAPPlugin, CAPBridgedPlugin {
         let normalizedPath = url.standardizedFileURL.path
         let now = Date().timeIntervalSince1970
         lock.lock()
-        if let lastPath = lastHandledPath,
-           lastPath == normalizedPath,
+        recentHandledPaths = recentHandledPaths.filter { (_, timestamp) in
+            (now - timestamp) < Self.duplicatePathDebounceInterval
+        }
+        if let lastHandledAt = recentHandledPaths[normalizedPath],
            (now - lastHandledAt) < Self.duplicatePathDebounceInterval {
             lock.unlock()
             return true
         }
-        lastHandledPath = normalizedPath
-        lastHandledAt = now
+        recentHandledPaths[normalizedPath] = now
         lock.unlock()
 
         let accessed = url.startAccessingSecurityScopedResource()

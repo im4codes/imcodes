@@ -265,7 +265,7 @@ describe('share-receiver service', () => {
     expect(vi.mocked(mockPlugin.consumePendingShares).mock.calls.length).toBe(callsBeforePostDisposeEvents);
   });
 
-  it('keeps iOS AppDelegate and ShareReceiverPlugin native bridge contracts aligned', () => {
+  it('keeps iOS AppDelegate and ShareReceiverPlugin native bridge contracts aligned and deduplicates per-path within 2s across interleaved A -> B -> A shares', () => {
     const appDelegate = readFileSync(join(WEB_ROOT, 'ios/App/App/AppDelegate.swift'), 'utf8');
     const authPlugin = readFileSync(join(WEB_ROOT, 'ios/App/App/AuthSessionPlugin.swift'), 'utf8');
 
@@ -273,9 +273,71 @@ describe('share-receiver service', () => {
     expect(appDelegate).toContain('ShareReceiverPlugin.shared.flushToWebView()');
     expect(authPlugin).toContain('url.path.contains("/Documents/Inbox/") || url.path.contains("-Inbox/")');
     expect(authPlugin).toContain('duplicatePathDebounceInterval: TimeInterval = 2.0');
+    expect(authPlugin).toContain('recentHandledPaths: [String: TimeInterval] = [:]');
+    expect(authPlugin).toContain('recentHandledPaths = recentHandledPaths.filter');
+    expect(authPlugin).toContain('recentHandledPaths[normalizedPath] = now');
+    expect(authPlugin).not.toContain('lastHandledPath');
     expect(authPlugin).toContain('maxPendingShares = 20');
     expect(authPlugin).toContain('self.pendingShares.append(payload)');
     expect(authPlugin).toContain('window.__imcodesConsumePendingShares?.()');
+
+    // Deterministic contract harness modeling ShareReceiverPlugin.handleIncomingFileURL
+    // per-path 2.0s window deduplication + Inbox file deletion semantics:
+    const debounceMatch = authPlugin.match(/duplicatePathDebounceInterval:\s*TimeInterval\s*=\s*([0-9.]+)/);
+    const windowSec = Number(debounceMatch?.[1] ?? NaN);
+    expect(windowSec).toBe(2.0);
+
+    const inboxFiles = new Map<string, string>([
+      ['/tmp/com.im.codes-Inbox/A.txt', 'content-A-1'],
+      ['/tmp/com.im.codes-Inbox/B.txt', 'content-B-1'],
+    ]);
+    const recentHandledPaths = new Map<string, number>();
+    const dispatched: Array<{ path: string; content?: string; error?: string }> = [];
+
+    const simulateHandleIncomingFile = (rawPath: string, nowSec: number): boolean => {
+      for (const [p, ts] of recentHandledPaths.entries()) {
+        if (nowSec - ts >= windowSec) {
+          recentHandledPaths.delete(p);
+        }
+      }
+      const lastAt = recentHandledPaths.get(rawPath);
+      if (lastAt !== undefined && nowSec - lastAt < windowSec) {
+        return true;
+      }
+      recentHandledPaths.set(rawPath, nowSec);
+
+      const content = inboxFiles.get(rawPath);
+      if (rawPath.includes('/Documents/Inbox/') || rawPath.includes('-Inbox/')) {
+        inboxFiles.delete(rawPath);
+      }
+      if (content === undefined) {
+        dispatched.push({ path: rawPath, error: 'read_failed' });
+      } else {
+        dispatched.push({ path: rawPath, content });
+      }
+      return true;
+    };
+
+    // 1. Short-interval A -> A (t=0.0s, t=0.1s) and interleaved A -> B -> A (t=0.3s B, t=0.6s A):
+    //    Only A and B are enqueued once each; deleted Inbox file A at t=0.6s does NOT produce read_failed.
+    simulateHandleIncomingFile('/tmp/com.im.codes-Inbox/A.txt', 0.0);
+    simulateHandleIncomingFile('/tmp/com.im.codes-Inbox/A.txt', 0.1);
+    simulateHandleIncomingFile('/tmp/com.im.codes-Inbox/B.txt', 0.3);
+    simulateHandleIncomingFile('/tmp/com.im.codes-Inbox/A.txt', 0.6);
+
+    expect(dispatched).toEqual([
+      { path: '/tmp/com.im.codes-Inbox/A.txt', content: 'content-A-1' },
+      { path: '/tmp/com.im.codes-Inbox/B.txt', content: 'content-B-1' },
+    ]);
+
+    // 2. After the 2.0s window expires (t=2.5s >= 2.0s), a newly created Inbox file at path A is accepted again.
+    inboxFiles.set('/tmp/com.im.codes-Inbox/A.txt', 'content-A-2');
+    simulateHandleIncomingFile('/tmp/com.im.codes-Inbox/A.txt', 2.5);
+    expect(dispatched).toEqual([
+      { path: '/tmp/com.im.codes-Inbox/A.txt', content: 'content-A-1' },
+      { path: '/tmp/com.im.codes-Inbox/B.txt', content: 'content-B-1' },
+      { path: '/tmp/com.im.codes-Inbox/A.txt', content: 'content-A-2' },
+    ]);
   });
 
   it('ships complete shareTarget i18n keys across all 7 locales', () => {
