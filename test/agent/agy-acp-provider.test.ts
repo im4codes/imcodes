@@ -140,6 +140,18 @@ describe('AG native ACP', () => {
     await new Promise(r=>setTimeout(r,100));expect(done).toHaveBeenCalledTimes(2);
     const state=(provider as any).sessions.get(id);await provider.endSession(id);expect(state.agyBridges.size).toBe(0);
   });
+  it('reuses a completed native child cursor after send_message without replaying its old terminal',async()=>{
+    const {provider,requests}=await setup('native-child-reuse');const id=await route(provider),done=vi.fn(),events:ToolCallEvent[]=[];
+    provider.onComplete(done);provider.onToolCall((_,t)=>events.push(t));
+    const terminals=()=>events.filter(t=>t.name==='Agent'&&t.detail?.meta?.agentPath==='native-child-fixture'&&t.detail?.meta?.terminal);
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2));await vi.waitFor(()=>expect(terminals()).toHaveLength(1));
+    const key=terminals()[0].id;
+    await provider.send(id,'send child another assignment');
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(4));await vi.waitFor(()=>expect(terminals()).toHaveLength(2));
+    expect(terminals().every(t=>t.id===key)).toBe(true);
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(2);
+    expect(terminals()[1].output).toBe('REUSE-PONG');
+  });
   it('closes native log observers on Stop and never revives the stopped parent',async()=>{
     const {provider}=await setup('native-child-log');const id=await route(provider),done=vi.fn();provider.onComplete(done);
     await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1));

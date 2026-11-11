@@ -134,20 +134,22 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
         const file=dir+'/transcript_full.jsonl';
         const row=(step_index,type,content,extra={})=>JSON.stringify({step_index,type,status:'DONE',source:type==='USER_INPUT'?'USER_EXPLICIT':'MODEL',created_at:'2026-11-12T00:00:00Z',content,...extra})+'\n';
         const childId='native-child-fixture';
-        fs.writeFileSync(file,row(0,'USER_INPUT',text));
-        note(p.sessionId,{sessionUpdate:'tool_call',toolCallId:'launch',title:'Run invoke_subagent',kind:'other',status:'in_progress',rawInput:{Role:'WakeProbe',Prompt:'return result',Model:'model-a'}});
-        note(p.sessionId,{sessionUpdate:'tool_call_update',toolCallId:'launch',status:'completed'});
-        fs.appendFileSync(file,row(1,'PLANNER_RESPONSE','',{tool_calls:[{name:'invoke_subagent',args:{Role:'WakeProbe'}}]})+row(2,'GENERIC','Created the following subagent:\n'+JSON.stringify({conversationId:childId}))+row(3,'PLANNER_RESPONSE','PARENT-STARTED'));
+        const pass = state.bridgePass = (state.bridgePass || 0)+1, offset=(pass-1)*6;
+        if(pass===1) fs.writeFileSync(file,row(offset,'USER_INPUT',text));else fs.appendFileSync(file,row(offset,'USER_INPUT',text));
+        note(p.sessionId,{sessionUpdate:'tool_call',toolCallId:'launch-'+pass,title:pass===1?'Run invoke_subagent':'Run send_message',kind:'other',status:'in_progress',rawInput:pass===1?{Role:'WakeProbe',Prompt:'return result',Model:'model-a'}:{Recipient:childId,Prompt:'next assignment'}});
+        note(p.sessionId,{sessionUpdate:'tool_call_update',toolCallId:'launch-'+pass,status:'completed'});
+        fs.appendFileSync(file,row(offset+1,'PLANNER_RESPONSE','',{tool_calls:[{name:pass===1?'invoke_subagent':'send_message',args:pass===1?{Role:'WakeProbe'}:{Recipient:childId}}]})+row(offset+2,'GENERIC',pass===1?'Created the following subagent:\n'+JSON.stringify({conversationId:childId}):'Message sent')+row(offset+3,'PLANNER_RESPONSE','PARENT-STARTED'));
         note(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'PARENT-STARTED'}});
         const finishFirst=()=>ok(req.id,{stopReason:'end_turn',usage:{inputTokens:100,outputTokens:2}});
         if(scenario==='native-child-rpc-late') setTimeout(finishFirst,300);else finishFirst();
         setTimeout(()=>{
           const childDir=`${process.env.HOME}/.gemini/antigravity-cli/brain/${childId}/.system_generated/logs`;fs.mkdirSync(childDir,{recursive:true});
-          fs.writeFileSync(childDir+'/transcript_full.jsonl',row(0,'PLANNER_RESPONSE','CHILD-PONG'));
+          if(pass===1) fs.writeFileSync(childDir+'/transcript_full.jsonl',row(0,'PLANNER_RESPONSE','CHILD-PONG'));
+          else fs.appendFileSync(childDir+'/transcript_full.jsonl',row(1,'USER_INPUT','next assignment')+row(2,'PLANNER_RESPONSE','REUSE-PONG'));
           if(scenario==='native-child-both') {
             note(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'PARENT-WOKE CHILD-PONG'}});
           }
-          fs.appendFileSync(file,row(4,'SYSTEM_MESSAGE','[Message] sender='+childId+' content=CHILD-PONG')+row(5,'PLANNER_RESPONSE','PARENT-WOKE CHILD-PONG',{input_tokens:120,cache_read_tokens:80,output_tokens:3}));
+          fs.appendFileSync(file,row(offset+4,'SYSTEM_MESSAGE','[Message] sender='+childId+' content=CHILD-PONG')+row(offset+5,'PLANNER_RESPONSE','PARENT-WOKE CHILD-PONG',{input_tokens:120,cache_read_tokens:80,output_tokens:3}));
           if(scenario==='native-child-both') note(p.sessionId,{sessionUpdate:'turn_completed'});
         },180);
         return;

@@ -8,9 +8,9 @@ const record = (v: unknown): Record<string, unknown> => {
   return v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : {};
 };
 const string = (...values: unknown[]): string | undefined => values.find(v => typeof v === 'string' && v.trim()) as string | undefined;
-function toolName(name: string): string { return name.toLowerCase().replace(/^run\s+/, '').replace(/[-_\s]/g, ''); }
+export function normalizeAgyToolName(name: string): string { return name.toLowerCase().replace(/^run\s+/, '').replace(/[-_\s]/g, ''); }
 export function isAgySubagentTool(name: string): boolean {
-  return /^(invokesubagent|browsersubagent|managesubagents|definesubagent|swarm|sendmessage|subagent|agent)$/.test(toolName(name));
+  return /^(invokesubagent|browsersubagent|managesubagents|definesubagent|swarm|sendmessage|subagent|agent)$/.test(normalizeAgyToolName(name));
 }
 function status(value: unknown): SdkSubagentNormalizedStatus | undefined {
   const v = typeof value === 'string' ? value.toLowerCase() : '';
@@ -53,9 +53,13 @@ export class AgySubagentTracker {
       const text = value;
       try { value = JSON.parse(text); } catch {
         // AG native tool results can wrap their JSON snapshot in prose.
-        const start = text.indexOf('{'), end = text.lastIndexOf('}');
-        if (start < 0 || end < start) return [];
-        try { value = JSON.parse(text.slice(start,end+1)); } catch { return []; }
+        let parsed = false;
+        for (const [open,close] of [['{','}'],['[',']']]) {
+          const start = text.indexOf(open), end = text.lastIndexOf(close);
+          if (start < 0 || end < start) continue;
+          try { value = JSON.parse(text.slice(start,end+1)); parsed = true; break; } catch { /* try the array snapshot */ }
+        }
+        if (!parsed) return [];
       }
     }
     let obj = record(value);
@@ -91,7 +95,7 @@ export class AgySubagentTracker {
   tool(tool: ToolCallEvent): ToolCallEvent[] {
     if (!isAgySubagentTool(tool.name)) return [];
     const input = record(tool.input);
-    const name = toolName(tool.name);
+    const name = normalizeAgyToolName(tool.name);
     const action = string(input.action, input.Action, input.command, input.Command) ?? name;
     const launchResult = /^(invokesubagent|browsersubagent)$/.test(name) || name === 'swarm' && /^(add|start|create)$/.test(action);
     const snapshot = this.snapshot(tool.output, action, tool.id, launchResult ? tool.status === 'error' ? SDK_SUBAGENT_STATUS.ERROR : SDK_SUBAGENT_STATUS.RUNNING : undefined);

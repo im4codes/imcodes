@@ -12,6 +12,7 @@ describe('AG native transcript event bridge',()=>{
    await rename(file,file+'.old');await writeFile(file,row(0)+row(1));await b.flush();expect(cb).toHaveBeenCalledTimes(1);
    const bytes=Buffer.from(row(2,'summary 😀'));const split=bytes.indexOf(Buffer.from('😀'))+2;await appendFile(file,bytes.subarray(0,split));await b.flush();expect(cb).toHaveBeenCalledTimes(1);
    await appendFile(file,bytes.subarray(split));await vi.waitFor(()=>expect(cb).toHaveBeenCalledTimes(2));expect(cb.mock.calls[1][0].content).toBe('summary 😀');
+   b.close();await appendFile(file,row(3,'new assignment'));await b.resume();expect(cb).toHaveBeenCalledTimes(3);expect(cb.mock.calls[2][0].content).toBe('new assignment');
  });
  it('watches late directory creation without polling and closes all observers',async()=>{
    const home=await mkdtemp(path.join(tmpdir(),'imcodes-ag-native-'));roots.push(home);const file=agyTranscriptFile(home,'new-owner')!;

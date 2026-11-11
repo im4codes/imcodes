@@ -1,5 +1,5 @@
 import { AgyTranscriptBridge, agyTranscriptFile, type AgyTranscriptRow } from '../agy-transcript-bridge.js';
-import { AgySubagentTracker } from '../agy-subagents.js';
+import { AgySubagentTracker, isAgySubagentTool, normalizeAgyToolName } from '../agy-subagents.js';
 import { AgyCompactionWatermark } from '../agy-compaction-watermark.js';
 import { AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
 import { AgyContextUsage } from '../agy-context-usage.js';
@@ -286,7 +286,9 @@ interface KimiSdkSessionState {
   agyCompactionWatermark?: AgyCompactionWatermark;
   agySubagents?: AgySubagentTracker;
   agyBridges?: Map<string, AgyTranscriptBridge>;
-  agyPendingLaunches?: string[];
+  agyPendingNativeTools?: Map<string, ToolCallEvent>;
+  agyConsumedNativeTools?: Set<string>;
+  agyNativeToolOrder?: Array<{name:string;input:unknown;step:number;index:number}>;
   agyReactive?: boolean;
   agyPendingResponses?: Map<number, AgyTranscriptRow>;
   agyNativeAcks?: string[];
@@ -634,13 +636,15 @@ export class KimiSdkProvider implements TransportProvider {
     for (const bridge of state.agyBridges?.values() ?? []) bridge.close();
     state.agyBridges?.clear(); state.agyReactive = false;
     state.agyPendingResponses?.clear(); state.agyNativeAcks = [];
+    state.agyPendingNativeTools?.clear(); state.agyConsumedNativeTools?.clear(); state.agyNativeToolOrder = [];
   }
 
   private async startAgyBridge(sessionId: string, state: KimiSdkSessionState, childId?: string): Promise<void> {
     if (this.id !== AGY_SDK_PROVIDER_ID || !state.acpSessionId) return;
     const id = childId ?? state.acpSessionId;
     const bridges = state.agyBridges ??= new Map();
-    if (bridges.has(id)) return;
+    const existing = bridges.get(id);
+    if (existing) { if (childId && existing.isClosed) await existing.resume(); return; }
     const env = { ...process.env, ...(this.config?.env as Record<string,string> | undefined), ...state.env };
     const file = agyTranscriptFile(env.HOME || env.USERPROFILE || '', id);
     if (!file) return;
@@ -659,21 +663,28 @@ export class KimiSdkProvider implements TransportProvider {
     if (nativeId !== state.acpSessionId) {
       if (row.type === 'PLANNER_RESPONSE' && row.content?.trim() && !row.tool_calls?.length) {
         publish(tracker.snapshot({conversationId:nativeId,status:'completed',stateDetail:row.content}, 'native_completion'));
-        state.agyBridges?.get(nativeId)?.close(); state.agyBridges?.delete(nativeId);
+        state.agyBridges?.get(nativeId)?.close(); // Retain cursor for an explicit send_message reuse, never replay its old completion.
       }
       return;
     }
-    if (row.type === 'GENERIC' && row.content?.includes('Created the following subagent:')) {
-      // Real AG ACP omits rawOutput; this native tool-result supplies the id.
-      for (const match of row.content.matchAll(/\{[^{}]*"conversationId"[^{}]*\}/g)) {
-        try {
-          const child = JSON.parse(match[0]) as {conversationId?:string};
-          if (!child.conversationId || !agyTranscriptFile('/scoped',child.conversationId)) continue;
-          const toolId = state.agyPendingLaunches?.shift();
-          if (!toolId) continue; // Never replay another launch/history as ours.
-          publish(tracker.snapshot({...child,status:'running'}, 'native_launch', toolId));
-          void this.startAgyBridge(sessionId,state,child.conversationId);
-        } catch { /* not a native child creation result */ }
+    if (row.type === 'PLANNER_RESPONSE' && row.tool_calls?.length) {
+      for (const [index,call] of row.tool_calls.entries()) (state.agyNativeToolOrder ??= []).push({name:call.name ?? '',input:call.args,step:row.step_index,index});
+    }
+    if (row.type === 'GENERIC' && row.content) {
+      const nativeTool = state.agyNativeToolOrder?.shift();
+      if (nativeTool && isAgySubagentTool(nativeTool.name)) {
+        const pending = [...(state.agyPendingNativeTools?.values() ?? [])]
+          .find(tool => normalizeAgyToolName(tool.name) === normalizeAgyToolName(nativeTool.name));
+        const toolId = pending?.id ?? `${state.acpSessionId}:native-tool:${nativeTool.step}:${nativeTool.index}`;
+        state.agyPendingNativeTools?.delete(toolId);
+        (state.agyConsumedNativeTools ??= new Set()).add(toolId);
+        const events = tracker.tool({id:toolId,name:nativeTool.name,input:pending?.input ?? nativeTool.input,
+          status:pending?.status === 'error' ? 'error' : 'complete',output:row.content});
+        publish(events);
+        for (const event of events) {
+          const childId = event.detail?.meta?.agentPath;
+          if (typeof childId === 'string' && childId !== toolId && event.detail?.meta?.active) void this.startAgyBridge(sessionId,state,childId);
+        }
       }
     }
     if (row.type === 'USER_INPUT') state.agyReactive = false;
@@ -2229,13 +2240,18 @@ export class KimiSdkProvider implements TransportProvider {
     if (this.id === AGY_SDK_PROVIDER_ID) {
       const tracker = state.agySubagents ??= new AgySubagentTracker(state.acpSessionId ?? sessionId);
       const outputValue = merged.rawOutput !== undefined ? (typeof merged.rawOutput === 'string' ? merged.rawOutput : JSON.stringify(merged.rawOutput)) : evt.output;
-      const nativeName = merged.title.toLowerCase().replace(/^run\s+/, '').replace(/[-_\s]/g, '');
-      if (evt.status === 'running' && /^(invokesubagent|browsersubagent)$/.test(nativeName)) {
-        const pending = state.agyPendingLaunches ??= [];
-        if (!pending.includes(evt.id)) pending.push(evt.id);
+      if (isAgySubagentTool(merged.title) && !state.agyConsumedNativeTools?.has(evt.id)) {
+        (state.agyPendingNativeTools ??= new Map()).set(evt.id,evt);
       }
       const children = tracker.tool({ ...evt, ...(outputValue !== undefined ? { output: outputValue } : {}) });
-      if (children.some(child => child.detail?.meta?.agentPath !== evt.id)) state.agyPendingLaunches = state.agyPendingLaunches?.filter(id => id !== evt.id);
+      // Reuse an already-known child observer on explicit send_message, retaining
+      // its native cursor. Never read an arbitrary peer id supplied as input.
+      if (normalizeAgyToolName(merged.title) === 'sendmessage' && evt.status === 'running') {
+        for (const child of children) {
+          const id = child.detail?.meta?.agentPath;
+          if (typeof id === 'string' && state.agyBridges?.has(id)) void this.startAgyBridge(sessionId,state,id);
+        }
+      }
       if (children.length) {
         for (const child of children) for (const cb of this.toolCallCallbacks) cb(sessionId, child);
         return;

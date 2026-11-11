@@ -30,6 +30,9 @@ export class AgyTranscriptBridge {
   private watched?: string;
 
   constructor(readonly file: string, private readonly onRow: (row: AgyTranscriptRow) => void) {}
+  get isClosed(): boolean { return this.closed; }
+  async resume(): Promise<void> { this.closed = false; await this.arm(); await this.flush(); }
+
   async start(replayExisting = false): Promise<void> {
     // Baseline is read once (without replay callbacks) so rotation cannot
     // replay an old SYSTEM_MESSAGE from a restored conversation.
@@ -97,7 +100,7 @@ export class AgyTranscriptBridge {
     }
   }
   close(): void {
-    this.closed = true; this.watcher?.close(); this.watcher = undefined;
+    this.closed = true; this.watcher?.close(); this.watcher = undefined; this.watched = undefined;
     if (this.timer) clearTimeout(this.timer); this.timer = undefined;
   }
 }

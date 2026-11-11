@@ -16,6 +16,11 @@ describe('AG native child lifecycle adapter', () => {
     expect(killed.detail?.meta?.normalizedStatus).toBe(S.INTERRUPTED);
     expect(t.interrupt()).toEqual([]);
   });
+  it('parses real AG prose-wrapped multi-child list snapshots and preserves every child',()=>{
+    const t=new AgySubagentTracker('parent');
+    const events=t.tool({id:'list',name:'Run manage_subagents',status:'complete',input:{Action:'list'},output:'Created At: native\nYou have 2 active subagent(s):\n'+JSON.stringify([{conversationId:'one',state:'idle',role:'One'},{conversationId:'two',state:'running',role:'Two'}])});
+    expect(events).toHaveLength(2);expect(events.map(t=>t.detail?.meta?.normalizedStatus)).toEqual([S.COMPLETE,S.RUNNING]);
+  });
   it('handles native spelling, definitions/list without invented execution, swarm and explicit errors', () => {
     for(const name of ['invoke_subagent','InvokeSubagent','browser-subagent','manage_subagents','define_subagent','swarm','send_message']) expect(isAgySubagentTool(name)).toBe(true);
     const t=new AgySubagentTracker('parent');
