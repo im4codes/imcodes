@@ -172,7 +172,6 @@ public class StreamingSpeechPlugin extends Plugin {
     private static String join(String previous, String text) {
         if (previous.isEmpty()) return text;
         if (text.isEmpty()) return previous;
-        if (text.startsWith(previous)) return text;
         boolean asciiBoundary = previous.charAt(previous.length() - 1) < 128 && text.charAt(0) < 128;
         return previous + (asciiBoundary ? " " : "") + text;
     }

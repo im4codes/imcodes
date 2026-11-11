@@ -33,8 +33,8 @@ describe('shared mobile model preparation', () => {
     expect(ios).toContain('count: 16000');
     expect(android).toContain('new float[SAMPLE_RATE / 2]');
     expect(ios).toContain('count: 8000');
-    expect(android).toContain('if (text.startsWith(previous)) return text;');
-    expect(ios).toContain('if text.hasPrefix(previous) { return text }');
+    expect(android).not.toContain('startsWith(previous)');
+    expect(ios).not.toContain('hasPrefix(previous)');
     expect(android).toContain('OnlineStream next = recognizer.createStream("")');
     expect(android).not.toContain('recognizer.reset(stream)');
     expect(ios).toContain('func startNextStream() -> Bool');
@@ -80,5 +80,87 @@ describe('shared mobile model preparation', () => {
     await writeFile(join(root, 'models/decoder.int8.onnx'), bytes);
     await prepareSpeechAssets(url, async () => new Response(bytes), [['models/decoder.onnx', 'https://example.invalid/model', digest, bytes.length]]);
     expect(await readdir(join(root, 'models'))).toEqual(['decoder.onnx']);
+  });
+});
+
+describe('native stream segment concatenation and lifecycle semantics', () => {
+  function join(previous: string, text: string): string {
+    if (!previous) return text;
+    if (!text) return previous;
+    const asciiBoundary = previous.charCodeAt(previous.length - 1) < 128 && text.charCodeAt(0) < 128;
+    return previous + (asciiBoundary ? ' ' : '') + text;
+  }
+
+  it('correctly handles exact identical repeated segments without swallow', () => {
+    expect(join('你好', '你好')).toBe('你好你好');
+    expect(join('COMMIT', 'COMMIT')).toBe('COMMIT COMMIT');
+  });
+
+  it('correctly joins prefix overlap across endpoints without dropping earlier segment', () => {
+    expect(join('COMMIT', 'COMMIT TO GITHUB')).toBe('COMMIT COMMIT TO GITHUB');
+    expect(join('你好', '你好世界')).toBe('你好你好世界');
+  });
+
+  it('preserves ASCII boundary spacing between English and non-ASCII Chinese', () => {
+    expect(join('HELLO', 'WORLD')).toBe('HELLO WORLD');
+    expect(join('你好', '世界')).toBe('你好世界');
+    expect(join('你好', 'world')).toBe('你好world');
+    expect(join('hello', '世界')).toBe('hello世界');
+    expect(join('COMMIT', 'TO GITHUB')).toBe('COMMIT TO GITHUB');
+  });
+
+  it('handles empty segments, empty previous, and stop transitions cleanly', () => {
+    expect(join('', '')).toBe('');
+    expect(join('', 'hello')).toBe('hello');
+    expect(join('hello', '')).toBe('hello');
+  });
+
+  it('simulates multi-stream speech session without duplicate partials or swallowed repeated utterances', () => {
+    let committed = '';
+    let last = '';
+    const emittedPartials: string[] = [];
+
+    function onPartial(activeStreamText: string) {
+      const full = join(committed, activeStreamText.trim());
+      if (full !== last) {
+        emittedPartials.push(full);
+        last = full;
+      }
+      return full;
+    }
+
+    function onEndpoint(activeStreamFinalText: string) {
+      const full = join(committed, activeStreamFinalText.trim());
+      committed = full;
+    }
+
+    // Stream 1: User says "你好"
+    onPartial('你');
+    onPartial('你好');
+    onEndpoint('你好');
+    expect(committed).toBe('你好');
+
+    // Stream 2: After a pause, user says "你好" again
+    onPartial('你');
+    expect(last).toBe('你好你');
+    onPartial('你好');
+    expect(last).toBe('你好你好');
+    onEndpoint('你好');
+    expect(committed).toBe('你好你好');
+
+    // Stream 3: User says "COMMIT"
+    onPartial('COM');
+    onPartial('COMMIT');
+    onEndpoint('COMMIT');
+    expect(committed).toBe('你好你好COMMIT');
+
+    // Stream 4: User says "COMMIT TO GITHUB"
+    onPartial('COMMIT');
+    expect(last).toBe('你好你好COMMIT COMMIT');
+    onPartial('COMMIT TO GITHUB');
+    expect(last).toBe('你好你好COMMIT COMMIT TO GITHUB');
+    // Stop called: final stop flushes and commits final segment
+    const finalResult = join(committed, 'COMMIT TO GITHUB');
+    expect(finalResult).toBe('你好你好COMMIT COMMIT TO GITHUB');
   });
 });

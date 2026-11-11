@@ -182,7 +182,6 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     private func join(_ previous: String, _ text: String) -> String {
         if previous.isEmpty { return text }
         if text.isEmpty { return previous }
-        if text.hasPrefix(previous) { return text }
         let ascii = previous.unicodeScalars.last!.value < 128 && text.unicodeScalars.first!.value < 128
         return previous + (ascii ? " " : "") + text
     }
