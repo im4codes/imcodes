@@ -74,6 +74,7 @@ import {
   clearSupervisionTaskConsoleCacheForUser,
 } from './supervision-task-console-cache.js';
 import { ShareSessionDialog } from './components/ShareSessionDialog.js';
+import { ExternalDocShareSpace } from './components/DocShareDialog.js';
 import { SharedEntriesPanel } from './components/SharedEntriesPanel.js';
 import { MobileSharedEntriesMenu } from './components/MobileSharedEntriesMenu.js';
 import { MobileServerMenuToolbar } from './components/MobileServerMenuToolbar.js';
@@ -741,7 +742,50 @@ interface SharedOpenIntent {
 
 type SharedOpenResultStatus = 'opened' | 'superseded' | 'denied' | 'duplicate';
 
+function detectExternalDocShareRouteToken(): string | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const fromQuery = params.get('docShare')?.trim();
+    if (fromQuery) return fromQuery;
+    const pathMatch = window.location.pathname.match(/^\/doc-share\/([^/?#]+)/);
+    if (pathMatch?.[1]) return decodeURIComponent(pathMatch[1]);
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
 export function App() {
+  const [externalDocShareToken, setExternalDocShareToken] = useState<string | null>(() =>
+    detectExternalDocShareRouteToken(),
+  );
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const syncExternalDocShareRoute = () => {
+      setExternalDocShareToken(detectExternalDocShareRouteToken());
+    };
+    syncExternalDocShareRoute();
+    window.addEventListener('popstate', syncExternalDocShareRoute);
+    window.addEventListener('hashchange', syncExternalDocShareRoute);
+    return () => {
+      window.removeEventListener('popstate', syncExternalDocShareRoute);
+      window.removeEventListener('hashchange', syncExternalDocShareRoute);
+    };
+  }, []);
+
+  if (externalDocShareToken) {
+    if (typeof window !== 'undefined') {
+      configureApi(window.location.origin);
+    }
+    return <ExternalDocShareSpace token={externalDocShareToken} />;
+  }
+
+  return <InternalMainApp />;
+}
+
+function InternalMainApp() {
   recordPerfRender('App');
   const { t: trans } = useTranslation();
   const transRef = useRef(trans);
@@ -1546,8 +1590,13 @@ export function App() {
     const baseUrl = window.location.origin;
     configureApi(baseUrl);
     console.warn('[auth] mount: verifying session via /api/auth/user/me');
-    void apiFetch<{ id: string }>('/api/auth/user/me').then((user) => {
+    void apiFetch<{ id: string; scope?: 'doc_collaborator' | null }>('/api/auth/user/me').then((user) => {
       console.warn(`[auth] /me OK: userId=${user.id}`);
+      if (user.scope === 'doc_collaborator') {
+        setIsDocCollaborator(true);
+      } else {
+        setIsDocCollaborator(false);
+      }
       try { sessionStorage.removeItem(LOGIN_SESSION_NOT_STUCK_KEY); } catch { /* ignore */ }
       if (authGeneration !== authMutationGenerationRef.current) return;
       if (auth && auth.userId !== user.id) {
@@ -2666,9 +2715,11 @@ export function App() {
   ), [remoteDesktopConnectionManager]);
 
   // Fetch current user info on auth
+  const [isDocCollaborator, setIsDocCollaborator] = useState(false);
   useEffect(() => {
     if (!auth) {
       setIsAdmin(false);
+      setIsDocCollaborator(false);
       setUserDisplayName(null);
       setUsername(null);
       setUserHasPassword(false);
@@ -2676,6 +2727,7 @@ export function App() {
     }
     fetchMe().then((me) => {
       setIsAdmin(me.is_admin);
+      setIsDocCollaborator(me.scope === 'doc_collaborator');
       setUserDisplayName(me.display_name);
       setUsername(me.username);
       setUserHasPassword(me.has_password);
@@ -6684,6 +6736,10 @@ export function App() {
         onChangeServer={isNative() ? handleChangeServer : undefined}
       />
     );
+  }
+
+  if (isDocCollaborator) {
+    return <ExternalDocShareSpace token="" />;
   }
 
   const isSharedServerParticipant = selectedShareTarget?.kind === 'server'

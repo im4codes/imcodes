@@ -1,4 +1,4 @@
-import { createHmac } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import path from 'node:path';
 import { deflateRawSync } from 'node:zlib';
 import { Hono } from 'hono';
@@ -12,7 +12,11 @@ import {
   normalizeDocumentSharePath,
   resolveEffectiveDocumentAccess,
   type DocumentShareRole,
+  type EffectiveDocumentAccess,
 } from '../db/document-sharing.js';
+import { shareTargetFromSessionName } from '../db/tab-sharing.js';
+import { resolveHttpShareAccess, resolveHttpShareAccessForCoveredSession } from './share-http-auth.js';
+import type { Database } from '../db/client.js';
 import { WsBridge } from '../ws/bridge.js';
 
 export const onlyofficeRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
@@ -142,21 +146,119 @@ export function resolveOnlyOfficeJwtSecret(env: Pick<Env, 'ONLYOFFICE_JWT_SECRET
   return createHmac('sha256', env.JWT_SIGNING_KEY).update('imcodes-onlyoffice-jwt-secret').digest('hex');
 }
 
-// Track per-document save generation so concurrent opens share the exact same deterministic key,
-// while completed saves bump the revision so ONLYOFFICE loads the newly saved file on future sessions.
-const documentRevisionMap = new Map<string, number>();
+interface DocumentVersionState {
+  committedHash: string;
+  lastForceSavedHash: string | null;
+  rev: number;
+  activeKey: string;
+}
 
-export function getOnlyOfficeDocumentKey(serverId: string, normalizedPath: string): string {
+// Track per-document collaborative state backed by the recoverable daemon file digest
+// so concurrent opens of the same document version share the exact same key, while
+// completed saves, external edits, or process restarts never reuse a stale version room.
+const documentRevisionMap = new Map<string, number>();
+const documentVersionStateMap = new Map<string, DocumentVersionState>();
+
+function computeDocumentKeyFromDigest(
+  serverId: string,
+  normalizedPath: string,
+  contentHash: string,
+  extraRev = 0,
+): string {
+  const revSuffix = extraRev > 0 ? `:r${extraRev}` : '';
+  return sha256Hex(`onlyoffice-collab:${serverId}:${normalizedPath}:${contentHash}${revSuffix}`).slice(0, 32);
+}
+
+export function getOnlyOfficeDocumentKey(
+  serverId: string,
+  normalizedPath: string,
+  contentHash?: string,
+): string {
   const mapKey = `${serverId}:${normalizedPath}`;
+  if (contentHash) {
+    const rev = documentRevisionMap.get(`${mapKey}:${contentHash}`) ?? 0;
+    return computeDocumentKeyFromDigest(serverId, normalizedPath, contentHash, rev);
+  }
+  const existingState = documentVersionStateMap.get(mapKey);
+  if (existingState) {
+    return existingState.activeKey;
+  }
   const rev = documentRevisionMap.get(mapKey) ?? 1;
   return sha256Hex(`onlyoffice-collab:${serverId}:${normalizedPath}:r${rev}`).slice(0, 32);
 }
 
-export function bumpOnlyOfficeDocumentRevision(serverId: string, normalizedPath: string): number {
+export function bumpOnlyOfficeDocumentRevision(
+  serverId: string,
+  normalizedPath: string,
+  newContentHash?: string,
+): number {
   const mapKey = `${serverId}:${normalizedPath}`;
   const next = (documentRevisionMap.get(mapKey) ?? 1) + 1;
   documentRevisionMap.set(mapKey, next);
+
+  const existing = documentVersionStateMap.get(mapKey);
+  const resolvedHash = newContentHash ?? existing?.committedHash;
+  if (resolvedHash) {
+    const digestRevKey = `${mapKey}:${resolvedHash}`;
+    const prevDigestRev = documentRevisionMap.get(digestRevKey) ?? 0;
+    const nextDigestRev = existing && existing.committedHash === resolvedHash ? prevDigestRev + 1 : prevDigestRev;
+    if (nextDigestRev > 0) {
+      documentRevisionMap.set(digestRevKey, nextDigestRev);
+    }
+    const activeKey = computeDocumentKeyFromDigest(serverId, normalizedPath, resolvedHash, nextDigestRev);
+    documentVersionStateMap.set(mapKey, {
+      committedHash: resolvedHash,
+      lastForceSavedHash: null,
+      rev: next,
+      activeKey,
+    });
+  }
   return next;
+}
+
+export function resetOnlyOfficeDocumentKeyCacheForTests(): void {
+  documentRevisionMap.clear();
+  documentVersionStateMap.clear();
+}
+
+export async function resolveOnlyOfficeDocumentKey(
+  serverId: string,
+  normalizedPath: string,
+  options?: { allowedRoot?: string },
+): Promise<string> {
+  const mapKey = `${serverId}:${normalizedPath}`;
+  try {
+    const { bytes } = await readFileFromDaemon(serverId, normalizedPath, options);
+    const currentHash = createHash('sha256').update(bytes).digest('hex');
+    const existing = documentVersionStateMap.get(mapKey);
+    if (existing) {
+      if (currentHash === existing.committedHash || currentHash === existing.lastForceSavedHash) {
+        return existing.activeKey;
+      }
+      // File content changed externally on the daemon -> advance to new version key
+      const digestRev = documentRevisionMap.get(`${mapKey}:${currentHash}`) ?? 0;
+      const activeKey = computeDocumentKeyFromDigest(serverId, normalizedPath, currentHash, digestRev);
+      documentVersionStateMap.set(mapKey, {
+        committedHash: currentHash,
+        lastForceSavedHash: null,
+        rev: existing.rev + 1,
+        activeKey,
+      });
+      return activeKey;
+    }
+
+    const digestRev = documentRevisionMap.get(`${mapKey}:${currentHash}`) ?? 0;
+    const activeKey = computeDocumentKeyFromDigest(serverId, normalizedPath, currentHash, digestRev);
+    documentVersionStateMap.set(mapKey, {
+      committedHash: currentHash,
+      lastForceSavedHash: null,
+      rev: documentRevisionMap.get(mapKey) ?? 1,
+      activeKey,
+    });
+    return activeKey;
+  } catch {
+    return getOnlyOfficeDocumentKey(serverId, normalizedPath);
+  }
 }
 
 export interface OnlyOfficeDocTokenClaims {
@@ -168,6 +270,12 @@ export interface OnlyOfficeDocTokenClaims {
   role: DocumentShareRole;
   allowDownload: boolean;
   shareId: string | null;
+  userId?: string | null;
+  externalShareToken?: string | null;
+  deviceToken?: string | null;
+  sessionName?: string | null;
+  allowedRoot?: string | null;
+  documentKey?: string | null;
   iat?: number;
   exp?: number;
 }
@@ -213,6 +321,12 @@ export function verifyOnlyOfficeDocToken(
     role: payload.role,
     allowDownload: Boolean(payload.allowDownload),
     shareId: typeof payload.shareId === 'string' ? payload.shareId : null,
+    userId: typeof payload.userId === 'string' ? payload.userId : null,
+    externalShareToken: typeof payload.externalShareToken === 'string' ? payload.externalShareToken : null,
+    deviceToken: typeof payload.deviceToken === 'string' ? payload.deviceToken : null,
+    sessionName: typeof payload.sessionName === 'string' ? payload.sessionName : null,
+    allowedRoot: typeof payload.allowedRoot === 'string' ? payload.allowedRoot : null,
+    documentKey: typeof payload.documentKey === 'string' ? payload.documentKey : null,
     iat: typeof payload.iat === 'number' ? payload.iat : undefined,
     exp: typeof payload.exp === 'number' ? payload.exp : undefined,
   };
@@ -335,6 +449,7 @@ export async function sendDaemonFsCommand<T extends Record<string, unknown> = Re
 export async function readFileFromDaemon(
   serverId: string,
   filePath: string,
+  options?: { allowedRoot?: string },
 ): Promise<{ bytes: Buffer; mtime?: number }> {
   const norm = normalizeDocumentSharePath(filePath);
   if (!norm) throw new Error('invalid_path');
@@ -353,7 +468,12 @@ export async function readFileFromDaemon(
     type: 'fs.read',
     requestId,
     path: norm,
+    ...(options?.allowedRoot ? { allowedRoot: options.allowedRoot } : {}),
   });
+
+  if (res.status === 'error') {
+    throw new Error(res.error || 'daemon_file_read_failed');
+  }
 
   if (typeof res.content === 'string') {
     const bytes = res.encoding === 'base64'
@@ -374,14 +494,25 @@ export async function readFileFromDaemon(
       },
       30_000,
     )) as {
-      type: string;
-      downloadId: string;
-      content: string;
+      type?: string;
+      status?: string;
+      error?: string;
+      downloadId?: string;
+      content?: string;
       mime?: string;
       size?: number;
     };
+    if (
+      !dlRes ||
+      dlRes.type === 'file.download_error' ||
+      dlRes.status === 'error' ||
+      typeof dlRes.error === 'string' ||
+      typeof dlRes.content !== 'string'
+    ) {
+      throw new Error(dlRes?.error || 'daemon_file_download_failed');
+    }
     return {
-      bytes: Buffer.from(String(dlRes.content ?? ''), 'base64'),
+      bytes: Buffer.from(dlRes.content, 'base64'),
       mtime: res.mtime,
     };
   }
@@ -389,11 +520,32 @@ export async function readFileFromDaemon(
   throw new Error(res.error || 'daemon_file_read_failed');
 }
 
+function assertFileUploadSuccess(
+  upRes: unknown,
+  options?: { createOnly?: boolean },
+): void {
+  const rec = (upRes && typeof upRes === 'object' ? upRes : null) as {
+    type?: string;
+    status?: string;
+    error?: string;
+  } | null;
+  if (!rec) {
+    throw new Error('file_upload_empty_response');
+  }
+  if (rec.type === 'file.upload_error' || rec.status === 'error' || typeof rec.error === 'string') {
+    const rawErr = String(rec.error || 'file_upload_failed');
+    if (options?.createOnly && rawErr.includes('destination_exists')) {
+      throw new Error('EEXIST');
+    }
+    throw new Error(rawErr);
+  }
+}
+
 export async function writeFileToDaemon(
   serverId: string,
   filePath: string,
   bytes: Buffer,
-  options?: { createOnly?: boolean; isBinary?: boolean; mimeType?: string },
+  options?: { createOnly?: boolean; isBinary?: boolean; mimeType?: string; allowedRoot?: string },
 ): Promise<{ mtime?: number }> {
   const norm = normalizeDocumentSharePath(filePath);
   if (!norm) throw new Error('invalid_path');
@@ -401,6 +553,7 @@ export async function writeFileToDaemon(
   const meta = getOnlyOfficeDocumentMeta(norm);
   const isBinary = options?.isBinary ?? meta?.isBinary ?? false;
   const createOnly = Boolean(options?.createOnly);
+  const allowedRoot = options?.allowedRoot;
 
   if (!isBinary) {
     const requestId = `oo-write-${randomHex(10)}`;
@@ -417,6 +570,7 @@ export async function writeFileToDaemon(
       content: bytes.toString('utf8'),
       encoding: 'utf8',
       ...(createOnly ? { createOnly: true } : {}),
+      ...(allowedRoot ? { allowedRoot } : {}),
     });
     if (res.status === 'error') {
       throw new Error(res.error || 'daemon_write_failed');
@@ -425,40 +579,18 @@ export async function writeFileToDaemon(
   }
 
   // Binary file (.docx, .xlsx, .pptx, .pdf):
-  // Real daemon's `file.upload` writes exact binary Buffer.from(content, 'base64') to destinationDirectory.
-  // Because `file.upload` uses flag 'wx' (refusing existing file), for overwrite (`!createOnly`) we stage a temporary
-  // rename first, upload the new binary file, and delete the temporary backup (restoring on failure).
+  // Never fall back to UTF-8 fs.write on error.
+  // For createOnly: upload directly with wx semantics and inspect the daemon response.
+  // For overwrite (!createOnly): write the complete binary payload to a same-directory temporary staging file first
+  // without touching the original file, verify upload success, and then atomically commit via fs.rename(overwrite: true).
   const parentDir = path.posix.dirname(norm);
   const baseName = path.posix.basename(norm);
   const bridge = WsBridge.get(serverId);
   const mime = options?.mimeType || meta?.mimeType || 'application/octet-stream';
 
-  let backupPath: string | null = null;
-  if (!createOnly) {
-    const tempBackup = path.posix.join(parentDir, `.oo-bak-${randomHex(6)}-${baseName}`);
-    try {
-      const renRes = await sendDaemonFsCommand<{ status?: 'ok' | 'error'; error?: string }>(
-        serverId,
-        'rename',
-        {
-          type: 'fs.rename',
-          requestId: `oo-ren-${randomHex(8)}`,
-          oldPath: norm,
-          newPath: tempBackup,
-        },
-        5_000,
-      );
-      if (renRes.status === 'ok') {
-        backupPath = tempBackup;
-      }
-    } catch {
-      // If rename is not supported by a test mock daemon, fall through
-    }
-  }
-
-  try {
+  if (createOnly) {
     const uploadId = `oo-up-${randomHex(10)}`;
-    await bridge.sendFileTransferRequest(
+    const upRes = await bridge.sendFileTransferRequest(
       uploadId,
       {
         type: 'file.upload',
@@ -473,58 +605,62 @@ export async function writeFileToDaemon(
       },
       15_000,
     );
-    if (backupPath) {
-      await sendDaemonFsCommand(
-        serverId,
-        'delete',
-        {
-          type: 'fs.delete',
-          requestId: `oo-del-${randomHex(8)}`,
-          path: backupPath,
-        },
-        5_000,
-      ).catch(() => {});
+    assertFileUploadSuccess(upRes, { createOnly: true });
+    return {};
+  }
+
+  const stageName = `.oo-stage-${randomHex(8)}-${baseName}`;
+  const stagePath = path.posix.join(parentDir, stageName);
+  const uploadId = `oo-up-${randomHex(10)}`;
+
+  const upRes = await bridge.sendFileTransferRequest(
+    uploadId,
+    {
+      type: 'file.upload',
+      uploadId,
+      filename: `${uploadId}-${stageName}`,
+      originalName: stageName,
+      sanitizedName: stageName,
+      mime,
+      size: bytes.length,
+      content: bytes.toString('base64'),
+      destinationDirectory: parentDir,
+    },
+    15_000,
+  );
+  assertFileUploadSuccess(upRes, { createOnly: false });
+
+  try {
+    const renRes = await sendDaemonFsCommand<{ status?: 'ok' | 'error'; error?: string }>(
+      serverId,
+      'rename',
+      {
+        type: 'fs.rename',
+        requestId: `oo-commit-${randomHex(8)}`,
+        path: stagePath,
+        newPath: norm,
+        overwrite: true,
+        ...(allowedRoot ? { allowedRoot } : {}),
+      },
+      10_000,
+    );
+    if (renRes.status !== 'ok') {
+      throw new Error(renRes.error || 'atomic_rename_failed');
     }
     return {};
-  } catch (uploadErr) {
-    // Restore backup if we renamed it and upload failed
-    if (backupPath) {
-      await sendDaemonFsCommand(
-        serverId,
-        'rename',
-        {
-          type: 'fs.rename',
-          requestId: `oo-restore-${randomHex(8)}`,
-          oldPath: backupPath,
-          newPath: norm,
-        },
-        5_000,
-      ).catch(() => {});
-    }
-    const errMsg = uploadErr instanceof Error ? uploadErr.message : String(uploadErr);
-    if (createOnly && errMsg.includes('destination_exists')) {
-      throw new Error('EEXIST');
-    }
-    // Fallback to fs.write with base64 encoding for lightweight test daemons that only handle fs.write
-    const requestId = `oo-write-bin-${randomHex(10)}`;
-    const res = await sendDaemonFsCommand<{
-      type: string;
-      requestId: string;
-      status?: 'ok' | 'error';
-      mtime?: number;
-      error?: string;
-    }>(serverId, 'write', {
-      type: 'fs.write',
-      requestId,
-      path: norm,
-      content: bytes.toString('base64'),
-      encoding: 'base64',
-      ...(createOnly ? { createOnly: true } : {}),
-    });
-    if (res.status === 'error') {
-      throw new Error(res.error || errMsg);
-    }
-    return { mtime: res.mtime };
+  } catch (commitErr) {
+    await sendDaemonFsCommand(
+      serverId,
+      'delete',
+      {
+        type: 'fs.delete',
+        requestId: `oo-cleanup-${randomHex(8)}`,
+        path: stagePath,
+        ...(allowedRoot ? { allowedRoot } : {}),
+      },
+      5_000,
+    ).catch(() => {});
+    throw commitErr;
   }
 }
 
@@ -773,7 +909,151 @@ function extractShareToken(c: RouteContext): string | null {
   );
 }
 
-// GET /api/server/:id/onlyoffice/config?path=<encodedPath>&mode=<view|edit>&shareToken=<optionalToken>
+async function resolveLiveOnlyOfficeAccess(
+  db: Database,
+  params: {
+    serverId: string;
+    userId?: string | null;
+    userScope?: string | null;
+    externalShareToken?: string | null;
+    deviceToken?: string | null;
+    sessionName?: string | null;
+    filePath: string;
+  },
+): Promise<EffectiveDocumentAccess> {
+  const access = await resolveEffectiveDocumentAccess(db, {
+    serverId: params.serverId,
+    userId: params.userId ?? null,
+    externalShareToken: params.externalShareToken ?? null,
+    deviceToken: params.deviceToken ?? null,
+    filePath: params.filePath,
+  });
+
+  if (access.allowed) {
+    return access;
+  }
+
+  // Compatibility with existing server / main-session / sub-session tab shares for internal users
+  if (
+    access.reason === 'no_active_share' &&
+    params.userId &&
+    params.userScope !== 'doc_collaborator' &&
+    !params.externalShareToken
+  ) {
+    const serverAccess = await resolveHttpShareAccess(db, {
+      serverId: params.serverId,
+      userId: params.userId,
+      target: { kind: 'server', serverId: params.serverId },
+    });
+    if (serverAccess.actor.kind === 'share') {
+      return {
+        allowed: true,
+        role: serverAccess.actor.effectiveActorRole === 'participant' ? 'editor' : 'viewer',
+        allowDownload: true,
+        canManageShare: false,
+        isOwner: false,
+        shareId: null,
+        targetPath: null,
+      };
+    }
+
+    const sessionName = params.sessionName?.trim() || '';
+    if (sessionName) {
+      const target = shareTargetFromSessionName(params.serverId, sessionName);
+      if (target) {
+        const covered = await resolveHttpShareAccessForCoveredSession(db, {
+          serverId: params.serverId,
+          userId: params.userId,
+          target,
+        });
+        if (covered.actor.kind === 'share') {
+          return {
+            allowed: true,
+            role: covered.actor.effectiveActorRole === 'participant' ? 'editor' : 'viewer',
+            allowDownload: true,
+            canManageShare: false,
+            isOwner: false,
+            shareId: null,
+            targetPath: null,
+          };
+        }
+      }
+    }
+  }
+
+  return access;
+}
+
+function isUrlUnderTrustedBase(candidate: URL, base: URL): boolean {
+  if (candidate.origin !== base.origin) return false;
+  const basePath = base.pathname.replace(/\/$/, '');
+  if (!basePath || basePath === '') {
+    return candidate.pathname.startsWith('/');
+  }
+  return candidate.pathname === basePath || candidate.pathname.startsWith(`${basePath}/`);
+}
+
+export function resolveTrustedOnlyOfficeDownloadUrl(
+  rawUrl: string,
+  env: Pick<Env, 'SERVER_URL' | 'ONLYOFFICE_PUBLIC_URL' | 'ONLYOFFICE_INTERNAL_URL'>,
+): { internalFetchUrl: string; fallbackPublicUrl: string | null } | null {
+  let candidate: URL;
+  try {
+    candidate = new URL(rawUrl);
+  } catch {
+    return null;
+  }
+  if (candidate.protocol !== 'http:' && candidate.protocol !== 'https:') {
+    return null;
+  }
+  if (candidate.username || candidate.password) {
+    return null;
+  }
+  const decodedPath = (() => {
+    try {
+      return decodeURIComponent(candidate.pathname);
+    } catch {
+      return candidate.pathname;
+    }
+  })();
+  if (decodedPath.split('/').some((seg) => seg === '..')) {
+    return null;
+  }
+
+  const serverBase = (env.SERVER_URL || 'http://localhost:19138').replace(/\/$/, '');
+  const publicRaw = (env.ONLYOFFICE_PUBLIC_URL || `${serverBase}/onlyoffice`).replace(/\/$/, '');
+  const internalRaw = (env.ONLYOFFICE_INTERNAL_URL || 'http://onlyoffice:80').replace(/\/$/, '');
+
+  let publicBase: URL;
+  let internalBase: URL;
+  try {
+    publicBase = new URL(publicRaw);
+    internalBase = new URL(internalRaw);
+  } catch {
+    return null;
+  }
+
+  if (isUrlUnderTrustedBase(candidate, publicBase)) {
+    const publicBasePath = publicBase.pathname.replace(/\/$/, '');
+    const relativeSuffix = candidate.pathname.slice(publicBasePath.length) + candidate.search;
+    const rewritten = `${internalRaw}${relativeSuffix}`;
+    return {
+      internalFetchUrl: rewritten,
+      fallbackPublicUrl: candidate.toString(),
+    };
+  }
+
+  if (isUrlUnderTrustedBase(candidate, internalBase)) {
+    return {
+      internalFetchUrl: candidate.toString(),
+      fallbackPublicUrl: null,
+    };
+  }
+
+  return null;
+}
+
+// GET /api/server/:id/onlyoffice/config?path=<encodedPath>&mode=<view|edit>&shareToken=<optionalToken>&sessionName=<optionalSession>
 onlyofficeRoutes.get('/server/:id/onlyoffice/config', async (c): Promise<Response> => {
   const serverId = c.req.param('id') ?? '';
   const rawPath = c.req.query('path') ?? '';
@@ -790,12 +1070,15 @@ onlyofficeRoutes.get('/server/:id/onlyoffice/config', async (c): Promise<Respons
   const { auth } = await resolveAuthOutcome(c);
   const shareToken = extractShareToken(c);
   const deviceToken = extractDeviceToken(c);
+  const sessionName = c.req.query('sessionName')?.trim() || null;
 
-  const access = await resolveEffectiveDocumentAccess(c.env.DB, {
+  const access = await resolveLiveOnlyOfficeAccess(c.env.DB, {
     serverId,
     userId: auth?.userId ?? null,
+    userScope: auth?.scope ?? null,
     externalShareToken: shareToken,
     deviceToken,
+    sessionName,
     filePath: normPath,
   });
 
@@ -834,6 +1117,10 @@ onlyofficeRoutes.get('/server/:id/onlyoffice/config', async (c): Promise<Respons
     actorName = 'External Collaborator';
   }
 
+  const documentKey = await resolveOnlyOfficeDocumentKey(serverId, normPath, {
+    allowedRoot: access.targetPath ?? undefined,
+  });
+
   const docToken = signOnlyOfficeDocToken(
     {
       serverId,
@@ -843,6 +1130,12 @@ onlyofficeRoutes.get('/server/:id/onlyoffice/config', async (c): Promise<Respons
       role: access.role,
       allowDownload: access.allowDownload,
       shareId: access.shareId ?? null,
+      userId: auth?.userId ?? null,
+      externalShareToken: shareToken,
+      deviceToken,
+      sessionName,
+      allowedRoot: access.targetPath ?? null,
+      documentKey,
     },
     c.env.JWT_SIGNING_KEY,
     4 * 3600,
@@ -870,7 +1163,6 @@ onlyofficeRoutes.get('/server/:id/onlyoffice/config', async (c): Promise<Respons
   }
 
   const callbackUrl = `${serverBaseUrl}/api/onlyoffice/callback/${docToken}?serverId=${encodeURIComponent(serverId)}`;
-  const documentKey = getOnlyOfficeDocumentKey(serverId, normPath);
 
   const canEditDocument = effectiveMode === 'edit' && access.role === 'editor';
   const editorConfigPayload = {
@@ -905,7 +1197,14 @@ onlyofficeRoutes.get('/server/:id/onlyoffice/config', async (c): Promise<Respons
   };
 
   const ooSecret = resolveOnlyOfficeJwtSecret(c.env);
-  const ooJwt = signJwt(editorConfigPayload as unknown as Record<string, unknown>, ooSecret, 4 * 3600);
+  const ooJwt = signJwt(
+    {
+      ...editorConfigPayload,
+      tokenKind: 'editor_config',
+    } as unknown as Record<string, unknown>,
+    ooSecret,
+    4 * 3600,
+  );
 
   return c.json({
     enabled: true,
@@ -926,6 +1225,48 @@ onlyofficeRoutes.get('/server/:id/onlyoffice/config', async (c): Promise<Respons
   });
 });
 
+async function verifyLiveClaimsAccess(
+  db: Database,
+  claims: OnlyOfficeDocTokenClaims,
+): Promise<{ allowed: boolean; role: DocumentShareRole | null; allowedRoot: string | null }> {
+  if (claims.userId || claims.externalShareToken || claims.sessionName) {
+    const live = await resolveLiveOnlyOfficeAccess(db, {
+      serverId: claims.serverId,
+      userId: claims.userId ?? null,
+      externalShareToken: claims.externalShareToken ?? null,
+      deviceToken: claims.deviceToken ?? null,
+      sessionName: claims.sessionName ?? null,
+      filePath: claims.path,
+    });
+    if (!live.allowed || !live.role) {
+      return { allowed: false, role: null, allowedRoot: null };
+    }
+    return {
+      allowed: true,
+      role: live.role,
+      allowedRoot: live.targetPath ?? claims.allowedRoot ?? null,
+    };
+  }
+
+  if (claims.shareId) {
+    const share = await getDocumentShareById(db, claims.shareId, claims.serverId);
+    if (!share || share.revokedAt !== null || (share.expiresAt !== null && share.expiresAt <= Date.now())) {
+      return { allowed: false, role: null, allowedRoot: null };
+    }
+    return {
+      allowed: true,
+      role: share.role,
+      allowedRoot: share.targetPath ?? claims.allowedRoot ?? null,
+    };
+  }
+
+  return {
+    allowed: true,
+    role: claims.role,
+    allowedRoot: claims.allowedRoot ?? null,
+  };
+}
+
 async function handleOnlyOfficeFileDownload(c: RouteContext): Promise<Response> {
   const token = c.req.param('token') ?? '';
   const claims = verifyOnlyOfficeDocToken(token, c.env.JWT_SIGNING_KEY);
@@ -938,12 +1279,9 @@ async function handleOnlyOfficeFileDownload(c: RouteContext): Promise<Response> 
     return c.json({ error: 'server_id_mismatch' }, 403);
   }
 
-  // Re-verify share is still active when token is bound to a share grant
-  if (claims.shareId) {
-    const share = await getDocumentShareById(c.env.DB, claims.shareId, claims.serverId);
-    if (!share || share.revokedAt !== null || (share.expiresAt !== null && share.expiresAt <= Date.now())) {
-      return c.json({ error: 'share_revoked_or_expired' }, 403);
-    }
+  const liveAccess = await verifyLiveClaimsAccess(c.env.DB, claims);
+  if (!liveAccess.allowed) {
+    return c.json({ error: 'share_revoked_or_expired' }, 403);
   }
 
   // If ONLYOFFICE_ENABLED is true and ONLYOFFICE sends Authorization JWT header, verify it if present
@@ -958,7 +1296,9 @@ async function handleOnlyOfficeFileDownload(c: RouteContext): Promise<Response> 
 
   const meta = getOnlyOfficeDocumentMeta(claims.path);
   try {
-    const { bytes } = await readFileFromDaemon(claims.serverId, claims.path);
+    const { bytes } = await readFileFromDaemon(claims.serverId, claims.path, {
+      allowedRoot: liveAccess.allowedRoot ?? undefined,
+    });
     const filename = path.posix.basename(claims.path);
     return new Response(new Uint8Array(bytes), {
       status: 200,
@@ -972,7 +1312,14 @@ async function handleOnlyOfficeFileDownload(c: RouteContext): Promise<Response> 
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    const status = msg === 'daemon_offline' ? 503 : msg === 'ENOENT' ? 404 : 502;
+    const status =
+      msg === 'daemon_offline'
+        ? 503
+        : msg === 'ENOENT' || msg === 'enoent'
+          ? 404
+          : msg === 'forbidden_path'
+            ? 403
+            : 502;
     return c.json({ error: msg }, status);
   }
 }
@@ -996,16 +1343,9 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
     return c.json({ error: 1, message: 'editor_role_required' }, 403);
   }
 
-  if (claims.shareId) {
-    const share = await getDocumentShareById(c.env.DB, claims.shareId, claims.serverId);
-    if (
-      !share ||
-      share.revokedAt !== null ||
-      (share.expiresAt !== null && share.expiresAt <= Date.now()) ||
-      share.role !== 'editor'
-    ) {
-      return c.json({ error: 1, message: 'share_revoked_or_downgraded' }, 403);
-    }
+  const liveAccess = await verifyLiveClaimsAccess(c.env.DB, claims);
+  if (!liveAccess.allowed || liveAccess.role !== 'editor') {
+    return c.json({ error: 1, message: 'share_revoked_or_downgraded' }, 403);
   }
 
   let body: Record<string, unknown>;
@@ -1037,37 +1377,63 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
       ? (verifiedJwt.payload as Record<string, unknown>)
       : verifiedJwt;
 
-  const status = typeof body.status === 'number'
-    ? body.status
-    : typeof nestedPayload.status === 'number'
-      ? nestedPayload.status
-      : 0;
+  // Reject browser editor-config tokens reused as callback credentials
+  if (
+    nestedPayload.tokenKind === 'editor_config' ||
+    nestedPayload.editorConfig !== undefined ||
+    nestedPayload.document !== undefined ||
+    typeof nestedPayload.status !== 'number'
+  ) {
+    return c.json({ error: 1, message: 'invalid_onlyoffice_callback_jwt' }, 401);
+  }
+
+  // Reject any unsigned body field that attempts to override signed JWT callback fields
+  if (body.status !== undefined && body.status !== nestedPayload.status) {
+    return c.json({ error: 1, message: 'callback_payload_mismatch' }, 401);
+  }
+  const signedUrl = typeof nestedPayload.url === 'string' ? nestedPayload.url.trim() : '';
+  if (typeof body.url === 'string' && body.url.trim() && body.url.trim() !== signedUrl) {
+    return c.json({ error: 1, message: 'callback_payload_mismatch' }, 401);
+  }
+  const signedKey = typeof nestedPayload.key === 'string' ? nestedPayload.key.trim() : '';
+  if (typeof body.key === 'string' && body.key.trim() && signedKey && body.key.trim() !== signedKey) {
+    return c.json({ error: 1, message: 'callback_payload_mismatch' }, 401);
+  }
+
+  if (claims.documentKey && signedKey && signedKey !== claims.documentKey) {
+    return c.json({ error: 1, message: 'callback_key_mismatch' }, 401);
+  }
+
+  const status = nestedPayload.status;
 
   // Status 2 = ready for saving, Status 6 = force save while editing
   if (status === 2 || status === 6) {
-    const downloadUrl =
-      (typeof body.url === 'string' && body.url.trim()) ||
-      (typeof nestedPayload.url === 'string' && nestedPayload.url.trim()) ||
-      '';
-
+    const downloadUrl = signedUrl;
     if (!downloadUrl) {
       return c.json({ error: 1, message: 'missing_download_url' }, 400);
     }
 
-    // Rewrite public ONLYOFFICE URL prefix to ONLYOFFICE_INTERNAL_URL when configured so container-internal fetch succeeds directly
-    const publicUrl = (c.env.ONLYOFFICE_PUBLIC_URL || `${c.env.SERVER_URL.replace(/\/$/, '')}/onlyoffice`).replace(/\/$/, '');
-    const internalUrl = (c.env.ONLYOFFICE_INTERNAL_URL || 'http://onlyoffice:80').replace(/\/$/, '');
-    const resolvedDownloadUrl =
-      internalUrl && publicUrl && downloadUrl.startsWith(publicUrl)
-        ? `${internalUrl}${downloadUrl.slice(publicUrl.length)}`
-        : downloadUrl;
+    const trustedUrl = resolveTrustedOnlyOfficeDownloadUrl(downloadUrl, c.env);
+    if (!trustedUrl) {
+      return c.json({ error: 1, message: 'untrusted_download_url' }, 400);
+    }
+
+    const currentActiveKey = await resolveOnlyOfficeDocumentKey(claims.serverId, claims.path, {
+      allowedRoot: liveAccess.allowedRoot ?? undefined,
+    });
+    if (claims.documentKey && currentActiveKey !== claims.documentKey) {
+      return c.json({ error: 1, message: 'stale_document_key' }, 409);
+    }
+    if (signedKey && currentActiveKey !== signedKey) {
+      return c.json({ error: 1, message: 'stale_document_key' }, 409);
+    }
 
     let docRes: Response;
     try {
-      docRes = await fetch(resolvedDownloadUrl);
+      docRes = await fetch(trustedUrl.internalFetchUrl, { redirect: 'error' });
     } catch (fetchErr) {
-      if (resolvedDownloadUrl !== downloadUrl) {
-        docRes = await fetch(downloadUrl);
+      if (trustedUrl.fallbackPublicUrl && trustedUrl.fallbackPublicUrl !== trustedUrl.internalFetchUrl) {
+        docRes = await fetch(trustedUrl.fallbackPublicUrl, { redirect: 'error' });
       } else {
         throw fetchErr;
       }
@@ -1086,14 +1452,23 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
         createOnly: false,
         isBinary: meta?.isBinary ?? true,
         mimeType: meta?.mimeType,
+        allowedRoot: liveAccess.allowedRoot ?? undefined,
       });
     } catch (writeErr) {
       const msg = writeErr instanceof Error ? writeErr.message : String(writeErr);
-      return c.json({ error: 1, message: msg }, 502);
+      const errStatus = msg === 'forbidden_path' ? 403 : 502;
+      return c.json({ error: 1, message: msg }, errStatus);
     }
 
+    const newDigest = createHash('sha256').update(bytes).digest('hex');
     if (status === 2) {
-      bumpOnlyOfficeDocumentRevision(claims.serverId, claims.path);
+      bumpOnlyOfficeDocumentRevision(claims.serverId, claims.path, newDigest);
+    } else if (status === 6) {
+      const mapKey = `${claims.serverId}:${claims.path}`;
+      const existing = documentVersionStateMap.get(mapKey);
+      if (existing) {
+        existing.lastForceSavedHash = newDigest;
+      }
     }
   }
 

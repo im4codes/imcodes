@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { Hono } from 'hono';
 import type { Context } from 'hono';
-import { getCookie, setCookie } from 'hono/cookie';
+import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
 import type { Env } from '../env.js';
 import { randomHex, sha256Hex, signJwt, verifyJwt } from '../security/crypto.js';
 import { requireAuth, resolveAuthOutcome, resolveServerMembershipRole } from '../security/authorization.js';
@@ -15,6 +15,7 @@ import {
   listDocumentSharesForServer,
   listDocumentsSharedWithUser,
   normalizeDocumentSharePath,
+  recordVerifiedExternalSharePin,
   redeemMagicInviteShare,
   resolveEffectiveDocumentAccess,
   revokeDocumentShare,
@@ -79,6 +80,7 @@ async function issueAccountSessionCookies(
   extraClaims: Record<string, unknown> = {},
 ): Promise<string> {
   const isSecure = c.env.NODE_ENV === 'production';
+  const isDocCollab = extraClaims.scope === 'doc_collaborator';
   const accessToken = signJwt(
     { sub: userId, type: ACCOUNT_SESSION_JWT_TYPE, ...extraClaims },
     c.env.JWT_SIGNING_KEY,
@@ -86,7 +88,7 @@ async function issueAccountSessionCookies(
   );
   const refreshRaw = randomHex(32);
   const refreshHash = sha256Hex(refreshRaw);
-  const familyId = randomHex(16);
+  const familyId = isDocCollab ? `doc_collab:${randomHex(16)}` : randomHex(16);
   const refreshId = randomHex(16);
   await c.env.DB.execute(
     'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
@@ -325,11 +327,23 @@ documentSharingRoutes.post('/doc-shares/external/:token/verify', async (c): Prom
     (typeof body.deviceToken === 'string' && body.deviceToken.trim()) ||
     extractDeviceToken(c);
 
+  const resolvedHost = (c.get('resolvedHost' as never) as string | null) ?? 'localhost';
+  const isSecure = c.env.NODE_ENV === 'production';
+  const rpId = c.env.WEBAUTHN_RP_ID ?? resolvedHost.split(':')[0];
+  const origin = `${isSecure ? 'https' : 'http'}://${resolvedHost}`;
+
   const result = await verifyAndBindExternalShareDevice(c.env.DB, {
     rawToken,
     accessCode: typeof body.accessCode === 'string' ? body.accessCode : null,
     deviceToken: existingDeviceToken,
     passkeyCredentialId: typeof body.passkeyCredentialId === 'string' ? body.passkeyCredentialId : null,
+    passkeyChallengeId: typeof body.passkeyChallengeId === 'string' ? body.passkeyChallengeId : null,
+    passkeyResponse:
+      body.passkeyResponse && typeof body.passkeyResponse === 'object'
+        ? (body.passkeyResponse as Record<string, unknown>)
+        : null,
+    rpId,
+    origin,
     userId: auth?.userId ?? null,
   });
 
@@ -337,7 +351,6 @@ documentSharingRoutes.post('/doc-shares/external/:token/verify', async (c): Prom
     return c.json({ error: result.error }, result.status);
   }
 
-  const isSecure = c.env.NODE_ENV === 'production';
   setCookie(c, DOC_DEVICE_COOKIE, result.deviceToken, {
     httpOnly: true,
     secure: isSecure,
@@ -369,14 +382,26 @@ documentSharingRoutes.get('/doc-shares/external/:token/browse', async (c): Promi
   }
 
   const { auth } = await resolveAuthOutcome(c);
-  const deviceToken = extractDeviceToken(c);
+  if (share.shareMode === 'magic_invite') {
+    if (!share.redeemedByUserId) {
+      return c.json({ error: 'magic_invite_requires_redemption' }, 403);
+    }
+    if (auth?.userId !== share.redeemedByUserId) {
+      return c.json({ error: 'magic_invite_already_redeemed' }, 403);
+    }
+  }
 
-  // If access code is configured, require either matching accessCode param/header or an issued deviceToken
-  if (share.accessCodeHash) {
+  let deviceToken = extractDeviceToken(c);
+
+  // If access code is configured on an external_link, require either verified deviceToken or matching accessCode param/header
+  if (share.shareMode !== 'magic_invite' && share.accessCodeHash) {
     const suppliedCode = c.req.query('accessCode')?.trim() || c.req.header('x-doc-access-code')?.trim() || '';
     const codeMatches = Boolean(suppliedCode && sha256Hex(suppliedCode) === share.accessCodeHash);
-    if (!codeMatches && !deviceToken) {
-      return c.json({ error: 'access_code_required', hasAccessCode: true }, 401);
+    if (codeMatches) {
+      if (!deviceToken) {
+        deviceToken = `dpin_inline.${sha256Hex(`doc-pin-proof:v1:${share.id}:${share.accessCodeHash}:inline`)}`;
+      }
+      recordVerifiedExternalSharePin(share.id, share.accessCodeHash, deviceToken);
     }
   }
 
@@ -432,16 +457,26 @@ documentSharingRoutes.get('/doc-shares/external/:token/browse', async (c): Promi
       requestId: `ext-ls-${randomHex(8)}`,
       path: normPath,
       includeFiles: true,
+      allowedRoot: share.targetPath,
     });
 
     if (lsRes.status === 'error') {
-      return c.json({ error: lsRes.error || 'daemon_ls_failed' }, 502);
+      const status = lsRes.error === 'forbidden_path' ? 403 : 502;
+      return c.json({ error: lsRes.error || 'daemon_ls_failed' }, status);
     }
 
     const rawEntries = Array.isArray(lsRes.entries) ? lsRes.entries : [];
     const annotatedEntries = [];
     for (const entry of rawEntries) {
-      if (!entry || typeof entry.name !== 'string' || entry.name.startsWith('.oo-bak-')) continue;
+      if (
+        !entry ||
+        typeof entry.name !== 'string' ||
+        entry.name.startsWith('.oo-bak-') ||
+        entry.name.startsWith('.oo-stage-') ||
+        entry.name.startsWith('.imcodes-write-')
+      ) {
+        continue;
+      }
       const entryPath = path.posix.join(normPath, entry.name);
       if (!isPathWithinSharedFolder(entryPath, share.targetPath)) continue;
       const entryAccess = await resolveEffectiveDocumentAccess(c.env.DB, {
@@ -493,47 +528,79 @@ documentSharingRoutes.get('/doc-shares/auth-relay/callback', async (c): Promise<
   const code = c.req.query('code')?.trim();
   const stateParam = c.req.query('state')?.trim();
 
-  let stateClaims: Record<string, unknown> | null = null;
-  if (stateParam) {
-    const verifiedState = verifyJwt(stateParam, c.env.JWT_SIGNING_KEY);
-    if (!verifiedState || verifiedState.type !== 'doc-auth-relay-state') {
-      return c.json({ error: 'invalid_state' }, 400);
-    }
-    stateClaims = verifiedState;
+  if (!stateParam) {
+    return c.json({ error: 'missing_state' }, 400);
   }
+  const verifiedState = verifyJwt(stateParam, c.env.JWT_SIGNING_KEY);
+  if (!verifiedState || verifiedState.type !== 'doc-auth-relay-state') {
+    return c.json({ error: 'invalid_state' }, 400);
+  }
+  const expectedNonce = typeof verifiedState.nonce === 'string' ? verifiedState.nonce : '';
+  const cookieNonce = getCookie(c, 'doc_oauth_state')?.trim() || '';
+  if (!expectedNonce || !cookieNonce || cookieNonce !== expectedNonce) {
+    return c.json({ error: 'state_mismatch' }, 400);
+  }
+  deleteCookie(c, 'doc_oauth_state', { path: '/' });
+
+  const stateClaims: Record<string, unknown> = verifiedState;
+  const serverBaseUrl = (c.env.SERVER_URL || 'http://localhost:19138').replace(/\/$/, '');
 
   let userId = '';
-  let provider = (typeof stateClaims?.provider === 'string' ? stateClaims.provider : 'github') as string;
-  let shareToken = (typeof stateClaims?.shareToken === 'string' ? stateClaims.shareToken : c.req.query('shareToken')?.trim() || '') as string;
+  const provider = (typeof stateClaims.provider === 'string' ? stateClaims.provider : 'github') as string;
+  if (c.req.query('provider') && c.req.query('provider') !== provider) {
+    return c.json({ error: 'provider_mismatch' }, 400);
+  }
+  let shareToken = (typeof stateClaims.shareToken === 'string' ? stateClaims.shareToken : c.req.query('shareToken')?.trim() || '') as string;
   let redirectPath = normalizeSafeRedirectPath(
-    typeof stateClaims?.redirectPath === 'string' ? stateClaims.redirectPath : c.req.query('redirect'),
+    typeof stateClaims.redirectPath === 'string' ? stateClaims.redirectPath : c.req.query('redirect'),
     shareToken,
   );
 
   if (relayToken) {
-    const payload = verifyJwt(relayToken, c.env.JWT_SIGNING_KEY);
-    if (!payload || (payload.type !== 'auth-relay' && payload.type !== 'doc-auth-relay')) {
+    const relayBase = (c.env.AUTH_RELAY_URL || 'https://app.im.codes').replace(/\/$/, '');
+    let verifyRes: Response;
+    try {
+      verifyRes = await fetch(`${relayBase}/api/auth/relay/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({
+          relayToken,
+          expectedAudience: serverBaseUrl,
+          expectedProvider: provider,
+          expectedStateHash: sha256Hex(stateParam),
+        }),
+      });
+    } catch {
+      return c.json({ error: 'relay_verification_unavailable' }, 502);
+    }
+    if (!verifyRes.ok) {
       return c.json({ error: 'invalid_relay_token' }, 401);
     }
-    if (typeof payload.provider === 'string') provider = payload.provider;
-    if (typeof payload.shareToken === 'string' && !shareToken) shareToken = payload.shareToken;
-    if (typeof payload.redirectPath === 'string') {
-      redirectPath = normalizeSafeRedirectPath(payload.redirectPath, shareToken);
+    const verifiedData = (await verifyRes.json()) as {
+      ok?: boolean;
+      issuer?: string;
+      profile?: {
+        provider?: string;
+        externalId?: string;
+        username?: string;
+        email?: string | null;
+        displayName?: string;
+      };
+    };
+    if (
+      !verifiedData.ok ||
+      verifiedData.issuer !== relayBase ||
+      !verifiedData.profile ||
+      verifiedData.profile.provider !== provider ||
+      !verifiedData.profile.externalId
+    ) {
+      return c.json({ error: 'invalid_relay_token' }, 401);
     }
-
-    const platformId =
-      (typeof payload.platformId === 'string' && payload.platformId.trim()) ||
-      (typeof payload.sub === 'string' && payload.sub.trim()) ||
-      '';
-    if (!platformId) {
-      return c.json({ error: 'missing_platform_identity' }, 400);
-    }
-
+    const platformId = String(verifiedData.profile.externalId).trim();
     const displayName =
-      (typeof payload.displayName === 'string' && payload.displayName.trim()) ||
-      (typeof payload.name === 'string' && payload.name.trim()) ||
-      (typeof payload.login === 'string' && payload.login.trim()) ||
-      (typeof payload.email === 'string' && payload.email.trim()) ||
+      verifiedData.profile.displayName?.trim() ||
+      verifiedData.profile.username?.trim() ||
+      verifiedData.profile.email?.trim() ||
       `${provider}:${platformId}`;
 
     let user = await getUserByPlatformId(c.env.DB, provider, platformId);
@@ -554,7 +621,6 @@ documentSharingRoutes.get('/doc-shares/auth-relay/callback', async (c): Promise<
       userId = user.id;
     }
   } else if (code && stateClaims) {
-    const serverBaseUrl = (c.env.SERVER_URL || 'http://localhost:19138').replace(/\/$/, '');
     const callbackUrl = `${serverBaseUrl}/api/doc-shares/auth-relay/callback`;
 
     if (provider === 'github') {
@@ -631,7 +697,9 @@ documentSharingRoutes.get('/doc-shares/auth-relay/callback', async (c): Promise<
     return c.json({ error: 'missing_callback_params' }, 400);
   }
 
-  await issueAccountSessionCookies(c, userId);
+  await issueAccountSessionCookies(c, userId, {
+    scope: 'doc_collaborator',
+  });
 
   // If logging in from an external share link, bind/verify the user's identity as the device credential when unlocked
   if (shareToken) {
@@ -768,7 +836,7 @@ documentSharingRoutes.post('/doc-shares/magic-invite/:token/redeem', async (c): 
 // ── 5. Shared-With-Me, Internal Browse & Create Blank Document / Folder ───────
 
 // GET /api/doc-shares/shared-with-me
-documentSharingRoutes.get('/doc-shares/shared-with-me', requireAuth(), async (c): Promise<Response> => {
+documentSharingRoutes.get('/doc-shares/shared-with-me', requireAuth({ allowDocCollaborator: true }), async (c): Promise<Response> => {
   const userId = c.get('userId');
   const serverId = c.req.query('serverId')?.trim();
   const allShares = await listDocumentsSharedWithUser(c.env.DB, userId);
@@ -802,6 +870,8 @@ documentSharingRoutes.get('/server/:id/doc-shares/browse', async (c): Promise<Re
     return c.json({ error: 'forbidden', reason: access.reason ?? 'access_denied' }, status);
   }
 
+  const allowedRoot = access.isOwner ? undefined : (access.targetPath ?? normPath);
+
   try {
     const lsRes = await sendDaemonFsCommand<{
       type: string;
@@ -814,16 +884,26 @@ documentSharingRoutes.get('/server/:id/doc-shares/browse', async (c): Promise<Re
       requestId: `shr-ls-${randomHex(8)}`,
       path: normPath,
       includeFiles: true,
+      ...(allowedRoot ? { allowedRoot } : {}),
     });
 
     if (lsRes.status === 'error') {
-      return c.json({ error: lsRes.error || 'daemon_ls_failed' }, 502);
+      const status = lsRes.error === 'forbidden_path' ? 403 : 502;
+      return c.json({ error: lsRes.error || 'daemon_ls_failed' }, status);
     }
 
     const rawEntries = Array.isArray(lsRes.entries) ? lsRes.entries : [];
     const entries = [];
     for (const entry of rawEntries) {
-      if (!entry || typeof entry.name !== 'string' || entry.name.startsWith('.oo-bak-')) continue;
+      if (
+        !entry ||
+        typeof entry.name !== 'string' ||
+        entry.name.startsWith('.oo-bak-') ||
+        entry.name.startsWith('.oo-stage-') ||
+        entry.name.startsWith('.imcodes-write-')
+      ) {
+        continue;
+      }
       const entryPath = path.posix.join(normPath, entry.name);
       const entryAccess = await resolveEffectiveDocumentAccess(c.env.DB, {
         serverId,
@@ -911,6 +991,8 @@ documentSharingRoutes.post('/server/:id/doc-shares/create-item', async (c): Prom
     return c.json({ error: 'forbidden', reason: 'editor_role_required' }, 403);
   }
 
+  const allowedRoot = access.isOwner ? undefined : (access.targetPath ?? normPath);
+
   if (isFolder) {
     try {
       const mkdirRes = await sendDaemonFsCommand<{
@@ -923,10 +1005,12 @@ documentSharingRoutes.post('/server/:id/doc-shares/create-item', async (c): Prom
         type: 'fs.mkdir',
         requestId: `oo-mkdir-${randomHex(8)}`,
         path: normPath,
+        ...(allowedRoot ? { allowedRoot } : {}),
       });
 
       if (mkdirRes.status === 'error') {
-        return c.json({ error: mkdirRes.error || 'mkdir_failed' }, 400);
+        const status = mkdirRes.error === 'forbidden_path' ? 403 : 400;
+        return c.json({ error: mkdirRes.error || 'mkdir_failed' }, status);
       }
 
       return c.json({ ok: true, kind: 'folder', path: normPath }, 201);
@@ -947,6 +1031,7 @@ documentSharingRoutes.post('/server/:id/doc-shares/create-item', async (c): Prom
     await writeFileToDaemon(serverId, normPath, bytes, {
       createOnly: true,
       isBinary: ext !== '.md',
+      ...(allowedRoot ? { allowedRoot } : {}),
     });
     return c.json(
       {

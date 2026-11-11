@@ -2,9 +2,11 @@ import { useCallback, useEffect, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import {
   browseExternalDocShare,
+  browseSharedDocFolder,
   buildDocAuthRelayUrl,
   createDocumentShareApi,
   createSharedDocItem,
+  listDocsSharedWithMe,
   listDocumentShares,
   redeemMagicInviteDocShare,
   revokeDocumentShareApi,
@@ -15,6 +17,7 @@ import {
   type DocShareTargetKind,
   type DocumentShareItem,
   type ExternalShareView,
+  type SharedWithMeDocItem,
 } from '../api.js';
 import OfficePreview from './OfficePreview.js';
 
@@ -939,14 +942,15 @@ export function DocShareDialog({
 }
 
 /**
- * Pure External Collaborator Shared Document Space (`/doc-share/<token>` or `?docShare=<token>`).
+ * Pure External Collaborator Shared Document Space (`/doc-share/<token>` or `?docShare=<token>`,
+ * or logged-in `doc_collaborator` session).
  * Hides internal servers and AI sessions, rendering only the shared folder/document and embedded ONLYOFFICE editor.
  */
 export function ExternalDocShareSpace({ token }: { token: string }) {
   const { t } = useTranslation();
   const [deviceToken, setDeviceToken] = useState<string>(() => {
     try {
-      return localStorage.getItem(`imcodes_doc_dev_${token}`) || '';
+      return token ? localStorage.getItem(`imcodes_doc_dev_${token}`) || '' : '';
     } catch {
       return '';
     }
@@ -954,6 +958,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
   const [accessCode, setAccessCode] = useState('');
   const [displayName, setDisplayName] = useState('');
   const [shareInfo, setShareInfo] = useState<ExternalShareView | null>(null);
+  const [sharedWithMeList, setSharedWithMeList] = useState<SharedWithMeDocItem[]>([]);
   const [serverId, setServerId] = useState<string>('');
   const [currentPath, setCurrentPath] = useState<string>('');
   const [rootPath, setRootPath] = useState<string>('');
@@ -965,11 +970,72 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
   const [newItemName, setNewItemName] = useState('');
   const [newItemKind, setNewItemKind] = useState<'docx' | 'xlsx' | 'pptx' | 'md' | 'folder'>('docx');
 
+  // Reset per-token state when the route token changes
+  useEffect(() => {
+    let savedDev = '';
+    try {
+      savedDev = token ? localStorage.getItem(`imcodes_doc_dev_${token}`) || '' : '';
+    } catch {
+      savedDev = '';
+    }
+    setDeviceToken(savedDev);
+    setAccessCode('');
+    setShareInfo(null);
+    setSharedWithMeList([]);
+    setServerId('');
+    setCurrentPath('');
+    setRootPath('');
+    setEntries([]);
+    setActiveFilePath(null);
+    setNeedsVerify(false);
+    setError(null);
+  }, [token]);
+
   const loadExternalBrowse = useCallback(
     async (subPath?: string, customDevToken?: string, customCode?: string) => {
       setLoading(true);
       setError(null);
       try {
+        if (!token) {
+          const listRes = await listDocsSharedWithMe();
+          setSharedWithMeList(listRes.shares);
+          const first = listRes.shares[0];
+          if (!first) {
+            setNeedsVerify(false);
+            return;
+          }
+          setServerId(first.serverId);
+          setRootPath(first.targetPath);
+          const browsePath = subPath || first.targetPath;
+          setCurrentPath(browsePath);
+          setShareInfo({
+            id: first.id,
+            serverId: first.serverId,
+            targetKind: first.targetKind,
+            targetPath: first.targetPath,
+            label: first.label || first.targetPath.split('/').pop() || first.targetPath,
+            shareMode: first.shareMode,
+            participantLabel: first.participantLabel,
+            role: first.role,
+            allowDownload: first.allowDownload,
+            deviceLockEnabled: false,
+            isDeviceBound: false,
+            hasAccessCode: false,
+            redeemedAt: first.redeemedAt,
+            expiresAt: first.expiresAt,
+            revokedAt: first.revokedAt,
+          });
+          setNeedsVerify(false);
+          if (first.targetKind === 'file') {
+            setActiveFilePath(first.targetPath);
+            setEntries([]);
+          } else {
+            const folderRes = await browseSharedDocFolder(first.serverId, browsePath);
+            setEntries(folderRes.entries);
+          }
+          return;
+        }
+
         const res = await browseExternalDocShare(token, {
           path: subPath,
           deviceToken: customDevToken ?? (deviceToken || undefined),
@@ -983,9 +1049,11 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
         setNeedsVerify(false);
         if (res.targetKind === 'file') {
           setActiveFilePath(res.path);
+        } else if (!subPath) {
+          setActiveFilePath(null);
         }
       } catch (err) {
-        setNeedsVerify(true);
+        setNeedsVerify(Boolean(token));
         setError(err instanceof Error ? err.message : String(err));
       } finally {
         setLoading(false);
@@ -1355,12 +1423,43 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
           )}
 
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 520 }}>
+            {sharedWithMeList.length > 1 && (
+              <div style={{ display: 'flex', gap: 6, padding: '8px 12px', borderBottom: '1px solid #1e293b', flexWrap: 'wrap' }}>
+                {sharedWithMeList.map((item) => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => {
+                      setServerId(item.serverId);
+                      setRootPath(item.targetPath);
+                      setCurrentPath(item.targetPath);
+                      if (item.targetKind === 'file') {
+                        setActiveFilePath(item.targetPath);
+                      } else {
+                        void browseSharedDocFolder(item.serverId, item.targetPath).then((r) => setEntries(r.entries));
+                      }
+                    }}
+                    style={{
+                      padding: '4px 10px',
+                      background: rootPath === item.targetPath ? '#2563eb' : '#1e293b',
+                      color: '#e2e8f0',
+                      border: '1px solid #334155',
+                      borderRadius: 4,
+                      cursor: 'pointer',
+                      fontSize: 11,
+                    }}
+                  >
+                    {item.label || item.targetPath.split('/').pop()}
+                  </button>
+                ))}
+              </div>
+            )}
             {activeFilePath && serverId ? (
               <OfficePreview
                 serverId={serverId}
                 path={activeFilePath}
                 mimeType={guessMimeTypeFromPath(activeFilePath)}
-                shareToken={token}
+                shareToken={token || undefined}
                 deviceToken={deviceToken || undefined}
               />
             ) : (

@@ -1824,6 +1824,7 @@ export interface MeResponse {
   is_admin: boolean;
   status: string;
   has_password: boolean;
+  scope?: 'doc_collaborator' | null;
 }
 
 export async function fetchMe(): Promise<MeResponse> {
@@ -3280,6 +3281,7 @@ export async function fetchOnlyOfficeConfig(
     mode?: 'view' | 'edit';
     shareToken?: string;
     deviceToken?: string;
+    sessionName?: string;
     lang?: string;
   },
 ): Promise<OnlyOfficeConfigResponse> {
@@ -3287,6 +3289,7 @@ export async function fetchOnlyOfficeConfig(
   if (params.mode) qs.set('mode', params.mode);
   if (params.shareToken) qs.set('shareToken', params.shareToken);
   if (params.deviceToken) qs.set('deviceToken', params.deviceToken);
+  if (params.sessionName) qs.set('sessionName', params.sessionName);
   if (params.lang) qs.set('lang', params.lang);
   return apiFetch<OnlyOfficeConfigResponse>(
     `/api/server/${encodeURIComponent(serverId)}/onlyoffice/config?${qs.toString()}`,
@@ -3496,4 +3499,3 @@ export function buildDocAuthRelayUrl(
   const query = qs.toString() ? `?${qs.toString()}` : '';
   return `/api/doc-shares/auth-relay/${provider}${query}`;
 }
-

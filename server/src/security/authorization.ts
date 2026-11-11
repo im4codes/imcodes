@@ -30,6 +30,8 @@ export interface AuthContext {
   userId: string;
   role: Role;
   keyId?: string;
+  /** Set when the credential is a restricted document-only collaborator session. */
+  scope?: 'doc_collaborator';
   /** Set when the credential is a daemon server-token; the machine's node role. */
   nodeRole?: NodeRole;
   /** Set when the credential is a daemon server-token; its server id. */
@@ -81,7 +83,14 @@ export async function resolveAuth(c: Pick<Context<{ Bindings: Env }>, 'req' | 'e
 async function resolveLoginTokenUser(db: Database, payload: Record<string, unknown> & { sub: string }): Promise<AuthResolution> {
   const decision = evaluateUserAccess(await loadUserAccess(db, payload.sub), typeof payload.iat === 'number' ? payload.iat : undefined);
   if (!decision.ok) return { auth: null, denied: decision.code };
-  return { auth: { userId: payload.sub, role: (payload.role as Role) ?? 'member' } };
+  const scope = payload.scope === 'doc_collaborator' ? 'doc_collaborator' : undefined;
+  return {
+    auth: {
+      userId: payload.sub,
+      role: (payload.role as Role) ?? 'member',
+      ...(scope ? { scope } : {}),
+    },
+  };
 }
 
 /**
@@ -212,6 +221,7 @@ function canPerform(role: Role, op: Operation): boolean {
  * Sets c.var.userId and c.var.role.
  */
 export const DAEMON_CREDENTIAL_REFUSAL = 'daemon_credential_not_accepted';
+export const DOC_COLLABORATOR_SCOPE_REFUSAL = 'doc_collaborator_scope_restricted';
 
 export interface RequireAuthOptions {
   /**
@@ -220,6 +230,12 @@ export interface RequireAuthOptions {
    * minting must not accept it: only a login, an API key or a CLI key reaches those routes.
    */
   refuseDaemonCredential?: boolean;
+  /**
+   * Allow a restricted `doc_collaborator` session (minted by Magic Invite or Keyless Auth Relay)
+   * to access this route. Defaults to false so document-only sessions are default-denied on all
+   * ordinary server/session/team/account endpoints.
+   */
+  allowDocCollaborator?: boolean;
 }
 
 export function requireAuth(options: RequireAuthOptions = {}) {
@@ -229,6 +245,9 @@ export function requireAuth(options: RequireAuthOptions = {}) {
     if (!auth) return authFailureResponse(c, resolution);
     if (options.refuseDaemonCredential && auth.serverId) {
       return c.json({ error: 'forbidden', reason: DAEMON_CREDENTIAL_REFUSAL }, 403);
+    }
+    if (auth.scope === 'doc_collaborator' && !options.allowDocCollaborator) {
+      return c.json({ error: 'forbidden', reason: DOC_COLLABORATOR_SCOPE_REFUSAL }, 403);
     }
     const identityMismatch = rejectChangedClientIdentity(c, auth.userId);
     if (identityMismatch) return identityMismatch;
@@ -240,6 +259,7 @@ export function requireAuth(options: RequireAuthOptions = {}) {
 
     c.set('userId' as never, auth.userId);
     c.set('role' as never, auth.role);
+    if (auth.scope) c.set('authScope' as never, auth.scope);
     if (auth.keyId) c.set('keyId' as never, auth.keyId);
     if (auth.nodeRole) c.set('nodeRole' as never, auth.nodeRole);
     if (auth.serverId) c.set('authServerId' as never, auth.serverId);
@@ -259,6 +279,9 @@ export function requireRole(minRole: Role) {
     const resolution = await resolveAuthOutcome(c);
     const auth = resolution.auth;
     if (!auth) return authFailureResponse(c, resolution);
+    if (auth.scope === 'doc_collaborator') {
+      return c.json({ error: 'forbidden', reason: DOC_COLLABORATOR_SCOPE_REFUSAL }, 403);
+    }
     const identityMismatch = rejectChangedClientIdentity(c, auth.userId);
     if (identityMismatch) return identityMismatch;
     if (auth.nodeRole === NODE_ROLE.CONTROLLED) {
@@ -300,6 +323,9 @@ export function requireTeamRole(minRole: 'owner' | 'admin' | 'member' = 'member'
     const resolution = await resolveAuthOutcome(c);
     const auth = resolution.auth;
     if (!auth) return authFailureResponse(c, resolution);
+    if (auth.scope === 'doc_collaborator') {
+      return c.json({ error: 'forbidden', reason: DOC_COLLABORATOR_SCOPE_REFUSAL }, 403);
+    }
     const identityMismatch = rejectChangedClientIdentity(c, auth.userId);
     if (identityMismatch) return identityMismatch;
 

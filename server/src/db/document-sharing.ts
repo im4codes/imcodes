@@ -1,8 +1,93 @@
 import path from 'node:path';
+import { verifyAuthenticationResponse } from '@simplewebauthn/server';
 import type { Database } from './client.js';
 import { randomHex, sha256Hex } from '../security/crypto.js';
 import { resolveServerMembershipRole } from '../security/authorization.js';
 import { USER_STATUS, isUserStatusActive } from '../../../shared/user-status.js';
+
+/**
+ * Tracks `(shareId, accessCodeHash, deviceTokenHash) -> expiresAt` for external links
+ * that have passed mandatory PIN verification (`verifyAndBindExternalShareDevice`),
+ * ensuring PIN-protected links cannot be bypassed even when `device_lock_enabled` is false.
+ */
+const verifiedExternalPinTokens = new Map<string, number>();
+
+function makeVerifiedPinKey(shareId: string, accessCodeHash: string, deviceTokenHash: string): string {
+  return `${shareId}:${accessCodeHash}:${deviceTokenHash}`;
+}
+
+export function recordVerifiedExternalSharePin(
+  shareId: string,
+  accessCodeHash: string,
+  deviceToken: string,
+  ttlMs = 30 * 24 * 3600 * 1000,
+): void {
+  const tokenHash = sha256Hex(deviceToken.trim());
+  verifiedExternalPinTokens.set(
+    makeVerifiedPinKey(shareId, accessCodeHash, tokenHash),
+    Date.now() + ttlMs,
+  );
+}
+
+export function hasVerifiedExternalSharePin(
+  shareId: string,
+  accessCodeHash: string,
+  deviceToken: string | null | undefined,
+  now = Date.now(),
+): boolean {
+  const trimmed = deviceToken?.trim() ?? '';
+  if (!trimmed) return false;
+  // Also support self-verifying dpin_ tokens minted by verifyAndBindExternalShareDevice
+  if (trimmed.startsWith('dpin_')) {
+    const dot = trimmed.indexOf('.');
+    if (dot > 5) {
+      const nonce = trimmed.slice(5, dot);
+      const sig = trimmed.slice(dot + 1);
+      if (sig === sha256Hex(`doc-pin-proof:v1:${shareId}:${accessCodeHash}:${nonce}`)) {
+        return true;
+      }
+    }
+  }
+  const key = makeVerifiedPinKey(shareId, accessCodeHash, sha256Hex(trimmed));
+  const exp = verifiedExternalPinTokens.get(key);
+  if (!exp) return false;
+  if (exp <= now) {
+    verifiedExternalPinTokens.delete(key);
+    return false;
+  }
+  return true;
+}
+
+export function clearVerifiedExternalSharePinsForTests(): void {
+  verifiedExternalPinTokens.clear();
+}
+
+/**
+ * Checks whether `userId` is a member of the team associated with `serverId`
+ * (or the server's owner/admin/member via `machine_groups` or `servers.team_id`).
+ * Used to restrict `target_user_id = '*'` (team-wide shares) to genuine members
+ * of that server's team rather than arbitrary active accounts on the site.
+ */
+export async function isUserInServerTeam(
+  db: Database,
+  serverId: string,
+  userId: string,
+): Promise<boolean> {
+  const memberRole = await resolveServerMembershipRole(db, serverId, userId);
+  if (memberRole !== 'none') return true;
+
+  const directTeam = await db.queryOne<{ role: string | null }>(
+    `SELECT tm.role
+       FROM servers s
+       JOIN team_members tm ON tm.team_id = s.team_id
+      WHERE s.id = $1 AND tm.user_id = $2
+      LIMIT 1`,
+    [serverId, userId],
+  );
+  if (directTeam?.role) return true;
+
+  return false;
+}
 
 export type DocumentShareTargetKind = 'file' | 'folder';
 export type DocumentShareMode = 'user' | 'team' | 'external_link' | 'magic_invite';
@@ -349,7 +434,25 @@ export async function listDocumentsSharedWithUser(
       ORDER BY ds.updated_at DESC`,
     [now, userId],
   );
-  return rows.map((r) => ({
+  const teamMembershipByServer = new Map<string, boolean>();
+  const filtered: Array<DbDocumentShareRow & { server_name: string | null }> = [];
+  for (const r of rows) {
+    if (r.target_user_id === userId || r.redeemed_by_user_id === userId) {
+      filtered.push(r);
+      continue;
+    }
+    if (r.target_user_id === '*') {
+      let inTeam = teamMembershipByServer.get(r.server_id);
+      if (inTeam === undefined) {
+        inTeam = await isUserInServerTeam(db, r.server_id, userId);
+        teamMembershipByServer.set(r.server_id, inTeam);
+      }
+      if (inTeam) {
+        filtered.push(r);
+      }
+    }
+  }
+  return filtered.map((r) => ({
     ...mapDbRow(r),
     serverName: r.server_name ?? null,
   }));
@@ -453,6 +556,10 @@ export interface VerifyExternalShareInput {
   accessCode?: string | null;
   deviceToken?: string | null;
   passkeyCredentialId?: string | null;
+  passkeyChallengeId?: string | null;
+  passkeyResponse?: Record<string, unknown> | null;
+  rpId?: string;
+  origin?: string;
   userId?: string | null;
   now?: number;
 }
@@ -488,6 +595,9 @@ export async function verifyAndBindExternalShareDevice(
   if (share.expiresAt !== null && share.expiresAt <= now) {
     return { ok: false, status: 410, error: 'share_expired' };
   }
+  if (share.shareMode === 'magic_invite') {
+    return { ok: false, status: 403, error: 'magic_invite_requires_redemption' };
+  }
 
   // Verify access code when configured
   if (share.accessCodeHash) {
@@ -497,15 +607,88 @@ export async function verifyAndBindExternalShareDevice(
     }
   }
 
+  // Never trust a bare passkeyCredentialId string without cryptographic WebAuthn assertion verification
+  let verifiedPasskeyToken: string | null = null;
+  if (input.passkeyCredentialId?.trim() || input.passkeyResponse) {
+    if (!input.passkeyChallengeId?.trim() || !input.passkeyResponse || typeof input.passkeyResponse !== 'object') {
+      return { ok: false, status: 401, error: 'passkey_assertion_required' };
+    }
+    const challengeRow = await db.queryOne<{ challenge: string }>(
+      'SELECT challenge FROM passkey_challenges WHERE id = $1 AND expires_at > $2',
+      [input.passkeyChallengeId.trim(), now],
+    );
+    if (!challengeRow) {
+      return { ok: false, status: 401, error: 'passkey_challenge_expired' };
+    }
+    await db.execute('DELETE FROM passkey_challenges WHERE id = $1', [input.passkeyChallengeId.trim()]);
+
+    const respId = typeof input.passkeyResponse.id === 'string'
+      ? input.passkeyResponse.id
+      : (input.passkeyCredentialId?.trim() ?? '');
+    if (!respId) {
+      return { ok: false, status: 401, error: 'invalid_passkey_response' };
+    }
+    const storedCred = await db.queryOne<{
+      id: string;
+      user_id: string;
+      public_key: string;
+      counter: number;
+      transports: string | null;
+    }>(
+      'SELECT id, user_id, public_key, counter, transports FROM passkey_credentials WHERE id = $1',
+      [respId],
+    );
+    if (!storedCred) {
+      return { ok: false, status: 403, error: 'wrong_passkey' };
+    }
+    try {
+      const verification = await verifyAuthenticationResponse({
+        response: input.passkeyResponse as unknown as Parameters<typeof verifyAuthenticationResponse>[0]['response'],
+        expectedChallenge: challengeRow.challenge,
+        expectedOrigin: input.origin ?? 'http://localhost',
+        expectedRPID: input.rpId ?? 'localhost',
+        authenticator: {
+          credentialID: storedCred.id,
+          credentialPublicKey: Uint8Array.from(Buffer.from(storedCred.public_key, 'base64')),
+          counter: storedCred.counter,
+          transports: storedCred.transports ? JSON.parse(storedCred.transports) : undefined,
+        },
+      });
+      if (!verification.verified) {
+        return { ok: false, status: 401, error: 'passkey_verification_failed' };
+      }
+      await db.execute(
+        'UPDATE passkey_credentials SET counter = $1, last_used_at = $2 WHERE id = $3',
+        [verification.authenticationInfo.newCounter, now, storedCred.id],
+      );
+      verifiedPasskeyToken = `passkey:${storedCred.id}`;
+    } catch {
+      return { ok: false, status: 401, error: 'passkey_verification_failed' };
+    }
+  }
+
+  // Reject attempts to pass the stored boundDeviceHash itself as the raw deviceToken
+  const rawSuppliedDevice = input.deviceToken?.trim() ?? '';
+  if (rawSuppliedDevice && share.boundDeviceHash && rawSuppliedDevice === share.boundDeviceHash) {
+    return { ok: false, status: 403, error: 'device_locked_to_another_device' };
+  }
+
+  const defaultGeneratedToken = share.accessCodeHash
+    ? (() => {
+        const nonce = randomHex(16);
+        return `dpin_${nonce}.${sha256Hex(`doc-pin-proof:v1:${share.id}:${share.accessCodeHash}:${nonce}`)}`;
+      })()
+    : `dev_${randomHex(24)}`;
+
   // Determine candidate device credential token
   const candidateToken =
-    input.passkeyCredentialId?.trim()
-      ? `passkey:${input.passkeyCredentialId.trim()}`
-      : input.deviceToken?.trim()
-        ? input.deviceToken.trim()
+    verifiedPasskeyToken
+      ? verifiedPasskeyToken
+      : rawSuppliedDevice
+        ? rawSuppliedDevice
         : input.userId?.trim()
           ? `user:${input.userId.trim()}`
-          : `dev_${randomHex(24)}`;
+          : defaultGeneratedToken;
 
   const candidateHash = sha256Hex(candidateToken);
 
@@ -521,6 +704,9 @@ export async function verifyAndBindExternalShareDevice(
         [candidateHash, now, share.id],
       );
       if (updated) {
+        if (share.accessCodeHash) {
+          recordVerifiedExternalSharePin(share.id, share.accessCodeHash, candidateToken);
+        }
         return {
           ok: true,
           share: mapDbRow(updated),
@@ -533,6 +719,9 @@ export async function verifyAndBindExternalShareDevice(
       if (!recheck || recheck.boundDeviceHash !== candidateHash) {
         return { ok: false, status: 403, error: 'device_locked_to_another_device' };
       }
+      if (share.accessCodeHash) {
+        recordVerifiedExternalSharePin(share.id, share.accessCodeHash, candidateToken);
+      }
       return {
         ok: true,
         share: recheck,
@@ -544,6 +733,10 @@ export async function verifyAndBindExternalShareDevice(
     if (share.boundDeviceHash !== candidateHash) {
       return { ok: false, status: 403, error: 'device_locked_to_another_device' };
     }
+  }
+
+  if (share.accessCodeHash) {
+    recordVerifiedExternalSharePin(share.id, share.accessCodeHash, candidateToken);
   }
 
   return {
@@ -746,13 +939,15 @@ export async function resolveEffectiveDocumentAccess(
     const exp = toNum(extRow.expires_at);
     if (exp !== null && exp <= now) return denied('share_expired');
 
-    // If magic_invite was already redeemed by a different user, raw token cannot be reused by strangers
-    if (
-      extRow.share_mode === 'magic_invite' &&
-      extRow.redeemed_by_user_id &&
-      userId !== extRow.redeemed_by_user_id
-    ) {
-      return denied('magic_invite_already_redeemed');
+    // Magic Invite tokens MUST be redeemed first via redeemMagicInviteShare;
+    // unredeemed magic_invite raw tokens or tokens redeemed by a different user are never accepted directly.
+    if (extRow.share_mode === 'magic_invite') {
+      if (!extRow.redeemed_at || !extRow.redeemed_by_user_id) {
+        return denied('magic_invite_requires_redemption');
+      }
+      if (userId !== extRow.redeemed_by_user_id) {
+        return denied('magic_invite_already_redeemed');
+      }
     }
 
     // Scope check
@@ -764,27 +959,48 @@ export async function resolveEffectiveDocumentAccess(
       }
     }
 
+    const suppliedDeviceToken = input.deviceToken?.trim()
+      || (userId ? `user:${userId}` : '');
+
+    // Reject attempts to pass the stored bound_device_hash itself as raw deviceToken
+    if (suppliedDeviceToken && extRow.bound_device_hash && suppliedDeviceToken === extRow.bound_device_hash) {
+      return denied('device_locked');
+    }
+
+    // Mandatory PIN check: when access_code_hash is configured on an external_link,
+    // the caller MUST have completed verifyAndBindExternalShareDevice for this deviceToken
+    if (extRow.share_mode === 'external_link' && extRow.access_code_hash) {
+      if (!hasVerifiedExternalSharePin(extRow.id, extRow.access_code_hash, suppliedDeviceToken, now)) {
+        return denied('access_code_verification_required');
+      }
+    }
+
     // Device / Passkey lock verification
     if (extRow.device_lock_enabled) {
-      const suppliedDeviceToken = input.deviceToken?.trim()
-        || (userId ? `user:${userId}` : '');
       if (!suppliedDeviceToken) {
         return denied('device_locked');
       }
       const suppliedHash = sha256Hex(suppliedDeviceToken);
       if (extRow.bound_device_hash) {
-        if (
-          suppliedHash !== extRow.bound_device_hash &&
-          suppliedDeviceToken !== extRow.bound_device_hash
-        ) {
+        if (suppliedHash !== extRow.bound_device_hash) {
           return denied('device_locked');
         }
       } else if (!extRow.access_code_hash) {
-        // Bind on first access when no access code gate is unverified
-        await db.execute(
-          'UPDATE document_shares SET bound_device_hash = $1, updated_at = $2 WHERE id = $3 AND bound_device_hash IS NULL',
+        // Bind on first access when no access code gate is configured, using atomic CAS + re-read
+        const updated = await db.queryOne<DbDocumentShareRow>(
+          `UPDATE document_shares
+              SET bound_device_hash = $1,
+                  updated_at = $2
+            WHERE id = $3 AND bound_device_hash IS NULL
+            RETURNING *`,
           [suppliedHash, now, extRow.id],
         );
+        if (!updated) {
+          const recheck = await getDocumentShareById(db, extRow.id);
+          if (!recheck || recheck.boundDeviceHash !== suppliedHash) {
+            return denied('device_locked');
+          }
+        }
       } else {
         return denied('device_locked');
       }
@@ -851,7 +1067,7 @@ export async function resolveEffectiveDocumentAccess(
     return denied('user_inactive');
   }
 
-  const activeShares = await db.query<DbDocumentShareRow>(
+  const activeSharesRaw = await db.query<DbDocumentShareRow>(
     `SELECT * FROM document_shares
       WHERE server_id = $1
         AND revoked_at IS NULL
@@ -862,6 +1078,20 @@ export async function resolveEffectiveDocumentAccess(
           OR target_user_id = '*'
         )`,
     [input.serverId, now, userId],
+  );
+
+  // Team wildcard ('*') shares only apply if the user is a member of this server's team
+  const hasWildcardCandidate = activeSharesRaw.some(
+    (r) => r.target_user_id === '*' && r.target_user_id !== userId && r.redeemed_by_user_id !== userId,
+  );
+  const userInServerTeam = hasWildcardCandidate
+    ? await isUserInServerTeam(db, input.serverId, userId)
+    : false;
+  const activeShares = activeSharesRaw.filter(
+    (r) =>
+      r.target_user_id === userId ||
+      r.redeemed_by_user_id === userId ||
+      (r.target_user_id === '*' && userInServerTeam),
   );
 
   if (activeShares.length === 0) {

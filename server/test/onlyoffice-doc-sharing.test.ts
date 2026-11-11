@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { buildApp } from '../src/index.js';
@@ -11,13 +12,18 @@ import {
   buildBlankDocumentBytes,
   bumpOnlyOfficeDocumentRevision,
   getOnlyOfficeDocumentKey,
+  resetOnlyOfficeDocumentKeyCacheForTests,
 } from '../src/routes/onlyoffice.js';
 import {
+  clearVerifiedExternalSharePinsForTests,
   isPathWithinSharedFolder,
   normalizeDocumentSharePath,
 } from '../src/db/document-sharing.js';
+import { handleWebCommand, __resetFsGitCachesForTests } from '../../src/daemon/command-handler.js';
+import type { ServerLink } from '../../src/daemon/server-link.js';
 
 const JWT_KEY = 'onlyoffice-doc-share-test-signing-key-32chars!!';
+const CENTRAL_JWT_KEY = 'central-auth-relay-independent-signing-key-64!!';
 
 interface MemShareRow {
   id: string;
@@ -52,17 +58,40 @@ interface MemUserRow {
   is_admin: boolean;
 }
 
+interface MemRefreshTokenRow {
+  id: string;
+  user_id: string;
+  token_hash: string;
+  family_id: string;
+  expires_at: number;
+  revoked_at: number | null;
+  created_at: number;
+}
+
 function createInMemoryDb() {
   const users = new Map<string, MemUserRow>([
     ['owner-1', { id: 'owner-1', username: 'alice', display_name: 'Alice Owner', status: 'active', sessions_valid_after: 0, is_admin: false }],
     ['user-bob', { id: 'user-bob', username: 'bob', display_name: 'Bob Member', status: 'active', sessions_valid_after: 0, is_admin: false }],
     ['user-carol', { id: 'user-carol', username: 'carol', display_name: 'Carol Member', status: 'active', sessions_valid_after: 0, is_admin: false }],
+    ['user-stranger', { id: 'user-stranger', username: 'mallory', display_name: 'Mallory NonTeam', status: 'active', sessions_valid_after: 0, is_admin: false }],
   ]);
   const servers = new Map<string, { id: string; name: string; user_id: string; team_id: string | null }>([
-    ['srv-1', { id: 'srv-1', name: 'Primary Server', user_id: 'owner-1', team_id: null }],
+    ['srv-1', { id: 'srv-1', name: 'Primary Server', user_id: 'owner-1', team_id: 'team-1' }],
+  ]);
+  // team-1 has owner-1, user-bob, user-carol, NOT user-stranger
+  const teamMembers = new Map<string, string>([
+    ['team-1:owner-1', 'owner'],
+    ['team-1:user-bob', 'member'],
+    ['team-1:user-carol', 'member'],
   ]);
   const shares = new Map<string, MemShareRow>();
   const platformIdentities = new Map<string, string>(); // `${platform}:${externalId}` -> userId
+  const refreshTokens = new Map<string, MemRefreshTokenRow>();
+  const passkeyChallenges = new Map<string, { challenge: string; expires_at: number }>();
+  const passkeyCredentials = new Map<
+    string,
+    { id: string; user_id: string; public_key: string; counter: number; transports: string | null }
+  >();
 
   const enrichShare = (row: MemShareRow) => {
     const u = users.get(row.target_user_id);
@@ -161,6 +190,15 @@ function createInMemoryDb() {
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> => {
       const normSql = sql.replace(/\s+/g, ' ').trim();
 
+      // isUserInServerTeam check
+      if (normSql.includes('SELECT tm.role') && normSql.includes('FROM servers s') && normSql.includes('JOIN team_members tm')) {
+        const [serverId, userId] = params as [string, string];
+        const srv = servers.get(serverId);
+        if (!srv || !srv.team_id) return null;
+        const role = teamMembers.get(`${srv.team_id}:${userId}`);
+        return (role ? { role } : null) as unknown as T | null;
+      }
+
       // Server & owner check in resolveEffectiveDocumentAccess & resolveServerMembershipRole
       if (normSql.includes('FROM servers WHERE id = $1') && normSql.includes('owner_status')) {
         const srv = servers.get(params[0] as string);
@@ -175,25 +213,6 @@ function createInMemoryDb() {
         } as unknown as T;
       }
 
-      if (normSql.startsWith('INSERT INTO users')) {
-        const [id, created_at, status] = params as [string, number, string];
-        const row: MockUser = {
-          id,
-          username: null,
-          display_name: null,
-          status: status ?? 'active',
-          created_at: created_at ?? Date.now(),
-        };
-        users.set(id, row);
-        return row as unknown as T;
-      }
-
-      if (normSql.startsWith('INSERT INTO platform_identities')) {
-        const [id, platform, externalId, userId, createdAt] = params as [string, string, string, string, number];
-        platformIdentities.set(`${platform}:${externalId}`, userId);
-        return { id, platform, external_id: externalId, user_id: userId, created_at: createdAt ?? Date.now() } as unknown as T;
-      }
-
       // resolveServerMembershipRole query
       if (normSql.includes('FROM servers s') && normSql.includes('WHERE s.id = $1')) {
         const [serverId, userId] = params as [string, string];
@@ -201,12 +220,13 @@ function createInMemoryDb() {
         if (!srv) return null;
         const owner = users.get(srv.user_id);
         const actor = users.get(userId);
+        const teamRole = srv.team_id ? (teamMembers.get(`${srv.team_id}:${userId}`) ?? null) : null;
         return {
           user_id: srv.user_id,
           team_id: srv.team_id,
           owner_status: owner?.status ?? null,
           actor_status: actor?.status ?? null,
-          team_role: null,
+          team_role: teamRole,
         } as unknown as T;
       }
 
@@ -214,6 +234,29 @@ function createInMemoryDb() {
       if (normSql.startsWith('SELECT * FROM servers WHERE id = $1')) {
         const srv = servers.get(params[0] as string);
         return (srv ?? null) as unknown as T | null;
+      }
+
+      // Passkey challenge & credential lookups
+      if (normSql.startsWith('SELECT challenge FROM passkey_challenges WHERE id = $1 AND expires_at > $2')) {
+        const [id, now] = params as [string, number];
+        const row = passkeyChallenges.get(id);
+        if (!row || row.expires_at <= now) return null;
+        return { challenge: row.challenge } as unknown as T;
+      }
+      if (normSql.startsWith('SELECT id, user_id, public_key, counter, transports FROM passkey_credentials WHERE id = $1')) {
+        const id = params[0] as string;
+        const row = passkeyCredentials.get(id);
+        return (row ?? null) as unknown as T | null;
+      }
+
+      // Refresh token lookup
+      if (normSql.includes('FROM refresh_tokens WHERE token_hash = $1')) {
+        const tokenHash = params[0] as string;
+        const now = typeof params[1] === 'number' ? params[1] : 0;
+        const row = [...refreshTokens.values()].find(
+          (r) => r.token_hash === tokenHash && r.revoked_at === null && (!now || r.expires_at > now),
+        );
+        return (row ?? null) as unknown as T | null;
       }
 
       // User lookup by id or username (resolveUserByIdentifier)
@@ -241,10 +284,18 @@ function createInMemoryDb() {
       }
 
       // Platform identity lookup
-      if (normSql.includes('FROM platform_identities WHERE platform = $1 AND external_id = $2')) {
+      if (
+        normSql.includes('FROM platform_identities WHERE platform = $1 AND external_id = $2') ||
+        normSql.includes('FROM users u JOIN platform_identities pi ON u.id = pi.user_id WHERE pi.platform = $1 AND pi.external_id = $2')
+      ) {
         const key = `${params[0]}:${params[1]}`;
         const uid = platformIdentities.get(key);
-        return (uid ? { user_id: uid } : null) as unknown as T | null;
+        if (!uid) return null;
+        if (normSql.includes('JOIN platform_identities')) {
+          const u = users.get(uid);
+          return (u ?? null) as unknown as T | null;
+        }
+        return { user_id: uid } as unknown as T;
       }
 
       // INSERT INTO document_shares ... ON CONFLICT
@@ -441,24 +492,71 @@ function createInMemoryDb() {
       const normSql = sql.replace(/\s+/g, ' ').trim();
       if (normSql.startsWith('INSERT INTO users')) {
         const id = params[0] as string;
-        const displayName = (params[1] as string | null) ?? 'Guest Collaborator';
-        const status = (params[2] as string | undefined) ?? 'active';
+        const displayName =
+          normSql.includes('display_name') && typeof params[1] === 'string'
+            ? params[1]
+            : 'Guest Collaborator';
         if (!users.has(id)) {
           users.set(id, {
             id,
             username: null,
             display_name: displayName,
-            status: status.includes('active') ? 'active' : 'active',
+            status: 'active',
             sessions_valid_after: 0,
             is_admin: false,
           });
         }
         return { changes: 1 };
       }
+      if (normSql.startsWith('UPDATE users SET display_name = COALESCE(display_name, $1) WHERE id = $2')) {
+        const [displayName, id] = params as [string, string];
+        const u = users.get(id);
+        if (u && !u.display_name) u.display_name = displayName;
+        return { changes: u ? 1 : 0 };
+      }
       if (normSql.startsWith('INSERT INTO platform_identities')) {
         const [, userId, platform, externalId] = params as [string, string, string, string];
         platformIdentities.set(`${platform}:${externalId}`, userId);
         return { changes: 1 };
+      }
+      if (normSql.startsWith('INSERT INTO refresh_tokens')) {
+        const [id, userId, tokenHash, familyId, expiresAt, createdAt] = params as [
+          string,
+          string,
+          string,
+          string,
+          number,
+          number,
+        ];
+        refreshTokens.set(id, {
+          id,
+          user_id: userId,
+          token_hash: tokenHash,
+          family_id: familyId,
+          expires_at: expiresAt,
+          revoked_at: null,
+          created_at: createdAt,
+        });
+        return { changes: 1 };
+      }
+      if (
+        normSql.startsWith('UPDATE refresh_tokens SET revoked_at = $1 WHERE id = $2') ||
+        normSql.startsWith('UPDATE refresh_tokens SET used_at = $1 WHERE id = $2')
+      ) {
+        const [now, id] = params as [number, string];
+        const r = refreshTokens.get(id);
+        if (r) r.revoked_at = now;
+        return { changes: r ? 1 : 0 };
+      }
+      if (normSql.startsWith('DELETE FROM passkey_challenges WHERE id = $1')) {
+        passkeyChallenges.delete(params[0] as string);
+        return { changes: 1 };
+      }
+      if (normSql.startsWith('UPDATE passkey_credentials SET counter = $1')) {
+        const [counter, , id] = params as [number, number, string];
+        const cred = passkeyCredentials.get(id);
+        if (cred) cred.counter = counter;
+        return { changes: cred ? 1 : 0 };
       }
       if (
         normSql.startsWith('UPDATE document_shares SET bound_device_hash = $1') &&
@@ -479,7 +577,16 @@ function createInMemoryDb() {
     close: async () => undefined,
   } as unknown as Database;
 
-  return { db, users, servers, shares };
+  return {
+    db,
+    users,
+    servers,
+    teamMembers,
+    shares,
+    refreshTokens,
+    passkeyChallenges,
+    passkeyCredentials,
+  };
 }
 
 function makeEnv(db: Database, overrides: Partial<Env> = {}): Env {
@@ -616,7 +723,7 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
             ],
           });
         } else if (msg.type === 'fs.rename') {
-          const oldPath = String(msg.oldPath ?? '');
+          const oldPath = String(msg.path ?? msg.oldPath ?? '');
           const newPath = String(msg.newPath ?? '');
           const existing = virtualFiles.get(oldPath);
           if (existing) {
@@ -627,6 +734,7 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
             type: 'fs.rename_response',
             requestId: reqId,
             status: 'ok',
+            path: oldPath,
             oldPath,
             newPath,
           });
@@ -659,7 +767,13 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
           encoding: 'base64',
           mtime: Date.now(),
         });
-        return { type: 'file.upload_response', uploadId: _id, status: 'ok', attachmentId: _id };
+        return {
+          type: 'file.upload_response',
+          uploadId: _id,
+          status: 'ok',
+          attachmentId: _id,
+          relPath: fullPath,
+        };
       }
       return { status: 'ok' };
     });
@@ -669,6 +783,8 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
   beforeEach(() => {
     WsBridge.getAll().clear();
     virtualFiles.clear();
+    resetOnlyOfficeDocumentKeyCacheForTests();
+    clearVerifiedExternalSharePinsForTests();
     virtualFiles.set('/team/shared/spec.docx', {
       content: Buffer.from('PK\x03\x04mock-docx-bytes').toString('base64'),
       encoding: 'base64',
@@ -689,7 +805,7 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
     vi.restoreAllMocks();
   });
 
-  it('enforces folder share inheritance and single-file permission override (viewer / allowDownload=false)', async () => {
+  it('enforces folder share inheritance, single-file permission override (viewer / allowDownload=false), and blocks non-team users from wildcard (*) shares (F3b)', async () => {
     // 1. Owner shares /team/shared folder with entire team ('*') as editor
     const folderShareRes = await app.request('/api/server/srv-1/doc-shares', {
       method: 'POST',
@@ -724,7 +840,7 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
     });
     expect(childOverrideRes.status).toBe(201);
 
-    // 3. Bob accesses /team/shared/spec.docx -> inherits folder 'editor' + allowDownload: true
+    // 3. Bob (team member) accesses /team/shared/spec.docx -> inherits folder 'editor' + allowDownload: true
     const specCfgRes = await app.request(
       `/api/server/srv-1/onlyoffice/config?path=${encodeURIComponent('/team/shared/spec.docx')}&mode=edit`,
       { headers: { Authorization: bearer('user-bob') } },
@@ -743,6 +859,18 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
     expect(specCfg.allowDownload).toBe(true);
     expect(specCfg.config.document.permissions.edit).toBe(true);
     expect(specCfg.config.document.permissions.download).toBe(true);
+
+    // 3b. F3b: Non-team user ('user-stranger') on the same platform is strictly denied wildcard '*' share access
+    const strangerCfgRes = await app.request(
+      `/api/server/srv-1/onlyoffice/config?path=${encodeURIComponent('/team/shared/spec.docx')}&mode=edit`,
+      { headers: { Authorization: bearer('user-stranger') } },
+    );
+    expect(strangerCfgRes.status).toBe(403);
+    const strangerSharedListRes = await app.request('/api/doc-shares/shared-with-me?serverId=srv-1', {
+      headers: { Authorization: bearer('user-stranger') },
+    });
+    expect(strangerSharedListRes.status).toBe(200);
+    expect(((await strangerSharedListRes.json()) as { shares: unknown[] }).shares).toHaveLength(0);
 
     // 4. Bob accesses /team/shared/salary.xlsx -> overridden to 'viewer' + allowDownload: false even when requesting mode=edit
     const salaryCfgRes = await app.request(
@@ -822,7 +950,7 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
     expect(expiredRes.status).toBe(403);
   });
 
-  it('Scheme 1: verifies external dedicated link access code, locks to first device/Passkey, and blocks forwarded 2nd device', async () => {
+  it('Scheme 1: verifies external dedicated link access code, locks to first device/Passkey, rejects bound_device_hash replay & bare passkeyCredentialId, and blocks forwarded 2nd device (F2)', async () => {
     // 1. Owner creates an external link with access code "8848" and deviceLockEnabled: true
     const createRes = await app.request('/api/server/srv-1/doc-shares', {
       method: 'POST',
@@ -858,6 +986,15 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
     });
     expect(badCodeRes.status).toBe(401);
 
+    // 2b. Bare passkeyCredentialId without WebAuthn assertion is rejected (401 passkey_assertion_required)
+    const barePasskeyRes = await app.request(`/api/doc-shares/external/${created.shareToken}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accessCode: '8848', passkeyCredentialId: 'cred-fake-123' }),
+    });
+    expect(barePasskeyRes.status).toBe(401);
+    expect(await barePasskeyRes.json()).toMatchObject({ error: 'passkey_assertion_required' });
+
     // 3. First device ("device-wangjie-1") verifies with correct code -> binds device hash
     const firstDeviceRes = await app.request(`/api/doc-shares/external/${created.shareToken}/verify`, {
       method: 'POST',
@@ -873,6 +1010,13 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
     expect(firstVerified.ok).toBe(true);
     expect(firstVerified.deviceBound).toBe(true);
     expect(firstVerified.deviceToken).toBe('device-wangjie-1');
+
+    // 3b. Passing the stored bound_device_hash (64-hex SHA-256) as raw deviceToken is rejected
+    const boundHash = sha256Hex('device-wangjie-1');
+    const hashReplayBrowse = await app.request(
+      `/api/doc-shares/external/${created.shareToken}/browse?deviceToken=${boundHash}`,
+    );
+    expect(hashReplayBrowse.status).toBe(403);
 
     // 4. Forwarded link opened on a 2nd device ("device-stranger-2") -> 403 device_locked_to_another_device even with correct accessCode!
     const secondDeviceRes = await app.request(`/api/doc-shares/external/${created.shareToken}/verify`, {
@@ -913,40 +1057,146 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
     expect(afterRevokeRes.status).toBe(403);
   });
 
-  it('Scheme 2: supports keyless Google / GitHub Auth Relay redirect and signed callback session creation', async () => {
-    // 1. Initiate Auth Relay for Google when GOOGLE_CLIENT_ID is not configured on self-hosted server
+  it('Scheme 2: supports keyless Google / GitHub Auth Relay across independent self-hosted and central instances with state cookie, audience/issuer check, and one-time jti consumption (F5)', async () => {
+    // Build an independent Central Auth Relay server instance with its own signing key (CENTRAL_JWT_KEY !== JWT_KEY)
+    const centralStore = createInMemoryDb();
+    const centralApp = buildApp(
+      makeEnv(centralStore.db, {
+        JWT_SIGNING_KEY: CENTRAL_JWT_KEY,
+        SERVER_URL: 'https://app.im.codes',
+        GOOGLE_CLIENT_ID: 'central-google-client-id',
+        GOOGLE_CLIENT_SECRET: 'central-google-client-secret',
+        GITHUB_CLIENT_ID: 'central-github-client-id',
+        GITHUB_CLIENT_SECRET: 'central-github-client-secret',
+      }),
+    );
+
+    const originalFetch = globalThis.fetch;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const urlStr = String(input);
+        if (urlStr.startsWith('https://app.im.codes/')) {
+          return centralApp.request(urlStr, init);
+        }
+        if (urlStr === 'https://oauth2.googleapis.com/token') {
+          return new Response(JSON.stringify({ access_token: 'google-oauth-token-123' }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        if (urlStr === 'https://www.googleapis.com/oauth2/v2/userinfo') {
+          return new Response(
+            JSON.stringify({
+              id: 'google-uid-999',
+              email: 'partner@example.com',
+              name: 'External Partner',
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          );
+        }
+        return originalFetch(input, init);
+      }),
+    );
+
+    // Owner creates an external share on self-hosted instance so Auth Relay login can auto-bind to it
+    const shareRes = await app.request('/api/server/srv-1/doc-shares', {
+      method: 'POST',
+      headers: {
+        Authorization: bearer('owner-1'),
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        targetKind: 'file',
+        targetPath: '/team/shared/spec.docx',
+        shareMode: 'external_link',
+        role: 'editor',
+        allowDownload: true,
+      }),
+    });
+    const { shareToken } = (await shareRes.json()) as { shareToken: string };
+
+    // 1. Self-hosted instance initiates Auth Relay for Google (no GOOGLE_CLIENT_ID on self-hosted)
     const startRes = await app.request(
-      '/api/doc-shares/auth-relay/google?shareToken=tok_123&redirect=%2Fdoc-share%2Ftok_123',
+      `/api/doc-shares/auth-relay/google?shareToken=${encodeURIComponent(shareToken)}&redirect=${encodeURIComponent(`/doc-share/${shareToken}`)}`,
     );
     expect(startRes.status).toBe(302);
-    const location = startRes.headers.get('location') ?? '';
-    expect(location).toContain('https://app.im.codes/api/auth/google');
-    const urlObj = new URL(location);
-    const state = urlObj.searchParams.get('state') ?? '';
-    expect(state).toBeTruthy();
+    const setCookieHeader = startRes.headers.get('set-cookie') ?? '';
+    const stateCookieMatch = setCookieHeader.match(/doc_oauth_state=([^;]+)/);
+    expect(stateCookieMatch).not.toBeNull();
+    const stateCookiePair = `doc_oauth_state=${stateCookieMatch![1]}`;
 
-    // 2. Central Auth Relay redirects back with signed relay_token
-    const relayToken = signJwt(
+    const centralStartLocation = startRes.headers.get('location') ?? '';
+    expect(centralStartLocation).toContain('https://app.im.codes/api/auth/google');
+
+    // 2. Browser follows redirect to Central Auth Relay (/api/auth/google)
+    const centralStartRes = await centralApp.request(centralStartLocation);
+    expect(centralStartRes.status).toBe(302);
+    const googleAuthUrl = new URL(centralStartRes.headers.get('location') ?? '');
+    expect(googleAuthUrl.origin).toBe('https://accounts.google.com');
+    const centralState = googleAuthUrl.searchParams.get('state') ?? '';
+    expect(centralState).toBeTruthy();
+
+    // 3. Google redirects back to Central Auth Relay (/api/auth/google/callback)
+    const centralCbRes = await centralApp.request(
+      `https://app.im.codes/api/auth/google/callback?code=google_code_abc&state=${encodeURIComponent(centralState)}`,
+    );
+    expect(centralCbRes.status).toBe(302);
+    const selfHostedCbLocation = centralCbRes.headers.get('location') ?? '';
+    expect(selfHostedCbLocation).toContain('https://im.example.com/api/doc-shares/auth-relay/callback');
+    const selfHostedCbUrl = new URL(selfHostedCbLocation);
+    const relayToken = selfHostedCbUrl.searchParams.get('relay_token') ?? '';
+    const clientState = selfHostedCbUrl.searchParams.get('state') ?? '';
+
+    // 4a. Negative: Callback without doc_oauth_state cookie is rejected (400 state_mismatch)
+    const noCookieCbRes = await app.request(
+      `${selfHostedCbUrl.pathname}${selfHostedCbUrl.search}`,
+    );
+    expect(noCookieCbRes.status).toBe(400);
+
+    // 4b. Negative: Forged token signed with self-hosted JWT_KEY instead of CENTRAL_JWT_KEY is rejected (401)
+    const forgedToken = signJwt(
       {
-        type: 'doc-auth-relay',
+        type: 'doc-auth-relay-ticket',
+        iss: 'https://app.im.codes',
+        aud: 'https://im.example.com',
+        jti: 'forged-jti',
         provider: 'google',
-        platformId: 'google-uid-999',
-        email: 'partner@example.com',
-        name: 'External Partner',
+        externalId: 'attacker-1',
+        stateHash: sha256Hex(clientState),
       },
       JWT_KEY,
-      300,
+      120,
     );
+    const forgedCbRes = await app.request(
+      `/api/doc-shares/auth-relay/callback?state=${encodeURIComponent(clientState)}&relay_token=${encodeURIComponent(forgedToken)}`,
+      { headers: { Cookie: stateCookiePair } },
+    );
+    expect(forgedCbRes.status).toBe(401);
 
+    // 5. Positive: Valid callback with state cookie verifies relay_token against Central /api/auth/relay/verify and issues scoped session
     const callbackRes = await app.request(
-      `/api/doc-shares/auth-relay/callback?state=${encodeURIComponent(state)}&relay_token=${encodeURIComponent(relayToken)}`,
+      `${selfHostedCbUrl.pathname}${selfHostedCbUrl.search}`,
+      { headers: { Cookie: stateCookiePair } },
     );
     expect(callbackRes.status).toBe(302);
-    expect(callbackRes.headers.get('location')).toBe('/doc-share/tok_123');
-    expect(callbackRes.headers.get('set-cookie')).toContain('rcc_session=');
+    expect(callbackRes.headers.get('location')).toBe(`/doc-share/${shareToken}`);
+    const cbCookies = callbackRes.headers.get('set-cookie') ?? '';
+    expect(cbCookies).toContain('rcc_session=');
+    const sessionMatch = cbCookies.match(/rcc_session=([^;]+)/);
+    const sessionJwt = sessionMatch![1];
+    const verifiedSession = verifyJwt(sessionJwt, JWT_KEY);
+    expect(verifiedSession?.scope).toBe('doc_collaborator');
+
+    // 6. Negative: Replaying the same relay_token a second time is rejected (401 relay_token_replayed)
+    const replayCbRes = await app.request(
+      `${selfHostedCbUrl.pathname}${selfHostedCbUrl.search}`,
+      { headers: { Cookie: stateCookiePair } },
+    );
+    expect(replayCbRes.status).toBe(401);
   });
 
-  it('Scheme 3: redeems one-time Magic Link atomically, issues collaborator session, and rejects second redemption', async () => {
+  it('Scheme 3: redeems one-time Magic Link atomically, issues scoped collaborator session, rejects unredeemed magic link on external browse/config, and rejects second redemption (F2 + F3a)', async () => {
     const createRes = await app.request('/api/server/srv-1/doc-shares', {
       method: 'POST',
       headers: {
@@ -964,6 +1214,23 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
     });
     expect(createRes.status).toBe(201);
     const { shareToken } = (await createRes.json()) as { shareToken: string };
+
+    // F2: Unredeemed magic_invite token cannot be used directly on /external/:token/verify, /external/:token/browse, or /onlyoffice/config
+    const unredeemedVerify = await app.request(`/api/doc-shares/external/${shareToken}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceToken: 'dev-1' }),
+    });
+    expect(unredeemedVerify.status).toBe(403);
+    expect(await unredeemedVerify.json()).toMatchObject({ error: 'magic_invite_requires_redemption' });
+
+    const unredeemedBrowse = await app.request(`/api/doc-shares/external/${shareToken}/browse`);
+    expect(unredeemedBrowse.status).toBe(403);
+
+    const unredeemedOo = await app.request(
+      `/api/server/srv-1/onlyoffice/config?path=${encodeURIComponent('/team/shared/spec.docx')}&shareToken=${shareToken}`,
+    );
+    expect(unredeemedOo.status).toBe(403);
 
     // 1st redemption succeeds
     const redeem1 = await app.request(`/api/doc-shares/magic-invite/${shareToken}/redeem`, {
@@ -997,9 +1264,23 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
     expect(sharedWithMeRes.status).toBe(200);
     const sharedList = (await sharedWithMeRes.json()) as { shares: Array<{ targetPath: string }> };
     expect(sharedList.shares.map((s) => s.targetPath)).toContain('/team/shared/spec.docx');
+
+    // Refreshing a collaborator session preserves scope: 'doc_collaborator'
+    const setCookies = redeem1.headers.get('set-cookie') ?? '';
+    const refreshMatch = setCookies.match(/rcc_refresh=([^;]+)/);
+    expect(refreshMatch).not.toBeNull();
+    const refreshRes = await app.request('/api/auth/refresh', {
+      method: 'POST',
+      headers: { Cookie: `rcc_refresh=${refreshMatch![1]}` },
+    });
+    expect(refreshRes.status).toBe(200);
+    const refreshedSessionMatch = (refreshRes.headers.get('set-cookie') ?? '').match(/rcc_session=([^;]+)/);
+    expect(refreshedSessionMatch).not.toBeNull();
+    const refreshedClaims = verifyJwt(refreshedSessionMatch![1], JWT_KEY);
+    expect(refreshedClaims?.scope).toBe('doc_collaborator');
   });
 
-  it('streams file to ONLYOFFICE, writes back edited bytes on callback status=2, and creates valid blank .docx/.xlsx/.pptx/.md', async () => {
+  it('streams file to ONLYOFFICE, writes back edited bytes on callback status=2, enforces live overrides & callback claim/SSRF guards, and creates valid blank .docx/.xlsx/.pptx/.md (F3c + F4 + F8)', async () => {
     // 1. Get ONLYOFFICE config as owner
     const cfgRes = await app.request(
       `/api/server/srv-1/onlyoffice/config?path=${encodeURIComponent('/team/shared/spec.docx')}&mode=edit`,
@@ -1022,14 +1303,14 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
     expect(docUrl.searchParams.get('serverId')).toBe('srv-1');
     expect(cbUrl.searchParams.get('serverId')).toBe('srv-1');
 
-    // Verify deterministic collaborative key
-    const keyA = getOnlyOfficeDocumentKey('srv-1', '/team/shared/spec.docx');
-    const keyB = getOnlyOfficeDocumentKey('srv-1', '/team/shared/spec.docx');
-    expect(keyA).toBe(keyB);
-    expect(cfgJson.config.document.key).toBe(keyA);
-    bumpOnlyOfficeDocumentRevision('srv-1', '/team/shared/spec.docx');
-    const keyAfterSave = getOnlyOfficeDocumentKey('srv-1', '/team/shared/spec.docx');
-    expect(keyA).not.toBe(keyAfterSave);
+    // Concurrent open by another editor yields the exact same document.key
+    const cfgRes2 = await app.request(
+      `/api/server/srv-1/onlyoffice/config?path=${encodeURIComponent('/team/shared/spec.docx')}&mode=edit`,
+      { headers: { Authorization: bearer('owner-1') } },
+    );
+    const cfgJson2 = (await cfgRes2.json()) as typeof cfgJson;
+    expect(cfgJson2.config.document.key).toBe(cfgJson.config.document.key);
+    const initialKey = cfgJson.config.document.key;
 
     // Verify ONLYOFFICE JWT token is valid
     const verifiedJwt = verifyJwt(cfgJson.token, 'onlyoffice-jwt-secret-key-test!!');
@@ -1067,18 +1348,61 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
     });
     expect(unauthCbRes.status).toBe(401);
 
-    const callbackPayload = {
+    // F4a: Rejects replaying the browser editor_config JWT on the callback endpoint (401)
+    const replayEditorJwtRes = await app.request(`${cbUrl.pathname}${cbUrl.search}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        status: 2,
+        url: 'https://im.example.com/onlyoffice/cache/files/edited.docx',
+        token: cfgJson.token,
+      }),
+    });
+    expect(replayEditorJwtRes.status).toBe(401);
+
+    // F4b: Rejects unsigned body tampering of url when JWT signed a different url (401)
+    const signedCbClaims = {
       status: 2,
       url: 'https://im.example.com/onlyoffice/cache/files/edited.docx',
+      key: initialKey,
     };
-    const cbJwt = signJwt(callbackPayload, 'onlyoffice-jwt-secret-key-test!!', 300);
+    const validCbJwt = signJwt(signedCbClaims, 'onlyoffice-jwt-secret-key-test!!', 300);
+    const tamperedBodyRes = await app.request(`${cbUrl.pathname}${cbUrl.search}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        status: 2,
+        url: 'https://evil.example.com/payload.docx',
+        key: initialKey,
+        token: validCbJwt,
+      }),
+    });
+    expect(tamperedBodyRes.status).toBe(401);
 
+    // F4c: Rejects SSRF downloadUrl pointing outside ONLYOFFICE origin (400)
+    const ssrfClaims = {
+      status: 2,
+      url: 'http://169.254.169.254/latest/meta-data/iam',
+      key: initialKey,
+    };
+    const ssrfJwt = signJwt(ssrfClaims, 'onlyoffice-jwt-secret-key-test!!', 300);
+    const ssrfRes = await app.request(`${cbUrl.pathname}${cbUrl.search}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...ssrfClaims,
+        token: ssrfJwt,
+      }),
+    });
+    expect(ssrfRes.status).toBe(400);
+
+    // Valid callback succeeds and writes binary bytes atomically
     const cbRes = await app.request(`${cbUrl.pathname}${cbUrl.search}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        ...callbackPayload,
-        token: cbJwt,
+        ...signedCbClaims,
+        token: validCbJwt,
       }),
     });
     expect(cbRes.status).toBe(200);
@@ -1087,11 +1411,84 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
       Buffer.from(virtualFiles.get('/team/shared/spec.docx')!.content, 'base64').toString('utf8'),
     ).toBe('PK\x03\x04updated-collaborative-docx-bytes');
 
+    // F8: After save, opening the document again produces a new content-derived key, and survives process restart
+    const afterSaveCfgRes = await app.request(
+      `/api/server/srv-1/onlyoffice/config?path=${encodeURIComponent('/team/shared/spec.docx')}&mode=edit`,
+      { headers: { Authorization: bearer('owner-1') } },
+    );
+    const afterSaveKey = ((await afterSaveCfgRes.json()) as typeof cfgJson).config.document.key;
+    expect(afterSaveKey).not.toBe(initialKey);
+
+    resetOnlyOfficeDocumentKeyCacheForTests();
+    const afterRestartCfgRes = await app.request(
+      `/api/server/srv-1/onlyoffice/config?path=${encodeURIComponent('/team/shared/spec.docx')}&mode=edit`,
+      { headers: { Authorization: bearer('owner-1') } },
+    );
+    const afterRestartKey = ((await afterRestartCfgRes.json()) as typeof cfgJson).config.document.key;
+    expect(afterRestartKey).toBe(afterSaveKey);
+    expect(afterRestartKey).not.toBe(initialKey);
+
+    // F8: Replaying a stale callback with initialKey now fails with 409 stale_document_key
+    const staleCbRes = await app.request(`${cbUrl.pathname}${cbUrl.search}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...signedCbClaims,
+        token: validCbJwt,
+      }),
+    });
+    expect(staleCbRes.status).toBe(409);
+
+    // F3c: Live permission downgrade (child file override to viewer) immediately blocks callback write from an older folder editor token
+    await app.request('/api/server/srv-1/doc-shares', {
+      method: 'POST',
+      headers: { Authorization: bearer('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetKind: 'folder',
+        targetPath: '/team/shared',
+        shareMode: 'user',
+        targetUser: 'bob',
+        role: 'editor',
+      }),
+    });
+    const bobCfgRes = await app.request(
+      `/api/server/srv-1/onlyoffice/config?path=${encodeURIComponent('/team/shared/spec.docx')}&mode=edit`,
+      { headers: { Authorization: bearer('user-bob') } },
+    );
+    const bobCfg = (await bobCfgRes.json()) as typeof cfgJson;
+    const bobCbUrl = new URL(bobCfg.config.editorConfig.callbackUrl);
+
+    // Owner now downgrades Bob on /team/shared/spec.docx to viewer
+    await app.request('/api/server/srv-1/doc-shares', {
+      method: 'POST',
+      headers: { Authorization: bearer('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetKind: 'file',
+        targetPath: '/team/shared/spec.docx',
+        shareMode: 'user',
+        targetUser: 'bob',
+        role: 'viewer',
+      }),
+    });
+    const bobCbClaims = {
+      status: 2,
+      url: 'https://im.example.com/onlyoffice/cache/files/edited.docx',
+      key: bobCfg.config.document.key,
+    };
+    const bobCbRes = await app.request(`${bobCbUrl.pathname}${bobCbUrl.search}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...bobCbClaims,
+        token: signJwt(bobCbClaims, 'onlyoffice-jwt-secret-key-test!!', 300),
+      }),
+    });
+    expect(bobCbRes.status).toBe(403);
+
     // 4. Create blank .docx, .xlsx, .pptx, .md and folder via POST /api/server/srv-1/doc-shares/create-item
     for (const ext of ['.docx', '.xlsx', '.pptx'] as const) {
       const bytes = buildBlankDocumentBytes(ext, 'Quarterly Plan');
       expect(bytes).not.toBeNull();
-      // Valid ZIP header PK\x03\x04
       expect(bytes![0]).toBe(0x50);
       expect(bytes![1]).toBe(0x4b);
       expect(bytes![2]).toBe(0x03);
@@ -1124,5 +1521,281 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
       enabled: false,
       fallbackReason: 'onlyoffice_disabled',
     });
+  });
+
+  it('audit: callback writeback fails closed when daemon upload fails and does not overwrite binary docx with utf8 JSON', async () => {
+    const cfgRes = await app.request(
+      `/api/server/srv-1/onlyoffice/config?path=${encodeURIComponent('/team/shared/spec.docx')}&mode=edit`,
+      { headers: { Authorization: bearer('owner-1') } },
+    );
+    expect(cfgRes.status).toBe(200);
+    const cfgJson = (await cfgRes.json()) as {
+      config: { editorConfig: { callbackUrl: string } };
+    };
+    const cbUrl = new URL(cfgJson.config.editorConfig.callbackUrl);
+
+    const bridge = WsBridge.get('srv-1');
+    vi.spyOn(bridge, 'sendFileTransferRequest').mockResolvedValue({
+      type: 'file.upload_response',
+      status: 'error',
+      error: 'Upload path is not allowed',
+    });
+
+    const updatedBytes = Buffer.from([0x50, 0x4b, 0x03, 0x04, 0xff, 0xd8, 0x00, 0x89]);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(updatedBytes, { status: 200 })),
+    );
+
+    const callbackPayload = {
+      status: 2,
+      url: 'https://im.example.com/onlyoffice/cache/files/edited.docx',
+    };
+    const cbJwt = signJwt(callbackPayload, 'onlyoffice-jwt-secret-key-test!!', 300);
+
+    const cbRes = await app.request(`${cbUrl.pathname}${cbUrl.search}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...callbackPayload,
+        token: cbJwt,
+      }),
+    });
+
+    expect(cbRes.status).toBe(502);
+    expect(virtualFiles.get('/team/shared/spec.docx')).toMatchObject({
+      content: Buffer.from('PK\x03\x04mock-docx-bytes').toString('base64'),
+      encoding: 'base64',
+    });
+  });
+
+  it('audit: external share with accessCode requires code verification before ONLYOFFICE config or folder browse when deviceLockEnabled is false', async () => {
+    const createRes = await app.request('/api/server/srv-1/doc-shares', {
+      method: 'POST',
+      headers: {
+        Authorization: bearer('owner-1'),
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        targetKind: 'folder',
+        targetPath: '/team/shared',
+        shareMode: 'external_link',
+        participantLabel: '外部顾问',
+        accessCode: '8848',
+        deviceLockEnabled: false,
+        role: 'editor',
+        allowDownload: true,
+      }),
+    });
+    expect(createRes.status).toBe(201);
+    const created = (await createRes.json()) as { shareToken: string };
+
+    const unverifiedBrowseRes = await app.request(
+      `/api/doc-shares/external/${created.shareToken}/browse`,
+    );
+    expect(unverifiedBrowseRes.status).toBe(403);
+
+    const unverifiedOoRes = await app.request(
+      `/api/server/srv-1/onlyoffice/config?path=${encodeURIComponent('/team/shared/spec.docx')}&shareToken=${created.shareToken}`,
+    );
+    expect(unverifiedOoRes.status).toBe(403);
+  });
+
+  it('audit: magic invite collaborator session is scoped to shared documents and cannot access full internal server routes', async () => {
+    const createRes = await app.request('/api/server/srv-1/doc-shares', {
+      method: 'POST',
+      headers: {
+        Authorization: bearer('owner-1'),
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        targetKind: 'file',
+        targetPath: '/team/shared/spec.docx',
+        shareMode: 'magic_invite',
+        participantLabel: '外部访客',
+        role: 'editor',
+        allowDownload: true,
+      }),
+    });
+    expect(createRes.status).toBe(201);
+    const { shareToken } = (await createRes.json()) as { shareToken: string };
+
+    const redeem = await app.request(`/api/doc-shares/magic-invite/${shareToken}/redeem`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ displayName: '外部访客' }),
+    });
+    expect(redeem.status).toBe(200);
+    const { sessionToken } = (await redeem.json()) as { sessionToken: string };
+
+    const serverListRes = await app.request('/api/server', {
+      headers: { Authorization: `Bearer ${sessionToken}` },
+    });
+    expect(serverListRes.status).toBe(403);
+
+    const createKeyRes = await app.request('/api/auth/user/me/keys', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${sessionToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ label: 'escalated-key' }),
+    });
+    expect(createKeyRes.status).toBe(403);
+
+    const wsTicketRes = await app.request('/api/auth/ws-ticket', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${sessionToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ serverId: 'srv-1' }),
+    });
+    expect(wsTicketRes.status).toBe(403);
+  });
+});
+
+describe('Real Daemon CommandHandler Integration: Atomic Binary Save & Symlink Escape Prevention (F1 + F3d)', () => {
+  let tmpRoot: string;
+  let sharedDir: string;
+  let outsideDir: string;
+
+  beforeEach(() => {
+    __resetFsGitCachesForTests();
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'imcodes-oo-real-daemon-'));
+    sharedDir = path.join(tmpRoot, 'shared');
+    outsideDir = path.join(tmpRoot, 'outside');
+    fs.mkdirSync(sharedDir, { recursive: true });
+    fs.mkdirSync(outsideDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    __resetFsGitCachesForTests();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  function dispatchRealDaemon(cmd: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return new Promise((resolve) => {
+      const fakeServerLink = {
+        send(msg: Record<string, unknown>) {
+          resolve(msg);
+        },
+      } as unknown as ServerLink;
+      handleWebCommand(cmd, fakeServerLink);
+    });
+  }
+
+  it('F1: atomically overwrites existing binary .docx via staged file.upload + fs.rename(overwrite=true) and preserves original bytes on failure', async () => {
+    const targetDocx = path.join(sharedDir, 'contract.docx');
+    const originalBytes = Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x11, 0x22, 0x33, 0x44]);
+    fs.writeFileSync(targetDocx, originalBytes);
+
+    // 1. Stage new binary bytes via real file.upload handler
+    const newBytes = Buffer.from([0x50, 0x4b, 0x03, 0x04, 0xaa, 0xbb, 0xcc, 0xdd, 0xff]);
+    const stageName = '.oo-stage-test1234-contract.docx';
+    const uploadReply = await dispatchRealDaemon({
+      type: 'file.upload',
+      uploadId: 'up-1',
+      filename: `up-1-${stageName}`,
+      destinationDirectory: sharedDir,
+      originalName: stageName,
+      sanitizedName: stageName,
+      content: newBytes.toString('base64'),
+      size: newBytes.byteLength,
+    });
+    expect(uploadReply.error).toBeUndefined();
+    expect(uploadReply.type).toBe('file.upload_done');
+    expect(uploadReply.attachment).toBeTruthy();
+
+    // Original file is still untouched before atomic rename commit
+    expect(fs.readFileSync(targetDocx).equals(originalBytes)).toBe(true);
+
+    // 2. Commit via real fs.rename with overwrite: true and allowedRoot: targetDocx
+    const stagePath = path.join(sharedDir, stageName);
+    const renameReply = await dispatchRealDaemon({
+      type: 'fs.rename',
+      requestId: 'ren-1',
+      path: stagePath,
+      newPath: targetDocx,
+      overwrite: true,
+      allowedRoot: targetDocx,
+    });
+    expect(renameReply.status).toBe('ok');
+    expect(fs.existsSync(stagePath)).toBe(false);
+    expect(fs.readFileSync(targetDocx).equals(newBytes)).toBe(true);
+
+    // 3. Base64 fs.write atomic overwrite also preserves binary bytes and rejects symlinks
+    const writeBytes = Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x99, 0x88, 0x77]);
+    const writeReply = await dispatchRealDaemon({
+      type: 'fs.write',
+      requestId: 'wr-1',
+      path: targetDocx,
+      content: writeBytes.toString('base64'),
+      encoding: 'base64',
+      allowedRoot: sharedDir,
+    });
+    expect(writeReply.status).toBe('ok');
+    expect(fs.readFileSync(targetDocx).equals(writeBytes)).toBe(true);
+  });
+
+  it('F3d: enforces allowedRoot and blocks symlink escapes on fs.read, fs.ls, fs.write, and fs.rename', async () => {
+    const insideFile = path.join(sharedDir, 'legit.docx');
+    const outsideSecret = path.join(outsideDir, 'secret.docx');
+    fs.writeFileSync(insideFile, 'legit-content');
+    fs.writeFileSync(outsideSecret, 'top-secret-outside');
+
+    // Create symlinks inside sharedDir pointing to outsideSecret and outsideDir
+    const symlinkFile = path.join(sharedDir, 'escape-file.docx');
+    const symlinkDir = path.join(sharedDir, 'escape-dir');
+    fs.symlinkSync(outsideSecret, symlinkFile);
+    fs.symlinkSync(outsideDir, symlinkDir);
+
+    // 1. fs.read on symlink escaping allowedRoot is rejected with forbidden_path
+    const readEscape = await dispatchRealDaemon({
+      type: 'fs.read',
+      requestId: 'rd-escape',
+      path: symlinkFile,
+      allowedRoot: sharedDir,
+    });
+    expect(readEscape.status).toBe('error');
+    expect(readEscape.error).toBe('forbidden_path');
+
+    // 2. fs.ls on sharedDir with allowedRoot filters out symlinks that escape sharedDir
+    const lsShared = await dispatchRealDaemon({
+      type: 'fs.ls',
+      requestId: 'ls-shared',
+      path: sharedDir,
+      includeFiles: true,
+      allowedRoot: sharedDir,
+    });
+    expect(lsShared.status).toBe('ok');
+    const entryNames = (lsShared.entries as Array<{ name: string }>).map((e) => e.name);
+    expect(entryNames).toContain('legit.docx');
+    expect(entryNames).not.toContain('escape-file.docx');
+    expect(entryNames).not.toContain('escape-dir');
+
+    // 3. fs.ls directly on symlinkDir with allowedRoot is rejected with forbidden_path
+    const lsEscapeDir = await dispatchRealDaemon({
+      type: 'fs.ls',
+      requestId: 'ls-escape-dir',
+      path: symlinkDir,
+      includeFiles: true,
+      allowedRoot: sharedDir,
+    });
+    expect(lsEscapeDir.status).toBe('error');
+    expect(lsEscapeDir.error).toBe('forbidden_path');
+
+    // 4. fs.write on symlinkFile is rejected with forbidden_path and outsideSecret is untouched
+    const writeEscape = await dispatchRealDaemon({
+      type: 'fs.write',
+      requestId: 'wr-escape',
+      path: symlinkFile,
+      content: Buffer.from('hacked').toString('base64'),
+      encoding: 'base64',
+      allowedRoot: sharedDir,
+    });
+    expect(writeEscape.status).toBe('error');
+    expect(writeEscape.error).toBe('forbidden_path');
+    expect(fs.readFileSync(outsideSecret, 'utf8')).toBe('top-secret-outside');
   });
 });
