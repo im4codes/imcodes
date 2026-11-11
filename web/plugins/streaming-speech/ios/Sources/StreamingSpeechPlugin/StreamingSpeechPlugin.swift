@@ -163,7 +163,17 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
             self.decodeAvailable(decoder)
             let text = self.join(self.committed, decoder.text.trimmingCharacters(in: .whitespacesAndNewlines))
             if text != self.lastText { self.emitText(text, final: false); self.lastText = text }
-            if decoder.isEndpoint() { self.committed = text; decoder.reset() }
+            if decoder.isEndpoint() {
+                if decoder.startNextStream() { self.committed = text }
+                else {
+                    DispatchQueue.main.async {
+                        if self.isCurrent(owner) {
+                            self.notifyListeners("recognitionError", data: ["message": "Offline speech could not continue"])
+                            self.endCapture(nil)
+                        }
+                    }
+                }
+            }
         }
     }
     private func decodeAvailable(_ decoder: SpeechDecoder) {
@@ -212,7 +222,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
 // instead of force-unwrapping it and crashing the app. Worker-thread owned.
 private final class SpeechDecoder {
     let recognizer: OpaquePointer
-    let stream: OpaquePointer
+    private(set) var stream: OpaquePointer
     init?(config: UnsafePointer<SherpaOnnxOnlineRecognizerConfig>) {
         guard let recognizer = SherpaOnnxCreateOnlineRecognizer(config) else { return nil }
         guard let stream = SherpaOnnxCreateOnlineStream(recognizer) else {
@@ -230,7 +240,12 @@ private final class SpeechDecoder {
     func inputFinished() { SherpaOnnxOnlineStreamInputFinished(stream) }
     func isReady() -> Bool { SherpaOnnxIsOnlineStreamReady(recognizer, stream) != 0 }
     func decode() { SherpaOnnxDecodeOnlineStream(recognizer, stream) }
-    func reset() { SherpaOnnxOnlineStreamReset(recognizer, stream) }
+    func startNextStream() -> Bool {
+        guard let next = SherpaOnnxCreateOnlineStream(recognizer) else { return false }
+        SherpaOnnxDestroyOnlineStream(stream)
+        stream = next
+        return true
+    }
     func isEndpoint() -> Bool { SherpaOnnxOnlineStreamIsEndpoint(recognizer, stream) != 0 }
     var text: String {
         guard let result = SherpaOnnxGetOnlineStreamResult(recognizer, stream) else { return "" }

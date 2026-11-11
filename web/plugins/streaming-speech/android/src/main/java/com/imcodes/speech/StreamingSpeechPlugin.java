@@ -126,8 +126,12 @@ public class StreamingSpeechPlugin extends Plugin {
                 String full = join(committed, text);
                 if (!full.equals(last)) { partial(full, false); last = full; }
                 if (recognizer.isEndpoint(stream)) {
+                    // Reset keeps transducer encoder context; a fresh stream prevents
+                    // the next utterance from losing its first words after a pause.
+                    OnlineStream next = recognizer.createStream("");
+                    stream.release();
+                    stream = next;
                     committed = full;
-                    recognizer.reset(stream);
                 }
             }
         } catch (Exception | LinkageError e) {

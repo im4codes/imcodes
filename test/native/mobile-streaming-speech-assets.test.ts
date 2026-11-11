@@ -31,6 +31,10 @@ describe('shared mobile model preparation', () => {
     expect(ios).toContain('hotwordsScore: 2.0');
     expect(android).toContain('new float[SAMPLE_RATE]');
     expect(ios).toContain('count: 16000');
+    expect(android).toContain('OnlineStream next = recognizer.createStream("")');
+    expect(android).not.toContain('recognizer.reset(stream)');
+    expect(ios).toContain('func startNextStream() -> Bool');
+    expect(ios).not.toContain('SherpaOnnxOnlineStreamReset(');
     expect(android).not.toContain('getParaformer()');
     expect(ios).not.toContain('sherpaOnnxOnlineParaformerModelConfig(');
   });
