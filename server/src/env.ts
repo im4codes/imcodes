@@ -18,6 +18,19 @@ export interface EnvConfig {
   GITHUB_CLIENT_ID?: string;
   GITHUB_CLIENT_SECRET?: string;
 
+  // Google OAuth (optional — falls back to AUTH_RELAY_URL if absent)
+  GOOGLE_CLIENT_ID?: string;
+  GOOGLE_CLIENT_SECRET?: string;
+
+  // Auth relay for key-free Google/GitHub login on self-hosted servers (default: https://app.im.codes)
+  AUTH_RELAY_URL?: string;
+
+  // ONLYOFFICE Document Server integration (optional)
+  ONLYOFFICE_ENABLED?: string;
+  ONLYOFFICE_JWT_SECRET?: string;
+  ONLYOFFICE_PUBLIC_URL?: string;
+  ONLYOFFICE_INTERNAL_URL?: string;
+
   // Server URL (used to build webhook URLs)
   SERVER_URL: string;
 
@@ -121,6 +134,13 @@ export function loadEnv(): EnvConfig {
     BOT_ENCRYPTION_KEY: process.env.BOT_ENCRYPTION_KEY ?? '',
     GITHUB_CLIENT_ID: process.env.GITHUB_CLIENT_ID,
     GITHUB_CLIENT_SECRET: process.env.GITHUB_CLIENT_SECRET,
+    GOOGLE_CLIENT_ID: process.env.GOOGLE_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET,
+    AUTH_RELAY_URL: process.env.AUTH_RELAY_URL ?? 'https://app.im.codes',
+    ONLYOFFICE_ENABLED: process.env.ONLYOFFICE_ENABLED,
+    ONLYOFFICE_JWT_SECRET: process.env.ONLYOFFICE_JWT_SECRET,
+    ONLYOFFICE_PUBLIC_URL: process.env.ONLYOFFICE_PUBLIC_URL,
+    ONLYOFFICE_INTERNAL_URL: process.env.ONLYOFFICE_INTERNAL_URL ?? 'http://onlyoffice:80',
     SERVER_URL: process.env.SERVER_URL ?? `http://localhost:${process.env.PORT ?? 19138}`,
     ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS,
     TRUSTED_PROXIES: process.env.TRUSTED_PROXIES,

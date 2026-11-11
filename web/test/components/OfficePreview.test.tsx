@@ -4,6 +4,13 @@
 import { cleanup, render, waitFor } from '@testing-library/preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string, fallback?: string) => (typeof fallback === 'string' ? fallback : key),
+    i18n: { language: 'en' },
+  }),
+}));
+
 /** OfficePreview fetches its bytes from the chunked download URL. */
 function installFetchStub(bytes = new Uint8Array([0, 0]).buffer): void {
   vi.stubGlobal('fetch', vi.fn(async () => ({
@@ -220,5 +227,142 @@ describe('OfficePreview — XLSX sanitization', () => {
 
     await waitFor(() => expect(container.textContent).toContain('hello'));
     expect(container.textContent).toContain('42');
+  });
+});
+
+describe('OfficePreview — Embedded ONLYOFFICE & permission controls', () => {
+  const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+
+  afterEach(() => {
+    cleanup();
+    delete (window as unknown as { DocsAPI?: unknown }).DocsAPI;
+    vi.unstubAllGlobals();
+  });
+
+  it('mounts DocsAPI.DocEditor when ONLYOFFICE is enabled, enforces allowDownload, and supports view/edit mode toggle', async () => {
+    const docEditorSpy = vi.fn().mockImplementation(() => ({
+      destroyEditor: vi.fn(),
+    }));
+    (window as unknown as { DocsAPI: { DocEditor: typeof docEditorSpy } }).DocsAPI = {
+      DocEditor: docEditorSpy,
+    };
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const urlStr = String(input);
+      if (urlStr.includes('/onlyoffice/config')) {
+        const mode = urlStr.includes('mode=view') ? 'view' : 'edit';
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            enabled: true,
+            role: 'editor',
+            allowDownload: false,
+            canManageShare: true,
+            isOwner: true,
+            mode,
+            publicUrl: 'https://im.example.com/onlyoffice',
+            scriptUrl: 'https://im.example.com/onlyoffice/web-apps/apps/api/documents/api.js',
+            docToken: 'doc_tok_123',
+            config: {
+              documentType: 'cell',
+              document: {
+                fileType: 'xlsx',
+                key: 'collab_key_123',
+                title: 'budget.xlsx',
+                url: 'https://im.example.com/api/onlyoffice/file/doc_tok_123?serverId=srv-1',
+                permissions: {
+                  edit: mode === 'edit',
+                  download: false,
+                },
+              },
+              editorConfig: {
+                mode,
+                callbackUrl: 'https://im.example.com/api/onlyoffice/callback/doc_tok_123?serverId=srv-1',
+                user: { id: 'owner-1', name: 'Alice' },
+              },
+              token: 'jwt_123',
+            },
+          }),
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => new Uint8Array([0, 0]).buffer,
+      };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
+    const onOpenShare = vi.fn();
+    const { getByTestId, queryByTestId } = render(
+      <OfficePreview
+        srcUrl="https://example.test/budget.xlsx"
+        mimeType={XLSX_MIME}
+        path="/team/budget.xlsx"
+        serverId="srv-1"
+        onOpenShare={onOpenShare}
+      />,
+    );
+
+    await waitFor(() => expect(getByTestId('onlyoffice-embedded-wrapper')).toBeTruthy());
+    await waitFor(() => expect(docEditorSpy).toHaveBeenCalledTimes(1));
+
+    // Download link must be hidden when allowDownload is false
+    expect(queryByTestId('onlyoffice-download-link')).toBeNull();
+
+    // Share button is visible for owner/canManageShare
+    const shareBtn = getByTestId('onlyoffice-open-share');
+    shareBtn.click();
+    expect(onOpenShare).toHaveBeenCalledTimes(1);
+
+    // Switch from Co-Edit to Preview mode -> re-fetches config with mode=view
+    const viewBtn = getByTestId('onlyoffice-mode-view');
+    viewBtn.click();
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(([u]) => String(u).includes('/onlyoffice/config') && String(u).includes('mode=view')),
+      ).toBe(true),
+    );
+  });
+
+  it('automatically falls back to local preview when ONLYOFFICE is disabled on the server', async () => {
+    xlsxApi.html = '<table><tr><td>local-fallback-cell</td></tr></table>';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const urlStr = String(input);
+        if (urlStr.includes('/onlyoffice/config')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              enabled: false,
+              fallbackReason: 'onlyoffice_disabled',
+              role: 'viewer',
+              allowDownload: true,
+            }),
+          };
+        }
+        return {
+          ok: true,
+          status: 200,
+          arrayBuffer: async () => new Uint8Array([0, 0]).buffer,
+        };
+      }),
+    );
+
+    const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
+    const { container } = render(
+      <OfficePreview
+        srcUrl="https://example.test/budget.xlsx"
+        mimeType={XLSX_MIME}
+        path="/team/budget.xlsx"
+        serverId="srv-1"
+      />,
+    );
+
+    await waitFor(() => expect(container.textContent).toContain('local-fallback-cell'));
   });
 });

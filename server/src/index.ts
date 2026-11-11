@@ -52,6 +52,8 @@ import { sessionMgmtRoutes } from './routes/session-mgmt.js';
 import { subSessionRoutes } from './routes/sub-sessions.js';
 import { discussionRoutes } from './routes/discussions.js';
 import { tabSharingRoutes } from './routes/tab-sharing.js';
+import { onlyofficeRoutes } from './routes/onlyoffice.js';
+import { documentSharingRoutes } from './routes/document-sharing.js';
 import { preferencesRoutes } from './routes/preferences.js';
 import { aliasRoutes } from './routes/aliases.js';
 import { buildAppContentSecurityPolicy } from '../../shared/app-content-security-policy.js';
@@ -277,6 +279,8 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
   // must not sit under a pod-sticky `/api/server/:serverId/...` path.
   app.route('/api', remoteDesktopGuestAccessRoutes);
   app.route('/api', tabSharingRoutes);
+  app.route('/api', onlyofficeRoutes);
+  app.route('/api', documentSharingRoutes);
   app.route('/api', tokenUsageRoutes);
   // Pod-sticky memory routes: serverId is read from the `?serverId=` query
   // string by the ingress for pod routing; the projection-owner resolver

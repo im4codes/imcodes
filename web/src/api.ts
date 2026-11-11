@@ -3168,3 +3168,332 @@ export async function deleteEnterpriseSharedMemory(enterpriseId: string, memoryI
     method: 'DELETE',
   });
 }
+
+// ── ONLYOFFICE & Document Sharing APIs ────────────────────────────────────────
+
+export type DocShareRole = 'viewer' | 'editor';
+export type DocShareMode = 'user' | 'team' | 'external_link' | 'magic_invite';
+export type DocShareTargetKind = 'file' | 'folder';
+
+export interface OnlyOfficeConfigResponse {
+  enabled: boolean;
+  role: DocShareRole;
+  allowDownload: boolean;
+  canManageShare?: boolean;
+  isOwner?: boolean;
+  mode: 'view' | 'edit';
+  publicUrl?: string;
+  scriptUrl?: string;
+  docToken?: string;
+  fileUrl?: string;
+  config?: {
+    documentType: 'word' | 'cell' | 'slide' | 'pdf';
+    document: {
+      fileType: string;
+      key: string;
+      title: string;
+      url: string;
+      permissions: {
+        edit: boolean;
+        download: boolean;
+        print: boolean;
+        copy: boolean;
+        review: boolean;
+        comment: boolean;
+      };
+    };
+    editorConfig: {
+      mode: 'view' | 'edit';
+      callbackUrl: string;
+      lang: string;
+      user: {
+        id: string;
+        name: string;
+      };
+      customization?: Record<string, unknown>;
+    };
+    token: string;
+  };
+}
+
+export interface DocumentShareItem {
+  id: string;
+  serverId: string;
+  targetKind: DocShareTargetKind;
+  targetPath: string;
+  label: string | null;
+  shareMode: DocShareMode;
+  targetUserId: string;
+  targetUsername?: string | null;
+  targetDisplayName?: string | null;
+  participantLabel: string | null;
+  hasAccessCode: boolean;
+  deviceLockEnabled: boolean;
+  isDeviceBound: boolean;
+  redeemedByUserId: string | null;
+  redeemedAt: number | null;
+  role: DocShareRole;
+  allowDownload: boolean;
+  createdBy: string;
+  createdAt: number;
+  updatedAt: number;
+  expiresAt: number | null;
+  revokedAt: number | null;
+}
+
+export interface SharedWithMeDocItem extends DocumentShareItem {
+  serverName: string | null;
+}
+
+export interface ExternalShareView {
+  id: string;
+  serverId: string;
+  targetKind: DocShareTargetKind;
+  targetPath: string;
+  label: string;
+  shareMode: DocShareMode;
+  participantLabel: string | null;
+  hasAccessCode: boolean;
+  deviceLockEnabled: boolean;
+  isDeviceBound: boolean;
+  redeemedAt: number | null;
+  role: DocShareRole;
+  allowDownload: boolean;
+  expiresAt: number | null;
+  revokedAt: number | null;
+}
+
+export interface DocShareBrowseEntry {
+  name: string;
+  path: string;
+  isDir: boolean;
+  size?: number;
+  mtime?: number;
+  role: DocShareRole | null;
+  allowDownload: boolean;
+}
+
+export async function fetchOnlyOfficeConfig(
+  serverId: string,
+  params: {
+    path: string;
+    mode?: 'view' | 'edit';
+    shareToken?: string;
+    deviceToken?: string;
+    lang?: string;
+  },
+): Promise<OnlyOfficeConfigResponse> {
+  const qs = new URLSearchParams({ path: params.path });
+  if (params.mode) qs.set('mode', params.mode);
+  if (params.shareToken) qs.set('shareToken', params.shareToken);
+  if (params.deviceToken) qs.set('deviceToken', params.deviceToken);
+  if (params.lang) qs.set('lang', params.lang);
+  return apiFetch<OnlyOfficeConfigResponse>(
+    `/api/server/${encodeURIComponent(serverId)}/onlyoffice/config?${qs.toString()}`,
+    { method: 'GET' },
+  );
+}
+
+export async function listDocumentShares(
+  serverId: string,
+  targetPath?: string,
+): Promise<{ shares: DocumentShareItem[] }> {
+  const qs = new URLSearchParams();
+  if (targetPath) qs.set('path', targetPath);
+  const query = qs.toString() ? `?${qs.toString()}` : '';
+  return apiFetch<{ shares: DocumentShareItem[] }>(
+    `/api/server/${encodeURIComponent(serverId)}/doc-shares${query}`,
+    { method: 'GET' },
+  );
+}
+
+export async function createDocumentShareApi(
+  serverId: string,
+  body: {
+    targetKind: DocShareTargetKind;
+    targetPath: string;
+    label?: string;
+    shareMode: DocShareMode;
+    targetUser?: string;
+    targetUserId?: string;
+    participantLabel?: string;
+    accessCode?: string;
+    deviceLockEnabled?: boolean;
+    role: DocShareRole;
+    allowDownload?: boolean;
+    expiresAt?: number | null;
+  },
+): Promise<{
+  share: DocumentShareItem;
+  shareToken: string | null;
+  sharePath: string | null;
+  shareUrl: string | null;
+}> {
+  return apiFetch(
+    `/api/server/${encodeURIComponent(serverId)}/doc-shares`,
+    {
+      method: 'POST',
+      body: JSON.stringify(body),
+    },
+  );
+}
+
+export async function updateDocumentShareApi(
+  serverId: string,
+  shareId: string,
+  body: {
+    role?: DocShareRole;
+    allowDownload?: boolean;
+    participantLabel?: string | null;
+    label?: string | null;
+    deviceLockEnabled?: boolean;
+    resetDeviceLock?: boolean;
+    accessCode?: string | null;
+    expiresAt?: number | null;
+  },
+): Promise<{ share: DocumentShareItem }> {
+  return apiFetch(
+    `/api/server/${encodeURIComponent(serverId)}/doc-shares/${encodeURIComponent(shareId)}`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    },
+  );
+}
+
+export async function revokeDocumentShareApi(
+  serverId: string,
+  shareId: string,
+): Promise<{ ok: boolean; share: DocumentShareItem }> {
+  return apiFetch(
+    `/api/server/${encodeURIComponent(serverId)}/doc-shares/${encodeURIComponent(shareId)}`,
+    { method: 'DELETE' },
+  );
+}
+
+export async function verifyExternalDocShare(
+  token: string,
+  body?: {
+    accessCode?: string;
+    deviceToken?: string;
+    passkeyCredentialId?: string;
+  },
+): Promise<{
+  ok: boolean;
+  share: ExternalShareView;
+  deviceToken: string;
+  deviceBound: boolean;
+}> {
+  return apiFetch(`/api/doc-shares/external/${encodeURIComponent(token)}/verify`, {
+    method: 'POST',
+    body: JSON.stringify(body ?? {}),
+  });
+}
+
+export async function browseExternalDocShare(
+  token: string,
+  params?: {
+    path?: string;
+    deviceToken?: string;
+    accessCode?: string;
+  },
+): Promise<{
+  share: ExternalShareView;
+  serverId: string;
+  targetKind: DocShareTargetKind;
+  rootPath: string;
+  path: string;
+  role: DocShareRole;
+  allowDownload: boolean;
+  entries: DocShareBrowseEntry[];
+}> {
+  const qs = new URLSearchParams();
+  if (params?.path) qs.set('path', params.path);
+  if (params?.deviceToken) qs.set('deviceToken', params.deviceToken);
+  if (params?.accessCode) qs.set('accessCode', params.accessCode);
+  const query = qs.toString() ? `?${qs.toString()}` : '';
+  return apiFetch(`/api/doc-shares/external/${encodeURIComponent(token)}/browse${query}`, {
+    method: 'GET',
+  });
+}
+
+export async function redeemMagicInviteDocShare(
+  token: string,
+  body: {
+    displayName: string;
+    accessCode?: string;
+  },
+): Promise<{
+  ok: boolean;
+  userId: string;
+  displayName: string;
+  share: DocumentShareItem;
+  sessionToken: string;
+}> {
+  return apiFetch(`/api/doc-shares/magic-invite/${encodeURIComponent(token)}/redeem`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export async function listDocsSharedWithMe(serverId?: string): Promise<{ shares: SharedWithMeDocItem[] }> {
+  const qs = serverId ? `?serverId=${encodeURIComponent(serverId)}` : '';
+  return apiFetch(`/api/doc-shares/shared-with-me${qs}`, { method: 'GET' });
+}
+
+export async function browseSharedDocFolder(
+  serverId: string,
+  path: string,
+  params?: { shareToken?: string; deviceToken?: string },
+): Promise<{
+  path: string;
+  role: DocShareRole;
+  allowDownload: boolean;
+  canManageShare: boolean;
+  isOwner: boolean;
+  entries: DocShareBrowseEntry[];
+}> {
+  const qs = new URLSearchParams({ path });
+  if (params?.shareToken) qs.set('shareToken', params.shareToken);
+  if (params?.deviceToken) qs.set('deviceToken', params.deviceToken);
+  return apiFetch(
+    `/api/server/${encodeURIComponent(serverId)}/doc-shares/browse?${qs.toString()}`,
+    { method: 'GET' },
+  );
+}
+
+export async function createSharedDocItem(
+  serverId: string,
+  body: {
+    parentDir?: string;
+    name?: string;
+    path?: string;
+    kind: 'file' | 'folder' | 'mkdir';
+    shareToken?: string;
+    deviceToken?: string;
+  },
+): Promise<{
+  ok: boolean;
+  kind: 'file' | 'folder';
+  path: string;
+  ext?: string;
+  size?: number;
+}> {
+  return apiFetch(`/api/server/${encodeURIComponent(serverId)}/doc-shares/create-item`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export function buildDocAuthRelayUrl(
+  provider: 'google' | 'github',
+  shareToken?: string,
+  redirectPath?: string,
+): string {
+  const qs = new URLSearchParams();
+  if (shareToken) qs.set('shareToken', shareToken);
+  if (redirectPath) qs.set('redirect', redirectPath);
+  const query = qs.toString() ? `?${qs.toString()}` : '';
+  return `/api/doc-shares/auth-relay/${provider}${query}`;
+}
+
