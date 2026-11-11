@@ -1291,7 +1291,11 @@ export async function relaunchSessionWithSettings(
   const targetLabel = overrides.label !== undefined ? overrides.label : (record.label ?? null);
   const targetDescription = overrides.description !== undefined ? overrides.description : (record.description ?? null);
   const targetIdentityPrompt = overrides.identityPrompt !== undefined ? overrides.identityPrompt : ((await resolveEffectiveIdentityPrompt(record)) ?? null);
-  const targetRequestedModel = overrides.requestedModel !== undefined ? overrides.requestedModel : (record.requestedModel ?? null);
+  // A model id is provider-scoped. An AG switch without an explicit choice
+  // must use AG's default, not the previous provider's (possibly invalid) id.
+  const enteringAgy = targetAgentType === AGY_SDK_PROVIDER_ID && record.agentType !== AGY_SDK_PROVIDER_ID;
+  const targetRequestedModel = overrides.requestedModel !== undefined ? overrides.requestedModel
+    : enteringAgy ? null : (record.requestedModel ?? null);
   const targetEffort = overrides.effort !== undefined ? overrides.effort : (record.effort ?? null);
   const targetTransportConfig = overrides.transportConfig !== undefined ? overrides.transportConfig : (record.transportConfig ?? null);
   const targetCcPreset = overrides.ccPreset !== undefined ? overrides.ccPreset : (record.ccPreset ?? null);
@@ -3634,9 +3638,11 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   if (agentType === AGY_SDK_PROVIDER_ID && existing?.agentType === AGY_SDK_PROVIDER_ID
     && !opts.fresh && !opts.providerResumeId && !existing.providerResumeId
     && existing.agyNativeSessionState !== AGY_NATIVE_SESSION_STATE.UNSTARTED) {
-    throw new Error('AG conversation requires a trusted resume id; refusing an implicit fresh launch');
+    throw new Error('AG conversation requires a trusted resume id; use Start over (session_restart reset=true) to explicitly create a new conversation. Restart cannot safely resume this session.');
   }
-  const storedRequestedModel = !opts.fresh ? existing?.requestedModel : undefined;
+  const storedRequestedModel = !opts.fresh
+    && (agentType !== AGY_SDK_PROVIDER_ID || existing?.agentType === AGY_SDK_PROVIDER_ID)
+    ? existing?.requestedModel : undefined;
   const storedProviderResumeId = (!opts.fresh && (existing?.providerId ?? existing?.agentType) === agentType)
     ? existing?.providerResumeId
     : undefined;
@@ -3842,7 +3848,8 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   } else if (usesProviderResumeId(agentType)) {
     effectiveSessionKey = randomUUID();
     effectiveBindExistingKey = undefined;
-    transportResumeId = opts.providerResumeId ?? storedProviderResumeId;
+    transportResumeId = agentType === AGY_SDK_PROVIDER_ID && opts.fresh
+      ? undefined : opts.providerResumeId ?? storedProviderResumeId;
     // providerSessionId is only an IM.codes route key for this family. Durable
     // continuity comes exclusively from providerResumeId, so a stale route key
     // must never make us skip session creation without a real resume target.

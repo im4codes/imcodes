@@ -2,11 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
-import { switchSessionModelNow } from '../../src/daemon/command-handler.js';
+import { switchSessionModelNow, restartSessionNow } from '../../src/daemon/command-handler.js';
 import { SESSION_MODEL_APPLIED } from '../../shared/session-model-control.js';
+import { AgyAcpProvider } from '../../src/agent/providers/agy-acp.js';
+import { AGY_ACP_AGENT_NAME } from '../../shared/agy-agent.js';
 import { AgySdkProvider } from '../../src/agent/providers/agy-sdk.js';
 import * as store from '../../src/store/session-store.js';
-import { getTransportRuntime, launchTransportSession, stopTransportRuntimeSession } from '../../src/agent/session-manager.js';
+import { getTransportRuntime, launchTransportSession, stopTransportRuntimeSession, relaunchSessionWithSettings } from '../../src/agent/session-manager.js';
 import { rebuildSubSessions } from '../../src/daemon/subsession-manager.js';
 import { AGY_NATIVE_START_NOT_ATTEMPTED, AGY_NATIVE_SESSION_STATE, AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { writeAgyNativeChildFixture } from '../helpers/agy-native-child.js';
@@ -26,7 +28,7 @@ vi.mock('../../src/daemon/session-resource-service.js', () => ({
   initializeSessionResourceLifecycle: async () => ({ released: 0, preserved: 0, failed: 0 }),
   resourceOwnerEnv: () => ({}),
 }));
-let provider: AgySdkProvider;
+let provider: AgySdkProvider | AgyAcpProvider;
 let home: string;
 const names = ['deck_realproj_ag_brain', 'deck_sub_ag_start_fixture'];
 beforeEach(async () => {
@@ -333,5 +335,78 @@ describe('AG manager start ownership (real runtime, SQLite and SDK child)', () =
     expect(store.getSession(name)).toMatchObject({ providerResumeId: native, requestedModel: 'fixture-B', activeModel: 'fixture-B' });
     expect(readFileSync(path.join(home, 'models'), 'utf8').trim().split('\n').map(s => JSON.parse(s))).toEqual(['fixture-A', 'fixture-B']);
     expect(readFileSync(path.join(home, 'inputs'), 'utf8').trim().split('\n')).toHaveLength(2);
+  });
+});
+
+// Real ACP SDK + runtime + SQLite; no account, credentials or network.
+describe('AG provider-switch failure recovery', () => {
+  async function acp(scenario = 'unsupported-carbon') {
+    await provider.disconnect();
+    const binary = path.join(home, 'agy-acp');
+    writeFileSync(binary, `#!/bin/sh\nexec '${process.execPath}' '${path.resolve('test/fixtures/agy-acp.mjs')}' "$@"\n`, { mode: 0o700 });
+    provider = new AgyAcpProvider();
+    await provider.connect({ binaryPath: binary, env: { HOME: home, AGY_ACP_FIXTURE_AGENT_NAME: AGY_ACP_AGENT_NAME,
+      AGY_ACP_FIXTURE_LOG: path.join(home, 'rpc.jsonl'), AGY_ACP_FIXTURE_SCENARIO: scenario } });
+  }
+  const rows = () => readFileSync(path.join(home, 'rpc.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  async function send(name: string, id: string) {
+    const runtime = getTransportRuntime(name)!;
+    runtime.send(id, id);
+    await vi.waitFor(() => expect(runtime.sending).toBe(false), { timeout: 5000 });
+    expect(runtime.lastProviderError).toBeNull();
+  }
+  it.each(names)('does not inherit a foreign model/resume or Gemini auth when switching %s to AG', async name => {
+    await acp();
+    mkdirSync(path.join(home, '.gemini'));
+    writeFileSync(path.join(home, '.gemini/oauth_creds.json'), JSON.stringify({ access_token: 'opaque-fixture-only' }));
+    store.upsertSession({ name, projectName: 'realproj', role: name === names[0] ? 'brain' : 'w1',
+      agentType: 'gemini-sdk', providerId: 'gemini-sdk', runtimeType: 'transport', providerSessionId: 'old-route',
+      providerResumeId: 'foreign-native', requestedModel: 'gemini-4-carbon-medium', projectDir: home,
+      state: 'idle', restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1 });
+    await relaunchSessionWithSettings(store.getSession(name)!, { agentType: AGY_SDK_PROVIDER_ID, identityPrompt: 'fixture' });
+    await send(name, 'after-switch');
+    expect(store.getSession(name)?.providerResumeId).not.toBe('foreign-native');
+    expect(rows().filter(row => row.method === 'session/resume')).toHaveLength(0);
+    expect(rows().filter(row => row.method === 'session/set_model').some(row => row.params.modelId === 'gemini-4-carbon-medium')).toBe(false);
+  });
+  it('rejects an unsupported model, accepts a supported selection, resumes after disk reload and resets explicitly', async () => {
+    await acp(); const name = names[0];
+    const options = { name, projectName: 'realproj', role: 'brain' as const, agentType: AGY_SDK_PROVIDER_ID, projectDir: home, identityPrompt: 'fixture' };
+    await launchTransportSession({ ...options, fresh: true, requestedModel: 'gemini-4-carbon-medium' });
+    const runtime = getTransportRuntime(name)!; runtime.send('rejected', 'unsupported');
+    await vi.waitFor(() => expect(runtime.lastProviderError).toBeTruthy());
+    const native = store.getSession(name)!.providerResumeId;
+    expect(native).toBeTruthy();
+    expect(rows().some(row => row.method === 'session/prompt')).toBe(false);
+    expect(runtime.lastProviderError?.message).toMatch(/model.*unavailable/i);
+    await expect(switchSessionModelNow(name, 'model-b')).resolves.toMatchObject({ ok: true });
+    await send(name, 'supported');
+    await store.flushStore({ requireWrite: true });
+    await stopTransportRuntimeSession(name); await store.loadStore({ probe: false });
+    await restartSessionNow(name, { reset: false }); await send(name, 'resumed');
+    expect(rows().filter(row => row.method === 'session/resume').at(-1).params.sessionId).toBe(native);
+    await Promise.all([restartSessionNow(name, { reset: false }), restartSessionNow(name, { reset: true })]);
+    expect(store.getSession(name)?.providerResumeId).toBeUndefined();
+    expect(store.getSession(name)?.agyNativeSessionState).toBe(AGY_NATIVE_SESSION_STATE.UNSTARTED);
+    await send(name, 'reset');
+    expect(store.getSession(name)?.providerResumeId).not.toBe(native);
+  });
+  it('keeps uncertain native creation closed to implicit retry but makes explicit reset recoverable', async () => {
+    await acp('new-error-once'); const name = names[1];
+    await launchTransportSession({ name, projectName: 'realproj', role: 'w1', agentType: AGY_SDK_PROVIDER_ID, projectDir: home, identityPrompt: 'fixture' });
+    const runtime = getTransportRuntime(name)!; runtime.send('first', 'creation-failed');
+    await vi.waitFor(() => expect(runtime.lastProviderError).toBeTruthy());
+    expect(store.getSession(name)?.providerResumeId).toBeUndefined();
+    await expect(restartSessionNow(name, { reset: false })).rejects.toThrow(/start over|reset=true/i);
+    await restartSessionNow(name, { reset: true }); await send(name, 'after-reset');
+    expect(rows().filter(row => row.method === 'session/new')).toHaveLength(2);
+  });
+  it('treats fresh as authoritative even if its caller carries a stale native handle', async () => {
+    await acp(); const name = names[0];
+    await launchTransportSession({ name, projectName: 'realproj', role: 'brain', agentType: AGY_SDK_PROVIDER_ID, projectDir: home,
+      identityPrompt: 'fixture', fresh: true, providerResumeId: 'stale-conversation' });
+    await send(name, 'fresh-with-stale-input');
+    expect(rows().some(row => row.method === 'session/resume')).toBe(false);
+    expect(rows().filter(row => row.method === 'session/new')).toHaveLength(1);
   });
 });

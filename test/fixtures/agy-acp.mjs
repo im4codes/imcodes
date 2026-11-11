@@ -3,7 +3,7 @@ import readline from 'node:readline';
 import fs from 'node:fs';
 const logPath = process.env.AGY_ACP_FIXTURE_LOG;
 const scenario = process.env.AGY_ACP_FIXTURE_SCENARIO || '';
-const sessions = new Map(); let nextId = 0;
+const sessions = new Map(); let nextId = 0; let modelAttempts = 0;
 const send = obj => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...obj }) + '\n');
 const ok = (id, result = {}) => send({ id, result });
 const error = (id, message) => send({ id, error: { code: -32602, message } });
@@ -31,6 +31,9 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   switch (req.method) {
     case 'initialize': return ok(req.id, { protocolVersion: 1, agentInfo: { name: process.env.AGY_ACP_FIXTURE_AGENT_NAME, version: '1.5.4' }, agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {}, close: {}, list: {} } } });
     case 'session/new': {
+      if (scenario === 'new-error-once' && !fs.existsSync(logPath + '.new-failed')) {
+        fs.writeFileSync(logPath + '.new-failed', 'failed'); return error(req.id, 'native creation unavailable');
+      }
       const sessionId = `native-${++nextId}`; sessions.set(sessionId, { pending: [], inputs: [] });
       return setTimeout(() => ok(req.id, { sessionId, models }), scenario === 'late-new' ? 150 : 0);
     }
@@ -41,7 +44,8 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       return ok(req.id, { sessionId: p.sessionId, models });
     }
     case 'session/set_model': {
-      if (p.modelId === 'invalid' || scenario === 'model-error') return error(req.id, 'Unknown model');
+      if (p.modelId === 'invalid' || (scenario === 'unsupported-carbon' && p.modelId === 'gemini-4-carbon-medium') || scenario === 'model-error'
+        || (scenario === 'model-error-once' && modelAttempts++ === 0)) return error(req.id, 'Unknown model');
       if (scenario === 'model-unsupported') return error(req.id, 'Method unavailable');
       const respond = () => { const state = sessions.get(p.sessionId); if (state) state.model = p.modelId; ok(req.id); };
       return setTimeout(respond, p.modelId === 'model-b' && scenario === 'model-late' ? 180 : p.modelId === 'model-b' && scenario === 'model-timeout' ? 5500 : 0);

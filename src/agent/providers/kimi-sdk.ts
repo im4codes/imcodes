@@ -700,7 +700,16 @@ export class KimiSdkProvider implements TransportProvider {
         if (state.confirmedModel !== model) {
           const setter = connection?.unstable_setSessionModel;
           if (!setter || !nativeId) throw this.makeError(PROVIDER_ERROR_CODES.CONFIG_ERROR, 'ACP model selection unsupported', false);
-          await setter.call(connection, { sessionId: nativeId, modelId: model });
+          try {
+            await setter.call(connection, { sessionId: nativeId, modelId: model });
+          } catch (error) {
+            // Report only our own bounded model guidance, never raw ACP diagnostics.
+            if (error instanceof RequestError && /unknown model|unsupported model|model.*not supported/i.test(error.message)) {
+              throw this.makeError(PROVIDER_ERROR_CODES.CONFIG_ERROR,
+                `Selected ${this.profile.displayName} model is unavailable; choose a supported model and retry.`, false);
+            }
+            throw error;
+          }
           // Even a superseded successful RPC changed native state. Invalidate
           // the old cached model before the intent check (A→B→A must reapply A).
           if (this.sessions.get(sessionId) === state && this.connection === connection && state.acpSessionId === nativeId) {
@@ -714,7 +723,15 @@ export class KimiSdkProvider implements TransportProvider {
       state.modelApplyRequest = request;
       state.modelApplyTail = promise.catch(() => {});
     }
-    const outcome = await withTimeoutOutcome(request.promise, SESSION_MODEL_APPLY_TIMEOUT_MS);
+    let outcome;
+    try {
+      outcome = await withTimeoutOutcome(request.promise, SESSION_MODEL_APPLY_TIMEOUT_MS);
+    } catch (error) {
+      // Share an in-flight confirmation, not a permanently rejected Promise.
+      // A transient first-turn RPC failure must permit the same model to retry.
+      if (state.modelApplyRequest === request) state.modelApplyRequest = undefined;
+      throw error;
+    }
     if (outcome.timedOut) {
       if (state.modelRevision === revision) { state.modelRevision++; state.confirmedModel = undefined; }
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'ACP model selection was not confirmed before its deadline', true);

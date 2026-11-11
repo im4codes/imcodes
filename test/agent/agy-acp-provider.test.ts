@@ -111,6 +111,16 @@ describe('AG native ACP', () => {
     await expect(provider.send(id, 'A')).rejects.toMatchObject({ details: { [AGY_NATIVE_START_NOT_ATTEMPTED]: true } });
     expect((await requests()).some(x => x.method === 'session/new')).toBe(false);
   });
+  it('retries a transient initial model rejection without changing the selected model or native conversation', async () => {
+    const { provider, requests } = await setup('model-error-once');
+    const id = await route(provider, undefined, { agentId: 'model-b' });
+    await expect(provider.send(id, 'first')).rejects.toBeTruthy();
+    await expect(provider.send(id, 'retry')).resolves.toBeUndefined();
+    await vi.waitFor(async () => expect((await requests()).filter(x => x.method === 'session/prompt')).toHaveLength(1));
+    const rows = await requests();
+    expect(rows.filter(x => x.method === 'session/new')).toHaveLength(1);
+    expect(rows.filter(x => x.method === 'session/set_model').map(x => x.params.modelId)).toEqual(['model-b', 'model-b']);
+  });
   it('does not prompt or publish a late new-session result after Stop', async () => {
     const { provider, requests } = await setup('late-new'); const id = await route(provider); const info = vi.fn(); provider.onSessionInfo(info);
     const sending = provider.send(id, 'A'); const rejected = expect(sending).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CANCELLED });
