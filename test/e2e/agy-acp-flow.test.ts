@@ -48,6 +48,20 @@ beforeEach(async () => {
 });
 afterEach(async () => { off?.(); await stopTransportRuntimeSession(NAME); removeSession(NAME); await disconnectAll(); await rm(root, { recursive: true, force: true }); });
 describe('real AG ACP SDK/runtime/durable store/relay', () => {
+  it('projects a pre-native idle model choice immediately without starting an ACP session', async () => {
+    const runtime = getTransportRuntime(NAME)!;
+    expect(runtime.sending).toBe(false);
+    expect(getSession(NAME)?.agyNativeSessionState).toBe(AGY_NATIVE_SESSION_STATE.UNSTARTED);
+    const result = await switchSessionModelNow(NAME, 'model-b');
+    expect(result).toMatchObject({ ok: true, model: 'model-b', applied: SESSION_MODEL_APPLIED.NEXT_START });
+    expect(getSession(NAME)).toMatchObject({ requestedModel: 'model-b', activeModel: 'model-b', modelDisplay: 'model-b' });
+    expect(events.some(event => event.type === 'usage.update' && event.payload.model === 'model-b')).toBe(true);
+    expect(events.some(event => event.type === 'assistant.text' && event.payload.noticeCode === DAEMON_USER_NOTICE_CODE.MODEL_SWITCHED)).toBe(true);
+    expect(events.some(event => event.type === 'assistant.text' && event.payload.noticeCode === DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PENDING)).toBe(false);
+    expect((await requests()).some(row => row.method === 'session/new')).toBe(false);
+    expect(getSession(NAME)?.agyNativeSessionState).toBe(AGY_NATIVE_SESSION_STATE.UNSTARTED);
+  });
+
   it.each(['model-b', 'model-a'])('applies loaded idle ACP model %s now instead of unconditional next-start', async model => {
     const runtime = getTransportRuntime(NAME)!;
     runtime.send('WARM_MODEL', 'e2e-agy-model-warm');

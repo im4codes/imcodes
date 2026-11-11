@@ -6768,6 +6768,7 @@ describe('handleWebCommand transport queue behavior', () => {
       providerSessionId: 'provider-route-agy',
       recipientIdentity: { sessionInstanceId: 'agy-instance', runtimeEpoch: 'agy-epoch' },
       setAgentId,
+      getStatus: () => 'streaming',
     });
 
     handleWebCommand({

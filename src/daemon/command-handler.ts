@@ -23,6 +23,7 @@ import { startProject, stopProject, teardownProject, getTransportRuntime, launch
 import { buildTransportResumeLaunchOpts } from '../agent/transport-resume-opts.js';
 import { isTransportAgent, type AgentType } from '../agent/detect.js';
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, isClaudeCodeSdkAgentType } from '../../shared/agent-types.js';
+import { isWorkingSessionState } from '../../shared/session-activity-types.js';
 import { aliasExpansionModeFor, expandForAgent } from '../../shared/alias-expand.js';
 import { ALIAS_REASONS } from '../../shared/alias-types.js';
 import { classifyCodexFastCommand, isCodexFastServiceTier } from '../../shared/codex-service-tier.js';
@@ -3033,6 +3034,7 @@ async function applyTransportModelSwitch(
   let nextRecord: SessionRecord;
   let contextWindow: number | undefined;
   let deferred = false;
+  let applied: typeof SESSION_MODEL_APPLIED[keyof typeof SESSION_MODEL_APPLIED] = SESSION_MODEL_APPLIED.LIVE;
 
   const validated = await resolveValidatedModelList(record);
   if (agentType === AGY_SDK_PROVIDER_ID) {
@@ -3155,17 +3157,21 @@ async function applyTransportModelSwitch(
     );
   } else if (agentType === AGY_SDK_PROVIDER_ID) {
     try {
-      let applied: typeof SESSION_MODEL_APPLIED[keyof typeof SESSION_MODEL_APPLIED] = SESSION_MODEL_APPLIED.NEXT_START;
+      applied = SESSION_MODEL_APPLIED.NEXT_START;
       if (transportRuntime?.supportsConfirmedModelSelection) {
         applied = await transportRuntime.applyAgentId(requestedModel);
       } else {
         transportRuntime?.setAgentId(requestedModel);
       }
       if (!currentOwner()) return modelOwnerChanged(sessionName);
-      deferred = applied !== SESSION_MODEL_APPLIED.LIVE;
+      const latestRecord = getSession(sessionName)!;
+      const turnInFlight = Boolean(transportRuntime?.sending)
+        || isWorkingSessionState(transportRuntime?.getStatus())
+        || isWorkingSessionState(latestRecord.state);
+      deferred = applied !== SESSION_MODEL_APPLIED.LIVE && turnInFlight;
       // Merge native-info/queue updates which arrived during the confirmed RPC;
       // only an idle/effective confirmation may advance actual model/UI.
-      nextRecord = { ...getSession(sessionName)!, requestedModel,
+      nextRecord = { ...latestRecord, requestedModel,
         ...(!deferred ? { activeModel: requestedModel, modelDisplay: requestedModel } : {}), updatedAt: Date.now() };
     } catch (error) {
       if (!currentOwner()) return modelOwnerChanged(sessionName);
@@ -3225,7 +3231,7 @@ async function applyTransportModelSwitch(
     agentType: agentType ?? '',
     model: requestedModel,
     ...(previousModel ? { previousModel } : {}),
-    applied: transportRuntime && !deferred ? SESSION_MODEL_APPLIED.LIVE : SESSION_MODEL_APPLIED.NEXT_START,
+    applied: transportRuntime ? applied : SESSION_MODEL_APPLIED.NEXT_START,
   };
 }
 
