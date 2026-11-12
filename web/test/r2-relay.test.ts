@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { FILE_RELAY_MODE, R2_RELAY_PHASE } from '@shared/r2-relay.js';
 import { saveFileRelayMode, readFileRelayMode } from '../src/r2-relay-preference.js';
-import { configureExpectedUserId, prepareR2AttachmentDownload, tryUploadR2File, isR2RelaySelected, downloadAttachment } from '../src/api.js';
+import { configureExpectedUserId, prepareR2AttachmentDownload, tryUploadR2File, isR2RelaySelected, downloadAttachment, uploadFile } from '../src/api.js';
 import { beginDownloadTransfer, getDownloadTransfers, __resetDownloadTransfersForTests, cancelDownloadTransfer,
   reportR2Preparation, updateDownloadTransfer, reportDownloadTransferProgress, DOWNLOAD_TRANSFER_ROUTE, DOWNLOAD_TRANSFER_STATUS } from '../src/download-transfer-store.js';
 import { createDownloadTransferWiring } from '../src/download-transfer-wiring.js';
@@ -145,5 +145,54 @@ describe('R2 user routing and progress', () => {
     cancelDownloadTransfer(id);
     reportR2Preparation(id, progress);
     expect(getDownloadTransfers()[0]?.status).toBe(DOWNLOAD_TRANSFER_STATUS.CANCELED);
+  });
+
+  it('aborts direct upload XHR synchronously when R2 is disabled by default', async () => {
+    expect(isR2RelaySelected()).toBe(false);
+    const instances: Xhr[] = [];
+    class Xhr {
+      upload = {};
+      aborted = false;
+      onabort?: () => void;
+      open = vi.fn();
+      setRequestHeader = vi.fn();
+      constructor() { instances.push(this); }
+      send = vi.fn();
+      abort() { this.aborted = true; this.onabort?.(); }
+    }
+    vi.stubGlobal('XMLHttpRequest', Xhr);
+    const controller = new AbortController();
+    const pending = uploadFile('srv', new File(['hello'], 'direct-cancel.txt'), undefined, 'cid-1', controller.signal);
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError', message: 'upload_canceled' });
+    expect(instances).toHaveLength(1);
+    expect(instances[0]!.aborted).toBe(true);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('aborts in-flight R2 PUT XHR without committing when R2 relay is explicitly enabled', async () => {
+    saveFileRelayMode('user-a', FILE_RELAY_MODE.R2);
+    expect(isR2RelaySelected()).toBe(true);
+    fetchMock.mockResolvedValueOnce(Response.json({ id: 'ticket-cancel', url: 'https://r2.example/signed-put-cancel' }));
+    const instances: Xhr[] = [];
+    class Xhr {
+      upload = {};
+      aborted = false;
+      onabort?: () => void;
+      open = vi.fn();
+      setRequestHeader = vi.fn();
+      constructor() { instances.push(this); }
+      send = vi.fn();
+      abort() { this.aborted = true; this.onabort?.(); }
+    }
+    vi.stubGlobal('XMLHttpRequest', Xhr);
+    const controller = new AbortController();
+    const pending = uploadFile('srv', new File(['hello'], 'r2-cancel.txt'), undefined, 'cid-2', controller.signal);
+    await vi.waitFor(() => expect(instances).toHaveLength(1));
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError', message: 'upload_canceled' });
+    expect(instances[0]!.aborted).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]![0]).toContain('/r2-relay/uploads');
   });
 });

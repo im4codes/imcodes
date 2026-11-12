@@ -2096,8 +2096,10 @@ export async function uploadFile(
   sessionName?: string,
   destinationDirectory?: string,
 ): Promise<{ ok: boolean; attachment: AttachmentRefResponse }> {
-  const relayResult = await tryUploadR2File(serverId, file, onProgress, clientUploadId, signal, sessionName, destinationDirectory);
-  if (relayResult) return relayResult;
+  if (isR2RelaySelected() && !destinationDirectory) {
+    const relayResult = await tryUploadR2File(serverId, file, onProgress, clientUploadId, signal, sessionName, destinationDirectory);
+    if (relayResult) return relayResult;
+  }
   let highestProgress = 0;
   const emitProgress = (pct: number) => {
     highestProgress = Math.max(highestProgress, Math.min(100, Math.round(pct)));
@@ -2565,33 +2567,35 @@ export async function downloadAttachment(
   signal?: AbortSignal,
 ): Promise<void> {
   if (signal?.aborted) throw new DOMException('download_canceled', 'AbortError');
-  let relayTransfer: string | undefined;
-  let transferSignal: AbortSignal | undefined;
-  const relayAbort = new AbortController();
-  const abortRelay = () => relayAbort.abort();
-  signal?.addEventListener('abort', abortRelay, { once: true });
-  if (signal?.aborted) relayAbort.abort();
-  const relaySignal = relayAbort.signal;
-  try {
-    const r2Url = await prepareR2AttachmentDownload(serverId, attachmentId, sessionName, relaySignal, (progress) => {
-      if (!relayTransfer) {
-        const transfer = beginDownloadTransfer(attachmentId);
-        relayTransfer = transfer.id; transferSignal = transfer.signal;
-        transferSignal.addEventListener('abort', abortRelay, { once: true });
+  if (isR2RelaySelected()) {
+    let relayTransfer: string | undefined;
+    let transferSignal: AbortSignal | undefined;
+    const relayAbort = new AbortController();
+    const abortRelay = () => relayAbort.abort();
+    signal?.addEventListener('abort', abortRelay, { once: true });
+    if (signal?.aborted) relayAbort.abort();
+    const relaySignal = relayAbort.signal;
+    try {
+      const r2Url = await prepareR2AttachmentDownload(serverId, attachmentId, sessionName, relaySignal, (progress) => {
+        if (!relayTransfer) {
+          const transfer = beginDownloadTransfer(attachmentId);
+          relayTransfer = transfer.id; transferSignal = transfer.signal;
+          transferSignal.addEventListener('abort', abortRelay, { once: true });
+        }
+        reportR2Preparation(relayTransfer, progress);
+      });
+      if (r2Url) {
+        await handoffR2Download(r2Url, relaySignal);
+        if (relayTransfer) completeDownloadTransfer(relayTransfer, true);
+        return;
       }
-      reportR2Preparation(relayTransfer, progress);
-    });
-    if (r2Url) {
-      await handoffR2Download(r2Url, relaySignal);
-      if (relayTransfer) completeDownloadTransfer(relayTransfer, true);
-      return;
+    } catch (error) {
+      if (relayTransfer) failDownloadTransfer(relayTransfer, relaySignal.aborted);
+      throw error;
+    } finally {
+      transferSignal?.removeEventListener('abort', abortRelay);
+      signal?.removeEventListener('abort', abortRelay);
     }
-  } catch (error) {
-    if (relayTransfer) failDownloadTransfer(relayTransfer, relaySignal.aborted);
-    throw error;
-  } finally {
-    transferSignal?.removeEventListener('abort', abortRelay);
-    signal?.removeEventListener('abort', abortRelay);
   }
   // Native: acquire a one-time token and hand off to the system browser.
   if (isNative()) {
@@ -3541,6 +3545,7 @@ export async function tryUploadR2File(serverId: string, file: File, onProgress?:
   clientUploadId?: string, signal?: AbortSignal, sessionName?: string, destinationDirectory?: string,
 ): Promise<{ ok: boolean; attachment: AttachmentRefResponse } | null> {
   if (!isR2RelaySelected() || destinationDirectory) return null;
+  if (signal?.aborted) throw new DOMException('upload_canceled', 'AbortError');
   const root = withSessionName(`/api/server/${encodeURIComponent(serverId)}/${R2_RELAY_API.ROOT}/${R2_RELAY_API.UPLOADS}`, sessionName);
   const response = await rawFetch(root, { method: 'POST', signal, body: JSON.stringify({
     filename: file.name, size: file.size, clientUploadId, destinationDirectory,
