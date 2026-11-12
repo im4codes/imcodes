@@ -31,14 +31,12 @@ export class AgyTranscriptBridge {
 
   constructor(readonly file: string, private readonly onRow: (row: AgyTranscriptRow) => void) {}
   get isClosed(): boolean { return this.closed; }
-  async resume(): Promise<void> { this.closed = false; await this.arm(); await this.flush(); }
+  async resume(): Promise<void> { this.closed = false; await this.flush(); }
 
   async start(replayExisting = false): Promise<void> {
     // Baseline is read once (without replay callbacks) so rotation cannot
     // replay an old SYSTEM_MESSAGE from a restored conversation.
-    await this.arm();
-    if (replayExisting) await this.flush();
-    else await this.read(true);
+    await this.run(!replayExisting);
   }
 
   private async arm(): Promise<void> {
@@ -72,10 +70,23 @@ export class AgyTranscriptBridge {
     this.timer.unref?.();
   }
   flush(): Promise<void> {
+    return this.run(false);
+  }
+  private run(baseline: boolean): Promise<void> {
     if (this.closed) return Promise.resolve();
-    if (this.reading) { this.again = true; return this.reading; }
+    if (this.reading) {
+      if (!baseline) this.again = true;
+      return this.reading;
+    }
+    let first = baseline;
     this.reading = (async () => {
-      do { this.again = false; await this.arm(); await this.read(); } while (this.again && !this.closed);
+      do {
+        this.again = false;
+        const isBaseline = first;
+        first = false;
+        await this.arm();
+        await this.read(isBaseline);
+      } while (this.again && !this.closed);
     })().finally(() => { this.reading = undefined; });
     return this.reading;
   }
