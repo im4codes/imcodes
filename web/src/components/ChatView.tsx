@@ -5311,6 +5311,7 @@ function ToolActivityPeek({
   running,
   failed,
   duration,
+  chatContainerRect,
 }: {
   anchor: DOMRect;
   peekId: string;
@@ -5321,27 +5322,57 @@ function ToolActivityPeek({
   running: boolean;
   failed: boolean;
   duration: string | null;
+  chatContainerRect?: DOMRect | null;
 }) {
   const { t } = useTranslation();
   if (typeof document === 'undefined') return null;
 
   const margin = 8;
-  const width = Math.min(560, Math.max(280, window.innerWidth - margin * 2));
+  const BASE_WIDTH = 560;
+
+  const viewportWidth = (typeof window !== 'undefined' && window.innerWidth > 0)
+    ? window.innerWidth
+    : 1024;
+  const hasContainer = Boolean(chatContainerRect && chatContainerRect.width > 0);
+  const containerLeft = hasContainer ? chatContainerRect!.left : 0;
+  const containerRight = hasContainer ? chatContainerRect!.right : viewportWidth;
+  const containerWidth = hasContainer ? chatContainerRect!.width : viewportWidth;
+
+  const minLeft = Math.max(margin, containerLeft + margin);
+  const maxRight = Math.min(viewportWidth - margin, containerRight - margin);
+  const maxAvailableWidth = Math.max(0, maxRight - minLeft);
+
+  const targetWidth = Math.round(containerWidth * 0.6);
+  // When chat container is narrow or 60% of chat width is less than base 560px,
+  // adapt to full available width (leaving safe margins); otherwise use >=60% of chat width.
+  const computedWidth = targetWidth < BASE_WIDTH
+    ? maxAvailableWidth
+    : Math.min(targetWidth, maxAvailableWidth);
+
+  const minWidth = Math.min(280, maxAvailableWidth);
+  const width = Math.min(maxAvailableWidth, Math.max(minWidth, computedWidth));
+
+  const maxLeft = maxRight - width;
+  const left = Math.min(
+    Math.max(minLeft, anchor.left),
+    Math.max(minLeft, maxLeft),
+  );
+
   // Prefer above the chip (the chip sits under the reply text, so upward keeps
   // the message readable); flip below only when there is not enough room.
   const spaceAbove = anchor.top;
-  const placeBelow = spaceAbove < 220 && window.innerHeight - anchor.bottom > spaceAbove;
-  const left = Math.min(
-    Math.max(margin, anchor.left),
-    Math.max(margin, window.innerWidth - width - margin),
-  );
+  const viewportHeight = (typeof window !== 'undefined' && window.innerHeight > 0)
+    ? window.innerHeight
+    : 768;
+  const spaceBelow = viewportHeight - anchor.bottom;
+  const placeBelow = spaceAbove < 280 && spaceBelow > spaceAbove;
   const maxHeight = Math.max(
     140,
-    (placeBelow ? window.innerHeight - anchor.bottom : anchor.top) - margin * 2,
+    (placeBelow ? spaceBelow : anchor.top) - margin * 2,
   );
   const position = placeBelow
     ? { top: `${anchor.bottom + margin}px` }
-    : { bottom: `${window.innerHeight - anchor.top + margin}px` };
+    : { bottom: `${viewportHeight - anchor.top + margin}px` };
 
   const status = running
     ? t('chat.tool_peek_running')
@@ -5414,6 +5445,7 @@ function ToolActivitySummary({
   // needs the chip's viewport position. Re-measured on every open so scrolling
   // between hovers cannot leave it stranded.
   const [peekAnchor, setPeekAnchor] = useState<DOMRect | null>(null);
+  const [chatContainerRect, setChatContainerRect] = useState<DOMRect | null>(null);
   // The element the peek is anchored to, kept so scroll/resize can re-measure it
   // rather than leaving the panel at a rect that is now wrong.
   const peekTriggerRef = useRef<HTMLElement | null>(null);
@@ -5439,10 +5471,13 @@ function ToolActivitySummary({
     if (!last || !element) return;
     peekTriggerRef.current = element;
     setPeekAnchor(element.getBoundingClientRect());
+    const container = (element.closest('.chat-view') ?? element.closest('.chat-view-wrap')) as HTMLElement | null;
+    setChatContainerRect(container ? container.getBoundingClientRect() : null);
   };
   const closePeek = () => {
     peekTriggerRef.current = null;
     setPeekAnchor(null);
+    setChatContainerRect(null);
   };
   // Pointer only. Touch clients report no hover, and opening the peek on a tap
   // would fight the expand toggle. Keyboard focus deliberately does NOT go
@@ -5467,6 +5502,8 @@ function ToolActivitySummary({
         || rect.right < 0 || rect.left > window.innerWidth;
       if (offscreen) { closePeek(); return; }
       setPeekAnchor(rect);
+      const container = (element.closest('.chat-view') ?? element.closest('.chat-view-wrap')) as HTMLElement | null;
+      setChatContainerRect(container ? container.getBoundingClientRect() : null);
     };
     // Capture phase so nested scrollers (the chat list itself) are observed too;
     // `scroll` does not bubble.
@@ -5545,6 +5582,7 @@ function ToolActivitySummary({
           running={last.running}
           failed={last.failed}
           duration={lastDuration}
+          chatContainerRect={chatContainerRect}
         />
       )}
       <span class="chat-tool-activity-live" role="status" aria-live="polite" aria-atomic="true">{summary}</span>
@@ -7061,3 +7099,4 @@ function splitPathsAndUrls(
  * Same convention as `__buildViewItemsForTests` above.
  */
 export const __ChatEventForTests = ChatEvent;
+export const __ToolActivityPeekForTests = ToolActivityPeek;

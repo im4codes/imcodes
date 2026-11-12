@@ -5920,7 +5920,7 @@ html.native-ios-mac .chat-dl-btn {
 }
 .chat-tool-peek-pre {
   margin: 0;
-  max-height: 220px;
+  max-height: 400px;
   overflow: auto;
   padding: 7px 9px;
   border-left: 2px solid rgba(34, 211, 238, 0.4);

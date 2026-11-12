@@ -52,7 +52,7 @@ vi.mock('../src/hooks/usePref.js', () => ({
   }),
 }));
 
-import { ChatView } from '../src/components/ChatView.js';
+import { ChatView, __ToolActivityPeekForTests } from '../src/components/ChatView.js';
 import type { TimelineEvent } from '../src/ws-client.js';
 
 function makeEvent(
@@ -707,5 +707,264 @@ describe('ChatView compact tool activity', () => {
     expect(container.querySelector('.chat-tool-activity-details')).not.toBeNull();
     const collapseLabel = container.querySelector('.chat-tool-activity-collapse-label');
     expect(collapseLabel).not.toBeNull();
+  });
+
+  describe('ToolActivityPeek width, positioning, and content display', () => {
+    it('calculates width dynamically to at least 60% and >= 560px on wide desktop chat view', () => {
+      stubHover(true);
+      const call = makeEvent('wide-call', 'tool.call', { tool: 'Python', input: { command: 'import numpy as np; print(np.zeros(10))' } }, 1);
+      const result = makeEvent('wide-result', 'tool.result', { output: '[0. 0. 0. 0. 0. 0. 0. 0. 0. 0.]' }, 2);
+
+      const { container } = render(<ChatView events={[call, result]} loading={false} />);
+      const chatView = container.querySelector('.chat-view') as HTMLElement;
+      expect(chatView).not.toBeNull();
+
+      // Mock chat container to 1200px width
+      chatView.getBoundingClientRect = () => ({
+        top: 0, bottom: 800, left: 0, right: 1200, width: 1200, height: 800, x: 0, y: 0,
+        toJSON: () => ({}),
+      }) as DOMRect;
+
+      const chip = container.querySelector('.chat-tool-activity') as HTMLElement;
+      chip.getBoundingClientRect = () => ({
+        top: 200, bottom: 230, left: 100, right: 300, width: 200, height: 30, x: 100, y: 200,
+        toJSON: () => ({}),
+      }) as DOMRect;
+
+      fireEvent.mouseEnter(chip);
+      const peek = document.querySelector('.chat-tool-peek') as HTMLElement;
+      expect(peek).not.toBeNull();
+      // 1200 * 0.6 = 720px, which is >= 60% and >= 560px
+      expect(peek.style.width).toBe('720px');
+      expect(peek.style.left).toBe('100px');
+    });
+
+    it('adapts to full width (minus margins) when 60% of chat width is less than 560px', () => {
+      stubHover(true);
+      const call = makeEvent('narrow-call', 'tool.call', { tool: 'Bash', input: { command: 'echo narrow' } }, 1);
+      const result = makeEvent('narrow-result', 'tool.result', { output: 'narrow' }, 2);
+
+      const { container } = render(<ChatView events={[call, result]} loading={false} />);
+      const chatView = container.querySelector('.chat-view') as HTMLElement;
+
+      // Mock 800px chat container (60% is 480 < 560 -> adapts to full width: 800 - 16 = 784px)
+      chatView.getBoundingClientRect = () => ({
+        top: 0, bottom: 800, left: 0, right: 800, width: 800, height: 800, x: 0, y: 0,
+        toJSON: () => ({}),
+      }) as DOMRect;
+
+      const chip = container.querySelector('.chat-tool-activity') as HTMLElement;
+      chip.getBoundingClientRect = () => ({
+        top: 200, bottom: 230, left: 50, right: 250, width: 200, height: 30, x: 50, y: 200,
+        toJSON: () => ({}),
+      }) as DOMRect;
+
+      fireEvent.mouseEnter(chip);
+      const peek = document.querySelector('.chat-tool-peek') as HTMLElement;
+      expect(peek).not.toBeNull();
+      expect(peek.style.width).toBe('784px');
+      expect(peek.style.left).toBe('8px');
+    });
+
+    it('adapts to full width in narrow container (e.g. 500px)', () => {
+      stubHover(true);
+      const call = makeEvent('n500-call', 'tool.call', { tool: 'Bash', input: { command: 'echo 500' } }, 1);
+      const result = makeEvent('n500-result', 'tool.result', { output: '500' }, 2);
+
+      const { container } = render(<ChatView events={[call, result]} loading={false} />);
+      const chatView = container.querySelector('.chat-view') as HTMLElement;
+
+      // 500px container: 500 - 16 = 484px
+      chatView.getBoundingClientRect = () => ({
+        top: 0, bottom: 800, left: 0, right: 500, width: 500, height: 800, x: 0, y: 0,
+        toJSON: () => ({}),
+      }) as DOMRect;
+
+      const chip = container.querySelector('.chat-tool-activity') as HTMLElement;
+      chip.getBoundingClientRect = () => ({
+        top: 200, bottom: 230, left: 50, right: 250, width: 200, height: 30, x: 50, y: 200,
+        toJSON: () => ({}),
+      }) as DOMRect;
+
+      fireEvent.mouseEnter(chip);
+      const peek = document.querySelector('.chat-tool-peek') as HTMLElement;
+      expect(peek).not.toBeNull();
+      expect(peek.style.width).toBe('484px');
+      expect(peek.style.left).toBe('8px');
+    });
+
+    it('accurately uses the chat view bounds in split-view / sidebar mode, not window width', () => {
+      stubHover(true);
+      const call = makeEvent('split-call', 'tool.call', { tool: 'Bash', input: { command: 'git status' } }, 1);
+      const result = makeEvent('split-result', 'tool.result', { output: 'clean' }, 2);
+
+      const { container } = render(<ChatView events={[call, result]} loading={false} />);
+      const chatView = container.querySelector('.chat-view') as HTMLElement;
+
+      // Window is 1600px, but chat view is docked between 400 and 1200 (width = 800px)
+      window.innerWidth = 1600;
+      chatView.getBoundingClientRect = () => ({
+        top: 0, bottom: 900, left: 400, right: 1200, width: 800, height: 900, x: 400, y: 0,
+        toJSON: () => ({}),
+      }) as DOMRect;
+
+      const chip = container.querySelector('.chat-tool-activity') as HTMLElement;
+      chip.getBoundingClientRect = () => ({
+        top: 300, bottom: 330, left: 450, right: 650, width: 200, height: 30, x: 450, y: 300,
+        toJSON: () => ({}),
+      }) as DOMRect;
+
+      fireEvent.mouseEnter(chip);
+      const peek = document.querySelector('.chat-tool-peek') as HTMLElement;
+      expect(peek).not.toBeNull();
+      // Should be 800 - 16 = 784px (full width of chat container), NOT 1600 * 0.6 = 960px
+      expect(peek.style.width).toBe('784px');
+      // Left docked safely at chat container left + margin = 408px
+      expect(peek.style.left).toBe('408px');
+    });
+
+    it('clamps horizontal position safely inside container and viewport preventing overflow', () => {
+      stubHover(true);
+      const call = makeEvent('clamp-call', 'tool.call', { tool: 'Bash', input: { command: 'test-clamp' } }, 1);
+      const result = makeEvent('clamp-result', 'tool.result', { output: 'clamped' }, 2);
+
+      const { container } = render(<ChatView events={[call, result]} loading={false} />);
+      const chatView = container.querySelector('.chat-view') as HTMLElement;
+
+      window.innerWidth = 1200;
+      chatView.getBoundingClientRect = () => ({
+        top: 0, bottom: 800, left: 0, right: 1200, width: 1200, height: 800, x: 0, y: 0,
+        toJSON: () => ({}),
+      }) as DOMRect;
+
+      const chip = container.querySelector('.chat-tool-activity') as HTMLElement;
+      // Chip is near right edge: left: 1100, right: 1180
+      chip.getBoundingClientRect = () => ({
+        top: 200, bottom: 230, left: 1100, right: 1180, width: 80, height: 30, x: 1100, y: 200,
+        toJSON: () => ({}),
+      }) as DOMRect;
+
+      fireEvent.mouseEnter(chip);
+      const peek = document.querySelector('.chat-tool-peek') as HTMLElement;
+      expect(peek).not.toBeNull();
+      expect(peek.style.width).toBe('720px');
+      // maxLeft = 1200 - 8 - 720 = 472px
+      expect(peek.style.left).toBe('472px');
+    });
+
+    it('handles short viewports and flips below when space above is constrained', () => {
+      stubHover(true);
+      const call = makeEvent('flip-call', 'tool.call', { tool: 'Bash', input: { command: 'test-flip' } }, 1);
+      const result = makeEvent('flip-result', 'tool.result', { output: 'flipped' }, 2);
+
+      const { container } = render(<ChatView events={[call, result]} loading={false} />);
+      const chip = container.querySelector('.chat-tool-activity') as HTMLElement;
+
+      // Chip near top of screen: anchor.top = 100, anchor.bottom = 130; innerHeight = 800
+      // spaceAbove = 100 < 280, spaceBelow = 670 > spaceAbove -> flips below
+      window.innerHeight = 800;
+      chip.getBoundingClientRect = () => ({
+        top: 100, bottom: 130, left: 50, right: 250, width: 200, height: 30, x: 50, y: 100,
+        toJSON: () => ({}),
+      }) as DOMRect;
+
+      fireEvent.mouseEnter(chip);
+      const peek = document.querySelector('.chat-tool-peek') as HTMLElement;
+      expect(peek).not.toBeNull();
+      // Position is top: 130 + 8 = 138px
+      expect(peek.style.top).toBe('138px');
+      expect(peek.style.bottom).toBe('');
+    });
+
+    it('protects against short viewports with maxHeight clamp', () => {
+      stubHover(true);
+      const call = makeEvent('short-call', 'tool.call', { tool: 'Bash', input: { command: 'test-short' } }, 1);
+      const result = makeEvent('short-result', 'tool.result', { output: 'short viewport' }, 2);
+
+      const { container } = render(<ChatView events={[call, result]} loading={false} />);
+      const chip = container.querySelector('.chat-tool-activity') as HTMLElement;
+
+      // Short window: innerHeight = 350, anchor.top = 220, anchor.bottom = 250
+      // spaceAbove = 220, spaceBelow = 100 -> stays above
+      window.innerHeight = 350;
+      chip.getBoundingClientRect = () => ({
+        top: 220, bottom: 250, left: 50, right: 250, width: 200, height: 30, x: 50, y: 220,
+        toJSON: () => ({}),
+      }) as DOMRect;
+
+      fireEvent.mouseEnter(chip);
+      const peek = document.querySelector('.chat-tool-peek') as HTMLElement;
+      expect(peek).not.toBeNull();
+      // maxHeight = anchor.top - 16 = 220 - 16 = 204px
+      expect(peek.style.maxHeight).toBe('204px');
+      // bottom = 350 - 220 + 8 = 138px
+      expect(peek.style.bottom).toBe('138px');
+    });
+
+    it('direct component test: __ToolActivityPeekForTests bounds verification for mobile and desktop', () => {
+      window.innerWidth = 1600;
+      window.innerHeight = 900;
+
+      // Ultra-narrow mobile: 320px chat container
+      const mobileAnchor = { top: 200, bottom: 230, left: 10, right: 100, width: 90, height: 30 } as DOMRect;
+      const mobileContainer = { top: 0, bottom: 600, left: 0, right: 320, width: 320, height: 600 } as DOMRect;
+
+      const { unmount: unmountMobile } = render(
+        <__ToolActivityPeekForTests
+          anchor={mobileAnchor}
+          peekId="peek-mobile"
+          toolName="Bash"
+          command="ls -la"
+          output="total 0"
+          error={null}
+          running={false}
+          failed={false}
+          duration="12ms"
+          chatContainerRect={mobileContainer}
+        />
+      );
+
+      const mobilePeek = document.getElementById('peek-mobile') as HTMLElement;
+      expect(mobilePeek).not.toBeNull();
+      expect(mobilePeek.style.width).toBe('304px'); // 320 - 16
+      expect(mobilePeek.style.left).toBe('8px');
+      unmountMobile();
+
+      // Wide desktop: 2000px container
+      const desktopAnchor = { top: 300, bottom: 330, left: 200, right: 400, width: 200, height: 30 } as DOMRect;
+      const desktopContainer = { top: 0, bottom: 900, left: 0, right: 2000, width: 2000, height: 900 } as DOMRect;
+
+      const { unmount: unmountDesktop } = render(
+        <__ToolActivityPeekForTests
+          anchor={desktopAnchor}
+          peekId="peek-desktop"
+          toolName="Bash"
+          command="python3 -c 'print(1)'"
+          output="1"
+          error={null}
+          running={false}
+          failed={false}
+          duration="50ms"
+          chatContainerRect={desktopContainer}
+        />
+      );
+
+      const desktopPeek = document.getElementById('peek-desktop') as HTMLElement;
+      expect(desktopPeek).not.toBeNull();
+      // 2000 * 0.6 = 1200px
+      expect(desktopPeek.style.width).toBe('1200px');
+      expect(desktopPeek.style.left).toBe('200px');
+      unmountDesktop();
+    });
+
+    it('sets max-height of .chat-tool-peek-pre to 400px in stylesheet', async () => {
+      const fs = await import('fs');
+      const path = await import('path');
+      const cssPath = path.resolve(__dirname, '../src/styles.css');
+      const css = fs.readFileSync(cssPath, 'utf8');
+      const match = css.match(/\.chat-tool-peek-pre\s*\{[^}]*\}/);
+      expect(match).not.toBeNull();
+      expect(match![0]).toMatch(/max-height:\s*400px/);
+    });
   });
 });
