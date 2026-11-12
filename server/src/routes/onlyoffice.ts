@@ -310,12 +310,16 @@ export async function resolveOnlyOfficeDocumentKey(
   try {
     const { bytes } = await readFileFromDaemon(serverId, normalizedPath, options);
     const currentHash = createHash('sha256').update(bytes).digest('hex');
-    let existing = documentVersionStateMap.get(mapKey);
-    if (!existing && options?.db) {
+    let existing: DocumentVersionState | undefined = undefined;
+    if (options?.db) {
       existing = (await loadPersistentRoomFromDb(options.db, serverId, normalizedPath)) ?? undefined;
       if (existing) {
         documentVersionStateMap.set(mapKey, existing);
+      } else {
+        documentVersionStateMap.delete(mapKey);
       }
+    } else {
+      existing = documentVersionStateMap.get(mapKey);
     }
 
     const pendingMemoryHash = pendingCommitHashMap.get(mapKey);
@@ -1638,8 +1642,8 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
       }
 
       const newDigest = createHash('sha256').update(bytes).digest('hex');
-      let state = documentVersionStateMap.get(mapKey);
-      if (!state && c.env.DB) {
+      let state: DocumentVersionState | undefined = undefined;
+      if (c.env.DB) {
         try {
           state = (await loadPersistentRoomFromDb(c.env.DB, claims.serverId, claims.path)) ?? undefined;
         } catch {
@@ -1647,7 +1651,11 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
         }
         if (state) {
           documentVersionStateMap.set(mapKey, state);
+        } else {
+          documentVersionStateMap.delete(mapKey);
         }
+      } else {
+        state = documentVersionStateMap.get(mapKey);
       }
       const currentEpoch = state?.sessionEpoch ?? 0;
       const currentKey = state?.activeKey ?? signedKey;
@@ -1741,9 +1749,13 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
 
   if (status === 4) {
     const mapKey = `${claims.serverId}:${claims.path}`;
-    let state = documentVersionStateMap.get(mapKey);
-    if (!state && c.env.DB) {
-      state = (await loadPersistentRoomFromDb(c.env.DB, claims.serverId, claims.path)) ?? undefined;
+    let state: DocumentVersionState | undefined = undefined;
+    if (c.env.DB) {
+      try {
+        state = (await loadPersistentRoomFromDb(c.env.DB, claims.serverId, claims.path)) ?? undefined;
+      } catch { /* best effort on status 4 */ }
+    } else {
+      state = documentVersionStateMap.get(mapKey);
     }
     if (state && state.active !== false) {
       const newState: DocumentVersionState = {

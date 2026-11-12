@@ -603,20 +603,29 @@ function createInMemoryDb() {
           active,
           updatedAt,
         ] = params as [string, string, string, string, string | null, string, number, number, boolean, number];
-        const row: OnlyOfficeRoomRow = {
-          server_id: serverId,
-          normalized_path: normalizedPath,
-          current_confirmed_hash: currentConfirmedHash,
-          committed_hash: committedHash,
-          last_force_saved_hash: lastForceSavedHash,
-          active_key: activeKey,
-          session_epoch: Number(sessionEpoch),
-          commit_seq: Number(commitSeq),
-          active: Boolean(active),
-          updated_at: Number(updatedAt),
-        };
-        rooms.set(`${serverId}:${normalizedPath}`, row);
-        return { changes: 1 };
+        const key = `${serverId}:${normalizedPath}`;
+        const existing = rooms.get(key);
+        if (
+          !existing ||
+          Number(sessionEpoch) > existing.session_epoch ||
+          (Number(sessionEpoch) === existing.session_epoch && Number(commitSeq) >= existing.commit_seq)
+        ) {
+          const row: OnlyOfficeRoomRow = {
+            server_id: serverId,
+            normalized_path: normalizedPath,
+            current_confirmed_hash: currentConfirmedHash,
+            committed_hash: committedHash,
+            last_force_saved_hash: lastForceSavedHash,
+            active_key: activeKey,
+            session_epoch: Number(sessionEpoch),
+            commit_seq: Number(commitSeq),
+            active: Boolean(active),
+            updated_at: Number(updatedAt),
+          };
+          rooms.set(key, row);
+          return { changes: 1 };
+        }
+        return { changes: 0 };
       }
 
       if (normSql.startsWith('DELETE FROM onlyoffice_rooms WHERE server_id = $1 AND normalized_path = $2')) {
@@ -1991,6 +2000,44 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
     const after = store.rooms.get('srv-1:/team/shared/spec.docx')!;
     expect.soft(after.session_epoch, 'PG epoch must not be reset to zero after a read error').toBe(row.session_epoch);
     expect.soft(after.active_key, 'PG active key must not be replaced with a fabricated initial key').toBe(row.active_key);
+  });
+
+  it('audit-r9: a warm cache must not fork or overwrite a room force-saved by another PG-authoritative instance', async () => {
+    const get = () =>
+      app.request('/api/server/srv-1/onlyoffice/config?path=%2Fteam%2Fshared%2Fspec.docx&mode=edit', {
+        headers: { Authorization: bearer('owner-1') },
+      });
+    const first = await get();
+    expect(first.status).toBe(200);
+    const cfg = (await first.json()) as any;
+    const mapKey = 'srv-1:/team/shared/spec.docx';
+    const prior = { ...store.rooms.get(mapKey)! };
+    // Model a successful status-6 commit by a different instance sharing the same PG authority.
+    // A force-save advances confirmed hash/seq but deliberately retains the active room key.
+    const bytes = 'force-save-from-another-authoritative-instance';
+    const digest = sha256Hex(bytes);
+    const authoritative = {
+      ...prior,
+      current_confirmed_hash: digest,
+      committed_hash: digest,
+      last_force_saved_hash: digest,
+      commit_seq: prior.commit_seq + 1,
+      active: true,
+      updated_at: Date.now(),
+    };
+    store.rooms.set(mapKey, authoritative);
+    virtualFiles.set('/team/shared/spec.docx', {
+      content: Buffer.from(bytes).toString('base64'),
+      encoding: 'base64',
+      mtime: Date.now(),
+    });
+    expect(store.commitJournals.size).toBe(0);
+    const next = await get();
+    expect(next.status).toBe(200);
+    const nextCfg = (await next.json()) as any;
+    expect.soft(nextCfg.config.document.key, 'a joining participant must stay in the PG-confirmed active editing room').toBe(cfg.config.document.key);
+    expect.soft(store.rooms.get(mapKey)!.session_epoch, 'stale local cache must not advance/overwrite authoritative room epoch').toBe(authoritative.session_epoch);
+    expect.soft(store.rooms.get(mapKey)!.commit_seq, 'stale local cache must not overwrite the PG-confirmed commit revision').toBe(authoritative.commit_seq);
   });
 });
 

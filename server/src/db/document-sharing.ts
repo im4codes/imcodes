@@ -1226,7 +1226,9 @@ export async function upsertOnlyOfficeRoomRecord(
        session_epoch = EXCLUDED.session_epoch,
        commit_seq = EXCLUDED.commit_seq,
        active = EXCLUDED.active,
-       updated_at = EXCLUDED.updated_at`,
+       updated_at = EXCLUDED.updated_at
+     WHERE EXCLUDED.session_epoch > onlyoffice_rooms.session_epoch
+        OR (EXCLUDED.session_epoch = onlyoffice_rooms.session_epoch AND EXCLUDED.commit_seq >= onlyoffice_rooms.commit_seq)`,
     [
       room.server_id,
       room.normalized_path,
