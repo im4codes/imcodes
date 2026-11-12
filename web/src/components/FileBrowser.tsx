@@ -736,6 +736,7 @@ export function FileBrowser({
   const [sharedNewName, setSharedNewName] = useState('');
   const [sharedNewKind, setSharedNewKind] = useState<'docx' | 'xlsx' | 'pptx' | 'md' | 'folder'>('docx');
   const [sharedShowCreate, setSharedShowCreate] = useState(false);
+  const sharedFolderEpochRef = useRef(0);
   const externalShareToken = useMemo(() => detectExternalDocShareToken(), []);
   const [contextMenu, setContextMenu] = useState<FileContextMenuState | null>(null);
   const [modifiedFiles, setModifiedFiles] = useState<Map<string, string>>(new Map()); // path → git code
@@ -3135,9 +3136,10 @@ export function FileBrowser({
                 const targetSrv = item.serverId || serverId || '';
                 if (!targetSrv) return;
                 if (item.targetKind === 'folder') {
+                  const epoch = ++sharedFolderEpochRef.current;
                   void browseSharedDocFolder(targetSrv, item.targetPath)
                     .then((res) => {
-                      if (!mountedRef.current) return;
+                      if (!mountedRef.current || epoch !== sharedFolderEpochRef.current) return;
                       setSharedFolderView({
                         serverId: targetSrv,
                         rootPath: item.targetPath,
@@ -3147,7 +3149,7 @@ export function FileBrowser({
                       });
                     })
                     .catch((err: unknown) => {
-                      if (!mountedRef.current) return;
+                      if (!mountedRef.current || epoch !== sharedFolderEpochRef.current) return;
                       setError(err instanceof Error ? err.message : String(err));
                     });
                 } else {
@@ -3204,7 +3206,7 @@ export function FileBrowser({
                       data-testid="shared-folder-create-toggle"
                       onClick={() => setSharedShowCreate((prev) => !prev)}
                       style={{ background: 'transparent', border: 'none', color: '#38bdf8', cursor: 'pointer', fontSize: 11, fontWeight: 600 }}
-                      title={t('doc_share.new_document', 'New Document')}
+                      title={t('doc_share.new_doc_btn')}
                     >
                       +
                     </button>
@@ -3213,11 +3215,13 @@ export function FileBrowser({
                     <button
                       type="button"
                       onClick={() => {
+                        const epoch = ++sharedFolderEpochRef.current;
+                        const targetServer = sharedFolderView.serverId;
                         const parent = sharedFolderView.currentPath.split('/').slice(0, -1).join('/') || sharedFolderView.rootPath;
                         const safeParent = parent.startsWith(sharedFolderView.rootPath) ? parent : sharedFolderView.rootPath;
-                        void browseSharedDocFolder(sharedFolderView.serverId, safeParent).then((res) => {
-                          if (!mountedRef.current) return;
-                          setSharedFolderView((prev) => prev ? { ...prev, currentPath: res.path, entries: res.entries } : null);
+                        void browseSharedDocFolder(targetServer, safeParent).then((res) => {
+                          if (!mountedRef.current || epoch !== sharedFolderEpochRef.current) return;
+                          setSharedFolderView((prev) => (prev && prev.serverId === targetServer) ? { ...prev, currentPath: res.path, entries: res.entries } : null);
                         });
                       }}
                       style={{ background: 'transparent', border: 'none', color: '#60a5fa', cursor: 'pointer', fontSize: 11 }}
@@ -3233,21 +3237,24 @@ export function FileBrowser({
                   onSubmit={(e) => {
                     e.preventDefault();
                     if (!sharedNewName.trim()) return;
+                    const epoch = ++sharedFolderEpochRef.current;
+                    const targetServer = sharedFolderView.serverId;
+                    const targetPath = sharedFolderView.currentPath;
                     const base = sharedNewName.trim();
                     const ext = sharedNewKind === 'folder' ? '' : `.${sharedNewKind}`;
                     const finalName = ext && base.toLowerCase().endsWith(ext) ? base : `${base}${ext}`;
-                    void createSharedDocItem(sharedFolderView.serverId, {
-                      parentDir: sharedFolderView.currentPath,
+                    void createSharedDocItem(targetServer, {
+                      parentDir: targetPath,
                       name: finalName,
                       kind: sharedNewKind === 'folder' ? 'folder' : 'file',
                     }).then((created) => {
                       setSharedNewName('');
                       setSharedShowCreate(false);
-                      return browseSharedDocFolder(sharedFolderView.serverId, sharedFolderView.currentPath).then((res) => {
-                        if (!mountedRef.current) return;
-                        setSharedFolderView((prev) => prev ? { ...prev, entries: res.entries } : null);
+                      return browseSharedDocFolder(targetServer, targetPath).then((res) => {
+                        if (!mountedRef.current || epoch !== sharedFolderEpochRef.current) return;
+                        setSharedFolderView((prev) => (prev && prev.serverId === targetServer) ? { ...prev, entries: res.entries } : null);
                         if (created.kind === 'file') {
-                          setActiveSharedDocServerId(sharedFolderView.serverId);
+                          setActiveSharedDocServerId(targetServer);
                           setActiveSharedDocReadOnly(false);
                           setPreview({
                             status: 'office',
@@ -3278,14 +3285,14 @@ export function FileBrowser({
                     <option value="xlsx">.xlsx</option>
                     <option value="pptx">.pptx</option>
                     <option value="md">.md</option>
-                    <option value="folder">{t('doc_share.folder', 'Folder')}</option>
+                    <option value="folder">{t('doc_share.kind_folder')}</option>
                   </select>
                   <button
                     type="submit"
                     data-testid="shared-folder-create-submit"
                     style={{ padding: '3px 8px', background: '#2563eb', color: '#fff', border: 'none', borderRadius: 4, fontSize: 11, cursor: 'pointer' }}
                   >
-                    OK
+                    {t('common.confirm')}
                   </button>
                 </form>
               )}
@@ -3295,9 +3302,11 @@ export function FileBrowser({
                   data-testid={`shared-folder-entry-${entry.name}`}
                   onClick={() => {
                     if (entry.isDir) {
-                      void browseSharedDocFolder(sharedFolderView.serverId, entry.path).then((res) => {
-                        if (!mountedRef.current) return;
-                        setSharedFolderView((prev) => prev ? { ...prev, currentPath: res.path, entries: res.entries } : null);
+                      const epoch = ++sharedFolderEpochRef.current;
+                      const targetServer = sharedFolderView.serverId;
+                      void browseSharedDocFolder(targetServer, entry.path).then((res) => {
+                        if (!mountedRef.current || epoch !== sharedFolderEpochRef.current) return;
+                        setSharedFolderView((prev) => (prev && prev.serverId === targetServer) ? { ...prev, currentPath: res.path, entries: res.entries } : null);
                       });
                     } else {
                       setActiveSharedDocServerId(sharedFolderView.serverId);

@@ -4264,8 +4264,15 @@
     "route": "Маршрут: {{route}}",
     "encoder": "Кодировщик: {{encoder}}",
     "encoder_actual": "Кодировщик: {{detail}}",
-    "encoder_codec": { "vp9": "VP9", "vp8": "VP8", "h264": "H.264" },
-    "encoder_impl": { "software": "программный", "hardware": "аппаратный" },
+    "encoder_codec": {
+      "vp9": "VP9",
+      "vp8": "VP8",
+      "h264": "H.264"
+    },
+    "encoder_impl": {
+      "software": "программный",
+      "hardware": "аппаратный"
+    },
     "encoder_detail": "{{codec}} ({{implementation}}, {{name}})",
     "encoder_detail_plain": "{{codec}} ({{implementation}})",
     "encoder_note_setting": "H.264 принудительно настройкой узла",
@@ -4959,6 +4966,8 @@
     "new_folder_btn": "+ Новая папка",
     "up_folder": "⬆ Вверх",
     "empty_folder": "Эта общая папка пуста.",
-    "select_file_prompt": "Выберите документ слева для просмотра или редактирования в ONLYOFFICE."
+    "select_file_prompt": "Выберите документ слева для просмотра или редактирования в ONLYOFFICE.",
+    "new_file_name": "Имя...",
+    "up_dir": "Вверх"
   }
 }

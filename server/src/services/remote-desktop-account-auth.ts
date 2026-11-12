@@ -256,6 +256,7 @@ export async function resolveBrowserAccountSession(
   if (!token) return null;
   const payload = verifyJwt(token, jwtSigningKey);
   if (!isAccountSessionJwt(payload)) return null;
+  if ((payload as Record<string, unknown>).scope === 'doc_collaborator') return null;
   const session = {
     kind: 'web',
     id: hashDomain(WEB_SESSION_HASH_DOMAIN, token),

@@ -106,7 +106,13 @@ import { csrfMiddleware } from './security/csrf.js';
 import { cors } from 'hono/cors';
 import { verifyJwt } from './security/crypto.js';
 import { evaluateUserAccess, loadUserAccess } from './security/user-status.js';
-import { resolveAuth, resolveServerWebSocketAccess } from './security/authorization.js';
+import {
+  resolveAuth,
+  resolveServerWebSocketAccess,
+  isAllowedDocCollaboratorRoute,
+  DOC_COLLABORATOR_SCOPE_REFUSAL,
+  getCookieFromHeader,
+} from './security/authorization.js';
 import logger from './util/logger.js';
 import { getPodIdentity } from './util/pod-identity.js';
 import { REMOTE_DESKTOP_APP_MANIFEST_MIME, isRemoteDesktopAppAssetPath } from '../../shared/remote-desktop-app.js';
@@ -245,6 +251,38 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
 
   // CSRF protection for all API write operations (skips Bearer auth and safe methods)
   app.use('/api/*', csrfMiddleware());
+
+  // Central boundary for restricted doc_collaborator tokens (both Cookie and Bearer)
+  app.use('/api/*', async (c, next) => {
+    if (c.req.method.toUpperCase() === 'OPTIONS') {
+      return next();
+    }
+    const signingKey = c.env.JWT_SIGNING_KEY;
+    if (signingKey) {
+      let isDocCollaborator = false;
+      const cookieVal = getCookieFromHeader(c.req.header('Cookie'), COOKIE_SESSION);
+      if (cookieVal) {
+        const payload = verifyJwt(cookieVal, signingKey);
+        if (isAccountSessionJwt(payload) && (payload as Record<string, unknown>).scope === 'doc_collaborator') {
+          isDocCollaborator = true;
+        }
+      }
+      if (!isDocCollaborator) {
+        const authHeader = c.req.header('Authorization');
+        if (authHeader?.startsWith('Bearer ')) {
+          const bearerToken = authHeader.slice(7);
+          const payload = verifyJwt(bearerToken, signingKey);
+          if (payload && (payload as Record<string, unknown>).scope === 'doc_collaborator') {
+            isDocCollaborator = true;
+          }
+        }
+      }
+      if (isDocCollaborator && !isAllowedDocCollaboratorRoute(c.req.method, c.req.path)) {
+        return c.json({ error: 'forbidden', reason: DOC_COLLABORATOR_SCOPE_REFUSAL }, 403);
+      }
+    }
+    await next();
+  });
 
   app.route('/api/auth', authRoutes);
   app.route('/api/auth/github', githubAuthRoutes);

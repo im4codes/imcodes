@@ -64,17 +64,26 @@ export function authFailureResponse(c: Pick<Context, 'json'>, resolution: AuthRe
  * and a disabled user keeps none of them. The check is a join in the credential's own lookup where there is one, and a primary-key read
  * for a stateless JWT -- never a per-pod cache, so a disable is honoured by every replica on its next request.
  */
-function isAllowedDocCollaboratorRoute(path: string): boolean {
-  return (
-    path.startsWith('/api/onlyoffice/') ||
-    path === '/api/onlyoffice' ||
-    path.startsWith('/api/doc-shares/') ||
-    path === '/api/doc-shares' ||
-    path.includes('/onlyoffice/') ||
-    path === '/api/auth/me' ||
-    path === '/api/auth/refresh' ||
-    path === '/api/auth/logout'
-  );
+export function isAllowedDocCollaboratorRoute(method: string, rawPath: string): boolean {
+  if (method.toUpperCase() === 'OPTIONS') return true;
+  const path = rawPath.startsWith('/api') ? rawPath : `/api${rawPath.startsWith('/') ? '' : '/'}${rawPath}`;
+  const upperMethod = method.toUpperCase();
+
+  // Session verification & lifecycle endpoints
+  if (upperMethod === 'GET' && (path === '/api/auth/user/me' || path === '/api/auth/me')) return true;
+  if (upperMethod === 'POST' && (path === '/api/auth/refresh' || path === '/api/auth/logout')) return true;
+
+  // ONLYOFFICE endpoints (top-level and scoped to server)
+  if (path === '/api/onlyoffice' || path.startsWith('/api/onlyoffice/')) return true;
+  if (/^\/api\/server\/[^/]+\/onlyoffice(\/.*)?$/.test(path)) return true;
+
+  // Doc shares external/public & collaboration endpoints
+  if (path === '/api/doc-shares' || path.startsWith('/api/doc-shares/')) return true;
+  if (upperMethod === 'GET' && /^\/api\/server\/[^/]+\/doc-shares\/browse$/.test(path)) return true;
+  if (upperMethod === 'POST' && /^\/api\/server\/[^/]+\/doc-shares\/create-item$/.test(path)) return true;
+  if (upperMethod === 'GET' && /^\/api\/server\/[^/]+\/doc-shares\/file$/.test(path)) return true;
+
+  return false;
 }
 
 export async function resolveAuthOutcome(c: Pick<Context<{ Bindings: Env }>, 'req' | 'env'>): Promise<AuthResolution> {
@@ -83,7 +92,7 @@ export async function resolveAuthOutcome(c: Pick<Context<{ Bindings: Env }>, 're
   if (cookieToken && c.env.JWT_SIGNING_KEY) {
     const payload = verifyJwt(cookieToken, c.env.JWT_SIGNING_KEY);
     if (isAccountSessionJwt(payload)) {
-      return resolveLoginTokenUser(c.env.DB, payload, c.req.path);
+      return resolveLoginTokenUser(c.env.DB, payload, c.req.path, c.req.method);
     }
   }
 
@@ -98,11 +107,12 @@ async function resolveLoginTokenUser(
   db: Database,
   payload: Record<string, unknown> & { sub: string },
   reqPath?: string,
+  reqMethod = 'GET',
 ): Promise<AuthResolution> {
   const decision = evaluateUserAccess(await loadUserAccess(db, payload.sub), typeof payload.iat === 'number' ? payload.iat : undefined);
   if (!decision.ok) return { auth: null, denied: decision.code };
   const scope = payload.scope === 'doc_collaborator' ? 'doc_collaborator' : undefined;
-  if (scope === 'doc_collaborator' && reqPath && !isAllowedDocCollaboratorRoute(reqPath)) {
+  if (scope === 'doc_collaborator' && reqPath && !isAllowedDocCollaboratorRoute(reqMethod, reqPath)) {
     throw new HTTPException(403, {
       res: Response.json({ error: 'forbidden', reason: DOC_COLLABORATOR_SCOPE_REFUSAL }, { status: 403 }),
     });
@@ -187,10 +197,10 @@ export async function resolveBearerOutcome(
   const payload = verifyJwt(token, c.env.JWT_SIGNING_KEY);
   if (!payload) return { auth: null };
   if (!isAccountSessionJwt(payload)) return { auth: null }; // special-purpose tokens (tickets, machine authority, capability blobs) are not logins
-  return resolveLoginTokenUser(c.env.DB, payload, c.req.path);
+  return resolveLoginTokenUser(c.env.DB, payload, c.req.path, c.req.method);
 }
 
-function getCookieFromHeader(cookieHeader: string | undefined, name: string): string | undefined {
+export function getCookieFromHeader(cookieHeader: string | undefined, name: string): string | undefined {
   if (!cookieHeader) return undefined;
   const parts = cookieHeader.split(/;\s*/);
   for (const part of parts) {

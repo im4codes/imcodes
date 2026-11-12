@@ -4265,8 +4265,15 @@
     "route": "路徑：{{route}}",
     "encoder": "編碼器：{{encoder}}",
     "encoder_actual": "編碼器：{{detail}}",
-    "encoder_codec": { "vp9": "VP9", "vp8": "VP8", "h264": "H.264" },
-    "encoder_impl": { "software": "軟體", "hardware": "硬體" },
+    "encoder_codec": {
+      "vp9": "VP9",
+      "vp8": "VP8",
+      "h264": "H.264"
+    },
+    "encoder_impl": {
+      "software": "軟體",
+      "hardware": "硬體"
+    },
     "encoder_detail": "{{codec}}（{{implementation}}，{{name}}）",
     "encoder_detail_plain": "{{codec}}（{{implementation}}）",
     "encoder_note_setting": "H.264（節點設定強制）",
@@ -4960,6 +4967,8 @@
     "new_folder_btn": "+ 新增資料夾",
     "up_folder": "⬆ 上一層",
     "empty_folder": "目前共用資料夾為空。",
-    "select_file_prompt": "請從左側清單選擇文件以使用 ONLYOFFICE 預覽或協同編輯。"
+    "select_file_prompt": "請從左側清單選擇文件以使用 ONLYOFFICE 預覽或協同編輯。",
+    "new_file_name": "名稱...",
+    "up_dir": "上一級"
   }
 }

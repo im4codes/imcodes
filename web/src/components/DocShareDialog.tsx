@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'preact/hooks';
+import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import {
   browseExternalDocShare,
@@ -960,6 +960,9 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
   const [shareInfo, setShareInfo] = useState<ExternalShareView | null>(null);
   const [sharedWithMeList, setSharedWithMeList] = useState<SharedWithMeDocItem[]>([]);
   const [selectedShareId, setSelectedShareId] = useState<string>('');
+  const requestEpochRef = useRef(0);
+  const selectedShareIdRef = useRef<string>('');
+  selectedShareIdRef.current = selectedShareId;
   const [serverId, setServerId] = useState<string>('');
   const [currentPath, setCurrentPath] = useState<string>('');
   const [rootPath, setRootPath] = useState<string>('');
@@ -995,21 +998,24 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
 
   const loadExternalBrowse = useCallback(
     async (subPath?: string, customDevToken?: string, customCode?: string) => {
+      const epoch = ++requestEpochRef.current;
       setLoading(true);
       setError(null);
       try {
         if (!token) {
           const listRes = await listDocsSharedWithMe();
+          if (epoch !== requestEpochRef.current) return;
           setSharedWithMeList(listRes.shares);
           const currentShare =
-            (selectedShareId ? listRes.shares.find((s) => s.id === selectedShareId) : null) ||
+            (selectedShareIdRef.current ? listRes.shares.find((s) => s.id === selectedShareIdRef.current) : null) ||
             listRes.shares[0];
           if (!currentShare) {
             setNeedsVerify(false);
             return;
           }
-          if (currentShare.id !== selectedShareId) {
+          if (currentShare.id !== selectedShareIdRef.current) {
             setSelectedShareId(currentShare.id);
+            selectedShareIdRef.current = currentShare.id;
           }
           setServerId(currentShare.serverId);
           setRootPath(currentShare.targetPath);
@@ -1038,6 +1044,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
             setEntries([]);
           } else {
             const folderRes = await browseSharedDocFolder(currentShare.serverId, browsePath);
+            if (epoch !== requestEpochRef.current || selectedShareIdRef.current !== currentShare.id) return;
             setEntries(folderRes.entries);
             if (!subPath) {
               setActiveFilePath(null);
@@ -1051,6 +1058,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
           deviceToken: customDevToken ?? (deviceToken || undefined),
           accessCode: customCode ?? (accessCode || undefined),
         });
+        if (epoch !== requestEpochRef.current) return;
         setShareInfo(res.share);
         setServerId(res.serverId);
         setRootPath(res.rootPath);
@@ -1063,10 +1071,13 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
           setActiveFilePath(null);
         }
       } catch (err) {
+        if (epoch !== requestEpochRef.current) return;
         setNeedsVerify(Boolean(token));
         setError(err instanceof Error ? err.message : String(err));
       } finally {
-        setLoading(false);
+        if (epoch === requestEpochRef.current) {
+          setLoading(false);
+        }
       }
     },
     [token, deviceToken, accessCode, selectedShareId],
@@ -1441,7 +1452,10 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
                     type="button"
                     data-testid={`shared-tab-${item.id}`}
                     onClick={() => {
+                      const epoch = ++requestEpochRef.current;
+                      const targetId = item.id;
                       setSelectedShareId(item.id);
+                      selectedShareIdRef.current = item.id;
                       setServerId(item.serverId);
                       setRootPath(item.targetPath);
                       setCurrentPath(item.targetPath);
@@ -1468,7 +1482,10 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
                       } else {
                         setActiveFilePath(null);
                         setEntries([]);
-                        void browseSharedDocFolder(item.serverId, item.targetPath).then((r) => setEntries(r.entries));
+                        void browseSharedDocFolder(item.serverId, item.targetPath).then((r) => {
+                          if (epoch !== requestEpochRef.current || selectedShareIdRef.current !== targetId) return;
+                          setEntries(r.entries);
+                        });
                       }
                     }}
                     style={{

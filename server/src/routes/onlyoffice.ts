@@ -152,8 +152,10 @@ export function resolveOnlyOfficeJwtSecret(env: Pick<Env, 'ONLYOFFICE_JWT_SECRET
 interface DocumentVersionState {
   committedHash: string;
   lastForceSavedHash: string | null;
-  rev: number;
+  sessionEpoch: number;
+  commitSeq: number;
   activeKey: string;
+  updatedAt: number;
 }
 
 const ROOMS_STORE_PATH = path.join(os.tmpdir(), '.imcodes-onlyoffice-rooms.json');
@@ -177,7 +179,9 @@ function savePersistentRoom(mapKey: string, state: DocumentVersionState | null):
     } else {
       data[mapKey] = state;
     }
-    fs.writeFileSync(ROOMS_STORE_PATH, JSON.stringify(data), 'utf8');
+    const tmp = `${ROOMS_STORE_PATH}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(data), 'utf8');
+    fs.renameSync(tmp, ROOMS_STORE_PATH);
   } catch { /* ignore */ }
 }
 
@@ -204,6 +208,11 @@ async function lockDocumentCommit<T>(key: string, fn: () => Promise<T>): Promise
 const documentRevisionMap = new Map<string, number>();
 const documentVersionStateMap = new Map<string, DocumentVersionState>();
 
+function getDocumentCommitSeq(mapKey: string): number {
+  const state = documentVersionStateMap.get(mapKey) ?? loadPersistentRooms()[mapKey];
+  return state?.commitSeq ?? 0;
+}
+
 function computeDocumentKeyFromDigest(
   serverId: string,
   normalizedPath: string,
@@ -220,16 +229,15 @@ export function getOnlyOfficeDocumentKey(
   contentHash?: string,
 ): string {
   const mapKey = `${serverId}:${normalizedPath}`;
-  if (contentHash) {
-    const rev = documentRevisionMap.get(`${mapKey}:${contentHash}`) ?? 0;
-    return computeDocumentKeyFromDigest(serverId, normalizedPath, contentHash, rev);
+  const state = documentVersionStateMap.get(mapKey) ?? loadPersistentRooms()[mapKey];
+  if (state) {
+    if (contentHash && contentHash !== state.committedHash && contentHash !== state.lastForceSavedHash) {
+      return computeDocumentKeyFromDigest(serverId, normalizedPath, contentHash, state.sessionEpoch);
+    }
+    return state.activeKey;
   }
-  const existingState = documentVersionStateMap.get(mapKey) || loadPersistentRooms()[mapKey];
-  if (existingState) {
-    return existingState.activeKey;
-  }
-  const rev = documentRevisionMap.get(mapKey) ?? 1;
-  return sha256Hex(`onlyoffice-collab:${serverId}:${normalizedPath}:r${rev}`).slice(0, 32);
+  const hash = contentHash ?? 'initial';
+  return computeDocumentKeyFromDigest(serverId, normalizedPath, hash, 0);
 }
 
 export function bumpOnlyOfficeDocumentRevision(
@@ -238,29 +246,25 @@ export function bumpOnlyOfficeDocumentRevision(
   newContentHash?: string,
 ): number {
   const mapKey = `${serverId}:${normalizedPath}`;
-  const next = (documentRevisionMap.get(mapKey) ?? 1) + 1;
-  documentRevisionMap.set(mapKey, next);
-
-  const existing = documentVersionStateMap.get(mapKey) || loadPersistentRooms()[mapKey];
-  const resolvedHash = newContentHash ?? existing?.committedHash;
-  if (resolvedHash) {
-    const digestRevKey = `${mapKey}:${resolvedHash}`;
-    const prevDigestRev = documentRevisionMap.get(digestRevKey) ?? 0;
-    const nextDigestRev = existing && existing.committedHash === resolvedHash ? prevDigestRev + 1 : prevDigestRev;
-    if (nextDigestRev > 0) {
-      documentRevisionMap.set(digestRevKey, nextDigestRev);
-    }
-    const activeKey = computeDocumentKeyFromDigest(serverId, normalizedPath, resolvedHash, nextDigestRev);
-    const newState: DocumentVersionState = {
-      committedHash: resolvedHash,
-      lastForceSavedHash: null,
-      rev: next,
-      activeKey,
-    };
-    documentVersionStateMap.set(mapKey, newState);
-    savePersistentRoom(mapKey, newState);
+  let state = documentVersionStateMap.get(mapKey);
+  if (!state) {
+    state = loadPersistentRooms()[mapKey];
   }
-  return next;
+  const sessionEpoch = (state?.sessionEpoch ?? 0) + 1;
+  const commitSeq = (state?.commitSeq ?? 0) + 1;
+  const resolvedHash = newContentHash ?? state?.committedHash ?? 'initial';
+  const activeKey = computeDocumentKeyFromDigest(serverId, normalizedPath, resolvedHash, sessionEpoch);
+  const newState: DocumentVersionState = {
+    committedHash: resolvedHash,
+    lastForceSavedHash: null,
+    sessionEpoch,
+    commitSeq,
+    activeKey,
+    updatedAt: Date.now(),
+  };
+  documentVersionStateMap.set(mapKey, newState);
+  savePersistentRoom(mapKey, newState);
+  return sessionEpoch;
 }
 
 export function resetOnlyOfficeDocumentKeyCacheForTests(): void {
@@ -290,26 +294,30 @@ export async function resolveOnlyOfficeDocumentKey(
         return existing.activeKey;
       }
       // File content changed externally on the daemon -> advance to new version key
-      const digestRev = documentRevisionMap.get(`${mapKey}:${currentHash}`) ?? 0;
-      const activeKey = computeDocumentKeyFromDigest(serverId, normalizedPath, currentHash, digestRev);
+      const nextEpoch = existing.sessionEpoch + 1;
+      const nextSeq = existing.commitSeq + 1;
+      const activeKey = computeDocumentKeyFromDigest(serverId, normalizedPath, currentHash, nextEpoch);
       const newState: DocumentVersionState = {
         committedHash: currentHash,
         lastForceSavedHash: null,
-        rev: existing.rev + 1,
+        sessionEpoch: nextEpoch,
+        commitSeq: nextSeq,
         activeKey,
+        updatedAt: Date.now(),
       };
       documentVersionStateMap.set(mapKey, newState);
       savePersistentRoom(mapKey, newState);
       return activeKey;
     }
 
-    const digestRev = documentRevisionMap.get(`${mapKey}:${currentHash}`) ?? 0;
-    const activeKey = computeDocumentKeyFromDigest(serverId, normalizedPath, currentHash, digestRev);
+    const activeKey = computeDocumentKeyFromDigest(serverId, normalizedPath, currentHash, 0);
     const newState: DocumentVersionState = {
       committedHash: currentHash,
       lastForceSavedHash: null,
-      rev: documentRevisionMap.get(mapKey) ?? 1,
+      sessionEpoch: 0,
+      commitSeq: 0,
       activeKey,
+      updatedAt: Date.now(),
     };
     documentVersionStateMap.set(mapKey, newState);
     savePersistentRoom(mapKey, newState);
@@ -1483,6 +1491,7 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
     }
 
     const mapKey = `${claims.serverId}:${claims.path}`;
+    const startCommitSeq = getDocumentCommitSeq(mapKey);
     const preCheckKey = await resolveOnlyOfficeDocumentKey(claims.serverId, claims.path, {
       allowedRoot: liveAccess.allowedRoot ?? undefined,
     });
@@ -1519,6 +1528,11 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
         return c.json({ error: 1, message: 'share_revoked_or_downgraded' }, 403);
       }
 
+      // Check commit sequence: if a newer commit succeeded while downloading, this older callback loses write authority
+      if (getDocumentCommitSeq(mapKey) !== startCommitSeq) {
+        return c.json({ error: 1, message: 'stale_document_commit_sequence' }, 409);
+      }
+
       const keyAtCommit = await resolveOnlyOfficeDocumentKey(claims.serverId, claims.path, {
         allowedRoot: liveCommitAccess.allowedRoot ?? undefined,
       });
@@ -1543,21 +1557,35 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
       }
 
       const newDigest = createHash('sha256').update(bytes).digest('hex');
+      let state = documentVersionStateMap.get(mapKey) ?? loadPersistentRooms()[mapKey];
       if (status === 2) {
-        bumpOnlyOfficeDocumentRevision(claims.serverId, claims.path, newDigest);
+        const nextEpoch = (state?.sessionEpoch ?? 0) + 1;
+        const nextSeq = (state?.commitSeq ?? 0) + 1;
+        const nextKey = computeDocumentKeyFromDigest(claims.serverId, claims.path, newDigest, nextEpoch);
+        const newState: DocumentVersionState = {
+          committedHash: newDigest,
+          lastForceSavedHash: null,
+          sessionEpoch: nextEpoch,
+          commitSeq: nextSeq,
+          activeKey: nextKey,
+          updatedAt: Date.now(),
+        };
+        documentVersionStateMap.set(mapKey, newState);
+        savePersistentRoom(mapKey, newState);
       } else if (status === 6) {
-        let existing = documentVersionStateMap.get(mapKey);
-        if (!existing) {
-          const persisted = loadPersistentRooms()[mapKey];
-          if (persisted) {
-            existing = persisted;
-            documentVersionStateMap.set(mapKey, existing);
-          }
-        }
-        if (existing) {
-          existing.lastForceSavedHash = newDigest;
-          savePersistentRoom(mapKey, existing);
-        }
+        const nextSeq = (state?.commitSeq ?? 0) + 1;
+        const currentEpoch = state?.sessionEpoch ?? 0;
+        const currentKey = state?.activeKey ?? signedKey;
+        const newState: DocumentVersionState = {
+          committedHash: state?.committedHash ?? newDigest,
+          lastForceSavedHash: newDigest,
+          sessionEpoch: currentEpoch,
+          commitSeq: nextSeq,
+          activeKey: currentKey,
+          updatedAt: Date.now(),
+        };
+        documentVersionStateMap.set(mapKey, newState);
+        savePersistentRoom(mapKey, newState);
       }
 
       return c.json({ error: 0 });

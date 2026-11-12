@@ -2433,7 +2433,37 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
             const rawExpanded = destDir.startsWith('~') ? destDir.replace(/^~/, homedir()) : destDir;
             const resolvedDest = nodePath.resolve(rawExpanded);
             const realDest = await fsRealpath(resolvedDest);
-            if (!isPathAllowed(realDest) || !isSameOrInsidePath(sessionRoot.realRoot, realDest)) {
+            if (!isPathAllowed(realDest)) {
+              try {
+                serverLink.send({
+                  type: 'file.upload_error',
+                  uploadId: cmd.uploadId,
+                  error: 'forbidden_path',
+                });
+              } catch { /* ignore */ }
+              return;
+            }
+            if (sessionRoot.allowedRootIsFile) {
+              const fileName = typeof cmd.sanitizedName === 'string' && cmd.sanitizedName
+                ? cmd.sanitizedName
+                : typeof cmd.originalName === 'string' ? cmd.originalName : '';
+              const targetBase = nodePath.basename(sessionRoot.realRoot);
+              const targetDir = nodePath.dirname(sessionRoot.realRoot);
+              const isAllowedStage = realDest === targetDir
+                && fileName.startsWith('.oo-stage-')
+                && fileName.endsWith(`-${targetBase}`);
+              const isExactFileTarget = realDest === targetDir && fileName === targetBase;
+              if (!isAllowedStage && !isExactFileTarget) {
+                try {
+                  serverLink.send({
+                    type: 'file.upload_error',
+                    uploadId: cmd.uploadId,
+                    error: 'forbidden_path',
+                  });
+                } catch { /* ignore */ }
+                return;
+              }
+            } else if (!isSameOrInsidePath(sessionRoot.realRoot, realDest)) {
               try {
                 serverLink.send({
                   type: 'file.upload_error',

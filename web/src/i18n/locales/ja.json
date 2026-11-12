@@ -4264,8 +4264,15 @@
     "route": "経路: {{route}}",
     "encoder": "エンコーダー: {{encoder}}",
     "encoder_actual": "エンコーダー: {{detail}}",
-    "encoder_codec": { "vp9": "VP9", "vp8": "VP8", "h264": "H.264" },
-    "encoder_impl": { "software": "ソフトウェア", "hardware": "ハードウェア" },
+    "encoder_codec": {
+      "vp9": "VP9",
+      "vp8": "VP8",
+      "h264": "H.264"
+    },
+    "encoder_impl": {
+      "software": "ソフトウェア",
+      "hardware": "ハードウェア"
+    },
     "encoder_detail": "{{codec}}（{{implementation}}、{{name}}）",
     "encoder_detail_plain": "{{codec}}（{{implementation}}）",
     "encoder_note_setting": "ノードの設定により H.264 に固定",
@@ -4959,6 +4966,8 @@
     "new_folder_btn": "+ 新規フォルダ",
     "up_folder": "⬆ 上へ",
     "empty_folder": "この共有フォルダは空です。",
-    "select_file_prompt": "左側のリストからドキュメントを選択して ONLYOFFICE で開きます。"
+    "select_file_prompt": "左側のリストからドキュメントを選択して ONLYOFFICE で開きます。",
+    "new_file_name": "名前...",
+    "up_dir": "上へ"
   }
 }

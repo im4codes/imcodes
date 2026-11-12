@@ -4264,8 +4264,15 @@
     "route": "경로: {{route}}",
     "encoder": "인코더: {{encoder}}",
     "encoder_actual": "인코더: {{detail}}",
-    "encoder_codec": { "vp9": "VP9", "vp8": "VP8", "h264": "H.264" },
-    "encoder_impl": { "software": "소프트웨어", "hardware": "하드웨어" },
+    "encoder_codec": {
+      "vp9": "VP9",
+      "vp8": "VP8",
+      "h264": "H.264"
+    },
+    "encoder_impl": {
+      "software": "소프트웨어",
+      "hardware": "하드웨어"
+    },
     "encoder_detail": "{{codec}} ({{implementation}}, {{name}})",
     "encoder_detail_plain": "{{codec}} ({{implementation}})",
     "encoder_note_setting": "노드 설정으로 H.264 강제",
@@ -4959,6 +4966,8 @@
     "new_folder_btn": "+ 새 폴더",
     "up_folder": "⬆ 상위 폴더",
     "empty_folder": "이 공유 폴더는 비어 있습니다.",
-    "select_file_prompt": "왼쪽 목록에서 문서를 선택하여 ONLYOFFICE에서 미리보거나 편집하세요."
+    "select_file_prompt": "왼쪽 목록에서 문서를 선택하여 ONLYOFFICE에서 미리보거나 편집하세요.",
+    "new_file_name": "이름...",
+    "up_dir": "위로"
   }
 }

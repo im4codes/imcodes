@@ -4266,8 +4266,15 @@
     "route": "链路：{{route}}",
     "encoder": "编码器：{{encoder}}",
     "encoder_actual": "编码器：{{detail}}",
-    "encoder_codec": { "vp9": "VP9", "vp8": "VP8", "h264": "H.264" },
-    "encoder_impl": { "software": "软件", "hardware": "硬件" },
+    "encoder_codec": {
+      "vp9": "VP9",
+      "vp8": "VP8",
+      "h264": "H.264"
+    },
+    "encoder_impl": {
+      "software": "软件",
+      "hardware": "硬件"
+    },
     "encoder_detail": "{{codec}}（{{implementation}}，{{name}}）",
     "encoder_detail_plain": "{{codec}}（{{implementation}}）",
     "encoder_note_setting": "H.264（节点设置强制）",
@@ -4970,6 +4977,8 @@
     "new_folder_btn": "+ 新建文件夹",
     "up_folder": "⬆ 上一级",
     "empty_folder": "当前共享文件夹为空。",
-    "select_file_prompt": "请从左侧列表选择文档以使用 ONLYOFFICE 预览或协同编辑。"
+    "select_file_prompt": "请从左侧列表选择文档以使用 ONLYOFFICE 预览或协同编辑。",
+    "new_file_name": "名称...",
+    "up_dir": "上一级"
   }
 }

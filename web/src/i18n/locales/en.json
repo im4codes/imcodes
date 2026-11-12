@@ -4266,8 +4266,15 @@
     "route": "Route: {{route}}",
     "encoder": "Encoder: {{encoder}}",
     "encoder_actual": "Encoder: {{detail}}",
-    "encoder_codec": { "vp9": "VP9", "vp8": "VP8", "h264": "H.264" },
-    "encoder_impl": { "software": "software", "hardware": "hardware" },
+    "encoder_codec": {
+      "vp9": "VP9",
+      "vp8": "VP8",
+      "h264": "H.264"
+    },
+    "encoder_impl": {
+      "software": "software",
+      "hardware": "hardware"
+    },
     "encoder_detail": "{{codec}} ({{implementation}}, {{name}})",
     "encoder_detail_plain": "{{codec}} ({{implementation}})",
     "encoder_note_setting": "H.264 forced by the node setting",
@@ -4970,6 +4977,8 @@
     "new_folder_btn": "+ New Folder",
     "up_folder": "⬆ Up",
     "empty_folder": "This shared folder is empty.",
-    "select_file_prompt": "Select a document from the left to preview or collaborate in ONLYOFFICE."
+    "select_file_prompt": "Select a document from the left to preview or collaborate in ONLYOFFICE.",
+    "new_file_name": "Name...",
+    "up_dir": "Up"
   }
 }
