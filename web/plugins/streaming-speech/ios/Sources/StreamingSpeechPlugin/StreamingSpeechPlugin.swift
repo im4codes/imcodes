@@ -81,7 +81,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     }
     @objc public func start(_ call: CAPPluginCall) {
         DispatchQueue.main.async {
-            guard UIApplication.shared.applicationState == .active else {
+            guard UIApplication.shared.applicationState != .background else {
                 call.reject("Speech requires a foreground app"); return
             }
             if self.engine?.isRunning == true { call.resolve(); return }
@@ -132,8 +132,8 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                     throw NSError(domain: "StreamingSpeech", code: 2, userInfo: nil)
                 }
                 self.engine = engine
-                input.installTap(onBus: 0, bufferSize: AVAudioFrameCount(format.sampleRate / 10), format: nil) { [weak self] buffer, _ in
-                    self?.consume(buffer, owner: owner, converter: converter, format: mono)
+                input.installTap(onBus: 0, bufferSize: AVAudioFrameCount(format.sampleRate / 10), format: format) { [weak self] buffer, _ in
+                    self?.consume(buffer, owner: owner, converter: converter, mono: mono)
                 }
                 self.tapInstalled = true
                 self.startingCall = call
@@ -150,23 +150,41 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
             }
         }
     }
-    private func consume(_ buffer: AVAudioPCMBuffer, owner: UInt64, converter: AVAudioConverter, format: AVAudioFormat) {
+    private func consume(_ buffer: AVAudioPCMBuffer, owner: UInt64, converter: AVAudioConverter, mono: AVAudioFormat) {
         // Admission and worker enqueue are atomic with the stop barrier. A tap
         // already converting when stop begins must enqueue its tail before flush.
         lock.lock()
         defer { lock.unlock() }
         guard generation == owner else { return }
         let capacity = AVAudioFrameCount(ceil(Double(buffer.frameLength) * 16000 / buffer.format.sampleRate) + 16)
-        guard let converted = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: capacity) else { return }
+        guard let converted = AVAudioPCMBuffer(pcmFormat: mono, frameCapacity: capacity) else { return }
+        let activeConverter: AVAudioConverter
+        if converter.inputFormat == buffer.format {
+            activeConverter = converter
+        } else if let fallback = AVAudioConverter(from: buffer.format, to: mono) {
+            activeConverter = fallback
+        } else {
+            DispatchQueue.main.async {
+                if self.isCurrent(owner) {
+                    self.notifyListeners("recognitionError", data: ["message": "Offline audio conversion failed: incompatible tap format"])
+                    self.endCapture(nil)
+                }
+            }
+            return
+        }
         var supplied = false
         var conversionError: NSError?
-        converter.convert(to: converted, error: &conversionError) { _, status in
+        activeConverter.convert(to: converted, error: &conversionError) { _, status in
             if supplied { status.pointee = .noDataNow; return nil }
             supplied = true; status.pointee = .haveData; return buffer
         }
         guard conversionError == nil, let channel = converted.floatChannelData?[0] else {
+            let detail = conversionError?.localizedDescription ?? "missing converted channel data"
             DispatchQueue.main.async {
-                if self.isCurrent(owner) { self.endCapture(nil) }
+                if self.isCurrent(owner) {
+                    self.notifyListeners("recognitionError", data: ["message": "Offline audio conversion failed: \(detail)"])
+                    self.endCapture(nil)
+                }
             }
             return
         }

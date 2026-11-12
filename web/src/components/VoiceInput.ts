@@ -58,9 +58,17 @@ let _nativeSession: { recognition: NativeSpeechRecognition } | null = null;
 let _removePartial: (() => void | Promise<void>) | null = null;
 let _removeLevel: (() => void | Promise<void>) | null = null;
 let _removeListeningState: (() => void | Promise<void>) | null = null;
+let _removeRecognitionError: (() => void | Promise<void>) | null = null;
 let _onResult: ((text: string, isFinal: boolean) => void) | null = null;
 let _onLevel: ((level: number) => void) | null = null;
 let _onListeningChange: ((listening: boolean) => void) | null = null;
+let _onError: ((error: string) => void) | null = null;
+let _lastError: string | null = null;
+
+function reportError(error: string): void {
+  _lastError = error;
+  _onError?.(error);
+}
 
 // --- Web Speech API fallback state (desktop browsers) ---
 let _webRec: any = null;
@@ -89,13 +97,16 @@ async function removeRecognitionListeners(): Promise<void> {
   const removePartial = _removePartial;
   const removeLevel = _removeLevel;
   const removeListeningState = _removeListeningState;
+  const removeRecognitionError = _removeRecognitionError;
   _removePartial = null;
   _removeLevel = null;
   _removeListeningState = null;
+  _removeRecognitionError = null;
   await Promise.all([
     Promise.resolve().then(() => removePartial?.()).catch(() => undefined),
     Promise.resolve().then(() => removeLevel?.()).catch(() => undefined),
     Promise.resolve().then(() => removeListeningState?.()).catch(() => undefined),
+    Promise.resolve().then(() => removeRecognitionError?.()).catch(() => undefined),
   ]);
 }
 
@@ -113,17 +124,26 @@ async function startListeningInternal(generation: number): Promise<boolean> {
   const locale = pickLocale();
   const session = { recognition: getNativeSpeechRecognition(), text: null as string | null, final: false };
   const recognition = session.recognition;
+  _lastError = null;
   await removeRecognitionListeners();
   if (generation !== _generation) return false;
   _nativeSession = session;
 
   try {
     const perms = await recognition.requestPermissions();
-    if (perms.speechRecognition !== 'granted') return false;
+    if (perms.speechRecognition !== 'granted') {
+      console.warn('[voice] microphone permission denied');
+      if (generation === _generation) reportError('permission_denied');
+      return false;
+    }
     if (generation !== _generation) return false;
 
     const available = await recognition.available();
-    if (!available.available) return false;
+    if (!available.available) {
+      console.warn('[voice] speech recognition unavailable');
+      if (generation === _generation) reportError('Offline speech model unavailable');
+      return false;
+    }
     if (generation !== _generation) return false;
 
     // Partial results listener
@@ -160,6 +180,16 @@ async function startListeningInternal(generation: number): Promise<boolean> {
     });
     _removeListeningState = () => removeHandle(h3);
 
+    const h4 = await recognition.addListener('recognitionError' as any, (data: any) => {
+      if (_nativeSession !== session) return;
+      const message = typeof data?.message === 'string' && data.message.trim()
+        ? data.message.trim()
+        : 'Speech recognition error';
+      console.warn('[voice] recognitionError:', message);
+      reportError(message);
+    });
+    _removeRecognitionError = () => removeHandle(h4);
+
     if (generation !== _generation) {
       await removeRecognitionListeners();
       if (_nativeSession === session) _nativeSession = null;
@@ -187,7 +217,11 @@ async function startListeningInternal(generation: number): Promise<boolean> {
     return true;
   } catch (err) {
     console.warn('[voice] start failed:', err);
-    if (generation === _generation) setListening(false);
+    if (generation === _generation) {
+      const msg = err instanceof Error ? err.message : String(err ?? 'Failed to start speech recognition');
+      reportError(/permission|denied|not allowed/i.test(msg) ? 'permission_denied' : msg);
+      setListening(false);
+    }
     await removeRecognitionListeners();
     if (_nativeSession === session) _nativeSession = null;
     return false;
@@ -251,7 +285,11 @@ async function startWebLevelMeter(generation: number): Promise<void> {
 
 function startWebListening(): boolean {
   const Ctor = getWebSpeechCtor();
-  if (!Ctor) return false;
+  if (!Ctor) {
+    reportError('Speech recognition is not available');
+    return false;
+  }
+  _lastError = null;
 
   // Tear down any prior instance so a fresh start never hits InvalidStateError.
   if (_webRec) {
@@ -285,6 +323,10 @@ function startWebListening(): boolean {
       // 'no-speech' / 'aborted' are routine; only surface real failures.
       if (e?.error && e.error !== 'no-speech' && e.error !== 'aborted') {
         console.warn('[voice] web speech error:', e.error);
+        if (generation === _generation) {
+          const errStr = String(e.error);
+          reportError(/not-allowed|service-not-allowed|permission/i.test(errStr) ? 'permission_denied' : errStr);
+        }
       }
     };
     rec.onend = (): void => {
@@ -301,6 +343,8 @@ function startWebListening(): boolean {
     return true;
   } catch (err) {
     console.warn('[voice] web start failed:', err);
+    const msg = err instanceof Error ? err.message : String(err ?? 'Failed to start web speech');
+    reportError(/permission|denied|not-allowed/i.test(msg) ? 'permission_denied' : msg);
     setListening(false);
     return false;
   }
@@ -346,8 +390,15 @@ function stopWebListening(): Promise<void> {
 export async function startListening(
   onResult: (text: string, isFinal: boolean) => void,
   onListeningChange?: (listening: boolean) => void,
+  onError?: (error: string) => void,
 ): Promise<boolean> {
-  if (!isAvailable()) return false;
+  if (onError !== undefined) {
+    _onError = onError ?? null;
+  }
+  if (!isAvailable()) {
+    reportError('Speech recognition is not available');
+    return false;
+  }
 
   if (!isNative()) {
     if (_pendingStop) await _pendingStop;
@@ -442,6 +493,15 @@ export async function stopListening(): Promise<void> {
 /** Register a callback for real-time audio level (0..1). Call before startListening. */
 export function onAudioLevel(cb: ((level: number) => void) | null): void {
   _onLevel = cb;
+}
+
+/** Register a callback for recognition / permission / startup errors. */
+export function onRecognitionError(cb: ((error: string) => void) | null): void {
+  _onError = cb;
+}
+
+export function getLastError(): string | null {
+  return _lastError;
 }
 
 export function isListening(): boolean {

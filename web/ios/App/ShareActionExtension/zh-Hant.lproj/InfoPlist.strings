@@ -1,4 +1,5 @@
 "CFBundleDisplayName" = "傳送到 IM.codes";
 "share.openApp" = "檔案已儲存。請開啟 IM.codes 選擇伺服器與工作階段。";
+"share.openNow" = "開啟 IM.codes";
 "share.done" = "完成";
 "share.error" = "無法匯入分享檔案，請重試。";

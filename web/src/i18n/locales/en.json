@@ -1497,6 +1497,7 @@
     "send": "Send",
     "mic_permission_failed": "Failed to start — check microphone/speech permissions in Settings",
     "error": "Voice error: {{error}}",
+    "retry": "Retry",
     "notepad": "Notepad",
     "notepad_hint": "Keep transcribing a meeting until you stop, then send it to this session to summarize. Keep the app open; the screen stays on.",
     "notepad_send": "Send & summarize",

@@ -81,6 +81,11 @@ describe('Qwen3-ASR mobile assets', () => {
     expect(ios).not.toContain('.duckOthers');
     expect(ios).toContain('if warming && inbox.warmupRemaining == 0');
     expect(ios).toContain('startingCall?.resolve(); startingCall = nil');
+    expect(ios).toContain('AVAudioPCMBuffer(pcmFormat: mono, frameCapacity: capacity)');
+    expect(ios).not.toContain('AVAudioPCMBuffer(pcmFormat: format, frameCapacity: capacity)');
+    expect(ios).toContain('input.installTap(onBus: 0, bufferSize: AVAudioFrameCount(format.sampleRate / 10), format: format)');
+    expect(ios).toContain('Offline audio conversion failed:');
+    expect(ios).toContain('UIApplication.shared.applicationState != .background');
   });
   it('compiles and executes the production Android plugin through cold/warm/stop/segmentation/overflow/destroy', async () => {
     await setup(); const srcDir = join(root, 'src'), classesDir = join(root, 'classes'); await mkdir(classesDir, { recursive: true });

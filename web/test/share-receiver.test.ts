@@ -367,4 +367,31 @@ describe('share-receiver service', () => {
       expect(keys).toEqual(keysets[0]);
     }
   });
+
+  it('walks the UIResponder chain for openURL in ShareActionViewController and localizes share.openNow across all 7 iOS lproj bundles', () => {
+    const shareVC = readFileSync(
+      join(WEB_ROOT, 'ios/App/ShareActionExtension/ShareActionViewController.swift'),
+      'utf8',
+    );
+    expect(shareVC).toContain('sel_registerName("openURL:options:completionHandler:")');
+    expect(shareVC).toContain('sel_registerName("openURL:")');
+    expect(shareVC).toContain('URL(string: "imcodes://share-inbox")!');
+    expect(shareVC).toContain('self.openHostApp(url)');
+    expect(shareVC).toContain('self.localized("share.openNow")');
+    expect(shareVC).toContain('self.localized("share.done")');
+
+    const iosLocales = ['en', 'zh-Hans', 'zh-Hant', 'ja', 'ko', 'es', 'ru'];
+    const requiredKeys = ['CFBundleDisplayName', 'share.openApp', 'share.openNow', 'share.done', 'share.error'];
+    for (const lproj of iosLocales) {
+      const content = readFileSync(
+        join(WEB_ROOT, 'ios/App/ShareActionExtension', `${lproj}.lproj/InfoPlist.strings`),
+        'utf8',
+      );
+      for (const key of requiredKeys) {
+        const pattern = new RegExp(`"${key.replace('.', '\\.')}"\\s*=\\s*"([^"]+)"\\s*;`);
+        const match = content.match(pattern);
+        expect(match?.[1]?.trim().length, `${lproj}:${key}`).toBeGreaterThan(0);
+      }
+    }
+  });
 });

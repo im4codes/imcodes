@@ -107,6 +107,30 @@ describe('VoiceInput', () => {
     await waitFor(() => expect(onListeningChange).toHaveBeenLastCalledWith(false));
     expect(VoiceInput.isListening()).toBe(false);
   });
+
+  it('reports permission_denied when microphone permission is not granted', async () => {
+    speechApi.requestPermissions.mockResolvedValueOnce({ speechRecognition: 'denied' });
+    const onError = vi.fn();
+    VoiceInput.onRecognitionError(onError);
+
+    await expect(VoiceInput.startListening(vi.fn())).resolves.toBe(false);
+    expect(onError).toHaveBeenCalledWith('permission_denied');
+    expect(VoiceInput.getLastError()).toBe('permission_denied');
+    VoiceInput.onRecognitionError(null);
+  });
+
+  it('forwards native recognitionError events to error listeners and records lastError', async () => {
+    const onError = vi.fn();
+    VoiceInput.onRecognitionError(onError);
+
+    await expect(VoiceInput.startListening(vi.fn())).resolves.toBe(true);
+    listeners.recognitionError?.({ message: 'Offline audio conversion failed: format mismatch' });
+
+    expect(onError).toHaveBeenCalledWith('Offline audio conversion failed: format mismatch');
+    expect(VoiceInput.getLastError()).toBe('Offline audio conversion failed: format mismatch');
+    await VoiceInput.stopListening();
+    VoiceInput.onRecognitionError(null);
+  });
 });
 
 

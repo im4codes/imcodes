@@ -1,4 +1,5 @@
 "CFBundleDisplayName" = "Отправить в IM.codes";
 "share.openApp" = "Файлы сохранены. Откройте IM.codes и выберите сервер и сессию.";
+"share.openNow" = "Открыть IM.codes";
 "share.done" = "Готово";
 "share.error" = "Не удалось импортировать файлы. Повторите попытку.";

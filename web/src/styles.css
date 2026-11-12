@@ -3237,6 +3237,20 @@ html.native-ios-mac .chat-dl-btn {
 }
 .voice-overlay-send:disabled { background: #334155; color: #64748b; cursor: default; }
 /* Voice notepad: unfinished-draft offer and the review step before sending. */
+.voice-overlay-error {
+  width: 100%; max-width: 600px; margin-top: 12px; z-index: 1;
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 10px 14px; border-radius: 14px; box-sizing: border-box;
+  background: rgba(239,68,68,0.12); border: 1px solid rgba(248,113,113,0.4);
+  color: #fecaca; font-size: 13px; line-height: 1.4;
+}
+.voice-overlay-error-text { flex: 1; min-width: 0; }
+.voice-overlay-retry {
+  background: rgba(255,255,255,0.08); border: 1px solid rgba(252,165,165,0.35);
+  color: #fecaca; font-size: 12px; font-family: inherit; cursor: pointer;
+  padding: 5px 12px; border-radius: 14px; flex-shrink: 0; white-space: nowrap;
+}
+.voice-overlay-retry:hover { background: rgba(255,255,255,0.16); color: #fff; }
 .voice-notepad-recovery {
   width: 100%; max-width: 600px; margin-top: 16px; z-index: 1;
   display: flex; flex-direction: column; gap: 10px;

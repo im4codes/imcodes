@@ -129,6 +129,7 @@ export function VoiceOverlay({
   const reviewRef = useRef<NotepadReview | null>(null);
   const [sendingNotepad, setSendingNotepad] = useState(false);
   const [notepadSendFailed, setNotepadSendFailed] = useState(false);
+  const [voiceError, setVoiceError] = useState<string | null>(null);
 
   const setReview = useCallback((next: NotepadReview | null) => {
     reviewRef.current = next;
@@ -239,6 +240,7 @@ export function VoiceOverlay({
     setReviewState(null);
     setSendingNotepad(false);
     setNotepadSendFailed(false);
+    setVoiceError(null);
     const scope = draftScopeRef.current;
     const recoverable = scope ? readVoiceNotepadDraft(scope) : null;
     setRecoverableDraft(recoverable);
@@ -310,6 +312,7 @@ export function VoiceOverlay({
     insertPosRef.current = atPos;
     voiceLenRef.current = 0;
     segmentStartedAtRef.current = Date.now();
+    setVoiceError(null);
 
     try {
       const ok = await VoiceInput.startListening((partial) => {
@@ -348,15 +351,26 @@ export function VoiceOverlay({
         // A stop with a still-current token was not requested by the user
         // (user stops bump the token first): the recognizer ended a segment.
         if (!next && flushingTokenRef.current !== token && notepadRef.current && openRef.current) scheduleNotepadRestart();
+      }, (err) => {
+        if (sessionTokenRef.current !== token || !openRef.current) return;
+        setVoiceError(err || 'permission_denied');
+        stopNotepadAutoRestart();
       });
       // Check guards after async — overlay may have closed or session may have changed
       if (ok && sessionTokenRef.current === token && openRef.current) {
         setListeningState(true);
-      } else if (!ok && sessionTokenRef.current === token) {
+      } else if (!ok && sessionTokenRef.current === token && openRef.current) {
         setListeningState(false);
         stopNotepadAutoRestart();
+        setVoiceError((prev) => prev ?? 'permission_denied');
       }
-    } catch { /* ignore */ }
+    } catch (err) {
+      if (sessionTokenRef.current === token && openRef.current) {
+        setListeningState(false);
+        stopNotepadAutoRestart();
+        setVoiceError(err instanceof Error ? err.message : 'permission_denied');
+      }
+    }
   }, [setListeningState]);
 
   /** Recognizer ended a segment on its own in notepad mode: keep going at the end. */
@@ -734,6 +748,32 @@ export function VoiceOverlay({
           <button class="voice-overlay-close" onClick={handleClose} aria-label={t('common.close')}>✕</button>
         </div>
       </div>
+
+      {voiceError && !review && (
+        <div class="voice-overlay-error" role="alert">
+          <span class="voice-overlay-error-text">
+            {voiceError === 'permission_denied'
+              ? t('voice.mic_permission_failed')
+              : t('voice.error', { error: voiceError })}
+          </span>
+          <button
+            type="button"
+            class="voice-overlay-retry"
+            onClick={() => {
+              clearAutoStartTimer();
+              clearRestartTimer();
+              restartPausedRef.current = false;
+              shortSegmentsRef.current = 0;
+              setVoiceError(null);
+              const ta = taRef.current;
+              const pos = ta ? (ta.selectionStart ?? ta.value.length) : 0;
+              void startSession(pos);
+            }}
+          >
+            {t('voice.retry')}
+          </button>
+        </div>
+      )}
 
       {recoverableDraft && !review && (
         <div class="voice-notepad-recovery" role="status">

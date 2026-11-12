@@ -67,20 +67,84 @@ final class ShareActionViewController: UIViewController {
                 try? self.fileManager.removeItem(at: staging)
                 self.fail(); return
             }
-            self.extensionContext?.open(URL(string: "imcodes://share-inbox")!) { opened in
+            let url = URL(string: "imcodes://share-inbox")!
+            self.openHostApp(url) { opened in
                 DispatchQueue.main.async {
-                    if opened { self.extensionContext?.completeRequest(returningItems: nil) }
-                    else {
+                    if opened {
+                        self.extensionContext?.completeRequest(returningItems: nil)
+                    } else {
                         // Action extensions may not open the app on iOS. Never lose the
                         // queued files or pretend launch succeeded: next activation drains them.
                         let alert = UIAlertController(title: self.localized("CFBundleDisplayName"), message: self.localized("share.openApp"), preferredStyle: .alert)
-                        alert.addAction(UIAlertAction(title: self.localized("share.done"), style: .default) { _ in
+                        alert.addAction(UIAlertAction(title: self.localized("share.openNow"), style: .default) { _ in
+                            self.openHostApp(url) { _ in
+                                DispatchQueue.main.async {
+                                    self.extensionContext?.completeRequest(returningItems: nil)
+                                }
+                            }
+                        })
+                        alert.addAction(UIAlertAction(title: self.localized("share.done"), style: .cancel) { _ in
                             self.extensionContext?.completeRequest(returningItems: nil)
                         })
                         self.present(alert, animated: true)
                     }
                 }
             }
+        }
+    }
+
+    private func openHostApp(_ url: URL, completion: @escaping (Bool) -> Void) {
+        let openWithCompletion = sel_registerName("openURL:options:completionHandler:")
+        let openLegacy = sel_registerName("openURL:")
+        var responder: UIResponder? = self
+        while let current = responder {
+            if current.responds(to: openWithCompletion) {
+                typealias OpenURLOptionsCompletionFn = @convention(c) (
+                    AnyObject,
+                    Selector,
+                    NSURL,
+                    NSDictionary,
+                    @escaping @convention(block) (Bool) -> Void
+                ) -> Void
+                let imp = current.method(for: openWithCompletion)
+                let fn = unsafeBitCast(imp, to: OpenURLOptionsCompletionFn.self)
+                fn(current, openWithCompletion, url as NSURL, NSDictionary()) { opened in
+                    if opened {
+                        completion(true)
+                    } else if current.responds(to: openLegacy) {
+                        typealias OpenURLFn = @convention(c) (AnyObject, Selector, NSURL) -> Bool
+                        let legacyImp = current.method(for: openLegacy)
+                        let legacyFn = unsafeBitCast(legacyImp, to: OpenURLFn.self)
+                        if legacyFn(current, openLegacy, url as NSURL) {
+                            completion(true)
+                        } else if self.extensionContext != nil {
+                            self.extensionContext?.open(url, completionHandler: completion)
+                        } else {
+                            completion(false)
+                        }
+                    } else if self.extensionContext != nil {
+                        self.extensionContext?.open(url, completionHandler: completion)
+                    } else {
+                        completion(false)
+                    }
+                }
+                return
+            }
+            if current.responds(to: openLegacy) {
+                typealias OpenURLFn = @convention(c) (AnyObject, Selector, NSURL) -> Bool
+                let imp = current.method(for: openLegacy)
+                let fn = unsafeBitCast(imp, to: OpenURLFn.self)
+                if fn(current, openLegacy, url as NSURL) {
+                    completion(true)
+                    return
+                }
+            }
+            responder = current.next
+        }
+        if extensionContext != nil {
+            extensionContext?.open(url, completionHandler: completion)
+        } else {
+            completion(false)
         }
     }
 

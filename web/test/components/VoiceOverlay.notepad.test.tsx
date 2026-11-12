@@ -8,6 +8,7 @@ const { voiceApi, awake } = vi.hoisted(() => ({
   voiceApi: {
     partialHandler: null as ((partial: string) => void) | null,
     listeningHandler: null as ((listening: boolean) => void) | null,
+    errorHandler: null as ((error: string) => void) | null,
     startListening: vi.fn(),
     stopListening: vi.fn(),
     onAudioLevel: vi.fn(),
@@ -16,7 +17,10 @@ const { voiceApi, awake } = vi.hoisted(() => ({
 }));
 
 vi.mock('react-i18next', () => ({
-  useTranslation: () => ({ t: (key: string) => key }),
+  useTranslation: () => ({
+    t: (key: string, opts?: Record<string, unknown>) =>
+      opts?.error ? `${key}:${String(opts.error)}` : key,
+  }),
 }));
 
 vi.mock('../../src/components/VoiceInput.js', () => ({
@@ -65,12 +69,15 @@ beforeEach(() => {
   vi.useFakeTimers();
   voiceApi.partialHandler = null;
   voiceApi.listeningHandler = null;
+  voiceApi.errorHandler = null;
   voiceApi.startListening.mockReset().mockImplementation(async (
     handler: (partial: string) => void,
     onListeningChange?: (listening: boolean) => void,
+    onError?: (error: string) => void,
   ) => {
     voiceApi.partialHandler = handler;
     voiceApi.listeningHandler = onListeningChange ?? null;
+    voiceApi.errorHandler = onError ?? null;
     onListeningChange?.(true);
     return true;
   });
@@ -672,5 +679,32 @@ describe('VoiceOverlay mobile microphone gestures', () => {
     await vi.advanceTimersByTimeAsync(1000);
     expect(voiceApi.startListening).toHaveBeenCalledTimes(2);
     expect(send).not.toHaveBeenCalled();
+  });
+
+  it('surfaces permission failure and runtime recognitionError with a working retry button', async () => {
+    voiceApi.startListening.mockImplementationOnce(async (
+      _handler: (partial: string) => void,
+      _onListeningChange?: (listening: boolean) => void,
+      onError?: (error: string) => void,
+    ) => {
+      onError?.('permission_denied');
+      return false;
+    });
+    render(<VoiceOverlay open initialText="" onSend={vi.fn()} onClose={vi.fn()} />);
+    await vi.advanceTimersByTimeAsync(150);
+
+    expect(document.querySelector('.voice-overlay-error')?.textContent).toContain('voice.mic_permission_failed');
+
+    // Clicking retry clears the error and starts listening when permission is now granted
+    fireEvent.click(document.querySelector('.voice-overlay-retry') as HTMLElement);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.querySelector('.voice-overlay-error')).toBeNull();
+    expect(voiceApi.startListening).toHaveBeenCalledTimes(2);
+
+    // Runtime native recognitionError (e.g. conversion failure) surfaces visibly
+    voiceApi.errorHandler?.('Offline audio conversion failed');
+    voiceApi.listeningHandler?.(false);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.querySelector('.voice-overlay-error')?.textContent).toContain('voice.error:Offline audio conversion failed');
   });
 });
