@@ -520,7 +520,7 @@ describe('SessionTabs', () => {
     const stored = JSON.parse(localStorage.getItem('rcc_sync_tab_order') ?? 'null') as { v: string[]; t: number };
     expect(stored.v).toEqual(['session_gamma', 'session_alpha', 'session_beta']);
     // No timer advance is needed: discrete tab order writes start immediately.
-    expect(saveUserPrefMock).toHaveBeenCalledWith('tab_order', JSON.stringify(stored));
+    expect(saveUserPrefMock).toHaveBeenCalledWith('tab_order', JSON.stringify(stored), { signal: expect.any(AbortSignal) });
 
     view.unmount();
     render(
