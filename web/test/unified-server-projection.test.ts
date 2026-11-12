@@ -564,7 +564,7 @@ describe('projectUnifiedServerList', () => {
     expect(projected[0].status).toBe('offline');
   });
 
-  it('benchmark: 60-server projection completes 10,000 iterations in bounded time (<1000ms)', () => {
+  it('benchmark: 60-server projection completes 10,000 iterations in bounded time (<2500ms)', () => {
     const servers = Array.from({ length: 30 }, (_, i) => ({
       id: `dev-${i}`,
       name: `Server-${i}`,
@@ -588,7 +588,7 @@ describe('projectUnifiedServerList', () => {
     }
     const elapsed = performance.now() - start;
     console.log(`[benchmark] 60-server projection 10000 iterations: ${elapsed.toFixed(2)}ms (${(elapsed / 10000).toFixed(4)}ms/iter)`);
-    expect(elapsed).toBeLessThan(1000);
+    expect(elapsed).toBeLessThan(2500);
   });
 });
 

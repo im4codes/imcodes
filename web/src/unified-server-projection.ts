@@ -135,12 +135,13 @@ export function getServerPresence(
   return classifyServerPresence(server, now);
 }
 
+function grantScore(grant: SharedEntrySummary): number {
+  return (grant.target.kind === 'server' ? 10 : 0) + (grant.role === 'participant' ? 2 : 1);
+}
+
 function compareGrants(a: SharedEntrySummary, b: SharedEntrySummary): number {
-  const kindScore = (kind: string) => (kind === 'server' ? 10 : 0);
-  const roleScore = (role: string) => (role === 'participant' ? 2 : 1);
-  const scoreA = kindScore(a.target.kind) + roleScore(a.role);
-  const scoreB = kindScore(b.target.kind) + roleScore(b.role);
-  if (scoreB !== scoreA) return scoreB - scoreA;
+  const diff = grantScore(b) - grantScore(a);
+  if (diff !== 0) return diff;
   return a.id.localeCompare(b.id);
 }
 
@@ -158,22 +159,14 @@ export function projectUnifiedServerList<T extends OnlineServerInfo>(
   serverPinned: readonly string[] = [],
   now = Date.now(),
 ): UnifiedServerItem[] {
-  // 1. Group active grants by serverId
-  const activeGrants = sharedEntries.filter((entry) => entry.status === 'active');
-  const grantsByServerId = new Map<string, SharedEntrySummary[]>();
-  for (const grant of activeGrants) {
-    const existing = grantsByServerId.get(grant.serverId);
-    if (existing) {
-      existing.push(grant);
-    } else {
-      grantsByServerId.set(grant.serverId, [grant]);
-    }
-  }
-
+  // 1. Group active grants by serverId, retaining the single best grant per serverId in a single pass
   const bestGrantByServerId = new Map<string, SharedEntrySummary>();
-  for (const [serverId, list] of grantsByServerId.entries()) {
-    list.sort(compareGrants);
-    bestGrantByServerId.set(serverId, list[0]);
+  for (const grant of sharedEntries) {
+    if (grant.status !== 'active') continue;
+    const existing = bestGrantByServerId.get(grant.serverId);
+    if (!existing || compareGrants(grant, existing) < 0) {
+      bestGrantByServerId.set(grant.serverId, grant);
+    }
   }
 
   const seenServerIds = new Set<string>();
