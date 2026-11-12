@@ -8,7 +8,24 @@ const record = (v: unknown): Record<string, unknown> => {
   return v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : {};
 };
 const string = (...values: unknown[]): string | undefined => values.find(v => typeof v === 'string' && v.trim()) as string | undefined;
-export function normalizeAgyToolName(name: string): string { return name.toLowerCase().replace(/^run\s+/, '').replace(/[-_\s]/g, ''); }
+export function normalizeAgyToolName(name: string): string {
+  // Some ACP builds include the invocation JSON in the display title.
+  return name.trim().split(/\s*[\[({]/, 1)[0].toLowerCase().replace(/^run\s+/, '').replace(/[-_\s]/g, '');
+}
+function toolInput(tool: ToolCallEvent): Record<string, unknown> {
+  if (tool.input != null) return record(tool.input);
+  const start = tool.name.indexOf('{');
+  return start < 0 ? {} : record(tool.name.slice(start));
+}
+function textLaunchResult(text: string): unknown {
+  const uuid = '[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}';
+  // Only a launch result may supply a bare UUID. UUIDs in unrelated prose
+  // (request ids, paths, diagnostics) are not child-conversation authority.
+  const bare = new RegExp(`^${uuid}$`, 'i').exec(text.trim());
+  const labelled = new RegExp(`\\b(?:conversation[ _-]*id|subagent(?:[ _-]*id)?)\\s*[:=]\\s*["'\\x60]?(${uuid})(?![0-9a-f-])`, 'i').exec(text);
+  const id = bare?.[0] ?? labelled?.[1];
+  return id ? { conversationId: id } : undefined;
+}
 export function isAgySubagentTool(name: string): boolean {
   return /^(invokesubagent|browsersubagent|managesubagents|definesubagent|swarm|sendmessage|subagent|agent)$/.test(normalizeAgyToolName(name));
 }
@@ -31,8 +48,11 @@ interface Child { key: string; id: string; name?: string; model?: string; prompt
 export class AgySubagentTracker {
   private children = new Map<string, Child>();
   private unbound = new Set<string>();
+  private nativeChildren = new Set<string>();
   private toolChildren = new Map<string, string[]>();
   constructor(private parent: string) {}
+
+  isNativeChild(id: string): boolean { return this.nativeChildren.has(id); }
 
   private emit(child: Child, action: string, output?: string): ToolCallEvent {
     const active = child.state === SDK_SUBAGENT_STATUS.RUNNING;
@@ -62,7 +82,10 @@ export class AgySubagentTracker {
           if (start < 0 || end < start) continue;
           try { value = JSON.parse(text.slice(start,end+1)); parsed = true; break; } catch { /* try the array snapshot */ }
         }
-        if (!parsed) return [];
+        if (!parsed) {
+          value = defaultState ? textLaunchResult(text) : undefined;
+          if (!value) return [];
+        }
       }
     }
     let obj = record(value);
@@ -78,7 +101,8 @@ export class AgySubagentTracker {
       if (!id) continue;
       const normalized = status(row.state ?? row.status ?? row.Status) ?? defaultState;
       if (!normalized) continue;
-      const slots = toolId ? this.toolChildren.get(toolId) : undefined;
+      let slots = toolId ? this.toolChildren.get(toolId) : undefined;
+      if (!slots && toolId && defaultState) { slots = []; this.toolChildren.set(toolId, slots); }
       const role = string(row.role, row.Role, row.name, row.TypeName);
       // Prefer native identity, then role, then complete batch position, then
       // the next unbound launch slot (single-result updates may arrive apart).
@@ -97,7 +121,8 @@ export class AgySubagentTracker {
         started: previous?.started ?? Date.now(), state: normalized, toolId: previous?.toolId ?? toolId };
       if (placeholder && placeholder !== id) this.children.delete(placeholder);
       if (placeholder) this.unbound.delete(placeholder);
-      if (slots && slot >= 0) slots[slot] = id;
+      if (slots) { if (slot >= 0) slots[slot] = id; else if (!slots.includes(id)) slots.push(id); }
+      this.nativeChildren.add(id);
       this.children.set(id, child);
       result.push(this.emit(child, action, string(row.stateDetail, row.state_detail)));
     }
@@ -106,7 +131,7 @@ export class AgySubagentTracker {
 
   tool(tool: ToolCallEvent): ToolCallEvent[] {
     if (!isAgySubagentTool(tool.name)) return [];
-    const input = record(tool.input);
+    const input = toolInput(tool);
     const name = normalizeAgyToolName(tool.name);
     const action = string(input.action, input.Action, input.command, input.Command) ?? name;
     const launchResult = /^(invokesubagent|browsersubagent)$/.test(name) || name === 'swarm' && /^(add|start|create)$/.test(action);
@@ -133,7 +158,8 @@ export class AgySubagentTracker {
           : kill && tool.status === 'complete' ? SDK_SUBAGENT_STATUS.INTERRUPTED
           : definition || (name === 'browsersubagent' && tool.status === 'complete') ? SDK_SUBAGENT_STATUS.COMPLETE
           : previous?.state ?? SDK_SUBAGENT_STATUS.RUNNING, toolId: tool.id };
-      if (tool.status === 'running' && (launch || name === 'sendmessage')) child.state = SDK_SUBAGENT_STATUS.RUNNING;
+      if (tool.status === 'running' && (launch || name === 'sendmessage')
+        && (!previous || previous.toolId !== tool.id)) child.state = SDK_SUBAGENT_STATUS.RUNNING;
       this.children.set(id, child);
       const ids = this.toolChildren.get(tool.id) ?? []; ids[i] = id; this.toolChildren.set(tool.id, ids);
       result.push(this.emit(child, action, tool.output));

@@ -27,7 +27,7 @@ export class AgyTranscriptBridge {
   private partial = '';
   private decoder = new StringDecoder('utf8');
   private lastStep = -1;
-  private watched?: string;
+  private watched?: { dir: string; ino: number; dev: number };
 
   constructor(readonly file: string, private readonly onRow: (row: AgyTranscriptRow) => void) {}
   get isClosed(): boolean { return this.closed; }
@@ -45,12 +45,14 @@ export class AgyTranscriptBridge {
       // Native session/new can return before its logs directory exists. Watch
       // the nearest existing ancestor until creation, then narrow the watcher.
       let dir = target;
+      let identity: Awaited<ReturnType<typeof stat>> | undefined;
       while (true) {
-        try { if ((await stat(dir)).isDirectory()) break; } catch { /* descend on the next creation event */ }
+        try { const info = await stat(dir); if (info.isDirectory()) { identity = info; break; } } catch { /* descend on the next creation event */ }
         const parent = path.dirname(dir); if (parent === dir) return; dir = parent;
       }
-      if (this.closed || dir === this.watched) return;
-      this.watcher?.close(); this.watched = dir;
+      if (this.closed || !identity) return;
+      if (dir === this.watched?.dir && identity.ino === this.watched.ino && identity.dev === this.watched.dev) return;
+      this.watcher?.close(); this.watched = { dir, ino: Number(identity.ino), dev: Number(identity.dev) };
       try {
         this.watcher = watch(
           dir,

@@ -1,3 +1,4 @@
+import { SDK_SUBAGENT_DETAIL_KIND } from '../../shared/sdk-subagent-status.js';
 import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
 import { readFileSync } from 'node:fs';
 import { AGY_ACP_AGENT_NAME, AGY_CLI_PATH_ENV } from '../../shared/agy-agent.js';
@@ -168,6 +169,46 @@ describe('AG native ACP', () => {
     expect(one.at(-1)?.detail?.meta?.normalizedStatus).toBe('complete');
     expect(two.at(-1)?.detail?.meta?.normalizedStatus).toBe('error');
 
+  });
+  it.each(['acp-child-json','acp-child-text','acp-child-inline','acp-child-update-only'])('tracks ACP-only launch results through real child and parent transcript callbacks (%s)',async scenario=>{
+    const {provider,requests}=await setup(scenario),id=await route(provider),done=vi.fn(),events:ToolCallEvent[]=[];
+    provider.onComplete(done);provider.onToolCall((_,tool)=>events.push(tool));
+    await provider.send(id,'launch directly');
+    const state=(provider as any).sessions.get(id),childId='12345678-1234-1234-1234-123456789abc';
+    await vi.waitFor(()=>expect(state.agyBridges?.has(childId)).toBe(true),{timeout:3000});
+    await vi.waitFor(()=>expect(events.some(e=>e.detail?.meta?.agentPath===childId && e.detail?.meta?.terminal===true)).toBe(true),{timeout:5000});
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2),{timeout:5000});
+    expect(done.mock.calls.map(([,message])=>message.content)).toEqual(['PARENT-STARTED','PARENT-CONTINUED CHILD-RESULT']);
+    expect(events.every(e=>e.detail?.kind===SDK_SUBAGENT_DETAIL_KIND)).toBe(true);
+    expect(new Set(events.map(e=>e.id)).size).toBe(1);
+    if(scenario==='acp-child-inline') expect(events[0].detail?.input?.description).toBe('return child result');
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(1);
+    await new Promise(r=>setTimeout(r,120));expect(done).toHaveBeenCalledTimes(2);
+  });
+  it.each(['stop','rebind'])('does not deliver ACP-only child or parent callback after %s',async action=>{
+    const {provider,root,requests}=await setup('acp-child-json'),id=await route(provider),done=vi.fn(),events:ToolCallEvent[]=[];
+    provider.onComplete(done);provider.onToolCall((_,tool)=>events.push(tool));
+    await provider.send(id,'launch directly');
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1),{timeout:5000});
+    const old=(provider as any).sessions.get(id);
+    if(action==='stop') await provider.cancel(id);else await route(provider,id,{fresh:true});
+    const before=events.length;
+    await new Promise(r=>setTimeout(r,450));
+    expect(old.agyBridges.size).toBe(0);expect(done).toHaveBeenCalledTimes(1);expect(events).toHaveLength(before);
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(1);
+    const file=path.join(root,'.gemini/antigravity-cli/brain/native-1/.system_generated/logs/transcript_full.jsonl');
+    expect(await readFile(file,'utf8')).toContain('PARENT-CONTINUED CHILD-RESULT');
+  });
+  it('never observes an input-only peer or a request UUID in unrelated launch output',async()=>{
+    const {provider,requests}=await setup('acp-child-json'),id=await route(provider),done=vi.fn();provider.onComplete(done);
+    await provider.send(id,'launch directly');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2),{timeout:5000});
+    const state=(provider as any).sessions.get(id);
+    const update=(update:any)=>(provider as any).handleSessionUpdate({sessionId:state.acpSessionId,update});
+    update({sessionUpdate:'tool_call',toolCallId:'peer',title:'Run send_message',status:'in_progress',rawInput:{Recipient:'unrelated-peer',Prompt:'note'}});
+    update({sessionUpdate:'tool_call',toolCallId:'unresolved',title:'Run invoke_subagent',status:'in_progress',rawInput:{Prompt:'work'}});
+    update({sessionUpdate:'tool_call_update',toolCallId:'unresolved',status:'completed',rawOutput:'Request ID: aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'});
+    expect([...state.agyBridges.keys()].sort()).toEqual(['12345678-1234-1234-1234-123456789abc','native-1']);
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(1);
   });
   it.each(['native-child-log','native-child-both','native-child-rpc-late','native-child-late','native-child-late-chunks'])('bridges real-shaped native child results/reactive parent completion once without another RPC (%s)', async scenario => {
     const {provider,requests}=await setup(scenario);const id=await route(provider),done=vi.fn(),events:ToolCallEvent[]=[];

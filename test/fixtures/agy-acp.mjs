@@ -142,6 +142,31 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
         ok(state.steeredRpc,{stopReason:'end_turn',usage:{inputTokens:100,outputTokens:2}});
         ok(req.id,{stopReason:'end_turn',usage:{inputTokens:300,outputTokens:3}});return;
       }
+      if (scenario.startsWith('acp-child-')) {
+        const dir = `${process.env.HOME}/.gemini/antigravity-cli/brain/${p.sessionId}/.system_generated/logs`;
+        fs.mkdirSync(dir,{recursive:true});
+        const file=dir+'/transcript_full.jsonl';
+        const row=(step_index,type,content)=>JSON.stringify({step_index,type,status:'DONE',source:type==='USER_INPUT'?'USER_EXPLICIT':'MODEL',content})+'\n';
+        const childId='12345678-1234-1234-1234-123456789abc';
+        fs.writeFileSync(file,row(0,'USER_INPUT',text)+row(1,'PLANNER_RESPONSE','PARENT-STARTED'));
+        const inline=scenario==='acp-child-inline';
+        const title=inline?'Run invoke_subagent {"Model":"inherit","Prompt":"return child result"}':'Run invoke_subagent';
+        if(scenario!=='acp-child-update-only') note(p.sessionId,{sessionUpdate:'tool_call',toolCallId:'direct-child',title,status:'in_progress',...(inline?{}:{rawInput:{Model:'inherit',Prompt:'return child result'}})});
+        const output=scenario==='acp-child-text'
+          ? {content:[{type:'content',content:{type:'text',text:'Created subagent: '+childId}}]}
+          : {rawOutput:{conversationId:childId}};
+        note(p.sessionId,{sessionUpdate:'tool_call_update',toolCallId:'direct-child',title,status:'completed',...output});
+        note(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'PARENT-STARTED'}});
+        ok(req.id,{stopReason:'end_turn'});
+        setTimeout(()=>{
+          const childDir=`${process.env.HOME}/.gemini/antigravity-cli/brain/${childId}/.system_generated/logs`;
+          fs.mkdirSync(childDir,{recursive:true});fs.writeFileSync(childDir+'/transcript_full.jsonl',row(0,'PLANNER_RESPONSE','CHILD-RESULT'));
+          // Real-shaped native callback: the parent engine reacts without an
+          // additional platform prompt RPC, even after ACP's prompt ended.
+          fs.appendFileSync(file,row(2,'SYSTEM_MESSAGE','[Message] sender='+childId+' content=CHILD-RESULT')+row(3,'PLANNER_RESPONSE','PARENT-CONTINUED CHILD-RESULT'));
+        },180);
+        return;
+      }
       if (scenario.startsWith('native-child-')) {
         const dir = `${process.env.HOME}/.gemini/antigravity-cli/brain/${p.sessionId}/.system_generated/logs`;
         fs.mkdirSync(dir,{recursive:true});
