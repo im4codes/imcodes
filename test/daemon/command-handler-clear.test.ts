@@ -171,4 +171,39 @@ describe('process session /clear handling', () => {
       error: COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID,
     });
   });
+
+  it('relaunches claude-code sessions fresh with handoff on /handoff', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_proj_brain',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'claude-code',
+      runtimeType: 'process',
+      state: 'idle',
+      projectDir: '/proj',
+      ccSessionId: 'cc-old',
+    });
+
+    handleWebCommand({ type: 'session.send', session: 'deck_proj_brain', text: '/handoff', commandId: 'cmd-handoff-process' }, serverLink as any);
+    await flushAsync();
+
+    expect(relaunchSessionWithSettingsMock).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'deck_proj_brain', agentType: 'claude-code' }),
+      { fresh: true, handoff: true },
+    );
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_proj_brain',
+      'user.message',
+      { text: '/handoff', allowDuplicate: true, commandId: 'cmd-handoff-process' },
+      { source: 'daemon', confidence: 'high', eventId: 'transport-user:cmd-handoff-process' },
+    );
+    expect(emitMock).toHaveBeenCalledWith('deck_proj_brain', 'assistant.text', {
+      text: 'Started a fresh conversation',
+      noticeCode: DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED,
+      noticeParams: {},
+      streaming: false,
+      memoryExcluded: true,
+    }, expect.objectContaining({ source: 'daemon' }));
+    expect(emitMock).toHaveBeenCalledWith('deck_proj_brain', 'command.ack', { commandId: 'cmd-handoff-process', status: 'accepted' });
+  });
 });

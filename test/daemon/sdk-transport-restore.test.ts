@@ -24,6 +24,10 @@ const reassignSessionFileMock = vi.hoisted(() => vi.fn());
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
 const timelineReadByTypesPreferredMock = vi.hoisted(() => vi.fn(async () => []));
+const timelineReadPreferredMock = vi.hoisted(() => vi.fn(async () => []));
+const timelineReadCompletedTextTailMock = vi.hoisted(() => vi.fn(async () => []));
+const writePrivateInputMock = vi.hoisted(() => vi.fn());
+const preparePrivateInputWriterMock = vi.hoisted(() => vi.fn(async () => writePrivateInputMock));
 const getDshPresetTransportConfigMock = vi.hoisted(() => vi.fn(async () => ({
   env: { ANTHROPIC_MODEL: 'MiniMax-M3' },
   llm: {
@@ -208,13 +212,19 @@ vi.mock('../../src/daemon/timeline-emitter.js', () => ({
   timelineEmitter: { emit: timelineEmitterEmitMock, on: vi.fn(() => () => {}), epoch: 0, replay: vi.fn(() => ({ events: [], truncated: false })) },
 }));
 vi.mock('../../src/daemon/timeline-store.js', () => ({
-  timelineStore: { readByTypesPreferred: timelineReadByTypesPreferredMock },
+  timelineStore: {
+    readByTypesPreferred: timelineReadByTypesPreferredMock,
+    readPreferred: timelineReadPreferredMock,
+    readCompletedTextTail: timelineReadCompletedTextTailMock,
+  },
 }));
 
 vi.mock('../../src/agent/tmux.js', () => ({
   listSessions: vi.fn().mockResolvedValue([]),
   newSession: vi.fn().mockResolvedValue(undefined), killSession: vi.fn().mockResolvedValue(undefined), sessionExists: vi.fn(), isPaneAlive: vi.fn(), respawnPane: vi.fn(),
-  sendKeys: vi.fn(), sendKey: vi.fn(), capturePane: vi.fn(), showBuffer: vi.fn(), getPaneId: vi.fn().mockResolvedValue(undefined), getPaneCwd: vi.fn().mockResolvedValue('/tmp'), getPaneStartCommand: vi.fn().mockResolvedValue(''), cleanupOrphanFifos: vi.fn(), BACKEND: 'tmux',
+  sendKeys: vi.fn(), sendKey: vi.fn(), capturePane: vi.fn(), showBuffer: vi.fn(), getPaneId: vi.fn().mockResolvedValue(undefined), getPaneCwd: vi.fn().mockResolvedValue('/tmp'), getPaneStartCommand: vi.fn().mockResolvedValue(''), cleanupOrphanFifos: vi.fn(),
+  preparePrivateInputWriter: preparePrivateInputWriterMock,
+  BACKEND: 'tmux',
 }));
 vi.mock('../../src/daemon/jsonl-watcher.js', () => ({ startWatching: vi.fn().mockResolvedValue(undefined), startWatchingFile: vi.fn().mockResolvedValue(undefined), reserveSessionFile: vi.fn(), reassignSessionFile: reassignSessionFileMock, stopWatching: vi.fn(), isWatching: vi.fn(() => false), findJsonlPathBySessionId: vi.fn(() => '/tmp/mock.jsonl') }));
 vi.mock('../../src/daemon/codex-watcher.js', () => ({ startWatching: vi.fn().mockResolvedValue(undefined), startWatchingSpecificFile: vi.fn().mockResolvedValue(undefined), startWatchingById: vi.fn().mockResolvedValue(undefined), stopWatching: vi.fn(), isWatching: vi.fn(() => false), findRolloutPathByUuid: vi.fn(async () => null) }));
@@ -506,6 +516,12 @@ describe('sdk transport session restore', () => {
     timelineEmitterEmitMock.mockClear();
     timelineReadByTypesPreferredMock.mockReset();
     timelineReadByTypesPreferredMock.mockResolvedValue([]);
+    timelineReadPreferredMock.mockReset();
+    timelineReadPreferredMock.mockResolvedValue([]);
+    timelineReadCompletedTextTailMock.mockReset();
+    timelineReadCompletedTextTailMock.mockResolvedValue([]);
+    writePrivateInputMock.mockClear();
+    preparePrivateInputWriterMock.mockClear();
     setSessionEventCallback(() => {});
     setSessionPersistCallback(async () => {});
   });
@@ -3193,5 +3209,256 @@ describe('sdk transport session restore', () => {
     expect(mocks.store.get(name)?.agentType).toBe('codex');
     expect(mocks.store.get(name)?.codexSessionId).toBe('codex-thread-switch');
     expect(String(vi.mocked(newSession).mock.calls.at(-1)?.[1] ?? '')).toContain('codex-thread-switch');
+  });
+
+  it('resets codex-sdk fresh with handoff pack on { fresh: true, handoff: true } and injects it into the next turn', async () => {
+    const name = 'deck_handoff_cxsdk_brain';
+    const record = {
+      name,
+      projectName: 'handoffcxsdk',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/handoff-cxsdk',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-handoff',
+      codexSessionId: 'codex-thread-before-handoff',
+    };
+    mocks.store.set(name, record);
+    const prevUserEvent = {
+      eventId: 'ev-1',
+      sessionId: name,
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: 'HANDOFF_GOAL_ALPHA' },
+    };
+    const prevAssistantEvent = {
+      eventId: 'ev-2',
+      sessionId: name,
+      ts: 200,
+      seq: 2,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'HANDOFF_STATE_BETA', streaming: false },
+    };
+    const handoffCmdEvent = {
+      eventId: 'ev-3',
+      sessionId: name,
+      ts: 300,
+      seq: 3,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: '/handoff' },
+    };
+    timelineReadPreferredMock.mockResolvedValue([handoffCmdEvent as any]);
+    timelineReadCompletedTextTailMock.mockResolvedValue([prevUserEvent, prevAssistantEvent, handoffCmdEvent] as any);
+
+    await connectProvider('codex-sdk', {});
+    await relaunchSessionWithSettings(record as any, { fresh: true, handoff: true });
+
+    const pendingDeadline = Date.now() + 5_000;
+    while (!mocks.store.get(name)?.crossVendorHandoff?.pending && Date.now() < pendingDeadline) {
+      await flush();
+    }
+    const updated = mocks.store.get(name);
+    expect(updated?.codexSessionId).not.toBe('codex-thread-before-handoff');
+    expect(updated?.crossVendorHandoff?.pending?.text).toContain('HANDOFF_GOAL_ALPHA');
+    expect(updated?.crossVendorHandoff?.pending?.text).toContain('HANDOFF_STATE_BETA');
+    expect(updated?.crossVendorHandoff?.pending?.text).not.toContain('/handoff');
+
+    const runtime = getTransportRuntime(name);
+    expect(runtime).toBeDefined();
+    runtime!.send('continue task');
+    await settleCodexRun(name, 'start');
+    const deadline = Date.now() + 5_000;
+    while (!codexRunForSession(name, 'start')?.input.includes('continue task') && Date.now() < deadline) {
+      await flush();
+    }
+    const run = codexRunForSession(name, 'start');
+    expect(run?.input).toContain('HANDOFF_GOAL_ALPHA');
+    expect(run?.input).toContain('HANDOFF_STATE_BETA');
+    expect(run?.input).toContain('continue task');
+    expect(run?.input).not.toContain('/handoff');
+    expect(mocks.store.get(name)?.crossVendorHandoff?.pending).toBeUndefined();
+  });
+
+  it('clears stale pending handoff pack when relaunched fresh without handoff (/clear)', async () => {
+    const name = 'deck_clear_strips_pending_brain';
+    const record = {
+      name,
+      projectName: 'clearpending',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/clear-pending',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-clear-pending',
+      codexSessionId: 'codex-thread-pending',
+      crossVendorHandoff: {
+        pending: {
+          text: 'STALE_HANDOFF_SHOULD_VANISH',
+          sourceAgentType: 'codex-sdk',
+          sourceRuntimeType: 'transport',
+          cutoff: { epoch: 1, seq: 1, ts: 10 },
+          createdAt: 10,
+          tokenCount: 10,
+        },
+      },
+    };
+    mocks.store.set(name, record);
+
+    await connectProvider('codex-sdk', {});
+    await relaunchSessionWithSettings(record as any, { fresh: true });
+
+    expect(mocks.store.get(name)?.crossVendorHandoff?.pending).toBeUndefined();
+    const runtime = getTransportRuntime(name);
+    runtime!.send('brand new start');
+    await settleCodexRun(name, 'start');
+    const deadline = Date.now() + 5_000;
+    while (!codexRunForSession(name, 'start')?.input.includes('brand new start') && Date.now() < deadline) {
+      await flush();
+    }
+    const run = codexRunForSession(name, 'start');
+    expect(run?.input).toBe('brand new start');
+  });
+
+  it('degrades cleanly with no handoff pack when timeline is empty or control-only on /handoff', async () => {
+    const name = 'deck_handoff_empty_brain';
+    const record = {
+      name,
+      projectName: 'handoffempty',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/handoff-empty',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-handoff-empty',
+      codexSessionId: 'codex-thread-empty',
+    };
+    mocks.store.set(name, record);
+    timelineReadPreferredMock.mockResolvedValue([{
+      eventId: 'ev-handoff-only',
+      sessionId: name,
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: '/handoff' },
+    } as any]);
+    timelineReadCompletedTextTailMock.mockResolvedValue([{
+      eventId: 'ev-handoff-only',
+      sessionId: name,
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: '/handoff' },
+    } as any]);
+
+    await connectProvider('codex-sdk', {});
+    await relaunchSessionWithSettings(record as any, { fresh: true, handoff: true });
+
+    expect(mocks.store.get(name)?.crossVendorHandoff?.pending).toBeUndefined();
+    const runtime = getTransportRuntime(name);
+    runtime!.send('first real question');
+    await settleCodexRun(name, 'start');
+    const deadline = Date.now() + 5_000;
+    while (!codexRunForSession(name, 'start')?.input.includes('first real question') && Date.now() < deadline) {
+      await flush();
+    }
+    expect(codexRunForSession(name, 'start')?.input).toBe('first real question');
+  });
+
+  it('delivers handoff pack via process private writer when relaunching claude-code with { fresh: true, handoff: true }', async () => {
+    const name = 'deck_handoff_cccli_brain';
+    const record = {
+      name,
+      projectName: 'handoffcccli',
+      role: 'brain',
+      agentType: 'claude-code',
+      runtimeType: 'process',
+      projectDir: '/tmp/handoff-cccli',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      ccSessionId: 'cc-old-handoff',
+    };
+    mocks.store.set(name, record);
+    timelineReadPreferredMock.mockResolvedValue([{
+      eventId: 'ev-proc-2',
+      sessionId: name,
+      ts: 200,
+      seq: 2,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'PROCESS_HANDOFF_FACT', streaming: false },
+    } as any]);
+    timelineReadCompletedTextTailMock.mockResolvedValue([
+      {
+        eventId: 'ev-proc-1',
+        sessionId: name,
+        ts: 100,
+        seq: 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'user.message',
+        payload: { text: 'PROCESS_HANDOFF_TASK' },
+      },
+      {
+        eventId: 'ev-proc-2',
+        sessionId: name,
+        ts: 200,
+        seq: 2,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'assistant.text',
+        payload: { text: 'PROCESS_HANDOFF_FACT', streaming: false },
+      },
+    ] as any);
+
+    await relaunchSessionWithSettings(record as any, { fresh: true, handoff: true });
+    const deadline = Date.now() + 5_000;
+    while (writePrivateInputMock.mock.calls.length === 0 && Date.now() < deadline) {
+      await flush();
+    }
+
+    expect(mocks.store.get(name)?.ccSessionId).not.toBe('cc-old-handoff');
+    expect(String(vi.mocked(newSession).mock.calls.at(-1)?.[1] ?? '')).not.toContain('cc-old-handoff');
+    expect(preparePrivateInputWriterMock).toHaveBeenCalledWith(name);
+    expect(writePrivateInputMock).toHaveBeenCalledWith(expect.stringContaining('PROCESS_HANDOFF_TASK'));
+    expect(writePrivateInputMock).toHaveBeenCalledWith(expect.stringContaining('PROCESS_HANDOFF_FACT'));
   });
 });

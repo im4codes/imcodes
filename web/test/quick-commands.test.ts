@@ -58,12 +58,36 @@ describe('slash command suggestions', () => {
     ]));
   });
 
-  it('offers Antigravity clear and model controls without compact', () => {
+  it('offers Antigravity clear, handoff and model controls without compact', () => {
     expect(getDefaultQuickCommands(AGY_SDK_PROVIDER_ID)).toEqual([
       '/stop',
       '/clear',
+      '/handoff',
       '/model',
     ]);
+  });
+
+  it('offers /handoff for every provider that supports /clear', () => {
+    for (const provider of [
+      'claude-code',
+      'claude-code-sdk',
+      'codex',
+      'codex-sdk',
+      'copilot-sdk',
+      'cursor-headless',
+      'opencode',
+      'opencode-sdk',
+      'qwen',
+      'grok-sdk',
+      'kimi-sdk',
+      HERMES_AGENT_PROVIDER_ID,
+      AGY_SDK_PROVIDER_ID,
+      'deepseek-harness',
+      'pi',
+      'openclaw',
+    ]) {
+      expect(getDefaultQuickCommands(provider)).toContain('/handoff');
+    }
   });
 });
 

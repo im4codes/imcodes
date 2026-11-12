@@ -323,16 +323,22 @@ export async function dispatchSessionMessage(
     ? MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
     : (options.deliveryMode ?? MEMORY_MCP_SEND_DELIVERY_MODES.APPEND);
   if ((target.runtimeType ?? getSessionRuntimeType(target.agentType)) === 'transport') {
-    // `/clear` is daemon-managed: a fresh provider conversation, exactly as
-    // from the browser. Handing it to runtime.send made it ordinary model text
-    // and left the whole context in place.
-    if (isSessionControlCommandText(message.trim(), 'clear')) {
-      const { clearTransportConversation, supportsTransportClear } = await import('./command-handler.js');
+    // `/clear` and `/handoff` are daemon-managed: a fresh provider conversation,
+    // exactly as from the browser. Handing them to runtime.send made them ordinary
+    // model text and left the whole context in place.
+    const isTransportClear = isSessionControlCommandText(message.trim(), 'clear');
+    const isTransportHandoff = isSessionControlCommandText(message.trim(), 'handoff');
+    if (isTransportClear || isTransportHandoff) {
+      const { clearTransportConversation, handoffSessionConversation, supportsTransportClear } = await import('./command-handler.js');
       if (supportsTransportClear(target.agentType)) {
         if (!options.suppressTimeline) {
           emitStructuredTransportUserMessage(target.name, message, options.messageId, options.sharedActor, options.messageOrigin);
         }
-        await clearTransportConversation(target);
+        if (isTransportHandoff) {
+          await handoffSessionConversation(target);
+        } else {
+          await clearTransportConversation(target);
+        }
         return 'sent';
       }
     }
@@ -513,6 +519,17 @@ export async function dispatchSessionMessage(
       }, { source: 'daemon', confidence: 'high' });
     }
     return result;
+  }
+
+  if (isSessionControlCommandText(message.trim(), 'handoff')) {
+    const { handoffSessionConversation, supportsProcessClear } = await import('./command-handler.js');
+    if (supportsProcessClear(target.agentType)) {
+      if (!options.suppressTimeline) {
+        emitStructuredTransportUserMessage(target.name, message, options.messageId, options.sharedActor, options.messageOrigin);
+      }
+      await handoffSessionConversation(target);
+      return 'sent';
+    }
   }
 
   const { sendProcessSessionMessageForAutomation } = await import('./command-handler.js');

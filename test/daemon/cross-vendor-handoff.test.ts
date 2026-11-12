@@ -49,11 +49,13 @@ describe('cross-vendor handoff contract', () => {
     expect(normalizeCrossVendorHandoffConfig({ maxTokens: 50_001, recentTurns: 999 })).toMatchObject({ maxTokens: 50_000, recentTurns: 100 });
   });
 
-  it('triggers only for a non-fresh family or runtime-kind switch', () => {
+  it('triggers only for a non-fresh family or runtime-kind switch unless forced for /handoff', () => {
     expect(shouldCreateCrossVendorHandoff({ agentType: 'claude-code-sdk', runtimeType: 'transport' }, 'codex-sdk', 'transport', false)).toBe(true);
     expect(shouldCreateCrossVendorHandoff({ agentType: 'claude-code-sdk', runtimeType: 'transport' }, 'claude-code-sdk', 'transport', false)).toBe(false);
     expect(shouldCreateCrossVendorHandoff({ agentType: 'claude-code', runtimeType: 'process' }, 'claude-code-sdk', 'transport', false)).toBe(true);
     expect(shouldCreateCrossVendorHandoff({ agentType: 'claude-code-sdk', runtimeType: 'transport' }, 'codex-sdk', 'transport', true)).toBe(false);
+    expect(shouldCreateCrossVendorHandoff({ agentType: 'claude-code-sdk', runtimeType: 'transport' }, 'claude-code-sdk', 'transport', true, true)).toBe(true);
+    expect(shouldCreateCrossVendorHandoff({ agentType: 'claude-code', runtimeType: 'process' }, 'claude-code', 'process', true, true)).toBe(true);
   });
 
   it('covers SDK, process/tmux, Qoder, and runtime-kind matrix without conflating native threads', () => {
@@ -178,5 +180,30 @@ describe('reported lost provider-switch context counterexamples', () => {
     expect(pack!.text).toContain('NEWEST_GOAL_9D');
     expect(pack!.text).not.toContain('OLD_GOAL_0');
     expect(pack!.tokenCount).toBeLessThanOrEqual(120);
+  });
+  it('returns undefined when completed timeline has no non-control turns (prevents empty/loop handoffs)', async () => {
+    vi.spyOn(timelineStore, 'readCompletedTextTail').mockResolvedValueOnce([]);
+    const emptyPack = await buildCrossVendorHandoffPack(record('claude-code-sdk'), { epoch: 1, seq: 1, ts: 1 }, 'claude-code-sdk', 'transport');
+    expect(emptyPack).toBeUndefined();
+
+    vi.spyOn(timelineStore, 'readCompletedTextTail').mockResolvedValueOnce([
+      event('user.message', { text: '/clear' }, 1, 1),
+      event('user.message', { text: ' /handoff ' }, 2, 2),
+      event('user.message', { text: '/compact' }, 3, 3),
+    ]);
+    const controlOnlyPack = await buildCrossVendorHandoffPack(record('claude-code-sdk'), { epoch: 1, seq: 3, ts: 3 }, 'claude-code-sdk', 'transport');
+    expect(controlOnlyPack).toBeUndefined();
+  });
+  it('strips bare session control commands while preserving real turns on consecutive handoffs', async () => {
+    vi.spyOn(timelineStore, 'readCompletedTextTail').mockResolvedValue([
+      event('user.message', { text: 'Fix login retry backoff' }, 1, 1),
+      event('assistant.text', { text: 'Updated backoff in auth.ts', streaming: false }, 2, 2),
+      event('user.message', { text: '/handoff' }, 3, 3),
+    ]);
+    const pack = await buildCrossVendorHandoffPack(record('claude-code-sdk'), { epoch: 1, seq: 3, ts: 3 }, 'claude-code-sdk', 'transport');
+    expect(pack).toBeDefined();
+    expect(pack!.text).toContain('Fix login retry backoff');
+    expect(pack!.text).toContain('Updated backoff in auth.ts');
+    expect(pack!.text).not.toContain('/handoff');
   });
 });

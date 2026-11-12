@@ -1086,8 +1086,48 @@ export function supportsTransportClear(agentType: string | undefined): boolean {
 // records raw events into `context_event_archive`, so provenance is preserved
 // independently of provider-side compaction.
 
-function supportsProcessClear(agentType: string | undefined): agentType is 'claude-code' | 'codex' | 'opencode' {
+export function supportsProcessClear(agentType: string | undefined): agentType is 'claude-code' | 'codex' | 'opencode' {
   return agentType === 'claude-code' || agentType === 'codex' || agentType === 'opencode';
+}
+
+async function finalizeConversationReset(sessionName: string, serverLink?: ServerLink): Promise<void> {
+  // Reset per-session memory injection history — fresh conversation should be
+  // allowed to re-inject previously-shown memories again.
+  clearRecentInjectionHistory(sessionName);
+  clearSummarySyncHistory(sessionName);
+  if (serverLink) {
+    await handleGetSessions(serverLink);
+    await syncSubSessionIfNeeded(sessionName, serverLink);
+  }
+  timelineEmitter.emit(sessionName, 'assistant.text', {
+    ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED, 'Started a fresh conversation'),
+    streaming: false,
+    memoryExcluded: true,
+  }, { source: 'daemon', confidence: 'high' });
+}
+
+async function executeDaemonResetCommand(opts: {
+  sessionName: string;
+  serverLink: ServerLink;
+  effectiveId: string;
+  isLegacy: boolean;
+  label: string;
+  run: () => Promise<void>;
+  formatError: (err: unknown) => string;
+}): Promise<void> {
+  const { sessionName, serverLink, effectiveId, isLegacy, label, run, formatError } = opts;
+  try {
+    await run();
+    const clearStatus = isLegacy ? 'accepted_legacy' : 'accepted';
+    timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: clearStatus });
+    emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: clearStatus });
+  } catch (err) {
+    const errMsg = formatError(err);
+    logger.error({ sessionName, err }, `${label} failed`);
+    timelineEmitter.emit(sessionName, 'assistant.text', { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_CLEAR_FAILED, `⚠️ Clear failed: ${errMsg}`, { detail: errMsg }), streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+    timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
+    emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
+  }
 }
 
 /**
@@ -1106,19 +1146,21 @@ export async function clearTransportConversation(record: SessionRecord, serverLi
   await runExclusiveSessionRelaunch(sessionName, async () => {
     await relaunchFreshTransportConversation(record);
   });
-  // Reset per-session memory injection history — fresh conversation should be
-  // allowed to re-inject previously-shown memories again.
-  clearRecentInjectionHistory(sessionName);
-  clearSummarySyncHistory(sessionName);
-  if (serverLink) {
-    await handleGetSessions(serverLink);
-    await syncSubSessionIfNeeded(sessionName, serverLink);
-  }
-  timelineEmitter.emit(sessionName, 'assistant.text', {
-    ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED, 'Started a fresh conversation'),
-    streaming: false,
-    memoryExcluded: true,
-  }, { source: 'daemon', confidence: 'high' });
+  await finalizeConversationReset(sessionName, serverLink);
+}
+
+/**
+ * `/handoff` for transport and process sessions: reset the provider
+ * conversation (`fresh: true`) like `/clear` while attaching a bounded handoff
+ * pack from the prior conversation for continuity on the next turn.
+ */
+export async function handoffSessionConversation(record: SessionRecord, serverLink?: ServerLink): Promise<void> {
+  const sessionName = record.name;
+  clearResend(sessionName);
+  await runExclusiveSessionRelaunch(sessionName, async () => {
+    await relaunchSessionWithSettings(record, { fresh: true, handoff: true });
+  });
+  await finalizeConversationReset(sessionName, serverLink);
 }
 
 async function relaunchFreshTransportConversation(record: SessionRecord): Promise<void> {
@@ -5187,20 +5229,20 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
   const transportUserEventId = (clientMessageId: string) => `transport-user:${clientMessageId}`;
   const isTransportSession = record?.runtimeType === 'transport'
     || (typeof record?.agentType === 'string' && isTransportAgent(record.agentType));
-  if (isTransportSession && isSessionControlCommandText(trimmedText, 'clear') && supportsTransportClear(record?.agentType)) {
+  const isTransportHandoff = isSessionControlCommandText(trimmedText, 'handoff');
+  if (isTransportSession && (isSessionControlCommandText(trimmedText, 'clear') || isTransportHandoff) && supportsTransportClear(record?.agentType)) {
     emitTransportUserMessage(text);
-    try {
-      await clearTransportConversation(record!, serverLink);
-      const clearStatus = isLegacy ? 'accepted_legacy' : 'accepted';
-      timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: clearStatus });
-      emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: clearStatus });
-    } catch (err) {
-      const errMsg = describeTransportSendError(err);
-      logger.error({ sessionName, err }, 'session.clear (transport) failed');
-      timelineEmitter.emit(sessionName, 'assistant.text', { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_CLEAR_FAILED, `⚠️ Clear failed: ${errMsg}`, { detail: errMsg }), streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
-      timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
-      emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
-    }
+    await executeDaemonResetCommand({
+      sessionName,
+      serverLink,
+      effectiveId,
+      isLegacy,
+      label: isTransportHandoff ? 'session.handoff (transport)' : 'session.clear (transport)',
+      run: () => isTransportHandoff
+        ? handoffSessionConversation(record!, serverLink)
+        : clearTransportConversation(record!, serverLink),
+      formatError: describeTransportSendError,
+    });
     return;
   }
   if (!transportRuntime && isTransportSession) {
@@ -5624,33 +5666,27 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
         preferenceContext: preferenceMessagePreamble,
       });
 
-  if (isSessionControlCommandText(text, 'clear') && record?.runtimeType !== 'transport' && supportsProcessClear(record?.agentType)) {
+  const isProcessHandoff = isSessionControlCommandText(text, 'handoff');
+  if ((isSessionControlCommandText(text, 'clear') || isProcessHandoff) && record?.runtimeType !== 'transport' && supportsProcessClear(record?.agentType)) {
     emitTransportUserMessage(text);
-    try {
-      await runExclusiveSessionRelaunch(sessionName, async () => {
-        await relaunchSessionWithSettings(record, { fresh: true });
-      });
-      // Reset per-session memory injection history — fresh conversation
-      // should be allowed to re-inject previously-shown memories again.
-      clearRecentInjectionHistory(sessionName);
-      clearSummarySyncHistory(sessionName);
-      await handleGetSessions(serverLink);
-      await syncSubSessionIfNeeded(sessionName, serverLink);
-      timelineEmitter.emit(sessionName, 'assistant.text', {
-        ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED, 'Started a fresh conversation'),
-        streaming: false,
-        memoryExcluded: true,
-      }, { source: 'daemon', confidence: 'high' });
-      const clearStatus = isLegacy ? 'accepted_legacy' : 'accepted';
-      timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: clearStatus });
-      emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: clearStatus });
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      logger.error({ sessionName, err }, 'session.clear failed');
-      timelineEmitter.emit(sessionName, 'assistant.text', { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_CLEAR_FAILED, `⚠️ Clear failed: ${errMsg}`, { detail: errMsg }), streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
-      timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
-      emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
-    }
+    await executeDaemonResetCommand({
+      sessionName,
+      serverLink,
+      effectiveId,
+      isLegacy,
+      label: isProcessHandoff ? 'session.handoff' : 'session.clear',
+      run: async () => {
+        if (isProcessHandoff) {
+          await handoffSessionConversation(record, serverLink);
+          return;
+        }
+        await runExclusiveSessionRelaunch(sessionName, async () => {
+          await relaunchSessionWithSettings(record, { fresh: true });
+        });
+        await finalizeConversationReset(sessionName, serverLink);
+      },
+      formatError: (err) => (err instanceof Error ? err.message : String(err)),
+    });
     return;
   }
 

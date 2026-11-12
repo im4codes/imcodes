@@ -12,8 +12,16 @@ import type { SessionRecord } from '../store/session-store.js';
 import { incrementCounter } from '../util/metrics.js';
 import { redactSensitiveText } from '../../shared/redact-secrets.js';
 import { isClaudeCodeSdkAgentType } from '../../shared/agent-types.js';
+import { classifySessionControlCommand } from '../../shared/session-control-commands.js';
 
-export function shouldCreateCrossVendorHandoff(record: Pick<SessionRecord, 'agentType' | 'runtimeType'>, targetAgentType: string, targetRuntimeType: 'process' | 'transport', fresh: boolean): boolean {
+export function shouldCreateCrossVendorHandoff(
+  record: Pick<SessionRecord, 'agentType' | 'runtimeType'>,
+  targetAgentType: string,
+  targetRuntimeType: 'process' | 'transport',
+  fresh: boolean,
+  force = false,
+): boolean {
+  if (force) return true;
   return !fresh && (record.agentType !== targetAgentType || (record.runtimeType ?? 'process') !== targetRuntimeType);
 }
 
@@ -49,6 +57,10 @@ export async function buildCrossVendorHandoffPack(record: SessionRecord, cutoff:
     incrementCounter('handoff.timeline_read_failed', {});
     return undefined;
   }
+  // Never echo bare session control commands (/clear, /handoff, /compact, /stop)
+  // back into the new conversation as user turns.
+  messages = messages.filter((message) => classifySessionControlCommand(message.text) === null);
+  if (messages.length === 0) return undefined;
   // Identity/system instructions are reapplied by the normal launch bootstrap.
   // The handoff is conversation text only, never tools or processed memory.
   const render = (rows: typeof messages, maxTextChars: number) => redactSensitiveText([

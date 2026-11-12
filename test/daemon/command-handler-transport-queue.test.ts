@@ -1910,6 +1910,61 @@ describe('handleWebCommand transport queue behavior', () => {
     );
   });
 
+  it('handles /handoff via relaunchSessionWithSettings fresh + handoff, clears resend queue, and acks without queuing', async () => {
+    const { clearAllResend, enqueueResend, getResendEntries } = await import('../../src/daemon/transport-resend-queue.js');
+    clearAllResend();
+    enqueueResend('deck_transport_brain', { text: 'stale queued msg', timestamp: Date.now() });
+    expect(getResendEntries('deck_transport_brain')).toHaveLength(1);
+    relaunchSessionWithSettingsMock.mockResolvedValueOnce(undefined);
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      projectDir: '/proj',
+      label: 'Brain',
+      description: 'desc',
+      requestedModel: 'sonnet',
+      effort: 'high',
+      transportConfig: { supervision: { mode: 'off' } },
+      ccPreset: 'preset-a',
+      ccSessionId: 'cc-old',
+      providerSessionId: 'route-transport',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      cancel: vi.fn(),
+      send: vi.fn(() => 'queued'),
+      pendingCount: 2,
+      pendingMessages: ['a', 'b'],
+    });
+
+    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: ' /handoff ', commandId: 'cmd-handoff-cc' }, serverLink as any);
+    await flushAsync();
+
+    expect(getResendEntries('deck_transport_brain')).toEqual([]);
+    expect(relaunchSessionWithSettingsMock).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'deck_transport_brain', agentType: 'claude-code-sdk' }),
+      { fresh: true, handoff: true },
+    );
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'user.message',
+      { text: ' /handoff ', allowDuplicate: true, commandId: 'cmd-handoff-cc' },
+      { source: 'daemon', confidence: 'high', eventId: 'transport-user:cmd-handoff-cc' },
+    );
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'assistant.text', {
+      text: 'Started a fresh conversation',
+      noticeCode: DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED,
+      noticeParams: {},
+      streaming: false,
+      memoryExcluded: true,
+    }, expect.objectContaining({ source: 'daemon' }));
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-handoff-cc', status: 'accepted' });
+  });
+
   it('passes requestedModel when starting a copilot-sdk main session', async () => {
     handleWebCommand({
       type: 'session.start',

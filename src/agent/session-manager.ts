@@ -1212,6 +1212,7 @@ export interface LaunchOpts {
 export interface SessionRelaunchOverrides {
   agentType?: AgentType;
   fresh?: boolean | null;
+  handoff?: boolean;
   projectDir?: string;
   label?: string | null;
   description?: string | null;
@@ -1301,10 +1302,12 @@ export async function relaunchSessionWithSettings(
   const targetCcPreset = overrides.ccPreset !== undefined ? overrides.ccPreset : (record.ccPreset ?? null);
   const compatibleIds = targetFresh ? {} : getCompatibleSessionIds(record, targetAgentType);
   const targetRuntimeType = getSessionRuntimeType(targetAgentType);
+  const forceHandoff = overrides.handoff === true;
   const handoffConfig = normalizeCrossVendorHandoffConfig(record.crossVendorHandoff?.config);
+  const effectiveHandoffConfig = forceHandoff ? { ...handoffConfig, enabled: true } : handoffConfig;
   let handoffPromise: Promise<import('../../shared/cross-vendor-handoff.js').CrossVendorHandoffPack | undefined> | undefined;
   let handoffCutoff: CrossVendorHandoffCutoff | undefined;
-  if (shouldCreateCrossVendorHandoff(record, targetAgentType, targetRuntimeType, targetFresh) && handoffConfig.enabled) {
+  if (shouldCreateCrossVendorHandoff(record, targetAgentType, targetRuntimeType, targetFresh, forceHandoff) && effectiveHandoffConfig.enabled) {
     try {
       const events = await timelineStore.readPreferred(record.name, { limit: 1 });
       const last = events.at(-1);
@@ -1325,17 +1328,18 @@ export async function relaunchSessionWithSettings(
     );
     upsertSession({ ...record, crossVendorHandoff: persistedState, updatedAt: Date.now() });
     const build = buildCrossVendorHandoffPack(record, cutoff, targetAgentType, targetRuntimeType, {
-      ...handoffConfig,
+      ...effectiveHandoffConfig,
       // A previous cutoff means this is a switch-back; the pack builder still
       // uses the authoritative timeline and the target runtime receives it once.
-      ...(priorCutoff ? { recentTurns: handoffConfig.recentTurns } : {}),
+      ...(priorCutoff ? { recentTurns: effectiveHandoffConfig.recentTurns } : {}),
     }, priorCutoff);
-    handoffPromise = resolveCrossVendorHandoffPack(build, handoffConfig.timeoutMs);
+    handoffPromise = resolveCrossVendorHandoffPack(build, effectiveHandoffConfig.timeoutMs);
   }
   const preserveTransportBinding = record.runtimeType === RUNTIME_TYPES.TRANSPORT
     && record.agentType === targetAgentType
+    && (!targetFresh || targetAgentType === 'openclaw')
     // Qwen uses providerSessionId as its real resume key, so explicit restart must
-    // preserve it. Claude/Codex SDKs keep their provider continuity in ccSessionId /
+    // preserve it (unless fresh conversation requested). Claude/Codex SDKs keep their provider continuity in ccSessionId /
     // codexSessionId; Kimi/Grok use providerResumeId, so these providers use a fresh
     // local route key on relaunch.
     && !isClaudeCodeSdkAgentType(targetAgentType)
@@ -1364,7 +1368,7 @@ export async function relaunchSessionWithSettings(
       : undefined,
     ...(preserveTransportBinding ? {
       bindExistingKey: record.providerSessionId,
-      skipCreate: true,
+      ...(!targetFresh ? { skipCreate: true } : {}),
     } : {}),
     ...(!targetFresh && record.agentType === targetAgentType && usesProviderResumeId(targetAgentType) && record.providerResumeId
       ? { providerResumeId: record.providerResumeId }
@@ -1418,7 +1422,7 @@ export async function relaunchSessionWithSettings(
         const pending = current?.crossVendorHandoff?.pending;
         if (pending) markConsumed(pending);
       });
-      launchedTransport.setPendingHandoffReady(guardedPromise, handoffConfig.providerWaitMs);
+      launchedTransport.setPendingHandoffReady(guardedPromise, effectiveHandoffConfig.providerWaitMs);
     }
     void guardedPromise.then(async (pack) => {
       if (!pack || !isCurrentLaunch()) return;
@@ -4013,7 +4017,11 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
         ...(preservedSummarySyncFingerprints && preservedSummarySyncFingerprints.length > 0
           ? { summarySyncFingerprints: preservedSummarySyncFingerprints }
           : {}),
-        ...(existing?.crossVendorHandoff ? { crossVendorHandoff: existing.crossVendorHandoff } : {}),
+        ...(existing?.crossVendorHandoff ? {
+          crossVendorHandoff: opts.fresh && existing.crossVendorHandoff.pending
+            ? { ...existing.crossVendorHandoff, pending: undefined }
+            : existing.crossVendorHandoff,
+        } : {}),
       });
       const launchGapEntries = getResendEntries(name);
       if (launchGapEntries.length > 0 && launchGapEntries.every((entry) => !entry.recipient)) {
@@ -4405,7 +4413,11 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       ...(opts.identityPrompt ? { appliedIdentityHash: identityPromptHash(opts.identityPrompt) } : {}),
       ...(opts.parentSession ? { parentSession: opts.parentSession } : {}),
       ...(opts.userCreated ? { userCreated: true } : {}),
-      ...(existing?.crossVendorHandoff ? { crossVendorHandoff: existing.crossVendorHandoff } : {}),
+      ...(existing?.crossVendorHandoff ? {
+        crossVendorHandoff: fresh && existing.crossVendorHandoff.pending
+          ? { ...existing.crossVendorHandoff, pending: undefined }
+          : existing.crossVendorHandoff,
+      } : {}),
       ...(summarySyncFingerprints.length > 0 ? { summarySyncFingerprints } : {}),
       ...(familyDisplay ?? {}),
       ...(launchedNativeAgentFence ? { nativeAgentLaunchFence: launchedNativeAgentFence } : {}),
