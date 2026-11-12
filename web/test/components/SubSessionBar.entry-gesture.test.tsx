@@ -150,6 +150,17 @@ describe('sub-session entry gesture helper', () => {
       '<span class="subcard-resize-handle"></span>',
       '<span class="subcard-drag-handle"></span>',
       '<span class="subsession-drag-icon"></span>',
+      '<div class="subcard-input-area"><span>padding</span></div>',
+      '<div class="controls"><span>controls</span></div>',
+      '<div class="controls-composer"><span>composer</span></div>',
+      '<div class="quick-input-panel"><span>quick</span></div>',
+      '<div class="qp"><span>qp</span></div>',
+      '<div class="menu-dropdown"><span>menu</span></div>',
+      '<div role="dialog">dialog</div>',
+      '<div role="menu">menu</div>',
+      '<div role="menuitem">menuitem</div>',
+      '<div role="listbox">listbox</div>',
+      '<div role="option">option</div>',
     ];
 
     for (const markup of cases) {

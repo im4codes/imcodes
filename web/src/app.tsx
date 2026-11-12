@@ -294,7 +294,11 @@ import {
   removeTransportPendingEntryForUserMessage,
 } from './transport-queue.js';
 import { ingestTimelineEventForCache, requestActiveTimelineRefresh, dispatchActiveTimelineRefresh, requestActiveTimelineRefreshAfterUserAction } from './hooks/useTimeline.js';
-import { getMobileKeyboardState } from './mobile-keyboard.js';
+import {
+  getMobileKeyboardState,
+  isMobileKeyboardInputTarget,
+  isSubSessionBarInputTarget,
+} from './mobile-keyboard.js';
 import { shouldUseIosMacTextScale } from './native-platform.js';
 import { boundedVisualViewportHeight, createSettledViewportUpdater } from './visual-viewport.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
@@ -1348,12 +1352,13 @@ function InternalMainApp() {
     if (shouldUseIosMacTextScale()) {
       document.documentElement.style.removeProperty('--vvh');
       document.documentElement.style.removeProperty('--kbh');
-      document.documentElement.classList.remove('kb-open', 'input-focused');
+      document.documentElement.classList.remove('kb-open', 'input-focused', 'subcard-input-focused');
       return;
     }
     const vv = window.visualViewport;
     if (!vv) return;
     let inputFocused = false;
+    let subCardInputFocused = false;
     let hadKeyboardOpen = false;
     let scrollTimer: ReturnType<typeof setTimeout> | undefined;
     const update = () => {
@@ -1385,6 +1390,7 @@ function InternalMainApp() {
       const { kbOpen, hideInputUi } = state;
       document.documentElement.classList.toggle('kb-open', kbOpen);
       document.documentElement.classList.toggle('input-focused', hideInputUi);
+      document.documentElement.classList.toggle('subcard-input-focused', hideInputUi && subCardInputFocused);
       // Reset any scroll/offset caused by keyboard opening on mobile — but ONLY
       // when there is actually an offset to correct. Running scrollTo(0,0) on
       // EVERY visualViewport resize (which includes IME candidate-bar toggles
@@ -1414,12 +1420,11 @@ function InternalMainApp() {
     const onFocusIn = (e: FocusEvent) => {
       const el = e.target as HTMLElement | null;
       if (!el) return;
-      const tag = el.tagName;
-      inputFocused = tag === 'INPUT' || tag === 'TEXTAREA'
-        || el.getAttribute('contenteditable') === 'true'
-        || el.classList.contains('xterm-helper-textarea');
+      inputFocused = isMobileKeyboardInputTarget(el);
+      subCardInputFocused = isSubSessionBarInputTarget(el);
       // Toggle .input-focused instantly on focus (no viewport delay needed)
       document.documentElement.classList.toggle('input-focused', inputFocused);
+      document.documentElement.classList.toggle('subcard-input-focused', inputFocused && subCardInputFocused);
       // Aggressively reset scroll — iOS visual viewport push
       if (inputFocused) {
         window.scrollTo(0, 0);
@@ -1430,8 +1435,9 @@ function InternalMainApp() {
     };
     const onFocusOut = () => {
       inputFocused = false;
+      subCardInputFocused = false;
       hadKeyboardOpen = false;
-      document.documentElement.classList.remove('input-focused');
+      document.documentElement.classList.remove('input-focused', 'subcard-input-focused');
       clearTimeout(scrollTimer);
       scheduleUpdate();
     };
@@ -1453,17 +1459,16 @@ function InternalMainApp() {
     const onResume = () => {
       if (document.visibilityState !== 'visible') return;
       const active = document.activeElement as HTMLElement | null;
-      const activeIsInput = !!active && (
-        active.tagName === 'INPUT'
-        || active.tagName === 'TEXTAREA'
-        || active.getAttribute('contenteditable') === 'true'
-        || active.classList.contains('xterm-helper-textarea')
-      );
+      const activeIsInput = isMobileKeyboardInputTarget(active);
       // If the OS dismissed focus during background, blur the stale element so
       // update() reflects reality. If focus genuinely survived, keep it.
       if (!activeIsInput) {
         inputFocused = false;
+        subCardInputFocused = false;
         hadKeyboardOpen = false;
+      } else {
+        inputFocused = true;
+        subCardInputFocused = isSubSessionBarInputTarget(active);
       }
       scheduleUpdate();
     };

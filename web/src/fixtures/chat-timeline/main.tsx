@@ -59,6 +59,12 @@ import { createSupervisionTaskConsoleState, SUPERVISION_TASK_CONSOLE_PHASE, SUPE
 import { TASK_PAIR_TIMELINE_EVENT } from '@shared/task-pair.js';
 import type { SupervisionConsolePairInfo } from '@shared/supervision-task-console.js';
 import { SubSessionWindow } from '../../components/SubSessionWindow.js';
+import { SubSessionBar } from '../../components/SubSessionBar.js';
+import {
+  getMobileKeyboardState,
+  isMobileKeyboardInputTarget,
+  isSubSessionBarInputTarget,
+} from '../../mobile-keyboard.js';
 import type { SubSession } from '../../hooks/useSubSessions.js';
 import { ChatView, __buildViewItemsForTests } from '../../components/ChatView.js';
 import { WsClient, type TimelineEvent } from '../../ws-client.js';
@@ -334,6 +340,148 @@ function FixtureSubWindow() {
     getMaximizeBounds={() => ({ x: 0, y: 0, w: innerWidth, h: innerHeight })} />;
 }
 
+// Opt-in production SubSessionBar + SubSessionCard + SubSessionWindow IME/focus fixture.
+function FixtureSubBar() {
+  const [openIds, setOpenIds] = useState<string[]>([]);
+  const [focusedSubId, setFocusedSubId] = useState<string | null>(null);
+  const [maximizedIds, setMaximizedIds] = useState<string[]>([]);
+  const [showWindow, setShowWindow] = useState(query.get('openWindow') === '1');
+  const [windowMinimizedCount, setWindowMinimizedCount] = useState(0);
+  const subTransport: SubSession = { id: 'sub-tr', serverId: 'fixture-server', type: 'codex-sdk', runtimeType: 'transport', shellBin: null, cwd: null, ccSessionId: null, geminiSessionId: null, parentSession: 'fixture-brain', label: 'Card Transport', ccPresetId: null, sessionName: 'fixture-sub-tr', state: 'idle', createdAt: 1700000000000, updatedAt: 1700000000000 };
+  const subShell: SubSession = { id: 'sub-sh', serverId: 'fixture-server', type: 'shell', runtimeType: 'process', shellBin: '/bin/bash', cwd: null, ccSessionId: null, geminiSessionId: null, parentSession: 'fixture-brain', label: 'Card Shell', ccPresetId: null, sessionName: 'fixture-sub-sh', state: 'idle', createdAt: 1700000000000, updatedAt: 1700000000000 };
+
+  useEffect(() => {
+    const vv = window.visualViewport;
+    let inputFocused = false;
+    let subCardInputFocused = false;
+    let hadKeyboardOpen = false;
+    const update = () => {
+      const vh = vv?.height ?? window.innerHeight;
+      const shrink = Math.max(0, window.innerHeight - vh);
+      const state = getMobileKeyboardState(inputFocused, shrink, hadKeyboardOpen);
+      hadKeyboardOpen = state.hadKeyboardOpen;
+      document.documentElement.classList.toggle('kb-open', state.kbOpen);
+      document.documentElement.classList.toggle('input-focused', state.hideInputUi);
+      document.documentElement.classList.toggle('subcard-input-focused', state.hideInputUi && subCardInputFocused);
+    };
+    const onFocusIn = (e: FocusEvent) => {
+      const el = e.target as HTMLElement | null;
+      if (!el) return;
+      inputFocused = isMobileKeyboardInputTarget(el);
+      subCardInputFocused = isSubSessionBarInputTarget(el);
+      document.documentElement.classList.toggle('input-focused', inputFocused);
+      document.documentElement.classList.toggle('subcard-input-focused', inputFocused && subCardInputFocused);
+    };
+    const onFocusOut = () => {
+      inputFocused = false;
+      subCardInputFocused = false;
+      hadKeyboardOpen = false;
+      document.documentElement.classList.remove('input-focused', 'subcard-input-focused');
+      update();
+    };
+    vv?.addEventListener('resize', update);
+    window.addEventListener('resize', update);
+    document.addEventListener('focusin', onFocusIn);
+    document.addEventListener('focusout', onFocusOut);
+    return () => {
+      vv?.removeEventListener('resize', update);
+      window.removeEventListener('resize', update);
+      document.removeEventListener('focusin', onFocusIn);
+      document.removeEventListener('focusout', onFocusOut);
+      document.documentElement.classList.remove('kb-open', 'input-focused', 'subcard-input-focused');
+    };
+  }, []);
+
+  const useFallbackInput = query.get('fallback') === '1';
+  const subBarWs = useFallbackInput ? null : ({
+    sendSessionCommand: () => {},
+    send: () => {},
+    subscribeTerminal: () => {},
+    onMessage: () => () => {},
+    getDaemonCapabilitySnapshot: () => null,
+    onDaemonCapabilitySnapshot: () => () => {},
+    fsGitStatus: () => '1',
+  } as unknown as WsClient);
+
+  const quickData = {
+    data: { history: [], sessionHistory: {}, commands: [], phrases: [] },
+    loaded: true,
+    recordHistory: () => {},
+    addCommand: () => {},
+    addPhrase: () => {},
+    removeCommand: () => {},
+    removePhrase: () => {},
+    removeHistory: () => {},
+    removeSessionHistory: () => {},
+    clearHistory: () => {},
+    clearSessionHistory: () => {},
+  };
+
+  return (
+    <div
+      data-testid="fixture-subbar-host"
+      data-open-ids={openIds.join(',')}
+      data-focused-id={focusedSubId ?? ''}
+      data-maximized-ids={maximizedIds.join(',')}
+      data-window-minimized-count={String(windowMinimizedCount)}
+      style={{ display: 'flex', flexDirection: 'column', height: '100vh', width: '100vw' }}
+    >
+      <div style={{ flex: '1 1 auto', padding: 12 }}>
+        <div
+          contenteditable="true"
+          role="textbox"
+          class="controls-input"
+          data-testid="main-composer"
+          data-placeholder="Main session input"
+        />
+      </div>
+      {showWindow && (
+        <SubSessionWindow
+          sub={subTransport}
+          ws={subBarWs}
+          connected={true}
+          active
+          serverId="fixture-server"
+          zIndex={20}
+          onDiff={() => {}}
+          onHistory={() => {}}
+          onMinimize={() => { setWindowMinimizedCount((c) => c + 1); setShowWindow(false); }}
+          onClose={() => setShowWindow(false)}
+          onRestart={() => {}}
+          onRename={() => {}}
+          onFocus={() => setFocusedSubId(subTransport.id)}
+        />
+      )}
+      <SubSessionBar
+        subSessions={[subTransport, subShell]}
+        openIds={new Set(openIds)}
+        maximizedIds={new Set(maximizedIds)}
+        focusedSubId={focusedSubId}
+        collapsed={false}
+        desktopLayoutCapable={window.matchMedia('(pointer: fine)').matches}
+        onOpen={(id) => {
+          setOpenIds((prev) => (prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]));
+          setFocusedSubId(id);
+        }}
+        onFocus={(id) => setFocusedSubId(id)}
+        onOpenMaximized={(id) => {
+          setOpenIds((prev) => (prev.includes(id) ? prev : [...prev, id]));
+          setMaximizedIds((prev) => (prev.includes(id) ? prev : [...prev, id]));
+        }}
+        onMaximize={(id) => setMaximizedIds((prev) => (prev.includes(id) ? prev : [...prev, id]))}
+        onRestore={(id) => setMaximizedIds((prev) => prev.filter((item) => item !== id))}
+        onClose={() => {}}
+        onRestart={() => {}}
+        ws={subBarWs}
+        connected={true}
+        onDiff={() => {}}
+        onHistory={() => {}}
+        quickData={useFallbackInput ? undefined : (quickData as any)}
+      />
+    </div>
+  );
+}
+
 function FixtureHarness() {
   const [events, setEvents] = useState<TimelineEvent[]>(initialEvents);
   publishEvents = setEvents;
@@ -346,6 +494,7 @@ function FixtureHarness() {
   }, []);
 
   if (query.get('subWindow') === '1') return <FixtureSubWindow />;
+  if (query.get('subBar') === '1') return <FixtureSubBar />;
 
   const cellStyle = windowCount === 4
     ? { height: '50vh', width: '50vw', display: 'flex', flexDirection: 'column' as const, overflow: 'hidden', boxSizing: 'border-box' as const, border: '1px solid #222' }

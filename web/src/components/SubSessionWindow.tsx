@@ -39,6 +39,7 @@ import { useNowTicker } from '../hooks/useNowTicker.js';
 import { useExecutionRouting } from '../hooks/useExecutionRouting.js';
 import { useExecutionCloneLaunch } from '../hooks/useExecutionCloneLaunch.js';
 import { resolveSubSessionRuntimeType } from '../runtime-type.js';
+import { shouldSuppressSubSessionBarForKeyboard } from '../mobile-keyboard.js';
 import { DESKTOP_WINDOW_IDS } from '../window-stack.js';
 import {
   clampGeometryFullyIntoWorkspace,
@@ -219,8 +220,7 @@ export function measureMobileSubSessionBarHeight(
 }
 
 function isMobileSubSessionBarSuppressed(doc: Document = document): boolean {
-  const root = doc.documentElement;
-  return root.classList.contains('kb-open') || root.classList.contains('input-focused');
+  return shouldSuppressSubSessionBarForKeyboard(doc);
 }
 
 function getInitialMobileSubSessionBarHeight(isMobile: boolean): number {

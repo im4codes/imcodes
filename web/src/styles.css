@@ -1964,7 +1964,7 @@ html.native-ios-mac .chat-dl-btn {
   .controls-target-bubble::after,
   .controls-target-pulse { animation: none; }
 }
-.controls-input { flex: 1; min-width: 0; background: linear-gradient(180deg, rgba(15,23,42,0.92), rgba(8,13,22,0.94)); border: 1px solid rgba(125,211,252,0.18); color: #e2e8f0; padding: 7px 11px; border-radius: 7px; font-family: inherit; font-size: 13px; outline: none; overflow-y: auto; min-height: 32px; max-height: 120px; line-height: 1.45; word-break: break-word; white-space: pre-wrap; text-align: left !important; direction: ltr; -webkit-user-modify: read-write-plaintext-only; box-shadow: inset 0 1px 0 rgba(255,255,255,0.035), inset 0 0 18px rgba(34,211,238,0.025); transition: border-color 0.14s, box-shadow 0.14s, background 0.14s; }
+.controls-input { flex: 1; min-width: 0; background: linear-gradient(180deg, rgba(15,23,42,0.92), rgba(8,13,22,0.94)); border: 1px solid rgba(125,211,252,0.18); color: #e2e8f0; padding: 7px 11px; border-radius: 7px; font-family: inherit; font-size: 13px; outline: none; overflow-y: auto; min-height: 32px; max-height: 120px; line-height: 1.45; word-break: break-word; white-space: pre-wrap; text-align: left !important; direction: ltr; user-select: text; -webkit-user-select: text; -webkit-user-modify: read-write-plaintext-only; box-shadow: inset 0 1px 0 rgba(255,255,255,0.035), inset 0 0 18px rgba(34,211,238,0.025); transition: border-color 0.14s, box-shadow 0.14s, background 0.14s; }
 .controls-input:focus { border-color: rgba(34,211,238,0.62); box-shadow: 0 0 0 1px rgba(34,211,238,0.14), 0 0 16px rgba(34,211,238,0.12), inset 0 1px 0 rgba(255,255,255,0.055); background: linear-gradient(180deg, rgba(15,40,62,0.72), rgba(8,13,22,0.94)); }
 .controls-input-file-drag-over { border-color: rgba(96,165,250,0.82); box-shadow: 0 0 0 1px rgba(96,165,250,0.42), 0 0 18px rgba(59,130,246,0.2), inset 0 1px 0 rgba(255,255,255,0.06); background: linear-gradient(180deg, rgba(20,53,82,0.74), rgba(8,13,22,0.94)); }
 .controls-input-p2p { background: linear-gradient(180deg, rgba(44,27,60,0.64), rgba(15,18,32,0.94)); }
@@ -7214,7 +7214,7 @@ html.native-ios-mac .chat-dl-btn {
 .subcard-resize-handle::after { content: '⋮'; position: absolute; right: 8px; top: 50%; transform: translateY(-50%); font-size: 12px; color: #334155; pointer-events: none; line-height: 1; }
 .subcard-resize-handle:hover, .subcard-resize-handle.is-pointer-hovered { background: rgba(59,130,246,0.4); }
 .subcard-resize-handle:hover::after, .subcard-resize-handle.is-pointer-hovered::after { color: #60a5fa; }
-.subcard-input-area { flex-shrink: 0; border-top: 1px solid rgba(125,211,252,0.12); background: linear-gradient(180deg, #0a101b, #080d16); padding: 5px 6px; display: flex; flex-direction: column; gap: 3px; border-radius: 0 0 8px 8px; }
+.subcard-input-area { flex-shrink: 0; border-top: 1px solid rgba(125,211,252,0.12); background: linear-gradient(180deg, #0a101b, #080d16); padding: 5px 6px; display: flex; flex-direction: column; gap: 3px; border-radius: 0 0 8px 8px; cursor: default; user-select: text; -webkit-user-select: text; }
 .subcard-input-row { display: flex; align-items: stretch; gap: 6px; }
 .subcard-input-main { flex: 1; min-width: 0; }
 /* Card composers deliberately remain a single visible row. Full sessions
@@ -7248,13 +7248,13 @@ html.native-ios-mac .chat-dl-btn {
    .input-focused is toggled instantly on focusin/focusout (no viewport delay).
    .kb-open is kept as fallback for viewport-based detection. */
 @media (pointer: coarse) {
-  .input-focused .subcard-bar { display: none; }
+  :root:not(.subcard-input-focused).input-focused .subcard-bar:not(:focus-within) { display: none; }
   .input-focused .session-usage-footer { display: none; }
   .input-focused .shell-terminal-pane .controls { display: none; }
   .input-focused .shell-terminal-pane .attachment-badges { display: none; }
   .input-focused .shell-terminal-pane .shell-quick-trigger { display: inline-flex !important; color: #fbbf24 !important; }
 }
-.kb-open .subcard-bar { display: none; }
+:root:not(.subcard-input-focused).kb-open .subcard-bar:not(:focus-within) { display: none; }
 .kb-open .session-usage-footer { display: none; }
 .kb-open .shell-terminal-pane .controls { display: none; }
 .kb-open .shell-terminal-pane .attachment-badges { display: none; }

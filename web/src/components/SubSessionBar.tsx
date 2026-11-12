@@ -51,6 +51,7 @@ import { isAuthoritativeUsageContextWindowSource, type UsageContextWindowSource 
 import { resolveQuickAgentDelegationModel } from '../quick-agent-delegation-model.js';
 import {
   createSubSessionEntryGestureController,
+  shouldIgnoreSubSessionEntryGestureTarget,
   type SubSessionEntryGestureController,
 } from '../subsession-entry-gesture.js';
 import {
@@ -2084,7 +2085,26 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
               <div
                 key={sub.id}
                 class="subcard-drag-wrap"
-                draggable
+                draggable={desktopLayoutCapable}
+                onPointerDownCapture={(event) => {
+                  const target = event.target as Element | null;
+                  (event.currentTarget as HTMLDivElement).draggable = desktopLayoutCapable
+                    && !shouldIgnoreSubSessionEntryGestureTarget(target, event.currentTarget as Element);
+                }}
+                onMouseDownCapture={(event) => {
+                  const target = event.target as Element | null;
+                  (event.currentTarget as HTMLDivElement).draggable = desktopLayoutCapable
+                    && !shouldIgnoreSubSessionEntryGestureTarget(target, event.currentTarget as Element);
+                }}
+                onPointerUpCapture={(event) => {
+                  (event.currentTarget as HTMLDivElement).draggable = desktopLayoutCapable;
+                }}
+                onPointerCancelCapture={(event) => {
+                  (event.currentTarget as HTMLDivElement).draggable = desktopLayoutCapable;
+                }}
+                onMouseUpCapture={(event) => {
+                  (event.currentTarget as HTMLDivElement).draggable = desktopLayoutCapable;
+                }}
                 onPointerDown={(event) => handleEntryPointerDown(sub.id, event)}
                 onTouchStart={(event) => handleExpandedEntryTouchStart(sub.id, event)}
                 onTouchMove={(event) => handleExpandedEntryTouchMove(sub.id, event)}
@@ -2093,9 +2113,14 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                 onClick={(event) => handleEntryClick(sub.id, event)}
                 onDblClick={(event) => handleEntryDoubleClick(sub.id, event)}
                 onDragStart={(e) => {
+                  const target = e.target as Element | null;
+                  if (!desktopLayoutCapable || shouldIgnoreSubSessionEntryGestureTarget(target, e.currentTarget as Element)) {
+                    e.preventDefault();
+                    return;
+                  }
                   dragIdRef.current = sub.id;
                   suppressEntryClickRef.current = true;
-                  e.dataTransfer!.effectAllowed = 'move';
+                  if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
                   (e.currentTarget as HTMLElement).style.opacity = '0.5';
                   // Initialize dragOrder from current displayed order
                   if (!dragOrder) setDragOrder(orderedSessions.map((s) => s.id));

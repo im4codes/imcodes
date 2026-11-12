@@ -534,7 +534,21 @@ function SubSessionCardImpl({ sub, ws, connected, isOpen, isFocused, idleFlashTo
       </div>
 
       {/* Compact input — reuses SessionControls with @picker, ⚡, 📎, paste upload */}
-      <div class="subcard-input-area" onClick={(e) => e.stopPropagation()}>
+      <div
+        class="subcard-input-area"
+        draggable={false}
+        onPointerDown={(e) => e.stopPropagation()}
+        onTouchStart={(e) => e.stopPropagation()}
+        onTouchMove={(e) => e.stopPropagation()}
+        onTouchEnd={(e) => e.stopPropagation()}
+        onTouchCancel={(e) => e.stopPropagation()}
+        onClick={(e) => e.stopPropagation()}
+        onDblClick={(e) => e.stopPropagation()}
+        onDragStart={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+        }}
+      >
         <div class="subcard-input-row">
           {/* Fallback cards do not mount SessionControls. Keep their direct
               cancel, while compact SessionControls uses the ordinary
