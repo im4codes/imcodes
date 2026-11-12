@@ -1,8 +1,15 @@
 /**
  * @vitest-environment jsdom
  */
-import { cleanup, render, waitFor } from '@testing-library/preact';
+import { cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string, fallback?: string) => (typeof fallback === 'string' ? fallback : key),
+    i18n: { language: 'en' },
+  }),
+}));
 
 /** OfficePreview fetches its bytes from the chunked download URL. */
 function installFetchStub(bytes = new Uint8Array([0, 0]).buffer): void {
@@ -220,5 +227,419 @@ describe('OfficePreview — XLSX sanitization', () => {
 
     await waitFor(() => expect(container.textContent).toContain('hello'));
     expect(container.textContent).toContain('42');
+  });
+});
+
+describe('OfficePreview — Embedded ONLYOFFICE & permission controls', () => {
+  const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+
+  afterEach(() => {
+    cleanup();
+    delete (window as unknown as { DocsAPI?: unknown }).DocsAPI;
+    vi.unstubAllGlobals();
+  });
+
+  it('mounts DocsAPI.DocEditor when ONLYOFFICE is enabled, enforces allowDownload, and supports view/edit mode toggle', async () => {
+    const docEditorSpy = vi.fn().mockImplementation(() => ({
+      destroyEditor: vi.fn(),
+    }));
+    (window as unknown as { DocsAPI: { DocEditor: typeof docEditorSpy } }).DocsAPI = {
+      DocEditor: docEditorSpy,
+    };
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const urlStr = String(input);
+      if (urlStr.includes('/onlyoffice/config')) {
+        const mode = urlStr.includes('mode=view') ? 'view' : 'edit';
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            enabled: true,
+            role: 'editor',
+            allowDownload: false,
+            canManageShare: true,
+            isOwner: true,
+            mode,
+            publicUrl: 'https://im.example.com/onlyoffice',
+            scriptUrl: 'https://im.example.com/onlyoffice/web-apps/apps/api/documents/api.js',
+            docToken: 'doc_tok_123',
+            config: {
+              documentType: 'cell',
+              document: {
+                fileType: 'xlsx',
+                key: 'collab_key_123',
+                title: 'budget.xlsx',
+                url: 'https://im.example.com/api/onlyoffice/file/doc_tok_123?serverId=srv-1',
+                permissions: {
+                  edit: mode === 'edit',
+                  download: false,
+                },
+              },
+              editorConfig: {
+                mode,
+                callbackUrl: 'https://im.example.com/api/onlyoffice/callback/doc_tok_123?serverId=srv-1',
+                user: { id: 'owner-1', name: 'Alice' },
+              },
+              token: 'jwt_123',
+            },
+          }),
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => new Uint8Array([0, 0]).buffer,
+      };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
+    const onOpenShare = vi.fn();
+    const { getByTestId, queryByTestId } = render(
+      <OfficePreview
+        srcUrl="https://example.test/budget.xlsx"
+        mimeType={XLSX_MIME}
+        path="/team/budget.xlsx"
+        serverId="srv-1"
+        onOpenShare={onOpenShare}
+      />,
+    );
+
+    await waitFor(() => expect(getByTestId('onlyoffice-embedded-wrapper')).toBeTruthy());
+    await waitFor(() => expect(docEditorSpy).toHaveBeenCalledTimes(1));
+
+    // Download link must be hidden when allowDownload is false
+    expect(queryByTestId('onlyoffice-download-link')).toBeNull();
+
+    // Share button is visible for owner/canManageShare
+    const shareBtn = getByTestId('onlyoffice-open-share');
+    shareBtn.click();
+    expect(onOpenShare).toHaveBeenCalledTimes(1);
+
+    // Switch from Co-Edit to Preview mode -> re-fetches config with mode=view
+    const viewBtn = getByTestId('onlyoffice-mode-view');
+    viewBtn.click();
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(([u]) => String(u).includes('/onlyoffice/config') && String(u).includes('mode=view')),
+      ).toBe(true),
+    );
+  });
+
+  it('automatically falls back to local preview when ONLYOFFICE is disabled on the server', async () => {
+    xlsxApi.html = '<table><tr><td>local-fallback-cell</td></tr></table>';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const urlStr = String(input);
+        if (urlStr.includes('/onlyoffice/config')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              enabled: false,
+              fallbackReason: 'onlyoffice_disabled',
+              role: 'viewer',
+              allowDownload: true,
+            }),
+          };
+        }
+        return {
+          ok: true,
+          status: 200,
+          arrayBuffer: async () => new Uint8Array([0, 0]).buffer,
+        };
+      }),
+    );
+
+    const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
+    const { container } = render(
+      <OfficePreview
+        srcUrl="https://example.test/budget.xlsx"
+        mimeType={XLSX_MIME}
+        path="/team/budget.xlsx"
+        serverId="srv-1"
+      />,
+    );
+
+    await waitFor(() => expect(container.textContent).toContain('local-fallback-cell'));
+  });
+
+  it('F7: automatically falls back to local preview via authorized fileUrl when ONLYOFFICE script load fails (even without srcUrl on external shares), cleans up failed script tag, and resets forceLocal on path change', async () => {
+    xlsxApi.html = '<table><tr><td>external-fileurl-fallback-ok</td></tr></table>';
+    const appendSpy = vi.spyOn(document.head, 'appendChild').mockImplementation((node: Node) => {
+      const el = node as HTMLScriptElement;
+      if (el.tagName === 'SCRIPT') {
+        setTimeout(() => {
+          el.onerror?.(new Event('error'));
+        }, 5);
+      }
+      return node;
+    });
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const urlStr = String(input);
+      if (urlStr.includes('/onlyoffice/config')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            enabled: true,
+            role: 'viewer',
+            allowDownload: true,
+            canManageShare: false,
+            isOwner: false,
+            mode: 'view',
+            publicUrl: 'https://im.example.com/onlyoffice',
+            scriptUrl: 'https://broken-onlyoffice.example.com/web-apps/apps/api/documents/api.js',
+            docToken: 'doc_tok_ext_1',
+            fileUrl: 'https://im.example.com/api/onlyoffice/file/doc_tok_ext_1?serverId=srv-1',
+            config: {
+              documentType: 'cell',
+              document: {
+                fileType: 'xlsx',
+                key: 'collab_key_ext_1',
+                title: 'external.xlsx',
+                url: 'https://im.example.com/api/onlyoffice/file/doc_tok_ext_1?serverId=srv-1',
+                permissions: { edit: false, download: true },
+              },
+              editorConfig: {
+                mode: 'view',
+                callbackUrl: 'https://im.example.com/api/onlyoffice/callback/doc_tok_ext_1?serverId=srv-1',
+                user: { id: 'ext-1', name: 'Guest' },
+              },
+              token: 'jwt_ext_1',
+            },
+          }),
+        };
+      }
+      if (urlStr.includes('/api/onlyoffice/file/doc_tok_ext_1')) {
+        return {
+          ok: true,
+          status: 200,
+          arrayBuffer: async () => new Uint8Array([0x50, 0x4b, 0x03, 0x04]).buffer,
+        };
+      }
+      throw new Error(`Unexpected fetch URL: ${urlStr}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
+    const { container, rerender, getByTestId } = render(
+      <OfficePreview
+        mimeType={XLSX_MIME}
+        path="/team/external.xlsx"
+        serverId="srv-1"
+        shareToken="ext_tok_1"
+      />,
+    );
+
+    // Automatically falls back to local preview using config.fileUrl even though srcUrl was not passed
+    await waitFor(() => expect(container.textContent).toContain('external-fileurl-fallback-ok'));
+    expect(
+      fetchMock.mock.calls.some(([u]) => String(u).includes('/api/onlyoffice/file/doc_tok_ext_1')),
+    ).toBe(true);
+
+    // Switching to another document resets forceLocal so ONLYOFFICE editor mounts when DocsAPI is available
+    appendSpy.mockRestore();
+    const docEditorSpy = vi.fn().mockImplementation(() => ({ destroyEditor: vi.fn() }));
+    (window as unknown as { DocsAPI: { DocEditor: typeof docEditorSpy } }).DocsAPI = {
+      DocEditor: docEditorSpy,
+    };
+
+    rerender(
+      <OfficePreview
+        mimeType={XLSX_MIME}
+        path="/team/second-doc.xlsx"
+        serverId="srv-1"
+        shareToken="ext_tok_1"
+      />,
+    );
+
+    await waitFor(() => expect(getByTestId('onlyoffice-embedded-wrapper')).toBeTruthy());
+    await waitFor(() => expect(docEditorSpy).toHaveBeenCalledTimes(1));
+  });
+
+  it('F7: refuses to downgrade 403/401/404 ONLYOFFICE config errors to local srcUrl and renders safe unsupported fallback for .pptx', async () => {
+    const srcUrlFetched = vi.fn();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const urlStr = String(input);
+        if (urlStr.includes('/onlyoffice/config') && urlStr.includes('forbidden.xlsx')) {
+          return {
+            ok: false,
+            status: 403,
+            text: async () => JSON.stringify({ error: 'forbidden', reason: 'share_revoked' }),
+            json: async () => ({ error: 'forbidden', reason: 'share_revoked' }),
+          };
+        }
+        if (urlStr.includes('/onlyoffice/config') && urlStr.includes('slides.pptx')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              enabled: false,
+              fallbackReason: 'onlyoffice_disabled',
+              role: 'viewer',
+              allowDownload: true,
+              fileUrl: 'https://im.example.com/api/onlyoffice/file/pptx_tok?serverId=srv-1',
+            }),
+          };
+        }
+        srcUrlFetched(urlStr);
+        return {
+          ok: true,
+          status: 200,
+          arrayBuffer: async () => new Uint8Array([0, 0]).buffer,
+        };
+      }),
+    );
+
+    const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
+    const { getByTestId, rerender } = render(
+      <OfficePreview
+        srcUrl="https://example.test/forbidden.xlsx"
+        mimeType={XLSX_MIME}
+        path="/team/forbidden.xlsx"
+        serverId="srv-1"
+      />,
+    );
+
+    await waitFor(() => expect(getByTestId('office-preview-auth-error')).toBeTruthy());
+    expect(srcUrlFetched).not.toHaveBeenCalled();
+
+    // Now render a .pptx when ONLYOFFICE is disabled -> renders safe unsupported-local fallback with download link
+    rerender(
+      <OfficePreview
+        mimeType="application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        path="/team/slides.pptx"
+        serverId="srv-1"
+      />,
+    );
+
+    await waitFor(() => expect(getByTestId('office-preview-unsupported-local')).toBeTruthy());
+  });
+
+  it('F6: isolates multi-share navigation across multiple servers and folders, preventing cross-server target leak and host WS fallback', async () => {
+    const fetchedUrls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const urlStr = String(input);
+        fetchedUrls.push(urlStr);
+        if (urlStr.includes('/api/doc-shares/shared-with-me')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              shares: [
+                {
+                  id: 'share-1',
+                  serverId: 'srv-1',
+                  targetKind: 'folder',
+                  targetPath: '/team/docs',
+                  label: 'Docs Server 1',
+                  shareMode: 'user',
+                  role: 'editor',
+                  allowDownload: true,
+                  updatedAt: 1000,
+                },
+                {
+                  id: 'share-2',
+                  serverId: 'srv-2',
+                  targetKind: 'folder',
+                  targetPath: '/finance/reports',
+                  label: 'Finance Server 2',
+                  shareMode: 'user',
+                  role: 'viewer',
+                  allowDownload: false,
+                  updatedAt: 2000,
+                },
+              ],
+            }),
+          };
+        }
+        if (urlStr.includes('/api/server/srv-1/doc-shares/browse')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              path: '/team/docs',
+              role: 'editor',
+              allowDownload: true,
+              canManageShare: false,
+              isOwner: false,
+              entries: [
+                { name: 'guide.docx', path: '/team/docs/guide.docx', isDir: false, role: 'editor' },
+              ],
+            }),
+          };
+        }
+        if (urlStr.includes('/api/server/srv-2/doc-shares/browse')) {
+          const isSub = urlStr.includes('subfolder');
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              path: isSub ? '/finance/reports/subfolder' : '/finance/reports',
+              role: 'viewer',
+              allowDownload: false,
+              canManageShare: false,
+              isOwner: false,
+              entries: isSub
+                ? [{ name: 'budget.docx', path: '/finance/reports/subfolder/budget.docx', isDir: false, role: 'viewer' }]
+                : [
+                    { name: 'q1.xlsx', path: '/finance/reports/q1.xlsx', isDir: false, role: 'viewer' },
+                    { name: 'subfolder', path: '/finance/reports/subfolder', isDir: true, role: 'viewer' },
+                  ],
+            }),
+          };
+        }
+        if (urlStr.includes('/onlyoffice/config')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              enabled: false,
+              role: 'viewer',
+              allowDownload: false,
+              fallbackReason: 'onlyoffice_disabled',
+            }),
+          };
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({}),
+        };
+      }),
+    );
+
+    const { ExternalDocShareSpace } = await import('../../src/components/DocShareDialog.js');
+    const { getByTestId, queryByText, findByText } = render(<ExternalDocShareSpace token="" />);
+
+    // Initially loads share-1 on srv-1
+    await findByText(/guide\.docx/);
+    expect(fetchedUrls.some((u) => u.includes('/api/server/srv-1/doc-shares/browse'))).toBe(true);
+
+    // Switch to share-2 on srv-2
+    const tab2 = getByTestId('shared-tab-share-2');
+    fireEvent.click(tab2);
+
+    // Should load srv-2 folder entries and clear guide.docx
+    await findByText(/q1\.xlsx/);
+    expect(queryByText(/guide\.docx/)).toBeNull();
+    expect(fetchedUrls.some((u) => u.includes('/api/server/srv-2/doc-shares/browse') && u.includes('%2Ffinance%2Freports'))).toBe(true);
+
+    // Navigate to subfolder on srv-2
+    const subfolderBtn = await findByText(/subfolder/);
+    fireEvent.click(subfolderBtn);
+
+    // Should browse /finance/reports/subfolder on srv-2 (NOT srv-1)
+    await findByText(/budget\.docx/);
+    expect(fetchedUrls.some((u) => u.includes('/api/server/srv-2/doc-shares/browse') && u.includes('subfolder'))).toBe(true);
+    expect(fetchedUrls.some((u) => u.includes('/api/server/srv-1/doc-shares/browse') && u.includes('subfolder'))).toBe(false);
   });
 });

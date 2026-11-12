@@ -1,26 +1,116 @@
 /**
- * OfficePreview — lazy-loaded previewer for PDF, DOCX, and XLSX files.
- * Libraries are dynamically imported on first render to avoid bloating the main bundle.
+ * OfficePreview — embedded ONLYOFFICE Document Server viewer/collaborative editor
+ * with automatic fallback to lazy-loaded local previewers (PDF, DOCX, XLSX).
  */
 import { useEffect, useRef, useState } from 'preact/hooks';
+import { useTranslation } from 'react-i18next';
+import { ApiError, fetchOnlyOfficeConfig, type OnlyOfficeConfigResponse } from '../api.js';
 
-interface Props {
+export interface OfficePreviewProps {
   /**
-   * Chunked HTTP download URL for the document. The bytes are fetched here
-   * instead of being inlined into a WebSocket frame, so a large document can
-   * never monopolise the daemon link.
+   * Chunked HTTP download URL for local fallback preview.
+   * Optional when `serverId` is provided and ONLYOFFICE is active.
    */
-  srcUrl: string;
+  srcUrl?: string;
   /** MIME type (application/pdf, .../wordprocessingml.document, .../spreadsheetml.sheet). */
   mimeType: string;
-  /** File path — used for display and extension detection. */
+  /** File path — used for display, extension detection, and ONLYOFFICE config lookup. */
   path: string;
+  /** Target server ID — enables embedded ONLYOFFICE preview/collaborative editing when configured. */
+  serverId?: string;
+  /** Optional external share token for external collaborator access. */
+  shareToken?: string;
+  /** Optional bound device token for device-locked external links. */
+  deviceToken?: string;
+  /** Optional session name for main/sub session-share coverage resolution. */
+  sessionName?: string;
+  /** Force read-only view mode (e.g., viewer session share). */
+  readOnly?: boolean;
+  /** Optional initial mode preference ('view' | 'edit'). */
+  initialMode?: 'view' | 'edit';
+  /** Optional callback to open the document share dialog. */
+  onOpenShare?: () => void;
+}
+
+declare global {
+  interface Window {
+    DocsAPI?: {
+      DocEditor: new (placeholderId: string, config: Record<string, unknown>) => {
+        destroyEditor?: () => void;
+      };
+    };
+  }
 }
 
 async function fetchArrayBuffer(url: string, signal: AbortSignal): Promise<ArrayBuffer> {
   const res = await fetch(url, { credentials: 'include', signal });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.arrayBuffer();
+}
+
+const scriptLoadPromises = new Map<string, Promise<void>>();
+
+export function loadOnlyOfficeScript(scriptUrl: string): Promise<void> {
+  if (typeof window !== 'undefined' && window.DocsAPI?.DocEditor) {
+    return Promise.resolve();
+  }
+  const existing = scriptLoadPromises.get(scriptUrl);
+  if (existing) return existing;
+
+  const promise = new Promise<void>((resolve, reject) => {
+    if (typeof document === 'undefined') {
+      scriptLoadPromises.delete(scriptUrl);
+      reject(new Error('Document is unavailable'));
+      return;
+    }
+    if (window.DocsAPI?.DocEditor) {
+      resolve();
+      return;
+    }
+    const existingTag = document.querySelector(`script[data-onlyoffice-src="${scriptUrl}"]`) as HTMLScriptElement | null;
+    if (existingTag) {
+      existingTag.remove();
+    }
+    const script = document.createElement('script');
+    script.src = scriptUrl;
+    script.async = true;
+    script.dataset.onlyofficeSrc = scriptUrl;
+    script.onload = () => resolve();
+    script.onerror = () => {
+      scriptLoadPromises.delete(scriptUrl);
+      script.remove();
+      reject(new Error('Failed to load ONLYOFFICE API script'));
+    };
+    document.head.appendChild(script);
+  });
+
+  scriptLoadPromises.set(scriptUrl, promise);
+  return promise;
+}
+
+export function isLocallyPreviewableFormat(filePath: string, mimeType: string): boolean {
+  const lowerPath = filePath.toLowerCase();
+  if (mimeType === 'application/pdf' || lowerPath.endsWith('.pdf')) return true;
+  if (mimeType.includes('wordprocessingml') || lowerPath.endsWith('.docx')) return true;
+  if (
+    mimeType.includes('spreadsheetml')
+    || mimeType === 'text/csv'
+    || lowerPath.endsWith('.xlsx')
+    || lowerPath.endsWith('.xls')
+    || lowerPath.endsWith('.csv')
+    || lowerPath.endsWith('.ods')
+  ) {
+    return true;
+  }
+  if (
+    mimeType.startsWith('text/')
+    || lowerPath.endsWith('.md')
+    || lowerPath.endsWith('.txt')
+    || lowerPath.endsWith('.rtf')
+  ) {
+    return true;
+  }
+  return false;
 }
 
 let pdfWorkerBlobUrl: string | null = null;
@@ -224,27 +314,585 @@ function XlsxPreview({ data }: { data: ArrayBuffer }) {
   );
 }
 
-export default function OfficePreview({ srcUrl, mimeType, path }: Props) {
-  const [data, setData] = useState<ArrayBuffer | null>(null);
-  const [error, setError] = useState<string | null>(null);
+function OnlyOfficeEmbeddedEditor({
+  ooConfig,
+  mode,
+  onModeChange,
+  isFullscreen,
+  onToggleFullscreen,
+  onFallbackLocal,
+  onAutoFallbackLocal,
+  onOpenShare,
+  downloadUrl,
+}: {
+  ooConfig: OnlyOfficeConfigResponse;
+  mode: 'view' | 'edit';
+  onModeChange: (next: 'view' | 'edit') => void;
+  isFullscreen: boolean;
+  onToggleFullscreen: () => void;
+  onFallbackLocal?: () => void;
+  onAutoFallbackLocal?: (reason: string) => void;
+  onOpenShare?: () => void;
+  downloadUrl?: string;
+}) {
+  const { t } = useTranslation();
+  const holderIdRef = useRef(`onlyoffice-editor-${Math.random().toString(36).slice(2, 10)}`);
+  const editorInstanceRef = useRef<{ destroyEditor?: () => void } | null>(null);
+  const [scriptError, setScriptError] = useState<string | null>(null);
+  const [retryCount, setRetryCount] = useState(0);
 
   useEffect(() => {
+    let cancelled = false;
+    setScriptError(null);
+    if (!ooConfig.config || !ooConfig.scriptUrl) return;
+
+    (async () => {
+      try {
+        await loadOnlyOfficeScript(ooConfig.scriptUrl!);
+        if (cancelled) return;
+        if (!window.DocsAPI?.DocEditor) {
+          throw new Error('DocsAPI.DocEditor is unavailable');
+        }
+        if (editorInstanceRef.current?.destroyEditor) {
+          try { editorInstanceRef.current.destroyEditor(); } catch { /* ignore */ }
+        }
+        editorInstanceRef.current = new window.DocsAPI.DocEditor(
+          holderIdRef.current,
+          ooConfig.config as unknown as Record<string, unknown>,
+        );
+      } catch (err) {
+        if (!cancelled) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (onAutoFallbackLocal) {
+            onAutoFallbackLocal(msg);
+          } else {
+            setScriptError(msg);
+          }
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      if (editorInstanceRef.current?.destroyEditor) {
+        try { editorInstanceRef.current.destroyEditor(); } catch { /* ignore */ }
+        editorInstanceRef.current = null;
+      }
+    };
+  }, [ooConfig, retryCount]);
+
+  if (scriptError) {
+    return (
+      <div style={{ padding: 16, textAlign: 'center', color: '#f87171' }} data-testid="onlyoffice-script-error">
+        <div style={{ marginBottom: 8 }}>{t('office_preview.onlyoffice_load_failed', 'ONLYOFFICE failed to load')}: {scriptError}</div>
+        <div style={{ display: 'flex', justifyContent: 'center', gap: 8 }}>
+          {onFallbackLocal && (
+            <button
+              type="button"
+              data-testid="onlyoffice-error-fallback-btn"
+              onClick={onFallbackLocal}
+              style={{ padding: '6px 14px', background: '#1e293b', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 4, cursor: 'pointer', fontSize: 12 }}
+            >
+              {t('office_preview.switch_local_preview', 'Use Local Preview')}
+            </button>
+          )}
+          <button
+            type="button"
+            data-testid="onlyoffice-error-retry-btn"
+            onClick={() => setRetryCount((c) => c + 1)}
+            style={{ padding: '6px 14px', background: '#334155', color: '#e2e8f0', border: '1px solid #475569', borderRadius: 4, cursor: 'pointer', fontSize: 12 }}
+          >
+            {t('common.retry', 'Retry')}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  const canEdit = ooConfig.role === 'editor';
+  const allowDownload = ooConfig.allowDownload;
+  const effectiveDownloadUrl = downloadUrl || ooConfig.config?.document?.url;
+
+  return (
+    <div
+      data-testid="onlyoffice-embedded-wrapper"
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        width: '100%',
+        height: isFullscreen ? '100vh' : '100%',
+        minHeight: isFullscreen ? '100vh' : 480,
+        position: isFullscreen ? 'fixed' : 'relative',
+        inset: isFullscreen ? 0 : undefined,
+        zIndex: isFullscreen ? 9999 : undefined,
+        background: '#0f172a',
+      }}
+    >
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: 8,
+          padding: '6px 12px',
+          background: '#1e293b',
+          borderBottom: '1px solid #334155',
+          fontSize: 12,
+          color: '#e2e8f0',
+          flexWrap: 'wrap',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span
+            style={{
+              padding: '2px 8px',
+              borderRadius: 999,
+              fontSize: 11,
+              fontWeight: 600,
+              background: canEdit ? '#065f46' : '#334155',
+              color: canEdit ? '#6ee7b7' : '#cbd5e1',
+            }}
+          >
+            {canEdit
+              ? t('office_preview.role_editor', 'Collaborative Editor')
+              : t('office_preview.role_viewer', 'Read-only Viewer')}
+          </span>
+          {canEdit && (
+            <div style={{ display: 'inline-flex', borderRadius: 4, overflow: 'hidden', border: '1px solid #475569' }}>
+              <button
+                type="button"
+                data-testid="onlyoffice-mode-view"
+                onClick={() => onModeChange('view')}
+                style={{
+                  padding: '3px 10px',
+                  fontSize: 11,
+                  border: 'none',
+                  cursor: 'pointer',
+                  background: mode === 'view' ? '#3b82f6' : 'transparent',
+                  color: mode === 'view' ? '#fff' : '#cbd5e1',
+                }}
+              >
+                {t('office_preview.mode_view', 'Preview')}
+              </button>
+              <button
+                type="button"
+                data-testid="onlyoffice-mode-edit"
+                onClick={() => onModeChange('edit')}
+                style={{
+                  padding: '3px 10px',
+                  fontSize: 11,
+                  border: 'none',
+                  cursor: 'pointer',
+                  background: mode === 'edit' ? '#3b82f6' : 'transparent',
+                  color: mode === 'edit' ? '#fff' : '#cbd5e1',
+                }}
+              >
+                {t('office_preview.mode_edit', 'Co-Edit')}
+              </button>
+            </div>
+          )}
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          {onOpenShare && ooConfig.canManageShare && (
+            <button
+              type="button"
+              data-testid="onlyoffice-open-share"
+              onClick={onOpenShare}
+              style={{
+                padding: '3px 10px',
+                background: '#2563eb',
+                color: '#fff',
+                border: 'none',
+                borderRadius: 4,
+                cursor: 'pointer',
+                fontSize: 11,
+              }}
+            >
+              {t('doc_share.share_button', 'Share & Permissions')}
+            </button>
+          )}
+          {allowDownload && effectiveDownloadUrl && (
+            <a
+              href={effectiveDownloadUrl}
+              download={ooConfig.config?.document?.title || true}
+              data-testid="onlyoffice-download-link"
+              style={{
+                padding: '3px 10px',
+                background: '#334155',
+                color: '#e2e8f0',
+                textDecoration: 'none',
+                borderRadius: 4,
+                fontSize: 11,
+              }}
+            >
+              {t('office_preview.download', 'Download')}
+            </a>
+          )}
+          {onFallbackLocal && (
+            <button
+              type="button"
+              data-testid="onlyoffice-fallback-btn"
+              onClick={onFallbackLocal}
+              style={{
+                padding: '3px 10px',
+                background: 'transparent',
+                color: '#94a3b8',
+                border: '1px solid #334155',
+                borderRadius: 4,
+                cursor: 'pointer',
+                fontSize: 11,
+              }}
+            >
+              {t('office_preview.local_preview', 'Local Preview')}
+            </button>
+          )}
+          <button
+            type="button"
+            data-testid="onlyoffice-fullscreen-btn"
+            onClick={onToggleFullscreen}
+            style={{
+              padding: '3px 10px',
+              background: '#334155',
+              color: '#e2e8f0',
+              border: 'none',
+              borderRadius: 4,
+              cursor: 'pointer',
+              fontSize: 11,
+            }}
+          >
+            {isFullscreen
+              ? t('office_preview.exit_fullscreen', 'Exit Fullscreen')
+              : t('office_preview.fullscreen', 'Fullscreen')}
+          </button>
+        </div>
+      </div>
+      <div style={{ flex: 1, width: '100%', minHeight: 420, position: 'relative' }}>
+        <div id={holderIdRef.current} data-testid="onlyoffice-editor-holder" style={{ width: '100%', height: '100%' }} />
+      </div>
+    </div>
+  );
+}
+
+export default function OfficePreview({
+  srcUrl,
+  mimeType,
+  path,
+  serverId,
+  shareToken,
+  deviceToken,
+  sessionName,
+  readOnly,
+  initialMode,
+  onOpenShare,
+}: OfficePreviewProps) {
+  const { t } = useTranslation();
+  const [data, setData] = useState<ArrayBuffer | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [authDeniedError, setAuthDeniedError] = useState<string | null>(null);
+  const [authorizedFileUrl, setAuthorizedFileUrl] = useState<string>('');
+  const [fallbackNotice, setFallbackNotice] = useState<string | null>(null);
+  const [ooRetryKey, setOoRetryKey] = useState(0);
+  const [ooState, setOoState] = useState<{
+    loading: boolean;
+    config: OnlyOfficeConfigResponse | null;
+    forceLocal: boolean;
+  }>({
+    loading: Boolean(serverId),
+    config: null,
+    forceLocal: false,
+  });
+  const effectiveInitialMode: 'view' | 'edit' = readOnly ? 'view' : (initialMode ?? 'edit');
+  const [mode, setMode] = useState<'view' | 'edit'>(effectiveInitialMode);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+
+  // Reset per-document state whenever target document or server changes
+  useEffect(() => {
+    setData(null);
+    setError(null);
+    setAuthDeniedError(null);
+    setAuthorizedFileUrl('');
+    setFallbackNotice(null);
+    setMode(readOnly ? 'view' : (initialMode ?? 'edit'));
+    setOoState({
+      loading: Boolean(serverId),
+      config: null,
+      forceLocal: false,
+    });
+  }, [serverId, path, shareToken, deviceToken, sessionName, readOnly, initialMode]);
+
+  // 1. When `serverId` is provided, query ONLYOFFICE config first
+  useEffect(() => {
+    if (!serverId) {
+      setOoState({ loading: false, config: null, forceLocal: false });
+      return;
+    }
+    if (ooState.forceLocal) {
+      setOoState((prev) => ({ ...prev, loading: false }));
+      return;
+    }
+
+    let cancelled = false;
+    setOoState((prev) => ({ ...prev, loading: true }));
+    setAuthDeniedError(null);
+
+    fetchOnlyOfficeConfig(serverId, {
+      path,
+      mode: readOnly ? 'view' : mode,
+      shareToken,
+      deviceToken,
+      sessionName,
+    })
+      .then((res) => {
+        if (cancelled) return;
+        const resolvedUrl = res.fileUrl || res.config?.document?.url || '';
+        if (resolvedUrl) {
+          setAuthorizedFileUrl(resolvedUrl);
+        }
+        setOoState({
+          loading: false,
+          config: res,
+          forceLocal: false,
+        });
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        const status = err instanceof ApiError ? err.status : 0;
+        const msg = err instanceof Error ? err.message : String(err);
+        if (
+          status === 401 ||
+          status === 403 ||
+          status === 404 ||
+          /\b(401|403|404)\b|forbidden|unauthorized|access_denied/i.test(msg)
+        ) {
+          setAuthDeniedError(msg || 'Access denied');
+          setOoState({
+            loading: false,
+            config: null,
+            forceLocal: false,
+          });
+          return;
+        }
+        // Fallback seamlessly to local preview when ONLYOFFICE config endpoint is unreachable (5xx / network)
+        setOoState((prev) => ({
+          loading: false,
+          config: prev.config,
+          forceLocal: true,
+        }));
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [serverId, path, mode, shareToken, deviceToken, sessionName, readOnly, ooState.forceLocal, ooRetryKey]);
+
+  if (authDeniedError) {
+    return (
+      <div style={{ color: '#ef4444', padding: 16 }} data-testid="office-preview-auth-error">
+        {authDeniedError}
+      </div>
+    );
+  }
+
+  const useOnlyOffice =
+    Boolean(serverId) &&
+    !ooState.forceLocal &&
+    ooState.config?.enabled === true &&
+    Boolean(ooState.config?.config);
+
+  const effectiveSrcUrl =
+    authorizedFileUrl ||
+    ooState.config?.fileUrl ||
+    ooState.config?.config?.document?.url ||
+    srcUrl ||
+    '';
+
+  const canLocalPreview = isLocallyPreviewableFormat(path, mimeType);
+
+  // 2. Local preview ArrayBuffer fetch (runs when serverId is omitted OR when ONLYOFFICE is disabled/forced-local)
+  useEffect(() => {
+    if (ooState.loading || useOnlyOffice || authDeniedError) return;
+    if (!effectiveSrcUrl || !canLocalPreview) return;
+
     const controller = new AbortController();
     setData(null);
     setError(null);
-    fetchArrayBuffer(srcUrl, controller.signal)
+    fetchArrayBuffer(effectiveSrcUrl, controller.signal)
       .then((buf) => { if (!controller.signal.aborted) setData(buf); })
       .catch((e: unknown) => {
         if (controller.signal.aborted) return;
         setError(e instanceof Error ? e.message : String(e));
       });
     return () => controller.abort();
-  }, [srcUrl]);
+  }, [effectiveSrcUrl, canLocalPreview, ooState.loading, useOnlyOffice, authDeniedError]);
 
-  if (error) return <div style={{ color: '#ef4444', padding: 12 }}>{error}</div>;
+  if (ooState.loading) {
+    return <div style={{ color: '#64748b', padding: 12 }}>…</div>;
+  }
+
+  if (useOnlyOffice && ooState.config) {
+    return (
+      <OnlyOfficeEmbeddedEditor
+        ooConfig={ooState.config}
+        mode={readOnly ? 'view' : ooState.config.mode}
+        onModeChange={(nextMode) => {
+          if (!readOnly) setMode(nextMode);
+        }}
+        isFullscreen={isFullscreen}
+        onToggleFullscreen={() => setIsFullscreen((f) => !f)}
+        onFallbackLocal={
+          effectiveSrcUrl && canLocalPreview
+            ? () => {
+                setFallbackNotice(null);
+                setOoState((s) => ({ ...s, forceLocal: true }));
+              }
+            : undefined
+        }
+        onAutoFallbackLocal={
+          effectiveSrcUrl && canLocalPreview
+            ? (reason) => {
+                setFallbackNotice(reason);
+                setOoState((s) => ({ ...s, forceLocal: true }));
+              }
+            : undefined
+        }
+        onOpenShare={onOpenShare}
+        downloadUrl={effectiveSrcUrl}
+      />
+    );
+  }
+
+  const retryOnlyOfficeButton = serverId ? (
+    <button
+      type="button"
+      data-testid="office-preview-retry-onlyoffice"
+      onClick={() => {
+        setFallbackNotice(null);
+        setOoState((s) => ({ ...s, forceLocal: false }));
+        setOoRetryKey((k) => k + 1);
+      }}
+      style={{
+        padding: '4px 10px',
+        background: '#1e293b',
+        color: '#e2e8f0',
+        border: '1px solid #334155',
+        borderRadius: 4,
+        cursor: 'pointer',
+        fontSize: 11,
+      }}
+    >
+      {t('common.retry', 'Retry ONLYOFFICE')}
+    </button>
+  ) : null;
+
+  if (!canLocalPreview) {
+    const allowDl = ooState.config ? ooState.config.allowDownload : true;
+    return (
+      <div style={{ color: '#cbd5e1', padding: 16, textAlign: 'center' }} data-testid="office-preview-unsupported-local">
+        <div style={{ marginBottom: 10 }}>
+          {t('office_preview.unsupported_local_format', 'Local preview is not available for this format')}: {path.split('/').pop()}
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'center', gap: 8 }}>
+          {allowDl && effectiveSrcUrl && (
+            <a
+              href={effectiveSrcUrl}
+              download={path.split('/').pop() || true}
+              style={{
+                padding: '6px 14px',
+                background: '#2563eb',
+                color: '#fff',
+                textDecoration: 'none',
+                borderRadius: 4,
+                fontSize: 12,
+              }}
+            >
+              {t('office_preview.download', 'Download')}
+            </a>
+          )}
+          {retryOnlyOfficeButton}
+        </div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div style={{ color: '#ef4444', padding: 12 }}>
+        <div>{error}</div>
+        {retryOnlyOfficeButton && <div style={{ marginTop: 8 }}>{retryOnlyOfficeButton}</div>}
+      </div>
+    );
+  }
   if (!data) return <div style={{ color: '#64748b', padding: 12 }}>…</div>;
-  if (mimeType === 'application/pdf') return <PdfPreview data={data} />;
-  if (mimeType.includes('wordprocessingml')) return <DocxPreview data={data} />;
-  if (mimeType.includes('spreadsheetml')) return <XlsxPreview data={data} />;
-  return <div style={{ color: '#64748b', padding: 12 }}>Unsupported format: {path.split('/').pop()}</div>;
+
+  const lowerPath = path.toLowerCase();
+  let renderedPreview;
+  if (mimeType === 'application/pdf' || lowerPath.endsWith('.pdf')) {
+    renderedPreview = <PdfPreview data={data} />;
+  } else if (mimeType.includes('wordprocessingml') || lowerPath.endsWith('.docx')) {
+    renderedPreview = <DocxPreview data={data} />;
+  } else if (
+    mimeType.includes('spreadsheetml')
+    || mimeType === 'text/csv'
+    || lowerPath.endsWith('.xlsx')
+    || lowerPath.endsWith('.xls')
+    || lowerPath.endsWith('.csv')
+    || lowerPath.endsWith('.ods')
+  ) {
+    renderedPreview = <XlsxPreview data={data} />;
+  } else if (
+    mimeType.startsWith('text/')
+    || lowerPath.endsWith('.md')
+    || lowerPath.endsWith('.txt')
+    || lowerPath.endsWith('.rtf')
+  ) {
+    const textContent = new TextDecoder('utf-8').decode(new Uint8Array(data));
+    renderedPreview = (
+      <pre
+        data-testid="office-preview-text-fallback"
+        style={{
+          overflow: 'auto',
+          padding: 12,
+          background: '#0f172a',
+          color: '#e2e8f0',
+          borderRadius: 4,
+          fontSize: 12,
+          whiteSpace: 'pre-wrap',
+          margin: 0,
+        }}
+      >
+        {textContent}
+      </pre>
+    );
+  } else {
+    renderedPreview = <div style={{ color: '#64748b', padding: 12 }}>Unsupported format: {path.split('/').pop()}</div>;
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%' }}>
+      {(fallbackNotice || ooState.forceLocal) && serverId && (
+        <div
+          data-testid="office-preview-local-fallback-bar"
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: 8,
+            padding: '6px 12px',
+            background: '#1e293b',
+            borderBottom: '1px solid #334155',
+            fontSize: 12,
+            color: '#cbd5e1',
+          }}
+        >
+          <span>
+            {fallbackNotice
+              ? `${t('office_preview.onlyoffice_load_failed', 'ONLYOFFICE unavailable')} — ${t('office_preview.local_preview', 'Local Preview')}`
+              : t('office_preview.local_preview', 'Local Preview')}
+          </span>
+          {retryOnlyOfficeButton}
+        </div>
+      )}
+      <div style={{ flex: 1, minHeight: 0, overflow: 'auto' }}>{renderedPreview}</div>
+    </div>
+  );
 }

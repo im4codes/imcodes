@@ -137,7 +137,7 @@ import {
   type TimelineResponseStatus,
 } from '../../shared/timeline-protocol.js';
 import { homedir } from 'os';
-import { lstat as fsLstat, open as fsOpen, readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, rename as fsRename, rm as fsRm, stat as fsStat, unlink as fsUnlink, writeFile as fsWriteFile } from 'node:fs/promises';
+import { chmod as fsChmod, lstat as fsLstat, open as fsOpen, readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, rename as fsRename, rm as fsRm, stat as fsStat, unlink as fsUnlink, writeFile as fsWriteFile } from 'node:fs/promises';
 import * as nodePath from 'node:path';
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, serializeP2pRun, type P2pTarget, type SharedP2pRunScope } from './p2p-orchestrator.js';
 import {
@@ -2415,7 +2415,77 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       void handleMemoryObservationPromote(cmd, serverLink);
       break;
     case 'file.upload':
-      void handleFileUpload(cmd, serverLink);
+      void (async () => {
+        if (typeof cmd.allowedRoot === 'string' && cmd.allowedRoot.trim()) {
+          const destDir = typeof cmd.destinationDirectory === 'string' ? cmd.destinationDirectory : '';
+          const sessionRoot = await resolveFsSessionRoot(cmd);
+          if (!sessionRoot.ok || !sessionRoot.realRoot) {
+            try {
+              serverLink.send({
+                type: 'file.upload_error',
+                uploadId: cmd.uploadId,
+                error: 'forbidden_path',
+              });
+            } catch { /* ignore */ }
+            return;
+          }
+          try {
+            const rawExpanded = destDir.startsWith('~') ? destDir.replace(/^~/, homedir()) : destDir;
+            const resolvedDest = nodePath.resolve(rawExpanded);
+            const realDest = await fsRealpath(resolvedDest);
+            if (!isPathAllowed(realDest)) {
+              try {
+                serverLink.send({
+                  type: 'file.upload_error',
+                  uploadId: cmd.uploadId,
+                  error: 'forbidden_path',
+                });
+              } catch { /* ignore */ }
+              return;
+            }
+            if (sessionRoot.allowedRootIsFile) {
+              const fileName = typeof cmd.sanitizedName === 'string' && cmd.sanitizedName
+                ? cmd.sanitizedName
+                : typeof cmd.originalName === 'string' ? cmd.originalName : '';
+              const targetBase = nodePath.basename(sessionRoot.realRoot);
+              const targetDir = nodePath.dirname(sessionRoot.realRoot);
+              const isAllowedStage = realDest === targetDir
+                && fileName.startsWith('.oo-stage-')
+                && fileName.endsWith(`-${targetBase}`);
+              const isExactFileTarget = realDest === targetDir && fileName === targetBase;
+              if (!isAllowedStage && !isExactFileTarget) {
+                try {
+                  serverLink.send({
+                    type: 'file.upload_error',
+                    uploadId: cmd.uploadId,
+                    error: 'forbidden_path',
+                  });
+                } catch { /* ignore */ }
+                return;
+              }
+            } else if (!isSameOrInsidePath(sessionRoot.realRoot, realDest)) {
+              try {
+                serverLink.send({
+                  type: 'file.upload_error',
+                  uploadId: cmd.uploadId,
+                  error: 'forbidden_path',
+                });
+              } catch { /* ignore */ }
+              return;
+            }
+          } catch {
+            try {
+              serverLink.send({
+                type: 'file.upload_error',
+                uploadId: cmd.uploadId,
+                error: 'forbidden_path',
+              });
+            } catch { /* ignore */ }
+            return;
+          }
+        }
+        await handleFileUpload(cmd, serverLink);
+      })();
       break;
     case 'file.upload_fetch':
       void handleFileUploadFetch(cmd, serverLink);
@@ -9562,7 +9632,7 @@ async function resolveAssistantPublishedReadTarget(sessionName: string, rawPath:
 }
 
 async function resolveFsSessionRoot(cmd: Record<string, unknown>): Promise<
-  | { ok: true; realRoot?: string }
+  | { ok: true; realRoot?: string; allowedRootIsFile?: boolean }
   | { ok: false; error: string }
 > {
   const sessionName = typeof cmd.sessionName === 'string'
@@ -9570,16 +9640,42 @@ async function resolveFsSessionRoot(cmd: Record<string, unknown>): Promise<
     : typeof cmd.session === 'string'
       ? cmd.session
       : '';
-  if (!sessionName) return { ok: true };
-  const record = getSession(sessionName);
-  if (!record?.projectDir) return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH };
-  try {
-    const realRoot = await fsRealpath(record.projectDir);
-    if (!isPathAllowed(realRoot)) return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH };
-    return { ok: true, realRoot };
-  } catch {
-    return { ok: false, error: FS_GENERIC_ERROR_CODES.PARENT_NOT_FOUND };
+  let sessionRealRoot: string | undefined;
+  if (sessionName) {
+    const record = getSession(sessionName);
+    if (!record?.projectDir) return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH };
+    try {
+      const realRoot = await fsRealpath(record.projectDir);
+      if (!isPathAllowed(realRoot)) return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH };
+      sessionRealRoot = realRoot;
+    } catch {
+      return { ok: false, error: FS_GENERIC_ERROR_CODES.PARENT_NOT_FOUND };
+    }
   }
+
+  const rawAllowedRoot = typeof cmd.allowedRoot === 'string' ? cmd.allowedRoot.trim() : '';
+  if (rawAllowedRoot) {
+    const expanded = rawAllowedRoot.startsWith('~') ? rawAllowedRoot.replace(/^~/, homedir()) : rawAllowedRoot;
+    const resolved = nodePath.resolve(expanded);
+    try {
+      const linkStats = await fsLstat(resolved);
+      if (linkStats.isSymbolicLink()) {
+        return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH };
+      }
+      const allowedReal = await fsRealpath(resolved);
+      if (!isPathAllowed(allowedReal)) {
+        return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH };
+      }
+      if (sessionRealRoot && !isSameOrInsidePath(sessionRealRoot, allowedReal)) {
+        return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH };
+      }
+      return { ok: true, realRoot: allowedReal, allowedRootIsFile: linkStats.isFile() };
+    } catch {
+      return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH };
+    }
+  }
+
+  return { ok: true, realRoot: sessionRealRoot };
 }
 
 // ── P2P cancel/status handlers ────────────────────────────────────────────
@@ -10460,9 +10556,31 @@ async function handleFsListInner(
   }
 
   const snapshot = await getFsListSnapshot(canonical.realPath, includeFiles, includeMetadata, !canonical.usedFallback);
+  let visibleEntries = snapshot.entries;
+  if (sessionRealRoot) {
+    const filtered: Array<Record<string, unknown>> = [];
+    for (const entry of visibleEntries) {
+      const candidatePath = typeof entry.path === 'string' && entry.path
+        ? entry.path
+        : typeof entry.name === 'string' && entry.name
+          ? nodePath.join(canonical.realPath, entry.name)
+          : '';
+      if (!candidatePath) continue;
+      try {
+        const realCandidate = await fsRealpath(candidatePath);
+        if (!isPathAllowed(realCandidate) || !isSameOrInsidePath(sessionRealRoot, realCandidate)) {
+          continue;
+        }
+        filtered.push(entry);
+      } catch {
+        // Broken symlink or inaccessible entry inside scoped root — omit
+      }
+    }
+    visibleEntries = filtered;
+  }
   const entries = shouldAttachOpenSpecTaskStats(canonical.realPath, includeOpenSpecTaskStats)
-    ? await attachOpenSpecTaskStats(snapshot.entries)
-    : snapshot.entries;
+    ? await attachOpenSpecTaskStats(visibleEntries)
+    : visibleEntries;
 
   requestContext.send({ type: 'fs.ls_response', requestId, path: rawPath, resolvedPath: snapshot.resolvedPath, status: 'ok', entries });
 }
@@ -10550,10 +10668,11 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
   if (sessionRoot.realRoot) {
     const target = await resolveExistingFsMutationTarget(rawPath, sessionRoot.realRoot);
     if (!target.ok) {
-      const registeredUpload = target.error === FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH
+      const hasExplicitAllowedRoot = typeof cmd.allowedRoot === 'string' && cmd.allowedRoot.trim().length > 0;
+      const registeredUpload = !hasExplicitAllowedRoot && target.error === FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH
         ? await resolveRegisteredUploadReadTarget(rawPath)
         : null;
-      const legacyPublished = !registeredUpload && target.error === FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH
+      const legacyPublished = !hasExplicitAllowedRoot && !registeredUpload && target.error === FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH
         ? await resolveAssistantPublishedReadTarget(
           typeof cmd.sessionName === 'string' ? cmd.sessionName : typeof cmd.session === 'string' ? cmd.session : '',
           rawPath,
@@ -11396,8 +11515,8 @@ async function handleFsMkdir(cmd: Record<string, unknown>, serverLink: ServerLin
   if (!rawPath || !requestId) return;
 
   const sessionRoot = await resolveFsSessionRoot(cmd);
-  if (!sessionRoot.ok) {
-    try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: sessionRoot.error }); } catch { /* ignore */ }
+  if (!sessionRoot.ok || sessionRoot.allowedRootIsFile) {
+    try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: sessionRoot.ok ? FS_READ_ERROR_CODES.FORBIDDEN_PATH : sessionRoot.error }); } catch { /* ignore */ }
     return;
   }
 
@@ -11457,6 +11576,7 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
 
   const expectedMtime = typeof cmd.expectedMtime === 'number' ? cmd.expectedMtime : undefined;
   const createOnly = cmd.createOnly === true;
+  const isBase64 = cmd.encoding === 'base64';
 
   const sessionRoot = await resolveFsSessionRoot(cmd);
   if (!sessionRoot.ok) {
@@ -11467,8 +11587,10 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
   const expanded = rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath;
   const resolved = nodePath.resolve(expanded);
 
+  const writeBuffer = isBase64 ? Buffer.from(content, 'base64') : Buffer.from(content, 'utf-8');
+
   // Size check first (cheap, before any I/O)
-  if (Buffer.byteLength(content, 'utf-8') > FS_WRITE_MAX_BYTES) {
+  if (writeBuffer.byteLength > FS_WRITE_MAX_BYTES) {
     try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE }); } catch { /* ignore */ }
     return;
   }
@@ -11476,7 +11598,7 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
   // Determine if file exists to choose sandbox validation strategy
   let fileExists = false;
   try {
-    await fsStat(resolved);
+    await fsLstat(resolved);
     fileExists = true;
   } catch {
     fileExists = false;
@@ -11515,8 +11637,12 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
         }
       }
 
-      // Write the file
-      await fsWriteFile(real, content, 'utf-8');
+      // Write the file preserving mode and inode
+      if (isBase64) {
+        await fsWriteFile(real, writeBuffer);
+      } else {
+        await fsWriteFile(real, content, 'utf-8');
+      }
       const newStats = await fsStat(real);
       invalidateFsListCachesForPath(real);
       invalidateFileSearchCachesForPath(real);
@@ -11527,6 +11653,10 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
       try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: getFsWriteErrorCode(err) }); } catch { /* ignore */ }
     }
   } else {
+    if (sessionRoot.allowedRootIsFile) {
+      try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
+      return;
+    }
     // New file: realpath of parent must be within FS_ALLOWED_ROOTS
     const parent = nodePath.dirname(resolved);
     try {
@@ -11547,7 +11677,7 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
         if (code !== 'ENOENT') throw err;
       }
       // Write the file
-      await fsWriteFile(resolved, content, { encoding: 'utf-8', flag: 'wx' });
+      await fsWriteFile(resolved, writeBuffer, { flag: 'wx' });
       const newStats = await fsStat(resolved);
       const real = await fsRealpath(resolved);
       invalidateFsListCachesForPath(real);
@@ -11562,7 +11692,11 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
   }
 }
 
-async function resolveExistingFsMutationTarget(rawPath: string, sessionRealRoot?: string): Promise<
+async function resolveExistingFsMutationTarget(
+  rawPath: string,
+  sessionRealRoot?: string,
+  options?: { allowStagingNextToFileRoot?: boolean },
+): Promise<
   | { ok: true; resolved: string; real: string }
   | { ok: false; error: string; resolved?: string }
 > {
@@ -11581,7 +11715,12 @@ async function resolveExistingFsMutationTarget(rawPath: string, sessionRealRoot?
     const real = await fsRealpath(resolved);
     if (!isPathAllowed(real)) return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved: real };
     if (sessionRealRoot && !isSameOrInsidePath(sessionRealRoot, real)) {
-      return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved: real };
+      const isAllowedStage = options?.allowStagingNextToFileRoot
+        && nodePath.dirname(real) === nodePath.dirname(sessionRealRoot)
+        && nodePath.basename(real).startsWith('.oo-stage-');
+      if (!isAllowedStage) {
+        return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved: real };
+      }
     }
     return { ok: true, resolved, real };
   } catch {
@@ -11589,7 +11728,11 @@ async function resolveExistingFsMutationTarget(rawPath: string, sessionRealRoot?
   }
 }
 
-async function resolveFsMutationDestination(rawPath: string, sessionRealRoot?: string): Promise<
+async function resolveFsMutationDestination(
+  rawPath: string,
+  sessionRealRoot?: string,
+  options?: { overwrite?: boolean; allowedRootIsFile?: boolean },
+): Promise<
   | { ok: true; resolved: string; realParent: string }
   | { ok: false; error: string; resolved?: string }
 > {
@@ -11599,12 +11742,30 @@ async function resolveFsMutationDestination(rawPath: string, sessionRealRoot?: s
   try {
     const realParent = await fsRealpath(parent);
     if (!isPathAllowed(realParent)) return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved };
-    if (sessionRealRoot && !isSameOrInsidePath(sessionRealRoot, realParent)) {
-      return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved };
+    if (sessionRealRoot) {
+      if (options?.allowedRootIsFile) {
+        if (nodePath.join(realParent, nodePath.basename(resolved)) !== sessionRealRoot) {
+          return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved };
+        }
+      } else if (!isSameOrInsidePath(sessionRealRoot, realParent)) {
+        return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved };
+      }
     }
     try {
-      await fsLstat(resolved);
-      return { ok: false, error: FS_WRITE_ERROR.FILE_EXISTS, resolved };
+      const targetStats = await fsLstat(resolved);
+      if (targetStats.isSymbolicLink()) {
+        return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved };
+      }
+      if (!options?.overwrite || targetStats.isDirectory()) {
+        return { ok: false, error: FS_WRITE_ERROR.FILE_EXISTS, resolved };
+      }
+      const realExisting = await fsRealpath(resolved);
+      if (!isPathAllowed(realExisting)) {
+        return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved: realExisting };
+      }
+      if (sessionRealRoot && !isSameOrInsidePath(sessionRealRoot, realExisting)) {
+        return { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, resolved: realExisting };
+      }
     } catch (err) {
       const code = typeof err === 'object' && err !== null && 'code' in err ? String((err as { code?: unknown }).code) : '';
       if (code !== 'ENOENT') return { ok: false, error: FS_GENERIC_ERROR_CODES.INTERNAL_ERROR, resolved };
@@ -11619,6 +11780,7 @@ async function handleFsRename(cmd: Record<string, unknown>, serverLink: ServerLi
   const rawPath = cmd.path as string | undefined;
   const rawNewPath = cmd.newPath as string | undefined;
   const requestId = cmd.requestId as string | undefined;
+  const overwrite = cmd.overwrite === true;
   if (!rawPath || !rawNewPath || !requestId) {
     if (requestId) {
       try { serverLink.send({ type: FS_TRANSPORT_MSG.RENAME_RESPONSE, requestId, path: rawPath ?? '', newPath: rawNewPath, status: 'error', error: FS_GENERIC_ERROR_CODES.INVALID_REQUEST }); } catch { /* ignore */ }
@@ -11632,19 +11794,29 @@ async function handleFsRename(cmd: Record<string, unknown>, serverLink: ServerLi
     return;
   }
 
-  const source = await resolveExistingFsMutationTarget(rawPath, sessionRoot.realRoot);
+  const source = await resolveExistingFsMutationTarget(rawPath, sessionRoot.realRoot, {
+    allowStagingNextToFileRoot: sessionRoot.allowedRootIsFile === true,
+  });
   if (!source.ok) {
     try { serverLink.send({ type: FS_TRANSPORT_MSG.RENAME_RESPONSE, requestId, path: rawPath, newPath: rawNewPath, resolvedPath: source.resolved, status: 'error', error: source.error }); } catch { /* ignore */ }
     return;
   }
-  const destination = await resolveFsMutationDestination(rawNewPath, sessionRoot.realRoot);
+  const destination = await resolveFsMutationDestination(rawNewPath, sessionRoot.realRoot, {
+    overwrite,
+    allowedRootIsFile: sessionRoot.allowedRootIsFile === true,
+  });
   if (!destination.ok) {
     try { serverLink.send({ type: FS_TRANSPORT_MSG.RENAME_RESPONSE, requestId, path: rawPath, newPath: rawNewPath, resolvedPath: destination.resolved, status: 'error', error: destination.error }); } catch { /* ignore */ }
     return;
   }
 
   try {
+    const priorStats = overwrite ? await fsStat(destination.resolved).catch(() => null) : null;
     await fsRename(source.resolved, destination.resolved);
+    if (priorStats) {
+      await fsChmod(destination.resolved, priorStats.mode).catch(() => {});
+    }
+    const destStats = await fsStat(destination.resolved).catch(() => null);
     invalidateFsListCachesForPath(source.real);
     invalidateFsListCachesForPath(destination.resolved);
     invalidateFileSearchCachesForPath(source.real);
@@ -11657,7 +11829,8 @@ async function handleFsRename(cmd: Record<string, unknown>, serverLink: ServerLi
         requestId,
         path: rawPath,
         newPath: rawNewPath,
-        resolvedPath: source.real,
+        resolvedPath: destination.resolved,
+        ...(destStats ? { mtime: destStats.mtimeMs } : {}),
         status: 'ok',
       });
     } catch { /* ignore */ }
@@ -11683,7 +11856,9 @@ async function handleFsDelete(cmd: Record<string, unknown>, serverLink: ServerLi
     return;
   }
 
-  const target = await resolveExistingFsMutationTarget(rawPath, sessionRoot.realRoot);
+  const target = await resolveExistingFsMutationTarget(rawPath, sessionRoot.realRoot, {
+    allowStagingNextToFileRoot: sessionRoot.allowedRootIsFile === true,
+  });
   if (!target.ok) {
     try { serverLink.send({ type: FS_TRANSPORT_MSG.DELETE_RESPONSE, requestId, path: rawPath, resolvedPath: target.resolved, status: 'error', error: target.error }); } catch { /* ignore */ }
     return;
