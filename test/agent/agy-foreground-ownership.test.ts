@@ -317,4 +317,49 @@ describe('AG captured native foreground ownership', () => {
     expect((await owner.output(1))?.content).toBe('file content read');
     expect(owner.hasActiveLane()).toBe(false);
   });
+  it('does not retain an earlier eligible candidate across a later ineligible subagent step', async () => {
+    const owner = new AgyForegroundOwnership(60_000);
+    owner.register(1, 'launch background worker');
+    owner.observe(row(0, 'USER_INPUT', '<USER_REQUEST>launch background worker</USER_REQUEST>', 'USER_EXPLICIT'));
+    // Step 1: eligible tool call with prose (e.g. read_file)
+    owner.observe({
+      ...row(1, 'PLANNER_RESPONSE', 'Reading configuration'),
+      tool_calls: [{ name: 'read_file', args: { Path: '/etc/cfg' } }],
+    });
+    expect(owner.hasActiveLane()).toBe(true);
+    // Step 2: ineligible subagent tool call (e.g. invoke_subagent with commentary)
+    owner.observe({
+      ...row(2, 'PLANNER_RESPONSE', 'Launching worker'),
+      tool_calls: [{ name: 'invoke_subagent', args: { Role: 'Child' } }],
+    });
+    // settle(1) must NOT fall back to Step 1's "Reading configuration"
+    expect(owner.settle(1)).toBeUndefined();
+    expect(owner.latest).toBeUndefined();
+    expect(owner.hasActiveLane()).toBe(true);
+
+    // Later arriving pure text settles correctly
+    owner.observe(row(3, 'PLANNER_RESPONSE', 'PARENT-STARTED'));
+    expect(owner.settle(1)?.content).toBe('PARENT-STARTED');
+    expect((await owner.output(1))?.content).toBe('PARENT-STARTED');
+    expect(owner.hasActiveLane()).toBe(false);
+  });
+  it('does not revive an earlier eligible candidate on output deadline timeout when latest row is ineligible', async () => {
+    const owner = new AgyForegroundOwnership(20);
+    owner.register(1, 'launch background worker');
+    owner.observe(row(0, 'USER_INPUT', '<USER_REQUEST>launch background worker</USER_REQUEST>', 'USER_EXPLICIT'));
+    // Step 1: eligible tool call with prose
+    owner.observe({
+      ...row(1, 'PLANNER_RESPONSE', 'Reading configuration'),
+      tool_calls: [{ name: 'read_file', args: { Path: '/etc/cfg' } }],
+    });
+    // Step 2: ineligible subagent tool call
+    owner.observe({
+      ...row(2, 'PLANNER_RESPONSE', 'Launching worker'),
+      tool_calls: [{ name: 'invoke_subagent', args: { Role: 'Child' } }],
+    });
+    // output(1) deadline timeout should NOT return Step 1
+    const out = await owner.output(1);
+    expect(out).toBeUndefined();
+    expect(owner.latest).toBeUndefined();
+  });
 });

@@ -197,11 +197,9 @@ export class AgyForegroundOwnership {
     } else if (row.type === 'PLANNER_RESPONSE' && this.lane !== undefined) {
       const prompt = this.prompts.get(this.lane);
       if (!prompt || prompt.inputStep === undefined || row.step_index <= prompt.inputStep) return false;
-      if (isTerminalForegroundRow(row)) {
-        prompt.lastResponse = row;
-      }
+      prompt.lastResponse = row;
       if (!row.tool_calls?.length || (prompt.settling && isTerminalForegroundRow(row))) {
-        prompt.output = row.tool_calls?.length ? (prompt.lastResponse ?? row) : row;
+        prompt.output = row;
         if (!this.latest || prompt.generation >= this.latest.generation) {
           this.latest = { generation: prompt.generation, row: prompt.output };
         }
