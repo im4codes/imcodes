@@ -2,7 +2,7 @@ import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-que
 import { readFileSync } from 'node:fs';
 import { AGY_ACP_AGENT_NAME, AGY_CLI_PATH_ENV } from '../../shared/agy-agent.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, writeFile, readFile, rm, mkdir, unlink } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile, rm, mkdir, unlink, appendFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { AgyAcpProvider, createAgyProvider, supportsAgyAcp } from '../../src/agent/providers/agy-acp.js';
@@ -204,16 +204,78 @@ describe('AG native ACP', () => {
     expect(nativeSteps).toEqual([5,11]);
     expect(messages).toHaveLength(4);expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(2);
   });
-  it('releases divergent ACP streaming and retains repeated independent responses after consuming an old receipt',async()=>{
-    const {provider}=await setup('native-child-log');const id=await route(provider),done=vi.fn(),deltas=vi.fn();provider.onComplete(done);provider.onDelta(deltas);
+  it('uses independent native steps after async, ignoring unowned ACP even with repeated bodies',async()=>{
+    const {provider,root}=await setup('native-child-log');const id=await route(provider),done=vi.fn(),deltas=vi.fn();provider.onComplete(done);provider.onDelta(deltas);
     await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2));
-    const native=(provider as any).sessions.get(id).acpSessionId;
+    const state=(provider as any).sessions.get(id),native=state.acpSessionId;
     const update=(update:any)=>(provider as any).handleSessionUpdate({sessionId:native,update});
+    const before=deltas.mock.calls.length;
     update({sessionUpdate:'agent_message_chunk',content:{type:'text',text:'Different response'}});
-    expect(deltas.mock.calls.at(-1)[1].delta).toBe('Different response');
-    update({sessionUpdate:'turn_completed'});expect(done).toHaveBeenCalledTimes(3);
-    update({sessionUpdate:'agent_message_chunk',content:{type:'text',text:'PARENT-WOKE CHILD-PONG'}});
-    update({sessionUpdate:'turn_completed'});expect(done).toHaveBeenCalledTimes(4);
+    update({sessionUpdate:'turn_completed'});expect(done).toHaveBeenCalledTimes(2);expect(deltas).toHaveBeenCalledTimes(before);
+    update({sessionUpdate:'tool_call_update',toolCallId:'launch-1',status:'completed'});
+    expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
+    const file=path.join(root,'.gemini/antigravity-cli/brain',native,'.system_generated/logs/transcript_full.jsonl');
+    for(const [i,body] of ['Different response','PARENT-WOKE CHILD-PONG'].entries()) {
+      await appendFile(file,JSON.stringify({step_index:6+i*2,type:'SYSTEM_MESSAGE',status:'DONE',content:'[Message] sender=child content=result'})+'\n'+JSON.stringify({step_index:7+i*2,type:'PLANNER_RESPONSE',status:'DONE',content:body})+'\n');
+      await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(3+i));
+      expect(done.mock.calls.at(-1)![1].content).toBe(body);
+    }
+  });
+  it.each(['native-child-slow-foreground','native-child-same-foreground','native-child-cross-chunks'])('keeps an actively running successor foreground isolated from late prior chunks, usage and terminals (%s)',async scenario=>{
+    const {provider,requests}=await setup(scenario);const id=await route(provider),done=vi.fn(),deltas=vi.fn();provider.onComplete(done);provider.onDelta(deltas);
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2));
+    const start=deltas.mock.calls.length;
+    await provider.send(id,'successor foreground');
+    await new Promise(r=>setTimeout(r,600));expect(done).toHaveBeenCalledTimes(2);
+    expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true);
+    expect(deltas.mock.calls.slice(start).filter(([,d])=>d.type==='text')).toHaveLength(0);
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(4),{timeout:5000});
+    expect(done.mock.calls.map(([,m])=>m.content)).toEqual(['PARENT-STARTED','PARENT-WOKE CHILD-PONG',scenario==='native-child-same-foreground'?'PARENT-WOKE CHILD-PONG':'PARENT-STARTED','PARENT-WOKE CHILD-PONG']);
+    expect(done.mock.calls[2][1].metadata.usage).toMatchObject({input_tokens:700,output_tokens:71});
+    expect(done.mock.calls[3][1].metadata.usage).toMatchObject({input_tokens:120,output_tokens:3});
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(2);
+    await new Promise(r=>setTimeout(r,300));expect(done).toHaveBeenCalledTimes(4);
+  });
+  it('keeps async active steering correlated to the latest explicit native input without waiting for superseded output',async()=>{
+    const {provider,requests}=await setup('native-steering');const id=await route(provider),done=vi.fn(),errors=vi.fn();provider.onComplete(done);provider.onError(errors);
+    await provider.send(id,'A');await vi.waitFor(()=>expect((provider as any).sessions.get(id).agyForeground?.authoritative).toBe(true));
+    expect(await provider.notifyActiveDelegation(id,notification('B'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1));expect(done.mock.calls[0][1].content).toBe('STEERED OWNED RESULT');
+    expect(done.mock.calls[0][1].metadata.usage).toMatchObject({input_tokens:400,output_tokens:5});expect(errors).not.toHaveBeenCalled();
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(2);
+  });
+  it('waits on the native output event after prompt RPC settlement, not a dedup grace timer',async()=>{
+    const {provider,requests}=await setup('native-child-output-after-ack');const id=await route(provider),done=vi.fn();provider.onComplete(done);
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2));
+    expect(done.mock.calls.map(([,m])=>m.content)).toEqual(['PARENT-STARTED','PARENT-WOKE CHILD-PONG']);
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(1);
+  });
+  it.each(['stop','rebind'])('releases an unresolved native foreground wait on %s',async action=>{
+    const {provider,requests}=await setup('native-child-wait');const id=await route(provider),done=vi.fn();provider.onComplete(done);
+    await provider.send(id,'launch');const old=(provider as any).sessions.get(id);
+    await vi.waitFor(()=>expect(old.agyForeground?.authoritative).toBe(true));
+    await (provider as any).promptTerminals.get(old); // Actual RPC has ended; native PLANNER has not.
+    expect(done).not.toHaveBeenCalled();
+    if(action==='stop') await provider.cancel(id);else await route(provider,id,{fresh:true});
+    await vi.waitFor(()=>expect(old.agyBridges.size).toBe(0));
+    await new Promise(r=>setTimeout(r,700));expect(done).not.toHaveBeenCalled();
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(1);
+  });
+  it('fails boundedly without publishing unattributed async ACP text when the native output is absent',async()=>{
+    const {provider}=await setup('native-child-no-owned-output');const id=await route(provider),done=vi.fn(),errors=vi.fn(),deltas=vi.fn();provider.onComplete(done);provider.onError(errors);provider.onDelta(deltas);
+    // Shorten only the failure deadline on this captured owner, not file ordering/coalescing.
+    const {AgyForegroundOwnership}=await import('../../src/agent/agy-foreground-ownership.js');
+    (provider as any).sessions.get(id).agyForeground=new AgyForegroundOwnership(30);
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(errors).toHaveBeenCalledTimes(1));
+    expect(errors.mock.calls[0][1].message).toContain('could not be attributed');expect(done).not.toHaveBeenCalled();
+    expect(deltas.mock.calls.filter(([,d])=>d.type==='text')).toHaveLength(0);
+    expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
+    expect((provider as any).sessions.get(id).agyBridges.size).toBe(0);
+  });
+  it('keeps ordinary no-async ACP chunk streaming before the prompt RPC terminates',async()=>{
+    const {provider}=await setup('stream-before-ack');const id=await route(provider),done=vi.fn(),deltas=vi.fn();provider.onComplete(done);provider.onDelta(deltas);
+    await provider.send(id,'normal');await vi.waitFor(()=>expect(deltas.mock.calls.some(([,d])=>d.delta==='direct ')).toBe(true));
+    expect(done).not.toHaveBeenCalled();await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1));expect(done.mock.calls[0][1].content).toBe('direct stream');
   });
   it.each(['stop','rebind'])('discards native-first late ACP receipts across %s',async action=>{
     const {provider}=await setup('native-child-late');const id=await route(provider),done=vi.fn();provider.onComplete(done);

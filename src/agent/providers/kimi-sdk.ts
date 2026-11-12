@@ -1,3 +1,4 @@
+import { AgyForegroundOwnership } from '../agy-foreground-ownership.js';
 import { AgyTranscriptBridge, agyTranscriptFile, type AgyTranscriptRow } from '../agy-transcript-bridge.js';
 import { AgySubagentTracker, isAgySubagentTool, normalizeAgyToolName } from '../agy-subagents.js';
 import { AgyCompactionWatermark } from '../agy-compaction-watermark.js';
@@ -291,13 +292,11 @@ interface KimiSdkSessionState {
   agyNativeToolOrder?: Array<{name:string;input:unknown;step:number;index:number}>;
   agyReactive?: boolean;
   agyPendingResponses?: Map<number, AgyTranscriptRow>;
-  // One-use, owner-local turn receipts. Text is a matching check within the
-  // ordered turn ledger, never a permanent/global content identity.
+  // Receipts for pre-async ACP autonomous completions; native authority
+  // clears them when a subagent/peer interaction is observed.
   agyNativeAcks?: Array<{generation:number;text:string}>;
-  agyNativeDelivered?: Array<{step:number;text:string}>;
-  agyLateAcpUpdates?: SessionUpdate[];
-  agyLateAcpText?: string;
-  agyReplayingLateAcp?: boolean;
+  agyForeground?: AgyForegroundOwnership;
+  agyProvisionalAutoMessageId?: string;
   agyBridging?: boolean;
   agyNativeTurnGeneration?: number;
 }
@@ -511,6 +510,8 @@ export class KimiSdkProvider implements TransportProvider {
       emittedToolSignatures: new Map(),
       lastStatusSignature: null,
       sessionSystemTextInjected: existing?.sessionSystemTextInjected,
+      agyForeground: this.id === AGY_SDK_PROVIDER_ID && existing?.acpSessionId === (config.resumeId ?? existing?.acpSessionId) && existing?.agyForeground?.authoritative
+        ? Object.assign(new AgyForegroundOwnership(),{authoritative:true}) : undefined,
     };
     if (prior?.acpSessionId && prior.acpSessionId !== state.acpSessionId) {
       this.releaseAcpRoute(prior.acpSessionId, routeId);
@@ -642,8 +643,26 @@ export class KimiSdkProvider implements TransportProvider {
     for (const bridge of state.agyBridges?.values() ?? []) bridge.close();
     state.agyBridges?.clear(); state.agyReactive = false;
     state.agyPendingResponses?.clear(); state.agyNativeAcks = [];
-    state.agyNativeDelivered = []; state.agyLateAcpUpdates = undefined; state.agyLateAcpText = undefined;
+    const nativeAuthority = state.agyForeground?.authoritative;
+    state.agyForeground?.clear();
+    if (state.agyForeground) state.agyForeground.authoritative = !!nativeAuthority;
+    state.agyProvisionalAutoMessageId = undefined;
     state.agyPendingNativeTools?.clear(); state.agyConsumedNativeTools?.clear(); state.agyNativeToolOrder = [];
+  }
+
+  private useAgyNativeOutput(state: KimiSdkSessionState): void {
+    if (this.id !== AGY_SDK_PROVIDER_ID) return;
+    (state.agyForeground ??= new AgyForegroundOwnership()).authoritative = true;
+    state.agyNativeAcks = [];
+    // A provisional ACP autonomous stream has no RPC owner. Its native step
+    // will settle it; do not leave an unowned active generation blocking it.
+    if (state.autonomousTurnGeneration !== undefined && !state.agyBridging) {
+      state.agyProvisionalAutoMessageId = state.currentMessageId ?? undefined;
+      state.activePromptGenerations?.delete(state.autonomousTurnGeneration);
+      state.autonomousTurnGeneration = undefined; state.promptInFlight = false;
+      state.currentText = ''; state.currentMessageId = null;
+      this.steeringRunTerminals.get(state)?.complete();
+    }
   }
 
   private async startAgyBridge(sessionId: string, state: KimiSdkSessionState, childId?: string): Promise<void> {
@@ -674,7 +693,10 @@ export class KimiSdkProvider implements TransportProvider {
       }
       return;
     }
+    state.agyForeground?.observe(row);
+    if (row.type === 'SYSTEM_MESSAGE' && /\[Message\].*sender=/.test(row.content ?? '')) this.useAgyNativeOutput(state);
     if (row.type === 'PLANNER_RESPONSE' && row.tool_calls?.length) {
+      if (row.tool_calls.some(call => /^(invokesubagent|browsersubagent|sendmessage|swarm)$/.test(normalizeAgyToolName(call.name ?? '')))) this.useAgyNativeOutput(state);
       for (const [index,call] of row.tool_calls.entries()) (state.agyNativeToolOrder ??= []).push({name:call.name ?? '',input:call.args,step:row.step_index,index});
     }
     if (row.type === 'GENERIC' && row.content) {
@@ -712,12 +734,11 @@ export class KimiSdkProvider implements TransportProvider {
       // preserves a new child wakeup that beats the PREVIOUS RPC's delayed ack.
       const ack = state.agyNativeAcks?.[0];
       if (ack !== undefined && ack.text === row.content!.trimEnd()) { state.agyNativeAcks!.shift(); continue; }
-      (state.agyNativeDelivered ??= []).push({step,text:row.content!.trimEnd()});
       state.agyBridging = true;
       try {
         this.startAutonomousTurn(sessionId,state);
         const generation = state.autonomousTurnGeneration!;
-        state.currentMessageId = `${state.acpSessionId}:step:${row.step_index}`; state.currentText = row.content!;
+        state.currentMessageId = state.agyProvisionalAutoMessageId ?? `${state.acpSessionId}:step:${row.step_index}`; state.agyProvisionalAutoMessageId = undefined; state.currentText = row.content!;
         state.lastTurnUsage = {input_tokens:row.input_tokens,output_tokens:row.output_tokens,cache_read_input_tokens:row.cache_read_tokens};
         this.emitStatus(sessionId,state,{status:'streaming',label:null});
         for (const cb of this.deltaCallbacks) cb(sessionId,{messageId:state.currentMessageId,type:'text',delta:row.content!,role:'assistant'});
@@ -1074,6 +1095,7 @@ export class KimiSdkProvider implements TransportProvider {
       const generation = ++state.turnGeneration;
       queuedGeneration = generation;
       (state.activePromptGenerations ??= new Set()).add(generation);
+      if (this.id === AGY_SDK_PROVIDER_ID) (state.agyForeground ??= new AgyForegroundOwnership()).register(generation,activePromptText);
       const queuedPrompt = connection.prompt({
         sessionId: state.acpSessionId,
         prompt: [{ type: 'text', text: activePromptText }],
@@ -1087,16 +1109,7 @@ export class KimiSdkProvider implements TransportProvider {
       this.promptTerminals.set(state, queuedPrompt);
       void queuedPrompt.then((result) => {
         if (this.profile.steeringPrompts && !state.activePromptGenerations?.has(generation)) return;
-        this.capturePromptUsage(state, result);
-        if (result.stopReason === 'cancelled') {
-          logger.debug({ provider: this.id, sessionId }, 'ACP active-turn queued prompt later settled as cancelled');
-        }
-        this.settleTurn(
-          sessionId,
-          state,
-          generation,
-          result.stopReason,
-        );
+        return this.settleOwnedAcpPrompt(sessionId,state,generation,result);
       }).catch((error: unknown) => {
         logger.warn({
           provider: this.id,
@@ -1396,9 +1409,7 @@ export class KimiSdkProvider implements TransportProvider {
       const terminal = new Promise<void>(resolve => { complete = resolve; });
       this.steeringRunTerminals.set(state, { terminal, complete });
     }
-    // Outstanding native receipts may still get their ACP half AFTER this
-    // foreground request. Retain them until matched or owner teardown.
-    state.agyLateAcpUpdates = undefined; state.agyLateAcpText = undefined;
+    if (this.id === AGY_SDK_PROVIDER_ID) (state.agyForeground ??= new AgyForegroundOwnership()).latest = undefined;
     state.promptInFlight = true;
     state.promptSubmittedGeneration = null;
     (state.activePromptGenerations ??= new Set()).add(generation);
@@ -1432,6 +1443,7 @@ export class KimiSdkProvider implements TransportProvider {
       // when the turn ends.  Publish the generation-scoped admission boundary
       // before returning from send(), then settle asynchronously.
       const connection = this.connection!;
+      if (this.id === AGY_SDK_PROVIDER_ID) (state.agyForeground ??= new AgyForegroundOwnership()).register(generation,promptBlocks.map(b => b.type === 'text' ? b.text : '').join(''));
       const turn = connection.prompt({
         sessionId: state.acpSessionId!,
         prompt: promptBlocks,
@@ -1440,15 +1452,8 @@ export class KimiSdkProvider implements TransportProvider {
       this.promptTerminals.set(state, turn);
       void turn.then((result: PromptResponse) => {
         if (this.profile.steeringPrompts && !state.activePromptGenerations?.has(generation)) return;
-        this.capturePromptUsage(state, result);
-        this.settleTurn(
-          sessionId,
-          state,
-          generation,
-          result.stopReason,
-          includeSessionSystemText ? sessionContractKey : undefined,
-          compactControl,
-        );
+        return this.settleOwnedAcpPrompt(sessionId,state,generation,result,
+          includeSessionSystemText ? sessionContractKey : undefined,compactControl);
       }).catch((err: unknown) => {
         this.failTurn(sessionId, state, generation, err);
       });
@@ -1472,6 +1477,37 @@ export class KimiSdkProvider implements TransportProvider {
       this.failTurn(sessionId, state, generation, err);
       throw this.normalizeError(err);
     }
+  }
+
+  private async settleOwnedAcpPrompt(sessionId: string, state: KimiSdkSessionState, generation: number,
+    result: PromptResponse, contractKey?: string, compactControl = false): Promise<void> {
+    const owner = state.agyForeground;
+    try {
+      if (this.id === AGY_SDK_PROVIDER_ID) await state.agyBridges?.get(state.acpSessionId!)?.flush();
+      this.assertCurrentSession(sessionId,state);
+      if (!state.activePromptGenerations?.has(generation)) return;
+      if (owner?.authoritative && !owner.hasSuccessor(generation) && result.stopReason !== 'cancelled' && !compactControl) {
+        const output = await owner.output(generation);
+        this.assertCurrentSession(sessionId,state);
+        if (!state.activePromptGenerations?.has(generation)) return;
+        if (!output) throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+          'AG native foreground output could not be attributed before its deadline',true);
+      }
+      if (owner?.authoritative && state.activePromptGenerations.size === 1) {
+        const row = owner.latest?.row;
+        const text = compactControl ? '' : row?.content ?? '';
+        // In async mode every published parent byte comes from the associated
+        // native lane. Late ACP text/usage/turn_completed never enter here.
+        const prior = state.currentText;
+        state.currentText = text;
+        state.currentMessageId ??= row ? `${state.acpSessionId}:step:${row.step_index}` : null;
+        const delta = prior && text.startsWith(prior) ? text.slice(prior.length) : text;
+        if (delta) for (const cb of this.deltaCallbacks) cb(sessionId,{
+          messageId:state.currentMessageId!,type:'text',delta,role:'assistant'});
+      }
+      this.capturePromptUsage(state,result);
+      this.settleTurn(sessionId,state,generation,result.stopReason,contractKey,compactControl);
+    } finally { owner?.release(generation); }
   }
 
   private capturePromptUsage(state: KimiSdkSessionState, result: PromptResponse): void {
@@ -1506,6 +1542,7 @@ export class KimiSdkProvider implements TransportProvider {
       state.steeringFailure = undefined;
       state.steeringTerminal = undefined;
     } else if (state.settledGeneration >= generation) return;
+    if (this.id === AGY_SDK_PROVIDER_ID) this.closeAgyBridges(state);
     state.settledGeneration = state.turnGeneration;
     state.activePromptGenerations?.clear();
     state.autonomousTurnGeneration = undefined;
@@ -1934,44 +1971,6 @@ export class KimiSdkProvider implements TransportProvider {
     for (const cb of this.completeCallbacks) cb(sessionId, msg);
   }
 
-  /** Native-first counterpart to agyNativeAcks. A late ACP stream may be
-   * the SAME already-delivered native step. Buffer only while such a receipt
-   * exists; release immediately if its chunks diverge, or consume one receipt
-   * at turn_completed. ACP-first ordinary streaming is unchanged. */
-  private captureAgyLateAutonomousUpdate(state: KimiSdkSessionState, params: SessionNotification): boolean {
-    if (this.id !== AGY_SDK_PROVIDER_ID || state.agyReplayingLateAcp || state.cancelled || state.stoppedByCancel) return false;
-    const update = params.update as SessionUpdate;
-    const kind = (update as {sessionUpdate:string}).sessionUpdate;
-    const scoped = ['agent_message_chunk','agent_thought_chunk','tool_call','tool_call_update','usage_update','plan'].includes(kind);
-    if (!state.agyLateAcpUpdates) {
-      if (!scoped || state.promptInFlight || !state.agyNativeDelivered?.length) return false;
-      state.agyLateAcpUpdates = []; state.agyLateAcpText = '';
-    }
-    if (!scoped && kind !== 'turn_completed') return false;
-    if (scoped) state.agyLateAcpUpdates.push(update);
-    const chunk = update.sessionUpdate === 'agent_message_chunk' ? extractTextFromContent(update.content) : '';
-    const offset = state.agyLateAcpText?.length ?? 0;
-    const text = state.agyLateAcpText = (state.agyLateAcpText ?? '') + chunk;
-    const receipt = state.agyNativeDelivered?.[0];
-    if (kind === 'turn_completed' && receipt?.text === text.trimEnd()) {
-      state.agyNativeDelivered!.shift(); state.agyLateAcpUpdates = undefined; state.agyLateAcpText = undefined;
-      return true; // No second generation, delta, completion or prompt.
-    }
-    if (kind !== 'turn_completed' && receipt && (receipt.text.startsWith(chunk,offset)
-      || text.length >= receipt.text.length && text.trimEnd() === receipt.text)) return true;
-    const buffered = state.agyLateAcpUpdates;
-    state.agyLateAcpUpdates = undefined; state.agyLateAcpText = undefined;
-    // A different ordered ACP turn supersedes unmatched old receipts. Do not
-    // suppress a later independent turn merely because it repeats old text.
-    state.agyNativeDelivered = [];
-    state.agyReplayingLateAcp = true;
-    try {
-      for (const item of buffered) this.handleSessionUpdate({...params,update:item});
-      if (kind === 'turn_completed') this.handleSessionUpdate(params);
-    } finally { state.agyReplayingLateAcp = false; }
-    return true;
-  }
-
   // ── sessionUpdate dispatch ──────────────────────────────────────────────
 
   private handleSessionUpdate(params: SessionNotification): void {
@@ -1989,7 +1988,22 @@ export class KimiSdkProvider implements TransportProvider {
     if (state.replaying) {
       return;
     }
-    if (this.captureAgyLateAutonomousUpdate(state, params)) return;
+    if (this.id === AGY_SDK_PROVIDER_ID && state.agyForeground?.authoritative) {
+      if (update.sessionUpdate === 'agent_message_chunk') {
+        const text = extractTextFromContent(update.content);
+        if (parseSdkRuntimeSubagentTag(text)) this.handleAgentChunk(routeId,state,update);
+        return;
+      }
+      if (['agent_thought_chunk','usage_update','plan','turn_completed'].includes(update.sessionUpdate)) return;
+      if (!state.promptInFlight && (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update')) {
+        // Tool IDs remain attributable, but an unowned delayed tool update
+        // must not create an ACP autonomous generation waiting for a terminal
+        // that is intentionally owned by the native lane.
+        if (update.sessionUpdate === 'tool_call') this.handleToolCall(routeId,state,update);
+        else this.handleToolCallUpdate(routeId,state,update);
+        return;
+      }
+    }
     const updateRecord = update as unknown as Record<string, unknown>;
     if (this.id === AGY_SDK_PROVIDER_ID && isSdkRuntimeSubagentEventName(updateRecord.sessionUpdate)) {
       for (const event of (state.agySubagents ??= new AgySubagentTracker(state.acpSessionId ?? routeId)).snapshot(updateRecord)) {
@@ -2214,6 +2228,7 @@ export class KimiSdkProvider implements TransportProvider {
       rawInput: update.rawInput,
       rawOutput: update.rawOutput,
     };
+    if (this.id === AGY_SDK_PROVIDER_ID && /^(invokesubagent|browsersubagent|sendmessage|swarm)$/.test(normalizeAgyToolName(merged.title ?? ''))) this.useAgyNativeOutput(state);
     state.toolCalls.set(update.toolCallId, merged);
     this.emitMergedToolCall(sessionId, state, merged);
   }
