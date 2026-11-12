@@ -1565,4 +1565,42 @@ describe('styles.css regression contracts', () => {
     expect(bodyRule).toMatch(/font-variant-ligatures:\s*none/);
     expect(bodyRule).toMatch(/font-feature-settings:\s*"calt"\s*0,\s*"liga"\s*0/);
   });
+
+  it('disables mobile WebKit/Blink text autosizing at root html while preserving html.native-ios-mac 115% scaling and normal chat bubble sizes', () => {
+    const htmlMatch = cssWithoutComments.match(/(?:^|\n)html\s*\{[^}]*\}/);
+    const htmlRule = htmlMatch?.[0];
+    expect(htmlRule, 'base html rule missing').toBeTruthy();
+    expect(htmlRule).toMatch(/-webkit-text-size-adjust:\s*100%/);
+    expect(htmlRule).toMatch(/(?:^|[;\s])text-size-adjust:\s*100%/m);
+
+    const iosMacMatch = cssWithoutComments.match(/(?:^|\n)html\.native-ios-mac\s*\{[^}]*\}/);
+    const iosMacRule = iosMacMatch?.[0];
+    expect(iosMacRule, 'html.native-ios-mac scaling rule missing').toBeTruthy();
+    expect(iosMacRule).toMatch(/-webkit-text-size-adjust:\s*115%/);
+    expect(iosMacRule).toMatch(/(?:^|[;\s])text-size-adjust:\s*115%/m);
+    expect(iosMacMatch!.index!).toBeGreaterThan(htmlMatch!.index!);
+
+    // Inheritance from html ensures descendants stop font boosting on mobile while
+    // still inheriting 115% under html.native-ios-mac; descendant rules must not
+    // re-pin text-size-adjust: 100% or alter base 14px / native-ios-mac 16px chat sizes.
+    const bodyRule = cssWithoutComments.match(/\nbody\s*\{[^}]*\}/)?.[0] ?? '';
+    expect(bodyRule).toMatch(/font-size:\s*14px/);
+    expect(bodyRule).not.toMatch(/text-size-adjust/);
+
+    const iosMacChatRule = cssWithoutComments.match(
+      /html\.native-ios-mac\s+\.chat-user,[\s\S]*?html\.native-ios-mac\s+\.chat-bubble-content\s*\{[^}]*\}/,
+    )?.[0];
+    expect(iosMacChatRule).toMatch(/font-size:\s*16px/);
+
+    const chatUserRule = cssWithoutComments.match(/\n\.chat-user\s*\{[^}]*\}/)?.[0] ?? '';
+    expect(chatUserRule).toMatch(/word-break:\s*break-all/);
+    expect(chatUserRule).toMatch(/overflow-wrap:\s*break-word/);
+    expect(chatUserRule).not.toMatch(/font-size|text-size-adjust/);
+
+    const foldToggleRule = cssWithoutComments.match(/\n\.chat-user-message-fold-toggle\s*\{[^}]*\}/)?.[0] ?? '';
+    expect(foldToggleRule).toMatch(/font-size:\s*11px/);
+
+    const bubbleTimeRule = cssWithoutComments.match(/\n\.chat-bubble-time\s*\{[^}]*\}/)?.[0] ?? '';
+    expect(bubbleTimeRule).toMatch(/font-size:\s*10px/);
+  });
 });

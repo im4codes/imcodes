@@ -2,8 +2,14 @@
 .spinner { width: 28px; height: 28px; border: 3px solid #334155; border-top-color: #3b82f6; border-radius: 50%; animation: spin 0.8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 html, body, #app { margin: 0; padding: 0; height: 100%; width: 100%; overflow: hidden; touch-action: pan-x pan-y; }
-/* position:fixed prevents iOS from scrolling the page when the virtual keyboard opens */
-html { position: fixed; }
+/* position:fixed prevents iOS from scrolling the page when the virtual keyboard opens;
+   100% text-size-adjust disables mobile WebKit/Blink font boosting on wrapped/folded chat blocks
+   while keeping html.native-ios-mac's 115% override intact via inheritance and specificity. */
+html {
+  position: fixed;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
 :root {
   --sat: env(safe-area-inset-top, 0px);
   --chrome-bg: #080d16;
