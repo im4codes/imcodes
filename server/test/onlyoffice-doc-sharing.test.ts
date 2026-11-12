@@ -2484,6 +2484,37 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
     expect.soft(store.rooms.get(mapKey)!.session_epoch).toBe(before.session_epoch);
     expect.soft(store.rooms.get(mapKey)!.commit_seq).toBe(before.commit_seq + 1);
   });
+
+  it('audit-r15: recovery retry after room persistence succeeds but WAL cleanup fails must not apply the same intent twice', async () => {
+    const get = () => app.request('/api/server/srv-1/onlyoffice/config?path=%2Fteam%2Fshared%2Fspec.docx&mode=edit', { headers: { Authorization: bearer('owner-1') } });
+    const res = await get(); expect(res.status).toBe(200); const cfg = await res.json() as any; const cb = new URL(cfg.config.editorConfig.callbackUrl);
+    const mapKey = 'srv-1:/team/shared/spec.docx'; const prior = { ...store.rooms.get(mapKey)! };
+    const execute = store.db.execute.bind(store.db); let commitFaults = 0;
+    const commitFault = vi.spyOn(store.db, 'execute').mockImplementation(async (sql, params) => {
+      if (sql.replace(/\s+/g, ' ').startsWith('UPDATE onlyoffice_rooms SET') && commitFaults++ === 0) throw new Error('audit fail initial room commit after force-save binary write');
+      return execute(sql, params);
+    });
+    const forceBytes = 'force-save-bytes-for-partial-recovery-retry';
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(forceBytes, { status: 200 }));
+    const payload = { status: 6, key: cfg.config.document.key, url: 'https://im.example.com/onlyoffice/cache/retry-recovery.docx' };
+    const saved = await app.request(cb.pathname + cb.search, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...payload, token: signJwt(payload, 'onlyoffice-jwt-secret-key-test!!', 300) }) });
+    expect(saved.status).toBe(500); expect(commitFaults).toBeGreaterThan(0); expect(store.commitJournals.has(mapKey)).toBe(true);
+    commitFault.mockRestore(); resetOnlyOfficeDocumentKeyCacheForTests();
+    const now = Date.now() + 31_000; vi.spyOn(Date, 'now').mockReturnValue(now);
+    let cleanupFaults = 0;
+    const cleanupFault = vi.spyOn(store.db, 'execute').mockImplementation(async (sql, params) => {
+      if (sql.replace(/\s+/g, ' ').startsWith('DELETE FROM onlyoffice_commit_journal') && cleanupFaults++ === 0) throw new Error('audit cleanup fails AFTER recovery room state is durably stored');
+      return execute(sql, params);
+    });
+    const firstRecovery = await get(); expect(firstRecovery.status).toBe(500); expect(cleanupFaults).toBeGreaterThan(0);
+    expect(store.rooms.get(mapKey)!.commit_seq).toBe(prior.commit_seq + 1);
+    expect(store.commitJournals.has(mapKey)).toBe(true);
+    cleanupFault.mockRestore(); resetOnlyOfficeDocumentKeyCacheForTests();
+    const retried = await get(); expect(retried.status).toBe(200);
+    expect.soft(store.rooms.get(mapKey)!.commit_seq, 'the same WAL intent already applied before cleanup failure must be consumed idempotently, not applied as another commit').toBe(prior.commit_seq + 1);
+    expect.soft(store.commitJournals.has(mapKey)).toBe(false);
+    expect.soft(Buffer.from(virtualFiles.get('/team/shared/spec.docx')!.content, 'base64').toString()).toBe(forceBytes);
+  });
 });
 
 describe('Real Daemon CommandHandler Integration: Atomic Binary Save & Symlink Escape Prevention (F1 + F3d)', () => {

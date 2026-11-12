@@ -359,7 +359,6 @@ export async function resolveOnlyOfficeDocumentKey(
       const isExpiredCrashRecovery = Boolean(
         journalEntry &&
         !isJournalLive &&
-        journalEntry.room_key === existing.activeKey &&
         journalEntry.target_hash === currentHash
       );
       const isPendingMemoryRecovery = Boolean(pendingMemoryHash && currentHash === pendingMemoryHash);
@@ -369,49 +368,67 @@ export async function resolveOnlyOfficeDocumentKey(
           journalEntry?.phase?.startsWith('terminal:') ||
           journalEntry?.phase?.includes(':terminal')
         );
+        const journalEpoch = Number(journalEntry?.session_epoch ?? existing.sessionEpoch);
+        const journalSeq = Number(journalEntry?.expected_seq ?? existing.commitSeq);
+        const intendedEpoch = isTerminal ? journalEpoch + 1 : journalEpoch;
+        const intendedSeq = journalSeq + 1;
+        const intendedKey = isTerminal
+          ? computeDocumentKeyFromDigest(serverId, normalizedPath, currentHash, intendedEpoch)
+          : (journalEntry?.room_key ?? existing.activeKey);
 
-        if (isTerminal) {
-          const nextEpoch = existing.sessionEpoch + 1;
-          const nextSeq = existing.commitSeq + 1;
-          const nextKey = computeDocumentKeyFromDigest(serverId, normalizedPath, currentHash, nextEpoch);
+        const isPostState =
+          existing.sessionEpoch > intendedEpoch ||
+          (existing.sessionEpoch === intendedEpoch && existing.commitSeq >= intendedSeq);
+
+        if (isPostState) {
+          // Room is already at or ahead of intended post-state: idempotently consume journal
+          pendingCommitHashMap.delete(mapKey);
+          if (options?.db) {
+            await releaseOnlyOfficeCommitClaim(options.db, serverId, normalizedPath, journalEntry?.owner_token);
+          }
+          return existing.activeKey;
+        }
+
+        const isPreState =
+          existing.sessionEpoch === journalEpoch &&
+          existing.commitSeq === journalSeq &&
+          (!journalEntry?.room_key || existing.activeKey === journalEntry.room_key);
+
+        if (isPreState || !options?.db) {
+          // Room is at expected pre-state: apply intended post-state exactly once
           const recoveredState: DocumentVersionState = {
             currentConfirmedHash: currentHash,
             committedHash: currentHash,
-            lastForceSavedHash: null,
-            sessionEpoch: nextEpoch,
-            commitSeq: nextSeq,
-            activeKey: nextKey,
-            active: false,
+            lastForceSavedHash: isTerminal ? null : currentHash,
+            sessionEpoch: intendedEpoch,
+            commitSeq: intendedSeq,
+            activeKey: intendedKey,
+            active: !isTerminal,
             updatedAt: Date.now(),
           };
+
+          const executeRecovery = async (db: Database) => {
+            await savePersistentRoomToDb(db, serverId, normalizedPath, recoveredState);
+            await releaseOnlyOfficeCommitClaim(db, serverId, normalizedPath, journalEntry?.owner_token);
+          };
+
+          if (options?.db) {
+            if (typeof (options.db as any).transaction === 'function') {
+              await (options.db as any).transaction(executeRecovery);
+            } else {
+              await executeRecovery(options.db);
+            }
+          }
+
           documentVersionStateMap.set(mapKey, recoveredState);
           pendingCommitHashMap.delete(mapKey);
-          if (options?.db) {
-            await savePersistentRoomToDb(options.db, serverId, normalizedPath, recoveredState);
-            await releaseOnlyOfficeCommitClaim(options.db, serverId, normalizedPath);
-          }
-          return nextKey;
+          return intendedKey;
         }
 
-        // Force-save (status 6) crash recovery:
-        const nextSeq = existing.commitSeq + 1;
-        const recoveredState: DocumentVersionState = {
-          currentConfirmedHash: currentHash,
-          committedHash: currentHash,
-          lastForceSavedHash: currentHash,
-          sessionEpoch: existing.sessionEpoch,
-          commitSeq: nextSeq,
-          activeKey: existing.activeKey,
-          active: true,
-          updatedAt: Date.now(),
-        };
-        documentVersionStateMap.set(mapKey, recoveredState);
-        pendingCommitHashMap.delete(mapKey);
+        // Room is at an unrelated version: do not overwrite with stale intent
         if (options?.db) {
-          await savePersistentRoomToDb(options.db, serverId, normalizedPath, recoveredState);
-          await releaseOnlyOfficeCommitClaim(options.db, serverId, normalizedPath);
+          await releaseOnlyOfficeCommitClaim(options.db, serverId, normalizedPath, journalEntry?.owner_token);
         }
-        return existing.activeKey;
       }
 
       const authoritativeHash = getAuthoritativeHash(existing);
@@ -471,12 +488,21 @@ export async function resolveOnlyOfficeDocumentKey(
         active: !isTerminal,
         updatedAt: Date.now(),
       };
+
+      const executeRecovery = async (db: Database) => {
+        await savePersistentRoomToDb(db, serverId, normalizedPath, recoveredState);
+        await releaseOnlyOfficeCommitClaim(db, serverId, normalizedPath, journalEntry?.owner_token);
+      };
+
+      if (options?.db) {
+        if (typeof (options.db as any).transaction === 'function') {
+          await (options.db as any).transaction(executeRecovery);
+        } else {
+          await executeRecovery(options.db);
+        }
+      }
       documentVersionStateMap.set(mapKey, recoveredState);
       pendingCommitHashMap.delete(mapKey);
-      if (options?.db) {
-        await savePersistentRoomToDb(options.db, serverId, normalizedPath, recoveredState);
-        await releaseOnlyOfficeCommitClaim(options.db, serverId, normalizedPath);
-      }
       return recoveredState.activeKey;
     }
 
