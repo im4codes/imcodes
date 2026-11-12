@@ -224,6 +224,53 @@ describe('push notification preferences', () => {
     expect(getLocalPushNotificationPreferences()).toEqual(['task_pair_audit']);
   });
 
+  it('rejects a GET issued while dirty even when its response arrives after POST ACK (edit -> GET -> ACK -> response)', async () => {
+    const {
+      syncPushNotificationPreferences,
+      fetchPushNotificationPreferences,
+      getLocalPushNotificationPreferences,
+      hasUnsyncedPushNotificationEdits,
+    } = await import('../src/push-notifications.js');
+
+    let ack: ((val: any) => void) | undefined;
+    let readResolve: ((val: any) => void) | undefined;
+
+    apiFetchMock.mockImplementation((path: string, options: any) => {
+      if (options?.method === 'POST') {
+        return new Promise((resolve) => {
+          ack = resolve;
+        });
+      }
+      return new Promise((resolve) => {
+        readResolve = resolve;
+      });
+    });
+
+    const save = syncPushNotificationPreferences(['task_pair_audit']);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(hasUnsyncedPushNotificationEdits()).toBe(true);
+
+    // Issue GET while dirty
+    const pendingRead = fetchPushNotificationPreferences();
+
+    // POST succeeds and ACK arrives before GET response
+    ack!({ ok: true });
+    await save;
+    expect(hasUnsyncedPushNotificationEdits()).toBe(false);
+
+    // Old GET response arrives with stale defaults
+    readResolve!({
+      ok: true,
+      types: ['task_complete', 'waiting_input', 'session_error', 'task_pair_done', 'task_pair_paused', 'remote_desktop'],
+    });
+    const result = await pendingRead;
+
+    // Must be discarded and must not overwrite user's selection
+    expect(result).toBeNull();
+    expect(getLocalPushNotificationPreferences()).toEqual(['task_pair_audit']);
+  });
+
   it('allows normal remote hydration once in-flight edits are successfully ACKed', async () => {
     const { syncPushNotificationPreferences, fetchPushNotificationPreferences, getLocalPushNotificationPreferences } = await import('../src/push-notifications.js');
 

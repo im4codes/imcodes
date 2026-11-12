@@ -275,13 +275,16 @@ export function getCurrentPushNotificationEditGeneration(): number {
 
 export async function fetchPushNotificationPreferences(): Promise<PushNotificationType[] | null> {
   const startGen = currentEditGeneration;
+  const wasDirtyAtStart = hasUnsyncedPushNotificationEdits();
   try {
     const res = await apiFetch<{ ok: boolean; types: PushNotificationType[] }>('/api/push/preferences');
     if (res?.ok && Array.isArray(res.types)) {
       const valid = res.types.filter(isPushNotificationType);
-      // Guard against stale/late initial read overwriting newer local edits,
-      // and guard against overwriting un-ACKed dirty local edits
-      if (currentEditGeneration > startGen || hasUnsyncedPushNotificationEdits()) {
+      // Guard against:
+      // 1. Reads initiated while dirty (un-ACKed/pending local edits) - cannot be upgraded by subsequent ACK;
+      // 2. Reads arriving after newer local edits were made;
+      // 3. Reads completing while local state is currently dirty.
+      if (wasDirtyAtStart || currentEditGeneration > startGen || hasUnsyncedPushNotificationEdits()) {
         return null;
       }
       setLocalPushNotificationPreferences(valid);
