@@ -3461,4 +3461,419 @@ describe('sdk transport session restore', () => {
     expect(writePrivateInputMock).toHaveBeenCalledWith(expect.stringContaining('PROCESS_HANDOFF_TASK'));
     expect(writePrivateInputMock).toHaveBeenCalledWith(expect.stringContaining('PROCESS_HANDOFF_FACT'));
   });
+
+  it('invalidates an in-flight /handoff pack on clearTransportConversation and never resurrects it on later restore', async () => {
+    const { clearTransportConversation } = await import('../../src/daemon/command-handler.js');
+    const name = 'deck_clear_inflight_handoff_brain';
+    const record = {
+      name,
+      projectName: 'clearinflighthandoff',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/clear-inflight-handoff',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-clear-inflight',
+      codexSessionId: 'codex-thread-inflight',
+    };
+    mocks.store.set(name, record);
+
+    const rowsReady = deferred<any[]>();
+    timelineReadPreferredMock.mockResolvedValue([{
+      eventId: 'ev-inflight-cutoff',
+      sessionId: name,
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: 'PRIVATE_CONTEXT_CLEARED_BY_USER' },
+    } as any]);
+    timelineReadCompletedTextTailMock.mockImplementation(() => rowsReady.promise);
+
+    await connectProvider('codex-sdk', {});
+    await relaunchSessionWithSettings(record as any, { fresh: true, handoff: true });
+
+    // User immediately runs /clear before the async handoff pack finishes building.
+    await clearTransportConversation(mocks.store.get(name) as any);
+
+    rowsReady.resolve([{
+      eventId: 'ev-inflight-1',
+      sessionId: name,
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: 'PRIVATE_CONTEXT_CLEARED_BY_USER' },
+    }]);
+    await flush();
+    await flush();
+
+    expect(mocks.store.get(name)?.crossVendorHandoff?.pending).toBeUndefined();
+
+    // Stop runtime and run ordinary recovery/restore: cleared session must remain blank.
+    await stopTransportRuntimeSession(name);
+    mocks.codexRuns.length = 0;
+    await restoreTransportSessions('codex-sdk', { sessionName: name });
+    const runtime = getTransportRuntime(name);
+    expect(runtime).toBeDefined();
+    runtime!.send('NEW_QUESTION_AFTER_CLEAR');
+    await settleCodexRun(name, 'start', 'NEW_QUESTION_AFTER_CLEAR');
+    const run = codexRunForSession(name, 'start');
+    expect(run?.input).toBe('NEW_QUESTION_AFTER_CLEAR');
+    expect(run?.input).not.toContain('PRIVATE_CONTEXT_CLEARED_BY_USER');
+  });
+
+  it('clears a ready-pending /handoff pack on clearTransportConversation and keeps subsequent restore clean', async () => {
+    const { clearTransportConversation } = await import('../../src/daemon/command-handler.js');
+    const name = 'deck_clear_ready_handoff_brain';
+    const record = {
+      name,
+      projectName: 'clearreadyhandoff',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/clear-ready-handoff',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-clear-ready',
+      codexSessionId: 'codex-thread-ready',
+    };
+    mocks.store.set(name, record);
+    timelineReadPreferredMock.mockResolvedValue([{
+      eventId: 'ev-ready-1',
+      sessionId: name,
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: 'READY_CONTEXT_CLEARED_BY_USER' },
+    } as any]);
+    timelineReadCompletedTextTailMock.mockResolvedValue([{
+      eventId: 'ev-ready-1',
+      sessionId: name,
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: 'READY_CONTEXT_CLEARED_BY_USER' },
+    } as any]);
+
+    await connectProvider('codex-sdk', {});
+    await relaunchSessionWithSettings(record as any, { fresh: true, handoff: true });
+    const pendingDeadline = Date.now() + 5_000;
+    while (!mocks.store.get(name)?.crossVendorHandoff?.pending && Date.now() < pendingDeadline) {
+      await flush();
+    }
+    expect(mocks.store.get(name)?.crossVendorHandoff?.pending?.text).toContain('READY_CONTEXT_CLEARED_BY_USER');
+
+    await clearTransportConversation(mocks.store.get(name) as any);
+    expect(mocks.store.get(name)?.crossVendorHandoff?.pending).toBeUndefined();
+
+    await stopTransportRuntimeSession(name);
+    mocks.codexRuns.length = 0;
+    await restoreTransportSessions('codex-sdk', { sessionName: name });
+    const runtime = getTransportRuntime(name);
+    runtime!.send('AFTER_READY_CLEAR');
+    await settleCodexRun(name, 'start', 'AFTER_READY_CLEAR');
+    const run = codexRunForSession(name, 'start');
+    expect(run?.input).toBe('AFTER_READY_CLEAR');
+    expect(run?.input).not.toContain('READY_CONTEXT_CLEARED_BY_USER');
+  });
+
+  it('delivers only the newest pack once across consecutive /handoff calls', async () => {
+    const name = 'deck_consecutive_handoff_brain';
+    const record = {
+      name,
+      projectName: 'consecutivehandoff',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/consecutive-handoff',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-consecutive',
+      codexSessionId: 'codex-thread-consec',
+    };
+    mocks.store.set(name, record);
+
+    const firstSlow = deferred<any[]>();
+    timelineReadPreferredMock.mockResolvedValue([{
+      eventId: 'ev-consec-1',
+      sessionId: name,
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: 'STALE_FIRST_HANDOFF' },
+    } as any]);
+    timelineReadCompletedTextTailMock
+      .mockImplementationOnce(() => firstSlow.promise)
+      .mockResolvedValueOnce([{
+        eventId: 'ev-consec-2',
+        sessionId: name,
+        ts: 200,
+        seq: 2,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'user.message',
+        payload: { text: 'LATEST_SECOND_HANDOFF' },
+      } as any]);
+
+    await connectProvider('codex-sdk', {});
+    await relaunchSessionWithSettings(record as any, { fresh: true, handoff: true });
+    await relaunchSessionWithSettings(mocks.store.get(name) as any, { fresh: true, handoff: true });
+
+    firstSlow.resolve([{
+      eventId: 'ev-consec-1',
+      sessionId: name,
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: 'STALE_FIRST_HANDOFF' },
+    }]);
+    const deadline = Date.now() + 5_000;
+    while (!mocks.store.get(name)?.crossVendorHandoff?.pending && Date.now() < deadline) {
+      await flush();
+    }
+    expect(mocks.store.get(name)?.crossVendorHandoff?.pending?.text).toContain('LATEST_SECOND_HANDOFF');
+    expect(mocks.store.get(name)?.crossVendorHandoff?.pending?.text).not.toContain('STALE_FIRST_HANDOFF');
+
+    mocks.codexRuns.length = 0;
+    const runtime = getTransportRuntime(name);
+    runtime!.send('turn one');
+    await settleCodexRun(name, 'start');
+    const firstTurnDeadline = Date.now() + 5_000;
+    while (!codexRunForSession(name, 'start')?.input.includes('turn one') && Date.now() < firstTurnDeadline) {
+      await flush();
+    }
+    expect(codexRunForSession(name, 'start')?.input).toContain('LATEST_SECOND_HANDOFF');
+    expect(codexRunForSession(name, 'start')?.input).not.toContain('STALE_FIRST_HANDOFF');
+
+    // Consumed: second turn after /handoff must not repeat the handoff pack.
+    runtime!.send('turn two');
+    await settleCodexRun(name, 'start', 'turn two');
+    expect(codexRunForSession(name, 'start')?.input).toBe('turn two');
+  });
+
+  it('preserves codex-sdk ccPreset and resolves getCodexPresetTransportConfig on /handoff with one-time pack delivery', async () => {
+    const ccPresets = await import('../../src/daemon/cc-presets.js');
+    const codexPresetSpy = vi.spyOn(ccPresets, 'getCodexPresetTransportConfig').mockResolvedValue({
+      env: { OPENAI_BASE_URL: 'https://custom-codex.example/v1' },
+      model: 'custom-codex-model',
+      availableModels: ['custom-codex-model', 'custom-codex-mini'],
+      contextWindow: 128_000,
+      codexModelProvider: {
+        id: 'custom_codex_preset',
+        name: 'custom-codex-preset',
+        baseUrl: 'https://custom-codex.example/v1',
+        envKey: 'CUSTOM_API_KEY',
+      },
+    });
+    try {
+      const name = 'deck_handoff_codex_preset_brain';
+      const record = {
+        name,
+        projectName: 'handoffcodexpreset',
+        role: 'brain',
+        agentType: 'codex-sdk',
+        projectDir: '/tmp/handoff-codex-preset',
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        runtimeType: 'transport',
+        providerId: 'codex-sdk',
+        providerSessionId: 'route-cx-preset',
+        codexSessionId: 'codex-thread-preset-old',
+        ccPreset: 'custom-codex-preset',
+        requestedModel: 'custom-codex-model',
+      };
+      mocks.store.set(name, record);
+      timelineReadPreferredMock.mockResolvedValue([{
+        eventId: 'ev-preset-1',
+        sessionId: name,
+        ts: 100,
+        seq: 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'user.message',
+        payload: { text: 'CODEX_PRESET_HANDOFF_GOAL' },
+      } as any]);
+      timelineReadCompletedTextTailMock.mockResolvedValue([{
+        eventId: 'ev-preset-1',
+        sessionId: name,
+        ts: 100,
+        seq: 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'user.message',
+        payload: { text: 'CODEX_PRESET_HANDOFF_GOAL' },
+      } as any]);
+
+      await connectProvider('codex-sdk', {});
+      await relaunchSessionWithSettings(record as any, { fresh: true, handoff: true });
+
+      expect(codexPresetSpy).toHaveBeenCalledWith('custom-codex-preset', 'custom-codex-model');
+      const updated = mocks.store.get(name);
+      expect(updated?.ccPreset).toBe('custom-codex-preset');
+      expect(updated?.requestedModel).toBe('custom-codex-model');
+      expect(updated?.codexSessionId).not.toBe('codex-thread-preset-old');
+
+      const pendingDeadline = Date.now() + 5_000;
+      while (!mocks.store.get(name)?.crossVendorHandoff?.pending && Date.now() < pendingDeadline) {
+        await flush();
+      }
+      mocks.codexRuns.length = 0;
+      const runtime = getTransportRuntime(name);
+      runtime!.send('next step');
+      await settleCodexRun(name, 'start');
+      const runDeadline = Date.now() + 5_000;
+      while (!codexRunForSession(name, 'start')?.input.includes('next step') && Date.now() < runDeadline) {
+        await flush();
+      }
+      expect(codexRunForSession(name, 'start')?.input).toContain('CODEX_PRESET_HANDOFF_GOAL');
+      expect(codexRunForSession(name, 'start')?.options.model).toBe('custom-codex-model');
+
+      // One-time delivery check
+      runtime!.send('follow up');
+      await settleCodexRun(name, 'start', 'follow up');
+      expect(codexRunForSession(name, 'start')?.input).toBe('follow up');
+    } finally {
+      codexPresetSpy.mockRestore();
+    }
+  });
+
+  it('preserves codex process ccPreset and available models while rotating thread and delivering handoff pack', async () => {
+    const ccPresets = await import('../../src/daemon/cc-presets.js');
+    const resolveEnvSpy = vi.spyOn(ccPresets, 'resolvePresetEnv').mockResolvedValue({});
+    const getPresetSpy = vi.spyOn(ccPresets, 'getPreset').mockResolvedValue({
+      name: 'custom-codex-cli-preset',
+      env: { OPENAI_BASE_URL: 'https://custom-codex.example/v1' },
+      contextWindow: 128_000,
+      availableModels: [{ id: 'custom-codex-model' }],
+    } as any);
+    try {
+      const name = 'deck_handoff_codex_cli_preset_brain';
+      const record = {
+        name,
+        projectName: 'handoffcodexclipreset',
+        role: 'brain',
+        agentType: 'codex',
+        runtimeType: 'process',
+        projectDir: '/tmp/handoff-codex-cli-preset',
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        codexSessionId: 'codex-cli-thread-old',
+        ccPreset: 'custom-codex-cli-preset',
+      };
+      mocks.store.set(name, record);
+      timelineReadPreferredMock.mockResolvedValue([{
+        eventId: 'ev-cli-preset-1',
+        sessionId: name,
+        ts: 100,
+        seq: 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'user.message',
+        payload: { text: 'CODEX_CLI_PRESET_GOAL' },
+      } as any]);
+      timelineReadCompletedTextTailMock.mockResolvedValue([{
+        eventId: 'ev-cli-preset-1',
+        sessionId: name,
+        ts: 100,
+        seq: 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'user.message',
+        payload: { text: 'CODEX_CLI_PRESET_GOAL' },
+      } as any]);
+
+      await relaunchSessionWithSettings(record as any, { fresh: true, handoff: true });
+      const deadline = Date.now() + 5_000;
+      while (writePrivateInputMock.mock.calls.length === 0 && Date.now() < deadline) {
+        await flush();
+      }
+
+      const updated = mocks.store.get(name);
+      expect(resolveEnvSpy).toHaveBeenCalledWith('custom-codex-cli-preset', undefined);
+      expect(getPresetSpy).toHaveBeenCalledWith('custom-codex-cli-preset');
+      expect(updated?.ccPreset).toBe('custom-codex-cli-preset');
+      expect(updated?.codexAvailableModels).toEqual(['custom-codex-model']);
+      expect(updated?.codexSessionId).not.toBe('codex-cli-thread-old');
+      expect(writePrivateInputMock).toHaveBeenCalledWith(expect.stringContaining('CODEX_CLI_PRESET_GOAL'));
+    } finally {
+      resolveEnvSpy.mockRestore();
+      getPresetSpy.mockRestore();
+    }
+  });
+
+  it('does not carry an incompatible ccPreset across families when switching from claude-code to codex-sdk without an override', async () => {
+    const ccPresets = await import('../../src/daemon/cc-presets.js');
+    const codexPresetSpy = vi.spyOn(ccPresets, 'getCodexPresetTransportConfig');
+    try {
+      const name = 'deck_cross_family_preset_drop_brain';
+      const record = {
+        name,
+        projectName: 'crossfamilypreset',
+        role: 'brain',
+        agentType: 'claude-code-sdk',
+        runtimeType: 'transport',
+        projectDir: '/tmp/cross-family-preset',
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        providerId: 'claude-code-sdk',
+        providerSessionId: 'route-cc-cross',
+        ccSessionId: 'cc-cross-old',
+        ccPreset: 'claude-only-preset',
+      };
+      mocks.store.set(name, record);
+
+      await connectProvider('codex-sdk', {});
+      await relaunchSessionWithSettings(record as any, { agentType: 'codex-sdk' });
+
+      expect(codexPresetSpy).not.toHaveBeenCalled();
+      expect(mocks.store.get(name)?.agentType).toBe('codex-sdk');
+      expect(mocks.store.get(name)?.ccPreset).toBeUndefined();
+    } finally {
+      codexPresetSpy.mockRestore();
+    }
+  });
 });

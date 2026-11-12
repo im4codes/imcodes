@@ -87,6 +87,7 @@ import { getCodexRuntimeConfig } from './codex-runtime-config.js';
 import { mergeCodexDisplayMetadata } from './codex-display.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import { getSessionRuntimeType, isClaudeCodeFamily, isClaudeCodeSdkAgentType, isCodexFamily } from '../../shared/agent-types.js';
+import { CUSTOM_PROVIDER_SDK_AGENT_TYPES } from '../../shared/cc-presets.js';
 import { detectLocalAuthContext, hasLocalAuthCandidate, isExplicitlyUnsupportedLocalAuthProvider, localAuthContextEnv, type LocalAuthContext } from './local-auth-context.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
 import { DEFAULT_CODEX_SESSION_MODEL } from '../shared/models/options.js';
@@ -1207,6 +1208,8 @@ export interface LaunchOpts {
   parentSession?: string;
   /** Mark as user-created (not auto-synced from provider). Protected from sync/health cleanup. */
   userCreated?: boolean;
+  /** Internal: launch generation already allocated by `relaunchSessionWithSettings`. */
+  handoffLaunchGeneration?: number;
 }
 
 export interface SessionRelaunchOverrides {
@@ -1280,12 +1283,45 @@ async function teardownSessionRuntime(record: SessionRecord): Promise<void> {
 
 const crossVendorHandoffLaunchGenerations = new Map<string, number>();
 
+function advanceCrossVendorHandoffLaunchGeneration(sessionName: string): number {
+  const next = (crossVendorHandoffLaunchGenerations.get(sessionName) ?? 0) + 1;
+  crossVendorHandoffLaunchGenerations.set(sessionName, next);
+  return next;
+}
+
+function stripPendingCrossVendorHandoff(
+  state: SessionRecord['crossVendorHandoff'],
+  fresh: boolean | undefined,
+): SessionRecord['crossVendorHandoff'] {
+  if (!state) return undefined;
+  return fresh && state.pending ? { ...state, pending: undefined } : state;
+}
+
+function invalidateFreshCrossVendorHandoff(sessionName: string): void {
+  advanceCrossVendorHandoffLaunchGeneration(sessionName);
+  const stored = getSession(sessionName);
+  if (stored?.crossVendorHandoff?.pending) {
+    upsertSession({
+      ...stored,
+      crossVendorHandoff: { ...stored.crossVendorHandoff, pending: undefined },
+      updatedAt: Date.now(),
+    });
+  }
+}
+
+function isPresetCompatibleAgentSwitch(sourceAgentType: string, targetAgentType: string): boolean {
+  if (!CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(targetAgentType)) return false;
+  if (sourceAgentType === targetAgentType) return true;
+  if (isClaudeCodeFamily(sourceAgentType) && isClaudeCodeFamily(targetAgentType)) return true;
+  if (isCodexFamily(sourceAgentType) && isCodexFamily(targetAgentType)) return true;
+  return false;
+}
+
 export async function relaunchSessionWithSettings(
   record: SessionRecord,
   overrides: SessionRelaunchOverrides = {},
 ): Promise<void> {
-  const launchGeneration = (crossVendorHandoffLaunchGenerations.get(record.name) ?? 0) + 1;
-  crossVendorHandoffLaunchGenerations.set(record.name, launchGeneration);
+  const launchGeneration = advanceCrossVendorHandoffLaunchGeneration(record.name);
   const targetAgentType = (overrides.agentType ?? record.agentType) as AgentType;
   const targetFresh = overrides.fresh === true;
   const targetProjectDir = overrides.projectDir ?? record.projectDir;
@@ -1299,7 +1335,9 @@ export async function relaunchSessionWithSettings(
     : enteringAgy ? null : (record.requestedModel ?? null);
   const targetEffort = overrides.effort !== undefined ? overrides.effort : (record.effort ?? null);
   const targetTransportConfig = overrides.transportConfig !== undefined ? overrides.transportConfig : (record.transportConfig ?? null);
-  const targetCcPreset = overrides.ccPreset !== undefined ? overrides.ccPreset : (record.ccPreset ?? null);
+  const targetCcPreset = overrides.ccPreset !== undefined
+    ? (CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(targetAgentType) ? (overrides.ccPreset ?? null) : null)
+    : (isPresetCompatibleAgentSwitch(record.agentType, targetAgentType) ? (record.ccPreset ?? null) : null);
   const compatibleIds = targetFresh ? {} : getCompatibleSessionIds(record, targetAgentType);
   const targetRuntimeType = getSessionRuntimeType(targetAgentType);
   const forceHandoff = overrides.handoff === true;
@@ -1363,9 +1401,7 @@ export async function relaunchSessionWithSettings(
     requestedModel: targetRequestedModel ?? undefined,
     effort: targetEffort ?? undefined,
     transportConfig: targetTransportConfig ?? undefined,
-    ccPreset: (targetAgentType === 'claude-code' || isClaudeCodeSdkAgentType(targetAgentType) || targetAgentType === 'qwen' || targetAgentType === 'deepseek-harness' || targetAgentType === 'pi')
-      ? (targetCcPreset ?? undefined)
-      : undefined,
+    ccPreset: targetCcPreset ?? undefined,
     ...(preserveTransportBinding ? {
       bindExistingKey: record.providerSessionId,
       ...(!targetFresh ? { skipCreate: true } : {}),
@@ -1377,20 +1413,33 @@ export async function relaunchSessionWithSettings(
     ...(record.parentSession ? { parentSession: record.parentSession } : {}),
     ...(record.userCreated ? { userCreated: true } : {}),
     ...(targetFresh ? { fresh: true } : {}),
+    handoffLaunchGeneration: launchGeneration,
   });
-  if (handoffPromise) {
-    const launchedTransport = targetRuntimeType === RUNTIME_TYPES.TRANSPORT
-      ? transportRuntimes.get(record.name)
-      : undefined;
-    const isCurrentLaunch = (): boolean => {
-      const current = getSession(record.name);
-      return isCrossVendorHandoffLaunchCurrent({
-        expectedGeneration: launchGeneration,
-        currentGeneration: crossVendorHandoffLaunchGenerations.get(record.name),
-        currentAgentType: current?.agentType,
-        targetAgentType,
-      });
-    };
+  const launchedTransport = targetRuntimeType === RUNTIME_TYPES.TRANSPORT
+    ? transportRuntimes.get(record.name)
+    : undefined;
+  const launchedRecord = getSession(record.name);
+  const launchedRuntimeEpoch = launchedRecord?.runtimeEpoch;
+  const launchedSessionInstanceId = launchedRecord?.sessionInstanceId;
+  const isCurrentLaunch = (): boolean => {
+    const current = getSession(record.name);
+    if (!isCrossVendorHandoffLaunchCurrent({
+      expectedGeneration: launchGeneration,
+      currentGeneration: crossVendorHandoffLaunchGenerations.get(record.name),
+      currentAgentType: current?.agentType,
+      targetAgentType,
+    })) {
+      return false;
+    }
+    if (launchedRuntimeEpoch && (current?.runtimeEpoch !== launchedRuntimeEpoch || current?.sessionInstanceId !== launchedSessionInstanceId)) {
+      return false;
+    }
+    if (launchedTransport && transportRuntimes.get(record.name) !== launchedTransport) {
+      return false;
+    }
+    return true;
+  };
+  if (handoffPromise && isCurrentLaunch()) {
     const persistPending = (pack: import('../../shared/cross-vendor-handoff.js').CrossVendorHandoffPack): void => {
       if (!isCurrentLaunch()) return;
       const current = getSession(record.name);
@@ -3525,6 +3574,11 @@ export function getTransportLaunchInFlightWaitMs(): number {
 
 export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   const { name } = opts;
+  // Every fresh launch outside an owning relaunchSessionWithSettings supersedes
+  // any in-flight async handoff pack so `/clear` never resurrects stale context.
+  if (opts.fresh && opts.handoffLaunchGeneration === undefined) {
+    invalidateFreshCrossVendorHandoff(name);
+  }
   // A (re)launch is an explicit session change: forget any restore backoff.
   clearTransportRestoreBackoff(name);
   const inFlight = transportLaunchInFlight.get(name);
@@ -3670,7 +3724,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   // back to the OAuth `coder-model` placeholder. `opts.fresh` (from /clear or
   // explicit reset) still wins — same rule applied to transportConfig above.
   const effectiveCcPreset: string | undefined =
-    opts.ccPreset ?? (!opts.fresh ? existing?.ccPreset : undefined);
+    opts.ccPreset ?? (!opts.fresh && existing?.ccPreset && isPresetCompatibleAgentSwitch(existing.agentType, agentType) ? existing.ccPreset : undefined);
   const effectiveUserCreated: boolean | undefined =
     opts.userCreated ?? (!opts.fresh ? existing?.userCreated : undefined);
   const effectiveParentSession: string | undefined =
@@ -4018,9 +4072,10 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
           ? { summarySyncFingerprints: preservedSummarySyncFingerprints }
           : {}),
         ...(existing?.crossVendorHandoff ? {
-          crossVendorHandoff: opts.fresh && existing.crossVendorHandoff.pending
-            ? { ...existing.crossVendorHandoff, pending: undefined }
-            : existing.crossVendorHandoff,
+          crossVendorHandoff: stripPendingCrossVendorHandoff(
+            (getSession(name) ?? existing)?.crossVendorHandoff,
+            opts.fresh,
+          ),
         } : {}),
       });
       const launchGapEntries = getResendEntries(name);
@@ -4230,6 +4285,9 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     await launchTransportSession(opts);
     return;
   }
+  if (opts.fresh && opts.handoffLaunchGeneration === undefined) {
+    invalidateFreshCrossVendorHandoff(opts.name);
+  }
 
   const { name, projectName, role, agentType, projectDir, skipStore, extraEnv, fresh, label } = opts;
   const driver = getDriver(agentType);
@@ -4414,9 +4472,10 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       ...(opts.parentSession ? { parentSession: opts.parentSession } : {}),
       ...(opts.userCreated ? { userCreated: true } : {}),
       ...(existing?.crossVendorHandoff ? {
-        crossVendorHandoff: fresh && existing.crossVendorHandoff.pending
-          ? { ...existing.crossVendorHandoff, pending: undefined }
-          : existing.crossVendorHandoff,
+        crossVendorHandoff: stripPendingCrossVendorHandoff(
+          (getSession(name) ?? existing)?.crossVendorHandoff,
+          fresh,
+        ),
       } : {}),
       ...(summarySyncFingerprints.length > 0 ? { summarySyncFingerprints } : {}),
       ...(familyDisplay ?? {}),
@@ -4448,6 +4507,10 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
         ...(opts.identityPrompt ? { appliedIdentityHash: identityPromptHash(opts.identityPrompt) } : {}),
         ...(opts.parentSession ? { parentSession: opts.parentSession } : {}),
         ...(opts.userCreated ? { userCreated: true } : {}),
+        ...(opts.ccPreset ? { ccPreset: opts.ccPreset } : {}),
+        ...(existing.crossVendorHandoff ? {
+          crossVendorHandoff: stripPendingCrossVendorHandoff(existing.crossVendorHandoff, fresh),
+        } : {}),
         ...(launchedNativeAgentFence ? { nativeAgentLaunchFence: launchedNativeAgentFence } : {}),
         updatedAt: Date.now(),
       };
