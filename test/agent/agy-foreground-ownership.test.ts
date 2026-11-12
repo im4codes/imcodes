@@ -132,6 +132,26 @@ describe('AG captured native foreground ownership', () => {
     expect(owner.observe(row(21, 'PLANNER_RESPONSE', 'Owned parser fix with nested literal tag'))).toBe(true);
     expect((await owner.output(1))?.content).toBe('Owned parser fix with nested literal tag');
     expect(owner.latest?.generation).toBe(1);
+
+    // 4. Plain (unwrapped) exact/whitespace-normalized and wrapped USER_EXPLICIT inputs containing inline or full literal <USER_REQUEST> tags bind FIFO
+    const wholeTagPayload = '<USER_REQUEST>this is the complete literal user payload</USER_REQUEST>';
+    owner.register(2, promptText);
+    owner.register(3, wholeTagPayload);
+    owner.register(4, wholeTagPayload);
+    owner.register(5, wholeTagPayload);
+    owner.observe(row(22, 'USER_INPUT', promptText, 'USER_EXPLICIT'));
+    owner.observe(row(23, 'PLANNER_RESPONSE', 'plain inline tag answer'));
+    owner.observe(row(24, 'USER_INPUT', wholeTagPayload, 'USER_EXPLICIT'));
+    owner.observe(row(25, 'PLANNER_RESPONSE', 'plain whole tag answer 1'));
+    owner.observe(row(26, 'USER_INPUT', '<USER_REQUEST>this is the complete\r\n  literal user payload</USER_REQUEST>', 'USER_EXPLICIT'));
+    owner.observe(row(27, 'PLANNER_RESPONSE', 'plain whole tag answer 2'));
+    owner.observe(row(28, 'USER_INPUT', `<USER_REQUEST>\r\n${wholeTagPayload}\r\n</USER_REQUEST>`, 'USER_EXPLICIT'));
+    owner.observe(row(29, 'PLANNER_RESPONSE', 'wrapped whole tag answer 3'));
+    expect((await owner.output(2))?.content).toBe('plain inline tag answer');
+    expect((await owner.output(3))?.content).toBe('plain whole tag answer 1');
+    expect((await owner.output(4))?.content).toBe('plain whole tag answer 2');
+    expect((await owner.output(5))?.content).toBe('wrapped whole tag answer 3');
+    expect(owner.latest?.generation).toBe(5);
   });
   it('clears active lane on release after timeout so late native output cannot pollute the next turn', async () => {
     const owner = new AgyForegroundOwnership(20);

@@ -117,6 +117,19 @@ export class AgyForegroundOwnership {
     const unbound = [...this.prompts.values()].filter(p => p.inputStep === undefined && p.text);
     if (unbound.length === 0) return undefined;
 
+    // 1. Direct raw payload fidelity (exact, trimmed, or whitespace-normalized full equality).
+    // Preserves plain USER_EXPLICIT fixtures/inputs even when the prompt itself contains or
+    // consists of literal <USER_REQUEST>...</USER_REQUEST> tags, in FIFO order.
+    const exactRaw = unbound.find(p => content === p.text || content.trim() === p.text!.trim());
+    if (exactRaw) return exactRaw;
+
+    const normRaw = collapseWhitespace(content);
+    if (!normRaw) return undefined;
+
+    const normRawMatch = unbound.find(p => p.normText !== undefined && p.normText.length > 0 && normRaw === p.normText);
+    if (normRawMatch) return normRawMatch;
+
+    // 2. Native outer envelope extraction and prefix fallback.
     const envelope = parseNativeInputEnvelope(content);
     if (envelope.kind === 'invalid') return undefined;
 
@@ -137,17 +150,14 @@ export class AgyForegroundOwnership {
       return selectUnambiguousPrefixMatch(prefixMatches);
     }
 
-    // envelope.kind === 'plain'
+    // envelope.kind === 'plain' (no <USER_REQUEST> tags in content)
     const plainCandidates = unbound.filter(p => p.tagCount === 0);
     if (plainCandidates.length === 0) return undefined;
 
     const exactPlain = plainCandidates.find(p => content.includes(p.text!));
     if (exactPlain) return exactPlain;
 
-    const normRow = collapseWhitespace(content);
-    if (!normRow) return undefined;
-
-    const normPlain = plainCandidates.find(p => p.normText !== undefined && p.normText.length > 0 && normRow.includes(p.normText));
+    const normPlain = plainCandidates.find(p => p.normText !== undefined && p.normText.length > 0 && normRaw.includes(p.normText));
     if (normPlain) return normPlain;
 
     const trimmedContent = content.trim();
