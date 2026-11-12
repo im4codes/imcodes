@@ -3,8 +3,20 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { isIncognitoSession } from './session-incognito-types.js';
 const privacy = new AsyncLocalStorage<boolean>();
 const privateSessions = new Set<string>();
+const teardownListeners = new Set<(name: string) => void>();
 export function setSessionIncognito(name: string, enabled: boolean): void {
   if (enabled) privateSessions.add(name); else privateSessions.delete(name);
+}
+/** Register an in-memory teardown callback invoked when a session is stopped or detached. */
+export function onSessionTeardown(listener: (name: string) => void): () => void {
+  teardownListeners.add(listener);
+  return () => { teardownListeners.delete(listener); };
+}
+/** Invoke registered session teardown listeners without coupling across optional/mocked boundaries. */
+export function notifySessionTeardown(name: string): void {
+  for (const listener of teardownListeners) {
+    try { listener(name); } catch { /* best-effort teardown */ }
+  }
 }
 export function isIncognitoSessionName(name: unknown): boolean {
   return typeof name === 'string' && privateSessions.has(name);

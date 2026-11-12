@@ -38,7 +38,7 @@ import {
 import { readNativeAgentAdmissionMode } from '../../shared/native-collaboration-policy.js';
 import { appendTransportEvent } from './transport-history.js';
 import { isIncognitoSession } from '../../shared/session-incognito-types.js';
-import { withSessionPrivacy } from '../../shared/session-incognito-context.js';
+import { onSessionTeardown, withSessionPrivacy } from '../../shared/session-incognito-context.js';
 import logger from '../util/logger.js';
 import { TrailingThrottle } from '../util/trailing-throttle.js';
 import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
@@ -319,6 +319,8 @@ export function forgetTransportRelaySession(sessionName: string): void {
     if (key.startsWith(prefix)) emittedSdkTurnLostRecoveryPhases.delete(key);
   }
 }
+
+onSessionTeardown(forgetTransportRelaySession);
 
 function emitStreamingAssistantText(sessionName: string, eventId: string, text: string): void {
   runWithRelaySessionPrivacy(sessionName, () => {

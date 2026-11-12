@@ -1,5 +1,5 @@
 import { isIncognitoSession, supportsSessionIncognito, SESSION_INCOGNITO_UNSUPPORTED, type SessionIncognitoConfig } from '../../shared/session-incognito-types.js';
-import { setSessionIncognito, withSessionPrivacy } from '../../shared/session-incognito-context.js';
+import { notifySessionTeardown, setSessionIncognito, withSessionPrivacy } from '../../shared/session-incognito-context.js';
 import { AGY_NATIVE_SESSION_STATE, AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { agyNativeStartNotAttemptedError, persistAgyNativeSessionStart } from './agy-session-persistence.js';
 import { queuedUserMessageAttribution } from './transport-queued-user-message.js';
@@ -129,7 +129,6 @@ import { getDefaultTimelineDetailStore } from '../daemon/timeline-detail-store.j
 import { getTransportQueueStore } from '../daemon/transport-queue-store.js';
 import { buildTransportQueueSnapshotPayload, transportQueueSnapshotToPayload } from '../daemon/transport-queue-projection.js';
 import { appendTransportEvent, replayTransportHistory } from '../daemon/transport-history.js';
-import { forgetTransportRelaySession } from '../daemon/transport-relay.js';
 import { materializeMasterSummary } from '../context/materialization-coordinator.js';
 import { serializeContextNamespace } from '../context/context-keys.js';
 import { clearSummarySyncHistory, getSummarySyncFingerprints } from '../context/summary-sync-history.js';
@@ -474,7 +473,7 @@ export async function stopProject(
         // (otherwise they leak for every session that ever ran), and drop any
         // queued resend work so it can't replay into a same-named session later.
         timelineEmitter.forgetSession(record.name);
-        forgetTransportRelaySession(record.name);
+        notifySessionTeardown(record.name);
         clearResend(record.name, 'session_removed');
         if (isIncognitoSession(record)) {
           getTransportQueueStore().discardSessionQueueState(record.name);
@@ -1268,7 +1267,7 @@ async function detachTransportRuntimeSession(
   options: { preserveTransportQueue?: boolean } = {},
 ): Promise<void> {
   clearTransportResendAuthorityRetry(sessionName);
-  forgetTransportRelaySession(sessionName);
+  notifySessionTeardown(sessionName);
   const transportRuntime = transportRuntimes.get(sessionName);
   if (!transportRuntime) return;
   const providerSid = transportRuntime.providerSessionId;
