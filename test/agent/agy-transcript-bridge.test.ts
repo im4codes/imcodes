@@ -65,4 +65,15 @@ describe('AG native transcript event bridge',()=>{
    b.close();await appendFile(file,row(2));await new Promise(r=>setTimeout(r,100));expect(cb).toHaveBeenCalledTimes(2);
    expect(agyTranscriptFile(home,'../other')).toBeUndefined();expect(agyTranscriptFile('relative','id')).toBeUndefined();
  });
+ it('reattaches after the watched logs directory is replaced, including later appends',async()=>{
+   const home=await mkdtemp(path.join(tmpdir(),'imcodes-ag-native-'));roots.push(home);
+   const file=agyTranscriptFile(home,'rotated-directory')!;await mkdir(path.dirname(file),{recursive:true});
+   await writeFile(file,row(0));const cb=vi.fn(),b=new AgyTranscriptBridge(file,cb);bridges.push(b);await b.start();
+   await rename(path.dirname(file),path.dirname(file)+'.old');
+   await mkdir(path.dirname(file));await writeFile(file,row(1));
+   await vi.waitFor(()=>expect(cb).toHaveBeenCalledTimes(1),waitOpts);
+   await appendFile(file,row(2));await vi.waitFor(()=>expect(cb).toHaveBeenCalledTimes(2),waitOpts);
+   expect(cb.mock.calls.map(([r])=>r.step_index)).toEqual([1,2]);
+ });
+
 });

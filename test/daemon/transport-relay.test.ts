@@ -64,6 +64,7 @@ import {
   isSdkTurnLostRecovery,
   type TransportProvider,
 } from '../../src/agent/transport-provider.js';
+import { AgySubagentTracker } from '../../src/agent/agy-subagents.js';
 import { AgySdkProvider } from '../../src/agent/providers/agy-sdk.js';
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -1717,6 +1718,23 @@ describe('transport-relay (timeline-emitter based)', () => {
         toolCallId: 'todo-1',
         tool: 'update_plan',
       }));
+    });
+
+    it('keeps AG invocation title/child binding/terminal projections hidden and canonical', async () => {
+      const {provider,fireTool}=makeMockProvider();wireProviderToRelay(provider);
+      const tracker=new AgySubagentTracker('parent-native');
+      const launch={id:'ag-launch',name:'Run invoke_subagent {"Model":"inherit","Prompt":"work"}',status:'running' as const};
+      const start=tracker.tool(launch);
+      const bound=tracker.tool({...launch,status:'complete',output:JSON.stringify({conversationId:'child-native'})});
+      const terminal=tracker.snapshot({conversationId:'child-native',status:'completed'});
+      for(const event of [...start,...bound,...terminal]) fireTool('sess-agy',event);
+      await Promise.resolve();
+      const calls=emitMock.mock.calls.filter(c=>c[1]==='tool.call'||c[1]==='tool.result');
+      expect(calls).toHaveLength(3);
+      expect(calls.every(c=>c[3].hidden===true)).toBe(true);
+      expect(new Set(calls.map(c=>c[2].detail.meta.canonicalKey)).size).toBe(1);
+      expect(calls.at(-1)?.[2].detail.meta).toMatchObject({agentPath:'child-native',terminal:true});
+      expect(appendMock).not.toHaveBeenCalled();
     });
 
     it('emits hidden tool.call for running SDK sub-agent snapshots', async () => {

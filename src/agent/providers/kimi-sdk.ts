@@ -666,7 +666,8 @@ export class KimiSdkProvider implements TransportProvider {
   }
 
   private async startAgyBridge(sessionId: string, state: KimiSdkSessionState, childId?: string): Promise<void> {
-    if (this.id !== AGY_SDK_PROVIDER_ID || !state.acpSessionId) return;
+    if (this.id !== AGY_SDK_PROVIDER_ID || !state.acpSessionId
+      || this.sessions.get(sessionId) !== state || state.cancelled || state.stoppedByCancel) return;
     const id = childId ?? state.acpSessionId;
     const bridges = state.agyBridges ??= new Map();
     const existing = bridges.get(id);
@@ -683,9 +684,21 @@ export class KimiSdkProvider implements TransportProvider {
     if (this.sessions.get(sessionId) !== state || state.cancelled) bridge.close();
   }
 
+  private publishAgySubagents(sessionId: string, state: KimiSdkSessionState, events: ToolCallEvent[]): void {
+    for (const event of events) {
+      for (const cb of this.toolCallCallbacks) cb(sessionId, event);
+      const id = event.detail?.meta?.agentPath;
+      // A native result/snapshot, not a caller-supplied send_message target,
+      // authorizes observing a child's transcript. Retain cursors on reuse.
+      if (typeof id !== 'string' || id === state.acpSessionId || !state.agySubagents?.isNativeChild(id)) continue;
+      if (event.detail?.meta?.active) void this.startAgyBridge(sessionId, state, id);
+      else state.agyBridges?.get(id)?.close();
+    }
+  }
+
   private handleAgyTranscriptRow(sessionId: string, state: KimiSdkSessionState, nativeId: string, row: AgyTranscriptRow): void {
     const tracker = state.agySubagents ??= new AgySubagentTracker(state.acpSessionId ?? sessionId);
-    const publish = (events: ToolCallEvent[]) => { for (const event of events) for (const cb of this.toolCallCallbacks) cb(sessionId, event); };
+    const publish = (events: ToolCallEvent[]) => this.publishAgySubagents(sessionId, state, events);
     if (nativeId !== state.acpSessionId) {
       if (row.type === 'PLANNER_RESPONSE' && row.content?.trim() && !row.tool_calls?.length) {
         publish(tracker.snapshot({conversationId:nativeId,status:'completed',stateDetail:row.content}, 'native_completion'));
@@ -710,10 +723,6 @@ export class KimiSdkProvider implements TransportProvider {
         const events = tracker.tool({id:toolId,name:nativeTool.name,input:pending?.input ?? nativeTool.input,
           status:pending?.status === 'error' ? 'error' : 'complete',output:row.content});
         publish(events);
-        for (const event of events) {
-          const childId = event.detail?.meta?.agentPath;
-          if (typeof childId === 'string' && childId !== toolId && event.detail?.meta?.active) void this.startAgyBridge(sessionId,state,childId);
-        }
       }
     }
     if (row.type === 'USER_INPUT' || claimedByForeground) state.agyReactive = false;
@@ -2007,9 +2016,8 @@ export class KimiSdkProvider implements TransportProvider {
     }
     const updateRecord = update as unknown as Record<string, unknown>;
     if (this.id === AGY_SDK_PROVIDER_ID && isSdkRuntimeSubagentEventName(updateRecord.sessionUpdate)) {
-      for (const event of (state.agySubagents ??= new AgySubagentTracker(state.acpSessionId ?? routeId)).snapshot(updateRecord)) {
-        for (const cb of this.toolCallCallbacks) cb(routeId, event);
-      }
+      this.publishAgySubagents(routeId, state,
+        (state.agySubagents ??= new AgySubagentTracker(state.acpSessionId ?? routeId)).snapshot(updateRecord));
       return;
     }
     if (this.profile.runtimeSubagent && isSdkRuntimeSubagentEventName(updateRecord.sessionUpdate)) {
@@ -2154,9 +2162,8 @@ export class KimiSdkProvider implements TransportProvider {
     if (this.id === AGY_SDK_PROVIDER_ID) {
       const child = parseSdkRuntimeSubagentTag(chunkText);
       if (child) {
-        for (const event of (state.agySubagents ??= new AgySubagentTracker(state.acpSessionId ?? sessionId)).snapshot(child)) {
-          for (const cb of this.toolCallCallbacks) cb(sessionId, event);
-        }
+        this.publishAgySubagents(sessionId, state,
+          (state.agySubagents ??= new AgySubagentTracker(state.acpSessionId ?? sessionId)).snapshot(child));
         return;
       }
       if (startsWithSdkRuntimeSubagentTag(chunkText)) return;
@@ -2229,7 +2236,6 @@ export class KimiSdkProvider implements TransportProvider {
       rawInput: update.rawInput,
       rawOutput: update.rawOutput,
     };
-    if (this.id === AGY_SDK_PROVIDER_ID && /^(invokesubagent|browsersubagent|sendmessage|swarm)$/.test(normalizeAgyToolName(merged.title ?? ''))) this.useAgyNativeOutput(state);
     state.toolCalls.set(update.toolCallId, merged);
     this.emitMergedToolCall(sessionId, state, merged);
   }
@@ -2304,22 +2310,15 @@ export class KimiSdkProvider implements TransportProvider {
       },
     };
     if (this.id === AGY_SDK_PROVIDER_ID) {
+      if (/^(invokesubagent|browsersubagent|sendmessage|swarm)$/.test(normalizeAgyToolName(merged.title))) this.useAgyNativeOutput(state);
       const tracker = state.agySubagents ??= new AgySubagentTracker(state.acpSessionId ?? sessionId);
       const outputValue = merged.rawOutput !== undefined ? (typeof merged.rawOutput === 'string' ? merged.rawOutput : JSON.stringify(merged.rawOutput)) : evt.output;
       if (isAgySubagentTool(merged.title) && !state.agyConsumedNativeTools?.has(evt.id)) {
         (state.agyPendingNativeTools ??= new Map()).set(evt.id,evt);
       }
       const children = tracker.tool({ ...evt, ...(outputValue !== undefined ? { output: outputValue } : {}) });
-      // Reuse an already-known child observer on explicit send_message, retaining
-      // its native cursor. Never read an arbitrary peer id supplied as input.
-      if (normalizeAgyToolName(merged.title) === 'sendmessage' && evt.status === 'running') {
-        for (const child of children) {
-          const id = child.detail?.meta?.agentPath;
-          if (typeof id === 'string' && state.agyBridges?.has(id)) void this.startAgyBridge(sessionId,state,id);
-        }
-      }
       if (children.length) {
-        for (const child of children) for (const cb of this.toolCallCallbacks) cb(sessionId, child);
+        this.publishAgySubagents(sessionId, state, children);
         return;
       }
     }

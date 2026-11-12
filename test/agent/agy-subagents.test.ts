@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { AgySubagentTracker, isAgySubagentTool } from '../../src/agent/agy-subagents.js';
-import { SDK_SUBAGENT_STATUS as S } from '../../shared/sdk-subagent-status.js';
+import { SDK_SUBAGENT_DETAIL_KIND, SDK_SUBAGENT_STATUS as S } from '../../shared/sdk-subagent-status.js';
 describe('AG native child lifecycle adapter', () => {
   it('keeps canonical identity across launch, native id, snapshots, send, kill and late completion', () => {
     const t=new AgySubagentTracker('parent');
@@ -54,6 +54,44 @@ describe('AG native child lifecycle adapter', () => {
     const start=t.tool({id:'m',name:'invoke_subagent',status:'running',input});
     for(const [i,id] of ['native-one','native-two'].entries()) expect(t.tool({id:'m',name:'invoke_subagent',status:'complete',input,output:JSON.stringify({conversationId:id,status:'running'})})[0].id).toBe(start[i].id);
     expect(t.interrupt().map(e=>e.id)).toEqual(start.map(e=>e.id));
+  });
+
+  it.each(['Run invoke_subagent', 'Run invoke_subagent {"Model":"inherit","Prompt":"task"}', ' invoke_subagent '])('normalizes first and terminal-only packets for %s', name => {
+    const tracker = new AgySubagentTracker('parent');
+    const start = tracker.tool({id:'inline', name, status:'running'})[0];
+    expect(start?.detail?.kind).toBe(SDK_SUBAGENT_DETAIL_KIND);
+    const terminal = tracker.tool({id:'inline', name, status:'complete', output:JSON.stringify({conversationId:'child-inline'})})[0];
+    expect(terminal?.id).toBe(start.id);
+    expect(terminal?.detail?.meta).toMatchObject({agentPath:'child-inline', active:true});
+    const only = new AgySubagentTracker('parent');
+    const result = only.tool({id:'terminal-only', name, status:'complete', output:JSON.stringify({conversationId:'child-inline'})})[0];
+    expect(result?.detail?.kind).toBe(SDK_SUBAGENT_DETAIL_KIND);
+    expect(only.tool({id:'terminal-only', name, status:'running'})[0]?.id).toBe(result.id);
+  });
+  it.each([
+    'Created subagent: 12345678-1234-1234-1234-123456789abc',
+    'Conversation ID: 12345678-1234-1234-1234-123456789abc',
+    '12345678-1234-1234-1234-123456789abc',
+  ])('binds native launch identity from text: %s', output => {
+    const tracker = new AgySubagentTracker('parent');
+    const start = tracker.tool({id:'text-result', name:'Run invoke_subagent', status:'running', input:{Prompt:'work'}})[0];
+    const bound = tracker.tool({id:'text-result', name:'Run invoke_subagent', status:'complete', output})[0];
+    expect(bound.id).toBe(start.id);
+    expect(bound.detail?.meta?.agentPath).toBe('12345678-1234-1234-1234-123456789abc');
+  });
+  it('does not treat unrelated UUID text or input-only peer ids as a native launch result', () => {
+    const tracker = new AgySubagentTracker('parent');
+    const event = tracker.tool({id:'negative', name:'invoke_subagent', status:'complete', output:'Request correlation ID: 12345678-1234-1234-1234-123456789abc'})[0];
+    expect(event.detail?.meta?.agentPath).toBe('negative');
+  });
+  it('does not revive a terminal child when its launch running packet is duplicated', () => {
+    const tracker = new AgySubagentTracker('parent');
+    const launch = {id:'late', name:'invoke_subagent', status:'running' as const};
+    tracker.tool(launch);
+    tracker.tool({...launch, status:'complete', output:JSON.stringify({conversationId:'finished'})});
+    tracker.snapshot({conversationId:'finished',status:'completed'});
+    expect(tracker.tool(launch)[0]?.detail?.meta?.normalizedStatus).toBe(S.COMPLETE);
+    expect(tracker.tool({id:'new-send',name:'send_message',status:'running',input:{Recipient:'finished'}})[0].detail?.meta?.active).toBe(true);
   });
 
 });
