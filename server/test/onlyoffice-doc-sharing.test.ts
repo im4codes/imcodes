@@ -1933,6 +1933,65 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
     vi.restoreAllMocks();
   });
 
+  it('audit-r8: the first direct callback after restart must load PG commit sequence before comparing CAS', async () => {
+    const res = await app.request('/api/server/srv-1/onlyoffice/config?path=%2Fteam%2Fshared%2Fspec.docx&mode=edit', {
+      headers: { Authorization: bearer('owner-1') },
+    });
+    expect(res.status).toBe(200);
+    const cfg = (await res.json()) as any;
+    const key = cfg.config.document.key;
+    const cb = new URL(cfg.config.editorConfig.callbackUrl);
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response('first-force-save', { status: 200 }));
+    const save = () => {
+      const data = { status: 6, key, url: 'https://im.example.com/onlyoffice/cache/recover-direct.docx' };
+      return app.request(cb.pathname + cb.search, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...data, token: signJwt(data, 'onlyoffice-jwt-secret-key-test!!', 300) }),
+      });
+    };
+    expect((await save()).status).toBe(200);
+    expect(store.rooms.get('srv-1:/team/shared/spec.docx')!.commit_seq).toBeGreaterThan(0);
+    resetOnlyOfficeDocumentKeyCacheForTests();
+    vi.mocked(globalThis.fetch).mockImplementation(async () => new Response('second-force-save-after-restart', { status: 200 }));
+    const after = await save();
+    expect.soft(after.status, 'valid Document Server callback must recover directly without a prior browser config request').toBe(200);
+    expect.soft(Buffer.from(virtualFiles.get('/team/shared/spec.docx')!.content, 'base64').toString()).toBe('second-force-save-after-restart');
+  });
+
+  it('audit-r8: a transient PG room read error must not become absent state and reset a committed room epoch', async () => {
+    const get = () =>
+      app.request('/api/server/srv-1/onlyoffice/config?path=%2Fteam%2Fshared%2Fspec.docx&mode=edit', {
+        headers: { Authorization: bearer('owner-1') },
+      });
+    const first = await get();
+    expect(first.status).toBe(200);
+    const cfg = (await first.json()) as any;
+    const cb = new URL(cfg.config.editorConfig.callbackUrl);
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response('final-durable-revision', { status: 200 }));
+    const data = { status: 2, key: cfg.config.document.key, url: 'https://im.example.com/onlyoffice/cache/final-durable.docx' };
+    const saved = await app.request(cb.pathname + cb.search, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...data, token: signJwt(data, 'onlyoffice-jwt-secret-key-test!!', 300) }),
+    });
+    expect(saved.status).toBe(200);
+    const row = { ...store.rooms.get('srv-1:/team/shared/spec.docx')! };
+    expect(row.session_epoch).toBeGreaterThan(0);
+    resetOnlyOfficeDocumentKeyCacheForTests();
+    const query = store.db.queryOne.bind(store.db);
+    let injected = 0;
+    vi.spyOn(store.db, 'queryOne').mockImplementation(async (sql, params) => {
+      if (sql.includes('FROM onlyoffice_rooms') && injected++ === 0) throw new Error('audit transient PG room SELECT connection failure');
+      return query(sql, params);
+    });
+    const res = await get();
+    expect(injected).toBeGreaterThan(0);
+    expect.soft(res.status, 'failed authoritative read must fail closed, never return a fabricated editing config').toBeGreaterThanOrEqual(500);
+    const after = store.rooms.get('srv-1:/team/shared/spec.docx')!;
+    expect.soft(after.session_epoch, 'PG epoch must not be reset to zero after a read error').toBe(row.session_epoch);
+    expect.soft(after.active_key, 'PG active key must not be replaced with a fabricated initial key').toBe(row.active_key);
+  });
 });
 
 describe('Real Daemon CommandHandler Integration: Atomic Binary Save & Symlink Escape Prevention (F1 + F3d)', () => {

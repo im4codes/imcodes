@@ -175,22 +175,18 @@ async function loadPersistentRoomFromDb(
   normalizedPath: string,
 ): Promise<DocumentVersionState | null> {
   if (!db) return null;
-  try {
-    const row = await getOnlyOfficeRoomRecord(db, serverId, normalizedPath);
-    if (!row) return null;
-    return {
-      currentConfirmedHash: row.current_confirmed_hash,
-      committedHash: row.committed_hash,
-      lastForceSavedHash: row.last_force_saved_hash,
-      sessionEpoch: row.session_epoch,
-      commitSeq: row.commit_seq,
-      activeKey: row.active_key,
-      active: row.active,
-      updatedAt: row.updated_at,
-    };
-  } catch {
-    return null;
-  }
+  const row = await getOnlyOfficeRoomRecord(db, serverId, normalizedPath);
+  if (!row) return null;
+  return {
+    currentConfirmedHash: row.current_confirmed_hash,
+    committedHash: row.committed_hash,
+    lastForceSavedHash: row.last_force_saved_hash,
+    sessionEpoch: row.session_epoch,
+    commitSeq: row.commit_seq,
+    activeKey: row.active_key,
+    active: row.active,
+    updatedAt: row.updated_at,
+  };
 }
 
 async function savePersistentRoomToDb(
@@ -325,9 +321,7 @@ export async function resolveOnlyOfficeDocumentKey(
     const pendingMemoryHash = pendingCommitHashMap.get(mapKey);
     let journalEntry: OnlyOfficeCommitJournalRow | null = null;
     if (options?.db) {
-      try {
-        journalEntry = await getOnlyOfficeCommitJournalRecord(options.db, serverId, normalizedPath);
-      } catch { /* best effort */ }
+      journalEntry = await getOnlyOfficeCommitJournalRecord(options.db, serverId, normalizedPath);
     }
     const isPendingRoomWrite =
       (pendingMemoryHash && currentHash === pendingMemoryHash) ||
@@ -343,10 +337,8 @@ export async function resolveOnlyOfficeDocumentKey(
           existing.updatedAt = Date.now();
           documentVersionStateMap.set(mapKey, existing);
           if (options?.db) {
-            try {
-              await savePersistentRoomToDb(options.db, serverId, normalizedPath, existing);
-              await clearOnlyOfficeCommitJournalRecord(options.db, serverId, normalizedPath);
-            } catch { /* best effort */ }
+            await savePersistentRoomToDb(options.db, serverId, normalizedPath, existing);
+            await clearOnlyOfficeCommitJournalRecord(options.db, serverId, normalizedPath);
           }
         }
         return existing.activeKey;
@@ -359,9 +351,7 @@ export async function resolveOnlyOfficeDocumentKey(
           existing.updatedAt = Date.now();
           documentVersionStateMap.set(mapKey, existing);
           if (options?.db) {
-            try {
-              await savePersistentRoomToDb(options.db, serverId, normalizedPath, existing);
-            } catch { /* best effort */ }
+            await savePersistentRoomToDb(options.db, serverId, normalizedPath, existing);
           }
         }
         return existing.activeKey;
@@ -383,10 +373,8 @@ export async function resolveOnlyOfficeDocumentKey(
       };
       documentVersionStateMap.set(mapKey, newState);
       if (options?.db) {
-        try {
-          await savePersistentRoomToDb(options.db, serverId, normalizedPath, newState);
-          await clearOnlyOfficeCommitJournalRecord(options.db, serverId, normalizedPath);
-        } catch { /* best effort */ }
+        await savePersistentRoomToDb(options.db, serverId, normalizedPath, newState);
+        await clearOnlyOfficeCommitJournalRecord(options.db, serverId, normalizedPath);
       }
       return activeKey;
     }
@@ -404,12 +392,13 @@ export async function resolveOnlyOfficeDocumentKey(
     };
     documentVersionStateMap.set(mapKey, newState);
     if (options?.db) {
-      try {
-        await savePersistentRoomToDb(options.db, serverId, normalizedPath, newState);
-      } catch { /* best effort */ }
+      await savePersistentRoomToDb(options.db, serverId, normalizedPath, newState);
     }
     return activeKey;
-  } catch {
+  } catch (err) {
+    if (options?.db) {
+      throw err;
+    }
     return getOnlyOfficeDocumentKey(serverId, normalizedPath);
   }
 }
@@ -1276,10 +1265,15 @@ onlyofficeRoutes.get('/server/:id/onlyoffice/config', async (c): Promise<Respons
     actorName = 'External Collaborator';
   }
 
-  const documentKey = await resolveOnlyOfficeDocumentKey(serverId, normPath, {
-    allowedRoot: access.targetPath ?? undefined,
-    db: c.env.DB,
-  });
+  let documentKey: string;
+  try {
+    documentKey = await resolveOnlyOfficeDocumentKey(serverId, normPath, {
+      allowedRoot: access.targetPath ?? undefined,
+      db: c.env.DB,
+    });
+  } catch {
+    return c.json({ error: 1, message: 'durable_room_state_failed' }, 500);
+  }
 
   const docToken = signOnlyOfficeDocToken(
     {
@@ -1579,11 +1573,16 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
     }
 
     const mapKey = `${claims.serverId}:${claims.path}`;
+    let preCheckKey: string;
+    try {
+      preCheckKey = await resolveOnlyOfficeDocumentKey(claims.serverId, claims.path, {
+        allowedRoot: liveAccess.allowedRoot ?? undefined,
+        db: c.env.DB,
+      });
+    } catch {
+      return c.json({ error: 1, message: 'durable_room_state_failed' }, 500);
+    }
     const startCommitSeq = getDocumentCommitSeq(mapKey);
-    const preCheckKey = await resolveOnlyOfficeDocumentKey(claims.serverId, claims.path, {
-      allowedRoot: liveAccess.allowedRoot ?? undefined,
-      db: c.env.DB,
-    });
     if (claims.documentKey && preCheckKey !== claims.documentKey) {
       return c.json({ error: 1, message: 'stale_document_key' }, 409);
     }
@@ -1622,10 +1621,15 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
         return c.json({ error: 1, message: 'stale_document_commit_sequence' }, 409);
       }
 
-      const keyAtCommit = await resolveOnlyOfficeDocumentKey(claims.serverId, claims.path, {
-        allowedRoot: liveCommitAccess.allowedRoot ?? undefined,
-        db: c.env.DB,
-      });
+      let keyAtCommit: string;
+      try {
+        keyAtCommit = await resolveOnlyOfficeDocumentKey(claims.serverId, claims.path, {
+          allowedRoot: liveCommitAccess.allowedRoot ?? undefined,
+          db: c.env.DB,
+        });
+      } catch {
+        return c.json({ error: 1, message: 'durable_room_state_failed' }, 500);
+      }
       if (claims.documentKey && keyAtCommit !== claims.documentKey) {
         return c.json({ error: 1, message: 'stale_document_key' }, 409);
       }
@@ -1636,7 +1640,11 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
       const newDigest = createHash('sha256').update(bytes).digest('hex');
       let state = documentVersionStateMap.get(mapKey);
       if (!state && c.env.DB) {
-        state = (await loadPersistentRoomFromDb(c.env.DB, claims.serverId, claims.path)) ?? undefined;
+        try {
+          state = (await loadPersistentRoomFromDb(c.env.DB, claims.serverId, claims.path)) ?? undefined;
+        } catch {
+          return c.json({ error: 1, message: 'durable_room_state_failed' }, 500);
+        }
         if (state) {
           documentVersionStateMap.set(mapKey, state);
         }
