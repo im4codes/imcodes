@@ -46,11 +46,34 @@ describe('shortModelLabel', () => {
     expect(shortModelLabel('fable')).toBe('fable');
   });
 
-  it('preserves Qwen and compatible provider model labels', () => {
+  it('shortens Gemini and other multi-segment model IDs to their last two segments while preserving 2-segment labels', () => {
+    expect(shortModelLabel('gemini-4-hydrogen-high')).toBe('hydrogen-high');
+    expect(shortModelLabel('gemini-4-argon-high')).toBe('argon-high');
+    expect(shortModelLabel('gemini-4-hydrogen-medium')).toBe('hydrogen-medium');
+    expect(shortModelLabel('gemini-2.5-pro')).toBe('2.5-pro');
+    expect(shortModelLabel('google/gemini-4-hydrogen-high')).toBe('hydrogen-high');
     expect(shortModelLabel('coder-model')).toBe('coder-model');
-    expect(shortModelLabel('qwen3-coder-next')).toBe('qwen3-coder-next');
+    expect(shortModelLabel('qwen3-coder-next')).toBe('coder-next');
     expect(shortModelLabel('glm-4.7')).toBe('glm-4.7');
     expect(shortModelLabel('kimi-k2.5')).toBe('kimi-k2.5');
+    expect(shortModelLabel('minimax-m2.5-high')).toBe('m2.5-high');
+    expect(shortModelLabel('deepseek-v3.2-chat')).toBe('v3.2-chat');
+    expect(shortModelLabel('gpt-oss-120b-medium')).toBe('120b-medium');
+    expect(shortModelLabel('grok-build')).toBe('grok-build');
+    expect(shortModelLabel('grok-build-fast')).toBe('build-fast');
+  });
+
+  it('handles null/whitespace, [1m], and trailing date suffixes cleanly', () => {
+    expect(shortModelLabel(null)).toBeNull();
+    expect(shortModelLabel(undefined)).toBeNull();
+    expect(shortModelLabel('')).toBeNull();
+    expect(shortModelLabel('   ')).toBeNull();
+    expect(shortModelLabel('[1M]')).toBeNull();
+    expect(shortModelLabel('gemini-4-hydrogen-high[1m]')).toBe('hydrogen-high');
+    expect(shortModelLabel('gemini-4-hydrogen-high[1M]')).toBe('hydrogen-high');
+    expect(shortModelLabel('gemini-4-hydrogen-high-20260514')).toBe('hydrogen-high');
+    expect(shortModelLabel('gemini-4-hydrogen-high-2024-08-06')).toBe('hydrogen-high');
+    expect(shortModelLabel('gpt-5.4-mini-20260514')).toBe('5.4-mini');
   });
 });
 
@@ -93,8 +116,9 @@ describe('subSessionModelPresentation', () => {
     expect(subSessionModelPresentation(null, 'gemini-4-argon-high').label).toBe('argon-high');
     expect(subSessionModelPresentation('gpt-6.1-sol', 'gpt-5.4-mini').label).toBe('6.1-sol');
     expect(subSessionModelPresentation(null, '')).toEqual({ label: null, title: undefined });
-    // Non-sub-session consumers still get the original full Gemini label.
-    expect(bestModelLabel('gemini-4-argon-high')).toBe('gemini-4-argon-high');
-    expect(bestModelLabel('qwen3-coder-next')).toBe('qwen3-coder-next');
+    // Non-sub-session consumers also get the shortened last-two-segments label.
+    expect(bestModelLabel('gemini-4-hydrogen-high')).toBe('hydrogen-high');
+    expect(bestModelLabel('gemini-4-argon-high')).toBe('argon-high');
+    expect(bestModelLabel('qwen3-coder-next')).toBe('coder-next');
   });
 });

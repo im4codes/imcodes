@@ -133,6 +133,7 @@ import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/
 import { AGY_MODEL_IDS, CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions, normalizeClaudeCodeModelId } from '../../../src/shared/models/options.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, MUSE_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, clampTransportEffort, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
+import { shortModelLabel } from '../model-label.js';
 import { CUSTOM_PROVIDER_SDK_AGENT_TYPES } from '@shared/cc-presets.js';
 import { useTransportModels, supportsDynamicTransportModels } from '../hooks/useTransportModels.js';
 import { loadCodexModelPreference, loadLegacyCodexModelPreferenceForModelessSession, saveCodexModelPreference } from '../codex-model-preference.js';
@@ -6934,7 +6935,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               title={displayedClaudeModel ? `Model: ${displayedClaudeModel}` : 'Model: Unknown — tap to select'}
               style={{ color: displayedClaudeModel ? '#a78bfa' : '#6b7280', fontSize: 10 }}
             >
-              {displayedClaudeModel ?? 'unknown'}
+              {claudePinnedModel ? (shortModelLabel(claudePinnedModel) ?? claudePinnedModel) : (displayedClaudeModel ?? 'unknown')}
             </button>
             {modelOpen && renderModelDropdown(
               <>
@@ -6963,7 +6964,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               title={displayedCodexModel ? `Model: ${displayedCodexModel}` : 'Model: default — tap to select'}
               style={{ color: displayedCodexModel ? '#34d399' : '#6b7280', fontSize: 10 }}
             >
-              {displayedCodexModel ?? 'default'}
+              {shortModelLabel(displayedCodexModel) ?? displayedCodexModel ?? 'default'}
             </button>
             {modelOpen && renderModelDropdown(
               <>
@@ -7036,7 +7037,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               title={genericTransportModel ? `Model: ${genericTransportModel}` : 'Model: default — tap to select'}
               style={{ color: genericTransportModel ? '#34d399' : '#6b7280', fontSize: 10 }}
             >
-              {genericTransportModel ?? 'default'}
+              {shortModelLabel(genericTransportModel) ?? genericTransportModel ?? 'default'}
             </button>
             {modelOpen && renderModelDropdown(
               <>

@@ -2,8 +2,8 @@ import { bestModelLabel } from '../../src/shared/models/label.js';
 
 export { shortModelLabel, bestModelLabel } from '../../src/shared/models/label.js';
 
-/** Sub-session display only: keep selection/version priority and raw model IDs separate. */
-export function subSessionModelPresentation(...models: Array<string | null | undefined>): {
+/** Shared compact display helper: keep selection/version priority and raw model IDs separate. */
+export function formatModelPresentation(...models: Array<string | null | undefined>): {
   label: string | null;
   title: string | undefined;
 } {
@@ -14,3 +14,5 @@ export function subSessionModelPresentation(...models: Array<string | null | und
     title: [...new Set(fullModels)].join(' · ') || undefined,
   };
 }
+
+export const subSessionModelPresentation = formatModelPresentation;

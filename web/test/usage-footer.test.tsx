@@ -805,6 +805,27 @@ describe('UsageFooter', () => {
     expect(container.querySelector('.session-usage-footer')?.getAttribute('title')).toContain('Context: 0 / 922k (0.0%)');
   });
 
+  it('displays the last two segments for multi-segment Gemini models and keeps full ID in tooltip', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 10_000,
+          cacheTokens: 0,
+          contextWindow: 1_000_000,
+          model: 'gemini-4-hydrogen-high',
+        }}
+        sessionName="deck_test_agy"
+        agentType="agy-sdk"
+        modelOverride="gemini-4-hydrogen-high"
+      />,
+    );
+
+    const modelEl = container.querySelector('.session-usage-model');
+    expect(modelEl?.textContent).toBe('hydrogen-high');
+    expect(modelEl?.getAttribute('title')).toBe('gemini-4-hydrogen-high');
+    expect(container.querySelector('.session-usage-footer')?.getAttribute('title')).toContain('gemini-4-hydrogen-high');
+  });
+
   // ── Shell / script sessions are not "agents" ────────────────────────────────
   //
   // Regression: shell + script terminals fired session.state(running) on any

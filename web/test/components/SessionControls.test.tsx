@@ -10865,7 +10865,9 @@ afterEach(() => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: /^gemini-2.5-pro$/i }));
+    const modelBtn = screen.getByRole('button', { name: /^2\.5-pro$/i });
+    expect(modelBtn.getAttribute('title')).toBe('Model: gemini-2.5-pro');
+    fireEvent.click(modelBtn);
     const menu = document.querySelector('.menu-dropdown') as HTMLElement;
     fireEvent.click(within(menu).getByRole('button', { name: /auto/i }));
 
@@ -10929,7 +10931,9 @@ afterEach(() => {
       isAuthenticated: true,
     }));
 
-    fireEvent.click(screen.getByRole('button', { name: /^gemini-2.5-pro$/i }));
+    const modelBtn = screen.getByRole('button', { name: /^2\.5-pro$/i });
+    expect(modelBtn.getAttribute('title')).toBe('Model: gemini-2.5-pro');
+    fireEvent.click(modelBtn);
     const menu = document.querySelector('.menu-dropdown') as HTMLElement;
     expect(within(menu).getByRole('button', { name: /auto/i })).toBeDefined();
     fireEvent.click(within(menu).getByRole('button', { name: /gemini-2.5-flash/i }));
@@ -10978,7 +10982,9 @@ afterEach(() => {
       isAuthenticated: true,
     }));
 
-    fireEvent.click(screen.getByRole('button', { name: /^opencode\/pickle$/i }));
+    const modelBtn = screen.getByRole('button', { name: /^pickle$/i });
+    expect(modelBtn.getAttribute('title')).toBe('Model: opencode/pickle');
+    fireEvent.click(modelBtn);
     const menu = document.querySelector('.menu-dropdown') as HTMLElement;
     fireEvent.click(within(menu).getByRole('button', { name: /anthropic\/claude-sonnet-4-5/i }));
 
@@ -11018,7 +11024,9 @@ afterEach(() => {
       isAuthenticated: true,
     }));
 
-    fireEvent.click(screen.getByRole('button', { name: /^moonshot-v1-auto$/i }));
+    const modelBtn = screen.getByRole('button', { name: /^v1-auto$/i });
+    expect(modelBtn.getAttribute('title')).toBe('Model: moonshot-v1-auto');
+    fireEvent.click(modelBtn);
     const menu = document.querySelector('.menu-dropdown') as HTMLElement;
     fireEvent.click(within(menu).getByRole('button', { name: /moonshot-v1-auto,thinking/i }));
 
@@ -11189,7 +11197,9 @@ afterEach(() => {
   it('keeps the Antigravity footer dropdown populated when a refresh throws', () => {
     const ws = Object.assign(makeWs(), { requestTransportModels: () => { throw new Error('offline probe'); } });
     render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'agy-refresh-failed', agentType: AGY_SDK_PROVIDER_ID, runtimeType: 'transport', activeModel: 'gemini-3.8-flash-high' })} quickData={makeQuickData() as any} />);
-    fireEvent.click(screen.getByRole('button', { name: /^gemini-3\.8-flash-high$/i }));
+    const modelBtn = screen.getByRole('button', { name: /^flash$/i });
+    expect(modelBtn.getAttribute('title')).toBe('Model: gemini-3.8-flash-high');
+    fireEvent.click(modelBtn);
     const menu = document.querySelector('.menu-dropdown') as HTMLElement;
     expect(within(menu).getByRole('button', { name: /gemini-3\.8-flash-high/i })).toBeDefined();
   });
@@ -11224,7 +11234,9 @@ afterEach(() => {
       isAuthenticated: true,
     }));
 
-    fireEvent.click(screen.getByRole('button', { name: /^gemini-2\.5-pro$/i }));
+    const modelBtn = screen.getByRole('button', { name: /^2\.5-pro$/i });
+    expect(modelBtn.getAttribute('title')).toBe('Model: gemini-2.5-pro');
+    fireEvent.click(modelBtn);
     const menu = document.querySelector('.menu-dropdown') as HTMLElement;
     expect(within(menu).queryByRole('button', { name: /gemini-4-argon-medium/i })).toBeNull();
     expect(within(menu).getAllByRole('button')).toHaveLength(2);
@@ -11233,6 +11245,52 @@ afterEach(() => {
     expectSendPayload(ws, {
       sessionName: 'agy-sdk-session',
       text: '/model gemini-2.5-flash',
+    });
+  });
+
+  it('shortens long multi-segment agy-sdk model labels on the selector pill while keeping full IDs in title and /model commands', async () => {
+    const ws = makeWs();
+    const session = makeSession({
+      name: 'agy-long-model-session',
+      agentType: AGY_SDK_PROVIDER_ID,
+      runtimeType: 'transport',
+      activeModel: 'gemini-4-hydrogen-high',
+      requestedModel: 'gemini-4-hydrogen-high',
+    });
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={session}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const request = ws.send.mock.calls.find((call) => call[0]?.type === 'transport.list_models')?.[0];
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: AGY_SDK_PROVIDER_ID,
+      requestId: request?.requestId,
+      models: [
+        { id: 'gemini-4-hydrogen-high', name: 'Gemini 4 Hydrogen High' },
+        { id: 'gemini-4-argon-high', name: 'Gemini 4 Argon High' },
+      ],
+      defaultModel: 'gemini-4-hydrogen-high',
+      isAuthenticated: true,
+    }));
+
+    const pill = screen.getByRole('button', { name: /^hydrogen-high$/i });
+    expect(pill.getAttribute('title')).toBe('Model: gemini-4-hydrogen-high');
+    expect(session.activeModel).toBe('gemini-4-hydrogen-high');
+    expect(session.requestedModel).toBe('gemini-4-hydrogen-high');
+
+    fireEvent.click(pill);
+    const menu = document.querySelector('.menu-dropdown') as HTMLElement;
+    expect(within(menu).getByRole('button', { name: /gemini-4-hydrogen-high/i })).toBeDefined();
+    fireEvent.click(within(menu).getByRole('button', { name: /gemini-4-argon-high/i }));
+
+    expectSendPayload(ws, {
+      sessionName: 'agy-long-model-session',
+      text: '/model gemini-4-argon-high',
     });
   });
 

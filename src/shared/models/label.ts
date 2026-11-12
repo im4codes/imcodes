@@ -1,7 +1,23 @@
+function stripModelSuffixes(id: string): string {
+  return id
+    .replace(/\[1m\]/gi, '')
+    .trim()
+    .replace(/-\d{4}-\d{2}-\d{2}$/, '')
+    .replace(/[-_]\d{6,8}$/, '')
+    .trim();
+}
+
+function lastTwoSegments(id: string): string {
+  const parts = id.split(/[-\s]+/).filter(Boolean);
+  return parts.length > 0 ? parts.slice(-2).join('-') : id;
+}
+
 export function shortModelLabel(model?: string | null): string | null {
   const m = model?.trim();
   if (!m) return null;
-  const lower = m.toLowerCase();
+  const cleaned = stripModelSuffixes(m);
+  if (!cleaned) return null;
+  const lower = cleaned.toLowerCase();
 
   const claudeFamily =
     lower.includes('opus') ? 'opus'
@@ -15,13 +31,8 @@ export function shortModelLabel(model?: string | null): string | null {
     // family) or old-style `claude-3-5-sonnet` (digits BEFORE the family).
     // Capture at most major[-minor] so trailing date suffixes like
     // `-20260514` are not swallowed. `-`/`_` separators render as `.`.
-    // Strip a trailing release-date suffix first so a single-segment version
-    // like `claude-fable-5-20260609` reads as `fable-5`, not `fable-5.20260609`
-    // (multi-segment ids like opus-4-8 are already protected by the 2-segment
-    // capture, but single-segment ones would otherwise swallow the date).
-    const verSrc = lower.replace(/[-_]\d{6,8}$/, '');
-    const before = verSrc.match(new RegExp(`(\\d+(?:[-.]\\d+)?)[-_]${claudeFamily}`));
-    const after = verSrc.match(new RegExp(`${claudeFamily}[-_]?(\\d+(?:[-.]\\d+)?)`));
+    const before = lower.match(new RegExp(`(\\d+(?:[-.]\\d+)?)[-_]${claudeFamily}`));
+    const after = lower.match(new RegExp(`${claudeFamily}[-_]?(\\d+(?:[-.]\\d+)?)`));
     const ver = before?.[1] ?? after?.[1] ?? null;
     return ver ? `${claudeFamily}-${ver.replace(/[-_]/g, '.')}` : claudeFamily;
   }
@@ -36,26 +47,17 @@ export function shortModelLabel(model?: string | null): string | null {
   // gpt-6-luna, ...): show its last two dash-separated parts so both the
   // version and the variant survive; a bare `gpt-5.6` stays `gpt-5.6`.
   const gpt = lower.match(/\bgpt-\d[\w.-]*/);
-  if (gpt) {
-    const id = gpt[0].replace(/-\d{4}-\d{2}-\d{2}$/, '').replace(/[-_]\d{6,8}$/, '');
-    return id.split('-').filter(Boolean).slice(-2).join('-');
-  }
+  if (gpt) return lastTwoSegments(gpt[0]);
 
   const gem = lower.match(/\b(gemini[- ]\d[\w.-]*)\b/);
-  if (gem) return gem[1];
+  if (gem) return lastTwoSegments(gem[1]);
 
   if (lower === 'coder-model') return 'coder-model';
-  const qwen = m.match(/\b(qwen[\w.-]*)\b/i);
-  if (qwen) return qwen[1];
-  const glm = m.match(/\b(glm[\w.-]*)\b/i);
-  if (glm) return glm[1];
-  const kimi = m.match(/\b(kimi[\w.-]*)\b/i);
-  if (kimi) return kimi[1];
-  const minimax = m.match(/\b(minimax[\w.-]*)\b/i);
-  if (minimax) return minimax[1];
+  const compatFamily = cleaned.match(/\b((?:qwen|glm|kimi|minimax)[\w.-]*)\b/i);
+  if (compatFamily) return lastTwoSegments(compatFamily[1]);
 
-  const parts = m.split('-');
-  return parts[parts.length - 1] ?? m;
+  const unscoped = cleaned.split('/').pop()?.trim() || cleaned;
+  return lastTwoSegments(unscoped);
 }
 
 /**
