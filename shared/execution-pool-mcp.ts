@@ -8,6 +8,8 @@ import {
 import { getSessionRuntimeType } from './agent-types.js';
 import { resolvePeerAuditProviderFamily } from './peer-audit.js';
 import { normalizeSharedContextRuntimeBackend } from './shared-context-runtime-config.js';
+import { AGY_SDK_PROVIDER_ID, isAgyModelId } from './agy-agent.js';
+import { looksLikeCodexModelId } from '../src/shared/models/options.js';
 
 export const EXECUTION_POOL_MCP_TOOLS = {
   GET: 'execution_pool_get',
@@ -44,11 +46,20 @@ export function executionPoolEntryFromConfig(config: SupervisionExecutionConfig)
 
 export function configFromExecutionPoolEntry(entry: ExecutionPoolMcpEntry): SupervisionExecutionConfig {
   const rawProvider = entry.provider.trim();
-  const agentType = normalizeSharedContextRuntimeBackend(rawProvider)
-    ?? ({ anthropic: 'claude-code-sdk', openai: 'codex', google: 'gemini', qwen: 'qwen', deepseek: 'deepseek' } as Record<string, string>)[rawProvider.toLowerCase()]
-    ?? rawProvider;
-  const model = normalizeSupervisionExecutionModel(agentType, entry.model.trim());
-  const providerFamily = resolvePeerAuditProviderFamily({ agentType });
+  const rawModel = entry.model.trim();
+  const lowerProvider = rawProvider.toLowerCase();
+  let agentType: string;
+  if (lowerProvider === 'agy' || lowerProvider === AGY_SDK_PROVIDER_ID || lowerProvider === 'google' || isAgyModelId(rawModel)) {
+    agentType = AGY_SDK_PROVIDER_ID;
+  } else if (lowerProvider === 'openai' && (looksLikeCodexModelId(rawModel) || rawModel.includes('sol') || rawModel.includes('luna'))) {
+    agentType = 'codex-sdk';
+  } else {
+    agentType = normalizeSharedContextRuntimeBackend(rawProvider)
+      ?? ({ anthropic: 'claude-code-sdk', openai: 'codex', google: 'gemini', qwen: 'qwen', deepseek: 'deepseek' } as Record<string, string>)[lowerProvider]
+      ?? rawProvider;
+  }
+  const model = normalizeSupervisionExecutionModel(agentType, rawModel);
+  const providerFamily = resolvePeerAuditProviderFamily({ agentType, providerId: rawProvider });
   const runtimeType = getSessionRuntimeType(agentType);
   const base = { agentType, providerFamily, runtimeType, model,
     ...(entry.role !== 'both' ? { role: entry.role } : {}) };

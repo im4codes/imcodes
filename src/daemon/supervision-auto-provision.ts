@@ -1,5 +1,6 @@
 import { TASK_PAIR_SESSION_ID_PREFIX } from '../../shared/task-pair.js';
 import { createHash } from 'node:crypto';
+import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { identityContentHash } from '../util/identity-prompt-hash.js';
 import {
   DELEGATION_AVAILABILITY,
@@ -207,7 +208,10 @@ export function configMatchesSession(
   identityPrompt?: string,
 ): boolean {
   const model = resolveEffectiveSessionModel(session);
-  return session.agentType === config.agentType
+  const isAgy = (t?: string) => t === AGY_SDK_PROVIDER_ID || t === 'agy';
+  const agentTypeMatches = session.agentType === config.agentType
+    || (isAgy(session.agentType) && isAgy(config.agentType));
+  return agentTypeMatches
     && (session.runtimeType ?? 'process') === config.runtimeType
     && resolvePeerAuditProviderFamily(session) === config.providerFamily
     && typeof model === 'string'

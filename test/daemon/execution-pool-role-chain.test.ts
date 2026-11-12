@@ -116,6 +116,111 @@ describe('owner preference HTTP → SQLite mirror → MCP → automatic pool sel
     } finally { sql.close(); }
   });
 
+  it('stably persists agy executor and codex-sdk sol auditor roles and enforces scheduler selection priority', async () => {
+    const { sql, mcp } = await stack();
+    try {
+      const entries = [
+        { model: 'gemini-3.8-flash-high', provider: 'agy-sdk', role: 'executor' as const },
+        { model: 'gpt-6.1-sol', provider: 'codex-sdk', role: 'auditor' as const },
+        { model: 'sonnet', provider: 'claude-code-sdk', role: 'both' as const },
+      ];
+      const setResult = await mcp.execution_pool_set({ entries });
+      expect(setResult).toMatchObject({
+        status: 'ok',
+        entries: [
+          { model: 'gemini-3.8-flash-high', role: 'executor' },
+          { model: 'gpt-6.1-sol', role: 'auditor' },
+          { model: 'sonnet', role: 'both' },
+        ],
+      });
+
+      await refreshSupervisorDefaultsCache();
+      __setCachedSupervisorDefaultsForTests(null);
+      __reloadSupervisorDefaultsCacheFromDiskForTests();
+
+      const getResult = await mcp.execution_pool_get();
+      expect(getResult).toMatchObject({
+        status: 'ok',
+        entries: [
+          { model: 'gemini-3.8-flash-high', role: 'executor' },
+          { model: 'gpt-6.1-sol', role: 'auditor' },
+          { model: 'sonnet', role: 'both' },
+        ],
+      });
+
+      const currentDefaults = getCachedSupervisorDefaults()!;
+      const parent = {
+        name: brain,
+        role: 'brain',
+        agentType: 'agy-sdk',
+        projectName: 'e2e_poolroles',
+        transportConfig: { supervision: { executionPools: currentDefaults.executionPools } },
+      } as SessionRecord;
+
+      const agWorker = {
+        ...parent,
+        name: 'deck_sub_ag10',
+        parentSession: brain,
+        agentType: 'agy-sdk',
+        runtimeType: 'transport',
+        providerId: 'google',
+        role: 'w1',
+        state: 'idle',
+        activeModel: 'gemini-3.8-flash-high',
+        sessionInstanceId: 'i1',
+        runtimeEpoch: 'r1',
+        updatedAt: 100,
+      } as SessionRecord;
+
+      const solWorker = {
+        ...parent,
+        name: 'deck_sub_sol',
+        parentSession: brain,
+        agentType: 'codex-sdk',
+        runtimeType: 'transport',
+        providerId: 'openai',
+        role: 'w2',
+        state: 'idle',
+        activeModel: 'gpt-6.1-sol',
+        sessionInstanceId: 'i2',
+        runtimeEpoch: 'r2',
+        updatedAt: 100,
+      } as SessionRecord;
+
+      const unconstrainedWorker = {
+        ...parent,
+        name: 'deck_sub_sonnet',
+        parentSession: brain,
+        agentType: 'claude-code-sdk',
+        runtimeType: 'transport',
+        providerId: 'anthropic',
+        role: 'w3',
+        state: 'idle',
+        activeModel: 'sonnet',
+        sessionInstanceId: 'i3',
+        runtimeEpoch: 'r3',
+        updatedAt: 50, // older idle time than agWorker / solWorker
+      } as SessionRecord;
+
+      const sessions = [parent, agWorker, solWorker, unconstrainedWorker];
+      const deps = {
+        listSessions: () => sessions,
+        getSession: (name: string) => sessions.find((s) => s.name === name),
+        hasPendingMessages: () => false,
+      };
+
+      // Single-role executor comes first ahead of unconstrained worker
+      const executorCandidates = listTaskPairCandidates({ brain, role: 'executor', pool: 'primary', exclude: new Set() }, deps);
+      expect(executorCandidates.map((s) => s.name)).toEqual(['deck_sub_ag10', 'deck_sub_sonnet']);
+
+      // Single-role auditor comes first ahead of unconstrained worker
+      const auditorCandidates = listTaskPairCandidates({ brain, role: 'auditor', pool: 'primary', exclude: new Set() }, deps);
+      expect(auditorCandidates.map((s) => s.name)).toEqual(['deck_sub_sol', 'deck_sub_sonnet']);
+    } finally {
+      sql.close();
+    }
+  });
+
   it.runIf(!!process.env.IMC_POOL_ROLE_BROWSER_URL)('real browser selection/save/reload uses the same owner HTTP preference and MCP reader', async () => {
     const { app, sql, mcp } = await stack();
     const require = createRequire(resolve('web/package.json'));

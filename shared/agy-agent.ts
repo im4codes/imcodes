@@ -102,6 +102,22 @@ export const AGY_FALLBACK_MODEL_IDS = [
 
 export const AGY_DEFAULT_MODEL_ID = 'gemini-3.8-flash-high' as const;
 
+/**
+ * True when `model` is an Antigravity/AGY model (gemini-3.8-flash-*, gemini-4-argon-*,
+ * or an explicit agy fallback/alias model id).
+ */
+export function isAgyModelId(model: string | null | undefined): boolean {
+  const trimmed = model?.trim().toLowerCase();
+  if (!trimmed) return false;
+  if (trimmed === 'agy' || trimmed === AGY_SDK_PROVIDER_ID) return true;
+  if (/^gemini-(?:4-argon|3\.8-flash)(?:-(?:high|medium|low))?$/i.test(trimmed)) return true;
+  if (/^gemini-(?:4|3\.8)(?:$|[-_.])/i.test(trimmed)) return true;
+  if (/^gemini-(?:flash|argon)(?:$|[-_.])/i.test(trimmed)) return true;
+  return false;
+}
+
+export const looksLikeAgyModelId = isAgyModelId;
+
 /** Persisted evidence for AG's lazy native-conversation creation. Missing means
  * unknown, NOT unused. STARTED is monotone for one provider route. */
 export const AGY_NATIVE_SESSION_STATE = {

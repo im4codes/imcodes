@@ -25,6 +25,30 @@ describe('execution pool MCP tools', () => {
     expect(result).toMatchObject({ status: 'ok', entries: [{ role: 'auditor' }], auditByDefault: true, concurrencyCap: 4 });
     expect(setDefaults).toHaveBeenCalledOnce();
   });
+  it('sets gemini-3.8-flash-high executor and gpt-6.1-sol auditor entries and maps to modern transport runtimes', async () => {
+    let saved = defaults();
+    const setDefaults = vi.fn(async (_caller, mutate) => { saved = mutate(saved); return saved; });
+    const handlers = createExecutionPoolMcpToolHandlers(caller, { getDefaults: () => saved, setDefaults, isProjectBrain: () => true });
+    const result = await handlers.execution_pool_set({
+      entries: [
+        { model: 'gemini-3.8-flash-high', provider: 'google', role: 'executor' },
+        { model: 'gpt-6.1-sol', provider: 'openai', role: 'auditor' },
+      ],
+      autoPairingEnabled: true,
+    });
+    expect(result).toMatchObject({
+      status: 'ok',
+      entries: [
+        { model: 'gemini-3.8-flash-high', role: 'executor' },
+        { model: 'gpt-6.1-sol', role: 'auditor' },
+      ],
+      autoPairingEnabled: true,
+    });
+    expect(saved.executionPools.primaryDevelopmentPool.configs).toMatchObject([
+      { agentType: 'agy-sdk', providerFamily: 'google', runtimeType: 'transport', model: 'gemini-3.8-flash-high', role: 'executor' },
+      { agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport', model: 'gpt-6.1-sol', role: 'auditor' },
+    ]);
+  });
   it('reports persistence failure rather than projecting an unsaved role as success', async () => {
     const handlers = createExecutionPoolMcpToolHandlers(caller, {
       getDefaults: defaults, setDefaults: async () => null, isProjectBrain: () => true,

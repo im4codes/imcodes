@@ -29,6 +29,7 @@ import {
 import { resolvePeerAuditProviderFamily } from '../../../shared/peer-audit.js';
 import { getSessionRuntimeType } from '../../../shared/agent-types.js';
 import { inferSharedContextRuntimeBackend } from '../../../shared/shared-context-runtime-config.js';
+import { AGY_SDK_PROVIDER_ID, isAgyModelId } from '../../../shared/agy-agent.js';
 import {
   SUPERVISION_DEFAULT_EXCLUDED_DEVELOPMENT_SESSIONS,
   SUPERVISION_EXECUTION_SELECTION_SOURCES,
@@ -216,7 +217,7 @@ export function describeRequestedModelMiss(requestedModel: string): string {
 }
 
 /** A named model (`executormodel=`/`auditormodel=`) matches by exact id, case-insensitively. */
-function sameModelId(a: string | null | undefined, b: string): boolean {
+export function sameModelId(a: string | null | undefined, b: string): boolean {
   return !!a && a.toLowerCase() === b.toLowerCase();
 }
 
@@ -295,6 +296,9 @@ export function listTaskPairCandidates(input: {
       if (!input.requestedModel) {
         const ar = poolConfigOf(a);
         const br = poolConfigOf(b);
+        const aRole = ar?.role === input.role ? 0 : 1;
+        const bRole = br?.role === input.role ? 0 : 1;
+        if (aRole !== bRole) return aRole - bRole;
         const tier = (ar ? supervisionTierPriority(ar, input.role) : 99)
           - (br ? supervisionTierPriority(br, input.role) : 99);
         if (tier !== 0) return tier;
@@ -349,7 +353,12 @@ export function describeAuditorPoolGap(input: {
  * known backend at all (an unsupported/unrecognized model id).
  */
 export function resolveRequestedModelProvisionConfig(requestedModel: string): SupervisionExecutionConfig | undefined {
-  const agentType = inferSharedContextRuntimeBackend(requestedModel);
+  let agentType: string | undefined;
+  if (isAgyModelId(requestedModel)) {
+    agentType = AGY_SDK_PROVIDER_ID;
+  } else {
+    agentType = inferSharedContextRuntimeBackend(requestedModel);
+  }
   if (!agentType) return undefined;
   const providerFamily = resolvePeerAuditProviderFamily({ agentType });
   const runtimeType = getSessionRuntimeType(agentType);
@@ -385,7 +394,12 @@ export function roleEligibleProvisionConfig(input: {
   if (matches.length === 0) {
     return input.requestedModel ? resolveRequestedModelProvisionConfig(input.requestedModel) : undefined;
   }
-  const ordered = [...matches].sort((a, b) => supervisionTierPriority(a, input.role) - supervisionTierPriority(b, input.role));
+  const ordered = [...matches].sort((a, b) => {
+    const aRole = a.role === input.role ? 0 : 1;
+    const bRole = b.role === input.role ? 0 : 1;
+    if (aRole !== bRole) return aRole - bRole;
+    return supervisionTierPriority(a, input.role) - supervisionTierPriority(b, input.role);
+  });
   if (!input.avoidProviderFamily) return ordered[0];
   return ordered.find((config) => config.providerFamily !== input.avoidProviderFamily) ?? ordered[0];
 }

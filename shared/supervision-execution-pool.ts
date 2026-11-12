@@ -20,6 +20,7 @@ export type SupervisionExecutionPoolRole = typeof SUPERVISION_EXECUTION_POOL_ROL
 export const SUPERVISION_TIER_PAIRS = [
   { providerFamily: 'openai', executor: 'gpt-6-luna', auditor: 'gpt-6-sol', secondaryLaunchModel: 'gpt-6-sol' },
   { providerFamily: 'anthropic', executor: 'claude-haiku', auditor: 'claude-sonnet', secondaryLaunchModel: 'sonnet' },
+  { providerFamily: 'google', executor: 'gemini-flash', auditor: 'gemini-flash', secondaryLaunchModel: 'gemini-3.8-flash-high' },
   // No launchable id can be inferred for DeepSeek's secondary model, so a session for it cannot be created automatically.
   { providerFamily: 'deepseek', executor: 'deepseek-flash', auditor: 'deepseek-pro', secondaryLaunchModel: undefined },
 ] as const;
@@ -53,6 +54,9 @@ function matchesTierModel(model: string, tierModel: string): boolean {
   if (tierModel === 'claude-sonnet') return normalized.includes('sonnet');
   if (tierModel === 'deepseek-flash') return normalized.includes('deepseek') && normalized.includes('flash');
   if (tierModel === 'deepseek-pro') return normalized.includes('deepseek') && (normalized.includes('pro') || normalized.includes('reasoner'));
+  if (tierModel === 'gemini-flash') return normalized.includes('gemini') && (normalized.includes('flash') || normalized.includes('argon'));
+  if (tierModel === 'gpt-6-sol') return normalized.includes('sol');
+  if (tierModel === 'gpt-6-luna') return normalized.includes('luna');
   return normalized.includes(modelFamily(tierModel));
 }
 
@@ -444,8 +448,33 @@ function normalizePool(value: unknown, kind: SupervisionExecutionPoolKind): Supe
       byCapability.set(item.capabilityId, { ...item, role: mergedRole });
     }
   }
+  // Modern transport runtimes supersede legacy process runtimes for the same
+  // provider family, model, and preset (e.g. transport:codex-sdk supersedes process:codex,
+  // transport:agy-sdk supersedes process:gemini).
+  // An explicit role on either is preserved, giving preference to the transport role.
+  const entries = [...byCapability.values()];
+  const processIndicesToDrop = new Set<number>();
+  for (let i = 0; i < entries.length; i++) {
+    const item = entries[i]!;
+    if (item.runtimeType !== 'process') continue;
+    const transportEntry = entries.find((e) => (
+      e.runtimeType === 'transport'
+      && e.providerFamily === item.providerFamily
+      && e.model === item.model
+      && e.ccPresetId === item.ccPresetId
+    ));
+    if (transportEntry) {
+      processIndicesToDrop.add(i);
+      if (transportEntry.role === undefined && item.role !== undefined) {
+        transportEntry.role = item.role;
+      } else if (transportEntry.role !== undefined && item.role !== undefined && transportEntry.role !== item.role) {
+        delete transportEntry.role;
+      }
+    }
+  }
+  const finalConfigs = entries.filter((_, idx) => !processIndicesToDrop.has(idx));
   return {
-    configs: [...byCapability.values()],
+    configs: finalConfigs,
     controls: {
       maxConcurrency: positive(controls.maxConcurrency, DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS[kind].maxConcurrency),
       maxSpawned: positive(controls.maxSpawned, DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS[kind].maxSpawned),

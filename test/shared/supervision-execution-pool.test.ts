@@ -57,6 +57,36 @@ describe('supervision execution pools', () => {
     expect(normalized.primaryDevelopmentPool.configs[0]?.role).toBe('executor');
   });
 
+  it('supersedes legacy process runtime when modern transport runtime exists for the same model, preserving explicit role', () => {
+    const legacySolProcess: SupervisionExecutionConfig = {
+      agentType: 'codex',
+      providerFamily: 'openai',
+      runtimeType: 'process',
+      model: 'gpt-6.1-sol',
+      capabilityId: buildSupervisionExecutionCapabilityId({ agentType: 'codex', providerFamily: 'openai', runtimeType: 'process', model: 'gpt-6.1-sol' }),
+    };
+    const modernSolTransport: SupervisionExecutionConfig = {
+      agentType: 'codex-sdk',
+      providerFamily: 'openai',
+      runtimeType: 'transport',
+      model: 'gpt-6.1-sol',
+      role: 'auditor',
+      capabilityId: buildSupervisionExecutionCapabilityId({ agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport', model: 'gpt-6.1-sol' }),
+    };
+    const normalized = normalizeSupervisionExecutionPools({
+      state: 'configured',
+      primaryDevelopmentPool: { configs: [legacySolProcess, modernSolTransport] },
+      economyTaskPool: { configs: [] },
+    });
+    expect(normalized.primaryDevelopmentPool.configs).toHaveLength(1);
+    expect(normalized.primaryDevelopmentPool.configs[0]).toMatchObject({
+      agentType: 'codex-sdk',
+      runtimeType: 'transport',
+      model: 'gpt-6.1-sol',
+      role: 'auditor',
+    });
+  });
+
   it('resolves the ordered Luna/Sol tier before lower-priority families', () => {
     const entries = [
       config('deepseek-sdk', 'deepseek', 'deepseek-pro'),

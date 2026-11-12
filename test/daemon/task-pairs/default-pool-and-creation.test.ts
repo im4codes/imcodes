@@ -67,11 +67,12 @@ const marker = (over: Partial<TaskPairCreatedSessionMetadata> = {}): TaskPairCre
 describe('the secondary tier per provider family comes from one shared table', () => {
   it('maps anthropic -> sonnet, openai -> gpt-6-sol, deepseek -> pro, and only the secondary model counts', () => {
     expect(SUPERVISION_TIER_PAIRS.map((tier) => [tier.providerFamily, tier.auditor])).toEqual([
-      ['openai', 'gpt-6-sol'], ['anthropic', 'claude-sonnet'], ['deepseek', 'deepseek-pro'],
+      ['openai', 'gpt-6-sol'], ['anthropic', 'claude-sonnet'], ['google', 'gemini-flash'], ['deepseek', 'deepseek-pro'],
     ]);
     expect(supervisionSecondaryModelOfFamily('anthropic')).toBe('claude-sonnet');
     expect(supervisionSecondaryLaunchModelOfFamily('anthropic')).toBe('sonnet');
     expect(supervisionSecondaryLaunchModelOfFamily('openai')).toBe('gpt-6-sol');
+    expect(supervisionSecondaryLaunchModelOfFamily('google')).toBe('gemini-3.8-flash-high');
     expect(supervisionSecondaryLaunchModelOfFamily('deepseek')).toBeUndefined();
     const check = (brainFamily: string, targetFamily: string, targetModel: string) => isDefaultSecondaryTierTarget({ brainFamily, targetFamily, targetModel });
     expect(check('anthropic', 'anthropic', 'claude-sonnet-5')).toBe(true);
@@ -80,6 +81,8 @@ describe('the secondary tier per provider family comes from one shared table', (
     expect(check('anthropic', 'openai', 'gpt-6-sol')).toBe(false); // another vendor
     expect(check('openai', 'openai', 'gpt-6-sol')).toBe(true);
     expect(check('openai', 'openai', 'gpt-6-luna')).toBe(false);
+    expect(check('google', 'google', 'gemini-3.8-flash-high')).toBe(true);
+    expect(check('google', 'google', 'gemini-4-argon-medium')).toBe(true);
     expect(check('unknown', 'unknown', 'claude-sonnet-5')).toBe(false); // a family without a tier row has no default
   });
 });
@@ -317,6 +320,17 @@ describe('creation: one deterministic rule', () => {
     const withModel = await ensurePairSessions({ ...base, auditor: 'none', createExecutor: { model: 'gpt-6-sol' } }, w.deps);
     expect(withModel).toMatchObject({ ok: true });
     expect(w.calls[0]!.model).toBe('gpt-6-sol');
+    const withGemini = await ensurePairSessions({ ...base, auditor: 'none', createExecutor: { model: 'gemini-3.8-flash-high' } }, w.deps);
+    expect(withGemini).toMatchObject({ ok: true });
+    expect(w.calls[1]!.model).toBe('gemini-3.8-flash-high');
+    const withArgon = await ensurePairSessions({ ...base, auditor: 'none', createExecutor: { model: 'gemini-4-argon-medium' } }, w.deps);
+    expect(withArgon).toMatchObject({ ok: true });
+    expect(w.calls[2]!.model).toBe('gemini-4-argon-medium');
+    const googleBrain = brainRecord({ agentType: 'agy-sdk' });
+    expect(resolveCreationConfig(googleBrain, undefined)).toMatchObject({
+      ok: true,
+      config: { providerFamily: 'google', model: 'gemini-3.8-flash-high', agentType: 'agy-sdk', runtimeType: 'transport' },
+    });
     expect(await ensurePairSessions({ ...base, executor: 'deck_sub_x', createExecutor: {} }, w.deps)).toMatchObject({ ok: false, error: expect.stringContaining('createExecutor cannot be combined') });
     expect(await ensurePairSessions({ ...base, auditorModel: 'opus', createAuditor: {} }, w.deps)).toMatchObject({ ok: false, error: expect.stringContaining('createAuditor cannot be combined') });
     expect(await ensurePairSessions({ ...base, auditor: 'none', createExecutor: { model: 'no-such-model-xyz' } }, world([brainRecord()]).deps)).toMatchObject({ ok: false, error: expect.stringContaining('cannot be launched') });
