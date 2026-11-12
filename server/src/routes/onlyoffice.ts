@@ -150,13 +150,18 @@ export function resolveOnlyOfficeJwtSecret(env: Pick<Env, 'ONLYOFFICE_JWT_SECRET
 }
 
 interface DocumentVersionState {
-  committedHash: string;
-  lastForceSavedHash: string | null;
+  currentConfirmedHash?: string;
+  committedHash?: string;
+  lastForceSavedHash?: string | null;
   sessionEpoch: number;
   commitSeq: number;
   activeKey: string;
   active?: boolean;
   updatedAt: number;
+}
+
+function getAuthoritativeHash(state: DocumentVersionState): string {
+  return state.currentConfirmedHash || state.lastForceSavedHash || state.committedHash || '';
 }
 
 const ROOMS_STORE_PATH = path.join(os.tmpdir(), '.imcodes-onlyoffice-rooms.json');
@@ -204,13 +209,11 @@ function loadCommitJournal(): Record<string, CommitJournalEntry> {
 }
 
 function recordCommitJournal(mapKey: string, entry: CommitJournalEntry): void {
-  try {
-    const data = loadCommitJournal();
-    data[mapKey] = entry;
-    const tmp = `${JOURNAL_STORE_PATH}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(data), 'utf8');
-    fs.renameSync(tmp, JOURNAL_STORE_PATH);
-  } catch { /* best effort recovery record */ }
+  const data = loadCommitJournal();
+  data[mapKey] = entry;
+  const tmp = `${JOURNAL_STORE_PATH}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data), 'utf8');
+  fs.renameSync(tmp, JOURNAL_STORE_PATH);
 }
 
 function clearCommitJournal(mapKey: string): void {
@@ -340,23 +343,23 @@ export async function resolveOnlyOfficeDocumentKey(
 
     if (existing) {
       if (isPendingRoomWrite) {
-        if (existing.lastForceSavedHash !== currentHash || existing.active === false) {
+        if (getAuthoritativeHash(existing) !== currentHash || existing.active === false) {
+          existing.currentConfirmedHash = currentHash;
           existing.lastForceSavedHash = currentHash;
+          existing.committedHash = currentHash;
           existing.active = true;
           existing.updatedAt = Date.now();
           documentVersionStateMap.set(mapKey, existing);
           try {
             savePersistentRoom(mapKey, existing);
+            clearCommitJournal(mapKey);
           } catch { /* best effort */ }
         }
         return existing.activeKey;
       }
 
-      const isKnownHash =
-        currentHash === existing.committedHash ||
-        currentHash === existing.lastForceSavedHash;
-
-      if (isKnownHash) {
+      const authoritativeHash = getAuthoritativeHash(existing);
+      if (currentHash === authoritativeHash) {
         if (existing.active === false) {
           existing.active = true;
           existing.updatedAt = Date.now();
@@ -373,6 +376,7 @@ export async function resolveOnlyOfficeDocumentKey(
       const nextSeq = existing.commitSeq + 1;
       const activeKey = computeDocumentKeyFromDigest(serverId, normalizedPath, currentHash, nextEpoch);
       const newState: DocumentVersionState = {
+        currentConfirmedHash: currentHash,
         committedHash: currentHash,
         lastForceSavedHash: null,
         sessionEpoch: nextEpoch,
@@ -390,6 +394,7 @@ export async function resolveOnlyOfficeDocumentKey(
 
     const activeKey = computeDocumentKeyFromDigest(serverId, normalizedPath, currentHash, 0);
     const newState: DocumentVersionState = {
+      currentConfirmedHash: currentHash,
       committedHash: currentHash,
       lastForceSavedHash: null,
       sessionEpoch: 0,
@@ -1629,14 +1634,20 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
       const currentEpoch = state?.sessionEpoch ?? 0;
       const currentKey = state?.activeKey ?? signedKey;
 
-      // Record in-flight pending commit so concurrent GET config knows this write belongs to active room
+      // 1. Write-Ahead Intent: MUST successfully persist intent BEFORE any daemon write side-effect
+      try {
+        recordCommitJournal(mapKey, {
+          roomKey: currentKey,
+          hash: newDigest,
+          epoch: currentEpoch,
+          updatedAt: Date.now(),
+        });
+      } catch (walErr) {
+        // If WAL cannot be recorded, abort immediately without modifying daemon binary
+        return c.json({ error: 1, message: 'durable_room_state_failed' }, 500);
+      }
+
       pendingCommitHashMap.set(mapKey, newDigest);
-      recordCommitJournal(mapKey, {
-        roomKey: currentKey,
-        hash: newDigest,
-        epoch: currentEpoch,
-        updatedAt: Date.now(),
-      });
 
       try {
         await writeFileToDaemon(claims.serverId, claims.path, bytes, {
@@ -1658,6 +1669,7 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
         const nextSeq = (state?.commitSeq ?? 0) + 1;
         const nextKey = computeDocumentKeyFromDigest(claims.serverId, claims.path, newDigest, nextEpoch);
         const newState: DocumentVersionState = {
+          currentConfirmedHash: newDigest,
           committedHash: newDigest,
           lastForceSavedHash: null,
           sessionEpoch: nextEpoch,
@@ -1677,7 +1689,8 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
       } else if (status === 6) {
         const nextSeq = (state?.commitSeq ?? 0) + 1;
         const newState: DocumentVersionState = {
-          committedHash: state?.committedHash ?? newDigest,
+          currentConfirmedHash: newDigest,
+          committedHash: newDigest,
           lastForceSavedHash: newDigest,
           sessionEpoch: currentEpoch,
           commitSeq: nextSeq,
