@@ -969,27 +969,30 @@ export function ensureComposeHasOnlyOffice(
   } | null;
 
   if (!doc || typeof doc !== 'object' || !doc.services || typeof doc.services !== 'object') {
-    return dockerComposeTemplate({
-      ...(mirrorMode ? {
-        ghcrPrefix: GHCR_MIRROR_PREFIX,
-        turnImage: TURN_SERVICE_DEFAULTS.MIRROR_IMAGE,
-      } : {}),
-      onlyoffice,
-    });
+    throw new Error('Invalid docker-compose.yml: missing services structure');
   }
 
   const server = doc.services.server ?? {};
   const rawEnv = server.environment;
-  const envObj: Record<string, string> = {};
+  const envObj: Record<string, string | null> = {};
   if (Array.isArray(rawEnv)) {
     for (const entry of rawEnv) {
+      if (entry === null || entry === undefined) continue;
       const str = String(entry);
       const eq = str.indexOf('=');
-      if (eq !== -1) envObj[str.slice(0, eq)] = str.slice(eq + 1);
+      if (eq !== -1) {
+        envObj[str.slice(0, eq)] = str.slice(eq + 1);
+      } else {
+        envObj[str] = null;
+      }
     }
   } else if (rawEnv && typeof rawEnv === 'object') {
     for (const [k, v] of Object.entries(rawEnv)) {
-      envObj[k] = String(v ?? '');
+      if (v === null || v === undefined) {
+        envObj[k] = null;
+      } else {
+        envObj[k] = String(v);
+      }
     }
   }
 
@@ -1002,9 +1005,17 @@ export function ensureComposeHasOnlyOffice(
   }
   server.environment = envObj;
 
-  const serverVolumes = Array.isArray(server.volumes) ? server.volumes.map(String) : [];
+  const serverVolumes = Array.isArray(server.volumes) ? [...server.volumes] : [];
   const versionMount = `${NODE_EXE_VERSION_VOLUME}:${NODE_EXE_VERSION_DIR}`;
-  if (!serverVolumes.includes(versionMount)) {
+  const hasVersionMount = serverVolumes.some((v) => {
+    if (typeof v === 'string') return v === versionMount;
+    if (v && typeof v === 'object') {
+      const vol = v as { source?: string; target?: string };
+      return vol.source === NODE_EXE_VERSION_VOLUME && vol.target === NODE_EXE_VERSION_DIR;
+    }
+    return false;
+  });
+  if (!hasVersionMount) {
     serverVolumes.push(versionMount);
   }
   server.volumes = serverVolumes;
@@ -1052,7 +1063,13 @@ export function ensureCaddyfileHasOnlyOffice(
     return caddyfileTemplate(domain, { onlyoffice: enabled });
   }
   if (!enabled) {
-    return caddyfileTemplate(domain, { onlyoffice: false });
+    if (!existingCaddyfile.includes(`handle_path ${ONLYOFFICE_SERVICE_DEFAULTS.SUBPATH}/*`)) {
+      return existingCaddyfile;
+    }
+    return existingCaddyfile.replace(
+      new RegExp(`\\n?[ \\t]*handle_path\\s+${ONLYOFFICE_SERVICE_DEFAULTS.SUBPATH.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/\\*[\\s\\S]*?\\n\\t*\\}\\n?`),
+      '\n',
+    );
   }
   if (existingCaddyfile.includes(`handle_path ${ONLYOFFICE_SERVICE_DEFAULTS.SUBPATH}/*`)) {
     return existingCaddyfile;
@@ -1064,13 +1081,15 @@ export function ensureCaddyfileHasOnlyOffice(
     + `\t\t\theader_up X-Forwarded-Prefix ${ONLYOFFICE_SERVICE_DEFAULTS.SUBPATH}\n`
     + `\t\t}\n`
     + `\t}\n`;
-  if (existingCaddyfile.includes('reverse_proxy server:19138')) {
-    return existingCaddyfile.replace(
-      /(\t*reverse_proxy\s+server:19138)/,
-      `${handleBlock}$1`,
-    );
+
+  const proxyRegex = /([ \t]*reverse_proxy\s+(?:https?:\/\/)?(?:\S+)?19138[^\n]*)/;
+  if (proxyRegex.test(existingCaddyfile)) {
+    return existingCaddyfile.replace(proxyRegex, `${handleBlock}$1`);
   }
-  return caddyfileTemplate(domain, { onlyoffice: true });
+
+  throw new Error(
+    `Cannot patch Caddyfile for ONLYOFFICE: could not locate server upstream reverse_proxy (:19138) in existing configuration`,
+  );
 }
 
 async function writeConfigs(
@@ -1132,13 +1151,12 @@ async function runIncrementalOnlyOfficeAddon(
   domain: string,
   opts: SetupFlowOptions,
 ): Promise<void> {
-  log('Existing .env detected without .setup-secrets.json — running non-destructive ONLYOFFICE add-on setup...');
+  log('Existing .env detected — running non-destructive ONLYOFFICE add-on setup...');
 
   log('Detecting network...');
   const mirrorMode = detectMirrorMode();
   if (mirrorMode) {
-    log('Mirror mode: hub.docker.com unreachable, using registry mirrors.');
-    setupDaemonMirrors(true);
+    log('Mirror mode: hub.docker.com unreachable, using registry mirrors for service images.');
   } else {
     log('Direct mode: hub.docker.com reachable.');
   }
@@ -1150,7 +1168,14 @@ async function runIncrementalOnlyOfficeAddon(
     log('Preserving retained Windows installers from the previous container...');
   }
 
-  const onlyoffice = resolveOnlyOfficeDeployment(domain, dir, {}, { ...opts, onlyoffice: true });
+  const existingSecrets = await recoverSecrets(dir);
+  const secrets: Partial<SetupSecrets> = existingSecrets ?? {};
+  const onlyoffice = resolveOnlyOfficeDeployment(domain, dir, secrets, { ...opts, onlyoffice: true });
+  if (existingSecrets && onlyoffice.jwtSecret && existingSecrets.onlyofficeJwtSecret !== onlyoffice.jwtSecret) {
+    existingSecrets.onlyofficeJwtSecret = onlyoffice.jwtSecret;
+    await persistSecrets(dir, existingSecrets);
+  }
+
   const envPath = join(dir, '.env');
   const existingEnvContent = await readFile(envPath, 'utf8');
   const updatedEnvContent = upsertOnlyOfficeEnvContent(existingEnvContent, domain, onlyoffice);
@@ -1170,6 +1195,15 @@ async function runIncrementalOnlyOfficeAddon(
   composeCmd(compose, dir, 'up -d onlyoffice server caddy');
   if (!isServiceHealthy(compose, dir, 'server')) {
     await waitForService(compose, dir, 'server');
+  }
+
+  log('Reloading Caddy configuration...');
+  try {
+    composeCmd(compose, dir, 'exec -T caddy caddy reload --config /etc/caddy/Caddyfile');
+    log('Caddy configuration reloaded successfully.');
+  } catch {
+    log('Graceful caddy reload failed; restarting caddy container...');
+    composeCmd(compose, dir, 'restart caddy');
   }
   log('ONLYOFFICE Document Server, server, and Caddy updated.');
 
@@ -1642,16 +1676,16 @@ export async function setupFlow(domainInput?: string, opts: SetupFlowOptions = {
   }
 
   if (!opts.force) {
+    if (existsSync(join(dir, '.env')) && opts.onlyoffice === true) {
+      await runIncrementalOnlyOfficeAddon(compose, dir, domain, opts);
+      return;
+    }
     const existing = await recoverSecrets(dir);
     if (existing) {
       secrets = existing;
       resumed = true;
       log('Resuming previous setup (existing .env + secrets found).');
     } else if (existsSync(join(dir, '.env'))) {
-      if (opts.onlyoffice === true) {
-        await runIncrementalOnlyOfficeAddon(compose, dir, domain, opts);
-        return;
-      }
       // .env exists but no .setup-secrets.json — can't safely resume full setup
       fatal('Incomplete setup state: .env exists but secrets file is missing. Use --force to start fresh.');
     } else {

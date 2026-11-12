@@ -493,6 +493,70 @@ describe('setupFlow ONLYOFFICE fresh install, --no-onlyoffice, and existing depl
     expect(readFileSync(join(projectDir, '.env'), 'utf8')).toContain('ONLYOFFICE_ENABLED=true');
     expect(existsSync(join(projectDir, 'docker-compose.yml'))).toBe(true);
   });
+
+  it('preserves valid long mounts, inherited env without equals, and custom Caddy directives/sites', async () => {
+    const { ensureComposeHasOnlyOffice, ensureCaddyfileHasOnlyOffice } = await import('../../src/setup/setup-flow.js');
+    const mount = { type: 'bind', source: './uploads', target: '/app/uploads', read_only: true };
+    const original = {
+      services: {
+        server: {
+          image: 'example/server:fixed',
+          environment: ['HOST_INHERITED', 'EXISTING=value'],
+          volumes: [mount],
+        },
+        caddy: { image: 'caddy:2-alpine' },
+      },
+      volumes: {},
+    };
+    const next = parse(ensureComposeHasOnlyOffice(JSON.stringify(original), { enabled: true, jwtSecret: 'synthetic' })) as {
+      services: {
+        server: {
+          volumes: unknown[];
+          environment: Record<string, unknown>;
+        };
+      };
+    };
+    expect(next.services.server.volumes[0]).toEqual(mount);
+    expect(next.services.server.environment).toHaveProperty('HOST_INHERITED');
+    expect(next.services.server.environment.HOST_INHERITED).toBeNull();
+    expect(next.services.server.environment.EXISTING).toBe('value');
+
+    const oldCaddy = 'docs.test {\n encode gzip\n reverse_proxy http://server:19138\n}\nother.test {\n respond "keep-this"\n}\n';
+    const patchedCaddy = ensureCaddyfileHasOnlyOffice(oldCaddy, 'docs.test');
+    expect(patchedCaddy).toContain('keep-this');
+    expect(patchedCaddy).toContain('encode gzip');
+    expect(patchedCaddy).toContain('handle_path /onlyoffice/*');
+    expect(patchedCaddy).toContain('reverse_proxy http://server:19138');
+  });
+
+  it('fails closed when Caddyfile has unknown upstream reverse_proxy or Compose has invalid services', async () => {
+    const { ensureComposeHasOnlyOffice, ensureCaddyfileHasOnlyOffice } = await import('../../src/setup/setup-flow.js');
+    const unknownCaddy = 'docs.test {\n respond "hello"\n}\n';
+    expect(() => ensureCaddyfileHasOnlyOffice(unknownCaddy, 'docs.test')).toThrow(
+      /could not locate server upstream reverse_proxy/,
+    );
+
+    const invalidCompose = 'version: "3"\nnetworks:\n  test:\n';
+    expect(() => ensureComposeHasOnlyOffice(invalidCompose, { enabled: true, jwtSecret: 'sec' })).toThrow(
+      /missing services structure/,
+    );
+  });
+
+  it('keeps custom env variables and additional Caddy sites when setup secrets file already exists', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { setupFlow } = await import('../../src/setup/setup-flow.js');
+    await setupFlow('docs.test', { onlyoffice: false });
+    const env = join(projectDir, '.env');
+    const caddy = join(projectDir, 'Caddyfile');
+    writeFileSync(env, readFileSync(env, 'utf8') + 'GITHUB_CLIENT_ID=keep-client\nCUSTOM_SETTING=preserve-this\n');
+    writeFileSync(caddy, readFileSync(caddy, 'utf8') + '\nother.test { respond "keep-this" }\n');
+
+    await setupFlow('docs.test', { onlyoffice: true });
+    expect(readFileSync(env, 'utf8')).toContain('CUSTOM_SETTING=preserve-this');
+    expect(readFileSync(env, 'utf8')).toContain('GITHUB_CLIENT_ID=keep-client');
+    expect(readFileSync(caddy, 'utf8')).toContain('keep-this');
+    expect(readFileSync(caddy, 'utf8')).toContain('handle_path /onlyoffice/*');
+  });
 });
 
 describe('scripts/setup-onlyoffice.sh standalone non-destructive add-on script', () => {
@@ -624,6 +688,155 @@ describe('scripts/setup-onlyoffice.sh standalone non-destructive add-on script',
       expect(readFileSync(join(deployDir, '.env'), 'utf8')).toBe(envAfterSuccess);
       expect(readFileSync(join(deployDir, 'docker-compose.yml'), 'utf8')).toBe(composeAfterSuccess);
       expect(readFileSync(join(deployDir, 'Caddyfile'), 'utf8')).toBe(caddyAfterSuccess);
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('script fills env without TRUSTED_PROXIES, preserves file inodes, and reloads running Caddy', () => {
+    const tmpRoot = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'imcodes-script-audit-'));
+    const bin = join(tmpRoot, 'bin');
+    mkdirSync(bin, { recursive: true });
+    const log = join(tmpRoot, 'docker.log');
+    const project = join(tmpRoot, 'project');
+    mkdirSync(project, { recursive: true });
+
+    try {
+      const fake = join(bin, 'docker');
+      writeFileSync(fake, '#!/bin/sh\nprintf "%s\\n" "$*" >> "$DOCKER_LOG"\nexit 0\n');
+      chmodSync(fake, 0o755);
+
+      const envPath = join(project, '.env');
+      const composePath = join(project, 'docker-compose.yml');
+      const caddyPath = join(project, 'Caddyfile');
+
+      writeFileSync(envPath, 'DOMAIN=docs.test\nPOSTGRES_PASSWORD=synthetic-pg\nJWT_SIGNING_KEY=synthetic-jwt\n');
+      writeFileSync(composePath, 'services:\n  server:\n    image: example/server:fixed\n    environment:\n      NODE_ENV: production\n  caddy:\n    image: caddy:2-alpine\n    volumes:\n      - ./Caddyfile:/etc/caddy/Caddyfile:ro\nvolumes:\n  pgdata:\n');
+      writeFileSync(caddyPath, 'docs.test {\n reverse_proxy server:19138\n}\n');
+
+      const envStatBefore = statSync(envPath);
+      const composeStatBefore = statSync(composePath);
+      const caddyStatBefore = statSync(caddyPath);
+
+      const scriptPath = join(repoRoot, 'scripts/setup-onlyoffice.sh');
+      const res = spawnSync(scriptPath, [project], {
+        encoding: 'utf8',
+        timeout: 10000,
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, DOCKER_LOG: log },
+      });
+      expect(res.status, res.stderr).toBe(0);
+
+      const envStatAfter = statSync(envPath);
+      const composeStatAfter = statSync(composePath);
+      const caddyStatAfter = statSync(caddyPath);
+
+      // Verify file inodes were preserved (in-place writes)
+      expect(envStatAfter.ino).toBe(envStatBefore.ino);
+      expect(composeStatAfter.ino).toBe(composeStatBefore.ino);
+      expect(caddyStatAfter.ino).toBe(caddyStatBefore.ino);
+
+      const doc = parse(readFileSync(composePath, 'utf8')) as {
+        services: {
+          server: {
+            environment: Record<string, string>;
+          };
+        };
+      };
+      const calls = readFileSync(log, 'utf8');
+      expect(doc.services.server.environment.ONLYOFFICE_ENABLED).toBeDefined();
+      expect(doc.services.server.environment.ONLYOFFICE_JWT_SECRET).toBeDefined();
+      expect(doc.services.server.environment.NODE_ENV).toBe('production');
+      expect(calls).toMatch(/caddy reload|--force-recreate[^\n]*caddy|restart caddy/);
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('script stages and restores retained Windows installers, and refuses to upgrade when ambiguous server containers exist', () => {
+    const tmpRoot = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'imcodes-script-retained-'));
+    const bin = join(tmpRoot, 'bin');
+    mkdirSync(bin, { recursive: true });
+    const log = join(tmpRoot, 'docker.log');
+    const project = join(tmpRoot, 'project');
+    mkdirSync(project, { recursive: true });
+
+    try {
+      const fake = join(bin, 'docker');
+      writeFileSync(fake, [
+        '#!/usr/bin/env bash',
+        'echo "$@" >> "$DOCKER_LOG"',
+        'if [ "$1" = "info" ]; then exit 0; fi',
+        'if [ "$1" = "compose" ] && [ "$2" = "version" ]; then exit 0; fi',
+        'if [ "$1" = "compose" ] && [[ "$*" == *"ps -aq server"* ]]; then',
+        '  if [ "${AMBIGUOUS_CONTAINERS:-0}" = "1" ]; then',
+        '    echo "srv-alpha"',
+        '    echo "srv-beta"',
+        '  else',
+        '    echo "srv-single"',
+        '  fi',
+        '  exit 0',
+        'fi',
+        'if [ "$1" = "inspect" ] && [[ "$*" == *"range .Mounts"* ]]; then',
+        '  echo "/app/data"',
+        '  exit 0',
+        'fi',
+        'if [ "$1" = "inspect" ] && [[ "$*" == *"State.Running"* ]]; then',
+        '  echo "true"',
+        '  exit 0',
+        'fi',
+        'if [ "$1" = "exec" ] && [[ "$*" == *"__imcodes_legacy_versions_absent__"* ]]; then',
+        '  echo "v1.0.0.exe"',
+        '  exit 0',
+        'fi',
+        'if [ "$1" = "cp" ]; then',
+        '  # Emulate copy by writing a sentinel file to destination',
+        '  dest="${!#}"',
+        '  dest_clean="${dest%/}"',
+        '  dest_clean="${dest_clean%/.}"',
+        '  if [ -d "$dest_clean" ]; then',
+        '    touch "$dest_clean/staged-installer.exe"',
+        '  fi',
+        '  exit 0',
+        'fi',
+        'if [ "$1" = "compose" ] && [[ "$*" == *"ps -q server"* ]]; then',
+        '  echo "srv-new"',
+        '  exit 0',
+        'fi',
+        'exit 0',
+      ].join('\n'));
+      chmodSync(fake, 0o755);
+
+      const envPath = join(project, '.env');
+      const composePath = join(project, 'docker-compose.yml');
+      const caddyPath = join(project, 'Caddyfile');
+
+      writeFileSync(envPath, 'DOMAIN=retained.test\nPOSTGRES_PASSWORD=pass\nJWT_SIGNING_KEY=jwt\n');
+      writeFileSync(composePath, 'services:\n  server:\n    image: test/server\n');
+      writeFileSync(caddyPath, 'retained.test {\n reverse_proxy server:19138\n}\n');
+
+      const scriptPath = join(repoRoot, 'scripts/setup-onlyoffice.sh');
+
+      // 1. Ambiguous containers -> fail closed without touching files
+      const ambigRes = spawnSync(scriptPath, [project], {
+        encoding: 'utf8',
+        timeout: 10000,
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, DOCKER_LOG: log, AMBIGUOUS_CONTAINERS: '1' },
+      });
+      expect(ambigRes.status).not.toBe(0);
+      expect(ambigRes.stderr).toContain('ambiguous server containers found');
+
+      // 2. Single container with legacy bytes -> stages and restores into durable volume
+      const successRes = spawnSync(scriptPath, [project], {
+        encoding: 'utf8',
+        timeout: 10000,
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, DOCKER_LOG: log, AMBIGUOUS_CONTAINERS: '0' },
+      });
+      expect(successRes.status, successRes.stderr).toBe(0);
+      expect(successRes.stdout).toContain('Retained Windows installers migrated into the durable volume');
+
+      const dockerCalls = readFileSync(log, 'utf8');
+      expect(dockerCalls).toContain('cp srv-single:/app/controlled-node-executables/versions/.');
+      expect(dockerCalls).toContain('srv-new:/var/lib/imcodes/node-exe-versions/');
     } finally {
       rmSync(tmpRoot, { recursive: true, force: true });
     }

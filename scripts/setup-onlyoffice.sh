@@ -13,6 +13,9 @@ ENV_FILE="$TARGET_DIR/.env"
 COMPOSE_FILE="$TARGET_DIR/docker-compose.yml"
 CADDY_FILE="$TARGET_DIR/Caddyfile"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." 2>/dev/null && pwd || true)"
+
 if ! docker info >/dev/null 2>&1; then
   echo "Error: Docker is not running or not accessible." >&2
   exit 1
@@ -93,9 +96,90 @@ else
   ONLYOFFICE_INTERNAL_URL="http://onlyoffice:80"
 fi
 
-TMP_ENV="$(mktemp "$TARGET_DIR/.env.onlyoffice.XXXXXX")"
-trap 'rm -f "$TMP_ENV"' EXIT
+# ── Retained-artifact staging (pre-check before any config or container replace) ─
+LEGACY_DIR="/app/controlled-node-executables/versions"
+DURABLE_DIR="/var/lib/imcodes/node-exe-versions"
+STAGING_DIR=""
+HAS_STAGED_ARTIFACTS=0
 
+cleanup_staging() {
+  if [ -n "$STAGING_DIR" ] && [ -d "$STAGING_DIR" ]; then
+    echo "Warning: Script terminated early; retained installers copy preserved at $STAGING_DIR" >&2
+  fi
+}
+trap cleanup_staging EXIT
+
+if [ -f "$COMPOSE_FILE" ]; then
+  SERVER_CIDS_RAW="$("${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" ps -aq server 2>/dev/null || true)"
+  SERVER_CIDS=()
+  while IFS= read -r cid; do
+    [ -n "$cid" ] && SERVER_CIDS+=("$cid")
+  done <<< "$SERVER_CIDS_RAW"
+
+  if [ "${#SERVER_CIDS[@]}" -gt 1 ]; then
+    echo "Error: Refusing to replace server container: ambiguous server containers found: ${SERVER_CIDS[*]}" >&2
+    exit 1
+  elif [ "${#SERVER_CIDS[@]}" -eq 1 ]; then
+    SERVER_CID="${SERVER_CIDS[0]}"
+    MOUNTS="$(docker inspect -f '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' "$SERVER_CID" 2>/dev/null || true)"
+    ALREADY_MOUNTED=0
+    while IFS= read -r mdest; do
+      if [ "$mdest" = "$DURABLE_DIR" ]; then
+        ALREADY_MOUNTED=1
+        break
+      fi
+    done <<< "$MOUNTS"
+
+    if [ "$ALREADY_MOUNTED" -eq 0 ]; then
+      IS_RUNNING="$(docker inspect -f '{{.State.Running}}' "$SERVER_CID" 2>/dev/null || true)"
+      CANDIDATE_STAGING="$(mktemp -d "${TMPDIR:-/tmp}/imcodes-node-exe-versions-XXXXXX")"
+      if [ "$IS_RUNNING" = "true" ]; then
+        PROBE_OUT="$(docker exec "$SERVER_CID" sh -c "if [ ! -d '$LEGACY_DIR' ]; then echo __imcodes_legacy_versions_absent__; exit 0; fi; ls -A '$LEGACY_DIR'" 2>/dev/null || echo "__imcodes_probe_failed__")"
+        if [ "$PROBE_OUT" = "__imcodes_probe_failed__" ]; then
+          echo "Error: Failed to probe legacy installer directory in running server container." >&2
+          rm -rf "$CANDIDATE_STAGING"
+          exit 1
+        fi
+        if [ "$PROBE_OUT" != "__imcodes_legacy_versions_absent__" ] && [ -n "$(echo "$PROBE_OUT" | tr -d '[:space:]')" ]; then
+          if ! docker cp "$SERVER_CID:$LEGACY_DIR/." "$CANDIDATE_STAGING/" 2>/dev/null; then
+            echo "Error: Failed to copy retained Windows installers from running server container." >&2
+            rm -rf "$CANDIDATE_STAGING"
+            exit 1
+          fi
+          STAGING_DIR="$CANDIDATE_STAGING"
+          HAS_STAGED_ARTIFACTS=1
+        else
+          rm -rf "$CANDIDATE_STAGING"
+        fi
+      else
+        # Stopped container
+        CP_LOG="$(mktemp)"
+        if docker cp "$SERVER_CID:$LEGACY_DIR/." "$CANDIDATE_STAGING/" 2>"$CP_LOG"; then
+          if [ -n "$(ls -A "$CANDIDATE_STAGING" 2>/dev/null)" ]; then
+            STAGING_DIR="$CANDIDATE_STAGING"
+            HAS_STAGED_ARTIFACTS=1
+          else
+            rm -rf "$CANDIDATE_STAGING"
+          fi
+        else
+          CP_ERR_TEXT="$(cat "$CP_LOG")"
+          if echo "$CP_ERR_TEXT" | grep -Eqi 'no such file or directory|could not find the file|no such container:path'; then
+            rm -rf "$CANDIDATE_STAGING"
+          else
+            echo "Error: Failed to copy retained Windows installers from stopped server container: $CP_ERR_TEXT" >&2
+            rm -f "$CP_LOG"
+            rm -rf "$CANDIDATE_STAGING"
+            exit 1
+          fi
+        fi
+        rm -f "$CP_LOG" 2>/dev/null || true
+      fi
+    fi
+  fi
+fi
+
+# ── Update .env (in-place to preserve inode) ──────────────────────────────────
+TMP_ENV="$(mktemp "$TARGET_DIR/.env.onlyoffice.XXXXXX")"
 awk \
   -v enabled="true" \
   -v secret="$ONLYOFFICE_JWT_SECRET" \
@@ -156,9 +240,20 @@ awk \
   }
 ' "$ENV_FILE" > "$TMP_ENV"
 
-chmod 600 "$TMP_ENV"
-mv "$TMP_ENV" "$ENV_FILE"
+if ! grep -q '^ONLYOFFICE_ENABLED=' "$TMP_ENV" || \
+   ! grep -q '^ONLYOFFICE_JWT_SECRET=' "$TMP_ENV" || \
+   ! grep -q '^ONLYOFFICE_PUBLIC_URL=' "$TMP_ENV" || \
+   ! grep -q '^ONLYOFFICE_INTERNAL_URL=' "$TMP_ENV"; then
+  echo "Error: Failed to safely write ONLYOFFICE variables to .env" >&2
+  rm -f "$TMP_ENV"
+  exit 1
+fi
 
+chmod 600 "$TMP_ENV"
+cat "$TMP_ENV" > "$ENV_FILE"
+rm -f "$TMP_ENV"
+
+# ── Update docker-compose.yml (in-place to preserve inode) ─────────────────────
 if [ ! -f "$COMPOSE_FILE" ]; then
   cat > "$COMPOSE_FILE" <<'EOF'
 services:
@@ -252,68 +347,206 @@ volumes:
   node_exe_versions:
 EOF
 else
-  # Ensure server environment has ONLYOFFICE_* variables
-  if ! grep -q 'ONLYOFFICE_JWT_SECRET:' "$COMPOSE_FILE"; then
-    TMP_COMPOSE="$(mktemp "$TARGET_DIR/.compose.onlyoffice.XXXXXX")"
-    awk '
-      {
-        print $0
-        if ($0 ~ /^[[:space:]]*TRUSTED_PROXIES:/ && !inserted_env) {
-          print "      ONLYOFFICE_ENABLED: \"${ONLYOFFICE_ENABLED:-true}\""
-          print "      ONLYOFFICE_JWT_SECRET: \"${ONLYOFFICE_JWT_SECRET:-}\""
-          print "      ONLYOFFICE_PUBLIC_URL: \"${ONLYOFFICE_PUBLIC_URL:-https://${DOMAIN}/onlyoffice}\""
-          print "      ONLYOFFICE_INTERNAL_URL: \"${ONLYOFFICE_INTERNAL_URL:-http://onlyoffice:80}\""
-          inserted_env = 1
+  TMP_COMPOSE="$(mktemp "$TARGET_DIR/.compose.onlyoffice.XXXXXX")"
+  COMPOSE_UPDATED=0
+
+  # Strategy 1: Node.js with yaml package (from local, global, or repository node_modules)
+  if command -v node >/dev/null 2>&1; then
+    if REPO_YAML="$REPO_ROOT/node_modules/yaml" node -e "
+      let yaml;
+      try { yaml = require('yaml'); } catch {
+        try { yaml = require(process.env.REPO_YAML || ''); } catch { process.exit(1); }
+      }
+      const { parse, stringify } = yaml;
+      const fs = require('fs');
+      const content = fs.readFileSync(process.argv[1], 'utf8');
+      const doc = parse(content);
+      if (!doc || typeof doc !== 'object' || !doc.services || typeof doc.services !== 'object') {
+        process.exit(1);
+      }
+      const server = doc.services.server || {};
+      const rawEnv = server.environment;
+      const envObj = {};
+      if (Array.isArray(rawEnv)) {
+        for (const entry of rawEnv) {
+          if (entry === null || entry === undefined) continue;
+          const str = String(entry);
+          const eq = str.indexOf('=');
+          if (eq !== -1) {
+            envObj[str.slice(0, eq)] = str.slice(eq + 1);
+          } else {
+            envObj[str] = null;
+          }
+        }
+      } else if (rawEnv && typeof rawEnv === 'object') {
+        for (const [k, v] of Object.entries(rawEnv)) {
+          if (v === null || v === undefined) {
+            envObj[k] = null;
+          } else {
+            envObj[k] = String(v);
+          }
         }
       }
-    ' "$COMPOSE_FILE" > "$TMP_COMPOSE"
-    mv "$TMP_COMPOSE" "$COMPOSE_FILE"
+      envObj['ONLYOFFICE_ENABLED'] = '\${ONLYOFFICE_ENABLED:-true}';
+      envObj['ONLYOFFICE_JWT_SECRET'] = '\${ONLYOFFICE_JWT_SECRET:-}';
+      envObj['ONLYOFFICE_PUBLIC_URL'] = '\${ONLYOFFICE_PUBLIC_URL:-https://\${DOMAIN}/onlyoffice}';
+      envObj['ONLYOFFICE_INTERNAL_URL'] = '\${ONLYOFFICE_INTERNAL_URL:-http://onlyoffice:80}';
+      if (!envObj['IMCODES_NODE_EXE_VERSION_DIR']) {
+        envObj['IMCODES_NODE_EXE_VERSION_DIR'] = '/var/lib/imcodes/node-exe-versions';
+      }
+      server.environment = envObj;
+
+      const serverVolumes = Array.isArray(server.volumes) ? [...server.volumes] : [];
+      const versionMount = 'node_exe_versions:/var/lib/imcodes/node-exe-versions';
+      const hasVersionMount = serverVolumes.some((v) => {
+        if (typeof v === 'string') return v === versionMount;
+        if (v && typeof v === 'object') {
+          return v.source === 'node_exe_versions' && v.target === '/var/lib/imcodes/node-exe-versions';
+        }
+        return false;
+      });
+      if (!hasVersionMount) serverVolumes.push(versionMount);
+      server.volumes = serverVolumes;
+      doc.services.server = server;
+
+      if (!doc.services.onlyoffice) {
+        doc.services.onlyoffice = {
+          image: 'onlyoffice/documentserver:latest',
+          restart: 'unless-stopped',
+          environment: {
+            JWT_ENABLED: 'true',
+            JWT_SECRET: '\${ONLYOFFICE_JWT_SECRET}',
+            JWT_HEADER: 'Authorization',
+            JWT_IN_BODY: 'true',
+            WOPI_ENABLED: 'false',
+          },
+          volumes: [
+            'onlyoffice_data:/var/www/onlyoffice/Data',
+            'onlyoffice_logs:/var/log/onlyoffice',
+          ],
+        };
+      }
+
+      doc.volumes = doc.volumes && typeof doc.volumes === 'object' ? doc.volumes : {};
+      if (!('onlyoffice_data' in doc.volumes)) doc.volumes.onlyoffice_data = null;
+      if (!('onlyoffice_logs' in doc.volumes)) doc.volumes.onlyoffice_logs = null;
+      if (!('node_exe_versions' in doc.volumes)) doc.volumes.node_exe_versions = null;
+
+      fs.writeFileSync(process.argv[2], stringify(doc, { lineWidth: 0 }), 'utf8');
+    " "$COMPOSE_FILE" "$TMP_COMPOSE" 2>/dev/null; then
+      COMPOSE_UPDATED=1
+    fi
   fi
 
-  # Ensure onlyoffice service exists
-  if ! grep -Eq '^[[:space:]]{2}onlyoffice:[[:space:]]*$' "$COMPOSE_FILE"; then
-    TMP_COMPOSE="$(mktemp "$TARGET_DIR/.compose.onlyoffice.XXXXXX")"
-    awk '
-      {
-        if ($0 ~ /^[[:space:]]{2}caddy:[[:space:]]*$/ && !inserted_svc) {
-          print "  onlyoffice:"
-          print "    image: onlyoffice/documentserver:latest"
-          print "    restart: unless-stopped"
-          print "    environment:"
-          print "      JWT_ENABLED: \"true\""
-          print "      JWT_SECRET: \"${ONLYOFFICE_JWT_SECRET}\""
-          print "      JWT_HEADER: \"Authorization\""
-          print "      JWT_IN_BODY: \"true\""
-          print "      WOPI_ENABLED: \"false\""
-          print "    volumes:"
-          print "      - onlyoffice_data:/var/www/onlyoffice/Data"
-          print "      - onlyoffice_logs:/var/log/onlyoffice"
-          print ""
-          inserted_svc = 1
-        }
-        print $0
-      }
-    ' "$COMPOSE_FILE" > "$TMP_COMPOSE"
-    mv "$TMP_COMPOSE" "$COMPOSE_FILE"
+  # Strategy 2: Python 3 with PyYAML
+  if [ "$COMPOSE_UPDATED" -eq 0 ] && command -v python3 >/dev/null 2>&1; then
+    if python3 -c "
+import sys, yaml
+compose_file = sys.argv[1]
+out_file = sys.argv[2]
+with open(compose_file, 'r', encoding='utf8') as f:
+    doc = yaml.safe_load(f)
+if not doc or not isinstance(doc, dict) or 'services' not in doc or not isinstance(doc['services'], dict):
+    sys.exit(1)
+server = doc['services'].get('server') or {}
+raw_env = server.get('environment')
+env_obj = {}
+if isinstance(raw_env, list):
+    for entry in raw_env:
+        if entry is None: continue
+        s = str(entry)
+        if '=' in s:
+            k, v = s.split('=', 1)
+            env_obj[k] = v
+        else:
+            env_obj[s] = None
+elif isinstance(raw_env, dict):
+    for k, v in raw_env.items():
+        if v is None:
+            env_obj[k] = None
+        else:
+            env_obj[k] = str(v)
+env_obj['ONLYOFFICE_ENABLED'] = '\${ONLYOFFICE_ENABLED:-true}'
+env_obj['ONLYOFFICE_JWT_SECRET'] = '\${ONLYOFFICE_JWT_SECRET:-}'
+env_obj['ONLYOFFICE_PUBLIC_URL'] = '\${ONLYOFFICE_PUBLIC_URL:-https://\${DOMAIN}/onlyoffice}'
+env_obj['ONLYOFFICE_INTERNAL_URL'] = '\${ONLYOFFICE_INTERNAL_URL:-http://onlyoffice:80}'
+if 'IMCODES_NODE_EXE_VERSION_DIR' not in env_obj or not env_obj['IMCODES_NODE_EXE_VERSION_DIR']:
+    env_obj['IMCODES_NODE_EXE_VERSION_DIR'] = '/var/lib/imcodes/node-exe-versions'
+server['environment'] = env_obj
+
+vols = server.get('volumes')
+if not isinstance(vols, list):
+    vols = []
+version_mount = 'node_exe_versions:/var/lib/imcodes/node-exe-versions'
+has_mount = False
+for v in vols:
+    if v == version_mount:
+        has_mount = True
+        break
+    if isinstance(v, dict) and v.get('source') == 'node_exe_versions' and v.get('target') == '/var/lib/imcodes/node-exe-versions':
+        has_mount = True
+        break
+if not has_mount:
+    vols.append(version_mount)
+server['volumes'] = vols
+doc['services']['server'] = server
+
+if 'onlyoffice' not in doc['services']:
+    doc['services']['onlyoffice'] = {
+        'image': 'onlyoffice/documentserver:latest',
+        'restart': 'unless-stopped',
+        'environment': {
+            'JWT_ENABLED': 'true',
+            'JWT_SECRET': '\${ONLYOFFICE_JWT_SECRET}',
+            'JWT_HEADER': 'Authorization',
+            'JWT_IN_BODY': 'true',
+            'WOPI_ENABLED': 'false',
+        },
+        'volumes': [
+            'onlyoffice_data:/var/www/onlyoffice/Data',
+            'onlyoffice_logs:/var/log/onlyoffice',
+        ],
+    }
+
+top_vols = doc.get('volumes')
+if not isinstance(top_vols, dict):
+    top_vols = {}
+    doc['volumes'] = top_vols
+for v in ['onlyoffice_data', 'onlyoffice_logs', 'node_exe_versions']:
+    if v not in top_vols:
+        top_vols[v] = None
+
+with open(out_file, 'w', encoding='utf8') as f:
+    yaml.dump(doc, f, sort_keys=False)
+" "$COMPOSE_FILE" "$TMP_COMPOSE" 2>/dev/null; then
+      COMPOSE_UPDATED=1
+    fi
   fi
 
-  # Ensure onlyoffice_data and onlyoffice_logs volumes exist
-  if ! grep -Eq '^[[:space:]]{2}onlyoffice_data:[[:space:]]*$' "$COMPOSE_FILE"; then
-    TMP_COMPOSE="$(mktemp "$TARGET_DIR/.compose.onlyoffice.XXXXXX")"
-    awk '
-      {
-        print $0
-        if ($0 ~ /^volumes:[[:space:]]*$/ && !inserted_vols) {
-          print "  onlyoffice_data:"
-          print "  onlyoffice_logs:"
-          inserted_vols = 1
-        }
-      }
-    ' "$COMPOSE_FILE" > "$TMP_COMPOSE"
-    mv "$TMP_COMPOSE" "$COMPOSE_FILE"
+  if [ "$COMPOSE_UPDATED" -eq 0 ]; then
+    echo "Error: Neither Node.js (with yaml) nor Python 3 (with PyYAML) is available to parse docker-compose.yml safely." >&2
+    rm -f "$TMP_COMPOSE"
+    exit 1
   fi
+
+  # Validate updated compose file before replacing
+  if ! grep -q 'ONLYOFFICE_ENABLED' "$TMP_COMPOSE" || \
+     ! grep -q 'ONLYOFFICE_JWT_SECRET' "$TMP_COMPOSE" || \
+     ! grep -q 'ONLYOFFICE_PUBLIC_URL' "$TMP_COMPOSE" || \
+     ! grep -q 'ONLYOFFICE_INTERNAL_URL' "$TMP_COMPOSE" || \
+     ! grep -Eq '^[[:space:]]*onlyoffice:' "$TMP_COMPOSE" || \
+     ! grep -q 'onlyoffice_data' "$TMP_COMPOSE" || \
+     ! grep -q 'onlyoffice_logs' "$TMP_COMPOSE"; then
+    echo "Error: Failed to safely inject ONLYOFFICE configuration into docker-compose.yml" >&2
+    rm -f "$TMP_COMPOSE"
+    exit 1
+  fi
+
+  cat "$TMP_COMPOSE" > "$COMPOSE_FILE"
+  rm -f "$TMP_COMPOSE"
 fi
 
+# ── Update Caddyfile (in-place to preserve inode) ──────────────────────────────
 if [ ! -f "$CADDY_FILE" ]; then
   cat > "$CADDY_FILE" <<EOF
 ${CLEAN_DOMAIN} {
@@ -329,9 +562,9 @@ ${CLEAN_DOMAIN} {
 EOF
 elif ! grep -q 'handle_path /onlyoffice/\*' "$CADDY_FILE"; then
   TMP_CADDY="$(mktemp "$TARGET_DIR/.caddy.onlyoffice.XXXXXX")"
-  awk '
+  if awk '
     {
-      if ($0 ~ /reverse_proxy[[:space:]]+server:19138/ && !inserted) {
+      if ($0 ~ /reverse_proxy/ && $0 ~ /19138/ && !inserted) {
         print "\thandle_path /onlyoffice/* {"
         print "\t\treverse_proxy onlyoffice:80 {"
         print "\t\t\theader_up X-Forwarded-Proto {scheme}"
@@ -343,12 +576,48 @@ elif ! grep -q 'handle_path /onlyoffice/\*' "$CADDY_FILE"; then
       }
       print $0
     }
-  ' "$CADDY_FILE" > "$TMP_CADDY"
-  mv "$TMP_CADDY" "$CADDY_FILE"
+    END {
+      if (!inserted) exit 2
+    }
+  ' "$CADDY_FILE" > "$TMP_CADDY"; then
+    cat "$TMP_CADDY" > "$CADDY_FILE"
+    rm -f "$TMP_CADDY"
+  else
+    echo "Error: could not find server reverse_proxy :19138 in $CADDY_FILE to inject ONLYOFFICE proxy" >&2
+    rm -f "$TMP_CADDY"
+    exit 1
+  fi
 fi
 
+# ── Start services and reload Caddy ──────────────────────────────────────────
 echo "Starting ONLYOFFICE Document Server and updating server + Caddy..."
 "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d onlyoffice server caddy
+
+echo "Reloading Caddy configuration..."
+if "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" exec -T caddy caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
+  echo "Caddy configuration reloaded successfully."
+else
+  echo "Restarting Caddy to apply new configuration..."
+  "${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" restart caddy
+fi
+
+# ── Restore retained Windows installer artifacts if staged ───────────────────
+if [ "$HAS_STAGED_ARTIFACTS" -eq 1 ] && [ -n "$STAGING_DIR" ] && [ -d "$STAGING_DIR" ]; then
+  NEW_SERVER_CID="$("${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" ps -q server 2>/dev/null | head -n 1 || true)"
+  RESTORED=0
+  if [ -n "$NEW_SERVER_CID" ]; then
+    if docker exec "$NEW_SERVER_CID" sh -c "mkdir -p '$DURABLE_DIR'" 2>/dev/null && \
+       docker cp "$STAGING_DIR/." "$NEW_SERVER_CID:$DURABLE_DIR/" 2>/dev/null; then
+      RESTORED=1
+      rm -rf "$STAGING_DIR"
+      STAGING_DIR=""
+      echo "Retained Windows installers migrated into the durable volume."
+    fi
+  fi
+  if [ "$RESTORED" -eq 0 ]; then
+    echo "Warning: Could not migrate retained Windows installers. The only copy is preserved at $STAGING_DIR; copy it into the server's $DURABLE_DIR to keep existing install codes resolvable." >&2
+  fi
+fi
 
 echo ""
 echo "ONLYOFFICE Document Server is enabled at: ${ONLYOFFICE_PUBLIC_URL}"
