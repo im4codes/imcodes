@@ -2569,7 +2569,9 @@ export async function downloadAttachment(
   let transferSignal: AbortSignal | undefined;
   const relayAbort = new AbortController();
   const abortRelay = () => relayAbort.abort();
-  const relaySignal = signal ? AbortSignal.any([signal, relayAbort.signal]) : relayAbort.signal;
+  signal?.addEventListener('abort', abortRelay, { once: true });
+  if (signal?.aborted) relayAbort.abort();
+  const relaySignal = relayAbort.signal;
   try {
     const r2Url = await prepareR2AttachmentDownload(serverId, attachmentId, sessionName, relaySignal, (progress) => {
       if (!relayTransfer) {
@@ -2587,7 +2589,10 @@ export async function downloadAttachment(
   } catch (error) {
     if (relayTransfer) failDownloadTransfer(relayTransfer, relaySignal.aborted);
     throw error;
-  } finally { transferSignal?.removeEventListener('abort', abortRelay); }
+  } finally {
+    transferSignal?.removeEventListener('abort', abortRelay);
+    signal?.removeEventListener('abort', abortRelay);
+  }
   // Native: acquire a one-time token and hand off to the system browser.
   if (isNative()) {
     const downloadUrl = await buildAttachmentDownloadUrl(serverId, attachmentId, sessionName);

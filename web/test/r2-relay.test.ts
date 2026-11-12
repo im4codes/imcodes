@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { FILE_RELAY_MODE, R2_RELAY_PHASE } from '@shared/r2-relay.js';
 import { saveFileRelayMode, readFileRelayMode } from '../src/r2-relay-preference.js';
-import { configureExpectedUserId, prepareR2AttachmentDownload, tryUploadR2File, isR2RelaySelected } from '../src/api.js';
+import { configureExpectedUserId, prepareR2AttachmentDownload, tryUploadR2File, isR2RelaySelected, downloadAttachment } from '../src/api.js';
 import { beginDownloadTransfer, getDownloadTransfers, __resetDownloadTransfersForTests, cancelDownloadTransfer,
   reportR2Preparation, updateDownloadTransfer, reportDownloadTransferProgress, DOWNLOAD_TRANSFER_ROUTE, DOWNLOAD_TRANSFER_STATUS } from '../src/download-transfer-store.js';
 import { createDownloadTransferWiring } from '../src/download-transfer-wiring.js';
@@ -67,6 +67,41 @@ describe('R2 user routing and progress', () => {
     expect(send).toHaveBeenCalledWith(file); expect(headers).not.toHaveBeenCalled();
     expect(fetchMock.mock.calls[1]![0]).toContain('/r2-relay/uploads/ticket/commit');
   });
+  it('keeps default native-browser handoff working with a signal on older WebViews without AbortSignal.any', async () => {
+    const original = Object.getOwnPropertyDescriptor(AbortSignal, 'any');
+    Object.defineProperty(AbortSignal, 'any', { configurable: true, value: undefined });
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+    fetchMock.mockResolvedValue(Response.json({ token: 'download-token' }));
+    try {
+      await downloadAttachment('srv', 'abc', undefined, new AbortController().signal);
+      expect(click).toHaveBeenCalledTimes(1);
+      expect(fetchMock).not.toHaveBeenCalled(); // cookie-auth browser path requires no token request
+    } finally {
+      if (original) Object.defineProperty(AbortSignal, 'any', original);
+      click.mockRestore();
+    }
+  });
+
+  it('canceling a standalone R2 preparation row aborts its reader and never hands off the URL', async () => {
+    saveFileRelayMode('user-a', FILE_RELAY_MODE.R2);
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+    let requestSignal: AbortSignal | undefined;
+    fetchMock.mockImplementation(async (_path, init) => {
+      requestSignal = init.signal;
+      return new Response(new ReadableStream({ start(controller) {
+        controller.enqueue(new TextEncoder().encode(JSON.stringify({ phase: R2_RELAY_PHASE.PREPARING, loadedBytes: 1, totalBytes: 10, speedBps: 1, etaSeconds: 9 }) + '\n'));
+        requestSignal!.addEventListener('abort', () => controller.error(new DOMException('aborted', 'AbortError')), { once: true });
+      } }));
+    });
+    const pending = downloadAttachment('srv', 'abc');
+    const assertion = expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    await vi.waitFor(() => expect(getDownloadTransfers()).toHaveLength(1));
+    cancelDownloadTransfer(getDownloadTransfers()[0]!.id);
+    await assertion;
+    expect(requestSignal!.aborted).toBe(true); expect(click).not.toHaveBeenCalled();
+    click.mockRestore();
+  });
+
   it('routes a selected R2 download before WebRTC and streams signed GET into the chosen destination', async () => {
     saveFileRelayMode('user-a', FILE_RELAY_MODE.R2);
     const progress = { phase: R2_RELAY_PHASE.PREPARING, loadedBytes: 3, totalBytes: 3, speedBps: 1, etaSeconds: 0 };
