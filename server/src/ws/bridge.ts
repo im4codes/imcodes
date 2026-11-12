@@ -335,7 +335,12 @@ import {
 import { isStreamingResponse } from '../../../shared/preview-stream-policy.js';
 import { getSessionRuntimeType } from '../../../shared/agent-types.js';
 import { LocalWebPreviewRegistry, setPreviewActiveRelayHook, setPreviewEvictedHook } from '../preview/registry.js';
-import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, getSubSessionById, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent, getUserPref, setUserPref, deleteUserPref, getDbSessionsByServer, getUserById, insertDiscussionComment } from '../db/queries.js';
+import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, createSubSessionsBatch, getSubSessionById, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent, getUserPref, setUserPref, deleteUserPref, getDbSessionsByServer, getUserById, insertDiscussionComment } from '../db/queries.js';
+import {
+  SUBSESSION_CREATED_BATCH_MSG,
+  SUBSESSION_SYNC_BATCH_MAX_ITEMS,
+  SUBSESSION_SYNC_BATCH_MSG,
+} from '../../../shared/scale-limits.js';
 import {
   activateCapabilityVersion,
   advanceCapabilityOperation,
@@ -2412,6 +2417,7 @@ export class WsBridge {
   private controlledNodeWorkerRefreshStatus: ControlledNodeWorkerRefreshStatusMessage | null = null;
   private controlledNodeWorkerRefreshPersistence: Promise<void> = Promise.resolve();
   private browserSockets = new Set<WebSocket>();
+  private batchCreatedBrowsers = new WeakSet<WebSocket>();
   /**
    * Task-console subscriptions each browser socket opened, so a socket that
    * goes away without saying so (tab closed, phone asleep, network drop) can
@@ -7502,6 +7508,11 @@ export class WsBridge {
       if (msg.type === SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE || msg.type === SUPERVISION_TASK_CONSOLE_MSG.UNSUBSCRIBE) {
         this.trackBrowserConsoleSubscription(ws, msg);
       }
+      if (browserMessageType === 'subsession.rebuild_all') {
+        if (msg.supportsCreatedBatch === true) this.batchCreatedBrowsers.add(ws);
+        this.sendToDaemon(JSON.stringify({ ...msg, supportsSyncBatch: true }));
+        return;
+      }
       this.sendToDaemon(raw);
     };
     // An owner socket runs each message straight away. A share-scoped socket
@@ -9224,124 +9235,64 @@ export class WsBridge {
     }
 
     // ── Sub-session sync: daemon creates sub-sessions → persist to DB ────────
-    if (type === 'subsession.sync' && (isIncognitoSession(msg) || (typeof msg.id === 'string' && this.incognitoSessions.has(`deck_sub_${msg.id}`)))) return;
-    if (type === 'subsession.sync' && this.db) {
+    if ((type === 'subsession.sync' || type === SUBSESSION_SYNC_BATCH_MSG) && this.db) {
       const db = this.db;
-      if (isKnownTestSessionLike({
-        name: typeof msg.id === 'string' ? `deck_sub_${msg.id}` : undefined,
-        cwd: typeof msg.cwd === 'string' ? msg.cwd : undefined,
-        parentSession: typeof msg.parentSession === 'string' ? msg.parentSession : undefined,
-      })) {
+      const rawItems = type === SUBSESSION_SYNC_BATCH_MSG
+        ? (Array.isArray(msg.items) ? msg.items.filter((x): x is Record<string, unknown> => !!x && typeof x === 'object') : [])
+        : [msg];
+      const acceptedItems: Record<string, unknown>[] = [];
+      for (const item of rawItems) {
+        if (isIncognitoSession(item) || (typeof item.id === 'string' && this.incognitoSessions.has(`deck_sub_${item.id}`))) {
+          continue;
+        }
+        if (this.registerActiveSubSessionFromSync(item)) acceptedItems.push(item);
+      }
+      if (acceptedItems.length === 0) return;
+
+      if (type === 'subsession.sync') {
+        const single = acceptedItems[0];
+        void (async () => {
+          const resolved = await this.resolveSubSessionSyncItem(db, single);
+          if (!resolved) {
+            logger.warn({ id: single.id }, 'Skipping sub-session DB sync without sessionType');
+            return;
+          }
+          await createSubSession(
+            db,
+            resolved.row.id,
+            this.serverId,
+            resolved.row.type,
+            resolved.row.shellBin,
+            resolved.row.cwd,
+            resolved.row.label,
+            resolved.row.ccSessionId,
+            resolved.row.geminiSessionId ?? null,
+            resolved.row.parentSession ?? null,
+            resolved.row.runtimeType ?? null,
+            resolved.row.providerId ?? null,
+            resolved.row.providerSessionId ?? null,
+            resolved.row.description ?? null,
+            resolved.row.ccPresetId ?? null,
+            resolved.row.requestedModel ?? null,
+            resolved.row.activeModel ?? null,
+            resolved.row.effort ?? null,
+            resolved.row.transportConfig ?? null,
+            resolved.row.executionCloneMetadata ?? null,
+          );
+          this.broadcastToBrowsers(JSON.stringify(resolved.frame));
+        })().catch((e) => logger.error({ err: e, id: single.id }, 'Failed to sync sub-session to DB'));
         return;
       }
-      const subSessionName = `deck_sub_${String(msg.id ?? '')}`;
-      if (subSessionName !== 'deck_sub_') {
-        const label = typeof msg.label === 'string' && msg.label.trim() ? msg.label.trim() : undefined;
-        const parentSession = typeof msg.parentSession === 'string' && msg.parentSession ? msg.parentSession : undefined;
-        const agentType = typeof msg.sessionType === 'string' && msg.sessionType ? msg.sessionType : undefined;
-        const runtimeType = typeof msg.runtimeType === 'string'
-          ? msg.runtimeType
-          : agentType
-            ? getSessionRuntimeType(agentType)
-            : undefined;
-        this.activeSubSessions.set(subSessionName, {
-          name: subSessionName,
-          state: typeof msg.state === 'string' ? msg.state : undefined,
-          label,
-          parentSession,
-          agentType,
-          runtimeType,
-        });
-        const subIdentityProjectKey = sessionIdentityProjectKey({
-          contextNamespace: msg.contextNamespace as { projectId?: unknown } | null | undefined,
-        });
-        if (subIdentityProjectKey) this.subIdentityProjectKeys.set(subSessionName, subIdentityProjectKey);
-        this.sessionRuntimeTypes.set(subSessionName, this.normalizeRuntimeType(runtimeType));
-        if (typeof msg.state === 'string') this.updateAuthoritativeSessionState(subSessionName, msg.state);
-      }
+
       void (async () => {
-        const requestedType = typeof msg.sessionType === 'string' && msg.sessionType.trim()
-          ? msg.sessionType.trim()
-          : null;
-        const persisted = requestedType ? null : await getSubSessionById(db, msg.id as string, this.serverId).catch(() => null);
-        const sessionType = requestedType ?? persisted?.type ?? null;
-        if (!sessionType) {
-          logger.warn({ id: msg.id }, 'Skipping sub-session DB sync without sessionType');
-          return;
+        const resolved = (await Promise.all(acceptedItems.map((item) => this.resolveSubSessionSyncItem(db, item))))
+          .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+        for (let i = 0; i < resolved.length; i += SUBSESSION_SYNC_BATCH_MAX_ITEMS) {
+          const chunk = resolved.slice(i, i + SUBSESSION_SYNC_BATCH_MAX_ITEMS);
+          await createSubSessionsBatch(db, chunk.map((entry) => entry.row));
+          this.broadcastSubsessionCreatedBatch(chunk.map((entry) => entry.frame));
         }
-        const persistedRuntimeType = typeof msg.runtimeType === 'string'
-          ? msg.runtimeType
-          : sessionType
-            ? getSessionRuntimeType(sessionType)
-            : null;
-        await createSubSession(
-          db,
-          msg.id as string,
-          this.serverId,
-          sessionType,
-          (msg.shellBin as string) || null,
-          (msg.cwd as string) || null,
-          (msg.label as string) || null,
-          (msg.ccSessionId as string) || null,
-          (msg.geminiSessionId as string) || null,
-          (msg.parentSession as string) || null,
-          persistedRuntimeType,
-          (msg.providerId as string) || null,
-          (msg.providerSessionId as string) || null,
-          (msg.description as string) || null,
-          (msg.ccPresetId as string) || null,
-          (msg.requestedModel as string) || null,
-          ((msg.activeModel as string) || (msg.modelDisplay as string)) || null,
-          (msg.effort as string) || null,
-          (msg.transportConfig as Record<string, unknown>) || null,
-          (msg.executionCloneMetadata as Record<string, unknown>) || null,
-        );
-        // Notify browsers so sub-session appears immediately without page refresh
-        const queueRelay = buildSubsessionQueueRelay(msg);
-        const executionCloneMetadata = (msg.executionCloneMetadata && typeof msg.executionCloneMetadata === 'object')
-          ? msg.executionCloneMetadata as Record<string, unknown>
-          : null;
-        const isExecutionClone = executionCloneMetadata?.kind === EXECUTION_CLONE_KIND;
-        const executionCloneProjection = isExecutionClone
-          ? {
-              executionCloneKind: EXECUTION_CLONE_KIND,
-              ...(typeof executionCloneMetadata.parentRunId === 'string'
-                ? { parentRunId: executionCloneMetadata.parentRunId }
-                : {}),
-            }
-          : {};
-        this.broadcastToBrowsers(JSON.stringify({
-          type: 'subsession.created',
-          id: msg.id,
-          sessionName: `deck_sub_${msg.id}`,
-          sessionInstanceId: msg.sessionInstanceId || null,
-          runtimeEpoch: msg.runtimeEpoch || null,
-          sessionType,
-          cwd: msg.cwd || null,
-          label: msg.label || null,
-          parentSession: msg.parentSession || null,
-          ccPresetId: (msg.ccPresetId as string) || null,
-          runtimeType: persistedRuntimeType,
-          providerId: msg.providerId || null,
-          providerSessionId: msg.providerSessionId || null,
-          requestedModel: msg.requestedModel || null,
-          activeModel: msg.activeModel || msg.modelDisplay || null,
-          effort: msg.effort || null,
-          transportConfig: msg.transportConfig || null,
-          supervisionHeartbeat: msg.supervisionHeartbeat || null,
-          ...queueRelay,
-          ...executionCloneProjection,
-          qwenModel: msg.qwenModel || null,
-          qwenAuthType: msg.qwenAuthType || null,
-          qwenAvailableModels: msg.qwenAvailableModels || null,
-          modelDisplay: msg.modelDisplay || null,
-          planLabel: msg.planLabel || null,
-          quotaLabel: msg.quotaLabel || null,
-          quotaUsageLabel: msg.quotaUsageLabel || null,
-          quotaMeta: msg.quotaMeta || null,
-          state: (msg.state as string) || 'idle',
-        }));
-      })().catch((e) => logger.error({ err: e, id: msg.id }, 'Failed to sync sub-session to DB'));
+      })().catch((e) => logger.error({ err: e, count: acceptedItems.length }, 'Failed to batch sync sub-sessions to DB'));
       return;
     }
     if (type === 'subsession.update_gemini_id' && this.db) {
@@ -10614,6 +10565,157 @@ export class WsBridge {
       logger.warn({ serverId: this.serverId, sessionId, projectDir, err }, 'repo.checkout_branch: authorization check failed');
       sendRepoError('unauthorized');
       return false;
+    }
+  }
+
+  private registerActiveSubSessionFromSync(msg: Record<string, unknown>): boolean {
+    if (isKnownTestSessionLike({
+      name: typeof msg.id === 'string' ? `deck_sub_${msg.id}` : undefined,
+      cwd: typeof msg.cwd === 'string' ? msg.cwd : undefined,
+      parentSession: typeof msg.parentSession === 'string' ? msg.parentSession : undefined,
+    })) {
+      return false;
+    }
+    const subSessionName = `deck_sub_${String(msg.id ?? '')}`;
+    if (subSessionName !== 'deck_sub_') {
+      const label = typeof msg.label === 'string' && msg.label.trim() ? msg.label.trim() : undefined;
+      const parentSession = typeof msg.parentSession === 'string' && msg.parentSession ? msg.parentSession : undefined;
+      const agentType = typeof msg.sessionType === 'string' && msg.sessionType ? msg.sessionType : undefined;
+      const runtimeType = typeof msg.runtimeType === 'string'
+        ? msg.runtimeType
+        : agentType
+          ? getSessionRuntimeType(agentType)
+          : undefined;
+      this.activeSubSessions.set(subSessionName, {
+        name: subSessionName,
+        state: typeof msg.state === 'string' ? msg.state : undefined,
+        label,
+        parentSession,
+        agentType,
+        runtimeType,
+      });
+      const subIdentityProjectKey = sessionIdentityProjectKey({
+        contextNamespace: msg.contextNamespace as { projectId?: unknown } | null | undefined,
+      });
+      if (subIdentityProjectKey) this.subIdentityProjectKeys.set(subSessionName, subIdentityProjectKey);
+      this.sessionRuntimeTypes.set(subSessionName, this.normalizeRuntimeType(runtimeType));
+      if (typeof msg.state === 'string') this.updateAuthoritativeSessionState(subSessionName, msg.state);
+    }
+    return true;
+  }
+
+  private async resolveSubSessionSyncItem(
+    db: Database,
+    msg: Record<string, unknown>,
+  ): Promise<{ row: import('../db/queries.js').SubSessionBatchUpsertInput; frame: Record<string, unknown> } | null> {
+    if (typeof msg.id !== 'string' || !msg.id) return null;
+    const requestedType = typeof msg.sessionType === 'string' && msg.sessionType.trim()
+      ? msg.sessionType.trim()
+      : null;
+    const persisted = requestedType ? null : await getSubSessionById(db, msg.id, this.serverId).catch(() => null);
+    const sessionType = requestedType ?? persisted?.type ?? null;
+    if (!sessionType) return null;
+    const persistedRuntimeType = typeof msg.runtimeType === 'string'
+      ? msg.runtimeType
+      : sessionType
+        ? getSessionRuntimeType(sessionType)
+        : null;
+    const queueRelay = buildSubsessionQueueRelay(msg);
+    const executionCloneMetadata = (msg.executionCloneMetadata && typeof msg.executionCloneMetadata === 'object')
+      ? msg.executionCloneMetadata as Record<string, unknown>
+      : null;
+    const isExecutionClone = executionCloneMetadata?.kind === EXECUTION_CLONE_KIND;
+    const executionCloneProjection = isExecutionClone
+      ? {
+          executionCloneKind: EXECUTION_CLONE_KIND,
+          ...(typeof executionCloneMetadata.parentRunId === 'string'
+            ? { parentRunId: executionCloneMetadata.parentRunId }
+            : {}),
+        }
+      : {};
+    const activeModel = ((msg.activeModel as string) || (msg.modelDisplay as string)) || null;
+    return {
+      row: {
+        id: msg.id,
+        serverId: this.serverId,
+        type: sessionType,
+        shellBin: (msg.shellBin as string) || null,
+        cwd: (msg.cwd as string) || null,
+        label: (msg.label as string) || null,
+        ccSessionId: (msg.ccSessionId as string) || null,
+        geminiSessionId: (msg.geminiSessionId as string) || null,
+        parentSession: (msg.parentSession as string) || null,
+        runtimeType: persistedRuntimeType,
+        providerId: (msg.providerId as string) || null,
+        providerSessionId: (msg.providerSessionId as string) || null,
+        description: (msg.description as string) || null,
+        ccPresetId: (msg.ccPresetId as string) || null,
+        requestedModel: (msg.requestedModel as string) || null,
+        activeModel,
+        effort: (msg.effort as string) || null,
+        transportConfig: (msg.transportConfig as Record<string, unknown>) || null,
+        executionCloneMetadata,
+      },
+      frame: {
+        type: 'subsession.created',
+        id: msg.id,
+        sessionName: `deck_sub_${msg.id}`,
+        sessionInstanceId: msg.sessionInstanceId || null,
+        runtimeEpoch: msg.runtimeEpoch || null,
+        sessionType,
+        cwd: msg.cwd || null,
+        label: msg.label || null,
+        parentSession: msg.parentSession || null,
+        ccPresetId: (msg.ccPresetId as string) || null,
+        runtimeType: persistedRuntimeType,
+        providerId: msg.providerId || null,
+        providerSessionId: msg.providerSessionId || null,
+        requestedModel: msg.requestedModel || null,
+        activeModel: msg.activeModel || msg.modelDisplay || null,
+        effort: msg.effort || null,
+        transportConfig: msg.transportConfig || null,
+        supervisionHeartbeat: msg.supervisionHeartbeat || null,
+        ...queueRelay,
+        ...executionCloneProjection,
+        qwenModel: msg.qwenModel || null,
+        qwenAuthType: msg.qwenAuthType || null,
+        qwenAvailableModels: msg.qwenAvailableModels || null,
+        modelDisplay: msg.modelDisplay || null,
+        planLabel: msg.planLabel || null,
+        quotaLabel: msg.quotaLabel || null,
+        quotaUsageLabel: msg.quotaUsageLabel || null,
+        quotaMeta: msg.quotaMeta || null,
+        state: (msg.state as string) || 'idle',
+      },
+    };
+  }
+
+  private broadcastSubsessionCreatedBatch(frames: Array<Record<string, unknown>>): void {
+    if (frames.length === 0) return;
+    const batchJson = JSON.stringify({ type: SUBSESSION_CREATED_BATCH_MSG, items: frames });
+    this.controlledBrowserReads.broadcast(batchJson);
+    let legacyFrames: Array<{ frame: Record<string, unknown>; json: string }> | null = null;
+    const getLegacyFrames = () => {
+      if (!legacyFrames) {
+        legacyFrames = frames.map((frame) => ({ frame, json: JSON.stringify(frame) }));
+      }
+      return legacyFrames;
+    };
+    for (const bs of this.browserSockets) {
+      if (this.controlledTargetBrowserSockets.has(bs)) continue;
+      try {
+        const isShare = this.browserShareStates.has(bs);
+        if (!isShare && this.batchCreatedBrowsers.has(bs)) {
+          bs.send(batchJson);
+          continue;
+        }
+        for (const { frame, json } of getLegacyFrames()) {
+          const outgoing = this.filterShareOutgoingJson(bs, frame, json);
+          if (outgoing) bs.send(outgoing);
+        }
+      } catch {
+        this.browserSockets.delete(bs);
+      }
     }
   }
 

@@ -1,6 +1,9 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { buildSubSessionSyncPayload } from '../../src/daemon/subsession-sync.js';
+import { handleWebCommand } from '../../src/daemon/command-handler.js';
+import type { ServerLink } from '../../src/daemon/server-link.js';
+import { SUBSESSION_SYNC_BATCH_MAX_ITEMS, SUBSESSION_SYNC_BATCH_MSG } from '../../shared/scale-limits.js';
 import { getTransportQueueStore, resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
 import { recipientFromSessionRecord } from '../../src/daemon/transport-resend-queue.js';
 import {
@@ -116,5 +119,46 @@ describe('subsession-sync transport queue projection', () => {
     expect(payload?.quotaMeta).toEqual({
       primary: { windowDurationMins: 44640, usedPercent: 0, resetsAt: 1730000000 },
     });
+  });
+
+  it('batches handleWebCommand subsession.rebuild_all when supportsSyncBatch is true and falls back cleanly when omitted', async () => {
+    const subs = Array.from({ length: SUBSESSION_SYNC_BATCH_MAX_ITEMS + 12 }, (_, i) => ({
+      id: `batch_sub_${i}`,
+      type: 'qwen',
+      runtimeType: 'transport' as const,
+      providerId: 'qwen',
+      providerSessionId: `prov-${i}`,
+      cwd: '/tmp/batch-demo',
+      label: `worker-${i}`,
+      parentSession: 'deck_demo_brain',
+    }));
+
+    const batchFrames: Array<Record<string, unknown>> = [];
+    handleWebCommand(
+      { type: 'subsession.rebuild_all', subSessions: subs, supportsSyncBatch: true },
+      { send: (m: Record<string, unknown>) => batchFrames.push(m) } as unknown as ServerLink,
+    );
+    await vi.waitFor(() => {
+      const total = batchFrames
+        .filter((f) => f.type === SUBSESSION_SYNC_BATCH_MSG)
+        .reduce((n, f) => n + ((f.items as unknown[])?.length ?? 0), 0);
+      expect(total).toBe(subs.length);
+    });
+    const batchOnly = batchFrames.filter((f) => f.type === SUBSESSION_SYNC_BATCH_MSG);
+    expect(batchOnly).toHaveLength(2);
+    expect((batchOnly[0]!.items as unknown[]).length).toBe(SUBSESSION_SYNC_BATCH_MAX_ITEMS);
+    expect((batchOnly[1]!.items as unknown[]).length).toBe(12);
+
+    // Legacy servers that omit supportsSyncBatch must continue receiving individual `subsession.sync` frames.
+    const legacyFrames: Array<Record<string, unknown>> = [];
+    const legacySubs = subs.slice(0, 4);
+    handleWebCommand(
+      { type: 'subsession.rebuild_all', subSessions: legacySubs },
+      { send: (m: Record<string, unknown>) => legacyFrames.push(m) } as unknown as ServerLink,
+    );
+    await vi.waitFor(() => {
+      expect(legacyFrames.filter((f) => f.type === 'subsession.sync')).toHaveLength(4);
+    });
+    expect(legacyFrames.some((f) => f.type === SUBSESSION_SYNC_BATCH_MSG)).toBe(false);
   });
 });

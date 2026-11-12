@@ -26,6 +26,7 @@ import { localizeDaemonUserNoticeEvent } from '../daemon-user-notice-i18n.js';
 import { recordPerfRender } from '../perf-render-debug.js';
 import { localizeChatDownloadError } from '../chat-download-error.js';
 import { copyToClipboard } from '../util/clipboard.js';
+import { WEB_UNLOCK_COALESCE_MS } from '@shared/scale-limits.js';
 /**
  * ChatView — renders TimelineEvent[] as a chat-style view.
  * Merges consecutive streaming assistant.text events into single blocks.
@@ -2493,6 +2494,7 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
   // resume, rather than letting the old virtual range point at empty space.
   useEffect(() => {
     if (!enabled) return undefined;
+    let lastResumeAt = 0;
     const capture = () => {
       if (document.visibilityState !== 'hidden') return;
       resumeSnapshotRef.current = {
@@ -2500,8 +2502,15 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
         atBottom: wasAtBottomRef.current,
       };
     };
-    const resume = () => {
+    const resume = (ev?: Event) => {
       if (document.visibilityState === 'hidden') return;
+      // Ignore non-persisted initial pageshow when we never captured a hidden snapshot.
+      if (ev && ev.type === 'pageshow' && 'persisted' in ev && !(ev as PageTransitionEvent).persisted && !resumeSnapshotRef.current) {
+        return;
+      }
+      const now = Date.now();
+      if (now - lastResumeAt < WEB_UNLOCK_COALESCE_MS) return;
+      lastResumeAt = now;
       if (!resumeSnapshotRef.current) {
         const root = scrollRef.current;
         if (root) resumeSnapshotRef.current = {
@@ -2611,8 +2620,35 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
   // that frame showed a 15-42px gap/reverse jump.
   const lastCommitSignatureRef = useRef('');
   const lastCommitClientHeightRef = useRef(0);
+  const syncLayoutPassCountRef = useRef(0);
+  const pendingLayoutRafRef = useRef<number | null>(null);
+  const resizeObserverRef = useRef<ResizeObserver | null>(null);
+  const observedNodesRef = useRef<Set<HTMLElement>>(new Set());
+  const latestLayoutHandlersRef = useRef({
+    commitMeasuredRows,
+    captureViewportAnchor,
+    onMeasuredLayout,
+  });
+  latestLayoutHandlersRef.current = {
+    commitMeasuredRows,
+    captureViewportAnchor,
+    onMeasuredLayout,
+  };
+
+  useEffect(() => {
+    return () => {
+      if (pendingLayoutRafRef.current !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(pendingLayoutRafRef.current);
+        pendingLayoutRafRef.current = null;
+      }
+    };
+  }, [enabled]);
+
   useLayoutEffect(() => {
-    if (!enabled) return;
+    if (!enabled) {
+      syncLayoutPassCountRef.current = 0;
+      return;
+    }
     const root = scrollRef.current;
     if (!root) return;
     const wasAtBottom = wasAtBottomRef.current;
@@ -2629,36 +2665,87 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
     const signature = `${layoutVersion}:${items.length}:${items[0]?.key ?? ''}:${items[items.length - 1]?.key ?? ''}`;
     const layoutMayHaveChanged = changed || viewportResized || signature !== lastCommitSignatureRef.current;
     lastCommitSignatureRef.current = signature;
-    if (!layoutMayHaveChanged) return;
+    if (!layoutMayHaveChanged) {
+      syncLayoutPassCountRef.current = 0;
+      return;
+    }
     onMeasuredLayout?.(root, wasAtBottom);
     scrollTopRef.current = root.scrollTop;
     captureViewportAnchor();
-    // A measurement change alters the spacers: re-render (still before paint,
-    // Preact flushes it in a microtask) so the pin below runs on final geometry.
-    if (changed) setLayoutVersion((v) => v + 1);
+    if (!changed) {
+      syncLayoutPassCountRef.current = 0;
+      return;
+    }
+    // Bound consecutive synchronous pre-paint re-renders so subpixel/range-edge
+    // height oscillation (for example after desktop sleep/wake or zoom changes)
+    // cannot lock the main thread in a tight microtask layout loop.
+    syncLayoutPassCountRef.current += 1;
+    if (syncLayoutPassCountRef.current <= 3) {
+      setLayoutVersion((v) => v + 1);
+      return;
+    }
+    if (pendingLayoutRafRef.current === null) {
+      if (typeof requestAnimationFrame === 'function') {
+        pendingLayoutRafRef.current = requestAnimationFrame(() => {
+          pendingLayoutRafRef.current = null;
+          syncLayoutPassCountRef.current = 0;
+          setLayoutVersion((v) => v + 1);
+        });
+      } else {
+        syncLayoutPassCountRef.current = 0;
+      }
+    }
   });
 
   useEffect(() => {
     if (!enabled || typeof ResizeObserver === 'undefined') return undefined;
     const root = scrollRef.current;
     if (!root) return undefined;
+    const observed = observedNodesRef.current;
+    observed.clear();
     const observer = new ResizeObserver((entries) => {
+      const { commitMeasuredRows: commitRows, captureViewportAnchor: captureAnchor, onMeasuredLayout: handleMeasured } =
+        latestLayoutHandlersRef.current;
       const wasAtBottom = wasAtBottomRef.current;
-      const changed = commitMeasuredRows(entries.map((entry) => entry.target as HTMLElement));
+      const changed = commitRows(entries.map((entry) => entry.target as HTMLElement));
       // Do not infer pin state from the post-growth geometry: with
       // `overflow-anchor: none`, a row growing at the bottom makes the current
       // distance non-zero even though the user was pinned immediately before
       // the measurement. That used to classify a pinned stream as a reader
       // anchor, then fight ChatView's follow pass on the next frame.
       if (!changed) return;
-      onMeasuredLayout?.(root, wasAtBottom);
+      handleMeasured?.(root, wasAtBottom);
       scrollTopRef.current = root.scrollTop;
-      captureViewportAnchor();
+      captureAnchor();
       setLayoutVersion((v) => v + 1);
     });
-    root.querySelectorAll<HTMLElement>('[data-virtual-key]').forEach((node) => observer.observe(node));
-    return () => observer.disconnect();
-  }, [enabled, items, layoutVersion, onMeasuredLayout, scrollRef]);
+    resizeObserverRef.current = observer;
+    return () => {
+      observer.disconnect();
+      if (resizeObserverRef.current === observer) resizeObserverRef.current = null;
+      observed.clear();
+    };
+  }, [enabled, scrollRef]);
+
+  useEffect(() => {
+    const observer = resizeObserverRef.current;
+    const root = scrollRef.current;
+    if (!enabled || !observer || !root) return;
+    const observed = observedNodesRef.current;
+    const current = new Set(root.querySelectorAll<HTMLElement>('[data-virtual-key]'));
+    for (const node of observed) {
+      if (!node.isConnected || !current.has(node)) {
+        observer.unobserve(node);
+        observed.delete(node);
+      }
+    }
+    for (const node of current) {
+      if (!observed.has(node)) {
+        observer.observe(node);
+        observed.add(node);
+      }
+    }
+  }, [enabled, items, layoutVersion, scrollRef]);
 
   // Hidden/jsdom panes have no measurable viewport; do not drop rows until a
   // real viewport exists, preserving deterministic rendering and accessibility.
@@ -4146,6 +4233,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     const el = scrollRef.current;
     if (!el || typeof MutationObserver === 'undefined') return undefined;
     const observer = new MutationObserver(() => {
+      if (el.clientHeight <= 0 || (typeof document !== 'undefined' && document.visibilityState === 'hidden')) return;
       if (loadingOlderRef.current || scrollAnchorRef.current) return;
       // A reader's anchor row is re-aligned; only a follower is pinned.
       if (!autoScrollRef.current) { restoreReaderAnchor(); return; }
@@ -4188,6 +4276,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     const deadline = Date.now() + CHAT_MOUNT_SETTLE_MS;
     const timer = setInterval(() => {
       if (Date.now() > deadline) { clearInterval(timer); return; }
+      if (el.clientHeight <= 0 || (typeof document !== 'undefined' && document.visibilityState === 'hidden')) return;
       const following = preview || autoScrollRef.current;
       if (!following) { clearInterval(timer); return; }
       if (loadingOlderRef.current || scrollAnchorRef.current) return;

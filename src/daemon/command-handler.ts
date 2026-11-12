@@ -88,7 +88,16 @@ import {
   type SubSessionRecord,
 } from './subsession-manager.js';
 import { resolveSubSessionCwd } from './subsession-cwd.js';
-import { sendSubSessionSync } from './subsession-sync.js';
+import {
+  buildSubSessionSyncPayload,
+  createSubSessionSyncSharedCache,
+  sendSubSessionSync,
+} from './subsession-sync.js';
+import {
+  SUBSESSION_SYNC_BATCH_MAX_ITEMS,
+  SUBSESSION_SYNC_BATCH_MSG,
+  SUBSESSION_SYNC_REBUILD_CONCURRENCY,
+} from '../../shared/scale-limits.js';
 import { isMemoryPressureShedding } from './memory-guard.js';
 import { DAEMON_MEMORY_PRESSURE_HISTORY_BUDGET_BYTES } from '../../shared/daemon-memory-guard.js';
 import logger from '../util/logger.js';
@@ -1513,6 +1522,35 @@ function refreshQwenQuotaUsageLabels(serverLink?: ServerLink): void {
   if (serverLink) void handleGetSessions(serverLink);
 }
 
+async function syncSubSessionsForPeriodicRefresh(
+  serverLink: ServerLink,
+  sessions: readonly SessionRecord[],
+): Promise<void> {
+  const subSessions = sessions.filter((s) => s.name.startsWith('deck_sub_'));
+  if (subSessions.length === 0) return;
+  const sharedCache = createSubSessionSyncSharedCache();
+  const workerCount = Math.min(SUBSESSION_SYNC_REBUILD_CONCURRENCY, subSessions.length);
+  let nextIdx = 0;
+  const worker = async () => {
+    while (true) {
+      const idx = nextIdx;
+      nextIdx += 1;
+      if (idx >= subSessions.length) return;
+      const session = subSessions[idx]!;
+      const subId = session.name.replace(/^deck_sub_/, '');
+      try {
+        await sendSubSessionSync(serverLink, subId, undefined, {
+          ...(getSubSessionSyncOptions(session.name) ?? {}),
+          sharedCache,
+        });
+      } catch {
+        // not connected
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: workerCount }, worker));
+}
+
 export async function refreshCodexQuotaMetadata(serverLink?: ServerLink): Promise<void> {
   const sessions = listSessions();
   const codexSessions = sessions.filter((session) => session.agentType === 'codex' || session.agentType === 'codex-sdk');
@@ -1525,15 +1563,7 @@ export async function refreshCodexQuotaMetadata(serverLink?: ServerLink): Promis
   }
 
   if (!serverLink) return;
-  for (const session of codexSessions) {
-    if (!session.name.startsWith('deck_sub_')) continue;
-    const subId = session.name.replace(/^deck_sub_/, '');
-    try {
-      await sendSubSessionSync(serverLink, subId, undefined, getSubSessionSyncOptions(session.name));
-    } catch {
-      // not connected
-    }
-  }
+  await syncSubSessionsForPeriodicRefresh(serverLink, codexSessions);
 }
 
 /**
@@ -1550,17 +1580,12 @@ export async function refreshCodexQuotaMetadata(serverLink?: ServerLink): Promis
  */
 export async function refreshClaudeSdkSubQuotaMetadata(serverLink?: ServerLink): Promise<void> {
   if (!serverLink) return;
-  for (const session of listSessions()) {
-    if (session.agentType !== 'claude-code-sdk') continue;
-    if (!session.name.startsWith('deck_sub_')) continue;
-    if (session.state === 'stopped' || session.state === 'error') continue;
-    const subId = session.name.replace(/^deck_sub_/, '');
-    try {
-      await sendSubSessionSync(serverLink, subId, undefined, getSubSessionSyncOptions(session.name));
-    } catch {
-      // not connected
-    }
-  }
+  const eligible = listSessions().filter((session) =>
+    session.agentType === 'claude-code-sdk'
+    && session.name.startsWith('deck_sub_')
+    && session.state !== 'stopped'
+    && session.state !== 'error');
+  await syncSubSessionsForPeriodicRefresh(serverLink, eligible);
 }
 
 /**
@@ -1595,15 +1620,7 @@ export async function refreshAgyQuotaMetadataForSessions(serverLink?: ServerLink
   }
 
   if (!serverLink) return;
-  for (const session of agySessions) {
-    if (!session.name.startsWith('deck_sub_')) continue;
-    const subId = session.name.replace(/^deck_sub_/, '');
-    try {
-      await sendSubSessionSync(serverLink, subId, undefined, getSubSessionSyncOptions(session.name));
-    } catch {
-      // not connected
-    }
-  }
+  await syncSubSessionsForPeriodicRefresh(serverLink, agySessions);
 }
 
 /**
@@ -1630,15 +1647,7 @@ export async function refreshGrokQuotaMetadataForSessions(serverLink?: ServerLin
   }
 
   if (!serverLink) return;
-  for (const session of grokSessions) {
-    if (!session.name.startsWith('deck_sub_')) continue;
-    const subId = session.name.replace(/^deck_sub_/, '');
-    try {
-      await sendSubSessionSync(serverLink, subId, undefined, getSubSessionSyncOptions(session.name));
-    } catch {
-      // not connected
-    }
-  }
+  await syncSubSessionsForPeriodicRefresh(serverLink, grokSessions);
 }
 
 /**
@@ -1665,15 +1674,7 @@ export async function refreshMuseQuotaMetadataForSessions(serverLink?: ServerLin
   }
 
   if (!serverLink) return;
-  for (const session of museSessions) {
-    if (!session.name.startsWith('deck_sub_')) continue;
-    const subId = session.name.replace(/^deck_sub_/, '');
-    try {
-      await sendSubSessionSync(serverLink, subId, undefined, getSubSessionSyncOptions(session.name));
-    } catch {
-      // not connected
-    }
-  }
+  await syncSubSessionsForPeriodicRefresh(serverLink, museSessions);
 }
 
 // ── @@ token parsing ─────────────────────────────────────────────────────────
@@ -8067,11 +8068,45 @@ async function handleSubSessionRebuildAll(cmd: Record<string, unknown>, serverLi
   const subSessions = cmd.subSessions as SubSessionRecord[] | undefined;
   if (!Array.isArray(subSessions)) return;
   await rebuildSubSessions(subSessions).catch((e: unknown) => logger.error({ err: e }, 'subsession.rebuild_all failed'));
-  for (const sub of subSessions) {
+  const sharedCache = createSubSessionSyncSharedCache();
+  const payloads = new Array<Record<string, unknown> | null>(subSessions.length).fill(null);
+  const workerCount = Math.min(SUBSESSION_SYNC_REBUILD_CONCURRENCY, Math.max(1, subSessions.length));
+  let nextIdx = 0;
+  const worker = async () => {
+    while (true) {
+      const idx = nextIdx;
+      nextIdx += 1;
+      if (idx >= subSessions.length) return;
+      const sub = subSessions[idx]!;
+      try {
+        const opts = getSubSessionSyncOptions(`deck_sub_${sub.id}`);
+        payloads[idx] = await buildSubSessionSyncPayload(sub.id, undefined, { ...(opts ?? {}), sharedCache });
+      } catch (e) {
+        logger.warn({ err: e, id: sub.id }, 'Failed to build rebuilt sub-session sync payload');
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: workerCount }, worker));
+
+  const validPayloads = payloads.filter((p): p is Record<string, unknown> => p !== null);
+  if (cmd.supportsSyncBatch === true) {
+    for (let i = 0; i < validPayloads.length; i += SUBSESSION_SYNC_BATCH_MAX_ITEMS) {
+      const items = validPayloads.slice(i, i + SUBSESSION_SYNC_BATCH_MAX_ITEMS);
+      try {
+        serverLink.send({ type: SUBSESSION_SYNC_BATCH_MSG, items });
+      } catch (e) {
+        logger.warn({ err: e, count: items.length }, 'Failed to send subsession.sync.batch');
+      }
+    }
+    return;
+  }
+
+  // Backward-compatible fallback for older servers that only speak individual `subsession.sync`.
+  for (const payload of validPayloads) {
     try {
-      await sendSubSessionSync(serverLink, sub.id, undefined, getSubSessionSyncOptions(`deck_sub_${sub.id}`));
+      serverLink.send(payload);
     } catch (e) {
-      logger.warn({ err: e, id: sub.id }, 'Failed to sync rebuilt sub-session');
+      logger.warn({ err: e, id: payload.id }, 'Failed to sync rebuilt sub-session');
     }
   }
 }

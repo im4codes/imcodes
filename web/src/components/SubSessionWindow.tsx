@@ -566,12 +566,15 @@ export function SubSessionWindow({
   }, [sub.id, geom, viewMode, isDesktopMaximized]);
 
   useEffect(() => {
-    if (isMobile) return;
+    if (isMobile || !visible) return;
     const onResize = () => {
       if (isDesktopMaximized) {
         setMaximizeBoundsVersion((v) => v + 1);
       } else {
-        setGeom((g) => clampDesktopGeom(g));
+        setGeom((g) => {
+          const next = clampDesktopGeom(g);
+          return next.x === g.x && next.y === g.y && next.w === g.w && next.h === g.h ? g : next;
+        });
       }
     };
     window.addEventListener('resize', onResize);

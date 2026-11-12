@@ -43,6 +43,7 @@ import { EmbeddingStatusIcon } from './EmbeddingStatusIcon.js';
 import { SharedStateIndicator } from './SharedStateIndicator.js';
 import type { SharedStateSummary } from '../tab-sharing-ui.js';
 import type { EmbeddingStatus } from '@shared/embedding-status.js';
+import { SUBSESSION_BAR_MAX_EXPANDED_CARDS } from '@shared/scale-limits.js';
 import type { DiskUsage } from '@shared/disk-usage.js';
 import type { MemoryShortRefHealth } from '@shared/memory-short-ref-health.js';
 import { formatDaemonVersionMobile, formatDaemonVersionShort } from '../util/format-version.js';
@@ -122,6 +123,7 @@ interface CollapsedSubSessionButtonProps {
   usage?: { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string };
   detectedModel?: string;
   orientation?: 'horizontal' | 'vertical';
+  extraClass?: string;
   sharedState?: SharedStateSummary | null;
   inP2p: boolean;
   draggable?: boolean;
@@ -362,7 +364,40 @@ function renderTechClock(text: string): JSX.Element {
   );
 }
 
-function CollapsedSubSessionButtonImpl({ sub, accentColor, isOpen, isFocused, idleFlashToken, usage, sharedState, inP2p, draggable, onEntryPointerDown, onEntryTouchStart, onEntryClick, onEntryDoubleClick, onEntryDragStart, onEntryDragOver, onEntryDragEnd, onContextMenu, pinned, t, detectedModel, orientation = 'horizontal' }: CollapsedSubSessionButtonProps) {
+export function selectPrioritizedExpandedSessions(
+  orderedSessions: SubSession[],
+  openIds: Set<string>,
+  focusedSubId: string | null | undefined,
+  maxExpandedCards = SUBSESSION_BAR_MAX_EXPANDED_CARDS,
+): { cardSessions: SubSession[]; overflowSessions: SubSession[] } {
+  if (orderedSessions.length <= maxExpandedCards) {
+    return { cardSessions: orderedSessions, overflowSessions: [] };
+  }
+  const selectedIds = new Set<string>();
+  const addTier = (predicate: (sub: SubSession) => boolean, enforceCap: boolean) => {
+    for (const sub of orderedSessions) {
+      if (enforceCap && selectedIds.size >= maxExpandedCards) break;
+      if (selectedIds.has(sub.id)) continue;
+      if (predicate(sub)) selectedIds.add(sub.id);
+    }
+  };
+  // Focused or currently open floating cards always remain hydrated.
+  addTier((sub) => focusedSubId === sub.id || openIds.has(sub.id), false);
+  // Active/running/queued sessions take precedence over idle historical sessions.
+  addTier((sub) => isVisuallyBusy(sub.state, false) || sub.state === 'error', true);
+  // Fill remaining expanded slots in bar visual order.
+  addTier(() => true, true);
+
+  const cardSessions: SubSession[] = [];
+  const overflowSessions: SubSession[] = [];
+  for (const sub of orderedSessions) {
+    if (selectedIds.has(sub.id)) cardSessions.push(sub);
+    else overflowSessions.push(sub);
+  }
+  return { cardSessions, overflowSessions };
+}
+
+function CollapsedSubSessionButtonImpl({ sub, accentColor, isOpen, isFocused, idleFlashToken, usage, sharedState, inP2p, draggable, onEntryPointerDown, onEntryTouchStart, onEntryClick, onEntryDoubleClick, onEntryDragStart, onEntryDragOver, onEntryDragEnd, onContextMenu, pinned, t, detectedModel, orientation = 'horizontal', extraClass }: CollapsedSubSessionButtonProps) {
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
   const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
@@ -384,7 +419,7 @@ function CollapsedSubSessionButtonImpl({ sub, accentColor, isOpen, isFocused, id
     <button
       key={sub.id}
       data-sub-id={sub.id}
-      class={`subsession-card${orientation === 'vertical' ? ' subsession-card-rail' : ''}${isOpen ? ' open' : ''}${isFocused ? ' focused' : ''} mobile${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}`}
+      class={`subsession-card${orientation === 'vertical' ? ' subsession-card-rail' : ''}${isOpen ? ' open' : ''}${isFocused ? ' focused' : ''} mobile${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}${extraClass ? ` ${extraClass}` : ''}`}
       draggable={draggable}
       onPointerDown={(event) => onEntryPointerDown(sub.id, event)}
       onTouchStart={() => onEntryTouchStart(sub.id)}
@@ -456,6 +491,7 @@ const CollapsedSubSessionButton = memo(CollapsedSubSessionButtonImpl, (prev, nex
   && prev.t === next.t
   && prev.detectedModel === next.detectedModel
   && prev.orientation === next.orientation
+  && prev.extraClass === next.extraClass
 ));
 
 function ExpandedSubSessionPlaceholder({ sub, accentColor, cardSize, sharedState, inP2p, t }: { sub: SubSession; accentColor: string; cardSize: CardSize; sharedState?: SharedStateSummary | null; inP2p: boolean; t: (key: string, vars?: Record<string, unknown>) => string }) {
@@ -1027,9 +1063,13 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   const currentExpandedPreviewBudget = expandedPreviewKeyRef.current === orderedSessionIdsKey
     ? expandedPreviewBudget
     : EXPANDED_PREVIEW_INITIAL_COUNT;
+  const { cardSessions: expandedCardSessions, overflowSessions: expandedOverflowSessions } = useMemo(
+    () => selectPrioritizedExpandedSessions(orderedSessions, openIds, focusedSubId, SUBSESSION_BAR_MAX_EXPANDED_CARDS),
+    [orderedSessions, openIds, focusedSubId],
+  );
   const hydratedExpandedPreviewIds = useMemo(
-    () => new Set(orderedSessions.slice(0, currentExpandedPreviewBudget).map((sub) => sub.id)),
-    [currentExpandedPreviewBudget, orderedSessionIdsKey],
+    () => new Set(expandedCardSessions.slice(0, currentExpandedPreviewBudget).map((sub) => sub.id)),
+    [currentExpandedPreviewBudget, expandedCardSessions],
   );
   const openSubWindowCount = useMemo(
     () => orderedSessionIds.filter((id) => openIds.has(id)).length,
@@ -1132,7 +1172,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       setExpandedPreviewBudget(0);
       return;
     }
-    const total = orderedSessions.length;
+    const total = expandedCardSessions.length;
     const initial = Math.min(total, EXPANDED_PREVIEW_INITIAL_COUNT);
     setExpandedPreviewBudget(initial);
     if (initial >= total) return;
@@ -1153,7 +1193,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [collapsed, orderedSessionIdsKey, orderedSessions.length]);
+  }, [collapsed, orderedSessionIdsKey, expandedCardSessions.length]);
 
   useEffect(() => {
     save(SUBSESSION_BAR_COLLAPSED_STORAGE_KEY, collapsed);
@@ -1517,11 +1557,16 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     </button>
   ) : null;
 
-  const renderCompactSubSessionButtons = (orientation: 'horizontal' | 'vertical') => orderedSessions.map((sub) => (
+  const renderCompactSubSessionButtons = (
+    orientation: 'horizontal' | 'vertical',
+    sessionsToRender: SubSession[] = orderedSessions,
+    extraClass?: string,
+  ) => sessionsToRender.map((sub) => (
     <CollapsedSubSessionButton
       key={sub.id}
       sub={sub}
       orientation={orientation}
+      extraClass={extraClass}
       accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
       isOpen={openIds.has(sub.id)}
       isFocused={isMobile ? openIds.has(sub.id) : focusedSubId === sub.id}
@@ -2035,7 +2080,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
             class={`subcard-scroll ${layout === 'double' ? 'subcard-double' : 'subcard-single'}`}
             style={layout === 'double' ? { gridAutoColumns: 'max-content' } : undefined}
           >
-            {orderedSessions.map((sub, index) => (
+            {expandedCardSessions.map((sub, index) => (
               <div
                 key={sub.id}
                 class="subcard-drag-wrap"
@@ -2114,6 +2159,15 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                 )}
               </div>
             ))}
+            {expandedOverflowSessions.length > 0 && (
+              <div
+                class="subsession-overflow-pills"
+                data-testid="subsession-overflow-pills"
+                style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, padding: '4px 6px' }}
+              >
+                {renderCompactSubSessionButtons('horizontal', expandedOverflowSessions, 'subsession-pill')}
+              </div>
+            )}
           </div>
         </div>
       )}

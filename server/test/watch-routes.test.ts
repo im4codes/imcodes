@@ -1135,4 +1135,43 @@ describe('Watch routes', () => {
     expect(historyRes.headers.get(IMCODES_POD_HEADER)).toBe('pod-a');
     expect(sendRes.headers.get(IMCODES_POD_HEADER)).toBe('pod-a');
   });
+
+  it('GET /api/watch/sessions bounds concurrent getRecentTextForWatch calls to WATCH_RECENT_TEXT_CONCURRENCY', async () => {
+    mockGetDbSessionsByServer.mockResolvedValue(
+      Array.from({ length: 15 }, (_, m) => ({
+        name: `deck_proj_${m}_brain`,
+        project_name: `proj_${m}`,
+        label: `Main ${m}`,
+        state: 'idle',
+        agent_type: 'claude-code-sdk',
+      })),
+    );
+    mockGetSubSessionsByServer.mockResolvedValue(
+      Array.from({ length: 45 }, (_, s) => ({
+        id: `sub_${s}`,
+        type: 'codex-sdk',
+        label: `Sub ${s}`,
+        parent_session: `deck_proj_${s % 15}_brain`,
+        closed_at: null,
+      })),
+    );
+
+    let active = 0;
+    let peak = 0;
+    mockGetRecentTextForWatch.mockImplementation(async () => {
+      active += 1;
+      if (active > peak) peak = active;
+      await new Promise((r) => setTimeout(r, 8));
+      active -= 1;
+      return [{ eventId: 'ev1', type: 'assistant.text', text: 'ok', ts: 1 }];
+    });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/watch/sessions?serverId=srv-1');
+    expect(res.status).toBe(200);
+    const body = await res.json() as { sessions: unknown[] };
+    expect(body.sessions).toHaveLength(60);
+    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBeLessThanOrEqual(20);
+  });
 });

@@ -1122,6 +1122,81 @@ export async function createSubSession(
   };
 }
 
+export interface SubSessionBatchUpsertInput {
+  id: string;
+  serverId: string;
+  type: string;
+  shellBin: string | null;
+  cwd: string | null;
+  label: string | null;
+  ccSessionId: string | null;
+  geminiSessionId?: string | null;
+  parentSession?: string | null;
+  runtimeType?: string | null;
+  providerId?: string | null;
+  providerSessionId?: string | null;
+  description?: string | null;
+  ccPresetId?: string | null;
+  requestedModel?: string | null;
+  activeModel?: string | null;
+  effort?: string | null;
+  transportConfig?: Record<string, unknown> | null;
+  executionCloneMetadata?: Record<string, unknown> | null;
+}
+
+export async function createSubSessionsBatch(
+  db: Database,
+  rows: SubSessionBatchUpsertInput[],
+): Promise<void> {
+  if (rows.length === 0) return;
+  // Deduplicate by (id, serverId) keeping the latest entry so PostgreSQL
+  // ON CONFLICT DO UPDATE never hits a single-statement duplicate conflict.
+  const dedupedMap = new Map<string, SubSessionBatchUpsertInput>();
+  for (const row of rows) {
+    dedupedMap.set(`${row.serverId}\0${row.id}`, row);
+  }
+  const deduped = Array.from(dedupedMap.values());
+  const now = Date.now();
+  const params: unknown[] = [];
+  const tuples: string[] = [];
+  for (let i = 0; i < deduped.length; i += 1) {
+    const r = deduped[i];
+    const base = i * 21;
+    tuples.push(
+      `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, NULL, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10}, $${base + 11}, $${base + 12}, $${base + 13}, $${base + 14}, $${base + 15}, $${base + 16}, $${base + 17}, $${base + 18}, $${base + 19}, $${base + 20}::jsonb, $${base + 21}::jsonb)`,
+    );
+    params.push(
+      r.id,
+      r.serverId,
+      r.type,
+      r.shellBin ?? null,
+      r.cwd ?? null,
+      r.label ?? null,
+      r.ccSessionId ?? null,
+      r.geminiSessionId ?? null,
+      r.parentSession ?? null,
+      r.runtimeType ?? null,
+      r.providerId ?? null,
+      r.providerSessionId ?? null,
+      r.description ?? null,
+      now,
+      now,
+      r.ccPresetId ?? null,
+      r.requestedModel ?? null,
+      r.activeModel ?? null,
+      r.effort ?? null,
+      JSON.stringify(r.transportConfig ?? {}),
+      r.executionCloneMetadata == null ? null : JSON.stringify(r.executionCloneMetadata),
+    );
+  }
+  await db.execute(
+    `INSERT INTO sub_sessions (id, server_id, type, shell_bin, cwd, label, closed_at, cc_session_id, gemini_session_id, parent_session, runtime_type, provider_id, provider_session_id, description, created_at, updated_at, cc_preset_id, requested_model, active_model, effort, transport_config, execution_clone_metadata)
+     VALUES ${tuples.join(', ')}
+     ON CONFLICT (id, server_id) DO UPDATE SET type = EXCLUDED.type, shell_bin = EXCLUDED.shell_bin, cwd = EXCLUDED.cwd, label = COALESCE(EXCLUDED.label, sub_sessions.label), closed_at = NULL, cc_session_id = CASE WHEN EXCLUDED.execution_clone_metadata->>'kind' = 'execution_clone' THEN EXCLUDED.cc_session_id ELSE COALESCE(EXCLUDED.cc_session_id, sub_sessions.cc_session_id) END, gemini_session_id = CASE WHEN EXCLUDED.execution_clone_metadata->>'kind' = 'execution_clone' THEN EXCLUDED.gemini_session_id ELSE COALESCE(EXCLUDED.gemini_session_id, sub_sessions.gemini_session_id) END, parent_session = COALESCE(EXCLUDED.parent_session, sub_sessions.parent_session), runtime_type = COALESCE(EXCLUDED.runtime_type, sub_sessions.runtime_type), provider_id = COALESCE(EXCLUDED.provider_id, sub_sessions.provider_id), provider_session_id = CASE WHEN EXCLUDED.execution_clone_metadata->>'kind' = 'execution_clone' THEN EXCLUDED.provider_session_id ELSE COALESCE(EXCLUDED.provider_session_id, sub_sessions.provider_session_id) END, description = COALESCE(EXCLUDED.description, sub_sessions.description), updated_at = EXCLUDED.updated_at, cc_preset_id = COALESCE(EXCLUDED.cc_preset_id, sub_sessions.cc_preset_id), requested_model = COALESCE(EXCLUDED.requested_model, sub_sessions.requested_model), active_model = COALESCE(EXCLUDED.active_model, sub_sessions.active_model), effort = COALESCE(EXCLUDED.effort, sub_sessions.effort), transport_config = CASE WHEN EXCLUDED.transport_config = '{}'::jsonb THEN sub_sessions.transport_config ELSE EXCLUDED.transport_config END, execution_clone_metadata = EXCLUDED.execution_clone_metadata`,
+    params,
+  );
+}
+
 export async function updateSubSession(
   db: Database,
   id: string,

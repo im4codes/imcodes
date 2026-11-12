@@ -19,6 +19,7 @@ import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../../shared/timeline-payload-
 import { TIMELINE_RESPONSE_STATUS } from '../../../shared/timeline-protocol.js';
 import { TIMELINE_HISTORY_LIMITS, clampTimelineHistoryLimit } from '../../../shared/timeline-history-limits.js';
 import { isRecoverableTimelineRequestErrorReason } from '../../../shared/timeline-history-errors.js';
+import { WATCH_RECENT_TEXT_CONCURRENCY } from '../../../shared/scale-limits.js';
 import { getPodIdentity } from '../util/pod-identity.js';
 import logger from '../util/logger.js';
 // Shared so the daemon (command-handler.ts) and server emit the SAME log
@@ -382,6 +383,27 @@ watchRoutes.get('/watch/servers', requireAuth(), async (c) => {
   });
 });
 
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) return [];
+  const results = new Array<R>(items.length);
+  const workerCount = Math.min(Math.max(1, limit), items.length);
+  let nextIndex = 0;
+  const worker = async () => {
+    while (true) {
+      const current = nextIndex;
+      nextIndex += 1;
+      if (current >= items.length) return;
+      results[current] = await fn(items[current]!);
+    }
+  };
+  await Promise.all(Array.from({ length: workerCount }, worker));
+  return results;
+}
+
 watchRoutes.get('/watch/sessions', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.query('serverId')?.trim();
@@ -412,7 +434,7 @@ watchRoutes.get('/watch/sessions', requireAuth(), async (c) => {
     .filter((session) => !session.name.startsWith('deck_sub_'));
 
   const mainTitleBySession = new Map<string, string>();
-  const mainRows = await Promise.all(mainSessions.map(async (session) => {
+  const mainRows = await mapWithConcurrency(mainSessions, WATCH_RECENT_TEXT_CONCURRENCY, async (session) => {
     const recentText = await bridge.getRecentTextForWatch(session.name);
     const latest = recentText.at(-1);
     const row = {
@@ -431,30 +453,29 @@ watchRoutes.get('/watch/sessions', requireAuth(), async (c) => {
     };
     mainTitleBySession.set(session.name, row.title);
     return row;
-  }));
+  });
 
   const activeMainNames = new Set(mainRows.map((row) => row.sessionName));
-  const subRows = await Promise.all(subSessions
-    .filter((sub) => sub.parent_session && activeMainNames.has(sub.parent_session))
-    .map(async (sub) => {
-      const sessionName = `deck_sub_${sub.id}`;
-      const recentText = await bridge.getRecentTextForWatch(sessionName);
-      const latest = recentText.at(-1);
-      return {
-        serverId,
-        sessionName,
-        title: titleForSubSession(sub),
-        state: normalizeState(sub.closed_at ? 'stopped' : 'running'),
-        agentBadge: badgeForType(sub.type),
-        isSubSession: true,
-        parentTitle: sub.parent_session ? mainTitleBySession.get(sub.parent_session) : undefined,
-        parentSessionName: sub.parent_session ?? undefined,
-        isPinned: false,
-        previewText: latest?.text ?? undefined,
-        previewUpdatedAt: latest?.ts ?? undefined,
-        recentText,
-      };
-    }));
+  const activeSubs = subSessions.filter((sub) => sub.parent_session && activeMainNames.has(sub.parent_session));
+  const subRows = await mapWithConcurrency(activeSubs, WATCH_RECENT_TEXT_CONCURRENCY, async (sub) => {
+    const sessionName = `deck_sub_${sub.id}`;
+    const recentText = await bridge.getRecentTextForWatch(sessionName);
+    const latest = recentText.at(-1);
+    return {
+      serverId,
+      sessionName,
+      title: titleForSubSession(sub),
+      state: normalizeState(sub.closed_at ? 'stopped' : 'running'),
+      agentBadge: badgeForType(sub.type),
+      isSubSession: true,
+      parentTitle: sub.parent_session ? mainTitleBySession.get(sub.parent_session) : undefined,
+      parentSessionName: sub.parent_session ?? undefined,
+      isPinned: false,
+      previewText: latest?.text ?? undefined,
+      previewUpdatedAt: latest?.ts ?? undefined,
+      recentText,
+    };
+  });
 
   const orderedMainRows = orderMainSessions(mainRows, tabPrefs.order, tabPrefs.pinned);
   const sessions = [...orderedMainRows, ...subRows];

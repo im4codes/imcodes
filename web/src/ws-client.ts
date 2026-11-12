@@ -87,6 +87,7 @@ import type {
 } from '../../src/shared/transport/fs.js';
 import type { DaemonBuildInfo } from '@shared/build-manifest-types.js';
 import type { DirectFileTransferServerMessage } from '@shared/direct-file-transfer.js';
+import { SUBSESSION_CREATED_BATCH_MSG } from '@shared/scale-limits.js';
 
 export type MessageHandler = (msg: ServerMessage) => void;
 export type SessionMessageHandler = (msg: ServerMessage) => void;
@@ -277,6 +278,7 @@ export type ServerMessage =
   | { type: typeof P2P_CONFIG_MSG.SAVE_RESPONSE; requestId: string; scopeSession: string; ok: boolean; error?: string }
   | { type: typeof P2P_WORKFLOW_MSG.CONFLICT; existingRunId: string; initiatorSession: string; commandId: string }
   | { type: 'subsession.created'; id: string; sessionName: string; sessionInstanceId?: string; runtimeEpoch?: string; activityGeneration?: import('../../shared/session-activity-types.js').ActivityGenerationLike; sessionType: string; cwd?: string; label?: string; parentSession?: string; state?: string; runtimeType?: 'process' | 'transport' | null; providerId?: string | null; providerSessionId?: string | null; ccPresetId?: string | null; requestedModel?: string | null; activeModel?: string | null; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace'] | null; contextNamespaceDiagnostics?: string[] | null; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextRetryExhausted?: boolean | null; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride | null; transportConfig?: Record<string, unknown> | null; supervisionMode?: import('../../shared/supervision-config.js').SupervisionMode | null; supervisionHeartbeat?: import('../../shared/supervision-heartbeat.js').SupervisionHeartbeatSnapshot | null; qwenModel?: string | null; qwenAuthType?: string | null; qwenAvailableModels?: string[] | null; codexAvailableModels?: string[] | null; modelDisplay?: string | null; planLabel?: string | null; permissionLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; codexCreditsBalance?: string | null; codexCreditsHasCredits?: boolean | null; codexCreditsUnlimited?: boolean | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null; transportPendingMessageEntries?: TransportPendingMessageEntry[]; queueEpoch?: string; queueAuthorityId?: string; failedMessageEntries?: TransportPendingMessageEntry[]; pendingMessageVersion?: number; transportPendingMessageVersion?: number }
+  | { type: typeof SUBSESSION_CREATED_BATCH_MSG; items: Array<Extract<ServerMessage, { type: 'subsession.created' }>> }
   | { type: 'subsession.sync'; id: string; sessionName?: string; sessionInstanceId?: string; runtimeEpoch?: string; activityGeneration?: import('../../shared/session-activity-types.js').ActivityGenerationLike; state?: string; cwd?: string; label?: string; ccPresetId?: string | null; requestedModel?: string | null; activeModel?: string | null; providerId?: string | null; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace'] | null; contextNamespaceDiagnostics?: string[] | null; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextRetryExhausted?: boolean | null; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride | null; transportConfig?: Record<string, unknown> | null; supervisionHeartbeat?: import('../../shared/supervision-heartbeat.js').SupervisionHeartbeatSnapshot | null; qwenModel?: string | null; codexAvailableModels?: string[] | null; modelDisplay?: string | null; planLabel?: string | null; permissionLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; codexCreditsBalance?: string | null; codexCreditsHasCredits?: boolean | null; codexCreditsUnlimited?: boolean | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null; transportPendingMessageEntries?: TransportPendingMessageEntry[]; queueEpoch?: string; queueAuthorityId?: string; failedMessageEntries?: TransportPendingMessageEntry[]; pendingMessageVersion?: number; transportPendingMessageVersion?: number }
   | { type: 'subsession.removed'; id: string; sessionName: string }
   | { type: typeof P2P_WORKFLOW_MSG.RUN_STARTED; runId: string; session: string }
@@ -540,6 +542,8 @@ export class WsClient {
   private pendingInput: Array<{ sessionName: string; data: string }> = [];
   private pendingInputBytes = 0;
   private _connecting = false;
+  private attemptStartedAt = 0;
+  private wsOpenStartedAt = 0;
   private _destroyed = false;
   /** Timeline backlog delivery is yielded after a small first-paint burst. */
   private pendingTimelineEvents: TimelineEventMessage[] = [];
@@ -866,10 +870,24 @@ export class WsClient {
    */
   probeConnection(timeoutMs = RESUME_PROBE_TIMEOUT_MS): void {
     // Ticket acquisition and socket opening already have bounded watchdogs.
-    // Resume/focus must not restart them before they can finish.
-    if (this._destroyed || this.connectionAttemptInFlight) return;
+    // Resume/focus must not restart them before they can finish, unless OS sleep
+    // suspended timers past their wall-clock deadline.
+    if (this._destroyed) return;
+    if (this.connectionAttemptInFlight) {
+      if (this.isConnectionAttemptWallClockStale()) {
+        this.reconnectNow(true);
+      }
+      return;
+    }
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       this.reconnectNow(false);
+      return;
+    }
+
+    // Desktop sleep/lock often resumes via `focus` only without `visibilitychange`.
+    // If pong age exceeds 2x stale threshold, tear down the dead TCP socket immediately.
+    if (this._lastPongAt > 0 && Date.now() - this._lastPongAt > RESUME_FORCE_STALE_PONG_MS * 2) {
+      this.reconnectNow(true);
       return;
     }
 
@@ -925,7 +943,13 @@ export class WsClient {
    * mobile WebView zombie states that otherwise require killing the app.
    */
   resumeConnection(forceIfStale = false): void {
-    if (this._destroyed || this.connectionAttemptInFlight) return;
+    if (this._destroyed) return;
+    if (this.connectionAttemptInFlight) {
+      if (this.isConnectionAttemptWallClockStale()) {
+        this.reconnectNow(true);
+      }
+      return;
+    }
     if (!forceIfStale) {
       this.probeConnection();
       return;
@@ -1460,7 +1484,7 @@ export class WsClient {
     let sent = false;
     for (const batch of chunkSubSessionRebuildBatches(subSessions)) {
       try {
-        this.send({ type: 'subsession.rebuild_all', subSessions: batch });
+        this.send({ type: 'subsession.rebuild_all', subSessions: batch, supportsCreatedBatch: true });
         sent = true;
       } catch (err) {
         console.warn(
@@ -2239,6 +2263,8 @@ export class WsClient {
       this.detachCurrentSocket(4001, 'client reconnect stale socket');
     }
     this._connecting = true;
+    this.attemptStartedAt = Date.now();
+    this.wsOpenStartedAt = 0;
     const generation = ++this.socketGeneration;
 
     const wsUrl = this.baseUrl
@@ -2276,6 +2302,8 @@ export class WsClient {
     } catch (err) {
       if (generation !== this.socketGeneration) return;
       this._connecting = false;
+      this.attemptStartedAt = 0;
+      this.wsOpenStartedAt = 0;
       // Auth expired (401) → onAuthExpired already fired, don't keep reconnecting
       if (err instanceof ApiError && err.status === 401) return;
       this.scheduleReconnect();
@@ -2289,6 +2317,8 @@ export class WsClient {
     if (generation !== this.socketGeneration) return;
     if (this._destroyed) {
       this._connecting = false;
+      this.attemptStartedAt = 0;
+      this.wsOpenStartedAt = 0;
       return;
     }
 
@@ -2297,10 +2327,12 @@ export class WsClient {
     if (this.ws) {
       this.detachCurrentSocket(4001, 'client replace stale socket');
       this._connecting = true;
+      this.attemptStartedAt = Date.now();
     }
 
     const socket = new WebSocket(url);
     this.ws = socket;
+    this.wsOpenStartedAt = Date.now();
     socket.binaryType = 'arraybuffer';
     this.armWsOpenTimer(socket, generation);
 
@@ -2308,6 +2340,8 @@ export class WsClient {
       if (!this.isCurrentSocket(socket, generation)) return;
       this.clearWsOpenTimer();
       this._connecting = false;
+      this.attemptStartedAt = 0;
+      this.wsOpenStartedAt = 0;
       this._connected = true;
       this._probePending = false;
       // Rebuild state is scoped to the actual WebSocket. Probe recovery keeps
@@ -2537,6 +2571,16 @@ export class WsClient {
     this.postConnectNonCriticalSlots = 0;
   }
 
+  private isConnectionAttemptWallClockStale(now = Date.now()): boolean {
+    if (this.ws && this.ws.readyState === WebSocket.CONNECTING) {
+      return this.wsOpenStartedAt > 0 && now - this.wsOpenStartedAt >= WS_OPEN_TIMEOUT_MS;
+    }
+    if (this._connecting) {
+      return this.attemptStartedAt > 0 && now - this.attemptStartedAt >= WS_TICKET_TIMEOUT_MS;
+    }
+    return false;
+  }
+
   private detachCurrentSocket(code: number, reason: string): void {
     const socket = this.ws;
     const wasConnected = this._connected;
@@ -2544,6 +2588,8 @@ export class WsClient {
     this._connected = false;
     this._probePending = false;
     this._connecting = false;
+    this.attemptStartedAt = 0;
+    this.wsOpenStartedAt = 0;
     this.clearSocketTimers();
     if (wasConnected) {
       this.dispatch({
@@ -2586,6 +2632,8 @@ export class WsClient {
       this.socketGeneration++;
       this.abortWsTicketRequest();
       this._connecting = false;
+      this.attemptStartedAt = 0;
+      this.wsOpenStartedAt = 0;
     }
 
     if (this.ws) {
@@ -2594,6 +2642,8 @@ export class WsClient {
       this._connected = false;
       this._probePending = false;
       this._connecting = false;
+      this.attemptStartedAt = 0;
+      this.wsOpenStartedAt = 0;
       this.clearSocketTimers();
     }
 

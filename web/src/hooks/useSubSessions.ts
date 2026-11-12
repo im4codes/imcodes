@@ -32,6 +32,7 @@ import {
 import { TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE, type QueueEvent } from '@shared/transport-queue-types.js';
 import { isValidTransportQueueWireEvent } from '@shared/transport-queue-wire.js';
 import { isActiveTurnFinishedError } from '../session-live-status.js';
+import { SUBSESSION_CREATED_BATCH_MSG } from '@shared/scale-limits.js';
 
 export interface SubSession extends SubSessionData {
   sessionName: string;
@@ -305,104 +306,124 @@ export function useSubSessions(
       let sessionName: string | undefined;
       let state: string | undefined;
 
-      // Sub-session created by daemon (e.g., discussion orchestrator)
-      if (msg.type === 'subsession.created') {
-        const m = msg as any;
-        if (m.id) {
+      // Sub-session created or synced by daemon (single or batched rebuild replay)
+      if (msg.type === 'subsession.created' || msg.type === SUBSESSION_CREATED_BATCH_MSG) {
+        const items: any[] = msg.type === SUBSESSION_CREATED_BATCH_MSG ? (Array.isArray((msg as any).items) ? (msg as any).items : []) : [msg];
+        const validItems = items.filter((m) => m && m.id);
+        if (validItems.length > 0) {
           setSubSessions((prev) => {
-            // Update existing sub-session metadata (subsession.sync re-broadcasts arrive as subsession.created)
-            const existingIdx = prev.findIndex((s) => s.id === m.id);
-            if (existingIdx !== -1) {
-              const updated = [...prev];
-              const existing = updated[existingIdx];
-              if (isOlderActivityGeneration(m.activityGeneration, existing.activityGeneration)) return prev;
-              const preserveQuota = isQuotaPreservingSubSessionType(existing.type);
-              const transportPendingPatch = buildTransportPendingSyncPatch(
-                existing,
-                m,
-                existing.sessionName,
-              );
-              updated[existingIdx] = { ...updated[existingIdx],
-                ...(m.activityGeneration !== undefined && { activityGeneration: m.activityGeneration as ActivityGenerationLike }),
-                ...(m.state != null && { state: m.state as SubSession['state'] }),
-                ...(m.sessionInstanceId !== undefined && { sessionInstanceId: m.sessionInstanceId }),
-                ...(m.runtimeEpoch !== undefined && { runtimeEpoch: m.runtimeEpoch }),
-                ...(m.cwd != null && { cwd: m.cwd }),
-                ...(m.label != null && { label: m.label }),
-                ...(m.ccPresetId !== undefined && { ccPresetId: m.ccPresetId }),
-                ...(m.modelDisplay != null && { modelDisplay: m.modelDisplay }),
-                ...(m.requestedModel !== undefined && { requestedModel: m.requestedModel }),
-                ...(m.activeModel !== undefined && { activeModel: m.activeModel }),
-                ...((m.planLabel != null || (!preserveQuota && m.planLabel === null)) ? { planLabel: m.planLabel } : {}),
-                ...((m.quotaLabel != null || (!preserveQuota && m.quotaLabel === null)) ? { quotaLabel: m.quotaLabel } : {}),
-                ...((m.quotaUsageLabel != null || (!preserveQuota && m.quotaUsageLabel === null)) ? { quotaUsageLabel: m.quotaUsageLabel } : {}),
-                ...((m.quotaMeta != null || (!preserveQuota && m.quotaMeta === null)) ? { quotaMeta: m.quotaMeta } : {}),
-                ...(m.effort != null && { effort: m.effort }),
-                ...(m.contextNamespace !== undefined && { contextNamespace: m.contextNamespace }),
-                ...(m.contextNamespaceDiagnostics !== undefined && { contextNamespaceDiagnostics: m.contextNamespaceDiagnostics }),
-                ...(m.executionCloneKind !== undefined && { executionCloneKind: m.executionCloneKind }),
-                ...(m.parentRunId !== undefined && { parentRunId: m.parentRunId }),
-                ...(m.transportConfig !== undefined && {
-                  transportConfig: mergeTransportConfigPreservingSupervision(
-                    m.transportConfig,
-                    updated[existingIdx].transportConfig,
-                  ),
-                }),
-                ...(m.supervisionMode !== undefined && { supervisionMode: m.supervisionMode }),
-                ...(m.supervisionHeartbeat !== undefined && {
-                  supervisionHeartbeat: parseSupervisionHeartbeatSnapshot(m.supervisionHeartbeat),
-                }),
-                ...transportPendingPatch,
-                ...(m.qwenModel != null && { qwenModel: m.qwenModel }),
-                ...(m.qwenAuthType != null && { qwenAuthType: m.qwenAuthType }),
-                ...(m.qwenAvailableModels != null && { qwenAvailableModels: m.qwenAvailableModels }),
-                ...((m.codexAvailableModels != null || (!preserveQuota && m.codexAvailableModels === null)) ? { codexAvailableModels: m.codexAvailableModels } : {}),
-                updatedAt: Date.now(),
-              };
-              return updated;
+            // Avoid building an O(N) Map on single-item updates (e.g. legacy 1-by-1 stream).
+            const indexById = validItems.length > 1 ? new Map<string, number>() : null;
+            if (indexById) {
+              for (let i = 0; i < prev.length; i += 1) indexById.set(prev[i].id, i);
             }
+            let next = prev;
+            let cloned = false;
             const now = Date.now();
-            const sessionNameForCreate = m.sessionName || `deck_sub_${m.id}`;
-            const transportPendingPatch = buildTransportPendingSyncPatch({}, m, sessionNameForCreate);
-            return [...prev, {
-              id: m.id,
-              sessionInstanceId: m.sessionInstanceId ?? null,
-              runtimeEpoch: m.runtimeEpoch ?? null,
-              serverId: '',
-              type: m.sessionType || 'shell',
-              sessionName: sessionNameForCreate,
-              runtimeType: m.runtimeType ?? getSessionRuntimeType(m.sessionType || 'shell'),
-              providerId: m.providerId ?? null,
-              providerSessionId: m.providerSessionId ?? null,
-              cwd: m.cwd || null,
-              label: m.label || null,
-              ccPresetId: m.ccPresetId ?? null,
-              parentSession: m.parentSession || null,
-              createdAt: now,
-              updatedAt: now,
-              state: (m.state || 'idle') as SubSession['state'],
-              ...(m.activityGeneration !== undefined ? { activityGeneration: m.activityGeneration as ActivityGenerationLike } : {}),
-              qwenModel: m.qwenModel ?? null,
-              requestedModel: m.requestedModel ?? null,
-              activeModel: m.activeModel ?? m.modelDisplay ?? null,
-              qwenAuthType: m.qwenAuthType ?? null,
-              qwenAvailableModels: m.qwenAvailableModels ?? null,
-              codexAvailableModels: m.codexAvailableModels ?? null,
-              modelDisplay: m.modelDisplay ?? null,
-              planLabel: m.planLabel ?? null,
-              quotaLabel: m.quotaLabel ?? null,
-              quotaUsageLabel: m.quotaUsageLabel ?? null,
-              quotaMeta: m.quotaMeta ?? null,
-              effort: m.effort ?? null,
-              contextNamespace: m.contextNamespace ?? null,
-              contextNamespaceDiagnostics: m.contextNamespaceDiagnostics ?? null,
-              executionCloneKind: m.executionCloneKind ?? null,
-              parentRunId: m.parentRunId ?? null,
-              transportConfig: m.transportConfig ?? null,
-              supervisionMode: m.supervisionMode ?? null,
-              supervisionHeartbeat: parseSupervisionHeartbeatSnapshot(m.supervisionHeartbeat),
-              ...transportPendingPatch,
-            }];
+            const ensureClone = () => {
+              if (!cloned) {
+                next = [...prev];
+                cloned = true;
+              }
+            };
+            for (const m of validItems) {
+              const foundIdx = indexById ? indexById.get(m.id) : next.findIndex((s) => s.id === m.id);
+              const existingIdx = foundIdx !== undefined && foundIdx !== -1 ? foundIdx : undefined;
+              if (existingIdx !== undefined) {
+                const existing = next[existingIdx];
+                if (isOlderActivityGeneration(m.activityGeneration, existing.activityGeneration)) continue;
+                const preserveQuota = isQuotaPreservingSubSessionType(existing.type);
+                const transportPendingPatch = buildTransportPendingSyncPatch(
+                  existing,
+                  m,
+                  existing.sessionName,
+                );
+                ensureClone();
+                next[existingIdx] = {
+                  ...existing,
+                  ...(m.activityGeneration !== undefined && { activityGeneration: m.activityGeneration as ActivityGenerationLike }),
+                  ...(m.state != null && { state: m.state as SubSession['state'] }),
+                  ...(m.sessionInstanceId !== undefined && { sessionInstanceId: m.sessionInstanceId }),
+                  ...(m.runtimeEpoch !== undefined && { runtimeEpoch: m.runtimeEpoch }),
+                  ...(m.cwd != null && { cwd: m.cwd }),
+                  ...(m.label != null && { label: m.label }),
+                  ...(m.ccPresetId !== undefined && { ccPresetId: m.ccPresetId }),
+                  ...(m.modelDisplay != null && { modelDisplay: m.modelDisplay }),
+                  ...(m.requestedModel !== undefined && { requestedModel: m.requestedModel }),
+                  ...(m.activeModel !== undefined && { activeModel: m.activeModel }),
+                  ...((m.planLabel != null || (!preserveQuota && m.planLabel === null)) ? { planLabel: m.planLabel } : {}),
+                  ...((m.quotaLabel != null || (!preserveQuota && m.quotaLabel === null)) ? { quotaLabel: m.quotaLabel } : {}),
+                  ...((m.quotaUsageLabel != null || (!preserveQuota && m.quotaUsageLabel === null)) ? { quotaUsageLabel: m.quotaUsageLabel } : {}),
+                  ...((m.quotaMeta != null || (!preserveQuota && m.quotaMeta === null)) ? { quotaMeta: m.quotaMeta } : {}),
+                  ...(m.effort != null && { effort: m.effort }),
+                  ...(m.contextNamespace !== undefined && { contextNamespace: m.contextNamespace }),
+                  ...(m.contextNamespaceDiagnostics !== undefined && { contextNamespaceDiagnostics: m.contextNamespaceDiagnostics }),
+                  ...(m.executionCloneKind !== undefined && { executionCloneKind: m.executionCloneKind }),
+                  ...(m.parentRunId !== undefined && { parentRunId: m.parentRunId }),
+                  ...(m.transportConfig !== undefined && {
+                    transportConfig: mergeTransportConfigPreservingSupervision(
+                      m.transportConfig,
+                      existing.transportConfig,
+                    ),
+                  }),
+                  ...(m.supervisionMode !== undefined && { supervisionMode: m.supervisionMode }),
+                  ...(m.supervisionHeartbeat !== undefined && {
+                    supervisionHeartbeat: parseSupervisionHeartbeatSnapshot(m.supervisionHeartbeat),
+                  }),
+                  ...transportPendingPatch,
+                  ...(m.qwenModel != null && { qwenModel: m.qwenModel }),
+                  ...(m.qwenAuthType != null && { qwenAuthType: m.qwenAuthType }),
+                  ...(m.qwenAvailableModels != null && { qwenAvailableModels: m.qwenAvailableModels }),
+                  ...((m.codexAvailableModels != null || (!preserveQuota && m.codexAvailableModels === null)) ? { codexAvailableModels: m.codexAvailableModels } : {}),
+                  updatedAt: now,
+                };
+              } else {
+                const sessionNameForCreate = m.sessionName || `deck_sub_${m.id}`;
+                const transportPendingPatch = buildTransportPendingSyncPatch({}, m, sessionNameForCreate);
+                ensureClone();
+                indexById?.set(m.id, next.length);
+                next.push({
+                  id: m.id,
+                  sessionInstanceId: m.sessionInstanceId ?? null,
+                  runtimeEpoch: m.runtimeEpoch ?? null,
+                  serverId: '',
+                  type: m.sessionType || 'shell',
+                  sessionName: sessionNameForCreate,
+                  runtimeType: m.runtimeType ?? getSessionRuntimeType(m.sessionType || 'shell'),
+                  providerId: m.providerId ?? null,
+                  providerSessionId: m.providerSessionId ?? null,
+                  cwd: m.cwd || null,
+                  label: m.label || null,
+                  ccPresetId: m.ccPresetId ?? null,
+                  parentSession: m.parentSession || null,
+                  createdAt: now,
+                  updatedAt: now,
+                  state: (m.state || 'idle') as SubSession['state'],
+                  ...(m.activityGeneration !== undefined ? { activityGeneration: m.activityGeneration as ActivityGenerationLike } : {}),
+                  qwenModel: m.qwenModel ?? null,
+                  requestedModel: m.requestedModel ?? null,
+                  activeModel: m.activeModel ?? m.modelDisplay ?? null,
+                  qwenAuthType: m.qwenAuthType ?? null,
+                  qwenAvailableModels: m.qwenAvailableModels ?? null,
+                  codexAvailableModels: m.codexAvailableModels ?? null,
+                  modelDisplay: m.modelDisplay ?? null,
+                  planLabel: m.planLabel ?? null,
+                  quotaLabel: m.quotaLabel ?? null,
+                  quotaUsageLabel: m.quotaUsageLabel ?? null,
+                  quotaMeta: m.quotaMeta ?? null,
+                  effort: m.effort ?? null,
+                  contextNamespace: m.contextNamespace ?? null,
+                  contextNamespaceDiagnostics: m.contextNamespaceDiagnostics ?? null,
+                  executionCloneKind: m.executionCloneKind ?? null,
+                  parentRunId: m.parentRunId ?? null,
+                  transportConfig: m.transportConfig ?? null,
+                  supervisionMode: m.supervisionMode ?? null,
+                  supervisionHeartbeat: parseSupervisionHeartbeatSnapshot(m.supervisionHeartbeat),
+                  ...transportPendingPatch,
+                });
+              }
+            }
+            return cloned ? next : prev;
           });
         }
         return;

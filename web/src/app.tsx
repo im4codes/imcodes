@@ -49,6 +49,7 @@ import type { MessagePin } from '@shared/message-pins.js';
 import { mapP2pRunToDiscussion, mergeP2pDiscussionUpdate, mergeP2pStatusResponseDiscussions } from './p2p-run-mapping.js';
 import { matchDiscussionIndex, reconcileDiscussionEntry, reconcileClassicList, isBarActiveDiscussion, makeOptimisticDiscussionEntry, discussionErrorReasonKey, shouldToastDiscussionError, classifyDiscussionStop, removeDiscussionByRequestId } from './discussion-reconcile.js';
 import { PENDING_START_TIMEOUT_MS, DISCUSSION_RECONCILE_HIDDEN_MS } from '@shared/discussion-ui.js';
+import { WEB_AUTH_VERIFY_MIN_INTERVAL_MS, WEB_UNLOCK_COALESCE_MS } from '@shared/scale-limits.js';
 import { LOGIN_SESSION_NOT_STUCK_KEY } from './login-session-not-stuck.js';
 import { useTranslation } from 'react-i18next';
 import { ErrorBoundary } from './components/ErrorBoundary.js';
@@ -1687,13 +1688,21 @@ function InternalMainApp() {
 
   useEffect(() => {
     if (!auth) return;
+    let lastVerifyAt = 0;
+    let verifyInFlight = false;
     const verifyAuthStillValid = async (reason: string) => {
+      const now = Date.now();
+      if (verifyInFlight || now - lastVerifyAt < WEB_AUTH_VERIFY_MIN_INTERVAL_MS) return;
+      verifyInFlight = true;
+      lastVerifyAt = now;
       try {
         await fetchMe();
       } catch (err) {
         if (err instanceof ApiError && err.status === 401) {
           await clearAuthState(reason, { credentialServerUrl: auth.baseUrl });
         }
+      } finally {
+        verifyInFlight = false;
       }
     };
     const onVisible = () => {
@@ -5479,9 +5488,11 @@ function InternalMainApp() {
     let lastResumeCheckWasForce = false;
     let hiddenSinceAt = 0;
     let lastDiscussionResyncAt = 0;
-    const handleResume = (forceIfStale = false, refreshTimeline = false) => {
+    const handleResume = (forceIfStale = false, refreshTimeline = false): boolean => {
       const now = Date.now();
-      if (now - lastResumeCheckAt < 500 && (!forceIfStale || lastResumeCheckWasForce)) return;
+      if (now - lastResumeCheckAt < WEB_UNLOCK_COALESCE_MS && (!forceIfStale || lastResumeCheckWasForce)) {
+        return false;
+      }
       lastResumeCheckAt = now;
       lastResumeCheckWasForce = forceIfStale;
       ws.resumeConnection(forceIfStale);
@@ -5496,6 +5507,7 @@ function InternalMainApp() {
         appOpenSpecAutoRequestStatusRef.current();
       }
       if (refreshTimeline) requestActiveTimelineRefresh({ resetCooldowns: true });
+      return true;
     };
     const onVisibility = () => {
       if (document.visibilityState === 'hidden') {
@@ -5505,11 +5517,11 @@ function InternalMainApp() {
       resumeDirectFileTransfers(ws, selectedServerId);
       const wasLongHidden = hiddenSinceAt > 0 && Date.now() - hiddenSinceAt > DISCUSSION_RECONCILE_HIDDEN_MS;
       hiddenSinceAt = 0;
-      handleResume(wasLongHidden, wasLongHidden);
+      const dispatched = handleResume(wasLongHidden, wasLongHidden);
       // Short-hide (alt-tab etc.) still needs a timeline catch-up — the bare
       // dispatch passes through the 15s success-only backfill cooldown, so
       // alt-tab churn is absorbed but a real gap > 15s gets one HTTP backfill.
-      if (!wasLongHidden) dispatchActiveTimelineRefresh();
+      if (dispatched && !wasLongHidden) dispatchActiveTimelineRefresh();
     };
     document.addEventListener('visibilitychange', onVisibility);
     // Desktop "messages stuck before leaving" P0 fix: a foreground tab whose
@@ -5521,8 +5533,7 @@ function InternalMainApp() {
     // cooldown, so >15s real gaps fire a backfill while alt-tab churn is
     // absorbed automatically (no need to reset cooldowns).
     const onFocus = () => {
-      handleResume(false);
-      dispatchActiveTimelineRefresh();
+      if (handleResume(false)) dispatchActiveTimelineRefresh();
     };
     window.addEventListener('focus', onFocus);
     const onPageShow = (ev: PageTransitionEvent) => {
@@ -5533,8 +5544,7 @@ function InternalMainApp() {
     // reset): `online` is unreliable behind proxies/captive portals, so we
     // never want it to clear cooldowns, only to nudge a catch-up attempt.
     const onOnline = () => {
-      handleResume(false);
-      dispatchActiveTimelineRefresh();
+      if (handleResume(false)) dispatchActiveTimelineRefresh();
     };
     window.addEventListener('online', onOnline);
 
