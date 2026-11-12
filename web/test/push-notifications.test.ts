@@ -143,4 +143,39 @@ describe('push notification preferences', () => {
       body: JSON.stringify({ types: ['task_complete', 'waiting_input'] }),
     });
   });
+
+  it('preserves explicitly empty array [] in localStorage and does not fall back to defaults', async () => {
+    const { setLocalPushNotificationPreferences, getLocalPushNotificationPreferences } = await import('../src/push-notifications.js');
+
+    setLocalPushNotificationPreferences([]);
+    expect(getLocalPushNotificationPreferences()).toEqual([]);
+  });
+
+  it('guards against late initial fetch overwriting newer local edits', async () => {
+    const { fetchPushNotificationPreferences, recordLocalPushNotificationEdit, getLocalPushNotificationPreferences } = await import('../src/push-notifications.js');
+
+    let resolveFetch: (val: any) => void;
+    const fetchPromise = new Promise((resolve) => {
+      resolveFetch = resolve;
+    });
+    apiFetchMock.mockReturnValueOnce(fetchPromise);
+
+    // Initial fetch starts
+    const pendingFetch = fetchPushNotificationPreferences();
+
+    // User edits checkbox in UI before fetch completes
+    recordLocalPushNotificationEdit(['remote_desktop']);
+
+    // Fetch finally completes with stale defaults
+    resolveFetch!({
+      ok: true,
+      types: ['task_complete', 'waiting_input', 'session_error', 'task_pair_done', 'task_pair_paused', 'remote_desktop'],
+    });
+
+    const result = await pendingFetch;
+    // Returns null to indicate discarded stale fetch
+    expect(result).toBeNull();
+    // Local storage still retains user's edit
+    expect(getLocalPushNotificationPreferences()).toEqual(['remote_desktop']);
+  });
 });

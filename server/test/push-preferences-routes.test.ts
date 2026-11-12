@@ -9,6 +9,7 @@ import {
   PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP,
   PUSH_PLATFORM_IOS,
   PUSH_PLATFORM_ANDROID_JPUSH,
+  classifyTaskPairNotificationType,
 } from '../../shared/push-notifications.js';
 
 const mockDb = {
@@ -66,6 +67,20 @@ describe('push preferences and registration routes', () => {
       expect(json.defaultTypes).toEqual(DEFAULT_PUSH_NOTIFICATION_TYPES);
     });
 
+    it('returns empty array when user explicitly configured empty preferences', async () => {
+      mockDb.queryOne.mockResolvedValueOnce({
+        notification_types: [],
+      });
+
+      const res = await app.request('/api/push/preferences', {
+        headers: { Authorization: 'Bearer valid-user-token' },
+      });
+      expect(res.status).toBe(200);
+      const json = await res.json();
+      expect(json.ok).toBe(true);
+      expect(json.types).toEqual([]);
+    });
+
     it('returns saved preferences for the user', async () => {
       mockDb.queryOne.mockResolvedValueOnce({
         notification_types: ['task_complete', 'task_pair_done', 'remote_desktop'],
@@ -118,6 +133,24 @@ describe('push preferences and registration routes', () => {
         body: JSON.stringify({ notTypes: true }),
       });
       expect(res.status).toBe(400);
+    });
+
+    it('returns 500 if database update fails', async () => {
+      mockDb.execute.mockRejectedValueOnce(new Error('injected DB outage'));
+
+      const res = await app.request('/api/push/preferences', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer valid-user-token',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          types: ['task_complete'],
+        }),
+      });
+      expect(res.status).toBe(500);
+      const json = await res.json();
+      expect(json.error).toBe('failed to update push preferences');
     });
 
     it('sanitizes notification types and updates all tokens for the user when token is omitted', async () => {
@@ -291,6 +324,188 @@ describe('push preferences and registration routes', () => {
       expect(mockDb.query).toHaveBeenCalledTimes(1); // only the SELECT tokens query, no UPDATE badge_count query
 
       fetchSpy.mockRestore();
+    });
+
+    it('does not dispatch any notifications or increment badge when user explicitly set notification_types to empty array', async () => {
+      const mockEnv = {
+        DB: mockDb,
+        JPUSH_APP_KEY: 'mock-key',
+        JPUSH_MASTER_SECRET: 'mock-secret',
+      } as any;
+
+      mockDb.query.mockResolvedValueOnce([
+        {
+          token: 'dev-token-empty',
+          platform: PUSH_PLATFORM_ANDROID_JPUSH,
+          notification_types: [], // explicitly empty
+        },
+      ]);
+
+      const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+      await dispatchPush(
+        {
+          userId: 'user-123',
+          title: 'Task complete',
+          body: 'Task done',
+          type: PUSH_NOTIFICATION_TYPE_TASK_COMPLETE,
+        },
+        mockEnv,
+      );
+
+      // Even for task_complete, explicitly empty settings must suppress push and badge update
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(mockDb.query).toHaveBeenCalledTimes(1); // only SELECT tokens, no UPDATE badge_count
+
+      fetchSpy.mockRestore();
+    });
+  });
+
+  describe('POST /api/push/relay', () => {
+    it('relays payload.type and retains priority 2 for remote_desktop', async () => {
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response(JSON.stringify({ sendno: '1', msg_id: '123' }), { status: 200 }),
+      );
+
+      const res = await app.request('/api/push/relay', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          token: 'jpush-reg-id',
+          platform: PUSH_PLATFORM_ANDROID_JPUSH,
+          title: '🚨 [最高安全警示] 远程桌面自动解锁',
+          body: 'Auto unlock detected',
+          type: PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP,
+        }),
+      });
+      expect(res.status).toBe(200);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      const call = fetchSpy.mock.calls[0];
+      const body = JSON.parse(call[1]!.body as string);
+      expect(body.notification.android.priority).toBe(2);
+
+      fetchSpy.mockRestore();
+    });
+  });
+
+  describe('classifyTaskPairNotificationType', () => {
+    it('returns task_pair_done for valid completion transition', () => {
+      expect(classifyTaskPairNotificationType({ toStatus: 'done', fromStatus: 'passed' })).toBe(PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE);
+      expect(classifyTaskPairNotificationType({ verb: 'DONE', effect: 'status', toStatus: 'done', fromStatus: 'passed' })).toBe(PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE);
+    });
+
+    it('rejects invalid or rejected DONE (unusual=true)', () => {
+      expect(classifyTaskPairNotificationType({ verb: 'DONE', unusual: true, toStatus: 'working' })).toBeNull();
+      expect(classifyTaskPairNotificationType({ verb: 'DONE', effect: 'rejected', unusual: true })).toBeNull();
+    });
+
+    it('rejects redundant metadata/notice events when already in done', () => {
+      expect(classifyTaskPairNotificationType({ toStatus: 'done', fromStatus: 'done' })).toBeNull();
+    });
+
+    it('returns task_pair_paused for manual pause or awaiting decision', () => {
+      expect(classifyTaskPairNotificationType({ verb: 'PAUSE', effect: 'scheduled' })).toBe(PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED);
+      expect(classifyTaskPairNotificationType({ scheduling: { manual: true, epoch: 2 } })).toBe(PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED);
+      expect(classifyTaskPairNotificationType({ toStatus: 'awaiting_brain_decision', fromStatus: 'working' })).toBe(PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED);
+      expect(classifyTaskPairNotificationType({ verb: 'NEEDS_DECISION' })).toBe(PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED);
+    });
+
+    it('returns task_pair_audit for intermediate audit states', () => {
+      expect(classifyTaskPairNotificationType({ verb: 'READY_FOR_AUDIT', toStatus: 'in_audit', fromStatus: 'working' })).toBe(PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT);
+      expect(classifyTaskPairNotificationType({ verb: 'PASS', toStatus: 'passed', fromStatus: 'in_audit' })).toBe(PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT);
+      expect(classifyTaskPairNotificationType({ verb: 'REWORK', toStatus: 'rework', fromStatus: 'in_audit' })).toBe(PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT);
+    });
+
+    it('rejects duplicate or no-op audit events', () => {
+      expect(classifyTaskPairNotificationType({ verb: 'READY_FOR_AUDIT', effect: 'duplicate_ready' })).toBeNull();
+      expect(classifyTaskPairNotificationType({ effect: 'in_audit_guarded' })).toBeNull();
+    });
+  });
+
+  describe('WsBridge task pair push deduplication and multi-session suppression', () => {
+    it('dispatches only once when multiple copies of the same event arrive from executor, auditor, and brain', async () => {
+      const { WsBridge } = await import('../src/ws/bridge.js');
+      const bridge = WsBridge.get('test-server-id');
+
+      // Mock server lookup
+      mockDb.queryOne.mockResolvedValue({
+        id: 'test-server-id',
+        name: 'test-machine',
+        user_id: 'user-123',
+      });
+
+      // Mock token query and badge update
+      mockDb.query.mockResolvedValue([
+        {
+          token: 'dev-token',
+          platform: PUSH_PLATFORM_ANDROID_JPUSH,
+          notification_types: DEFAULT_PUSH_NOTIFICATION_TYPES,
+        },
+      ]);
+
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response(JSON.stringify({ sendno: '1', msg_id: '123' }), { status: 200 }),
+      );
+
+      const mockEnv = {
+        DB: mockDb,
+        JPUSH_APP_KEY: 'mock-key',
+        JPUSH_MASTER_SECRET: 'mock-secret',
+      } as any;
+
+      const pausePayload = {
+        taskId: 'tsk_pause_test',
+        verb: 'PAUSE',
+        effect: 'scheduled',
+        scheduling: { manual: true, epoch: 1 },
+        title: 'Task Pause Test',
+        round: 1,
+      };
+
+      // 1st copy (executor)
+      await (bridge as any).dispatchTaskPairPush(mockDb, mockEnv, 'executor-session', pausePayload);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+      // 2nd copy (auditor)
+      await (bridge as any).dispatchTaskPairPush(mockDb, mockEnv, 'auditor-session', pausePayload);
+      expect(fetchSpy).toHaveBeenCalledTimes(1); // STILL 1, suppressed!
+
+      // 3rd copy (brain)
+      await (bridge as any).dispatchTaskPairPush(mockDb, mockEnv, 'brain-session', pausePayload);
+      expect(fetchSpy).toHaveBeenCalledTimes(1); // STILL 1, suppressed!
+
+      fetchSpy.mockRestore();
+    });
+
+    it('does not dispatch for premature unusual DONE markers', async () => {
+      const { WsBridge } = await import('../src/ws/bridge.js');
+      const bridge = WsBridge.get('test-server-id-2');
+
+      mockDb.queryOne.mockResolvedValue({
+        id: 'test-server-id-2',
+        name: 'test-machine',
+        user_id: 'user-123',
+      });
+
+      const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+      const mockEnv = {
+        DB: mockDb,
+        JPUSH_APP_KEY: 'mock-key',
+        JPUSH_MASTER_SECRET: 'mock-secret',
+      } as any;
+
+      const invalidDonePayload = {
+        taskId: 'tsk_invalid_done',
+        verb: 'DONE',
+        effect: 'rejected',
+        unusual: true,
+        toStatus: 'working',
+        round: 1,
+      };
+
+      await (bridge as any).dispatchTaskPairPush(mockDb, mockEnv, 'executor-session', invalidDonePayload);
+      expect(fetchSpy).not.toHaveBeenCalled();
     });
   });
 });

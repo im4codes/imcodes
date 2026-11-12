@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'preact/hooks';
+import { useState, useEffect, useRef } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { startAuthentication } from '@simplewebauthn/browser';
 import { ApiError, passwordChange, passkeyVerifyBegin, passwordSetupWithPasskey, updateDisplayName } from '../api.js';
@@ -55,10 +55,12 @@ export function SettingsPage({ displayName, username, hasPassword, serverUrl, on
     getLocalPushNotificationPreferences(),
   );
 
+  const userEditedPushRef = useRef(false);
+
   useEffect(() => {
     let unmounted = false;
     void fetchPushNotificationPreferences().then((types) => {
-      if (!unmounted && types) {
+      if (!unmounted && types !== null && !userEditedPushRef.current) {
         setPushPreferences(types);
       }
     });
@@ -68,6 +70,7 @@ export function SettingsPage({ displayName, username, hasPassword, serverUrl, on
   }, []);
 
   const togglePushType = (type: PushNotificationType) => {
+    userEditedPushRef.current = true;
     setPushPreferences((prev) => {
       const next = prev.includes(type) ? prev.filter((t) => t !== type) : [...prev, type];
       void syncPushNotificationPreferences(next);

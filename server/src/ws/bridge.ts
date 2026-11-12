@@ -14101,13 +14101,26 @@ export class WsBridge {
     const taskId = String(payload.taskId ?? '');
     if (!taskId) return;
 
+    const unusual = Boolean(payload.unusual);
     const verb = typeof payload.verb === 'string' ? payload.verb : undefined;
+    const effect = typeof payload.effect === 'string' ? payload.effect : undefined;
+    const fromStatus = typeof payload.fromStatus === 'string' ? payload.fromStatus : undefined;
     const toStatus = typeof payload.toStatus === 'string' ? payload.toStatus : undefined;
-    const taskTitle = typeof payload.title === 'string' && payload.title.trim() ? payload.title.trim() : taskId;
+    const scheduling = (payload.scheduling && typeof payload.scheduling === 'object')
+      ? (payload.scheduling as { manual?: boolean; epoch?: number; dependsOn?: string[] })
+      : undefined;
 
-    const notifType = classifyTaskPairNotificationType(verb, toStatus);
+    const notifType = classifyTaskPairNotificationType({
+      verb,
+      toStatus,
+      fromStatus,
+      effect,
+      unusual,
+      scheduling,
+    });
     if (!notifType) return;
 
+    const taskTitle = typeof payload.title === 'string' && payload.title.trim() ? payload.title.trim() : taskId;
     const titleParts = [server.name, taskTitle];
     const title = titleParts.join(' · ');
 
@@ -14128,8 +14141,26 @@ export class WsBridge {
       }
     }
 
-    const round = payload.round ?? 0;
-    const pushKey = `task_pair:${taskId}:${notifType}:${round}:${verb ?? toStatus}`;
+    const round = typeof payload.round === 'number' ? payload.round : 0;
+    let transitionIdentity = '';
+    if (notifType === PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE) {
+      transitionIdentity = `done:${round}`;
+    } else if (notifType === PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED) {
+      const epoch = typeof scheduling?.epoch === 'number' ? scheduling.epoch : round;
+      transitionIdentity = `paused:${epoch}`;
+    } else if (notifType === PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT) {
+      const v = (verb ?? '').toUpperCase();
+      const s = (toStatus ?? '').toLowerCase();
+      const stage = (v === 'REWORK' || s === 'rework')
+        ? 'rework'
+        : (v === 'PASS' || s === 'passed')
+          ? 'pass'
+          : 'ready';
+      transitionIdentity = `audit_${stage}:${round}`;
+    }
+
+    // Stable transition identity deduplication across executor / auditor / Brain copies
+    const pushKey = `task_pair:${taskId}:${notifType}:${transitionIdentity}`;
     const now = Date.now();
     if (this.wasPushDelivered(pushKey, now)) return;
 

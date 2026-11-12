@@ -84,30 +84,86 @@ export const DEFAULT_PUSH_NOTIFICATION_TYPES: readonly PushNotificationType[] = 
 
 export const REMOTE_DESKTOP_ALERT_PREFIX = '🚨 [最高安全警示] ';
 
+export interface TaskPairNotificationContext {
+  verb?: string | null;
+  toStatus?: string | null;
+  fromStatus?: string | null;
+  effect?: string | null;
+  unusual?: boolean;
+  scheduling?: {
+    manual?: boolean;
+    epoch?: number;
+    dependsOn?: string[];
+  } | null;
+}
+
 /** Classify a task pair marker/state event into a fine-grained push notification type. */
 export function classifyTaskPairNotificationType(
-  verb?: string | null,
-  toStatus?: string | null,
+  ctxOrVerb?: TaskPairNotificationContext | string | null,
+  legacyToStatus?: string | null,
 ): PushNotificationType | null {
+  let verb: string | null = null;
+  let toStatus: string | null = null;
+  let fromStatus: string | null = null;
+  let effect: string | null = null;
+  let unusual = false;
+  let scheduling: { manual?: boolean; epoch?: number; dependsOn?: string[] } | null = null;
+
+  if (typeof ctxOrVerb === 'string' || ctxOrVerb === null || ctxOrVerb === undefined) {
+    verb = ctxOrVerb ?? null;
+    toStatus = legacyToStatus ?? null;
+  } else {
+    verb = ctxOrVerb.verb ?? null;
+    toStatus = ctxOrVerb.toStatus ?? null;
+    fromStatus = ctxOrVerb.fromStatus ?? null;
+    effect = ctxOrVerb.effect ?? null;
+    unusual = Boolean(ctxOrVerb.unusual);
+    scheduling = ctxOrVerb.scheduling ?? null;
+  }
+
+  // Never push for unusual, rejected, or invalid markers (e.g. premature DONE)
+  if (unusual) return null;
+
+  // Never push for no-op or duplicate effects
+  if (effect === 'duplicate_ready' || effect === 'in_audit_guarded' || effect === 'none' || effect === 'recorded') {
+    return null;
+  }
+
   const v = (verb ?? '').toUpperCase();
   const s = (toStatus ?? '').toLowerCase();
+  const fs = (fromStatus ?? '').toLowerCase();
 
-  if (v === 'DONE' || s === 'done') {
+  // Task done: must transition to 'done' and not be a repeat/metadata event while already done
+  if (s === 'done' || (v === 'DONE' && effect !== 'rejected' && effect !== 'none')) {
+    if (fs === 'done') {
+      return null;
+    }
     return PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE;
   }
-  if (v === 'PAUSE' || v === 'NEEDS_DECISION' || s === 'awaiting_brain_decision' || s === 'paused') {
+
+  // Task paused / awaiting decision:
+  if (v === 'PAUSE' || scheduling?.manual === true) {
     return PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED;
   }
+  if (s === 'awaiting_brain_decision' && fs !== 'awaiting_brain_decision') {
+    return PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED;
+  }
+  if (v === 'NEEDS_DECISION') {
+    return PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED;
+  }
+
+  // Task audit & intermediate steps:
   if (
     v === 'READY_FOR_AUDIT' ||
-    v === 'PASS' ||
-    v === 'REWORK' ||
     s === 'in_audit' ||
-    s === 'awaiting_audit' ||
-    s === 'rework' ||
-    s === 'passed'
+    v === 'PASS' ||
+    s === 'passed' ||
+    v === 'REWORK' ||
+    s === 'rework'
   ) {
+    if (s && fs && s === fs) return null;
     return PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT;
   }
+
   return null;
 }

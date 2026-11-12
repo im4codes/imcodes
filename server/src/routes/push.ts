@@ -54,7 +54,7 @@ pushRoutes.post('/register', async (c) => {
     : undefined;
 
   try {
-    if (notificationTypes) {
+    if (hasExplicitTypes) {
       await c.env.DB.execute(
         `INSERT INTO push_tokens (user_id, token, platform, notification_types, created_at)
          VALUES ($1, $2, $3, $4, $5)
@@ -93,8 +93,8 @@ pushRoutes.get('/preferences', async (c) => {
       [userId],
     );
   }
-  const types = Array.isArray(row?.notification_types) && row!.notification_types!.length > 0
-    ? row!.notification_types!
+  const types = (row && Array.isArray(row.notification_types))
+    ? row.notification_types
     : DEFAULT_PUSH_NOTIFICATION_TYPES;
   return c.json({ ok: true, types, defaultTypes: DEFAULT_PUSH_NOTIFICATION_TYPES });
 });
@@ -120,7 +120,8 @@ pushRoutes.post('/preferences', async (c) => {
       );
     }
   } catch (err) {
-    logger.warn({ err, userId }, 'Failed to update push preferences');
+    logger.error({ err, userId }, 'Failed to update push preferences');
+    return c.json({ error: 'failed to update push preferences' }, 500);
   }
   return c.json({ ok: true, types: sanitizedTypes });
 });
@@ -156,7 +157,15 @@ pushRoutes.post('/badge-reset', async (c) => {
 // APNs rejects it and we return the error.
 
 pushRoutes.post('/relay', async (c) => {
-  const body = await c.req.json<{ token: string; platform: string; title: string; body: string; badge?: number; data?: Record<string, string> }>().catch(() => null);
+  const body = await c.req.json<{
+    token: string;
+    platform: string;
+    title: string;
+    body: string;
+    badge?: number;
+    data?: Record<string, string>;
+    type?: string;
+  }>().catch(() => null);
   if (!body?.token || !body?.platform || !body?.title) {
     return c.json({ error: 'token, platform, title, body required' }, 400);
   }
@@ -172,7 +181,15 @@ pushRoutes.post('/relay', async (c) => {
   }
 
   try {
-    const relayPayload: PushPayload = { userId: '', title: body.title, body: body.body, badge: body.badge, data: body.data };
+    const relayType = isPushNotificationType(body.type) ? body.type : undefined;
+    const relayPayload: PushPayload = {
+      userId: '',
+      title: body.title,
+      body: body.body,
+      badge: body.badge,
+      data: body.data,
+      type: relayType,
+    };
     if (body.platform === PUSH_PLATFORM_IOS && hasApns) {
       await sendApns(body.token, relayPayload, c.env);
       return c.json({ ok: true });
@@ -240,7 +257,7 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
 
   const matchingTokens = tokens.filter((t) => {
     if (!payload.type) return true;
-    const allowed = Array.isArray(t.notification_types) && t.notification_types.length > 0
+    const allowed = Array.isArray(t.notification_types)
       ? t.notification_types
       : (DEFAULT_PUSH_NOTIFICATION_TYPES as readonly string[]);
     return allowed.includes(payload.type);
@@ -303,6 +320,7 @@ async function relayPush(relayBaseUrl: string, token: string, platform: string, 
       body: payload.body,
       badge: payload.badge,
       data: payload.data,
+      type: payload.type,
     }),
     signal: AbortSignal.timeout(10_000),
   });
