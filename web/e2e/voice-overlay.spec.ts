@@ -22,6 +22,8 @@ test.beforeEach(async ({ page }) => {
 const fixture = '/src/fixtures/voice-overlay/index.html';
 
 test('touch capture release toggles once, one status and animated masked ring, keyboard viewport stays usable', async ({ page }, testInfo) => {
+  const errors: string[] = [];
+  page.on('pageerror', error => errors.push(error.message));
   await page.goto(fixture);
   const status = page.locator('.voice-overlay-status');
   await expect(status).toContainText('Listening');
@@ -29,12 +31,14 @@ test('touch capture release toggles once, one status and animated masked ring, k
   await mic.tap();
   await expect(status).toContainText('Tap the microphone');
   // Replay the reported WebKit ordering in a real browser; not an iOS device claim.
-  await mic.dispatchEvent('pointerdown', { pointerId: 42, button: 0 });
-  await mic.dispatchEvent('lostpointercapture', { pointerId: 42 });
-  await mic.dispatchEvent('pointerup', { pointerId: 42, button: 0 });
-  // Outside the double-tap send window.
+  // Use an actual active pointer so setPointerCapture does not fail on a
+  // synthetic pointerdown with no browser-owned pointer.
   await page.waitForTimeout(400);
-  await mic.dispatchEvent('click', { detail: 1 });
+  const micBox = await mic.boundingBox();
+  await page.mouse.move(micBox!.x + micBox!.width / 2, micBox!.y + micBox!.height / 2);
+  await page.mouse.down();
+  await mic.dispatchEvent('lostpointercapture', { pointerId: 1 });
+  await page.mouse.up();
   await expect(status).toContainText('Listening');
   await page.evaluate(() => (window as unknown as { emitSpeech(text: string): void }).emitSpeech('COMMIT GITHUB is legitimate spoken text'));
   await expect(status).toContainText('Recognizing');
@@ -62,6 +66,7 @@ test('touch capture release toggles once, one status and animated masked ring, k
   expect(await active.evaluate(el => getComputedStyle(el, '::before').animationName)).toBe('none');
   await mic.tap();
   await expect(page.locator('.voice-editor-marquee')).toHaveCount(0);
+  expect(errors).toEqual([]);
 });
 
 test('edit opening is ready, not paused; real hold and release drains once without send', async ({ page }) => {
