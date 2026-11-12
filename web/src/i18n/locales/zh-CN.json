@@ -1491,6 +1491,8 @@
   "voice": {
     "listening": "识别中...",
     "paused": "已暂停",
+    "starting": "正在启动麦克风…",
+    "ready": "点击麦克风开始说话",
     "speak_now": "开始说话...",
     "voice_input": "语音输入",
     "stop_voice": "停止语音输入",

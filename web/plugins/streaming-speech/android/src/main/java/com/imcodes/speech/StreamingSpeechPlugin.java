@@ -88,7 +88,7 @@ public class StreamingSpeechPlugin extends Plugin {
         OfflineRecognizerConfig config = new OfflineRecognizerConfig();
         var model = config.getModelConfig();
         model.setNumThreads(4);
-        model.setProvider("cpu");
+        model.setProvider("nnapi");
         var qwen = model.getQwen3Asr();
         qwen.setConvFrontend(new File(root, "conv_frontend.onnx").getPath());
         qwen.setEncoder(new File(root, "encoder.int4.onnx").getPath());
@@ -99,7 +99,14 @@ public class StreamingSpeechPlugin extends Plugin {
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(getContext().getAssets().open("hotwords.txt"), StandardCharsets.UTF_8))) {
             qwen.setHotwords(String.join(",", reader.lines().map(String::trim).filter(line -> !line.isEmpty()).toArray(String[]::new)));
         }
-        recognizer = new OfflineRecognizer(null, config);
+        try {
+            recognizer = new OfflineRecognizer(null, config);
+        } catch (RuntimeException | LinkageError accelerationUnavailable) {
+            // Older runtimes/devices may reject NNAPI at session creation.
+            // Keep the same resident model/segmentation on the CPU fallback.
+            model.setProvider("cpu");
+            recognizer = new OfflineRecognizer(null, config);
+        }
         return recognizer;
     }
 
@@ -118,7 +125,7 @@ public class StreamingSpeechPlugin extends Plugin {
         boolean ready = true;
         for (String name : MODEL_FILES) {
             try (java.io.InputStream input = getContext().getAssets().open(name)) {
-                if (input.read() < 0) ready = false;
+                if (!name.equals("hotwords.txt") && input.read() < 0) ready = false;
             } catch (IOException e) { ready = false; }
         }
         JSObject result = new JSObject(); result.put("available", ready); call.resolve(result);

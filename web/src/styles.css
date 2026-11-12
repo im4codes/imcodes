@@ -3119,6 +3119,12 @@ html.native-ios-mac .chat-dl-btn {
 @keyframes voice-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
 
 /* ── Voice Overlay (sci-fi 2/3 sheet) ── */
+.voice-overlay-backdrop {
+  position: fixed; inset: 0; z-index: 9998;
+  background: rgba(2, 6, 23, 0.78);
+  -webkit-backdrop-filter: blur(16px);
+  backdrop-filter: blur(16px);
+}
 .voice-overlay {
   position: fixed; left: 0; right: 0; top: 0; z-index: 9999;
   height: 66vh;
@@ -3164,8 +3170,9 @@ html.native-ios-mac .chat-dl-btn {
 .voice-notepad-elapsed { font-variant-numeric: tabular-nums; letter-spacing: 1px; color: #a5f3fc; }
 .voice-overlay-status {
   display: flex; align-items: center; gap: 8px;
-  font-size: 13px; color: #64748b;
-  letter-spacing: 2px; text-transform: uppercase;
+  font-size: 12px; color: #a5b4cc;
+  letter-spacing: 0.3px; min-width: 0;
+  padding-right: 12px;
 }
 .voice-status-dot {
   width: 8px; height: 8px; border-radius: 50%;
@@ -3181,13 +3188,6 @@ html.native-ios-mac .chat-dl-btn {
   box-shadow: 0 0 16px #38bdf8, 0 0 32px rgba(56,189,248,0.55);
 }
 @keyframes voice-dot-pulse { 0%,100% { box-shadow: 0 0 12px #22d3ee, 0 0 24px rgba(34,211,238,0.3); } 50% { box-shadow: 0 0 20px #22d3ee, 0 0 40px rgba(34,211,238,0.5); } }
-.voice-recognizing-pill {
-  display: inline-flex; align-items: center; gap: 6px;
-  padding: 2px 9px; border-radius: 999px;
-  font-size: 11px; font-weight: 600; letter-spacing: 0.5px; text-transform: none;
-  color: #e0f2fe; background: rgba(14,165,233,0.18);
-  border: 1px solid rgba(56,189,248,0.45);
-}
 .voice-recognizing-dots {
   display: inline-flex; align-items: center; gap: 3px;
 }
@@ -3210,31 +3210,46 @@ html.native-ios-mac .chat-dl-btn {
 }
 .voice-overlay-text {
   flex: 1; width: 100%; max-width: 600px;
-  margin: 0; padding: 20px 20px 42px;
+  margin: 0; padding: 20px;
   box-sizing: border-box;
   font-size: 18px; line-height: 1.7; color: #e2e8f0;
   overflow-y: auto; z-index: 1;
   border: 1px solid rgba(56,189,248,0.1);
   border-radius: 16px;
-  background: rgba(15,23,42,0.6);
+  background: rgba(10,19,35,0.92);
   backdrop-filter: blur(8px);
   box-shadow: inset 0 0 30px rgba(56,189,248,0.03), 0 0 1px rgba(56,189,248,0.2);
   resize: none; font-family: inherit;
 }
-.voice-overlay-buffering {
-  position: absolute; left: 14px; bottom: 10px; z-index: 2;
-  display: inline-flex; align-items: center; gap: 7px;
-  padding: 4px 10px; border-radius: 999px;
-  font-size: 12px; color: #94a3b8;
-  background: rgba(15,23,42,0.78);
-  border: 1px solid rgba(148,163,184,0.2);
-  pointer-events: none; transition: all 0.2s ease;
+/* Animate a masked ring only; the editor remains stationary and readable. */
+@property --voice-ring-angle {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 0deg;
 }
-.voice-overlay-buffering.is-recognizing {
-  color: #e0f2fe;
-  background: rgba(8,145,178,0.24);
-  border-color: rgba(56,189,248,0.5);
-  box-shadow: 0 0 14px rgba(56,189,248,0.18);
+.voice-overlay-editor-wrap::before, .voice-overlay-editor-wrap::after {
+  content: ''; position: absolute; inset: -1px; border-radius: 17px;
+  pointer-events: none; opacity: 0;
+}
+.voice-editor-marquee::before {
+  z-index: 2; opacity: 1; padding: 2px;
+  background: conic-gradient(from var(--voice-ring-angle), transparent 12%, #22d3ee 28%, transparent 44%, #a78bfa 68%, #38bdf8 80%, transparent 96%);
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  mask-composite: exclude;
+  animation: voice-editor-orbit 3s linear infinite;
+}
+.voice-editor-marquee::after {
+  box-shadow: 0 0 22px rgba(34,211,238,0.22), 0 0 40px rgba(139,92,246,0.12);
+  animation: voice-editor-glow 2.5s ease-in-out infinite;
+}
+@keyframes voice-editor-orbit { to { --voice-ring-angle: 360deg; } }
+@keyframes voice-editor-glow { 0%,100% { opacity: 0.45; } 50% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  .voice-overlay, .voice-overlay-grid, .voice-status-dot-active,
+  .voice-editor-marquee::before, .voice-editor-marquee::after { animation: none; }
+  .voice-editor-marquee::after { opacity: 0.6; }
 }
 .voice-hold-hud {
   position: fixed; left: 12px; right: 12px; bottom: 86px; z-index: 9998;

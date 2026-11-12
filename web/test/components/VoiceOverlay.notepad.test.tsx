@@ -602,6 +602,46 @@ describe('VoiceOverlay mobile microphone gestures', () => {
     return onSend;
   }
 
+  it('keeps a short tap after implicit lost capture, and still cancels a real cancelled gesture', async () => {
+    await openVoice();
+    pointer('pointerdown');
+    pointer('lostpointercapture'); // WebKit may release implicit touch capture before pointerup.
+    pointer('pointerup');
+    fireEvent.click(mic(), { detail: 1 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(voiceApi.stopListening).toHaveBeenCalledOnce();
+    pointer('pointerdown'); pointer('pointercancel');
+    fireEvent.click(mic(), { detail: 1 });
+    expect(voiceApi.startListening).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(400);
+    pointer('pointerdown'); pointer('pointerup'); pointer('lostpointercapture');
+    fireEvent.click(mic(), { detail: 1 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(voiceApi.startListening).toHaveBeenCalledTimes(2);
+  });
+
+  it('shows starting then ready, coalesces pending starts and permits stopping startup', async () => {
+    let resolve!: (ok: boolean) => void;
+    voiceApi.startListening.mockReturnValueOnce(new Promise<boolean>(r => { resolve = r; }));
+    render(<VoiceOverlay open onSend={vi.fn()} onClose={vi.fn()} />);
+    expect(document.querySelector('.voice-overlay-status')?.textContent).toContain('voice.starting');
+    await vi.advanceTimersByTimeAsync(150);
+    // Click during permission/startup cancels; late success must not reactivate the sheet.
+    fireEvent.click(mic());
+    await vi.advanceTimersByTimeAsync(0);
+    resolve(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.querySelector('.voice-overlay-status')?.textContent).toContain('voice.ready');
+    expect(voiceApi.startListening).toHaveBeenCalledOnce();
+    expect(voiceApi.stopListening).toHaveBeenCalledOnce();
+    fireEvent.click(mic());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(voiceApi.startListening).toHaveBeenCalledTimes(2);
+    expect(document.querySelector('.voice-overlay-status')?.textContent).toContain('voice.listening');
+    expect(document.querySelector('.voice-overlay-backdrop')).not.toBeNull();
+    expect(document.querySelector('.voice-overlay-status')?.textContent).not.toContain('voice.paused');
+  });
+
   it('keeps short-tap toggle and stops a long press on release without sending', async () => {
     const send = await openVoice();
     fireEvent.click(mic()); await vi.advanceTimersByTimeAsync(0); // pause
@@ -746,15 +786,13 @@ describe('VoiceOverlay mobile microphone gestures', () => {
     await vi.advanceTimersByTimeAsync(150);
     expect(document.activeElement).not.toBe(ta);
 
-    // Buffering indicator is visible while listening and highlights immediately when audio arrives
-    const buffering = document.querySelector('.voice-overlay-buffering');
-    expect(buffering).not.toBeNull();
-    expect(buffering?.getAttribute('data-recognizing')).toBe('false');
-
+    // One status, with activity on the editor rather than a duplicate badge.
+    expect(document.querySelector('.voice-overlay-buffering')).toBeNull();
+    expect(document.querySelectorAll('.voice-overlay-status [role="status"]')).toHaveLength(1);
+    expect(document.querySelector('.voice-editor-marquee')).not.toBeNull();
     audioLevelCb?.(0.25);
     await vi.advanceTimersByTimeAsync(0);
-    expect(document.querySelector('.voice-overlay-buffering')?.getAttribute('data-recognizing')).toBe('true');
-    expect(document.querySelector('.voice-recognizing-pill')?.textContent).toContain('voice.recognizing');
+    expect(document.querySelector('.voice-overlay-status')?.textContent).toContain('voice.recognizing');
 
     // Streaming partial results must not focus the textarea unless the user manually focused it
     voiceApi.partialHandler?.('spoken words');

@@ -1491,6 +1491,8 @@
   "voice": {
     "listening": "Escuchando...",
     "paused": "Pausado",
+    "starting": "Iniciando micrófono…",
+    "ready": "Toca el micrófono para hablar",
     "speak_now": "Habla ahora...",
     "voice_input": "Entrada de voz",
     "stop_voice": "Detener entrada de voz",

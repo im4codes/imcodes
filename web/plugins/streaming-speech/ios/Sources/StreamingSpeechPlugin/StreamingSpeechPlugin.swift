@@ -323,10 +323,17 @@ private final class SpeechRecognizer {
         qwen.decoder = UnsafePointer(strings[2]!)
         qwen.tokenizer = UnsafePointer(strings[3]!)
         qwen.hotwords = UnsafePointer(strings[4]!)
-        let model = sherpaOnnxOfflineModelConfig(tokens: "", numThreads: 4, qwen3Asr: qwen)
-        var config = sherpaOnnxOfflineRecognizerConfig(featConfig: sherpaOnnxFeatureConfig(), modelConfig: model)
-        guard let pointer = SherpaOnnxCreateOfflineRecognizer(&config) else { return nil }
-        self.pointer = pointer
+        // CoreML delegates supported operators to Apple hardware; ORT keeps CPU
+        // kernels for the rest. Retry CPU if the accelerated session cannot load.
+        for provider in ["coreml", "cpu"] {
+            let model = sherpaOnnxOfflineModelConfig(tokens: "", numThreads: 4, provider: provider, qwen3Asr: qwen)
+            var config = sherpaOnnxOfflineRecognizerConfig(featConfig: sherpaOnnxFeatureConfig(), modelConfig: model)
+            if let pointer = SherpaOnnxCreateOfflineRecognizer(&config) {
+                self.pointer = pointer
+                return
+            }
+        }
+        return nil
     }
     deinit { SherpaOnnxDestroyOfflineRecognizer(pointer) }
 }

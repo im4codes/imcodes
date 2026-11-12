@@ -81,6 +81,7 @@ export default defineConfig(({ mode }) => ({
             main: path.resolve(__dirname, 'index.html'),
             'execution-pool-fixture': path.resolve(__dirname, 'src/fixtures/execution-pool/index.html'),
             'chat-timeline-fixture': path.resolve(__dirname, 'src/fixtures/chat-timeline/index.html'),
+            'voice-overlay-fixture': path.resolve(__dirname, 'src/fixtures/voice-overlay/index.html'),
           },
         }
         : {}),

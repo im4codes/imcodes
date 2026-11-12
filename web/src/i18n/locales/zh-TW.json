@@ -1491,6 +1491,8 @@
   "voice": {
     "listening": "辨識中...",
     "paused": "已暫停",
+    "starting": "正在啟動麥克風…",
+    "ready": "點擊麥克風開始說話",
     "speak_now": "開始說話...",
     "voice_input": "語音輸入",
     "stop_voice": "停止語音輸入",

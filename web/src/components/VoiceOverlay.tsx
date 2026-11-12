@@ -75,6 +75,8 @@ export function VoiceOverlay({
 }: Props) {
   const { t } = useTranslation();
   const [listening, setListening] = useState(false);
+  const [starting, setStarting] = useState(open && autoStartListening);
+  const startingTokenRef = useRef<number | null>(null);
   const [recognizing, setRecognizing] = useState(false);
   const [hasText, setHasText] = useState(false);
   const [bars, setBars] = useState<number[]>(() => Array(BAR_COUNT).fill(0));
@@ -278,6 +280,8 @@ export function VoiceOverlay({
     const scope = draftScopeRef.current;
     const recoverable = scope ? readVoiceNotepadDraft(scope) : null;
     setRecoverableDraft(recoverable);
+    startingTokenRef.current = null;
+    setStarting(!recoverable && autoStartListening);
     insertPosRef.current = init.length;
     voiceLenRef.current = 0;
     sessionTokenRef.current++;
@@ -331,6 +335,7 @@ export function VoiceOverlay({
       micPointerRef.current = null;
       notepadRef.current = false;
       openRef.current = false;
+      startingTokenRef.current = null;
       voiceRetryPendingRef.current = false;
       flushingTokenRef.current = null;
       pendingFlushRef.current = null;
@@ -347,6 +352,8 @@ export function VoiceOverlay({
 
   /** Stop current session and commit voice zone */
   const commitAndStop = useCallback((flush = false): Promise<boolean> => {
+    startingTokenRef.current = null;
+    setStarting(false);
     const token = sessionTokenRef.current;
     // A tap-stop and double-tap-send can await the SAME native stop ACK.
     // Share the whole commit, not merely stopListening(): incrementing the
@@ -385,10 +392,12 @@ export function VoiceOverlay({
 
   /** Start a new recognition session, inserting at given position */
   const startSession = useCallback(async (atPos: number) => {
-    if (!openRef.current) return;
+    if (!openRef.current || startingTokenRef.current !== null) return;
     const ta = taRef.current;
     if (!ta) return;
     const token = ++sessionTokenRef.current;
+    startingTokenRef.current = token;
+    setStarting(true);
     insertPosRef.current = atPos;
     voiceLenRef.current = 0;
     segmentStartedAtRef.current = Date.now();
@@ -459,6 +468,11 @@ export function VoiceOverlay({
         stopNotepadAutoRestart();
         setVoiceError(err instanceof Error ? err.message : 'permission_denied');
       }
+    } finally {
+      if (startingTokenRef.current === token) {
+        startingTokenRef.current = null;
+        if (openRef.current) setStarting(false);
+      }
     }
   }, [commitAndStop, setListeningState]);
 
@@ -521,7 +535,7 @@ export function VoiceOverlay({
       clearRestartTimer();
       restartPausedRef.current = false;
       shortSegmentsRef.current = 0;
-      if (listeningRef.current || pendingFlushRef.current) {
+      if (listeningRef.current || startingTokenRef.current !== null || pendingFlushRef.current) {
         if (!await commitAndStop(true) || !openRef.current) return;
       }
       if (!openRef.current) return;
@@ -534,11 +548,11 @@ export function VoiceOverlay({
   }, [clearAutoStartTimer, clearRestartTimer, commitAndStop, startSession]);
 
   const handleToggle = useCallback(async () => {
-    if ((listeningRef.current || restartTimerRef.current) && notepadRef.current) {
+    if ((listeningRef.current || startingTokenRef.current !== null || restartTimerRef.current) && notepadRef.current) {
       await openReview();
       return;
     }
-    if (listeningRef.current || restartTimerRef.current) {
+    if (listeningRef.current || startingTokenRef.current !== null || restartTimerRef.current) {
       clearRestartTimer();
       if (!await commitAndStop(true)) return;
       setBars(Array(BAR_COUNT).fill(0));
@@ -777,7 +791,7 @@ export function VoiceOverlay({
     // Ignore programmatic writes from partial callbacks
     if (programmaticWriteRef.current) return;
     // User typed/pasted/deleted — commit current voice segment and stop
-    if (listeningRef.current || restartTimerRef.current) {
+    if (listeningRef.current || startingTokenRef.current !== null || restartTimerRef.current) {
       clearRestartTimer();
       void commitAndStop();
     }
@@ -803,21 +817,19 @@ export function VoiceOverlay({
   // (`isolation: isolate`), so rendering in place traps the overlay's z-index
   // beneath the app chrome and hides the close button.
   return createPortal((
+    <>
+    <div class="voice-overlay-backdrop" aria-hidden="true" />
     <div class="voice-overlay" style={{ height: maxH }}>
       <div class="voice-overlay-grid" />
 
       <div class="voice-overlay-header">
         <div class="voice-overlay-status">
           <div class={`voice-status-dot${listening ? ' voice-status-dot-active' : ''}${recognizing ? ' voice-status-dot-recognizing' : ''}`} />
-          <span>{listening ? t('voice.listening') : t('voice.paused')}</span>
-          {listening && recognizing && (
-            <span class="voice-recognizing-pill" role="status" aria-live="polite">
-              <span class="voice-recognizing-dots" aria-hidden="true">
-                <i /><i /><i />
-              </span>
-              <span>{t('voice.recognizing')}</span>
-            </span>
-          )}
+          <span role="status" aria-live="polite">
+            {starting ? t('voice.starting') : listening
+              ? t(recognizing ? 'voice.recognizing' : 'voice.listening')
+              : t('voice.ready')}
+          </span>
           {notepad && notepadStartedAt !== null && (
             <span class="voice-notepad-elapsed">{formatElapsed(now - notepadStartedAt)}</span>
           )}
@@ -930,7 +942,7 @@ export function VoiceOverlay({
         </div>
       )}
 
-      <div class="voice-overlay-editor-wrap" style={review ? { display: 'none' } : undefined}>
+      <div class={`voice-overlay-editor-wrap${listening || recognizing ? ' voice-editor-marquee' : ''}`} style={review ? { display: 'none' } : undefined}>
         <textarea
           ref={taRef}
           class="voice-overlay-text"
@@ -942,20 +954,6 @@ export function VoiceOverlay({
           onTouchEnd={handleCursorChange}
           onKeyUp={handleCursorChange}
         />
-        {listening && (
-          <div
-            class={`voice-overlay-buffering${recognizing ? ' is-recognizing' : ''}`}
-            data-recognizing={recognizing ? 'true' : 'false'}
-            aria-live="polite"
-          >
-            <span class="voice-recognizing-dots" aria-hidden="true">
-              <i /><i /><i />
-            </span>
-            <span class="voice-overlay-buffering-text">
-              {recognizing ? t('voice.buffering_hint') : t('voice.recognizing')}
-            </span>
-          </div>
-        )}
       </div>
 
       <div class="voice-overlay-controls" style={review ? { display: 'none' } : undefined}>
@@ -989,7 +987,8 @@ export function VoiceOverlay({
           }}
           onPointerUp={(event) => endMicPress(event.pointerId)}
           onPointerCancel={(event) => endMicPress(event.pointerId, true)}
-          onLostPointerCapture={(event) => endMicPress(event.pointerId, true)}
+          // Implicit capture release is not pointer cancellation (notably on WebKit).
+          onLostPointerCapture={(event) => endMicPress(event.pointerId)}
           onClick={(event) => {
             if (suppressMicClickRef.current) { suppressMicClickRef.current = false; return; }
             const now = Date.now();
@@ -1028,5 +1027,6 @@ export function VoiceOverlay({
         </button>
       </div>
     </div>
+    </>
   ), document.body);
 }

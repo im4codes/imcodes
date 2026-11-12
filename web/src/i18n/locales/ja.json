@@ -1491,6 +1491,8 @@
   "voice": {
     "listening": "音声認識中...",
     "paused": "一時停止",
+    "starting": "マイクを起動中…",
+    "ready": "マイクをタップして話す",
     "speak_now": "話してください...",
     "voice_input": "音声入力",
     "stop_voice": "音声入力を停止",
