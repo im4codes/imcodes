@@ -2039,6 +2039,61 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
     expect.soft(store.rooms.get(mapKey)!.session_epoch, 'stale local cache must not advance/overwrite authoritative room epoch').toBe(authoritative.session_epoch);
     expect.soft(store.rooms.get(mapKey)!.commit_seq, 'stale local cache must not overwrite the PG-confirmed commit revision').toBe(authoritative.commit_seq);
   });
+
+  it('audit-r10: a callback delayed on download must compare its expected sequence to PG before overwriting another instance commit', async () => {
+    const res = await app.request('/api/server/srv-1/onlyoffice/config?path=%2Fteam%2Fshared%2Fspec.docx&mode=edit', {
+      headers: { Authorization: bearer('owner-1') },
+    });
+    expect(res.status).toBe(200);
+    const cfg = (await res.json()) as any;
+    const cb = new URL(cfg.config.editorConfig.callbackUrl);
+    const mapKey = 'srv-1:/team/shared/spec.docx';
+    const prior = { ...store.rooms.get(mapKey)! };
+    let release!: () => void;
+    let entered!: () => void;
+    const started = new Promise<void>((r) => {
+      entered = r;
+    });
+    const hold = new Promise<void>((r) => {
+      release = r;
+    });
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      entered();
+      await hold;
+      return new Response('older-delayed-callback-content', { status: 200 });
+    });
+    const data = { status: 6, key: cfg.config.document.key, url: 'https://im.example.com/onlyoffice/cache/delayed-cross-instance.docx' };
+    const request = app.request(cb.pathname + cb.search, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...data, token: signJwt(data, 'onlyoffice-jwt-secret-key-test!!', 300) }),
+    });
+    await started;
+    // Model a newer successful status-6 commit from a different process during the old fetch.
+    // Its confirmed room remains active with the same key; only hash and commit_seq advance.
+    const newer = 'newer-confirmed-content-from-another-instance';
+    const digest = sha256Hex(newer);
+    const authoritative = {
+      ...prior,
+      current_confirmed_hash: digest,
+      committed_hash: digest,
+      last_force_saved_hash: digest,
+      commit_seq: prior.commit_seq + 1,
+      active: true,
+      updated_at: Date.now(),
+    };
+    store.rooms.set(mapKey, authoritative);
+    virtualFiles.set('/team/shared/spec.docx', {
+      content: Buffer.from(newer).toString('base64'),
+      encoding: 'base64',
+      mtime: Date.now(),
+    });
+    release();
+    const response = await request;
+    expect.soft(response.status, 'old callback must lose authority when PG commit_seq changed during download').toBe(409);
+    expect.soft(Buffer.from(virtualFiles.get('/team/shared/spec.docx')!.content, 'base64').toString(), 'newer confirmed binary must not be overwritten by the stale callback').toBe(newer);
+    expect.soft(store.rooms.get(mapKey)!.commit_seq, 'rejected stale callback must not publish another commit').toBe(authoritative.commit_seq);
+  });
 });
 
 describe('Real Daemon CommandHandler Integration: Atomic Binary Save & Symlink Escape Prevention (F1 + F3d)', () => {

@@ -1587,6 +1587,7 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
       return c.json({ error: 1, message: 'durable_room_state_failed' }, 500);
     }
     const startCommitSeq = getDocumentCommitSeq(mapKey);
+    const startEpoch = documentVersionStateMap.get(mapKey)?.sessionEpoch ?? 0;
     if (claims.documentKey && preCheckKey !== claims.documentKey) {
       return c.json({ error: 1, message: 'stale_document_key' }, 409);
     }
@@ -1620,28 +1621,7 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
         return c.json({ error: 1, message: 'share_revoked_or_downgraded' }, 403);
       }
 
-      // Check commit sequence: if a newer commit succeeded while downloading, this older callback loses write authority
-      if (getDocumentCommitSeq(mapKey) !== startCommitSeq) {
-        return c.json({ error: 1, message: 'stale_document_commit_sequence' }, 409);
-      }
-
-      let keyAtCommit: string;
-      try {
-        keyAtCommit = await resolveOnlyOfficeDocumentKey(claims.serverId, claims.path, {
-          allowedRoot: liveCommitAccess.allowedRoot ?? undefined,
-          db: c.env.DB,
-        });
-      } catch {
-        return c.json({ error: 1, message: 'durable_room_state_failed' }, 500);
-      }
-      if (claims.documentKey && keyAtCommit !== claims.documentKey) {
-        return c.json({ error: 1, message: 'stale_document_key' }, 409);
-      }
-      if (signedKey && keyAtCommit !== signedKey) {
-        return c.json({ error: 1, message: 'stale_document_key' }, 409);
-      }
-
-      const newDigest = createHash('sha256').update(bytes).digest('hex');
+      // Load authoritative PG room state under commit lock
       let state: DocumentVersionState | undefined = undefined;
       if (c.env.DB) {
         try {
@@ -1657,8 +1637,23 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
       } else {
         state = documentVersionStateMap.get(mapKey);
       }
+
+      const currentCommitSeq = state?.commitSeq ?? 0;
       const currentEpoch = state?.sessionEpoch ?? 0;
       const currentKey = state?.activeKey ?? signedKey;
+
+      // Check commit sequence and epoch: if a newer commit succeeded while downloading, this older callback loses write authority
+      if (currentCommitSeq !== startCommitSeq) {
+        return c.json({ error: 1, message: 'stale_document_commit_sequence' }, 409);
+      }
+      if (currentEpoch !== startEpoch) {
+        return c.json({ error: 1, message: 'stale_document_epoch' }, 409);
+      }
+      if (currentKey !== preCheckKey || (claims.documentKey && currentKey !== claims.documentKey) || (signedKey && currentKey !== signedKey)) {
+        return c.json({ error: 1, message: 'stale_document_key' }, 409);
+      }
+
+      const newDigest = createHash('sha256').update(bytes).digest('hex');
 
       // 1. Write-Ahead Intent: MUST successfully persist intent in PG BEFORE any daemon write side-effect
       try {
