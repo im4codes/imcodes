@@ -32,3 +32,82 @@ export const PUSH_PLATFORMS: readonly PushPlatform[] = [
 export function isPushPlatform(value: unknown): value is PushPlatform {
   return typeof value === 'string' && (PUSH_PLATFORMS as readonly string[]).includes(value);
 }
+
+// ── Push notification types and user preferences ─────────────────────────────
+export const PUSH_NOTIFICATION_TYPE_TASK_COMPLETE = 'task_complete';
+export const PUSH_NOTIFICATION_TYPE_WAITING_INPUT = 'waiting_input';
+export const PUSH_NOTIFICATION_TYPE_SESSION_ERROR = 'session_error';
+export const PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE = 'task_pair_done';
+export const PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED = 'task_pair_paused';
+export const PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT = 'task_pair_audit';
+export const PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP = 'remote_desktop';
+
+export type PushNotificationType =
+  | typeof PUSH_NOTIFICATION_TYPE_TASK_COMPLETE
+  | typeof PUSH_NOTIFICATION_TYPE_WAITING_INPUT
+  | typeof PUSH_NOTIFICATION_TYPE_SESSION_ERROR
+  | typeof PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE
+  | typeof PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED
+  | typeof PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT
+  | typeof PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP;
+
+export const PUSH_NOTIFICATION_TYPES: readonly PushNotificationType[] = [
+  PUSH_NOTIFICATION_TYPE_TASK_COMPLETE,
+  PUSH_NOTIFICATION_TYPE_WAITING_INPUT,
+  PUSH_NOTIFICATION_TYPE_SESSION_ERROR,
+  PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE,
+  PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED,
+  PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT,
+  PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP,
+] as const;
+
+export function isPushNotificationType(value: unknown): value is PushNotificationType {
+  return typeof value === 'string' && (PUSH_NOTIFICATION_TYPES as readonly string[]).includes(value as PushNotificationType);
+}
+
+/**
+ * Default enabled notification types:
+ * - Basic: task_complete, waiting_input, session_error
+ * - Task Lifecycle: task_pair_done (DONE), task_pair_paused (PAUSED)
+ * - Security: remote_desktop (Highest Security Alert)
+ *
+ * NOTE: task_pair_audit (intermediate audit/rework steps) is DISABLED by default.
+ */
+export const DEFAULT_PUSH_NOTIFICATION_TYPES: readonly PushNotificationType[] = [
+  PUSH_NOTIFICATION_TYPE_TASK_COMPLETE,
+  PUSH_NOTIFICATION_TYPE_WAITING_INPUT,
+  PUSH_NOTIFICATION_TYPE_SESSION_ERROR,
+  PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE,
+  PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED,
+  PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP,
+] as const;
+
+export const REMOTE_DESKTOP_ALERT_PREFIX = '🚨 [最高安全警示] ';
+
+/** Classify a task pair marker/state event into a fine-grained push notification type. */
+export function classifyTaskPairNotificationType(
+  verb?: string | null,
+  toStatus?: string | null,
+): PushNotificationType | null {
+  const v = (verb ?? '').toUpperCase();
+  const s = (toStatus ?? '').toLowerCase();
+
+  if (v === 'DONE' || s === 'done') {
+    return PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE;
+  }
+  if (v === 'PAUSE' || v === 'NEEDS_DECISION' || s === 'awaiting_brain_decision' || s === 'paused') {
+    return PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED;
+  }
+  if (
+    v === 'READY_FOR_AUDIT' ||
+    v === 'PASS' ||
+    v === 'REWORK' ||
+    s === 'in_audit' ||
+    s === 'awaiting_audit' ||
+    s === 'rework' ||
+    s === 'passed'
+  ) {
+    return PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT;
+  }
+  return null;
+}

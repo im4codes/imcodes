@@ -2175,7 +2175,28 @@
         "target_not_found": "セッションが見つかりません",
         "destroy_forbidden": "許可されていません"
       }
-    }
+    },
+    "push_notifications_label": "プッシュ通知",
+    "push_notifications_title": "プッシュ通知設定",
+    "push_notifications_desc": "モバイル端末で受信するプッシュ通知の種類をカスタマイズします。変更は端末とサーバーに即座に反映されます。",
+    "push_group_basic": "基本通知",
+    "push_task_complete_title": "タスク完了 / セッション待機",
+    "push_task_complete_desc": "セッションの実行が完了した、またはアイドル状態になったときにプッシュ通知を送信します",
+    "push_waiting_input_title": "ユーザー入力待ち / 質問",
+    "push_waiting_input_desc": "Agentから質問があり、ユーザーの確認や入力を待っているときに通知を送信します",
+    "push_session_error_title": "エラーと例外",
+    "push_session_error_desc": "タスク実行中に重大なエラーや例外が発生したときに通知を送信します",
+    "push_group_task_pair": "タスクライフサイクル",
+    "push_task_pair_done_title": "タスク完了 (DONE)",
+    "push_task_pair_done_desc": "タスクが最終承認・完了したときに通知します（デフォルト有効）",
+    "push_task_pair_paused_title": "タスク一時停止 / 意思決定待ち (PAUSED)",
+    "push_task_pair_paused_desc": "タスクが一時停止した、または手動/Brain判断待ちになったときに通知します（デフォルト有効）",
+    "push_task_pair_audit_title": "監査および中間プロセス (Audit & Rework)",
+    "push_task_pair_audit_desc": "READY、PASS、REWORK などの監査中間ステップ（デフォルト無効、必要に応じて有効化）",
+    "push_group_security": "セキュリティ警告",
+    "push_security_highest_badge": "最高重要度警告",
+    "push_remote_desktop_title": "リモートデスクトップ自動ロック解除通知",
+    "push_remote_desktop_desc": "資格情報を使用したリモートデスクトップ自動ロック解除が検出された際の最高重要度アラートです。有効のままにすることを強く推奨します。"
   },
   "capabilities": {
     "eyebrow": "ポータブル AI 機能",

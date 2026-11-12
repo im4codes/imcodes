@@ -2176,7 +2176,28 @@
         "target_not_found": "找不到工作階段",
         "destroy_forbidden": "不允許"
       }
-    }
+    },
+    "push_notifications_label": "推播通知",
+    "push_notifications_title": "推播通知偏好設定",
+    "push_notifications_desc": "自訂在行動裝置上接收的推播通知類型。變更將即時儲存在目前裝置與伺服器端。",
+    "push_group_basic": "基礎通知",
+    "push_task_complete_title": "任務完成 / 工作階段閒置",
+    "push_task_complete_desc": "當工作階段完成執行或進入閒置等待狀態時發送推播通知",
+    "push_waiting_input_title": "等待使用者輸入 / 提問",
+    "push_waiting_input_desc": "當 Agent 向您提出問題並等待您的確認或輸入時發送通知",
+    "push_session_error_title": "執行報錯與異常",
+    "push_session_error_desc": "當任務執行過程中出現未擷取的嚴重錯誤或異常時發送通知",
+    "push_group_task_pair": "任務流轉 (Task Lifecycle)",
+    "push_task_pair_done_title": "任務結束與達成 (DONE)",
+    "push_task_pair_done_desc": "任務最終完成或被 Brain 驗收合併時通知（預設開啟）",
+    "push_task_pair_paused_title": "任務暫停與待決策 (PAUSED)",
+    "push_task_pair_paused_desc": "任務被掛起、暫停或需要等待人工/Brain 仲裁決策時通知（預設開啟）",
+    "push_task_pair_audit_title": "審計與中間流轉過程 (Audit & Rework)",
+    "push_task_pair_audit_desc": "就緒提審 (READY)、審計通過 (PASS)、審計返工 (REWORK) 等中間過程（預設關閉，可依需求開啟）",
+    "push_group_security": "安全警示",
+    "push_security_highest_badge": "最高級別警告",
+    "push_remote_desktop_title": "遠端桌面自動解鎖提醒",
+    "push_remote_desktop_desc": "偵測到憑證被用於遠端桌面自動解鎖，屬於最高安全告警級別，強烈建議保持開啟"
   },
   "capabilities": {
     "eyebrow": "跨 Agent 的 AI 能力",

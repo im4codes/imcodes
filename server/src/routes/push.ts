@@ -23,37 +23,106 @@ import {
   PUSH_PLATFORM_IOS,
   PUSH_PLATFORM_ANDROID_FCM,
   PUSH_PLATFORM_ANDROID_JPUSH,
+  PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP,
+  DEFAULT_PUSH_NOTIFICATION_TYPES,
   isPushPlatform,
+  isPushNotificationType,
   type PushPlatform,
+  type PushNotificationType,
 } from '../../../shared/push-notifications.js';
 
 export const pushRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
-// Auth required for register/unregister but NOT for relay (self-hosted servers call relay without auth)
+// Auth required for register/unregister/preferences but NOT for relay (self-hosted servers call relay without auth)
 pushRoutes.use('/register', requireAuth());
 pushRoutes.use('/unregister', requireAuth());
+pushRoutes.use('/preferences', requireAuth());
 
 // POST /api/push/register — store device token for user
 pushRoutes.post('/register', async (c) => {
   const userId = c.get('userId' as never) as string;
-  const body = await c.req.json<{ token: string; platform: PushPlatform }>().catch(() => null);
+  const body = await c.req.json<{ token: string; platform: PushPlatform; notificationTypes?: string[] }>().catch(() => null);
   if (!body?.token || !body?.platform) return c.json({ error: 'token and platform required' }, 400);
   if (!isPushPlatform(body.platform)) {
     return c.json({ error: `unsupported platform: ${body.platform}` }, 400);
   }
 
+  const rawTypes = body.notificationTypes;
+  const hasExplicitTypes = Array.isArray(rawTypes);
+  const notificationTypes = hasExplicitTypes
+    ? rawTypes.filter(isPushNotificationType)
+    : undefined;
+
   try {
-    await c.env.DB.execute(
-      `INSERT INTO push_tokens (user_id, token, platform, created_at)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (user_id, token) DO UPDATE SET platform = excluded.platform`,
-      [userId, body.token, body.platform, Date.now()],
-    );
+    if (notificationTypes) {
+      await c.env.DB.execute(
+        `INSERT INTO push_tokens (user_id, token, platform, notification_types, created_at)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (user_id, token) DO UPDATE SET platform = excluded.platform, notification_types = excluded.notification_types`,
+        [userId, body.token, body.platform, notificationTypes, Date.now()],
+      );
+    } else {
+      await c.env.DB.execute(
+        `INSERT INTO push_tokens (user_id, token, platform, notification_types, created_at)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (user_id, token) DO UPDATE SET platform = excluded.platform`,
+        [userId, body.token, body.platform, DEFAULT_PUSH_NOTIFICATION_TYPES, Date.now()],
+      );
+    }
   } catch (err) {
     logger.warn({ err }, 'push_tokens insert failed');
   }
 
   return c.json({ ok: true });
+});
+
+// GET /api/push/preferences — get notification types preferences
+pushRoutes.get('/preferences', async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const token = c.req.query('token');
+  let row: { notification_types?: string[] | null } | null = null;
+  if (token) {
+    row = await c.env.DB.queryOne<{ notification_types?: string[] | null }>(
+      'SELECT notification_types FROM push_tokens WHERE user_id = $1 AND token = $2 LIMIT 1',
+      [userId, token],
+    );
+  }
+  if (!row) {
+    row = await c.env.DB.queryOne<{ notification_types?: string[] | null }>(
+      'SELECT notification_types FROM push_tokens WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1',
+      [userId],
+    );
+  }
+  const types = Array.isArray(row?.notification_types) && row!.notification_types!.length > 0
+    ? row!.notification_types!
+    : DEFAULT_PUSH_NOTIFICATION_TYPES;
+  return c.json({ ok: true, types, defaultTypes: DEFAULT_PUSH_NOTIFICATION_TYPES });
+});
+
+// POST /api/push/preferences — update notification types preferences
+pushRoutes.post('/preferences', async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const body = await c.req.json<{ types?: string[]; token?: string }>().catch(() => null);
+  if (!body || !Array.isArray(body.types)) {
+    return c.json({ error: 'types array required' }, 400);
+  }
+  const sanitizedTypes = body.types.filter(isPushNotificationType);
+  try {
+    if (body.token) {
+      await c.env.DB.execute(
+        'UPDATE push_tokens SET notification_types = $1 WHERE user_id = $2 AND token = $3',
+        [sanitizedTypes, userId, body.token],
+      );
+    } else {
+      await c.env.DB.execute(
+        'UPDATE push_tokens SET notification_types = $1 WHERE user_id = $2',
+        [sanitizedTypes, userId],
+      );
+    }
+  } catch (err) {
+    logger.warn({ err, userId }, 'Failed to update push preferences');
+  }
+  return c.json({ ok: true, types: sanitizedTypes });
 });
 
 // DELETE /api/push/unregister — remove device token
@@ -134,6 +203,7 @@ export interface PushPayload {
   body: string;
   badge?: number;
   data?: Record<string, string>;
+  type?: PushNotificationType;
 }
 
 /**
@@ -154,11 +224,11 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
     env = maybeEnv!;
   }
 
-  let tokens: Array<{ token: string; platform: string }> = [];
+  let tokens: Array<{ token: string; platform: string; notification_types?: string[] | null }> = [];
   try {
-    tokens = await db.query<{ token: string; platform: string }>(
+    tokens = await db.query<{ token: string; platform: string; notification_types?: string[] | null }>(
       // A disabled user's devices receive nothing (security/user-status.ts); their registrations stay, so enabling the account resumes it.
-      `SELECT t.token, t.platform FROM push_tokens t WHERE t.user_id = $1 AND ${activeUserExistsSql('t.user_id')}`,
+      `SELECT t.token, t.platform, t.notification_types FROM push_tokens t WHERE t.user_id = $1 AND ${activeUserExistsSql('t.user_id')}`,
       [payload.userId],
     );
   } catch (err) {
@@ -167,6 +237,16 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
   }
 
   if (tokens.length === 0) return;
+
+  const matchingTokens = tokens.filter((t) => {
+    if (!payload.type) return true;
+    const allowed = Array.isArray(t.notification_types) && t.notification_types.length > 0
+      ? t.notification_types
+      : (DEFAULT_PUSH_NOTIFICATION_TYPES as readonly string[]);
+    return allowed.includes(payload.type);
+  });
+
+  if (matchingTokens.length === 0) return;
 
   // Atomically increment badge count and read the new value
   let badgeCount = 1;
@@ -190,7 +270,7 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
   const isSelfHosted = !hasApns && !hasFcm && !hasJpush;
   const relayUrl = isSelfHosted ? (env.PUSH_RELAY_URL || 'https://app.im.codes') : null;
 
-  for (const { token, platform } of tokens) {
+  for (const { token, platform } of matchingTokens) {
     try {
       if (relayUrl) {
         // Self-hosted: relay through central server
@@ -394,7 +474,8 @@ export async function sendJpush(
         // priority 1 (high) — developer-tool notifications should arrive
         // promptly but are not life-critical. Value 2 (max) is reserved by
         // most vendors for IM-class and triggers stricter quota checks.
-        priority: 1,
+        // Highest-level security warning (remote desktop auto unlock) uses max priority 2.
+        priority: payload.type === PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP ? 2 : 1,
         // Maps to Android Notification.CATEGORY_SERVICE — matches what this
         // app actually emits ("AI agent finished a task", "session needs
         // your attention"). NOT 'msg' / CATEGORY_MESSAGE: that's the IM

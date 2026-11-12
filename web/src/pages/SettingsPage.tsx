@@ -1,10 +1,25 @@
-import { useState } from 'preact/hooks';
+import { useState, useEffect } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { startAuthentication } from '@simplewebauthn/browser';
 import { ApiError, passwordChange, passkeyVerifyBegin, passwordSetupWithPasskey, updateDisplayName } from '../api.js';
 import { isNative } from '../native.js';
 import { validatePasswordComplexity } from '@shared/password-rules.js';
 import { AUTH_ERROR_CODES } from '@shared/auth-error-codes.js';
+import {
+  PUSH_NOTIFICATION_TYPE_TASK_COMPLETE,
+  PUSH_NOTIFICATION_TYPE_WAITING_INPUT,
+  PUSH_NOTIFICATION_TYPE_SESSION_ERROR,
+  PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE,
+  PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED,
+  PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT,
+  PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP,
+  type PushNotificationType,
+} from '@shared/push-notifications.js';
+import {
+  fetchPushNotificationPreferences,
+  getLocalPushNotificationPreferences,
+  syncPushNotificationPreferences,
+} from '../push-notifications.js';
 
 interface Props {
   displayName: string | null;
@@ -35,6 +50,30 @@ export function SettingsPage({ displayName, username, hasPassword, serverUrl, on
   const [confirmPw, setConfirmPw] = useState('');
   const [pwSaving, setPwSaving] = useState(false);
   const [pwMsg, setPwMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+
+  const [pushPreferences, setPushPreferences] = useState<PushNotificationType[]>(() =>
+    getLocalPushNotificationPreferences(),
+  );
+
+  useEffect(() => {
+    let unmounted = false;
+    void fetchPushNotificationPreferences().then((types) => {
+      if (!unmounted && types) {
+        setPushPreferences(types);
+      }
+    });
+    return () => {
+      unmounted = true;
+    };
+  }, []);
+
+  const togglePushType = (type: PushNotificationType) => {
+    setPushPreferences((prev) => {
+      const next = prev.includes(type) ? prev.filter((t) => t !== type) : [...prev, type];
+      void syncPushNotificationPreferences(next);
+      return next;
+    });
+  };
 
   const applySetupErrorCode = (errorCode: string | null) => {
     if (errorCode === AUTH_ERROR_CODES.USERNAME_TAKEN) {
@@ -229,6 +268,65 @@ export function SettingsPage({ displayName, username, hasPassword, serverUrl, on
     marginBottom: '6px',
   };
 
+  const checkboxRowStyle: Record<string, string> = {
+    display: 'flex',
+    gap: '10px',
+    alignItems: 'flex-start',
+    cursor: 'pointer',
+    padding: '8px 10px',
+    borderRadius: '6px',
+    background: '#0f172a',
+  };
+
+  const checkboxStyle: Record<string, string> = {
+    marginTop: '3px',
+    cursor: 'pointer',
+    width: '16px',
+    height: '16px',
+  };
+
+  const checkboxTitleStyle: Record<string, string> = {
+    fontSize: '13px',
+    fontWeight: '600',
+    color: '#e2e8f0',
+  };
+
+  const checkboxDescStyle: Record<string, string> = {
+    fontSize: '12px',
+    color: '#94a3b8',
+    marginTop: '2px',
+    lineHeight: '1.4',
+  };
+
+  const pushGroupTitleStyle: Record<string, string> = {
+    fontSize: '13px',
+    fontWeight: '700',
+    color: '#94a3b8',
+    textTransform: 'uppercase',
+    letterSpacing: '0.04em',
+    marginBottom: '8px',
+    marginTop: '16px',
+  };
+
+  const securityRowStyle: Record<string, string> = {
+    ...checkboxRowStyle,
+    background: 'rgba(239, 68, 68, 0.08)',
+    border: '1px solid rgba(239, 68, 68, 0.35)',
+  };
+
+  const securityBadgeStyle: Record<string, string> = {
+    display: 'inline-block',
+    fontSize: '11px',
+    fontWeight: '700',
+    color: '#f87171',
+    background: 'rgba(239, 68, 68, 0.18)',
+    border: '1px solid rgba(239, 68, 68, 0.4)',
+    borderRadius: '4px',
+    padding: '1px 6px',
+    marginLeft: '6px',
+    verticalAlign: 'middle',
+  };
+
   const teamPointStyle: Record<string, string> = {
     display: 'flex',
     gap: '8px',
@@ -316,6 +414,130 @@ export function SettingsPage({ displayName, username, hasPassword, serverUrl, on
               {nameMsg.text}
             </div>
           )}
+        </div>
+
+        {/* Push Notification Preferences */}
+        <div style={cardStyle} data-testid="push-notification-settings-card">
+          <div style={inlineLabelStyle}>{t('settings.push_notifications_label')}</div>
+          <h2 style={{ fontSize: '16px', fontWeight: '600', marginBottom: '6px', color: '#e2e8f0' }}>
+            {t('settings.push_notifications_title')}
+          </h2>
+          <p style={{ color: '#94a3b8', fontSize: '13px', lineHeight: 1.5, margin: '0 0 16px' }}>
+            {t('settings.push_notifications_desc')}
+          </p>
+
+          {/* Group 1: Basic */}
+          <div style={pushGroupTitleStyle}>{t('settings.push_group_basic')}</div>
+          <div style={{ display: 'grid', gap: '8px' }}>
+            <label style={checkboxRowStyle}>
+              <input
+                type="checkbox"
+                aria-label={t('settings.push_task_complete_title')}
+                checked={pushPreferences.includes(PUSH_NOTIFICATION_TYPE_TASK_COMPLETE)}
+                onChange={() => togglePushType(PUSH_NOTIFICATION_TYPE_TASK_COMPLETE)}
+                style={checkboxStyle}
+              />
+              <div>
+                <div style={checkboxTitleStyle}>{t('settings.push_task_complete_title')}</div>
+                <div style={checkboxDescStyle}>{t('settings.push_task_complete_desc')}</div>
+              </div>
+            </label>
+
+            <label style={checkboxRowStyle}>
+              <input
+                type="checkbox"
+                aria-label={t('settings.push_waiting_input_title')}
+                checked={pushPreferences.includes(PUSH_NOTIFICATION_TYPE_WAITING_INPUT)}
+                onChange={() => togglePushType(PUSH_NOTIFICATION_TYPE_WAITING_INPUT)}
+                style={checkboxStyle}
+              />
+              <div>
+                <div style={checkboxTitleStyle}>{t('settings.push_waiting_input_title')}</div>
+                <div style={checkboxDescStyle}>{t('settings.push_waiting_input_desc')}</div>
+              </div>
+            </label>
+
+            <label style={checkboxRowStyle}>
+              <input
+                type="checkbox"
+                aria-label={t('settings.push_session_error_title')}
+                checked={pushPreferences.includes(PUSH_NOTIFICATION_TYPE_SESSION_ERROR)}
+                onChange={() => togglePushType(PUSH_NOTIFICATION_TYPE_SESSION_ERROR)}
+                style={checkboxStyle}
+              />
+              <div>
+                <div style={checkboxTitleStyle}>{t('settings.push_session_error_title')}</div>
+                <div style={checkboxDescStyle}>{t('settings.push_session_error_desc')}</div>
+              </div>
+            </label>
+          </div>
+
+          {/* Group 2: Task Lifecycle */}
+          <div style={pushGroupTitleStyle}>{t('settings.push_group_task_pair')}</div>
+          <div style={{ display: 'grid', gap: '8px' }}>
+            <label style={checkboxRowStyle}>
+              <input
+                type="checkbox"
+                aria-label={t('settings.push_task_pair_done_title')}
+                checked={pushPreferences.includes(PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE)}
+                onChange={() => togglePushType(PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE)}
+                style={checkboxStyle}
+              />
+              <div>
+                <div style={checkboxTitleStyle}>{t('settings.push_task_pair_done_title')}</div>
+                <div style={checkboxDescStyle}>{t('settings.push_task_pair_done_desc')}</div>
+              </div>
+            </label>
+
+            <label style={checkboxRowStyle}>
+              <input
+                type="checkbox"
+                aria-label={t('settings.push_task_pair_paused_title')}
+                checked={pushPreferences.includes(PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED)}
+                onChange={() => togglePushType(PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED)}
+                style={checkboxStyle}
+              />
+              <div>
+                <div style={checkboxTitleStyle}>{t('settings.push_task_pair_paused_title')}</div>
+                <div style={checkboxDescStyle}>{t('settings.push_task_pair_paused_desc')}</div>
+              </div>
+            </label>
+
+            <label style={checkboxRowStyle}>
+              <input
+                type="checkbox"
+                aria-label={t('settings.push_task_pair_audit_title')}
+                checked={pushPreferences.includes(PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT)}
+                onChange={() => togglePushType(PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT)}
+                style={checkboxStyle}
+              />
+              <div>
+                <div style={checkboxTitleStyle}>{t('settings.push_task_pair_audit_title')}</div>
+                <div style={checkboxDescStyle}>{t('settings.push_task_pair_audit_desc')}</div>
+              </div>
+            </label>
+          </div>
+
+          {/* Group 3: Security Alert */}
+          <div style={pushGroupTitleStyle}>{t('settings.push_group_security')}</div>
+          <div style={{ display: 'grid', gap: '8px' }}>
+            <label style={securityRowStyle}>
+              <input
+                type="checkbox"
+                aria-label={t('settings.push_remote_desktop_title')}
+                checked={pushPreferences.includes(PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP)}
+                onChange={() => togglePushType(PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP)}
+                style={checkboxStyle}
+              />
+              <div>
+                <div style={checkboxTitleStyle}>
+                  {t('settings.push_remote_desktop_title')}
+                  <span style={securityBadgeStyle}>{t('settings.push_security_highest_badge')}</span>
+                </div>
+                <div style={checkboxDescStyle}>{t('settings.push_remote_desktop_desc')}</div>
+              </div>
+            </label>
+          </div>
         </div>
 
         {!hasPassword ? (

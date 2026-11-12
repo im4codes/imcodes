@@ -621,4 +621,39 @@ describe('generic i18n coverage guard', () => {
       }
     }
   });
+
+  it('keeps push notification settings keys present in every locale', () => {
+    const PUSH_NOTIFICATION_SETTINGS_KEYS = [
+      'settings.push_notifications_label',
+      'settings.push_notifications_title',
+      'settings.push_notifications_desc',
+      'settings.push_group_basic',
+      'settings.push_task_complete_title',
+      'settings.push_task_complete_desc',
+      'settings.push_waiting_input_title',
+      'settings.push_waiting_input_desc',
+      'settings.push_session_error_title',
+      'settings.push_session_error_desc',
+      'settings.push_group_task_pair',
+      'settings.push_task_pair_done_title',
+      'settings.push_task_pair_done_desc',
+      'settings.push_task_pair_paused_title',
+      'settings.push_task_pair_paused_desc',
+      'settings.push_task_pair_audit_title',
+      'settings.push_task_pair_audit_desc',
+      'settings.push_group_security',
+      'settings.push_security_highest_badge',
+      'settings.push_remote_desktop_title',
+      'settings.push_remote_desktop_desc',
+    ];
+
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as unknown;
+      for (const key of PUSH_NOTIFICATION_SETTINGS_KEYS) {
+        const value = readPath(messages, key);
+        expect(value, `${locale}:${key}`).toEqual(expect.any(String));
+        expect((value as string | undefined)?.trim().length, `${locale}:${key}`).toBeGreaterThan(0);
+      }
+    }
+  });
 });

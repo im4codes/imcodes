@@ -86,3 +86,61 @@ describe('push notification badge reset', () => {
     expect(apiFetchMock).toHaveBeenCalledWith('/api/push/badge-reset', { method: 'POST' });
   });
 });
+
+describe('push notification preferences', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    apiFetchMock.mockReset();
+  });
+
+  it('falls back to default push notification types when localStorage is empty', async () => {
+    const { getLocalPushNotificationPreferences } = await import('../src/push-notifications.js');
+    const { DEFAULT_PUSH_NOTIFICATION_TYPES } = await import('@shared/push-notifications.js');
+
+    const prefs = getLocalPushNotificationPreferences();
+    expect(prefs).toEqual(DEFAULT_PUSH_NOTIFICATION_TYPES);
+  });
+
+  it('reads and sanitizes saved push notification types from localStorage', async () => {
+    const { getLocalPushNotificationPreferences, PUSH_NOTIFICATION_PREFERENCES_KEY } = await import('../src/push-notifications.js');
+    localStorage.setItem(
+      PUSH_NOTIFICATION_PREFERENCES_KEY,
+      JSON.stringify(['task_complete', 'invalid_type', 'remote_desktop']),
+    );
+
+    const prefs = getLocalPushNotificationPreferences();
+    expect(prefs).toEqual(['task_complete', 'remote_desktop']);
+  });
+
+  it('saves preferences to localStorage', async () => {
+    const { setLocalPushNotificationPreferences, getLocalPushNotificationPreferences } = await import('../src/push-notifications.js');
+
+    setLocalPushNotificationPreferences(['task_pair_done', 'remote_desktop']);
+    expect(getLocalPushNotificationPreferences()).toEqual(['task_pair_done', 'remote_desktop']);
+  });
+
+  it('fetches remote preferences and caches them locally', async () => {
+    const { fetchPushNotificationPreferences, getLocalPushNotificationPreferences } = await import('../src/push-notifications.js');
+    apiFetchMock.mockResolvedValueOnce({
+      ok: true,
+      types: ['task_complete', 'task_pair_paused', 'remote_desktop'],
+    });
+
+    const types = await fetchPushNotificationPreferences();
+    expect(types).toEqual(['task_complete', 'task_pair_paused', 'remote_desktop']);
+    expect(getLocalPushNotificationPreferences()).toEqual(['task_complete', 'task_pair_paused', 'remote_desktop']);
+    expect(apiFetchMock).toHaveBeenCalledWith('/api/push/preferences');
+  });
+
+  it('syncs push notification preferences to the server and local storage', async () => {
+    const { syncPushNotificationPreferences, getLocalPushNotificationPreferences } = await import('../src/push-notifications.js');
+    apiFetchMock.mockResolvedValueOnce({ ok: true });
+
+    await syncPushNotificationPreferences(['task_complete', 'waiting_input']);
+    expect(getLocalPushNotificationPreferences()).toEqual(['task_complete', 'waiting_input']);
+    expect(apiFetchMock).toHaveBeenCalledWith('/api/push/preferences', {
+      method: 'POST',
+      body: JSON.stringify({ types: ['task_complete', 'waiting_input'] }),
+    });
+  });
+});

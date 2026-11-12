@@ -20,7 +20,10 @@ import {
   PUSH_PLATFORM_IOS,
   PUSH_PLATFORM_ANDROID_FCM,
   PUSH_PLATFORM_ANDROID_JPUSH,
+  DEFAULT_PUSH_NOTIFICATION_TYPES,
+  isPushNotificationType,
   type PushPlatform,
+  type PushNotificationType,
 } from '@shared/push-notifications.js';
 
 let pushSupported = false;
@@ -202,6 +205,60 @@ function handleNotificationOpen(data: Record<string, string> | undefined): void 
   requestAnimationFrame(() => requestAnimationFrame(fireRefresh));
 }
 
+export const PUSH_NOTIFICATION_PREFERENCES_KEY = 'imcodes.push_notification_preferences';
+
+export function getLocalPushNotificationPreferences(): PushNotificationType[] {
+  try {
+    const raw = localStorage.getItem(PUSH_NOTIFICATION_PREFERENCES_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        const valid = parsed.filter(isPushNotificationType);
+        if (valid.length > 0) return valid;
+      }
+    }
+  } catch {
+    // fallback
+  }
+  return [...DEFAULT_PUSH_NOTIFICATION_TYPES];
+}
+
+export function setLocalPushNotificationPreferences(types: PushNotificationType[]): void {
+  try {
+    localStorage.setItem(PUSH_NOTIFICATION_PREFERENCES_KEY, JSON.stringify(types));
+  } catch {
+    // ignore
+  }
+}
+
+export async function fetchPushNotificationPreferences(): Promise<PushNotificationType[]> {
+  try {
+    const res = await apiFetch<{ ok: boolean; types: PushNotificationType[] }>('/api/push/preferences');
+    if (res?.ok && Array.isArray(res.types)) {
+      const valid = res.types.filter(isPushNotificationType);
+      if (valid.length > 0) {
+        setLocalPushNotificationPreferences(valid);
+        return valid;
+      }
+    }
+  } catch (err) {
+    console.warn('Failed to fetch remote push notification preferences:', err);
+  }
+  return getLocalPushNotificationPreferences();
+}
+
+export async function syncPushNotificationPreferences(types: PushNotificationType[]): Promise<void> {
+  setLocalPushNotificationPreferences(types);
+  try {
+    await apiFetch('/api/push/preferences', {
+      method: 'POST',
+      body: JSON.stringify({ types }),
+    });
+  } catch (err) {
+    console.warn('Failed to sync push notification preferences:', err);
+  }
+}
+
 async function registerDeviceToken(
   token: string,
   platform: PushPlatform,
@@ -209,13 +266,14 @@ async function registerDeviceToken(
   cfWorkerUrl: string,
 ): Promise<void> {
   try {
+    const notificationTypes = getLocalPushNotificationPreferences();
     await fetch(`${cfWorkerUrl}/api/push/register`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ token, platform }),
+      body: JSON.stringify({ token, platform, notificationTypes }),
     });
   } catch (err) {
     console.warn('Failed to register push token:', err);

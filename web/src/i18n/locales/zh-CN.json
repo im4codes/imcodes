@@ -2176,7 +2176,28 @@
         "target_not_found": "未找到会话",
         "destroy_forbidden": "不允许"
       }
-    }
+    },
+    "push_notifications_label": "推送通知",
+    "push_notifications_title": "推送通知偏好设置",
+    "push_notifications_desc": "自定义在移动设备上接收的推送通知类型。更改将即时保存在当前设备与服务端。",
+    "push_group_basic": "基础通知",
+    "push_task_complete_title": "任务完成 / 会话空闲",
+    "push_task_complete_desc": "当会话完成执行或进入空闲等待状态时发送推送通知",
+    "push_waiting_input_title": "等待用户输入 / 提问",
+    "push_waiting_input_desc": "当 Agent 向您提出问题并等待您的确认或输入时发送通知",
+    "push_session_error_title": "运行报错与异常",
+    "push_session_error_desc": "当任务执行过程中出现未捕获的严重错误或异常时发送通知",
+    "push_group_task_pair": "任务流转 (Task Lifecycle)",
+    "push_task_pair_done_title": "任务结束与达成 (DONE)",
+    "push_task_pair_done_desc": "任务最终完成或被 Brain 验收合并时通知（默认开启）",
+    "push_task_pair_paused_title": "任务暂停与待决策 (PAUSED)",
+    "push_task_pair_paused_desc": "任务被挂起、暂停或需要等待人工/Brain 仲裁决策时通知（默认开启）",
+    "push_task_pair_audit_title": "审计与中间流转过程 (Audit & Rework)",
+    "push_task_pair_audit_desc": "就绪提审 (READY)、审计通过 (PASS)、审计返工 (REWORK) 等中间过程（默认关闭，可按需开启）",
+    "push_group_security": "安全警示",
+    "push_security_highest_badge": "最高级别警告",
+    "push_remote_desktop_title": "远程桌面自动解锁提醒",
+    "push_remote_desktop_desc": "检测到凭据被用于远程桌面自动解锁，属于最高安全告警级别，强烈建议保持开启"
   },
   "capabilities": {
     "eyebrow": "跨 Agent 的 AI 能力",

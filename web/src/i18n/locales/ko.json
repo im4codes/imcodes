@@ -2175,7 +2175,28 @@
         "target_not_found": "세션을 찾을 수 없음",
         "destroy_forbidden": "허용되지 않음"
       }
-    }
+    },
+    "push_notifications_label": "푸시 알림",
+    "push_notifications_title": "푸시 알림 기본 설정",
+    "push_notifications_desc": "모바일 기기에서 수신할 푸시 알림 유형을 맞춤설정합니다. 변경사항은 즉시 기기와 서버에 반영됩니다.",
+    "push_group_basic": "기본 알림",
+    "push_task_complete_title": "작업 완료 / 세션 유휴",
+    "push_task_complete_desc": "세션 실행이 완료되거나 유휴 상태가 되었을 때 푸시 알림을 전송합니다",
+    "push_waiting_input_title": "사용자 입력 대기 / 질문",
+    "push_waiting_input_desc": "Agent가 질문을 하여 사용자의 확인이나 입력을 기다릴 때 알림을 전송합니다",
+    "push_session_error_title": "실행 오류 및 예외",
+    "push_session_error_desc": "작업 실행 중 치명적인 오류나 예외가 발생했을 때 알림을 전송합니다",
+    "push_group_task_pair": "작업 라이프사이클",
+    "push_task_pair_done_title": "작업 완료 (DONE)",
+    "push_task_pair_done_desc": "작업이 최종 승인 및 완료되었을 때 알림을 보냅니다 (기본 켜짐)",
+    "push_task_pair_paused_title": "작업 일시 중지 / 결정 대기 (PAUSED)",
+    "push_task_pair_paused_desc": "작업이 일시 중지되거나 결정 대기 상태가 되었을 때 알림을 보냅니다 (기본 켜짐)",
+    "push_task_pair_audit_title": "감사 및 중간 진행 과정 (Audit & Rework)",
+    "push_task_pair_audit_desc": "READY, PASS, REWORK 등 중간 진행 단계 (기본 꺼짐, 필요 시 활성화)",
+    "push_group_security": "보안 알림",
+    "push_security_highest_badge": "최고 수준 경고",
+    "push_remote_desktop_title": "원격 데스크톱 자동 잠금 해제 알림",
+    "push_remote_desktop_desc": "원격 데스크톱 자동 잠금 해제에 자격 증명이 사용되었을 때 전송되는 최고 수준의 보안 경고입니다. 항상 켜두는 것을 강력히 권장합니다."
   },
   "capabilities": {
     "eyebrow": "이식 가능한 AI 기능",
