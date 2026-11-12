@@ -644,6 +644,10 @@
     "messageQueuedLabel": "대기 중"
   },
   "session": {
+    "incognito": "시크릿 세션",
+    "incognito_hint": "기록은 메모리에만 보관되며 세션을 닫거나 연결을 끊으면 삭제됩니다. 메모리 도구는 비활성화됩니다. 에이전트가 만든 프로젝트 파일은 유지됩니다.",
+    "incognito_available": "현재 Claude SDK만 지원합니다.",
+    "incognito_unsupported": "업데이트된 서버와 데몬 및 Claude SDK가 필요합니다. 다른 런타임에서는 기록 비저장을 보장할 수 없습니다.",
     "restart": "↺ 재시작",
     "restart_plain": "재시작",
     "terminal_recovery_exhausted": "터미널을 자동으로 복구하지 못했습니다. 계속하려면 다시 시작하세요.",

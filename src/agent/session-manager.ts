@@ -1,3 +1,5 @@
+import { isIncognitoSession, supportsSessionIncognito, SESSION_INCOGNITO_UNSUPPORTED, type SessionIncognitoConfig } from '../../shared/session-incognito-types.js';
+import { notifySessionTeardown, setSessionIncognito, withSessionPrivacy } from '../../shared/session-incognito-context.js';
 import { AGY_NATIVE_SESSION_STATE, AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { agyNativeStartNotAttemptedError, persistAgyNativeSessionStart } from './agy-session-persistence.js';
 import { queuedUserMessageAttribution } from './transport-queued-user-message.js';
@@ -124,6 +126,7 @@ import { resolveTransportQueueEntryAdmission } from '../daemon/delegation-reply-
 import { isNativeAgentFenceRequiredForLaunch } from '../daemon/native-collaboration-guard.js';
 import { processLaunchFence } from './native-agent-fence.js';
 import { getTransportQueueRevision, observeTransportQueueRevision } from '../daemon/transport-queue-revision.js';
+import { getDefaultTimelineDetailStore } from '../daemon/timeline-detail-store.js';
 import { getTransportQueueStore } from '../daemon/transport-queue-store.js';
 import { buildTransportQueueSnapshotPayload, transportQueueSnapshotToPayload } from '../daemon/transport-queue-projection.js';
 import { appendTransportEvent, replayTransportHistory } from '../daemon/transport-history.js';
@@ -442,7 +445,7 @@ export async function stopProject(
           timelineEmitter.emit(record.name, 'session.state', { state: 'stopped' });
           return;
         }
-        if (shouldMaterializeMasterOnSessionStop(record)) {
+        if (!isIncognitoSession(record) && shouldMaterializeMasterOnSessionStop(record)) {
           const registration = registerMasterCompaction(
             () => materializeMasterSummary(record.name, record.contextNamespace),
             {
@@ -471,7 +474,12 @@ export async function stopProject(
         // (otherwise they leak for every session that ever ran), and drop any
         // queued resend work so it can't replay into a same-named session later.
         timelineEmitter.forgetSession(record.name);
+        notifySessionTeardown(record.name);
         clearResend(record.name, 'session_removed');
+        if (isIncognitoSession(record)) {
+          getTransportQueueStore().discardSessionQueueState(record.name);
+          getDefaultTimelineDetailStore().forgetSession(record.name);
+        }
         emitSessionPersist(null, record.name);
         if (record.projectDir && !invalidatedDirs.has(record.projectDir)) {
           invalidatedDirs.add(record.projectDir);
@@ -1164,7 +1172,7 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
   return true;
 }
 
-export interface LaunchOpts {
+export interface LaunchOpts extends SessionIncognitoConfig {
   name: string;
   projectName: string;
   role: 'brain' | `w${number}`;
@@ -1263,6 +1271,7 @@ async function detachTransportRuntimeSession(
   options: { preserveTransportQueue?: boolean } = {},
 ): Promise<void> {
   clearTransportResendAuthorityRetry(sessionName);
+  notifySessionTeardown(sessionName);
   const transportRuntime = transportRuntimes.get(sessionName);
   if (!transportRuntime) return;
   const providerSid = transportRuntime.providerSessionId;
@@ -2264,6 +2273,7 @@ function wireTransportCallbacks(
     timelineEmitter.emit(sessionName, 'session.state', built.payload, { source: 'daemon', confidence: 'high' });
   };
   runtime.onDrain = (messages, merged, count, metadata) => {
+    withSessionPrivacy(sessionName, isIncognitoSession(getSession(sessionName)), () => {
     // The post-drain queue version. Stamped on the per-entry user.message
     // events AND the cleared session.state below so the UI advances its
     // baseline even if one of those events is lost on a weak network — a
@@ -2306,9 +2316,11 @@ function wireTransportCallbacks(
       }),
       { source: 'daemon', confidence: 'high' },
     );
+    });
   };
   runtime.pendingDrainAdmission = (entry) => resolveTransportQueueEntryAdmission(sessionName, entry);
   runtime.onActiveAppend = (messages, snapshot) => {
+    withSessionPrivacy(sessionName, isIncognitoSession(getSession(sessionName)), () => {
     const pendingMessageVersion = observeTransportQueueRevision(sessionName, snapshot.pendingMessageVersion);
     for (const entry of messages) {
       // Avoid a static cycle: supervision-automation owns runtimes through this
@@ -2343,6 +2355,7 @@ function wireTransportCallbacks(
       state: runtime.pendingCount > 0 ? 'queued' : 'running',
       ...transportQueueSnapshotToPayload(snapshot),
     }, { source: 'daemon', confidence: 'high' });
+    });
   };
   if (!options.deferProviderReadyDrain) wireTransportProviderReadyDrain(runtime, sessionName);
   runtime.onStartupMemoryInjected = () => {
@@ -3597,7 +3610,12 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     // intentionally tears down + recreates).
     if (!opts.fresh && transportRuntimes.has(name)) return;
   }
-  const launch = launchTransportSessionInner(opts);
+  const incognito = opts.incognito === true || (!opts.fresh && isIncognitoSession(getSession(name)));
+  if (incognito && !supportsSessionIncognito(opts.agentType)) throw new Error(SESSION_INCOGNITO_UNSUPPORTED);
+  if (incognito && !opts.fresh && getSession(name)) throw new Error('Incognito session cannot be restored; start a fresh session.');
+  opts = { ...opts, ...(incognito ? { incognito: true } : {}) };
+  setSessionIncognito(name, incognito);
+  const launch = withSessionPrivacy(name, incognito, () => launchTransportSessionInner(opts));
   const tracked = launch.then(() => {}, () => {});
   transportLaunchInFlight.set(name, tracked);
   try {
@@ -3765,8 +3783,10 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     startupMemoryAlreadyInjected: preserveStartupMemoryInject,
     ...(onNamespaceResolved ? { onNamespaceResolved } : {}),
   });
-  const { bootstrap: contextBootstrap, deferred: deferredContextBootstrap } = await resolveLaunchContextBootstrap(name, resolveRuntimeContextBootstrap);
-  runtime.setContextBootstrapResolver(() => resolveRuntimeContextBootstrap());
+  const { bootstrap: contextBootstrap, deferred: deferredContextBootstrap } = opts.incognito
+    ? { bootstrap: {}, deferred: undefined }
+    : await resolveLaunchContextBootstrap(name, resolveRuntimeContextBootstrap);
+  if (!opts.incognito) runtime.setContextBootstrapResolver(() => resolveRuntimeContextBootstrap());
   if (deferredContextBootstrap) runtime.deferContextBootstrap(deferredContextBootstrap);
     if (agentType === 'qwen') {
       const qwenRuntime = await getQwenRuntimeConfig().catch(() => null);
@@ -3949,6 +3969,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   // Create session on provider
   const launchAuthContext = await resolveLaunchAuthContext(provider.id, transportEnv);
   await runtime.initialize({
+    ...(opts.incognito ? { incognito: true } : {}),
     sessionKey: effectiveSessionKey,
     sessionName: name,
     sessionInstanceId: resourceSessionInstanceId,
@@ -4002,6 +4023,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   try {
     if (!skipStore) {
       const record = markSessionLaunchIdentity<SessionRecord>({
+        ...(opts.incognito ? { incognito: true } : {}),
         name,
         sessionInstanceId: resourceSessionInstanceId,
         runtimeEpoch: resourceRuntimeEpoch,

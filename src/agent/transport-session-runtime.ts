@@ -589,6 +589,7 @@ function brainContractVariantKey(automaticSupervision: boolean, taskPairEngine: 
 }
 
 export class TransportSessionRuntime implements SessionRuntime {
+  private incognito = false;
   readonly type = RUNTIME_TYPES.TRANSPORT;
 
   private _status: AgentStatus = 'idle';
@@ -2737,6 +2738,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   async initialize(config: SessionConfig): Promise<void> {
+    this.incognito = config.incognito === true;
     config = withMemoryMcpSessionEnv({ ...config, providerId: this.provider.id });
     this._pendingHandoff = config.pendingHandoff ?? null;
     // When resuming/restoring an existing conversation, mark startup memory
@@ -4870,7 +4872,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       // particular, do not consume first-turn startup memory or run semantic
       // recall: both can contain recent summaries and both emit public
       // memory.context evidence after provider acceptance.
-      const suppressMemoryContext = isSlashControl || isPrivateControlDispatch;
+      const suppressMemoryContext = this.incognito || isSlashControl || isPrivateControlDispatch;
       // The toggle is re-read here, not only at bootstrap: a session whose
       // first-turn memory was assembled before injection was turned off must
       // still honor the switch without a restart. Managed Skills stay.
@@ -4888,7 +4890,7 @@ export class TransportSessionRuntime implements SessionRuntime {
             ? await buildTransportStartupMemory(this._contextNamespace, { projectDir: this._projectDir })
             : null
         ));
-      const memoryRecallResult = isPrivateControlDispatch
+      const memoryRecallResult = this.incognito || isPrivateControlDispatch
         ? { artifact: null }
         : isSlashControl
         ? {

@@ -1,4 +1,5 @@
 import { R2_RELAY_CAPABILITY } from '../../shared/r2-relay.js';
+import { SESSION_INCOGNITO_CAPABILITY, SESSION_INCOGNITO_SERVER_READY } from '../../shared/session-incognito-types.js';
 import os from 'node:os';
 import fs from 'node:fs';
 import { performance } from 'node:perf_hooks';
@@ -607,7 +608,12 @@ export class ServerLink {
     return this.serverId;
   }
 
+  private incognitoServerReady = false;
+
+  supportsIncognitoSessions(): boolean { return this.incognitoServerReady; }
+
   connect(): void {
+    this.incognitoServerReady = false;
     // A new authentication attempt replaces all authority learned over the
     // prior socket, even if that socket never delivers a close event.
     clearServerLinkSecurity('connect_replacement');
@@ -869,6 +875,13 @@ export class ServerLink {
             });
           return;
         }
+        if (msg?.type === SESSION_INCOGNITO_SERVER_READY) {
+          if (!this.incognitoServerReady) {
+            this.incognitoServerReady = true;
+            this.sendDaemonHello();
+          }
+          return;
+        }
         if (msg?.type === 'heartbeat_ack') {
           this.observeHeartbeatAck(msg[CLOCK_SYNC_FIELD.SENT_AT], this.lastPong);
           // Heartbeat acks are the CLI/status proof-of-life source. They must
@@ -897,6 +910,7 @@ export class ServerLink {
       // this one with 1001 "replaced" — that's expected and we must NOT reconnect,
       // otherwise the newer connection gets kicked and we loop forever.
       if (this.ws !== ws) return;
+      this.incognitoServerReady = false;
       clearConnectTimeout();
       logger.info({ code: event.code, reason: event.reason }, 'ServerLink: closed');
       clearServerLinkSecurity('socket_close');
@@ -1505,6 +1519,7 @@ export class ServerLink {
     return [...new Set([
       ...this.p2pWorkflowCapabilities,
       ...DAEMON_STATIC_CAPABILITIES,
+      ...(this.incognitoServerReady ? [SESSION_INCOGNITO_CAPABILITY] : []),
       ...directFileTransferDaemonCapabilities(isDirectFileTransferAvailable()),
       ...daemonRemoteDesktopCapabilities(),
     ])];

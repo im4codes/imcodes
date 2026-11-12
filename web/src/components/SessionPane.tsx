@@ -209,6 +209,7 @@ export function SessionPane({
     loadMessageContext,
     forceRefresh: timelineForceRefresh,
   } = useTimeline(sessionName, ws, serverId, {
+    incognito: session.incognito,
     // A focused sub-session window owns keyboard/recovery focus while it is
     // open. Keep this main pane mounted and subscribed, but do not let it join
     // the same global resume broadcast and double the foreground work.

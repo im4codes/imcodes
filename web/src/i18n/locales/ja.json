@@ -644,6 +644,10 @@
     "messageQueuedLabel": "キュー済み"
   },
   "session": {
+    "incognito": "シークレットセッション",
+    "incognito_hint": "履歴はメモリ内のみで保持し、終了・切断時に消去します。メモリツールは無効です。エージェントが作成したプロジェクトファイルは残ります。",
+    "incognito_available": "現在は Claude SDK のみ対応しています。",
+    "incognito_unsupported": "更新済みのサーバーとデーモン、および Claude SDK が必要です。他の実行環境では履歴の非保存を保証できません。",
     "restart": "↺ 再起動",
     "restart_plain": "再起動",
     "terminal_recovery_exhausted": "ターミナルを自動復旧できませんでした。再起動して続行してください。",

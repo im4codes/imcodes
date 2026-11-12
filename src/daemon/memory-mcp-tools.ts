@@ -1,3 +1,5 @@
+import { isIncognitoSessionName } from '../../shared/session-incognito-context.js';
+import { SESSION_INCOGNITO_MEMORY_DISABLED } from '../../shared/session-incognito-types.js';
 import { TASK_PAIR_DECISION_LIMITS, validateTaskPairDecisionDetails, type TaskPairDecisionDetails } from '../../shared/task-pair-decision.js';
 import { readSessionTextMessages, readSessionSummaries, readSessionToolEvents, resolveHistorySession, canReadSessionHistory } from './session-history.js';
 import { SESSION_TEXT_HISTORY_DEFAULT_LIMIT, SESSION_TEXT_HISTORY_MAX_LIMIT, SESSION_HISTORY_KINDS } from '../../shared/session-history.js';
@@ -5033,10 +5035,10 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       handlers[name] = (input) => deps.invokeDaemonMemoryTool!(name, input);
     }
   }
-  return wrapHandlers(handlers);
+  return wrapHandlers(handlers, caller.sessionName);
 }
 
-function wrapHandlers(handlers: Record<MemoryMcpToolName, MemoryMcpToolHandler>): Record<MemoryMcpToolName, MemoryMcpToolHandler> {
+function wrapHandlers(handlers: Record<MemoryMcpToolName, MemoryMcpToolHandler>, sessionName: string | null): Record<MemoryMcpToolName, MemoryMcpToolHandler> {
   const wrapped = {} as Record<MemoryMcpToolName, MemoryMcpToolHandler>;
   // Keep retired handlers available to the daemon-side direct-call seam so an
   // old client receives the explicit retirement guidance. They are still
@@ -5048,6 +5050,7 @@ function wrapHandlers(handlers: Record<MemoryMcpToolName, MemoryMcpToolHandler>)
   for (const name of names as Set<MemoryMcpToolName>) {
     wrapped[name] = async (input?: unknown, context?: MemoryMcpToolContext) => {
       try {
+        if (isIncognitoSessionName(sessionName)) throw new Error(SESSION_INCOGNITO_MEMORY_DISABLED);
         return await handlers[name](input, context);
       } catch (err) {
         return sanitizeCaughtError(err);

@@ -1,3 +1,6 @@
+import { inIncognitoContext, isIncognitoSessionName } from '../../shared/session-incognito-context.js';
+import { isIncognitoSession } from '../../shared/session-incognito-types.js';
+import { getSession } from '../store/session-store.js';
 import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 /**
  * Transport session JSONL history — local cache for transport-backed agent messages.
@@ -208,14 +211,29 @@ export function trimTransportHistoryEventsToReplayBudget(sessionId: string, even
   return kept;
 }
 
+function isPrivateTransportSession(sessionId: string, event?: Record<string, unknown>): boolean {
+  if (inIncognitoContext() || isIncognitoSessionName(sessionId)) return true;
+  if (isIncognitoSession(getSession(sessionId))) return true;
+  if (event && (isIncognitoSession(event) || isIncognitoSession(event.payload as { incognito?: boolean } | null | undefined))) {
+    return true;
+  }
+  const eventSessionId = typeof event?.sessionId === 'string' ? event.sessionId : undefined;
+  if (eventSessionId && (isIncognitoSessionName(eventSessionId) || isIncognitoSession(getSession(eventSessionId)))) {
+    return true;
+  }
+  return false;
+}
+
 /** Append a transport event to the session's JSONL file. */
 export async function appendTransportEvent(sessionId: string, event: Record<string, unknown>): Promise<void> {
   try {
+    if (isPrivateTransportSession(sessionId, event)) return;
     if (!shouldKeepTransportHistoryEvent(event)) return;
     await ensureDir();
     const line = JSON.stringify(sanitizeTransportHistoryEvent({ ...event, _ts: Date.now() })) + '\n';
     await appendFile(sessionFile(sessionId), line, 'utf8');
   } catch (err) {
+    if (isPrivateTransportSession(sessionId, event)) return;
     logger.debug({ sessionId, err }, 'transport-history: append failed');
   }
 }
@@ -234,6 +252,7 @@ export async function appendTransportEvent(sessionId: string, event: Record<stri
  * multi-hundred-MB JSONLs no longer force a ~340MB V8 string allocation.
  */
 export async function replayTransportHistory(sessionId: string): Promise<Record<string, unknown>[]> {
+  if (isPrivateTransportSession(sessionId)) return [];
   let fh;
   try {
     fh = await open(sessionFile(sessionId), 'r');

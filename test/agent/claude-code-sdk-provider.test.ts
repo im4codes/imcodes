@@ -393,6 +393,35 @@ describe('ClaudeCodeSdkProvider', () => {
     });
   });
 
+  it('keeps an incognito query in memory across turns with persistence and MCP memory disabled', async () => {
+    sdkMock.setWaitForClose(true);
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'private-native' },
+      { type: 'assistant', session_id: 'private-native', message: { content: [{ type: 'text', text: 'private answer' }], stop_reason: 'end_turn' } },
+      { type: 'result', subtype: 'success', session_id: 'private-native', result: 'private answer', usage: { input_tokens: 1, output_tokens: 1 } },
+    ]);
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'private-route', sessionName: 'deck_private_brain', cwd: '/tmp/project', incognito: true });
+    const completed: string[] = [];
+    provider.onComplete((_sid, message) => completed.push(message.content));
+    await provider.send('private-route', 'first private turn');
+    await waitFor(() => completed.length === 1);
+    expect(completed).toEqual(['private answer']);
+    expect(sdkMock.runs[0].options).toMatchObject({ persistSession: false, strictMcpConfig: true, mcpServers: {} });
+    expect(sdkMock.runs[0].options.resume).toBeUndefined();
+    expect(sdkMock.runs[0].closed).toBe(false);
+    await provider.send('private-route', 'second private turn');
+    expect(sdkMock.runs).toHaveLength(1);
+    expect((sdkMock.runs[0].promptSource as { buffer: unknown[] }).buffer).toEqual(expect.arrayContaining([expect.objectContaining({ message: expect.objectContaining({ content: 'second private turn' }) })]));
+    await provider.cancel('private-route');
+    await expect(provider.send('private-route', 'must not resume')).rejects.toThrow('Incognito conversation ended');
+    expect(sdkMock.runs).toHaveLength(1);
+    await provider.endSession('private-route');
+    expect(sdkMock.runs[0].closed).toBe(true);
+    await provider.disconnect();
+  });
+
   it('uses stable resume id, emits cumulative text deltas, and completes from result', async () => {
     sdkMock.setNextMessages([
       { type: 'system', subtype: 'init', session_id: 'session-1', model: 'claude-sonnet-4-6' },

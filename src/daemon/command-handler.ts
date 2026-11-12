@@ -1,4 +1,6 @@
 import { R2_RELAY_MSG } from '../../shared/r2-relay.js';
+import { isIncognitoSession, supportsSessionIncognito, SESSION_INCOGNITO_UNSUPPORTED } from '../../shared/session-incognito-types.js';
+import { isIncognitoSessionName, setSessionIncognito, withSessionPrivacy } from '../../shared/session-incognito-context.js';
 import { TASK_PAIR_DECISION_MSG } from '../../shared/task-pair-decision.js';
 import { queuedUserMessageAttribution } from '../agent/transport-queued-user-message.js';
 /**
@@ -1983,6 +1985,13 @@ export function setRouterContext(ctx: RouterContext): void {
 }
 
 export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
+  const cmd = msg && typeof msg === 'object' ? msg as Record<string, unknown> : {};
+  const name = resolveSessionCommandName(cmd) ?? (typeof cmd.project === 'string' ? `deck_${sanitizeProjectName(cmd.project)}_brain` : undefined);
+  if (cmd.type === 'session.start' && name && cmd.incognito === true) setSessionIncognito(name, true);
+  withSessionPrivacy(name, cmd.incognito === true || isIncognitoSession(name ? getSession(name) : undefined), () => handleWebCommandInternal(msg, serverLink));
+}
+
+function handleWebCommandInternal(msg: unknown, serverLink: ServerLink): void {
   // Input validation: anything that isn't a non-null object goes
   // straight to the floor.  We log a debug ping for arrays / primitives
   // so a confused client gets diagnostic feedback without flooding.
@@ -2767,6 +2776,11 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
   const ccInitPrompt = cmd.ccInitPrompt as string | undefined;
   const requestedModel = (cmd.requestedModel as string | undefined) ?? (cmd.model as string | undefined);
   const requestedEffort: unknown = cmd.thinking ?? cmd.effort;
+  if (cmd.incognito === true && (!supportsSessionIncognito(agentType) || !serverLink.supportsIncognitoSessions())) {
+    serverLink.send({ type: 'session.error', project: rawProject, message: SESSION_INCOGNITO_UNSUPPORTED });
+    return;
+  }
+
 
   if (!rawProject) {
     logger.warn('session.start: missing project name');
@@ -2820,6 +2834,11 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       return;
     }
 
+    const incognito = cmd.incognito === true;
+    // Only after the duplicate-active-session guard passes can a replacement start
+    // reset any closed-session privacy tombstone for this session name.
+    setSessionIncognito(sessionName, incognito);
+    await withSessionPrivacy(sessionName, incognito, async () => {
     const dir = await maybeCloneGitRemoteToDirectory({
       gitRemoteUrl: cmd.gitRemoteUrl,
       targetDir: requestedDir,
@@ -2835,7 +2854,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
     // The identity chosen at creation lives in the identity store (SESSION scope), not in the session record: that is what a
     // restart, a restore and the identity sync derive it from. It is saved BEFORE the session exists, so nothing that follows can
     // miss it; this run still gets it directly (below). The save never throws: a failure is logged and counted.
-    if (identityPrompt) await persistExplicitSessionIdentity(sessionName, identityPrompt);
+    if (identityPrompt && cmd.incognito !== true) await persistExplicitSessionIdentity(sessionName, identityPrompt);
     const config: ProjectConfig = {
       name: project,
       dir,
@@ -2851,6 +2870,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
     if (isClaudeCodeSdkAgentType(agentType)) {
       logger.info({ project }, 'SDK fresh session.start launching new Claude SDK main session');
       await launchTransportSession({
+        ...(cmd.incognito === true ? { incognito: true } : {}),
         name: `deck_${project}_brain`,
         projectName: project,
         role: 'brain',
@@ -2950,6 +2970,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         }, 5000);
       }
     }
+    });
   } catch (err) {
     logger.error({ project, err }, 'session.start failed');
     const message = describeTransportSendError(err);
@@ -7057,7 +7078,8 @@ function timelineReplayInflightKey(params: TimelineReplayRequestParams): string 
 }
 
 async function buildTimelineReplay(params: TimelineReplayRequestParams): Promise<TimelineReplayBuildResult> {
-  if (params.requestEpoch !== timelineEmitter.epoch) {
+  const incognito = isIncognitoSessionName(params.sessionName) || isIncognitoSession(getSession(params.sessionName));
+  if (params.requestEpoch !== timelineEmitter.epoch && !incognito) {
     // Epoch reset (client reconnected across a daemon restart) — serve the
     // latest events from the SQLite projection, the sole chat-history read
     // source. readPreferred returns the most recent N events (across epochs)
@@ -7089,7 +7111,7 @@ async function buildTimelineReplay(params: TimelineReplayRequestParams): Promise
     };
   }
 
-  const replay = timelineEmitter.replay(params.sessionName, params.afterSeq);
+  const replay = timelineEmitter.replay(params.sessionName, incognito && params.requestEpoch !== timelineEmitter.epoch ? 0 : params.afterSeq);
   // Replay is a gap-fill path, but it can span the whole in-memory ring when
   // a browser reconnects after a busy SDK turn. Keep it on the same bounded
   // 200-event wire contract as history/page responses; the newer cursor lets
@@ -7467,6 +7489,26 @@ function buildTimelineHistory(params: TimelineHistoryRequestParams): Promise<Tim
 }
 
 function getTimelineHistoryResult(params: TimelineHistoryRequestParams): Promise<TimelineHistoryBuildResult> {
+  if (isIncognitoSessionName(params.sessionName) || isIncognitoSession(getSession(params.sessionName))) {
+    const buffered = timelineEmitter.getBufferedEvents(params.sessionName).filter(event =>
+      (params.afterSeq === undefined || event.seq > params.afterSeq)
+      && (params.afterTs === undefined || event.ts > params.afterTs)
+      && (params.beforeTs === undefined || event.ts < params.beforeTs));
+    const selected = buffered.slice(-params.limit);
+    const shaped = shapeTimelineEventsForTransport(selected, {
+      maxResponseBytes: params.maxResponseBytes, detailSink: getDefaultTimelineDetailStore(),
+    }, resolveTimelineSupervisionTaskProjection);
+    return Promise.resolve({
+      events: shaped.events, eventsRead: selected.length, payloadBytes: shaped.payloadBytes,
+      droppedEvents: shaped.droppedEvents, truncatedEvents: shaped.truncatedEvents,
+      hasMore: buffered.length > selected.length || shaped.droppedEvents > 0,
+      readMs: 0, synthesizeMs: 0, sanitizeMs: 0,
+      source: TIMELINE_RESPONSE_SOURCES.RING_BUFFER,
+      status: timelineStatusFromPayload(shaped.droppedEvents, shaped.truncatedEvents),
+      detailRefs: shaped.detailRefs,
+    });
+  }
+
   const key = timelineHistoryInflightKey(params);
   const existing = timelineHistoryInflight.get(key);
   if (existing) return existing;
@@ -7812,6 +7854,9 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
 // ── Sub-session handlers ──────────────────────────────────────────────────
 
 async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  if (cmd.incognito === true) {
+    serverLink.send({ type: 'session.error', message: SESSION_INCOGNITO_UNSUPPORTED }); return;
+  }
   const id = cmd.id as string | undefined;
   const type = cmd.sessionType as string | undefined;
   if (!id || !type) {
@@ -11979,6 +12024,7 @@ async function handleTransportApprovalResponse(cmd: Record<string, unknown>, ser
 async function handleChatSubscribeReplay(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const sessionId = cmd.sessionId as string | undefined;
   if (!sessionId) return;
+  if (isIncognitoSessionName(sessionId) || isIncognitoSession(getSession(sessionId))) return;
   try {
     const { replayTransportHistory, trimTransportHistoryEventsToReplayBudget } = await import('./transport-history.js');
     const events = trimTransportHistoryEventsToReplayBudget(sessionId, await replayTransportHistory(sessionId));

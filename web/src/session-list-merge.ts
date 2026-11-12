@@ -42,6 +42,7 @@ import {
  * `SessionListItem` type — any field not listed is simply ignored.
  */
 export interface IncomingSessionListEntry {
+  incognito?: boolean;
   name: string;
   sessionInstanceId?: string;
   runtimeEpoch?: string;
@@ -187,6 +188,7 @@ export function mergeSessionListEntry(
 
   return {
     name: incoming.name,
+    ...(incoming.incognito === true ? { incognito: true } : {}),
     sessionInstanceId: incoming.sessionInstanceId ?? existing?.sessionInstanceId,
     runtimeEpoch: incoming.runtimeEpoch ?? existing?.runtimeEpoch,
     project: incoming.project,

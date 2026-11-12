@@ -1,4 +1,5 @@
 import { R2RelayToggle } from './components/R2RelayToggle.js';
+import { syncIncognitoTimelineSessions, forgetIncognitoTimelineSessions } from './hooks/useTimeline.js';
 import { useState, useEffect, useCallback, useRef, useMemo } from 'preact/hooks';
 import {
   MutableDesktopWindowStack,
@@ -4458,6 +4459,7 @@ function InternalMainApp() {
         }));
       }
       if (msg.type === 'session.event') {
+        if (msg.event === 'disconnected' || msg.event === 'stopped') forgetIncognitoTimelineSessions(selectedServerId, msg.event === 'stopped' ? msg.session : undefined);
         if (msg.session) {
           watchProjectionStore.updateSessionState(msg.session, msg.state);
         }
@@ -4561,6 +4563,7 @@ function InternalMainApp() {
         }
       }
       if (msg.type === 'session_list') {
+        syncIncognitoTimelineSessions(selectedServerId, msg.sessions);
         if (selectedShareTarget) {
           setSharedActiveDispatchIds((previous) => {
             const next = new Map(previous);
@@ -5231,6 +5234,7 @@ function InternalMainApp() {
         }
       }
       if (msg.type === DAEMON_MSG.DISCONNECTED) {
+        forgetIncognitoTimelineSessions(selectedServerId);
         // Mark projection stale immediately — that's just a data-freshness
         // hint, not the user-facing status badge. But do NOT flip the
         // "Daemon Offline" badge yet: the server side still has a

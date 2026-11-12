@@ -1,3 +1,4 @@
+import { isIncognitoSessionName } from '../../shared/session-incognito-context.js';
 import { readQueueDeliveryPolicy, type TransportAppendFallbackReason } from '../../shared/session-send-delivery.js';
 import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { createRequire } from 'node:module';
@@ -2530,13 +2531,38 @@ export class TransportQueueStore {
 }
 
 let singleton: TransportQueueStore | null = null;
+let privateStore: TransportQueueStore | null = null;
+let routedStore: TransportQueueStore | null = null;
 
 export function getTransportQueueStore(): TransportQueueStore {
   singleton ??= new TransportQueueStore();
-  return singleton;
+  // Reuse the exact same synchronous queue state machine, but put private
+  // admission, prompts, handoff material and system contracts in RAM-only SQLite.
+  routedStore ??= new Proxy(singleton, {
+    get(target, key) {
+      const value = Reflect.get(target, key);
+      if (typeof value !== 'function') return value;
+      return (...args: unknown[]) => {
+        const first = args[0];
+        const sessionName = typeof first === 'string' ? first
+          : first && typeof first === 'object' ? (first as { sessionName?: string }).sessionName : undefined;
+        if (isIncognitoSessionName(sessionName)) {
+          privateStore ??= new TransportQueueStore({ dbPath: ':memory:' });
+          return (Reflect.get(privateStore, key) as (...callArgs: unknown[]) => unknown).apply(privateStore, args);
+        }
+        const result = value.apply(target, args);
+        if (privateStore && ['listLiveQueueSessions', 'listQueueSessionsForReconciliation', 'listSessionNames'].includes(String(key))) {
+          return [...result, ...(Reflect.get(privateStore, key) as (...callArgs: unknown[]) => unknown[]).apply(privateStore, args)];
+        }
+        return result;
+      };
+    },
+  });
+  return routedStore;
 }
 
 export function resetTransportQueueStoreForTests(): void {
   singleton?.close();
   singleton = null;
+  privateStore?.close(); privateStore = null; routedStore = null;
 }

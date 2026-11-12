@@ -1,3 +1,5 @@
+import { setSessionIncognito } from '../../shared/session-incognito-context.js';
+import { isIncognitoSession, type SessionIncognitoConfig } from '../../shared/session-incognito-types.js';
 import { AGY_SDK_PROVIDER_ID, AGY_NATIVE_SESSION_STATE, type AgyNativeSessionState } from '../../shared/agy-agent.js';
 import { statSync } from 'node:fs';
 import { Worker } from 'node:worker_threads';
@@ -114,7 +116,7 @@ export type SessionState = 'running' | 'idle' | 'error' | 'stopped';
 // TODO: import from '../agent/session-runtime.js' when available
 type RuntimeType = 'process' | 'transport';
 
-export interface SessionRecord extends SessionContextBootstrapState {
+export interface SessionRecord extends SessionContextBootstrapState, SessionIncognitoConfig {
   name: string;
   /**
    * Stable identity for this logical session record. It survives daemon and
@@ -414,7 +416,7 @@ export function resetSessionStoreAuthorityForTests(): void {
 }
 
 function isPersistableSessionRecord(record: SessionRecord): boolean {
-  return !isKnownTestSessionLike({
+  return !isIncognitoSession(record) && !isKnownTestSessionLike({
     name: record.name,
     projectName: record.projectName,
     projectDir: record.projectDir,
@@ -531,7 +533,7 @@ function recordsFromPayloads(payloads: Map<string, string>, blobs: ReadonlyMap<s
   for (const [name, payload] of payloads) {
     try {
       const parsed = JSON.parse(payload) as unknown;
-      if (!isObjectRecord(parsed)) continue;
+      if (!isObjectRecord(parsed) || isIncognitoSession(parsed)) continue;
       const hydrated = hydrateSessionRecord(parsed, lookup, (field, hash) => {
         logger.warn({ session: name, field, hash }, 'Session row refers to a missing blob; the field is left unset');
       });
@@ -555,7 +557,7 @@ function hydrateStore(value: unknown): { store: SessionStore; legacy: boolean } 
   const table = isObjectRecord(value.identityPrompts) ? value.identityPrompts : null;
   const sessions: Record<string, SessionRecord> = {};
   for (const [name, rawRecord] of Object.entries(value.sessions)) {
-    if (!isObjectRecord(rawRecord)) continue;
+    if (!isObjectRecord(rawRecord) || isIncognitoSession(rawRecord)) continue;
     const record: Record<string, unknown> = { ...rawRecord };
     const reference = record[SESSION_IDENTITY_PROMPT_REF_FIELD];
     const inline = record[SESSION_IDENTITY_PROMPT_FIELD];
@@ -1472,6 +1474,8 @@ export function upsertSession(record: SessionRecord): void {
     : undefined;
   store.sessions[record.name] = {
     ...incoming,
+    // Privacy cannot be erased by a metadata rebuild that omits the flag.
+    ...(isIncognitoSession(existing) || isIncognitoSession(record) ? { incognito: true } : {}),
     ...(record.agentType === AGY_SDK_PROVIDER_ID ? { providerResumeId: agyResumeId, agyNativeSessionState } : {}),
     sessionInstanceId,
     runtimeEpoch,
@@ -1482,6 +1486,7 @@ export function upsertSession(record: SessionRecord): void {
     ...(pairCreatedMetadata !== undefined ? { pairCreatedMetadata } : {}),
     updatedAt: Date.now(),
   };
+  setSessionIncognito(record.name, isIncognitoSession(store.sessions[record.name]));
   sessionValuesCache = null;
   markDirty(record.name);
   scheduleWrite();

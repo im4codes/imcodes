@@ -1,3 +1,4 @@
+import type { SessionIncognitoConfig } from '../../shared/session-incognito-types.js';
 /**
  * TransportProvider — second-layer abstraction between IM.codes and external agent services.
  *
@@ -312,7 +313,7 @@ export interface ProviderConfig {
 }
 
 /** Parameters for creating a new session on the provider. */
-export interface SessionConfig {
+export interface SessionConfig extends SessionIncognitoConfig {
   /** Local-only AG lifecycle barrier. Must persist start evidence before a native
    * process can be spawned; never serialized to a provider protocol. */
   beforeNativeSessionStart?: () => Promise<void>;

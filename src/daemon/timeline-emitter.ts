@@ -1,3 +1,5 @@
+import { inIncognitoContext, isIncognitoSessionName } from '../../shared/session-incognito-context.js';
+import { isIncognitoSession, INCOGNITO_TIMELINE_PAYLOAD, SESSION_INCOGNITO_MAX_BUFFER } from '../../shared/session-incognito-types.js';
 /**
  * Timeline event bus — per-session seq counter, ring buffer, replay.
  * Singleton: import { timelineEmitter } from './timeline-emitter.js'
@@ -56,7 +58,7 @@ function isTrustedTempPath(filePath: string): boolean {
   return true;
 }
 
-const MAX_BUFFER = 500;
+const MAX_BUFFER = SESSION_INCOGNITO_MAX_BUFFER;
 
 /**
  * Latest-value signals are snapshots.  Providers and terminal probes can call
@@ -123,6 +125,9 @@ export class TimelineEmitter {
     payload: Record<string, unknown>,
     opts?: { source?: TimelineSource; confidence?: TimelineConfidence; eventId?: string; ts?: number; hidden?: boolean },
   ): TimelineEvent | null {
+    const session = getSession(sessionId);
+    const incognito = inIncognitoContext() || isIncognitoSessionName(sessionId) || isIncognitoSession(session) || isIncognitoSession(payload);
+    if (incognito) payload = { ...payload, ...INCOGNITO_TIMELINE_PAYLOAD };
     const traceStart = performance.now();
     let traceTempFileMs = 0;
     let traceEventIdHashMs = 0;
@@ -314,6 +319,12 @@ export class TimelineEmitter {
       ts,
       seq,
       epoch: this.epoch,
+      ...(typeof session?.sessionInstanceId === 'string' && session.sessionInstanceId
+        ? { sessionInstanceId: session.sessionInstanceId }
+        : {}),
+      ...(typeof session?.runtimeEpoch === 'string' && session.runtimeEpoch
+        ? { runtimeEpoch: session.runtimeEpoch }
+        : {}),
       source: opts?.source ?? 'daemon',
       confidence: opts?.confidence ?? 'high',
       type,
@@ -361,7 +372,7 @@ export class TimelineEmitter {
     // Persist to disk — skip intermediate streaming events (streaming: true with stable eventId)
     // to avoid JSONL bloat; the final version (streaming: false) will be persisted by onComplete
     const isStreamingDelta = isStableUpdate && payload.streaming === true;
-    if (!isStreamingDelta) {
+    if (!incognito && !isStreamingDelta) {
       const appendStart = performance.now();
       timelineStore.append(event);
       traceAppendScheduleMs += performance.now() - appendStart;
@@ -486,6 +497,14 @@ export class TimelineEmitter {
    */
   replay(sessionId: string, afterSeq: number): { events: TimelineEvent[]; truncated: boolean; source: TimelineResponseSource } {
     const buf = this.buffer.get(sessionId) ?? [];
+    // Private history is only this process's bounded ring, never a disk fallback.
+    if (isIncognitoSessionName(sessionId) || isIncognitoSession(getSession(sessionId)) || buf.some(e => isIncognitoSession(e.payload))) {
+      return {
+        events: buf.filter(e => e.seq > afterSeq),
+        truncated: buf.length > 0 && afterSeq + 1 < buf[0].seq,
+        source: TIMELINE_RESPONSE_SOURCES.RING_BUFFER,
+      };
+    }
 
     // Fast path — buffer covers everything from afterSeq+1 forward.
     if (buf.length > 0 && (afterSeq + 1) >= buf[0].seq) {

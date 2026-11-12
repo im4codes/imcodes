@@ -1,3 +1,5 @@
+import { isIncognitoSessionName } from '../../shared/session-incognito-context.js';
+import { SESSION_INCOGNITO_MEMORY_DISABLED } from '../../shared/session-incognito-types.js';
 import { resolveTaskPairTitleTurn } from './task-pair-title-authority.js';
 import { installMcpErrorResultBoundary } from './mcp-error-result-boundary.js';
 import { TASK_PAIR_LEGACY_TOOL_HOOK_PATH } from '../../shared/task-pair.js';
@@ -335,6 +337,7 @@ function installMemoryMcpResourceGuard(
   const original = server.registerTool.bind(server);
   server.registerTool = ((name: string, config: unknown, callback: (...args: unknown[]) => unknown) => {
     const guarded = async (...args: unknown[]) => guard.run(name, async () => {
+      if (isIncognitoSessionName(caller.sessionName)) return { isError: true, content: [{ type: 'text', text: SESSION_INCOGNITO_MEMORY_DISABLED }] };
       const lease = daemonAdmissionEnabled && DAEMON_ADMISSION_ACCOUNTED_TOOLS.has(name)
         ? await observeDaemonTaskAdmission(name, caller, daemonAdmissionOwner)
         : null;
