@@ -19,6 +19,7 @@ interface Prompt {
   output?: AgyTranscriptRow;
   lastResponse?: AgyTranscriptRow;
   settling?: boolean;
+  timedOut?: boolean;
   ready: Promise<void>;
   resolve: () => void;
 }
@@ -108,23 +109,48 @@ export class AgyForegroundOwnership {
   authoritative = false;
   private prompts = new Map<number, Prompt>();
   private lane?: number;
-  private lastGeneration = 0;
+  private retainedLane?: Prompt;
+  private lastBoundGeneration = 0;
+  private turnStartGeneration?: number;
   latest?: { generation: number; row: AgyTranscriptRow };
   constructor(private deadlineMs = NATIVE_OUTPUT_DEADLINE_MS) {}
 
-  register(generation: number, text: string): void {
+  beginTurn(): void {
+    this.latest = undefined;
+    this.retainedLane?.resolve();
+    this.retainedLane = undefined;
+    this.turnStartGeneration = undefined;
+  }
+
+  register(generation: number, text: string, shareActiveTurn = false): void {
     let resolve!: () => void;
     const ready = new Promise<void>(r => { resolve = r; });
-    this.lastGeneration = Math.max(this.lastGeneration,generation);
+    const hasIncompletePrompt = [...this.prompts.values()].some(p => !p.output && !p.timedOut)
+      || Boolean(this.retainedLane && !this.retainedLane.output && !this.retainedLane.timedOut);
+    if ((!shareActiveTurn && !hasIncompletePrompt) || this.turnStartGeneration === undefined) {
+      this.turnStartGeneration = generation;
+    }
     const normText = collapseWhitespace(text);
     const tagCount = countUserRequestTags(text);
     this.prompts.set(generation,{generation,text,normText,tagCount,ready,resolve});
   }
 
+  private activeLanePrompt(): Prompt | undefined {
+    if (this.lane !== undefined) return this.prompts.get(this.lane);
+    return this.retainedLane;
+  }
+
   hasActiveLane(): boolean {
-    if (this.lane === undefined) return false;
-    const prompt = this.prompts.get(this.lane);
-    return Boolean(prompt && prompt.inputStep !== undefined && !prompt.output);
+    const prompt = this.activeLanePrompt();
+    return Boolean(prompt && prompt.inputStep !== undefined && !prompt.output && !prompt.timedOut);
+  }
+
+  hasBoundInput(generation: number): boolean {
+    return this.prompts.get(generation)?.inputStep !== undefined;
+  }
+
+  hasBoundSuccessor(generation: number): boolean {
+    return this.lastBoundGeneration > generation;
   }
 
   private findMatchingPrompt(content: string | undefined): Prompt | undefined {
@@ -182,20 +208,99 @@ export class AgyForegroundOwnership {
     return selectUnambiguousPrefixMatch(prefixMatches);
   }
 
+  private getTurnLatest(): { generation: number; row: AgyTranscriptRow } | undefined {
+    if (!this.latest) return undefined;
+    const minGen = Math.max(this.turnStartGeneration ?? 0, this.lastBoundGeneration);
+    return this.latest.generation >= minGen ? this.latest : undefined;
+  }
+
+  private getAdoptableLane(generation: number): Prompt | undefined {
+    if (this.hasBoundSuccessor(generation)) return undefined;
+    if (
+      this.retainedLane
+      && this.retainedLane.generation < generation
+      && !this.retainedLane.output
+      && !this.retainedLane.timedOut
+    ) {
+      return this.retainedLane;
+    }
+    const active = this.lane !== undefined ? this.prompts.get(this.lane) : undefined;
+    if (
+      active
+      && active.generation < generation
+      && active.inputStep !== undefined
+      && !active.output
+      && !active.timedOut
+    ) {
+      return active;
+    }
+    for (const candidate of this.prompts.values()) {
+      if (
+        candidate.generation < generation
+        && candidate.inputStep !== undefined
+        && !candidate.output
+        && !candidate.timedOut
+      ) {
+        return candidate;
+      }
+    }
+    return undefined;
+  }
+
+  private attributeLastResponse(prompt: Prompt): AgyTranscriptRow | undefined {
+    prompt.settling = true;
+    if (!prompt.output && isTerminalForegroundRow(prompt.lastResponse)) {
+      prompt.output = prompt.lastResponse;
+      if (!this.latest || prompt.generation >= this.latest.generation) {
+        this.latest = { generation: prompt.generation, row: prompt.lastResponse! };
+      }
+      if (this.lane === prompt.generation) this.lane = undefined;
+      if (this.retainedLane?.generation === prompt.generation) this.retainedLane = undefined;
+      prompt.resolve();
+    }
+    return prompt.output;
+  }
+
   observe(row: AgyTranscriptRow): boolean {
     if (row.type === 'USER_INPUT' && row.source === 'USER_EXPLICIT') {
       // The full native log wraps but retains the exact submitted payload.
       // FIFO unbound requests distinguish repeated identical user messages.
       const prompt = this.findMatchingPrompt(row.content);
       this.lane = prompt?.generation;
-      if (prompt) { prompt.inputStep = row.step_index; prompt.text = undefined; prompt.normText = undefined; prompt.tagCount = undefined; }
+      if (!prompt && this.retainedLane) {
+        const superseded = this.retainedLane;
+        this.retainedLane = undefined;
+        superseded.resolve();
+      }
+      if (prompt) {
+        prompt.inputStep = row.step_index;
+        prompt.text = undefined;
+        prompt.normText = undefined;
+        prompt.tagCount = undefined;
+        this.lastBoundGeneration = Math.max(this.lastBoundGeneration, prompt.generation);
+        if (this.retainedLane && this.retainedLane.generation < prompt.generation) {
+          const superseded = this.retainedLane;
+          this.retainedLane = undefined;
+          superseded.resolve();
+        }
+        // Wake older unresolved waits immediately so they yield to the bound successor
+        // instead of hanging until the failure deadline.
+        for (const existing of this.prompts.values()) {
+          if (existing.generation < prompt.generation && !existing.output) {
+            existing.resolve();
+          }
+        }
+      }
       return false;
     } else if (row.type === 'SYSTEM_MESSAGE' && /\[Message\].*sender=/.test(row.content ?? '')) {
-      const prompt = this.lane !== undefined ? this.prompts.get(this.lane) : undefined;
-      if (!prompt || prompt.output) this.lane = undefined;
+      const prompt = this.activeLanePrompt();
+      if (!prompt || prompt.output) {
+        this.lane = undefined;
+        this.retainedLane = undefined;
+      }
       return false;
-    } else if (row.type === 'PLANNER_RESPONSE' && this.lane !== undefined) {
-      const prompt = this.prompts.get(this.lane);
+    } else if (row.type === 'PLANNER_RESPONSE') {
+      const prompt = this.activeLanePrompt();
       if (!prompt || prompt.inputStep === undefined || row.step_index <= prompt.inputStep) return false;
       prompt.lastResponse = row;
       if (!row.tool_calls?.length || (prompt.settling && isTerminalForegroundRow(row))) {
@@ -203,7 +308,8 @@ export class AgyForegroundOwnership {
         if (!this.latest || prompt.generation >= this.latest.generation) {
           this.latest = { generation: prompt.generation, row: prompt.output };
         }
-        this.lane = undefined;
+        if (this.lane === prompt.generation) this.lane = undefined;
+        if (this.retainedLane?.generation === prompt.generation) this.retainedLane = undefined;
         prompt.resolve();
         return true;
       }
@@ -216,40 +322,99 @@ export class AgyForegroundOwnership {
     const prompt = this.prompts.get(generation);
     if (!prompt) return undefined;
     prompt.settling = true;
-    if (!prompt.output && isTerminalForegroundRow(prompt.lastResponse)) {
-      prompt.output = prompt.lastResponse;
-      if (!this.latest || prompt.generation >= this.latest.generation) {
-        this.latest = { generation: prompt.generation, row: prompt.lastResponse! };
-      }
-      if (this.lane === generation) this.lane = undefined;
-      prompt.resolve();
+    if (prompt.inputStep !== undefined || prompt.output) {
+      return this.attributeLastResponse(prompt);
     }
-    return prompt.output;
+    const turnLatest = this.getTurnLatest();
+    if (turnLatest) return turnLatest.row;
+    const adoptable = this.getAdoptableLane(generation);
+    return adoptable ? this.attributeLastResponse(adoptable) : undefined;
   }
 
   async output(generation: number): Promise<AgyTranscriptRow | undefined> {
-    const prompt = this.prompts.get(generation);
-    if (!prompt) return;
-    if (!prompt.output) {
-      const result = await withTimeoutOutcome(prompt.ready, this.deadlineMs);
-      if (result.timedOut) {
-        if (!prompt.output && isTerminalForegroundRow(prompt.lastResponse)) {
-          return this.settle(generation);
+    const endAt = Number.isFinite(this.deadlineMs) && this.deadlineMs > 0
+      ? Date.now() + this.deadlineMs
+      : undefined;
+    while (true) {
+      const prompt = this.prompts.get(generation);
+      if (!prompt) return undefined;
+      if (prompt.output) return prompt.output;
+      if (this.hasBoundSuccessor(generation)) return undefined;
+      if (prompt.inputStep === undefined) {
+        const turnLatest = this.getTurnLatest();
+        if (turnLatest) return turnLatest.row;
+      }
+      const adoptable = prompt.inputStep === undefined ? this.getAdoptableLane(generation) : undefined;
+      const waitPromise = adoptable
+        ? Promise.race([prompt.ready, adoptable.ready])
+        : prompt.ready;
+      const remainingMs = endAt === undefined ? this.deadlineMs : endAt - Date.now();
+      const timedOut = endAt !== undefined && remainingMs <= 0
+        ? true
+        : (await withTimeoutOutcome(waitPromise, remainingMs)).timedOut;
+      if (timedOut) {
+        const current = this.prompts.get(generation);
+        if (!current) return undefined;
+        if (current.output) return current.output;
+        if (this.hasBoundSuccessor(generation)) return undefined;
+        if (current.inputStep !== undefined && isTerminalForegroundRow(current.lastResponse)) {
+          return this.attributeLastResponse(current);
         }
-        return;
+        if (current.inputStep === undefined) {
+          const settled = this.settle(generation);
+          if (settled) return settled;
+        }
+        current.timedOut = true;
+        if (adoptable) {
+          adoptable.timedOut = true;
+          if (this.lane === adoptable.generation) this.lane = undefined;
+          if (this.retainedLane?.generation === adoptable.generation) {
+            this.retainedLane = undefined;
+            adoptable.resolve();
+          }
+        }
+        return undefined;
       }
     }
-    return prompt.output;
   }
 
-  hasSuccessor(generation: number): boolean { return this.lastGeneration > generation; }
-
   release(generation: number): void {
-    if (this.lane === generation) this.lane = undefined;
+    const prompt = this.prompts.get(generation);
     this.prompts.delete(generation);
+    if (this.prompts.size === 0) {
+      this.lane = undefined;
+      this.retainedLane?.resolve();
+      this.retainedLane = undefined;
+      return;
+    }
+    if (this.lane === generation) {
+      const hasPendingLaterUnboundPrompt = [...this.prompts.values()].some(
+        p => p.generation > generation && p.inputStep === undefined && !p.output && !p.timedOut,
+      );
+      if (
+        prompt
+        && prompt.inputStep !== undefined
+        && !prompt.output
+        && !prompt.timedOut
+        && !this.hasBoundSuccessor(generation)
+        && hasPendingLaterUnboundPrompt
+      ) {
+        // Keep the live bound lane reachable for an absorbed successor within the same
+        // turn if this prompt's RPC releases before the native PLANNER_RESPONSE lands.
+        this.retainedLane = prompt;
+      }
+      this.lane = undefined;
+    }
   }
   clear(): void {
     for (const prompt of this.prompts.values()) prompt.resolve();
-    this.prompts.clear(); this.lane = undefined; this.lastGeneration = 0; this.latest = undefined; this.authoritative = false;
+    this.retainedLane?.resolve();
+    this.prompts.clear();
+    this.lane = undefined;
+    this.retainedLane = undefined;
+    this.lastBoundGeneration = 0;
+    this.turnStartGeneration = undefined;
+    this.latest = undefined;
+    this.authoritative = false;
   }
 }

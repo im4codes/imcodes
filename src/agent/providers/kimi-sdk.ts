@@ -1166,7 +1166,7 @@ export class KimiSdkProvider implements TransportProvider {
       const generation = ++state.turnGeneration;
       queuedGeneration = generation;
       (state.activePromptGenerations ??= new Set()).add(generation);
-      if (this.id === AGY_SDK_PROVIDER_ID) (state.agyForeground ??= new AgyForegroundOwnership()).register(generation,activePromptText);
+      if (this.id === AGY_SDK_PROVIDER_ID) (state.agyForeground ??= new AgyForegroundOwnership()).register(generation,activePromptText,true);
       const queuedPrompt = connection.prompt({
         sessionId: state.acpSessionId,
         prompt: [{ type: 'text', text: activePromptText }],
@@ -1480,7 +1480,7 @@ export class KimiSdkProvider implements TransportProvider {
       const terminal = new Promise<void>(resolve => { complete = resolve; });
       this.steeringRunTerminals.set(state, { terminal, complete });
     }
-    if (this.id === AGY_SDK_PROVIDER_ID) (state.agyForeground ??= new AgyForegroundOwnership()).latest = undefined;
+    if (this.id === AGY_SDK_PROVIDER_ID) (state.agyForeground ??= new AgyForegroundOwnership()).beginTurn();
     state.promptInFlight = true;
     state.promptSubmittedGeneration = null;
     (state.activePromptGenerations ??= new Set()).add(generation);
@@ -1557,12 +1557,19 @@ export class KimiSdkProvider implements TransportProvider {
       if (this.id === AGY_SDK_PROVIDER_ID) await state.agyBridges?.get(state.acpSessionId!)?.flush();
       this.assertCurrentSession(sessionId,state);
       if (!state.activePromptGenerations?.has(generation)) return;
-      if (owner?.authoritative && !owner.hasSuccessor(generation) && result.stopReason !== 'cancelled' && !compactControl) {
+      const deferToRemainingOwner = owner?.authoritative
+        && !owner.hasBoundInput(generation)
+        && state.activePromptGenerations.size > 1;
+      if (owner?.authoritative
+        && !owner.hasBoundSuccessor(generation)
+        && !deferToRemainingOwner
+        && result.stopReason !== 'cancelled'
+        && !compactControl) {
         owner.settle(generation);
         const output = await owner.output(generation);
         this.assertCurrentSession(sessionId,state);
         if (!state.activePromptGenerations?.has(generation)) return;
-        if (!output) throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+        if (!output && !owner.hasBoundSuccessor(generation)) throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR,
           'AG native foreground output could not be attributed before its deadline',true);
       }
       if (owner?.authoritative && state.activePromptGenerations.size === 1) {
@@ -1606,6 +1613,7 @@ export class KimiSdkProvider implements TransportProvider {
     if (this.profile.steeringPrompts) {
       if (!state.activePromptGenerations?.delete(generation)) return;
       state.steeringFailure ??= error;
+      state.agyForeground?.release(generation);
       // A rejected steering request is NOT proof that the original task or
       // another admitted prompt stopped. Retain busy/text/tools until all
       // native RPCs settle (connection death rejects them all as well).

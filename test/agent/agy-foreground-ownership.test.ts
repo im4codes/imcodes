@@ -362,4 +362,120 @@ describe('AG captured native foreground ownership', () => {
     expect(out).toBeUndefined();
     expect(owner.latest).toBeUndefined();
   });
+  it('attributes G1 final output to absorbed G2 when ask_question answer writes no new USER_EXPLICIT row', async () => {
+    const owner = new AgyForegroundOwnership(60_000);
+    owner.beginTurn();
+    owner.register(1, 'initial prompt');
+    owner.observe(row(0, 'USER_INPUT', '<USER_REQUEST>initial prompt</USER_REQUEST>', 'USER_EXPLICIT'));
+    owner.observe({
+      ...row(1, 'PLANNER_RESPONSE', 'Need confirmation'),
+      tool_calls: [{ name: 'ask_question', args: { question: 'Proceed?' } }],
+    });
+    owner.register(2, 'Proceed', true);
+    // ask_question answer in native transcript lacks source=USER_EXPLICIT or is absorbed mid-turn
+    owner.observe(row(2, 'USER_INPUT', 'Proceed', 'USER_ANSWER'));
+    owner.observe(row(3, 'PLANNER_RESPONSE', 'COMPLETED AFTER ABSORPTION'));
+
+    expect(owner.hasBoundInput(1)).toBe(true);
+    expect(owner.hasBoundInput(2)).toBe(false);
+    expect(owner.hasBoundSuccessor(1)).toBe(false);
+    expect(owner.settle(1)?.content).toBe('COMPLETED AFTER ABSORPTION');
+    owner.release(1);
+    expect(owner.settle(2)?.content).toBe('COMPLETED AFTER ABSORPTION');
+    expect((await owner.output(2))?.content).toBe('COMPLETED AFTER ABSORPTION');
+    owner.release(2);
+    expect(owner.hasActiveLane()).toBe(false);
+  });
+  it('retains G1 bound lane across early release(1) until delayed final output arrives for absorbed G2', async () => {
+    const owner = new AgyForegroundOwnership(60_000);
+    owner.beginTurn();
+    owner.register(1, 'initial prompt');
+    owner.observe(row(0, 'USER_INPUT', '<USER_REQUEST>initial prompt</USER_REQUEST>', 'USER_EXPLICIT'));
+    owner.register(2, 'steering note', true);
+    // G1 RPC settled/released before final native PLANNER_RESPONSE arrives while G2 is waiting
+    owner.release(1);
+    expect(owner.hasActiveLane()).toBe(true);
+
+    const pendingG2 = owner.output(2);
+    await Promise.resolve();
+    expect(owner.settle(2)).toBeUndefined();
+
+    owner.observe(row(1, 'PLANNER_RESPONSE', 'LATE ABSORBED RESULT'));
+    expect((await pendingG2)?.content).toBe('LATE ABSORBED RESULT');
+    expect(owner.hasActiveLane()).toBe(false);
+    owner.release(2);
+    expect(owner.hasActiveLane()).toBe(false);
+  });
+  it('clears retainedLane on genuine G2 USER_EXPLICIT takeover and isolates G1 wait', async () => {
+    const owner = new AgyForegroundOwnership(60_000);
+    owner.beginTurn();
+    owner.register(1, 'first');
+    owner.observe(row(0, 'USER_INPUT', '<USER_REQUEST>first</USER_REQUEST>', 'USER_EXPLICIT'));
+    owner.register(2, 'second', true);
+    const wait1 = owner.output(1);
+
+    owner.observe(row(1, 'USER_INPUT', '<USER_REQUEST>second</USER_REQUEST>', 'USER_EXPLICIT'));
+    expect(await wait1).toBeUndefined();
+    expect(owner.hasBoundSuccessor(1)).toBe(true);
+    expect(owner.hasBoundInput(2)).toBe(true);
+    owner.release(1);
+
+    owner.observe(row(2, 'PLANNER_RESPONSE', 'GENUINE G2 RESULT'));
+    expect((await owner.output(2))?.content).toBe('GENUINE G2 RESULT');
+  });
+  it('clears retainedLane on foreign unmatched USER_EXPLICIT so foreign output cannot satisfy G2', async () => {
+    const owner = new AgyForegroundOwnership(25);
+    owner.beginTurn();
+    owner.register(1, 'first');
+    owner.observe(row(0, 'USER_INPUT', '<USER_REQUEST>first</USER_REQUEST>', 'USER_EXPLICIT'));
+    owner.register(2, 'absorbed follow-up', true);
+    owner.release(1);
+    expect(owner.hasActiveLane()).toBe(true);
+
+    owner.observe(row(1, 'USER_INPUT', '<USER_REQUEST>foreign ide prompt</USER_REQUEST>', 'USER_EXPLICIT'));
+    expect(owner.hasActiveLane()).toBe(false);
+    expect(owner.observe(row(2, 'PLANNER_RESPONSE', 'FOREIGN OUTPUT'))).toBe(false);
+    expect(await owner.output(2)).toBeUndefined();
+  });
+  it('isolates Turn 1 latest so Turn 2 (beginTurn or new non-shared register) cannot reuse it', async () => {
+    const owner = new AgyForegroundOwnership(20);
+    owner.beginTurn();
+    owner.register(1, 'turn 1');
+    owner.observe(row(0, 'USER_INPUT', '<USER_REQUEST>turn 1</USER_REQUEST>', 'USER_EXPLICIT'));
+    owner.observe(row(1, 'PLANNER_RESPONSE', 'TURN 1 OUTPUT'));
+    expect((await owner.output(1))?.content).toBe('TURN 1 OUTPUT');
+    owner.release(1);
+
+    owner.beginTurn();
+    owner.register(2, 'turn 2');
+    expect(owner.settle(2)).toBeUndefined();
+    expect(await owner.output(2)).toBeUndefined();
+    owner.release(2);
+
+    // Also without release(1)/beginTurn(): completed turn does not leak into non-shared register(3)
+    owner.register(3, 'turn 3');
+    owner.observe(row(2, 'USER_INPUT', '<USER_REQUEST>turn 3</USER_REQUEST>', 'USER_EXPLICIT'));
+    owner.observe(row(3, 'PLANNER_RESPONSE', 'TURN 3 OUTPUT'));
+    expect((await owner.output(3))?.content).toBe('TURN 3 OUTPUT');
+    owner.register(4, 'turn 4');
+    expect(owner.settle(4)).toBeUndefined();
+    expect(await owner.output(4)).toBeUndefined();
+  });
+  it('still fails boundedly for absorbed G2 when no terminal native output ever arrives', async () => {
+    const owner = new AgyForegroundOwnership(20);
+    owner.beginTurn();
+    owner.register(1, 'initial prompt');
+    owner.observe(row(0, 'USER_INPUT', '<USER_REQUEST>initial prompt</USER_REQUEST>', 'USER_EXPLICIT'));
+    owner.observe({
+      ...row(1, 'PLANNER_RESPONSE', 'Spawning helper'),
+      tool_calls: [{ name: 'invoke_subagent', args: { Role: 'Helper' } }],
+    });
+    owner.register(2, 'absorbed input', true);
+    owner.release(1);
+    expect(owner.hasActiveLane()).toBe(true);
+
+    expect(await owner.output(2)).toBeUndefined();
+    expect(owner.hasActiveLane()).toBe(false);
+    expect(owner.latest).toBeUndefined();
+  });
 });

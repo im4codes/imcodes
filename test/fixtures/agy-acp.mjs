@@ -150,6 +150,40 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
         ok(state.steeredRpc,{stopReason:'end_turn',usage:{inputTokens:100,outputTokens:2}});
         ok(req.id,{stopReason:'end_turn',usage:{inputTokens:300,outputTokens:3}});return;
       }
+      if (scenario.startsWith('absorbed-steering-')) {
+        const dir=`${process.env.HOME}/.gemini/antigravity-cli/brain/${p.sessionId}/.system_generated/logs`;fs.mkdirSync(dir,{recursive:true});
+        const file=dir+'/transcript_full.jsonl',row=(step_index,type,content,extra={})=>JSON.stringify({step_index,type,content,status:'DONE',source:type==='USER_INPUT'?'USER_EXPLICIT':'MODEL',...extra})+'\n';
+        if (!state.steeringPass) {
+          state.steeringPass=1;state.steeredRpc=req.id;
+          const toolRow=scenario==='absorbed-steering-no-native'
+            ? {step_index:1,type:'PLANNER_RESPONSE',content:'Launching child',status:'DONE',source:'MODEL',tool_calls:[{name:'invoke_subagent',args:{Role:'Worker'}}]}
+            : {step_index:1,type:'PLANNER_RESPONSE',content:'Need confirmation',status:'DONE',source:'MODEL',tool_calls:[{name:'ask_question',args:{question:'Proceed?'}}]};
+          fs.writeFileSync(file,row(0,'USER_INPUT',text)+JSON.stringify(toolRow)+'\n');
+          note(p.sessionId,{sessionUpdate:'tool_call',toolCallId:'launch',title:'Run invoke_subagent',kind:'other',status:'in_progress',rawInput:{Role:'Child',Prompt:'work'}});
+          return;
+        }
+        if (scenario==='absorbed-steering-g1-first') {
+          fs.appendFileSync(file,row(2,'USER_INPUT',text,{source:'USER_ANSWER'})+row(3,'PLANNER_RESPONSE','ABSORBED FINAL G1-FIRST'));
+          note(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'unattributed stale ACP'}});
+          ok(state.steeredRpc,{stopReason:'end_turn',usage:{inputTokens:100,outputTokens:2}});
+          setTimeout(()=>ok(req.id,{stopReason:'end_turn',usage:{inputTokens:300,outputTokens:3}}),25);
+          return;
+        }
+        if (scenario==='absorbed-steering-g2-first') {
+          ok(req.id,{stopReason:'end_turn',usage:{inputTokens:50,outputTokens:1}});
+          setTimeout(()=>{
+            fs.appendFileSync(file,row(2,'PLANNER_RESPONSE','ABSORBED FINAL G2-FIRST'));
+            ok(state.steeredRpc,{stopReason:'end_turn',usage:{inputTokens:150,outputTokens:4}});
+          },40);
+          return;
+        }
+        if (scenario==='absorbed-steering-no-native') {
+          note(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'UNATTRIBUTED ACP TEXT'}});
+          ok(state.steeredRpc,{stopReason:'end_turn',usage:{inputTokens:100,outputTokens:2}});
+          setTimeout(()=>ok(req.id,{stopReason:'end_turn',usage:{inputTokens:50,outputTokens:1}}),20);
+          return;
+        }
+      }
       if (scenario.startsWith('acp-child-')) {
         const dir = `${process.env.HOME}/.gemini/antigravity-cli/brain/${p.sessionId}/.system_generated/logs`;
         fs.mkdirSync(dir,{recursive:true});

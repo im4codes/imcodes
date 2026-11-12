@@ -285,6 +285,42 @@ describe('AG native ACP', () => {
     expect(done.mock.calls[0][1].metadata.usage).toMatchObject({input_tokens:400,output_tokens:5});expect(errors).not.toHaveBeenCalled();
     expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(2);
   });
+  it('attributes G1 output when active steering/ask_question answer writes no new USER_EXPLICIT row (G1 resolves first)',async()=>{
+    const {provider,requests}=await setup('absorbed-steering-g1-first');const id=await route(provider),done=vi.fn(),errors=vi.fn();provider.onComplete(done);provider.onError(errors);
+    await provider.send(id,'initial task');await vi.waitFor(()=>expect((provider as any).sessions.get(id).agyForeground?.authoritative).toBe(true), { timeout: 5000 });
+    expect(await provider.notifyActiveDelegation(id,notification('B','Proceed'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(done.mock.calls[0][1].content).toBe('ABSORBED FINAL G1-FIRST');
+    expect(done.mock.calls[0][1].metadata.usage).toMatchObject({input_tokens:400,output_tokens:5});
+    expect(errors).not.toHaveBeenCalled();
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(2);
+  });
+  it('defers absorbed G2 settlement until G1 finishes when G2 RPC resolves first',async()=>{
+    const {provider,requests}=await setup('absorbed-steering-g2-first');const id=await route(provider),done=vi.fn(),errors=vi.fn();provider.onComplete(done);provider.onError(errors);
+    await provider.send(id,'initial task');await vi.waitFor(()=>expect((provider as any).sessions.get(id).agyForeground?.authoritative).toBe(true), { timeout: 5000 });
+    expect(await provider.notifyActiveDelegation(id,notification('B','Proceed'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    await new Promise(r=>setTimeout(r,15));
+    expect(done).not.toHaveBeenCalled();
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(done.mock.calls[0][1].content).toBe('ABSORBED FINAL G2-FIRST');
+    expect(done.mock.calls[0][1].metadata.usage).toMatchObject({input_tokens:200,output_tokens:5});
+    expect(errors).not.toHaveBeenCalled();
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(2);
+  });
+  it('fails boundedly without publishing unattributed ACP text when absorbed steering produces no terminal native output',async()=>{
+    const {provider}=await setup('absorbed-steering-no-native');const id=await route(provider),done=vi.fn(),errors=vi.fn(),deltas=vi.fn();
+    provider.onComplete(done);provider.onError(errors);provider.onDelta(deltas);
+    await provider.send(id,'initial task');
+    const state=(provider as any).sessions.get(id);
+    await vi.waitFor(()=>expect(state.agyForeground?.authoritative).toBe(true), { timeout: 5000 });
+    state.agyForeground.deadlineMs=30;
+    expect(await provider.notifyActiveDelegation(id,notification('B','Proceed'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    await vi.waitFor(()=>expect(errors).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(errors.mock.calls[0][1].message).toContain('could not be attributed');
+    expect(done).not.toHaveBeenCalled();
+    expect(deltas.mock.calls.filter(([,d])=>d.type==='text')).toHaveLength(0);
+    expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
+  });
   it('waits on the native output event after prompt RPC settlement, not a dedup grace timer',async()=>{
     const {provider,requests}=await setup('native-child-output-after-ack');const id=await route(provider),done=vi.fn();provider.onComplete(done);
     await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
