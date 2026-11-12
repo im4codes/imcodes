@@ -5,11 +5,17 @@ import {
   type SupervisionExecutionConfig,
   type SupervisionExecutionPoolRole,
 } from './supervision-execution-pool.js';
-import { getSessionRuntimeType } from './agent-types.js';
+import {
+  getSessionRuntimeType,
+  isSessionAgentType,
+  CLAUDE_CODE_CLI_SDK_AGENT_TYPE,
+} from './agent-types.js';
 import { resolvePeerAuditProviderFamily } from './peer-audit.js';
-import { normalizeSharedContextRuntimeBackend } from './shared-context-runtime-config.js';
+import {
+  inferSharedContextRuntimeBackend,
+  normalizeSharedContextRuntimeBackend,
+} from './shared-context-runtime-config.js';
 import { AGY_SDK_PROVIDER_ID, isAgyModelId } from './agy-agent.js';
-import { looksLikeCodexModelId } from '../src/shared/models/options.js';
 
 export const EXECUTION_POOL_MCP_TOOLS = {
   GET: 'execution_pool_get',
@@ -49,20 +55,51 @@ export function configFromExecutionPoolEntry(entry: ExecutionPoolMcpEntry): Supe
   const rawModel = entry.model.trim();
   const lowerProvider = rawProvider.toLowerCase();
   let agentType: string;
-  if (lowerProvider === 'agy' || lowerProvider === AGY_SDK_PROVIDER_ID || lowerProvider === 'google' || isAgyModelId(rawModel)) {
+
+  // 1. Explicit agent types / backends:
+  // When entry.provider explicitly specifies an agentType/backend, preserve that choice.
+  if (lowerProvider === 'agy' || lowerProvider === AGY_SDK_PROVIDER_ID) {
     agentType = AGY_SDK_PROVIDER_ID;
-  } else if (lowerProvider === 'openai' && (looksLikeCodexModelId(rawModel) || rawModel.includes('sol') || rawModel.includes('luna'))) {
+  } else if (lowerProvider === 'gemini') {
+    agentType = 'gemini';
+  } else if (lowerProvider === 'gemini-sdk') {
+    agentType = 'gemini-sdk';
+  } else if (lowerProvider === 'codex') {
+    agentType = 'codex';
+  } else if (lowerProvider === 'codex-sdk') {
     agentType = 'codex-sdk';
+  } else if (lowerProvider === 'claude-code') {
+    agentType = 'claude-code';
+  } else if (lowerProvider === 'claude-code-sdk' || lowerProvider === CLAUDE_CODE_CLI_SDK_AGENT_TYPE) {
+    agentType = lowerProvider;
+  } else if (normalizeSharedContextRuntimeBackend(rawProvider)) {
+    agentType = normalizeSharedContextRuntimeBackend(rawProvider)!;
+  } else if (isSessionAgentType(lowerProvider)) {
+    agentType = lowerProvider;
+  } else if (lowerProvider === 'google') {
+    // 2. Generic provider-family alias: 'google'
+    // AGY series models map to agy-sdk transport; other models stay on gemini process.
+    agentType = isAgyModelId(rawModel) ? AGY_SDK_PROVIDER_ID : 'gemini';
+  } else if (lowerProvider === 'openai') {
+    // Generic provider-family alias: 'openai'
+    agentType = (inferSharedContextRuntimeBackend(rawModel) === 'codex-sdk' || rawModel.includes('sol') || rawModel.includes('luna'))
+      ? 'codex-sdk'
+      : 'codex';
   } else {
-    agentType = normalizeSharedContextRuntimeBackend(rawProvider)
-      ?? ({ anthropic: 'claude-code-sdk', openai: 'codex', google: 'gemini', qwen: 'qwen', deepseek: 'deepseek' } as Record<string, string>)[lowerProvider]
+    agentType = ({ anthropic: 'claude-code-sdk', qwen: 'qwen', deepseek: 'deepseek' } as Record<string, string>)[lowerProvider]
       ?? rawProvider;
   }
+
   const model = normalizeSupervisionExecutionModel(agentType, rawModel);
   const providerFamily = resolvePeerAuditProviderFamily({ agentType, providerId: rawProvider });
   const runtimeType = getSessionRuntimeType(agentType);
-  const base = { agentType, providerFamily, runtimeType, model,
-    ...(entry.role !== 'both' ? { role: entry.role } : {}) };
+  const base = {
+    agentType,
+    providerFamily,
+    runtimeType,
+    model,
+    ...(entry.role !== 'both' ? { role: entry.role } : {}),
+  };
   return { ...base, capabilityId: buildSupervisionExecutionCapabilityId(base) };
 }
 

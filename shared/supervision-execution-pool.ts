@@ -451,9 +451,11 @@ function normalizePool(value: unknown, kind: SupervisionExecutionPoolKind): Supe
   // Modern transport runtimes supersede legacy process runtimes for the same
   // provider family, model, and preset (e.g. transport:codex-sdk supersedes process:codex,
   // transport:agy-sdk supersedes process:gemini).
-  // An explicit role on either is preserved, giving preference to the transport role.
+  // An explicit role on the modern transport is strictly preserved (never widened or erased).
+  // When the modern transport lacks an explicit role, it safely inherits from legacy process.
   const entries = [...byCapability.values()];
   const processIndicesToDrop = new Set<number>();
+  const transportInheritedLegacyRole = new Map<string, SupervisionExecutionPoolRole | 'conflicted'>();
   for (let i = 0; i < entries.length; i++) {
     const item = entries[i]!;
     if (item.runtimeType !== 'process') continue;
@@ -465,10 +467,21 @@ function normalizePool(value: unknown, kind: SupervisionExecutionPoolKind): Supe
     ));
     if (transportEntry) {
       processIndicesToDrop.add(i);
-      if (transportEntry.role === undefined && item.role !== undefined) {
-        transportEntry.role = item.role;
-      } else if (transportEntry.role !== undefined && item.role !== undefined && transportEntry.role !== item.role) {
-        delete transportEntry.role;
+      // An explicit role on the modern transport is NEVER erased, widened, or overridden
+      // by a legacy process entry, regardless of entry ordering or conflicting roles.
+      if (transportEntry.role !== undefined) {
+        continue;
+      }
+      // If transport had no explicit role, inherit from legacy process if available and unambiguous.
+      if (item.role !== undefined) {
+        const prevInherited = transportInheritedLegacyRole.get(transportEntry.capabilityId);
+        if (prevInherited === undefined) {
+          transportInheritedLegacyRole.set(transportEntry.capabilityId, item.role);
+          transportEntry.role = item.role;
+        } else if (prevInherited !== item.role) {
+          transportInheritedLegacyRole.set(transportEntry.capabilityId, 'conflicted');
+          delete transportEntry.role;
+        }
       }
     }
   }

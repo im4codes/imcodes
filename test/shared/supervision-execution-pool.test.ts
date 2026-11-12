@@ -87,6 +87,54 @@ describe('supervision execution pools', () => {
     });
   });
 
+  it('never widens or clears an explicit modern role across conflicting legacy roles, both orderings and pools (F1)', () => {
+    function makeEntry(agentType: string, runtimeType: 'process' | 'transport', role?: SupervisionExecutionPoolRole, ccPresetId?: string): SupervisionExecutionConfig {
+      const c = { agentType, runtimeType, providerFamily: 'openai', model: 'gpt-6.1-sol', role, ccPresetId };
+      return { ...c, capabilityId: buildSupervisionExecutionCapabilityId(c) };
+    }
+
+    // 1. Conflicting roles: modern role must never be widened to both or erased
+    for (const role of ['executor', 'auditor'] as const) {
+      const oppositeRole = role === 'executor' ? 'auditor' : 'executor';
+      const modern = makeEntry('codex-sdk', 'transport', role);
+      const legacy = makeEntry('codex', 'process', oppositeRole);
+
+      for (const configs of [[modern, legacy], [legacy, modern]]) {
+        const out = normalizeSupervisionExecutionPools({
+          state: 'configured',
+          primaryDevelopmentPool: { configs },
+          economyTaskPool: { configs: [] },
+        }).primaryDevelopmentPool.configs;
+        expect(out).toHaveLength(1);
+        expect(out[0]?.agentType).toBe('codex-sdk');
+        expect(out[0]?.role).toBe(role);
+      }
+    }
+
+    // 2. Modern without role inherits legacy role
+    const modernNoRole = makeEntry('codex-sdk', 'transport', undefined);
+    const legacyExecutor = makeEntry('codex', 'process', 'executor');
+    for (const configs of [[modernNoRole, legacyExecutor], [legacyExecutor, modernNoRole]]) {
+      const out = normalizeSupervisionExecutionPools({
+        state: 'configured',
+        primaryDevelopmentPool: { configs },
+        economyTaskPool: { configs: [] },
+      }).primaryDevelopmentPool.configs;
+      expect(out).toHaveLength(1);
+      expect(out[0]?.role).toBe('executor');
+    }
+
+    // 3. Preset isolation: distinct ccPresetId entries are not collapsed
+    const modernPreset = makeEntry('codex-sdk', 'transport', 'auditor', 'review-preset');
+    const legacyNoPreset = makeEntry('codex', 'process', 'executor');
+    const withPreset = normalizeSupervisionExecutionPools({
+      state: 'configured',
+      primaryDevelopmentPool: { configs: [modernPreset, legacyNoPreset] },
+      economyTaskPool: { configs: [] },
+    }).primaryDevelopmentPool.configs;
+    expect(withPreset).toHaveLength(2);
+  });
+
   it('resolves the ordered Luna/Sol tier before lower-priority families', () => {
     const entries = [
       config('deepseek-sdk', 'deepseek', 'deepseek-pro'),
