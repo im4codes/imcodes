@@ -231,8 +231,9 @@ describe('update manager', () => {
     await waitFor(() => expect(downloadMock).toHaveBeenCalledTimes(1));
 
     const pbxproj = readFileSync(join(WEB_ROOT, 'ios/App/App.xcodeproj/project.pbxproj'), 'utf8');
-    expect(pbxproj.match(/CURRENT_PROJECT_VERSION = 1\.2;/g)).toHaveLength(2);
-    expect(pbxproj.match(/MARKETING_VERSION = 1\.2;/g)).toHaveLength(2);
+    // App and ShareActionExtension each have Debug and Release configurations.
+    expect(pbxproj.match(/CURRENT_PROJECT_VERSION = 1\.2;/g)).toHaveLength(4);
+    expect(pbxproj.match(/MARKETING_VERSION = 1\.2;/g)).toHaveLength(4);
     expect(pbxproj).not.toContain('CURRENT_PROJECT_VERSION = 1.1;');
     expect(pbxproj).not.toContain('MARKETING_VERSION = 1.1;');
   });
