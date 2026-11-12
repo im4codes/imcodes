@@ -217,8 +217,9 @@ type IncognitoCacheEntry = {
   mode: 'incognito' | 'closed-tombstone' | 'normal';
   sessionInstanceId?: string;
   runtimeEpoch?: string;
-  privateEpochs: Set<string>;
-  normalSinceTs?: number;
+  privateInstanceIds: Set<string>;
+  privateRuntimeEpochs: Set<string>;
+  privateFallbackEpochs: Set<string>;
 };
 const incognitoCacheState = new Map<string, IncognitoCacheEntry>();
 const cacheListeners = new Map<string, Set<(events: TimelineEvent[]) => void>>();
@@ -1045,7 +1046,12 @@ function scopeCacheKey(serverId: string | null | undefined, sessionId: string): 
 function getOrCreateIncognitoState(cacheKey: string): IncognitoCacheEntry {
   let state = incognitoCacheState.get(cacheKey);
   if (!state) {
-    state = { mode: 'normal', privateEpochs: new Set<string>() };
+    state = {
+      mode: 'normal',
+      privateInstanceIds: new Set<string>(),
+      privateRuntimeEpochs: new Set<string>(),
+      privateFallbackEpochs: new Set<string>(),
+    };
     incognitoCacheState.set(cacheKey, state);
   }
   return state;
@@ -1054,6 +1060,10 @@ function getOrCreateIncognitoState(cacheKey: string): IncognitoCacheEntry {
 function isCacheKeyIncognito(cacheKey: string): boolean {
   const mode = incognitoCacheState.get(cacheKey)?.mode;
   return mode === 'incognito' || mode === 'closed-tombstone';
+}
+
+export function isIncognitoTimelineSession(serverId: string | null | undefined, sessionId: string): boolean {
+  return incognitoCacheState.get(scopeCacheKey(serverId, sessionId))?.mode === 'incognito';
 }
 
 function eventEpochKey(event: TimelineEvent): string | undefined {
@@ -1071,11 +1081,47 @@ function resetTransientTimelineState(cacheKey: string): void {
   getTimelineStore(cacheKey).reset();
 }
 
+function recordPrivateInstanceMetadata(state: IncognitoCacheEntry, event: TimelineEvent): void {
+  if (event.sessionInstanceId) state.privateInstanceIds.add(event.sessionInstanceId);
+  if (event.runtimeEpoch) state.privateRuntimeEpochs.add(event.runtimeEpoch);
+  // Only fall back to daemon event.epoch when neither session/event carries
+  // per-instance identity, so normal reuse on the same daemon is never blocked.
+  if (!state.sessionInstanceId && !state.runtimeEpoch && !event.sessionInstanceId && !event.runtimeEpoch) {
+    const ep = eventEpochKey(event);
+    if (ep) state.privateFallbackEpochs.add(ep);
+  }
+}
+
+function hasMatchingClosedPrivateInstance(state: IncognitoCacheEntry, event: TimelineEvent): boolean {
+  if (event.sessionInstanceId && state.privateInstanceIds.has(event.sessionInstanceId) && state.sessionInstanceId !== event.sessionInstanceId) {
+    return true;
+  }
+  if (event.runtimeEpoch && state.privateRuntimeEpochs.has(event.runtimeEpoch) && state.runtimeEpoch !== event.runtimeEpoch) {
+    return true;
+  }
+  return false;
+}
+
+function hasNewPrivateInstanceIdentity(state: IncognitoCacheEntry, event: TimelineEvent): boolean {
+  const newInstanceId = Boolean(
+    event.sessionInstanceId
+    && !state.privateInstanceIds.has(event.sessionInstanceId)
+    && event.sessionInstanceId !== state.sessionInstanceId,
+  );
+  const newRuntimeEpoch = Boolean(
+    event.runtimeEpoch
+    && !state.privateRuntimeEpochs.has(event.runtimeEpoch)
+    && event.runtimeEpoch !== state.runtimeEpoch,
+  );
+  return newInstanceId || newRuntimeEpoch;
+}
+
 function forgetIncognitoTimelineKey(cacheKey: string): void {
   const state = incognitoCacheState.get(cacheKey);
   if (!state) return;
   resetTransientTimelineState(cacheKey);
-  if (state.runtimeEpoch) state.privateEpochs.add(state.runtimeEpoch);
+  if (state.sessionInstanceId) state.privateInstanceIds.add(state.sessionInstanceId);
+  if (state.runtimeEpoch) state.privateRuntimeEpochs.add(state.runtimeEpoch);
   state.mode = 'closed-tombstone';
 }
 
@@ -1089,8 +1135,7 @@ function markPrivateTimelineEvents(cacheKey: string, events: TimelineEvent[]): T
   const activeState = incognitoCacheState.get(cacheKey);
   if (activeState?.mode === 'incognito' || activeState?.mode === 'closed-tombstone') {
     for (const event of events) {
-      const ep = eventEpochKey(event);
-      if (ep) activeState.privateEpochs.add(ep);
+      recordPrivateInstanceMetadata(activeState, event);
     }
     return events.map(event => isIncognitoSession(event.payload) ? event : { ...event, payload: { ...event.payload, ...INCOGNITO_TIMELINE_PAYLOAD } });
   }
@@ -1103,33 +1148,47 @@ function shouldDropIncomingTimelineEvent(cacheKey: string, event: TimelineEvent)
   const ep = eventEpochKey(event);
   const payloadPrivate = isIncognitoSession(event.payload);
   if (state.mode === 'incognito') {
-    if (ep) state.privateEpochs.add(ep);
+    recordPrivateInstanceMetadata(state, event);
     return false;
   }
   if (state.mode === 'closed-tombstone') {
-    if (payloadPrivate || (ep !== undefined && state.privateEpochs.has(ep))) {
-      if (ep) state.privateEpochs.add(ep);
+    const stalePrivateInstance = Boolean(
+      (event.sessionInstanceId && state.privateInstanceIds.has(event.sessionInstanceId))
+      || (event.runtimeEpoch && state.privateRuntimeEpochs.has(event.runtimeEpoch)),
+    );
+    const staleFallbackEpoch = !state.sessionInstanceId && !state.runtimeEpoch
+      && !event.sessionInstanceId && !event.runtimeEpoch
+      && ep !== undefined && state.privateFallbackEpochs.has(ep);
+    if (payloadPrivate || stalePrivateInstance || staleFallbackEpoch) {
+      recordPrivateInstanceMetadata(state, event);
       return true;
     }
-    // An authoritative non-incognito event from a distinct epoch indicates a
-    // brand-new normal session started with the same name.
+    // An authoritative non-incognito event without closed private identity
+    // indicates a brand-new normal session started with the same name.
     state.mode = 'normal';
-    state.sessionInstanceId = undefined;
-    state.runtimeEpoch = ep;
-    state.normalSinceTs = Date.now();
+    state.sessionInstanceId = event.sessionInstanceId;
+    state.runtimeEpoch = event.runtimeEpoch;
     return false;
   }
   // state.mode === 'normal'
-  if (ep !== undefined && state.privateEpochs.has(ep)) return true;
+  if (hasMatchingClosedPrivateInstance(state, event)) return true;
   if (payloadPrivate) {
-    // Late old-private frame arriving after the normal session started.
-    if (state.normalSinceTs !== undefined && (!event.ts || event.ts <= state.normalSinceTs)) {
-      if (ep) state.privateEpochs.add(ep);
-      return true;
+    // Only flip a known normal session to incognito on a live event when the
+    // event carries a distinct private sessionInstanceId or runtimeEpoch.
+    if (hasNewPrivateInstanceIdentity(state, event)) {
+      resetTransientTimelineState(cacheKey);
+      state.mode = 'incognito';
+      if (event.sessionInstanceId) {
+        state.sessionInstanceId = event.sessionInstanceId;
+        state.privateInstanceIds.add(event.sessionInstanceId);
+      }
+      if (event.runtimeEpoch) {
+        state.runtimeEpoch = event.runtimeEpoch;
+        state.privateRuntimeEpochs.add(event.runtimeEpoch);
+      }
+      return false;
     }
-    state.mode = 'incognito';
-    if (ep) state.privateEpochs.add(ep);
-    return false;
+    return true;
   }
   return false;
 }
@@ -1141,22 +1200,29 @@ export function registerIncognitoTimelineSession(
 ): void {
   const cacheKey = scopeCacheKey(serverId, sessionId);
   const state = getOrCreateIncognitoState(cacheKey);
+  const nextInstanceId = meta?.sessionInstanceId || undefined;
   const nextEpoch = meta?.runtimeEpoch !== undefined ? String(meta.runtimeEpoch) : undefined;
   const instanceChanged = Boolean(
-    (meta?.sessionInstanceId && state.sessionInstanceId && meta.sessionInstanceId !== state.sessionInstanceId)
+    (nextInstanceId && state.sessionInstanceId && nextInstanceId !== state.sessionInstanceId)
     || (nextEpoch && state.runtimeEpoch && nextEpoch !== state.runtimeEpoch)
     || state.mode === 'normal',
   );
   if (state.mode !== 'incognito' || instanceChanged) {
+    if (state.mode === 'incognito') {
+      if (state.sessionInstanceId) state.privateInstanceIds.add(state.sessionInstanceId);
+      if (state.runtimeEpoch) state.privateRuntimeEpochs.add(state.runtimeEpoch);
+    }
     resetTransientTimelineState(cacheKey);
   }
   state.mode = 'incognito';
-  if (meta?.sessionInstanceId !== undefined) state.sessionInstanceId = meta.sessionInstanceId;
+  if (nextInstanceId !== undefined) {
+    state.sessionInstanceId = nextInstanceId;
+    state.privateInstanceIds.add(nextInstanceId);
+  }
   if (nextEpoch !== undefined) {
     state.runtimeEpoch = nextEpoch;
-    state.privateEpochs.add(nextEpoch);
+    state.privateRuntimeEpochs.add(nextEpoch);
   }
-  state.normalSinceTs = undefined;
 }
 
 export function registerNormalTimelineSession(
@@ -1165,16 +1231,29 @@ export function registerNormalTimelineSession(
   meta?: { sessionInstanceId?: string; runtimeEpoch?: string | number },
 ): void {
   const cacheKey = scopeCacheKey(serverId, sessionId);
-  const state = incognitoCacheState.get(cacheKey);
-  if (!state) return;
+  const nextInstanceId = meta?.sessionInstanceId || undefined;
+  const nextEpoch = meta?.runtimeEpoch !== undefined ? String(meta.runtimeEpoch) : undefined;
+  let state = incognitoCacheState.get(cacheKey);
+  if (!state) {
+    if (!nextInstanceId && !nextEpoch) return;
+    state = getOrCreateIncognitoState(cacheKey);
+  }
   if (state.mode === 'incognito') {
-    if (state.runtimeEpoch) state.privateEpochs.add(state.runtimeEpoch);
+    if (state.sessionInstanceId) state.privateInstanceIds.add(state.sessionInstanceId);
+    if (state.runtimeEpoch) state.privateRuntimeEpochs.add(state.runtimeEpoch);
     resetTransientTimelineState(cacheKey);
   }
   state.mode = 'normal';
-  state.sessionInstanceId = meta?.sessionInstanceId;
-  state.runtimeEpoch = meta?.runtimeEpoch !== undefined ? String(meta.runtimeEpoch) : undefined;
-  state.normalSinceTs = Date.now();
+  if (nextInstanceId !== undefined) {
+    state.sessionInstanceId = nextInstanceId;
+  } else if (state.sessionInstanceId && state.privateInstanceIds.has(state.sessionInstanceId)) {
+    state.sessionInstanceId = undefined;
+  }
+  if (nextEpoch !== undefined) {
+    state.runtimeEpoch = nextEpoch;
+  } else if (state.runtimeEpoch && state.privateRuntimeEpochs.has(state.runtimeEpoch)) {
+    state.runtimeEpoch = undefined;
+  }
 }
 
 export function syncIncognitoTimelineSessions(
@@ -2004,7 +2083,15 @@ export function __setTimelineCacheForTests(cacheKey: string, events: TimelineEve
 export function ingestTimelineEventForCache(event: TimelineEvent, serverId?: string | null): void {
   const cacheKey = scopeCacheKey(serverId, event.sessionId);
   if (shouldDropIncomingTimelineEvent(cacheKey, event)) return;
-  if (isIncognitoSession(event.payload)) registerIncognitoTimelineSession(serverId, event.sessionId, { runtimeEpoch: event.epoch });
+  if (isIncognitoSession(event.payload)) {
+    const state = incognitoCacheState.get(cacheKey);
+    if (!state || state.mode !== 'incognito' || event.sessionInstanceId || event.runtimeEpoch) {
+      registerIncognitoTimelineSession(serverId, event.sessionId, {
+        ...(event.sessionInstanceId ? { sessionInstanceId: event.sessionInstanceId } : {}),
+        ...(event.runtimeEpoch ? { runtimeEpoch: event.runtimeEpoch } : {}),
+      });
+    }
+  }
   if (shouldFrameCoalesceTimelineEvent(event)) {
     queueTimelineCacheIngest(cacheKey, event);
     return;

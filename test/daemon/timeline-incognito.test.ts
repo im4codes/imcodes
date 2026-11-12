@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 const { sessions, append, read, run } = vi.hoisted(() => ({
-  sessions: new Map<string, { incognito?: boolean }>(),
+  sessions: new Map<string, { incognito?: boolean; sessionInstanceId?: string; runtimeEpoch?: string }>(),
   append: vi.fn(), read: vi.fn(() => []), run: vi.fn(async () => undefined),
 }));
 vi.mock('../../src/store/session-store.js', () => ({ getSession: (name: string) => sessions.get(name) }));
@@ -42,5 +42,18 @@ describe('incognito timeline', () => {
     expect(event?.payload.memoryExcluded).toBeUndefined();
     emitter.emit('normal', 'usage.update', { inputTokens: 1 });
     expect(append).toHaveBeenCalledTimes(2); expect(run).toHaveBeenCalledWith('recordTurnUsage', [expect.any(Object)]);
+  });
+  it('propagates per-session sessionInstanceId and runtimeEpoch onto emitted TimelineEvent without conflating daemon epoch', () => {
+    sessions.set('private', { incognito: true, sessionInstanceId: 'inst-p', runtimeEpoch: 'rt-p' });
+    sessions.set('normal', { incognito: false, sessionInstanceId: 'inst-n', runtimeEpoch: 'rt-n' });
+    const emitter = new TimelineEmitter();
+    const privEvent = emitter.emit('private', 'assistant.text', { text: 'priv' });
+    const normEvent = emitter.emit('normal', 'assistant.text', { text: 'norm' });
+    expect(privEvent?.sessionInstanceId).toBe('inst-p');
+    expect(privEvent?.runtimeEpoch).toBe('rt-p');
+    expect(privEvent?.epoch).toBe(emitter.epoch);
+    expect(normEvent?.sessionInstanceId).toBe('inst-n');
+    expect(normEvent?.runtimeEpoch).toBe('rt-n');
+    expect(normEvent?.epoch).toBe(emitter.epoch);
   });
 });

@@ -30,6 +30,7 @@ vi.mock('../../src/components/file-browser-lazy.js', () => ({ FileBrowser: () =>
 
 import { NewSessionDialog } from '../../src/components/NewSessionDialog.js';
 import { SessionControls } from '../../src/components/SessionControls.js';
+import { __resetTimelineCacheForTests, registerIncognitoTimelineSession } from '../../src/hooks/useTimeline.js';
 
 describe('NewSessionDialog & SessionControls incognito UI contracts (F3)', () => {
   beforeEach(() => {
@@ -175,5 +176,127 @@ describe('NewSessionDialog & SessionControls incognito UI contracts (F3)', () =>
     // Must not write any rcc_draft_* entry to localStorage while incognito
     const keys = Object.keys(localStorage);
     expect(keys.some((k) => k.includes('rcc_draft'))).toBe(false);
+    __resetTimelineCacheForTests();
+  });
+
+  it('SessionControls skips auto quickData.recordHistory for incognito sends (flag or timeline registry) and records for normal sends (F1-R2)', () => {
+    const makeProps = (session: Record<string, unknown>, recordHistory = vi.fn()) => {
+      const ws = {
+        connected: true,
+        send: vi.fn(),
+        sendSessionCommand: vi.fn(),
+        onMessage: vi.fn(() => () => {}),
+      };
+      const quickData = {
+        data: { history: [], sessionHistory: {}, commands: [], phrases: [] },
+        loaded: true,
+        recordHistory,
+        addCommand: vi.fn(),
+        addPhrase: vi.fn(),
+        removeCommand: vi.fn(),
+        removePhrase: vi.fn(),
+        removeHistory: vi.fn(),
+        removeSessionHistory: vi.fn(),
+        clearHistory: vi.fn(),
+        clearSessionHistory: vi.fn(),
+      };
+      return { ws, quickData, session };
+    };
+
+    // 1. Explicitly incognito session
+    const priv = makeProps({
+      name: 'deck_priv_send',
+      project: 'priv',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      state: 'idle',
+      runtimeType: 'transport',
+      incognito: true,
+    });
+    render(
+      <SessionControls
+        ws={priv.ws as any}
+        connected={true}
+        activeSession={priv.session as any}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+        quickData={priv.quickData as any}
+      />,
+    );
+    const privInput = screen.getByRole('textbox');
+    privInput.textContent = 'PRIVATE-QUICK-PROMPT';
+    fireEvent.input(privInput);
+    fireEvent.keyDown(privInput, { key: 'Enter' });
+    expect(priv.ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+      sessionName: 'deck_priv_send',
+      text: 'PRIVATE-QUICK-PROMPT',
+    }));
+    expect(priv.quickData.recordHistory).not.toHaveBeenCalled();
+    cleanup();
+
+    // 2. Session known to be incognito in timeline state even before activeSession prop catches up
+    __resetTimelineCacheForTests();
+    registerIncognitoTimelineSession('srv-1', 'deck_tl_priv_send', { sessionInstanceId: 'inst-tl', runtimeEpoch: 'rt-tl' });
+    const tlPriv = makeProps({
+      name: 'deck_tl_priv_send',
+      project: 'priv',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      state: 'idle',
+      runtimeType: 'transport',
+    });
+    render(
+      <SessionControls
+        ws={tlPriv.ws as any}
+        connected={true}
+        activeSession={tlPriv.session as any}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+        quickData={tlPriv.quickData as any}
+      />,
+    );
+    const tlInput = screen.getByRole('textbox');
+    tlInput.textContent = 'TL-PRIVATE-PROMPT';
+    fireEvent.input(tlInput);
+    fireEvent.keyDown(tlInput, { key: 'Enter' });
+    expect(tlPriv.ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+      sessionName: 'deck_tl_priv_send',
+      text: 'TL-PRIVATE-PROMPT',
+    }));
+    expect(tlPriv.quickData.recordHistory).not.toHaveBeenCalled();
+    cleanup();
+    __resetTimelineCacheForTests();
+
+    // 3. Normal session control MUST continue recording history
+    const norm = makeProps({
+      name: 'deck_norm_send',
+      project: 'norm',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      state: 'idle',
+      runtimeType: 'transport',
+    });
+    render(
+      <SessionControls
+        ws={norm.ws as any}
+        connected={true}
+        activeSession={norm.session as any}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+        quickData={norm.quickData as any}
+      />,
+    );
+    const normInput = screen.getByRole('textbox');
+    normInput.textContent = 'NORMAL-QUICK-PROMPT';
+    fireEvent.input(normInput);
+    fireEvent.keyDown(normInput, { key: 'Enter' });
+    expect(norm.ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+      sessionName: 'deck_norm_send',
+      text: 'NORMAL-QUICK-PROMPT',
+    }));
+    expect(norm.quickData.recordHistory).toHaveBeenCalledWith('NORMAL-QUICK-PROMPT', 'deck_norm_send');
   });
 });

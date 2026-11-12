@@ -64,7 +64,8 @@ import {
 } from './OpenSpecAutoDeliver.js';
 import { OpenSpecChangeRow } from './OpenSpecChangeRow.js';
 import { useOpenSpecAutoDeliver } from '../hooks/useOpenSpecAutoDeliver.js';
-import { requestActiveTimelineRefreshAfterUserAction } from '../hooks/useTimeline.js';
+import { isIncognitoTimelineSession, requestActiveTimelineRefreshAfterUserAction } from '../hooks/useTimeline.js';
+import { isIncognitoSession } from '@shared/session-incognito-types.js';
 import { isOpenSpecAutoDeliverActiveProjection } from '../openspec-auto-deliver.js';
 import type { OpenSpecAutoDeliverMaterializedLimits, OpenSpecAutoDeliverPresetId } from '../openspec-auto-deliver.js';
 import { isFutureWorkflowSchema } from '@shared/p2p-workflow-validators.js';
@@ -1789,9 +1790,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const imeComposingRef = useRef(false);
   const lastImeCompositionAtRef = useRef(0);
   const attachmentDraftRef = useRef<ComposerAttachmentRecord[]>([]);
+  const activeSessionIncognito = isIncognitoSession(activeSession)
+    || (activeSession?.name ? isIncognitoTimelineSession(serverId ?? null, activeSession.name) : false);
   const composerDraftScope = buildComposerDraftScope(activeSession, subSessionId);
-  const draftKey = !activeSession?.incognito && composerDraftScope ? `rcc_draft_${composerDraftScope}` : null;
-  const attachmentDraftKey = !activeSession?.incognito && composerDraftScope ? `rcc_draft_attachments_${composerDraftScope}` : null;
+  const draftKey = !activeSessionIncognito && composerDraftScope ? `rcc_draft_${composerDraftScope}` : null;
+  const attachmentDraftKey = !activeSessionIncognito && composerDraftScope ? `rcc_draft_attachments_${composerDraftScope}` : null;
   const attachmentDraftKeyRef = useRef<string | null>(attachmentDraftKey);
   attachmentDraftKeyRef.current = attachmentDraftKey;
   const mountedRef = useRef(true);
@@ -1799,7 +1802,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // A voice notepad's local draft is kept per session exactly like the
   // composer's own draft (main sessions and sub-sessions alike), and per
   // server, so two servers' same-named sessions never share one.
-  const voiceNotepadDraftScope = !activeSession?.incognito && composerDraftScope
+  const voiceNotepadDraftScope = !activeSessionIncognito && composerDraftScope
     ? (serverId ? `${serverId}:${composerDraftScope}` : composerDraftScope)
     : null;
   const [hasVoiceNotepadDraft, setHasVoiceNotepadDraft] = useState(false);
@@ -4659,7 +4662,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     } catch (err) {
       localFailure = err instanceof Error ? err.message : String(err || 'Send failed');
     }
-    if (!localFailure) quickData.recordHistory(payload.delegation?.task ?? payload.text, activeSession.name);
+    const activeIncognitoNow = isIncognitoSession(activeSession)
+      || isIncognitoTimelineSession(serverId ?? null, activeSession.name);
+    if (!localFailure && !activeIncognitoNow) quickData.recordHistory(payload.delegation?.task ?? payload.text, activeSession.name);
     // An Append-mode send is headed INTO the running turn, not behind it, so it
     // belongs in the timeline immediately (optimistic bubble reconciled by the
     // daemon's user.message for the same id), not in the FIFO card strip.
@@ -4711,7 +4716,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       clearComposerState();
     }
     return localFailure ? 'rejected' : 'accepted';
-  }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, directAppendMode, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, incomingQueuedTransportVersion, makeCommandId, onRemoveQuote, onSend, publishComposerText, quickData, queuedTransportEntries, quotes, sendQueuedMessageMutation, sendSessionMessage, showSendWarning, showStopFeedback, t, transportSendShouldQueue, uploading]);
+  }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, directAppendMode, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, incomingQueuedTransportVersion, makeCommandId, onRemoveQuote, onSend, publishComposerText, quickData, queuedTransportEntries, quotes, sendQueuedMessageMutation, sendSessionMessage, serverId, showSendWarning, showStopFeedback, t, transportSendShouldQueue, uploading]);
 
   const handleQueuedMessageEdit = useCallback((entry: { clientMessageId: string; text: string }) => {
     if (!isEditableQueuedEntry(entry)) return;
@@ -5603,8 +5608,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       return;
     }
 
-    // Use session-scoped history, falling back to global history if session has no entries
-    const history = getNavigableHistory(quickData.data, activeSession?.name);
+    // Use session-scoped history, falling back to global history if session has no entries.
+    // Never look up per-session history under an incognito session's name.
+    const history = getNavigableHistory(quickData.data, activeSessionIncognito ? undefined : activeSession?.name);
     if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && history.length > 0) {
       // Only intercept when caret is on first/last visual line to avoid breaking multiline editing
       const atTop = getCaretLineBoundary('up');
@@ -6471,7 +6477,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         </div>
       </div>
     )}
-    {activeSession?.incognito && <div class="incognito-session-badge" role="status" title={t('session.incognito_hint')}>🕶️ {t('session.incognito')}</div>}
+    {activeSessionIncognito && <div class="incognito-session-badge" role="status" title={t('session.incognito_hint')}>🕶️ {t('session.incognito')}</div>}
     <div ref={controlsWrapperRef} class={`controls-wrapper${showRunningSweep ? ' controls-wrapper-running' : ''}${mobileComposerExpanded ? ' controls-wrapper-mobile-expanded' : ''}`}>
       {dropOverlayStyle && createPortal(
         <div class="session-file-drop-overlay" style={dropOverlayStyle}>

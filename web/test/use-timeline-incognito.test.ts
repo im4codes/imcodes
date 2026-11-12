@@ -7,6 +7,7 @@ import type { TimelineEvent, WsClient } from '../src/ws-client.js';
 import { TimelineDB } from '../src/timeline-db.js';
 import { TIMELINE_SNAPSHOT_STORAGE_PREFIX } from '../src/local-storage-quota.js';
 import {
+  __getTimelineCacheForTests,
   __resetTimelineCacheForTests,
   __flushTimelineSnapshotsBeforeFreezeForTests,
   registerIncognitoTimelineSession,
@@ -14,6 +15,7 @@ import {
   syncIncognitoTimelineSessions,
   forgetIncognitoTimelineSessions,
   ingestTimelineEventForCache,
+  isIncognitoTimelineSession,
   useTimeline,
 } from '../src/hooks/useTimeline.js';
 
@@ -200,5 +202,72 @@ describe('useTimeline incognito lifecycle & persistence isolation (F2)', () => {
     const writtenB = writtenEvents.filter((e) => e.sessionId === `${srvB}:${name}`);
     expect(writtenA).toEqual([]);
     expect(writtenB.map((e) => e.eventId)).toEqual(['b-norm']);
+  });
+
+  it('keeps daemon epoch separate from runtimeEpoch across same-daemon close->normal reuse and unchanged session_list refreshes (F2-R2)', async () => {
+    const serverId = `srv-f2-r2-${Math.random().toString(36).slice(2)}`;
+    const name = 'deck_same_daemon_reuse';
+    const cacheKey = `${serverId}:${name}`;
+    const snapKey = `${TIMELINE_SNAPSHOT_STORAGE_PREFIX}${cacheKey}`;
+    const putSpy = vi.spyOn(TimelineDB.prototype, 'putEvents').mockResolvedValue(undefined);
+
+    // Active private instance under daemon epoch 123456
+    syncIncognitoTimelineSessions(serverId, [
+      { name, incognito: true, sessionInstanceId: 'priv-inst-1', runtimeEpoch: 'priv-rt-1' },
+    ]);
+    expect(isIncognitoTimelineSession(serverId, name)).toBe(true);
+
+    ingestTimelineEventForCache(makeEvent({
+      eventId: 'p-live-1',
+      sessionId: name,
+      epoch: 123456,
+      seq: 1,
+      payload: { text: 'LIVE-PRIVATE-TRANSCRIPT', streaming: false, incognito: true },
+    }), serverId);
+
+    // Periodic identical session_list must NOT wipe live RAM transcript
+    syncIncognitoTimelineSessions(serverId, [
+      { name, incognito: true, sessionInstanceId: 'priv-inst-1', runtimeEpoch: 'priv-rt-1' },
+    ]);
+    expect(__getTimelineCacheForTests(cacheKey)?.map((e) => e.eventId)).toEqual(['p-live-1']);
+    expect(putSpy).not.toHaveBeenCalled();
+
+    // Stop private session, then start normal session on the SAME daemon epoch 123456
+    forgetIncognitoTimelineSessions(serverId, name);
+    expect(isIncognitoTimelineSession(serverId, name)).toBe(false);
+    syncIncognitoTimelineSessions(serverId, [
+      { name, incognito: false, sessionInstanceId: 'norm-inst-2', runtimeEpoch: 'norm-rt-2' },
+    ]);
+
+    // Stale frame explicitly stamped with old private runtimeEpoch/sessionInstanceId must be dropped
+    ingestTimelineEventForCache(makeEvent({
+      eventId: 'p-stale-inst',
+      sessionId: name,
+      epoch: 123456,
+      seq: 2,
+      sessionInstanceId: 'priv-inst-1',
+      runtimeEpoch: 'priv-rt-1',
+      payload: { text: 'STALE-PRIVATE-LEAK', streaming: false, incognito: true },
+    }), serverId);
+
+    // New normal message on SAME daemon epoch 123456 MUST display and persist
+    ingestTimelineEventForCache(makeEvent({
+      eventId: 'n-same-epoch',
+      sessionId: name,
+      epoch: 123456,
+      seq: 1,
+      sessionInstanceId: 'norm-inst-2',
+      runtimeEpoch: 'norm-rt-2',
+      payload: { text: 'NORMAL-SAME-DAEMON-EPOCH', streaming: false },
+    }), serverId);
+
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    __flushTimelineSnapshotsBeforeFreezeForTests();
+
+    expect(__getTimelineCacheForTests(cacheKey)?.map((e) => e.eventId)).toEqual(['n-same-epoch']);
+    const stored = putSpy.mock.calls.flatMap(([events]) => events);
+    expect(stored.map((e) => e.eventId)).toEqual(['n-same-epoch']);
+    expect(localStorage.getItem(snapKey)).toContain('NORMAL-SAME-DAEMON-EPOCH');
+    expect(localStorage.getItem(snapKey)).not.toContain('STALE-PRIVATE-LEAK');
   });
 });

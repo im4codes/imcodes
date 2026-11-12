@@ -304,6 +304,10 @@ export interface TimelineEvent {
   ts: number;
   seq: number;
   epoch: number;
+  /** Optional per-session instance identifier emitted by the daemon for privacy/lifecycle isolation. */
+  sessionInstanceId?: string;
+  /** Optional per-launch runtime epoch UUID emitted by the daemon for privacy/lifecycle isolation. */
+  runtimeEpoch?: string;
   source: TimelineSource;
   confidence: TimelineConfidence;
   type: TimelineEventType;

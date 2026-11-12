@@ -125,7 +125,8 @@ export class TimelineEmitter {
     payload: Record<string, unknown>,
     opts?: { source?: TimelineSource; confidence?: TimelineConfidence; eventId?: string; ts?: number; hidden?: boolean },
   ): TimelineEvent | null {
-    const incognito = inIncognitoContext() || isIncognitoSessionName(sessionId) || isIncognitoSession(getSession(sessionId)) || isIncognitoSession(payload);
+    const session = getSession(sessionId);
+    const incognito = inIncognitoContext() || isIncognitoSessionName(sessionId) || isIncognitoSession(session) || isIncognitoSession(payload);
     if (incognito) payload = { ...payload, ...INCOGNITO_TIMELINE_PAYLOAD };
     const traceStart = performance.now();
     let traceTempFileMs = 0;
@@ -318,6 +319,12 @@ export class TimelineEmitter {
       ts,
       seq,
       epoch: this.epoch,
+      ...(typeof session?.sessionInstanceId === 'string' && session.sessionInstanceId
+        ? { sessionInstanceId: session.sessionInstanceId }
+        : {}),
+      ...(typeof session?.runtimeEpoch === 'string' && session.runtimeEpoch
+        ? { runtimeEpoch: session.runtimeEpoch }
+        : {}),
       source: opts?.source ?? 'daemon',
       confidence: opts?.confidence ?? 'high',
       type,
