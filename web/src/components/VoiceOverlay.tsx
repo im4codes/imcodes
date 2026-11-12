@@ -42,6 +42,8 @@ interface NotepadReview {
 }
 
 const BAR_COUNT = 48;
+export const VOICE_HOLD_MS = 350;
+export const VOICE_DOUBLE_TAP_MS = 375;
 /** Delay before re-arming the recognizer after it ends a segment by itself. */
 export const NOTEPAD_RESTART_DELAY_MS = 250;
 /** A notepad segment shorter than this counts as a failed restart. */
@@ -74,6 +76,11 @@ export function VoiceOverlay({
   const [bars, setBars] = useState<number[]>(() => Array(BAR_COUNT).fill(2));
   const [maxH, setMaxH] = useState('66vh');
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const holdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const heldRef = useRef(false);
+  const suppressMicClickRef = useRef(false);
+  const lastMicTapRef = useRef<number | null>(null);
+  const micPointerRef = useRef<number | null>(null);
   const barsRef = useRef<number[]>(Array(BAR_COUNT).fill(2));
   // Voice zone: [insertPos, insertPos+voiceLen) is the active voice segment
   const insertPosRef = useRef(0);
@@ -81,6 +88,7 @@ export function VoiceOverlay({
   // Session token: monotonic counter — partials with stale token are discarded
   const sessionTokenRef = useRef(0);
   const flushingTokenRef = useRef<number | null>(null);
+  const pendingFlushRef = useRef<{ token: number; promise: Promise<boolean> } | null>(null);
   const voiceSendPendingRef = useRef(false);
   // Track listening state in a ref so event handlers always see current value
   const listeningRef = useRef(false);
@@ -275,6 +283,11 @@ export function VoiceOverlay({
     return () => {
       clearAutoStartTimer();
       clearRestartTimer();
+      if (holdTimerRef.current) clearTimeout(holdTimerRef.current);
+      holdTimerRef.current = null;
+      heldRef.current = false;
+      lastMicTapRef.current = null;
+      micPointerRef.current = null;
       notepadRef.current = false;
       openRef.current = false;
       vv?.removeEventListener('resize', onResize);
@@ -375,22 +388,36 @@ export function VoiceOverlay({
   }
 
   /** Stop current session and commit voice zone */
-  const commitAndStop = useCallback(async (flush = false) => {
+  const commitAndStop = useCallback((flush = false): Promise<boolean> => {
     const token = sessionTokenRef.current;
+    // A tap-stop and double-tap-send can await the SAME native stop ACK.
+    // Share the whole commit, not merely stopListening(): incrementing the
+    // token twice would make the send waiter look stale and silently cancel it.
+    const pending = pendingFlushRef.current;
+    if (flush && pending?.token === token) return pending.promise;
     if (flush) flushingTokenRef.current = token;
     else { flushingTokenRef.current = null; sessionTokenRef.current++; }
-    await VoiceInput.stopListening();
-    if (sessionTokenRef.current !== token + (flush ? 0 : 1)) return false;
+    const stopping = (async () => {
+      await VoiceInput.stopListening();
+      if (sessionTokenRef.current !== token + (flush ? 0 : 1)) return false;
+      if (flush) {
+        sessionTokenRef.current++;
+        flushingTokenRef.current = null;
+      }
+      setListeningState(false);
+      // Commit exactly once; all waiters receive the same success/failure.
+      recordCommittedSegment();
+      insertPosRef.current += voiceLenRef.current;
+      voiceLenRef.current = 0;
+      return true;
+    })();
     if (flush) {
-      sessionTokenRef.current++;
-      flushingTokenRef.current = null;
+      const entry = { token, promise: stopping };
+      pendingFlushRef.current = entry;
+      const clear = () => { if (pendingFlushRef.current === entry) pendingFlushRef.current = null; };
+      void stopping.then(clear, clear);
     }
-    setListeningState(false);
-    // Commit: advance insertPos past the committed voice text
-    recordCommittedSegment();
-    insertPosRef.current += voiceLenRef.current;
-    voiceLenRef.current = 0;
-    return true;
+    return stopping;
   }, [recordCommittedSegment, setListeningState]);
 
   /**
@@ -517,6 +544,22 @@ export function VoiceOverlay({
       }
     } finally { voiceSendPendingRef.current = false; }
   }, [onSend, onClose, openReview, commitAndStop, clearRestartTimer, settleDraft]);
+
+  const endMicPress = useCallback((pointerId: number, cancelled = false) => {
+    if (micPointerRef.current !== pointerId) return;
+    micPointerRef.current = null;
+    if (holdTimerRef.current) clearTimeout(holdTimerRef.current);
+    holdTimerRef.current = null;
+    if (heldRef.current) {
+      heldRef.current = false;
+      suppressMicClickRef.current = true;
+      lastMicTapRef.current = null;
+      void commitAndStop(true);
+    } else if (cancelled) {
+      suppressMicClickRef.current = true;
+      lastMicTapRef.current = null;
+    }
+  }, [commitAndStop]);
 
   const handleReviewSend = useCallback(async () => {
     const current = reviewRef.current;
@@ -797,7 +840,32 @@ export function VoiceOverlay({
 
         <button
           class={`voice-overlay-mic${listening ? ' voice-overlay-mic-active' : ''}`}
-          onClick={handleToggle}
+          style={{ touchAction: 'none' }}
+          aria-label={t('voice.voice_input')}
+          onPointerDown={(event) => {
+            if (event.button !== 0 || micPointerRef.current !== null || notepadRef.current) return;
+            micPointerRef.current = event.pointerId;
+            suppressMicClickRef.current = false;
+            event.currentTarget.setPointerCapture?.(event.pointerId);
+            holdTimerRef.current = setTimeout(() => {
+              holdTimerRef.current = null;
+              heldRef.current = true;
+              if (!listeningRef.current) void handleToggle();
+            }, VOICE_HOLD_MS);
+          }}
+          onPointerUp={(event) => endMicPress(event.pointerId)}
+          onPointerCancel={(event) => endMicPress(event.pointerId, true)}
+          onLostPointerCapture={(event) => endMicPress(event.pointerId, true)}
+          onClick={(event) => {
+            if (suppressMicClickRef.current) { suppressMicClickRef.current = false; return; }
+            const now = Date.now();
+            const prior = lastMicTapRef.current;
+            lastMicTapRef.current = event.detail > 0 ? now : null;
+            if (event.detail > 0 && prior !== null && now - prior <= VOICE_DOUBLE_TAP_MS) {
+              lastMicTapRef.current = null;
+              void handleSend(); // Uses the existing final-drain + accepted-send guard.
+            } else { void handleToggle(); }
+          }}
         >
           <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
             {listening ? (

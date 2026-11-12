@@ -1,7 +1,7 @@
 /**
  * @vitest-environment jsdom
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen } from '@testing-library/preact';
 
 const { voiceApi, awake } = vi.hoisted(() => ({
@@ -565,5 +565,112 @@ describe('VoiceOverlay recovered notepad and the composer text', () => {
     await vi.advanceTimersByTimeAsync(150);
     fireEvent.click(screen.getByText('voice.notepad_send'));
     expect(reviewField('transcript').value).toBe('typed before\nmeeting text');
+  });
+});
+
+describe('VoiceOverlay mobile microphone gestures', () => {
+  const pointerProperties = ['onpointerdown', 'onpointerup', 'onpointercancel', 'onlostpointercapture'];
+  const descriptors = pointerProperties.map(name => Object.getOwnPropertyDescriptor(HTMLElement.prototype, name));
+  beforeAll(() => {
+    // Same browser-capability shim used by TaskPairPanelWidth: older jsdom
+    // lacks handler properties that Preact uses to lowercase pointer events.
+    for (const name of pointerProperties) Object.defineProperty(HTMLElement.prototype, name, { configurable: true, value: null });
+  });
+  afterAll(() => {
+    pointerProperties.forEach((name, index) => {
+      const descriptor = descriptors[index];
+      if (descriptor) Object.defineProperty(HTMLElement.prototype, name, descriptor);
+      else delete (HTMLElement.prototype as unknown as Record<string, unknown>)[name];
+    });
+  });
+  function mic() { return document.querySelector('.voice-overlay-mic') as HTMLButtonElement; }
+  function pointer(type: string, pointerId = 1) {
+    const event = new Event(type, { bubbles: true });
+    Object.assign(event, { pointerId, button: 0 });
+    fireEvent(mic(), event);
+  }
+  async function openVoice(onSend = vi.fn(() => 'accepted' as const)) {
+    render(<VoiceOverlay open initialText="" onSend={onSend} onClose={vi.fn()} />);
+    await vi.advanceTimersByTimeAsync(150);
+    return onSend;
+  }
+
+  it('keeps short-tap toggle and stops a long press on release without sending', async () => {
+    const send = await openVoice();
+    fireEvent.click(mic()); await vi.advanceTimersByTimeAsync(0); // pause
+    const stops = voiceApi.stopListening.mock.calls.length;
+    pointer('pointerdown');
+    await vi.advanceTimersByTimeAsync(350);
+    expect(voiceApi.startListening).toHaveBeenCalledTimes(2);
+    voiceApi.partialHandler?.('PTT final');
+    pointer('pointerup'); await vi.advanceTimersByTimeAsync(0);
+    fireEvent.click(mic(), { detail: 1 }); // synthetic release click is not a tap
+    expect(voiceApi.stopListening).toHaveBeenCalledTimes(stops + 1);
+    expect(voiceApi.startListening).toHaveBeenCalledTimes(2);
+    expect(send).not.toHaveBeenCalled();
+    expect(textarea().value).toBe('PTT final');
+  });
+
+  it('cancels an active hold safely and never turns cancellation into send', async () => {
+    const send = await openVoice();
+    pointer('pointerdown'); await vi.advanceTimersByTimeAsync(350);
+    pointer('pointerup', 2); // another finger cannot stop this hold
+    expect(voiceApi.stopListening).not.toHaveBeenCalled();
+    pointer('pointercancel'); await vi.advanceTimersByTimeAsync(0);
+    expect(voiceApi.stopListening).toHaveBeenCalledOnce();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('double-taps within 375ms, waits for the final tail and sends once', async () => {
+    const send = await openVoice();
+    let release!: () => void;
+    voiceApi.partialHandler?.('before');
+    const drained = new Promise<void>(resolve => { release = resolve; });
+    voiceApi.stopListening.mockReturnValue(drained);
+    fireEvent.click(mic(), { detail: 1 });
+    await vi.advanceTimersByTimeAsync(350);
+    fireEvent.click(mic(), { detail: 2 });
+    expect(voiceApi.stopListening).toHaveBeenCalledOnce();
+    voiceApi.partialHandler?.('before last word');
+    expect(send).not.toHaveBeenCalled();
+    release(); await vi.advanceTimersByTimeAsync(0);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledWith('before last word');
+  });
+
+  it('invalidates old flush waiters on close and never reuses them for a new recording', async () => {
+    const send = vi.fn(() => 'accepted' as const), close = vi.fn();
+    const view = render(<VoiceOverlay open initialText="" onSend={send} onClose={close} />);
+    await vi.advanceTimersByTimeAsync(150);
+    let release!: () => void;
+    voiceApi.stopListening.mockReturnValueOnce(new Promise<void>(resolve => { release = resolve; }));
+    voiceApi.partialHandler?.('old recording');
+    fireEvent.click(mic(), { detail: 1 });
+    await vi.advanceTimersByTimeAsync(350);
+    fireEvent.click(mic(), { detail: 2 });
+    fireEvent.click(screen.getByLabelText('common.close'));
+    view.rerender(<VoiceOverlay open={false} onSend={send} onClose={close} />);
+    view.rerender(<VoiceOverlay open initialText="new draft" onSend={send} onClose={close} />);
+    await vi.advanceTimersByTimeAsync(150);
+    release(); await vi.advanceTimersByTimeAsync(0);
+    expect(send).not.toHaveBeenCalled();
+    expect(textarea().value).toBe('new draft');
+    fireEvent.click(document.querySelector('.voice-overlay-send')!);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(send).toHaveBeenCalledOnce();
+    expect(send).toHaveBeenCalledWith('new draft');
+  });
+
+  it('does not send for taps outside the double-tap window or after unmount', async () => {
+    const send = await openVoice();
+    voiceApi.partialHandler?.('draft');
+    fireEvent.click(mic(), { detail: 1 });
+    await vi.advanceTimersByTimeAsync(376);
+    fireEvent.click(mic(), { detail: 2 });
+    expect(send).not.toHaveBeenCalled();
+    pointer('pointerdown'); cleanup();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(voiceApi.startListening).toHaveBeenCalledTimes(2);
+    expect(send).not.toHaveBeenCalled();
   });
 });

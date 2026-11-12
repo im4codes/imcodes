@@ -20,10 +20,11 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     private var generation: UInt64 = 0
     private var abortedOwner: UInt64 = 0
     private var eventOwner: UInt64 = 0
-    // Bounded audio work: buffer up to ~6.4s while the model finishes cold warmup.
-    private let slots = DispatchSemaphore(value: 64)
+    // One scheduled drain, not one queued decode per 100ms microphone tap.
+    private var inbox = SpeechInbox()
     private var engine: AVAudioEngine?
     private var tapInstalled = false
+    private var startingCall: CAPPluginCall? // main-thread only; ready after 100ms warmup
     // Resident recognizer model kept across sessions on worker; stream is per-capture.
     private var recognizer: SpeechRecognizer?
     // Only accessed on worker; queued PCM drains before the stop/final barrier.
@@ -91,7 +92,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                 call.reject("Offline speech model missing"); return
             }
             let owner = self.nextOwner()
-            self.lock.lock(); self.eventOwner = owner; self.lock.unlock()
+            self.lock.lock(); self.eventOwner = owner; self.inbox = SpeechInbox(); self.lock.unlock()
             // Enqueue decoder setup on the serial worker queue BEFORE starting AVAudioEngine
             // so any audio buffers captured while the model finishes warming up are queued
             // strictly behind this setup block and decoded in order without losing the first words.
@@ -118,7 +119,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
             }
             do {
                 let session = AVAudioSession.sharedInstance()
-                try session.setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker, .allowBluetooth])
+                try session.setCategory(.playAndRecord, mode: .measurement, options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth])
                 try session.setActive(true)
                 let engine = AVAudioEngine()
                 let input = engine.inputNode
@@ -135,10 +136,12 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                     self?.consume(buffer, owner: owner, converter: converter, format: mono)
                 }
                 self.tapInstalled = true
+                self.startingCall = call
                 try engine.start()
-                self.notifyListeners("listeningState", data: ["status": "started"])
-                call.resolve()
+                // consume() signals ready only after startup PCM was discarded;
+                // the UI must not invite speech during that 100ms interval.
             } catch {
+                self.startingCall = nil
                 self.lock.lock()
                 self.abortedOwner = owner
                 self.lock.unlock()
@@ -153,18 +156,8 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         lock.lock()
         defer { lock.unlock() }
         guard generation == owner else { return }
-        guard slots.wait(timeout: .now()) == .success else {
-            // Fail visibly, instead of silently dropping audio or growing memory.
-            DispatchQueue.main.async {
-                if self.isCurrent(owner) {
-                    self.notifyListeners("recognitionError", data: ["message": "Offline speech processing overloaded"])
-                    self.endCapture(nil)
-                }
-            }
-            return
-        }
         let capacity = AVAudioFrameCount(ceil(Double(buffer.frameLength) * 16000 / buffer.format.sampleRate) + 16)
-        guard let converted = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: capacity) else { slots.signal(); return }
+        guard let converted = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: capacity) else { return }
         var supplied = false
         var conversionError: NSError?
         converter.convert(to: converted, error: &conversionError) { _, status in
@@ -172,22 +165,50 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
             supplied = true; status.pointee = .haveData; return buffer
         }
         guard conversionError == nil, let channel = converted.floatChannelData?[0] else {
-            slots.signal()
             DispatchQueue.main.async {
                 if self.isCurrent(owner) { self.endCapture(nil) }
             }
             return
         }
-        let count = Int(converted.frameLength)
-        let samples = Array(UnsafeBufferPointer(start: channel, count: count))
-        let power = samples.reduce(Float(0)) { $0 + $1 * $1 }
-        let level = min(1, sqrt(power / Float(max(count, 1))) * 3)
-        notifyListeners("audioLevel", data: ["level": level])
-        worker.async {
-            defer { self.slots.signal() }
-            guard self.decoderOwner == owner, let decoder = self.decoder else { return }
+        let samples = Array(UnsafeBufferPointer(start: channel, count: Int(converted.frameLength)))
+        do {
+            let warming = inbox.warmupRemaining > 0
+            let schedule = try inbox.offer(samples)
+            if warming && inbox.warmupRemaining == 0 {
+                DispatchQueue.main.async {
+                    guard self.isCurrent(owner), let call = self.startingCall else { return }
+                    self.startingCall = nil
+                    self.notifyListeners("listeningState", data: ["status": "started"])
+                    call.resolve()
+                }
+            }
+            if schedule { worker.async { self.drain(owner: owner) } }
+        } catch {
+            // Bounded admission fails visibly; never silently discard words.
+            DispatchQueue.main.async {
+                if self.isCurrent(owner) {
+                    self.notifyListeners("recognitionError", data: ["message": "Offline speech processing overloaded"])
+                    self.endCapture(nil)
+                }
+            }
+        }
+    }
+
+    private func drain(owner: UInt64) {
+        while true {
+            lock.lock()
+            // Stop owns the entire remaining tail. Its single final barrier
+            // follows this in-flight decode on worker, without intermediate steps.
+            guard generation == owner, let batch = inbox.take() else {
+                lock.unlock(); return
+            }
+            lock.unlock()
+            guard decoderOwner == owner, let decoder = decoder else { return }
+            let power = batch.samples.reduce(Float(0)) { $0 + $1 * $1 }
+            let level = min(1, sqrt(power / Float(max(batch.samples.count, 1))) * 3)
+            notifyListeners("audioLevel", data: ["level": level])
             do {
-                try self.window.append(samples, speech: level >= 0.01, decode: decoder.decode) { text in
+                try window.append(batch.samples, speech: batch.speech, trailingSilence: batch.trailingSilence, decode: decoder.decode) { text in
                     self.emitText(text, final: false, owner: owner)
                 }
             } catch {
@@ -197,6 +218,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                         self.endCapture(nil)
                     }
                 }
+                return
             }
         }
     }
@@ -218,7 +240,13 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     @objc public func stop(_ call: CAPPluginCall) { DispatchQueue.main.async { self.endCapture(call) } }
     // Main-thread capture teardown; serial decoder flush precedes stopped and ACK.
     private func endCapture(_ call: CAPPluginCall?) {
-        let stoppingOwner = nextOwner()
+        lock.lock()
+        generation &+= 1
+        let stoppingOwner = generation
+        let tail = inbox.take()
+        lock.unlock()
+        // Stop during warmup must also settle the pending start promise.
+        startingCall?.resolve(); startingCall = nil
         if tapInstalled { engine?.inputNode.removeTap(onBus: 0); tapInstalled = false }
         engine?.stop(); engine = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
@@ -226,6 +254,9 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
             let owner = self.decoderOwner
             if let decoder = self.decoder {
                 do {
+                    if let tail = tail {
+                        try self.window.append(tail.samples, speech: tail.speech, trailingSilence: tail.trailingSilence, final: true, decode: decoder.decode) { _ in }
+                    }
                     let text = try self.window.finish(decode: decoder.decode)
                     self.emitText(text, final: true, owner: owner)
                 } catch {
@@ -262,7 +293,7 @@ private final class SpeechRecognizer {
         let strings = values.map { strdup($0) }
         defer { strings.forEach { free($0) } }
         guard strings.allSatisfy({ $0 != nil }) else { return nil }
-        var qwen = sherpaOnnxOfflineQwen3ASRModelConfig(maxTotalLen: 768, maxNewTokens: 32, temperature: 1e-6, topP: 0.8, seed: 42)
+        var qwen = sherpaOnnxOfflineQwen3ASRModelConfig(maxTotalLen: 768, maxNewTokens: 24, temperature: 1e-6, topP: 0.8, seed: 42)
         qwen.conv_frontend = UnsafePointer(strings[0]!)
         qwen.encoder = UnsafePointer(strings[1]!)
         qwen.decoder = UnsafePointer(strings[2]!)
@@ -299,9 +330,9 @@ private final class SpeechDecoder {
 // PCM, overlap anchors and each decode input stay bounded.
 struct SpeechWindow {
     static let sampleRate = 16000
-    static let stride = sampleRate // 1 second of NEW audio per partial decode
-    static let capacity = 3 * sampleRate
-    static let overlap = sampleRate
+    static let stride = sampleRate * 3 / 2 // 1.5s of NEW audio per partial decode
+    static let capacity = 3 * stride
+    static let overlap = stride
     static let rollbackCharacters = 5
     static let punctuationPause = sampleRate * 4 / 10
     static let vadPause = sampleRate * 7 / 10
@@ -324,31 +355,22 @@ struct SpeechWindow {
     private var lastEmitted = ""
     var text: String { rolling ? committed + partial : Self.join(committed, partial) }
 
-    mutating func append(_ input: [Float], speech: Bool,
+    mutating func append(_ input: [Float], speech: Bool, trailingSilence: Int = 0, final: Bool = false,
                          decode: ([Float]) -> String?, emit: (String) -> Void) throws {
-        var offset = 0
-        while offset < input.count {
-            if samples.isEmpty && !speech { return }
-            // Split even a large tap at exact scheduler boundaries, not just at
-            // capacity: cost and silence thresholds do not depend on tap size.
-            let pause = Self.endsSentence(partial) ? Self.punctuationPause : Self.vadPause
-            let untilPause = speech ? Self.capacity : max(1, pause - silentSamples)
-            let count = min(input.count - offset, Self.capacity - samples.count,
-                            Self.stride - newSamples, untilPause)
-            samples.append(contentsOf: input[offset..<(offset + count)])
-            offset += count
-            newSamples += count
-            silentSamples = speech ? 0 : silentSamples + count
-            let endpoint = silentSamples >= pause
-            if endpoint || newSamples >= Self.stride || samples.count == Self.capacity {
-                try evaluate(decode)
-                if endpoint {
-                    commitSentence()
-                } else if samples.count == Self.capacity {
-                    rollWindow()
-                }
-                if text != lastEmitted { lastEmitted = text; emit(text) }
-            }
+        guard !input.isEmpty, !samples.isEmpty || speech else { return }
+        // The inbox is bounded independently; a delayed consumer takes ALL of
+        // its current audio in one step. Never split a backlog into stride jobs.
+        samples.append(contentsOf: input)
+        newSamples += input.count
+        silentSamples = speech ? trailingSilence : silentSamples + input.count
+        guard !final else { return } // Stop merges everything into finish().
+        let pause = Self.endsSentence(partial) ? Self.punctuationPause : Self.vadPause
+        let endpoint = silentSamples >= pause
+        if endpoint || newSamples >= Self.stride || samples.count >= Self.capacity {
+            try evaluate(decode)
+            if endpoint { commitSentence() }
+            else if samples.count >= Self.capacity { rollWindow() }
+            if text != lastEmitted { lastEmitted = text; emit(text) }
         }
     }
 
@@ -477,5 +499,40 @@ struct SpeechWindow {
         let ascii = previous.unicodeScalars.last!.value < 128 && next.unicodeScalars.first!.value < 128
         let separated = previous.last!.isWhitespace || next.first!.isWhitespace
         return previous + (ascii && !separated ? " " : "") + next
+    }
+}
+
+
+/// Caller holds the capture lock. PCM ownership swaps at take(), in O(1);
+/// only copying admitted audio is O(n), bounded at 6.4s / 409,600 PCM bytes.
+struct SpeechInbox {
+    static let limit = 16000 * 64 / 10
+    private(set) var pending: [Float] = []
+    private var scheduled = false
+    private var speech = false
+    private var trailingSilence = 0
+    private(set) var warmupRemaining = 1600 // exactly 100ms at 16kHz, once per capture
+    enum Failure: Error { case overload }
+    mutating func offer(_ input: [Float]) throws -> Bool {
+        let skip = min(warmupRemaining, input.count)
+        warmupRemaining -= skip
+        let audio = input.dropFirst(skip)
+        guard !audio.isEmpty else { return false }
+        guard audio.count <= Self.limit - pending.count else { throw Failure.overload }
+        let power = audio.reduce(Float(0)) { $0 + $1 * $1 }
+        let voiced = sqrt(power / Float(audio.count)) * 3 >= 0.01
+        speech = speech || voiced
+        trailingSilence = voiced ? 0 : trailingSilence + audio.count
+        pending.append(contentsOf: audio)
+        if scheduled { return false }
+        scheduled = true
+        return true
+    }
+    struct Batch { let samples: [Float]; let speech: Bool; let trailingSilence: Int }
+    mutating func take() -> Batch? {
+        guard !pending.isEmpty else { scheduled = false; return nil }
+        let batch = Batch(samples: pending, speech: speech, trailingSilence: trailingSilence)
+        pending = []; speech = false; trailingSilence = 0
+        return batch
     }
 }

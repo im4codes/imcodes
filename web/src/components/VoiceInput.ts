@@ -99,6 +99,16 @@ async function removeRecognitionListeners(): Promise<void> {
   ]);
 }
 
+/** Pause app-owned playback before activating a recording audio session. This
+ * avoids a simultaneous playback/record route transition; never change the
+ * system volume or attempt to control other apps. Resumption is user-owned. */
+function pauseBackgroundAudio(): void {
+  for (const media of document.querySelectorAll<HTMLMediaElement>('audio, video')) {
+    try { if (!media.paused) media.pause(); } catch { /* best effort */ }
+  }
+  try { globalThis.speechSynthesis?.cancel(); } catch { /* unsupported */ }
+}
+
 async function startListeningInternal(generation: number): Promise<boolean> {
   const locale = pickLocale();
   const session = { recognition: getNativeSpeechRecognition(), text: null as string | null, final: false };
@@ -155,6 +165,7 @@ async function startListeningInternal(generation: number): Promise<boolean> {
       if (_nativeSession === session) _nativeSession = null;
       return false;
     }
+    pauseBackgroundAudio();
     await recognition.start({
       language: locale,
       partialResults: true,
@@ -202,10 +213,13 @@ function stopWebLevelMeter(): void {
 
 /** Best-effort waveform levels via Web Audio. Failure must not break recognition. */
 async function startWebLevelMeter(generation: number): Promise<void> {
+  // Transcript ownership intentionally survives Stop until final/onend, but
+  // microphone/RAF ownership ends immediately when capture stops.
+  const isCapturing = (): boolean => generation === _generation && _listening;
   try {
-    if (!navigator.mediaDevices?.getUserMedia) return;
+    if (!isCapturing() || !navigator.mediaDevices?.getUserMedia) return;
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    if (generation !== _generation) {
+    if (!isCapturing()) {
       stream.getTracks().forEach((t) => t.stop());
       return;
     }
@@ -220,7 +234,7 @@ async function startWebLevelMeter(generation: number): Promise<void> {
     source.connect(analyser);
     const data = new Uint8Array(analyser.frequencyBinCount);
     const tick = (): void => {
-      if (generation !== _generation) return;
+      if (!isCapturing()) return;
       analyser.getByteTimeDomainData(data);
       let sum = 0;
       for (let i = 0; i < data.length; i++) {
@@ -229,7 +243,7 @@ async function startWebLevelMeter(generation: number): Promise<void> {
       }
       const rms = Math.sqrt(sum / data.length);
       _onLevel?.(Math.min(1, rms * 3));
-      _webLevelRAF = requestAnimationFrame(tick);
+      if (isCapturing()) _webLevelRAF = requestAnimationFrame(tick);
     };
     _webLevelRAF = requestAnimationFrame(tick);
   } catch { /* no level meter; recognition still works */ }
@@ -280,6 +294,7 @@ function startWebListening(): boolean {
       stopWebLevelMeter();
     };
     _webRec = rec;
+    pauseBackgroundAudio();
     rec.start();
     setListening(true);
     void startWebLevelMeter(generation);
@@ -291,21 +306,41 @@ function startWebListening(): boolean {
   }
 }
 
-function stopWebListening(): void {
-  _generation++;
+/** Stop-only deadline: browser engines may omit onend on device failure.
+ * Never applied to an active recording and never used as a 60s duration cap. */
+const WEB_FINAL_DRAIN_MS = 2000;
+function stopWebListening(): Promise<void> {
   setListening(false);
   stopWebLevelMeter();
   const rec = _webRec;
-  _webRec = null;
-  if (rec) {
-    try {
+  if (!rec) { _generation++; return Promise.resolve(); }
+  return new Promise((resolve) => {
+    let finished = false;
+    const finish = (): void => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      stopWebLevelMeter();
       rec.onend = null;
       rec.onresult = null;
       rec.onerror = null;
-      rec.stop();
-      rec.abort?.();
-    } catch { /* best effort */ }
-  }
+      if (_webRec === rec) _webRec = null;
+      _generation++;
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      console.warn('[voice] web final drain timed out');
+      finish();
+      try { rec.abort?.(); } catch { /* already ended */ }
+    }, WEB_FINAL_DRAIN_MS);
+    // Keep onresult and its generation alive until onend: stop() asks the
+    // browser for the remaining final hypothesis, abort() would discard it.
+    rec.onend = finish;
+    try { rec.stop(); } catch {
+      finish();
+      try { rec.abort?.(); } catch { /* already ended */ }
+    }
+  });
 }
 
 export async function startListening(
@@ -315,6 +350,7 @@ export async function startListening(
   if (!isAvailable()) return false;
 
   if (!isNative()) {
+    if (_pendingStop) await _pendingStop;
     _onResult = onResult;
     _onListeningChange = onListeningChange ?? null;
     if (_listening) {
@@ -354,8 +390,11 @@ export async function stopListening(): Promise<void> {
   if (!isAvailable()) return;
 
   if (!isNative()) {
-    stopWebListening();
-    forgetRecognitionCallbacks();
+    if (_pendingStop) return _pendingStop;
+    const stopping = stopWebListening().then(() => { forgetRecognitionCallbacks(); });
+    _pendingStop = stopping;
+    try { await stopping; }
+    finally { if (_pendingStop === stopping) _pendingStop = null; }
     return;
   }
 
