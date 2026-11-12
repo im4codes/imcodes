@@ -20,7 +20,10 @@ import {
   PUSH_PLATFORM_IOS,
   PUSH_PLATFORM_ANDROID_FCM,
   PUSH_PLATFORM_ANDROID_JPUSH,
+  DEFAULT_PUSH_NOTIFICATION_TYPES,
+  isPushNotificationType,
   type PushPlatform,
+  type PushNotificationType,
 } from '@shared/push-notifications.js';
 
 let pushSupported = false;
@@ -202,6 +205,129 @@ function handleNotificationOpen(data: Record<string, string> | undefined): void 
   requestAnimationFrame(() => requestAnimationFrame(fireRefresh));
 }
 
+export const PUSH_NOTIFICATION_PREFERENCES_KEY = 'imcodes.push_notification_preferences';
+
+let currentEditGeneration = 0;
+let lastSyncedGeneration = 0;
+let syncQueue: Promise<void> = Promise.resolve();
+let pendingSync: { types: PushNotificationType[]; generation: number } | null = null;
+
+export function hasUnsyncedPushNotificationEdits(): boolean {
+  if (pendingSync !== null) return true;
+  if (currentEditGeneration > lastSyncedGeneration) {
+    try {
+      if (typeof localStorage !== 'undefined' && localStorage.getItem(PUSH_NOTIFICATION_PREFERENCES_KEY) === null) {
+        currentEditGeneration = 0;
+        lastSyncedGeneration = 0;
+        return false;
+      }
+    } catch {
+      // ignore
+    }
+    return true;
+  }
+  return false;
+}
+
+export function getLastSyncedPushNotificationGeneration(): number {
+  return lastSyncedGeneration;
+}
+
+export function resetPushNotificationPreferencesStateForTesting(): void {
+  currentEditGeneration = 0;
+  lastSyncedGeneration = 0;
+  pendingSync = null;
+  syncQueue = Promise.resolve();
+}
+
+export function getLocalPushNotificationPreferences(): PushNotificationType[] {
+  try {
+    const raw = localStorage.getItem(PUSH_NOTIFICATION_PREFERENCES_KEY);
+    if (raw !== null) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return parsed.filter(isPushNotificationType);
+      }
+    }
+  } catch {
+    // fallback
+  }
+  return [...DEFAULT_PUSH_NOTIFICATION_TYPES];
+}
+
+export function setLocalPushNotificationPreferences(types: PushNotificationType[]): void {
+  try {
+    localStorage.setItem(PUSH_NOTIFICATION_PREFERENCES_KEY, JSON.stringify(types));
+  } catch {
+    // ignore
+  }
+}
+
+export function recordLocalPushNotificationEdit(types: PushNotificationType[]): number {
+  currentEditGeneration++;
+  setLocalPushNotificationPreferences(types);
+  return currentEditGeneration;
+}
+
+export function getCurrentPushNotificationEditGeneration(): number {
+  return currentEditGeneration;
+}
+
+export async function fetchPushNotificationPreferences(): Promise<PushNotificationType[] | null> {
+  const startGen = currentEditGeneration;
+  const wasDirtyAtStart = hasUnsyncedPushNotificationEdits();
+  try {
+    const res = await apiFetch<{ ok: boolean; types: PushNotificationType[] }>('/api/push/preferences');
+    if (res?.ok && Array.isArray(res.types)) {
+      const valid = res.types.filter(isPushNotificationType);
+      // Guard against:
+      // 1. Reads initiated while dirty (un-ACKed/pending local edits) - cannot be upgraded by subsequent ACK;
+      // 2. Reads arriving after newer local edits were made;
+      // 3. Reads completing while local state is currently dirty.
+      if (wasDirtyAtStart || currentEditGeneration > startGen || hasUnsyncedPushNotificationEdits()) {
+        return null;
+      }
+      setLocalPushNotificationPreferences(valid);
+      return valid;
+    }
+  } catch (err) {
+    console.warn('Failed to fetch remote push notification preferences:', err);
+  }
+  return null;
+}
+
+export async function syncPushNotificationPreferences(types: PushNotificationType[]): Promise<void> {
+  const gen = recordLocalPushNotificationEdit(types);
+  pendingSync = { types, generation: gen };
+
+  syncQueue = syncQueue.then(async () => {
+    if (!pendingSync || lastSyncedGeneration >= pendingSync.generation) return;
+    const targetGen = pendingSync.generation;
+    const toSend = pendingSync.types;
+    try {
+      const res = await apiFetch<{ ok?: boolean }>('/api/push/preferences', {
+        method: 'POST',
+        body: JSON.stringify({ types: toSend }),
+      });
+      if (res && res.ok !== false) {
+        if (lastSyncedGeneration < targetGen) {
+          lastSyncedGeneration = targetGen;
+        }
+        if (pendingSync && pendingSync.generation <= targetGen) {
+          pendingSync = null;
+        }
+      } else {
+        throw new Error('Push preferences update failed');
+      }
+    } catch (err) {
+      console.warn('Failed to sync push notification preferences:', err);
+      // Do NOT clear pendingSync on failure, retaining dirty state for subsequent sync/read guards
+    }
+  });
+
+  await syncQueue;
+}
+
 async function registerDeviceToken(
   token: string,
   platform: PushPlatform,
@@ -209,13 +335,14 @@ async function registerDeviceToken(
   cfWorkerUrl: string,
 ): Promise<void> {
   try {
+    const notificationTypes = getLocalPushNotificationPreferences();
     await fetch(`${cfWorkerUrl}/api/push/register`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ token, platform }),
+      body: JSON.stringify({ token, platform, notificationTypes }),
     });
   } catch (err) {
     console.warn('Failed to register push token:', err);

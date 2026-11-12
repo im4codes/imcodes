@@ -1,6 +1,7 @@
 import { isTerminalTaskPairStatus } from '../../../shared/task-pair.js';
 import { TASK_PAIR_DEPENDENCY_GRAPH_LIMIT, TASK_PAIR_MAX_DEPENDENCIES, type TaskPairScheduling } from '../../../shared/task-pair-suspension.js';
 import { getTaskPairStore } from './store.js';
+import { emitTaskPairTimelineEvent } from './service.js';
 
 /** IDs resolve only inside the caller's existing project; no session-name or cross-owner inference. */
 export function validatePairDependencies(project: string, taskId: string, input: unknown): string[] {
@@ -36,6 +37,20 @@ export function pausePair(project: string, taskId: string, writer: string, mode:
   const next: TaskPairScheduling = { epoch: (prev?.epoch ?? 0) + 1, manual, dependsOn: deps, resumePending: !manual && deps.length === 0, since: Date.now(), writer, ...(note ? { note } : {}) };
   const saved = store.patchScheduling(project, taskId, prev, next, Date.now());
   if (!saved) throw new Error('pair changed; retry pause');
+  try {
+    emitTaskPairTimelineEvent({
+      taskId: saved.state.taskId,
+      writer,
+      role: 'brain',
+      source: 'daemon',
+      verb: 'PAUSE',
+      effect: 'scheduled',
+      unusual: false,
+      ...(note ? { noticeText: note } : {}),
+    }, saved.state, `pause:${saved.state.taskId}:${next.epoch}`);
+  } catch {
+    // observers never break pause
+  }
   return saved;
 }
 export function resumePair(project: string, taskId: string, writer: string) {

@@ -2184,7 +2184,28 @@
         "target_not_found": "session not found",
         "destroy_forbidden": "not allowed"
       }
-    }
+    },
+    "push_notifications_label": "Push Notifications",
+    "push_notifications_title": "Push Notification Preferences",
+    "push_notifications_desc": "Customize the types of push notifications you receive on mobile devices. Changes are saved immediately to this device and synced with the server.",
+    "push_group_basic": "Basic Notifications",
+    "push_task_complete_title": "Task Complete / Session Idle",
+    "push_task_complete_desc": "Send push notification when a session finishes execution or becomes idle",
+    "push_waiting_input_title": "Waiting for User Input / Question",
+    "push_waiting_input_desc": "Send notification when an Agent asks a question and is waiting for your response or confirmation",
+    "push_session_error_title": "Session Errors & Exceptions",
+    "push_session_error_desc": "Send notification when an uncaught critical error or exception occurs during execution",
+    "push_group_task_pair": "Task Lifecycle",
+    "push_task_pair_done_title": "Task Done (DONE)",
+    "push_task_pair_done_desc": "Notify when a task pair is accepted and completed (default ON)",
+    "push_task_pair_paused_title": "Task Paused / Awaiting Decision (PAUSED)",
+    "push_task_pair_paused_desc": "Notify when a task pair is paused or waiting for manual / Brain decision (default ON)",
+    "push_task_pair_audit_title": "Audit & Intermediate Steps (Audit & Rework)",
+    "push_task_pair_audit_desc": "Intermediate steps like READY, PASS, and REWORK (default OFF, enable as needed)",
+    "push_group_security": "Security Alerts",
+    "push_security_highest_badge": "Highest Security Alert",
+    "push_remote_desktop_title": "Remote Desktop Auto-Unlock Alert",
+    "push_remote_desktop_desc": "Alerts when credentials are used for remote desktop auto-unlock. Highest severity alert; strongly recommended to keep enabled."
   },
   "capabilities": {
     "eyebrow": "Portable AI capabilities",

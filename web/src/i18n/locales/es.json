@@ -2184,7 +2184,28 @@
         "target_not_found": "sesión no encontrada",
         "destroy_forbidden": "no permitido"
       }
-    }
+    },
+    "push_notifications_label": "Notificaciones push",
+    "push_notifications_title": "Preferencias de notificaciones push",
+    "push_notifications_desc": "Personaliza los tipos de notificaciones push que recibes en dispositivos móviles. Los cambios se guardan inmediatamente en este dispositivo y se sincronizan con el servidor.",
+    "push_group_basic": "Notificaciones básicas",
+    "push_task_complete_title": "Tarea completada / Sesión inactiva",
+    "push_task_complete_desc": "Enviar notificación push cuando una sesión finaliza su ejecución o pasa a estar inactiva",
+    "push_waiting_input_title": "Esperando entrada de usuario / Pregunta",
+    "push_waiting_input_desc": "Enviar notificación cuando un Agent hace una pregunta y está esperando tu respuesta o confirmación",
+    "push_session_error_title": "Errores y excepciones de sesión",
+    "push_session_error_desc": "Enviar notificación cuando ocurra un error crítico o excepción durante la ejecución",
+    "push_group_task_pair": "Ciclo de vida de tareas",
+    "push_task_pair_done_title": "Tarea finalizada (DONE)",
+    "push_task_pair_done_desc": "Notificar cuando una tarea sea aceptada y completada (activado por defecto)",
+    "push_task_pair_paused_title": "Tarea pausada / Esperando decisión (PAUSED)",
+    "push_task_pair_paused_desc": "Notificar cuando una tarea esté pausada o esperando decisión manual / de Brain (activado por defecto)",
+    "push_task_pair_audit_title": "Auditoría y pasos intermedios (Audit & Rework)",
+    "push_task_pair_audit_desc": "Pasos intermedios como READY, PASS y REWORK (desactivado por defecto, activar según sea necesario)",
+    "push_group_security": "Alertas de seguridad",
+    "push_security_highest_badge": "Alerta de máxima seguridad",
+    "push_remote_desktop_title": "Aviso de desbloqueo automático de escritorio remoto",
+    "push_remote_desktop_desc": "Alerta cuando se utilizan credenciales para el desbloqueo automático de escritorio remoto. Alerta de máxima seguridad; se recomienda encarecidamente mantener activada."
   },
   "capabilities": {
     "eyebrow": "Capacidades de IA portátiles",

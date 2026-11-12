@@ -376,7 +376,19 @@ import { addCounter, incrementCounter, snapshotCounters } from '../util/metrics.
 import { logAudit } from '../security/audit.js';
 import { pickReadableSessionDisplay } from '../../../shared/session-display.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
-import { PUSH_TIMELINE_EVENT_MAX_AGE_MS, TIMELINE_SUPPRESS_PUSH_FIELD } from '../../../shared/push-notifications.js';
+import {
+  PUSH_TIMELINE_EVENT_MAX_AGE_MS,
+  TIMELINE_SUPPRESS_PUSH_FIELD,
+  PUSH_NOTIFICATION_TYPE_TASK_COMPLETE,
+  PUSH_NOTIFICATION_TYPE_WAITING_INPUT,
+  PUSH_NOTIFICATION_TYPE_SESSION_ERROR,
+  PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE,
+  PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED,
+  PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT,
+  classifyTaskPairNotificationType,
+  type PushNotificationType,
+} from '../../../shared/push-notifications.js';
+import { TASK_PAIR_TIMELINE_EVENT } from '../../../shared/task-pair.js';
 import { isServerLinkResyncStatePayload } from '../../../shared/session-activity-types.js';
 import {
   DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION,
@@ -6572,6 +6584,17 @@ export class WsBridge {
               eventId: event.eventId,
               eventTs: event.ts,
             });
+          }
+          // task_pair.event for task lifecycle push notifications (DONE, PAUSED, AUDIT)
+          if (event?.type === TASK_PAIR_TIMELINE_EVENT || event?.type === 'task_pair.event') {
+            const payload = (event.payload && typeof event.payload === 'object')
+              ? (event.payload as Record<string, unknown>)
+              : {};
+            const eventTs = typeof event.ts === 'number' ? event.ts : undefined;
+            if (eventTs && Date.now() - eventTs > PUSH_TIMELINE_EVENT_MAX_AGE_MS) return;
+            this.dispatchTaskPairPush(db, env, event.sessionId ? String(event.sessionId) : '', payload, event.eventId as string | undefined, eventTs).catch((err) =>
+              logger.error({ err }, 'Task pair push dispatch failed'),
+            );
           }
         }
       }
@@ -14008,19 +14031,23 @@ export class WsBridge {
     let title: string;
     let body: string;
     let assistantEventId: string | undefined;
+    let pushType: PushNotificationType;
     switch (eventType) {
       case 'session.idle':
         title = titleParts.join(' · ');
         ({ text: body, eventId: assistantEventId } = this.resolveLatestAssistantForPush(sessionName, daemonLastText));
         body = body || 'Task complete — ready for input';
+        pushType = PUSH_NOTIFICATION_TYPE_TASK_COMPLETE;
         break;
       case 'session.error':
         title = titleParts.join(' · ');
         body = `Error: ${String(msg.error ?? 'unknown')}`;
+        pushType = PUSH_NOTIFICATION_TYPE_SESSION_ERROR;
         break;
       case 'ask.question':
         title = titleParts.join(' · ');
         body = this.extractAskQuestionBody(msg) || 'Waiting for your answer';
+        pushType = PUSH_NOTIFICATION_TYPE_WAITING_INPUT;
         break;
       default:
         return;
@@ -14039,7 +14066,112 @@ export class WsBridge {
         userId: server.user_id,
         title,
         body,
+        type: pushType,
         data: { serverId: this.serverId, session: sessionName, type: eventType },
+      }, env);
+      this.deliveredPushKeys.set(pushKey, now);
+    } finally {
+      this.inFlightPushKeys.delete(pushKey);
+    }
+  }
+
+  private async dispatchTaskPairPush(
+    db: Database,
+    env: Env,
+    sessionName: string,
+    payload: Record<string, unknown>,
+    eventId?: string,
+    eventTs?: number,
+  ): Promise<void> {
+    const server = await db.queryOne<{ user_id: string; name: string }>('SELECT user_id, name FROM servers WHERE id = $1', [this.serverId]);
+    if (!server) return;
+
+    for (const mobileWs of this.mobileSockets) {
+      if (mobileWs.readyState !== WebSocket.OPEN) continue;
+      if (this.browserUserIds.get(mobileWs) !== server.user_id) continue;
+      return;
+    }
+
+    const { dispatchPush } = await import('../routes/push.js').catch((err) => {
+      logger.error({ err }, 'Failed to import push module — push notifications disabled');
+      return { dispatchPush: null };
+    });
+    if (!dispatchPush) return;
+
+    const taskId = String(payload.taskId ?? '');
+    if (!taskId) return;
+
+    const unusual = Boolean(payload.unusual);
+    const verb = typeof payload.verb === 'string' ? payload.verb : undefined;
+    const effect = typeof payload.effect === 'string' ? payload.effect : undefined;
+    const fromStatus = typeof payload.fromStatus === 'string' ? payload.fromStatus : undefined;
+    const toStatus = typeof payload.toStatus === 'string' ? payload.toStatus : undefined;
+    const scheduling = (payload.scheduling && typeof payload.scheduling === 'object')
+      ? (payload.scheduling as { manual?: boolean; epoch?: number; dependsOn?: string[] })
+      : undefined;
+
+    const notifType = classifyTaskPairNotificationType({
+      verb,
+      toStatus,
+      fromStatus,
+      effect,
+      unusual,
+      scheduling,
+    });
+    if (!notifType) return;
+
+    const taskTitle = typeof payload.title === 'string' && payload.title.trim() ? payload.title.trim() : taskId;
+    const titleParts = [server.name, taskTitle];
+    const title = titleParts.join(' · ');
+
+    let body = '';
+    if (notifType === PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE) {
+      body = `任务完成 (DONE) · ${taskTitle}`;
+    } else if (notifType === PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED) {
+      body = `任务暂停 / 等待决策 (PAUSED) · ${taskTitle}`;
+    } else if (notifType === PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT) {
+      const v = (verb ?? '').toUpperCase();
+      const s = (toStatus ?? '').toLowerCase();
+      if (v === 'REWORK' || s === 'rework') {
+        body = `任务返工 (REWORK) · ${taskTitle}`;
+      } else if (v === 'PASS' || s === 'passed') {
+        body = `任务审计通过 (PASS) · ${taskTitle}`;
+      } else {
+        body = `任务审计中 (READY_FOR_AUDIT) · ${taskTitle}`;
+      }
+    }
+
+    const round = typeof payload.round === 'number' ? payload.round : 0;
+    let transitionIdentity = '';
+    if (notifType === PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE) {
+      transitionIdentity = `done:${round}`;
+    } else if (notifType === PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED) {
+      const epoch = typeof scheduling?.epoch === 'number' ? scheduling.epoch : round;
+      transitionIdentity = `paused:${epoch}`;
+    } else if (notifType === PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT) {
+      const v = (verb ?? '').toUpperCase();
+      const s = (toStatus ?? '').toLowerCase();
+      const stage = (v === 'REWORK' || s === 'rework')
+        ? 'rework'
+        : (v === 'PASS' || s === 'passed')
+          ? 'pass'
+          : 'ready';
+      transitionIdentity = `audit_${stage}:${round}`;
+    }
+
+    // Stable transition identity deduplication across executor / auditor / Brain copies
+    const pushKey = `task_pair:${taskId}:${notifType}:${transitionIdentity}`;
+    const now = Date.now();
+    if (this.wasPushDelivered(pushKey, now)) return;
+
+    this.inFlightPushKeys.add(pushKey);
+    try {
+      await dispatchPush({
+        userId: server.user_id,
+        title,
+        body,
+        type: notifType,
+        data: { serverId: this.serverId, taskId, type: notifType },
       }, env);
       this.deliveredPushKeys.set(pushKey, now);
     } finally {

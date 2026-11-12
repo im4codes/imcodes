@@ -4,6 +4,10 @@ import type { PushPayload } from '../routes/push.js';
 import type { RemoteDesktopAutoUnlockEvent } from '../ws/remote-desktop-router.js';
 import { REMOTE_DESKTOP_AUDIT_EVENT } from '../../../shared/remote-desktop.js';
 import { REMOTE_DESKTOP_ACTOR_SOURCE } from '../../../shared/remote-desktop-access.js';
+import {
+  PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP,
+  REMOTE_DESKTOP_ALERT_PREFIX,
+} from '../../../shared/push-notifications.js';
 import logger from '../util/logger.js';
 
 export interface RemoteDesktopAutoUnlockNotifierDeps {
@@ -62,8 +66,9 @@ export async function notifyRemoteDesktopAutoUnlock(
       ?? (await import('../routes/push.js')).dispatchPush as (payload: PushPayload, db: Database, env: Env) => Promise<void>;
     await dispatch({
       userId: server.user_id,
-      title: 'Remote desktop auto unlock',
-      body: `${machine} was unlocked by auto unlock for ${await actorLabel(db, event)}.`,
+      title: `${REMOTE_DESKTOP_ALERT_PREFIX}远程桌面自动解锁`,
+      body: `[🚨 最高安全警示] ${machine} was unlocked by auto unlock for ${await actorLabel(db, event)}.`,
+      type: PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP,
       data: { serverId: event.serverId, type: REMOTE_DESKTOP_AUDIT_EVENT.AUTO_UNLOCK_SUCCEEDED },
     }, db, env);
     return true;
