@@ -1184,6 +1184,8 @@ export interface OnlyOfficeCommitJournalRow {
   target_hash: string;
   session_epoch: number;
   phase: string;
+  owner_token?: string;
+  expected_seq?: number;
   updated_at: number;
 }
 
@@ -1255,19 +1257,274 @@ export async function deleteOnlyOfficeRoomRecord(
   );
 }
 
+export interface CommitClaimParams {
+  serverId: string;
+  normalizedPath: string;
+  expectedKey: string;
+  expectedEpoch: number;
+  expectedSeq: number;
+  targetHash: string;
+  ownerToken: string;
+  now?: number;
+  leaseMs?: number;
+}
+
+export async function claimOnlyOfficeCommitOwner(
+  db: Database,
+  params: CommitClaimParams,
+): Promise<{ ok: true } | { ok: false; reason: 'conflict' | 'stale_version' | 'held_by_other_owner' }> {
+  const now = params.now ?? Date.now();
+  const leaseMs = params.leaseMs ?? 30000;
+
+  if (typeof (db as any).transaction === 'function') {
+    return await (db as any).transaction(async (tx: Database) => {
+      const room = await tx.queryOne<OnlyOfficeRoomRow>(
+        `SELECT * FROM onlyoffice_rooms WHERE server_id = $1 AND normalized_path = $2 FOR UPDATE`,
+        [params.serverId, params.normalizedPath],
+      );
+      if (room) {
+        if (
+          Number(room.session_epoch) !== params.expectedEpoch ||
+          Number(room.commit_seq) !== params.expectedSeq ||
+          room.active_key !== params.expectedKey
+        ) {
+          return { ok: false, reason: 'stale_version' };
+        }
+      }
+
+      const journal = await tx.queryOne<OnlyOfficeCommitJournalRow>(
+        `SELECT * FROM onlyoffice_commit_journal WHERE server_id = $1 AND normalized_path = $2 FOR UPDATE`,
+        [params.serverId, params.normalizedPath],
+      );
+      if (journal) {
+        const jOwner = journal.owner_token || (journal.phase?.startsWith('intent:') ? journal.phase.slice(7) : '');
+        const isExpired = now - Number(journal.updated_at) > leaseMs;
+        if (jOwner && jOwner !== params.ownerToken && !isExpired) {
+          return { ok: false, reason: 'held_by_other_owner' };
+        }
+      }
+
+      await tx.execute(
+        `INSERT INTO onlyoffice_commit_journal (
+           server_id, normalized_path, room_key, target_hash, session_epoch, phase, owner_token, expected_seq, updated_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (server_id, normalized_path) DO UPDATE SET
+           room_key = EXCLUDED.room_key,
+           target_hash = EXCLUDED.target_hash,
+           session_epoch = EXCLUDED.session_epoch,
+           phase = EXCLUDED.phase,
+           owner_token = EXCLUDED.owner_token,
+           expected_seq = EXCLUDED.expected_seq,
+           updated_at = EXCLUDED.updated_at`,
+        [
+          params.serverId,
+          params.normalizedPath,
+          params.expectedKey,
+          params.targetHash,
+          params.expectedEpoch,
+          `intent:${params.ownerToken}`,
+          params.ownerToken,
+          params.expectedSeq,
+          now,
+        ],
+      );
+      return { ok: true };
+    });
+  }
+
+  // Fallback for non-transactional database mocks
+  const room = await getOnlyOfficeRoomRecord(db, params.serverId, params.normalizedPath);
+  if (room) {
+    if (
+      Number(room.session_epoch) !== params.expectedEpoch ||
+      Number(room.commit_seq) !== params.expectedSeq ||
+      room.active_key !== params.expectedKey
+    ) {
+      return { ok: false, reason: 'stale_version' };
+    }
+  }
+
+  const journal = await getOnlyOfficeCommitJournalRecord(db, params.serverId, params.normalizedPath);
+  if (journal) {
+    const jOwner = journal.owner_token || (journal.phase?.startsWith('intent:') ? journal.phase.slice(7) : '');
+    const isExpired = now - Number(journal.updated_at) > leaseMs;
+    if (jOwner && jOwner !== params.ownerToken && !isExpired) {
+      return { ok: false, reason: 'held_by_other_owner' };
+    }
+  }
+
+  await recordOnlyOfficeCommitJournalRecord(db, {
+    server_id: params.serverId,
+    normalized_path: params.normalizedPath,
+    room_key: params.expectedKey,
+    target_hash: params.targetHash,
+    session_epoch: params.expectedEpoch,
+    phase: `intent:${params.ownerToken}`,
+    owner_token: params.ownerToken,
+    expected_seq: params.expectedSeq,
+    updated_at: now,
+  });
+
+  // Verify room didn't advance and exclusive journal claim was acquired
+  const verifyRoom = await getOnlyOfficeRoomRecord(db, params.serverId, params.normalizedPath);
+  if (verifyRoom) {
+    if (
+      Number(verifyRoom.commit_seq) !== params.expectedSeq ||
+      Number(verifyRoom.session_epoch) !== params.expectedEpoch ||
+      verifyRoom.active_key !== params.expectedKey
+    ) {
+      await releaseOnlyOfficeCommitClaim(db, params.serverId, params.normalizedPath, params.ownerToken);
+      return { ok: false, reason: 'stale_version' };
+    }
+  }
+
+  const verifyJournal = await getOnlyOfficeCommitJournalRecord(db, params.serverId, params.normalizedPath);
+  if (
+    !verifyJournal ||
+    (verifyJournal.owner_token && verifyJournal.owner_token !== params.ownerToken) ||
+    (verifyJournal.phase && !verifyJournal.phase.includes(params.ownerToken) && verifyJournal.phase !== 'intent')
+  ) {
+    await releaseOnlyOfficeCommitClaim(db, params.serverId, params.normalizedPath, params.ownerToken);
+    return { ok: false, reason: 'held_by_other_owner' };
+  }
+
+  return { ok: true };
+}
+
+export async function commitOnlyOfficeRoom(
+  db: Database,
+  params: {
+    serverId: string;
+    normalizedPath: string;
+    ownerToken: string;
+    expectedSeq: number;
+    expectedEpoch: number;
+    newState: {
+      currentConfirmedHash?: string;
+      committedHash?: string;
+      lastForceSavedHash?: string | null;
+      activeKey: string;
+      sessionEpoch: number;
+      commitSeq: number;
+      active?: boolean;
+      updatedAt: number;
+    };
+  },
+): Promise<{ ok: boolean; changes: number }> {
+  const executeCommit = async (tx: Database) => {
+    const confirmedHash = params.newState.currentConfirmedHash ?? '';
+    const committedHash = params.newState.committedHash ?? '';
+    const isActive = params.newState.active !== false;
+
+    // 1. Conditional update on onlyoffice_rooms: require exact expected commit_seq
+    const updateRes = await tx.execute(
+      `UPDATE onlyoffice_rooms SET
+         current_confirmed_hash = $3,
+         committed_hash = $4,
+         last_force_saved_hash = $5,
+         active_key = $6,
+         session_epoch = $7,
+         commit_seq = $8,
+         active = $9,
+         updated_at = $10
+       WHERE server_id = $1 AND normalized_path = $2
+         AND commit_seq = $11 AND session_epoch = $12`,
+      [
+        params.serverId,
+        params.normalizedPath,
+        confirmedHash,
+        committedHash,
+        params.newState.lastForceSavedHash,
+        params.newState.activeKey,
+        params.newState.sessionEpoch,
+        params.newState.commitSeq,
+        isActive,
+        params.newState.updatedAt,
+        params.expectedSeq,
+        params.expectedEpoch,
+      ],
+    );
+
+    if (updateRes.changes === 0) {
+      // Room row did not exist or commit_seq diverged (concurrent commit occurred)
+      const existing = await getOnlyOfficeRoomRecord(tx, params.serverId, params.normalizedPath);
+      if (!existing) {
+        // First room creation insert if absent
+        const insRes = await tx.execute(
+          `INSERT INTO onlyoffice_rooms (
+             server_id, normalized_path, current_confirmed_hash, committed_hash,
+             last_force_saved_hash, active_key, session_epoch, commit_seq, active, updated_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+           ON CONFLICT DO NOTHING`,
+          [
+            params.serverId,
+            params.normalizedPath,
+            confirmedHash,
+            committedHash,
+            params.newState.lastForceSavedHash,
+            params.newState.activeKey,
+            params.newState.sessionEpoch,
+            params.newState.commitSeq,
+            isActive,
+            params.newState.updatedAt,
+          ],
+        );
+        if (insRes.changes === 0) {
+          return { ok: false, changes: 0 };
+        }
+      } else {
+        return { ok: false, changes: 0 };
+      }
+    }
+
+    // 2. Delete journal record only for this owner
+    await releaseOnlyOfficeCommitClaim(tx, params.serverId, params.normalizedPath, params.ownerToken);
+
+    return { ok: true, changes: 1 };
+  };
+
+  if (typeof (db as any).transaction === 'function') {
+    return await (db as any).transaction(executeCommit);
+  }
+  return await executeCommit(db);
+}
+
+export async function releaseOnlyOfficeCommitClaim(
+  db: Database,
+  serverId: string,
+  normalizedPath: string,
+  ownerToken?: string,
+): Promise<void> {
+  if (ownerToken) {
+    await db.execute(
+      `DELETE FROM onlyoffice_commit_journal
+       WHERE server_id = $1 AND normalized_path = $2
+         AND (owner_token = $3 OR phase = $4 OR phase LIKE $5)`,
+      [serverId, normalizedPath, ownerToken, `intent:${ownerToken}`, `%${ownerToken}%`],
+    );
+  } else {
+    await db.execute(
+      `DELETE FROM onlyoffice_commit_journal WHERE server_id = $1 AND normalized_path = $2`,
+      [serverId, normalizedPath],
+    );
+  }
+}
+
 export async function recordOnlyOfficeCommitJournalRecord(
   db: Database,
   entry: OnlyOfficeCommitJournalRow,
 ): Promise<void> {
   await db.execute(
     `INSERT INTO onlyoffice_commit_journal (
-       server_id, normalized_path, room_key, target_hash, session_epoch, phase, updated_at
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+       server_id, normalized_path, room_key, target_hash, session_epoch, phase, owner_token, expected_seq, updated_at
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
      ON CONFLICT (server_id, normalized_path) DO UPDATE SET
        room_key = EXCLUDED.room_key,
        target_hash = EXCLUDED.target_hash,
        session_epoch = EXCLUDED.session_epoch,
        phase = EXCLUDED.phase,
+       owner_token = EXCLUDED.owner_token,
+       expected_seq = EXCLUDED.expected_seq,
        updated_at = EXCLUDED.updated_at`,
     [
       entry.server_id,
@@ -1276,6 +1533,8 @@ export async function recordOnlyOfficeCommitJournalRecord(
       entry.target_hash,
       entry.session_epoch,
       entry.phase || 'intent',
+      entry.owner_token || '',
+      entry.expected_seq || 0,
       entry.updated_at,
     ],
   );
@@ -1287,7 +1546,7 @@ export async function getOnlyOfficeCommitJournalRecord(
   normalizedPath: string,
 ): Promise<OnlyOfficeCommitJournalRow | null> {
   const row = await db.queryOne<OnlyOfficeCommitJournalRow>(
-    `SELECT server_id, normalized_path, room_key, target_hash, session_epoch, phase, updated_at
+    `SELECT server_id, normalized_path, room_key, target_hash, session_epoch, phase, owner_token, expected_seq, updated_at
      FROM onlyoffice_commit_journal
      WHERE server_id = $1 AND normalized_path = $2`,
     [serverId, normalizedPath],
@@ -1296,6 +1555,7 @@ export async function getOnlyOfficeCommitJournalRecord(
   return {
     ...row,
     session_epoch: Number(row.session_epoch),
+    expected_seq: row.expected_seq !== undefined ? Number(row.expected_seq) : 0,
     updated_at: Number(row.updated_at),
   };
 }
@@ -1304,10 +1564,8 @@ export async function clearOnlyOfficeCommitJournalRecord(
   db: Database,
   serverId: string,
   normalizedPath: string,
+  ownerToken?: string,
 ): Promise<void> {
-  await db.execute(
-    `DELETE FROM onlyoffice_commit_journal WHERE server_id = $1 AND normalized_path = $2`,
-    [serverId, normalizedPath],
-  );
+  return releaseOnlyOfficeCommitClaim(db, serverId, normalizedPath, ownerToken);
 }
 

@@ -59,6 +59,8 @@ CREATE TABLE IF NOT EXISTS onlyoffice_commit_journal (
   target_hash            TEXT NOT NULL,
   session_epoch          INTEGER NOT NULL,
   phase                  TEXT NOT NULL DEFAULT 'intent',
+  owner_token            TEXT NOT NULL DEFAULT '',
+  expected_seq           INTEGER NOT NULL DEFAULT 0,
   updated_at             BIGINT NOT NULL,
   PRIMARY KEY (server_id, normalized_path)
 );

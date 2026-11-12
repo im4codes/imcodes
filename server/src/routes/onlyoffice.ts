@@ -15,9 +15,11 @@ import {
   getOnlyOfficeRoomRecord,
   upsertOnlyOfficeRoomRecord,
   deleteOnlyOfficeRoomRecord,
-  recordOnlyOfficeCommitJournalRecord,
   getOnlyOfficeCommitJournalRecord,
   clearOnlyOfficeCommitJournalRecord,
+  claimOnlyOfficeCommitOwner,
+  commitOnlyOfficeRoom,
+  releaseOnlyOfficeCommitClaim,
   type DocumentShareRole,
   type EffectiveDocumentAccess,
   type OnlyOfficeCommitJournalRow,
@@ -1671,36 +1673,39 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
       }
 
       const newDigest = createHash('sha256').update(bytes).digest('hex');
+      const ownerToken = `claim_${Date.now()}_${randomHex(16)}`;
 
-      // 1. Write-Ahead Intent: MUST successfully persist intent in PG BEFORE any daemon write side-effect
-      try {
-        await recordOnlyOfficeCommitJournalRecord(c.env.DB, {
-          server_id: claims.serverId,
-          normalized_path: claims.path,
-          room_key: currentKey,
-          target_hash: newDigest,
-          session_epoch: currentEpoch,
-          phase: 'intent',
-          updated_at: Date.now(),
-        });
-      } catch (walErr) {
-        // If WAL cannot be recorded, abort immediately without modifying daemon binary
-        return c.json({ error: 1, message: 'durable_room_state_failed' }, 500);
-      }
-
-      // Re-verify room authority post-WAL: ensure no concurrent writer committed between check and intent acquisition
+      // 1. Write-Ahead Intent: MUST successfully acquire atomic commit claim in PG BEFORE any daemon write side-effect
       if (c.env.DB) {
         try {
-          const verifiedRoom = await loadPersistentRoomFromDb(c.env.DB, claims.serverId, claims.path);
+          const claim = await claimOnlyOfficeCommitOwner(c.env.DB, {
+            serverId: claims.serverId,
+            normalizedPath: claims.path,
+            expectedKey: currentKey,
+            expectedEpoch: currentEpoch,
+            expectedSeq: currentCommitSeq,
+            targetHash: newDigest,
+            ownerToken,
+            now: Date.now(),
+          });
+          if (!claim.ok) {
+            return c.json({ error: 1, message: 'stale_document_commit_sequence' }, 409);
+          }
+        } catch (walErr) {
+          // If WAL cannot be recorded, abort immediately without modifying daemon binary
+          return c.json({ error: 1, message: 'durable_room_state_failed' }, 500);
+        }
+
+        // Verify exclusive claim ownership right before touching daemon disk
+        try {
+          const activeJournal = await getOnlyOfficeCommitJournalRecord(c.env.DB, claims.serverId, claims.path);
           if (
-            !verifiedRoom ||
-            verifiedRoom.commitSeq !== startCommitSeq ||
-            verifiedRoom.sessionEpoch !== startEpoch ||
-            verifiedRoom.activeKey !== currentKey
+            !activeJournal ||
+            activeJournal.room_key !== currentKey ||
+            activeJournal.target_hash !== newDigest ||
+            (activeJournal.owner_token && activeJournal.owner_token !== ownerToken) ||
+            (activeJournal.phase && !activeJournal.phase.includes(ownerToken) && activeJournal.phase !== 'intent')
           ) {
-            try {
-              await clearOnlyOfficeCommitJournalRecord(c.env.DB, claims.serverId, claims.path);
-            } catch { /* best effort */ }
             return c.json({ error: 1, message: 'stale_document_commit_sequence' }, 409);
           }
         } catch {
@@ -1719,9 +1724,11 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
         });
       } catch (writeErr) {
         pendingCommitHashMap.delete(mapKey);
-        try {
-          await clearOnlyOfficeCommitJournalRecord(c.env.DB, claims.serverId, claims.path);
-        } catch { /* best effort */ }
+        if (c.env.DB) {
+          try {
+            await releaseOnlyOfficeCommitClaim(c.env.DB, claims.serverId, claims.path, ownerToken);
+          } catch { /* best effort */ }
+        }
         const msg = writeErr instanceof Error ? writeErr.message : String(writeErr);
         const errStatus = msg === 'forbidden_path' ? 403 : 502;
         return c.json({ error: 1, message: msg }, errStatus);
@@ -1729,7 +1736,7 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
 
       if (status === 2) {
         const nextEpoch = currentEpoch + 1;
-        const nextSeq = (state?.commitSeq ?? 0) + 1;
+        const nextSeq = currentCommitSeq + 1;
         const nextKey = computeDocumentKeyFromDigest(claims.serverId, claims.path, newDigest, nextEpoch);
         const newState: DocumentVersionState = {
           currentConfirmedHash: newDigest,
@@ -1741,18 +1748,27 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
           active: false,
           updatedAt: Date.now(),
         };
-        try {
-          await savePersistentRoomToDb(c.env.DB, claims.serverId, claims.path, newState);
-        } catch (persistErr) {
-          return c.json({ error: 1, message: 'durable_room_state_failed' }, 500);
+        if (c.env.DB) {
+          try {
+            const commitRes = await commitOnlyOfficeRoom(c.env.DB, {
+              serverId: claims.serverId,
+              normalizedPath: claims.path,
+              ownerToken,
+              expectedSeq: currentCommitSeq,
+              expectedEpoch: currentEpoch,
+              newState,
+            });
+            if (!commitRes.ok) {
+              return c.json({ error: 1, message: 'stale_document_commit_sequence' }, 409);
+            }
+          } catch (persistErr) {
+            return c.json({ error: 1, message: 'durable_room_state_failed' }, 500);
+          }
         }
         documentVersionStateMap.set(mapKey, newState);
         pendingCommitHashMap.delete(mapKey);
-        try {
-          await clearOnlyOfficeCommitJournalRecord(c.env.DB, claims.serverId, claims.path);
-        } catch { /* best effort */ }
       } else if (status === 6) {
-        const nextSeq = (state?.commitSeq ?? 0) + 1;
+        const nextSeq = currentCommitSeq + 1;
         const newState: DocumentVersionState = {
           currentConfirmedHash: newDigest,
           committedHash: newDigest,
@@ -1763,16 +1779,25 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
           active: true,
           updatedAt: Date.now(),
         };
-        try {
-          await savePersistentRoomToDb(c.env.DB, claims.serverId, claims.path, newState);
-        } catch (persistErr) {
-          return c.json({ error: 1, message: 'durable_room_state_failed' }, 500);
+        if (c.env.DB) {
+          try {
+            const commitRes = await commitOnlyOfficeRoom(c.env.DB, {
+              serverId: claims.serverId,
+              normalizedPath: claims.path,
+              ownerToken,
+              expectedSeq: currentCommitSeq,
+              expectedEpoch: currentEpoch,
+              newState,
+            });
+            if (!commitRes.ok) {
+              return c.json({ error: 1, message: 'stale_document_commit_sequence' }, 409);
+            }
+          } catch (persistErr) {
+            return c.json({ error: 1, message: 'durable_room_state_failed' }, 500);
+          }
         }
         documentVersionStateMap.set(mapKey, newState);
         pendingCommitHashMap.delete(mapKey);
-        try {
-          await clearOnlyOfficeCommitJournalRecord(c.env.DB, claims.serverId, claims.path);
-        } catch { /* best effort */ }
       }
 
       return c.json({ error: 0 });

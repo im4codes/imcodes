@@ -628,6 +628,58 @@ function createInMemoryDb() {
         return { changes: 0 };
       }
 
+      if (normSql.startsWith('UPDATE onlyoffice_rooms SET')) {
+        const [
+          serverId,
+          normalizedPath,
+          currentConfirmedHash,
+          committedHash,
+          lastForceSavedHash,
+          activeKey,
+          sessionEpoch,
+          commitSeq,
+          active,
+          updatedAt,
+          expectedSeq,
+          expectedEpoch,
+        ] = params as [
+          string,
+          string,
+          string,
+          string,
+          string | null,
+          string,
+          number,
+          number,
+          boolean,
+          number,
+          number,
+          number,
+        ];
+        const key = `${serverId}:${normalizedPath}`;
+        const existing = rooms.get(key);
+        if (existing) {
+          if (existing.commit_seq !== Number(expectedSeq) || existing.session_epoch !== Number(expectedEpoch)) {
+            return { changes: 0 };
+          }
+          const row: OnlyOfficeRoomRow = {
+            server_id: serverId,
+            normalized_path: normalizedPath,
+            current_confirmed_hash: currentConfirmedHash,
+            committed_hash: committedHash,
+            last_force_saved_hash: lastForceSavedHash,
+            active_key: activeKey,
+            session_epoch: Number(sessionEpoch),
+            commit_seq: Number(commitSeq),
+            active: Boolean(active),
+            updated_at: Number(updatedAt),
+          };
+          rooms.set(key, row);
+          return { changes: 1 };
+        }
+        return { changes: 0 };
+      }
+
       if (normSql.startsWith('DELETE FROM onlyoffice_rooms WHERE server_id = $1 AND normalized_path = $2')) {
         const [serverId, normalizedPath] = params as [string, string];
         rooms.delete(`${serverId}:${normalizedPath}`);
@@ -642,8 +694,12 @@ function createInMemoryDb() {
           targetHash,
           sessionEpoch,
           phase,
-          updatedAt,
-        ] = params as [string, string, string, string, number, string, number];
+          ownerTokenOrUpdated,
+          expectedSeq,
+          updatedAtParam,
+        ] = params as [string, string, string, string, number, string, string | number, number | undefined, number | undefined];
+        const ownerToken = typeof ownerTokenOrUpdated === 'string' ? ownerTokenOrUpdated : '';
+        const updatedAt = typeof ownerTokenOrUpdated === 'number' ? ownerTokenOrUpdated : (updatedAtParam ?? Date.now());
         const row: OnlyOfficeCommitJournalRow = {
           server_id: serverId,
           normalized_path: normalizedPath,
@@ -651,6 +707,8 @@ function createInMemoryDb() {
           target_hash: targetHash,
           session_epoch: Number(sessionEpoch),
           phase: phase || 'intent',
+          owner_token: ownerToken || (phase?.startsWith('intent:') ? phase.slice(7) : ''),
+          expected_seq: expectedSeq !== undefined ? Number(expectedSeq) : 0,
           updated_at: Number(updatedAt),
         };
         commitJournals.set(`${serverId}:${normalizedPath}`, row);
@@ -658,9 +716,20 @@ function createInMemoryDb() {
       }
 
       if (normSql.startsWith('DELETE FROM onlyoffice_commit_journal WHERE server_id = $1 AND normalized_path = $2')) {
-        const [serverId, normalizedPath] = params as [string, string];
-        commitJournals.delete(`${serverId}:${normalizedPath}`);
-        return { changes: 1 };
+        const [serverId, normalizedPath, ownerToken] = params as [string, string, string | undefined];
+        const key = `${serverId}:${normalizedPath}`;
+        const existing = commitJournals.get(key);
+        if (existing) {
+          if (ownerToken) {
+            const jOwner = existing.owner_token || (existing.phase?.startsWith('intent:') ? existing.phase.slice(7) : '');
+            if (jOwner && jOwner !== ownerToken && !existing.phase.includes(ownerToken)) {
+              return { changes: 0 };
+            }
+          }
+          commitJournals.delete(key);
+          return { changes: 1 };
+        }
+        return { changes: 0 };
       }
 
       return { changes: 1 };
@@ -2178,6 +2247,54 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
     const out = await pending;
     expect.soft(out.status, 'disk version changed while downloading: the old room must lose write authority').toBe(409);
     expect.soft(Buffer.from(virtualFiles.get('/team/shared/spec.docx')!.content, 'base64').toString(), 'external edits must not be overwritten by the old callback').toBe(external);
+  });
+
+  it('audit-r12: repeating SELECT after WAL is not an atomic owner claim and cannot protect the winning committed bytes', async () => {
+    const res = await app.request('/api/server/srv-1/onlyoffice/config?path=%2Fteam%2Fshared%2Fspec.docx&mode=edit', {
+      headers: { Authorization: bearer('owner-1') },
+    });
+    expect(res.status).toBe(200);
+    const cfg = (await res.json()) as any;
+    const cb = new URL(cfg.config.editorConfig.callbackUrl);
+    const mapKey = 'srv-1:/team/shared/spec.docx';
+    const prior = { ...store.rooms.get(mapKey)! };
+    const newer = 'newer-writer-commit-after-last-read-snapshot';
+    const digest = sha256Hex(newer);
+    const query = store.db.queryOne.bind(store.db);
+    let injected = 0;
+    vi.spyOn(store.db, 'queryOne').mockImplementation(async (sql, params) => {
+      const snapshot = await query(sql, params);
+      // The post-WAL SELECT has observed old seq0. Another process can commit
+      // before this read returns to the application because no PG ownership lock exists.
+      if (sql.includes('FROM onlyoffice_rooms') && store.commitJournals.has(mapKey) && injected++ === 0) {
+        store.rooms.set(mapKey, {
+          ...prior,
+          current_confirmed_hash: digest,
+          committed_hash: digest,
+          last_force_saved_hash: digest,
+          commit_seq: prior.commit_seq + 1,
+          active: true,
+          updated_at: Date.now(),
+        });
+        store.commitJournals.delete(mapKey); // Winning writer completed its durable commit.
+        virtualFiles.set('/team/shared/spec.docx', {
+          content: Buffer.from(newer).toString('base64'),
+          encoding: 'base64',
+          mtime: Date.now(),
+        });
+      }
+      return snapshot;
+    });
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response('old-callback-after-last-select', { status: 200 }));
+    const data = { status: 6, key: cfg.config.document.key, url: 'https://im.example.com/onlyoffice/cache/post-wal-toctou.docx' };
+    const out = await app.request(cb.pathname + cb.search, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...data, token: signJwt(data, 'onlyoffice-jwt-secret-key-test!!', 300) }),
+    });
+    expect(injected).toBeGreaterThan(0);
+    expect.soft(out.status, 'old expected-version callback must not retain write permission after another PG writer wins').toBe(409);
+    expect.soft(Buffer.from(virtualFiles.get('/team/shared/spec.docx')!.content, 'base64').toString(), 'a last SELECT without an owner cannot allow older callback bytes to overwrite the winner').toBe(newer);
   });
 });
 
