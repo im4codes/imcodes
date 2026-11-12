@@ -55,3 +55,28 @@ describe('OfficePreview docx over the chunked download URL (tsk_5rf)', () => {
     await waitFor(() => expect(container.textContent).toContain('404'));
   });
 });
+
+describe('OfficePreview unavailable ONLYOFFICE uses real local DOCX rendering', () => {
+  it.each(['404', 'network', 'disabled'] as const)('renders DOCX text when config is %s, without exposing the config error', async (scenario) => {
+    const bytes = await buildMinimalDocx();
+    const source = 'https://host/api/server/s1/uploads/docx-fallback/download';
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).includes('/onlyoffice/config')) {
+        if (scenario === 'network') throw new TypeError('Failed to fetch');
+        if (scenario === '404') return { ok: false, status: 404, text: async () => '{"error":"not_found"}' };
+        return { ok: true, status: 200, json: async () => ({ enabled: false, role: 'viewer', allowDownload: true }) };
+      }
+      expect(String(input)).toBe(source);
+      return { ok: true, status: 200, arrayBuffer: async () => bytes };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const { container, queryByTestId } = render(
+      <OfficePreview serverId="s1" srcUrl={source} mimeType={DOCX_MIME} path="/repo/contract.docx" />,
+    );
+    await waitFor(() => expect(container.textContent).toContain(DOC_TEXT), { timeout: 5000 });
+    expect(queryByTestId('office-preview-auth-error')).toBeNull();
+    expect(container.textContent).not.toMatch(/API 404|not_found|Failed to fetch/);
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes('/onlyoffice/config'))).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledWith(source, expect.objectContaining({ credentials: 'include', signal: expect.any(AbortSignal) }));
+  });
+});

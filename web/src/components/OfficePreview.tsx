@@ -573,7 +573,18 @@ function OnlyOfficeEmbeddedEditor({
   );
 }
 
-export default function OfficePreview({
+export default function OfficePreview(props: OfficePreviewProps) {
+  // Reset synchronously on document/auth identity changes. An effect-only reset
+  // can let the previous document's forceLocal/authorized URL/data start a new
+  // download before the new config has checked its permissions.
+  const identity = JSON.stringify([
+    props.serverId, props.path, props.srcUrl, props.mimeType,
+    props.shareToken, props.deviceToken, props.sessionName, props.readOnly, props.initialMode,
+  ]);
+  return <OfficePreviewDocument key={identity} {...props} />;
+}
+
+function OfficePreviewDocument({
   srcUrl,
   mimeType,
   path,
@@ -604,21 +615,6 @@ export default function OfficePreview({
   const effectiveInitialMode: 'view' | 'edit' = readOnly ? 'view' : (initialMode ?? 'edit');
   const [mode, setMode] = useState<'view' | 'edit'>(effectiveInitialMode);
   const [isFullscreen, setIsFullscreen] = useState(false);
-
-  // Reset per-document state whenever target document or server changes
-  useEffect(() => {
-    setData(null);
-    setError(null);
-    setAuthDeniedError(null);
-    setAuthorizedFileUrl('');
-    setFallbackNotice(null);
-    setMode(readOnly ? 'view' : (initialMode ?? 'edit'));
-    setOoState({
-      loading: Boolean(serverId),
-      config: null,
-      forceLocal: false,
-    });
-  }, [serverId, path, shareToken, deviceToken, sessionName, readOnly, initialMode]);
 
   // 1. When `serverId` is provided, query ONLYOFFICE config first
   useEffect(() => {
@@ -661,8 +657,7 @@ export default function OfficePreview({
         if (
           status === 401 ||
           status === 403 ||
-          status === 404 ||
-          /\b(401|403|404)\b|forbidden|unauthorized|access_denied/i.test(msg)
+          (status === 0 && /\b(401|403)\b|forbidden|unauthorized|access_denied/i.test(msg))
         ) {
           setAuthDeniedError(msg || 'Access denied');
           setOoState({
@@ -672,7 +667,10 @@ export default function OfficePreview({
           });
           return;
         }
-        // Fallback seamlessly to local preview when ONLYOFFICE config endpoint is unreachable (5xx / network)
+        // A missing/disabled ONLYOFFICE route is not a document permission
+        // denial. Fall back on 404 as on 5xx/network errors; the authenticated
+        // document download still enforces its own access checks. Structured
+        // HTTP status takes precedence over auth-shaped text in an error body.
         setOoState((prev) => ({
           loading: false,
           config: prev.config,
@@ -684,14 +682,6 @@ export default function OfficePreview({
       cancelled = true;
     };
   }, [serverId, path, mode, shareToken, deviceToken, sessionName, readOnly, ooState.forceLocal, ooRetryKey]);
-
-  if (authDeniedError) {
-    return (
-      <div style={{ color: '#ef4444', padding: 16 }} data-testid="office-preview-auth-error">
-        {authDeniedError}
-      </div>
-    );
-  }
 
   const useOnlyOffice =
     Boolean(serverId) &&
@@ -724,6 +714,14 @@ export default function OfficePreview({
       });
     return () => controller.abort();
   }, [effectiveSrcUrl, canLocalPreview, ooState.loading, useOnlyOffice, authDeniedError]);
+
+  if (authDeniedError) {
+    return (
+      <div style={{ color: '#ef4444', padding: 16 }} data-testid="office-preview-auth-error">
+        {authDeniedError}
+      </div>
+    );
+  }
 
   if (ooState.loading) {
     return <div style={{ color: '#64748b', padding: 12 }}>…</div>;

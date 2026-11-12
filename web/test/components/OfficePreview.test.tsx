@@ -95,8 +95,9 @@ function installControllableResizeObserver(initialWidth: number): { trigger: (wi
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((res) => { resolve = res; });
-  return { promise, resolve };
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
 }
 
 describe('OfficePreview PDF worker setup', () => {
@@ -461,7 +462,7 @@ describe('OfficePreview — Embedded ONLYOFFICE & permission controls', () => {
     await waitFor(() => expect(docEditorSpy).toHaveBeenCalledTimes(1));
   });
 
-  it('F7: refuses to downgrade 403/401/404 ONLYOFFICE config errors to local srcUrl and renders safe unsupported fallback for .pptx', async () => {
+  it('F7: refuses to downgrade authentication errors from ONLYOFFICE config to local srcUrl and renders safe unsupported fallback for .pptx', async () => {
     const srcUrlFetched = vi.fn();
     vi.stubGlobal(
       'fetch',
@@ -641,5 +642,167 @@ describe('OfficePreview — Embedded ONLYOFFICE & permission controls', () => {
     await findByText(/budget\.docx/);
     expect(fetchedUrls.some((u) => u.includes('/api/server/srv-2/doc-shares/browse') && u.includes('subfolder'))).toBe(true);
     expect(fetchedUrls.some((u) => u.includes('/api/server/srv-1/doc-shares/browse') && u.includes('subfolder'))).toBe(false);
+  });
+});
+
+describe('OfficePreview config failure classification and isolation', () => {
+  const source = 'https://example.test/download/local-file';
+  beforeEach(() => {
+    vi.resetModules(); vi.clearAllMocks();
+    xlsxApi.html = '<table><tr><td>unavailable-office-local-cell</td></tr></table>';
+    pdfjsApi.getDocument.mockReturnValue({ promise: Promise.resolve({ numPages: 0, getPage: vi.fn() }) });
+  });
+  afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+  async function rejectConfig(status: number | null, body = 'not_found') {
+    const api = await import('../../src/api.js');
+    const error = status === null ? new TypeError('Failed to fetch') : new api.ApiError(status, JSON.stringify({ error: body }));
+    return vi.spyOn(api, 'fetchOnlyOfficeConfig').mockRejectedValue(error);
+  }
+
+  it.each([404, 503, null])('locally renders XLSX when config fails with %s', async (status) => {
+    await rejectConfig(status); installFetchStub();
+    const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
+    const { container, queryByTestId } = render(<OfficePreview serverId="s1" srcUrl={source} path="/repo/a.xlsx" mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" />);
+    await waitFor(() => expect(container.textContent).toContain('unavailable-office-local-cell'));
+    expect(queryByTestId('office-preview-auth-error')).toBeNull();
+    expect(container.textContent).not.toMatch(/API 404|not_found|Failed to fetch/);
+  });
+
+  it.each([404, null, 'disabled'] as const)('opens local PDF when config is %s', async (status) => {
+    if (status === 'disabled') {
+      const api = await import('../../src/api.js');
+      vi.spyOn(api, 'fetchOnlyOfficeConfig').mockResolvedValue({ enabled: false } as any);
+    } else await rejectConfig(status);
+    installFetchStub(); installCreateObjectURL(vi.fn(() => 'blob:local-pdf'));
+    installResizeObserver(320);
+    const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
+    const { container, queryByTestId } = render(<OfficePreview serverId="s1" srcUrl={source} path="/repo/a.pdf" mimeType="application/pdf" />);
+    await waitFor(() => expect(pdfjsApi.getDocument).toHaveBeenCalledTimes(1));
+    expect(pdfjsApi.getDocument.mock.calls[0]?.[0]).toMatchObject({ data: expect.any(Uint8Array) });
+    expect(queryByTestId('office-preview-auth-error')).toBeNull();
+    expect(container.textContent).not.toMatch(/API 404|not_found|Failed to fetch/);
+  });
+
+  it('offers localized unsupported-format/download controls on 404 without attempting a local binary fetch', async () => {
+    await rejectConfig(404); const fetchMock = vi.fn(); vi.stubGlobal('fetch', fetchMock);
+    const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
+    const { container, getByTestId } = render(<OfficePreview serverId="s1" srcUrl={source} path="/repo/slides.pptx" mimeType="application/vnd.openxmlformats-officedocument.presentationml.presentation" />);
+    await waitFor(() => expect(getByTestId('office-preview-unsupported-local')).toBeTruthy());
+    expect(container.textContent).toContain('Local preview is not available for this format');
+    expect(container.querySelector('a[download]')?.getAttribute('href')).toBe(source);
+    expect(container.textContent).toContain('Download');
+    expect(container.textContent).not.toMatch(/API 404|not_found/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([401, 403])('does not fall back or offer download for explicit %s denial', async (status) => {
+    await rejectConfig(status, 'forbidden'); const fetchMock = vi.fn(); vi.stubGlobal('fetch', fetchMock);
+    const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
+    const { getByTestId, container } = render(<OfficePreview serverId="s1" srcUrl={source} shareToken="expired" path="/repo/a.xlsx" mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" />);
+    await waitFor(() => expect(getByTestId('office-preview-auth-error')).toBeTruthy());
+    expect(container.querySelector('a[download]')).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('uses authoritative HTTP status rather than auth-shaped text in a 404 body', async () => {
+    await rejectConfig(404, 'forbidden'); installFetchStub();
+    const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
+    const { container } = render(<OfficePreview serverId="s1" srcUrl={source} path="/repo/a.xlsx" mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" />);
+    await waitFor(() => expect(container.textContent).toContain('unavailable-office-local-cell'));
+  });
+
+  it.each(['web', 'native-mobile'])('falls back in %s without changing the renderer branch', async (platform) => {
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => platform === 'native-mobile' });
+    await rejectConfig(404); installFetchStub();
+    const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
+    const { container } = render(<OfficePreview serverId="s1" srcUrl={source} path="/repo/a.xlsx" mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" />);
+    await waitFor(() => expect(container.textContent).toContain('unavailable-office-local-cell'));
+  });
+
+  it('ignores a late 404 from the previous server/path while preserving a new 403 denial', async () => {
+    const old = deferred<never>(); const api = await import('../../src/api.js');
+    const config = vi.spyOn(api, 'fetchOnlyOfficeConfig').mockReturnValueOnce(old.promise).mockRejectedValue(new api.ApiError(403, 'forbidden'));
+    const fetchMock = vi.fn(); vi.stubGlobal('fetch', fetchMock);
+    const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
+    const props = { srcUrl: source, path: '/repo/a.xlsx', mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' };
+    const view = render(<OfficePreview {...props} serverId="old-server" />);
+    await waitFor(() => expect(config).toHaveBeenCalledTimes(1));
+    view.rerender(<OfficePreview {...props} path="/repo/private.xlsx" serverId="new-server" shareToken="new-token" />);
+    await waitFor(() => expect(view.getByTestId('office-preview-auth-error')).toBeTruthy());
+    // A rejection from the cancelled request cannot enable the local fetch.
+    old.reject(new api.ApiError(404, 'not_found'));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(view.getByTestId('office-preview-auth-error')).toBeTruthy();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('ignores stale config success after a new document has fallen back', async () => {
+    const old = deferred<any>(); const api = await import('../../src/api.js');
+    const config = vi.spyOn(api, 'fetchOnlyOfficeConfig').mockReturnValueOnce(old.promise).mockRejectedValue(new api.ApiError(404, 'not_found'));
+    installFetchStub();
+    const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
+    const props = { path: '/repo/a.xlsx', mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', serverId: 's1' };
+    const view = render(<OfficePreview {...props} srcUrl={source + '/old'} />);
+    await waitFor(() => expect(config).toHaveBeenCalledTimes(1));
+    view.rerender(<OfficePreview {...props} path="/repo/b.xlsx" srcUrl={source + '/new'} />);
+    await waitFor(() => expect(view.container.textContent).toContain('unavailable-office-local-cell'));
+    old.resolve({ enabled: true, fileUrl: 'https://wrong.example/old', config: { document: { url: 'https://wrong.example/old' } } });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(view.queryByTestId('onlyoffice-embedded-wrapper')).toBeNull();
+    expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).includes('wrong.example'))).toBe(false);
+  });
+});
+
+describe('OfficePreview fallback document transitions', () => {
+  beforeEach(() => {
+    vi.resetModules(); vi.clearAllMocks();
+    xlsxApi.html = '<table><tr><td>allowed-old-document</td></tr></table>';
+  });
+  afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+  it('rechecks permissions before fetching a new source after an earlier 404 fallback', async () => {
+    const api = await import('../../src/api.js');
+    const deny = deferred<never>();
+    vi.spyOn(api, 'fetchOnlyOfficeConfig').mockRejectedValueOnce(new api.ApiError(404, 'not_found')).mockReturnValue(deny.promise);
+    installFetchStub();
+    const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
+    const props = { serverId: 's1', path: '/old.xlsx', srcUrl: 'https://files.test/allowed', mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' };
+    const view = render(<OfficePreview {...props} />);
+    await waitFor(() => expect(view.container.textContent).toContain('allowed-old-document'));
+    vi.mocked(fetch).mockClear();
+    view.rerender(<OfficePreview {...props} serverId="s2" path="/private.xlsx" srcUrl="https://files.test/private" shareToken="revoked" />);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(fetch).not.toHaveBeenCalled();
+    deny.reject(new api.ApiError(403, 'forbidden'));
+    await waitFor(() => expect(view.getByTestId('office-preview-auth-error')).toBeTruthy());
+    expect(fetch).not.toHaveBeenCalled();
+    expect(view.container.textContent).not.toContain('allowed-old-document');
+  });
+
+  it('aborts old local fetch and rejects its late bytes after a new file is rendered', async () => {
+    const api = await import('../../src/api.js');
+    vi.spyOn(api, 'fetchOnlyOfficeConfig').mockRejectedValue(new api.ApiError(404, 'not_found'));
+    const oldBytes = deferred<ArrayBuffer>();
+    let oldSignal: AbortSignal | undefined;
+    const fetchMock = vi.fn(async (url: RequestInfo | URL, options?: RequestInit) => {
+      if (String(url).endsWith('/old')) {
+        oldSignal = options?.signal as AbortSignal;
+        return { ok: true, arrayBuffer: () => oldBytes.promise };
+      }
+      return { ok: true, arrayBuffer: async () => new Uint8Array([2]).buffer };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    installCreateObjectURL(vi.fn(() => 'blob:transition-pdf')); installResizeObserver(320);
+    pdfjsApi.getDocument.mockReturnValue({ promise: Promise.resolve({ numPages: 0, getPage: vi.fn() }) });
+    const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
+    const props = { serverId: 's1', path: '/old.pdf', srcUrl: 'https://files.test/old', mimeType: 'application/pdf' };
+    const view = render(<OfficePreview {...props} />);
+    await waitFor(() => expect(oldSignal).toBeDefined());
+    view.rerender(<OfficePreview {...props} path="/new.pdf" srcUrl="https://files.test/new" />);
+    await waitFor(() => expect(pdfjsApi.getDocument).toHaveBeenCalled());
+    expect(oldSignal!.aborted).toBe(true);
+    oldBytes.resolve(new Uint8Array([1]).buffer);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    for (const [options] of pdfjsApi.getDocument.mock.calls) expect([...options.data]).toEqual([2]);
   });
 });
