@@ -2548,11 +2548,11 @@ export function getTransportQueueStore(): TransportQueueStore {
           : first && typeof first === 'object' ? (first as { sessionName?: string }).sessionName : undefined;
         if (isIncognitoSessionName(sessionName)) {
           privateStore ??= new TransportQueueStore({ dbPath: ':memory:' });
-          return (Reflect.get(privateStore, key) as Function).apply(privateStore, args);
+          return (Reflect.get(privateStore, key) as (...callArgs: unknown[]) => unknown).apply(privateStore, args);
         }
         const result = value.apply(target, args);
         if (privateStore && ['listLiveQueueSessions', 'listQueueSessionsForReconciliation', 'listSessionNames'].includes(String(key))) {
-          return [...result, ...(Reflect.get(privateStore, key) as Function).apply(privateStore, args)];
+          return [...result, ...(Reflect.get(privateStore, key) as (...callArgs: unknown[]) => unknown[]).apply(privateStore, args)];
         }
         return result;
       };
