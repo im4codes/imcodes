@@ -960,7 +960,8 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
   const [shareInfo, setShareInfo] = useState<ExternalShareView | null>(null);
   const [sharedWithMeList, setSharedWithMeList] = useState<SharedWithMeDocItem[]>([]);
   const [selectedShareId, setSelectedShareId] = useState<string>('');
-  const requestEpochRef = useRef(0);
+  const selectionEpochRef = useRef(0);
+  const browseRequestIdRef = useRef(0);
   const selectedShareIdRef = useRef<string>('');
   selectedShareIdRef.current = selectedShareId;
   const [serverId, setServerId] = useState<string>('');
@@ -976,6 +977,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
 
   // Reset per-token state when the route token changes
   useEffect(() => {
+    ++selectionEpochRef.current;
     let savedDev = '';
     try {
       savedDev = token ? localStorage.getItem(`imcodes_doc_dev_${token}`) || '' : '';
@@ -998,13 +1000,13 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
 
   const loadExternalBrowse = useCallback(
     async (subPath?: string, customDevToken?: string, customCode?: string) => {
-      const epoch = ++requestEpochRef.current;
+      const reqId = ++browseRequestIdRef.current;
       setLoading(true);
       setError(null);
       try {
         if (!token) {
           const listRes = await listDocsSharedWithMe();
-          if (epoch !== requestEpochRef.current) return;
+          if (reqId !== browseRequestIdRef.current) return;
           setSharedWithMeList(listRes.shares);
           const currentShare =
             (selectedShareIdRef.current ? listRes.shares.find((s) => s.id === selectedShareIdRef.current) : null) ||
@@ -1044,7 +1046,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
             setEntries([]);
           } else {
             const folderRes = await browseSharedDocFolder(currentShare.serverId, browsePath);
-            if (epoch !== requestEpochRef.current || selectedShareIdRef.current !== currentShare.id) return;
+            if (reqId !== browseRequestIdRef.current || selectedShareIdRef.current !== currentShare.id) return;
             setEntries(folderRes.entries);
             if (!subPath) {
               setActiveFilePath(null);
@@ -1058,7 +1060,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
           deviceToken: customDevToken ?? (deviceToken || undefined),
           accessCode: customCode ?? (accessCode || undefined),
         });
-        if (epoch !== requestEpochRef.current) return;
+        if (reqId !== browseRequestIdRef.current) return;
         setShareInfo(res.share);
         setServerId(res.serverId);
         setRootPath(res.rootPath);
@@ -1071,11 +1073,11 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
           setActiveFilePath(null);
         }
       } catch (err) {
-        if (epoch !== requestEpochRef.current) return;
+        if (reqId !== browseRequestIdRef.current) return;
         setNeedsVerify(Boolean(token));
         setError(err instanceof Error ? err.message : String(err));
       } finally {
-        if (epoch === requestEpochRef.current) {
+        if (reqId === browseRequestIdRef.current) {
           setLoading(false);
         }
       }
@@ -1089,7 +1091,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
 
   const handleVerifyDevice = async (e: Event) => {
     e.preventDefault();
-    const actionEpoch = requestEpochRef.current;
+    const actionEpoch = selectionEpochRef.current;
     const actionToken = token;
     setError(null);
     try {
@@ -1097,7 +1099,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
         accessCode: accessCode.trim() || undefined,
         deviceToken: deviceToken || undefined,
       });
-      if (actionEpoch !== requestEpochRef.current || actionToken !== token) return;
+      if (actionEpoch !== selectionEpochRef.current || actionToken !== token) return;
       setDeviceToken(res.deviceToken);
       try {
         localStorage.setItem(`imcodes_doc_dev_${actionToken}`, res.deviceToken);
@@ -1106,7 +1108,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
       }
       await loadExternalBrowse(undefined, res.deviceToken, accessCode.trim() || undefined);
     } catch (err) {
-      if (actionEpoch !== requestEpochRef.current || actionToken !== token) return;
+      if (actionEpoch !== selectionEpochRef.current || actionToken !== token) return;
       setError(err instanceof Error ? err.message : String(err));
     }
   };
@@ -1114,7 +1116,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
   const handleRedeemMagicLink = async (e: Event) => {
     e.preventDefault();
     if (!displayName.trim()) return;
-    const actionEpoch = requestEpochRef.current;
+    const actionEpoch = selectionEpochRef.current;
     const actionToken = token;
     setError(null);
     try {
@@ -1122,11 +1124,11 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
         displayName: displayName.trim(),
         accessCode: accessCode.trim() || undefined,
       });
-      if (actionEpoch !== requestEpochRef.current || actionToken !== token) return;
+      if (actionEpoch !== selectionEpochRef.current || actionToken !== token) return;
       setServerId(res.share.serverId);
       await loadExternalBrowse();
     } catch (err) {
-      if (actionEpoch !== requestEpochRef.current || actionToken !== token) return;
+      if (actionEpoch !== selectionEpochRef.current || actionToken !== token) return;
       setError(err instanceof Error ? err.message : String(err));
     }
   };
@@ -1134,7 +1136,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
   const handleCreateItem = async (e: Event) => {
     e.preventDefault();
     if (!newItemName.trim() || !serverId || !currentPath) return;
-    const actionEpoch = requestEpochRef.current;
+    const actionEpoch = selectionEpochRef.current;
     const actionShareId = selectedShareIdRef.current;
     const actionServerId = serverId;
     const actionParentDir = currentPath;
@@ -1156,7 +1158,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
         deviceToken: deviceToken || undefined,
       });
       if (
-        actionEpoch !== requestEpochRef.current ||
+        actionEpoch !== selectionEpochRef.current ||
         actionShareId !== selectedShareIdRef.current ||
         actionServerId !== serverId ||
         actionToken !== token
@@ -1166,7 +1168,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
       setNewItemName('');
       await loadExternalBrowse(actionParentDir);
       if (
-        actionEpoch === requestEpochRef.current &&
+        actionEpoch === selectionEpochRef.current &&
         actionShareId === selectedShareIdRef.current &&
         actionServerId === serverId &&
         actionToken === token
@@ -1177,7 +1179,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
       }
     } catch (err) {
       if (
-        actionEpoch !== requestEpochRef.current ||
+        actionEpoch !== selectionEpochRef.current ||
         actionShareId !== selectedShareIdRef.current ||
         actionServerId !== serverId ||
         actionToken !== token
@@ -1488,7 +1490,8 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
                     type="button"
                     data-testid={`shared-tab-${item.id}`}
                     onClick={() => {
-                      const epoch = ++requestEpochRef.current;
+                      ++selectionEpochRef.current;
+                      const reqId = ++browseRequestIdRef.current;
                       const targetId = item.id;
                       setSelectedShareId(item.id);
                       selectedShareIdRef.current = item.id;
@@ -1519,7 +1522,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
                         setActiveFilePath(null);
                         setEntries([]);
                         void browseSharedDocFolder(item.serverId, item.targetPath).then((r) => {
-                          if (epoch !== requestEpochRef.current || selectedShareIdRef.current !== targetId) return;
+                          if (reqId !== browseRequestIdRef.current || selectedShareIdRef.current !== targetId) return;
                           setEntries(r.entries);
                         });
                       }
