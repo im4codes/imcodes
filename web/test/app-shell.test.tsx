@@ -44,7 +44,9 @@ const {
   authExpiredState,
   loginAttemptState,
   loginState,
+  syncedPrefs,
 } = vi.hoisted(() => ({
+  syncedPrefs: { enabled: false, get: vi.fn(), save: vi.fn() },
   apiFetchMock: vi.fn(),
   chatScrollMock: vi.fn(),
   clearApiKeyMock: vi.fn(),
@@ -153,6 +155,8 @@ vi.mock('../src/api.js', () => {
 
   return {
     ApiError,
+    getUserPref: (...args: unknown[]) => syncedPrefs.get(...args),
+    saveUserPref: (...args: unknown[]) => syncedPrefs.save(...args),
     SharedOpenTimeoutError,
     DEFAULT_SHARED_ENTRY_OPEN_TIMEOUT_MS: 15_000,
     apiFetch: (...args: unknown[]) => apiFetchMock(...args),
@@ -318,8 +322,10 @@ vi.mock('../src/hooks/usePref.js', () => ({
 
 vi.mock('../src/hooks/useSyncedPreference.js', async () => {
   const { useState } = await vi.importActual<typeof import('preact/hooks')>('preact/hooks');
+  const actual = await vi.importActual<typeof import('../src/hooks/useSyncedPreference.js')>('../src/hooks/useSyncedPreference.js');
   return {
-    useSyncedPreference: (_key: string, initial: unknown) => {
+    useSyncedPreference: (_key: string, initial: unknown, debounce?: number, scope?: string) => {
+      if (syncedPrefs.enabled && _key.startsWith('server_')) return actual.useSyncedPreference(_key, initial, debounce, scope);
       const [value, setValue] = useState(initial);
       return [value, setValue, true];
     },
@@ -877,9 +883,10 @@ vi.mock('../src/components/ServerContextMenu.js', () => ({
       <button onClick={onCancel}>delete-cancel</button>
     </div>
   ),
-  ServerContextMenu: ({ onClose, onDelete, onRename, onUpgrade, onUpgradeAll }: any) => (
+  ServerContextMenu: ({ onClose, onDelete, onRename, onUpgrade, onUpgradeAll, onTogglePin }: any) => (
     <div>
       server-context-menu
+      <button onClick={onTogglePin}>server-menu-pin</button>
       <button onClick={onRename}>server-menu-rename</button>
       <button onClick={onUpgrade}>server-menu-upgrade</button>
       <button onClick={onUpgradeAll}>server-menu-upgrade-all</button>
@@ -1094,6 +1101,9 @@ async function getActiveWsClient() {
 
 beforeEach(() => {
   vi.resetModules();
+  syncedPrefs.enabled = false;
+  syncedPrefs.get.mockReset().mockResolvedValue(null);
+  syncedPrefs.save.mockReset().mockResolvedValue(undefined);
   history.replaceState(null, '', '/');
   localStorage.clear();
   sessionStorage.clear();
@@ -1156,6 +1166,46 @@ afterEach(() => {
 });
 
 describe('App shell', () => {
+  it.each(['partial', 'empty', 'error'])('pin persistence: retains absent IDs through %s inventory and reload', async (inventory) => {
+    syncedPrefs.enabled = true;
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    const pinned = ['temporarily-absent', 'srv-1'];
+    localStorage.setItem('rcc_sync_user-1:server_pinned', JSON.stringify({ v: pinned, t: 100 }));
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') {
+        if (inventory === 'error') throw new Error('offline');
+        return inventory === 'empty' ? { servers: [] } : serverList();
+      }
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      return {};
+    });
+    const { App } = await importApp();
+    const view = render(<App />);
+    await waitFor(() => expect(syncedPrefs.get.mock.calls.some(([key]) => key === 'server_pinned')).toBe(true));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 150)); });
+    expect(JSON.parse(localStorage.getItem('rcc_sync_user-1:server_pinned')!).v).toEqual(pinned);
+    expect(syncedPrefs.save.mock.calls.filter(([key, raw]) => key === 'server_pinned' && JSON.parse(raw).v.length !== 2)).toEqual([]);
+    view.unmount();
+    render(<App />);
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 150)); });
+    expect(JSON.parse(localStorage.getItem('rcc_sync_user-1:server_pinned')!).v).toEqual(pinned);
+  }, 20_000);
+
+  it('pin persistence: explicit toggle preserves temporarily absent pins and permits unpin', async () => {
+    syncedPrefs.enabled = true;
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_sync_user-1:server_pinned', JSON.stringify({ v: ['temporarily-absent'], t: 100 }));
+    const { App } = await importApp();
+    render(<App />);
+    fireEvent.click(await screen.findByText('server-menu'));
+    fireEvent.click(await screen.findByText('server-menu-pin'));
+    await waitFor(() => expect(JSON.parse(localStorage.getItem('rcc_sync_user-1:server_pinned')!).v).toEqual(['temporarily-absent', 'srv-1']));
+    fireEvent.click(await screen.findByText('server-menu'));
+    fireEvent.click(await screen.findByText('server-menu-pin'));
+    await waitFor(() => expect(JSON.parse(localStorage.getItem('rcc_sync_user-1:server_pinned')!).v).toEqual(['temporarily-absent']));
+  }, 20_000);
+
   it('deletes an offline server from the dashboard without a daemon connection', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     let servers = [{ ...serverList().servers[0], status: 'offline', lastHeartbeatAt: null }];

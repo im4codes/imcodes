@@ -215,7 +215,7 @@ import {
 } from './session-list-merge.js';
 import { resolveSessionInfoRuntimeType } from './runtime-type.js';
 import { useSyncedPreference } from './hooks/useSyncedPreference.js';
-import { normalizePinnedServers, normalizeServerOrder, sortServersByPreference } from './server-order.js';
+import { normalizePinnedServers, toggleServerPin, sortServersByPreference } from './server-order.js';
 import { parseString, parseBooleanish, usePref } from './hooks/usePref.js';
 import { CLAUDE_WEEKLY_QUOTA_PREF_KEY } from '@shared/claude-quota.js';
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
@@ -2325,13 +2325,13 @@ export function App() {
   // follow the same cross-device sync path as session tabs. Scope the browser
   // cache by user to avoid briefly showing another account's arrangement.
   const serverPreferenceScope = auth?.userId ?? 'anonymous';
-  const [serverOrder, setServerOrder, serverOrderHydrated] = useSyncedPreference<string[]>(
+  const [serverOrder] = useSyncedPreference<string[]>(
     'server_order',
     [],
     0,
     serverPreferenceScope,
   );
-  const [serverPinned, setServerPinned, serverPinnedHydrated] = useSyncedPreference<string[]>(
+  const [serverPinned, setServerPinned] = useSyncedPreference<string[]>(
     'server_pinned',
     [],
     0,
@@ -2353,23 +2353,12 @@ export function App() {
     () => filterRestrictedSharedEntries(sharedEntries),
     [sharedEntries],
   );
-  useEffect(() => {
-    if (!serversLoaded || !serverOrderHydrated || !serverPinnedHydrated) return;
-    const nextOrder = normalizeServerOrder(servers, serverOrder);
-    if (JSON.stringify(nextOrder) !== JSON.stringify(serverOrder)) setServerOrder(nextOrder);
-    const nextPinned = normalizePinnedServers(servers, serverPinned);
-    if (JSON.stringify(nextPinned) !== JSON.stringify(serverPinned)) setServerPinned(nextPinned);
-  // The comparisons above prevent a persistence loop after reconciliation.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [servers, serversLoaded, serverOrder, serverPinned, serverOrderHydrated, serverPinnedHydrated]);
+  // Inventory is a possibly partial projection (owned/shared discovery, offline
+  // refresh). It must never rewrite durable pin/order intent. Filter only when
+  // rendering; only an explicit user action may change these preferences.
   const toggleServerPinned = useCallback((serverId: string) => {
-    setServerPinned((previous) => {
-      const current = normalizePinnedServers(servers, previous);
-      return current.includes(serverId)
-        ? current.filter((id) => id !== serverId)
-        : [...current, serverId];
-    });
-  }, [servers, setServerPinned]);
+    setServerPinned((previous) => toggleServerPin(previous, serverId));
+  }, [setServerPinned]);
   const [newUserGuidePref, setNewUserGuidePref] = useSyncedPreference<NewUserGuidePref>('new_user_guide', DEFAULT_NEW_USER_GUIDE_PREF, 0);
   const [teamDiscussionGuidePref, setTeamDiscussionGuidePref] = useSyncedPreference<TeamDiscussionGuidePref>('team_discussion_guide', DEFAULT_TEAM_DISCUSSION_GUIDE_PREF, 0);
   const [featureAnnouncementsPending, setFeatureAnnouncementsPending] = useState(true);

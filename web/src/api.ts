@@ -1883,11 +1883,15 @@ export async function updateAdminSettings(settings: AdminSettings): Promise<void
 
 // ── User preferences ───────────────────────────────────────────────────────
 
-export async function getUserPref(key: string): Promise<unknown | null> {
+export async function getUserPref(key: string, options: { strict?: boolean; signal?: AbortSignal } = {}): Promise<unknown | null> {
   try {
-    const res = await apiFetch<{ value: unknown }>(`/api/preferences/${key}`);
+    const res = await apiFetch<{ value: unknown }>(`/api/preferences/${key}`, {
+      signal: options.signal,
+      headers: _expectedUserId ? { [EXPECTED_USER_ID_HEADER]: _expectedUserId } : undefined,
+    });
     return res.value ?? null;
-  } catch {
+  } catch (error) {
+    if (options.strict) throw error;
     return null;
   }
 }
@@ -1942,8 +1946,10 @@ export function onUserPrefChanged(cb: (key: string, value: unknown, meta: UserPr
   };
 }
 
-export async function saveUserPref(key: string, value: unknown): Promise<void> {
+export async function saveUserPref(key: string, value: unknown, options: { signal?: AbortSignal } = {}): Promise<void> {
   await apiFetch(`/api/preferences/${key}`, {
+    signal: options.signal,
+    headers: _expectedUserId ? { [EXPECTED_USER_ID_HEADER]: _expectedUserId } : undefined,
     method: 'PUT',
     body: JSON.stringify({ value }),
   });

@@ -719,6 +719,16 @@ describe('auth nonce exchange API', () => {
     expect(JSON.parse(String(requests[4].body))).toEqual({ ids: ['sub-2', 'sub-1'] });
   });
 
+  it('distinguishes failed preference reads from missing values for strict reconciliation', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValue(jsonResponse({ error: 'unavailable' }, 503));
+    const { getUserPref } = await import('../src/api.js');
+    await expect(getUserPref('server_pinned')).resolves.toBeNull();
+    await expect(getUserPref('server_pinned', { strict: true })).rejects.toMatchObject({ status: 503 });
+    fetchMock.mockResolvedValue(jsonResponse({ value: null }));
+    await expect(getUserPref('server_pinned', { strict: true })).resolves.toBeNull();
+  });
+
   it('keeps current user, admin, and preference wrappers on stable contracts', async () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock

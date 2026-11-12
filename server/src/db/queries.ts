@@ -1,3 +1,4 @@
+import { parseSyncedPreference } from '../../../shared/synced-preference.js';
 import { USER_STATUS, type UserStatus } from '../../../shared/user-status.js';
 import type { Database } from './client.js';
 import type { ContextModelConfig } from '../../../shared/context-types.js';
@@ -1188,10 +1189,28 @@ export async function getUserPref(db: Database, userId: string, key: string): Pr
 }
 
 export async function setUserPref(db: Database, userId: string, key: string, value: string): Promise<void> {
-  await db.execute(
-    'INSERT INTO user_preferences (user_id, key, value, updated_at) VALUES ($1, $2, $3, $4) ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at',
-    [userId, key, value, Date.now()],
-  );
+  // The route serializes `value`; old clients put a JSON-string envelope inside
+  // it, while others send an object. Plain scalar preferences keep their API.
+  const parseStored = (raw: string) => {
+    try { return parseSyncedPreference(JSON.parse(raw)); } catch { return null; }
+  };
+  const incoming = parseStored(value);
+  const write = async (tx: Database) => {
+    await tx.execute(
+      'INSERT INTO user_preferences (user_id, key, value, updated_at) VALUES ($1, $2, $3, $4) ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at',
+      [userId, key, value, Date.now()],
+    );
+  };
+  if (!incoming) { await write(db); return; }
+  await db.transaction(async (tx) => {
+    // Lock even an absent row: SELECT FOR UPDATE alone races on first insert.
+    // Transaction-scoped and database-backed, so concurrent pods agree too.
+    await tx.queryOne('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [JSON.stringify([userId, key])]);
+    const raw = await getUserPref(tx, userId, key);
+    const current = raw === null ? null : parseStored(raw);
+    if (current && current.t >= incoming.t) return; // server wins existing ties
+    await write(tx);
+  });
 }
 
 export async function deleteUserPref(db: Database, userId: string, key: string): Promise<void> {
