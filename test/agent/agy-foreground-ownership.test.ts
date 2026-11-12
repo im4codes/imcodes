@@ -1,8 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { AgyForegroundOwnership } from '../../src/agent/agy-foreground-ownership.js';
+import { AgyForegroundOwnership, NATIVE_OUTPUT_DEADLINE_MS } from '../../src/agent/agy-foreground-ownership.js';
 import type { AgyTranscriptRow } from '../../src/agent/agy-transcript-bridge.js';
 const row = (step: number, type: string, content: string, source = 'MODEL'): AgyTranscriptRow => ({step_index:step,type,content,source,status:'DONE'});
 describe('AG captured native foreground ownership', () => {
+  it('uses an extended default attribution deadline (45s-60s) for multi-step native turns', () => {
+    expect(NATIVE_OUTPUT_DEADLINE_MS).toBeGreaterThanOrEqual(45_000);
+    expect(NATIVE_OUTPUT_DEADLINE_MS).toBeLessThanOrEqual(60_000);
+  });
   it('binds wrapped explicit inputs FIFO, not repeated output body or ACP arrival', async () => {
     const owner=new AgyForegroundOwnership();owner.register(1,'same user');owner.register(2,'same user');
     owner.observe(row(0,'USER_INPUT','wrapper same user tail','USER_EXPLICIT'));
@@ -33,5 +37,80 @@ describe('AG captured native foreground ownership', () => {
     owner.register(2,'next');const cancelled=owner.output(2);owner.clear();expect(await cancelled).toBeUndefined();
     expect(owner.latest).toBeUndefined();owner.register(3,'next');owner.observe(row(2,'USER_INPUT','next','USER_EXPLICIT'));
     owner.observe(row(3,'PLANNER_RESPONSE','new owner'));expect((await owner.output(3))?.content).toBe('new owner');
+  });
+  it('retains active foreground lane across mid-turn peer SYSTEM_MESSAGE and multi-step tool calls', async () => {
+    const owner = new AgyForegroundOwnership(100);
+    owner.register(1, 'execute complex multi-step investigation');
+    owner.observe(row(0, 'USER_INPUT', '<USER_REQUEST>\nexecute complex multi-step investigation\n</USER_REQUEST>', 'USER_EXPLICIT'));
+    expect(owner.hasActiveLane()).toBe(true);
+    owner.observe({ ...row(1, 'PLANNER_RESPONSE', 'step 1 tool'), tool_calls: [{ name: 'run_command' }] });
+    owner.observe(row(2, 'SYSTEM_MESSAGE', '[Message] sender=subagent_a content=intermediate update'));
+    expect(owner.hasActiveLane()).toBe(true);
+    owner.observe({ ...row(3, 'PLANNER_RESPONSE', 'step 2 tool'), tool_calls: [{ name: 'read_file' }] });
+    owner.observe(row(4, 'SYSTEM_MESSAGE', '[Message] sender=subagent_b content=second update'));
+    expect(owner.hasActiveLane()).toBe(true);
+    expect(owner.observe(row(5, 'PLANNER_RESPONSE', 'final synthesized foreground answer'))).toBe(true);
+    expect(owner.hasActiveLane()).toBe(false);
+    expect((await owner.output(1))?.content).toBe('final synthesized foreground answer');
+    expect((await owner.output(1))?.step_index).toBe(5);
+    // Subsequent reactive peer message after foreground settled must not overwrite prompt 1
+    owner.observe(row(6, 'SYSTEM_MESSAGE', '[Message] sender=subagent_c content=post-turn wakeup'));
+    expect(owner.observe(row(7, 'PLANNER_RESPONSE', 'reactive follow-up'))).toBe(false);
+    expect((await owner.output(1))?.step_index).toBe(5);
+  });
+  it('matches normalized <USER_REQUEST> wrappers, CRLF newlines, and truncated long prompt prefixes', async () => {
+    const owner = new AgyForegroundOwnership(50);
+    owner.register(1, 'first line\r\nsecond   line\r\n\r\nthird line');
+    owner.observe(row(0, 'USER_INPUT', '<USER_REQUEST>\nfirst line\nsecond line\nthird line\n</USER_REQUEST>\n<ADDITIONAL_METADATA>meta</ADDITIONAL_METADATA>', 'USER_EXPLICIT'));
+    owner.observe(row(1, 'PLANNER_RESPONSE', 'normalized match ok'));
+    expect((await owner.output(1))?.content).toBe('normalized match ok');
+
+    const longPrompt = 'Context instructions: '.repeat(6) + 'implement foreground ownership fix with full verification and tail marker XYZ-999';
+    owner.register(2, longPrompt);
+    const truncatedInLog = `<USER_REQUEST>\n${longPrompt.slice(0, 140)}...[truncated]\n</USER_REQUEST>`;
+    owner.observe(row(2, 'USER_INPUT', truncatedInLog, 'USER_EXPLICIT'));
+    owner.observe(row(3, 'PLANNER_RESPONSE', 'truncated prefix match ok'));
+    expect((await owner.output(2))?.content).toBe('truncated prefix match ok');
+  });
+  it('does not mis-bind similar prefixes with divergent suffixes or ambiguous multiple pending prompts', async () => {
+    const owner = new AgyForegroundOwnership(20);
+    const sharedPrefix = 'Shared system context header block for agent session '.repeat(3); // > 150 chars
+    owner.register(1, `${sharedPrefix} :: execute task ALPHA`);
+    // Foreign input shares the 150+ char prefix but has a different suffix BETA
+    owner.observe(row(0, 'USER_INPUT', `<USER_REQUEST>${sharedPrefix} :: execute task BETA</USER_REQUEST>`, 'USER_EXPLICIT'));
+    owner.observe(row(1, 'PLANNER_RESPONSE', 'wrong beta output'));
+    expect(await owner.output(1)).toBeUndefined();
+
+    // Multiple pending prompts sharing the same prefix: truncated prefix is ambiguous and must not guess
+    owner.register(2, `${sharedPrefix} :: execute task BETA`);
+    owner.observe(row(2, 'USER_INPUT', `<USER_REQUEST>${sharedPrefix.slice(0, 120)}...</USER_REQUEST>`, 'USER_EXPLICIT'));
+    owner.observe(row(3, 'PLANNER_RESPONSE', 'ambiguous output'));
+    expect(await owner.output(1)).toBeUndefined();
+    expect(await owner.output(2)).toBeUndefined();
+
+    // Full input for BETA binds specifically to generation 2, not generation 1
+    owner.observe(row(4, 'USER_INPUT', `<USER_REQUEST>${sharedPrefix} :: execute task BETA</USER_REQUEST>`, 'USER_EXPLICIT'));
+    owner.observe(row(5, 'PLANNER_RESPONSE', 'exact beta output'));
+    expect((await owner.output(2))?.content).toBe('exact beta output');
+    expect(await owner.output(1)).toBeUndefined();
+  });
+  it('clears active lane on release after timeout so late native output cannot pollute the next turn', async () => {
+    const owner = new AgyForegroundOwnership(20);
+    owner.register(1, 'turn one payload');
+    owner.observe(row(0, 'USER_INPUT', 'turn one payload', 'USER_EXPLICIT'));
+    expect(owner.hasActiveLane()).toBe(true);
+    expect(await owner.output(1)).toBeUndefined();
+    owner.release(1);
+    expect(owner.hasActiveLane()).toBe(false);
+    // Late PLANNER_RESPONSE from timed-out turn 1 arrives after release(1)
+    expect(owner.observe(row(1, 'PLANNER_RESPONSE', 'late turn one output'))).toBe(false);
+    expect(owner.latest).toBeUndefined();
+
+    // Turn 2 proceeds cleanly without pollution from turn 1
+    owner.register(2, 'turn two payload');
+    owner.observe(row(2, 'USER_INPUT', 'turn two payload', 'USER_EXPLICIT'));
+    expect(owner.observe(row(3, 'PLANNER_RESPONSE', 'turn two output'))).toBe(true);
+    expect((await owner.output(2))?.content).toBe('turn two output');
+    expect(owner.latest?.generation).toBe(2);
   });
 });

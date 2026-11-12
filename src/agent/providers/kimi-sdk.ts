@@ -693,7 +693,7 @@ export class KimiSdkProvider implements TransportProvider {
       }
       return;
     }
-    state.agyForeground?.observe(row);
+    const claimedByForeground = state.agyForeground?.observe(row) === true;
     if (row.type === 'SYSTEM_MESSAGE' && /\[Message\].*sender=/.test(row.content ?? '')) this.useAgyNativeOutput(state);
     if (row.type === 'PLANNER_RESPONSE' && row.tool_calls?.length) {
       if (row.tool_calls.some(call => /^(invokesubagent|browsersubagent|sendmessage|swarm)$/.test(normalizeAgyToolName(call.name ?? '')))) this.useAgyNativeOutput(state);
@@ -716,9 +716,9 @@ export class KimiSdkProvider implements TransportProvider {
         }
       }
     }
-    if (row.type === 'USER_INPUT') state.agyReactive = false;
-    if (row.type === 'SYSTEM_MESSAGE' && /\[Message\].*sender=/.test(row.content ?? '')) state.agyReactive = true;
-    if (row.type !== 'PLANNER_RESPONSE' || !row.content?.trim() || row.tool_calls?.length || !state.agyReactive) return;
+    if (row.type === 'USER_INPUT' || claimedByForeground) state.agyReactive = false;
+    if (row.type === 'SYSTEM_MESSAGE' && /\[Message\].*sender=/.test(row.content ?? '') && !state.agyForeground?.hasActiveLane()) state.agyReactive = true;
+    if (claimedByForeground || row.type !== 'PLANNER_RESPONSE' || !row.content?.trim() || row.tool_calls?.length || !state.agyReactive) return;
     state.agyReactive = false;
     (state.agyPendingResponses ??= new Map()).set(row.step_index, row);
     this.deliverAgyPendingResponses(sessionId,state);

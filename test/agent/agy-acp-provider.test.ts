@@ -272,6 +272,24 @@ describe('AG native ACP', () => {
     expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
     expect((provider as any).sessions.get(id).agyBridges.size).toBe(0);
   });
+  it('attributes foreground output once when a peer SYSTEM_MESSAGE arrives during active tool calls',async()=>{
+    const {provider,root}=await setup('native-child-no-owned-output');const id=await route(provider),done=vi.fn(),errors=vi.fn();provider.onComplete(done);provider.onError(errors);
+    await provider.send(id,'launch');
+    const state=(provider as any).sessions.get(id);
+    await vi.waitFor(()=>expect(state.agyForeground?.authoritative).toBe(true), { timeout: 5000 });
+    await (provider as any).promptTerminals.get(state);
+    const native=state.acpSessionId;
+    const file=path.join(root,'.gemini/antigravity-cli/brain',native,'.system_generated/logs/transcript_full.jsonl');
+    await appendFile(file,
+      JSON.stringify({step_index:3,type:'SYSTEM_MESSAGE',status:'DONE',content:'[Message] sender=peer content=mid-turn note'})+'\n'+
+      JSON.stringify({step_index:4,type:'PLANNER_RESPONSE',status:'DONE',content:'',tool_calls:[{name:'read_file',args:{Path:'/tmp/x'}}]})+'\n'+
+      JSON.stringify({step_index:5,type:'PLANNER_RESPONSE',status:'DONE',content:'FOREGROUND-AFTER-MID-TURN-MESSAGE'})+'\n');
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(done.mock.calls[0][1].content).toBe('FOREGROUND-AFTER-MID-TURN-MESSAGE');
+    expect(errors).not.toHaveBeenCalled();
+    await new Promise(r=>setTimeout(r,200));
+    expect(done).toHaveBeenCalledTimes(1);
+  });
   it('keeps ordinary no-async ACP chunk streaming before the prompt RPC terminates',async()=>{
     const {provider}=await setup('stream-before-ack');const id=await route(provider),done=vi.fn(),deltas=vi.fn();provider.onComplete(done);provider.onDelta(deltas);
     await provider.send(id,'normal');await vi.waitFor(()=>expect(deltas.mock.calls.some(([,d])=>d.delta==='direct ')).toBe(true), { timeout: 5000 });
