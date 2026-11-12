@@ -38,7 +38,7 @@ import {
   TASK_PAIR_WORKSPACE_REQUESTS,
   TASK_PAIR_WORKTREE_ONLY_WHEN_NECESSARY,
 } from './task-pair-workspace.js';
-import { TASK_PAIR_BRAIN_CLOSE_TOOL_NOTE, TASK_PAIR_BRAIN_CLOSE_TOOL_SHORT_NOTE } from './task-pair.js';
+import { TASK_PAIR_BRAIN_CLOSE_TOOL_NOTE, TASK_PAIR_BRAIN_CLOSE_TOOL_SHORT_NOTE, TASK_PAIR_SPLIT_UNRELATED_RULE } from './task-pair.js';
 import { MACHINE_FILE_TRANSFER_TRANSPORT } from './machine-direct-file-transfer.js';
 import { TRANSPORT_EFFORT_LEVELS } from './effort-levels.js';
 import {
@@ -862,7 +862,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]: {
     name: MEMORY_MCP_TOOL_NAMES.PAIR_CREATE,
-    description: 'Brain-only structured creation of a task pair. Persists the brief and assignments atomically, then delivers participant briefs with durable delivery receipts. Retry with the same idempotencyKey to replay without duplicate creation or sends. Unnamed roles come from the pool; with no pool, from idle same-vendor secondary-tier sub-sessions, creating missing ones (capped, marked autoCreated). createExecutor/createAuditor create one. ' + TASK_PAIR_SUBSESSION_TERM_SHORT + ' ' + TASK_PAIR_BRAIN_CLOSE_TOOL_SHORT_NOTE + ' ' + TASK_PAIR_WORKTREE_ONLY_WHEN_NECESSARY + ' ' + TASK_PAIR_WORKSPACE_PICK_GUIDANCE,
+    description: 'Brain-only structured creation of a task pair. Persists the brief and assignments atomically, then delivers participant briefs with durable delivery receipts. Retry with the same idempotencyKey to replay without duplicate creation or sends. Unnamed roles come from the pool; with no pool, from idle same-vendor secondary-tier sub-sessions, creating missing ones (capped, marked autoCreated). createExecutor/createAuditor create one. ' + TASK_PAIR_SUBSESSION_TERM_SHORT + ' ' + TASK_PAIR_BRAIN_CLOSE_TOOL_SHORT_NOTE + ' ' + TASK_PAIR_SPLIT_UNRELATED_RULE + ' ' + TASK_PAIR_WORKTREE_ONLY_WHEN_NECESSARY + ' ' + TASK_PAIR_WORKSPACE_PICK_GUIDANCE,
     inputSchema: objectSchema({
       taskId: stringSchema('Optional stable task id. When omitted, idempotencyKey deterministically derives one.'),
       title: stringSchema('Short specific title in the owner UI language.'),

@@ -728,6 +728,10 @@ export const TASK_PAIR_SPLIT_UNRELATED_RULE: string =
   + 'into separate, independently executed, audited and merged task pairs — never '
   + 'mix unrelated work into one pair.';
 
+/** Compact snake_case token used by the Brain duty tables in supervision-prompts.ts. */
+export const TASK_PAIR_SPLIT_UNRELATED_TOKEN =
+  'split_unrelated_tasks_into_separate_pairs_never_mix_unrelated_work_in_one_pair' as const;
+
 /** Short liveness rule shown with Brain decision notices. */
 export const TASK_PAIR_BRAIN_REPLY_RESOLUTION_RULE: string =
   'A plain reply to the participant (including delegation_reply) resolves the wait and stops reminders.';

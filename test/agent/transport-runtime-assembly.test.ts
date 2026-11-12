@@ -16,7 +16,7 @@ import { VERIFICATION_MACHINE_MCP_TOOLS } from '../../shared/verification-machin
 import { ALIAS_MCP_TOOLS } from '../../shared/alias-types.js';
 import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
 import { AUDIT_CONVERGENCE_CONTRACT_ID } from '../../shared/audit-convergence.js';
-import { TASK_PAIR_BRAIN_CONTRACT_ID, TASK_PAIR_CONTRACT_ID } from '../../shared/task-pair.js';
+import { TASK_PAIR_BRAIN_CONTRACT_ID, TASK_PAIR_CONTRACT_ID, TASK_PAIR_SPLIT_UNRELATED_RULE, TASK_PAIR_SPLIT_UNRELATED_TOKEN } from '../../shared/task-pair.js';
 import { buildFileOutputContract } from '../../shared/file-output-contract.js';
 import { CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../shared/cron-types.js';
 import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
@@ -313,6 +313,8 @@ describe('buildProviderContextPayload', () => {
     expect(text).toContain('"automaticSupervision":true');
     expect(text).toContain('"engine":"pairs"');
     expect(text).toContain('pair_create_with_brief_and_roles_then_pair_dispatch_if_queued');
+    expect(text).toContain(TASK_PAIR_SPLIT_UNRELATED_TOKEN);
+    expect(text).toContain(TASK_PAIR_SPLIT_UNRELATED_RULE);
     expect(text).toContain('never_ask_or_explain_them');
     // Engine-neutral routing stays.
     expect(text).toContain('coordinate_not_implement');
