@@ -474,4 +474,71 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(voiceMock.startListening).toHaveBeenCalledTimes(2);
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
   });
+
+  it('runtime recognitionError joins stopListening drain before releasing hold transaction so retry release never leaves microphone active', async () => {
+    let releaseOldStop!: () => void;
+    const oldStop = new Promise<void>((r) => { releaseOldStop = r; });
+    let activeListening = false;
+    voiceMock.startListening.mockImplementation(async (
+      onResult: (partial: string) => void,
+      onListeningChange?: (listening: boolean) => void,
+      onError?: (error: string) => void,
+    ) => {
+      voiceMock.partialHandler = onResult;
+      voiceMock.listeningHandler = onListeningChange ?? null;
+      voiceMock.errorHandler = onError ?? null;
+      activeListening = true;
+      onListeningChange?.(true);
+      return true;
+    });
+    voiceMock.stopListening
+      .mockImplementationOnce(async () => {
+        await oldStop;
+        activeListening = false;
+      })
+      .mockImplementation(async () => {
+        activeListening = false;
+      });
+
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = document.querySelector('.controls-input') as HTMLElement;
+    dispatchPointer(input, 'pointerdown', 180);
+    await vi.advanceTimersByTimeAsync(350);
+    expect(voiceMock.startListening).toHaveBeenCalledTimes(1);
+
+    // Runtime error during active hold triggers failTransaction -> finalizeVoiceHold('failed')
+    voiceMock.errorHandler?.('decoder interrupted');
+    dispatchPointer(input, 'pointerup', 180);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(voiceMock.stopListening).toHaveBeenCalledTimes(1);
+
+    // Retry hold and release while old stop ACK is still draining
+    dispatchPointer(input, 'pointerdown', 180);
+    await vi.advanceTimersByTimeAsync(350);
+    dispatchPointer(input, 'pointerup', 180);
+    await vi.advanceTimersByTimeAsync(0);
+
+    releaseOldStop();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(activeListening).toBe(false);
+
+    // After old error drain completes, a fresh hold can start and stop cleanly
+    dispatchPointer(input, 'pointerdown', 180);
+    await vi.advanceTimersByTimeAsync(350);
+    expect(voiceMock.startListening).toHaveBeenCalledTimes(2);
+    dispatchPointer(input, 'pointerup', 180);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(activeListening).toBe(false);
+  });
 });

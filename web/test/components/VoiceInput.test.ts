@@ -322,6 +322,33 @@ describe('mobile capture defenses', () => {
       await VoiceInput.stopListening();
     }
   });
+
+  it('cancels a queued startListening waiting on an in-flight error stop drain when stopListening is called before the old stop ACK arrives', async () => {
+    const oldStop = deferred<void>();
+    speechApi.stop.mockReturnValueOnce(oldStop.promise).mockResolvedValue(undefined);
+    try {
+      expect(await VoiceInput.startListening(vi.fn())).toBe(true);
+      expect(speechApi.start).toHaveBeenCalledTimes(1);
+
+      // Runtime recognitionError triggers asynchronous stop drain (oldStop pending)
+      listeners.recognitionError?.({ message: 'decoder interrupted' });
+      expect(speechApi.stop).toHaveBeenCalledTimes(1);
+
+      // Retry start queues behind _pendingStop, then user releases (stopListening) before oldStop settles
+      const retryStart = VoiceInput.startListening(vi.fn());
+      const retryStop = VoiceInput.stopListening();
+
+      oldStop.resolve();
+      expect(await retryStart).toBe(false);
+      await retryStop;
+
+      expect(speechApi.start).toHaveBeenCalledTimes(1);
+      expect(VoiceInput.isListening()).toBe(false);
+    } finally {
+      oldStop.resolve();
+      await VoiceInput.stopListening();
+    }
+  });
 });
 
 

@@ -76,6 +76,8 @@ export function isAvailable(): boolean {
 
 let _listening = false;
 let _generation = 0;
+let _intentSeq = 0;
+let _lastStopIntent = 0;
 let _pendingStart: Promise<boolean> | null = null;
 let _pendingStop: Promise<void> | null = null;
 let _nativeSession: { recognition: NativeSpeechRecognition } | null = null;
@@ -488,8 +490,13 @@ export async function startListening(
     return false;
   }
 
+  const startIntent = ++_intentSeq;
+
   if (!isNative()) {
-    if (_pendingStop) await _pendingStop;
+    if (_pendingStop) {
+      await _pendingStop;
+      if (startIntent < _lastStopIntent) return false;
+    }
     _onResult = onResult;
     _onListeningChange = onListeningChange ?? null;
     if (_listening) {
@@ -501,6 +508,7 @@ export async function startListening(
 
   if (_pendingStop) {
     await _pendingStop;
+    if (startIntent < _lastStopIntent) return false;
   }
 
   _onResult = onResult;
@@ -526,6 +534,7 @@ export async function startListening(
 }
 
 export async function stopListening(): Promise<void> {
+  _lastStopIntent = ++_intentSeq;
   if (!isAvailable()) return;
 
   if (!isNative()) {
@@ -537,7 +546,10 @@ export async function stopListening(): Promise<void> {
     return;
   }
 
-  if (_pendingStop) return _pendingStop;
+  if (_pendingStop) {
+    _generation++;
+    return _pendingStop;
+  }
   const startPromise = _pendingStart;
   const session = _nativeSession;
   const shouldStopNative = _listening || !!startPromise;

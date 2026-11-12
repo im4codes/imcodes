@@ -5159,17 +5159,18 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setVoiceHoldZone('send');
     }
 
-    const shouldRequestStop = outcome !== 'failed' || !tx.startSettled;
     tx.phase = outcome === 'failed' ? 'failed' : 'draining';
 
     tx.drainPromise = (async () => {
       try {
-        // Request stop BEFORE awaiting startPromise so a pending native start
-        // (waiting on permission / first PCM / startingCall) is aborted immediately
-        // via VoiceInput's generation barrier instead of deadlocking.
-        const stopTask = shouldRequestStop
-          ? Promise.resolve(VoiceInput.stopListening()).catch(() => {})
-          : Promise.resolve();
+        // Always join the idempotent VoiceInput.stopListening() barrier BEFORE
+        // awaiting startPromise:
+        // 1. If native start is still pending (permission / first PCM / startingCall),
+        //    stopListening immediately aborts it via the generation barrier.
+        // 2. If recording already started and failed at runtime (recognitionError),
+        //    stopListening joins the active native stop drain so voiceHoldTxRef is
+        //    not released until the underlying native session has fully stopped.
+        const stopTask = Promise.resolve(VoiceInput.stopListening()).catch(() => {});
         if (!tx.startPromise) {
           await Promise.resolve();
         }
