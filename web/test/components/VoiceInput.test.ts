@@ -302,6 +302,26 @@ describe('mobile capture defenses', () => {
       expect(speechApi.stop).not.toHaveBeenCalled();
     } finally { await VoiceInput.stopListening(); vi.useRealTimers(); }
   });
+
+  it('cancelling via stopListening while requestPermissions is pending prevents late permission grant from starting native capture', async () => {
+    const permGate = deferred<{ speechRecognition: string }>();
+    speechApi.requestPermissions.mockReturnValueOnce(permGate.promise);
+    try {
+      const startTask = VoiceInput.startListening(vi.fn());
+      const stopTask = VoiceInput.stopListening();
+      permGate.resolve({ speechRecognition: 'granted' });
+      expect(await startTask).toBe(false);
+      await stopTask;
+      expect(speechApi.start).not.toHaveBeenCalled();
+      expect(VoiceInput.isListening()).toBe(false);
+
+      // Next start succeeds normally
+      expect(await VoiceInput.startListening(vi.fn())).toBe(true);
+      expect(speechApi.start).toHaveBeenCalledTimes(1);
+    } finally {
+      await VoiceInput.stopListening();
+    }
+  });
 });
 
 

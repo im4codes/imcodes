@@ -1278,6 +1278,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     phase: 'starting' | 'recording' | 'draining' | 'failed' | 'settled';
     error: string | null;
     settled: boolean;
+    startSettled: boolean;
     startPromise: Promise<boolean> | null;
     drainPromise: Promise<void> | null;
   } | null>(null);
@@ -5142,6 +5143,77 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }, durationMs);
   }, []);
 
+  const finalizeVoiceHold = useCallback((
+    tx: NonNullable<typeof voiceHoldTxRef.current>,
+    outcome: 'send' | 'cancel' | 'edit' | 'failed',
+  ): Promise<void> => {
+    if (tx.drainPromise !== null) return tx.drainPromise;
+    voiceHoldPointerRef.current = null;
+    voiceHoldActiveRef.current = false;
+    clearVoiceHoldTimers();
+    VoiceInput.onAudioLevel(null);
+    if (mountedRef.current) {
+      setVoiceHoldPending(false);
+      setVoiceHoldRecognizing(false);
+      setVoiceHoldActive(false);
+      setVoiceHoldZone('send');
+    }
+
+    const shouldRequestStop = outcome !== 'failed' || !tx.startSettled;
+    tx.phase = outcome === 'failed' ? 'failed' : 'draining';
+
+    tx.drainPromise = (async () => {
+      try {
+        // Request stop BEFORE awaiting startPromise so a pending native start
+        // (waiting on permission / first PCM / startingCall) is aborted immediately
+        // via VoiceInput's generation barrier instead of deadlocking.
+        const stopTask = shouldRequestStop
+          ? Promise.resolve(VoiceInput.stopListening()).catch(() => {})
+          : Promise.resolve();
+        if (!tx.startPromise) {
+          await Promise.resolve();
+        }
+        const started = tx.startPromise ? await tx.startPromise : false;
+        await stopTask;
+
+        if (tx.settled || outcome === 'failed' || !started || tx.error !== null || !mountedRef.current) {
+          tx.settled = true;
+          tx.phase = 'settled';
+          return;
+        }
+        tx.settled = true;
+        tx.phase = 'settled';
+
+        if (outcome === 'cancel') {
+          return;
+        }
+
+        const spoken = tx.transcript.trim();
+        const base = tx.baseText;
+        const combined = base
+          ? (spoken ? `${base}${base.endsWith(' ') || base.endsWith('\n') ? '' : ' '}${spoken}` : base)
+          : spoken;
+
+        if (outcome === 'edit') {
+          setVoiceOverlayInitialText(combined);
+          setVoiceOverlayAutoStart(false);
+          setVoiceOpen(true);
+          return;
+        }
+        if (spoken && combined.trim()) {
+          handleVoiceSend(combined.trim());
+        }
+      } finally {
+        tx.settled = true;
+        if (voiceHoldTxRef.current === tx) {
+          voiceHoldTxRef.current = null;
+        }
+      }
+    })();
+
+    return tx.drainPromise;
+  }, [clearVoiceHoldTimers, handleVoiceSend]);
+
   const handleComposerVoicePointerDown = useCallback((event: PointerEvent) => {
     if (handledVoicePointerEventsRef.current.has(event)) return;
     handledVoicePointerEventsRef.current.add(event);
@@ -5186,6 +5258,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         phase: 'starting' as 'starting' | 'recording' | 'draining' | 'failed' | 'settled',
         error: null as string | null,
         settled: false,
+        startSettled: false,
         startPromise: null as Promise<boolean> | null,
         drainPromise: null as Promise<void> | null,
       };
@@ -5201,22 +5274,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setVoiceHoldRecognizing(true);
 
       const failTransaction = (errCode: string) => {
-        if (tx.settled || tx.phase === 'failed') return;
+        if (tx.settled || tx.error !== null) return;
         tx.phase = 'failed';
         tx.error = errCode || 'permission_denied';
-        voiceHoldActiveRef.current = false;
-        clearVoiceHoldTimers();
-        VoiceInput.onAudioLevel(null);
         if (mountedRef.current) {
-          setVoiceHoldRecognizing(false);
-          setVoiceHoldActive(false);
-          setVoiceHoldZone('send');
           setVoiceHoldError(tx.error);
         }
+        void finalizeVoiceHold(tx, 'failed');
       };
 
       VoiceInput.onAudioLevel((rawLevel) => {
-        if (!mountedRef.current || voiceHoldTxRef.current !== tx || tx.settled || tx.phase === 'failed' || tx.phase === 'draining') return;
+        if (!mountedRef.current || voiceHoldTxRef.current !== tx || tx.settled || tx.error !== null || tx.phase === 'draining') return;
         const level = Math.max(0, Math.min(1, Number.isFinite(rawLevel) ? rawLevel : 0));
         if (level > 0.015) pulseVoiceHoldRecognizing(1800);
         const prev = voiceHoldBarsRef.current;
@@ -5227,7 +5295,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
       tx.startPromise = VoiceInput.startListening(
         (partial) => {
-          if (tx.settled || tx.phase === 'failed') return;
+          if (tx.settled || tx.error !== null) return;
           tx.transcript = partial;
           if (mountedRef.current && voiceHoldTxRef.current === tx && (tx.phase === 'starting' || tx.phase === 'recording')) {
             setVoiceHoldText(partial);
@@ -5240,8 +5308,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         },
       ).then(
         (started) => {
-          if (!started || tx.phase === 'failed') {
-            failTransaction(tx.error ?? 'permission_denied');
+          tx.startSettled = true;
+          if (!started || tx.error !== null) {
+            if (tx.drainPromise === null) {
+              failTransaction(tx.error ?? 'permission_denied');
+            }
             return false;
           }
           if (tx.phase === 'starting') {
@@ -5250,23 +5321,27 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           return true;
         },
         (err) => {
-          failTransaction(err instanceof Error ? err.message : 'permission_denied');
+          tx.startSettled = true;
+          if (tx.drainPromise === null) {
+            failTransaction(err instanceof Error ? err.message : 'permission_denied');
+          }
           return false;
         },
       );
     }, 350);
-  }, [inputDisabled, voiceOpen, pulseVoiceHoldRecognizing, clearVoiceHoldTimers]);
+  }, [inputDisabled, voiceOpen, pulseVoiceHoldRecognizing, clearVoiceHoldTimers, finalizeVoiceHold]);
 
   const handleComposerVoicePointerMove = useCallback((event: PointerEvent) => {
     if (handledVoicePointerEventsRef.current.has(event)) return;
     handledVoicePointerEventsRef.current.add(event);
     const ptr = voiceHoldPointerRef.current;
-    if (!ptr || (event.pointerId !== undefined && event.pointerId !== ptr.id)) return;
-    const dx = (event.clientX ?? 0) - ptr.startX;
-    const dy = (event.clientY ?? 0) - ptr.startY;
-
     const tx = voiceHoldTxRef.current;
-    if (!tx || (tx.phase !== 'starting' && tx.phase !== 'recording')) {
+    if (ptr && event.pointerId !== undefined && event.pointerId !== ptr.id) return;
+    if (!ptr && !tx) return;
+
+    if (!tx) {
+      const dx = (event.clientX ?? 0) - ptr!.startX;
+      const dy = (event.clientY ?? 0) - ptr!.startY;
       if (Math.hypot(dx, dy) > 18) {
         clearVoiceHoldTimers();
         voiceHoldPointerRef.current = null;
@@ -5274,7 +5349,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       }
       return;
     }
+    if (tx.phase !== 'starting' && tx.phase !== 'recording') {
+      if (tx.phase === 'failed') {
+        void finalizeVoiceHold(tx, 'failed');
+      }
+      return;
+    }
+    if (!ptr) return;
 
+    const dx = (event.clientX ?? 0) - ptr.startX;
     event.preventDefault();
     let nextZone: 'send' | 'cancel' | 'edit' = 'send';
     if (dx <= -44) nextZone = 'cancel';
@@ -5286,80 +5369,32 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setVoiceHoldZone(nextZone);
       try { navigator.vibrate?.(12); } catch { /* ignore */ }
     }
-  }, [clearVoiceHoldTimers]);
+  }, [clearVoiceHoldTimers, finalizeVoiceHold]);
 
   const handleComposerVoicePointerEnd = useCallback((event: PointerEvent, cancelled = false) => {
     if (handledVoicePointerEventsRef.current.has(event)) return;
     handledVoicePointerEventsRef.current.add(event);
     const ptr = voiceHoldPointerRef.current;
-    if (!ptr || (event.pointerId !== undefined && event.pointerId !== ptr.id)) return;
+    const tx = voiceHoldTxRef.current;
+    if (ptr && event.pointerId !== undefined && event.pointerId !== ptr.id) return;
+    if (!ptr && !tx) return;
     voiceHoldPointerRef.current = null;
     setVoiceHoldPending(false);
 
     if (voiceHoldTimerRef.current !== null) {
       clearTimeout(voiceHoldTimerRef.current);
       voiceHoldTimerRef.current = null;
-      if (!cancelled && !ptr.wasFocused) {
+      if (!cancelled && ptr && !ptr.wasFocused) {
         divRef.current?.focus();
       }
       return;
     }
 
-    const tx = voiceHoldTxRef.current;
     if (!tx || tx.settled || tx.drainPromise !== null) return;
     event.preventDefault();
     const finalZone: 'send' | 'cancel' | 'edit' = cancelled ? 'cancel' : tx.zone;
-    voiceHoldActiveRef.current = false;
-    clearVoiceHoldTimers();
-    setVoiceHoldActive(false);
-    setVoiceHoldZone('send');
-    setVoiceHoldRecognizing(false);
-    VoiceInput.onAudioLevel(null);
-
-    tx.drainPromise = (async () => {
-      try {
-        const started = tx.startPromise ? await tx.startPromise : false;
-        if (!started || tx.phase === 'failed') {
-          tx.settled = true;
-          tx.phase = 'settled';
-          return;
-        }
-        tx.phase = 'draining';
-        await VoiceInput.stopListening();
-        if (tx.settled || tx.error !== null || !mountedRef.current) {
-          tx.settled = true;
-          tx.phase = 'settled';
-          return;
-        }
-        tx.settled = true;
-        tx.phase = 'settled';
-
-        if (finalZone === 'cancel') {
-          return;
-        }
-
-        const spoken = tx.transcript.trim();
-        const base = tx.baseText;
-        const combined = base
-          ? (spoken ? `${base}${base.endsWith(' ') || base.endsWith('\n') ? '' : ' '}${spoken}` : base)
-          : spoken;
-
-        if (finalZone === 'edit') {
-          setVoiceOverlayInitialText(combined);
-          setVoiceOverlayAutoStart(false);
-          setVoiceOpen(true);
-          return;
-        }
-        if (spoken && combined.trim()) {
-          handleVoiceSend(combined.trim());
-        }
-      } finally {
-        if (voiceHoldTxRef.current === tx) {
-          voiceHoldTxRef.current = null;
-        }
-      }
-    })();
-  }, [clearVoiceHoldTimers, handleVoiceSend]);
+    void finalizeVoiceHold(tx, tx.error !== null ? 'failed' : finalZone);
+  }, [finalizeVoiceHold]);
 
   useEffect(() => {
     const el = divRef.current;
@@ -5372,11 +5407,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     el.addEventListener('pointermove', onMove);
     el.addEventListener('pointerup', onUp);
     el.addEventListener('pointercancel', onCancel);
+    el.addEventListener('lostpointercapture', onCancel);
     return () => {
       el.removeEventListener('pointerdown', onDown);
       el.removeEventListener('pointermove', onMove);
       el.removeEventListener('pointerup', onUp);
       el.removeEventListener('pointercancel', onCancel);
+      el.removeEventListener('lostpointercapture', onCancel);
     };
   }, [handleComposerVoicePointerDown, handleComposerVoicePointerMove, handleComposerVoicePointerEnd]);
 

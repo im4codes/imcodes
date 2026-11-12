@@ -408,4 +408,70 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
 
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
   });
+
+  it('releasing during pending native start requests stop without waiting for the start promise', async () => {
+    let release!: (ok: boolean) => void;
+    voiceMock.startListening.mockImplementationOnce(() => new Promise<boolean>((r) => { release = r; }));
+    voiceMock.stopListening.mockImplementationOnce(async () => {
+      release(false);
+    });
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = document.querySelector('.controls-input') as HTMLElement;
+    dispatchPointer(input, 'pointerdown', 180);
+    await vi.advanceTimersByTimeAsync(350);
+    dispatchPointer(input, 'pointerup', 180);
+    await vi.advanceTimersByTimeAsync(0);
+
+    try {
+      expect(voiceMock.stopListening).toHaveBeenCalledTimes(1);
+      expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+    } finally {
+      release(false);
+      await vi.advanceTimersByTimeAsync(0);
+    }
+
+    // Subsequent hold after aborted pending start still works cleanly
+    dispatchPointer(input, 'pointerdown', 180);
+    await vi.advanceTimersByTimeAsync(350);
+    expect(voiceMock.startListening).toHaveBeenCalledTimes(2);
+  });
+
+  it('failed start followed by cancel movement releases the transaction so a new hold can start', async () => {
+    voiceMock.startListening.mockResolvedValueOnce(false);
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = document.querySelector('.controls-input') as HTMLElement;
+    dispatchPointer(input, 'pointerdown', 180);
+    await vi.advanceTimersByTimeAsync(350);
+    dispatchPointer(input, 'pointermove', 90);
+    dispatchPointer(input, 'pointerup', 90);
+    await vi.advanceTimersByTimeAsync(0);
+
+    dispatchPointer(input, 'pointerdown', 180);
+    await vi.advanceTimersByTimeAsync(350);
+
+    expect(voiceMock.startListening).toHaveBeenCalledTimes(2);
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+  });
 });
