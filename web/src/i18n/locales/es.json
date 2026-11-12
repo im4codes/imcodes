@@ -644,6 +644,10 @@
     "messageQueuedLabel": "En cola"
   },
   "session": {
+    "incognito": "Sesión de incógnito",
+    "incognito_hint": "El historial solo permanece en memoria y se borra al cerrar o desconectar. Las herramientas de memoria están desactivadas. Los archivos del proyecto creados por el agente se conservan.",
+    "incognito_available": "Disponible solo con Claude SDK.",
+    "incognito_unsupported": "Requiere servidor y daemon actualizados y Claude SDK. Otros entornos no garantizan un historial privado.",
     "restart": "↺ Reiniciar",
     "restart_plain": "Reiniciar",
     "terminal_recovery_exhausted": "El terminal no pudo recuperarse automáticamente. Reinícialo para continuar.",

@@ -1,3 +1,4 @@
+import { SESSION_INCOGNITO_CAPABILITY, supportsSessionIncognito } from '@shared/session-incognito-types.js';
 import { useState, useEffect, useMemo, useRef } from "preact/hooks";
 import { useTranslation } from "react-i18next";
 import type { WsClient } from "../ws-client.js";
@@ -138,6 +139,8 @@ export function NewSessionDialog({
   const [requestedModel, setRequestedModel] = useState("");
   const [error, setError] = useState("");
   const [starting, setStarting] = useState(false);
+  const [incognito, setIncognito] = useState(false);
+  const canIncognito = !!ws?.getDaemonCapabilitySnapshot?.()?.capabilities.includes(SESSION_INCOGNITO_CAPABILITY) && !ws?.isDaemonCapabilityStale?.();
   const [showDirBrowser, setShowDirBrowser] = useState(false);
   const [pendingSessionIdentity, setPendingSessionIdentity] = useState('');
   const [pendingSessionIdentitySourceFile, setPendingSessionIdentitySourceFile] = useState('');
@@ -355,7 +358,7 @@ export function NewSessionDialog({
       setError("");
       setStarting(false);
       void (async () => {
-        if (pendingSessionIdentity.trim()) {
+        if (!incognito && pendingSessionIdentity.trim()) {
           try {
             await saveSessionIdentityProfile({
               scope: SESSION_IDENTITY_SCOPES.SESSION,
@@ -415,7 +418,7 @@ export function NewSessionDialog({
     });
 
     return unsub;
-  }, [onClose, onSessionStarted, onToast, pendingSessionIdentity, pendingSessionIdentitySourceFile, serverId, t, ws]);
+  }, [onClose, onSessionStarted, onToast, incognito, pendingSessionIdentity, pendingSessionIdentitySourceFile, serverId, t, ws]);
 
   useEffect(() => {
     if (!ws || !starting) return;
@@ -472,6 +475,9 @@ export function NewSessionDialog({
     }
 
     const slug = sanitizeProjectName(project.trim());
+    if (incognito && (!canIncognito || !supportsSessionIncognito(agentType))) {
+      setError(t('session.incognito_unsupported')); return;
+    }
     const identityPrompt = pendingSessionIdentity.trim()
       ? normalizeSessionIdentityContent(pendingSessionIdentity)
       : undefined;
@@ -494,6 +500,7 @@ export function NewSessionDialog({
               ocDescription: ocDescription.trim(),
             };
       ws.sendSessionCommand("start", {
+        ...(incognito ? { incognito: true } : {}),
         project: project.trim(),
         dir: dir.trim(),
         agentType,
@@ -530,6 +537,7 @@ export function NewSessionDialog({
         extra.requestedModel = requestedModel.trim();
       }
       ws.sendSessionCommand("start", {
+        ...(incognito ? { incognito: true } : {}),
         project: project.trim(),
         dir: dir.trim(),
         agentType,
@@ -851,7 +859,7 @@ export function NewSessionDialog({
                       // underlying data/behavior (and any test that still
                       // queries it directly) stays fully intact.
                       style={choice.hidden ? { display: 'none' } : undefined}
-                      disabled={starting || (customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id))}
+                      disabled={starting || (incognito && !supportsSessionIncognito(choice.id)) || (customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id))}
                       aria-pressed={agentType === choice.id}
                       onClick={() => selectAgentType(choice.id as AgentType)}
                     >
@@ -1864,6 +1872,16 @@ export function NewSessionDialog({
 
         </div>
 
+        <div class="incognito-create-option">
+          <label>
+            <input type="checkbox" checked={incognito} disabled={!canIncognito}
+              onChange={event => setIncognito(event.currentTarget.checked)} />
+            {t('session.incognito')}
+          </label>
+          <p>{incognito ? t('session.incognito_hint') : t('session.incognito_available')}</p>
+          {(!canIncognito || (incognito && !supportsSessionIncognito(agentType))) && <p role="status">{t('session.incognito_unsupported')}</p>}
+        </div>
+
         <div
           class="dialog-footer"
           style={{
@@ -1885,7 +1903,7 @@ export function NewSessionDialog({
           <button
             class="btn btn-primary"
             onClick={handleStart}
-            disabled={starting}
+            disabled={starting || (incognito && (!canIncognito || !supportsSessionIncognito(agentType)))}
           >
             {starting ? t("new_session.starting") : t("new_session.start")}
           </button>

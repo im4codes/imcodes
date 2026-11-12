@@ -1,3 +1,4 @@
+import { suppressIncognitoLog } from '../../../shared/session-incognito-context.js';
 /**
  * Simple structured logger for CF Worker environment.
  * Redacts sensitive fields before writing — no raw secrets ever reach a log sink.
@@ -61,6 +62,7 @@ function scrubResolvedAliases(value: unknown): unknown {
 }
 
 function log(level: LogLevel, context: Record<string, unknown>, message: string): void {
+  if (suppressIncognitoLog([context, message])) return;
   const scrubbed = scrubResolvedAliases(context) as Redactable;
   const safe = redactObject(scrubbed);
   const entry = JSON.stringify({ level, time: Date.now(), msg: message, ...safe });

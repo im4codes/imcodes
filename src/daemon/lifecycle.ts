@@ -1,3 +1,4 @@
+import { isIncognitoSession } from '../../shared/session-incognito-types.js';
 import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/chat-message-origin.js';
 import { IMCODES_AUTOMATIC_COMPACTION_ENABLED } from '../../shared/automatic-compaction.js';
 import { taskPairService } from './task-pairs/service.js';
@@ -10,7 +11,7 @@ import { createSupervisionSessionPresentationResolver } from './supervision-sess
 import { createSupervisionPairRefreshScheduler } from './supervision-pair-refresh.js';
 import { loadStore, flushStore, listSessions, getSession, upsertSession, removeSession, markSessionStoreAuthoritative, configureSessionStoreWriteAuthority, type SessionRecord } from '../store/session-store.js';
 import { markDaemonProcess } from './process-role.js';
-import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, setTransportSessionRestoredCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute, resyncTransportSessionStatesAfterLinkRestore, ensureTransportRuntimeForPendingResend } from '../agent/session-manager.js';
+import { stopProject, restoreFromStore, setSessionEventCallback, setSessionPersistCallback, setTransportSessionRestoredCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute, resyncTransportSessionStatesAfterLinkRestore, ensureTransportRuntimeForPendingResend } from '../agent/session-manager.js';
 import { beginUpgradeReadinessTracking, markGracefulShutdownStarted, markStartupPhaseDone } from './upgrade-readiness.js';
 import { DAEMON_STARTUP_PHASE } from '../../shared/daemon-upgrade.js';
 import { sessionExists, isPaneAlive, BACKEND, killSession, createTmuxHealthProbe, type TmuxHealthProbe } from '../agent/tmux.js';
@@ -859,6 +860,10 @@ export async function startup(): Promise<DaemonContext> {
     const capabilityServicesByOwner = new Map<string, DaemonCapabilityServiceAdapter>();
     const capabilitySyncServicesByOwner = new Map<string, CapabilitySyncService>();
     setServerLinkDisconnectSecurityHandler(() => {
+      // A server restart/disconnect ends private sessions; no automatic restore.
+      const projects = new Set(listSessions().filter(isIncognitoSession).map(record => record.projectName));
+      for (const project of projects) void stopProject(project, serverLink).catch(() => {});
+
       for (const ownerId of new Set([...capabilityServicesByOwner.keys(), ...capabilitySyncServicesByOwner.keys()])) {
         clearCapabilityAuthorizationKeys(ownerId, serverId);
       }

@@ -1,3 +1,4 @@
+import { INCOGNITO_TIMELINE_PAYLOAD, isIncognitoSession } from '@shared/session-incognito-types.js';
 import { createTimelineDisplayProjectionCache } from '../timeline/display-projection-cache.js';
 import { createSignalWriteBatcher } from '../signal-write-batcher.js';
 import {
@@ -212,6 +213,7 @@ sharedDb.open().catch(() => {});
 // render immediately from in-memory state without waiting for IDB or network.
 // Canonical per-session stores prevent duplicate merge/cache work across panes.
 const eventsCache = new Map<string, TimelineEvent[]>();
+const incognitoCacheKeys = new Set<string>();
 const cacheListeners = new Map<string, Set<(events: TimelineEvent[]) => void>>();
 // Per-cacheKey wall-clock of the last *successful* HTTP backfill (response
 // received, not a timeout/null). Two consumers:
@@ -949,12 +951,14 @@ function boundCachedEvents(events: TimelineEvent[]): TimelineEvent[] {
  * subscribers. Streaming deltas use this path so each mounted pane renders its
  * own local frame while companion panes/tabs are not fanned out on every tick. */
 function setCachedEventsLocal(cacheKey: string, events: TimelineEvent[]): void {
+  events = markPrivateTimelineEvents(cacheKey, events);
   const bounded = boundCachedEvents(events);
   eventsCache.set(cacheKey, bounded);
   scheduleTimelineSnapshotPersist(cacheKey, bounded);
 }
 
 function setCachedEvents(cacheKey: string, events: TimelineEvent[]): void {
+  events = markPrivateTimelineEvents(cacheKey, events);
   const bounded = boundCachedEvents(events);
   getTimelineStore(cacheKey).replace(bounded, undefined, undefined, MAX_WINDOW_CACHED_EVENTS);
   eventsCache.set(cacheKey, bounded);
@@ -1028,6 +1032,34 @@ function subscribeCache(cacheKey: string, listener: (events: TimelineEvent[]) =>
 
 function scopeCacheKey(serverId: string | null | undefined, sessionId: string): string {
   return serverId ? `${serverId}:${sessionId}` : sessionId;
+}
+
+function markPrivateTimelineEvents(cacheKey: string, events: TimelineEvent[]): TimelineEvent[] {
+  if (events.some(event => isIncognitoSession(event.payload))) incognitoCacheKeys.add(cacheKey);
+  return incognitoCacheKeys.has(cacheKey)
+    ? events.map(event => isIncognitoSession(event.payload) ? event : { ...event, payload: { ...event.payload, ...INCOGNITO_TIMELINE_PAYLOAD } })
+    : events;
+}
+
+export function registerIncognitoTimelineSession(serverId: string | null | undefined, sessionId: string): void {
+  incognitoCacheKeys.add(scopeCacheKey(serverId, sessionId));
+}
+
+export function forgetIncognitoTimelineSessions(serverId: string | null | undefined, sessionId?: string): void {
+  const prefix = serverId ? `${serverId}:` : '';
+  for (const key of incognitoCacheKeys) {
+    if (sessionId ? key !== scopeCacheKey(serverId, sessionId) : !key.startsWith(prefix)) continue;
+    pendingTimelineCacheIngests.delete(key);
+    const timer = pendingTimelineSnapshotTimers.get(key);
+    if (timer) clearTimeout(timer);
+    pendingTimelineSnapshotTimers.delete(key);
+    pendingTimelineSnapshotTails.delete(key);
+    lastWrittenTimelineSnapshotTails.delete(key);
+    eventsCache.delete(key);
+    getTimelineStore(key).reset();
+    // Keep only the name tombstone until a new normal session list replaces it:
+    // a late frame must not become durable after close.
+  }
 }
 
 function getTimelineSnapshotStorageKey(cacheKey: string): string {
@@ -1130,6 +1162,7 @@ function getPersistableTimelineTail(
   opts?: { includeStreaming?: boolean },
 ): TimelineEvent[] {
   const persistable = events.filter((event) => {
+    if (isIncognitoSession(event.payload)) return false;
     if (opts?.includeStreaming !== true && !shouldPersistTimelineEvent(event)) return false;
     if (event.hidden) return false;
     // Keep rows that definitely paint plus tool-detail rows the user may have
@@ -1250,6 +1283,7 @@ function areTimelineSnapshotTailsSame(left: TimelineEvent[] | undefined, right: 
 }
 
 function persistTimelineSnapshotTail(cacheKey: string, tail: TimelineEvent[]): void {
+  if (incognitoCacheKeys.has(cacheKey)) tail = [];
   try {
     if (tail.length === 0) {
       safeLocalStorageRemoveItem(getTimelineSnapshotStorageKey(cacheKey));
@@ -1342,6 +1376,7 @@ export function __flushTimelineSnapshotsBeforeFreezeForTests(): number {
 }
 
 function scheduleTimelineSnapshotPersist(cacheKey: string, events: TimelineEvent[]): void {
+  if (incognitoCacheKeys.has(cacheKey)) return;
   const tail = getPersistableTimelineTail(events);
   const pendingTail = pendingTimelineSnapshotTails.get(cacheKey);
   if (areTimelineSnapshotTailsSame(pendingTail, tail)) return;
@@ -1503,6 +1538,7 @@ const signalWriteBatcher = createSignalWriteBatcher({
 });
 
 function persistTimelineEvents(cacheKey: string, events: TimelineEvent[]): void {
+  if (incognitoCacheKeys.has(cacheKey)) return;
   if (events.length === 0) return;
   const persistable = events.filter(shouldPersistTimelineEvent);
   if (persistable.length === 0) return;
@@ -1517,6 +1553,8 @@ function persistTimelineEvents(cacheKey: string, events: TimelineEvent[]): void 
 // Persist events to IDB WITHOUT the streaming filter — used only by the
 // streaming idle-flush so the latest streaming assistant.text becomes durable.
 function persistTimelineEventsIncludingStreaming(cacheKey: string, events: TimelineEvent[]): void {
+  if (incognitoCacheKeys.has(cacheKey)) return;
+  events = events.filter(event => !isIncognitoSession(event.payload));
   if (events.length === 0) return;
   sharedDb.putEvents(scopeEventsForDb(cacheKey, events)).catch(() => {});
   scheduleLocalHistoryPrune(cacheKey, events.length, false, false, events[0]?.sessionId);
@@ -1527,7 +1565,7 @@ function shouldPersistTimelineEvent(event: TimelineEvent): boolean {
   // eventId. They are already represented in the in-memory UI cache and the
   // final non-streaming event is persisted, so writing every intermediate
   // token to IndexedDB just builds a transaction backlog on busy chats.
-  return event.payload?.streaming !== true;
+  return !isIncognitoSession(event.payload) && event.payload?.streaming !== true;
 }
 
 function shouldFrameCoalesceTimelineEvent(event: TimelineEvent): boolean {
@@ -1716,6 +1754,7 @@ export function __resetTimelineCacheForTests(): void {
   cancelPendingTimelineCacheIngests();
   flushPendingTimelineSnapshotWrites();
   eventsCache.clear();
+  incognitoCacheKeys.clear();
   cacheListeners.clear();
   __resetTimelineStoresForTests();
   lastHttpBackfillResponseAt.clear();
@@ -1811,6 +1850,7 @@ export function __setTimelineCacheForTests(cacheKey: string, events: TimelineEve
 
 export function ingestTimelineEventForCache(event: TimelineEvent, serverId?: string | null): void {
   const cacheKey = scopeCacheKey(serverId, event.sessionId);
+  if (isIncognitoSession(event.payload)) incognitoCacheKeys.add(cacheKey);
   if (shouldFrameCoalesceTimelineEvent(event)) {
     queueTimelineCacheIngest(cacheKey, event);
     return;
@@ -1885,6 +1925,7 @@ export interface UseTimelineResult {
 }
 
 export interface UseTimelineOptions {
+  incognito?: boolean;
   /**
    * Only the active timeline should trigger opportunistic HTTP
    * backfills. Inactive mounted timelines still stay warm via cache + WS
@@ -2337,6 +2378,7 @@ export function useTimeline(
   // IDB + memory cache key: scope by serverId to prevent cross-server pollution
   // when different servers share the same session name (e.g. deck_cd_brain).
   const cacheKey = sessionId ? scopeCacheKey(serverId, sessionId) : sessionId;
+  if (cacheKey && options?.incognito) incognitoCacheKeys.add(cacheKey);
   const isActiveSession = options?.isActiveSession ?? true;
   const isVisible = options?.isVisible ?? isActiveSession;
   const subscriptionMode = options?.subscriptionMode ?? (isActiveSession || isVisible ? 'full' : 'summary');
@@ -3861,7 +3903,7 @@ export function useTimeline(
         optimisticTimersRef.current.set(commandId, timer);
       }
     }
-    const payload: Record<string, unknown> = { text, pending: true };
+    const payload: Record<string, unknown> = { text, pending: true, ...(cacheKeyRef.current && incognitoCacheKeys.has(cacheKeyRef.current) ? INCOGNITO_TIMELINE_PAYLOAD : {}) };
     if (commandId) payload.commandId = commandId;
     if (isAppend) payload.queueAppended = true;
     if (opts?.attachments && opts.attachments.length > 0) payload.attachments = opts.attachments;

@@ -38,6 +38,7 @@ export interface AutoFixTaskStatus {
 }
 
 export interface SessionInfo {
+  incognito?: boolean;
   name: string;
   sessionInstanceId?: string;
   runtimeEpoch?: string;

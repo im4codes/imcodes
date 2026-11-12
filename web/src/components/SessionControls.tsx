@@ -1790,8 +1790,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const lastImeCompositionAtRef = useRef(0);
   const attachmentDraftRef = useRef<ComposerAttachmentRecord[]>([]);
   const composerDraftScope = buildComposerDraftScope(activeSession, subSessionId);
-  const draftKey = composerDraftScope ? `rcc_draft_${composerDraftScope}` : null;
-  const attachmentDraftKey = composerDraftScope ? `rcc_draft_attachments_${composerDraftScope}` : null;
+  const draftKey = !activeSession?.incognito && composerDraftScope ? `rcc_draft_${composerDraftScope}` : null;
+  const attachmentDraftKey = !activeSession?.incognito && composerDraftScope ? `rcc_draft_attachments_${composerDraftScope}` : null;
   const attachmentDraftKeyRef = useRef<string | null>(attachmentDraftKey);
   attachmentDraftKeyRef.current = attachmentDraftKey;
   const mountedRef = useRef(true);
@@ -1799,7 +1799,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // A voice notepad's local draft is kept per session exactly like the
   // composer's own draft (main sessions and sub-sessions alike), and per
   // server, so two servers' same-named sessions never share one.
-  const voiceNotepadDraftScope = composerDraftScope
+  const voiceNotepadDraftScope = !activeSession?.incognito && composerDraftScope
     ? (serverId ? `${serverId}:${composerDraftScope}` : composerDraftScope)
     : null;
   const [hasVoiceNotepadDraft, setHasVoiceNotepadDraft] = useState(false);
@@ -6471,6 +6471,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         </div>
       </div>
     )}
+    {activeSession?.incognito && <div class="incognito-session-badge" role="status" title={t('session.incognito_hint')}>🕶️ {t('session.incognito')}</div>}
     <div ref={controlsWrapperRef} class={`controls-wrapper${showRunningSweep ? ' controls-wrapper-running' : ''}${mobileComposerExpanded ? ' controls-wrapper-mobile-expanded' : ''}`}>
       {dropOverlayStyle && createPortal(
         <div class="session-file-drop-overlay" style={dropOverlayStyle}>

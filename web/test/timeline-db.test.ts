@@ -32,6 +32,14 @@ describe('TimelineDB — memory fallback mode', () => {
     await db.open();
   });
 
+  it('never queues private events into disk or a future-retry memory fallback', async () => {
+    await db.putEvents([
+      makeEvent({ eventId: 'private', payload: { text: 'private-sentinel', incognito: true, memoryExcluded: true } }),
+      makeEvent({ eventId: 'ordinary', seq: 2 }),
+    ]);
+    expect((await db.getEvents('session-a', 1000)).map(event => event.eventId)).toEqual(['ordinary']);
+  });
+
   it('operates in memory-only mode when IndexedDB is unavailable', () => {
     expect(db.memoryOnly).toBe(true);
   });

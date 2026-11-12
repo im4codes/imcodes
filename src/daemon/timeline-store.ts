@@ -1,3 +1,5 @@
+import { isIncognitoSession } from '../../shared/session-incognito-types.js';
+import { inIncognitoContext, isIncognitoSessionName } from '../../shared/session-incognito-context.js';
 import type { TimelineTextTailOptions } from './timeline-projection-types.js';
 import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 /**
@@ -223,6 +225,7 @@ class TimelineStore {
    * as ack-outbox `appendRecord`).
    */
   append(event: TimelineEvent): Promise<void> {
+    if (isIncognitoSession(event.payload) || isIncognitoSessionName(event.sessionId) || inIncognitoContext()) return Promise.resolve();
     const sessionId = event.sessionId;
     const prev = this.sessionChains.get(sessionId) ?? Promise.resolve();
     const next = prev.then(

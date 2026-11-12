@@ -1,3 +1,4 @@
+import { isIncognitoSession } from '@shared/session-incognito-types.js';
 /**
  * IndexedDB persistence for timeline events.
  * Database: imcodes-timeline
@@ -303,6 +304,9 @@ export class TimelineDB {
   }
 
   async putEvents(events: TimelineEvent[]): Promise<void> {
+    // Live private events stay in useTimeline's in-memory cache, not IndexedDB
+    // or its retry fallback (which may flush to disk after a reconnect).
+    events = events.filter(event => !isIncognitoSession(event.payload));
     if (events.length === 0) return;
 
     const db = await this.ensureOpen();

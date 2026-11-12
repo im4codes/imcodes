@@ -1,3 +1,4 @@
+import { isIncognitoSession, SESSION_INCOGNITO_SERVER_READY } from '../../../shared/session-incognito-types.js';
 import { machineGroupInvalidationReady, machineGroupInvalidationRevision } from '../services/machine-group-invalidation.js';
 import {
   CONTROLLED_NODE_ABI_MODERN, CONTROLLED_NODE_ABI_GLIBC217,
@@ -2139,6 +2140,8 @@ function heartbeatAckWithClock(
 }
 
 export class WsBridge {
+  // Session names are only unique within a daemon, never across owners.
+  private readonly incognitoSessions = new Set<string>();
   private static instances = new Map<string, WsBridge>();
   private static remoteDesktopReconnectRevalidator: ((serverId: string) => Promise<void>) | null = null;
 
@@ -6490,6 +6493,7 @@ export class WsBridge {
 
       if (msg.type === P2P_WORKFLOW_MSG.DAEMON_HELLO) {
         this.handleDaemonP2pWorkflowHello(msg);
+        this.sendToDaemon(JSON.stringify({ type: SESSION_INCOGNITO_SERVER_READY }));
         return;
       }
 
@@ -6536,7 +6540,10 @@ export class WsBridge {
       this.relayToBrowsers(msg);
 
       // Push notifications for key events
-      if (env) {
+      const eventForPrivacy = msg.event as { sessionId?: unknown; payload?: unknown } | undefined;
+      const privateSession = isIncognitoSession(eventForPrivacy?.payload)
+        || this.incognitoSessions.has(String(eventForPrivacy?.sessionId ?? msg.session ?? msg.sessionName));
+      if (env && !privateSession) {
         const pushType = msg.type as string;
         if (pushType === 'session.idle') {
           this.scheduleIdleEventPush(db, env, msg);
@@ -9063,6 +9070,12 @@ export class WsBridge {
     }
 
       if (type === 'session_list') {
+        for (const session of Array.isArray(msg.sessions) ? msg.sessions : []) {
+          if (session && typeof session === 'object' && typeof session.name === 'string') {
+            if (isIncognitoSession(session)) this.incognitoSessions.add(session.name);
+            else this.incognitoSessions.delete(session.name);
+          }
+        }
         this.replaceActiveMainSessions(msg.sessions);
         this.pruneMainSessionRecentText(msg.sessions);
         const sessions = Array.isArray(msg.sessions)
@@ -9101,8 +9114,9 @@ export class WsBridge {
         const payload = rawEvent.payload as Record<string, unknown> | undefined;
         if (typeof payload?.state === 'string') this.updateAuthoritativeSessionState(sessionId, payload.state);
       }
+      if (isIncognitoSession(rawEvent.payload)) this.incognitoSessions.add(sessionId);
       this.ingestRecentTextFromTimelineEvent(rawEvent);
-      if (this.db) {
+      if (this.db && !isIncognitoSession(rawEvent.payload) && !this.incognitoSessions.has(sessionId)) {
         void upsertSessionTextTailCacheEvent(this.db, this.serverId, rawEvent)
           .catch((err) => logger.warn({ err, serverId: this.serverId, sessionId }, 'Failed to update session_text_tail_cache'));
       }
@@ -9194,6 +9208,7 @@ export class WsBridge {
     }
 
     // ── Sub-session sync: daemon creates sub-sessions → persist to DB ────────
+    if (type === 'subsession.sync' && isIncognitoSession(msg)) return;
     if (type === 'subsession.sync' && this.db) {
       const db = this.db;
       if (isKnownTestSessionLike({

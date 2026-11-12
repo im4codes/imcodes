@@ -143,6 +143,12 @@ export class TimelineDetailStore {
     return { ok: true, entry };
   }
 
+  forgetSession(sessionName: string): void {
+    for (const [id, entry] of this.entries) {
+      if (entry.sessionName === sessionName) this.delete(id);
+    }
+  }
+
   clear(): void {
     this.entries.clear();
     this.totalBytes = 0;
