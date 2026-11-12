@@ -1192,4 +1192,72 @@ rl.on('line', (line) => {
     expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
     expect(errors).not.toHaveBeenCalled();
   });
+
+  it('preserves second prompt text and settles idle when response(A), second chunk, and response(B) arrive in the same stdout chunk', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'imcodes-test-agy-dual-prompt-'));
+    const script = path.join(root, 'dual-prompt-agy.mjs');
+    const binary = path.join(root, 'agy');
+    await writeFile(script, `
+import { createInterface } from 'node:readline';
+const rl = createInterface({ input: process.stdin });
+const send = (lines) => process.stdout.write(lines.map((l) => JSON.stringify(l)).join('\\n') + '\\n');
+let promptAId = null;
+rl.on('line', (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') {
+    send([{ jsonrpc: '2.0', id: msg.id, result: {
+      protocolVersion: 1,
+      agentInfo: { name: ${JSON.stringify(AGY_ACP_AGENT_NAME)}, version: '2.0.0' },
+      agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {}, list: {} } },
+    } }]);
+    return;
+  }
+  if (msg.method === 'session/new') {
+    send([{ jsonrpc: '2.0', id: msg.id, result: {
+      sessionId: 'native-dual-prompt',
+      models: { currentModelId: 'model-a', availableModels: [{ modelId: 'model-a', name: 'Model A' }] },
+    } }]);
+    return;
+  }
+  if (msg.method === 'session/prompt') {
+    if (promptAId === null) {
+      promptAId = msg.id;
+      send([
+        { jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'native-dual-prompt', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'FIRST ' } } } },
+      ]);
+      return;
+    }
+    send([
+      { jsonrpc: '2.0', id: promptAId, result: { stopReason: 'end_turn' } },
+      { jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'native-dual-prompt', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'SECOND' } } } },
+      { jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } },
+    ]);
+  }
+});
+`);
+    await writeFile(binary, `#!/bin/sh\nexec '${process.execPath}' '${script}' "$@"\n`, { mode: 0o700 });
+    const provider = new AgyAcpProvider();
+    resources.push({ provider, root });
+    await provider.connect({ binaryPath: binary, env: { HOME: root, AGY_ACP_FIXTURE_AGENT_NAME: AGY_ACP_AGENT_NAME } });
+    const id = await route(provider, 'deck_test_dual_prompt');
+    const complete = vi.fn();
+    const deltas: string[] = [];
+    const errors = vi.fn();
+    provider.onComplete(complete);
+    provider.onDelta((sid, evt) => {
+      if (sid === id && evt.type === 'text' && evt.delta) deltas.push(evt.delta);
+    });
+    provider.onError(errors);
+
+    await provider.send(id, 'FIRST');
+    await vi.waitFor(() => expect(deltas.join('')).toBe('FIRST '), { timeout: 5000 });
+    expect(await provider.notifyActiveDelegation(id, notification('SECOND'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(complete).toHaveBeenCalledTimes(1);
+    expect(complete.mock.calls[0]?.[1].content).toBe('FIRST SECOND');
+    expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
+    expect(errors).not.toHaveBeenCalled();
+  });
 });

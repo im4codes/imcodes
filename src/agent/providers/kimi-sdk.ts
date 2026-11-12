@@ -261,12 +261,9 @@ interface KimiSdkSessionState {
   settledGeneration: number;
   /** Active and queued prompt generations currently in flight on the ACP session. */
   activePromptGenerations?: Set<number>;
-  /** Settlements of `session/prompt` RPC responses already seen on the wire that
-   *  must finish settling before subsequent `session/update` notifications run. */
-  arrivedPromptSettlements?: Set<Promise<void>>;
-  /** Serialized tail for deferred `session/update` notifications waiting on
-   *  arrived prompt settlements. */
-  sessionUpdateQueue?: Promise<void>;
+  /** Single per-session FIFO tail ensuring prompt settlements and `session/update`
+   *  notifications execute in exact stdout wire order. */
+  wireOrderTail?: Promise<void>;
   /** Generation allocated for an autonomous provider-initiated wakeup turn. */
   autonomousTurnGeneration?: number;
   /** True after user cancel or turn failure until the next send(). */
@@ -359,7 +356,13 @@ export class KimiSdkProvider implements TransportProvider {
 
   private child: ChildProcessWithoutNullStreams | null = null;
   protected connection: ClientSideConnection | null = null;
-  private promptWriteQueues = new WeakMap<ClientSideConnection, Map<string, Array<{ state: KimiSdkSessionState; settlement: Promise<void> }>>>();
+  private promptWriteQueues = new WeakMap<ClientSideConnection, Map<string, Array<{
+    onResponseArrived: () => void;
+    clearPending: () => void;
+  }>> & {
+    reserveSlot: (state: KimiSdkSessionState) => { waitForPrior?: Promise<void>; release: () => void };
+  }>();
+  private pendingUpdateSlots = new WeakMap<object, { waitForPrior?: Promise<void>; release: () => void }>();
   /** Resolves once `initialize` has completed so subsequent RPCs can proceed. */
   private initPromise: Promise<void> | null = null;
   /** Models returned by the first ACP `newSession` call, cached for the
@@ -1354,9 +1357,29 @@ export class KimiSdkProvider implements TransportProvider {
       }),
     ) as ReadableStream<Uint8Array>;
     const rawStream = ndJsonStream(writable, readable);
-    type PendingPromptSettlement = { state: KimiSdkSessionState; settlement: Promise<void> };
-    const pendingPromptWrites = new Map<string, PendingPromptSettlement[]>();
-    const inFlightPromptSettlements = new Map<string | number, PendingPromptSettlement>();
+    type PendingPromptWrite = { onResponseArrived: () => void; clearPending: () => void };
+    const pendingPromptWrites = new Map<string, PendingPromptWrite[]>();
+    const inFlightPromptWrites = new Map<string | number, PendingPromptWrite>();
+    const activeSlotReleasers = new Set<() => void>();
+    const reserveSlot = (state: KimiSdkSessionState): { waitForPrior?: Promise<void>; release: () => void } => {
+      const waitForPrior = state.wireOrderTail;
+      let resolveSlot!: () => void;
+      const slot = new Promise<void>((r) => { resolveSlot = r; });
+      state.wireOrderTail = slot;
+      const release = (): void => {
+        if (!activeSlotReleasers.delete(release)) return;
+        if (state.wireOrderTail === slot) state.wireOrderTail = undefined;
+        resolveSlot();
+      };
+      activeSlotReleasers.add(release);
+      return { waitForPrior, release };
+    };
+    const releaseAllSlots = (): void => {
+      for (const release of [...activeSlotReleasers]) release();
+    };
+    child.once('exit', releaseAllSlots);
+    child.once('error', releaseAllSlots);
+
     const rawWriter = rawStream.writable.getWriter();
     const interceptedWritable = new WritableStream({
       write: (message) => {
@@ -1373,7 +1396,11 @@ export class KimiSdkProvider implements TransportProvider {
             const q = pendingPromptWrites.get(sid);
             const entry = q?.shift();
             if (q && q.length === 0) pendingPromptWrites.delete(sid);
-            if (entry) inFlightPromptSettlements.set(message.id as string | number, entry);
+            if (entry) {
+              const reqId = message.id as string | number;
+              inFlightPromptWrites.set(reqId, entry);
+              entry.clearPending = () => { inFlightPromptWrites.delete(reqId); };
+            }
           }
         }
         return rawWriter.write(message);
@@ -1390,10 +1417,10 @@ export class KimiSdkProvider implements TransportProvider {
     const stream = {
       writable: interceptedWritable,
       readable: rawStream.readable.pipeThrough(new TransformStream({
-        transform(message, controller) {
-          // Record prompt response arrival BEFORE downstream notifications enter
-          // `ClientSideConnection.receive()`, because `receive()` dispatches
-          // notifications synchronously without awaiting `async prompt()`.
+        transform: (message, controller) => {
+          // Reserve per-session wire slots here in exact stream order BEFORE
+          // downstream `ClientSideConnection.receive()` pulls/reorders microtasks
+          // between `async prompt()` responses and synchronous notifications.
           if (
             message
             && typeof message === 'object'
@@ -1402,17 +1429,31 @@ export class KimiSdkProvider implements TransportProvider {
             && message.id !== null
             && !('method' in message)
           ) {
-            const settledEntry = inFlightPromptSettlements.get(message.id as string | number);
-            if (settledEntry) {
-              inFlightPromptSettlements.delete(message.id as string | number);
-              (settledEntry.state.arrivedPromptSettlements ??= new Set()).add(settledEntry.settlement);
+            const entry = inFlightPromptWrites.get(message.id as string | number);
+            if (entry) {
+              inFlightPromptWrites.delete(message.id as string | number);
+              entry.onResponseArrived();
+            }
+          } else if (message && typeof message === 'object' && !('id' in message)) {
+            const method = (message as { method?: unknown }).method;
+            const rawParams = (message as { params?: unknown }).params;
+            if ((method === 'session/update' || method === '_x.ai/session/update') && rawParams && typeof rawParams === 'object') {
+              const sid = (rawParams as { sessionId?: unknown }).sessionId;
+              const routeId = typeof sid === 'string' ? this.acpToRoute.get(sid) : undefined;
+              const state = routeId ? this.sessions.get(routeId) : undefined;
+              if (state && state.acpSessionId === sid && state.wireOrderTail) {
+                this.pendingUpdateSlots.set(rawParams, reserveSlot(state));
+              }
+            }
+            if (method === 'session/update') {
+              controller.enqueue({ ...(message as Record<string, unknown>), method: '_imcodes/session/update' });
+              return;
             }
           }
-          if (message && typeof message === 'object' && !('id' in message) && (message as { method?: unknown }).method === 'session/update') {
-            controller.enqueue({ ...(message as Record<string, unknown>), method: '_imcodes/session/update' });
-            return;
-          }
           controller.enqueue(message);
+        },
+        flush() {
+          releaseAllSlots();
         },
       })),
     };
@@ -1421,7 +1462,7 @@ export class KimiSdkProvider implements TransportProvider {
     // can use to call RPC methods; we return a Client impl that handles
     // reverse RPC (requestPermission + session notifications).
     this.connection = new ClientSideConnection(() => this.createClientImpl(child), stream);
-    this.promptWriteQueues.set(this.connection, pendingPromptWrites);
+    this.promptWriteQueues.set(this.connection, Object.assign(pendingPromptWrites, { reserveSlot }));
 
     // Kick off initialize once; all subsequent calls await the same promise.
     this.initPromise = (async () => {
@@ -1772,7 +1813,7 @@ export class KimiSdkProvider implements TransportProvider {
               cwd: state.cwd,
               mcpServers: this.mcpServersForState(state),
             });
-            if (state.sessionUpdateQueue) await state.sessionUpdateQueue;
+            if (state.wireOrderTail) await state.wireOrderTail;
           } finally {
             state.replaying = false;
           }
@@ -2163,24 +2204,15 @@ export class KimiSdkProvider implements TransportProvider {
     onRejected: (err: unknown) => void,
   ): void {
     const pendingWrites = this.promptWriteQueues.get(connection);
-    let settlement!: Promise<void>;
-    const entry: { state: KimiSdkSessionState; settlement: Promise<void> } = {
-      state,
-      settlement: Promise.resolve(),
-    };
-    settlement = turn
-      .then(onFulfilled)
-      .catch(onRejected)
-      .finally(() => {
-        state.arrivedPromptSettlements?.delete(settlement);
-        const q = acpSessionId ? pendingWrites?.get(acpSessionId) : undefined;
-        if (q) {
-          const idx = q.indexOf(entry);
-          if (idx >= 0) q.splice(idx, 1);
-          if (q.length === 0 && acpSessionId) pendingWrites?.delete(acpSessionId);
+    let slot: { waitForPrior?: Promise<void>; release: () => void } | undefined;
+    const entry: { onResponseArrived: () => void; clearPending: () => void } = {
+      onResponseArrived: () => {
+        if (!slot && pendingWrites) {
+          slot = pendingWrites.reserveSlot(state);
         }
-      });
-    entry.settlement = settlement;
+      },
+      clearPending: () => {},
+    };
     if (pendingWrites && acpSessionId) {
       let q = pendingWrites.get(acpSessionId);
       if (!q) {
@@ -2189,28 +2221,47 @@ export class KimiSdkProvider implements TransportProvider {
       }
       q.push(entry);
     }
+    void turn
+      .then(async (result) => {
+        if (slot?.waitForPrior) await slot.waitForPrior;
+        return await onFulfilled(result);
+      })
+      .catch(async (err) => {
+        if (slot?.waitForPrior) await slot.waitForPrior;
+        onRejected(err);
+      })
+      .finally(() => {
+        entry.clearPending();
+        const q = acpSessionId ? pendingWrites?.get(acpSessionId) : undefined;
+        if (q) {
+          const idx = q.indexOf(entry);
+          if (idx >= 0) q.splice(idx, 1);
+          if (q.length === 0 && acpSessionId) pendingWrites?.delete(acpSessionId);
+        }
+        slot?.release();
+      });
   }
 
   private enqueueSessionUpdate(params: SessionNotification): void {
     if (!params || typeof params !== 'object' || typeof params.sessionId !== 'string' || !params.update || typeof params.update !== 'object') return;
-    const routeId = this.acpToRoute.get(params.sessionId);
-    if (!routeId) return;
-    const state = this.sessions.get(routeId);
-    if (!state || state.acpSessionId !== params.sessionId) return;
-    if ((state.arrivedPromptSettlements?.size ?? 0) === 0 && !state.sessionUpdateQueue) {
-      this.handleSessionUpdate(params);
+    const slot = this.pendingUpdateSlots.get(params);
+    if (slot) this.pendingUpdateSlots.delete(params);
+    if (!slot?.waitForPrior) {
+      try {
+        this.handleSessionUpdate(params);
+      } finally {
+        slot?.release();
+      }
       return;
     }
-    const prev = state.sessionUpdateQueue ?? Promise.resolve();
-    const next = prev.then(async () => {
-      while ((state.arrivedPromptSettlements?.size ?? 0) > 0) {
-        await Promise.allSettled([...state.arrivedPromptSettlements!]);
-      }
-      this.handleSessionUpdate(params);
-    }).finally(() => {
-      if (state.sessionUpdateQueue === next) state.sessionUpdateQueue = undefined;
-    });
-    state.sessionUpdateQueue = next;
+    void slot.waitForPrior
+      .catch(() => {})
+      .then(() => {
+        this.handleSessionUpdate(params);
+      })
+      .finally(() => {
+        slot.release();
+      });
   }
 
   private handleSessionUpdate(params: SessionNotification): void {
