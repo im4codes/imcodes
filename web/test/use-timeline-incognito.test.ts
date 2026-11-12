@@ -535,4 +535,159 @@ describe('useTimeline incognito lifecycle & persistence isolation (F2)', () => {
 
     expect(__getTimelineCacheForTests(cacheKey)?.map((e) => e.payload?.text)).toEqual(['NEW-PRIVATE-NO-META']);
   });
+
+  it('adopts first authoritative identity after metadata-less registration across instanceId-only, runtimeEpoch-only, and both variants without treating it as closed (F2-R4)', () => {
+    const putSpy = vi.spyOn(TimelineDB.prototype, 'putEvents').mockResolvedValue(undefined);
+    const variants: Array<{
+      label: string;
+      meta: { sessionInstanceId?: string; runtimeEpoch?: string };
+    }> = [
+      { label: 'instance-only', meta: { sessionInstanceId: 'inst-only-1' } },
+      { label: 'runtime-only', meta: { runtimeEpoch: 'rt-only-1' } },
+      { label: 'both-ids', meta: { sessionInstanceId: 'inst-both-1', runtimeEpoch: 'rt-both-1' } },
+    ];
+
+    for (const { label, meta } of variants) {
+      __resetTimelineCacheForTests();
+      localStorage.clear();
+      const serverId = `srv-f2-r4-${label}`;
+      const name = `deck_r4_${label}`;
+      const cacheKey = `${serverId}:${name}`;
+
+      // Metadata-less registration (same path as useTimeline(..., { incognito: true }) initial render)
+      registerIncognitoTimelineSession(serverId, name);
+      ingestTimelineEventForCache(makeEvent({
+        eventId: `first-${label}`,
+        sessionId: name,
+        epoch: 123456,
+        seq: 1,
+        ...meta,
+        payload: { text: `FIRST-${label}`, streaming: false, incognito: true },
+      }), serverId);
+
+      // Authoritative session_list subsequently publishes the same identity
+      syncIncognitoTimelineSessions(serverId, [{ name, incognito: true, ...meta }]);
+      __flushTimelineSnapshotsBeforeFreezeForTests();
+
+      expect(__getTimelineCacheForTests(cacheKey)?.map((e) => e.payload?.text)).toEqual([`FIRST-${label}`]);
+      expect(isIncognitoTimelineSession(serverId, name)).toBe(true);
+      expect(localStorage.getItem(`${TIMELINE_SNAPSHOT_STORAGE_PREFIX}${cacheKey}`)).toBeNull();
+    }
+    expect(putSpy).not.toHaveBeenCalled();
+  });
+
+  it('preserves adopted identity through repeated batch filters after metadata-less mount while still rejecting previously closed private instances (F2-R4)', async () => {
+    const serverId = `srv-f2-r4-batch-${Math.random().toString(36).slice(2)}`;
+    const name = 'deck_r4_batch_brain';
+    const cacheKey = `${serverId}:${name}`;
+    const snapKey = `${TIMELINE_SNAPSHOT_STORAGE_PREFIX}${cacheKey}`;
+    const putSpy = vi.spyOn(TimelineDB.prototype, 'putEvents').mockResolvedValue(undefined);
+    const handlers = new Set<(msg: Record<string, unknown>) => void>();
+
+    const ws = {
+      connected: true,
+      onMessage: (cb: (msg: Record<string, unknown>) => void) => {
+        handlers.add(cb);
+        return () => handlers.delete(cb);
+      },
+      onSessionMessage: (_sid: string, cb: (msg: Record<string, unknown>) => void) => {
+        handlers.add(cb);
+        return () => handlers.delete(cb);
+      },
+      send: vi.fn(),
+      sendTimelineHistoryRequest: vi.fn(),
+    } as unknown as WsClient;
+
+    const emit = (msg: Record<string, unknown>) => {
+      for (const h of handlers) h(msg);
+    };
+
+    // An earlier private instance existed and closed cleanly
+    registerIncognitoTimelineSession(serverId, name, { sessionInstanceId: 'priv-old-r4', runtimeEpoch: 'rt-old-r4' });
+    forgetIncognitoTimelineSessions(serverId, name);
+
+    // Mount new private pane before session_list delivers new metadata (registerIncognitoTimelineSession without meta)
+    const { result } = renderHook(() => useTimeline(name, ws, serverId, { incognito: true, isActiveSession: true }));
+
+    act(() => {
+      emit({
+        type: 'timeline.event',
+        event: makeEvent({
+          eventId: 'cur-evt-1',
+          sessionId: name,
+          epoch: 123456,
+          seq: 1,
+          sessionInstanceId: 'priv-cur-r4',
+          runtimeEpoch: 'rt-cur-r4',
+          payload: { text: 'CURRENT-FIRST', streaming: false, incognito: true },
+        }),
+      });
+      emit({
+        type: 'timeline.history',
+        sessionName: name,
+        epoch: 123456,
+        hasMore: false,
+        events: [
+          makeEvent({
+            eventId: 'old-hist-leak',
+            sessionId: name,
+            epoch: 123456,
+            seq: 1,
+            sessionInstanceId: 'priv-old-r4',
+            runtimeEpoch: 'rt-old-r4',
+            payload: { text: 'OLD-CLOSED-HIST', streaming: false, incognito: true },
+          }),
+          makeEvent({
+            eventId: 'cur-hist-2',
+            sessionId: name,
+            epoch: 123456,
+            seq: 2,
+            sessionInstanceId: 'priv-cur-r4',
+            runtimeEpoch: 'rt-cur-r4',
+            payload: { text: 'CURRENT-HISTORY', streaming: false, incognito: true },
+          }),
+        ],
+      });
+      emit({
+        type: 'timeline.replay',
+        sessionName: name,
+        epoch: 123456,
+        truncated: false,
+        events: [
+          makeEvent({
+            eventId: 'cur-replay-3',
+            sessionId: name,
+            epoch: 123456,
+            seq: 3,
+            sessionInstanceId: 'priv-cur-r4',
+            runtimeEpoch: 'rt-cur-r4',
+            payload: { text: 'CURRENT-REPLAY', streaming: false, incognito: true },
+          }),
+        ],
+      });
+    });
+
+    // Matching session_list arrives after repeated filters/batches
+    syncIncognitoTimelineSessions(serverId, [
+      { name, incognito: true, sessionInstanceId: 'priv-cur-r4', runtimeEpoch: 'rt-cur-r4' },
+    ]);
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    });
+    __flushTimelineSnapshotsBeforeFreezeForTests();
+
+    expect(result.current.events.map((e) => e.payload?.text)).toEqual([
+      'CURRENT-FIRST',
+      'CURRENT-HISTORY',
+      'CURRENT-REPLAY',
+    ]);
+    expect(__getTimelineCacheForTests(cacheKey)?.map((e) => e.payload?.text)).toEqual([
+      'CURRENT-FIRST',
+      'CURRENT-HISTORY',
+      'CURRENT-REPLAY',
+    ]);
+    expect(putSpy).not.toHaveBeenCalled();
+    expect(localStorage.getItem(snapKey)).toBeNull();
+  });
 });

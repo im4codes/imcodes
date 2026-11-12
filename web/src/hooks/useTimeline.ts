@@ -223,8 +223,8 @@ type IncognitoCacheEntry = {
   mode: 'incognito' | 'closed-tombstone' | 'normal';
   sessionInstanceId?: string;
   runtimeEpoch?: string;
-  privateInstanceIds: Set<string>;
-  privateRuntimeEpochs: Set<string>;
+  closedPrivateInstanceIds: Set<string>;
+  closedPrivateRuntimeEpochs: Set<string>;
   privateFallbackEpochs: Set<string>;
 };
 const incognitoCacheState = new Map<string, IncognitoCacheEntry>();
@@ -1054,8 +1054,8 @@ function getOrCreateIncognitoState(cacheKey: string): IncognitoCacheEntry {
   if (!state) {
     state = {
       mode: 'normal',
-      privateInstanceIds: new Set<string>(),
-      privateRuntimeEpochs: new Set<string>(),
+      closedPrivateInstanceIds: new Set<string>(),
+      closedPrivateRuntimeEpochs: new Set<string>(),
       privateFallbackEpochs: new Set<string>(),
     };
     incognitoCacheState.set(cacheKey, state);
@@ -1098,11 +1098,31 @@ function addBoundedPrivateId(set: Set<string>, value: string): void {
   }
 }
 
-function recordPrivateInstanceMetadata(state: IncognitoCacheEntry, event: TimelineEvent): void {
-  if (event.sessionInstanceId) addBoundedPrivateId(state.privateInstanceIds, event.sessionInstanceId);
-  if (event.runtimeEpoch) addBoundedPrivateId(state.privateRuntimeEpochs, event.runtimeEpoch);
+function retireActivePrivateIdentity(state: IncognitoCacheEntry): void {
+  if (state.sessionInstanceId) addBoundedPrivateId(state.closedPrivateInstanceIds, state.sessionInstanceId);
+  if (state.runtimeEpoch) addBoundedPrivateId(state.closedPrivateRuntimeEpochs, state.runtimeEpoch);
+  state.sessionInstanceId = undefined;
+  state.runtimeEpoch = undefined;
+}
+
+function adoptActivePrivateIdentity(state: IncognitoCacheEntry, event: TimelineEvent): void {
+  if (!state.sessionInstanceId && event.sessionInstanceId) {
+    state.sessionInstanceId = event.sessionInstanceId;
+  }
+  if (!state.runtimeEpoch && event.runtimeEpoch) {
+    state.runtimeEpoch = event.runtimeEpoch;
+  }
   // Only fall back to daemon event.epoch when neither session/event carries
   // per-instance identity, so normal reuse on the same daemon is never blocked.
+  if (!state.sessionInstanceId && !state.runtimeEpoch && !event.sessionInstanceId && !event.runtimeEpoch) {
+    const ep = eventEpochKey(event);
+    if (ep) addBoundedPrivateId(state.privateFallbackEpochs, ep);
+  }
+}
+
+function retireClosedPrivateEventIdentity(state: IncognitoCacheEntry, event: TimelineEvent): void {
+  if (event.sessionInstanceId) addBoundedPrivateId(state.closedPrivateInstanceIds, event.sessionInstanceId);
+  if (event.runtimeEpoch) addBoundedPrivateId(state.closedPrivateRuntimeEpochs, event.runtimeEpoch);
   if (!state.sessionInstanceId && !state.runtimeEpoch && !event.sessionInstanceId && !event.runtimeEpoch) {
     const ep = eventEpochKey(event);
     if (ep) addBoundedPrivateId(state.privateFallbackEpochs, ep);
@@ -1114,10 +1134,10 @@ function hasMatchingClosedPrivateMeta(
   instanceId: string | undefined,
   runtimeEpoch: string | undefined,
 ): boolean {
-  if (instanceId && state.privateInstanceIds.has(instanceId) && state.sessionInstanceId !== instanceId) {
+  if (instanceId && state.closedPrivateInstanceIds.has(instanceId) && state.sessionInstanceId !== instanceId) {
     return true;
   }
-  if (runtimeEpoch && state.privateRuntimeEpochs.has(runtimeEpoch) && state.runtimeEpoch !== runtimeEpoch) {
+  if (runtimeEpoch && state.closedPrivateRuntimeEpochs.has(runtimeEpoch) && state.runtimeEpoch !== runtimeEpoch) {
     return true;
   }
   return false;
@@ -1130,12 +1150,12 @@ function hasMatchingClosedPrivateInstance(state: IncognitoCacheEntry, event: Tim
 function hasNewPrivateInstanceIdentity(state: IncognitoCacheEntry, event: TimelineEvent): boolean {
   const newInstanceId = Boolean(
     event.sessionInstanceId
-    && !state.privateInstanceIds.has(event.sessionInstanceId)
+    && !state.closedPrivateInstanceIds.has(event.sessionInstanceId)
     && event.sessionInstanceId !== state.sessionInstanceId,
   );
   const newRuntimeEpoch = Boolean(
     event.runtimeEpoch
-    && !state.privateRuntimeEpochs.has(event.runtimeEpoch)
+    && !state.closedPrivateRuntimeEpochs.has(event.runtimeEpoch)
     && event.runtimeEpoch !== state.runtimeEpoch,
   );
   return newInstanceId || newRuntimeEpoch;
@@ -1145,10 +1165,7 @@ function forgetIncognitoTimelineKey(cacheKey: string): void {
   const state = incognitoCacheState.get(cacheKey);
   if (!state) return;
   resetTransientTimelineState(cacheKey);
-  if (state.sessionInstanceId) addBoundedPrivateId(state.privateInstanceIds, state.sessionInstanceId);
-  if (state.runtimeEpoch) addBoundedPrivateId(state.privateRuntimeEpochs, state.runtimeEpoch);
-  state.sessionInstanceId = undefined;
-  state.runtimeEpoch = undefined;
+  retireActivePrivateIdentity(state);
   state.mode = 'closed-tombstone';
   setIncognitoTimelineKeyActive(cacheKey, false);
 }
@@ -1165,11 +1182,14 @@ function markPrivateTimelineEvents(cacheKey: string, events: TimelineEvent[]): T
     setIncognitoTimelineKeyActive(cacheKey, true);
   }
   const activeState = incognitoCacheState.get(cacheKey);
-  if (activeState?.mode === 'incognito' || activeState?.mode === 'closed-tombstone') {
+  if (activeState?.mode === 'incognito') {
     for (const event of nonClosedEvents) {
-      recordPrivateInstanceMetadata(activeState, event);
+      adoptActivePrivateIdentity(activeState, event);
     }
     return nonClosedEvents.map(event => isIncognitoSession(event.payload) ? event : { ...event, payload: { ...event.payload, ...INCOGNITO_TIMELINE_PAYLOAD } });
+  }
+  if (activeState?.mode === 'closed-tombstone') {
+    return [];
   }
   return nonClosedEvents;
 }
@@ -1182,7 +1202,7 @@ function shouldDropIncomingTimelineEvent(cacheKey: string, event: TimelineEvent)
   const ep = eventEpochKey(event);
   const payloadPrivate = isIncognitoSession(event.payload);
   if (state.mode === 'incognito') {
-    recordPrivateInstanceMetadata(state, event);
+    adoptActivePrivateIdentity(state, event);
     return false;
   }
   if (state.mode === 'closed-tombstone') {
@@ -1190,7 +1210,7 @@ function shouldDropIncomingTimelineEvent(cacheKey: string, event: TimelineEvent)
       && !event.sessionInstanceId && !event.runtimeEpoch
       && ep !== undefined && state.privateFallbackEpochs.has(ep);
     if (payloadPrivate || staleFallbackEpoch) {
-      recordPrivateInstanceMetadata(state, event);
+      retireClosedPrivateEventIdentity(state, event);
       return true;
     }
     // An authoritative non-incognito event without closed private identity
@@ -1209,14 +1229,8 @@ function shouldDropIncomingTimelineEvent(cacheKey: string, event: TimelineEvent)
       resetTransientTimelineState(cacheKey);
       state.mode = 'incognito';
       setIncognitoTimelineKeyActive(cacheKey, true);
-      if (event.sessionInstanceId) {
-        state.sessionInstanceId = event.sessionInstanceId;
-        addBoundedPrivateId(state.privateInstanceIds, event.sessionInstanceId);
-      }
-      if (event.runtimeEpoch) {
-        state.runtimeEpoch = event.runtimeEpoch;
-        addBoundedPrivateId(state.privateRuntimeEpochs, event.runtimeEpoch);
-      }
+      state.sessionInstanceId = event.sessionInstanceId || undefined;
+      state.runtimeEpoch = event.runtimeEpoch || undefined;
       return false;
     }
     return true;
@@ -1248,8 +1262,7 @@ export function registerIncognitoTimelineSession(
   );
   if (state.mode !== 'incognito' || instanceChanged) {
     if (state.mode === 'incognito') {
-      if (state.sessionInstanceId) addBoundedPrivateId(state.privateInstanceIds, state.sessionInstanceId);
-      if (state.runtimeEpoch) addBoundedPrivateId(state.privateRuntimeEpochs, state.runtimeEpoch);
+      retireActivePrivateIdentity(state);
     }
     resetTransientTimelineState(cacheKey);
   }
@@ -1257,11 +1270,9 @@ export function registerIncognitoTimelineSession(
   setIncognitoTimelineKeyActive(cacheKey, true);
   if (nextInstanceId !== undefined) {
     state.sessionInstanceId = nextInstanceId;
-    addBoundedPrivateId(state.privateInstanceIds, nextInstanceId);
   }
   if (nextEpoch !== undefined) {
     state.runtimeEpoch = nextEpoch;
-    addBoundedPrivateId(state.privateRuntimeEpochs, nextEpoch);
   }
 }
 
@@ -1282,20 +1293,19 @@ export function registerNormalTimelineSession(
     return;
   }
   if (state.mode === 'incognito') {
-    if (state.sessionInstanceId) addBoundedPrivateId(state.privateInstanceIds, state.sessionInstanceId);
-    if (state.runtimeEpoch) addBoundedPrivateId(state.privateRuntimeEpochs, state.runtimeEpoch);
+    retireActivePrivateIdentity(state);
     resetTransientTimelineState(cacheKey);
   }
   state.mode = 'normal';
   setIncognitoTimelineKeyActive(cacheKey, false);
   if (nextInstanceId !== undefined) {
     state.sessionInstanceId = nextInstanceId;
-  } else if (state.sessionInstanceId && state.privateInstanceIds.has(state.sessionInstanceId)) {
+  } else if (state.sessionInstanceId && state.closedPrivateInstanceIds.has(state.sessionInstanceId)) {
     state.sessionInstanceId = undefined;
   }
   if (nextEpoch !== undefined) {
     state.runtimeEpoch = nextEpoch;
-  } else if (state.runtimeEpoch && state.privateRuntimeEpochs.has(state.runtimeEpoch)) {
+  } else if (state.runtimeEpoch && state.closedPrivateRuntimeEpochs.has(state.runtimeEpoch)) {
     state.runtimeEpoch = undefined;
   }
 }
