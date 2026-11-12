@@ -1019,7 +1019,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
           }
           setServerId(currentShare.serverId);
           setRootPath(currentShare.targetPath);
-          const browsePath = subPath || currentShare.targetPath;
+          const browsePath = (subPath && subPath.startsWith(currentShare.targetPath)) ? subPath : currentShare.targetPath;
           setCurrentPath(browsePath);
           setShareInfo({
             id: currentShare.id,
@@ -1089,20 +1089,24 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
 
   const handleVerifyDevice = async (e: Event) => {
     e.preventDefault();
+    const actionEpoch = requestEpochRef.current;
+    const actionToken = token;
     setError(null);
     try {
-      const res = await verifyExternalDocShare(token, {
+      const res = await verifyExternalDocShare(actionToken, {
         accessCode: accessCode.trim() || undefined,
         deviceToken: deviceToken || undefined,
       });
+      if (actionEpoch !== requestEpochRef.current || actionToken !== token) return;
       setDeviceToken(res.deviceToken);
       try {
-        localStorage.setItem(`imcodes_doc_dev_${token}`, res.deviceToken);
+        localStorage.setItem(`imcodes_doc_dev_${actionToken}`, res.deviceToken);
       } catch {
         // Ignore storage errors
       }
       await loadExternalBrowse(undefined, res.deviceToken, accessCode.trim() || undefined);
     } catch (err) {
+      if (actionEpoch !== requestEpochRef.current || actionToken !== token) return;
       setError(err instanceof Error ? err.message : String(err));
     }
   };
@@ -1110,15 +1114,19 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
   const handleRedeemMagicLink = async (e: Event) => {
     e.preventDefault();
     if (!displayName.trim()) return;
+    const actionEpoch = requestEpochRef.current;
+    const actionToken = token;
     setError(null);
     try {
-      const res = await redeemMagicInviteDocShare(token, {
+      const res = await redeemMagicInviteDocShare(actionToken, {
         displayName: displayName.trim(),
         accessCode: accessCode.trim() || undefined,
       });
+      if (actionEpoch !== requestEpochRef.current || actionToken !== token) return;
       setServerId(res.share.serverId);
       await loadExternalBrowse();
     } catch (err) {
+      if (actionEpoch !== requestEpochRef.current || actionToken !== token) return;
       setError(err instanceof Error ? err.message : String(err));
     }
   };
@@ -1126,6 +1134,11 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
   const handleCreateItem = async (e: Event) => {
     e.preventDefault();
     if (!newItemName.trim() || !serverId || !currentPath) return;
+    const actionEpoch = requestEpochRef.current;
+    const actionShareId = selectedShareIdRef.current;
+    const actionServerId = serverId;
+    const actionParentDir = currentPath;
+    const actionToken = token;
     setError(null);
     try {
       const base = newItemName.trim();
@@ -1135,19 +1148,42 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
           : base.toLowerCase().endsWith(`.${newItemKind}`)
             ? base
             : `${base}.${newItemKind}`;
-      const res = await createSharedDocItem(serverId, {
-        parentDir: currentPath,
+      const res = await createSharedDocItem(actionServerId, {
+        parentDir: actionParentDir,
         name: finalName,
         kind: newItemKind === 'folder' ? 'folder' : 'file',
-        shareToken: token,
+        shareToken: actionToken,
         deviceToken: deviceToken || undefined,
       });
+      if (
+        actionEpoch !== requestEpochRef.current ||
+        actionShareId !== selectedShareIdRef.current ||
+        actionServerId !== serverId ||
+        actionToken !== token
+      ) {
+        return;
+      }
       setNewItemName('');
-      await loadExternalBrowse(currentPath);
-      if (res.kind === 'file') {
-        setActiveFilePath(res.path);
+      await loadExternalBrowse(actionParentDir);
+      if (
+        actionEpoch === requestEpochRef.current &&
+        actionShareId === selectedShareIdRef.current &&
+        actionServerId === serverId &&
+        actionToken === token
+      ) {
+        if (res.kind === 'file') {
+          setActiveFilePath(res.path);
+        }
       }
     } catch (err) {
+      if (
+        actionEpoch !== requestEpochRef.current ||
+        actionShareId !== selectedShareIdRef.current ||
+        actionServerId !== serverId ||
+        actionToken !== token
+      ) {
+        return;
+      }
       setError(err instanceof Error ? err.message : String(err));
     }
   };

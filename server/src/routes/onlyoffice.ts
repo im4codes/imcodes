@@ -155,6 +155,7 @@ interface DocumentVersionState {
   sessionEpoch: number;
   commitSeq: number;
   activeKey: string;
+  active?: boolean;
   updatedAt: number;
 }
 
@@ -172,17 +173,15 @@ function loadPersistentRooms(): Record<string, DocumentVersionState> {
 }
 
 function savePersistentRoom(mapKey: string, state: DocumentVersionState | null): void {
-  try {
-    const data = loadPersistentRooms();
-    if (state === null) {
-      delete data[mapKey];
-    } else {
-      data[mapKey] = state;
-    }
-    const tmp = `${ROOMS_STORE_PATH}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(data), 'utf8');
-    fs.renameSync(tmp, ROOMS_STORE_PATH);
-  } catch { /* ignore */ }
+  const data = loadPersistentRooms();
+  if (state === null) {
+    delete data[mapKey];
+  } else {
+    data[mapKey] = state;
+  }
+  const tmp = `${ROOMS_STORE_PATH}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data), 'utf8');
+  fs.renameSync(tmp, ROOMS_STORE_PATH);
 }
 
 const docCommitMutex = new Map<string, Promise<void>>();
@@ -290,10 +289,13 @@ export async function resolveOnlyOfficeDocumentKey(
       }
     }
     if (existing) {
+      if (existing.active !== false) {
+        return existing.activeKey;
+      }
       if (currentHash === existing.committedHash || currentHash === existing.lastForceSavedHash) {
         return existing.activeKey;
       }
-      // File content changed externally on the daemon -> advance to new version key
+      // Previous session closed -> advance to new version key
       const nextEpoch = existing.sessionEpoch + 1;
       const nextSeq = existing.commitSeq + 1;
       const activeKey = computeDocumentKeyFromDigest(serverId, normalizedPath, currentHash, nextEpoch);
@@ -303,10 +305,13 @@ export async function resolveOnlyOfficeDocumentKey(
         sessionEpoch: nextEpoch,
         commitSeq: nextSeq,
         activeKey,
+        active: true,
         updatedAt: Date.now(),
       };
       documentVersionStateMap.set(mapKey, newState);
-      savePersistentRoom(mapKey, newState);
+      try {
+        savePersistentRoom(mapKey, newState);
+      } catch { /* best effort */ }
       return activeKey;
     }
 
@@ -317,10 +322,13 @@ export async function resolveOnlyOfficeDocumentKey(
       sessionEpoch: 0,
       commitSeq: 0,
       activeKey,
+      active: true,
       updatedAt: Date.now(),
     };
     documentVersionStateMap.set(mapKey, newState);
-    savePersistentRoom(mapKey, newState);
+    try {
+      savePersistentRoom(mapKey, newState);
+    } catch { /* best effort */ }
     return activeKey;
   } catch {
     return getOnlyOfficeDocumentKey(serverId, normalizedPath);
@@ -1568,10 +1576,15 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
           sessionEpoch: nextEpoch,
           commitSeq: nextSeq,
           activeKey: nextKey,
+          active: false,
           updatedAt: Date.now(),
         };
+        try {
+          savePersistentRoom(mapKey, newState);
+        } catch (persistErr) {
+          return c.json({ error: 1, message: 'durable_room_state_failed' }, 500);
+        }
         documentVersionStateMap.set(mapKey, newState);
-        savePersistentRoom(mapKey, newState);
       } else if (status === 6) {
         const nextSeq = (state?.commitSeq ?? 0) + 1;
         const currentEpoch = state?.sessionEpoch ?? 0;
@@ -1582,14 +1595,35 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
           sessionEpoch: currentEpoch,
           commitSeq: nextSeq,
           activeKey: currentKey,
+          active: true,
           updatedAt: Date.now(),
         };
+        try {
+          savePersistentRoom(mapKey, newState);
+        } catch (persistErr) {
+          return c.json({ error: 1, message: 'durable_room_state_failed' }, 500);
+        }
         documentVersionStateMap.set(mapKey, newState);
-        savePersistentRoom(mapKey, newState);
       }
 
       return c.json({ error: 0 });
     });
+  }
+
+  if (status === 4) {
+    const mapKey = `${claims.serverId}:${claims.path}`;
+    const state = documentVersionStateMap.get(mapKey) ?? loadPersistentRooms()[mapKey];
+    if (state && state.active !== false) {
+      const newState: DocumentVersionState = {
+        ...state,
+        active: false,
+        updatedAt: Date.now(),
+      };
+      try {
+        savePersistentRoom(mapKey, newState);
+      } catch { /* best effort on status 4 */ }
+      documentVersionStateMap.set(mapKey, newState);
+    }
   }
 
   return c.json({ error: 0 });
