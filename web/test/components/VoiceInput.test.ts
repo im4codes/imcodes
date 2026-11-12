@@ -108,3 +108,28 @@ describe('VoiceInput', () => {
     expect(VoiceInput.isListening()).toBe(false);
   });
 });
+
+
+describe('mobile capture defenses', () => {
+  it('pauses app playback before activating the native microphone', async () => {
+    const media = document.createElement('audio');
+    Object.defineProperty(media, 'paused', { value: false });
+    const pause = vi.fn(); media.pause = pause; document.body.append(media);
+    const cancel = vi.fn(); vi.stubGlobal('speechSynthesis', { cancel });
+    speechApi.start.mockImplementationOnce(async () => {
+      expect(pause).toHaveBeenCalledOnce(); expect(cancel).toHaveBeenCalledOnce();
+    });
+    try { expect(await VoiceInput.startListening(vi.fn())).toBe(true); }
+    finally { await VoiceInput.stopListening(); media.remove(); vi.unstubAllGlobals(); }
+  });
+
+  it('does not hard-stop a long native recording at 60 seconds', async () => {
+    vi.useFakeTimers();
+    try {
+      await VoiceInput.startListening(vi.fn());
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(VoiceInput.isListening()).toBe(true);
+      expect(speechApi.stop).not.toHaveBeenCalled();
+    } finally { await VoiceInput.stopListening(); vi.useRealTimers(); }
+  });
+});

@@ -99,6 +99,16 @@ async function removeRecognitionListeners(): Promise<void> {
   ]);
 }
 
+/** Pause app-owned playback before activating a recording audio session. This
+ * avoids a simultaneous playback/record route transition; never change the
+ * system volume or attempt to control other apps. Resumption is user-owned. */
+function pauseBackgroundAudio(): void {
+  for (const media of document.querySelectorAll<HTMLMediaElement>('audio, video')) {
+    try { if (!media.paused) media.pause(); } catch { /* best effort */ }
+  }
+  try { globalThis.speechSynthesis?.cancel(); } catch { /* unsupported */ }
+}
+
 async function startListeningInternal(generation: number): Promise<boolean> {
   const locale = pickLocale();
   const session = { recognition: getNativeSpeechRecognition(), text: null as string | null, final: false };
@@ -155,6 +165,7 @@ async function startListeningInternal(generation: number): Promise<boolean> {
       if (_nativeSession === session) _nativeSession = null;
       return false;
     }
+    pauseBackgroundAudio();
     await recognition.start({
       language: locale,
       partialResults: true,
@@ -280,6 +291,7 @@ function startWebListening(): boolean {
       stopWebLevelMeter();
     };
     _webRec = rec;
+    pauseBackgroundAudio();
     rec.start();
     setListening(true);
     void startWebLevelMeter(generation);

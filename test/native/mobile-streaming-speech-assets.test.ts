@@ -73,8 +73,8 @@ describe('Qwen3-ASR mobile assets', () => {
     expect(ios).toContain('SherpaOnnxDestroyOfflineStream(stream)'); expect(ios).toContain('SherpaOnnxDestroyOfflineRecognizerResult(result)');
     expect(android).toContain('qwen.setMaxTotalLen(768)'); expect(android).toContain('new OfflineRecognizer(null, config)');
     expect(android).toContain('getNoBackupFilesDir()'); expect(android).toContain('finally { stream.release(); }');
-    expect(ios).toContain('static let capacity = 3 * sampleRate'); expect(ios).toContain('maxNewTokens: 32'); expect(android).toContain('20 * SAMPLE_RATE');
-    expect(ios).toContain('DispatchSemaphore(value: 64)'); expect(android).toContain('MAX_BUFFERED_CHUNKS = 64');
+    expect(ios).toContain('static let capacity = 3 * stride'); expect(ios).toContain('maxNewTokens: 24'); expect(android).toContain('qwen.setMaxNewTokens(24)');
+    expect(ios).toContain('static let limit = 16000 * 64 / 10'); expect(android).toContain('MAX_BUFFERED_CHUNKS = 64');
     expect(ios).not.toContain('OfflinePunctuation'); expect(android).not.toContain('OfflinePunctuation');
     expect(ios).not.toContain('OnlineStream'); expect(android).not.toContain('OnlineStream');
   });
@@ -175,21 +175,31 @@ public class Harness {
    PluginCall stop=new PluginCall();p.stop(stop);OfflineRecognizer.release.countDown();await(stop.done);
    check(OfflineRecognizer.lastSamples==1600,p.events); check(finals(p)==1,p.events);check(p.events.get(p.events.size()-1).contains("status=stopped"),p.events);
    System.out.println("COLD_STOP_OK");
-   p.events.clear();AudioRecord.chunksPerStart=12;OfflineRecognizer.decoded=new CountDownLatch(1);
+   p.events.clear();AudioRecord.chunksPerStart=18;OfflineRecognizer.decoded=new CountDownLatch(1);
    p.start(new PluginCall());await(OfflineRecognizer.decoded);await(AudioRecord.delivered);PluginCall stop2=new PluginCall();p.stop(stop2);await(stop2.done);
    check(OfflineRecognizer.creations==1,p.events);check(finals(p)==1,p.events);check(p.events.stream().anyMatch(x->x.contains("isFinal=false")),p.events);System.out.println("WARM_REUSE_OK");
-   p.events.clear();AudioRecord.chunksPerStart=6;AudioRecord.silentChunksPerStart=6;OfflineRecognizer.decoded=new CountDownLatch(1);
+   p.events.clear();AudioRecord.chunksPerStart=55;OfflineRecognizer.holdDecode=true;
+   OfflineRecognizer.decoding=new CountDownLatch(1);OfflineRecognizer.decodeRelease=new CountDownLatch(1);
+   int beforeDrain=OfflineStream.created;
+   p.start(new PluginCall());await(OfflineRecognizer.decoding);await(AudioRecord.delivered);
+   PluginCall drainedStop=new PluginCall();p.stop(drainedStop);
+   check(drainedStop.done.getCount()==1,"stop overtook in-flight decode");
+   OfflineRecognizer.decodeRelease.countDown();await(drainedStop.done);OfflineRecognizer.holdDecode=false;
+   check(OfflineStream.created-beforeDrain==2,"tail replayed fixed steps: "+(OfflineStream.created-beforeDrain));
+   check(OfflineRecognizer.lastSamples==55*1600,"tail did not merge all accepted PCM");
+   check(finals(p)==1,p.events);System.out.println("SINGLE_TAIL_DRAIN_OK");
+   p.events.clear();AudioRecord.chunksPerStart=15;AudioRecord.silentChunksPerStart=6;OfflineRecognizer.decoded=new CountDownLatch(1);
    p.start(new PluginCall());await(OfflineRecognizer.decoded);await(AudioRecord.delivered);PluginCall stop3=new PluginCall();p.stop(stop3);await(stop3.done);
    check(p.events.stream().filter(x->x.contains("isFinal=true")).anyMatch(x->x.contains("你好 Hello.")&&!x.contains("你好 Hello.你好")),p.events);System.out.println("SILENCE_SEGMENT_OK");
    p.events.clear();AudioRecord.chunksPerStart=205;AudioRecord.silentChunksPerStart=0;OfflineRecognizer.decoded=new CountDownLatch(1);
    p.start(new PluginCall());await(AudioRecord.delivered);PluginCall stop4=new PluginCall();p.stop(stop4);await(stop4.done);
-   check(OfflineStream.maxSamples==320000,OfflineStream.maxSamples);check(finals(p)==1,p.events);check(p.events.stream().anyMatch(x->x.contains("你好 Hello.你好 Hello.")),p.events);check(OfflineStream.created==OfflineStream.released,p.events);System.out.println("WINDOW_AND_RELEASE_OK");
+   check(OfflineStream.maxSamples>=48000 && OfflineStream.maxSamples<=150400,OfflineStream.maxSamples);check(finals(p)==1,p.events);check(p.events.stream().anyMatch(x->x.contains("你好 Hello.你好 Hello.")),p.events);check(OfflineStream.created==OfflineStream.released,p.events);System.out.println("WINDOW_AND_RELEASE_OK");
   } finally {p.destroy();}
   for(int i=0;i<100&&OfflineRecognizer.releases==0;i++)Thread.sleep(5);check(OfflineRecognizer.releases==1,OfflineRecognizer.releases);
   OfflineRecognizer.entered=new CountDownLatch(1);OfflineRecognizer.release=new CountDownLatch(1);AudioRecord.chunksPerStart=70;
   Subject overflow=new Subject();try{overflow.load();await(OfflineRecognizer.entered);overflow.start(new PluginCall());for(int i=0;i<800&&AudioRecord.latest.getRecordingState()==AudioRecord.RECORDSTATE_RECORDING;i++)Thread.sleep(5);check(AudioRecord.latest.getRecordingState()!=AudioRecord.RECORDSTATE_RECORDING,"overflow did not stop intake");OfflineRecognizer.release.countDown();PluginCall end=new PluginCall();overflow.stop(end);await(end.done);check(overflow.events.stream().anyMatch(x->x.contains("processing overloaded")),overflow.events);System.out.println("OVERFLOW_OK");}finally{overflow.destroy();}
   for(int i=0;i<100&&OfflineRecognizer.releases<2;i++)Thread.sleep(5);
-  OfflineRecognizer.holdDecode=true;AudioRecord.chunksPerStart=6;
+  OfflineRecognizer.holdDecode=true;OfflineRecognizer.decoding=new CountDownLatch(1);OfflineRecognizer.decodeRelease=new CountDownLatch(1);AudioRecord.chunksPerStart=15;
   Subject retired=new Subject();retired.load();retired.start(new PluginCall());await(OfflineRecognizer.decoding);
   retired.destroy();OfflineRecognizer.decodeRelease.countDown();
   for(int i=0;i<100&&OfflineRecognizer.releases<3;i++)Thread.sleep(5);
@@ -203,7 +213,7 @@ public class Harness {
     sources.push(fileURLToPath(new URL('../../web/plugins/streaming-speech/android/src/main/java/com/imcodes/speech/StreamingSpeechPlugin.java',import.meta.url)));
     execFileSync('javac',['-d',classesDir,...sources],{stdio:'pipe',timeout:30000});
     const output=execFileSync('java',['-Djava.io.tmpdir='+root,'-cp',classesDir,'Harness'],{encoding:'utf8',timeout:15000}).trim().split('\n');
-    expect(output).toEqual(['COLD_STOP_OK','WARM_REUSE_OK','SILENCE_SEGMENT_OK','WINDOW_AND_RELEASE_OK','OVERFLOW_OK','OWNER_RETIRE_OK']);
+    expect(output).toEqual(['COLD_STOP_OK','WARM_REUSE_OK','SINGLE_TAIL_DRAIN_OK','SILENCE_SEGMENT_OK','WINDOW_AND_RELEASE_OK','OVERFLOW_OK','OWNER_RETIRE_OK']);
   });
 });
 
@@ -219,14 +229,14 @@ it.skipIf(!swiftCompiler)('executes the actual Swift bounded window through roll
   await writeFile(file, 'import Foundation\n' + state + '\n' + swiftWindowCases);
   execFileSync(swiftCompiler!, ['-swift-version', '5', file, '-o', executable], { encoding: 'utf8', timeout: 60000 });
   const result = execFileSync(executable, [], { encoding: 'utf8', timeout: 30000 });
-  for (const name of ['TAIL', 'ROLLBACK', 'VAD', 'PUNCTUATION', 'REPEATED_SENTENCE', 'LONG_CONTINUOUS', 'VARIABLE_TAP', 'FAILURE', 'UNICODE', 'EMPTY', 'IN_FLIGHT_STOP', 'LONG_TRANSCRIPT', 'SHORT_CJK', 'SHORT_ASCII', 'REPEATED_OVERLAP', 'STABLE_HYPOTHESIS', 'NO_PROGRESS_THEN_GROWTH']) {
+  for (const name of ['TAIL', 'ROLLBACK', 'VAD', 'PUNCTUATION', 'REPEATED_SENTENCE', 'LONG_CONTINUOUS', 'VARIABLE_TAP', 'FAILURE', 'UNICODE', 'EMPTY', 'IN_FLIGHT_STOP', 'LONG_TRANSCRIPT', 'SHORT_CJK', 'SHORT_ASCII', 'REPEATED_OVERLAP', 'STABLE_HYPOTHESIS', 'NO_PROGRESS_THEN_GROWTH', 'ZERO_LAG', 'WARMUP', 'OVERLOAD', 'TAIL_BATCH']) {
     expect(result).toContain(name + ':PASS');
   }
 }, 95000);
 
 const swiftWindowCases = `
-func check(_ condition: @autoclosure () -> Bool, _ message: String) {
-    if !condition() { fatalError(message) }
+func check(_ condition: @autoclosure () throws -> Bool, _ message: String) {
+    if !(try! condition()) { fatalError(message) }
 }
 func pcm(_ count: Int) -> [Float] { Array(repeating: 0.1, count: count) }
 // Exercise the actual production window on the same serial worker/barrier
@@ -239,7 +249,7 @@ final class InFlightCapture {
     func decode(_ samples: [Float]) -> String? {
         lengths.append(samples.count)
         if lengths.count == 1 { entered.signal(); release.wait() }
-        return samples.count == 16000 ? "before tail" : "before tail last word"
+        return samples.count == 24000 ? "before tail" : "before tail last word"
     }
 }
 func labelledSeams(_ words: [String], separator: String, holds: [Int] = []) throws {
@@ -255,11 +265,11 @@ func labelledSeams(_ words: [String], separator: String, holds: [Int] = []) thro
     for id in 0..<words.count {
         let expected = words.prefix(id + 1).joined(separator: separator)
         for _ in 0..<(holds.isEmpty ? 1 : holds[id]) {
-            try window.append(Array(repeating: Float(id), count: 16000), speech: true, decode: decode) { snapshot in
+            try window.append(Array(repeating: Float(id), count: 24000), speech: true, decode: decode) { snapshot in
                 check(snapshot == expected, "seam corrupted an intermediate snapshot: " + snapshot + " != " + expected)
             }
             check(window.text == expected, "window lost previously recognised text")
-            check(window.samples.count <= 48000, "labelled input grew the PCM window")
+            check(window.samples.count <= 72000, "labelled input grew the PCM window")
         }
     }
     let final = try window.finish(decode: decode)
@@ -279,12 +289,12 @@ func run() throws {
     window = SpeechWindow(); calls = []; emitted = []
     var hypotheses = ["alpha hello", "alpha hello worlt", "alpha hello world", "hello world again"]
     let rollingDecode: ([Float]) -> String? = { samples in calls.append(samples.count); return hypotheses.removeFirst() }
-    for _ in 0..<3 { try window.append(pcm(16000), speech: true, decode: rollingDecode) { emitted.append($0) } }
+    for _ in 0..<3 { try window.append(pcm(24000), speech: true, decode: rollingDecode) { emitted.append($0) } }
     check(window.committed == "alpha hello " && window.partial == "world", "five-character rollback")
-    check(window.samples.count == 16000 && window.text == "alpha hello world", "roll did not retain exact seam")
-    try window.append(pcm(16000), speech: true, decode: rollingDecode) { emitted.append($0) }
+    check(window.samples.count == 24000 && window.text == "alpha hello world", "roll did not retain exact seam")
+    try window.append(pcm(24000), speech: true, decode: rollingDecode) { emitted.append($0) }
     check(window.text == "alpha hello world again", "overlap repeated or split word")
-    check(calls == [16000, 32000, 48000, 32000], "decode input unbounded")
+    check(calls == [24000, 48000, 72000, 48000], "decode input unbounded")
     _ = try window.finish(decode: rollingDecode)
     check(calls.count == 4, "overlap-only stop reran audio")
     print("ROLLBACK:PASS")
@@ -328,11 +338,11 @@ func run() throws {
 
     window = SpeechWindow()
     let sentence: ([Float]) -> String? = { _ in "同一句。" }
-    try window.append(pcm(16000), speech: true, decode: sentence) { _ in }
+    try window.append(pcm(24000), speech: true, decode: sentence) { _ in }
     try window.append(pcm(6400), speech: false, decode: sentence) { _ in }
     check(window.samples.isEmpty && window.committed == "同一句。", "punctuation pause did not commit")
     print("PUNCTUATION:PASS")
-    try window.append(pcm(16000), speech: true, decode: sentence) { _ in }
+    try window.append(pcm(24000), speech: true, decode: sentence) { _ in }
     try window.append(pcm(6400), speech: false, decode: sentence) { _ in }
     check(window.committed == "同一句。同一句。", "valid repeated sentence deduplicated")
     print("REPEATED_SENTENCE:PASS")
@@ -344,11 +354,11 @@ func run() throws {
     }
     for _ in 0..<1200 {
         try window.append(pcm(1600), speech: true, decode: longDecode) { _ in }
-        check(window.samples.count <= 48000, "PCM grew with duration")
+        check(window.samples.count <= 72000, "PCM grew with duration")
         check(window.partial.count <= 32, "mock hypothesis leaked historical partial")
     }
     _ = try window.finish(decode: longDecode)
-    check(calls.count == 120 && calls.max() == 48000, "2 minute decode cadence/bound failed")
+    check(calls.count == 80 && calls.max() == 72000, "2 minute decode cadence/bound failed")
     check(window.samples.isEmpty, "final did not release PCM")
     print("LONG_CONTINUOUS:PASS")
 
@@ -365,33 +375,64 @@ func run() throws {
         return words.joined(separator: " ")
     }
     for second in 0..<120 {
-        try window.append(Array(repeating: Float(second), count: 16000), speech: true, decode: labelled) { _ in }
+        try window.append(Array(repeating: Float(second), count: 24000), speech: true, decode: labelled) { _ in }
     }
     let transcript = try window.finish(decode: labelled)
     check(transcript == (0..<120).map(word).joined(separator: " "), "continuous overlapped words repeated or lost")
     print("LONG_TRANSCRIPT:PASS")
 
     window = SpeechWindow(); calls = []
-    try window.append(pcm(16000 * 11 + 137), speech: true, decode: longDecode) { _ in }
+    try window.append(pcm(64000 + 137), speech: true, decode: longDecode) { _ in }
     _ = try window.finish(decode: longDecode)
-    check(calls.count == 12 && calls.max() == 48000 && calls.last! == 16137, "large tap overshot boundary or lost tail")
+    check(calls == [64137], "large tap overshot boundary or lost tail")
     print("VARIABLE_TAP:PASS")
 
+    var inbox = SpeechInbox()
+    check(!(try inbox.offer(pcm(800))), "warmup scheduled decode")
+    check(!(try inbox.offer(pcm(800))), "warmup not exactly 100ms")
+    check(try inbox.offer([1, 2, 3]), "first PCM did not schedule")
+    check(!(try inbox.offer([4, 5])), "duplicate drain scheduled")
+    check(inbox.take()?.samples == [1, 2, 3, 4, 5] && inbox.pending.isEmpty, "drain left backlog")
+    check(!(try inbox.offer([6])), "in-flight drain scheduled a duplicate")
+    check(inbox.take()?.samples == [6] && inbox.take() == nil, "in-flight PCM lost")
+    check(try inbox.offer([7]), "empty drain did not rearm")
+    print("ZERO_LAG:PASS")
+    print("WARMUP:PASS")
+
+    inbox = SpeechInbox()
+    _ = try inbox.offer(pcm(1600))
+    _ = try inbox.offer(pcm(SpeechInbox.limit))
+    do { _ = try inbox.offer([1]); fatalError("overflow unbounded") }
+    catch SpeechInbox.Failure.overload { check(inbox.pending.count == SpeechInbox.limit, "overflow lost admitted PCM") }
+    print("OVERLOAD:PASS")
+
+    window = SpeechWindow(); calls = []
+    try window.append(pcm(24000), speech: true, decode: longDecode) { _ in }
+    let beforeStop = calls.count
+    // Remaining accepted backlog plus any sub-step tail: not an intermediate
+    // decode, even when this is several strides. Final is exactly ONE call.
+    try window.append(pcm(SpeechInbox.limit), speech: true, final: true, decode: longDecode) { _ in fatalError("stop emitted partial") }
+    _ = try window.finish(decode: longDecode)
+    check(calls.count == beforeStop + 1 && calls.last! == 24000 + SpeechInbox.limit, "stop replayed queued steps")
+    _ = try window.finish(decode: longDecode)
+    check(calls.count == beforeStop + 1, "stop decoded twice")
+    print("TAIL_BATCH:PASS")
+
     window = SpeechWindow()
-    try window.append(pcm(16000), speech: true, decode: sentence) { _ in }
+    try window.append(pcm(24000), speech: true, decode: sentence) { _ in }
     try window.append(pcm(100), speech: true, decode: sentence) { _ in }
     do { _ = try window.finish(decode: { _ in nil }); fatalError("decode failure swallowed") }
-    catch SpeechWindow.Failure.decode { check(window.text == "同一句。" && window.samples.count == 16100, "failed flush discarded previous text/PCM") }
+    catch SpeechWindow.Failure.decode { check(window.text == "同一句。" && window.samples.count == 24100, "failed flush discarded previous text/PCM") }
     print("FAILURE:PASS")
 
     window = SpeechWindow()
     let unicode: ([Float]) -> String? = { _ in "你好👨‍👩‍👧‍👦e\\u{301}世界朋友再见" }
-    try window.append(pcm(48000), speech: true, decode: unicode) { _ in }
+    try window.append(pcm(72000), speech: true, decode: unicode) { _ in }
     check(window.partial.count == 5 && !window.text.contains("�"), "split grapheme cluster")
     print("UNICODE:PASS")
 
     window = SpeechWindow(); calls = []
-    try window.append(pcm(160000), speech: false, decode: decode) { _ in }
+    try window.append(pcm(240000), speech: false, decode: decode) { _ in }
     let empty = try window.finish(decode: decode)
     check(empty.isEmpty && calls.isEmpty, "silence hallucinated an empty session")
     print("EMPTY:PASS")
@@ -399,7 +440,7 @@ func run() throws {
     let capture = InFlightCapture(), worker = DispatchQueue(label: "speech-window-test")
     let done = DispatchSemaphore(value: 0)
     worker.async {
-        try! capture.window.append(pcm(16000), speech: true, decode: capture.decode) { _ in capture.events.append("partial") }
+        try! capture.window.append(pcm(24000), speech: true, decode: capture.decode) { _ in capture.events.append("partial") }
     }
     check(capture.entered.wait(timeout: .now() + 2) == .success, "decode did not start")
     worker.async {
@@ -414,7 +455,7 @@ func run() throws {
     check(done.wait(timeout: .now() + 0.02) == .timedOut, "stop overtook in-flight decode")
     capture.release.signal()
     check(done.wait(timeout: .now() + 2) == .success, "stop barrier hung")
-    check(capture.lengths == [16000, 16137], "accepted tail lost or decoded twice")
+    check(capture.lengths == [24000, 24137], "accepted tail lost or decoded twice")
     check(capture.events == ["partial", "before tail last word", "stopped/ACK"], "final did not precede stopped/ACK")
     print("IN_FLIGHT_STOP:PASS")
 }

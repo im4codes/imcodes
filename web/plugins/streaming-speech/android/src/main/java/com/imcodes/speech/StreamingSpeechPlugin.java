@@ -38,8 +38,8 @@ import java.util.concurrent.atomic.AtomicLong;
 public class StreamingSpeechPlugin extends Plugin {
     private static final int SAMPLE_RATE = 16000;
     private static final int MAX_BUFFERED_CHUNKS = 64; // ~6.4s at 100ms/chunk (matches iOS slots = 64)
-    private static final int MAX_UTTERANCE_SAMPLES = 20 * SAMPLE_RATE;
-    private static final int PARTIAL_INTERVAL_SAMPLES = 9600; // 0.6s, not a latency guarantee
+    private static final int MAX_UTTERANCE_SAMPLES = 3 * SAMPLE_RATE;
+    private static final int PARTIAL_INTERVAL_SAMPLES = 24000; // 1.5s of new audio, not a latency guarantee
     private static final String[] MODEL_FILES = { "conv_frontend.onnx", "encoder.int4.onnx", "encoder.int4.weights", "decoder.int4.onnx", "decoder.int4.weights", "tokenizer/vocab.json", "tokenizer/merges.txt", "tokenizer/tokenizer_config.json", "hotwords.txt" };
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final AtomicLong generation = new AtomicLong();
@@ -89,7 +89,7 @@ public class StreamingSpeechPlugin extends Plugin {
         qwen.setEncoder(new File(root, "encoder.int4.onnx").getPath());
         qwen.setDecoder(new File(root, "decoder.int4.onnx").getPath());
         qwen.setTokenizer(new File(root, "tokenizer").getPath());
-        qwen.setMaxTotalLen(768); qwen.setMaxNewTokens(128);
+        qwen.setMaxTotalLen(768); qwen.setMaxNewTokens(24);
         qwen.setTemperature(1e-6f); qwen.setTopP(0.8f); qwen.setSeed(42);
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(getContext().getAssets().open("hotwords.txt"), StandardCharsets.UTF_8))) {
             qwen.setHotwords(String.join(",", reader.lines().map(String::trim).filter(line -> !line.isEmpty()).toArray(String[]::new)));
@@ -233,8 +233,8 @@ public class StreamingSpeechPlugin extends Plugin {
 
     private void capture(PluginCall call, long owner, AudioRecord audio, CaptureSession session) {
         OfflineRecognizer recognizer = null;
-        float[] utteranceSamples = new float[MAX_UTTERANCE_SAMPLES];
-        int sampleCount = 0, lastDecodedCount = 0, unchangedSilentChunks = 0;
+        float[] utteranceSamples = new float[MAX_UTTERANCE_SAMPLES + MAX_BUFFERED_CHUNKS * 1600];
+        int sampleCount = 0, lastDecodedCount = 0, silentSamples = 0;
         String committed = "", last = "";
         boolean failed = false;
         try {
@@ -242,24 +242,25 @@ public class StreamingSpeechPlugin extends Plugin {
             recognizer = ensureRecognizer();
             if (session.isDiscarded() || generation.get() != owner) return;
             while (!session.isDiscarded() && generation.get() == owner) {
-                float[] samples = session.pollSamples(generation);
-                if (samples == null) break;
-                boolean speech = computeLevel(samples) >= 0.01;
+                AudioBatch batch = session.pollSamples(generation);
+                if (batch == null) break;
+                float[] samples = batch.samples;
+                boolean speech = batch.speech;
                 if (sampleCount == 0 && !speech) continue; // Don't hallucinate from leading silence.
-                for (int offset = 0; offset < samples.length;) {
-                    int count = Math.min(samples.length - offset, MAX_UTTERANCE_SAMPLES - sampleCount);
-                    System.arraycopy(samples, offset, utteranceSamples, sampleCount, count);
-                    sampleCount += count; offset += count;
-                    unchangedSilentChunks = speech ? 0 : unchangedSilentChunks + 1;
-                    boolean endpoint = sampleCount == MAX_UTTERANCE_SAMPLES || unchangedSilentChunks >= 6;
-                    if (endpoint || (speech && sampleCount - lastDecodedCount >= PARTIAL_INTERVAL_SAMPLES)) {
-                        String text = decodeSamples(recognizer, utteranceSamples, sampleCount);
-                        if (session.isDiscarded() || generation.get() != owner) break;
-                        String full = join(committed, text);
-                        if (!full.equals(last)) { partial(full, false); last = full; }
-                        lastDecodedCount = sampleCount;
-                        if (endpoint) { committed = full; sampleCount = 0; lastDecodedCount = 0; unchangedSilentChunks = 0; }
-                    }
+                // pollSamples swaps ALL accepted backlog into this batch. One
+                // worker turn can decode once, never replay fixed-stride jobs.
+                System.arraycopy(samples, 0, utteranceSamples, sampleCount, samples.length);
+                sampleCount += samples.length;
+                silentSamples = speech ? batch.trailingSilence : silentSamples + samples.length;
+                if (session.isStopRequested()) continue; // final tail belongs to finally
+                boolean endpoint = sampleCount >= MAX_UTTERANCE_SAMPLES || silentSamples >= 9600;
+                if (endpoint || (speech && sampleCount - lastDecodedCount >= PARTIAL_INTERVAL_SAMPLES)) {
+                    String text = decodeSamples(recognizer, utteranceSamples, sampleCount);
+                    if (session.isDiscarded() || generation.get() != owner) break;
+                    String full = join(committed, text);
+                    if (!full.equals(last)) { partial(full, false); last = full; }
+                    lastDecodedCount = sampleCount;
+                    if (endpoint) { committed = full; sampleCount = 0; lastDecodedCount = 0; silentSamples = 0; }
                 }
             }
         } catch (Exception | LinkageError e) {
@@ -277,7 +278,7 @@ public class StreamingSpeechPlugin extends Plugin {
             // Normal stop drains every accepted PCM chunk before the final barrier.
             if (!failed && !session.isDiscarded() && generation.get() == owner && recognizer != null) {
                 try {
-                    String full = join(committed, decodeSamples(recognizer, utteranceSamples, sampleCount));
+                    String full = sampleCount == lastDecodedCount ? last : join(committed, decodeSamples(recognizer, utteranceSamples, sampleCount));
                     if (!session.isDiscarded() && generation.get() == owner) partial(full, true);
                 } catch (Exception | LinkageError error) {
                     JSObject failure = new JSObject(); failure.put("message", "Offline speech final decoding failed");
@@ -304,6 +305,15 @@ public class StreamingSpeechPlugin extends Plugin {
         double power = 0;
         for (float s : samples) power += s * s;
         return Math.min(1, Math.sqrt(power / samples.length) * 3);
+    }
+
+    private static final class AudioBatch {
+        final float[] samples;
+        final boolean speech;
+        final int trailingSilence;
+        AudioBatch(float[] samples, boolean speech, int trailingSilence) {
+            this.samples = samples; this.speech = speech; this.trailingSilence = trailingSilence;
+        }
     }
 
     private static final class CaptureSession {
@@ -372,8 +382,8 @@ public class StreamingSpeechPlugin extends Plugin {
             notifyAll();
         }
 
-        synchronized float[] pollSamples(AtomicLong generation) throws Exception {
-            while (pcmQueue.isEmpty() && !readerDone && !discarded && generation.get() == owner) {
+        synchronized AudioBatch pollSamples(AtomicLong generation) throws Exception {
+            while ((pcmQueue.isEmpty() || stopRequested) && !readerDone && !discarded && generation.get() == owner) {
                 wait();
             }
             if (discarded || generation.get() != owner) return null;
@@ -381,7 +391,22 @@ public class StreamingSpeechPlugin extends Plugin {
                 throw new IOException("Offline speech processing overloaded");
             }
             if (!pcmQueue.isEmpty()) {
-                return pcmQueue.removeFirst();
+                int count = 0, trailingSilence = 0;
+                boolean speech = false;
+                for (float[] chunk : pcmQueue) {
+                    count += chunk.length;
+                    boolean voiced = computeLevel(chunk) >= 0.01;
+                    speech |= voiced;
+                    trailingSilence = voiced ? 0 : trailingSilence + chunk.length;
+                }
+                float[] batch = new float[count];
+                int offset = 0;
+                while (!pcmQueue.isEmpty()) {
+                    float[] chunk = pcmQueue.removeFirst();
+                    System.arraycopy(chunk, 0, batch, offset, chunk.length);
+                    offset += chunk.length;
+                }
+                return new AudioBatch(batch, speech, trailingSilence);
             }
             if (readError != null) {
                 throw readError;

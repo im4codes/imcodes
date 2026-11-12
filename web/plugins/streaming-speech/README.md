@@ -15,18 +15,24 @@ assets are removed only after the replacement verifies; unrelated files remain.
 Binaries remain ignored, never committed. This requires a **new native build**;
 web-only OTA cannot replace installed native graphs or code.
 
-The resident recognizer uses at most two threads. Recognition is segmented
-rather than a streaming transducer: 16kHz mono PCM is decoded every ~0.6 seconds
-of active speech, at six silent chunks, at the 20-second window, and on Stop.
-These are scheduling intervals, **not guaranteed end-to-end latency**. Each
-partial is the cumulative transcript; Stop drains accepted PCM and emits its
-final result before stopped/ACK. Real speed and accuracy depend on the device.
+The resident recognizer uses at most two threads and a 24-token generation
+budget. New-audio cadence is 1.5s, with VAD/capacity/Stop able to flush earlier.
+Each worker turn drains the entire current inbox instead of replaying small
+queued steps. Stop waits for in-flight capture/decode and merges the remaining
+tail into at most one final decode before stopped/ACK. Each result is cumulative.
+iOS retains a bounded 4.5s overlapping window; Android commits at 3s/VAD. A drained
+backlog may extend one decode input by at most the 6.4s inbox bound. No audio
+history grows with recording duration, and overload fails visibly.
 
-The serial worker retains the existing 64-chunk (~6.4s) audio backlog bound.
-Overflow fails visibly rather than silently dropping words or growing memory.
-Background/interruption stops the microphone; it never silently restarts. JNI/C
-streams and result snapshots are freed after each decode. Hotwords are loaded
-from the shared text file as comma-separated native hints, not string replacements.
+On iOS, app-owned Web playback is paused before capture, the audio session uses
+playAndRecord/mixWithOthers/defaultToSpeaker, and exactly the first 100ms of
+converted PCM is discarded once per capture. Background/interruption stops the
+microphone and never silently restarts it. Native streams/results are freed.
+
+These are scheduling/resource contracts, **not measured physical-device speed
+or accuracy guarantees**. The <500ms step / >=60% headroom targets and acoustic
+startup behavior require device measurements. See the complete
+[mobile speech guidelines](../../docs/STREAMING_SPEECH_MOBILE_GUIDELINES.md).
 
 Android copies the packaged assets once into a revision-keyed **no-backup private
 cache**, atomically per file, because ONNX external `.weights` need filesystem
