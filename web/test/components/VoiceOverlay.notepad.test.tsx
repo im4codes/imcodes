@@ -782,9 +782,13 @@ describe('VoiceOverlay mobile microphone gestures', () => {
     render(<VoiceOverlay open initialText="initial" onSend={vi.fn()} onClose={vi.fn()} />);
     const ta = textarea();
     expect(document.activeElement).not.toBe(ta);
+    expect(ta.readOnly).toBe(true);
+    expect(ta.getAttribute('inputmode')).toBe('none');
 
     await vi.advanceTimersByTimeAsync(150);
     expect(document.activeElement).not.toBe(ta);
+    expect(ta.readOnly).toBe(true);
+    expect(ta.getAttribute('inputmode')).toBe('none');
 
     // One status, with activity on the editor rather than a duplicate badge.
     expect(document.querySelector('.voice-overlay-buffering')).toBeNull();
@@ -807,6 +811,8 @@ describe('VoiceOverlay mobile microphone gestures', () => {
     await vi.advanceTimersByTimeAsync(300);
     expect(voiceApi.startListening).not.toHaveBeenCalled();
     expect(textarea().value).toBe('right swipe edit text');
+    expect(textarea().readOnly).toBe(false);
+    expect(textarea().getAttribute('inputmode')).toBeNull();
     expect(document.activeElement).not.toBe(textarea());
   });
 });

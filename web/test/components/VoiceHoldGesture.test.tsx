@@ -176,7 +176,8 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     const input = document.querySelector('.controls-input') as HTMLElement;
     expect(document.activeElement).not.toBe(input);
 
-    dispatchPointer(input, 'pointerdown', 180);
+    // Must not call preventDefault on pointerdown so iOS/Android tap-to-open-IME still fires natively.
+    expect(dispatchPointer(input, 'pointerdown', 180)).toBe(true);
     await vi.advanceTimersByTimeAsync(120);
     dispatchPointer(input, 'pointerup', 180);
 

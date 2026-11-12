@@ -948,6 +948,8 @@ export function VoiceOverlay({
           class="voice-overlay-text"
           placeholder={t('voice.speak_now')}
           spellcheck={false}
+          readOnly={listening || starting}
+          inputMode={listening || starting ? 'none' : undefined}
           onInput={handleInput}
           onSelect={handleCursorChange}
           onClick={handleCursorChange}

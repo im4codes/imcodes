@@ -5225,11 +5225,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
     const el = divRef.current;
     const wasFocused = !!el && document.activeElement === el;
-    if (!wasFocused) {
-      // Prevent browser default focus on press-down so the soft keyboard never
-      // pops up during a 350ms hold; short taps explicitly focus on pointerup.
-      event.preventDefault();
-    }
+    // Never call event.preventDefault() on pointerdown: doing so suppresses
+    // iOS/Android native tap-to-focus and prevents the soft keyboard / IME
+    // from opening when tapping the composer. If the press turns into a 350ms
+    // voice hold, the timer blurs the composer to dismiss the keyboard.
     setVoiceHoldError(null);
     const pointerId = event.pointerId ?? 1;
     const startX = event.clientX ?? 0;
@@ -5393,6 +5392,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
     if (!tx || tx.settled || tx.drainPromise !== null) return;
     event.preventDefault();
+    try { divRef.current?.blur(); } catch { /* ignore */ }
     const finalZone: 'send' | 'cancel' | 'edit' = cancelled ? 'cancel' : tx.zone;
     void finalizeVoiceHold(tx, tx.error !== null ? 'failed' : finalZone);
   }, [finalizeVoiceHold]);
