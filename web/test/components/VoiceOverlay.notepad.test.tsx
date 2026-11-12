@@ -1,7 +1,7 @@
 /**
  * @vitest-environment jsdom
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen } from '@testing-library/preact';
 
 const { voiceApi, awake } = vi.hoisted(() => ({
@@ -569,6 +569,20 @@ describe('VoiceOverlay recovered notepad and the composer text', () => {
 });
 
 describe('VoiceOverlay mobile microphone gestures', () => {
+  const pointerProperties = ['onpointerdown', 'onpointerup', 'onpointercancel', 'onlostpointercapture'];
+  const descriptors = pointerProperties.map(name => Object.getOwnPropertyDescriptor(HTMLElement.prototype, name));
+  beforeAll(() => {
+    // Same browser-capability shim used by TaskPairPanelWidth: older jsdom
+    // lacks handler properties that Preact uses to lowercase pointer events.
+    for (const name of pointerProperties) Object.defineProperty(HTMLElement.prototype, name, { configurable: true, value: null });
+  });
+  afterAll(() => {
+    pointerProperties.forEach((name, index) => {
+      const descriptor = descriptors[index];
+      if (descriptor) Object.defineProperty(HTMLElement.prototype, name, descriptor);
+      else delete (HTMLElement.prototype as unknown as Record<string, unknown>)[name];
+    });
+  });
   function mic() { return document.querySelector('.voice-overlay-mic') as HTMLButtonElement; }
   function pointer(type: string, pointerId = 1) {
     const event = new Event(type, { bubbles: true });

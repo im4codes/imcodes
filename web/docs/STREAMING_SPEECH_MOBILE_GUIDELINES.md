@@ -78,6 +78,9 @@ Android Stop 等待 readerDone 后一次取走剩余输入。前一 session 的�
 长于 30s/60s 的语音只由用户、系统中断、资源失败结束；不能因为 elapsed 时间主动断开。
 Web Speech 平台自身的 `onend` 限制不是应用的可配置超时，普通模式应如实显示暂停，
 现有长笔记模式可按受限重启策略续录，不能承诺浏览器连续连接无限时长。
+Web Mobile Stop 保留 `onresult` 到 `onend` 再清理，新会话等待旧 Stop；
+仅停录阶段有 2s final-drain 兜底，缺失 `onend` 时保留最后文本并清理，不能挂住 UI。
+这是停录故障收尾上界，**不是持续录音时长上限**。
 
 未来若引入 ASR WebSocket：
 

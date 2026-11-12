@@ -133,3 +133,55 @@ describe('mobile capture defenses', () => {
     } finally { await VoiceInput.stopListening(); vi.useRealTimers(); }
   });
 });
+
+
+describe('Web Mobile final drain', () => {
+  function browser() {
+    const instances: any[] = [];
+    class Recognizer {
+      onresult: any; onend: any; onerror: any;
+      start = vi.fn(); stop = vi.fn(); abort = vi.fn();
+      constructor() { instances.push(this); }
+    }
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => false });
+    vi.stubGlobal('SpeechRecognition', Recognizer);
+    return instances;
+  }
+  function final(rec: any, text: string) {
+    const result: any = [{ transcript: text }]; result.isFinal = true;
+    rec.onresult?.({ results: [result] });
+  }
+
+  it('retains final results after stop and serializes a new capture behind onend', async () => {
+    const instances = browser(), first = vi.fn(), next = vi.fn();
+    try {
+      await VoiceInput.startListening(first);
+      const rec = instances[0];
+      const stop = VoiceInput.stopListening();
+      const start = VoiceInput.startListening(next);
+      expect(instances).toHaveLength(1);
+      expect(rec.abort).not.toHaveBeenCalled();
+      final(rec, 'before last word');
+      expect(first).toHaveBeenLastCalledWith('before last word', true);
+      rec.onend(); await stop; await start;
+      expect(instances).toHaveLength(2);
+      expect(next).not.toHaveBeenCalled();
+      const stopped = VoiceInput.stopListening(); instances[1].onend(); await stopped;
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it('bounds a missing stop ACK without timing out a 120s active recording', async () => {
+    vi.useFakeTimers();
+    const instances = browser();
+    try {
+      await VoiceInput.startListening(vi.fn());
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(VoiceInput.isListening()).toBe(true);
+      expect(instances[0].stop).not.toHaveBeenCalled();
+      const stopped = VoiceInput.stopListening();
+      await vi.advanceTimersByTimeAsync(2000); await stopped;
+      expect(instances[0].abort).toHaveBeenCalledOnce();
+      expect(VoiceInput.isListening()).toBe(false);
+    } finally { vi.useRealTimers(); vi.unstubAllGlobals(); }
+  });
+});

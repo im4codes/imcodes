@@ -303,21 +303,40 @@ function startWebListening(): boolean {
   }
 }
 
-function stopWebListening(): void {
-  _generation++;
+/** Stop-only deadline: browser engines may omit onend on device failure.
+ * Never applied to an active recording and never used as a 60s duration cap. */
+const WEB_FINAL_DRAIN_MS = 2000;
+function stopWebListening(): Promise<void> {
   setListening(false);
   stopWebLevelMeter();
   const rec = _webRec;
-  _webRec = null;
-  if (rec) {
-    try {
+  if (!rec) { _generation++; return Promise.resolve(); }
+  return new Promise((resolve) => {
+    let finished = false;
+    const finish = (): void => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
       rec.onend = null;
       rec.onresult = null;
       rec.onerror = null;
-      rec.stop();
-      rec.abort?.();
-    } catch { /* best effort */ }
-  }
+      if (_webRec === rec) _webRec = null;
+      _generation++;
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      console.warn('[voice] web final drain timed out');
+      finish();
+      try { rec.abort?.(); } catch { /* already ended */ }
+    }, WEB_FINAL_DRAIN_MS);
+    // Keep onresult and its generation alive until onend: stop() asks the
+    // browser for the remaining final hypothesis, abort() would discard it.
+    rec.onend = finish;
+    try { rec.stop(); } catch {
+      finish();
+      try { rec.abort?.(); } catch { /* already ended */ }
+    }
+  });
 }
 
 export async function startListening(
@@ -327,6 +346,7 @@ export async function startListening(
   if (!isAvailable()) return false;
 
   if (!isNative()) {
+    if (_pendingStop) await _pendingStop;
     _onResult = onResult;
     _onListeningChange = onListeningChange ?? null;
     if (_listening) {
@@ -366,8 +386,11 @@ export async function stopListening(): Promise<void> {
   if (!isAvailable()) return;
 
   if (!isNative()) {
-    stopWebListening();
-    forgetRecognitionCallbacks();
+    if (_pendingStop) return _pendingStop;
+    const stopping = stopWebListening().then(() => { forgetRecognitionCallbacks(); });
+    _pendingStop = stopping;
+    try { await stopping; }
+    finally { if (_pendingStop === stopping) _pendingStop = null; }
     return;
   }
 
