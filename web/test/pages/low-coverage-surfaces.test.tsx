@@ -389,7 +389,7 @@ describe('low-coverage page and component surfaces', () => {
     await vi.advanceTimersByTimeAsync(150);
     await waitFor(() => expect(voiceApi.startListening).toHaveBeenCalledTimes(1));
     voiceApi.listeningHandler?.(false);
-    await waitFor(() => expect(screen.getByText('voice.paused')).toBeTruthy());
+    await waitFor(() => expect(screen.getByText('voice.ready')).toBeTruthy());
 
     const micButton = document.querySelector('.voice-overlay-mic') as HTMLButtonElement;
     fireEvent.click(micButton);
