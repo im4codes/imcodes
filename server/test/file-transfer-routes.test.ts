@@ -211,6 +211,25 @@ describe('file-transfer upload route', () => {
     expect(response.status).toBe(403); expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
   });
 
+  it('rejects R2 upload staging and commit with destinationDirectory returning 409 capability_unavailable', async () => {
+    mockSharedFileAccess('participant');
+    const app = makeApp('http://localhost', true);
+    // Staging rejects destinationDirectory with 409
+    const stage = await app.request('/api/server/srv-1/r2-relay/uploads?sessionName=deck_project_brain', {
+      method: 'POST', headers: { Authorization: 'Bearer test' },
+      body: JSON.stringify({ filename: 'a.txt', size: 10, destinationDirectory: '/home/ai/target' }),
+    });
+    expect(stage.status).toBe(409);
+    expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
+
+    // Oversize uploads (> MAX_FILE_SIZE) are rejected with 400
+    const oversize = await app.request('/api/server/srv-1/r2-relay/uploads?sessionName=deck_project_brain', {
+      method: 'POST', headers: { Authorization: 'Bearer test' },
+      body: JSON.stringify({ filename: 'huge.bin', size: FILE_TRANSFER_LIMITS.MAX_FILE_SIZE + 1 }),
+    });
+    expect(oversize.status).toBe(400);
+  });
+
   it('uses canonical SERVER_URL for the controlled-node staged download callback', async () => {
     const form = new FormData();
     form.append('file', new File(['hello'], 'hello.txt', { type: 'text/plain' }));

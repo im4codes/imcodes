@@ -22,17 +22,28 @@ export function r2StagingKey(filename: string, now = Date.now()): string {
 }
 /** S3 SigV4 query signing, credentials remain server-only. */
 export function presignR2(config: R2RelayConfig, method: string, key: string,
-  query: Record<string, string> = {}, now = Date.now()): string {
+  query: Record<string, string> = {}, now = Date.now(),
+  headers: Record<string, string> = {}): string {
   if (key && !isR2StagingKey(key)) throw new Error('invalid_staging_key');
   const host = `${config.accountId}.r2.cloudflarestorage.com`;
   const date = new Date(now).toISOString().replace(/[:-]|\.\d{3}/g, '');
   const day = date.slice(0, 8); const scope = `${day}/auto/s3/aws4_request`;
   const pathname = `/${config.bucket}/${key.split('/').map(encode).join('/')}`;
+
+  const allHeaders: Record<string, string> = { host };
+  for (const [k, v] of Object.entries(headers)) {
+    allHeaders[k.toLowerCase()] = v.trim();
+  }
+  const headerKeys = Object.keys(allHeaders).sort();
+  const signedHeaders = headerKeys.join(';');
+  const canonicalHeaders = headerKeys.map((k) => `${k}:${allHeaders[k]}\n`).join('');
+
   const fields: Record<string, string> = { ...query,
     'X-Amz-Algorithm': 'AWS4-HMAC-SHA256', 'X-Amz-Credential': `${config.accessKeyId}/${scope}`,
-    'X-Amz-Date': date, 'X-Amz-Expires': String(R2_RELAY_LIMITS.URL_TTL_SECONDS), 'X-Amz-SignedHeaders': 'host' };
+    'X-Amz-Date': date, 'X-Amz-Expires': String(R2_RELAY_LIMITS.URL_TTL_SECONDS),
+    'X-Amz-SignedHeaders': signedHeaders };
   const qs = Object.keys(fields).sort().map((k) => `${encode(k)}=${encode(fields[k]!)}`).join('&');
-  const canonical = `${method}\n${pathname}\n${qs}\nhost:${host}\n\nhost\nUNSIGNED-PAYLOAD`;
+  const canonical = `${method}\n${pathname}\n${qs}\n${canonicalHeaders}\n${signedHeaders}\nUNSIGNED-PAYLOAD`;
   const signingKey = hmac(hmac(hmac(hmac(`AWS4${config.secretAccessKey}`, day), 'auto'), 's3'), 'aws4_request');
   const signature = hmac(signingKey, `AWS4-HMAC-SHA256\n${date}\n${scope}\n${hash(canonical)}`).toString('hex');
   return `https://${host}${pathname}?${qs}&X-Amz-Signature=${signature}`;

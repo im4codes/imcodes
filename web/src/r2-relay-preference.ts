@@ -11,4 +11,5 @@ export function saveFileRelayMode(userId: string | null, mode: FileRelayMode): v
 
 let currentUserId: string | null = null;
 export function setFileRelayUser(userId: string | null): void { currentUserId = userId; }
+export function getFileRelayUser(): string | null { return currentUserId; }
 export function isFileRelaySelected(): boolean { return readFileRelayMode(currentUserId) === FILE_RELAY_MODE.R2; }

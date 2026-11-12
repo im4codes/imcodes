@@ -33,6 +33,23 @@ describe('R2 signing and lifecycle', () => {
     expect(() => presignR2(config, 'PUT', r2StagingKey('x'.repeat(159) + '😀', now))).not.toThrow();
     expect(r2StagingKey('../../hello.txt', now)).toMatch(/^staging\/2026-11-13\/[a-f0-9]{32}-[^/]+$/);
   });
+  it('binds exact content-length in SignedHeaders and canonical headers, resisting tampering across 0/exact/max', () => {
+    for (const size of [0, 1, 1024, 2 * 1024 * 1024 * 1024]) {
+      const url = new URL(presignR2(config, 'PUT', key, {}, now, { 'content-length': String(size) }));
+      const signedHeaders = url.searchParams.get('X-Amz-SignedHeaders');
+      expect(signedHeaders?.split(';')).toEqual(['content-length', 'host']);
+      const sig = url.searchParams.get('X-Amz-Signature');
+      expect(sig).toMatch(/^[a-f0-9]{64}$/);
+      // Changing the size produces a distinct signature; a client attempting to upload a different length fails signature check
+      const tamperedUrl = new URL(presignR2(config, 'PUT', key, {}, now, { 'content-length': String(size + 1) }));
+      expect(tamperedUrl.searchParams.get('X-Amz-Signature')).not.toBe(sig);
+    }
+    // Unicode keys with content-length sign cleanly
+    const unicodeKey = `staging/2026-11-12/${'c'.repeat(32)}-中文 文件 😀.bin`;
+    const unicodeUrl = new URL(presignR2(config, 'PUT', unicodeKey, {}, now, { 'content-length': '42' }));
+    expect(unicodeUrl.searchParams.get('X-Amz-SignedHeaders')?.split(';')).toEqual(['content-length', 'host']);
+    expect(unicodeUrl.searchParams.get('X-Amz-Signature')).toMatch(/^[a-f0-9]{64}$/);
+  });
   it('sweeps at exactly 12h, survives restart by listing storage and paginates only staging', async () => {
     const fresh = key.replace('hello', 'fresh'); const other = 'durable/keep';
     const block = (k: string, date: number) => `<Contents><Key>${k.replace(/&/g, '&amp;').replace('世界', '&#x4e16;&#30028;')}</Key><LastModified>${new Date(date).toISOString()}</LastModified></Contents>`;

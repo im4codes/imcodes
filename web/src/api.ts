@@ -3540,7 +3540,7 @@ export function isR2RelaySelected(): boolean {
 export async function tryUploadR2File(serverId: string, file: File, onProgress?: (pct: number) => void,
   clientUploadId?: string, signal?: AbortSignal, sessionName?: string, destinationDirectory?: string,
 ): Promise<{ ok: boolean; attachment: AttachmentRefResponse } | null> {
-  if (!isR2RelaySelected()) return null;
+  if (!isR2RelaySelected() || destinationDirectory) return null;
   const root = withSessionName(`/api/server/${encodeURIComponent(serverId)}/${R2_RELAY_API.ROOT}/${R2_RELAY_API.UPLOADS}`, sessionName);
   const response = await rawFetch(root, { method: 'POST', signal, body: JSON.stringify({
     filename: file.name, size: file.size, clientUploadId, destinationDirectory,

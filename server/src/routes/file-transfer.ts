@@ -1900,6 +1900,9 @@ fileTransferRoutes.post(`/:id/${R2_RELAY_API.ROOT}/${R2_RELAY_API.UPLOADS}`, asy
     || (destinationDirectory !== undefined && (typeof destinationDirectory !== 'string' || destinationDirectory.length > 4096))) {
     return c.json({ error: R2_RELAY_ERROR.INVALID }, 400);
   }
+  if (destinationDirectory) {
+    return c.json({ error: 'capability_unavailable' }, 409);
+  }
   for (const [id, ticket] of r2UploadTickets) if (ticket.expiresAt <= Date.now()) r2UploadTickets.delete(id);
   if (r2UploadTickets.size >= 1000) return c.json({ error: R2_RELAY_ERROR.FAILED }, 429);
   const id = randomHex(16); const key = r2StagingKey(filename);
@@ -1907,7 +1910,7 @@ fileTransferRoutes.post(`/:id/${R2_RELAY_API.ROOT}/${R2_RELAY_API.UPLOADS}`, asy
     expiresAt: Date.now() + R2_RELAY_LIMITS.OBJECT_TTL_MS, sessionName: access.sessionName,
     ...(typeof clientUploadId === 'string' ? { clientUploadId } : {}),
     ...(typeof destinationDirectory === 'string' ? { destinationDirectory } : {}) });
-  return c.json({ id, url: presignR2(access.config, 'PUT', key) });
+  return c.json({ id, url: presignR2(access.config, 'PUT', key, {}, Date.now(), { 'content-length': String(size) }) });
 });
 fileTransferRoutes.post(`/:id/${R2_RELAY_API.ROOT}/${R2_RELAY_API.UPLOADS}/:uploadId/commit`, async (c) => {
   const access = await r2RouteAccess(c, 'write'); if ('response' in access) return access.response;
@@ -1915,6 +1918,9 @@ fileTransferRoutes.post(`/:id/${R2_RELAY_API.ROOT}/${R2_RELAY_API.UPLOADS}/:uplo
   if (!ticket || ticket.serverId !== access.serverId || ticket.userId !== access.userId
     || ticket.sessionName !== access.sessionName || ticket.expiresAt <= Date.now()) {
     return c.json({ error: R2_RELAY_ERROR.EXPIRED }, 403);
+  }
+  if (ticket.destinationDirectory) {
+    return c.json({ error: 'capability_unavailable' }, 409);
   }
   try {
     const head = await r2Request(access.config, 'HEAD', ticket.key);

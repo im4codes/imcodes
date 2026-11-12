@@ -2557,8 +2557,8 @@ export async function uploadFileWithDirectFallback(options: {
   destinationDirectory?: string;
 }): Promise<{ ok: boolean; attachment: AttachmentRefResponse }> {
   const { clientUploadId, storageKey } = resumableUploadIdentity(options);
-  const r2 = isFileRelaySelected() ? await tryUploadR2File(options.serverId, options.file, options.onProgress, clientUploadId,
-    options.signal, options.sessionName, options.destinationDirectory) : null;
+  const r2 = isFileRelaySelected() && !options.destinationDirectory ? await tryUploadR2File(options.serverId, options.file, options.onProgress, clientUploadId,
+    options.signal, options.sessionName) : null;
   if (r2) { clearResumableUploadIdentity(storageKey, clientUploadId); return r2; }
   const broker = options.ws ? getBroker(options.ws, options.serverId) : null;
   if (options.ws && supportsUpload(options.ws)
