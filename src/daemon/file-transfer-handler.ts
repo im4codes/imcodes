@@ -1,3 +1,5 @@
+import { sniffAttachmentFileMime } from '../../shared/attachment-mime-file.js';
+import { FILE_RELAY_MODE, R2_RELAY_MSG, R2_RELAY_LIMITS, createR2Progress, type R2RelayDownloadRequest, type R2RelayProgressMessage } from '../../shared/r2-relay.js';
 import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 /**
  * Daemon-side file transfer handler.
@@ -894,7 +896,7 @@ export async function handleFileUploadFetch(cmd: Record<string, unknown>, server
       uploadId,
       filename: storageId,
       originalName,
-      mime,
+      mime: msg.relayMode === FILE_RELAY_MODE.R2 ? await sniffAttachmentFileMime(resolved) : mime,
       resolved,
       size,
       serverLink,
@@ -994,7 +996,7 @@ export async function handleFileDownload(cmd: Record<string, unknown>, serverLin
 }
 
 export async function handleFileDownloadStream(cmd: Record<string, unknown>, serverLink: FileTransferSender): Promise<void> {
-  const msg = cmd as unknown as FileDownloadStreamRequest;
+  const msg = cmd as unknown as FileDownloadStreamRequest | R2RelayDownloadRequest;
   const { downloadId, attachmentId, uploadUrl } = msg;
   let target: DownloadTarget | null = null;
 
@@ -1014,12 +1016,14 @@ export async function handleFileDownloadStream(cmd: Record<string, unknown>, ser
       throw new Error('range_not_satisfiable');
     }
 
+    const r2Relay = cmd.type === R2_RELAY_MSG.DOWNLOAD;
+    if (r2Relay && offset !== 0) throw new Error('invalid_offset');
     // Small files: skip the relay and reply inline in a single round-trip. The
     // relay's PUT + readiness handshake is pure latency for these (and times out
     // entirely if the relay is unhealthy), so only genuinely large files stream.
     // The server returns the inline bytes immediately on receiving this (and
     // slices them itself for a resumed request).
-    if (typeof target.size === 'number' && target.size >= 0
+    if (!r2Relay && typeof target.size === 'number' && target.size >= 0
         && target.size <= FILE_TRANSFER_LIMITS.DOWNLOAD_INLINE_MAX_BYTES) {
       await sendInlineDownload(serverLink, downloadId, target);
       return;
@@ -1033,7 +1037,21 @@ export async function handleFileDownloadStream(cmd: Record<string, unknown>, ser
       size: target.size,
       ...(offset > 0 ? { offset } : {}),
     };
-    serverLink.send(ready);
+    if (!r2Relay) serverLink.send(ready);
+    const progress = createR2Progress(target.size);
+    let loaded = 0; let lastPublished = 0;
+    const emitProgress = () => serverLink.send({ type: R2_RELAY_MSG.PROGRESS, downloadId, ...progress(loaded) } satisfies R2RelayProgressMessage);
+    if (r2Relay) emitProgress();
+    const readPath = target.readPath;
+    const source = r2Relay ? Readable.from((async function* () {
+      for await (const chunk of createReadStream(readPath)) {
+        loaded += (chunk as Buffer).byteLength;
+        if (Date.now() - lastPublished >= R2_RELAY_LIMITS.PROGRESS_INTERVAL_MS) {
+          lastPublished = Date.now(); emitProgress();
+        }
+        yield chunk;
+      }
+    })()) : createReadStream(readPath, offset > 0 ? { start: offset } : undefined);
 
     const headers: Record<string, string> = {
       'content-type': target.mime || 'application/octet-stream',
@@ -1041,16 +1059,24 @@ export async function handleFileDownloadStream(cmd: Record<string, unknown>, ser
       [FILE_TRANSFER_RELAY_HEADER.FILENAME]: encodeURIComponent(target.filename),
       ...(offset > 0 ? { [FILE_TRANSFER_RELAY_HEADER.OFFSET]: String(offset) } : {}),
     };
-    const response = await fetch(uploadUrl, {
-      method: 'PUT',
-      headers,
-      body: createReadStream(target.readPath, offset > 0 ? { start: offset } : undefined) as never,
-      duplex: 'half',
-      signal: AbortSignal.timeout(FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS),
-    } as RequestInit & { duplex: 'half' });
-    if (!response.ok) {
-      throw new Error(`relay_upload_${response.status}`);
-    }
+    try {
+      const response = await fetch(uploadUrl, {
+        method: 'PUT',
+        headers,
+        body: source as never,
+        duplex: 'half',
+        signal: AbortSignal.timeout(r2Relay ? fileTransferUploadTimeoutMs(target.size) : FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS),
+      } as RequestInit & { duplex: 'half' });
+      if (!response.ok) {
+        await response.body?.cancel();
+        throw new Error(`relay_upload_${response.status}`);
+      }
+      await response.body?.cancel();
+      if (r2Relay) {
+        emitProgress();
+        serverLink.send({ ...ready, type: R2_RELAY_MSG.DONE });
+      }
+    } finally { source.destroy(); }
   } catch (err) {
     sendDownloadError(serverLink, downloadId, attachmentId, target?.entry, err);
   }

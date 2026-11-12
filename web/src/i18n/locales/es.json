@@ -5002,5 +5002,13 @@
     "select_file_prompt": "Selecciona un documento a la izquierda para abrirlo en ONLYOFFICE.",
     "new_file_name": "Nombre...",
     "up_dir": "Arriba"
+  },
+  "r2_relay": {
+    "route": "R2",
+    "enable": "Usar retransmisión de archivos R2",
+    "hint": "Opcional: requiere R2 configurado por el administrador. Desactivado por defecto; subidas y descargas usan R2 si está disponible. Los objetos caducan a las 12 horas.",
+    "preparing": "Subiendo a R2 antes de descargar",
+    "estimating": "Estimando espera…",
+    "eta": "Quedan unos {{seconds}} s"
   }
 }

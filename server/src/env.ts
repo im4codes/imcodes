@@ -2,6 +2,12 @@ import type { Database } from './db/client.js';
 
 /** Environment config loaded from process.env (no DB, that's injected at runtime). */
 export interface EnvConfig {
+  /** Explicit deployment opt-in; users must additionally select R2 in the UI. */
+  USE_R2_RELAY?: string;
+  R2_ACCOUNT_ID?: string;
+  R2_BUCKET?: string;
+  R2_ACCESS_KEY_ID?: string;
+  R2_SECRET_ACCESS_KEY?: string;
   // Database connection string
   DATABASE_URL: string;
 
@@ -129,6 +135,11 @@ export function loadEnv(): EnvConfig {
   }
 
   return {
+    USE_R2_RELAY: process.env.USE_R2_RELAY,
+    R2_ACCOUNT_ID: process.env.R2_ACCOUNT_ID,
+    R2_BUCKET: process.env.R2_BUCKET,
+    R2_ACCESS_KEY_ID: process.env.R2_ACCESS_KEY_ID,
+    R2_SECRET_ACCESS_KEY: process.env.R2_SECRET_ACCESS_KEY,
     DATABASE_URL: process.env.DATABASE_URL!,
     JWT_SIGNING_KEY: process.env.JWT_SIGNING_KEY!,
     BOT_ENCRYPTION_KEY: process.env.BOT_ENCRYPTION_KEY ?? '',

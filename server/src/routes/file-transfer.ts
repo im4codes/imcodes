@@ -1,3 +1,6 @@
+import { sniffAttachmentFileMime as sniffStagedUploadMime } from '../../../shared/attachment-mime-file.js';
+import { FILE_RELAY_MODE, R2_RELAY_API, R2_RELAY_MSG, R2_RELAY_CAPABILITY, R2_RELAY_LIMITS, R2_RELAY_PHASE, R2_RELAY_ERROR } from '../../../shared/r2-relay.js';
+import { r2RelayConfig, r2StagingKey, presignR2, r2Request } from '../services/r2-relay.js';
 /**
  * File transfer routes: upload and download via HTTP, relayed to daemon over WS.
  */
@@ -80,7 +83,7 @@ import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { PassThrough, Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { ATTACHMENT_SNIFF_BYTES, attachmentContentDisposition, resolveAttachmentDelivery, sniffAttachmentMime } from '../../../shared/attachment-delivery.js';
+import { attachmentContentDisposition, resolveAttachmentDelivery } from '../../../shared/attachment-delivery.js';
 
 export const fileTransferRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -480,16 +483,6 @@ function setAttachmentDeliveryHeaders(c: Context, claimedMime: string | undefine
   for (const [name, value] of Object.entries(delivery.securityHeaders)) c.header(name, value);
 }
 
-async function sniffStagedUploadMime(filePath: string): Promise<string> {
-  const handle = await open(filePath, 'r');
-  try {
-    const prefix = Buffer.alloc(ATTACHMENT_SNIFF_BYTES);
-    const { bytesRead } = await handle.read(prefix, 0, prefix.length, 0);
-    return sniffAttachmentMime(prefix.subarray(0, bytesRead));
-  } finally {
-    await handle.close();
-  }
-}
 
 /**
  * Send a `file.download_done` (base64 inline) daemon result to the browser as a
@@ -1873,4 +1866,100 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
     logger.error({ serverId, downloadId, err }, 'Download relay failed');
     return c.json({ error: 'download_failed' }, 500);
   }
+});
+
+// R2 is a metadata/control plane only. No file bytes pass through this server.
+type R2UploadTicket = { serverId: string; userId: string; key: string; filename: string; size: number;
+  expiresAt: number; sessionName?: string; clientUploadId?: string; destinationDirectory?: string };
+const r2UploadTickets = new Map<string, R2UploadTicket>();
+fileTransferRoutes.use(`/:id/${R2_RELAY_API.ROOT}/*`, authMiddleware);
+
+async function r2RouteAccess(c: Context, mode: SharedFileAccessMode) {
+  const serverId = c.req.param('id')!;
+  const userId = c.get('userId' as never) as string;
+  const access = await authorizeSessionFileAccess(c, serverId, userId, mode);
+  if (!access.ok) return { response: c.json({ error: 'forbidden' }, 403) } as const;
+  const config = r2RelayConfig(c.env);
+  const target = await c.env.DB.queryOne('SELECT node_role FROM servers WHERE id = $1', [serverId]) as { node_role?: string } | null;
+  const bridge = WsBridge.get(serverId);
+  // Controlled nodes keep their established handle/authority path unchanged.
+  if (!config || !target || target.node_role === 'controlled' || !bridge.hasDaemonCapability(R2_RELAY_CAPABILITY)) {
+    return { response: c.body(null, 204) } as const;
+  }
+  if (!bridge.isDaemonConnected()) return { response: c.json({ error: 'daemon_offline' }, 503) } as const;
+  return { config, bridge, serverId, userId, sessionName: c.req.query('sessionName') || undefined } as const;
+}
+fileTransferRoutes.post(`/:id/${R2_RELAY_API.ROOT}/${R2_RELAY_API.UPLOADS}`, async (c) => {
+  const access = await r2RouteAccess(c, 'write'); if ('response' in access) return access.response;
+  const body = await readBoundedJsonObject(c.req.raw, 8192);
+  if (!body.ok) return c.json({ error: R2_RELAY_ERROR.INVALID }, 400);
+  const { filename, size, clientUploadId, destinationDirectory } = body.value;
+  if (typeof filename !== 'string' || filename.length > 255 || !Number.isSafeInteger(size)
+    || (size as number) < 0 || (size as number) > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE
+    || (clientUploadId !== undefined && !isDirectFileTransferClientUploadId(clientUploadId))
+    || (destinationDirectory !== undefined && (typeof destinationDirectory !== 'string' || destinationDirectory.length > 4096))) {
+    return c.json({ error: R2_RELAY_ERROR.INVALID }, 400);
+  }
+  for (const [id, ticket] of r2UploadTickets) if (ticket.expiresAt <= Date.now()) r2UploadTickets.delete(id);
+  if (r2UploadTickets.size >= 1000) return c.json({ error: R2_RELAY_ERROR.FAILED }, 429);
+  const id = randomHex(16); const key = r2StagingKey(filename);
+  r2UploadTickets.set(id, { serverId: access.serverId, userId: access.userId, key, filename, size: size as number,
+    expiresAt: Date.now() + R2_RELAY_LIMITS.OBJECT_TTL_MS, sessionName: access.sessionName,
+    ...(typeof clientUploadId === 'string' ? { clientUploadId } : {}),
+    ...(typeof destinationDirectory === 'string' ? { destinationDirectory } : {}) });
+  return c.json({ id, url: presignR2(access.config, 'PUT', key) });
+});
+fileTransferRoutes.post(`/:id/${R2_RELAY_API.ROOT}/${R2_RELAY_API.UPLOADS}/:uploadId/commit`, async (c) => {
+  const access = await r2RouteAccess(c, 'write'); if ('response' in access) return access.response;
+  const ticket = r2UploadTickets.get(c.req.param('uploadId'));
+  if (!ticket || ticket.serverId !== access.serverId || ticket.userId !== access.userId
+    || ticket.sessionName !== access.sessionName || ticket.expiresAt <= Date.now()) {
+    return c.json({ error: R2_RELAY_ERROR.EXPIRED }, 403);
+  }
+  try {
+    const head = await r2Request(access.config, 'HEAD', ticket.key);
+    if (Number(head.headers.get('content-length')) !== ticket.size) return c.json({ error: R2_RELAY_ERROR.INVALID }, 400);
+    const uploadId = randomHex(16);
+    const result = await access.bridge.sendFileTransferRequest(uploadId, {
+      type: FILE_TRANSFER_MSG.UPLOAD_FETCH, relayMode: FILE_RELAY_MODE.R2, uploadId, filename: fileTransferLegacyFilename(uploadId, ticket.filename),
+      originalName: ticket.filename, mime: 'application/octet-stream', size: ticket.size,
+      downloadUrl: presignR2(access.config, 'GET', ticket.key),
+      clientUploadId: ticket.clientUploadId ?? c.req.param('uploadId'),
+      ...(ticket.destinationDirectory ? { destinationDirectory: ticket.destinationDirectory } : {}),
+    }, fileTransferUploadTimeoutMs(ticket.size));
+    if (result.type !== FILE_TRANSFER_MSG.UPLOAD_DONE) throw new Error(R2_RELAY_ERROR.FAILED);
+    const attachment = result.attachment as AttachmentRef;
+    attachment.serverId = access.serverId;
+    r2UploadTickets.delete(c.req.param('uploadId'));
+    return c.json({ ok: true, attachment });
+  } catch { return c.json({ error: R2_RELAY_ERROR.FAILED }, 502); }
+});
+fileTransferRoutes.post(`/:id/${R2_RELAY_API.ROOT}/${R2_RELAY_API.DOWNLOADS}/:attachmentId`, async (c) => {
+  const access = await r2RouteAccess(c, 'read'); if ('response' in access) return access.response;
+  const attachmentId = c.req.param('attachmentId');
+  if (!/^[a-f0-9]+(\.[a-zA-Z0-9]+)?$/.test(attachmentId)) return c.json({ error: R2_RELAY_ERROR.INVALID }, 400);
+  const downloadId = randomHex(16); const key = r2StagingKey('download');
+  let canceled = false;
+  const encoder = new TextEncoder();
+  return new Response(new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const write = (payload: unknown) => { if (!canceled) controller.enqueue(encoder.encode(jsonLine(payload))); };
+      try {
+        const result = await access.bridge.sendFileTransferRequest(downloadId, {
+          type: R2_RELAY_MSG.DOWNLOAD, downloadId, attachmentId, uploadUrl: presignR2(access.config, 'PUT', key),
+        }, fileTransferUploadTimeoutMs(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE), (msg) => {
+          if (msg.type === R2_RELAY_MSG.PROGRESS) write(msg);
+        });
+        if (result.type !== R2_RELAY_MSG.DONE) throw new Error(R2_RELAY_ERROR.FAILED);
+        // Include a signed disposition so cross-origin native/browser navigation saves, not renders, the file.
+        const filename = String(result.filename || 'download').replace(/[\r\n"]/g, '_');
+        const url = presignR2(access.config, 'GET', key, {
+          'response-content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`,
+        });
+        write({ phase: R2_RELAY_PHASE.READY, url });
+      } catch { write({ phase: R2_RELAY_PHASE.ERROR, error: R2_RELAY_ERROR.FAILED }); }
+      finally { if (!canceled) controller.close(); }
+    },
+    cancel() { canceled = true; },
+  }), { headers: { 'Content-Type': 'application/x-ndjson', 'Cache-Control': 'no-store' } });
 });

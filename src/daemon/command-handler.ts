@@ -1,3 +1,4 @@
+import { R2_RELAY_MSG } from '../../shared/r2-relay.js';
 import { TASK_PAIR_DECISION_MSG } from '../../shared/task-pair-decision.js';
 import { queuedUserMessageAttribution } from '../agent/transport-queued-user-message.js';
 /**
@@ -2493,6 +2494,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case 'file.download':
       void handleFileDownload(cmd, serverLink);
       break;
+    case R2_RELAY_MSG.DOWNLOAD:
     case FILE_TRANSFER_MSG.DOWNLOAD_STREAM:
       void handleFileDownloadStream(cmd, serverLink);
       break;

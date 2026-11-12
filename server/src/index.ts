@@ -1,3 +1,4 @@
+import { startR2RelayCleanup } from './services/r2-relay.js';
 import { taskPairTitleAuthorityRoutes } from './routes/task-pair-title-authority.js';
 import { TASK_PAIR_TITLE_AUTHORITY_PATH } from '../../shared/task-pair-title-access.js';
 import { MachineGroupInvalidationRuntime } from './services/machine-group-invalidation.js';
@@ -929,6 +930,7 @@ async function ensureDefaultAdmin(db: Database, envConfig: EnvConfig): Promise<v
 async function main() {
   const envConfig = loadEnv();
 
+
   if (!envConfig.JWT_SIGNING_KEY || Buffer.byteLength(envConfig.JWT_SIGNING_KEY, 'utf8') < 32) {
     console.error('FATAL: JWT_SIGNING_KEY must be at least 32 bytes');
     process.exit(1);
@@ -955,6 +957,7 @@ async function main() {
   await runMigrations(db);
   await ensureDefaultAdmin(db, envConfig);
   await initializeAuthNonceCleanup(db);
+  startR2RelayCleanup(envConfig);
 
   const machineGroupInvalidation = new MachineGroupInvalidationRuntime(
     db, (scope) => applyMachineGroupInvalidation(db, scope), failClosedMachineGroupConnections,

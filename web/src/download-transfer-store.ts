@@ -1,3 +1,4 @@
+import { FILE_RELAY_MODE, type R2RelayProgress } from '@shared/r2-relay.js';
 import {
   canRevealSavedDownload,
   revealSavedDownload,
@@ -18,6 +19,7 @@ export const DOWNLOAD_TRANSFER_STATUS = {
 } as const;
 
 export const DOWNLOAD_TRANSFER_ROUTE = {
+  R2: FILE_RELAY_MODE.R2,
   PENDING: 'pending',
   DIRECT: 'direct',
   HTTP: 'http',
@@ -35,6 +37,7 @@ export interface DownloadTransferItem {
   readonly loadedBytes: number;
   readonly totalBytes: number | null;
   readonly speedBps: number;
+  readonly etaSeconds?: number | null;
   readonly startedAt: number;
   readonly updatedAt: number;
 }
@@ -282,7 +285,18 @@ export function updateDownloadTransfer(
   status: DownloadTransferStatus,
   now = Date.now(),
 ): void {
-  updateItem(id, (item) => isTerminal(item.status) ? item : { ...item, route, status, updatedAt: now });
+  updateItem(id, (item) => {
+    if (isTerminal(item.status)) return item;
+    if (item.route === DOWNLOAD_TRANSFER_ROUTE.R2 && route !== DOWNLOAD_TRANSFER_ROUTE.R2) {
+      const runtime = runtimeById.get(id);
+      if (runtime) {
+        clearRuntimeTimer(runtime); runtime.pending = null;
+        runtime.lastSampleAt = now; runtime.lastSampleBytes = 0; runtime.speedBps = 0; runtime.lastPublishedAt = 0;
+      }
+      return { ...item, route, status, loadedBytes: 0, totalBytes: null, speedBps: 0, etaSeconds: null, updatedAt: now };
+    }
+    return { ...item, route, status, updatedAt: now };
+  });
 }
 
 export function reportDownloadTransferProgress(
@@ -452,4 +466,14 @@ export function __resetDownloadTransfersForTests(): void {
   runtimeById.clear();
   snapshot = [];
   listeners.clear();
+}
+
+/** Preparation bytes belong to the daemon → R2 PUT, not the user's download. */
+export function reportR2Preparation(id: string, progress: R2RelayProgress): void {
+  const runtime = runtimeById.get(id);
+  const item = snapshot.find((entry) => entry.id === id);
+  if (!runtime || runtime.controller.signal.aborted || !item || isInactive(item.status)) return;
+  updateItem(id, (current) => ({ ...current, route: DOWNLOAD_TRANSFER_ROUTE.R2,
+    status: DOWNLOAD_TRANSFER_STATUS.PREPARING, loadedBytes: progress.loadedBytes,
+    totalBytes: progress.totalBytes, speedBps: progress.speedBps, etaSeconds: progress.etaSeconds, updatedAt: Date.now() }));
 }

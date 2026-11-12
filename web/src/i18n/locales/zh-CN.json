@@ -5012,5 +5012,13 @@
     "select_file_prompt": "请从左侧列表选择文档以使用 ONLYOFFICE 预览或协同编辑。",
     "new_file_name": "名称...",
     "up_dir": "上一级"
+  },
+  "r2_relay": {
+    "route": "R2",
+    "enable": "启用 R2 文件中继",
+    "hint": "可选：需管理员配置 R2。默认关闭，开启后上传和下载均优先使用 R2；临时对象 12 小时后过期。",
+    "preparing": "正在推送至 R2，随后开始下载",
+    "estimating": "正在估算等待时间…",
+    "eta": "预计还需 {{seconds}} 秒"
   }
 }

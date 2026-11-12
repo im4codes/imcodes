@@ -1,3 +1,4 @@
+import { R2_RELAY_MSG, R2_RELAY_PHASE, R2_RELAY_LIMITS } from '../../shared/r2-relay.js';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import {
@@ -77,13 +78,15 @@ vi.mock('../src/security/crypto.js', () => ({
 
 import { fileTransferRoutes } from '../src/routes/file-transfer.js';
 
-function makeApp(serverUrl = 'http://localhost'): Hono {
+function makeApp(serverUrl = 'http://localhost', r2Enabled = false): Hono {
   const app = new Hono();
   app.use('/*', async (c, next) => {
     (c as never as { env: { DB: unknown; SERVER_URL: string } }).env = {
       // `execute` is the durable machine-action audit (recorded before any controlled-node file operation starts).
       DB: { queryOne: queryOneMock, execute: executeMock },
       SERVER_URL: serverUrl,
+      ...(r2Enabled ? { USE_R2_RELAY: 'true', R2_ACCOUNT_ID: 'a'.repeat(32), R2_BUCKET: 'staging-test',
+        R2_ACCESS_KEY_ID: 'test-access', R2_SECRET_ACCESS_KEY: 'test-secret' } : {}),
     };
     return next();
   });
@@ -130,6 +133,82 @@ describe('file-transfer upload route', () => {
       },
       sourceIdentity: { size: 10, mtimeMs: 1, device: 2, inode: 3 },
     });
+  });
+
+  it('keeps unconfigured/old daemons and controlled nodes on the existing route without any R2 operation', async () => {
+    const fetch = vi.fn(); vi.stubGlobal('fetch', fetch);
+    try {
+      const request = { method: 'POST', headers: { Authorization: 'Bearer test' } };
+      expect((await makeApp().request('/api/server/srv-1/r2-relay/uploads', request)).status).toBe(204);
+      hasDaemonCapabilityMock.mockReturnValue(false);
+      expect((await makeApp('http://localhost', true).request('/api/server/srv-1/r2-relay/uploads', request)).status).toBe(204);
+      hasDaemonCapabilityMock.mockReturnValue(true);
+      queryOneMock.mockResolvedValue({ node_role: 'controlled' });
+      expect((await makeApp('http://localhost', true).request('/api/server/srv-1/r2-relay/uploads', request)).status).toBe(204);
+      expect(fetch).not.toHaveBeenCalled(); expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it('binds an R2 upload to user/server/session and daemon pulls a fresh signed GET after size check', async () => {
+    const app = makeApp('http://localhost', true);
+    const stage = await app.request('/api/server/srv-1/r2-relay/uploads?sessionName=deck_project_brain', {
+      method: 'POST', headers: { Authorization: 'Bearer test' }, body: JSON.stringify({ filename: 'a.txt', size: 5 }),
+    });
+    expect(stage.status).toBe(200);
+    const { id, url } = await stage.json() as { id: string; url: string };
+    expect(new URL(url).hostname).toBe(`${'a'.repeat(32)}.r2.cloudflarestorage.com`);
+    const fetch = vi.fn().mockResolvedValue(new Response(null, { headers: { 'content-length': '5' } }));
+    vi.stubGlobal('fetch', fetch);
+    try {
+      const commit = (server: string, session: string) => app.request(`/api/server/${server}/r2-relay/uploads/${id}/commit?sessionName=${session}`, { method: 'POST', headers: { Authorization: 'Bearer test' } });
+      expect((await commit('srv-2', 'deck_project_brain')).status).toBe(403);
+      expect((await commit('srv-1', 'deck_other_brain')).status).toBe(403);
+      expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
+      const response = await commit('srv-1', 'deck_project_brain');
+      expect(response.status).toBe(200);
+      expect((await response.json()).attachment.serverId).toBe('srv-1');
+      expect(fetch).toHaveBeenCalledTimes(1); expect(fetch.mock.calls[0]![1].method).toBe('HEAD');
+      expect(sendFileTransferRequestMock.mock.calls[0]![1]).toMatchObject({ type: FILE_TRANSFER_MSG.UPLOAD_FETCH, size: 5, originalName: 'a.txt' });
+      const get = new URL(sendFileTransferRequestMock.mock.calls[0]![1].downloadUrl);
+      expect(get.searchParams.get('X-Amz-Expires')).toBe('900');
+      expect(get.pathname).toBe(new URL(url).pathname);
+      expect(get.searchParams.get('X-Amz-Signature')).not.toBe(new URL(url).searchParams.get('X-Amz-Signature'));
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it('rejects R2 upload size mismatches before daemon fetch', async () => {
+    const app = makeApp('http://localhost', true);
+    const staged = await app.request('/api/server/srv-1/r2-relay/uploads', { method: 'POST', headers: { Authorization: 'Bearer test' }, body: JSON.stringify({ filename: 'a.bin', size: 5 }) });
+    const { id } = await staged.json() as { id: string };
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { headers: { 'content-length': '6' } })));
+    try {
+      expect((await app.request(`/api/server/srv-1/r2-relay/uploads/${id}/commit`, { method: 'POST', headers: { Authorization: 'Bearer test' } })).status).toBe(400);
+      expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it('streams R2 preparation progress/ETA then a signed GET without proxying any file body', async () => {
+    sendFileTransferRequestMock.mockImplementation(async (_id, command, _timeout, onProgress) => {
+      expect(command.type).toBe(R2_RELAY_MSG.DOWNLOAD);
+      expect(new URL(command.uploadUrl).searchParams.get('X-Amz-Expires')).toBe(String(R2_RELAY_LIMITS.URL_TTL_SECONDS));
+      onProgress({ type: R2_RELAY_MSG.PROGRESS, phase: R2_RELAY_PHASE.PREPARING, loadedBytes: 5, totalBytes: 10, speedBps: 1, etaSeconds: 5 });
+      return { type: R2_RELAY_MSG.DONE, filename: '世界.txt', size: 10 };
+    });
+    const fetch = vi.fn(); vi.stubGlobal('fetch', fetch);
+    try {
+      const response = await makeApp('http://localhost', true).request(`/api/server/srv-1/r2-relay/downloads/${'b'.repeat(32)}`, { method: 'POST', headers: { Authorization: 'Bearer test' } });
+      const events = (await response.text()).trim().split('\n').map((line) => JSON.parse(line));
+      expect(events[0]).toMatchObject({ phase: R2_RELAY_PHASE.PREPARING, etaSeconds: 5, loadedBytes: 5 });
+      expect(events[1].phase).toBe(R2_RELAY_PHASE.READY);
+      expect(new URL(events[1].url).searchParams.get('response-content-disposition')).toContain(encodeURIComponent('世界.txt'));
+      expect(fetch).not.toHaveBeenCalled();
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it('refuses R2 writes from a shared viewer before signing or contacting daemon', async () => {
+    mockSharedFileAccess('viewer');
+    const response = await makeApp('http://localhost', true).request('/api/server/srv-1/r2-relay/uploads?sessionName=deck_project_brain', { method: 'POST', headers: { Authorization: 'Bearer test' }, body: JSON.stringify({ filename: 'a.txt', size: 5 }) });
+    expect(response.status).toBe(403); expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
   });
 
   it('uses canonical SERVER_URL for the controlled-node staged download callback', async () => {

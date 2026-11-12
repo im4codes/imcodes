@@ -1,3 +1,5 @@
+import { isFileRelaySelected } from './r2-relay-preference.js';
+import { R2_RELAY_ERROR, FILE_RELAY_MODE, type R2RelayProgress } from '@shared/r2-relay.js';
 import {
   directFileTransferAttemptBindingMatches,
   type DirectFileTransferAttemptBinding,
@@ -51,6 +53,9 @@ import {
   FILE_TRANSFER_RESUMABLE_UPLOAD_ERROR,
 } from '@shared/transport/file-transfer.js';
 import {
+  prepareR2AttachmentDownload,
+  handoffR2Download,
+  tryUploadR2File,
   downloadAttachment,
   streamAttachmentDownloadToWritable,
   uploadFile,
@@ -76,6 +81,7 @@ export const FILE_UPLOAD_TRANSPORT_MODE = {
 export type FileUploadTransportMode = typeof FILE_UPLOAD_TRANSPORT_MODE[keyof typeof FILE_UPLOAD_TRANSPORT_MODE];
 
 export const FILE_DOWNLOAD_TRANSPORT_MODE = {
+  R2: FILE_RELAY_MODE.R2,
   CONNECTING: 'connecting',
   DIRECT: 'direct',
   RECOVERING: 'recovering',
@@ -85,7 +91,7 @@ export const FILE_DOWNLOAD_TRANSPORT_MODE = {
 } as const;
 
 export type FileDownloadTransportMode = typeof FILE_DOWNLOAD_TRANSPORT_MODE[keyof typeof FILE_DOWNLOAD_TRANSPORT_MODE];
-export type FileDownloadProgress = { loadedBytes: number; totalBytes: number | null };
+export type FileDownloadProgress = { loadedBytes: number; totalBytes: number | null } & Partial<Pick<R2RelayProgress, 'phase' | 'speedBps' | 'etaSeconds'>>;
 
 /** Redacted browser observability: never include ids, names, paths, SDP, or authority. */
 export const DIRECT_FILE_TRANSFER_CLIENT_METRIC = {
@@ -2551,6 +2557,9 @@ export async function uploadFileWithDirectFallback(options: {
   destinationDirectory?: string;
 }): Promise<{ ok: boolean; attachment: AttachmentRefResponse }> {
   const { clientUploadId, storageKey } = resumableUploadIdentity(options);
+  const r2 = isFileRelaySelected() ? await tryUploadR2File(options.serverId, options.file, options.onProgress, clientUploadId,
+    options.signal, options.sessionName, options.destinationDirectory) : null;
+  if (r2) { clearResumableUploadIdentity(storageKey, clientUploadId); return r2; }
   const broker = options.ws ? getBroker(options.ws, options.serverId) : null;
   if (options.ws && supportsUpload(options.ws)
     && (!options.destinationDirectory || supportsDirectoryUpload(options.ws))) {
@@ -2782,6 +2791,36 @@ export async function downloadPreviewWithDirectFallback(options: {
   onMode?: (mode: FileDownloadTransportMode) => void;
   onSaveReady?: (save: () => Promise<void>) => void;
 }): Promise<void> {
+  const r2Url = isFileRelaySelected() ? await prepareR2AttachmentDownload(options.serverId, options.previewHandle, options.sessionName,
+    options.signal, (progress) => {
+      options.onMode?.(FILE_DOWNLOAD_TRANSPORT_MODE.R2);
+      options.onProgress?.(progress);
+    }) : null;
+  if (r2Url) {
+    if (!options.destination) {
+      options.onMode?.(FILE_DOWNLOAD_TRANSPORT_MODE.BROWSER);
+      await handoffR2Download(r2Url, options.signal); return;
+    }
+    const writable = await options.destination.handle.createWritable();
+    try {
+      options.onMode?.(FILE_DOWNLOAD_TRANSPORT_MODE.HTTP);
+      const response = await fetch(r2Url, { signal: options.signal, credentials: 'omit' });
+      if (!response.ok || !response.body) throw new Error(R2_RELAY_ERROR.FAILED);
+      const totalBytes = response.headers.has('content-length') ? Number(response.headers.get('content-length')) : null;
+      let loadedBytes = 0;
+      const reader = response.body.getReader();
+      try {
+        for (;;) {
+          const { done, value } = await reader.read(); if (done) break;
+          await writable.write(value); loadedBytes += value.byteLength;
+          options.onProgress?.({ loadedBytes, totalBytes });
+        }
+      } finally { await reader.cancel().catch(() => undefined); reader.releaseLock(); }
+      if (totalBytes !== null && loadedBytes !== totalBytes) throw new Error(R2_RELAY_ERROR.FAILED);
+      await writable.close();
+    } catch (error) { await writable.abort(error).catch(() => undefined); throw error; }
+    return;
+  }
   // Mobile WebViews have no File System Access picker. Give the existing P2P
   // protocol an in-memory writable target, then pass the completed bytes to the
   // embedded Capacitor Filesystem/Share bridge (or a fresh Web Share tap). The

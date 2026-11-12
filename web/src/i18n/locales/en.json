@@ -5012,5 +5012,13 @@
     "select_file_prompt": "Select a document from the left to preview or collaborate in ONLYOFFICE.",
     "new_file_name": "Name...",
     "up_dir": "Up"
+  },
+  "r2_relay": {
+    "route": "R2",
+    "enable": "Use R2 file relay",
+    "hint": "Optional: requires R2 configured by the server administrator. Off by default; both uploads and downloads use R2 when available. Temporary objects expire after 12 hours.",
+    "preparing": "Uploading to R2 before download",
+    "estimating": "Estimating wait…",
+    "eta": "About {{seconds}}s remaining"
   }
 }

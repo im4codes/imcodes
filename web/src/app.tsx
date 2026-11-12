@@ -1,3 +1,4 @@
+import { R2RelayToggle } from './components/R2RelayToggle.js';
 import { useState, useEffect, useCallback, useRef, useMemo } from 'preact/hooks';
 import {
   MutableDesktopWindowStack,
@@ -7580,7 +7581,7 @@ function InternalMainApp() {
             {(() => { try { const d = new Date(__BUILD_TIME__); return `Build: ${d.getMonth()+1}/${d.getDate()} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`; } catch { return ''; } })()}
           </div>
           <div style={{ display: 'flex', gap: 6, marginBottom: 6 }}>
-            <LanguageSwitcher />
+            <LanguageSwitcher /><R2RelayToggle />
           </div>
           <button class="btn btn-secondary" style={{ width: '100%', fontSize: 11 }} onClick={handleLogout}>
             Log Out
@@ -7647,7 +7648,7 @@ function InternalMainApp() {
                 </button>
                 {showMobileServerMenu && (
                   <>
-                  <MobileServerMenu footer={<LanguageSwitcher />}>
+                  <MobileServerMenu footer={<><LanguageSwitcher /><R2RelayToggle /></>}>
                     <MobileServerMenuToolbar
                       onHome={() => {
                         setShowMobileServerMenu(false);
@@ -8446,7 +8447,7 @@ function InternalMainApp() {
                 </div>
               )}
               <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                <LanguageSwitcher />
+                <LanguageSwitcher /><R2RelayToggle />
                 <span style={{ fontSize: 10, color: '#475569' }}>
                   {(() => { try { const d = new Date(__BUILD_TIME__); return `${d.getMonth()+1}/${d.getDate()} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`; } catch { return ''; } })()}
                 </span>

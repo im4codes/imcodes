@@ -1,3 +1,4 @@
+import { R2_RELAY_MSG } from '../../../shared/r2-relay.js';
 import { machineGroupInvalidationReady, machineGroupInvalidationRevision } from '../services/machine-group-invalidation.js';
 import {
   CONTROLLED_NODE_ABI_MODERN, CONTROLLED_NODE_ABI_GLIBC217,
@@ -8973,6 +8974,11 @@ export class WsBridge {
     }
 
     // ── File transfer responses: resolve HTTP handler Promises ─────────────────
+    if (type === R2_RELAY_MSG.PROGRESS) {
+      const requestId = msg.downloadId as string | undefined;
+      if (requestId) this.notifyFileTransferProgress(requestId, msg);
+      return;
+    }
     if (type === 'file.upload_progress') {
       const requestId = msg.uploadId as string | undefined;
       if (requestId) this.notifyFileTransferProgress(requestId, msg);
@@ -8988,7 +8994,7 @@ export class WsBridge {
       if (requestId) this.resolveFileTransfer(requestId, msg);
       return;
     }
-    if (type === 'file.download_done' || type === FILE_TRANSFER_MSG.DOWNLOAD_STREAM_READY || type === 'file.download_error') {
+    if (type === R2_RELAY_MSG.DONE || type === 'file.download_done' || type === FILE_TRANSFER_MSG.DOWNLOAD_STREAM_READY || type === 'file.download_error') {
       const requestId = msg.downloadId as string | undefined;
       if (requestId) this.resolveFileTransfer(requestId, msg);
       return;

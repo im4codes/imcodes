@@ -1,3 +1,6 @@
+import { beginDownloadTransfer, reportR2Preparation, completeDownloadTransfer, failDownloadTransfer } from './download-transfer-store.js';
+import { FILE_RELAY_MODE, R2_RELAY_API, R2_RELAY_PHASE, R2_RELAY_ERROR, type R2RelayProgress, type R2RelayReady } from '@shared/r2-relay.js';
+import { readFileRelayMode, setFileRelayUser } from './r2-relay-preference.js';
 /**
  * Fetch wrapper with cookie-based auth for the IM.codes API.
  * Credentials are sent automatically via HttpOnly cookie.
@@ -113,6 +116,7 @@ export function getApiKey(): string | null {
  */
 export function configureExpectedUserId(userId: string | null): void {
   _expectedUserId = typeof userId === 'string' ? (userId.trim() || null) : null;
+  setFileRelayUser(_expectedUserId);
 }
 
 export function getExpectedUserId(): string | null {
@@ -2092,6 +2096,8 @@ export async function uploadFile(
   sessionName?: string,
   destinationDirectory?: string,
 ): Promise<{ ok: boolean; attachment: AttachmentRefResponse }> {
+  const relayResult = await tryUploadR2File(serverId, file, onProgress, clientUploadId, signal, sessionName, destinationDirectory);
+  if (relayResult) return relayResult;
   let highestProgress = 0;
   const emitProgress = (pct: number) => {
     highestProgress = Math.max(highestProgress, Math.min(100, Math.round(pct)));
@@ -2559,6 +2565,29 @@ export async function downloadAttachment(
   signal?: AbortSignal,
 ): Promise<void> {
   if (signal?.aborted) throw new DOMException('download_canceled', 'AbortError');
+  let relayTransfer: string | undefined;
+  let transferSignal: AbortSignal | undefined;
+  const relayAbort = new AbortController();
+  const abortRelay = () => relayAbort.abort();
+  const relaySignal = signal ? AbortSignal.any([signal, relayAbort.signal]) : relayAbort.signal;
+  try {
+    const r2Url = await prepareR2AttachmentDownload(serverId, attachmentId, sessionName, relaySignal, (progress) => {
+      if (!relayTransfer) {
+        const transfer = beginDownloadTransfer(attachmentId);
+        relayTransfer = transfer.id; transferSignal = transfer.signal;
+        transferSignal.addEventListener('abort', abortRelay, { once: true });
+      }
+      reportR2Preparation(relayTransfer, progress);
+    });
+    if (r2Url) {
+      await handoffR2Download(r2Url, relaySignal);
+      if (relayTransfer) completeDownloadTransfer(relayTransfer, true);
+      return;
+    }
+  } catch (error) {
+    if (relayTransfer) failDownloadTransfer(relayTransfer, relaySignal.aborted);
+    throw error;
+  } finally { transferSignal?.removeEventListener('abort', abortRelay); }
   // Native: acquire a one-time token and hand off to the system browser.
   if (isNative()) {
     const downloadUrl = await buildAttachmentDownloadUrl(serverId, attachmentId, sessionName);
@@ -3498,4 +3527,72 @@ export function buildDocAuthRelayUrl(
   if (redirectPath) qs.set('redirect', redirectPath);
   const query = qs.toString() ? `?${qs.toString()}` : '';
   return `/api/doc-shares/auth-relay/${provider}${query}`;
+}
+
+export function isR2RelaySelected(): boolean {
+  return readFileRelayMode(getExpectedUserId()) === FILE_RELAY_MODE.R2;
+}
+export async function tryUploadR2File(serverId: string, file: File, onProgress?: (pct: number) => void,
+  clientUploadId?: string, signal?: AbortSignal, sessionName?: string, destinationDirectory?: string,
+): Promise<{ ok: boolean; attachment: AttachmentRefResponse } | null> {
+  if (!isR2RelaySelected()) return null;
+  const root = withSessionName(`/api/server/${encodeURIComponent(serverId)}/${R2_RELAY_API.ROOT}/${R2_RELAY_API.UPLOADS}`, sessionName);
+  const response = await rawFetch(root, { method: 'POST', signal, body: JSON.stringify({
+    filename: file.name, size: file.size, clientUploadId, destinationDirectory,
+  }) });
+  if (response.status === 204 || response.status === 404) return null;
+  if (!response.ok) throw new ApiError(response.status, await response.text());
+  const stage = await response.json() as { id: string; url: string };
+  await new Promise<void>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const abort = () => { xhr.abort(); reject(new DOMException('upload_canceled', 'AbortError')); };
+    const cleanup = () => signal?.removeEventListener('abort', abort);
+    xhr.open('PUT', stage.url); // no app credentials or authorization headers on the R2 request
+    xhr.upload.onprogress = (event) => { if (event.lengthComputable) onProgress?.(event.loaded * 50 / event.total); };
+    xhr.onload = () => { cleanup(); if (xhr.status >= 200 && xhr.status < 300) resolve(); else reject(new ApiError(xhr.status, R2_RELAY_ERROR.FAILED)); };
+    xhr.onerror = () => { cleanup(); reject(new ApiError(0, R2_RELAY_ERROR.FAILED)); };
+    xhr.onabort = () => { cleanup(); reject(new DOMException('upload_canceled', 'AbortError')); };
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) { abort(); return; }
+    xhr.send(file);
+  });
+  onProgress?.(50);
+  const commit = await rawFetch(withSessionName(`/api/server/${encodeURIComponent(serverId)}/${R2_RELAY_API.ROOT}/${R2_RELAY_API.UPLOADS}/${encodeURIComponent(stage.id)}/commit`, sessionName), { method: 'POST', signal });
+  if (!commit.ok) throw new ApiError(commit.status, await commit.text());
+  const result = await commit.json() as { ok: boolean; attachment: AttachmentRefResponse };
+  onProgress?.(100); return result;
+}
+export async function prepareR2AttachmentDownload(serverId: string, attachmentId: string, sessionName?: string,
+  signal?: AbortSignal, onProgress?: (progress: R2RelayProgress) => void): Promise<string | null> {
+  if (!isR2RelaySelected()) return null;
+  const response = await rawFetch(withSessionName(`/api/server/${encodeURIComponent(serverId)}/${R2_RELAY_API.ROOT}/${R2_RELAY_API.DOWNLOADS}/${encodeURIComponent(attachmentId)}`, sessionName), { method: 'POST', signal });
+  if (response.status === 204 || response.status === 404) return null;
+  if (!response.ok) throw new ApiError(response.status, await response.text());
+  const reader = response.body?.getReader(); if (!reader) throw new Error(R2_RELAY_ERROR.FAILED);
+  const decoder = new TextDecoder(); let pending = ''; let url: string | null = null;
+  const consume = (line: string) => {
+    if (!line.trim()) return;
+    const event = JSON.parse(line) as R2RelayProgress | R2RelayReady | { phase: typeof R2_RELAY_PHASE.ERROR };
+    if (event.phase === R2_RELAY_PHASE.ERROR) throw new Error(R2_RELAY_ERROR.FAILED);
+    if (event.phase === R2_RELAY_PHASE.PREPARING) onProgress?.(event);
+    if (event.phase === R2_RELAY_PHASE.READY && typeof event.url === 'string') url = event.url;
+  };
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      pending += decoder.decode(value, { stream: !done });
+      const lines = pending.split('\n'); pending = lines.pop()!;
+      for (const line of lines) consume(line);
+      if (pending.length > 65536) throw new Error(R2_RELAY_ERROR.INVALID);
+      if (done) { consume(pending); break; }
+    }
+    if (!url) throw new Error(R2_RELAY_ERROR.FAILED);
+    return url;
+  } finally { await reader.cancel().catch(() => undefined); reader.releaseLock(); }
+}
+export async function handoffR2Download(url: string, signal?: AbortSignal): Promise<void> {
+  throwIfDownloadAborted(signal);
+  if (isNative()) { const { Browser } = await import('@capacitor/browser'); await Browser.open({ url }); return; }
+  const anchor = document.createElement('a'); anchor.href = url; anchor.download = ''; anchor.rel = 'noopener';
+  document.body.appendChild(anchor); anchor.click(); anchor.remove();
 }

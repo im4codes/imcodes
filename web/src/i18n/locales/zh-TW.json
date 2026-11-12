@@ -5002,5 +5002,13 @@
     "select_file_prompt": "請從左側清單選擇文件以使用 ONLYOFFICE 預覽或協同編輯。",
     "new_file_name": "名稱...",
     "up_dir": "上一級"
+  },
+  "r2_relay": {
+    "route": "R2",
+    "enable": "啟用 R2 檔案中繼",
+    "hint": "選用：需管理員設定 R2。預設關閉，開啟後上傳與下載均優先使用 R2；暫存物件 12 小時後到期。",
+    "preparing": "正在推送至 R2，隨後開始下載",
+    "estimating": "正在估算等待時間…",
+    "eta": "預計還需 {{seconds}} 秒"
   }
 }

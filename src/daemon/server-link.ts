@@ -1,3 +1,4 @@
+import { R2_RELAY_CAPABILITY } from '../../shared/r2-relay.js';
 import os from 'node:os';
 import fs from 'node:fs';
 import { performance } from 'node:perf_hooks';
@@ -317,6 +318,7 @@ function clearServerLinkSecurity(reason: string): void {
   }
 }
 const DAEMON_STATIC_CAPABILITIES = [
+  R2_RELAY_CAPABILITY,
   SESSION_GROUP_CLONE_CAPABILITY_V1,
   // Distinct from session-group-clone — gates the dedicated execution-clone
   // MCP send/destroy path (managed ephemeral clones). The two features version
