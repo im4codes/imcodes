@@ -94,6 +94,45 @@ describe('AG captured native foreground ownership', () => {
     expect((await owner.output(2))?.content).toBe('exact beta output');
     expect(await owner.output(1)).toBeUndefined();
   });
+  it('preserves literal <USER_REQUEST> tags inside outbound prompts, rejecting foreign quotes and incomplete wrappers while binding genuine wrapped inputs', async () => {
+    const owner = new AgyForegroundOwnership(20);
+    const example = '<USER_REQUEST>example payload</USER_REQUEST>';
+    const promptText = `Fix the parser for the literal ${example}; preserve nested tags and add tests.`;
+    owner.register(1, promptText);
+
+    // 1. Foreign request quoting the same literal <USER_REQUEST> example must NOT bind
+    owner.observe(row(0, 'USER_INPUT', `<USER_REQUEST>Explain the documentation for the literal ${example}; do not change the parser.</USER_REQUEST>`, 'USER_EXPLICIT'));
+    owner.observe(row(1, 'PLANNER_RESPONSE', 'Foreign explanation, not the requested parser fix'));
+    expect(await owner.output(1)).toBeUndefined();
+    expect(owner.latest).toBeUndefined();
+
+    // 2. Incomplete, unbalanced, or malformed outer wrappers must NOT bind
+    for (const [idx, malformed] of [
+      `<USER_REQUEST>${promptText}`,
+      `${promptText}</USER_REQUEST>`,
+      `<USER_REQUEST>outer <USER_REQUEST>inner</USER_REQUEST>`,
+      `<USER_REQUEST>${promptText}</USER_REQUEST> unexpected trailing text`,
+      `unexpected leading text <USER_REQUEST>${promptText}</USER_REQUEST>`,
+    ].entries()) {
+      owner.observe(row(2 + idx * 2, 'USER_INPUT', malformed, 'USER_EXPLICIT'));
+      owner.observe(row(3 + idx * 2, 'PLANNER_RESPONSE', `malformed output ${idx}`));
+    }
+    expect(await owner.output(1)).toBeUndefined();
+    expect(owner.latest).toBeUndefined();
+
+    // 3. Genuine native outer wrapper around prompt containing literal <USER_REQUEST> tags (with CRLF + metadata) DOES bind
+    owner.observe(
+      row(
+        20,
+        'USER_INPUT',
+        `<USER_REQUEST>\r\nFix the parser for the literal ${example};\r\npreserve nested tags and add tests.\r\n</USER_REQUEST>\n<ADDITIONAL_METADATA>meta</ADDITIONAL_METADATA>`,
+        'USER_EXPLICIT',
+      ),
+    );
+    expect(owner.observe(row(21, 'PLANNER_RESPONSE', 'Owned parser fix with nested literal tag'))).toBe(true);
+    expect((await owner.output(1))?.content).toBe('Owned parser fix with nested literal tag');
+    expect(owner.latest?.generation).toBe(1);
+  });
   it('clears active lane on release after timeout so late native output cannot pollute the next turn', async () => {
     const owner = new AgyForegroundOwnership(20);
     owner.register(1, 'turn one payload');
