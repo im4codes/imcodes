@@ -133,6 +133,43 @@ describe('supervision execution pools', () => {
       economyTaskPool: { configs: [] },
     }).primaryDevelopmentPool.configs;
     expect(withPreset).toHaveLength(2);
+
+    // 4. Multiple legacy entries: conflicting legacy roles leave modern Both role intact, order-independent (F1-R2)
+    const modernBoth = makeEntry('codex-sdk', 'transport', undefined);
+    const legacyExec = makeEntry('codex', 'process', 'executor');
+    const legacyAudit = makeEntry('opencode', 'process', 'auditor');
+
+    for (const poolKind of ['primaryDevelopmentPool', 'economyTaskPool'] as const) {
+      for (const order of [
+        [modernBoth, legacyExec, legacyAudit],
+        [modernBoth, legacyAudit, legacyExec],
+        [legacyExec, modernBoth, legacyAudit],
+        [legacyAudit, legacyExec, modernBoth],
+      ]) {
+        const poolOutput = normalizeSupervisionExecutionPools({
+          state: 'configured',
+          primaryDevelopmentPool: { configs: [] },
+          economyTaskPool: { configs: [] },
+          [poolKind]: { configs: order },
+        })[poolKind].configs;
+
+        expect(poolOutput).toHaveLength(1);
+        const modernResult = poolOutput[0]!;
+        expect(modernResult.agentType).toBe('codex-sdk');
+        expect(supervisionExecutionConfigRole(modernResult)).toBe('both');
+      }
+
+      // If multiple legacy entries agree on the same role, inherit that agreed role
+      const legacyExec2 = makeEntry('opencode', 'process', 'executor');
+      const agreedOutput = normalizeSupervisionExecutionPools({
+        state: 'configured',
+        primaryDevelopmentPool: { configs: [] },
+        economyTaskPool: { configs: [] },
+        [poolKind]: { configs: [modernBoth, legacyExec, legacyExec2] },
+      })[poolKind].configs;
+      expect(agreedOutput).toHaveLength(1);
+      expect(agreedOutput[0]?.role).toBe('executor');
+    }
   });
 
   it('resolves the ordered Luna/Sol tier before lower-priority families', () => {

@@ -451,40 +451,50 @@ function normalizePool(value: unknown, kind: SupervisionExecutionPoolKind): Supe
   // Modern transport runtimes supersede legacy process runtimes for the same
   // provider family, model, and preset (e.g. transport:codex-sdk supersedes process:codex,
   // transport:agy-sdk supersedes process:gemini).
-  // An explicit role on the modern transport is strictly preserved (never widened or erased).
-  // When the modern transport lacks an explicit role, it safely inherits from legacy process.
+  // 1. Explicit role on modern transport is strictly preserved (never widened or erased).
+  // 2. When modern transport lacks an explicit role, it safely inherits from legacy process
+  //    if and only if all matching legacy process entries agree on a single unambiguous role.
+  //    Conflicting legacy roles leave the modern transport role as both (undefined), regardless
+  //    of traversal or array arrival order.
   const entries = [...byCapability.values()];
   const processIndicesToDrop = new Set<number>();
-  const transportInheritedLegacyRole = new Map<string, SupervisionExecutionPoolRole | 'conflicted'>();
+  const transportEntries = entries.filter((e) => e.runtimeType === 'transport');
+  const transportLegacyRoles = new Map<SupervisionExecutionConfig, Set<SupervisionExecutionPoolRole>>();
+
   for (let i = 0; i < entries.length; i++) {
     const item = entries[i]!;
     if (item.runtimeType !== 'process') continue;
-    const transportEntry = entries.find((e) => (
-      e.runtimeType === 'transport'
-      && e.providerFamily === item.providerFamily
-      && e.model === item.model
-      && e.ccPresetId === item.ccPresetId
+    const matchingTransport = transportEntries.find((t) => (
+      t.providerFamily === item.providerFamily
+      && t.model === item.model
+      && t.ccPresetId === item.ccPresetId
     ));
-    if (transportEntry) {
+    if (matchingTransport) {
       processIndicesToDrop.add(i);
-      // An explicit role on the modern transport is NEVER erased, widened, or overridden
-      // by a legacy process entry, regardless of entry ordering or conflicting roles.
-      if (transportEntry.role !== undefined) {
-        continue;
-      }
-      // If transport had no explicit role, inherit from legacy process if available and unambiguous.
       if (item.role !== undefined) {
-        const prevInherited = transportInheritedLegacyRole.get(transportEntry.capabilityId);
-        if (prevInherited === undefined) {
-          transportInheritedLegacyRole.set(transportEntry.capabilityId, item.role);
-          transportEntry.role = item.role;
-        } else if (prevInherited !== item.role) {
-          transportInheritedLegacyRole.set(transportEntry.capabilityId, 'conflicted');
-          delete transportEntry.role;
+        let set = transportLegacyRoles.get(matchingTransport);
+        if (!set) {
+          set = new Set();
+          transportLegacyRoles.set(matchingTransport, set);
         }
+        set.add(item.role);
       }
     }
   }
+
+  for (const transport of transportEntries) {
+    if (transport.role !== undefined) {
+      // Modern explicit role is always preserved verbatim
+      continue;
+    }
+    const legacyRoles = transportLegacyRoles.get(transport);
+    if (legacyRoles && legacyRoles.size === 1) {
+      const [onlyRole] = legacyRoles;
+      if (onlyRole) transport.role = onlyRole;
+    }
+    // If legacyRoles.size > 1 (conflicted) or 0 (no legacy role), transport.role remains undefined (both)
+  }
+
   const finalConfigs = entries.filter((_, idx) => !processIndicesToDrop.has(idx));
   return {
     configs: finalConfigs,
