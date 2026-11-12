@@ -1515,7 +1515,15 @@
     "notepad_resume": "再開",
     "notepad_sending": "送信中…",
     "notepad_send_failed": "送信できませんでした。メモはこの端末に保存されたままです。",
-    "notepad_draft_indicator": "この端末に未完了の音声メモがあります"
+    "notepad_draft_indicator": "この端末に未完了の音声メモがあります",
+    "recognizing": "認識中...",
+    "buffering_hint": "音声を認識しています...",
+    "hold_to_talk": "長押しで話す",
+    "release_to_send": "離して送信",
+    "slide_left_cancel": "👈 左スワイプでキャンセル",
+    "slide_right_edit": "👉 右スワイプで編集",
+    "release_to_cancel": "離して録音をキャンセル",
+    "release_to_edit": "離してテキストを編集"
   },
   "p2p": {
     "final_original_request_reminder": "議論の要約だけで終わらせず、議論を統合した後は必ず元のユーザー依頼に直接対応してください。\n元のユーザー依頼: \"{{request}}\"",

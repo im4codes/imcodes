@@ -1255,6 +1255,24 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [hasText, setHasText] = useState(false);
   const [composerFocused, setComposerFocused] = useState(false);
   const [voiceOpen, setVoiceOpen] = useState(false);
+  const [voiceOverlayInitialText, setVoiceOverlayInitialText] = useState<string | null>(null);
+  const [voiceOverlayAutoStart, setVoiceOverlayAutoStart] = useState(true);
+  const [voiceHoldPending, setVoiceHoldPending] = useState(false);
+  const [voiceHoldActive, setVoiceHoldActive] = useState(false);
+  const [voiceHoldZone, setVoiceHoldZone] = useState<'send' | 'cancel' | 'edit'>('send');
+  const [voiceHoldText, setVoiceHoldText] = useState('');
+  const [voiceHoldRecognizing, setVoiceHoldRecognizing] = useState(false);
+  const [voiceHoldBars, setVoiceHoldBars] = useState<number[]>(() => Array(16).fill(0));
+  const voiceHoldTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const voiceHoldRecognizingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const voiceHoldPointerRef = useRef<{ id: number; startX: number; startY: number; wasFocused: boolean } | null>(null);
+  const voiceHoldActiveRef = useRef(false);
+  const voiceHoldZoneRef = useRef<'send' | 'cancel' | 'edit'>('send');
+  const voiceHoldBaseTextRef = useRef('');
+  const voiceHoldTranscriptRef = useRef('');
+  const voiceHoldTokenRef = useRef(0);
+  const voiceHoldBarsRef = useRef<number[]>(Array(16).fill(0));
+  const handledVoicePointerEventsRef = useRef<WeakSet<Event>>(new WeakSet());
   const [menuOpen, setMenuOpen] = useState(false);
   const [atPickerOpen, setAtPickerOpen] = useState(false);
   const [atQuery, setAtQuery] = useState('');
@@ -5077,9 +5095,228 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     return requestSend(buildSendPayload({ textOverride: voiceText }), {
       clearComposer: true,
       retainOnRejection: true,
-      onConfirmedAccepted: () => setVoiceOpen(false),
+      onConfirmedAccepted: () => {
+        setVoiceOpen(false);
+        setVoiceOverlayInitialText(null);
+        setVoiceOverlayAutoStart(true);
+      },
     });
   }, [buildSendPayload, requestSend]);
+
+  const openStandardVoiceOverlay = useCallback(() => {
+    setVoiceOverlayInitialText(null);
+    setVoiceOverlayAutoStart(true);
+    setVoiceOpen(true);
+  }, []);
+
+  const clearVoiceHoldTimers = useCallback(() => {
+    if (voiceHoldTimerRef.current !== null) {
+      clearTimeout(voiceHoldTimerRef.current);
+      voiceHoldTimerRef.current = null;
+    }
+    if (voiceHoldRecognizingTimerRef.current !== null) {
+      clearTimeout(voiceHoldRecognizingTimerRef.current);
+      voiceHoldRecognizingTimerRef.current = null;
+    }
+  }, []);
+
+  const pulseVoiceHoldRecognizing = useCallback((durationMs = 1500) => {
+    if (!voiceHoldActiveRef.current) return;
+    setVoiceHoldRecognizing(true);
+    if (voiceHoldRecognizingTimerRef.current !== null) {
+      clearTimeout(voiceHoldRecognizingTimerRef.current);
+    }
+    voiceHoldRecognizingTimerRef.current = setTimeout(() => {
+      voiceHoldRecognizingTimerRef.current = null;
+      if (voiceHoldActiveRef.current) setVoiceHoldRecognizing(false);
+    }, durationMs);
+  }, []);
+
+  const handleComposerVoicePointerDown = useCallback((event: PointerEvent) => {
+    if (handledVoicePointerEventsRef.current.has(event)) return;
+    handledVoicePointerEventsRef.current.add(event);
+    const mobile = typeof window !== 'undefined' && window.innerWidth <= 640;
+    if (!mobile || inputDisabled || voiceOpen || !VoiceInput.isAvailable()) return;
+    if (event.button !== undefined && event.button !== 0) return;
+    if (voiceHoldPointerRef.current !== null || voiceHoldActiveRef.current) return;
+
+    const el = divRef.current;
+    const wasFocused = !!el && document.activeElement === el;
+    if (!wasFocused) {
+      // Prevent browser default focus on press-down so the soft keyboard never
+      // pops up during a 350ms hold; short taps explicitly focus on pointerup.
+      event.preventDefault();
+    }
+    const pointerId = event.pointerId ?? 1;
+    const startX = event.clientX ?? 0;
+    const startY = event.clientY ?? 0;
+    voiceHoldPointerRef.current = { id: pointerId, startX, startY, wasFocused };
+    setVoiceHoldPending(true);
+    try {
+      (event.currentTarget as HTMLElement | null)?.setPointerCapture?.(pointerId);
+    } catch { /* ignore unsupported pointer capture */ }
+
+    if (voiceHoldTimerRef.current !== null) clearTimeout(voiceHoldTimerRef.current);
+    voiceHoldTimerRef.current = setTimeout(() => {
+      voiceHoldTimerRef.current = null;
+      setVoiceHoldPending(false);
+      // Dismiss any active keyboard or selection before starting voice capture.
+      try { divRef.current?.blur(); } catch { /* ignore */ }
+      try { window.getSelection()?.removeAllRanges(); } catch { /* ignore */ }
+      try { navigator.vibrate?.(20); } catch { /* ignore */ }
+
+      const base = divRef.current ? readComposerElementText(divRef.current) : '';
+      voiceHoldBaseTextRef.current = base;
+      voiceHoldTranscriptRef.current = '';
+      voiceHoldActiveRef.current = true;
+      voiceHoldZoneRef.current = 'send';
+      const emptyBars = Array(16).fill(0);
+      voiceHoldBarsRef.current = emptyBars;
+      setVoiceHoldBars(emptyBars);
+      setVoiceHoldText('');
+      setVoiceHoldZone('send');
+      setVoiceHoldActive(true);
+      setVoiceHoldRecognizing(true);
+
+      const token = ++voiceHoldTokenRef.current;
+      VoiceInput.onAudioLevel((rawLevel) => {
+        if (!voiceHoldActiveRef.current || voiceHoldTokenRef.current !== token) return;
+        const level = Math.max(0, Math.min(1, Number.isFinite(rawLevel) ? rawLevel : 0));
+        if (level > 0.015) pulseVoiceHoldRecognizing(1800);
+        const prev = voiceHoldBarsRef.current;
+        const next = [...prev.slice(1), level];
+        voiceHoldBarsRef.current = next;
+        setVoiceHoldBars(next);
+      });
+
+      void VoiceInput.startListening(
+        (partial) => {
+          if (voiceHoldTokenRef.current !== token) return;
+          voiceHoldTranscriptRef.current = partial;
+          if (voiceHoldActiveRef.current) {
+            setVoiceHoldText(partial);
+            pulseVoiceHoldRecognizing(900);
+          }
+        },
+        undefined,
+        () => {
+          if (voiceHoldTokenRef.current !== token) return;
+          setVoiceHoldRecognizing(false);
+        },
+      );
+    }, 350);
+  }, [inputDisabled, voiceOpen, pulseVoiceHoldRecognizing]);
+
+  const handleComposerVoicePointerMove = useCallback((event: PointerEvent) => {
+    if (handledVoicePointerEventsRef.current.has(event)) return;
+    handledVoicePointerEventsRef.current.add(event);
+    const ptr = voiceHoldPointerRef.current;
+    if (!ptr || (event.pointerId !== undefined && event.pointerId !== ptr.id)) return;
+    const dx = (event.clientX ?? 0) - ptr.startX;
+    const dy = (event.clientY ?? 0) - ptr.startY;
+
+    if (!voiceHoldActiveRef.current) {
+      if (Math.hypot(dx, dy) > 18) {
+        clearVoiceHoldTimers();
+        voiceHoldPointerRef.current = null;
+        setVoiceHoldPending(false);
+      }
+      return;
+    }
+
+    event.preventDefault();
+    let nextZone: 'send' | 'cancel' | 'edit' = 'send';
+    if (dx <= -44) nextZone = 'cancel';
+    else if (dx >= 44) nextZone = 'edit';
+
+    if (nextZone !== voiceHoldZoneRef.current) {
+      voiceHoldZoneRef.current = nextZone;
+      setVoiceHoldZone(nextZone);
+      try { navigator.vibrate?.(12); } catch { /* ignore */ }
+    }
+  }, [clearVoiceHoldTimers]);
+
+  const handleComposerVoicePointerEnd = useCallback((event: PointerEvent, cancelled = false) => {
+    if (handledVoicePointerEventsRef.current.has(event)) return;
+    handledVoicePointerEventsRef.current.add(event);
+    const ptr = voiceHoldPointerRef.current;
+    if (!ptr || (event.pointerId !== undefined && event.pointerId !== ptr.id)) return;
+    voiceHoldPointerRef.current = null;
+    setVoiceHoldPending(false);
+
+    if (voiceHoldTimerRef.current !== null) {
+      clearTimeout(voiceHoldTimerRef.current);
+      voiceHoldTimerRef.current = null;
+      if (!cancelled && !ptr.wasFocused) {
+        divRef.current?.focus();
+      }
+      return;
+    }
+
+    if (!voiceHoldActiveRef.current) return;
+    event.preventDefault();
+    const finalZone: 'send' | 'cancel' | 'edit' = cancelled ? 'cancel' : voiceHoldZoneRef.current;
+    const token = voiceHoldTokenRef.current;
+    voiceHoldActiveRef.current = false;
+    clearVoiceHoldTimers();
+    setVoiceHoldActive(false);
+    setVoiceHoldZone('send');
+    setVoiceHoldRecognizing(false);
+    VoiceInput.onAudioLevel(null);
+
+    void (async () => {
+      await VoiceInput.stopListening();
+      if (voiceHoldTokenRef.current === token) {
+        voiceHoldTokenRef.current++;
+      }
+      const spoken = voiceHoldTranscriptRef.current.trim();
+      const base = voiceHoldBaseTextRef.current;
+      const combined = base
+        ? (spoken ? `${base}${base.endsWith(' ') || base.endsWith('\n') ? '' : ' '}${spoken}` : base)
+        : spoken;
+
+      if (finalZone === 'cancel') {
+        return;
+      }
+      if (finalZone === 'edit') {
+        setVoiceOverlayInitialText(combined);
+        setVoiceOverlayAutoStart(false);
+        setVoiceOpen(true);
+        return;
+      }
+      if (combined.trim()) {
+        handleVoiceSend(combined.trim());
+      }
+    })();
+  }, [clearVoiceHoldTimers, handleVoiceSend]);
+
+  useEffect(() => {
+    const el = divRef.current;
+    if (!el) return;
+    const onDown = (e: Event) => handleComposerVoicePointerDown(e as PointerEvent);
+    const onMove = (e: Event) => handleComposerVoicePointerMove(e as PointerEvent);
+    const onUp = (e: Event) => handleComposerVoicePointerEnd(e as PointerEvent, false);
+    const onCancel = (e: Event) => handleComposerVoicePointerEnd(e as PointerEvent, true);
+    el.addEventListener('pointerdown', onDown);
+    el.addEventListener('pointermove', onMove);
+    el.addEventListener('pointerup', onUp);
+    el.addEventListener('pointercancel', onCancel);
+    return () => {
+      el.removeEventListener('pointerdown', onDown);
+      el.removeEventListener('pointermove', onMove);
+      el.removeEventListener('pointerup', onUp);
+      el.removeEventListener('pointercancel', onCancel);
+    };
+  }, [handleComposerVoicePointerDown, handleComposerVoicePointerMove, handleComposerVoicePointerEnd]);
+
+  useEffect(() => () => {
+    clearVoiceHoldTimers();
+    if (voiceHoldActiveRef.current) {
+      voiceHoldActiveRef.current = false;
+      VoiceInput.onAudioLevel(null);
+      void VoiceInput.stopListening();
+    }
+  }, [clearVoiceHoldTimers]);
 
   const handleKeyDown = (e: KeyboardEvent) => {
     if (imeComposingRef.current || isImeComposingKeyEvent(e)) return;
@@ -7705,7 +7942,65 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           for contenteditable elements, unlike <input> or <textarea>.
         */}
         {mobileComposerExpanded && <div class="controls-composer-backdrop" onClick={() => setMobileComposerExpanded(false)} />}
-        <div class={`controls-composer${embeddedComposerActionCount > 0 ? ' controls-composer-with-trailing' : ''}${mobileComposerExpanded ? ' controls-composer-mobile-expanded' : ''}`}>
+        {voiceHoldActive && (
+          <div
+            class={`voice-hold-hud voice-hold-hud-zone-${voiceHoldZone}`}
+            data-zone={voiceHoldZone}
+            role="status"
+            aria-live="polite"
+          >
+            <div class="voice-hold-hud-card">
+              <div class="voice-hold-hud-header">
+                <span class={`voice-hold-hud-recognizing${voiceHoldRecognizing ? ' is-recognizing' : ''}`}>
+                  <span class="voice-recognizing-dots" aria-hidden="true">
+                    <i /><i /><i />
+                  </span>
+                  <span>{voiceHoldRecognizing ? t('voice.recognizing') : t('voice.listening')}</span>
+                </span>
+                <div class="voice-hold-hud-waveform" aria-hidden="true">
+                  {voiceHoldBars.map((level, idx) => (
+                    <span
+                      key={idx}
+                      class="voice-hold-hud-bar"
+                      style={{ height: `${Math.round(4 + level * 20)}px`, opacity: 0.35 + level * 0.65 }}
+                    />
+                  ))}
+                </div>
+              </div>
+              <div class="voice-hold-hud-transcript">
+                {voiceHoldText.trim() ? voiceHoldText : t('voice.buffering_hint')}
+              </div>
+              <div class={`voice-hold-hud-active-hint is-${voiceHoldZone}`}>
+                {voiceHoldZone === 'cancel'
+                  ? t('voice.release_to_cancel')
+                  : voiceHoldZone === 'edit'
+                    ? t('voice.release_to_edit')
+                    : t('voice.release_to_send')}
+              </div>
+              <div class="voice-hold-hud-zones">
+                <div
+                  class={`voice-hold-zone voice-hold-zone-cancel${voiceHoldZone === 'cancel' ? ' is-active' : ''}`}
+                  data-zone-target="cancel"
+                >
+                  {t('voice.slide_left_cancel')}
+                </div>
+                <div
+                  class={`voice-hold-zone voice-hold-zone-send${voiceHoldZone === 'send' ? ' is-active' : ''}`}
+                  data-zone-target="send"
+                >
+                  {t('voice.release_to_send')}
+                </div>
+                <div
+                  class={`voice-hold-zone voice-hold-zone-edit${voiceHoldZone === 'edit' ? ' is-active' : ''}`}
+                  data-zone-target="edit"
+                >
+                  {t('voice.slide_right_edit')}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+        <div class={`controls-composer${embeddedComposerActionCount > 0 ? ' controls-composer-with-trailing' : ''}${mobileComposerExpanded ? ' controls-composer-mobile-expanded' : ''}${voiceHoldActive ? ' controls-composer-voice-holding' : ''}`}>
           {!isMobileLayout && !compact && (
             <>
               <div
@@ -7744,6 +8039,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             }}
             onFocus={handleFocus}
             onBlur={handleBlur}
+            onPointerDown={handleComposerVoicePointerDown}
+            onPointerMove={handleComposerVoicePointerMove}
+            onPointerUp={(e) => handleComposerVoicePointerEnd(e, false)}
+            onPointerCancel={(e) => handleComposerVoicePointerEnd(e, true)}
+            onLostPointerCapture={(e) => handleComposerVoicePointerEnd(e, true)}
+            onContextMenu={(e) => {
+              if (voiceHoldPending || voiceHoldActiveRef.current) {
+                e.preventDefault();
+              }
+            }}
             onInput={(event) => {
               const currentText = divRef.current ? readComposerElementText(divRef.current) : '';
               setHasText(!!currentText.trim());
@@ -7912,8 +8217,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                   // Open on pointerdown (fires synchronously at touch-start) so the
                   // tap is never lost to the ~300ms click delay or to a re-render
                   // unmounting this conditionally-rendered button mid-gesture.
-                  onPointerDown={(e) => { e.preventDefault(); setVoiceOpen(true); }}
-                  onClick={() => setVoiceOpen(true)}
+                  onPointerDown={(e) => { e.preventDefault(); openStandardVoiceOverlay(); }}
+                  onClick={() => openStandardVoiceOverlay()}
                   disabled={inputDisabled}
                   data-notepad-draft={hasVoiceNotepadDraft ? 'true' : undefined}
                   title={hasVoiceNotepadDraft ? t('voice.notepad_draft_indicator') : t('voice.voice_input')}
@@ -7993,7 +8298,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         {!isMobileLayout && VoiceInput.isAvailable() && (
           <button
             class="btn btn-voice"
-            onClick={() => setVoiceOpen(true)}
+            onClick={() => openStandardVoiceOverlay()}
             disabled={inputDisabled}
             data-notepad-draft={hasVoiceNotepadDraft ? 'true' : undefined}
             title={hasVoiceNotepadDraft ? t('voice.notepad_draft_indicator') : t('voice.voice_input')}
@@ -8287,12 +8592,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     )}
     <VoiceOverlay
       open={voiceOpen}
-      onClose={() => setVoiceOpen(false)}
+      onClose={() => {
+        setVoiceOpen(false);
+        setVoiceOverlayInitialText(null);
+        setVoiceOverlayAutoStart(true);
+      }}
       onSend={handleVoiceSend}
       onSendNotepad={handleVoiceNotepadSend}
       draftScope={voiceNotepadDraftScope}
       sessionLabel={composerTargetName}
-      initialText={divRef.current ? readComposerElementText(divRef.current) : ''}
+      autoStartListening={voiceOverlayAutoStart}
+      initialText={voiceOverlayInitialText !== null ? voiceOverlayInitialText : (divRef.current ? readComposerElementText(divRef.current) : '')}
     />
     {p2pConfigOpen && (
       <P2pConfigPanel

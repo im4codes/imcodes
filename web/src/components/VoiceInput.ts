@@ -8,13 +8,35 @@
  * cumulative transcript of the current session each time (the overlay replaces
  * the prior voice segment with it), plus an isFinal flag.
  */
-import { getNativeSpeechRecognition, type NativeSpeechRecognition } from '../voice-recognition-backend.js';
+import {
+  getNativeSpeechRecognition,
+  getPlatformFallbackSpeechRecognition,
+  type NativeSpeechRecognition,
+} from '../voice-recognition-backend.js';
 import type { PluginListenerHandle } from '@capacitor/core';
 
+/** Resolve the user's active UI language preference first, then fall back to system navigator.language. */
+function resolvePreferredLanguageTag(preferredLang?: string): string {
+  if (typeof preferredLang === 'string' && preferredLang.trim()) {
+    return preferredLang.trim();
+  }
+  try {
+    const saved = globalThis.localStorage?.getItem('imcodes_lang');
+    if (typeof saved === 'string' && saved.trim()) {
+      return saved.trim();
+    }
+  } catch { /* localStorage may be unavailable in restricted contexts */ }
+  const docLang = typeof document !== 'undefined' ? document.documentElement?.lang?.trim() : '';
+  if (docLang) return docLang;
+  return (typeof navigator !== 'undefined' && navigator.language) ? navigator.language : 'en-US';
+}
+
 /** Native (Capacitor) speech-recognition locale tags. */
-export function pickLocale(): string {
-  const lang = navigator.language.toLowerCase();
-  if (lang.startsWith('zh')) return 'zh-Hans';
+export function pickLocale(preferredLang?: string): string {
+  const lang = resolvePreferredLanguageTag(preferredLang).toLowerCase();
+  if (lang.startsWith('zh')) {
+    return lang.includes('tw') || lang.includes('hk') || lang.includes('hant') ? 'zh-Hant' : 'zh-Hans';
+  }
   if (lang.startsWith('ja')) return 'ja-JP';
   if (lang.startsWith('ko')) return 'ko-KR';
   if (lang.startsWith('es')) return 'es-ES';
@@ -23,9 +45,11 @@ export function pickLocale(): string {
 }
 
 /** Web Speech API locale tags (BCP-47, region-specific). */
-export function pickWebLocale(): string {
-  const lang = navigator.language.toLowerCase();
-  if (lang.startsWith('zh')) return lang.includes('tw') || lang.includes('hk') ? 'zh-TW' : 'zh-CN';
+export function pickWebLocale(preferredLang?: string): string {
+  const lang = resolvePreferredLanguageTag(preferredLang).toLowerCase();
+  if (lang.startsWith('zh')) {
+    return lang.includes('tw') || lang.includes('hk') || lang.includes('hant') ? 'zh-TW' : 'zh-CN';
+  }
   if (lang.startsWith('ja')) return 'ja-JP';
   if (lang.startsWith('ko')) return 'ko-KR';
   if (lang.startsWith('es')) return 'es-ES';
@@ -120,10 +144,78 @@ function pauseBackgroundAudio(): void {
   try { globalThis.speechSynthesis?.cancel(); } catch { /* unsupported */ }
 }
 
+async function attachSessionListeners(
+  recognition: NativeSpeechRecognition,
+  session: { recognition: NativeSpeechRecognition; text: string | null; final: boolean },
+  generation: number,
+): Promise<void> {
+  // Partial results listener
+  const h1 = await recognition.addListener('partialResults', (data) => {
+    if (_nativeSession !== session || session.final || !data.matches?.length) return;
+    const text = data.matches[0];
+    const final = (data as { isFinal?: boolean }).isFinal === true;
+    // Native owns committed + unfixed text and emits a cumulative snapshot,
+    // not an append-only delta. Corrections may shorten the unfixed tail.
+    // Keep this listener through stop ACK so its final short tail is retained.
+    if (typeof text !== 'string' || (!final && session.text === text)) return;
+    session.text = text;
+    session.final = final;
+    _onResult?.(text, final);
+  });
+  _removePartial = () => removeHandle(h1);
+
+  // Audio level listener (emitted from native at ~15-20fps; ignore after stop advances generation)
+  const h2 = await recognition.addListener('audioLevel' as any, (data: any) => {
+    if (_nativeSession !== session || generation !== _generation) return;
+    _onLevel?.(data.level ?? 0);
+  });
+  _removeLevel = () => removeHandle(h2);
+
+  const h3 = await recognition.addListener('listeningState', (data) => {
+    if (_nativeSession !== session || generation !== _generation) return;
+    if (data.status === 'started') {
+      setListening(true);
+      return;
+    }
+    // Serialize cleanup with the next start; a late stopped event from this
+    // recognizer cannot tear down a new language session.
+    void stopListening();
+  });
+  _removeListeningState = () => removeHandle(h3);
+
+  const h4 = await recognition.addListener('recognitionError' as any, (data: any) => {
+    if (_nativeSession !== session) return;
+    const message = typeof data?.message === 'string' && data.message.trim()
+      ? data.message.trim()
+      : 'Speech recognition error';
+    console.warn('[voice] recognitionError:', message);
+    reportError(message);
+    void stopListening();
+  });
+  _removeRecognitionError = () => removeHandle(h4);
+}
+
+async function resolveUsableFallbackRecognizer(
+  primary: NativeSpeechRecognition,
+): Promise<NativeSpeechRecognition | null> {
+  const fallback = getPlatformFallbackSpeechRecognition();
+  if (!fallback || fallback === primary || typeof fallback.available !== 'function') return null;
+  try {
+    const perms = typeof fallback.requestPermissions === 'function'
+      ? await fallback.requestPermissions()
+      : { speechRecognition: 'granted' };
+    if (perms?.speechRecognition !== 'granted') return null;
+    const avail = await fallback.available();
+    return avail?.available ? fallback : null;
+  } catch {
+    return null;
+  }
+}
+
 async function startListeningInternal(generation: number): Promise<boolean> {
   const locale = pickLocale();
   const session = { recognition: getNativeSpeechRecognition(), text: null as string | null, final: false };
-  const recognition = session.recognition;
+  let recognition = session.recognition;
   _lastError = null;
   await removeRecognitionListeners();
   if (generation !== _generation) return false;
@@ -138,58 +230,28 @@ async function startListeningInternal(generation: number): Promise<boolean> {
     }
     if (generation !== _generation) return false;
 
-    const available = await recognition.available();
-    if (!available.available) {
-      console.warn('[voice] speech recognition unavailable');
-      if (generation === _generation) reportError('Offline speech model unavailable');
-      return false;
+    let available = { available: false };
+    try {
+      available = await recognition.available();
+    } catch {
+      available = { available: false };
+    }
+    if (!available?.available) {
+      const fallback = await resolveUsableFallbackRecognizer(recognition);
+      if (generation !== _generation) return false;
+      if (fallback) {
+        console.warn('[voice] custom offline speech unavailable, falling back to platform recognizer');
+        recognition = fallback;
+        session.recognition = fallback;
+      } else {
+        console.warn('[voice] speech recognition unavailable');
+        if (generation === _generation) reportError('Offline speech model unavailable');
+        return false;
+      }
     }
     if (generation !== _generation) return false;
 
-    // Partial results listener
-    const h1 = await recognition.addListener('partialResults', (data) => {
-      if (_nativeSession !== session || session.final || !data.matches?.length) return;
-      const text = data.matches[0];
-      const final = (data as { isFinal?: boolean }).isFinal === true;
-      // Native owns committed + unfixed text and emits a cumulative snapshot,
-      // not an append-only delta. Corrections may shorten the unfixed tail.
-      // Keep this listener through stop ACK so its final short tail is retained.
-      if (typeof text !== 'string' || (!final && session.text === text)) return;
-      session.text = text;
-      session.final = final;
-      _onResult?.(text, final);
-    });
-    _removePartial = () => removeHandle(h1);
-
-    // Audio level listener (emitted from native at ~15-20fps; ignore after stop advances generation)
-    const h2 = await recognition.addListener('audioLevel' as any, (data: any) => {
-      if (_nativeSession !== session || generation !== _generation) return;
-      _onLevel?.(data.level ?? 0);
-    });
-    _removeLevel = () => removeHandle(h2);
-
-    const h3 = await recognition.addListener('listeningState', (data) => {
-      if (_nativeSession !== session || generation !== _generation) return;
-      if (data.status === 'started') {
-        setListening(true);
-        return;
-      }
-      // Serialize cleanup with the next start; a late stopped event from this
-      // recognizer cannot tear down a new language session.
-      void stopListening();
-    });
-    _removeListeningState = () => removeHandle(h3);
-
-    const h4 = await recognition.addListener('recognitionError' as any, (data: any) => {
-      if (_nativeSession !== session) return;
-      const message = typeof data?.message === 'string' && data.message.trim()
-        ? data.message.trim()
-        : 'Speech recognition error';
-      console.warn('[voice] recognitionError:', message);
-      reportError(message);
-      void stopListening();
-    });
-    _removeRecognitionError = () => removeHandle(h4);
+    await attachSessionListeners(recognition, session, generation);
 
     if (generation !== _generation) {
       await removeRecognitionListeners();
@@ -197,12 +259,36 @@ async function startListeningInternal(generation: number): Promise<boolean> {
       return false;
     }
     pauseBackgroundAudio();
-    await recognition.start({
-      language: locale,
-      partialResults: true,
-      popup: false,
-      addPunctuation: true,
-    });
+    try {
+      await recognition.start({
+        language: locale,
+        partialResults: true,
+        popup: false,
+        addPunctuation: true,
+      });
+    } catch (startErr) {
+      const startMsg = startErr instanceof Error ? startErr.message : String(startErr ?? '');
+      if (!/permission|denied|not allowed/i.test(startMsg)) {
+        const fallback = await resolveUsableFallbackRecognizer(recognition);
+        if (fallback && generation === _generation) {
+          console.warn('[voice] custom offline speech start failed, falling back to platform recognizer:', startMsg);
+          await removeRecognitionListeners();
+          recognition = fallback;
+          session.recognition = fallback;
+          await attachSessionListeners(recognition, session, generation);
+          await recognition.start({
+            language: locale,
+            partialResults: true,
+            popup: false,
+            addPunctuation: true,
+          });
+        } else {
+          throw startErr;
+        }
+      } else {
+        throw startErr;
+      }
+    }
 
     if (generation !== _generation) {
       try {

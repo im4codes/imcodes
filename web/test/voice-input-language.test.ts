@@ -55,6 +55,81 @@ describe('multilingual plugin session ownership', () => {
     const stopping = input.stopListening(); release({ speechRecognition: 'granted' });
     expect(await starting).toBe(false); await stopping; expect(bridges.streaming.start).not.toHaveBeenCalled();
   });
+
+  it('follows the user-selected app language in pickLocale and pickWebLocale before falling back to navigator.language', async () => {
+    vi.stubGlobal('navigator', { language: 'en-US' });
+    localStorage.setItem('imcodes_lang', 'ja');
+    expect(input.pickLocale()).toBe('ja-JP');
+    expect(input.pickWebLocale()).toBe('ja-JP');
+
+    localStorage.setItem('imcodes_lang', 'zh-TW');
+    expect(input.pickLocale()).toBe('zh-Hant');
+    expect(input.pickWebLocale()).toBe('zh-TW');
+
+    localStorage.setItem('imcodes_lang', 'zh-CN');
+    expect(input.pickLocale()).toBe('zh-Hans');
+    expect(input.pickWebLocale()).toBe('zh-CN');
+
+    localStorage.setItem('imcodes_lang', 'ko');
+    expect(input.pickLocale()).toBe('ko-KR');
+    expect(input.pickWebLocale()).toBe('ko-KR');
+
+    localStorage.setItem('imcodes_lang', 'es');
+    expect(input.pickLocale()).toBe('es-ES');
+
+    localStorage.setItem('imcodes_lang', 'ru');
+    expect(input.pickLocale()).toBe('ru-RU');
+
+    localStorage.setItem('imcodes_lang', 'ja');
+    expect(await input.startListening(vi.fn())).toBe(true);
+    expect(bridges.streaming.start).toHaveBeenCalledWith(expect.objectContaining({ language: 'ja-JP' }));
+  });
+
+  it('strictly prioritizes custom offline StreamingSpeech and falls back to platform SpeechRecognition only when StreamingSpeech is unavailable or fails to start', async () => {
+    localStorage.setItem('imcodes_lang', 'ja');
+    // 1. When StreamingSpeech is available, platform recognizer is never touched
+    expect(await input.startListening(vi.fn())).toBe(true);
+    expect(bridges.streaming.start).toHaveBeenCalledTimes(1);
+    expect(bridges.platform.start).not.toHaveBeenCalled();
+    await input.stopListening();
+
+    // 2. When StreamingSpeech.available() returns false, falls back to platform recognizer
+    bridges.streaming.available.mockResolvedValueOnce({ available: false });
+    bridges.platform.available.mockResolvedValueOnce({ available: true });
+    const onResult = vi.fn();
+    expect(await input.startListening(onResult)).toBe(true);
+    expect(bridges.platform.start).toHaveBeenCalledTimes(1);
+    expect(bridges.platform.start).toHaveBeenCalledWith(expect.objectContaining({ language: 'ja-JP' }));
+    bridges.platform.listeners.partialResults?.({ matches: ['日本語 test'], isFinal: true });
+    expect(onResult).toHaveBeenCalledWith('日本語 test', true);
+    await input.stopListening();
+
+    // 3. When StreamingSpeech.start() rejects with model/init error, falls back to platform recognizer
+    bridges.streaming.start.mockRejectedValueOnce(new Error('Offline speech model missing'));
+    bridges.platform.available.mockResolvedValueOnce({ available: true });
+    expect(await input.startListening(vi.fn())).toBe(true);
+    expect(bridges.platform.start).toHaveBeenCalledTimes(2);
+    await input.stopListening();
+  });
+
+  it('keeps all 7 locale files synchronized for all voice keys including recognizing, buffering, and hold-to-talk HUD prompts', () => {
+    const locales = ['en', 'zh-CN', 'zh-TW', 'ja', 'ko', 'es', 'ru'];
+    const requiredKeys = [
+      'listening', 'paused', 'speak_now', 'voice_input', 'stop_voice', 'send',
+      'mic_permission_failed', 'error', 'retry', 'recognizing', 'buffering_hint',
+      'hold_to_talk', 'release_to_send', 'slide_left_cancel', 'slide_right_edit',
+      'release_to_cancel', 'release_to_edit',
+    ];
+    const baseKeys = Object.keys(JSON.parse(read('../src/i18n/locales/en.json')).voice).sort();
+    for (const locale of locales) {
+      const data = JSON.parse(read(`../src/i18n/locales/${locale}.json`));
+      expect(Object.keys(data.voice).sort()).toEqual(baseKeys);
+      for (const key of requiredKeys) {
+        expect(typeof data.voice[key]).toBe('string');
+        expect(data.voice[key].trim().length).toBeGreaterThan(0);
+      }
+    }
+  });
 });
 
 function read(relative: string): string { return readFileSync(new URL(relative, import.meta.url), 'utf8'); }

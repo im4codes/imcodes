@@ -733,4 +733,42 @@ describe('VoiceOverlay mobile microphone gestures', () => {
     voiceApi.partialHandler?.('second segment');
     expect(textarea().value).toBe('first segment tail second segment');
   });
+
+  it('never auto-focuses the textarea on open or partial streaming so the soft keyboard never occludes the Send button', async () => {
+    let audioLevelCb: ((level: number) => void) | null = null;
+    voiceApi.onAudioLevel.mockImplementation((cb: ((level: number) => void) | null) => {
+      audioLevelCb = cb;
+    });
+    render(<VoiceOverlay open initialText="initial" onSend={vi.fn()} onClose={vi.fn()} />);
+    const ta = textarea();
+    expect(document.activeElement).not.toBe(ta);
+
+    await vi.advanceTimersByTimeAsync(150);
+    expect(document.activeElement).not.toBe(ta);
+
+    // Buffering indicator is visible while listening and highlights immediately when audio arrives
+    const buffering = document.querySelector('.voice-overlay-buffering');
+    expect(buffering).not.toBeNull();
+    expect(buffering?.getAttribute('data-recognizing')).toBe('false');
+
+    audioLevelCb?.(0.25);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.querySelector('.voice-overlay-buffering')?.getAttribute('data-recognizing')).toBe('true');
+    expect(document.querySelector('.voice-recognizing-pill')?.textContent).toContain('voice.recognizing');
+
+    // Streaming partial results must not focus the textarea unless the user manually focused it
+    voiceApi.partialHandler?.('spoken words');
+    await vi.advanceTimersByTimeAsync(20);
+    expect(ta.value).toBe('initial spoken words');
+    expect(document.activeElement).not.toBe(ta);
+
+    // When opened in edit-only mode (autoStartListening=false), does not start mic or focus textarea
+    cleanup();
+    voiceApi.startListening.mockClear();
+    render(<VoiceOverlay open autoStartListening={false} initialText="right swipe edit text" onSend={vi.fn()} onClose={vi.fn()} />);
+    await vi.advanceTimersByTimeAsync(300);
+    expect(voiceApi.startListening).not.toHaveBeenCalled();
+    expect(textarea().value).toBe('right swipe edit text');
+    expect(document.activeElement).not.toBe(textarea());
+  });
 });

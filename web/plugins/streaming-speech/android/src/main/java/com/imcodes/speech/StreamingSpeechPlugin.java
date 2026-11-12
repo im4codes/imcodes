@@ -37,7 +37,7 @@ import java.util.concurrent.atomic.AtomicLong;
 })
 public class StreamingSpeechPlugin extends Plugin {
     private static final int SAMPLE_RATE = 16000;
-    private static final int MAX_BUFFERED_CHUNKS = 64; // ~6.4s at 100ms/chunk (matches iOS slots = 64)
+    private static final int MAX_BUFFERED_CHUNKS = 320; // ~32s at 100ms/chunk (matches iOS 32s limit)
     private static final int MAX_UTTERANCE_SAMPLES = 3 * SAMPLE_RATE;
     private static final int PARTIAL_INTERVAL_SAMPLES = 24000; // 1.5s of new audio, not a latency guarantee
     private static final String[] MODEL_FILES = { "conv_frontend.onnx", "encoder.int4.onnx", "encoder.int4.weights", "decoder.int4.onnx", "decoder.int4.weights", "tokenizer/vocab.json", "tokenizer/merges.txt", "tokenizer/tokenizer_config.json", "hotwords.txt" };
@@ -82,7 +82,7 @@ public class StreamingSpeechPlugin extends Plugin {
         }
         OfflineRecognizerConfig config = new OfflineRecognizerConfig();
         var model = config.getModelConfig();
-        model.setNumThreads(2);
+        model.setNumThreads(4);
         model.setProvider("cpu");
         var qwen = model.getQwen3Asr();
         qwen.setConvFrontend(new File(root, "conv_frontend.onnx").getPath());

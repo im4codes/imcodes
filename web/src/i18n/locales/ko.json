@@ -1515,7 +1515,15 @@
     "notepad_resume": "이어서 녹음",
     "notepad_sending": "보내는 중…",
     "notepad_send_failed": "보내지 못했습니다. 메모는 이 기기에 그대로 저장되어 있습니다.",
-    "notepad_draft_indicator": "이 기기에 완료되지 않은 음성 메모가 있습니다"
+    "notepad_draft_indicator": "이 기기에 완료되지 않은 음성 메모가 있습니다",
+    "recognizing": "인식 중...",
+    "buffering_hint": "음성을 인식하는 중...",
+    "hold_to_talk": "길게 눌러 말하기",
+    "release_to_send": "놓아서 전송",
+    "slide_left_cancel": "👈 왼쪽으로 밀어 취소",
+    "slide_right_edit": "👉 오른쪽으로 밀어 편집",
+    "release_to_cancel": "놓아서 녹음 취소",
+    "release_to_edit": "놓아서 텍스트 편집"
   },
   "p2p": {
     "final_original_request_reminder": "토론 요약으로 끝내지 말고, 논의를 종합한 뒤에는 반드시 원래 사용자 요청을 직접 완전히 처리하세요.\n원래 사용자 요청: \"{{request}}\"",

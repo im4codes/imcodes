@@ -1515,7 +1515,15 @@
     "notepad_resume": "繼續",
     "notepad_sending": "傳送中…",
     "notepad_send_failed": "傳送失敗。記事本仍保存在本裝置上。",
-    "notepad_draft_indicator": "本裝置上有未完成的語音記事本"
+    "notepad_draft_indicator": "本裝置上有未完成的語音記事本",
+    "recognizing": "辨識中...",
+    "buffering_hint": "正在辨識語音...",
+    "hold_to_talk": "按住說話",
+    "release_to_send": "放開 傳送",
+    "slide_left_cancel": "👈 左滑 取消",
+    "slide_right_edit": "👉 右滑 編輯",
+    "release_to_cancel": "放開取消錄音",
+    "release_to_edit": "放開進入編輯"
   },
   "p2p": {
     "final_original_request_reminder": "在完成討論綜合後，務必直接落實並完整回應使用者的原始請求，不要只停留在討論總結。\n使用者的原始請求是：「{{request}}」",

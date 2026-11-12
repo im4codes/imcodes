@@ -1515,7 +1515,15 @@
     "notepad_resume": "继续",
     "notepad_sending": "发送中…",
     "notepad_send_failed": "发送失败。记事本仍保存在本设备上。",
-    "notepad_draft_indicator": "本设备上有未完成的语音记事本"
+    "notepad_draft_indicator": "本设备上有未完成的语音记事本",
+    "recognizing": "识别中...",
+    "buffering_hint": "正在识别语音...",
+    "hold_to_talk": "按住说话",
+    "release_to_send": "松开 发送",
+    "slide_left_cancel": "👈 左滑 取消",
+    "slide_right_edit": "👉 右滑 编辑",
+    "release_to_cancel": "松手取消录音",
+    "release_to_edit": "松手进入编辑"
   },
   "p2p": {
     "final_original_request_reminder": "在完成讨论综合后，务必直接落实并完整回应用户的原始请求，不要只停留在讨论总结。\n用户的原始请求是：\"{{request}}\"",

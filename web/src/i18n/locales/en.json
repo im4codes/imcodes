@@ -1515,7 +1515,15 @@
     "notepad_resume": "Resume",
     "notepad_sending": "Sending…",
     "notepad_send_failed": "Couldn't send. The notepad is still saved on this device.",
-    "notepad_draft_indicator": "Unfinished voice notepad saved on this device"
+    "notepad_draft_indicator": "Unfinished voice notepad saved on this device",
+    "recognizing": "Recognizing...",
+    "buffering_hint": "Recognizing speech...",
+    "hold_to_talk": "Hold to talk",
+    "release_to_send": "Release to send",
+    "slide_left_cancel": "👈 Slide left to cancel",
+    "slide_right_edit": "👉 Slide right to edit",
+    "release_to_cancel": "Release to cancel recording",
+    "release_to_edit": "Release to edit text"
   },
   "p2p": {
     "final_original_request_reminder": "After synthesizing the discussion, directly address and fulfill the user's original request instead of stopping at a discussion summary.\nThe original user request is: \"{{request}}\"",

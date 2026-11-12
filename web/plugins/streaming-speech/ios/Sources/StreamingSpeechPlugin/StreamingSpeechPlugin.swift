@@ -323,7 +323,7 @@ private final class SpeechRecognizer {
         qwen.decoder = UnsafePointer(strings[2]!)
         qwen.tokenizer = UnsafePointer(strings[3]!)
         qwen.hotwords = UnsafePointer(strings[4]!)
-        let model = sherpaOnnxOfflineModelConfig(tokens: "", numThreads: 2, qwen3Asr: qwen)
+        let model = sherpaOnnxOfflineModelConfig(tokens: "", numThreads: 4, qwen3Asr: qwen)
         var config = sherpaOnnxOfflineRecognizerConfig(featConfig: sherpaOnnxFeatureConfig(), modelConfig: model)
         guard let pointer = SherpaOnnxCreateOfflineRecognizer(&config) else { return nil }
         self.pointer = pointer
@@ -382,12 +382,33 @@ struct SpeechWindow {
     mutating func append(_ input: [Float], speech: Bool, trailingSilence: Int = 0, final: Bool = false,
                          decode: ([Float]) -> String?, emit: (String) -> Void) throws {
         guard !input.isEmpty, !samples.isEmpty || speech else { return }
-        // The inbox is bounded independently; a delayed consumer takes ALL of
-        // its current audio in one step. Never split a backlog into stride jobs.
-        samples.append(contentsOf: input)
-        newSamples += input.count
-        silentSamples = speech ? trailingSilence : silentSamples + input.count
-        guard !final else { return } // Stop merges everything into finish().
+        if final {
+            // Stop merges the remaining tail into finish().
+            samples.append(contentsOf: input)
+            newSamples += input.count
+            silentSamples = speech ? trailingSilence : silentSamples + input.count
+            return
+        }
+        // Chunk oversized live batches at the bounded window capacity (4.5s) so
+        // continuous speech never accumulates an unbounded window or triggers O(T^2) lag.
+        var remaining = input[...]
+        while samples.count + remaining.count > Self.capacity {
+            let takeCount = max(1, Self.capacity - samples.count)
+            let chunk = remaining.prefix(takeCount)
+            remaining = remaining.dropFirst(takeCount)
+            samples.append(contentsOf: chunk)
+            newSamples += chunk.count
+            silentSamples = speech ? (remaining.isEmpty ? trailingSilence : 0) : silentSamples + chunk.count
+            try evaluate(decode)
+            let pause = Self.endsSentence(partial) ? Self.punctuationPause : Self.vadPause
+            if silentSamples >= pause { commitSentence() }
+            else { rollWindow() }
+            if text != lastEmitted { lastEmitted = text; emit(text) }
+        }
+        guard !remaining.isEmpty else { return }
+        samples.append(contentsOf: remaining)
+        newSamples += remaining.count
+        silentSamples = speech ? trailingSilence : silentSamples + remaining.count
         let pause = Self.endsSentence(partial) ? Self.punctuationPause : Self.vadPause
         let endpoint = silentSamples >= pause
         if endpoint || newSamples >= Self.stride || samples.count >= Self.capacity {
@@ -502,7 +523,7 @@ struct SpeechWindow {
 
     private static func endsSentence(_ text: String) -> Bool {
         guard let last = text.last else { return false }
-        return "。！？.!?".contains(last)
+        return "，、；,;.。！？!?".contains(last)
     }
 
     private static func overlapCount(_ previous: String, _ next: String) -> Int {
@@ -528,15 +549,16 @@ struct SpeechWindow {
 
 
 /// Caller holds the capture lock. PCM ownership swaps at take(), in O(1);
-/// only copying admitted audio is O(n), bounded at 6.4s / 409,600 PCM bytes.
+/// only copying admitted audio is O(n), bounded at 32s / 2,048,000 PCM bytes.
 struct SpeechInbox {
-    static let limit = 16000 * 64 / 10
+    static let limit = 16000 * 320 / 10
+    static let warmupSamples = 320 // 20ms at 16kHz drops route startup pop without clipping the first syllable
     static let audioLevelInterval: TimeInterval = 0.05 // ~20fps (50ms) main-thread audioLevel throttle
     private(set) var pending: [Float] = []
     private var scheduled = false
     private var speech = false
     private var trailingSilence = 0
-    private(set) var warmupRemaining = 1600 // exactly 100ms at 16kHz, once per capture
+    private(set) var warmupRemaining = SpeechInbox.warmupSamples
     private var pendingAudioLevel: Float?
     private var lastAudioLevelAt: TimeInterval = -.infinity
     enum Failure: Error { case overload }

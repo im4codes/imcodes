@@ -1515,7 +1515,15 @@
     "notepad_resume": "Reanudar",
     "notepad_sending": "Enviando…",
     "notepad_send_failed": "No se pudo enviar. Las notas siguen guardadas en este dispositivo.",
-    "notepad_draft_indicator": "Notas de voz sin terminar guardadas en este dispositivo"
+    "notepad_draft_indicator": "Notas de voz sin terminar guardadas en este dispositivo",
+    "recognizing": "Reconociendo...",
+    "buffering_hint": "Reconociendo voz...",
+    "hold_to_talk": "Mantén pulsado para hablar",
+    "release_to_send": "Suelta para enviar",
+    "slide_left_cancel": "👈 Desliza a la izq. para cancelar",
+    "slide_right_edit": "👉 Desliza a la der. para editar",
+    "release_to_cancel": "Suelta para cancelar la grabación",
+    "release_to_edit": "Suelta para editar el texto"
   },
   "p2p": {
     "final_original_request_reminder": "No te quedes solo en el resumen de la discusión. Después de sintetizarla, asegúrate de responder y ejecutar directamente la solicitud original del usuario.\nLa solicitud original del usuario es: \"{{request}}\"",

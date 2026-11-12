@@ -20,6 +20,8 @@ interface Props {
   onClose: () => void;
   onSend: (text: string) => 'accepted' | 'pending' | 'rejected';
   initialText?: string;
+  /** When false, opens the overlay with initialText for editing without auto-starting microphone capture. */
+  autoStartListening?: boolean;
   /**
    * The session the overlay was opened from. Keys the notepad's local draft,
    * so an unfinished notepad is only ever offered back in that session.
@@ -66,16 +68,19 @@ export function VoiceOverlay({
   onClose,
   onSend,
   initialText,
+  autoStartListening = true,
   draftScope,
   sessionLabel,
   onSendNotepad,
 }: Props) {
   const { t } = useTranslation();
   const [listening, setListening] = useState(false);
+  const [recognizing, setRecognizing] = useState(false);
   const [hasText, setHasText] = useState(false);
   const [bars, setBars] = useState<number[]>(() => Array(BAR_COUNT).fill(0));
   const [maxH, setMaxH] = useState('66vh');
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const recognizingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const holdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const heldRef = useRef(false);
   const suppressMicClickRef = useRef(false);
@@ -193,17 +198,38 @@ export function VoiceOverlay({
     draftSegmentsRef.current.push({ atMs: Math.max(0, Date.now() - draftStartedAtRef.current), text });
   }, []);
 
+  const clearRecognizingTimer = useCallback(() => {
+    if (!recognizingTimerRef.current) return;
+    clearTimeout(recognizingTimerRef.current);
+    recognizingTimerRef.current = null;
+  }, []);
+
+  const pulseRecognizing = useCallback((durationMs = 1600) => {
+    if (!openRef.current || !listeningRef.current) return;
+    setRecognizing(true);
+    clearRecognizingTimer();
+    recognizingTimerRef.current = setTimeout(() => {
+      recognizingTimerRef.current = null;
+      if (openRef.current) setRecognizing(false);
+    }, durationMs);
+  }, [clearRecognizingTimer]);
+
   const setListeningState = useCallback((next: boolean) => {
     // stopListening() reports `false` synchronously while the effect is being
     // cleaned up. Never enqueue hook state once the overlay is closed or
     // unmounting; the next open initializes both values below.
     if (!openRef.current) {
       listeningRef.current = false;
+      clearRecognizingTimer();
       return;
     }
     listeningRef.current = next;
     setListening(next);
-  }, []);
+    if (!next) {
+      clearRecognizingTimer();
+      setRecognizing(false);
+    }
+  }, [clearRecognizingTimer]);
 
   const clearRestartTimer = useCallback(() => {
     if (!restartTimerRef.current) return;
@@ -222,10 +248,14 @@ export function VoiceOverlay({
     openRef.current = true;
     const init = initialText ?? '';
     initialTextRef.current = init;
-    if (taRef.current) { taRef.current.value = init; taRef.current.focus(); }
+    // Never auto-focus the textarea on open: popping up the mobile soft keyboard
+    // occludes the Send button. The keyboard only opens when the user manually taps the textarea.
+    if (taRef.current) { taRef.current.value = init; }
     setHasText(!!init.trim());
     setMaxH('66vh');
     setListening(false);
+    setRecognizing(false);
+    clearRecognizingTimer();
     listeningRef.current = false;
     notepadRef.current = false;
     setNotepad(false);
@@ -256,6 +286,9 @@ export function VoiceOverlay({
 
     VoiceInput.onAudioLevel((rawLevel) => {
       const level = Math.max(0, Math.min(1, Number.isFinite(rawLevel) ? rawLevel : 0));
+      if (level > 0.015 && listeningRef.current) {
+        pulseRecognizing(1800);
+      }
       const prev = barsRef.current;
       const isEmpty = prev.every((v) => v < 0.01);
       if (isEmpty && level > 0.01) {
@@ -281,7 +314,7 @@ export function VoiceOverlay({
     // notepad waits for the user's choice instead: dictation starting on its
     // own would talk over the offer to resume it.
     clearAutoStartTimer();
-    if (!recoverable) {
+    if (!recoverable && autoStartListening) {
       autoStartTimerRef.current = setTimeout(() => {
         autoStartTimerRef.current = null;
         void startSession(init.length);
@@ -290,6 +323,7 @@ export function VoiceOverlay({
     return () => {
       clearAutoStartTimer();
       clearRestartTimer();
+      clearRecognizingTimer();
       if (holdTimerRef.current) clearTimeout(holdTimerRef.current);
       holdTimerRef.current = null;
       heldRef.current = false;
@@ -334,7 +368,7 @@ export function VoiceOverlay({
       const committedLen = voiceLenRef.current;
       insertPosRef.current += committedLen;
       voiceLenRef.current = 0;
-      if (committedLen > 0 && taRef.current) {
+      if (committedLen > 0 && taRef.current && document.activeElement === taRef.current) {
         const endPos = insertPosRef.current;
         taRef.current.setSelectionRange(endPos, endPos);
       }
@@ -383,14 +417,17 @@ export function VoiceOverlay({
         const actualPos = pos + sep.length;
         if (sep.length > 0) insertPosRef.current = actualPos;
         voiceLenRef.current = newVoiceLen;
-        // Move cursor to end of voice segment
+        // Move cursor to end of voice segment only if the user already focused the textarea;
+        // never focus programmatically, as that pops up the mobile soft keyboard over the Send button.
         const cursorPos = actualPos + newVoiceLen;
         requestAnimationFrame(() => {
-          ta.focus();
-          ta.setSelectionRange(cursorPos, cursorPos);
+          if (document.activeElement === ta) {
+            ta.setSelectionRange(cursorPos, cursorPos);
+          }
         });
         ta.scrollTop = ta.scrollHeight;
         setHasText(!!ta.value.trim());
+        pulseRecognizing(900);
       }, (next) => {
         if (sessionTokenRef.current !== token) return;
         if (!openRef.current && next) return;
@@ -771,8 +808,16 @@ export function VoiceOverlay({
 
       <div class="voice-overlay-header">
         <div class="voice-overlay-status">
-          <div class={`voice-status-dot${listening ? ' voice-status-dot-active' : ''}`} />
+          <div class={`voice-status-dot${listening ? ' voice-status-dot-active' : ''}${recognizing ? ' voice-status-dot-recognizing' : ''}`} />
           <span>{listening ? t('voice.listening') : t('voice.paused')}</span>
+          {listening && recognizing && (
+            <span class="voice-recognizing-pill" role="status" aria-live="polite">
+              <span class="voice-recognizing-dots" aria-hidden="true">
+                <i /><i /><i />
+              </span>
+              <span>{t('voice.recognizing')}</span>
+            </span>
+          )}
           {notepad && notepadStartedAt !== null && (
             <span class="voice-notepad-elapsed">{formatElapsed(now - notepadStartedAt)}</span>
           )}
@@ -885,18 +930,33 @@ export function VoiceOverlay({
         </div>
       )}
 
-      <textarea
-        ref={taRef}
-        style={review ? { display: 'none' } : undefined}
-        class="voice-overlay-text"
-        placeholder={t('voice.speak_now')}
-        spellcheck={false}
-        onInput={handleInput}
-        onSelect={handleCursorChange}
-        onClick={handleCursorChange}
-        onTouchEnd={handleCursorChange}
-        onKeyUp={handleCursorChange}
-      />
+      <div class="voice-overlay-editor-wrap" style={review ? { display: 'none' } : undefined}>
+        <textarea
+          ref={taRef}
+          class="voice-overlay-text"
+          placeholder={t('voice.speak_now')}
+          spellcheck={false}
+          onInput={handleInput}
+          onSelect={handleCursorChange}
+          onClick={handleCursorChange}
+          onTouchEnd={handleCursorChange}
+          onKeyUp={handleCursorChange}
+        />
+        {listening && (
+          <div
+            class={`voice-overlay-buffering${recognizing ? ' is-recognizing' : ''}`}
+            data-recognizing={recognizing ? 'true' : 'false'}
+            aria-live="polite"
+          >
+            <span class="voice-recognizing-dots" aria-hidden="true">
+              <i /><i /><i />
+            </span>
+            <span class="voice-overlay-buffering-text">
+              {recognizing ? t('voice.buffering_hint') : t('voice.recognizing')}
+            </span>
+          </div>
+        )}
+      </div>
 
       <div class="voice-overlay-controls" style={review ? { display: 'none' } : undefined}>
         <div class="voice-waveform-bg">

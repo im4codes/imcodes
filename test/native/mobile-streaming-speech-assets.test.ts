@@ -74,7 +74,9 @@ describe('Qwen3-ASR mobile assets', () => {
     expect(android).toContain('qwen.setMaxTotalLen(768)'); expect(android).toContain('new OfflineRecognizer(null, config)');
     expect(android).toContain('getNoBackupFilesDir()'); expect(android).toContain('finally { stream.release(); }');
     expect(ios).toContain('static let capacity = 3 * stride'); expect(ios).toContain('maxNewTokens: 24'); expect(android).toContain('qwen.setMaxNewTokens(24)');
-    expect(ios).toContain('static let limit = 16000 * 64 / 10'); expect(android).toContain('MAX_BUFFERED_CHUNKS = 64');
+    expect(ios).toContain('static let limit = 16000 * 320 / 10'); expect(android).toContain('MAX_BUFFERED_CHUNKS = 320');
+    expect(ios).toContain('numThreads: 4'); expect(android).toContain('model.setNumThreads(4)');
+    expect(ios).toContain('static let warmupSamples = 320');
     expect(ios).not.toContain('OfflinePunctuation'); expect(android).not.toContain('OfflinePunctuation');
     expect(ios).not.toContain('OnlineStream'); expect(android).not.toContain('OnlineStream');
     expect(ios).toContain('options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth]');
@@ -160,7 +162,7 @@ public class Plugin {
       'com/k2fsa/sherpa/onnx/OfflineRecognizerConfig.java': `package com.k2fsa.sherpa.onnx;
 public class OfflineRecognizerConfig {
   private final Model model=new Model(); public Model getModelConfig(){return model;}
-  public static class Model { public void setNumThreads(int n){if(n!=2)throw new AssertionError();} public void setProvider(String p){} public Qwen getQwen3Asr(){return new Qwen();} }
+  public static class Model { public void setNumThreads(int n){if(n!=4)throw new AssertionError();} public void setProvider(String p){} public Qwen getQwen3Asr(){return new Qwen();} }
   public static class Qwen { public void setConvFrontend(String p){} public void setEncoder(String p){} public void setDecoder(String p){} public void setTokenizer(String p){} public void setMaxTotalLen(int n){if(n!=768)throw new AssertionError();} public void setMaxNewTokens(int n){} public void setTemperature(float n){} public void setTopP(float n){} public void setSeed(int n){} public void setHotwords(String s){if(!s.equals("COMMIT,GITHUB,ENGLISH"))throw new AssertionError(s);} }
 }`,
       'com/k2fsa/sherpa/onnx/OfflineStream.java': `package com.k2fsa.sherpa.onnx;
@@ -211,7 +213,7 @@ public class Harness {
    check(OfflineStream.maxSamples>=48000 && OfflineStream.maxSamples<=150400,OfflineStream.maxSamples);check(finals(p)==1,p.events);check(p.events.stream().anyMatch(x->x.contains("你好 Hello.你好 Hello.")),p.events);check(OfflineStream.created==OfflineStream.released,p.events);System.out.println("WINDOW_AND_RELEASE_OK");
   } finally {p.destroy();}
   for(int i=0;i<100&&OfflineRecognizer.releases==0;i++)Thread.sleep(5);check(OfflineRecognizer.releases==1,OfflineRecognizer.releases);
-  OfflineRecognizer.entered=new CountDownLatch(1);OfflineRecognizer.release=new CountDownLatch(1);AudioRecord.chunksPerStart=70;
+  OfflineRecognizer.entered=new CountDownLatch(1);OfflineRecognizer.release=new CountDownLatch(1);AudioRecord.chunksPerStart=330;
   Subject overflow=new Subject();try{overflow.load();await(OfflineRecognizer.entered);overflow.start(new PluginCall());for(int i=0;i<800&&AudioRecord.latest.getRecordingState()==AudioRecord.RECORDSTATE_RECORDING;i++)Thread.sleep(5);check(AudioRecord.latest.getRecordingState()!=AudioRecord.RECORDSTATE_RECORDING,"overflow did not stop intake");OfflineRecognizer.release.countDown();PluginCall end=new PluginCall();overflow.stop(end);await(end.done);check(overflow.events.stream().anyMatch(x->x.contains("processing overloaded")),overflow.events);System.out.println("OVERFLOW_OK");}finally{overflow.destroy();}
   for(int i=0;i<100&&OfflineRecognizer.releases<2;i++)Thread.sleep(5);
   OfflineRecognizer.holdDecode=true;OfflineRecognizer.decoding=new CountDownLatch(1);OfflineRecognizer.decodeRelease=new CountDownLatch(1);AudioRecord.chunksPerStart=15;
@@ -244,7 +246,7 @@ it.skipIf(!swiftCompiler)('executes the actual Swift bounded window through roll
   await writeFile(file, 'import Foundation\n' + state + '\n' + swiftWindowCases);
   execFileSync(swiftCompiler!, ['-swift-version', '5', file, '-o', executable], { encoding: 'utf8', timeout: 60000 });
   const result = execFileSync(executable, [], { encoding: 'utf8', timeout: 30000 });
-  for (const name of ['TAIL', 'ROLLBACK', 'VAD', 'PUNCTUATION', 'REPEATED_SENTENCE', 'LONG_CONTINUOUS', 'VARIABLE_TAP', 'FAILURE', 'UNICODE', 'EMPTY', 'IN_FLIGHT_STOP', 'LONG_TRANSCRIPT', 'SHORT_CJK', 'SHORT_ASCII', 'REPEATED_OVERLAP', 'STABLE_HYPOTHESIS', 'NO_PROGRESS_THEN_GROWTH', 'ZERO_LAG', 'WARMUP', 'AUDIO_LEVEL_THROTTLE', 'OVERLOAD', 'TAIL_BATCH']) {
+  for (const name of ['TAIL', 'ROLLBACK', 'VAD', 'PUNCTUATION', 'REPEATED_SENTENCE', 'LONG_CONTINUOUS', 'VARIABLE_TAP', 'BACKLOG_CHUNKING', 'FAILURE', 'UNICODE', 'EMPTY', 'IN_FLIGHT_STOP', 'LONG_TRANSCRIPT', 'SHORT_CJK', 'SHORT_ASCII', 'REPEATED_OVERLAP', 'STABLE_HYPOTHESIS', 'NO_PROGRESS_THEN_GROWTH', 'ZERO_LAG', 'WARMUP', 'AUDIO_LEVEL_THROTTLE', 'OVERLOAD', 'TAIL_BATCH']) {
     expect(result).toContain(name + ':PASS');
   }
 }, 95000);
@@ -483,9 +485,14 @@ func run() throws {
     check(calls == [64137], "large tap overshot boundary or lost tail")
     print("VARIABLE_TAP:PASS")
 
+    window = SpeechWindow(); calls = []
+    try window.append(pcm(120000), speech: true, decode: longDecode) { _ in }
+    check(calls == [72000, 72000] && window.samples.count == 24000, "live backlog exceeded capacity without rolling")
+    print("BACKLOG_CHUNKING:PASS")
+
     var inbox = SpeechInbox()
-    check(!(try inbox.offer(pcm(800))), "warmup scheduled decode")
-    check(!(try inbox.offer(pcm(800))), "warmup not exactly 100ms")
+    check(!(try inbox.offer(pcm(160))), "warmup scheduled decode")
+    check(!(try inbox.offer(pcm(160))), "warmup not exactly 20ms")
     check(try inbox.offer([1, 2, 3]), "first PCM did not schedule")
     check(!(try inbox.offer([4, 5])), "duplicate drain scheduled")
     check(inbox.take()?.samples == [1, 2, 3, 4, 5] && inbox.pending.isEmpty, "drain left backlog")
@@ -496,10 +503,10 @@ func run() throws {
     print("WARMUP:PASS")
 
     var levelInbox = SpeechInbox()
-    // Warmup taps (first 1600 samples) must never emit audioLevel
-    _ = try levelInbox.offer(pcm(800))
+    // Warmup taps (first 320 samples = 20ms) must never emit audioLevel
+    _ = try levelInbox.offer(pcm(160))
     check(levelInbox.pollAudioLevel(now: 0.0) == nil, "audioLevel emitted during first warmup half")
-    _ = try levelInbox.offer(pcm(800))
+    _ = try levelInbox.offer(pcm(160))
     check(levelInbox.pollAudioLevel(now: 0.01) == nil, "audioLevel emitted on exact warmup completion without post-warmup samples")
     // First post-warmup tap at t=0.05 emits RMS * 3 (0.1 * 3 = 0.3), independent of inbox.take() / worker drain
     _ = try levelInbox.offer(pcm(320))
@@ -522,7 +529,7 @@ func run() throws {
     print("AUDIO_LEVEL_THROTTLE:PASS")
 
     inbox = SpeechInbox()
-    _ = try inbox.offer(pcm(1600))
+    _ = try inbox.offer(pcm(SpeechInbox.warmupSamples))
     _ = try inbox.offer(pcm(SpeechInbox.limit))
     do { _ = try inbox.offer([1]); fatalError("overflow unbounded") }
     catch SpeechInbox.Failure.overload { check(inbox.pending.count == SpeechInbox.limit, "overflow lost admitted PCM") }
