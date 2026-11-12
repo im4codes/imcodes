@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
+import { mkdtempSync, renameSync, rmSync, statSync, truncateSync, writeFileSync, appendFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { AgyForegroundOwnership, NATIVE_OUTPUT_DEADLINE_MS } from '../../src/agent/agy-foreground-ownership.js';
-import type { AgyTranscriptRow } from '../../src/agent/agy-transcript-bridge.js';
+import { AgyTranscriptBridge, type AgyTranscriptRow } from '../../src/agent/agy-transcript-bridge.js';
 const row = (step: number, type: string, content: string, source = 'MODEL'): AgyTranscriptRow => ({step_index:step,type,content,source,status:'DONE'});
 describe('AG captured native foreground ownership', () => {
   it('uses an extended default attribution deadline (45s-60s) for multi-step native turns', () => {
@@ -532,5 +535,146 @@ describe('AG captured native foreground ownership', () => {
     }, 360);
     expect(owner.settle(owner.resolveAggregateGeneration(2))?.content).toBe('Second question');
     owner.releaseTurn();
+  });
+  it('audit: post-continuation ask_question survives native transcript rotation (rename to new inode, F2-R2)', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'agy-f2r2-rename-'));
+    const file = path.join(dir, 'transcript_full.jsonl');
+    const owner = new AgyForegroundOwnership(60_000);
+    const bridge = new AgyTranscriptBridge(file, (r, cursor) => owner.observe(r, cursor));
+    try {
+      const preRows = [
+        JSON.stringify(row(0, 'USER_INPUT', '<USER_REQUEST>initial prompt</USER_REQUEST>', 'USER_EXPLICIT')),
+        JSON.stringify({ ...row(1, 'PLANNER_RESPONSE', 'Need confirmation'), tool_calls: [{ name: 'ask_question', args: { question: 'Proceed?' } }] }),
+        JSON.stringify(row(2, 'GENERIC', 'X'.repeat(10_240))),
+      ].join('\n') + '\n';
+      writeFileSync(file, preRows);
+
+      owner.beginTurn();
+      owner.register(1, 'initial prompt');
+      await bridge.start(true);
+      await bridge.flush();
+
+      const oldIno = statSync(file).ino;
+      const watermark = bridge.currentCursor();
+      expect(watermark?.byteOffset).toBeGreaterThan(10_000);
+
+      owner.register(2, 'Proceed', true, watermark);
+      // Pre-continuation ask_question must not satisfy settlement.
+      expect(owner.settle(1)).toBeUndefined();
+
+      // Rotate transcript by rename + recreate (new inode, much smaller byteOffset < watermark.byteOffset).
+      renameSync(file, path.join(dir, 'transcript_full.1.jsonl'));
+      const postRows = [
+        JSON.stringify(row(3, 'USER_INPUT', 'Proceed', 'USER_ANSWER')),
+        JSON.stringify({ ...row(4, 'PLANNER_RESPONSE', 'New question after continuation'), tool_calls: [{ name: 'ask_question', args: { question: 'Confirm rotated?' } }] }),
+      ].join('\n') + '\n';
+      writeFileSync(file, postRows);
+      expect(statSync(file).ino).not.toBe(oldIno);
+      expect(statSync(file).size).toBeLessThan(watermark!.byteOffset);
+
+      await bridge.flush();
+      const target = owner.resolveAggregateGeneration(2);
+      expect(owner.settle(target)?.content).toBe('New question after continuation');
+      expect((await owner.output(target))?.content).toBe('New question after continuation');
+      owner.releaseTurn();
+    } finally {
+      bridge.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it('survives same-inode truncation with smaller post-truncation ask_question and keeps old candidate cleared (F2-R2)', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'agy-f2r2-truncate-'));
+    const file = path.join(dir, 'transcript_full.jsonl');
+    const owner = new AgyForegroundOwnership(60_000);
+    const bridge = new AgyTranscriptBridge(file, (r, cursor) => owner.observe(r, cursor));
+    try {
+      const preRows = [
+        JSON.stringify(row(0, 'USER_INPUT', '<USER_REQUEST>initial prompt</USER_REQUEST>', 'USER_EXPLICIT')),
+        JSON.stringify({ ...row(1, 'PLANNER_RESPONSE', 'Old question 🚀'), tool_calls: [{ name: 'ask_question', args: { question: 'Old?' } }] }),
+        JSON.stringify(row(2, 'GENERIC', 'P'.repeat(8192))),
+      ].join('\n') + '\n';
+      writeFileSync(file, preRows);
+
+      owner.beginTurn();
+      owner.register(1, 'initial prompt');
+      await bridge.start(true);
+      await bridge.flush();
+
+      const sameIno = statSync(file).ino;
+      const watermark = bridge.currentCursor();
+      owner.register(2, 'Proceed', true, watermark);
+      expect(owner.settle(1)).toBeUndefined();
+
+      // Truncate same inode in place and write smaller continuation rows.
+      truncateSync(file, 0);
+      const postRows = [
+        JSON.stringify(row(3, 'USER_INPUT', 'Proceed', 'USER_ANSWER')),
+        JSON.stringify({ ...row(4, 'PLANNER_RESPONSE', 'Post-truncate 🚀 确认'), tool_calls: [{ name: 'ask_question', args: { question: 'New?' } }] }),
+      ].join('\n') + '\n';
+      appendFileSync(file, postRows);
+      expect(statSync(file).ino).toBe(sameIno);
+      expect(statSync(file).size).toBeLessThan(watermark!.byteOffset);
+
+      await bridge.flush();
+      const target = owner.resolveAggregateGeneration(2);
+      expect(owner.settle(target)?.content).toBe('Post-truncate 🚀 确认');
+      expect((await owner.output(target))?.content).toBe('Post-truncate 🚀 确认');
+      owner.releaseTurn();
+    } finally {
+      bridge.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it('tracks multi-byte UTF-8 and partial lines across flushes within the same incarnation without reviving pre-answer ask_question', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'agy-f2r2-utf8-'));
+    const file = path.join(dir, 'transcript_full.jsonl');
+    const owner = new AgyForegroundOwnership(60_000);
+    const seenOffsets: number[] = [];
+    const bridge = new AgyTranscriptBridge(file, (r, cursor) => {
+      if (cursor) seenOffsets.push(cursor.byteOffset);
+      owner.observe(r, cursor);
+    });
+    try {
+      writeFileSync(file, JSON.stringify(row(0, 'USER_INPUT', '<USER_REQUEST>中文提示🚀</USER_REQUEST>', 'USER_EXPLICIT')) + '\n');
+      owner.beginTurn();
+      owner.register(1, '中文提示🚀');
+      await bridge.start(true);
+      await bridge.flush();
+
+      // Append multi-byte UTF-8 ask_question in two partial chunks (without \n first, then \n).
+      const askLine = JSON.stringify({
+        ...row(1, 'PLANNER_RESPONSE', '请确认操作🚀'),
+        tool_calls: [{ name: 'ask_question', args: { question: '确认？' } }],
+      }) + '\n';
+      const rawBuf = Buffer.from(askLine, 'utf8');
+      const splitPoint = Math.floor(rawBuf.length / 2);
+      appendFileSync(file, rawBuf.subarray(0, splitPoint));
+      await bridge.flush();
+      appendFileSync(file, rawBuf.subarray(splitPoint));
+      await bridge.flush();
+
+      const expectedPreSize = statSync(file).size;
+      expect(seenOffsets.at(-1)).toBe(expectedPreSize);
+
+      // Register continuation after UTF-8 partial line completed; old candidate must not revive.
+      const watermark = bridge.currentCursor();
+      expect(watermark?.byteOffset).toBe(expectedPreSize);
+      owner.register(2, '确认', true, watermark);
+      expect(owner.settle(1)).toBeUndefined();
+
+      // A new post-continuation ask_question beyond UTF-8 watermark is accepted cleanly.
+      const postLine = JSON.stringify({
+        ...row(2, 'PLANNER_RESPONSE', '第二次询问 🎉'),
+        tool_calls: [{ name: 'ask_question', args: { question: '继续？' } }],
+      }) + '\n';
+      appendFileSync(file, postLine);
+      await bridge.flush();
+      expect(seenOffsets.at(-1)).toBe(statSync(file).size);
+      expect(owner.settle(owner.resolveAggregateGeneration(2))?.content).toBe('第二次询问 🎉');
+      owner.releaseTurn();
+    } finally {
+      bridge.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -1,6 +1,11 @@
 import { withTimeoutOutcome } from '../util/timeout-outcome.js';
-import type { AgyTranscriptRow } from './agy-transcript-bridge.js';
+import type { AgyTranscriptCursor, AgyTranscriptRow } from './agy-transcript-bridge.js';
 import { isAgySubagentTool, isAgyInteractiveTool } from './agy-subagents.js';
+
+function normalizeTranscriptCursor(cursor?: AgyTranscriptCursor | number): AgyTranscriptCursor | undefined {
+  if (cursor === undefined) return undefined;
+  return typeof cursor === 'number' ? { incarnation: 'unscoped', byteOffset: cursor } : cursor;
+}
 
 // A failure deadline, NOT a grace period for ordering or content deduplication.
 export const NATIVE_OUTPUT_DEADLINE_MS = 60_000;
@@ -112,7 +117,7 @@ export class AgyForegroundOwnership {
   private retainedLane?: Prompt;
   private lastBoundGeneration = 0;
   private turnStartGeneration?: number;
-  private continuationWatermarkBytes?: number;
+  private continuationWatermark?: AgyTranscriptCursor;
   latest?: { generation: number; row: AgyTranscriptRow };
   constructor(private deadlineMs = NATIVE_OUTPUT_DEADLINE_MS) {}
 
@@ -121,10 +126,15 @@ export class AgyForegroundOwnership {
     this.retainedLane?.resolve();
     this.retainedLane = undefined;
     this.turnStartGeneration = undefined;
-    this.continuationWatermarkBytes = undefined;
+    this.continuationWatermark = undefined;
   }
 
-  register(generation: number, text: string, shareActiveTurn = false, continuationBytes?: number): void {
+  register(
+    generation: number,
+    text: string,
+    shareActiveTurn = false,
+    continuationCursor?: AgyTranscriptCursor | number,
+  ): void {
     let resolve!: () => void;
     const ready = new Promise<void>(r => { resolve = r; });
     const hasIncompletePrompt = [...this.prompts.values()].some(p => !p.output && !p.timedOut)
@@ -143,8 +153,14 @@ export class AgyForegroundOwnership {
       if (this.retainedLane && !this.retainedLane.output && this.retainedLane.lastResponse?.tool_calls?.length) {
         this.retainedLane.lastResponse = undefined;
       }
-      if (continuationBytes !== undefined) {
-        this.continuationWatermarkBytes = Math.max(this.continuationWatermarkBytes ?? 0, continuationBytes);
+      const nextWatermark = normalizeTranscriptCursor(continuationCursor);
+      if (nextWatermark) {
+        this.continuationWatermark = !this.continuationWatermark || this.continuationWatermark.incarnation !== nextWatermark.incarnation
+          ? nextWatermark
+          : {
+              incarnation: nextWatermark.incarnation,
+              byteOffset: Math.max(this.continuationWatermark.byteOffset, nextWatermark.byteOffset),
+            };
       }
     }
     const normText = collapseWhitespace(text);
@@ -285,7 +301,7 @@ export class AgyForegroundOwnership {
     return prompt.output;
   }
 
-  observe(row: AgyTranscriptRow, rowByteEnd?: number): boolean {
+  observe(row: AgyTranscriptRow, cursorOrByteEnd?: AgyTranscriptCursor | number): boolean {
     if (row.type === 'USER_INPUT' && row.source === 'USER_EXPLICIT') {
       // The full native log wraps but retains the exact submitted payload.
       // FIFO unbound requests distinguish repeated identical user messages.
@@ -332,11 +348,13 @@ export class AgyForegroundOwnership {
     } else if (row.type === 'PLANNER_RESPONSE') {
       const prompt = this.activeLanePrompt();
       if (!prompt || prompt.inputStep === undefined || row.step_index <= prompt.inputStep) return false;
+      const cursor = normalizeTranscriptCursor(cursorOrByteEnd);
       if (
         row.tool_calls?.length
-        && rowByteEnd !== undefined
-        && this.continuationWatermarkBytes !== undefined
-        && rowByteEnd <= this.continuationWatermarkBytes
+        && cursor
+        && this.continuationWatermark
+        && cursor.incarnation === this.continuationWatermark.incarnation
+        && cursor.byteOffset <= this.continuationWatermark.byteOffset
       ) {
         return false;
       }
@@ -452,7 +470,7 @@ export class AgyForegroundOwnership {
     this.retainedLane = undefined;
     this.lastBoundGeneration = 0;
     this.turnStartGeneration = undefined;
-    this.continuationWatermarkBytes = undefined;
+    this.continuationWatermark = undefined;
     this.latest = undefined;
   }
 

@@ -1,5 +1,5 @@
 import { AgyForegroundOwnership } from '../agy-foreground-ownership.js';
-import { AgyTranscriptBridge, agyTranscriptFile, type AgyTranscriptRow } from '../agy-transcript-bridge.js';
+import { AgyTranscriptBridge, agyTranscriptFile, type AgyTranscriptCursor, type AgyTranscriptRow } from '../agy-transcript-bridge.js';
 import { AgySubagentTracker, isAgySubagentTool, normalizeAgyToolName } from '../agy-subagents.js';
 import { AgyCompactionWatermark } from '../agy-compaction-watermark.js';
 import { AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
@@ -728,9 +728,9 @@ export class KimiSdkProvider implements TransportProvider {
     const env = { ...process.env, ...(this.config?.env as Record<string,string> | undefined), ...state.env };
     const file = agyTranscriptFile(env.HOME || env.USERPROFILE || '', id);
     if (!file) return;
-    const bridge = new AgyTranscriptBridge(file, (row, rowByteEnd) => {
+    const bridge = new AgyTranscriptBridge(file, (row, cursor) => {
       if (this.sessions.get(sessionId) !== state || state.cancelled || state.stoppedByCancel) return;
-      this.handleAgyTranscriptRow(sessionId, state, id, row, rowByteEnd);
+      this.handleAgyTranscriptRow(sessionId, state, id, row, cursor);
     });
     bridges.set(id, bridge);
     await bridge.start(!!childId);
@@ -749,7 +749,7 @@ export class KimiSdkProvider implements TransportProvider {
     }
   }
 
-  private handleAgyTranscriptRow(sessionId: string, state: KimiSdkSessionState, nativeId: string, row: AgyTranscriptRow, rowByteEnd?: number): void {
+  private handleAgyTranscriptRow(sessionId: string, state: KimiSdkSessionState, nativeId: string, row: AgyTranscriptRow, cursor?: AgyTranscriptCursor): void {
     const tracker = state.agySubagents ??= new AgySubagentTracker(state.acpSessionId ?? sessionId);
     const publish = (events: ToolCallEvent[]) => this.publishAgySubagents(sessionId, state, events);
     if (nativeId !== state.acpSessionId) {
@@ -759,7 +759,7 @@ export class KimiSdkProvider implements TransportProvider {
       }
       return;
     }
-    const claimedByForeground = state.agyForeground?.observe(row, rowByteEnd) === true;
+    const claimedByForeground = state.agyForeground?.observe(row, cursor) === true;
     if (row.type === 'SYSTEM_MESSAGE' && /\[Message\].*sender=/.test(row.content ?? '')) this.useAgyNativeOutput(state);
     if (row.type === 'PLANNER_RESPONSE' && row.tool_calls?.length) {
       if (row.tool_calls.some(call => /^(invokesubagent|browsersubagent|sendmessage|swarm)$/.test(normalizeAgyToolName(call.name ?? '')))) this.useAgyNativeOutput(state);
@@ -1167,14 +1167,14 @@ export class KimiSdkProvider implements TransportProvider {
       queuedGeneration = generation;
       (state.activePromptGenerations ??= new Set()).add(generation);
       if (this.id === AGY_SDK_PROVIDER_ID) {
-        const continuationBytes = state.acpSessionId
-          ? state.agyBridges?.get(state.acpSessionId)?.currentFileSize()
+        const continuationCursor = state.acpSessionId
+          ? state.agyBridges?.get(state.acpSessionId)?.currentCursor()
           : undefined;
         (state.agyForeground ??= new AgyForegroundOwnership()).register(
           generation,
           activePromptText,
           true,
-          continuationBytes,
+          continuationCursor,
         );
       }
       const queuedPrompt = connection.prompt({

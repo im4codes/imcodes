@@ -8,6 +8,10 @@ export interface AgyTranscriptRow {
   tool_calls?: Array<{ name?: string; args?: unknown }>;
   input_tokens?: number; output_tokens?: number; cache_read_tokens?: number;
 }
+export interface AgyTranscriptCursor {
+  incarnation: string;
+  byteOffset: number;
+}
 const BACKGROUND_TASK_RUNNING_RE = /Tool is running as a background task with task id:/i;
 export function agyTranscriptFile(home: string, id: string): string | undefined {
   if (!path.isAbsolute(home) || !/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,199}$/.test(id)) return;
@@ -25,16 +29,29 @@ export class AgyTranscriptBridge {
   private again = false;
   private offset = 0;
   private parsedBytes = 0;
+  private dev?: number;
   private inode?: number;
+  private truncationEpoch = 0;
   private partial = '';
   private decoder = new StringDecoder('utf8');
   private lastStep = -1;
   private watched?: { dir: string; ino: number; dev: number };
 
-  constructor(readonly file: string, private readonly onRow: (row: AgyTranscriptRow, byteOffset?: number) => void) {}
+  constructor(readonly file: string, private readonly onRow: (row: AgyTranscriptRow, cursor?: AgyTranscriptCursor) => void) {}
   get isClosed(): boolean { return this.closed; }
-  currentFileSize(): number {
-    try { return statSync(this.file).size; } catch { return 0; }
+  currentCursor(): AgyTranscriptCursor | undefined {
+    try {
+      const s = statSync(this.file);
+      const dev = Number(s.dev);
+      const ino = Number(s.ino);
+      const size = Number(s.size);
+      const epoch = this.inode !== undefined && this.dev === dev && this.inode === ino
+        ? (size < this.offset ? this.truncationEpoch + 1 : this.truncationEpoch)
+        : 0;
+      return { incarnation: `${dev}:${ino}:${epoch}`, byteOffset: size };
+    } catch {
+      return undefined;
+    }
   }
   async resume(): Promise<void> { this.closed = false; await this.flush(); }
 
@@ -100,12 +117,21 @@ export class AgyTranscriptBridge {
   private async read(baseline = false): Promise<void> {
     try {
       const s = await stat(this.file);
-      if (this.inode !== s.ino || s.size < this.offset) {
+      const dev = Number(s.dev);
+      const ino = Number(s.ino);
+      const size = Number(s.size);
+      if (this.inode === undefined || this.dev !== dev || this.inode !== ino) {
+        this.truncationEpoch = 0;
+        this.offset = 0; this.parsedBytes = 0; this.partial = ''; this.decoder = new StringDecoder('utf8');
+      } else if (size < this.offset) {
+        this.truncationEpoch += 1;
         this.offset = 0; this.parsedBytes = 0; this.partial = ''; this.decoder = new StringDecoder('utf8');
       }
-      this.inode = s.ino;
-      if (s.size <= this.offset) return;
-      const end = s.size;
+      this.dev = dev;
+      this.inode = ino;
+      if (size <= this.offset) return;
+      const incarnation = `${dev}:${ino}:${this.truncationEpoch}`;
+      const end = size;
       for await (const bytes of createReadStream(this.file, { start: this.offset, end: end - 1, highWaterMark: 64 * 1024 })) {
         if (this.closed) return;
         this.partial += this.decoder.write(bytes as Buffer);
@@ -122,7 +148,7 @@ export class AgyTranscriptBridge {
             && BACKGROUND_TASK_RUNNING_RE.test(row.content ?? '');
           if (row.status !== 'DONE' && !allowRunningBackgroundTask) continue;
           this.lastStep = row.step_index;
-          if (!this.closed && !baseline) this.onRow(row, rowByteEnd);
+          if (!this.closed && !baseline) this.onRow(row, { incarnation, byteOffset: rowByteEnd });
         }
       }
       this.offset = end;
