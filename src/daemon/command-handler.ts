@@ -11598,7 +11598,7 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
   // Determine if file exists to choose sandbox validation strategy
   let fileExists = false;
   try {
-    await fsLstat(resolved);
+    await fsStat(resolved);
     fileExists = true;
   } catch {
     fileExists = false;
@@ -11676,8 +11676,12 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
         const code = typeof err === 'object' && err !== null && 'code' in err ? String((err as { code?: unknown }).code) : '';
         if (code !== 'ENOENT') throw err;
       }
-      // Write the file
-      await fsWriteFile(resolved, writeBuffer, { flag: 'wx' });
+      // Keep exclusive creation for both binary and UTF-8 text writes.
+      if (isBase64) {
+        await fsWriteFile(resolved, writeBuffer, { flag: 'wx' });
+      } else {
+        await fsWriteFile(resolved, content, { encoding: 'utf-8', flag: 'wx' });
+      }
       const newStats = await fsStat(resolved);
       const real = await fsRealpath(resolved);
       invalidateFsListCachesForPath(real);

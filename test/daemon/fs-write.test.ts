@@ -387,6 +387,62 @@ describe('fs.write handler', () => {
     });
   });
 
+  it.each([false, true])('writes base64 as binary bytes (existing=%s)', async (existing) => {
+    const filePath = path.join(homedir(), 'binary-write.bin');
+    const bytes = Buffer.from([0, 255, 128, 65]);
+    const mtime = 2000;
+    if (existing) {
+      mockStat.mockResolvedValueOnce({ mtimeMs: 1000 } as fsp.Stats);
+      mockRealpath.mockResolvedValueOnce(filePath as unknown as string);
+    } else {
+      mockStat.mockRejectedValueOnce(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+      mockRealpath.mockResolvedValueOnce(path.dirname(filePath) as unknown as string);
+    }
+    mockStat.mockResolvedValueOnce({ mtimeMs: mtime } as fsp.Stats);
+    if (!existing) mockRealpath.mockResolvedValueOnce(filePath as unknown as string);
+    mockWriteFile.mockResolvedValue(undefined);
+
+    handleWebCommand({ type: 'fs.write', path: filePath, content: bytes.toString('base64'), encoding: 'base64', requestId: 'req-binary' }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockWriteFile).toHaveBeenCalledTimes(1);
+    if (existing) {
+      expect(mockWriteFile).toHaveBeenCalledWith(filePath, bytes);
+    } else {
+      expect(mockWriteFile).toHaveBeenCalledWith(filePath, bytes, { flag: 'wx' });
+    }
+    expect(sent[0]).toMatchObject({ status: 'ok', mtime });
+  });
+
+  it('writes an existing symlink only through its allowed real target', async () => {
+    const linkPath = path.join(homedir(), 'allowed-link.txt');
+    const realPath = path.join(homedir(), 'allowed-target.txt');
+    mockStat.mockResolvedValue({ mtimeMs: 1000 } as fsp.Stats);
+    mockRealpath.mockResolvedValue(realPath as unknown as string);
+    mockLstat.mockResolvedValue({ isSymbolicLink: () => true } as fsp.Stats);
+    mockWriteFile.mockResolvedValue(undefined);
+
+    handleWebCommand({ type: 'fs.write', path: linkPath, content: 'updated', requestId: 'req-allowed-link' }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockStat).toHaveBeenCalledWith(linkPath);
+    expect(mockWriteFile).toHaveBeenCalledWith(realPath, 'updated', 'utf-8');
+    expect(sent[0]).toMatchObject({ status: 'ok', resolvedPath: realPath });
+  });
+
+  it('rejects a dangling symlink even when stat reports its target missing', async () => {
+    const linkPath = path.join(homedir(), 'dangling-link.txt');
+    mockStat.mockRejectedValueOnce(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+    mockRealpath.mockResolvedValueOnce(path.dirname(linkPath) as unknown as string);
+    mockLstat.mockResolvedValueOnce({ isSymbolicLink: () => true } as fsp.Stats);
+
+    handleWebCommand({ type: 'fs.write', path: linkPath, content: 'blocked', requestId: 'req-dangling-link' }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockWriteFile).not.toHaveBeenCalled();
+    expect(sent[0]).toMatchObject({ status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH });
+  });
+
   it('fails closed when a new target appears as a symlink after the initial existence check', async () => {
     const filePath = path.join(homedir(), 'new-link-to-secret.txt');
     const parentPath = path.dirname(filePath);
@@ -414,6 +470,7 @@ describe('fs.rename and fs.delete handlers', () => {
     vi.clearAllMocks();
     sent.length = 0;
     mockServerLink.send.mockImplementation((msg: unknown) => { sent.push(msg); });
+    mockStat.mockResolvedValue({ mtimeMs: 1000 } as fsp.Stats);
     mockRename.mockResolvedValue(undefined);
     mockRm.mockResolvedValue(undefined);
     __resetFsGitCachesForTests();
