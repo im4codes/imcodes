@@ -290,7 +290,8 @@ describe('update manager', () => {
     expect(notifyAppReadyMock).not.toHaveBeenCalled();
     expect(downloadMock).not.toHaveBeenCalled();
 
-    // 2. If reset failed to switch bundle in the same session, loop guard prevents repeated reset
+    // 2. If reset resolved without switching bundle in the same session, loop guard prevents repeated reset
+    // while still refusing to certify the incompatible bundle healthy via notifyAppReady.
     vi.resetModules();
     currentBundleMock.mockResolvedValueOnce({
       bundle: { id: 'c84Qsje59L', version: '6175', status: 'success' },
@@ -299,7 +300,7 @@ describe('update manager', () => {
     const { initUpdateManager: initAgainSameSession } = await import('../src/update-manager.js');
     await initAgainSameSession();
     expect(resetBundleMock).toHaveBeenCalledTimes(1);
-    expect(notifyAppReadyMock).toHaveBeenCalledTimes(1);
+    expect(notifyAppReadyMock).not.toHaveBeenCalled();
 
     // 3. After reload onto builtin, stale server manifest (v6175) is not re-downloaded, while compatible v6176 is allowed
     vi.resetModules();
@@ -374,5 +375,52 @@ describe('update manager', () => {
     expect(appDelegate).toContain('Self.reconcileCachedOtaBundles()');
     expect(appDelegate).toContain('NoCloud/ionic_built_snapshots');
     expect(appDelegate).toContain('window.__IMCODES_NATIVE_BUILD_INFO__');
+  });
+
+  it('never marks the same incompatible active OTA healthy after a reset failure and reload, allows one bounded retry, and acknowledges builtin once recovered', async () => {
+    (globalThis as any).__IMCODES_NATIVE_BUILD_INFO__ = {
+      buildId: 'native-new',
+      buildTime: '2026-11-12T06:46:15.240Z',
+    };
+    currentBundleMock.mockResolvedValue({
+      bundle: { id: 'stale6175', version: '6175' },
+      native: '1.2',
+    });
+    preferencesGetMock.mockResolvedValue({ value: '6175' });
+    resetBundleMock.mockRejectedValue(new Error('Reset failed'));
+    deleteBundleMock.mockRejectedValue(new Error('cannot delete active bundle'));
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 404 })));
+
+    const first = await import('../src/update-manager.js');
+    await first.initUpdateManager();
+    expect(resetBundleMock).toHaveBeenCalledTimes(1);
+    expect(notifyAppReadyMock).not.toHaveBeenCalled();
+    expect(globalThis.sessionStorage?.getItem('deck_ota_reset_guard:stale6175')).toBe('retry:1');
+
+    // A WebView reload still serves the same incompatible bundle after failed native reset.
+    // JS module state restarts, while sessionStorage survives a reload.
+    // One bounded retry is allowed, and notifyAppReady must remain uncalled.
+    vi.resetModules();
+    const second = await import('../src/update-manager.js');
+    await second.initUpdateManager();
+    expect(resetBundleMock).toHaveBeenCalledTimes(2);
+    expect(notifyAppReadyMock).not.toHaveBeenCalled();
+    expect(globalThis.sessionStorage?.getItem('deck_ota_reset_guard:stale6175')).toBe('1');
+
+    // A third reload or re-init in the same session hits the terminal throttle guard ('1'):
+    // neither reset() nor notifyAppReady() is called.
+    await second.initUpdateManager();
+    expect(resetBundleMock).toHaveBeenCalledTimes(2);
+    expect(notifyAppReadyMock).not.toHaveBeenCalled();
+
+    // Once native reset/recovery switches the active bundle to builtin, notifyAppReady is called once
+    // and the reset guard is cleared.
+    currentBundleMock.mockResolvedValue({
+      bundle: { id: 'builtin', version: '' },
+      native: '1.2',
+    });
+    await second.initUpdateManager();
+    expect(notifyAppReadyMock).toHaveBeenCalledTimes(1);
+    expect(globalThis.sessionStorage?.getItem('deck_ota_reset_guard:stale6175')).toBeNull();
   });
 });

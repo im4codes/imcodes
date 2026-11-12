@@ -30,8 +30,12 @@ const PREFS_OTA_VERSION_KEY = 'deck_ota_version';
 const BUILTIN_BUILD_STORAGE_KEY = 'deck_builtin_build_info';
 const OTA_RESET_GUARD_PREFIX = 'deck_ota_reset_guard:';
 
-const memoryResetGuards = new Set<string>();
+type OtaResetGuardState = 'none' | 'retry:1' | '1';
+
+const memoryResetGuards = new Map<string, OtaResetGuardState>();
+const rejectedBundleIds = new Set<string>();
 let initialized = false;
+let initInFlight: Promise<void> | null = null;
 let isBuiltinActive = false;
 
 function extractBuildTime(info: LocalAppBuildInfo | null | undefined): string {
@@ -75,23 +79,58 @@ function writeStoredBuiltinBuildInfo(info: LocalAppBuildInfo): void {
   }
 }
 
-function hasResetGuard(bundleId: string): boolean {
+function getResetGuardState(bundleId: string): OtaResetGuardState {
   const key = `${OTA_RESET_GUARD_PREFIX}${bundleId}`;
-  if (memoryResetGuards.has(key)) return true;
+  const mem = memoryResetGuards.get(key);
+  if (mem) return mem;
   try {
-    return globalThis.sessionStorage?.getItem(key) === '1';
+    const stored = globalThis.sessionStorage?.getItem(key);
+    if (stored === '1' || stored === 'retry:1') {
+      return stored;
+    }
   } catch {
-    return false;
+    // Ignore storage read errors
+  }
+  return 'none';
+}
+
+function setResetGuardState(bundleId: string, state: OtaResetGuardState): void {
+  const key = `${OTA_RESET_GUARD_PREFIX}${bundleId}`;
+  if (state === 'none') {
+    memoryResetGuards.delete(key);
+    try {
+      globalThis.sessionStorage?.removeItem(key);
+    } catch {
+      // Ignore storage errors
+    }
+    return;
+  }
+  memoryResetGuards.set(key, state);
+  try {
+    globalThis.sessionStorage?.setItem(key, state);
+  } catch {
+    // Best-effort loop guard
   }
 }
 
-function markResetGuard(bundleId: string): void {
-  const key = `${OTA_RESET_GUARD_PREFIX}${bundleId}`;
-  memoryResetGuards.add(key);
+function clearAllResetGuards(): void {
+  memoryResetGuards.clear();
+  rejectedBundleIds.clear();
   try {
-    globalThis.sessionStorage?.setItem(key, '1');
+    const storage = globalThis.sessionStorage;
+    if (!storage) return;
+    const keysToRemove: string[] = [];
+    for (let i = 0; i < storage.length; i += 1) {
+      const k = storage.key(i);
+      if (k && k.startsWith(OTA_RESET_GUARD_PREFIX)) {
+        keysToRemove.push(k);
+      }
+    }
+    for (const k of keysToRemove) {
+      storage.removeItem(k);
+    }
   } catch {
-    // Best-effort loop guard
+    // Ignore storage errors
   }
 }
 
@@ -116,6 +155,9 @@ async function reconcileActiveOtaBundle(CapacitorUpdater: any): Promise<boolean>
   const activeId = typeof current?.bundle?.id === 'string' ? current.bundle.id.trim() : '';
   if (!activeId || activeId === 'builtin') {
     isBuiltinActive = activeId === 'builtin';
+    if (isBuiltinActive) {
+      clearAllResetGuards();
+    }
     return true;
   }
   isBuiltinActive = false;
@@ -128,13 +170,17 @@ async function reconcileActiveOtaBundle(CapacitorUpdater: any): Promise<boolean>
     && !cap.isPluginAvailable(STREAMING_SPEECH_PLUGIN_NAME)
     && !cap.isPluginAvailable('SpeechRecognition');
 
-  const isIncompatible = Number.isNaN(activeMs)
+  const isIncompatible = rejectedBundleIds.has(activeId)
+    || Number.isNaN(activeMs)
     || (!Number.isNaN(builtinMs) && activeMs <= builtinMs)
     || missingSpeechBridge;
 
-  if (!isIncompatible) return true;
-  if (hasResetGuard(activeId)) return true;
-  markResetGuard(activeId);
+  if (!isIncompatible) {
+    setResetGuardState(activeId, 'none');
+    return true;
+  }
+
+  rejectedBundleIds.add(activeId);
 
   const rawVersion = typeof current?.bundle?.version === 'string' ? current.bundle.version.trim() : '';
   const parsedVersion = rawVersion ? parseInt(rawVersion, 10) : 0;
@@ -150,10 +196,25 @@ async function reconcileActiveOtaBundle(CapacitorUpdater: any): Promise<boolean>
     }
   }
 
+  const guardState = getResetGuardState(activeId);
+  if (guardState === '1') {
+    // Already exhausted reset attempts for this incompatible bundle in this session.
+    // Stay blocked (never call notifyAppReady on an incompatible bundle) without looping reset().
+    return false;
+  }
+
+  // Allow at most one bounded retry if the initial reset() call rejected;
+  // if reset() resolves, immediately lock the guard at '1' to prevent reload loops.
+  const isRetryAttempt = guardState === 'retry:1';
+  setResetGuardState(activeId, '1');
+
   try {
     await CapacitorUpdater.reset?.({ toLastSuccessful: false });
   } catch (err) {
     console.warn('[OTA] Failed to reset incompatible bundle:', err);
+    if (!isRetryAttempt) {
+      setResetGuardState(activeId, 'retry:1');
+    }
   }
   try {
     await CapacitorUpdater.delete?.({ id: activeId });
@@ -166,22 +227,29 @@ async function reconcileActiveOtaBundle(CapacitorUpdater: any): Promise<boolean>
 /** Call once on app startup (native only). Sets up resume listener. */
 export async function initUpdateManager(): Promise<void> {
   if (!isNative() || initialized) return;
-  initialized = true;
+  if (initInFlight) return initInFlight;
 
-  const { CapacitorUpdater } = await import('@capgo/capacitor-updater');
-  const compatible = await reconcileActiveOtaBundle(CapacitorUpdater);
-  if (!compatible) return;
+  initInFlight = (async () => {
+    const { CapacitorUpdater } = await import('@capgo/capacitor-updater');
+    const compatible = await reconcileActiveOtaBundle(CapacitorUpdater);
+    if (!compatible) return;
 
-  await CapacitorUpdater.notifyAppReady();
+    initialized = true;
+    await CapacitorUpdater.notifyAppReady();
 
-  // Cold start: check + apply immediately
-  checkForUpdate(true).catch(() => {});
+    // Cold start: check + apply immediately
+    checkForUpdate(true).catch(() => {});
 
-  // Resume: download only, apply on next cold start
-  const { App } = await import('@capacitor/app');
-  App.addListener('appStateChange', ({ isActive }) => {
-    if (isActive) checkForUpdate(false).catch(() => {});
+    // Resume: download only, apply on next cold start
+    const { App } = await import('@capacitor/app');
+    App.addListener('appStateChange', ({ isActive }) => {
+      if (isActive) checkForUpdate(false).catch(() => {});
+    });
+  })().finally(() => {
+    initInFlight = null;
   });
+
+  return initInFlight;
 }
 
 async function checkForUpdate(applyNow: boolean): Promise<void> {
