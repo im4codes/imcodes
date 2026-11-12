@@ -112,6 +112,7 @@ export class AgyForegroundOwnership {
   private retainedLane?: Prompt;
   private lastBoundGeneration = 0;
   private turnStartGeneration?: number;
+  private continuationWatermarkBytes?: number;
   latest?: { generation: number; row: AgyTranscriptRow };
   constructor(private deadlineMs = NATIVE_OUTPUT_DEADLINE_MS) {}
 
@@ -120,15 +121,31 @@ export class AgyForegroundOwnership {
     this.retainedLane?.resolve();
     this.retainedLane = undefined;
     this.turnStartGeneration = undefined;
+    this.continuationWatermarkBytes = undefined;
   }
 
-  register(generation: number, text: string, shareActiveTurn = false): void {
+  register(generation: number, text: string, shareActiveTurn = false, continuationBytes?: number): void {
     let resolve!: () => void;
     const ready = new Promise<void>(r => { resolve = r; });
     const hasIncompletePrompt = [...this.prompts.values()].some(p => !p.output && !p.timedOut)
       || Boolean(this.retainedLane && !this.retainedLane.output && !this.retainedLane.timedOut);
     if ((!shareActiveTurn && !hasIncompletePrompt) || this.turnStartGeneration === undefined) {
       this.turnStartGeneration = generation;
+    }
+    if (shareActiveTurn) {
+      // A shared-turn continuation (e.g., ask_question answer or mid-turn steer)
+      // invalidates any earlier pending interactive/tool response as a terminal candidate.
+      for (const existing of this.prompts.values()) {
+        if (!existing.output && existing.lastResponse?.tool_calls?.length) {
+          existing.lastResponse = undefined;
+        }
+      }
+      if (this.retainedLane && !this.retainedLane.output && this.retainedLane.lastResponse?.tool_calls?.length) {
+        this.retainedLane.lastResponse = undefined;
+      }
+      if (continuationBytes !== undefined) {
+        this.continuationWatermarkBytes = Math.max(this.continuationWatermarkBytes ?? 0, continuationBytes);
+      }
     }
     const normText = collapseWhitespace(text);
     const tagCount = countUserRequestTags(text);
@@ -151,6 +168,13 @@ export class AgyForegroundOwnership {
 
   hasBoundSuccessor(generation: number): boolean {
     return this.lastBoundGeneration > generation;
+  }
+
+  resolveAggregateGeneration(fallbackGeneration: number): number {
+    if (this.lastBoundGeneration > 0 && this.prompts.has(this.lastBoundGeneration)) {
+      return this.lastBoundGeneration;
+    }
+    return fallbackGeneration;
   }
 
   private findMatchingPrompt(content: string | undefined): Prompt | undefined {
@@ -261,7 +285,7 @@ export class AgyForegroundOwnership {
     return prompt.output;
   }
 
-  observe(row: AgyTranscriptRow): boolean {
+  observe(row: AgyTranscriptRow, rowByteEnd?: number): boolean {
     if (row.type === 'USER_INPUT' && row.source === 'USER_EXPLICIT') {
       // The full native log wraps but retains the exact submitted payload.
       // FIFO unbound requests distinguish repeated identical user messages.
@@ -292,6 +316,12 @@ export class AgyForegroundOwnership {
         }
       }
       return false;
+    } else if (row.type === 'USER_INPUT') {
+      const prompt = this.activeLanePrompt();
+      if (prompt && !prompt.output && prompt.lastResponse?.tool_calls?.length) {
+        prompt.lastResponse = undefined;
+      }
+      return false;
     } else if (row.type === 'SYSTEM_MESSAGE' && /\[Message\].*sender=/.test(row.content ?? '')) {
       const prompt = this.activeLanePrompt();
       if (!prompt || prompt.output) {
@@ -302,6 +332,14 @@ export class AgyForegroundOwnership {
     } else if (row.type === 'PLANNER_RESPONSE') {
       const prompt = this.activeLanePrompt();
       if (!prompt || prompt.inputStep === undefined || row.step_index <= prompt.inputStep) return false;
+      if (
+        row.tool_calls?.length
+        && rowByteEnd !== undefined
+        && this.continuationWatermarkBytes !== undefined
+        && rowByteEnd <= this.continuationWatermarkBytes
+      ) {
+        return false;
+      }
       prompt.lastResponse = row;
       if (!row.tool_calls?.length || (prompt.settling && isTerminalForegroundRow(row))) {
         prompt.output = row;
@@ -406,7 +444,7 @@ export class AgyForegroundOwnership {
       this.lane = undefined;
     }
   }
-  clear(): void {
+  releaseTurn(): void {
     for (const prompt of this.prompts.values()) prompt.resolve();
     this.retainedLane?.resolve();
     this.prompts.clear();
@@ -414,7 +452,12 @@ export class AgyForegroundOwnership {
     this.retainedLane = undefined;
     this.lastBoundGeneration = 0;
     this.turnStartGeneration = undefined;
+    this.continuationWatermarkBytes = undefined;
     this.latest = undefined;
+  }
+
+  clear(): void {
+    this.releaseTurn();
     this.authoritative = false;
   }
 }

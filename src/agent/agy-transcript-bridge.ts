@@ -1,4 +1,4 @@
-import { watch, type FSWatcher, createReadStream } from 'node:fs';
+import { watch, type FSWatcher, createReadStream, statSync } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
@@ -24,14 +24,18 @@ export class AgyTranscriptBridge {
   private reading?: Promise<void>;
   private again = false;
   private offset = 0;
+  private parsedBytes = 0;
   private inode?: number;
   private partial = '';
   private decoder = new StringDecoder('utf8');
   private lastStep = -1;
   private watched?: { dir: string; ino: number; dev: number };
 
-  constructor(readonly file: string, private readonly onRow: (row: AgyTranscriptRow) => void) {}
+  constructor(readonly file: string, private readonly onRow: (row: AgyTranscriptRow, byteOffset?: number) => void) {}
   get isClosed(): boolean { return this.closed; }
+  currentFileSize(): number {
+    try { return statSync(this.file).size; } catch { return 0; }
+  }
   async resume(): Promise<void> { this.closed = false; await this.flush(); }
 
   async start(replayExisting = false): Promise<void> {
@@ -97,7 +101,7 @@ export class AgyTranscriptBridge {
     try {
       const s = await stat(this.file);
       if (this.inode !== s.ino || s.size < this.offset) {
-        this.offset = 0; this.partial = ''; this.decoder = new StringDecoder('utf8');
+        this.offset = 0; this.parsedBytes = 0; this.partial = ''; this.decoder = new StringDecoder('utf8');
       }
       this.inode = s.ino;
       if (s.size <= this.offset) return;
@@ -108,6 +112,8 @@ export class AgyTranscriptBridge {
         let lineEnd: number;
         while ((lineEnd = this.partial.indexOf('\n')) >= 0) {
           const line = this.partial.slice(0, lineEnd); this.partial = this.partial.slice(lineEnd + 1);
+          const rowByteEnd = this.parsedBytes + Buffer.byteLength(line, 'utf8') + 1;
+          this.parsedBytes = rowByteEnd;
           let row: AgyTranscriptRow;
           try { row = JSON.parse(line) as AgyTranscriptRow; } catch { continue; }
           if (!Number.isSafeInteger(row.step_index) || row.step_index <= this.lastStep) continue;
@@ -116,7 +122,7 @@ export class AgyTranscriptBridge {
             && BACKGROUND_TASK_RUNNING_RE.test(row.content ?? '');
           if (row.status !== 'DONE' && !allowRunningBackgroundTask) continue;
           this.lastStep = row.step_index;
-          if (!this.closed && !baseline) this.onRow(row);
+          if (!this.closed && !baseline) this.onRow(row, rowByteEnd);
         }
       }
       this.offset = end;

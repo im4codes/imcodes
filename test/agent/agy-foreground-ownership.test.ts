@@ -478,4 +478,59 @@ describe('AG captured native foreground ownership', () => {
     expect(owner.hasActiveLane()).toBe(false);
     expect(owner.latest).toBeUndefined();
   });
+  it('keeps genuine G2 attributable when G2 USER_EXPLICIT arrives after G2 RPC and G1 settles via resolveAggregateGeneration', async () => {
+    const owner = new AgyForegroundOwnership(60_000);
+    owner.beginTurn();
+    owner.register(1, 'first prompt');
+    owner.observe(row(0, 'USER_INPUT', '<USER_REQUEST>first prompt</USER_REQUEST>', 'USER_EXPLICIT'));
+    owner.register(2, 'second prompt', true, 120);
+
+    // G2 RPC finishes early before G2 native USER_INPUT is logged; caller defers without release(2).
+    // Later, native logs G2's USER_EXPLICIT + final PLANNER_RESPONSE before G1 settles.
+    owner.observe(row(1, 'USER_INPUT', '<USER_REQUEST>second prompt</USER_REQUEST>', 'USER_EXPLICIT'));
+    owner.observe(row(2, 'PLANNER_RESPONSE', 'STEERED OWNED RESULT'));
+
+    const target = owner.resolveAggregateGeneration(1);
+    expect(target).toBe(2);
+    expect(owner.settle(target)?.content).toBe('STEERED OWNED RESULT');
+    expect((await owner.output(target))?.content).toBe('STEERED OWNED RESULT');
+    owner.releaseTurn();
+    expect(owner.hasActiveLane()).toBe(false);
+    expect(owner.latest).toBeUndefined();
+  });
+  it('ignores pre-continuation ask_question after shared G2 registration while keeping single-prompt and post-continuation ask_question working', async () => {
+    // Negative control: single-prompt ask_question still resolves normally.
+    const single = new AgyForegroundOwnership(60_000);
+    single.beginTurn();
+    single.register(1, 'solo');
+    single.observe(row(0, 'USER_INPUT', '<USER_REQUEST>solo</USER_REQUEST>', 'USER_EXPLICIT'));
+    single.observe({
+      ...row(1, 'PLANNER_RESPONSE', 'Need confirmation'),
+      tool_calls: [{ name: 'ask_question', args: { question: 'Proceed?' } }],
+    }, 200);
+    expect(single.settle(1)?.content).toBe('Need confirmation');
+    single.releaseTurn();
+
+    // F2 class: pre-continuation ask_question must not satisfy settle(1) after G2 answers it.
+    const owner = new AgyForegroundOwnership(60_000);
+    owner.beginTurn();
+    owner.register(1, 'initial task');
+    owner.observe(row(0, 'USER_INPUT', '<USER_REQUEST>initial task</USER_REQUEST>', 'USER_EXPLICIT'), 100);
+    owner.observe({
+      ...row(1, 'PLANNER_RESPONSE', 'Need confirmation'),
+      tool_calls: [{ name: 'ask_question', args: { question: 'Proceed?' } }],
+    }, 220);
+    owner.register(2, 'Proceed', true, 220);
+
+    // Even if replayed/read up to watermark 220 or before continuation lands, ask_question is suppressed.
+    expect(owner.settle(owner.resolveAggregateGeneration(2))).toBeUndefined();
+
+    // A second ask_question written *past* the watermark remains valid if it terminates there.
+    owner.observe({
+      ...row(2, 'PLANNER_RESPONSE', 'Second question'),
+      tool_calls: [{ name: 'ask_question', args: { question: 'Sure?' } }],
+    }, 360);
+    expect(owner.settle(owner.resolveAggregateGeneration(2))?.content).toBe('Second question');
+    owner.releaseTurn();
+  });
 });

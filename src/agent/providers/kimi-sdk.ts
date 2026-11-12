@@ -728,9 +728,9 @@ export class KimiSdkProvider implements TransportProvider {
     const env = { ...process.env, ...(this.config?.env as Record<string,string> | undefined), ...state.env };
     const file = agyTranscriptFile(env.HOME || env.USERPROFILE || '', id);
     if (!file) return;
-    const bridge = new AgyTranscriptBridge(file, row => {
+    const bridge = new AgyTranscriptBridge(file, (row, rowByteEnd) => {
       if (this.sessions.get(sessionId) !== state || state.cancelled || state.stoppedByCancel) return;
-      this.handleAgyTranscriptRow(sessionId, state, id, row);
+      this.handleAgyTranscriptRow(sessionId, state, id, row, rowByteEnd);
     });
     bridges.set(id, bridge);
     await bridge.start(!!childId);
@@ -749,7 +749,7 @@ export class KimiSdkProvider implements TransportProvider {
     }
   }
 
-  private handleAgyTranscriptRow(sessionId: string, state: KimiSdkSessionState, nativeId: string, row: AgyTranscriptRow): void {
+  private handleAgyTranscriptRow(sessionId: string, state: KimiSdkSessionState, nativeId: string, row: AgyTranscriptRow, rowByteEnd?: number): void {
     const tracker = state.agySubagents ??= new AgySubagentTracker(state.acpSessionId ?? sessionId);
     const publish = (events: ToolCallEvent[]) => this.publishAgySubagents(sessionId, state, events);
     if (nativeId !== state.acpSessionId) {
@@ -759,7 +759,7 @@ export class KimiSdkProvider implements TransportProvider {
       }
       return;
     }
-    const claimedByForeground = state.agyForeground?.observe(row) === true;
+    const claimedByForeground = state.agyForeground?.observe(row, rowByteEnd) === true;
     if (row.type === 'SYSTEM_MESSAGE' && /\[Message\].*sender=/.test(row.content ?? '')) this.useAgyNativeOutput(state);
     if (row.type === 'PLANNER_RESPONSE' && row.tool_calls?.length) {
       if (row.tool_calls.some(call => /^(invokesubagent|browsersubagent|sendmessage|swarm)$/.test(normalizeAgyToolName(call.name ?? '')))) this.useAgyNativeOutput(state);
@@ -1166,7 +1166,17 @@ export class KimiSdkProvider implements TransportProvider {
       const generation = ++state.turnGeneration;
       queuedGeneration = generation;
       (state.activePromptGenerations ??= new Set()).add(generation);
-      if (this.id === AGY_SDK_PROVIDER_ID) (state.agyForeground ??= new AgyForegroundOwnership()).register(generation,activePromptText,true);
+      if (this.id === AGY_SDK_PROVIDER_ID) {
+        const continuationBytes = state.acpSessionId
+          ? state.agyBridges?.get(state.acpSessionId)?.currentFileSize()
+          : undefined;
+        (state.agyForeground ??= new AgyForegroundOwnership()).register(
+          generation,
+          activePromptText,
+          true,
+          continuationBytes,
+        );
+      }
       const queuedPrompt = connection.prompt({
         sessionId: state.acpSessionId,
         prompt: [{ type: 'text', text: activePromptText }],
@@ -1557,23 +1567,30 @@ export class KimiSdkProvider implements TransportProvider {
       if (this.id === AGY_SDK_PROVIDER_ID) await state.agyBridges?.get(state.acpSessionId!)?.flush();
       this.assertCurrentSession(sessionId,state);
       if (!state.activePromptGenerations?.has(generation)) return;
-      const deferToRemainingOwner = owner?.authoritative
-        && !owner.hasBoundInput(generation)
-        && state.activePromptGenerations.size > 1;
+      let attributedRow: AgyTranscriptRow | undefined;
       if (owner?.authoritative
-        && !owner.hasBoundSuccessor(generation)
-        && !deferToRemainingOwner
+        && state.activePromptGenerations.size === 1
         && result.stopReason !== 'cancelled'
         && !compactControl) {
-        owner.settle(generation);
-        const output = await owner.output(generation);
-        this.assertCurrentSession(sessionId,state);
-        if (!state.activePromptGenerations?.has(generation)) return;
-        if (!output && !owner.hasBoundSuccessor(generation)) throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR,
-          'AG native foreground output could not be attributed before its deadline',true);
+        let targetGeneration = owner.resolveAggregateGeneration(generation);
+        while (true) {
+          owner.settle(targetGeneration);
+          const output = await owner.output(targetGeneration);
+          this.assertCurrentSession(sessionId,state);
+          if (!state.activePromptGenerations?.has(generation)) return;
+          if (state.activePromptGenerations.size > 1) break;
+          if (owner.hasBoundSuccessor(targetGeneration)) {
+            targetGeneration = owner.resolveAggregateGeneration(targetGeneration);
+            continue;
+          }
+          if (!output) throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+            'AG native foreground output could not be attributed before its deadline',true);
+          attributedRow = output;
+          break;
+        }
       }
       if (owner?.authoritative && state.activePromptGenerations.size === 1) {
-        const row = owner.latest?.row;
+        const row = attributedRow ?? owner.latest?.row;
         const text = compactControl ? '' : row?.content ?? '';
         // In async mode every published parent byte comes from the associated
         // native lane. Late ACP text/usage/turn_completed never enter here.
@@ -1586,7 +1603,9 @@ export class KimiSdkProvider implements TransportProvider {
       }
       this.capturePromptUsage(state,result);
       this.settleTurn(sessionId,state,generation,result.stopReason,contractKey,compactControl);
-    } finally { owner?.release(generation); }
+    } finally {
+      if ((state.activePromptGenerations?.size ?? 0) === 0) owner?.releaseTurn();
+    }
   }
 
   private capturePromptUsage(state: KimiSdkSessionState, result: PromptResponse): void {
@@ -1613,7 +1632,9 @@ export class KimiSdkProvider implements TransportProvider {
     if (this.profile.steeringPrompts) {
       if (!state.activePromptGenerations?.delete(generation)) return;
       state.steeringFailure ??= error;
-      state.agyForeground?.release(generation);
+      if (state.agyForeground && !state.agyForeground.hasBoundInput(generation)) {
+        state.agyForeground.release(generation);
+      }
       // A rejected steering request is NOT proof that the original task or
       // another admitted prompt stopped. Retain busy/text/tools until all
       // native RPCs settle (connection death rejects them all as well).

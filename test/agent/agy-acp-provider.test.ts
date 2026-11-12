@@ -321,6 +321,39 @@ describe('AG native ACP', () => {
     expect(deltas.mock.calls.filter(([,d])=>d.type==='text')).toHaveLength(0);
     expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
   });
+  it('keeps genuine G2 input logged after G2 RPC ACK attributable instead of dropping it as foreign (F1)',async()=>{
+    const {provider,requests}=await setup('native-steering-delayed-input');const id=await route(provider),done=vi.fn(),errors=vi.fn();provider.onComplete(done);provider.onError(errors);
+    await provider.send(id,'A');await vi.waitFor(()=>expect((provider as any).sessions.get(id).agyForeground?.authoritative).toBe(true), { timeout: 5000 });
+    expect(await provider.notifyActiveDelegation(id,notification('B','genuine steered prompt'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(done.mock.calls[0][1].content).toBe('STEERED DELAYED RESULT');
+    expect(done.mock.calls[0][1].metadata.usage).toMatchObject({input_tokens:400,output_tokens:5});
+    expect(errors).not.toHaveBeenCalled();
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(2);
+  });
+  it('does not promote pre-answer ask_question when G1 RPC settles before delayed continuation lands (F2: G1 first)',async()=>{
+    const {provider,requests}=await setup('absorbed-steering-g1-first-delayed');const id=await route(provider),done=vi.fn(),errors=vi.fn();provider.onComplete(done);provider.onError(errors);
+    await provider.send(id,'initial task');await vi.waitFor(()=>expect((provider as any).sessions.get(id).agyForeground?.authoritative).toBe(true), { timeout: 5000 });
+    expect(await provider.notifyActiveDelegation(id,notification('B','Proceed'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(done.mock.calls[0][1].content).toBe('ABSORBED FINAL G1-FIRST DELAYED');
+    expect(done.mock.calls[0][1].metadata.usage).toMatchObject({input_tokens:400,output_tokens:5});
+    expect(errors).not.toHaveBeenCalled();
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(2);
+  });
+  it('waits past pre-answer ask_question even when both G1 and G2 RPCs settle before delayed native continuation lands (F2: both RPCs first)',async()=>{
+    const {provider,requests}=await setup('absorbed-steering-both-before-native');const id=await route(provider),done=vi.fn(),errors=vi.fn();provider.onComplete(done);provider.onError(errors);
+    await provider.send(id,'initial task');await vi.waitFor(()=>expect((provider as any).sessions.get(id).agyForeground?.authoritative).toBe(true), { timeout: 5000 });
+    expect(await provider.notifyActiveDelegation(id,notification('B','Proceed'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    const state=(provider as any).sessions.get(id);
+    // Flush bridge after fixture appends delayed row at 55ms so host EMFILE inotify limits cannot mask bridge delivery.
+    setTimeout(()=>{ void state.agyBridges?.get(state.acpSessionId)?.flush(); }, 80);
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(done.mock.calls[0][1].content).toBe('ABSORBED FINAL BOTH-BEFORE-NATIVE');
+    expect(done.mock.calls[0][1].metadata.usage).toMatchObject({input_tokens:400,output_tokens:5});
+    expect(errors).not.toHaveBeenCalled();
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(2);
+  });
   it('waits on the native output event after prompt RPC settlement, not a dedup grace timer',async()=>{
     const {provider,requests}=await setup('native-child-output-after-ack');const id=await route(provider),done=vi.fn();provider.onComplete(done);
     await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });

@@ -150,6 +150,24 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
         ok(state.steeredRpc,{stopReason:'end_turn',usage:{inputTokens:100,outputTokens:2}});
         ok(req.id,{stopReason:'end_turn',usage:{inputTokens:300,outputTokens:3}});return;
       }
+      if (scenario==='native-steering-delayed-input') {
+        const dir=`${process.env.HOME}/.gemini/antigravity-cli/brain/${p.sessionId}/.system_generated/logs`;fs.mkdirSync(dir,{recursive:true});
+        const file=dir+'/transcript_full.jsonl',row=(step_index,type,content,extra={})=>JSON.stringify({step_index,type,content,status:'DONE',source:type==='USER_INPUT'?'USER_EXPLICIT':'MODEL',...extra})+'\n';
+        if (!state.steeringPass) {
+          state.steeringPass=1;state.steeredRpc=req.id;
+          fs.writeFileSync(file,row(0,'USER_INPUT',text));
+          note(p.sessionId,{sessionUpdate:'tool_call',toolCallId:'launch',title:'Run invoke_subagent',kind:'other',status:'in_progress',rawInput:{Role:'Child',Prompt:'work'}});
+          return;
+        }
+        // G2 RPC resolves first, before native logs G2's USER_EXPLICIT + output.
+        ok(req.id,{stopReason:'end_turn',usage:{inputTokens:300,outputTokens:3}});
+        setTimeout(()=>{
+          fs.appendFileSync(file,row(1,'USER_INPUT',text)+row(2,'PLANNER_RESPONSE','STEERED DELAYED RESULT'));
+          note(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'unattributed stale ACP'}});
+        },40);
+        setTimeout(()=>ok(state.steeredRpc,{stopReason:'end_turn',usage:{inputTokens:100,outputTokens:2}}),100);
+        return;
+      }
       if (scenario.startsWith('absorbed-steering-')) {
         const dir=`${process.env.HOME}/.gemini/antigravity-cli/brain/${p.sessionId}/.system_generated/logs`;fs.mkdirSync(dir,{recursive:true});
         const file=dir+'/transcript_full.jsonl',row=(step_index,type,content,extra={})=>JSON.stringify({step_index,type,content,status:'DONE',source:type==='USER_INPUT'?'USER_EXPLICIT':'MODEL',...extra})+'\n';
@@ -175,6 +193,18 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
             fs.appendFileSync(file,row(2,'PLANNER_RESPONSE','ABSORBED FINAL G2-FIRST'));
             ok(state.steeredRpc,{stopReason:'end_turn',usage:{inputTokens:150,outputTokens:4}});
           },40);
+          return;
+        }
+        if (scenario==='absorbed-steering-g1-first-delayed') {
+          ok(state.steeredRpc,{stopReason:'end_turn',usage:{inputTokens:100,outputTokens:2}});
+          setTimeout(()=>fs.appendFileSync(file,row(2,'USER_INPUT',text,{source:'USER_ANSWER'})+row(3,'PLANNER_RESPONSE','ABSORBED FINAL G1-FIRST DELAYED')),30);
+          setTimeout(()=>ok(req.id,{stopReason:'end_turn',usage:{inputTokens:300,outputTokens:3}}),70);
+          return;
+        }
+        if (scenario==='absorbed-steering-both-before-native') {
+          ok(state.steeredRpc,{stopReason:'end_turn',usage:{inputTokens:100,outputTokens:2}});
+          setTimeout(()=>ok(req.id,{stopReason:'end_turn',usage:{inputTokens:300,outputTokens:3}}),15);
+          setTimeout(()=>fs.appendFileSync(file,row(2,'USER_INPUT',text,{source:'USER_ANSWER'})+row(3,'PLANNER_RESPONSE','ABSORBED FINAL BOTH-BEFORE-NATIVE')),55);
           return;
         }
         if (scenario==='absorbed-steering-no-native') {
