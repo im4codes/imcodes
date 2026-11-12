@@ -6,6 +6,7 @@ import { renderHook, act } from '@testing-library/preact';
 import type { TimelineEvent, WsClient } from '../src/ws-client.js';
 import { TimelineDB } from '../src/timeline-db.js';
 import { TIMELINE_SNAPSHOT_STORAGE_PREFIX } from '../src/local-storage-quota.js';
+import { TIMELINE_MESSAGES } from '../../shared/timeline-protocol.js';
 import {
   __getTimelineCacheForTests,
   __resetTimelineCacheForTests,
@@ -438,7 +439,7 @@ describe('useTimeline incognito lifecycle & persistence isolation (F2)', () => {
       });
       // History & Replay batches mixing stale closed-private events with valid new-private events
       emit({
-        type: 'timeline.history',
+        type: TIMELINE_MESSAGES.HISTORY,
         sessionName: name,
         epoch: 123456,
         hasMore: false,
@@ -464,7 +465,7 @@ describe('useTimeline incognito lifecycle & persistence isolation (F2)', () => {
         ],
       });
       emit({
-        type: 'timeline.replay',
+        type: TIMELINE_MESSAGES.REPLAY,
         sessionName: name,
         epoch: 123456,
         truncated: false,
@@ -623,7 +624,7 @@ describe('useTimeline incognito lifecycle & persistence isolation (F2)', () => {
         }),
       });
       emit({
-        type: 'timeline.history',
+        type: TIMELINE_MESSAGES.HISTORY,
         sessionName: name,
         epoch: 123456,
         hasMore: false,
@@ -649,7 +650,7 @@ describe('useTimeline incognito lifecycle & persistence isolation (F2)', () => {
         ],
       });
       emit({
-        type: 'timeline.replay',
+        type: TIMELINE_MESSAGES.REPLAY,
         sessionName: name,
         epoch: 123456,
         truncated: false,
