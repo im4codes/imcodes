@@ -1621,6 +1621,23 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
         return c.json({ error: 1, message: 'share_revoked_or_downgraded' }, 403);
       }
 
+      // Check external disk modifications during download
+      let keyAtCommit: string;
+      try {
+        keyAtCommit = await resolveOnlyOfficeDocumentKey(claims.serverId, claims.path, {
+          allowedRoot: liveCommitAccess.allowedRoot ?? undefined,
+          db: c.env.DB,
+        });
+      } catch {
+        return c.json({ error: 1, message: 'durable_room_state_failed' }, 500);
+      }
+      if (claims.documentKey && keyAtCommit !== claims.documentKey) {
+        return c.json({ error: 1, message: 'stale_document_key' }, 409);
+      }
+      if (signedKey && keyAtCommit !== signedKey) {
+        return c.json({ error: 1, message: 'stale_document_key' }, 409);
+      }
+
       // Load authoritative PG room state under commit lock
       let state: DocumentVersionState | undefined = undefined;
       if (c.env.DB) {
@@ -1669,6 +1686,26 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
       } catch (walErr) {
         // If WAL cannot be recorded, abort immediately without modifying daemon binary
         return c.json({ error: 1, message: 'durable_room_state_failed' }, 500);
+      }
+
+      // Re-verify room authority post-WAL: ensure no concurrent writer committed between check and intent acquisition
+      if (c.env.DB) {
+        try {
+          const verifiedRoom = await loadPersistentRoomFromDb(c.env.DB, claims.serverId, claims.path);
+          if (
+            !verifiedRoom ||
+            verifiedRoom.commitSeq !== startCommitSeq ||
+            verifiedRoom.sessionEpoch !== startEpoch ||
+            verifiedRoom.activeKey !== currentKey
+          ) {
+            try {
+              await clearOnlyOfficeCommitJournalRecord(c.env.DB, claims.serverId, claims.path);
+            } catch { /* best effort */ }
+            return c.json({ error: 1, message: 'stale_document_commit_sequence' }, 409);
+          }
+        } catch {
+          return c.json({ error: 1, message: 'durable_room_state_failed' }, 500);
+        }
       }
 
       pendingCommitHashMap.set(mapKey, newDigest);

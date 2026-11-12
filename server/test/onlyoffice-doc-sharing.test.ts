@@ -2094,6 +2094,91 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
     expect.soft(Buffer.from(virtualFiles.get('/team/shared/spec.docx')!.content, 'base64').toString(), 'newer confirmed binary must not be overwritten by the stale callback').toBe(newer);
     expect.soft(store.rooms.get(mapKey)!.commit_seq, 'rejected stale callback must not publish another commit').toBe(authoritative.commit_seq);
   });
+
+  it('audit-r11: PG expected-version validation and intent acquisition must be atomic, not SELECT then unconditional WAL', async () => {
+    const res = await app.request('/api/server/srv-1/onlyoffice/config?path=%2Fteam%2Fshared%2Fspec.docx&mode=edit', {
+      headers: { Authorization: bearer('owner-1') },
+    });
+    expect(res.status).toBe(200);
+    const cfg = (await res.json()) as any;
+    const cb = new URL(cfg.config.editorConfig.callbackUrl);
+    const mapKey = 'srv-1:/team/shared/spec.docx';
+    const prior = { ...store.rooms.get(mapKey)! };
+    const newer = 'newer-commit-between-select-and-wal';
+    const digest = sha256Hex(newer);
+    let injected = 0;
+    const execute = store.db.execute.bind(store.db);
+    vi.spyOn(store.db, 'execute').mockImplementation(async (sql, params) => {
+      // Schedule another writer AFTER this callback read/checked expected PG state,
+      // but BEFORE its independent WAL INSERT acquires any durable write right.
+      if (sql.includes('INSERT INTO onlyoffice_commit_journal') && injected++ === 0) {
+        store.rooms.set(mapKey, {
+          ...prior,
+          current_confirmed_hash: digest,
+          committed_hash: digest,
+          last_force_saved_hash: digest,
+          commit_seq: prior.commit_seq + 1,
+          active: true,
+          updated_at: Date.now(),
+        });
+        virtualFiles.set('/team/shared/spec.docx', {
+          content: Buffer.from(newer).toString('base64'),
+          encoding: 'base64',
+          mtime: Date.now(),
+        });
+      }
+      return execute(sql, params);
+    });
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response('old-racing-callback-content', { status: 200 }));
+    const data = { status: 6, key: cfg.config.document.key, url: 'https://im.example.com/onlyoffice/cache/toctou.docx' };
+    const out = await app.request(cb.pathname + cb.search, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...data, token: signJwt(data, 'onlyoffice-jwt-secret-key-test!!', 300) }),
+    });
+    expect(injected).toBeGreaterThan(0);
+    expect.soft(out.status, 'another writer winning before WAL must invalidate this old expected version before file overwrite').toBe(409);
+    expect.soft(Buffer.from(virtualFiles.get('/team/shared/spec.docx')!.content, 'base64').toString(), 'newer winning bytes must survive').toBe(newer);
+  });
+
+  it('audit-r11: external disk changes while a callback downloads must still invalidate the old save', async () => {
+    const res = await app.request('/api/server/srv-1/onlyoffice/config?path=%2Fteam%2Fshared%2Fspec.docx&mode=edit', {
+      headers: { Authorization: bearer('owner-1') },
+    });
+    expect(res.status).toBe(200);
+    const cfg = (await res.json()) as any;
+    const cb = new URL(cfg.config.editorConfig.callbackUrl);
+    let release!: () => void;
+    let entered!: () => void;
+    const started = new Promise<void>((r) => {
+      entered = r;
+    });
+    const hold = new Promise<void>((r) => {
+      release = r;
+    });
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      entered();
+      await hold;
+      return new Response('old-office-content-before-external-edit', { status: 200 });
+    });
+    const data = { status: 6, key: cfg.config.document.key, url: 'https://im.example.com/onlyoffice/cache/external-during-download.docx' };
+    const pending = app.request(cb.pathname + cb.search, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...data, token: signJwt(data, 'onlyoffice-jwt-secret-key-test!!', 300) }),
+    });
+    await started;
+    const external = 'external-authoritative-disk-change-during-download';
+    virtualFiles.set('/team/shared/spec.docx', {
+      content: Buffer.from(external).toString('base64'),
+      encoding: 'base64',
+      mtime: Date.now(),
+    });
+    release();
+    const out = await pending;
+    expect.soft(out.status, 'disk version changed while downloading: the old room must lose write authority').toBe(409);
+    expect.soft(Buffer.from(virtualFiles.get('/team/shared/spec.docx')!.content, 'base64').toString(), 'external edits must not be overwritten by the old callback').toBe(external);
+  });
 });
 
 describe('Real Daemon CommandHandler Integration: Atomic Binary Save & Symlink Escape Prevention (F1 + F3d)', () => {
