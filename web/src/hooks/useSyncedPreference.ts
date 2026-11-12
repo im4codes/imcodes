@@ -1,50 +1,27 @@
-import { useState, useEffect, useRef } from 'preact/hooks';
+import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
+import { parseSyncedPreference, type SyncedPreferencePayload } from '@shared/synced-preference.js';
 import { getUserPref, saveUserPref } from '../api.js';
 import { safeLocalStorageSetItem } from '../local-storage-quota.js';
 
-/** Payload format stored in both localStorage and server. */
-interface SyncPayload<T> {
-  v: T;
-  t: number;
-}
-
 const LS_PREFIX = 'rcc_sync_';
-
-function lsKey(key: string, localScope?: string): string {
-  return `${LS_PREFIX}${localScope ? `${encodeURIComponent(localScope)}:` : ''}${key}`;
+function lsKey(key: string, scope?: string): string {
+  return `${LS_PREFIX}${scope ? `${encodeURIComponent(scope)}:` : ''}${key}`;
+}
+function readLocal<T>(storageKey: string): SyncedPreferencePayload<T> | null {
+  try { return parseSyncedPreference<T>(localStorage.getItem(storageKey)); } catch { return null; }
+}
+function localValue<T>(storageKey: string, fallback: T): T {
+  const local = readLocal<T>(storageKey);
+  return local === null ? fallback : local.v;
+}
+function writeLocal<T>(storageKey: string, payload: SyncedPreferencePayload<T>): void {
+  // Preferences are durable intent: quota recovery evicts volatile snapshots first.
+  safeLocalStorageSetItem(storageKey, JSON.stringify(payload));
 }
 
-function readFromLocalStorage<T>(key: string, localScope?: string): SyncPayload<T> | null {
-  try {
-    const raw = localStorage.getItem(lsKey(key, localScope));
-    if (!raw) return null;
-    return JSON.parse(raw) as SyncPayload<T>;
-  } catch {
-    return null;
-  }
-}
-
-function writeToLocalStorage<T>(key: string, payload: SyncPayload<T>, localScope?: string): void {
-  // Timeline/file-preview snapshots can fill the browser quota. Preferences
-  // are durable user intent, so route them through the shared quota recovery
-  // path which evicts volatile snapshots and retries instead of silently
-  // dropping the write.
-  safeLocalStorageSetItem(lsKey(key, localScope), JSON.stringify(payload));
-}
-
-/**
- * Generic write-through cache hook for server-synced preferences.
- *
- * - On mount: reads localStorage immediately (instant render), then fetches
- *   server async. Newer timestamp wins; if local is newer, pushes to server.
- * - On setValue: updates state + localStorage immediately, then debounces a
- *   server PUT.
- * - On unmount: cancels any pending debounced save.
- * - The third tuple item becomes true after server reconciliation completes.
- * - `localScope` isolates browser cache entries for account-specific callers;
- *   the server preference remains scoped by the authenticated user.
- *
- * Both localStorage and server store the same `{ v: T, t: number }` payload.
+/** Whole-value LWW cache. Inventory/render projections must never be saved here.
+ * Reconcile on mount/resume/reconnect; a failed read is not a missing preference.
+ * Scope changes cancel pending requests/timers and fence old render callbacks.
  */
 export function useSyncedPreference<T>(
   key: string,
@@ -52,132 +29,111 @@ export function useSyncedPreference<T>(
   debounceMs = 300,
   localScope?: string,
 ): [T, (value: T | ((prev: T) => T)) => void, boolean] {
-  const [value, setValueState] = useState<T>(() => {
-    const local = readFromLocalStorage<T>(key, localScope);
-    return local !== null ? local.v : defaultValue;
-  });
-
+  const storageKey = lsKey(key, localScope);
+  const owner = useRef({ storageKey, key });
+  if (owner.current.storageKey !== storageKey || owner.current.key !== key) owner.current = { storageKey, key };
+  const identity = owner.current;
+  const [state, setState] = useState(() => ({ identity, value: localValue(storageKey, defaultValue) }));
+  const [hydratedOwner, setHydratedOwner] = useState<typeof identity | null>(null);
+  const latest = useRef<{ identity: typeof identity; payload: SyncedPreferencePayload<T> | null } | null>(null);
+  if (latest.current?.identity !== identity) latest.current = { identity, payload: readLocal<T>(storageKey) };
+  const readLatest = () => {
+    const local = readLocal<T>(storageKey);
+    const memory = latest.current?.payload ?? null;
+    return local && (!memory || local.t >= memory.t) ? local : memory;
+  };
   const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [hydrated, setHydrated] = useState(false);
+  const controller = useRef<AbortController | null>(null);
 
-  // On mount: fetch server and reconcile timestamps.
   useEffect(() => {
+    const abort = new AbortController();
+    controller.current = abort;
     let cancelled = false;
-    setHydrated(false);
-    const initialLocal = readFromLocalStorage<T>(key, localScope);
-    setValueState(initialLocal !== null ? initialLocal.v : defaultValue);
+    let running = false;
+    let queued = false;
+    const active = () => !cancelled && owner.current === identity;
+    const apply = (payload: SyncedPreferencePayload<T>) => {
+      if (!active()) return;
+      latest.current = { identity, payload };
+      writeLocal(storageKey, payload);
+      setState({ identity, value: payload.v });
+    };
+    setState({ identity, value: localValue(storageKey, defaultValue) });
 
-    void (async () => {
-      const serverRaw = await getUserPref(key);
-      if (cancelled) return;
-
-      if (serverRaw == null) {
-        // No server value — push local value (if any) to server.
-        const local = readFromLocalStorage<T>(key, localScope);
-        if (local !== null) {
-          try {
-            await saveUserPref(key, JSON.stringify(local));
-          } catch (err) {
-            console.warn(`[useSyncedPreference] failed to push local pref "${key}" to server:`, err);
-          }
-        }
-        return;
-      }
-
-      // Server value exists — parse it.
-      let serverPayload: SyncPayload<T> | null = null;
-      try {
-        const raw = typeof serverRaw === 'string' ? serverRaw : JSON.stringify(serverRaw);
-        serverPayload = JSON.parse(raw) as SyncPayload<T>;
-      } catch {
-        console.warn(`[useSyncedPreference] could not parse server pref "${key}"`);
-        return;
-      }
-
-      if (!serverPayload || typeof serverPayload.t !== 'number') return;
-
-      const local = readFromLocalStorage<T>(key, localScope);
-
-      if (local === null || serverPayload.t >= local.t) {
-        // Server is newer (or no local) — update state and localStorage.
-        if (cancelled) return;
-        setValueState(serverPayload.v);
-        writeToLocalStorage(key, serverPayload, localScope);
-      } else {
-        // Local is newer — push to server.
+    const reconcile = async () => {
+      if (!active()) return;
+      if (running) { queued = true; return; }
+      running = true;
+      do {
+        queued = false;
         try {
-          await saveUserPref(key, JSON.stringify(local));
-        } catch (err) {
-          console.warn(`[useSyncedPreference] failed to push newer local pref "${key}" to server:`, err);
+          const raw = await getUserPref(key, { strict: true, signal: abort.signal });
+          if (!active()) return;
+          const remote = parseSyncedPreference<T>(raw);
+          const local = readLatest();
+          if (raw != null && !remote) continue; // corrupt/legacy data is not a reset
+          if (remote && (!local || remote.t >= local.t)) apply(remote);
+          else if (local) await saveUserPref(key, JSON.stringify(local), { signal: abort.signal });
+        } catch (error) {
+          if (active()) console.warn(`[useSyncedPreference] failed to reconcile pref "${key}":`, error);
+        } finally {
+          if (active()) setHydratedOwner(identity);
         }
+      } while (queued && active());
+      running = false;
+    };
+    const wake = () => { void reconcile(); };
+    const visible = () => { if (document.visibilityState === 'visible') wake(); };
+    const storage = (event: StorageEvent) => {
+      if (!active() || event.key !== storageKey) return;
+      const incoming = parseSyncedPreference<T>(event.newValue);
+      const local = readLatest();
+      if (incoming && (!local || incoming.t >= local.t)) apply(incoming);
+      else if (local && incoming && incoming.t < local.t) {
+        // An older tab may have overwritten the shared storage row already.
+        // Restore known intent too, so an offline reload cannot resurrect it.
+        writeLocal(storageKey, local);
       }
-    })().catch((err) => {
-      if (!cancelled) {
-        console.warn(`[useSyncedPreference] failed to fetch server pref "${key}":`, err);
-      }
-    }).finally(() => {
-      if (!cancelled) setHydrated(true);
-    });
-
+    };
+    wake();
+    window.addEventListener('online', wake);
+    window.addEventListener('focus', wake);
+    window.addEventListener('storage', storage);
+    document.addEventListener('visibilitychange', visible);
     return () => {
       cancelled = true;
+      abort.abort();
+      if (debounceTimer.current !== null) clearTimeout(debounceTimer.current);
+      debounceTimer.current = null;
+      window.removeEventListener('online', wake);
+      window.removeEventListener('focus', wake);
+      window.removeEventListener('storage', storage);
+      document.removeEventListener('visibilitychange', visible);
     };
+  // Default objects/arrays are often inline; scope/key alone define ownership.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key, localScope]);
+  }, [identity]);
 
-  // Cleanup debounce timer on unmount.
-  useEffect(() => {
-    return () => {
-      if (debounceTimer.current !== null) {
-        clearTimeout(debounceTimer.current);
-        debounceTimer.current = null;
-      }
+  const setValue = useCallback((updater: T | ((prev: T) => T)): void => {
+    if (owner.current !== identity) return;
+    const previous = readLatest();
+    const priorValue = previous ? previous.v : (state.identity === identity ? state.value : defaultValue);
+    const next = typeof updater === 'function' ? (updater as (prev: T) => T)(priorValue) : updater;
+    const payload: SyncedPreferencePayload<T> = { v: next, t: Math.max(Date.now(), (previous?.t ?? 0) + 1) };
+    latest.current = { identity, payload };
+    writeLocal(storageKey, payload);
+    setState({ identity, value: next });
+    if (debounceTimer.current !== null) clearTimeout(debounceTimer.current);
+    const save = () => {
+      debounceTimer.current = null;
+      if (owner.current !== identity || controller.current?.signal.aborted) return;
+      void saveUserPref(key, JSON.stringify(payload), { signal: controller.current?.signal }).catch((error) => {
+        if (owner.current === identity) console.warn(`[useSyncedPreference] failed to save pref "${key}":`, error);
+      });
     };
-  }, []);
+    if (debounceMs <= 0) save();
+    else debounceTimer.current = setTimeout(save, debounceMs);
+  }, [identity, storageKey, key, state, defaultValue, debounceMs]);
 
-  const setValue = (updater: T | ((prev: T) => T)): void => {
-    setValueState((prev) => {
-      const newValue = typeof updater === 'function'
-        ? (updater as (prev: T) => T)(prev)
-        : updater;
-
-      const previousLocal = readFromLocalStorage<T>(key, localScope);
-      const payload: SyncPayload<T> = {
-        v: newValue,
-        // Preserve strict last-write ordering even for two updates in the same
-        // millisecond. Equal timestamps let an older server value win on the
-        // next mount because reconciliation intentionally prefers server on a
-        // tie.
-        t: Math.max(Date.now(), (previousLocal?.t ?? 0) + 1),
-      };
-
-      // Write to localStorage synchronously (survives page close).
-      writeToLocalStorage(key, payload, localScope);
-
-      // Immediate mode is used for discrete, durable actions such as a tab
-      // drop. Starting the PUT in the same event prevents page refresh/unmount
-      // from cancelling a not-yet-fired timer and leaving the server on the old
-      // order.
-      if (debounceTimer.current !== null) {
-        clearTimeout(debounceTimer.current);
-        debounceTimer.current = null;
-      }
-      if (debounceMs <= 0) {
-        void saveUserPref(key, JSON.stringify(payload)).catch((err) => {
-          console.warn(`[useSyncedPreference] failed to save pref "${key}" to server:`, err);
-        });
-      } else {
-        debounceTimer.current = setTimeout(() => {
-          debounceTimer.current = null;
-          void saveUserPref(key, JSON.stringify(payload)).catch((err) => {
-            console.warn(`[useSyncedPreference] failed to save pref "${key}" to server:`, err);
-          });
-        }, debounceMs);
-      }
-
-      return newValue;
-    });
-  };
-
-  return [value, setValue, hydrated];
+  return [state.identity === identity ? state.value : localValue(storageKey, defaultValue), setValue, hydratedOwner === identity];
 }

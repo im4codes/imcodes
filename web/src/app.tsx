@@ -215,7 +215,7 @@ import {
 } from './session-list-merge.js';
 import { resolveSessionInfoRuntimeType } from './runtime-type.js';
 import { useSyncedPreference } from './hooks/useSyncedPreference.js';
-import { normalizePinnedServers, normalizeServerOrder, sortServersByPreference } from './server-order.js';
+import { normalizePinnedServers, normalizeServerOrder, toggleServerPin, sortServersByPreference } from './server-order.js';
 import { parseString, parseBooleanish, usePref } from './hooks/usePref.js';
 import { CLAUDE_WEEKLY_QUOTA_PREF_KEY } from '@shared/claude-quota.js';
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
@@ -2357,19 +2357,13 @@ export function App() {
     if (!serversLoaded || !serverOrderHydrated || !serverPinnedHydrated) return;
     const nextOrder = normalizeServerOrder(servers, serverOrder);
     if (JSON.stringify(nextOrder) !== JSON.stringify(serverOrder)) setServerOrder(nextOrder);
-    const nextPinned = normalizePinnedServers(servers, serverPinned);
-    if (JSON.stringify(nextPinned) !== JSON.stringify(serverPinned)) setServerPinned(nextPinned);
-  // The comparisons above prevent a persistence loop after reconciliation.
+    // Inventory may be partial (owned/shared discovery or an offline refresh).
+    // Filter pins only for rendering, never persist that projection as intent.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [servers, serversLoaded, serverOrder, serverPinned, serverOrderHydrated, serverPinnedHydrated]);
+  }, [servers, serversLoaded, serverOrder, serverOrderHydrated, serverPinnedHydrated]);
   const toggleServerPinned = useCallback((serverId: string) => {
-    setServerPinned((previous) => {
-      const current = normalizePinnedServers(servers, previous);
-      return current.includes(serverId)
-        ? current.filter((id) => id !== serverId)
-        : [...current, serverId];
-    });
-  }, [servers, setServerPinned]);
+    setServerPinned((previous) => toggleServerPin(previous, serverId));
+  }, [setServerPinned]);
   const [newUserGuidePref, setNewUserGuidePref] = useSyncedPreference<NewUserGuidePref>('new_user_guide', DEFAULT_NEW_USER_GUIDE_PREF, 0);
   const [teamDiscussionGuidePref, setTeamDiscussionGuidePref] = useSyncedPreference<TeamDiscussionGuidePref>('team_discussion_guide', DEFAULT_TEAM_DISCUSSION_GUIDE_PREF, 0);
   const [featureAnnouncementsPending, setFeatureAnnouncementsPending] = useState(true);

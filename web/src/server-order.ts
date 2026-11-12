@@ -59,3 +59,9 @@ export function normalizePinnedServers<T extends ServerOrderEntry>(
 ): string[] {
   return uniqueKnownIds([...servers], pinned);
 }
+
+/** Explicit user toggle, independent of a temporarily incomplete inventory. */
+export function toggleServerPin(pinned: readonly string[], serverId: string): string[] {
+  const current = [...new Set((Array.isArray(pinned) ? pinned : []).filter((id) => typeof id === 'string'))];
+  return current.includes(serverId) ? current.filter((id) => id !== serverId) : [...current, serverId];
+}

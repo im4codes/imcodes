@@ -12,6 +12,17 @@ function makeDb() {
 }
 
 describe('db queries contracts', () => {
+  it('keeps newer synced preferences when requests complete out of timestamp order', async () => {
+    let stored: string | null = null;
+    const db = makeDb();
+    db.queryOne.mockImplementation(async (sql: string) => sql.startsWith('SELECT value') && stored !== null ? { value: stored } : null);
+    db.execute.mockImplementation(async (_sql: string, params: unknown[]) => { stored = params[2] as string; return { changes: 1 }; });
+    const encode = (v: string[], t: number) => JSON.stringify(JSON.stringify({ v, t }));
+    await queries.setUserPref(db, 'user-1', 'server_pinned', encode(['keep'], 20));
+    await queries.setUserPref(db, 'user-1', 'server_pinned', encode([], 10));
+    expect(stored).toBe(encode(['keep'], 20));
+  });
+
   it('keeps controlled nodes out of full server listings while preserving legacy rows', async () => {
     const db = makeDb();
     db.query

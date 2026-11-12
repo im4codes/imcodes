@@ -55,7 +55,7 @@ describe('FeatureAnnouncement', () => {
 
     resolvePreference(JSON.stringify({ v: { dismissed: ['message-pins@1'] }, t: 10 }));
     await waitFor(() => expect(onPendingChange).toHaveBeenLastCalledWith(false));
-    expect(getUserPref).toHaveBeenCalledWith(FEATURE_ANNOUNCEMENTS_PREF_KEY);
+    expect(getUserPref).toHaveBeenCalledWith(FEATURE_ANNOUNCEMENTS_PREF_KEY, { strict: true, signal: expect.any(AbortSignal) });
     expect(screen.queryByTestId('feature-announcement')).toBeNull();
   });
 
