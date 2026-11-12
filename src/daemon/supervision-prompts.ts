@@ -292,6 +292,7 @@ export function buildBrainSupervisedWorkDelegationContract(
 export const BRAIN_PAIRS_SUPERVISED_WORK = {
   newWork: 'pair_create_with_brief_and_roles_then_pair_dispatch_if_queued',
   sameWork: 'append_to_the_same_executor_same_taskId',
+  taskSplitting: 'split_unrelated_tasks_into_separate_pairs_never_mix_unrelated_work_in_one_pair',
   material: 'executor_workspace_on_READY_FOR_AUDIT_relayed_by_daemon_worktree_and_head_or_task_dir_path',
   workspace: `${TASK_PAIR_WORKTREE_ONLY_WHEN_NECESSARY_TOKEN}_removed_7d_after_end`,
   deliverables: 'judge_by_task_type_keep_via_DONE_output=_copied_into_project_user_told_temporary_plain_DONE',
@@ -542,6 +543,7 @@ export const BRAIN_MANUAL_AUDITED_WORK = {
   pairs: {
     route: 'task_pair',
     open: ['pair_create with brief/executor/auditor', 'pair_dispatch only when pair_create returns queued'],
+    taskSplitting: 'split_unrelated_tasks_into_separate_pairs_never_mix_unrelated_work_in_one_pair',
     auditor: 'named_or_daemon_auto_pick',
     heartbeat: 'daemon_pair_heartbeat_when_supervision_on_see_pair_create_result',
     brainCronSelf: 'forbidden',

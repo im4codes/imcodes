@@ -718,6 +718,16 @@ export const TASK_PAIR_SCOPE_DECISION_RULE: string =
   + '(pair_task_update), so any current or future auditor audits the same '
   + 'scope; a decision sent only by message does not bind a replaced auditor.';
 
+/**
+ * Owner rule: unrelated tasks must be split rationally into separate task pairs
+ * rather than mixed together, keeping scopes, worktrees, audits and merges
+ * independent and clean.
+ */
+export const TASK_PAIR_SPLIT_UNRELATED_RULE: string =
+  'Split unrelated tasks (Brain): decompose unrelated goals, bugs or features '
+  + 'into separate, independently executed, audited and merged task pairs — never '
+  + 'mix unrelated work into one pair.';
+
 /** Short liveness rule shown with Brain decision notices. */
 export const TASK_PAIR_BRAIN_REPLY_RESOLUTION_RULE: string =
   'A plain reply to the participant (including delegation_reply) resolves the wait and stops reminders.';
@@ -2657,6 +2667,7 @@ export function buildTaskPairMarkerContract(): string {
     TASK_PAIR_CONVERGENCE_CHECKPOINT_RULE,
     TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE,
     TASK_PAIR_BRAIN_PAIR_CREATE_RULE,
+    TASK_PAIR_SPLIT_UNRELATED_RULE,
     TASK_PAIR_BRIEF_STRUCTURE_RULE,
     TASK_PAIR_ENVIRONMENT_PREFLIGHT_RULE,
     TASK_PAIR_BOUNDARY_AUDIT_RULE,
