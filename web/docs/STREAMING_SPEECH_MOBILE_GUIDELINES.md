@@ -79,6 +79,8 @@ Android Stop 等待 readerDone 后一次取走剩余输入。前一 session 的�
 Web Speech 平台自身的 `onend` 限制不是应用的可配置超时，普通模式应如实显示暂停，
 现有长笔记模式可按受限重启策略续录，不能承诺浏览器连续连接无限时长。
 Web Mobile Stop 保留 `onresult` 到 `onend` 再清理，新会话等待旧 Stop；
+转写 owner 的存活不代表电平麦克风仍可采集：getUserMedia 授权返回、RAF 执行/重排均须检查
+当前 generation 且仍 listening。Stop 立即关闭已取得资源，迟到授权立即 stop tracks，final 清理幂等兜底。
 仅停录阶段有 2s final-drain 兜底，缺失 `onend` 时保留最后文本并清理，不能挂住 UI。
 这是停录故障收尾上界，**不是持续录音时长上限**。
 

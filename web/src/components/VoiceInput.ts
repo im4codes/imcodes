@@ -213,10 +213,13 @@ function stopWebLevelMeter(): void {
 
 /** Best-effort waveform levels via Web Audio. Failure must not break recognition. */
 async function startWebLevelMeter(generation: number): Promise<void> {
+  // Transcript ownership intentionally survives Stop until final/onend, but
+  // microphone/RAF ownership ends immediately when capture stops.
+  const isCapturing = (): boolean => generation === _generation && _listening;
   try {
-    if (!navigator.mediaDevices?.getUserMedia) return;
+    if (!isCapturing() || !navigator.mediaDevices?.getUserMedia) return;
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    if (generation !== _generation) {
+    if (!isCapturing()) {
       stream.getTracks().forEach((t) => t.stop());
       return;
     }
@@ -231,7 +234,7 @@ async function startWebLevelMeter(generation: number): Promise<void> {
     source.connect(analyser);
     const data = new Uint8Array(analyser.frequencyBinCount);
     const tick = (): void => {
-      if (generation !== _generation) return;
+      if (!isCapturing()) return;
       analyser.getByteTimeDomainData(data);
       let sum = 0;
       for (let i = 0; i < data.length; i++) {
@@ -240,7 +243,7 @@ async function startWebLevelMeter(generation: number): Promise<void> {
       }
       const rms = Math.sqrt(sum / data.length);
       _onLevel?.(Math.min(1, rms * 3));
-      _webLevelRAF = requestAnimationFrame(tick);
+      if (isCapturing()) _webLevelRAF = requestAnimationFrame(tick);
     };
     _webLevelRAF = requestAnimationFrame(tick);
   } catch { /* no level meter; recognition still works */ }
@@ -317,6 +320,7 @@ function stopWebListening(): Promise<void> {
       if (finished) return;
       finished = true;
       clearTimeout(timer);
+      stopWebLevelMeter();
       rec.onend = null;
       rec.onresult = null;
       rec.onerror = null;
