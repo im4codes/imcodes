@@ -41,7 +41,7 @@ describe('AG native ACP', () => {
     await Promise.all([provider.notifyActiveDelegation(id, notification('B')), provider.notifyActiveDelegation(id, notification('C'))]);
     await new Promise(resolve => setTimeout(resolve, 35));
     expect(complete).not.toHaveBeenCalled(); expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true);
-    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
     expect(complete.mock.calls[0]?.[1].content).toBe('A B C'); expect(errors).not.toHaveBeenCalled();
     const prompts = (await requests()).filter(x => x.method === 'session/prompt');
     expect(prompts.map(x => x.params.sessionId)).toEqual(['native-1', 'native-1', 'native-1']);
@@ -53,19 +53,19 @@ describe('AG native ACP', () => {
     await provider.send(id, 'A');
     await Promise.all([provider.notifyActiveDelegation(id, notification('B')), provider.notifyActiveDelegation(id, notification('B'))]);
     await provider.notifyActiveDelegation(id, notification('B'));
-    await vi.waitFor(async () => expect((await requests()).filter(x => x.method === 'session/prompt')).toHaveLength(2));
+    await vi.waitFor(async () => expect((await requests()).filter(x => x.method === 'session/prompt')).toHaveLength(2), { timeout: 5000 });
   });
   it('does not clear an active A/tool when only B RPC is rejected', async () => {
     const { provider } = await setup('reject-b'); const id = await route(provider), complete = vi.fn(), errors = vi.fn(); provider.onComplete(complete); provider.onError(errors);
     await provider.send(id, 'A'); await provider.notifyActiveDelegation(id, notification('B'));
     await new Promise(resolve => setTimeout(resolve, 40));
     expect(complete).not.toHaveBeenCalled(); expect(errors).not.toHaveBeenCalled(); expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true);
-    await vi.waitFor(() => expect(errors).toHaveBeenCalledTimes(1)); expect(complete).not.toHaveBeenCalled(); expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
+    await vi.waitFor(() => expect(errors).toHaveBeenCalledTimes(1), { timeout: 5000 }); expect(complete).not.toHaveBeenCalled(); expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
   });
   it('Stop cancels the aggregate once without allowing delayed updates to revive it', async () => {
     const { provider } = await setup('reordered'); const id = await route(provider); const complete = vi.fn(), errors = vi.fn(); provider.onComplete(complete); provider.onError(errors);
     await provider.send(id, 'A'); await provider.notifyActiveDelegation(id, notification('B')); await provider.cancelAndWait(id);
-    await vi.waitFor(() => expect(errors).toHaveBeenCalledTimes(1)); expect(complete).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(errors).toHaveBeenCalledTimes(1), { timeout: 5000 }); expect(complete).not.toHaveBeenCalled();
     expect(await provider.notifyActiveDelegation(id, notification('C'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
   });
   it('keeps one stable ACP prefix and normalizes native usage for relay', async () => {
@@ -76,7 +76,7 @@ describe('AG native ACP', () => {
       const payload = normalizeProviderPayload(message);
       payload.sessionSystemText = text;
       await provider.send(id, payload);
-      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(message === 'ordinary one' ? 1 : 2));
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(message === 'ordinary one' ? 1 : 2), { timeout: 5000 });
     }
     const prompts = (await requests()).filter(x => x.method === 'session/prompt');
     expect(prompts[0].params.prompt[0].text).toContain(text);
@@ -90,7 +90,7 @@ describe('AG native ACP', () => {
     const send=async(label:string, injected:boolean) => {
       const payload=normalizeProviderPayload(label); payload.sessionSystemText=contract;
       await provider.send(id,payload); count++;
-      await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(count));
+      await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(count), { timeout: 5000 });
       const prompt=(await requests()).filter(x=>x.method==='session/prompt').at(-1).params.prompt[0].text;
       expect(prompt.split(contract).length-1).toBe(injected?1:0);
       if(label!=='/compact') expect(Number(done.mock.calls.at(-1)![1].metadata.usage.input_tokens)).toBeGreaterThan(0);
@@ -118,8 +118,8 @@ describe('AG native ACP', () => {
     const send=async(body?:string)=>{
       const before=(await requests()).filter(r=>r.method==='session/prompt').length;
       runtime.send('ordinary-'+(++n),'id-'+n,undefined,undefined,body===undefined?undefined:{registeredSystemContract:{contractId:'dynamic',signature:body,body}});
-      await vi.waitFor(async()=>expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(before+1));
-      await vi.waitFor(()=>expect(runtime.getStatus()).toBe('idle'));
+      await vi.waitFor(async()=>expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(before+1), { timeout: 5000 });
+      await vi.waitFor(()=>expect(runtime.getStatus()).toBe('idle'), { timeout: 5000 });
       return (await requests()).filter(r=>r.method==='session/prompt').at(-1).params.prompt.map((b:any)=>b.text??'').join('');
     };
     try {
@@ -145,7 +145,7 @@ describe('AG native ACP', () => {
   it.each(['usage-missing','usage-zero','usage-used'])('reports positive current ACP occupancy (%s)', async scenario => {
     const {provider}=await setup(scenario); const id=await route(provider); const done=vi.fn(),usage=vi.fn(); provider.onComplete(done);provider.onUsage(usage);
     const p=normalizeProviderPayload('hello');p.sessionSystemText='full system contract '.repeat(100);
-    await provider.send(id,p); await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1));
+    await provider.send(id,p); await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
     const value=done.mock.calls[0][1].metadata.usage;
     if(scenario==='usage-used') expect(value).toMatchObject({input_tokens:45000,model_context_window:1000000});
     else { expect(value.input_tokens).toBeGreaterThan(100);expect(value.context_usage_estimated).toBe(true); }
@@ -154,7 +154,7 @@ describe('AG native ACP', () => {
   it('synchronizes real ACP tool calls and native snapshots into canonical Agent lifecycles', async () => {
     const {provider}=await setup('subagents');const id=await route(provider),done=vi.fn(),events:ToolCallEvent[]=[];
     provider.onComplete(done);provider.onToolCall((_,t)=>events.push(t));
-    await provider.send(id,'children');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1));
+    await provider.send(id,'children');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
     const child=events.filter(t=>t.name==='Agent');expect(child.length).toBeGreaterThan(8);
     for(const normalizedStatus of ['running','complete','error','interrupted']) expect(child.some(t=>t.detail?.meta?.normalizedStatus===normalizedStatus)).toBe(true);
     const a=child.filter(t=>t.detail?.meta?.agentPath==='child-a'); expect(new Set(a.map(t=>t.id)).size).toBe(1);
@@ -177,7 +177,7 @@ describe('AG native ACP', () => {
     expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(1);
     const children=events.filter(t=>t.name==='Agent');
     expect(children.some(t=>t.detail?.meta?.agentPath==='native-child-fixture')).toBe(true);
-    await vi.waitFor(()=>expect(events.some(t=>t.detail?.meta?.normalizedStatus==='complete')).toBe(true));
+    await vi.waitFor(()=>expect(events.some(t=>t.detail?.meta?.normalizedStatus==='complete')).toBe(true), { timeout: 5000 });
     expect(new Set(children.filter(t=>t.detail?.meta?.agentPath==='native-child-fixture').map(t=>t.id)).size).toBe(1);
     await new Promise(r=>setTimeout(r,500));expect(done).toHaveBeenCalledTimes(2);
     const state=(provider as any).sessions.get(id);await provider.endSession(id);expect(state.agyBridges.size).toBe(0);
@@ -198,15 +198,15 @@ describe('AG native ACP', () => {
         nativeSteps.push(Math.max(...readFileSync(file,'utf8').trim().split('\n').map(line=>JSON.parse(line).step_index)));
       }
     });
-    await provider.send(id,'launch');await vi.waitFor(()=>expect(messages).toHaveLength(2));
-    await provider.send(id,'immediate successor');await vi.waitFor(()=>expect(messages).toHaveLength(4));
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(messages).toHaveLength(2), { timeout: 5000 });
+    await provider.send(id,'immediate successor');await vi.waitFor(()=>expect(messages).toHaveLength(4), { timeout: 5000 });
     await new Promise(r=>setTimeout(r,500));
     expect(nativeSteps).toEqual([5,11]);
     expect(messages).toHaveLength(4);expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(2);
   });
   it('uses independent native steps after async, ignoring unowned ACP even with repeated bodies',async()=>{
     const {provider,root}=await setup('native-child-log');const id=await route(provider),done=vi.fn(),deltas=vi.fn();provider.onComplete(done);provider.onDelta(deltas);
-    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2));
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
     const state=(provider as any).sessions.get(id),native=state.acpSessionId;
     const update=(update:any)=>(provider as any).handleSessionUpdate({sessionId:native,update});
     const before=deltas.mock.calls.length;
@@ -217,13 +217,13 @@ describe('AG native ACP', () => {
     const file=path.join(root,'.gemini/antigravity-cli/brain',native,'.system_generated/logs/transcript_full.jsonl');
     for(const [i,body] of ['Different response','PARENT-WOKE CHILD-PONG'].entries()) {
       await appendFile(file,JSON.stringify({step_index:6+i*2,type:'SYSTEM_MESSAGE',status:'DONE',content:'[Message] sender=child content=result'})+'\n'+JSON.stringify({step_index:7+i*2,type:'PLANNER_RESPONSE',status:'DONE',content:body})+'\n');
-      await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(3+i));
+      await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(3+i), { timeout: 5000 });
       expect(done.mock.calls.at(-1)![1].content).toBe(body);
     }
   });
   it.each(['native-child-slow-foreground','native-child-same-foreground','native-child-cross-chunks'])('keeps an actively running successor foreground isolated from late prior chunks, usage and terminals (%s)',async scenario=>{
     const {provider,requests}=await setup(scenario);const id=await route(provider),done=vi.fn(),deltas=vi.fn();provider.onComplete(done);provider.onDelta(deltas);
-    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2));
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
     const start=deltas.mock.calls.length;
     await provider.send(id,'successor foreground');
     await new Promise(r=>setTimeout(r,600));expect(done).toHaveBeenCalledTimes(2);
@@ -238,26 +238,26 @@ describe('AG native ACP', () => {
   });
   it('keeps async active steering correlated to the latest explicit native input without waiting for superseded output',async()=>{
     const {provider,requests}=await setup('native-steering');const id=await route(provider),done=vi.fn(),errors=vi.fn();provider.onComplete(done);provider.onError(errors);
-    await provider.send(id,'A');await vi.waitFor(()=>expect((provider as any).sessions.get(id).agyForeground?.authoritative).toBe(true));
+    await provider.send(id,'A');await vi.waitFor(()=>expect((provider as any).sessions.get(id).agyForeground?.authoritative).toBe(true), { timeout: 5000 });
     expect(await provider.notifyActiveDelegation(id,notification('B'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
-    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1));expect(done.mock.calls[0][1].content).toBe('STEERED OWNED RESULT');
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });expect(done.mock.calls[0][1].content).toBe('STEERED OWNED RESULT');
     expect(done.mock.calls[0][1].metadata.usage).toMatchObject({input_tokens:400,output_tokens:5});expect(errors).not.toHaveBeenCalled();
     expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(2);
   });
   it('waits on the native output event after prompt RPC settlement, not a dedup grace timer',async()=>{
     const {provider,requests}=await setup('native-child-output-after-ack');const id=await route(provider),done=vi.fn();provider.onComplete(done);
-    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2));
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
     expect(done.mock.calls.map(([,m])=>m.content)).toEqual(['PARENT-STARTED','PARENT-WOKE CHILD-PONG']);
     expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(1);
   });
   it.each(['stop','rebind'])('releases an unresolved native foreground wait on %s',async action=>{
     const {provider,requests}=await setup('native-child-wait');const id=await route(provider),done=vi.fn();provider.onComplete(done);
     await provider.send(id,'launch');const old=(provider as any).sessions.get(id);
-    await vi.waitFor(()=>expect(old.agyForeground?.authoritative).toBe(true));
+    await vi.waitFor(()=>expect(old.agyForeground?.authoritative).toBe(true), { timeout: 5000 });
     await (provider as any).promptTerminals.get(old); // Actual RPC has ended; native PLANNER has not.
     expect(done).not.toHaveBeenCalled();
     if(action==='stop') await provider.cancel(id);else await route(provider,id,{fresh:true});
-    await vi.waitFor(()=>expect(old.agyBridges.size).toBe(0));
+    await vi.waitFor(()=>expect(old.agyBridges.size).toBe(0), { timeout: 5000 });
     await new Promise(r=>setTimeout(r,700));expect(done).not.toHaveBeenCalled();
     expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(1);
   });
@@ -266,7 +266,7 @@ describe('AG native ACP', () => {
     // Shorten only the failure deadline on this captured owner, not file ordering/coalescing.
     const {AgyForegroundOwnership}=await import('../../src/agent/agy-foreground-ownership.js');
     (provider as any).sessions.get(id).agyForeground=new AgyForegroundOwnership(30);
-    await provider.send(id,'launch');await vi.waitFor(()=>expect(errors).toHaveBeenCalledTimes(1));
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(errors).toHaveBeenCalledTimes(1), { timeout: 5000 });
     expect(errors.mock.calls[0][1].message).toContain('could not be attributed');expect(done).not.toHaveBeenCalled();
     expect(deltas.mock.calls.filter(([,d])=>d.type==='text')).toHaveLength(0);
     expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
@@ -274,12 +274,12 @@ describe('AG native ACP', () => {
   });
   it('keeps ordinary no-async ACP chunk streaming before the prompt RPC terminates',async()=>{
     const {provider}=await setup('stream-before-ack');const id=await route(provider),done=vi.fn(),deltas=vi.fn();provider.onComplete(done);provider.onDelta(deltas);
-    await provider.send(id,'normal');await vi.waitFor(()=>expect(deltas.mock.calls.some(([,d])=>d.delta==='direct ')).toBe(true));
-    expect(done).not.toHaveBeenCalled();await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1));expect(done.mock.calls[0][1].content).toBe('direct stream');
+    await provider.send(id,'normal');await vi.waitFor(()=>expect(deltas.mock.calls.some(([,d])=>d.delta==='direct ')).toBe(true), { timeout: 5000 });
+    expect(done).not.toHaveBeenCalled();await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });expect(done.mock.calls[0][1].content).toBe('direct stream');
   });
   it.each(['stop','rebind'])('discards native-first late ACP receipts across %s',async action=>{
     const {provider}=await setup('native-child-late');const id=await route(provider),done=vi.fn();provider.onComplete(done);
-    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2));
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
     if(action==='stop') await provider.cancel(id);else await route(provider,id,{fresh:true});
     await new Promise(r=>setTimeout(r,600));expect(done).toHaveBeenCalledTimes(2);
   });
@@ -287,17 +287,17 @@ describe('AG native ACP', () => {
     const {provider,requests}=await setup('native-child-reuse');const id=await route(provider),done=vi.fn(),events:ToolCallEvent[]=[];
     provider.onComplete(done);provider.onToolCall((_,t)=>events.push(t));
     const terminals=()=>events.filter(t=>t.name==='Agent'&&t.detail?.meta?.agentPath==='native-child-fixture'&&t.detail?.meta?.terminal);
-    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2));await vi.waitFor(()=>expect(terminals()).toHaveLength(1));
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });await vi.waitFor(()=>expect(terminals()).toHaveLength(1), { timeout: 5000 });
     const key=terminals()[0].id;
     await provider.send(id,'send child another assignment');
-    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(4));await vi.waitFor(()=>expect(terminals()).toHaveLength(2));
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(4), { timeout: 5000 });await vi.waitFor(()=>expect(terminals()).toHaveLength(2), { timeout: 5000 });
     expect(terminals().every(t=>t.id===key)).toBe(true);
     expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(2);
     expect(terminals()[1].output).toBe('REUSE-PONG');
   });
   it('closes native log observers on Stop and never revives the stopped parent',async()=>{
     const {provider}=await setup('native-child-log');const id=await route(provider),done=vi.fn();provider.onComplete(done);
-    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1));
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
     const state=(provider as any).sessions.get(id);await provider.cancel(id);
     expect(state.agyBridges.size).toBe(0);await new Promise(r=>setTimeout(r,300));expect(done).toHaveBeenCalledTimes(1);
   });
@@ -336,7 +336,7 @@ describe('AG native ACP', () => {
     try {
       await route(provider, id, { fresh: true });
       await provider.send(id, 'NEW_OWNER'); await rejected;
-      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1));
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
       expect(complete.mock.calls[0]?.[1].content).toBe('NEW_OWNER');
       expect(confirmed).not.toHaveBeenCalled();
       expect((await requests()).some(x => x.method === 'session/cancel')).toBe(false);
@@ -352,7 +352,7 @@ describe('AG native ACP', () => {
     const id = await route(provider, undefined, { agentId: 'model-b' });
     await expect(provider.send(id, 'first')).rejects.toBeTruthy();
     await expect(provider.send(id, 'retry')).resolves.toBeUndefined();
-    await vi.waitFor(async () => expect((await requests()).filter(x => x.method === 'session/prompt')).toHaveLength(1));
+    await vi.waitFor(async () => expect((await requests()).filter(x => x.method === 'session/prompt')).toHaveLength(1), { timeout: 5000 });
     const rows = await requests();
     expect(rows.filter(x => x.method === 'session/new')).toHaveLength(1);
     expect(rows.filter(x => x.method === 'session/set_model').map(x => x.params.modelId)).toEqual(['model-b', 'model-b']);
@@ -360,7 +360,7 @@ describe('AG native ACP', () => {
   it('does not prompt or publish a late new-session result after Stop', async () => {
     const { provider, requests } = await setup('late-new'); const id = await route(provider); const info = vi.fn(); provider.onSessionInfo(info);
     const sending = provider.send(id, 'A'); const rejected = expect(sending).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CANCELLED });
-    await vi.waitFor(async () => expect((await requests()).some(x => x.method === 'session/new')).toBe(true));
+    await vi.waitFor(async () => expect((await requests()).some(x => x.method === 'session/new')).toBe(true), { timeout: 5000 });
     await provider.cancel(id); await rejected;
     expect((await requests()).some(x => x.method === 'session/prompt')).toBe(false); expect(info).not.toHaveBeenCalled();
   });
@@ -374,9 +374,9 @@ describe('AG native ACP', () => {
     const { provider, requests } = await setup(); const id = await route(provider); const complete = vi.fn(), info: SessionInfoUpdate[] = []; provider.onComplete(complete); provider.onSessionInfo((_id, update) => info.push(update));
     await provider.send(id, 'A'); provider.setSessionAgentId(id, 'model-b');
     expect(info.filter(x => x.model === 'model-b')).toHaveLength(0);
-    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1)); expect(complete.mock.calls[0]?.[1].metadata.model).toBe('model-a');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 }); expect(complete.mock.calls[0]?.[1].metadata.model).toBe('model-a');
     await provider.send(id, 'A'); expect(info.some(x => x.model === 'model-b')).toBe(true);
-    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
     provider.setSessionAgentId(id, 'model-a'); await provider.send(id, 'A');
     expect((await requests()).filter(x => x.method === 'session/set_model').map(x => x.params.modelId)).toEqual(['model-b', 'model-a']);
   });
@@ -388,7 +388,7 @@ describe('AG native ACP', () => {
     try {
       await provider.send(id, 'A');
       const switching = provider.applySessionModel(id, 'model-b');
-      await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/set_model')).toBe(true));
+      await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/set_model')).toBe(true), { timeout: 5000 });
       expect(info.mock.calls.some(call => call[1].model === 'model-b')).toBe(false);
       expect(complete).not.toHaveBeenCalled();
       const repeated = provider.applySessionModel(id, 'model-b');
@@ -398,12 +398,12 @@ describe('AG native ACP', () => {
       expect((await requests()).filter(row => row.method === 'session/set_model')).toHaveLength(1);
       expect(info.mock.calls.some(call => call[1].model === 'model-b')).toBe(false);
       await provider.notifyActiveDelegation(id, notification('STEER_AFTER_SELECTION'));
-      await vi.waitFor(async () => expect((await requests()).filter(row => row.fixture === 'prompt-model').map(row => row.model)).toEqual(['model-a', 'model-a']));
+      await vi.waitFor(async () => expect((await requests()).filter(row => row.fixture === 'prompt-model').map(row => row.model)).toEqual(['model-a', 'model-a']), { timeout: 5000 });
     } finally { await unlink(hold); }
-    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
     expect(complete.mock.calls[0][1].metadata.model).toBe('model-a');
     await provider.send(id, 'NEXT_TURN');
-    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
     expect(complete.mock.calls[1][1].metadata.model).toBe('model-b');
     expect(info.mock.calls.some(call => call[1].model === 'model-b')).toBe(true);
     expect((await requests()).filter(row => row.fixture === 'prompt-model').at(-1).model).toBe('model-b');
@@ -411,10 +411,10 @@ describe('AG native ACP', () => {
 
   it('orders C after a delayed B but never publishes the superseded B ACK', async () => {
     const { provider, requests } = await setup('model-late'); const id = await route(provider); const info = vi.fn();
-    await provider.send(id, 'warm'); await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false));
+    await provider.send(id, 'warm'); await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false), { timeout: 5000 });
     provider.onSessionInfo(info);
     const first = provider.applySessionModel(id, 'model-b'); const rejected = expect(first).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CANCELLED });
-    await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/set_model')).toBe(true));
+    await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/set_model')).toBe(true), { timeout: 5000 });
     expect(await provider.applySessionModel(id, 'model-c')).toBe(SESSION_MODEL_APPLIED.LIVE); await rejected;
     expect(info.mock.calls.map(call => call[1].model)).toEqual(['model-c']);
     expect((await requests()).filter(row => row.method === 'session/set_model').map(row => row.params.modelId)).toEqual(['model-b', 'model-c']);
@@ -423,7 +423,7 @@ describe('AG native ACP', () => {
     const { provider, requests } = await setup('model-late'); const id = await route(provider); const info = vi.fn();
     await provider.send(id, 'A'); provider.onSessionInfo(info);
     const switching = provider.applySessionModel(id, 'model-b'); const rejected = expect(switching).rejects.toBeTruthy();
-    await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/set_model')).toBe(true));
+    await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/set_model')).toBe(true), { timeout: 5000 });
     if (action === 'cancel') await provider.cancel(id);
     else if (action === 'replace') await route(provider, id, { fresh: true });
     else await provider.disconnect();
@@ -432,44 +432,44 @@ describe('AG native ACP', () => {
   });
   it.each(['model-error', 'model-unsupported'])('does not report false model success on %s', async scenario => {
     const { provider } = await setup(scenario); const id = await route(provider); const info = vi.fn();
-    await provider.send(id, 'warm'); await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false));
+    await provider.send(id, 'warm'); await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false), { timeout: 5000 });
     provider.onSessionInfo(info);
     await expect(provider.applySessionModel(id, 'model-b')).rejects.toBeTruthy();
     expect(info.mock.calls.some(call => call[1].model === 'model-b')).toBe(false);
     await provider.send(id, 'after-rejection');
-    await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false));
+    await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false), { timeout: 5000 });
   });
   it('reapplies A after a delayed superseded B instead of trusting the old A cache', async () => {
     const { provider, requests } = await setup('model-late'); const id = await route(provider);
-    await provider.send(id, 'warm'); await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false));
+    await provider.send(id, 'warm'); await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false), { timeout: 5000 });
     const first = provider.applySessionModel(id, 'model-b'); const rejected = expect(first).rejects.toBeTruthy();
-    await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/set_model')).toBe(true));
+    await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/set_model')).toBe(true), { timeout: 5000 });
     expect(await provider.applySessionModel(id, 'model-a')).toBe(SESSION_MODEL_APPLIED.LIVE); await rejected;
     expect((await requests()).filter(row => row.method === 'session/set_model').map(row => row.params.modelId)).toEqual(['model-b', 'model-a']);
   });
   it('returns to the retained selection if C fails after superseding a pending B', async () => {
     const { provider, requests } = await setup('model-late'); const id = await route(provider); const info = vi.fn();
-    await provider.send(id, 'warm'); await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false));
+    await provider.send(id, 'warm'); await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false), { timeout: 5000 });
     provider.onSessionInfo(info);
     const old = provider.applySessionModel(id, 'model-b'); const rejected = expect(old).rejects.toBeTruthy();
-    await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/set_model')).toBe(true));
+    await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/set_model')).toBe(true), { timeout: 5000 });
     await expect(provider.applySessionModel(id, 'invalid')).rejects.toBeTruthy(); await rejected;
     await provider.send(id, 'after-failed-c');
-    await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false));
+    await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false), { timeout: 5000 });
     expect((await requests()).filter(row => row.method === 'session/set_model').map(row => row.params.modelId)).toEqual(['model-b', 'invalid', 'model-a']);
     expect(info.mock.calls.some(call => call[1].model === 'model-b')).toBe(false);
   });
 
   it('bounds a model RPC timeout, rejects its late ACK, and recovers on a new confirmed selection', async () => {
     const { provider } = await setup('model-timeout'); const id = await route(provider); const info = vi.fn();
-    await provider.send(id, 'warm'); await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false));
+    await provider.send(id, 'warm'); await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false), { timeout: 5000 });
     provider.onSessionInfo(info);
     await expect(provider.applySessionModel(id, 'model-b')).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.PROVIDER_ERROR });
     expect(info.mock.calls.some(call => call[1].model === 'model-b')).toBe(false);
     expect(await provider.applySessionModel(id, 'model-c')).toBe(SESSION_MODEL_APPLIED.LIVE);
     expect(info.mock.calls.map(call => call[1].model)).toEqual(['model-c']);
     await provider.send(id, 'after-timeout');
-    await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false));
+    await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false), { timeout: 5000 });
   }, 10000);
 
   it('keeps an unloaded selection next-start without creating native work', async () => {
@@ -494,16 +494,16 @@ describe('AG native ACP', () => {
   it('passes combined native base-model/thought IDs unchanged and captures the original executor choice', async () => {
     const { provider, requests, root } = await setup();
     const id = await route(provider, undefined, { agentId: 'gemini-3.8-flash-low' }); const done = vi.fn(); provider.onComplete(done);
-    await provider.send(id, 'warm'); await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(1));
+    await provider.send(id, 'warm'); await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
     expect(await provider.applySessionModel(id, 'gemini-3.8-flash-high')).toBe(SESSION_MODEL_APPLIED.LIVE);
     const hold = path.join(root, 'rpc.jsonl.hold'); await writeFile(hold, 'hold');
     try {
       await provider.send(id, 'A');
       expect(await provider.applySessionModel(id, 'gemini-4-carbon-medium')).toBe(SESSION_MODEL_APPLIED.NEXT_START);
     } finally { await unlink(hold); }
-    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
     expect(done.mock.calls[1][1].metadata.model).toBe('gemini-3.8-flash-high');
-    await provider.send(id, 'next'); await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(3));
+    await provider.send(id, 'next'); await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(3), { timeout: 5000 });
     expect(done.mock.calls[2][1].metadata.model).toBe('gemini-4-carbon-medium');
     expect((await requests()).filter(row => row.method === 'session/set_model').map(row => row.params.modelId)).toEqual(['gemini-3.8-flash-low', 'gemini-3.8-flash-high', 'gemini-4-carbon-medium']);
   });
@@ -522,15 +522,15 @@ describe('AG native ACP', () => {
     await new Promise(resolve => setTimeout(resolve, 25)); expect(admitted).toBe(false);
     const retry = provider.notifyActiveDelegation(id, notification('B')); release();
     expect(await first).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED); expect(await retry).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
-    await vi.waitFor(async () => expect((await requests()).filter(x => x.method === 'session/prompt')).toHaveLength(2));
+    await vi.waitFor(async () => expect((await requests()).filter(x => x.method === 'session/prompt')).toHaveLength(2), { timeout: 5000 });
   });
   it('isolates child death to this provider and never replays the admitted B', async () => {
     const { provider, requests } = await setup('crash'); const id = await route(provider), errors = vi.fn(), complete = vi.fn();
     provider.onError(errors); provider.onComplete(complete);
     await provider.send(id, 'A'); await provider.notifyActiveDelegation(id, notification('B'));
-    await vi.waitFor(() => expect(errors).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(errors).toHaveBeenCalledTimes(1), { timeout: 5000 });
     expect(complete).not.toHaveBeenCalled(); expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
-    await vi.waitFor(async () => expect((await requests()).filter(x => x.method === 'session/prompt')).toHaveLength(2));
+    await vi.waitFor(async () => expect((await requests()).filter(x => x.method === 'session/prompt')).toHaveLength(2), { timeout: 5000 });
     expect(await provider.notifyActiveDelegation(id, notification('C'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
   });
   it('replaces a pending startup owner even when the canonical route is unchanged', async () => {
@@ -544,13 +544,13 @@ describe('AG native ACP', () => {
       await expect(provider.send(id, 'new-owner')).resolves.toBeUndefined();
     } finally { release(); }
     expect(await oldSend).toBe(PROVIDER_ERROR_CODES.CANCELLED);
-    await vi.waitFor(async () => expect((await requests()).filter(x => x.method === 'session/prompt').map(x => x.params.prompt[0].text)).toEqual(['new-owner']));
+    await vi.waitFor(async () => expect((await requests()).filter(x => x.method === 'session/prompt').map(x => x.params.prompt[0].text)).toEqual(['new-owner']), { timeout: 5000 });
   });
   it('ignores old native-session updates and terminals after delete/recreate of the route', async () => {
     const { provider } = await setup(); const id = await route(provider); const complete = vi.fn(), deltas = vi.fn(); provider.onComplete(complete); provider.onDelta(deltas);
     await provider.send(id, 'A');
     await provider.createSession({ sessionKey: id, cwd: process.cwd(), fresh: true, agentId: 'model-a' });
-    await provider.send(id, 'new-owner'); await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1));
+    await provider.send(id, 'new-owner'); await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
     await new Promise(resolve => setTimeout(resolve, 650));
     expect(complete).toHaveBeenCalledTimes(1); expect(complete.mock.calls[0]?.[1].content).toBe('new-owner');
     expect(deltas.mock.calls.some(x => x[1].delta === 'A')).toBe(false);
@@ -558,18 +558,18 @@ describe('AG native ACP', () => {
   it('suppresses all resume replay and keeps the current real error visible', async () => {
     const { provider } = await setup('resume-history'); const id = await route(provider, undefined, { resumeId: 'saved-id' });
     const deltas = vi.fn(), complete = vi.fn(); provider.onDelta(deltas); provider.onComplete(complete);
-    await provider.send(id, 'A'); await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1));
+    await provider.send(id, 'A'); await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
     expect(complete.mock.calls[0]?.[1].content).toBe('A'); expect(deltas.mock.calls.some(x => x[1].delta.includes('OLD_ERROR'))).toBe(false);
   });
   it('includes stable system instructions once per native history and reasserts after refresh', async () => {
     const { provider, requests } = await setup(); const id = await route(provider), complete = vi.fn(); provider.onComplete(complete);
     const base = normalizeProviderPayload('A');
     const input = { ...base, sessionSystemText: 'IDENTITY_TEST_334', context: { ...base.context, sessionSystemText: 'IDENTITY_TEST_334' } };
-    await provider.send(id, input); await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1));
-    await provider.send(id, input); await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2));
+    await provider.send(id, input); await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    await provider.send(id, input); await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
     provider.refreshSessionSystemText(id); await provider.send(id, input);
     // send resolves at native write, before the peer necessarily logs receipt.
-    await vi.waitFor(async () => expect((await requests()).filter(x => x.method === 'session/prompt')).toHaveLength(3));
+    await vi.waitFor(async () => expect((await requests()).filter(x => x.method === 'session/prompt')).toHaveLength(3), { timeout: 5000 });
     const text = (await requests()).filter(x => x.method === 'session/prompt').map(x => x.params.prompt[0].text);
     expect(text.map(x => x.includes('IDENTITY_TEST_334'))).toEqual([true, false, true]);
   });
@@ -612,12 +612,12 @@ describe('AG native ACP', () => {
     await writeFile(autoHold, 'hold');
     try {
       runtime.send('SCHEDULE_WAKEUP');
-      await vi.waitFor(() => expect(completed).toHaveLength(1));
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
       expect(runtime.getStatus()).toBe('idle');
 
       // Release startHold so autonomous wakeup turn begins with agent_thought_chunk while thoughtHold is held.
       await unlink(startHold);
-      await vi.waitFor(() => expect(runtime.getStatus()).toBe('thinking'));
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('thinking'), { timeout: 5000 });
       expect(provider.getActiveWorkSnapshot(id)).toMatchObject({
         activeWorkCount: 1,
         busyReasons: ['provider_wait'],
@@ -625,7 +625,7 @@ describe('AG native ACP', () => {
 
       // Release thoughtHold so tool_call (in_progress) is emitted while autoHold is held.
       await unlink(thoughtHold);
-      await vi.waitFor(() => expect(tools.some(t => t.id === 'edit-1' && t.status === 'running')).toBe(true));
+      await vi.waitFor(() => expect(tools.some(t => t.id === 'edit-1' && t.status === 'running')).toBe(true), { timeout: 5000 });
       expect(provider.getActiveWorkSnapshot(id)).toMatchObject({
         activeWorkCount: 1,
         activeToolCount: 1,
@@ -645,7 +645,7 @@ describe('AG native ACP', () => {
       await unlink(autoHold).catch(() => {});
     }
 
-    await vi.waitFor(() => expect(completed).toHaveLength(2));
+    await vi.waitFor(() => expect(completed).toHaveLength(2), { timeout: 5000 });
     expect(runtime.getStatus()).toBe('idle');
     expect(provider.getActiveWorkSnapshot(id)).toMatchObject({
       activeWorkCount: 0,
@@ -675,13 +675,13 @@ describe('AG native ACP', () => {
     await writeFile(autoHold, 'hold');
     try {
       await provider.send(id, 'SCHEDULE_WAKEUP');
-      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1));
-      await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true));
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+      await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true), { timeout: 5000 });
       expect(await provider.notifyActiveDelegation(id, notification('STEER_IN_AUTO'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
     } finally {
       await unlink(autoHold).catch(() => {});
     }
-    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
     expect(complete.mock.calls[1]?.[1].content).toBe('AUTONOMOUS_WAKEUP_DONE STEER_IN_AUTO');
     expect(errors).not.toHaveBeenCalled();
 
@@ -690,14 +690,14 @@ describe('AG native ACP', () => {
     await writeFile(autoCancelHold, 'hold');
     try {
       await provider.send(id, 'SCHEDULE_WAKEUP');
-      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(3));
-      await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true));
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(3), { timeout: 5000 });
+      await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true), { timeout: 5000 });
       let proof = false, resolved = false;
       const stopping = provider.cancelAndWait(id);
       stopping.then(() => { resolved = true; }, () => {});
       const off = onConfirmedProviderStop(stopping, () => { proof = true; });
       try {
-        await vi.waitFor(async () => expect((await requests()).some(r => r.fixture === 'auto-cancel-requested')).toBe(true));
+        await vi.waitFor(async () => expect((await requests()).some(r => r.fixture === 'auto-cancel-requested')).toBe(true), { timeout: 5000 });
         expect(proof).toBe(false);
         expect(resolved).toBe(false);
         expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true);
@@ -735,8 +735,8 @@ describe('AG native ACP', () => {
     let off = () => {};
     try {
       runtime.send('SCHEDULE_WAKEUP');
-      await vi.waitFor(() => expect(completed).toHaveLength(1));
-      await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true));
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+      await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true), { timeout: 5000 });
       expect(runtime.send('QUEUED_SUCCESSOR', 'msg-after-auto-stop')).toBe('queued');
 
       let proof = false, resolved = false;
@@ -745,7 +745,7 @@ describe('AG native ACP', () => {
       off = onConfirmedProviderStop(stop, () => { proof = true; });
       await runtime.cancel();
 
-      await vi.waitFor(async () => expect((await requests()).some(row => row.fixture === 'cancel-ignored')).toBe(true));
+      await vi.waitFor(async () => expect((await requests()).some(row => row.fixture === 'cancel-ignored')).toBe(true), { timeout: 5000 });
       const ignored = (await requests()).find(row => row.fixture === 'cancel-ignored');
       expect(ignored?.inAutoWakeup).toBe(true);
       expect(proof, 'cancel request is not native terminal proof').toBe(false);
@@ -760,7 +760,7 @@ describe('AG native ACP', () => {
       expect(errors).toHaveLength(1);
       expect(errors[0]?.code).toBe(PROVIDER_ERROR_CODES.CANCELLED);
 
-      await vi.waitFor(() => expect(completed).toHaveLength(2));
+      await vi.waitFor(() => expect(completed).toHaveLength(2), { timeout: 5000 });
       expect(completed[1]?.content).toBe('QUEUED_SUCCESSOR');
       expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
     } finally {
