@@ -270,4 +270,269 @@ describe('useTimeline incognito lifecycle & persistence isolation (F2)', () => {
     expect(localStorage.getItem(snapKey)).toContain('NORMAL-SAME-DAEMON-EPOCH');
     expect(localStorage.getItem(snapKey)).not.toContain('STALE-PRIVATE-LEAK');
   });
+
+  it('drops delayed frames and stale re-registrations from a closed private instance without wiping the new private transcript (F2-R3)', async () => {
+    const serverId = `srv-f2-r3-${Math.random().toString(36).slice(2)}`;
+    const name = 'deck_priv_reuse_brain';
+    const cacheKey = `${serverId}:${name}`;
+    const snapKey = `${TIMELINE_SNAPSHOT_STORAGE_PREFIX}${cacheKey}`;
+    const putSpy = vi.spyOn(TimelineDB.prototype, 'putEvents').mockResolvedValue(undefined);
+
+    // 1. Old private instance opens, receives events + coalesced streaming delta, and closes
+    syncIncognitoTimelineSessions(serverId, [
+      { name, incognito: true, sessionInstanceId: 'priv-old', runtimeEpoch: 'rt-old' },
+    ]);
+    ingestTimelineEventForCache(makeEvent({
+      eventId: 'p-old-1',
+      sessionId: name,
+      epoch: 123456,
+      seq: 1,
+      sessionInstanceId: 'priv-old',
+      runtimeEpoch: 'rt-old',
+      payload: { text: 'OLD-PRIVATE-SECRET', streaming: false, incognito: true },
+    }), serverId);
+    ingestTimelineEventForCache(makeEvent({
+      eventId: 'p-old-stream',
+      sessionId: name,
+      epoch: 123456,
+      seq: 2,
+      sessionInstanceId: 'priv-old',
+      runtimeEpoch: 'rt-old',
+      payload: { text: 'OLD-PRIVATE-STREAMING', streaming: true, incognito: true },
+    }), serverId);
+    forgetIncognitoTimelineSessions(serverId, name);
+
+    // 2. New private instance opens with the same (serverId, sessionName) on the same daemon epoch
+    syncIncognitoTimelineSessions(serverId, [
+      { name, incognito: true, sessionInstanceId: 'priv-new', runtimeEpoch: 'rt-new' },
+    ]);
+    ingestTimelineEventForCache(makeEvent({
+      eventId: 'p-cur-1',
+      sessionId: name,
+      epoch: 123456,
+      seq: 1,
+      sessionInstanceId: 'priv-new',
+      runtimeEpoch: 'rt-new',
+      payload: { text: 'CURRENT-PRIVATE', streaming: false, incognito: true },
+    }), serverId);
+    expect(__getTimelineCacheForTests(cacheKey)?.map((e) => e.payload?.text)).toEqual(['CURRENT-PRIVATE']);
+
+    // 3. Delayed frame + stale session_list carrying old private identity must both be dropped
+    ingestTimelineEventForCache(makeEvent({
+      eventId: 'p-old-late',
+      sessionId: name,
+      epoch: 123456,
+      seq: 3,
+      sessionInstanceId: 'priv-old',
+      runtimeEpoch: 'rt-old',
+      payload: { text: 'LATE-CLOSED-PRIVATE', streaming: false, incognito: true },
+    }), serverId);
+    ingestTimelineEventForCache(makeEvent({
+      eventId: 'p-old-late-stream',
+      sessionId: name,
+      epoch: 123456,
+      seq: 4,
+      sessionInstanceId: 'priv-old',
+      runtimeEpoch: 'rt-old',
+      payload: { text: 'LATE-CLOSED-STREAMING', streaming: true, incognito: true },
+    }), serverId);
+    registerIncognitoTimelineSession(serverId, name, { sessionInstanceId: 'priv-old', runtimeEpoch: 'rt-old' });
+
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    __flushTimelineSnapshotsBeforeFreezeForTests();
+
+    expect(__getTimelineCacheForTests(cacheKey)?.map((e) => e.payload?.text)).toEqual(['CURRENT-PRIVATE']);
+    expect(isIncognitoTimelineSession(serverId, name)).toBe(true);
+    expect(putSpy).not.toHaveBeenCalled();
+    expect(localStorage.getItem(snapKey)).toBeNull();
+  });
+
+  it('rejects closed private instance frames across mounted WS events, user.message reconciliation, history, and replay batches (F2-R3)', async () => {
+    const serverId = `srv-f2-ws-${Math.random().toString(36).slice(2)}`;
+    const name = 'deck_priv_ws_brain';
+    const cacheKey = `${serverId}:${name}`;
+    const snapKey = `${TIMELINE_SNAPSHOT_STORAGE_PREFIX}${cacheKey}`;
+    const putSpy = vi.spyOn(TimelineDB.prototype, 'putEvents').mockResolvedValue(undefined);
+    const handlers = new Set<(msg: Record<string, unknown>) => void>();
+
+    const ws = {
+      connected: true,
+      onMessage: (cb: (msg: Record<string, unknown>) => void) => {
+        handlers.add(cb);
+        return () => handlers.delete(cb);
+      },
+      onSessionMessage: (_sid: string, cb: (msg: Record<string, unknown>) => void) => {
+        handlers.add(cb);
+        return () => handlers.delete(cb);
+      },
+      send: vi.fn(),
+      sendTimelineHistoryRequest: vi.fn(),
+    } as unknown as WsClient;
+
+    const emit = (msg: Record<string, unknown>) => {
+      for (const h of handlers) h(msg);
+    };
+
+    // Old private instance starts and closes, leaving tombstone for priv-old / rt-old
+    syncIncognitoTimelineSessions(serverId, [
+      { name, incognito: true, sessionInstanceId: 'priv-old', runtimeEpoch: 'rt-old' },
+    ]);
+    const { result } = renderHook(() => useTimeline(name, ws, serverId, { incognito: true, isActiveSession: true }));
+    expect(handlers.size).toBeGreaterThan(0);
+
+    // Queue a streaming delta from old instance, then close and launch new private instance before RAF flushes
+    act(() => {
+      emit({
+        type: 'timeline.event',
+        event: makeEvent({
+          eventId: 'p-old-queued-stream',
+          sessionId: name,
+          epoch: 123456,
+          seq: 1,
+          sessionInstanceId: 'priv-old',
+          runtimeEpoch: 'rt-old',
+          payload: { text: 'OLD-QUEUED-STREAM', streaming: true, incognito: true },
+        }),
+      });
+      forgetIncognitoTimelineSessions(serverId, name);
+      syncIncognitoTimelineSessions(serverId, [
+        { name, incognito: true, sessionInstanceId: 'priv-new', runtimeEpoch: 'rt-new' },
+      ]);
+      emit({
+        type: 'timeline.event',
+        event: makeEvent({
+          eventId: 'p-new-live',
+          sessionId: name,
+          epoch: 123456,
+          seq: 1,
+          sessionInstanceId: 'priv-new',
+          runtimeEpoch: 'rt-new',
+          payload: { text: 'CURRENT-PRIVATE', streaming: false, incognito: true },
+        }),
+      });
+      // Late WS live event + inline user.message from closed old private instance
+      emit({
+        type: 'timeline.event',
+        event: makeEvent({
+          eventId: 'p-old-ws-late',
+          sessionId: name,
+          epoch: 123456,
+          seq: 2,
+          sessionInstanceId: 'priv-old',
+          runtimeEpoch: 'rt-old',
+          payload: { text: 'LATE-WS-CLOSED-PRIVATE', streaming: false, incognito: true },
+        }),
+      });
+      emit({
+        type: 'timeline.event',
+        event: makeEvent({
+          eventId: 'p-old-user-late',
+          sessionId: name,
+          epoch: 123456,
+          seq: 3,
+          type: 'user.message',
+          sessionInstanceId: 'priv-old',
+          runtimeEpoch: 'rt-old',
+          payload: { text: 'LATE-USER-CLOSED-PRIVATE', incognito: true },
+        }),
+      });
+      // History & Replay batches mixing stale closed-private events with valid new-private events
+      emit({
+        type: 'timeline.history',
+        sessionName: name,
+        epoch: 123456,
+        hasMore: false,
+        events: [
+          makeEvent({
+            eventId: 'p-old-hist',
+            sessionId: name,
+            epoch: 123456,
+            seq: 4,
+            sessionInstanceId: 'priv-old',
+            runtimeEpoch: 'rt-old',
+            payload: { text: 'LATE-HISTORY-CLOSED-PRIVATE', streaming: false, incognito: true },
+          }),
+          makeEvent({
+            eventId: 'p-new-hist',
+            sessionId: name,
+            epoch: 123456,
+            seq: 2,
+            sessionInstanceId: 'priv-new',
+            runtimeEpoch: 'rt-new',
+            payload: { text: 'NEW-PRIVATE-HISTORY', streaming: false, incognito: true },
+          }),
+        ],
+      });
+      emit({
+        type: 'timeline.replay',
+        sessionName: name,
+        epoch: 123456,
+        truncated: false,
+        events: [
+          makeEvent({
+            eventId: 'p-old-replay',
+            sessionId: name,
+            epoch: 123456,
+            seq: 5,
+            sessionInstanceId: 'priv-old',
+            runtimeEpoch: 'rt-old',
+            payload: { text: 'LATE-REPLAY-CLOSED-PRIVATE', streaming: false, incognito: true },
+          }),
+          makeEvent({
+            eventId: 'p-new-replay',
+            sessionId: name,
+            epoch: 123456,
+            seq: 3,
+            sessionInstanceId: 'priv-new',
+            runtimeEpoch: 'rt-new',
+            payload: { text: 'NEW-PRIVATE-REPLAY', streaming: false, incognito: true },
+          }),
+        ],
+      });
+    });
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    });
+    __flushTimelineSnapshotsBeforeFreezeForTests();
+
+    const texts = result.current.events.map((e) => e.payload?.text);
+    expect(texts).toEqual(['CURRENT-PRIVATE', 'NEW-PRIVATE-HISTORY', 'NEW-PRIVATE-REPLAY']);
+    expect(__getTimelineCacheForTests(cacheKey)?.map((e) => e.payload?.text)).toEqual([
+      'CURRENT-PRIVATE',
+      'NEW-PRIVATE-HISTORY',
+      'NEW-PRIVATE-REPLAY',
+    ]);
+    expect(putSpy).not.toHaveBeenCalled();
+    expect(localStorage.getItem(snapKey)).toBeNull();
+  });
+
+  it('continues accepting legacy new private frames without per-instance metadata after closing an older private instance (F2-R3)', () => {
+    const serverId = `srv-f2-legacy-${Math.random().toString(36).slice(2)}`;
+    const name = 'deck_priv_legacy_brain';
+    const cacheKey = `${serverId}:${name}`;
+
+    registerIncognitoTimelineSession(serverId, name, { sessionInstanceId: 'priv-old', runtimeEpoch: 'rt-old' });
+    forgetIncognitoTimelineSessions(serverId, name);
+    registerIncognitoTimelineSession(serverId, name);
+
+    ingestTimelineEventForCache(makeEvent({
+      eventId: 'p-legacy-new',
+      sessionId: name,
+      epoch: 123456,
+      seq: 1,
+      payload: { text: 'NEW-PRIVATE-NO-META', streaming: false, incognito: true },
+    }), serverId);
+    ingestTimelineEventForCache(makeEvent({
+      eventId: 'p-old-late-after-nometa',
+      sessionId: name,
+      epoch: 123456,
+      seq: 2,
+      sessionInstanceId: 'priv-old',
+      runtimeEpoch: 'rt-old',
+      payload: { text: 'LATE-OLD-PRIVATE', streaming: false, incognito: true },
+    }), serverId);
+
+    expect(__getTimelineCacheForTests(cacheKey)?.map((e) => e.payload?.text)).toEqual(['NEW-PRIVATE-NO-META']);
+  });
 });

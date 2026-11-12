@@ -1085,25 +1085,46 @@ function resetTransientTimelineState(cacheKey: string): void {
   getTimelineStore(cacheKey).reset();
 }
 
+const MAX_CLOSED_PRIVATE_INSTANCES = 32;
+
+function addBoundedPrivateId(set: Set<string>, value: string): void {
+  if (!value) return;
+  if (set.has(value)) set.delete(value);
+  set.add(value);
+  while (set.size > MAX_CLOSED_PRIVATE_INSTANCES) {
+    const oldest = set.values().next().value;
+    if (oldest === undefined) break;
+    set.delete(oldest);
+  }
+}
+
 function recordPrivateInstanceMetadata(state: IncognitoCacheEntry, event: TimelineEvent): void {
-  if (event.sessionInstanceId) state.privateInstanceIds.add(event.sessionInstanceId);
-  if (event.runtimeEpoch) state.privateRuntimeEpochs.add(event.runtimeEpoch);
+  if (event.sessionInstanceId) addBoundedPrivateId(state.privateInstanceIds, event.sessionInstanceId);
+  if (event.runtimeEpoch) addBoundedPrivateId(state.privateRuntimeEpochs, event.runtimeEpoch);
   // Only fall back to daemon event.epoch when neither session/event carries
   // per-instance identity, so normal reuse on the same daemon is never blocked.
   if (!state.sessionInstanceId && !state.runtimeEpoch && !event.sessionInstanceId && !event.runtimeEpoch) {
     const ep = eventEpochKey(event);
-    if (ep) state.privateFallbackEpochs.add(ep);
+    if (ep) addBoundedPrivateId(state.privateFallbackEpochs, ep);
   }
 }
 
-function hasMatchingClosedPrivateInstance(state: IncognitoCacheEntry, event: TimelineEvent): boolean {
-  if (event.sessionInstanceId && state.privateInstanceIds.has(event.sessionInstanceId) && state.sessionInstanceId !== event.sessionInstanceId) {
+function hasMatchingClosedPrivateMeta(
+  state: IncognitoCacheEntry,
+  instanceId: string | undefined,
+  runtimeEpoch: string | undefined,
+): boolean {
+  if (instanceId && state.privateInstanceIds.has(instanceId) && state.sessionInstanceId !== instanceId) {
     return true;
   }
-  if (event.runtimeEpoch && state.privateRuntimeEpochs.has(event.runtimeEpoch) && state.runtimeEpoch !== event.runtimeEpoch) {
+  if (runtimeEpoch && state.privateRuntimeEpochs.has(runtimeEpoch) && state.runtimeEpoch !== runtimeEpoch) {
     return true;
   }
   return false;
+}
+
+function hasMatchingClosedPrivateInstance(state: IncognitoCacheEntry, event: TimelineEvent): boolean {
+  return hasMatchingClosedPrivateMeta(state, event.sessionInstanceId, event.runtimeEpoch);
 }
 
 function hasNewPrivateInstanceIdentity(state: IncognitoCacheEntry, event: TimelineEvent): boolean {
@@ -1124,15 +1145,20 @@ function forgetIncognitoTimelineKey(cacheKey: string): void {
   const state = incognitoCacheState.get(cacheKey);
   if (!state) return;
   resetTransientTimelineState(cacheKey);
-  if (state.sessionInstanceId) state.privateInstanceIds.add(state.sessionInstanceId);
-  if (state.runtimeEpoch) state.privateRuntimeEpochs.add(state.runtimeEpoch);
+  if (state.sessionInstanceId) addBoundedPrivateId(state.privateInstanceIds, state.sessionInstanceId);
+  if (state.runtimeEpoch) addBoundedPrivateId(state.privateRuntimeEpochs, state.runtimeEpoch);
+  state.sessionInstanceId = undefined;
+  state.runtimeEpoch = undefined;
   state.mode = 'closed-tombstone';
   setIncognitoTimelineKeyActive(cacheKey, false);
 }
 
 function markPrivateTimelineEvents(cacheKey: string, events: TimelineEvent[]): TimelineEvent[] {
   const state = incognitoCacheState.get(cacheKey);
-  const hasPrivatePayload = events.some(event => isIncognitoSession(event.payload));
+  const nonClosedEvents = state
+    ? events.filter((event) => !hasMatchingClosedPrivateInstance(state, event))
+    : events;
+  const hasPrivatePayload = nonClosedEvents.some(event => isIncognitoSession(event.payload));
   if (hasPrivatePayload && (!state || state.mode === 'incognito')) {
     const next = state ?? getOrCreateIncognitoState(cacheKey);
     next.mode = 'incognito';
@@ -1140,17 +1166,19 @@ function markPrivateTimelineEvents(cacheKey: string, events: TimelineEvent[]): T
   }
   const activeState = incognitoCacheState.get(cacheKey);
   if (activeState?.mode === 'incognito' || activeState?.mode === 'closed-tombstone') {
-    for (const event of events) {
+    for (const event of nonClosedEvents) {
       recordPrivateInstanceMetadata(activeState, event);
     }
-    return events.map(event => isIncognitoSession(event.payload) ? event : { ...event, payload: { ...event.payload, ...INCOGNITO_TIMELINE_PAYLOAD } });
+    return nonClosedEvents.map(event => isIncognitoSession(event.payload) ? event : { ...event, payload: { ...event.payload, ...INCOGNITO_TIMELINE_PAYLOAD } });
   }
-  return events;
+  return nonClosedEvents;
 }
 
 function shouldDropIncomingTimelineEvent(cacheKey: string, event: TimelineEvent): boolean {
   const state = incognitoCacheState.get(cacheKey);
   if (!state) return false;
+  // Closed private instances stay tombstoned across subsequent private or normal opens.
+  if (hasMatchingClosedPrivateInstance(state, event)) return true;
   const ep = eventEpochKey(event);
   const payloadPrivate = isIncognitoSession(event.payload);
   if (state.mode === 'incognito') {
@@ -1158,14 +1186,10 @@ function shouldDropIncomingTimelineEvent(cacheKey: string, event: TimelineEvent)
     return false;
   }
   if (state.mode === 'closed-tombstone') {
-    const stalePrivateInstance = Boolean(
-      (event.sessionInstanceId && state.privateInstanceIds.has(event.sessionInstanceId))
-      || (event.runtimeEpoch && state.privateRuntimeEpochs.has(event.runtimeEpoch)),
-    );
     const staleFallbackEpoch = !state.sessionInstanceId && !state.runtimeEpoch
       && !event.sessionInstanceId && !event.runtimeEpoch
       && ep !== undefined && state.privateFallbackEpochs.has(ep);
-    if (payloadPrivate || stalePrivateInstance || staleFallbackEpoch) {
+    if (payloadPrivate || staleFallbackEpoch) {
       recordPrivateInstanceMetadata(state, event);
       return true;
     }
@@ -1178,7 +1202,6 @@ function shouldDropIncomingTimelineEvent(cacheKey: string, event: TimelineEvent)
     return false;
   }
   // state.mode === 'normal'
-  if (hasMatchingClosedPrivateInstance(state, event)) return true;
   if (payloadPrivate) {
     // Only flip a known normal session to incognito on a live event when the
     // event carries a distinct private sessionInstanceId or runtimeEpoch.
@@ -1188,17 +1211,22 @@ function shouldDropIncomingTimelineEvent(cacheKey: string, event: TimelineEvent)
       setIncognitoTimelineKeyActive(cacheKey, true);
       if (event.sessionInstanceId) {
         state.sessionInstanceId = event.sessionInstanceId;
-        state.privateInstanceIds.add(event.sessionInstanceId);
+        addBoundedPrivateId(state.privateInstanceIds, event.sessionInstanceId);
       }
       if (event.runtimeEpoch) {
         state.runtimeEpoch = event.runtimeEpoch;
-        state.privateRuntimeEpochs.add(event.runtimeEpoch);
+        addBoundedPrivateId(state.privateRuntimeEpochs, event.runtimeEpoch);
       }
       return false;
     }
     return true;
   }
   return false;
+}
+
+function filterAcceptedTimelineEvents(cacheKey: string | null | undefined, events: TimelineEvent[]): TimelineEvent[] {
+  if (!cacheKey || events.length === 0) return events;
+  return events.filter((event) => !shouldDropIncomingTimelineEvent(cacheKey, event));
 }
 
 export function registerIncognitoTimelineSession(
@@ -1210,6 +1238,9 @@ export function registerIncognitoTimelineSession(
   const state = getOrCreateIncognitoState(cacheKey);
   const nextInstanceId = meta?.sessionInstanceId || undefined;
   const nextEpoch = meta?.runtimeEpoch !== undefined ? String(meta.runtimeEpoch) : undefined;
+  if (hasMatchingClosedPrivateMeta(state, nextInstanceId, nextEpoch)) {
+    return;
+  }
   const instanceChanged = Boolean(
     (nextInstanceId && state.sessionInstanceId && nextInstanceId !== state.sessionInstanceId)
     || (nextEpoch && state.runtimeEpoch && nextEpoch !== state.runtimeEpoch)
@@ -1217,8 +1248,8 @@ export function registerIncognitoTimelineSession(
   );
   if (state.mode !== 'incognito' || instanceChanged) {
     if (state.mode === 'incognito') {
-      if (state.sessionInstanceId) state.privateInstanceIds.add(state.sessionInstanceId);
-      if (state.runtimeEpoch) state.privateRuntimeEpochs.add(state.runtimeEpoch);
+      if (state.sessionInstanceId) addBoundedPrivateId(state.privateInstanceIds, state.sessionInstanceId);
+      if (state.runtimeEpoch) addBoundedPrivateId(state.privateRuntimeEpochs, state.runtimeEpoch);
     }
     resetTransientTimelineState(cacheKey);
   }
@@ -1226,11 +1257,11 @@ export function registerIncognitoTimelineSession(
   setIncognitoTimelineKeyActive(cacheKey, true);
   if (nextInstanceId !== undefined) {
     state.sessionInstanceId = nextInstanceId;
-    state.privateInstanceIds.add(nextInstanceId);
+    addBoundedPrivateId(state.privateInstanceIds, nextInstanceId);
   }
   if (nextEpoch !== undefined) {
     state.runtimeEpoch = nextEpoch;
-    state.privateRuntimeEpochs.add(nextEpoch);
+    addBoundedPrivateId(state.privateRuntimeEpochs, nextEpoch);
   }
 }
 
@@ -1247,9 +1278,12 @@ export function registerNormalTimelineSession(
     if (!nextInstanceId && !nextEpoch) return;
     state = getOrCreateIncognitoState(cacheKey);
   }
+  if (hasMatchingClosedPrivateMeta(state, nextInstanceId, nextEpoch)) {
+    return;
+  }
   if (state.mode === 'incognito') {
-    if (state.sessionInstanceId) state.privateInstanceIds.add(state.sessionInstanceId);
-    if (state.runtimeEpoch) state.privateRuntimeEpochs.add(state.runtimeEpoch);
+    if (state.sessionInstanceId) addBoundedPrivateId(state.privateInstanceIds, state.sessionInstanceId);
+    if (state.runtimeEpoch) addBoundedPrivateId(state.privateRuntimeEpochs, state.runtimeEpoch);
     resetTransientTimelineState(cacheKey);
   }
   state.mode = 'normal';
@@ -4378,16 +4412,19 @@ export function useTimeline(
     let offset = 0;
     const drain = (): void => {
       if (cacheKeyRef.current !== key) return;
-      const chunk = incoming.slice(offset, offset + HISTORY_APPLY_CHUNK_EVENTS);
-      offset += chunk.length;
-      if (chunk.length === 0) return;
-      mergeEvents(chunk, maxEvents);
-      for (const historyEvent of chunk) {
-        applyTimelineTransportQueueEvidence(historyEvent);
-        settleOptimisticByCommandAckEvent(historyEvent);
-        settleOptimisticByTimelineProgress(historyEvent);
+      const rawChunk = incoming.slice(offset, offset + HISTORY_APPLY_CHUNK_EVENTS);
+      offset += rawChunk.length;
+      if (rawChunk.length === 0) return;
+      const chunk = filterAcceptedTimelineEvents(key, rawChunk);
+      if (chunk.length > 0) {
+        mergeEvents(chunk, maxEvents);
+        for (const historyEvent of chunk) {
+          applyTimelineTransportQueueEvidence(historyEvent);
+          settleOptimisticByCommandAckEvent(historyEvent);
+          settleOptimisticByTimelineProgress(historyEvent);
+        }
+        idbPutEvents(chunk);
       }
-      idbPutEvents(chunk);
       if (offset < incoming.length) setTimeout(drain, 0);
     };
     drain();
@@ -4493,8 +4530,9 @@ export function useTimeline(
 
   const flushPendingRealtimeEvents = useCallback(() => {
     pendingRealtimeFlushCancelRef.current = null;
-    const incoming = [...pendingRealtimeEventsRef.current.values()];
+    const rawIncoming = [...pendingRealtimeEventsRef.current.values()];
     pendingRealtimeEventsRef.current.clear();
+    const incoming = filterAcceptedTimelineEvents(cacheKeyRef.current, rawIncoming);
     if (incoming.length === 0) return;
     // Streaming assistant snapshots are already coalesced by eventId. They
     // are ephemeral UI deltas; updating the shared cache/store on every frame
@@ -4884,13 +4922,16 @@ export function useTimeline(
             },
             mergePage: async (events) => {
               if (scopeGenerationRef.current !== roundGeneration || cacheKeyRef.current !== backfillCacheKey) return { candidateCount: 0, minTs: null, maxTs: null };
-              const recovered = events.filter(
-                (ev): ev is TimelineEvent => !!ev && typeof ev === 'object'
-                  && typeof (ev as TimelineEvent).eventId === 'string'
-                  && typeof (ev as TimelineEvent).sessionId === 'string'
-                  && typeof (ev as TimelineEvent).type === 'string'
-                  && typeof (ev as TimelineEvent).ts === 'number'
-                  && Number.isFinite((ev as TimelineEvent).ts),
+              const recovered = filterAcceptedTimelineEvents(
+                backfillCacheKey,
+                events.filter(
+                  (ev): ev is TimelineEvent => !!ev && typeof ev === 'object'
+                    && typeof (ev as TimelineEvent).eventId === 'string'
+                    && typeof (ev as TimelineEvent).sessionId === 'string'
+                    && typeof (ev as TimelineEvent).type === 'string'
+                    && typeof (ev as TimelineEvent).ts === 'number'
+                    && Number.isFinite((ev as TimelineEvent).ts),
+                ),
               );
               if (recovered.length === 0) return { candidateCount: 0, minTs: null, maxTs: null };
               backfillDebug('fireHttpBackfill: merging page', { sessionId: backfillSessionId, count: recovered.length });
@@ -4914,13 +4955,15 @@ export function useTimeline(
               const APPLY_CHUNK = 20;
               for (let offset = 0; offset < recovered.length; offset += APPLY_CHUNK) {
                 if (scopeGenerationRef.current !== roundGeneration || cacheKeyRef.current !== backfillCacheKey) return { candidateCount: 0, minTs: null, maxTs: null };
-                const chunk = recovered.slice(offset, offset + APPLY_CHUNK);
-                mergeEvents(chunk, wideMerge ? MAX_HISTORY_EVENTS : undefined);
-                for (const recoveredEvent of chunk) {
-                  settleOptimisticByCommandAckEvent(recoveredEvent);
-                  settleOptimisticByTimelineProgress(recoveredEvent);
+                const chunk = filterAcceptedTimelineEvents(backfillCacheKey, recovered.slice(offset, offset + APPLY_CHUNK));
+                if (chunk.length > 0) {
+                  mergeEvents(chunk, wideMerge ? MAX_HISTORY_EVENTS : undefined);
+                  for (const recoveredEvent of chunk) {
+                    settleOptimisticByCommandAckEvent(recoveredEvent);
+                    settleOptimisticByTimelineProgress(recoveredEvent);
+                  }
+                  idbPutEvents(chunk);
                 }
-                idbPutEvents(chunk);
                 if (offset + APPLY_CHUNK < recovered.length) {
                   await new Promise<void>((resolve) => setTimeout(resolve, 0));
                 }
@@ -5578,6 +5621,7 @@ export function useTimeline(
       if (msg.type === TIMELINE_MESSAGES.EVENT) {
         const event = msg.event;
         if (event.sessionId !== sessionId) return;
+        if (cacheKeyRef.current && shouldDropIncomingTimelineEvent(cacheKeyRef.current, event)) return;
         // Watchdog liveness = CONTENT freshness, not pipe-alive. `session.state`
         // heartbeats from a running agent must NOT reset liveness, or a dropped
         // `assistant.text`/`tool.*` event stays invisible to the watchdog while
@@ -5737,9 +5781,12 @@ export function useTimeline(
       if (msg.type === TRANSPORT_MSG.CHAT_HISTORY) {
         if (msg.sessionId !== sessionId) return;
         if (eventsRef.current.length > 0) return;
-        const provisionalEvents = msg.events
-          .map((event, index) => convertTransportHistoryRecordToTimelineEvent(sessionId, event, index))
-          .filter((event): event is TimelineEvent => event != null);
+        const provisionalEvents = filterAcceptedTimelineEvents(
+          cacheKeyRef.current,
+          msg.events
+            .map((event, index) => convertTransportHistoryRecordToTimelineEvent(sessionId, event, index))
+            .filter((event): event is TimelineEvent => event != null),
+        );
         if (provisionalEvents.length === 0) return;
         updateHistoryStep('daemon', 'done', 'bootstrap');
         mergeHistoryEventsYielding(provisionalEvents.slice(-MAX_FORWARD_PAGE_EVENTS));
@@ -5750,6 +5797,7 @@ export function useTimeline(
       // ── History response (full load from daemon file store) ──
       if (msg.type === TIMELINE_MESSAGES.HISTORY || msg.type === TIMELINE_MESSAGES.PAGE) {
         if (msg.sessionName !== sessionId) return;
+        const acceptedEvents = filterAcceptedTimelineEvents(cacheKeyRef.current, msg.events);
         const responseState = getTimelineResponseState(msg);
         const shouldPreserveOlderAvailability = responseState === 'error'
           || responseState === 'deferred'
@@ -5762,8 +5810,8 @@ export function useTimeline(
           recordTimelineResponse(msg, 'older');
           const olderCursor = getOlderTimelineCursor(msg);
           if (hasStructuredOlderPage(msg) && olderCursor) olderCursorRef.current = olderCursor;
-          if (msg.events.length > 0) {
-            mergeHistoryEventsYielding(msg.events, MAX_HISTORY_EVENTS);
+          if (acceptedEvents.length > 0) {
+            mergeHistoryEventsYielding(acceptedEvents, MAX_HISTORY_EVENTS);
           }
           if (shouldPreserveOlderAvailability) {
             return;
@@ -5782,7 +5830,7 @@ export function useTimeline(
         if (msg.type === TIMELINE_MESSAGES.HISTORY && msg.requestId && msg.requestId === peekRequestIdRef.current) {
           peekRequestIdRef.current = null;
           updateHistoryStep('textTail', 'done', 'bootstrap');
-          if (msg.events.length > 0 && responseState !== 'error') mergeHistoryEventsYielding(msg.events);
+          if (acceptedEvents.length > 0 && responseState !== 'error') mergeHistoryEventsYielding(acceptedEvents);
           return;
         }
 
@@ -5801,8 +5849,8 @@ export function useTimeline(
             updateHistoryStep('textTail', 'done', 'bootstrap');
           }
           // This newest-window page is the evidence for whether a hole sits between the cache and it.
-          if (msg.requestId && msg.type === TIMELINE_MESSAGES.HISTORY && responseState !== 'error' && msg.events.length > 0) {
-            noteOpenWindowTail(msg.events, msg.hasMore === true);
+          if (msg.requestId && msg.type === TIMELINE_MESSAGES.HISTORY && responseState !== 'error' && acceptedEvents.length > 0) {
+            noteOpenWindowTail(acceptedEvents, msg.hasMore === true);
           }
         }
         if (!olderRequestIdRef.current || msg.requestId !== olderRequestIdRef.current) {
@@ -5817,37 +5865,39 @@ export function useTimeline(
         // must NOT re-lock path-2 and clobber an intentionally-unlocked
         // low-completeness IDB restore (the bug that made S2 a no-op for active
         // sessions). Idempotent + never-unlock: a complete restore stays locked.
-        markHistoryLoadedIfComplete(msg.events);
+        markHistoryLoadedIfComplete(acceptedEvents);
         const forwardOlderCursor = getOlderTimelineCursor(msg);
         if (hasStructuredOlderPage(msg) && forwardOlderCursor) {
           olderCursorRef.current = forwardOlderCursor;
           setHasOlderHistory(true);
         }
 
-        epochRef.current = msg.epoch;
+        if (msg.events.length === 0 || acceptedEvents.length > 0) {
+          epochRef.current = msg.epoch;
+        }
 
-        if (msg.events.length > 0) {
+        if (acceptedEvents.length > 0) {
           historyRetryRef.current = 0; // reset on success
-          const maxSeq = msg.events.reduce((max, e) => Math.max(max, e.seq), 0);
+          const maxSeq = acceptedEvents.reduce((max, e) => Math.max(max, e.seq), 0);
           seqRef.current = Math.max(seqRef.current, maxSeq);
           const current = getSharedTimelineBase(cacheKeyRef.current, eventsRef.current, MAX_MEMORY_EVENTS);
           const withoutProvisionalTransportHistory = current.filter((event) => !isProvisionalTransportHistoryEvent(event));
           const hadProvisionalTransportHistory = withoutProvisionalTransportHistory.length !== current.length;
           if (hadProvisionalTransportHistory) {
             const next = withoutProvisionalTransportHistory.length === 0
-              ? msg.events
+              ? acceptedEvents
               : mergeTimelineEventsForWindow(
                 withoutProvisionalTransportHistory,
-                msg.events,
+                acceptedEvents,
                 retainedTimelineMergeLimit(withoutProvisionalTransportHistory),
               );
             replaceEvents(next);
-            idbPutEvents(msg.events);
+            idbPutEvents(acceptedEvents);
           } else {
             // While a hole is open the window keeps the tail AND the cache it will be stitched to.
-            mergeHistoryEventsYielding(msg.events, getTimelineGap(cacheKeyRef.current) ? MAX_HISTORY_EVENTS : undefined);
+            mergeHistoryEventsYielding(acceptedEvents, getTimelineGap(cacheKeyRef.current) ? MAX_HISTORY_EVENTS : undefined);
           }
-        } else if (historyRetryRef.current < 2 && ws?.connected && isActiveSessionRef.current && shouldRetryTimelineHistoryResponse(msg, eventsRef.current.length > 0)) {
+        } else if (msg.events.length === 0 && historyRetryRef.current < 2 && ws?.connected && isActiveSessionRef.current && shouldRetryTimelineHistoryResponse(msg, eventsRef.current.length > 0)) {
           // Legacy empty response with no cached events — retry once after a
           // short delay. Explicit protocol outcomes (empty success, deferred,
           // queue-full, timeout, unavailable, malformed, internal, etc.) are
@@ -5885,18 +5935,21 @@ export function useTimeline(
         updateHistoryStep('daemon', 'done', 'refresh');
         recordTimelineResponse(msg, 'refresh');
         const { events: replayEvents, truncated, epoch } = msg;
+        const acceptedReplayEvents = filterAcceptedTimelineEvents(cacheKeyRef.current, replayEvents);
 
         // Update epoch — don't clear events, ts-sort handles cross-epoch order
-        epochRef.current = epoch;
+        if (replayEvents.length === 0 || acceptedReplayEvents.length > 0) {
+          epochRef.current = epoch;
+        }
 
         if (truncated === true && ws) {
           ws.sendSnapshotRequest(sessionId);
         }
 
-        if (replayEvents.length > 0) {
-          const maxSeq = replayEvents.reduce((max, e) => Math.max(max, e.seq), 0);
+        if (acceptedReplayEvents.length > 0) {
+          const maxSeq = acceptedReplayEvents.reduce((max, e) => Math.max(max, e.seq), 0);
           seqRef.current = Math.max(seqRef.current, maxSeq);
-          mergeHistoryEventsYielding(replayEvents);
+          mergeHistoryEventsYielding(acceptedReplayEvents);
         }
         setRefreshing(false);
       }
