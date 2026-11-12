@@ -85,7 +85,7 @@ describe('useSyncedPreference durable intent', () => {
 
   it('propagates only matching storage keys and ignores older same-owner events', async () => {
     localStorage.setItem(key(), payload(['alice'], 20));
-    render(<Probe />);
+    const view = render(<Probe />);
     await ready();
     act(() => window.dispatchEvent(new StorageEvent('storage', { key: key('bob'), newValue: payload(['bob'], 50) })));
     expect(screen.getByTestId('pins').textContent).toBe('["alice"]:true');
@@ -94,6 +94,13 @@ describe('useSyncedPreference durable intent', () => {
     await waitFor(() => expect(screen.getByTestId('pins').textContent).toBe('["cross-tab"]:true'));
     localStorage.setItem(key(), payload([], 10));
     act(() => window.dispatchEvent(new StorageEvent('storage', { key: key(), newValue: payload([], 10) })));
+    expect(screen.getByTestId('pins').textContent).toBe('["cross-tab"]:true');
+    expect(localStorage.getItem(key())).toBe(payload(['cross-tab'], 30));
+    view.unmount();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    api.get.mockRejectedValue(new Error('offline reload'));
+    render(<Probe />);
+    await ready();
     expect(screen.getByTestId('pins').textContent).toBe('["cross-tab"]:true');
   });
 

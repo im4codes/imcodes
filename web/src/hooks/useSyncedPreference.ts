@@ -89,6 +89,11 @@ export function useSyncedPreference<T>(
       const incoming = parseSyncedPreference<T>(event.newValue);
       const local = readLatest();
       if (incoming && (!local || incoming.t >= local.t)) apply(incoming);
+      else if (local && incoming && incoming.t < local.t) {
+        // An older tab may have overwritten the shared storage row already.
+        // Restore known intent too, so an offline reload cannot resurrect it.
+        writeLocal(storageKey, local);
+      }
     };
     wake();
     window.addEventListener('online', wake);
