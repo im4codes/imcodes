@@ -101,16 +101,30 @@ LEGACY_DIR="/app/controlled-node-executables/versions"
 DURABLE_DIR="/var/lib/imcodes/node-exe-versions"
 STAGING_DIR=""
 HAS_STAGED_ARTIFACTS=0
+TMP_ENV=""
+TMP_COMPOSE=""
+TMP_CADDY=""
 
-cleanup_staging() {
+cleanup() {
+  [ -n "$TMP_ENV" ] && [ -f "$TMP_ENV" ] && rm -f "$TMP_ENV"
+  [ -n "$TMP_COMPOSE" ] && [ -f "$TMP_COMPOSE" ] && rm -f "$TMP_COMPOSE"
+  [ -n "$TMP_CADDY" ] && [ -f "$TMP_CADDY" ] && rm -f "$TMP_CADDY"
   if [ -n "$STAGING_DIR" ] && [ -d "$STAGING_DIR" ]; then
     echo "Warning: Script terminated early; retained installers copy preserved at $STAGING_DIR" >&2
   fi
 }
-trap cleanup_staging EXIT
+trap cleanup EXIT
 
 if [ -f "$COMPOSE_FILE" ]; then
-  SERVER_CIDS_RAW="$("${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" ps -aq server 2>/dev/null || true)"
+  PS_ERR="$(mktemp "${TMPDIR:-/tmp}/imcodes-ps-err.XXXXXX")"
+  if ! SERVER_CIDS_RAW="$("${COMPOSE_CMD[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" ps -aq server 2>"$PS_ERR")"; then
+    ERR_MSG="$(cat "$PS_ERR")"
+    rm -f "$PS_ERR"
+    echo "Error: Failed to query existing server container via docker compose ps: $ERR_MSG" >&2
+    exit 1
+  fi
+  rm -f "$PS_ERR"
+
   SERVER_CIDS=()
   while IFS= read -r cid; do
     [ -n "$cid" ] && SERVER_CIDS+=("$cid")
@@ -121,7 +135,15 @@ if [ -f "$COMPOSE_FILE" ]; then
     exit 1
   elif [ "${#SERVER_CIDS[@]}" -eq 1 ]; then
     SERVER_CID="${SERVER_CIDS[0]}"
-    MOUNTS="$(docker inspect -f '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' "$SERVER_CID" 2>/dev/null || true)"
+    INSPECT_ERR="$(mktemp "${TMPDIR:-/tmp}/imcodes-inspect-err.XXXXXX")"
+    if ! MOUNTS="$(docker inspect -f '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' "$SERVER_CID" 2>"$INSPECT_ERR")"; then
+      ERR_MSG="$(cat "$INSPECT_ERR")"
+      rm -f "$INSPECT_ERR"
+      echo "Error: Failed to inspect mounts for server container $SERVER_CID: $ERR_MSG" >&2
+      exit 1
+    fi
+    rm -f "$INSPECT_ERR"
+
     ALREADY_MOUNTED=0
     while IFS= read -r mdest; do
       if [ "$mdest" = "$DURABLE_DIR" ]; then
@@ -131,30 +153,47 @@ if [ -f "$COMPOSE_FILE" ]; then
     done <<< "$MOUNTS"
 
     if [ "$ALREADY_MOUNTED" -eq 0 ]; then
-      IS_RUNNING="$(docker inspect -f '{{.State.Running}}' "$SERVER_CID" 2>/dev/null || true)"
+      STATE_ERR="$(mktemp "${TMPDIR:-/tmp}/imcodes-state-err.XXXXXX")"
+      if ! IS_RUNNING="$(docker inspect -f '{{.State.Running}}' "$SERVER_CID" 2>"$STATE_ERR")"; then
+        ERR_MSG="$(cat "$STATE_ERR")"
+        rm -f "$STATE_ERR"
+        echo "Error: Failed to inspect running state for server container $SERVER_CID: $ERR_MSG" >&2
+        exit 1
+      fi
+      rm -f "$STATE_ERR"
+
       CANDIDATE_STAGING="$(mktemp -d "${TMPDIR:-/tmp}/imcodes-node-exe-versions-XXXXXX")"
       if [ "$IS_RUNNING" = "true" ]; then
-        PROBE_OUT="$(docker exec "$SERVER_CID" sh -c "if [ ! -d '$LEGACY_DIR' ]; then echo __imcodes_legacy_versions_absent__; exit 0; fi; ls -A '$LEGACY_DIR'" 2>/dev/null || echo "__imcodes_probe_failed__")"
-        if [ "$PROBE_OUT" = "__imcodes_probe_failed__" ]; then
-          echo "Error: Failed to probe legacy installer directory in running server container." >&2
+        PROBE_ERR="$(mktemp "${TMPDIR:-/tmp}/imcodes-probe-err.XXXXXX")"
+        if ! PROBE_OUT="$(docker exec "$SERVER_CID" sh -c "if [ ! -d '$LEGACY_DIR' ]; then echo __imcodes_legacy_versions_absent__; exit 0; fi; ls -A '$LEGACY_DIR'" 2>"$PROBE_ERR")"; then
+          ERR_MSG="$(cat "$PROBE_ERR")"
+          rm -f "$PROBE_ERR"
           rm -rf "$CANDIDATE_STAGING"
+          echo "Error: Failed to probe legacy installer directory in running server container: $ERR_MSG" >&2
           exit 1
         fi
+        rm -f "$PROBE_ERR"
+
         if [ "$PROBE_OUT" != "__imcodes_legacy_versions_absent__" ] && [ -n "$(echo "$PROBE_OUT" | tr -d '[:space:]')" ]; then
-          if ! docker cp "$SERVER_CID:$LEGACY_DIR/." "$CANDIDATE_STAGING/" 2>/dev/null; then
-            echo "Error: Failed to copy retained Windows installers from running server container." >&2
+          CP_RUNNING_ERR="$(mktemp "${TMPDIR:-/tmp}/imcodes-cp-err.XXXXXX")"
+          if ! docker cp "$SERVER_CID:$LEGACY_DIR/." "$CANDIDATE_STAGING/" 2>"$CP_RUNNING_ERR"; then
+            ERR_MSG="$(cat "$CP_RUNNING_ERR")"
+            rm -f "$CP_RUNNING_ERR"
             rm -rf "$CANDIDATE_STAGING"
+            echo "Error: Failed to copy retained Windows installers from running server container: $ERR_MSG" >&2
             exit 1
           fi
+          rm -f "$CP_RUNNING_ERR"
           STAGING_DIR="$CANDIDATE_STAGING"
           HAS_STAGED_ARTIFACTS=1
         else
           rm -rf "$CANDIDATE_STAGING"
         fi
       else
-        # Stopped container
-        CP_LOG="$(mktemp)"
+        # Stopped container: probe via docker cp
+        CP_LOG="$(mktemp "${TMPDIR:-/tmp}/imcodes-cp-stopped.XXXXXX")"
         if docker cp "$SERVER_CID:$LEGACY_DIR/." "$CANDIDATE_STAGING/" 2>"$CP_LOG"; then
+          rm -f "$CP_LOG"
           if [ -n "$(ls -A "$CANDIDATE_STAGING" 2>/dev/null)" ]; then
             STAGING_DIR="$CANDIDATE_STAGING"
             HAS_STAGED_ARTIFACTS=1
@@ -163,22 +202,21 @@ if [ -f "$COMPOSE_FILE" ]; then
           fi
         else
           CP_ERR_TEXT="$(cat "$CP_LOG")"
+          rm -f "$CP_LOG"
           if echo "$CP_ERR_TEXT" | grep -Eqi 'no such file or directory|could not find the file|no such container:path'; then
             rm -rf "$CANDIDATE_STAGING"
           else
             echo "Error: Failed to copy retained Windows installers from stopped server container: $CP_ERR_TEXT" >&2
-            rm -f "$CP_LOG"
             rm -rf "$CANDIDATE_STAGING"
             exit 1
           fi
         fi
-        rm -f "$CP_LOG" 2>/dev/null || true
       fi
     fi
   fi
 fi
 
-# ── Update .env (in-place to preserve inode) ──────────────────────────────────
+# ── Prepare candidate .env (validate before commit) ───────────────────────────
 TMP_ENV="$(mktemp "$TARGET_DIR/.env.onlyoffice.XXXXXX")"
 awk \
   -v enabled="true" \
@@ -246,16 +284,15 @@ if ! grep -q '^ONLYOFFICE_ENABLED=' "$TMP_ENV" || \
    ! grep -q '^ONLYOFFICE_INTERNAL_URL=' "$TMP_ENV"; then
   echo "Error: Failed to safely write ONLYOFFICE variables to .env" >&2
   rm -f "$TMP_ENV"
+  TMP_ENV=""
   exit 1
 fi
-
 chmod 600 "$TMP_ENV"
-cat "$TMP_ENV" > "$ENV_FILE"
-rm -f "$TMP_ENV"
 
-# ── Update docker-compose.yml (in-place to preserve inode) ─────────────────────
+# ── Prepare candidate docker-compose.yml (validate before commit) ─────────────
+TMP_COMPOSE="$(mktemp "$TARGET_DIR/.compose.onlyoffice.XXXXXX")"
 if [ ! -f "$COMPOSE_FILE" ]; then
-  cat > "$COMPOSE_FILE" <<'EOF'
+  cat > "$TMP_COMPOSE" <<'EOF'
 services:
   postgres:
     image: pgvector/pgvector:pg18
@@ -347,7 +384,6 @@ volumes:
   node_exe_versions:
 EOF
 else
-  TMP_COMPOSE="$(mktemp "$TARGET_DIR/.compose.onlyoffice.XXXXXX")"
   COMPOSE_UPDATED=0
 
   # Strategy 1: Node.js with yaml package (from local, global, or repository node_modules)
@@ -526,29 +562,29 @@ with open(out_file, 'w', encoding='utf8') as f:
   if [ "$COMPOSE_UPDATED" -eq 0 ]; then
     echo "Error: Neither Node.js (with yaml) nor Python 3 (with PyYAML) is available to parse docker-compose.yml safely." >&2
     rm -f "$TMP_COMPOSE"
+    TMP_COMPOSE=""
     exit 1
   fi
-
-  # Validate updated compose file before replacing
-  if ! grep -q 'ONLYOFFICE_ENABLED' "$TMP_COMPOSE" || \
-     ! grep -q 'ONLYOFFICE_JWT_SECRET' "$TMP_COMPOSE" || \
-     ! grep -q 'ONLYOFFICE_PUBLIC_URL' "$TMP_COMPOSE" || \
-     ! grep -q 'ONLYOFFICE_INTERNAL_URL' "$TMP_COMPOSE" || \
-     ! grep -Eq '^[[:space:]]*onlyoffice:' "$TMP_COMPOSE" || \
-     ! grep -q 'onlyoffice_data' "$TMP_COMPOSE" || \
-     ! grep -q 'onlyoffice_logs' "$TMP_COMPOSE"; then
-    echo "Error: Failed to safely inject ONLYOFFICE configuration into docker-compose.yml" >&2
-    rm -f "$TMP_COMPOSE"
-    exit 1
-  fi
-
-  cat "$TMP_COMPOSE" > "$COMPOSE_FILE"
-  rm -f "$TMP_COMPOSE"
 fi
 
-# ── Update Caddyfile (in-place to preserve inode) ──────────────────────────────
+# Validate updated compose file before replacing
+if ! grep -q 'ONLYOFFICE_ENABLED' "$TMP_COMPOSE" || \
+   ! grep -q 'ONLYOFFICE_JWT_SECRET' "$TMP_COMPOSE" || \
+   ! grep -q 'ONLYOFFICE_PUBLIC_URL' "$TMP_COMPOSE" || \
+   ! grep -q 'ONLYOFFICE_INTERNAL_URL' "$TMP_COMPOSE" || \
+   ! grep -Eq '^[[:space:]]*onlyoffice:' "$TMP_COMPOSE" || \
+   ! grep -q 'onlyoffice_data' "$TMP_COMPOSE" || \
+   ! grep -q 'onlyoffice_logs' "$TMP_COMPOSE"; then
+  echo "Error: Failed to safely inject ONLYOFFICE configuration into docker-compose.yml" >&2
+  rm -f "$TMP_COMPOSE"
+  TMP_COMPOSE=""
+  exit 1
+fi
+
+# ── Prepare candidate Caddyfile (validate before commit) ──────────────────────
 if [ ! -f "$CADDY_FILE" ]; then
-  cat > "$CADDY_FILE" <<EOF
+  TMP_CADDY="$(mktemp "$TARGET_DIR/.caddy.onlyoffice.XXXXXX")"
+  cat > "$TMP_CADDY" <<EOF
 ${CLEAN_DOMAIN} {
 	handle_path /onlyoffice/* {
 		reverse_proxy onlyoffice:80 {
@@ -560,11 +596,14 @@ ${CLEAN_DOMAIN} {
 	reverse_proxy server:19138
 }
 EOF
-elif ! grep -q 'handle_path /onlyoffice/\*' "$CADDY_FILE"; then
+elif ! grep -Eq '^[[:space:]]*handle_path[[:space:]]+/onlyoffice/\*' "$CADDY_FILE"; then
   TMP_CADDY="$(mktemp "$TARGET_DIR/.caddy.onlyoffice.XXXXXX")"
   if awk '
     {
-      if ($0 ~ /reverse_proxy/ && $0 ~ /19138/ && !inserted) {
+      line = $0
+      trimmed = line
+      sub(/^[[:space:]]+/, "", trimmed)
+      if (trimmed ~ /^reverse_proxy([[:space:]]|$)/ && trimmed ~ /19138/ && !inserted) {
         print "\thandle_path /onlyoffice/* {"
         print "\t\treverse_proxy onlyoffice:80 {"
         print "\t\t\theader_up X-Forwarded-Proto {scheme}"
@@ -580,13 +619,33 @@ elif ! grep -q 'handle_path /onlyoffice/\*' "$CADDY_FILE"; then
       if (!inserted) exit 2
     }
   ' "$CADDY_FILE" > "$TMP_CADDY"; then
-    cat "$TMP_CADDY" > "$CADDY_FILE"
-    rm -f "$TMP_CADDY"
+    : # generated successfully
   else
-    echo "Error: could not find server reverse_proxy :19138 in $CADDY_FILE to inject ONLYOFFICE proxy" >&2
+    echo "Error: could not locate server upstream reverse_proxy (:19138) in $CADDY_FILE to inject ONLYOFFICE proxy" >&2
     rm -f "$TMP_CADDY"
+    TMP_CADDY=""
     exit 1
   fi
+fi
+
+# ── All candidate configurations validated: commit in-place to preserve inodes ─
+if [ -n "$TMP_ENV" ] && [ -f "$TMP_ENV" ]; then
+  cat "$TMP_ENV" > "$ENV_FILE"
+  rm -f "$TMP_ENV"
+  TMP_ENV=""
+  chmod 600 "$ENV_FILE"
+fi
+
+if [ -n "$TMP_COMPOSE" ] && [ -f "$TMP_COMPOSE" ]; then
+  cat "$TMP_COMPOSE" > "$COMPOSE_FILE"
+  rm -f "$TMP_COMPOSE"
+  TMP_COMPOSE=""
+fi
+
+if [ -n "$TMP_CADDY" ] && [ -f "$TMP_CADDY" ]; then
+  cat "$TMP_CADDY" > "$CADDY_FILE"
+  rm -f "$TMP_CADDY"
+  TMP_CADDY=""
 fi
 
 # ── Start services and reload Caddy ──────────────────────────────────────────

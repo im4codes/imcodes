@@ -1082,7 +1082,7 @@ export function ensureCaddyfileHasOnlyOffice(
     + `\t\t}\n`
     + `\t}\n`;
 
-  const proxyRegex = /([ \t]*reverse_proxy\s+(?:https?:\/\/)?(?:\S+)?19138[^\n]*)/;
+  const proxyRegex = /^([ \t]*reverse_proxy\s+(?:https?:\/\/)?(?:\S+)?19138[^\n]*)$/m;
   if (proxyRegex.test(existingCaddyfile)) {
     return existingCaddyfile.replace(proxyRegex, `${handleBlock}$1`);
   }
@@ -1171,24 +1171,29 @@ async function runIncrementalOnlyOfficeAddon(
   const existingSecrets = await recoverSecrets(dir);
   const secrets: Partial<SetupSecrets> = existingSecrets ?? {};
   const onlyoffice = resolveOnlyOfficeDeployment(domain, dir, secrets, { ...opts, onlyoffice: true });
+
+  const envPath = join(dir, '.env');
+  const existingEnvContent = await readFile(envPath, 'utf8');
+  const updatedEnvContent = upsertOnlyOfficeEnvContent(existingEnvContent, domain, onlyoffice);
+
+  const composePath = join(dir, 'docker-compose.yml');
+  const existingCompose = existsSync(composePath) ? await readFile(composePath, 'utf8') : undefined;
+  const updatedComposeContent = ensureComposeHasOnlyOffice(existingCompose, onlyoffice, mirrorMode);
+
+  const caddyPath = join(dir, 'Caddyfile');
+  const existingCaddy = existsSync(caddyPath) ? await readFile(caddyPath, 'utf8') : undefined;
+  const updatedCaddyContent = ensureCaddyfileHasOnlyOffice(existingCaddy, domain, true);
+
+  // All candidates validated successfully — commit configuration and secrets
   if (existingSecrets && onlyoffice.jwtSecret && existingSecrets.onlyofficeJwtSecret !== onlyoffice.jwtSecret) {
     existingSecrets.onlyofficeJwtSecret = onlyoffice.jwtSecret;
     await persistSecrets(dir, existingSecrets);
   }
 
-  const envPath = join(dir, '.env');
-  const existingEnvContent = await readFile(envPath, 'utf8');
-  const updatedEnvContent = upsertOnlyOfficeEnvContent(existingEnvContent, domain, onlyoffice);
   await writeFile(envPath, updatedEnvContent, { encoding: 'utf8', mode: 0o600 });
   await chmod(envPath, 0o600);
-
-  const composePath = join(dir, 'docker-compose.yml');
-  const existingCompose = existsSync(composePath) ? await readFile(composePath, 'utf8') : undefined;
-  await writeFile(composePath, ensureComposeHasOnlyOffice(existingCompose, onlyoffice, mirrorMode), 'utf8');
-
-  const caddyPath = join(dir, 'Caddyfile');
-  const existingCaddy = existsSync(caddyPath) ? await readFile(caddyPath, 'utf8') : undefined;
-  await writeFile(caddyPath, ensureCaddyfileHasOnlyOffice(existingCaddy, domain, true), 'utf8');
+  await writeFile(composePath, updatedComposeContent, 'utf8');
+  await writeFile(caddyPath, updatedCaddyContent, 'utf8');
 
   log('Updated .env, docker-compose.yml, and Caddyfile with ONLYOFFICE configuration.');
   log('Starting ONLYOFFICE Document Server and updating server + Caddy...');

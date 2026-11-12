@@ -557,6 +557,30 @@ describe('setupFlow ONLYOFFICE fresh install, --no-onlyoffice, and existing depl
     expect(readFileSync(caddy, 'utf8')).toContain('keep-this');
     expect(readFileSync(caddy, 'utf8')).toContain('handle_path /onlyoffice/*');
   });
+
+  it('does not commit env/compose before rejecting unsupported Caddy in CLI add-on', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { setupFlow } = await import('../../src/setup/setup-flow.js');
+    const env = join(projectDir, '.env');
+    const compose = join(projectDir, 'docker-compose.yml');
+    const caddy = join(projectDir, 'Caddyfile');
+    const oldEnv = 'DOMAIN=docs.test\nPOSTGRES_PASSWORD=synthetic-pg\nJWT_SIGNING_KEY=synthetic-jwt\nCUSTOM_SETTING=keep\n';
+    const oldCompose = 'services:\n  server:\n    image: example/server:fixed\n  caddy:\n    image: caddy:2-alpine\n';
+    writeFileSync(env, oldEnv);
+    writeFileSync(compose, oldCompose);
+    writeFileSync(caddy, 'docs.test {\n respond "existing business"\n}\n');
+
+    await expect(setupFlow('docs.test', { onlyoffice: true })).rejects.toThrow(/could not locate server upstream/);
+    expect(readFileSync(env, 'utf8')).toBe(oldEnv);
+    expect(readFileSync(compose, 'utf8')).toBe(oldCompose);
+    expect(execSyncMock.mock.calls.some(([cmd]) => String(cmd).includes('up -d onlyoffice server caddy'))).toBe(false);
+  });
+
+  it('does not treat commented reverse_proxy text as a live Caddy upstream', async () => {
+    const { ensureCaddyfileHasOnlyOffice } = await import('../../src/setup/setup-flow.js');
+    const old = 'docs.test {\n # reverse_proxy server:19138 (old deployment example)\n reverse_proxy current-backend:8080\n}\n';
+    expect(() => ensureCaddyfileHasOnlyOffice(old, 'docs.test')).toThrow(/could not locate server upstream/);
+  });
 });
 
 describe('scripts/setup-onlyoffice.sh standalone non-destructive add-on script', () => {
@@ -837,6 +861,54 @@ describe('scripts/setup-onlyoffice.sh standalone non-destructive add-on script',
       const dockerCalls = readFileSync(log, 'utf8');
       expect(dockerCalls).toContain('cp srv-single:/app/controlled-node-executables/versions/.');
       expect(dockerCalls).toContain('srv-new:/var/lib/imcodes/node-exe-versions/');
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('script refuses a failed server-container discovery before edits or compose up', () => {
+    const tmpRoot = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'imcodes-script-fail-discovery-'));
+    const bin = join(tmpRoot, 'bin');
+    mkdirSync(bin, { recursive: true });
+    const log = join(tmpRoot, 'docker.log');
+    const project = join(tmpRoot, 'project');
+    mkdirSync(project, { recursive: true });
+
+    try {
+      const fake = join(bin, 'docker');
+      writeFileSync(fake, [
+        '#!/usr/bin/env bash',
+        'printf "%s\\n" "$*" >> "$DOCKER_LOG"',
+        'if [[ "$1" == compose && "$*" == *"ps -aq server"* ]]; then',
+        '  echo "synthetic Docker API failure" >&2',
+        '  exit 42',
+        'fi',
+        'exit 0',
+      ].join('\n'));
+      chmodSync(fake, 0o755);
+
+      const envPath = join(project, '.env');
+      const composePath = join(project, 'docker-compose.yml');
+      const caddyPath = join(project, 'Caddyfile');
+
+      const oldEnv = 'DOMAIN=docs.test\nPOSTGRES_PASSWORD=synthetic-pg\nJWT_SIGNING_KEY=synthetic-jwt\n';
+      const oldCompose = 'services:\n  server:\n    image: example/server:fixed\n  caddy:\n    image: caddy:2-alpine\n';
+      writeFileSync(envPath, oldEnv);
+      writeFileSync(composePath, oldCompose);
+      writeFileSync(caddyPath, 'docs.test {\n reverse_proxy server:19138\n}\n');
+
+      const scriptPath = join(repoRoot, 'scripts/setup-onlyoffice.sh');
+      const res = spawnSync(scriptPath, [project], {
+        encoding: 'utf8',
+        timeout: 10000,
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, DOCKER_LOG: log },
+      });
+
+      expect(res.status).not.toBe(0);
+      const calls = readFileSync(log, 'utf8');
+      expect(calls).not.toContain('up -d onlyoffice server caddy');
+      expect(readFileSync(envPath, 'utf8')).toBe(oldEnv);
+      expect(readFileSync(composePath, 'utf8')).toBe(oldCompose);
     } finally {
       rmSync(tmpRoot, { recursive: true, force: true });
     }
