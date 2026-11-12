@@ -42,32 +42,40 @@ export class AgyTranscriptBridge {
   }
 
   private async arm(): Promise<void> {
-    if (this.closed) return;
-    // Native session/new can return before its logs directory exists. Watch
-    // the nearest existing ancestor until creation, then narrow the watcher.
-    let dir = path.dirname(this.file);
-    while (true) {
-      try { if ((await stat(dir)).isDirectory()) break; } catch { /* descend on the next creation event */ }
-      const parent = path.dirname(dir); if (parent === dir) return; dir = parent;
+    const target = path.dirname(this.file);
+    while (!this.closed) {
+      // Native session/new can return before its logs directory exists. Watch
+      // the nearest existing ancestor until creation, then narrow the watcher.
+      let dir = target;
+      while (true) {
+        try { if ((await stat(dir)).isDirectory()) break; } catch { /* descend on the next creation event */ }
+        const parent = path.dirname(dir); if (parent === dir) return; dir = parent;
+      }
+      if (this.closed || dir === this.watched) return;
+      this.watcher?.close(); this.watched = dir;
+      try {
+        this.watcher = watch(
+          dir,
+          { persistent: false, recursive: process.platform === 'darwin' || process.platform === 'win32' },
+          () => this.schedule(),
+        );
+        this.watcher.on('error', () => { this.watcher?.close(); this.watched = undefined; });
+        this.schedule();
+      } catch { this.watched = undefined; return; }
+      if (dir === target) return;
     }
-    if (this.closed || dir === this.watched) return;
-    this.watcher?.close(); this.watched = dir;
-    try {
-      this.watcher = watch(dir, { persistent: false }, () => this.schedule());
-      this.watcher.on('error', () => { this.watcher?.close(); this.watched = undefined; });
-    } catch { this.watched = undefined; }
   }
   private schedule(): void {
     if (this.closed || this.timer) return;
     // Event coalescing gives native ACP frames precedence, not a polling loop.
-    this.timer = setTimeout(() => { this.timer = undefined; void this.arm().then(() => this.flush()); }, 60);
+    this.timer = setTimeout(() => { this.timer = undefined; void this.flush(); }, 60);
     this.timer.unref?.();
   }
   flush(): Promise<void> {
     if (this.closed) return Promise.resolve();
     if (this.reading) { this.again = true; return this.reading; }
     this.reading = (async () => {
-      do { this.again = false; await this.read(); } while (this.again && !this.closed);
+      do { this.again = false; await this.arm(); await this.read(); } while (this.again && !this.closed);
     })().finally(() => { this.reading = undefined; });
     return this.reading;
   }
