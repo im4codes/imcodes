@@ -28,6 +28,7 @@ import { shareTargetFromSessionName } from '../db/tab-sharing.js';
 import { resolveHttpShareAccess, resolveHttpShareAccessForCoveredSession } from './share-http-auth.js';
 import type { Database } from '../db/client.js';
 import { WsBridge } from '../ws/bridge.js';
+import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
 
 export const onlyofficeRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -833,7 +834,7 @@ export async function writeFileToDaemon(
 
   const allowedRoot = options?.allowedRoot;
   if (allowedRoot && !isPathWithinSharedFolder(norm, allowedRoot)) {
-    throw new Error('forbidden_path');
+    throw new Error(FS_READ_ERROR_CODES.FORBIDDEN_PATH);
   }
 
   const meta = getOnlyOfficeDocumentMeta(norm);
@@ -1610,7 +1611,7 @@ async function handleOnlyOfficeFileDownload(c: RouteContext): Promise<Response> 
         ? 503
         : msg === 'ENOENT' || msg === 'enoent'
           ? 404
-          : msg === 'forbidden_path'
+          : msg === FS_READ_ERROR_CODES.FORBIDDEN_PATH
             ? 403
             : 502;
     return c.json({ error: msg }, status);
@@ -1865,7 +1866,7 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
           } catch { /* best effort */ }
         }
         const msg = writeErr instanceof Error ? writeErr.message : String(writeErr);
-        const errStatus = msg === 'forbidden_path' ? 403 : 502;
+        const errStatus = msg === FS_READ_ERROR_CODES.FORBIDDEN_PATH ? 403 : 502;
         return c.json({ error: 1, message: msg }, errStatus);
       }
 

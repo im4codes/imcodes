@@ -2424,7 +2424,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
               serverLink.send({
                 type: 'file.upload_error',
                 uploadId: cmd.uploadId,
-                error: 'forbidden_path',
+                error: FS_READ_ERROR_CODES.FORBIDDEN_PATH,
               });
             } catch { /* ignore */ }
             return;
@@ -2438,7 +2438,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
                 serverLink.send({
                   type: 'file.upload_error',
                   uploadId: cmd.uploadId,
-                  error: 'forbidden_path',
+                  error: FS_READ_ERROR_CODES.FORBIDDEN_PATH,
                 });
               } catch { /* ignore */ }
               return;
@@ -2458,7 +2458,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
                   serverLink.send({
                     type: 'file.upload_error',
                     uploadId: cmd.uploadId,
-                    error: 'forbidden_path',
+                    error: FS_READ_ERROR_CODES.FORBIDDEN_PATH,
                   });
                 } catch { /* ignore */ }
                 return;
@@ -2468,7 +2468,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
                 serverLink.send({
                   type: 'file.upload_error',
                   uploadId: cmd.uploadId,
-                  error: 'forbidden_path',
+                  error: FS_READ_ERROR_CODES.FORBIDDEN_PATH,
                 });
               } catch { /* ignore */ }
               return;
@@ -2478,7 +2478,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
               serverLink.send({
                 type: 'file.upload_error',
                 uploadId: cmd.uploadId,
-                error: 'forbidden_path',
+                error: FS_READ_ERROR_CODES.FORBIDDEN_PATH,
               });
             } catch { /* ignore */ }
             return;

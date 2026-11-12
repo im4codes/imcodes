@@ -8,6 +8,7 @@ import { requireAuth, resolveAuthOutcome, resolveServerMembershipRole } from '..
 import { resolveUserByIdentifier } from '../db/user-lookup.js';
 import { createUser, getUserByPlatformId, upsertPlatformIdentity } from '../db/queries.js';
 import { ACCOUNT_SESSION_JWT_TYPE } from '../../../shared/auth-token-types.js';
+import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
 import {
   createDocumentShare,
   getDocumentShareByToken,
@@ -461,7 +462,7 @@ documentSharingRoutes.get('/doc-shares/external/:token/browse', async (c): Promi
     });
 
     if (lsRes.status === 'error') {
-      const status = lsRes.error === 'forbidden_path' ? 403 : 502;
+      const status = lsRes.error === FS_READ_ERROR_CODES.FORBIDDEN_PATH ? 403 : 502;
       return c.json({ error: lsRes.error || 'daemon_ls_failed' }, status);
     }
 
@@ -888,7 +889,7 @@ documentSharingRoutes.get('/server/:id/doc-shares/browse', async (c): Promise<Re
     });
 
     if (lsRes.status === 'error') {
-      const status = lsRes.error === 'forbidden_path' ? 403 : 502;
+      const status = lsRes.error === FS_READ_ERROR_CODES.FORBIDDEN_PATH ? 403 : 502;
       return c.json({ error: lsRes.error || 'daemon_ls_failed' }, status);
     }
 
@@ -1009,7 +1010,7 @@ documentSharingRoutes.post('/server/:id/doc-shares/create-item', async (c): Prom
       });
 
       if (mkdirRes.status === 'error') {
-        const status = mkdirRes.error === 'forbidden_path' ? 403 : 400;
+        const status = mkdirRes.error === FS_READ_ERROR_CODES.FORBIDDEN_PATH ? 403 : 400;
         return c.json({ error: mkdirRes.error || 'mkdir_failed' }, status);
       }
 
