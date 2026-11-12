@@ -1,6 +1,8 @@
+import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
+import { readFileSync } from 'node:fs';
 import { AGY_ACP_AGENT_NAME, AGY_CLI_PATH_ENV } from '../../shared/agy-agent.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, writeFile, readFile, rm, mkdir, unlink } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile, rm, mkdir, unlink, appendFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { AgyAcpProvider, createAgyProvider, supportsAgyAcp } from '../../src/agent/providers/agy-acp.js';
@@ -44,7 +46,7 @@ describe('AG native ACP', () => {
     const prompts = (await requests()).filter(x => x.method === 'session/prompt');
     expect(prompts.map(x => x.params.sessionId)).toEqual(['native-1', 'native-1', 'native-1']);
     expect((await requests()).some(x => x.method === 'session/cancel')).toBe(false);
-    expect(complete.mock.calls[0]?.[1].metadata.usage).toEqual({ inputTokens: scenario === 'reordered' ? 30 : 10, outputTokens: scenario === 'reordered' ? 15 : 5 });
+    expect(complete.mock.calls[0]?.[1].metadata.usage).toMatchObject({ inputTokens: scenario === 'reordered' ? 30 : 10, outputTokens: scenario === 'reordered' ? 15 : 5 });
   });
   it('deduplicates durable ids, including retries after the superseded A response', async () => {
     const { provider, requests } = await setup(); const id = await route(provider);
@@ -65,6 +67,239 @@ describe('AG native ACP', () => {
     await provider.send(id, 'A'); await provider.notifyActiveDelegation(id, notification('B')); await provider.cancelAndWait(id);
     await vi.waitFor(() => expect(errors).toHaveBeenCalledTimes(1)); expect(complete).not.toHaveBeenCalled();
     expect(await provider.notifyActiveDelegation(id, notification('C'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
+  });
+  it('keeps one stable ACP prefix and normalizes native usage for relay', async () => {
+    const { provider, requests } = await setup(); const id = await route(provider);
+    const complete = vi.fn(); provider.onComplete(complete);
+    const text = 'UNCOMPRESSED Brain role; user/project/pair/session identity; MCP policy 完整 😀';
+    for (const message of ['ordinary one', 'after silent compaction']) {
+      const payload = normalizeProviderPayload(message);
+      payload.sessionSystemText = text;
+      await provider.send(id, payload);
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(message === 'ordinary one' ? 1 : 2));
+    }
+    const prompts = (await requests()).filter(x => x.method === 'session/prompt');
+    expect(prompts[0].params.prompt[0].text).toContain(text);
+    expect(prompts[1].params.prompt[0].text).not.toContain(text);
+    expect(complete.mock.calls[1][1].metadata.usage).toMatchObject({ input_tokens: 10, output_tokens: 5 });
+  });
+  it('reasserts byte-identical ACP contracts once after summary/model/compact/clear/initialize', async () => {
+    const {provider,requests,root}=await setup('usage-missing'); let id=await route(provider);
+    const done=vi.fn(); provider.onComplete(done); let count=0;
+    const contract='UNCOMPRESSED Brain-only delegation; USER/PROJECT/PAIR/SESSION identity; MCP guidance 完整 😀';
+    const send=async(label:string, injected:boolean) => {
+      const payload=normalizeProviderPayload(label); payload.sessionSystemText=contract;
+      await provider.send(id,payload); count++;
+      await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(count));
+      const prompt=(await requests()).filter(x=>x.method==='session/prompt').at(-1).params.prompt[0].text;
+      expect(prompt.split(contract).length-1).toBe(injected?1:0);
+      if(label!=='/compact') expect(Number(done.mock.calls.at(-1)![1].metadata.usage.input_tokens)).toBeGreaterThan(0);
+      return prompt;
+    };
+    const first=await send('ordinary one',true);
+    await send('ordinary two',false); await send('ordinary three',false); await send('ordinary four',false);
+    const native=(await requests()).find(x=>x.method==='session/prompt').params.sessionId;
+    const logs=path.join(root,'.gemini/antigravity-cli/brain',native,'.system_generated/logs'); await mkdir(logs,{recursive:true});
+    await writeFile(path.join(logs,'transcript.jsonl'),JSON.stringify({step_index:10,source:'USER_EXPLICIT',type:'USER_INPUT',status:'DONE',created_at:'2026-11-12T00:00:00Z',content:'<CONTEXT_SUMMARY>summary</CONTEXT_SUMMARY>'})+'\n');
+    const restored=await send('after summary',true);
+    expect(restored.slice(0,restored.indexOf('after summary'))).toBe(first.slice(0,first.indexOf('ordinary one')));
+    await send('post summary ordinary',false);
+    provider.setSessionAgentId(id,'model-b'); await send('after set model',true); await send('post set ordinary',false);
+    await provider.applySessionModel(id,'model-a'); await send('after apply model',true); await send('post apply ordinary',false);
+    await send('/compact',false); await send('after compact',true); await send('post compact ordinary',false);
+    provider.refreshSessionSystemText(id); await send('after clear',true); await send('post clear ordinary',false);
+    id=await route(provider,id,{fresh:true}); await send('after initialize',true); await send('post initialize ordinary',false);
+  });
+  it('keeps registered originals through real runtime fresh initialization, injects once and withdraws without resurrection',async()=>{
+    const {provider,requests,root}=await setup();const key='deck_test_agy_reset_contract';
+    vi.stubEnv('IMCODES_TRANSPORT_QUEUE_DB_PATH',path.join(root,'contracts-queue.sqlite'));resetTransportQueueStoreForTests();
+    let runtime=new TransportSessionRuntime(provider,key);const config={sessionKey:key,sessionInstanceId:'logical-owner',cwd:root,agentId:'model-a',systemPrompt:'Original system'};
+    let n=0;
+    const send=async(body?:string)=>{
+      const before=(await requests()).filter(r=>r.method==='session/prompt').length;
+      runtime.send('ordinary-'+(++n),'id-'+n,undefined,undefined,body===undefined?undefined:{registeredSystemContract:{contractId:'dynamic',signature:body,body}});
+      await vi.waitFor(async()=>expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(before+1));
+      await vi.waitFor(()=>expect(runtime.getStatus()).toBe('idle'));
+      return (await requests()).filter(r=>r.method==='session/prompt').at(-1).params.prompt.map((b:any)=>b.text??'').join('');
+    };
+    try {
+      await runtime.initialize(config);
+      expect(await send('COMPLETE ORIGINAL REGISTERED BODY')).toContain('COMPLETE ORIGINAL REGISTERED BODY');
+      expect(await send()).not.toContain('COMPLETE ORIGINAL REGISTERED BODY');
+      for(const extra of [{fresh:true},{startupMemoryAlreadyInjected:true},{runtimeEpoch:'next-runtime'}]) {
+        await runtime.initialize({...config,...extra});
+        expect(await send()).toContain('COMPLETE ORIGINAL REGISTERED BODY');
+        expect(await send()).not.toContain('COMPLETE ORIGINAL REGISTERED BODY');
+      }
+      // Real /clear creates a new Runtime object; closing/reopening the
+      // private store also models daemon restore, not module-global retention.
+      await runtime.kill();resetTransportQueueStoreForTests();runtime=new TransportSessionRuntime(provider,key);
+      await runtime.initialize({...config,fresh:true,runtimeEpoch:'restored-epoch'});
+      expect(await send()).toContain('COMPLETE ORIGINAL REGISTERED BODY');
+      expect(await send()).not.toContain('COMPLETE ORIGINAL REGISTERED BODY');
+      await send('');await runtime.kill();resetTransportQueueStoreForTests();runtime=new TransportSessionRuntime(provider,key);
+      await runtime.initialize({...config,fresh:true,runtimeEpoch:'after-withdrawal'});
+      expect(await send()).not.toContain('COMPLETE ORIGINAL REGISTERED BODY');
+    } finally {await runtime.kill();resetTransportQueueStoreForTests();}
+  });
+  it.each(['usage-missing','usage-zero','usage-used'])('reports positive current ACP occupancy (%s)', async scenario => {
+    const {provider}=await setup(scenario); const id=await route(provider); const done=vi.fn(),usage=vi.fn(); provider.onComplete(done);provider.onUsage(usage);
+    const p=normalizeProviderPayload('hello');p.sessionSystemText='full system contract '.repeat(100);
+    await provider.send(id,p); await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1));
+    const value=done.mock.calls[0][1].metadata.usage;
+    if(scenario==='usage-used') expect(value).toMatchObject({input_tokens:45000,model_context_window:1000000});
+    else { expect(value.input_tokens).toBeGreaterThan(100);expect(value.context_usage_estimated).toBe(true); }
+    expect(usage.mock.calls.some(([,u])=>u.usage.input_tokens>0)).toBe(true);
+  });
+  it('synchronizes real ACP tool calls and native snapshots into canonical Agent lifecycles', async () => {
+    const {provider}=await setup('subagents');const id=await route(provider),done=vi.fn(),events:ToolCallEvent[]=[];
+    provider.onComplete(done);provider.onToolCall((_,t)=>events.push(t));
+    await provider.send(id,'children');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1));
+    const child=events.filter(t=>t.name==='Agent');expect(child.length).toBeGreaterThan(8);
+    for(const normalizedStatus of ['running','complete','error','interrupted']) expect(child.some(t=>t.detail?.meta?.normalizedStatus===normalizedStatus)).toBe(true);
+    const a=child.filter(t=>t.detail?.meta?.agentPath==='child-a'); expect(new Set(a.map(t=>t.id)).size).toBe(1);
+    expect(a.at(-1)?.detail?.meta?.terminal).toBe(true);
+    expect(child.some(t=>t.detail?.input?.description==='find info')).toBe(true);
+    const one=child.filter(t=>t.detail?.meta?.agentName==='MultiOne');
+    const two=child.filter(t=>t.detail?.meta?.agentName==='MultiTwo');
+    expect(one.length).toBeGreaterThan(2);expect(two.length).toBeGreaterThan(2);
+    expect(new Set(one.map(t=>t.id)).size).toBe(1);expect(new Set(two.map(t=>t.id)).size).toBe(1);
+    expect(one[0].id).not.toBe(two[0].id);
+    expect(one.at(-1)?.detail?.meta?.normalizedStatus).toBe('complete');
+    expect(two.at(-1)?.detail?.meta?.normalizedStatus).toBe('error');
+
+  });
+  it.each(['native-child-log','native-child-both','native-child-rpc-late','native-child-late','native-child-late-chunks'])('bridges real-shaped native child results/reactive parent completion once without another RPC (%s)', async scenario => {
+    const {provider,requests}=await setup(scenario);const id=await route(provider),done=vi.fn(),events:ToolCallEvent[]=[];
+    provider.onComplete(done);provider.onToolCall((_,t)=>events.push(t));
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2),{timeout:6000});
+    expect(done.mock.calls.map(([,m])=>m.content)).toEqual(['PARENT-STARTED','PARENT-WOKE CHILD-PONG']);
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(1);
+    const children=events.filter(t=>t.name==='Agent');
+    expect(children.some(t=>t.detail?.meta?.agentPath==='native-child-fixture')).toBe(true);
+    await vi.waitFor(()=>expect(events.some(t=>t.detail?.meta?.normalizedStatus==='complete')).toBe(true));
+    expect(new Set(children.filter(t=>t.detail?.meta?.agentPath==='native-child-fixture').map(t=>t.id)).size).toBe(1);
+    await new Promise(r=>setTimeout(r,500));expect(done).toHaveBeenCalledTimes(2);
+    const state=(provider as any).sessions.get(id);await provider.endSession(id);expect(state.agyBridges.size).toBe(0);
+  });
+  it('pairs native-first duplicate streams once per native step, not permanently by response text',async()=>{
+    const {provider,requests}=await setup('native-child-same-twice');const id=await route(provider),done=vi.fn();provider.onComplete(done);
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(3),{timeout:5000});
+    await new Promise(r=>setTimeout(r,500));
+    expect(done.mock.calls.map(([,m])=>m.content)).toEqual(['PARENT-STARTED','PARENT-WOKE CHILD-PONG','PARENT-WOKE CHILD-PONG']);
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(1);
+  });
+  it('does not mistake a previous late ACP reply for a new foreground successor child wake',async()=>{
+    const {provider,root,requests}=await setup('native-child-late');const id=await route(provider),messages:string[]=[],nativeSteps:number[]=[];
+    provider.onComplete((_,m)=>{
+      messages.push(m.content??'');
+      if(m.content==='PARENT-WOKE CHILD-PONG') {
+        const file=path.join(root,'.gemini/antigravity-cli/brain/native-1/.system_generated/logs/transcript_full.jsonl');
+        nativeSteps.push(Math.max(...readFileSync(file,'utf8').trim().split('\n').map(line=>JSON.parse(line).step_index)));
+      }
+    });
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(messages).toHaveLength(2));
+    await provider.send(id,'immediate successor');await vi.waitFor(()=>expect(messages).toHaveLength(4));
+    await new Promise(r=>setTimeout(r,500));
+    expect(nativeSteps).toEqual([5,11]);
+    expect(messages).toHaveLength(4);expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(2);
+  });
+  it('uses independent native steps after async, ignoring unowned ACP even with repeated bodies',async()=>{
+    const {provider,root}=await setup('native-child-log');const id=await route(provider),done=vi.fn(),deltas=vi.fn();provider.onComplete(done);provider.onDelta(deltas);
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2));
+    const state=(provider as any).sessions.get(id),native=state.acpSessionId;
+    const update=(update:any)=>(provider as any).handleSessionUpdate({sessionId:native,update});
+    const before=deltas.mock.calls.length;
+    update({sessionUpdate:'agent_message_chunk',content:{type:'text',text:'Different response'}});
+    update({sessionUpdate:'turn_completed'});expect(done).toHaveBeenCalledTimes(2);expect(deltas).toHaveBeenCalledTimes(before);
+    update({sessionUpdate:'tool_call_update',toolCallId:'launch-1',status:'completed'});
+    expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
+    const file=path.join(root,'.gemini/antigravity-cli/brain',native,'.system_generated/logs/transcript_full.jsonl');
+    for(const [i,body] of ['Different response','PARENT-WOKE CHILD-PONG'].entries()) {
+      await appendFile(file,JSON.stringify({step_index:6+i*2,type:'SYSTEM_MESSAGE',status:'DONE',content:'[Message] sender=child content=result'})+'\n'+JSON.stringify({step_index:7+i*2,type:'PLANNER_RESPONSE',status:'DONE',content:body})+'\n');
+      await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(3+i));
+      expect(done.mock.calls.at(-1)![1].content).toBe(body);
+    }
+  });
+  it.each(['native-child-slow-foreground','native-child-same-foreground','native-child-cross-chunks'])('keeps an actively running successor foreground isolated from late prior chunks, usage and terminals (%s)',async scenario=>{
+    const {provider,requests}=await setup(scenario);const id=await route(provider),done=vi.fn(),deltas=vi.fn();provider.onComplete(done);provider.onDelta(deltas);
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2));
+    const start=deltas.mock.calls.length;
+    await provider.send(id,'successor foreground');
+    await new Promise(r=>setTimeout(r,600));expect(done).toHaveBeenCalledTimes(2);
+    expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true);
+    expect(deltas.mock.calls.slice(start).filter(([,d])=>d.type==='text')).toHaveLength(0);
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(4),{timeout:5000});
+    expect(done.mock.calls.map(([,m])=>m.content)).toEqual(['PARENT-STARTED','PARENT-WOKE CHILD-PONG',scenario==='native-child-same-foreground'?'PARENT-WOKE CHILD-PONG':'PARENT-STARTED','PARENT-WOKE CHILD-PONG']);
+    expect(done.mock.calls[2][1].metadata.usage).toMatchObject({input_tokens:700,output_tokens:71});
+    expect(done.mock.calls[3][1].metadata.usage).toMatchObject({input_tokens:120,output_tokens:3});
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(2);
+    await new Promise(r=>setTimeout(r,300));expect(done).toHaveBeenCalledTimes(4);
+  });
+  it('keeps async active steering correlated to the latest explicit native input without waiting for superseded output',async()=>{
+    const {provider,requests}=await setup('native-steering');const id=await route(provider),done=vi.fn(),errors=vi.fn();provider.onComplete(done);provider.onError(errors);
+    await provider.send(id,'A');await vi.waitFor(()=>expect((provider as any).sessions.get(id).agyForeground?.authoritative).toBe(true));
+    expect(await provider.notifyActiveDelegation(id,notification('B'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1));expect(done.mock.calls[0][1].content).toBe('STEERED OWNED RESULT');
+    expect(done.mock.calls[0][1].metadata.usage).toMatchObject({input_tokens:400,output_tokens:5});expect(errors).not.toHaveBeenCalled();
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(2);
+  });
+  it('waits on the native output event after prompt RPC settlement, not a dedup grace timer',async()=>{
+    const {provider,requests}=await setup('native-child-output-after-ack');const id=await route(provider),done=vi.fn();provider.onComplete(done);
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2));
+    expect(done.mock.calls.map(([,m])=>m.content)).toEqual(['PARENT-STARTED','PARENT-WOKE CHILD-PONG']);
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(1);
+  });
+  it.each(['stop','rebind'])('releases an unresolved native foreground wait on %s',async action=>{
+    const {provider,requests}=await setup('native-child-wait');const id=await route(provider),done=vi.fn();provider.onComplete(done);
+    await provider.send(id,'launch');const old=(provider as any).sessions.get(id);
+    await vi.waitFor(()=>expect(old.agyForeground?.authoritative).toBe(true));
+    await (provider as any).promptTerminals.get(old); // Actual RPC has ended; native PLANNER has not.
+    expect(done).not.toHaveBeenCalled();
+    if(action==='stop') await provider.cancel(id);else await route(provider,id,{fresh:true});
+    await vi.waitFor(()=>expect(old.agyBridges.size).toBe(0));
+    await new Promise(r=>setTimeout(r,700));expect(done).not.toHaveBeenCalled();
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(1);
+  });
+  it('fails boundedly without publishing unattributed async ACP text when the native output is absent',async()=>{
+    const {provider}=await setup('native-child-no-owned-output');const id=await route(provider),done=vi.fn(),errors=vi.fn(),deltas=vi.fn();provider.onComplete(done);provider.onError(errors);provider.onDelta(deltas);
+    // Shorten only the failure deadline on this captured owner, not file ordering/coalescing.
+    const {AgyForegroundOwnership}=await import('../../src/agent/agy-foreground-ownership.js');
+    (provider as any).sessions.get(id).agyForeground=new AgyForegroundOwnership(30);
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(errors).toHaveBeenCalledTimes(1));
+    expect(errors.mock.calls[0][1].message).toContain('could not be attributed');expect(done).not.toHaveBeenCalled();
+    expect(deltas.mock.calls.filter(([,d])=>d.type==='text')).toHaveLength(0);
+    expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
+    expect((provider as any).sessions.get(id).agyBridges.size).toBe(0);
+  });
+  it('keeps ordinary no-async ACP chunk streaming before the prompt RPC terminates',async()=>{
+    const {provider}=await setup('stream-before-ack');const id=await route(provider),done=vi.fn(),deltas=vi.fn();provider.onComplete(done);provider.onDelta(deltas);
+    await provider.send(id,'normal');await vi.waitFor(()=>expect(deltas.mock.calls.some(([,d])=>d.delta==='direct ')).toBe(true));
+    expect(done).not.toHaveBeenCalled();await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1));expect(done.mock.calls[0][1].content).toBe('direct stream');
+  });
+  it.each(['stop','rebind'])('discards native-first late ACP receipts across %s',async action=>{
+    const {provider}=await setup('native-child-late');const id=await route(provider),done=vi.fn();provider.onComplete(done);
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2));
+    if(action==='stop') await provider.cancel(id);else await route(provider,id,{fresh:true});
+    await new Promise(r=>setTimeout(r,600));expect(done).toHaveBeenCalledTimes(2);
+  });
+  it('reuses a completed native child cursor after send_message without replaying its old terminal',async()=>{
+    const {provider,requests}=await setup('native-child-reuse');const id=await route(provider),done=vi.fn(),events:ToolCallEvent[]=[];
+    provider.onComplete(done);provider.onToolCall((_,t)=>events.push(t));
+    const terminals=()=>events.filter(t=>t.name==='Agent'&&t.detail?.meta?.agentPath==='native-child-fixture'&&t.detail?.meta?.terminal);
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(2));await vi.waitFor(()=>expect(terminals()).toHaveLength(1));
+    const key=terminals()[0].id;
+    await provider.send(id,'send child another assignment');
+    await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(4));await vi.waitFor(()=>expect(terminals()).toHaveLength(2));
+    expect(terminals().every(t=>t.id===key)).toBe(true);
+    expect((await requests()).filter(r=>r.method==='session/prompt')).toHaveLength(2);
+    expect(terminals()[1].output).toBe('REUSE-PONG');
+  });
+  it('closes native log observers on Stop and never revives the stopped parent',async()=>{
+    const {provider}=await setup('native-child-log');const id=await route(provider),done=vi.fn();provider.onComplete(done);
+    await provider.send(id,'launch');await vi.waitFor(()=>expect(done).toHaveBeenCalledTimes(1));
+    const state=(provider as any).sessions.get(id);await provider.cancel(id);
+    expect(state.agyBridges.size).toBe(0);await new Promise(r=>setTimeout(r,300));expect(done).toHaveBeenCalledTimes(1);
   });
   it.each(['reordered', 'reject-b'])('Stop waits for all RPCs even after the last one settled (%s)', async scenario => {
     const { provider } = await setup(scenario), id = await route(provider), errors = vi.fn();

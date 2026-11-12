@@ -66,9 +66,10 @@ function finish(sid, state) {
   record({ fixture: 'completed-model', sessionId: sid, model: state.turnModel });
   note(sid, { sessionUpdate: 'tool_call_update', toolCallId: 'sleep', status: 'completed', rawOutput: 'done' });
   note(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: state.inputs.join(' ') } });
+  if (scenario === 'usage-used') note(sid,{sessionUpdate:'usage_update',used:45000,size:1000000});
   const pending = state.pending.splice(0);
   if (scenario === 'reordered') pending.reverse();
-  for (const [i, id] of pending.entries()) setTimeout(() => ok(id, { stopReason: 'end_turn', usage: { inputTokens: 10, outputTokens: 5 } }), i * (Number(process.env.AGY_ACP_FIXTURE_REPLY_GAP_MS) || 20));
+  for (const [i, id] of pending.entries()) setTimeout(() => ok(id, { stopReason: 'end_turn', usage: scenario === 'usage-missing' ? {} : scenario === 'usage-zero' ? {inputTokens:0,outputTokens:0} : { inputTokens: 10, outputTokens: 5 } }), i * (Number(process.env.AGY_ACP_FIXTURE_REPLY_GAP_MS) || 20));
   state.inputs = [];
   if (shouldScheduleWakeup) state.autoTimer = setTimeout(() => startAutoWakeup(sid, state), 20);
 }
@@ -127,6 +128,86 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     case 'session/prompt': {
       const state = sessions.get(p.sessionId); if (!state) return error(req.id, 'Missing session');
       const text = p.prompt.map(x => x.text || '').join('');
+      if(scenario==='native-steering') {
+        const dir=`${process.env.HOME}/.gemini/antigravity-cli/brain/${p.sessionId}/.system_generated/logs`;fs.mkdirSync(dir,{recursive:true});
+        const file=dir+'/transcript_full.jsonl',row=(step_index,type,content,extra={})=>JSON.stringify({step_index,type,content,status:'DONE',source:type==='USER_INPUT'?'USER_EXPLICIT':'MODEL',...extra})+'\n';
+        if(!state.steeringPass) {
+          state.steeringPass=1;state.steeredRpc=req.id;
+          fs.writeFileSync(file,row(0,'USER_INPUT',text));
+          note(p.sessionId,{sessionUpdate:'tool_call',toolCallId:'launch',title:'Run invoke_subagent',kind:'other',status:'in_progress',rawInput:{Role:'Child',Prompt:'work'}});
+          return;
+        }
+        fs.appendFileSync(file,row(1,'USER_INPUT',text)+row(2,'PLANNER_RESPONSE','STEERED OWNED RESULT'));
+        note(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'unattributed stale ACP'}});
+        ok(state.steeredRpc,{stopReason:'end_turn',usage:{inputTokens:100,outputTokens:2}});
+        ok(req.id,{stopReason:'end_turn',usage:{inputTokens:300,outputTokens:3}});return;
+      }
+      if (scenario.startsWith('native-child-')) {
+        const dir = `${process.env.HOME}/.gemini/antigravity-cli/brain/${p.sessionId}/.system_generated/logs`;
+        fs.mkdirSync(dir,{recursive:true});
+        const file=dir+'/transcript_full.jsonl';
+        const row=(step_index,type,content,extra={})=>JSON.stringify({step_index,type,status:'DONE',source:type==='USER_INPUT'?'USER_EXPLICIT':'MODEL',created_at:'2026-11-12T00:00:00Z',content,...extra})+'\n';
+        const childId='native-child-fixture';
+        const pass = state.bridgePass = (state.bridgePass || 0)+1, offset=(pass-1)*6;
+        if(pass===1) fs.writeFileSync(file,row(offset,'USER_INPUT',text));else fs.appendFileSync(file,row(offset,'USER_INPUT',text));
+        note(p.sessionId,{sessionUpdate:'tool_call',toolCallId:'launch-'+pass,title:pass===1?'Run invoke_subagent':'Run send_message',kind:'other',status:'in_progress',rawInput:pass===1?{Role:'WakeProbe',Prompt:'return result',Model:'model-a'}:{Recipient:childId,Prompt:'next assignment'}});
+        note(p.sessionId,{sessionUpdate:'tool_call_update',toolCallId:'launch-'+pass,status:'completed'});
+        fs.appendFileSync(file,row(offset+1,'PLANNER_RESPONSE','',{tool_calls:[{name:pass===1?'invoke_subagent':'send_message',args:pass===1?{Role:'WakeProbe'}:{Recipient:childId}}]})+row(offset+2,'GENERIC',pass===1?'Created the following subagent:\n'+JSON.stringify({conversationId:childId}):'Message sent'));
+        const foregroundRow=()=>fs.appendFileSync(file,row(offset+3,'PLANNER_RESPONSE',scenario==='native-child-same-foreground'&&pass===2?'PARENT-WOKE CHILD-PONG':'PARENT-STARTED'));
+        if(scenario==='native-child-output-after-ack') setTimeout(foregroundRow,120);else if(scenario==='native-child-wait') setTimeout(foregroundRow,600);else if(scenario!=='native-child-no-owned-output') foregroundRow();
+        note(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'PARENT-STARTED'}});
+        const finishFirst=()=>ok(req.id,{stopReason:'end_turn',usage:{inputTokens:pass===2?700:100,outputTokens:pass===2?71:2}});
+        if(pass===2 && ['native-child-slow-foreground','native-child-same-foreground','native-child-cross-chunks'].includes(scenario)) setTimeout(finishFirst,900);else if(scenario==='native-child-rpc-late') setTimeout(finishFirst,300);else finishFirst();
+        if(['native-child-wait','native-child-no-owned-output'].includes(scenario)) return;
+        setTimeout(()=>{
+          const childDir=`${process.env.HOME}/.gemini/antigravity-cli/brain/${childId}/.system_generated/logs`;fs.mkdirSync(childDir,{recursive:true});
+          if(pass===1) fs.writeFileSync(childDir+'/transcript_full.jsonl',row(0,'PLANNER_RESPONSE','CHILD-PONG'));
+          else fs.appendFileSync(childDir+'/transcript_full.jsonl',row(1,'USER_INPUT','next assignment')+row(2,'PLANNER_RESPONSE','REUSE-PONG'));
+          if(scenario==='native-child-both' || scenario==='native-child-late' || scenario==='native-child-late-chunks' || scenario==='native-child-same-twice' || ['native-child-slow-foreground','native-child-same-foreground','native-child-cross-chunks'].includes(scenario)) {
+            if(scenario==='native-child-both') note(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'PARENT-WOKE CHILD-PONG'}});
+            else setTimeout(()=>{
+              note(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'PARENT-WOKE '}});
+              setTimeout(()=>{note(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'CHILD-PONG'}});note(p.sessionId,{sessionUpdate:'usage_update',used:999999,size:1000000});note(p.sessionId,{sessionUpdate:'turn_completed'});},scenario==='native-child-late-chunks'?80:scenario==='native-child-cross-chunks'?300:0);
+            },scenario==='native-child-cross-chunks'?0:200);
+          }
+          fs.appendFileSync(file,row(offset+4,'SYSTEM_MESSAGE','[Message] sender='+childId+' content=CHILD-PONG')+row(offset+5,'PLANNER_RESPONSE','PARENT-WOKE CHILD-PONG',{input_tokens:120,cache_read_tokens:80,output_tokens:3}));
+          if(scenario==='native-child-both') note(p.sessionId,{sessionUpdate:'turn_completed'});
+          if(scenario==='native-child-same-twice') setTimeout(()=>{
+            fs.appendFileSync(file,row(offset+6,'SYSTEM_MESSAGE','[Message] sender='+childId+' content=another result')+row(offset+7,'PLANNER_RESPONSE','PARENT-WOKE CHILD-PONG'));
+            setTimeout(()=>{note(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'PARENT-WOKE CHILD-PONG'}});note(p.sessionId,{sessionUpdate:'turn_completed'});},scenario==='native-child-cross-chunks'?0:200);
+          },500);
+        },180);
+        return;
+      }
+      if (scenario === 'subagents') {
+      const nativeDir=`${process.env.HOME}/.gemini/antigravity-cli/brain/${p.sessionId}/.system_generated/logs`;fs.mkdirSync(nativeDir,{recursive:true});
+      const nativeRow=(step_index,type,content)=>JSON.stringify({step_index,type,content,status:'DONE',source:type==='USER_INPUT'?'USER_EXPLICIT':'MODEL'})+'\n';
+      fs.writeFileSync(nativeDir+'/transcript_full.jsonl',nativeRow(0,'USER_INPUT',text));
+      const ops = [
+        ['define_subagent', {name:'Researcher',prompt:'definition only'}, {}],
+        ['invoke_subagent', {Subagents:[{Role:'Researcher',Prompt:'find info',Model:'model-a'}]}, {conversationId:'child-a',status:'running'}],
+        ['manage_subagents', {action:'list'}, {subagents:[{conversationId:'child-a',status:'completed',role:'Researcher'}]}],
+        ['swarm', {action:'add',conversationId:'child-b',prompt:'work'}, {conversationId:'child-b',status:'running'}],
+        ['swarm', {action:'status'}, {agents:[{conversationId:'child-b',status:'error'}]}],
+        ['send_message', {conversationId:'child-b',prompt:'try again'}, {}],
+        ['manage_subagents', {action:'kill',conversationId:'child-b'}, {}],
+        ['browser_subagent', {prompt:'inspect local page'}, {conversationId:'browser-c',status:'completed'}],
+        ['invoke_subagent', {Subagents:[{Role:'MultiOne',Prompt:'first member'},{Role:'MultiTwo',Prompt:'second member'}]}, {subagents:[{conversationId:'multi-one',status:'running',role:'MultiOne'},{conversationId:'multi-two',status:'running',role:'MultiTwo'}]}],
+        ['manage_subagents', {action:'list'}, {subagents:[{conversationId:'multi-one',status:'completed',role:'MultiOne'},{conversationId:'multi-two',status:'failed',role:'MultiTwo'}]}],
+
+      ];
+        for (const [i,[title,rawInput,rawOutput]] of ops.entries()) {
+          note(p.sessionId, {sessionUpdate:'tool_call',toolCallId:`child-tool-${i}`,title,kind:'other',status:'in_progress',rawInput});
+          note(p.sessionId, {sessionUpdate:'tool_call_update',toolCallId:`child-tool-${i}`,status:'completed',rawOutput});
+        }
+        fs.appendFileSync(nativeDir+'/transcript_full.jsonl',nativeRow(1,'PLANNER_RESPONSE','children synced'));
+        note(p.sessionId, {sessionUpdate:'agent_message_chunk',content:{type:'text',text:'children synced'}});
+        return ok(req.id,{stopReason:'end_turn',usage:{inputTokens:50,outputTokens:2}});
+      }
+      if (scenario==='stream-before-ack') {
+        note(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'direct '}});
+        setTimeout(()=>{note(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'stream'}});ok(req.id,{stopReason:'end_turn',usage:{inputTokens:40,outputTokens:2}});},300);return;
+      }
       if (text === 'B' && scenario === 'reject-b') return error(req.id, 'B was rejected');
       if (state.inAutoWakeup) {
         record({ fixture: 'prompt-model', sessionId: p.sessionId, model: state.turnModel, text });

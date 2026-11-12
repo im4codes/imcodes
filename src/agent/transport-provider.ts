@@ -618,6 +618,9 @@ export interface TransportProvider {
    * durable conversation. Codex implements this by resuming the same thread
    * with new baseInstructions before the next turn.
    */
+  /** Read-only provider-native compaction watermark, checked before context
+   * assembly so complete role contracts are restored instead of old refs. */
+  checkSessionCompaction?(sessionId: string): Promise<boolean>;
   refreshSessionSystemText?(sessionId: string): void;
 
   // ── Core methods — all providers must implement ──────────────────────────

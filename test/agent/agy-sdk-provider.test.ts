@@ -1,8 +1,10 @@
+import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
+import { SDK_SUBAGENT_WAKE_PROMPT_HEADER } from '../../shared/sdk-subagent-status.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { withMemoryMcpSessionEnv } from '../../src/agent/providers/getDefaultMcpServers.js';
 import { MEMORY_MCP_ENV_KEYS as E } from '../../shared/memory-mcp-env.js';
 import { IMCODES_SESSION_ENV } from '../../shared/imcodes-send.js';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
@@ -120,6 +122,21 @@ process.stdin.on('data', (d) => {
       emit({ event: 'result', result: { conversation_id: convId, status: 'ERROR', response: '', error: 'boom unauthorized', num_turns: 0, usage: {} } });
       continue;
     }
+    if (text.includes('CHILD_ASYNC')) {
+      const idx=step++;
+      for(const state of ['ACTIVE','DONE']) emit({event:'step_update',step_update:{conversation_id:convId,step_index:idx,state,step_type:'tool',tool_name:'invoke_subagent',tool_info:{name:'invoke_subagent',parameters:{Role:'Async child',Prompt:'do test'},...(state==='DONE'?{output:JSON.stringify({conversationId:'async-child',status:'running'})}:{})}}});
+      emit({event:'step_update',step_update:{conversation_id:convId,step_index:step++,state:'DONE',step_type:'agent_response',text_delta:'PARENT-STARTED'}});
+      emit({event:'result',result:{conversation_id:convId,status:'SUCCESS',response:'PARENT-STARTED',usage:{input_tokens:20,output_tokens:3}}});
+      setTimeout(()=>emit({event:'subagent_notification',data:{conversationId:'async-child',status:'completed',stateDetail:'CHILD-PONG'}}),100);
+      continue;
+    }
+    if (text.includes('CONTEXT_MISSING') || text.includes('CONTEXT_ZERO')) {
+      const idx = step++;
+      emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'A nonempty answer' } });
+      const usage = text.includes('CONTEXT_ZERO') ? { input_tokens: 0, output_tokens: 0 } : {};
+      emit({ event: 'result', result: { conversation_id: convId, status: 'SUCCESS', response: 'A nonempty answer', usage } });
+      continue;
+    }
     if (text.includes('MULTI_STEP')) {
       const idx1 = step++;
       emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx1, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'Before' } });
@@ -137,6 +154,25 @@ process.stdin.on('data', (d) => {
       const idx = step++;
       emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'ACTIVE', step_type: 'tool', tool_name: 'run_command', tool_info: { name: 'run_command', parameters: { CommandLine: 'echo hi' } } } });
       emit({ event: 'step_update', step_update: { conversation_id: convId, step_index: idx, state: 'DONE', step_type: 'tool', tool_name: 'run_command', tool_info: { name: 'run_command', parameters: { CommandLine: 'echo hi' }, output: 'hi\\r\\n' } } });
+    }
+    if (text.includes('CHILD_LIFECYCLE')) {
+      const ops = [
+        ['define_subagent', {name:'Researcher',prompt:'definition only'}, {}],
+        ['invoke_subagent', {Subagents:[{Role:'Researcher',Prompt:'find info',Model:'model-a'}]}, {conversationId:'child-a',status:'running'}],
+        ['manage_subagents', {action:'list'}, {subagents:[{conversationId:'child-a',status:'completed',role:'Researcher'}]}],
+        ['swarm', {action:'add',conversationId:'child-b',prompt:'work'}, {conversationId:'child-b',status:'running'}],
+        ['swarm', {action:'status'}, {agents:[{conversationId:'child-b',status:'error'}]}],
+        ['send_message', {conversationId:'child-b',prompt:'try again'}, {}],
+        ['manage_subagents', {action:'kill',conversationId:'child-b'}, {}],
+        ['browser_subagent', {prompt:'inspect local page'}, {conversationId:'browser-c',status:'completed'}],
+        ['invoke_subagent', {Subagents:[{Role:'MultiOne',Prompt:'first member'},{Role:'MultiTwo',Prompt:'second member'}]}, {subagents:[{conversationId:'multi-one',status:'running',role:'MultiOne'},{conversationId:'multi-two',status:'running',role:'MultiTwo'}]}],
+        ['manage_subagents', {action:'list'}, {subagents:[{conversationId:'multi-one',status:'completed',role:'MultiOne'},{conversationId:'multi-two',status:'failed',role:'MultiTwo'}]}],
+
+      ];
+      for (const [name,parameters,output] of ops) {
+        const idx=step++;
+        for (const state of ['ACTIVE','DONE']) emit({event:'step_update',step_update:{conversation_id:convId,step_index:idx,state,step_type:'tool',tool_name:name,tool_info:{name,parameters,...(state==='DONE'?{output:JSON.stringify(output)}:{})}}});
+      }
     }
     if (text.includes('SUBAGENT')) {
       const idx = step++;
@@ -350,6 +386,42 @@ describe('AgySdkProvider (fake agy process)', () => {
     await provider.send(sid, contextPayload(contractV2, 'after process restart'));
     await waitFor(() => completes.length === 5);
     expect(inputs()[5]).toContain(contractV2);
+  });
+
+  it('reasserts the complete uncompressed contract after opaque compaction and model changes', async () => {
+    const sid = await provider.createSession({ sessionKey: 'uncompressed-contract', cwd: dir });
+    const contract = 'Brain: delegate, never implement.\nIdentity user/project/pair/session intact.\nMCP managed services.\n完整原文 😀';
+    let count=0;
+    const send=async(label: string, injected: boolean) => {
+      await provider.send(sid,contextPayload(contract,`ordinary ${label}`));
+      count++; await waitFor(()=>completes.length===count);
+      const prompt=inputs().at(-1)!;
+      expect(prompt.split(contract).length-1).toBe(injected?1:0);
+      expect(Number((completes.at(-1)![1].metadata?.usage as any).input_tokens)).toBeGreaterThan(0);
+    };
+    await send('initial',true); await send('ordinary2',false); await send('ordinary3',false); await send('ordinary4',false);
+    const prefix=inputs()[0].slice(0,inputs()[0].indexOf('ordinary initial'));
+    const conv = infos.find(([, info]) => info.resumeId)?.[1].resumeId!;
+    const logs = path.join(dir, '.gemini', 'antigravity-cli', 'brain', conv, '.system_generated', 'logs');
+    mkdirSync(logs, { recursive: true });
+    appendFileSync(path.join(logs, 'transcript.jsonl'), JSON.stringify({step_index:10,source:'USER_EXPLICIT',type:'USER_INPUT',status:'DONE',created_at:'2026-11-12T00:00:00Z',content:'<CONTEXT_SUMMARY>summary</CONTEXT_SUMMARY>'})+'\n');
+    await send('after summary',true); expect(inputs().at(-1)!.slice(0,prefix.length)).toBe(prefix);
+    await send('post summary ordinary',false);
+    provider.setSessionAgentId(sid,'gemini-4-argon-high');
+    await send('after model',true); await send('post model ordinary',false);
+    provider.refreshSessionSystemText(sid);
+    await send('after clear refresh',true); await send('post clear ordinary',false);
+    await provider.createSession({sessionKey:'uncompressed-contract',cwd:dir,fresh:true});
+    await send('after initialize',true); await send('post initialize ordinary',false);
+  });
+
+  it.each(['CONTEXT_MISSING', 'CONTEXT_ZERO'])('estimates positive current context when native usage is absent/zero (%s)', async (scenario) => {
+    const sid = await provider.createSession({ sessionKey: 'estimated-context', cwd: dir });
+    await provider.send(sid, contextPayload('Full system identity and MCP contract '.repeat(30), scenario));
+    await waitFor(() => completes.length === 1);
+    const usage = completes[0][1].metadata?.usage as Record<string, number>;
+    expect(usage.input_tokens).toBeGreaterThan(50);
+    expect(usages.some(([, update]) => update.finalized === true && Number(update.usage?.input_tokens) > 0)).toBe(true);
   });
 
   it('never spawns before the start barrier commits, and a failed barrier cannot start a child', async () => {
@@ -810,7 +882,7 @@ describe('AgySdkProvider (fake agy process)', () => {
 
     expect(usages.length).toBeGreaterThanOrEqual(2);
     // Live step usage
-    const stepUsage = usages.find(([, u]) => u.finalized === false);
+    const stepUsage = usages.find(([, u]) => u.finalized === false && u.usage?.input_tokens === 5 && u.usage?.output_tokens === 2);
     expect(stepUsage).toBeDefined();
     expect(stepUsage![1].usage).toMatchObject({
       input_tokens: 5,
@@ -920,6 +992,35 @@ describe('AgySdkProvider (fake agy process)', () => {
     expect(await broken.listModels()).toMatchObject({ models: [], isAuthenticated: false });
   });
 
+  it('wakes the real stream driver/runtime once for a late native child terminal without polling',async()=>{
+    const runtime=new TransportSessionRuntime(provider,'deck_ag_async_child');
+    try {
+      await runtime.initialize({sessionKey:'deck_ag_async_child',cwd:dir});
+      runtime.send('CHILD_ASYNC','child-first');
+      await waitFor(()=>completes.length===2,15000);
+      expect(inputs()).toHaveLength(2);expect(inputs()[1]).toContain(SDK_SUBAGENT_WAKE_PROMPT_HEADER);
+      expect(tools.some(([,t])=>t.name==='Agent'&&t.detail?.meta?.normalizedStatus==='complete')).toBe(true);
+      await new Promise(r=>setTimeout(r,150));expect(inputs()).toHaveLength(2);
+    } finally {await runtime.kill();}
+  });
+  it('synchronizes actual stream child launch/list/swarm/send/kill/browser/definition events', async () => {
+    const sid=await provider.createSession({sessionKey:'child-lifecycle',cwd:dir});
+    await provider.send(sid,'CHILD_LIFECYCLE'); await waitFor(()=>completes.length===1);
+    const events=tools.map(([,t])=>t).filter(t=>t.name==='Agent');
+    expect(events.length).toBeGreaterThan(8);
+    for(const state of [SDK_SUBAGENT_STATUS.RUNNING,SDK_SUBAGENT_STATUS.COMPLETE,SDK_SUBAGENT_STATUS.ERROR,SDK_SUBAGENT_STATUS.INTERRUPTED]) expect(events.some(t=>t.detail?.meta?.normalizedStatus===state)).toBe(true);
+    const child=events.filter(t=>t.detail?.meta?.agentPath==='child-a');
+    expect(new Set(child.map(t=>t.id)).size).toBe(1); expect(child.at(-1)?.detail?.meta?.terminal).toBe(true);
+    expect(events.some(t=>t.detail?.input?.description==='find info')).toBe(true);
+    const one=events.filter(t=>t.detail?.meta?.agentName==='MultiOne');
+    const two=events.filter(t=>t.detail?.meta?.agentName==='MultiTwo');
+    expect(one.length).toBeGreaterThan(2);expect(two.length).toBeGreaterThan(2);
+    expect(new Set(one.map(t=>t.id)).size).toBe(1);expect(new Set(two.map(t=>t.id)).size).toBe(1);
+    expect(one[0].id).not.toBe(two[0].id);
+    expect(one.at(-1)?.detail?.meta?.normalizedStatus).toBe(SDK_SUBAGENT_STATUS.COMPLETE);
+    expect(two.at(-1)?.detail?.meta?.normalizedStatus).toBe(SDK_SUBAGENT_STATUS.ERROR);
+
+  });
   it('emits subagent tool call with normalized SdkSubagentDetail for invoke_subagent', async () => {
     const sid = await provider.createSession({ sessionKey: 'subagent-sess', cwd: dir });
     const toolEvents: ToolCallEvent[] = [];
@@ -930,7 +1031,7 @@ describe('AgySdkProvider (fake agy process)', () => {
     const subagentCalls = toolEvents.filter((t) => t.detail?.kind === SDK_SUBAGENT_DETAIL_KIND);
     expect(subagentCalls.length).toBeGreaterThanOrEqual(1);
     const subagentCall = subagentCalls[subagentCalls.length - 1];
-    expect(subagentCall.name).toBe('invoke_subagent');
+    expect(subagentCall.name).toBe('Agent');
     expect(subagentCall.detail).toMatchObject({
       kind: SDK_SUBAGENT_DETAIL_KIND,
       summary: 'Antigravity sub-agent Researcher',
@@ -938,9 +1039,9 @@ describe('AgySdkProvider (fake agy process)', () => {
         isSdkSubagent: true,
         provider: SDK_SUBAGENT_PROVIDERS.AGY_SDK,
         providerKind: SDK_SUBAGENT_PROVIDER_KINDS.AGY_RUNTIME_AGENT,
-        normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
-        active: false,
-        terminal: true,
+        normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+        active: true,
+        terminal: false,
         backgrounded: true,
       },
     });

@@ -31,8 +31,9 @@ const PROFILE: AcpCliProviderProfile = {
   // Keep the existing text-only attachment contract. Native ACP images can be
   // enabled separately once local attachment encoding has been verified.
   compact: {
-    execution: 'unsupported', verified: true, completion: 'none', cancellation: 'none',
-    reason: 'Antigravity manages its own context; no verified ACP compact command.',
+    execution: 'slash-command', providerCommand: '/compact', verified: true,
+    completion: 'command-result', cancellation: 'provider-cancel', reassertsSessionSystemText: true,
+    reason: 'AG 1.5.6 ACP advertises compact and a real isolated RPC produces a native SYSTEM compaction checkpoint.',
   },
 };
 
