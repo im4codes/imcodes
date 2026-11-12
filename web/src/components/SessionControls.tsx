@@ -64,7 +64,8 @@ import {
 } from './OpenSpecAutoDeliver.js';
 import { OpenSpecChangeRow } from './OpenSpecChangeRow.js';
 import { useOpenSpecAutoDeliver } from '../hooks/useOpenSpecAutoDeliver.js';
-import { isIncognitoTimelineSession, requestActiveTimelineRefreshAfterUserAction } from '../hooks/useTimeline.js';
+import { requestActiveTimelineRefreshAfterUserAction } from '../hooks/useTimeline.js';
+import { isIncognitoTimelineSession } from '../incognito-session-registry.js';
 import { isIncognitoSession } from '@shared/session-incognito-types.js';
 import { isOpenSpecAutoDeliverActiveProjection } from '../openspec-auto-deliver.js';
 import type { OpenSpecAutoDeliverMaterializedLimits, OpenSpecAutoDeliverPresetId } from '../openspec-auto-deliver.js';

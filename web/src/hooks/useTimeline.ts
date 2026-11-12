@@ -1,4 +1,10 @@
 import { INCOGNITO_TIMELINE_PAYLOAD, isIncognitoSession } from '@shared/session-incognito-types.js';
+import {
+  clearIncognitoTimelineRegistry,
+  isIncognitoTimelineSession,
+  scopeIncognitoTimelineCacheKey,
+  setIncognitoTimelineKeyActive,
+} from '../incognito-session-registry.js';
 import { createTimelineDisplayProjectionCache } from '../timeline/display-projection-cache.js';
 import { createSignalWriteBatcher } from '../signal-write-batcher.js';
 import {
@@ -1040,7 +1046,7 @@ function subscribeCache(cacheKey: string, listener: (events: TimelineEvent[]) =>
 }
 
 function scopeCacheKey(serverId: string | null | undefined, sessionId: string): string {
-  return serverId ? `${serverId}:${sessionId}` : sessionId;
+  return scopeIncognitoTimelineCacheKey(serverId, sessionId);
 }
 
 function getOrCreateIncognitoState(cacheKey: string): IncognitoCacheEntry {
@@ -1062,9 +1068,7 @@ function isCacheKeyIncognito(cacheKey: string): boolean {
   return mode === 'incognito' || mode === 'closed-tombstone';
 }
 
-export function isIncognitoTimelineSession(serverId: string | null | undefined, sessionId: string): boolean {
-  return incognitoCacheState.get(scopeCacheKey(serverId, sessionId))?.mode === 'incognito';
-}
+export { isIncognitoTimelineSession };
 
 function eventEpochKey(event: TimelineEvent): string | undefined {
   return event.epoch !== undefined && event.epoch !== null ? String(event.epoch) : undefined;
@@ -1123,6 +1127,7 @@ function forgetIncognitoTimelineKey(cacheKey: string): void {
   if (state.sessionInstanceId) state.privateInstanceIds.add(state.sessionInstanceId);
   if (state.runtimeEpoch) state.privateRuntimeEpochs.add(state.runtimeEpoch);
   state.mode = 'closed-tombstone';
+  setIncognitoTimelineKeyActive(cacheKey, false);
 }
 
 function markPrivateTimelineEvents(cacheKey: string, events: TimelineEvent[]): TimelineEvent[] {
@@ -1131,6 +1136,7 @@ function markPrivateTimelineEvents(cacheKey: string, events: TimelineEvent[]): T
   if (hasPrivatePayload && (!state || state.mode === 'incognito')) {
     const next = state ?? getOrCreateIncognitoState(cacheKey);
     next.mode = 'incognito';
+    setIncognitoTimelineKeyActive(cacheKey, true);
   }
   const activeState = incognitoCacheState.get(cacheKey);
   if (activeState?.mode === 'incognito' || activeState?.mode === 'closed-tombstone') {
@@ -1166,6 +1172,7 @@ function shouldDropIncomingTimelineEvent(cacheKey: string, event: TimelineEvent)
     // An authoritative non-incognito event without closed private identity
     // indicates a brand-new normal session started with the same name.
     state.mode = 'normal';
+    setIncognitoTimelineKeyActive(cacheKey, false);
     state.sessionInstanceId = event.sessionInstanceId;
     state.runtimeEpoch = event.runtimeEpoch;
     return false;
@@ -1178,6 +1185,7 @@ function shouldDropIncomingTimelineEvent(cacheKey: string, event: TimelineEvent)
     if (hasNewPrivateInstanceIdentity(state, event)) {
       resetTransientTimelineState(cacheKey);
       state.mode = 'incognito';
+      setIncognitoTimelineKeyActive(cacheKey, true);
       if (event.sessionInstanceId) {
         state.sessionInstanceId = event.sessionInstanceId;
         state.privateInstanceIds.add(event.sessionInstanceId);
@@ -1215,6 +1223,7 @@ export function registerIncognitoTimelineSession(
     resetTransientTimelineState(cacheKey);
   }
   state.mode = 'incognito';
+  setIncognitoTimelineKeyActive(cacheKey, true);
   if (nextInstanceId !== undefined) {
     state.sessionInstanceId = nextInstanceId;
     state.privateInstanceIds.add(nextInstanceId);
@@ -1244,6 +1253,7 @@ export function registerNormalTimelineSession(
     resetTransientTimelineState(cacheKey);
   }
   state.mode = 'normal';
+  setIncognitoTimelineKeyActive(cacheKey, false);
   if (nextInstanceId !== undefined) {
     state.sessionInstanceId = nextInstanceId;
   } else if (state.sessionInstanceId && state.privateInstanceIds.has(state.sessionInstanceId)) {
@@ -1987,6 +1997,7 @@ export function __resetTimelineCacheForTests(): void {
   flushPendingTimelineSnapshotWrites();
   eventsCache.clear();
   incognitoCacheState.clear();
+  clearIncognitoTimelineRegistry();
   cacheListeners.clear();
   __resetTimelineStoresForTests();
   lastHttpBackfillResponseAt.clear();
