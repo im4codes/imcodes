@@ -1632,6 +1632,8 @@ function pairChecklistAccess(caller: McpRuntimeCaller, sessions: readonly Sessio
   const record = sessions.find((session) => session.name === caller.sessionName);
   const project = (record ? resolveEffectiveProjectName(record, sessions) : undefined)
     ?? projectOfSession(caller.sessionName ?? '')
+    ?? caller.projectName
+    ?? caller.namespace?.projectId
     ?? undefined;
   const stored = project ? getTaskPairStore().getPair(project, taskId.trim()) : undefined;
   return stored ? { status: 'forbidden', pair: stored } : { status: 'missing' };
@@ -1645,16 +1647,29 @@ function refreshPairChecklistAccess(caller: McpRuntimeCaller, previous: NonNulla
   return role === 'other' || role === 'daemon' ? { status: 'forbidden', pair } : { status: 'ok', pair };
 }
 
-function pairAccessError(access: PairChecklistAccess): ToolResult {
-  return access.status === 'forbidden'
-    ? error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain or a current pair participant may query this task pair')
-    : error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
+function pairAccessError(access: PairChecklistAccess, caller?: McpRuntimeCaller): ToolResult {
+  if (access.status === 'forbidden') {
+    const pair = access.pair.state;
+    const callerName = caller?.sessionName;
+    const isReassigned = callerName && (
+      pair.previousAuditors?.includes(callerName)
+      || pair.previousExecutors?.includes(callerName)
+    );
+    if (isReassigned) {
+      return error(
+        MCP_ERROR_REASONS.SCOPE_FORBIDDEN,
+        `session ${callerName} was reassigned from task pair ${pair.taskId} and is no longer an active participant (current executor: ${pair.executor}, auditor: ${pair.auditor})`,
+      );
+    }
+    return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain or a current pair participant may query this task pair');
+  }
+  return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
 }
 
 function pairChecklistView(pair: ReturnType<typeof pairChecklistTarget>) {
   if (!pair) return undefined;
   const markdown = pair.state.brief ?? '';
-  return { taskId: pair.state.taskId, scheduling: pair.state.scheduling ?? null, title: pair.state.title ?? null, markdown, status: pair.state.status, executor: pair.state.executor, auditor: pair.state.auditor, brain: pair.state.brain, round: pair.state.round, flags: pair.state.flags, blocking: pair.state.blocking, previousAuditors: pair.state.previousAuditors, capCounts: pair.state.capCounts, workspaceKind: pair.state.workspaceKind, lastVerdict: pair.state.lastVerdict, createdAt: pair.state.createdAt, updatedAt: pair.state.updatedAt, workspace: pair.state.workspace, material: pair.state.material, output: pair.state.output, resourceClaims: pair.state.resourceClaims ?? [], resourceCleanup: pair.state.resourceCleanup ?? null, ...taskPairChecklistCounts(markdown) };
+  return { taskId: pair.state.taskId, scheduling: pair.state.scheduling ?? null, title: pair.state.title ?? null, markdown, status: pair.state.status, executor: pair.state.executor, auditor: pair.state.auditor, brain: pair.state.brain, round: pair.state.round, flags: pair.state.flags, blocking: pair.state.blocking, previousAuditors: pair.state.previousAuditors, previousExecutors: pair.state.previousExecutors ?? [], capCounts: pair.state.capCounts, workspaceKind: pair.state.workspaceKind, lastVerdict: pair.state.lastVerdict, createdAt: pair.state.createdAt, updatedAt: pair.state.updatedAt, workspace: pair.state.workspace, material: pair.state.material, output: pair.state.output, resourceClaims: pair.state.resourceClaims ?? [], resourceCleanup: pair.state.resourceCleanup ?? null, ...taskPairChecklistCounts(markdown) };
 }
 
 function savePairBrief(pair: NonNullable<ReturnType<typeof pairChecklistTarget>>, markdown: string, writer: string) {
@@ -2229,9 +2244,9 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_GET]: async (input) => {
       const taskId = typeof input === 'object' && input !== null && typeof (input as Record<string, unknown>).taskId === 'string' ? String((input as Record<string, unknown>).taskId) : undefined;
       const access = pairChecklistAccess(caller, await sendSessions(), taskId);
-      if (access.status !== 'ok') return pairAccessError(access);
+      if (access.status !== 'ok') return pairAccessError(access, caller);
       const current = refreshPairChecklistAccess(caller, access.pair);
-      if (current.status !== 'ok') return pairAccessError(current);
+      if (current.status !== 'ok') return pairAccessError(current, caller);
       const view = pairChecklistView(current.pair)!;
       const profile = await getLocalSessionIdentityProfile(SESSION_IDENTITY_SCOPES.PAIR, sessionIdentityPairKey(access.pair.state.taskId)).catch(() => null);
       return {
@@ -2247,9 +2262,9 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (viewers !== undefined && (!Array.isArray(viewers) || viewers.length === 0 || viewers.length > TASK_PAIR_TITLE_ACCESS_MAX_USERS || viewers.some((id) => typeof id !== 'string' || !id.trim() || id.length > TASK_PAIR_TITLE_ACCESS_MAX_USER_CHARS))) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'titleViewerUserIds must contain 1..64 non-empty user ids');
       if (markdown === undefined && !title && viewers === undefined) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'markdown, title or titleViewerUserIds is required');
       const access = pairChecklistAccess(caller, await sendSessions(), typeof args.taskId === 'string' ? args.taskId : undefined);
-      if (access.status !== 'ok') return pairAccessError(access);
+      if (access.status !== 'ok') return pairAccessError(access, caller);
       const current = refreshPairChecklistAccess(caller, access.pair);
-      if (current.status !== 'ok') return pairAccessError(current);
+      if (current.status !== 'ok') return pairAccessError(current, caller);
       const pair = current.pair;
       if (viewers !== undefined) {
         if (!caller.serverId || pair.state.brain !== caller.sessionName) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain may update legacy title viewer metadata');
@@ -2260,7 +2275,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       }
       const latest = getTaskPairStore().getPair(pair.project, pair.state.taskId);
       const saved = markdown !== undefined && latest ? savePairBrief(latest, markdown, caller.sessionName ?? 'unknown') : latest;
-      if (!saved) return pairAccessError({ status: 'forbidden', pair });
+      if (!saved) return pairAccessError({ status: 'forbidden', pair }, caller);
       return pairChecklistView(saved)!;
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK]: async (input) => {
@@ -2269,13 +2284,13 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const box = args.box === 'implemented' || args.box === 'audited' ? args.box : undefined;
       if (!items || !box || typeof args.checked !== 'boolean') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'items, box and checked are required');
       const access = pairChecklistAccess(caller, await sendSessions(), typeof args.taskId === 'string' ? args.taskId : undefined);
-      if (access.status !== 'ok') return pairAccessError(access);
+      if (access.status !== 'ok') return pairAccessError(access, caller);
       const current = refreshPairChecklistAccess(caller, access.pair);
-      if (current.status !== 'ok') return pairAccessError(current);
+      if (current.status !== 'ok') return pairAccessError(current, caller);
       const pair = current.pair;
       const markdown = updateTaskPairChecklist(pair.state.brief ?? '', items, box, args.checked);
       const saved = savePairBrief(pair, markdown, caller.sessionName ?? 'unknown');
-      if (!saved) return pairAccessError({ status: 'forbidden', pair });
+      if (!saved) return pairAccessError({ status: 'forbidden', pair }, caller);
       return pairChecklistView(saved)!;
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_RESOURCE_CLAIM]: async (input) => {
@@ -3364,7 +3379,20 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const isParticipant = stored.state.brain === caller.sessionName
         || stored.state.executor === caller.sessionName
         || stored.state.auditor === caller.sessionName;
-      if (!isParticipant) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain or a current pair participant may query this task pair');
+      if (!isParticipant) {
+        const callerName = caller.sessionName;
+        const isReassigned = callerName && (
+          stored.state.previousAuditors?.includes(callerName)
+          || stored.state.previousExecutors?.includes(callerName)
+        );
+        if (isReassigned) {
+          return error(
+            MCP_ERROR_REASONS.SCOPE_FORBIDDEN,
+            `session ${callerName} was reassigned from task pair ${taskId} and is no longer an active participant (current executor: ${stored.state.executor}, auditor: ${stored.state.auditor})`,
+          );
+        }
+        return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain or a current pair participant may query this task pair');
+      }
       const eventLimit = Math.min(200, Math.max(1, Math.floor(numberArg(args, 'eventLimit') ?? 50)));
       const queuePositions = stored.state.status === 'queued'
         ? queuePositionsOf(getTaskPairStore().listPairsForBrain(caller.sessionName!, context.project, false, 500))
@@ -3700,7 +3728,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const args = pickAllowedMcpArgs(input, ['taskId', 'mode', 'dependsOn', 'note']);
       const taskId = stringArg(args, 'taskId');
       const access = pairChecklistAccess(caller, await sendSessions(), taskId);
-      if (access.status !== 'ok') return pairAccessError(access);
+      if (access.status !== 'ok') return pairAccessError(access, caller);
       const mode = stringArg(args, 'mode') ?? TASK_PAIR_PAUSE_MODES[0];
       if (!(TASK_PAIR_PAUSE_MODES as readonly string[]).includes(mode)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'unknown pause mode');
       try {
@@ -3714,7 +3742,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     [MEMORY_MCP_TOOL_NAMES.PAIR_RESUME]: async (input) => {
       const args = pickAllowedMcpArgs(input, ['taskId']);
       const access = pairChecklistAccess(caller, await sendSessions(), stringArg(args, 'taskId'));
-      if (access.status !== 'ok') return pairAccessError(access);
+      if (access.status !== 'ok') return pairAccessError(access, caller);
       try {
         resumePair(access.pair.project, access.pair.state.taskId, caller.sessionName ?? '');
         await taskPairAutomation.reconcileSuspensions();

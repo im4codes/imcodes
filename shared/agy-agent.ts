@@ -85,6 +85,9 @@ export const PROVIDER_QUOTA_GROUP_LABEL = {
 
 /** Canonical static/fallback models for `agy-sdk` used when CLI probe is pending or unauthenticated. */
 export const AGY_FALLBACK_MODEL_IDS = [
+  'gemini-4-hydrogen-high',
+  'gemini-4-hydrogen-medium',
+  'gemini-4-hydrogen-low',
   'gemini-4-argon-medium',
   'gemini-4-argon-high',
   'gemini-4-argon-low',
@@ -100,19 +103,19 @@ export const AGY_FALLBACK_MODEL_IDS = [
   'gpt-oss-120b-medium',
 ] as const;
 
-export const AGY_DEFAULT_MODEL_ID = 'gemini-3.8-flash-high' as const;
+export const AGY_DEFAULT_MODEL_ID = 'gemini-4-hydrogen-high' as const;
 
 /**
- * True when `model` is an Antigravity/AGY model (gemini-3.8-flash-*, gemini-4-argon-*,
+ * True when `model` is an Antigravity/AGY model (gemini-4-hydrogen-*, gemini-3.8-flash-*, gemini-4-argon-*,
  * or an explicit agy fallback/alias model id).
  */
 export function isAgyModelId(model: string | null | undefined): boolean {
   const trimmed = model?.trim().toLowerCase();
   if (!trimmed) return false;
   if (trimmed === 'agy' || trimmed === AGY_SDK_PROVIDER_ID) return true;
-  if (/^gemini-(?:4-argon|3\.8-flash)(?:-(?:high|medium|low))?$/i.test(trimmed)) return true;
+  if (/^gemini-(?:4-hydrogen|4-argon|3\.8-flash)(?:-(?:high|medium|low))?$/i.test(trimmed)) return true;
   if (/^gemini-(?:4|3\.8)(?:$|[-_.])/i.test(trimmed)) return true;
-  if (/^gemini-(?:flash|argon)(?:$|[-_.])/i.test(trimmed)) return true;
+  if (/^gemini-(?:flash|argon|hydrogen)(?:$|[-_.])/i.test(trimmed)) return true;
   return false;
 }
 

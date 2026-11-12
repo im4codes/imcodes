@@ -37,7 +37,7 @@ const NOW = 1_000_000;
 // the auditor role, so an auditor replacement can land on either family.
 const EXEC_MODEL = 'gpt-6-luna';
 const ANTHROPIC_AUDITOR_MODEL = 'opus';
-const OPENAI_AUDITOR_MODEL = 'gpt-5.6-sol';
+const OPENAI_AUDITOR_MODEL = 'gpt-5-audit';
 
 function poolConfig(agentType: string, providerFamily: string, model: string, role: SupervisionExecutionConfig['role']): SupervisionExecutionConfig {
   const canonical = normalizeSupervisionExecutionModel(agentType, model);

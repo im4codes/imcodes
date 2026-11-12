@@ -73,4 +73,19 @@ describe('pair checklist MCP tools', () => {
     expect(checked).toMatchObject({ reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN, message: expect.stringContaining('current pair participant') });
     expect(getTaskPairStore().getPair('p', state.taskId)?.state.brief).toBe(state.brief);
   });
+
+  it('reports an informative error when a reassigned executor or auditor calls pair tools', async () => {
+    putTaskPairFixture(getTaskPairStore(), 'p', {
+      ...state,
+      previousExecutors: ['former-executor'],
+      executor: 'new-executor',
+    });
+    const formerCaller: McpRuntimeCaller = { ...caller, sessionName: 'former-executor' };
+    const handlers = createMemoryMcpToolHandlers(formerCaller, deps);
+    const got = await handlers.pair_task_get!({ taskId: state.taskId });
+    expect(got).toMatchObject({
+      reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN,
+      message: expect.stringContaining('was reassigned from task pair'),
+    });
+  });
 });

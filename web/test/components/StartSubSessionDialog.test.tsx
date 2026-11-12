@@ -919,8 +919,8 @@ describe('StartSubSessionDialog', () => {
     fireEvent.click(screen.getByRole('button', { name: /agy_sdk/i }));
     const input = screen.getByPlaceholderText('selectModel') as HTMLInputElement;
     act(() => input.focus());
-    await waitFor(() => expect(screen.getByRole('option', { name: 'gemini-3.8-flash-high' })).toBeDefined());
-    expect(input.value).toBe('gemini-3.8-flash-high');
+    await waitFor(() => expect(screen.getByRole('option', { name: 'gemini-4-hydrogen-high' })).toBeDefined());
+    expect(input.value).toBe('gemini-4-hydrogen-high');
   });
 
   it('replaces Antigravity sub-session fallback options with the refreshed catalog', async () => {

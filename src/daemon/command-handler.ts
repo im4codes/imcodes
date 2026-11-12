@@ -5185,6 +5185,22 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
   const transportUserEventId = (clientMessageId: string) => `transport-user:${clientMessageId}`;
   const isTransportSession = record?.runtimeType === 'transport'
     || (typeof record?.agentType === 'string' && isTransportAgent(record.agentType));
+  if (isTransportSession && isSessionControlCommandText(trimmedText, 'clear') && supportsTransportClear(record?.agentType)) {
+    emitTransportUserMessage(text);
+    try {
+      await clearTransportConversation(record!, serverLink);
+      const clearStatus = isLegacy ? 'accepted_legacy' : 'accepted';
+      timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: clearStatus });
+      emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: clearStatus });
+    } catch (err) {
+      const errMsg = describeTransportSendError(err);
+      logger.error({ sessionName, err }, 'session.clear (transport) failed');
+      timelineEmitter.emit(sessionName, 'assistant.text', { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_CLEAR_FAILED, `⚠️ Clear failed: ${errMsg}`, { detail: errMsg }), streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
+      emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
+    }
+    return;
+  }
   if (!transportRuntime && isTransportSession) {
     // No runtime — provider is still (re)connecting. Queue the message for
     // automatic redelivery once `restoreTransportSessions()` rebuilds the
@@ -5380,22 +5396,6 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
     return;
   }
   if (transportRuntime) {
-    if (isSessionControlCommandText(trimmedText, 'clear') && supportsTransportClear(record?.agentType)) {
-      emitTransportUserMessage(text);
-      try {
-        await clearTransportConversation(record!, serverLink);
-        const clearStatus = isLegacy ? 'accepted_legacy' : 'accepted';
-        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: clearStatus });
-        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: clearStatus });
-      } catch (err) {
-        const errMsg = describeTransportSendError(err);
-        logger.error({ sessionName, err }, 'session.clear (transport) failed');
-        timelineEmitter.emit(sessionName, 'assistant.text', { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_CLEAR_FAILED, `⚠️ Clear failed: ${errMsg}`, { detail: errMsg }), streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
-        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
-      }
-      return;
-    }
     // `/compact` is intentionally NOT handled as daemon-side compaction here.
     // The transport runtime/provider capability decides whether it is translated
     // to an SDK RPC, forwarded as a verified slash command, or rejected visibly.

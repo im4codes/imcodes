@@ -968,6 +968,9 @@ describe('task-pair marker ingestion', () => {
     expect(brief?.text).toContain('executor of this task pair');
     // Owner rule (tsk_cd_dispatch_default): ask, don't just reply.
     expect(brief?.text).toContain('Ask, don\'t just reply');
+    const replacedNotice = sent.find((entry) => entry.target === EXEC);
+    expect(replacedNotice).toBeTruthy();
+    expect(replacedNotice?.text).toContain('You have been replaced as executor of task T13');
   });
 
   it('delivers the stored brief again when Brain explicitly requeues a cancelled pair', async () => {

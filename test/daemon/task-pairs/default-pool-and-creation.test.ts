@@ -72,7 +72,7 @@ describe('the secondary tier per provider family comes from one shared table', (
     expect(supervisionSecondaryModelOfFamily('anthropic')).toBe('claude-sonnet');
     expect(supervisionSecondaryLaunchModelOfFamily('anthropic')).toBe('sonnet');
     expect(supervisionSecondaryLaunchModelOfFamily('openai')).toBe('gpt-6-sol');
-    expect(supervisionSecondaryLaunchModelOfFamily('google')).toBe('gemini-3.8-flash-high');
+    expect(supervisionSecondaryLaunchModelOfFamily('google')).toBe('gemini-4-hydrogen-high');
     expect(supervisionSecondaryLaunchModelOfFamily('deepseek')).toBeUndefined();
     const check = (brainFamily: string, targetFamily: string, targetModel: string) => isDefaultSecondaryTierTarget({ brainFamily, targetFamily, targetModel });
     expect(check('anthropic', 'anthropic', 'claude-sonnet-5')).toBe(true);
@@ -82,6 +82,7 @@ describe('the secondary tier per provider family comes from one shared table', (
     expect(check('openai', 'openai', 'gpt-6-sol')).toBe(true);
     expect(check('openai', 'openai', 'gpt-6-luna')).toBe(false);
     expect(check('google', 'google', 'gemini-3.8-flash-high')).toBe(true);
+    expect(check('google', 'google', 'gemini-4-hydrogen-high')).toBe(true);
     expect(check('google', 'google', 'gemini-4-argon-medium')).toBe(true);
     expect(check('unknown', 'unknown', 'claude-sonnet-5')).toBe(false); // a family without a tier row has no default
   });
@@ -329,7 +330,7 @@ describe('creation: one deterministic rule', () => {
     const googleBrain = brainRecord({ agentType: 'agy-sdk' });
     expect(resolveCreationConfig(googleBrain, undefined)).toMatchObject({
       ok: true,
-      config: { providerFamily: 'google', model: 'gemini-3.8-flash-high', agentType: 'agy-sdk', runtimeType: 'transport' },
+      config: { providerFamily: 'google', model: 'gemini-4-hydrogen-high', agentType: 'agy-sdk', runtimeType: 'transport' },
     });
     expect(await ensurePairSessions({ ...base, executor: 'deck_sub_x', createExecutor: {} }, w.deps)).toMatchObject({ ok: false, error: expect.stringContaining('createExecutor cannot be combined') });
     expect(await ensurePairSessions({ ...base, auditorModel: 'opus', createAuditor: {} }, w.deps)).toMatchObject({ ok: false, error: expect.stringContaining('createAuditor cannot be combined') });

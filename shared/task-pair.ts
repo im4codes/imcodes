@@ -1267,6 +1267,7 @@ export interface TaskPairState {
   blockingSource?: TaskPairBlockingSource;
   lastVerdict?: TaskPairLastVerdict;
   previousAuditors: string[];
+  previousExecutors?: string[];
   /** Blocker / decision explanation episode generation. Monotonically advanced on genuine entry or context change. */
   episodeGeneration?: number;
   /** Auditor explicitly selected by Brain; heartbeat replacement must keep it
@@ -1691,6 +1692,7 @@ function clonePair(pair: TaskPairState): TaskPairState {
     flagSides: { ...pair.flagSides },
     blocking: [...pair.blocking],
     previousAuditors: [...pair.previousAuditors],
+    previousExecutors: pair.previousExecutors ? [...pair.previousExecutors] : [],
     capCounts: { ...pair.capCounts },
     lastWaitResolution: pair.lastWaitResolution ? { ...pair.lastWaitResolution } : undefined,
     lastVerdict: pair.lastVerdict ? {
@@ -1717,6 +1719,7 @@ function newPair(taskId: string, brain: string, ctx: TaskPairApplyContext, statu
     blocking: normalizeAuditBlockingSeverities(ctx.projectBlocking),
     blockingSource: 'config',
     previousAuditors: [],
+    previousExecutors: [],
     capCounts: {},
     capRound: 0,
     ...(status !== 'queued' ? { startedAt: ctx.now } : {}),
@@ -1752,7 +1755,15 @@ function resetCaps(pair: TaskPairState): void {
 }
 
 function setRolesFromAttrs(pair: TaskPairState, attrs: Record<string, string>, intents: TaskPairIntent[]): void {
-  if (attrs.executor) pair.executor = attrs.executor;
+  if (attrs.executor) {
+    if (pair.executor && pair.executor !== attrs.executor) {
+      if (!pair.previousExecutors) pair.previousExecutors = [];
+      if (!pair.previousExecutors.includes(pair.executor)) {
+        pair.previousExecutors.push(pair.executor);
+      }
+    }
+    pair.executor = attrs.executor;
+  }
   if (attrs.executormodel) pair.executorModel = attrs.executormodel;
   if (attrs.executorthinking) pair.executorThinking = attrs.executorthinking;
   if (attrs.auditor) {

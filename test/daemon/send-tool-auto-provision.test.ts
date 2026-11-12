@@ -137,7 +137,7 @@ describe('send_message task.autoProvision: what gets created', () => {
   });
 
   it('refuses, naming the fix, when the family has no default model to create', async () => {
-    const odd = session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain', agentType: 'gemini', providerId: 'google' });
+    const odd = session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain', agentType: 'deepseek', providerId: 'deepseek' });
     const { result, requests } = await send(odd, [], {});
     expect(requests).toHaveLength(0);
     expect(result).toMatchObject({ status: 'error', error: expect.stringContaining('requestedExecutionType') });

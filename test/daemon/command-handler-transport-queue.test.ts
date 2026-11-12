@@ -3759,8 +3759,8 @@ describe('handleWebCommand transport queue behavior', () => {
       type: 'transport.models_response',
       agentType: AGY_SDK_PROVIDER_ID,
       requestId: 'passive-agy-default',
-      defaultModel: 'gemini-3.8-flash-high',
-      models: expect.arrayContaining([expect.objectContaining({ id: 'gemini-3.8-flash-high' })]),
+      defaultModel: 'gemini-4-hydrogen-high',
+      models: expect.arrayContaining([expect.objectContaining({ id: 'gemini-4-hydrogen-high' })]),
     }));
   });
 
@@ -4801,6 +4801,38 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(getResendEntries('deck_transport_brain')).toEqual([
       expect.objectContaining({ text: '/model gemini-2.5-pro', commandId: 'cmd-missing-runtime-type-model' }),
     ]);
+
+    clearAllResend();
+  });
+
+  it('executes /clear even when transport runtime is missing instead of queuing it for resend', async () => {
+    const { clearAllResend, getResendEntries } = await import('../../src/daemon/transport-resend-queue.js');
+    clearAllResend();
+
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: AGY_SDK_PROVIDER_ID,
+      providerId: AGY_SDK_PROVIDER_ID,
+      runtimeType: 'transport',
+      state: 'idle',
+    });
+    getTransportRuntimeMock.mockReturnValue(undefined);
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/clear',
+      commandId: 'cmd-missing-runtime-clear',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(getResendEntries('deck_transport_brain')).toHaveLength(0);
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_transport_brain',
+      fresh: true,
+    }));
 
     clearAllResend();
   });

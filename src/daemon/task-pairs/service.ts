@@ -1052,6 +1052,28 @@ export class TaskPairService {
           && (transition.effect === 'reassigned' || transition.effect === 'reassigned_auditor')))) {
       this.#track(this.briefParticipants(input.project, stored.state.taskId));
     }
+    if (stored && (transition.effect === 'reassigned' || transition.effect === 'reassigned_auditor')) {
+      const oldExecutor = existing?.state.executor;
+      const newExecutor = stored.state.executor;
+      if (oldExecutor && newExecutor && oldExecutor !== newExecutor) {
+        this.#track(sendTaskPairMessage(
+          oldExecutor,
+          stored.state.taskId,
+          'task-pair-reassigned',
+          `You have been replaced as executor of task ${stored.state.taskId} by ${newExecutor}. Please stop working on this task and do not call pair tools for it.`,
+        ));
+      }
+      const oldAuditor = existing?.state.auditor;
+      const newAuditor = stored.state.auditor;
+      if (oldAuditor && newAuditor && oldAuditor !== newAuditor && oldAuditor !== TASK_PAIR_NO_AUDITOR) {
+        this.#track(sendTaskPairMessage(
+          oldAuditor,
+          stored.state.taskId,
+          'task-pair-reassigned',
+          `You have been replaced as auditor of task ${stored.state.taskId} by ${newAuditor}.`,
+        ));
+      }
+    }
     // Brain's explicit marker can still start a queued pair by hand. It must end
     // up exactly like an admitted pair: workspace provisioned, brief delivered.
     if (stored && !input.suppressAutomaticBrief && input.source !== 'queue' && transition.fromStatus === 'queued'

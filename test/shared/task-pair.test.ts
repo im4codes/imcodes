@@ -636,6 +636,8 @@ describe('task-pair state machine', () => {
     expect(apply(withStatus('in_audit'), EXEC, '<!-- IMCODES_TASK REASSIGN T42 auditor=deck_sub_c -->').pair).toBeUndefined();
     const reassigned = apply(withStatus('in_audit'), BRAIN, '<!-- IMCODES_TASK REASSIGN T42 auditor=deck_sub_c -->').pair!;
     expect(reassigned).toMatchObject({ auditor: 'deck_sub_c', previousAuditors: [AUD] });
+    const reassignedExec = apply(withStatus('working'), BRAIN, '<!-- IMCODES_TASK REASSIGN T42 executor=deck_sub_b -->').pair!;
+    expect(reassignedExec).toMatchObject({ executor: 'deck_sub_b', previousExecutors: [EXEC] });
   });
 
   it('applies a non-participant status marker as unusual without changing roles', () => {
