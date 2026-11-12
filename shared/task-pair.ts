@@ -1706,7 +1706,7 @@ function clonePair(pair: TaskPairState): TaskPairState {
     flagSides: { ...pair.flagSides },
     blocking: [...pair.blocking],
     previousAuditors: [...pair.previousAuditors],
-    previousExecutors: pair.previousExecutors ? [...pair.previousExecutors] : [],
+    ...(pair.previousExecutors ? { previousExecutors: [...pair.previousExecutors] } : {}),
     capCounts: { ...pair.capCounts },
     lastWaitResolution: pair.lastWaitResolution ? { ...pair.lastWaitResolution } : undefined,
     lastVerdict: pair.lastVerdict ? {
