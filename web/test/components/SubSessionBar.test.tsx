@@ -216,6 +216,15 @@ describe('SubSessionBar', () => {
     expect(view.container.querySelector('.subsession-card-model')).toBeNull();
     view.rerender(<SubSessionBar {...props} subSessions={[{ ...sub, activeModel: null }]} />);
     expect(view.container.querySelector('.subsession-card-model')?.textContent).toBe('argon-high');
+    view.rerender(
+      <SubSessionBar
+        {...props}
+        subSessions={[{ ...sub, requestedModel: 'gemini-4-hydrogen-high', activeModel: 'gemini-4-hydrogen-high' }]}
+        subUsages={new Map([[sub.sessionName, { inputTokens: 100_000, cacheTokens: 0, contextWindow: 1_000_000, model: 'gemini-2.5-pro' }]])}
+      />,
+    );
+    expect(view.container.querySelector('.subsession-card-model')?.textContent).toBe('hydrogen-high');
+    expect(view.container.querySelector('.subsession-card-model')?.getAttribute('title')).toBe('gemini-4-hydrogen-high · gemini-2.5-pro');
   });
 
   it('shows gray, green, and yellow daemon-bar connection states from the live broker', async () => {

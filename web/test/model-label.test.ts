@@ -89,6 +89,27 @@ describe('bestModelLabel', () => {
     expect(bestModelLabel('claude-opus-4-8', 'opus[1M]')).toBe('opus-4.8');
   });
 
+  it('preserves pre-cap version priority across multi-segment and bare-alias candidates', () => {
+    expect(bestModelLabel('gemini-4-hydrogen-high', 'gemini-2.5-pro')).toBe('hydrogen-high');
+    expect(bestModelLabel('auto', 'gemini-4-hydrogen-high')).toBe('hydrogen-high');
+    expect(bestModelLabel('qwen3-coder-next', 'glm-4.7')).toBe('coder-next');
+    expect(bestModelLabel('deepseek-v3-beta-fast', 'gpt-5.4')).toBe('beta-fast');
+    expect(bestModelLabel('gemini-3.8-flash-high', 'gpt-5.4')).toBe('flash');
+    expect(bestModelLabel('opus-20260514', 'claude-opus-4-8')).toBe('opus-4.8');
+    expect(subSessionModelPresentation('gemini-4-hydrogen-high', 'gemini-2.5-pro')).toEqual({
+      label: 'hydrogen-high',
+      title: 'gemini-4-hydrogen-high · gemini-2.5-pro',
+    });
+    expect(subSessionModelPresentation('auto', 'gemini-4-hydrogen-high')).toEqual({
+      label: 'hydrogen-high',
+      title: 'auto · gemini-4-hydrogen-high',
+    });
+    expect(subSessionModelPresentation('qwen3-coder-next', 'glm-4.7')).toEqual({
+      label: 'coder-next',
+      title: 'qwen3-coder-next · glm-4.7',
+    });
+  });
+
   it('falls back to the first non-empty label when none have a version', () => {
     expect(bestModelLabel('opus[1M]', undefined)).toBe('opus');
     expect(bestModelLabel(null, 'opus[1M]')).toBe('opus');
