@@ -4897,6 +4897,7 @@
     "local_preview": "本地预览",
     "fullscreen": "全屏",
     "exit_fullscreen": "退出全屏",
+    "unsupported_local_format": "当前格式暂不支持本地预览",
     "open_in_onlyoffice": "ONLYOFFICE 表格"
   },
   "doc_share": {

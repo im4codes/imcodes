@@ -733,6 +733,9 @@ export function FileBrowser({
   } | null>(null);
   const [activeSharedDocServerId, setActiveSharedDocServerId] = useState<string | undefined>(undefined);
   const [activeSharedDocReadOnly, setActiveSharedDocReadOnly] = useState<boolean | undefined>(undefined);
+  const [sharedNewName, setSharedNewName] = useState('');
+  const [sharedNewKind, setSharedNewKind] = useState<'docx' | 'xlsx' | 'pptx' | 'md' | 'folder'>('docx');
+  const [sharedShowCreate, setSharedShowCreate] = useState(false);
   const externalShareToken = useMemo(() => detectExternalDocShareToken(), []);
   const [contextMenu, setContextMenu] = useState<FileContextMenuState | null>(null);
   const [modifiedFiles, setModifiedFiles] = useState<Map<string, string>>(new Map()); // path → git code
@@ -3193,24 +3196,99 @@ export function FileBrowser({
               }}
             >
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 11, color: '#94a3b8' }}>
-                <span>{sharedFolderView.currentPath}</span>
-                {sharedFolderView.currentPath !== sharedFolderView.rootPath && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const parent = sharedFolderView.currentPath.split('/').slice(0, -1).join('/') || sharedFolderView.rootPath;
-                      const safeParent = parent.startsWith(sharedFolderView.rootPath) ? parent : sharedFolderView.rootPath;
-                      void browseSharedDocFolder(sharedFolderView.serverId, safeParent).then((res) => {
-                        if (!mountedRef.current) return;
-                        setSharedFolderView((prev) => prev ? { ...prev, currentPath: res.path, entries: res.entries } : null);
-                      });
-                    }}
-                    style={{ background: 'transparent', border: 'none', color: '#60a5fa', cursor: 'pointer', fontSize: 11 }}
-                  >
-                    ↑ {t('doc_share.up_dir', 'Up')}
-                  </button>
-                )}
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 160 }}>{sharedFolderView.currentPath}</span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+                  {sharedFolderView.role === 'editor' && (
+                    <button
+                      type="button"
+                      data-testid="shared-folder-create-toggle"
+                      onClick={() => setSharedShowCreate((prev) => !prev)}
+                      style={{ background: 'transparent', border: 'none', color: '#38bdf8', cursor: 'pointer', fontSize: 11, fontWeight: 600 }}
+                      title={t('doc_share.new_document', 'New Document')}
+                    >
+                      +
+                    </button>
+                  )}
+                  {sharedFolderView.currentPath !== sharedFolderView.rootPath && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const parent = sharedFolderView.currentPath.split('/').slice(0, -1).join('/') || sharedFolderView.rootPath;
+                        const safeParent = parent.startsWith(sharedFolderView.rootPath) ? parent : sharedFolderView.rootPath;
+                        void browseSharedDocFolder(sharedFolderView.serverId, safeParent).then((res) => {
+                          if (!mountedRef.current) return;
+                          setSharedFolderView((prev) => prev ? { ...prev, currentPath: res.path, entries: res.entries } : null);
+                        });
+                      }}
+                      style={{ background: 'transparent', border: 'none', color: '#60a5fa', cursor: 'pointer', fontSize: 11 }}
+                    >
+                      ↑ {t('doc_share.up_dir', 'Up')}
+                    </button>
+                  )}
+                </div>
               </div>
+              {sharedShowCreate && sharedFolderView.role === 'editor' && (
+                <form
+                  data-testid="shared-folder-create-form"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    if (!sharedNewName.trim()) return;
+                    const base = sharedNewName.trim();
+                    const ext = sharedNewKind === 'folder' ? '' : `.${sharedNewKind}`;
+                    const finalName = ext && base.toLowerCase().endsWith(ext) ? base : `${base}${ext}`;
+                    void createSharedDocItem(sharedFolderView.serverId, {
+                      parentDir: sharedFolderView.currentPath,
+                      name: finalName,
+                      kind: sharedNewKind === 'folder' ? 'folder' : 'file',
+                    }).then((created) => {
+                      setSharedNewName('');
+                      setSharedShowCreate(false);
+                      return browseSharedDocFolder(sharedFolderView.serverId, sharedFolderView.currentPath).then((res) => {
+                        if (!mountedRef.current) return;
+                        setSharedFolderView((prev) => prev ? { ...prev, entries: res.entries } : null);
+                        if (created.kind === 'file') {
+                          setActiveSharedDocServerId(sharedFolderView.serverId);
+                          setActiveSharedDocReadOnly(false);
+                          setPreview({
+                            status: 'office',
+                            path: created.path,
+                            srcUrl: '',
+                            mimeType: getOfficeType(created.path) || 'text/markdown',
+                          });
+                        }
+                      });
+                    });
+                  }}
+                  style={{ display: 'flex', gap: 4, marginTop: 4, flexWrap: 'wrap' }}
+                >
+                  <input
+                    type="text"
+                    data-testid="shared-folder-new-name-input"
+                    value={sharedNewName}
+                    onInput={(e) => setSharedNewName((e.target as HTMLInputElement).value)}
+                    placeholder={t('doc_share.new_file_name', 'Name...')}
+                    style={{ flex: 1, minWidth: 80, padding: '3px 6px', background: '#0f172a', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 4, fontSize: 11 }}
+                  />
+                  <select
+                    value={sharedNewKind}
+                    onChange={(e) => setSharedNewKind((e.target as HTMLSelectElement).value as any)}
+                    style={{ padding: '3px', background: '#0f172a', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 4, fontSize: 11 }}
+                  >
+                    <option value="docx">.docx</option>
+                    <option value="xlsx">.xlsx</option>
+                    <option value="pptx">.pptx</option>
+                    <option value="md">.md</option>
+                    <option value="folder">{t('doc_share.folder', 'Folder')}</option>
+                  </select>
+                  <button
+                    type="submit"
+                    data-testid="shared-folder-create-submit"
+                    style={{ padding: '3px 8px', background: '#2563eb', color: '#fff', border: 'none', borderRadius: 4, fontSize: 11, cursor: 'pointer' }}
+                  >
+                    OK
+                  </button>
+                </form>
+              )}
               {sharedFolderView.entries.map((entry) => (
                 <div
                   key={entry.path}

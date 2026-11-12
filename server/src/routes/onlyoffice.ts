@@ -1,4 +1,6 @@
 import { createHash, createHmac } from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { deflateRawSync } from 'node:zlib';
 import { Hono } from 'hono';
@@ -9,6 +11,7 @@ import { randomHex, sha256Hex, signJwt, verifyJwt } from '../security/crypto.js'
 import { resolveAuthOutcome } from '../security/authorization.js';
 import {
   getDocumentShareById,
+  isPathWithinSharedFolder,
   normalizeDocumentSharePath,
   resolveEffectiveDocumentAccess,
   type DocumentShareRole,
@@ -153,6 +156,48 @@ interface DocumentVersionState {
   activeKey: string;
 }
 
+const ROOMS_STORE_PATH = path.join(os.tmpdir(), '.imcodes-onlyoffice-rooms.json');
+
+function loadPersistentRooms(): Record<string, DocumentVersionState> {
+  try {
+    if (fs.existsSync(ROOMS_STORE_PATH)) {
+      const raw = fs.readFileSync(ROOMS_STORE_PATH, 'utf8');
+      const data = JSON.parse(raw);
+      if (data && typeof data === 'object') return data;
+    }
+  } catch { /* ignore */ }
+  return {};
+}
+
+function savePersistentRoom(mapKey: string, state: DocumentVersionState | null): void {
+  try {
+    const data = loadPersistentRooms();
+    if (state === null) {
+      delete data[mapKey];
+    } else {
+      data[mapKey] = state;
+    }
+    fs.writeFileSync(ROOMS_STORE_PATH, JSON.stringify(data), 'utf8');
+  } catch { /* ignore */ }
+}
+
+const docCommitMutex = new Map<string, Promise<void>>();
+async function lockDocumentCommit<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const prev = docCommitMutex.get(key) ?? Promise.resolve();
+  let resolveNext!: () => void;
+  const next = new Promise<void>((r) => { resolveNext = r; });
+  docCommitMutex.set(key, prev.then(() => next));
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    resolveNext();
+    if (docCommitMutex.get(key) === next) {
+      docCommitMutex.delete(key);
+    }
+  }
+}
+
 // Track per-document collaborative state backed by the recoverable daemon file digest
 // so concurrent opens of the same document version share the exact same key, while
 // completed saves, external edits, or process restarts never reuse a stale version room.
@@ -179,7 +224,7 @@ export function getOnlyOfficeDocumentKey(
     const rev = documentRevisionMap.get(`${mapKey}:${contentHash}`) ?? 0;
     return computeDocumentKeyFromDigest(serverId, normalizedPath, contentHash, rev);
   }
-  const existingState = documentVersionStateMap.get(mapKey);
+  const existingState = documentVersionStateMap.get(mapKey) || loadPersistentRooms()[mapKey];
   if (existingState) {
     return existingState.activeKey;
   }
@@ -196,7 +241,7 @@ export function bumpOnlyOfficeDocumentRevision(
   const next = (documentRevisionMap.get(mapKey) ?? 1) + 1;
   documentRevisionMap.set(mapKey, next);
 
-  const existing = documentVersionStateMap.get(mapKey);
+  const existing = documentVersionStateMap.get(mapKey) || loadPersistentRooms()[mapKey];
   const resolvedHash = newContentHash ?? existing?.committedHash;
   if (resolvedHash) {
     const digestRevKey = `${mapKey}:${resolvedHash}`;
@@ -206,12 +251,14 @@ export function bumpOnlyOfficeDocumentRevision(
       documentRevisionMap.set(digestRevKey, nextDigestRev);
     }
     const activeKey = computeDocumentKeyFromDigest(serverId, normalizedPath, resolvedHash, nextDigestRev);
-    documentVersionStateMap.set(mapKey, {
+    const newState: DocumentVersionState = {
       committedHash: resolvedHash,
       lastForceSavedHash: null,
       rev: next,
       activeKey,
-    });
+    };
+    documentVersionStateMap.set(mapKey, newState);
+    savePersistentRoom(mapKey, newState);
   }
   return next;
 }
@@ -230,7 +277,14 @@ export async function resolveOnlyOfficeDocumentKey(
   try {
     const { bytes } = await readFileFromDaemon(serverId, normalizedPath, options);
     const currentHash = createHash('sha256').update(bytes).digest('hex');
-    const existing = documentVersionStateMap.get(mapKey);
+    let existing = documentVersionStateMap.get(mapKey);
+    if (!existing) {
+      const persisted = loadPersistentRooms()[mapKey];
+      if (persisted) {
+        existing = persisted;
+        documentVersionStateMap.set(mapKey, existing);
+      }
+    }
     if (existing) {
       if (currentHash === existing.committedHash || currentHash === existing.lastForceSavedHash) {
         return existing.activeKey;
@@ -238,23 +292,27 @@ export async function resolveOnlyOfficeDocumentKey(
       // File content changed externally on the daemon -> advance to new version key
       const digestRev = documentRevisionMap.get(`${mapKey}:${currentHash}`) ?? 0;
       const activeKey = computeDocumentKeyFromDigest(serverId, normalizedPath, currentHash, digestRev);
-      documentVersionStateMap.set(mapKey, {
+      const newState: DocumentVersionState = {
         committedHash: currentHash,
         lastForceSavedHash: null,
         rev: existing.rev + 1,
         activeKey,
-      });
+      };
+      documentVersionStateMap.set(mapKey, newState);
+      savePersistentRoom(mapKey, newState);
       return activeKey;
     }
 
     const digestRev = documentRevisionMap.get(`${mapKey}:${currentHash}`) ?? 0;
     const activeKey = computeDocumentKeyFromDigest(serverId, normalizedPath, currentHash, digestRev);
-    documentVersionStateMap.set(mapKey, {
+    const newState: DocumentVersionState = {
       committedHash: currentHash,
       lastForceSavedHash: null,
       rev: documentRevisionMap.get(mapKey) ?? 1,
       activeKey,
-    });
+    };
+    documentVersionStateMap.set(mapKey, newState);
+    savePersistentRoom(mapKey, newState);
     return activeKey;
   } catch {
     return getOnlyOfficeDocumentKey(serverId, normalizedPath);
@@ -550,10 +608,14 @@ export async function writeFileToDaemon(
   const norm = normalizeDocumentSharePath(filePath);
   if (!norm) throw new Error('invalid_path');
 
+  const allowedRoot = options?.allowedRoot;
+  if (allowedRoot && !isPathWithinSharedFolder(norm, allowedRoot)) {
+    throw new Error('forbidden_path');
+  }
+
   const meta = getOnlyOfficeDocumentMeta(norm);
   const isBinary = options?.isBinary ?? meta?.isBinary ?? false;
   const createOnly = Boolean(options?.createOnly);
-  const allowedRoot = options?.allowedRoot;
 
   if (!isBinary) {
     const requestId = `oo-write-${randomHex(10)}`;
@@ -602,6 +664,7 @@ export async function writeFileToDaemon(
         size: bytes.length,
         content: bytes.toString('base64'),
         destinationDirectory: parentDir,
+        ...(allowedRoot ? { allowedRoot } : {}),
       },
       15_000,
     );
@@ -625,6 +688,7 @@ export async function writeFileToDaemon(
       size: bytes.length,
       content: bytes.toString('base64'),
       destinationDirectory: parentDir,
+      ...(allowedRoot ? { allowedRoot } : {}),
     },
     15_000,
   );
@@ -1418,13 +1482,14 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
       return c.json({ error: 1, message: 'untrusted_download_url' }, 400);
     }
 
-    const currentActiveKey = await resolveOnlyOfficeDocumentKey(claims.serverId, claims.path, {
+    const mapKey = `${claims.serverId}:${claims.path}`;
+    const preCheckKey = await resolveOnlyOfficeDocumentKey(claims.serverId, claims.path, {
       allowedRoot: liveAccess.allowedRoot ?? undefined,
     });
-    if (claims.documentKey && currentActiveKey !== claims.documentKey) {
+    if (claims.documentKey && preCheckKey !== claims.documentKey) {
       return c.json({ error: 1, message: 'stale_document_key' }, 409);
     }
-    if (signedKey && currentActiveKey !== signedKey) {
+    if (signedKey && preCheckKey !== signedKey) {
       return c.json({ error: 1, message: 'stale_document_key' }, 409);
     }
 
@@ -1447,29 +1512,56 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
     const bytes = Buffer.from(arrayBuf);
     const meta = getOnlyOfficeDocumentMeta(claims.path);
 
-    try {
-      await writeFileToDaemon(claims.serverId, claims.path, bytes, {
-        createOnly: false,
-        isBinary: meta?.isBinary ?? true,
-        mimeType: meta?.mimeType,
-        allowedRoot: liveAccess.allowedRoot ?? undefined,
-      });
-    } catch (writeErr) {
-      const msg = writeErr instanceof Error ? writeErr.message : String(writeErr);
-      const errStatus = msg === 'forbidden_path' ? 403 : 502;
-      return c.json({ error: 1, message: msg }, errStatus);
-    }
-
-    const newDigest = createHash('sha256').update(bytes).digest('hex');
-    if (status === 2) {
-      bumpOnlyOfficeDocumentRevision(claims.serverId, claims.path, newDigest);
-    } else if (status === 6) {
-      const mapKey = `${claims.serverId}:${claims.path}`;
-      const existing = documentVersionStateMap.get(mapKey);
-      if (existing) {
-        existing.lastForceSavedHash = newDigest;
+    return await lockDocumentCommit(mapKey, async () => {
+      // Re-check live access and key CAS under commit lock
+      const liveCommitAccess = await verifyLiveClaimsAccess(c.env.DB, claims);
+      if (!liveCommitAccess.allowed || liveCommitAccess.role !== 'editor') {
+        return c.json({ error: 1, message: 'share_revoked_or_downgraded' }, 403);
       }
-    }
+
+      const keyAtCommit = await resolveOnlyOfficeDocumentKey(claims.serverId, claims.path, {
+        allowedRoot: liveCommitAccess.allowedRoot ?? undefined,
+      });
+      if (claims.documentKey && keyAtCommit !== claims.documentKey) {
+        return c.json({ error: 1, message: 'stale_document_key' }, 409);
+      }
+      if (signedKey && keyAtCommit !== signedKey) {
+        return c.json({ error: 1, message: 'stale_document_key' }, 409);
+      }
+
+      try {
+        await writeFileToDaemon(claims.serverId, claims.path, bytes, {
+          createOnly: false,
+          isBinary: meta?.isBinary ?? true,
+          mimeType: meta?.mimeType,
+          allowedRoot: liveCommitAccess.allowedRoot ?? undefined,
+        });
+      } catch (writeErr) {
+        const msg = writeErr instanceof Error ? writeErr.message : String(writeErr);
+        const errStatus = msg === 'forbidden_path' ? 403 : 502;
+        return c.json({ error: 1, message: msg }, errStatus);
+      }
+
+      const newDigest = createHash('sha256').update(bytes).digest('hex');
+      if (status === 2) {
+        bumpOnlyOfficeDocumentRevision(claims.serverId, claims.path, newDigest);
+      } else if (status === 6) {
+        let existing = documentVersionStateMap.get(mapKey);
+        if (!existing) {
+          const persisted = loadPersistentRooms()[mapKey];
+          if (persisted) {
+            existing = persisted;
+            documentVersionStateMap.set(mapKey, existing);
+          }
+        }
+        if (existing) {
+          existing.lastForceSavedHash = newDigest;
+          savePersistentRoom(mapKey, existing);
+        }
+      }
+
+      return c.json({ error: 0 });
+    });
   }
 
   return c.json({ error: 0 });

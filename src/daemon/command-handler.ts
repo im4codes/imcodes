@@ -137,7 +137,7 @@ import {
   type TimelineResponseStatus,
 } from '../../shared/timeline-protocol.js';
 import { homedir } from 'os';
-import { lstat as fsLstat, open as fsOpen, readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, rename as fsRename, rm as fsRm, stat as fsStat, unlink as fsUnlink, writeFile as fsWriteFile } from 'node:fs/promises';
+import { chmod as fsChmod, lstat as fsLstat, open as fsOpen, readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, rename as fsRename, rm as fsRm, stat as fsStat, unlink as fsUnlink, writeFile as fsWriteFile } from 'node:fs/promises';
 import * as nodePath from 'node:path';
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, serializeP2pRun, type P2pTarget, type SharedP2pRunScope } from './p2p-orchestrator.js';
 import {
@@ -2415,7 +2415,47 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       void handleMemoryObservationPromote(cmd, serverLink);
       break;
     case 'file.upload':
-      void handleFileUpload(cmd, serverLink);
+      void (async () => {
+        if (typeof cmd.allowedRoot === 'string' && cmd.allowedRoot.trim()) {
+          const destDir = typeof cmd.destinationDirectory === 'string' ? cmd.destinationDirectory : '';
+          const sessionRoot = await resolveFsSessionRoot(cmd);
+          if (!sessionRoot.ok || !sessionRoot.realRoot) {
+            try {
+              serverLink.send({
+                type: 'file.upload_error',
+                uploadId: cmd.uploadId,
+                error: 'forbidden_path',
+              });
+            } catch { /* ignore */ }
+            return;
+          }
+          try {
+            const rawExpanded = destDir.startsWith('~') ? destDir.replace(/^~/, homedir()) : destDir;
+            const resolvedDest = nodePath.resolve(rawExpanded);
+            const realDest = await fsRealpath(resolvedDest);
+            if (!isPathAllowed(realDest) || !isSameOrInsidePath(sessionRoot.realRoot, realDest)) {
+              try {
+                serverLink.send({
+                  type: 'file.upload_error',
+                  uploadId: cmd.uploadId,
+                  error: 'forbidden_path',
+                });
+              } catch { /* ignore */ }
+              return;
+            }
+          } catch {
+            try {
+              serverLink.send({
+                type: 'file.upload_error',
+                uploadId: cmd.uploadId,
+                error: 'forbidden_path',
+              });
+            } catch { /* ignore */ }
+            return;
+          }
+        }
+        await handleFileUpload(cmd, serverLink);
+      })();
       break;
     case 'file.upload_fetch':
       void handleFileUploadFetch(cmd, serverLink);
@@ -11528,11 +11568,7 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
   // Determine if file exists to choose sandbox validation strategy
   let fileExists = false;
   try {
-    const lstat = await fsLstat(resolved);
-    if (lstat.isSymbolicLink()) {
-      try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
-      return;
-    }
+    await fsLstat(resolved);
     fileExists = true;
   } catch {
     fileExists = false;
@@ -11540,7 +11576,6 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
 
   if (fileExists) {
     // Existing file: realpath of target must be within FS_ALLOWED_ROOTS
-    let tmpPath: string | null = null;
     try {
       const real = await fsRealpath(resolved);
       const allowed = isPathAllowed(real)
@@ -11572,23 +11607,18 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
         }
       }
 
-      // Write atomically via a same-directory temp file then POSIX rename
-      tmpPath = nodePath.join(
-        nodePath.dirname(real),
-        `.imcodes-write-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}.tmp`,
-      );
-      await fsWriteFile(tmpPath, writeBuffer, { flag: 'wx' });
-      await fsRename(tmpPath, real);
-      tmpPath = null;
+      // Write the file preserving mode and inode
+      if (isBase64) {
+        await fsWriteFile(real, writeBuffer);
+      } else {
+        await fsWriteFile(real, content, 'utf-8');
+      }
       const newStats = await fsStat(real);
       invalidateFsListCachesForPath(real);
       invalidateFileSearchCachesForPath(real);
       invalidateGitCachesForPath(real);
       try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', mtime: newStats.mtimeMs }); } catch { /* ignore */ }
     } catch (err) {
-      if (tmpPath) {
-        await fsRm(tmpPath, { force: true }).catch(() => {});
-      }
       logger.warn({ requestId, errorCode: getFsWriteErrorCode(err) }, 'fs.write failed');
       try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: getFsWriteErrorCode(err) }); } catch { /* ignore */ }
     }
@@ -11751,7 +11781,11 @@ async function handleFsRename(cmd: Record<string, unknown>, serverLink: ServerLi
   }
 
   try {
+    const priorStats = overwrite ? await fsStat(destination.resolved).catch(() => null) : null;
     await fsRename(source.resolved, destination.resolved);
+    if (priorStats) {
+      await fsChmod(destination.resolved, priorStats.mode).catch(() => {});
+    }
     const destStats = await fsStat(destination.resolved).catch(() => null);
     invalidateFsListCachesForPath(source.real);
     invalidateFsListCachesForPath(destination.resolved);

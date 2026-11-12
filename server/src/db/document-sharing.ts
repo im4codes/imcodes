@@ -74,19 +74,7 @@ export async function isUserInServerTeam(
   userId: string,
 ): Promise<boolean> {
   const memberRole = await resolveServerMembershipRole(db, serverId, userId);
-  if (memberRole !== 'none') return true;
-
-  const directTeam = await db.queryOne<{ role: string | null }>(
-    `SELECT tm.role
-       FROM servers s
-       JOIN team_members tm ON tm.team_id = s.team_id
-      WHERE s.id = $1 AND tm.user_id = $2
-      LIMIT 1`,
-    [serverId, userId],
-  );
-  if (directTeam?.role) return true;
-
-  return false;
+  return memberRole !== 'none';
 }
 
 export type DocumentShareTargetKind = 'file' | 'folder';
@@ -661,7 +649,9 @@ export async function verifyAndBindExternalShareDevice(
         'UPDATE passkey_credentials SET counter = $1, last_used_at = $2 WHERE id = $3',
         [verification.authenticationInfo.newCounter, now, storedCred.id],
       );
-      verifiedPasskeyToken = `passkey:${storedCred.id}`;
+      const nonce = randomHex(16);
+      const proofSig = sha256Hex(`doc-passkey-proof:v1:${share.id}:${storedCred.id}:${nonce}`);
+      verifiedPasskeyToken = `pkey_${nonce}.${proofSig}`;
     } catch {
       return { ok: false, status: 401, error: 'passkey_verification_failed' };
     }
@@ -671,6 +661,10 @@ export async function verifyAndBindExternalShareDevice(
   const rawSuppliedDevice = input.deviceToken?.trim() ?? '';
   if (rawSuppliedDevice && share.boundDeviceHash && rawSuppliedDevice === share.boundDeviceHash) {
     return { ok: false, status: 403, error: 'device_locked_to_another_device' };
+  }
+  // Reject bare passkey / credential identifiers supplied directly as deviceToken
+  if (rawSuppliedDevice && (rawSuppliedDevice.startsWith('passkey:') || rawSuppliedDevice.startsWith('cred_'))) {
+    return { ok: false, status: 403, error: 'invalid_device_token' };
   }
 
   const defaultGeneratedToken = share.accessCodeHash
@@ -961,6 +955,11 @@ export async function resolveEffectiveDocumentAccess(
 
     const suppliedDeviceToken = input.deviceToken?.trim()
       || (userId ? `user:${userId}` : '');
+
+    // Reject bare passkey / credential identifiers supplied directly as deviceToken
+    if (suppliedDeviceToken && (suppliedDeviceToken.startsWith('passkey:') || suppliedDeviceToken.startsWith('cred_'))) {
+      return denied('device_locked');
+    }
 
     // Reject attempts to pass the stored bound_device_hash itself as raw deviceToken
     if (suppliedDeviceToken && extRow.bound_device_hash && suppliedDeviceToken === extRow.bound_device_hash) {

@@ -4886,6 +4886,7 @@
     "local_preview": "Локальный просмотр",
     "fullscreen": "На весь экран",
     "exit_fullscreen": "Выйти из полноэкранного режима",
+    "unsupported_local_format": "Локальный предварительный просмотр недоступен для этого формата",
     "open_in_onlyoffice": "ONLYOFFICE"
   },
   "doc_share": {

@@ -959,6 +959,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
   const [displayName, setDisplayName] = useState('');
   const [shareInfo, setShareInfo] = useState<ExternalShareView | null>(null);
   const [sharedWithMeList, setSharedWithMeList] = useState<SharedWithMeDocItem[]>([]);
+  const [selectedShareId, setSelectedShareId] = useState<string>('');
   const [serverId, setServerId] = useState<string>('');
   const [currentPath, setCurrentPath] = useState<string>('');
   const [rootPath, setRootPath] = useState<string>('');
@@ -982,6 +983,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
     setAccessCode('');
     setShareInfo(null);
     setSharedWithMeList([]);
+    setSelectedShareId('');
     setServerId('');
     setCurrentPath('');
     setRootPath('');
@@ -999,39 +1001,47 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
         if (!token) {
           const listRes = await listDocsSharedWithMe();
           setSharedWithMeList(listRes.shares);
-          const first = listRes.shares[0];
-          if (!first) {
+          const currentShare =
+            (selectedShareId ? listRes.shares.find((s) => s.id === selectedShareId) : null) ||
+            listRes.shares[0];
+          if (!currentShare) {
             setNeedsVerify(false);
             return;
           }
-          setServerId(first.serverId);
-          setRootPath(first.targetPath);
-          const browsePath = subPath || first.targetPath;
+          if (currentShare.id !== selectedShareId) {
+            setSelectedShareId(currentShare.id);
+          }
+          setServerId(currentShare.serverId);
+          setRootPath(currentShare.targetPath);
+          const browsePath = subPath || currentShare.targetPath;
           setCurrentPath(browsePath);
           setShareInfo({
-            id: first.id,
-            serverId: first.serverId,
-            targetKind: first.targetKind,
-            targetPath: first.targetPath,
-            label: first.label || first.targetPath.split('/').pop() || first.targetPath,
-            shareMode: first.shareMode,
-            participantLabel: first.participantLabel,
-            role: first.role,
-            allowDownload: first.allowDownload,
+            id: currentShare.id,
+            serverId: currentShare.serverId,
+            targetKind: currentShare.targetKind,
+            targetPath: currentShare.targetPath,
+            label: currentShare.label || currentShare.targetPath.split('/').pop() || currentShare.targetPath,
+            shareMode: currentShare.shareMode,
+            participantLabel: currentShare.participantLabel,
+            role: currentShare.role,
+            allowDownload: currentShare.allowDownload,
             deviceLockEnabled: false,
             isDeviceBound: false,
             hasAccessCode: false,
-            redeemedAt: first.redeemedAt,
-            expiresAt: first.expiresAt,
-            revokedAt: first.revokedAt,
+            redeemedAt: currentShare.redeemedAt,
+            expiresAt: currentShare.expiresAt,
+            revokedAt: currentShare.revokedAt,
           });
           setNeedsVerify(false);
-          if (first.targetKind === 'file') {
-            setActiveFilePath(first.targetPath);
+          if (currentShare.targetKind === 'file') {
+            setActiveFilePath(currentShare.targetPath);
             setEntries([]);
           } else {
-            const folderRes = await browseSharedDocFolder(first.serverId, browsePath);
+            const folderRes = await browseSharedDocFolder(currentShare.serverId, browsePath);
             setEntries(folderRes.entries);
+            if (!subPath) {
+              setActiveFilePath(null);
+            }
           }
           return;
         }
@@ -1059,7 +1069,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
         setLoading(false);
       }
     },
-    [token, deviceToken, accessCode],
+    [token, deviceToken, accessCode, selectedShareId],
   );
 
   useEffect(() => {
@@ -1429,19 +1439,41 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
                   <button
                     key={item.id}
                     type="button"
+                    data-testid={`shared-tab-${item.id}`}
                     onClick={() => {
+                      setSelectedShareId(item.id);
                       setServerId(item.serverId);
                       setRootPath(item.targetPath);
                       setCurrentPath(item.targetPath);
+                      setShareInfo({
+                        id: item.id,
+                        serverId: item.serverId,
+                        targetKind: item.targetKind,
+                        targetPath: item.targetPath,
+                        label: item.label || item.targetPath.split('/').pop() || item.targetPath,
+                        shareMode: item.shareMode,
+                        participantLabel: item.participantLabel,
+                        role: item.role,
+                        allowDownload: item.allowDownload,
+                        deviceLockEnabled: false,
+                        isDeviceBound: false,
+                        hasAccessCode: false,
+                        redeemedAt: item.redeemedAt,
+                        expiresAt: item.expiresAt,
+                        revokedAt: item.revokedAt,
+                      });
                       if (item.targetKind === 'file') {
                         setActiveFilePath(item.targetPath);
+                        setEntries([]);
                       } else {
+                        setActiveFilePath(null);
+                        setEntries([]);
                         void browseSharedDocFolder(item.serverId, item.targetPath).then((r) => setEntries(r.entries));
                       }
                     }}
                     style={{
                       padding: '4px 10px',
-                      background: rootPath === item.targetPath ? '#2563eb' : '#1e293b',
+                      background: selectedShareId === item.id ? '#2563eb' : '#1e293b',
                       color: '#e2e8f0',
                       border: '1px solid #334155',
                       borderRadius: 4,

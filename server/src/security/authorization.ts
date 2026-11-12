@@ -3,6 +3,7 @@
  * Enforces owner/admin/member/unauthenticated permission matrix.
  */
 import type { Context, Next } from 'hono';
+import { HTTPException } from 'hono/http-exception';
 import type { Env } from '../env.js';
 import type { Database } from '../db/client.js';
 import { sha256Hex, verifyJwt } from './crypto.js';
@@ -63,13 +64,26 @@ export function authFailureResponse(c: Pick<Context, 'json'>, resolution: AuthRe
  * and a disabled user keeps none of them. The check is a join in the credential's own lookup where there is one, and a primary-key read
  * for a stateless JWT -- never a per-pod cache, so a disable is honoured by every replica on its next request.
  */
+function isAllowedDocCollaboratorRoute(path: string): boolean {
+  return (
+    path.startsWith('/api/onlyoffice/') ||
+    path === '/api/onlyoffice' ||
+    path.startsWith('/api/doc-shares/') ||
+    path === '/api/doc-shares' ||
+    path.includes('/onlyoffice/') ||
+    path === '/api/auth/me' ||
+    path === '/api/auth/refresh' ||
+    path === '/api/auth/logout'
+  );
+}
+
 export async function resolveAuthOutcome(c: Pick<Context<{ Bindings: Env }>, 'req' | 'env'>): Promise<AuthResolution> {
   // Task 1: Try HttpOnly session cookie first (browser sessions)
   const cookieToken = getCookieFromHeader(c.req.header('Cookie'), COOKIE_SESSION);
   if (cookieToken && c.env.JWT_SIGNING_KEY) {
     const payload = verifyJwt(cookieToken, c.env.JWT_SIGNING_KEY);
     if (isAccountSessionJwt(payload)) {
-      return resolveLoginTokenUser(c.env.DB, payload);
+      return resolveLoginTokenUser(c.env.DB, payload, c.req.path);
     }
   }
 
@@ -80,10 +94,19 @@ export async function resolveAuth(c: Pick<Context<{ Bindings: Env }>, 'req' | 'e
   return (await resolveAuthOutcome(c)).auth;
 }
 
-async function resolveLoginTokenUser(db: Database, payload: Record<string, unknown> & { sub: string }): Promise<AuthResolution> {
+async function resolveLoginTokenUser(
+  db: Database,
+  payload: Record<string, unknown> & { sub: string },
+  reqPath?: string,
+): Promise<AuthResolution> {
   const decision = evaluateUserAccess(await loadUserAccess(db, payload.sub), typeof payload.iat === 'number' ? payload.iat : undefined);
   if (!decision.ok) return { auth: null, denied: decision.code };
   const scope = payload.scope === 'doc_collaborator' ? 'doc_collaborator' : undefined;
+  if (scope === 'doc_collaborator' && reqPath && !isAllowedDocCollaboratorRoute(reqPath)) {
+    throw new HTTPException(403, {
+      res: Response.json({ error: 'forbidden', reason: DOC_COLLABORATOR_SCOPE_REFUSAL }, { status: 403 }),
+    });
+  }
   return {
     auth: {
       userId: payload.sub,
@@ -164,7 +187,7 @@ export async function resolveBearerOutcome(
   const payload = verifyJwt(token, c.env.JWT_SIGNING_KEY);
   if (!payload) return { auth: null };
   if (!isAccountSessionJwt(payload)) return { auth: null }; // special-purpose tokens (tickets, machine authority, capability blobs) are not logins
-  return resolveLoginTokenUser(c.env.DB, payload);
+  return resolveLoginTokenUser(c.env.DB, payload, c.req.path);
 }
 
 function getCookieFromHeader(cookieHeader: string | undefined, name: string): string | undefined {

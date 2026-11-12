@@ -4886,6 +4886,7 @@
     "local_preview": "로컬 미리보기",
     "fullscreen": "전체 화면",
     "exit_fullscreen": "전체 화면 종료",
+    "unsupported_local_format": "이 형식은 로컬 미리보기를 지원하지 않습니다",
     "open_in_onlyoffice": "ONLYOFFICE"
   },
   "doc_share": {

@@ -190,8 +190,11 @@ function createInMemoryDb() {
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> => {
       const normSql = sql.replace(/\s+/g, ' ').trim();
 
-      // isUserInServerTeam check
-      if (normSql.includes('SELECT tm.role') && normSql.includes('FROM servers s') && normSql.includes('JOIN team_members tm')) {
+      // isUserInServerTeam / resolveServerMembershipRole machine_groups check
+      if (
+        (normSql.includes('SELECT tm.role') && normSql.includes('FROM servers s') && normSql.includes('JOIN team_members tm')) ||
+        (normSql.includes('FROM machine_groups mg') && normSql.includes('JOIN team_members tm'))
+      ) {
         const [serverId, userId] = params as [string, string];
         const srv = servers.get(serverId);
         if (!srv || !srv.team_id) return null;
@@ -1017,6 +1020,20 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
       `/api/doc-shares/external/${created.shareToken}/browse?deviceToken=${boundHash}`,
     );
     expect(hashReplayBrowse.status).toBe(403);
+
+    // 3c. Passing bare passkey / credential identifiers as bearer secrets is rejected
+    const barePasskeyBrowse = await app.request(
+      `/api/doc-shares/external/${created.shareToken}/browse?deviceToken=passkey:cred-fake-123`,
+    );
+    expect(barePasskeyBrowse.status).toBe(403);
+
+    const barePasskeyVerify = await app.request(`/api/doc-shares/external/${created.shareToken}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accessCode: '8848', deviceToken: 'passkey:cred-fake-123' }),
+    });
+    expect(barePasskeyVerify.status).toBe(403);
+    expect(await barePasskeyVerify.json()).toMatchObject({ error: 'invalid_device_token' });
 
     // 4. Forwarded link opened on a 2nd device ("device-stranger-2") -> 403 device_locked_to_another_device even with correct accessCode!
     const secondDeviceRes = await app.request(`/api/doc-shares/external/${created.shareToken}/verify`, {
