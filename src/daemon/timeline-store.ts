@@ -1,5 +1,6 @@
 import { isIncognitoSession } from '../../shared/session-incognito-types.js';
 import { inIncognitoContext, isIncognitoSessionName } from '../../shared/session-incognito-context.js';
+import { getSession } from '../store/session-store.js';
 import type { TimelineTextTailOptions } from './timeline-projection-types.js';
 import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 /**
@@ -306,7 +307,12 @@ class TimelineStore {
    * Uses reverse-read from file tail for efficiency — only reads as many lines
    * as needed instead of loading the entire file.
    */
+  private isPrivateSession(sessionName: string): boolean {
+    return inIncognitoContext() || isIncognitoSessionName(sessionName) || isIncognitoSession(getSession(sessionName));
+  }
+
   read(sessionName: string, opts?: { epoch?: number; afterSeq?: number; afterTs?: number; beforeTs?: number; limit?: number }): TimelineEvent[] {
+    if (this.isPrivateSession(sessionName)) return [];
     const filePath = this.filePath(sessionName);
     // Read more lines than limit to account for filtered-out events.
     // For most queries (no epoch/afterTs filter), 2x is plenty.
@@ -336,6 +342,7 @@ class TimelineStore {
     sessionName: string,
     opts?: { afterTs?: number; afterSeq?: number; epoch?: number; beforeTs?: number; limit?: number },
   ): Promise<TimelineEvent[]> {
+    if (this.isPrivateSession(sessionName)) return [];
     let events: TimelineEvent[] | null;
     try {
       events = await timelineProjection.queryHistory({
@@ -361,6 +368,7 @@ class TimelineStore {
     types: TimelineEvent['type'][],
     opts?: TimelineProjectionQueryOpts,
   ): Promise<TimelineEvent[]> {
+    if (this.isPrivateSession(sessionName)) return [];
     let events: TimelineEvent[] | null;
     try {
       events = await timelineProjection.queryByTypes({
@@ -385,6 +393,7 @@ class TimelineStore {
   }
 
   async readCompletedTextTail(sessionName: string, limit = 50, options?: TimelineTextTailOptions): Promise<TimelineEvent[]> {
+    if (this.isPrivateSession(sessionName)) return [];
     let events: TimelineEvent[] | null;
     try {
       events = await timelineProjection.queryCompletedTextTail(sessionName, limit, options);
@@ -402,6 +411,7 @@ class TimelineStore {
    * Get the latest epoch and seq for a session (from the last line).
    */
   getLatest(sessionName: string): { epoch: number; seq: number } | null {
+    if (this.isPrivateSession(sessionName)) return null;
     const filePath = this.filePath(sessionName);
     const lines = readTailLines(filePath, 5); // read last few lines in case some are corrupt
     for (const line of lines) {
@@ -414,6 +424,7 @@ class TimelineStore {
   }
 
   async getLatestPreferred(sessionName: string): Promise<{ epoch: number; seq: number } | null> {
+    if (this.isPrivateSession(sessionName)) return null;
     return await timelineProjection.getLatest(sessionName);
   }
 
@@ -426,6 +437,7 @@ class TimelineStore {
    * reset so subsequent appends open a fresh fd against the new inode.
    */
   async truncate(sessionName: string, keepLast = MAX_EVENTS_PER_FILE): Promise<void> {
+    if (this.isPrivateSession(sessionName)) return;
     // Put compaction on the same per-session chain as appends. Merely awaiting
     // the current chain leaves a race where a new append can start while the
     // tmp file is being written and then be erased by rename. Reserving the

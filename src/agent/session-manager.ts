@@ -129,6 +129,7 @@ import { getDefaultTimelineDetailStore } from '../daemon/timeline-detail-store.j
 import { getTransportQueueStore } from '../daemon/transport-queue-store.js';
 import { buildTransportQueueSnapshotPayload, transportQueueSnapshotToPayload } from '../daemon/transport-queue-projection.js';
 import { appendTransportEvent, replayTransportHistory } from '../daemon/transport-history.js';
+import { forgetTransportRelaySession } from '../daemon/transport-relay.js';
 import { materializeMasterSummary } from '../context/materialization-coordinator.js';
 import { serializeContextNamespace } from '../context/context-keys.js';
 import { clearSummarySyncHistory, getSummarySyncFingerprints } from '../context/summary-sync-history.js';
@@ -473,6 +474,7 @@ export async function stopProject(
         // (otherwise they leak for every session that ever ran), and drop any
         // queued resend work so it can't replay into a same-named session later.
         timelineEmitter.forgetSession(record.name);
+        forgetTransportRelaySession(record.name);
         clearResend(record.name, 'session_removed');
         if (isIncognitoSession(record)) {
           getTransportQueueStore().discardSessionQueueState(record.name);
@@ -1266,6 +1268,7 @@ async function detachTransportRuntimeSession(
   options: { preserveTransportQueue?: boolean } = {},
 ): Promise<void> {
   clearTransportResendAuthorityRetry(sessionName);
+  forgetTransportRelaySession(sessionName);
   const transportRuntime = transportRuntimes.get(sessionName);
   if (!transportRuntime) return;
   const providerSid = transportRuntime.providerSessionId;
@@ -2218,6 +2221,7 @@ function wireTransportCallbacks(
     timelineEmitter.emit(sessionName, 'session.state', built.payload, { source: 'daemon', confidence: 'high' });
   };
   runtime.onDrain = (messages, merged, count, metadata) => {
+    withSessionPrivacy(sessionName, isIncognitoSession(getSession(sessionName)), () => {
     // The post-drain queue version. Stamped on the per-entry user.message
     // events AND the cleared session.state below so the UI advances its
     // baseline even if one of those events is lost on a weak network — a
@@ -2260,9 +2264,11 @@ function wireTransportCallbacks(
       }),
       { source: 'daemon', confidence: 'high' },
     );
+    });
   };
   runtime.pendingDrainAdmission = (entry) => resolveTransportQueueEntryAdmission(sessionName, entry);
   runtime.onActiveAppend = (messages, snapshot) => {
+    withSessionPrivacy(sessionName, isIncognitoSession(getSession(sessionName)), () => {
     const pendingMessageVersion = observeTransportQueueRevision(sessionName, snapshot.pendingMessageVersion);
     for (const entry of messages) {
       // Avoid a static cycle: supervision-automation owns runtimes through this
@@ -2297,6 +2303,7 @@ function wireTransportCallbacks(
       state: runtime.pendingCount > 0 ? 'queued' : 'running',
       ...transportQueueSnapshotToPayload(snapshot),
     }, { source: 'daemon', confidence: 'high' });
+    });
   };
   if (!options.deferProviderReadyDrain) wireTransportProviderReadyDrain(runtime, sessionName);
   runtime.onStartupMemoryInjected = () => {
@@ -3546,7 +3553,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     // intentionally tears down + recreates).
     if (!opts.fresh && transportRuntimes.has(name)) return;
   }
-  const incognito = opts.incognito === true || isIncognitoSession(getSession(name));
+  const incognito = opts.incognito === true || (!opts.fresh && isIncognitoSession(getSession(name)));
   if (incognito && !supportsSessionIncognito(opts.agentType)) throw new Error(SESSION_INCOGNITO_UNSUPPORTED);
   if (incognito && !opts.fresh && getSession(name)) throw new Error('Incognito session cannot be restored; start a fresh session.');
   opts = { ...opts, ...(incognito ? { incognito: true } : {}) };

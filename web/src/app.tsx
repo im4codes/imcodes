@@ -1,4 +1,4 @@
-import { registerIncognitoTimelineSession, forgetIncognitoTimelineSessions } from './hooks/useTimeline.js';
+import { syncIncognitoTimelineSessions, forgetIncognitoTimelineSessions } from './hooks/useTimeline.js';
 import { useState, useEffect, useCallback, useRef, useMemo } from 'preact/hooks';
 import {
   MutableDesktopWindowStack,
@@ -4562,9 +4562,7 @@ function InternalMainApp() {
         }
       }
       if (msg.type === 'session_list') {
-        for (const session of msg.sessions) {
-          if (session.incognito) registerIncognitoTimelineSession(selectedServerId, session.name);
-        }
+        syncIncognitoTimelineSessions(selectedServerId, msg.sessions);
         if (selectedShareTarget) {
           setSharedActiveDispatchIds((previous) => {
             const next = new Map(previous);

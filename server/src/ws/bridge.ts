@@ -1,4 +1,5 @@
 import { isIncognitoSession, SESSION_INCOGNITO_SERVER_READY } from '../../../shared/session-incognito-types.js';
+import { withSessionPrivacy } from '../../../shared/session-incognito-context.js';
 import { machineGroupInvalidationReady, machineGroupInvalidationRevision } from '../services/machine-group-invalidation.js';
 import {
   CONTROLLED_NODE_ABI_MODERN, CONTROLLED_NODE_ABI_GLIBC217,
@@ -6011,6 +6012,7 @@ export class WsBridge {
         this.authenticated = true;
         this.daemonVersion = typeof msg.daemonVersion === 'string' ? msg.daemonVersion : null;
         this.recentTextBySession.clear();
+        this.incognitoSessions.clear();
         this.clearPendingIdlePushes();
         this.activeMainSessions.clear();
         this.hasActiveMainSessionSnapshot = false;
@@ -6622,6 +6624,7 @@ export class WsBridge {
         this.upgradeBlockedSyncRequiredGeneration = null;
         this.upgradeBlockedSyncCompleteGeneration = null;
         this.recentTextBySession.clear();
+        this.incognitoSessions.clear();
         this.clearPendingIdlePushes();
         this.activeMainSessions.clear();
         this.activeSubSessions.clear();
@@ -9065,6 +9068,10 @@ export class WsBridge {
 
     // ── Lifecycle events: broadcast whitelist ─────────────────────────────────
     if (type === 'session_event') {
+      if (msg.event === 'stopped' && typeof msg.session === 'string' && msg.session) {
+        this.incognitoSessions.delete(msg.session);
+        this.recentTextBySession.delete(msg.session);
+      }
       this.broadcastToBrowsers(JSON.stringify({ ...msg, type: 'session.event' }));
       return;
     }
@@ -9105,27 +9112,30 @@ export class WsBridge {
         logger.warn({ serverId: this.serverId }, 'timeline event missing sessionId - discarded');
         return;
       }
-      if (rawEvent.type === 'user.message') {
-        const payload = rawEvent.payload as Record<string, unknown> | undefined;
-        const commandId = typeof payload?.commandId === 'string' ? payload.commandId : '';
-        if (commandId) this.clearInflightOnAuthoritativeEcho(commandId);
-      }
-      if (rawEvent.type === 'session.state') {
-        const payload = rawEvent.payload as Record<string, unknown> | undefined;
-        if (typeof payload?.state === 'string') this.updateAuthoritativeSessionState(sessionId, payload.state);
-      }
       if (isIncognitoSession(rawEvent.payload)) this.incognitoSessions.add(sessionId);
-      this.ingestRecentTextFromTimelineEvent(rawEvent);
-      if (this.db && !isIncognitoSession(rawEvent.payload) && !this.incognitoSessions.has(sessionId)) {
-        void upsertSessionTextTailCacheEvent(this.db, this.serverId, rawEvent)
-          .catch((err) => logger.warn({ err, serverId: this.serverId, sessionId }, 'Failed to update session_text_tail_cache'));
-      }
-      // New clients have per-socket explicit mode subscriptions. Legacy
-      // clients retain the old path until they speak timeline.subscribe.
-      const timelineRecipients = this.timelineProtocolSockets.size > 0
-        ? this.deliverTimelineEventToSubscribers(sessionId, rawEvent, msg)
-        : this.sendJsonToSessionUserDevices(sessionId, JSON.stringify(msg));
-      this.recordTimelineFanout(sessionId, rawEvent, timelineRecipients);
+      const isPrivate = isIncognitoSession(rawEvent.payload) || this.incognitoSessions.has(sessionId);
+      withSessionPrivacy(undefined, isPrivate, () => {
+        if (rawEvent.type === 'user.message') {
+          const payload = rawEvent.payload as Record<string, unknown> | undefined;
+          const commandId = typeof payload?.commandId === 'string' ? payload.commandId : '';
+          if (commandId) this.clearInflightOnAuthoritativeEcho(commandId);
+        }
+        if (rawEvent.type === 'session.state') {
+          const payload = rawEvent.payload as Record<string, unknown> | undefined;
+          if (typeof payload?.state === 'string') this.updateAuthoritativeSessionState(sessionId, payload.state);
+        }
+        this.ingestRecentTextFromTimelineEvent(rawEvent);
+        if (this.db && !isPrivate) {
+          void upsertSessionTextTailCacheEvent(this.db, this.serverId, rawEvent)
+            .catch((err) => logger.warn({ err, serverId: this.serverId, sessionId }, 'Failed to update session_text_tail_cache'));
+        }
+        // New clients have per-socket explicit mode subscriptions. Legacy
+        // clients retain the old path until they speak timeline.subscribe.
+        const timelineRecipients = this.timelineProtocolSockets.size > 0
+          ? this.deliverTimelineEventToSubscribers(sessionId, rawEvent, msg)
+          : this.sendJsonToSessionUserDevices(sessionId, JSON.stringify(msg));
+        this.recordTimelineFanout(sessionId, rawEvent, timelineRecipients);
+      });
       return;
     }
 
@@ -9208,7 +9218,7 @@ export class WsBridge {
     }
 
     // ── Sub-session sync: daemon creates sub-sessions → persist to DB ────────
-    if (type === 'subsession.sync' && isIncognitoSession(msg)) return;
+    if (type === 'subsession.sync' && (isIncognitoSession(msg) || (typeof msg.id === 'string' && this.incognitoSessions.has(`deck_sub_${msg.id}`)))) return;
     if (type === 'subsession.sync' && this.db) {
       const db = this.db;
       if (isKnownTestSessionLike({
@@ -9791,8 +9801,10 @@ export class WsBridge {
 
   private ingestRecentTextFromTimelineEvent(rawEvent: Record<string, unknown>): void {
     const sessionId = rawEvent.sessionId;
+    if (typeof sessionId !== 'string') return;
+    if (isIncognitoSession(rawEvent.payload) || this.incognitoSessions.has(sessionId)) return;
     const row = recentTextRowFromTimelineEvent(rawEvent);
-    if (typeof sessionId !== 'string' || !row) return;
+    if (!row) return;
     const rows = this.recentTextBySession.get(sessionId) ?? [];
     this.recentTextBySession.set(sessionId, mergeRecentTextRows([...rows, row]));
   }
@@ -10653,6 +10665,7 @@ export class WsBridge {
     sessionName: string,
     raw: string,
   ): void {
+    withSessionPrivacy(undefined, this.incognitoSessions.has(sessionName), () => {
     // Guard: if we already have an inflight for this commandId, the browser is
     // retrying / double-sending. Keep the existing inflight and wait for its
     // ack/timeout instead of forwarding another copy to the daemon.
@@ -10720,6 +10733,7 @@ export class WsBridge {
       timeoutTimer: null,
       share: this.inflightShareMetadata(ws),
     }, ACK_FAILURE_DAEMON_OFFLINE);
+    });
   }
 
   /** Replay buffered + dispatched commands to the daemon after reconnect. */
@@ -12637,11 +12651,13 @@ export class WsBridge {
   }
 
   getRecentText(sessionName: string): WatchRecentTextRow[] {
+    if (this.incognitoSessions.has(sessionName)) return [];
     const rows = this.recentTextBySession.get(sessionName);
     return rows ? rows.map((row) => ({ ...row })) : [];
   }
 
   async getRecentTextForWatch(sessionName: string, timeoutMs = 1500): Promise<WatchRecentTextRow[]> {
+    if (this.incognitoSessions.has(sessionName)) return [];
     const cached = this.getRecentText(sessionName);
     if (cached.length > 0 || !this.isDaemonConnected()) return cached;
 

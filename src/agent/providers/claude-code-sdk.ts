@@ -722,11 +722,14 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const backgroundedSubagentCount = activeSubagentTasks.length - blockingSubagentCount;
     const onlyBackgroundedSubagents = activeSubagentTasks.length > 0 && blockingSubagentCount === 0;
     const waitingForTaskNotification = state.completed && !state.pendingComplete && blockingSubagentCount > 0;
+    const settledIncognitoIdle = Boolean(
+      state.incognito && state.completed && !state.pendingComplete && !state.cancelled,
+    );
     const backgroundActive = Boolean(
       state.resultCompletionTimer
       || state.authRefreshRetryPending
-      || (state.currentQuery && !waitingForTaskNotification && !onlyBackgroundedSubagents)
-      || (state.currentChild && !state.currentChild.killed && !waitingForTaskNotification && !onlyBackgroundedSubagents),
+      || (state.currentQuery && !waitingForTaskNotification && !onlyBackgroundedSubagents && !settledIncognitoIdle)
+      || (state.currentChild && !state.currentChild.killed && !waitingForTaskNotification && !onlyBackgroundedSubagents && !settledIncognitoIdle),
     );
     const busyReasons: SessionActivityBusyReason[] = [];
     if (activeToolCount > 0) busyReasons.push('provider_tool_item');
@@ -2076,6 +2079,11 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         // here: deliver the foreground result to IM.codes, but keep listening
         // so task_notification can terminalize the background row.
         state.retainedSubagentMode = true;
+        for (const cb of this.completeCallbacks) cb(sessionId, pendingComplete);
+        return;
+      }
+      if (state.incognito) {
+        // Keep the live in-memory query open across turns for incognito sessions.
         for (const cb of this.completeCallbacks) cb(sessionId, pendingComplete);
         return;
       }

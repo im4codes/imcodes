@@ -213,7 +213,14 @@ sharedDb.open().catch(() => {});
 // render immediately from in-memory state without waiting for IDB or network.
 // Canonical per-session stores prevent duplicate merge/cache work across panes.
 const eventsCache = new Map<string, TimelineEvent[]>();
-const incognitoCacheKeys = new Set<string>();
+type IncognitoCacheEntry = {
+  mode: 'incognito' | 'closed-tombstone' | 'normal';
+  sessionInstanceId?: string;
+  runtimeEpoch?: string;
+  privateEpochs: Set<string>;
+  normalSinceTs?: number;
+};
+const incognitoCacheState = new Map<string, IncognitoCacheEntry>();
 const cacheListeners = new Map<string, Set<(events: TimelineEvent[]) => void>>();
 // Per-cacheKey wall-clock of the last *successful* HTTP backfill (response
 // received, not a timeout/null). Two consumers:
@@ -723,6 +730,7 @@ async function refreshCachedWindowAfterDrain(
   deletedIds: readonly string[],
   rawSessionId: string | undefined,
 ): Promise<boolean> {
+  if (isCacheKeyIncognito(cacheKey)) return false;
   const refreshed = restoreTimelineSessionOwner(
     await sharedDb.getRecentEvents(cacheKey, { limit: MAX_MEMORY_EVENTS }).catch(() => [] as TimelineEvent[]),
     cacheKey,
@@ -1034,31 +1042,176 @@ function scopeCacheKey(serverId: string | null | undefined, sessionId: string): 
   return serverId ? `${serverId}:${sessionId}` : sessionId;
 }
 
-function markPrivateTimelineEvents(cacheKey: string, events: TimelineEvent[]): TimelineEvent[] {
-  if (events.some(event => isIncognitoSession(event.payload))) incognitoCacheKeys.add(cacheKey);
-  return incognitoCacheKeys.has(cacheKey)
-    ? events.map(event => isIncognitoSession(event.payload) ? event : { ...event, payload: { ...event.payload, ...INCOGNITO_TIMELINE_PAYLOAD } })
-    : events;
+function getOrCreateIncognitoState(cacheKey: string): IncognitoCacheEntry {
+  let state = incognitoCacheState.get(cacheKey);
+  if (!state) {
+    state = { mode: 'normal', privateEpochs: new Set<string>() };
+    incognitoCacheState.set(cacheKey, state);
+  }
+  return state;
 }
 
-export function registerIncognitoTimelineSession(serverId: string | null | undefined, sessionId: string): void {
-  incognitoCacheKeys.add(scopeCacheKey(serverId, sessionId));
+function isCacheKeyIncognito(cacheKey: string): boolean {
+  const mode = incognitoCacheState.get(cacheKey)?.mode;
+  return mode === 'incognito' || mode === 'closed-tombstone';
+}
+
+function eventEpochKey(event: TimelineEvent): string | undefined {
+  return event.epoch !== undefined && event.epoch !== null ? String(event.epoch) : undefined;
+}
+
+function resetTransientTimelineState(cacheKey: string): void {
+  pendingTimelineCacheIngests.delete(cacheKey);
+  const timer = pendingTimelineSnapshotTimers.get(cacheKey);
+  if (timer) clearTimeout(timer);
+  pendingTimelineSnapshotTimers.delete(cacheKey);
+  pendingTimelineSnapshotTails.delete(cacheKey);
+  lastWrittenTimelineSnapshotTails.delete(cacheKey);
+  eventsCache.delete(cacheKey);
+  getTimelineStore(cacheKey).reset();
+}
+
+function forgetIncognitoTimelineKey(cacheKey: string): void {
+  const state = incognitoCacheState.get(cacheKey);
+  if (!state) return;
+  resetTransientTimelineState(cacheKey);
+  if (state.runtimeEpoch) state.privateEpochs.add(state.runtimeEpoch);
+  state.mode = 'closed-tombstone';
+}
+
+function markPrivateTimelineEvents(cacheKey: string, events: TimelineEvent[]): TimelineEvent[] {
+  const state = incognitoCacheState.get(cacheKey);
+  const hasPrivatePayload = events.some(event => isIncognitoSession(event.payload));
+  if (hasPrivatePayload && (!state || state.mode === 'incognito')) {
+    const next = state ?? getOrCreateIncognitoState(cacheKey);
+    next.mode = 'incognito';
+  }
+  const activeState = incognitoCacheState.get(cacheKey);
+  if (activeState?.mode === 'incognito' || activeState?.mode === 'closed-tombstone') {
+    for (const event of events) {
+      const ep = eventEpochKey(event);
+      if (ep) activeState.privateEpochs.add(ep);
+    }
+    return events.map(event => isIncognitoSession(event.payload) ? event : { ...event, payload: { ...event.payload, ...INCOGNITO_TIMELINE_PAYLOAD } });
+  }
+  return events;
+}
+
+function shouldDropIncomingTimelineEvent(cacheKey: string, event: TimelineEvent): boolean {
+  const state = incognitoCacheState.get(cacheKey);
+  if (!state) return false;
+  const ep = eventEpochKey(event);
+  const payloadPrivate = isIncognitoSession(event.payload);
+  if (state.mode === 'incognito') {
+    if (ep) state.privateEpochs.add(ep);
+    return false;
+  }
+  if (state.mode === 'closed-tombstone') {
+    if (payloadPrivate || (ep !== undefined && state.privateEpochs.has(ep))) {
+      if (ep) state.privateEpochs.add(ep);
+      return true;
+    }
+    // An authoritative non-incognito event from a distinct epoch indicates a
+    // brand-new normal session started with the same name.
+    state.mode = 'normal';
+    state.sessionInstanceId = undefined;
+    state.runtimeEpoch = ep;
+    state.normalSinceTs = Date.now();
+    return false;
+  }
+  // state.mode === 'normal'
+  if (ep !== undefined && state.privateEpochs.has(ep)) return true;
+  if (payloadPrivate) {
+    // Late old-private frame arriving after the normal session started.
+    if (state.normalSinceTs !== undefined && (!event.ts || event.ts <= state.normalSinceTs)) {
+      if (ep) state.privateEpochs.add(ep);
+      return true;
+    }
+    state.mode = 'incognito';
+    if (ep) state.privateEpochs.add(ep);
+    return false;
+  }
+  return false;
+}
+
+export function registerIncognitoTimelineSession(
+  serverId: string | null | undefined,
+  sessionId: string,
+  meta?: { sessionInstanceId?: string; runtimeEpoch?: string | number },
+): void {
+  const cacheKey = scopeCacheKey(serverId, sessionId);
+  const state = getOrCreateIncognitoState(cacheKey);
+  const nextEpoch = meta?.runtimeEpoch !== undefined ? String(meta.runtimeEpoch) : undefined;
+  const instanceChanged = Boolean(
+    (meta?.sessionInstanceId && state.sessionInstanceId && meta.sessionInstanceId !== state.sessionInstanceId)
+    || (nextEpoch && state.runtimeEpoch && nextEpoch !== state.runtimeEpoch)
+    || state.mode === 'normal',
+  );
+  if (state.mode !== 'incognito' || instanceChanged) {
+    resetTransientTimelineState(cacheKey);
+  }
+  state.mode = 'incognito';
+  if (meta?.sessionInstanceId !== undefined) state.sessionInstanceId = meta.sessionInstanceId;
+  if (nextEpoch !== undefined) {
+    state.runtimeEpoch = nextEpoch;
+    state.privateEpochs.add(nextEpoch);
+  }
+  state.normalSinceTs = undefined;
+}
+
+export function registerNormalTimelineSession(
+  serverId: string | null | undefined,
+  sessionId: string,
+  meta?: { sessionInstanceId?: string; runtimeEpoch?: string | number },
+): void {
+  const cacheKey = scopeCacheKey(serverId, sessionId);
+  const state = incognitoCacheState.get(cacheKey);
+  if (!state) return;
+  if (state.mode === 'incognito') {
+    if (state.runtimeEpoch) state.privateEpochs.add(state.runtimeEpoch);
+    resetTransientTimelineState(cacheKey);
+  }
+  state.mode = 'normal';
+  state.sessionInstanceId = meta?.sessionInstanceId;
+  state.runtimeEpoch = meta?.runtimeEpoch !== undefined ? String(meta.runtimeEpoch) : undefined;
+  state.normalSinceTs = Date.now();
+}
+
+export function syncIncognitoTimelineSessions(
+  serverId: string | null | undefined,
+  sessions: ReadonlyArray<{ name: string; incognito?: boolean; sessionInstanceId?: string; runtimeEpoch?: string | number }>,
+): void {
+  const seenIncognitoKeys = new Set<string>();
+  for (const session of sessions) {
+    if (!session || typeof session.name !== 'string') continue;
+    const meta = {
+      sessionInstanceId: session.sessionInstanceId,
+      runtimeEpoch: session.runtimeEpoch,
+    };
+    if (isIncognitoSession(session)) {
+      seenIncognitoKeys.add(scopeCacheKey(serverId, session.name));
+      registerIncognitoTimelineSession(serverId, session.name, meta);
+    } else {
+      registerNormalTimelineSession(serverId, session.name, meta);
+    }
+  }
+  const prefix = serverId ? `${serverId}:` : '';
+  for (const [key, state] of incognitoCacheState.entries()) {
+    if (state.mode !== 'incognito') continue;
+    if (serverId ? !key.startsWith(prefix) : key.includes(':')) continue;
+    if (!seenIncognitoKeys.has(key)) forgetIncognitoTimelineKey(key);
+  }
 }
 
 export function forgetIncognitoTimelineSessions(serverId: string | null | undefined, sessionId?: string): void {
   const prefix = serverId ? `${serverId}:` : '';
-  for (const key of incognitoCacheKeys) {
+  for (const [key, state] of incognitoCacheState.entries()) {
     if (sessionId ? key !== scopeCacheKey(serverId, sessionId) : !key.startsWith(prefix)) continue;
-    pendingTimelineCacheIngests.delete(key);
-    const timer = pendingTimelineSnapshotTimers.get(key);
-    if (timer) clearTimeout(timer);
-    pendingTimelineSnapshotTimers.delete(key);
-    pendingTimelineSnapshotTails.delete(key);
-    lastWrittenTimelineSnapshotTails.delete(key);
-    eventsCache.delete(key);
-    getTimelineStore(key).reset();
-    // Keep only the name tombstone until a new normal session list replaces it:
-    // a late frame must not become durable after close.
+    if (state.mode === 'incognito') {
+      forgetIncognitoTimelineKey(key);
+    } else {
+      resetTransientTimelineState(key);
+    }
   }
 }
 
@@ -1283,7 +1436,7 @@ function areTimelineSnapshotTailsSame(left: TimelineEvent[] | undefined, right: 
 }
 
 function persistTimelineSnapshotTail(cacheKey: string, tail: TimelineEvent[]): void {
-  if (incognitoCacheKeys.has(cacheKey)) tail = [];
+  if (isCacheKeyIncognito(cacheKey)) return;
   try {
     if (tail.length === 0) {
       safeLocalStorageRemoveItem(getTimelineSnapshotStorageKey(cacheKey));
@@ -1376,7 +1529,7 @@ export function __flushTimelineSnapshotsBeforeFreezeForTests(): number {
 }
 
 function scheduleTimelineSnapshotPersist(cacheKey: string, events: TimelineEvent[]): void {
-  if (incognitoCacheKeys.has(cacheKey)) return;
+  if (isCacheKeyIncognito(cacheKey)) return;
   const tail = getPersistableTimelineTail(events);
   const pendingTail = pendingTimelineSnapshotTails.get(cacheKey);
   if (areTimelineSnapshotTailsSame(pendingTail, tail)) return;
@@ -1538,7 +1691,7 @@ const signalWriteBatcher = createSignalWriteBatcher({
 });
 
 function persistTimelineEvents(cacheKey: string, events: TimelineEvent[]): void {
-  if (incognitoCacheKeys.has(cacheKey)) return;
+  if (isCacheKeyIncognito(cacheKey)) return;
   if (events.length === 0) return;
   const persistable = events.filter(shouldPersistTimelineEvent);
   if (persistable.length === 0) return;
@@ -1553,7 +1706,7 @@ function persistTimelineEvents(cacheKey: string, events: TimelineEvent[]): void 
 // Persist events to IDB WITHOUT the streaming filter — used only by the
 // streaming idle-flush so the latest streaming assistant.text becomes durable.
 function persistTimelineEventsIncludingStreaming(cacheKey: string, events: TimelineEvent[]): void {
-  if (incognitoCacheKeys.has(cacheKey)) return;
+  if (isCacheKeyIncognito(cacheKey)) return;
   events = events.filter(event => !isIncognitoSession(event.payload));
   if (events.length === 0) return;
   sharedDb.putEvents(scopeEventsForDb(cacheKey, events)).catch(() => {});
@@ -1605,7 +1758,7 @@ function flushPendingTimelineCacheIngests(): void {
   const batches = [...pendingTimelineCacheIngests.entries()];
   pendingTimelineCacheIngests.clear();
   for (const [cacheKey, byEventId] of batches) {
-    const incoming = [...byEventId.values()];
+    const incoming = [...byEventId.values()].filter((event) => !shouldDropIncomingTimelineEvent(cacheKey, event));
     if (incoming.length === 0) continue;
     const existing = getCachedEvents(cacheKey) ?? [];
     const merged = mergeTimelineEventsForWindow(existing, incoming, retainedTimelineMergeLimit(existing));
@@ -1754,7 +1907,7 @@ export function __resetTimelineCacheForTests(): void {
   cancelPendingTimelineCacheIngests();
   flushPendingTimelineSnapshotWrites();
   eventsCache.clear();
-  incognitoCacheKeys.clear();
+  incognitoCacheState.clear();
   cacheListeners.clear();
   __resetTimelineStoresForTests();
   lastHttpBackfillResponseAt.clear();
@@ -1850,7 +2003,8 @@ export function __setTimelineCacheForTests(cacheKey: string, events: TimelineEve
 
 export function ingestTimelineEventForCache(event: TimelineEvent, serverId?: string | null): void {
   const cacheKey = scopeCacheKey(serverId, event.sessionId);
-  if (isIncognitoSession(event.payload)) incognitoCacheKeys.add(cacheKey);
+  if (shouldDropIncomingTimelineEvent(cacheKey, event)) return;
+  if (isIncognitoSession(event.payload)) registerIncognitoTimelineSession(serverId, event.sessionId, { runtimeEpoch: event.epoch });
   if (shouldFrameCoalesceTimelineEvent(event)) {
     queueTimelineCacheIngest(cacheKey, event);
     return;
@@ -2378,7 +2532,11 @@ export function useTimeline(
   // IDB + memory cache key: scope by serverId to prevent cross-server pollution
   // when different servers share the same session name (e.g. deck_cd_brain).
   const cacheKey = sessionId ? scopeCacheKey(serverId, sessionId) : sessionId;
-  if (cacheKey && options?.incognito) incognitoCacheKeys.add(cacheKey);
+  if (cacheKey && sessionId) {
+    if (options?.incognito === true) registerIncognitoTimelineSession(serverId, sessionId);
+    else if (options?.incognito === false) registerNormalTimelineSession(serverId, sessionId);
+  }
+  const isIncognito = !!(options?.incognito || (cacheKey && isCacheKeyIncognito(cacheKey)));
   const isActiveSession = options?.isActiveSession ?? true;
   const isVisible = options?.isVisible ?? isActiveSession;
   const subscriptionMode = options?.subscriptionMode ?? (isActiveSession || isVisible ? 'full' : 'summary');
@@ -2407,6 +2565,7 @@ export function useTimeline(
     if (!cacheKey) return [];
     const memCached = getCachedEvents(cacheKey);
     if (memCached && memCached.length > 0) return memCached;
+    if (isIncognito) return [];
     // Fall back to the bare sessionId snapshot for rows written before
     // `selectedServerId` resolved on this page session — without this the
     // first paint after a refresh shows blank even when the snapshot is
@@ -3026,8 +3185,19 @@ export function useTimeline(
       // here: the module cache is only ever written by full sources — IDB /
       // daemon / HTTP — never by the low-completeness localStorage seed, so a
       // small memCached is a genuinely small session, not a truncated tail.)
-      if (isActiveSession) {
+      if (isActiveSession && !isIncognito) {
         fireHttpBackfillRef.current(200, { cooldownMs: MOUNT_BACKFILL_COOLDOWN_MS, phase: 'bootstrap' });
+      }
+      return () => { cancelled = true; };
+    }
+
+    if (isIncognito) {
+      updateHistoryStep('cache', 'empty', 'bootstrap', 0);
+      setLoading(false);
+      epochRef.current = 0;
+      seqRef.current = 0;
+      if (shouldBootstrapVisibleHistory && wsConnected) {
+        requestDaemonHistory(true, MAX_MEMORY_EVENTS);
       }
       return () => { cancelled = true; };
     }
@@ -3328,7 +3498,7 @@ export function useTimeline(
       cancelled = true;
       if (coldDaemonTimer) clearTimeout(coldDaemonTimer);
     };
-  }, [buildForwardHistoryArgs, cacheKey, clearForwardHistoryTimeout, clearHttpBackfillTimer, disableHistory, getLocalCacheCursorTs, isActiveSession, sendForwardHistoryRequest, sessionId, shouldBootstrapVisibleHistory, ws, wsConnected]);
+  }, [buildForwardHistoryArgs, cacheKey, clearForwardHistoryTimeout, clearHttpBackfillTimer, disableHistory, getLocalCacheCursorTs, isActiveSession, isIncognito, sendForwardHistoryRequest, sessionId, shouldBootstrapVisibleHistory, ws, wsConnected]);
 
   // Map of commandId → optimistic eventId for O(1) lookup on command.ack / dedup.
   const optimisticIdsByCommandRef = useRef(new Map<string, string>());
@@ -3903,7 +4073,7 @@ export function useTimeline(
         optimisticTimersRef.current.set(commandId, timer);
       }
     }
-    const payload: Record<string, unknown> = { text, pending: true, ...(cacheKeyRef.current && incognitoCacheKeys.has(cacheKeyRef.current) ? INCOGNITO_TIMELINE_PAYLOAD : {}) };
+    const payload: Record<string, unknown> = { text, pending: true, ...(cacheKeyRef.current && isCacheKeyIncognito(cacheKeyRef.current) ? INCOGNITO_TIMELINE_PAYLOAD : {}) };
     if (commandId) payload.commandId = commandId;
     if (isAppend) payload.queueAppended = true;
     if (opts?.attachments && opts.attachments.length > 0) payload.attachments = opts.attachments;
@@ -4317,6 +4487,8 @@ export function useTimeline(
   }, [flushStreamingIdlePersist]);
 
   const appendRealtimeEvent = useCallback((event: TimelineEvent) => {
+    const activeKey = cacheKeyRef.current;
+    if (activeKey && shouldDropIncomingTimelineEvent(activeKey, event)) return;
     // Full-mode sockets deliver high-rate status/usage frames live for
     // authoritative subscribers, but they are telemetry rather than chat rows.
     // Keep only those two streams out of rendered timeline state so a 25 Hz
@@ -4929,6 +5101,7 @@ export function useTimeline(
   const reloadLocalTimeline = useCallback(async () => {
     const key = cacheKeyRef.current;
     if (!key) return;
+    if (isIncognito || isCacheKeyIncognito(key)) return;
     // Only force a reopen when the DB is actually degraded — resetAndReopen()
     // closes the SHARED singleton connection, which would disrupt every OTHER
     // session's in-flight reads/writes. A healthy connection just re-reads

@@ -2790,6 +2790,11 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       return;
     }
 
+    const incognito = cmd.incognito === true;
+    // Only after the duplicate-active-session guard passes can a replacement start
+    // reset any closed-session privacy tombstone for this session name.
+    setSessionIncognito(sessionName, incognito);
+    await withSessionPrivacy(sessionName, incognito, async () => {
     const dir = await maybeCloneGitRemoteToDirectory({
       gitRemoteUrl: cmd.gitRemoteUrl,
       targetDir: requestedDir,
@@ -2921,6 +2926,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         }, 5000);
       }
     }
+    });
   } catch (err) {
     logger.error({ project, err }, 'session.start failed');
     const message = describeTransportSendError(err);
@@ -11980,6 +11986,7 @@ async function handleTransportApprovalResponse(cmd: Record<string, unknown>, ser
 async function handleChatSubscribeReplay(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const sessionId = cmd.sessionId as string | undefined;
   if (!sessionId) return;
+  if (isIncognitoSessionName(sessionId) || isIncognitoSession(getSession(sessionId))) return;
   try {
     const { replayTransportHistory, trimTransportHistoryEventsToReplayBudget } = await import('./transport-history.js');
     const events = trimTransportHistoryEventsToReplayBudget(sessionId, await replayTransportHistory(sessionId));

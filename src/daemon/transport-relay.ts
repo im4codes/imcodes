@@ -37,6 +37,8 @@ import {
 } from './native-collaboration-guard.js';
 import { readNativeAgentAdmissionMode } from '../../shared/native-collaboration-policy.js';
 import { appendTransportEvent } from './transport-history.js';
+import { isIncognitoSession } from '../../shared/session-incognito-types.js';
+import { withSessionPrivacy } from '../../shared/session-incognito-context.js';
 import logger from '../util/logger.js';
 import { TrailingThrottle } from '../util/trailing-throttle.js';
 import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
@@ -291,15 +293,46 @@ function emitToolResult(sessionName: string, tool: ToolCallEvent): void {
   });
 }
 
+function runWithRelaySessionPrivacy<T>(sessionName: string, fn: () => T): T {
+  return withSessionPrivacy(sessionName, isIncognitoSession(getSession(sessionName)), fn);
+}
+
+/** Forget per-session streaming/status/in-flight relay state when a session stops or is replaced. */
+export function forgetTransportRelaySession(sessionName: string): void {
+  const tracked = inFlightMessages.get(sessionName);
+  if (tracked) {
+    clearPendingStreamUpdate(tracked.eventId);
+    inFlightMessages.delete(sessionName);
+  }
+  clearPendingStatusUpdate(sessionName);
+  const prefix = `${sessionName}:`;
+  for (const key of pendingFileLikeTools.keys()) {
+    if (key.startsWith(prefix)) pendingFileLikeTools.delete(key);
+  }
+  for (const key of completedFileLikeTools) {
+    if (key.startsWith(prefix)) completedFileLikeTools.delete(key);
+  }
+  for (const key of askQuestionToolIds) {
+    if (key.startsWith(prefix)) askQuestionToolIds.delete(key);
+  }
+  for (const key of emittedSdkTurnLostRecoveryPhases) {
+    if (key.startsWith(prefix)) emittedSdkTurnLostRecoveryPhases.delete(key);
+  }
+}
+
 function emitStreamingAssistantText(sessionName: string, eventId: string, text: string): void {
-  timelineEmitter.emit(sessionName, 'assistant.text', {
-    text,
-    streaming: true,
-  }, { source: 'daemon', confidence: 'high', eventId });
+  runWithRelaySessionPrivacy(sessionName, () => {
+    timelineEmitter.emit(sessionName, 'assistant.text', {
+      text,
+      streaming: true,
+    }, { source: 'daemon', confidence: 'high', eventId });
+  });
 }
 
 function emitAgentStatus(sessionName: string, payload: Record<string, unknown>): void {
-  timelineEmitter.emit(sessionName, 'agent.status', payload, { source: 'daemon', confidence: 'high' });
+  runWithRelaySessionPrivacy(sessionName, () => {
+    timelineEmitter.emit(sessionName, 'agent.status', payload, { source: 'daemon', confidence: 'high' });
+  });
 }
 
 function clearPendingStreamUpdate(eventId: string): void {
@@ -422,7 +455,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       logger.warn({ providerSid }, 'transport-relay: unresolved route for delta — dropped');
       return;
     }
-
+    runWithRelaySessionPrivacy(sessionName, () => {
     // Provider may send cumulative deltas (full text so far) or incremental.
     // Use delta.delta as the display text directly — the provider's internal
     // accumulator handles cumulative vs incremental differences.
@@ -456,6 +489,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     });
 
     emitThrottledStreamingAssistantText(sessionName, stableEventId, delta.delta);
+    });
   });
 
   provider.onComplete((providerSid: string, message: AgentMessage) => {
@@ -464,6 +498,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       logger.debug({ providerSid }, 'transport-relay: unresolved route for complete — dropped');
       return;
     }
+    runWithRelaySessionPrivacy(sessionName, () => {
     if (isCompactControlCompletion(message)) {
       const tracked = inFlightMessages.get(sessionName);
       if (tracked) {
@@ -528,6 +563,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       recordAgyQuotaActivity();
       void refreshAgyQuotaMetadata().catch(() => {});
     }
+    });
   });
 
   provider.onError((providerSid: string, error: ProviderError) => {
@@ -536,7 +572,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       logger.debug({ providerSid }, 'transport-relay: unresolved route for error — dropped');
       return;
     }
-
+    runWithRelaySessionPrivacy(sessionName, () => {
     const tracked = inFlightMessages.get(sessionName);
     inFlightMessages.delete(sessionName);
     if (tracked) clearPendingStreamUpdate(tracked.eventId);
@@ -684,12 +720,13 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       error: error.message,
       code: error.code,
     });
+    });
   });
 
   provider.onToolCall?.((providerSid: string, tool: ToolCallEvent) => {
     const sessionName = resolveSessionName(providerSid);
     if (!sessionName) return;
-
+    runWithRelaySessionPrivacy(sessionName, () => {
     // Suppress the tool_result of an AskUserQuestion we already surfaced as a
     // card. The SDK re-emits it as a generic name:'tool' event (is_error when the
     // answer was delivered via canUseTool deny) — rendering it would show a
@@ -940,6 +977,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     }
 
     emitToolResult(sessionName, tool);
+    });
   });
 
   provider.onStatus?.((providerSid: string, status: ProviderStatusUpdate) => {
@@ -948,11 +986,12 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       logger.debug({ providerSid }, 'transport-relay: unresolved route for status — dropped');
       return;
     }
-
-    emitThrottledAgentStatus(sessionName, {
-      status: status.status,
-      ...(status.label !== undefined ? { label: status.label } : {}),
-    }, status.status);
+    runWithRelaySessionPrivacy(sessionName, () => {
+      emitThrottledAgentStatus(sessionName, {
+        status: status.status,
+        ...(status.label !== undefined ? { label: status.label } : {}),
+      }, status.status);
+    });
   });
 
   provider.onUsage?.((providerSid: string, update: ProviderUsageUpdate) => {
@@ -961,7 +1000,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       logger.debug({ providerSid }, 'transport-relay: unresolved route for usage — dropped');
       return;
     }
-
+    runWithRelaySessionPrivacy(sessionName, () => {
     const usagePayload = normalizeUsageUpdatePayload(sessionName, update.usage, update.model);
     if (usagePayload) {
       const tracked = inFlightMessages.get(sessionName);
@@ -982,6 +1021,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
         streaming: !finalized,
       }, { source: 'daemon', confidence: 'high', eventId: usageEventId });
     }
+    });
   });
 
   provider.onApprovalRequest?.((providerSid: string, request) => {
@@ -990,7 +1030,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       logger.debug({ providerSid }, 'transport-relay: unresolved route for approval — dropped');
       return;
     }
-
+    runWithRelaySessionPrivacy(sessionName, () => {
     const payload = {
       type: TRANSPORT_EVENT.CHAT_APPROVAL,
       sessionId: sessionName,
@@ -1004,6 +1044,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     } as const;
     sendToServer?.(payload);
     void appendTransportEvent(sessionName, payload);
+    });
   });
 }
 
@@ -1021,14 +1062,16 @@ export function emitTransportUserMessage(
   extra: Record<string, unknown> = {},
   eventId?: string,
 ): void {
-  const payload = { text, allowDuplicate: true, ...extra };
-  const emitted = timelineEmitter.emit(
-    sessionId,
-    'user.message',
-    payload,
-    { source: 'daemon', confidence: 'high', ...(eventId ? { eventId } : {}) },
-  );
-  persistTransportUserMessage(sessionId, text, payload, emitted?.eventId || eventId);
+  runWithRelaySessionPrivacy(sessionId, () => {
+    const payload = { text, allowDuplicate: true, ...extra };
+    const emitted = timelineEmitter.emit(
+      sessionId,
+      'user.message',
+      payload,
+      { source: 'daemon', confidence: 'high', ...(eventId ? { eventId } : {}) },
+    );
+    persistTransportUserMessage(sessionId, text, payload, emitted?.eventId || eventId);
+  });
 }
 
 /** Persist the fallback copy for a user.message already emitted elsewhere. */
@@ -1038,12 +1081,14 @@ export function persistTransportUserMessage(
   extra: Record<string, unknown> = {},
   eventId?: string,
 ): void {
-  void appendTransportEvent(sessionId, {
-    type: 'user.message',
-    sessionId,
-    text,
-    ...extra,
-    ...(eventId ? { eventId } : {}),
+  runWithRelaySessionPrivacy(sessionId, () => {
+    void appendTransportEvent(sessionId, {
+      type: 'user.message',
+      sessionId,
+      text,
+      ...extra,
+      ...(eventId ? { eventId } : {}),
+    });
   });
 }
 
