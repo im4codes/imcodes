@@ -1,5 +1,6 @@
 import { withTimeoutOutcome } from '../util/timeout-outcome.js';
 import type { AgyTranscriptRow } from './agy-transcript-bridge.js';
+import { isAgySubagentTool, isAgyInteractiveTool } from './agy-subagents.js';
 
 // A failure deadline, NOT a grace period for ordering or content deduplication.
 export const NATIVE_OUTPUT_DEADLINE_MS = 60_000;
@@ -16,6 +17,8 @@ interface Prompt {
   tagCount?: number;
   inputStep?: number;
   output?: AgyTranscriptRow;
+  lastResponse?: AgyTranscriptRow;
+  settling?: boolean;
   ready: Promise<void>;
   resolve: () => void;
 }
@@ -85,6 +88,18 @@ function selectUnambiguousPrefixMatch(matches: Prompt[]): Prompt | undefined {
     if (distinct.size === 1) return matches[0];
   }
   return undefined;
+}
+
+export function isTerminalForegroundRow(row: AgyTranscriptRow | undefined): boolean {
+  if (!row || row.type !== 'PLANNER_RESPONSE') return false;
+  if (!row.tool_calls?.length) return true;
+  if (row.tool_calls.some(call => typeof call?.name === 'string' && isAgySubagentTool(call.name))) {
+    return false;
+  }
+  if (row.tool_calls.some(call => typeof call?.name === 'string' && isAgyInteractiveTool(call.name))) {
+    return true;
+  }
+  return Boolean(row.content?.trim());
 }
 
 /** Captured outbound RPC -> explicit native input -> native response. ACP
@@ -179,24 +194,52 @@ export class AgyForegroundOwnership {
       const prompt = this.lane !== undefined ? this.prompts.get(this.lane) : undefined;
       if (!prompt || prompt.output) this.lane = undefined;
       return false;
-    } else if (row.type === 'PLANNER_RESPONSE' && !row.tool_calls?.length && this.lane !== undefined) {
+    } else if (row.type === 'PLANNER_RESPONSE' && this.lane !== undefined) {
       const prompt = this.prompts.get(this.lane);
       if (!prompt || prompt.inputStep === undefined || row.step_index <= prompt.inputStep) return false;
-      prompt.output = row;
-      if (!this.latest || prompt.generation >= this.latest.generation) this.latest = {generation:prompt.generation,row};
-      this.lane = undefined;
-      prompt.resolve();
-      return true;
+      if (isTerminalForegroundRow(row)) {
+        prompt.lastResponse = row;
+      }
+      if (!row.tool_calls?.length || (prompt.settling && isTerminalForegroundRow(row))) {
+        prompt.output = row.tool_calls?.length ? (prompt.lastResponse ?? row) : row;
+        if (!this.latest || prompt.generation >= this.latest.generation) {
+          this.latest = { generation: prompt.generation, row: prompt.output };
+        }
+        this.lane = undefined;
+        prompt.resolve();
+        return true;
+      }
+      return false;
     }
     return false;
+  }
+
+  settle(generation: number): AgyTranscriptRow | undefined {
+    const prompt = this.prompts.get(generation);
+    if (!prompt) return undefined;
+    prompt.settling = true;
+    if (!prompt.output && isTerminalForegroundRow(prompt.lastResponse)) {
+      prompt.output = prompt.lastResponse;
+      if (!this.latest || prompt.generation >= this.latest.generation) {
+        this.latest = { generation: prompt.generation, row: prompt.lastResponse! };
+      }
+      if (this.lane === generation) this.lane = undefined;
+      prompt.resolve();
+    }
+    return prompt.output;
   }
 
   async output(generation: number): Promise<AgyTranscriptRow | undefined> {
     const prompt = this.prompts.get(generation);
     if (!prompt) return;
     if (!prompt.output) {
-      const result = await withTimeoutOutcome(prompt.ready,this.deadlineMs);
-      if (result.timedOut) return;
+      const result = await withTimeoutOutcome(prompt.ready, this.deadlineMs);
+      if (result.timedOut) {
+        if (!prompt.output && isTerminalForegroundRow(prompt.lastResponse)) {
+          return this.settle(generation);
+        }
+        return;
+      }
     }
     return prompt.output;
   }

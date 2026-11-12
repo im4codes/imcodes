@@ -1487,6 +1487,7 @@ export class KimiSdkProvider implements TransportProvider {
       this.assertCurrentSession(sessionId,state);
       if (!state.activePromptGenerations?.has(generation)) return;
       if (owner?.authoritative && !owner.hasSuccessor(generation) && result.stopReason !== 'cancelled' && !compactControl) {
+        owner.settle(generation);
         const output = await owner.output(generation);
         this.assertCurrentSession(sessionId,state);
         if (!state.activePromptGenerations?.has(generation)) return;

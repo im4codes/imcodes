@@ -172,4 +172,149 @@ describe('AG captured native foreground ownership', () => {
     expect((await owner.output(2))?.content).toBe('turn two output');
     expect(owner.latest?.generation).toBe(2);
   });
+  it('attributes foreground output via settle() when turn ends with a PLANNER_RESPONSE containing tool_calls', async () => {
+    const owner = new AgyForegroundOwnership(60_000);
+    owner.register(1, 'ask user question payload');
+    owner.observe(row(0, 'USER_INPUT', '<USER_REQUEST>ask user question payload</USER_REQUEST>', 'USER_EXPLICIT'));
+    expect(owner.hasActiveLane()).toBe(true);
+    owner.observe({
+      ...row(1, 'PLANNER_RESPONSE', 'Which option do you prefer?'),
+      tool_calls: [{ name: 'ask_question', args: { question: 'Pick one' } }],
+    });
+    // Explicit settle() attributes the lastResponse immediately without waiting for 60s timeout
+    const settled = owner.settle(1);
+    expect(settled?.content).toBe('Which option do you prefer?');
+    expect(settled?.step_index).toBe(1);
+    const out = await owner.output(1);
+    expect(out?.content).toBe('Which option do you prefer?');
+    expect(out?.step_index).toBe(1);
+    expect(owner.latest?.generation).toBe(1);
+    expect(owner.latest?.row.content).toBe('Which option do you prefer?');
+    expect(owner.hasActiveLane()).toBe(false);
+  });
+  it('falls back to lastResponse on output() deadline if settle() was not called', async () => {
+    const owner = new AgyForegroundOwnership(20);
+    owner.register(1, 'ask user question payload');
+    owner.observe(row(0, 'USER_INPUT', '<USER_REQUEST>ask user question payload</USER_REQUEST>', 'USER_EXPLICIT'));
+    expect(owner.hasActiveLane()).toBe(true);
+    owner.observe({
+      ...row(1, 'PLANNER_RESPONSE', 'Fallback question text'),
+      tool_calls: [{ name: 'ask_question', args: { question: 'Pick one' } }],
+    });
+    // On base, output(1) would return undefined after timeout.
+    // With fix, it falls back to lastResponse after timeout.
+    const out = await owner.output(1);
+    expect(out?.content).toBe('Fallback question text');
+    expect(out?.step_index).toBe(1);
+    expect(owner.latest?.generation).toBe(1);
+    expect(owner.latest?.row.content).toBe('Fallback question text');
+    expect(owner.hasActiveLane()).toBe(false);
+  });
+  it('retains the final tool_call response across multi-step intermediate tool calls when settling', async () => {
+    const owner = new AgyForegroundOwnership(60_000);
+    owner.register(1, 'investigate and ask');
+    owner.observe(row(0, 'USER_INPUT', '<USER_REQUEST>investigate and ask</USER_REQUEST>', 'USER_EXPLICIT'));
+    // Step 1: intermediate tool call (e.g. read_file)
+    owner.observe({
+      ...row(1, 'PLANNER_RESPONSE', 'reading config'),
+      tool_calls: [{ name: 'read_file', args: { Path: '/etc/cfg' } }],
+    });
+    expect(owner.hasActiveLane()).toBe(true);
+    // Step 2: intermediate peer message
+    owner.observe(row(2, 'SYSTEM_MESSAGE', '[Message] sender=peer content=note'));
+    expect(owner.hasActiveLane()).toBe(true);
+    // Step 3: final tool call ending the turn (e.g. ask_question)
+    owner.observe({
+      ...row(3, 'PLANNER_RESPONSE', 'Do you want to proceed with this config?'),
+      tool_calls: [{ name: 'ask_question', args: { question: 'Proceed?' } }],
+    });
+    expect(owner.hasActiveLane()).toBe(true);
+    // Turn finishes, settle attributes step 3, NOT step 1
+    const settled = owner.settle(1);
+    expect(settled?.step_index).toBe(3);
+    expect(settled?.content).toBe('Do you want to proceed with this config?');
+    const out = await owner.output(1);
+    expect(out?.step_index).toBe(3);
+    expect(owner.latest?.generation).toBe(1);
+    expect(owner.latest?.row.step_index).toBe(3);
+    expect(owner.hasActiveLane()).toBe(false);
+
+    // Repeated settle is idempotent
+    expect(owner.settle(1)?.step_index).toBe(3);
+    // Settle on non-existent generation is safe
+    expect(owner.settle(99)).toBeUndefined();
+  });
+  it('does not overwrite pure text output with settle() and preserves pure text behavior', async () => {
+    const owner = new AgyForegroundOwnership(60_000);
+    owner.register(1, 'pure text prompt');
+    owner.observe(row(0, 'USER_INPUT', '<USER_REQUEST>pure text prompt</USER_REQUEST>', 'USER_EXPLICIT'));
+    owner.observe({
+      ...row(1, 'PLANNER_RESPONSE', 'intermediate tool'),
+      tool_calls: [{ name: 'run_command' }],
+    });
+    // Pure text response arrives
+    expect(owner.observe(row(2, 'PLANNER_RESPONSE', 'final pure text answer'))).toBe(true);
+    expect(owner.hasActiveLane()).toBe(false);
+    // Settle afterwards does not modify or corrupt the already resolved pure text
+    const settled = owner.settle(1);
+    expect(settled?.content).toBe('final pure text answer');
+    expect(settled?.step_index).toBe(2);
+    expect((await owner.output(1))?.content).toBe('final pure text answer');
+  });
+  it('does not attribute intermediate subagent tool calls (empty or non-empty content) on settle()', async () => {
+    const owner = new AgyForegroundOwnership(60_000);
+    owner.register(1, 'launch background worker');
+    owner.observe(row(0, 'USER_INPUT', '<USER_REQUEST>launch background worker</USER_REQUEST>', 'USER_EXPLICIT'));
+    // Step 1: subagent tool call with non-empty commentary (e.g. invoke_subagent with 'Launching worker')
+    owner.observe({
+      ...row(1, 'PLANNER_RESPONSE', 'Launching worker'),
+      tool_calls: [{ name: 'invoke_subagent', args: { Role: 'Child' } }],
+    });
+    // settle(1) should not attribute the subagent tool call
+    expect(owner.settle(1)).toBeUndefined();
+    expect(owner.latest).toBeUndefined();
+    expect(owner.hasActiveLane()).toBe(true);
+
+    // Later arriving pure text settles correctly
+    owner.observe(row(2, 'PLANNER_RESPONSE', 'PARENT-STARTED'));
+    expect(owner.settle(1)?.content).toBe('PARENT-STARTED');
+    expect((await owner.output(1))?.content).toBe('PARENT-STARTED');
+    expect(owner.hasActiveLane()).toBe(false);
+  });
+  it('attributes foreground output via settle() even when final ask_question has empty content', async () => {
+    const owner = new AgyForegroundOwnership(60_000);
+    owner.register(1, 'confirm action');
+    owner.observe(row(0, 'USER_INPUT', '<USER_REQUEST>confirm action</USER_REQUEST>', 'USER_EXPLICIT'));
+    // Step 1: terminal ask_question with empty content
+    owner.observe({
+      ...row(1, 'PLANNER_RESPONSE', ''),
+      tool_calls: [{ name: 'ask_question', args: { question: 'Confirm?' } }],
+    });
+    const settled = owner.settle(1);
+    expect(settled).toBeDefined();
+    expect(settled?.content).toBe('');
+    expect(settled?.step_index).toBe(1);
+    expect((await owner.output(1))?.step_index).toBe(1);
+    expect(owner.hasActiveLane()).toBe(false);
+  });
+  it('does not attribute intermediate execution tools with empty content on settle()', async () => {
+    const owner = new AgyForegroundOwnership(60_000);
+    owner.register(1, 'read file prompt');
+    owner.observe(row(0, 'USER_INPUT', '<USER_REQUEST>read file prompt</USER_REQUEST>', 'USER_EXPLICIT'));
+    // Step 1: execution tool call with empty content (e.g. read_file)
+    owner.observe({
+      ...row(1, 'PLANNER_RESPONSE', ''),
+      tool_calls: [{ name: 'read_file', args: { Path: '/tmp/test' } }],
+    });
+    // settle(1) should not attribute empty execution tool call
+    expect(owner.settle(1)).toBeUndefined();
+    expect(owner.latest).toBeUndefined();
+    expect(owner.hasActiveLane()).toBe(true);
+
+    // Later arriving pure text settles correctly
+    owner.observe(row(2, 'PLANNER_RESPONSE', 'file content read'));
+    expect(owner.settle(1)?.content).toBe('file content read');
+    expect((await owner.output(1))?.content).toBe('file content read');
+    expect(owner.hasActiveLane()).toBe(false);
+  });
 });

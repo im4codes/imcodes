@@ -152,9 +152,10 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
         if(pass===1) fs.writeFileSync(file,row(offset,'USER_INPUT',text));else fs.appendFileSync(file,row(offset,'USER_INPUT',text));
         note(p.sessionId,{sessionUpdate:'tool_call',toolCallId:'launch-'+pass,title:pass===1?'Run invoke_subagent':'Run send_message',kind:'other',status:'in_progress',rawInput:pass===1?{Role:'WakeProbe',Prompt:'return result',Model:'model-a'}:{Recipient:childId,Prompt:'next assignment'}});
         note(p.sessionId,{sessionUpdate:'tool_call_update',toolCallId:'launch-'+pass,status:'completed'});
-        fs.appendFileSync(file,row(offset+1,'PLANNER_RESPONSE','',{tool_calls:[{name:pass===1?'invoke_subagent':'send_message',args:pass===1?{Role:'WakeProbe'}:{Recipient:childId}}]})+row(offset+2,'GENERIC',pass===1?'Created the following subagent:\n'+JSON.stringify({conversationId:childId}):'Message sent'));
+        const intermediateContent = scenario === 'native-child-commentary' ? 'Launching worker' : '';
+        fs.appendFileSync(file,row(offset+1,'PLANNER_RESPONSE',intermediateContent,{tool_calls:[{name:pass===1?'invoke_subagent':'send_message',args:pass===1?{Role:'WakeProbe'}:{Recipient:childId}}]})+row(offset+2,'GENERIC',pass===1?'Created the following subagent:\n'+JSON.stringify({conversationId:childId}):'Message sent'));
         const foregroundRow=()=>fs.appendFileSync(file,row(offset+3,'PLANNER_RESPONSE',scenario==='native-child-same-foreground'&&pass===2?'PARENT-WOKE CHILD-PONG':'PARENT-STARTED'));
-        if(scenario==='native-child-output-after-ack') setTimeout(foregroundRow,120);else if(scenario==='native-child-wait') setTimeout(foregroundRow,600);else if(scenario!=='native-child-no-owned-output') foregroundRow();
+        if(['native-child-output-after-ack','native-child-commentary'].includes(scenario)) setTimeout(foregroundRow,120);else if(scenario==='native-child-wait') setTimeout(foregroundRow,600);else if(scenario!=='native-child-no-owned-output') foregroundRow();
         note(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'PARENT-STARTED'}});
         const finishFirst=()=>ok(req.id,{stopReason:'end_turn',usage:{inputTokens:pass===2?700:100,outputTokens:pass===2?71:2}});
         if(pass===2 && ['native-child-slow-foreground','native-child-same-foreground','native-child-cross-chunks'].includes(scenario)) setTimeout(finishFirst,900);else if(scenario==='native-child-rpc-late') setTimeout(finishFirst,300);else finishFirst();

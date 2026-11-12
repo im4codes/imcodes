@@ -12,6 +12,9 @@ export function normalizeAgyToolName(name: string): string { return name.toLower
 export function isAgySubagentTool(name: string): boolean {
   return /^(invokesubagent|browsersubagent|managesubagents|definesubagent|swarm|sendmessage|subagent|agent)$/.test(normalizeAgyToolName(name));
 }
+export function isAgyInteractiveTool(name: string): boolean {
+  return /^(askquestion|askuserquestion|askuser)$/.test(normalizeAgyToolName(name));
+}
 function status(value: unknown): SdkSubagentNormalizedStatus | undefined {
   const v = typeof value === 'string' ? value.toLowerCase() : '';
   if (/^(complete|completed|done|success|idle|finished)$/.test(v)) return SDK_SUBAGENT_STATUS.COMPLETE;
