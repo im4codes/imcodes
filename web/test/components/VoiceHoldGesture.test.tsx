@@ -306,4 +306,106 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(overlay.getAttribute('data-initial-text')).toBe('需要二次修改的文字');
     expect(overlay.getAttribute('data-auto-start')).toBe('false');
   });
+
+  it('failed microphone start shows localized error banner and never sends existing unsent draft on release', async () => {
+    voiceMock.startListening.mockImplementation(async (_r, _l, onError) => {
+      onError?.('permission_denied');
+      return false;
+    });
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = document.querySelector('.controls-input') as HTMLElement;
+    input.textContent = 'existing unsent draft';
+    fireEvent.input(input);
+
+    dispatchPointer(input, 'pointerdown', 180);
+    await vi.advanceTimersByTimeAsync(350);
+    dispatchPointer(input, 'pointerup', 180);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+    expect(document.querySelector('.voice-hold-error-banner')?.textContent).toContain('voice.mic_permission_failed');
+    expect(input.textContent).toBe('existing unsent draft');
+  });
+
+  it('a new hold while stopListening is draining cannot discard or overwrite the prior hold final tail', async () => {
+    let releaseDrain!: () => void;
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = document.querySelector('.controls-input') as HTMLElement;
+    dispatchPointer(input, 'pointerdown', 180);
+    await vi.advanceTimersByTimeAsync(350);
+
+    const firstResult = voiceMock.partialHandler!;
+    firstResult('first partial');
+    voiceMock.stopListening.mockImplementationOnce(async () => {
+      await new Promise<void>((r) => { releaseDrain = r; });
+      firstResult('first final tail');
+    });
+
+    dispatchPointer(input, 'pointerup', 180);
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Attempt another hold while the first stop is still draining
+    dispatchPointer(input, 'pointerdown', 180);
+    await vi.advanceTimersByTimeAsync(350);
+
+    releaseDrain();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledTimes(1);
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+      text: 'first final tail',
+    }));
+  });
+
+  it('unmount invalidates a pending stop drain instead of sending after leaving the composer', async () => {
+    let releaseDrain!: () => void;
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    const view = render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = document.querySelector('.controls-input') as HTMLElement;
+    dispatchPointer(input, 'pointerdown', 180);
+    await vi.advanceTimersByTimeAsync(350);
+    voiceMock.partialHandler?.('do not send after leaving');
+    voiceMock.stopListening.mockImplementationOnce(() => new Promise<void>((r) => { releaseDrain = r; }));
+
+    dispatchPointer(input, 'pointerup', 180);
+    await vi.advanceTimersByTimeAsync(0);
+
+    view.unmount();
+    releaseDrain();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+  });
 });

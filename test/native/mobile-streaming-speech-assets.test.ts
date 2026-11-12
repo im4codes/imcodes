@@ -107,11 +107,13 @@ public class AudioRecord {
   public static volatile AudioRecord latest;
   public static volatile int chunksPerStart=1;
   public static volatile int silentChunksPerStart=0;
+  public static volatile boolean labelledWords=false;
   public static int reads=0;
   public static volatile java.util.concurrent.CountDownLatch delivered;
   private boolean recording;
   private int remaining;
   private int silentRemaining;
+  private int deliveredVoiced=0;
   public AudioRecord(int a,int b,int c,int d,int e){ latest=this; remaining=chunksPerStart; silentRemaining=silentChunksPerStart; delivered=new java.util.concurrent.CountDownLatch(remaining+silentRemaining); }
   public static int getMinBufferSize(int a,int b,int c){ return 3200; }
   public int getState(){ return STATE_INITIALIZED; }
@@ -127,7 +129,9 @@ public class AudioRecord {
     if (!recording || (remaining <= 0 && silentRemaining <= 0)) return 0;
     if (remaining > 0) {
       remaining--;
-      java.util.Arrays.fill(out, (short) 1000);
+      short val = labelledWords ? (short)(1000 + (deliveredVoiced / 15)) : (short) 1000;
+      deliveredVoiced++;
+      java.util.Arrays.fill(out, val);
     } else {
       silentRemaining--;
       java.util.Arrays.fill(out, (short) 0);
@@ -165,8 +169,22 @@ public class OfflineRecognizerConfig {
   public static class Model { public void setNumThreads(int n){if(n!=4)throw new AssertionError();} public void setProvider(String p){} public Qwen getQwen3Asr(){return new Qwen();} }
   public static class Qwen { public void setConvFrontend(String p){} public void setEncoder(String p){} public void setDecoder(String p){} public void setTokenizer(String p){} public void setMaxTotalLen(int n){if(n!=768)throw new AssertionError();} public void setMaxNewTokens(int n){} public void setTemperature(float n){} public void setTopP(float n){} public void setSeed(int n){} public void setHotwords(String s){if(!s.equals("COMMIT,GITHUB,ENGLISH"))throw new AssertionError(s);} }
 }`,
-      'com/k2fsa/sherpa/onnx/OfflineStream.java': `package com.k2fsa.sherpa.onnx;
-public class OfflineStream { public float[] samples; public static int created=0,released=0,maxSamples=0; public OfflineStream(){created++;} public void acceptWaveform(float[] s,int rate){if(samples!=null||rate!=16000)throw new AssertionError(); samples=s;maxSamples=Math.max(maxSamples,s.length);} public void release(){released++;} }`,
+      'com/k2fsa/sherpa/onnx/OfflineStream.java': `package com.k2fsa/sherpa/onnx;`.replace(/\//g, '.').replace('package com.k2fsa.sherpa.onnx.;', 'package com.k2fsa.sherpa.onnx;') + `
+public class OfflineStream {
+  public float[] samples;
+  public static int created=0,released=0,maxSamples=0;
+  public static volatile float[] lastAcceptedSamples;
+  public static final java.util.List<Integer> acceptedLengths=java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+  public OfflineStream(){created++;}
+  public void acceptWaveform(float[] s,int rate){
+    if(samples!=null||rate!=16000)throw new AssertionError();
+    samples=s;
+    lastAcceptedSamples=s;
+    acceptedLengths.add(s.length);
+    maxSamples=Math.max(maxSamples,s.length);
+  }
+  public void release(){released++;}
+}`,
       'com/k2fsa/sherpa/onnx/OfflineRecognizer.java': `package com.k2fsa.sherpa.onnx;
 public class OfflineRecognizer {
  public static java.util.concurrent.CountDownLatch entered=new java.util.concurrent.CountDownLatch(1),release=new java.util.concurrent.CountDownLatch(1),decoded=new java.util.concurrent.CountDownLatch(1);
@@ -174,8 +192,25 @@ public class OfflineRecognizer {
  public OfflineRecognizer(Object assets,OfflineRecognizerConfig config){if(assets!=null)throw new AssertionError("external weights require files");creations++;entered.countDown();try{release.await();}catch(InterruptedException e){throw new RuntimeException(e);}}
  public OfflineStream createStream(){return new OfflineStream();}
  public void decode(OfflineStream stream){lastSamples=stream.samples.length;decoded.countDown();if(holdDecode){decoding.countDown();try{decodeRelease.await();}catch(InterruptedException e){throw new RuntimeException(e);}}}
- public Result getResult(OfflineStream stream){return new Result();}
- public static class Result {public String getText(){return "你好 Hello.";}}
+ public Result getResult(OfflineStream stream){
+  if (android.media.AudioRecord.labelledWords && stream.samples != null) {
+   StringBuilder sb = new StringBuilder();
+   int prev = -1;
+   for (float v : stream.samples) {
+    int raw = Math.round(v * 32768.0f);
+    if (raw < 1000) continue;
+    int id = raw - 1000;
+    if (id != prev) {
+     if (sb.length() > 0) sb.append(' ');
+     sb.append(String.format("word%03d", id));
+     prev = id;
+    }
+   }
+   return new Result(sb.toString());
+  }
+  return new Result("你好 Hello.");
+ }
+ public static class Result { private final String text; public Result(String t){this.text=t;} public String getText(){return text;}}
  public void release(){releases++;}
 }`,
       'Harness.java': `import com.imcodes.speech.StreamingSpeechPlugin; import com.getcapacitor.PluginCall; import com.k2fsa.sherpa.onnx.*; import android.media.AudioRecord; import java.util.concurrent.*;
@@ -184,33 +219,50 @@ public class Harness {
  static void await(CountDownLatch l)throws Exception{if(!l.await(4,TimeUnit.SECONDS))throw new AssertionError("timeout");}
  static void check(boolean b,Object message){if(!b)throw new AssertionError(message);}
  static long finals(Subject p){return p.events.stream().filter(x->x.contains("isFinal=true")).count();}
+ static boolean hasTrailingZeroFlush(float[] s, int voicedCount) {
+  if (s == null || s.length != voicedCount + 3200) return false;
+  for (int i = 0; i < voicedCount; i++) if (s[i] == 0.0f) return false;
+  for (int i = voicedCount; i < s.length; i++) if (s[i] != 0.0f) return false;
+  return true;
+ }
  public static void main(String[] args)throws Exception {
   Subject p=new Subject();
   try {
    p.load();await(OfflineRecognizer.entered);
    PluginCall start=new PluginCall();p.start(start);await(start.done);await(AudioRecord.delivered);
    PluginCall stop=new PluginCall();p.stop(stop);OfflineRecognizer.release.countDown();await(stop.done);
-   check(OfflineRecognizer.lastSamples==1600,p.events); check(finals(p)==1,p.events);check(p.events.get(p.events.size()-1).contains("status=stopped"),p.events);
+   check(OfflineRecognizer.lastSamples==1600+3200,"expected 1600+3200 final samples, got "+OfflineRecognizer.lastSamples);
+   check(hasTrailingZeroFlush(OfflineStream.lastAcceptedSamples, 1600),"final decode missing exact 3200 zero flush");
+   check(finals(p)==1,p.events);check(p.events.get(p.events.size()-1).contains("status=stopped"),p.events);
    System.out.println("COLD_STOP_OK");
-   p.events.clear();AudioRecord.chunksPerStart=18;OfflineRecognizer.decoded=new CountDownLatch(1);
+   p.events.clear();OfflineStream.acceptedLengths.clear();AudioRecord.chunksPerStart=18;OfflineRecognizer.decoded=new CountDownLatch(1);
    p.start(new PluginCall());await(OfflineRecognizer.decoded);await(AudioRecord.delivered);PluginCall stop2=new PluginCall();p.stop(stop2);await(stop2.done);
    check(OfflineRecognizer.creations==1,p.events);check(finals(p)==1,p.events);check(p.events.stream().anyMatch(x->x.contains("isFinal=false")),p.events);System.out.println("WARM_REUSE_OK");
-   p.events.clear();AudioRecord.chunksPerStart=55;OfflineRecognizer.holdDecode=true;
+   p.events.clear();OfflineStream.acceptedLengths.clear();OfflineStream.maxSamples=0;AudioRecord.chunksPerStart=55;OfflineRecognizer.holdDecode=true;
    OfflineRecognizer.decoding=new CountDownLatch(1);OfflineRecognizer.decodeRelease=new CountDownLatch(1);
-   int beforeDrain=OfflineStream.created;
    p.start(new PluginCall());await(OfflineRecognizer.decoding);await(AudioRecord.delivered);
    PluginCall drainedStop=new PluginCall();p.stop(drainedStop);
    check(drainedStop.done.getCount()==1,"stop overtook in-flight decode");
    OfflineRecognizer.decodeRelease.countDown();await(drainedStop.done);OfflineRecognizer.holdDecode=false;
-   check(OfflineStream.created-beforeDrain==2,"tail replayed fixed steps: "+(OfflineStream.created-beforeDrain));
-   check(OfflineRecognizer.lastSamples==55*1600,"tail did not merge all accepted PCM");
+   check(OfflineStream.maxSamples<=72000+3200,"stop drain exceeded bounded 4.5s capacity: "+OfflineStream.maxSamples);
+   check(hasTrailingZeroFlush(OfflineStream.lastAcceptedSamples, 40000),"final bounded window missing 3200 zero flush");
    check(finals(p)==1,p.events);System.out.println("SINGLE_TAIL_DRAIN_OK");
    p.events.clear();AudioRecord.chunksPerStart=15;AudioRecord.silentChunksPerStart=6;OfflineRecognizer.decoded=new CountDownLatch(1);
    p.start(new PluginCall());await(OfflineRecognizer.decoded);await(AudioRecord.delivered);PluginCall stop3=new PluginCall();p.stop(stop3);await(stop3.done);
    check(p.events.stream().filter(x->x.contains("isFinal=true")).anyMatch(x->x.contains("你好 Hello.")&&!x.contains("你好 Hello.你好")),p.events);System.out.println("SILENCE_SEGMENT_OK");
-   p.events.clear();AudioRecord.chunksPerStart=205;AudioRecord.silentChunksPerStart=0;OfflineRecognizer.decoded=new CountDownLatch(1);
+   p.events.clear();OfflineStream.acceptedLengths.clear();OfflineStream.maxSamples=0;
+   AudioRecord.labelledWords=true;AudioRecord.chunksPerStart=205;AudioRecord.silentChunksPerStart=0;OfflineRecognizer.decoded=new CountDownLatch(1);
    p.start(new PluginCall());await(AudioRecord.delivered);PluginCall stop4=new PluginCall();p.stop(stop4);await(stop4.done);
-   check(OfflineStream.maxSamples>=48000 && OfflineStream.maxSamples<=150400,OfflineStream.maxSamples);check(finals(p)==1,p.events);check(p.events.stream().anyMatch(x->x.contains("你好 Hello.你好 Hello.")),p.events);check(OfflineStream.created==OfflineStream.released,p.events);System.out.println("WINDOW_AND_RELEASE_OK");
+   AudioRecord.labelledWords=false;
+   check(OfflineStream.maxSamples>=48000 && OfflineStream.maxSamples<=72000+3200,"window capacity violated: "+OfflineStream.maxSamples);
+   for (int idx=0; idx<OfflineStream.acceptedLengths.size()-1; idx++) {
+    check(OfflineStream.acceptedLengths.get(idx)<=72000, "live/intermediate window exceeded 72000: "+OfflineStream.acceptedLengths.get(idx));
+   }
+   check(finals(p)==1,p.events);
+   StringBuilder expectedWords = new StringBuilder();
+   for (int w=0; w<=13; w++) { if (w>0) expectedWords.append(' '); expectedWords.append(String.format("word%03d", w)); }
+   check(p.events.stream().filter(x->x.contains("isFinal=true")).anyMatch(x->x.contains(expectedWords.toString())),p.events);
+   check(OfflineStream.created==OfflineStream.released,p.events);System.out.println("WINDOW_AND_RELEASE_OK");
   } finally {p.destroy();}
   for(int i=0;i<100&&OfflineRecognizer.releases==0;i++)Thread.sleep(5);check(OfflineRecognizer.releases==1,OfflineRecognizer.releases);
   OfflineRecognizer.entered=new CountDownLatch(1);OfflineRecognizer.release=new CountDownLatch(1);AudioRecord.chunksPerStart=330;
@@ -374,14 +426,19 @@ func labelledSeams(_ words: [String], separator: String, holds: [Int] = []) thro
     check(final == words.joined(separator: separator), "seam corrupted final text")
 }
 func run() throws {
-    var window = SpeechWindow(), calls: [Int] = [], emitted: [String] = []
-    let decode: ([Float]) -> String? = { samples in calls.append(samples.count); return "最后的字" }
+    var window = SpeechWindow(), calls: [Int] = [], emitted: [String] = [], lastDecodedSamples: [Float] = []
+    let decode: ([Float]) -> String? = { samples in
+        calls.append(samples.count)
+        lastDecodedSamples = samples
+        return "最后的字"
+    }
     try window.append(pcm(1599), speech: true, decode: decode) { emitted.append($0) }
     check(calls.isEmpty, "short tail decoded early")
     let tail = try window.finish(decode: decode)
-    check(tail == "最后的字" && calls == [1599], "short tail lost")
+    check(tail == "最后的字" && calls == [1599 + SpeechWindow.finalSilencePadding], "short tail lost or missing 200ms silence flush")
+    check(lastDecodedSamples.prefix(1599).allSatisfy { $0 == 0.1 } && lastDecodedSamples.suffix(SpeechWindow.finalSilencePadding).allSatisfy { $0 == 0 }, "final decode did not append exact 3200 trailing zeros after real PCM")
     _ = try window.finish(decode: decode)
-    check(calls == [1599] && window.samples.isEmpty, "final decoded twice")
+    check(calls == [1599 + SpeechWindow.finalSilencePadding] && window.samples.isEmpty, "final decoded twice")
     print("TAIL:PASS")
 
     window = SpeechWindow(); calls = []; emitted = []
@@ -538,13 +595,52 @@ func run() throws {
     window = SpeechWindow(); calls = []
     try window.append(pcm(24000), speech: true, decode: longDecode) { _ in }
     let beforeStop = calls.count
-    // Remaining accepted backlog plus any sub-step tail: not an intermediate
-    // decode, even when this is several strides. Final is exactly ONE call.
+    // Remaining 32s accepted backlog on stop: chunked into bounded 72,000-sample
+    // windows without emitting intermediate partials, then flushed once in finish()
+    // with 3,200 trailing zero samples.
     try window.append(pcm(SpeechInbox.limit), speech: true, final: true, decode: longDecode) { _ in fatalError("stop emitted partial") }
     _ = try window.finish(decode: longDecode)
-    check(calls.count == beforeStop + 1 && calls.last! == 24000 + SpeechInbox.limit, "stop replayed queued steps")
+    let stopCalls = Array(calls.dropFirst(beforeStop))
+    check(stopCalls.count == 11, "expected 10 full 72k windows + 1 final tail window, got \\(stopCalls)")
+    check(stopCalls.dropLast().allSatisfy { $0 == SpeechWindow.capacity }, "intermediate stop window exceeded or missed 72k capacity: \\(stopCalls)")
+    check(stopCalls.last! == 56000 + SpeechWindow.finalSilencePadding, "final stop window missing bounded tail + 3200 silence flush: \\(stopCalls)")
+    let afterFirstFinish = calls.count
     _ = try window.finish(decode: longDecode)
-    check(calls.count == beforeStop + 1, "stop decoded twice")
+    check(calls.count == afterFirstFinish, "stop decoded twice")
+
+    // Verify 19.75s (13 strides + 4000 tail = 316,000 samples) labelled backlog across both live and final stop paths:
+    // every decode stays <= capacity (+ final padding on finish), all words stitch without seam duplication or tail loss.
+    for isFinalPath in [false, true] {
+        var backlogWindow = SpeechWindow()
+        var backlogLengths: [Int] = []
+        var backlogLastSamples: [Float] = []
+        let labelledBacklogDecode: ([Float]) -> String? = { samples in
+            backlogLengths.append(samples.count)
+            backlogLastSamples = samples
+            var previous = -1, words: [String] = []
+            for sample in samples {
+                let raw = Int(sample.rounded())
+                if raw <= 0 { continue } // ignore 0.0 final silence padding
+                if raw != previous { words.append(word(raw)); previous = raw }
+            }
+            return words.joined(separator: " ")
+        }
+        var fullBacklog: [Float] = []
+        for id in 1...13 {
+            fullBacklog.append(contentsOf: Array(repeating: Float(id), count: 24000))
+        }
+        // Append 4000 extra samples (< 24000 stride) on word 14 so finish() flushes the sub-stride tail on both live and final paths
+        fullBacklog.append(contentsOf: Array(repeating: Float(14), count: 4000))
+        try backlogWindow.append(fullBacklog, speech: true, final: isFinalPath, decode: labelledBacklogDecode) { _ in
+            if isFinalPath { fatalError("final backlog emitted partial") }
+        }
+        let stitched = try backlogWindow.finish(decode: labelledBacklogDecode)
+        let expectedStitched = (1...14).map(word).joined(separator: " ")
+        check(stitched == expectedStitched, "backlog stitched transcript mismatch (final=\\(isFinalPath)): " + stitched + " != " + expectedStitched)
+        check(backlogLengths.dropLast().allSatisfy { $0 <= SpeechWindow.capacity }, "live/intermediate backlog decode exceeded 72k: \\(backlogLengths)")
+        check(backlogLengths.last! == 28000 + SpeechWindow.finalSilencePadding, "final backlog window did not flush exact tail + 3200 zeros: \\(backlogLengths)")
+        check(backlogLastSamples.prefix(28000).allSatisfy { $0 > 0 } && backlogLastSamples.suffix(SpeechWindow.finalSilencePadding).allSatisfy { $0 == 0 }, "final backlog window zero padding corrupted")
+    }
     print("TAIL_BATCH:PASS")
 
     window = SpeechWindow()
@@ -584,7 +680,7 @@ func run() throws {
     check(done.wait(timeout: .now() + 0.02) == .timedOut, "stop overtook in-flight decode")
     capture.release.signal()
     check(done.wait(timeout: .now() + 2) == .success, "stop barrier hung")
-    check(capture.lengths == [24000, 24137], "accepted tail lost or decoded twice")
+    check(capture.lengths == [24000, 24137 + SpeechWindow.finalSilencePadding], "accepted tail lost or decoded twice")
     check(capture.events == ["partial", "before tail last word", "stopped/ACK"], "final did not precede stopped/ACK")
     print("IN_FLIGHT_STOP:PASS")
 }

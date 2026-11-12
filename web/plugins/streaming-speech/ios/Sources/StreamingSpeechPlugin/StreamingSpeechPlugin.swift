@@ -357,6 +357,7 @@ struct SpeechWindow {
     static let stride = sampleRate * 3 / 2 // 1.5s of NEW audio per partial decode
     static let capacity = 3 * stride
     static let overlap = stride
+    static let finalSilencePadding = sampleRate * 2 / 10 // 200ms (3200 zero samples) flushed once at final boundary
     static let rollbackCharacters = 5
     static let punctuationPause = sampleRate * 4 / 10
     static let vadPause = sampleRate * 7 / 10
@@ -382,15 +383,9 @@ struct SpeechWindow {
     mutating func append(_ input: [Float], speech: Bool, trailingSilence: Int = 0, final: Bool = false,
                          decode: ([Float]) -> String?, emit: (String) -> Void) throws {
         guard !input.isEmpty, !samples.isEmpty || speech else { return }
-        if final {
-            // Stop merges the remaining tail into finish().
-            samples.append(contentsOf: input)
-            newSamples += input.count
-            silentSamples = speech ? trailingSilence : silentSamples + input.count
-            return
-        }
-        // Chunk oversized live batches at the bounded window capacity (4.5s) so
-        // continuous speech never accumulates an unbounded window or triggers O(T^2) lag.
+        // Chunk oversized batches (both live and final stop drain) at the bounded
+        // window capacity (4.5s = 72,000 samples) so neither continuous speech nor a
+        // 32s inbox backlog ever exceeds the per-decode window capacity.
         var remaining = input[...]
         while samples.count + remaining.count > Self.capacity {
             let takeCount = max(1, Self.capacity - samples.count)
@@ -403,12 +398,16 @@ struct SpeechWindow {
             let pause = Self.endsSentence(partial) ? Self.punctuationPause : Self.vadPause
             if silentSamples >= pause { commitSentence() }
             else { rollWindow() }
-            if text != lastEmitted { lastEmitted = text; emit(text) }
+            if !final && text != lastEmitted { lastEmitted = text; emit(text) }
         }
         guard !remaining.isEmpty else { return }
         samples.append(contentsOf: remaining)
         newSamples += remaining.count
         silentSamples = speech ? trailingSilence : silentSamples + remaining.count
+        if final {
+            // Stop flushes the final bounded window once in finish() with 200ms silence padding.
+            return
+        }
         let pause = Self.endsSentence(partial) ? Self.punctuationPause : Self.vadPause
         let endpoint = silentSamples >= pause
         if endpoint || newSamples >= Self.stride || samples.count >= Self.capacity {
@@ -421,8 +420,12 @@ struct SpeechWindow {
 
     mutating func finish(decode: ([Float]) -> String?) throws -> String {
         // Accepted PCM drains on the serial worker before this call. A sub-stride
-        // tail must be decoded; overlap-only audio must NOT be decoded twice.
-        if newSamples > 0 { try evaluate(decode) }
+        // tail must be decoded with a single 200ms (3200-sample) trailing silence
+        // flush; overlap-only audio must NOT be decoded twice.
+        if newSamples > 0 {
+            let padded = samples + Array(repeating: Float(0), count: Self.finalSilencePadding)
+            try evaluate({ _ in decode(padded) })
+        }
         commitSentence()
         return text
     }
@@ -464,21 +467,25 @@ struct SpeechWindow {
                 partial = Self.join(seamTail, next)
             }
         }
-        // Remember only the most recent nonempty local growth, not a history.
+        // Remember only the most recent nonempty single-stride local growth, not a history.
         // A word may span several strides: equal hypotheses do not prove that
         // the retained audio contains no text. This hint also disambiguates
         // stable a/a -> a/a/a, where longest textual overlap would eat a word.
-        if let prior = previousHypothesis {
-            if next != prior {
-                lastGrowth = nil
-                if next.hasPrefix(prior) {
-                    let added = String(next.dropFirst(prior.count)).trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !added.isEmpty { lastGrowth = added }
+        if newSamples <= Self.stride {
+            if let prior = previousHypothesis {
+                if next != prior {
+                    lastGrowth = nil
+                    if next.hasPrefix(prior) {
+                        let added = String(next.dropFirst(prior.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !added.isEmpty { lastGrowth = added }
+                    }
                 }
+            } else {
+                let added = String(next.dropFirst(matched)).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !added.isEmpty { lastGrowth = added }
             }
         } else {
-            let added = String(next.dropFirst(matched)).trimmingCharacters(in: .whitespacesAndNewlines)
-            if !added.isEmpty { lastGrowth = added }
+            lastGrowth = nil
         }
         newSamples = 0
     }

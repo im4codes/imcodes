@@ -38,8 +38,13 @@ import java.util.concurrent.atomic.AtomicLong;
 public class StreamingSpeechPlugin extends Plugin {
     private static final int SAMPLE_RATE = 16000;
     private static final int MAX_BUFFERED_CHUNKS = 320; // ~32s at 100ms/chunk (matches iOS 32s limit)
-    private static final int MAX_UTTERANCE_SAMPLES = 3 * SAMPLE_RATE;
-    private static final int PARTIAL_INTERVAL_SAMPLES = 24000; // 1.5s of new audio, not a latency guarantee
+    private static final int STRIDE_SAMPLES = SAMPLE_RATE * 3 / 2; // 1.5s (24,000 samples)
+    private static final int WINDOW_CAPACITY = 3 * STRIDE_SAMPLES; // 4.5s (72,000 samples)
+    private static final int OVERLAP_SAMPLES = STRIDE_SAMPLES; // 1.5s (24,000 samples)
+    private static final int FINAL_SILENCE_PADDING = SAMPLE_RATE * 2 / 10; // 200ms (3,200 zero samples)
+    private static final int ROLLBACK_CHARS = 5;
+    private static final int PUNCTUATION_PAUSE = SAMPLE_RATE * 4 / 10; // 400ms (6,400 samples)
+    private static final int VAD_PAUSE = 9600; // 600ms (9,600 samples)
     private static final String[] MODEL_FILES = { "conv_frontend.onnx", "encoder.int4.onnx", "encoder.int4.weights", "decoder.int4.onnx", "decoder.int4.weights", "tokenizer/vocab.json", "tokenizer/merges.txt", "tokenizer/tokenizer_config.json", "hotwords.txt" };
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final AtomicLong generation = new AtomicLong();
@@ -233,35 +238,32 @@ public class StreamingSpeechPlugin extends Plugin {
 
     private void capture(PluginCall call, long owner, AudioRecord audio, CaptureSession session) {
         OfflineRecognizer recognizer = null;
-        float[] utteranceSamples = new float[MAX_UTTERANCE_SAMPLES + MAX_BUFFERED_CHUNKS * 1600];
-        int sampleCount = 0, lastDecodedCount = 0, silentSamples = 0;
-        String committed = "", last = "";
+        SpeechWindow window = new SpeechWindow();
         boolean failed = false;
         try {
             if (session.isDiscarded() || generation.get() != owner) return;
             recognizer = ensureRecognizer();
             if (session.isDiscarded() || generation.get() != owner) return;
+            final OfflineRecognizer activeRecognizer = recognizer;
             while (!session.isDiscarded() && generation.get() == owner) {
                 AudioBatch batch = session.pollSamples(generation);
                 if (batch == null) break;
-                float[] samples = batch.samples;
-                boolean speech = batch.speech;
-                if (sampleCount == 0 && !speech) continue; // Don't hallucinate from leading silence.
-                // pollSamples swaps ALL accepted backlog into this batch. One
-                // worker turn can decode once, never replay fixed-stride jobs.
-                System.arraycopy(samples, 0, utteranceSamples, sampleCount, samples.length);
-                sampleCount += samples.length;
-                silentSamples = speech ? batch.trailingSilence : silentSamples + samples.length;
-                if (batch.finalTail) continue; // final tail belongs to finally
-                boolean endpoint = sampleCount >= MAX_UTTERANCE_SAMPLES || silentSamples >= 9600;
-                if (endpoint || (speech && sampleCount - lastDecodedCount >= PARTIAL_INTERVAL_SAMPLES)) {
-                    String text = decodeSamples(recognizer, utteranceSamples, sampleCount);
-                    if (session.isDiscarded() || generation.get() != owner) break;
-                    String full = join(committed, text);
-                    if (!full.equals(last)) { partial(full, false); last = full; }
-                    lastDecodedCount = sampleCount;
-                    if (endpoint) { committed = full; sampleCount = 0; lastDecodedCount = 0; silentSamples = 0; }
-                }
+                window.append(
+                    batch.samples,
+                    batch.speech,
+                    batch.trailingSilence,
+                    batch.finalTail,
+                    (pcm, count) -> {
+                        if (session.isDiscarded() || generation.get() != owner) return null;
+                        return decodeSamples(activeRecognizer, pcm, count);
+                    },
+                    (text) -> {
+                        if (!session.isDiscarded() && generation.get() == owner) {
+                            partial(text, false);
+                        }
+                    }
+                );
+                if (batch.finalTail) break;
             }
         } catch (Exception | LinkageError e) {
             failed = true;
@@ -278,7 +280,8 @@ public class StreamingSpeechPlugin extends Plugin {
             // Normal stop drains every accepted PCM chunk before the final barrier.
             if (!failed && !session.isDiscarded() && generation.get() == owner && recognizer != null) {
                 try {
-                    String full = sampleCount == lastDecodedCount ? last : join(committed, decodeSamples(recognizer, utteranceSamples, sampleCount));
+                    final OfflineRecognizer activeRecognizer = recognizer;
+                    String full = window.finish((pcm, count) -> decodeSamples(activeRecognizer, pcm, count));
                     if (!session.isDiscarded() && generation.get() == owner) partial(full, true);
                 } catch (Exception | LinkageError error) {
                     JSObject failure = new JSObject(); failure.put("message", "Offline speech final decoding failed");
@@ -297,6 +300,237 @@ public class StreamingSpeechPlugin extends Plugin {
                 }
             }
             if (!session.isDiscarded() && generation.get() == owner) state("stopped");
+        }
+    }
+
+    private interface WindowDecoder {
+        String decode(float[] samples, int count);
+    }
+
+    private interface WindowEmitter {
+        void emit(String text);
+    }
+
+    private static final class SpeechWindow {
+        private final float[] samples = new float[WINDOW_CAPACITY];
+        private int sampleCount = 0;
+        private int newSamples = 0;
+        private int silentSamples = 0;
+        private String committed = "";
+        private String partial = "";
+        private String anchor = "";
+        private boolean rolling = false;
+        private String seamTail = "";
+        private String overlapText = null;
+        private String overlapHint = null;
+        private String lastGrowth = null;
+        private String hypothesis = null;
+        private String previousHypothesis = null;
+        private String lastEmitted = "";
+
+        String getText() {
+            return rolling ? committed + partial : join(committed, partial);
+        }
+
+        void append(float[] input, boolean speech, int trailingSilence, boolean isFinal, WindowDecoder decoder, WindowEmitter emitter) {
+            if (input.length == 0 || (sampleCount == 0 && !speech)) return;
+            int offset = 0;
+            int remaining = input.length;
+            while (sampleCount + remaining > WINDOW_CAPACITY) {
+                int takeCount = Math.max(1, WINDOW_CAPACITY - sampleCount);
+                System.arraycopy(input, offset, samples, sampleCount, takeCount);
+                offset += takeCount;
+                remaining -= takeCount;
+                sampleCount += takeCount;
+                newSamples += takeCount;
+                silentSamples = speech ? (remaining == 0 ? trailingSilence : 0) : silentSamples + takeCount;
+                if (!evaluate(decoder, false)) return;
+                int pause = endsSentence(partial) ? PUNCTUATION_PAUSE : VAD_PAUSE;
+                if (silentSamples >= pause) commitSentence();
+                else rollWindow();
+                String current = getText();
+                if (!isFinal && !current.equals(lastEmitted)) {
+                    lastEmitted = current;
+                    emitter.emit(current);
+                }
+            }
+            if (remaining <= 0) return;
+            System.arraycopy(input, offset, samples, sampleCount, remaining);
+            sampleCount += remaining;
+            newSamples += remaining;
+            silentSamples = speech ? trailingSilence : silentSamples + remaining;
+            if (isFinal) return;
+            int pause = endsSentence(partial) ? PUNCTUATION_PAUSE : VAD_PAUSE;
+            boolean endpoint = silentSamples >= pause;
+            if (endpoint || newSamples >= STRIDE_SAMPLES || sampleCount >= WINDOW_CAPACITY) {
+                if (!evaluate(decoder, false)) return;
+                if (endpoint) commitSentence();
+                else if (sampleCount >= WINDOW_CAPACITY) rollWindow();
+                String current = getText();
+                if (!current.equals(lastEmitted)) {
+                    lastEmitted = current;
+                    emitter.emit(current);
+                }
+            }
+        }
+
+        String finish(WindowDecoder decoder) {
+            if (newSamples > 0) {
+                evaluate(decoder, true);
+            }
+            commitSentence();
+            return getText();
+        }
+
+        private boolean evaluate(WindowDecoder decoder, boolean padFinalSilence) {
+            final String raw;
+            if (padFinalSilence) {
+                float[] padded = new float[sampleCount + FINAL_SILENCE_PADDING];
+                System.arraycopy(samples, 0, padded, 0, sampleCount);
+                raw = decoder.decode(padded, padded.length);
+            } else {
+                raw = decoder.decode(samples, sampleCount);
+            }
+            if (raw == null) return false;
+            String next = raw.trim();
+            previousHypothesis = hypothesis;
+            hypothesis = next;
+            int matched = 0;
+            if (!rolling) {
+                partial = next;
+            } else {
+                int size;
+                if (overlapText != null && !overlapText.isEmpty() && next.startsWith(overlapText)) {
+                    size = cpCount(overlapText);
+                } else if (overlapHint != null && !overlapHint.isEmpty() && next.startsWith(overlapHint)) {
+                    size = cpCount(overlapHint);
+                } else {
+                    size = overlapCount(anchor + seamTail, next);
+                }
+                matched = size;
+                int seamTailLen = cpCount(seamTail);
+                if (size > seamTailLen) {
+                    partial = dropFirstCp(next, size - seamTailLen);
+                } else if (size > 0) {
+                    partial = dropLastCp(seamTail, size) + next;
+                } else {
+                    partial = join(seamTail, next);
+                }
+            }
+            if (newSamples <= STRIDE_SAMPLES) {
+                if (previousHypothesis != null) {
+                    if (!next.equals(previousHypothesis)) {
+                        lastGrowth = null;
+                        if (next.startsWith(previousHypothesis)) {
+                            String added = next.substring(previousHypothesis.length()).trim();
+                            if (!added.isEmpty()) lastGrowth = added;
+                        }
+                    }
+                } else {
+                    String added = dropFirstCp(next, matched).trim();
+                    if (!added.isEmpty()) lastGrowth = added;
+                }
+            } else {
+                lastGrowth = null;
+            }
+            newSamples = 0;
+            return true;
+        }
+
+        private void rollWindow() {
+            overlapText = null;
+            if (previousHypothesis != null && hypothesis != null
+                && hypothesis.length() > previousHypothesis.length()
+                && hypothesis.startsWith(previousHypothesis)) {
+                String added = hypothesis.substring(previousHypothesis.length()).trim();
+                if (!added.isEmpty()) overlapText = added;
+            }
+            overlapHint = null;
+            if (lastGrowth != null && !lastGrowth.isEmpty() && hypothesis != null && hypothesis.endsWith(lastGrowth)) {
+                overlapHint = lastGrowth;
+            }
+            hypothesis = null;
+            previousHypothesis = null;
+            String tail = suffixCp(partial, ROLLBACK_CHARS);
+            int tailCp = cpCount(tail);
+            String stable = dropLastCp(partial, tailCp);
+            committed = rolling ? committed + stable : join(committed, stable);
+            rolling = true;
+            anchor = suffixCp(anchor + stable, 48);
+            partial = tail;
+            seamTail = tail;
+            int keep = Math.min(sampleCount, OVERLAP_SAMPLES);
+            if (keep > 0 && sampleCount > keep) {
+                System.arraycopy(samples, sampleCount - keep, samples, 0, keep);
+            }
+            sampleCount = keep;
+        }
+
+        private void commitSentence() {
+            committed = getText();
+            partial = "";
+            anchor = "";
+            rolling = false;
+            seamTail = "";
+            overlapText = null;
+            overlapHint = null;
+            lastGrowth = null;
+            hypothesis = null;
+            previousHypothesis = null;
+            sampleCount = 0;
+            newSamples = 0;
+            silentSamples = 0;
+        }
+
+        private static boolean endsSentence(String text) {
+            if (text.isEmpty()) return false;
+            int cp = text.codePointBefore(text.length());
+            return "，、；,;.。！？!?".indexOf(cp) >= 0;
+        }
+
+        private static int overlapCount(String previous, String next) {
+            int maxWindow = 48 + ROLLBACK_CHARS;
+            String left = suffixCp(previous, maxWindow);
+            String right = prefixCp(next, maxWindow);
+            int limit = Math.min(cpCount(left), cpCount(right));
+            for (int size = limit; size >= 1; size--) {
+                if (suffixCp(left, size).equals(prefixCp(right, size))) {
+                    return size;
+                }
+            }
+            return 0;
+        }
+
+        private static int cpCount(String s) {
+            return s.codePointCount(0, s.length());
+        }
+
+        private static String prefixCp(String s, int n) {
+            int total = cpCount(s);
+            if (n >= total) return s;
+            if (n <= 0) return "";
+            return s.substring(0, s.offsetByCodePoints(0, n));
+        }
+
+        private static String suffixCp(String s, int n) {
+            int total = cpCount(s);
+            if (n >= total) return s;
+            if (n <= 0) return "";
+            return s.substring(s.offsetByCodePoints(0, total - n));
+        }
+
+        private static String dropFirstCp(String s, int n) {
+            int total = cpCount(s);
+            if (n >= total) return "";
+            if (n <= 0) return s;
+            return s.substring(s.offsetByCodePoints(0, n));
+        }
+
+        private static String dropLastCp(String s, int n) {
+            int total = cpCount(s);
+            if (n >= total) return "";
+            if (n <= 0) return s;
+            return s.substring(0, s.offsetByCodePoints(0, total - n));
         }
     }
 

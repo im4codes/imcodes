@@ -1262,15 +1262,25 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [voiceHoldZone, setVoiceHoldZone] = useState<'send' | 'cancel' | 'edit'>('send');
   const [voiceHoldText, setVoiceHoldText] = useState('');
   const [voiceHoldRecognizing, setVoiceHoldRecognizing] = useState(false);
+  const [voiceHoldError, setVoiceHoldError] = useState<string | null>(null);
   const [voiceHoldBars, setVoiceHoldBars] = useState<number[]>(() => Array(16).fill(0));
   const voiceHoldTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const voiceHoldRecognizingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const voiceHoldPointerRef = useRef<{ id: number; startX: number; startY: number; wasFocused: boolean } | null>(null);
   const voiceHoldActiveRef = useRef(false);
   const voiceHoldZoneRef = useRef<'send' | 'cancel' | 'edit'>('send');
-  const voiceHoldBaseTextRef = useRef('');
-  const voiceHoldTranscriptRef = useRef('');
   const voiceHoldTokenRef = useRef(0);
+  const voiceHoldTxRef = useRef<{
+    id: number;
+    baseText: string;
+    transcript: string;
+    zone: 'send' | 'cancel' | 'edit';
+    phase: 'starting' | 'recording' | 'draining' | 'failed' | 'settled';
+    error: string | null;
+    settled: boolean;
+    startPromise: Promise<boolean> | null;
+    drainPromise: Promise<void> | null;
+  } | null>(null);
   const voiceHoldBarsRef = useRef<number[]>(Array(16).fill(0));
   const handledVoicePointerEventsRef = useRef<WeakSet<Event>>(new WeakSet());
   const [menuOpen, setMenuOpen] = useState(false);
@@ -5138,7 +5148,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     const mobile = typeof window !== 'undefined' && window.innerWidth <= 640;
     if (!mobile || inputDisabled || voiceOpen || !VoiceInput.isAvailable()) return;
     if (event.button !== undefined && event.button !== 0) return;
-    if (voiceHoldPointerRef.current !== null || voiceHoldActiveRef.current) return;
+    if (voiceHoldPointerRef.current !== null || voiceHoldActiveRef.current || voiceHoldTxRef.current !== null) return;
 
     const el = divRef.current;
     const wasFocused = !!el && document.activeElement === el;
@@ -5147,6 +5157,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       // pops up during a 350ms hold; short taps explicitly focus on pointerup.
       event.preventDefault();
     }
+    setVoiceHoldError(null);
     const pointerId = event.pointerId ?? 1;
     const startX = event.clientX ?? 0;
     const startY = event.clientY ?? 0;
@@ -5160,14 +5171,25 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     voiceHoldTimerRef.current = setTimeout(() => {
       voiceHoldTimerRef.current = null;
       setVoiceHoldPending(false);
+      if (!mountedRef.current || voiceHoldTxRef.current !== null) return;
       // Dismiss any active keyboard or selection before starting voice capture.
       try { divRef.current?.blur(); } catch { /* ignore */ }
       try { window.getSelection()?.removeAllRanges(); } catch { /* ignore */ }
       try { navigator.vibrate?.(20); } catch { /* ignore */ }
 
       const base = divRef.current ? readComposerElementText(divRef.current) : '';
-      voiceHoldBaseTextRef.current = base;
-      voiceHoldTranscriptRef.current = '';
+      const tx = {
+        id: ++voiceHoldTokenRef.current,
+        baseText: base,
+        transcript: '',
+        zone: 'send' as 'send' | 'cancel' | 'edit',
+        phase: 'starting' as 'starting' | 'recording' | 'draining' | 'failed' | 'settled',
+        error: null as string | null,
+        settled: false,
+        startPromise: null as Promise<boolean> | null,
+        drainPromise: null as Promise<void> | null,
+      };
+      voiceHoldTxRef.current = tx;
       voiceHoldActiveRef.current = true;
       voiceHoldZoneRef.current = 'send';
       const emptyBars = Array(16).fill(0);
@@ -5178,9 +5200,23 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setVoiceHoldActive(true);
       setVoiceHoldRecognizing(true);
 
-      const token = ++voiceHoldTokenRef.current;
+      const failTransaction = (errCode: string) => {
+        if (tx.settled || tx.phase === 'failed') return;
+        tx.phase = 'failed';
+        tx.error = errCode || 'permission_denied';
+        voiceHoldActiveRef.current = false;
+        clearVoiceHoldTimers();
+        VoiceInput.onAudioLevel(null);
+        if (mountedRef.current) {
+          setVoiceHoldRecognizing(false);
+          setVoiceHoldActive(false);
+          setVoiceHoldZone('send');
+          setVoiceHoldError(tx.error);
+        }
+      };
+
       VoiceInput.onAudioLevel((rawLevel) => {
-        if (!voiceHoldActiveRef.current || voiceHoldTokenRef.current !== token) return;
+        if (!mountedRef.current || voiceHoldTxRef.current !== tx || tx.settled || tx.phase === 'failed' || tx.phase === 'draining') return;
         const level = Math.max(0, Math.min(1, Number.isFinite(rawLevel) ? rawLevel : 0));
         if (level > 0.015) pulseVoiceHoldRecognizing(1800);
         const prev = voiceHoldBarsRef.current;
@@ -5189,23 +5225,37 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         setVoiceHoldBars(next);
       });
 
-      void VoiceInput.startListening(
+      tx.startPromise = VoiceInput.startListening(
         (partial) => {
-          if (voiceHoldTokenRef.current !== token) return;
-          voiceHoldTranscriptRef.current = partial;
-          if (voiceHoldActiveRef.current) {
+          if (tx.settled || tx.phase === 'failed') return;
+          tx.transcript = partial;
+          if (mountedRef.current && voiceHoldTxRef.current === tx && (tx.phase === 'starting' || tx.phase === 'recording')) {
             setVoiceHoldText(partial);
             pulseVoiceHoldRecognizing(900);
           }
         },
         undefined,
-        () => {
-          if (voiceHoldTokenRef.current !== token) return;
-          setVoiceHoldRecognizing(false);
+        (err) => {
+          failTransaction(err || 'permission_denied');
+        },
+      ).then(
+        (started) => {
+          if (!started || tx.phase === 'failed') {
+            failTransaction(tx.error ?? 'permission_denied');
+            return false;
+          }
+          if (tx.phase === 'starting') {
+            tx.phase = 'recording';
+          }
+          return true;
+        },
+        (err) => {
+          failTransaction(err instanceof Error ? err.message : 'permission_denied');
+          return false;
         },
       );
     }, 350);
-  }, [inputDisabled, voiceOpen, pulseVoiceHoldRecognizing]);
+  }, [inputDisabled, voiceOpen, pulseVoiceHoldRecognizing, clearVoiceHoldTimers]);
 
   const handleComposerVoicePointerMove = useCallback((event: PointerEvent) => {
     if (handledVoicePointerEventsRef.current.has(event)) return;
@@ -5215,7 +5265,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     const dx = (event.clientX ?? 0) - ptr.startX;
     const dy = (event.clientY ?? 0) - ptr.startY;
 
-    if (!voiceHoldActiveRef.current) {
+    const tx = voiceHoldTxRef.current;
+    if (!tx || (tx.phase !== 'starting' && tx.phase !== 'recording')) {
       if (Math.hypot(dx, dy) > 18) {
         clearVoiceHoldTimers();
         voiceHoldPointerRef.current = null;
@@ -5229,7 +5280,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (dx <= -44) nextZone = 'cancel';
     else if (dx >= 44) nextZone = 'edit';
 
-    if (nextZone !== voiceHoldZoneRef.current) {
+    if (nextZone !== tx.zone) {
+      tx.zone = nextZone;
       voiceHoldZoneRef.current = nextZone;
       setVoiceHoldZone(nextZone);
       try { navigator.vibrate?.(12); } catch { /* ignore */ }
@@ -5253,10 +5305,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       return;
     }
 
-    if (!voiceHoldActiveRef.current) return;
+    const tx = voiceHoldTxRef.current;
+    if (!tx || tx.settled || tx.drainPromise !== null) return;
     event.preventDefault();
-    const finalZone: 'send' | 'cancel' | 'edit' = cancelled ? 'cancel' : voiceHoldZoneRef.current;
-    const token = voiceHoldTokenRef.current;
+    const finalZone: 'send' | 'cancel' | 'edit' = cancelled ? 'cancel' : tx.zone;
     voiceHoldActiveRef.current = false;
     clearVoiceHoldTimers();
     setVoiceHoldActive(false);
@@ -5264,28 +5316,47 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     setVoiceHoldRecognizing(false);
     VoiceInput.onAudioLevel(null);
 
-    void (async () => {
-      await VoiceInput.stopListening();
-      if (voiceHoldTokenRef.current === token) {
-        voiceHoldTokenRef.current++;
-      }
-      const spoken = voiceHoldTranscriptRef.current.trim();
-      const base = voiceHoldBaseTextRef.current;
-      const combined = base
-        ? (spoken ? `${base}${base.endsWith(' ') || base.endsWith('\n') ? '' : ' '}${spoken}` : base)
-        : spoken;
+    tx.drainPromise = (async () => {
+      try {
+        const started = tx.startPromise ? await tx.startPromise : false;
+        if (!started || tx.phase === 'failed') {
+          tx.settled = true;
+          tx.phase = 'settled';
+          return;
+        }
+        tx.phase = 'draining';
+        await VoiceInput.stopListening();
+        if (tx.settled || tx.error !== null || !mountedRef.current) {
+          tx.settled = true;
+          tx.phase = 'settled';
+          return;
+        }
+        tx.settled = true;
+        tx.phase = 'settled';
 
-      if (finalZone === 'cancel') {
-        return;
-      }
-      if (finalZone === 'edit') {
-        setVoiceOverlayInitialText(combined);
-        setVoiceOverlayAutoStart(false);
-        setVoiceOpen(true);
-        return;
-      }
-      if (combined.trim()) {
-        handleVoiceSend(combined.trim());
+        if (finalZone === 'cancel') {
+          return;
+        }
+
+        const spoken = tx.transcript.trim();
+        const base = tx.baseText;
+        const combined = base
+          ? (spoken ? `${base}${base.endsWith(' ') || base.endsWith('\n') ? '' : ' '}${spoken}` : base)
+          : spoken;
+
+        if (finalZone === 'edit') {
+          setVoiceOverlayInitialText(combined);
+          setVoiceOverlayAutoStart(false);
+          setVoiceOpen(true);
+          return;
+        }
+        if (spoken && combined.trim()) {
+          handleVoiceSend(combined.trim());
+        }
+      } finally {
+        if (voiceHoldTxRef.current === tx) {
+          voiceHoldTxRef.current = null;
+        }
       }
     })();
   }, [clearVoiceHoldTimers, handleVoiceSend]);
@@ -5311,6 +5382,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   useEffect(() => () => {
     clearVoiceHoldTimers();
+    const tx = voiceHoldTxRef.current;
+    if (tx) {
+      tx.settled = true;
+      tx.phase = 'settled';
+      voiceHoldTxRef.current = null;
+    }
     if (voiceHoldActiveRef.current) {
       voiceHoldActiveRef.current = false;
       VoiceInput.onAudioLevel(null);
@@ -7379,6 +7456,18 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         </div>
       )}
 
+      {voiceHoldError && (
+        <div
+          class="voice-hold-error-banner"
+          role="alert"
+          style={{ padding: '4px 12px', fontSize: 12, color: '#ef4444', background: 'rgba(239,68,68,0.1)', borderRadius: 4, margin: '0 8px 4px' }}
+        >
+          {voiceHoldError === 'permission_denied'
+            ? t('voice.mic_permission_failed')
+            : t('voice.error', { error: voiceHoldError })}
+        </div>
+      )}
+
       {/* Delegation target chip — separate from Team/P2P routing tokens. */}
       {pendingDelegateTarget && (
         <div class="attachment-badges">
@@ -8055,6 +8144,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               publishComposerText(currentText);
               syncMobileComposerMetrics();
               if (sendWarning) clearSendWarning();
+              if (voiceHoldError) setVoiceHoldError(null);
               if (atSelectionLockRef.current && currentText !== atSelectionSnapshotRef.current) {
                 atSelectionLockRef.current = false;
                 atSelectionSnapshotRef.current = currentText;
