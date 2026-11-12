@@ -333,7 +333,12 @@ export async function resolveOnlyOfficeDocumentKey(
     const leaseMs = 30000;
     const isJournalLive = Boolean(
       journalEntry &&
-      journalEntry.owner_token &&
+      (journalEntry.owner_token ||
+        (journalEntry.phase?.startsWith('intent:')
+          ? journalEntry.phase.slice(7)
+          : journalEntry.phase?.startsWith('terminal:')
+            ? journalEntry.phase.slice(9)
+            : '')) &&
       (now - Number(journalEntry.updated_at) <= leaseMs)
     );
 
@@ -360,23 +365,60 @@ export async function resolveOnlyOfficeDocumentKey(
       const isPendingMemoryRecovery = Boolean(pendingMemoryHash && currentHash === pendingMemoryHash);
 
       if (isExpiredCrashRecovery || isPendingMemoryRecovery) {
-        if (getAuthoritativeHash(existing) !== currentHash || existing.active === false) {
-          existing.currentConfirmedHash = currentHash;
-          existing.lastForceSavedHash = currentHash;
-          existing.committedHash = currentHash;
-          existing.active = true;
-          existing.updatedAt = Date.now();
-          documentVersionStateMap.set(mapKey, existing);
+        const isTerminal = Boolean(
+          journalEntry?.phase?.startsWith('terminal:') ||
+          journalEntry?.phase?.includes(':terminal')
+        );
+
+        if (isTerminal) {
+          const nextEpoch = existing.sessionEpoch + 1;
+          const nextSeq = existing.commitSeq + 1;
+          const nextKey = computeDocumentKeyFromDigest(serverId, normalizedPath, currentHash, nextEpoch);
+          const recoveredState: DocumentVersionState = {
+            currentConfirmedHash: currentHash,
+            committedHash: currentHash,
+            lastForceSavedHash: null,
+            sessionEpoch: nextEpoch,
+            commitSeq: nextSeq,
+            activeKey: nextKey,
+            active: false,
+            updatedAt: Date.now(),
+          };
+          documentVersionStateMap.set(mapKey, recoveredState);
+          pendingCommitHashMap.delete(mapKey);
           if (options?.db) {
-            await savePersistentRoomToDb(options.db, serverId, normalizedPath, existing);
+            await savePersistentRoomToDb(options.db, serverId, normalizedPath, recoveredState);
             await releaseOnlyOfficeCommitClaim(options.db, serverId, normalizedPath);
           }
+          return nextKey;
+        }
+
+        // Force-save (status 6) crash recovery:
+        const nextSeq = existing.commitSeq + 1;
+        const recoveredState: DocumentVersionState = {
+          currentConfirmedHash: currentHash,
+          committedHash: currentHash,
+          lastForceSavedHash: currentHash,
+          sessionEpoch: existing.sessionEpoch,
+          commitSeq: nextSeq,
+          activeKey: existing.activeKey,
+          active: true,
+          updatedAt: Date.now(),
+        };
+        documentVersionStateMap.set(mapKey, recoveredState);
+        pendingCommitHashMap.delete(mapKey);
+        if (options?.db) {
+          await savePersistentRoomToDb(options.db, serverId, normalizedPath, recoveredState);
+          await releaseOnlyOfficeCommitClaim(options.db, serverId, normalizedPath);
         }
         return existing.activeKey;
       }
 
       const authoritativeHash = getAuthoritativeHash(existing);
       if (currentHash === authoritativeHash) {
+        if (!isJournalLive && journalEntry && options?.db) {
+          await releaseOnlyOfficeCommitClaim(options.db, serverId, normalizedPath);
+        }
         if (existing.active === false) {
           existing.active = true;
           existing.updatedAt = Date.now();
@@ -408,6 +450,34 @@ export async function resolveOnlyOfficeDocumentKey(
         await releaseOnlyOfficeCommitClaim(options.db, serverId, normalizedPath);
       }
       return activeKey;
+    }
+
+    if (!existing && journalEntry && !isJournalLive && journalEntry.target_hash === currentHash) {
+      const isTerminal = Boolean(
+        journalEntry.phase?.startsWith('terminal:') ||
+        journalEntry.phase?.includes(':terminal')
+      );
+      const baseEpoch = Number(journalEntry.session_epoch) || 0;
+      const nextEpoch = isTerminal ? baseEpoch + 1 : baseEpoch;
+      const nextSeq = (Number(journalEntry.expected_seq) || 0) + 1;
+      const nextKey = computeDocumentKeyFromDigest(serverId, normalizedPath, currentHash, nextEpoch);
+      const recoveredState: DocumentVersionState = {
+        currentConfirmedHash: currentHash,
+        committedHash: currentHash,
+        lastForceSavedHash: isTerminal ? null : currentHash,
+        sessionEpoch: nextEpoch,
+        commitSeq: nextSeq,
+        activeKey: isTerminal ? nextKey : journalEntry.room_key,
+        active: !isTerminal,
+        updatedAt: Date.now(),
+      };
+      documentVersionStateMap.set(mapKey, recoveredState);
+      pendingCommitHashMap.delete(mapKey);
+      if (options?.db) {
+        await savePersistentRoomToDb(options.db, serverId, normalizedPath, recoveredState);
+        await releaseOnlyOfficeCommitClaim(options.db, serverId, normalizedPath);
+      }
+      return recoveredState.activeKey;
     }
 
     const activeKey = computeDocumentKeyFromDigest(serverId, normalizedPath, currentHash, 0);
@@ -1711,6 +1781,8 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
             expectedSeq: currentCommitSeq,
             targetHash: newDigest,
             ownerToken,
+            isTerminal: status === 2,
+            phase: status === 2 ? `terminal:${ownerToken}` : `intent:${ownerToken}`,
             now: Date.now(),
           });
           if (!claim.ok) {

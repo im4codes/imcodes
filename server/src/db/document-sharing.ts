@@ -1265,6 +1265,8 @@ export interface CommitClaimParams {
   expectedSeq: number;
   targetHash: string;
   ownerToken: string;
+  isTerminal?: boolean;
+  phase?: string;
   now?: number;
   leaseMs?: number;
 }
@@ -1275,6 +1277,8 @@ export async function claimOnlyOfficeCommitOwner(
 ): Promise<{ ok: true } | { ok: false; reason: 'conflict' | 'stale_version' | 'held_by_other_owner' }> {
   const now = params.now ?? Date.now();
   const leaseMs = params.leaseMs ?? 30000;
+  const claimPhase =
+    params.phase ?? (params.isTerminal ? `terminal:${params.ownerToken}` : `intent:${params.ownerToken}`);
 
   const executeClaim = async (tx: Database) => {
     const room = await tx.queryOne<OnlyOfficeRoomRow>(
@@ -1296,7 +1300,13 @@ export async function claimOnlyOfficeCommitOwner(
       [params.serverId, params.normalizedPath],
     );
     if (journal) {
-      const jOwner = journal.owner_token || (journal.phase?.startsWith('intent:') ? journal.phase.slice(7) : '');
+      const jOwner =
+        journal.owner_token ||
+        (journal.phase?.startsWith('intent:')
+          ? journal.phase.slice(7)
+          : journal.phase?.startsWith('terminal:')
+            ? journal.phase.slice(9)
+            : '');
       const isExpired = now - Number(journal.updated_at) > leaseMs;
       if (jOwner && jOwner !== params.ownerToken && !isExpired) {
         return { ok: false, reason: 'held_by_other_owner' as const };
@@ -1321,7 +1331,7 @@ export async function claimOnlyOfficeCommitOwner(
         params.expectedKey,
         params.targetHash,
         params.expectedEpoch,
-        `intent:${params.ownerToken}`,
+        claimPhase,
         params.ownerToken,
         params.expectedSeq,
         now,
@@ -1382,7 +1392,13 @@ export async function commitOnlyOfficeRoom(
     if (!journal) {
       return { ok: false, changes: 0 };
     }
-    const jOwner = journal.owner_token || (journal.phase?.startsWith('intent:') ? journal.phase.slice(7) : '');
+    const jOwner =
+      journal.owner_token ||
+      (journal.phase?.startsWith('intent:')
+        ? journal.phase.slice(7)
+        : journal.phase?.startsWith('terminal:')
+          ? journal.phase.slice(9)
+          : '');
     if (!params.ownerToken || jOwner !== params.ownerToken) {
       return { ok: false, changes: 0 };
     }
@@ -1426,7 +1442,7 @@ export async function commitOnlyOfficeRoom(
          AND commit_seq = $11 AND session_epoch = $12
          AND EXISTS (
            SELECT 1 FROM onlyoffice_commit_journal
-           WHERE server_id = $1 AND normalized_path = $2 AND (owner_token = $13 OR phase = $14)
+           WHERE server_id = $1 AND normalized_path = $2 AND (owner_token = $13 OR phase = $14 OR phase LIKE $15)
          )`,
       [
         params.serverId,
@@ -1443,6 +1459,7 @@ export async function commitOnlyOfficeRoom(
         params.expectedEpoch,
         params.ownerToken,
         `intent:${params.ownerToken}`,
+        `%${params.ownerToken}%`,
       ],
     );
 

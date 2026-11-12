@@ -669,7 +669,13 @@ function createInMemoryDb() {
           if (ownerToken) {
             const jRow = commitJournals.get(key);
             if (!jRow) return { changes: 0 };
-            const jOwner = jRow.owner_token || (jRow.phase?.startsWith('intent:') ? jRow.phase.slice(7) : '');
+            const jOwner =
+              jRow.owner_token ||
+              (jRow.phase?.startsWith('intent:')
+                ? jRow.phase.slice(7)
+                : jRow.phase?.startsWith('terminal:')
+                  ? jRow.phase.slice(9)
+                  : '');
             if (jOwner !== ownerToken && !jRow.phase.includes(ownerToken)) {
               return { changes: 0 };
             }
@@ -719,7 +725,13 @@ function createInMemoryDb() {
           target_hash: targetHash,
           session_epoch: Number(sessionEpoch),
           phase: phase || 'intent',
-          owner_token: ownerToken || (phase?.startsWith('intent:') ? phase.slice(7) : ''),
+          owner_token:
+            ownerToken ||
+            (phase?.startsWith('intent:')
+              ? phase.slice(7)
+              : phase?.startsWith('terminal:')
+                ? phase.slice(9)
+                : ''),
           expected_seq: expectedSeq !== undefined ? Number(expectedSeq) : 0,
           updated_at: Number(updatedAt),
         };
@@ -733,7 +745,13 @@ function createInMemoryDb() {
         const existing = commitJournals.get(key);
         if (existing) {
           if (typeof ownerTokenOrExpiry === 'string' && ownerTokenOrExpiry) {
-            const jOwner = existing.owner_token || (existing.phase?.startsWith('intent:') ? existing.phase.slice(7) : '');
+            const jOwner =
+              existing.owner_token ||
+              (existing.phase?.startsWith('intent:')
+                ? existing.phase.slice(7)
+                : existing.phase?.startsWith('terminal:')
+                  ? existing.phase.slice(9)
+                  : '');
             if (jOwner && jOwner !== ownerTokenOrExpiry && !existing.phase.includes(ownerTokenOrExpiry)) {
               return { changes: 0 };
             }
@@ -743,7 +761,11 @@ function createInMemoryDb() {
           // No owner token passed: only delete if expired or ownerless
           const cutoff = typeof ownerTokenOrExpiry === 'number' ? ownerTokenOrExpiry : Date.now() - 30000;
           const isExpired = Number(existing.updated_at) <= cutoff;
-          const hasOwner = Boolean(existing.owner_token || (existing.phase?.startsWith('intent:') && existing.phase.length > 7));
+          const hasOwner = Boolean(
+            existing.owner_token ||
+              (existing.phase?.startsWith('intent:') && existing.phase.length > 7) ||
+              (existing.phase?.startsWith('terminal:') && existing.phase.length > 9),
+          );
           if (hasOwner && !isExpired) {
             return { changes: 0 };
           }
@@ -2394,6 +2416,73 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
     expect.soft(out.ok, 'ownerToken must guard the UPDATE itself, not merely qualify the later journal DELETE').toBe(false);
     expect.soft(store.rooms.get(mapKey)!.commit_seq, 'wrong owner must not publish a new authoritative sequence').toBe(row.commit_seq);
     expect.soft(store.commitJournals.get(mapKey)?.owner_token).toBe('claim_legitimate_owner');
+  });
+
+  it('audit-r14: expired WAL recovery of a written final save must close the old room and reject its stale callback', async () => {
+    const get = () => app.request('/api/server/srv-1/onlyoffice/config?path=%2Fteam%2Fshared%2Fspec.docx&mode=edit', { headers: { Authorization: bearer('owner-1') } });
+    const first = await get(); expect(first.status).toBe(200); const cfg = await first.json() as any;
+    const key = cfg.config.document.key; const cb = new URL(cfg.config.editorConfig.callbackUrl); const mapKey = 'srv-1:/team/shared/spec.docx';
+    const before = { ...store.rooms.get(mapKey)! };
+    const execute = store.db.execute.bind(store.db); let failed = 0;
+    const writeFault = vi.spyOn(store.db, 'execute').mockImplementation(async (sql, params) => {
+      if (sql.replace(/\s+/g, ' ').startsWith('UPDATE onlyoffice_rooms SET') && failed++ === 0) throw new Error('audit PG commit failure AFTER final file rename');
+      return execute(sql, params);
+    });
+    const finalBytes = 'terminal-status-2-bytes-already-written';
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(finalBytes, { status: 200 }));
+    const send = (status: number) => {
+      const payload = { status, key, url: 'https://im.example.com/onlyoffice/cache/final-wal-recovery.docx' };
+      return app.request(cb.pathname + cb.search, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...payload, token: signJwt(payload, 'onlyoffice-jwt-secret-key-test!!', 300) }) });
+    };
+    const broken = await send(2); expect(broken.status).toBe(500); expect(failed).toBeGreaterThan(0);
+    expect(Buffer.from(virtualFiles.get('/team/shared/spec.docx')!.content, 'base64').toString()).toBe(finalBytes);
+    expect(store.commitJournals.has(mapKey), 'write-ahead final-save intent must survive the failed PG room commit').toBe(true);
+    writeFault.mockRestore();
+    resetOnlyOfficeDocumentKeyCacheForTests();
+    const later = Date.now() + 31_000; vi.spyOn(Date, 'now').mockReturnValue(later);
+    const recovered = await get(); expect(recovered.status).toBe(200); const next = await recovered.json() as any;
+    expect.soft(next.config.document.key, 'recovery must finish status-2 room closure, not silently convert it to force-save on the old key').not.toBe(key);
+    expect.soft(store.rooms.get(mapKey)!.session_epoch, 'terminal intent recovery must advance session epoch').toBeGreaterThan(before.session_epoch);
+    vi.mocked(globalThis.fetch).mockImplementation(async () => new Response('stale-old-room-callback-bytes', { status: 200 }));
+    const stale = await send(6);
+    expect.soft(stale.status, 'the old closed room must not regain write permission after PG crash recovery').toBe(409);
+    expect.soft(Buffer.from(virtualFiles.get('/team/shared/spec.docx')!.content, 'base64').toString(), 'final written bytes must survive a delayed callback from the recovered closed room').toBe(finalBytes);
+  });
+
+  it('audit-r14: force-save crash recovery advances seq without changing room key and is idempotent', async () => {
+    const get = () => app.request('/api/server/srv-1/onlyoffice/config?path=%2Fteam%2Fshared%2Fspec.docx&mode=edit', { headers: { Authorization: bearer('owner-1') } });
+    const first = await get(); expect(first.status).toBe(200); const cfg = await first.json() as any;
+    const key = cfg.config.document.key; const cb = new URL(cfg.config.editorConfig.callbackUrl); const mapKey = 'srv-1:/team/shared/spec.docx';
+    const before = { ...store.rooms.get(mapKey)! };
+    const execute = store.db.execute.bind(store.db); let failed = 0;
+    const writeFault = vi.spyOn(store.db, 'execute').mockImplementation(async (sql, params) => {
+      if (sql.replace(/\s+/g, ' ').startsWith('UPDATE onlyoffice_rooms SET') && failed++ === 0) throw new Error('audit PG commit failure AFTER force-save rename');
+      return execute(sql, params);
+    });
+    const forceBytes = 'force-save-status-6-bytes-written';
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(forceBytes, { status: 200 }));
+    const send = (status: number) => {
+      const payload = { status, key, url: 'https://im.example.com/onlyoffice/cache/force-save-recovery.docx' };
+      return app.request(cb.pathname + cb.search, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...payload, token: signJwt(payload, 'onlyoffice-jwt-secret-key-test!!', 300) }) });
+    };
+    const broken = await send(6); expect(broken.status).toBe(500); expect(failed).toBeGreaterThan(0);
+    expect(Buffer.from(virtualFiles.get('/team/shared/spec.docx')!.content, 'base64').toString()).toBe(forceBytes);
+    expect(store.commitJournals.has(mapKey)).toBe(true);
+    writeFault.mockRestore();
+    resetOnlyOfficeDocumentKeyCacheForTests();
+    const later = Date.now() + 31_000; vi.spyOn(Date, 'now').mockReturnValue(later);
+    const recovered = await get(); expect(recovered.status).toBe(200); const recJson = await recovered.json() as any;
+    // Force save recovery preserves activeKey and sessionEpoch, but increments commitSeq
+    expect.soft(recJson.config.document.key).toBe(key);
+    expect.soft(store.rooms.get(mapKey)!.session_epoch).toBe(before.session_epoch);
+    expect.soft(store.rooms.get(mapKey)!.commit_seq).toBe(before.commit_seq + 1);
+    expect.soft(store.commitJournals.has(mapKey)).toBe(false);
+
+    // Repeat GET config: must be idempotent and not bump epoch or seq
+    const second = await get(); expect(second.status).toBe(200); const secondJson = await second.json() as any;
+    expect.soft(secondJson.config.document.key).toBe(key);
+    expect.soft(store.rooms.get(mapKey)!.session_epoch).toBe(before.session_epoch);
+    expect.soft(store.rooms.get(mapKey)!.commit_seq).toBe(before.commit_seq + 1);
   });
 });
 
