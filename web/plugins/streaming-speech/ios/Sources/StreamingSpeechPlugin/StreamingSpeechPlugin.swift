@@ -24,6 +24,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     private var inbox = SpeechInbox()
     private var engine: AVAudioEngine?
     private var tapInstalled = false
+    private var startingCall: CAPPluginCall? // main-thread only; ready after 100ms warmup
     // Resident recognizer model kept across sessions on worker; stream is per-capture.
     private var recognizer: SpeechRecognizer?
     // Only accessed on worker; queued PCM drains before the stop/final barrier.
@@ -135,10 +136,12 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                     self?.consume(buffer, owner: owner, converter: converter, format: mono)
                 }
                 self.tapInstalled = true
+                self.startingCall = call
                 try engine.start()
-                self.notifyListeners("listeningState", data: ["status": "started"])
-                call.resolve()
+                // consume() signals ready only after startup PCM was discarded;
+                // the UI must not invite speech during that 100ms interval.
             } catch {
+                self.startingCall = nil
                 self.lock.lock()
                 self.abortedOwner = owner
                 self.lock.unlock()
@@ -169,7 +172,16 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         }
         let samples = Array(UnsafeBufferPointer(start: channel, count: Int(converted.frameLength)))
         do {
+            let warming = inbox.warmupRemaining > 0
             let schedule = try inbox.offer(samples)
+            if warming && inbox.warmupRemaining == 0 {
+                DispatchQueue.main.async {
+                    guard self.isCurrent(owner), let call = self.startingCall else { return }
+                    self.startingCall = nil
+                    self.notifyListeners("listeningState", data: ["status": "started"])
+                    call.resolve()
+                }
+            }
             if schedule { worker.async { self.drain(owner: owner) } }
         } catch {
             // Bounded admission fails visibly; never silently discard words.
@@ -233,6 +245,8 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         let stoppingOwner = generation
         let tail = inbox.take()
         lock.unlock()
+        // Stop during warmup must also settle the pending start promise.
+        startingCall?.resolve(); startingCall = nil
         if tapInstalled { engine?.inputNode.removeTap(onBus: 0); tapInstalled = false }
         engine?.stop(); engine = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)

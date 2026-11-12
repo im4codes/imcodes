@@ -77,6 +77,10 @@ describe('Qwen3-ASR mobile assets', () => {
     expect(ios).toContain('static let limit = 16000 * 64 / 10'); expect(android).toContain('MAX_BUFFERED_CHUNKS = 64');
     expect(ios).not.toContain('OfflinePunctuation'); expect(android).not.toContain('OfflinePunctuation');
     expect(ios).not.toContain('OnlineStream'); expect(android).not.toContain('OnlineStream');
+    expect(ios).toContain('options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth]');
+    expect(ios).not.toContain('.duckOthers');
+    expect(ios).toContain('if warming && inbox.warmupRemaining == 0');
+    expect(ios).toContain('startingCall?.resolve(); startingCall = nil');
   });
   it('compiles and executes the production Android plugin through cold/warm/stop/segmentation/overflow/destroy', async () => {
     await setup(); const srcDir = join(root, 'src'), classesDir = join(root, 'classes'); await mkdir(classesDir, { recursive: true });

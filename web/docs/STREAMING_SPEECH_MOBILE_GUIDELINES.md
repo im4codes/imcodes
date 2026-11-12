@@ -103,7 +103,8 @@ Web Speech 平台自身的 `onend` 限制不是应用的可配置超时，普通
    禁止 `.duckOthers`：它主动降低其他音频，不等于保护首字。
 4. 将转换后的首 **1600 个 16kHz sample（100ms）** 当作本次捕获启动瞬态丢弃，
    即使它跨多个短 tap 也只丢这一段；不能每步/每个分段都丢 100ms。
-   用户应在启动稳定后讲话；100ms 滤除不是声学首字无损保证，必须实机检查提示时序。
+   `started` 事件与 start ACK 等这 100ms 消费完才发出，避免 UI 过早提示讲话；
+   warmup 期间 Stop 也必须结算 pending start，不能挂起。100ms 滤除不是声学首字无损保证，仍须实机检查。
 5. Stop/后台/音频中断卸载 tap、停 engine、`setActive(false, .notifyOthersOnDeactivation)`；
    不自动重开麦克风。错误同样必须清理。
 
