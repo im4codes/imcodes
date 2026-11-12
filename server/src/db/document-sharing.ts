@@ -1159,3 +1159,153 @@ export async function resolveEffectiveDocumentAccess(
 
   return denied('path_not_shared');
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Authoritative PostgreSQL ONLYOFFICE Collaborative Room & Commit WAL
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface OnlyOfficeRoomRow {
+  server_id: string;
+  normalized_path: string;
+  current_confirmed_hash: string;
+  committed_hash: string;
+  last_force_saved_hash: string | null;
+  active_key: string;
+  session_epoch: number;
+  commit_seq: number;
+  active: boolean;
+  updated_at: number;
+}
+
+export interface OnlyOfficeCommitJournalRow {
+  server_id: string;
+  normalized_path: string;
+  room_key: string;
+  target_hash: string;
+  session_epoch: number;
+  phase: string;
+  updated_at: number;
+}
+
+export async function getOnlyOfficeRoomRecord(
+  db: Database,
+  serverId: string,
+  normalizedPath: string,
+): Promise<OnlyOfficeRoomRow | null> {
+  const row = await db.queryOne<OnlyOfficeRoomRow>(
+    `SELECT server_id, normalized_path, current_confirmed_hash, committed_hash, last_force_saved_hash,
+            active_key, session_epoch, commit_seq, active, updated_at
+     FROM onlyoffice_rooms
+     WHERE server_id = $1 AND normalized_path = $2`,
+    [serverId, normalizedPath],
+  );
+  if (!row) return null;
+  return {
+    ...row,
+    session_epoch: Number(row.session_epoch),
+    commit_seq: Number(row.commit_seq),
+    active: Boolean(row.active),
+    updated_at: Number(row.updated_at),
+  };
+}
+
+export async function upsertOnlyOfficeRoomRecord(
+  db: Database,
+  room: OnlyOfficeRoomRow,
+): Promise<void> {
+  await db.execute(
+    `INSERT INTO onlyoffice_rooms (
+       server_id, normalized_path, current_confirmed_hash, committed_hash,
+       last_force_saved_hash, active_key, session_epoch, commit_seq, active, updated_at
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     ON CONFLICT (server_id, normalized_path) DO UPDATE SET
+       current_confirmed_hash = EXCLUDED.current_confirmed_hash,
+       committed_hash = EXCLUDED.committed_hash,
+       last_force_saved_hash = EXCLUDED.last_force_saved_hash,
+       active_key = EXCLUDED.active_key,
+       session_epoch = EXCLUDED.session_epoch,
+       commit_seq = EXCLUDED.commit_seq,
+       active = EXCLUDED.active,
+       updated_at = EXCLUDED.updated_at`,
+    [
+      room.server_id,
+      room.normalized_path,
+      room.current_confirmed_hash,
+      room.committed_hash,
+      room.last_force_saved_hash,
+      room.active_key,
+      room.session_epoch,
+      room.commit_seq,
+      room.active,
+      room.updated_at,
+    ],
+  );
+}
+
+export async function deleteOnlyOfficeRoomRecord(
+  db: Database,
+  serverId: string,
+  normalizedPath: string,
+): Promise<void> {
+  await db.execute(
+    `DELETE FROM onlyoffice_rooms WHERE server_id = $1 AND normalized_path = $2`,
+    [serverId, normalizedPath],
+  );
+}
+
+export async function recordOnlyOfficeCommitJournalRecord(
+  db: Database,
+  entry: OnlyOfficeCommitJournalRow,
+): Promise<void> {
+  await db.execute(
+    `INSERT INTO onlyoffice_commit_journal (
+       server_id, normalized_path, room_key, target_hash, session_epoch, phase, updated_at
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (server_id, normalized_path) DO UPDATE SET
+       room_key = EXCLUDED.room_key,
+       target_hash = EXCLUDED.target_hash,
+       session_epoch = EXCLUDED.session_epoch,
+       phase = EXCLUDED.phase,
+       updated_at = EXCLUDED.updated_at`,
+    [
+      entry.server_id,
+      entry.normalized_path,
+      entry.room_key,
+      entry.target_hash,
+      entry.session_epoch,
+      entry.phase || 'intent',
+      entry.updated_at,
+    ],
+  );
+}
+
+export async function getOnlyOfficeCommitJournalRecord(
+  db: Database,
+  serverId: string,
+  normalizedPath: string,
+): Promise<OnlyOfficeCommitJournalRow | null> {
+  const row = await db.queryOne<OnlyOfficeCommitJournalRow>(
+    `SELECT server_id, normalized_path, room_key, target_hash, session_epoch, phase, updated_at
+     FROM onlyoffice_commit_journal
+     WHERE server_id = $1 AND normalized_path = $2`,
+    [serverId, normalizedPath],
+  );
+  if (!row) return null;
+  return {
+    ...row,
+    session_epoch: Number(row.session_epoch),
+    updated_at: Number(row.updated_at),
+  };
+}
+
+export async function clearOnlyOfficeCommitJournalRecord(
+  db: Database,
+  serverId: string,
+  normalizedPath: string,
+): Promise<void> {
+  await db.execute(
+    `DELETE FROM onlyoffice_commit_journal WHERE server_id = $1 AND normalized_path = $2`,
+    [serverId, normalizedPath],
+  );
+}
+

@@ -1,6 +1,4 @@
 import { createHash, createHmac } from 'node:crypto';
-import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { deflateRawSync } from 'node:zlib';
 import { Hono } from 'hono';
@@ -14,8 +12,15 @@ import {
   isPathWithinSharedFolder,
   normalizeDocumentSharePath,
   resolveEffectiveDocumentAccess,
+  getOnlyOfficeRoomRecord,
+  upsertOnlyOfficeRoomRecord,
+  deleteOnlyOfficeRoomRecord,
+  recordOnlyOfficeCommitJournalRecord,
+  getOnlyOfficeCommitJournalRecord,
+  clearOnlyOfficeCommitJournalRecord,
   type DocumentShareRole,
   type EffectiveDocumentAccess,
+  type OnlyOfficeCommitJournalRow,
 } from '../db/document-sharing.js';
 import { shareTargetFromSessionName } from '../db/tab-sharing.js';
 import { resolveHttpShareAccess, resolveHttpShareAccessForCoveredSession } from './share-http-auth.js';
@@ -164,68 +169,53 @@ function getAuthoritativeHash(state: DocumentVersionState): string {
   return state.currentConfirmedHash || state.lastForceSavedHash || state.committedHash || '';
 }
 
-const ROOMS_STORE_PATH = path.join(os.tmpdir(), '.imcodes-onlyoffice-rooms.json');
-const JOURNAL_STORE_PATH = path.join(os.tmpdir(), '.imcodes-onlyoffice-journal.json');
-
-function loadPersistentRooms(): Record<string, DocumentVersionState> {
+async function loadPersistentRoomFromDb(
+  db: Database | undefined,
+  serverId: string,
+  normalizedPath: string,
+): Promise<DocumentVersionState | null> {
+  if (!db) return null;
   try {
-    if (fs.existsSync(ROOMS_STORE_PATH)) {
-      const raw = fs.readFileSync(ROOMS_STORE_PATH, 'utf8');
-      const data = JSON.parse(raw);
-      if (data && typeof data === 'object') return data;
-    }
-  } catch { /* ignore */ }
-  return {};
-}
-
-function savePersistentRoom(mapKey: string, state: DocumentVersionState | null): void {
-  const data = loadPersistentRooms();
-  if (state === null) {
-    delete data[mapKey];
-  } else {
-    data[mapKey] = state;
+    const row = await getOnlyOfficeRoomRecord(db, serverId, normalizedPath);
+    if (!row) return null;
+    return {
+      currentConfirmedHash: row.current_confirmed_hash,
+      committedHash: row.committed_hash,
+      lastForceSavedHash: row.last_force_saved_hash,
+      sessionEpoch: row.session_epoch,
+      commitSeq: row.commit_seq,
+      activeKey: row.active_key,
+      active: row.active,
+      updatedAt: row.updated_at,
+    };
+  } catch {
+    return null;
   }
-  const tmp = `${ROOMS_STORE_PATH}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(data), 'utf8');
-  fs.renameSync(tmp, ROOMS_STORE_PATH);
 }
 
-interface CommitJournalEntry {
-  roomKey: string;
-  hash: string;
-  epoch: number;
-  updatedAt: number;
-}
-
-function loadCommitJournal(): Record<string, CommitJournalEntry> {
-  try {
-    if (fs.existsSync(JOURNAL_STORE_PATH)) {
-      const raw = fs.readFileSync(JOURNAL_STORE_PATH, 'utf8');
-      const data = JSON.parse(raw);
-      if (data && typeof data === 'object') return data;
-    }
-  } catch { /* ignore */ }
-  return {};
-}
-
-function recordCommitJournal(mapKey: string, entry: CommitJournalEntry): void {
-  const data = loadCommitJournal();
-  data[mapKey] = entry;
-  const tmp = `${JOURNAL_STORE_PATH}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(data), 'utf8');
-  fs.renameSync(tmp, JOURNAL_STORE_PATH);
-}
-
-function clearCommitJournal(mapKey: string): void {
-  try {
-    const data = loadCommitJournal();
-    if (data[mapKey]) {
-      delete data[mapKey];
-      const tmp = `${JOURNAL_STORE_PATH}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
-      fs.writeFileSync(tmp, JSON.stringify(data), 'utf8');
-      fs.renameSync(tmp, JOURNAL_STORE_PATH);
-    }
-  } catch { /* best effort */ }
+async function savePersistentRoomToDb(
+  db: Database | undefined,
+  serverId: string,
+  normalizedPath: string,
+  state: DocumentVersionState | null,
+): Promise<void> {
+  if (!db) return;
+  if (state === null) {
+    await deleteOnlyOfficeRoomRecord(db, serverId, normalizedPath);
+  } else {
+    await upsertOnlyOfficeRoomRecord(db, {
+      server_id: serverId,
+      normalized_path: normalizedPath,
+      current_confirmed_hash: state.currentConfirmedHash ?? state.lastForceSavedHash ?? state.committedHash ?? '',
+      committed_hash: state.committedHash ?? state.currentConfirmedHash ?? '',
+      last_force_saved_hash: state.lastForceSavedHash ?? null,
+      active_key: state.activeKey,
+      session_epoch: state.sessionEpoch,
+      commit_seq: state.commitSeq,
+      active: state.active !== false,
+      updated_at: state.updatedAt,
+    });
+  }
 }
 
 const docCommitMutex = new Map<string, Promise<void>>();
@@ -253,7 +243,7 @@ const documentVersionStateMap = new Map<string, DocumentVersionState>();
 const pendingCommitHashMap = new Map<string, string>();
 
 function getDocumentCommitSeq(mapKey: string): number {
-  const state = documentVersionStateMap.get(mapKey) ?? loadPersistentRooms()[mapKey];
+  const state = documentVersionStateMap.get(mapKey);
   return state?.commitSeq ?? 0;
 }
 
@@ -273,7 +263,7 @@ export function getOnlyOfficeDocumentKey(
   contentHash?: string,
 ): string {
   const mapKey = `${serverId}:${normalizedPath}`;
-  const state = documentVersionStateMap.get(mapKey) ?? loadPersistentRooms()[mapKey];
+  const state = documentVersionStateMap.get(mapKey);
   if (state) {
     if (contentHash && contentHash !== state.committedHash && contentHash !== state.lastForceSavedHash) {
       return computeDocumentKeyFromDigest(serverId, normalizedPath, contentHash, state.sessionEpoch);
@@ -290,24 +280,22 @@ export function bumpOnlyOfficeDocumentRevision(
   newContentHash?: string,
 ): number {
   const mapKey = `${serverId}:${normalizedPath}`;
-  let state = documentVersionStateMap.get(mapKey);
-  if (!state) {
-    state = loadPersistentRooms()[mapKey];
-  }
+  const state = documentVersionStateMap.get(mapKey);
   const sessionEpoch = (state?.sessionEpoch ?? 0) + 1;
   const commitSeq = (state?.commitSeq ?? 0) + 1;
   const resolvedHash = newContentHash ?? state?.committedHash ?? 'initial';
   const activeKey = computeDocumentKeyFromDigest(serverId, normalizedPath, resolvedHash, sessionEpoch);
   const newState: DocumentVersionState = {
+    currentConfirmedHash: resolvedHash,
     committedHash: resolvedHash,
     lastForceSavedHash: null,
     sessionEpoch,
     commitSeq,
     activeKey,
+    active: true,
     updatedAt: Date.now(),
   };
   documentVersionStateMap.set(mapKey, newState);
-  savePersistentRoom(mapKey, newState);
   return sessionEpoch;
 }
 
@@ -320,26 +308,30 @@ export function resetOnlyOfficeDocumentKeyCacheForTests(): void {
 export async function resolveOnlyOfficeDocumentKey(
   serverId: string,
   normalizedPath: string,
-  options?: { allowedRoot?: string },
+  options?: { allowedRoot?: string; db?: Database },
 ): Promise<string> {
   const mapKey = `${serverId}:${normalizedPath}`;
   try {
     const { bytes } = await readFileFromDaemon(serverId, normalizedPath, options);
     const currentHash = createHash('sha256').update(bytes).digest('hex');
     let existing = documentVersionStateMap.get(mapKey);
-    if (!existing) {
-      const persisted = loadPersistentRooms()[mapKey];
-      if (persisted) {
-        existing = persisted;
+    if (!existing && options?.db) {
+      existing = (await loadPersistentRoomFromDb(options.db, serverId, normalizedPath)) ?? undefined;
+      if (existing) {
         documentVersionStateMap.set(mapKey, existing);
       }
     }
 
     const pendingMemoryHash = pendingCommitHashMap.get(mapKey);
-    const journalEntry = loadCommitJournal()[mapKey];
+    let journalEntry: OnlyOfficeCommitJournalRow | null = null;
+    if (options?.db) {
+      try {
+        journalEntry = await getOnlyOfficeCommitJournalRecord(options.db, serverId, normalizedPath);
+      } catch { /* best effort */ }
+    }
     const isPendingRoomWrite =
       (pendingMemoryHash && currentHash === pendingMemoryHash) ||
-      (journalEntry && journalEntry.roomKey === existing?.activeKey && journalEntry.hash === currentHash);
+      (journalEntry && journalEntry.room_key === existing?.activeKey && journalEntry.target_hash === currentHash);
 
     if (existing) {
       if (isPendingRoomWrite) {
@@ -350,10 +342,12 @@ export async function resolveOnlyOfficeDocumentKey(
           existing.active = true;
           existing.updatedAt = Date.now();
           documentVersionStateMap.set(mapKey, existing);
-          try {
-            savePersistentRoom(mapKey, existing);
-            clearCommitJournal(mapKey);
-          } catch { /* best effort */ }
+          if (options?.db) {
+            try {
+              await savePersistentRoomToDb(options.db, serverId, normalizedPath, existing);
+              await clearOnlyOfficeCommitJournalRecord(options.db, serverId, normalizedPath);
+            } catch { /* best effort */ }
+          }
         }
         return existing.activeKey;
       }
@@ -364,9 +358,11 @@ export async function resolveOnlyOfficeDocumentKey(
           existing.active = true;
           existing.updatedAt = Date.now();
           documentVersionStateMap.set(mapKey, existing);
-          try {
-            savePersistentRoom(mapKey, existing);
-          } catch { /* best effort */ }
+          if (options?.db) {
+            try {
+              await savePersistentRoomToDb(options.db, serverId, normalizedPath, existing);
+            } catch { /* best effort */ }
+          }
         }
         return existing.activeKey;
       }
@@ -386,9 +382,12 @@ export async function resolveOnlyOfficeDocumentKey(
         updatedAt: Date.now(),
       };
       documentVersionStateMap.set(mapKey, newState);
-      try {
-        savePersistentRoom(mapKey, newState);
-      } catch { /* best effort */ }
+      if (options?.db) {
+        try {
+          await savePersistentRoomToDb(options.db, serverId, normalizedPath, newState);
+          await clearOnlyOfficeCommitJournalRecord(options.db, serverId, normalizedPath);
+        } catch { /* best effort */ }
+      }
       return activeKey;
     }
 
@@ -404,9 +403,11 @@ export async function resolveOnlyOfficeDocumentKey(
       updatedAt: Date.now(),
     };
     documentVersionStateMap.set(mapKey, newState);
-    try {
-      savePersistentRoom(mapKey, newState);
-    } catch { /* best effort */ }
+    if (options?.db) {
+      try {
+        await savePersistentRoomToDb(options.db, serverId, normalizedPath, newState);
+      } catch { /* best effort */ }
+    }
     return activeKey;
   } catch {
     return getOnlyOfficeDocumentKey(serverId, normalizedPath);
@@ -1277,6 +1278,7 @@ onlyofficeRoutes.get('/server/:id/onlyoffice/config', async (c): Promise<Respons
 
   const documentKey = await resolveOnlyOfficeDocumentKey(serverId, normPath, {
     allowedRoot: access.targetPath ?? undefined,
+    db: c.env.DB,
   });
 
   const docToken = signOnlyOfficeDocToken(
@@ -1580,6 +1582,7 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
     const startCommitSeq = getDocumentCommitSeq(mapKey);
     const preCheckKey = await resolveOnlyOfficeDocumentKey(claims.serverId, claims.path, {
       allowedRoot: liveAccess.allowedRoot ?? undefined,
+      db: c.env.DB,
     });
     if (claims.documentKey && preCheckKey !== claims.documentKey) {
       return c.json({ error: 1, message: 'stale_document_key' }, 409);
@@ -1621,6 +1624,7 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
 
       const keyAtCommit = await resolveOnlyOfficeDocumentKey(claims.serverId, claims.path, {
         allowedRoot: liveCommitAccess.allowedRoot ?? undefined,
+        db: c.env.DB,
       });
       if (claims.documentKey && keyAtCommit !== claims.documentKey) {
         return c.json({ error: 1, message: 'stale_document_key' }, 409);
@@ -1630,17 +1634,26 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
       }
 
       const newDigest = createHash('sha256').update(bytes).digest('hex');
-      let state = documentVersionStateMap.get(mapKey) ?? loadPersistentRooms()[mapKey];
+      let state = documentVersionStateMap.get(mapKey);
+      if (!state && c.env.DB) {
+        state = (await loadPersistentRoomFromDb(c.env.DB, claims.serverId, claims.path)) ?? undefined;
+        if (state) {
+          documentVersionStateMap.set(mapKey, state);
+        }
+      }
       const currentEpoch = state?.sessionEpoch ?? 0;
       const currentKey = state?.activeKey ?? signedKey;
 
-      // 1. Write-Ahead Intent: MUST successfully persist intent BEFORE any daemon write side-effect
+      // 1. Write-Ahead Intent: MUST successfully persist intent in PG BEFORE any daemon write side-effect
       try {
-        recordCommitJournal(mapKey, {
-          roomKey: currentKey,
-          hash: newDigest,
-          epoch: currentEpoch,
-          updatedAt: Date.now(),
+        await recordOnlyOfficeCommitJournalRecord(c.env.DB, {
+          server_id: claims.serverId,
+          normalized_path: claims.path,
+          room_key: currentKey,
+          target_hash: newDigest,
+          session_epoch: currentEpoch,
+          phase: 'intent',
+          updated_at: Date.now(),
         });
       } catch (walErr) {
         // If WAL cannot be recorded, abort immediately without modifying daemon binary
@@ -1658,7 +1671,9 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
         });
       } catch (writeErr) {
         pendingCommitHashMap.delete(mapKey);
-        clearCommitJournal(mapKey);
+        try {
+          await clearOnlyOfficeCommitJournalRecord(c.env.DB, claims.serverId, claims.path);
+        } catch { /* best effort */ }
         const msg = writeErr instanceof Error ? writeErr.message : String(writeErr);
         const errStatus = msg === 'forbidden_path' ? 403 : 502;
         return c.json({ error: 1, message: msg }, errStatus);
@@ -1679,13 +1694,15 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
           updatedAt: Date.now(),
         };
         try {
-          savePersistentRoom(mapKey, newState);
+          await savePersistentRoomToDb(c.env.DB, claims.serverId, claims.path, newState);
         } catch (persistErr) {
           return c.json({ error: 1, message: 'durable_room_state_failed' }, 500);
         }
         documentVersionStateMap.set(mapKey, newState);
         pendingCommitHashMap.delete(mapKey);
-        clearCommitJournal(mapKey);
+        try {
+          await clearOnlyOfficeCommitJournalRecord(c.env.DB, claims.serverId, claims.path);
+        } catch { /* best effort */ }
       } else if (status === 6) {
         const nextSeq = (state?.commitSeq ?? 0) + 1;
         const newState: DocumentVersionState = {
@@ -1699,13 +1716,15 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
           updatedAt: Date.now(),
         };
         try {
-          savePersistentRoom(mapKey, newState);
+          await savePersistentRoomToDb(c.env.DB, claims.serverId, claims.path, newState);
         } catch (persistErr) {
           return c.json({ error: 1, message: 'durable_room_state_failed' }, 500);
         }
         documentVersionStateMap.set(mapKey, newState);
         pendingCommitHashMap.delete(mapKey);
-        clearCommitJournal(mapKey);
+        try {
+          await clearOnlyOfficeCommitJournalRecord(c.env.DB, claims.serverId, claims.path);
+        } catch { /* best effort */ }
       }
 
       return c.json({ error: 0 });
@@ -1714,7 +1733,10 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
 
   if (status === 4) {
     const mapKey = `${claims.serverId}:${claims.path}`;
-    const state = documentVersionStateMap.get(mapKey) ?? loadPersistentRooms()[mapKey];
+    let state = documentVersionStateMap.get(mapKey);
+    if (!state && c.env.DB) {
+      state = (await loadPersistentRoomFromDb(c.env.DB, claims.serverId, claims.path)) ?? undefined;
+    }
     if (state && state.active !== false) {
       const newState: DocumentVersionState = {
         ...state,
@@ -1722,11 +1744,13 @@ async function handleOnlyOfficeCallback(c: RouteContext): Promise<Response> {
         updatedAt: Date.now(),
       };
       try {
-        savePersistentRoom(mapKey, newState);
+        await savePersistentRoomToDb(c.env.DB, claims.serverId, claims.path, newState);
       } catch { /* best effort on status 4 */ }
       documentVersionStateMap.set(mapKey, newState);
       pendingCommitHashMap.delete(mapKey);
-      clearCommitJournal(mapKey);
+      try {
+        await clearOnlyOfficeCommitJournalRecord(c.env.DB, claims.serverId, claims.path);
+      } catch { /* best effort */ }
     }
   }
 

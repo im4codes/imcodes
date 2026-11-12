@@ -18,6 +18,8 @@ import {
   clearVerifiedExternalSharePinsForTests,
   isPathWithinSharedFolder,
   normalizeDocumentSharePath,
+  type OnlyOfficeRoomRow,
+  type OnlyOfficeCommitJournalRow,
 } from '../src/db/document-sharing.js';
 import { handleWebCommand, __resetFsGitCachesForTests } from '../../src/daemon/command-handler.js';
 import type { ServerLink } from '../../src/daemon/server-link.js';
@@ -92,6 +94,8 @@ function createInMemoryDb() {
     string,
     { id: string; user_id: string; public_key: string; counter: number; transports: string | null }
   >();
+  const rooms = new Map<string, OnlyOfficeRoomRow>();
+  const commitJournals = new Map<string, OnlyOfficeCommitJournalRow>();
 
   const enrichShare = (row: MemShareRow) => {
     const u = users.get(row.target_user_id);
@@ -387,6 +391,18 @@ function createInMemoryDb() {
         return row as unknown as T;
       }
 
+      if (normSql.includes('FROM onlyoffice_rooms') && normSql.includes('WHERE server_id = $1 AND normalized_path = $2')) {
+        const [serverId, normalizedPath] = params as [string, string];
+        const row = rooms.get(`${serverId}:${normalizedPath}`);
+        return (row ?? null) as unknown as T | null;
+      }
+
+      if (normSql.includes('FROM onlyoffice_commit_journal') && normSql.includes('WHERE server_id = $1 AND normalized_path = $2')) {
+        const [serverId, normalizedPath] = params as [string, string];
+        const row = commitJournals.get(`${serverId}:${normalizedPath}`);
+        return (row ?? null) as unknown as T | null;
+      }
+
       // getDocumentShareByToken
       if (normSql.includes('FROM document_shares ds') && normSql.includes('WHERE ds.share_token_hash = $1')) {
         const hash = params[0] as string;
@@ -574,6 +590,70 @@ function createInMemoryDb() {
         }
         return { changes: 0 };
       }
+      if (normSql.startsWith('INSERT INTO onlyoffice_rooms')) {
+        const [
+          serverId,
+          normalizedPath,
+          currentConfirmedHash,
+          committedHash,
+          lastForceSavedHash,
+          activeKey,
+          sessionEpoch,
+          commitSeq,
+          active,
+          updatedAt,
+        ] = params as [string, string, string, string, string | null, string, number, number, boolean, number];
+        const row: OnlyOfficeRoomRow = {
+          server_id: serverId,
+          normalized_path: normalizedPath,
+          current_confirmed_hash: currentConfirmedHash,
+          committed_hash: committedHash,
+          last_force_saved_hash: lastForceSavedHash,
+          active_key: activeKey,
+          session_epoch: Number(sessionEpoch),
+          commit_seq: Number(commitSeq),
+          active: Boolean(active),
+          updated_at: Number(updatedAt),
+        };
+        rooms.set(`${serverId}:${normalizedPath}`, row);
+        return { changes: 1 };
+      }
+
+      if (normSql.startsWith('DELETE FROM onlyoffice_rooms WHERE server_id = $1 AND normalized_path = $2')) {
+        const [serverId, normalizedPath] = params as [string, string];
+        rooms.delete(`${serverId}:${normalizedPath}`);
+        return { changes: 1 };
+      }
+
+      if (normSql.startsWith('INSERT INTO onlyoffice_commit_journal')) {
+        const [
+          serverId,
+          normalizedPath,
+          roomKey,
+          targetHash,
+          sessionEpoch,
+          phase,
+          updatedAt,
+        ] = params as [string, string, string, string, number, string, number];
+        const row: OnlyOfficeCommitJournalRow = {
+          server_id: serverId,
+          normalized_path: normalizedPath,
+          room_key: roomKey,
+          target_hash: targetHash,
+          session_epoch: Number(sessionEpoch),
+          phase: phase || 'intent',
+          updated_at: Number(updatedAt),
+        };
+        commitJournals.set(`${serverId}:${normalizedPath}`, row);
+        return { changes: 1 };
+      }
+
+      if (normSql.startsWith('DELETE FROM onlyoffice_commit_journal WHERE server_id = $1 AND normalized_path = $2')) {
+        const [serverId, normalizedPath] = params as [string, string];
+        commitJournals.delete(`${serverId}:${normalizedPath}`);
+        return { changes: 1 };
+      }
+
       return { changes: 1 };
     },
     exec: async () => undefined,
@@ -589,6 +669,8 @@ function createInMemoryDb() {
     refreshTokens,
     passkeyChallenges,
     passkeyCredentials,
+    rooms,
+    commitJournals,
   };
 }
 
@@ -627,6 +709,9 @@ describe('103_document_shares.sql migration & path security invariants', () => {
     expect(sql).toContain('idx_document_shares_server_revoked');
     expect(sql).toContain('idx_document_shares_user_revoked');
     expect(sql).toContain('idx_document_shares_token_hash');
+    expect(sql).toContain('CREATE TABLE IF NOT EXISTS onlyoffice_rooms');
+    expect(sql).toContain('CREATE TABLE IF NOT EXISTS onlyoffice_commit_journal');
+    expect(sql).toContain('PRIMARY KEY (server_id, normalized_path)');
   });
 
   it('normalizes document paths and strictly prevents prefix collisions and .. traversal', () => {
@@ -1670,6 +1755,184 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
     });
     expect(wsTicketRes.status).toBe(403);
   });
+
+  it('persists collaborative room state in PostgreSQL and retains key across in-memory cache resets (F8)', async () => {
+    const res = await app.request('/api/server/srv-1/onlyoffice/config?path=%2Fteam%2Fshared%2Fspec.docx&mode=edit', {
+      headers: { Authorization: bearer('owner-1') },
+    });
+    expect(res.status).toBe(200);
+    const cfg = (await res.json()) as any;
+    const key = cfg.config.document.key;
+
+    // Verify room was persisted into PostgreSQL
+    const roomInDb = store.rooms.get('srv-1:/team/shared/spec.docx');
+    expect(roomInDb).toBeDefined();
+    expect(roomInDb?.active_key).toBe(key);
+    expect(roomInDb?.session_epoch).toBe(0);
+    expect(roomInDb?.active).toBe(true);
+
+    // Reset in-memory cache completely to simulate service restart or separate pod
+    resetOnlyOfficeDocumentKeyCacheForTests();
+
+    // Query config again: must recover exactly the same key from PostgreSQL
+    const res2 = await app.request('/api/server/srv-1/onlyoffice/config?path=%2Fteam%2Fshared%2Fspec.docx&mode=edit', {
+      headers: { Authorization: bearer('owner-1') },
+    });
+    expect(res2.status).toBe(200);
+    const cfg2 = (await res2.json()) as any;
+    expect(cfg2.config.document.key).toBe(key);
+  });
+
+  it('aborts callback without modifying daemon binary if PostgreSQL WAL intent write fails (F8)', async () => {
+    const res = await app.request('/api/server/srv-1/onlyoffice/config?path=%2Fteam%2Fshared%2Fspec.docx&mode=edit', {
+      headers: { Authorization: bearer('owner-1') },
+    });
+    expect(res.status).toBe(200);
+    const cfg = (await res.json()) as any;
+    const key = cfg.config.document.key;
+    const cb = new URL(cfg.config.editorConfig.callbackUrl);
+
+    const originalContent = virtualFiles.get('/team/shared/spec.docx')!.content;
+
+    // Mock fetch for ONLYOFFICE document download
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      new Response('new-content-blocked-by-wal', { status: 200 }),
+    );
+
+    // Cause DB WAL write to fail
+    const origExecute = store.db.execute.bind(store.db);
+    let walAttempted = 0;
+    const execSpy = vi.spyOn(store.db, 'execute').mockImplementation(async (sql, params) => {
+      if (sql.includes('INSERT INTO onlyoffice_commit_journal')) {
+        walAttempted++;
+        throw new Error('PostgreSQL WAL disk full / connection closed');
+      }
+      return origExecute(sql, params);
+    });
+
+    const data = { status: 6, key, url: 'https://im.example.com/onlyoffice/cache/force-save.docx' };
+    const saveRes = await app.request(cb.pathname + cb.search, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...data, token: signJwt(data, 'onlyoffice-jwt-secret-key-test!!', 300) }),
+    });
+
+    expect(walAttempted).toBeGreaterThan(0);
+    expect(saveRes.status).toBe(500);
+    const saveBody = (await saveRes.json()) as any;
+    expect(saveBody.message).toBe('durable_room_state_failed');
+
+    // Invariant: If WAL cannot be recorded in PG, the daemon binary MUST NOT be modified
+    expect(virtualFiles.get('/team/shared/spec.docx')!.content).toBe(originalContent);
+
+    execSpy.mockRestore();
+    vi.restoreAllMocks();
+  });
+
+  it('invalidates PostgreSQL room on external restore and rejects stale room callback with 409 (F8)', async () => {
+    const res = await app.request('/api/server/srv-1/onlyoffice/config?path=%2Fteam%2Fshared%2Fspec.docx&mode=edit', {
+      headers: { Authorization: bearer('owner-1') },
+    });
+    expect(res.status).toBe(200);
+    const cfg = (await res.json()) as any;
+    const originalKey = cfg.config.document.key;
+    const cb = new URL(cfg.config.editorConfig.callbackUrl);
+    const originalFile = { ...virtualFiles.get('/team/shared/spec.docx')! };
+
+    // Force-save creates revision B on disk and in PG
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      new Response('revision-B-content', { status: 200 }),
+    );
+    const forced = { status: 6, key: originalKey, url: 'https://im.example.com/onlyoffice/cache/rev-b.docx' };
+    const forceRes = await app.request(cb.pathname + cb.search, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...forced, token: signJwt(forced, 'onlyoffice-jwt-secret-key-test!!', 300) }),
+    });
+    expect(forceRes.status).toBe(200);
+
+    const roomAfterForce = store.rooms.get('srv-1:/team/shared/spec.docx');
+    expect(roomAfterForce?.active_key).toBe(originalKey);
+    expect(roomAfterForce?.current_confirmed_hash).not.toBe(sha256Hex(originalFile.content));
+
+    // External actor restores file back to original A content
+    virtualFiles.set('/team/shared/spec.docx', { ...originalFile, mtime: Date.now() });
+
+    // Next GET config detects external restore: current hash (A) != confirmed hash (B)
+    // Must advance to a new sessionEpoch and generate a new key
+    const resAfterRestore = await app.request(
+      '/api/server/srv-1/onlyoffice/config?path=%2Fteam%2Fshared%2Fspec.docx&mode=edit',
+      {
+        headers: { Authorization: bearer('owner-1') },
+      },
+    );
+    expect(resAfterRestore.status).toBe(200);
+    const cfgAfterRestore = (await resAfterRestore.json()) as any;
+    const newKey = cfgAfterRestore.config.document.key;
+    expect(newKey).not.toBe(originalKey);
+
+    // Old room callback attempting late save with originalKey must be rejected with 409
+    vi.mocked(globalThis.fetch).mockImplementation(async () =>
+      new Response('stale-overwrite-attempt', { status: 200 }),
+    );
+    const staleData = { status: 2, key: originalKey, url: 'https://im.example.com/onlyoffice/cache/stale.docx' };
+    const staleRes = await app.request(cb.pathname + cb.search, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...staleData, token: signJwt(staleData, 'onlyoffice-jwt-secret-key-test!!', 300) }),
+    });
+    expect(staleRes.status).toBe(409);
+    expect(virtualFiles.get('/team/shared/spec.docx')!.content).toBe(originalFile.content);
+
+    vi.restoreAllMocks();
+  });
+
+  it('updates PostgreSQL authoritative hash on force-save and marks inactive on status 2 final save (F8)', async () => {
+    const res = await app.request('/api/server/srv-1/onlyoffice/config?path=%2Fteam%2Fshared%2Fspec.docx&mode=edit', {
+      headers: { Authorization: bearer('owner-1') },
+    });
+    expect(res.status).toBe(200);
+    const cfg = (await res.json()) as any;
+    const key = cfg.config.document.key;
+    const cb = new URL(cfg.config.editorConfig.callbackUrl);
+
+    // Status 6: force-save
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      new Response('force-saved-bytes', { status: 200 }),
+    );
+    const forceData = { status: 6, key, url: 'https://im.example.com/onlyoffice/cache/force.docx' };
+    const forceRes = await app.request(cb.pathname + cb.search, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...forceData, token: signJwt(forceData, 'onlyoffice-jwt-secret-key-test!!', 300) }),
+    });
+    expect(forceRes.status).toBe(200);
+
+    const roomAfterForce = store.rooms.get('srv-1:/team/shared/spec.docx');
+    expect(roomAfterForce?.active).toBe(true);
+    expect(roomAfterForce?.current_confirmed_hash).toBe(sha256Hex('force-saved-bytes'));
+    expect(store.commitJournals.has('srv-1:/team/shared/spec.docx')).toBe(false);
+
+    // Status 2: final save
+    vi.mocked(globalThis.fetch).mockImplementation(async () =>
+      new Response('final-saved-bytes', { status: 200 }),
+    );
+    const finalData = { status: 2, key, url: 'https://im.example.com/onlyoffice/cache/final.docx' };
+    const finalRes = await app.request(cb.pathname + cb.search, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...finalData, token: signJwt(finalData, 'onlyoffice-jwt-secret-key-test!!', 300) }),
+    });
+    expect(finalRes.status).toBe(200);
+
+    const roomAfterFinal = store.rooms.get('srv-1:/team/shared/spec.docx');
+    expect(roomAfterFinal?.active).toBe(false);
+    expect(roomAfterFinal?.current_confirmed_hash).toBe(sha256Hex('final-saved-bytes'));
+    expect(store.commitJournals.has('srv-1:/team/shared/spec.docx')).toBe(false);
+
+    vi.restoreAllMocks();
+  });
+
 });
 
 describe('Real Daemon CommandHandler Integration: Atomic Binary Save & Symlink Escape Prevention (F1 + F3d)', () => {

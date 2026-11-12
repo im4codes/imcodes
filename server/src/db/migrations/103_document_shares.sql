@@ -36,3 +36,35 @@ CREATE INDEX IF NOT EXISTS idx_document_shares_user_revoked
 
 CREATE INDEX IF NOT EXISTS idx_document_shares_token_hash
   ON document_shares (share_token_hash);
+
+-- Authoritative ONLYOFFICE collaborative room state and commit intent WAL
+CREATE TABLE IF NOT EXISTS onlyoffice_rooms (
+  server_id              TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  normalized_path        TEXT NOT NULL,
+  current_confirmed_hash TEXT NOT NULL,
+  committed_hash         TEXT NOT NULL,
+  last_force_saved_hash  TEXT,
+  active_key             TEXT NOT NULL,
+  session_epoch          INTEGER NOT NULL DEFAULT 0,
+  commit_seq             INTEGER NOT NULL DEFAULT 0,
+  active                 BOOLEAN NOT NULL DEFAULT TRUE,
+  updated_at             BIGINT NOT NULL,
+  PRIMARY KEY (server_id, normalized_path)
+);
+
+CREATE TABLE IF NOT EXISTS onlyoffice_commit_journal (
+  server_id              TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+  normalized_path        TEXT NOT NULL,
+  room_key               TEXT NOT NULL,
+  target_hash            TEXT NOT NULL,
+  session_epoch          INTEGER NOT NULL,
+  phase                  TEXT NOT NULL DEFAULT 'intent',
+  updated_at             BIGINT NOT NULL,
+  PRIMARY KEY (server_id, normalized_path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_onlyoffice_rooms_lookup
+  ON onlyoffice_rooms (server_id, normalized_path);
+
+CREATE INDEX IF NOT EXISTS idx_onlyoffice_journal_lookup
+  ON onlyoffice_commit_journal (server_id, normalized_path);
