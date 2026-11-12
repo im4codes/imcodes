@@ -620,6 +620,27 @@ describe('AG native ACP', () => {
     expect((await requests()).filter(row => row.method === 'session/set_model').map(row => row.params.modelId)).toEqual(['gemini-3.8-flash-low', 'gemini-3.8-flash-high', 'gemini-4-carbon-medium']);
   });
 
+  it('defaults new sessions without agentId and cached listModels defaultModel to gemini-4-hydrogen-high when supported', async () => {
+    const { provider, requests } = await setup('legacy-flash-default');
+    const id = 'deck_test_agy_acp_default';
+    const done = vi.fn();
+    provider.onComplete(done);
+    await provider.createSession({ sessionKey: id, sessionName: id, cwd: process.cwd(), fresh: true });
+    await provider.send(id, 'hello');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(done.mock.calls[0]?.[1].metadata.model).toBe('gemini-4-hydrogen-high');
+    expect((await requests()).filter(row => row.method === 'session/set_model').map(row => row.params.modelId)).toEqual(['gemini-4-hydrogen-high']);
+    expect((await provider.listModels()).defaultModel).toBe('gemini-4-hydrogen-high');
+    expect(provider.getCachedModels()?.defaultModel).toBe('gemini-4-hydrogen-high');
+
+    // Resumed native session without explicit agentId keeps its native currentModelId.
+    const resumedId = 'deck_test_agy_acp_resumed';
+    await provider.createSession({ sessionKey: resumedId, sessionName: resumedId, cwd: process.cwd(), resumeId: 'owned-native' });
+    await provider.send(resumedId, 'resumed turn');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(done.mock.calls[1]?.[1].metadata.model).toBe('gemini-3.8-flash-high');
+  });
+
   it('does not submit a prompt if native model selection fails', async () => {
     const { provider, requests } = await setup(); const id = await route(provider, undefined, { agentId: 'invalid' });
     await expect(provider.send(id, 'A')).rejects.toBeTruthy(); expect((await requests()).some(x => x.method === 'session/prompt')).toBe(false);

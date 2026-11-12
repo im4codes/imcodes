@@ -11,7 +11,15 @@ const note = (sessionId, update) => send({ method: 'session/update', params: { s
 const record = data => { if (logPath) fs.appendFileSync(logPath, JSON.stringify(data) + '\n'); };
 if (process.argv.includes('--help')) { console.log('Usage: agy'); process.exit(0); }
 if (process.argv.includes('--version')) { console.log(process.env.AGY_ACP_FIXTURE_VERSION || '1.5.4'); process.exit(0); }
-const models = { currentModelId: 'model-a', availableModels: [{ modelId: 'model-a', name: 'Model A' }, { modelId: 'model-b', name: 'Model B' }] };
+const models = scenario === 'legacy-flash-default'
+  ? {
+      currentModelId: 'gemini-3.8-flash-high',
+      availableModels: [
+        { modelId: 'gemini-3.8-flash-high', name: 'Gemini 3.8 Flash (High)' },
+        { modelId: 'gemini-4-hydrogen-high', name: 'Gemini 4 Hydrogen (High)' },
+      ],
+    }
+  : { currentModelId: 'model-a', availableModels: [{ modelId: 'model-a', name: 'Model A' }, { modelId: 'model-b', name: 'Model B' }] };
 function startAutoWakeup(sid, state) {
   if (logPath && fs.existsSync(logPath + '.auto-start-hold')) {
     state.autoTimer = setTimeout(() => startAutoWakeup(sid, state), 10); return;

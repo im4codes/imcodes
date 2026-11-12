@@ -188,6 +188,8 @@ export interface AcpCliProviderProfile {
   resumeWithoutReplay?: boolean;
   /** Defer model selection until idle, and fail rather than run a wrong model. */
   strictModelSelection?: boolean;
+  /** Preferred default model for brand-new sessions when supported by the catalogue. */
+  defaultModel?: string;
   runtimeSubagent?: {
     provider: SdkSubagentProvider;
     providerKind: SdkSubagentProviderKind;
@@ -224,6 +226,7 @@ interface KimiSdkSessionState {
   env?: Record<string, string>;
   contextNamespace?: SessionConfig['contextNamespace'];
   model?: string;
+  modelIsDefault?: boolean;
   confirmedModel?: string;
   modelRevision: number;
   modelControlIntent?: { previous?: string };
@@ -479,6 +482,13 @@ export class KimiSdkProvider implements TransportProvider {
     const prior = this.sessions.get(routeId);
     if (prior) this.closeAgyBridges(prior);
     const existing = config.fresh ? undefined : prior;
+    const explicitAgentId = typeof config.agentId === 'string' && config.agentId.trim()
+      ? config.agentId.trim()
+      : undefined;
+    const inheritedModel = existing?.model;
+    const profileDefaultModel = !explicitAgentId && !inheritedModel && !config.resumeId
+      ? this.profile.defaultModel
+      : undefined;
     const state: KimiSdkSessionState = {
       routeId,
       sessionName: config.sessionName ?? existing?.sessionName,
@@ -487,7 +497,8 @@ export class KimiSdkProvider implements TransportProvider {
       cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
       env: config.env ?? existing?.env,
       contextNamespace: config.contextNamespace ?? existing?.contextNamespace,
-      model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
+      model: explicitAgentId ?? inheritedModel ?? profileDefaultModel,
+      modelIsDefault: !explicitAgentId && (inheritedModel ? existing?.modelIsDefault : !!profileDefaultModel),
       confirmedModel: existing?.confirmedModel,
       modelRevision: 0,
       beforeNativeSessionStart: config.beforeNativeSessionStart ?? existing?.beforeNativeSessionStart,
@@ -805,6 +816,7 @@ export class KimiSdkProvider implements TransportProvider {
   setSessionAgentId(sessionId: string, agentId: string): void {
     const state = this.sessions.get(sessionId);
     if (!state) return;
+    state.modelIsDefault = false;
     if (state.model !== agentId) { state.model = agentId; state.modelRevision++; state.modelControlIntent = undefined; }
     if (this.profile.strictModelSelection) return;
     // If session already loaded, best-effort push the model change via the
@@ -1744,7 +1756,11 @@ export class KimiSdkProvider implements TransportProvider {
       id: String(m.modelId ?? m.id ?? ''),
       ...(m.name ? { name: String(m.name) } : {}),
     })).filter((m) => m.id);
-    this.cachedDefaultModel = typeof models.currentModelId === 'string' ? models.currentModelId : null;
+    const catalogDefault = typeof models.currentModelId === 'string' ? models.currentModelId : null;
+    const preferredDefault = this.profile.defaultModel;
+    this.cachedDefaultModel = preferredDefault && this.cachedModels.some((m) => m.id === preferredDefault)
+      ? preferredDefault
+      : catalogDefault;
     logger.debug({ provider: this.id, count: this.cachedModels.length, default: this.cachedDefaultModel }, `${this.profile.displayName} models cached`);
   }
 
@@ -1801,6 +1817,14 @@ export class KimiSdkProvider implements TransportProvider {
   ): void {
     if (!info) return;
     const currentModel = info.models?.currentModelId;
+    const available = Array.isArray(info.models?.availableModels) ? info.models.availableModels : [];
+    if (state.modelIsDefault && state.model && available.length > 0) {
+      const supported = available.some((m: Record<string, unknown>) => String((m as Record<string, unknown>).modelId ?? (m as Record<string, unknown>).id ?? '') === state.model);
+      if (!supported) {
+        state.model = typeof currentModel === 'string' ? currentModel : undefined;
+        state.modelIsDefault = false;
+      }
+    }
     if (this.profile.strictModelSelection && typeof currentModel === 'string') {
       state.confirmedModel = currentModel;
     }
