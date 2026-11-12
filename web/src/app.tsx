@@ -215,7 +215,7 @@ import {
 } from './session-list-merge.js';
 import { resolveSessionInfoRuntimeType } from './runtime-type.js';
 import { useSyncedPreference } from './hooks/useSyncedPreference.js';
-import { normalizePinnedServers, toggleServerPin, sortServersByPreference } from './server-order.js';
+import { normalizePinnedServers, normalizeServerOrder, toggleServerPin, sortServersByPreference } from './server-order.js';
 import { parseString, parseBooleanish, usePref } from './hooks/usePref.js';
 import { CLAUDE_WEEKLY_QUOTA_PREF_KEY } from '@shared/claude-quota.js';
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
@@ -2325,13 +2325,13 @@ export function App() {
   // follow the same cross-device sync path as session tabs. Scope the browser
   // cache by user to avoid briefly showing another account's arrangement.
   const serverPreferenceScope = auth?.userId ?? 'anonymous';
-  const [serverOrder] = useSyncedPreference<string[]>(
+  const [serverOrder, setServerOrder, serverOrderHydrated] = useSyncedPreference<string[]>(
     'server_order',
     [],
     0,
     serverPreferenceScope,
   );
-  const [serverPinned, setServerPinned] = useSyncedPreference<string[]>(
+  const [serverPinned, setServerPinned, serverPinnedHydrated] = useSyncedPreference<string[]>(
     'server_pinned',
     [],
     0,
@@ -2353,9 +2353,14 @@ export function App() {
     () => filterRestrictedSharedEntries(sharedEntries),
     [sharedEntries],
   );
-  // Inventory is a possibly partial projection (owned/shared discovery, offline
-  // refresh). It must never rewrite durable pin/order intent. Filter only when
-  // rendering; only an explicit user action may change these preferences.
+  useEffect(() => {
+    if (!serversLoaded || !serverOrderHydrated || !serverPinnedHydrated) return;
+    const nextOrder = normalizeServerOrder(servers, serverOrder);
+    if (JSON.stringify(nextOrder) !== JSON.stringify(serverOrder)) setServerOrder(nextOrder);
+    // Inventory may be partial (owned/shared discovery or an offline refresh).
+    // Filter pins only for rendering, never persist that projection as intent.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [servers, serversLoaded, serverOrder, serverOrderHydrated, serverPinnedHydrated]);
   const toggleServerPinned = useCallback((serverId: string) => {
     setServerPinned((previous) => toggleServerPin(previous, serverId));
   }, [setServerPinned]);

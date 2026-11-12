@@ -1192,6 +1192,15 @@ describe('App shell', () => {
     expect(JSON.parse(localStorage.getItem('rcc_sync_user-1:server_pinned')!).v).toEqual(pinned);
   }, 20_000);
 
+  it('pin persistence: preserves existing automatic ordinary-order initialization', async () => {
+    syncedPrefs.enabled = true;
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    const { App } = await importApp();
+    render(<App />);
+    await waitFor(() => expect(JSON.parse(localStorage.getItem('rcc_sync_user-1:server_order') ?? 'null')?.v).toEqual(['srv-1']));
+    expect(syncedPrefs.save.mock.calls.some(([key]) => key === 'server_pinned')).toBe(false);
+  }, 20_000);
+
   it('pin persistence: explicit toggle preserves temporarily absent pins and permits unpin', async () => {
     syncedPrefs.enabled = true;
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
