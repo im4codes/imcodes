@@ -90,6 +90,7 @@ export function VoiceOverlay({
   const flushingTokenRef = useRef<number | null>(null);
   const pendingFlushRef = useRef<{ token: number; promise: Promise<boolean> } | null>(null);
   const voiceSendPendingRef = useRef(false);
+  const voiceRetryPendingRef = useRef(false);
   // Track listening state in a ref so event handlers always see current value
   const listeningRef = useRef(false);
   // Guard: true while a programmatic write (partial callback) is in progress
@@ -241,6 +242,9 @@ export function VoiceOverlay({
     setSendingNotepad(false);
     setNotepadSendFailed(false);
     setVoiceError(null);
+    voiceRetryPendingRef.current = false;
+    flushingTokenRef.current = null;
+    pendingFlushRef.current = null;
     const scope = draftScopeRef.current;
     const recoverable = scope ? readVoiceNotepadDraft(scope) : null;
     setRecoverableDraft(recoverable);
@@ -292,6 +296,9 @@ export function VoiceOverlay({
       micPointerRef.current = null;
       notepadRef.current = false;
       openRef.current = false;
+      voiceRetryPendingRef.current = false;
+      flushingTokenRef.current = null;
+      pendingFlushRef.current = null;
       vv?.removeEventListener('resize', onResize);
       VoiceInput.onAudioLevel(null);
       VoiceInput.stopListening();
@@ -302,6 +309,44 @@ export function VoiceOverlay({
       listeningRef.current = false;
     };
   }, [open, clearAutoStartTimer, clearRestartTimer, setListeningState]);
+
+  /** Stop current session and commit voice zone */
+  const commitAndStop = useCallback((flush = false): Promise<boolean> => {
+    const token = sessionTokenRef.current;
+    // A tap-stop and double-tap-send can await the SAME native stop ACK.
+    // Share the whole commit, not merely stopListening(): incrementing the
+    // token twice would make the send waiter look stale and silently cancel it.
+    const pending = pendingFlushRef.current;
+    if (flush && pending?.token === token) return pending.promise;
+    if (flush) flushingTokenRef.current = token;
+    else { flushingTokenRef.current = null; sessionTokenRef.current++; }
+    const stopping = (async () => {
+      await VoiceInput.stopListening();
+      if (sessionTokenRef.current !== token + (flush ? 0 : 1)) return false;
+      if (flush) {
+        sessionTokenRef.current++;
+        flushingTokenRef.current = null;
+      }
+      setListeningState(false);
+      // Commit exactly once; all waiters receive the same success/failure.
+      recordCommittedSegment();
+      const committedLen = voiceLenRef.current;
+      insertPosRef.current += committedLen;
+      voiceLenRef.current = 0;
+      if (committedLen > 0 && taRef.current) {
+        const endPos = insertPosRef.current;
+        taRef.current.setSelectionRange(endPos, endPos);
+      }
+      return true;
+    })();
+    if (flush) {
+      const entry = { token, promise: stopping };
+      pendingFlushRef.current = entry;
+      const clear = () => { if (pendingFlushRef.current === entry) pendingFlushRef.current = null; };
+      void stopping.then(clear, clear);
+    }
+    return stopping;
+  }, [recordCommittedSegment, setListeningState]);
 
   /** Start a new recognition session, inserting at given position */
   const startSession = useCallback(async (atPos: number) => {
@@ -314,6 +359,7 @@ export function VoiceOverlay({
     segmentStartedAtRef.current = Date.now();
     setVoiceError(null);
 
+    let sessionActive = false;
     try {
       const ok = await VoiceInput.startListening((partial) => {
         // Discard if session token changed (stale callback from old session)
@@ -347,6 +393,7 @@ export function VoiceOverlay({
       }, (next) => {
         if (sessionTokenRef.current !== token) return;
         if (!openRef.current && next) return;
+        if (next) sessionActive = true;
         setListeningState(next);
         // A stop with a still-current token was not requested by the user
         // (user stops bump the token first): the recognizer ended a segment.
@@ -355,9 +402,13 @@ export function VoiceOverlay({
         if (sessionTokenRef.current !== token || !openRef.current) return;
         setVoiceError(err || 'permission_denied');
         stopNotepadAutoRestart();
+        if (sessionActive || listeningRef.current) {
+          void commitAndStop(true);
+        }
       });
       // Check guards after async — overlay may have closed or session may have changed
-      if (ok && sessionTokenRef.current === token && openRef.current) {
+      if (ok && sessionTokenRef.current === token && flushingTokenRef.current !== token && openRef.current) {
+        sessionActive = true;
         setListeningState(true);
       } else if (!ok && sessionTokenRef.current === token && openRef.current) {
         setListeningState(false);
@@ -371,7 +422,7 @@ export function VoiceOverlay({
         setVoiceError(err instanceof Error ? err.message : 'permission_denied');
       }
     }
-  }, [setListeningState]);
+  }, [commitAndStop, setListeningState]);
 
   /** Recognizer ended a segment on its own in notepad mode: keep going at the end. */
   function scheduleNotepadRestart(): void {
@@ -401,39 +452,6 @@ export function VoiceOverlay({
     restartPausedRef.current = true;
   }
 
-  /** Stop current session and commit voice zone */
-  const commitAndStop = useCallback((flush = false): Promise<boolean> => {
-    const token = sessionTokenRef.current;
-    // A tap-stop and double-tap-send can await the SAME native stop ACK.
-    // Share the whole commit, not merely stopListening(): incrementing the
-    // token twice would make the send waiter look stale and silently cancel it.
-    const pending = pendingFlushRef.current;
-    if (flush && pending?.token === token) return pending.promise;
-    if (flush) flushingTokenRef.current = token;
-    else { flushingTokenRef.current = null; sessionTokenRef.current++; }
-    const stopping = (async () => {
-      await VoiceInput.stopListening();
-      if (sessionTokenRef.current !== token + (flush ? 0 : 1)) return false;
-      if (flush) {
-        sessionTokenRef.current++;
-        flushingTokenRef.current = null;
-      }
-      setListeningState(false);
-      // Commit exactly once; all waiters receive the same success/failure.
-      recordCommittedSegment();
-      insertPosRef.current += voiceLenRef.current;
-      voiceLenRef.current = 0;
-      return true;
-    })();
-    if (flush) {
-      const entry = { token, promise: stopping };
-      pendingFlushRef.current = entry;
-      const clear = () => { if (pendingFlushRef.current === entry) pendingFlushRef.current = null; };
-      void stopping.then(clear, clear);
-    }
-    return stopping;
-  }, [recordCommittedSegment, setListeningState]);
-
   /**
    * End the notepad and show what will be sent. Nothing leaves the device
    * here; the draft is written so the review itself survives a crash.
@@ -457,6 +475,26 @@ export function VoiceOverlay({
     await startSession(newPos);
   }, [commitAndStop, startSession]);
 
+  const handleRetry = useCallback(async () => {
+    if (voiceRetryPendingRef.current) return;
+    voiceRetryPendingRef.current = true;
+    try {
+      clearAutoStartTimer();
+      clearRestartTimer();
+      restartPausedRef.current = false;
+      shortSegmentsRef.current = 0;
+      if (listeningRef.current || pendingFlushRef.current) {
+        if (!await commitAndStop(true) || !openRef.current) return;
+      }
+      if (!openRef.current) return;
+      const ta = taRef.current;
+      const pos = ta ? (ta.selectionStart ?? ta.value.length) : 0;
+      await startSession(pos);
+    } finally {
+      voiceRetryPendingRef.current = false;
+    }
+  }, [clearAutoStartTimer, clearRestartTimer, commitAndStop, startSession]);
+
   const handleToggle = useCallback(async () => {
     if ((listeningRef.current || restartTimerRef.current) && notepadRef.current) {
       await openReview();
@@ -468,9 +506,13 @@ export function VoiceOverlay({
       setBars(Array(BAR_COUNT).fill(2));
       barsRef.current = Array(BAR_COUNT).fill(2);
     } else {
+      if (voiceRetryPendingRef.current) return;
       clearAutoStartTimer();
       restartPausedRef.current = false;
       shortSegmentsRef.current = 0;
+      if (pendingFlushRef.current) {
+        if (!await commitAndStop(true) || !openRef.current) return;
+      }
       const ta = taRef.current;
       const pos = ta ? (ta.selectionStart ?? ta.value.length) : 0;
       void startSession(pos);
@@ -759,16 +801,7 @@ export function VoiceOverlay({
           <button
             type="button"
             class="voice-overlay-retry"
-            onClick={() => {
-              clearAutoStartTimer();
-              clearRestartTimer();
-              restartPausedRef.current = false;
-              shortSegmentsRef.current = 0;
-              setVoiceError(null);
-              const ta = taRef.current;
-              const pos = ta ? (ta.selectionStart ?? ta.value.length) : 0;
-              void startSession(pos);
-            }}
+            onClick={() => { void handleRetry(); }}
           >
             {t('voice.retry')}
           </button>

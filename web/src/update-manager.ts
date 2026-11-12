@@ -10,23 +10,158 @@
  * user's configured server URL (not a hardcoded Capgo endpoint).
  */
 
+import { STREAMING_SPEECH_PLUGIN_NAME } from '@shared/voice-recognition.js';
 import { isNative, getServerUrl } from './native';
 
 interface UpdateManifest {
   version: number;
   sha256: string;
   url: string;       // relative path, e.g. "/api/updates/bundle.zip"
-  buildTime: string;  // ISO 8601
+  buildTime?: string; // ISO 8601
 }
 
 interface LocalAppBuildInfo {
+  buildId?: string;
   buildTime?: string;
   builtAt?: string;
 }
 
 const PREFS_OTA_VERSION_KEY = 'deck_ota_version';
+const BUILTIN_BUILD_STORAGE_KEY = 'deck_builtin_build_info';
+const OTA_RESET_GUARD_PREFIX = 'deck_ota_reset_guard:';
 
+const memoryResetGuards = new Set<string>();
 let initialized = false;
+let isBuiltinActive = false;
+
+function extractBuildTime(info: LocalAppBuildInfo | null | undefined): string {
+  if (typeof info?.buildTime === 'string' && info.buildTime.trim()) {
+    return info.buildTime.trim();
+  }
+  if (typeof info?.builtAt === 'string' && info.builtAt.trim()) {
+    return info.builtAt.trim();
+  }
+  return '';
+}
+
+function parseBuildTimeMs(info: LocalAppBuildInfo | null | undefined): number {
+  const raw = extractBuildTime(info);
+  return raw ? Date.parse(raw) : Number.NaN;
+}
+
+function readStoredBuiltinBuildInfo(): LocalAppBuildInfo | null {
+  const injected = (globalThis as any).__IMCODES_NATIVE_BUILD_INFO__ as LocalAppBuildInfo | undefined;
+  if (injected && !Number.isNaN(parseBuildTimeMs(injected))) {
+    return injected;
+  }
+  try {
+    const raw = globalThis.localStorage?.getItem(BUILTIN_BUILD_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as LocalAppBuildInfo;
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredBuiltinBuildInfo(info: LocalAppBuildInfo): void {
+  try {
+    globalThis.localStorage?.setItem(BUILTIN_BUILD_STORAGE_KEY, JSON.stringify({
+      buildId: info.buildId,
+      buildTime: extractBuildTime(info),
+    }));
+  } catch {
+    // Best-effort persistence
+  }
+}
+
+function hasResetGuard(bundleId: string): boolean {
+  const key = `${OTA_RESET_GUARD_PREFIX}${bundleId}`;
+  if (memoryResetGuards.has(key)) return true;
+  try {
+    return globalThis.sessionStorage?.getItem(key) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function markResetGuard(bundleId: string): void {
+  const key = `${OTA_RESET_GUARD_PREFIX}${bundleId}`;
+  memoryResetGuards.add(key);
+  try {
+    globalThis.sessionStorage?.setItem(key, '1');
+  } catch {
+    // Best-effort loop guard
+  }
+}
+
+async function fetchLocalBuildInfo(): Promise<LocalAppBuildInfo | null> {
+  try {
+    const res = await fetch('/app-build.json', { cache: 'no-cache' });
+    if (!res.ok) return null;
+    return await res.json() as LocalAppBuildInfo;
+  } catch {
+    return null;
+  }
+}
+
+async function reconcileActiveOtaBundle(CapacitorUpdater: any): Promise<boolean> {
+  if (typeof CapacitorUpdater?.current !== 'function') return true;
+  let current: { bundle?: { id?: string; version?: string }; native?: string } | null = null;
+  try {
+    current = await CapacitorUpdater.current();
+  } catch {
+    return true;
+  }
+  const activeId = typeof current?.bundle?.id === 'string' ? current.bundle.id.trim() : '';
+  if (!activeId || activeId === 'builtin') {
+    isBuiltinActive = activeId === 'builtin';
+    return true;
+  }
+  isBuiltinActive = false;
+
+  const activeBuild = await fetchLocalBuildInfo();
+  const activeMs = parseBuildTimeMs(activeBuild);
+  const builtinMs = parseBuildTimeMs(readStoredBuiltinBuildInfo());
+  const cap = (globalThis as any).Capacitor;
+  const missingSpeechBridge = typeof cap?.isPluginAvailable === 'function'
+    && !cap.isPluginAvailable(STREAMING_SPEECH_PLUGIN_NAME)
+    && !cap.isPluginAvailable('SpeechRecognition');
+
+  const isIncompatible = Number.isNaN(activeMs)
+    || (!Number.isNaN(builtinMs) && activeMs <= builtinMs)
+    || missingSpeechBridge;
+
+  if (!isIncompatible) return true;
+  if (hasResetGuard(activeId)) return true;
+  markResetGuard(activeId);
+
+  const rawVersion = typeof current?.bundle?.version === 'string' ? current.bundle.version.trim() : '';
+  const parsedVersion = rawVersion ? parseInt(rawVersion, 10) : 0;
+  if (parsedVersion > 0) {
+    try {
+      const { Preferences } = await import('@capacitor/preferences');
+      await Preferences.set({
+        key: PREFS_OTA_VERSION_KEY,
+        value: String(parsedVersion),
+      });
+    } catch {
+      // Best-effort version poison so the rejected bundle is not re-downloaded
+    }
+  }
+
+  try {
+    await CapacitorUpdater.reset?.({ toLastSuccessful: false });
+  } catch (err) {
+    console.warn('[OTA] Failed to reset incompatible bundle:', err);
+  }
+  try {
+    await CapacitorUpdater.delete?.({ id: activeId });
+  } catch {
+    // Active bundle may only be deletable after reload onto builtin
+  }
+  return false;
+}
 
 /** Call once on app startup (native only). Sets up resume listener. */
 export async function initUpdateManager(): Promise<void> {
@@ -34,6 +169,9 @@ export async function initUpdateManager(): Promise<void> {
   initialized = true;
 
   const { CapacitorUpdater } = await import('@capgo/capacitor-updater');
+  const compatible = await reconcileActiveOtaBundle(CapacitorUpdater);
+  if (!compatible) return;
+
   await CapacitorUpdater.notifyAppReady();
 
   // Cold start: check + apply immediately
@@ -72,25 +210,26 @@ async function checkForUpdate(applyNow: boolean): Promise<void> {
 
   // Compare against local bundled /app-build.json buildTime so an older server OTA
   // snapshot never overwrites a newer native build.
-  try {
-    const localRes = await fetch('/app-build.json', { cache: 'no-cache' });
-    if (localRes.ok) {
-      const localBuild = await localRes.json() as LocalAppBuildInfo;
-      const localBuildTime = typeof localBuild?.buildTime === 'string' && localBuild.buildTime.trim()
-        ? localBuild.buildTime.trim()
-        : (typeof localBuild?.builtAt === 'string' && localBuild.builtAt.trim()
-          ? localBuild.builtAt.trim()
-          : '');
-      if (localBuildTime && typeof manifest.buildTime === 'string' && manifest.buildTime.trim()) {
-        const localMs = Date.parse(localBuildTime);
-        const remoteMs = Date.parse(manifest.buildTime);
-        if (!Number.isNaN(localMs) && !Number.isNaN(remoteMs) && remoteMs <= localMs) {
-          return;
-        }
-      }
+  const localBuild = await fetchLocalBuildInfo();
+  const localMs = parseBuildTimeMs(localBuild);
+  if (isBuiltinActive && localBuild && !Number.isNaN(localMs)) {
+    const storedBuiltinMs = parseBuildTimeMs(readStoredBuiltinBuildInfo());
+    if (Number.isNaN(storedBuiltinMs) || localMs > storedBuiltinMs) {
+      writeStoredBuiltinBuildInfo(localBuild);
     }
-  } catch {
-    // Missing or unreadable /app-build.json — fall back to version comparison
+  }
+  const builtinMs = parseBuildTimeMs(readStoredBuiltinBuildInfo());
+  const baselineMs = !Number.isNaN(localMs) && !Number.isNaN(builtinMs)
+    ? Math.max(localMs, builtinMs)
+    : (!Number.isNaN(localMs) ? localMs : builtinMs);
+
+  if (!Number.isNaN(baselineMs)) {
+    const remoteMs = typeof manifest.buildTime === 'string' && manifest.buildTime.trim()
+      ? Date.parse(manifest.buildTime.trim())
+      : Number.NaN;
+    if (Number.isNaN(remoteMs) || remoteMs <= baselineMs) {
+      return;
+    }
   }
 
   // Build absolute download URL

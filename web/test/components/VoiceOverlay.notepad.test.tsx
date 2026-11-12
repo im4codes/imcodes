@@ -681,7 +681,7 @@ describe('VoiceOverlay mobile microphone gestures', () => {
     expect(send).not.toHaveBeenCalled();
   });
 
-  it('surfaces permission failure and runtime recognitionError with a working retry button', async () => {
+  it('surfaces permission failure and runtime recognitionError with a working retry button that waits for drain and preserves the final tail', async () => {
     voiceApi.startListening.mockImplementationOnce(async (
       _handler: (partial: string) => void,
       _onListeningChange?: (listening: boolean) => void,
@@ -694,17 +694,43 @@ describe('VoiceOverlay mobile microphone gestures', () => {
     await vi.advanceTimersByTimeAsync(150);
 
     expect(document.querySelector('.voice-overlay-error')?.textContent).toContain('voice.mic_permission_failed');
+    expect(voiceApi.stopListening).not.toHaveBeenCalled();
 
-    // Clicking retry clears the error and starts listening when permission is now granted
+    // Clicking retry after permission failure clears the error and starts listening without redundant stop
     fireEvent.click(document.querySelector('.voice-overlay-retry') as HTMLElement);
     await vi.advanceTimersByTimeAsync(0);
     expect(document.querySelector('.voice-overlay-error')).toBeNull();
     expect(voiceApi.startListening).toHaveBeenCalledTimes(2);
+    expect(voiceApi.stopListening).not.toHaveBeenCalled();
 
-    // Runtime native recognitionError (e.g. conversion failure) surfaces visibly
+    // Runtime native recognitionError before stop drain completes:
+    let releaseDrain!: () => void;
+    voiceApi.stopListening.mockReturnValueOnce(new Promise<void>((resolve) => {
+      releaseDrain = resolve;
+    }));
+    voiceApi.partialHandler?.('first segment');
     voiceApi.errorHandler?.('Offline audio conversion failed');
-    voiceApi.listeningHandler?.(false);
     await vi.advanceTimersByTimeAsync(0);
     expect(document.querySelector('.voice-overlay-error')?.textContent).toContain('voice.error:Offline audio conversion failed');
+    expect(voiceApi.stopListening).toHaveBeenCalledTimes(1);
+
+    // Clicking retry twice while drain is still in flight coalesces and waits for final tail + drain ACK
+    const retryBtn = document.querySelector('.voice-overlay-retry') as HTMLElement;
+    fireEvent.click(retryBtn);
+    fireEvent.click(retryBtn);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(voiceApi.startListening).toHaveBeenCalledTimes(2);
+
+    // Final tail arrives during drain before stop resolves, followed by delayed listeningState(false)
+    voiceApi.partialHandler?.('first segment tail');
+    voiceApi.listeningHandler?.(false);
+    releaseDrain();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(voiceApi.startListening).toHaveBeenCalledTimes(3);
+    expect(document.querySelector('.voice-overlay-error')).toBeNull();
+    expect(document.querySelector('.voice-overlay-status')?.textContent).toContain('voice.listening');
+    voiceApi.partialHandler?.('second segment');
+    expect(textarea().value).toBe('first segment tail second segment');
   });
 });

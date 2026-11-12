@@ -10,6 +10,9 @@ const getServerUrlMock = vi.fn();
 const notifyAppReadyMock = vi.fn();
 const downloadMock = vi.fn();
 const setBundleMock = vi.fn();
+const currentBundleMock = vi.fn();
+const resetBundleMock = vi.fn();
+const deleteBundleMock = vi.fn();
 const addListenerMock = vi.fn();
 const preferencesGetMock = vi.fn();
 const preferencesSetMock = vi.fn();
@@ -24,6 +27,9 @@ vi.mock('@capgo/capacitor-updater', () => ({
     notifyAppReady: (...args: unknown[]) => notifyAppReadyMock(...args),
     download: (...args: unknown[]) => downloadMock(...args),
     set: (...args: unknown[]) => setBundleMock(...args),
+    current: (...args: unknown[]) => currentBundleMock(...args),
+    reset: (...args: unknown[]) => resetBundleMock(...args),
+    delete: (...args: unknown[]) => deleteBundleMock(...args),
   },
 }), { virtual: true });
 
@@ -49,8 +55,14 @@ describe('update manager', () => {
     notifyAppReadyMock.mockResolvedValue(undefined);
     downloadMock.mockResolvedValue({ id: 'bundle-2' });
     setBundleMock.mockResolvedValue(undefined);
+    currentBundleMock.mockResolvedValue({ bundle: { id: 'builtin', version: '', status: 'success' }, native: '1.2' });
+    resetBundleMock.mockResolvedValue(undefined);
+    deleteBundleMock.mockResolvedValue(undefined);
     preferencesGetMock.mockResolvedValue({ value: '1' });
     preferencesSetMock.mockResolvedValue(undefined);
+    globalThis.localStorage?.clear?.();
+    globalThis.sessionStorage?.clear?.();
+    delete (globalThis as any).__IMCODES_NATIVE_BUILD_INFO__;
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url === '/app-build.json') {
@@ -206,6 +218,7 @@ describe('update manager', () => {
     expect(downloadMock).not.toHaveBeenCalled();
 
     // Missing /app-build.json (404) or invalid timestamp falls back safely and allows newer version download
+    globalThis.localStorage?.removeItem?.('deck_builtin_build_info');
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url === '/app-build.json') {
@@ -236,5 +249,130 @@ describe('update manager', () => {
     expect(pbxproj.match(/MARKETING_VERSION = 1\.2;/g)).toHaveLength(4);
     expect(pbxproj).not.toContain('CURRENT_PROJECT_VERSION = 1.1;');
     expect(pbxproj).not.toContain('MARKETING_VERSION = 1.1;');
+  });
+
+  it('resets incompatible cached OTA bundles (missing or older buildTime) to builtin without looping, then blocks re-downloading the stale bundle while allowing newer compatible updates', async () => {
+    // 1. Native binary boots with an active stale OTA bundle (c84Qsje59L / v6175) older than native build
+    (globalThis as any).__IMCODES_NATIVE_BUILD_INFO__ = {
+      buildId: 'native-46fc7b80c9e6',
+      buildTime: '2026-11-12T06:46:15.240Z',
+    };
+    currentBundleMock.mockResolvedValueOnce({
+      bundle: { id: 'c84Qsje59L', version: '6175', status: 'success' },
+      native: '1.2',
+    });
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/app-build.json') {
+        return { ok: false, status: 404, json: async () => ({}) };
+      }
+      return {
+        ok: true,
+        json: async () => ({
+          version: 6175,
+          sha256: 'stale-6175',
+          url: '/api/updates/bundle.zip',
+          buildTime: '2026-11-11T12:33:09.000Z',
+        }),
+      };
+    }));
+
+    const { initUpdateManager } = await import('../src/update-manager.js');
+    await initUpdateManager();
+
+    expect(resetBundleMock).toHaveBeenCalledWith({ toLastSuccessful: false });
+    expect(deleteBundleMock).toHaveBeenCalledWith({ id: 'c84Qsje59L' });
+    expect(preferencesSetMock).toHaveBeenCalledWith({
+      key: 'deck_ota_version',
+      value: '6175',
+    });
+    // Must not mark the broken OTA bundle as appReady or download anything in the dying context
+    expect(notifyAppReadyMock).not.toHaveBeenCalled();
+    expect(downloadMock).not.toHaveBeenCalled();
+
+    // 2. If reset failed to switch bundle in the same session, loop guard prevents repeated reset
+    vi.resetModules();
+    currentBundleMock.mockResolvedValueOnce({
+      bundle: { id: 'c84Qsje59L', version: '6175', status: 'success' },
+      native: '1.2',
+    });
+    const { initUpdateManager: initAgainSameSession } = await import('../src/update-manager.js');
+    await initAgainSameSession();
+    expect(resetBundleMock).toHaveBeenCalledTimes(1);
+    expect(notifyAppReadyMock).toHaveBeenCalledTimes(1);
+
+    // 3. After reload onto builtin, stale server manifest (v6175) is not re-downloaded, while compatible v6176 is allowed
+    vi.resetModules();
+    notifyAppReadyMock.mockClear();
+    downloadMock.mockClear();
+    currentBundleMock.mockResolvedValue({
+      bundle: { id: 'builtin', version: '', status: 'success' },
+      native: '1.2',
+    });
+    preferencesGetMock.mockResolvedValueOnce({ value: '6175' });
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/app-build.json') {
+        return {
+          ok: true,
+          json: async () => ({
+            buildId: 'native-46fc7b80c9e6',
+            buildTime: '2026-11-12T06:46:15.240Z',
+          }),
+        };
+      }
+      return {
+        ok: true,
+        json: async () => ({
+          version: 6175,
+          sha256: 'stale-6175',
+          url: '/api/updates/bundle.zip',
+          buildTime: '2026-11-11T12:33:09.000Z',
+        }),
+      };
+    }));
+
+    const { initUpdateManager: initOnBuiltin } = await import('../src/update-manager.js');
+    await initOnBuiltin();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(notifyAppReadyMock).toHaveBeenCalledTimes(1);
+    expect(downloadMock).not.toHaveBeenCalled();
+
+    // Now server publishes compatible newer v6176
+    const resume = addListenerMock.mock.calls.at(-1)?.[1] as (state: { isActive: boolean }) => void;
+    preferencesGetMock.mockResolvedValueOnce({ value: '6175' });
+    downloadMock.mockResolvedValueOnce({ id: 'bundle-6176' });
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/app-build.json') {
+        return {
+          ok: true,
+          json: async () => ({
+            buildId: 'native-46fc7b80c9e6',
+            buildTime: '2026-11-12T06:46:15.240Z',
+          }),
+        };
+      }
+      return {
+        ok: true,
+        json: async () => ({
+          version: 6176,
+          sha256: 'fresh-6176',
+          url: '/api/updates/bundle.zip',
+          buildTime: '2026-11-12T10:00:00.000Z',
+        }),
+      };
+    }));
+    resume({ isActive: true });
+    await waitFor(() => expect(downloadMock).toHaveBeenCalledWith({
+      url: 'https://deck.test/api/updates/bundle.zip',
+      version: '6176',
+    }));
+
+    // Verify iOS native bootstrap reconciliation contract in AppDelegate.swift
+    const appDelegate = readFileSync(join(WEB_ROOT, 'ios/App/App/AppDelegate.swift'), 'utf8');
+    expect(appDelegate).toContain('Self.reconcileCachedOtaBundles()');
+    expect(appDelegate).toContain('NoCloud/ionic_built_snapshots');
+    expect(appDelegate).toContain('window.__IMCODES_NATIVE_BUILD_INFO__');
   });
 });

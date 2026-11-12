@@ -2,7 +2,8 @@
  * @vitest-environment jsdom
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { waitFor } from '@testing-library/preact';
+import { h } from 'preact';
+import { cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
 
 const speechApi = vi.hoisted(() => ({
   available: vi.fn(),
@@ -16,6 +17,16 @@ vi.mock('@capacitor/core', () => ({ registerPlugin: vi.fn() }));
 
 vi.mock('@capgo/capacitor-speech-recognition', () => ({
   SpeechRecognition: speechApi,
+}));
+
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string, opts?: Record<string, unknown>) => (opts?.error ? `${key}:${opts.error}` : key),
+  }),
+}));
+
+vi.mock('../../src/screen-awake.js', () => ({
+  holdScreenAwake: () => () => {},
 }));
 
 type VoiceInputModule = typeof import('../../src/components/VoiceInput.js');
@@ -119,17 +130,90 @@ describe('VoiceInput', () => {
     VoiceInput.onRecognitionError(null);
   });
 
-  it('forwards native recognitionError events to error listeners and records lastError', async () => {
+  it('forwards native recognitionError events to error listeners, retires the dying session, and waits for stop drain before a fresh start', async () => {
+    const drain = deferred<void>();
+    speechApi.stop.mockReturnValueOnce(drain.promise);
     const onError = vi.fn();
+    const firstPartials = vi.fn();
+    const secondPartials = vi.fn();
     VoiceInput.onRecognitionError(onError);
 
-    await expect(VoiceInput.startListening(vi.fn())).resolves.toBe(true);
+    await expect(VoiceInput.startListening(firstPartials)).resolves.toBe(true);
+    expect(speechApi.start).toHaveBeenCalledTimes(1);
+
+    // Native emits recognitionError before endCapture's serial worker drain and stopped event
     listeners.recognitionError?.({ message: 'Offline audio conversion failed: format mismatch' });
 
     expect(onError).toHaveBeenCalledWith('Offline audio conversion failed: format mismatch');
     expect(VoiceInput.getLastError()).toBe('Offline audio conversion failed: format mismatch');
+    expect(VoiceInput.isListening()).toBe(false);
+    expect(speechApi.stop).toHaveBeenCalledTimes(1);
+
+    // Retrying immediately before stop drain resolves must wait for the drain and start a 2nd session
+    const retryPromise = VoiceInput.startListening(secondPartials);
+    listeners.partialResults?.({ matches: ['final tail before drain'], isFinal: true });
+    expect(firstPartials).toHaveBeenLastCalledWith('final tail before drain', true);
+    listeners.listeningState?.({ status: 'stopped' });
+    drain.resolve();
+
+    await expect(retryPromise).resolves.toBe(true);
+    expect(speechApi.start).toHaveBeenCalledTimes(2);
+    expect(VoiceInput.isListening()).toBe(true);
+
     await VoiceInput.stopListening();
     VoiceInput.onRecognitionError(null);
+  });
+
+  it('integrates real VoiceOverlay + real VoiceInput across recognitionError -> immediate Retry -> delayed final tail & stopped/ACK', async () => {
+    vi.useFakeTimers();
+    try {
+      const drain = deferred<void>();
+      speechApi.stop.mockReturnValueOnce(drain.promise);
+      const { VoiceOverlay } = await import('../../src/components/VoiceOverlay.js');
+
+      render(h(VoiceOverlay, {
+        open: true,
+        initialText: '',
+        onSend: () => 'accepted',
+        onClose: () => {},
+      }));
+      await vi.advanceTimersByTimeAsync(150);
+      expect(speechApi.start).toHaveBeenCalledTimes(1);
+      expect(VoiceInput.isListening()).toBe(true);
+
+      listeners.partialResults?.({ matches: ['hello'], isFinal: false });
+      listeners.recognitionError?.({ message: 'Offline audio conversion failed: test' });
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(document.querySelector('[role="alert"]')?.textContent).toContain('Offline audio conversion failed: test');
+      expect(speechApi.stop).toHaveBeenCalledTimes(1);
+
+      // Click Retry twice before native stop drain or listeningState: stopped arrives
+      const retryBtn = document.querySelector('.voice-overlay-retry') as HTMLElement;
+      fireEvent.click(retryBtn);
+      fireEvent.click(retryBtn);
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Final transcript tail arrives while native worker drains before stop ACK
+      listeners.partialResults?.({ matches: ['hello world'], isFinal: true });
+      listeners.listeningState?.({ status: 'stopped' });
+      drain.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(speechApi.start).toHaveBeenCalledTimes(2);
+      expect(speechApi.stop).toHaveBeenCalledTimes(1);
+      expect(VoiceInput.isListening()).toBe(true);
+      expect(document.querySelector('[role="alert"]')).toBeNull();
+
+      listeners.partialResults?.({ matches: ['next phrase'], isFinal: true });
+      const ta = document.querySelector('textarea') as HTMLTextAreaElement;
+      expect(ta.value).toBe('hello world next phrase');
+    } finally {
+      cleanup();
+      await VoiceInput.stopListening();
+      await vi.advanceTimersByTimeAsync(0);
+      vi.useRealTimers();
+    }
   });
 });
 

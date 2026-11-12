@@ -243,6 +243,87 @@ it.skipIf(!swiftCompiler)('executes the actual Swift bounded window through roll
   }
 }, 95000);
 
+it.skipIf(!swiftCompiler)('executes AppDelegate.reconcileCachedOtaBundles to purge stale OTA snapshots, poison rejected version, preserve user prefs, and retain newer valid OTA bundles', async () => {
+  await setup();
+  const appDelegateSource = await readFile(new URL('../../web/ios/App/App/AppDelegate.swift', import.meta.url), 'utf8');
+  const startIdx = appDelegateSource.indexOf('private static let nativeBundledBuildIdKey');
+  const endIdx = appDelegateSource.lastIndexOf('}');
+  const extracted = appDelegateSource.slice(startIdx, endIdx);
+  const harness = `
+import Foundation
+class AppDelegate {
+${extracted}
+}
+func require(_ cond: Bool, _ msg: String) {
+    if !cond { FileHandle.standardError.write(Data((msg + "\\n").utf8)); exit(1) }
+}
+let root = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
+let fm = FileManager.default
+let builtinPublic = root.appendingPathComponent("builtin/public", isDirectory: true)
+let libraryDir = root.appendingPathComponent("Library", isDirectory: true)
+let snapshotsDir = libraryDir.appendingPathComponent("NoCloud/ionic_built_snapshots", isDirectory: true)
+try fm.createDirectory(at: builtinPublic, withIntermediateDirectories: true)
+try fm.createDirectory(at: snapshotsDir, withIntermediateDirectories: true)
+try Data(#"{"buildId":"10eb7c82","buildTime":"2026-04-19T06:22:02.634Z"}"#.utf8).write(to: builtinPublic.appendingPathComponent("app-build.json"))
+
+let suiteName = "imcodes.ota.test." + UUID().uuidString
+let defaults = UserDefaults(suiteName: suiteName)!
+defer { defaults.removePersistentDomain(forName: suiteName) }
+
+// 1. Stale legacy snapshot c84Qsje59L (v6175, missing app-build.json)
+let staleDir = snapshotsDir.appendingPathComponent("c84Qsje59L", isDirectory: true)
+try fm.createDirectory(at: staleDir, withIntermediateDirectories: true)
+try Data("<html>stale</html>".utf8).write(to: staleDir.appendingPathComponent("index.html"))
+defaults.set("/var/mobile/Containers/Data/Application/X/Library/NoCloud/ionic_built_snapshots/c84Qsje59L", forKey: "serverBasePath")
+defaults.set("c84Qsje59L", forKey: "pastVersion")
+defaults.set("c84Qsje59L", forKey: "nextVersion")
+defaults.set(try JSONSerialization.data(withJSONObject: ["id": "c84Qsje59L", "version": "6175", "status": "success"]), forKey: "c84Qsje59L_info")
+defaults.set("keep-user-pref", forKey: "CapacitorStorage.user_pref")
+
+let didReset = AppDelegate.reconcileCachedOtaBundles(
+    defaults: defaults,
+    fileManager: fm,
+    builtinPublicURL: builtinPublic,
+    libraryURL: libraryDir,
+    nativeBuildVersion: "1.2"
+)
+require(didReset, "expected stale OTA snapshot to trigger reset")
+require((defaults.string(forKey: "serverBasePath") ?? "") == "", "serverBasePath not cleared")
+require(defaults.string(forKey: "pastVersion") == "builtin", "pastVersion not reset to builtin")
+require(defaults.string(forKey: "nextVersion") == nil, "nextVersion not removed")
+require(defaults.data(forKey: "c84Qsje59L_info") == nil, "stale bundle info not removed")
+require(!fm.fileExists(atPath: staleDir.path), "stale snapshot dir not deleted")
+require(defaults.string(forKey: "CapacitorStorage.deck_ota_version") == "6175", "rejected version 6175 not recorded")
+require(defaults.string(forKey: "CapacitorStorage.user_pref") == "keep-user-pref", "user preference wiped")
+
+// 2. Newer compatible OTA snapshot (v6176, newer app-build.json)
+let newerDir = snapshotsDir.appendingPathComponent("validNewer99", isDirectory: true)
+try fm.createDirectory(at: newerDir, withIntermediateDirectories: true)
+try Data("<html>newer</html>".utf8).write(to: newerDir.appendingPathComponent("index.html"))
+try Data(#"{"buildId":"9999aaaa","buildTime":"2026-04-20T00:00:00.000Z"}"#.utf8).write(to: newerDir.appendingPathComponent("app-build.json"))
+defaults.set(newerDir.path, forKey: "serverBasePath")
+defaults.set("validNewer99", forKey: "pastVersion")
+defaults.set(try JSONSerialization.data(withJSONObject: ["id": "validNewer99", "version": "6176", "status": "success"]), forKey: "validNewer99_info")
+
+let didResetNewer = AppDelegate.reconcileCachedOtaBundles(
+    defaults: defaults,
+    fileManager: fm,
+    builtinPublicURL: builtinPublic,
+    libraryURL: libraryDir,
+    nativeBuildVersion: "1.2"
+)
+require(!didResetNewer, "valid newer OTA snapshot should not be reset")
+require(defaults.string(forKey: "serverBasePath") == newerDir.path, "valid newer serverBasePath altered")
+require(fm.fileExists(atPath: newerDir.path), "valid newer snapshot deleted")
+print("OTA_RECONCILE:PASS")
+`;
+  const swiftFile = join(root, 'OtaReconcileTest.swift');
+  const binFile = join(root, 'ota-reconcile-test');
+  await writeFile(swiftFile, harness);
+  execFileSync(swiftCompiler!, ['-swift-version', '5', swiftFile, '-o', binFile], { encoding: 'utf8', timeout: 60000 });
+  expect(execFileSync(binFile, [root], { encoding: 'utf8', timeout: 10000 }).trim()).toBe('OTA_RECONCILE:PASS');
+}, 65000);
+
 const swiftWindowCases = `
 func check(_ condition: @autoclosure () throws -> Bool, _ message: String) {
     if !(try! condition()) { fatalError(message) }

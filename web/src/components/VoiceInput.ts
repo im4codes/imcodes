@@ -187,6 +187,7 @@ async function startListeningInternal(generation: number): Promise<boolean> {
         : 'Speech recognition error';
       console.warn('[voice] recognitionError:', message);
       reportError(message);
+      void stopListening();
     });
     _removeRecognitionError = () => removeHandle(h4);
 
@@ -326,6 +327,7 @@ function startWebListening(): boolean {
         if (generation === _generation) {
           const errStr = String(e.error);
           reportError(/not-allowed|service-not-allowed|permission/i.test(errStr) ? 'permission_denied' : errStr);
+          void stopListening();
         }
       }
     };
