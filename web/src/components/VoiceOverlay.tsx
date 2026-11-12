@@ -88,6 +88,7 @@ export function VoiceOverlay({
   // Session token: monotonic counter — partials with stale token are discarded
   const sessionTokenRef = useRef(0);
   const flushingTokenRef = useRef<number | null>(null);
+  const pendingFlushRef = useRef<{ token: number; promise: Promise<boolean> } | null>(null);
   const voiceSendPendingRef = useRef(false);
   // Track listening state in a ref so event handlers always see current value
   const listeningRef = useRef(false);
@@ -387,22 +388,36 @@ export function VoiceOverlay({
   }
 
   /** Stop current session and commit voice zone */
-  const commitAndStop = useCallback(async (flush = false) => {
+  const commitAndStop = useCallback((flush = false): Promise<boolean> => {
     const token = sessionTokenRef.current;
+    // A tap-stop and double-tap-send can await the SAME native stop ACK.
+    // Share the whole commit, not merely stopListening(): incrementing the
+    // token twice would make the send waiter look stale and silently cancel it.
+    const pending = pendingFlushRef.current;
+    if (flush && pending?.token === token) return pending.promise;
     if (flush) flushingTokenRef.current = token;
     else { flushingTokenRef.current = null; sessionTokenRef.current++; }
-    await VoiceInput.stopListening();
-    if (sessionTokenRef.current !== token + (flush ? 0 : 1)) return false;
+    const stopping = (async () => {
+      await VoiceInput.stopListening();
+      if (sessionTokenRef.current !== token + (flush ? 0 : 1)) return false;
+      if (flush) {
+        sessionTokenRef.current++;
+        flushingTokenRef.current = null;
+      }
+      setListeningState(false);
+      // Commit exactly once; all waiters receive the same success/failure.
+      recordCommittedSegment();
+      insertPosRef.current += voiceLenRef.current;
+      voiceLenRef.current = 0;
+      return true;
+    })();
     if (flush) {
-      sessionTokenRef.current++;
-      flushingTokenRef.current = null;
+      const entry = { token, promise: stopping };
+      pendingFlushRef.current = entry;
+      const clear = () => { if (pendingFlushRef.current === entry) pendingFlushRef.current = null; };
+      void stopping.then(clear, clear);
     }
-    setListeningState(false);
-    // Commit: advance insertPos past the committed voice text
-    recordCommittedSegment();
-    insertPosRef.current += voiceLenRef.current;
-    voiceLenRef.current = 0;
-    return true;
+    return stopping;
   }, [recordCommittedSegment, setListeningState]);
 
   /**

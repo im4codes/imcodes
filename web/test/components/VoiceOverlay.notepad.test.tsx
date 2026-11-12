@@ -625,15 +625,40 @@ describe('VoiceOverlay mobile microphone gestures', () => {
     const send = await openVoice();
     let release!: () => void;
     voiceApi.partialHandler?.('before');
-    voiceApi.stopListening.mockImplementation(() => new Promise<void>(resolve => { release = resolve; }));
+    const drained = new Promise<void>(resolve => { release = resolve; });
+    voiceApi.stopListening.mockReturnValue(drained);
     fireEvent.click(mic(), { detail: 1 });
     await vi.advanceTimersByTimeAsync(350);
     fireEvent.click(mic(), { detail: 2 });
+    expect(voiceApi.stopListening).toHaveBeenCalledOnce();
     voiceApi.partialHandler?.('before last word');
     expect(send).not.toHaveBeenCalled();
     release(); await vi.advanceTimersByTimeAsync(0);
     expect(send).toHaveBeenCalledTimes(1);
     expect(send).toHaveBeenCalledWith('before last word');
+  });
+
+  it('invalidates old flush waiters on close and never reuses them for a new recording', async () => {
+    const send = vi.fn(() => 'accepted' as const), close = vi.fn();
+    const view = render(<VoiceOverlay open initialText="" onSend={send} onClose={close} />);
+    await vi.advanceTimersByTimeAsync(150);
+    let release!: () => void;
+    voiceApi.stopListening.mockReturnValueOnce(new Promise<void>(resolve => { release = resolve; }));
+    voiceApi.partialHandler?.('old recording');
+    fireEvent.click(mic(), { detail: 1 });
+    await vi.advanceTimersByTimeAsync(350);
+    fireEvent.click(mic(), { detail: 2 });
+    fireEvent.click(screen.getByLabelText('common.close'));
+    view.rerender(<VoiceOverlay open={false} onSend={send} onClose={close} />);
+    view.rerender(<VoiceOverlay open initialText="new draft" onSend={send} onClose={close} />);
+    await vi.advanceTimersByTimeAsync(150);
+    release(); await vi.advanceTimersByTimeAsync(0);
+    expect(send).not.toHaveBeenCalled();
+    expect(textarea().value).toBe('new draft');
+    fireEvent.click(document.querySelector('.voice-overlay-send')!);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(send).toHaveBeenCalledOnce();
+    expect(send).toHaveBeenCalledWith('new draft');
   });
 
   it('does not send for taps outside the double-tap window or after unmount', async () => {

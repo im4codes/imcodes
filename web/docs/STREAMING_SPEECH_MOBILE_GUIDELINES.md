@@ -123,7 +123,9 @@ Web Mobile Stop 保留 `onresult` 到 `onend` 再清理，新会话等待旧 Sto
 - 长按达到 350ms：Press-to-talk；暂停状态先开始，松手即停并保留最终尾字，不自动发送。
   pointer capture 防止移出按钮后漏掉松手；cancel/lost-capture 也停止，第二根手指不能干扰 owner。
 - 两次有效点击间隔 ≤375ms（350–400ms 区间）：走现有 `handleSend`，先等待 final/stop，
-  再提交一次。超过窗口仅执行普通点录。长按后的合成 click 被抑制，不能误触发送。
+  再提交一次。同一 session token 的并发调用共享整个 flush/commit Promise（不能只共用底层 stop），
+  防止首个等待者提交后把发送等待者误判为 stale；取消/新录音不得复用旧 token 的 Promise。
+  超过窗口仅执行普通点录。长按后的合成 click 被抑制，不能误触发送。
 - 长笔记模式保持原有显式复核，双击不得绕过 review；关闭/卸载取消手势定时器。
 - 不直接向 session transport 写消息；沿用 composer 的 accepted/pending/rejected 及重复发送保护。
 
