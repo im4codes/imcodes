@@ -210,7 +210,35 @@ export const PUSH_NOTIFICATION_PREFERENCES_KEY = 'imcodes.push_notification_pref
 let currentEditGeneration = 0;
 let lastSyncedGeneration = 0;
 let syncQueue: Promise<void> = Promise.resolve();
-let pendingTypesToSync: PushNotificationType[] | null = null;
+let pendingSync: { types: PushNotificationType[]; generation: number } | null = null;
+
+export function hasUnsyncedPushNotificationEdits(): boolean {
+  if (pendingSync !== null) return true;
+  if (currentEditGeneration > lastSyncedGeneration) {
+    try {
+      if (typeof localStorage !== 'undefined' && localStorage.getItem(PUSH_NOTIFICATION_PREFERENCES_KEY) === null) {
+        currentEditGeneration = 0;
+        lastSyncedGeneration = 0;
+        return false;
+      }
+    } catch {
+      // ignore
+    }
+    return true;
+  }
+  return false;
+}
+
+export function getLastSyncedPushNotificationGeneration(): number {
+  return lastSyncedGeneration;
+}
+
+export function resetPushNotificationPreferencesStateForTesting(): void {
+  currentEditGeneration = 0;
+  lastSyncedGeneration = 0;
+  pendingSync = null;
+  syncQueue = Promise.resolve();
+}
 
 export function getLocalPushNotificationPreferences(): PushNotificationType[] {
   try {
@@ -251,8 +279,9 @@ export async function fetchPushNotificationPreferences(): Promise<PushNotificati
     const res = await apiFetch<{ ok: boolean; types: PushNotificationType[] }>('/api/push/preferences');
     if (res?.ok && Array.isArray(res.types)) {
       const valid = res.types.filter(isPushNotificationType);
-      // Guard against stale/late initial read overwriting newer local edits
-      if (currentEditGeneration > startGen) {
+      // Guard against stale/late initial read overwriting newer local edits,
+      // and guard against overwriting un-ACKed dirty local edits
+      if (currentEditGeneration > startGen || hasUnsyncedPushNotificationEdits()) {
         return null;
       }
       setLocalPushNotificationPreferences(valid);
@@ -266,20 +295,30 @@ export async function fetchPushNotificationPreferences(): Promise<PushNotificati
 
 export async function syncPushNotificationPreferences(types: PushNotificationType[]): Promise<void> {
   const gen = recordLocalPushNotificationEdit(types);
-  pendingTypesToSync = types;
+  pendingSync = { types, generation: gen };
 
   syncQueue = syncQueue.then(async () => {
-    if (pendingTypesToSync === null || lastSyncedGeneration >= gen) return;
-    const toSend = pendingTypesToSync;
-    pendingTypesToSync = null;
+    if (!pendingSync || lastSyncedGeneration >= pendingSync.generation) return;
+    const targetGen = pendingSync.generation;
+    const toSend = pendingSync.types;
     try {
-      await apiFetch('/api/push/preferences', {
+      const res = await apiFetch<{ ok?: boolean }>('/api/push/preferences', {
         method: 'POST',
         body: JSON.stringify({ types: toSend }),
       });
-      lastSyncedGeneration = gen;
+      if (res && res.ok !== false) {
+        if (lastSyncedGeneration < targetGen) {
+          lastSyncedGeneration = targetGen;
+        }
+        if (pendingSync && pendingSync.generation <= targetGen) {
+          pendingSync = null;
+        }
+      } else {
+        throw new Error('Push preferences update failed');
+      }
     } catch (err) {
       console.warn('Failed to sync push notification preferences:', err);
+      // Do NOT clear pendingSync on failure, retaining dirty state for subsequent sync/read guards
     }
   });
 

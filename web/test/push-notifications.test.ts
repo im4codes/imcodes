@@ -178,4 +178,88 @@ describe('push notification preferences', () => {
     // Local storage still retains user's edit
     expect(getLocalPushNotificationPreferences()).toEqual(['remote_desktop']);
   });
+
+  it('preserves dirty selection when preference sync fails, blocking subsequent remote read override', async () => {
+    const { syncPushNotificationPreferences, fetchPushNotificationPreferences, getLocalPushNotificationPreferences } = await import('../src/push-notifications.js');
+
+    apiFetchMock.mockRejectedValueOnce(new Error('injected POST failure'));
+    await syncPushNotificationPreferences(['task_pair_audit']);
+    expect(getLocalPushNotificationPreferences()).toEqual(['task_pair_audit']);
+
+    apiFetchMock.mockResolvedValueOnce({
+      ok: true,
+      types: ['task_complete', 'waiting_input', 'session_error', 'task_pair_done', 'task_pair_paused', 'remote_desktop'],
+    });
+    const result = await fetchPushNotificationPreferences();
+    expect(result).toBeNull();
+    expect(getLocalPushNotificationPreferences()).toEqual(['task_pair_audit']);
+  });
+
+  it('prevents a settings read started before save ACK from restoring stale server defaults', async () => {
+    const { syncPushNotificationPreferences, fetchPushNotificationPreferences, getLocalPushNotificationPreferences } = await import('../src/push-notifications.js');
+
+    let ack: (val: any) => void;
+    apiFetchMock.mockImplementation((path: string, options: any) => {
+      if (options?.method === 'POST') {
+        return new Promise((resolve) => {
+          ack = resolve;
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        types: ['task_complete', 'waiting_input', 'session_error', 'task_pair_done', 'task_pair_paused', 'remote_desktop'],
+      });
+    });
+
+    const save = syncPushNotificationPreferences(['task_pair_audit']);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    await fetchPushNotificationPreferences();
+    const seen = getLocalPushNotificationPreferences();
+    ack!({ ok: true });
+    await save;
+
+    expect(seen).toEqual(['task_pair_audit']);
+    expect(getLocalPushNotificationPreferences()).toEqual(['task_pair_audit']);
+  });
+
+  it('allows normal remote hydration once in-flight edits are successfully ACKed', async () => {
+    const { syncPushNotificationPreferences, fetchPushNotificationPreferences, getLocalPushNotificationPreferences } = await import('../src/push-notifications.js');
+
+    apiFetchMock.mockResolvedValueOnce({ ok: true });
+    await syncPushNotificationPreferences(['task_pair_done']);
+    expect(getLocalPushNotificationPreferences()).toEqual(['task_pair_done']);
+
+    // Once successfully ACKed, a new remote fetch hydrates cleanly
+    apiFetchMock.mockResolvedValueOnce({
+      ok: true,
+      types: ['task_pair_done', 'remote_desktop'],
+    });
+    const hydrated = await fetchPushNotificationPreferences();
+    expect(hydrated).toEqual(['task_pair_done', 'remote_desktop']);
+    expect(getLocalPushNotificationPreferences()).toEqual(['task_pair_done', 'remote_desktop']);
+  });
+
+  it('coalesces rapid consecutive sync calls and commits the final generation', async () => {
+    const { syncPushNotificationPreferences, getLocalPushNotificationPreferences } = await import('../src/push-notifications.js');
+
+    const postBodies: any[] = [];
+    apiFetchMock.mockImplementation((path: string, options: any) => {
+      if (options?.method === 'POST') {
+        postBodies.push(JSON.parse(options.body));
+        return Promise.resolve({ ok: true });
+      }
+      return Promise.resolve({ ok: true, types: [] });
+    });
+
+    await Promise.all([
+      syncPushNotificationPreferences(['task_complete']),
+      syncPushNotificationPreferences(['task_complete', 'waiting_input']),
+      syncPushNotificationPreferences(['task_pair_audit']),
+    ]);
+
+    expect(getLocalPushNotificationPreferences()).toEqual(['task_pair_audit']);
+    expect(postBodies[postBodies.length - 1]).toEqual({ types: ['task_pair_audit'] });
+  });
 });

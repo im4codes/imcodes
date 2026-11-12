@@ -19,6 +19,7 @@ import {
   fetchPushNotificationPreferences,
   getLocalPushNotificationPreferences,
   syncPushNotificationPreferences,
+  hasUnsyncedPushNotificationEdits,
 } from '../push-notifications.js';
 
 interface Props {
@@ -60,7 +61,7 @@ export function SettingsPage({ displayName, username, hasPassword, serverUrl, on
   useEffect(() => {
     let unmounted = false;
     void fetchPushNotificationPreferences().then((types) => {
-      if (!unmounted && types !== null && !userEditedPushRef.current) {
+      if (!unmounted && types !== null && !userEditedPushRef.current && !hasUnsyncedPushNotificationEdits()) {
         setPushPreferences(types);
       }
     });
