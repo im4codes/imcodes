@@ -1288,6 +1288,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   } | null>(null);
   const voiceHoldBarsRef = useRef<number[]>(Array(16).fill(0));
   const handledVoicePointerEventsRef = useRef<WeakSet<Event>>(new WeakSet());
+  const touchTapCompatShieldCleanupRef = useRef<(() => void) | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [atPickerOpen, setAtPickerOpen] = useState(false);
   const [atQuery, setAtQuery] = useState('');
@@ -5392,6 +5393,54 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
   }, [clearVoiceHoldTimers, finalizeVoiceHold]);
 
+  const disarmTouchTapCompatMouseShield = useCallback(() => {
+    touchTapCompatShieldCleanupRef.current?.();
+    touchTapCompatShieldCleanupRef.current = null;
+  }, []);
+
+  /**
+   * Focusing the composer synchronously on a short touch `pointerup` can trigger
+   * `.input-focused` / `.subcard-bar` hiding and shift the composer downward
+   * before the browser dispatches the tap's compatibility `mousedown`. Guard
+   * against that stale compatibility `mousedown` landing on `.chat-view`
+   * (`tabIndex={-1}`) and stealing focus back out of the composer.
+   */
+  const armTouchTapCompatMouseShield = useCallback(() => {
+    disarmTouchTapCompatMouseShield();
+    if (typeof document === 'undefined') return;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const cleanup = () => {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      document.removeEventListener('pointerdown', onNewInteraction, true);
+      document.removeEventListener('touchstart', onNewInteraction, true);
+      document.removeEventListener('keydown', onNewInteraction, true);
+      document.removeEventListener('mousedown', onCompatMouseDown, true);
+      if (touchTapCompatShieldCleanupRef.current === cleanup) {
+        touchTapCompatShieldCleanupRef.current = null;
+      }
+    };
+    const onNewInteraction = () => {
+      cleanup();
+    };
+    const onCompatMouseDown = (ev: MouseEvent) => {
+      const el = divRef.current;
+      const target = ev.target as Node | null;
+      if (el && document.activeElement === el && (!target || !el.contains(target))) {
+        ev.preventDefault();
+      }
+      cleanup();
+    };
+    document.addEventListener('pointerdown', onNewInteraction, true);
+    document.addEventListener('touchstart', onNewInteraction, true);
+    document.addEventListener('keydown', onNewInteraction, true);
+    document.addEventListener('mousedown', onCompatMouseDown, true);
+    timer = setTimeout(cleanup, 400);
+    touchTapCompatShieldCleanupRef.current = cleanup;
+  }, [disarmTouchTapCompatMouseShield]);
+
   const handleComposerVoicePointerEnd = useCallback((event: PointerEvent, cancelled = false) => {
     if (handledVoicePointerEventsRef.current.has(event)) return;
     handledVoicePointerEventsRef.current.add(event);
@@ -5406,6 +5455,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       clearTimeout(voiceHoldTimerRef.current);
       voiceHoldTimerRef.current = null;
       if (!cancelled && ptr && !ptr.wasFocused) {
+        if (event.pointerType === 'touch') {
+          armTouchTapCompatMouseShield();
+        }
         divRef.current?.focus();
       }
       return;
@@ -5416,7 +5468,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     try { divRef.current?.blur(); } catch { /* ignore */ }
     const finalZone: 'send' | 'cancel' | 'edit' = cancelled ? 'cancel' : tx.zone;
     void finalizeVoiceHold(tx, tx.error !== null ? 'failed' : finalZone);
-  }, [finalizeVoiceHold]);
+  }, [armTouchTapCompatMouseShield, finalizeVoiceHold]);
 
   useEffect(() => {
     const el = divRef.current;
@@ -5440,6 +5492,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [handleComposerVoicePointerDown, handleComposerVoicePointerMove, handleComposerVoicePointerEnd]);
 
   useEffect(() => () => {
+    disarmTouchTapCompatMouseShield();
     clearVoiceHoldTimers();
     const tx = voiceHoldTxRef.current;
     if (tx) {
@@ -5452,7 +5505,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       VoiceInput.onAudioLevel(null);
       void VoiceInput.stopListening();
     }
-  }, [clearVoiceHoldTimers]);
+  }, [clearVoiceHoldTimers, disarmTouchTapCompatMouseShield]);
 
   const handleKeyDown = (e: KeyboardEvent) => {
     if (imeComposingRef.current || isImeComposingKeyEvent(e)) return;

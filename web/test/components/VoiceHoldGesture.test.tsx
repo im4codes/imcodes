@@ -186,6 +186,60 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(document.activeElement).toBe(input);
   });
 
+  it('shields composer focus from stale compatibility mousedown after a touch short tap while allowing genuine subsequent taps', async () => {
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    render(
+      <div>
+        <div class="chat-view" tabIndex={-1}>messages</div>
+        <SessionControls
+          ws={ws}
+          activeSession={makeSession()}
+          quickData={makeQuickData()}
+          sessions={[]}
+          subSessions={[]}
+          serverId="srv-1"
+        />
+      </div>,
+    );
+
+    const chatView = document.querySelector('.chat-view') as HTMLElement;
+    const input = document.querySelector('.controls-input') as HTMLElement;
+
+    const down = new Event('pointerdown', { bubbles: true, cancelable: true });
+    Object.assign(down, { clientX: 180, clientY: 500, pointerId: 1, button: 0, pointerType: 'touch' });
+    fireEvent(input, down);
+
+    await vi.advanceTimersByTimeAsync(80);
+
+    const up = new Event('pointerup', { bubbles: true, cancelable: true });
+    Object.assign(up, { clientX: 180, clientY: 500, pointerId: 1, button: 0, pointerType: 'touch' });
+    fireEvent(input, up);
+    expect(document.activeElement).toBe(input);
+
+    // Delayed compatibility mousedown landing on sibling .chat-view after layout expansion is prevented
+    const compatDown = new MouseEvent('mousedown', { bubbles: true, cancelable: true });
+    expect(fireEvent(chatView, compatDown)).toBe(false);
+    expect(compatDown.defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(input);
+
+    // Positive control: a fresh genuine interaction (pointerdown before mousedown) disarms the shield
+    const secondDown = new Event('pointerdown', { bubbles: true, cancelable: true });
+    Object.assign(secondDown, { clientX: 180, clientY: 500, pointerId: 2, button: 0, pointerType: 'touch' });
+    fireEvent(input, secondDown);
+    await vi.advanceTimersByTimeAsync(80);
+    input.blur();
+    const secondUp = new Event('pointerup', { bubbles: true, cancelable: true });
+    Object.assign(secondUp, { clientX: 180, clientY: 500, pointerId: 2, button: 0, pointerType: 'touch' });
+    fireEvent(input, secondUp);
+
+    const nextTapPointerDown = new Event('pointerdown', { bubbles: true, cancelable: true });
+    Object.assign(nextTapPointerDown, { clientX: 100, clientY: 100, pointerId: 3, button: 0, pointerType: 'touch' });
+    fireEvent(chatView, nextTapPointerDown);
+    const genuineMouseDown = new MouseEvent('mousedown', { bubbles: true, cancelable: true });
+    expect(fireEvent(chatView, genuineMouseDown)).toBe(true);
+    expect(genuineMouseDown.defaultPrevented).toBe(false);
+  });
+
   it('holds 350ms -> vibrates & suppresses keyboard -> shows 3-zone HUD with recognizing feedback -> releases in center to auto-send', async () => {
     const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
     render(
