@@ -43,7 +43,45 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 willPresent notification: UNNotification,
                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        if Self.isShareInboxNotification(notification.request) {
+            self.handleShareInboxNotification()
+        }
         completionHandler([.banner, .sound, .badge])
+    }
+
+    // Drain SharedInbox and flush to WebView when user taps a local share notification banner
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        if Self.isShareInboxNotification(response.notification.request) {
+            self.handleShareInboxNotification()
+        } else {
+            self.registerLocalPluginsIfNeeded()
+            ShareReceiverPlugin.shared.drainInboxFilesIfNeeded()
+            ShareReceiverPlugin.shared.flushToWebView()
+        }
+        completionHandler()
+    }
+
+    static func isShareInboxNotification(_ request: UNNotificationRequest) -> Bool {
+        if request.identifier.hasPrefix("imcodes.share.") {
+            return true
+        }
+        if let type = request.content.userInfo["type"] as? String, type == "share-inbox" {
+            return true
+        }
+        return false
+    }
+
+    private func handleShareInboxNotification() {
+        self.registerLocalPluginsIfNeeded()
+        ShareReceiverPlugin.shared.drainInboxFilesIfNeeded()
+        ShareReceiverPlugin.shared.flushToWebView()
+        DispatchQueue.main.async {
+            self.registerLocalPluginsIfNeeded()
+            ShareReceiverPlugin.shared.drainInboxFilesIfNeeded()
+            ShareReceiverPlugin.shared.flushToWebView()
+        }
     }
 
     func applicationWillResignActive(_ application: UIApplication) {

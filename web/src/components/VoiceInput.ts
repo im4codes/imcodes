@@ -161,9 +161,9 @@ async function startListeningInternal(generation: number): Promise<boolean> {
     });
     _removePartial = () => removeHandle(h1);
 
-    // Audio level listener (emitted from native at ~15fps)
+    // Audio level listener (emitted from native at ~15-20fps; ignore after stop advances generation)
     const h2 = await recognition.addListener('audioLevel' as any, (data: any) => {
-      if (_nativeSession !== session) return;
+      if (_nativeSession !== session || generation !== _generation) return;
       _onLevel?.(data.level ?? 0);
     });
     _removeLevel = () => removeHandle(h2);

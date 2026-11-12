@@ -87,10 +87,11 @@ describe('iOS localized Action extension and shared Inbox handoff', () => {
     expect(plist('../ios/App/ShareActionExtension/ShareActionExtension.entitlements')['com.apple.security.application-groups']).toEqual(['group.com.im.codes']);
     const app = plist('../ios/App/App/Info.plist'); expect(app.CFBundleDocumentTypes[0].CFBundleTypeRole).toBe('Viewer'); expect(app.CFBundleLocalizations).toEqual(Object.keys(localizations));
   });
-  it.each(Object.entries(localizations))('packages %s display name and truthful cannot-open fallback', (locale, label) => {
+  it.each(Object.entries(localizations))('packages %s display name and truthful notification + completion strings', (locale, label) => {
     const strings = read('../ios/App/ShareActionExtension/' + locale + '.lproj/InfoPlist.strings');
     expect(strings).toContain('"CFBundleDisplayName" = "' + label + '";');
-    for (const key of ['share.openApp', 'share.done', 'share.error']) expect(strings).toContain('"' + key + '" = "');
+    for (const key of ['share.notificationBody', 'share.openApp', 'share.done', 'share.error']) expect(strings).toContain('"' + key + '" = "');
+    expect(strings).not.toContain('"share.openNow"');
     const project = read('../ios/App/App.xcodeproj/project.pbxproj'); expect(project).toContain(locale + '.lproj/InfoPlist.strings');
   });
   it('embeds the extension as a dependency with source/resource/config/signing references', () => {
@@ -100,8 +101,10 @@ describe('iOS localized Action extension and shared Inbox handoff', () => {
     for (const text of ['ShareActionExtension.appex', 'com.apple.product-type.app-extension', 'Embed App Extensions', 'dstSubfolderSpec = 13', 'com.im.codes.ShareAction', 'APPLICATION_EXTENSION_API_ONLY = YES', 'ShareActionExtension/ShareActionExtension.entitlements', 'PRODUCT_BUNDLE_IDENTIFIER = com.im.codes.ShareAction', 'MARKETING_VERSION = 1.2']) expect(project).toContain(text);
     const extension = read('../ios/App/ShareActionExtension/ShareActionViewController.swift');
     expect(extension).toContain('loadFileRepresentation'); expect(extension).toContain('copyItem(at: source');
-    expect(extension).toContain('moveItem(at: staging'); expect(extension).toContain('extensionContext?.open');
-    expect(extension).toContain('if opened'); expect(extension).toContain('share.openApp');
+    expect(extension).toContain('moveItem(at: staging'); expect(extension).toContain('UNUserNotificationCenter.current()');
+    expect(extension).toContain('share.notificationBody'); expect(extension).toContain('share.openApp');
+    expect(extension).toContain('share.done'); expect(extension).toContain('completeRequest(returningItems: nil)');
+    expect(extension).not.toContain('openHostApp');
     expect(extension).not.toContain('UIApplication.shared'); expect(extension).not.toContain('performSelector');
   });
   it('drains both inboxes after launch/foreground/URL and keeps unpublished or unreadable files safe', () => {

@@ -215,6 +215,68 @@ describe('VoiceInput', () => {
       vi.useRealTimers();
     }
   });
+
+  it('initializes VoiceOverlay waveform bars at 0 (2px idle height), animates on audioLevel > 0.01, resets to 0 on stop, and isolates stale audioLevel events during stop drain', async () => {
+    vi.useFakeTimers();
+    try {
+      const stopDrain = deferred<void>();
+      speechApi.stop.mockReturnValueOnce(stopDrain.promise);
+      const { VoiceOverlay } = await import('../../src/components/VoiceOverlay.js');
+
+      render(h(VoiceOverlay, {
+        open: true,
+        initialText: '',
+        onSend: () => 'accepted',
+        onClose: () => {},
+      }));
+
+      // 1. Initial idle bars are fill(0) -> height 2px (2 + 0 * 44), opacity 0.15 (never 90px overflow from fill(2))
+      const getBarHeights = () =>
+        Array.from(document.querySelectorAll('.voice-waveform-bar')).map(
+          (el) => parseFloat((el as HTMLElement).style.height),
+        );
+      expect(getBarHeights()).toHaveLength(48);
+      expect(getBarHeights().every((h) => h === 2)).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(150);
+      expect(speechApi.start).toHaveBeenCalledTimes(1);
+
+      // 2. First active audioLevel > 0.01 triggers isEmpty initial burst across all 24 bars (within 2px..46px)
+      listeners.audioLevel?.({ level: 0.5 });
+      await vi.advanceTimersByTimeAsync(0);
+      const burstHeights = getBarHeights();
+      expect(burstHeights.every((h) => h > 2 && h <= 46)).toBe(true);
+
+      // 3. Subsequent audioLevel events shift the waveform smoothly and clamp out-of-range values to <= 46px
+      listeners.audioLevel?.({ level: 0.25 });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(getBarHeights().at(-1)).toBeCloseTo(2 + 0.25 * 44, 2);
+
+      listeners.audioLevel?.({ level: 3.0 });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(getBarHeights().at(-1)).toBeCloseTo(46, 2);
+
+      // 4. Tapping mic to stop immediately suppresses stale native audioLevel events during final stop drain,
+      //    and resets waveform bars back to 2px (fill(0)) once stop completes.
+      const micBtn = document.querySelector('.voice-overlay-mic') as HTMLElement;
+      fireEvent.click(micBtn);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const heightsBeforeStaleEvent = getBarHeights();
+      listeners.audioLevel?.({ level: 0.9 });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(getBarHeights()).toEqual(heightsBeforeStaleEvent);
+
+      stopDrain.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(getBarHeights().every((h) => h === 2)).toBe(true);
+    } finally {
+      cleanup();
+      await VoiceInput.stopListening();
+      await vi.advanceTimersByTimeAsync(0);
+      vi.useRealTimers();
+    }
+  });
 });
 
 

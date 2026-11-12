@@ -1,9 +1,11 @@
 import UIKit
 import UniformTypeIdentifiers
+import UserNotifications
 
 /// An Action extension, not a Share extension: appears in the vertical actions list.
 final class ShareActionViewController: UIViewController {
     private var started = false
+    private var didPresentCompletion = false
     private let fileManager = FileManager.default
 
     override func viewDidAppear(_ animated: Bool) {
@@ -67,85 +69,74 @@ final class ShareActionViewController: UIViewController {
                 try? self.fileManager.removeItem(at: staging)
                 self.fail(); return
             }
-            let url = URL(string: "imcodes://share-inbox")!
-            self.openHostApp(url) { opened in
-                DispatchQueue.main.async {
-                    if opened {
-                        self.extensionContext?.completeRequest(returningItems: nil)
-                    } else {
-                        // Action extensions may not open the app on iOS. Never lose the
-                        // queued files or pretend launch succeeded: next activation drains them.
-                        let alert = UIAlertController(title: self.localized("CFBundleDisplayName"), message: self.localized("share.openApp"), preferredStyle: .alert)
-                        alert.addAction(UIAlertAction(title: self.localized("share.openNow"), style: .default) { _ in
-                            self.openHostApp(url) { _ in
-                                DispatchQueue.main.async {
-                                    self.extensionContext?.completeRequest(returningItems: nil)
-                                }
-                            }
-                        })
-                        alert.addAction(UIAlertAction(title: self.localized("share.done"), style: .cancel) { _ in
-                            self.extensionContext?.completeRequest(returningItems: nil)
-                        })
-                        self.present(alert, animated: true)
-                    }
-                }
+            // Schedule an immediate local notification banner so tapping it
+            // wakes IM.codes directly (iOS 18 blocks Extension openURL calls).
+            // Never block or fail completion if notification permission is denied.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                self?.presentCompletionAlert()
+            }
+            self.scheduleShareNotification(fileCount: providers.count, batch: batch) { [weak self] in
+                self?.presentCompletionAlert()
             }
         }
     }
 
-    private func openHostApp(_ url: URL, completion: @escaping (Bool) -> Void) {
-        let openWithCompletion = sel_registerName("openURL:options:completionHandler:")
-        let openLegacy = sel_registerName("openURL:")
-        var responder: UIResponder? = self
-        while let current = responder {
-            if current.responds(to: openWithCompletion) {
-                typealias OpenURLOptionsCompletionFn = @convention(c) (
-                    AnyObject,
-                    Selector,
-                    NSURL,
-                    NSDictionary,
-                    @escaping @convention(block) (Bool) -> Void
-                ) -> Void
-                let imp = current.method(for: openWithCompletion)
-                let fn = unsafeBitCast(imp, to: OpenURLOptionsCompletionFn.self)
-                fn(current, openWithCompletion, url as NSURL, NSDictionary()) { opened in
-                    if opened {
-                        completion(true)
-                    } else if current.responds(to: openLegacy) {
-                        typealias OpenURLFn = @convention(c) (AnyObject, Selector, NSURL) -> Bool
-                        let legacyImp = current.method(for: openLegacy)
-                        let legacyFn = unsafeBitCast(legacyImp, to: OpenURLFn.self)
-                        if legacyFn(current, openLegacy, url as NSURL) {
-                            completion(true)
-                        } else if self.extensionContext != nil {
-                            self.extensionContext?.open(url, completionHandler: completion)
-                        } else {
-                            completion(false)
-                        }
-                    } else if self.extensionContext != nil {
-                        self.extensionContext?.open(url, completionHandler: completion)
+    private func scheduleShareNotification(fileCount: Int, batch: String, completion: @escaping () -> Void) {
+        let center = UNUserNotificationCenter.current()
+        let finish: () -> Void = {
+            DispatchQueue.main.async {
+                completion()
+            }
+        }
+        let enqueue: () -> Void = {
+            let content = UNMutableNotificationContent()
+            content.title = self.localized("CFBundleDisplayName")
+            content.body = String(format: self.localized("share.notificationBody"), fileCount)
+            content.sound = .default
+            content.userInfo = [
+                "type": "share-inbox",
+                "batch": batch,
+                "fileCount": fileCount
+            ]
+            let request = UNNotificationRequest(
+                identifier: "imcodes.share.\(batch)",
+                content: content,
+                trigger: nil
+            )
+            center.add(request) { _ in
+                finish()
+            }
+        }
+        center.getNotificationSettings { settings in
+            switch settings.authorizationStatus {
+            case .authorized, .provisional, .ephemeral:
+                enqueue()
+            case .notDetermined:
+                center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+                    if granted {
+                        enqueue()
                     } else {
-                        completion(false)
+                        finish()
                     }
                 }
-                return
+            default:
+                finish()
             }
-            if current.responds(to: openLegacy) {
-                typealias OpenURLFn = @convention(c) (AnyObject, Selector, NSURL) -> Bool
-                let imp = current.method(for: openLegacy)
-                let fn = unsafeBitCast(imp, to: OpenURLFn.self)
-                if fn(current, openLegacy, url as NSURL) {
-                    completion(true)
-                    return
-                }
-            }
-            responder = current.next
         }
-        if extensionContext != nil {
-            extensionContext?.open(url, completionHandler: completion)
-        } else {
-            completion(false)
-        }
+    }
+
+    private func presentCompletionAlert() {
+        guard !didPresentCompletion else { return }
+        didPresentCompletion = true
+        let alert = UIAlertController(
+            title: localized("CFBundleDisplayName"),
+            message: localized("share.openApp"),
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: localized("share.done"), style: .default) { _ in
+            self.extensionContext?.completeRequest(returningItems: nil)
+        })
+        present(alert, animated: true)
     }
 
     private func copy(_ source: URL, to directory: URL) -> Bool {

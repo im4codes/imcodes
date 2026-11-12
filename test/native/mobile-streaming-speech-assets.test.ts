@@ -86,6 +86,12 @@ describe('Qwen3-ASR mobile assets', () => {
     expect(ios).toContain('input.installTap(onBus: 0, bufferSize: AVAudioFrameCount(format.sampleRate / 10), format: format)');
     expect(ios).toContain('Offline audio conversion failed:');
     expect(ios).toContain('UIApplication.shared.applicationState != .background');
+    expect(ios).toContain('static let audioLevelInterval: TimeInterval = 0.05');
+    expect(ios).toContain('if let level = inbox.pollAudioLevel(now: ProcessInfo.processInfo.systemUptime)');
+    expect(ios).toContain('let active = self.generation == owner && self.eventOwner == owner');
+    expect(ios).toContain('self.notifyListeners("audioLevel", data: ["level": level])');
+    const drainSection = ios.slice(ios.indexOf('private func drain('), ios.indexOf('private func emitText('));
+    expect(drainSection).not.toContain('audioLevel');
   });
   it('compiles and executes the production Android plugin through cold/warm/stop/segmentation/overflow/destroy', async () => {
     await setup(); const srcDir = join(root, 'src'), classesDir = join(root, 'classes'); await mkdir(classesDir, { recursive: true });
@@ -238,7 +244,7 @@ it.skipIf(!swiftCompiler)('executes the actual Swift bounded window through roll
   await writeFile(file, 'import Foundation\n' + state + '\n' + swiftWindowCases);
   execFileSync(swiftCompiler!, ['-swift-version', '5', file, '-o', executable], { encoding: 'utf8', timeout: 60000 });
   const result = execFileSync(executable, [], { encoding: 'utf8', timeout: 30000 });
-  for (const name of ['TAIL', 'ROLLBACK', 'VAD', 'PUNCTUATION', 'REPEATED_SENTENCE', 'LONG_CONTINUOUS', 'VARIABLE_TAP', 'FAILURE', 'UNICODE', 'EMPTY', 'IN_FLIGHT_STOP', 'LONG_TRANSCRIPT', 'SHORT_CJK', 'SHORT_ASCII', 'REPEATED_OVERLAP', 'STABLE_HYPOTHESIS', 'NO_PROGRESS_THEN_GROWTH', 'ZERO_LAG', 'WARMUP', 'OVERLOAD', 'TAIL_BATCH']) {
+  for (const name of ['TAIL', 'ROLLBACK', 'VAD', 'PUNCTUATION', 'REPEATED_SENTENCE', 'LONG_CONTINUOUS', 'VARIABLE_TAP', 'FAILURE', 'UNICODE', 'EMPTY', 'IN_FLIGHT_STOP', 'LONG_TRANSCRIPT', 'SHORT_CJK', 'SHORT_ASCII', 'REPEATED_OVERLAP', 'STABLE_HYPOTHESIS', 'NO_PROGRESS_THEN_GROWTH', 'ZERO_LAG', 'WARMUP', 'AUDIO_LEVEL_THROTTLE', 'OVERLOAD', 'TAIL_BATCH']) {
     expect(result).toContain(name + ':PASS');
   }
 }, 95000);
@@ -488,6 +494,32 @@ func run() throws {
     check(try inbox.offer([7]), "empty drain did not rearm")
     print("ZERO_LAG:PASS")
     print("WARMUP:PASS")
+
+    var levelInbox = SpeechInbox()
+    // Warmup taps (first 1600 samples) must never emit audioLevel
+    _ = try levelInbox.offer(pcm(800))
+    check(levelInbox.pollAudioLevel(now: 0.0) == nil, "audioLevel emitted during first warmup half")
+    _ = try levelInbox.offer(pcm(800))
+    check(levelInbox.pollAudioLevel(now: 0.01) == nil, "audioLevel emitted on exact warmup completion without post-warmup samples")
+    // First post-warmup tap at t=0.05 emits RMS * 3 (0.1 * 3 = 0.3), independent of inbox.take() / worker drain
+    _ = try levelInbox.offer(pcm(320))
+    let firstLevel = levelInbox.pollAudioLevel(now: 0.05)
+    check(firstLevel != nil && abs(firstLevel! - 0.3) < 0.001, "first post-warmup audioLevel inaccurate: \\(String(describing: firstLevel))")
+    // Subsequent taps within <50ms (t=0.07, t=0.099) are throttled even as new samples accumulate while drain is busy
+    _ = try levelInbox.offer(Array(repeating: 0.2, count: 320))
+    check(levelInbox.pollAudioLevel(now: 0.07) == nil, "audioLevel not throttled at +20ms")
+    _ = try levelInbox.offer(Array(repeating: 0.2, count: 320))
+    check(levelInbox.pollAudioLevel(now: 0.099) == nil, "audioLevel not throttled at +49ms")
+    // At +50ms (t=0.10), throttled window opens and emits latest level (0.2 * 3 = 0.6) while inbox is still un-drained!
+    let secondLevel = levelInbox.pollAudioLevel(now: 0.10)
+    check(secondLevel != nil && abs(secondLevel! - 0.6) < 0.001, "throttled audioLevel did not emit at +50ms: \\(String(describing: secondLevel))")
+    // Without new audio offered, polling again at t=0.20 returns nil
+    check(levelInbox.pollAudioLevel(now: 0.20) == nil, "duplicate audioLevel emitted without new samples")
+    // Loud audio clamps to 1.0
+    _ = try levelInbox.offer(Array(repeating: 0.8, count: 320))
+    let clampedLevel = levelInbox.pollAudioLevel(now: 0.20)
+    check(clampedLevel == 1.0, "loud audioLevel did not clamp to 1.0: \\(String(describing: clampedLevel))")
+    print("AUDIO_LEVEL_THROTTLE:PASS")
 
     inbox = SpeechInbox()
     _ = try inbox.offer(pcm(1600))

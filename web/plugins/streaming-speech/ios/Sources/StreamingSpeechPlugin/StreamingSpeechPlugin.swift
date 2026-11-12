@@ -200,6 +200,15 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                     call.resolve()
                 }
             }
+            if let level = inbox.pollAudioLevel(now: ProcessInfo.processInfo.systemUptime) {
+                DispatchQueue.main.async {
+                    self.lock.lock()
+                    let active = self.generation == owner && self.eventOwner == owner
+                    self.lock.unlock()
+                    guard active else { return }
+                    self.notifyListeners("audioLevel", data: ["level": level])
+                }
+            }
             if schedule { worker.async { self.drain(owner: owner) } }
         } catch {
             // Bounded admission fails visibly; never silently discard words.
@@ -222,9 +231,6 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
             }
             lock.unlock()
             guard decoderOwner == owner, let decoder = decoder else { return }
-            let power = batch.samples.reduce(Float(0)) { $0 + $1 * $1 }
-            let level = min(1, sqrt(power / Float(max(batch.samples.count, 1))) * 3)
-            notifyListeners("audioLevel", data: ["level": level])
             do {
                 try window.append(batch.samples, speech: batch.speech, trailingSilence: batch.trailingSilence, decode: decoder.decode) { text in
                     self.emitText(text, final: false, owner: owner)
@@ -525,11 +531,14 @@ struct SpeechWindow {
 /// only copying admitted audio is O(n), bounded at 6.4s / 409,600 PCM bytes.
 struct SpeechInbox {
     static let limit = 16000 * 64 / 10
+    static let audioLevelInterval: TimeInterval = 0.05 // ~20fps (50ms) main-thread audioLevel throttle
     private(set) var pending: [Float] = []
     private var scheduled = false
     private var speech = false
     private var trailingSilence = 0
     private(set) var warmupRemaining = 1600 // exactly 100ms at 16kHz, once per capture
+    private var pendingAudioLevel: Float?
+    private var lastAudioLevelAt: TimeInterval = -.infinity
     enum Failure: Error { case overload }
     mutating func offer(_ input: [Float]) throws -> Bool {
         let skip = min(warmupRemaining, input.count)
@@ -538,13 +547,21 @@ struct SpeechInbox {
         guard !audio.isEmpty else { return false }
         guard audio.count <= Self.limit - pending.count else { throw Failure.overload }
         let power = audio.reduce(Float(0)) { $0 + $1 * $1 }
-        let voiced = sqrt(power / Float(audio.count)) * 3 >= 0.01
+        let level = min(1, sqrt(power / Float(audio.count)) * 3)
+        pendingAudioLevel = level
+        let voiced = level >= 0.01
         speech = speech || voiced
         trailingSilence = voiced ? 0 : trailingSilence + audio.count
         pending.append(contentsOf: audio)
         if scheduled { return false }
         scheduled = true
         return true
+    }
+    mutating func pollAudioLevel(now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> Float? {
+        guard warmupRemaining == 0, let level = pendingAudioLevel, now - lastAudioLevelAt >= Self.audioLevelInterval else { return nil }
+        pendingAudioLevel = nil
+        lastAudioLevelAt = now
+        return level
     }
     struct Batch { let samples: [Float]; let speech: Bool; let trailingSilence: Int }
     mutating func take() -> Batch? {

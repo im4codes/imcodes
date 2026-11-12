@@ -1,5 +1,5 @@
 "CFBundleDisplayName" = "Enviar a IM.codes";
-"share.openApp" = "Archivos guardados. Abre IM.codes para elegir un servidor y una sesión.";
-"share.openNow" = "Abrir IM.codes";
+"share.notificationBody" = "Se guardaron %d archivo(s). Toca para entrar en IM.codes y enviar.";
+"share.openApp" = "Archivos guardados. Toca la notificación o abre IM.codes para elegir un servidor y una sesión.";
 "share.done" = "Listo";
 "share.error" = "No se pudieron importar los archivos compartidos. Inténtalo de nuevo.";

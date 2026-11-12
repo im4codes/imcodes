@@ -73,7 +73,7 @@ export function VoiceOverlay({
   const { t } = useTranslation();
   const [listening, setListening] = useState(false);
   const [hasText, setHasText] = useState(false);
-  const [bars, setBars] = useState<number[]>(() => Array(BAR_COUNT).fill(2));
+  const [bars, setBars] = useState<number[]>(() => Array(BAR_COUNT).fill(0));
   const [maxH, setMaxH] = useState('66vh');
   const taRef = useRef<HTMLTextAreaElement>(null);
   const holdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -81,7 +81,7 @@ export function VoiceOverlay({
   const suppressMicClickRef = useRef(false);
   const lastMicTapRef = useRef<number | null>(null);
   const micPointerRef = useRef<number | null>(null);
-  const barsRef = useRef<number[]>(Array(BAR_COUNT).fill(2));
+  const barsRef = useRef<number[]>(Array(BAR_COUNT).fill(0));
   // Voice zone: [insertPos, insertPos+voiceLen) is the active voice segment
   const insertPosRef = useRef(0);
   const voiceLenRef = useRef(0);
@@ -251,10 +251,11 @@ export function VoiceOverlay({
     insertPosRef.current = init.length;
     voiceLenRef.current = 0;
     sessionTokenRef.current++;
-    setBars(Array(BAR_COUNT).fill(2));
-    barsRef.current = Array(BAR_COUNT).fill(2);
+    setBars(Array(BAR_COUNT).fill(0));
+    barsRef.current = Array(BAR_COUNT).fill(0);
 
-    VoiceInput.onAudioLevel((level) => {
+    VoiceInput.onAudioLevel((rawLevel) => {
+      const level = Math.max(0, Math.min(1, Number.isFinite(rawLevel) ? rawLevel : 0));
       const prev = barsRef.current;
       const isEmpty = prev.every((v) => v < 0.01);
       if (isEmpty && level > 0.01) {
@@ -459,8 +460,8 @@ export function VoiceOverlay({
   const openReview = useCallback(async () => {
     clearRestartTimer();
     if (!await commitAndStop(true) || !openRef.current) return;
-    setBars(Array(BAR_COUNT).fill(2));
-    barsRef.current = Array(BAR_COUNT).fill(2);
+    setBars(Array(BAR_COUNT).fill(0));
+    barsRef.current = Array(BAR_COUNT).fill(0);
     setNotepadSendFailed(false);
     setReview({
       instruction: draftInstructionRef.current ?? t('voice.notepad_summary_instruction'),
@@ -503,8 +504,8 @@ export function VoiceOverlay({
     if (listeningRef.current || restartTimerRef.current) {
       clearRestartTimer();
       if (!await commitAndStop(true)) return;
-      setBars(Array(BAR_COUNT).fill(2));
-      barsRef.current = Array(BAR_COUNT).fill(2);
+      setBars(Array(BAR_COUNT).fill(0));
+      barsRef.current = Array(BAR_COUNT).fill(0);
     } else {
       if (voiceRetryPendingRef.current) return;
       clearAutoStartTimer();

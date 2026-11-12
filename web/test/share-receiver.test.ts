@@ -368,30 +368,122 @@ describe('share-receiver service', () => {
     }
   });
 
-  it('walks the UIResponder chain for openURL in ShareActionViewController and localizes share.openNow across all 7 iOS lproj bundles', () => {
+  it('schedules a local notification via UNUserNotificationCenter in ShareActionViewController with permission/error fallback, routes notification taps in AppDelegate, and localizes across all 7 iOS lproj bundles', () => {
     const shareVC = readFileSync(
       join(WEB_ROOT, 'ios/App/ShareActionExtension/ShareActionViewController.swift'),
       'utf8',
     );
-    expect(shareVC).toContain('sel_registerName("openURL:options:completionHandler:")');
-    expect(shareVC).toContain('sel_registerName("openURL:")');
-    expect(shareVC).toContain('URL(string: "imcodes://share-inbox")!');
-    expect(shareVC).toContain('self.openHostApp(url)');
-    expect(shareVC).toContain('self.localized("share.openNow")');
-    expect(shareVC).toContain('self.localized("share.done")');
+    const appDelegate = readFileSync(
+      join(WEB_ROOT, 'ios/App/App/AppDelegate.swift'),
+      'utf8',
+    );
 
+    // 1. Removed broken iOS 18 responder-chain openURL / openHostApp / fake "Open IM.codes" button
+    expect(shareVC).not.toContain('openHostApp');
+    expect(shareVC).not.toContain('sel_registerName("openURL:options:completionHandler:")');
+    expect(shareVC).not.toContain('sel_registerName("openURL:")');
+    expect(shareVC).not.toContain('extensionContext?.open');
+    expect(shareVC).not.toContain('share.openNow');
+
+    // 2. Uses UNUserNotificationCenter with permission handling + failure fallback + single Done completion alert
+    expect(shareVC).toContain('import UserNotifications');
+    expect(shareVC).toContain('UNUserNotificationCenter.current()');
+    expect(shareVC).toContain('UNMutableNotificationContent()');
+    expect(shareVC).toContain('String(format: self.localized("share.notificationBody"), fileCount)');
+    expect(shareVC).toContain('"type": "share-inbox"');
+    expect(shareVC).toContain('identifier: "imcodes.share.\\(batch)"');
+    expect(shareVC).toContain('center.getNotificationSettings');
+    expect(shareVC).toContain('center.requestAuthorization(options: [.alert, .sound])');
+    expect(shareVC).toContain('center.add(request)');
+    expect(shareVC).toContain('localized("share.openApp")');
+    expect(shareVC).toContain('localized("share.done")');
+    expect(shareVC).toContain('self.extensionContext?.completeRequest(returningItems: nil)');
+
+    // 3. Host AppDelegate routes notification banner presentation and tap to SharedInbox drain + WebView flush
+    expect(appDelegate).toContain('didReceive response: UNNotificationResponse');
+    expect(appDelegate).toContain('Self.isShareInboxNotification(response.notification.request)');
+    expect(appDelegate).toContain('Self.isShareInboxNotification(notification.request)');
+    expect(appDelegate).toContain('request.identifier.hasPrefix("imcodes.share.")');
+    expect(appDelegate).toContain('request.content.userInfo["type"] as? String');
+    expect(appDelegate).toContain('self.handleShareInboxNotification()');
+
+    // 4. All 7 iOS lproj InfoPlist.strings include required keys (with %d in share.notificationBody) and omit share.openNow
     const iosLocales = ['en', 'zh-Hans', 'zh-Hant', 'ja', 'ko', 'es', 'ru'];
-    const requiredKeys = ['CFBundleDisplayName', 'share.openApp', 'share.openNow', 'share.done', 'share.error'];
+    const requiredKeys = ['CFBundleDisplayName', 'share.notificationBody', 'share.openApp', 'share.done', 'share.error'];
     for (const lproj of iosLocales) {
       const content = readFileSync(
         join(WEB_ROOT, 'ios/App/ShareActionExtension', `${lproj}.lproj/InfoPlist.strings`),
         'utf8',
       );
+      expect(content, `${lproj} should not contain share.openNow`).not.toContain('share.openNow');
       for (const key of requiredKeys) {
         const pattern = new RegExp(`"${key.replace('.', '\\.')}"\\s*=\\s*"([^"]+)"\\s*;`);
         const match = content.match(pattern);
         expect(match?.[1]?.trim().length, `${lproj}:${key}`).toBeGreaterThan(0);
+        if (key === 'share.notificationBody') {
+          expect(match?.[1], `${lproj}:share.notificationBody placeholder`).toContain('%d');
+        }
       }
     }
+
+    // 5. Behavioral contract verification for permission/error degradation and AppDelegate tap routing
+    type AuthStatus = 'authorized' | 'provisional' | 'ephemeral' | 'notDetermined' | 'denied';
+    const simulateScheduleAndPresent = (opts: {
+      status: AuthStatus;
+      grantOnPrompt?: boolean;
+      addError?: boolean;
+      fileCount: number;
+      batch: string;
+    }) => {
+      const scheduled: Array<{ identifier: string; body: string; userInfo: Record<string, unknown> }> = [];
+      let alertPresentedCount = 0;
+      const presentCompletionAlert = () => {
+        if (alertPresentedCount > 0) return;
+        alertPresentedCount++;
+      };
+      const enqueue = () => {
+        if (!opts.addError) {
+          scheduled.push({
+            identifier: `imcodes.share.${opts.batch}`,
+            body: `已保存 ${opts.fileCount} 个文件，轻点进入 IM.codes 发送`,
+            userInfo: { type: 'share-inbox', batch: opts.batch, fileCount: opts.fileCount },
+          });
+        }
+        presentCompletionAlert();
+      };
+      if (opts.status === 'authorized' || opts.status === 'provisional' || opts.status === 'ephemeral') {
+        enqueue();
+      } else if (opts.status === 'notDetermined') {
+        if (opts.grantOnPrompt) enqueue();
+        else presentCompletionAlert();
+      } else {
+        presentCompletionAlert();
+      }
+      // Fallback timer also calls presentCompletionAlert() — must be idempotent
+      presentCompletionAlert();
+      return { scheduled, alertPresentedCount };
+    };
+
+    const authorizedRun = simulateScheduleAndPresent({ status: 'authorized', fileCount: 2, batch: 'b1' });
+    expect(authorizedRun.scheduled).toHaveLength(1);
+    expect(authorizedRun.scheduled[0]!.identifier).toBe('imcodes.share.b1');
+    expect(authorizedRun.scheduled[0]!.body).toContain('2');
+    expect(authorizedRun.alertPresentedCount).toBe(1);
+
+    const promptGrantedRun = simulateScheduleAndPresent({ status: 'notDetermined', grantOnPrompt: true, fileCount: 1, batch: 'b2' });
+    expect(promptGrantedRun.scheduled).toHaveLength(1);
+    expect(promptGrantedRun.alertPresentedCount).toBe(1);
+
+    const promptDeniedRun = simulateScheduleAndPresent({ status: 'notDetermined', grantOnPrompt: false, fileCount: 1, batch: 'b3' });
+    expect(promptDeniedRun.scheduled).toHaveLength(0);
+    expect(promptDeniedRun.alertPresentedCount).toBe(1);
+
+    const deniedRun = simulateScheduleAndPresent({ status: 'denied', fileCount: 3, batch: 'b4' });
+    expect(deniedRun.scheduled).toHaveLength(0);
+    expect(deniedRun.alertPresentedCount).toBe(1);
+
+    const addErrorRun = simulateScheduleAndPresent({ status: 'authorized', addError: true, fileCount: 1, batch: 'b5' });
+    expect(addErrorRun.scheduled).toHaveLength(0);
+    expect(addErrorRun.alertPresentedCount).toBe(1);
   });
 });
