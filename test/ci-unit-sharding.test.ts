@@ -5,9 +5,10 @@ import { parse } from 'yaml';
 type Job = {
   name?: string;
   needs?: string[];
+  'timeout-minutes'?: number;
   'continue-on-error'?: boolean;
   strategy?: { 'fail-fast'?: boolean; 'max-parallel'?: number; matrix: { node?: string[]; shard: number[] } };
-  steps: Array<{ run?: string; uses?: string; 'continue-on-error'?: boolean }>;
+  steps: Array<{ name?: string; run?: string; uses?: string; with?: Record<string, unknown>; 'continue-on-error'?: boolean }>;
 };
 const ci = () => parse(readFileSync('.github/workflows/ci.yml', 'utf8')) as {
   concurrency: { group: string; 'cancel-in-progress': string };
@@ -15,9 +16,10 @@ const ci = () => parse(readFileSync('.github/workflows/ci.yml', 'utf8')) as {
 };
 
 describe('bounded parallel daemon CI, with unchanged release safety', () => {
-  it.each([['unit-tests', 2], ['macos-unit-tests', 3]] as const)(
+  it.each([['unit-tests', 4], ['macos-unit-tests', 3]] as const)(
     '%s executes every contiguous shard once, without masking failures', (id, count) => {
       const job = ci().jobs[id]!;
+      expect(job.name).toContain(`shard \${{ matrix.shard }}/${count}`);
       expect(job.strategy?.matrix.shard).toEqual(Array.from({ length: count }, (_, i) => i + 1));
       expect(job.strategy?.['fail-fast']).toBe(false);
       expect(job.strategy?.['max-parallel']).toBe(id === 'unit-tests' ? 4 : 3);
@@ -27,6 +29,27 @@ describe('bounded parallel daemon CI, with unchanged release safety', () => {
       expect(job.steps.find((step) => step.run?.includes('npm run test:unit'))?.['continue-on-error']).not.toBe(true);
     },
   );
+
+  it('configures coverage-shard across 1..4 shards with 30-minute timeout and aggregates all 4 shard artifacts in coverage', () => {
+    const jobs = ci().jobs;
+    const covShard = jobs['coverage-shard']!;
+    expect(covShard['timeout-minutes']).toBe(30);
+    expect(covShard.strategy?.matrix.shard).toEqual([1, 2, 3, 4]);
+    expect(covShard.strategy?.['fail-fast']).toBe(false);
+    expect(covShard.steps.filter((step) => step.run?.includes('npm run test:coverage:ci')).map((step) => step.run))
+      .toEqual(['npm run test:coverage:ci -- --shard=${{ matrix.shard }}/4 --coverage.reportsDirectory=coverage/shard-${{ matrix.shard }} --reporter=blob --reporter=default']);
+    const covReport = jobs.coverage!;
+    expect(covReport.needs).toEqual(['coverage-shard']);
+    const downloadedArtifacts = covReport.steps
+      .filter((step) => step.uses === 'actions/download-artifact@v4')
+      .map((step) => step.with?.name);
+    expect(downloadedArtifacts).toEqual([
+      'coverage-shard-1',
+      'coverage-shard-2',
+      'coverage-shard-3',
+      'coverage-shard-4',
+    ]);
+  });
 
   it('retains both Node versions and existing per-runner worker limits', () => {
     expect(ci().jobs['unit-tests']!.strategy?.matrix.node).toEqual(['22', '24']);

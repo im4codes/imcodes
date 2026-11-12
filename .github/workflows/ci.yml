@@ -94,7 +94,7 @@ jobs:
   # ── Daemon unit tests ─────────────────────────────────────────────────────
 
   unit-tests:
-    name: Unit Tests (Node ${{ matrix.node }}, shard ${{ matrix.shard }}/2)
+    name: Unit Tests (Node ${{ matrix.node }}, shard ${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
     # Keep both Node versions and every daemon test; split across runners instead of increasing per-runner workers.
     timeout-minutes: 30
@@ -103,7 +103,7 @@ jobs:
       max-parallel: 4
       matrix:
         node: ['22', '24']
-        shard: [1, 2]
+        shard: [1, 2, 3, 4]
     steps:
       - name: Checkout
         id: checkout_1
@@ -149,7 +149,7 @@ jobs:
           cache: 'npm'
       - run: ./scripts/ci-npm-ci.sh .
       - run: npm run build
-      - run: npm run test:unit -- --shard=${{ matrix.shard }}/2
+      - run: npm run test:unit -- --shard=${{ matrix.shard }}/4
 
   preview-dist-smoke:
     name: Preview Dist Smoke
@@ -700,7 +700,7 @@ jobs:
     name: Coverage shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
     # Ends a hung job itself instead of holding the concurrency group for the 6 h default (normal 5-6 min, max 6.8).
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       max-parallel: 4
