@@ -252,7 +252,7 @@ public class StreamingSpeechPlugin extends Plugin {
                 System.arraycopy(samples, 0, utteranceSamples, sampleCount, samples.length);
                 sampleCount += samples.length;
                 silentSamples = speech ? batch.trailingSilence : silentSamples + samples.length;
-                if (session.isStopRequested()) continue; // final tail belongs to finally
+                if (batch.finalTail) continue; // final tail belongs to finally
                 boolean endpoint = sampleCount >= MAX_UTTERANCE_SAMPLES || silentSamples >= 9600;
                 if (endpoint || (speech && sampleCount - lastDecodedCount >= PARTIAL_INTERVAL_SAMPLES)) {
                     String text = decodeSamples(recognizer, utteranceSamples, sampleCount);
@@ -311,8 +311,10 @@ public class StreamingSpeechPlugin extends Plugin {
         final float[] samples;
         final boolean speech;
         final int trailingSilence;
-        AudioBatch(float[] samples, boolean speech, int trailingSilence) {
+        final boolean finalTail;
+        AudioBatch(float[] samples, boolean speech, int trailingSilence, boolean finalTail) {
             this.samples = samples; this.speech = speech; this.trailingSilence = trailingSilence;
+            this.finalTail = finalTail;
         }
     }
 
@@ -406,7 +408,10 @@ public class StreamingSpeechPlugin extends Plugin {
                     System.arraycopy(chunk, 0, batch, offset, chunk.length);
                     offset += chunk.length;
                 }
-                return new AudioBatch(batch, speech, trailingSilence);
+                // Bind stop ownership at the drain boundary, not after copying.
+                // A stop racing a taken normal batch cannot turn TWO full
+                // inboxes into one unbounded tail in utteranceSamples.
+                return new AudioBatch(batch, speech, trailingSilence, stopRequested && readerDone);
             }
             if (readError != null) {
                 throw readError;
