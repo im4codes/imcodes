@@ -2515,6 +2515,32 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
     expect.soft(store.commitJournals.has(mapKey)).toBe(false);
     expect.soft(Buffer.from(virtualFiles.get('/team/shared/spec.docx')!.content, 'base64').toString()).toBe(forceBytes);
   });
+
+  it('audit-r16: obsolete WAL post-state cleanup must not hide a new external restore that matches an old intent target', async () => {
+    const get = () => app.request('/api/server/srv-1/onlyoffice/config?path=%2Fteam%2Fshared%2Fspec.docx&mode=edit', { headers: { Authorization: bearer('owner-1') } });
+    const res = await get(); expect(res.status).toBe(200); const cfg = await res.json() as any;
+    const mapKey = 'srv-1:/team/shared/spec.docx'; const initial = { ...store.rooms.get(mapKey)! };
+    const historicalTarget = 'historical-old-intent-target-A';
+    expect((await claimOnlyOfficeCommitOwner(store.db, { serverId: 'srv-1', normalizedPath: '/team/shared/spec.docx', expectedKey: cfg.config.document.key, expectedEpoch: initial.session_epoch, expectedSeq: initial.commit_seq, targetHash: sha256Hex(historicalTarget), ownerToken: 'claim_old_intent_for_restore' })).ok).toBe(true);
+    const later = Date.now() + 31_000; vi.spyOn(Date, 'now').mockReturnValue(later);
+    // External B advances the authoritative room while one cleanup fault leaves the expired A intent.
+    const newer = 'external-current-confirmed-version-B';
+    virtualFiles.set('/team/shared/spec.docx', { content: Buffer.from(newer).toString('base64'), encoding: 'base64', mtime: later });
+    const execute = store.db.execute.bind(store.db); let cleanupFaults = 0;
+    const fault = vi.spyOn(store.db, 'execute').mockImplementation(async (sql, params) => {
+      if (sql.replace(/\s+/g, ' ').startsWith('DELETE FROM onlyoffice_commit_journal') && cleanupFaults++ === 0) throw new Error('audit retain old expired intent after new external room is saved');
+      return execute(sql, params);
+    });
+    const advanced = await get(); expect(advanced.status).toBe(500); expect(cleanupFaults).toBeGreaterThan(0);
+    const confirmed = { ...store.rooms.get(mapKey)! }; expect(confirmed.current_confirmed_hash).toBe(sha256Hex(newer)); expect(store.commitJournals.has(mapKey)).toBe(true);
+    fault.mockRestore(); resetOnlyOfficeDocumentKeyCacheForTests();
+    // A is a fresh external disk change even though its bytes happen to match old WAL target A.
+    virtualFiles.set('/team/shared/spec.docx', { content: Buffer.from(historicalTarget).toString('base64'), encoding: 'base64', mtime: later + 1 });
+    const restored = await get(); expect(restored.status).toBe(200); const next = await restored.json() as any;
+    expect.soft(next.config.document.key, 'obsolete post-state shortcut must not reuse version B room key for restored A bytes').not.toBe(confirmed.active_key);
+    expect.soft(store.rooms.get(mapKey)!.current_confirmed_hash, 'PG authority must recognize restored A, not pretend disk still contains B').toBe(sha256Hex(historicalTarget));
+    expect.soft(store.rooms.get(mapKey)!.session_epoch, 'external restore is a fresh version regardless of an obsolete target hash').toBeGreaterThan(confirmed.session_epoch);
+  });
 });
 
 describe('Real Daemon CommandHandler Integration: Atomic Binary Save & Symlink Escape Prevention (F1 + F3d)', () => {

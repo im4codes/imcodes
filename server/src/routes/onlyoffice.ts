@@ -386,7 +386,19 @@ export async function resolveOnlyOfficeDocumentKey(
           if (options?.db) {
             await releaseOnlyOfficeCommitClaim(options.db, serverId, normalizedPath, journalEntry?.owner_token);
           }
-          return existing.activeKey;
+          // Only return existing.activeKey if current disk bytes actually match authoritative room state
+          if (getAuthoritativeHash(existing) === currentHash) {
+            if (existing.active === false) {
+              existing.active = true;
+              existing.updatedAt = Date.now();
+              documentVersionStateMap.set(mapKey, existing);
+              if (options?.db) {
+                await savePersistentRoomToDb(options.db, serverId, normalizedPath, existing);
+              }
+            }
+            return existing.activeKey;
+          }
+          // Otherwise disk has changed relative to authoritative room: fall through to Step 3
         }
 
         const isPreState =
