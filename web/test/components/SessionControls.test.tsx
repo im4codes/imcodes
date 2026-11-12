@@ -6306,6 +6306,249 @@ afterEach(() => {
     expect(screen.getAllByText('survivor card')).toHaveLength(1);
   });
 
+  it.each(['subsession.created', 'subsession.created.batch'] as const)(
+    'supersedes append rollback when empty queue authority arrives via %s and parent rerenders',
+    async (carrier) => {
+      const ws = makeWs();
+      const view = render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeTransportSession({
+            name: 'deck_sub_qwen',
+            agentType: 'qwen',
+            state: 'running',
+            transportPendingMessageEntries: [
+              { clientMessageId: 'ghost-id', text: 'ghost card' },
+            ],
+            transportPendingMessageVersion: 7,
+            queueEpoch: 'queue-epoch-1',
+            queueAuthorityId: 'queue-authority-1',
+          })}
+          quickData={makeQuickData() as any}
+        />,
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: 'transport_queue_append' }));
+      const append = ws.send.mock.calls.find(([payload]) => (
+        payload?.type === 'session.append_queued_messages'
+      ))?.[0] as { commandId: string };
+
+      act(() => {
+        const targetItem = {
+          type: 'subsession.created',
+          id: 'qwen',
+          sessionName: 'deck_sub_qwen',
+          sessionType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+          queueEpoch: 'queue-epoch-1',
+          queueAuthorityId: 'queue-authority-1',
+          pendingMessageVersion: 9,
+          pendingMessageEntries: [],
+          failedMessageEntries: [],
+        };
+        const unrelatedItem = {
+          ...targetItem,
+          id: 'other',
+          sessionName: 'deck_sub_other',
+          pendingMessageEntries: [
+            { clientMessageId: 'other-id', text: 'unrelated card' },
+          ],
+        };
+        ws.emit(
+          carrier === 'subsession.created'
+            ? targetItem
+            : { type: carrier, items: [unrelatedItem, targetItem] },
+        );
+      });
+
+      view.rerender(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeTransportSession({
+            name: 'deck_sub_qwen',
+            agentType: 'qwen',
+            state: 'running',
+            transportPendingMessageEntries: [],
+            transportPendingMessageVersion: 9,
+            queueEpoch: 'queue-epoch-1',
+            queueAuthorityId: 'queue-authority-1',
+          })}
+          quickData={makeQuickData() as any}
+        />,
+      );
+
+      act(() => {
+        ws.emit({
+          type: 'command.ack',
+          session: 'deck_sub_qwen',
+          commandId: append.commandId,
+          status: 'error',
+          error: 'Queued message not found',
+          queueEpoch: 'queue-epoch-1',
+          queueAuthorityId: 'queue-authority-1',
+          pendingMessageVersion: 8,
+          pendingMessageEntries: [],
+          failedMessageEntries: [],
+          queueReconcilesCommandId: append.commandId,
+        });
+      });
+
+      await waitFor(() => expect(screen.queryByText('ghost card')).toBeNull());
+      expect(screen.queryByText('unrelated card')).toBeNull();
+    },
+  );
+
+  it.each(['subsession.created', 'subsession.created.batch'] as const)(
+    'preserves surviving entries without resurrecting removed ghost across %s',
+    async (carrier) => {
+      const ws = makeWs();
+      const view = render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeTransportSession({
+            name: 'deck_sub_qwen',
+            agentType: 'qwen',
+            state: 'running',
+            transportPendingMessageEntries: [
+              { clientMessageId: 'ghost-id', text: 'ghost card' },
+              { clientMessageId: 'survivor-id', text: 'survivor card' },
+            ],
+            transportPendingMessageVersion: 7,
+            queueEpoch: 'queue-epoch-1',
+            queueAuthorityId: 'queue-authority-1',
+          })}
+          quickData={makeQuickData() as any}
+        />,
+      );
+
+      fireEvent.click(screen.getAllByRole('button', { name: 'transport_queue_append' })[0]);
+      const append = ws.send.mock.calls.find(([payload]) => (
+        payload?.type === 'session.append_queued_messages'
+      ))?.[0] as { commandId: string };
+
+      const survivorEntry = {
+        clientMessageId: 'survivor-id',
+        text: 'survivor card',
+        createdAt: 1,
+        updatedAt: 1,
+      };
+      act(() => {
+        const targetItem = {
+          type: 'subsession.created',
+          id: 'qwen',
+          sessionName: 'deck_sub_qwen',
+          sessionType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+          queueEpoch: 'queue-epoch-1',
+          queueAuthorityId: 'queue-authority-1',
+          pendingMessageVersion: 9,
+          pendingMessageEntries: [survivorEntry],
+          failedMessageEntries: [],
+        };
+        ws.emit(
+          carrier === 'subsession.created'
+            ? targetItem
+            : { type: carrier, items: [targetItem] },
+        );
+      });
+
+      view.rerender(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeTransportSession({
+            name: 'deck_sub_qwen',
+            agentType: 'qwen',
+            state: 'running',
+            transportPendingMessageEntries: [survivorEntry],
+            transportPendingMessageVersion: 9,
+            queueEpoch: 'queue-epoch-1',
+            queueAuthorityId: 'queue-authority-1',
+          })}
+          quickData={makeQuickData() as any}
+        />,
+      );
+
+      act(() => {
+        ws.emit({
+          type: 'command.ack',
+          session: 'deck_sub_qwen',
+          commandId: append.commandId,
+          status: 'error',
+          error: 'Queued message not found',
+          queueEpoch: 'queue-epoch-1',
+          queueAuthorityId: 'queue-authority-1',
+          pendingMessageVersion: 8,
+          pendingMessageEntries: [],
+          failedMessageEntries: [],
+          queueReconcilesCommandId: append.commandId,
+        });
+      });
+
+      await waitFor(() => expect(screen.queryByText('ghost card')).toBeNull());
+      expect(screen.getAllByText('survivor card')).toHaveLength(1);
+    },
+  );
+
+  it('ignores unrelated sessions and stale-version batch items in subsession.created.batch', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'deck_sub_qwen',
+          agentType: 'qwen',
+          state: 'running',
+          transportPendingMessageEntries: [
+            { clientMessageId: 'active-id', text: 'active v7 card' },
+          ],
+          transportPendingMessageVersion: 7,
+          queueEpoch: 'queue-epoch-2',
+          queueAuthorityId: 'queue-authority-2',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    act(() => {
+      ws.emit({
+        type: 'subsession.created.batch',
+        items: [
+          {
+            type: 'subsession.created',
+            id: 'other',
+            sessionName: 'deck_sub_other',
+            sessionType: 'qwen',
+            runtimeType: 'transport',
+            state: 'running',
+            queueEpoch: 'queue-epoch-2',
+            queueAuthorityId: 'queue-authority-other',
+            pendingMessageVersion: 10,
+            pendingMessageEntries: [{ clientMessageId: 'other-id', text: 'other session card' }],
+            failedMessageEntries: [],
+          },
+          {
+            type: 'subsession.created',
+            id: 'qwen',
+            sessionName: 'deck_sub_qwen',
+            sessionType: 'qwen',
+            runtimeType: 'transport',
+            state: 'running',
+            queueEpoch: 'queue-epoch-2',
+            queueAuthorityId: 'queue-authority-2',
+            pendingMessageVersion: 6,
+            pendingMessageEntries: [],
+            failedMessageEntries: [],
+          },
+        ],
+      });
+    });
+
+    await waitFor(() => expect(screen.getByText('active v7 card')).toBeTruthy());
+    expect(screen.queryByText('other session card')).toBeNull();
+  });
+
   it('supersedes the append rollback when the newer authority arrived via session_list', async () => {
     // The audit named session_list alongside session.state as a carrier of
     // uncorrelated authority. Supersession must not depend on which frame

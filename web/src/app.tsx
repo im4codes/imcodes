@@ -49,7 +49,11 @@ import type { MessagePin } from '@shared/message-pins.js';
 import { mapP2pRunToDiscussion, mergeP2pDiscussionUpdate, mergeP2pStatusResponseDiscussions } from './p2p-run-mapping.js';
 import { matchDiscussionIndex, reconcileDiscussionEntry, reconcileClassicList, isBarActiveDiscussion, makeOptimisticDiscussionEntry, discussionErrorReasonKey, shouldToastDiscussionError, classifyDiscussionStop, removeDiscussionByRequestId } from './discussion-reconcile.js';
 import { PENDING_START_TIMEOUT_MS, DISCUSSION_RECONCILE_HIDDEN_MS } from '@shared/discussion-ui.js';
-import { WEB_AUTH_VERIFY_MIN_INTERVAL_MS, WEB_UNLOCK_COALESCE_MS } from '@shared/scale-limits.js';
+import {
+  SUBSESSION_CREATED_BATCH_MSG,
+  WEB_AUTH_VERIFY_MIN_INTERVAL_MS,
+  WEB_UNLOCK_COALESCE_MS,
+} from '@shared/scale-limits.js';
 import { LOGIN_SESSION_NOT_STUCK_KEY } from './login-session-not-stuck.js';
 import { useTranslation } from 'react-i18next';
 import { ErrorBoundary } from './components/ErrorBoundary.js';
@@ -4974,14 +4978,19 @@ function InternalMainApp() {
           message: msg.message,
         });
       }
-      if (msg.type === 'subsession.created') {
-        watchProjectionStore.addSubSession({
-          sessionName: msg.sessionName,
-          sessionType: msg.sessionType,
-          state: msg.state,
-          label: msg.label,
-          parentSession: msg.parentSession,
-        }, selectedServerId);
+      if (msg.type === 'subsession.created' || msg.type === SUBSESSION_CREATED_BATCH_MSG) {
+        const items = msg.type === SUBSESSION_CREATED_BATCH_MSG
+          ? (Array.isArray(msg.items) ? msg.items : [])
+          : [msg];
+        for (const item of items) {
+          watchProjectionStore.addSubSession({
+            sessionName: item.sessionName,
+            sessionType: item.sessionType,
+            state: item.state,
+            label: item.label,
+            parentSession: item.parentSession,
+          }, selectedServerId);
+        }
       }
       if (msg.type === 'subsession.removed') {
         watchProjectionStore.removeSubSession(msg.sessionName);

@@ -87,6 +87,7 @@ import { safeSessionStorageGetItem, safeSessionStorageRemoveItem, safeSessionSto
 import { attachmentDownloadId } from '../attachment-refs.js';
 import { formatTransferBytes, formatTransferDuration } from '../util/transfer-format.js';
 import { DIRECT_FILE_TRANSFER_ERROR } from '@shared/direct-file-transfer.js';
+import { SUBSESSION_CREATED_BATCH_MSG } from '@shared/scale-limits.js';
 import { DirectFileTransferFailure, FILE_UPLOAD_TRANSPORT_MODE, isFileUploadCanceled, prewarmDirectFileLease, uploadFileWithDirectFallback, type FileUploadTransportMode } from '../direct-file-transfer.js';
 import { patchSessionSupervision } from '../api.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
@@ -2693,14 +2694,27 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         if (session) applyRealtimeQueueSnapshot(session as Record<string, unknown>, sessionName);
         return;
       }
-      if (msg.type === 'subsession.sync' || msg.type === 'subsession.created') {
-        const payload = msg as unknown as Record<string, unknown>;
-        const sessionName = typeof payload.sessionName === 'string'
+      const applySubsessionPayload = (payload: Record<string, unknown>) => {
+        const snapshotSessionName = typeof payload.sessionName === 'string'
           ? payload.sessionName
           : typeof payload.id === 'string'
             ? `deck_sub_${payload.id}`
             : '';
-        applyRealtimeQueueSnapshot(payload, sessionName);
+        if (snapshotSessionName !== sessionName) return;
+        applyRealtimeQueueSnapshot(payload, snapshotSessionName);
+      };
+      if (msg.type === 'subsession.sync' || msg.type === 'subsession.created') {
+        applySubsessionPayload(msg as unknown as Record<string, unknown>);
+        return;
+      }
+      if (msg.type === SUBSESSION_CREATED_BATCH_MSG) {
+        if (Array.isArray(msg.items)) {
+          for (const item of msg.items) {
+            if (item && typeof item === 'object') {
+              applySubsessionPayload(item as unknown as Record<string, unknown>);
+            }
+          }
+        }
         return;
       }
       if (msg.type === 'command.ack') {
