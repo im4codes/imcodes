@@ -3,6 +3,14 @@
  */
 import { cleanup, render, waitFor } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string, fallback?: string) => fallback ?? key,
+    i18n: { language: 'en' },
+  }),
+}));
+
 import OfficePreview from '../../src/components/OfficePreview.js';
 import { MINIMAL_DOCX_MIME as DOCX_MIME, MINIMAL_DOCX_TEXT as DOC_TEXT, buildMinimalDocx } from '../fixtures/minimal-docx.js';
 

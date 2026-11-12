@@ -424,11 +424,29 @@ describe('low-coverage page and component surfaces', () => {
   });
 
   it('OfficePreview renders unsupported and spreadsheet previews', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, arrayBuffer: async () => new Uint8Array([0, 0]).buffer })));
-    const { rerender } = render(<OfficePreview srcUrl="https://example.test/doc" mimeType="text/plain" path="/tmp/readme.txt" />);
-    // Bytes now arrive over the chunked download URL, so the component renders
-    // a placeholder until the fetch resolves.
-    expect(await screen.findByText('Unsupported format: readme.txt')).toBeTruthy();
+    const textBytes = new TextEncoder().encode('hello plain text content');
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : (input as Request).url;
+      if (url.includes('/onlyoffice/config')) {
+        return { ok: true, status: 200, json: async () => ({ enabled: false }), text: async () => '{"enabled":false}' };
+      }
+      if (url.includes('doc-txt')) {
+        return { ok: true, status: 200, arrayBuffer: async () => textBytes.buffer };
+      }
+      return { ok: true, status: 200, arrayBuffer: async () => new Uint8Array([0, 0]).buffer };
+    }));
+
+    const { rerender } = render(<OfficePreview srcUrl="https://example.test/doc" mimeType="application/octet-stream" path="/tmp/binary.bin" />);
+    // Bytes arrive over the chunked download URL, and unsupported formats display the unsupported local preview banner.
+    const unsupported = await screen.findByTestId('office-preview-unsupported-local');
+    expect(unsupported).toBeTruthy();
+    expect(unsupported.textContent).toContain('binary.bin');
+
+    // Plain text formats fall back to the text preview component.
+    rerender(<OfficePreview srcUrl="https://example.test/doc-txt" mimeType="text/plain" path="/tmp/readme.txt" />);
+    const textElem = await screen.findByTestId('office-preview-text-fallback');
+    expect(textElem).toBeTruthy();
+    expect(textElem.textContent).toContain('hello plain text content');
 
     rerender(<OfficePreview srcUrl="https://example.test/doc2" mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" path="/tmp/book.xlsx" />);
     expect(await screen.findByText('Total')).toBeTruthy();

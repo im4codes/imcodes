@@ -1178,7 +1178,22 @@ describe('FileBrowser', () => {
   // Asserting previewMode === 'stream' would have passed while users saw blank.
   it('renders real Word text through the streamed office preview branch (tsk_5rf)', async () => {
     const bytes = await buildMinimalDocx();
-    const fetchMock = vi.fn(async () => ({ ok: true, status: 200, arrayBuffer: async () => bytes }));
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : (input as Request).url;
+      if (url.includes('/onlyoffice/config')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ enabled: false }),
+          text: async () => JSON.stringify({ enabled: false }),
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => bytes,
+      };
+    });
     vi.stubGlobal('fetch', fetchMock);
     const { ws, respond, sendMsg } = makeWsFactory();
     const view = render(
@@ -1213,9 +1228,14 @@ describe('FileBrowser', () => {
     await waitFor(() => expect(view.container.textContent).toContain(MINIMAL_DOCX_TEXT), { timeout: 5000 });
 
     // Bytes came over the authenticated chunked URL, never back through the WS.
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    const [url] = fetchMock.mock.calls[0] as [string];
+    const downloadCall = fetchMock.mock.calls.find(([callUrl]) => {
+      const urlStr = typeof callUrl === 'string' ? callUrl : (callUrl as Request)?.url ?? '';
+      return urlStr.includes('/api/server/srv-1/uploads/docx-handle/download');
+    });
+    expect(downloadCall).toBeTruthy();
+    const [url, init] = downloadCall as [string, RequestInit | undefined];
     expect(url).toContain('/api/server/srv-1/uploads/docx-handle/download');
+    expect(init?.credentials).toBe('include');
   });
 
   it('does not blank or leak when the office preview lacks a serverId (tsk_5rf)', async () => {

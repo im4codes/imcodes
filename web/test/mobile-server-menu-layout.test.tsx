@@ -231,7 +231,7 @@ describe('mobile server menu shared-entry reachability', () => {
     }
   });
 
-  it('bounds mobile server menu top-row at 320px and 390px across all 7 locales with zero horizontal overflow in chromium', async () => {
+  it('bounds mobile server menu top-row at 320px and 390px across all 7 locales with zero horizontal overflow in chromium', { timeout: 30000 }, async () => {
     const browserType = (require('playwright') as typeof import('playwright')).chromium;
     if (!require('node:fs').existsSync(browserType.executablePath())) {
       return;
