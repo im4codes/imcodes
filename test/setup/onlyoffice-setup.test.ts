@@ -581,6 +581,61 @@ describe('setupFlow ONLYOFFICE fresh install, --no-onlyoffice, and existing depl
     const old = 'docs.test {\n # reverse_proxy server:19138 (old deployment example)\n reverse_proxy current-backend:8080\n}\n';
     expect(() => ensureCaddyfileHasOnlyOffice(old, 'docs.test')).toThrow(/could not locate server upstream/);
   });
+
+  it('installs a real route in CLI add-on when existing route mention is only a comment', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { setupFlow } = await import('../../src/setup/setup-flow.js');
+    const env = join(projectDir, '.env');
+    const compose = join(projectDir, 'docker-compose.yml');
+    const caddy = join(projectDir, 'Caddyfile');
+    writeFileSync(env, 'DOMAIN=docs.test\nPOSTGRES_PASSWORD=synthetic-pg\nJWT_SIGNING_KEY=synthetic-jwt\n');
+    writeFileSync(compose, 'services:\n  server:\n    image: example/server:fixed\n  caddy:\n    image: caddy:2-alpine\n');
+    const oldCaddy = 'docs.test {\n # Previously disabled: handle_path /onlyoffice/*\n reverse_proxy server:19138\n}\n';
+    writeFileSync(caddy, oldCaddy);
+
+    await setupFlow('docs.test', { onlyoffice: true });
+    const result = readFileSync(caddy, 'utf8');
+    const activeRouteCount = result.split('\n').filter((line) => /^\s*handle_path\s+\/onlyoffice\/\*/.test(line)).length;
+    expect(activeRouteCount).toBe(1);
+    expect(result).toContain('# Previously disabled: handle_path /onlyoffice/*');
+    expect(execSyncMock.mock.calls.some(([cmd]) => String(cmd).includes('up -d onlyoffice server caddy'))).toBe(true);
+  });
+
+  it('keeps exactly one active route and does not duplicate on repeated CLI add-on runs', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { setupFlow } = await import('../../src/setup/setup-flow.js');
+    const env = join(projectDir, '.env');
+    const compose = join(projectDir, 'docker-compose.yml');
+    const caddy = join(projectDir, 'Caddyfile');
+    writeFileSync(env, 'DOMAIN=docs.test\nPOSTGRES_PASSWORD=synthetic-pg\nJWT_SIGNING_KEY=synthetic-jwt\n');
+    writeFileSync(compose, 'services:\n  server:\n    image: example/server:fixed\n  caddy:\n    image: caddy:2-alpine\n');
+    const existingCaddy = 'docs.test {\n\thandle_path /onlyoffice/* {\n\t\treverse_proxy onlyoffice:80\n\t}\n\treverse_proxy server:19138\n}\n';
+    writeFileSync(caddy, existingCaddy);
+
+    await setupFlow('docs.test', { onlyoffice: true });
+    const result = readFileSync(caddy, 'utf8');
+    const activeRouteCount = result.split('\n').filter((line) => /^\s*handle_path\s+\/onlyoffice\/\*/.test(line)).length;
+    expect(activeRouteCount).toBe(1);
+    expect(result).toBe(existingCaddy);
+  });
+
+  it('does not commit env/compose when Caddyfile has only commented route but unsupported server upstream', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { setupFlow } = await import('../../src/setup/setup-flow.js');
+    const env = join(projectDir, '.env');
+    const compose = join(projectDir, 'docker-compose.yml');
+    const caddy = join(projectDir, 'Caddyfile');
+    const oldEnv = 'DOMAIN=docs.test\nPOSTGRES_PASSWORD=synthetic-pg\nJWT_SIGNING_KEY=synthetic-jwt\n';
+    const oldCompose = 'services:\n  server:\n    image: example/server:fixed\n  caddy:\n    image: caddy:2-alpine\n';
+    writeFileSync(env, oldEnv);
+    writeFileSync(compose, oldCompose);
+    writeFileSync(caddy, 'docs.test {\n # handle_path /onlyoffice/*\n # reverse_proxy server:19138\n respond "fallback"\n}\n');
+
+    await expect(setupFlow('docs.test', { onlyoffice: true })).rejects.toThrow(/could not locate server upstream/);
+    expect(readFileSync(env, 'utf8')).toBe(oldEnv);
+    expect(readFileSync(compose, 'utf8')).toBe(oldCompose);
+    expect(execSyncMock.mock.calls.some(([cmd]) => String(cmd).includes('up -d onlyoffice server caddy'))).toBe(false);
+  });
 });
 
 describe('scripts/setup-onlyoffice.sh standalone non-destructive add-on script', () => {

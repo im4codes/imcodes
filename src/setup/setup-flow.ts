@@ -1062,16 +1062,20 @@ export function ensureCaddyfileHasOnlyOffice(
   if (!existingCaddyfile || !existingCaddyfile.trim()) {
     return caddyfileTemplate(domain, { onlyoffice: enabled });
   }
+
+  const escapedSubpath = ONLYOFFICE_SERVICE_DEFAULTS.SUBPATH.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const activeRouteRegex = new RegExp(`^[ \\t]*handle_path\\s+${escapedSubpath}/\\*`, 'm');
+
   if (!enabled) {
-    if (!existingCaddyfile.includes(`handle_path ${ONLYOFFICE_SERVICE_DEFAULTS.SUBPATH}/*`)) {
+    if (!activeRouteRegex.test(existingCaddyfile)) {
       return existingCaddyfile;
     }
     return existingCaddyfile.replace(
-      new RegExp(`\\n?[ \\t]*handle_path\\s+${ONLYOFFICE_SERVICE_DEFAULTS.SUBPATH.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/\\*[\\s\\S]*?\\n\\t*\\}\\n?`),
+      new RegExp(`(?:^|\\n)[ \\t]*handle_path\\s+${escapedSubpath}/\\*[\\s\\S]*?\\n[ \\t]*\\}\\n?`),
       '\n',
     );
   }
-  if (existingCaddyfile.includes(`handle_path ${ONLYOFFICE_SERVICE_DEFAULTS.SUBPATH}/*`)) {
+  if (activeRouteRegex.test(existingCaddyfile)) {
     return existingCaddyfile;
   }
   const handleBlock = `\thandle_path ${ONLYOFFICE_SERVICE_DEFAULTS.SUBPATH}/* {\n`
