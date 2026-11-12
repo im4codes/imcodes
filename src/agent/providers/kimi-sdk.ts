@@ -261,6 +261,12 @@ interface KimiSdkSessionState {
   settledGeneration: number;
   /** Active and queued prompt generations currently in flight on the ACP session. */
   activePromptGenerations?: Set<number>;
+  /** Settlements of `session/prompt` RPC responses already seen on the wire that
+   *  must finish settling before subsequent `session/update` notifications run. */
+  arrivedPromptSettlements?: Set<Promise<void>>;
+  /** Serialized tail for deferred `session/update` notifications waiting on
+   *  arrived prompt settlements. */
+  sessionUpdateQueue?: Promise<void>;
   /** Generation allocated for an autonomous provider-initiated wakeup turn. */
   autonomousTurnGeneration?: number;
   /** True after user cancel or turn failure until the next send(). */
@@ -353,6 +359,7 @@ export class KimiSdkProvider implements TransportProvider {
 
   private child: ChildProcessWithoutNullStreams | null = null;
   protected connection: ClientSideConnection | null = null;
+  private promptWriteQueues = new WeakMap<ClientSideConnection, Map<string, Array<{ state: KimiSdkSessionState; settlement: Promise<void> }>>>();
   /** Resolves once `initialize` has completed so subsequent RPCs can proceed. */
   private initPromise: Promise<void> | null = null;
   /** Models returned by the first ACP `newSession` call, cached for the
@@ -1188,17 +1195,24 @@ export class KimiSdkProvider implements TransportProvider {
         messageId: stableAcpMessageId(notification.notificationId),
       });
       this.promptTerminals.set(state, queuedPrompt);
-      void queuedPrompt.then((result) => {
-        if (this.profile.steeringPrompts && !state.activePromptGenerations?.has(generation)) return;
-        return this.settleOwnedAcpPrompt(sessionId,state,generation,result);
-      }).catch((error: unknown) => {
-        logger.warn({
-          provider: this.id,
-          sessionId,
-          ...this.errorLogFields(error),
-        }, 'ACP active-turn queued prompt failed after submission');
-        this.failTurn(sessionId, state, generation, error);
-      });
+      this.trackPromptSettlement(
+        connection,
+        state.acpSessionId,
+        state,
+        queuedPrompt,
+        (result) => {
+          if (this.profile.steeringPrompts && !state.activePromptGenerations?.has(generation)) return;
+          return this.settleOwnedAcpPrompt(sessionId, state, generation, result);
+        },
+        (error: unknown) => {
+          logger.warn({
+            provider: this.id,
+            sessionId,
+            ...this.errorLogFields(error),
+          }, 'ACP active-turn queued prompt failed after submission');
+          this.failTurn(sessionId, state, generation, error);
+        },
+      );
       // ClientSideConnection.prompt() resolves at the end of the queued turn,
       // while sendRequest() writes through an internal serialized writeQueue.
       // Wait for that exact write to flush, not for the model turn, before
@@ -1340,15 +1354,60 @@ export class KimiSdkProvider implements TransportProvider {
       }),
     ) as ReadableStream<Uint8Array>;
     const rawStream = ndJsonStream(writable, readable);
+    type PendingPromptSettlement = { state: KimiSdkSessionState; settlement: Promise<void> };
+    const pendingPromptWrites = new Map<string, PendingPromptSettlement[]>();
+    const inFlightPromptSettlements = new Map<string | number, PendingPromptSettlement>();
+    const rawWriter = rawStream.writable.getWriter();
+    const interceptedWritable = new WritableStream({
+      write: (message) => {
+        if (
+          message
+          && typeof message === 'object'
+          && 'id' in message
+          && message.id !== undefined
+          && message.id !== null
+          && (message as { method?: unknown }).method === 'session/prompt'
+        ) {
+          const sid = (message as { params?: { sessionId?: unknown } }).params?.sessionId;
+          if (typeof sid === 'string') {
+            const q = pendingPromptWrites.get(sid);
+            const entry = q?.shift();
+            if (q && q.length === 0) pendingPromptWrites.delete(sid);
+            if (entry) inFlightPromptSettlements.set(message.id as string | number, entry);
+          }
+        }
+        return rawWriter.write(message);
+      },
+      close: () => rawWriter.close(),
+      abort: (reason) => rawWriter.abort(reason),
+    }) as typeof rawStream.writable;
+
     // `@agentclientprotocol/sdk` validates `session/update` against a strict
     // Zod union that rejects non-standard `sessionUpdate` types (`turn_completed`,
     // runtime subagent events) and strips `usage_update.tokens`. Route
     // `session/update` notifications through `extNotification` so custom ACP
     // update payloads reach `handleSessionUpdate` intact.
     const stream = {
-      writable: rawStream.writable,
+      writable: interceptedWritable,
       readable: rawStream.readable.pipeThrough(new TransformStream({
         transform(message, controller) {
+          // Record prompt response arrival BEFORE downstream notifications enter
+          // `ClientSideConnection.receive()`, because `receive()` dispatches
+          // notifications synchronously without awaiting `async prompt()`.
+          if (
+            message
+            && typeof message === 'object'
+            && 'id' in message
+            && message.id !== undefined
+            && message.id !== null
+            && !('method' in message)
+          ) {
+            const settledEntry = inFlightPromptSettlements.get(message.id as string | number);
+            if (settledEntry) {
+              inFlightPromptSettlements.delete(message.id as string | number);
+              (settledEntry.state.arrivedPromptSettlements ??= new Set()).add(settledEntry.settlement);
+            }
+          }
           if (message && typeof message === 'object' && !('id' in message) && (message as { method?: unknown }).method === 'session/update') {
             controller.enqueue({ ...(message as Record<string, unknown>), method: '_imcodes/session/update' });
             return;
@@ -1362,6 +1421,7 @@ export class KimiSdkProvider implements TransportProvider {
     // can use to call RPC methods; we return a Client impl that handles
     // reverse RPC (requestPermission + session notifications).
     this.connection = new ClientSideConnection(() => this.createClientImpl(child), stream);
+    this.promptWriteQueues.set(this.connection, pendingPromptWrites);
 
     // Kick off initialize once; all subsequent calls await the same promise.
     this.initPromise = (async () => {
@@ -1445,7 +1505,7 @@ export class KimiSdkProvider implements TransportProvider {
         return { outcome: { outcome: 'cancelled' } };
       },
       sessionUpdate: async (params: SessionNotification): Promise<void> => {
-        if (!child || this.child === child) this.handleSessionUpdate(params);
+        if (!child || this.child === child) this.enqueueSessionUpdate(params);
       },
       extNotification: async (method: string, _params: Record<string, unknown>): Promise<void> => {
         if (method === '_x.ai/models/update' && _params && typeof _params === 'object') {
@@ -1453,7 +1513,7 @@ export class KimiSdkProvider implements TransportProvider {
           return;
         }
         if ((method === '_x.ai/session/update' || method === '_imcodes/session/update') && _params && typeof _params === 'object') {
-          if (!child || this.child === child) this.handleSessionUpdate(_params as unknown as SessionNotification);
+          if (!child || this.child === child) this.enqueueSessionUpdate(_params as unknown as SessionNotification);
           return;
         }
         // Grok publishes MCP catalog refreshes through an xAI extension. The
@@ -1531,13 +1591,20 @@ export class KimiSdkProvider implements TransportProvider {
         messageId: randomUUID(),
       });
       this.promptTerminals.set(state, turn);
-      void turn.then((result: PromptResponse) => {
-        if (this.profile.steeringPrompts && !state.activePromptGenerations?.has(generation)) return;
-        return this.settleOwnedAcpPrompt(sessionId,state,generation,result,
-          includeSessionSystemText ? sessionContractKey : undefined,compactControl);
-      }).catch((err: unknown) => {
-        this.failTurn(sessionId, state, generation, err);
-      });
+      this.trackPromptSettlement(
+        connection,
+        state.acpSessionId!,
+        state,
+        turn,
+        (result: PromptResponse) => {
+          if (this.profile.steeringPrompts && !state.activePromptGenerations?.has(generation)) return;
+          return this.settleOwnedAcpPrompt(sessionId, state, generation, result,
+            includeSessionSystemText ? sessionContractKey : undefined, compactControl);
+        },
+        (err: unknown) => {
+          this.failTurn(sessionId, state, generation, err);
+        },
+      );
       if (!await this.waitForAcpWrite(connection, true)) {
         if (!this.profile.steeringPrompts) state.activePromptGenerations?.delete(generation);
         throw this.makeError(
@@ -1705,6 +1772,7 @@ export class KimiSdkProvider implements TransportProvider {
               cwd: state.cwd,
               mcpServers: this.mcpServersForState(state),
             });
+            if (state.sessionUpdateQueue) await state.sessionUpdateQueue;
           } finally {
             state.replaying = false;
           }
@@ -2085,6 +2153,65 @@ export class KimiSdkProvider implements TransportProvider {
   }
 
   // ── sessionUpdate dispatch ──────────────────────────────────────────────
+
+  private trackPromptSettlement(
+    connection: ClientSideConnection,
+    acpSessionId: string | undefined,
+    state: KimiSdkSessionState,
+    turn: Promise<PromptResponse>,
+    onFulfilled: (result: PromptResponse) => Promise<void> | void,
+    onRejected: (err: unknown) => void,
+  ): void {
+    const pendingWrites = this.promptWriteQueues.get(connection);
+    let settlement!: Promise<void>;
+    const entry: { state: KimiSdkSessionState; settlement: Promise<void> } = {
+      state,
+      settlement: Promise.resolve(),
+    };
+    settlement = turn
+      .then(onFulfilled)
+      .catch(onRejected)
+      .finally(() => {
+        state.arrivedPromptSettlements?.delete(settlement);
+        const q = acpSessionId ? pendingWrites?.get(acpSessionId) : undefined;
+        if (q) {
+          const idx = q.indexOf(entry);
+          if (idx >= 0) q.splice(idx, 1);
+          if (q.length === 0 && acpSessionId) pendingWrites?.delete(acpSessionId);
+        }
+      });
+    entry.settlement = settlement;
+    if (pendingWrites && acpSessionId) {
+      let q = pendingWrites.get(acpSessionId);
+      if (!q) {
+        q = [];
+        pendingWrites.set(acpSessionId, q);
+      }
+      q.push(entry);
+    }
+  }
+
+  private enqueueSessionUpdate(params: SessionNotification): void {
+    if (!params || typeof params !== 'object' || typeof params.sessionId !== 'string' || !params.update || typeof params.update !== 'object') return;
+    const routeId = this.acpToRoute.get(params.sessionId);
+    if (!routeId) return;
+    const state = this.sessions.get(routeId);
+    if (!state || state.acpSessionId !== params.sessionId) return;
+    if ((state.arrivedPromptSettlements?.size ?? 0) === 0 && !state.sessionUpdateQueue) {
+      this.handleSessionUpdate(params);
+      return;
+    }
+    const prev = state.sessionUpdateQueue ?? Promise.resolve();
+    const next = prev.then(async () => {
+      while ((state.arrivedPromptSettlements?.size ?? 0) > 0) {
+        await Promise.allSettled([...state.arrivedPromptSettlements!]);
+      }
+      this.handleSessionUpdate(params);
+    }).finally(() => {
+      if (state.sessionUpdateQueue === next) state.sessionUpdateQueue = undefined;
+    });
+    state.sessionUpdateQueue = next;
+  }
 
   private handleSessionUpdate(params: SessionNotification): void {
     if (!params || typeof params !== 'object' || typeof params.sessionId !== 'string' || !params.update || typeof params.update !== 'object') return;

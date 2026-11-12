@@ -802,23 +802,10 @@ describe('sdk transport flow e2e', () => {
       ccPreset: 'MiniMax',
     });
 
-    const serverLink = { send: vi.fn() } as any;
-    handleWebCommand({
-      type: 'session.restart',
-      sessionName: 'deck_settings_preset_brain',
-      agentType: 'claude-code-sdk',
-    }, serverLink);
-    await flushAsync();
-    await waitForCondition(() => serverLink.send.mock.calls.some((call) => call[0]?.type === 'session_list'));
-
-    const switched = mocks.store.get('deck_settings_preset_brain');
-    expect(switched?.agentType).toBe('claude-code-sdk');
-    expect(switched?.ccPreset).toBe('MiniMax');
-
-    // Seed the source timeline so this test exercises the real cross-vendor
-    // handoff builder. The resulting pack resolves asynchronously while the
-    // first target dispatch waits within providerWaitMs.
-    const readPreferred = vi.spyOn(timelineStore, 'readPreferred').mockResolvedValue([{
+    // Seed the source timeline BEFORE settings restart so relaunchSessionWithSettings
+    // and buildCrossVendorHandoffPack both see the prior conversation text. The resulting
+    // pack resolves asynchronously while the first target dispatch waits within providerWaitMs.
+    const priorTimeline = [{
       eventId: 'settings-prior-user',
       sessionId: 'deck_settings_preset_brain',
       ts: 10,
@@ -828,27 +815,46 @@ describe('sdk transport flow e2e', () => {
       confidence: 'high',
       type: 'user.message',
       payload: { text: 'prior conversation context' },
-    }] as any);
-    handleWebCommand({ type: 'session.send', session: 'deck_settings_preset_brain', text: 'hello', commandId: 'cmd-settings-preset' }, serverLink);
-    await flushAsync();
-    // Cross-vendor handoff tokenization is worker-backed. Wait for the actual
-    // provider dispatch instead of assuming one microtask flush is sufficient.
-    await waitForCondition(() => mocks.claudeCalls.length > 0, 5000);
+    }] as any;
+    const readPreferred = vi.spyOn(timelineStore, 'readPreferred').mockResolvedValue(priorTimeline);
+    const readCompletedTextTail = vi.spyOn(timelineStore, 'readCompletedTextTail').mockResolvedValue(priorTimeline);
+    try {
+      const serverLink = { send: vi.fn() } as any;
+      handleWebCommand({
+        type: 'session.restart',
+        sessionName: 'deck_settings_preset_brain',
+        agentType: 'claude-code-sdk',
+      }, serverLink);
+      await flushAsync();
+      await waitForCondition(() => serverLink.send.mock.calls.some((call) => call[0]?.type === 'session_list'));
 
-    const claudeCall = mocks.claudeCalls.at(-1);
-    expect(claudeCall?.options.env).toMatchObject({
-      ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
-      ANTHROPIC_API_KEY: expect.any(String),
-      ANTHROPIC_MODEL: 'MiniMax-M2.7',
-    });
-    expect(claudeCall?.options.model).toBe('MiniMax-M2.7');
-    expect(claudePresetAppend(claudeCall?.options)).toContain('Authoritative runtime model: MiniMax-M2.7.');
-    // This is one captured first post-switch provider call: preserve both the
-    // handoff context and the unchanged cc-preset routing contract together.
-    const serializedPrompt = JSON.stringify(claudeCall?.prompt);
-    expect(serializedPrompt).toContain('[claude-code handoff —');
-    expect(serializedPrompt).toContain('IM.codes cross-vendor handoff');
-    readPreferred.mockRestore();
+      const switched = mocks.store.get('deck_settings_preset_brain');
+      expect(switched?.agentType).toBe('claude-code-sdk');
+      expect(switched?.ccPreset).toBe('MiniMax');
+
+      handleWebCommand({ type: 'session.send', session: 'deck_settings_preset_brain', text: 'hello', commandId: `cmd-settings-preset-${Date.now()}` }, serverLink);
+      await flushAsync();
+      // Cross-vendor handoff tokenization is worker-backed. Wait for the actual
+      // provider dispatch instead of assuming one microtask flush is sufficient.
+      await waitForCondition(() => mocks.claudeCalls.length > 0, 5000);
+
+      const claudeCall = mocks.claudeCalls.at(-1);
+      expect(claudeCall?.options.env).toMatchObject({
+        ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+        ANTHROPIC_API_KEY: expect.any(String),
+        ANTHROPIC_MODEL: 'MiniMax-M2.7',
+      });
+      expect(claudeCall?.options.model).toBe('MiniMax-M2.7');
+      expect(claudePresetAppend(claudeCall?.options)).toContain('Authoritative runtime model: MiniMax-M2.7.');
+      // This is one captured first post-switch provider call: preserve both the
+      // handoff context and the unchanged cc-preset routing contract together.
+      const serializedPrompt = JSON.stringify(claudeCall?.prompt);
+      expect(serializedPrompt).toContain('[claude-code handoff —');
+      expect(serializedPrompt).toContain('IM.codes cross-vendor handoff');
+    } finally {
+      readPreferred.mockRestore();
+      readCompletedTextTail.mockRestore();
+    }
   });
 
   it('pushes a corrective session_list when settings restart fails', async () => {

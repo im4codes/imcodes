@@ -880,6 +880,9 @@ describe('AG native ACP', () => {
       await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
       await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true), { timeout: 5000 });
       expect(await provider.notifyActiveDelegation(id, notification('STEER_IN_AUTO'))).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+      await vi.waitFor(async () => expect((await requests()).some((r) =>
+        r.method === 'session/prompt' && JSON.stringify(r.params?.prompt ?? '').includes('STEER_IN_AUTO')
+      )).toBe(true), { timeout: 5000 });
     } finally {
       await unlink(autoHold).catch(() => {});
     }
@@ -1116,5 +1119,77 @@ describe('AG native ACP', () => {
     } finally {
       await runtime.kill();
     }
+  });
+
+  it('starts an autonomous turn when wakeup session/update frames arrive in the same stdout chunk right after prompt end_turn', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'imcodes-test-agy-same-tick-'));
+    const holdFile = path.join(root, 'auto.hold');
+    const script = path.join(root, 'same-tick-agy.mjs');
+    const binary = path.join(root, 'agy');
+    await writeFile(holdFile, 'hold');
+    await writeFile(script, `
+import { createInterface } from 'node:readline';
+import { existsSync } from 'node:fs';
+const holdFile = ${JSON.stringify(holdFile)};
+const rl = createInterface({ input: process.stdin });
+const send = (lines) => process.stdout.write(lines.map((l) => JSON.stringify(l)).join('\\n') + '\\n');
+rl.on('line', (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') {
+    send([{ jsonrpc: '2.0', id: msg.id, result: {
+      protocolVersion: 1,
+      agentInfo: { name: ${JSON.stringify(AGY_ACP_AGENT_NAME)}, version: '2.0.0' },
+      agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {}, list: {} } },
+    } }]);
+    return;
+  }
+  if (msg.method === 'session/new') {
+    send([{ jsonrpc: '2.0', id: msg.id, result: {
+      sessionId: 'native-same-tick',
+      models: { currentModelId: 'model-a', availableModels: [{ modelId: 'model-a', name: 'Model A' }] },
+    } }]);
+    return;
+  }
+  if (msg.method === 'session/prompt') {
+    send([
+      { jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'native-same-tick', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'INITIAL_OK' } } } },
+      { jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } },
+      { jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'native-same-tick', update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: '' } } } },
+      { jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'native-same-tick', update: { sessionUpdate: 'tool_call', toolCallId: 'edit-same-tick', title: 'Edit', kind: 'edit', status: 'running' } } },
+    ]);
+    const poll = setInterval(() => {
+      if (existsSync(holdFile)) return;
+      clearInterval(poll);
+      send([
+        { jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'native-same-tick', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'AUTO_SAME_TICK_DONE' } } } },
+        { jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'native-same-tick', update: { sessionUpdate: 'turn_completed' } } },
+      ]);
+    }, 5);
+  }
+});
+`);
+    await writeFile(binary, `#!/bin/sh\nexec '${process.execPath}' '${script}' "$@"\n`, { mode: 0o700 });
+    const provider = new AgyAcpProvider();
+    resources.push({ provider, root });
+    await provider.connect({ binaryPath: binary, env: { HOME: root, AGY_ACP_FIXTURE_AGENT_NAME: AGY_ACP_AGENT_NAME } });
+    const id = await route(provider, 'deck_test_same_tick');
+    const complete = vi.fn();
+    const errors = vi.fn();
+    provider.onComplete(complete);
+    provider.onError(errors);
+
+    try {
+      await provider.send(id, 'hello');
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+      await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(true), { timeout: 5000 });
+      expect(complete.mock.calls[0]?.[1].content).toBe('INITIAL_OK');
+    } finally {
+      await unlink(holdFile).catch(() => {});
+    }
+
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(complete.mock.calls[1]?.[1].content).toBe('AUTO_SAME_TICK_DONE');
+    expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
+    expect(errors).not.toHaveBeenCalled();
   });
 });
