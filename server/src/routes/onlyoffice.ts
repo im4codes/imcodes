@@ -329,12 +329,37 @@ export async function resolveOnlyOfficeDocumentKey(
     if (options?.db) {
       journalEntry = await getOnlyOfficeCommitJournalRecord(options.db, serverId, normalizedPath);
     }
-    const isPendingRoomWrite =
-      (pendingMemoryHash && currentHash === pendingMemoryHash) ||
-      (journalEntry && journalEntry.room_key === existing?.activeKey && journalEntry.target_hash === currentHash);
+    const now = Date.now();
+    const leaseMs = 30000;
+    const isJournalLive = Boolean(
+      journalEntry &&
+      journalEntry.owner_token &&
+      (now - Number(journalEntry.updated_at) <= leaseMs)
+    );
 
     if (existing) {
-      if (isPendingRoomWrite) {
+      // 1. In-flight write by an active unexpired owner:
+      // The file on disk was renamed/written by a live writer awaiting ACK/commit.
+      // Readers MUST NOT mutate the room in DB and MUST NOT delete or unlock the live claim!
+      if (
+        isJournalLive &&
+        journalEntry &&
+        journalEntry.room_key === existing.activeKey &&
+        journalEntry.target_hash === currentHash
+      ) {
+        return existing.activeKey;
+      }
+
+      // 2. Crash recovery: writer died/expired (>30s) after disk write, before commit
+      const isExpiredCrashRecovery = Boolean(
+        journalEntry &&
+        !isJournalLive &&
+        journalEntry.room_key === existing.activeKey &&
+        journalEntry.target_hash === currentHash
+      );
+      const isPendingMemoryRecovery = Boolean(pendingMemoryHash && currentHash === pendingMemoryHash);
+
+      if (isExpiredCrashRecovery || isPendingMemoryRecovery) {
         if (getAuthoritativeHash(existing) !== currentHash || existing.active === false) {
           existing.currentConfirmedHash = currentHash;
           existing.lastForceSavedHash = currentHash;
@@ -344,7 +369,7 @@ export async function resolveOnlyOfficeDocumentKey(
           documentVersionStateMap.set(mapKey, existing);
           if (options?.db) {
             await savePersistentRoomToDb(options.db, serverId, normalizedPath, existing);
-            await clearOnlyOfficeCommitJournalRecord(options.db, serverId, normalizedPath);
+            await releaseOnlyOfficeCommitClaim(options.db, serverId, normalizedPath);
           }
         }
         return existing.activeKey;
@@ -363,7 +388,7 @@ export async function resolveOnlyOfficeDocumentKey(
         return existing.activeKey;
       }
 
-      // File content changed externally on the daemon -> advance to new version key
+      // 3. File content changed externally on the daemon -> advance to new version key
       const nextEpoch = existing.sessionEpoch + 1;
       const nextSeq = existing.commitSeq + 1;
       const activeKey = computeDocumentKeyFromDigest(serverId, normalizedPath, currentHash, nextEpoch);
@@ -380,7 +405,7 @@ export async function resolveOnlyOfficeDocumentKey(
       documentVersionStateMap.set(mapKey, newState);
       if (options?.db) {
         await savePersistentRoomToDb(options.db, serverId, normalizedPath, newState);
-        await clearOnlyOfficeCommitJournalRecord(options.db, serverId, normalizedPath);
+        await releaseOnlyOfficeCommitClaim(options.db, serverId, normalizedPath);
       }
       return activeKey;
     }

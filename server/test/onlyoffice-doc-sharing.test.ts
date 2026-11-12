@@ -18,6 +18,8 @@ import {
   clearVerifiedExternalSharePinsForTests,
   isPathWithinSharedFolder,
   normalizeDocumentSharePath,
+  claimOnlyOfficeCommitOwner,
+  commitOnlyOfficeRoom,
   type OnlyOfficeRoomRow,
   type OnlyOfficeCommitJournalRow,
 } from '../src/db/document-sharing.js';
@@ -642,6 +644,7 @@ function createInMemoryDb() {
           updatedAt,
           expectedSeq,
           expectedEpoch,
+          ownerToken,
         ] = params as [
           string,
           string,
@@ -655,12 +658,21 @@ function createInMemoryDb() {
           number,
           number,
           number,
+          string | undefined,
         ];
         const key = `${serverId}:${normalizedPath}`;
         const existing = rooms.get(key);
         if (existing) {
           if (existing.commit_seq !== Number(expectedSeq) || existing.session_epoch !== Number(expectedEpoch)) {
             return { changes: 0 };
+          }
+          if (ownerToken) {
+            const jRow = commitJournals.get(key);
+            if (!jRow) return { changes: 0 };
+            const jOwner = jRow.owner_token || (jRow.phase?.startsWith('intent:') ? jRow.phase.slice(7) : '');
+            if (jOwner !== ownerToken && !jRow.phase.includes(ownerToken)) {
+              return { changes: 0 };
+            }
           }
           const row: OnlyOfficeRoomRow = {
             server_id: serverId,
@@ -716,15 +728,24 @@ function createInMemoryDb() {
       }
 
       if (normSql.startsWith('DELETE FROM onlyoffice_commit_journal WHERE server_id = $1 AND normalized_path = $2')) {
-        const [serverId, normalizedPath, ownerToken] = params as [string, string, string | undefined];
+        const [serverId, normalizedPath, ownerTokenOrExpiry] = params as [string, string, string | number | undefined];
         const key = `${serverId}:${normalizedPath}`;
         const existing = commitJournals.get(key);
         if (existing) {
-          if (ownerToken) {
+          if (typeof ownerTokenOrExpiry === 'string' && ownerTokenOrExpiry) {
             const jOwner = existing.owner_token || (existing.phase?.startsWith('intent:') ? existing.phase.slice(7) : '');
-            if (jOwner && jOwner !== ownerToken && !existing.phase.includes(ownerToken)) {
+            if (jOwner && jOwner !== ownerTokenOrExpiry && !existing.phase.includes(ownerTokenOrExpiry)) {
               return { changes: 0 };
             }
+            commitJournals.delete(key);
+            return { changes: 1 };
+          }
+          // No owner token passed: only delete if expired or ownerless
+          const cutoff = typeof ownerTokenOrExpiry === 'number' ? ownerTokenOrExpiry : Date.now() - 30000;
+          const isExpired = Number(existing.updated_at) <= cutoff;
+          const hasOwner = Boolean(existing.owner_token || (existing.phase?.startsWith('intent:') && existing.phase.length > 7));
+          if (hasOwner && !isExpired) {
+            return { changes: 0 };
           }
           commitJournals.delete(key);
           return { changes: 1 };
@@ -736,6 +757,7 @@ function createInMemoryDb() {
     },
     exec: async () => undefined,
     close: async () => undefined,
+    transaction: async (fn: (tx: Database) => Promise<any>) => fn(db),
   } as unknown as Database;
 
   return {
@@ -2295,6 +2317,83 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
     expect(injected).toBeGreaterThan(0);
     expect.soft(out.status, 'old expected-version callback must not retain write permission after another PG writer wins').toBe(409);
     expect.soft(Buffer.from(virtualFiles.get('/team/shared/spec.docx')!.content, 'base64').toString(), 'a last SELECT without an owner cannot allow older callback bytes to overwrite the winner').toBe(newer);
+  });
+
+  it('audit-r13: config during an owner-written but unacknowledged save must not release the live claim to another writer', async () => {
+    const get = () => app.request('/api/server/srv-1/onlyoffice/config?path=%2Fteam%2Fshared%2Fspec.docx&mode=edit', { headers: { Authorization: bearer('owner-1') } });
+    const res = await get();
+    expect(res.status).toBe(200);
+    const cfg = (await res.json()) as any;
+    const mapKey = 'srv-1:/team/shared/spec.docx';
+    const row = { ...store.rooms.get(mapKey)! };
+    let transactions = 0;
+    (store.db as any).transaction = async (fn: any) => {
+      transactions++;
+      return fn(store.db);
+    };
+    const bytes = 'owner-a-new-bytes-written-before-ack';
+    const base = {
+      serverId: 'srv-1',
+      normalizedPath: '/team/shared/spec.docx',
+      expectedKey: cfg.config.document.key,
+      expectedEpoch: row.session_epoch,
+      expectedSeq: row.commit_seq,
+    };
+    const claimed = await claimOnlyOfficeCommitOwner(store.db, {
+      ...base,
+      targetHash: sha256Hex(bytes),
+      ownerToken: 'claim_owner_a',
+    });
+    expect(claimed.ok).toBe(true);
+    expect(transactions).toBeGreaterThan(0);
+    // Exact intermediate state after the owner's atomic file rename, before its ACK / PG final commit.
+    virtualFiles.set('/team/shared/spec.docx', { content: Buffer.from(bytes).toString('base64'), encoding: 'base64', mtime: Date.now() });
+    const config = await get();
+    expect(config.status).toBe(200);
+    expect.soft(store.commitJournals.get(mapKey)?.owner_token, 'a reader must not delete an unexpired live owner while the write awaits acknowledgment').toBe('claim_owner_a');
+    const second = await claimOnlyOfficeCommitOwner(store.db, {
+      ...base,
+      targetHash: sha256Hex('competing-writer'),
+      ownerToken: 'claim_owner_b',
+    });
+    expect.soft(second.ok, 'second writer must be denied while the first owner is active').toBe(false);
+  });
+
+  it('audit-r13: room commit must reject a different owner even when expected epoch and sequence match', async () => {
+    const res = await app.request('/api/server/srv-1/onlyoffice/config?path=%2Fteam%2Fshared%2Fspec.docx&mode=edit', { headers: { Authorization: bearer('owner-1') } });
+    expect(res.status).toBe(200);
+    const cfg = (await res.json()) as any;
+    const mapKey = 'srv-1:/team/shared/spec.docx';
+    const row = { ...store.rooms.get(mapKey)! };
+    (store.db as any).transaction = async (fn: any) => fn(store.db);
+    const base = {
+      serverId: 'srv-1',
+      normalizedPath: '/team/shared/spec.docx',
+      expectedKey: cfg.config.document.key,
+      expectedEpoch: row.session_epoch,
+      expectedSeq: row.commit_seq,
+    };
+    expect((await claimOnlyOfficeCommitOwner(store.db, { ...base, targetHash: sha256Hex('legitimate-owner-content'), ownerToken: 'claim_legitimate_owner' })).ok).toBe(true);
+    const out = await commitOnlyOfficeRoom(store.db, {
+      serverId: base.serverId,
+      normalizedPath: base.normalizedPath,
+      ownerToken: 'claim_lost_or_wrong_owner',
+      expectedSeq: row.commit_seq,
+      expectedEpoch: row.session_epoch,
+      newState: {
+        currentConfirmedHash: sha256Hex('stale-owner-content'),
+        committedHash: sha256Hex('stale-owner-content'),
+        lastForceSavedHash: sha256Hex('stale-owner-content'),
+        activeKey: row.active_key,
+        sessionEpoch: row.session_epoch,
+        commitSeq: row.commit_seq + 1,
+        active: true,
+        updatedAt: Date.now(),
+      },
+    });
+    expect.soft(out.ok, 'ownerToken must guard the UPDATE itself, not merely qualify the later journal DELETE').toBe(false);
+    expect.soft(store.rooms.get(mapKey)!.commit_seq, 'wrong owner must not publish a new authoritative sequence').toBe(row.commit_seq);
+    expect.soft(store.commitJournals.get(mapKey)?.owner_token).toBe('claim_legitimate_owner');
   });
 });
 

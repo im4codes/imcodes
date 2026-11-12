@@ -1276,119 +1276,81 @@ export async function claimOnlyOfficeCommitOwner(
   const now = params.now ?? Date.now();
   const leaseMs = params.leaseMs ?? 30000;
 
+  const executeClaim = async (tx: Database) => {
+    const room = await tx.queryOne<OnlyOfficeRoomRow>(
+      `SELECT * FROM onlyoffice_rooms WHERE server_id = $1 AND normalized_path = $2 FOR UPDATE`,
+      [params.serverId, params.normalizedPath],
+    );
+    if (room) {
+      if (
+        Number(room.session_epoch) !== params.expectedEpoch ||
+        Number(room.commit_seq) !== params.expectedSeq ||
+        room.active_key !== params.expectedKey
+      ) {
+        return { ok: false, reason: 'stale_version' as const };
+      }
+    }
+
+    const journal = await tx.queryOne<OnlyOfficeCommitJournalRow>(
+      `SELECT * FROM onlyoffice_commit_journal WHERE server_id = $1 AND normalized_path = $2 FOR UPDATE`,
+      [params.serverId, params.normalizedPath],
+    );
+    if (journal) {
+      const jOwner = journal.owner_token || (journal.phase?.startsWith('intent:') ? journal.phase.slice(7) : '');
+      const isExpired = now - Number(journal.updated_at) > leaseMs;
+      if (jOwner && jOwner !== params.ownerToken && !isExpired) {
+        return { ok: false, reason: 'held_by_other_owner' as const };
+      }
+    }
+
+    await tx.execute(
+      `INSERT INTO onlyoffice_commit_journal (
+         server_id, normalized_path, room_key, target_hash, session_epoch, phase, owner_token, expected_seq, updated_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       ON CONFLICT (server_id, normalized_path) DO UPDATE SET
+         room_key = EXCLUDED.room_key,
+         target_hash = EXCLUDED.target_hash,
+         session_epoch = EXCLUDED.session_epoch,
+         phase = EXCLUDED.phase,
+         owner_token = EXCLUDED.owner_token,
+         expected_seq = EXCLUDED.expected_seq,
+         updated_at = EXCLUDED.updated_at`,
+      [
+        params.serverId,
+        params.normalizedPath,
+        params.expectedKey,
+        params.targetHash,
+        params.expectedEpoch,
+        `intent:${params.ownerToken}`,
+        params.ownerToken,
+        params.expectedSeq,
+        now,
+      ],
+    );
+
+    // Verify room didn't advance and exclusive journal claim was acquired
+    const verifyRoom = await tx.queryOne<OnlyOfficeRoomRow>(
+      `SELECT * FROM onlyoffice_rooms WHERE server_id = $1 AND normalized_path = $2 FOR UPDATE`,
+      [params.serverId, params.normalizedPath],
+    );
+    if (verifyRoom) {
+      if (
+        Number(verifyRoom.commit_seq) !== params.expectedSeq ||
+        Number(verifyRoom.session_epoch) !== params.expectedEpoch ||
+        verifyRoom.active_key !== params.expectedKey
+      ) {
+        await releaseOnlyOfficeCommitClaim(tx, params.serverId, params.normalizedPath, params.ownerToken);
+        return { ok: false, reason: 'stale_version' as const };
+      }
+    }
+
+    return { ok: true as const };
+  };
+
   if (typeof (db as any).transaction === 'function') {
-    return await (db as any).transaction(async (tx: Database) => {
-      const room = await tx.queryOne<OnlyOfficeRoomRow>(
-        `SELECT * FROM onlyoffice_rooms WHERE server_id = $1 AND normalized_path = $2 FOR UPDATE`,
-        [params.serverId, params.normalizedPath],
-      );
-      if (room) {
-        if (
-          Number(room.session_epoch) !== params.expectedEpoch ||
-          Number(room.commit_seq) !== params.expectedSeq ||
-          room.active_key !== params.expectedKey
-        ) {
-          return { ok: false, reason: 'stale_version' };
-        }
-      }
-
-      const journal = await tx.queryOne<OnlyOfficeCommitJournalRow>(
-        `SELECT * FROM onlyoffice_commit_journal WHERE server_id = $1 AND normalized_path = $2 FOR UPDATE`,
-        [params.serverId, params.normalizedPath],
-      );
-      if (journal) {
-        const jOwner = journal.owner_token || (journal.phase?.startsWith('intent:') ? journal.phase.slice(7) : '');
-        const isExpired = now - Number(journal.updated_at) > leaseMs;
-        if (jOwner && jOwner !== params.ownerToken && !isExpired) {
-          return { ok: false, reason: 'held_by_other_owner' };
-        }
-      }
-
-      await tx.execute(
-        `INSERT INTO onlyoffice_commit_journal (
-           server_id, normalized_path, room_key, target_hash, session_epoch, phase, owner_token, expected_seq, updated_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-         ON CONFLICT (server_id, normalized_path) DO UPDATE SET
-           room_key = EXCLUDED.room_key,
-           target_hash = EXCLUDED.target_hash,
-           session_epoch = EXCLUDED.session_epoch,
-           phase = EXCLUDED.phase,
-           owner_token = EXCLUDED.owner_token,
-           expected_seq = EXCLUDED.expected_seq,
-           updated_at = EXCLUDED.updated_at`,
-        [
-          params.serverId,
-          params.normalizedPath,
-          params.expectedKey,
-          params.targetHash,
-          params.expectedEpoch,
-          `intent:${params.ownerToken}`,
-          params.ownerToken,
-          params.expectedSeq,
-          now,
-        ],
-      );
-      return { ok: true };
-    });
+    return await (db as any).transaction(executeClaim);
   }
-
-  // Fallback for non-transactional database mocks
-  const room = await getOnlyOfficeRoomRecord(db, params.serverId, params.normalizedPath);
-  if (room) {
-    if (
-      Number(room.session_epoch) !== params.expectedEpoch ||
-      Number(room.commit_seq) !== params.expectedSeq ||
-      room.active_key !== params.expectedKey
-    ) {
-      return { ok: false, reason: 'stale_version' };
-    }
-  }
-
-  const journal = await getOnlyOfficeCommitJournalRecord(db, params.serverId, params.normalizedPath);
-  if (journal) {
-    const jOwner = journal.owner_token || (journal.phase?.startsWith('intent:') ? journal.phase.slice(7) : '');
-    const isExpired = now - Number(journal.updated_at) > leaseMs;
-    if (jOwner && jOwner !== params.ownerToken && !isExpired) {
-      return { ok: false, reason: 'held_by_other_owner' };
-    }
-  }
-
-  await recordOnlyOfficeCommitJournalRecord(db, {
-    server_id: params.serverId,
-    normalized_path: params.normalizedPath,
-    room_key: params.expectedKey,
-    target_hash: params.targetHash,
-    session_epoch: params.expectedEpoch,
-    phase: `intent:${params.ownerToken}`,
-    owner_token: params.ownerToken,
-    expected_seq: params.expectedSeq,
-    updated_at: now,
-  });
-
-  // Verify room didn't advance and exclusive journal claim was acquired
-  const verifyRoom = await getOnlyOfficeRoomRecord(db, params.serverId, params.normalizedPath);
-  if (verifyRoom) {
-    if (
-      Number(verifyRoom.commit_seq) !== params.expectedSeq ||
-      Number(verifyRoom.session_epoch) !== params.expectedEpoch ||
-      verifyRoom.active_key !== params.expectedKey
-    ) {
-      await releaseOnlyOfficeCommitClaim(db, params.serverId, params.normalizedPath, params.ownerToken);
-      return { ok: false, reason: 'stale_version' };
-    }
-  }
-
-  const verifyJournal = await getOnlyOfficeCommitJournalRecord(db, params.serverId, params.normalizedPath);
-  if (
-    !verifyJournal ||
-    (verifyJournal.owner_token && verifyJournal.owner_token !== params.ownerToken) ||
-    (verifyJournal.phase && !verifyJournal.phase.includes(params.ownerToken) && verifyJournal.phase !== 'intent')
-  ) {
-    await releaseOnlyOfficeCommitClaim(db, params.serverId, params.normalizedPath, params.ownerToken);
-    return { ok: false, reason: 'held_by_other_owner' };
-  }
-
-  return { ok: true };
+  return await executeClaim(db);
 }
 
 export async function commitOnlyOfficeRoom(
@@ -1412,11 +1374,44 @@ export async function commitOnlyOfficeRoom(
   },
 ): Promise<{ ok: boolean; changes: number }> {
   const executeCommit = async (tx: Database) => {
+    // 1. Lock and verify that the current active journal claim belongs to this owner
+    const journal = await tx.queryOne<OnlyOfficeCommitJournalRow>(
+      `SELECT * FROM onlyoffice_commit_journal WHERE server_id = $1 AND normalized_path = $2 FOR UPDATE`,
+      [params.serverId, params.normalizedPath],
+    );
+    if (!journal) {
+      return { ok: false, changes: 0 };
+    }
+    const jOwner = journal.owner_token || (journal.phase?.startsWith('intent:') ? journal.phase.slice(7) : '');
+    if (!params.ownerToken || jOwner !== params.ownerToken) {
+      return { ok: false, changes: 0 };
+    }
+    if (
+      Number(journal.expected_seq) !== params.expectedSeq ||
+      Number(journal.session_epoch) !== params.expectedEpoch
+    ) {
+      return { ok: false, changes: 0 };
+    }
+
+    // 2. Lock and verify room
+    const room = await tx.queryOne<OnlyOfficeRoomRow>(
+      `SELECT * FROM onlyoffice_rooms WHERE server_id = $1 AND normalized_path = $2 FOR UPDATE`,
+      [params.serverId, params.normalizedPath],
+    );
+    if (room) {
+      if (
+        Number(room.commit_seq) !== params.expectedSeq ||
+        Number(room.session_epoch) !== params.expectedEpoch
+      ) {
+        return { ok: false, changes: 0 };
+      }
+    }
+
     const confirmedHash = params.newState.currentConfirmedHash ?? '';
     const committedHash = params.newState.committedHash ?? '';
     const isActive = params.newState.active !== false;
 
-    // 1. Conditional update on onlyoffice_rooms: require exact expected commit_seq
+    // 3. Conditional update on onlyoffice_rooms guarded by expectedSeq, expectedEpoch and ownerToken
     const updateRes = await tx.execute(
       `UPDATE onlyoffice_rooms SET
          current_confirmed_hash = $3,
@@ -1428,7 +1423,11 @@ export async function commitOnlyOfficeRoom(
          active = $9,
          updated_at = $10
        WHERE server_id = $1 AND normalized_path = $2
-         AND commit_seq = $11 AND session_epoch = $12`,
+         AND commit_seq = $11 AND session_epoch = $12
+         AND EXISTS (
+           SELECT 1 FROM onlyoffice_commit_journal
+           WHERE server_id = $1 AND normalized_path = $2 AND (owner_token = $13 OR phase = $14)
+         )`,
       [
         params.serverId,
         params.normalizedPath,
@@ -1442,13 +1441,13 @@ export async function commitOnlyOfficeRoom(
         params.newState.updatedAt,
         params.expectedSeq,
         params.expectedEpoch,
+        params.ownerToken,
+        `intent:${params.ownerToken}`,
       ],
     );
 
     if (updateRes.changes === 0) {
-      // Room row did not exist or commit_seq diverged (concurrent commit occurred)
-      const existing = await getOnlyOfficeRoomRecord(tx, params.serverId, params.normalizedPath);
-      if (!existing) {
+      if (!room) {
         // First room creation insert if absent
         const insRes = await tx.execute(
           `INSERT INTO onlyoffice_rooms (
@@ -1477,7 +1476,7 @@ export async function commitOnlyOfficeRoom(
       }
     }
 
-    // 2. Delete journal record only for this owner
+    // 4. Delete journal record only for this owner
     await releaseOnlyOfficeCommitClaim(tx, params.serverId, params.normalizedPath, params.ownerToken);
 
     return { ok: true, changes: 1 };
@@ -1503,9 +1502,13 @@ export async function releaseOnlyOfficeCommitClaim(
       [serverId, normalizedPath, ownerToken, `intent:${ownerToken}`, `%${ownerToken}%`],
     );
   } else {
+    // Without an ownerToken, only expired (lease > 30s) or ownerless journal records may be cleared
+    const expiryCutoff = Date.now() - 30000;
     await db.execute(
-      `DELETE FROM onlyoffice_commit_journal WHERE server_id = $1 AND normalized_path = $2`,
-      [serverId, normalizedPath],
+      `DELETE FROM onlyoffice_commit_journal
+       WHERE server_id = $1 AND normalized_path = $2
+         AND (updated_at <= $3 OR owner_token = '' OR owner_token IS NULL)`,
+      [serverId, normalizedPath, expiryCutoff],
     );
   }
 }
