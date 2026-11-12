@@ -876,7 +876,7 @@ describe('ChatView compact tool activity', () => {
       expect(peek.style.bottom).toBe('');
     });
 
-    it('protects against short viewports with maxHeight clamp', () => {
+    it('protects against short viewports with maxHeight clamp (positive control 350px)', () => {
       stubHover(true);
       const call = makeEvent('short-call', 'tool.call', { tool: 'Bash', input: { command: 'test-short' } }, 1);
       const result = makeEvent('short-result', 'tool.result', { output: 'short viewport' }, 2);
@@ -899,6 +899,81 @@ describe('ChatView compact tool activity', () => {
       expect(peek.style.maxHeight).toBe('204px');
       // bottom = 350 - 220 + 8 = 138px
       expect(peek.style.bottom).toBe('138px');
+    });
+
+    it('clamps maxHeight strictly to availableSpace below (< 140px) preventing bottom overflow', () => {
+      stubHover(true);
+      const call = makeEvent('sub140-below-call', 'tool.call', { tool: 'Bash', input: { command: 'test-sub140-below' } }, 1);
+      const result = makeEvent('sub140-below-result', 'tool.result', { output: 'sub140' }, 2);
+
+      const { container } = render(<ChatView events={[call, result]} loading={false} />);
+      const chip = container.querySelector('.chat-tool-activity') as HTMLElement;
+
+      // Viewport: 320x240, anchor.top = 100, anchor.bottom = 130
+      // spaceAbove = 100 < 280, spaceBelow = 110 > spaceAbove -> placeBelow = true
+      // availableBelow = 240 - 130 - 16 = 94px (< 140px!)
+      window.innerHeight = 240;
+      window.innerWidth = 320;
+      chip.getBoundingClientRect = () => ({
+        top: 100, bottom: 130, left: 10, right: 150, width: 140, height: 30, x: 10, y: 100,
+        toJSON: () => ({}),
+      }) as DOMRect;
+
+      fireEvent.mouseEnter(chip);
+      const peek = document.querySelector('.chat-tool-peek') as HTMLElement;
+      expect(peek).not.toBeNull();
+      // maxHeight must be strictly 94px, NOT forced to 140px
+      expect(peek.style.maxHeight).toBe('94px');
+      expect(peek.style.top).toBe('138px'); // 130 + 8
+      expect(peek.style.bottom).toBe('');
+    });
+
+    it('clamps maxHeight strictly to availableSpace above (< 140px) preventing top overflow', () => {
+      stubHover(true);
+      const call = makeEvent('sub140-above-call', 'tool.call', { tool: 'Bash', input: { command: 'test-sub140-above' } }, 1);
+      const result = makeEvent('sub140-above-result', 'tool.result', { output: 'sub140' }, 2);
+
+      const { container } = render(<ChatView events={[call, result]} loading={false} />);
+      const chip = container.querySelector('.chat-tool-activity') as HTMLElement;
+
+      // Viewport: 320x240, anchor.top = 110, anchor.bottom = 140
+      // spaceAbove = 110, spaceBelow = 100 -> placeBelow = false (stays above)
+      // availableAbove = 110 - 16 = 94px (< 140px!)
+      window.innerHeight = 240;
+      window.innerWidth = 320;
+      chip.getBoundingClientRect = () => ({
+        top: 110, bottom: 140, left: 10, right: 150, width: 140, height: 30, x: 10, y: 110,
+        toJSON: () => ({}),
+      }) as DOMRect;
+
+      fireEvent.mouseEnter(chip);
+      const peek = document.querySelector('.chat-tool-peek') as HTMLElement;
+      expect(peek).not.toBeNull();
+      // maxHeight must be strictly 94px, NOT forced to 140px
+      expect(peek.style.maxHeight).toBe('94px');
+      expect(peek.style.bottom).toBe('138px'); // 240 - 110 + 8
+      expect(peek.style.top).toBe('');
+    });
+
+    it('returns null safely when availableSpace is <= 0 in an extreme short viewport', () => {
+      stubHover(true);
+      const call = makeEvent('zero-space-call', 'tool.call', { tool: 'Bash', input: { command: 'test-zero' } }, 1);
+      const result = makeEvent('zero-space-result', 'tool.result', { output: 'zero' }, 2);
+
+      const { container } = render(<ChatView events={[call, result]} loading={false} />);
+      const chip = container.querySelector('.chat-tool-activity') as HTMLElement;
+
+      // Viewport 320x30, anchor occupies entire height
+      window.innerHeight = 30;
+      window.innerWidth = 320;
+      chip.getBoundingClientRect = () => ({
+        top: 5, bottom: 25, left: 10, right: 150, width: 140, height: 20, x: 10, y: 5,
+        toJSON: () => ({}),
+      }) as DOMRect;
+
+      fireEvent.mouseEnter(chip);
+      const peek = document.querySelector('.chat-tool-peek');
+      expect(peek).toBeNull();
     });
 
     it('direct component test: __ToolActivityPeekForTests bounds verification for mobile and desktop', () => {

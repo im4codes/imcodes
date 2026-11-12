@@ -5366,10 +5366,9 @@ function ToolActivityPeek({
     : 768;
   const spaceBelow = viewportHeight - anchor.bottom;
   const placeBelow = spaceAbove < 280 && spaceBelow > spaceAbove;
-  const maxHeight = Math.max(
-    140,
-    (placeBelow ? spaceBelow : anchor.top) - margin * 2,
-  );
+  const availableSpace = (placeBelow ? spaceBelow : anchor.top) - margin * 2;
+  if (availableSpace <= 0) return null;
+  const maxHeight = availableSpace;
   const position = placeBelow
     ? { top: `${anchor.bottom + margin}px` }
     : { bottom: `${viewportHeight - anchor.top + margin}px` };
