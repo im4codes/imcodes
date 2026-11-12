@@ -1187,7 +1187,9 @@ export class TransportSessionRuntime implements SessionRuntime {
         // turn's completion re-injects what compaction may have summarized.
         if (status?.status === 'compacting') this._compactionObservedInTurn = true;
         if (!this._activeDispatchCancelled && this._status === 'idle' && status?.status && this.hasActiveTurnWork()) {
-          this.setStatus('thinking');
+          this.setStatus(status.status === 'waiting' ? 'tool_running' : 'thinking');
+        } else if (!status?.status && this._status === 'tool_running' && !this.hasLocalTurnInFlight() && !this.hasActiveTurnWork()) {
+          this.setStatus('idle');
         }
       })] : []),
       ...(this.provider.onUsage ? [this.provider.onUsage((sid: string, _update: ProviderUsageUpdate) => {

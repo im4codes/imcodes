@@ -289,6 +289,7 @@ interface KimiSdkSessionState {
   agyContextUsage?: AgyContextUsage;
   agyCompactionWatermark?: AgyCompactionWatermark;
   agySubagents?: AgySubagentTracker;
+  agyBackgroundTasks?: Set<string>;
   agyBridges?: Map<string, AgyTranscriptBridge>;
   agyPendingNativeTools?: Map<string, ToolCallEvent>;
   agyConsumedNativeTools?: Set<string>;
@@ -441,13 +442,17 @@ export class KimiSdkProvider implements TransportProvider {
     if (!state) return null;
     const pendingApprovalCount = [...this.pendingApprovals.values()]
       .filter((approval) => approval.routeId === sessionId).length;
+    const backgroundTaskCount = this.id === AGY_SDK_PROVIDER_ID
+      ? (state.agyBackgroundTasks?.size ?? 0)
+      : 0;
     const activeToolCount = [...state.toolCalls.values()]
-      .filter((tool) => tool.status === 'pending' || tool.status === 'in_progress').length;
-    const activeWorkCount = Number(state.promptInFlight) + Number(state.replaying) + pendingApprovalCount;
+      .filter((tool) => tool.status === 'pending' || tool.status === 'in_progress').length + backgroundTaskCount;
+    const activeWorkCount = Number(state.promptInFlight) + Number(state.replaying) + pendingApprovalCount + backgroundTaskCount;
     const busyReasons: ProviderActiveWorkSnapshot['busyReasons'] = [];
     if (state.promptInFlight || pendingApprovalCount > 0) busyReasons.push('provider_wait');
     if (state.replaying) busyReasons.push('provider_session_binding');
     if (activeToolCount > 0) busyReasons.push('open_tool_call');
+    if (backgroundTaskCount > 0) busyReasons.push('background_monitor');
     return {
       status: 'current',
       activeWorkCount,
@@ -652,13 +657,50 @@ export class KimiSdkProvider implements TransportProvider {
 
   private closeAgyBridges(state: KimiSdkSessionState): void {
     for (const bridge of state.agyBridges?.values() ?? []) bridge.close();
-    state.agyBridges?.clear(); state.agyReactive = false;
+    state.agyBridges?.clear(); state.agyBackgroundTasks?.clear(); state.agyReactive = false;
     state.agyPendingResponses?.clear(); state.agyNativeAcks = [];
     const nativeAuthority = state.agyForeground?.authoritative;
     state.agyForeground?.clear();
     if (state.agyForeground) state.agyForeground.authoritative = !!nativeAuthority;
     state.agyProvisionalAutoMessageId = undefined;
     state.agyPendingNativeTools?.clear(); state.agyConsumedNativeTools?.clear(); state.agyNativeToolOrder = [];
+  }
+
+  /**
+   * Track AG native background tasks (e.g. `run_command` exceeding
+   * WaitMsBeforeAsync or one-shot `schedule` timers) across prompt boundaries
+   * so `end_turn` while a background command is still executing does not
+   * falsely mark the session idle or trigger Task Pair both-idle nudges.
+   */
+  private updateAgyBackgroundTasks(
+    sessionId: string,
+    state: KimiSdkSessionState,
+    opts: { text?: string; isSystemMessage?: boolean; toolName?: string; toolInput?: unknown; toolStatus?: string },
+  ): void {
+    if (this.id !== AGY_SDK_PROVIDER_ID) return;
+    const tasks = state.agyBackgroundTasks ??= new Set<string>();
+    const prevSize = tasks.size;
+    const text = opts.text ?? '';
+
+    if (opts.isSystemMessage && AGY_BACKGROUND_TASKS_RESTART_RE.test(text)) {
+      tasks.clear();
+    } else {
+      if (!isAgySubagentTool(opts.toolName ?? '') && !isRecurringAgyScheduleTool(opts.toolName, opts.toolInput)) {
+        for (const id of extractAgyBackgroundTaskStartIds(text)) tasks.add(id);
+      }
+      for (const id of extractAgyBackgroundTaskTerminalIds(text, opts)) tasks.delete(id);
+    }
+
+    const nextSize = tasks.size;
+    if (state.promptInFlight) return;
+    if (prevSize === 0 && nextSize > 0) {
+      this.emitStatus(sessionId, state, { status: 'waiting', label: 'Running background task' });
+    } else if (prevSize > 0 && nextSize === 0 && !state.agyReactive) {
+      // Force-clear status even when settleTurn already recorded a null status
+      // signature, allowing TransportSessionRuntime to transition tool_running -> idle.
+      state.lastStatusSignature = null;
+      this.clearStatus(sessionId, state);
+    }
   }
 
   private useAgyNativeOutput(state: KimiSdkSessionState): void {
@@ -725,6 +767,11 @@ export class KimiSdkProvider implements TransportProvider {
     }
     if (row.type === 'GENERIC' && row.content) {
       const nativeTool = state.agyNativeToolOrder?.shift();
+      this.updateAgyBackgroundTasks(sessionId, state, {
+        text: row.content,
+        toolName: nativeTool?.name,
+        toolInput: nativeTool?.input,
+      });
       if (nativeTool && isAgySubagentTool(nativeTool.name)) {
         const pending = [...(state.agyPendingNativeTools?.values() ?? [])]
           .find(tool => normalizeAgyToolName(tool.name) === normalizeAgyToolName(nativeTool.name));
@@ -738,6 +785,9 @@ export class KimiSdkProvider implements TransportProvider {
     }
     if (row.type === 'USER_INPUT' || claimedByForeground) state.agyReactive = false;
     if (row.type === 'SYSTEM_MESSAGE' && /\[Message\].*sender=/.test(row.content ?? '') && !state.agyForeground?.hasActiveLane()) state.agyReactive = true;
+    if (row.type === 'SYSTEM_MESSAGE' && row.content) {
+      this.updateAgyBackgroundTasks(sessionId, state, { text: row.content, isSystemMessage: true });
+    }
     if (claimedByForeground || row.type !== 'PLANNER_RESPONSE' || !row.content?.trim() || row.tool_calls?.length || !state.agyReactive) return;
     state.agyReactive = false;
     (state.agyPendingResponses ??= new Map()).set(row.step_index, row);
@@ -2337,6 +2387,12 @@ export class KimiSdkProvider implements TransportProvider {
       if (/^(invokesubagent|browsersubagent|sendmessage|swarm)$/.test(normalizeAgyToolName(merged.title))) this.useAgyNativeOutput(state);
       const tracker = state.agySubagents ??= new AgySubagentTracker(state.acpSessionId ?? sessionId);
       const outputValue = merged.rawOutput !== undefined ? (typeof merged.rawOutput === 'string' ? merged.rawOutput : JSON.stringify(merged.rawOutput)) : evt.output;
+      this.updateAgyBackgroundTasks(sessionId, state, {
+        text: outputValue,
+        toolName: merged.title,
+        toolInput: merged.rawInput,
+        toolStatus: evt.status,
+      });
       if (isAgySubagentTool(merged.title) && !state.agyConsumedNativeTools?.has(evt.id)) {
         (state.agyPendingNativeTools ??= new Map()).set(evt.id,evt);
       }
@@ -2548,9 +2604,12 @@ export class KimiSdkProvider implements TransportProvider {
   private clearSessionWorkAfterFailure(routeId: string): boolean {
     const state = this.sessions.get(routeId);
     if (!state) return false;
+    const hadActiveWork = state.promptInFlight
+      || state.replaying
+      || state.toolCalls.size > 0
+      || (state.agyBackgroundTasks?.size ?? 0) > 0;
     this.closeAgyBridges(state);
     const run = this.steeringRunTerminals.get(state);
-    const hadActiveWork = state.promptInFlight || state.replaying || state.toolCalls.size > 0;
     if (hadActiveWork) state.settledGeneration = state.turnGeneration;
     state.activePromptGenerations?.clear();
     state.autonomousTurnGeneration = undefined;
@@ -2636,4 +2695,50 @@ function getPrivacySafeErrorCode(error: unknown): string {
     if (typeof code === 'string' && PRIVACY_SAFE_ACP_ERROR_CODES.has(code)) return code;
   }
   return error instanceof RequestError ? 'acp_request_error' : 'unknown';
+}
+
+const AGY_BACKGROUND_TASKS_RESTART_RE = /All your subagents and background tasks have been stopped due to server restart\./i;
+const AGY_BACKGROUND_TASK_START_RE = /Tool is running as a background task with task id:\s*([A-Za-z0-9._:/-]+)/gi;
+const AGY_BACKGROUND_TASK_FINISHED_RE = /Task id "([^"]+)" finished/gi;
+const AGY_BACKGROUND_TASK_SENDER_RE = /\bsender=([^\s]+)/gi;
+const AGY_MANAGE_TASK_TERMINAL_RE = /\bTask:\s*([A-Za-z0-9._:/-]+)\b[\s\S]*?\bStatus:\s*(?:DONE|KILLED|FAILED|CANCELLED|ERROR|STOPPED)\b/gi;
+
+function isRecurringAgyScheduleTool(toolName?: string, toolInput?: unknown): boolean {
+  if (normalizeAgyToolName(toolName ?? '') !== 'schedule') return false;
+  if (!toolInput || typeof toolInput !== 'object') return false;
+  const record = toolInput as Record<string, unknown>;
+  return Boolean(record.CronExpression || record.cronExpression);
+}
+
+function extractAgyBackgroundTaskStartIds(text: string): string[] {
+  const ids: string[] = [];
+  for (const match of text.matchAll(AGY_BACKGROUND_TASK_START_RE)) {
+    if (match[1]) ids.push(match[1]);
+  }
+  return ids;
+}
+
+function extractAgyBackgroundTaskTerminalIds(
+  text: string,
+  opts: { isSystemMessage?: boolean; toolName?: string; toolInput?: unknown; toolStatus?: string },
+): string[] {
+  const ids: string[] = [];
+  if (opts.isSystemMessage) {
+    for (const match of text.matchAll(AGY_BACKGROUND_TASK_FINISHED_RE)) {
+      if (match[1]) ids.push(match[1]);
+    }
+    for (const match of text.matchAll(AGY_BACKGROUND_TASK_SENDER_RE)) {
+      if (match[1]) ids.push(match[1]);
+    }
+  }
+  if (normalizeAgyToolName(opts.toolName ?? '') === 'managetask') {
+    const input = opts.toolInput && typeof opts.toolInput === 'object' ? opts.toolInput as Record<string, unknown> : null;
+    if (input?.Action === 'kill' && typeof input.TaskId === 'string' && opts.toolStatus !== 'error') {
+      ids.push(input.TaskId);
+    }
+    for (const match of text.matchAll(AGY_MANAGE_TASK_TERMINAL_RE)) {
+      if (match[1]) ids.push(match[1]);
+    }
+  }
+  return ids;
 }

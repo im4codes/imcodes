@@ -8,6 +8,7 @@ export interface AgyTranscriptRow {
   tool_calls?: Array<{ name?: string; args?: unknown }>;
   input_tokens?: number; output_tokens?: number; cache_read_tokens?: number;
 }
+const BACKGROUND_TASK_RUNNING_RE = /Tool is running as a background task with task id:/i;
 export function agyTranscriptFile(home: string, id: string): string | undefined {
   if (!path.isAbsolute(home) || !/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,199}$/.test(id)) return;
   return path.join(home, '.gemini/antigravity-cli/brain', id, '.system_generated/logs/transcript_full.jsonl');
@@ -109,7 +110,11 @@ export class AgyTranscriptBridge {
           const line = this.partial.slice(0, lineEnd); this.partial = this.partial.slice(lineEnd + 1);
           let row: AgyTranscriptRow;
           try { row = JSON.parse(line) as AgyTranscriptRow; } catch { continue; }
-          if (!Number.isSafeInteger(row.step_index) || row.step_index <= this.lastStep || row.status !== 'DONE') continue;
+          if (!Number.isSafeInteger(row.step_index) || row.step_index <= this.lastStep) continue;
+          const allowRunningBackgroundTask = row.type === 'GENERIC'
+            && row.status === 'RUNNING'
+            && BACKGROUND_TASK_RUNNING_RE.test(row.content ?? '');
+          if (row.status !== 'DONE' && !allowRunningBackgroundTask) continue;
           this.lastStep = row.step_index;
           if (!this.closed && !baseline) this.onRow(row);
         }

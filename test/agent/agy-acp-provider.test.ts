@@ -928,4 +928,124 @@ describe('AG native ACP', () => {
     const current = await createAgyProvider({ binaryPath: binary, env: { HOME: root } }); expect(current).toBeInstanceOf(AgyAcpProvider);
     expect(supportsAgyAcp('unrecognized')).toBe(false); expect(supportsAgyAcp('1.5.0')).toBe(true);
   });
+  it('tracks AG native background run_command tasks across end_turn and settles cleanly on completion or server restart', async () => {
+    const { provider, root } = await setup('native-child-no-owned-output');
+    const id = 'deck_test_agy_bg_task';
+    const runtime = new TransportSessionRuntime(provider, id);
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    const completed: Array<{ content: string }> = [];
+    const statuses: string[] = [];
+    provider.onComplete((sid, m) => { if (sid === id) completed.push(m); });
+    runtime.onStatusChange = (status) => { statuses.push(status); };
+
+    try {
+      expect(runtime.send('launch', 'msg-bg-1')).toBe('sent');
+      const state = (provider as any).sessions.get(id);
+      await vi.waitFor(() => expect(state?.agyForeground?.authoritative).toBe(true), { timeout: 5000 });
+      await (provider as any).promptTerminals.get(state);
+      const native = state.acpSessionId as string;
+      const file = path.join(root, '.gemini/antigravity-cli/brain', native, '.system_generated/logs/transcript_full.jsonl');
+
+      await appendFile(
+        file,
+        JSON.stringify({
+          step_index: 3,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          content: '',
+          tool_calls: [{ name: 'run_command', args: { CommandLine: 'npm test', WaitMsBeforeAsync: 5000 } }],
+        }) + '\n'
+        + JSON.stringify({
+          step_index: 4,
+          type: 'GENERIC',
+          status: 'RUNNING',
+          content: `Tool is running as a background task with task id: ${native}/task-11351`,
+        }) + '\n'
+        + JSON.stringify({
+          step_index: 5,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          content: 'Running full unit suite in background...',
+        }) + '\n',
+      );
+
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+      expect(completed[0]?.content).toBe('Running full unit suite in background...');
+      await vi.waitFor(() => {
+        const snap = provider.getActiveWorkSnapshot(id);
+        expect(snap?.activeWorkCount).toBe(1);
+        expect(snap?.busyReasons).toContain('background_monitor');
+      }, { timeout: 5000 });
+      expect(runtime.getActivitySnapshot().blockingWorkCount).toBeGreaterThan(0);
+      expect(runtime.getStatus()).toBe('tool_running');
+
+      // Completion SYSTEM_MESSAGE + reactive PLANNER_RESPONSE settles back to idle.
+      await appendFile(
+        file,
+        JSON.stringify({
+          step_index: 6,
+          type: 'SYSTEM_MESSAGE',
+          status: 'DONE',
+          content: `[Message] timestamp=2026-11-12T18:10:10Z sender=${native}/task-11351 priority=MESSAGE_PRIORITY_HIGH content=Task id "${native}/task-11351" finished with result:\nCommand exited with code 0.`,
+        }) + '\n'
+        + JSON.stringify({
+          step_index: 7,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          content: 'BACKGROUND-TASK-DONE',
+        }) + '\n',
+      );
+
+      await vi.waitFor(() => expect(completed).toHaveLength(2), { timeout: 5000 });
+      expect(completed[1]?.content).toBe('BACKGROUND-TASK-DONE');
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 5000 });
+      expect(provider.getActiveWorkSnapshot(id)?.activeWorkCount).toBe(0);
+
+      // Standing cron schedule does not hold the session busy; another background command + server restart settles to idle without a reactive PLANNER_RESPONSE.
+      await appendFile(
+        file,
+        JSON.stringify({
+          step_index: 8,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          content: '',
+          tool_calls: [
+            { name: 'schedule', args: { CronExpression: '*/5 * * * *', IsDaemon: true, Prompt: 'tick' } },
+            { name: 'run_command', args: { CommandLine: 'sleep 60', WaitMsBeforeAsync: 5000 } },
+          ],
+        }) + '\n'
+        + JSON.stringify({
+          step_index: 9,
+          type: 'GENERIC',
+          status: 'RUNNING',
+          content: `Tool is running as a background task with task id: ${native}/cron-standing`,
+        }) + '\n'
+        + JSON.stringify({
+          step_index: 10,
+          type: 'GENERIC',
+          status: 'RUNNING',
+          content: `Tool is running as a background task with task id: ${native}/task-22222`,
+        }) + '\n',
+      );
+
+      await vi.waitFor(() => expect(provider.getActiveWorkSnapshot(id)?.activeWorkCount).toBe(1), { timeout: 5000 });
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('tool_running'), { timeout: 5000 });
+
+      await appendFile(
+        file,
+        JSON.stringify({
+          step_index: 11,
+          type: 'SYSTEM_MESSAGE',
+          status: 'DONE',
+          content: 'All your subagents and background tasks have been stopped due to server restart.',
+        }) + '\n',
+      );
+
+      await vi.waitFor(() => expect(provider.getActiveWorkSnapshot(id)?.activeWorkCount).toBe(0), { timeout: 5000 });
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 5000 });
+      expect(statuses).toContain('tool_running');
+    } finally {
+      await runtime.kill();
+    }
+  });
 });
