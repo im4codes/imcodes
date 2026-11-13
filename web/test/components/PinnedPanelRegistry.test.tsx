@@ -78,7 +78,7 @@ import {
   SHARED_CONTEXT_DIAGNOSTICS_PANEL_TYPE,
   SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE,
 } from '../../src/components/pinnedPanelTypes.js';
-import { renderPanelContent } from '../../src/components/PinnedPanelRegistry.js';
+import { renderPanelContent, hasPinnedPanelServerProvenance } from '../../src/components/PinnedPanelRegistry.js';
 
 afterEach(() => {
   cleanup();
@@ -424,5 +424,135 @@ describe('pinned panel server-switch isolation', () => {
     expect(sharedContextManagementProps[0]).toMatchObject({ enterpriseId: 'ent-1', serverId: 'srv-1', activeProjectDir: '/srv1/app' });
     expect(sharedContextDiagnosticsProps).toHaveLength(1);
     expect(sharedContextDiagnosticsProps[0]).toMatchObject({ enterpriseId: 'ent-1', canonicalRepoId: 'repo-1', workspaceId: 'ws-1' });
+  });
+
+  it('requires positive matching serverId provenance and never falls back on legacy pins without serverId when target server has non-empty sessions lacking project_dir or project', () => {
+    expect(hasPinnedPanelServerProvenance({ props: { serverId: 'srv-1' } }, 'srv-1')).toBe(true);
+    expect(hasPinnedPanelServerProvenance({ props: { serverId: 'srv-1' } }, 'srv-2')).toBe(false);
+    expect(hasPinnedPanelServerProvenance({ props: {} }, 'srv-2')).toBe(false);
+    expect(hasPinnedPanelServerProvenance({ props: { serverId: '  ' } }, 'srv-2')).toBe(false);
+    expect(hasPinnedPanelServerProvenance({ props: { serverId: 'srv-1' } }, '')).toBe(false);
+
+    const legacyFollowPins = [
+      { id: 'fb-legacy', type: 'filebrowser', props: { sessionName: 'deck_A_brain', projectDir: '/srv-A/secret', changesRootPath: '/srv-A/secret' } },
+      { id: 'repo-legacy', type: 'repo', props: { sessionName: 'deck_A_brain', projectDir: '/srv-A/secret' } },
+      { id: 'rp-legacy', type: 'repopage', props: { sessionName: 'deck_A_brain', projectDir: '/srv-A/secret' } },
+    ];
+    const srvBNoDirSession = {
+      name: 'deck_B_brain',
+      project: 'B',
+      role: 'brain',
+      agentType: 'codex',
+      state: 'idle',
+    };
+
+    for (const panel of legacyFollowPins) {
+      cleanup();
+      render(<>{renderPanelContent(panel, makeCtx({
+        serverId: 'srv-B',
+        activeSession: 'deck_B_brain',
+        activeProjectDir: undefined,
+        sessions: [srvBNoDirSession],
+        sessionsLoading: false,
+      }))}</>);
+      expect(screen.getByText('No project dir')).toBeTruthy();
+    }
+
+    cleanup();
+    render(<>{renderPanelContent(
+      { id: 'cron-legacy', type: 'cronmanager', props: { sessionName: 'deck_A_brain', projectName: 'AlphaSecret' } },
+      makeCtx({
+        serverId: 'srv-B',
+        activeSession: 'deck_B_brain',
+        sessions: [{ name: 'deck_B_brain', project: '', role: 'brain', agentType: 'codex', state: 'idle' }],
+        sessionsLoading: false,
+      }),
+    )}</>);
+    expect(screen.getByText('No project')).toBeTruthy();
+
+    expect(fileBrowserProps).toHaveLength(0);
+    expect(repoPageProps).toHaveLength(0);
+    expect(cronManagerProps).toHaveLength(0);
+  });
+
+  it('never leaks legacy stale sessionName when target server has sessions but activeSession is null', () => {
+    const legacyPins = [
+      { id: 'fb-stale', type: 'filebrowser', props: { sessionName: 'deck_A_brain', projectDir: '/srv-A/secret' } },
+      { id: 'rp-stale', type: 'repopage', props: { sessionName: 'deck_A_brain', projectDir: '/srv-A/secret' } },
+    ];
+
+    for (const panel of legacyPins) {
+      cleanup();
+      render(<>{renderPanelContent(panel, makeCtx({
+        serverId: 'srv-B',
+        activeSession: null,
+        activeProjectDir: '/srv-B/repo',
+        sessions: [srv2Session],
+        sessionsLoading: false,
+      }))}</>);
+    }
+
+    expect(fileBrowserProps).toHaveLength(1);
+    expect(fileBrowserProps[0].initialPath).toBe('/srv-B/repo');
+    expect(fileBrowserProps[0].sessionName).toBeUndefined();
+    expect(repoPageProps).toHaveLength(1);
+    expect(repoPageProps[0].projectDir).toBe('/srv-B/repo');
+    expect(repoPageProps[0].sessionId).toBeUndefined();
+  });
+
+  it('fails closed on legacy server-bound pins missing serverId while allowing legacy follow-current pins to use live target context', () => {
+    const legacyBoundPins = [
+      { id: 'sub-legacy', type: 'subsession', props: { sessionName: 'deck_sub_A_1', label: 'A Helper' } },
+      { id: 'preview-legacy', type: LOCAL_WEB_PREVIEW_PANEL_TYPE, props: { port: '3000', path: '/secret' } },
+      { id: 'sc-mgmt-legacy', type: SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE, props: { enterpriseId: 'ent-A' } },
+      { id: 'sc-diag-legacy', type: SHARED_CONTEXT_DIAGNOSTICS_PANEL_TYPE, props: { enterpriseId: 'ent-A', workspaceId: 'ws-A' } },
+    ];
+
+    for (const panel of legacyBoundPins) {
+      cleanup();
+      render(<>{renderPanelContent(panel, makeCtx({
+        serverId: 'srv-2',
+        activeSession: 'deck_srv2_brain',
+        activeProjectDir: '/srv2/app',
+        sessions: [srv2Session],
+        subSessions: [{
+          id: 'sub-a',
+          sessionName: 'deck_sub_A_1',
+          parentSession: 'deck_srv2_brain',
+          label: 'Spoofed Name',
+          type: 'codex-sdk',
+          state: 'running',
+        } as any],
+      }))}</>);
+      expect(screen.getByText('No server selected')).toBeTruthy();
+    }
+
+    expect(localWebPreviewProps).toHaveLength(0);
+    expect(sharedContextManagementProps).toHaveLength(0);
+    expect(sharedContextDiagnosticsProps).toHaveLength(0);
+
+    // Follow-current legacy pins still work cleanly once B has legitimate live project context
+    const legacyFollowPins = [
+      { id: 'fb-legacy', type: 'filebrowser', props: { sessionName: 'deck_A_brain', projectDir: '/srv-A/secret' } },
+      { id: 'repo-legacy', type: 'repo', props: { sessionName: 'deck_A_brain', projectDir: '/srv-A/secret' } },
+      { id: 'rp-legacy', type: 'repopage', props: { sessionName: 'deck_A_brain', projectDir: '/srv-A/secret' } },
+      { id: 'cron-legacy', type: 'cronmanager', props: { sessionName: 'deck_A_brain', projectName: 'AlphaSecret' } },
+    ];
+    for (const panel of legacyFollowPins) {
+      cleanup();
+      render(<>{renderPanelContent(panel, makeCtx({
+        serverId: 'srv-2',
+        activeSession: 'deck_srv2_brain',
+        activeProjectDir: '/srv2/app',
+        sessions: [srv2Session],
+      }))}</>);
+    }
+
+    expect(fileBrowserProps).toHaveLength(2);
+    expect(fileBrowserProps[0]).toMatchObject({ initialPath: '/srv2/app', sessionName: 'deck_srv2_brain' });
+    expect(repoPageProps).toHaveLength(1);
+    expect(repoPageProps[0]).toMatchObject({ projectDir: '/srv2/app', sessionId: 'deck_srv2_brain' });
+    expect(cronManagerProps).toHaveLength(1);
+    expect(cronManagerProps[0]).toMatchObject({ projectName: 'srv2_app', activeSession: 'deck_srv2_brain' });
   });
 });

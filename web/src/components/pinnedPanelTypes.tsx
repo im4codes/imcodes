@@ -2,7 +2,7 @@
  * Register all built-in pinned panel types.
  * Import this file once at app startup to populate the registry.
  */
-import { registerPanelType, getPanelType } from './PinnedPanelRegistry.js';
+import { registerPanelType, getPanelType, hasPinnedPanelServerProvenance } from './PinnedPanelRegistry.js';
 import { ChatView } from './ChatView.js';
 import { TerminalView } from './TerminalView.js';
 import { FileBrowser } from './file-browser-lazy.js';
@@ -30,19 +30,13 @@ export const LOCAL_WEB_PREVIEW_PANEL_TYPE = 'localwebpreview';
 export const SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE = 'sharedcontext-management';
 export const SHARED_CONTEXT_DIAGNOSTICS_PANEL_TYPE = 'sharedcontext-diagnostics';
 
-function isCapturedPanelServerMismatch(panel: PinnedPanel, ctx: PanelRenderContext): boolean {
-  const panelServerId = typeof panel.props?.serverId === 'string' && panel.props.serverId.trim()
-    ? panel.props.serverId.trim()
-    : undefined;
-  return Boolean(panelServerId && panelServerId !== ctx.serverId);
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value : undefined;
 }
 
 function canUseCapturedPanelProps(panel: PinnedPanel, ctx: PanelRenderContext): boolean {
   if (ctx.sessionsLoading) return false;
-  if (isCapturedPanelServerMismatch(panel, ctx)) return false;
-  const hasExplicitServerId = typeof panel.props?.serverId === 'string' && panel.props.serverId.trim().length > 0;
-  if (!hasExplicitServerId && ctx.sessions && ctx.sessions.length === 0) return false;
-  return true;
+  return hasPinnedPanelServerProvenance(panel, ctx.serverId);
 }
 
 function resolveFollowCurrentProjectScope(panel: PinnedPanel, ctx: PanelRenderContext): {
@@ -56,10 +50,17 @@ function resolveFollowCurrentProjectScope(panel: PinnedPanel, ctx: PanelRenderCo
     return { loading: true, isTabShare, projectDir: undefined, activeSession: undefined };
   }
   const allowCaptured = canUseCapturedPanelProps(panel, ctx);
+  const liveActiveSession = nonEmptyString(ctx.activeSession);
+  const liveSessionInfo = liveActiveSession
+    ? ctx.sessions?.find((s) => s.name === liveActiveSession)
+    : undefined;
   const projectDir = isTabShare
     ? FS_SESSION_ROOT_PATH
-    : ctx.activeProjectDir ?? (allowCaptured ? panel.props?.projectDir as string | undefined : undefined);
-  const activeSession = ctx.activeSession ?? (allowCaptured ? panel.props?.sessionName as string | undefined : undefined);
+    : nonEmptyString(ctx.activeProjectDir)
+      ?? nonEmptyString(liveSessionInfo?.projectDir)
+      ?? (allowCaptured ? nonEmptyString(panel.props?.projectDir) : undefined);
+  const activeSession = liveActiveSession
+    ?? (allowCaptured ? nonEmptyString(panel.props?.sessionName) : undefined);
   return { loading: false, isTabShare, projectDir, activeSession };
 }
 
@@ -192,7 +193,12 @@ registerPanelType('subsession', {
     const agentType = liveSub?.type;
     return agentType ? `${label} · ${agentType}` : label;
   },
-  render: (panel, ctx) => <SubSessionContent panel={panel} ctx={ctx} />,
+  render: (panel, ctx) => {
+    if (!hasPinnedPanelServerProvenance(panel, ctx.serverId)) {
+      return <div class="sidebar-pinned-unavailable">No server selected</div>;
+    }
+    return <SubSessionContent panel={panel} ctx={ctx} />;
+  },
 });
 
 // ── File browser panel ───────────────────────────────────────────────────
@@ -279,15 +285,15 @@ registerPanelType('cronmanager', {
   title: () => 'Scheduled Tasks',
   render: (panel, ctx) => {
     if (ctx.sessionsLoading) return <div class="sidebar-pinned-unavailable">{ctx.t('common.loading')}</div>;
-    // Derive project from active session or subsession, fall back to pinned prop only for the same server.
+    // Derive project from active session or subsession, fall back to pinned prop only when server provenance matches.
     const allowCaptured = canUseCapturedPanelProps(panel, ctx);
     const activeSub = ctx.subSessions?.find((s) => s.sessionName === ctx.activeSession);
     const activeMain = ctx.sessions?.find((s) => s.name === ctx.activeSession);
     const parentMain = activeSub ? ctx.sessions?.find((s) => s.name === activeSub.parentSession) : null;
-    const projectName = (activeMain?.project
-      ?? parentMain?.project
-      ?? ctx.sessions?.[0]?.project
-      ?? (allowCaptured ? panel.props?.projectName as string | undefined : undefined));
+    const projectName = nonEmptyString(activeMain?.project)
+      ?? nonEmptyString(parentMain?.project)
+      ?? nonEmptyString(ctx.sessions?.[0]?.project)
+      ?? (allowCaptured ? nonEmptyString(panel.props?.projectName) : undefined);
     if (!projectName) return <div class="sidebar-pinned-unavailable">No project</div>;
     const subSessionsSlim = ctx.subSessions.map(s => ({
       sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession,
@@ -331,11 +337,10 @@ registerPanelType(LOCAL_WEB_PREVIEW_PANEL_TYPE, {
     return `🌐 ${label}${suffix}`;
   },
   render: (panel, ctx) => {
-    if (isCapturedPanelServerMismatch(panel, ctx)) {
+    if (!hasPinnedPanelServerProvenance(panel, ctx.serverId)) {
       return <div class="sidebar-pinned-unavailable">No server selected</div>;
     }
-    const serverId = (panel.props?.serverId as string | undefined) ?? ctx.serverId;
-    if (!serverId) return <div class="sidebar-pinned-unavailable">No server selected</div>;
+    const serverId = ctx.serverId;
     return (
       <LocalWebPreviewPanel
         serverId={serverId}
@@ -357,8 +362,8 @@ registerPanelType(LOCAL_WEB_PREVIEW_PANEL_TYPE, {
 registerPanelType(SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE, {
   title: (_panel, ctx) => ctx?.t('sharedContext.management.title') ?? 'Shared Context',
   render: (panel, ctx) => {
-    if (isCapturedPanelServerMismatch(panel, ctx)) {
-      return <div class="sidebar-pinned-unavailable">{ctx.t('common.loading')}</div>;
+    if (!hasPinnedPanelServerProvenance(panel, ctx.serverId)) {
+      return <div class="sidebar-pinned-unavailable">No server selected</div>;
     }
     return (
       <SharedContextManagementPanel
@@ -384,8 +389,8 @@ registerPanelType(SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE, {
 registerPanelType(SHARED_CONTEXT_DIAGNOSTICS_PANEL_TYPE, {
   title: (_panel, ctx) => ctx?.t('sharedContext.diagnostics.title') ?? 'Context Diagnostics',
   render: (panel, ctx) => {
-    if (isCapturedPanelServerMismatch(panel, ctx)) {
-      return <div class="sidebar-pinned-unavailable">{ctx.t('common.loading')}</div>;
+    if (!hasPinnedPanelServerProvenance(panel, ctx.serverId)) {
+      return <div class="sidebar-pinned-unavailable">No server selected</div>;
     }
     return (
       <ContextDiagnosticsPanel

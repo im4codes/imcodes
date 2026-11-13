@@ -177,7 +177,7 @@ import {
   DEFAULT_SUBSESSION_ACCENT_COLOR,
   getSubSessionAccentColorMap,
 } from './subsession-accent-colors.js';
-import type { PanelRenderContext } from './components/PinnedPanelRegistry.js';
+import { hasPinnedPanelServerProvenance, type PanelRenderContext } from './components/PinnedPanelRegistry.js';
 import { canSharedActorControlSession, shareTargetKey, type ShareDialogTarget, type ShareGrantSummary, type SharedStateSummary, type ShareTarget } from './tab-sharing-ui.js';
 import {
   clearSharedTabRestoreMarker,
@@ -2909,7 +2909,7 @@ function InternalMainApp() {
   }, [setSubSessionMaximized]);
 
   const isPinnedPanelForServer = useCallback((panel: PinnedPanel, serverId: string | null | undefined): boolean => (
-    !panel.props?.serverId || !serverId || panel.props.serverId === serverId
+    hasPinnedPanelServerProvenance(panel, serverId)
   ), []);
 
   const isSubSessionPinnedPanel = useCallback((id: string): boolean => {
@@ -4381,20 +4381,36 @@ function InternalMainApp() {
   /** Generic unpin: remove from pinnedPanels + reopen the source floating window. */
   const unpinPanel = useCallback((panel: PinnedPanel) => {
     const removePanel = () => setPinnedPanels((prev) => prev.filter((p) => p.id !== panel.id));
+    const sessionsLoading = !sessionsLoaded && Boolean(selectedServerId);
     // Reopen source window based on type
     if (panel.type === 'filebrowser' || panel.type === 'repo') {
+      if (sessionsLoading) {
+        removePanel();
+        return;
+      }
       runVersionSensitiveAction(trans('picker.files'), () => {
         removePanel();
         setShowDesktopFileBrowser(true);
       });
     } else if (panel.type === 'repopage') {
+      if (sessionsLoading) {
+        removePanel();
+        return;
+      }
       const tabShare = Boolean(selectedShareTarget && selectedShareTarget.kind !== 'server');
       const allowCaptured = isPinnedPanelForServer(panel, selectedServerId);
-      const currentProjectDir = sessions.find((s) => s.name === activeSession)?.projectDir;
+      const liveProjectDir = sessions.find((s) => s.name === activeSession)?.projectDir;
+      const currentProjectDir = typeof liveProjectDir === 'string' && liveProjectDir.trim() ? liveProjectDir : undefined;
+      const capturedProjectDir = allowCaptured && typeof panel.props?.projectDir === 'string' && panel.props.projectDir.trim()
+        ? panel.props.projectDir
+        : undefined;
       const projectDir = tabShare
         ? FS_SESSION_ROOT_PATH
-        : currentProjectDir ?? (allowCaptured && typeof panel.props?.projectDir === 'string' ? panel.props.projectDir : undefined);
-      const sessionId = activeSession ?? (allowCaptured && typeof panel.props?.sessionName === 'string' ? panel.props.sessionName : null);
+        : currentProjectDir ?? capturedProjectDir;
+      const capturedSessionId = allowCaptured && typeof panel.props?.sessionName === 'string' && panel.props.sessionName.trim()
+        ? panel.props.sessionName
+        : null;
+      const sessionId = activeSession ?? capturedSessionId;
       if (projectDir) {
         runVersionSensitiveAction(trans('repo.info_title', { defaultValue: 'Repository information' }), () => {
           removePanel();
@@ -4411,6 +4427,10 @@ function InternalMainApp() {
         removePanel();
       }
     } else if (panel.type === 'cronmanager') {
+      if (sessionsLoading) {
+        removePanel();
+        return;
+      }
       runVersionSensitiveAction(trans('cron.title'), () => {
         removePanel();
         setShowCronManager(true);
@@ -4451,7 +4471,7 @@ function InternalMainApp() {
         }
       }
     }
-  }, [activeSession, bringSubToFront, isPinnedPanelForServer, runVersionSensitiveAction, selectedServerId, selectedShareTarget, sessions, setPinnedPanels, subSessions, trans]);
+  }, [activeSession, bringSubToFront, isPinnedPanelForServer, runVersionSensitiveAction, selectedServerId, selectedShareTarget, sessions, sessionsLoaded, setPinnedPanels, subSessions, trans]);
 
   const isMobile = isMobileDevice();
   isMobileRef.current = isMobile;

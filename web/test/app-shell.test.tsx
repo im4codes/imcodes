@@ -4034,6 +4034,67 @@ describe('App shell', () => {
       expect(screen.queryByText('start-sub-session-dialog')).toBeNull();
       expect(screen.queryByTestId('local-web-preview')).toBeNull();
     }, 30_000);
+
+    it('never opens stale srv-1 overlays when unpinning follow-current panels during loading or on a non-empty target server without project_dir', async () => {
+      seedLogin('srv-1');
+      let releaseSrv2!: () => void;
+      const srv2Gate = new Promise<void>((resolve) => { releaseSrv2 = resolve; });
+      installApi({
+        sessions: async (serverId) => {
+          if (serverId === 'srv-2') {
+            await srv2Gate;
+            return {
+              sessions: [{
+                name: 'deck_gamma_brain',
+                project_name: 'Gamma',
+                role: 'brain',
+                agent_type: 'codex-sdk',
+                agent_version: '5.0',
+                state: 'running',
+              }],
+            };
+          }
+          return { sessions: listFor(serverId) };
+        },
+      });
+      const { App } = await importApp();
+      render(<App />);
+
+      await expectActive('deck_alpha_brain');
+      await waitFor(() => {
+        expect(screen.getByTestId('sidebar-pinned-filebrowser:deck_alpha_brain')).toBeTruthy();
+        expect(screen.getByTestId('sidebar-pinned-cronmanager:deck_alpha_brain')).toBeTruthy();
+      });
+
+      fireEvent.click(screen.getByText('subbar-repo'));
+      const repoWin = await screen.findByTestId('floating-panel-repo');
+      fireEvent.click(within(repoWin).getByText('floating-pin'));
+      await waitFor(() => expect(screen.getByTestId('sidebar-pinned-repopage:deck_alpha_brain')).toBeTruthy());
+
+      // Switch to srv-2 and unpin filebrowser + cronmanager while srv-2 is still loading
+      fireEvent.click(screen.getByText('server-select-srv-2'));
+      await waitFor(() => {
+        expect(screen.getByTestId('sidebar-pinned-repopage:deck_alpha_brain').getAttribute('data-ctx-sessions-loading')).toBe('true');
+      });
+
+      fireEvent.click(screen.getByTestId('pinned-unpin-filebrowser:deck_alpha_brain'));
+      fireEvent.click(screen.getByTestId('pinned-unpin-cronmanager:deck_alpha_brain'));
+      expect(screen.queryByTestId('floating-panel-filebrowser')).toBeNull();
+      expect(screen.queryByTestId('floating-panel-cron')).toBeNull();
+
+      // Finish loading srv-2 with a non-empty session lacking project_dir -> unpinned windows stay closed and repopage unpin must not fall back to srv-1 /work/deck_alpha_brain
+      await act(async () => {
+        releaseSrv2();
+        await Promise.resolve();
+      });
+      await expectActive('deck_gamma_brain');
+      expect(screen.queryByTestId('floating-panel-filebrowser')).toBeNull();
+      expect(screen.queryByTestId('floating-panel-cron')).toBeNull();
+
+      fireEvent.click(screen.getByTestId('pinned-unpin-repopage:deck_alpha_brain'));
+      await waitFor(() => expect(screen.queryByTestId('sidebar-pinned-repopage:deck_alpha_brain')).toBeNull());
+      expect(screen.queryByTestId('mock-repo-page')).toBeNull();
+    }, 30_000);
   });
 
   it('subscribes sdk sub-sessions to transport live events even when runtimeType is missing', async () => {

@@ -64,6 +64,25 @@ export interface PanelTypeRegistration {
   render: (panel: PinnedPanel, ctx: PanelRenderContext) => ComponentChildren;
 }
 
+/** Return the non-empty serverId stamped onto a pinned panel's props, if any. */
+export function getPinnedPanelServerId(panel: { props?: Record<string, unknown> }): string | undefined {
+  const raw = panel.props?.serverId;
+  return typeof raw === 'string' && raw.trim() ? raw.trim() : undefined;
+}
+
+/**
+ * Positive server-provenance check for pinned panels.
+ * Returns true only when both the panel and target server carry matching non-empty server IDs.
+ */
+export function hasPinnedPanelServerProvenance(
+  panel: { props?: Record<string, unknown> },
+  serverId: string | null | undefined,
+): boolean {
+  const panelServerId = getPinnedPanelServerId(panel);
+  const currentServerId = typeof serverId === 'string' && serverId.trim() ? serverId.trim() : undefined;
+  return Boolean(panelServerId && currentServerId && panelServerId === currentServerId);
+}
+
 const registry = new Map<string, PanelTypeRegistration>();
 
 export function registerPanelType(type: string, reg: PanelTypeRegistration): void {
