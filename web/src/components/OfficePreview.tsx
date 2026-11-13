@@ -4,7 +4,12 @@
  */
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import { ApiError, fetchOnlyOfficeConfig, type OnlyOfficeConfigResponse } from '../api.js';
+import {
+  ApiError,
+  fetchCloudDocOnlyOfficeConfig,
+  fetchOnlyOfficeConfig,
+  type OnlyOfficeConfigResponse,
+} from '../api.js';
 
 export interface OfficePreviewProps {
   /**
@@ -18,6 +23,8 @@ export interface OfficePreviewProps {
   path: string;
   /** Target server ID — enables embedded ONLYOFFICE preview/collaborative editing when configured. */
   serverId?: string;
+  /** Optional Cloud Doc ID — opens independent server-stored Cloud Document in ONLYOFFICE / fallback preview. */
+  cloudDocId?: string;
   /** Optional external share token for external collaborator access. */
   shareToken?: string;
   /** Optional bound device token for device-locked external links. */
@@ -578,7 +585,7 @@ export default function OfficePreview(props: OfficePreviewProps) {
   // can let the previous document's forceLocal/authorized URL/data start a new
   // download before the new config has checked its permissions.
   const identity = JSON.stringify([
-    props.serverId, props.path, props.srcUrl, props.mimeType,
+    props.cloudDocId, props.serverId, props.path, props.srcUrl, props.mimeType,
     props.shareToken, props.deviceToken, props.sessionName, props.readOnly, props.initialMode,
   ]);
   return <OfficePreviewDocument key={identity} {...props} />;
@@ -589,6 +596,7 @@ function OfficePreviewDocument({
   mimeType,
   path,
   serverId,
+  cloudDocId,
   shareToken,
   deviceToken,
   sessionName,
@@ -597,6 +605,7 @@ function OfficePreviewDocument({
   onOpenShare,
 }: OfficePreviewProps) {
   const { t } = useTranslation();
+  const hasRemoteTarget = Boolean(cloudDocId || serverId);
   const [data, setData] = useState<ArrayBuffer | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [authDeniedError, setAuthDeniedError] = useState<string | null>(null);
@@ -608,7 +617,7 @@ function OfficePreviewDocument({
     config: OnlyOfficeConfigResponse | null;
     forceLocal: boolean;
   }>({
-    loading: Boolean(serverId),
+    loading: hasRemoteTarget,
     config: null,
     forceLocal: false,
   });
@@ -616,9 +625,9 @@ function OfficePreviewDocument({
   const [mode, setMode] = useState<'view' | 'edit'>(effectiveInitialMode);
   const [isFullscreen, setIsFullscreen] = useState(false);
 
-  // 1. When `serverId` is provided, query ONLYOFFICE config first
+  // 1. When `cloudDocId` or `serverId` is provided, query ONLYOFFICE config first
   useEffect(() => {
-    if (!serverId) {
+    if (!hasRemoteTarget) {
       setOoState({ loading: false, config: null, forceLocal: false });
       return;
     }
@@ -631,13 +640,17 @@ function OfficePreviewDocument({
     setOoState((prev) => ({ ...prev, loading: true }));
     setAuthDeniedError(null);
 
-    fetchOnlyOfficeConfig(serverId, {
-      path,
-      mode: readOnly ? 'view' : mode,
-      shareToken,
-      deviceToken,
-      sessionName,
-    })
+    const requestPromise = cloudDocId
+      ? fetchCloudDocOnlyOfficeConfig(cloudDocId, { mode: readOnly ? 'view' : mode })
+      : fetchOnlyOfficeConfig(serverId!, {
+          path,
+          mode: readOnly ? 'view' : mode,
+          shareToken,
+          deviceToken,
+          sessionName,
+        });
+
+    requestPromise
       .then((res) => {
         if (cancelled) return;
         const resolvedUrl = res.fileUrl || res.config?.document?.url || '';
@@ -657,6 +670,7 @@ function OfficePreviewDocument({
         if (
           status === 401 ||
           status === 403 ||
+          (Boolean(cloudDocId) && status === 404) ||
           (status === 0 && /\b(401|403)\b|forbidden|unauthorized|access_denied/i.test(msg))
         ) {
           setAuthDeniedError(msg || 'Access denied');
@@ -681,10 +695,10 @@ function OfficePreviewDocument({
     return () => {
       cancelled = true;
     };
-  }, [serverId, path, mode, shareToken, deviceToken, sessionName, readOnly, ooState.forceLocal, ooRetryKey]);
+  }, [hasRemoteTarget, cloudDocId, serverId, path, mode, shareToken, deviceToken, sessionName, readOnly, ooState.forceLocal, ooRetryKey]);
 
   const useOnlyOffice =
-    Boolean(serverId) &&
+    hasRemoteTarget &&
     !ooState.forceLocal &&
     ooState.config?.enabled === true &&
     Boolean(ooState.config?.config);
@@ -759,7 +773,7 @@ function OfficePreviewDocument({
     );
   }
 
-  const retryOnlyOfficeButton = serverId ? (
+  const retryOnlyOfficeButton = hasRemoteTarget ? (
     <button
       type="button"
       data-testid="office-preview-retry-onlyoffice"
@@ -867,7 +881,7 @@ function OfficePreviewDocument({
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%' }}>
-      {(fallbackNotice || ooState.forceLocal) && serverId && (
+      {(fallbackNotice || ooState.forceLocal) && hasRemoteTarget && (
         <div
           data-testid="office-preview-local-fallback-bar"
           style={{

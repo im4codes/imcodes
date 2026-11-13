@@ -48,6 +48,20 @@ import {
   type SessionIdentityProfile,
   type SessionIdentityScope,
 } from '@shared/session-identity.js';
+import type {
+  CloudDocBlankType,
+  CloudDocFolder,
+  CloudDocItem,
+  CloudDocShareMode,
+  CloudDocShareRecord,
+  CloudDocShareRole,
+  CloudDocShareTargetKind,
+  CloudDocTeamOption,
+  RecentDocumentItem,
+  RecordRecentDocumentInput,
+  SharedCloudDocItem,
+  SharedCloudFolderItem,
+} from '@shared/cloud-docs.js';
 
 let _baseUrl = '';
 let _onAuthExpired: ((reason?: string) => void) | null = null;
@@ -3615,4 +3629,191 @@ export async function handoffR2Download(url: string, signal?: AbortSignal): Prom
   if (isNative()) { const { Browser } = await import('@capacitor/browser'); await Browser.open({ url }); return; }
   const anchor = document.createElement('a'); anchor.href = url; anchor.download = ''; anchor.rel = 'noopener';
   document.body.appendChild(anchor); anchor.click(); anchor.remove();
+}
+
+// ── Cloud Docs & Recent Documents ────────────────────────────────────────────
+
+export async function listCloudDocsApi(params?: {
+  folderId?: string | null;
+  allFolders?: boolean;
+  search?: string;
+  signal?: AbortSignal;
+}): Promise<{
+  folders: CloudDocFolder[];
+  docs: CloudDocItem[];
+  sharedFolders?: SharedCloudFolderItem[];
+  sharedDocs?: SharedCloudDocItem[];
+}> {
+  const qs = new URLSearchParams();
+  if (params?.allFolders) {
+    qs.set('folderId', '*');
+  } else if (params?.folderId !== undefined) {
+    qs.set('folderId', params.folderId ?? '');
+  }
+  if (params?.search?.trim()) qs.set('search', params.search.trim());
+  const suffix = qs.toString() ? `?${qs.toString()}` : '';
+  return apiFetch<{
+    folders: CloudDocFolder[];
+    docs: CloudDocItem[];
+    sharedFolders?: SharedCloudFolderItem[];
+    sharedDocs?: SharedCloudDocItem[];
+  }>(
+    `/api/cloud-docs${suffix}`,
+    { method: 'GET', signal: params?.signal },
+  );
+}
+
+export async function listCloudDocTeamsApi(signal?: AbortSignal): Promise<{ teams: CloudDocTeamOption[] }> {
+  return apiFetch<{ teams: CloudDocTeamOption[] }>('/api/cloud-docs/teams', {
+    method: 'GET',
+    signal,
+  });
+}
+
+export async function listCloudDocSharesApi(
+  targetKind: CloudDocShareTargetKind,
+  targetId: string,
+): Promise<{ shares: CloudDocShareRecord[] }> {
+  return apiFetch<{ shares: CloudDocShareRecord[] }>(
+    `/api/cloud-docs/shares/${encodeURIComponent(targetKind)}/${encodeURIComponent(targetId)}`,
+    { method: 'GET' },
+  );
+}
+
+export async function upsertCloudDocShareApi(body: {
+  targetKind: CloudDocShareTargetKind;
+  targetId: string;
+  shareMode: CloudDocShareMode;
+  targetTeamId?: string;
+  targetUserId?: string;
+  targetUsername?: string;
+  role: CloudDocShareRole;
+  allowDownload?: boolean;
+}): Promise<{ share: CloudDocShareRecord }> {
+  return apiFetch<{ share: CloudDocShareRecord }>('/api/cloud-docs/shares', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export async function revokeCloudDocShareApi(shareId: string): Promise<{ ok: boolean }> {
+  return apiFetch<{ ok: boolean }>(`/api/cloud-docs/shares/${encodeURIComponent(shareId)}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function createCloudDocFolderApi(body: {
+  name: string;
+  parentId?: string | null;
+}): Promise<{ folder: CloudDocFolder }> {
+  return apiFetch<{ folder: CloudDocFolder }>('/api/cloud-docs/folders', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export async function updateCloudDocFolderApi(
+  folderId: string,
+  body: { name?: string; parentId?: string | null },
+): Promise<{ folder: CloudDocFolder }> {
+  return apiFetch<{ folder: CloudDocFolder }>(
+    `/api/cloud-docs/folders/${encodeURIComponent(folderId)}`,
+    { method: 'PATCH', body: JSON.stringify(body) },
+  );
+}
+
+export async function deleteCloudDocFolderApi(folderId: string): Promise<{ ok: boolean }> {
+  return apiFetch<{ ok: boolean }>(
+    `/api/cloud-docs/folders/${encodeURIComponent(folderId)}`,
+    { method: 'DELETE' },
+  );
+}
+
+export async function createBlankCloudDocApi(body: {
+  type: CloudDocBlankType;
+  name?: string;
+  folderId?: string | null;
+}): Promise<{ doc: CloudDocItem }> {
+  return apiFetch<{ doc: CloudDocItem }>('/api/cloud-docs/blank', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export async function uploadCloudDocApi(
+  file: File,
+  options?: { folderId?: string | null; name?: string; signal?: AbortSignal },
+): Promise<{ doc: CloudDocItem }> {
+  const form = new FormData();
+  form.append('file', file);
+  if (options?.folderId) form.append('folderId', options.folderId);
+  if (options?.name) form.append('name', options.name);
+  return apiFetch<{ doc: CloudDocItem }>('/api/cloud-docs/files', {
+    method: 'POST',
+    body: form,
+    signal: options?.signal,
+  });
+}
+
+export async function updateCloudDocApi(
+  docId: string,
+  body: { name?: string; folderId?: string | null },
+): Promise<{ doc: CloudDocItem }> {
+  return apiFetch<{ doc: CloudDocItem }>(
+    `/api/cloud-docs/${encodeURIComponent(docId)}`,
+    { method: 'PATCH', body: JSON.stringify(body) },
+  );
+}
+
+export async function deleteCloudDocApi(docId: string): Promise<{ ok: boolean }> {
+  return apiFetch<{ ok: boolean }>(
+    `/api/cloud-docs/${encodeURIComponent(docId)}`,
+    { method: 'DELETE' },
+  );
+}
+
+export function getCloudDocDownloadUrl(docId: string, inline = false): string {
+  const qs = inline ? '' : '?download=1';
+  return `${_baseUrl}/api/cloud-docs/${encodeURIComponent(docId)}/download${qs}`;
+}
+
+export async function fetchCloudDocOnlyOfficeConfig(
+  docId: string,
+  params?: { mode?: 'view' | 'edit'; lang?: string },
+): Promise<OnlyOfficeConfigResponse> {
+  const qs = new URLSearchParams();
+  if (params?.mode) qs.set('mode', params.mode);
+  if (params?.lang) qs.set('lang', params.lang);
+  const suffix = qs.toString() ? `?${qs.toString()}` : '';
+  return apiFetch<OnlyOfficeConfigResponse>(
+    `/api/cloud-docs/${encodeURIComponent(docId)}/onlyoffice/config${suffix}`,
+    { method: 'GET' },
+  );
+}
+
+export async function listRecentDocumentsApi(options?: {
+  limit?: number;
+  signal?: AbortSignal;
+}): Promise<{ items: RecentDocumentItem[] }> {
+  const qs = options?.limit ? `?limit=${encodeURIComponent(String(options.limit))}` : '';
+  return apiFetch<{ items: RecentDocumentItem[] }>(
+    `/api/recent-documents${qs}`,
+    { method: 'GET', signal: options?.signal },
+  );
+}
+
+export async function recordRecentDocumentApi(
+  body: RecordRecentDocumentInput,
+): Promise<{ item: RecentDocumentItem }> {
+  return apiFetch<{ item: RecentDocumentItem }>('/api/recent-documents/record', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export async function deleteRecentDocumentApi(recentId: string): Promise<{ ok: boolean }> {
+  return apiFetch<{ ok: boolean }>(
+    `/api/recent-documents/${encodeURIComponent(recentId)}`,
+    { method: 'DELETE' },
+  );
 }

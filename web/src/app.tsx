@@ -68,9 +68,9 @@ import { StableSessionPane as SessionPane } from './components/StableSessionPane
 import {
   SupervisionTaskConsole,
   SupervisionTaskPairSnapshotBridge,
-  SupervisionTaskConsoleToggle,
   supervisionTaskConsolePreferenceBounds,
 } from './components/SupervisionTaskConsole.js';
+import { CloudDocsPanel } from './components/CloudDocsPanel.js';
 import {
   loadSupervisionTaskConsolePreferences,
   saveSupervisionTaskConsolePreferences,
@@ -1065,28 +1065,18 @@ function InternalMainApp() {
   const autoEntryRunRef = useRef(0);
   const [showMobileServerMenu, setShowMobileServerMenu] = useState(false);
   const [showMobileFileBrowser, setShowMobileFileBrowser] = useState(false);
+  const [showCloudDocs, setShowCloudDocs] = useState(false);
   // On phones the console is a large overlay: never re-open it by itself at
-  // launch (owner: load silently, no big box on open). It opens only from its
-  // toggle. Desktop keeps the remembered side-panel state.
+  // launch (owner: load silently, no big box on open). Desktop keeps the remembered side-panel state.
   const [showSupervisionTaskConsole, setShowSupervisionTaskConsole] = useState(
     () => !isMobileDevice() && loadSupervisionTaskConsolePreferences(supervisionTaskConsolePreferenceBounds()).open,
   );
-  const toggleSupervisionTaskConsole = useCallback(() => {
-    setShowSupervisionTaskConsole((open) => {
-      const nextOpen = !open;
-      const bounds = supervisionTaskConsolePreferenceBounds();
-      const preferences = loadSupervisionTaskConsolePreferences(bounds);
-      saveSupervisionTaskConsolePreferences({ ...preferences, open: nextOpen }, bounds);
-      return nextOpen;
-    });
-  }, []);
   const closeSupervisionTaskConsole = useCallback(() => {
     const bounds = supervisionTaskConsolePreferenceBounds();
     const preferences = loadSupervisionTaskConsolePreferences(bounds);
     saveSupervisionTaskConsolePreferences({ ...preferences, open: false }, bounds);
     setShowSupervisionTaskConsole(false);
   }, []);
-  const supervisionTaskConsoleToggleRef = useRef<HTMLButtonElement>(null);
   const [shareDialogTarget, setShareDialogTarget] = useState<ShareDialogTarget | null>(null);
   const [selectedShareTarget, setSelectedShareTarget] = useState<ShareTarget | null>(null);
   const [selectedSharedEntryId, setSelectedSharedEntryId] = useState<string | null>(
@@ -3232,6 +3222,17 @@ function InternalMainApp() {
       removeDesktopWindow(DESKTOP_WINDOW_IDS.filePreview);
     }
   }, [previewFileRequest, selectedServerId, ensureDesktopWindow, removeDesktopWindow]);
+
+  useEffect(() => {
+    if (showCloudDocs) {
+      ensureDesktopWindow(DESKTOP_WINDOW_IDS.cloudDocs, {
+        kind: DESKTOP_WINDOW_KINDS.cloudDocs,
+        serverId: selectedServerId ?? undefined,
+      }, { bringToFront: true });
+    } else {
+      removeDesktopWindow(DESKTOP_WINDOW_IDS.cloudDocs);
+    }
+  }, [showCloudDocs, selectedServerId, ensureDesktopWindow, removeDesktopWindow]);
 
   // The tab the user last chose on purpose, and whether they have chosen one at
   // all since this document loaded. Only an explicit choice is remembered per
@@ -7112,6 +7113,7 @@ function InternalMainApp() {
     || showAdminPage
     || showSharedContextManagement
     || showControlledNodes
+    || showCloudDocs
     || showSharedContextDiagnostics
     || showDiscussionsPage
     || showDiscussionDialog
@@ -7598,7 +7600,7 @@ function InternalMainApp() {
               }
             }}
           >
-            <div style={{ display: 'flex', gap: 8, padding: '8px 12px 0' }}>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, padding: '8px 12px 0' }}>
               <button
                 class="btn"
                 style={{ background: '#334155', color: '#e2e8f0', fontSize: 12 }}
@@ -7635,6 +7637,20 @@ function InternalMainApp() {
                 onOpen={openRemoteDesktop}
                 canSetUp={!selectedShareTarget}
               />
+              <button
+                class="btn"
+                data-testid="desktop-cloud-docs-btn"
+                style={{
+                  background: showCloudDocs ? '#1d4ed8' : '#334155',
+                  color: showCloudDocs ? '#ffffff' : '#e2e8f0',
+                  fontSize: 12,
+                }}
+                onClick={() => setShowCloudDocs((prev) => !prev)}
+                title={trans('cloud_docs.title', 'Cloud Docs')}
+                aria-pressed={showCloudDocs}
+              >
+                📄 {trans('cloud_docs.button_label', 'Cloud Docs')}
+              </button>
               {/* Session-list show/hide toggle — same as the mobile sidebar ⊞ button */}
               <button
                 class="btn"
@@ -7955,17 +7971,24 @@ function InternalMainApp() {
               </div>
               <div class="mobile-server-actions">
                 {/* Left of the file-manager button, on purpose: remote-desktop
-                    launch/enable is the first action in this row. */}
-                <DaemonRemoteDesktopControl
-                  compact
-                  offerLoginScreenSetup={false}
-                  ws={wsRef.current}
-                  serverId={selectedServerId}
-                  serverName={selectedServerInfo?.name}
-                  daemonOnline={daemonOnline}
-                  onOpen={openRemoteDesktop}
-                  canSetUp={!selectedShareTarget}
-                />
+                    launch/enable + quick-node dropdown are the first actions in this row. */}
+                <div class="mobile-remote-desktop-group" data-testid="mobile-remote-desktop-group">
+                  <DaemonRemoteDesktopControl
+                    compact
+                    offerLoginScreenSetup={false}
+                    ws={wsRef.current}
+                    serverId={selectedServerId}
+                    serverName={selectedServerInfo?.name}
+                    daemonOnline={daemonOnline}
+                    onOpen={openRemoteDesktop}
+                    canSetUp={!selectedShareTarget}
+                  />
+                  <ControlledNodeQuickMenu
+                    onOpenRemoteDesktop={openRemoteDesktop}
+                    onOpenRemoteDesktopWall={openRemoteDesktopWall}
+                    onConnectById={openRemoteDesktopById}
+                  />
+                </div>
                 {activeSession && (
                   <button
                     class="view-toggle"
@@ -7983,12 +8006,15 @@ function InternalMainApp() {
                 <button class="view-toggle" title={trans('localWebPreview.title')} onClick={() => setShowDesktopLocalWebPreview((o) => !o)} style={{ position: 'relative' }}>
                   🌐
                 </button>
-                <SupervisionTaskConsoleToggle
-                  visibility={supervisionTaskConsoleVisibility}
-                  open={showSupervisionTaskConsole}
-                  triggerRef={supervisionTaskConsoleToggleRef}
-                  onToggle={toggleSupervisionTaskConsole}
-                />
+                <button
+                  class="view-toggle"
+                  data-testid="mobile-cloud-docs-btn"
+                  title={trans('cloud_docs.title', 'Cloud Docs')}
+                  onClick={() => setShowCloudDocs((prev) => !prev)}
+                  aria-pressed={showCloudDocs}
+                >
+                  📄
+                </button>
                 {!isTransportSession && (
                   <button class="view-toggle" data-onboarding="view-toggle" onClick={toggleViewMode}>
                     {viewMode === 'chat' ? '⌨' : '💬'}
@@ -8113,12 +8139,6 @@ function InternalMainApp() {
                 >
                   🌐
                 </button>
-                <SupervisionTaskConsoleToggle
-                  visibility={supervisionTaskConsoleVisibility}
-                  open={showSupervisionTaskConsole}
-                  triggerRef={supervisionTaskConsoleToggleRef}
-                  onToggle={toggleSupervisionTaskConsole}
-                />
                 <DesktopWindowMaximizeButton
                   class="view-toggle desktop-main-maximize-toggle"
                   data-testid="main-session-maximize-toggle"
@@ -8242,7 +8262,6 @@ function InternalMainApp() {
                   mobile={isMobile}
                   readOnly={sharedAccessRole === 'viewer'}
                   onClose={closeSupervisionTaskConsole}
-                  returnFocusRef={supervisionTaskConsoleToggleRef}
                   onNavigateSession={(sessionName) => {
                     navigateToSession(sessionName);
                     if (isMobile) closeSupervisionTaskConsole();
@@ -8913,6 +8932,21 @@ function InternalMainApp() {
             initialAction={aideskManagementAction}
             remoteDesktopManager={remoteDesktopConnectionManager}
           />
+        </FloatingPanel>
+      )}
+      {showCloudDocs && !mobileRemoteSurfaceActive && (
+        <FloatingPanel
+          id={DESKTOP_WINDOW_IDS.cloudDocs}
+          title={trans('cloud_docs.title', 'Cloud Docs')}
+          onClose={() => setShowCloudDocs(false)}
+          defaultW={920}
+          defaultH={660}
+          zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.cloudDocs, 5102)}
+          onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.cloudDocs)}
+          getMaximizeBounds={getDesktopMaximizeBounds}
+          desktopLayoutCapable={desktopLayoutCapable}
+        >
+          <CloudDocsPanel />
         </FloatingPanel>
       )}
 

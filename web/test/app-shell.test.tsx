@@ -2543,7 +2543,7 @@ describe('App shell', () => {
     }
   }, 20_000);
 
-  it('restores the task panel open state and persists close and toggle changes across refreshes', async () => {
+  it('restores the task panel open state, persists close across refreshes, and retires the toolbar toggle button', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
     localStorage.setItem('rcc_session', 'deck_alpha_brain');
@@ -2554,17 +2554,20 @@ describe('App shell', () => {
     }));
 
     const { App } = await importApp();
-    render(<App />);
+    const first = render(<App />);
 
     expect(await screen.findByRole('complementary', { name: 'supervision_task_console.title' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'supervision_task_console.toggle' })).toBeNull();
     const close = screen.getByRole('button', { name: 'common.close' });
     fireEvent.click(close);
     await waitFor(() => expect(screen.queryByRole('complementary', { name: 'supervision_task_console.title' })).toBeNull());
     expect(JSON.parse(localStorage.getItem(SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY)!).open).toBe(false);
 
-    fireEvent.click(screen.getAllByRole('button', { name: 'supervision_task_console.toggle' })[0]!);
-    expect(await screen.findByRole('complementary', { name: 'supervision_task_console.title' })).toBeTruthy();
-    expect(JSON.parse(localStorage.getItem(SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY)!).open).toBe(true);
+    first.unmount();
+    render(<App />);
+    await waitFor(() => expect(wsInstances.length).toBeGreaterThanOrEqual(2));
+    expect(screen.queryByRole('complementary', { name: 'supervision_task_console.title' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'supervision_task_console.toggle' })).toBeNull();
   }, 20_000);
 
   it('opens the session named by an all-pins navigation request', async () => {
@@ -3034,7 +3037,9 @@ describe('App shell', () => {
     render(<App />);
     await waitFor(() => expect(wsInstances.length).toBe(1));
 
-    fireEvent.click(await screen.findByTestId('controlled-node-quick-trigger'));
+    const triggers = await screen.findAllByTestId('controlled-node-quick-trigger');
+    expect(triggers.length).toBe(2);
+    fireEvent.click(triggers[0]!);
     expect(await screen.findByText('remote-desktop-workspace')).toBeTruthy();
     expect(screen.queryByTestId('floating-panel-controlled-nodes')).toBeNull();
   }, 20_000);
@@ -7155,7 +7160,7 @@ describe('App shell', () => {
     await waitFor(() => {
       expect(screen.getByRole('complementary', { name: 'supervision_task_console.title' }).getAttribute('data-read-only')).toBe('true');
     });
-    expect(screen.getAllByRole('button', { name: 'supervision_task_console.toggle' }).length).toBeGreaterThan(0);
+    expect(screen.queryByRole('button', { name: 'supervision_task_console.toggle' })).toBeNull();
   }, 20_000);
 
   it('restores the exact shared tab after refresh even when its server is also in the server list', async () => {

@@ -5187,5 +5187,72 @@
       "api_keys": "API Key",
       "account": "安全與帳號"
     }
+  },
+  "cloud_docs": {
+    "title": "雲端文件",
+    "button_label": "雲端文件",
+    "tabs": {
+      "recent": "最近瀏覽",
+      "my_docs": "我的雲端文件",
+      "shared": "與我共用"
+    },
+    "search_placeholder": "搜尋文件...",
+    "root_folder": "根目錄",
+    "folder_label": "資料夾",
+    "confirm_delete": "確定刪除「{{name}}」嗎？",
+    "actions": {
+      "back_to_list": "返回列表",
+      "download": "下載",
+      "new_folder": "新增資料夾",
+      "upload": "上傳",
+      "create": "建立",
+      "move": "移動",
+      "rename": "重新命名",
+      "remove_recent": "移出最近列表",
+      "share": "共用"
+    },
+    "blank_type": {
+      "docx": "Word",
+      "xlsx": "Excel",
+      "pptx": "PPT"
+    },
+    "placeholders": {
+      "folder_name": "資料夾名稱",
+      "doc_name": "文件名稱（可選）"
+    },
+    "source": {
+      "cloud_doc": "雲端文件",
+      "server_file": "伺服器"
+    },
+    "badges": {
+      "no_access": "無法存取",
+      "server_offline": "離線"
+    },
+    "empty": {
+      "recent": "尚無最近瀏覽的文件。在檔案瀏覽器或雲端文件中開啟任何文件後都會記錄在這裡。",
+      "my_docs": "目前資料夾為空。可建立空白 Office 文件或上傳本機檔案。",
+      "shared": "尚無他人向您或您所屬分組共用的雲端文件或資料夾。"
+    },
+    "errors": {
+      "load_failed": "載入文件失敗",
+      "file_too_large": "檔案超過 50 MB 大小限制",
+      "unsupported_format": "不支援的文件格式",
+      "server_not_found": "目標伺服器已不存在或無法使用。",
+      "doc_missing": "此雲端文件已不存在或已被刪除。",
+      "access_denied": "您已無權存取此文件。"
+    },
+    "share": {
+      "title": "共用「{{name}}」",
+      "mode_team": "受控節點分組",
+      "mode_user": "指定使用者",
+      "no_teams": "暫無可用的受控節點分組",
+      "user_placeholder": "使用者名稱或 ID",
+      "role_viewer": "唯讀檢視",
+      "role_editor": "協作編輯",
+      "allow_download": "允許下載",
+      "no_download": "禁止下載",
+      "submit": "確認共用",
+      "revoke": "撤銷"
+    }
   }
 }

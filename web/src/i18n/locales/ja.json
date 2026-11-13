@@ -5186,5 +5186,72 @@
       "api_keys": "APIキー",
       "account": "セキュリティとアカウント"
     }
+  },
+  "cloud_docs": {
+    "title": "クラウド文書",
+    "button_label": "クラウド文書",
+    "tabs": {
+      "recent": "最近開いた項目",
+      "my_docs": "マイクラウド文書",
+      "shared": "共有された項目"
+    },
+    "search_placeholder": "文書を検索...",
+    "root_folder": "ルート",
+    "folder_label": "フォルダ",
+    "confirm_delete": "「{{name}}」を削除しますか？",
+    "actions": {
+      "back_to_list": "戻る",
+      "download": "ダウンロード",
+      "new_folder": "新規フォルダ",
+      "upload": "アップロード",
+      "create": "作成",
+      "move": "移動",
+      "rename": "名前変更",
+      "remove_recent": "履歴から削除",
+      "share": "共有"
+    },
+    "blank_type": {
+      "docx": "Word",
+      "xlsx": "Excel",
+      "pptx": "PPT"
+    },
+    "placeholders": {
+      "folder_name": "フォルダ名",
+      "doc_name": "文書名（任意）"
+    },
+    "source": {
+      "cloud_doc": "クラウド文書",
+      "server_file": "サーバー"
+    },
+    "badges": {
+      "no_access": "利用不可",
+      "server_offline": "オフライン"
+    },
+    "empty": {
+      "recent": "最近開いた文書はまだありません。ファイルブラウザやクラウド文書から開くとここに表示されます。",
+      "my_docs": "このフォルダは空です。新しい Office 文書を作成するかファイルをアップロードしてください。",
+      "shared": "共有されたクラウド文書やフォルダーはまだありません。"
+    },
+    "errors": {
+      "load_failed": "文書の読み込みに失敗しました",
+      "file_too_large": "ファイルサイズが 50 MB の上限を超えています",
+      "unsupported_format": "未対応の文書形式です",
+      "server_not_found": "このサーバーは存在しないか利用できません。",
+      "doc_missing": "このクラウド文書は見つかりません。",
+      "access_denied": "この文書を開く権限がありません。"
+    },
+    "share": {
+      "title": "「{{name}}」を共有",
+      "mode_team": "管理ノードグループ",
+      "mode_user": "ユーザー",
+      "no_teams": "利用可能な管理ノードグループがありません",
+      "user_placeholder": "ユーザー名またはID",
+      "role_viewer": "閲覧のみ",
+      "role_editor": "編集可",
+      "allow_download": "ダウンロード許可",
+      "no_download": "ダウンロード禁止",
+      "submit": "共有",
+      "revoke": "取り消す"
+    }
   }
 }

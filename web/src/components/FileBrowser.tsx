@@ -61,6 +61,7 @@ import {
   createSharedDocItem,
   downloadAttachment,
   listDocsSharedWithMe,
+  recordRecentDocumentApi,
   type DocShareBrowseEntry,
   type SharedWithMeDocItem,
 } from '../api.js';
@@ -1867,6 +1868,28 @@ export function FileBrowser({
       preview,
     });
   }, [onPreviewStateChange, preview, previewViewMode, showDiff]);
+
+  const lastRecordedRecentOfficeKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (preview.status !== 'office') {
+      lastRecordedRecentOfficeKeyRef.current = null;
+      return;
+    }
+    const targetServerId = activeSharedDocServerId || serverId;
+    if (!targetServerId || typeof recordRecentDocumentApi !== 'function') return;
+    const key = `${targetServerId}:${preview.path}`;
+    if (lastRecordedRecentOfficeKeyRef.current === key) return;
+    lastRecordedRecentOfficeKeyRef.current = key;
+    void recordRecentDocumentApi({
+      sourceKind: 'server_file',
+      serverId: targetServerId,
+      sessionName: scopedSessionName,
+      filePath: preview.path,
+      mimeType: preview.mimeType,
+      title: preview.path.split(/[/\\]/).pop() || preview.path,
+      openMode: (activeSharedDocReadOnly ?? readOnly) ? 'view' : 'edit',
+    }).catch(() => {});
+  }, [preview, activeSharedDocServerId, serverId, scopedSessionName, activeSharedDocReadOnly, readOnly]);
 
   // Auto-preview file on open (e.g. when clicking a path link in chat)
   useEffect(() => {

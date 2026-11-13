@@ -5186,5 +5186,72 @@
       "api_keys": "API 키",
       "account": "보안 및 계정"
     }
+  },
+  "cloud_docs": {
+    "title": "클라우드 문서",
+    "button_label": "클라우드 문서",
+    "tabs": {
+      "recent": "최근 문서",
+      "my_docs": "내 클라우드 문서",
+      "shared": "공유됨"
+    },
+    "search_placeholder": "문서 검색...",
+    "root_folder": "루트",
+    "folder_label": "폴더",
+    "confirm_delete": "\"{{name}}\" 항목을 삭제할까요?",
+    "actions": {
+      "back_to_list": "뒤로",
+      "download": "다운로드",
+      "new_folder": "새 폴더",
+      "upload": "업로드",
+      "create": "만들기",
+      "move": "이동",
+      "rename": "이름 변경",
+      "remove_recent": "최근 목록에서 제거",
+      "share": "공유"
+    },
+    "blank_type": {
+      "docx": "Word",
+      "xlsx": "Excel",
+      "pptx": "PPT"
+    },
+    "placeholders": {
+      "folder_name": "폴더 이름",
+      "doc_name": "문서 이름 (선택 사항)"
+    },
+    "source": {
+      "cloud_doc": "클라우드 문서",
+      "server_file": "서버"
+    },
+    "badges": {
+      "no_access": "접근 불가",
+      "server_offline": "오프라인"
+    },
+    "empty": {
+      "recent": "최근에 연 문서가 없습니다. 파일 탐색기나 클라우드 문서에서 문서를 열면 여기에 표시됩니다.",
+      "my_docs": "이 폴더가 비어 있습니다. 새 Office 문서를 만들거나 파일을 업로드하세요.",
+      "shared": "공유받은 클라우드 문서나 폴더가 아직 없습니다."
+    },
+    "errors": {
+      "load_failed": "문서를 불러오지 못했습니다",
+      "file_too_large": "파일 크기가 50 MB 제한을 초과했습니다",
+      "unsupported_format": "지원하지 않는 문서 형식입니다",
+      "server_not_found": "해당 서버가 더 이상 존재하지 않거나 사용할 수 없습니다.",
+      "doc_missing": "이 클라우드 문서를 더 이상 찾을 수 없습니다.",
+      "access_denied": "이 문서를 열 수 있는 권한이 없습니다."
+    },
+    "share": {
+      "title": "\"{{name}}\" 공유",
+      "mode_team": "제어 노드 그룹",
+      "mode_user": "사용자",
+      "no_teams": "사용 가능한 제어 노드 그룹이 없습니다",
+      "user_placeholder": "사용자 이름 또는 ID",
+      "role_viewer": "읽기 전용",
+      "role_editor": "편집 가능",
+      "allow_download": "다운로드 허용",
+      "no_download": "다운로드 금지",
+      "submit": "공유",
+      "revoke": "철회"
+    }
   }
 }

@@ -54,6 +54,12 @@ import { subSessionRoutes } from './routes/sub-sessions.js';
 import { discussionRoutes } from './routes/discussions.js';
 import { tabSharingRoutes } from './routes/tab-sharing.js';
 import { onlyofficeRoutes } from './routes/onlyoffice.js';
+import { createCloudDocsRoutes } from './routes/cloud-docs.js';
+import {
+  LocalCloudDocStorage,
+  resolveCloudDocsStorageDir,
+  type CloudDocStorage,
+} from './storage/cloud-doc-storage.js';
 import { documentSharingRoutes } from './routes/document-sharing.js';
 import { preferencesRoutes } from './routes/preferences.js';
 import { aliasRoutes } from './routes/aliases.js';
@@ -153,6 +159,8 @@ const MAX_UNAUTH_CONNECTIONS = 1000;
 export interface BuildAppOptions {
   /** Focused-test seam; production always uses the lazy PostgreSQL stack. */
   unattendedPasswordProofService?: Pick<RemoteDesktopUnattendedPasswordProofService, 'prove'>;
+  /** Test seam for Cloud Docs blob persistence (defaults to LocalCloudDocStorage). */
+  cloudDocStorage?: CloudDocStorage;
 }
 
 export function buildApp(env: Env, options: BuildAppOptions = {}) {
@@ -319,6 +327,10 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
   app.route('/api', remoteDesktopGuestAccessRoutes);
   app.route('/api', tabSharingRoutes);
   app.route('/api', onlyofficeRoutes);
+  const cloudDocStorage = options.cloudDocStorage ?? new LocalCloudDocStorage(
+    resolveCloudDocsStorageDir(env.IMCODES_CLOUD_DOCS_DIR, env.NODE_ENV),
+  );
+  app.route('/api', createCloudDocsRoutes(cloudDocStorage));
   app.route('/api', documentSharingRoutes);
   app.route('/api', tokenUsageRoutes);
   // Pod-sticky memory routes: serverId is read from the `?serverId=` query

@@ -1,13 +1,10 @@
 /**
- * Toolbar placement is an explicit acceptance criterion: on desktop the ▥
- * task-console toggle sits in the top-right toolbar AFTER the 🌐 local-web-
- * preview button and BEFORE the window maximize control.
- *
- * This asserts source order in app.tsx rather than rendering the whole App.
- * That is a deliberate trade: rendering App here would need the entire session/
- * socket/router surface stubbed, and the thing being protected is precisely the
- * ORDER of three siblings in one JSX block — which a reorder would change here
- * and which no existing test covers.
+ * Toolbar placement invariants:
+ * - SupervisionTaskConsoleToggle is retired from both desktop and mobile toolbars.
+ * - Desktop sidebar places the Cloud Docs button to the right of DaemonRemoteDesktopControl
+ *   and to the left of the session-tree toggle (⊞).
+ * - Mobile server actions bar replaces the retired task toggle after 🌐 (localWebPreview.title)
+ *   with the Cloud Docs button, before view-toggle.
  */
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -31,47 +28,65 @@ function desktopToolbarBlock(): string {
   );
 }
 
+function desktopSidebarToolbarBlock(): string {
+  return boundedBlock(
+    '<Sidebar',
+    '<SharedEntriesPanel',
+  );
+}
+
 function mobileToolbarBlock(): string {
   return boundedBlock('<div class="mobile-server-actions">', '<SessionTabs');
 }
 
-describe('supervision task console toolbar placement', () => {
-  it('places the desktop toggle after the local-web-preview button and before maximize', () => {
-    const block = desktopToolbarBlock();
-    const globe = block.indexOf('🌐');
-    const toggle = block.indexOf('<SupervisionTaskConsoleToggle');
-    const maximize = block.indexOf('<DesktopWindowMaximizeButton');
-
-    expect(globe, 'globe button present').toBeGreaterThan(-1);
-    expect(toggle, 'console toggle present in the desktop toolbar').toBeGreaterThan(-1);
-    expect(maximize, 'maximize button present').toBeGreaterThan(-1);
-
-    expect(toggle).toBeGreaterThan(globe);
-    expect(toggle).toBeLessThan(maximize);
+describe('toolbar placement & retired supervision task console toggle', () => {
+  it('retires SupervisionTaskConsoleToggle from both desktop and mobile toolbars', () => {
+    expect(desktopToolbarBlock()).not.toContain('<SupervisionTaskConsoleToggle');
+    expect(mobileToolbarBlock()).not.toContain('<SupervisionTaskConsoleToggle');
+    expect(app).not.toContain('<SupervisionTaskConsoleToggle');
   });
 
-  it('renders exactly one mobile toggle after local web preview using the one trigger ref', () => {
+  it('places the desktop Cloud Docs button to the right of DaemonRemoteDesktopControl and left of session tree toggle', () => {
+    const block = desktopSidebarToolbarBlock();
+    const computerBtn = block.indexOf('<DaemonRemoteDesktopControl');
+    const cloudDocsBtn = block.indexOf('data-testid="desktop-cloud-docs-btn"');
+    const treeToggle = block.indexOf("trans('sidebar.sessionTree'");
+
+    expect(computerBtn, 'computer button present in sidebar').toBeGreaterThan(-1);
+    expect(cloudDocsBtn, 'Cloud Docs button present in sidebar').toBeGreaterThan(-1);
+    expect(treeToggle, 'session tree toggle present in sidebar').toBeGreaterThan(-1);
+
+    expect(cloudDocsBtn).toBeGreaterThan(computerBtn);
+    expect(cloudDocsBtn).toBeLessThan(treeToggle);
+  });
+
+  it('places ControlledNodeQuickMenu immediately right of DaemonRemoteDesktopControl and left of Files inside mobile-server-actions', () => {
+    const block = mobileToolbarBlock();
+    const rd = block.indexOf('<DaemonRemoteDesktopControl');
+    const quickMenu = block.indexOf('<ControlledNodeQuickMenu');
+    const filesBtn = block.indexOf('📁');
+
+    expect(rd, 'mobile DaemonRemoteDesktopControl present').toBeGreaterThan(-1);
+    expect(quickMenu, 'mobile ControlledNodeQuickMenu present').toBeGreaterThan(-1);
+    expect(filesBtn, 'mobile Files button present').toBeGreaterThan(-1);
+
+    expect(quickMenu).toBeGreaterThan(rd);
+    expect(quickMenu).toBeLessThan(filesBtn);
+    expect(block).toContain('mobile-remote-desktop-group');
+  });
+
+  it('places the mobile Cloud Docs button directly to the right of 🌐 and before view-toggle', () => {
     const block = mobileToolbarBlock();
     const globe = block.indexOf('🌐');
-    const toggles = [...block.matchAll(/<SupervisionTaskConsoleToggle/g)];
-    expect(globe).toBeGreaterThan(-1);
-    expect(toggles).toHaveLength(1);
-    expect(toggles[0]!.index).toBeGreaterThan(globe);
-    expect(block.match(/triggerRef=\{supervisionTaskConsoleToggleRef\}/g)).toHaveLength(1);
-  });
+    const cloudDocsBtn = block.indexOf('data-testid="mobile-cloud-docs-btn"');
+    const viewToggle = block.indexOf('data-onboarding="view-toggle"');
 
-  it('routes the desktop toggle through the shared visibility decision', () => {
-    const block = desktopToolbarBlock();
-    const toggle = block.indexOf('<SupervisionTaskConsoleToggle');
-    const props = block.slice(toggle, toggle + 400);
-    expect(props).toContain('visibility={supervisionTaskConsoleVisibility}');
-  });
+    expect(globe, 'globe button present in mobile bar').toBeGreaterThan(-1);
+    expect(cloudDocsBtn, 'Cloud Docs button present in mobile bar').toBeGreaterThan(-1);
+    expect(viewToggle, 'view toggle present in mobile bar').toBeGreaterThan(-1);
 
-  it('routes the real mobile toggle through the same shared visibility decision', () => {
-    const block = mobileToolbarBlock();
-    const toggle = block.indexOf('<SupervisionTaskConsoleToggle');
-    const props = block.slice(toggle, toggle + 400);
-    expect(props).toContain('visibility={supervisionTaskConsoleVisibility}');
+    expect(cloudDocsBtn).toBeGreaterThan(globe);
+    expect(cloudDocsBtn).toBeLessThan(viewToggle);
   });
 
   it('gates the panel with the shared visibility helper and never duplicates a local role predicate', () => {
@@ -99,12 +114,8 @@ describe('supervision task console toolbar placement', () => {
     expect(app).toContain('if (!nextUserId) clearAllSupervisionTaskConsoleCaches();');
   });
 
-  it('restores and persists panel open state through the shared preferences helper', () => {
-    // Phones never re-open the large overlay at launch; desktop restores it.
-    expect(app).toMatch(/useState\(\s*\(\) => !isMobileDevice\(\) && loadSupervisionTaskConsolePreferences\(supervisionTaskConsolePreferenceBounds\(\)\)\.open/);
-    expect(app).toContain('saveSupervisionTaskConsolePreferences({ ...preferences, open: nextOpen }, bounds);');
-    expect(app).toContain('saveSupervisionTaskConsolePreferences({ ...preferences, open: false }, bounds);');
-    expect(app.match(/onToggle=\{toggleSupervisionTaskConsole\}/g)).toHaveLength(2);
-    expect(app).toContain('onClose={closeSupervisionTaskConsole}');
+  it('mounts CloudDocsPanel inside FloatingPanel when showCloudDocs is enabled', () => {
+    expect(app).toContain('id={DESKTOP_WINDOW_IDS.cloudDocs}');
+    expect(app).toContain('<CloudDocsPanel />');
   });
 });

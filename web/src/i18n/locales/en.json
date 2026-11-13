@@ -5197,5 +5197,72 @@
       "api_keys": "API Keys",
       "account": "Security & Account"
     }
+  },
+  "cloud_docs": {
+    "title": "Cloud Docs",
+    "button_label": "Cloud Docs",
+    "tabs": {
+      "recent": "Recent",
+      "my_docs": "My Cloud Docs",
+      "shared": "Shared with me"
+    },
+    "search_placeholder": "Search documents...",
+    "root_folder": "Root",
+    "folder_label": "Folder",
+    "confirm_delete": "Delete \"{{name}}\"?",
+    "actions": {
+      "back_to_list": "Back",
+      "download": "Download",
+      "new_folder": "New Folder",
+      "upload": "Upload",
+      "create": "Create",
+      "move": "Move",
+      "rename": "Rename",
+      "remove_recent": "Remove from Recent",
+      "share": "Share"
+    },
+    "blank_type": {
+      "docx": "Word",
+      "xlsx": "Excel",
+      "pptx": "PPT"
+    },
+    "placeholders": {
+      "folder_name": "Folder name",
+      "doc_name": "Document name (optional)"
+    },
+    "source": {
+      "cloud_doc": "Cloud Doc",
+      "server_file": "Server"
+    },
+    "badges": {
+      "no_access": "Unavailable",
+      "server_offline": "Offline"
+    },
+    "empty": {
+      "recent": "No recently viewed documents yet. Open any document in File Browser or Cloud Docs to see it here.",
+      "my_docs": "This folder is empty. Create a blank Office document or upload one to get started.",
+      "shared": "No cloud documents or folders have been shared with you yet."
+    },
+    "errors": {
+      "load_failed": "Failed to load documents",
+      "file_too_large": "File exceeds the 50 MB limit",
+      "unsupported_format": "Unsupported document format",
+      "server_not_found": "This server no longer exists or is unavailable.",
+      "doc_missing": "This cloud document is no longer available.",
+      "access_denied": "You no longer have permission to open this document."
+    },
+    "share": {
+      "title": "Share \"{{name}}\"",
+      "mode_team": "Node Group (Team)",
+      "mode_user": "User",
+      "no_teams": "No controlled-node groups available",
+      "user_placeholder": "Username or user ID",
+      "role_viewer": "Viewer",
+      "role_editor": "Editor",
+      "allow_download": "Allow Download",
+      "no_download": "No Download",
+      "submit": "Share",
+      "revoke": "Revoke"
+    }
   }
 }

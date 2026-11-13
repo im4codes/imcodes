@@ -5187,5 +5187,72 @@
       "api_keys": "Claves API",
       "account": "Seguridad y cuenta"
     }
+  },
+  "cloud_docs": {
+    "title": "Documentos en la nube",
+    "button_label": "Docs nube",
+    "tabs": {
+      "recent": "Recientes",
+      "my_docs": "Mis documentos",
+      "shared": "Compartidos"
+    },
+    "search_placeholder": "Buscar documentos...",
+    "root_folder": "Raíz",
+    "folder_label": "Carpeta",
+    "confirm_delete": "¿Eliminar \"{{name}}\"?",
+    "actions": {
+      "back_to_list": "Volver",
+      "download": "Descargar",
+      "new_folder": "Nueva carpeta",
+      "upload": "Subir",
+      "create": "Crear",
+      "move": "Mover",
+      "rename": "Renombrar",
+      "remove_recent": "Quitar de recientes",
+      "share": "Compartir"
+    },
+    "blank_type": {
+      "docx": "Word",
+      "xlsx": "Excel",
+      "pptx": "PPT"
+    },
+    "placeholders": {
+      "folder_name": "Nombre de la carpeta",
+      "doc_name": "Nombre del documento (opcional)"
+    },
+    "source": {
+      "cloud_doc": "Doc nube",
+      "server_file": "Servidor"
+    },
+    "badges": {
+      "no_access": "No disponible",
+      "server_offline": "Sin conexión"
+    },
+    "empty": {
+      "recent": "Aún no hay documentos recientes. Abre cualquier documento en el explorador de archivos o en Documentos en la nube para verlo aquí.",
+      "my_docs": "Esta carpeta está vacía. Crea un documento Office en blanco o sube uno para comenzar.",
+      "shared": "Todavía no se han compartido documentos ni carpetas contigo."
+    },
+    "errors": {
+      "load_failed": "No se pudieron cargar los documentos",
+      "file_too_large": "El archivo supera el límite de 50 MB",
+      "unsupported_format": "Formato de documento no compatible",
+      "server_not_found": "Este servidor ya no existe o no está disponible.",
+      "doc_missing": "Este documento en la nube ya no está disponible.",
+      "access_denied": "Ya no tienes permiso para abrir este documento."
+    },
+    "share": {
+      "title": "Compartir \"{{name}}\"",
+      "mode_team": "Grupo de nodos",
+      "mode_user": "Usuario",
+      "no_teams": "No hay grupos de nodos disponibles",
+      "user_placeholder": "Usuario o ID",
+      "role_viewer": "Lector",
+      "role_editor": "Editor",
+      "allow_download": "Permitir descarga",
+      "no_download": "Sin descarga",
+      "submit": "Compartir",
+      "revoke": "Revocar"
+    }
   }
 }

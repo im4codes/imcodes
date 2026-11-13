@@ -3643,6 +3643,36 @@ html.native-ios-mac .chat-dl-btn {
 .mobile-server-btn > .share-state-indicator { margin-left: 0; flex: 0 0 auto; }
 .mobile-server-btn-chevron { width: 24px; height: 24px; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; color: #67e8f9; background: rgba(15,23,42,0.52); }
 .mobile-server-actions { display: flex; gap: 5px; align-items: center; flex: 0 0 auto; }
+.mobile-remote-desktop-group { display: inline-flex; align-items: stretch; flex: 0 0 auto; }
+.mobile-remote-desktop-group .daemon-remote-desktop-btn { border-radius: 4px 0 0 4px; margin-right: 0; }
+.mobile-remote-desktop-group .controlled-nodes-quick-trigger {
+  width: 18px;
+  min-width: 18px;
+  height: auto;
+  padding: 0;
+  border-radius: 0 4px 4px 0;
+  border: 1px solid #475569;
+  border-left: 0;
+  background: none;
+  color: #cbd5e1;
+  font-size: 10px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.mobile-remote-desktop-group .controlled-nodes-quick-trigger:hover,
+.mobile-remote-desktop-group .controlled-nodes-quick-trigger[aria-expanded='true'] {
+  background: #334155;
+  color: #f8fafc;
+  border-color: #475569;
+}
+@media (max-width: 420px) {
+  .mobile-server-bar { gap: 5px; padding: 6px 6px; }
+  .mobile-server-actions { gap: 3px; }
+  .mobile-server-actions .view-toggle { padding: 4px 6px; font-size: 13px; }
+  .mobile-remote-desktop-group .controlled-nodes-quick-trigger { width: 16px; min-width: 16px; }
+}
 .mobile-server-backdrop { position: fixed; inset: 0; z-index: 6499; }
 .mobile-server-menu { position: absolute; top: calc(100% + 8px); left: 0; display: flex; flex-direction: column; width: min(300px, calc(100vw - 18px)); height: calc(var(--mobile-server-menu-available-height, calc(100vh - 72px)) - 8px - env(safe-area-inset-bottom, 0px)); height: calc(var(--mobile-server-menu-available-height, calc(100dvh - 72px)) - 8px - env(safe-area-inset-bottom, 0px)); box-sizing: border-box; max-height: calc(var(--vvh, 100dvh) - var(--sat, 0px) - 68px - env(safe-area-inset-bottom, 0px)); padding-bottom: max(16px, env(safe-area-inset-bottom, 0px)); background: #1e293b; border: 1px solid rgba(125,211,252,0.20); border-radius: 12px; min-width: min(240px, calc(100vw - 18px)); box-shadow: 0 14px 34px #00000090, 0 0 20px rgba(34,211,238,0.10); z-index: 50; overflow-x: hidden; overflow-y: hidden; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: rgba(125, 211, 252, 0.28) transparent; }
 .mobile-server-menu-body::-webkit-scrollbar { width: 5px; }
@@ -17191,5 +17221,411 @@ button.quick-agent-delegation-preset.active {
   }
   .api-key-pagination {
     justify-content: center;
+  }
+}
+
+/* ── Cloud Docs & Recent Documents Panel ──────────────────────────────────── */
+.cloud-docs-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  width: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
+  background: #0b1120;
+  color: #e2e8f0;
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+.cloud-docs-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid #1e293b;
+  background: #0f172a;
+  flex-shrink: 0;
+  min-width: 0;
+}
+.cloud-docs-tabs {
+  display: inline-flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.cloud-docs-tab {
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid #334155;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.cloud-docs-tab.is-active {
+  background: #1d4ed8;
+  border-color: #3b82f6;
+  color: #fff;
+}
+.cloud-docs-header-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 180px;
+  min-width: 0;
+  justify-content: flex-end;
+}
+.cloud-docs-search {
+  flex: 1 1 120px;
+  min-width: 0;
+  max-width: 260px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid #334155;
+  background: #020617;
+  color: #e2e8f0;
+  font-size: 12px;
+  box-sizing: border-box;
+}
+.cloud-docs-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid #1e293b;
+  background: #0f172a;
+  flex-shrink: 0;
+  min-width: 0;
+}
+.cloud-docs-breadcrumbs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  font-size: 12px;
+}
+.cloud-docs-crumb-sep {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #64748b;
+}
+.cloud-docs-crumb {
+  background: none;
+  border: none;
+  padding: 2px 4px;
+  border-radius: 4px;
+  color: #94a3b8;
+  cursor: pointer;
+  font-size: 12px;
+}
+.cloud-docs-crumb.is-current {
+  color: #e2e8f0;
+  font-weight: 600;
+}
+.cloud-docs-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+.cloud-docs-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  border: 1px solid #334155;
+  background: #1e293b;
+  color: #e2e8f0;
+  font-size: 12px;
+  text-decoration: none;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.cloud-docs-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.cloud-docs-btn.is-primary {
+  background: #2563eb;
+  border-color: #3b82f6;
+  color: #fff;
+}
+.cloud-docs-btn.is-danger {
+  background: rgba(185, 28, 28, 0.25);
+  border-color: rgba(248, 113, 113, 0.45);
+  color: #fca5a5;
+}
+.cloud-docs-link-btn {
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 13px;
+}
+.cloud-docs-inline-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  border-bottom: 1px solid #1e293b;
+  background: #111827;
+  flex-shrink: 0;
+  min-width: 0;
+}
+.cloud-docs-inline-label {
+  font-size: 12px;
+  color: #93c5fd;
+  font-weight: 600;
+}
+.cloud-docs-input {
+  flex: 1 1 140px;
+  min-width: 0;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid #334155;
+  background: #020617;
+  color: #e2e8f0;
+  font-size: 12px;
+  box-sizing: border-box;
+}
+.cloud-docs-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.cloud-docs-banner.is-error {
+  background: rgba(127, 29, 29, 0.35);
+  border-bottom: 1px solid rgba(248, 113, 113, 0.35);
+  color: #fecaca;
+}
+.cloud-docs-banner.is-warning {
+  background: rgba(120, 53, 15, 0.35);
+  border-bottom: 1px solid rgba(251, 191, 36, 0.35);
+  color: #fde68a;
+}
+.cloud-docs-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 10px 12px;
+}
+.cloud-docs-empty {
+  padding: 28px 16px;
+  text-align: center;
+  color: #94a3b8;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.cloud-docs-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+.cloud-docs-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid #1e293b;
+  border-radius: 8px;
+  background: #0f172a;
+  min-width: 0;
+}
+.cloud-docs-row.is-inaccessible {
+  opacity: 0.78;
+  border-color: rgba(245, 158, 11, 0.35);
+}
+.cloud-docs-row-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  flex: 1 1 200px;
+  min-width: 0;
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.cloud-docs-row-icon {
+  font-size: 18px;
+  line-height: 1.2;
+  flex-shrink: 0;
+}
+.cloud-docs-row-meta {
+  flex: 1;
+  min-width: 0;
+}
+.cloud-docs-row-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #f1f5f9;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.cloud-docs-row-sub {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 3px;
+  font-size: 11px;
+  color: #94a3b8;
+  min-width: 0;
+}
+.cloud-docs-path {
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+.cloud-docs-time {
+  color: #64748b;
+}
+.cloud-docs-badge {
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+}
+.cloud-docs-badge.is-cloud {
+  background: rgba(37, 99, 235, 0.25);
+  color: #93c5fd;
+}
+.cloud-docs-badge.is-server {
+  background: rgba(16, 185, 129, 0.2);
+  color: #6ee7b7;
+}
+.cloud-docs-badge.is-warn {
+  background: rgba(245, 158, 11, 0.22);
+  color: #fcd34d;
+}
+.cloud-docs-badge.is-muted {
+  background: rgba(100, 116, 139, 0.25);
+  color: #cbd5e1;
+}
+.cloud-docs-row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.cloud-docs-preview-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid #1e293b;
+  background: #0f172a;
+  flex-shrink: 0;
+  min-width: 0;
+}
+.cloud-docs-preview-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+}
+.cloud-docs-preview-stage {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.cloud-docs-loading {
+  padding: 20px;
+  color: #94a3b8;
+  text-align: center;
+}
+.cloud-docs-share-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 14px;
+  background: rgba(15, 23, 42, 0.96);
+  border-bottom: 1px solid #334155;
+  flex-shrink: 0;
+}
+.cloud-docs-share-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #f8fafc;
+}
+.cloud-docs-share-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.cloud-docs-share-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: #cbd5e1;
+  cursor: pointer;
+}
+.cloud-docs-share-hint {
+  font-size: 12px;
+  color: #94a3b8;
+}
+.cloud-docs-share-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.cloud-docs-share-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid #1e293b;
+  background: #0f172a;
+  font-size: 12px;
+  color: #e2e8f0;
+}
+@media (max-width: 480px) {
+  .cloud-docs-header {
+    padding: 8px 10px;
+  }
+  .cloud-docs-header-right {
+    flex: 1 1 100%;
+    justify-content: stretch;
+  }
+  .cloud-docs-search {
+    max-width: none;
+  }
+  .cloud-docs-toolbar,
+  .cloud-docs-body {
+    padding-left: 10px;
+    padding-right: 10px;
   }
 }

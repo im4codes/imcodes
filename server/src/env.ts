@@ -36,6 +36,7 @@ export interface EnvConfig {
   ONLYOFFICE_JWT_SECRET?: string;
   ONLYOFFICE_PUBLIC_URL?: string;
   ONLYOFFICE_INTERNAL_URL?: string;
+  IMCODES_CLOUD_DOCS_DIR?: string;
 
   // Server URL (used to build webhook URLs)
   SERVER_URL: string;
@@ -152,6 +153,7 @@ export function loadEnv(): EnvConfig {
     ONLYOFFICE_JWT_SECRET: process.env.ONLYOFFICE_JWT_SECRET,
     ONLYOFFICE_PUBLIC_URL: process.env.ONLYOFFICE_PUBLIC_URL,
     ONLYOFFICE_INTERNAL_URL: process.env.ONLYOFFICE_INTERNAL_URL ?? 'http://onlyoffice:80',
+    IMCODES_CLOUD_DOCS_DIR: process.env.IMCODES_CLOUD_DOCS_DIR,
     SERVER_URL: process.env.SERVER_URL ?? `http://localhost:${process.env.PORT ?? 19138}`,
     ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS,
     TRUSTED_PROXIES: process.env.TRUSTED_PROXIES,

@@ -39,6 +39,7 @@ services:
       # <IMCODES_NODE_EXE_DIR>/versions, which lives in the image and is lost on
       # every image replacement.
       IMCODES_NODE_EXE_VERSION_DIR: /var/lib/imcodes/node-exe-versions
+      IMCODES_CLOUD_DOCS_DIR: /var/lib/imcodes/cloud-docs
       # Other public https origins of THIS deployment (a proxy domain next to DOMAIN), comma separated. Controlled nodes
       # learn them from their authenticated connection and fall back to them when the address they were enrolled with is
       # blocked. A node sends its credential to every listed origin it connects to, so every listed origin MUST reach this
@@ -47,6 +48,7 @@ services:
       IMCODES_PUBLIC_URLS: "${IMCODES_PUBLIC_URLS:-}"
     volumes:
       - node_exe_versions:/var/lib/imcodes/node-exe-versions
+      - cloud_docs:/var/lib/imcodes/cloud-docs
     labels:
       - com.centurylinklabs.watchtower.scope=imcodes
     depends_on:
@@ -99,6 +101,7 @@ volumes:
   caddy_config:
   onlyoffice_data:
   onlyoffice_logs:
+  cloud_docs:
   # Retained superseded controlled-node artifacts. Declared explicitly so an
   # upgrade neither renames nor drops it, and kept separate from the image's
   # /app/controlled-node-executables so a new image cannot overwrite retained
