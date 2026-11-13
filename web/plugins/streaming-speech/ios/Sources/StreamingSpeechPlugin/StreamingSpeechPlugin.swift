@@ -17,15 +17,24 @@ final class SpeechCoordinator {
         case final(String)
         case error(String)
     }
+    enum CaptureResult {
+        case samples([Float])
+        case failure(String)
+        case ignore
+    }
     typealias DecodeFn = ([Float], @escaping () -> Bool) -> String?
 
-    private let lock = NSLock()
+    private let lock = NSCondition()
     let worker = DispatchQueue(label: "com.imcodes.streaming-speech", qos: .userInitiated)
     private let emitQueue: DispatchQueue
     private let onEvent: (Event) -> Void
 
     private var generation: UInt64 = 0
     private var eventOwner: UInt64 = 0
+    private var inboxOwner: UInt64 = 0
+    private var inFlightCapturesByOwner: [UInt64: Int] = [:]
+    private var pendingStopCaptureError: [UInt64: String] = [:]
+    private var stopInitiatedOwners: Set<UInt64> = []
     private var abortedOwner: UInt64 = 0
     private var isAppBackgrounded = false
     private var inbox = SpeechInbox()
@@ -60,6 +69,50 @@ final class SpeechCoordinator {
         return eventOwner == owner && !isAppBackgrounded
     }
 
+    private func claimStoppedEmissionLocked(for owner: UInt64) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard eventOwner == owner, stoppedEmittedOwner != owner else { return false }
+        stoppedEmittedOwner = owner
+        return true
+    }
+
+    private func releaseCaptureLeaseLocked(for owner: UInt64) {
+        let remaining = (inFlightCapturesByOwner[owner] ?? 1) - 1
+        if remaining <= 0 {
+            inFlightCapturesByOwner.removeValue(forKey: owner)
+            lock.broadcast()
+        } else {
+            inFlightCapturesByOwner[owner] = remaining
+        }
+    }
+
+    private func deliverStopOutcome(
+        owner: UInt64,
+        finalText: String? = nil,
+        errorMessage: String? = nil,
+        outcomeError: String?,
+        callbacks: [(String?) -> Void]
+    ) {
+        emitQueue.async { [weak self] in
+            guard let self = self else {
+                for cb in callbacks { cb(outcomeError) }
+                return
+            }
+            if let finalText = finalText, self.isEventOwner(owner) {
+                self.onEvent(.final(finalText))
+            }
+            if let errorMessage = errorMessage, self.isEventOwner(owner) {
+                self.onEvent(.error(errorMessage))
+            }
+            if self.claimStoppedEmissionLocked(for: owner) {
+                self.onEvent(.stopped)
+            }
+            for cb in callbacks {
+                cb(outcomeError)
+            }
+        }
+    }
+
     func beginStart(
         makeDecode: @escaping () -> DecodeFn?,
         onStartReady: @escaping () -> Void,
@@ -69,14 +122,18 @@ final class SpeechCoordinator {
         generation &+= 1
         let owner = generation
         eventOwner = owner
+        inboxOwner = owner
         abortedOwner = 0
         isAppBackgrounded = false
         inbox = SpeechInbox()
+        pendingStopCaptureError.removeAll()
+        stopInitiatedOwners.removeAll()
         startPendingOwner = owner
         startReadyCallback = onStartReady
         drainInterruptedOwner = 0
         reportedErrorOwner = 0
         settledStopErrors.removeAll()
+        lock.broadcast()
         lock.unlock()
 
         // Enqueue decoder setup on the serial worker queue BEFORE starting AVAudioEngine
@@ -141,50 +198,107 @@ final class SpeechCoordinator {
         }
     }
 
+    @discardableResult
+    func admitAndOffer(
+        owner: UInt64,
+        now: TimeInterval = ProcessInfo.processInfo.systemUptime,
+        onOverloadTeardown: @escaping () -> Void,
+        onErrorTeardown: (() -> Void)? = nil,
+        produce: () -> CaptureResult
+    ) -> Bool {
+        lock.lock()
+        guard generation == owner, inboxOwner == owner else {
+            lock.unlock()
+            return false
+        }
+        inFlightCapturesByOwner[owner, default: 0] += 1
+        lock.unlock()
+
+        let result = produce()
+
+        lock.lock()
+        releaseCaptureLeaseLocked(for: owner)
+        guard inboxOwner == owner else {
+            lock.unlock()
+            return true
+        }
+        if generation != owner {
+            switch result {
+            case .samples(let samples):
+                do {
+                    _ = try inbox.offer(samples)
+                } catch {
+                    if pendingStopCaptureError[owner] == nil {
+                        pendingStopCaptureError[owner] = "Offline speech processing overloaded"
+                    }
+                }
+            case .failure(let message):
+                if pendingStopCaptureError[owner] == nil {
+                    pendingStopCaptureError[owner] = message
+                }
+            case .ignore:
+                break
+            }
+            lock.unlock()
+            return true
+        }
+
+        switch result {
+        case .samples(let samples):
+            do {
+                let warming = inbox.warmupRemaining > 0
+                let schedule = try inbox.offer(samples)
+                var readyCallback: (() -> Void)?
+                if warming && inbox.warmupRemaining == 0 && startPendingOwner == owner {
+                    startPendingOwner = 0
+                    readyCallback = startReadyCallback
+                    startReadyCallback = nil
+                }
+                let level = inbox.pollAudioLevel(now: now)
+                lock.unlock()
+
+                if let readyCallback = readyCallback {
+                    emitQueue.async { [weak self] in
+                        readyCallback()
+                        guard let self = self, self.isCurrent(owner) else { return }
+                        self.onEvent(.started)
+                    }
+                }
+                if let level = level {
+                    emitQueue.async { [weak self] in
+                        guard let self = self else { return }
+                        self.lock.lock()
+                        let active = self.generation == owner && self.eventOwner == owner
+                        self.lock.unlock()
+                        guard active else { return }
+                        self.onEvent(.audioLevel(level))
+                    }
+                }
+                if schedule {
+                    worker.async { [weak self] in self?.drain(owner: owner) }
+                }
+            } catch {
+                lock.unlock()
+                // Bounded admission fails visibly; never silently discard words.
+                failCapture(owner: owner, message: "Offline speech processing overloaded", teardown: onOverloadTeardown)
+            }
+        case .failure(let message):
+            lock.unlock()
+            failCapture(owner: owner, message: message, teardown: onErrorTeardown ?? onOverloadTeardown)
+        case .ignore:
+            lock.unlock()
+        }
+        return true
+    }
+
     func offerSamples(
         _ samples: [Float],
         owner: UInt64,
         now: TimeInterval = ProcessInfo.processInfo.systemUptime,
         onOverloadTeardown: @escaping () -> Void
     ) {
-        lock.lock()
-        guard generation == owner else { lock.unlock(); return }
-        do {
-            let warming = inbox.warmupRemaining > 0
-            let schedule = try inbox.offer(samples)
-            var readyCallback: (() -> Void)?
-            if warming && inbox.warmupRemaining == 0 && startPendingOwner == owner {
-                startPendingOwner = 0
-                readyCallback = startReadyCallback
-                startReadyCallback = nil
-            }
-            let level = inbox.pollAudioLevel(now: now)
-            lock.unlock()
-
-            if let readyCallback = readyCallback {
-                emitQueue.async { [weak self] in
-                    guard let self = self, self.isCurrent(owner) else { return }
-                    readyCallback()
-                    self.onEvent(.started)
-                }
-            }
-            if let level = level {
-                emitQueue.async { [weak self] in
-                    guard let self = self else { return }
-                    self.lock.lock()
-                    let active = self.generation == owner && self.eventOwner == owner
-                    self.lock.unlock()
-                    guard active else { return }
-                    self.onEvent(.audioLevel(level))
-                }
-            }
-            if schedule {
-                worker.async { [weak self] in self?.drain(owner: owner) }
-            }
-        } catch {
-            lock.unlock()
-            // Bounded admission fails visibly; never silently discard words.
-            failCapture(owner: owner, message: "Offline speech processing overloaded", teardown: onOverloadTeardown)
+        _ = admitAndOffer(owner: owner, now: now, onOverloadTeardown: onOverloadTeardown) {
+            .samples(samples)
         }
     }
 
@@ -203,58 +317,68 @@ final class SpeechCoordinator {
         lock.lock()
         let owner = eventOwner
         generation &+= 1
-        let stoppingOwner = generation
-        let tail = inbox.take()
+        if owner == 0 {
+            var readyCallback: (() -> Void)?
+            if startPendingOwner == 0 {
+                readyCallback = startReadyCallback
+                startReadyCallback = nil
+            }
+            lock.unlock()
+            readyCallback?()
+            stopAudio()
+            if let stopCompletion = stopCompletion {
+                emitQueue.async { stopCompletion(nil) }
+            }
+            return
+        }
+
+        let isFirstStopForOwner = !stopInitiatedOwners.contains(owner)
+        if isFirstStopForOwner {
+            stopInitiatedOwners.insert(owner)
+            while inboxOwner == owner && (inFlightCapturesByOwner[owner] ?? 0) > 0 {
+                lock.wait()
+            }
+        }
+        let takeTail = isFirstStopForOwner && inboxOwner == owner
+        let tail = takeTail ? inbox.take() : nil
+        let captureFailure = takeTail ? pendingStopCaptureError.removeValue(forKey: owner) : nil
+        if takeTail {
+            inboxOwner = 0
+        }
+
         var readyCallback: (() -> Void)?
         if startPendingOwner == owner {
             startPendingOwner = 0
             readyCallback = startReadyCallback
             startReadyCallback = nil
         }
-        if let stopCompletion = stopCompletion {
-            if owner == 0 {
-                lock.unlock()
-                stopAudio()
-                readyCallback?()
-                emitQueue.async { stopCompletion(nil) }
-                return
+
+        if !isFirstStopForOwner, let existingOutcome = settledStopErrors[owner] {
+            let callbacks = stopCompletion.map { [$0] } ?? []
+            let stoppedPending = eventOwner == owner && stoppedEmittedOwner != owner
+            lock.unlock()
+            readyCallback?()
+            stopAudio()
+            if stoppedPending || !callbacks.isEmpty {
+                deliverStopOutcome(owner: owner, outcomeError: existingOutcome, callbacks: callbacks)
             }
+            return
+        }
+
+        if let stopCompletion = stopCompletion {
             pendingStopCallbacks[owner, default: []].append(stopCompletion)
         }
         lock.unlock()
 
         // Stop during warmup must also settle the pending start promise.
         readyCallback?()
+        // Release lock before AVAudioEngine teardown so removeTap/engine.stop cannot deadlock.
         stopAudio()
+        guard isFirstStopForOwner else { return }
 
         worker.async { [weak self] in
             guard let self = self else { return }
-            if owner == 0 {
-                self.lock.lock()
-                let shouldEmitStopped = self.generation == stoppingOwner && self.stoppedEmittedOwner != 0
-                self.lock.unlock()
-                if shouldEmitStopped {
-                    self.emitQueue.async { self.onEvent(.stopped) }
-                }
-                return
-            }
-
-            // Duplicate stop/interruption for an owner already settled on worker:
-            // replay the settled outcome without re-decoding or emitting duplicate events.
             self.lock.lock()
-            if let existingOutcome = self.settledStopErrors[owner] {
-                let callbacks = self.pendingStopCallbacks.removeValue(forKey: owner) ?? []
-                let shouldEmitStopped = self.generation == stoppingOwner && self.stoppedEmittedOwner != owner
-                if shouldEmitStopped { self.stoppedEmittedOwner = owner }
-                self.lock.unlock()
-                if shouldEmitStopped || !callbacks.isEmpty {
-                    self.emitQueue.async {
-                        if shouldEmitStopped { self.onEvent(.stopped) }
-                        for cb in callbacks { cb(existingOutcome) }
-                    }
-                }
-                return
-            }
             let alreadyReportedError = self.reportedErrorOwner == owner
             let wasDrainInterrupted = self.drainInterruptedOwner == owner
             self.lock.unlock()
@@ -266,7 +390,12 @@ final class SpeechCoordinator {
             var errorToEmit: String?
             var finalToEmit: String?
 
-            if self.isEventOwner(owner) {
+            if let captureFailure = captureFailure {
+                if self.isEventOwner(owner) {
+                    outcomeError = captureFailure
+                    if !alreadyReportedError { errorToEmit = captureFailure }
+                }
+            } else if self.isEventOwner(owner) {
                 if self.decoderOwner == owner, let decode = self.activeDecode, self.canRunMetal(owner) {
                     do {
                         if let tail = tail {
@@ -320,24 +449,15 @@ final class SpeechCoordinator {
             if errorToEmit != nil { self.reportedErrorOwner = owner }
             self.settledStopErrors[owner] = outcomeError
             let callbacks = self.pendingStopCallbacks.removeValue(forKey: owner) ?? []
-            let shouldEmitStopped = self.generation == stoppingOwner && self.stoppedEmittedOwner != owner
-            if shouldEmitStopped { self.stoppedEmittedOwner = owner }
             self.lock.unlock()
 
-            self.emitQueue.async {
-                if let finalText = finalToEmit, self.isEventOwner(owner) {
-                    self.onEvent(.final(finalText))
-                }
-                if let errorMsg = errorToEmit, self.isEventOwner(owner) {
-                    self.onEvent(.error(errorMsg))
-                }
-                if shouldEmitStopped {
-                    self.onEvent(.stopped)
-                }
-                for cb in callbacks {
-                    cb(outcomeError)
-                }
-            }
+            self.deliverStopOutcome(
+                owner: owner,
+                finalText: finalToEmit,
+                errorMessage: errorToEmit,
+                outcomeError: outcomeError,
+                callbacks: callbacks
+            )
         }
     }
 
@@ -539,35 +659,32 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
     private func consume(_ buffer: AVAudioPCMBuffer, owner: UInt64, converter: AVAudioConverter, mono: AVAudioFormat) {
-        let capacity = AVAudioFrameCount(ceil(Double(buffer.frameLength) * 16000 / buffer.format.sampleRate) + 16)
-        guard let converted = AVAudioPCMBuffer(pcmFormat: mono, frameCapacity: capacity) else { return }
-        let activeConverter: AVAudioConverter
-        if converter.inputFormat == buffer.format {
-            activeConverter = converter
-        } else if let fallback = AVAudioConverter(from: buffer.format, to: mono) {
-            activeConverter = fallback
-        } else {
-            coordinator.failCapture(owner: owner, message: "Offline audio conversion failed: incompatible tap format") { [weak self] in
-                self?.endCapture(nil)
+        coordinator.admitAndOffer(
+            owner: owner,
+            onOverloadTeardown: { [weak self] in self?.endCapture(nil) },
+            onErrorTeardown: { [weak self] in self?.endCapture(nil) }
+        ) {
+            let capacity = AVAudioFrameCount(ceil(Double(buffer.frameLength) * 16000 / buffer.format.sampleRate) + 16)
+            guard let converted = AVAudioPCMBuffer(pcmFormat: mono, frameCapacity: capacity) else { return .ignore }
+            let activeConverter: AVAudioConverter
+            if converter.inputFormat == buffer.format {
+                activeConverter = converter
+            } else if let fallback = AVAudioConverter(from: buffer.format, to: mono) {
+                activeConverter = fallback
+            } else {
+                return .failure("Offline audio conversion failed: incompatible tap format")
             }
-            return
-        }
-        var supplied = false
-        var conversionError: NSError?
-        activeConverter.convert(to: converted, error: &conversionError) { _, status in
-            if supplied { status.pointee = .noDataNow; return nil }
-            supplied = true; status.pointee = .haveData; return buffer
-        }
-        guard conversionError == nil, let channel = converted.floatChannelData?[0] else {
-            let detail = conversionError?.localizedDescription ?? "missing converted channel data"
-            coordinator.failCapture(owner: owner, message: "Offline audio conversion failed: \(detail)") { [weak self] in
-                self?.endCapture(nil)
+            var supplied = false
+            var conversionError: NSError?
+            activeConverter.convert(to: converted, error: &conversionError) { _, status in
+                if supplied { status.pointee = .noDataNow; return nil }
+                supplied = true; status.pointee = .haveData; return buffer
             }
-            return
-        }
-        let samples = Array(UnsafeBufferPointer(start: channel, count: Int(converted.frameLength)))
-        coordinator.offerSamples(samples, owner: owner) { [weak self] in
-            self?.endCapture(nil)
+            guard conversionError == nil, let channel = converted.floatChannelData?[0] else {
+                let detail = conversionError?.localizedDescription ?? "missing converted channel data"
+                return .failure("Offline audio conversion failed: \(detail)")
+            }
+            return .samples(Array(UnsafeBufferPointer(start: channel, count: Int(converted.frameLength))))
         }
     }
 

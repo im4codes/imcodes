@@ -630,10 +630,192 @@ do {
     require(errIdx != nil && stopIdx != nil && errIdx! < stopIdx!, "F: setup error must precede stopped: \\(evs)")
     print("SETUP_FAIL_WITH_STOP:PASS")
 }
+
+// 2G. R3-F2a: Late-delivery stopped guard across normal stop, duplicate stop, and owner replacement
+do {
+    func runOwnerDelivery(replaceBeforeDelivery: Bool, duplicateStop: Bool) {
+        let q = DispatchQueue(label: replaceBeforeDelivery ? "test.late.replace" : "test.late.normal")
+        var evs: [SpeechCoordinator.Event] = []
+        let coord = SpeechCoordinator(emitQueue: q) { evs.append($0) }
+        q.suspend()
+        let old = coord.beginStart(makeDecode: { { s, cont in cont() ? "old:\\(s.count)" : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
+        coord.offerSamples(speech(320), owner: old, now: 0.01) {}
+        coord.offerSamples(speech(8000), owner: old, now: 0.10) {}
+        coord.worker.sync {}
+        var oldAcks: [String?] = []
+        coord.endCapture(stopCompletion: { oldAcks.append($0) }, stopAudio: {})
+        if duplicateStop {
+            coord.endCapture(stopCompletion: { oldAcks.append($0) }, stopAudio: {})
+        }
+        coord.worker.sync {}
+        var freshOwner: UInt64 = 0
+        if replaceBeforeDelivery {
+            freshOwner = coord.beginStart(makeDecode: { { s, cont in cont() ? "fresh:\\(s.count)" : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
+            coord.offerSamples(speech(320), owner: freshOwner, now: 0.20) {}
+            coord.worker.sync {}
+        }
+        q.resume()
+        let snapshot = q.sync { evs }
+        let stops = snapshot.filter { $0 == .stopped }.count
+        let finals = snapshot.filter { if case .final = $0 { return true }; return false }.count
+        let expectedAcks = duplicateStop ? 2 : 1
+        require(oldAcks.count == expectedAcks && oldAcks.allSatisfy { $0 == nil }, "G: old ACK count/error mismatch: \\(oldAcks)")
+        if replaceBeforeDelivery {
+            require(stops == 0 && finals == 0 && snapshot == [.started], "G: stale stopped/final leaked into new owner: \\(snapshot)")
+            let freshAck = DispatchSemaphore(value: 0)
+            var freshErr: String? = "unset"
+            coord.offerSamples(speech(1600), owner: freshOwner, now: 0.30) {}
+            coord.endCapture(stopCompletion: { freshErr = $0; freshAck.signal() }, stopAudio: {})
+            require(freshAck.wait(timeout: .now() + 2) == .success && freshErr == nil, "G: fresh capture failed after stale drop")
+            let finalSnapshot = q.sync { evs }
+            require(finalSnapshot.contains(.final("fresh:4800")) && finalSnapshot.filter { $0 == .stopped }.count == 1, "G: fresh owner did not finish cleanly: \\(finalSnapshot)")
+        } else {
+            require(stops == 1 && finals == 1 && snapshot.contains(.final("old:11200")), "G: normal terminal events wrong: \\(snapshot)")
+        }
+    }
+    runOwnerDelivery(replaceBeforeDelivery: false, duplicateStop: false)
+    runOwnerDelivery(replaceBeforeDelivery: true, duplicateStop: false)
+    runOwnerDelivery(replaceBeforeDelivery: true, duplicateStop: true)
+    print("LATE_OWNER_STOP_GUARD:PASS")
+}
+
+// 2H. R3-F2b: In-flight conversion barrier vs Stop retains tail once & rejects post-Stop taps
+do {
+    let (coord, _, events) = makeHarness()
+    let owner = coord.beginStart(makeDecode: { { s, cont in cont() ? "tail:\\(s.count)" : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
+    require(coord.admitAndOffer(owner: owner, now: 0.01, onOverloadTeardown: {}, produce: { .samples(speech(320)) }), "H: warmup admit failed")
+
+    let convertEntered = DispatchSemaphore(value: 0)
+    let releaseConvert = DispatchSemaphore(value: 0)
+    let tapDone = DispatchSemaphore(value: 0)
+    let stopAck = DispatchSemaphore(value: 0)
+    var stopErr: String? = "unset"
+    var stopAudioCalled = false
+    var convertFinishedBeforeStopAudio = false
+
+    DispatchQueue.global(qos: .userInitiated).async {
+        let ok = coord.admitAndOffer(owner: owner, now: 0.10, onOverloadTeardown: {}) {
+            convertEntered.signal()
+            _ = releaseConvert.wait(timeout: .now() + 2)
+            convertFinishedBeforeStopAudio = !stopAudioCalled
+            return .samples(speech(8000))
+        }
+        require(ok, "H: in-flight frame should be admitted")
+        tapDone.signal()
+    }
+    require(convertEntered.wait(timeout: .now() + 2) == .success, "H: conversion never entered")
+
+    DispatchQueue.global(qos: .userInitiated).async {
+        coord.endCapture(stopCompletion: { e in stopErr = e; stopAck.signal() }, stopAudio: { stopAudioCalled = true })
+    }
+    let deadline = Date().addingTimeInterval(2)
+    while coord.isCurrent(owner) && Date() < deadline { usleep(1000) }
+    require(!coord.isCurrent(owner), "H: endCapture did not advance generation")
+
+    var postStopProduced = false
+    let postStopAdmitted = coord.admitAndOffer(owner: owner, now: 0.15, onOverloadTeardown: {}) {
+        postStopProduced = true
+        return .samples(speech(1600))
+    }
+    require(!postStopAdmitted && !postStopProduced, "H: post-Stop tap must be rejected before converting")
+    require(!stopAudioCalled, "H: stopAudio ran before blocked conversion finished")
+
+    releaseConvert.signal()
+    require(tapDone.wait(timeout: .now() + 2) == .success, "H: in-flight tap did not finish")
+    require(stopAck.wait(timeout: .now() + 2) == .success && stopErr == nil, "H: stop ACK failed: \\(String(describing: stopErr))")
+    require(convertFinishedBeforeStopAudio && stopAudioCalled, "H: stopAudio barrier violated")
+
+    let evs = events()
+    let finals = evs.filter { if case .final = $0 { return true }; return false }
+    let stops = evs.filter { $0 == .stopped }
+    require(finals == [.final("tail:11200")] && stops.count == 1, "H: missing or duplicated blocked tail final/stopped: \\(evs)")
+    require(evs.firstIndex(of: .final("tail:11200"))! < evs.firstIndex(of: .stopped)!, "H: final must precede stopped")
+    print("IN_FLIGHT_CONVERSION_TAIL_BARRIER:PASS")
+}
+
+// 2I. R3-F2b: In-flight conversion failure during Stop emits error visibly instead of truncated final
+do {
+    let (coord, _, events) = makeHarness()
+    let owner = coord.beginStart(makeDecode: { { s, cont in cont() ? "should_not_emit:\\(s.count)" : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
+    coord.offerSamples(speech(320), owner: owner, now: 0.01) {}
+    coord.offerSamples(speech(3200), owner: owner, now: 0.05) {}
+
+    let convertEntered = DispatchSemaphore(value: 0)
+    let releaseConvert = DispatchSemaphore(value: 0)
+    DispatchQueue.global(qos: .userInitiated).async {
+        _ = coord.admitAndOffer(owner: owner, now: 0.10, onOverloadTeardown: {}) {
+            convertEntered.signal()
+            _ = releaseConvert.wait(timeout: .now() + 2)
+            return .failure("Offline audio conversion failed: simulated")
+        }
+    }
+    require(convertEntered.wait(timeout: .now() + 2) == .success, "I: fail conversion never entered")
+
+    let stopAck = DispatchSemaphore(value: 0)
+    var stopErr: String? = nil
+    DispatchQueue.global(qos: .userInitiated).async {
+        coord.endCapture(stopCompletion: { e in stopErr = e; stopAck.signal() }, stopAudio: {})
+    }
+    let deadline = Date().addingTimeInterval(2)
+    while coord.isCurrent(owner) && Date() < deadline { usleep(1000) }
+    releaseConvert.signal()
+
+    require(stopAck.wait(timeout: .now() + 2) == .success && stopErr == "Offline audio conversion failed: simulated", "I: expected conversion failure ACK, got \\(String(describing: stopErr))")
+    let evs = events()
+    require(!evs.contains { if case .final = $0 { return true }; return false }, "I: failed tail must NOT emit truncated final: \\(evs)")
+    let errIdx = evs.firstIndex { if case .error = $0 { return true }; return false }
+    let stopIdx = evs.firstIndex(of: .stopped)
+    require(errIdx != nil && stopIdx != nil && errIdx! < stopIdx!, "I: error must precede stopped: \\(evs)")
+    print("IN_FLIGHT_CONVERSION_FAIL_AT_STOP:PASS")
+}
+
+// 2J. R3-F2b: Old owner's delayed in-flight conversion never leaks PCM into replacement owner
+do {
+    let (coord, _, events) = makeHarness()
+    let owner1 = coord.beginStart(makeDecode: { { s, cont in cont() ? "out:\\(s.count)" : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
+    coord.offerSamples(speech(320), owner: owner1, now: 0.01) {}
+    let convertEntered = DispatchSemaphore(value: 0)
+    let releaseConvert = DispatchSemaphore(value: 0)
+    let oldDone = DispatchSemaphore(value: 0)
+    DispatchQueue.global(qos: .userInitiated).async {
+        _ = coord.admitAndOffer(owner: owner1, now: 0.05, onOverloadTeardown: {}) {
+            convertEntered.signal()
+            _ = releaseConvert.wait(timeout: .now() + 2)
+            return .samples(speech(8000))
+        }
+        oldDone.signal()
+    }
+    require(convertEntered.wait(timeout: .now() + 2) == .success, "J: old convert never entered")
+    let owner2 = coord.beginStart(makeDecode: { { s, cont in cont() ? "owner2:\\(s.count)" : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
+    releaseConvert.signal()
+    require(oldDone.wait(timeout: .now() + 2) == .success, "J: old convert did not exit")
+    coord.offerSamples(speech(320), owner: owner2, now: 0.10) {}
+    coord.offerSamples(speech(1600), owner: owner2, now: 0.20) {}
+    let ack2 = DispatchSemaphore(value: 0)
+    var err2: String? = "unset"
+    coord.endCapture(stopCompletion: { e in err2 = e; ack2.signal() }, stopAudio: {})
+    require(ack2.wait(timeout: .now() + 2) == .success && err2 == nil, "J: owner2 stop failed")
+    let evs = events()
+    let finals = evs.filter { if case .final = $0 { return true }; return false }
+    require(finals == [.final("owner2:4800")], "J: old owner PCM leaked into owner2: \\(evs)")
+    print("OLD_IN_FLIGHT_ISOLATED_FROM_NEW_OWNER:PASS")
+}
 `);
   execFileSync(swiftCompiler!, ['-swift-version', '5', file, '-o', executable], { encoding: 'utf8', timeout: 60000 });
   const result = execFileSync(executable, [emptyDir, biasedDir], { encoding: 'utf8', timeout: 20000 });
-  for (const name of ['RECOGNIZER_DECODER', 'BG_UNDECODED_SHORT', 'BG_PARTIAL_PLUS_TAIL', 'BG_MID_DECODE_CANCEL', 'FG_CLEAN_AND_DUPLICATE_STOP', 'OWNER_REPLACEMENT_RECOVERY', 'SETUP_FAIL_WITH_STOP']) {
+  for (const name of [
+    'RECOGNIZER_DECODER',
+    'BG_UNDECODED_SHORT',
+    'BG_PARTIAL_PLUS_TAIL',
+    'BG_MID_DECODE_CANCEL',
+    'FG_CLEAN_AND_DUPLICATE_STOP',
+    'OWNER_REPLACEMENT_RECOVERY',
+    'SETUP_FAIL_WITH_STOP',
+    'LATE_OWNER_STOP_GUARD',
+    'IN_FLIGHT_CONVERSION_TAIL_BARRIER',
+    'IN_FLIGHT_CONVERSION_FAIL_AT_STOP',
+    'OLD_IN_FLIGHT_ISOLATED_FROM_NEW_OWNER',
+  ]) {
     expect(result).toContain(name + ':PASS');
   }
 }, 95000);
