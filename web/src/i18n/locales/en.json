@@ -2088,6 +2088,10 @@
     "preview_attachment": "Preview #{{seq}} {{name}}",
     "preview_loading": "Loading preview…",
     "preview_unavailable": "Preview unavailable",
+    "attachments_expand": "+{{count}} more",
+    "attachments_expand_title": "Show all {{total}} attachments",
+    "attachments_collapse": "Show fewer",
+    "attachments_collapse_title": "Collapse {{total}} attachments",
     "direct_required_large": "This file requires a direct connection; relay fallback is limited to {{max}}MB",
     "transport": {
       "connecting": "Connecting P2P",

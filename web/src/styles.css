@@ -1644,7 +1644,7 @@ html.native-ios-mac .chat-dl-btn {
   font-size: 12px;
   color: #cbd5e1;
 }
-.attachment-badges { display: flex; flex-wrap: wrap; gap: 4px; padding: 4px 8px 2px; position: relative; z-index: 1; }
+.attachment-badges { display: flex; flex-wrap: wrap; align-content: flex-start; gap: 4px; padding: 4px 8px 2px; position: relative; z-index: 1; max-height: 112px; overflow-y: auto; overscroll-behavior: contain; }
 .composer-upload-list {
   position: relative;
   z-index: 1;
@@ -1837,9 +1837,13 @@ html.native-ios-mac .chat-dl-btn {
 }
 @media (max-width: 640px) {
   .controls-composer-resize-edge { display: none; }
+  .attachment-badges { max-height: 84px; }
   .composer-upload-stats {
     gap: 4px 8px;
   }
+}
+@media (pointer: coarse) {
+  .attachment-badges { max-height: 84px; }
 }
 @keyframes composer-upload-signal {
   0%, 100% { opacity: 0.45; transform: scale(0.82); }
@@ -1853,6 +1857,9 @@ html.native-ios-mac .chat-dl-btn {
 .attachment-badge-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .attachment-badge-main { display: inline-flex; align-items: center; gap: 4px; min-width: 0; padding: 0; background: none; border: none; color: inherit; font: inherit; cursor: zoom-in; }
 .attachment-badge.is-previewable:hover { border-color: rgba(125,211,252,0.45); color: #cbd5e1; }
+.attachment-badge-toggle { cursor: pointer; border-color: rgba(56,189,248,0.36); background: rgba(14,116,144,0.24); color: #7dd3fc; font-family: inherit; font-weight: 600; padding: 2px 9px; white-space: nowrap; flex-shrink: 0; }
+.attachment-badge-toggle:hover { border-color: rgba(56,189,248,0.62); background: rgba(14,116,144,0.36); color: #e0f2fe; }
+.attachment-badge-toggle:focus-visible { outline: 2px solid rgba(56,189,248,0.65); outline-offset: 1px; }
 /* Hover preview: fixed so the (overflow-clipped) badge row can't cut it off. */
 .attachment-hover-preview { position: fixed; z-index: var(--layer-attachment-preview); display: grid; gap: 4px; max-width: calc(100vw - 24px); pointer-events: none; padding: 6px; background: #0b1220; border: 1px solid rgba(125,211,252,0.35); border-radius: 10px; box-shadow: 0 12px 32px rgba(0,0,0,0.55); pointer-events: none; }
 /* The picture is sized by script from the viewport and its own pixels (attachment-preview-size.ts); until it has loaded it is measured out of sight. */
@@ -7229,6 +7236,7 @@ html.native-ios-mac .chat-dl-btn {
 .subsession-controls-deferred { flex: 0 0 42px; min-height: 42px; border-top: 1px solid rgba(125,211,252,0.12); background: linear-gradient(180deg, #0a101b, #080d16); border-radius: 0 0 8px 8px; pointer-events: none; }
 .subcard-stop-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 .subcard-input-area .menu-dropdown { z-index: 10000; right: auto; left: 0; max-width: calc(100vw - 24px); }
+.subcard-input-area .attachment-badges { max-height: 60px; padding: 2px 2px 0; }
 .subcard-input-area .qp { z-index: 10002; }
 .subcard-shortcuts { display: flex; gap: 3px; }
 .subcard-shortcut-btn { background: #1a2233; border: 1px solid #334155; border-radius: 3px; color: #64748b; font-size: 10px; padding: 1px 5px; cursor: pointer; transition: all 0.12s; line-height: 1.4; }

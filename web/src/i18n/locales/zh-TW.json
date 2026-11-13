@@ -2088,6 +2088,10 @@
     "preview_attachment": "預覽 #{{seq}} {{name}}",
     "preview_loading": "正在載入預覽…",
     "preview_unavailable": "無法預覽",
+    "attachments_expand": "+{{count}} 項",
+    "attachments_expand_title": "展開全部 {{total}} 個附件",
+    "attachments_collapse": "收合",
+    "attachments_collapse_title": "收合 {{total}} 個附件",
     "direct_required_large": "此檔案需要直連；伺服器中轉回退上限為 {{max}}MB",
     "transport": {
       "connecting": "P2P 連線中",

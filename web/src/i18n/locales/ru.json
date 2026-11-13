@@ -2087,6 +2087,10 @@
     "preview_attachment": "Предпросмотр #{{seq}} {{name}}",
     "preview_loading": "Загрузка предпросмотра…",
     "preview_unavailable": "Предпросмотр недоступен",
+    "attachments_expand": "+{{count}} ещё",
+    "attachments_expand_title": "Показать все вложения ({{total}})",
+    "attachments_collapse": "Свернуть",
+    "attachments_collapse_title": "Свернуть вложения ({{total}})",
     "direct_required_large": "Для этого файла требуется прямое соединение; лимит серверного ретранслятора — {{max}}МБ",
     "transport": {
       "connecting": "Подключение P2P",

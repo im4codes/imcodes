@@ -2088,6 +2088,10 @@
     "preview_attachment": "Vista previa de #{{seq}} {{name}}",
     "preview_loading": "Cargando vista previa…",
     "preview_unavailable": "Vista previa no disponible",
+    "attachments_expand": "+{{count}} más",
+    "attachments_expand_title": "Mostrar los {{total}} adjuntos",
+    "attachments_collapse": "Contraer",
+    "attachments_collapse_title": "Contraer {{total}} adjuntos",
     "direct_required_large": "Este archivo requiere conexión directa; el relevo del servidor está limitado a {{max}}MB",
     "transport": {
       "connecting": "Conectando P2P",

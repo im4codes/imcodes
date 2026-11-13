@@ -176,6 +176,8 @@ import type { PendingSharedSessionUpload } from '../services/share-receiver.js';
 import { recordPerfRender } from '../perf-render-debug.js';
 
 export const COMPOSER_HEIGHT_STORAGE_KEY = 'imcodes_composer_height_v1';
+export const ATTACHMENT_BADGE_COLLAPSE_THRESHOLD = 3;
+export const ATTACHMENT_BADGE_COLLAPSED_VISIBLE_COUNT = 2;
 /**
  * Floor for the shared desktop composer height, matching the three-row resting
  * size the desktop stylesheet sets.
@@ -1837,6 +1839,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [supervisionModeNotice, setSupervisionModeNotice] = useState<string | null>(null);
   const [effortClampNotice, setEffortClampNotice] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<ComposerAttachmentRecord[]>([]);
+  const [attachmentsExpanded, setAttachmentsExpanded] = useState(false);
   const [deletingAttachmentKeys, setDeletingAttachmentKeys] = useState<Set<string>>(() => new Set());
   const [pendingDelegateTarget, setPendingDelegateTarget] = useState<PendingDelegateTarget | null>(null);
   const sendWarningTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1996,8 +1999,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   useEffect(() => {
     setHydratedAttachmentDraftKey(null);
+    setAttachmentsExpanded(false);
     if (!attachmentDraftKey) {
       setAttachments([]);
+      setAttachmentsExpanded(false);
       attachmentDraftRef.current = [];
       return;
     }
@@ -2009,6 +2014,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   useEffect(() => {
     attachmentDraftRef.current = attachments;
+    if (attachments.length <= ATTACHMENT_BADGE_COLLAPSE_THRESHOLD) {
+      setAttachmentsExpanded(false);
+    }
     closeQuickSuggestions();
     if (!attachmentDraftKey || hydratedAttachmentDraftKey !== attachmentDraftKey) return;
     try {
@@ -4619,6 +4627,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setMobileComposerExpanded(false);
       setMobileComposerMultiline(false);
       setAttachments([]);
+      setAttachmentsExpanded(false);
       if (quotes && quotes.length > 0) {
         for (let i = quotes.length - 1; i >= 0; i--) onRemoveQuote?.(i);
       }
@@ -7598,23 +7607,49 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       )}
 
       {/* Attachment badges — above input row */}
-      {attachments.length > 0 && (
-        <div class="attachment-badges">
-          {attachments.map((a) => (
-            <ComposerAttachmentBadge
-              key={a.path}
-              seq={a.seq}
-              name={a.name}
-              path={a.path}
-              {...(a.id ? { attachmentId: a.id } : {})}
-              {...((a.serverId || serverId) ? { serverId: a.serverId || serverId } : {})}
-              {...(isShareScopedSession && activeSession?.name ? { sessionName: activeSession.name } : {})}
-              removing={deletingAttachmentKeys.has(a.id ?? a.path)}
-              onRemove={() => { void handleRemoveAttachment(a); }}
-            />
-          ))}
-        </div>
-      )}
+      {attachments.length > 0 && (() => {
+        const shouldCollapse = attachments.length > ATTACHMENT_BADGE_COLLAPSE_THRESHOLD;
+        const isCollapsed = shouldCollapse && !attachmentsExpanded;
+        const visibleAttachments = isCollapsed
+          ? attachments.slice(0, ATTACHMENT_BADGE_COLLAPSED_VISIBLE_COUNT)
+          : attachments;
+        const hiddenCount = attachments.length - visibleAttachments.length;
+        const toggleTitle = isCollapsed
+          ? t('upload.attachments_expand_title', { count: hiddenCount, total: attachments.length })
+          : t('upload.attachments_collapse_title', { total: attachments.length });
+        return (
+          <div class={`attachment-badges attachment-badges-list${shouldCollapse && attachmentsExpanded ? ' is-expanded' : ''}`}>
+            {visibleAttachments.map((a) => (
+              <ComposerAttachmentBadge
+                key={a.path}
+                seq={a.seq}
+                name={a.name}
+                path={a.path}
+                {...(a.id ? { attachmentId: a.id } : {})}
+                {...((a.serverId || serverId) ? { serverId: a.serverId || serverId } : {})}
+                {...(isShareScopedSession && activeSession?.name ? { sessionName: activeSession.name } : {})}
+                removing={deletingAttachmentKeys.has(a.id ?? a.path)}
+                onRemove={() => { void handleRemoveAttachment(a); }}
+              />
+            ))}
+            {shouldCollapse && (
+              <button
+                type="button"
+                class="attachment-badge attachment-badge-toggle"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => setAttachmentsExpanded((prev) => !prev)}
+                aria-expanded={attachmentsExpanded}
+                aria-label={toggleTitle}
+                title={toggleTitle}
+              >
+                {isCollapsed
+                  ? t('upload.attachments_expand', { count: hiddenCount, total: attachments.length })
+                  : t('upload.attachments_collapse', { total: attachments.length })}
+              </button>
+            )}
+          </div>
+        );
+      })()}
 
       {/* Quote badges — above input row */}
       {quotes && quotes.length > 0 && (

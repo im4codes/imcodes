@@ -2087,6 +2087,10 @@
     "preview_attachment": "#{{seq}} {{name}} 미리보기",
     "preview_loading": "미리보기 불러오는 중…",
     "preview_unavailable": "미리보기 불가",
+    "attachments_expand": "+{{count}}개 더",
+    "attachments_expand_title": "첨부 {{total}}개 모두 보기",
+    "attachments_collapse": "접기",
+    "attachments_collapse_title": "첨부 {{total}}개 접기",
     "direct_required_large": "이 파일은 직접 연결이 필요합니다. 서버 릴레이는 최대 {{max}}MB입니다",
     "transport": {
       "connecting": "P2P 연결 중",

@@ -2088,6 +2088,10 @@
     "preview_attachment": "预览 #{{seq}} {{name}}",
     "preview_loading": "正在加载预览…",
     "preview_unavailable": "无法预览",
+    "attachments_expand": "+{{count}} 项",
+    "attachments_expand_title": "展开全部 {{total}} 个附件",
+    "attachments_collapse": "收起",
+    "attachments_collapse_title": "收起 {{total}} 个附件",
     "direct_required_large": "此文件需要直连；服务器中转回退最大为 {{max}}MB",
     "transport": {
       "connecting": "P2P 连接中",

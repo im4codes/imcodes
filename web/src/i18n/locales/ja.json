@@ -2087,6 +2087,10 @@
     "preview_attachment": "#{{seq}} {{name}} をプレビュー",
     "preview_loading": "プレビューを読み込み中…",
     "preview_unavailable": "プレビューできません",
+    "attachments_expand": "+{{count}} 件",
+    "attachments_expand_title": "{{total}} 件の添付をすべて表示",
+    "attachments_collapse": "折りたたむ",
+    "attachments_collapse_title": "{{total}} 件の添付を折りたたむ",
     "direct_required_large": "このファイルには直接接続が必要です。サーバー中継は最大 {{max}}MB です",
     "transport": {
       "connecting": "P2P 接続中",

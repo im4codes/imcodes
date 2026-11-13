@@ -12,6 +12,9 @@ import { FILE_TRANSFER_LIMITS } from '../../../shared/transport/file-transfer.js
 import { DIRECT_FILE_TRANSFER_ERROR } from '../../../shared/direct-file-transfer.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../../shared/hermes-agent.js';
 import { AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { SUPPORTED_LOCALES } from '../../src/i18n/locales/index.js';
 
 const DEFAULT_INNER_WIDTH = 1280;
 const { mockI18n, directFileTransferMocks, voiceOverlayMock } = vi.hoisted(() => ({
@@ -164,6 +167,10 @@ vi.mock('react-i18next', () => ({
       if (key === 'upload.long_text_requires_attachment') {
         return 'Paste is too large for inline input here. Upload it as a file instead.';
       }
+      if (key === 'upload.attachments_expand') return `+${String(opts?.count ?? 0)} more`;
+      if (key === 'upload.attachments_expand_title') return `Show all ${String(opts?.total ?? 0)} attachments`;
+      if (key === 'upload.attachments_collapse') return 'Show fewer';
+      if (key === 'upload.attachments_collapse_title') return `Collapse ${String(opts?.total ?? 0)} attachments`;
       if (key === 'session.stop_plain') return 'Stop';
       if (key === 'session.stop_appended_queue') return 'Queued messages appended; the session is still running.';
       if (key === 'session.restart_plain') return 'Restart';
@@ -11602,6 +11609,147 @@ afterEach(() => {
     } finally {
       spy.mockRestore();
     }
+  });
+
+  it('keeps <=3 attachments uncollapsed without a toggle (negative control)', async () => {
+    let seq = 0;
+    uploadFileMock.mockImplementation(async () => ({
+      attachment: { daemonPath: `/tmp/att-${++seq}.png`, id: `id-${seq}` },
+    }));
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'att-threshold-neg' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    for (const name of ['one.png', 'two.png', 'three.png']) {
+      fireEvent.paste(input, {
+        clipboardData: { files: [new File([name], name)], getData: () => '' },
+      });
+    }
+    await waitFor(() => expect(document.querySelectorAll('.attachment-badge-name')).toHaveLength(3));
+    expect(document.querySelector('.attachment-badge-toggle')).toBeNull();
+    expect(screen.queryByRole('button', { name: /Show all/ })).toBeNull();
+  });
+
+  it('collapses >3 attachments (15 images) by default, toggles expand/collapse, and resets on remove/send', async () => {
+    let seq = 0;
+    uploadFileMock.mockImplementation(async () => ({
+      attachment: { daemonPath: `/tmp/shot-${++seq}.png`, id: `id-${seq}` },
+    }));
+    const ws = makeWs();
+    const view = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'att-collapse-15' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+        quotes={['quote-1']}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.focus();
+
+    const files = Array.from({ length: 15 }, (_, idx) => new File([`img-${idx + 1}`], `img-${idx + 1}.png`));
+    fireEvent.paste(input, {
+      clipboardData: { files, getData: () => '' },
+    });
+
+    await waitFor(() => {
+      const toggle = document.querySelector('.attachment-badge-toggle') as HTMLButtonElement | null;
+      expect(toggle).toBeTruthy();
+      expect(toggle?.textContent).toBe('+13 more');
+    });
+
+    // Collapsed view renders first 2 attachment badges + 1 toggle pill (+ 1 unaffected quote badge)
+    const badgeList = document.querySelector('.attachment-badges-list')!;
+    expect(badgeList.classList.contains('is-expanded')).toBe(false);
+    expect(badgeList.querySelectorAll('.attachment-badge-name')).toHaveLength(2);
+    expect(badgeList.querySelectorAll('.attachment-badge-name')[0]?.textContent).toBe('img-1.png');
+    expect(badgeList.querySelectorAll('.attachment-badge-name')[1]?.textContent).toBe('img-2.png');
+    expect(document.querySelectorAll('.quote-badge')).toHaveLength(1);
+
+    // Expanding shows all 15 badges and preserves composer focus
+    const toggle = badgeList.querySelector('.attachment-badge-toggle') as HTMLButtonElement;
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(toggle.getAttribute('aria-label')).toBe('Show all 15 attachments');
+    const mouseDown = new MouseEvent('mousedown', { bubbles: true, cancelable: true });
+    expect(fireEvent(toggle, mouseDown)).toBe(false);
+    fireEvent.click(toggle);
+
+    expect(badgeList.classList.contains('is-expanded')).toBe(true);
+    expect(badgeList.querySelectorAll('.attachment-badge-name')).toHaveLength(15);
+    expect(toggle.textContent).toBe('Show fewer');
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(toggle.getAttribute('aria-label')).toBe('Collapse 15 attachments');
+    expect(document.activeElement).toBe(input);
+
+    // Collapsing folds back cleanly to 2 + "+13 more"
+    fireEvent.click(toggle);
+    expect(badgeList.classList.contains('is-expanded')).toBe(false);
+    expect(badgeList.querySelectorAll('.attachment-badge-name')).toHaveLength(2);
+    expect(toggle.textContent).toBe('+13 more');
+
+    // Sending clears attachments and resets expanded state for the next batch
+    fireEvent.click(toggle);
+    expect(badgeList.querySelectorAll('.attachment-badge-name')).toHaveLength(15);
+    fireEvent.click(screen.getByRole('button', { name: /^send$/i }));
+    await waitFor(() => expect(document.querySelector('.attachment-badges-list')).toBeNull());
+
+    // Re-attaching >3 items after send starts collapsed again (expanded state did not linger)
+    const nextFiles = Array.from({ length: 4 }, (_, idx) => new File([`next-${idx + 1}`], `next-${idx + 1}.png`));
+    fireEvent.paste(input, {
+      clipboardData: { files: nextFiles, getData: () => '' },
+    });
+    await waitFor(() => expect(document.querySelector('.attachment-badge-toggle')?.textContent).toBe('+2 more'));
+
+    // Expand the 4 items, then remove one so count drops to 3 (<= threshold): toggle vanishes and state resets
+    const nextToggle = document.querySelector('.attachment-badge-toggle') as HTMLButtonElement;
+    fireEvent.click(nextToggle);
+    expect(document.querySelectorAll('.attachment-badges-list .attachment-badge-name')).toHaveLength(4);
+    const fourthRemove = document.querySelectorAll('.attachment-badges-list .attachment-badge-remove')[3] as HTMLButtonElement;
+    fireEvent.click(fourthRemove);
+    await waitFor(() => {
+      expect(document.querySelector('.attachment-badge-toggle')).toBeNull();
+      expect(document.querySelectorAll('.attachment-badges-list .attachment-badge-name')).toHaveLength(3);
+    });
+
+    // Adding one more back to 4 starts collapsed again cleanly
+    fireEvent.paste(input, {
+      clipboardData: { files: [new File(['extra'], 'extra.png')], getData: () => '' },
+    });
+    await waitFor(() => {
+      expect(document.querySelector('.attachment-badge-toggle')?.textContent).toBe('+2 more');
+      expect(document.querySelectorAll('.attachment-badges-list .attachment-badge-name')).toHaveLength(2);
+    });
+    view.unmount();
+  });
+
+  it('defines attachment collapse/expand translations across all 7 locales and bounds .attachment-badges height in CSS', () => {
+    const webRoot = resolve(process.cwd().endsWith('/web') ? process.cwd() : resolve(process.cwd(), 'web'));
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(resolve(webRoot, `src/i18n/locales/${locale}.json`), 'utf8')) as {
+        upload?: Record<string, string>;
+      };
+      expect(messages.upload?.attachments_expand).toBeTruthy();
+      expect(messages.upload?.attachments_expand).toContain('{{count}}');
+      expect(messages.upload?.attachments_expand_title).toContain('{{total}}');
+      expect(messages.upload?.attachments_collapse).toBeTruthy();
+      expect(messages.upload?.attachments_collapse_title).toContain('{{total}}');
+    }
+
+    const css = readFileSync(resolve(webRoot, 'src/styles.css'), 'utf8');
+    expect(css).toMatch(/\.attachment-badges\s*\{[^}]*max-height:\s*112px[^}]*overflow-y:\s*auto/);
+    expect(css).toMatch(/@media\s*\(max-width:\s*640px\)\s*\{\s*\.controls-composer-resize-edge[^}]*\}\s*\.attachment-badges\s*\{\s*max-height:\s*84px;\s*\}/);
+    expect(css).toMatch(/@media\s*\(pointer:\s*coarse\)\s*\{\s*\.attachment-badges\s*\{\s*max-height:\s*84px;\s*\}\s*\}/);
+    expect(css).toMatch(/\.subcard-input-area\s+\.attachment-badges\s*\{\s*max-height:\s*60px;/);
+    expect(css).toMatch(/\.attachment-badge-toggle\s*\{/);
   });
 
 });
