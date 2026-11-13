@@ -77,6 +77,7 @@ describe('process session /clear handling', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    relaunchSessionWithSettingsMock.mockReset().mockResolvedValue(undefined);
     buildSessionListMock.mockResolvedValue([]);
   });
 
@@ -324,5 +325,168 @@ describe('process session /clear handling', () => {
     await expect(staleSecond).rejects.toThrow(/ownership changed/i);
     // Only the first call ran; the stale second owner call aborted before relaunch.
     expect(relaunchSessionWithSettingsMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('emits immediate receipt ack and starting state for /handoff and /clear even while a prior relaunch is pending or fails', async () => {
+    const rec = {
+      name: 'deck_proj_queued_ack',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'agy-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      projectDir: '/proj',
+      sessionInstanceId: 'inst-queued',
+    };
+    getSessionMock.mockReturnValue(rec);
+
+    let active = 0;
+    let maxActive = 0;
+    let releaseFirst!: () => void;
+    let rejectSecond!: (e: Error) => void;
+    relaunchSessionWithSettingsMock
+      .mockImplementationOnce(() => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        return new Promise<void>((resolve) => {
+          releaseFirst = () => {
+            active -= 1;
+            resolve();
+          };
+        });
+      })
+      .mockImplementationOnce(() => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        return new Promise<void>((_, reject) => {
+          rejectSecond = (e: Error) => {
+            active -= 1;
+            reject(e);
+          };
+        });
+      });
+
+    // 1) Start a slow prior restart; queued /handoff must still ack immediately without waiting.
+    handleWebCommand({ type: 'session.restart', sessionName: rec.name }, serverLink as any);
+    await flushAsync();
+    handleWebCommand({ type: 'session.send', session: rec.name, text: '/handoff', commandId: 'cmd-queued-handoff' }, serverLink as any);
+    await flushAsync();
+
+    expect(emitMock).toHaveBeenCalledWith(rec.name, 'command.ack', { commandId: 'cmd-queued-handoff', status: 'accepted' });
+    expect(emitMock).toHaveBeenCalledWith(rec.name, 'session.state', { state: 'starting' }, expect.objectContaining({ source: 'daemon' }));
+    // Only the initial restart has started running while blocked.
+    expect(relaunchSessionWithSettingsMock).toHaveBeenCalledTimes(1);
+
+    // Release prior restart -> queued handoff starts and can itself be queued behind by /clear.
+    releaseFirst();
+    await flushAsync();
+    expect(relaunchSessionWithSettingsMock).toHaveBeenCalledTimes(2);
+
+    handleWebCommand({ type: 'session.send', session: rec.name, text: '/clear', commandId: 'cmd-queued-clear' }, serverLink as any);
+    await flushAsync();
+    expect(emitMock).toHaveBeenCalledWith(rec.name, 'command.ack', { commandId: 'cmd-queued-clear', status: 'accepted' });
+
+    // Even when prior /handoff fails, cmd-queued-handoff still receives its error ack
+    // without clobbering cmd-queued-clear's starting state, and cmd-queued-clear finishes cleanly.
+    rejectSecond(new Error('prior failed'));
+    await flushAsync();
+    await flushAsync();
+
+    expect(emitMock).toHaveBeenCalledWith(rec.name, 'command.ack', {
+      commandId: 'cmd-queued-handoff',
+      status: 'error',
+      error: 'prior failed',
+    });
+    expect(emitMock).not.toHaveBeenCalledWith(
+      rec.name,
+      'assistant.text',
+      expect.objectContaining({ noticeCode: DAEMON_USER_NOTICE_CODE.CONVERSATION_CLEAR_FAILED }),
+      expect.anything(),
+    );
+    expect(maxActive).toBe(1);
+    expect(emitMock).toHaveBeenCalledWith(rec.name, 'usage.update', expect.objectContaining({ inputTokens: 0 }), expect.anything());
+    expect(emitMock).toHaveBeenCalledWith(rec.name, 'session.state', { state: 'idle' }, expect.objectContaining({ source: 'daemon' }));
+  });
+
+  it('never leaks old reset failure notice, late success finalization, or deleted-session emits onto replacement or missing owners', async () => {
+    const rec = {
+      name: 'deck_proj_reset_isolation',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'agy-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      projectDir: '/proj',
+      sessionInstanceId: 'inst-a',
+    };
+    getSessionMock.mockReturnValue(rec);
+
+    // Case 1: Old owner rejects after replacement -> error ack to old commandId, zero timeline/state pollution on new owner.
+    let rejectOld!: (e: Error) => void;
+    relaunchSessionWithSettingsMock.mockImplementationOnce(() => new Promise<void>((_, reject) => { rejectOld = reject; }));
+    handleWebCommand({ type: 'session.send', session: rec.name, text: '/handoff', commandId: 'cmd-old-fail' }, serverLink as any);
+    await flushAsync();
+    getSessionMock.mockReturnValue({ ...rec, state: 'working', sessionInstanceId: 'inst-b' });
+    emitMock.mockClear();
+    rejectOld(new Error('Session ownership changed during relaunch'));
+    await flushAsync();
+    await flushAsync();
+
+    expect(emitMock).toHaveBeenCalledWith(rec.name, 'command.ack', {
+      commandId: 'cmd-old-fail',
+      status: 'error',
+      error: 'Session ownership changed during relaunch',
+    });
+    expect(emitMock.mock.calls.filter(([name, type]) =>
+      name === rec.name && (type === 'assistant.text' || type === 'session.state' || type === 'usage.update'))).toEqual([]);
+
+    // Case 2: Old owner resolves late after replacement -> zero finalization emitted on new owner.
+    let resolveOld!: () => void;
+    getSessionMock.mockReturnValue(rec);
+    relaunchSessionWithSettingsMock.mockImplementationOnce(() => new Promise<void>((r) => { resolveOld = r; }));
+    handleWebCommand({ type: 'session.send', session: rec.name, text: '/handoff', commandId: 'cmd-old-late-win' }, serverLink as any);
+    await flushAsync();
+    getSessionMock.mockReturnValue({ ...rec, state: 'working', sessionInstanceId: 'inst-c' });
+    emitMock.mockClear();
+    resolveOld();
+    await flushAsync();
+    await flushAsync();
+
+    expect(emitMock.mock.calls.filter(([name, type]) =>
+      name === rec.name && (type === 'assistant.text' || type === 'session.state' || type === 'usage.update'))).toEqual([]);
+
+    // Case 3: Session deleted mid-handoff (both reject and late resolve paths) -> no session-level emits.
+    let rejectDeleted!: (e: Error) => void;
+    getSessionMock.mockReturnValue(rec);
+    relaunchSessionWithSettingsMock.mockImplementationOnce(() => new Promise<void>((_, reject) => { rejectDeleted = reject; }));
+    handleWebCommand({ type: 'session.send', session: rec.name, text: '/handoff', commandId: 'cmd-deleted-fail' }, serverLink as any);
+    await flushAsync();
+    getSessionMock.mockReturnValue(undefined);
+    emitMock.mockClear();
+    rejectDeleted(new Error('deleted mid-flight'));
+    await flushAsync();
+    await flushAsync();
+
+    expect(emitMock).toHaveBeenCalledWith(rec.name, 'command.ack', {
+      commandId: 'cmd-deleted-fail',
+      status: 'error',
+      error: 'deleted mid-flight',
+    });
+    expect(emitMock.mock.calls.filter(([name, type]) =>
+      name === rec.name && (type === 'assistant.text' || type === 'session.state' || type === 'usage.update'))).toEqual([]);
+
+    let resolveDeleted!: () => void;
+    getSessionMock.mockReturnValue(rec);
+    relaunchSessionWithSettingsMock.mockImplementationOnce(() => new Promise<void>((r) => { resolveDeleted = r; }));
+    handleWebCommand({ type: 'session.send', session: rec.name, text: '/handoff', commandId: 'cmd-deleted-win' }, serverLink as any);
+    await flushAsync();
+    getSessionMock.mockReturnValue(undefined);
+    emitMock.mockClear();
+    resolveDeleted();
+    await flushAsync();
+    await flushAsync();
+
+    expect(emitMock.mock.calls.filter(([name, type]) =>
+      name === rec.name && (type === 'assistant.text' || type === 'session.state' || type === 'usage.update'))).toEqual([]);
   });
 });

@@ -1101,27 +1101,59 @@ export function supportsProcessClear(agentType: string | undefined): agentType i
   return agentType === 'claude-code' || agentType === 'codex' || agentType === 'opencode';
 }
 
+const sessionResetGenerations = new Map<string, number>();
+let nextSessionResetGeneration = 0;
+
+function allocateSessionResetToken(sessionName: string): number {
+  const token = ++nextSessionResetGeneration;
+  sessionResetGenerations.set(sessionName, token);
+  return token;
+}
+
+function isSessionResetOwnerCurrent(
+  sessionName: string,
+  expectedInstanceId?: string,
+  expectedToken?: number,
+): boolean {
+  if (expectedToken !== undefined && sessionResetGenerations.get(sessionName) !== expectedToken) {
+    return false;
+  }
+  const currentRecord = getSession(sessionName);
+  if (!currentRecord) {
+    return false;
+  }
+  if (expectedInstanceId && currentRecord.sessionInstanceId !== expectedInstanceId) {
+    return false;
+  }
+  return true;
+}
+
 async function finalizeConversationReset(
   sessionName: string,
   serverLink?: ServerLink,
   expectedInstanceId?: string,
+  expectedResetToken?: number,
 ): Promise<void> {
-  const resetRecord = getSession(sessionName);
-  if (resetRecord && expectedInstanceId && resetRecord.sessionInstanceId
-    && resetRecord.sessionInstanceId !== expectedInstanceId) {
-    logger.warn({ sessionName, expectedInstanceId, actualInstanceId: resetRecord.sessionInstanceId }, 'Skipping reset finalization after session owner changed');
+  if (!isSessionResetOwnerCurrent(sessionName, expectedInstanceId, expectedResetToken)) {
+    const actualRecord = getSession(sessionName);
+    logger.warn({
+      sessionName,
+      expectedInstanceId,
+      actualInstanceId: actualRecord?.sessionInstanceId,
+      expectedResetToken,
+      currentResetToken: sessionResetGenerations.get(sessionName),
+    }, 'Skipping reset finalization after session owner changed, session deleted, or reset superseded');
     return;
   }
+  const resetRecord = getSession(sessionName)!;
   // Reset per-session memory injection history — fresh conversation should be
   // allowed to re-inject previously-shown memories again.
   clearRecentInjectionHistory(sessionName);
   clearSummarySyncHistory(sessionName);
-  const model = resetRecord?.activeModel ?? resetRecord?.requestedModel;
-  const contextWindow = resetRecord
-    ? resolveContextWindow(resetRecord.presetContextWindow, model, 1_000_000, {
-      preferExplicit: resetRecord.presetContextWindow !== undefined,
-    })
-    : undefined;
+  const model = resetRecord.activeModel ?? resetRecord.requestedModel;
+  const contextWindow = resolveContextWindow(resetRecord.presetContextWindow, model, 1_000_000, {
+    preferExplicit: resetRecord.presetContextWindow !== undefined,
+  });
   timelineEmitter.emit(sessionName, 'usage.update', {
     inputTokens: 0,
     cacheTokens: 0,
@@ -1147,23 +1179,36 @@ async function executeDaemonResetCommand(opts: {
   effectiveId: string;
   isLegacy: boolean;
   label: string;
-  run: () => Promise<void>;
+  expectedInstanceId?: string;
+  run: (resetToken: number) => Promise<void>;
   formatError: (err: unknown) => string;
 }): Promise<void> {
-  const { sessionName, serverLink, effectiveId, isLegacy, label, run, formatError } = opts;
+  const { sessionName, serverLink, effectiveId, isLegacy, label, expectedInstanceId, run, formatError } = opts;
+  const resetToken = allocateSessionResetToken(sessionName);
   // Emit receipt ack + starting progress immediately before teardown/relaunch
-  // so the UI never hangs silently; dual-ack turns the bubble failed on error.
+  // (and before any queued prior relaunch wait) so the UI never hangs silently.
   const clearStatus = isLegacy ? 'accepted_legacy' : 'accepted';
   timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: clearStatus });
   emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: clearStatus });
   timelineEmitter.emit(sessionName, 'session.state', { state: 'starting' }, { source: 'daemon', confidence: 'high' });
   try {
-    await run();
+    await run(resetToken);
   } catch (err) {
     const errMsg = formatError(err);
     logger.error({ sessionName, err }, `${label} failed`);
-    timelineEmitter.emit(sessionName, 'assistant.text', { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_CLEAR_FAILED, `⚠️ Clear failed: ${errMsg}`, { detail: errMsg }), streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
-    timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
+    if (isSessionResetOwnerCurrent(sessionName, expectedInstanceId, resetToken)) {
+      timelineEmitter.emit(sessionName, 'assistant.text', { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_CLEAR_FAILED, `⚠️ Clear failed: ${errMsg}`, { detail: errMsg }), streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
+    } else {
+      logger.warn({
+        sessionName,
+        effectiveId,
+        expectedInstanceId,
+        actualInstanceId: getSession(sessionName)?.sessionInstanceId,
+        resetToken,
+        currentResetToken: sessionResetGenerations.get(sessionName),
+      }, 'Skipping session-level reset failure notice/state after owner changed, session deleted, or reset superseded');
+    }
     timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });
     emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
   }
@@ -1177,15 +1222,20 @@ async function executeDaemonResetCommand(opts: {
  * `serverLink` only pushes the refreshed session list to browsers now; without
  * it the change still persists and reaches them through the normal sync.
  */
-export async function clearTransportConversation(record: SessionRecord, serverLink?: ServerLink): Promise<void> {
+export async function clearTransportConversation(
+  record: SessionRecord,
+  serverLink?: ServerLink,
+  resetToken?: number,
+): Promise<void> {
   const sessionName = record.name;
+  const token = resetToken ?? allocateSessionResetToken(sessionName);
   await runSerializedSessionReset(sessionName, record, async (currentRecord) => {
     // Fresh conversation must not replay stale queued messages from the prior
     // offline window — drop anything we had buffered for resend.
     clearResend(sessionName);
     await relaunchFreshTransportConversation(currentRecord);
-  });
-  await finalizeConversationReset(sessionName, serverLink, record.sessionInstanceId);
+  }, token);
+  await finalizeConversationReset(sessionName, serverLink, record.sessionInstanceId, token);
 }
 
 /**
@@ -1193,26 +1243,44 @@ export async function clearTransportConversation(record: SessionRecord, serverLi
  * conversation (`fresh: true`) like `/clear` while attaching a bounded handoff
  * pack from the prior conversation for continuity on the next turn.
  */
-export async function handoffSessionConversation(record: SessionRecord, serverLink?: ServerLink): Promise<void> {
+export async function handoffSessionConversation(
+  record: SessionRecord,
+  serverLink?: ServerLink,
+  resetToken?: number,
+): Promise<void> {
   const sessionName = record.name;
+  const token = resetToken ?? allocateSessionResetToken(sessionName);
   await runSerializedSessionReset(sessionName, record, async (currentRecord) => {
     clearResend(sessionName);
     await relaunchSessionWithSettings(currentRecord, { fresh: true, handoff: true });
-  });
-  await finalizeConversationReset(sessionName, serverLink, record.sessionInstanceId);
+  }, token);
+  await finalizeConversationReset(sessionName, serverLink, record.sessionInstanceId, token);
 }
 
-async function clearProcessConversation(record: SessionRecord, serverLink?: ServerLink): Promise<void> {
+async function clearProcessConversation(
+  record: SessionRecord,
+  serverLink?: ServerLink,
+  resetToken?: number,
+): Promise<void> {
   const sessionName = record.name;
+  const token = resetToken ?? allocateSessionResetToken(sessionName);
   await runSerializedSessionReset(sessionName, record, async (currentRecord) => {
     clearResend(sessionName);
     await relaunchSessionWithSettings(currentRecord, { fresh: true });
-  });
-  await finalizeConversationReset(sessionName, serverLink, record.sessionInstanceId);
+  }, token);
+  await finalizeConversationReset(sessionName, serverLink, record.sessionInstanceId, token);
 }
 
 async function relaunchFreshTransportConversation(record: SessionRecord): Promise<void> {
+  const existedAtStart = Boolean(getSession(record.name));
   await stopTransportRuntimeSession(record.name);
+  const latest = getSession(record.name);
+  if (existedAtStart && !latest) {
+    throw new Error(`Session ${record.name} deleted during relaunch`);
+  }
+  if (latest && record.sessionInstanceId && latest.sessionInstanceId !== record.sessionInstanceId) {
+    throw new Error(`Session ${record.name} ownership changed during relaunch`);
+  }
   await launchTransportSession({
     name: record.name,
     projectName: record.projectName,
@@ -1522,16 +1590,22 @@ async function runSerializedSessionReset(
   sessionName: string,
   expectedRecord: SessionRecord,
   factory: (currentRecord: SessionRecord) => Promise<void>,
+  expectedResetToken?: number,
 ): Promise<void> {
   while (pendingSessionRelaunches.has(sessionName)) {
     await waitForPendingSessionRelaunch(sessionName);
   }
-  const latest = getSession(sessionName);
-  if (latest && expectedRecord.sessionInstanceId && latest.sessionInstanceId
-    && latest.sessionInstanceId !== expectedRecord.sessionInstanceId) {
+  if (!isSessionResetOwnerCurrent(sessionName, expectedRecord.sessionInstanceId, expectedResetToken)) {
+    const latest = getSession(sessionName);
+    if (expectedResetToken !== undefined && sessionResetGenerations.get(sessionName) !== expectedResetToken) {
+      throw new Error(`Session ${sessionName} reset superseded by newer reset`);
+    }
+    if (!latest) {
+      throw new Error(`Session ${sessionName} no longer exists before reset`);
+    }
     throw new Error(`Session ${sessionName} ownership changed before reset`);
   }
-  const currentRecord = latest ?? expectedRecord;
+  const currentRecord = getSession(sessionName) ?? expectedRecord;
   await trackPendingSessionRelaunch(sessionName, factory(currentRecord));
 }
 
@@ -5103,6 +5177,67 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
     return;
   }
 
+  // Fast-path supported `/clear` and `/handoff` before waiting on any prior
+  // relaunch or running skill/preference/path expansion so receipt ack and
+  // starting feedback are immediate even when another relaunch is in flight.
+  const isResetClearFast = !wantsStructuredP2pRouting
+    && !wantsLegacyP2pRouting
+    && isSessionControlCommandText(trimmedText, 'clear');
+  const isResetHandoffFast = !wantsStructuredP2pRouting
+    && !wantsLegacyP2pRouting
+    && isSessionControlCommandText(trimmedText, 'handoff');
+  if (isResetClearFast || isResetHandoffFast) {
+    const fastRecord = getSession(sessionName);
+    if (!fastRecord) {
+      logger.warn(
+        { sessionName, commandId: effectiveId },
+        'handleSend: session record missing — emitting error ack instead of silent fallthrough',
+      );
+      timelineEmitter.emit(
+        sessionName,
+        'session.state',
+        { state: 'error', error: 'session_missing' },
+        { source: 'daemon', confidence: 'high' },
+      );
+      emitCommandAckReliable(serverLink, {
+        commandId: effectiveId,
+        sessionName,
+        status: 'error',
+        error: 'session_missing',
+      });
+      return;
+    }
+    const isTransportSessionFast = fastRecord.runtimeType === 'transport'
+      || (typeof fastRecord.agentType === 'string' && isTransportAgent(fastRecord.agentType));
+    if (
+      (isTransportSessionFast && supportsTransportClear(fastRecord.agentType))
+      || (fastRecord.runtimeType !== 'transport' && supportsProcessClear(fastRecord.agentType))
+    ) {
+      authorityBinding.current = bindProcessSharedMachineCommand(sessionName, fastRecord, cmd);
+      emitTransportUserMessage(text);
+      receiptAcked = true;
+      await executeDaemonResetCommand({
+        sessionName,
+        serverLink,
+        effectiveId,
+        isLegacy,
+        label: isResetHandoffFast
+          ? (isTransportSessionFast ? 'session.handoff (transport)' : 'session.handoff')
+          : (isTransportSessionFast ? 'session.clear (transport)' : 'session.clear'),
+        expectedInstanceId: fastRecord.sessionInstanceId,
+        run: (resetToken) => isResetHandoffFast
+          ? handoffSessionConversation(fastRecord, serverLink, resetToken)
+          : isTransportSessionFast
+            ? clearTransportConversation(fastRecord, serverLink, resetToken)
+            : clearProcessConversation(fastRecord, serverLink, resetToken),
+        formatError: isTransportSessionFast
+          ? describeTransportSendError
+          : (err) => (err instanceof Error ? err.message : String(err)),
+      });
+      return;
+    }
+  }
+
   await waitForPendingSessionRelaunch(sessionName);
 
   // Transport sessions — route directly to the provider runtime, bypassing tmux.
@@ -5153,40 +5288,6 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
       sessionName,
       status: 'error',
       error: 'session_missing',
-    });
-    return;
-  }
-
-  // Fast-path supported `/clear` and `/handoff` before skill/preference/path
-  // expansion so immediate ack + reset start with zero filesystem/DB latency.
-  const isTransportSessionFast = record.runtimeType === 'transport'
-    || (typeof record.agentType === 'string' && isTransportAgent(record.agentType));
-  const isResetClearFast = isSessionControlCommandText(trimmedText, 'clear');
-  const isResetHandoffFast = isSessionControlCommandText(trimmedText, 'handoff');
-  if (
-    (isResetClearFast || isResetHandoffFast)
-    && (
-      (isTransportSessionFast && supportsTransportClear(record.agentType))
-      || (record.runtimeType !== 'transport' && supportsProcessClear(record.agentType))
-    )
-  ) {
-    emitTransportUserMessage(text);
-    await executeDaemonResetCommand({
-      sessionName,
-      serverLink,
-      effectiveId,
-      isLegacy,
-      label: isResetHandoffFast
-        ? (isTransportSessionFast ? 'session.handoff (transport)' : 'session.handoff')
-        : (isTransportSessionFast ? 'session.clear (transport)' : 'session.clear'),
-      run: () => isResetHandoffFast
-        ? handoffSessionConversation(record, serverLink)
-        : isTransportSessionFast
-          ? clearTransportConversation(record, serverLink)
-          : clearProcessConversation(record, serverLink),
-      formatError: isTransportSessionFast
-        ? describeTransportSendError
-        : (err) => (err instanceof Error ? err.message : String(err)),
     });
     return;
   }
@@ -5342,15 +5443,17 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
   const isTransportHandoff = isSessionControlCommandText(trimmedText, 'handoff');
   if (isTransportSession && (isSessionControlCommandText(trimmedText, 'clear') || isTransportHandoff) && supportsTransportClear(record?.agentType)) {
     emitTransportUserMessage(text);
+    receiptAcked = true;
     await executeDaemonResetCommand({
       sessionName,
       serverLink,
       effectiveId,
       isLegacy,
       label: isTransportHandoff ? 'session.handoff (transport)' : 'session.clear (transport)',
-      run: () => isTransportHandoff
-        ? handoffSessionConversation(record!, serverLink)
-        : clearTransportConversation(record!, serverLink),
+      expectedInstanceId: record!.sessionInstanceId,
+      run: (resetToken) => isTransportHandoff
+        ? handoffSessionConversation(record!, serverLink, resetToken)
+        : clearTransportConversation(record!, serverLink, resetToken),
       formatError: describeTransportSendError,
     });
     return;
@@ -5779,22 +5882,17 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
   const isProcessHandoff = isSessionControlCommandText(text, 'handoff');
   if ((isSessionControlCommandText(text, 'clear') || isProcessHandoff) && record?.runtimeType !== 'transport' && supportsProcessClear(record?.agentType)) {
     emitTransportUserMessage(text);
+    receiptAcked = true;
     await executeDaemonResetCommand({
       sessionName,
       serverLink,
       effectiveId,
       isLegacy,
       label: isProcessHandoff ? 'session.handoff' : 'session.clear',
-      run: async () => {
-        if (isProcessHandoff) {
-          await handoffSessionConversation(record, serverLink);
-          return;
-        }
-        await runExclusiveSessionRelaunch(sessionName, async () => {
-          await relaunchSessionWithSettings(record, { fresh: true });
-        });
-        await finalizeConversationReset(sessionName, serverLink);
-      },
+      expectedInstanceId: record.sessionInstanceId,
+      run: (resetToken) => isProcessHandoff
+        ? handoffSessionConversation(record, serverLink, resetToken)
+        : clearProcessConversation(record, serverLink, resetToken),
       formatError: (err) => (err instanceof Error ? err.message : String(err)),
     });
     return;

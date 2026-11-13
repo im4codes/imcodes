@@ -1331,13 +1331,17 @@ export async function relaunchSessionWithSettings(
   overrides: SessionRelaunchOverrides = {},
 ): Promise<void> {
   const launchGeneration = advanceCrossVendorHandoffLaunchGeneration(record.name);
+  const existedAtStart = Boolean(getSession(record.name));
   const isGenerationCurrent = (): boolean => crossVendorHandoffLaunchGenerations.get(record.name) === launchGeneration;
   const assertSessionOwnership = (): void => {
     if (!isGenerationCurrent()) {
       throw new Error(`Session ${record.name} relaunch superseded by a newer launch`);
     }
     const latest = getSession(record.name);
-    if (latest && record.sessionInstanceId && latest.sessionInstanceId && latest.sessionInstanceId !== record.sessionInstanceId) {
+    if (existedAtStart && !latest) {
+      throw new Error(`Session ${record.name} deleted during relaunch`);
+    }
+    if (latest && record.sessionInstanceId && latest.sessionInstanceId !== record.sessionInstanceId) {
       throw new Error(`Session ${record.name} ownership changed during relaunch`);
     }
   };
