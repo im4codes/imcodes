@@ -53,55 +53,58 @@ public class QuantizedTextAttention: Module {
         super.init()
     }
 
+    private func projectQKV(_ hiddenStates: MLXArray, offset: Int) -> (MLXArray, MLXArray, MLXArray) {
+        let (batch, seqLen, _) = (hiddenStates.dim(0), hiddenStates.dim(1), hiddenStates.dim(2))
+
+        let queries = qNorm(qProj(hiddenStates).reshaped(batch, seqLen, numHeads, headDim)).transposed(0, 2, 1, 3)
+        let keys = kNorm(kProj(hiddenStates).reshaped(batch, seqLen, numKVHeads, headDim)).transposed(0, 2, 1, 3)
+        let values = vProj(hiddenStates).reshaped(batch, seqLen, numKVHeads, headDim).transposed(0, 2, 1, 3)
+
+        return (rope(queries, offset: offset), rope(keys, offset: offset), values)
+    }
+
     public func callAsFunction(
         _ hiddenStates: MLXArray,
         attentionMask: MLXArray? = nil,
         cache: (MLXArray, MLXArray)? = nil
     ) -> (MLXArray, (MLXArray, MLXArray)) {
-        let (batch, seqLen, _) = (hiddenStates.dim(0), hiddenStates.dim(1), hiddenStates.dim(2))
+        let maskMode: MLXFast.ScaledDotProductAttentionMaskMode = attentionMask.map { .array($0) }
+            ?? (hiddenStates.dim(1) == 1 ? .none : .causal)
+        return callWithMaskMode(hiddenStates, maskMode: maskMode, cache: cache)
+    }
 
-        // Project Q, K, V
-        var queries = qProj(hiddenStates)
-        var keys = kProj(hiddenStates)
-        var values = vProj(hiddenStates)
-
-        // Reshape for multi-head attention
-        queries = queries.reshaped(batch, seqLen, numHeads, headDim)
-        keys = keys.reshaped(batch, seqLen, numKVHeads, headDim)
-        values = values.reshaped(batch, seqLen, numKVHeads, headDim)
-
-        // Apply Q/K normalization
-        queries = qNorm(queries)
-        keys = kNorm(keys)
-
-        // Transpose to [batch, heads, seq, head_dim]
-        queries = queries.transposed(0, 2, 1, 3)
-        keys = keys.transposed(0, 2, 1, 3)
-        values = values.transposed(0, 2, 1, 3)
-
-        // Calculate offset for RoPE based on cache
+    func callWithMaskMode(
+        _ hiddenStates: MLXArray,
+        maskMode: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: (MLXArray, MLXArray)? = nil
+    ) -> (MLXArray, (MLXArray, MLXArray)) {
         let offset = cache?.0.dim(2) ?? 0
+        let (queries, keys, values) = projectQKV(hiddenStates, offset: offset)
 
-        // Apply MLXFast RoPE (handles split-half rotation via optimized Metal kernel)
-        queries = rope(queries, offset: offset)
-        keys = rope(keys, offset: offset)
-
-        // Update cache
         var cachedKeys = keys
         var cachedValues = values
-
         if let (prevKeys, prevValues) = cache {
             cachedKeys = concatenated([prevKeys, keys], axis: 2)
             cachedValues = concatenated([prevValues, values], axis: 2)
         }
 
-        // SDPA handles GQA natively (N_q != N_kv), no need to tile KV heads
         let merged = SDPA.attendAndMerge(
             qHeads: queries, kHeads: cachedKeys, vHeads: cachedValues,
-            scale: scale, mask: attentionMask)
-        let output = oProj(merged)
+            scale: scale, mask: maskMode)
+        return (oProj(merged), (cachedKeys, cachedValues))
+    }
 
-        return (output, (cachedKeys, cachedValues))
+    public func callWithKVCache(
+        _ hiddenStates: MLXArray,
+        maskMode: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: TextLayerKVCache
+    ) -> MLXArray {
+        let (queries, keys, values) = projectQKV(hiddenStates, offset: cache.offset)
+        let (cachedKeys, cachedValues) = cache.updateAndFetch(keys: keys, values: values)
+        let merged = SDPA.attendAndMerge(
+            qHeads: queries, kHeads: cachedKeys, vHeads: cachedValues,
+            scale: scale, mask: maskMode)
+        return oProj(merged)
     }
 }
 
@@ -153,24 +156,45 @@ public class QuantizedTextDecoderLayer: Module {
         super.init()
     }
 
+    private lazy var compiledPostAttnMLP: ([MLXArray]) -> [MLXArray] = compile(inputs: [self], shapeless: true) {
+        inputs in
+        let residual = inputs[0]
+        let attnOutput = inputs[1]
+        let postAttn = residual + attnOutput
+        let normed = self.postAttentionLayerNorm(postAttn)
+        let gate = silu(self.mlp.gateProj(normed))
+        let up = self.mlp.upProj(normed)
+        return [postAttn + self.mlp.downProj(gate * up)]
+    }
+
     public func callAsFunction(
         _ hiddenStates: MLXArray,
         attentionMask: MLXArray? = nil,
         cache: (MLXArray, MLXArray)? = nil
     ) -> (MLXArray, (MLXArray, MLXArray)) {
-        // Self attention with pre-norm
-        let residual = hiddenStates
-        var hidden = inputLayerNorm(hiddenStates)
-        let (attnOutput, newCache) = selfAttn(hidden, attentionMask: attentionMask, cache: cache)
-        hidden = residual + attnOutput
+        let maskMode: MLXFast.ScaledDotProductAttentionMaskMode = attentionMask.map { .array($0) }
+            ?? (hiddenStates.dim(1) == 1 ? .none : .causal)
+        return callWithMaskMode(hiddenStates, maskMode: maskMode, cache: cache)
+    }
 
-        // MLP with pre-norm
-        let residual2 = hidden
-        hidden = postAttentionLayerNorm(hidden)
-        hidden = mlp(hidden)
-        hidden = residual2 + hidden
+    func callWithMaskMode(
+        _ hiddenStates: MLXArray,
+        maskMode: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: (MLXArray, MLXArray)? = nil
+    ) -> (MLXArray, (MLXArray, MLXArray)) {
+        let hidden = inputLayerNorm(hiddenStates)
+        let (attnOutput, newCache) = selfAttn.callWithMaskMode(hidden, maskMode: maskMode, cache: cache)
+        return (compiledPostAttnMLP([hiddenStates, attnOutput])[0], newCache)
+    }
 
-        return (hidden, newCache)
+    public func callWithKVCache(
+        _ hiddenStates: MLXArray,
+        maskMode: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: TextLayerKVCache
+    ) -> MLXArray {
+        let hidden = inputLayerNorm(hiddenStates)
+        let attnOutput = selfAttn.callWithKVCache(hidden, maskMode: maskMode, cache: cache)
+        return compiledPostAttnMLP([hiddenStates, attnOutput])[0]
     }
 }
 
@@ -198,55 +222,55 @@ public class QuantizedTextModel: Module {
         super.init()
     }
 
-    /// Forward pass through text decoder
+    public func makeKVCache(step: Int = 256) -> [TextLayerKVCache] {
+        (0..<layers.count).map { _ in TextLayerKVCache(step: step) }
+    }
+
+    private func resolveEmbeddings(inputIds: MLXArray?, inputsEmbeds: MLXArray?) -> MLXArray {
+        if let embeds = inputsEmbeds { return embeds }
+        if let ids = inputIds { return embedTokens(ids) }
+        fatalError("Either inputIds or inputsEmbeds must be provided")
+    }
+
+    /// Forward pass through text decoder using tuple caches (kept for ForcedAlignerTextDecoding).
     public func callAsFunction(
         inputIds: MLXArray? = nil,
         inputsEmbeds: MLXArray? = nil,
         attentionMask: MLXArray? = nil,
         cache: [(MLXArray, MLXArray)]? = nil
     ) -> (MLXArray, [(MLXArray, MLXArray)]) {
-        // Get embeddings
-        var hiddenStates: MLXArray
-        if let embeds = inputsEmbeds {
-            hiddenStates = embeds
-        } else if let ids = inputIds {
-            hiddenStates = embedTokens(ids)
-        } else {
-            fatalError("Either inputIds or inputsEmbeds must be provided")
-        }
-
+        var hiddenStates = resolveEmbeddings(inputIds: inputIds, inputsEmbeds: inputsEmbeds)
         let seqLen = hiddenStates.dim(1)
+        let maskMode: MLXFast.ScaledDotProductAttentionMaskMode = attentionMask.map { .array($0) }
+            ?? (seqLen == 1 ? .none : .causal)
 
-        // Determine attention mask
-        let mask: MLXArray?
-        if let providedMask = attentionMask {
-            mask = providedMask
-        } else if seqLen == 1 {
-            // Autoregressive: single query can attend to all cached positions, no mask needed
-            mask = nil
-        } else {
-            // Prefill: create causal mask using MLX broadcast operations
-            let cacheLen = cache?.first?.0.dim(2) ?? 0
-            let totalLen = seqLen + cacheLen
-            let rows = (MLXArray(0..<Int32(seqLen)) + Int32(cacheLen)).expandedDimensions(axis: 1)
-            let cols = MLXArray(0..<Int32(totalLen)).expandedDimensions(axis: 0)
-            mask = MLX.where(cols .> rows, MLXArray(Float(-1e9)), MLXArray(Float(0)))
-                .expandedDimensions(axes: [0, 1])
-                .asType(hiddenStates.dtype)
-        }
-
-        // Apply decoder layers
         var newCache: [(MLXArray, MLXArray)] = []
+        newCache.reserveCapacity(layers.count)
         for (i, layer) in layers.enumerated() {
-            let layerCache = cache?[i]
-            let (output, updatedCache) = layer(hiddenStates, attentionMask: mask, cache: layerCache)
+            let (output, updatedCache) = layer.callWithMaskMode(hiddenStates, maskMode: maskMode, cache: cache?[i])
             hiddenStates = output
             newCache.append(updatedCache)
         }
 
-        // Final norm
-        hiddenStates = norm(hiddenStates)
+        return (norm(hiddenStates), newCache)
+    }
 
-        return (hiddenStates, newCache)
+    /// Forward pass using step-preallocated KV caches and native causal SDPA masking.
+    public func callWithKVCache(
+        inputIds: MLXArray? = nil,
+        inputsEmbeds: MLXArray? = nil,
+        attentionMask: MLXArray? = nil,
+        cache: [TextLayerKVCache]
+    ) -> MLXArray {
+        var hiddenStates = resolveEmbeddings(inputIds: inputIds, inputsEmbeds: inputsEmbeds)
+        let seqLen = hiddenStates.dim(1)
+        let maskMode: MLXFast.ScaledDotProductAttentionMaskMode = attentionMask.map { .array($0) }
+            ?? (seqLen == 1 ? .none : .causal)
+
+        for (i, layer) in layers.enumerated() {
+            hiddenStates = layer.callWithKVCache(hiddenStates, maskMode: maskMode, cache: cache[i])
+        }
+
+        return norm(hiddenStates)
     }
 }

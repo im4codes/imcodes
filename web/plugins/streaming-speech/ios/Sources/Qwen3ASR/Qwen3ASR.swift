@@ -268,9 +268,9 @@ public class Qwen3ASRModel {
         sampleRate: Int = 16000,
         options: Qwen3DecodingOptions
     ) -> String {
-        transcribe(
+        transcribeSegment(
             audio: audio, sampleRate: sampleRate, options: options,
-            checkCancellation: {})
+            prefixTokens: [], checkCancellation: {}).text
     }
 
     /// Throwing entry point that validates model readiness and cooperatively
@@ -308,9 +308,9 @@ public class Qwen3ASRModel {
         sampleRate: Int = 16000,
         options: Qwen3DecodingOptions = Qwen3DecodingOptions()
     ) throws -> String {
-        try transcribe(
+        try transcribeSegment(
             audio: audio, sampleRate: sampleRate, options: options,
-            checkCancellation: { try Task.checkCancellation() })
+            prefixTokens: [], checkCancellation: { try Task.checkCancellation() }).text
     }
 
     /// Transcribe with caller-supplied cooperative cancellation hook (e.g., generation/app-state guard).
@@ -320,23 +320,82 @@ public class Qwen3ASRModel {
         options: Qwen3DecodingOptions = Qwen3DecodingOptions(),
         checkCancellation: () throws -> Void
     ) throws -> String {
+        try transcribeSegmentWithCancellation(
+            audio: audio,
+            sampleRate: sampleRate,
+            options: options,
+            prefixTokens: [],
+            checkCancellation: checkCancellation
+        ).text
+    }
+
+    /// Transcribe an active streaming segment with optional confirmed `prefixTokens`
+    /// appended after `<asr_text>` for token-level prefix rollback continuation.
+    /// Returns decoded segment text plus the complete non-EOS token sequence.
+    public func transcribeSegmentWithCancellation(
+        audio: [Float],
+        sampleRate: Int = 16000,
+        options: Qwen3DecodingOptions = Qwen3DecodingOptions(),
+        prefixTokens: [Int32] = [],
+        checkCancellation: () throws -> Void
+    ) throws -> (text: String, tokens: [Int32]) {
         guard _isLoaded, textDecoder != nil, tokenizer != nil else {
             throw AudioModelError.inferenceFailed(operation: "transcribe", reason: "Model is not loaded")
         }
-        return try transcribe(
-            audio: audio, sampleRate: sampleRate, options: options,
-            checkCancellation: checkCancellation)
+        return try transcribeSegment(
+            audio: audio,
+            sampleRate: sampleRate,
+            options: options,
+            prefixTokens: prefixTokens,
+            checkCancellation: checkCancellation
+        )
+    }
+
+    /// Trim the trailing `rollbackCount` tokens after excluding EOS/PAD while snapping
+    /// back across incomplete multi-byte UTF-8 BPE boundaries (`U+FFFD`).
+    public func safePrefixTokensForRollback(_ tokens: [Int32], rollbackCount: Int = 5) -> [Int32] {
+        Self.safePrefixTokensForRollback(tokens, rollbackCount: rollbackCount, tokenizer: tokenizer)
+    }
+
+    public static func safePrefixTokensForRollback(
+        _ tokens: [Int32],
+        rollbackCount: Int = 5,
+        tokenizer: Qwen3Tokenizer?
+    ) -> [Int32] {
+        let eos = Int32(Qwen3ASRTokens.eosTokenId)
+        let pad = Int32(Qwen3ASRTokens.padTokenId)
+        var end = tokens.count
+        while end > 0 && (tokens[end - 1] == eos || tokens[end - 1] == pad) {
+            end -= 1
+        }
+        let headerEnd = tokens[..<end]
+            .lastIndex(of: Int32(Qwen3ASRTokens.asrTextTokenId))
+            .map { $0 + 1 } ?? 0
+        let trim = max(0, rollbackCount)
+        guard end - headerEnd > trim else { return [] }
+        end -= trim
+        if let tokenizer = tokenizer {
+            while end > headerEnd {
+                let decoded = tokenizer.decode(tokens: tokens[headerEnd..<end].map { Int($0) })
+                if !decoded.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("\u{FFFD}") {
+                    break
+                }
+                end -= 1
+            }
+        }
+        return end > headerEnd ? Array(tokens[..<end]) : []
     }
 
     /// Shared implementation behind the synchronous and the
     /// cancellation-aware entry points. `checkCancellation` is invoked at
     /// each cooperative checkpoint; the synchronous API passes a no-op.
-    private func transcribe(
+    private func transcribeSegment(
         audio: [Float],
         sampleRate: Int,
         options: Qwen3DecodingOptions,
+        prefixTokens: [Int32],
         checkCancellation: () throws -> Void
-    ) rethrows -> String {
+    ) rethrows -> (text: String, tokens: [Int32]) {
         try checkCancellation()
         let durationSeconds = sampleRate > 0
             ? Double(audio.count) / Double(sampleRate)
@@ -350,15 +409,16 @@ public class Qwen3ASRModel {
         audioEmbeds = audioEmbeds.expandedDimensions(axis: 0)
         guard let textDecoder = textDecoder else {
             let shape = audioEmbeds.shape
-            return "[Audio encoded: \(shape)] - Text decoder not loaded"
+            return ("[Audio encoded: \(shape)] - Text decoder not loaded", [])
         }
-        return try generateText(
+        return try generateTextSegment(
             audioEmbeds: audioEmbeds,
             textDecoder: textDecoder,
             language: effective.language,
             maxTokens: effective.maxTokens,
             context: effective.context,
             decodingOptions: effective,
+            prefixTokens: prefixTokens,
             checkCancellation: checkCancellation
         )
     }
@@ -429,6 +489,13 @@ public class Qwen3ASRModel {
         )
     }
 
+    /// Drain pending MLX GPU work and release cached scratch Metal buffers.
+    /// Call at session teardown or memory warnings, never between streaming steps.
+    public static func clearMetalCache() {
+        StreamOrDevice.default.stream.synchronize()
+        Memory.clearCache()
+    }
+
     /// Generate text from audio embeddings.
     ///
     /// When `decodingOptions` is supplied, the decoder loop applies an
@@ -440,10 +507,6 @@ public class Qwen3ASRModel {
     /// `checkCancellation` is invoked before decoder prefill and forwarded
     /// to the decoder loop, which invokes it before each token's work is
     /// submitted. Synchronous callers pass a no-op closure.
-    ///
-    /// Single-input transcription entry points share this decoder. Clear
-    /// reusable MLX buffers on return or cancellation so a long-running
-    /// process releases its scratch pool between requests.
     func generateText(
         audioEmbeds: MLXArray,
         textDecoder: QuantizedTextModel,
@@ -453,128 +516,101 @@ public class Qwen3ASRModel {
         decodingOptions: Qwen3DecodingOptions = Qwen3DecodingOptions(),
         checkCancellation: () throws -> Void
     ) rethrows -> String {
+        try generateTextSegment(
+            audioEmbeds: audioEmbeds,
+            textDecoder: textDecoder,
+            language: language,
+            maxTokens: maxTokens,
+            context: context,
+            decodingOptions: decodingOptions,
+            prefixTokens: [],
+            checkCancellation: checkCancellation
+        ).text
+    }
+
+    func generateTextSegment(
+        audioEmbeds: MLXArray,
+        textDecoder: QuantizedTextModel,
+        language: String?,
+        maxTokens: Int,
+        context: String? = nil,
+        decodingOptions: Qwen3DecodingOptions = Qwen3DecodingOptions(),
+        prefixTokens: [Int32] = [],
+        checkCancellation: () throws -> Void
+    ) rethrows -> (text: String, tokens: [Int32]) {
         defer {
             // Speculative greedy work can still be running at EOS or
             // cancellation. Wait for its buffers to become reusable before
-            // clearing the pool, after the decoder's local arrays are gone.
+            // decoder scratch arrays go out of scope, while keeping the
+            // bounded Metal cache pool warm across consecutive steps.
             StreamOrDevice.default.stream.synchronize()
-            Memory.clearCache()
         }
-        return try generateTextImpl(
+        return try generateTextSegmentImpl(
             audioEmbeds: audioEmbeds, textDecoder: textDecoder,
             language: language, maxTokens: maxTokens, context: context,
-            decodingOptions: decodingOptions, checkCancellation: checkCancellation)
+            decodingOptions: decodingOptions, prefixTokens: prefixTokens,
+            checkCancellation: checkCancellation)
     }
 
-    private func generateTextImpl(
+    private func generateTextSegmentImpl(
         audioEmbeds: MLXArray,
         textDecoder: QuantizedTextModel,
         language: String?,
         maxTokens: Int,
         context: String?,
         decodingOptions: Qwen3DecodingOptions,
+        prefixTokens: [Int32],
         checkCancellation: () throws -> Void
-    ) rethrows -> String {
-        let T = Qwen3ASRTokens.self
-        let numAudioTokens = audioEmbeds.dim(1)
-        var inputIds: [Int32] = []
+    ) rethrows -> (text: String, tokens: [Int32]) {
+        let (prefixTokenIds, suffixTokenIds) = Self.buildPromptTokenIds(
+            language: language, context: context, tokenizer: tokenizer, prefixTokens: prefixTokens)
+        let inputEmbeds = Self.buildInputEmbeds(
+            audioEmbeds: audioEmbeds,
+            audioTokenCount: audioEmbeds.dim(1),
+            prefixTokenIds: prefixTokenIds,
+            suffixTokenIds: suffixTokenIds,
+            audioStartIndex: prefixTokenIds.count,
+            textDecoder: textDecoder
+        )
 
-        // <|im_start|>system\n{context}<|im_end|>\n
-        inputIds.append(contentsOf: [T.imStartTokenId, T.systemTokenId, T.newlineTokenId].map { Int32($0) })
-        if let context = context, !context.isEmpty, let tokenizer = tokenizer {
-            let contextTokens = tokenizer.encode(context)
-            inputIds.append(contentsOf: contextTokens.map { Int32($0) })
-        }
-        inputIds.append(contentsOf: [T.imEndTokenId, T.newlineTokenId].map { Int32($0) })
-
-        // <|im_start|>user\n<|audio_start|>
-        inputIds.append(contentsOf: [T.imStartTokenId, T.userTokenId, T.newlineTokenId, T.audioStartTokenId].map { Int32($0) })
-
-        // <|audio_pad|> * numAudioTokens (placeholder tokens that will be replaced)
-        let audioStartIndex = inputIds.count
-        for _ in 0..<numAudioTokens {
-            inputIds.append(Int32(T.audioTokenId))
-        }
-        let audioEndIndex = inputIds.count
-
-        // <|audio_end|><|im_end|>\n
-        inputIds.append(contentsOf: [T.audioEndTokenId, T.imEndTokenId, T.newlineTokenId].map { Int32($0) })
-
-        // <|im_start|>assistant\n
-        inputIds.append(contentsOf: [T.imStartTokenId, T.assistantTokenId, T.newlineTokenId].map { Int32($0) })
-
-        // Add language hint if specified, then always add <asr_text>. Without
-        // <asr_text>, the model doesn't know it should transcribe. Without a
-        // language hint, the model auto-detects and prepends "language XX".
-        if let lang = language, let tokenizer = tokenizer {
-            let langPrefix = "language \(lang)"
-            let langTokens = tokenizer.encode(langPrefix)
-            inputIds.append(contentsOf: langTokens.map { Int32($0) })
-        }
-        inputIds.append(Int32(T.asrTextTokenId))
-
-        // Get text embeddings for all tokens
-        let inputIdsTensor = MLXArray(inputIds).expandedDimensions(axis: 0)
-        var inputEmbeds = textDecoder.embedTokens(inputIdsTensor)
-
-        // Replace audio_pad token positions with actual audio embeddings
-        let audioEmbedsTyped = audioEmbeds.asType(inputEmbeds.dtype)
-        let beforeAudio = inputEmbeds[0..., 0..<audioStartIndex, 0...]
-        let afterAudio = inputEmbeds[0..., audioEndIndex..., 0...]
-
-        inputEmbeds = concatenated([beforeAudio, audioEmbedsTyped, afterAudio], axis: 1)
-
-        // Initialize KV cache
-        var cache: [(MLXArray, MLXArray)]? = nil
-
-        // First pass: process the full input embeddings
+        // First pass: process the full input embeddings.
         try checkCancellation()
-        let (hiddenStates, newCache) = textDecoder(inputsEmbeds: inputEmbeds, cache: cache)
-        cache = newCache
-
-        // Get logits from the last position using embedding as LM head (tied weights)
-        let seqLen = hiddenStates.dim(1)
-        let lastHidden = hiddenStates[0..., (seqLen-1)..<seqLen, 0...]
-        let logits = textDecoder.embedTokens.asLinear(lastHidden)
-
-        // Greedy fast path uses a double-buffered asyncEval decode loop that
-        // overlaps the GPU forward pass for token N+1 with the host-side
-        // bookkeeping (EOS check + Swift array append) for token N. The
-        // legacy slow path stays on the per-token CPU sync because it pulls
-        // the full logits tensor to CPU for repetition / n-gram / temperature
-        // manipulation, which would defeat the overlap.
         let generatedTokens: [Int32]
         if Self.isGreedyFastPath(decodingOptions) {
-            generatedTokens = try Self.generateGreedyAsyncEval(
+            let kvCache = textDecoder.makeKVCache(step: 256)
+            let hiddenStates = textDecoder.callWithKVCache(inputsEmbeds: inputEmbeds, cache: kvCache)
+            let seqLen = hiddenStates.dim(1)
+            let logits = textDecoder.embedTokens.asLinear(hiddenStates[0..., (seqLen - 1)..<seqLen, 0...])
+            generatedTokens = try Self.generateGreedyAsyncEvalKVCache(
                 textDecoder: textDecoder,
                 initialLogits: logits,
-                cache: cache!,
+                cache: kvCache,
                 maxTokens: maxTokens,
                 checkCancellation: checkCancellation
             )
         } else {
+            let (hiddenStates, cache) = textDecoder(inputsEmbeds: inputEmbeds, cache: nil)
+            let seqLen = hiddenStates.dim(1)
+            let logits = textDecoder.embedTokens.asLinear(hiddenStates[0..., (seqLen - 1)..<seqLen, 0...])
             generatedTokens = try Self.generateSlow(
                 textDecoder: textDecoder,
                 initialLogits: logits,
-                cache: cache!,
+                cache: cache,
                 maxTokens: maxTokens,
                 options: decodingOptions,
                 checkCancellation: checkCancellation
             )
         }
 
-        // Decode tokens to text
-        if let tokenizer = tokenizer {
-            let rawText = tokenizer.decode(tokens: generatedTokens.map { Int($0) })
-            // Strip "language XX<asr_text>" prefix if present (auto-detection output)
-            if let range = rawText.range(of: "<asr_text>") {
-                return String(rawText[range.upperBound...]).trimmingCharacters(in: .whitespaces)
-            }
-            return rawText
-        } else {
-            // Fallback: return token IDs
-            return generatedTokens.map { String($0) }.joined(separator: " ")
+        let eos = Int32(Qwen3ASRTokens.eosTokenId)
+        let pad = Int32(Qwen3ASRTokens.padTokenId)
+        var continuation = generatedTokens
+        while let last = continuation.last, last == eos || last == pad {
+            continuation.removeLast()
         }
+        let fullTokens = prefixTokens + continuation
+        let text = Self.decodeTokenBatch(allTokens: [fullTokens], tokenizer: tokenizer)[0]
+        return (text, fullTokens)
     }
 
     /// Greedy with default options: temperature 0, no repetition penalty,
@@ -652,10 +688,10 @@ public class Qwen3ASRModel {
     /// (the first `asyncEval` also forces the prefill), then inside the
     /// loop before every speculative N+1 graph. A throw abandons the
     /// in-flight step; nothing further is queued on the GPU.
-    static func generateGreedyAsyncEval(
+    static func generateGreedyAsyncEvalKVCache(
         textDecoder: QuantizedTextModel,
         initialLogits: MLXArray,
-        cache initialCache: [(MLXArray, MLXArray)],
+        cache: [TextLayerKVCache],
         maxTokens: Int,
         checkCancellation: () throws -> Void
     ) rethrows -> [Int32] {
@@ -663,68 +699,44 @@ public class Qwen3ASRModel {
         guard maxTokens > 0 else { return generatedTokens }
         try checkCancellation()
 
-        // Stage 0: argmax of the prefill's last logits. Stays lazy until
-        // the first `.item()` below.
-        //
-        // Cast to int32 explicitly: MLX's `argmax` returns uint32, but the
-        // legacy loop fed `embedTokens` an int32 tensor (built from a Swift
-        // `Int32`). Quantized embedding lookup observably dispatches
-        // differently on uint32 vs. int32, producing tokens that diverge
-        // from the legacy path on a small fraction of inputs. Casting here
-        // restores exact dtype parity, so greedy stays token-for-token
-        // identical to the pre-optimisation decoder.
+        func enqueueEval(_ token: MLXArray) {
+            var targets: [MLXArray] = []
+            targets.reserveCapacity(1 + cache.count * 2)
+            targets.append(token)
+            for layerCache in cache {
+                if let k = layerCache.keys, let v = layerCache.values {
+                    targets.append(k)
+                    targets.append(v)
+                }
+            }
+            asyncEval(targets)
+        }
+
+        // Cast argMax explicitly from uint32 to int32 for quantized embedding dispatch parity.
         var nextTokenArr = argMax(initialLogits, axis: -1).squeezed().asType(.int32)
-        var cache = initialCache
-        // Kick off the GPU on the first token (and the prefill cache that
-        // step 1's graph will read from).
-        asyncEval(nextTokenArr, cache)
+        enqueueEval(nextTokenArr)
 
         let eosToken = Int32(Qwen3ASRTokens.eosTokenId)
 
         for step in 0..<maxTokens {
-            // Stage N+1's graph BEFORE syncing N. embedTokens expects a
-            // [batch, seq] int32 tensor; nextTokenArr is 0-D so we expand
-            // twice to [1, 1].
-            //
-            // Skip the speculative graph build on the LAST iteration —
-            // we'd never consume it, and on tiny `maxTokens` the saved
-            // GPU/host work matters.
             var nextTokenArrN1: MLXArray? = nil
-            var cacheN1: [(MLXArray, MLXArray)]? = nil
             if step + 1 < maxTokens {
                 try checkCancellation()
                 let nextEmbed = textDecoder.embedTokens(
                     nextTokenArr.expandedDimensions(axis: 0).expandedDimensions(axis: 0)
                 )
-                let (hiddenN1, newCacheN1) = textDecoder(inputsEmbeds: nextEmbed, cache: cache)
-                let lastHiddenN1 = hiddenN1[0..., (-1)..., .ellipsis]
-                let logitsN1 = textDecoder.embedTokens.asLinear(lastHiddenN1)
+                let hiddenN1 = textDecoder.callWithKVCache(inputsEmbeds: nextEmbed, cache: cache)
+                let logitsN1 = textDecoder.embedTokens.asLinear(hiddenN1[0..., (-1)..., .ellipsis])
                 let argN1 = argMax(logitsN1, axis: -1).squeezed().asType(.int32)
-                // Kick GPU on N+1 (chains after the asyncEval that is
-                // still computing N).
-                asyncEval(argN1, newCacheN1)
+                enqueueEval(argN1)
                 nextTokenArrN1 = argN1
-                cacheN1 = newCacheN1
             }
 
-            // Now sync N. By the time we reach `.item()` the GPU has
-            // very likely finished N already, and the cost of this call
-            // shrinks to a host-side memcpy of one int32 — which itself
-            // overlaps with the in-flight N+1 forward pass.
             let nextToken = nextTokenArr.item(Int32.self)
-            // Match the legacy loop semantics exactly: append the token
-            // first, *then* break on EOS. The legacy loop emitted EOS
-            // into `generatedTokens` whenever EOS was the most recent
-            // pick, so greedy stays bit-identical.
             generatedTokens.append(nextToken)
             if nextToken == eosToken { break }
 
-            guard let advancedCache = cacheN1, let advancedToken = nextTokenArrN1 else {
-                // Final iteration without speculative work — nothing to
-                // advance to; the loop will exit naturally next.
-                break
-            }
-            cache = advancedCache
+            guard let advancedToken = nextTokenArrN1 else { break }
             nextTokenArr = advancedToken
         }
         return generatedTokens
@@ -977,7 +989,8 @@ public class Qwen3ASRModel {
     static func buildPromptTokenIds(
         language: String?,
         context: String?,
-        tokenizer: Qwen3Tokenizer?
+        tokenizer: Qwen3Tokenizer?,
+        prefixTokens: [Int32] = []
     ) -> (prefix: [Int32], suffix: [Int32]) {
         let T = Qwen3ASRTokens.self
 
@@ -1001,6 +1014,9 @@ public class Qwen3ASRModel {
             suffix.append(contentsOf: langTokens.map { Int32($0) })
         }
         suffix.append(Int32(T.asrTextTokenId))
+        if !prefixTokens.isEmpty {
+            suffix.append(contentsOf: prefixTokens)
+        }
 
         return (prefix, suffix)
     }
@@ -1013,21 +1029,14 @@ public class Qwen3ASRModel {
         audioStartIndex: Int,
         textDecoder: QuantizedTextModel
     ) -> MLXArray {
-        var inputIds = prefixTokenIds
-        for _ in 0..<audioTokenCount {
-            inputIds.append(Int32(Qwen3ASRTokens.audioTokenId))
-        }
-        inputIds.append(contentsOf: suffixTokenIds)
-
-        let inputIdsTensor = MLXArray(inputIds).expandedDimensions(axis: 0)
-        var inputEmbeds = textDecoder.embedTokens(inputIdsTensor)
-
-        let audioEmbedsTyped = audioEmbeds.asType(inputEmbeds.dtype)
-        let audioEndIndex = audioStartIndex + audioTokenCount
-        let beforeAudio = inputEmbeds[0..., 0..<audioStartIndex, 0...]
-        let afterAudio = inputEmbeds[0..., audioEndIndex..., 0...]
-        inputEmbeds = concatenated([beforeAudio, audioEmbedsTyped, afterAudio], axis: 1)
-        return inputEmbeds
+        _ = audioTokenCount
+        _ = audioStartIndex
+        let prefixEmbeds = textDecoder.embedTokens(MLXArray(prefixTokenIds).expandedDimensions(axis: 0))
+        let suffixEmbeds = textDecoder.embedTokens(MLXArray(suffixTokenIds).expandedDimensions(axis: 0))
+        let audioEmbedsTyped = audioEmbeds.dtype == prefixEmbeds.dtype
+            ? audioEmbeds
+            : audioEmbeds.asType(prefixEmbeds.dtype)
+        return concatenated([prefixEmbeds, audioEmbedsTyped, suffixEmbeds], axis: 1)
     }
 
     static func decodeTokenBatch(

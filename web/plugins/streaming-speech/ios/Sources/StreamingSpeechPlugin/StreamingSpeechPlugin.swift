@@ -22,10 +22,23 @@ final class SpeechCoordinator {
         case failure(String)
         case ignore
     }
-    typealias DecodeFn = ([Float], @escaping () -> Bool) -> String?
+    typealias DecodeResult = (text: String, tokens: [Int32])
+    typealias DecodeFn = ([Float], [Int32], @escaping () -> Bool) -> DecodeResult?
+    typealias RollbackPrefixFn = ([Int32], Int) -> [Int32]
+    struct Decoder {
+        let decode: DecodeFn
+        let rollbackPrefix: RollbackPrefixFn
+        init(
+            decode: @escaping DecodeFn,
+            rollbackPrefix: @escaping RollbackPrefixFn = SpeechWindow.defaultRollbackPrefix
+        ) {
+            self.decode = decode
+            self.rollbackPrefix = rollbackPrefix
+        }
+    }
 
     private let lock = NSCondition()
-    let worker = DispatchQueue(label: "com.imcodes.streaming-speech", qos: .userInitiated)
+    let worker = DispatchQueue(label: "com.imcodes.streaming-speech", qos: .userInteractive)
     private let emitQueue: DispatchQueue
     private let onEvent: (Event) -> Void
 
@@ -39,7 +52,7 @@ final class SpeechCoordinator {
     private var isAppBackgrounded = false
     private var inbox = SpeechInbox()
     private var window = SpeechWindow()
-    private var activeDecode: DecodeFn?
+    private var activeDecoder: Decoder?
     private var decoderOwner: UInt64 = 0
     private var startPendingOwner: UInt64 = 0
     private var startReadyCallback: (() -> Void)?
@@ -114,7 +127,7 @@ final class SpeechCoordinator {
     }
 
     func beginStart(
-        makeDecode: @escaping () -> DecodeFn?,
+        makeDecode: @escaping () -> Decoder?,
         onStartReady: @escaping () -> Void,
         onSetupFailureTeardown: @escaping () -> Void
     ) -> UInt64 {
@@ -145,10 +158,10 @@ final class SpeechCoordinator {
             let aborted = self.abortedOwner == owner || self.eventOwner != owner
             self.lock.unlock()
             guard !aborted else { return }
-            guard let decode = makeDecode() else {
+            guard let decoder = makeDecode() else {
                 self.lock.lock()
                 if self.decoderOwner == owner || self.decoderOwner == 0 {
-                    self.activeDecode = nil
+                    self.activeDecoder = nil
                     self.decoderOwner = 0
                 }
                 let shouldReport = self.eventOwner == owner && self.reportedErrorOwner != owner
@@ -168,7 +181,7 @@ final class SpeechCoordinator {
             let stillActive = self.eventOwner == owner
             self.lock.unlock()
             guard stillActive else { return }
-            self.activeDecode = decode
+            self.activeDecoder = decoder
             self.decoderOwner = owner
             self.window = SpeechWindow()
         }
@@ -396,7 +409,7 @@ final class SpeechCoordinator {
                     if !alreadyReportedError { errorToEmit = captureFailure }
                 }
             } else if self.isEventOwner(owner) {
-                if self.decoderOwner == owner, let decode = self.activeDecode, self.canRunMetal(owner) {
+                if self.decoderOwner == owner, let decoder = self.activeDecoder, self.canRunMetal(owner) {
                     do {
                         if let tail = tail {
                             try self.window.append(
@@ -405,14 +418,18 @@ final class SpeechCoordinator {
                                 trailingSilence: tail.trailingSilence,
                                 final: true,
                                 shouldContinue: { [weak self] in self?.canRunMetal(owner) ?? false },
-                                decode: { [weak self] samples in
-                                    decode(samples) { self?.canRunMetal(owner) ?? false }
+                                rollbackPrefix: decoder.rollbackPrefix,
+                                decode: { [weak self] samples, prefixTokens in
+                                    decoder.decode(samples, prefixTokens) { self?.canRunMetal(owner) ?? false }
                                 }
                             ) { _ in }
                         }
                         guard self.canRunMetal(owner) else { throw SpeechWindow.Failure.cancelled }
-                        let text = try self.window.finish(shouldContinue: { [weak self] in self?.canRunMetal(owner) ?? false }) { samples in
-                            decode(samples) { [weak self] in self?.canRunMetal(owner) ?? false }
+                        let text = try self.window.finish(
+                            shouldContinue: { [weak self] in self?.canRunMetal(owner) ?? false },
+                            rollbackPrefix: decoder.rollbackPrefix
+                        ) { samples, prefixTokens in
+                            decoder.decode(samples, prefixTokens) { [weak self] in self?.canRunMetal(owner) ?? false }
                         }
                         finalToEmit = text
                     } catch SpeechWindow.Failure.cancelled {
@@ -434,14 +451,14 @@ final class SpeechCoordinator {
                     let msg = "Offline speech interrupted before final flush"
                     outcomeError = msg
                     errorToEmit = msg
-                } else if self.decoderOwner == owner, self.activeDecode != nil {
+                } else if self.decoderOwner == owner, self.activeDecoder != nil {
                     finalToEmit = self.window.text
                 }
             }
 
             if self.decoderOwner == owner || self.decoderOwner == 0 {
                 self.window = SpeechWindow()
-                self.activeDecode = nil
+                self.activeDecoder = nil
                 self.decoderOwner = 0
             }
 
@@ -470,7 +487,7 @@ final class SpeechCoordinator {
                 lock.unlock(); return
             }
             lock.unlock()
-            guard decoderOwner == owner, let decode = activeDecode else {
+            guard decoderOwner == owner, let decoder = activeDecoder else {
                 lock.lock()
                 if eventOwner == owner && isAppBackgrounded && (!batch.samples.isEmpty && (batch.speech || !window.samples.isEmpty)) {
                     drainInterruptedOwner = owner
@@ -486,8 +503,9 @@ final class SpeechCoordinator {
                     trailingSilence: batch.trailingSilence,
                     shouldEmitNonFinal: { [weak self] in self?.isCurrent(owner) ?? false },
                     shouldContinue: { [weak self] in self?.canRunMetal(owner) ?? false },
-                    decode: { [weak self] samples in
-                        decode(samples) { self?.canRunMetal(owner) ?? false }
+                    rollbackPrefix: decoder.rollbackPrefix,
+                    decode: { [weak self] samples, prefixTokens in
+                        decoder.decode(samples, prefixTokens) { self?.canRunMetal(owner) ?? false }
                     }
                 ) { [weak self] text in
                     guard let self = self else { return }
@@ -564,9 +582,15 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         NotificationCenter.default.addObserver(self, selector: #selector(didBecomeActive(_:)), name: UIApplication.didBecomeActiveNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(interrupted(_:)), name: AVAudioSession.interruptionNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(engineConfigurationChanged(_:)), name: .AVAudioEngineConfigurationChange, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(didReceiveMemoryWarning(_:)), name: UIApplication.didReceiveMemoryWarningNotification, object: nil)
         coordinator.worker.async { [weak self] in
             guard let self = self else { return }
             _ = self.ensureRecognizer()
+        }
+    }
+    @objc private func didReceiveMemoryWarning(_ notification: Notification) {
+        coordinator.worker.async {
+            Qwen3ASRModel.clearMetalCache()
         }
     }
     deinit {
@@ -638,9 +662,14 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                     guard let self = self,
                           let recognizer = self.ensureRecognizer(),
                           let decoder = SpeechDecoder(recognizer: recognizer) else { return nil }
-                    return { samples, shouldContinue in
-                        decoder.decode(samples: samples, shouldContinue: shouldContinue)
-                    }
+                    return SpeechCoordinator.Decoder(
+                        decode: { samples, prefixTokens, shouldContinue in
+                            decoder.decode(samples: samples, prefixTokens: prefixTokens, shouldContinue: shouldContinue)
+                        },
+                        rollbackPrefix: { tokens, rollbackCount in
+                            decoder.rollbackPrefix(tokens, rollbackCount: rollbackCount)
+                        }
+                    )
                 },
                 onStartReady: { [weak self, weak expectedCall] in
                     guard let self = self, let expectedCall = expectedCall,
@@ -782,6 +811,9 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                 }
             }
         )
+        coordinator.worker.async {
+            Qwen3ASRModel.clearMetalCache()
+        }
     }
 }
 
@@ -812,35 +844,54 @@ final class SpeechRecognizer {
 final class SpeechDecoder {
     let recognizer: SpeechRecognizer
     init?(recognizer: SpeechRecognizer) { self.recognizer = recognizer }
-    func decode(samples: [Float], shouldContinue: () -> Bool = { true }) -> String? {
-        if samples.isEmpty { return "" }
+    func decode(
+        samples: [Float],
+        prefixTokens: [Int32] = [],
+        shouldContinue: () -> Bool = { true }
+    ) -> (text: String, tokens: [Int32])? {
+        if samples.isEmpty { return ("", prefixTokens) }
         guard shouldContinue() else { return nil }
-        let options = Qwen3DecodingOptions(maxTokens: 128, language: nil, context: recognizer.hotwords)
+        let options = Qwen3DecodingOptions(maxTokens: 192, language: nil, context: recognizer.hotwords)
         do {
-            let text = try recognizer.model.transcribeWithCancellation(audio: samples, sampleRate: 16000, options: options) {
+            let result = try recognizer.model.transcribeSegmentWithCancellation(
+                audio: samples,
+                sampleRate: 16000,
+                options: options,
+                prefixTokens: prefixTokens
+            ) {
                 if !shouldContinue() { throw CancellationError() }
             }
-            return text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return (result.text.trimmingCharacters(in: .whitespacesAndNewlines), result.tokens)
         } catch is CancellationError {
             return nil
         } catch {
             return nil
         }
     }
+
+    func rollbackPrefix(_ tokens: [Int32], rollbackCount: Int = SpeechWindow.unfixedTokenNum) -> [Int32] {
+        recognizer.model.safePrefixTokensForRollback(tokens, rollbackCount: rollbackCount)
+    }
 }
 
-// MARK: - Bounded offline segmentation
-// This is local acoustic/text overlap reconciliation, NOT model-prefix/KV-cache
-// continuation. sherpa's offline Qwen API does not accept an assistant prefix or
-// previous-sentence context. Only the transcript grows with recording duration;
-// PCM, overlap anchors and each decode input stay bounded.
+// MARK: - Token Prefix Rollback streaming segmentation
+// Uses Qwen3-ASR native token-level prefix continuation (unfixedChunkNum = 2,
+// unfixedTokenNum = 5) inside an active segment, strict committed-vs-active
+// isolation across VAD pauses, and disjoint lowest-RMS micro-frame cuts when
+// continuous unpaused speech exceeds `segmentCapacity`. No string-overlap seam
+// matching or character-rollback heuristics are used.
 struct SpeechWindow {
+    typealias DecodeResult = (text: String, tokens: [Int32])
+    typealias DecodeFn = ([Float], [Int32]) -> DecodeResult?
+    typealias RollbackFn = ([Int32], Int) -> [Int32]
+
     static let sampleRate = 16000
     static let stride = sampleRate * 3 / 2 // 1.5s of NEW audio per partial decode
-    static let capacity = 4 * stride // 6.0s bounded Metal GPU window (measured RTF=0.187, stepMax=369ms, CER=0.030)
-    static let overlap = stride
+    static let segmentCapacity = sampleRate * 27 / 2 // 13.5s bounded active segment capacity (216,000 samples, below 15s threshold)
+    static let splitSearchWindow = sampleRate * 5 / 2 // Search trailing 2.5s band for a sustained quiet interval boundary
     static let finalSilencePadding = sampleRate * 2 / 10 // 200ms (3200 zero samples) flushed once at final boundary
-    static let rollbackCharacters = 5
+    static let unfixedChunkNum = 2
+    static let unfixedTokenNum = 5
     static let punctuationPause = sampleRate * 4 / 10
     static let vadPause = sampleRate * 7 / 10
     enum Failure: Error { case decode, cancelled }
@@ -848,241 +899,211 @@ struct SpeechWindow {
     private(set) var samples: [Float] = []
     private(set) var committed = ""
     private(set) var partial = ""
-    private var anchor = ""
-    private var rolling = false
-    // Frozen at each acoustic roll, never fed back from intermediate snapshots.
-    private var seamTail = ""
-    private var overlapText: String?
-    private var overlapHint: String?
-    private var lastGrowth: String?
-    private var hypothesis: String?
-    private var previousHypothesis: String?
+    private var activeTokens: [Int32] = []
+    private var chunkCount = 0
+    private var lastDecodedSampleCount = 0
     private(set) var newSamples = 0
     private var silentSamples = 0
     private var lastEmitted = ""
-    var text: String { rolling ? committed + partial : Self.join(committed, partial) }
+    var text: String { Self.join(committed, partial) }
 
-    mutating func append(_ input: [Float], speech: Bool, trailingSilence: Int = 0, final: Bool = false,
-                         shouldEmitNonFinal: () -> Bool = { true },
-                         shouldContinue: () -> Bool = { true },
-                         decode: ([Float]) -> String?, emit: (String) -> Void) throws {
+    static func defaultRollbackPrefix(_ tokens: [Int32], rollbackCount: Int = SpeechWindow.unfixedTokenNum) -> [Int32] {
+        let trim = max(0, rollbackCount)
+        guard tokens.count > trim else { return [] }
+        return Array(tokens.dropLast(trim))
+    }
+
+    static func lowestEnergySplitIndex(
+        in samples: [Float],
+        searchBack: Int = SpeechWindow.splitSearchWindow,
+        frameSize: Int = 1920,
+        hop: Int = 160
+    ) -> Int {
+        guard samples.count > frameSize, searchBack > frameSize else { return samples.count }
+        let searchStart = max(samples.count / 2, samples.count - searchBack)
+        let limit = samples.count - frameSize
+        guard searchStart <= limit else { return samples.count }
+        // Prefix sum of squared amplitudes over [searchStart..<samples.count] for O(searchBack) scoring.
+        let span = samples.count - searchStart
+        var prefixSq = [Double](repeating: 0, count: span + 1)
+        for idx in 0..<span {
+            let v = Double(samples[searchStart + idx])
+            prefixSq[idx + 1] = prefixSq[idx] + v * v
+        }
+        var bestStart = limit
+        var minEnergy = Double.infinity
+        var maxEnergy: Double = 0
+        var pos = searchStart
+        while pos <= limit {
+            let rel = pos - searchStart
+            let energy = prefixSq[rel + frameSize] - prefixSq[rel]
+            if energy < minEnergy {
+                minEnergy = energy
+                bestStart = pos
+            }
+            if energy > maxEnergy {
+                maxEnergy = energy
+            }
+            pos += hop
+        }
+        // Constant-amplitude synthetic signals split cleanly at segmentCapacity without an arbitrary offset.
+        if (maxEnergy - minEnergy) / Double(frameSize) <= 1e-9 {
+            return samples.count
+        }
+        return bestStart + frameSize / 2
+    }
+
+    private mutating func advanceSilence(sliceCount: Int, speech: Bool, trailingSilence: Int, tailRemaining: Int) {
+        guard speech else {
+            silentSamples += sliceCount
+            return
+        }
+        let silentEnd = max(0, trailingSilence - tailRemaining)
+        // If voiced speech preceded silentEnd inside this slice, reset prior clock; otherwise the whole slice
+        // belongs to trailing silence and extends only the post-cut carried silence of the active segment.
+        silentSamples = silentEnd < sliceCount ? silentEnd : silentSamples + sliceCount
+    }
+
+    mutating func append(
+        _ input: [Float],
+        speech: Bool,
+        trailingSilence: Int = 0,
+        final: Bool = false,
+        shouldEmitNonFinal: () -> Bool = { true },
+        shouldContinue: () -> Bool = { true },
+        rollbackPrefix: RollbackFn = SpeechWindow.defaultRollbackPrefix,
+        decode: DecodeFn,
+        emit: (String) -> Void
+    ) throws {
         guard !input.isEmpty, !samples.isEmpty || speech else { return }
-        // Chunk oversized batches (both live and final stop drain) at the bounded
-        // window capacity (6.0s = 96,000 samples) so neither continuous speech nor a
-        // 32s inbox backlog ever exceeds the per-decode window capacity.
         var remaining = input[...]
-        while samples.count + remaining.count > Self.capacity {
+        while samples.count + remaining.count > Self.segmentCapacity {
             guard shouldContinue() else { throw Failure.cancelled }
-            let takeCount = max(1, Self.capacity - samples.count)
+            let takeCount = max(0, Self.segmentCapacity - samples.count)
             let chunk = remaining.prefix(takeCount)
             remaining = remaining.dropFirst(takeCount)
             samples.append(contentsOf: chunk)
             newSamples += chunk.count
-            silentSamples = speech ? (remaining.isEmpty ? trailingSilence : 0) : silentSamples + chunk.count
-            try evaluate(decode, shouldContinue: shouldContinue)
+            advanceSilence(sliceCount: chunk.count, speech: speech, trailingSilence: trailingSilence, tailRemaining: remaining.count)
             let pause = Self.endsSentence(partial) ? Self.punctuationPause : Self.vadPause
-            if silentSamples >= pause { commitSentence() }
-            else { rollWindow() }
+            if silentSamples >= pause {
+                try evaluate(samples, allowPrefix: true, rollbackPrefix: rollbackPrefix, shouldContinue: shouldContinue, decode: decode)
+                commitSegment()
+            } else {
+                try splitAtLowestEnergy(rollbackPrefix: rollbackPrefix, shouldContinue: shouldContinue, decode: decode)
+            }
             if !final && shouldEmitNonFinal() && text != lastEmitted { lastEmitted = text; emit(text) }
         }
         guard !remaining.isEmpty else { return }
         guard shouldContinue() else { throw Failure.cancelled }
         samples.append(contentsOf: remaining)
         newSamples += remaining.count
-        silentSamples = speech ? trailingSilence : silentSamples + remaining.count
+        advanceSilence(sliceCount: remaining.count, speech: speech, trailingSilence: trailingSilence, tailRemaining: 0)
         if final || !shouldEmitNonFinal() {
-            // Stop flushes the final bounded window once in finish() with 200ms silence padding;
+            // Stop flushes the final bounded segment once in finish() with 200ms silence padding;
             // skip redundant non-final decodes once stop has already been requested.
             return
         }
         let pause = Self.endsSentence(partial) ? Self.punctuationPause : Self.vadPause
         let endpoint = silentSamples >= pause
-        if endpoint || newSamples >= Self.stride || samples.count >= Self.capacity {
-            try evaluate(decode, shouldContinue: shouldContinue)
-            if endpoint { commitSentence() }
-            else if samples.count >= Self.capacity { rollWindow() }
+        if endpoint {
+            try evaluate(samples, allowPrefix: true, rollbackPrefix: rollbackPrefix, shouldContinue: shouldContinue, decode: decode)
+            commitSegment()
+            if text != lastEmitted { lastEmitted = text; emit(text) }
+        } else if samples.count >= Self.segmentCapacity {
+            try splitAtLowestEnergy(rollbackPrefix: rollbackPrefix, shouldContinue: shouldContinue, decode: decode)
+            if text != lastEmitted { lastEmitted = text; emit(text) }
+        } else if newSamples >= Self.stride {
+            try evaluate(samples, allowPrefix: true, rollbackPrefix: rollbackPrefix, shouldContinue: shouldContinue, decode: decode)
             if text != lastEmitted { lastEmitted = text; emit(text) }
         }
     }
 
-    mutating func finish(shouldContinue: () -> Bool = { true }, decode: ([Float]) -> String?) throws -> String {
-        // Accepted PCM drains on the serial worker before this call. A sub-stride
-        // tail must be decoded with a single 200ms (3200-sample) trailing silence
-        // flush; overlap-only audio must NOT be decoded twice.
+    mutating func finish(
+        shouldContinue: () -> Bool = { true },
+        rollbackPrefix: RollbackFn = SpeechWindow.defaultRollbackPrefix,
+        decode: DecodeFn
+    ) throws -> String {
         if newSamples > 0 {
             let padded = samples + Array(repeating: Float(0), count: Self.finalSilencePadding)
-            try evaluate({ _ in decode(padded) }, shouldContinue: shouldContinue)
+            try evaluate(
+                padded,
+                allowPrefix: true,
+                rollbackPrefix: rollbackPrefix,
+                shouldContinue: shouldContinue,
+                decode: decode,
+                decodedSampleCount: samples.count
+            )
         }
-        commitSentence()
+        commitSegment()
         return text
     }
 
-    private mutating func evaluate(_ decode: ([Float]) -> String?, shouldContinue: () -> Bool = { true }) throws {
+    private mutating func splitAtLowestEnergy(
+        rollbackPrefix: RollbackFn,
+        shouldContinue: () -> Bool,
+        decode: DecodeFn
+    ) throws {
+        let cutIndex = Self.lowestEnergySplitIndex(in: samples)
+        let segmentAudio = Array(samples[..<cutIndex])
+        let carriedAudio = Array(samples[cutIndex...])
+        let preCommitSilent = silentSamples
+        if !segmentAudio.isEmpty && (newSamples > 0 || cutIndex != lastDecodedSampleCount) {
+            let allowPrefix = cutIndex >= lastDecodedSampleCount
+            try evaluate(
+                segmentAudio,
+                allowPrefix: allowPrefix,
+                rollbackPrefix: rollbackPrefix,
+                shouldContinue: shouldContinue,
+                decode: decode,
+                decodedSampleCount: segmentAudio.count
+            )
+        }
+        commitSegment()
+        samples = carriedAudio
+        newSamples = carriedAudio.count
+        silentSamples = carriedAudio.isEmpty ? 0 : min(preCommitSilent, carriedAudio.count)
+    }
+
+    private mutating func evaluate(
+        _ audio: [Float],
+        allowPrefix: Bool,
+        rollbackPrefix: RollbackFn,
+        shouldContinue: () -> Bool = { true },
+        decode: DecodeFn,
+        decodedSampleCount: Int? = nil
+    ) throws {
         guard shouldContinue() else { throw Failure.cancelled }
-        guard let decoded = decode(samples) else {
+        let prefixTokens: [Int32]
+        if allowPrefix && chunkCount >= Self.unfixedChunkNum {
+            prefixTokens = rollbackPrefix(activeTokens, Self.unfixedTokenNum)
+        } else {
+            prefixTokens = []
+        }
+        guard let result = decode(audio, prefixTokens) else {
             throw shouldContinue() ? Failure.decode : Failure.cancelled
         }
-        let next = decoded.trimmingCharacters(in: .whitespacesAndNewlines)
-        previousHypothesis = hypothesis
-        hypothesis = next
-        var matched = 0
-        if !rolling {
-            partial = next
-        } else {
-            // Empty anchor is NOT a new segment: retired PCM may still own the
-            // entire <=5 Character tail. Reconcile against the frozen roll seam,
-            // not the last partial (which also contains this window's new words).
-            let rawSize: Int?
-            if let overlapText = overlapText, !overlapText.isEmpty, next.hasPrefix(overlapText) {
-                rawSize = overlapText.count
-            } else if let hint = overlapHint, !hint.isEmpty, next.hasPrefix(hint) {
-                rawSize = hint.count
-            } else {
-                let exact = Self.overlapCount(anchor + seamTail, next)
-                rawSize = exact > 0 ? exact : nil
-            }
-            if let size = rawSize {
-                matched = size
-                if size > seamTail.count {
-                    // The shared acoustic text extends into the committed prefix.
-                    partial = String(next.dropFirst(size - seamTail.count))
-                } else {
-                    partial = String(seamTail.dropLast(size)) + next
-                }
-            } else if let aligned = Self.normalizedOverlap(anchor: anchor, seamTail: seamTail, next: next) {
-                matched = aligned.matchedRawInNext
-                partial = aligned.reconciledPartial
-            } else {
-                // Uncertain model revisions: preserve the frozen unfixed tail.
-                // This can repeat a seam, but cannot recursively re-append new
-                // words already included by an earlier decode of this window.
-                partial = Self.join(seamTail, next)
-            }
-        }
-        // Remember only the most recent nonempty single-stride local growth, not a history.
-        // A word may span several strides: equal hypotheses do not prove that
-        // the retained audio contains no text. This hint also disambiguates
-        // stable a/a -> a/a/a, where longest textual overlap would eat a word.
-        if newSamples <= Self.stride {
-            if let prior = previousHypothesis {
-                if next != prior {
-                    lastGrowth = nil
-                    if next.hasPrefix(prior) {
-                        let added = String(next.dropFirst(prior.count)).trimmingCharacters(in: .whitespacesAndNewlines)
-                        if !added.isEmpty { lastGrowth = added }
-                    }
-                }
-            } else {
-                let added = String(next.dropFirst(matched)).trimmingCharacters(in: .whitespacesAndNewlines)
-                if !added.isEmpty { lastGrowth = added }
-            }
-        } else {
-            lastGrowth = nil
-        }
+        partial = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        activeTokens = result.tokens
+        chunkCount += 1
+        lastDecodedSampleCount = decodedSampleCount ?? audio.count
         newSamples = 0
     }
 
-    private mutating func rollWindow() {
-        // When successive raw hypotheses extend exactly, their delta describes
-        // the retained final stride. Prefer that acoustic seam over a longest
-        // suffix match: identical repeated words can otherwise over-match.
-        overlapText = nil
-        if let prior = previousHypothesis, let current = hypothesis,
-           current.count > prior.count, current.hasPrefix(prior) {
-            let added = String(current.dropFirst(prior.count)).trimmingCharacters(in: .whitespacesAndNewlines)
-            // Stable/no-progress or whitespace-only hypotheses prove no new
-            // text, NOT zero acoustic overlap. Fall back to a nonempty local
-            // hint/anchor; an empty candidate would match every hypothesis.
-            if !added.isEmpty { overlapText = added }
-        }
-        overlapHint = nil
-        if let growth = lastGrowth, !growth.isEmpty, let current = hypothesis, current.hasSuffix(growth) {
-            overlapHint = growth
-        }
-        hypothesis = nil; previousHypothesis = nil
-        let tail = String(partial.suffix(Self.rollbackCharacters))
-        let stable = String(partial.dropLast(tail.count))
-        committed = rolling ? committed + stable : Self.join(committed, stable)
-        rolling = true
-        anchor = String((anchor + stable).suffix(48))
-        partial = tail
-        seamTail = tail
-        samples = Array(samples.suffix(Self.overlap))
-        // Keep the silence clock: a pause crossing a roll still commits once.
-    }
-
-    private mutating func commitSentence() {
+    private mutating func commitSegment() {
         committed = text
-        partial = ""; anchor = ""; rolling = false; seamTail = ""
-        overlapText = nil; overlapHint = nil; lastGrowth = nil
-        hypothesis = nil; previousHypothesis = nil
+        partial = ""
+        activeTokens.removeAll(keepingCapacity: true)
+        chunkCount = 0
+        lastDecodedSampleCount = 0
         samples.removeAll(keepingCapacity: true)
-        newSamples = 0; silentSamples = 0
+        newSamples = 0
+        silentSamples = 0
     }
 
     private static func endsSentence(_ text: String) -> Bool {
         guard let last = text.last else { return false }
         return "，、；,;.。！？!?".contains(last)
-    }
-
-    private static func isOverlapIgnorable(_ c: Character) -> Bool {
-        c.unicodeScalars.allSatisfy {
-            CharacterSet.punctuationCharacters.contains($0)
-                || CharacterSet.whitespacesAndNewlines.contains($0)
-                || CharacterSet.symbols.contains($0)
-        }
-    }
-
-    private static func normalizedOverlap(anchor: String, seamTail: String, next: String) -> (reconciledPartial: String, matchedRawInNext: Int)? {
-        let lhsChars = Array((anchor + seamTail).suffix(64 + rollbackCharacters))
-        let seamChars = Array(seamTail)
-        let rhsChars = Array(next.prefix(64 + rollbackCharacters))
-        let lhsNorm = lhsChars.filter { !isOverlapIgnorable($0) }.map { $0.lowercased() }
-        let seamNormCount = seamChars.filter { !isOverlapIgnorable($0) }.count
-        var rhsNorm: [String] = []
-        var rhsRawEndForNormLen: [Int] = [0]
-        for (idx, ch) in rhsChars.enumerated() {
-            if !isOverlapIgnorable(ch) {
-                rhsNorm.append(ch.lowercased())
-                rhsRawEndForNormLen.append(idx + 1)
-            }
-        }
-        let maxNorm = min(lhsNorm.count, rhsNorm.count)
-        guard maxNorm >= 2 else { return nil }
-        for len in Swift.stride(from: maxNorm, through: 2, by: -1) {
-            if lhsNorm.suffix(len).elementsEqual(rhsNorm.prefix(len)) {
-                let nextChars = Array(next)
-                let matchedRaw = rhsRawEndForNormLen[len]
-                if len > seamNormCount {
-                    let dropNorm = len - seamNormCount
-                    let dropRaw = rhsRawEndForNormLen[dropNorm]
-                    return (String(nextChars.dropFirst(dropRaw)), matchedRaw)
-                }
-                // Drop trailing `len` non-ignorable chars (and trailing punctuation on them) from seamTail.
-                var remainingNorm = len
-                var keepEnd = seamChars.count
-                while keepEnd > 0 && remainingNorm > 0 {
-                    keepEnd -= 1
-                    if !isOverlapIgnorable(seamChars[keepEnd]) {
-                        remainingNorm -= 1
-                    }
-                }
-                return (String(seamChars.prefix(keepEnd)) + next, matchedRaw)
-            }
-        }
-        return nil
-    }
-
-    private static func overlapCount(_ previous: String, _ next: String) -> Int {
-        // Only across known overlapping PCM, never across a VAD commit. One
-        // Character matters for short CJK; all work uses a bounded seam anchor.
-        let left = Array(previous.suffix(48 + rollbackCharacters)), right = Array(next.prefix(48 + rollbackCharacters))
-        let limit = min(left.count, right.count)
-        guard limit > 0 else { return 0 }
-        for size in Swift.stride(from: limit, through: 1, by: -1) {
-            if left.suffix(size).elementsEqual(right.prefix(size)) { return size }
-        }
-        return 0
     }
 
     private static func join(_ previous: String, _ next: String) -> String {

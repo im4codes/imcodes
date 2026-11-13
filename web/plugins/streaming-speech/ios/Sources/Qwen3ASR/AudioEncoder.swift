@@ -360,7 +360,11 @@ public class Qwen3AudioEncoder: Module {
     /// Input: [batch, mel_bins, time]
     /// Output: [time', output_dim] (no batch dim, matching Python)
     public func callAsFunction(_ melFeatures: MLXArray) -> MLXArray {
-        let timeFrames = melFeatures.dim(2)
+        // Keep activations in the loaded weight precision (typically BF16) so
+        // Float32 mel inputs do not promote all 18 transformer layers to Float32.
+        let targetDtype = conv2d1.weight.dtype
+        let melTyped = melFeatures.dtype == targetDtype ? melFeatures : melFeatures.asType(targetDtype)
+        let timeFrames = melTyped.dim(2)
         let chunkSize = config.nWindow * 2  // 100
 
         // Calculate number of chunks
@@ -385,7 +389,7 @@ public class Qwen3AudioEncoder: Module {
         for i in 0..<numChunks {
             let clen = chunkLengths[i]
             // Extract chunk from first (and only) batch item
-            let feat = melFeatures[0, 0..., pos..<(pos + clen)]  // [mel, clen]
+            let feat = melTyped[0, 0..., pos..<(pos + clen)]  // [mel, clen]
             pos += clen
 
             // Pad if needed
@@ -429,10 +433,11 @@ public class Qwen3AudioEncoder: Module {
         // Add sinusoidal position embeddings - same for each chunk!
         // Cache to avoid recomputing for the same sequence length
         let posEmbed: MLXArray
-        if let cached = cachedPosEmbeddings[timeAfterConv] {
+        if let cached = cachedPosEmbeddings[timeAfterConv], cached.dtype == targetDtype {
             posEmbed = cached
         } else {
             let computed = createSinusoidalPositionEmbeddings(seqLen: timeAfterConv, dModel: config.dModel)
+                .asType(targetDtype)
             cachedPosEmbeddings[timeAfterConv] = computed
             posEmbed = computed
         }
@@ -485,8 +490,11 @@ public class Qwen3AudioEncoder: Module {
             cuSeqlens.append(cumsum)
         }
 
-        // Create block attention mask
-        let attentionMask = createBlockAttentionMask(seqLen: totalTokens, cuSeqlens: cuSeqlens)
+        // Create block attention mask only when multiple inference windows exist;
+        // a single block attends densely so nil skips mask allocation and kernel reads.
+        let attentionMask: MLXArray? = cuChunkLens.count <= 1
+            ? nil
+            : createBlockAttentionMask(seqLen: totalTokens, cuSeqlens: cuSeqlens).asType(hiddenStates.dtype)
 
         // Add batch dimension for transformer: [1, totalTokens, 896]
         hiddenStates = hiddenStates.expandedDimensions(axis: 0)

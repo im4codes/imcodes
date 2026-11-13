@@ -152,10 +152,30 @@ describe('Qwen3-ASR mobile assets', () => {
     expect(ios).toContain('#if targetEnvironment(simulator)');
     expect(ios).toContain('MTLCreateSystemDefaultDevice() != nil');
     expect(ios).toContain('Qwen3ASRModel.loadLocal(from: root)');
-    expect(ios).toContain('Qwen3DecodingOptions(maxTokens: 128');
-    expect(ios).toContain('transcribeWithCancellation(audio: samples, sampleRate: 16000');
+    expect(ios).toContain('Qwen3DecodingOptions(maxTokens: 192');
+    expect(ios).toContain('transcribeSegmentWithCancellation(');
+    expect(ios).toContain('prefixTokens: prefixTokens');
+    expect(ios).toContain('safePrefixTokensForRollback(');
+    expect(ios).toContain('qos: .userInteractive');
+    expect(ios).toContain('didReceiveMemoryWarningNotification');
+    expect(ios).toContain('Qwen3ASRModel.clearMetalCache()');
     expect(ios).toContain('appendingPathComponent("ios-models", isDirectory: true)');
-    expect(ios).toContain('static let capacity = 4 * stride');
+    expect(ios).toContain('static let segmentCapacity = sampleRate * 27 / 2');
+    expect(ios).toContain('static let splitSearchWindow = sampleRate * 5 / 2');
+    expect(ios).toContain('static let unfixedChunkNum = 2');
+    expect(ios).toContain('static let unfixedTokenNum = 5');
+    for (const obsoleteSymbol of [
+      'overlapText',
+      'overlapHint',
+      'lastGrowth',
+      'normalizedOverlap',
+      'overlapCount',
+      'rollbackCharacters',
+      'seamTail',
+      'edgeTrimmedOverlap',
+    ]) {
+      expect(ios).not.toContain(obsoleteSymbol);
+    }
     expect(ios).toContain('static let limit = 16000 * 320 / 10');
     expect(ios).toContain('static let warmupSamples = 320');
     expect(ios).toContain('options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth]');
@@ -185,6 +205,8 @@ describe('Qwen3-ASR mobile assets', () => {
 
     expect(qwenAsr).toContain('modelId: String = "aufklarer/Qwen3-ASR-0.6B-MLX-4bit"');
     expect(qwenAsr).toContain('case .small: return .small');
+    expect(qwenAsr).toContain('prefixTokens: [Int32] = []');
+    expect(qwenAsr).toContain('suffix.append(contentsOf: prefixTokens)');
   });
   it('compiles and executes the production Android plugin through cold/warm/stop/segmentation/overflow/destroy', async () => {
     await setup(); const srcDir = join(root, 'src'), classesDir = join(root, 'classes'); await mkdir(classesDir, { recursive: true });
@@ -399,7 +421,7 @@ it.skipIf(!swiftCompiler)('executes the production Swift recognizer, decoder, an
   await setup();
   const plugin = await readFile(new URL('../../web/plugins/streaming-speech/ios/Sources/StreamingSpeechPlugin/StreamingSpeechPlugin.swift', import.meta.url), 'utf8');
   const coordinatorSlice = plugin.slice(plugin.indexOf('final class SpeechCoordinator {'), plugin.indexOf('/// The same Capacitor'));
-  const recognizerSlice = plugin.slice(plugin.indexOf('final class SpeechRecognizer {'), plugin.indexOf('// MARK: - Bounded offline segmentation'));
+  const recognizerSlice = plugin.slice(plugin.indexOf('final class SpeechRecognizer {'), plugin.indexOf('// MARK: - Token Prefix Rollback'));
   const windowAndInboxSlice = plugin.slice(plugin.indexOf('struct SpeechWindow {'));
   expect(coordinatorSlice).toContain('final class SpeechCoordinator');
   expect(recognizerSlice).toContain('final class SpeechRecognizer');
@@ -426,6 +448,7 @@ struct Qwen3DecodingOptions {
 }
 var loadedRoots: [URL] = []
 var seenOptions: [Qwen3DecodingOptions] = []
+var seenPrefixTokens: [[Int32]] = []
 var cancelAfterCheck = false
 final class Qwen3ASRModel {
     let root: URL
@@ -434,12 +457,23 @@ final class Qwen3ASRModel {
         loadedRoots.append(root)
         return Qwen3ASRModel(root: root)
     }
-    func transcribeWithCancellation(audio: [Float], sampleRate: Int, options: Qwen3DecodingOptions, cancellationCheck: () throws -> Void) throws -> String {
+    func transcribeSegmentWithCancellation(
+        audio: [Float],
+        sampleRate: Int,
+        options: Qwen3DecodingOptions,
+        prefixTokens: [Int32] = [],
+        checkCancellation: () throws -> Void
+    ) throws -> (text: String, tokens: [Int32]) {
         seenOptions.append(options)
+        seenPrefixTokens.append(prefixTokens)
         precondition(sampleRate == 16000)
-        try cancellationCheck()
+        try checkCancellation()
         if cancelAfterCheck { throw CancellationError() }
-        return "  ok:\\(audio.count)  "
+        return ("  ok:\\(audio.count)  ", prefixTokens + [10, 11])
+    }
+    func safePrefixTokensForRollback(_ tokens: [Int32], rollbackCount: Int = 5) -> [Int32] {
+        guard tokens.count > rollbackCount else { return [] }
+        return Array(tokens.dropLast(rollbackCount))
     }
 }
 ${recognizerSlice}
@@ -449,7 +483,7 @@ ${coordinatorSlice}
 let emptyRoot = URL(fileURLWithPath: CommandLine.arguments[1])
 let biasedRoot = URL(fileURLWithPath: CommandLine.arguments[2])
 
-// 1. SpeechRecognizer + SpeechDecoder Metal guard, hotwords bias & cancellation
+// 1. SpeechRecognizer + SpeechDecoder Metal guard, hotwords bias, prefixTokens & cancellation
 stubMetalAvailable = false
 require(SpeechRecognizer(root: emptyRoot) == nil, "expected nil SpeechRecognizer when Metal unavailable")
 stubMetalAvailable = true
@@ -458,8 +492,11 @@ require(rEmpty != nil && rEmpty?.hotwords == nil, "empty hotwords must yield nil
 let rBias = SpeechRecognizer(root: biasedRoot)
 require(rBias?.hotwords == "Qwen3, IMCodes", "hotwords trimming/joining mismatch: \\(String(describing: rBias?.hotwords))")
 let dec = SpeechDecoder(recognizer: rBias!)!
-require(dec.decode(samples: [0.1, 0.2]) == "ok:2", "expected trimmed decoded text")
-require(seenOptions.last?.maxTokens == 128 && seenOptions.last?.context == "Qwen3, IMCodes", "unexpected Qwen3DecodingOptions")
+let decOut = dec.decode(samples: [0.1, 0.2], prefixTokens: [1, 2])
+require(decOut?.text == "ok:2" && decOut?.tokens == [1, 2, 10, 11], "expected trimmed decoded text + prefix continuation")
+require(seenOptions.last?.maxTokens == 192 && seenOptions.last?.context == "Qwen3, IMCodes", "unexpected Qwen3DecodingOptions")
+require(seenPrefixTokens.last == [1, 2], "prefixTokens not forwarded to model")
+require(dec.rollbackPrefix([1, 2, 3, 4, 5, 6], rollbackCount: 5) == [1], "rollbackPrefix mismatch")
 require(dec.decode(samples: [0.1], shouldContinue: { false }) == nil, "expected pre-cancelled decode to return nil")
 cancelAfterCheck = true
 require(dec.decode(samples: [0.1], shouldContinue: { true }) == nil, "expected CancellationError decode to return nil")
@@ -477,7 +514,7 @@ func makeHarness() -> (SpeechCoordinator, DispatchQueue, () -> [SpeechCoordinato
 // 2A. 0.5s (8000 samples) un-decoded speech backgrounded -> error before stopped, NO false final, ACK rejects
 do {
     let (coord, _, events) = makeHarness()
-    let owner = coord.beginStart(makeDecode: { { s, cont in cont() ? "w:\\(s.count)" : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
+    let owner = coord.beginStart(makeDecode: { SpeechCoordinator.Decoder { s, _, cont in cont() ? ("w:\\(s.count)", []) : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
     coord.offerSamples(speech(320), owner: owner, now: 0.01) {}
     coord.offerSamples(speech(8000), owner: owner, now: 0.10) {}
     coord.setBackgrounded(true)
@@ -509,7 +546,7 @@ do {
         if case .partial = e { partialSeen.signal() }
     }
     _ = (coord, events)
-    let owner = coordB.beginStart(makeDecode: { { s, cont in cont() ? "partial_ok:\\(s.count)" : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
+    let owner = coordB.beginStart(makeDecode: { SpeechCoordinator.Decoder { s, _, cont in cont() ? ("partial_ok:\\(s.count)", [1, 2]) : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
     coordB.offerSamples(speech(320), owner: owner, now: 0.01) {}
     coordB.offerSamples(speech(24000), owner: owner, now: 0.20) {}
     require(partialSeen.wait(timeout: .now() + 2) == .success, "B: initial partial never emitted")
@@ -535,10 +572,10 @@ do {
     let decodeEntered = DispatchSemaphore(value: 0)
     let releaseDecode = DispatchSemaphore(value: 0)
     let owner = coord.beginStart(makeDecode: {
-        { _, cont in
+        SpeechCoordinator.Decoder { _, _, cont in
             decodeEntered.signal()
             _ = releaseDecode.wait(timeout: .now() + 2)
-            return cont() ? "never" : nil
+            return cont() ? ("never", []) : nil
         }
     }, onStartReady: {}, onSetupFailureTeardown: {})
     coord.offerSamples(speech(320), owner: owner, now: 0.01) {}
@@ -561,7 +598,7 @@ do {
 // 2D. Clean foreground capture & duplicate stop -> single final, zero errors, stopped once, nil ACK
 do {
     let (coord, _, events) = makeHarness()
-    let owner = coord.beginStart(makeDecode: { { s, cont in cont() ? "fg:\\(s.count)" : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
+    let owner = coord.beginStart(makeDecode: { SpeechCoordinator.Decoder { s, _, cont in cont() ? ("fg:\\(s.count)", []) : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
     coord.offerSamples(speech(320), owner: owner, now: 0.01) {}
     coord.offerSamples(speech(8000), owner: owner, now: 0.15) {}
     let ack1 = DispatchSemaphore(value: 0), ack2 = DispatchSemaphore(value: 0)
@@ -586,10 +623,10 @@ do {
     let decodeEntered = DispatchSemaphore(value: 0)
     let releaseOld = DispatchSemaphore(value: 0)
     let owner1 = coord.beginStart(makeDecode: {
-        { _, cont in
+        SpeechCoordinator.Decoder { _, _, cont in
             decodeEntered.signal()
             _ = releaseOld.wait(timeout: .now() + 2)
-            return cont() ? "old" : nil
+            return cont() ? ("old", []) : nil
         }
     }, onStartReady: {}, onSetupFailureTeardown: {})
     coord.offerSamples(speech(320), owner: owner1, now: 0.01) {}
@@ -598,7 +635,7 @@ do {
     coord.setBackgrounded(true)
     coord.endCapture(stopAudio: {})
     coord.setBackgrounded(false)
-    let owner2 = coord.beginStart(makeDecode: { { s, cont in cont() ? "recovered:\\(s.count)" : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
+    let owner2 = coord.beginStart(makeDecode: { SpeechCoordinator.Decoder { s, _, cont in cont() ? ("recovered:\\(s.count)", []) : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
     releaseOld.signal()
     coord.offerSamples(speech(320), owner: owner2, now: 0.50) {}
     coord.offerSamples(speech(8000), owner: owner2, now: 0.60) {}
@@ -642,7 +679,7 @@ do {
         var evs: [SpeechCoordinator.Event] = []
         let coord = SpeechCoordinator(emitQueue: q) { evs.append($0) }
         q.suspend()
-        let old = coord.beginStart(makeDecode: { { s, cont in cont() ? "old:\\(s.count)" : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
+        let old = coord.beginStart(makeDecode: { SpeechCoordinator.Decoder { s, _, cont in cont() ? ("old:\\(s.count)", []) : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
         coord.offerSamples(speech(320), owner: old, now: 0.01) {}
         coord.offerSamples(speech(8000), owner: old, now: 0.10) {}
         coord.worker.sync {}
@@ -654,7 +691,7 @@ do {
         coord.worker.sync {}
         var freshOwner: UInt64 = 0
         if replaceBeforeDelivery {
-            freshOwner = coord.beginStart(makeDecode: { { s, cont in cont() ? "fresh:\\(s.count)" : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
+            freshOwner = coord.beginStart(makeDecode: { SpeechCoordinator.Decoder { s, _, cont in cont() ? ("fresh:\\(s.count)", []) : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
             coord.offerSamples(speech(320), owner: freshOwner, now: 0.20) {}
             coord.worker.sync {}
         }
@@ -686,7 +723,7 @@ do {
 // 2H. R3-F2b: In-flight conversion barrier vs Stop retains tail once & rejects post-Stop taps
 do {
     let (coord, _, events) = makeHarness()
-    let owner = coord.beginStart(makeDecode: { { s, cont in cont() ? "tail:\\(s.count)" : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
+    let owner = coord.beginStart(makeDecode: { SpeechCoordinator.Decoder { s, _, cont in cont() ? ("tail:\\(s.count)", []) : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
     require(coord.admitAndOffer(owner: owner, now: 0.01, onOverloadTeardown: {}, produce: { .samples(speech(320)) }), "H: warmup admit failed")
 
     let convertEntered = DispatchSemaphore(value: 0)
@@ -740,7 +777,7 @@ do {
 // 2I. R3-F2b: In-flight conversion failure during Stop emits error visibly instead of truncated final
 do {
     let (coord, _, events) = makeHarness()
-    let owner = coord.beginStart(makeDecode: { { s, cont in cont() ? "should_not_emit:\\(s.count)" : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
+    let owner = coord.beginStart(makeDecode: { SpeechCoordinator.Decoder { s, _, cont in cont() ? ("should_not_emit:\\(s.count)", []) : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
     coord.offerSamples(speech(320), owner: owner, now: 0.01) {}
     coord.offerSamples(speech(3200), owner: owner, now: 0.05) {}
 
@@ -776,7 +813,7 @@ do {
 // 2J. R3-F2b: Old owner's delayed in-flight conversion never leaks PCM into replacement owner
 do {
     let (coord, _, events) = makeHarness()
-    let owner1 = coord.beginStart(makeDecode: { { s, cont in cont() ? "out:\\(s.count)" : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
+    let owner1 = coord.beginStart(makeDecode: { SpeechCoordinator.Decoder { s, _, cont in cont() ? ("out:\\(s.count)", []) : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
     coord.offerSamples(speech(320), owner: owner1, now: 0.01) {}
     let convertEntered = DispatchSemaphore(value: 0)
     let releaseConvert = DispatchSemaphore(value: 0)
@@ -790,7 +827,7 @@ do {
         oldDone.signal()
     }
     require(convertEntered.wait(timeout: .now() + 2) == .success, "J: old convert never entered")
-    let owner2 = coord.beginStart(makeDecode: { { s, cont in cont() ? "owner2:\\(s.count)" : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
+    let owner2 = coord.beginStart(makeDecode: { SpeechCoordinator.Decoder { s, _, cont in cont() ? ("owner2:\\(s.count)", []) : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
     releaseConvert.signal()
     require(oldDone.wait(timeout: .now() + 2) == .success, "J: old convert did not exit")
     coord.offerSamples(speech(320), owner: owner2, now: 0.10) {}
@@ -803,6 +840,44 @@ do {
     let finals = evs.filter { if case .final = $0 { return true }; return false }
     require(finals == [.final("owner2:4800")], "J: old owner PCM leaked into owner2: \\(evs)")
     print("OLD_IN_FLIGHT_ISOLATED_FROM_NEW_OWNER:PASS")
+}
+
+// 2K. Coordinator forwards prefixTokens and custom rollbackPrefix across chunks 1..4 & finish
+do {
+    let (coord, _, events) = makeHarness()
+    var seenPrefixes: [[Int32]] = []
+    let owner = coord.beginStart(makeDecode: {
+        SpeechCoordinator.Decoder(
+            decode: { s, prefix, cont in
+                guard cont() else { return nil }
+                seenPrefixes.append(prefix)
+                let stepTokens: [Int32] = Array(100..<(100 + Int32(s.count / 8000)))
+                let tokens = prefix.isEmpty ? stepTokens : prefix + stepTokens.suffix(3)
+                return ("t:\\(tokens.count)", tokens)
+            },
+            rollbackPrefix: { tokens, n in
+                tokens.count > n ? Array(tokens.dropLast(n)) : []
+            }
+        )
+    }, onStartReady: {}, onSetupFailureTeardown: {})
+    coord.offerSamples(speech(320), owner: owner, now: 0.01) {}
+    coord.worker.sync {}
+    for step in 1...4 {
+        coord.offerSamples(speech(24000), owner: owner, now: TimeInterval(step)) {}
+        coord.worker.sync {}
+    }
+    coord.offerSamples(speech(1600), owner: owner, now: 5.0) {}
+    coord.worker.sync {}
+    let ack = DispatchSemaphore(value: 0)
+    var err: String? = "unset"
+    coord.endCapture(stopCompletion: { e in err = e; ack.signal() }, stopAudio: {})
+    require(ack.wait(timeout: .now() + 2) == .success && err == nil, "K: coordinator prefix rollback failed")
+    require(seenPrefixes.count == 5, "K: expected 4 partials + 1 final decode, got \\(seenPrefixes)")
+    require(seenPrefixes[0].isEmpty && seenPrefixes[1].isEmpty, "K: first 2 chunks must not lock prefix: \\(seenPrefixes)")
+    require(!seenPrefixes[2].isEmpty && !seenPrefixes[4].isEmpty, "K: chunks >=3 and finish must receive rolled-back prefix: \\(seenPrefixes)")
+    let evs = events()
+    require(evs.contains(.final("t:\\(seenPrefixes[4].count + 3)")), "K: missing expected final: \\(evs)")
+    print("COORDINATOR_PREFIX_ROLLBACK:PASS")
 }
 `);
   execFileSync(swiftCompiler!, ['-swift-version', '5', file, '-o', executable], { encoding: 'utf8', timeout: 60000 });
@@ -819,12 +894,106 @@ do {
     'IN_FLIGHT_CONVERSION_TAIL_BARRIER',
     'IN_FLIGHT_CONVERSION_FAIL_AT_STOP',
     'OLD_IN_FLIGHT_ISOLATED_FROM_NEW_OWNER',
+    'COORDINATOR_PREFIX_ROLLBACK',
   ]) {
     expect(result).toContain(name + ':PASS');
   }
 }, 95000);
 
-it.skipIf(!swiftCompiler)('executes the actual Swift bounded window through rollback, VAD, long speech and final short tails', async () => {
+it.skipIf(!swiftCompiler)('executes Qwen3Tokenizer U+FFFD rollback boundary guard and buildPromptTokenIds prefix insertion', async () => {
+  await setup();
+  const tokenizerSrc = await readFile(new URL('../../web/plugins/streaming-speech/ios/Sources/AudioCommon/Tokenizer.swift', import.meta.url), 'utf8');
+  const qwenSrc = await readFile(new URL('../../web/plugins/streaming-speech/ios/Sources/Qwen3ASR/Qwen3ASR.swift', import.meta.url), 'utf8');
+  const tokensSlice = qwenSrc.slice(qwenSrc.indexOf('public struct Qwen3ASRTokens'), qwenSrc.indexOf('/// Main Qwen3-ASR model'));
+  const rollbackSlice = qwenSrc.slice(
+    qwenSrc.indexOf('    public static func safePrefixTokensForRollback('),
+    qwenSrc.indexOf('    /// Shared implementation behind')
+  );
+  const promptSlice = qwenSrc.slice(
+    qwenSrc.indexOf('    static func buildPromptTokenIds('),
+    qwenSrc.indexOf('    static func buildInputEmbeds(')
+  );
+  expect(rollbackSlice).toContain('hasSuffix("\\u{FFFD}")');
+  expect(promptSlice).toContain('suffix.append(contentsOf: prefixTokens)');
+
+  const file = join(root, 'TokenizerRollbackTests.swift'), executable = join(root, 'tokenizer-rollback-tests');
+  await writeFile(file, `${tokenizerSrc}
+${tokensSlice}
+struct PrefixRollbackBridge {
+${rollbackSlice}
+${promptSlice}
+}
+func assert(_ cond: @autoclosure () -> Bool, _ msg: String) {
+    if !cond() { FileHandle.standardError.write(Data(("FAIL: " + msg + "\\n").utf8)); exit(1) }
+}
+// Construct BPE idToToken where token 202 + 203 form 3-byte UTF-8 "中" ([0xE4, 0xB8, 0xAD])
+// so dropping trailing 5 tokens lands between 202 (incomplete [0xE4, 0xB8]) and 203 ([0xAD]).
+let testByteToUnicode: [UInt8: Character] = {
+    var m: [UInt8: Character] = [:], n = 0
+    for r: ClosedRange<UInt8> in [UInt8(ascii: "!")...UInt8(ascii: "~"), 0xA1...0xAC, 0xAE...0xFF] {
+        for b in r { m[b] = Character(UnicodeScalar(b)) }
+    }
+    for b: UInt8 in 0...255 where m[b] == nil {
+        m[b] = Character(UnicodeScalar(0x100 + n)!); n += 1
+    }
+    return m
+}()
+func bpeStr(_ bytes: [UInt8]) -> String {
+    String(bytes.compactMap { testByteToUnicode[$0] })
+}
+let idToToken: [Int: String] = [
+    151704: "<asr_text>",
+    151644: "<|im_start|>",
+    151645: "<|im_end|>",
+    151643: "<|endoftext|>",
+    151669: "<|audio_start|>",
+    151670: "<|audio_end|>",
+    198: "\\n",
+    8948: "system",
+    872: "user",
+    77091: "assistant",
+    200: "language",
+    201: bpeStr(Array("我".utf8)),
+    202: bpeStr([0xE4, 0xB8]),
+    203: bpeStr([0xAD]),
+    204: bpeStr(Array("们".utf8)),
+    205: bpeStr(Array("好".utf8)),
+    206: bpeStr(Array("啊".utf8)),
+    207: bpeStr(Array("！".utf8)),
+]
+let tokenizer = Qwen3Tokenizer(idToToken: idToToken)
+assert(tokenizer.decode(tokens: [201, 202]).hasSuffix("\\u{FFFD}"), "expected incomplete UTF-8 fragment to decode with U+FFFD")
+assert(tokenizer.decode(tokens: [201, 202, 203]) == "我中", "expected complete BPE pair to decode cleanly")
+
+// Sequence: ["我", part1("中"), part2("中"), "们", "好", "啊", "！", EOS]
+// Dropping EOS then rollbackCount=5 leaves [201, 202] -> ends in U+FFFD -> must snap back to [201].
+let rolled = PrefixRollbackBridge.safePrefixTokensForRollback([201, 202, 203, 204, 205, 206, 207, Int32(Qwen3ASRTokens.eosTokenId)], rollbackCount: 5, tokenizer: tokenizer)
+assert(rolled == [201], "U+FFFD boundary guard failed, got \\(rolled)")
+print("UTF8_ROLLBACK_GUARD:PASS")
+
+// Preserve <asr_text> header while only counting tokens after it against rollbackCount
+let withHeader: [Int32] = [200, Int32(Qwen3ASRTokens.asrTextTokenId), 201, 202, 203, 204, 205, 206, 207]
+let rolledHeader = PrefixRollbackBridge.safePrefixTokensForRollback(withHeader, rollbackCount: 5, tokenizer: tokenizer)
+assert(rolledHeader == [200, Int32(Qwen3ASRTokens.asrTextTokenId), 201], "header rollback failed, got \\(rolledHeader)")
+assert(PrefixRollbackBridge.safePrefixTokensForRollback([201, 202, 203], rollbackCount: 5, tokenizer: tokenizer).isEmpty, "short sequence must return []")
+print("HEADER_AND_SHORT_GUARD:PASS")
+
+// buildPromptTokenIds inserts prefixTokens strictly after T.asrTextTokenId
+let (_, suffixEmpty) = PrefixRollbackBridge.buildPromptTokenIds(language: nil, context: nil, tokenizer: tokenizer)
+assert(suffixEmpty.last == Int32(Qwen3ASRTokens.asrTextTokenId), "empty prefixTokens must end with asrTextTokenId")
+let (_, suffixWithPrefix) = PrefixRollbackBridge.buildPromptTokenIds(language: nil, context: nil, tokenizer: tokenizer, prefixTokens: [201, 202, 203])
+let asrIdx = suffixWithPrefix.firstIndex(of: Int32(Qwen3ASRTokens.asrTextTokenId))!
+assert(Array(suffixWithPrefix[(asrIdx + 1)...]) == [201, 202, 203], "prefixTokens missing after asrTextTokenId: \\(suffixWithPrefix)")
+print("PROMPT_PREFIX_INSERTION:PASS")
+`);
+  execFileSync(swiftCompiler!, ['-swift-version', '5', file, '-o', executable], { encoding: 'utf8', timeout: 60000 });
+  const result = execFileSync(executable, [], { encoding: 'utf8', timeout: 20000 });
+  for (const name of ['UTF8_ROLLBACK_GUARD', 'HEADER_AND_SHORT_GUARD', 'PROMPT_PREFIX_INSERTION']) {
+    expect(result).toContain(name + ':PASS');
+  }
+}, 95000);
+
+it.skipIf(!swiftCompiler)('executes the actual Swift bounded window through token prefix rollback, repeated phrases, VAD, disjoint low-RMS cut and final tails', async () => {
   await setup();
   const source = await readFile(new URL('../../web/plugins/streaming-speech/ios/Sources/StreamingSpeechPlugin/StreamingSpeechPlugin.swift', import.meta.url), 'utf8');
   const state = source.slice(source.indexOf('struct SpeechWindow {'));
@@ -833,7 +1002,7 @@ it.skipIf(!swiftCompiler)('executes the actual Swift bounded window through roll
   await writeFile(file, 'import Foundation\n' + state + '\n' + swiftWindowCases);
   execFileSync(swiftCompiler!, ['-swift-version', '5', file, '-o', executable], { encoding: 'utf8', timeout: 60000 });
   const result = execFileSync(executable, [], { encoding: 'utf8', timeout: 30000 });
-  for (const name of ['TAIL', 'ROLLBACK', 'VAD', 'PUNCTUATION', 'REPEATED_SENTENCE', 'LONG_CONTINUOUS', 'VARIABLE_TAP', 'BACKLOG_CHUNKING', 'FAILURE', 'UNICODE', 'EMPTY', 'IN_FLIGHT_STOP', 'LONG_TRANSCRIPT', 'SHORT_CJK', 'SHORT_ASCII', 'REPEATED_OVERLAP', 'STABLE_HYPOTHESIS', 'NO_PROGRESS_THEN_GROWTH', 'ZERO_LAG', 'WARMUP', 'AUDIO_LEVEL_THROTTLE', 'OVERLOAD', 'TAIL_BATCH', 'NORMALIZED_OVERLAP', 'MID_DECODE_CANCEL']) {
+  for (const name of ['TAIL', 'PREFIX_ROLLBACK_CADENCE', 'REPEATED_PHRASE_PUNCTUATION', 'VAD', 'PUNCTUATION', 'REPEATED_SENTENCE', 'LONG_CONTINUOUS', 'LONG_TRANSCRIPT', 'VARIABLE_TAP', 'BACKLOG_CHUNKING', 'DISJOINT_LOW_RMS_PARTITION', 'FAILURE', 'UNICODE', 'EMPTY', 'IN_FLIGHT_STOP', 'ZERO_LAG', 'WARMUP', 'AUDIO_LEVEL_THROTTLE', 'OVERLOAD', 'TAIL_BATCH', 'MID_DECODE_CANCEL']) {
     expect(result).toContain(name + ':PASS');
   }
 }, 95000);
@@ -923,111 +1092,118 @@ const swiftWindowCases = `
 func check(_ condition: @autoclosure () throws -> Bool, _ message: String) {
     if !(try! condition()) { fatalError(message) }
 }
-func pcm(_ count: Int) -> [Float] { Array(repeating: 0.1, count: count) }
-// Exercise the actual production window on the same serial worker/barrier
-// ordering as the plugin, with a deliberately blocked recognizer peer.
+func pcm(_ count: Int, amp: Float = 0.1) -> [Float] { Array(repeating: amp, count: count) }
 final class InFlightCapture {
     var window = SpeechWindow()
     var lengths: [Int] = []
     var events: [String] = []
     let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
-    func decode(_ samples: [Float]) -> String? {
+    func decode(_ samples: [Float], _ prefix: [Int32]) -> SpeechWindow.DecodeResult? {
         lengths.append(samples.count)
         if lengths.count == 1 { entered.signal(); release.wait() }
-        return samples.count == 24000 ? "before tail" : "before tail last word"
+        return samples.count == 24000 ? ("before tail", [1, 2]) : ("before tail last word", [1, 2, 3, 4])
     }
-}
-func labelledSeams(_ words: [String], separator: String, holds: [Int] = []) throws {
-    var window = SpeechWindow()
-    let decode: ([Float]) -> String? = { samples in
-        var previous = -1, result: [String] = []
-        for sample in samples {
-            let id = Int(sample)
-            if id != previous { result.append(words[id]); previous = id }
-        }
-        return result.joined(separator: separator)
-    }
-    for id in 0..<words.count {
-        let expected = words.prefix(id + 1).joined(separator: separator)
-        for _ in 0..<(holds.isEmpty ? 1 : holds[id]) {
-            try window.append(Array(repeating: Float(id), count: 24000), speech: true, decode: decode) { snapshot in
-                check(snapshot == expected, "seam corrupted an intermediate snapshot: " + snapshot + " != " + expected)
-            }
-            check(window.text == expected, "window lost previously recognised text")
-            check(window.samples.count <= SpeechWindow.capacity, "labelled input grew the PCM window")
-        }
-    }
-    let final = try window.finish(decode: decode)
-    check(final == words.joined(separator: separator), "seam corrupted final text")
 }
 func run() throws {
-    var window = SpeechWindow(), calls: [Int] = [], emitted: [String] = [], lastDecodedSamples: [Float] = []
-    let decode: ([Float]) -> String? = { samples in
+    var window = SpeechWindow(), calls: [Int] = [], seenPrefixes: [[Int32]] = [], emitted: [String] = [], lastDecodedSamples: [Float] = []
+    let decode: SpeechWindow.DecodeFn = { samples, prefix in
         calls.append(samples.count)
+        seenPrefixes.append(prefix)
         lastDecodedSamples = samples
-        return "最后的字"
+        return ("最后的字", [501, 502])
     }
     try window.append(pcm(1599), speech: true, decode: decode) { emitted.append($0) }
     check(calls.isEmpty, "short tail decoded early")
     let tail = try window.finish(decode: decode)
     check(tail == "最后的字" && calls == [1599 + SpeechWindow.finalSilencePadding], "short tail lost or missing 200ms silence flush")
+    check(seenPrefixes == [[]], "short tail must use empty prefix")
     check(lastDecodedSamples.prefix(1599).allSatisfy { $0 == 0.1 } && lastDecodedSamples.suffix(SpeechWindow.finalSilencePadding).allSatisfy { $0 == 0 }, "final decode did not append exact 3200 trailing zeros after real PCM")
     _ = try window.finish(decode: decode)
     check(calls == [1599 + SpeechWindow.finalSilencePadding] && window.samples.isEmpty, "final decoded twice")
     print("TAIL:PASS")
 
-    window = SpeechWindow(); calls = []; emitted = []
-    var hypotheses = ["alpha", "alpha hello", "alpha hello worlt", "alpha hello world", "hello world again"]
-    let rollingDecode: ([Float]) -> String? = { samples in calls.append(samples.count); return hypotheses.removeFirst() }
-    for _ in 0..<4 { try window.append(pcm(24000), speech: true, decode: rollingDecode) { emitted.append($0) } }
-    check(window.committed == "alpha hello " && window.partial == "world", "five-character rollback")
-    check(window.samples.count == 24000 && window.text == "alpha hello world", "roll did not retain exact seam")
-    try window.append(pcm(24000), speech: true, decode: rollingDecode) { emitted.append($0) }
-    check(window.text == "alpha hello world again", "overlap repeated or split word")
-    check(calls == [24000, 48000, 72000, 96000, 48000], "decode input unbounded")
-    _ = try window.finish(decode: rollingDecode)
-    check(calls.count == 5, "overlap-only stop reran audio")
-    print("ROLLBACK:PASS")
-
-    // Full short tails (including <=5 Character windows) can outlive their PCM.
-    // Check EVERY cumulative snapshot, not just a convenient long-word final.
-    for count in [3, 5, 8] {
-        try labelledSeams(Array(["你", "好", "吗", "我", "们", "来", "了", "啊"].prefix(count)), separator: "")
+    // unfixedChunkNum=2, unfixedTokenNum=5 cadence + rolled-back prefix propagation into finish()
+    window = SpeechWindow(); calls = []; seenPrefixes = []; emitted = []
+    let rollbackDecode: SpeechWindow.DecodeFn = { samples, prefix in
+        calls.append(samples.count)
+        seenPrefixes.append(prefix)
+        let chunks = calls.count
+        switch chunks {
+        case 1:
+            return ("w1 w2", [101, 102])
+        case 2:
+            return ("w1 w2 w3 w4 w5 w6 w7", [101, 102, 103, 104, 105, 106, 107])
+        case 3:
+            check(prefix == [101, 102], "chunk 3 expected rolled-back [101, 102], got \\(prefix)")
+            return ("w1 w2 w3 w4 w5 w6 w7 w8", prefix + [103, 104, 105, 106, 107, 108])
+        case 4:
+            check(prefix == [101, 102, 103], "chunk 4 expected rolled-back [101, 102, 103], got \\(prefix)")
+            return ("w1 w2 w3 w4 w5 w6 w7 w8 w9", prefix + [104, 105, 106, 107, 108, 109])
+        default:
+            check(prefix == [101, 102, 103, 104], "finish expected rolled-back [101, 102, 103, 104], got \\(prefix)")
+            return ("w1 w2 w3 w4 w5 w6 w7 w8 w9 end", prefix + [105, 106, 107, 108, 109, 110])
+        }
     }
-    try labelledSeams((0..<120).map { String(UnicodeScalar(0x4e00 + $0)!) }, separator: "")
-    print("SHORT_CJK:PASS")
-    try labelledSeams(["a", "be", "see", "dog", "eel", "fox", "go", "hi"], separator: " ")
-    try labelledSeams((0..<120).map { ["a", "be", "see", "dog", "eel", "fox", "go", "hi"][$0 % 8] }, separator: " ")
-    print("SHORT_ASCII:PASS")
-    // Longest text overlap alone over-matches legitimate consecutive repeats.
-    try labelledSeams(Array(repeating: "a", count: 12), separator: " ")
-    try labelledSeams(Array(repeating: "哈", count: 12), separator: "")
-    try labelledSeams(["go", "go", "now", "go", "now", "go", "go", "now"], separator: " ")
-    print("REPEATED_OVERLAP:PASS")
-    // One acoustic word can span several stride ticks: unchanged text must not
-    // manufacture an empty "known overlap" candidate and duplicate that word.
-    try labelledSeams(["hello", "world", "again"], separator: " ", holds: [3, 3, 3])
-    try labelledSeams(["你", "好", "吗"], separator: "", holds: [3, 3, 3])
-    print("STABLE_HYPOTHESIS:PASS")
-    try labelledSeams(["hello", "world", "again", "last", "word"], separator: " ", holds: [4, 1, 3, 2, 4])
-    try labelledSeams(["你", "好", "吗", "我", "们"], separator: "", holds: [4, 1, 3, 2, 4])
-    // Zero-progress intervals and genuinely distinct repeated words coexist.
-    try labelledSeams(["a", "a", "a", "be", "be"], separator: " ", holds: [3, 1, 3, 1, 3])
-    try labelledSeams(["哈", "哈", "哈", "好", "好"], separator: "", holds: [3, 1, 3, 1, 3])
-    try labelledSeams(["a", "a", "a"], separator: " ", holds: [1, 2, 1])
-    try labelledSeams(["哈", "哈", "哈"], separator: "", holds: [1, 2, 1])
-    try labelledSeams(["aaaa", "bbbb", "aaaa"], separator: " ", holds: [3, 3, 3])
-    try labelledSeams(["哈哈", "你好", "哈哈"], separator: "", holds: [3, 3, 3])
-    print("NO_PROGRESS_THEN_GROWTH:PASS")
+    for _ in 0..<4 {
+        try window.append(pcm(24000), speech: true, decode: rollbackDecode) { emitted.append($0) }
+    }
+    try window.append(pcm(1600), speech: true, decode: rollbackDecode) { emitted.append($0) }
+    let rollbackFinal = try window.finish(decode: rollbackDecode)
+    check(rollbackFinal == "w1 w2 w3 w4 w5 w6 w7 w8 w9 end", "prefix rollback final mismatch: " + rollbackFinal)
+    check(seenPrefixes[0].isEmpty && seenPrefixes[1].isEmpty, "chunks 1-2 must not lock prefixTokens")
+    print("PREFIX_ROLLBACK_CADENCE:PASS")
 
-    window = SpeechWindow(); calls = []
+    // Repeated Chinese phrase + punctuation counterfactual + repeated consecutive words preserved verbatim
+    window = SpeechWindow(); seenPrefixes = []
+    let repeatedPhrase = "我们一起研究广东深圳啊，广东深圳呢"
+    let phraseChars = Array(repeatedPhrase)
+    let phraseTokenIds: [Int32] = (0..<phraseChars.count).map { Int32(2000 + $0) }
+    var phraseStep = 0
+    let phraseDecode: SpeechWindow.DecodeFn = { _, prefix in
+        phraseStep += 1
+        let targetLen = min(phraseChars.count, phraseStep * 6)
+        if !prefix.isEmpty {
+            check(prefix == Array(phraseTokenIds.prefix(prefix.count)), "prefix diverged from phrase token stream")
+        }
+        return (String(phraseChars.prefix(targetLen)), Array(phraseTokenIds.prefix(targetLen)))
+    }
+    for _ in 0..<3 {
+        try window.append(pcm(24000), speech: true, decode: phraseDecode) { _ in }
+    }
+    let phraseOut = try window.finish(decode: phraseDecode)
+    check(phraseOut == repeatedPhrase, "repeated phrase corrupted: " + phraseOut)
+
+    // Across segmentCapacity split too: repeated CJK tokens are never dropped
+    window = SpeechWindow()
+    let repeatTokens: SpeechWindow.DecodeFn = { samples, prefix in
+        let count = samples.count / 24000
+        let toks = (0..<count).map { Int32(3000 + $0) }
+        return (Array(repeating: "哈", count: count).joined(), prefix.isEmpty ? toks : prefix + toks.suffix(min(toks.count, 5)))
+    }
+    for _ in 0..<10 {
+        try window.append(pcm(24000), speech: true, decode: repeatTokens) { _ in }
+    }
+    let repeatFinal = try window.finish(decode: repeatTokens)
+    check(repeatFinal.count == 10 && repeatFinal == String(repeating: "哈", count: 10), "repeated tokens lost: " + repeatFinal)
+    print("REPEATED_PHRASE_PUNCTUATION:PASS")
+
+    // VAD pause resets segment tokens & prefixTokens
+    window = SpeechWindow(); calls = []; seenPrefixes = []
     try window.append(pcm(8000), speech: true, decode: decode) { _ in }
     try window.append(pcm(11200), speech: false, decode: decode) { _ in }
-    check(window.samples.isEmpty && window.committed == "最后的字", "VAD failed to unload PCM")
+    check(window.samples.isEmpty && window.committed == "最后的字" && window.partial.isEmpty, "VAD failed to isolate segment")
+    var sawSecondSegmentEmptyPrefix = false
+    for s in 1...3 {
+        try window.append(pcm(24000), speech: true, decode: { _, prefix in
+            if s == 1 { sawSecondSegmentEmptyPrefix = prefix.isEmpty }
+            return ("第二句", [601, 602, 603, 604, 605, 606])
+        }) { _ in }
+    }
+    check(sawSecondSegmentEmptyPrefix, "new segment after VAD leaked prior prefix")
     print("VAD:PASS")
 
     window = SpeechWindow()
-    let sentence: ([Float]) -> String? = { _ in "同一句。" }
+    let sentence: SpeechWindow.DecodeFn = { _, _ in ("同一句。", [701, 702]) }
     try window.append(pcm(24000), speech: true, decode: sentence) { _ in }
     try window.append(pcm(6400), speech: false, decode: sentence) { _ in }
     check(window.samples.isEmpty && window.committed == "同一句。", "punctuation pause did not commit")
@@ -1037,38 +1213,45 @@ func run() throws {
     check(window.committed == "同一句。同一句。", "valid repeated sentence deduplicated")
     print("REPEATED_SENTENCE:PASS")
 
+    // Continuous 2-minute speech stays strictly bounded at segmentCapacity
     window = SpeechWindow(); calls = []
-    let longDecode: ([Float]) -> String? = { samples in
+    let longDecode: SpeechWindow.DecodeFn = { samples, _ in
         calls.append(samples.count)
-        return "连续讲话没有标点也没有停顿可以一直继续"
+        return ("连续讲话没有标点也没有停顿可以一直继续", [801, 802])
     }
     for _ in 0..<1200 {
         try window.append(pcm(1600), speech: true, decode: longDecode) { _ in }
-        check(window.samples.count <= SpeechWindow.capacity, "PCM grew with duration")
-        check(window.partial.count <= 32, "mock hypothesis leaked historical partial")
+        check(window.samples.count <= SpeechWindow.segmentCapacity, "PCM exceeded segmentCapacity")
     }
     _ = try window.finish(decode: longDecode)
-    check(calls.count == 80 && calls.max() == SpeechWindow.capacity, "2 minute decode cadence/bound failed")
+    check(calls.count == 80 && calls.max() == SpeechWindow.segmentCapacity, "2 minute decode cadence/bound failed: \\(calls.count) max=\\(calls.max() ?? -1)")
     check(window.samples.isEmpty, "final did not release PCM")
     print("LONG_CONTINUOUS:PASS")
 
-    // An ideal deterministic acoustic peer labels one word per second. This
-    // checks text seams too, not only the size of repeated constant hypotheses.
+    // Labelled 3-minute transcript across multiple segment splits preserves every word with zero duplication
     window = SpeechWindow()
     func word(_ id: Int) -> String { "word" + String(format: "%03d", id) }
-    let labelled: ([Float]) -> String? = { samples in
-        var previous = -1, words: [String] = []
+    let labelled: SpeechWindow.DecodeFn = { samples, _ in
+        var previous = -1, words: [String] = [], toks: [Int32] = []
         for sample in samples {
-            let id = Int(sample)
-            if id != previous { words.append(word(id)); previous = id }
+            let id = Int(sample.rounded())
+            if id <= 0 { continue }
+            if id != previous {
+                words.append(word(id))
+                toks.append(Int32(1000 + id))
+                previous = id
+            }
         }
-        return words.joined(separator: " ")
+        return (words.joined(separator: " "), toks)
     }
-    for second in 0..<120 {
-        try window.append(Array(repeating: Float(second), count: 24000), speech: true, decode: labelled) { _ in }
+    for second in 1...120 {
+        // Place a 160ms quiet word boundary after each 1.34s word so sustained-quiet splits land cleanly between words without slicing a word in half.
+        var chunk = Array(repeating: Float(second), count: 21_440)
+        chunk.append(contentsOf: Array(repeating: Float(0), count: 2_560))
+        try window.append(chunk, speech: true, decode: labelled) { _ in }
     }
     let transcript = try window.finish(decode: labelled)
-    check(transcript == (0..<120).map(word).joined(separator: " "), "continuous overlapped words repeated or lost")
+    check(transcript == (1...120).map(word).joined(separator: " "), "continuous segmented transcript corrupted")
     print("LONG_TRANSCRIPT:PASS")
 
     window = SpeechWindow(); calls = []
@@ -1078,9 +1261,160 @@ func run() throws {
     print("VARIABLE_TAP:PASS")
 
     window = SpeechWindow(); calls = []
-    try window.append(pcm(168000), speech: true, decode: longDecode) { _ in }
-    check(calls == [96000, 96000] && window.samples.count == 24000, "live backlog exceeded capacity without rolling")
+    try window.append(pcm(SpeechWindow.segmentCapacity + 24000), speech: true, decode: longDecode) { _ in }
+    check(calls == [SpeechWindow.segmentCapacity, 24000] && window.samples.count == 24000, "live backlog exceeded segmentCapacity: \\(calls)")
     print("BACKLOG_CHUNKING:PASS")
+
+    // Disjoint sustained-quiet-interval partitioning beyond segmentCapacity (13.5s = 216,000 samples)
+    do {
+        var quietGapSignal = Array(repeating: Float(0.25), count: 195_200) // 12.2s voiced
+        quietGapSignal.append(contentsOf: Array(repeating: Float(0.001), count: 3_200)) // 200ms sustained quiet interval
+        quietGapSignal.append(contentsOf: Array(repeating: Float(0.25), count: 19_200)) // 1.2s voiced -> 13.6s total (217,600)
+        check(quietGapSignal.count == 217_600, "fixture length mismatch")
+        let cutIdx = SpeechWindow.lowestEnergySplitIndex(in: Array(quietGapSignal.prefix(SpeechWindow.segmentCapacity)))
+        check(cutIdx >= 195_200 && cutIdx <= 198_400, "sustained-quiet cut missed quiet gap: \\(cutIdx)")
+
+        for isBacklog in [false, true] {
+            var segWin = SpeechWindow()
+            var sliceDecodeLog: [(Int, Int)] = []
+            let trackingDecode: SpeechWindow.DecodeFn = { samples, _ in
+                sliceDecodeLog.append((samples.count, samples.filter { $0 == 0.001 }.count))
+                return ("s\\(sliceDecodeLog.count)", [Int32(sliceDecodeLog.count)])
+            }
+            if isBacklog {
+                try segWin.append(quietGapSignal, speech: true, final: true, decode: trackingDecode) { _ in }
+                _ = try segWin.finish(decode: trackingDecode)
+                check(sliceDecodeLog.count == 2, "backlog expected 2 disjoint segments, got \\(sliceDecodeLog)")
+                let seg1Count = sliceDecodeLog[0].0
+                let seg2Count = sliceDecodeLog[1].0 - SpeechWindow.finalSilencePadding
+                check(seg1Count == cutIdx && seg1Count + seg2Count == quietGapSignal.count, "disjoint backlog split sum mismatch: \\(seg1Count) + \\(seg2Count) != \\(quietGapSignal.count)")
+            } else {
+                var offset = 0
+                while offset < quietGapSignal.count {
+                    let end = min(quietGapSignal.count, offset + 24_000)
+                    try segWin.append(Array(quietGapSignal[offset..<end]), speech: true, decode: trackingDecode) { _ in }
+                    offset = end
+                }
+                _ = try segWin.finish(decode: trackingDecode)
+                let finalSeg2Count = sliceDecodeLog.last!.0 - SpeechWindow.finalSilencePadding
+                let seg1Count = sliceDecodeLog[sliceDecodeLog.count - 2].0
+                check(seg1Count == cutIdx && seg1Count + finalSeg2Count == quietGapSignal.count, "disjoint streaming split sum mismatch: \\(seg1Count) + \\(finalSeg2Count) != \\(quietGapSignal.count)")
+            }
+        }
+        print("DISJOINT_LOW_RMS_PARTITION:PASS")
+    }
+
+    // F2 class test: isolated 20ms stop-closure trough mid-speech is ignored in favor of true 160ms sustained quiet pause
+    do {
+        var speechWithDip = Array(repeating: Float(0.30), count: SpeechWindow.segmentCapacity)
+        // Isolated 20ms zero dip at 11.80s..11.82s surrounded by loud 0.30 speech
+        for idx in 188_800..<189_120 { speechWithDip[idx] = 0.0 }
+        // True sustained 160ms quiet interval at 12.29s..12.45s
+        for idx in 196_640..<199_200 { speechWithDip[idx] = 0.002 }
+        let sustainedCut = SpeechWindow.lowestEnergySplitIndex(in: speechWithDip)
+        check(sustainedCut >= 196_960 && sustainedCut <= 198_880, "split picked isolated 20ms dip or edge instead of sustained quiet center: \\(sustainedCut)")
+        print("SUSTAINED_QUIET_CUT:PASS")
+    }
+
+    // F1 class test: capacity split preserves only carriedAudio's VAD trailing silence (no-cap control, post-cut silence, cut-straddling silence, empty carry, warmup isolation)
+    do {
+        // 1) Parameterized no-cap control vs post-cut carried silence
+        for useCapSplit in [false, true] {
+            var vadWin = SpeechWindow()
+            var seenPrefixes: [[Int32]] = []
+            let vadDecode: SpeechWindow.DecodeFn = { _, prefix in
+                seenPrefixes.append(prefix)
+                // Always return 7 tokens unpunctuated so vadPause (700ms = 11200) applies and rollback keeps >=2 tokens
+                return ("词一词二词三", [201, 202, 203, 204, 205, 206, 207])
+            }
+            if useCapSplit {
+                // Build 12.2s loud -> 200ms 0.0 valley (cut lands around 196_160 = 12.26s) -> loud up to 13.2s -> 300ms trailing silence (4,800) to reach 13.5s
+                var chunk = Array(repeating: Float(0.25), count: 195_200)
+                chunk.append(contentsOf: Array(repeating: Float(0.0), count: 3_200))
+                chunk.append(contentsOf: Array(repeating: Float(0.25), count: 12_800))
+                chunk.append(contentsOf: Array(repeating: Float(0.001), count: 4_800))
+                check(chunk.count == SpeechWindow.segmentCapacity, "vad cap fixture size mismatch")
+                // Feed in 24k strides so chunkCount >= 2 before reaching capacity, ending with final voiced+300ms silence batch hitting capacity+1600
+                var pos = 0
+                while pos < 192_000 {
+                    try vadWin.append(Array(chunk[pos..<(pos + 24_000)]), speech: true, trailingSilence: 0, decode: vadDecode) { _ in }
+                    pos += 24_000
+                }
+                let tailWithSilence = Array(chunk[pos..<216_000]) + Array(repeating: Float(0.0), count: 1_600)
+                // Last 4,800 + 1,600 = 6,400 samples (< 11,200 vadPause) trailing silence; carried tail has speech + 6,400 trailing silence
+                try vadWin.append(tailWithSilence, speech: true, trailingSilence: 6_400, decode: vadDecode) { _ in }
+                check(!vadWin.samples.isEmpty, "carried tail unexpectedly cleared before 700ms pause")
+                // Adding 300ms more silence (6,400 + 4,800 = 11,200 == vadPause) MUST commit and clear samples
+                try vadWin.append(pcm(4_800), speech: false, decode: vadDecode) { _ in }
+                check(vadWin.samples.isEmpty, "F1 regression: carried trailing silence lost across cap split, left \\(vadWin.samples.count) samples")
+            } else {
+                try vadWin.append(Array(repeating: Float(0.25), count: 24_000), speech: true, trailingSilence: 4_800, decode: vadDecode) { _ in }
+                try vadWin.append(pcm(6_400), speech: false, decode: vadDecode) { _ in }
+                check(vadWin.samples.isEmpty, "no-cap control did not commit at 700ms pause")
+            }
+            // Subsequent speech MUST start isolated with two warmup chunks (empty prefixTokens)
+            seenPrefixes.removeAll()
+            try vadWin.append(Array(repeating: Float(0.25), count: 24_000), speech: true, decode: vadDecode) { _ in }
+            try vadWin.append(Array(repeating: Float(0.25), count: 24_000), speech: true, decode: vadDecode) { _ in }
+            try vadWin.append(Array(repeating: Float(0.25), count: 24_000), speech: true, decode: vadDecode) { _ in }
+            check(seenPrefixes.count == 3 && seenPrefixes[0].isEmpty && seenPrefixes[1].isEmpty && !seenPrefixes[2].isEmpty,
+                  "next segment failed warmup prefix isolation after VAD commit: \\(seenPrefixes)")
+        }
+
+        // 2) Trailing silence straddling cut with non-empty remaining: exact 640ms stays uncommitted, 700ms commits + isolates warmup prefixes
+        var spanWin = SpeechWindow()
+        var spanPrefixes: [[Int32]] = []
+        let spanDecode: SpeechWindow.DecodeFn = { _, prefix in
+            spanPrefixes.append(prefix)
+            return ("不断言词", [301, 302, 303, 304, 305, 306])
+        }
+        var spanPcm = Array(repeating: Float(0.25), count: 205_600) // loud up to 12.85s
+        spanPcm.append(contentsOf: Array(repeating: Float(0.0), count: 10_400)) // 650ms silence at 12.85s..13.50s
+        try spanWin.append(spanPcm + Array(repeating: Float(0.0), count: 160), speech: true, trailingSilence: 10_560, decode: spanDecode) { _ in }
+        let carriedRemaining = spanWin.samples.count
+        check(carriedRemaining > 0 && carriedRemaining < 10_560, "expected partial silent carry, got \\(carriedRemaining)")
+        // Step just past where leaked trailingSilence (10_560) would cross vadPause (11_200), while post-cut silence is still < 700ms
+        let leakThresholdStep = max(640, SpeechWindow.vadPause - 10_560)
+        check(carriedRemaining + leakThresholdStep < SpeechWindow.vadPause, "fixture needs headroom between leakThreshold and vadPause")
+        try spanWin.append(pcm(leakThresholdStep), speech: false, decode: spanDecode) { _ in }
+        check(!spanWin.samples.isEmpty, "F1-R2 regression: pre-cut silence leaked across !remaining.isEmpty causing premature commit at \\(carriedRemaining + leakThresholdStep) samples")
+        // Reach 1 sample below actual 700ms in carried segment -> still must NOT commit
+        let nearlyFull = SpeechWindow.vadPause - (carriedRemaining + leakThresholdStep) - 1
+        if nearlyFull > 0 {
+            try spanWin.append(pcm(nearlyFull), speech: false, decode: spanDecode) { _ in }
+            check(!spanWin.samples.isEmpty, "carried segment committed 1 sample before 700ms pause")
+        }
+        // Final sample reaches exact 700ms (vadPause) -> commits cleanly
+        try spanWin.append(pcm(1), speech: false, decode: spanDecode) { _ in }
+        check(spanWin.samples.isEmpty, "carried segment did not commit at exact 700ms pause")
+        // Verify subsequent speech starts isolated with two empty warmup prefixes
+        spanPrefixes.removeAll()
+        for _ in 0..<3 {
+            try spanWin.append(Array(repeating: Float(0.25), count: 24_000), speech: true, decode: spanDecode) { _ in }
+        }
+        check(spanPrefixes.count == 3 && spanPrefixes[0].isEmpty && spanPrefixes[1].isEmpty && !spanPrefixes[2].isEmpty,
+              "post-straddle next segment leaked prefix tokens: \\(spanPrefixes)")
+
+        // 3) Empty carry (constant signal splits cleanly at segmentCapacity) + multi-split straddling silence + final path parity
+        var emptyCarryWin = SpeechWindow()
+        try emptyCarryWin.append(Array(repeating: Float(0.25), count: SpeechWindow.segmentCapacity + 1), speech: true, decode: { _, _ in ("ok", [1]) }) { _ in }
+        check(emptyCarryWin.samples.count == 1, "expected 1 carried sample after constant cap split, got \\(emptyCarryWin.samples.count)")
+        try emptyCarryWin.append(pcm(SpeechWindow.vadPause - 160), speech: false, decode: { _, _ in ("ok", [1]) }) { _ in }
+        check(!emptyCarryWin.samples.isEmpty, "empty-carry segment committed early before 700ms")
+        try emptyCarryWin.append(pcm(160), speech: false, decode: { _, _ in ("ok", [1]) }) { _ in }
+        check(emptyCarryWin.samples.isEmpty, "empty-carry segment did not commit at 700ms")
+
+        var multiWin = SpeechWindow()
+        var multiPcm = Array(repeating: Float(0.25), count: SpeechWindow.segmentCapacity * 2)
+        multiPcm.append(contentsOf: Array(repeating: Float(0.0), count: 160))
+        try multiWin.append(multiPcm, speech: true, trailingSilence: 160, decode: { _, _ in ("多段", [401]) }) { _ in }
+        check(multiWin.samples.count == 160, "expected 160 post-cut samples after uniform multi-split, got \\(multiWin.samples.count)")
+        try multiWin.append(pcm(SpeechWindow.vadPause - 320), speech: false, decode: { _, _ in ("多段", [401]) }) { _ in }
+        check(!multiWin.samples.isEmpty, "multi-split segment committed early before 700ms")
+        try multiWin.append(pcm(160), speech: false, decode: { _, _ in ("多段", [401]) }) { _ in }
+        check(multiWin.samples.isEmpty, "multi-split segment did not commit at 700ms")
+        print("CAP_VAD_CLOCK_PRESERVATION:PASS")
+    }
 
     var inbox = SpeechInbox()
     check(!(try inbox.offer(pcm(160))), "warmup scheduled decode")
@@ -1095,26 +1429,20 @@ func run() throws {
     print("WARMUP:PASS")
 
     var levelInbox = SpeechInbox()
-    // Warmup taps (first 320 samples = 20ms) must never emit audioLevel
     _ = try levelInbox.offer(pcm(160))
     check(levelInbox.pollAudioLevel(now: 0.0) == nil, "audioLevel emitted during first warmup half")
     _ = try levelInbox.offer(pcm(160))
     check(levelInbox.pollAudioLevel(now: 0.01) == nil, "audioLevel emitted on exact warmup completion without post-warmup samples")
-    // First post-warmup tap at t=0.05 emits RMS * 3 (0.1 * 3 = 0.3), independent of inbox.take() / worker drain
     _ = try levelInbox.offer(pcm(320))
     let firstLevel = levelInbox.pollAudioLevel(now: 0.05)
     check(firstLevel != nil && abs(firstLevel! - 0.3) < 0.001, "first post-warmup audioLevel inaccurate: \\(String(describing: firstLevel))")
-    // Subsequent taps within <50ms (t=0.07, t=0.099) are throttled even as new samples accumulate while drain is busy
     _ = try levelInbox.offer(Array(repeating: 0.2, count: 320))
     check(levelInbox.pollAudioLevel(now: 0.07) == nil, "audioLevel not throttled at +20ms")
     _ = try levelInbox.offer(Array(repeating: 0.2, count: 320))
     check(levelInbox.pollAudioLevel(now: 0.099) == nil, "audioLevel not throttled at +49ms")
-    // At +50ms (t=0.10), throttled window opens and emits latest level (0.2 * 3 = 0.6) while inbox is still un-drained!
     let secondLevel = levelInbox.pollAudioLevel(now: 0.10)
     check(secondLevel != nil && abs(secondLevel! - 0.6) < 0.001, "throttled audioLevel did not emit at +50ms: \\(String(describing: secondLevel))")
-    // Without new audio offered, polling again at t=0.20 returns nil
     check(levelInbox.pollAudioLevel(now: 0.20) == nil, "duplicate audioLevel emitted without new samples")
-    // Loud audio clamps to 1.0
     _ = try levelInbox.offer(Array(repeating: 0.8, count: 320))
     let clampedLevel = levelInbox.pollAudioLevel(now: 0.20)
     check(clampedLevel == 1.0, "loud audioLevel did not clamp to 1.0: \\(String(describing: clampedLevel))")
@@ -1130,65 +1458,68 @@ func run() throws {
     window = SpeechWindow(); calls = []
     try window.append(pcm(24000), speech: true, decode: longDecode) { _ in }
     let beforeStop = calls.count
-    // Remaining 32s accepted backlog on stop: chunked into bounded 96,000-sample
-    // windows without emitting intermediate partials, then flushed once in finish()
-    // with 3,200 trailing zero samples.
+    // Remaining 32s accepted backlog on stop: split into 216,000-sample (13.5s) segments + bounded tail
     try window.append(pcm(SpeechInbox.limit), speech: true, final: true, decode: longDecode) { _ in fatalError("stop emitted partial") }
     _ = try window.finish(decode: longDecode)
     let stopCalls = Array(calls.dropFirst(beforeStop))
-    check(stopCalls.count == 8, "expected 7 full 96k windows + 1 final tail window, got \\(stopCalls)")
-    check(stopCalls.dropLast().allSatisfy { $0 == SpeechWindow.capacity }, "intermediate stop window exceeded or missed 96k capacity: \\(stopCalls)")
-    check(stopCalls.last! == 32000 + SpeechWindow.finalSilencePadding, "final stop window missing bounded tail + 3200 silence flush: \\(stopCalls)")
+    check(stopCalls == [216000, 216000, 104000 + SpeechWindow.finalSilencePadding], "unexpected 32s stop split cadence: \\(stopCalls)")
     let afterFirstFinish = calls.count
     _ = try window.finish(decode: longDecode)
     check(calls.count == afterFirstFinish, "stop decoded twice")
 
-    // Verify 19.75s (13 strides + 4000 tail = 316,000 samples) labelled backlog across both live and final stop paths:
-    // every decode stays <= capacity (+ final padding on finish), all words stitch without seam duplication or tail loss.
+    // Verify 19.75s (13 strides + 4000 tail = 316,000 samples) labelled backlog across both live & final stop paths
     for isFinalPath in [false, true] {
         var backlogWindow = SpeechWindow()
         var backlogLengths: [Int] = []
         var backlogLastSamples: [Float] = []
-        let labelledBacklogDecode: ([Float]) -> String? = { samples in
+        let labelledBacklogDecode: SpeechWindow.DecodeFn = { samples, _ in
             backlogLengths.append(samples.count)
             backlogLastSamples = samples
             var previous = -1, words: [String] = []
             for sample in samples {
                 let raw = Int(sample.rounded())
-                if raw <= 0 { continue } // ignore 0.0 final silence padding
+                if raw <= 0 { continue }
                 if raw != previous { words.append(word(raw)); previous = raw }
             }
-            return words.joined(separator: " ")
+            return (words.joined(separator: " "), [])
         }
         var fullBacklog: [Float] = []
         for id in 1...13 {
-            fullBacklog.append(contentsOf: Array(repeating: Float(id), count: 24000))
+            fullBacklog.append(contentsOf: Array(repeating: Float(id), count: 21_440))
+            fullBacklog.append(contentsOf: Array(repeating: Float(0), count: 2_560))
         }
-        // Append 4000 extra samples (< 24000 stride) on word 14 so finish() flushes the sub-stride tail on both live and final paths
         fullBacklog.append(contentsOf: Array(repeating: Float(14), count: 4000))
         try backlogWindow.append(fullBacklog, speech: true, final: isFinalPath, decode: labelledBacklogDecode) { _ in
             if isFinalPath { fatalError("final backlog emitted partial") }
         }
         let stitched = try backlogWindow.finish(decode: labelledBacklogDecode)
         let expectedStitched = (1...14).map(word).joined(separator: " ")
-        check(stitched == expectedStitched, "backlog stitched transcript mismatch (final=\\(isFinalPath)): " + stitched + " != " + expectedStitched)
-        check(backlogLengths.dropLast().allSatisfy { $0 <= SpeechWindow.capacity }, "live/intermediate backlog decode exceeded 96k: \\(backlogLengths)")
-        check(backlogLengths.last! == 28000 + SpeechWindow.finalSilencePadding, "final backlog window did not flush exact tail + 3200 zeros: \\(backlogLengths)")
-        check(backlogLastSamples.prefix(28000).allSatisfy { $0 > 0 } && backlogLastSamples.suffix(SpeechWindow.finalSilencePadding).allSatisfy { $0 == 0 }, "final backlog window zero padding corrupted")
+        check(stitched == expectedStitched, "backlog transcript mismatch (final=\\(isFinalPath)): " + stitched + " != " + expectedStitched)
+        let expectedPad = isFinalPath ? SpeechWindow.finalSilencePadding : 0
+        check(backlogLengths.count == 2
+              && backlogLengths[0] >= SpeechWindow.segmentCapacity - SpeechWindow.splitSearchWindow
+              && backlogLengths[0] <= SpeechWindow.segmentCapacity
+              && backlogLengths[0] + backlogLengths[1] == fullBacklog.count + expectedPad,
+              "unexpected backlog split lengths (final=\\(isFinalPath)): \\(backlogLengths)")
+        if isFinalPath {
+            check(backlogLastSamples.dropLast(SpeechWindow.finalSilencePadding).suffix(4000).allSatisfy { $0 == 14 }
+                  && backlogLastSamples.suffix(SpeechWindow.finalSilencePadding).allSatisfy { $0 == 0 },
+                  "final backlog window zero padding corrupted")
+        }
     }
     print("TAIL_BATCH:PASS")
 
     window = SpeechWindow()
     try window.append(pcm(24000), speech: true, decode: sentence) { _ in }
     try window.append(pcm(100), speech: true, decode: sentence) { _ in }
-    do { _ = try window.finish(decode: { _ in nil }); fatalError("decode failure swallowed") }
+    do { _ = try window.finish(decode: { _, _ in nil }); fatalError("decode failure swallowed") }
     catch SpeechWindow.Failure.decode { check(window.text == "同一句。" && window.samples.count == 24100, "failed flush discarded previous text/PCM") }
     print("FAILURE:PASS")
 
     window = SpeechWindow()
-    let unicode: ([Float]) -> String? = { _ in "你好👨‍👩‍👧‍👦e\\u{301}世界朋友再见" }
-    try window.append(pcm(96000), speech: true, decode: unicode) { _ in }
-    check(window.partial.count == 5 && !window.text.contains("�"), "split grapheme cluster")
+    let unicode: SpeechWindow.DecodeFn = { _, _ in ("你好👨‍👩‍👧‍👦e\\u{301}世界朋友再见", [1, 2, 3]) }
+    try window.append(pcm(SpeechWindow.segmentCapacity), speech: true, decode: unicode) { _ in }
+    check(window.text == "你好👨‍👩‍👧‍👦e\\u{301}世界朋友再见" && !window.text.contains("\\u{FFFD}"), "corrupted unicode")
     print("UNICODE:PASS")
 
     window = SpeechWindow(); calls = []
@@ -1219,26 +1550,15 @@ func run() throws {
     check(capture.events == ["partial", "before tail last word", "stopped/ACK"], "final did not precede stopped/ACK")
     print("IN_FLIGHT_STOP:PASS")
 
-    // Normalized overlap reconciles punctuation/casing drift across rolling seams without duplication
-    window = SpeechWindow()
-    var normHypotheses = ["Hello", "Hello, world", "Hello, world", "Hello, world", "WORLD! Again"]
-    for _ in 0..<4 {
-        try window.append(pcm(24000), speech: true, decode: { _ in normHypotheses.removeFirst() }) { _ in }
-    }
-    try window.append(pcm(24000), speech: true, decode: { _ in normHypotheses.removeFirst() }) { _ in }
-    let normFinal = try window.finish(decode: { _ in nil })
-    check(normFinal == "Hello, WORLD! Again", "normalized overlap failed: \\(normFinal)")
-    print("NORMALIZED_OVERLAP:PASS")
-
     // Mid-decode & pre-append cancellation throws Failure.cancelled instead of Failure.decode or silent return
     window = SpeechWindow()
     do {
-        try window.append(pcm(24000), speech: true, shouldContinue: { false }, decode: { _ in fatalError("should not decode after shouldContinue=false") }) { _ in }
+        try window.append(pcm(24000), speech: true, shouldContinue: { false }, decode: { _, _ in fatalError("should not decode after shouldContinue=false") }) { _ in }
         fatalError("pre-append cancellation returned silently")
     } catch SpeechWindow.Failure.cancelled { }
     var keepGoing = true
     do {
-        try window.append(pcm(24000), speech: true, shouldContinue: { keepGoing }, decode: { _ in
+        try window.append(pcm(24000), speech: true, shouldContinue: { keepGoing }, decode: { _, _ in
             keepGoing = false
             return nil
         }) { _ in }
