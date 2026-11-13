@@ -40,6 +40,7 @@ import {
   normalizeCloudDocName,
 } from '@shared/cloud-docs.js';
 import { dismissHtmlSplashForDirectEntry } from '../html-splash.js';
+import { isImeComposingKeyEvent } from '../ime-keyboard.js';
 
 const OfficePreview = lazy(() => import('./OfficePreview.js'));
 
@@ -475,6 +476,7 @@ export function CloudDocsPanel({
   const shareTargetRef = useRef<{ kind: CloudDocShareTargetKind; id: string; name: string } | null>(null);
   const previewTitleInputRef = useRef<HTMLInputElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const searchComposingRef = useRef(false);
   const previewTitleCancelledRef = useRef(false);
   const savedStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const editGenCounterRef = useRef(0);
@@ -542,6 +544,11 @@ export function CloudDocsPanel({
     docsHydratedRef.current = false;
   }, [invalidatePendingRefresh]);
 
+  const closeMobileSearch = useCallback(() => {
+    searchComposingRef.current = false;
+    setMobileSearchOpen(false);
+  }, []);
+
   const openPreview = useCallback((target: PreviewTarget | null) => {
     if (savedStatusTimerRef.current) {
       clearTimeout(savedStatusTimerRef.current);
@@ -550,7 +557,7 @@ export function CloudDocsPanel({
     const nextPreviewSeq = activePreviewRef.current.previewSeq + 1;
     previewTitleCancelledRef.current = false;
     setContextMenu(null);
-    setMobileSearchOpen(false);
+    closeMobileSearch();
     setPreviewTarget(target);
     if (!target) {
       activePreviewRef.current = {
@@ -579,7 +586,7 @@ export function CloudDocsPanel({
       setPreviewTitleDraft(target.title);
       setPreviewTitleStatus('idle');
     }
-  }, []);
+  }, [closeMobileSearch]);
 
   // Close open overflow menu, right-click context menu, or share dialog cleanly on outside click / Escape / blur / resize.
   useEffect(() => {
@@ -2147,7 +2154,7 @@ export function CloudDocsPanel({
                 data-testid="cloud-docs-search-collapse"
                 aria-label={t('cloud_docs.actions.back_to_list', 'Back')}
                 title={t('cloud_docs.actions.back_to_list', 'Back')}
-                onClick={() => setMobileSearchOpen(false)}
+                onClick={closeMobileSearch}
               >
                 <BackArrowIcon />
               </button>
@@ -2161,10 +2168,17 @@ export function CloudDocsPanel({
               placeholder={t('cloud_docs.search_placeholder', 'Search documents...')}
               value={search}
               onInput={(e) => setSearch((e.currentTarget as HTMLInputElement).value)}
+              onCompositionStart={() => {
+                searchComposingRef.current = true;
+              }}
+              onCompositionEnd={() => {
+                searchComposingRef.current = false;
+              }}
               onKeyDown={(e) => {
+                if (searchComposingRef.current || isImeComposingKeyEvent(e)) return;
                 if (mobileSearchOpen && (e.key === 'Escape' || e.key === 'Enter')) {
                   e.stopPropagation();
-                  setMobileSearchOpen(false);
+                  closeMobileSearch();
                 }
               }}
             />

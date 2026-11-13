@@ -1654,6 +1654,47 @@ describe('CloudDocsPanel', () => {
     expect(header.classList.contains('is-mobile-search-open')).toBe(false);
     expect(searchInput.value).toBe('Budget');
 
+    // Reopen and verify normal Enter also collapses while preserving query & refocusing on reopen
+    fireEvent.click(searchToggle);
+    expect(header.classList.contains('is-mobile-search-open')).toBe(true);
+    expect(document.activeElement).toBe(searchInput);
+    fireEvent.keyDown(searchInput, { key: 'Enter' });
+    expect(header.classList.contains('is-mobile-search-open')).toBe(false);
+    expect(searchInput.value).toBe('Budget');
+
+    // IME composing counterexample: Enter/Escape during composition (isComposing, keyCode=229, Process, compositionstart..end) must NOT collapse or stopPropagation
+    fireEvent.click(searchToggle);
+    expect(header.classList.contains('is-mobile-search-open')).toBe(true);
+    expect(document.activeElement).toBe(searchInput);
+
+    for (const imeInit of [
+      { key: 'Enter', isComposing: true },
+      { key: 'Escape', isComposing: true },
+      { key: 'Enter', keyCode: 229 },
+      { key: 'Escape', keyCode: 229 },
+      { key: 'Process' },
+    ]) {
+      fireEvent.keyDown(searchInput, imeInit);
+      expect(header.classList.contains('is-mobile-search-open')).toBe(true);
+    }
+
+    fireEvent.compositionStart(searchInput);
+    fireEvent.keyDown(searchInput, { key: 'Enter' });
+    expect(header.classList.contains('is-mobile-search-open')).toBe(true);
+    fireEvent.keyDown(searchInput, { key: 'Escape' });
+    expect(header.classList.contains('is-mobile-search-open')).toBe(true);
+    fireEvent.compositionEnd(searchInput);
+
+    // After composition ends, ordinary Enter collapses search while retaining query and reopening focuses input
+    fireEvent.keyDown(searchInput, { key: 'Enter' });
+    expect(header.classList.contains('is-mobile-search-open')).toBe(false);
+    expect(searchInput.value).toBe('Budget');
+    fireEvent.click(searchToggle);
+    expect(header.classList.contains('is-mobile-search-open')).toBe(true);
+    expect(document.activeElement).toBe(searchInput);
+    fireEvent.keyDown(searchInput, { key: 'Escape' });
+    expect(header.classList.contains('is-mobile-search-open')).toBe(false);
+
     // Verify CSS boundaries: desktop base untouched, @media (max-width: 480px) no longer stacks header-right,
     // and single-row compact header rules live strictly inside @media (max-width: 600px).
     const testDir = dirname(fileURLToPath(import.meta.url));
