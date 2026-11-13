@@ -804,4 +804,39 @@ describe('generic i18n coverage guard', () => {
       }
     }
   });
+
+  it('keeps featureAnnouncements.cloudDocs localized per language without mixed Chinese/English cloud-doc nouns', () => {
+    const enMessages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales/en.json'), 'utf8')) as Record<string, any>;
+    const enKeys = Object.keys(enMessages.featureAnnouncements ?? {}).sort();
+    expect(enKeys).toEqual(expect.arrayContaining(['label', 'messagePins', 'cloudDocs', 'dismiss']));
+
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as Record<string, any>;
+      const announcements = messages.featureAnnouncements ?? {};
+      expect(Object.keys(announcements).sort(), `${locale}:featureAnnouncements key parity`).toEqual(enKeys);
+
+      for (const [key, value] of Object.entries(announcements)) {
+        expect(value, `${locale}:featureAnnouncements.${key}`).toEqual(expect.any(String));
+        expect((value as string).trim().length, `${locale}:featureAnnouncements.${key}`).toBeGreaterThan(0);
+      }
+
+      const cloudDocsText = String(announcements.cloudDocs ?? '');
+      if (locale !== 'en') {
+        expect(cloudDocsText, `${locale}:featureAnnouncements.cloudDocs must not contain English "cloud doc"`).not.toMatch(/cloud\s+docs?/i);
+      }
+      if (!locale.startsWith('zh-')) {
+        expect(cloudDocsText, `${locale}:featureAnnouncements.cloudDocs must not contain Chinese cloud-doc terms`).not.toContain('云文档');
+        expect(cloudDocsText, `${locale}:featureAnnouncements.cloudDocs must not contain Traditional Chinese cloud-doc terms`).not.toContain('雲端文件');
+        if (locale !== 'ja') {
+          expect(cloudDocsText, `${locale}:featureAnnouncements.cloudDocs must not contain Han characters`).not.toMatch(/[\u4e00-\u9fff]/);
+        }
+      } else if (locale === 'zh-CN') {
+        expect(cloudDocsText, 'zh-CN:featureAnnouncements.cloudDocs should use 云文档').toContain('云文档');
+        expect(cloudDocsText, 'zh-CN:featureAnnouncements.cloudDocs must not mix 雲端文件').not.toContain('雲端文件');
+      } else if (locale === 'zh-TW') {
+        expect(cloudDocsText, 'zh-TW:featureAnnouncements.cloudDocs should use 雲端文件').toContain('雲端文件');
+        expect(cloudDocsText, 'zh-TW:featureAnnouncements.cloudDocs must not mix 云文档').not.toContain('云文档');
+      }
+    }
+  });
 });

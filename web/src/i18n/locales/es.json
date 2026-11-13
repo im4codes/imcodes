@@ -4095,7 +4095,7 @@
   "featureAnnouncements": {
     "label": "Nueva función",
     "messagePins": "Haz clic derecho en un mensaje para fijarlo. En móvil, mantenlo pulsado.",
-    "cloudDocs": "Nuevo Cloud Docs: edita documentos, hojas y presentaciones en ONLYOFFICE con vista redimensionable o en nueva ventana, comparte por roles de equipo o menciona \"cloud doc\" / \"云文档\" en el chat para que el agente lea y edite vía MCP.",
+    "cloudDocs": "Nuevos Documentos en la nube: edita documentos, hojas y presentaciones en ONLYOFFICE con vista redimensionable o en nueva ventana, comparte por roles de equipo o menciona \"documentos en la nube\" en el chat para que el agente lea y edite vía MCP.",
     "dismiss": "Entendido"
   },
   "messagePins": {
