@@ -321,6 +321,24 @@ describe('FileBrowser', () => {
     expect(width).toBeGreaterThanOrEqual(320);
   });
 
+  it('applies --sat safe-area top at most once across mobile fullscreen preview pane and header', () => {
+    const styles = readFileSync(resolve(__dirname, '../../src/styles.css'), 'utf8');
+    expect(styles).not.toMatch(/\.fb-body-split\s+\.fb-preview\s*\{[^}]*--sat/);
+
+    const allPreviewSatLines = styles
+      .split('\n')
+      .filter((line) => line.includes('.fb-preview') && (line.includes('--sat') || line.includes('safe-area-inset-top')));
+    expect(allPreviewSatLines).toHaveLength(1);
+    expect(allPreviewSatLines[0]).toContain('.fb-body-split .fb-preview > .fb-preview-header { padding-top: calc(7px + var(--sat)); }');
+
+    const fixedPreviewIdx = styles.indexOf('.fb-body-split .fb-preview { position: fixed; inset: 0;');
+    expect(fixedPreviewIdx).toBeGreaterThan(-1);
+    const previewMediaIdx = styles.lastIndexOf('@media (max-width: 640px)', fixedPreviewIdx);
+    const previewMediaBlock = styles.slice(previewMediaIdx, styles.indexOf('\n}\n', fixedPreviewIdx) + 3);
+    expect(previewMediaBlock).toContain('.fb-preview-header { flex-wrap: wrap; align-items: center; }');
+    expect(previewMediaBlock).toContain('.fb-body-split .fb-preview > .fb-preview-header { padding-top: calc(7px + var(--sat)); }');
+  });
+
   it('treats save-picker cancellation as a no-op before creating a download entry', async () => {
     const canceled = new DOMException('canceled', 'AbortError');
     directFileTransferMocks.selectPreviewDownloadDestination.mockRejectedValueOnce(canceled);

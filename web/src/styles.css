@@ -268,7 +268,6 @@ html {
 }
 /* Global: all fixed full-screen overlays respect iOS safe area (status bar/notch) */
 .dialog-overlay, .ask-dialog-overlay, .fb-overlay, .mobile-fb-overlay { padding-top: var(--sat); }
-@media (max-width: 640px) { .fb-body-split .fb-preview { padding-top: var(--sat); } }
 body {
   background: var(--chrome-bg);
   color: #e2e8f0;
@@ -9643,7 +9642,8 @@ html.native-ios-mac .chat-dl-btn {
   .fb-breadcrumb-seg.active { max-width: 16ch; }
   .fb-body-split > .fb-tree { display: none; }
   .fb-body-split .fb-preview { position: fixed; inset: 0; z-index: var(--mobile-fullscreen-preview-z); background: #0f172a; display: flex; flex-direction: column; width: 100%; height: 100%; }
-  .fb-preview-header { flex-wrap: wrap; align-items: center; padding-top: calc(7px + var(--sat)); }
+  .fb-preview-header { flex-wrap: wrap; align-items: center; }
+  .fb-body-split .fb-preview > .fb-preview-header { padding-top: calc(7px + var(--sat)); }
   .fb-preview-name { flex: 1 1 120px; }
   .fb-preview-actions { order: 3; flex: 1 1 100%; width: 100%; justify-content: flex-start; }
   .fb-preview-back { display: block; flex: 0 0 auto; }
