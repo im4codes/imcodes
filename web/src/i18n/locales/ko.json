@@ -2254,6 +2254,7 @@
     "push_servers_select_all": "전체 선택",
     "push_servers_clear": "지우기",
     "push_servers_empty": "이 계정에 연결된 서버가 없습니다.",
+    "push_servers_load_error": "서버 목록을 불러오지 못했습니다. 다시 시도해 주세요.",
     "push_server_role_daemon": "데몬",
     "push_server_role_controlled": "제어 노드",
     "push_server_online": "온라인",

@@ -2255,6 +2255,7 @@
     "push_servers_select_all": "全选",
     "push_servers_clear": "清空",
     "push_servers_empty": "当前账号下暂无服务器。",
+    "push_servers_load_error": "加载服务器列表失败，请重试。",
     "push_server_role_daemon": "主节点",
     "push_server_role_controlled": "受控节点",
     "push_server_online": "在线",

@@ -2254,6 +2254,7 @@
     "push_servers_select_all": "すべて選択",
     "push_servers_clear": "クリア",
     "push_servers_empty": "このアカウントにサーバーが見つかりません。",
+    "push_servers_load_error": "サーバー一覧の読み込みに失敗しました。再試行してください。",
     "push_server_role_daemon": "デーモン",
     "push_server_role_controlled": "制御ノード",
     "push_server_online": "オンライン",

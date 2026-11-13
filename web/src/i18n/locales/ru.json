@@ -2254,6 +2254,7 @@
     "push_servers_select_all": "Выбрать все",
     "push_servers_clear": "Очистить",
     "push_servers_empty": "Для этого аккаунта серверы не найдены.",
+    "push_servers_load_error": "Не удалось загрузить серверы. Попробуйте ещё раз.",
     "push_server_role_daemon": "Демон",
     "push_server_role_controlled": "Управляемый узел",
     "push_server_online": "В сети",

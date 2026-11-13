@@ -104,10 +104,24 @@ export function SettingsPage({
   );
   const [pushServers, setPushServers] = useState<PushServerItem[]>([]);
   const [pushServersLoading, setPushServersLoading] = useState(false);
+  const [pushServersError, setPushServersError] = useState(false);
 
   const userEditedPushRef = useRef(false);
   const userEditedPushServersRef = useRef(false);
-  const pushServersFetchedRef = useRef(false);
+  const mountedRef = useRef(true);
+  const pushServersLoadedRef = useRef(false);
+  const pushServersGenerationRef = useRef(0);
+  const pushServersAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      pushServersGenerationRef.current += 1;
+      pushServersAbortRef.current?.abort();
+      pushServersAbortRef.current = null;
+    };
+  }, []);
 
   useEffect(() => {
     let unmounted = false;
@@ -125,49 +139,74 @@ export function SettingsPage({
     };
   }, []);
 
-  useEffect(() => {
-    if (activeTab !== 'notifications' || pushServersFetchedRef.current) return;
-    pushServersFetchedRef.current = true;
-    let unmounted = false;
+  const loadPushServers = () => {
+    pushServersAbortRef.current?.abort();
+    const controller = new AbortController();
+    pushServersAbortRef.current = controller;
+    const gen = ++pushServersGenerationRef.current;
+
     setPushServersLoading(true);
-    void Promise.allSettled([
-      apiFetch<{ servers?: Array<{ id?: unknown; name?: unknown; status?: unknown }> }>('/api/server'),
-      apiFetch<{ machines?: Array<{ serverId?: unknown; displayName?: unknown; online?: unknown }> }>('/api/machines'),
+    setPushServersError(false);
+
+    void Promise.all([
+      apiFetch<{ servers?: Array<{ id?: unknown; name?: unknown; status?: unknown }> }>('/api/server', { signal: controller.signal }),
+      apiFetch<{ machines?: Array<{ serverId?: unknown; displayName?: unknown; online?: unknown }> }>('/api/machines', { signal: controller.signal }),
     ]).then(([serversRes, machinesRes]) => {
-      if (unmounted) return;
+      if (!mountedRef.current || controller.signal.aborted || gen !== pushServersGenerationRef.current) return;
+      if (!Array.isArray(serversRes?.servers) || !Array.isArray(machinesRes?.machines)) {
+        throw new Error('Invalid server list response');
+      }
       const merged = new Map<string, PushServerItem>();
-      if (serversRes.status === 'fulfilled' && Array.isArray(serversRes.value?.servers)) {
-        for (const srv of serversRes.value.servers) {
-          const id = typeof srv.id === 'string' ? srv.id.trim() : '';
-          if (!id) continue;
-          const name = typeof srv.name === 'string' && srv.name.trim() ? srv.name.trim() : id;
-          merged.set(id, {
-            id,
-            name,
-            kind: 'daemon',
-            online: srv.status === 'online',
-          });
-        }
+      for (const srv of serversRes.servers) {
+        const id = typeof srv.id === 'string' ? srv.id.trim() : '';
+        if (!id) continue;
+        const name = typeof srv.name === 'string' && srv.name.trim() ? srv.name.trim() : id;
+        merged.set(id, {
+          id,
+          name,
+          kind: 'daemon',
+          online: srv.status === 'online',
+        });
       }
-      if (machinesRes.status === 'fulfilled' && Array.isArray(machinesRes.value?.machines)) {
-        for (const machine of machinesRes.value.machines) {
-          const id = typeof machine.serverId === 'string' ? machine.serverId.trim() : '';
-          if (!id || merged.has(id)) continue;
-          const name = typeof machine.displayName === 'string' && machine.displayName.trim() ? machine.displayName.trim() : id;
-          merged.set(id, {
-            id,
-            name,
-            kind: 'controlled',
-            online: Boolean(machine.online),
-          });
-        }
+      for (const machine of machinesRes.machines) {
+        const id = typeof machine.serverId === 'string' ? machine.serverId.trim() : '';
+        if (!id || merged.has(id)) continue;
+        const name = typeof machine.displayName === 'string' && machine.displayName.trim() ? machine.displayName.trim() : id;
+        merged.set(id, {
+          id,
+          name,
+          kind: 'controlled',
+          online: Boolean(machine.online),
+        });
       }
+      pushServersLoadedRef.current = true;
       setPushServers([...merged.values()]);
+      setPushServersError(false);
+    }).catch(() => {
+      if (!mountedRef.current || controller.signal.aborted || gen !== pushServersGenerationRef.current) return;
+      setPushServersError(true);
     }).finally(() => {
-      if (!unmounted) setPushServersLoading(false);
+      if (!mountedRef.current || gen !== pushServersGenerationRef.current) return;
+      if (pushServersAbortRef.current === controller) {
+        pushServersAbortRef.current = null;
+      }
+      setPushServersLoading(false);
     });
+  };
+
+  useEffect(() => {
+    if (activeTab !== 'notifications' || pushServersLoadedRef.current) return;
+    loadPushServers();
     return () => {
-      unmounted = true;
+      // Only cancel in-flight requests if leaving before a full authoritative snapshot completed.
+      if (!pushServersLoadedRef.current) {
+        pushServersGenerationRef.current += 1;
+        pushServersAbortRef.current?.abort();
+        pushServersAbortRef.current = null;
+        if (mountedRef.current) {
+          setPushServersLoading(false);
+        }
+      }
     };
   }, [activeTab]);
 
@@ -734,6 +773,18 @@ export function SettingsPage({
 
                 {pushServersLoading && pushServers.length === 0 ? (
                   <div style={{ color: '#94a3b8', fontSize: '13px' }}>{t('common.loading')}</div>
+                ) : pushServersError && pushServers.length === 0 ? (
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px' }}>
+                    <span style={{ color: '#f87171', fontSize: '13px' }}>{t('settings.push_servers_load_error')}</span>
+                    <button
+                      type="button"
+                      class="settings-btn-secondary"
+                      style={{ minHeight: '32px', padding: '6px 12px', fontSize: '12px' }}
+                      onClick={loadPushServers}
+                    >
+                      {t('common.retry')}
+                    </button>
+                  </div>
                 ) : pushServers.length === 0 ? (
                   <div style={{ color: '#94a3b8', fontSize: '13px' }}>{t('settings.push_servers_empty')}</div>
                 ) : (

@@ -2255,6 +2255,7 @@
     "push_servers_select_all": "Seleccionar todo",
     "push_servers_clear": "Limpiar",
     "push_servers_empty": "No se encontraron servidores para esta cuenta.",
+    "push_servers_load_error": "No se pudieron cargar los servidores. Inténtalo de nuevo.",
     "push_server_role_daemon": "Daemon",
     "push_server_role_controlled": "Nodo controlado",
     "push_server_online": "En línea",

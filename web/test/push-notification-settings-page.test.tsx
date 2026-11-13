@@ -68,6 +68,8 @@ vi.mock('react-i18next', () => ({
         'settings.push_servers_select_all': 'Select All',
         'settings.push_servers_clear': 'Clear',
         'settings.push_servers_empty': 'No servers found for this account.',
+        'settings.push_servers_load_error': 'Failed to load servers. Please try again.',
+        'common.retry': 'Retry',
         'settings.push_server_role_daemon': 'Daemon',
         'settings.push_server_role_controlled': 'Controlled Node',
         'settings.push_server_online': 'Online',
@@ -360,5 +362,246 @@ describe('SettingsPage push notification settings', () => {
       expect(postCalls.length).toBe(1);
       expect(JSON.parse((postCalls[0][1] as { body: string }).body)).toEqual({ enabledServerIds: ['srv-1'] });
     });
+  });
+
+  it('recovers when switching tabs during in-flight load (old resolves before return) and caches after completion', async () => {
+    let resolveServer1: (val: unknown) => void;
+    let resolveMachines1: (val: unknown) => void;
+    let serverCallCount = 0;
+
+    apiFetchMock.mockImplementation((path: string) => {
+      if (path === '/api/push/preferences') {
+        return Promise.resolve({
+          ok: true,
+          types: DEFAULT_PUSH_NOTIFICATION_TYPES,
+          enabledServerIds: null,
+        });
+      }
+      if (path === '/api/server') {
+        serverCallCount++;
+        if (serverCallCount === 1) {
+          return new Promise((resolve) => { resolveServer1 = resolve; });
+        }
+        return Promise.resolve({ servers: [{ id: 'srv-1', name: 'Office Mac', status: 'online' }] });
+      }
+      if (path === '/api/machines') {
+        if (serverCallCount === 1) {
+          return new Promise((resolve) => { resolveMachines1 = resolve; });
+        }
+        return Promise.resolve({ machines: [] });
+      }
+      return Promise.resolve({ ok: true });
+    });
+
+    render(
+      <SettingsPage
+        displayName="Ada Lovelace"
+        username="ada"
+        hasPassword={true}
+        initialTab="profile"
+        onBack={vi.fn()}
+        onDisplayNameChanged={vi.fn()}
+        onUserAuthUpdated={vi.fn()}
+      />,
+    );
+
+    // Enter Notifications -> immediately leave to Profile before responses arrive
+    fireEvent.click(screen.getByRole('tab', { name: 'Notifications' }));
+    await waitFor(() => expect(serverCallCount).toBe(1));
+    fireEvent.click(screen.getByRole('tab', { name: 'Profile' }));
+
+    // In-flight first requests finish while on Profile
+    resolveServer1!({ servers: [{ id: 'srv-1', name: 'Office Mac', status: 'online' }] });
+    resolveMachines1!({ machines: [] });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Return to Notifications -> must not get stuck loading; checkbox renders
+    fireEvent.click(screen.getByRole('tab', { name: 'Notifications' }));
+    const officeCb = await screen.findByLabelText('Office Mac') as HTMLInputElement;
+    expect(officeCb.checked).toBe(true);
+    const callsAfterLoaded = serverCallCount;
+
+    // Once loaded, normal tab switching retains cached list without redundant fetches
+    fireEvent.click(screen.getByRole('tab', { name: 'Profile' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Notifications' }));
+    expect(await screen.findByLabelText('Office Mac')).toBeDefined();
+    expect(serverCallCount).toBe(callsAfterLoaded);
+  });
+
+  it('ignores stale earlier request settling after a newer request completes on tab return', async () => {
+    let resolveServer1: (val: unknown) => void;
+    let rejectMachines1: (err: unknown) => void;
+    let resolveServer2: (val: unknown) => void;
+    let resolveMachines2: (val: unknown) => void;
+    let serverCallCount = 0;
+
+    apiFetchMock.mockImplementation((path: string) => {
+      if (path === '/api/push/preferences') {
+        return Promise.resolve({
+          ok: true,
+          types: DEFAULT_PUSH_NOTIFICATION_TYPES,
+          enabledServerIds: null,
+        });
+      }
+      if (path === '/api/server') {
+        serverCallCount++;
+        return new Promise((resolve) => {
+          if (serverCallCount === 1) resolveServer1 = resolve;
+          else resolveServer2 = resolve;
+        });
+      }
+      if (path === '/api/machines') {
+        return new Promise((resolve, reject) => {
+          if (serverCallCount === 1) rejectMachines1 = reject;
+          else resolveMachines2 = resolve;
+        });
+      }
+      return Promise.resolve({ ok: true });
+    });
+
+    render(
+      <SettingsPage
+        displayName="Ada Lovelace"
+        username="ada"
+        hasPassword={true}
+        initialTab="notifications"
+        onBack={vi.fn()}
+        onDisplayNameChanged={vi.fn()}
+        onUserAuthUpdated={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(serverCallCount).toBe(1));
+
+    // Leave before req 1 settles, then immediately return -> starts req 2 while req 1 is still pending
+    fireEvent.click(screen.getByRole('tab', { name: 'Profile' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Notifications' }));
+    await waitFor(() => expect(serverCallCount).toBe(2));
+
+    // Req 2 completes first with 2 servers
+    resolveServer2!({
+      servers: [
+        { id: 'srv-1', name: 'Fresh One', status: 'online' },
+        { id: 'srv-2', name: 'Fresh Two', status: 'online' },
+      ],
+    });
+    resolveMachines2!({ machines: [] });
+
+    const cb1 = await screen.findByLabelText('Fresh One') as HTMLInputElement;
+    const cb2 = screen.getByLabelText('Fresh Two') as HTMLInputElement;
+    expect(cb1.checked).toBe(false);
+    expect(cb2.checked).toBe(false);
+
+    // Hung stale req 1 later resolves/rejects -> must NOT clobber req 2's result or trigger error/loading
+    resolveServer1!({ servers: [{ id: 'srv-stale', name: 'Stale Only', status: 'online' }] });
+    rejectMachines1!(new Error('stale timeout'));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(screen.getByLabelText('Fresh One')).toBeDefined();
+    expect(screen.queryByLabelText('Stale Only')).toBeNull();
+    expect(screen.queryByText('Failed to load servers. Please try again.')).toBeNull();
+  });
+
+  it('shows error without partial single-server auto-opt-in on partial source failure, and recovers via Retry and tab re-entry', async () => {
+    let phase = 1;
+    apiFetchMock.mockImplementation((path: string) => {
+      if (path === '/api/push/preferences') {
+        return Promise.resolve({
+          ok: true,
+          types: DEFAULT_PUSH_NOTIFICATION_TYPES,
+          enabledServerIds: null,
+        });
+      }
+      if (path === '/api/server') {
+        return Promise.resolve({
+          servers: [{ id: 'srv-1', name: 'Sole Daemon', status: 'online' }],
+        });
+      }
+      if (path === '/api/machines') {
+        if (phase === 1 || phase === 2) {
+          return Promise.reject(new Error('machines endpoint unavailable'));
+        }
+        return Promise.resolve({
+          machines: [{ serverId: 'ctrl-1', displayName: 'Controlled Box', online: true }],
+        });
+      }
+      return Promise.resolve({ ok: true });
+    });
+
+    render(
+      <SettingsPage
+        displayName="Ada Lovelace"
+        username="ada"
+        hasPassword={true}
+        initialTab="notifications"
+        onBack={vi.fn()}
+        onDisplayNameChanged={vi.fn()}
+        onUserAuthUpdated={vi.fn()}
+      />,
+    );
+
+    // Partial failure (/api/server succeeded with 1, /api/machines failed) -> must show error, NOT Sole Daemon checked!
+    expect(await screen.findByText('Failed to load servers. Please try again.')).toBeDefined();
+    expect(screen.queryByLabelText('Sole Daemon')).toBeNull();
+
+    // Retry still fails in phase 2 -> remains recoverable
+    phase = 2;
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    expect(await screen.findByText('Failed to load servers. Please try again.')).toBeDefined();
+
+    // Leaving and re-entering in phase 3 auto-retries and loads both sources cleanly (2 servers -> unchecked under NULL)
+    phase = 3;
+    fireEvent.click(screen.getByRole('tab', { name: 'Profile' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Notifications' }));
+
+    const daemonCb = await screen.findByLabelText('Sole Daemon') as HTMLInputElement;
+    const controlledCb = screen.getByLabelText('Controlled Box') as HTMLInputElement;
+    expect(daemonCb.checked).toBe(false);
+    expect(controlledCb.checked).toBe(false);
+
+    // Now test explicit Retry button recovery after initial failure as well
+    cleanup();
+    localStorage.clear();
+    resetPushNotificationPreferencesStateForTesting();
+    let failFirst = true;
+    apiFetchMock.mockImplementation((path: string) => {
+      if (path === '/api/push/preferences') {
+        return Promise.resolve({
+          ok: true,
+          types: DEFAULT_PUSH_NOTIFICATION_TYPES,
+          enabledServerIds: null,
+        });
+      }
+      if (path === '/api/server') {
+        return Promise.resolve({ servers: [{ id: 'srv-retry', name: 'Recovered Node', status: 'online' }] });
+      }
+      if (path === '/api/machines') {
+        if (failFirst) {
+          failFirst = false;
+          return Promise.reject(new Error('transient outage'));
+        }
+        return Promise.resolve({ machines: [] });
+      }
+      return Promise.resolve({ ok: true });
+    });
+
+    render(
+      <SettingsPage
+        displayName="Ada Lovelace"
+        username="ada"
+        hasPassword={true}
+        initialTab="notifications"
+        onBack={vi.fn()}
+        onDisplayNameChanged={vi.fn()}
+        onUserAuthUpdated={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText('Failed to load servers. Please try again.')).toBeDefined();
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    const recoveredCb = await screen.findByLabelText('Recovered Node') as HTMLInputElement;
+    expect(recoveredCb.checked).toBe(true);
   });
 });
