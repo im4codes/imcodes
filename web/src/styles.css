@@ -16659,6 +16659,8 @@ button.quick-agent-delegation-preset.active {
 
   .guide-title {
     font-size: 20px;
+  }
+}
 
 /* Dashboard layout, segmented tabs, dark cards, and responsive API Key manager */
 .dashboard-page {
