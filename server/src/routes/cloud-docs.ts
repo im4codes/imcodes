@@ -56,6 +56,7 @@ import {
   normalizeCloudDocName,
   normalizeRecentFilePath,
 } from '../../../shared/cloud-docs.js';
+import { FS_GENERIC_ERROR_CODES } from '../../../shared/fs-error-codes.js';
 
 type RouteContext = Context<{ Bindings: Env; Variables: { userId: string; role: string } }>;
 
@@ -171,7 +172,7 @@ export function verifyCloudDocDownloadTicket(
 
 class PayloadTooLargeError extends Error {
   constructor() {
-    super('file_too_large');
+    super(FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE);
     this.name = 'PayloadTooLargeError';
   }
 }
@@ -605,7 +606,7 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
     const maxMultipartBytes = CLOUD_DOCS_MAX_UPLOAD_BYTES + 1024 * 1024;
     const rawLength = Number(c.req.header('Content-Length') ?? '0');
     if (Number.isFinite(rawLength) && rawLength > maxMultipartBytes) {
-      return c.json({ error: 'file_too_large', maxBytes: CLOUD_DOCS_MAX_UPLOAD_BYTES }, 413);
+      return c.json({ error: FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE, maxBytes: CLOUD_DOCS_MAX_UPLOAD_BYTES }, 413);
     }
 
     let form: FormData;
@@ -625,7 +626,7 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
       }
     } catch (err) {
       if (err instanceof PayloadTooLargeError) {
-        return c.json({ error: 'file_too_large', maxBytes: CLOUD_DOCS_MAX_UPLOAD_BYTES }, 413);
+        return c.json({ error: FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE, maxBytes: CLOUD_DOCS_MAX_UPLOAD_BYTES }, 413);
       }
       return c.json({ error: 'invalid_multipart' }, 400);
     }
@@ -636,7 +637,7 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
     }
     const uploadedFile = fileEntry as File;
     if (uploadedFile.size > CLOUD_DOCS_MAX_UPLOAD_BYTES) {
-      return c.json({ error: 'file_too_large', maxBytes: CLOUD_DOCS_MAX_UPLOAD_BYTES }, 413);
+      return c.json({ error: FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE, maxBytes: CLOUD_DOCS_MAX_UPLOAD_BYTES }, 413);
     }
 
     const rawFolderId = form.get('folderId');
@@ -671,7 +672,7 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
     const arrayBuf = await uploadedFile.arrayBuffer();
     const bytes = Buffer.from(arrayBuf);
     if (bytes.length > CLOUD_DOCS_MAX_UPLOAD_BYTES) {
-      return c.json({ error: 'file_too_large', maxBytes: CLOUD_DOCS_MAX_UPLOAD_BYTES }, 413);
+      return c.json({ error: FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE, maxBytes: CLOUD_DOCS_MAX_UPLOAD_BYTES }, 413);
     }
 
     const docId = `cdoc_${randomUUID().replace(/-/g, '').slice(0, 20)}`;
@@ -863,7 +864,7 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
       bytes = await readResponseBytesBounded(docRes, CLOUD_DOCS_MAX_UPLOAD_BYTES, downloadController);
     } catch (err) {
       if (err instanceof PayloadTooLargeError) {
-        return c.json({ error: 1, message: 'file_too_large' }, 413);
+        return c.json({ error: 1, message: FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE }, 413);
       }
       return c.json({ error: 1, message: 'failed_to_download_edited_file' }, 502);
     }

@@ -6,6 +6,7 @@ import {
   CLOUD_DOCS_DEFAULT_DIR,
   CLOUD_DOCS_MAX_UPLOAD_BYTES,
 } from '../../../shared/cloud-docs.js';
+import { FS_GENERIC_ERROR_CODES } from '../../../shared/fs-error-codes.js';
 
 export interface CloudDocWriteResult {
   sizeBytes: number;
@@ -64,7 +65,7 @@ export class LocalCloudDocStorage implements CloudDocStorage {
 
   async write(storageKey: string, bytes: Buffer): Promise<CloudDocWriteResult> {
     if (bytes.length > CLOUD_DOCS_MAX_UPLOAD_BYTES) {
-      throw new Error('file_too_large');
+      throw new Error(FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE);
     }
     const targetPath = this.resolveSafePath(storageKey);
     const dir = path.dirname(targetPath);
