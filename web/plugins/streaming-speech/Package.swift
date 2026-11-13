@@ -52,10 +52,16 @@ let package = Package(
                 "README.md",
                 "ios/Sources/AudioCommon",
                 "ios/Sources/MLXCommon",
-                "ios/Sources/Qwen3ASR"
+                "ios/Sources/Qwen3ASR",
+                "ios/Tests"
             ],
             sources: ["ios/Sources/StreamingSpeechPlugin"],
             resources: [.copy("ios-models")]
+        ),
+        .testTarget(
+            name: "StreamingSpeechPluginTests",
+            dependencies: ["StreamingSpeechPlugin"],
+            path: "ios/Tests/StreamingSpeechPluginTests"
         )
     ]
 )

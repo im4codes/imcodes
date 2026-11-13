@@ -178,6 +178,11 @@ describe('Qwen3-ASR mobile assets', () => {
     }
     expect(ios).toContain('static let limit = 16000 * 320 / 10');
     expect(ios).toContain('static let warmupSamples = 320');
+    expect(ios).toContain('mode: .spokenAudio, options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth]');
+    expect(ios).not.toContain('mode: .measurement');
+    expect(ios).toContain('session.isInputGainSettable');
+    expect(ios).toContain('try? session.setInputGain(1.0)');
+    expect(ios).toContain('struct SpeechGain');
     expect(ios).toContain('options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth]');
     expect(ios).not.toContain('.duckOthers');
     expect(ios).toContain('if warming && inbox.warmupRemaining == 0');
@@ -976,6 +981,65 @@ do {
     require(evs.contains(.final("t:\\(seenPrefixes[4].count + 3)")), "K: missing expected final: \\(evs)")
     print("COORDINATOR_PREFIX_ROLLBACK:PASS")
 }
+
+// 2L. SpeechGain + SpeechInbox adaptive quiet-speech gain, soft-knee limiting & noise-floor VAD
+do {
+    func sinePCM(_ count: Int, rms: Float) -> [Float] {
+        let peak = rms * sqrt(2.0)
+        return (0..<count).map { i in peak * sin(2.0 * .pi * 220.0 * Float(i) / 16000.0) }
+    }
+
+    // Quiet speech (RMS 0.0025 < old 0.00333 floor) amplifies without clipping and opens VAD.
+    var gain = SpeechGain()
+    let quiet = sinePCM(1600, rms: 0.0025)
+    let g1 = gain.process(quiet)
+    require(g1.boostedRMS >= g1.rawRMS * 4.0, "L: quiet speech chunk1 not boosted: \\(g1.boostedRMS) vs \\(g1.rawRMS)")
+    require(g1.samples.allSatisfy { $0 > -1.0 && $0 < 1.0 }, "L: quiet speech chunk1 clipped")
+    let g2 = gain.process(quiet)
+    require(g2.boostedRMS >= 0.015 && gain.currentGain <= SpeechGain.maxGain, "L: quiet speech chunk2 gain unexpected: rms=\\(g2.boostedRMS) gain=\\(gain.currentGain)")
+
+    // Loud burst immediately after high gain stays strictly inside (-1.0, 1.0) without hard clipping.
+    let loud = sinePCM(1600, rms: 0.85)
+    let gLoud = gain.process(loud)
+    require(gLoud.samples.allSatisfy { $0 > -1.0 && $0 < 1.0 }, "L: loud burst hard clipped")
+    require(gain.currentGain <= 1.5, "L: gain failed fast downward attack: \\(gain.currentGain)")
+
+    // Cold-start pure silence and ultra-low noise floor stay unboosted and unvoiced.
+    var inbox = SpeechInbox()
+    _ = try! inbox.offer([Float](repeating: 0, count: SpeechInbox.warmupSamples))
+    let noise = sinePCM(1600, rms: 0.0003)
+    _ = try! inbox.offer(noise)
+    require(!inbox.lastVoiced, "L: ultra-low noise triggered voiced")
+    let noiseBatch = inbox.take()!
+    require(!noiseBatch.speech && noiseBatch.trailingSilence == noise.count, "L: noise marked as speech")
+    require(SpeechGain.rms(noiseBatch.samples) <= 0.0004, "L: noise floor was wildly amplified")
+
+    // Quiet speech in inbox opens VAD, emits visible audioLevel, and trailing ambient floor releases VAD.
+    _ = try! inbox.offer(quiet)
+    require(inbox.lastVoiced, "L: quiet speech failed VAD onset")
+    let quietLevel = inbox.pollAudioLevel(now: 0.1)
+    require((quietLevel ?? 0) > 0.015, "L: quiet audioLevel too weak for equalizer: \\(String(describing: quietLevel))")
+    let quietBatch = inbox.take()!
+    require(quietBatch.speech && quietBatch.trailingSilence == 0, "L: quiet speech batch not marked voiced")
+
+    _ = try! inbox.offer(sinePCM(1600, rms: 0.0004))
+    require(!inbox.lastVoiced, "L: ambient hum stayed voiced after speech")
+
+    // Coordinator captures quiet speech (RMS 0.0025) cleanly without dropping initial audio.
+    let (coord, q, events) = makeHarness()
+    let owner = coord.beginStart(makeDecode: { SpeechCoordinator.Decoder { s, _, cont in cont() ? ("q:\\(s.count)", []) : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
+    coord.offerSamples(speech(320), owner: owner, now: 0.01) {}
+    coord.offerSamples(sinePCM(3200, rms: 0.0025), owner: owner, now: 0.10) {}
+    q.sync {}
+    let ack = DispatchSemaphore(value: 0)
+    var err: String? = "unset"
+    coord.endCapture(stopCompletion: { e in err = e; ack.signal() }, stopAudio: {})
+    require(ack.wait(timeout: .now() + 2) == .success && err == nil, "L: coordinator quiet capture failed")
+    let evs = events()
+    require(evs.contains(.final("q:6400")), "L: quiet speech dropped before final: \\(evs)")
+    require(evs.contains { if case .audioLevel(let lvl) = $0 { return lvl > 0.015 }; return false }, "L: missing responsive audioLevel event: \\(evs)")
+    print("SPEECH_GAIN_AND_INBOX_VAD:PASS")
+}
 `);
   execFileSync(swiftCompiler!, ['-swift-version', '5', file, '-o', executable], { encoding: 'utf8', timeout: 60000 });
   const result = execFileSync(executable, [emptyDir, biasedDir], { encoding: 'utf8', timeout: 20000 });
@@ -992,6 +1056,7 @@ do {
     'IN_FLIGHT_CONVERSION_FAIL_AT_STOP',
     'OLD_IN_FLIGHT_ISOLATED_FROM_NEW_OWNER',
     'COORDINATOR_PREFIX_ROLLBACK',
+    'SPEECH_GAIN_AND_INBOX_VAD',
   ]) {
     expect(result).toContain(name + ':PASS');
   }
@@ -1516,12 +1581,13 @@ func run() throws {
     var inbox = SpeechInbox()
     check(!(try inbox.offer(pcm(160))), "warmup scheduled decode")
     check(!(try inbox.offer(pcm(160))), "warmup not exactly 20ms")
-    check(try inbox.offer([1, 2, 3]), "first PCM did not schedule")
-    check(!(try inbox.offer([4, 5])), "duplicate drain scheduled")
-    check(inbox.take()?.samples == [1, 2, 3, 4, 5] && inbox.pending.isEmpty, "drain left backlog")
-    check(!(try inbox.offer([6])), "in-flight drain scheduled a duplicate")
-    check(inbox.take()?.samples == [6] && inbox.take() == nil, "in-flight PCM lost")
-    check(try inbox.offer([7]), "empty drain did not rearm")
+    check(try inbox.offer([0.1, 0.2, 0.3]), "first PCM did not schedule")
+    check(!(try inbox.offer([0.4, 0.5])), "duplicate drain scheduled")
+    let drained = inbox.take()
+    check(drained?.samples.count == 5 && drained?.samples.allSatisfy { $0 > -1.0 && $0 < 1.0 } == true && inbox.pending.isEmpty, "drain left backlog")
+    check(!(try inbox.offer([0.6])), "in-flight drain scheduled a duplicate")
+    check(inbox.take()?.samples.count == 1 && inbox.take() == nil, "in-flight PCM lost")
+    check(try inbox.offer([0.7]), "empty drain did not rearm")
     print("ZERO_LAG:PASS")
     print("WARMUP:PASS")
 
@@ -1530,15 +1596,15 @@ func run() throws {
     check(levelInbox.pollAudioLevel(now: 0.0) == nil, "audioLevel emitted during first warmup half")
     _ = try levelInbox.offer(pcm(160))
     check(levelInbox.pollAudioLevel(now: 0.01) == nil, "audioLevel emitted on exact warmup completion without post-warmup samples")
-    _ = try levelInbox.offer(pcm(320))
+    _ = try levelInbox.offer(Array(repeating: 0.0025, count: 320))
     let firstLevel = levelInbox.pollAudioLevel(now: 0.05)
-    check(firstLevel != nil && abs(firstLevel! - 0.3) < 0.001, "first post-warmup audioLevel inaccurate: \\(String(describing: firstLevel))")
+    check(firstLevel != nil && firstLevel! > 0.015 && firstLevel! < 0.2, "first quiet post-warmup audioLevel out of range: \\(String(describing: firstLevel))")
     _ = try levelInbox.offer(Array(repeating: 0.2, count: 320))
     check(levelInbox.pollAudioLevel(now: 0.07) == nil, "audioLevel not throttled at +20ms")
     _ = try levelInbox.offer(Array(repeating: 0.2, count: 320))
     check(levelInbox.pollAudioLevel(now: 0.099) == nil, "audioLevel not throttled at +49ms")
     let secondLevel = levelInbox.pollAudioLevel(now: 0.10)
-    check(secondLevel != nil && abs(secondLevel! - 0.6) < 0.001, "throttled audioLevel did not emit at +50ms: \\(String(describing: secondLevel))")
+    check(secondLevel != nil && abs(secondLevel! - 0.8) < 0.05, "throttled audioLevel did not emit at +50ms: \\(String(describing: secondLevel))")
     check(levelInbox.pollAudioLevel(now: 0.20) == nil, "duplicate audioLevel emitted without new samples")
     _ = try levelInbox.offer(Array(repeating: 0.8, count: 320))
     let clampedLevel = levelInbox.pollAudioLevel(now: 0.20)
