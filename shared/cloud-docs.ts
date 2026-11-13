@@ -12,6 +12,10 @@ export const CLOUD_DOC_CONTENT_MAX_CHARS = 512 * 1024; // 512 KiB readable text 
 export const CLOUD_DOC_ZIP_MAX_ENTRIES = 256;
 export const CLOUD_DOC_ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES = 10 * 1024 * 1024; // 10 MiB
 export const CLOUD_DOC_ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 32 * 1024 * 1024; // 32 MiB
+export const CLOUD_DOC_OOXML_MAX_COL_INDEX = 16_383; // Excel XFD (3 letters max)
+export const CLOUD_DOC_OOXML_MAX_ROW_COLS = 1024;
+export const CLOUD_DOC_OOXML_MAX_CELLS = 50_000;
+export const CLOUD_DOC_OOXML_MAX_PARAGRAPHS = 50_000;
 
 export const CLOUD_DOC_BLANK_TYPES = ['docx', 'xlsx', 'pptx'] as const;
 export type CloudDocBlankType = (typeof CLOUD_DOC_BLANK_TYPES)[number];

@@ -316,8 +316,35 @@ function createInMemoryCloudDocsDb() {
           err.code = '22P02';
           throw err;
         }
-        const [storage_key, size_bytes, content_sha256, doc_version, updated_at, id, userId, expectedVersion] =
-          params as [string, number, string, number, number, string, string, number];
+        const [
+          storage_key,
+          size_bytes,
+          content_sha256,
+          doc_version,
+          updated_at,
+          id,
+          userId,
+          expectedVersion,
+          nextName,
+          nextExt,
+          nextMimeType,
+          hasFolderId,
+          nextFolderId,
+        ] = params as [
+          string,
+          number,
+          string,
+          number,
+          number,
+          string,
+          string,
+          number,
+          string | null | undefined,
+          string | null | undefined,
+          string | null | undefined,
+          boolean | undefined,
+          string | null | undefined,
+        ];
         const row = docs.get(id);
         if (!row || row.user_id !== userId || Number(row.doc_version) !== expectedVersion) {
           return null;
@@ -327,9 +354,26 @@ function createInMemoryCloudDocsDb() {
         row.content_sha256 = content_sha256;
         row.doc_version = doc_version;
         row.updated_at = updated_at;
+        if (typeof nextName === 'string') row.name = nextName;
+        if (typeof nextExt === 'string') row.ext = nextExt;
+        if (typeof nextMimeType === 'string') row.mime_type = nextMimeType;
+        if (hasFolderId === true) row.folder_id = nextFolderId ?? null;
         if (mode === 'ambiguous') {
           throw new Error('simulated_post_commit_returning_failure');
         }
+        return { ...row } as unknown as T;
+      }
+
+      if (s.startsWith('UPDATE cloud_docs SET name = $1')) {
+        const [name, ext, mime_type, folder_id, updated_at, id, userId, expectedVersion] =
+          params as [string, string, string, string | null, number, string, string, number];
+        const row = docs.get(id);
+        if (!row || row.user_id !== userId || Number(row.doc_version) !== expectedVersion) return null;
+        row.name = name;
+        row.ext = ext;
+        row.mime_type = mime_type;
+        row.folder_id = folder_id;
+        row.updated_at = updated_at;
         return { ...row } as unknown as T;
       }
 
@@ -1823,5 +1867,81 @@ describe('cloud docs & recent documents', () => {
     });
     expect(writePdfRes.status).toBe(400);
     expect((await writePdfRes.json()).error).toBe('unsupported_content_edit');
+
+    // F1 causal test: DB rows returning string doc_version (e.g. pg driver numeric/bigint coercion)
+    // normalize cleanly without string concatenation ('1' + 1 -> '11') or false 409 conflicts.
+    const rawRow = memDb.docs.get(xlsxDoc.id)!;
+    (rawRow as unknown as { doc_version: string | number }).doc_version = '2';
+    const staleWithStringRow = await app.request(`/api/cloud-docs/${xlsxDoc.id}/content`, {
+      method: 'PUT',
+      headers: { ...ownerDaemon, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'conflict', mode: 'replace', expectedVersion: 1 }),
+    });
+    expect(staleWithStringRow.status).toBe(409);
+    expect(await staleWithStringRow.json()).toEqual({ error: 'version_conflict', currentVersion: 2 });
+
+    const validWithStringRow = await app.request(`/api/cloud-docs/${xlsxDoc.id}/content`, {
+      method: 'PUT',
+      headers: { ...ownerDaemon, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'UpdatedRow\t99', mode: 'replace', expectedVersion: 2 }),
+    });
+    expect(validWithStringRow.status).toBe(200);
+    expect((await validWithStringRow.json()).doc.docVersion).toBe(3);
+
+    // F4 causal test: combined PUT /content + metadata rejects atomically when metadata/ACL fails
+    const folderRes = await app.request('/api/cloud-docs/folders', {
+      method: 'POST',
+      headers: { ...ownerDaemon, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'TargetFolder' }),
+    });
+    const targetFolderId = (await folderRes.json()).folder.id as string;
+    await app.request('/api/cloud-docs/shares', {
+      method: 'POST',
+      headers: { ...ownerDaemon, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ targetKind: 'doc', targetId: xlsxDoc.id, granteeType: 'user', granteeId: 'u-alice', role: 'editor' }),
+    });
+    const aliceShared = {
+      ...ownerDaemon,
+      [SHARED_MACHINE_AUTHORITY_HEADER]: mintParticipantAuthority('u-alice'),
+    };
+
+    // Participant editor attempts combined content append + move to root (folderId: null, forbidden to non-owner)
+    const filesCountBeforeReject = fs.readdirSync(tmpDir, { recursive: true }).length;
+    const forbiddenCombo = await app.request(`/api/cloud-docs/${xlsxDoc.id}/content`, {
+      method: 'PUT',
+      headers: { ...aliceShared, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        content: 'SHOULD_NOT_WRITE',
+        mode: 'append',
+        name: 'HijackedName',
+        folderId: null,
+        expectedVersion: 3,
+      }),
+    });
+    expect(forbiddenCombo.status).toBe(403);
+    expect(Number(memDb.docs.get(xlsxDoc.id)?.doc_version)).toBe(3);
+    expect(memDb.docs.get(xlsxDoc.id)?.name).toBe('Budget.xlsx');
+    expect(fs.readdirSync(tmpDir, { recursive: true }).length).toBe(filesCountBeforeReject);
+    const readAfterReject = await app.request(`/api/cloud-docs/${xlsxDoc.id}/content`, { headers: ownerDaemon });
+    expect((await readAfterReject.json()).content).not.toContain('SHOULD_NOT_WRITE');
+
+    // Owner combined edit updates content + name + folderId atomically with one version bump
+    const okCombo = await app.request(`/api/cloud-docs/${xlsxDoc.id}/content`, {
+      method: 'PUT',
+      headers: { ...ownerDaemon, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        content: 'CombinedRow\t55',
+        mode: 'append',
+        name: 'BudgetFinal',
+        folderId: targetFolderId,
+        expectedVersion: 3,
+      }),
+    });
+    expect(okCombo.status).toBe(200);
+    expect((await okCombo.json()).doc).toMatchObject({
+      docVersion: 4,
+      name: 'BudgetFinal.xlsx',
+      folderId: targetFolderId,
+    });
   });
 });

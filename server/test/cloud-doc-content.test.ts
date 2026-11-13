@@ -7,7 +7,12 @@ import {
   extractZipEntries,
 } from '../src/services/cloud-doc-content.js';
 import { buildZipArchive } from '../src/routes/onlyoffice.js';
-import { CLOUD_DOC_CONTENT_MAX_CHARS, CLOUD_DOC_ERROR_CODES } from '../../shared/cloud-docs.js';
+import {
+  CLOUD_DOC_CONTENT_MAX_CHARS,
+  CLOUD_DOC_ERROR_CODES,
+  CLOUD_DOC_OOXML_MAX_PARAGRAPHS,
+  CLOUD_DOC_OOXML_MAX_ROW_COLS,
+} from '../../shared/cloud-docs.js';
 
 describe('cloud-doc-content OOXML & text service', () => {
   it('round-trips DOCX paragraphs with XML entities and control-char sanitization', () => {
@@ -164,5 +169,182 @@ describe('cloud-doc-content OOXML & text service', () => {
     expect(() => extractZipEntries(zipBomb, { maxEntryBytes: 16 * 1024, maxTotalBytes: 16 * 1024 })).toThrowError(
       /exceeds size (limit|budget)/,
     );
+  });
+
+  it('rejects absurd XLSX sparse column references and bounds sheets/slides under maxChars truncation and builder caps', () => {
+    for (const badRef of ['ZZZZZZZZ1', 'XFD1']) {
+      const badXlsx = buildZipArchive([
+        {
+          name: 'xl/worksheets/sheet1.xml',
+          content:
+            '<?xml version="1.0" encoding="UTF-8"?>' +
+            `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="${badRef}" t="n"><v>1</v></c></row></sheetData></worksheet>`,
+        },
+      ]);
+      expect(() => extractCloudDocContent('.xlsx', badXlsx)).toThrowError(
+        expect.objectContaining({ code: CLOUD_DOC_ERROR_CODES.CONTENT_TOO_LARGE, statusCode: 413 }),
+      );
+    }
+
+    const hugeCellXlsx = buildCloudDocBytesFromContent(
+      '.xlsx',
+      `## Sheet: First\n${'X'.repeat(1000)}\tExtra\n\n## Sheet: Second\nSkipped`,
+    );
+    const truncXlsx = extractCloudDocContent('.xlsx', hugeCellXlsx, 16);
+    expect(truncXlsx.truncated).toBe(true);
+    expect(truncXlsx.content.length).toBeLessThanOrEqual(16);
+    expect(truncXlsx.sheets).toHaveLength(1);
+    expect(truncXlsx.sheets?.[0].rows[0][0].length).toBeLessThanOrEqual(16);
+
+    const hugeSlidePptx = buildCloudDocBytesFromContent(
+      '.pptx',
+      `--- Slide 1 ---\n${'Y'.repeat(1000)}\nSecond line\n\n--- Slide 2 ---\nLater`,
+    );
+    const truncPptx = extractCloudDocContent('.pptx', hugeSlidePptx, 16);
+    expect(truncPptx.truncated).toBe(true);
+    expect(truncPptx.content.length).toBeLessThanOrEqual(16);
+    expect(truncPptx.slides).toHaveLength(1);
+    expect(truncPptx.slides?.[0].texts[0].length).toBeLessThanOrEqual(16);
+
+    const tooWideRow = Array.from({ length: CLOUD_DOC_OOXML_MAX_ROW_COLS + 1 }, (_v, i) => String(i)).join('\t');
+    expect(() => buildCloudDocBytesFromContent('.xlsx', tooWideRow)).toThrowError(
+      expect.objectContaining({ code: CLOUD_DOC_ERROR_CODES.CONTENT_TOO_LARGE, statusCode: 413 }),
+    );
+    const tooManyParas = Array.from({ length: CLOUD_DOC_OOXML_MAX_PARAGRAPHS + 1 }, () => 'p').join('\n');
+    expect(() => buildCloudDocBytesFromContent('.docx', tooManyParas)).toThrowError(
+      expect.objectContaining({ code: CLOUD_DOC_ERROR_CODES.CONTENT_TOO_LARGE, statusCode: 413 }),
+    );
+  });
+
+  it('performs non-destructive surgical append on DOCX, XLSX, and PPTX and fails closed on unsupported structures', () => {
+    // 1. XLSX preserves formulas, style attributes, and calcChain while appending new rows cleanly
+    const richXlsx = buildZipArchive([
+      {
+        name: '[Content_Types].xml',
+        content:
+          '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+          '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+          '<Default Extension="xml" ContentType="application/xml"/>' +
+          '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>' +
+          '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' +
+          '</Types>',
+      },
+      {
+        name: '_rels/.rels',
+        content:
+          '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+          '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>' +
+          '</Relationships>',
+      },
+      {
+        name: 'xl/workbook.xml',
+        content:
+          '<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>',
+      },
+      {
+        name: 'xl/_rels/workbook.xml.rels',
+        content:
+          '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>',
+      },
+      { name: 'xl/calcChain.xml', content: '<?xml version="1.0" encoding="UTF-8"?><calcChain><c r="B1"/></calcChain>' },
+      {
+        name: 'xl/worksheets/sheet1.xml',
+        content:
+          '<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>' +
+          '<row r="1"><c r="A1" s="1" t="n"><v>10</v></c><c r="B1"><f>A1*2</f><v>20</v></c></row>' +
+          '</sheetData></worksheet>',
+      },
+    ]);
+    const appendedXlsx = applyCloudDocContentEdit({ ext: '.xlsx', existingBytes: richXlsx, mode: 'append', content: '30\t40' });
+    const xlsxEntries = extractZipEntries(appendedXlsx);
+    expect(xlsxEntries.get('xl/calcChain.xml')?.toString('utf8')).toContain('<calcChain><c r="B1"/></calcChain>');
+    const updatedSheetXml = xlsxEntries.get('xl/worksheets/sheet1.xml')?.toString('utf8') ?? '';
+    expect(updatedSheetXml).toContain('<c r="A1" s="1" t="n"><v>10</v></c>');
+    expect(updatedSheetXml).toContain('<f>A1*2</f>');
+    expect(extractCloudDocContent('.xlsx', appendedXlsx).sheets?.[0].rows).toEqual([['10', '20'], ['30', '40']]);
+
+    // Refuse XLSX structured <tableParts> safely
+    const tableXlsx = buildZipArchive([
+      {
+        name: 'xl/worksheets/sheet1.xml',
+        content:
+          '<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><tableParts count="1"><tablePart r:id="rId1"/></tableParts></worksheet>',
+      },
+    ]);
+    expect(() =>
+      applyCloudDocContentEdit({ ext: '.xlsx', existingBytes: tableXlsx, mode: 'append', content: '2' }),
+    ).toThrowError(expect.objectContaining({ code: CLOUD_DOC_ERROR_CODES.UNSUPPORTED_CONTENT_EDIT, statusCode: 400 }));
+
+    // 2. DOCX preserves tables and embedded media when appending
+    const richDocx = buildZipArchive([
+      {
+        name: 'word/document.xml',
+        content:
+          '<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>' +
+          '<w:tbl><w:tr><w:tc><w:p><w:r><w:t>CellA</w:t></w:r></w:p></w:tc></w:tr></w:tbl>' +
+          '<w:sectPr/></w:body></w:document>',
+      },
+      { name: 'word/media/logo.png', content: Buffer.from([137, 80, 78, 71]) },
+    ]);
+    const appendedDocx = applyCloudDocContentEdit({ ext: '.docx', existingBytes: richDocx, mode: 'append', content: 'After table' });
+    const docxEntries = extractZipEntries(appendedDocx);
+    expect(docxEntries.get('word/media/logo.png')).toEqual(Buffer.from([137, 80, 78, 71]));
+    expect(docxEntries.get('word/document.xml')?.toString('utf8')).toContain('<w:tbl>');
+    expect(extractCloudDocContent('.docx', appendedDocx).content).toBe('CellA\nAfter table');
+
+    // 3. PPTX preserves embedded media & notesSlides and refuses <p:sectionLst> safely
+    const richPptx = buildZipArchive([
+      {
+        name: '[Content_Types].xml',
+        content:
+          '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+          '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+          '<Default Extension="xml" ContentType="application/xml"/>' +
+          '<Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>' +
+          '<Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>' +
+          '</Types>',
+      },
+      {
+        name: 'ppt/presentation.xml',
+        content:
+          '<?xml version="1.0" encoding="UTF-8"?><p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>',
+      },
+      {
+        name: 'ppt/_rels/presentation.xml.rels',
+        content:
+          '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>',
+      },
+      {
+        name: 'ppt/slides/slide1.xml',
+        content:
+          '<?xml version="1.0" encoding="UTF-8"?><p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>KeepMedia</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>',
+      },
+      { name: 'ppt/media/img.png', content: Buffer.from([1, 2, 3, 4]) },
+      { name: 'ppt/notesSlides/notesSlide1.xml', content: '<notes>Presenter note</notes>' },
+    ]);
+    const appendedPptx = applyCloudDocContentEdit({ ext: '.pptx', existingBytes: richPptx, mode: 'append', content: 'Slide Two' });
+    const pptxEntries = extractZipEntries(appendedPptx);
+    expect(pptxEntries.get('ppt/media/img.png')).toEqual(Buffer.from([1, 2, 3, 4]));
+    expect(pptxEntries.get('ppt/notesSlides/notesSlide1.xml')?.toString('utf8')).toBe('<notes>Presenter note</notes>');
+    expect(extractCloudDocContent('.pptx', appendedPptx).slides).toHaveLength(2);
+
+    const sectionedPptx = buildZipArchive([
+      {
+        name: '[Content_Types].xml',
+        content: '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"></Types>',
+      },
+      {
+        name: 'ppt/presentation.xml',
+        content: '<?xml version="1.0" encoding="UTF-8"?><p:presentation><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst><p:sectionLst/></p:presentation>',
+      },
+      {
+        name: 'ppt/_rels/presentation.xml.rels',
+        content: '<?xml version="1.0" encoding="UTF-8"?><Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>',
+      },
+      { name: 'ppt/slides/slide1.xml', content: '<p:sld/>' },
+    ]);
+    expect(() =>
+      applyCloudDocContentEdit({ ext: '.pptx', existingBytes: sectionedPptx, mode: 'append', content: 'Next' }),
+    ).toThrowError(expect.objectContaining({ code: CLOUD_DOC_ERROR_CODES.UNSUPPORTED_CONTENT_EDIT, statusCode: 400 }));
   });
 });

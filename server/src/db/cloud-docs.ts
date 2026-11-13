@@ -69,6 +69,19 @@ function toNum(v: number | string | null | undefined, fallback = 0): number {
   return Number.isFinite(n) ? n : fallback;
 }
 
+export function parseCloudDocVersion(raw: unknown): number | null {
+  if (typeof raw === 'number') {
+    return Number.isSafeInteger(raw) && raw >= 1 ? raw : null;
+  }
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!/^\d+$/.test(trimmed)) return null;
+    const parsed = Number(trimmed);
+    return Number.isSafeInteger(parsed) && parsed >= 1 ? parsed : null;
+  }
+  return null;
+}
+
 export function rowToCloudDocFolder(row: CloudDocFolderRow): CloudDocFolder {
   return {
     id: row.id,
@@ -89,7 +102,7 @@ export function rowToCloudDocItem(row: CloudDocRow): CloudDocItem {
     ext: row.ext,
     mimeType: row.mime_type,
     sizeBytes: toNum(row.size_bytes),
-    docVersion: toNum(row.doc_version, 1),
+    docVersion: parseCloudDocVersion(row.doc_version) ?? 1,
     createdAt: toNum(row.created_at),
     updatedAt: toNum(row.updated_at),
     lastOpenedAt: row.last_opened_at !== null && row.last_opened_at !== undefined
@@ -411,16 +424,34 @@ export async function updateCloudDocMetadata(
     mimeType?: string;
     folderId?: string | null;
     hasFolderId?: boolean;
+    expectedVersion?: number;
   },
 ): Promise<CloudDocRow | null> {
   const existing = await getCloudDocById(db, params.docId, params.userId);
   if (!existing) return null;
+  const currentVersion = parseCloudDocVersion(existing.doc_version);
+  if (currentVersion === null) return null;
+  if (params.expectedVersion !== undefined && params.expectedVersion !== currentVersion) {
+    return null;
+  }
 
   const nextName = params.name ?? existing.name;
   const nextExt = params.ext ?? existing.ext;
   const nextMime = params.mimeType ?? existing.mime_type;
   const nextFolderId = params.hasFolderId ? (params.folderId ?? null) : existing.folder_id;
   const now = Date.now();
+
+  if (params.expectedVersion !== undefined) {
+    const row = await db.queryOne<CloudDocRow>(
+      `UPDATE cloud_docs
+       SET name = $1, ext = $2, mime_type = $3, folder_id = $4, updated_at = $5
+       WHERE id = $6 AND user_id = $7 AND doc_version = $8
+       RETURNING id, user_id, folder_id, name, ext, mime_type, size_bytes, content_sha256,
+         storage_key, doc_version, created_at, updated_at, last_opened_at`,
+      [nextName, nextExt, nextMime, nextFolderId, now, params.docId, params.userId, params.expectedVersion],
+    );
+    return row ?? null;
+  }
 
   await db.execute(
     `UPDATE cloud_docs
@@ -453,27 +484,60 @@ export async function commitCloudDocContent(
     newStorageKey: string;
     sizeBytes: number;
     contentSha256: string;
+    name?: string;
+    ext?: string;
+    mimeType?: string;
+    folderId?: string | null;
+    hasFolderId?: boolean;
   },
 ): Promise<CommitCloudDocResult> {
   const nextVersion = params.bumpVersion ? params.expectedVersion + 1 : params.expectedVersion;
   const now = Date.now();
-  const row = await db.queryOne<CloudDocRow>(
-    `UPDATE cloud_docs
-     SET storage_key = $1, size_bytes = $2, content_sha256 = $3, doc_version = $4, updated_at = $5
-     WHERE id = $6 AND user_id = $7 AND doc_version = $8
-     RETURNING id, user_id, folder_id, name, ext, mime_type, size_bytes, content_sha256,
-       storage_key, doc_version, created_at, updated_at, last_opened_at`,
-    [
-      params.newStorageKey,
-      params.sizeBytes,
-      params.contentSha256,
-      nextVersion,
-      now,
-      params.docId,
-      params.userId,
-      params.expectedVersion,
-    ],
-  );
+  const hasMetadataUpdate = params.name !== undefined || params.hasFolderId === true;
+  const row = hasMetadataUpdate
+    ? await db.queryOne<CloudDocRow>(
+      `UPDATE cloud_docs
+       SET storage_key = $1, size_bytes = $2, content_sha256 = $3, doc_version = $4, updated_at = $5,
+           name = COALESCE($9, name),
+           ext = COALESCE($10, ext),
+           mime_type = COALESCE($11, mime_type),
+           folder_id = CASE WHEN $12::boolean THEN $13 ELSE folder_id END
+       WHERE id = $6 AND user_id = $7 AND doc_version = $8
+       RETURNING id, user_id, folder_id, name, ext, mime_type, size_bytes, content_sha256,
+         storage_key, doc_version, created_at, updated_at, last_opened_at`,
+      [
+        params.newStorageKey,
+        params.sizeBytes,
+        params.contentSha256,
+        nextVersion,
+        now,
+        params.docId,
+        params.userId,
+        params.expectedVersion,
+        params.name ?? null,
+        params.ext ?? null,
+        params.mimeType ?? null,
+        params.hasFolderId === true,
+        params.folderId ?? null,
+      ],
+    )
+    : await db.queryOne<CloudDocRow>(
+      `UPDATE cloud_docs
+       SET storage_key = $1, size_bytes = $2, content_sha256 = $3, doc_version = $4, updated_at = $5
+       WHERE id = $6 AND user_id = $7 AND doc_version = $8
+       RETURNING id, user_id, folder_id, name, ext, mime_type, size_bytes, content_sha256,
+         storage_key, doc_version, created_at, updated_at, last_opened_at`,
+      [
+        params.newStorageKey,
+        params.sizeBytes,
+        params.contentSha256,
+        nextVersion,
+        now,
+        params.docId,
+        params.userId,
+        params.expectedVersion,
+      ],
+    );
   if (!row) return { status: 'conflict' };
   return { status: 'committed', doc: row };
 }

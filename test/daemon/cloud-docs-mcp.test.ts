@@ -231,14 +231,57 @@ function createInMemoryMcpCloudDocsDb() {
         return { ...row } as unknown as T;
       }
       if (s.startsWith('UPDATE cloud_docs SET storage_key = $1')) {
-        const [storage_key, size_bytes, content_sha256, doc_version, updated_at, id, userId, expectedVersion] =
-          params as [string, number, string, number, number, string, string, number];
+        const [
+          storage_key,
+          size_bytes,
+          content_sha256,
+          doc_version,
+          updated_at,
+          id,
+          userId,
+          expectedVersion,
+          nextName,
+          nextExt,
+          nextMimeType,
+          hasFolderId,
+          nextFolderId,
+        ] = params as [
+          string,
+          number,
+          string,
+          number,
+          number,
+          string,
+          string,
+          number,
+          string | null | undefined,
+          string | null | undefined,
+          string | null | undefined,
+          boolean | undefined,
+          string | null | undefined,
+        ];
         const row = docs.get(id);
         if (!row || row.user_id !== userId || Number(row.doc_version) !== expectedVersion) return null;
         row.storage_key = storage_key;
         row.size_bytes = size_bytes;
         row.content_sha256 = content_sha256;
         row.doc_version = doc_version;
+        row.updated_at = updated_at;
+        if (typeof nextName === 'string') row.name = nextName;
+        if (typeof nextExt === 'string') row.ext = nextExt;
+        if (typeof nextMimeType === 'string') row.mime_type = nextMimeType;
+        if (hasFolderId === true) row.folder_id = nextFolderId ?? null;
+        return { ...row } as unknown as T;
+      }
+      if (s.startsWith('UPDATE cloud_docs SET name = $1')) {
+        const [name, ext, mime_type, folder_id, updated_at, id, userId, expectedVersion] =
+          params as [string, string, string, string | null, number, string, string, number];
+        const row = docs.get(id);
+        if (!row || row.user_id !== userId || Number(row.doc_version) !== expectedVersion) return null;
+        row.name = name;
+        row.ext = ext;
+        row.mime_type = mime_type;
+        row.folder_id = folder_id;
         row.updated_at = updated_at;
         return { ...row } as unknown as T;
       }
@@ -585,11 +628,49 @@ describe('cloud docs MCP tools', () => {
     });
     expect(bobEditMetrics).toMatchObject({ status: 'ok', doc: { docVersion: 2 }, role: 'editor' });
 
+    // F4 regression counterexample: combined content + forbidden root move rejects atomically
+    // with zero partial mutation to content, docVersion, or name.
+    const forbiddenComboEdit = await handlers[MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_EDIT]({
+      docId: metricsDocId,
+      content: 'SHOULD_NOT_PERSIST\t999',
+      mode: 'append',
+      name: 'ShouldNotRename',
+      folderId: null,
+      expectedVersion: 2,
+    });
+    expect(forbiddenComboEdit).toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN,
+    });
+    const afterRejectedCombo = await handlers[MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_READ]({ docId: metricsDocId });
+    expect(afterRejectedCombo).toMatchObject({
+      status: 'ok',
+      doc: { docVersion: 2, name: 'Metrics.xlsx', folderId },
+      sheets: [{ name: 'Sheet1', rows: [['KPI', 'Value'], ['Latency', '12'], ['Throughput', '450']] }],
+    });
+
+    // Valid combined content append + rename succeeds atomically in a single version bump (2 -> 3)
+    const validComboEdit = await handlers[MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_EDIT]({
+      docId: metricsDocId,
+      content: 'Availability\t99.9',
+      mode: 'append',
+      name: 'MetricsRenamed',
+      expectedVersion: 2,
+    });
+    expect(validComboEdit).toMatchObject({
+      status: 'ok',
+      doc: { docVersion: 3, name: 'MetricsRenamed.xlsx', folderId },
+      role: 'editor',
+    });
+
     const bobReadMetrics = await handlers[MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_READ]({ docId: metricsDocId });
     expect(bobReadMetrics).toMatchObject({
       status: 'ok',
       format: 'xlsx',
-      sheets: [{ name: 'Sheet1', rows: [['KPI', 'Value'], ['Latency', '12'], ['Throughput', '450']] }],
+      sheets: [{
+        name: 'Sheet1',
+        rows: [['KPI', 'Value'], ['Latency', '12'], ['Throughput', '450'], ['Availability', '99.9']],
+      }],
     });
 
     // Participant bob cannot delete or manage shares on shared doc

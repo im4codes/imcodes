@@ -42,6 +42,7 @@ import {
   listRecentDocumentsRaw,
   listSharedCloudItemsForUser,
   listUserTeamsForCloudDocs,
+  parseCloudDocVersion,
   resolveCloudDocAccess,
   resolveCloudDocFolderAccess,
   revokeCloudDocShare,
@@ -965,7 +966,10 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
       }
       const current = liveAccess.doc;
 
-      const currentVersion = Number(current.doc_version);
+      const currentVersion = parseCloudDocVersion(current.doc_version);
+      if (currentVersion === null) {
+        return c.json({ error: 1, message: 'cloud_doc_invalid_version' }, 500);
+      }
       const currentDocKey = computeCloudDocDocumentKey(current.id, currentVersion);
       if (currentVersion !== claims.docVersion || currentDocKey !== claims.documentKey) {
         return c.json({ error: 1, message: 'stale_document_key' }, 409);
@@ -1048,7 +1052,10 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
     );
     const actorName = userRow?.display_name || userRow?.username || auth.userId;
 
-    const docVersion = Number(row.doc_version) || 1;
+    const docVersion = parseCloudDocVersion(row.doc_version);
+    if (docVersion === null) {
+      return c.json({ error: 'cloud_doc_invalid_version' }, 500);
+    }
     const documentKey = computeCloudDocDocumentKey(row.id, docVersion);
 
     const docToken = signCloudDocOnlyOfficeToken(
@@ -1334,9 +1341,21 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
       return c.json({ error: 'forbidden' }, 403);
     }
 
-    let body: { content?: unknown; mode?: unknown; expectedVersion?: unknown };
+    let body: {
+      content?: unknown;
+      mode?: unknown;
+      expectedVersion?: unknown;
+      name?: unknown;
+      folderId?: unknown;
+    };
     try {
-      body = (await c.req.json()) as { content?: unknown; mode?: unknown; expectedVersion?: unknown };
+      body = (await c.req.json()) as {
+        content?: unknown;
+        mode?: unknown;
+        expectedVersion?: unknown;
+        name?: unknown;
+        folderId?: unknown;
+      };
     } catch {
       return c.json({ error: 'invalid_json' }, 400);
     }
@@ -1351,6 +1370,13 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
     if (body.expectedVersion !== undefined && (!Number.isInteger(body.expectedVersion) || (body.expectedVersion as number) < 1)) {
       return c.json({ error: 'invalid_expected_version' }, 400);
     }
+    if (body.name !== undefined && typeof body.name !== 'string') {
+      return c.json({ error: 'invalid_name' }, 400);
+    }
+    const hasFolderId = Object.prototype.hasOwnProperty.call(body, 'folderId') && body.folderId !== undefined;
+    if (hasFolderId && body.folderId !== null && typeof body.folderId !== 'string') {
+      return c.json({ error: 'invalid_folder_id' }, 400);
+    }
 
     return lockCloudDocCommit(docId, async () => {
       const liveAccess = await resolveCloudDocAccess(c.env.DB, docId, auth.userId);
@@ -1358,11 +1384,50 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
       if (liveAccess.role !== 'editor') return c.json({ error: 'forbidden' }, 403);
 
       const current = liveAccess.doc;
-      if (typeof body.expectedVersion === 'number' && body.expectedVersion !== current.doc_version) {
-        return c.json({ error: 'version_conflict', currentVersion: current.doc_version }, 409);
+      const currentVersion = parseCloudDocVersion(current.doc_version);
+      if (currentVersion === null) {
+        return c.json({ error: 'cloud_doc_invalid_version' }, 500);
+      }
+      if (typeof body.expectedVersion === 'number' && body.expectedVersion !== currentVersion) {
+        return c.json({ error: 'version_conflict', currentVersion }, 409);
       }
 
-      let existingBytes = Buffer.alloc(0);
+      // Validate all metadata and ACL constraints before touching storage so combined
+      // content + metadata edits are all-or-nothing.
+      let nextName: string | undefined;
+      let nextExt: string | undefined;
+      let nextMime: string | undefined;
+      if (typeof body.name === 'string') {
+        const normalized = normalizeCloudDocName(body.name, current.ext);
+        if (!normalized) return c.json({ error: 'invalid_name' }, 400);
+        const meta = getCloudDocMeta(normalized);
+        if (!meta) return c.json({ error: 'unsupported_document_type' }, 400);
+        if (meta.ext !== current.ext) {
+          return c.json({ error: 'unsupported_content_edit', message: 'Cannot change document extension during content edit' }, 400);
+        }
+        nextName = normalized;
+        nextExt = meta.ext;
+        nextMime = meta.mimeType;
+      }
+
+      let nextFolderId: string | null = null;
+      if (hasFolderId) {
+        nextFolderId = typeof body.folderId === 'string' && body.folderId.trim()
+          ? body.folderId.trim()
+          : null;
+        if (!nextFolderId && !liveAccess.isOwner) {
+          return c.json({ error: 'forbidden' }, 403);
+        }
+        if (nextFolderId) {
+          const folderAccess = await resolveCloudDocFolderAccess(c.env.DB, nextFolderId, auth.userId);
+          if (!folderAccess.allowed) return c.json({ error: 'folder_not_found' }, 404);
+          if (folderAccess.role !== 'editor' || folderAccess.folder.user_id !== current.user_id) {
+            return c.json({ error: 'forbidden' }, 403);
+          }
+        }
+      }
+
+      let existingBytes: Buffer = Buffer.alloc(0);
       if (mode === 'append') {
         if (!(await storage.exists(current.storage_key))) {
           return c.json({ error: 'cloud_doc_file_missing' }, 404);
@@ -1389,7 +1454,7 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
         return c.json({ error: 'unsupported_document_type' }, 400);
       }
 
-      const nextVersion = current.doc_version + 1;
+      const nextVersion = currentVersion + 1;
       const newStorageKey = buildCloudDocStorageKey(current.user_id, current.id, nextVersion);
       let writeResult: { sizeBytes: number; sha256: string };
       try {
@@ -1402,15 +1467,20 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
         const committed = await commitCloudDocContent(c.env.DB, {
           docId: current.id,
           userId: current.user_id,
-          expectedVersion: current.doc_version,
+          expectedVersion: currentVersion,
           bumpVersion: true,
           newStorageKey,
           sizeBytes: writeResult.sizeBytes,
           contentSha256: writeResult.sha256,
+          name: nextName,
+          ext: nextExt,
+          mimeType: nextMime,
+          folderId: nextFolderId,
+          hasFolderId,
         });
         if (committed.status === 'conflict') {
           await storage.delete(newStorageKey).catch(() => {});
-          return c.json({ error: 'version_conflict', currentVersion: current.doc_version }, 409);
+          return c.json({ error: 'version_conflict', currentVersion }, 409);
         }
         if (current.storage_key !== newStorageKey) {
           await storage.delete(current.storage_key).catch(() => {});
@@ -1436,65 +1506,86 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
     if (auth instanceof Response) return auth;
 
     const docId = c.req.param('id');
-    const access = await resolveCloudDocAccess(c.env.DB, docId, auth.userId);
-    if (!access.allowed) {
-      return c.json({ error: 'not_found' }, 404);
-    }
-    if (access.role !== 'editor') {
-      return c.json({ error: 'forbidden' }, 403);
-    }
-    const existing = access.doc;
 
-    let body: { name?: string; folderId?: string | null };
+    let body: { name?: unknown; folderId?: unknown; expectedVersion?: unknown };
     try {
-      body = (await c.req.json()) as { name?: string; folderId?: string | null };
+      body = (await c.req.json()) as { name?: unknown; folderId?: unknown; expectedVersion?: unknown };
     } catch {
       return c.json({ error: 'invalid_json' }, 400);
     }
 
-    let nextName: string | undefined;
-    let nextExt: string | undefined;
-    let nextMime: string | undefined;
-    if (body.name !== undefined) {
-      const normalized = normalizeCloudDocName(body.name, existing.ext);
-      if (!normalized) return c.json({ error: 'invalid_name' }, 400);
-      const meta = getCloudDocMeta(normalized);
-      if (!meta) return c.json({ error: 'unsupported_document_type' }, 400);
-      nextName = normalized;
-      nextExt = meta.ext;
-      nextMime = meta.mimeType;
+    if (body.expectedVersion !== undefined && (!Number.isInteger(body.expectedVersion) || (body.expectedVersion as number) < 1)) {
+      return c.json({ error: 'invalid_expected_version' }, 400);
+    }
+    if (body.name !== undefined && typeof body.name !== 'string') {
+      return c.json({ error: 'invalid_name' }, 400);
+    }
+    const hasFolderId = Object.prototype.hasOwnProperty.call(body, 'folderId') && body.folderId !== undefined;
+    if (hasFolderId && body.folderId !== null && typeof body.folderId !== 'string') {
+      return c.json({ error: 'invalid_folder_id' }, 400);
     }
 
-    const hasFolderId = Object.prototype.hasOwnProperty.call(body, 'folderId');
-    let nextFolderId: string | null = null;
-    if (hasFolderId) {
-      nextFolderId = typeof body.folderId === 'string' && body.folderId.trim()
-        ? body.folderId.trim()
-        : null;
-      if (!nextFolderId && !access.isOwner) {
+    return lockCloudDocCommit(docId, async () => {
+      const access = await resolveCloudDocAccess(c.env.DB, docId, auth.userId);
+      if (!access.allowed) {
+        return c.json({ error: 'not_found' }, 404);
+      }
+      if (access.role !== 'editor') {
         return c.json({ error: 'forbidden' }, 403);
       }
-      if (nextFolderId) {
-        const folderAccess = await resolveCloudDocFolderAccess(c.env.DB, nextFolderId, auth.userId);
-        if (!folderAccess.allowed) return c.json({ error: 'folder_not_found' }, 404);
-        if (folderAccess.role !== 'editor' || folderAccess.folder.user_id !== existing.user_id) {
+      const existing = access.doc;
+      const currentVersion = parseCloudDocVersion(existing.doc_version);
+      if (currentVersion === null) {
+        return c.json({ error: 'cloud_doc_invalid_version' }, 500);
+      }
+      if (typeof body.expectedVersion === 'number' && body.expectedVersion !== currentVersion) {
+        return c.json({ error: 'version_conflict', currentVersion }, 409);
+      }
+
+      let nextName: string | undefined;
+      let nextExt: string | undefined;
+      let nextMime: string | undefined;
+      if (typeof body.name === 'string') {
+        const normalized = normalizeCloudDocName(body.name, existing.ext);
+        if (!normalized) return c.json({ error: 'invalid_name' }, 400);
+        const meta = getCloudDocMeta(normalized);
+        if (!meta) return c.json({ error: 'unsupported_document_type' }, 400);
+        nextName = normalized;
+        nextExt = meta.ext;
+        nextMime = meta.mimeType;
+      }
+
+      let nextFolderId: string | null = null;
+      if (hasFolderId) {
+        nextFolderId = typeof body.folderId === 'string' && body.folderId.trim()
+          ? body.folderId.trim()
+          : null;
+        if (!nextFolderId && !access.isOwner) {
           return c.json({ error: 'forbidden' }, 403);
         }
+        if (nextFolderId) {
+          const folderAccess = await resolveCloudDocFolderAccess(c.env.DB, nextFolderId, auth.userId);
+          if (!folderAccess.allowed) return c.json({ error: 'folder_not_found' }, 404);
+          if (folderAccess.role !== 'editor' || folderAccess.folder.user_id !== existing.user_id) {
+            return c.json({ error: 'forbidden' }, 403);
+          }
+        }
       }
-    }
 
-    const updated = await updateCloudDocMetadata(c.env.DB, {
-      userId: existing.user_id,
-      docId,
-      name: nextName,
-      ext: nextExt,
-      mimeType: nextMime,
-      folderId: nextFolderId,
-      hasFolderId,
+      const updated = await updateCloudDocMetadata(c.env.DB, {
+        userId: existing.user_id,
+        docId,
+        expectedVersion: currentVersion,
+        name: nextName,
+        ext: nextExt,
+        mimeType: nextMime,
+        folderId: nextFolderId,
+        hasFolderId,
+      });
+      if (!updated) return c.json({ error: 'version_conflict', currentVersion }, 409);
+
+      return c.json({ doc: rowToCloudDocItem(updated) });
     });
-    if (!updated) return c.json({ error: 'not_found' }, 404);
-
-    return c.json({ doc: rowToCloudDocItem(updated) });
   });
 
   // ── Cloud Docs: Delete ──────────────────────────────────────────────────────

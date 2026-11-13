@@ -142,8 +142,8 @@ export const MCP_TOOL_GROUPS: readonly McpToolGroupDefinition[] = Object.freeze(
   }),
   Object.freeze({
     id: 'cloud-docs',
-    aliases: Object.freeze(['cloud docs', 'onlyoffice', 'documents', 'office', 'docx', 'xlsx', 'pptx', '云文档']),
-    summary: 'List, read, create, edit, delete, and share Cloud Docs and ONLYOFFICE documents with user parity.',
+    aliases: Object.freeze(['cloud doc', 'cloud docs', 'cloud-docs', '云文档', '共享文档', 'shared doc', 'onlyoffice', 'documents', 'office', 'docx', 'xlsx', 'pptx']),
+    summary: 'List, read, create, edit, delete, and share Cloud Docs and ONLYOFFICE collaborative documents with frontend/actor ACL parity.',
     tools: Object.freeze([
       MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_LIST,
       MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_READ,

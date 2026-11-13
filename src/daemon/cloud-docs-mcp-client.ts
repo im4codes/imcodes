@@ -184,26 +184,29 @@ export async function cloudDocEditClient(
   let bytesWritten: number | undefined;
 
   if (input.content !== undefined) {
+    const contentBody: Record<string, unknown> = {
+      content: input.content,
+    };
+    if (input.mode !== undefined) contentBody.mode = input.mode;
+    if (input.expectedVersion !== undefined) contentBody.expectedVersion = input.expectedVersion;
+    if (input.name !== undefined) contentBody.name = input.name;
+    if (input.folderId !== undefined) contentBody.folderId = input.folderId;
+
     const contentRes = await cloudDocsRequest<{
       ok: true;
       doc: CloudDocItem;
       role?: CloudDocShareRole | 'owner';
       bytesWritten?: number;
-    }>(creds, 'PUT', `${CLOUD_DOCS_API_PATH}/${encodeURIComponent(input.docId)}/content`, {
-      content: input.content,
-      ...(input.mode !== undefined ? { mode: input.mode } : {}),
-      ...(input.expectedVersion !== undefined ? { expectedVersion: input.expectedVersion } : {}),
-    });
+    }>(creds, 'PUT', `${CLOUD_DOCS_API_PATH}/${encodeURIComponent(input.docId)}/content`, contentBody);
     if (contentRes.status !== 'ok') return contentRes;
     latestDoc = contentRes.doc;
     role = contentRes.role;
     bytesWritten = contentRes.bytesWritten;
-  }
-
-  if (input.name !== undefined || input.folderId !== undefined) {
+  } else if (input.name !== undefined || input.folderId !== undefined) {
     const patchBody: Record<string, unknown> = {};
     if (input.name !== undefined) patchBody.name = input.name;
     if (input.folderId !== undefined) patchBody.folderId = input.folderId;
+    if (input.expectedVersion !== undefined) patchBody.expectedVersion = input.expectedVersion;
     const metaRes = await cloudDocsRequest<{ doc: CloudDocItem }>(
       creds,
       'PATCH',

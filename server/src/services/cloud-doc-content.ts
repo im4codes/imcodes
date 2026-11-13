@@ -3,6 +3,10 @@ import {
   CLOUD_DOC_CONTENT_MAX_CHARS,
   CLOUD_DOC_EDITABLE_EXTS,
   CLOUD_DOC_ERROR_CODES,
+  CLOUD_DOC_OOXML_MAX_CELLS,
+  CLOUD_DOC_OOXML_MAX_COL_INDEX,
+  CLOUD_DOC_OOXML_MAX_PARAGRAPHS,
+  CLOUD_DOC_OOXML_MAX_ROW_COLS,
   CLOUD_DOC_READABLE_TEXT_EXTS,
   CLOUD_DOC_ZIP_MAX_ENTRIES,
   CLOUD_DOC_ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES,
@@ -259,17 +263,81 @@ function extractParagraphRuns(xml: string, textTagPattern: RegExp, breakTagPatte
   return parts.join('');
 }
 
-function extractDocxText(entries: Map<string, Buffer>): string {
+function checkArchiveOutputBounds(files: ReadonlyArray<{ name: string; content: string | Buffer }>): void {
+  if (files.length > CLOUD_DOC_ZIP_MAX_ENTRIES) {
+    throw new CloudDocContentError(
+      CLOUD_DOC_ERROR_CODES.CONTENT_TOO_LARGE,
+      `Generated OOXML archive exceeds max entry limit (${CLOUD_DOC_ZIP_MAX_ENTRIES})`,
+      413,
+    );
+  }
+  let totalBytes = 0;
+  for (const file of files) {
+    const entryBytes = Buffer.isBuffer(file.content) ? file.content.length : Buffer.byteLength(file.content, 'utf8');
+    if (entryBytes > CLOUD_DOC_ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES) {
+      throw new CloudDocContentError(
+        CLOUD_DOC_ERROR_CODES.CONTENT_TOO_LARGE,
+        `Generated archive entry "${file.name}" exceeds size limit (${CLOUD_DOC_ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES} bytes)`,
+        413,
+      );
+    }
+    totalBytes += entryBytes;
+    if (totalBytes > CLOUD_DOC_ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES) {
+      throw new CloudDocContentError(
+        CLOUD_DOC_ERROR_CODES.CONTENT_TOO_LARGE,
+        `Generated archive exceeds total uncompressed size budget (${CLOUD_DOC_ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES} bytes)`,
+        413,
+      );
+    }
+  }
+}
+
+function extractDocxText(
+  entries: Map<string, Buffer>,
+  maxChars: number = CLOUD_DOC_CONTENT_MAX_CHARS,
+): { content: string; truncated: boolean; totalChars: number } {
   const docBuf = entries.get('word/document.xml');
   if (!docBuf) {
     throw new CloudDocContentError(CLOUD_DOC_ERROR_CODES.INVALID_ARCHIVE, 'Missing word/document.xml in DOCX');
   }
   const xml = docBuf.toString('utf8');
   const lines: string[] = [];
+  let paragraphCount = 0;
+  let remainingChars = maxChars;
+  let rawCharsSeen = 0;
+  let truncated = false;
 
   // Process top-level blocks in <w:body> preserving table rows (<w:tr>) vs standalone paragraphs (<w:p>).
   const bodyMatch = /<w:body\b[^>]*>([\s\S]*?)<\/w:body>/i.exec(xml);
   const body = bodyMatch ? bodyMatch[1] : xml;
+
+  const pushLine = (line: string): boolean => {
+    paragraphCount += 1;
+    if (paragraphCount > CLOUD_DOC_OOXML_MAX_PARAGRAPHS) {
+      throw new CloudDocContentError(
+        CLOUD_DOC_ERROR_CODES.CONTENT_TOO_LARGE,
+        `DOCX paragraph/row count exceeds limit (${CLOUD_DOC_OOXML_MAX_PARAGRAPHS})`,
+        413,
+      );
+    }
+    const sep = lines.length > 0 ? 1 : 0;
+    rawCharsSeen += sep + line.length;
+    if (remainingChars <= 0) {
+      truncated = true;
+      return false;
+    }
+    if (sep + line.length > remainingChars) {
+      if (remainingChars > sep) {
+        lines.push(line.slice(0, remainingChars - sep));
+      }
+      remainingChars = 0;
+      truncated = true;
+      return false;
+    }
+    lines.push(line);
+    remainingChars -= sep + line.length;
+    return true;
+  };
 
   const blockRe = /<w:tbl\b[^>]*>[\s\S]*?<\/w:tbl>|<w:p\b[^>]*>[\s\S]*?<\/w:p>|<w:p\s*\/>/g;
   let block: RegExpExecArray | null;
@@ -291,24 +359,55 @@ function extractDocxText(entries: Map<string, Buffer>): string {
           }
           cellTexts.push(pTexts.join(' ').trim());
         }
-        lines.push(cellTexts.join('\t'));
+        if (!pushLine(cellTexts.join('\t'))) {
+          const content = lines.join('\n').slice(0, maxChars);
+          return { content, truncated: true, totalChars: Math.max(rawCharsSeen, content.length + 1) };
+        }
       }
     } else {
-      lines.push(extractParagraphRuns(snippet, /^<w:t(?:\s|>)/, /^<w:(?:br|cr)(?:\s|\/>|>)/, /^<w:tab(?:\s|\/>|>)/));
+      const line = extractParagraphRuns(snippet, /^<w:t(?:\s|>)/, /^<w:(?:br|cr)(?:\s|\/>|>)/, /^<w:tab(?:\s|\/>|>)/);
+      if (!pushLine(line)) {
+        const content = lines.join('\n').slice(0, maxChars);
+        return { content, truncated: true, totalChars: Math.max(rawCharsSeen, content.length + 1) };
+      }
     }
   }
 
-  return lines.join('\n');
+  const content = lines.join('\n');
+  return { content, truncated, totalChars: truncated ? Math.max(rawCharsSeen, content.length + 1) : content.length };
 }
 
 function colRefToIndex(ref: string): number | null {
-  const letters = /^([A-Za-z]+)\d+$/.exec(ref.trim());
+  const letters = /^([A-Za-z]+)(\d+)$/.exec(ref.trim());
   if (!letters) return null;
+  if (letters[1].length > 3) {
+    throw new CloudDocContentError(
+      CLOUD_DOC_ERROR_CODES.CONTENT_TOO_LARGE,
+      `Spreadsheet cell reference "${ref}" exceeds supported column bounds`,
+      413,
+    );
+  }
+  const rowNum = Number.parseInt(letters[2], 10);
+  if (!Number.isFinite(rowNum) || rowNum <= 0) {
+    throw new CloudDocContentError(
+      CLOUD_DOC_ERROR_CODES.INVALID_ARCHIVE,
+      `Malformed spreadsheet cell reference "${ref}"`,
+      400,
+    );
+  }
   let idx = 0;
   for (const ch of letters[1].toUpperCase()) {
     idx = idx * 26 + (ch.charCodeAt(0) - 64);
   }
-  return idx - 1;
+  const zeroBased = idx - 1;
+  if (zeroBased > CLOUD_DOC_OOXML_MAX_COL_INDEX || zeroBased >= CLOUD_DOC_OOXML_MAX_ROW_COLS) {
+    throw new CloudDocContentError(
+      CLOUD_DOC_ERROR_CODES.CONTENT_TOO_LARGE,
+      `Spreadsheet column "${ref}" exceeds maximum row width (${CLOUD_DOC_OOXML_MAX_ROW_COLS})`,
+      413,
+    );
+  }
+  return zeroBased;
 }
 
 function indexToColRef(idx: number): string {
@@ -355,8 +454,7 @@ function parseSharedStrings(buf: Buffer | undefined): string[] {
   return out;
 }
 
-function extractXlsxContent(entries: Map<string, Buffer>): { content: string; sheets: Array<{ name: string; rows: string[][] }> } {
-  const sharedStrings = parseSharedStrings(entries.get('xl/sharedStrings.xml'));
+function discoverXlsxSheets(entries: Map<string, Buffer>): Array<{ name: string; path: string }> {
   const wbBuf = entries.get('xl/workbook.xml');
   const wbRels = parseRelationships(entries.get('xl/_rels/workbook.xml.rels'));
 
@@ -394,13 +492,33 @@ function extractXlsxContent(entries: Map<string, Buffer>): { content: string; sh
     fallbackPaths.forEach((p, idx) => sheetSpecs.push({ name: `Sheet${idx + 1}`, path: p }));
   }
 
+  return sheetSpecs;
+}
+
+function extractXlsxContent(
+  entries: Map<string, Buffer>,
+  maxChars: number = CLOUD_DOC_CONTENT_MAX_CHARS,
+): { content: string; sheets: Array<{ name: string; rows: string[][] }>; truncated: boolean; totalChars: number } {
+  const sharedStrings = parseSharedStrings(entries.get('xl/sharedStrings.xml'));
+  const sheetSpecs = discoverXlsxSheets(entries);
+
   const sheets: Array<{ name: string; rows: string[][] }> = [];
+  let totalCells = 0;
+  let remainingChars = maxChars;
+  let rawCharsSeen = 0;
+  let truncated = false;
+
   for (const spec of sheetSpecs) {
+    if (truncated) break;
     const sheetXml = entries.get(spec.path)!.toString('utf8');
     const rows: string[][] = [];
     const rowRe = /<row\b[^>]*>([\s\S]*?)<\/row>/g;
     let rMatch: RegExpExecArray | null;
     while ((rMatch = rowRe.exec(sheetXml)) !== null) {
+      if (remainingChars <= 0) {
+        truncated = true;
+        break;
+      }
       const rowValues: string[] = [];
       const cellRe = /<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g;
       let cMatch: RegExpExecArray | null;
@@ -409,6 +527,22 @@ function extractXlsxContent(entries: Map<string, Buffer>): { content: string; sh
         const body = cMatch[2] ?? '';
         const colIdx = attrs.r ? colRefToIndex(attrs.r) : rowValues.length;
         const targetCol = colIdx !== null && colIdx >= 0 ? colIdx : rowValues.length;
+        if (targetCol >= CLOUD_DOC_OOXML_MAX_ROW_COLS) {
+          throw new CloudDocContentError(
+            CLOUD_DOC_ERROR_CODES.CONTENT_TOO_LARGE,
+            `Spreadsheet row width exceeds maximum (${CLOUD_DOC_OOXML_MAX_ROW_COLS} columns)`,
+            413,
+          );
+        }
+        const addedCells = Math.max(0, targetCol - rowValues.length) + 1;
+        totalCells += addedCells;
+        if (totalCells > CLOUD_DOC_OOXML_MAX_CELLS) {
+          throw new CloudDocContentError(
+            CLOUD_DOC_ERROR_CODES.CONTENT_TOO_LARGE,
+            `Spreadsheet cell count exceeds maximum (${CLOUD_DOC_OOXML_MAX_CELLS})`,
+            413,
+          );
+        }
         while (rowValues.length < targetCol) rowValues.push('');
 
         const cellType = attrs.t ?? '';
@@ -433,27 +567,50 @@ function extractXlsxContent(entries: Map<string, Buffer>): { content: string; sh
             value = rawV;
           }
         }
+        rawCharsSeen += value.length + 1;
+        if (value.length > remainingChars) {
+          rowValues[targetCol] = value.slice(0, remainingChars);
+          remainingChars = 0;
+          truncated = true;
+          break;
+        }
         rowValues[targetCol] = value;
+        remainingChars -= value.length;
       }
       while (rowValues.length > 0 && rowValues[rowValues.length - 1] === '') {
         rowValues.pop();
       }
-      rows.push(rowValues);
+      if (rowValues.length > 0 || !truncated) {
+        rows.push(rowValues);
+      }
+      if (truncated) break;
     }
     sheets.push({ name: spec.name, rows });
   }
 
-  const content =
+  const fullContent =
     sheets.length === 1 && sheets[0].name === 'Sheet1'
       ? sheets[0].rows.map((row) => row.join('\t')).join('\n')
       : sheets.map((sheet) => `## Sheet: ${sheet.name}\n${sheet.rows.map((row) => row.join('\t')).join('\n')}`).join('\n\n');
 
-  return { content, sheets };
+  if (fullContent.length > maxChars) {
+    truncated = true;
+  }
+  const content = truncated ? fullContent.slice(0, maxChars) : fullContent;
+  const totalChars = truncated ? Math.max(rawCharsSeen, fullContent.length, content.length + 1) : content.length;
+
+  return { content, sheets, truncated, totalChars };
 }
 
 function extractPptxContent(
   entries: Map<string, Buffer>,
-): { content: string; slides: Array<{ index: number; title?: string; texts: string[] }> } {
+  maxChars: number = CLOUD_DOC_CONTENT_MAX_CHARS,
+): {
+  content: string;
+  slides: Array<{ index: number; title?: string; texts: string[] }>;
+  truncated: boolean;
+  totalChars: number;
+} {
   const presBuf = entries.get('ppt/presentation.xml');
   const presRels = parseRelationships(entries.get('ppt/_rels/presentation.xml.rels'));
 
@@ -489,27 +646,60 @@ function extractPptxContent(
   }
 
   const slides: Array<{ index: number; title?: string; texts: string[] }> = [];
-  slidePaths.forEach((slidePath, i) => {
-    const xml = entries.get(slidePath)!.toString('utf8');
+  let totalParagraphs = 0;
+  let remainingChars = maxChars;
+  let rawCharsSeen = 0;
+  let truncated = false;
+
+  for (let i = 0; i < slidePaths.length; i += 1) {
+    if (remainingChars <= 0) {
+      truncated = true;
+      break;
+    }
+    const xml = entries.get(slidePaths[i])!.toString('utf8');
     const texts: string[] = [];
     const pRe = /<a:p\b[^>]*>[\s\S]*?<\/a:p>|<a:p\s*\/>/g;
     let p: RegExpExecArray | null;
     while ((p = pRe.exec(xml)) !== null) {
+      totalParagraphs += 1;
+      if (totalParagraphs > CLOUD_DOC_OOXML_MAX_PARAGRAPHS) {
+        throw new CloudDocContentError(
+          CLOUD_DOC_ERROR_CODES.CONTENT_TOO_LARGE,
+          `Presentation paragraph count exceeds maximum (${CLOUD_DOC_OOXML_MAX_PARAGRAPHS})`,
+          413,
+        );
+      }
       const text = extractParagraphRuns(p[0], /^<a:t(?:\s|>)/, /^<a:br(?:\s|\/>|>)/, /^<a:tab(?:\s|\/>|>)/).trimEnd();
-      if (text) texts.push(text);
+      if (!text) continue;
+      rawCharsSeen += text.length + 1;
+      if (text.length > remainingChars) {
+        texts.push(text.slice(0, remainingChars));
+        remainingChars = 0;
+        truncated = true;
+        break;
+      }
+      texts.push(text);
+      remainingChars -= text.length;
     }
     slides.push({
       index: i + 1,
       ...(texts[0] ? { title: texts[0] } : {}),
       texts,
     });
-  });
+    if (truncated) break;
+  }
 
-  const content = slides
+  const fullContent = slides
     .map((slide) => `--- Slide ${slide.index} ---${slide.texts.length ? `\n${slide.texts.join('\n')}` : ''}`)
     .join('\n\n');
 
-  return { content, slides };
+  if (fullContent.length > maxChars) {
+    truncated = true;
+  }
+  const content = truncated ? fullContent.slice(0, maxChars) : fullContent;
+  const totalChars = truncated ? Math.max(rawCharsSeen, fullContent.length, content.length + 1) : content.length;
+
+  return { content, slides, truncated, totalChars };
 }
 
 function parseCsvLine(line: string): string[] {
@@ -556,6 +746,7 @@ function parseXlsxInputSheets(content: string): Array<{ name: string; rows: stri
   const lines = normalized.split('\n');
   const sheets: Array<{ name: string; rows: string[][] }> = [];
   let current: { name: string; rows: string[][] } | null = null;
+  let totalCells = 0;
   const sheetHeaderRe = /^(?:##\s*)?Sheet:\s*(.+?)\s*$/i;
 
   for (let i = 0; i < lines.length; i += 1) {
@@ -579,24 +770,51 @@ function parseXlsxInputSheets(content: string): Array<{ name: string; rows: stri
       // Ignore trailing newline at EOF or separator blank line immediately before the next sheet header.
       continue;
     }
-    current.rows.push(parseRowCells(line));
+    const rowCells = parseRowCells(line);
+    if (rowCells.length > CLOUD_DOC_OOXML_MAX_ROW_COLS) {
+      throw new CloudDocContentError(
+        CLOUD_DOC_ERROR_CODES.CONTENT_TOO_LARGE,
+        `Spreadsheet row width exceeds maximum (${CLOUD_DOC_OOXML_MAX_ROW_COLS} columns)`,
+        413,
+      );
+    }
+    totalCells += rowCells.length;
+    if (totalCells > CLOUD_DOC_OOXML_MAX_CELLS) {
+      throw new CloudDocContentError(
+        CLOUD_DOC_ERROR_CODES.CONTENT_TOO_LARGE,
+        `Spreadsheet cell count exceeds maximum (${CLOUD_DOC_OOXML_MAX_CELLS})`,
+        413,
+      );
+    }
+    current.rows.push(rowCells);
   }
 
   return sheets.length > 0 ? sheets : [{ name: 'Sheet1', rows: [] }];
 }
 
+function buildDocxParagraphsXml(lines: ReadonlyArray<string>): string {
+  return (lines.length > 0 ? lines : [''])
+    .map((line) => `<w:p><w:r><w:t xml:space="preserve">${escapeXmlText(line)}</w:t></w:r></w:p>`)
+    .join('');
+}
+
 function buildDocxBytes(content: string): Buffer {
   const lines = content.replace(/\r\n/g, '\n').split('\n');
-  const paragraphs = (lines.length > 0 ? lines : ['']).map(
-    (line) => `<w:p><w:r><w:t xml:space="preserve">${escapeXmlText(line)}</w:t></w:r></w:p>`,
-  );
-  return buildZipArchive([
+  if (lines.length > CLOUD_DOC_OOXML_MAX_PARAGRAPHS) {
+    throw new CloudDocContentError(
+      CLOUD_DOC_ERROR_CODES.CONTENT_TOO_LARGE,
+      `Document paragraph count exceeds maximum (${CLOUD_DOC_OOXML_MAX_PARAGRAPHS})`,
+      413,
+    );
+  }
+  const paragraphs = buildDocxParagraphsXml(lines);
+  const files: Array<{ name: string; content: string | Buffer }> = [
     {
       name: '[Content_Types].xml',
       content:
         `${XML_DECLARATION}` +
         '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
-        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-officedocument.relationships+xml"/>' +
         '<Default Extension="xml" ContentType="application/xml"/>' +
         '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>' +
         '</Types>',
@@ -614,10 +832,30 @@ function buildDocxBytes(content: string): Buffer {
       content:
         `${XML_DECLARATION}` +
         '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
-        `<w:body>${paragraphs.join('')}<w:sectPr/></w:body>` +
+        `<w:body>${paragraphs}<w:sectPr/></w:body>` +
         '</w:document>',
     },
-  ]);
+  ];
+  checkArchiveOutputBounds(files);
+  return buildZipArchive(files);
+}
+
+function buildXlsxRowsXml(rows: ReadonlyArray<ReadonlyArray<string>>, startRowNum: number = 1): string {
+  return rows
+    .map((cells, rIdx) => {
+      const rowNum = startRowNum + rIdx;
+      const cellsXml = cells
+        .map((val, cIdx) => {
+          const ref = `${indexToColRef(cIdx)}${rowNum}`;
+          if (/^-?(?:0|[1-9]\d*)(?:\.\d+)?$/.test(val) && Number.isFinite(Number(val))) {
+            return `<c r="${ref}" t="n"><v>${val}</v></c>`;
+          }
+          return `<c r="${ref}" t="inlineStr"><is><t xml:space="preserve">${escapeXmlText(val)}</t></is></c>`;
+        })
+        .join('');
+      return `<row r="${rowNum}">${cellsXml}</row>`;
+    })
+    .join('');
 }
 
 function buildXlsxBytes(content: string): Buffer {
@@ -678,21 +916,7 @@ function buildXlsxBytes(content: string): Buffer {
   });
 
   sheets.forEach((sheet, idx) => {
-    const rowXml = sheet.rows
-      .map((cells, rIdx) => {
-        const rowNum = rIdx + 1;
-        const cellsXml = cells
-          .map((val, cIdx) => {
-            const ref = `${indexToColRef(cIdx)}${rowNum}`;
-            if (/^-?(?:0|[1-9]\d*)(?:\.\d+)?$/.test(val) && Number.isFinite(Number(val))) {
-              return `<c r="${ref}" t="n"><v>${val}</v></c>`;
-            }
-            return `<c r="${ref}" t="inlineStr"><is><t xml:space="preserve">${escapeXmlText(val)}</t></is></c>`;
-          })
-          .join('');
-        return `<row r="${rowNum}">${cellsXml}</row>`;
-      })
-      .join('');
+    const rowXml = buildXlsxRowsXml(sheet.rows, 1);
     files.push({
       name: `xl/worksheets/sheet${idx + 1}.xml`,
       content:
@@ -703,6 +927,7 @@ function buildXlsxBytes(content: string): Buffer {
     });
   });
 
+  checkArchiveOutputBounds(files);
   return buildZipArchive(files);
 }
 
@@ -713,6 +938,7 @@ function parsePptxInputSlides(content: string): string[][] {
   const lines = normalized.split('\n');
   const slides: string[][] = [];
   let current: string[] | null = null;
+  let totalParagraphs = 0;
 
   for (const line of lines) {
     if (/^---\s*(?:Slide\s+\d+[^-]*)?---\s*$/i.test(line)) {
@@ -725,11 +951,39 @@ function parsePptxInputSlides(content: string): string[][] {
       slides.push(current);
     }
     if (line.trim() !== '') {
+      totalParagraphs += 1;
+      if (totalParagraphs > CLOUD_DOC_OOXML_MAX_PARAGRAPHS) {
+        throw new CloudDocContentError(
+          CLOUD_DOC_ERROR_CODES.CONTENT_TOO_LARGE,
+          `Presentation paragraph count exceeds maximum (${CLOUD_DOC_OOXML_MAX_PARAGRAPHS})`,
+          413,
+        );
+      }
       current.push(line);
     }
   }
 
   return slides.length > 0 ? slides : [[]];
+}
+
+function buildPptxSlideXml(slideLines: ReadonlyArray<string>): string {
+  const paragraphs = (slideLines.length > 0 ? slideLines : [''])
+    .map((line) => `<a:p><a:r><a:t>${escapeXmlText(line)}</a:t></a:r></a:p>`)
+    .join('');
+  return (
+    `${XML_DECLARATION}` +
+    '<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">' +
+    '<p:cSld><p:spTree>' +
+    '<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>' +
+    '<p:grpSpPr/>' +
+    '<p:sp>' +
+    '<p:nvSpPr><p:cNvPr id="2" name="Content"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>' +
+    '<p:spPr><a:xfrm><a:off x="457200" y="457200"/><a:ext cx="8229600" cy="5943600"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>' +
+    `<p:txBody><a:bodyPr wrap="square"/><a:lstStyle/>${paragraphs}</p:txBody>` +
+    '</p:sp>' +
+    '</p:spTree></p:cSld>' +
+    '</p:sld>'
+  );
 }
 
 function buildPptxBytes(content: string): Buffer {
@@ -792,27 +1046,293 @@ function buildPptxBytes(content: string): Buffer {
   });
 
   slides.forEach((slideLines, idx) => {
-    const paragraphs = (slideLines.length > 0 ? slideLines : [''])
-      .map((line) => `<a:p><a:r><a:t>${escapeXmlText(line)}</a:t></a:r></a:p>`)
-      .join('');
     files.push({
       name: `ppt/slides/slide${idx + 1}.xml`,
-      content:
-        `${XML_DECLARATION}` +
-        '<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">' +
-        '<p:cSld><p:spTree>' +
-        '<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>' +
-        '<p:grpSpPr/>' +
-        '<p:sp>' +
-        '<p:nvSpPr><p:cNvPr id="2" name="Content"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>' +
-        '<p:spPr><a:xfrm><a:off x="457200" y="457200"/><a:ext cx="8229600" cy="5943600"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>' +
-        `<p:txBody><a:bodyPr wrap="square"/><a:lstStyle/>${paragraphs}</p:txBody>` +
-        '</p:sp>' +
-        '</p:spTree></p:cSld>' +
-        '</p:sld>',
+      content: buildPptxSlideXml(slideLines),
     });
   });
 
+  checkArchiveOutputBounds(files);
+  return buildZipArchive(files);
+}
+
+function archiveFilesFromEntries(entries: Map<string, Buffer>): Array<{ name: string; content: Buffer }> {
+  const files: Array<{ name: string; content: Buffer }> = [];
+  for (const [name, content] of entries) {
+    files.push({ name, content });
+  }
+  return files;
+}
+
+function appendDocxBytes(existingBytes: Buffer, appendContent: string): Buffer {
+  const entries = extractZipEntries(existingBytes);
+  const docBuf = entries.get('word/document.xml');
+  if (!docBuf) {
+    throw new CloudDocContentError(CLOUD_DOC_ERROR_CODES.INVALID_ARCHIVE, 'Missing word/document.xml in DOCX');
+  }
+  const xml = docBuf.toString('utf8');
+  const lines = appendContent.replace(/\r\n/g, '\n').split('\n');
+  const existingParagraphs = xml.match(/<w:p\b/g)?.length ?? 0;
+  if (existingParagraphs + lines.length > CLOUD_DOC_OOXML_MAX_PARAGRAPHS) {
+    throw new CloudDocContentError(
+      CLOUD_DOC_ERROR_CODES.CONTENT_TOO_LARGE,
+      `Document paragraph count exceeds maximum (${CLOUD_DOC_OOXML_MAX_PARAGRAPHS})`,
+      413,
+    );
+  }
+  const newParagraphsXml = buildDocxParagraphsXml(lines);
+
+  let updatedXml: string;
+  const selfClosingBody = /<w:body\s*\/>/.exec(xml);
+  if (selfClosingBody) {
+    updatedXml = xml.replace(/<w:body\s*\/>/, `<w:body>${newParagraphsXml}</w:body>`);
+  } else {
+    const bodyOpenMatch = /<w:body\b[^>]*>/.exec(xml);
+    const bodyCloseIdx = xml.lastIndexOf('</w:body>');
+    if (!bodyOpenMatch || bodyCloseIdx === -1 || bodyCloseIdx < bodyOpenMatch.index + bodyOpenMatch[0].length) {
+      throw new CloudDocContentError(
+        CLOUD_DOC_ERROR_CODES.UNSUPPORTED_CONTENT_EDIT,
+        'DOCX structure lacks a supported </w:body> anchor for non-destructive append',
+        400,
+      );
+    }
+    const bodyStart = bodyOpenMatch.index + bodyOpenMatch[0].length;
+    const bodySlice = xml.slice(bodyStart, bodyCloseIdx);
+    const lastSectIdx = bodySlice.lastIndexOf('<w:sectPr');
+    const tailAfterSect = lastSectIdx !== -1 ? bodySlice.slice(lastSectIdx) : '';
+    const insertAt =
+      lastSectIdx !== -1 && !/<\/w:(?:p|tbl)>/i.test(tailAfterSect) ? bodyStart + lastSectIdx : bodyCloseIdx;
+    updatedXml = `${xml.slice(0, insertAt)}${newParagraphsXml}${xml.slice(insertAt)}`;
+  }
+
+  entries.set('word/document.xml', Buffer.from(updatedXml, 'utf8'));
+  const files = archiveFilesFromEntries(entries);
+  checkArchiveOutputBounds(files);
+  return buildZipArchive(files);
+}
+
+function appendXlsxBytes(existingBytes: Buffer, appendContent: string): Buffer {
+  const entries = extractZipEntries(existingBytes);
+  const sheetSpecs = discoverXlsxSheets(entries);
+
+  const normalizedInput = appendContent.replace(/\r\n/g, '\n');
+  const hasExplicitSheetHeaders = /(?:^|\n)(?:##\s*)?Sheet:\s*.+/i.test(normalizedInput);
+  const parsedSheets = parseXlsxInputSheets(appendContent);
+
+  const appendPlan = new Map<string, string[][]>();
+  if (!hasExplicitSheetHeaders) {
+    appendPlan.set(sheetSpecs[0].path, parsedSheets[0]?.rows ?? []);
+  } else {
+    for (const ps of parsedSheets) {
+      const target = sheetSpecs.find((spec) => spec.name === ps.name);
+      if (!target) {
+        throw new CloudDocContentError(
+          CLOUD_DOC_ERROR_CODES.UNSUPPORTED_CONTENT_EDIT,
+          `Target worksheet "${ps.name}" does not exist for non-destructive append`,
+          400,
+        );
+      }
+      const existingPlan = appendPlan.get(target.path) ?? [];
+      appendPlan.set(target.path, [...existingPlan, ...ps.rows]);
+    }
+  }
+
+  let totalWorkbookCells = 0;
+  for (const spec of sheetSpecs) {
+    const sheetXml = entries.get(spec.path)?.toString('utf8') ?? '';
+    totalWorkbookCells += sheetXml.match(/<c\b/g)?.length ?? 0;
+  }
+  let addedCells = 0;
+  for (const rows of appendPlan.values()) {
+    for (const row of rows) {
+      if (row.length > CLOUD_DOC_OOXML_MAX_ROW_COLS) {
+        throw new CloudDocContentError(
+          CLOUD_DOC_ERROR_CODES.CONTENT_TOO_LARGE,
+          `Spreadsheet row width exceeds maximum (${CLOUD_DOC_OOXML_MAX_ROW_COLS} columns)`,
+          413,
+        );
+      }
+      addedCells += row.length;
+    }
+  }
+  if (totalWorkbookCells + addedCells > CLOUD_DOC_OOXML_MAX_CELLS) {
+    throw new CloudDocContentError(
+      CLOUD_DOC_ERROR_CODES.CONTENT_TOO_LARGE,
+      `Spreadsheet cell count exceeds maximum (${CLOUD_DOC_OOXML_MAX_CELLS})`,
+      413,
+    );
+  }
+
+  for (const [path, rowsToAppend] of appendPlan) {
+    if (rowsToAppend.length === 0) continue;
+    const sheetXml = entries.get(path)!.toString('utf8');
+    if (/<tableParts\b/i.test(sheetXml)) {
+      throw new CloudDocContentError(
+        CLOUD_DOC_ERROR_CODES.UNSUPPORTED_CONTENT_EDIT,
+        'Non-destructive XLSX append refuses worksheets with structured <tableParts> ranges',
+        400,
+      );
+    }
+
+    let maxRow = 0;
+    let sequentialRows = 0;
+    const rowTagRe = /<row\b([^>]*)>/g;
+    let rm: RegExpExecArray | null;
+    while ((rm = rowTagRe.exec(sheetXml)) !== null) {
+      sequentialRows += 1;
+      const attrs = parseXmlAttributes(rm[1]);
+      const explicitRow = attrs.r ? Number.parseInt(attrs.r, 10) : 0;
+      maxRow = Math.max(maxRow, Number.isFinite(explicitRow) && explicitRow > 0 ? explicitRow : sequentialRows);
+    }
+
+    const newRowsXml = buildXlsxRowsXml(rowsToAppend, maxRow + 1);
+    let updatedSheetXml: string;
+    const selfClosingSheetData = /<sheetData\s*\/>/.exec(sheetXml);
+    if (selfClosingSheetData) {
+      updatedSheetXml = sheetXml.replace(/<sheetData\s*\/>/, `<sheetData>${newRowsXml}</sheetData>`);
+    } else {
+      const sheetDataCloseIdx = sheetXml.lastIndexOf('</sheetData>');
+      if (sheetDataCloseIdx === -1) {
+        throw new CloudDocContentError(
+          CLOUD_DOC_ERROR_CODES.UNSUPPORTED_CONTENT_EDIT,
+          'Worksheet lacks a supported </sheetData> anchor for non-destructive append',
+          400,
+        );
+      }
+      updatedSheetXml = `${sheetXml.slice(0, sheetDataCloseIdx)}${newRowsXml}${sheetXml.slice(sheetDataCloseIdx)}`;
+    }
+    entries.set(path, Buffer.from(updatedSheetXml, 'utf8'));
+  }
+
+  const files = archiveFilesFromEntries(entries);
+  checkArchiveOutputBounds(files);
+  return buildZipArchive(files);
+}
+
+function appendPptxBytes(existingBytes: Buffer, appendContent: string): Buffer {
+  const entries = extractZipEntries(existingBytes);
+  const existingSlidePaths = [...entries.keys()].filter((k) => /^ppt\/slides\/slide\d+\.xml$/i.test(k));
+  if (existingSlidePaths.length === 0) {
+    throw new CloudDocContentError(CLOUD_DOC_ERROR_CODES.INVALID_ARCHIVE, 'Missing slide XML in PPTX');
+  }
+
+  const presBuf = entries.get('ppt/presentation.xml');
+  const relsBuf = entries.get('ppt/_rels/presentation.xml.rels');
+  const contentTypesBuf = entries.get('[Content_Types].xml');
+  if (!presBuf || !relsBuf || !contentTypesBuf) {
+    throw new CloudDocContentError(
+      CLOUD_DOC_ERROR_CODES.UNSUPPORTED_CONTENT_EDIT,
+      'PPTX archive lacks required presentation metadata parts for non-destructive append',
+      400,
+    );
+  }
+
+  const presXml = presBuf.toString('utf8');
+  if (/<p:sectionLst\b/i.test(presXml)) {
+    throw new CloudDocContentError(
+      CLOUD_DOC_ERROR_CODES.UNSUPPORTED_CONTENT_EDIT,
+      'Non-destructive PPTX append refuses decks with <p:sectionLst> slide sections',
+      400,
+    );
+  }
+
+  const relsXml = relsBuf.toString('utf8');
+  const contentTypesXml = contentTypesBuf.toString('utf8');
+  const hasSelfClosingSldIdLst = /<p:sldIdLst\s*\/>/.test(presXml);
+  const sldIdLstCloseIdx = presXml.lastIndexOf('</p:sldIdLst>');
+  const relsCloseIdx = relsXml.lastIndexOf('</Relationships>');
+  const typesCloseIdx = contentTypesXml.lastIndexOf('</Types>');
+  if ((!hasSelfClosingSldIdLst && sldIdLstCloseIdx === -1) || relsCloseIdx === -1 || typesCloseIdx === -1) {
+    throw new CloudDocContentError(
+      CLOUD_DOC_ERROR_CODES.UNSUPPORTED_CONTENT_EDIT,
+      'PPTX structure lacks required XML anchors for non-destructive append',
+      400,
+    );
+  }
+
+  let existingParagraphs = 0;
+  for (const slidePath of existingSlidePaths) {
+    const slideXml = entries.get(slidePath)?.toString('utf8') ?? '';
+    existingParagraphs += slideXml.match(/<a:p\b/g)?.length ?? 0;
+  }
+  const slidesToAdd = parsePptxInputSlides(appendContent);
+  const addedParagraphs = slidesToAdd.reduce((sum, slide) => sum + Math.max(1, slide.length), 0);
+  if (existingParagraphs + addedParagraphs > CLOUD_DOC_OOXML_MAX_PARAGRAPHS) {
+    throw new CloudDocContentError(
+      CLOUD_DOC_ERROR_CODES.CONTENT_TOO_LARGE,
+      `Presentation paragraph count exceeds maximum (${CLOUD_DOC_OOXML_MAX_PARAGRAPHS})`,
+      413,
+    );
+  }
+
+  let maxSlideNum = 0;
+  for (const slidePath of existingSlidePaths) {
+    const num = Number.parseInt(/slide(\d+)\.xml$/i.exec(slidePath)?.[1] ?? '0', 10);
+    if (Number.isFinite(num)) maxSlideNum = Math.max(maxSlideNum, num);
+  }
+
+  let maxSldId = 255;
+  const sldIdNumRe = /<p:sldId\b([^>]*?)\/?>/g;
+  let sm: RegExpExecArray | null;
+  while ((sm = sldIdNumRe.exec(presXml)) !== null) {
+    const idVal = Number.parseInt(parseXmlAttributes(sm[1]).id ?? '0', 10);
+    if (Number.isFinite(idVal)) maxSldId = Math.max(maxSldId, idVal);
+  }
+
+  let maxRId = 0;
+  const relIdRe = /\bId\s*=\s*(?:"rId(\d+)"|'rId(\d+)')/g;
+  let rm: RegExpExecArray | null;
+  while ((rm = relIdRe.exec(relsXml)) !== null) {
+    const rVal = Number.parseInt(rm[1] ?? rm[2] ?? '0', 10);
+    if (Number.isFinite(rVal)) maxRId = Math.max(maxRId, rVal);
+  }
+
+  // Inherit slideLayout relationship if present on existing slides.
+  let templateSlideLayoutRels: string | null = null;
+  const sortedSlides = [...existingSlidePaths].sort();
+  for (const slidePath of sortedSlides) {
+    const baseName = slidePath.slice('ppt/slides/'.length);
+    const slideRelsBuf = entries.get(`ppt/slides/_rels/${baseName}.rels`);
+    if (!slideRelsBuf) continue;
+    const layoutMatch = /<Relationship\b[^>]*slideLayout[^>]*\/?>/i.exec(slideRelsBuf.toString('utf8'));
+    if (layoutMatch) {
+      templateSlideLayoutRels =
+        `${XML_DECLARATION}` +
+        `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${layoutMatch[0]}</Relationships>`;
+      break;
+    }
+  }
+
+  let newSldIdsXml = '';
+  let newRelsXml = '';
+  let newOverridesXml = '';
+  for (const slideLines of slidesToAdd) {
+    maxSlideNum += 1;
+    maxSldId += 1;
+    maxRId += 1;
+    const rId = `rId${maxRId}`;
+    const slideEntry = `ppt/slides/slide${maxSlideNum}.xml`;
+    entries.set(slideEntry, Buffer.from(buildPptxSlideXml(slideLines), 'utf8'));
+    if (templateSlideLayoutRels) {
+      entries.set(`ppt/slides/_rels/slide${maxSlideNum}.xml.rels`, Buffer.from(templateSlideLayoutRels, 'utf8'));
+    }
+    newSldIdsXml += `<p:sldId id="${maxSldId}" r:id="${rId}"/>`;
+    newRelsXml += `<Relationship Id="${rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide${maxSlideNum}.xml"/>`;
+    newOverridesXml += `<Override PartName="/${slideEntry}" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>`;
+  }
+
+  const updatedPresXml = hasSelfClosingSldIdLst
+    ? presXml.replace(/<p:sldIdLst\s*\/>/, `<p:sldIdLst>${newSldIdsXml}</p:sldIdLst>`)
+    : `${presXml.slice(0, sldIdLstCloseIdx)}${newSldIdsXml}${presXml.slice(sldIdLstCloseIdx)}`;
+  const updatedRelsXml = `${relsXml.slice(0, relsCloseIdx)}${newRelsXml}${relsXml.slice(relsCloseIdx)}`;
+  const updatedTypesXml = `${contentTypesXml.slice(0, typesCloseIdx)}${newOverridesXml}${contentTypesXml.slice(typesCloseIdx)}`;
+
+  entries.set('ppt/presentation.xml', Buffer.from(updatedPresXml, 'utf8'));
+  entries.set('ppt/_rels/presentation.xml.rels', Buffer.from(updatedRelsXml, 'utf8'));
+  entries.set('[Content_Types].xml', Buffer.from(updatedTypesXml, 'utf8'));
+
+  const files = archiveFilesFromEntries(entries);
+  checkArchiveOutputBounds(files);
   return buildZipArchive(files);
 }
 
@@ -825,36 +1345,44 @@ export function extractCloudDocContent(
   const boundedMax = Math.max(1, Math.min(maxChars, CLOUD_DOC_CONTENT_MAX_CHARS));
 
   let format: CloudDocContentPayload['format'];
-  let fullContent: string;
+  let content: string;
+  let truncated: boolean;
+  let totalChars: number;
   let sheets: Array<{ name: string; rows: string[][] }> | undefined;
   let slides: Array<{ index: number; title?: string; texts: string[] }> | undefined;
 
   if (normalizedExt === '.docx') {
     format = 'docx';
-    fullContent = extractDocxText(extractZipEntries(bytes));
+    const extracted = extractDocxText(extractZipEntries(bytes), boundedMax);
+    content = extracted.content;
+    truncated = extracted.truncated;
+    totalChars = extracted.totalChars;
   } else if (normalizedExt === '.xlsx') {
     format = 'xlsx';
-    const extracted = extractXlsxContent(extractZipEntries(bytes));
-    fullContent = extracted.content;
+    const extracted = extractXlsxContent(extractZipEntries(bytes), boundedMax);
+    content = extracted.content;
+    truncated = extracted.truncated;
+    totalChars = extracted.totalChars;
     sheets = extracted.sheets;
   } else if (normalizedExt === '.pptx') {
     format = 'pptx';
-    const extracted = extractPptxContent(extractZipEntries(bytes));
-    fullContent = extracted.content;
+    const extracted = extractPptxContent(extractZipEntries(bytes), boundedMax);
+    content = extracted.content;
+    truncated = extracted.truncated;
+    totalChars = extracted.totalChars;
     slides = extracted.slides;
   } else if (isPlainTextExt(normalizedExt)) {
     format = 'text';
-    fullContent = bytes.toString('utf8');
+    const fullContent = bytes.toString('utf8');
+    totalChars = fullContent.length;
+    truncated = totalChars > boundedMax;
+    content = truncated ? fullContent.slice(0, boundedMax) : fullContent;
   } else {
     throw new CloudDocContentError(
       CLOUD_DOC_ERROR_CODES.UNSUPPORTED_FORMAT,
       `Text content extraction is not supported for ${normalizedExt} files`,
     );
   }
-
-  const totalChars = fullContent.length;
-  const truncated = totalChars > boundedMax;
-  const content = truncated ? fullContent.slice(0, boundedMax) : fullContent;
 
   return {
     ext: normalizedExt,
@@ -908,19 +1436,44 @@ export function applyCloudDocContentEdit(params: {
       `Editing text content is not supported for ${normalizedExt} files`,
     );
   }
-
-  let nextText = params.content;
-  if (params.mode === 'append') {
-    const current = extractCloudDocContent(normalizedExt, params.existingBytes, CLOUD_DOC_CONTENT_MAX_CHARS);
-    if (current.truncated) {
-      throw new CloudDocContentError(
-        CLOUD_DOC_ERROR_CODES.CONTENT_TOO_LARGE,
-        'Existing document exceeds readable edit limit',
-        413,
-      );
-    }
-    nextText = current.content ? `${current.content}\n${params.content}` : params.content;
+  if (params.content.length > CLOUD_DOC_CONTENT_MAX_CHARS) {
+    throw new CloudDocContentError(
+      CLOUD_DOC_ERROR_CODES.CONTENT_TOO_LARGE,
+      `Document content exceeds maximum length of ${CLOUD_DOC_CONTENT_MAX_CHARS} characters`,
+      413,
+    );
   }
 
-  return buildCloudDocBytesFromContent(normalizedExt, nextText);
+  if (params.mode === 'replace') {
+    return buildCloudDocBytesFromContent(normalizedExt, params.content);
+  }
+
+  if (normalizedExt === '.docx') {
+    return appendDocxBytes(params.existingBytes, params.content);
+  }
+  if (normalizedExt === '.xlsx') {
+    return appendXlsxBytes(params.existingBytes, params.content);
+  }
+  if (normalizedExt === '.pptx') {
+    return appendPptxBytes(params.existingBytes, params.content);
+  }
+
+  // Plain-text append: keep existing bytes intact and enforce total char limit.
+  const existingText = params.existingBytes.toString('utf8');
+  if (existingText.length > CLOUD_DOC_CONTENT_MAX_CHARS) {
+    throw new CloudDocContentError(
+      CLOUD_DOC_ERROR_CODES.CONTENT_TOO_LARGE,
+      'Existing document exceeds readable edit limit',
+      413,
+    );
+  }
+  const nextText = existingText ? `${existingText}\n${params.content}` : params.content;
+  if (nextText.length > CLOUD_DOC_CONTENT_MAX_CHARS) {
+    throw new CloudDocContentError(
+      CLOUD_DOC_ERROR_CODES.CONTENT_TOO_LARGE,
+      `Document content exceeds maximum length of ${CLOUD_DOC_CONTENT_MAX_CHARS} characters`,
+      413,
+    );
+  }
+  return Buffer.from(nextText, 'utf8');
 }
