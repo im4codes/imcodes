@@ -122,7 +122,7 @@ describe('exact MCP discovery fallback', () => {
     const { call, sendToolListChanged } = harness(targets);
     const expected = cloudDocNames.slice(0, 6);
 
-    for (const query of ['cloud doc', 'cloud docs', 'cloud-docs', '云文档', '共享文档', 'shared doc', 'onlyoffice', 'group:cloud-docs']) {
+    for (const query of ['cloud doc', 'cloud docs', 'cloud-docs', '云文档', '共享文档', 'shared doc', 'shared docs', 'onlyoffice', 'group:cloud-docs']) {
       await expect(call({ query })).resolves.toMatchObject({
         structuredContent: {
           status: 'ok',
@@ -138,7 +138,7 @@ describe('exact MCP discovery fallback', () => {
       });
       expect(targets.find((tool) => tool.name === 'unrelated_hidden_tool')?.enabled).toBe(false);
     }
-    expect(sendToolListChanged).toHaveBeenCalledTimes(8);
+    expect(sendToolListChanged).toHaveBeenCalledTimes(9);
 
     // Multi-token query containing Chinese keywords matches preview metadata via Unicode tokenization without wildcard publishing
     const chinesePreview = await call({ query: '云文档 xlsx' });

@@ -216,6 +216,93 @@ describe('cloud-doc-content OOXML & text service', () => {
     );
   });
 
+  it('bounds XLSX empty rows, mixed empty/non-empty rows, empty multi-sheets, and empty PPTX slides under maxChars and default budget', () => {
+    // 1. 20,000 empty rows under maxChars=16 cannot return 20k empty row nodes
+    const emptyRows20k = buildZipArchive([
+      {
+        name: 'xl/worksheets/sheet1.xml',
+        content:
+          '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>' +
+          Array.from({ length: 20_000 }, (_v, i) => `<row r="${i + 1}"></row>`).join('') +
+          '</sheetData></worksheet>',
+      },
+    ]);
+    const boundedEmptyXlsx = extractCloudDocContent('.xlsx', emptyRows20k, 16);
+    expect(boundedEmptyXlsx.truncated).toBe(true);
+    expect(boundedEmptyXlsx.content.length).toBeLessThanOrEqual(16);
+    expect(boundedEmptyXlsx.sheets?.[0].rows.length ?? 0).toBeLessThanOrEqual(17);
+
+    // 2. Mixed empty + non-empty rows stop before reaching trailing marker
+    const mixedRows = buildZipArchive([
+      {
+        name: 'xl/worksheets/sheet1.xml',
+        content:
+          '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>' +
+          '<row r="1"><c r="A1" t="inlineStr"><is><t>Head</t></is></c></row>' +
+          Array.from({ length: 200 }, (_v, i) => `<row r="${i + 2}"></row>`).join('') +
+          '<row r="202"><c r="A202" t="inlineStr"><is><t>TAIL_SHOULD_STOP</t></is></c></row>' +
+          '</sheetData></worksheet>',
+      },
+    ]);
+    const boundedMixed = extractCloudDocContent('.xlsx', mixedRows, 16);
+    expect(boundedMixed.truncated).toBe(true);
+    expect(boundedMixed.sheets?.[0].rows.length ?? 0).toBeLessThanOrEqual(17);
+    expect(JSON.stringify(boundedMixed.sheets)).not.toContain('TAIL_SHOULD_STOP');
+
+    // 3. 200 empty multi-sheet workbook stops cleanly under maxChars=16
+    const manyEmptySheets = buildZipArchive([
+      {
+        name: 'xl/workbook.xml',
+        content:
+          '<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>' +
+          Array.from({ length: 200 }, (_v, i) => `<sheet name="Tab${i + 1}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`).join('') +
+          '</sheets></workbook>',
+      },
+      {
+        name: 'xl/_rels/workbook.xml.rels',
+        content:
+          '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+          Array.from({ length: 200 }, (_v, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`).join('') +
+          '</Relationships>',
+      },
+      ...Array.from({ length: 200 }, (_v, i) => ({
+        name: `xl/worksheets/sheet${i + 1}.xml`,
+        content: '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"></row></sheetData></worksheet>',
+      })),
+    ]);
+    const boundedSheets = extractCloudDocContent('.xlsx', manyEmptySheets, 16);
+    expect(boundedSheets.truncated).toBe(true);
+    expect(boundedSheets.content.length).toBeLessThanOrEqual(16);
+    expect(boundedSheets.sheets?.length ?? 0).toBeLessThanOrEqual(2);
+
+    // 4. 200 empty PPTX slides under maxChars=16 stop at header budget (<= 2 slides)
+    const emptySlides200 = buildZipArchive(
+      Array.from({ length: 200 }, (_v, i) => ({
+        name: `ppt/slides/slide${i + 1}.xml`,
+        content: '<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree/></p:cSld></p:sld>',
+      })),
+    );
+    const boundedEmptyPptx = extractCloudDocContent('.pptx', emptySlides200, 16);
+    expect(boundedEmptyPptx.truncated).toBe(true);
+    expect(boundedEmptyPptx.content.length).toBeLessThanOrEqual(16);
+    expect(boundedEmptyPptx.slides?.length ?? 0).toBeLessThanOrEqual(2);
+
+    // 5. Default CLOUD_DOC_CONTENT_MAX_CHARS cap still enforces truncation cleanly on >200k empty rows
+    const hugeEmptyRows = buildZipArchive([
+      {
+        name: 'xl/worksheets/sheet1.xml',
+        content:
+          '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>' +
+          '<row/>'.repeat(CLOUD_DOC_CONTENT_MAX_CHARS + 500) +
+          '</sheetData></worksheet>',
+      },
+    ]);
+    const defaultBounded = extractCloudDocContent('.xlsx', hugeEmptyRows);
+    expect(defaultBounded.truncated).toBe(true);
+    expect(defaultBounded.content.length).toBe(CLOUD_DOC_CONTENT_MAX_CHARS);
+    expect(defaultBounded.sheets?.[0].rows.length ?? 0).toBeLessThanOrEqual(CLOUD_DOC_CONTENT_MAX_CHARS + 1);
+  });
+
   it('performs non-destructive surgical append on DOCX, XLSX, and PPTX and fails closed on unsupported structures', () => {
     // 1. XLSX preserves formulas, style attributes, and calcChain while appending new rows cleanly
     const richXlsx = buildZipArchive([

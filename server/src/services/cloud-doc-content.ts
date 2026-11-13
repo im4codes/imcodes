@@ -501,6 +501,7 @@ function extractXlsxContent(
 ): { content: string; sheets: Array<{ name: string; rows: string[][] }>; truncated: boolean; totalChars: number } {
   const sharedStrings = parseSharedStrings(entries.get('xl/sharedStrings.xml'));
   const sheetSpecs = discoverXlsxSheets(entries);
+  const isSingleDefaultSheet = sheetSpecs.length === 1 && sheetSpecs[0].name === 'Sheet1';
 
   const sheets: Array<{ name: string; rows: string[][] }> = [];
   let totalCells = 0;
@@ -508,21 +509,43 @@ function extractXlsxContent(
   let rawCharsSeen = 0;
   let truncated = false;
 
-  for (const spec of sheetSpecs) {
-    if (truncated) break;
+  for (let sIdx = 0; sIdx < sheetSpecs.length; sIdx += 1) {
+    if (remainingChars <= 0) {
+      truncated = true;
+      break;
+    }
+    const spec = sheetSpecs[sIdx];
+    const headerLen = isSingleDefaultSheet
+      ? 0
+      : (sIdx > 0 ? 2 : 0) + `## Sheet: ${spec.name}`.length;
+    if (sIdx > 0 && remainingChars <= 2) {
+      truncated = true;
+      break;
+    }
+    rawCharsSeen += headerLen;
+    remainingChars = Math.max(0, remainingChars - headerLen);
+
     const sheetXml = entries.get(spec.path)!.toString('utf8');
     const rows: string[][] = [];
-    const rowRe = /<row\b[^>]*>([\s\S]*?)<\/row>/g;
+    const rowRe = /<row\b[^>]*\/>|<row\b[^>]*>([\s\S]*?)<\/row>/g;
     let rMatch: RegExpExecArray | null;
     while ((rMatch = rowRe.exec(sheetXml)) !== null) {
-      if (remainingChars <= 0) {
-        truncated = true;
-        break;
+      const rowInnerXml = rMatch[1] ?? '';
+      if (rows.length > 0 || !isSingleDefaultSheet) {
+        if (remainingChars <= 0) {
+          truncated = true;
+          break;
+        }
+        // Account for the rendered newline separator between rows (including empty rows).
+        if (rows.length > 0) {
+          rawCharsSeen += 1;
+          remainingChars -= 1;
+        }
       }
       const rowValues: string[] = [];
       const cellRe = /<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g;
       let cMatch: RegExpExecArray | null;
-      while ((cMatch = cellRe.exec(rMatch[1])) !== null) {
+      while ((cMatch = cellRe.exec(rowInnerXml)) !== null) {
         const attrs = parseXmlAttributes(cMatch[1]);
         const body = cMatch[2] ?? '';
         const colIdx = attrs.r ? colRefToIndex(attrs.r) : rowValues.length;
@@ -543,7 +566,6 @@ function extractXlsxContent(
             413,
           );
         }
-        while (rowValues.length < targetCol) rowValues.push('');
 
         const cellType = attrs.t ?? '';
         let value = '';
@@ -567,7 +589,16 @@ function extractXlsxContent(
             value = rawV;
           }
         }
-        rawCharsSeen += value.length + 1;
+
+        const tabsNeeded = rowValues.length === 0 ? targetCol : Math.max(0, targetCol - rowValues.length + 1);
+        rawCharsSeen += tabsNeeded + value.length;
+        if (tabsNeeded > remainingChars) {
+          remainingChars = 0;
+          truncated = true;
+          break;
+        }
+        remainingChars -= tabsNeeded;
+        while (rowValues.length < targetCol) rowValues.push('');
         if (value.length > remainingChars) {
           rowValues[targetCol] = value.slice(0, remainingChars);
           remainingChars = 0;
@@ -586,6 +617,10 @@ function extractXlsxContent(
       if (truncated) break;
     }
     sheets.push({ name: spec.name, rows });
+    if (remainingChars <= 0 && sIdx < sheetSpecs.length - 1) {
+      truncated = true;
+      break;
+    }
   }
 
   const fullContent =
@@ -656,6 +691,14 @@ function extractPptxContent(
       truncated = true;
       break;
     }
+    const slideHeaderCost = (i > 0 ? 2 : 0) + `--- Slide ${i + 1} ---`.length;
+    if (i > 0 && remainingChars <= 2) {
+      truncated = true;
+      break;
+    }
+    rawCharsSeen += slideHeaderCost;
+    remainingChars = Math.max(0, remainingChars - slideHeaderCost);
+
     const xml = entries.get(slidePaths[i])!.toString('utf8');
     const texts: string[] = [];
     const pRe = /<a:p\b[^>]*>[\s\S]*?<\/a:p>|<a:p\s*\/>/g;
@@ -671,7 +714,14 @@ function extractPptxContent(
       }
       const text = extractParagraphRuns(p[0], /^<a:t(?:\s|>)/, /^<a:br(?:\s|\/>|>)/, /^<a:tab(?:\s|\/>|>)/).trimEnd();
       if (!text) continue;
-      rawCharsSeen += text.length + 1;
+      const lineSep = texts.length > 0 ? 1 : 0;
+      rawCharsSeen += lineSep + text.length;
+      if (remainingChars <= lineSep) {
+        remainingChars = 0;
+        truncated = true;
+        break;
+      }
+      remainingChars -= lineSep;
       if (text.length > remainingChars) {
         texts.push(text.slice(0, remainingChars));
         remainingChars = 0;
@@ -686,7 +736,10 @@ function extractPptxContent(
       ...(texts[0] ? { title: texts[0] } : {}),
       texts,
     });
-    if (truncated) break;
+    if (remainingChars <= 0 && i < slidePaths.length - 1) {
+      truncated = true;
+      break;
+    }
   }
 
   const fullContent = slides
