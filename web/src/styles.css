@@ -3541,83 +3541,110 @@ html.native-ios-mac .chat-dl-btn {
 .voice-hold-hud-zones {
   position: relative;
   z-index: 1;
-  display: grid;
-  grid-template-columns: 1fr 1.25fr 1fr;
-  align-items: end;
-  gap: 6px;
-  padding: 12px 2px 0;
-  border-radius: 0 0 14px 14px;
-  background: radial-gradient(ellipse 92% 100% at 50% 100%, rgba(15,29,52,0.78) 0%, rgba(15,23,42,0.18) 68%, transparent 74%);
-  flex-shrink: 0;
-}
-.voice-hold-zone {
   display: flex;
-  flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 3px;
-  min-width: 0;
-  min-height: 60px;
-  text-align: center;
-  font-size: 12px;
-  font-weight: 700;
-  line-height: 1.2;
-  padding: 8px 6px;
-  border-radius: 22px;
+  width: 100%;
+  max-width: 100%;
+  padding: 6px 0 0;
+  border-radius: 0 0 14px 14px;
+  background: radial-gradient(ellipse 90% 95% at 50% 100%, rgba(15,29,52,0.78) 0%, rgba(15,23,42,0.18) 68%, transparent 74%);
+  flex-shrink: 0;
+  overflow: hidden;
+}
+.voice-hold-fan-svg {
+  display: block;
+  width: 100%;
+  max-width: 344px;
+  height: auto;
+  max-height: 152px;
+  overflow: visible;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.voice-hold-fan-track {
+  fill: none;
+  stroke: rgba(56,189,248,0.22);
+  stroke-width: 1.2;
+  stroke-dasharray: 4 4;
+}
+.voice-hold-fan-track-inner {
+  stroke: rgba(148,163,184,0.22);
+  stroke-dasharray: none;
+}
+.voice-hold-zone {
   color: #cbd5e1;
-  background: rgba(15,23,42,0.86);
-  border: 1.5px solid rgba(148,163,184,0.26);
-  transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease, transform 0.14s ease, box-shadow 0.14s ease;
+  transform-box: fill-box;
+  transform-origin: center bottom;
+  transition: transform 0.14s ease, filter 0.14s ease, color 0.14s ease;
+}
+.voice-hold-fan-sector {
+  fill: rgba(15,23,42,0.88);
+  stroke: rgba(148,163,184,0.3);
+  stroke-width: 1.5;
+  transition: fill 0.14s ease, stroke 0.14s ease, stroke-width 0.14s ease;
 }
 .voice-hold-zone-arrow {
-  width: 18px;
-  height: 18px;
-  flex-shrink: 0;
+  pointer-events: none;
+}
+.voice-hold-zone-label {
+  font-size: 11px;
+  font-weight: 700;
+  fill: currentColor;
+  letter-spacing: 0.01em;
+  pointer-events: none;
 }
 .voice-hold-zone-cancel {
   color: #fca5a5;
-  border-color: rgba(248,113,113,0.34);
-  background: linear-gradient(155deg, rgba(127,29,29,0.34), rgba(15,23,42,0.9));
-  border-radius: 26px 48px 14px 18px;
-  transform: translateY(-6px) rotate(-4deg);
-  transform-origin: right bottom;
+}
+.voice-hold-zone-cancel .voice-hold-fan-sector {
+  fill: rgba(127,29,29,0.34);
+  stroke: rgba(248,113,113,0.42);
 }
 .voice-hold-zone-send {
-  min-height: 76px;
-  font-size: 13px;
-  padding: 14px 8px 10px;
-  border-radius: 50% 50% 16px 16px / 44% 44% 16px 16px;
-  background: radial-gradient(ellipse at 50% 18%, rgba(30,41,59,0.92), rgba(15,23,42,0.96));
-  border-top: 2px solid rgba(56,189,248,0.42);
+  color: #bae6fd;
+}
+.voice-hold-zone-send .voice-hold-fan-sector {
+  fill: rgba(15,23,42,0.94);
+  stroke: rgba(56,189,248,0.46);
+  stroke-width: 1.75;
 }
 .voice-hold-zone-edit {
   color: #93c5fd;
-  border-color: rgba(96,165,250,0.34);
-  background: linear-gradient(205deg, rgba(30,58,138,0.34), rgba(15,23,42,0.9));
-  border-radius: 48px 26px 18px 14px;
-  transform: translateY(-6px) rotate(4deg);
-  transform-origin: left bottom;
+}
+.voice-hold-zone-edit .voice-hold-fan-sector {
+  fill: rgba(30,58,138,0.34);
+  stroke: rgba(96,165,250,0.42);
 }
 .voice-hold-zone-cancel.is-active {
   color: #ffffff;
-  background: radial-gradient(circle at 40% 30%, #f87171, #dc2626 70%);
-  border-color: #fca5a5;
-  box-shadow: 0 0 22px rgba(239,68,68,0.48);
-  transform: translateY(-8px) rotate(-4deg) scale(1.04);
+  filter: drop-shadow(0 0 12px rgba(239,68,68,0.55));
+  transform: scale(1.03);
+}
+.voice-hold-zone-cancel.is-active .voice-hold-fan-sector {
+  fill: url(#voice-fan-grad-cancel);
+  stroke: #fca5a5;
+  stroke-width: 2;
 }
 .voice-hold-zone-send.is-active {
   color: #082f49;
-  background: radial-gradient(ellipse at 50% 20%, #67e8f9 0%, #22d3ee 65%, #0891b2 100%);
-  border-color: #a5f3fc;
-  box-shadow: 0 -4px 22px rgba(34,211,238,0.42), inset 0 1px 0 rgba(255,255,255,0.45);
+  filter: drop-shadow(0 0 12px rgba(34,211,238,0.48));
   transform: scale(1.03);
+}
+.voice-hold-zone-send.is-active .voice-hold-fan-sector {
+  fill: url(#voice-fan-grad-send);
+  stroke: #a5f3fc;
+  stroke-width: 2;
 }
 .voice-hold-zone-edit.is-active {
   color: #ffffff;
-  background: radial-gradient(circle at 60% 30%, #60a5fa, #2563eb 70%);
-  border-color: #93c5fd;
-  box-shadow: 0 0 22px rgba(59,130,246,0.48);
-  transform: translateY(-8px) rotate(4deg) scale(1.04);
+  filter: drop-shadow(0 0 12px rgba(59,130,246,0.55));
+  transform: scale(1.03);
+}
+.voice-hold-zone-edit.is-active .voice-hold-fan-sector {
+  fill: url(#voice-fan-grad-edit);
+  stroke: #93c5fd;
+  stroke-width: 2;
 }
 .voice-streaming-robot-cursor {
   display: inline-flex;
@@ -3685,7 +3712,8 @@ html.native-ios-mac .chat-dl-btn {
   .voice-editor-marquee::after { opacity: 0.6; }
   .voice-status-dot,
   .voice-hold-hud-active-hint,
-  .voice-hold-zone { transition: none; }
+  .voice-hold-zone,
+  .voice-hold-fan-sector { transition: none; }
 }
 .voice-overlay-text::placeholder { color: #475569; font-style: italic; }
 .voice-overlay-text:focus { outline: none; border-color: rgba(56,189,248,0.25); }

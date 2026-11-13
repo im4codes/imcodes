@@ -102,6 +102,7 @@ function reportError(error: string): void {
 
 // --- Web Speech API fallback state (desktop browsers) ---
 let _webRec: any = null;
+let _webDrainCancel: (() => void) | null = null;
 let _webStream: MediaStream | null = null;
 let _webAudioCtx: AudioContext | null = null;
 let _webLevelRAF: number | null = null;
@@ -423,7 +424,9 @@ function startWebListening(): boolean {
   }
   _lastError = null;
 
-  // Tear down any prior instance so a fresh start never hits InvalidStateError.
+  // Tear down any prior instance (and any pending drain timer) so a fresh start never hits InvalidStateError.
+  _webDrainCancel?.();
+  _webDrainCancel = null;
   if (_webRec) {
     try {
       _webRec.onend = null;
@@ -486,17 +489,40 @@ function startWebListening(): boolean {
 /** Silent cleanup delay in case a browser speech engine omits `onend` after `stop()`.
  * Never emits a timeout error and never cuts off active recording. */
 export const WEB_FINAL_DRAIN_MS = 10_000;
-function stopWebListening(): Promise<void> {
+/** Upper bound when aborting/cancelling a native recognizer so hung native start/stop calls cannot wedge future holds. */
+export const NATIVE_ABORT_DRAIN_MS = 1_500;
+
+export interface StopListeningOptions {
+  abort?: boolean;
+}
+
+function stopWebListening(abort = false): Promise<void> {
   setListening(false);
   stopWebLevelMeter();
+  if (abort) {
+    _webDrainCancel?.();
+    _webDrainCancel = null;
+  }
   const rec = _webRec;
   if (!rec) { _generation++; return Promise.resolve(); }
+  if (abort) {
+    rec.onend = null;
+    rec.onresult = null;
+    rec.onerror = null;
+    if (_webRec === rec) _webRec = null;
+    _generation++;
+    try { rec.abort?.(); } catch {
+      try { rec.stop?.(); } catch { /* already ended */ }
+    }
+    return Promise.resolve();
+  }
   return new Promise((resolve) => {
     let finished = false;
     const finish = (): void => {
       if (finished) return;
       finished = true;
       clearTimeout(timer);
+      if (_webDrainCancel === finish) _webDrainCancel = null;
       stopWebLevelMeter();
       rec.onend = null;
       rec.onresult = null;
@@ -505,6 +531,7 @@ function stopWebListening(): Promise<void> {
       _generation++;
       resolve();
     };
+    _webDrainCancel = finish;
     const timer = setTimeout(() => {
       // Browser failed to fire onend after stop(); clean up silently without surfacing a timeout error.
       console.warn('[voice] web final drain missing onend; cleaning up silently');
@@ -585,16 +612,87 @@ export async function startListening(
   }
 }
 
-export async function stopListening(): Promise<void> {
+export async function stopListening(options?: StopListeningOptions): Promise<void> {
+  const abort = options?.abort === true;
   _lastStopIntent = ++_intentSeq;
   if (!isAvailable()) return;
 
   if (!isNative()) {
+    if (abort) {
+      forgetRecognitionCallbacks();
+      const aborting = stopWebListening(true).then(() => { forgetRecognitionCallbacks(); });
+      _pendingStop = aborting;
+      try { await aborting; }
+      finally { if (_pendingStop === aborting) _pendingStop = null; }
+      return;
+    }
     if (_pendingStop) return _pendingStop;
-    const stopping = stopWebListening().then(() => { forgetRecognitionCallbacks(); });
+    const stopping = stopWebListening(false).then(() => { forgetRecognitionCallbacks(); });
     _pendingStop = stopping;
     try { await stopping; }
     finally { if (_pendingStop === stopping) _pendingStop = null; }
+    return;
+  }
+
+  if (abort) {
+    const priorPendingStop = _pendingStop;
+    const startPromise = _pendingStart?.promise ?? null;
+    _pendingStart = null;
+    const session = _nativeSession;
+    const shouldStopNative = _listening || !!startPromise;
+    _generation++;
+    setListening(false);
+    forgetRecognitionCallbacks();
+
+    let abortTimer: ReturnType<typeof setTimeout> | null = null;
+    const cleanupAndStop = (async () => {
+      if (priorPendingStop) {
+        await priorPendingStop.catch(() => {});
+      }
+      if (shouldStopNative && session) {
+        try {
+          await session.recognition.stop();
+        } catch (err) {
+          console.warn('[voice] abort stop failed:', err);
+        }
+      }
+      if (startPromise) {
+        await startPromise.catch(() => false);
+      }
+      await cleanupSessionListeners(session);
+    })();
+
+    const boundedAbort = (async () => {
+      try {
+        await Promise.race([
+          cleanupAndStop,
+          new Promise<void>((resolve) => {
+            abortTimer = setTimeout(() => {
+              abortTimer = null;
+              console.warn('[voice] native abort drain timed out; releasing session');
+              resolve();
+            }, NATIVE_ABORT_DRAIN_MS);
+          }),
+        ]);
+      } finally {
+        if (abortTimer !== null) {
+          clearTimeout(abortTimer);
+          abortTimer = null;
+        }
+        if (_nativeSession === session) _nativeSession = null;
+        forgetRecognitionCallbacks();
+        setListening(false);
+      }
+    })();
+
+    _pendingStop = boundedAbort;
+    try {
+      await boundedAbort;
+    } finally {
+      if (_pendingStop === boundedAbort) {
+        _pendingStop = null;
+      }
+    }
     return;
   }
 

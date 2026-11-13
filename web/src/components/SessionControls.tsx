@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
+import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { ComponentChildren, JSX, RefObject } from 'preact';
@@ -181,11 +181,106 @@ import { recordPerfRender } from '../perf-render-debug.js';
 export const COMPOSER_HEIGHT_STORAGE_KEY = 'imcodes_composer_height_v1';
 export const ATTACHMENT_BADGE_COLLAPSE_THRESHOLD = 3;
 export const ATTACHMENT_BADGE_COLLAPSED_VISIBLE_COUNT = 2;
-const VOICE_HOLD_DELAY_MS = 240;
+const VOICE_HOLD_DELAY_MS = 100;
 const VOICE_HOLD_MOVE_SLOP_PX = 18;
 const VOICE_HOLD_CANCEL_THRESHOLD_PX = 44;
 const VOICE_HOLD_EDIT_THRESHOLD_PX = 44;
 const VOICE_HOLD_SLIDE_MAX_PX = 84;
+const VOICE_HOLD_FAILED_DRAIN_TIMEOUT_MS = 2500;
+const VOICE_HOLD_SETTLE_TIMEOUT_MS = 15_000;
+
+const VOICE_HOLD_FAN_CENTER_X = 180;
+const VOICE_HOLD_FAN_CENTER_Y = 204;
+const VOICE_HOLD_FAN_INNER_R = 88;
+const VOICE_HOLD_FAN_OUTER_R = 196;
+
+function polarToFanPoint(cx: number, cy: number, radius: number, angleDeg: number): [number, number] {
+  const rad = (angleDeg * Math.PI) / 180;
+  return [
+    +(cx + radius * Math.sin(rad)).toFixed(2),
+    +(cy - radius * Math.cos(rad)).toFixed(2),
+  ];
+}
+
+function buildVoiceFanSectorPath(
+  cx: number,
+  cy: number,
+  innerR: number,
+  outerR: number,
+  startDeg: number,
+  endDeg: number,
+): string {
+  const [ox1, oy1] = polarToFanPoint(cx, cy, outerR, startDeg);
+  const [ox2, oy2] = polarToFanPoint(cx, cy, outerR, endDeg);
+  const [ix1, iy1] = polarToFanPoint(cx, cy, innerR, endDeg);
+  const [ix2, iy2] = polarToFanPoint(cx, cy, innerR, startDeg);
+  const largeArc = Math.abs(endDeg - startDeg) > 180 ? 1 : 0;
+  return `M ${ox1} ${oy1} A ${outerR} ${outerR} 0 ${largeArc} 1 ${ox2} ${oy2} L ${ix1} ${iy1} A ${innerR} ${innerR} 0 ${largeArc} 0 ${ix2} ${iy2} Z`;
+}
+
+function buildVoiceFanArcPath(cx: number, cy: number, radius: number, startDeg: number, endDeg: number): string {
+  const [x1, y1] = polarToFanPoint(cx, cy, radius, startDeg);
+  const [x2, y2] = polarToFanPoint(cx, cy, radius, endDeg);
+  const largeArc = Math.abs(endDeg - startDeg) > 180 ? 1 : 0;
+  return `M ${x1} ${y1} A ${radius} ${radius} 0 ${largeArc} 1 ${x2} ${y2}`;
+}
+
+function splitVoiceFanLabel(raw: string): string[] {
+  const text = raw.trim();
+  if (!text) return [''];
+  if (text.includes('·')) {
+    const parts = text.split('·').map((part) => part.trim()).filter(Boolean);
+    if (parts.length >= 2) {
+      return [parts[0], parts.slice(1).join(' · ')];
+    }
+  }
+  const words = text.split(/\s+/).filter(Boolean);
+  if (words.length >= 2 && text.length > 10) {
+    let bestIdx = 1;
+    let bestDiff = Infinity;
+    for (let i = 1; i < words.length; i++) {
+      const left = words.slice(0, i).join(' ');
+      const right = words.slice(i).join(' ');
+      const diff = Math.abs(left.length - right.length);
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        bestIdx = i;
+      }
+    }
+    return [words.slice(0, bestIdx).join(' '), words.slice(bestIdx).join(' ')];
+  }
+  return [text];
+}
+
+const VOICE_HOLD_FAN_SECTORS = [
+  {
+    zone: 'cancel' as const,
+    startDeg: -60,
+    endDeg: -21,
+    pathD: buildVoiceFanSectorPath(VOICE_HOLD_FAN_CENTER_X, VOICE_HOLD_FAN_CENTER_Y, VOICE_HOLD_FAN_INNER_R, VOICE_HOLD_FAN_OUTER_R, -60, -21),
+    iconPos: polarToFanPoint(VOICE_HOLD_FAN_CENTER_X, VOICE_HOLD_FAN_CENTER_Y, 169, -40.5),
+    textPos: polarToFanPoint(VOICE_HOLD_FAN_CENTER_X, VOICE_HOLD_FAN_CENTER_Y, 123, -40.5),
+  },
+  {
+    zone: 'send' as const,
+    startDeg: -19,
+    endDeg: 19,
+    pathD: buildVoiceFanSectorPath(VOICE_HOLD_FAN_CENTER_X, VOICE_HOLD_FAN_CENTER_Y, VOICE_HOLD_FAN_INNER_R, VOICE_HOLD_FAN_OUTER_R, -19, 19),
+    iconPos: polarToFanPoint(VOICE_HOLD_FAN_CENTER_X, VOICE_HOLD_FAN_CENTER_Y, 168, 0),
+    textPos: polarToFanPoint(VOICE_HOLD_FAN_CENTER_X, VOICE_HOLD_FAN_CENTER_Y, 122, 0),
+  },
+  {
+    zone: 'edit' as const,
+    startDeg: 21,
+    endDeg: 60,
+    pathD: buildVoiceFanSectorPath(VOICE_HOLD_FAN_CENTER_X, VOICE_HOLD_FAN_CENTER_Y, VOICE_HOLD_FAN_INNER_R, VOICE_HOLD_FAN_OUTER_R, 21, 60),
+    iconPos: polarToFanPoint(VOICE_HOLD_FAN_CENTER_X, VOICE_HOLD_FAN_CENTER_Y, 169, 40.5),
+    textPos: polarToFanPoint(VOICE_HOLD_FAN_CENTER_X, VOICE_HOLD_FAN_CENTER_Y, 123, 40.5),
+  },
+] as const;
+
+const VOICE_HOLD_FAN_OUTER_TRACK_D = buildVoiceFanArcPath(VOICE_HOLD_FAN_CENTER_X, VOICE_HOLD_FAN_CENTER_Y, 201, -60, 60);
+const VOICE_HOLD_FAN_INNER_TRACK_D = buildVoiceFanArcPath(VOICE_HOLD_FAN_CENTER_X, VOICE_HOLD_FAN_CENTER_Y, 80, -60, 60);
 
 function applyComposerVoiceTouchLock(el: HTMLDivElement | null, lockContentEditable: boolean): void {
   if (!el) return;
@@ -1325,7 +1420,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [voiceHoldBars, setVoiceHoldBars] = useState<number[]>(() => Array(16).fill(0));
   const voiceHoldTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const voiceHoldRecognizingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const voiceHoldPointerRef = useRef<{ id: number; startX: number; startY: number; wasFocused: boolean } | null>(null);
+  const voiceHoldPointerRef = useRef<{ id: number; startX: number; startY: number; wasFocused: boolean; downAt: number } | null>(null);
   const voiceHoldPendingRef = useRef(false);
   const voiceHoldActiveRef = useRef(false);
   const voiceHoldZoneRef = useRef<'send' | 'cancel' | 'edit'>('send');
@@ -1352,6 +1447,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const voicePointerEndHandlerRef = useRef<(event: PointerEvent, cancelled?: boolean) => void>(() => {});
   const handledVoicePointerEventsRef = useRef<WeakSet<Event>>(new WeakSet());
   const touchTapCompatShieldCleanupRef = useRef<(() => void) | null>(null);
+  const suppressComposerClickFocusRef = useRef(false);
+  const suppressComposerClickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [atPickerOpen, setAtPickerOpen] = useState(false);
   const [atQuery, setAtQuery] = useState('');
@@ -5273,9 +5370,30 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setVoiceHoldDragX(0);
     }
 
+    const abortMode = outcome === 'cancel' || outcome === 'failed';
+    if (outcome === 'cancel') {
+      // Cancel discards immediately: detach the active transaction right away so
+      // another hold or short tap never waits on slow/hung native stop/start drains.
+      tx.settled = true;
+      tx.phase = 'settled';
+      if (voiceHoldTxRef.current === tx) {
+        voiceHoldTxRef.current = null;
+      }
+      const stopTask = Promise.resolve(VoiceInput.stopListening({ abort: true })).catch(() => {});
+      tx.drainPromise = Promise.allSettled([
+        tx.startPromise ?? Promise.resolve(false),
+        stopTask,
+      ]).then(() => {});
+      return tx.drainPromise;
+    }
+
     tx.phase = outcome === 'failed' ? 'failed' : 'draining';
+    const maxDrainMs = outcome === 'failed'
+      ? VOICE_HOLD_FAILED_DRAIN_TIMEOUT_MS
+      : VOICE_HOLD_SETTLE_TIMEOUT_MS;
 
     tx.drainPromise = (async () => {
+      let drainTimer: ReturnType<typeof setTimeout> | null = null;
       try {
         // Always join the idempotent VoiceInput.stopListening() barrier BEFORE
         // awaiting startPromise:
@@ -5283,25 +5401,41 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         //    stopListening immediately aborts it via the generation barrier.
         // 2. If recording already started and failed at runtime (recognitionError),
         //    stopListening joins the active native stop drain so voiceHoldTxRef is
-        //    not released until the underlying native session has fully stopped.
-        const stopTask = Promise.resolve(VoiceInput.stopListening()).catch(() => {});
+        //    not released until the underlying native session has fully stopped,
+        //    while capping stalled native calls via maxDrainMs.
+        const stopTask = Promise.resolve(
+          VoiceInput.stopListening(abortMode ? { abort: true } : undefined),
+        ).catch(() => {});
         if (!tx.startPromise) {
           await Promise.resolve();
         }
-        const started = tx.startPromise ? await tx.startPromise : false;
-        await stopTask;
+        const work = (async () => {
+          const started = tx.startPromise ? await tx.startPromise : false;
+          await stopTask;
+          return started;
+        })();
+        const raceResult = await Promise.race([
+          work.then((started) => ({ timedOut: false as const, started })),
+          new Promise<{ timedOut: true; started: false }>((resolve) => {
+            drainTimer = setTimeout(() => {
+              drainTimer = null;
+              resolve({ timedOut: true, started: false });
+            }, maxDrainMs);
+          }),
+        ]);
+        if (drainTimer !== null) {
+          clearTimeout(drainTimer);
+          drainTimer = null;
+        }
+        const started = raceResult.started;
 
-        if (tx.settled || outcome === 'failed' || !started || tx.error !== null || !mountedRef.current) {
+        if (raceResult.timedOut || tx.settled || outcome === 'failed' || !started || tx.error !== null || !mountedRef.current) {
           tx.settled = true;
           tx.phase = 'settled';
           return;
         }
         tx.settled = true;
         tx.phase = 'settled';
-
-        if (outcome === 'cancel') {
-          return;
-        }
 
         const spoken = tx.transcript.trim();
         const base = tx.baseText;
@@ -5319,6 +5453,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           handleVoiceSend(combined.trim());
         }
       } finally {
+        if (drainTimer !== null) {
+          clearTimeout(drainTimer);
+          drainTimer = null;
+        }
         tx.settled = true;
         if (voiceHoldTxRef.current === tx) {
           voiceHoldTxRef.current = null;
@@ -5332,23 +5470,43 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const handleComposerVoicePointerDown = useCallback((event: PointerEvent) => {
     if (handledVoicePointerEventsRef.current.has(event)) return;
     handledVoicePointerEventsRef.current.add(event);
+    suppressComposerClickFocusRef.current = false;
+    if (suppressComposerClickTimerRef.current !== null) {
+      clearTimeout(suppressComposerClickTimerRef.current);
+      suppressComposerClickTimerRef.current = null;
+    }
     const mobile = typeof window !== 'undefined' && window.innerWidth <= 640;
     if (!mobile || inputDisabled || voiceOpen || !VoiceInput.isAvailable()) return;
     if (event.button !== undefined && event.button !== 0) return;
-    if (voiceHoldPointerRef.current !== null || voiceHoldActiveRef.current || voiceHoldTxRef.current !== null) return;
+    if (voiceHoldActiveRef.current) return;
+
+    const existingPtr = voiceHoldPointerRef.current;
+    if (existingPtr !== null) {
+      const pointerId = event.pointerId ?? 1;
+      const stalePending = !voiceHoldPendingRef.current
+        || (pointerId !== existingPtr.id && Date.now() - existingPtr.downAt > 500);
+      if (!stalePending) return;
+      clearVoiceHoldTimers();
+      clearComposerVoiceWindowListeners();
+      voiceHoldPointerRef.current = null;
+      voiceHoldPendingRef.current = false;
+      setVoiceHoldPending(false);
+    }
 
     const el = divRef.current;
     const wasFocused = !!el && document.activeElement === el;
     // Never call event.preventDefault() on pointerdown: doing so suppresses
     // iOS/Android native tap-to-focus and prevents the soft keyboard / IME
-    // from opening when tapping the composer. If the press turns into a 240ms
-    // voice hold, the timer disables contenteditable and blurs to suppress iOS
-    // loupe/keyboard; meanwhile synchronously lock selection/callout on mobile.
+    // from opening when tapping the composer. Note that even while an earlier
+    // voice hold drain (voiceHoldTxRef.current) is still settling, pointerdown
+    // tracks short taps (<100ms) so tap-to-type is never locked out. If the
+    // press reaches 100ms without an active drain, the timer disables
+    // contenteditable and blurs to suppress iOS loupe/keyboard.
     setVoiceHoldError(null);
     const pointerId = event.pointerId ?? 1;
     const startX = event.clientX ?? 0;
     const startY = event.clientY ?? 0;
-    voiceHoldPointerRef.current = { id: pointerId, startX, startY, wasFocused };
+    voiceHoldPointerRef.current = { id: pointerId, startX, startY, wasFocused, downAt: Date.now() };
     voiceHoldPendingRef.current = true;
     setVoiceHoldPending(true);
     applyComposerVoiceTouchLock(el, false);
@@ -5363,6 +5521,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       voiceHoldPendingRef.current = false;
       setVoiceHoldPending(false);
       if (!mountedRef.current || voiceHoldTxRef.current !== null) {
+        voiceHoldPointerRef.current = null;
         clearComposerVoiceWindowListeners();
         clearComposerVoiceTouchLock(
           divRef.current,
@@ -5478,8 +5637,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (!ptr && !tx) return;
 
     if (!tx) {
-      const dx = (event.clientX ?? 0) - ptr!.startX;
-      const dy = (event.clientY ?? 0) - ptr!.startY;
+      if (!ptr) return;
+      const dx = (event.clientX ?? 0) - ptr.startX;
+      const dy = (event.clientY ?? 0) - ptr.startY;
       if (Math.hypot(dx, dy) > VOICE_HOLD_MOVE_SLOP_PX) {
         clearVoiceHoldTimers();
         clearComposerVoiceWindowListeners();
@@ -5599,6 +5759,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     clearComposerVoiceWindowListeners();
     if (!tx || tx.settled || tx.drainPromise !== null) return;
     event.preventDefault();
+    suppressComposerClickFocusRef.current = true;
+    if (suppressComposerClickTimerRef.current !== null) {
+      clearTimeout(suppressComposerClickTimerRef.current);
+    }
+    suppressComposerClickTimerRef.current = setTimeout(() => {
+      suppressComposerClickTimerRef.current = null;
+      suppressComposerClickFocusRef.current = false;
+    }, 80);
     try { divRef.current?.blur(); } catch { /* ignore */ }
     const finalZone: 'send' | 'cancel' | 'edit' = cancelled ? 'cancel' : tx.zone;
     void finalizeVoiceHold(tx, tx.error !== null ? 'failed' : finalZone);
@@ -5636,9 +5804,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   useEffect(() => {
     const initialEl = divRef.current;
     return () => {
+      if (suppressComposerClickTimerRef.current !== null) {
+        clearTimeout(suppressComposerClickTimerRef.current);
+        suppressComposerClickTimerRef.current = null;
+      }
+      suppressComposerClickFocusRef.current = false;
       disarmTouchTapCompatMouseShield();
       clearVoiceHoldTimers();
       clearComposerVoiceWindowListeners();
+      voiceHoldPointerRef.current = null;
       voiceHoldPendingRef.current = false;
       clearComposerVoiceTouchLock(divRef.current ?? initialEl, inputDisabledRef.current);
       const tx = voiceHoldTxRef.current;
@@ -5650,12 +5824,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       if (voiceHoldActiveRef.current) {
         voiceHoldActiveRef.current = false;
         VoiceInput.onAudioLevel(null);
-        void VoiceInput.stopListening();
+        void VoiceInput.stopListening({ abort: true });
       }
     };
   }, [clearComposerVoiceWindowListeners, clearVoiceHoldTimers, disarmTouchTapCompatMouseShield]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!voiceHoldActive) return;
     const el = voiceHoldTranscriptRef.current;
     if (!el) return;
@@ -8379,54 +8553,126 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                     : t('voice.release_to_send')}
               </div>
               <div class="voice-hold-hud-zones">
-                <div
-                  class={`voice-hold-zone voice-hold-zone-cancel${voiceHoldZone === 'cancel' ? ' is-active' : ''}`}
-                  data-zone-target="cancel"
+                <svg
+                  class="voice-hold-fan-svg"
+                  viewBox="0 0 360 166"
+                  aria-hidden="true"
                 >
-                  <svg
-                    class="voice-hold-zone-arrow"
-                    viewBox="0 0 24 24"
-                    width="20"
-                    height="20"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2.4"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    aria-hidden="true"
-                  >
-                    <path d="M19 12H5" />
-                    <path d="M12 19l-7-7 7-7" />
-                  </svg>
-                  <span class="voice-hold-zone-label">{t('voice.slide_left_cancel')}</span>
-                </div>
-                <div
-                  class={`voice-hold-zone voice-hold-zone-send${voiceHoldZone === 'send' ? ' is-active' : ''}`}
-                  data-zone-target="send"
-                >
-                  <span class="voice-hold-zone-label">{t('voice.release_to_send')}</span>
-                </div>
-                <div
-                  class={`voice-hold-zone voice-hold-zone-edit${voiceHoldZone === 'edit' ? ' is-active' : ''}`}
-                  data-zone-target="edit"
-                >
-                  <span class="voice-hold-zone-label">{t('voice.slide_right_edit')}</span>
-                  <svg
-                    class="voice-hold-zone-arrow"
-                    viewBox="0 0 24 24"
-                    width="20"
-                    height="20"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2.4"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    aria-hidden="true"
-                  >
-                    <path d="M5 12h14" />
-                    <path d="M12 5l7 7-7 7" />
-                  </svg>
-                </div>
+                  <defs>
+                    <radialGradient id="voice-fan-grad-cancel" cx="32%" cy="35%" r="75%">
+                      <stop offset="0%" stop-color="#f87171" stop-opacity="0.96" />
+                      <stop offset="100%" stop-color="#dc2626" stop-opacity="0.92" />
+                    </radialGradient>
+                    <radialGradient id="voice-fan-grad-send" cx="50%" cy="22%" r="78%">
+                      <stop offset="0%" stop-color="#67e8f9" stop-opacity="0.98" />
+                      <stop offset="65%" stop-color="#22d3ee" stop-opacity="0.95" />
+                      <stop offset="100%" stop-color="#0891b2" stop-opacity="0.96" />
+                    </radialGradient>
+                    <radialGradient id="voice-fan-grad-edit" cx="68%" cy="35%" r="75%">
+                      <stop offset="0%" stop-color="#60a5fa" stop-opacity="0.96" />
+                      <stop offset="100%" stop-color="#2563eb" stop-opacity="0.92" />
+                    </radialGradient>
+                  </defs>
+                  <path class="voice-hold-fan-track" d={VOICE_HOLD_FAN_OUTER_TRACK_D} />
+                  <path class="voice-hold-fan-track voice-hold-fan-track-inner" d={VOICE_HOLD_FAN_INNER_TRACK_D} />
+                  {VOICE_HOLD_FAN_SECTORS.map((sector) => {
+                    const isActive = voiceHoldZone === sector.zone;
+                    const label = sector.zone === 'cancel'
+                      ? t('voice.slide_left_cancel')
+                      : sector.zone === 'edit'
+                        ? t('voice.slide_right_edit')
+                        : t('voice.release_to_send');
+                    const lines = splitVoiceFanLabel(label);
+                    const [ix, iy] = sector.iconPos;
+                    const [tx, ty] = sector.textPos;
+                    return (
+                      <g
+                        key={sector.zone}
+                        class={`voice-hold-zone voice-hold-zone-${sector.zone}${isActive ? ' is-active' : ''}`}
+                        data-zone-target={sector.zone}
+                      >
+                        <path
+                          class="voice-hold-fan-sector"
+                          d={sector.pathD}
+                          data-fan-sector={sector.zone}
+                        />
+                        {sector.zone === 'cancel' && (
+                          <svg
+                            class="voice-hold-zone-arrow"
+                            x={ix - 10}
+                            y={iy - 10}
+                            width="20"
+                            height="20"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="2.4"
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                            aria-hidden="true"
+                          >
+                            <path d="M19 12H5" />
+                            <path d="M12 19l-7-7 7-7" />
+                          </svg>
+                        )}
+                        {sector.zone === 'send' && (
+                          <svg
+                            class="voice-hold-zone-arrow voice-hold-zone-send-icon"
+                            x={ix - 10}
+                            y={iy - 10}
+                            width="20"
+                            height="20"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="2.2"
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                            aria-hidden="true"
+                          >
+                            <path d="M12 19V5" />
+                            <path d="M5 12l7-7 7 7" />
+                          </svg>
+                        )}
+                        {sector.zone === 'edit' && (
+                          <svg
+                            class="voice-hold-zone-arrow"
+                            x={ix - 10}
+                            y={iy - 10}
+                            width="20"
+                            height="20"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="2.4"
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                            aria-hidden="true"
+                          >
+                            <path d="M5 12h14" />
+                            <path d="M12 5l7 7-7 7" />
+                          </svg>
+                        )}
+                        <text
+                          class="voice-hold-zone-label"
+                          x={tx}
+                          y={ty}
+                          text-anchor="middle"
+                          dominant-baseline="central"
+                        >
+                          {lines.length === 1 ? (
+                            <tspan x={tx} y={ty}>{lines[0]}</tspan>
+                          ) : (
+                            <>
+                              <tspan x={tx} y={ty - 6}>{lines[0]}</tspan>
+                              <tspan x={tx} y={ty + 8}>{lines[1]}</tspan>
+                            </>
+                          )}
+                        </text>
+                      </g>
+                    );
+                  })}
+                </svg>
               </div>
             </div>
           </div>,
@@ -8471,6 +8717,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             }}
             onFocus={handleFocus}
             onBlur={handleBlur}
+            onClick={() => {
+              const el = divRef.current;
+              if (!el || suppressComposerClickFocusRef.current) return;
+              if (inputDisabledRef.current || voiceHoldPendingRef.current || voiceHoldActiveRef.current) return;
+              if (!composerFocusedRef.current || el.getAttribute('contenteditable') !== 'true') {
+                focusComposerForTyping();
+              }
+            }}
             onPointerDown={handleComposerVoicePointerDown}
             onPointerMove={handleComposerVoicePointerMove}
             onPointerUp={(e) => handleComposerVoicePointerEnd(e, false)}

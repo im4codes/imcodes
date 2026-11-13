@@ -842,6 +842,52 @@ describe('mobile capture defenses', () => {
       await VoiceInput.stopListening();
     }
   });
+
+  it('bounds stalled native start/stop calls during stopListening({ abort: true }) so subsequent holds never wedge', async () => {
+    vi.useFakeTimers();
+    try {
+      const hungStart = deferred<Record<string, never>>();
+      const hungStop = deferred<void>();
+      speechApi.start
+        .mockReturnValueOnce(hungStart.promise)
+        .mockResolvedValue({});
+      speechApi.stop
+        .mockReturnValueOnce(hungStop.promise)
+        .mockResolvedValue(undefined);
+
+      const firstStart = VoiceInput.startListening(vi.fn());
+      await vi.advanceTimersByTimeAsync(0);
+      expect(speechApi.start).toHaveBeenCalledTimes(1);
+
+      let abortSettled = false;
+      const aborted = VoiceInput.stopListening({ abort: true }).then(() => { abortSettled = true; });
+      await vi.advanceTimersByTimeAsync(VoiceInput.NATIVE_ABORT_DRAIN_MS - 1);
+      expect(abortSettled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await aborted;
+      expect(abortSettled).toBe(true);
+      expect(VoiceInput.isListening()).toBe(false);
+
+      // Fresh start proceeds cleanly without needing an app restart even though old start/stop never resolved
+      const onFreshResult = vi.fn();
+      await expect(VoiceInput.startListening(onFreshResult)).resolves.toBe(true);
+      expect(speechApi.start).toHaveBeenCalledTimes(2);
+      expect(VoiceInput.isListening()).toBe(true);
+
+      // Clean up the abandoned hung promise cleanly after the fresh session is active
+      hungStart.resolve({});
+      hungStop.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      listeners.partialResults?.({ matches: ['new capture'], isFinal: false });
+      expect(onFreshResult).toHaveBeenCalledWith('new capture', false);
+      void firstStart;
+    } finally {
+      await VoiceInput.stopListening({ abort: true });
+      await vi.advanceTimersByTimeAsync(0);
+      vi.useRealTimers();
+    }
+  });
 });
 
 
@@ -1016,6 +1062,38 @@ describe('Web Mobile final drain', () => {
       expect(current.track.stop).toHaveBeenCalledOnce(); expect(meter.close).toHaveBeenCalledTimes(2);
     } finally {
       const cleanup = VoiceInput.stopListening(); instances.at(-1)?.onend?.(); await cleanup;
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('aborts Web Speech immediately without waiting for WEB_FINAL_DRAIN_MS and keeps subsequent sessions clean', async () => {
+    vi.useFakeTimers();
+    const instances = browser();
+    try {
+      const staleResult = vi.fn();
+      await expect(VoiceInput.startListening(staleResult)).resolves.toBe(true);
+      expect(instances).toHaveLength(1);
+
+      let settled = false;
+      const abortStop = VoiceInput.stopListening({ abort: true }).then(() => { settled = true; });
+      await abortStop;
+      expect(settled).toBe(true);
+      expect(instances[0].abort).toHaveBeenCalledTimes(1);
+      expect(instances[0].stop).not.toHaveBeenCalled();
+
+      // Stale result or delayed onend timer cannot leak or bump generation for a new session
+      final(instances[0], 'cancelled tail');
+      expect(staleResult).not.toHaveBeenCalled();
+
+      const freshResult = vi.fn();
+      await expect(VoiceInput.startListening(freshResult)).resolves.toBe(true);
+      expect(instances).toHaveLength(2);
+      await vi.advanceTimersByTimeAsync(VoiceInput.WEB_FINAL_DRAIN_MS + 100);
+      final(instances[1], 'fresh capture');
+      expect(freshResult).toHaveBeenCalledWith('fresh capture', true);
+    } finally {
+      await VoiceInput.stopListening({ abort: true });
+      vi.useRealTimers();
       vi.unstubAllGlobals();
     }
   });

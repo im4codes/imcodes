@@ -171,7 +171,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     document.body.innerHTML = '';
   });
 
-  it('short tap (<240ms) focuses composer input for keyboard typing without starting voice recording', async () => {
+  it('short tap (<100ms) focuses composer input for keyboard typing without starting voice recording', async () => {
     const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
     render(
       <SessionControls
@@ -196,7 +196,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(input.style.userSelect).toBe('none');
     expect(input.getAttribute('contenteditable')).toBe('false');
 
-    await vi.advanceTimersByTimeAsync(120);
+    await vi.advanceTimersByTimeAsync(50);
     dispatchPointer(input, 'pointerup', 180);
 
     expect(voiceMock.startListening).not.toHaveBeenCalled();
@@ -234,7 +234,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     Object.assign(down, { clientX: 180, clientY: 500, pointerId: 1, button: 0, pointerType: 'touch' });
     fireEvent(input, down);
 
-    await vi.advanceTimersByTimeAsync(80);
+    await vi.advanceTimersByTimeAsync(50);
 
     const up = new Event('pointerup', { bubbles: true, cancelable: true });
     Object.assign(up, { clientX: 180, clientY: 500, pointerId: 1, button: 0, pointerType: 'touch' });
@@ -251,7 +251,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     const secondDown = new Event('pointerdown', { bubbles: true, cancelable: true });
     Object.assign(secondDown, { clientX: 180, clientY: 500, pointerId: 2, button: 0, pointerType: 'touch' });
     fireEvent(input, secondDown);
-    await vi.advanceTimersByTimeAsync(80);
+    await vi.advanceTimersByTimeAsync(50);
     input.blur();
     const secondUp = new Event('pointerup', { bubbles: true, cancelable: true });
     Object.assign(secondUp, { clientX: 180, clientY: 500, pointerId: 2, button: 0, pointerType: 'touch' });
@@ -265,7 +265,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(genuineMouseDown.defaultPrevented).toBe(false);
   });
 
-  it('holds 240ms -> vibrates & suppresses iOS loupe/keyboard -> shows 3-zone sci-fi HUD with SVG arrows -> releases in center to auto-send', async () => {
+  it('holds 100ms -> vibrates & suppresses iOS loupe/keyboard -> shows 3-sector circular arc fan HUD with SVG arrows -> releases in center to auto-send', async () => {
     const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
     render(
       <SessionControls
@@ -282,13 +282,13 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     const composer = document.querySelector('.controls-composer') as HTMLElement;
     dispatchPointer(input, 'pointerdown', 180);
 
-    // Not triggered at 239ms; still pending with selection/callout lock
-    await vi.advanceTimersByTimeAsync(239);
+    // Not triggered at 99ms; still pending with selection/callout lock
+    await vi.advanceTimersByTimeAsync(99);
     expect(voiceMock.startListening).not.toHaveBeenCalled();
     expect(composer.classList.contains('controls-composer-voice-pending')).toBe(true);
     expect(composer.classList.contains('controls-composer-voice-holding')).toBe(false);
 
-    // Triggers exactly at 240ms (+1ms)
+    // Triggers exactly at 100ms (+1ms)
     await vi.advanceTimersByTimeAsync(1);
 
     expect(vibrate).toHaveBeenCalledWith(20);
@@ -298,13 +298,23 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(composer.classList.contains('controls-composer-voice-holding')).toBe(true);
     expect(input.getAttribute('contenteditable')).toBe('false');
 
-    // HUD shows all 3 gesture prompts, recognizing status, sci-fi grid, status dot, and SVG arrows
+    // HUD shows true 3-sector circular arc fan SVG with outer & inner A-arcs, status dot, and SVG arrows
     const hud = document.querySelector('.voice-hold-hud') as HTMLElement;
     expect(hud).not.toBeNull();
     expect(hud.getAttribute('data-zone')).toBe('send');
     expect(hud.style.getPropertyValue('--voice-slide-x')).toBe('0px');
     expect(hud.querySelector('.voice-hold-hud-grid')).not.toBeNull();
     expect(hud.querySelector('.voice-status-dot.voice-status-dot-active')).not.toBeNull();
+    const fanSvg = hud.querySelector('.voice-hold-hud-zones svg.voice-hold-fan-svg');
+    expect(fanSvg).not.toBeNull();
+    const sectorPaths = Array.from(fanSvg!.querySelectorAll('path.voice-hold-fan-sector'));
+    expect(sectorPaths).toHaveLength(3);
+    for (const p of sectorPaths) {
+      const d = p.getAttribute('d') ?? '';
+      expect(d).toContain('A 196 196');
+      expect(d).toContain('A 88 88');
+      expect(d.endsWith('Z')).toBe(true);
+    }
     expect(hud.querySelector('.voice-hold-zone-cancel svg')).not.toBeNull();
     expect(hud.querySelector('.voice-hold-zone-edit svg')).not.toBeNull();
     expect(hud.textContent).toContain('voice.slide_left_cancel');
@@ -746,7 +756,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       expect(fireEvent(input, pendingSelect)).toBe(false);
       expect(fireEvent(input, pendingMenu)).toBe(false);
 
-      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(50);
       dispatchPointer(input, 'pointerup', 180);
       await vi.advanceTimersByTimeAsync(0);
       expect(input.getAttribute('contenteditable')).toBe('true');
@@ -974,6 +984,42 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     const barsHtml = Array.from({ length: 16 }, () => '<span class="voice-hold-hud-bar" style="height: 16px; opacity: 0.8"></span>').join('');
     const longText = Array.from({ length: 40 }, (_, i) => `Line ${i + 1}: holding to dictate long technical text across multiple lines on iOS mobile viewport.`).join('\n');
 
+    const fanSvgHtml = `
+      <svg class="voice-hold-fan-svg" viewBox="0 0 360 166" aria-hidden="true">
+        <defs>
+          <radialGradient id="voice-fan-grad-cancel" cx="32%" cy="35%" r="75%">
+            <stop offset="0%" stop-color="#f87171" stop-opacity="0.96" />
+            <stop offset="100%" stop-color="#dc2626" stop-opacity="0.92" />
+          </radialGradient>
+          <radialGradient id="voice-fan-grad-send" cx="50%" cy="22%" r="78%">
+            <stop offset="0%" stop-color="#67e8f9" stop-opacity="0.98" />
+            <stop offset="65%" stop-color="#22d3ee" stop-opacity="0.95" />
+            <stop offset="100%" stop-color="#0891b2" stop-opacity="0.96" />
+          </radialGradient>
+          <radialGradient id="voice-fan-grad-edit" cx="68%" cy="35%" r="75%">
+            <stop offset="0%" stop-color="#60a5fa" stop-opacity="0.96" />
+            <stop offset="100%" stop-color="#2563eb" stop-opacity="0.92" />
+          </radialGradient>
+        </defs>
+        <path class="voice-hold-fan-track" d="M 5.93 103.5 A 201 201 0 0 1 354.07 103.5" />
+        <path class="voice-hold-fan-track voice-hold-fan-track-inner" d="M 110.72 164 A 80 80 0 0 1 249.28 164" />
+        <g class="voice-hold-zone voice-hold-zone-cancel" data-zone-target="cancel">
+          <path class="voice-hold-fan-sector" d="M 10.26 106 A 196 196 0 0 1 109.76 21.02 L 148.46 121.85 A 88 88 0 0 0 103.79 160 Z" data-fan-sector="cancel" />
+          <svg class="voice-hold-zone-arrow" x="60.24" y="65.49" width="20" height="20" viewBox="0 0 24 24"><path d="M19 12H5" /></svg>
+          <text class="voice-hold-zone-label" x="100.12" y="110.47" text-anchor="middle" dominant-baseline="central"><tspan class="test-cancel-label" x="100.12" y="110.47">Cancel</tspan></text>
+        </g>
+        <g class="voice-hold-zone voice-hold-zone-send is-active" data-zone-target="send">
+          <path class="voice-hold-fan-sector" d="M 116.19 18.67 A 196 196 0 0 1 243.81 18.67 L 208.65 120.8 A 88 88 0 0 0 151.35 120.8 Z" data-fan-sector="send" />
+          <svg class="voice-hold-zone-arrow voice-hold-zone-send-icon" x="170" y="26" width="20" height="20" viewBox="0 0 24 24"><path d="M12 19V5" /></svg>
+          <text class="voice-hold-zone-label" x="180" y="82" text-anchor="middle" dominant-baseline="central"><tspan class="test-send-label" x="180" y="82">Send</tspan></text>
+        </g>
+        <g class="voice-hold-zone voice-hold-zone-edit" data-zone-target="edit">
+          <path class="voice-hold-fan-sector" d="M 250.24 21.02 A 196 196 0 0 1 349.74 106 L 256.21 160 A 88 88 0 0 0 211.54 121.85 Z" data-fan-sector="edit" />
+          <svg class="voice-hold-zone-arrow" x="279.76" y="65.49" width="20" height="20" viewBox="0 0 24 24"><path d="M5 12h14" /></svg>
+          <text class="voice-hold-zone-label" x="259.88" y="110.47" text-anchor="middle" dominant-baseline="central"><tspan class="test-edit-label" x="259.88" y="110.47">Edit</tspan></text>
+        </g>
+      </svg>`;
+
     const browser = await browserType.launch({ headless: true });
     try {
       for (const reducedMotion of ['reduce', 'no-preference'] as const) {
@@ -1002,11 +1048,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
                 </div>
                 <div class="voice-hold-hud-transcript">Hello<span class="voice-streaming-robot-cursor is-active"><svg><circle class="voice-robot-antenna"></circle></svg></span></div>
                 <div class="voice-hold-hud-active-hint is-send">Hint</div>
-                <div class="voice-hold-hud-zones">
-                  <div class="voice-hold-zone voice-hold-zone-cancel"><span class="voice-hold-zone-label">Cancel</span></div>
-                  <div class="voice-hold-zone voice-hold-zone-send is-active"><span class="voice-hold-zone-label">Send</span></div>
-                  <div class="voice-hold-zone voice-hold-zone-edit"><span class="voice-hold-zone-label">Edit</span></div>
-                </div>
+                <div class="voice-hold-hud-zones">${fanSvgHtml}</div>
               </div>
             </div>
           </body></html>`);
@@ -1034,6 +1076,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
                 dotTrans: gs('.voice-status-dot').transitionProperty,
                 hintTrans: gs('.voice-hold-hud-active-hint').transitionProperty,
                 zoneTrans: gs('.voice-hold-zone').transitionProperty,
+                sectorTrans: gs('.voice-hold-fan-sector').transitionProperty,
                 trailing2PaddingRight: gs('.controls-input-with-trailing-2').paddingRight,
                 trailing1PaddingRight: gs('.test-idle-input').paddingRight,
                 idleTouchAction: gs('.test-idle-input').touchAction,
@@ -1063,6 +1106,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
               expect(computed.dotTrans).toBe('none');
               expect(computed.hintTrans).toBe('none');
               expect(computed.zoneTrans).toBe('none');
+              expect(computed.sectorTrans).toBe('none');
             } else {
               expect(computed.composerReadyAfter).toBe('voice-editor-orbit');
               expect(computed.composerInput).toBe('voice-composer-energy-pulse');
@@ -1081,6 +1125,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
 
       const viewports = [
         { width: 320, height: 568, sat: 0, sab: 0 },
+        { width: 390, height: 844, sat: 47, sab: 34 },
         { width: 430, height: 932, sat: 59, sab: 34 },
       ];
       for (const vp of viewports) {
@@ -1106,19 +1151,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
                 </div>
                 <div class="voice-hold-hud-transcript"></div>
                 <div class="voice-hold-hud-active-hint is-send"></div>
-                <div class="voice-hold-hud-zones">
-                  <div class="voice-hold-zone voice-hold-zone-cancel">
-                    <svg class="voice-hold-zone-arrow" viewBox="0 0 24 24" width="20" height="20"><path d="M19 12H5"/></svg>
-                    <span class="voice-hold-zone-label test-cancel-label"></span>
-                  </div>
-                  <div class="voice-hold-zone voice-hold-zone-send is-active">
-                    <span class="voice-hold-zone-label test-send-label"></span>
-                  </div>
-                  <div class="voice-hold-zone voice-hold-zone-edit">
-                    <span class="voice-hold-zone-label test-edit-label"></span>
-                    <svg class="voice-hold-zone-arrow" viewBox="0 0 24 24" width="20" height="20"><path d="M5 12h14"/></svg>
-                  </div>
-                </div>
+                <div class="voice-hold-hud-zones">${fanSvgHtml}</div>
               </div>
             </div>
           </body></html>`);
@@ -1149,19 +1182,51 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
                   const transcript = r('.voice-hold-hud-transcript');
                   const hint = r('.voice-hold-hud-active-hint');
                   const zones = r('.voice-hold-hud-zones');
+                  const fanSvg = r('.voice-hold-fan-svg');
+                  const cancelSector = r('path[data-fan-sector="cancel"]');
+                  const sendSector = r('path[data-fan-sector="send"]');
+                  const editSector = r('path[data-fan-sector="edit"]');
+                  const cancelCenterX = cancelSector.left + cancelSector.width / 2;
+                  const sendCenterX = sendSector.left + sendSector.width / 2;
+                  const editCenterX = editSector.left + editSector.width / 2;
+                  const hitTestSector = (x: number, y: number) => {
+                    const el = document.elementFromPoint(x, y);
+                    return el?.closest('[data-zone-target]')?.getAttribute('data-zone-target') ?? null;
+                  };
+                  const svgRect = fanSvg;
+                  const scaleX = svgRect.width / 360;
+                  const scaleY = svgRect.height / 166;
+                  const sectorPaths = Array.from(document.querySelectorAll('path.voice-hold-fan-sector')).map((el) => el.getAttribute('d') ?? '');
                   const strip = r('.session-live-status-inline');
                   const stripMidX = strip.left + strip.width / 2;
                   const stripMidY = strip.top + strip.height / 2;
                   const prevPe = (hudEl as HTMLElement).style.pointerEvents;
                   (hudEl as HTMLElement).style.pointerEvents = 'auto';
                   const topAtStrip = document.elementFromPoint(stripMidX, stripMidY);
+                  const cancelHit = hitTestSector(svgRect.left + 84.5 * scaleX, svgRect.top + 88 * scaleY);
+                  const sendHit = hitTestSector(svgRect.left + 180 * scaleX, svgRect.top + 68 * scaleY);
+                  const editHit = hitTestSector(svgRect.left + 275.5 * scaleX, svgRect.top + 88 * scaleY);
                   (hudEl as HTMLElement).style.pointerEvents = prevPe;
                   return {
                     hudZ: getComputedStyle(hudEl).zIndex,
                     cardTop: Math.round(card.top),
                     cardBottom: Math.round(card.bottom),
+                    cardLeft: Math.round(card.left),
+                    cardRight: Math.round(card.right),
                     headerTop: Math.round(header.top),
                     zonesBottom: Math.round(zones.bottom),
+                    fanSvgWidth: Math.round(fanSvg.width),
+                    fanSvgHeight: Math.round(fanSvg.height),
+                    cancelCenterX,
+                    sendCenterX,
+                    editCenterX,
+                    cancelLeft: cancelSector.left,
+                    editRight: editSector.right,
+                    cancelHit,
+                    sendHit,
+                    editHit,
+                    sectorPathCount: sectorPaths.length,
+                    allArcPathsValid: sectorPaths.every((d) => d.includes('A 196 196') && d.includes('A 88 88') && d.endsWith('Z')),
                     hintBottom: Math.round(hint.bottom),
                     transcriptH: Math.round(transcript.height),
                     transcriptScrollH: trEl.scrollHeight,
@@ -1187,6 +1252,17 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
                 expect(m.zonesBottom, `${code}/${zone}/${mode} zonesBottom`).toBeLessThanOrEqual(m.cardBottom);
                 expect(m.hintBottom, `${code}/${zone}/${mode} hintBottom`).toBeLessThanOrEqual(m.cardBottom);
                 expect(m.scrollOverflow, `${code}/${zone}/${mode} overflow`).toBe(false);
+                expect(m.sectorPathCount).toBe(3);
+                expect(m.allArcPathsValid).toBe(true);
+                expect(m.fanSvgWidth).toBeGreaterThan(0);
+                expect(m.fanSvgHeight).toBeGreaterThan(0);
+                expect(m.cancelCenterX).toBeLessThan(m.sendCenterX);
+                expect(m.sendCenterX).toBeLessThan(m.editCenterX);
+                expect(m.cancelHit).toBe('cancel');
+                expect(m.sendHit).toBe('send');
+                expect(m.editHit).toBe('edit');
+                expect(m.cancelLeft).toBeGreaterThanOrEqual(m.cardLeft);
+                expect(m.editRight).toBeLessThanOrEqual(m.cardRight);
                 if (mode === 'long') {
                   expect(m.transcriptScrollH, `${code}/${zone}/long scrollable`).toBeGreaterThan(m.transcriptClientH);
                 } else {
@@ -1394,10 +1470,115 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
 
     // 5. Short tap still restores contenteditable="true" + focus after round trip
     dispatchPointer(input, 'pointerdown', 180);
-    await vi.advanceTimersByTimeAsync(80);
+    await vi.advanceTimersByTimeAsync(50);
     dispatchPointer(input, 'pointerup', 180);
     await vi.advanceTimersByTimeAsync(0);
     expect(input.getAttribute('contenteditable')).toBe('true');
     expect(document.activeElement).toBe(input);
+  });
+
+  it('cancelling (even with stalled start/stop) passes abort:true and never deadlocks immediate re-hold, short-tap typing, or click focus', async () => {
+    voiceMock.startListening.mockImplementationOnce(() => new Promise<boolean>(() => {}));
+    voiceMock.stopListening.mockImplementationOnce(() => new Promise<void>(() => {}));
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = document.querySelector('.controls-input') as HTMLElement;
+
+    // 1. Hold 100ms while startListening stalls -> slide left into Cancel -> release
+    dispatchPointer(input, 'pointerdown', 200);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(voiceMock.startListening).toHaveBeenCalledTimes(1);
+    dispatchPointer(input, 'pointermove', 110);
+    await vi.advanceTimersByTimeAsync(0);
+    dispatchPointer(input, 'pointerup', 110);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(voiceMock.stopListening).toHaveBeenCalledWith({ abort: true });
+    expect(document.querySelector('.voice-hold-hud')).toBeNull();
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+
+    // 2. Immediately re-hold 100ms EVEN THOUGH previous start/stop never settled -> works immediately!
+    dispatchPointer(input, 'pointerdown', 200);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(voiceMock.startListening).toHaveBeenCalledTimes(2);
+    expect(document.querySelector('.voice-hold-hud')).not.toBeNull();
+    dispatchPointer(input, 'pointermove', 110);
+    dispatchPointer(input, 'pointerup', 110);
+    await vi.advanceTimersByTimeAsync(0);
+
+    // 3. Immediately short-tap (<100ms) -> restores contenteditable="true", focuses, and typing works cleanly
+    dispatchPointer(input, 'pointerdown', 180);
+    await vi.advanceTimersByTimeAsync(45);
+    dispatchPointer(input, 'pointerup', 180);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(document.activeElement).toBe(input);
+    input.textContent = 'Typed after cancel';
+    fireEvent.input(input);
+    expect(input.textContent).toBe('Typed after cancel');
+
+    // 4. Blur back to voice-ready -> click fallback also unlocks contenteditable="true" and focuses
+    input.blur();
+    fireEvent.blur(input);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(input.getAttribute('contenteditable')).toBe('false');
+    fireEvent.click(input);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(document.activeElement).toBe(input);
+  });
+
+  it('never blocks short-tap or click-to-type while a prior send drain is still settling, while still protecting its final tail from overlapping holds', async () => {
+    let releaseDrain!: () => void;
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = document.querySelector('.controls-input') as HTMLElement;
+    dispatchPointer(input, 'pointerdown', 180);
+    await vi.advanceTimersByTimeAsync(100);
+    const firstResult = voiceMock.partialHandler!;
+    firstResult('partial phrase');
+    voiceMock.stopListening.mockImplementationOnce(async () => {
+      await new Promise<void>((r) => { releaseDrain = r; });
+      firstResult('final drained phrase');
+    });
+    dispatchPointer(input, 'pointerup', 180);
+    await vi.advanceTimersByTimeAsync(0);
+
+    // While send drain is still running: short tap (<100ms) immediately enters typing mode
+    dispatchPointer(input, 'pointerdown', 180);
+    await vi.advanceTimersByTimeAsync(40);
+    dispatchPointer(input, 'pointerup', 180);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(document.activeElement).toBe(input);
+
+    // Release drain still delivers the first hold's final tail once without starting a second recording
+    releaseDrain();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(voiceMock.startListening).toHaveBeenCalledTimes(1);
+    expect(ws.sendSessionCommand).toHaveBeenCalledTimes(1);
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+      text: 'final drained phrase',
+    }));
   });
 });
