@@ -441,4 +441,167 @@ describe('FloatingPanel', () => {
     fireEvent.click(btn);
     expect(onOpenNewWindow).toHaveBeenCalledTimes(1);
   });
+
+  it('caps effective minW/minH to actual viewport below nominal minimum across load, restore, resize, drag, and 8-way resize', () => {
+    const assertInsideAvailable = (panel: HTMLElement, maxW: number, minTop: number, maxBottom: number) => {
+      const left = parseFloat(panel.style.left);
+      const top = parseFloat(panel.style.top);
+      const width = parseFloat(panel.style.width);
+      const height = parseFloat(panel.style.height);
+      expect(left).toBeGreaterThanOrEqual(0);
+      expect(top).toBeGreaterThanOrEqual(minTop);
+      expect(left + width).toBeLessThanOrEqual(maxW);
+      expect(top + height).toBeLessThanOrEqual(maxBottom);
+    };
+
+    // 1) Below nominal 640x440 (620x400, no tab bar -> available 620x300) on fresh default open
+    vi.spyOn(window, 'innerWidth', 'get').mockReturnValue(620);
+    vi.spyOn(window, 'innerHeight', 'get').mockReturnValue(400);
+    const vDefault = render(
+      <FloatingPanel
+        id="cloud-docs-small-default"
+        title="Cloud Docs"
+        onClose={() => {}}
+        defaultW={1080}
+        defaultH={760}
+        minW={640}
+        minH={440}
+        defaultVersion={2}
+        getDefaultGeometry={() => ({ x: 240, y: 48, w: 1200, h: 820 })}
+      >
+        <div>docs</div>
+      </FloatingPanel>,
+    );
+    const smallDefaultPanel = screen.getByTestId('floating-panel-cloud-docs-small-default') as HTMLElement;
+    assertInsideAvailable(smallDefaultPanel, 620, 0, 300);
+    expect(parseFloat(smallDefaultPanel.style.width)).toBe(620);
+    expect(parseFloat(smallDefaultPanel.style.height)).toBe(300);
+    vDefault.unmount();
+
+    // 2) Below nominal with .tab-bar top occupancy (620x400, tabBottom=44 -> available 620x256)
+    const tabBar = document.createElement('div');
+    tabBar.className = 'tab-bar';
+    const tabButton = document.createElement('button');
+    tabButton.setAttribute('role', 'tab');
+    tabButton.getBoundingClientRect = () => rectWithBottom(44);
+    tabBar.appendChild(tabButton);
+    document.body.appendChild(tabBar);
+
+    localStorage.setItem('rcc_float_cloud-docs', JSON.stringify({ x: 100, y: 80, w: 960, h: 610, _dv: 2 }));
+    const vStored = render(
+      <FloatingPanel
+        id="cloud-docs"
+        title="Cloud Docs"
+        onClose={() => {}}
+        defaultW={1080}
+        defaultH={760}
+        minW={640}
+        minH={440}
+        defaultVersion={2}
+        getDefaultGeometry={() => null}
+      >
+        <div>docs</div>
+      </FloatingPanel>,
+    );
+    const smallStoredPanel = screen.getByTestId('floating-panel-cloud-docs') as HTMLElement;
+    assertInsideAvailable(smallStoredPanel, 620, 44, 300);
+    expect(parseFloat(smallStoredPanel.style.width)).toBe(620);
+    expect(parseFloat(smallStoredPanel.style.height)).toBe(256);
+
+    // Drag and 8-way resize at 620x400 with tabBar=44 never push any edge out of [0..620]x[44..300]
+    fireEvent.mouseDown(screen.getByTestId('floating-bottom-drag'), { clientX: 200, clientY: 290 });
+    fireEvent.mouseMove(document, { clientX: 350, clientY: 100 });
+    fireEvent.mouseUp(document);
+    assertInsideAvailable(smallStoredPanel, 620, 44, 300);
+
+    for (const dir of ['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw'] as const) {
+      const handle = screen.getByTestId(`floating-resize-${dir}`);
+      fireEvent.mouseDown(handle, { clientX: 300, clientY: 150 });
+      fireEvent.mouseMove(document, {
+        clientX: dir.includes('w') ? 50 : dir.includes('e') ? 550 : 300,
+        clientY: dir.includes('n') ? 10 : dir.includes('s') ? 450 : 150,
+      });
+      fireEvent.mouseUp(document);
+      assertInsideAvailable(smallStoredPanel, 620, 44, 300);
+    }
+    vStored.unmount();
+
+    // 3) Window shrink from spacious (1600x1000) to below nominal (620x400)
+    vi.spyOn(window, 'innerWidth', 'get').mockReturnValue(1600);
+    vi.spyOn(window, 'innerHeight', 'get').mockReturnValue(1000);
+    localStorage.setItem('rcc_float_cloud-docs', JSON.stringify({ x: 200, y: 100, w: 1000, h: 650, _dv: 2 }));
+    const vShrink = render(
+      <FloatingPanel
+        id="cloud-docs"
+        title="Cloud Docs"
+        onClose={() => {}}
+        defaultW={1080}
+        defaultH={760}
+        minW={640}
+        minH={440}
+        defaultVersion={2}
+        getDefaultGeometry={() => ({ x: 240, y: 44, w: 1200, h: 820 })}
+      >
+        <div>docs</div>
+      </FloatingPanel>,
+    );
+    const shrinkPanel = screen.getByTestId('floating-panel-cloud-docs') as HTMLElement;
+    // Nominal min floor (640x440) still enforced when viewport is spacious (1600x1000)
+    fireEvent.mouseDown(screen.getByTestId('floating-resize-se'), { clientX: 1200, clientY: 750 });
+    fireEvent.mouseMove(document, { clientX: 400, clientY: 200 });
+    fireEvent.mouseUp(document);
+    expect(parseFloat(shrinkPanel.style.width)).toBe(640);
+    expect(parseFloat(shrinkPanel.style.height)).toBe(440);
+
+    // Now shrink viewport below nominal min -> window shrinks strictly inside real bounds
+    vi.spyOn(window, 'innerWidth', 'get').mockReturnValue(620);
+    vi.spyOn(window, 'innerHeight', 'get').mockReturnValue(400);
+    fireEvent(window, new Event('resize'));
+    assertInsideAvailable(shrinkPanel, 620, 44, 300);
+    vShrink.unmount();
+
+    // 4) Equal to nominal min (640 x (44 + 440 + 100) = 640x584) keeps exact 640x440
+    vi.spyOn(window, 'innerWidth', 'get').mockReturnValue(640);
+    vi.spyOn(window, 'innerHeight', 'get').mockReturnValue(584);
+    localStorage.clear();
+    const vEqual = render(
+      <FloatingPanel
+        id="cloud-docs-equal"
+        title="Cloud Docs"
+        onClose={() => {}}
+        defaultW={1080}
+        defaultH={760}
+        minW={640}
+        minH={440}
+        defaultVersion={2}
+        getDefaultGeometry={() => ({ x: 0, y: 44, w: 640, h: 440 })}
+      >
+        <div>docs</div>
+      </FloatingPanel>,
+    );
+    const equalPanel = screen.getByTestId('floating-panel-cloud-docs-equal') as HTMLElement;
+    assertInsideAvailable(equalPanel, 640, 44, 484);
+    expect(parseFloat(equalPanel.style.width)).toBe(640);
+    expect(parseFloat(equalPanel.style.height)).toBe(440);
+    vEqual.unmount();
+
+    // 5) Negative control: unversioned panel (cron/filebrowser without new props) keeps exact legacy behavior
+    vi.spyOn(window, 'innerWidth', 'get').mockReturnValue(1200);
+    vi.spyOn(window, 'innerHeight', 'get').mockReturnValue(800);
+    localStorage.setItem('rcc_float_cron', JSON.stringify({ x: 90, y: 95, w: 680, h: 500 }));
+    const vLegacy = render(
+      <FloatingPanel id="cron" title="Cron" onClose={() => {}}>
+        <div>cron</div>
+      </FloatingPanel>,
+    );
+    const cronPanel = screen.getByTestId('floating-panel-cron') as HTMLElement;
+    expect(cronPanel.style.left).toBe('90px');
+    expect(cronPanel.style.top).toBe('95px');
+    expect(cronPanel.style.width).toBe('680px');
+    expect(cronPanel.style.height).toBe('500px');
+    expect(JSON.parse(localStorage.getItem('rcc_float_cron') ?? '{}')._dv).toBeUndefined();
+    vLegacy.unmount();
+
+    tabBar.remove();
+  });
 });

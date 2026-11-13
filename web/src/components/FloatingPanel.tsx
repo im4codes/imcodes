@@ -57,25 +57,48 @@ const MIN_H = 280;
 const MOBILE_FLOATING_PANEL_Z_MIN = 7000;
 const MOBILE_FLOATING_PANEL_Z_OFFSET = 2000;
 
-function currentViewportBounds(minW = MIN_W, minH = MIN_H): WorkspaceBounds {
-  return reserveWorkspaceBottom(viewportWorkspaceBelowSessionTabs({
+function currentViewportBounds(
+  minW = MIN_W,
+  minH = MIN_H,
+  fitSmallViewport = false,
+): WorkspaceBounds {
+  const raw = reserveWorkspaceBottom(viewportWorkspaceBelowSessionTabs({
     viewportWidth: window.innerWidth,
     viewportHeight: window.innerHeight,
-    minW,
-    minH,
+    minW: fitSmallViewport ? 1 : minW,
+    minH: fitSmallViewport ? 1 : minH,
   }));
+  if (!fitSmallViewport) return raw;
+  return {
+    x: raw.x,
+    y: raw.y,
+    w: Math.max(1, raw.w),
+    h: Math.max(1, raw.h),
+  };
+}
+
+function effectiveMinimumSize(
+  bounds: WorkspaceBounds,
+  minW: number,
+  minH: number,
+  fitSmallViewport: boolean,
+): { minW: number; minH: number } {
+  if (!fitSmallViewport) return { minW, minH };
+  return {
+    minW: Math.max(1, Math.min(minW, bounds.w)),
+    minH: Math.max(1, Math.min(minH, bounds.h)),
+  };
 }
 
 function clampGeomToViewport(
   geom: WindowGeometry,
   minW = MIN_W,
   minH = MIN_H,
+  fitSmallViewport = false,
 ): WindowGeometry {
-  const bounds = currentViewportBounds(minW, minH);
-  return clampGeometryFullyIntoWorkspace(geom, bounds, {
-    minW,
-    minH,
-  });
+  const bounds = currentViewportBounds(minW, minH, fitSmallViewport);
+  const eff = effectiveMinimumSize(bounds, minW, minH, fitSmallViewport);
+  return clampGeometryFullyIntoWorkspace(geom, bounds, eff);
 }
 
 interface StoredWindowGeometry extends WindowGeometry {
@@ -109,6 +132,7 @@ function loadGeom(
   getDefaultGeometry?: () => WindowGeometry | null,
   defaultVersion?: number,
 ): WindowGeometry {
+  const fitSmallViewport = Boolean(getDefaultGeometry || defaultVersion !== undefined);
   const computedDefault = resolveDefaultGeometry(dw, dh, getDefaultGeometry);
   try {
     const raw = localStorage.getItem(`rcc_float_${id}`);
@@ -118,12 +142,12 @@ function loadGeom(
       const versionMatches = defaultVersion === undefined || (parsedObj !== null && parsedObj._dv === defaultVersion);
       if (versionMatches) {
         return clampGeomToViewport(
-          normalizeWindowGeometry(parsed, computedDefault), minW, minH,
+          normalizeWindowGeometry(parsed, computedDefault), minW, minH, fitSmallViewport,
         );
       }
     }
   } catch { /* ignore */ }
-  return clampGeomToViewport(computedDefault, minW, minH);
+  return clampGeomToViewport(computedDefault, minW, minH, fitSmallViewport);
 }
 
 function saveGeom(id: string, geom: WindowGeometry, defaultVersion?: number) {
@@ -133,8 +157,12 @@ function saveGeom(id: string, geom: WindowGeometry, defaultVersion?: number) {
   try { localStorage.setItem(`rcc_float_${id}`, JSON.stringify(payload)); } catch { /* ignore */ }
 }
 
-function fallbackMaximizedGeometry(minW: number, minH: number): WindowGeometry {
-  return geometryFromWorkspace(currentViewportBounds(minW, minH));
+function fallbackMaximizedGeometry(
+  minW: number,
+  minH: number,
+  fitSmallViewport = false,
+): WindowGeometry {
+  return geometryFromWorkspace(currentViewportBounds(minW, minH, fitSmallViewport));
 }
 
 export function FloatingPanel({
@@ -167,6 +195,7 @@ export function FloatingPanel({
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   const canUseDesktopMaximize = enableMaximize && desktopLayoutCapable;
   const isDesktopMaximized = canUseDesktopMaximize && isMaximized;
+  const fitSmallViewport = Boolean(getDefaultGeometry || defaultVersion !== undefined);
   const [geom, setGeom] = useState(() => loadGeom(
     id, defaultW, defaultH, minW, minH, getDefaultGeometry, defaultVersion,
   ));
@@ -183,19 +212,19 @@ export function FloatingPanel({
         forceWorkspaceRender((n) => n + 1);
         return;
       }
-      setGeom((g) => clampGeomToViewport(g, minW, minH));
+      setGeom((g) => clampGeomToViewport(g, minW, minH, fitSmallViewport));
     };
     window.addEventListener('resize', onResize);
     return () => window.removeEventListener('resize', onResize);
-  }, [isDesktopMaximized, minH, minW]);
+  }, [fitSmallViewport, isDesktopMaximized, minH, minW]);
 
   // ── Drag ─────────────────────────────────────────────────────────────────
   const dragStart = useRef<{ mx: number; my: number; ox: number; oy: number } | null>(null);
 
   const clampPos = useCallback((x: number, y: number, w: number, h = geomRef.current.h) => {
-    const clamped = clampGeomToViewport({ x, y, w, h }, minW, minH);
+    const clamped = clampGeomToViewport({ x, y, w, h }, minW, minH, fitSmallViewport);
     return { x: clamped.x, y: clamped.y };
-  }, [minH, minW]);
+  }, [fitSmallViewport, minH, minW]);
 
   const startDrag = useCallback((e: MouseEvent) => {
     if (isDesktopMaximized) {
@@ -241,23 +270,24 @@ export function FloatingPanel({
       const dx = me.clientX - sx;
       const dy = me.clientY - sy;
       setGeom(() => {
+        const bounds = currentViewportBounds(minW, minH, fitSmallViewport);
+        const eff = effectiveMinimumSize(bounds, minW, minH, fitSmallViewport);
         let { x, y, w, h } = { ...startG };
         const startRight = startG.x + startG.w;
         const startBottom = startG.y + startG.h;
-        if (dir.includes('e')) w = Math.max(minW, startG.w + dx);
-        if (dir.includes('s')) h = Math.max(minH, startG.h + dy);
+        if (dir.includes('e')) w = Math.max(eff.minW, startG.w + dx);
+        if (dir.includes('s')) h = Math.max(eff.minH, startG.h + dy);
         if (dir.includes('w')) {
           const desiredX = startG.x + dx;
-          x = Math.min(desiredX, startRight - minW);
+          x = Math.min(desiredX, startRight - eff.minW);
           w = startRight - x;
         }
         if (dir.includes('n')) {
-          const bounds = currentViewportBounds(minW, minH);
           const desiredY = startG.y + dy;
-          y = Math.max(bounds.y, Math.min(desiredY, startBottom - minH));
+          y = Math.max(bounds.y, Math.min(desiredY, startBottom - eff.minH));
           h = startBottom - y;
         }
-        return clampGeomToViewport({ x, y, w, h }, minW, minH);
+        return clampGeomToViewport({ x, y, w, h }, minW, minH, fitSmallViewport);
       });
     };
     const onUp = () => {
@@ -267,7 +297,7 @@ export function FloatingPanel({
     };
     document.addEventListener('mousemove', onMove);
     document.addEventListener('mouseup', onUp);
-  }, [isDesktopMaximized, minH, minW, onFocus]);
+  }, [fitSmallViewport, isDesktopMaximized, minH, minW, onFocus]);
 
   const onMaximizeClick = useCallback(() => {
     onFocus?.();
@@ -347,7 +377,7 @@ export function FloatingPanel({
   // Desktop: floating window
   const displayGeom = isDesktopMaximized
     ? geometryFromWorkspace(
-      getMaximizeBounds?.() ?? fallbackMaximizedGeometry(minW, minH),
+      getMaximizeBounds?.() ?? fallbackMaximizedGeometry(minW, minH, fitSmallViewport),
     )
     : geom;
   return (
