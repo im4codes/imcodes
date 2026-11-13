@@ -426,7 +426,6 @@ type AppUpdateNotice = {
   dismissed?: boolean;
 };
 
-const FAST_SERVER_SWITCH_SPLASH_KEY = 'imcodes:fast-server-switch-splash';
 const DAEMON_ONLINE_WS_RECOVERY_INITIAL_MS = 5_000;
 const DAEMON_ONLINE_WS_RECOVERY_INTERVAL_MS = 5_000;
 // Safety ceiling for the "daemon upgrading…" badge: an npm install + restart
@@ -467,26 +466,6 @@ function loadPersistedMaximizedSubSessionIds(serverId: string | null, sessionNam
 function readOpenSpecAutoRunbarCompactPreference(): boolean {
   try {
     return localStorage.getItem(OPENSPEC_AUTO_RUNBAR_COMPACT_STORAGE_KEY) === '1';
-  } catch {
-    return false;
-  }
-}
-
-function markFastServerSwitchSplash(): void {
-  try {
-    sessionStorage.setItem(FAST_SERVER_SWITCH_SPLASH_KEY, '1');
-  } catch {
-    // Ignore storage failures; switching servers should still reload normally.
-  }
-}
-
-function takeFastServerSwitchSplashFlag(): boolean {
-  try {
-    const flagged = sessionStorage.getItem(FAST_SERVER_SWITCH_SPLASH_KEY) === '1';
-    if (flagged) {
-      sessionStorage.removeItem(FAST_SERVER_SWITCH_SPLASH_KEY);
-    }
-    return flagged;
   } catch {
     return false;
   }
@@ -1547,8 +1526,7 @@ function InternalMainApp() {
     if (!splash) { setSplashDone(true); return; }
     if (!nativeReady && !nativeCallback) return;
     if (nativeCallback) { splash.remove(); setSplashDone(true); return; }
-    const fastServerSwitch = takeFastServerSwitchSplashFlag();
-    const minMs = fastServerSwitch ? 0 : 1100;
+    const minMs = 1100;
     const exitMs = 120;
     let exitTimer: ReturnType<typeof setTimeout> | undefined;
     const startExit = () => {
@@ -1976,14 +1954,20 @@ function InternalMainApp() {
     void refreshSharedEntries();
   }, [refreshSharedEntries]);
 
+  const managedSharesGenerationRef = useRef(0);
   const refreshManagedShares = useCallback(async () => {
-    if (!auth || !selectedServerId || selectedShareTarget) {
+    const generation = ++managedSharesGenerationRef.current;
+    const targetServerId = selectedServerId;
+    if (!auth || !targetServerId || selectedShareTarget) {
       setManagedShares([]);
       return;
     }
     try {
-      setManagedShares(await listManagedSharesForServer(selectedServerId));
+      const shares = await listManagedSharesForServer(targetServerId);
+      if (generation !== managedSharesGenerationRef.current || selectedServerIdRef.current !== targetServerId) return;
+      setManagedShares(shares);
     } catch {
+      if (generation !== managedSharesGenerationRef.current || selectedServerIdRef.current !== targetServerId) return;
       setManagedShares([]);
     }
   }, [auth, selectedServerId, selectedShareTarget]);
@@ -1995,13 +1979,16 @@ function InternalMainApp() {
   // Fetch sessions from DB immediately when auth + server are available
   useEffect(() => {
     if (!auth || !selectedServerId || selectedShareTarget || sharedHashRestorePending) return;
+    const targetServerId = selectedServerId;
+    let cancelled = false;
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 5_000); // 5s timeout — don't block UI on slow network
     apiFetch<{ sessions: Array<{ name: string; project_name: string; role: string; agent_type: string; agent_version?: string; state: string; error?: string | null; project_dir?: string; runtime_type?: 'process' | 'transport'; label?: string | null; description?: string | null }> }>(
-      `/api/server/${selectedServerId}/sessions`,
+      `/api/server/${targetServerId}/sessions`,
       { signal: ctrl.signal },
     ).then((data) => {
       clearTimeout(timer);
+      if (cancelled || ctrl.signal.aborted || selectedServerIdRef.current !== targetServerId) return;
       const mapped = data.sessions.map((s) => ({
         name: s.name,
         project: s.project_name,
@@ -2040,9 +2027,9 @@ function InternalMainApp() {
       // left by another server. A stale/missing snapshot safely falls back
       // to the first navigable tab -- without being recorded as the user's
       // choice, so the memory of what they really had open is kept.
-      restoreLastTabRef.current(selectedServerId, navigableMapped.map((session) => session.name));
+      restoreLastTabRef.current(targetServerId, navigableMapped.map((session) => session.name));
     }).catch(() => { clearTimeout(timer); /* WS fallback */ });
-    return () => { clearTimeout(timer); ctrl.abort(); };
+    return () => { cancelled = true; clearTimeout(timer); ctrl.abort(); };
   }, [auth, selectedServerId, selectedShareTarget, sharedHashRestorePending]);
 
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
@@ -3593,12 +3580,41 @@ function InternalMainApp() {
           ? selectedShareTarget.sessionName
           : undefined)
     : undefined;
-  const { subSessions, visibleSubSessions, loadedServerId, create: createSubSession, close: closeSubSession, restart: restartSubSession, rename: renameSubSession, updateLocal: updateSubLocal, hydrateShared: hydrateSharedSubSessions } = useSubSessions(
+  const staleSubSessionsSnapshotRef = useRef<readonly SubSession[] | null>(null);
+  const rawSubSessionsRef = useRef<readonly SubSession[]>([]);
+  const {
+    subSessions: rawSubSessions,
+    visibleSubSessions: rawVisibleSubSessions,
+    loadedServerId,
+    create: createSubSession,
+    close: closeSubSession,
+    restart: restartSubSession,
+    rename: renameSubSession,
+    updateLocal: updateSubLocal,
+    hydrateShared: hydrateSharedSubSessions,
+  } = useSubSessions(
     (nativeReady && auth) ? selectedServerId : null,
     wsRef.current,
     connected,
     activeSession || canonicalSharedSessionName || null,
     Boolean(selectedShareTarget),
+  );
+  rawSubSessionsRef.current = rawSubSessions;
+  useEffect(() => {
+    if (rawSubSessions !== staleSubSessionsSnapshotRef.current) {
+      staleSubSessionsSnapshotRef.current = null;
+    }
+  }, [rawSubSessions]);
+  const subSessionsScopedToServer = Boolean(selectedServerId)
+    && (loadedServerId === null || loadedServerId === selectedServerId)
+    && rawSubSessions !== staleSubSessionsSnapshotRef.current;
+  const subSessions = useMemo(
+    () => (subSessionsScopedToServer ? rawSubSessions : []),
+    [rawSubSessions, subSessionsScopedToServer],
+  );
+  const visibleSubSessions = useMemo(
+    () => (subSessionsScopedToServer ? rawVisibleSubSessions : []),
+    [rawVisibleSubSessions, subSessionsScopedToServer],
   );
 
   // Session settings may stay open across a daemon rolling upgrade. Keep the
@@ -4445,7 +4461,13 @@ function InternalMainApp() {
   useEffect(() => {
     if (!auth || !selectedServerId || sharedHashRestorePending) return;
 
-    const ws = new WsClient(auth.baseUrl, selectedServerId, { shareTarget: selectedShareTarget });
+    const targetServerId = selectedServerId;
+    selectedServerIdRef.current = targetServerId;
+    let effectDisposed = false;
+    const isStaleSocket = () => (
+      effectDisposed || wsRef.current !== ws || selectedServerIdRef.current !== targetServerId
+    );
+    const ws = new WsClient(auth.baseUrl, targetServerId, { shareTarget: selectedShareTarget });
     wsRef.current = ws;
     // Test-only, opt-in via an explicit query param: lets the identity-over-lease
     // real-machine harness (test/perf/browser/identity-p2p.spec.mjs) call
@@ -4463,6 +4485,7 @@ function InternalMainApp() {
     }
 
     const unsub = ws.onMessage((msg) => {
+      if (isStaleSocket()) return;
       askAnswerTrackerRef.current?.handle(msg);
       if (msg.type === 'timeline.event' && msg.event.type === 'user.message') {
         // The echo of an answer names the question it settled: close this
@@ -5460,6 +5483,7 @@ function InternalMainApp() {
     });
 
     ws.onLatency((ms) => {
+      if (isStaleSocket()) return;
       setLatencyMs(ms);
       // Pong proves the WS to the server pod is alive. Refresh lastHeartbeatAt
       // so the sidebar device dot stays green during quiet periods (no
@@ -5472,11 +5496,12 @@ function InternalMainApp() {
       // via MSG_DAEMON_OFFLINE doesn't get accidentally promoted back online.
       // Only touch heartbeat for owned servers; shared server presence is
       // authoritatively tracked by daemon DB heartbeats via discoverSharedEntries.
-      if (selectedServerId && ownedServerIdsRef.current.has(selectedServerId)) {
-        setServers((prev) => touchServerHeartbeat(prev, selectedServerId));
+      if (targetServerId && ownedServerIdsRef.current.has(targetServerId)) {
+        setServers((prev) => touchServerHeartbeat(prev, targetServerId));
       }
     });
     const unsubStats = ws.onMessage((msg) => {
+      if (isStaleSocket()) return;
       // A liveness frame (link-worker heartbeat) proves the daemon is alive just
       // like a stats frame, but carries no system numbers: both fold into the
       // last snapshot instead of replacing it, so nothing ever blanks or turns NaN.
@@ -5575,12 +5600,17 @@ function InternalMainApp() {
           remoteDesktopConnectionManager.resumeExhaustedConnections();
         }, App))
         .then((cleanup) => {
-          removeAppStateListener = cleanup;
+          if (effectDisposed) {
+            cleanup();
+          } else {
+            removeAppStateListener = cleanup;
+          }
         })
         .catch(() => {});
     }
 
     return () => {
+      effectDisposed = true;
       document.removeEventListener('visibilitychange', onVisibility);
       window.removeEventListener('focus', onFocus);
       window.removeEventListener('pageshow', onPageShow);
@@ -5962,7 +5992,92 @@ function InternalMainApp() {
     }
   }, [auth?.baseUrl, clearAuthState, holdAuthCredentialCleanupGate, nativeServerUrl]);
 
+  const resetServerScopedStateForSwitch = useCallback(() => {
+    staleSubSessionsSnapshotRef.current = rawSubSessionsRef.current;
+    managedSharesGenerationRef.current += 1;
+    explicitSelectionServerRef.current = null;
+    askAnswerTrackerRef.current?.dispose();
+    if (sessionListRetryRef.current) {
+      clearTimeout(sessionListRetryRef.current);
+      sessionListRetryRef.current = null;
+    }
+    if (daemonOfflineGraceTimerRef.current) {
+      clearTimeout(daemonOfflineGraceTimerRef.current);
+      daemonOfflineGraceTimerRef.current = null;
+    }
+    setSessions([]);
+    setSessionsLoaded(false);
+    setActiveSession(null, { remember: false });
+    setOpenSubIds(new Set());
+    setRetainedOpenSubIds(new Set());
+    setMaximizedSubIds(new Set());
+    setSharedActiveDispatchIds(new Map());
+    setPendingQuestion(null);
+    setAskAnswerFailure(null);
+    setDaemonStats(null);
+    setDaemonOnline(false);
+    setConnected(false);
+    setConnecting(true);
+    setLatencyMs(null);
+    setDiscussions([]);
+    setRepoContexts(new Map());
+    setManagedShares([]);
+    setSettingsTarget(null);
+    setCloneSessionTarget(null);
+    setPreviewFileRequest(null);
+    setShowRepoPage(false);
+    setShowCronManager(false);
+    setShowDiscussionsPage(false);
+    setDesktopFileBrowserMaximized(false);
+  }, [setActiveSession, setOpenSubIds]);
+
+  const switchToOwnedServerInApp = useCallback((serverId: string, serverName?: string | null) => {
+    setManualDashboard(false);
+    setSelectedShareTarget(null);
+    setSelectedSharedEntryId(null);
+    clearSharedTabRestoreMarker();
+    setShowSharedReturnGuide(false);
+    // Save current active session for the server we're leaving.
+    // Prefer live route refs over the cross-tab legacy fallback.  The latter
+    // may still point at a different server while a hash/back-forward route is
+    // converging.
+    // Only a tab the user deliberately opened is remembered; leaving a server
+    // with nothing selected (or with an automatic fallback showing) must keep
+    // what was remembered before, never erase or replace it.
+    const prevServer = selectedServerIdRef.current ?? localStorage.getItem('rcc_server');
+    const currentSession = activeSessionRef.current;
+    if (prevServer && prevServer !== serverId && !selectedShareTarget && currentSession && rememberIntentRef.current === currentSession) {
+      writeServerSession(prevServer, currentSession);
+    }
+
+    localStorage.setItem('rcc_server', serverId);
+    if (serverName) localStorage.setItem('rcc_server_name', serverName);
+
+    // The destination server's session list is not loaded yet. Keep the
+    // scoped snapshot in storage, but do not put an unvalidated candidate in
+    // the hash; the destination hydrate will resolve it against navigable
+    // sessions before selecting it.
+    // This click, not the route that happened to mount the document, is now
+    // authoritative. Converge the canonical state before any hash-sync or late
+    // shared-open callback can act on the outgoing server route.
+    const nextRoute = { serverId, sessionName: null, sharedEntryId: null };
+    initialHashStateRef.current = nextRoute;
+    initialSharedTabRestoreRef.current = null;
+    sharedHashRestoreStartedRef.current = true;
+    setSharedHashRestorePending(false);
+    selectedServerIdRef.current = serverId;
+    setSelectedServerId(serverId);
+    setSelectedServerName(serverName ?? null);
+    resetServerScopedStateForSwitch();
+    writeHashState(serverId, null, null);
+  }, [resetServerScopedStateForSwitch, selectedShareTarget]);
+
   const handleSelectServer = useCallback(async (serverId: string, serverName?: string) => {
+    const hadPendingSharedNavigation = Boolean(
+      sharedOpenAbortRef.current
+      || sharedOpenIntentRef.current
+      || externalRouteInFlightKeyRef.current,
+    );
     sharedOpenAbortRef.current?.abort();
     sharedOpenAbortRef.current = null;
     sharedOpenGenerationRef.current += 1;
@@ -5974,56 +6089,24 @@ function InternalMainApp() {
     externalRouteInFlightKeyRef.current = null;
     setOpeningSharedEntryId(null);
     autoEntryRunRef.current++;
-    setManualDashboard(false);
-    setSelectedShareTarget(null);
-    setSelectedSharedEntryId(null);
-    clearSharedTabRestoreMarker();
-    setShowSharedReturnGuide(false);
-    // Save current active session for the server we're leaving
-    // Prefer live route refs over the cross-tab legacy fallback.  The latter
-    // may still point at a different server while a hash/back-forward route is
-    // converging.
-    // Only a tab the user deliberately opened is remembered; leaving a server
-    // with nothing selected (or with an automatic fallback showing) must keep
-    // what was remembered before, never erase or replace it.
-    const prevServer = selectedServerIdRef.current ?? localStorage.getItem('rcc_server');
-    const currentSession = activeSessionRef.current;
-    if (prevServer && currentSession && rememberIntentRef.current === currentSession) {
-      writeServerSession(prevServer, currentSession);
+    setMobileSidebarOpen(false);
+    setShowMobileServerMenu(false);
+    setServerCtxMenu(null);
+
+    const alreadyOnOwnedServer =
+      selectedServerIdRef.current === serverId
+      && selectedShareTarget === null
+      && selectedSharedEntryId === null
+      && !manualDashboard;
+    if (alreadyOnOwnedServer) {
+      if (hadPendingSharedNavigation) {
+        writeHashState(serverId, activeSessionRef.current ?? null, null);
+      }
+      return;
     }
 
-    localStorage.setItem('rcc_server', serverId);
-    if (serverName) localStorage.setItem('rcc_server_name', serverName);
-
-    // The destination server's session list is not loaded yet. Keep the
-    // scoped snapshot in storage, but do not put an unvalidated candidate in
-    // the hash; the destination hydrate will resolve it against navigable
-    // sessions before selecting it.
-
-    // This click, not the route that happened to mount the document, is now
-    // authoritative. Converge the canonical state before the hash-sync effect
-    // can publish the old shared selection while reload is being scheduled.
-    // Retiring the startup refs also prevents a delayed restore/open result
-    // from treating the original shared URL as a still-live intent.
-    const nextRoute = { serverId, sessionName: null, sharedEntryId: null };
-    initialHashStateRef.current = nextRoute;
-    initialSharedTabRestoreRef.current = null;
-    sharedHashRestoreStartedRef.current = true;
-    setSharedHashRestorePending(false);
-    selectedServerIdRef.current = serverId;
-    setSelectedServerId(serverId);
-    setSelectedServerName(serverName ?? null);
-    setActiveSession(null);
-
-    // Write the hash BEFORE reload so the new page picks up the right server+session
-    // from the URL rather than from (now shared) localStorage.
-    writeHashState(serverId, null);
-
-    // Full page reload — guarantees all components, WS connections, and pinned
-    // panels start fresh with the new server. Avoids stale WS/state bugs.
-    markFastServerSwitchSplash();
-    window.location.reload();
-  }, [setActiveSession]);
+    switchToOwnedServerInApp(serverId, serverName);
+  }, [manualDashboard, selectedShareTarget, selectedSharedEntryId, switchToOwnedServerInApp]);
 
   const handleSelectServerForShare = useCallback((serverId: string) => {
     if (!serverId || serverId === selectedServerIdRef.current) return;
@@ -6036,34 +6119,8 @@ function InternalMainApp() {
     externalRouteInFlightKeyRef.current = null;
     setOpeningSharedEntryId(null);
     autoEntryRunRef.current++;
-    setManualDashboard(false);
-    setSelectedShareTarget(null);
-    setSelectedSharedEntryId(null);
-    clearSharedTabRestoreMarker();
-    setShowSharedReturnGuide(false);
-
-    const prevServer = selectedServerIdRef.current ?? localStorage.getItem('rcc_server');
-    const currentSession = activeSessionRef.current;
-    if (prevServer && currentSession && rememberIntentRef.current === currentSession) {
-      writeServerSession(prevServer, currentSession);
-    }
-
-    localStorage.setItem('rcc_server', serverId);
-    if (serverName) localStorage.setItem('rcc_server_name', serverName);
-
-    const nextRoute = { serverId, sessionName: null, sharedEntryId: null };
-    initialHashStateRef.current = nextRoute;
-    initialSharedTabRestoreRef.current = null;
-    sharedHashRestoreStartedRef.current = true;
-    setSharedHashRestorePending(false);
-    selectedServerIdRef.current = serverId;
-    setSessions([]);
-    setSessionsLoaded(false);
-    setSelectedServerId(serverId);
-    setSelectedServerName(serverName);
-    setActiveSession(null, { remember: false });
-    writeHashState(serverId, null);
-  }, [servers, setActiveSession]);
+    switchToOwnedServerInApp(serverId, serverName);
+  }, [servers, switchToOwnedServerInApp]);
 
   const handleDismissSharedPayload = useCallback((payloadId: string) => {
     setPendingSharedPayloads((prev) => prev.filter((item) => item.id !== payloadId));
@@ -7166,18 +7223,33 @@ function InternalMainApp() {
   // Show full-screen connecting indicator while waiting for initial WS + session data.
   // After 8s, show escape buttons so the user is never stuck.
   const [connectTimeout, setConnectTimeout] = useState(false);
+  const hasEnteredAppShellRef = useRef(false);
+  if (!auth) {
+    hasEnteredAppShellRef.current = false;
+  }
   const selectedServerInfo = selectedServerId
     ? servers.find((server) => server.id === selectedServerId) ?? null
     : null;
   // A confirmed offline daemon cannot satisfy the initial connection gate.
   // Keep server management (including deletion) available without waiting for WS.
   const selectedServerKnownOffline = serversLoaded && selectedServerInfo !== null && !isServerOnline(selectedServerInfo);
-  const showInitialConnectingGate = initialAuthVerificationPending || (!selectedServerKnownOffline && !pendingSharedPayload && shouldShowInitialConnectingGate(
-    Boolean(auth),
-    selectedServerId,
-    connected,
-    sessionsLoaded,
-  ));
+  // Once the app shell has mounted for this session, in-app server switches
+  // keep the shell (and ServerIconBar) interactive and show the content-area
+  // spinner instead of blanking the whole viewport behind the cold-boot gate.
+  const showInitialConnectingGate = initialAuthVerificationPending || (
+    !hasEnteredAppShellRef.current
+    && !selectedServerKnownOffline
+    && !pendingSharedPayload
+    && shouldShowInitialConnectingGate(
+      Boolean(auth),
+      selectedServerId,
+      connected,
+      sessionsLoaded,
+    )
+  );
+  if (auth && !showInitialConnectingGate) {
+    hasEnteredAppShellRef.current = true;
+  }
   const resolvedActiveSessionExists = hasResolvedActiveSession(activeSession, navigableMainSessions);
   const daemonVersionForDisplay = daemonStats?.daemonVersion ?? selectedServerInfo?.daemonVersion ?? null;
   const latestDaemonVersionForDisplay = daemonStats?.latestDaemonVersion ?? selectedServerInfo?.latestDaemonVersion ?? null;

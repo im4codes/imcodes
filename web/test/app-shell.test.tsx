@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/preact';
 import { createPortal } from 'preact/compat';
 import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
+import { DAEMON_STATS_MSG } from '@shared/daemon-stats.js';
 import { SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY } from '../src/supervision-task-console-preferences.js';
 import {
   SUBSESSION_DESKTOP_DOCK_SIDE,
@@ -3646,6 +3647,247 @@ describe('App shell', () => {
 
       expect(activePaneName()).toBe('deck_alpha_notes');
       expect(localStorage.getItem(serverSessionStorageKey('srv-1'))).toBe('deck_alpha_notes');
+    }, 30_000);
+
+    it('switches owned servers in-app without reloading, preserves loading spinner while sessions load, and restores each server tab', async () => {
+      seedLogin('srv-1');
+      let releaseSrv2!: () => void;
+      const srv2Gate = new Promise<void>((resolve) => { releaseSrv2 = resolve; });
+      installApi({
+        sessions: async (serverId) => {
+          if (serverId === 'srv-2') {
+            await srv2Gate;
+          }
+          return { sessions: listFor(serverId) };
+        },
+      });
+      const { App } = await importApp();
+      const view = render(<App />);
+
+      await expectActive('deck_alpha_brain');
+      fireEvent.click(screen.getByText('tabs-select-deck_alpha_notes'));
+      await expectActive('deck_alpha_notes');
+      expect(wsInstances.length).toBe(1);
+
+      // Switch to srv-2 in-app (no reloadApp): ws1 disconnects, ws2 starts, shell stays interactive, loading spinner shows while srv-2 REST/WS loads
+      fireEvent.click(screen.getByText('server-select-srv-2'));
+      await waitFor(() => {
+        expect(wsInstances[0].disconnect).toHaveBeenCalledTimes(1);
+        expect(wsInstances.length).toBe(2);
+      });
+      expect(screen.getByTestId('server-icon-bar')).toBeTruthy();
+      expect(screen.queryByText('common.reconnecting')).toBeNull();
+      expect(activePaneName()).toBeNull();
+      expect(view.container.querySelector('.spinner')).toBeTruthy();
+
+      await act(async () => {
+        releaseSrv2();
+        await Promise.resolve();
+      });
+      await expectActive('deck_gamma_brain');
+      expect(view.container.querySelector('.spinner')).toBeNull();
+
+      fireEvent.click(screen.getByText('tabs-select-deck_gamma_ops'));
+      await expectActive('deck_gamma_ops');
+
+      // Switch back to srv-1 in-app -> restores remembered deck_alpha_notes
+      fireEvent.click(screen.getByText('server-select-srv-1'));
+      await waitFor(() => expect(wsInstances[1].disconnect).toHaveBeenCalledTimes(1));
+      await expectActive('deck_alpha_notes');
+    }, 30_000);
+
+    it('resets subSessions, pendingQuestion, daemonStats, and context menu cleanly across server switch', async () => {
+      seedLogin('srv-1');
+      useSubSessionsState.loadedServerId = 'srv-1';
+      useSubSessionsState.subSessions = [{
+        id: 'sub-1',
+        sessionName: 'deck_sub_alpha_1',
+        parentSession: 'deck_alpha_brain',
+        label: 'Helper 1',
+        type: 'codex-sdk',
+        state: 'running',
+      }];
+      useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+      installApi();
+      const { App } = await importApp();
+      const view = render(<App />);
+
+      await expectActive('deck_alpha_brain');
+      const ws1 = await getActiveWsClient();
+
+      // Surface server-1 sub-session, ask-question card, daemon stats, and server context menu
+      expect(screen.getByText('subbar-open-sub-1')).toBeTruthy();
+      fireEvent.click(screen.getByText('server-menu'));
+      expect(screen.getByText('server-context-menu')).toBeTruthy();
+
+      await act(async () => {
+        ws1.emit({
+          type: 'timeline.event',
+          event: {
+            type: 'ask.question',
+            sessionId: 'deck_alpha_brain',
+            payload: {
+              toolUseId: 'q-srv-1',
+              questions: [{ header: 'H1', question: 'Question on srv-1?', options: [] }],
+            },
+          },
+        });
+        ws1.emit({
+          type: DAEMON_STATS_MSG,
+          daemonVersion: '2026.5.99',
+          uptimeSec: 120,
+          cpuPct: 12,
+          memUsedMb: 256,
+          memTotalMb: 1024,
+        });
+      });
+      expect(screen.getByText('Question on srv-1?')).toBeTruthy();
+
+      // Switch to srv-2 while loadedServerId still points to srv-1: old server state must vanish immediately
+      fireEvent.click(screen.getByText('server-select-srv-2'));
+      await waitFor(() => expect(ws1.disconnect).toHaveBeenCalled());
+      expect(screen.queryByText('Question on srv-1?')).toBeNull();
+      expect(screen.queryByText('server-context-menu')).toBeNull();
+      expect(screen.queryByText('subbar-open-sub-1')).toBeNull();
+      expect(view.container.querySelector('.daemon-stats-card')).toBeNull();
+    }, 30_000);
+
+    it('closes mobile sidebar and mobile server menu immediately when switching servers on mobile', async () => {
+      const originalUA = navigator.userAgent;
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+      try {
+        seedLogin('srv-1');
+        installApi();
+        const { App } = await importApp();
+        const view = render(<App />);
+
+        await expectActive('deck_alpha_brain');
+        fireEvent.click(view.container.querySelector('.mobile-sidebar-toggle')!);
+        await waitFor(() => expect(view.container.querySelector('.mobile-sidebar-overlay.open')).toBeTruthy());
+
+        const mobileSrv2 = Array.from(view.container.querySelectorAll('.mobile-sidebar-panel .server-item'))
+          .find((el) => el.textContent?.includes('Server srv-2')) as HTMLElement;
+        expect(mobileSrv2).toBeTruthy();
+        fireEvent.click(mobileSrv2);
+
+        await waitFor(() => expect(view.container.querySelector('.mobile-sidebar-overlay.open')).toBeNull());
+        await expectActive('deck_gamma_brain');
+
+        // Also verify MobileServerMenu closes immediately when selecting srv-1
+        fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+        await waitFor(() => expect(view.container.querySelector('.mobile-server-menu')).toBeTruthy());
+        const menuSrv1 = Array.from(view.container.querySelectorAll('.mobile-server-menu .mobile-server-menu-server'))
+          .find((el) => el.textContent?.includes('Server srv-1')) as HTMLElement;
+        fireEvent.click(menuSrv1);
+
+        await waitFor(() => expect(view.container.querySelector('.mobile-server-menu')).toBeNull());
+        await expectActive('deck_alpha_brain');
+      } finally {
+        Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUA });
+      }
+    }, 30_000);
+
+    it('ignores delayed REST responses and closing WS events across rapid A -> B -> A switches', async () => {
+      seedLogin('srv-2');
+      let srv1RestCount = 0;
+      let releaseFirstSrv1!: () => void;
+      const firstSrv1Gate = new Promise<void>((resolve) => { releaseFirstSrv1 = resolve; });
+      installApi({
+        sessions: async (serverId) => {
+          if (serverId === 'srv-1') {
+            srv1RestCount += 1;
+            if (srv1RestCount === 1) {
+              await firstSrv1Gate;
+              return { sessions: listFor('srv-1').slice(0, 1) };
+            }
+          }
+          return { sessions: listFor(serverId) };
+        },
+      });
+      const { App } = await importApp();
+      render(<App />);
+
+      await expectActive('deck_gamma_brain');
+      const initialWs = wsInstances[0];
+
+      // Rapidly switch B -> A (first srv-1 REST hangs), then back A -> B before first srv-1 resolves
+      fireEvent.click(await screen.findByText('server-select-srv-1'));
+      await waitFor(() => expect(srv1RestCount).toBe(1));
+      const ws1 = wsInstances[1];
+      expect(screen.getByTestId('server-icon-bar')).toBeTruthy();
+
+      fireEvent.click(screen.getByText('server-select-srv-2'));
+      await expectActive('deck_gamma_brain');
+      const ws2 = wsInstances[2];
+
+      // Closing WS A event firing late cannot inject srv-1 question or sessions into srv-2
+      await act(async () => {
+        initialWs.emit(wsSessionList('srv-2'));
+        ws1.emit({
+          type: 'timeline.event',
+          event: {
+            type: 'ask.question',
+            sessionId: 'deck_alpha_brain',
+            payload: { toolUseId: 'q-stale-ws1', questions: [{ header: 'Stale', question: 'Stale WS1 question?', options: [] }] },
+          },
+        });
+        ws1.emit(wsSessionList('srv-1'));
+      });
+      expect(screen.queryByText('Stale WS1 question?')).toBeNull();
+      expect(activePaneName()).toBe('deck_gamma_brain');
+
+      // Rapidly switch B -> A (second A REST completes with all 3 tabs)
+      fireEvent.click(screen.getByText('server-select-srv-1'));
+      await expectActive('deck_alpha_brain');
+      expect(screen.getByText('tabs-select-deck_alpha_notes')).toBeTruthy();
+
+      // Late closing WS B event & first A REST settling late must both be ignored
+      await act(async () => {
+        ws2.emit(wsSessionList('srv-2'));
+        releaseFirstSrv1();
+        await Promise.resolve();
+      });
+      expect(screen.queryByText('tabs-select-deck_gamma_brain')).toBeNull();
+      expect(screen.getByText('tabs-select-deck_alpha_notes')).toBeTruthy();
+      expect(activePaneName()).toBe('deck_alpha_brain');
+    }, 30_000);
+
+    it('keeps active session intact on already-active owned server click and clears shared UI when returning from share', async () => {
+      seedLogin('srv-1');
+      installApi();
+      const sharedEntry = {
+        id: 'share-ret-1',
+        serverId: 'srv-shared',
+        serverName: 'Shared Server',
+        role: 'participant',
+        status: 'active',
+        targetLabel: 'Shared Beta',
+        target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+      } as const;
+      discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+      openSharedEntryMock.mockResolvedValue(sharedMainOpenResult(sharedEntry.id, 'dispatch-shared'));
+
+      const { App } = await importApp();
+      render(<App />);
+      await expectActive('deck_alpha_brain');
+      fireEvent.click(screen.getByText('tabs-select-deck_alpha_notes'));
+      await expectActive('deck_alpha_notes');
+
+      // Clicking already-active owned srv-1 must NOT wipe activeSession or disconnect WS
+      fireEvent.click(screen.getByText('server-select-srv-1'));
+      expect(wsInstances.length).toBe(1);
+      expect(wsInstances[0].disconnect).not.toHaveBeenCalled();
+      expect(activePaneName()).toBe('deck_alpha_notes');
+
+      // Open shared entry -> shows shared pane + shared-return-guide
+      fireEvent.click((await screen.findByText('Shared Beta')).closest('button')!);
+      await expectActive('deck_beta_brain');
+      expect(screen.getByTestId('shared-return-guide')).toBeTruthy();
+
+      // Return to owned server via shared-return-guide button -> clears shared state in-app without reload
+      fireEvent.click(screen.getByTestId('shared-return-guide').querySelector('.shared-return-guide-return')!);
+      expect(screen.queryByTestId('shared-return-guide')).toBeNull();
+      await expectActive('deck_alpha_notes');
     }, 30_000);
   });
 
