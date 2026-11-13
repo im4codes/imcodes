@@ -18,9 +18,10 @@ export function isIncognitoSession(value: unknown): boolean {
 }
 
 export const SESSION_INCOGNITO_SERVER_READY = 'session-incognito.ready';
-export const SESSION_INCOGNITO_UNSUPPORTED = 'Incognito requires a compatible server and daemon and the claude-code-sdk runtime.';
+export const SESSION_INCOGNITO_UNSUPPORTED = 'Incognito requires a compatible server and daemon and a supported runtime (claude-code-sdk or pi).';
 export const SESSION_INCOGNITO_MEMORY_DISABLED = 'Memory tools are disabled in incognito sessions.';
 export const SESSION_INCOGNITO_AGENT_TYPE = 'claude-code-sdk';
+export const SESSION_INCOGNITO_AGENT_TYPES = [SESSION_INCOGNITO_AGENT_TYPE, 'pi'] as const;
 export function supportsSessionIncognito(agentType: unknown): boolean {
-  return agentType === SESSION_INCOGNITO_AGENT_TYPE;
+  return agentType === SESSION_INCOGNITO_AGENT_TYPE || agentType === 'pi';
 }

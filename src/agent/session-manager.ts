@@ -1347,6 +1347,10 @@ export async function relaunchSessionWithSettings(
   };
   const targetAgentType = (overrides.agentType ?? record.agentType) as AgentType;
   const targetFresh = overrides.fresh === true;
+  const isPrivate = isIncognitoSession(record);
+  if (isPrivate && !targetFresh) {
+    throw new Error('Incognito conversation ended; start a new session instead of resuming history.');
+  }
   const targetProjectDir = overrides.projectDir ?? record.projectDir;
   const targetLabel = overrides.label !== undefined ? overrides.label : (record.label ?? null);
   const targetDescription = overrides.description !== undefined ? overrides.description : (record.description ?? null);
@@ -1365,7 +1369,7 @@ export async function relaunchSessionWithSettings(
   const forceHandoff = overrides.handoff === true;
   const handoffConfig = normalizeCrossVendorHandoffConfig(record.crossVendorHandoff?.config);
   const effectiveHandoffConfig = forceHandoff ? { ...handoffConfig, enabled: true } : handoffConfig;
-  const wantsHandoff = shouldCreateCrossVendorHandoff(record, targetAgentType, targetRuntimeType, targetFresh, forceHandoff) && effectiveHandoffConfig.enabled;
+  const wantsHandoff = !isPrivate && shouldCreateCrossVendorHandoff(record, targetAgentType, targetRuntimeType, targetFresh, forceHandoff) && effectiveHandoffConfig.enabled;
   const [resolvedIdentityPrompt, cutoffEvents] = await Promise.all([
     overrides.identityPrompt !== undefined ? Promise.resolve(overrides.identityPrompt) : resolveEffectiveIdentityPrompt(record),
     wantsHandoff ? timelineStore.readPreferred(record.name, { limit: 1 }).catch(() => []) : Promise.resolve([]),
@@ -1439,6 +1443,7 @@ export async function relaunchSessionWithSettings(
       ...(record.parentSession ? { parentSession: record.parentSession } : {}),
       ...(record.userCreated ? { userCreated: true } : {}),
       ...(targetFresh ? { fresh: true } : {}),
+      ...(isPrivate ? { incognito: true } : {}),
       handoffLaunchGeneration: launchGeneration,
     });
   } catch (err) {
@@ -2484,7 +2489,7 @@ function wireTransportSessionInfo(
         next.codexSessionId = info.resumeId;
         changed = true;
       }
-      if (usesProviderResumeId(agentType) && next.providerResumeId !== info.resumeId) {
+      if (!isIncognitoSession(existing) && usesProviderResumeId(agentType) && next.providerResumeId !== info.resumeId) {
         next.providerResumeId = info.resumeId;
         changed = true;
       }
@@ -3000,6 +3005,7 @@ export async function restoreTransportSessions(
   };
   const pending = all.filter((s) =>
     isStoredTransportSession(s)
+    && !isIncognitoSession(s)
     && (s.providerId ?? s.agentType) === providerId
     && !!s.providerSessionId
     && (!options.sessionName || s.name === options.sessionName)
@@ -3928,7 +3934,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     }
     effectiveSessionKey = randomUUID();
     effectiveBindExistingKey = undefined;
-    transportResumeId = opts.providerResumeId ?? storedProviderResumeId;
+    transportResumeId = opts.incognito ? undefined : (opts.providerResumeId ?? storedProviderResumeId);
     effectiveSkipCreate = !!transportResumeId;
   } else if (agentType === 'pi') {
     if (effectiveCcPreset) {
@@ -3942,7 +3948,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     }
     effectiveSessionKey = randomUUID();
     effectiveBindExistingKey = undefined;
-    transportResumeId = opts.providerResumeId ?? storedProviderResumeId;
+    transportResumeId = opts.incognito ? undefined : (opts.providerResumeId ?? storedProviderResumeId);
     effectiveSkipCreate = !!transportResumeId;
   } else if (usesProviderResumeId(agentType)) {
     effectiveSessionKey = randomUUID();
@@ -4064,7 +4070,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
           agyNativeSessionState: transportResumeId || latestSessionInfo?.resumeId
             ? AGY_NATIVE_SESSION_STATE.STARTED : AGY_NATIVE_SESSION_STATE.UNSTARTED,
         } : {}),
-        ...(usesProviderResumeId(agentType) && (latestSessionInfo?.resumeId ?? transportResumeId)
+        ...(!opts.incognito && usesProviderResumeId(agentType) && (latestSessionInfo?.resumeId ?? transportResumeId)
           ? { providerResumeId: latestSessionInfo?.resumeId ?? transportResumeId }
           : {}),
         ...(isClaudeCodeSdkAgentType(agentType) && transportResumeId ? { ccSessionId: transportResumeId } : {}),
@@ -4233,7 +4239,7 @@ export async function ensureTransportRuntimeAvailable(
   if (!recovery) {
     recovery = (async () => {
       const record = getSession(sessionName);
-      if (!record || !isTransportAgent(record.agentType as AgentType)) return;
+      if (!record || !isTransportAgent(record.agentType as AgentType) || isIncognitoSession(record)) return;
       const runtime = getTransportRuntime(sessionName);
       if (runtime?.providerSessionId) return;
       if (runtime) {

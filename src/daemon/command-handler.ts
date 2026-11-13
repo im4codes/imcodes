@@ -1507,6 +1507,9 @@ export async function handoffSessionConversation(
   serverLink?: ServerLink,
   resetToken?: number,
 ): Promise<void> {
+  if (isIncognitoSession(record)) {
+    throw new Error('Incognito sessions do not support cross-vendor handoff.');
+  }
   const sessionName = record.name;
   const token = admitAndAllocateSessionResetToken(sessionName, record.sessionInstanceId, resetToken);
   await runSerializedSessionReset(sessionName, record, async (currentRecord) => {
@@ -1556,6 +1559,7 @@ async function relaunchFreshTransportConversation(record: SessionRecord): Promis
     ...(record.agentType === 'openclaw' && record.providerSessionId ? { bindExistingKey: record.providerSessionId } : {}),
     ...(record.parentSession ? { parentSession: record.parentSession } : {}),
     ...(record.userCreated ? { userCreated: true } : {}),
+    ...(isIncognitoSession(record) ? { incognito: true } : {}),
     fresh: true,
   });
 }
@@ -1574,6 +1578,9 @@ async function relaunchFreshTransportConversation(record: SessionRecord): Promis
  * the caller enqueued right before invoking this helper is auto-delivered.
  */
 async function resumeTransportRuntimeAfterLoss(record: SessionRecord): Promise<void> {
+  if (isIncognitoSession(record)) {
+    throw new Error('Incognito conversation ended; start a new session instead of resuming history.');
+  }
   const runtime = getTransportRuntime(record.name);
   if (runtime) {
     const preservation = preserveTransportRuntimeQueuesToResend(record.name, runtime);
@@ -3105,7 +3112,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       targetDir: requestedDir,
     });
 
-    if (isClaudeCodeSdkAgentType(agentType) || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID || agentType === 'muse-code-sdk') {
+    if (isClaudeCodeSdkAgentType(agentType) || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID || agentType === 'deepseek-harness' || agentType === 'pi' || agentType === 'muse-code-sdk') {
       logger.info({ project, agentType }, 'SDK fresh session.start removing stale main-session store record');
       // The fresh session starts under the SAME name, so its predecessor's
       // durable queue must be cleared and its authority rotated first.
@@ -3182,6 +3189,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       // provider and model atomically before the first turn.
       logger.info({ project, agentType }, 'SDK fresh session.start launching ACP SDK main session');
       await launchTransportSession({
+        ...(cmd.incognito === true ? { incognito: true } : {}),
         name: `deck_${project}_brain`,
         projectName: project,
         role: 'brain',

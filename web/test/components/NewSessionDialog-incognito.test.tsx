@@ -123,6 +123,43 @@ describe('NewSessionDialog & SessionControls incognito UI contracts (F3)', () =>
     expect(saveSessionIdentityProfileMock).not.toHaveBeenCalled();
   });
 
+  it('allows selecting pi in incognito mode and submits session.start with agentType: pi and incognito: true', async () => {
+    const wsCap = makeDialogWs([GIT_REMOTE_CLONE_CAPABILITY_V1, SESSION_INCOGNITO_CAPABILITY]);
+    const view = render(
+      <NewSessionDialog
+        ws={wsCap as any}
+        serverId="srv-1"
+        onClose={vi.fn()}
+        onSessionStarted={vi.fn()}
+      />,
+    );
+
+    const checkbox = view.container.querySelector('.incognito-create-option input[type="checkbox"]') as HTMLInputElement;
+    fireEvent.click(checkbox);
+    expect(checkbox.checked).toBe(true);
+
+    const piButton = view.container.querySelector('[data-agent-type="pi"]') as HTMLButtonElement | null;
+    expect(piButton).toBeTruthy();
+    expect(piButton!.disabled).toBe(false);
+    fireEvent.click(piButton!);
+
+    const projectInput = view.container.querySelector('input[placeholder="my-project"]') as HTMLInputElement;
+    fireEvent.input(projectInput, { target: { value: 'pipriv' } });
+
+    const startBtn = view.container.querySelector('.dialog-footer .btn-primary') as HTMLButtonElement;
+    expect(startBtn.disabled).toBe(false);
+    fireEvent.click(startBtn);
+
+    await waitFor(() => {
+      expect(wsCap.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+        project: 'pipriv',
+        agentType: 'pi',
+        incognito: true,
+      }));
+    });
+    expect(saveSessionIdentityProfileMock).not.toHaveBeenCalled();
+  });
+
   it('SessionControls displays incognito badge and suppresses composer draft persistence in localStorage', () => {
     const ws = {
       connected: true,
