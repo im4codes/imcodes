@@ -25,6 +25,6 @@ dependencies {
 // Do not silently ship an APK missing its offline recognizer/model.
 tasks.register('prepareStreamingSpeech', Exec) {
     workingDir rootProject.projectDir.parentFile
-    commandLine 'node', 'scripts/prepare-streaming-speech.mjs'
+    commandLine 'node', 'scripts/prepare-streaming-speech.mjs', '--android'
 }
 preBuild.dependsOn prepareStreamingSpeech

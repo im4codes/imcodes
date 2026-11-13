@@ -78,12 +78,17 @@ export async function prepareSpeechAssets(root, download = fetch, assets = SPEEC
   }
 }
 
+export function selectSpeechAssets(argv = []) {
+  const args = new Set(argv);
+  if (args.has('--ios') && !args.has('--android')) return IOS_SPEECH_ASSETS;
+  if (args.has('--android') && !args.has('--ios')) return ANDROID_SPEECH_ASSETS;
+  return SPEECH_ASSETS;
+}
+
 if (process.argv[1] && fileURLToPath(import.meta.url) === fileURLToPath(pathToFileURL(process.argv[1]))) {
-  const args = new Set(process.argv.slice(2));
-  const selected = args.has('--ios') && !args.has('--android')
-    ? IOS_SPEECH_ASSETS
-    : args.has('--android') && !args.has('--ios')
-      ? ANDROID_SPEECH_ASSETS
-      : SPEECH_ASSETS;
-  await prepareSpeechAssets(new URL('../plugins/streaming-speech/', import.meta.url), fetch, selected);
+  await prepareSpeechAssets(
+    new URL('../plugins/streaming-speech/', import.meta.url),
+    fetch,
+    selectSpeechAssets(process.argv.slice(2)),
+  );
 }

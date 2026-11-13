@@ -6,6 +6,403 @@ import MLXCommon
 import Qwen3ASR
 import UIKit
 
+/// Pure Foundation/Dispatch session coordinator managing capture ownership, foreground Metal
+/// gating, serial inbox draining, and lossless background/stop error reporting.
+final class SpeechCoordinator {
+    enum Event: Equatable {
+        case started
+        case stopped
+        case audioLevel(Float)
+        case partial(String)
+        case final(String)
+        case error(String)
+    }
+    typealias DecodeFn = ([Float], @escaping () -> Bool) -> String?
+
+    private let lock = NSLock()
+    let worker = DispatchQueue(label: "com.imcodes.streaming-speech", qos: .userInitiated)
+    private let emitQueue: DispatchQueue
+    private let onEvent: (Event) -> Void
+
+    private var generation: UInt64 = 0
+    private var eventOwner: UInt64 = 0
+    private var abortedOwner: UInt64 = 0
+    private var isAppBackgrounded = false
+    private var inbox = SpeechInbox()
+    private var window = SpeechWindow()
+    private var activeDecode: DecodeFn?
+    private var decoderOwner: UInt64 = 0
+    private var startPendingOwner: UInt64 = 0
+    private var startReadyCallback: (() -> Void)?
+    private var drainInterruptedOwner: UInt64 = 0
+    private var reportedErrorOwner: UInt64 = 0
+    private var stoppedEmittedOwner: UInt64 = 0
+    private var pendingStopCallbacks: [UInt64: [(String?) -> Void]] = [:]
+    private var settledStopErrors: [UInt64: String?] = [:]
+
+    init(emitQueue: DispatchQueue = .main, onEvent: @escaping (Event) -> Void) {
+        self.emitQueue = emitQueue
+        self.onEvent = onEvent
+    }
+
+    func isCurrent(_ owner: UInt64) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return generation == owner
+    }
+
+    func isEventOwner(_ owner: UInt64) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return eventOwner == owner
+    }
+
+    func canRunMetal(_ owner: UInt64) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return eventOwner == owner && !isAppBackgrounded
+    }
+
+    func beginStart(
+        makeDecode: @escaping () -> DecodeFn?,
+        onStartReady: @escaping () -> Void,
+        onSetupFailureTeardown: @escaping () -> Void
+    ) -> UInt64 {
+        lock.lock()
+        generation &+= 1
+        let owner = generation
+        eventOwner = owner
+        abortedOwner = 0
+        isAppBackgrounded = false
+        inbox = SpeechInbox()
+        startPendingOwner = owner
+        startReadyCallback = onStartReady
+        drainInterruptedOwner = 0
+        reportedErrorOwner = 0
+        settledStopErrors.removeAll()
+        lock.unlock()
+
+        // Enqueue decoder setup on the serial worker queue BEFORE starting AVAudioEngine
+        // so any audio buffers captured while the model finishes warming up are queued
+        // strictly behind this setup block and decoded in order without losing the first words.
+        worker.async { [weak self] in
+            guard let self = self else { return }
+            self.lock.lock()
+            let aborted = self.abortedOwner == owner || self.eventOwner != owner
+            self.lock.unlock()
+            guard !aborted else { return }
+            guard let decode = makeDecode() else {
+                self.lock.lock()
+                if self.decoderOwner == owner || self.decoderOwner == 0 {
+                    self.activeDecode = nil
+                    self.decoderOwner = 0
+                }
+                let shouldReport = self.eventOwner == owner && self.reportedErrorOwner != owner
+                if shouldReport { self.reportedErrorOwner = owner }
+                self.lock.unlock()
+                if shouldReport {
+                    self.emitQueue.async {
+                        if self.isEventOwner(owner) {
+                            self.onEvent(.error("Offline speech model initialization failed"))
+                            onSetupFailureTeardown()
+                        }
+                    }
+                }
+                return
+            }
+            self.lock.lock()
+            let stillActive = self.eventOwner == owner
+            self.lock.unlock()
+            guard stillActive else { return }
+            self.activeDecode = decode
+            self.decoderOwner = owner
+            self.window = SpeechWindow()
+        }
+        return owner
+    }
+
+    func cancelStartSetup(owner: UInt64) {
+        lock.lock()
+        abortedOwner = owner
+        if startPendingOwner == owner {
+            startPendingOwner = 0
+            startReadyCallback = nil
+        }
+        lock.unlock()
+    }
+
+    func failCapture(owner: UInt64, message: String, teardown: @escaping () -> Void) {
+        emitQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.lock.lock()
+            let shouldReport = self.generation == owner && self.eventOwner == owner && self.reportedErrorOwner != owner
+            if shouldReport { self.reportedErrorOwner = owner }
+            self.lock.unlock()
+            guard shouldReport else { return }
+            self.onEvent(.error(message))
+            teardown()
+        }
+    }
+
+    func offerSamples(
+        _ samples: [Float],
+        owner: UInt64,
+        now: TimeInterval = ProcessInfo.processInfo.systemUptime,
+        onOverloadTeardown: @escaping () -> Void
+    ) {
+        lock.lock()
+        guard generation == owner else { lock.unlock(); return }
+        do {
+            let warming = inbox.warmupRemaining > 0
+            let schedule = try inbox.offer(samples)
+            var readyCallback: (() -> Void)?
+            if warming && inbox.warmupRemaining == 0 && startPendingOwner == owner {
+                startPendingOwner = 0
+                readyCallback = startReadyCallback
+                startReadyCallback = nil
+            }
+            let level = inbox.pollAudioLevel(now: now)
+            lock.unlock()
+
+            if let readyCallback = readyCallback {
+                emitQueue.async { [weak self] in
+                    guard let self = self, self.isCurrent(owner) else { return }
+                    readyCallback()
+                    self.onEvent(.started)
+                }
+            }
+            if let level = level {
+                emitQueue.async { [weak self] in
+                    guard let self = self else { return }
+                    self.lock.lock()
+                    let active = self.generation == owner && self.eventOwner == owner
+                    self.lock.unlock()
+                    guard active else { return }
+                    self.onEvent(.audioLevel(level))
+                }
+            }
+            if schedule {
+                worker.async { [weak self] in self?.drain(owner: owner) }
+            }
+        } catch {
+            lock.unlock()
+            // Bounded admission fails visibly; never silently discard words.
+            failCapture(owner: owner, message: "Offline speech processing overloaded", teardown: onOverloadTeardown)
+        }
+    }
+
+    func setBackgrounded(_ backgrounded: Bool) {
+        lock.lock()
+        isAppBackgrounded = backgrounded
+        lock.unlock()
+    }
+
+    func endCapture(
+        stopCompletion: ((String?) -> Void)? = nil,
+        stopAudio: () -> Void,
+        onAsyncErrorTeardown: (() -> Void)? = nil
+    ) {
+        _ = onAsyncErrorTeardown
+        lock.lock()
+        let owner = eventOwner
+        generation &+= 1
+        let stoppingOwner = generation
+        let tail = inbox.take()
+        var readyCallback: (() -> Void)?
+        if startPendingOwner == owner {
+            startPendingOwner = 0
+            readyCallback = startReadyCallback
+            startReadyCallback = nil
+        }
+        if let stopCompletion = stopCompletion {
+            if owner == 0 {
+                lock.unlock()
+                stopAudio()
+                readyCallback?()
+                emitQueue.async { stopCompletion(nil) }
+                return
+            }
+            pendingStopCallbacks[owner, default: []].append(stopCompletion)
+        }
+        lock.unlock()
+
+        // Stop during warmup must also settle the pending start promise.
+        readyCallback?()
+        stopAudio()
+
+        worker.async { [weak self] in
+            guard let self = self else { return }
+            if owner == 0 {
+                self.lock.lock()
+                let shouldEmitStopped = self.generation == stoppingOwner && self.stoppedEmittedOwner != 0
+                self.lock.unlock()
+                if shouldEmitStopped {
+                    self.emitQueue.async { self.onEvent(.stopped) }
+                }
+                return
+            }
+
+            // Duplicate stop/interruption for an owner already settled on worker:
+            // replay the settled outcome without re-decoding or emitting duplicate events.
+            self.lock.lock()
+            if let existingOutcome = self.settledStopErrors[owner] {
+                let callbacks = self.pendingStopCallbacks.removeValue(forKey: owner) ?? []
+                let shouldEmitStopped = self.generation == stoppingOwner && self.stoppedEmittedOwner != owner
+                if shouldEmitStopped { self.stoppedEmittedOwner = owner }
+                self.lock.unlock()
+                if shouldEmitStopped || !callbacks.isEmpty {
+                    self.emitQueue.async {
+                        if shouldEmitStopped { self.onEvent(.stopped) }
+                        for cb in callbacks { cb(existingOutcome) }
+                    }
+                }
+                return
+            }
+            let alreadyReportedError = self.reportedErrorOwner == owner
+            let wasDrainInterrupted = self.drainInterruptedOwner == owner
+            self.lock.unlock()
+
+            let tailHasSpeech = tail.map { !$0.samples.isEmpty && ($0.speech || !self.window.samples.isEmpty) } ?? false
+            let hadUnflushedSpeech = (self.window.newSamples > 0) || tailHasSpeech || wasDrainInterrupted
+
+            var outcomeError: String?
+            var errorToEmit: String?
+            var finalToEmit: String?
+
+            if self.isEventOwner(owner) {
+                if self.decoderOwner == owner, let decode = self.activeDecode, self.canRunMetal(owner) {
+                    do {
+                        if let tail = tail {
+                            try self.window.append(
+                                tail.samples,
+                                speech: tail.speech,
+                                trailingSilence: tail.trailingSilence,
+                                final: true,
+                                shouldContinue: { [weak self] in self?.canRunMetal(owner) ?? false },
+                                decode: { [weak self] samples in
+                                    decode(samples) { self?.canRunMetal(owner) ?? false }
+                                }
+                            ) { _ in }
+                        }
+                        guard self.canRunMetal(owner) else { throw SpeechWindow.Failure.cancelled }
+                        let text = try self.window.finish(shouldContinue: { [weak self] in self?.canRunMetal(owner) ?? false }) { samples in
+                            decode(samples) { [weak self] in self?.canRunMetal(owner) ?? false }
+                        }
+                        finalToEmit = text
+                    } catch SpeechWindow.Failure.cancelled {
+                        if self.isEventOwner(owner) {
+                            let msg = "Offline speech interrupted before final flush"
+                            outcomeError = msg
+                            if !alreadyReportedError { errorToEmit = msg }
+                        }
+                    } catch {
+                        // Preserve the last successful hypothesis on a visible non-cancel error;
+                        // never silently replace the full transcript with an empty tail.
+                        finalToEmit = self.window.text
+                        if !alreadyReportedError { errorToEmit = "Offline speech final decoding failed" }
+                    }
+                } else if alreadyReportedError {
+                    outcomeError = "Offline speech interrupted"
+                } else if hadUnflushedSpeech {
+                    // Never mark partial/un-decoded tail as a complete final or silently ACK.
+                    let msg = "Offline speech interrupted before final flush"
+                    outcomeError = msg
+                    errorToEmit = msg
+                } else if self.decoderOwner == owner, self.activeDecode != nil {
+                    finalToEmit = self.window.text
+                }
+            }
+
+            if self.decoderOwner == owner || self.decoderOwner == 0 {
+                self.window = SpeechWindow()
+                self.activeDecode = nil
+                self.decoderOwner = 0
+            }
+
+            self.lock.lock()
+            if errorToEmit != nil { self.reportedErrorOwner = owner }
+            self.settledStopErrors[owner] = outcomeError
+            let callbacks = self.pendingStopCallbacks.removeValue(forKey: owner) ?? []
+            let shouldEmitStopped = self.generation == stoppingOwner && self.stoppedEmittedOwner != owner
+            if shouldEmitStopped { self.stoppedEmittedOwner = owner }
+            self.lock.unlock()
+
+            self.emitQueue.async {
+                if let finalText = finalToEmit, self.isEventOwner(owner) {
+                    self.onEvent(.final(finalText))
+                }
+                if let errorMsg = errorToEmit, self.isEventOwner(owner) {
+                    self.onEvent(.error(errorMsg))
+                }
+                if shouldEmitStopped {
+                    self.onEvent(.stopped)
+                }
+                for cb in callbacks {
+                    cb(outcomeError)
+                }
+            }
+        }
+    }
+
+    private func drain(owner: UInt64) {
+        while true {
+            lock.lock()
+            // Stop owns the entire remaining tail. Its single final barrier
+            // follows this in-flight decode on worker, without intermediate steps.
+            guard generation == owner, let batch = inbox.take() else {
+                lock.unlock(); return
+            }
+            lock.unlock()
+            guard decoderOwner == owner, let decode = activeDecode else {
+                lock.lock()
+                if eventOwner == owner && isAppBackgrounded && (!batch.samples.isEmpty && (batch.speech || !window.samples.isEmpty)) {
+                    drainInterruptedOwner = owner
+                }
+                lock.unlock()
+                return
+            }
+            let batchHasSpeech = !batch.samples.isEmpty && (batch.speech || !window.samples.isEmpty)
+            do {
+                try window.append(
+                    batch.samples,
+                    speech: batch.speech,
+                    trailingSilence: batch.trailingSilence,
+                    shouldEmitNonFinal: { [weak self] in self?.isCurrent(owner) ?? false },
+                    shouldContinue: { [weak self] in self?.canRunMetal(owner) ?? false },
+                    decode: { [weak self] samples in
+                        decode(samples) { self?.canRunMetal(owner) ?? false }
+                    }
+                ) { [weak self] text in
+                    guard let self = self else { return }
+                    self.emitQueue.async {
+                        if self.isEventOwner(owner) {
+                            self.onEvent(.partial(text))
+                        }
+                    }
+                }
+            } catch SpeechWindow.Failure.cancelled {
+                lock.lock()
+                if eventOwner == owner && isAppBackgrounded && (batchHasSpeech || window.newSamples > 0) {
+                    drainInterruptedOwner = owner
+                }
+                lock.unlock()
+                return
+            } catch {
+                lock.lock()
+                let shouldReport = generation == owner && eventOwner == owner && reportedErrorOwner != owner
+                if shouldReport { reportedErrorOwner = owner }
+                lock.unlock()
+                if shouldReport {
+                    emitQueue.async {
+                        if self.isCurrent(owner) {
+                            self.onEvent(.error("Offline speech decoding failed"))
+                            self.endCapture(stopAudio: {})
+                        }
+                    }
+                }
+                return
+            }
+        }
+    }
+}
+
 /// The same Capacitor event contract as the existing voice input. No cloud service.
 @objc(StreamingSpeechPlugin)
 public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
@@ -17,41 +414,44 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "start", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "stop", returnType: CAPPluginReturnPromise)
     ]
-    private let worker = DispatchQueue(label: "com.imcodes.streaming-speech", qos: .userInitiated)
-    private let lock = NSLock()
-    private var generation: UInt64 = 0
-    private var abortedOwner: UInt64 = 0
-    private var eventOwner: UInt64 = 0
-    private var isAppBackgrounded = false
-    // One scheduled drain, not one queued decode per 100ms microphone tap.
-    private var inbox = SpeechInbox()
+    private lazy var coordinator = SpeechCoordinator { [weak self] event in
+        guard let self = self else { return }
+        switch event {
+        case .started:
+            self.notifyListeners("listeningState", data: ["status": "started"])
+        case .stopped:
+            self.notifyListeners("listeningState", data: ["status": "stopped"])
+        case .audioLevel(let level):
+            self.notifyListeners("audioLevel", data: ["level": level])
+        case .partial(let text):
+            self.notifyListeners("partialResults", data: ["matches": [text], "isFinal": false])
+        case .final(let text):
+            self.notifyListeners("partialResults", data: ["matches": [text], "isFinal": true])
+        case .error(let message):
+            self.notifyListeners("recognitionError", data: ["message": message])
+        }
+    }
     private var engine: AVAudioEngine?
     private var tapInstalled = false
     private var startingCall: CAPPluginCall? // main-thread only; ready after warmup
     // Resident recognizer model kept across sessions on worker; Metal state is guarded for foreground use.
     private var recognizer: SpeechRecognizer?
-    // Only accessed on worker; queued PCM drains before the stop/final barrier.
-    private var decoder: SpeechDecoder?
-    private var decoderOwner: UInt64 = 0
-    private var window = SpeechWindow()
 
     public override func load() {
         NotificationCenter.default.addObserver(self, selector: #selector(interrupted(_:)), name: UIApplication.willResignActiveNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(didEnterBackground(_:)), name: UIApplication.didEnterBackgroundNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(didBecomeActive(_:)), name: UIApplication.didBecomeActiveNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(interrupted(_:)), name: AVAudioSession.interruptionNotification, object: nil)
-        worker.async { [weak self] in
+        coordinator.worker.async { [weak self] in
             guard let self = self else { return }
             _ = self.ensureRecognizer()
         }
     }
     deinit {
         NotificationCenter.default.removeObserver(self)
-        let retainedDecoder = decoder
         let retainedRecognizer = recognizer
-        if retainedDecoder != nil || retainedRecognizer != nil {
-            worker.async {
-                _ = retainedDecoder
+        if retainedRecognizer != nil {
+            coordinator.worker.async {
                 _ = retainedRecognizer
             }
         }
@@ -61,23 +461,6 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         guard modelAvailable, let root = modelRoot, let created = SpeechRecognizer(root: root) else { return nil }
         recognizer = created
         return created
-    }
-    private func nextOwner() -> UInt64 {
-        lock.lock(); defer { lock.unlock() }
-        generation &+= 1
-        return generation
-    }
-    private func isCurrent(_ owner: UInt64) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        return generation == owner
-    }
-    private func isEventOwner(_ owner: UInt64) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        return eventOwner == owner
-    }
-    private func canRunMetal(_ owner: UInt64) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        return eventOwner == owner && !isAppBackgrounded
     }
     private func isMetalDeviceAvailable() -> Bool {
         SpeechRecognizer.isMetalSupported
@@ -107,36 +490,24 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
             guard self.modelAvailable else {
                 call.reject("Offline speech model missing"); return
             }
-            let owner = self.nextOwner()
-            self.lock.lock()
-            self.eventOwner = owner
-            self.isAppBackgrounded = false
-            self.inbox = SpeechInbox()
-            self.lock.unlock()
-            // Enqueue decoder setup on the serial worker queue BEFORE starting AVAudioEngine
-            // so any audio buffers captured while the model finishes warming up are queued
-            // strictly behind this setup block and decoded in order without losing the first words.
-            self.worker.async {
-                self.lock.lock()
-                let aborted = self.abortedOwner == owner
-                self.lock.unlock()
-                guard !aborted else { return }
-                guard let recognizer = self.ensureRecognizer(),
-                      let decoder = SpeechDecoder(recognizer: recognizer) else {
-                    self.decoder = nil
-                    self.decoderOwner = 0
-                    DispatchQueue.main.async {
-                        if self.isCurrent(owner) {
-                            self.notifyListeners("recognitionError", data: ["message": "Offline speech model initialization failed"])
-                            self.endCapture(nil)
-                        }
+            self.startingCall = call
+            let owner = self.coordinator.beginStart(
+                makeDecode: { [weak self] in
+                    guard let self = self,
+                          let recognizer = self.ensureRecognizer(),
+                          let decoder = SpeechDecoder(recognizer: recognizer) else { return nil }
+                    return { samples, shouldContinue in
+                        decoder.decode(samples: samples, shouldContinue: shouldContinue)
                     }
-                    return
+                },
+                onStartReady: { [weak self] in
+                    self?.startingCall?.resolve()
+                    self?.startingCall = nil
+                },
+                onSetupFailureTeardown: { [weak self] in
+                    self?.endCapture(nil)
                 }
-                self.decoder = decoder
-                self.decoderOwner = owner
-                self.window = SpeechWindow()
-            }
+            )
             do {
                 let session = AVAudioSession.sharedInstance()
                 try session.setCategory(.playAndRecord, mode: .measurement, options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth])
@@ -156,26 +527,18 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                     self?.consume(buffer, owner: owner, converter: converter, mono: mono)
                 }
                 self.tapInstalled = true
-                self.startingCall = call
                 try engine.start()
                 // consume() signals ready only after startup PCM was discarded;
                 // the UI must not invite speech during that 100ms interval.
             } catch {
                 self.startingCall = nil
-                self.lock.lock()
-                self.abortedOwner = owner
-                self.lock.unlock()
+                self.coordinator.cancelStartSetup(owner: owner)
                 self.endCapture(nil)
                 call.reject("Offline speech could not start", nil, error)
             }
         }
     }
     private func consume(_ buffer: AVAudioPCMBuffer, owner: UInt64, converter: AVAudioConverter, mono: AVAudioFormat) {
-        // Admission and worker enqueue are atomic with the stop barrier. A tap
-        // already converting when stop begins must enqueue its tail before flush.
-        lock.lock()
-        defer { lock.unlock() }
-        guard generation == owner else { return }
         let capacity = AVAudioFrameCount(ceil(Double(buffer.frameLength) * 16000 / buffer.format.sampleRate) + 16)
         guard let converted = AVAudioPCMBuffer(pcmFormat: mono, frameCapacity: capacity) else { return }
         let activeConverter: AVAudioConverter
@@ -184,11 +547,8 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         } else if let fallback = AVAudioConverter(from: buffer.format, to: mono) {
             activeConverter = fallback
         } else {
-            DispatchQueue.main.async {
-                if self.isCurrent(owner) {
-                    self.notifyListeners("recognitionError", data: ["message": "Offline audio conversion failed: incompatible tap format"])
-                    self.endCapture(nil)
-                }
+            coordinator.failCapture(owner: owner, message: "Offline audio conversion failed: incompatible tap format") { [weak self] in
+                self?.endCapture(nil)
             }
             return
         }
@@ -200,168 +560,48 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         }
         guard conversionError == nil, let channel = converted.floatChannelData?[0] else {
             let detail = conversionError?.localizedDescription ?? "missing converted channel data"
-            DispatchQueue.main.async {
-                if self.isCurrent(owner) {
-                    self.notifyListeners("recognitionError", data: ["message": "Offline audio conversion failed: \(detail)"])
-                    self.endCapture(nil)
-                }
+            coordinator.failCapture(owner: owner, message: "Offline audio conversion failed: \(detail)") { [weak self] in
+                self?.endCapture(nil)
             }
             return
         }
         let samples = Array(UnsafeBufferPointer(start: channel, count: Int(converted.frameLength)))
-        do {
-            let warming = inbox.warmupRemaining > 0
-            let schedule = try inbox.offer(samples)
-            if warming && inbox.warmupRemaining == 0 {
-                DispatchQueue.main.async {
-                    guard self.isCurrent(owner), let call = self.startingCall else { return }
-                    self.startingCall = nil
-                    self.notifyListeners("listeningState", data: ["status": "started"])
-                    call.resolve()
-                }
-            }
-            if let level = inbox.pollAudioLevel(now: ProcessInfo.processInfo.systemUptime) {
-                DispatchQueue.main.async {
-                    self.lock.lock()
-                    let active = self.generation == owner && self.eventOwner == owner
-                    self.lock.unlock()
-                    guard active else { return }
-                    self.notifyListeners("audioLevel", data: ["level": level])
-                }
-            }
-            if schedule { worker.async { self.drain(owner: owner) } }
-        } catch {
-            // Bounded admission fails visibly; never silently discard words.
-            DispatchQueue.main.async {
-                if self.isCurrent(owner) {
-                    self.notifyListeners("recognitionError", data: ["message": "Offline speech processing overloaded"])
-                    self.endCapture(nil)
-                }
-            }
-        }
-    }
-
-    private func drain(owner: UInt64) {
-        while true {
-            lock.lock()
-            // Stop owns the entire remaining tail. Its single final barrier
-            // follows this in-flight decode on worker, without intermediate steps.
-            guard generation == owner, let batch = inbox.take() else {
-                lock.unlock(); return
-            }
-            lock.unlock()
-            guard decoderOwner == owner, let decoder = decoder else { return }
-            do {
-                try window.append(
-                    batch.samples,
-                    speech: batch.speech,
-                    trailingSilence: batch.trailingSilence,
-                    shouldEmitNonFinal: { [weak self] in self?.isCurrent(owner) ?? false },
-                    shouldContinue: { [weak self] in self?.canRunMetal(owner) ?? false },
-                    decode: { [weak self] samples in
-                        decoder.decode(samples: samples) { self?.canRunMetal(owner) ?? false }
-                    }
-                ) { text in
-                    self.emitText(text, final: false, owner: owner)
-                }
-            } catch SpeechWindow.Failure.cancelled {
-                return
-            } catch {
-                DispatchQueue.main.async {
-                    if self.isCurrent(owner) {
-                        self.notifyListeners("recognitionError", data: ["message": "Offline speech decoding failed"])
-                        self.endCapture(nil)
-                    }
-                }
-                return
-            }
-        }
-    }
-
-    private func emitText(_ text: String, final: Bool, owner: UInt64) {
-        DispatchQueue.main.async {
-            self.lock.lock(); let current = self.eventOwner == owner; self.lock.unlock()
-            guard current else { return }
-            self.notifyListeners("partialResults", data: ["matches": [text], "isFinal": final])
+        coordinator.offerSamples(samples, owner: owner) { [weak self] in
+            self?.endCapture(nil)
         }
     }
 
     @objc private func interrupted(_ notification: Notification) {
         if notification.name == UIApplication.willResignActiveNotification {
-            lock.lock(); isAppBackgrounded = true; lock.unlock()
+            coordinator.setBackgrounded(true)
         } else if notification.name == AVAudioSession.interruptionNotification,
            let value = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
            value != AVAudioSession.InterruptionType.began.rawValue { return }
         DispatchQueue.main.async { self.endCapture(nil) }
     }
     @objc private func didEnterBackground(_ notification: Notification) {
-        lock.lock(); isAppBackgrounded = true; lock.unlock()
+        coordinator.setBackgrounded(true)
         DispatchQueue.main.async { self.endCapture(nil) }
     }
     @objc private func didBecomeActive(_ notification: Notification) {
-        lock.lock(); isAppBackgrounded = false; lock.unlock()
+        coordinator.setBackgrounded(false)
     }
     @objc public func stop(_ call: CAPPluginCall) { DispatchQueue.main.async { self.endCapture(call) } }
     // Main-thread capture teardown; serial decoder flush precedes stopped and ACK.
     private func endCapture(_ call: CAPPluginCall?) {
-        lock.lock()
-        generation &+= 1
-        let stoppingOwner = generation
-        let tail = inbox.take()
-        lock.unlock()
-        // Stop during warmup must also settle the pending start promise.
-        startingCall?.resolve(); startingCall = nil
-        if tapInstalled { engine?.inputNode.removeTap(onBus: 0); tapInstalled = false }
-        engine?.stop(); engine = nil
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-        worker.async {
-            let owner = self.decoderOwner
-            if let decoder = self.decoder, self.canRunMetal(owner) {
-                do {
-                    if let tail = tail {
-                        try self.window.append(
-                            tail.samples,
-                            speech: tail.speech,
-                            trailingSilence: tail.trailingSilence,
-                            final: true,
-                            shouldContinue: { [weak self] in self?.canRunMetal(owner) ?? false },
-                            decode: { [weak self] samples in
-                                decoder.decode(samples: samples) { self?.canRunMetal(owner) ?? false }
-                            }
-                        ) { _ in }
-                    }
-                    if self.canRunMetal(owner) {
-                        let text = try self.window.finish(shouldContinue: { [weak self] in self?.canRunMetal(owner) ?? false }) { samples in
-                            decoder.decode(samples: samples) { [weak self] in self?.canRunMetal(owner) ?? false }
-                        }
-                        self.emitText(text, final: true, owner: owner)
-                    } else if self.isEventOwner(owner) {
-                        self.emitText(self.window.text, final: true, owner: owner)
-                    }
-                } catch SpeechWindow.Failure.cancelled {
-                    if self.isEventOwner(owner) {
-                        self.emitText(self.window.text, final: true, owner: owner)
-                    }
-                } catch {
-                    // Preserve the last successful hypothesis on a visible error;
-                    // never silently replace the full transcript with an empty tail.
-                    self.emitText(self.window.text, final: true, owner: owner)
-                    DispatchQueue.main.async {
-                        self.lock.lock(); let current = self.eventOwner == owner; self.lock.unlock()
-                        if current { self.notifyListeners("recognitionError", data: ["message": "Offline speech final decoding failed"]) }
-                    }
+        coordinator.endCapture(
+            stopCompletion: call.map { c in
+                { errorMsg in
+                    if let errorMsg = errorMsg { c.reject(errorMsg) }
+                    else { c.resolve() }
                 }
-            } else if self.decoder != nil && self.isEventOwner(owner) {
-                self.emitText(self.window.text, final: true, owner: owner)
+            },
+            stopAudio: {
+                if tapInstalled { engine?.inputNode.removeTap(onBus: 0); tapInstalled = false }
+                engine?.stop(); engine = nil
+                try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
             }
-            self.window = SpeechWindow()
-            self.decoder = nil
-            self.decoderOwner = 0
-            DispatchQueue.main.async {
-                if self.isCurrent(stoppingOwner) { self.notifyListeners("listeningState", data: ["status": "stopped"]) }
-                call?.resolve()
-            }
-        }
+        )
     }
 }
 
@@ -437,7 +677,7 @@ struct SpeechWindow {
     private var lastGrowth: String?
     private var hypothesis: String?
     private var previousHypothesis: String?
-    private var newSamples = 0
+    private(set) var newSamples = 0
     private var silentSamples = 0
     private var lastEmitted = ""
     var text: String { rolling ? committed + partial : Self.join(committed, partial) }
@@ -448,11 +688,11 @@ struct SpeechWindow {
                          decode: ([Float]) -> String?, emit: (String) -> Void) throws {
         guard !input.isEmpty, !samples.isEmpty || speech else { return }
         // Chunk oversized batches (both live and final stop drain) at the bounded
-        // window capacity (4.5s = 72,000 samples) so neither continuous speech nor a
+        // window capacity (6.0s = 96,000 samples) so neither continuous speech nor a
         // 32s inbox backlog ever exceeds the per-decode window capacity.
         var remaining = input[...]
         while samples.count + remaining.count > Self.capacity {
-            guard shouldContinue() else { return }
+            guard shouldContinue() else { throw Failure.cancelled }
             let takeCount = max(1, Self.capacity - samples.count)
             let chunk = remaining.prefix(takeCount)
             remaining = remaining.dropFirst(takeCount)
@@ -465,7 +705,8 @@ struct SpeechWindow {
             else { rollWindow() }
             if !final && shouldEmitNonFinal() && text != lastEmitted { lastEmitted = text; emit(text) }
         }
-        guard !remaining.isEmpty, shouldContinue() else { return }
+        guard !remaining.isEmpty else { return }
+        guard shouldContinue() else { throw Failure.cancelled }
         samples.append(contentsOf: remaining)
         newSamples += remaining.count
         silentSamples = speech ? trailingSilence : silentSamples + remaining.count

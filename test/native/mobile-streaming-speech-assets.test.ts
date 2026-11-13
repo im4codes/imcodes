@@ -8,7 +8,16 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 import { STREAMING_SPEECH_PLUGIN_NAME } from '../../shared/voice-recognition.js';
 // @ts-ignore plain build script
-import { matchesAsset, prepareSpeechAssets, SPEECH_ASSETS, MODEL_REVISION } from '../../web/scripts/prepare-streaming-speech.mjs';
+import {
+  ANDROID_SPEECH_ASSETS,
+  IOS_MODEL_REVISION,
+  IOS_SPEECH_ASSETS,
+  MODEL_REVISION,
+  SPEECH_ASSETS,
+  matchesAsset,
+  prepareSpeechAssets,
+  selectSpeechAssets,
+} from '../../web/scripts/prepare-streaming-speech.mjs';
 let root: string;
 afterEach(async () => { if (root) await rm(root, { recursive: true, force: true }); });
 async function setup() { root = await mkdtemp(join(tmpdir(), 'imcodes-test-speech-')); return pathToFileURL(root + '/'); }
@@ -16,32 +25,77 @@ const bytes = Buffer.from('offline-model');
 const digest = createHash('sha256').update(bytes).digest('hex');
 const asset = ['models/test.onnx', 'https://example.invalid/pinned/model', digest, bytes.length];
 const modelFiles = ['conv_frontend.onnx', 'encoder.int4.onnx', 'encoder.int4.weights', 'decoder.int4.onnx', 'decoder.int4.weights', 'tokenizer/vocab.json', 'tokenizer/merges.txt', 'tokenizer/tokenizer_config.json', 'hotwords.txt'];
+const iosModelFiles = ['config.json', 'model.safetensors', 'vocab.json', 'merges.txt', 'tokenizer_config.json', 'hotwords.txt'];
 
 describe('Qwen3-ASR mobile assets', () => {
-  it('pins the complete INT4 model/external weights/tokenizer/hotwords and AAR without a punctuator', async () => {
+  it('pins the Android INT4 ONNX and iOS 0.6B MLX 4-bit assets and platform routing', async () => {
     expect(MODEL_REVISION).toBe('9012f07ac1ce43c7e9fbd3afd8cad90fe147f88e');
-    expect(SPEECH_ASSETS).toHaveLength(10);
-    expect(SPEECH_ASSETS.map((a: any) => a[2])).toEqual([
+    expect(IOS_MODEL_REVISION).toBe('bc441bd1e4295c1f42d9879f056049a925b6e013');
+    expect(ANDROID_SPEECH_ASSETS).toHaveLength(10);
+    expect(ANDROID_SPEECH_ASSETS.map((a: any) => a[2])).toEqual([
       'd22dc4423e0940e49884e903d2ea2f7e5567c14fc1aed97e4e26d6b8f208ef9e', '774e997d23a2f06c3f544666625c93a3b824fdd83d04c6acd88ee25f4e3b6e2e',
       'dc66975d9be10fbd31f89c76d33dd0bf4a8059ef14da4abf545bbf9895a5293d', 'c588d2a89460315f51ca8c65dbe85a0619891500fc853e5b673e3c914c25b2d3',
       '126c8e16074cc87250dacbf07602315e3bc5239c93ea414773b6e3a6fd4bf466', 'ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910',
       '8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5', '4942d005604266809309cabc9f4e9cb89ce855d59b14681fdc0e1cc62ea26c4c',
       'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855', 'a8d09d1d32f3eb8520482c6d3d43fae674681c5b050385967c70a3c2c9bf0ee7',
     ]);
-    expect(SPEECH_ASSETS.map((a: any) => a[0])).toEqual([...modelFiles.map(x => 'models/' + x), 'android/libs/sherpa-onnx-2.0.1.aar']);
-    expect(SPEECH_ASSETS.every((a: any) => /^[a-f\d]{64}$/.test(a[2]) && (a[0] === 'models/hotwords.txt' ? a[3] === 0 : a[3] > 0))).toBe(true);
-    expect(SPEECH_ASSETS.slice(0, 8).every((a: any) => a[1].includes('/goodpixelltd/qwen3-asr-0.6b-int4-sherpa-onnx/resolve/' + MODEL_REVISION))).toBe(true);
-    expect(SPEECH_ASSETS.map((a: any) => a[3])).toEqual([44148281, 5622024, 110308864, 891837, 469962752, 2776833, 1671853, 12487, 0, 49441341]);
-    expect(await matchesAsset(new URL('../../web/plugins/streaming-speech/models/hotwords.txt', import.meta.url), SPEECH_ASSETS[8][2], 0)).toBe(true);
+    expect(ANDROID_SPEECH_ASSETS.map((a: any) => a[0])).toEqual([...modelFiles.map(x => 'models/' + x), 'android/libs/sherpa-onnx-2.0.1.aar']);
+    expect(ANDROID_SPEECH_ASSETS.every((a: any) => /^[a-f\d]{64}$/.test(a[2]) && (a[0] === 'models/hotwords.txt' ? a[3] === 0 : a[3] > 0))).toBe(true);
+    expect(ANDROID_SPEECH_ASSETS.slice(0, 8).every((a: any) => a[1].includes('/goodpixelltd/qwen3-asr-0.6b-int4-sherpa-onnx/resolve/' + MODEL_REVISION))).toBe(true);
+    expect(ANDROID_SPEECH_ASSETS.map((a: any) => a[3])).toEqual([44148281, 5622024, 110308864, 891837, 469962752, 2776833, 1671853, 12487, 0, 49441341]);
+    expect(await matchesAsset(new URL('../../web/plugins/streaming-speech/models/hotwords.txt', import.meta.url), ANDROID_SPEECH_ASSETS[8][2], 0)).toBe(true);
+
+    expect(IOS_SPEECH_ASSETS).toHaveLength(7);
+    expect(IOS_SPEECH_ASSETS.map((a: any) => a[2])).toEqual([
+      '923618cf5ca452fda0253a6be5c1a17f94a2e4851d3b98beb45848565587bd72', '8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5',
+      '70c7e67e588062adce4f10796e47ad42ead51c6671eda61a0987eae38ca95ddf', 'e3bb80ef0fd42a5be07b04e90c97d60460bbde8af3531e0bfe9100a61404d81a',
+      '4942d005604266809309cabc9f4e9cb89ce855d59b14681fdc0e1cc62ea26c4c', 'ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910',
+      'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+    ]);
+    expect(IOS_SPEECH_ASSETS.map((a: any) => a[0])).toEqual([
+      'ios-models/config.json',
+      'ios-models/merges.txt',
+      'ios-models/model.safetensors',
+      'ios-models/model.safetensors.index.json',
+      'ios-models/tokenizer_config.json',
+      'ios-models/vocab.json',
+      'ios-models/hotwords.txt',
+    ]);
+    expect(IOS_SPEECH_ASSETS.every((a: any) => /^[a-f\d]{64}$/.test(a[2]) && (a[0] === 'ios-models/hotwords.txt' ? a[3] === 0 : a[3] > 0))).toBe(true);
+    expect(IOS_SPEECH_ASSETS.slice(0, 6).every((a: any) => a[1].includes('/aufklarer/Qwen3-ASR-0.6B-MLX-4bit/resolve/' + IOS_MODEL_REVISION))).toBe(true);
+    expect(IOS_SPEECH_ASSETS.map((a: any) => a[3])).toEqual([7187, 1671853, 708236945, 71814, 12487, 2776833, 0]);
+    expect(await matchesAsset(new URL('../../web/plugins/streaming-speech/ios-models/hotwords.txt', import.meta.url), IOS_SPEECH_ASSETS[6][2], 0)).toBe(true);
+
+    expect(SPEECH_ASSETS).toHaveLength(17);
+    expect(SPEECH_ASSETS).toEqual([...ANDROID_SPEECH_ASSETS, ...IOS_SPEECH_ASSETS]);
+    expect(selectSpeechAssets(['--android'])).toEqual(ANDROID_SPEECH_ASSETS);
+    expect(selectSpeechAssets(['--ios'])).toEqual(IOS_SPEECH_ASSETS);
+    expect(selectSpeechAssets([])).toEqual(SPEECH_ASSETS);
+    expect(selectSpeechAssets(['--android', '--ios'])).toEqual(SPEECH_ASSETS);
+
+    const gradle = await readFile(new URL('../../web/plugins/streaming-speech/android/build.gradle', import.meta.url), 'utf8');
+    expect(gradle).toContain("'--android'");
+    const workflow = await readFile(new URL('../../.github/workflows/mobile-speech.yml', import.meta.url), 'utf8');
+    expect(workflow).toContain('--ios');
+    expect(workflow).toContain('MetalToolchain');
+    expect(workflow).toContain('ios-models');
+    const pluginPkg = await readFile(new URL('../../web/plugins/streaming-speech/Package.swift', import.meta.url), 'utf8');
+    expect(pluginPkg).toContain('.iOS(.v17)');
+    expect(pluginPkg).toContain('mlx-swift.git');
+    expect(pluginPkg).toContain('"Cordova"');
+    const capAppPkg = await readFile(new URL('../../web/ios/App/CapApp-SPM/Package.swift', import.meta.url), 'utf8');
+    expect(capAppPkg).toContain('.iOS(.v17)');
+    const pbxproj = await readFile(new URL('../../web/ios/App/App.xcodeproj/project.pbxproj', import.meta.url), 'utf8');
+    expect(pbxproj).toContain('IPHONEOS_DEPLOYMENT_TARGET = 17.0;');
   });
   it('reuses the bundled empty bias file without downloads and rejects stale hotwords', async () => {
     const url = await setup(); await mkdir(join(root, 'models'));
     const fetcher = vi.fn();
     await writeFile(join(root, 'models/hotwords.txt'), '');
-    await prepareSpeechAssets(url, fetcher, [SPEECH_ASSETS[8]]);
+    await prepareSpeechAssets(url, fetcher, [ANDROID_SPEECH_ASSETS[8]]);
     expect(fetcher).not.toHaveBeenCalled();
     await writeFile(join(root, 'models/hotwords.txt'), 'COMMIT');
-    await expect(prepareSpeechAssets(url, fetcher, [SPEECH_ASSETS[8]])).rejects.toThrow('Bundled speech asset');
+    await expect(prepareSpeechAssets(url, fetcher, [ANDROID_SPEECH_ASSETS[8]])).rejects.toThrow('Bundled speech asset');
     expect(fetcher).not.toHaveBeenCalled();
   });
   it('publishes verified files atomically, reuses them, and repairs a corrupt cached file', async () => {
@@ -71,44 +125,62 @@ describe('Qwen3-ASR mobile assets', () => {
     await prepareSpeechAssets(url, async () => new Response(bytes), [['models/conv_frontend.onnx', 'https://example.invalid/pinned', digest, bytes.length]]);
     expect((await readdir(join(root, 'models'))).sort()).toEqual(['conv_frontend.onnx', 'unrelated.keep']);
   });
-  it('keeps native contracts, bounded offline segments, and stream ownership aligned', async () => {
+  it('keeps native contracts, bounded offline segments, 0.6B MLX config, and stream ownership aligned', async () => {
     const base = new URL('../../web/plugins/streaming-speech/', import.meta.url);
     const android = await readFile(new URL('android/src/main/java/com/imcodes/speech/StreamingSpeechPlugin.java', base), 'utf8');
     const ios = await readFile(new URL('ios/Sources/StreamingSpeechPlugin/StreamingSpeechPlugin.swift', base), 'utf8');
+    const qwenAsr = await readFile(new URL('ios/Sources/Qwen3ASR/Qwen3ASR.swift', base), 'utf8');
     expect(android).toContain(`@CapacitorPlugin(name = "${STREAMING_SPEECH_PLUGIN_NAME}"`);
     expect(ios).toContain(`jsName = "${STREAMING_SPEECH_PLUGIN_NAME}"`);
-    for (const name of modelFiles) { expect(android).toContain('"' + name + '"'); expect(ios).toContain('"' + name + '"'); }
+    for (const name of modelFiles) { expect(android).toContain('"' + name + '"'); }
+    for (const name of iosModelFiles) { expect(ios).toContain('"' + name + '"'); }
     for (const name of ['listeningState', 'audioLevel', 'partialResults', 'recognitionError']) { expect(android).toContain('"' + name + '"'); expect(ios).toContain('"' + name + '"'); }
-    expect(ios).toContain('sherpaOnnxOfflineQwen3ASRModelConfig(maxTotalLen: 768');
-    expect(ios).toContain('SherpaOnnxDestroyOfflineStream(stream)'); expect(ios).toContain('SherpaOnnxDestroyOfflineRecognizerResult(result)');
     expect(android).toContain('qwen.setMaxTotalLen(768)'); expect(android).toContain('new OfflineRecognizer(null, config)');
     expect(android).toContain('getNoBackupFilesDir()'); expect(android).toContain('finally { stream.release(); }');
-    expect(ios).toContain('static let capacity = 3 * stride'); expect(ios).toContain('maxNewTokens: 24'); expect(android).toContain('qwen.setMaxNewTokens(24)');
-    expect(ios).toContain('static let limit = 16000 * 320 / 10'); expect(android).toContain('MAX_BUFFERED_CHUNKS = 320');
-    expect(ios).toContain('for provider in ["coreml", "cpu"]');
-    expect(ios).toContain('provider: provider, qwen3Asr: qwen');
+    expect(android).toContain('qwen.setMaxNewTokens(24)');
+    expect(android).toContain('MAX_BUFFERED_CHUNKS = 320');
     expect(android).toContain('model.setProvider("nnapi")');
     expect(android).toContain('catch (RuntimeException | LinkageError accelerationUnavailable)');
     expect(android).toContain('model.setProvider("cpu")');
-    expect(ios).toContain('numThreads: 4'); expect(android).toContain('model.setNumThreads(4)');
+    expect(android).toContain('model.setNumThreads(4)');
+    expect(android).not.toContain('OfflinePunctuation'); expect(android).not.toContain('OnlineStream');
+
+    expect(ios).toContain('import Qwen3ASR');
+    expect(ios).toContain('import Metal');
+    expect(ios).not.toContain('SherpaOnnx');
+    expect(ios).not.toContain('OfflinePunctuation'); expect(ios).not.toContain('OnlineStream');
+    expect(ios).toContain('#if targetEnvironment(simulator)');
+    expect(ios).toContain('MTLCreateSystemDefaultDevice() != nil');
+    expect(ios).toContain('Qwen3ASRModel.loadLocal(from: root)');
+    expect(ios).toContain('Qwen3DecodingOptions(maxTokens: 128');
+    expect(ios).toContain('transcribeWithCancellation(audio: samples, sampleRate: 16000');
+    expect(ios).toContain('appendingPathComponent("ios-models", isDirectory: true)');
+    expect(ios).toContain('static let capacity = 4 * stride');
+    expect(ios).toContain('static let limit = 16000 * 320 / 10');
     expect(ios).toContain('static let warmupSamples = 320');
-    expect(ios).not.toContain('OfflinePunctuation'); expect(android).not.toContain('OfflinePunctuation');
-    expect(ios).not.toContain('OnlineStream'); expect(android).not.toContain('OnlineStream');
     expect(ios).toContain('options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth]');
     expect(ios).not.toContain('.duckOthers');
     expect(ios).toContain('if warming && inbox.warmupRemaining == 0');
-    expect(ios).toContain('startingCall?.resolve(); startingCall = nil');
+    expect(ios).toContain('self?.startingCall?.resolve()');
+    expect(ios).toContain('self?.startingCall = nil');
     expect(ios).toContain('AVAudioPCMBuffer(pcmFormat: mono, frameCapacity: capacity)');
     expect(ios).not.toContain('AVAudioPCMBuffer(pcmFormat: format, frameCapacity: capacity)');
     expect(ios).toContain('input.installTap(onBus: 0, bufferSize: AVAudioFrameCount(format.sampleRate / 10), format: format)');
     expect(ios).toContain('Offline audio conversion failed:');
     expect(ios).toContain('UIApplication.shared.applicationState != .background');
+    expect(ios).toContain('UIApplication.willResignActiveNotification');
+    expect(ios).toContain('UIApplication.didEnterBackgroundNotification');
+    expect(ios).toContain('UIApplication.didBecomeActiveNotification');
     expect(ios).toContain('static let audioLevelInterval: TimeInterval = 0.05');
-    expect(ios).toContain('if let level = inbox.pollAudioLevel(now: ProcessInfo.processInfo.systemUptime)');
+    expect(ios).toContain('let level = inbox.pollAudioLevel(now: now)');
     expect(ios).toContain('let active = self.generation == owner && self.eventOwner == owner');
+    expect(ios).toContain('case .audioLevel(let level):');
     expect(ios).toContain('self.notifyListeners("audioLevel", data: ["level": level])');
-    const drainSection = ios.slice(ios.indexOf('private func drain('), ios.indexOf('private func emitText('));
+    const drainSection = ios.slice(ios.indexOf('private func drain('), ios.indexOf('/// The same Capacitor'));
     expect(drainSection).not.toContain('audioLevel');
+
+    expect(qwenAsr).toContain('modelId: String = "aufklarer/Qwen3-ASR-0.6B-MLX-4bit"');
+    expect(qwenAsr).toContain('case .small: return .small');
   });
   it('compiles and executes the production Android plugin through cold/warm/stop/segmentation/overflow/destroy', async () => {
     await setup(); const srcDir = join(root, 'src'), classesDir = join(root, 'classes'); await mkdir(classesDir, { recursive: true });
@@ -316,47 +388,254 @@ public class Harness {
   });
 });
 
-// Execute the production Foundation-only state machine, not a JS copy of it.
-// iOS AVAudioEngine/sherpa linking remains the separate macOS publishing job.
+// Execute the production Foundation-only recognizer, decoder, coordinator, and bounded window.
+// iOS AVAudioEngine/MLX Metal kernel execution runs on physical iOS hardware in Xcode.
 const swiftCompiler = process.env.SWIFTC || (existsSync('/usr/bin/swiftc') ? '/usr/bin/swiftc' : undefined);
-it.skipIf(!swiftCompiler)('executes the production Swift recognizer CoreML success/nil CPU fallback and empty bias lifetime', async () => {
+it.skipIf(!swiftCompiler)('executes the production Swift recognizer, decoder, and background cancellation coordinator', async () => {
   await setup();
   const plugin = await readFile(new URL('../../web/plugins/streaming-speech/ios/Sources/StreamingSpeechPlugin/StreamingSpeechPlugin.swift', import.meta.url), 'utf8');
-  const recognizer = plugin.slice(plugin.indexOf('private final class SpeechRecognizer {'), plugin.indexOf('private final class SpeechDecoder {'));
-  const file = join(root, 'providers.swift'), executable = join(root, 'providers');
-  await writeFile(join(root, 'hotwords.txt'), '');
+  const coordinatorSlice = plugin.slice(plugin.indexOf('final class SpeechCoordinator {'), plugin.indexOf('/// The same Capacitor'));
+  const recognizerSlice = plugin.slice(plugin.indexOf('final class SpeechRecognizer {'), plugin.indexOf('// MARK: - Bounded offline segmentation'));
+  const windowAndInboxSlice = plugin.slice(plugin.indexOf('struct SpeechWindow {'));
+  expect(coordinatorSlice).toContain('final class SpeechCoordinator');
+  expect(recognizerSlice).toContain('final class SpeechRecognizer');
+  expect(recognizerSlice).toContain('final class SpeechDecoder');
+  expect(windowAndInboxSlice).toContain('struct SpeechInbox');
+
+  const file = join(root, 'coordinator.swift'), executable = join(root, 'coordinator');
+  const emptyDir = join(root, 'empty-hw'), biasedDir = join(root, 'biased-hw');
+  await mkdir(emptyDir, { recursive: true });
+  await mkdir(biasedDir, { recursive: true });
+  await writeFile(join(emptyDir, 'hotwords.txt'), '');
+  await writeFile(join(biasedDir, 'hotwords.txt'), 'Qwen3\n  IMCodes \n\n');
+
   await writeFile(file, `import Foundation
-struct Qwen { var conv_frontend, encoder, decoder, tokenizer, hotwords: UnsafePointer<CChar>? }
-struct Model { let provider: String; let qwen: Qwen }
-struct Config { let model: Model }
-func sherpaOnnxOfflineQwen3ASRModelConfig(maxTotalLen: Int, maxNewTokens: Int, temperature: Double, topP: Double, seed: Int) -> Qwen { Qwen() }
-func sherpaOnnxOfflineModelConfig(tokens: String, numThreads: Int, provider: String, qwen3Asr: Qwen) -> Model {
-  precondition(numThreads == 4); return Model(provider: provider, qwen: qwen3Asr)
+func require(_ cond: @autoclosure () -> Bool, _ msg: String) {
+    if !cond() { FileHandle.standardError.write(Data(("FAIL: " + msg + "\\n").utf8)); exit(1) }
 }
-func sherpaOnnxFeatureConfig() -> Int { 0 }
-func sherpaOnnxOfflineRecognizerConfig(featConfig: Int, modelConfig: Model) -> Config { Config(model: modelConfig) }
-var attempts: [String] = [], rejected: Set<String> = [], destroys = 0
-func SherpaOnnxCreateOfflineRecognizer(_ config: inout Config) -> OpaquePointer? {
-  let model = config.model; attempts.append(model.provider)
-  precondition(String(cString: model.qwen.hotwords!) == "")
-  precondition(String(cString: model.qwen.encoder!).hasSuffix("encoder.int4.onnx"))
-  return rejected.contains(model.provider) ? nil : OpaquePointer(bitPattern: 1)
+var stubMetalAvailable = true
+func MTLCreateSystemDefaultDevice() -> AnyObject? { stubMetalAvailable ? NSObject() : nil }
+struct Qwen3DecodingOptions {
+    var maxTokens: Int = 448
+    var language: String? = nil
+    var context: String? = nil
 }
-func SherpaOnnxDestroyOfflineRecognizer(_ pointer: OpaquePointer) { destroys += 1 }
-${recognizer}
-let root = URL(fileURLWithPath: CommandLine.arguments[1])
-do { let rec = SpeechRecognizer(root: root); precondition(rec != nil); precondition(attempts == ["coreml"]) }
-precondition(destroys == 1)
-attempts = []; rejected = ["coreml"]
-do { let rec = SpeechRecognizer(root: root); precondition(rec != nil); precondition(attempts == ["coreml", "cpu"]) }
-precondition(destroys == 2)
-attempts = []; rejected = ["coreml", "cpu"]
-precondition(SpeechRecognizer(root: root) == nil); precondition(attempts == ["coreml", "cpu"])
-precondition(destroys == 2)
-print("PROVIDERS:PASS")
+var loadedRoots: [URL] = []
+var seenOptions: [Qwen3DecodingOptions] = []
+var cancelAfterCheck = false
+final class Qwen3ASRModel {
+    let root: URL
+    init(root: URL) { self.root = root }
+    static func loadLocal(from root: URL) throws -> Qwen3ASRModel {
+        loadedRoots.append(root)
+        return Qwen3ASRModel(root: root)
+    }
+    func transcribeWithCancellation(audio: [Float], sampleRate: Int, options: Qwen3DecodingOptions, cancellationCheck: () throws -> Void) throws -> String {
+        seenOptions.append(options)
+        precondition(sampleRate == 16000)
+        try cancellationCheck()
+        if cancelAfterCheck { throw CancellationError() }
+        return "  ok:\\(audio.count)  "
+    }
+}
+${recognizerSlice}
+${windowAndInboxSlice}
+${coordinatorSlice}
+
+let emptyRoot = URL(fileURLWithPath: CommandLine.arguments[1])
+let biasedRoot = URL(fileURLWithPath: CommandLine.arguments[2])
+
+// 1. SpeechRecognizer + SpeechDecoder Metal guard, hotwords bias & cancellation
+stubMetalAvailable = false
+require(SpeechRecognizer(root: emptyRoot) == nil, "expected nil SpeechRecognizer when Metal unavailable")
+stubMetalAvailable = true
+let rEmpty = SpeechRecognizer(root: emptyRoot)
+require(rEmpty != nil && rEmpty?.hotwords == nil, "empty hotwords must yield nil bias")
+let rBias = SpeechRecognizer(root: biasedRoot)
+require(rBias?.hotwords == "Qwen3, IMCodes", "hotwords trimming/joining mismatch: \\(String(describing: rBias?.hotwords))")
+let dec = SpeechDecoder(recognizer: rBias!)!
+require(dec.decode(samples: [0.1, 0.2]) == "ok:2", "expected trimmed decoded text")
+require(seenOptions.last?.maxTokens == 128 && seenOptions.last?.context == "Qwen3, IMCodes", "unexpected Qwen3DecodingOptions")
+require(dec.decode(samples: [0.1], shouldContinue: { false }) == nil, "expected pre-cancelled decode to return nil")
+cancelAfterCheck = true
+require(dec.decode(samples: [0.1], shouldContinue: { true }) == nil, "expected CancellationError decode to return nil")
+cancelAfterCheck = false
+print("RECOGNIZER_DECODER:PASS")
+
+func speech(_ count: Int, amp: Float = 0.2) -> [Float] { Array(repeating: amp, count: count) }
+func makeHarness() -> (SpeechCoordinator, DispatchQueue, () -> [SpeechCoordinator.Event]) {
+    let q = DispatchQueue(label: "test.emit")
+    var events: [SpeechCoordinator.Event] = []
+    let coord = SpeechCoordinator(emitQueue: q) { event in events.append(event) }
+    return (coord, q, { q.sync { events } })
+}
+
+// 2A. 0.5s (8000 samples) un-decoded speech backgrounded -> error before stopped, NO false final, ACK rejects
+do {
+    let (coord, _, events) = makeHarness()
+    let owner = coord.beginStart(makeDecode: { { s, cont in cont() ? "w:\\(s.count)" : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
+    coord.offerSamples(speech(320), owner: owner, now: 0.01) {}
+    coord.offerSamples(speech(8000), owner: owner, now: 0.10) {}
+    coord.setBackgrounded(true)
+    let ack1 = DispatchSemaphore(value: 0)
+    var err1: String? = nil
+    coord.endCapture(stopCompletion: { err in err1 = err; ack1.signal() }, stopAudio: {})
+    require(ack1.wait(timeout: .now() + 2) == .success, "A: stop ACK timed out")
+    require(err1 != nil, "A: expected rejection on background un-decoded audio, got nil")
+    let ack2 = DispatchSemaphore(value: 0)
+    var err2: String? = nil
+    coord.endCapture(stopCompletion: { err in err2 = err; ack2.signal() }, stopAudio: {})
+    require(ack2.wait(timeout: .now() + 2) == .success && err2 == err1, "A: duplicate stop did not replay error")
+    let evs = events()
+    require(!evs.contains { if case .final = $0 { return true }; return false }, "A: must not emit final on lost tail: \\(evs)")
+    let errIdx = evs.firstIndex { if case .error = $0 { return true }; return false }
+    let stopIdx = evs.firstIndex(of: .stopped)
+    require(errIdx != nil && stopIdx != nil && errIdx! < stopIdx!, "A: error must precede stopped: \\(evs)")
+    print("BG_UNDECODED_SHORT:PASS")
+}
+
+// 2B. partial already emitted (>=24000) + 8000 tail backgrounded -> NO partial-as-final, error before stopped, ACK rejects
+do {
+    let (coord, _, events) = makeHarness()
+    let partialSeen = DispatchSemaphore(value: 0)
+    let q = DispatchQueue(label: "test.emit.b")
+    var evList: [SpeechCoordinator.Event] = []
+    let coordB = SpeechCoordinator(emitQueue: q) { e in
+        evList.append(e)
+        if case .partial = e { partialSeen.signal() }
+    }
+    _ = (coord, events)
+    let owner = coordB.beginStart(makeDecode: { { s, cont in cont() ? "partial_ok:\\(s.count)" : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
+    coordB.offerSamples(speech(320), owner: owner, now: 0.01) {}
+    coordB.offerSamples(speech(24000), owner: owner, now: 0.20) {}
+    require(partialSeen.wait(timeout: .now() + 2) == .success, "B: initial partial never emitted")
+    coordB.offerSamples(speech(8000), owner: owner, now: 0.30) {}
+    coordB.setBackgrounded(true)
+    let ack = DispatchSemaphore(value: 0)
+    var stopErr: String? = nil
+    coordB.endCapture(stopCompletion: { err in stopErr = err; ack.signal() }, stopAudio: {})
+    require(ack.wait(timeout: .now() + 2) == .success && stopErr != nil, "B: expected stop rejection when tail lost in background")
+    let evs = q.sync { evList }
+    require(!evs.contains { if case .final = $0 { return true }; return false }, "B: partial must NOT be promoted to final=true on background drop: \\(evs)")
+    let errIdx = evs.firstIndex { if case .error = $0 { return true }; return false }
+    let stopIdx = evs.firstIndex(of: .stopped)
+    require(errIdx != nil && stopIdx != nil && errIdx! < stopIdx!, "B: error must precede stopped: \\(evs)")
+    print("BG_PARTIAL_PLUS_TAIL:PASS")
+}
+
+// 2C. Mid-decode background cancellation -> cancel active decode, NO final, error before stopped, ACK rejects
+do {
+    let q = DispatchQueue(label: "test.emit.c")
+    var evList: [SpeechCoordinator.Event] = []
+    let coord = SpeechCoordinator(emitQueue: q) { e in evList.append(e) }
+    let decodeEntered = DispatchSemaphore(value: 0)
+    let releaseDecode = DispatchSemaphore(value: 0)
+    let owner = coord.beginStart(makeDecode: {
+        { _, cont in
+            decodeEntered.signal()
+            _ = releaseDecode.wait(timeout: .now() + 2)
+            return cont() ? "never" : nil
+        }
+    }, onStartReady: {}, onSetupFailureTeardown: {})
+    coord.offerSamples(speech(320), owner: owner, now: 0.01) {}
+    coord.offerSamples(speech(24000), owner: owner, now: 0.20) {}
+    require(decodeEntered.wait(timeout: .now() + 2) == .success, "C: decode did not enter")
+    coord.setBackgrounded(true)
+    releaseDecode.signal()
+    let ack = DispatchSemaphore(value: 0)
+    var stopErr: String? = nil
+    coord.endCapture(stopCompletion: { err in stopErr = err; ack.signal() }, stopAudio: {})
+    require(ack.wait(timeout: .now() + 2) == .success && stopErr != nil, "C: mid-decode cancel must reject stop ACK")
+    let evs = q.sync { evList }
+    require(!evs.contains { if case .final = $0 { return true }; return false }, "C: mid-decode cancel emitted final: \\(evs)")
+    let errIdx = evs.firstIndex { if case .error = $0 { return true }; return false }
+    let stopIdx = evs.firstIndex(of: .stopped)
+    require(errIdx != nil && stopIdx != nil && errIdx! < stopIdx!, "C: error must precede stopped: \\(evs)")
+    print("BG_MID_DECODE_CANCEL:PASS")
+}
+
+// 2D. Clean foreground capture & duplicate stop -> single final, zero errors, stopped once, nil ACK
+do {
+    let (coord, _, events) = makeHarness()
+    let owner = coord.beginStart(makeDecode: { { s, cont in cont() ? "fg:\\(s.count)" : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
+    coord.offerSamples(speech(320), owner: owner, now: 0.01) {}
+    coord.offerSamples(speech(8000), owner: owner, now: 0.15) {}
+    let ack1 = DispatchSemaphore(value: 0), ack2 = DispatchSemaphore(value: 0)
+    var err1: String? = "unset", err2: String? = "unset"
+    coord.endCapture(stopCompletion: { e in err1 = e; ack1.signal() }, stopAudio: {})
+    coord.endCapture(stopCompletion: { e in err2 = e; ack2.signal() }, stopAudio: {})
+    require(ack1.wait(timeout: .now() + 2) == .success && ack2.wait(timeout: .now() + 2) == .success, "D: stop timed out")
+    require(err1 == nil && err2 == nil, "D: expected nil errors on clean foreground stop")
+    let evs = events()
+    let finals = evs.filter { if case .final = $0 { return true }; return false }
+    let stops = evs.filter { $0 == .stopped }
+    let errs = evs.filter { if case .error = $0 { return true }; return false }
+    require(finals == [.final("fg:11200")] && stops.count == 1 && errs.isEmpty, "D: unexpected foreground events: \\(evs)")
+    print("FG_CLEAN_AND_DUPLICATE_STOP:PASS")
+}
+
+// 2E. Owner replacement & foreground recovery -> old backgrounded owner never leaks errors to new foreground owner
+do {
+    let q = DispatchQueue(label: "test.emit.e")
+    var evList: [SpeechCoordinator.Event] = []
+    let coord = SpeechCoordinator(emitQueue: q) { e in evList.append(e) }
+    let decodeEntered = DispatchSemaphore(value: 0)
+    let releaseOld = DispatchSemaphore(value: 0)
+    let owner1 = coord.beginStart(makeDecode: {
+        { _, cont in
+            decodeEntered.signal()
+            _ = releaseOld.wait(timeout: .now() + 2)
+            return cont() ? "old" : nil
+        }
+    }, onStartReady: {}, onSetupFailureTeardown: {})
+    coord.offerSamples(speech(320), owner: owner1, now: 0.01) {}
+    coord.offerSamples(speech(24000), owner: owner1, now: 0.20) {}
+    require(decodeEntered.wait(timeout: .now() + 2) == .success, "E: owner1 decode did not enter")
+    coord.setBackgrounded(true)
+    coord.endCapture(stopAudio: {})
+    coord.setBackgrounded(false)
+    let owner2 = coord.beginStart(makeDecode: { { s, cont in cont() ? "recovered:\\(s.count)" : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
+    releaseOld.signal()
+    coord.offerSamples(speech(320), owner: owner2, now: 0.50) {}
+    coord.offerSamples(speech(8000), owner: owner2, now: 0.60) {}
+    let ack2 = DispatchSemaphore(value: 0)
+    var err2: String? = "unset"
+    coord.endCapture(stopCompletion: { e in err2 = e; ack2.signal() }, stopAudio: {})
+    require(ack2.wait(timeout: .now() + 2) == .success && err2 == nil, "E: owner2 recovery failed: \\(String(describing: err2))")
+    let evs = q.sync { evList }
+    require(!evs.contains { if case .error = $0 { return true }; return false }, "E: old owner leaked error into new session: \\(evs)")
+    require(evs.contains(.final("recovered:11200")), "E: owner2 final missing: \\(evs)")
+    print("OWNER_REPLACEMENT_RECOVERY:PASS")
+}
+
+// 2F. Cold setup failure concurrent with endCapture -> single error, stopped, rejected ACK
+do {
+    let (coord, _, events) = makeHarness()
+    let setupEntered = DispatchSemaphore(value: 0), releaseSetup = DispatchSemaphore(value: 0)
+    let owner = coord.beginStart(makeDecode: {
+        setupEntered.signal()
+        _ = releaseSetup.wait(timeout: .now() + 2)
+        return nil
+    }, onStartReady: {}, onSetupFailureTeardown: {})
+    coord.offerSamples(speech(320), owner: owner, now: 0.01) {}
+    require(setupEntered.wait(timeout: .now() + 2) == .success, "F: setup did not start")
+    let ack = DispatchSemaphore(value: 0)
+    var err: String? = nil
+    coord.endCapture(stopCompletion: { e in err = e; ack.signal() }, stopAudio: {})
+    releaseSetup.signal()
+    require(ack.wait(timeout: .now() + 2) == .success && err != nil, "F: setup fail should reject stop")
+    let evs = events()
+    let errIdx = evs.firstIndex { if case .error = $0 { return true }; return false }
+    let stopIdx = evs.firstIndex(of: .stopped)
+    require(errIdx != nil && stopIdx != nil && errIdx! < stopIdx!, "F: setup error must precede stopped: \\(evs)")
+    print("SETUP_FAIL_WITH_STOP:PASS")
+}
 `);
   execFileSync(swiftCompiler!, ['-swift-version', '5', file, '-o', executable], { encoding: 'utf8', timeout: 60000 });
-  expect(execFileSync(executable, [root], { encoding: 'utf8', timeout: 10000 }).trim()).toBe('PROVIDERS:PASS');
+  const result = execFileSync(executable, [emptyDir, biasedDir], { encoding: 'utf8', timeout: 20000 });
+  for (const name of ['RECOGNIZER_DECODER', 'BG_UNDECODED_SHORT', 'BG_PARTIAL_PLUS_TAIL', 'BG_MID_DECODE_CANCEL', 'FG_CLEAN_AND_DUPLICATE_STOP', 'OWNER_REPLACEMENT_RECOVERY', 'SETUP_FAIL_WITH_STOP']) {
+    expect(result).toContain(name + ':PASS');
+  }
 }, 95000);
 
 it.skipIf(!swiftCompiler)('executes the actual Swift bounded window through rollback, VAD, long speech and final short tails', async () => {
@@ -368,7 +647,7 @@ it.skipIf(!swiftCompiler)('executes the actual Swift bounded window through roll
   await writeFile(file, 'import Foundation\n' + state + '\n' + swiftWindowCases);
   execFileSync(swiftCompiler!, ['-swift-version', '5', file, '-o', executable], { encoding: 'utf8', timeout: 60000 });
   const result = execFileSync(executable, [], { encoding: 'utf8', timeout: 30000 });
-  for (const name of ['TAIL', 'ROLLBACK', 'VAD', 'PUNCTUATION', 'REPEATED_SENTENCE', 'LONG_CONTINUOUS', 'VARIABLE_TAP', 'BACKLOG_CHUNKING', 'FAILURE', 'UNICODE', 'EMPTY', 'IN_FLIGHT_STOP', 'LONG_TRANSCRIPT', 'SHORT_CJK', 'SHORT_ASCII', 'REPEATED_OVERLAP', 'STABLE_HYPOTHESIS', 'NO_PROGRESS_THEN_GROWTH', 'ZERO_LAG', 'WARMUP', 'AUDIO_LEVEL_THROTTLE', 'OVERLOAD', 'TAIL_BATCH']) {
+  for (const name of ['TAIL', 'ROLLBACK', 'VAD', 'PUNCTUATION', 'REPEATED_SENTENCE', 'LONG_CONTINUOUS', 'VARIABLE_TAP', 'BACKLOG_CHUNKING', 'FAILURE', 'UNICODE', 'EMPTY', 'IN_FLIGHT_STOP', 'LONG_TRANSCRIPT', 'SHORT_CJK', 'SHORT_ASCII', 'REPEATED_OVERLAP', 'STABLE_HYPOTHESIS', 'NO_PROGRESS_THEN_GROWTH', 'ZERO_LAG', 'WARMUP', 'AUDIO_LEVEL_THROTTLE', 'OVERLOAD', 'TAIL_BATCH', 'NORMALIZED_OVERLAP', 'MID_DECODE_CANCEL']) {
     expect(result).toContain(name + ':PASS');
   }
 }, 95000);
@@ -489,7 +768,7 @@ func labelledSeams(_ words: [String], separator: String, holds: [Int] = []) thro
                 check(snapshot == expected, "seam corrupted an intermediate snapshot: " + snapshot + " != " + expected)
             }
             check(window.text == expected, "window lost previously recognised text")
-            check(window.samples.count <= 72000, "labelled input grew the PCM window")
+            check(window.samples.count <= SpeechWindow.capacity, "labelled input grew the PCM window")
         }
     }
     let final = try window.finish(decode: decode)
@@ -512,16 +791,16 @@ func run() throws {
     print("TAIL:PASS")
 
     window = SpeechWindow(); calls = []; emitted = []
-    var hypotheses = ["alpha hello", "alpha hello worlt", "alpha hello world", "hello world again"]
+    var hypotheses = ["alpha", "alpha hello", "alpha hello worlt", "alpha hello world", "hello world again"]
     let rollingDecode: ([Float]) -> String? = { samples in calls.append(samples.count); return hypotheses.removeFirst() }
-    for _ in 0..<3 { try window.append(pcm(24000), speech: true, decode: rollingDecode) { emitted.append($0) } }
+    for _ in 0..<4 { try window.append(pcm(24000), speech: true, decode: rollingDecode) { emitted.append($0) } }
     check(window.committed == "alpha hello " && window.partial == "world", "five-character rollback")
     check(window.samples.count == 24000 && window.text == "alpha hello world", "roll did not retain exact seam")
     try window.append(pcm(24000), speech: true, decode: rollingDecode) { emitted.append($0) }
     check(window.text == "alpha hello world again", "overlap repeated or split word")
-    check(calls == [24000, 48000, 72000, 48000], "decode input unbounded")
+    check(calls == [24000, 48000, 72000, 96000, 48000], "decode input unbounded")
     _ = try window.finish(decode: rollingDecode)
-    check(calls.count == 4, "overlap-only stop reran audio")
+    check(calls.count == 5, "overlap-only stop reran audio")
     print("ROLLBACK:PASS")
 
     // Full short tails (including <=5 Character windows) can outlive their PCM.
@@ -579,11 +858,11 @@ func run() throws {
     }
     for _ in 0..<1200 {
         try window.append(pcm(1600), speech: true, decode: longDecode) { _ in }
-        check(window.samples.count <= 72000, "PCM grew with duration")
+        check(window.samples.count <= SpeechWindow.capacity, "PCM grew with duration")
         check(window.partial.count <= 32, "mock hypothesis leaked historical partial")
     }
     _ = try window.finish(decode: longDecode)
-    check(calls.count == 80 && calls.max() == 72000, "2 minute decode cadence/bound failed")
+    check(calls.count == 80 && calls.max() == SpeechWindow.capacity, "2 minute decode cadence/bound failed")
     check(window.samples.isEmpty, "final did not release PCM")
     print("LONG_CONTINUOUS:PASS")
 
@@ -613,8 +892,8 @@ func run() throws {
     print("VARIABLE_TAP:PASS")
 
     window = SpeechWindow(); calls = []
-    try window.append(pcm(120000), speech: true, decode: longDecode) { _ in }
-    check(calls == [72000, 72000] && window.samples.count == 24000, "live backlog exceeded capacity without rolling")
+    try window.append(pcm(168000), speech: true, decode: longDecode) { _ in }
+    check(calls == [96000, 96000] && window.samples.count == 24000, "live backlog exceeded capacity without rolling")
     print("BACKLOG_CHUNKING:PASS")
 
     var inbox = SpeechInbox()
@@ -665,15 +944,15 @@ func run() throws {
     window = SpeechWindow(); calls = []
     try window.append(pcm(24000), speech: true, decode: longDecode) { _ in }
     let beforeStop = calls.count
-    // Remaining 32s accepted backlog on stop: chunked into bounded 72,000-sample
+    // Remaining 32s accepted backlog on stop: chunked into bounded 96,000-sample
     // windows without emitting intermediate partials, then flushed once in finish()
     // with 3,200 trailing zero samples.
     try window.append(pcm(SpeechInbox.limit), speech: true, final: true, decode: longDecode) { _ in fatalError("stop emitted partial") }
     _ = try window.finish(decode: longDecode)
     let stopCalls = Array(calls.dropFirst(beforeStop))
-    check(stopCalls.count == 11, "expected 10 full 72k windows + 1 final tail window, got \\(stopCalls)")
-    check(stopCalls.dropLast().allSatisfy { $0 == SpeechWindow.capacity }, "intermediate stop window exceeded or missed 72k capacity: \\(stopCalls)")
-    check(stopCalls.last! == 56000 + SpeechWindow.finalSilencePadding, "final stop window missing bounded tail + 3200 silence flush: \\(stopCalls)")
+    check(stopCalls.count == 8, "expected 7 full 96k windows + 1 final tail window, got \\(stopCalls)")
+    check(stopCalls.dropLast().allSatisfy { $0 == SpeechWindow.capacity }, "intermediate stop window exceeded or missed 96k capacity: \\(stopCalls)")
+    check(stopCalls.last! == 32000 + SpeechWindow.finalSilencePadding, "final stop window missing bounded tail + 3200 silence flush: \\(stopCalls)")
     let afterFirstFinish = calls.count
     _ = try window.finish(decode: longDecode)
     check(calls.count == afterFirstFinish, "stop decoded twice")
@@ -707,7 +986,7 @@ func run() throws {
         let stitched = try backlogWindow.finish(decode: labelledBacklogDecode)
         let expectedStitched = (1...14).map(word).joined(separator: " ")
         check(stitched == expectedStitched, "backlog stitched transcript mismatch (final=\\(isFinalPath)): " + stitched + " != " + expectedStitched)
-        check(backlogLengths.dropLast().allSatisfy { $0 <= SpeechWindow.capacity }, "live/intermediate backlog decode exceeded 72k: \\(backlogLengths)")
+        check(backlogLengths.dropLast().allSatisfy { $0 <= SpeechWindow.capacity }, "live/intermediate backlog decode exceeded 96k: \\(backlogLengths)")
         check(backlogLengths.last! == 28000 + SpeechWindow.finalSilencePadding, "final backlog window did not flush exact tail + 3200 zeros: \\(backlogLengths)")
         check(backlogLastSamples.prefix(28000).allSatisfy { $0 > 0 } && backlogLastSamples.suffix(SpeechWindow.finalSilencePadding).allSatisfy { $0 == 0 }, "final backlog window zero padding corrupted")
     }
@@ -722,7 +1001,7 @@ func run() throws {
 
     window = SpeechWindow()
     let unicode: ([Float]) -> String? = { _ in "你好👨‍👩‍👧‍👦e\\u{301}世界朋友再见" }
-    try window.append(pcm(72000), speech: true, decode: unicode) { _ in }
+    try window.append(pcm(96000), speech: true, decode: unicode) { _ in }
     check(window.partial.count == 5 && !window.text.contains("�"), "split grapheme cluster")
     print("UNICODE:PASS")
 
@@ -753,6 +1032,35 @@ func run() throws {
     check(capture.lengths == [24000, 24137 + SpeechWindow.finalSilencePadding], "accepted tail lost or decoded twice")
     check(capture.events == ["partial", "before tail last word", "stopped/ACK"], "final did not precede stopped/ACK")
     print("IN_FLIGHT_STOP:PASS")
+
+    // Normalized overlap reconciles punctuation/casing drift across rolling seams without duplication
+    window = SpeechWindow()
+    var normHypotheses = ["Hello", "Hello, world", "Hello, world", "Hello, world", "WORLD! Again"]
+    for _ in 0..<4 {
+        try window.append(pcm(24000), speech: true, decode: { _ in normHypotheses.removeFirst() }) { _ in }
+    }
+    try window.append(pcm(24000), speech: true, decode: { _ in normHypotheses.removeFirst() }) { _ in }
+    let normFinal = try window.finish(decode: { _ in nil })
+    check(normFinal == "Hello, WORLD! Again", "normalized overlap failed: \\(normFinal)")
+    print("NORMALIZED_OVERLAP:PASS")
+
+    // Mid-decode & pre-append cancellation throws Failure.cancelled instead of Failure.decode or silent return
+    window = SpeechWindow()
+    do {
+        try window.append(pcm(24000), speech: true, shouldContinue: { false }, decode: { _ in fatalError("should not decode after shouldContinue=false") }) { _ in }
+        fatalError("pre-append cancellation returned silently")
+    } catch SpeechWindow.Failure.cancelled { }
+    var keepGoing = true
+    do {
+        try window.append(pcm(24000), speech: true, shouldContinue: { keepGoing }, decode: { _ in
+            keepGoing = false
+            return nil
+        }) { _ in }
+        fatalError("mid-decode cancellation did not throw Failure.cancelled")
+    } catch SpeechWindow.Failure.cancelled {
+        check(window.newSamples == 24000, "cancelled decode lost un-flushed sample count")
+    }
+    print("MID_DECODE_CANCEL:PASS")
 }
 try run()
 `;
