@@ -3,7 +3,7 @@ import type { SupervisionConsolePairInfo } from '@shared/supervision-task-consol
 import { taskPairWaitKind, readPairScheduling, TASK_PAIR_WAIT_KINDS, type TaskPairScheduling } from '@shared/task-pair-suspension.js';
 import { taskPairDisplayTitle, taskPairResolveDisplaySessionLabel } from '@shared/task-pair-display.js';
 import { isMobileLayout } from '../mobile-device.js';
-import { bindTaskPairPanelFit } from '../task-pair-panel-fit.js';
+import { applyTaskPairPanelFit, bindTaskPairPanelFit } from '../task-pair-panel-fit.js';
 import { useTaskPairPanelWidth } from '../task-pair-panel-width.js';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
@@ -134,7 +134,28 @@ function hasPairActivity(events: readonly TimelineEvent[]): boolean {
   return Boolean(snapshot?.authorityUnavailable) || (Array.isArray(snapshot?.tasks) && snapshot.tasks.length > 0);
 }
 
-export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId, collapsedVisitKey }: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null; collapsedVisitKey?: string | null }) {
+function resetScrollPosition(node: Element | EventTarget | null | undefined): void {
+  if (!node || !('scrollTop' in node) || !('scrollLeft' in node)) return;
+  const el = node as HTMLElement;
+  if (el.scrollTop !== 0) el.scrollTop = 0;
+  if (el.scrollLeft !== 0) el.scrollLeft = 0;
+}
+
+function resetPanelChromeScroll(panel: HTMLElement | null, toggleEl: HTMLElement | null): void {
+  resetScrollPosition(panel);
+  resetScrollPosition(toggleEl);
+  if (panel?.parentElement?.classList.contains('chat-titlebar')) resetScrollPosition(panel.parentElement);
+  if (!panel) return;
+  for (const el of panel.querySelectorAll('.task-pair-status-toggle, .task-pair-status-compact, .task-pair-status-icons, .task-pair-status-mobile-content')) {
+    resetScrollPosition(el);
+  }
+}
+
+function clampElementScroll(event: { currentTarget: EventTarget | null }): void {
+  resetScrollPosition(event.currentTarget);
+}
+
+export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId, collapsedVisitKey, mobileAnchor }: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null; collapsedVisitKey?: string | null; mobileAnchor?: Element | null }) {
   const { t } = useTranslation();
   const [isMobile, setIsMobile] = useState(isMobileLayout);
   // A phone sub-session or split-executor visit shows its panel CLOSED every time it is opened and keeps the user's own choice in this component's memory only
@@ -150,15 +171,12 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
   // instead, without touching the user's choice.
   const [cramped, setCramped] = useState(false);
   const panelRef = useRef<HTMLElement>(null);
+  const toggleRef = useRef<HTMLElement | null>(null);
+  const setToggleNode = useCallback((el: HTMLElement | null) => { toggleRef.current = el; }, []);
   const persistCollapsed = useCallback((next: boolean) => {
     setChoice(next);
     if (!visitScoped) writeServerWideChoice({ serverId, mobile: isMobile, collapsed: next });
   }, [serverId, isMobile, visitScoped]);
-  useLayoutEffect(() => {
-    const panel = panelRef.current;
-    if (!isMobile || !panel) { setCramped(false); return undefined; }
-    return bindTaskPairPanelFit(panel, setCramped);
-  }, [isMobile]);
   useEffect(() => {
     const media = window.matchMedia?.('(max-width: 720px)');
     if (!media) return undefined;
@@ -258,8 +276,20 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
   // What is shown: the user's own choice if there is one, else the default (a phone sub-session: closed); too little room on a phone
   // shows the strip without touching the choice.
   const collapsed = resolveTaskPairPanelCollapsed({ choice, mobile: isMobile, phone, scopeSessionId, collapsedVisitKey }) || (isMobile && cramped);
-  const panelWidth = useTaskPairPanelWidth(panelRef, !isMobile && !collapsed && allRows.length > 0, Boolean(scopeSessionId || collapsedVisitKey));
-  if (latest.size === 0 || allRows.length === 0) return null;
+  const hasRows = latest.size > 0 && allRows.length > 0;
+  const panelWidth = useTaskPairPanelWidth(panelRef, !isMobile && !collapsed && hasRows, Boolean(scopeSessionId || collapsedVisitKey));
+  useLayoutEffect(() => {
+    const panel = panelRef.current;
+    if (!isMobile || !hasRows || !panel) { setCramped(false); return undefined; }
+    return bindTaskPairPanelFit(panel, setCramped);
+  }, [isMobile, hasRows, mobileAnchor]);
+  useLayoutEffect(() => {
+    const panel = panelRef.current;
+    resetPanelChromeScroll(panel, toggleRef.current);
+    if (!isMobile || !hasRows || !panel) return;
+    applyTaskPairPanelFit(panel, setCramped);
+  }, [isMobile, hasRows, collapsed, mobileAnchor]);
+  if (!hasRows) return null;
   const toggle = () => persistCollapsed(!collapsed);
   const toggleWithKeyboard = (event: KeyboardEvent) => {
     if (event.key !== 'Enter' && event.key !== ' ') return;
@@ -307,17 +337,17 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
       <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--queued">{t('taskPair.panel_count_queued', { count: counts.queued })}</span>
       <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--awaiting_brain_decision">{t('taskPair.status.awaiting_brain_decision')} ({counts.awaitingBrain})</span>
     </span><span class="task-pair-status-collapse-icon" aria-hidden="true">⌃</span></>;
-  return <aside ref={panelRef} class={`task-pair-status-panel${collapsed ? ' is-collapsed' : ''}${isMobile ? ' is-mobile' : ' is-desktop'}`} data-testid="task-pair-status-panel">
+  return <aside ref={panelRef} class={`task-pair-status-panel${collapsed ? ' is-collapsed' : ''}${isMobile ? ' is-mobile' : ' is-desktop'}`} data-testid="task-pair-status-panel" onScroll={clampElementScroll}>
     {!isMobile && !collapsed && <div class="task-pair-status-resize" role="separator" tabIndex={0}
       aria-label={t('taskPair.panel_resize')} title={t('taskPair.panel_resize')} aria-orientation="vertical"
       aria-valuemin={panelWidth.min} aria-valuemax={panelWidth.max} aria-valuenow={panelWidth.width}
       onPointerDown={panelWidth.onPointerDown} onKeyDown={panelWidth.onKeyDown} />}
-    {isMobile && collapsed ? <div class="task-pair-status-toggle task-pair-status-compact" role="button" tabIndex={0} aria-expanded={false} aria-label={toggleLabel} title={t('taskPair.panel_expand')} onClick={toggle} onKeyDown={toggleWithKeyboard}>
+    {isMobile && collapsed ? <div key="compact-toggle" ref={setToggleNode} class="task-pair-status-toggle task-pair-status-compact" role="button" tabIndex={0} aria-expanded={false} aria-label={toggleLabel} title={t('taskPair.panel_expand')} onClick={toggle} onKeyDown={toggleWithKeyboard} onScroll={clampElementScroll}>
       {toggleContent}
-    </div> : <button type="button" class="task-pair-status-toggle" aria-expanded={!collapsed} aria-label={toggleLabel} title={t(collapsed ? 'taskPair.panel_expand' : 'taskPair.panel_collapse')} onClick={toggle}>
+    </div> : <button key={collapsed ? 'collapsed-toggle' : 'expanded-toggle'} ref={setToggleNode} type="button" class="task-pair-status-toggle" aria-expanded={!collapsed} aria-label={toggleLabel} title={t(collapsed ? 'taskPair.panel_expand' : 'taskPair.panel_collapse')} onClick={toggle} onScroll={clampElementScroll}>
       {toggleContent}
     </button>}
-    {!collapsed && <div class="task-pair-status-rows" data-testid="task-pair-status-rows">
+    {!collapsed && <div key="expanded-body" class="task-pair-status-body"><div class="task-pair-status-rows" data-testid="task-pair-status-rows">
       {(() => { let sequence = 0; return groups.map((group) => {
         const heading = <h4>{TASK_PAIR_WAIT_KINDS.includes(group.key as typeof TASK_PAIR_WAIT_KINDS[number]) ? t(`taskPair.status.${group.key}`) : group.key === 'awaiting_brain_decision' ? t('taskPair.status.awaiting_brain_decision') : t(`taskPair.panel_group_${group.key}`)} <small>({group.rows.length})</small></h4>;
         const content = group.rows.map((row, index) => { const payload = row.payload; const sequenceNumber = ++sequence; const queued = group.key === 'queued'; const terminal = TASK_PAIR_TERMINAL_STATUSES.includes(payload.toStatus as TaskPairStatus); const duration = formatTaskDuration({ startedAt: row.startedAt, finishedAt: payload.finishedAt, endedAt: payload.endedAt, updatedAt: row.updatedAt, now, durationMs: payload.durationMs, terminal }, durationUnits); const title = taskPairDisplayTitle(payload.title, String(payload.taskId), payload.brief) ?? t('taskPair.panel_untitled'); const taskStatus = String(payload.toStatus); const reworkCount = Math.max(1, reworkCounts.get(String(payload.taskId)) ?? 0); const auditRound = Number(payload.round ?? 0); const deliveryRound = Math.max(1, Number(payload.deliveryRound ?? 1)); return <div class={`task-pair-status-row task-pair-chip--${taskStatus}`} data-status={taskStatus} key={String(payload.taskId)}>
@@ -377,7 +407,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
           ? <details class={`task-pair-status-group task-pair-status-group-${group.key}`} key={group.key}><summary>{heading}</summary>{content}</details>
           : <section class={`task-pair-status-group task-pair-status-group-${group.key}`} key={group.key}>{heading}{content}</section>;
       }); })()}
-    </div>}
+    </div></div>}
   </aside>;
 }
 
@@ -390,7 +420,7 @@ export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[
   useLayoutEffect(() => {
     const anchor = props.mobileAnchor ?? props.mobileAnchorRef?.current ?? null;
     if (anchor !== resolvedMobileAnchor) setResolvedMobileAnchor(anchor);
-  }, [active, props.mobileAnchor, props.mobileAnchorRef, resolvedMobileAnchor]);
+  });
   useEffect(() => {
     if (!active && hasPairActivity(props.events)) {
       setActive(true);
@@ -425,7 +455,7 @@ export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[
   // box may cover the conversation. The panel reappears with fresh data.
   if (authorityUnavailable) return null;
   const { mobileAnchor, mobileAnchorRef, ...panelProps } = props;
-  const panel = <TaskPairStatusPanel {...panelProps} />;
+  const panel = <TaskPairStatusPanel {...panelProps} mobileAnchor={resolvedMobileAnchor} />;
   // The titlebar is the only safe host: keeping the panel in normal flow makes
   // both mobile and desktop controls reserve space instead of being covered by
   // a chat-main overlay. Expanded rows still open below the titlebar.

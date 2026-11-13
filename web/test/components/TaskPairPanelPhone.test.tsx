@@ -6,7 +6,8 @@ vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string, opts?: Record<string, unknown>) => (opts ? `${key}:${JSON.stringify(opts)}` : key) }),
 }));
 
-import { TaskPairStatusPanel } from '../../src/components/TaskPairStatusPanel.js';
+import { TaskPairStatusPanel, TaskPairStatusPanelHost } from '../../src/components/TaskPairStatusPanel.js';
+import { TASK_PAIR_PANEL_MAX_HEIGHT_VAR } from '../../src/task-pair-panel-fit.js';
 import { LEGACY_SESSION_MAP_KEY_PREFIX, resetTaskPairPanelMemoryForTests } from '../../src/task-pair-panel-state.js';
 
 const originalMatchMedia = window.matchMedia;
@@ -263,6 +264,135 @@ describe('everything that is not a phone sub-session is unchanged', () => {
     expect(view.container.querySelector('.task-pair-status-row-title')?.textContent).toBe('Task tb');
     expect(window.localStorage.getItem('imcodes.task-pair-status-panel.collapsed:srv:desktop')).toBe('0');
     expect(window.localStorage.getItem('imcodes.task-pair-status-panel.collapsed:new-server:desktop')).toBeNull();
+  });
+
+  it('binds --task-pair-panel-max-h even when rows populate after initial empty mount and after portal anchor attachment', () => {
+    setDevice('phone');
+    const host = document.createElement('div');
+    host.className = 'chat-main';
+    const titlebar = document.createElement('div');
+    titlebar.className = 'chat-titlebar';
+    host.appendChild(titlebar);
+    document.body.appendChild(host);
+    host.getBoundingClientRect = () => ({ top: 140, bottom: 637, left: 0, right: 440, width: 440, height: 497, x: 0, y: 140, toJSON: () => ({}) } as DOMRect);
+    titlebar.getBoundingClientRect = () => ({ top: 140, bottom: 193, left: 0, right: 440, width: 440, height: 53, x: 0, y: 140, toJSON: () => ({}) } as DOMRect);
+
+    const anchorRef: { current: Element | null } = { current: null };
+    const mountTarget = document.createElement('div');
+    host.appendChild(mountTarget);
+
+    // Mount with activity for another session so active=true in Host while scoped allRows is initially empty.
+    const view = render(
+      <TaskPairStatusPanelHost
+        events={[pairEvent('other', 'working', 'deck_sub_other')]}
+        serverId="srv"
+        scopeSessionId="deck_sub_a"
+        mobileAnchorRef={anchorRef}
+      />,
+      { container: mountTarget },
+    );
+    expect(host.querySelector('[data-testid="task-pair-status-panel"]')).toBeNull();
+
+    // Now anchor attaches and scoped rows arrive later (snapshot / event update).
+    anchorRef.current = titlebar;
+    view.rerender(
+      <TaskPairStatusPanelHost
+        events={[pairEvent('other', 'working', 'deck_sub_other'), pairEvent('t1', 'working', 'deck_sub_a')]}
+        serverId="srv"
+        scopeSessionId="deck_sub_a"
+        mobileAnchorRef={anchorRef}
+      />,
+    );
+    const panel = titlebar.querySelector('[data-testid="task-pair-status-panel"]') as HTMLElement | null;
+    expect(panel).toBeTruthy();
+    // 637 - (193 + 4) - 8 = 432px
+    expect(panel!.style.getPropertyValue(TASK_PAIR_PANEL_MAX_HEIGHT_VAR)).toBe('432px');
+    host.remove();
+  });
+
+  it('detaches the expanded scroll container, resets scrollTop/scrollLeft on collapse, and restores cleanly on re-expand', () => {
+    setDevice('phone');
+    const host = document.createElement('div');
+    host.className = 'chat-main';
+    const titlebar = document.createElement('div');
+    titlebar.className = 'chat-titlebar';
+    host.appendChild(titlebar);
+    document.body.appendChild(host);
+    host.getBoundingClientRect = () => ({ top: 140, bottom: 637, left: 0, right: 440, width: 440, height: 497, x: 0, y: 140, toJSON: () => ({}) } as DOMRect);
+    titlebar.getBoundingClientRect = () => ({ top: 140, bottom: 193, left: 0, right: 440, width: 440, height: 53, x: 0, y: 140, toJSON: () => ({}) } as DOMRect);
+
+    const anchorRef = { current: titlebar };
+    const mountTarget = document.createElement('div');
+    host.appendChild(mountTarget);
+
+    render(
+      <TaskPairStatusPanelHost
+        events={[
+          pairEvent('t1', 'working', 'deck_sub_a'),
+          pairEvent('t2', 'in_audit', 'deck_sub_a'),
+          pairEvent('t3', 'queued', 'deck_sub_a'),
+        ]}
+        serverId="srv"
+        scopeSessionId="deck_sub_a"
+        mobileAnchorRef={anchorRef}
+      />,
+      { container: mountTarget },
+    );
+
+    // Expand
+    const compactBefore = titlebar.querySelector('.task-pair-status-compact') as HTMLElement;
+    expect(compactBefore).toBeTruthy();
+    fireEvent.click(compactBefore);
+
+    const panel = titlebar.querySelector('[data-testid="task-pair-status-panel"]') as HTMLElement;
+    const expandedToggle = titlebar.querySelector('button.task-pair-status-toggle') as HTMLElement;
+    const rows = titlebar.querySelector('[data-testid="task-pair-status-rows"]') as HTMLElement;
+    expect(panel.classList.contains('is-collapsed')).toBe(false);
+    expect(rows.parentElement?.classList.contains('task-pair-status-body')).toBe(true);
+
+    // Scroll the expanded rows list and simulate accidental scroll offset on panel/toggle/titlebar
+    rows.scrollTop = 180;
+    panel.scrollTop = 16;
+    panel.scrollLeft = 12;
+    fireEvent.scroll(panel);
+    expect(panel.scrollTop).toBe(0);
+    expect(panel.scrollLeft).toBe(0);
+
+    // Re-inject non-zero scroll offsets directly before collapsing to verify collapse cleanup resets them
+    panel.scrollTop = 14;
+    panel.scrollLeft = 10;
+    expandedToggle.scrollTop = 8;
+    expandedToggle.scrollLeft = 9;
+    titlebar.scrollTop = 6;
+    titlebar.scrollLeft = 5;
+
+    // Collapse
+    fireEvent.click(expandedToggle);
+    expect(panel.classList.contains('is-collapsed')).toBe(true);
+    expect(titlebar.querySelector('[data-testid="task-pair-status-rows"]')).toBeNull();
+    expect(titlebar.querySelector('.task-pair-status-body')).toBeNull();
+
+    const compactAfter = titlebar.querySelector('.task-pair-status-compact') as HTMLElement;
+    expect(compactAfter).toBeTruthy();
+    expect(compactAfter).not.toBe(expandedToggle);
+    expect(panel.scrollTop).toBe(0);
+    expect(panel.scrollLeft).toBe(0);
+    expect(compactAfter.scrollTop).toBe(0);
+    expect(compactAfter.scrollLeft).toBe(0);
+    expect(titlebar.scrollTop).toBe(0);
+    expect(titlebar.scrollLeft).toBe(0);
+
+    // Re-expand and verify state fidelity & fit bound
+    fireEvent.click(compactAfter);
+    expect(panel.classList.contains('is-collapsed')).toBe(false);
+    const rowsReopened = titlebar.querySelector('[data-testid="task-pair-status-rows"]') as HTMLElement;
+    expect(rowsReopened).toBeTruthy();
+    expect(rowsReopened.scrollTop).toBe(0);
+    expect(panel.scrollTop).toBe(0);
+    expect(panel.scrollLeft).toBe(0);
+    expect(panel.style.getPropertyValue(TASK_PAIR_PANEL_MAX_HEIGHT_VAR)).toBe('432px');
+    expect(rowsReopened.querySelectorAll('.task-pair-status-row')).toHaveLength(3);
+    host.remove();
   });
 
 });

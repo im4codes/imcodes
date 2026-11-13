@@ -209,11 +209,26 @@ describe('stylesheet: mobile expanded panel is bounded by the measured variable'
     expect(desktop).not.toContain(TASK_PAIR_PANEL_MAX_HEIGHT_VAR);
   });
 
-  it('keeps the rows list as the only scroll container so every card is reachable', () => {
+  it('keeps the rows list inside an isolated body scroll wrapper so compact trigger and rows never share scroll containers', () => {
+    const body = /\.task-pair-status-body \{([^}]*)\}/.exec(css)?.[1] ?? '';
+    expect(body).toMatch(/overflow:\s*hidden/);
+    expect(body).toMatch(/min-height:\s*0/);
     const rows = /\.task-pair-status-rows \{([^}]*)\}/.exec(css)?.[1] ?? '';
     expect(rows).toMatch(/overflow-y:\s*auto/);
     expect(rows).toMatch(/min-height:\s*0/);
     const toggle = /\.task-pair-status-toggle \{\s*width: 100%;([^}]*)\}/.exec(css)?.[1] ?? '';
     expect(toggle).toMatch(/flex-shrink:\s*0/);
+  });
+
+  it('keeps mobile titlebar/chat-main fallback panels and mobile SupervisionTaskConsole clear of composer/safe-areas', () => {
+    const wideMobileTitlebar = /\.chat-titlebar > \.task-pair-status-panel\.is-mobile:not\(\.is-collapsed\) \{\s*height:\s*auto;([^}]*)\}/.exec(css)?.[1] ?? '';
+    expect(wideMobileTitlebar).toMatch(/z-index:\s*20/);
+    const mobileMainFallback = /\.chat-main > \.task-pair-status-panel\.is-mobile:not\(\.is-collapsed\) \{([^}]*)\}/.exec(css)?.[1] ?? '';
+    expect(mobileMainFallback).toMatch(/bottom:\s*auto/);
+    expect(mobileMainFallback).toContain(TASK_PAIR_PANEL_MAX_HEIGHT_VAR);
+    const consoleMobile = /\.supervision-task-console\.is-mobile \{([^}]*)\}/.exec(css)?.[1] ?? '';
+    expect(consoleMobile).toMatch(/height:\s*var\(--vvh,\s*100dvh\)/);
+    expect(consoleMobile).toMatch(/safe-area-inset-top/);
+    expect(consoleMobile).toMatch(/safe-area-inset-bottom/);
   });
 });

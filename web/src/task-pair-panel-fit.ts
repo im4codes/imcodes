@@ -61,9 +61,39 @@ function measurePanelTop(parent: Element, host: Element): number {
 }
 
 /**
+ * Measure and apply the mobile panel's max-height bound once. Safe to invoke
+ * both from the continuous ResizeObserver binding and synchronously on expand.
+ */
+export function applyTaskPairPanelFit(panel: HTMLElement, onCramped: (cramped: boolean) => void): void {
+  const titlebar = panel.parentElement;
+  const host = panel.closest('.chat-main');
+  if (!titlebar || !host) {
+    panel.style.removeProperty(TASK_PAIR_PANEL_MAX_HEIGHT_VAR);
+    onCramped(false);
+    return;
+  }
+  const viewport = window.visualViewport;
+  const hostRect = host.getBoundingClientRect();
+  if (hostRect.width === 0 && hostRect.height === 0) {
+    // Not laid out (hidden tab, detached subtree): nothing to measure, so keep
+    // the stylesheet fallback rather than collapsing on a bogus zero.
+    panel.style.removeProperty(TASK_PAIR_PANEL_MAX_HEIGHT_VAR);
+    onCramped(false);
+    return;
+  }
+  const fit = computeTaskPairPanelFit({
+    panelTop: measurePanelTop(titlebar, host),
+    hostBottom: hostRect.bottom,
+    viewportBottom: viewport ? viewport.offsetTop + viewport.height : window.innerHeight,
+  });
+  panel.style.setProperty(TASK_PAIR_PANEL_MAX_HEIGHT_VAR, `${fit.maxHeight}px`);
+  onCramped(fit.cramped);
+}
+
+/**
  * Keep `panel`'s bound current for as long as it is mounted. `panel`'s parent
- * (the titlebar) and its `.chat-main` are observed; window and visual-viewport
- * changes (rotation, keyboard) re-measure too. Returns the cleanup.
+ * (the titlebar), `panel` itself, and its `.chat-main` are observed; window and
+ * visual-viewport changes (rotation, keyboard) re-measure too. Returns cleanup.
  */
 export function bindTaskPairPanelFit(panel: HTMLElement, onCramped: (cramped: boolean) => void): () => void {
   const titlebar = panel.parentElement;
@@ -75,22 +105,7 @@ export function bindTaskPairPanelFit(panel: HTMLElement, onCramped: (cramped: bo
   let frame = 0;
   const apply = () => {
     frame = 0;
-    const viewport = window.visualViewport;
-    const hostRect = host.getBoundingClientRect();
-    if (hostRect.width === 0 && hostRect.height === 0) {
-      // Not laid out (hidden tab, detached subtree): nothing to measure, so keep
-      // the stylesheet fallback rather than collapsing on a bogus zero.
-      panel.style.removeProperty(TASK_PAIR_PANEL_MAX_HEIGHT_VAR);
-      onCramped(false);
-      return;
-    }
-    const fit = computeTaskPairPanelFit({
-      panelTop: measurePanelTop(titlebar, host),
-      hostBottom: hostRect.bottom,
-      viewportBottom: viewport ? viewport.offsetTop + viewport.height : window.innerHeight,
-    });
-    panel.style.setProperty(TASK_PAIR_PANEL_MAX_HEIGHT_VAR, `${fit.maxHeight}px`);
-    onCramped(fit.cramped);
+    applyTaskPairPanelFit(panel, onCramped);
   };
   const schedule = () => {
     if (frame) return;
@@ -98,15 +113,16 @@ export function bindTaskPairPanelFit(panel: HTMLElement, onCramped: (cramped: bo
   };
   apply();
   const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(schedule);
-  observer?.observe(host);
-  observer?.observe(titlebar);
+  for (const el of new Set<Element>([host, titlebar])) observer?.observe(el);
   window.addEventListener('resize', schedule);
+  window.addEventListener('orientationchange', schedule);
   window.visualViewport?.addEventListener('resize', schedule);
   window.visualViewport?.addEventListener('scroll', schedule);
   return () => {
     if (frame) window.cancelAnimationFrame(frame);
     observer?.disconnect();
     window.removeEventListener('resize', schedule);
+    window.removeEventListener('orientationchange', schedule);
     window.visualViewport?.removeEventListener('resize', schedule);
     window.visualViewport?.removeEventListener('scroll', schedule);
     panel.style.removeProperty(TASK_PAIR_PANEL_MAX_HEIGHT_VAR);

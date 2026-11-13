@@ -79,7 +79,8 @@ html {
 .supervision-task-console-toggle.is-active { background: rgba(34,211,238,.16); box-shadow: inset 0 0 14px rgba(34,211,238,.12), 0 0 10px rgba(34,211,238,.12); }
 .supervision-task-console { position: relative; flex: 0 0 auto; min-width: 0; min-height: 0; color: #dbeafe; background: radial-gradient(circle at 100% 0, rgba(34,211,238,.09), transparent 36%), linear-gradient(180deg, #0d1422 0%, #080d16 100%); border-left: 1px solid var(--chrome-line); box-shadow: -12px 0 34px rgba(0,0,0,.32); display: flex; flex-direction: column; overflow: hidden; z-index: 20; }
 .supervision-task-console.is-desktop { max-width: 65vw; }
-.supervision-task-console.is-mobile { position: fixed; inset: 0; width: 100%; max-width: none; padding-top: var(--sat); z-index: calc(var(--mobile-fullscreen-window-z) + 2); border-left: 0; }
+.supervision-task-console.is-mobile { position: fixed; inset: 0; height: var(--vvh, 100dvh); max-height: var(--vvh, 100dvh); width: 100%; max-width: none; padding-top: max(var(--sat, 0px), env(safe-area-inset-top, 0px)); padding-bottom: env(safe-area-inset-bottom, 0px); z-index: calc(var(--mobile-fullscreen-window-z) + 2); border-left: 0; }
+.supervision-task-console.is-mobile .supervision-task-console-body { padding-bottom: max(14px, env(safe-area-inset-bottom, 0px)); }
 .supervision-task-console-resize { position: absolute; inset: 0 auto 0 -5px; width: 10px; cursor: col-resize; touch-action: none; z-index: 3; }
 .supervision-task-console-resize:focus-visible { outline: 2px solid var(--chrome-accent); outline-offset: -3px; }
 .supervision-task-console-header { min-height: 62px; padding: 12px 14px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--chrome-line-soft); }
@@ -14889,7 +14890,8 @@ button.quick-agent-delegation-preset.active {
 .supervision-task-console-toggle.is-active { background: rgba(34,211,238,.16); box-shadow: inset 0 0 14px rgba(34,211,238,.12), 0 0 10px rgba(34,211,238,.12); }
 .supervision-task-console { position: relative; flex: 0 0 auto; min-width: 0; min-height: 0; color: #dbeafe; background: radial-gradient(circle at 100% 0, rgba(34,211,238,.09), transparent 36%), linear-gradient(180deg, #0d1422 0%, #080d16 100%); border-left: 1px solid var(--chrome-line); box-shadow: -12px 0 34px rgba(0,0,0,.32); display: flex; flex-direction: column; overflow: hidden; z-index: 20; }
 .supervision-task-console.is-desktop { max-width: 65vw; }
-.supervision-task-console.is-mobile { position: fixed; inset: 0; width: 100%; max-width: none; padding-top: var(--sat); z-index: calc(var(--mobile-fullscreen-window-z) + 2); border-left: 0; }
+.supervision-task-console.is-mobile { position: fixed; inset: 0; height: var(--vvh, 100dvh); max-height: var(--vvh, 100dvh); width: 100%; max-width: none; padding-top: max(var(--sat, 0px), env(safe-area-inset-top, 0px)); padding-bottom: env(safe-area-inset-bottom, 0px); z-index: calc(var(--mobile-fullscreen-window-z) + 2); border-left: 0; }
+.supervision-task-console.is-mobile .supervision-task-console-body { padding-bottom: max(14px, env(safe-area-inset-bottom, 0px)); }
 .supervision-task-console-resize { position: absolute; inset: 0 auto 0 -5px; width: 10px; cursor: col-resize; touch-action: none; z-index: 3; }
 .supervision-task-console-resize:focus-visible { outline: 2px solid var(--chrome-accent); outline-offset: -3px; }
 .supervision-task-console-header { min-height: 62px; padding: 12px 14px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--chrome-line-soft); }
@@ -15367,7 +15369,7 @@ button.quick-agent-delegation-preset.active {
    every card. The viewport-relative value is only the pre-measurement / no-JS
    fallback. Height follows the content up to that bound. */
 .chat-titlebar > .task-pair-status-panel.is-mobile:not(.is-collapsed) {
-  height: auto; max-height: var(--task-pair-panel-max-h, min(65vh, calc(100dvh - 160px)));
+  height: auto; max-height: var(--task-pair-panel-max-h, min(65vh, calc(100dvh - 160px))); z-index: 20;
 }
 .chat-titlebar > .task-pair-status-panel.is-collapsed {
   /* Keep the collapsed strip in the titlebar flex flow on desktop too. The
@@ -15389,6 +15391,9 @@ button.quick-agent-delegation-preset.active {
 .chat-main > .task-pair-status-panel:not(.is-collapsed) {
   position: absolute; top: 40px; right: 0; bottom: 0; height: auto; max-height: none;
   width: min(var(--task-pair-panel-width), 100%); max-width: var(--task-pair-panel-width); overflow: hidden;
+}
+.chat-main > .task-pair-status-panel.is-mobile:not(.is-collapsed) {
+  bottom: auto; max-height: var(--task-pair-panel-max-h, calc(100% - 48px)); z-index: 20;
 }
 .chat-main > .task-pair-status-panel.is-collapsed {
   position: absolute; top: 4px; right: 8px; bottom: auto; z-index: 13;
@@ -15506,6 +15511,9 @@ button.quick-agent-delegation-preset.active {
     border: 1px solid var(--status-info-border, var(--chrome-accent)); border-radius: 10px;
     box-shadow: 0 8px 28px color-mix(in srgb, #000 35%, transparent);
   }
+  .chat-main > .task-pair-status-panel.is-mobile:not(.is-collapsed) {
+    bottom: auto; max-height: var(--task-pair-panel-max-h, calc(100% - 48px));
+  }
   .chat-main > .task-pair-status-panel.is-collapsed {
     position: absolute; top: 4px; right: 8px; bottom: auto; height: auto; max-height: none; overflow: visible;
   }
@@ -15525,6 +15533,7 @@ button.quick-agent-delegation-preset.active {
 }
 .task-pair-status-toggle strong { min-width: 0; overflow-wrap: anywhere; }
 .task-pair-status-summary { display: flex; flex-wrap: wrap; gap: 4px; min-width: 0; }
+.task-pair-status-body { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
 .task-pair-status-rows { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; scrollbar-gutter: stable; scroll-padding-bottom: 16px; padding: 0 8px 16px; }
 .task-pair-status-group { margin: 0 0 6px; }
 .task-pair-status-group h4 { display: flex; align-items: center; gap: 5px; margin: 6px 0 0; padding-top: 3px; border-top: 1px solid color-mix(in srgb, currentColor 22%, transparent); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; opacity: .78; }
