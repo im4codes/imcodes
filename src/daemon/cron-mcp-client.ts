@@ -12,10 +12,22 @@ import { DEVICE_TIMEZONE_HEADER } from '../../shared/http-header-names.js';
 import { normalizeClientTimezone } from '../../shared/client-timezone.js';
 import { daemonApiUrl, type DaemonHttpMethod } from '../../shared/daemon-token-routes.js';
 import { daemonServerAuthHeaders } from '../../shared/daemon-server-auth.js';
+import {
+  formatNetworkErrorMessage,
+  isPreConnectNetworkError,
+  withPreConnectRetry,
+  type PreConnectRetryOptions,
+} from '../util/pre-connect-retry.js';
 
 const CRON_EXPIRES_AT_MAX_MS = 90 * 24 * 60 * 60 * 1000;
 const CRON_LIST_LIMIT_MAX = 100;
 const DEFAULT_TIMEOUT_MS = 15_000;
+const CRON_RETRY_MAX_ATTEMPTS = 3;
+const CRON_RETRY_BASE_DELAY_MS = 500;
+const CRON_RETRY_MAX_DELAY_MS = 2_000;
+const TRANSIENT_GET_SOCKET_CODES: ReadonlySet<string> = new Set(['UND_ERR_SOCKET', 'ECONNRESET', 'EPIPE']);
+const TRANSIENT_GET_SOCKET_MESSAGES = /other side closed|socket hang up|ECONNRESET/i;
+const TRANSIENT_GET_STATUSES: ReadonlySet<number> = new Set([502, 503, 504]);
 
 export interface CronServerEndpoint {
   serverId: string;
@@ -32,6 +44,8 @@ export interface CronMcpClientOptions {
   runtimeServerId?: string | null;
   timeoutMs?: number;
   deviceTimezone?: string | null;
+  /** Optional retry policy override for transient network failures (test seam). */
+  preConnectRetry?: PreConnectRetryOptions;
 }
 
 export interface CronCreateInput extends MemoryMcpSourceProvenance {
@@ -190,6 +204,28 @@ function responseMessage(body: unknown, fallback: string): string {
   return fallback;
 }
 
+class TransientCronHttpError extends Error {
+  constructor(readonly result: CronMcpFailure) {
+    super(result.message);
+  }
+}
+
+function isIdempotentGetTransientError(err: unknown): boolean {
+  if (err instanceof TransientCronHttpError) return true;
+  if (isPreConnectNetworkError(err)) return true;
+  const seen = new Set<unknown>();
+  let current: unknown = err;
+  for (let depth = 0; depth < 5 && current instanceof Error; depth += 1) {
+    if (seen.has(current)) break;
+    seen.add(current);
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === 'string' && TRANSIENT_GET_SOCKET_CODES.has(code)) return true;
+    if (TRANSIENT_GET_SOCKET_MESSAGES.test(current.message)) return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
 async function requestCron(
   endpoint: CronServerEndpoint,
   runtimeServerId: string,
@@ -198,40 +234,59 @@ async function requestCron(
   options: CronMcpClientOptions,
 ): Promise<CronMcpResult<{ body: unknown }>> {
   const fetchImpl = options.fetchImpl ?? fetch;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const method = ((init.method ?? 'GET').toUpperCase()) as DaemonHttpMethod;
+  const url = cronUrl(endpoint, runtimeServerId, pathSuffix, method);
   const deviceTimezone = normalizeClientTimezone(
     options.deviceTimezone !== undefined
       ? options.deviceTimezone
       : Intl.DateTimeFormat().resolvedOptions().timeZone,
   );
+  const headers = {
+    // The credential names the BOUND server (the token belongs to it); the route names the server the job is for.
+    ...daemonServerAuthHeaders(endpoint),
+    'Content-Type': 'application/json',
+    ...(deviceTimezone ? { [DEVICE_TIMEZONE_HEADER]: deviceTimezone } : {}),
+    ...init.headers,
+  };
   try {
-    const res = await fetchImpl(cronUrl(endpoint, runtimeServerId, pathSuffix, (init.method ?? 'GET') as DaemonHttpMethod), {
-      ...init,
-      headers: {
-        // The credential names the BOUND server (the token belongs to it); the route names the server the job is for.
-        ...daemonServerAuthHeaders(endpoint),
-        'Content-Type': 'application/json',
-        ...(deviceTimezone ? { [DEVICE_TIMEZONE_HEADER]: deviceTimezone } : {}),
-        ...init.headers,
-      },
-      signal: controller.signal,
+    return await withPreConnectRetry(async () => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+      timer.unref?.();
+      try {
+        const res = await fetchImpl(url, {
+          ...init,
+          headers,
+          signal: controller.signal,
+        });
+        const body = await parseJsonResponse(res);
+        if (res.status === 401) {
+          // The server did not authenticate this daemon (revoked or re-bound server token, or a server that has not been
+          // updated to this daemon yet). Say so: it is not a transient failure and retrying will not help. A 403 is NOT this:
+          // the cron API answers 403 for a legitimate scope denial and its reason must reach the caller (handled below).
+          return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, "The server rejected this daemon's credential for the cron API (HTTP 401); re-bind the daemon (imcodes bind) or update the server");
+        }
+        if (!res.ok) {
+          const failure = error(MCP_ERROR_REASONS.INTERNAL_ERROR, responseMessage(body, `Cron request failed with status ${res.status}`));
+          if (method === 'GET' && TRANSIENT_GET_STATUSES.has(res.status)) {
+            throw new TransientCronHttpError(failure);
+          }
+          return failure;
+        }
+        return { status: 'ok', body };
+      } finally {
+        clearTimeout(timer);
+      }
+    }, {
+      maxAttempts: CRON_RETRY_MAX_ATTEMPTS,
+      baseDelayMs: CRON_RETRY_BASE_DELAY_MS,
+      maxDelayMs: CRON_RETRY_MAX_DELAY_MS,
+      shouldRetry: method === 'GET' ? isIdempotentGetTransientError : isPreConnectNetworkError,
+      ...options.preConnectRetry,
     });
-    const body = await parseJsonResponse(res);
-    if (res.status === 401) {
-      // The server did not authenticate this daemon (revoked or re-bound server token, or a server that has not been
-      // updated to this daemon yet). Say so: it is not a transient failure and retrying will not help. A 403 is NOT this:
-      // the cron API answers 403 for a legitimate scope denial and its reason must reach the caller (handled below).
-      return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, "The server rejected this daemon's credential for the cron API (HTTP 401); re-bind the daemon (imcodes bind) or update the server");
-    }
-    if (!res.ok) {
-      return error(MCP_ERROR_REASONS.INTERNAL_ERROR, responseMessage(body, `Cron request failed with status ${res.status}`));
-    }
-    return { status: 'ok', body };
   } catch (err) {
-    return error(MCP_ERROR_REASONS.INTERNAL_ERROR, err instanceof Error ? err.message : String(err));
-  } finally {
-    clearTimeout(timer);
+    if (err instanceof TransientCronHttpError) return err.result;
+    return error(MCP_ERROR_REASONS.INTERNAL_ERROR, formatNetworkErrorMessage(err));
   }
 }
 
