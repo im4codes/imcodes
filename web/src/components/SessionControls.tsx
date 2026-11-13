@@ -181,105 +181,13 @@ import { recordPerfRender } from '../perf-render-debug.js';
 export const COMPOSER_HEIGHT_STORAGE_KEY = 'imcodes_composer_height_v1';
 export const ATTACHMENT_BADGE_COLLAPSE_THRESHOLD = 3;
 export const ATTACHMENT_BADGE_COLLAPSED_VISIBLE_COUNT = 2;
-const VOICE_HOLD_DELAY_MS = 100;
+const VOICE_HOLD_DELAY_MS = 45;
 const VOICE_HOLD_MOVE_SLOP_PX = 18;
 const VOICE_HOLD_CANCEL_THRESHOLD_PX = 44;
 const VOICE_HOLD_EDIT_THRESHOLD_PX = 44;
 const VOICE_HOLD_SLIDE_MAX_PX = 84;
 const VOICE_HOLD_FAILED_DRAIN_TIMEOUT_MS = 2500;
-
-const VOICE_HOLD_FAN_CENTER_X = 180;
-const VOICE_HOLD_FAN_CENTER_Y = 204;
-const VOICE_HOLD_FAN_INNER_R = 88;
-const VOICE_HOLD_FAN_OUTER_R = 196;
-
-function polarToFanPoint(cx: number, cy: number, radius: number, angleDeg: number): [number, number] {
-  const rad = (angleDeg * Math.PI) / 180;
-  return [
-    +(cx + radius * Math.sin(rad)).toFixed(2),
-    +(cy - radius * Math.cos(rad)).toFixed(2),
-  ];
-}
-
-function buildVoiceFanSectorPath(
-  cx: number,
-  cy: number,
-  innerR: number,
-  outerR: number,
-  startDeg: number,
-  endDeg: number,
-): string {
-  const [ox1, oy1] = polarToFanPoint(cx, cy, outerR, startDeg);
-  const [ox2, oy2] = polarToFanPoint(cx, cy, outerR, endDeg);
-  const [ix1, iy1] = polarToFanPoint(cx, cy, innerR, endDeg);
-  const [ix2, iy2] = polarToFanPoint(cx, cy, innerR, startDeg);
-  const largeArc = Math.abs(endDeg - startDeg) > 180 ? 1 : 0;
-  return `M ${ox1} ${oy1} A ${outerR} ${outerR} 0 ${largeArc} 1 ${ox2} ${oy2} L ${ix1} ${iy1} A ${innerR} ${innerR} 0 ${largeArc} 0 ${ix2} ${iy2} Z`;
-}
-
-function buildVoiceFanArcPath(cx: number, cy: number, radius: number, startDeg: number, endDeg: number): string {
-  const [x1, y1] = polarToFanPoint(cx, cy, radius, startDeg);
-  const [x2, y2] = polarToFanPoint(cx, cy, radius, endDeg);
-  const largeArc = Math.abs(endDeg - startDeg) > 180 ? 1 : 0;
-  return `M ${x1} ${y1} A ${radius} ${radius} 0 ${largeArc} 1 ${x2} ${y2}`;
-}
-
-function splitVoiceFanLabel(raw: string): string[] {
-  const text = raw.trim();
-  if (!text) return [''];
-  if (text.includes('·')) {
-    const parts = text.split('·').map((part) => part.trim()).filter(Boolean);
-    if (parts.length >= 2) {
-      return [parts[0], parts.slice(1).join(' · ')];
-    }
-  }
-  const words = text.split(/\s+/).filter(Boolean);
-  if (words.length >= 2 && text.length > 10) {
-    let bestIdx = 1;
-    let bestDiff = Infinity;
-    for (let i = 1; i < words.length; i++) {
-      const left = words.slice(0, i).join(' ');
-      const right = words.slice(i).join(' ');
-      const diff = Math.abs(left.length - right.length);
-      if (diff < bestDiff) {
-        bestDiff = diff;
-        bestIdx = i;
-      }
-    }
-    return [words.slice(0, bestIdx).join(' '), words.slice(bestIdx).join(' ')];
-  }
-  return [text];
-}
-
-const VOICE_HOLD_FAN_SECTORS = [
-  {
-    zone: 'cancel' as const,
-    startDeg: -60,
-    endDeg: -21,
-    pathD: buildVoiceFanSectorPath(VOICE_HOLD_FAN_CENTER_X, VOICE_HOLD_FAN_CENTER_Y, VOICE_HOLD_FAN_INNER_R, VOICE_HOLD_FAN_OUTER_R, -60, -21),
-    iconPos: polarToFanPoint(VOICE_HOLD_FAN_CENTER_X, VOICE_HOLD_FAN_CENTER_Y, 169, -40.5),
-    textPos: polarToFanPoint(VOICE_HOLD_FAN_CENTER_X, VOICE_HOLD_FAN_CENTER_Y, 123, -40.5),
-  },
-  {
-    zone: 'send' as const,
-    startDeg: -19,
-    endDeg: 19,
-    pathD: buildVoiceFanSectorPath(VOICE_HOLD_FAN_CENTER_X, VOICE_HOLD_FAN_CENTER_Y, VOICE_HOLD_FAN_INNER_R, VOICE_HOLD_FAN_OUTER_R, -19, 19),
-    iconPos: polarToFanPoint(VOICE_HOLD_FAN_CENTER_X, VOICE_HOLD_FAN_CENTER_Y, 168, 0),
-    textPos: polarToFanPoint(VOICE_HOLD_FAN_CENTER_X, VOICE_HOLD_FAN_CENTER_Y, 122, 0),
-  },
-  {
-    zone: 'edit' as const,
-    startDeg: 21,
-    endDeg: 60,
-    pathD: buildVoiceFanSectorPath(VOICE_HOLD_FAN_CENTER_X, VOICE_HOLD_FAN_CENTER_Y, VOICE_HOLD_FAN_INNER_R, VOICE_HOLD_FAN_OUTER_R, 21, 60),
-    iconPos: polarToFanPoint(VOICE_HOLD_FAN_CENTER_X, VOICE_HOLD_FAN_CENTER_Y, 169, 40.5),
-    textPos: polarToFanPoint(VOICE_HOLD_FAN_CENTER_X, VOICE_HOLD_FAN_CENTER_Y, 123, 40.5),
-  },
-] as const;
-
-const VOICE_HOLD_FAN_OUTER_TRACK_D = buildVoiceFanArcPath(VOICE_HOLD_FAN_CENTER_X, VOICE_HOLD_FAN_CENTER_Y, 201, -60, 60);
-const VOICE_HOLD_FAN_INNER_TRACK_D = buildVoiceFanArcPath(VOICE_HOLD_FAN_CENTER_X, VOICE_HOLD_FAN_CENTER_Y, 80, -60, 60);
+const VOICE_HOLD_BAR_COUNT = 28;
 
 function applyComposerVoiceTouchLock(el: HTMLDivElement | null, lockContentEditable: boolean): void {
   if (!el) return;
@@ -1416,7 +1324,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [voiceHoldText, setVoiceHoldText] = useState('');
   const [voiceHoldRecognizing, setVoiceHoldRecognizing] = useState(false);
   const [voiceHoldError, setVoiceHoldError] = useState<string | null>(null);
-  const [voiceHoldBars, setVoiceHoldBars] = useState<number[]>(() => Array(16).fill(0));
+  const [voiceHoldBars, setVoiceHoldBars] = useState<number[]>(() => Array(VOICE_HOLD_BAR_COUNT).fill(0));
   const voiceHoldTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const voiceHoldRecognizingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const voiceHoldPointerRef = useRef<{
@@ -1444,7 +1352,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     startPromise: Promise<boolean> | null;
     drainPromise: Promise<void> | null;
   } | null>(null);
-  const voiceHoldBarsRef = useRef<number[]>(Array(16).fill(0));
+  const voiceHoldBarsRef = useRef<number[]>(Array(VOICE_HOLD_BAR_COUNT).fill(0));
   const voiceHoldTranscriptRef = useRef<HTMLDivElement | null>(null);
   const inputDisabledRef = useRef(false);
   const voiceHoldReadyRef = useRef(false);
@@ -5537,8 +5445,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     // iOS/Android native tap-to-focus and prevents the soft keyboard / IME
     // from opening when tapping the composer. Note that even while an earlier
     // voice hold drain (voiceHoldTxRef.current) is still settling, pointerdown
-    // tracks short taps (<100ms) so tap-to-type is never locked out. If the
-    // press reaches 100ms without an active drain, the timer disables
+    // tracks short taps (<45ms) so tap-to-type is never locked out. If the
+    // press reaches 45ms without an active drain, the timer disables
     // contenteditable and blurs to suppress iOS loupe/keyboard.
     setVoiceHoldError(null);
     const pointerId = event.pointerId ?? 1;
@@ -5600,7 +5508,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       voiceHoldTxRef.current = tx;
       voiceHoldActiveRef.current = true;
       voiceHoldZoneRef.current = 'send';
-      const emptyBars = Array(16).fill(0);
+      const emptyBars = Array(VOICE_HOLD_BAR_COUNT).fill(0);
       voiceHoldBarsRef.current = emptyBars;
       setVoiceHoldBars(emptyBars);
       setVoiceHoldText('');
@@ -8565,8 +8473,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             role="status"
             aria-live="polite"
           >
+            <div class="voice-hold-hud-atmosphere" aria-hidden="true">
+              <div class="voice-hold-hud-aurora" />
+              <div class="voice-hold-hud-aurora-core" />
+            </div>
             <div class="voice-hold-hud-card">
-              <div class="voice-hold-hud-grid" aria-hidden="true" />
+              <div ref={voiceHoldTranscriptRef} class="voice-hold-hud-transcript">
+                {voiceHoldText.trim() ? voiceHoldText : t('voice.buffering_hint')}
+                <VoiceStreamingRobot active={voiceHoldRecognizing} />
+              </div>
               <div class="voice-hold-hud-header">
                 <span class={`voice-hold-hud-recognizing${voiceHoldRecognizing ? ' is-recognizing' : ''}`}>
                   <span
@@ -8578,19 +8493,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                   </span>
                   <span>{voiceHoldRecognizing ? t('voice.recognizing') : t('voice.listening')}</span>
                 </span>
-                <div class="voice-hold-hud-waveform" aria-hidden="true">
-                  {voiceHoldBars.map((level, idx) => (
-                    <span
-                      key={idx}
-                      class="voice-hold-hud-bar"
-                      style={{ height: `${Math.round(4 + level * 20)}px`, opacity: 0.35 + level * 0.65 }}
-                    />
-                  ))}
-                </div>
-              </div>
-              <div ref={voiceHoldTranscriptRef} class="voice-hold-hud-transcript">
-                {voiceHoldText.trim() ? voiceHoldText : t('voice.buffering_hint')}
-                <VoiceStreamingRobot active={voiceHoldRecognizing} />
               </div>
               <div class={`voice-hold-hud-active-hint is-${voiceHoldZone}`}>
                 {voiceHoldZone === 'cancel'
@@ -8599,127 +8501,91 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                     ? t('voice.release_to_edit')
                     : t('voice.release_to_send')}
               </div>
+              <div class="voice-hold-hud-waveform" aria-hidden="true">
+                {voiceHoldBars.map((level, idx) => {
+                  const centerNorm = 1 - Math.abs((idx / Math.max(1, voiceHoldBars.length - 1)) * 2 - 1);
+                  const envelope = 0.38 + 0.62 * Math.sin((centerNorm * Math.PI) / 2);
+                  return (
+                    <span
+                      key={idx}
+                      class="voice-hold-hud-bar"
+                      style={{
+                        height: `${Math.round(5 + level * 22 * envelope)}px`,
+                        opacity: 0.45 + level * 0.55,
+                      }}
+                    />
+                  );
+                })}
+              </div>
               <div class="voice-hold-hud-zones">
-                <svg
-                  class="voice-hold-fan-svg"
-                  viewBox="0 0 360 166"
-                  aria-hidden="true"
-                >
-                  <defs>
-                    <radialGradient id="voice-fan-grad-cancel" cx="32%" cy="35%" r="75%">
-                      <stop offset="0%" stop-color="#f87171" stop-opacity="0.96" />
-                      <stop offset="100%" stop-color="#dc2626" stop-opacity="0.92" />
-                    </radialGradient>
-                    <radialGradient id="voice-fan-grad-send" cx="50%" cy="22%" r="78%">
-                      <stop offset="0%" stop-color="#67e8f9" stop-opacity="0.98" />
-                      <stop offset="65%" stop-color="#22d3ee" stop-opacity="0.95" />
-                      <stop offset="100%" stop-color="#0891b2" stop-opacity="0.96" />
-                    </radialGradient>
-                    <radialGradient id="voice-fan-grad-edit" cx="68%" cy="35%" r="75%">
-                      <stop offset="0%" stop-color="#60a5fa" stop-opacity="0.96" />
-                      <stop offset="100%" stop-color="#2563eb" stop-opacity="0.92" />
-                    </radialGradient>
-                  </defs>
-                  <path class="voice-hold-fan-track" d={VOICE_HOLD_FAN_OUTER_TRACK_D} />
-                  <path class="voice-hold-fan-track voice-hold-fan-track-inner" d={VOICE_HOLD_FAN_INNER_TRACK_D} />
-                  {VOICE_HOLD_FAN_SECTORS.map((sector) => {
-                    const isActive = voiceHoldZone === sector.zone;
-                    const label = sector.zone === 'cancel'
-                      ? t('voice.slide_left_cancel')
-                      : sector.zone === 'edit'
-                        ? t('voice.slide_right_edit')
-                        : t('voice.release_to_send');
-                    const lines = splitVoiceFanLabel(label);
-                    const [ix, iy] = sector.iconPos;
-                    const [tx, ty] = sector.textPos;
-                    return (
-                      <g
-                        key={sector.zone}
-                        class={`voice-hold-zone voice-hold-zone-${sector.zone}${isActive ? ' is-active' : ''}`}
-                        data-zone-target={sector.zone}
-                      >
-                        <path
-                          class="voice-hold-fan-sector"
-                          d={sector.pathD}
-                          data-fan-sector={sector.zone}
-                        />
-                        {sector.zone === 'cancel' && (
-                          <svg
-                            class="voice-hold-zone-arrow"
-                            x={ix - 10}
-                            y={iy - 10}
-                            width="20"
-                            height="20"
-                            viewBox="0 0 24 24"
-                            fill="none"
-                            stroke="currentColor"
-                            stroke-width="2.4"
-                            stroke-linecap="round"
-                            stroke-linejoin="round"
-                            aria-hidden="true"
-                          >
-                            <path d="M19 12H5" />
-                            <path d="M12 19l-7-7 7-7" />
-                          </svg>
-                        )}
-                        {sector.zone === 'send' && (
-                          <svg
-                            class="voice-hold-zone-arrow voice-hold-zone-send-icon"
-                            x={ix - 10}
-                            y={iy - 10}
-                            width="20"
-                            height="20"
-                            viewBox="0 0 24 24"
-                            fill="none"
-                            stroke="currentColor"
-                            stroke-width="2.2"
-                            stroke-linecap="round"
-                            stroke-linejoin="round"
-                            aria-hidden="true"
-                          >
-                            <path d="M12 19V5" />
-                            <path d="M5 12l7-7 7 7" />
-                          </svg>
-                        )}
-                        {sector.zone === 'edit' && (
-                          <svg
-                            class="voice-hold-zone-arrow"
-                            x={ix - 10}
-                            y={iy - 10}
-                            width="20"
-                            height="20"
-                            viewBox="0 0 24 24"
-                            fill="none"
-                            stroke="currentColor"
-                            stroke-width="2.4"
-                            stroke-linecap="round"
-                            stroke-linejoin="round"
-                            aria-hidden="true"
-                          >
-                            <path d="M5 12h14" />
-                            <path d="M12 5l7 7-7 7" />
-                          </svg>
-                        )}
-                        <text
-                          class="voice-hold-zone-label"
-                          x={tx}
-                          y={ty}
-                          text-anchor="middle"
-                          dominant-baseline="central"
+                {(['cancel', 'send', 'edit'] as const).map((zone) => {
+                  const isActive = voiceHoldZone === zone;
+                  const label = zone === 'cancel'
+                    ? t('voice.slide_left_cancel')
+                    : zone === 'edit'
+                      ? t('voice.slide_right_edit')
+                      : t('voice.release_to_send');
+                  return (
+                    <div
+                      key={zone}
+                      class={`voice-hold-zone voice-hold-zone-${zone}${isActive ? ' is-active' : ''}`}
+                      data-zone-target={zone}
+                    >
+                      {zone === 'cancel' && (
+                        <svg
+                          class="voice-hold-zone-arrow"
+                          width="14"
+                          height="14"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="2.2"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                          aria-hidden="true"
                         >
-                          {lines.length === 1 ? (
-                            <tspan x={tx} y={ty}>{lines[0]}</tspan>
-                          ) : (
-                            <>
-                              <tspan x={tx} y={ty - 6}>{lines[0]}</tspan>
-                              <tspan x={tx} y={ty + 8}>{lines[1]}</tspan>
-                            </>
-                          )}
-                        </text>
-                      </g>
-                    );
-                  })}
-                </svg>
+                          <path d="M19 12H5" />
+                          <path d="M12 19l-7-7 7-7" />
+                        </svg>
+                      )}
+                      {zone === 'send' && (
+                        <svg
+                          class="voice-hold-zone-arrow voice-hold-zone-send-icon"
+                          width="14"
+                          height="14"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="2.1"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                          aria-hidden="true"
+                        >
+                          <path d="M12 19V5" />
+                          <path d="M5 12l7-7 7 7" />
+                        </svg>
+                      )}
+                      <span class="voice-hold-zone-label">{label}</span>
+                      {zone === 'edit' && (
+                        <svg
+                          class="voice-hold-zone-arrow"
+                          width="14"
+                          height="14"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="2.2"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                          aria-hidden="true"
+                        >
+                          <path d="M5 12h14" />
+                          <path d="M12 5l7 7-7 7" />
+                        </svg>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             </div>
           </div>,

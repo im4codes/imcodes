@@ -171,7 +171,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     document.body.innerHTML = '';
   });
 
-  it('short tap (<100ms) focuses composer input for keyboard typing without starting voice recording', async () => {
+  it('short tap (<45ms) focuses composer input for keyboard typing without starting voice recording', async () => {
     const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
     render(
       <SessionControls
@@ -196,7 +196,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(input.style.userSelect).toBe('none');
     expect(input.getAttribute('contenteditable')).toBe('false');
 
-    await vi.advanceTimersByTimeAsync(50);
+    await vi.advanceTimersByTimeAsync(25);
     dispatchPointer(input, 'pointerup', 180);
 
     expect(voiceMock.startListening).not.toHaveBeenCalled();
@@ -234,7 +234,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     Object.assign(down, { clientX: 180, clientY: 500, pointerId: 1, button: 0, pointerType: 'touch' });
     fireEvent(input, down);
 
-    await vi.advanceTimersByTimeAsync(50);
+    await vi.advanceTimersByTimeAsync(25);
 
     const up = new Event('pointerup', { bubbles: true, cancelable: true });
     Object.assign(up, { clientX: 180, clientY: 500, pointerId: 1, button: 0, pointerType: 'touch' });
@@ -251,7 +251,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     const secondDown = new Event('pointerdown', { bubbles: true, cancelable: true });
     Object.assign(secondDown, { clientX: 180, clientY: 500, pointerId: 2, button: 0, pointerType: 'touch' });
     fireEvent(input, secondDown);
-    await vi.advanceTimersByTimeAsync(50);
+    await vi.advanceTimersByTimeAsync(25);
     input.blur();
     const secondUp = new Event('pointerup', { bubbles: true, cancelable: true });
     Object.assign(secondUp, { clientX: 180, clientY: 500, pointerId: 2, button: 0, pointerType: 'touch' });
@@ -265,7 +265,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(genuineMouseDown.defaultPrevented).toBe(false);
   });
 
-  it('holds 100ms -> vibrates & suppresses iOS loupe/keyboard -> shows 3-sector circular arc fan HUD with SVG arrows -> releases in center to auto-send', async () => {
+  it('holds 45ms -> vibrates & suppresses iOS loupe/keyboard -> shows borderless diffused aurora HUD with 28 waveform capsules -> releases in center to auto-send', async () => {
     const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
     render(
       <SessionControls
@@ -282,13 +282,13 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     const composer = document.querySelector('.controls-composer') as HTMLElement;
     dispatchPointer(input, 'pointerdown', 180);
 
-    // Not triggered at 99ms; still pending with selection/callout lock
-    await vi.advanceTimersByTimeAsync(99);
+    // Not triggered at 44ms; still pending with selection/callout lock
+    await vi.advanceTimersByTimeAsync(44);
     expect(voiceMock.startListening).not.toHaveBeenCalled();
     expect(composer.classList.contains('controls-composer-voice-pending')).toBe(true);
     expect(composer.classList.contains('controls-composer-voice-holding')).toBe(false);
 
-    // Triggers exactly at 100ms (+1ms)
+    // Triggers exactly at 45ms (+1ms)
     await vi.advanceTimersByTimeAsync(1);
 
     expect(vibrate).toHaveBeenCalledWith(20);
@@ -298,25 +298,24 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(composer.classList.contains('controls-composer-voice-holding')).toBe(true);
     expect(input.getAttribute('contenteditable')).toBe('false');
 
-    // HUD shows true 3-sector circular arc fan SVG with outer & inner A-arcs, status dot, and SVG arrows
+    // HUD shows borderless diffused atmosphere + aurora layers + 28 waveform capsules + 3 borderless zone cues (no SVG fan boxes)
     const hud = document.querySelector('.voice-hold-hud') as HTMLElement;
     expect(hud).not.toBeNull();
     expect(hud.getAttribute('data-zone')).toBe('send');
     expect(hud.style.getPropertyValue('--voice-slide-x')).toBe('0px');
-    expect(hud.querySelector('.voice-hold-hud-grid')).not.toBeNull();
+    expect(hud.querySelector('.voice-hold-hud-atmosphere')).not.toBeNull();
+    expect(hud.querySelector('.voice-hold-hud-aurora')).not.toBeNull();
+    expect(hud.querySelector('.voice-hold-hud-aurora-core')).not.toBeNull();
+    expect(hud.querySelector('.voice-hold-hud-grid')).toBeNull();
+    expect(hud.querySelector('.voice-hold-fan-svg')).toBeNull();
+    expect(hud.querySelector('.voice-hold-fan-sector')).toBeNull();
     expect(hud.querySelector('.voice-status-dot.voice-status-dot-active')).not.toBeNull();
-    const fanSvg = hud.querySelector('.voice-hold-hud-zones svg.voice-hold-fan-svg');
-    expect(fanSvg).not.toBeNull();
-    const sectorPaths = Array.from(fanSvg!.querySelectorAll('path.voice-hold-fan-sector'));
-    expect(sectorPaths).toHaveLength(3);
-    for (const p of sectorPaths) {
-      const d = p.getAttribute('d') ?? '';
-      expect(d).toContain('A 196 196');
-      expect(d).toContain('A 88 88');
-      expect(d.endsWith('Z')).toBe(true);
-    }
+    expect(hud.querySelectorAll('.voice-hold-hud-waveform .voice-hold-hud-bar')).toHaveLength(28);
+    expect(hud.querySelectorAll('.voice-hold-hud-zones [data-zone-target]')).toHaveLength(3);
     expect(hud.querySelector('.voice-hold-zone-cancel svg')).not.toBeNull();
+    expect(hud.querySelector('.voice-hold-zone-send svg')).not.toBeNull();
     expect(hud.querySelector('.voice-hold-zone-edit svg')).not.toBeNull();
+    expect(hud.querySelector('.voice-hold-zone-send.is-active')).not.toBeNull();
     expect(hud.textContent).toContain('voice.slide_left_cancel');
     expect(hud.textContent).toContain('voice.release_to_send');
     expect(hud.textContent).toContain('voice.slide_right_edit');
@@ -756,7 +755,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       expect(fireEvent(input, pendingSelect)).toBe(false);
       expect(fireEvent(input, pendingMenu)).toBe(false);
 
-      await vi.advanceTimersByTimeAsync(50);
+      await vi.advanceTimersByTimeAsync(25);
       dispatchPointer(input, 'pointerup', 180);
       await vi.advanceTimersByTimeAsync(0);
       expect(input.getAttribute('contenteditable')).toBe('true');
@@ -981,44 +980,22 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       code,
       json: JSON.parse(readFileSync(resolve(localesDir, `${code}.json`), 'utf8')) as { voice: Record<string, string> },
     }));
-    const barsHtml = Array.from({ length: 16 }, () => '<span class="voice-hold-hud-bar" style="height: 16px; opacity: 0.8"></span>').join('');
+    const barsHtml = Array.from({ length: 28 }, () => '<span class="voice-hold-hud-bar" style="height: 16px; opacity: 0.8"></span>').join('');
     const longText = Array.from({ length: 40 }, (_, i) => `Line ${i + 1}: holding to dictate long technical text across multiple lines on iOS mobile viewport.`).join('\n');
 
-    const fanSvgHtml = `
-      <svg class="voice-hold-fan-svg" viewBox="0 0 360 166" aria-hidden="true">
-        <defs>
-          <radialGradient id="voice-fan-grad-cancel" cx="32%" cy="35%" r="75%">
-            <stop offset="0%" stop-color="#f87171" stop-opacity="0.96" />
-            <stop offset="100%" stop-color="#dc2626" stop-opacity="0.92" />
-          </radialGradient>
-          <radialGradient id="voice-fan-grad-send" cx="50%" cy="22%" r="78%">
-            <stop offset="0%" stop-color="#67e8f9" stop-opacity="0.98" />
-            <stop offset="65%" stop-color="#22d3ee" stop-opacity="0.95" />
-            <stop offset="100%" stop-color="#0891b2" stop-opacity="0.96" />
-          </radialGradient>
-          <radialGradient id="voice-fan-grad-edit" cx="68%" cy="35%" r="75%">
-            <stop offset="0%" stop-color="#60a5fa" stop-opacity="0.96" />
-            <stop offset="100%" stop-color="#2563eb" stop-opacity="0.92" />
-          </radialGradient>
-        </defs>
-        <path class="voice-hold-fan-track" d="M 5.93 103.5 A 201 201 0 0 1 354.07 103.5" />
-        <path class="voice-hold-fan-track voice-hold-fan-track-inner" d="M 110.72 164 A 80 80 0 0 1 249.28 164" />
-        <g class="voice-hold-zone voice-hold-zone-cancel" data-zone-target="cancel">
-          <path class="voice-hold-fan-sector" d="M 10.26 106 A 196 196 0 0 1 109.76 21.02 L 148.46 121.85 A 88 88 0 0 0 103.79 160 Z" data-fan-sector="cancel" />
-          <svg class="voice-hold-zone-arrow" x="60.24" y="65.49" width="20" height="20" viewBox="0 0 24 24"><path d="M19 12H5" /></svg>
-          <text class="voice-hold-zone-label" x="100.12" y="110.47" text-anchor="middle" dominant-baseline="central"><tspan class="test-cancel-label" x="100.12" y="110.47">Cancel</tspan></text>
-        </g>
-        <g class="voice-hold-zone voice-hold-zone-send is-active" data-zone-target="send">
-          <path class="voice-hold-fan-sector" d="M 116.19 18.67 A 196 196 0 0 1 243.81 18.67 L 208.65 120.8 A 88 88 0 0 0 151.35 120.8 Z" data-fan-sector="send" />
-          <svg class="voice-hold-zone-arrow voice-hold-zone-send-icon" x="170" y="26" width="20" height="20" viewBox="0 0 24 24"><path d="M12 19V5" /></svg>
-          <text class="voice-hold-zone-label" x="180" y="82" text-anchor="middle" dominant-baseline="central"><tspan class="test-send-label" x="180" y="82">Send</tspan></text>
-        </g>
-        <g class="voice-hold-zone voice-hold-zone-edit" data-zone-target="edit">
-          <path class="voice-hold-fan-sector" d="M 250.24 21.02 A 196 196 0 0 1 349.74 106 L 256.21 160 A 88 88 0 0 0 211.54 121.85 Z" data-fan-sector="edit" />
-          <svg class="voice-hold-zone-arrow" x="279.76" y="65.49" width="20" height="20" viewBox="0 0 24 24"><path d="M5 12h14" /></svg>
-          <text class="voice-hold-zone-label" x="259.88" y="110.47" text-anchor="middle" dominant-baseline="central"><tspan class="test-edit-label" x="259.88" y="110.47">Edit</tspan></text>
-        </g>
-      </svg>`;
+    const zonesHtml = `
+      <div class="voice-hold-zone voice-hold-zone-cancel" data-zone-target="cancel">
+        <svg class="voice-hold-zone-arrow" width="14" height="14" viewBox="0 0 24 24"><path d="M19 12H5" /></svg>
+        <span class="voice-hold-zone-label test-cancel-label">Cancel</span>
+      </div>
+      <div class="voice-hold-zone voice-hold-zone-send is-active" data-zone-target="send">
+        <svg class="voice-hold-zone-arrow voice-hold-zone-send-icon" width="14" height="14" viewBox="0 0 24 24"><path d="M12 19V5" /></svg>
+        <span class="voice-hold-zone-label test-send-label">Send</span>
+      </div>
+      <div class="voice-hold-zone voice-hold-zone-edit" data-zone-target="edit">
+        <span class="voice-hold-zone-label test-edit-label">Edit</span>
+        <svg class="voice-hold-zone-arrow" width="14" height="14" viewBox="0 0 24 24"><path d="M5 12h14" /></svg>
+      </div>`;
 
     const browser = await browserType.launch({ headless: true });
     try {
@@ -1035,28 +1012,32 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
             </div>
             <div class="voice-overlay" style="display:none"></div>
             <button class="btn-voice btn-voice-active"></button>
-            <div class="voice-hold-hud voice-hold-hud-zone-send">
+            <div class="voice-hold-hud voice-hold-hud-zone-send" style="--voice-slide-x:0px;">
+              <div class="voice-hold-hud-atmosphere">
+                <div class="voice-hold-hud-aurora"></div>
+                <div class="voice-hold-hud-aurora-core"></div>
+              </div>
               <div class="voice-hold-hud-card">
-                <div class="voice-hold-hud-grid"></div>
+                <div class="voice-hold-hud-transcript">Hello<span class="voice-streaming-robot-cursor is-active"><svg><circle class="voice-robot-antenna"></circle></svg></span></div>
                 <div class="voice-hold-hud-header">
                   <span class="voice-hold-hud-recognizing is-recognizing">
                     <span class="voice-status-dot voice-status-dot-active voice-status-dot-recognizing"></span>
                     <span class="voice-recognizing-dots"><i></i><i></i><i></i></span>
                     <span>Listening</span>
                   </span>
-                  <div class="voice-hold-hud-waveform">${barsHtml}</div>
                 </div>
-                <div class="voice-hold-hud-transcript">Hello<span class="voice-streaming-robot-cursor is-active"><svg><circle class="voice-robot-antenna"></circle></svg></span></div>
                 <div class="voice-hold-hud-active-hint is-send">Hint</div>
-                <div class="voice-hold-hud-zones">${fanSvgHtml}</div>
+                <div class="voice-hold-hud-waveform">${barsHtml}</div>
+                <div class="voice-hold-hud-zones">${zonesHtml}</div>
               </div>
             </div>
           </body></html>`);
 
           for (const zone of ['send', 'cancel', 'edit'] as const) {
             const computed = await page.evaluate((z) => {
-              const hud = document.querySelector('.voice-hold-hud')!;
+              const hud = document.querySelector('.voice-hold-hud') as HTMLElement;
               hud.className = `voice-hold-hud voice-hold-hud-zone-${z}`;
+              hud.style.setProperty('--voice-slide-x', z === 'cancel' ? '-52px' : z === 'edit' ? '52px' : '0px');
               const hint = document.querySelector('.voice-hold-hud-active-hint')!;
               hint.className = `voice-hold-hud-active-hint is-${z}`;
               for (const k of ['cancel', 'send', 'edit']) {
@@ -1067,16 +1048,27 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
                 composerReadyAfter: gs('.controls-composer-voice-ready', '::after').animationName,
                 composerInput: gs('.controls-composer-voice-holding .controls-input').animationName,
                 btnVoiceActive: gs('.btn-voice-active').animationName,
-                hudCardBefore: gs('.voice-hold-hud-card', '::before').animationName,
-                hudGrid: gs('.voice-hold-hud-grid').animationName,
+                hudAurora: gs('.voice-hold-hud-aurora').animationName,
+                hudAuroraCore: gs('.voice-hold-hud-aurora-core').animationName,
                 dotActive: gs('.voice-status-dot-active').animationName,
                 recDot: gs('.voice-recognizing-dots i').animationName,
                 robotCursor: gs('.voice-streaming-robot-cursor.is-active').animationName,
                 robotAntenna: gs('.voice-robot-antenna').animationName,
+                atmosphereTrans: gs('.voice-hold-hud-atmosphere').transitionProperty,
+                auroraTrans: gs('.voice-hold-hud-aurora').transitionProperty,
+                auroraCoreTrans: gs('.voice-hold-hud-aurora-core').transitionProperty,
+                barTrans: gs('.voice-hold-hud-bar').transitionProperty,
                 dotTrans: gs('.voice-status-dot').transitionProperty,
                 hintTrans: gs('.voice-hold-hud-active-hint').transitionProperty,
                 zoneTrans: gs('.voice-hold-zone').transitionProperty,
-                sectorTrans: gs('.voice-hold-fan-sector').transitionProperty,
+                atmosphereBlur: gs('.voice-hold-hud-atmosphere').backdropFilter,
+                atmosphereMask: gs('.voice-hold-hud-atmosphere').maskImage || gs('.voice-hold-hud-atmosphere').webkitMaskImage,
+                auroraFilter: gs('.voice-hold-hud-aurora').filter,
+                cardBorderTopStyle: gs('.voice-hold-hud-card').borderTopStyle,
+                cardBorderTopWidth: gs('.voice-hold-hud-card').borderTopWidth,
+                transcriptBorderTopStyle: gs('.voice-hold-hud-transcript').borderTopStyle,
+                hintBorderTopStyle: gs('.voice-hold-hud-active-hint').borderTopStyle,
+                zoneBorderTopStyle: gs(`.voice-hold-zone-${z}`).borderTopStyle,
                 trailing2PaddingRight: gs('.controls-input-with-trailing-2').paddingRight,
                 trailing1PaddingRight: gs('.test-idle-input').paddingRight,
                 idleTouchAction: gs('.test-idle-input').touchAction,
@@ -1092,26 +1084,37 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
             expect(computed.idleUserSelect).toBe('none');
             expect(computed.overlayBorderRadius).toBe('0px');
             expect(computed.overlayZIndex).toBe('2147483021');
+            expect(computed.atmosphereBlur).toContain('blur(');
+            expect(computed.atmosphereMask).toContain('linear-gradient');
+            expect(computed.auroraFilter).toContain('blur(');
+            expect(computed.cardBorderTopStyle).toBe('none');
+            expect(computed.cardBorderTopWidth).toBe('0px');
+            expect(computed.transcriptBorderTopStyle).toBe('none');
+            expect(computed.hintBorderTopStyle).toBe('none');
+            expect(computed.zoneBorderTopStyle).toBe('none');
 
             if (reducedMotion === 'reduce') {
               expect(computed.composerReadyAfter).toBe('none');
               expect(computed.composerInput).toBe('none');
               expect(computed.btnVoiceActive).toBe('none');
-              expect(computed.hudCardBefore).toBe('none');
-              expect(computed.hudGrid).toBe('none');
+              expect(computed.hudAurora).toBe('none');
+              expect(computed.hudAuroraCore).toBe('none');
               expect(computed.dotActive).toBe('none');
               expect(computed.recDot).toBe('none');
               expect(computed.robotCursor).toBe('none');
               expect(computed.robotAntenna).toBe('none');
+              expect(computed.atmosphereTrans).toBe('none');
+              expect(computed.auroraTrans).toBe('none');
+              expect(computed.auroraCoreTrans).toBe('none');
+              expect(computed.barTrans).toBe('none');
               expect(computed.dotTrans).toBe('none');
               expect(computed.hintTrans).toBe('none');
               expect(computed.zoneTrans).toBe('none');
-              expect(computed.sectorTrans).toBe('none');
             } else {
               expect(computed.composerReadyAfter).toBe('voice-editor-orbit');
               expect(computed.composerInput).toBe('voice-composer-energy-pulse');
-              expect(computed.hudCardBefore).toBe('voice-editor-orbit');
-              expect(computed.hudGrid).toBe('voice-grid-scroll');
+              expect(computed.hudAurora).toBe('voice-aurora-drift');
+              expect(computed.hudAuroraCore).toBe('voice-aurora-pulse');
               expect(computed.dotActive).toBe('voice-dot-pulse');
               expect(computed.recDot).toBe('voice-recognizing-bounce');
               expect(computed.robotCursor).toBe('voice-robot-bob');
@@ -1139,19 +1142,22 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
               </div>
             </div>
             <div class="voice-hold-hud voice-hold-hud-zone-send">
+              <div class="voice-hold-hud-atmosphere">
+                <div class="voice-hold-hud-aurora"></div>
+                <div class="voice-hold-hud-aurora-core"></div>
+              </div>
               <div class="voice-hold-hud-card">
-                <div class="voice-hold-hud-grid"></div>
+                <div class="voice-hold-hud-transcript"></div>
                 <div class="voice-hold-hud-header">
                   <span class="voice-hold-hud-recognizing is-recognizing">
                     <span class="voice-status-dot voice-status-dot-active voice-status-dot-recognizing"></span>
                     <span class="voice-recognizing-dots"><i></i><i></i><i></i></span>
                     <span class="test-rec-label"></span>
                   </span>
-                  <div class="voice-hold-hud-waveform">${barsHtml}</div>
                 </div>
-                <div class="voice-hold-hud-transcript"></div>
                 <div class="voice-hold-hud-active-hint is-send"></div>
-                <div class="voice-hold-hud-zones">${fanSvgHtml}</div>
+                <div class="voice-hold-hud-waveform">${barsHtml}</div>
+                <div class="voice-hold-hud-zones">${zonesHtml}</div>
               </div>
             </div>
           </body></html>`);
@@ -1178,55 +1184,38 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
                   }
                   const r = (sel: string) => document.querySelector(sel)!.getBoundingClientRect();
                   const card = r('.voice-hold-hud-card');
+                  const atmosphere = r('.voice-hold-hud-atmosphere');
                   const header = r('.voice-hold-hud-header');
                   const transcript = r('.voice-hold-hud-transcript');
                   const hint = r('.voice-hold-hud-active-hint');
                   const zones = r('.voice-hold-hud-zones');
-                  const fanSvg = r('.voice-hold-fan-svg');
-                  const cancelSector = r('path[data-fan-sector="cancel"]');
-                  const sendSector = r('path[data-fan-sector="send"]');
-                  const editSector = r('path[data-fan-sector="edit"]');
-                  const cancelCenterX = cancelSector.left + cancelSector.width / 2;
-                  const sendCenterX = sendSector.left + sendSector.width / 2;
-                  const editCenterX = editSector.left + editSector.width / 2;
-                  const hitTestSector = (x: number, y: number) => {
-                    const el = document.elementFromPoint(x, y);
-                    return el?.closest('[data-zone-target]')?.getAttribute('data-zone-target') ?? null;
-                  };
-                  const svgRect = fanSvg;
-                  const scaleX = svgRect.width / 360;
-                  const scaleY = svgRect.height / 166;
-                  const sectorPaths = Array.from(document.querySelectorAll('path.voice-hold-fan-sector')).map((el) => el.getAttribute('d') ?? '');
+                  const cancelCue = r('[data-zone-target="cancel"]');
+                  const sendCue = r('[data-zone-target="send"]');
+                  const editCue = r('[data-zone-target="edit"]');
+                  const cancelCenterX = cancelCue.left + cancelCue.width / 2;
+                  const sendCenterX = sendCue.left + sendCue.width / 2;
+                  const editCenterX = editCue.left + editCue.width / 2;
                   const strip = r('.session-live-status-inline');
                   const stripMidX = strip.left + strip.width / 2;
                   const stripMidY = strip.top + strip.height / 2;
                   const prevPe = (hudEl as HTMLElement).style.pointerEvents;
                   (hudEl as HTMLElement).style.pointerEvents = 'auto';
                   const topAtStrip = document.elementFromPoint(stripMidX, stripMidY);
-                  const cancelHit = hitTestSector(svgRect.left + 84.5 * scaleX, svgRect.top + 88 * scaleY);
-                  const sendHit = hitTestSector(svgRect.left + 180 * scaleX, svgRect.top + 68 * scaleY);
-                  const editHit = hitTestSector(svgRect.left + 275.5 * scaleX, svgRect.top + 88 * scaleY);
                   (hudEl as HTMLElement).style.pointerEvents = prevPe;
                   return {
                     hudZ: getComputedStyle(hudEl).zIndex,
+                    atmosphereBottom: Math.round(atmosphere.bottom),
                     cardTop: Math.round(card.top),
                     cardBottom: Math.round(card.bottom),
                     cardLeft: Math.round(card.left),
                     cardRight: Math.round(card.right),
                     headerTop: Math.round(header.top),
                     zonesBottom: Math.round(zones.bottom),
-                    fanSvgWidth: Math.round(fanSvg.width),
-                    fanSvgHeight: Math.round(fanSvg.height),
                     cancelCenterX,
                     sendCenterX,
                     editCenterX,
-                    cancelLeft: cancelSector.left,
-                    editRight: editSector.right,
-                    cancelHit,
-                    sendHit,
-                    editHit,
-                    sectorPathCount: sectorPaths.length,
-                    allArcPathsValid: sectorPaths.every((d) => d.includes('A 196 196') && d.includes('A 88 88') && d.endsWith('Z')),
+                    cancelLeft: cancelCue.left,
+                    editRight: editCue.right,
                     hintBottom: Math.round(hint.bottom),
                     transcriptH: Math.round(transcript.height),
                     transcriptScrollH: trEl.scrollHeight,
@@ -1246,27 +1235,21 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
 
                 expect(m.hudZ, `${code}/${zone}/${mode} z-index`).toBe('2147483022');
                 expect(m.hudCoversStrip, `${code}/${zone}/${mode} covered by live strip`).toBe(true);
-                expect(m.cardTop, `${code}/${zone}/${mode} cardTop`).toBeGreaterThanOrEqual(15 + vp.sat);
-                expect(m.cardBottom, `${code}/${zone}/${mode} cardBottom`).toBeLessThanOrEqual(vp.height - 67 - vp.sab);
+                expect(m.atmosphereBottom, `${code}/${zone}/${mode} atmosphereBottom`).toBe(vp.height);
+                expect(m.cardTop, `${code}/${zone}/${mode} cardTop`).toBeGreaterThanOrEqual(11 + vp.sat);
+                expect(m.cardBottom, `${code}/${zone}/${mode} cardBottom`).toBeLessThanOrEqual(vp.height);
                 expect(m.headerTop, `${code}/${zone}/${mode} headerTop`).toBeGreaterThanOrEqual(m.cardTop);
-                expect(m.zonesBottom, `${code}/${zone}/${mode} zonesBottom`).toBeLessThanOrEqual(m.cardBottom);
+                expect(m.zonesBottom, `${code}/${zone}/${mode} zonesBottom`).toBeLessThanOrEqual(vp.height - 20 - vp.sab);
                 expect(m.hintBottom, `${code}/${zone}/${mode} hintBottom`).toBeLessThanOrEqual(m.cardBottom);
                 expect(m.scrollOverflow, `${code}/${zone}/${mode} overflow`).toBe(false);
-                expect(m.sectorPathCount).toBe(3);
-                expect(m.allArcPathsValid).toBe(true);
-                expect(m.fanSvgWidth).toBeGreaterThan(0);
-                expect(m.fanSvgHeight).toBeGreaterThan(0);
                 expect(m.cancelCenterX).toBeLessThan(m.sendCenterX);
                 expect(m.sendCenterX).toBeLessThan(m.editCenterX);
-                expect(m.cancelHit).toBe('cancel');
-                expect(m.sendHit).toBe('send');
-                expect(m.editHit).toBe('edit');
                 expect(m.cancelLeft).toBeGreaterThanOrEqual(m.cardLeft);
                 expect(m.editRight).toBeLessThanOrEqual(m.cardRight);
                 if (mode === 'long') {
                   expect(m.transcriptScrollH, `${code}/${zone}/long scrollable`).toBeGreaterThan(m.transcriptClientH);
                 } else {
-                  expect(m.transcriptH, `${code}/${zone}/short transcriptH`).toBeGreaterThanOrEqual(88);
+                  expect(m.transcriptH, `${code}/${zone}/short transcriptH`).toBeGreaterThanOrEqual(32);
                 }
               }
             }
@@ -1470,7 +1453,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
 
     // 5. Short tap still restores contenteditable="true" + focus after round trip
     dispatchPointer(input, 'pointerdown', 180);
-    await vi.advanceTimersByTimeAsync(50);
+    await vi.advanceTimersByTimeAsync(25);
     dispatchPointer(input, 'pointerup', 180);
     await vi.advanceTimersByTimeAsync(0);
     expect(input.getAttribute('contenteditable')).toBe('true');
@@ -1516,9 +1499,9 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     dispatchPointer(input, 'pointerup', 110);
     await vi.advanceTimersByTimeAsync(0);
 
-    // 3. Immediately short-tap (<100ms) -> restores contenteditable="true", focuses, and typing works cleanly
+    // 3. Immediately short-tap (<45ms) -> restores contenteditable="true", focuses, and typing works cleanly
     dispatchPointer(input, 'pointerdown', 180);
-    await vi.advanceTimersByTimeAsync(45);
+    await vi.advanceTimersByTimeAsync(25);
     dispatchPointer(input, 'pointerup', 180);
     await vi.advanceTimersByTimeAsync(0);
     expect(input.getAttribute('contenteditable')).toBe('true');
@@ -1564,9 +1547,9 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     dispatchPointer(input, 'pointerup', 180);
     await vi.advanceTimersByTimeAsync(0);
 
-    // While send drain is still running: short tap (<100ms) immediately enters typing mode
+    // While send drain is still running: short tap (<45ms) immediately enters typing mode
     dispatchPointer(input, 'pointerdown', 180);
-    await vi.advanceTimersByTimeAsync(40);
+    await vi.advanceTimersByTimeAsync(25);
     dispatchPointer(input, 'pointerup', 180);
     await vi.advanceTimersByTimeAsync(0);
     expect(input.getAttribute('contenteditable')).toBe('true');
@@ -1617,9 +1600,9 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     dispatchPointer(input, 'pointerup', 180, 500, 2);
     expect(voiceMock.startListening).toHaveBeenCalledTimes(1);
 
-    // Short tap (<100ms) while drain is still active MUST still enter editable focus cleanly
+    // Short tap (<45ms) while drain is still active MUST still enter editable focus cleanly
     dispatchPointer(input, 'pointerdown', 180, 500, 3);
-    await vi.advanceTimersByTimeAsync(45);
+    await vi.advanceTimersByTimeAsync(25);
     dispatchPointer(input, 'pointerup', 180, 500, 3);
     await vi.advanceTimersByTimeAsync(0);
     expect(input.getAttribute('contenteditable')).toBe('true');
@@ -1700,12 +1683,12 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(input.getAttribute('contenteditable')).toBe('false');
 
-    // 5. setPointerCapture failure + swallowed pending pointerup (<100ms) -> new primary tap still enters typing cleanly
+    // 5. setPointerCapture failure + swallowed pending pointerup (<45ms) -> new primary tap still enters typing cleanly
     (input as any).setPointerCapture = () => { throw new Error('capture failed'); };
     dispatchPointer(input, 'pointerdown', 180, 500, 4);
-    await vi.advanceTimersByTimeAsync(30); // no pointerup!
+    await vi.advanceTimersByTimeAsync(20); // no pointerup!
     dispatchPointer(input, 'pointerdown', 180, 500, 4);
-    await vi.advanceTimersByTimeAsync(45);
+    await vi.advanceTimersByTimeAsync(25);
     dispatchPointer(input, 'pointerup', 180, 500, 4);
     await vi.advanceTimersByTimeAsync(0);
     expect(input.getAttribute('contenteditable')).toBe('true');
