@@ -184,6 +184,8 @@ import { FeatureAnnouncementHost } from './components/FeatureAnnouncement.js';
 import { DownloadTransferCenter } from './components/DownloadTransferCenter.js';
 import { mergeUsageUpdate } from './usage-data.js';
 import { ServerIconBar } from './components/ServerIconBar.js';
+import { PushStatusBadge } from './components/PushStatusBadge.js';
+import { NewDevicePushPrompt, type NewDevicePushPromptServer } from './components/NewDevicePushPrompt.js';
 import { Sidebar, loadSidebarCollapsed, saveSidebarCollapsed } from './components/Sidebar.js';
 import { SessionTree } from './components/SessionTree.js';
 import { P2pRingProgress } from './components/P2pRingProgress.js';
@@ -277,7 +279,19 @@ import {
   clearAuthKeyId,
   initializeServerScopedAuth,
 } from './biometric-auth.js';
-import { initPushNotifications, resetPushBadge } from './push-notifications.js';
+import {
+  initPushNotifications,
+  resetPushBadge,
+  getLocalPushEnabledServers,
+  fetchPushNotificationSettings,
+  subscribePushEnabledServers,
+  commitPushEnabledServers,
+  hasUnsyncedPushEnabledServerEdits,
+} from './push-notifications.js';
+import {
+  resolveEffectivePushEnabledServerIds,
+  sanitizePushEnabledServerIds,
+} from '@shared/push-notifications.js';
 import { ServerSetupPage } from './pages/ServerSetupPage.js';
 import { NativeAuthBridge } from './pages/NativeAuthBridge.js';
 import type { SessionInfo, TerminalDiff } from './types.js';
@@ -426,13 +440,47 @@ type AppToast = {
   id: number;
   sessionName?: string;
   project?: string;
-  kind: 'idle' | 'notification' | 'success';
+  kind: 'idle' | 'notification' | 'success' | 'error';
   title?: string;
   message?: string;
   openRepoLatest?: boolean;
   failedJobName?: string;
   failedStepName?: string;
 };
+
+type PendingNewDevicePushPrompt = NewDevicePushPromptServer & {
+  priorAccessibleServerIds: string[];
+};
+
+function pushBindPromptedStorageKey(auth: { userId?: string; baseUrl?: string } | null): string | null {
+  if (!auth?.userId) return null;
+  return `imcodes.push_bind_prompted:${auth.baseUrl ?? ''}:${auth.userId}`;
+}
+
+function readHandledNewDevicePushIds(auth: { userId?: string; baseUrl?: string } | null): Set<string> {
+  const key = pushBindPromptedStorageKey(auth);
+  if (!key) return new Set();
+  try {
+    const raw = localStorage.getItem(key);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return Array.isArray(parsed) ? new Set(parsed.filter((item): item is string => typeof item === 'string')) : new Set();
+  } catch {
+    return new Set();
+  }
+}
+
+function markHandledNewDevicePushId(auth: { userId?: string; baseUrl?: string } | null, serverId: string): void {
+  const key = pushBindPromptedStorageKey(auth);
+  if (!key) return;
+  try {
+    const existing = readHandledNewDevicePushIds(auth);
+    existing.add(serverId);
+    const trimmed = [...existing].slice(-200);
+    localStorage.setItem(key, JSON.stringify(trimmed));
+  } catch {
+    // ignore storage errors
+  }
+}
 
 type AppUpdateNotice = {
   required: boolean;
@@ -809,6 +857,18 @@ function InternalMainApp() {
   const remoteDesktopConnectionManager = remoteDesktopConnectionManagerRef.current;
   /** Server ids this account actually owns, sourced only from /api/server. */
   const ownedServerIdsRef = useRef<Set<string>>(new Set());
+  /** Settled baseline of owned server IDs after initial sync; null until first inventory arrives. */
+  const knownOwnedServerIdsRef = useRef<Set<string> | null>(null);
+  const queuedNewDeviceIdsRef = useRef<Set<string>>(new Set());
+  const controlledMachineServerIdsRef = useRef<string[]>([]);
+  const [controlledMachineServerIds, setControlledMachineServerIds] = useState<string[]>([]);
+  const [pushEnabledServers, setPushEnabledServers] = useState<string[] | null>(() => (
+    typeof getLocalPushEnabledServers === 'function' ? getLocalPushEnabledServers() : null
+  ));
+  const pushEnabledServersRef = useRef<string[] | null>(pushEnabledServers);
+  pushEnabledServersRef.current = pushEnabledServers;
+  const [newDevicePushPrompts, setNewDevicePushPrompts] = useState<PendingNewDevicePushPrompt[]>([]);
+  const [newDevicePushSaving, setNewDevicePushSaving] = useState(false);
   // Only successful share discovery updates this set; a transient fetch failure
   // must not erase navigation back to a server the user just left.
   const sharedNavigationServerIdsRef = useRef<Set<string>>(new Set());
@@ -1226,6 +1286,11 @@ function InternalMainApp() {
     if (!auth) {
       setServersLoaded(false);
       setServersSynced(false);
+      knownOwnedServerIdsRef.current = null;
+      queuedNewDeviceIdsRef.current.clear();
+      controlledMachineServerIdsRef.current = [];
+      setControlledMachineServerIds([]);
+      setNewDevicePushPrompts([]);
       watchProjectionStore.setApiKey(null);
       watchProjectionStore.setSnapshotStatus('switching');
       watchProjectionStore.setServers([]);
@@ -1580,6 +1645,36 @@ function InternalMainApp() {
     };
   }, [auth]);
 
+  // Keep per-server push preferences synchronized with Settings -> Notifications and remote devices.
+  useEffect(() => {
+    if (!auth) return;
+    const unsubscribe = typeof subscribePushEnabledServers === 'function'
+      ? subscribePushEnabledServers((next) => {
+        setPushEnabledServers(next);
+      })
+      : () => {};
+    if (typeof getLocalPushEnabledServers === 'function') {
+      setPushEnabledServers(getLocalPushEnabledServers());
+    }
+    if (typeof fetchPushNotificationSettings === 'function') {
+      void fetchPushNotificationSettings().then((snapshot) => {
+        if (snapshot && snapshot.enabledServerIds !== undefined && (typeof hasUnsyncedPushEnabledServerEdits !== 'function' || !hasUnsyncedPushEnabledServerEdits())) {
+          setPushEnabledServers(snapshot.enabledServerIds);
+        }
+      });
+    }
+    const onVisible = () => {
+      if (document.visibilityState === 'visible' && typeof fetchPushNotificationSettings === 'function') {
+        void fetchPushNotificationSettings();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      unsubscribe();
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, [auth]);
+
   // When session expires mid-session (refresh failed), clear auth and show login.
   // Registered once so any apiFetch 401 after refresh failure lands here.
   useEffect(() => {
@@ -1784,6 +1879,8 @@ function InternalMainApp() {
       await apiFetch(`/api/server/${server.id}`, { method: 'DELETE' });
       setServers((prev) => prev.filter((s) => s.id !== server.id));
       ownedServerIdsRef.current.delete(server.id);
+      knownOwnedServerIdsRef.current?.delete(server.id);
+      setNewDevicePushPrompts((prev) => prev.filter((item) => item.id !== server.id));
       if (server.id === selectedServerId) {
         autoEntryRunRef.current++;
         setManualDashboard(true);
@@ -1809,7 +1906,43 @@ function InternalMainApp() {
     // account owns it. Ownership decides whether a route may skip the
     // /api/shares/open coverage check, so it must come from /api/server and
     // nowhere else.
-    ownedServerIdsRef.current = new Set(incoming.map((server) => server.id));
+    const nextOwnedIds = new Set(incoming.map((server) => server.id));
+    ownedServerIdsRef.current = nextOwnedIds;
+
+    if (knownOwnedServerIdsRef.current === null) {
+      // Establish initial baseline once per session/auth context — never prompt on boot or refresh.
+      knownOwnedServerIdsRef.current = new Set(nextOwnedIds);
+    } else {
+      const prevOwnedIds = knownOwnedServerIdsRef.current;
+      const newlyBound = incoming.filter((server) => !prevOwnedIds.has(server.id));
+      if (newlyBound.length > 0) {
+        const priorAccessibleIds = [...new Set([...prevOwnedIds, ...controlledMachineServerIdsRef.current])];
+        const handledIds = readHandledNewDevicePushIds(authRef.current);
+        const currentExplicit = pushEnabledServersRef.current;
+        const toQueue: PendingNewDevicePushPrompt[] = [];
+        for (const server of newlyBound) {
+          if (queuedNewDeviceIdsRef.current.has(server.id) || handledIds.has(server.id)) {
+            continue;
+          }
+          if (Array.isArray(currentExplicit) && currentExplicit.includes(server.id)) {
+            markHandledNewDevicePushId(authRef.current, server.id);
+            queuedNewDeviceIdsRef.current.add(server.id);
+            continue;
+          }
+          queuedNewDeviceIdsRef.current.add(server.id);
+          toQueue.push({
+            id: server.id,
+            name: server.name,
+            priorAccessibleServerIds: priorAccessibleIds,
+          });
+        }
+        if (toQueue.length > 0) {
+          setNewDevicePushPrompts((prev) => [...prev, ...toQueue]);
+        }
+      }
+      knownOwnedServerIdsRef.current = new Set(nextOwnedIds);
+    }
+
     setServers((previous) => mergeServerNavigation(incoming, previous, sharedNavigationServerIdsRef.current));
   }, []);
 
@@ -1817,7 +1950,17 @@ function InternalMainApp() {
   const loadServers = useCallback(async () => {
     if (!auth) return;
     try {
-      const data = await apiFetch<{ servers: ServerInfo[] }>('/api/server');
+      const [data, machinesData] = await Promise.all([
+        apiFetch<{ servers: ServerInfo[] }>('/api/server'),
+        apiFetch<{ machines?: Array<{ serverId?: unknown }> }>('/api/machines').catch(() => null),
+      ]);
+      if (Array.isArray(machinesData?.machines)) {
+        const machineIds = sanitizePushEnabledServerIds(
+          machinesData.machines.map((m) => (typeof m.serverId === 'string' ? m.serverId : '')),
+        );
+        controlledMachineServerIdsRef.current = machineIds;
+        setControlledMachineServerIds(machineIds);
+      }
       applyServerInventory(data.servers);
       setServersSynced(true);
     } catch {
@@ -1832,6 +1975,9 @@ function InternalMainApp() {
   useEffect(() => {
     setServersLoaded(false);
     setServersSynced(false);
+    knownOwnedServerIdsRef.current = null;
+    queuedNewDeviceIdsRef.current.clear();
+    setNewDevicePushPrompts([]);
     void loadServers();
   }, [loadServers]);
 
@@ -2196,6 +2342,11 @@ function InternalMainApp() {
     setToasts((prev) => [...prev, { id, kind: 'success', title }]);
     setTimeout(() => setToasts((prev) => prev.filter((toast) => toast.id !== id)), 4000);
   }, []);
+  const showErrorToast = useCallback((title: string) => {
+    const id = Date.now() + Math.random();
+    setToasts((prev) => [...prev, { id, kind: 'error', title }]);
+    setTimeout(() => setToasts((prev) => prev.filter((toast) => toast.id !== id)), 5000);
+  }, []);
   useEffect(() => {
     void checkForAppUpdate();
     const handleVisibility = () => {
@@ -2459,6 +2610,58 @@ function InternalMainApp() {
   const toggleServerPinned = useCallback((serverId: string) => {
     setServerPinned((previous) => toggleServerPin(previous, serverId));
   }, [setServerPinned]);
+  const accessiblePushServerIds = useMemo(
+    () => sanitizePushEnabledServerIds([
+      ...servers.filter((s) => ownedServerIdsRef.current.has(s.id)).map((s) => s.id),
+      ...controlledMachineServerIds,
+    ]),
+    [servers, controlledMachineServerIds],
+  );
+  const effectivePushEnabledServerIdSet = useMemo(
+    () => new Set(resolveEffectivePushEnabledServerIds(pushEnabledServers, accessiblePushServerIds)),
+    [pushEnabledServers, accessiblePushServerIds],
+  );
+  const handleToggleServerPushMute = useCallback(async (serverId: string) => {
+    if (!ownedServerIdsRef.current.has(serverId)) return;
+    const prevRaw = pushEnabledServersRef.current;
+    const currentEffective = resolveEffectivePushEnabledServerIds(prevRaw, accessiblePushServerIds);
+    const next = currentEffective.includes(serverId)
+      ? currentEffective.filter((id) => id !== serverId)
+      : [...currentEffective, serverId];
+    const ok = await commitPushEnabledServers(next, prevRaw);
+    if (!ok) {
+      showErrorToast(trans('server.push_preferences_save_failed'));
+    }
+  }, [accessiblePushServerIds, showErrorToast, trans]);
+  const activeNewDevicePushPrompt = newDevicePushPrompts[0] ?? null;
+  const handleRespondToNewDevicePushPrompt = useCallback(async (mode: 'enable' | 'mute' | 'dismiss') => {
+    const prompt = newDevicePushPrompts[0];
+    if (!prompt) return;
+    if (mode === 'dismiss') {
+      markHandledNewDevicePushId(authRef.current, prompt.id);
+      setNewDevicePushPrompts((prev) => prev.filter((item) => item.id !== prompt.id));
+      return;
+    }
+    const prevRaw = pushEnabledServersRef.current;
+    const baseEffective = Array.isArray(prevRaw)
+      ? prevRaw
+      : resolveEffectivePushEnabledServerIds(null, prompt.priorAccessibleServerIds);
+    const next = mode === 'enable'
+      ? sanitizePushEnabledServerIds([...baseEffective, prompt.id])
+      : sanitizePushEnabledServerIds(baseEffective.filter((id) => id !== prompt.id));
+    setNewDevicePushSaving(true);
+    try {
+      const ok = await commitPushEnabledServers(next, prevRaw);
+      if (ok) {
+        markHandledNewDevicePushId(authRef.current, prompt.id);
+        setNewDevicePushPrompts((prev) => prev.filter((item) => item.id !== prompt.id));
+      } else {
+        showErrorToast(trans('server.push_preferences_save_failed'));
+      }
+    } finally {
+      setNewDevicePushSaving(false);
+    }
+  }, [newDevicePushPrompts, showErrorToast, trans]);
   const [newUserGuidePref, setNewUserGuidePref] = useSyncedPreference<NewUserGuidePref>('new_user_guide', DEFAULT_NEW_USER_GUIDE_PREF, 0);
   const [teamDiscussionGuidePref, setTeamDiscussionGuidePref] = useSyncedPreference<TeamDiscussionGuidePref>('team_discussion_guide', DEFAULT_TEAM_DISCUSSION_GUIDE_PREF, 0);
   const [featureAnnouncementsPending, setFeatureAnnouncementsPending] = useState(true);
@@ -7907,6 +8110,7 @@ function InternalMainApp() {
             sharedServerStates={managedSharedServerStateById}
             returnHintServerId={showSharedReturnGuide ? sharedReturnServer?.id : null}
             pinnedServerIds={pinnedServerIds}
+            pushEnabledServerIds={effectivePushEnabledServerIdSet}
           />
           <Sidebar
             collapsed={sidebarCollapsed}
@@ -8285,6 +8489,9 @@ function InternalMainApp() {
                                 {presenceSymbol}
                               </span>
                               <span class="mobile-server-menu-name">{s.name}</span>
+                              {!s.isSharedIn && (
+                                <PushStatusBadge enabled={effectivePushEnabledServerIdSet.has(s.id)} variant="inline" />
+                              )}
                               {s.isSharedIn ? (
                                 <SharedStateIndicator variant="shared-in" iconOnly />
                               ) : (
@@ -8904,6 +9111,9 @@ function InternalMainApp() {
                           </span>
                         )}
                         <span class="server-item-name">{s.name}</span>
+                        {!s.isSharedIn && (
+                          <PushStatusBadge enabled={effectivePushEnabledServerIdSet.has(s.id)} variant="inline" />
+                        )}
                         {s.isSharedIn ? (
                           <SharedStateIndicator variant="shared-in" iconOnly />
                         ) : (
@@ -9685,7 +9895,13 @@ function InternalMainApp() {
           x={serverCtxMenu.x}
           y={serverCtxMenu.y}
           pinned={normalizePinnedServers(servers, serverPinned).includes(serverCtxMenu.server.id)}
+          pushMuted={!effectivePushEnabledServerIdSet.has(serverCtxMenu.server.id)}
           onTogglePin={() => toggleServerPinned(serverCtxMenu.server.id)}
+          onTogglePushMute={
+            ownedServerIdsRef.current.has(serverCtxMenu.server.id)
+              ? () => void handleToggleServerPushMute(serverCtxMenu.server.id)
+              : undefined
+          }
           onRename={() => handleRenameServer(serverCtxMenu.server)}
           onUpgrade={() => handleUpgradeDaemon(serverCtxMenu.server)}
           onUpgradeAll={servers.length > 1 ? handleUpgradeAll : undefined}
@@ -9961,6 +10177,14 @@ function InternalMainApp() {
 
       <CloudDocsWindowBlockedNotice />
 
+      <NewDevicePushPrompt
+        server={activeNewDevicePushPrompt}
+        busy={newDevicePushSaving}
+        onEnable={() => void handleRespondToNewDevicePushPrompt('enable')}
+        onKeepMuted={() => void handleRespondToNewDevicePushPrompt('mute')}
+        onDismiss={() => void handleRespondToNewDevicePushPrompt('dismiss')}
+      />
+
       {/* Toasts: idle completions + CC notifications */}
       {toasts.length > 0 && (
         <div class="toast-container">
@@ -9994,7 +10218,7 @@ function InternalMainApp() {
                 setToasts((prev) => prev.filter((x) => x.id !== t.id));
               }}
             >
-              <span class="toast-icon">{t.kind === 'notification' ? '🔔' : '✓'}</span>
+              <span class="toast-icon">{t.kind === 'notification' ? '🔔' : t.kind === 'error' ? '⚠' : '✓'}</span>
               <span class="toast-body">
                 {t.kind === 'idle' ? (
                   <><strong>{t.project}</strong> {trans('toast.finished')}</>

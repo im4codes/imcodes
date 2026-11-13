@@ -96,4 +96,38 @@ describe('ServerIconBar labels', () => {
     const { container } = render(<ServerIconBar servers={[server('a', '')]} activeServerId={null} onSelectServer={() => {}} />);
     expect(labelOf(container.querySelector('.server-icon-server')!)).toBe('?');
   });
+
+  it('renders enabled speaker badge vs muted ban badge and excludes shared-in servers', () => {
+    const onMenu = vi.fn();
+    const { container } = render(
+      <ServerIconBar
+        servers={[
+          server('a', 'vm-enabled'),
+          server('b', 'vm-muted'),
+          server('c', 'vm-shared', { isSharedIn: true }),
+        ]}
+        activeServerId="a"
+        pushEnabledServerIds={new Set(['a', 'c'])}
+        onSelectServer={() => {}}
+        onServerContextMenu={onMenu}
+      />,
+    );
+    const btnA = container.querySelector('button[aria-label="vm-enabled"]') as HTMLButtonElement;
+    const btnB = container.querySelector('button[aria-label="vm-muted"]') as HTMLButtonElement;
+    const btnC = container.querySelector('button[aria-label="vm-shared"]') as HTMLButtonElement;
+
+    const badgeA = btnA.querySelector('.server-icon-push-badge');
+    const badgeB = btnB.querySelector('.server-icon-push-badge');
+    const badgeC = btnC.querySelector('.server-icon-push-badge');
+
+    expect(badgeA?.classList.contains('is-enabled')).toBe(true);
+    expect(badgeA?.getAttribute('data-push-state')).toBe('enabled');
+    expect(badgeB?.classList.contains('is-muted')).toBe(true);
+    expect(badgeB?.getAttribute('data-push-state')).toBe('muted');
+    expect(badgeC).toBeNull();
+
+    // Right-click on shared-in server must not invoke context menu
+    fireEvent.contextMenu(btnC, { clientX: 10, clientY: 20 });
+    expect(onMenu).not.toHaveBeenCalled();
+  });
 });

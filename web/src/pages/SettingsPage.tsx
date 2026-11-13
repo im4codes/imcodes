@@ -22,6 +22,7 @@ import {
   getLocalPushEnabledServers,
   syncPushNotificationPreferences,
   syncPushEnabledServers,
+  subscribePushEnabledServers,
   hasUnsyncedPushNotificationEdits,
   hasUnsyncedPushEnabledServerEdits,
 } from '../push-notifications.js';
@@ -125,6 +126,13 @@ export function SettingsPage({
 
   useEffect(() => {
     let unmounted = false;
+    const unsubscribe = typeof subscribePushEnabledServers === 'function'
+      ? subscribePushEnabledServers((next) => {
+        if (!unmounted) {
+          setPushEnabledServers(next);
+        }
+      })
+      : () => {};
     void fetchPushNotificationSettings().then((snapshot) => {
       if (unmounted || !snapshot) return;
       if (snapshot.types !== null && !userEditedPushRef.current && !hasUnsyncedPushNotificationEdits()) {
@@ -136,6 +144,7 @@ export function SettingsPage({
     });
     return () => {
       unmounted = true;
+      unsubscribe();
     };
   }, []);
 

@@ -4,6 +4,7 @@ import { getServerPresence } from '../unified-server-projection.js';
 import type { SharedStateSummary } from '../tab-sharing-ui.js';
 import type { SharedEntrySummary } from '../api.js';
 import { SharedStateIndicator } from './SharedStateIndicator.js';
+import { PushStatusBadge } from './PushStatusBadge.js';
 import { isDaemonUpgradeAvailable } from '@shared/daemon-upgrade.js';
 import { buildServerIconLabels } from '@shared/server-icon-label.js';
 
@@ -34,6 +35,7 @@ interface Props {
   sharedServerStates?: ReadonlyMap<string, SharedStateSummary>;
   returnHintServerId?: string | null;
   pinnedServerIds?: ReadonlySet<string>;
+  pushEnabledServerIds?: ReadonlySet<string>;
 }
 
 export function ServerIconBar({
@@ -51,6 +53,7 @@ export function ServerIconBar({
   sharedServerStates,
   returnHintServerId = null,
   pinnedServerIds,
+  pushEnabledServerIds,
 }: Props) {
   const { t } = useTranslation();
   // One short label per server, unique across the list; recomputed when a server is added, renamed or removed.
@@ -140,6 +143,9 @@ export function ServerIconBar({
             )}
             {!isSharedIn && isDaemonUpgradeAvailable(server.daemonVersion, server.latestDaemonVersion) && (
               <span class="server-icon-upgrade" aria-label={t('server.daemon_upgrade_available')} title={t('server.daemon_upgrade_available')}>↥</span>
+            )}
+            {!isSharedIn && pushEnabledServerIds && (
+              <PushStatusBadge enabled={pushEnabledServerIds.has(server.id)} />
             )}
             <span
               class={`server-icon-dot server-icon-dot-${presence}`}

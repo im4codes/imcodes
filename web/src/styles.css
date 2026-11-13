@@ -487,12 +487,26 @@ html.native-ios-mac .chat-dl-btn {
 .toast-notification { border-color: #60a5fa; }
 .toast-notification:hover { background: #1a2033; }
 .toast-notification .toast-icon { color: #60a5fa; }
+.toast-error { border-color: #f87171; }
+.toast-error:hover { background: #2a181c; }
+.toast-error .toast-icon { color: #f87171; }
 .toast-icon { color: #3fb950; font-size: 15px; flex-shrink: 0; }
 .toast-body { flex: 1; font-size: 13px; }
 .toast-close { background: none; border: none; color: #6e7681; cursor: pointer; font-size: 12px; padding: 0 0 0 4px; flex-shrink: 0; line-height: 1; }
 .toast-close:hover { color: #e6edf3; }
 @keyframes toast-in { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
 @media (max-width: 640px) { .toast-container { bottom: 130px; right: 8px; left: 8px; } .toast { max-width: 100%; } }
+
+/* Newly-bound device push prompt */
+.new-device-push-prompt { position: fixed; top: max(14px, calc(var(--sat, 0px) + 12px)); right: 16px; z-index: 650; width: min(340px, calc(100vw - 24px)); background: linear-gradient(180deg, rgba(17, 27, 45, 0.98), rgba(8, 13, 22, 0.98)); border: 1px solid rgba(56, 189, 248, 0.42); border-radius: 10px; padding: 12px 14px; color: #e2e8f0; box-shadow: 0 12px 30px rgba(0, 0, 0, 0.55), 0 0 18px rgba(34, 211, 238, 0.14); display: flex; flex-direction: column; gap: 10px; animation: toast-in 0.2s ease; }
+.new-device-push-prompt-row { display: flex; align-items: flex-start; gap: 9px; }
+.new-device-push-prompt-icon { flex: 0 0 auto; margin-top: 2px; color: #38bdf8; display: inline-flex; }
+.new-device-push-prompt-text { flex: 1 1 auto; font-size: 13px; line-height: 1.4; color: #e2e8f0; min-width: 0; word-break: break-word; }
+.new-device-push-prompt-close { flex: 0 0 auto; background: none; border: none; color: #94a3b8; font-size: 16px; line-height: 1; cursor: pointer; padding: 0 2px; }
+.new-device-push-prompt-close:hover { color: #f8fafc; }
+.new-device-push-prompt-actions { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+.new-device-push-prompt-btn { font-size: 12px; padding: 5px 11px; }
+@media (max-width: 640px) { .new-device-push-prompt { left: 12px; right: 12px; width: auto; } }
 
 /* Center-screen confirmation for Stop's queue-first action. */
 .queue-append-success-toast {
@@ -9625,6 +9639,10 @@ html.native-ios-mac .chat-dl-btn {
 .server-icon-label-sm .server-icon-line { font-size: 9.5px; line-height: 1.15; letter-spacing: -0.2px; }
 .server-icon > .share-state-indicator { position: absolute; top: -6px; right: -7px; z-index: 2; margin-left: 0; }
 .server-icon-dot { position: absolute; bottom: 3px; right: 3px; width: 7px; height: 7px; border-radius: 50%; border: 1.5px solid #080d16; pointer-events: none; box-shadow: 0 0 8px currentColor; z-index: 1; }
+.server-icon-push-badge { position: absolute; left: 2px; bottom: 2px; z-index: 2; width: 12px; height: 12px; border-radius: 999px; display: inline-flex; align-items: center; justify-content: center; pointer-events: none; background: rgba(8, 13, 22, 0.92); box-shadow: 0 0 0 1px rgba(8, 13, 22, 0.95); }
+.server-icon-push-badge.is-enabled { color: #38bdf8; }
+.server-icon-push-badge.is-muted { color: #f87171; }
+.server-icon-push-badge-inline { position: static; flex: 0 0 auto; width: 14px; height: 14px; background: transparent; box-shadow: none; }
 
 /* Sidebar panel — collapsible, resizable */
 .sidebar-panel { display: flex; flex-direction: column; min-width: 0; background: repeating-linear-gradient(90deg, transparent 0 22px, rgba(125,211,252,0.024) 22px 23px), linear-gradient(180deg, #0d1422 0%, #080d16 100%); border-right: 1px solid rgba(34,211,238,0.18); position: relative; transition: width 0.2s ease; overflow: visible; flex-shrink: 0; box-shadow: inset -1px 0 0 rgba(255,255,255,0.035), 10px 0 26px rgba(0,0,0,0.24); }

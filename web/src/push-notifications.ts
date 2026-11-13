@@ -218,8 +218,10 @@ interface SyncedLocalPreference<TValue> {
   getLocal: () => TValue;
   setLocal: (value: TValue) => void;
   recordEdit: (value: TValue) => number;
+  rollbackTo: (previousValue: TValue, expectedGen: number) => boolean;
+  subscribe: (listener: (value: TValue) => void) => () => void;
   applyRemoteIfClean: (raw: unknown, startGen: number, wasDirtyAtStart: boolean) => TValue | undefined;
-  sync: (value: TValue) => Promise<void>;
+  sync: (value: TValue) => Promise<boolean>;
 }
 
 function createSyncedLocalPreference<TValue>(options: {
@@ -233,6 +235,16 @@ function createSyncedLocalPreference<TValue>(options: {
   let lastSyncedGeneration = 0;
   let syncQueue: Promise<void> = Promise.resolve();
   let pendingSync: { value: TValue; generation: number } | null = null;
+  const listeners = new Set<(value: TValue) => void>();
+
+  const cloneValue = (value: TValue): TValue =>
+    (Array.isArray(value) ? [...value] : value) as TValue;
+
+  const notify = (value: TValue): void => {
+    for (const listener of listeners) {
+      listener(cloneValue(value));
+    }
+  };
 
   const hasUnsyncedEdits = (): boolean => {
     if (pendingSync !== null) return true;
@@ -277,12 +289,28 @@ function createSyncedLocalPreference<TValue>(options: {
     } catch {
       // ignore
     }
+    notify(value);
   };
 
   const recordEdit = (value: TValue): number => {
     currentEditGeneration++;
     setLocal(value);
     return currentEditGeneration;
+  };
+
+  const rollbackTo = (previousValue: TValue, expectedGen: number): boolean => {
+    if (currentEditGeneration !== expectedGen) return false;
+    pendingSync = null;
+    lastSyncedGeneration = currentEditGeneration;
+    setLocal(previousValue);
+    return true;
+  };
+
+  const subscribe = (listener: (value: TValue) => void): (() => void) => {
+    listeners.add(listener);
+    return () => {
+      listeners.delete(listener);
+    };
   };
 
   const applyRemoteIfClean = (raw: unknown, startGen: number, wasDirtyAtStart: boolean): TValue | undefined => {
@@ -299,9 +327,10 @@ function createSyncedLocalPreference<TValue>(options: {
     return valid;
   };
 
-  const sync = async (value: TValue): Promise<void> => {
+  const sync = async (value: TValue): Promise<boolean> => {
     const gen = recordEdit(value);
     pendingSync = { value, generation: gen };
+    let ok = true;
 
     syncQueue = syncQueue.then(async () => {
       if (!pendingSync || lastSyncedGeneration >= pendingSync.generation) return;
@@ -323,12 +352,14 @@ function createSyncedLocalPreference<TValue>(options: {
           throw new Error('Push preferences update failed');
         }
       } catch (err) {
+        ok = false;
         console.warn('Failed to sync push notification preferences:', err);
         // Do NOT clear pendingSync on failure, retaining dirty state for subsequent sync/read guards
       }
     });
 
     await syncQueue;
+    return ok;
   };
 
   return {
@@ -340,10 +371,13 @@ function createSyncedLocalPreference<TValue>(options: {
       lastSyncedGeneration = 0;
       pendingSync = null;
       syncQueue = Promise.resolve();
+      listeners.clear();
     },
     getLocal,
     setLocal,
     recordEdit,
+    rollbackTo,
+    subscribe,
     applyRemoteIfClean,
     sync,
   };
@@ -450,12 +484,34 @@ export async function fetchPushNotificationPreferences(): Promise<PushNotificati
   return snapshot?.types ?? null;
 }
 
-export async function syncPushNotificationPreferences(types: PushNotificationType[]): Promise<void> {
-  await pushTypesPref.sync(types);
+export async function syncPushNotificationPreferences(types: PushNotificationType[]): Promise<boolean> {
+  return pushTypesPref.sync(types);
 }
 
-export async function syncPushEnabledServers(serverIds: string[] | null): Promise<void> {
-  await pushServersPref.sync(serverIds === null ? null : sanitizePushEnabledServerIds(serverIds));
+export async function syncPushEnabledServers(serverIds: string[] | null): Promise<boolean> {
+  return pushServersPref.sync(serverIds === null ? null : sanitizePushEnabledServerIds(serverIds));
+}
+
+export function subscribePushEnabledServers(listener: (serverIds: string[] | null) => void): () => void {
+  return pushServersPref.subscribe(listener);
+}
+
+/**
+ * Optimistically apply `next` enabled server IDs, persist via POST /api/push/preferences,
+ * and roll back to `previous` if the request fails (provided no newer edit superseded it).
+ */
+export async function commitPushEnabledServers(
+  next: string[] | null,
+  previous: string[] | null,
+): Promise<boolean> {
+  const normalizedNext = next === null ? null : sanitizePushEnabledServerIds(next);
+  const normalizedPrev = previous === null ? null : sanitizePushEnabledServerIds(previous);
+  const expectedGen = pushServersPref.getCurrentEditGeneration() + 1;
+  const ok = await pushServersPref.sync(normalizedNext);
+  if (!ok) {
+    pushServersPref.rollbackTo(normalizedPrev, expectedGen);
+  }
+  return ok;
 }
 
 async function registerDeviceToken(

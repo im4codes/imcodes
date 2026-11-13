@@ -398,4 +398,45 @@ describe('push enabled servers preferences', () => {
     });
     expect(getLocalPushEnabledServers()).toEqual(['srv-2']);
   });
+
+  it('commits optimistically, notifies subscribers, and rolls back on API failure without clobbering newer edits', async () => {
+    const {
+      commitPushEnabledServers,
+      subscribePushEnabledServers,
+      getLocalPushEnabledServers,
+      hasUnsyncedPushEnabledServerEdits,
+      resetPushNotificationPreferencesStateForTesting,
+    } = await import('../src/push-notifications.js');
+
+    resetPushNotificationPreferencesStateForTesting();
+    const seen: Array<string[] | null> = [];
+    const unsubscribe = subscribePushEnabledServers((next) => seen.push(next));
+
+    // Failure case: previous null -> attempt [] -> POST fails -> rolls back to null
+    apiFetchMock.mockRejectedValueOnce(new Error('network down'));
+    const okFail = await commitPushEnabledServers([], null);
+    expect(okFail).toBe(false);
+    expect(getLocalPushEnabledServers()).toBeNull();
+    expect(hasUnsyncedPushEnabledServerEdits()).toBe(false);
+    expect(seen).toEqual([[], null]);
+
+    // Concurrent case: slow POST 1 fails after POST 2 starts -> rollback of #1 must not overwrite #2
+    seen.length = 0;
+    let rejectFirst: (err: Error) => void;
+    apiFetchMock
+      .mockImplementationOnce(() => new Promise((_, reject) => { rejectFirst = reject; }))
+      .mockResolvedValueOnce({ ok: true });
+
+    const first = commitPushEnabledServers(['srv-1'], null);
+    await Promise.resolve();
+    const second = commitPushEnabledServers(['srv-1', 'srv-2'], ['srv-1']);
+    rejectFirst!(new Error('stale failure'));
+    const [ok1, ok2] = await Promise.all([first, second]);
+
+    expect(ok1).toBe(false);
+    expect(ok2).toBe(true);
+    expect(getLocalPushEnabledServers()).toEqual(['srv-1', 'srv-2']);
+    expect(seen).toEqual([['srv-1'], ['srv-1', 'srv-2']]);
+    unsubscribe();
+  });
 });

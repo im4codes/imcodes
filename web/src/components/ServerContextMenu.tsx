@@ -5,7 +5,9 @@ interface Props {
   x: number;
   y: number;
   pinned: boolean;
+  pushMuted?: boolean;
   onTogglePin: () => void;
+  onTogglePushMute?: () => void;
   onRename: () => void;
   onUpgrade: () => void;
   onUpgradeAll?: () => void;
@@ -13,7 +15,19 @@ interface Props {
   onClose: () => void;
 }
 
-export function ServerContextMenu({ x, y, pinned, onTogglePin, onRename, onUpgrade, onUpgradeAll, onDelete, onClose }: Props) {
+export function ServerContextMenu({
+  x,
+  y,
+  pinned,
+  pushMuted = false,
+  onTogglePin,
+  onTogglePushMute,
+  onRename,
+  onUpgrade,
+  onUpgradeAll,
+  onDelete,
+  onClose,
+}: Props) {
   const { t } = useTranslation();
   const ref = useRef<HTMLDivElement>(null);
 
@@ -30,16 +44,27 @@ export function ServerContextMenu({ x, y, pinned, onTogglePin, onRename, onUpgra
     };
   }, [onClose]);
 
-  // Clamp menu to viewport
+  // Clamp menu to viewport (accounts for optional Mute/Unmute and Upgrade All items)
+  const estimatedWidth = onTogglePushMute ? 196 : 160;
+  const estimatedHeight = 148 + (onTogglePushMute ? 36 : 0) + (onUpgradeAll ? 36 : 0);
   const style: Record<string, string | number> = { position: 'fixed', left: x, top: y };
-  if (x + 160 > window.innerWidth) style.left = window.innerWidth - 164;
-  if (y + 140 > window.innerHeight) style.top = Math.max(4, y - 140);
+  if (x + estimatedWidth > window.innerWidth) style.left = Math.max(4, window.innerWidth - estimatedWidth - 4);
+  if (y + estimatedHeight > window.innerHeight) style.top = Math.max(4, y - estimatedHeight);
 
   return (
     <div ref={ref} class="server-ctx-menu" style={style}>
       <button class="server-ctx-item" onClick={() => { onClose(); onTogglePin(); }}>
         {t(pinned ? 'server.unpin' : 'server.pin')}
       </button>
+      {onTogglePushMute && (
+        <button
+          class="server-ctx-item"
+          data-testid="server-ctx-toggle-push-mute"
+          onClick={() => { onClose(); onTogglePushMute(); }}
+        >
+          {t(pushMuted ? 'server.unmute_notifications' : 'server.mute_notifications')}
+        </button>
+      )}
       <button class="server-ctx-item" onClick={() => { onClose(); onRename(); }}>
         {t('session.rename')}
       </button>

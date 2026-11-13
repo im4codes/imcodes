@@ -132,6 +132,11 @@ vi.mock('../../src/biometric-auth.js', () => ({
 vi.mock('../../src/push-notifications.js', () => ({
   initPushNotifications: vi.fn(async () => undefined),
   resetPushBadge: vi.fn(async () => undefined),
+  getLocalPushEnabledServers: vi.fn(() => null),
+  fetchPushNotificationSettings: vi.fn(async () => null),
+  subscribePushEnabledServers: vi.fn(() => () => {}),
+  commitPushEnabledServers: vi.fn(async () => true),
+  hasUnsyncedPushEnabledServerEdits: vi.fn(() => false),
 }));
 
 vi.mock('../../src/ws-client.js', () => ({
