@@ -83,6 +83,7 @@ export default defineConfig({
             'server/test/job-dispatch.test.ts',
             // Real server HTTP + daemon retry contract: server-native job installs both layers.
             'server/test/daemon-token-version-skew.test.ts',
+            'server/test/cloud-docs-mcp.test.ts',
             '**/node_modules/**',
           ],
           environment: 'node',
