@@ -1393,7 +1393,32 @@
     "bind_url": "URL de vinculación",
     "bind_command": "Comando de vinculación",
     "copy_bind_command": "Copiar comando",
-    "dismiss": "Cerrar"
+    "dismiss": "Cerrar",
+    "title": "Claves API",
+    "subtitle": "Crea tokens para el daemon CLI y administra tus claves existentes",
+    "empty": "Aún no hay claves API.",
+    "empty_filtered": "Ninguna clave API coincide con este filtro.",
+    "col_label": "Etiqueta",
+    "col_created": "Creada",
+    "col_status": "Estado",
+    "no_label": "(sin etiqueta)",
+    "status_active": "Activa",
+    "status_revoked": "Revocada",
+    "filter_all": "Todas",
+    "filter_active": "Activas",
+    "filter_revoked": "Revocadas",
+    "pagination_range": "Mostrando {{start}}–{{end}} de {{total}}",
+    "pagination_page": "Página {{page}} / {{totalPages}}",
+    "prev_page": "Anterior",
+    "next_page": "Siguiente",
+    "revoke_error": "No se pudo revocar la clave API.",
+    "revoke_dialog_title": "Revocar clave API",
+    "revoke_dialog_about": "Estás a punto de revocar",
+    "revoke_dialog_warning_strong": "Esto bloqueará de inmediato cualquier CLI o herramienta externa que use esta clave.",
+    "revoke_dialog_warning_daemons": "No desconectará los daemons en ejecución (usan sus propios tokens de servidor) ni cerrará tu sesión actual en el navegador.",
+    "revoke_dialog_continue": "Continuar",
+    "revoke_dialog_confirm_prompt": "Escribe el nombre de la clave para confirmar:",
+    "revoke_dialog_confirm_btn": "Revocar clave"
   },
   "getting_started": {
     "step1_pending": "Paso 1: Genera una clave API",
@@ -5142,6 +5167,16 @@
         "tip_2": "Programa chequeos nocturnos o recordatorios con Cron o `cron_create_self`.",
         "tip_3": "Ajusta las notificaciones push por grupo (Básicas, Ciclo de tareas y Seguridad) en Configuración."
       }
+    }
+  },
+  "dashboard": {
+    "subtitle": "Administra tus dispositivos conectados, claves API y seguridad de la cuenta",
+    "logout": "Cerrar sesión",
+    "tabs": {
+      "label": "Secciones del panel",
+      "devices": "Dispositivos y compartidos",
+      "api_keys": "Claves API",
+      "account": "Seguridad y cuenta"
     }
   }
 }

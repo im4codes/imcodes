@@ -1393,7 +1393,32 @@
     "bind_url": "Bind URL",
     "bind_command": "Bind command",
     "copy_bind_command": "Copy bind command",
-    "dismiss": "Dismiss"
+    "dismiss": "Dismiss",
+    "title": "API Keys",
+    "subtitle": "Create tokens for the CLI daemon and manage existing keys",
+    "empty": "No API keys yet.",
+    "empty_filtered": "No API keys match this filter.",
+    "col_label": "Label",
+    "col_created": "Created",
+    "col_status": "Status",
+    "no_label": "(no label)",
+    "status_active": "Active",
+    "status_revoked": "Revoked",
+    "filter_all": "All",
+    "filter_active": "Active",
+    "filter_revoked": "Revoked",
+    "pagination_range": "Showing {{start}}–{{end}} of {{total}}",
+    "pagination_page": "Page {{page}} / {{totalPages}}",
+    "prev_page": "Previous",
+    "next_page": "Next",
+    "revoke_error": "Failed to revoke API key.",
+    "revoke_dialog_title": "Revoke API Key",
+    "revoke_dialog_about": "You are about to revoke",
+    "revoke_dialog_warning_strong": "This will immediately block any CLI or external tools using this key.",
+    "revoke_dialog_warning_daemons": "It will not disconnect running daemons (they use their own server tokens) or end your current browser session.",
+    "revoke_dialog_continue": "Continue",
+    "revoke_dialog_confirm_prompt": "Type the key name to confirm:",
+    "revoke_dialog_confirm_btn": "Revoke Key"
   },
   "getting_started": {
     "step1_pending": "Step 1: Generate an API Key",
@@ -5152,6 +5177,16 @@
         "tip_2": "Set up Cron jobs for nightly test/lint sweeps or periodic status digests via `cron_create_self` / Cron panel.",
         "tip_3": "Customize Basic, Task Lifecycle, and Security push preferences in Settings so your phone and Watch only ping when it matters."
       }
+    }
+  },
+  "dashboard": {
+    "subtitle": "Manage your connected devices, API keys, and account security",
+    "logout": "Log Out",
+    "tabs": {
+      "label": "Dashboard sections",
+      "devices": "Devices & Shares",
+      "api_keys": "API Keys",
+      "account": "Security & Account"
     }
   }
 }

@@ -1393,7 +1393,32 @@
     "bind_url": "綁定連結",
     "bind_command": "綁定命令",
     "copy_bind_command": "複製綁定命令",
-    "dismiss": "關閉"
+    "dismiss": "關閉",
+    "title": "API Key",
+    "subtitle": "為 CLI 常駐程式建立權杖並管理現有金鑰",
+    "empty": "尚無 API Key。",
+    "empty_filtered": "目前篩選條件下沒有 API Key。",
+    "col_label": "標籤",
+    "col_created": "建立時間",
+    "col_status": "狀態",
+    "no_label": "（無標籤）",
+    "status_active": "有效",
+    "status_revoked": "已撤銷",
+    "filter_all": "全部",
+    "filter_active": "有效",
+    "filter_revoked": "已撤銷",
+    "pagination_range": "顯示第 {{start}}–{{end}} 筆，共 {{total}} 筆",
+    "pagination_page": "第 {{page}} / {{totalPages}} 頁",
+    "prev_page": "上一頁",
+    "next_page": "下一頁",
+    "revoke_error": "撤銷 API Key 失敗。",
+    "revoke_dialog_title": "撤銷 API Key",
+    "revoke_dialog_about": "您即將撤銷金鑰",
+    "revoke_dialog_warning_strong": "這會立即封鎖任何使用此金鑰的 CLI 或外部工具。",
+    "revoke_dialog_warning_daemons": "這不會中斷執行中的常駐程式（它們使用獨立的伺服器權杖），也不會結束目前的瀏覽器工作階段。",
+    "revoke_dialog_continue": "繼續",
+    "revoke_dialog_confirm_prompt": "請輸入金鑰名稱以確認：",
+    "revoke_dialog_confirm_btn": "確認撤銷"
   },
   "getting_started": {
     "step1_pending": "步驟 1：生成 API 金鑰",
@@ -5142,6 +5167,16 @@
         "tip_2": "運用 Cron 面板或 `cron_create_self` 設定週期性驗證或自我喚醒巡檢。",
         "tip_3": "在設定頁細分基礎、任務生命週期與安全警示推播，只接收真正重要的通知。"
       }
+    }
+  },
+  "dashboard": {
+    "subtitle": "管理已連線的裝置、API Key 與帳號安全",
+    "logout": "登出",
+    "tabs": {
+      "label": "主控台分頁",
+      "devices": "裝置與共用",
+      "api_keys": "API Key",
+      "account": "安全與帳號"
     }
   }
 }

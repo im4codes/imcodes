@@ -1393,7 +1393,32 @@
     "bind_url": "URL привязки",
     "bind_command": "Команда привязки",
     "copy_bind_command": "Скопировать команду",
-    "dismiss": "Закрыть"
+    "dismiss": "Закрыть",
+    "title": "API-ключи",
+    "subtitle": "Создавайте токены для демона CLI и управляйте существующими ключами",
+    "empty": "API-ключей пока нет.",
+    "empty_filtered": "Нет API-ключей, подходящих под этот фильтр.",
+    "col_label": "Метка",
+    "col_created": "Создан",
+    "col_status": "Статус",
+    "no_label": "(без метки)",
+    "status_active": "Активен",
+    "status_revoked": "Отозван",
+    "filter_all": "Все",
+    "filter_active": "Активные",
+    "filter_revoked": "Отозванные",
+    "pagination_range": "Показано {{start}}–{{end}} из {{total}}",
+    "pagination_page": "Страница {{page}} / {{totalPages}}",
+    "prev_page": "Назад",
+    "next_page": "Вперёд",
+    "revoke_error": "Не удалось отозвать API-ключ.",
+    "revoke_dialog_title": "Отозвать API-ключ",
+    "revoke_dialog_about": "Вы собираетесь отозвать",
+    "revoke_dialog_warning_strong": "Это немедленно заблокирует любые CLI и внешние инструменты, использующие этот ключ.",
+    "revoke_dialog_warning_daemons": "Запущенные демоны не отключатся (они используют собственные токены сервера), а текущая сессия в браузере сохранится.",
+    "revoke_dialog_continue": "Продолжить",
+    "revoke_dialog_confirm_prompt": "Введите имя ключа для подтверждения:",
+    "revoke_dialog_confirm_btn": "Отозвать ключ"
   },
   "getting_started": {
     "step1_pending": "Шаг 1: Сгенерируйте API-ключ",
@@ -5141,6 +5166,16 @@
         "tip_2": "Настраивайте ночные прогоны и напоминания через панель Cron или `cron_create_self`.",
         "tip_3": "Раздельно настройте базовые, task-pair и критические security push-уведомления в Настройках."
       }
+    }
+  },
+  "dashboard": {
+    "subtitle": "Управление подключёнными устройствами, API-ключами и безопасностью аккаунта",
+    "logout": "Выйти",
+    "tabs": {
+      "label": "Разделы панели",
+      "devices": "Устройства и доступ",
+      "api_keys": "API-ключи",
+      "account": "Безопасность и аккаунт"
     }
   }
 }

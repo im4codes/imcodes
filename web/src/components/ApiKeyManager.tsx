@@ -1,6 +1,10 @@
-import { useState } from 'preact/hooks';
+import { useEffect, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { apiFetch, getApiBaseUrl } from '../api.js';
+
+export const API_KEYS_PAGE_SIZE = 6;
+
+export type ApiKeyStatusFilter = 'all' | 'active' | 'revoked';
 
 interface KeyInfo {
   id: string;
@@ -12,6 +16,7 @@ interface KeyInfo {
 interface Props {
   keys: KeyInfo[];
   onKeysChanged: () => void;
+  pageSize?: number;
 }
 
 interface RevokeTarget {
@@ -19,7 +24,18 @@ interface RevokeTarget {
   label: string | null;
 }
 
-function RevokeConfirmDialog({ target, onConfirm, onCancel }: { target: RevokeTarget; onConfirm: () => void; onCancel: () => void }) {
+function RevokeConfirmDialog({
+  target,
+  error,
+  onConfirm,
+  onCancel,
+}: {
+  target: RevokeTarget;
+  error: string | null;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const { t } = useTranslation();
   const displayName = target.label || `key-${target.id.slice(0, 8)}`;
   const [typed, setTyped] = useState('');
   const [step, setStep] = useState<1 | 2>(1);
@@ -27,29 +43,33 @@ function RevokeConfirmDialog({ target, onConfirm, onCancel }: { target: RevokeTa
   return (
     <div class="ask-dialog-overlay" onClick={(e) => { if (e.target === e.currentTarget) onCancel(); }}>
       <div class="ask-dialog" style={{ maxWidth: 420 }}>
-        <div style={{ fontSize: 15, fontWeight: 600, color: '#f87171' }}>Revoke API Key</div>
+        <div style={{ fontSize: 15, fontWeight: 600, color: '#f87171' }}>{t('api_key.revoke_dialog_title')}</div>
+        {error && <div class="dashboard-error" style={{ marginBottom: 0 }}>{error}</div>}
         {step === 1 ? (
           <>
             <div style={{ fontSize: 13, color: '#94a3b8', lineHeight: 1.6 }}>
-              You are about to revoke <code style={{ color: '#f87171', background: '#1e293b', padding: '2px 6px', borderRadius: 4 }}>{displayName}</code>.<br /><br />
-              <strong style={{ color: '#e2e8f0' }}>This will immediately block any CLI or external tools using this key.</strong><br />
-              It will <em>not</em> disconnect running daemons (they use their own server tokens) or end your current browser session.
+              {t('api_key.revoke_dialog_about')}{' '}
+              <code style={{ color: '#f87171', background: '#0f172a', padding: '2px 6px', borderRadius: 4 }}>{displayName}</code>.<br /><br />
+              <strong style={{ color: '#e2e8f0' }}>{t('api_key.revoke_dialog_warning_strong')}</strong><br />
+              {t('api_key.revoke_dialog_warning_daemons')}
             </div>
             <div class="ask-actions">
-              <button class="ask-btn-cancel" onClick={onCancel}>Cancel</button>
+              <button type="button" class="ask-btn-cancel" onClick={onCancel}>{t('common.cancel')}</button>
               <button
+                type="button"
                 class="ask-btn-submit"
                 style={{ background: '#dc2626' }}
                 onClick={() => setStep(2)}
               >
-                Continue
+                {t('api_key.revoke_dialog_continue')}
               </button>
             </div>
           </>
         ) : (
           <>
             <div style={{ fontSize: 13, color: '#94a3b8', marginBottom: 4 }}>
-              Type the key name to confirm: <code style={{ color: '#f87171', background: '#1e293b', padding: '2px 6px', borderRadius: 4 }}>{displayName}</code>
+              {t('api_key.revoke_dialog_confirm_prompt')}{' '}
+              <code style={{ color: '#f87171', background: '#0f172a', padding: '2px 6px', borderRadius: 4 }}>{displayName}</code>
             </div>
             <input
               class="ask-custom-input"
@@ -60,8 +80,9 @@ function RevokeConfirmDialog({ target, onConfirm, onCancel }: { target: RevokeTa
               autoFocus
             />
             <div class="ask-actions">
-              <button class="ask-btn-cancel" onClick={onCancel}>Cancel</button>
+              <button type="button" class="ask-btn-cancel" onClick={onCancel}>{t('common.cancel')}</button>
               <button
+                type="button"
                 class="ask-btn-submit"
                 style={{
                   background: typed === displayName ? '#ef4444' : '#7f1d1d',
@@ -71,7 +92,7 @@ function RevokeConfirmDialog({ target, onConfirm, onCancel }: { target: RevokeTa
                 disabled={typed !== displayName}
                 onClick={onConfirm}
               >
-                Revoke Key
+                {t('api_key.revoke_dialog_confirm_btn')}
               </button>
             </div>
           </>
@@ -81,15 +102,37 @@ function RevokeConfirmDialog({ target, onConfirm, onCancel }: { target: RevokeTa
   );
 }
 
-export function ApiKeyManager({ keys, onKeysChanged }: Props) {
+export function ApiKeyManager({ keys, onKeysChanged, pageSize = API_KEYS_PAGE_SIZE }: Props) {
   const { t } = useTranslation();
   const [newLabel, setNewLabel] = useState('');
   const [newKey, setNewKey] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
   const [copiedTarget, setCopiedTarget] = useState<'key' | 'bind_url' | 'bind_command' | null>(null);
   const [revokeTarget, setRevokeTarget] = useState<RevokeTarget | null>(null);
-
+  const [revokeError, setRevokeError] = useState<string | null>(null);
   const [genError, setGenError] = useState<string | null>(null);
+  const [statusFilter, setStatusFilter] = useState<ApiKeyStatusFilter>('all');
+  const [page, setPage] = useState(1);
+
+  const effectivePageSize = Math.max(1, pageSize);
+  const activeCount = keys.filter((k) => !k.revokedAt).length;
+  const revokedCount = keys.length - activeCount;
+  const filteredKeys = keys.filter((k) => {
+    if (statusFilter === 'active') return !k.revokedAt;
+    if (statusFilter === 'revoked') return Boolean(k.revokedAt);
+    return true;
+  });
+  const totalPages = Math.max(1, Math.ceil(filteredKeys.length / effectivePageSize));
+  const safePage = Math.min(Math.max(1, page), totalPages);
+  const startIndex = (safePage - 1) * effectivePageSize;
+  const pageItems = filteredKeys.slice(startIndex, startIndex + effectivePageSize);
+
+  useEffect(() => {
+    setPage((prev) => {
+      const clamped = Math.min(Math.max(1, prev), totalPages);
+      return clamped === prev ? prev : clamped;
+    });
+  }, [totalPages]);
 
   const bindUrl = newKey ? `${getApiBaseUrl()}/bind/${newKey}` : '';
   const bindCommand = bindUrl ? `imcodes bind ${bindUrl}` : '';
@@ -106,6 +149,8 @@ export function ApiKeyManager({ keys, onKeysChanged }: Props) {
       });
       setNewKey(res.apiKey);
       setNewLabel('');
+      setStatusFilter((prev) => (prev === 'revoked' ? 'all' : prev));
+      setPage(1);
       onKeysChanged();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -118,12 +163,14 @@ export function ApiKeyManager({ keys, onKeysChanged }: Props) {
 
   const handleRevoke = async () => {
     if (!revokeTarget) return;
+    setRevokeError(null);
     try {
       await apiFetch(`/api/auth/user/me/keys/${revokeTarget.id}`, { method: 'DELETE' });
       setRevokeTarget(null);
       onKeysChanged();
     } catch (err) {
       console.error('Failed to revoke key:', err);
+      setRevokeError(t('api_key.revoke_error'));
     }
   };
 
@@ -134,114 +181,190 @@ export function ApiKeyManager({ keys, onKeysChanged }: Props) {
     setTimeout(() => setCopiedTarget((prev) => (prev === target ? null : prev)), 2000);
   };
 
+  const handleFilterChange = (nextFilter: ApiKeyStatusFilter) => {
+    setStatusFilter(nextFilter);
+    setPage(1);
+  };
+
+  const filterOptions: { id: ApiKeyStatusFilter; label: string; count: number }[] = [
+    { id: 'all', label: t('api_key.filter_all'), count: keys.length },
+    { id: 'active', label: t('api_key.filter_active'), count: activeCount },
+    { id: 'revoked', label: t('api_key.filter_revoked'), count: revokedCount },
+  ];
+
   return (
     <>
-    {revokeTarget && (
-      <RevokeConfirmDialog
-        target={revokeTarget}
-        onConfirm={handleRevoke}
-        onCancel={() => setRevokeTarget(null)}
-      />
-    )}
-    <div style={{ marginTop: 32 }}>
-      <h2 style={{ fontSize: 18, marginBottom: 16 }}>API Keys</h2>
-
-      {newKey && (
-        <div style={{ background: '#1e293b', border: '1px solid #f59e0b', borderRadius: 8, padding: 16, marginBottom: 16 }}>
-          <div style={{ color: '#f59e0b', fontWeight: 600, marginBottom: 8 }}>{t('api_key.save_once')}</div>
-          <div style={{ display: 'grid', gap: 10 }}>
-            <div>
-              <div style={{ color: '#94a3b8', fontSize: 12, marginBottom: 4 }}>{t('api_key.raw_key')}</div>
-              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                <code style={{ flex: 1, wordBreak: 'break-all', fontSize: 13, color: '#e2e8f0' }}>{newKey}</code>
-                <button class="btn btn-secondary" style={{ whiteSpace: 'nowrap' }} onClick={() => handleCopy('key', newKey)}>
-                  {copiedTarget === 'key' ? t('api_key.copied') : t('api_key.copy')}
-                </button>
-              </div>
-            </div>
-            <div>
-              <div style={{ color: '#94a3b8', fontSize: 12, marginBottom: 4 }}>{t('api_key.bind_url')}</div>
-              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                <code style={{ flex: 1, wordBreak: 'break-all', fontSize: 13, color: '#e2e8f0' }}>{bindUrl}</code>
-                <button class="btn btn-secondary" style={{ whiteSpace: 'nowrap' }} onClick={() => handleCopy('bind_url', bindUrl)}>
-                  {copiedTarget === 'bind_url' ? t('api_key.copied') : t('api_key.copy')}
-                </button>
-              </div>
-            </div>
-            <div>
-              <div style={{ color: '#94a3b8', fontSize: 12, marginBottom: 4 }}>{t('api_key.bind_command')}</div>
-              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                <code style={{ flex: 1, wordBreak: 'break-all', fontSize: 13, color: '#e2e8f0' }}>{bindCommand}</code>
-                <button class="btn btn-primary" style={{ whiteSpace: 'nowrap' }} onClick={() => handleCopy('bind_command', bindCommand)}>
-                  {copiedTarget === 'bind_command' ? t('api_key.copied') : t('api_key.copy_bind_command')}
-                </button>
-              </div>
-            </div>
+      {revokeTarget && (
+        <RevokeConfirmDialog
+          target={revokeTarget}
+          error={revokeError}
+          onConfirm={handleRevoke}
+          onCancel={() => { setRevokeTarget(null); setRevokeError(null); }}
+        />
+      )}
+      <section class="dashboard-card">
+        <div class="dashboard-card-header">
+          <div>
+            <h2 class="dashboard-card-title">{t('api_key.title')}</h2>
+            <p class="dashboard-card-subtitle">{t('api_key.subtitle')}</p>
           </div>
-          <button class="btn btn-secondary" style={{ marginTop: 8, fontSize: 12 }} onClick={() => setNewKey(null)}>
-            {t('api_key.dismiss')}
+        </div>
+
+        {newKey && (
+          <div class="api-key-banner">
+            <div class="api-key-banner-title">{t('api_key.save_once')}</div>
+            <div class="api-key-banner-grid">
+              <div>
+                <div class="api-key-banner-label">{t('api_key.raw_key')}</div>
+                <div class="api-key-banner-row">
+                  <code class="api-key-banner-code">{newKey}</code>
+                  <button type="button" class="btn btn-secondary" style={{ whiteSpace: 'nowrap' }} onClick={() => handleCopy('key', newKey)}>
+                    {copiedTarget === 'key' ? t('api_key.copied') : t('api_key.copy')}
+                  </button>
+                </div>
+              </div>
+              <div>
+                <div class="api-key-banner-label">{t('api_key.bind_url')}</div>
+                <div class="api-key-banner-row">
+                  <code class="api-key-banner-code">{bindUrl}</code>
+                  <button type="button" class="btn btn-secondary" style={{ whiteSpace: 'nowrap' }} onClick={() => handleCopy('bind_url', bindUrl)}>
+                    {copiedTarget === 'bind_url' ? t('api_key.copied') : t('api_key.copy')}
+                  </button>
+                </div>
+              </div>
+              <div>
+                <div class="api-key-banner-label">{t('api_key.bind_command')}</div>
+                <div class="api-key-banner-row">
+                  <code class="api-key-banner-code">{bindCommand}</code>
+                  <button type="button" class="btn btn-primary" style={{ whiteSpace: 'nowrap' }} onClick={() => handleCopy('bind_command', bindCommand)}>
+                    {copiedTarget === 'bind_command' ? t('api_key.copied') : t('api_key.copy_bind_command')}
+                  </button>
+                </div>
+              </div>
+            </div>
+            <button type="button" class="btn btn-secondary" style={{ marginTop: 10, fontSize: 12 }} onClick={() => setNewKey(null)}>
+              {t('api_key.dismiss')}
+            </button>
+          </div>
+        )}
+
+        {genError && (
+          <div class="dashboard-error">[Error] {genError}</div>
+        )}
+
+        <div class="dashboard-inline-form">
+          <input
+            class="input"
+            type="text"
+            placeholder={t('api_key.label_placeholder')}
+            value={newLabel}
+            onInput={(e) => setNewLabel((e.target as HTMLInputElement).value)}
+          />
+          <button type="button" class="btn btn-primary" onClick={handleGenerate} disabled={generating}>
+            {generating ? t('api_key.generating') : t('api_key.generate')}
           </button>
         </div>
-      )}
 
-      {genError && (
-        <div style={{ color: '#f87171', marginBottom: 12, fontSize: 13, wordBreak: 'break-all' }}>
-          [Error] {genError}
-        </div>
-      )}
+        {keys.length === 0 ? (
+          <div class="dashboard-empty" style={{ marginTop: 16 }}>{t('api_key.empty')}</div>
+        ) : (
+          <>
+            <div class="api-key-toolbar">
+              <div class="api-key-filters" role="group" aria-label={t('api_key.col_status')}>
+                {filterOptions.map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    class={`api-key-filter-btn${statusFilter === opt.id ? ' is-active' : ''}`}
+                    aria-pressed={statusFilter === opt.id}
+                    onClick={() => handleFilterChange(opt.id)}
+                  >
+                    <span>{opt.label}</span>
+                    <span class="api-key-filter-count">{opt.count}</span>
+                  </button>
+                ))}
+              </div>
+              {filteredKeys.length > 0 && (
+                <span class="api-key-range">
+                  {t('api_key.pagination_range', {
+                    start: startIndex + 1,
+                    end: startIndex + pageItems.length,
+                    total: filteredKeys.length,
+                  })}
+                </span>
+              )}
+            </div>
 
-      <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
-        <input
-          type="text"
-          placeholder={t('api_key.label_placeholder')}
-          value={newLabel}
-          onInput={(e) => setNewLabel((e.target as HTMLInputElement).value)}
-          style={{ flex: 1, padding: '8px 12px', borderRadius: 6, border: '1px solid #334155', background: '#0f172a', color: '#e2e8f0' }}
-        />
-        <button class="btn btn-primary" onClick={handleGenerate} disabled={generating}>
-          {generating ? t('api_key.generating') : t('api_key.generate')}
-        </button>
-      </div>
+            {filteredKeys.length === 0 ? (
+              <div class="dashboard-empty">{t('api_key.empty_filtered')}</div>
+            ) : (
+              <>
+                <table class="api-key-table">
+                  <thead>
+                    <tr>
+                      <th>{t('api_key.col_label')}</th>
+                      <th>{t('api_key.col_created')}</th>
+                      <th>{t('api_key.col_status')}</th>
+                      <th class="is-actions" />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {pageItems.map((k) => (
+                      <tr key={k.id} class="api-key-row">
+                        <td class="api-key-cell-label">{k.label || t('api_key.no_label')}</td>
+                        <td class="api-key-cell-created">{new Date(k.createdAt).toLocaleDateString()}</td>
+                        <td class="api-key-cell-status">
+                          <span class={`api-key-status ${k.revokedAt ? 'is-revoked' : 'is-active'}`}>
+                            {k.revokedAt ? t('api_key.status_revoked') : t('api_key.status_active')}
+                          </span>
+                        </td>
+                        <td class="api-key-cell-actions">
+                          {!k.revokedAt && (
+                            <button
+                              type="button"
+                              class="btn btn-secondary"
+                              style={{ fontSize: 11, color: '#f87171', borderColor: 'rgba(248, 113, 113, 0.32)' }}
+                              onClick={() => { setRevokeError(null); setRevokeTarget({ id: k.id, label: k.label }); }}
+                            >
+                              {t('api_key.revoke')}
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
 
-      {keys.length === 0 ? (
-        <div style={{ color: '#64748b', padding: 16, textAlign: 'center' }}>No API keys yet.</div>
-      ) : (
-        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-          <thead>
-            <tr style={{ borderBottom: '1px solid #334155', color: '#94a3b8', fontSize: 12 }}>
-              <th style={{ textAlign: 'left', padding: '8px 12px' }}>Label</th>
-              <th style={{ textAlign: 'left', padding: '8px 12px' }}>Created</th>
-              <th style={{ textAlign: 'left', padding: '8px 12px' }}>Status</th>
-              <th style={{ textAlign: 'right', padding: '8px 12px' }}></th>
-            </tr>
-          </thead>
-          <tbody>
-            {keys.map((k) => (
-              <tr key={k.id} style={{ borderBottom: '1px solid #1e293b' }}>
-                <td style={{ padding: '8px 12px', color: '#e2e8f0' }}>{k.label || '(no label)'}</td>
-                <td style={{ padding: '8px 12px', color: '#94a3b8', fontSize: 13 }}>
-                  {new Date(k.createdAt).toLocaleDateString()}
-                </td>
-                <td style={{ padding: '8px 12px' }}>
-                  {k.revokedAt ? (
-                    <span style={{ color: '#ef4444', fontSize: 12 }}>Revoked</span>
-                  ) : (
-                    <span style={{ color: '#22c55e', fontSize: 12 }}>Active</span>
-                  )}
-                </td>
-                <td style={{ padding: '8px 12px', textAlign: 'right' }}>
-                  {!k.revokedAt && (
-                    <button class="btn btn-secondary" style={{ fontSize: 11, color: '#f87171' }} onClick={() => setRevokeTarget({ id: k.id, label: k.label })}>
-                      {t('api_key.revoke')}
-                    </button>
-                  )}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
-    </div>
+                {totalPages > 1 && (
+                  <div class="api-key-pagination">
+                    <span class="api-key-page-info">
+                      {t('api_key.pagination_page', { page: safePage, totalPages })}
+                    </span>
+                    <div class="api-key-page-controls">
+                      <button
+                        type="button"
+                        class="btn btn-secondary"
+                        disabled={safePage <= 1}
+                        onClick={() => setPage((prev) => Math.max(1, prev - 1))}
+                      >
+                        {t('api_key.prev_page')}
+                      </button>
+                      <button
+                        type="button"
+                        class="btn btn-secondary"
+                        disabled={safePage >= totalPages}
+                        onClick={() => setPage((prev) => Math.min(totalPages, prev + 1))}
+                      >
+                        {t('api_key.next_page')}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
+          </>
+        )}
+      </section>
     </>
   );
 }

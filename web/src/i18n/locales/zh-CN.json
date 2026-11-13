@@ -1393,7 +1393,32 @@
     "bind_url": "绑定链接",
     "bind_command": "绑定命令",
     "copy_bind_command": "复制绑定命令",
-    "dismiss": "关闭"
+    "dismiss": "关闭",
+    "title": "API Key",
+    "subtitle": "为 CLI 守护进程创建令牌并管理现有密钥",
+    "empty": "暂无 API Key。",
+    "empty_filtered": "当前筛选条件下没有 API Key。",
+    "col_label": "备注",
+    "col_created": "创建时间",
+    "col_status": "状态",
+    "no_label": "（无备注）",
+    "status_active": "有效",
+    "status_revoked": "已吊销",
+    "filter_all": "全部",
+    "filter_active": "有效",
+    "filter_revoked": "已吊销",
+    "pagination_range": "显示第 {{start}}–{{end}} 条，共 {{total}} 条",
+    "pagination_page": "第 {{page}} / {{totalPages}} 页",
+    "prev_page": "上一页",
+    "next_page": "下一页",
+    "revoke_error": "吊销 API Key 失败。",
+    "revoke_dialog_title": "吊销 API Key",
+    "revoke_dialog_about": "即将吊销密钥",
+    "revoke_dialog_warning_strong": "这将立即拦截所有使用此密钥的 CLI 或外部工具。",
+    "revoke_dialog_warning_daemons": "此操作不会断开正在运行的守护进程（它们使用独立的服务器令牌），也不会结束当前浏览器会话。",
+    "revoke_dialog_continue": "继续",
+    "revoke_dialog_confirm_prompt": "请输入密钥名称以确认：",
+    "revoke_dialog_confirm_btn": "确认吊销"
   },
   "getting_started": {
     "step1_pending": "步骤 1：生成 API Key",
@@ -5152,6 +5177,16 @@
         "tip_2": "利用 Cron 面板或 MCP `cron_create_self` 配置定时巡检与自唤醒任务。",
         "tip_3": "在“设置”页按基础、任务对生命周期与安全告警分组精细配置手机/手表推送。"
       }
+    }
+  },
+  "dashboard": {
+    "subtitle": "管理已连接的设备、API Key 与账号安全",
+    "logout": "退出登录",
+    "tabs": {
+      "label": "控制台分组",
+      "devices": "设备与共享",
+      "api_keys": "API Key",
+      "account": "安全与账号"
     }
   }
 }

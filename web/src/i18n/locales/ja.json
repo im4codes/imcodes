@@ -1393,7 +1393,32 @@
     "bind_url": "バインドURL",
     "bind_command": "バインドコマンド",
     "copy_bind_command": "バインドコマンドをコピー",
-    "dismiss": "閉じる"
+    "dismiss": "閉じる",
+    "title": "APIキー",
+    "subtitle": "CLIデーモン用のトークンを作成し、既存のキーを管理します",
+    "empty": "APIキーはまだありません。",
+    "empty_filtered": "このフィルターに一致するAPIキーはありません。",
+    "col_label": "ラベル",
+    "col_created": "作成日",
+    "col_status": "ステータス",
+    "no_label": "（ラベルなし）",
+    "status_active": "有効",
+    "status_revoked": "失効済み",
+    "filter_all": "すべて",
+    "filter_active": "有効",
+    "filter_revoked": "失効済み",
+    "pagination_range": "{{total}}件中 {{start}}–{{end}}件を表示",
+    "pagination_page": "ページ {{page}} / {{totalPages}}",
+    "prev_page": "前へ",
+    "next_page": "次へ",
+    "revoke_error": "APIキーの失効に失敗しました。",
+    "revoke_dialog_title": "APIキーを失効",
+    "revoke_dialog_about": "次のキーを失効させようとしています:",
+    "revoke_dialog_warning_strong": "このキーを使用しているCLIや外部ツールは直ちにブロックされます。",
+    "revoke_dialog_warning_daemons": "実行中のデーモン（独自のサーバートークンを使用）は切断されず、現在のブラウザセッションも終了しません。",
+    "revoke_dialog_continue": "続行",
+    "revoke_dialog_confirm_prompt": "確認のためキー名を入力してください:",
+    "revoke_dialog_confirm_btn": "キーを失効"
   },
   "getting_started": {
     "step1_pending": "ステップ1: APIキーを生成する",
@@ -5141,6 +5166,16 @@
         "tip_2": "夜間テストや定期巡回には Cron パネルまたは `cron_create_self` を活用してください。",
         "tip_3": "設定画面の通知グループ（基本・タスクライフサイクル・セキュリティ）でプッシュ通知を最適化できます。"
       }
+    }
+  },
+  "dashboard": {
+    "subtitle": "接続済みデバイス、APIキー、アカウントのセキュリティを管理します",
+    "logout": "ログアウト",
+    "tabs": {
+      "label": "ダッシュボードセクション",
+      "devices": "デバイスと共有",
+      "api_keys": "APIキー",
+      "account": "セキュリティとアカウント"
     }
   }
 }

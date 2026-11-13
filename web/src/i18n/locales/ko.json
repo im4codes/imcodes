@@ -1393,7 +1393,32 @@
     "bind_url": "바인드 URL",
     "bind_command": "바인드 명령어",
     "copy_bind_command": "바인드 명령어 복사",
-    "dismiss": "닫기"
+    "dismiss": "닫기",
+    "title": "API 키",
+    "subtitle": "CLI 데몬용 토큰을 생성하고 기존 키를 관리합니다",
+    "empty": "아직 API 키가 없습니다.",
+    "empty_filtered": "이 필터와 일치하는 API 키가 없습니다.",
+    "col_label": "라벨",
+    "col_created": "생성일",
+    "col_status": "상태",
+    "no_label": "(라벨 없음)",
+    "status_active": "활성",
+    "status_revoked": "폐기됨",
+    "filter_all": "전체",
+    "filter_active": "활성",
+    "filter_revoked": "폐기됨",
+    "pagination_range": "전체 {{total}}개 중 {{start}}–{{end}}",
+    "pagination_page": "페이지 {{page}} / {{totalPages}}",
+    "prev_page": "이전",
+    "next_page": "다음",
+    "revoke_error": "API 키 폐기에 실패했습니다.",
+    "revoke_dialog_title": "API 키 폐기",
+    "revoke_dialog_about": "다음 키를 폐기하려고 합니다:",
+    "revoke_dialog_warning_strong": "이 키를 사용하는 모든 CLI 또는 외부 도구가 즉시 차단됩니다.",
+    "revoke_dialog_warning_daemons": "실행 중인 데몬은 자체 서버 토큰을 사용하므로 연결이 끊기지 않으며, 현재 브라우저 세션도 유지됩니다.",
+    "revoke_dialog_continue": "계속",
+    "revoke_dialog_confirm_prompt": "확인을 위해 키 이름을 입력하세요:",
+    "revoke_dialog_confirm_btn": "키 폐기"
   },
   "getting_started": {
     "step1_pending": "1단계: API 키 생성",
@@ -5141,6 +5166,16 @@
         "tip_2": "야간 테스트나 주기적 점검은 Cron 패널 또는 `cron_create_self`로 자동화하세요.",
         "tip_3": "설정 화면에서 기본·작업 수명주기·보안 알림별로 모바일/워치 푸시를 세밀하게 조정할 수 있습니다."
       }
+    }
+  },
+  "dashboard": {
+    "subtitle": "연결된 기기, API 키 및 계정 보안을 관리합니다",
+    "logout": "로그아웃",
+    "tabs": {
+      "label": "대시보드 섹션",
+      "devices": "기기 및 공유",
+      "api_keys": "API 키",
+      "account": "보안 및 계정"
     }
   }
 }
