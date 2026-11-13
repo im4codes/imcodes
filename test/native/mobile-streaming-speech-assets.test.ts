@@ -213,23 +213,76 @@ describe('Qwen3-ASR mobile assets', () => {
     const files: Record<string, string> = {
       'android/Manifest.java': `package android; public class Manifest { public static class permission { public static final String RECORD_AUDIO="mic"; } }`,
       'android/media/AudioFormat.java': `package android.media; public class AudioFormat { public static final int CHANNEL_IN_MONO=1, ENCODING_PCM_16BIT=2; }`,
-      'android/media/MediaRecorder.java': `package android.media; public class MediaRecorder { public static class AudioSource { public static final int VOICE_RECOGNITION=1; } }`,
+      'android/media/MediaRecorder.java': `package android.media; public class MediaRecorder { public static class AudioSource { public static final int MIC=1, VOICE_RECOGNITION=6; } }`,
+      'android/media/audiofx/AudioEffect.java': `package android.media.audiofx; public class AudioEffect { public static final int SUCCESS=0, ERROR=-1; }`,
+      'android/media/audiofx/AutomaticGainControl.java': `package android.media.audiofx;
+public class AutomaticGainControl extends AudioEffect {
+  public static volatile boolean available=true;
+  public static volatile boolean returnNullOnCreate=false;
+  public static volatile boolean throwOnCreate=false;
+  public static volatile boolean failEnable=false;
+  public static volatile boolean throwOnEnable=false;
+  public static volatile boolean throwOnRelease=false;
+  public static volatile int created=0, enabled=0, disabled=0, released=0, lastSessionId=-1;
+  public static void reset(){
+    available=true; returnNullOnCreate=false; throwOnCreate=false;
+    failEnable=false; throwOnEnable=false; throwOnRelease=false;
+    created=0; enabled=0; disabled=0; released=0; lastSessionId=-1;
+  }
+  public static boolean isAvailable(){ return available; }
+  public static AutomaticGainControl create(int sessionId){
+    lastSessionId=sessionId;
+    if(throwOnCreate) throw new RuntimeException("agc create failed");
+    if(returnNullOnCreate) return null;
+    created++;
+    return new AutomaticGainControl();
+  }
+  public int setEnabled(boolean enable){
+    if(enable){
+      if(throwOnEnable) throw new IllegalStateException("agc enable failed");
+      if(failEnable) return ERROR;
+      enabled++;
+      return SUCCESS;
+    }
+    disabled++;
+    return SUCCESS;
+  }
+  public void release(){
+    released++;
+    if(throwOnRelease) throw new RuntimeException("agc release failed");
+  }
+}`,
       'android/media/AudioRecord.java': `package android.media;
 public class AudioRecord {
-  public static final int STATE_INITIALIZED=1, RECORDSTATE_RECORDING=3, READ_BLOCKING=0;
+  public static final int STATE_INITIALIZED=1, STATE_UNINITIALIZED=0, RECORDSTATE_RECORDING=3, READ_BLOCKING=0;
   public static volatile AudioRecord latest;
   public static volatile int chunksPerStart=1;
   public static volatile int silentChunksPerStart=0;
   public static volatile boolean labelledWords=false;
+  public static volatile boolean failMicSource=false;
+  public static volatile int lastSource=-1;
+  private static int nextSessionId=42;
   public static int reads=0;
   public static volatile java.util.concurrent.CountDownLatch delivered;
+  private final int audioSessionId=nextSessionId++;
+  private final int state;
   private boolean recording;
   private int remaining;
   private int silentRemaining;
   private int deliveredVoiced=0;
-  public AudioRecord(int a,int b,int c,int d,int e){ latest=this; remaining=chunksPerStart; silentRemaining=silentChunksPerStart; delivered=new java.util.concurrent.CountDownLatch(remaining+silentRemaining); }
+  public AudioRecord(int source,int b,int c,int d,int e){
+    lastSource=source;
+    state=(failMicSource && source==MediaRecorder.AudioSource.MIC) ? STATE_UNINITIALIZED : STATE_INITIALIZED;
+    if(state==STATE_INITIALIZED){
+      latest=this;
+      remaining=chunksPerStart;
+      silentRemaining=silentChunksPerStart;
+      delivered=new java.util.concurrent.CountDownLatch(remaining+silentRemaining);
+    }
+  }
   public static int getMinBufferSize(int a,int b,int c){ return 3200; }
-  public int getState(){ return STATE_INITIALIZED; }
+  public int getState(){ return state; }
+  public int getAudioSessionId(){ return audioSessionId; }
   public synchronized int getRecordingState(){ return recording ? RECORDSTATE_RECORDING : 0; }
   public synchronized void startRecording(){ recording=true; }
   public synchronized void stop(){ recording=false; notifyAll(); }
@@ -242,9 +295,15 @@ public class AudioRecord {
     if (!recording || (remaining <= 0 && silentRemaining <= 0)) return 0;
     if (remaining > 0) {
       remaining--;
-      short val = labelledWords ? (short)(1000 + (deliveredVoiced / 15)) : (short) 1000;
+      if (labelledWords) {
+        int halfPeriod = 4 + (deliveredVoiced / 15);
+        for (int i = 0; i < out.length; i++) {
+          out[i] = ((i / halfPeriod) % 2 == 0) ? (short) 1000 : (short) -1000;
+        }
+      } else {
+        java.util.Arrays.fill(out, (short) 1000);
+      }
       deliveredVoiced++;
-      java.util.Arrays.fill(out, val);
     } else {
       silentRemaining--;
       java.util.Arrays.fill(out, (short) 0);
@@ -316,10 +375,15 @@ public class OfflineRecognizer {
   if (android.media.AudioRecord.labelledWords && stream.samples != null) {
    StringBuilder sb = new StringBuilder();
    int prev = -1;
-   for (float v : stream.samples) {
-    int raw = Math.round(v * 32768.0f);
-    if (raw < 1000) continue;
-    int id = raw - 1000;
+   for (int base = 0; base + 1600 <= stream.samples.length; base += 1600) {
+    int limit = base + 1580;
+    int i = base + 20;
+    while (i < limit && stream.samples[i] >= -1e-4f) i++;
+    while (i < limit && stream.samples[i] <= 1e-4f) i++;
+    int run = 0;
+    while (i < limit && stream.samples[i] > 1e-4f) { run++; i++; }
+    if (i >= limit || stream.samples[i] >= -1e-4f || run < 4) continue;
+    int id = run - 4;
     if (id != prev) {
      if (sb.length() > 0) sb.append(' ');
      sb.append(String.format("word%03d", id));
@@ -333,7 +397,7 @@ public class OfflineRecognizer {
  public static class Result { private final String text; public Result(String t){this.text=t;} public String getText(){return text;}}
  public void release(){releases++;}
 }`,
-      'Harness.java': `import com.imcodes.speech.StreamingSpeechPlugin; import com.getcapacitor.PluginCall; import com.k2fsa.sherpa.onnx.*; import android.media.AudioRecord; import java.util.concurrent.*;
+      'Harness.java': `import com.imcodes.speech.StreamingSpeechPlugin; import com.imcodes.speech.SpeechGainTest; import com.getcapacitor.PluginCall; import com.k2fsa.sherpa.onnx.*; import android.media.AudioRecord; import android.media.MediaRecorder; import android.media.audiofx.AutomaticGainControl; import java.util.concurrent.*;
 public class Harness {
  static class Subject extends StreamingSpeechPlugin {void destroy(){handleOnDestroy();}}
  static void await(CountDownLatch l)throws Exception{if(!l.await(4,TimeUnit.SECONDS))throw new AssertionError("timeout");}
@@ -389,6 +453,35 @@ public class Harness {
    for (int w=0; w<=13; w++) { if (w>0) expectedWords.append(' '); expectedWords.append(String.format("word%03d", w)); }
    check(p.events.stream().filter(x->x.contains("isFinal=true")).anyMatch(x->x.contains(expectedWords.toString())),p.events);
    check(OfflineStream.created==OfflineStream.released,p.events);System.out.println("WINDOW_AND_RELEASE_OK");
+   check(AutomaticGainControl.created>=1 && AutomaticGainControl.enabled==AutomaticGainControl.created, "AGC should attach and enable");
+   check(AutomaticGainControl.disabled==AutomaticGainControl.created && AutomaticGainControl.released==AutomaticGainControl.created,
+    "AGC must disable and release once per session: disabled="+AutomaticGainControl.disabled+" released="+AutomaticGainControl.released+" created="+AutomaticGainControl.created);
+   System.out.println("AGC_LIFECYCLE_OK");
+   String[] agcModes = {"unavailable", "null", "throwCreate", "failEnable", "throwEnable", "throwRelease"};
+   for (String mode : agcModes) {
+    AutomaticGainControl.reset();
+    if (mode.equals("unavailable")) AutomaticGainControl.available = false;
+    if (mode.equals("null")) AutomaticGainControl.returnNullOnCreate = true;
+    if (mode.equals("throwCreate")) AutomaticGainControl.throwOnCreate = true;
+    if (mode.equals("failEnable")) AutomaticGainControl.failEnable = true;
+    if (mode.equals("throwEnable")) AutomaticGainControl.throwOnEnable = true;
+    if (mode.equals("throwRelease")) AutomaticGainControl.throwOnRelease = true;
+    p.events.clear();AudioRecord.chunksPerStart=1;AudioRecord.silentChunksPerStart=0;OfflineRecognizer.decoded=new CountDownLatch(1);
+    PluginCall modeStart=new PluginCall();p.start(modeStart);await(modeStart.done);await(AudioRecord.delivered);
+    check(modeStart.error==null, "AGC mode "+mode+" must be non-fatal: "+modeStart.error);
+    PluginCall modeStop=new PluginCall();p.stop(modeStop);await(modeStop.done);
+    check(finals(p)==1, "AGC mode "+mode+" failed to deliver final result");
+    check(AutomaticGainControl.released==AutomaticGainControl.created, "AGC mode "+mode+" leaked AutomaticGainControl");
+   }
+   AutomaticGainControl.reset();
+   AudioRecord.failMicSource = true;
+   p.events.clear();AudioRecord.chunksPerStart=1;AudioRecord.silentChunksPerStart=0;OfflineRecognizer.decoded=new CountDownLatch(1);
+   PluginCall fbStart=new PluginCall();p.start(fbStart);await(fbStart.done);await(AudioRecord.delivered);
+   check(AudioRecord.lastSource==MediaRecorder.AudioSource.VOICE_RECOGNITION, "MIC init failure must fall back to VOICE_RECOGNITION");
+   PluginCall fbStop=new PluginCall();p.stop(fbStop);await(fbStop.done);
+   check(finals(p)==1, "fallback source failed to deliver final result");
+   AudioRecord.failMicSource = false;
+   System.out.println("AGC_FALLBACK_OK");
   } finally {p.destroy();}
   for(int i=0;i<100&&OfflineRecognizer.releases==0;i++)Thread.sleep(5);check(OfflineRecognizer.releases==1,OfflineRecognizer.releases);
   OfflineRecognizer.entered=new CountDownLatch(1);OfflineRecognizer.release=new CountDownLatch(1);AudioRecord.chunksPerStart=330;
@@ -400,16 +493,20 @@ public class Harness {
   for(int i=0;i<100&&OfflineRecognizer.releases<3;i++)Thread.sleep(5);
   check(retired.events.stream().noneMatch(x->x.contains("partialResults")),retired.events);
   check(OfflineStream.created==OfflineStream.released,retired.events);System.out.println("OWNER_RETIRE_OK");
+  SpeechGainTest.main(new String[0]);
  }
-}`,
+}
+`,
     };
     const sources: string[] = [];
     for (const [relative, content] of Object.entries(files)) { const full=join(srcDir, relative); await mkdir(dirname(full),{recursive:true});await writeFile(full,content);sources.push(full); }
+    sources.push(fileURLToPath(new URL('../../web/plugins/streaming-speech/android/src/main/java/com/imcodes/speech/SpeechGain.java',import.meta.url)));
     sources.push(fileURLToPath(new URL('../../web/plugins/streaming-speech/android/src/main/java/com/imcodes/speech/StreamingSpeechPlugin.java',import.meta.url)));
+    sources.push(fileURLToPath(new URL('../../web/plugins/streaming-speech/android/src/test/java/com/imcodes/speech/SpeechGainTest.java',import.meta.url)));
     execFileSync('javac',['-d',classesDir,...sources],{stdio:'pipe',timeout:30000});
     for (const failure of ['none', 'runtime', 'linkage']) {
       const output=execFileSync('java',['-Djava.io.tmpdir='+root, '-DnnapiFailure='+failure, '-cp',classesDir,'Harness'],{encoding:'utf8',timeout:15000}).trim().split('\n');
-      expect(output, `NNAPI ${failure}`).toEqual(['COLD_STOP_OK','WARM_REUSE_OK','SINGLE_TAIL_DRAIN_OK','SILENCE_SEGMENT_OK','WINDOW_AND_RELEASE_OK','OVERFLOW_OK','OWNER_RETIRE_OK']);
+      expect(output, `NNAPI ${failure}`).toEqual(['COLD_STOP_OK','WARM_REUSE_OK','SINGLE_TAIL_DRAIN_OK','SILENCE_SEGMENT_OK','WINDOW_AND_RELEASE_OK','AGC_LIFECYCLE_OK','AGC_FALLBACK_OK','OVERFLOW_OK','OWNER_RETIRE_OK','SpeechGainTest: ALL 6 TESTS PASSED']);
     }
   });
 });
