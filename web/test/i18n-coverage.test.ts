@@ -656,4 +656,58 @@ describe('generic i18n coverage guard', () => {
       }
     }
   });
+
+  it('keeps settings tab labels and complete User Guide keys present and translated in all 7 locales', () => {
+    const GUIDE_SECTION_IDS = [
+      'overview',
+      'team',
+      'taskPairs',
+      'executionPools',
+      'controlledNodes',
+      'remoteDesktopOcu',
+      'quickInputVoice',
+      'aliasesVerification',
+      'isolationLiveness',
+      'memoryIdentity',
+      'autoCronMobile',
+    ] as const;
+    const GUIDE_TOP_KEYS = [
+      'settings.tab_settings',
+      'settings.tab_guide',
+      'guide.kicker',
+      'guide.title',
+      'guide.subtitle',
+      'guide.quick_jump',
+      'guide.expand_all',
+      'guide.collapse_all',
+      'guide.pain_label',
+      'guide.solution_label',
+      'guide.tips_label',
+    ] as const;
+    const SECTION_FIELDS = ['pill', 'title', 'tagline', 'pain', 'solution', 'tip_1', 'tip_2', 'tip_3'] as const;
+
+    const enMessages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales/en.json'), 'utf8')) as unknown;
+    const enTitle = readPath(enMessages, 'guide.title');
+
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as unknown;
+      for (const key of GUIDE_TOP_KEYS) {
+        const value = readPath(messages, key);
+        expect(value, `${locale}:${key}`).toEqual(expect.any(String));
+        expect((value as string | undefined)?.trim().length, `${locale}:${key}`).toBeGreaterThan(0);
+      }
+      if (locale !== 'en') {
+        expect(readPath(messages, 'guide.title'), `${locale}:guide.title must be translated`).not.toBe(enTitle);
+        expect(readPath(messages, 'settings.tab_guide'), `${locale}:settings.tab_guide must be translated`).not.toBe('User Guide');
+      }
+      for (const id of GUIDE_SECTION_IDS) {
+        for (const field of SECTION_FIELDS) {
+          const key = `guide.sections.${id}.${field}`;
+          const value = readPath(messages, key);
+          expect(value, `${locale}:${key}`).toEqual(expect.any(String));
+          expect((value as string | undefined)?.trim().length, `${locale}:${key}`).toBeGreaterThan(0);
+        }
+      }
+    }
+  });
 });

@@ -120,7 +120,7 @@ describe('SettingsPage', () => {
     expect(screen.getByText('alice')).toBeDefined();
   });
 
-  it('shows a persistent Team discussion explainer for later review', () => {
+  it('keeps Team discussion out of Settings tab and mounts standalone GuidePage in the User Guide tab', () => {
     render(
       <SettingsPage
         displayName="Alice"
@@ -133,9 +133,40 @@ describe('SettingsPage', () => {
       />,
     );
 
-    expect(screen.getByText('settings.team_discussion_title')).toBeDefined();
-    expect(screen.getByText('settings.team_discussion_body')).toBeDefined();
-    expect(screen.getByText('settings.team_discussion_point_3')).toBeDefined();
+    expect(screen.queryByText('settings.team_discussion_title')).toBeNull();
+    expect(screen.queryByTestId('guide-page')).toBeNull();
+
+    const settingsTab = screen.getByRole('tab', { name: 'settings.tab_settings' });
+    const guideTab = screen.getByRole('tab', { name: 'settings.tab_guide' });
+    expect(settingsTab.getAttribute('aria-selected')).toBe('true');
+    expect(guideTab.getAttribute('aria-selected')).toBe('false');
+
+    fireEvent.click(guideTab);
+    expect(guideTab.getAttribute('aria-selected')).toBe('true');
+    expect(screen.getByTestId('guide-page')).toBeDefined();
+    expect(screen.getByText('guide.sections.team.title')).toBeDefined();
+    expect(screen.queryByText('settings.change_password')).toBeNull();
+  });
+
+  it('establishes a bounded mobile-first scroll container with safe-area bottom padding', () => {
+    render(
+      <SettingsPage
+        displayName="Alice"
+        username="alice"
+        hasPassword
+        serverUrl="https://app.im.codes"
+        onBack={vi.fn()}
+        onDisplayNameChanged={vi.fn()}
+        onUserAuthUpdated={vi.fn()}
+      />,
+    );
+
+    const scroll = screen.getByTestId('settings-page-scroll');
+    expect(scroll.style.overflowY).toBe('auto');
+    expect(scroll.style.minHeight).toBe('0px');
+    expect(scroll.style.touchAction).toBe('pan-y');
+    const inner = scroll.firstElementChild as HTMLElement | null;
+    expect(inner?.style.paddingBottom).toContain('--sab');
   });
 
   it('maps structured API error codes for password setup', async () => {

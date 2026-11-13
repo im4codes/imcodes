@@ -5520,6 +5520,11 @@ describe('App shell', () => {
 
     fireEvent.click(screen.getByText('server-settings'));
     expect(await screen.findByText('settings-page')).toBeTruthy();
+    const settingsOverlay = screen.getByTestId('settings-page-overlay');
+    expect(settingsOverlay.style.display).toBe('flex');
+    expect(settingsOverlay.style.flexDirection).toBe('column');
+    expect(settingsOverlay.style.height).toBe('var(--vvh, 100dvh)');
+    expect(settingsOverlay.style.overflow).toBe('hidden');
     fireEvent.click(screen.getByText('settings-display'));
     fireEvent.click(screen.getByText('settings-auth'));
     fireEvent.click(screen.getByText('settings-back'));

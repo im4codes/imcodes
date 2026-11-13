@@ -2215,7 +2215,9 @@
     "push_group_security": "安全警示",
     "push_security_highest_badge": "最高級別警告",
     "push_remote_desktop_title": "遠端桌面自動解鎖提醒",
-    "push_remote_desktop_desc": "偵測到憑證被用於遠端桌面自動解鎖，屬於最高安全告警級別，強烈建議保持開啟"
+    "push_remote_desktop_desc": "偵測到憑證被用於遠端桌面自動解鎖，屬於最高安全告警級別，強烈建議保持開啟",
+    "tab_settings": "設定",
+    "tab_guide": "使用指南"
   },
   "capabilities": {
     "eyebrow": "跨 Agent 的 AI 能力",
@@ -5018,5 +5020,128 @@
     "preparing": "正在推送至 R2，隨後開始下載",
     "estimating": "正在估算等待時間…",
     "eta": "預計還需 {{seconds}} 秒"
+  },
+  "guide": {
+    "kicker": "IM.codes 工程底座指南",
+    "title": "使用指南與系統架構解析",
+    "subtitle": "IM.codes 不是另一個 AI IDE 或單純遠端終端——它是圍繞終端（tmux/ConPTY）與 SDK 編碼 Agent 打造的編排、記憶、隔離與跨模型審計底座（Harness）。",
+    "quick_jump": "快速跳轉",
+    "expand_all": "全部展開",
+    "collapse_all": "全部摺疊",
+    "pain_label": "解決的痛點",
+    "solution_label": "IM.codes 的解決方式",
+    "tips_label": "實用技巧",
+    "sections": {
+      "overview": {
+        "pill": "為何選擇 IM.codes",
+        "title": "Harness 總覽：突破桌面與單一模型限制",
+        "tagline": "離開電腦依然隨時可控，以工程底座彌補單一模型的盲點與脆弱性。",
+        "pain": "離開電腦後，終端內的 Agent 工作流經常中斷（只能靠繁瑣的 SSH/tmux）；同時單一模型長時執行容易產生慣性盲點、靜默偏離，或因當機而遺失上下文。",
+        "solution": "IM.codes 為本地 CLI 與 SDK Agent（Claude Code、Codex、Gemini CLI、Qwen、OpenClaw）提供完整底座：持久化時間線、檔案/Git 預覽、安全本機預覽隧道、Worktree 隔離、共享記憶與跨模型審查。",
+        "tip_1": "在開發機執行 `imcodes bind`，即可於手機、iPad 或 Web 儀表板即時查看與接管工作階段。",
+        "tip_2": "可隨時在原始 PTY 終端與結構化聊天時間線（含工具呼叫與思考區塊）間切換。",
+        "tip_3": "將檔案瀏覽器、Repo 儀表板或子工作階段釘選（Pin）到側邊欄，跨裝置同步維持可見性。"
+      },
+      "team": {
+        "pill": "Team 多Agent討論",
+        "title": "Team 多模型協作討論",
+        "tagline": "在寫下第一行程式碼前，讓不同模型互相挑戰與互補。",
+        "pain": "單一模型審查自己的產出常有盲點，容易漏掉競態條件、資料庫遷移、API 邊界或架構缺陷。",
+        "solution": "Team 討論不僅適合寫程式，同樣適合複雜文件、OpenSpec 提案、審計與重要決策。透過多階段流程（`audit → review → plan`、`review`、`discuss`、`brainstorm`），讓 Claude Code、Codex、Gemini CLI 與 Qwen 閱讀並挑戰前序結論。",
+        "tip_1": "先在輸入框寫好主題或草案，再選擇討論模式或輸入 `@@all(config)` 啟動討論。",
+        "tip_2": "困難任務可增加輪數（`@@all+`），讓上一輪結論持續被覆核與加固。",
+        "tip_3": "先用 `audit` / `review` 模式跑完 OpenSpec 規格與設計決策，可大幅減少返工。"
+      },
+      "taskPairs": {
+        "pill": "Task Pair 任務對",
+        "title": "Task Pair 與跨供應商獨立審計",
+        "tagline": "Brain + Executor + Auditor 嚴格收斂流程，杜絕自我評分幻覺。",
+        "pain": "無人看管時，單一 Agent 常在未驗證完成前自稱成功，或悄悄跳過失敗斷言、陷入空轉。",
+        "solution": "IM.codes 分離協調者（Brain）、執行者（Executor，於獨立 Worktree/目錄作業）與獨立審計者（Auditor，可跨廠商指派），透過 `STARTED → READY_FOR_AUDIT → PASS / REWORK → DONE` 狀態機與檢核清單確保收斂。",
+        "tip_1": "跨檔案修改、整合、安全或實機任務務必指派獨立 Auditor；僅極小修改才用 `auditor=none`。",
+        "tip_2": "多階段交付可透過多輪模式（`pair_next_round`）針對明確 commit 逐輪驗收。",
+        "tip_3": "遇到範圍或環境無法裁決的問題時，由決策請求上報 Brain/Owner 決定，避免無效循環。"
+      },
+      "executionPools": {
+        "pill": "執行池路由",
+        "title": "Pair Execution Pool 執行池（Primary / Economy）",
+        "tagline": "依角色路由模型與併發上限，兼顧速度、成本與審查品質。",
+        "pain": "所有任務與複審都用旗艦模型會快速消耗額度且延遲高；全部交給小模型又會降低程式碼與審計品質。",
+        "solution": "設定 Primary（主力池）與 Economy（經濟池），為每個項目指定 Provider/Model 與角色（`executor`、`auditor`、`both`）及併發上限 `maxConcurrency`，在控管預算的同時守住跨模型審查門檻。",
+        "tip_1": "依任務風險高低分別指派至 Primary 或 Economy 執行池。",
+        "tip_2": "讓高效模型擔任 `executor`，並指定不同模型家族擔任 `auditor` 以實現交叉驗證。",
+        "tip_3": "依主機記憶體與 API 限流調整 `maxConcurrency`，防止平行任務塞爆機器資源。"
+      },
+      "controlledNodes": {
+        "pill": "受控節點",
+        "title": "Controlled Nodes 受控節點",
+        "tagline": "安全操作多台 Windows / macOS / Linux 電腦，無需每台皆設為完整原始碼伺服器。",
+        "pain": "建置機、GPU 主機或跨平台測試環境分散在各處，為每台機器開放完整開發伺服器或手動搬檔既繁瑣又危險。",
+        "solution": "將電腦註冊為受控節點並以 `^` 或 `^^(名稱)` 選取，授權 Agent 即可透過 `exec_remote` 執行受控指令與點對點/中繼傳檔。節點擁有獨立可撤銷憑證，與一般伺服器清單完全隔離。",
+        "tip_1": "可保留已下載的節點安裝程式快速納管多台設備，並隨時於設定中停用或撤銷存取權。",
+        "tip_2": "在輸入框輸入 `^` 或透過受管 MCP 工具直接對選定節點下達作業。",
+        "tip_3": "只傳輸驗證所需的建置產物或日誌，不在測試機留下敏感專案憑證。"
+      },
+      "remoteDesktopOcu": {
+        "pill": "遠端桌面與 OCU",
+        "title": "遠端桌面、監控牆與 OCU 桌面操作",
+        "tagline": "Agent 結構化 GUI/瀏覽器操作 + 人類低延遲接管 + 最高安全推播警示。",
+        "pain": "純終端測試無法涵蓋桌面 UI 與瀏覽器登入流程；每步傳全螢幕截圖極耗 Token；未受監控的遠端自動解鎖風險極高。",
+        "solution": "支援的 SDK Agent 可透過型別化 OCU 工具與本機迴環 CDP 瀏覽器自動化操作介面（預設回傳文字快照）。人類可隨時在瀏覽器/手機開啟 Windows 遠端桌面與多節點 Wall 檢視或接管，並由最高安全等級的自動解鎖推播把關。",
+        "tip_1": "手機端提供觸控操作與虛擬滑鼠，並可在檢視（View）與控制（Control）模式間切換。",
+        "tip_2": "網頁偵錯優先採用 CDP 結構化快照，需要視覺比對時再擷取畫面。",
+        "tip_3": "建議永遠保持「遠端桌面自動解鎖警示」推播為開啟狀態。"
+      },
+      "quickInputVoice": {
+        "pill": "快捷輸入與語音",
+        "title": "快捷輸入、智慧選單與離線串流語音",
+        "tagline": "行動裝置快速指令輸入，離線語音識別且暫停保留草稿。",
+        "pain": "在手機上重複輸入長提示詞、檔案路徑與指令極為耗時；多數雲端語音在暫停或切換手打時容易遺失草稿。",
+        "solution": "Quick Input 儲存常用片段與指令，`@` 搜尋檔案、`@@` 選取 Team Agent、`/` 補全原生命令。iOS/行動端內建裝置端離線串流語音，支援在「暫停 → 切回麥克風或送出」之間完整保留草稿。",
+        "tip_1": "將常用測試指令、審查清單與固定前綴存入 Quick Input 一鍵插入。",
+        "tip_2": "用 `@` 精準插入路徑，用 `@@all(config)` 快速觸發既定 Team 討論設定。",
+        "tip_3": "語音口述到一半可先暫停手動微調參數，接著繼續口述或直接發送而不遺失內容。"
+      },
+      "aliasesVerification": {
+        "pill": "私密別名與驗證機",
+        "title": "Private Aliases 私密別名與驗證機授權",
+        "tagline": "`;` / `;;(name)` 頻外解析降低上下文噪音，鎖定授權實機測試目標。",
+        "pain": "反覆把主機名稱、路徑或測試帳號貼進對話會膨脹上下文並增加批次傾印風險；實機測試也常缺乏一致的機器綁定。",
+        "solution": "輸入 `;` 插入 `;;(name)` 私密別名，介面保持精簡標記並由系統頻外解析（MCP 批次清單僅曝露中繼資料）。Verification Machines 為專案綁定長效授權的受控節點或 SSH 別名 ID。",
+        "tip_1": "把常用路徑、測試端點或固定識別字存為私密別名，維持提示詞精簡安全。",
+        "tip_2": "透過 `verification_machine_list` 與 `verification_machine_verify` 確認驗證機狀態。",
+        "tip_3": "SSH 驗證僅檢查既有的穩定別名綁定，不會上傳私鑰或連線憑證。"
+      },
+      "isolationLiveness": {
+        "pill": "隔離與高優存活通道",
+        "title": "Worktree 隔離、緊急存活通道與主機安全防護",
+        "tagline": "主分支零污染、`/stop` 即時中斷、共享權限隔離與無痕模式。",
+        "pain": "多個 Agent 修改同一目錄會彼此覆寫；記憶處理或 Hook 阻塞會拖慢 `/stop`；共享主機時參與者可能越權；敏感對話不該留下歷史記憶。",
+        "solution": "程式碼任務皆在獨立 Git Worktree 進行，確保主工作區乾淨。Urgent Liveness Lane 讓 `/stop` 與指令 ACK 優先於記憶和 Hook 執行；Shared-Machine Authority 於參與者輸入期間隔離權限直至空閒邊緣；無痕模式（Incognito）全程記憶體運行不落盤。",
+        "tip_1": "由 Brain 審查後再從 Pair Worktree 合併至主開發分支，避免平行編輯衝突。",
+        "tip_2": "處理高機密對話時啟用無痕模式，不寫入本機或雲端持久記憶。",
+        "tip_3": "即使背景工具正在執行，仍可隨時發送 `/stop` 透過緊急通道立即中止目前回合。"
+      },
+      "memoryIdentity": {
+        "pill": "共享記憶與四層身分",
+        "title": "共享上下文記憶與四層確定性身分階層",
+        "tagline": "沉澱「問題→解法」精要，並以 User → Project → Pair → Session 鎖定規範。",
+        "pain": "冗長原始 log 會淹沒重點，更換模型就忘記專案脈絡；單靠對話提醒的規則在長任務中也容易遺忘。",
+        "solution": "IM.codes 僅將最終 `assistant.text` 提煉為記憶摘要，支援本機語意搜尋與伺服器端 pgvector 多語言召回；確定性規範則透過四層階層（User 100k → Project 300k → Pair 200k → Session 300k）在每次重啟與回合穩定注入。",
+        "tip_1": "將長期架構規範寫入 Project Identity，動態發現的事實以 `save_observation` 保存。",
+        "tip_2": "在時間線檢視每張召回卡片的相關度分數，必要時用 `get_memory_sources` 展開原文證據。",
+        "tip_3": "於 Shared Context 介面隨時查詢、預覽、封存或還原記憶項目。"
+      },
+      "autoCronMobile": {
+        "pill": "Auto Deliver、Cron 與 Watch",
+        "title": "OpenSpec Auto Deliver、排程任務與行動/手錶聯動",
+        "tagline": "端到端受監督交付管線、定時自動執行與腕間即時推播。",
+        "pain": "長流程常卡在等待手動輸入「繼續」；例行檢查缺少自動排程；離開座位漏接 Agent 提問會拖慢整天進度。",
+        "solution": "OpenSpec Auto Deliver 串聯規格審計、實作迴圈、自動模組評分與 Team 複審，並在交接前保持人類最終控制權。視覺化 Cron 管理定時任務與歷史結果；OTA 升級、生物辨識與 Apple Watch 支援在腕間掌握進度並快速回覆。",
+        "tip_1": "依變更風險選擇 `fast`、`standard`、`strict` 或 `deep` 交付預設。",
+        "tip_2": "運用 Cron 面板或 `cron_create_self` 設定週期性驗證或自我喚醒巡檢。",
+        "tip_3": "在設定頁細分基礎、任務生命週期與安全警示推播，只接收真正重要的通知。"
+      }
+    }
   }
 }

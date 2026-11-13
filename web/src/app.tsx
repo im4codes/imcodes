@@ -8618,7 +8618,14 @@ function InternalMainApp() {
       )}
 
       {showSettingsPage && (
-        <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: '#0a0e1a', paddingTop: 'var(--sat, 0px)' }}>
+        <div
+          data-testid="settings-page-overlay"
+          style={{
+            position: 'fixed', inset: 0, zIndex: 9999, display: 'flex', flexDirection: 'column',
+            width: '100%', height: 'var(--vvh, 100dvh)', maxHeight: 'var(--vvh, 100dvh)', minHeight: 0, boxSizing: 'border-box',
+            background: '#0a0e1a', paddingTop: 'var(--sat, 0px)', overflow: 'hidden',
+          }}
+        >
           <SettingsPage
             displayName={userDisplayName}
             username={username}

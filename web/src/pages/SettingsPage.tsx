@@ -21,19 +21,35 @@ import {
   syncPushNotificationPreferences,
   hasUnsyncedPushNotificationEdits,
 } from '../push-notifications.js';
+import { GuidePage } from './GuidePage.js';
+
+export type SettingsTab = 'settings' | 'guide';
 
 interface Props {
   displayName: string | null;
   username: string | null;
   hasPassword: boolean;
   serverUrl?: string | null;
+  initialTab?: SettingsTab;
   onBack: () => void;
   onDisplayNameChanged: (name: string) => void;
   onUserAuthUpdated: (next: { username: string | null; hasPassword: boolean }) => void;
 }
 
-export function SettingsPage({ displayName, username, hasPassword, serverUrl, onBack, onDisplayNameChanged, onUserAuthUpdated }: Props) {
+export function SettingsPage({
+  displayName,
+  username,
+  hasPassword,
+  serverUrl,
+  initialTab = 'settings',
+  onBack,
+  onDisplayNameChanged,
+  onUserAuthUpdated,
+}: Props) {
   const { t } = useTranslation();
+
+  const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab);
+  const scrollRef = useRef<HTMLDivElement>(null);
 
   const [editingName, setEditingName] = useState(false);
   const [nameValue, setNameValue] = useState(displayName ?? '');
@@ -70,10 +86,17 @@ export function SettingsPage({ displayName, username, hasPassword, serverUrl, on
     };
   }, []);
 
+  const handleSelectTab = (tab: SettingsTab) => {
+    setActiveTab(tab);
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = 0;
+    }
+  };
+
   const togglePushType = (type: PushNotificationType) => {
     userEditedPushRef.current = true;
     setPushPreferences((prev) => {
-      const next = prev.includes(type) ? prev.filter((t) => t !== type) : [...prev, type];
+      const next = prev.includes(type) ? prev.filter((item) => item !== type) : [...prev, type];
       void syncPushNotificationPreferences(next);
       return next;
     });
@@ -224,46 +247,6 @@ export function SettingsPage({ displayName, username, hasPassword, serverUrl, on
     }
   };
 
-  const cardStyle: Record<string, string> = {
-    background: '#1e293b',
-    borderRadius: '12px',
-    padding: '20px',
-    marginBottom: '16px',
-  };
-
-  const inputStyle: Record<string, string> = {
-    width: '100%',
-    padding: '10px 12px',
-    background: '#0f172a',
-    border: '1px solid #334155',
-    borderRadius: '8px',
-    color: '#e2e8f0',
-    fontSize: '14px',
-    marginBottom: '10px',
-    boxSizing: 'border-box',
-  };
-
-  const btnPrimary: Record<string, string> = {
-    padding: '10px 20px',
-    background: '#3b82f6',
-    color: '#fff',
-    border: 'none',
-    borderRadius: '8px',
-    cursor: 'pointer',
-    fontSize: '14px',
-    fontWeight: '600',
-  };
-
-  const btnSecondary: Record<string, string> = {
-    padding: '8px 16px',
-    background: '#334155',
-    color: '#e2e8f0',
-    border: 'none',
-    borderRadius: '8px',
-    cursor: 'pointer',
-    fontSize: '14px',
-  };
-
   const inlineLabelStyle: Record<string, string> = {
     fontSize: '12px',
     color: '#94a3b8',
@@ -272,50 +255,42 @@ export function SettingsPage({ displayName, username, hasPassword, serverUrl, on
     marginBottom: '6px',
   };
 
-  const checkboxRowStyle: Record<string, string> = {
-    display: 'flex',
-    gap: '10px',
-    alignItems: 'flex-start',
-    cursor: 'pointer',
-    padding: '8px 10px',
-    borderRadius: '6px',
-    background: '#0f172a',
-  };
-
   const checkboxStyle: Record<string, string> = {
     marginTop: '3px',
     cursor: 'pointer',
-    width: '16px',
-    height: '16px',
+    width: '18px',
+    height: '18px',
+    flexShrink: '0',
+  };
+
+  const checkboxTextWrapStyle: Record<string, string> = {
+    flex: '1 1 auto',
+    minWidth: '0',
   };
 
   const checkboxTitleStyle: Record<string, string> = {
     fontSize: '13px',
     fontWeight: '600',
     color: '#e2e8f0',
+    overflowWrap: 'anywhere',
   };
 
   const checkboxDescStyle: Record<string, string> = {
     fontSize: '12px',
     color: '#94a3b8',
     marginTop: '2px',
-    lineHeight: '1.4',
+    lineHeight: '1.45',
+    overflowWrap: 'anywhere',
   };
 
   const pushGroupTitleStyle: Record<string, string> = {
-    fontSize: '13px',
+    fontSize: '12px',
     fontWeight: '700',
     color: '#94a3b8',
     textTransform: 'uppercase',
     letterSpacing: '0.04em',
     marginBottom: '8px',
     marginTop: '16px',
-  };
-
-  const securityRowStyle: Record<string, string> = {
-    ...checkboxRowStyle,
-    background: 'rgba(239, 68, 68, 0.08)',
-    border: '1px solid rgba(239, 68, 68, 0.35)',
   };
 
   const securityBadgeStyle: Record<string, string> = {
@@ -331,322 +306,371 @@ export function SettingsPage({ displayName, username, hasPassword, serverUrl, on
     verticalAlign: 'middle',
   };
 
-  const teamPointStyle: Record<string, string> = {
-    display: 'flex',
-    gap: '8px',
-    alignItems: 'flex-start',
-    color: '#cbd5e1',
-    fontSize: '13px',
-    lineHeight: '1.55',
-  };
-
   const messageColor = (type: 'ok' | 'err'): string => (type === 'ok' ? '#4ade80' : '#f87171');
 
   return (
-    <div style={{ background: '#0a0e1a', color: '#e2e8f0', minHeight: '100%', padding: '20px', overflowY: 'auto' }}>
-      <div style={{ maxWidth: '920px', margin: '0 auto' }}>
-        <button onClick={onBack} style={{ ...btnSecondary, marginBottom: '20px' }}>
-          {t('settings.back')}
-        </button>
-        <h1 style={{ fontSize: '24px', fontWeight: '700', marginBottom: '24px' }}>{t('settings.title')}</h1>
+    <div
+      class="settings-page-root"
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        flex: '1 1 auto',
+        width: '100%',
+        height: '100%',
+        minHeight: 0,
+        overflow: 'hidden',
+        background: '#0a0e1a',
+        color: '#e2e8f0',
+      }}
+    >
+      <header class="settings-page-header">
+        <div class="settings-page-header-inner">
+          <div class="settings-page-header-row">
+            <button type="button" onClick={onBack} class="settings-btn-secondary settings-back-btn">
+              {t('settings.back')}
+            </button>
+            <h1 class="settings-page-title">{t('settings.title')}</h1>
+          </div>
 
+          <div class="settings-tabs" role="tablist" aria-label={t('settings.title')}>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === 'settings'}
+              class={`settings-tab-btn${activeTab === 'settings' ? ' is-active' : ''}`}
+              onClick={() => handleSelectTab('settings')}
+            >
+              {t('settings.tab_settings')}
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === 'guide'}
+              class={`settings-tab-btn${activeTab === 'guide' ? ' is-active' : ''}`}
+              onClick={() => handleSelectTab('guide')}
+            >
+              {t('settings.tab_guide')}
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <div
+        ref={scrollRef}
+        data-testid="settings-page-scroll"
+        class="settings-page-scroll"
+        style={{
+          flex: '1 1 auto',
+          minHeight: 0,
+          width: '100%',
+          overflowY: 'auto',
+          overflowX: 'hidden',
+          WebkitOverflowScrolling: 'touch',
+          overscrollBehaviorY: 'contain',
+          touchAction: 'pan-y',
+        }}
+      >
         <div
+          class="settings-page-inner"
           style={{
-            ...cardStyle,
-            background: 'linear-gradient(135deg, #102033 0%, #182235 58%, #111827 100%)',
-            border: '1px solid rgba(96, 165, 250, 0.28)',
+            paddingBottom: 'calc(28px + max(var(--sab, 0px), env(safe-area-inset-bottom, 0px)))',
           }}
         >
-          <div style={inlineLabelStyle}>{t('settings.team_discussion_label')}</div>
-          <h2 style={{ fontSize: '17px', fontWeight: '700', margin: '0 0 10px', color: '#e5edf7' }}>
-            {t('settings.team_discussion_title')}
-          </h2>
-          <p style={{ color: '#b6c2d2', fontSize: '14px', lineHeight: 1.6, margin: '0 0 12px' }}>
-            {t('settings.team_discussion_body')}
-          </p>
-          <div style={{ display: 'grid', gap: '8px' }}>
-            <div style={teamPointStyle}>
-              <span aria-hidden="true" style={{ color: '#60a5fa', fontWeight: '700' }}>01</span>
-              <span>{t('settings.team_discussion_point_1')}</span>
-            </div>
-            <div style={teamPointStyle}>
-              <span aria-hidden="true" style={{ color: '#60a5fa', fontWeight: '700' }}>02</span>
-              <span>{t('settings.team_discussion_point_2')}</span>
-            </div>
-            <div style={teamPointStyle}>
-              <span aria-hidden="true" style={{ color: '#60a5fa', fontWeight: '700' }}>03</span>
-              <span>{t('settings.team_discussion_point_3')}</span>
-            </div>
-          </div>
-        </div>
-
-        <div style={cardStyle}>
-          <h2 style={{ fontSize: '16px', fontWeight: '600', marginBottom: '12px', color: '#94a3b8' }}>
-            {t('settings.account_identity')}
-          </h2>
-          <div style={inlineLabelStyle}>{t('settings.username')}</div>
-          <div style={{ fontSize: '16px', marginBottom: '14px' }}>{username ?? t('settings.no_username')}</div>
-          <div style={inlineLabelStyle}>{t('settings.display_name')}</div>
-          {!editingName ? (
-            <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-              <span style={{ fontSize: '16px' }}>{displayName || t('settings.no_name')}</span>
-              <button onClick={() => { setEditingName(true); setNameValue(displayName ?? ''); setNameMsg(null); }} style={btnSecondary}>
-                {t('settings.edit')}
-              </button>
+          {activeTab === 'guide' ? (
+            <div role="tabpanel" aria-label={t('settings.tab_guide')}>
+              <GuidePage />
             </div>
           ) : (
-            <div>
-              <input
-                type="text"
-                value={nameValue}
-                onInput={(e) => setNameValue((e.target as HTMLInputElement).value)}
-                style={inputStyle}
-                placeholder={t('settings.name_placeholder')}
-              />
-              <div style={{ display: 'flex', gap: '8px' }}>
-                <button onClick={handleSaveName} disabled={nameSaving} style={btnPrimary}>
-                  {nameSaving ? t('common.loading') : t('settings.save')}
-                </button>
-                <button onClick={() => { setEditingName(false); setNameMsg(null); }} style={btnSecondary}>
-                  {t('common.cancel')}
-                </button>
+            <div role="tabpanel" aria-label={t('settings.tab_settings')}>
+              <div class="settings-card">
+                <h2 class="settings-card-heading">
+                  {t('settings.account_identity')}
+                </h2>
+                <div style={inlineLabelStyle}>{t('settings.username')}</div>
+                <div class="settings-identity-value">{username ?? t('settings.no_username')}</div>
+                <div style={inlineLabelStyle}>{t('settings.display_name')}</div>
+                {!editingName ? (
+                  <div class="settings-name-row">
+                    <span class="settings-identity-value settings-identity-inline">
+                      {displayName || t('settings.no_name')}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => { setEditingName(true); setNameValue(displayName ?? ''); setNameMsg(null); }}
+                      class="settings-btn-secondary"
+                    >
+                      {t('settings.edit')}
+                    </button>
+                  </div>
+                ) : (
+                  <div>
+                    <input
+                      type="text"
+                      value={nameValue}
+                      onInput={(e) => setNameValue((e.target as HTMLInputElement).value)}
+                      class="settings-input"
+                      placeholder={t('settings.name_placeholder')}
+                    />
+                    <div class="settings-action-row">
+                      <button
+                        type="button"
+                        onClick={handleSaveName}
+                        disabled={nameSaving}
+                        class="settings-btn-primary"
+                      >
+                        {nameSaving ? t('common.loading') : t('settings.save')}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => { setEditingName(false); setNameMsg(null); }}
+                        class="settings-btn-secondary"
+                      >
+                        {t('common.cancel')}
+                      </button>
+                    </div>
+                  </div>
+                )}
+                {nameMsg && (
+                  <div style={{ marginTop: '8px', fontSize: '13px', color: messageColor(nameMsg.type) }}>
+                    {nameMsg.text}
+                  </div>
+                )}
               </div>
-            </div>
-          )}
-          {nameMsg && (
-            <div style={{ marginTop: '8px', fontSize: '13px', color: messageColor(nameMsg.type) }}>
-              {nameMsg.text}
-            </div>
-          )}
-        </div>
 
-        {/* Push Notification Preferences */}
-        <div style={cardStyle} data-testid="push-notification-settings-card">
-          <div style={inlineLabelStyle}>{t('settings.push_notifications_label')}</div>
-          <h2 style={{ fontSize: '16px', fontWeight: '600', marginBottom: '6px', color: '#e2e8f0' }}>
-            {t('settings.push_notifications_title')}
-          </h2>
-          <p style={{ color: '#94a3b8', fontSize: '13px', lineHeight: 1.5, margin: '0 0 16px' }}>
-            {t('settings.push_notifications_desc')}
-          </p>
+              {/* Push Notification Preferences */}
+              <div class="settings-card" data-testid="push-notification-settings-card">
+                <div style={inlineLabelStyle}>{t('settings.push_notifications_label')}</div>
+                <h2 style={{ fontSize: '16px', fontWeight: '600', margin: '0 0 6px', color: '#e2e8f0' }}>
+                  {t('settings.push_notifications_title')}
+                </h2>
+                <p style={{ color: '#94a3b8', fontSize: '13px', lineHeight: 1.5, margin: '0 0 16px' }}>
+                  {t('settings.push_notifications_desc')}
+                </p>
 
-          {/* Group 1: Basic */}
-          <div style={pushGroupTitleStyle}>{t('settings.push_group_basic')}</div>
-          <div style={{ display: 'grid', gap: '8px' }}>
-            <label style={checkboxRowStyle}>
-              <input
-                type="checkbox"
-                aria-label={t('settings.push_task_complete_title')}
-                checked={pushPreferences.includes(PUSH_NOTIFICATION_TYPE_TASK_COMPLETE)}
-                onChange={() => togglePushType(PUSH_NOTIFICATION_TYPE_TASK_COMPLETE)}
-                style={checkboxStyle}
-              />
-              <div>
-                <div style={checkboxTitleStyle}>{t('settings.push_task_complete_title')}</div>
-                <div style={checkboxDescStyle}>{t('settings.push_task_complete_desc')}</div>
-              </div>
-            </label>
+                {/* Group 1: Basic */}
+                <div style={pushGroupTitleStyle}>{t('settings.push_group_basic')}</div>
+                <div style={{ display: 'grid', gap: '8px' }}>
+                  <label class="settings-checkbox-row">
+                    <input
+                      type="checkbox"
+                      aria-label={t('settings.push_task_complete_title')}
+                      checked={pushPreferences.includes(PUSH_NOTIFICATION_TYPE_TASK_COMPLETE)}
+                      onChange={() => togglePushType(PUSH_NOTIFICATION_TYPE_TASK_COMPLETE)}
+                      style={checkboxStyle}
+                    />
+                    <div style={checkboxTextWrapStyle}>
+                      <div style={checkboxTitleStyle}>{t('settings.push_task_complete_title')}</div>
+                      <div style={checkboxDescStyle}>{t('settings.push_task_complete_desc')}</div>
+                    </div>
+                  </label>
 
-            <label style={checkboxRowStyle}>
-              <input
-                type="checkbox"
-                aria-label={t('settings.push_waiting_input_title')}
-                checked={pushPreferences.includes(PUSH_NOTIFICATION_TYPE_WAITING_INPUT)}
-                onChange={() => togglePushType(PUSH_NOTIFICATION_TYPE_WAITING_INPUT)}
-                style={checkboxStyle}
-              />
-              <div>
-                <div style={checkboxTitleStyle}>{t('settings.push_waiting_input_title')}</div>
-                <div style={checkboxDescStyle}>{t('settings.push_waiting_input_desc')}</div>
-              </div>
-            </label>
+                  <label class="settings-checkbox-row">
+                    <input
+                      type="checkbox"
+                      aria-label={t('settings.push_waiting_input_title')}
+                      checked={pushPreferences.includes(PUSH_NOTIFICATION_TYPE_WAITING_INPUT)}
+                      onChange={() => togglePushType(PUSH_NOTIFICATION_TYPE_WAITING_INPUT)}
+                      style={checkboxStyle}
+                    />
+                    <div style={checkboxTextWrapStyle}>
+                      <div style={checkboxTitleStyle}>{t('settings.push_waiting_input_title')}</div>
+                      <div style={checkboxDescStyle}>{t('settings.push_waiting_input_desc')}</div>
+                    </div>
+                  </label>
 
-            <label style={checkboxRowStyle}>
-              <input
-                type="checkbox"
-                aria-label={t('settings.push_session_error_title')}
-                checked={pushPreferences.includes(PUSH_NOTIFICATION_TYPE_SESSION_ERROR)}
-                onChange={() => togglePushType(PUSH_NOTIFICATION_TYPE_SESSION_ERROR)}
-                style={checkboxStyle}
-              />
-              <div>
-                <div style={checkboxTitleStyle}>{t('settings.push_session_error_title')}</div>
-                <div style={checkboxDescStyle}>{t('settings.push_session_error_desc')}</div>
-              </div>
-            </label>
-          </div>
-
-          {/* Group 2: Task Lifecycle */}
-          <div style={pushGroupTitleStyle}>{t('settings.push_group_task_pair')}</div>
-          <div style={{ display: 'grid', gap: '8px' }}>
-            <label style={checkboxRowStyle}>
-              <input
-                type="checkbox"
-                aria-label={t('settings.push_task_pair_done_title')}
-                checked={pushPreferences.includes(PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE)}
-                onChange={() => togglePushType(PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE)}
-                style={checkboxStyle}
-              />
-              <div>
-                <div style={checkboxTitleStyle}>{t('settings.push_task_pair_done_title')}</div>
-                <div style={checkboxDescStyle}>{t('settings.push_task_pair_done_desc')}</div>
-              </div>
-            </label>
-
-            <label style={checkboxRowStyle}>
-              <input
-                type="checkbox"
-                aria-label={t('settings.push_task_pair_paused_title')}
-                checked={pushPreferences.includes(PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED)}
-                onChange={() => togglePushType(PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED)}
-                style={checkboxStyle}
-              />
-              <div>
-                <div style={checkboxTitleStyle}>{t('settings.push_task_pair_paused_title')}</div>
-                <div style={checkboxDescStyle}>{t('settings.push_task_pair_paused_desc')}</div>
-              </div>
-            </label>
-
-            <label style={checkboxRowStyle}>
-              <input
-                type="checkbox"
-                aria-label={t('settings.push_task_pair_audit_title')}
-                checked={pushPreferences.includes(PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT)}
-                onChange={() => togglePushType(PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT)}
-                style={checkboxStyle}
-              />
-              <div>
-                <div style={checkboxTitleStyle}>{t('settings.push_task_pair_audit_title')}</div>
-                <div style={checkboxDescStyle}>{t('settings.push_task_pair_audit_desc')}</div>
-              </div>
-            </label>
-          </div>
-
-          {/* Group 3: Security Alert */}
-          <div style={pushGroupTitleStyle}>{t('settings.push_group_security')}</div>
-          <div style={{ display: 'grid', gap: '8px' }}>
-            <label style={securityRowStyle}>
-              <input
-                type="checkbox"
-                aria-label={t('settings.push_remote_desktop_title')}
-                checked={pushPreferences.includes(PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP)}
-                onChange={() => togglePushType(PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP)}
-                style={checkboxStyle}
-              />
-              <div>
-                <div style={checkboxTitleStyle}>
-                  {t('settings.push_remote_desktop_title')}
-                  <span style={securityBadgeStyle}>{t('settings.push_security_highest_badge')}</span>
+                  <label class="settings-checkbox-row">
+                    <input
+                      type="checkbox"
+                      aria-label={t('settings.push_session_error_title')}
+                      checked={pushPreferences.includes(PUSH_NOTIFICATION_TYPE_SESSION_ERROR)}
+                      onChange={() => togglePushType(PUSH_NOTIFICATION_TYPE_SESSION_ERROR)}
+                      style={checkboxStyle}
+                    />
+                    <div style={checkboxTextWrapStyle}>
+                      <div style={checkboxTitleStyle}>{t('settings.push_session_error_title')}</div>
+                      <div style={checkboxDescStyle}>{t('settings.push_session_error_desc')}</div>
+                    </div>
+                  </label>
                 </div>
-                <div style={checkboxDescStyle}>{t('settings.push_remote_desktop_desc')}</div>
-              </div>
-            </label>
-          </div>
-        </div>
 
-        {!hasPassword ? (
-          <div style={cardStyle}>
-            <h2 style={{ fontSize: '16px', fontWeight: '600', marginBottom: '12px', color: '#94a3b8' }}>
-              {t('settings.set_password_login')}
-            </h2>
-            <p style={{ color: '#94a3b8', fontSize: '14px', lineHeight: 1.6, marginTop: 0, marginBottom: '14px' }}>
-              {t('settings.set_password_hint')}
-            </p>
-            <input
-              type="text"
-              placeholder={t('settings.username_placeholder')}
-              value={setupUsername}
-              onInput={(e) => setSetupUsername((e.target as HTMLInputElement).value)}
-              style={inputStyle}
-              autoCapitalize="none"
-              autoCorrect="off"
-              spellcheck={false}
-            />
-            <input
-              type="password"
-              placeholder={t('settings.new_password')}
-              value={setupPassword}
-              onInput={(e) => setSetupPassword((e.target as HTMLInputElement).value)}
-              style={inputStyle}
-            />
-            <input
-              type="password"
-              placeholder={t('settings.confirm_password')}
-              value={setupConfirmPassword}
-              onInput={(e) => setSetupConfirmPassword((e.target as HTMLInputElement).value)}
-              style={inputStyle}
-            />
-            <button
-              onClick={handleSetupPassword}
-              disabled={setupSaving || !setupUsername || !setupPassword || !setupConfirmPassword}
-              style={{ ...btnPrimary, opacity: (!setupUsername || !setupPassword || !setupConfirmPassword) ? '0.5' : '1' }}
-            >
-              {setupSaving ? t('common.loading') : t('settings.set_password_btn')}
-            </button>
-            {setupMsg && (
-              <div style={{ marginTop: '8px', fontSize: '13px', color: messageColor(setupMsg.type) }}>
-                {setupMsg.text}
-              </div>
-            )}
-          </div>
-        ) : (
-          <div style={cardStyle}>
-            <h2 style={{ fontSize: '16px', fontWeight: '600', marginBottom: '12px', color: '#94a3b8' }}>
-              {t('settings.change_password')}
-            </h2>
-            <input
-              type="password"
-              placeholder={t('settings.old_password')}
-              value={oldPw}
-              onInput={(e) => setOldPw((e.target as HTMLInputElement).value)}
-              style={inputStyle}
-            />
-            <input
-              type="password"
-              placeholder={t('settings.new_password')}
-              value={newPw}
-              onInput={(e) => setNewPw((e.target as HTMLInputElement).value)}
-              style={inputStyle}
-            />
-            <input
-              type="password"
-              placeholder={t('settings.confirm_password')}
-              value={confirmPw}
-              onInput={(e) => setConfirmPw((e.target as HTMLInputElement).value)}
-              style={inputStyle}
-            />
-            <button
-              onClick={handleChangePw}
-              disabled={pwSaving || !oldPw || !newPw || !confirmPw}
-              style={{ ...btnPrimary, opacity: (!oldPw || !newPw || !confirmPw) ? '0.5' : '1' }}
-            >
-              {pwSaving ? t('common.loading') : t('settings.change_password_btn')}
-            </button>
-            {pwMsg && (
-              <div style={{ marginTop: '8px', fontSize: '13px', color: messageColor(pwMsg.type) }}>
-                {pwMsg.text}
-              </div>
-            )}
-          </div>
-        )}
+                {/* Group 2: Task Lifecycle */}
+                <div style={pushGroupTitleStyle}>{t('settings.push_group_task_pair')}</div>
+                <div style={{ display: 'grid', gap: '8px' }}>
+                  <label class="settings-checkbox-row">
+                    <input
+                      type="checkbox"
+                      aria-label={t('settings.push_task_pair_done_title')}
+                      checked={pushPreferences.includes(PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE)}
+                      onChange={() => togglePushType(PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE)}
+                      style={checkboxStyle}
+                    />
+                    <div style={checkboxTextWrapStyle}>
+                      <div style={checkboxTitleStyle}>{t('settings.push_task_pair_done_title')}</div>
+                      <div style={checkboxDescStyle}>{t('settings.push_task_pair_done_desc')}</div>
+                    </div>
+                  </label>
 
-        <div style={{ textAlign: 'center', marginTop: '24px', marginBottom: '12px' }}>
-          <a
-            href="https://im.codes/privacy.html"
-            target="_blank"
-            rel="noopener noreferrer"
-            style={{ color: '#64748b', fontSize: '13px', textDecoration: 'none', marginRight: '16px' }}
-          >
-            {t('settings.privacy_policy')}
-          </a>
-          <a
-            href="https://im.codes/terms.html"
-            target="_blank"
-            rel="noopener noreferrer"
-            style={{ color: '#64748b', fontSize: '13px', textDecoration: 'none' }}
-          >
-            {t('settings.terms_of_service')}
-          </a>
+                  <label class="settings-checkbox-row">
+                    <input
+                      type="checkbox"
+                      aria-label={t('settings.push_task_pair_paused_title')}
+                      checked={pushPreferences.includes(PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED)}
+                      onChange={() => togglePushType(PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED)}
+                      style={checkboxStyle}
+                    />
+                    <div style={checkboxTextWrapStyle}>
+                      <div style={checkboxTitleStyle}>{t('settings.push_task_pair_paused_title')}</div>
+                      <div style={checkboxDescStyle}>{t('settings.push_task_pair_paused_desc')}</div>
+                    </div>
+                  </label>
+
+                  <label class="settings-checkbox-row">
+                    <input
+                      type="checkbox"
+                      aria-label={t('settings.push_task_pair_audit_title')}
+                      checked={pushPreferences.includes(PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT)}
+                      onChange={() => togglePushType(PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT)}
+                      style={checkboxStyle}
+                    />
+                    <div style={checkboxTextWrapStyle}>
+                      <div style={checkboxTitleStyle}>{t('settings.push_task_pair_audit_title')}</div>
+                      <div style={checkboxDescStyle}>{t('settings.push_task_pair_audit_desc')}</div>
+                    </div>
+                  </label>
+                </div>
+
+                {/* Group 3: Security Alert */}
+                <div style={pushGroupTitleStyle}>{t('settings.push_group_security')}</div>
+                <div style={{ display: 'grid', gap: '8px' }}>
+                  <label class="settings-checkbox-row settings-checkbox-row-security">
+                    <input
+                      type="checkbox"
+                      aria-label={t('settings.push_remote_desktop_title')}
+                      checked={pushPreferences.includes(PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP)}
+                      onChange={() => togglePushType(PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP)}
+                      style={checkboxStyle}
+                    />
+                    <div style={checkboxTextWrapStyle}>
+                      <div style={checkboxTitleStyle}>
+                        {t('settings.push_remote_desktop_title')}
+                        <span style={securityBadgeStyle}>{t('settings.push_security_highest_badge')}</span>
+                      </div>
+                      <div style={checkboxDescStyle}>{t('settings.push_remote_desktop_desc')}</div>
+                    </div>
+                  </label>
+                </div>
+              </div>
+
+              {!hasPassword ? (
+                <div class="settings-card">
+                  <h2 class="settings-card-heading">
+                    {t('settings.set_password_login')}
+                  </h2>
+                  <p style={{ color: '#94a3b8', fontSize: '14px', lineHeight: 1.6, marginTop: 0, marginBottom: '14px' }}>
+                    {t('settings.set_password_hint')}
+                  </p>
+                  <input
+                    type="text"
+                    placeholder={t('settings.username_placeholder')}
+                    value={setupUsername}
+                    onInput={(e) => setSetupUsername((e.target as HTMLInputElement).value)}
+                    class="settings-input"
+                    autoCapitalize="none"
+                    autoCorrect="off"
+                    spellcheck={false}
+                  />
+                  <input
+                    type="password"
+                    placeholder={t('settings.new_password')}
+                    value={setupPassword}
+                    onInput={(e) => setSetupPassword((e.target as HTMLInputElement).value)}
+                    class="settings-input"
+                  />
+                  <input
+                    type="password"
+                    placeholder={t('settings.confirm_password')}
+                    value={setupConfirmPassword}
+                    onInput={(e) => setSetupConfirmPassword((e.target as HTMLInputElement).value)}
+                    class="settings-input"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleSetupPassword}
+                    disabled={setupSaving || !setupUsername || !setupPassword || !setupConfirmPassword}
+                    class="settings-btn-primary settings-submit-btn"
+                    style={{ opacity: (!setupUsername || !setupPassword || !setupConfirmPassword) ? '0.5' : '1' }}
+                  >
+                    {setupSaving ? t('common.loading') : t('settings.set_password_btn')}
+                  </button>
+                  {setupMsg && (
+                    <div style={{ marginTop: '8px', fontSize: '13px', color: messageColor(setupMsg.type) }}>
+                      {setupMsg.text}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div class="settings-card">
+                  <h2 class="settings-card-heading">
+                    {t('settings.change_password')}
+                  </h2>
+                  <input
+                    type="password"
+                    placeholder={t('settings.old_password')}
+                    value={oldPw}
+                    onInput={(e) => setOldPw((e.target as HTMLInputElement).value)}
+                    class="settings-input"
+                  />
+                  <input
+                    type="password"
+                    placeholder={t('settings.new_password')}
+                    value={newPw}
+                    onInput={(e) => setNewPw((e.target as HTMLInputElement).value)}
+                    class="settings-input"
+                  />
+                  <input
+                    type="password"
+                    placeholder={t('settings.confirm_password')}
+                    value={confirmPw}
+                    onInput={(e) => setConfirmPw((e.target as HTMLInputElement).value)}
+                    class="settings-input"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleChangePw}
+                    disabled={pwSaving || !oldPw || !newPw || !confirmPw}
+                    class="settings-btn-primary settings-submit-btn"
+                    style={{ opacity: (!oldPw || !newPw || !confirmPw) ? '0.5' : '1' }}
+                  >
+                    {pwSaving ? t('common.loading') : t('settings.change_password_btn')}
+                  </button>
+                  {pwMsg && (
+                    <div style={{ marginTop: '8px', fontSize: '13px', color: messageColor(pwMsg.type) }}>
+                      {pwMsg.text}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <footer class="settings-legal-footer">
+                <a
+                  href="https://im.codes/privacy.html"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  class="settings-legal-link"
+                >
+                  {t('settings.privacy_policy')}
+                </a>
+                <a
+                  href="https://im.codes/terms.html"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  class="settings-legal-link"
+                >
+                  {t('settings.terms_of_service')}
+                </a>
+              </footer>
+            </div>
+          )}
         </div>
       </div>
     </div>

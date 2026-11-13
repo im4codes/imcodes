@@ -2215,7 +2215,9 @@
     "push_group_security": "Alertas de seguridad",
     "push_security_highest_badge": "Alerta de máxima seguridad",
     "push_remote_desktop_title": "Aviso de desbloqueo automático de escritorio remoto",
-    "push_remote_desktop_desc": "Alerta cuando se utilizan credenciales para el desbloqueo automático de escritorio remoto. Alerta de máxima seguridad; se recomienda encarecidamente mantener activada."
+    "push_remote_desktop_desc": "Alerta cuando se utilizan credenciales para el desbloqueo automático de escritorio remoto. Alerta de máxima seguridad; se recomienda encarecidamente mantener activada.",
+    "tab_settings": "Configuración",
+    "tab_guide": "Guía de uso"
   },
   "capabilities": {
     "eyebrow": "Capacidades de IA portátiles",
@@ -5018,5 +5020,128 @@
     "preparing": "Subiendo a R2 antes de descargar",
     "estimating": "Estimando espera…",
     "eta": "Quedan unos {{seconds}} s"
+  },
+  "guide": {
+    "kicker": "Guía de IM.codes",
+    "title": "Guía de usuario y arquitectura Harness",
+    "subtitle": "IM.codes no es otro IDE de IA ni una terminal remota simple: es el arnés de orquestación, memoria, aislamiento y auditoría cruzada para agentes de terminal (tmux/ConPTY) y SDK.",
+    "quick_jump": "Acceso rápido",
+    "expand_all": "Expandir todo",
+    "collapse_all": "Contraer todo",
+    "pain_label": "Problema que resuelve",
+    "solution_label": "Cómo lo resuelve IM.codes",
+    "tips_label": "Cómo usarlo",
+    "sections": {
+      "overview": {
+        "pill": "Por qué IM.codes",
+        "title": "Visión general: más allá del escritorio y un solo modelo",
+        "tagline": "Acceso continuo desde móvil/web y fiabilidad multi-agente en tu propia infraestructura.",
+        "pain": "Al alejarte del escritorio, los flujos en terminal se rompen con SSH/tmux frágiles, y un solo modelo sufre puntos ciegos, deriva silenciosa o pérdida de contexto tras caídas.",
+        "solution": "IM.codes envuelve agentes CLI y SDK (Claude Code, Codex, Gemini CLI, Qwen, OpenClaw) con líneas de tiempo persistentes, visor de archivos/Git, túnel seguro a localhost, aislamiento con worktrees, memoria compartida y revisión entre proveedores.",
+        "tip_1": "Ejecuta `imcodes bind` en tu equipo para controlar sesiones desde móvil, iPad o navegador.",
+        "tip_2": "Alterna en vivo entre terminal PTY pura y vista estructurada con llamadas de herramientas.",
+        "tip_3": "Fija el explorador de archivos, panel del repositorio o sub-sesiones en la barra lateral."
+      },
+      "team": {
+        "pill": "Equipo (Team)",
+        "title": "Debate multi-agente Team",
+        "tagline": "Revisión P2P entre distintos modelos antes de escribir código.",
+        "pain": "Un único modelo revisando su propio plan pasa por alto condiciones de carrera, migraciones faltantes o fallos de diseño.",
+        "solution": "Team encadena varios modelos (Claude Code, Codex, Gemini CLI, Qwen) en pipelines configurables (`audit → review → plan`, `review`, `discuss`, `brainstorm`) donde cada agente lee y cuestiona al anterior.",
+        "tip_1": "Redacta el tema o propuesta en el cuadro de entrada y lanza el modo deseado o `@@all(config)`.",
+        "tip_2": "Añade rondas (`@@all+`) en especificaciones OpenSpec o arquitecturas complejas para endurecer conclusiones.",
+        "tip_3": "Aprovéchalo también para documentos técnicos, auditorías y decisiones difíciles, no solo código."
+      },
+      "taskPairs": {
+        "pill": "Task Pairs",
+        "title": "Task Pairs y auditoría entre proveedores",
+        "tagline": "Convergencia Brain + Executor + Auditor sin auto-aprobación.",
+        "pain": "Los agentes autónomos suelen declarar tareas listas sin validar ni probar o quedan atrapados en bucles sin salida.",
+        "solution": "IM.codes separa Brain (coordinador), Executor (implementador en su propio workspace) y Auditor (revisor independiente entre proveedores) con el ciclo `STARTED → READY_FOR_AUDIT → PASS / REWORK → DONE`.",
+        "tip_1": "Usa un auditor independiente para cambios multi-archivo, seguridad o pruebas reales; deja `auditor=none` solo para ajustes triviales.",
+        "tip_2": "Divide entregas grandes en múltiples rondas (`pair_next_round`) sobre commits base explícitos.",
+        "tip_3": "Escala dudas de alcance o entorno a Brain/Owner mediante solicitudes de decisión en lugar de iterar a ciegas."
+      },
+      "executionPools": {
+        "pill": "Pools de ejecución",
+        "title": "Pools de ejecución (Primary y Economy)",
+        "tagline": "Enrutamiento por rol y límites de concurrencia sin perder rigor.",
+        "pain": "Usar siempre modelos insignia agota cuotas y ralentiza tareas simples, mientras que bajar todo a modelos pequeños degrada las auditorías.",
+        "solution": "Configura pools Primary y Economy asignando proveedor, modelo y rol (`executor`, `auditor`, `both`) junto a un límite `maxConcurrency` para equilibrar velocidad, costo e independencia de revisión.",
+        "tip_1": "Enruta tareas rutinarias al pool Economy y revisiones críticas o complejas al pool Primary.",
+        "tip_2": "Combina un ejecutor rápido con un auditor de otro proveedor para detectar sesgos de familia.",
+        "tip_3": "Ajusta `maxConcurrency` según memoria local y límites de tu API."
+      },
+      "controlledNodes": {
+        "pill": "Nodos controlados",
+        "title": "Controlled Nodes (flota multi-máquina)",
+        "tagline": "Ejecución acotada y transferencia de archivos sin exponer servidores completos.",
+        "pain": "Compilaciones, GPUs o pruebas reales suelen vivir en equipos Windows, macOS o Linux separados donde instalar un servidor completo es arriesgado.",
+        "solution": "Registra máquinas como Nodos Controlados y selecciónalas con `^` o `^^(nombre)`. Los agentes usan `exec_remote` y transferencia directa/relay con credenciales independientes y revocables, separadas de los servidores normales.",
+        "tip_1": "Conserva el instalador descargado para dar de alta varias máquinas y revoca permisos desde Configuración cuando quieras.",
+        "tip_2": "Usa `^` en el compositor o herramientas MCP (`exec_remote`, `send_file_to_machine`, `fetch_file_from_machine`).",
+        "tip_3": "Transfiere solo artefactos o registros de prueba; mantén los secretos fuera del nodo remoto."
+      },
+      "remoteDesktopOcu": {
+        "pill": "Escritorio y OCU",
+        "title": "Escritorio remoto, Wall y OCU (Computer Use)",
+        "tagline": "Automatización tipada de escritorio/navegador y control humano de baja latencia.",
+        "pain": "La terminal no cubre apps GUI ni flujos visuales, las capturas constantes disparan costos y el desbloqueo remoto sin alertas es inseguro.",
+        "solution": "Los agentes operan GUIs mediante Open Computer Use (OCU) y navegador CDP (instantáneas de texto por defecto). Las personas acceden a Escritorio Remoto de Windows y Wall multi-nodo desde web/móvil con alertas push de máxima prioridad al desbloquear.",
+        "tip_1": "Alterna entre modo Ver y Controlar (con mouse virtual táctil en móvil) para supervisar o intervenir.",
+        "tip_2": "Prefiere el navegador CDP estructurado antes de solicitar capturas completas.",
+        "tip_3": "Mantén activada siempre la alerta de seguridad de desbloqueo automático de Escritorio Remoto."
+      },
+      "quickInputVoice": {
+        "pill": "Entrada rápida y voz",
+        "title": "Entrada rápida, selectores inteligentes y voz offline",
+        "tagline": "Comandos fluidos desde el teléfono y dictado local sin perder borradores.",
+        "pain": "Escribir rutas, flags y prompts largos en móvil es lento y el dictado en la nube suele perder texto al pausar o editar.",
+        "solution": "Quick Input guarda fragmentos reutilizables; `@` busca archivos, `@@` elige agentes Team y `/` autocompleta comandos nativos. En iOS/móvil, el reconocimiento de voz local en streaming conserva el borrador entre Pausar → Micrófono o Enviar.",
+        "tip_1": "Guarda en Quick Input tus comandos de prueba, checklists y prompts frecuentes.",
+        "tip_2": "Combina `@` para rutas exactas y `@@all(config)` para iniciar debates Team al instante.",
+        "tip_3": "Pausa el dictado para ajustar un archivo a mano y retómalo o envía sin perder texto."
+      },
+      "aliasesVerification": {
+        "pill": "Alias y verificación",
+        "title": "Alias privados y máquinas de verificación",
+        "tagline": "Resolución fuera de banda `;` / `;;(nombre)` y destinos reales autorizados para QA.",
+        "pain": "Pegar rutas o datos repetitivos infla el contexto del modelo y un listado masivo podría exponer valores; las pruebas en hardware real necesitan destinos estables.",
+        "solution": "Escribe `;` para insertar `;;(nombre)`: la interfaz muestra solo el marcador y el daemon resuelve el valor fuera de banda (MCP lista solo metadatos). Verification Machines autoriza nodos o alias SSH estables para pruebas reales repetibles.",
+        "tip_1": "Guarda rutas repetitivas o identificadores de prueba como alias privados.",
+        "tip_2": "Usa `verification_machine_list` y `verification_machine_verify` antes de validar en dispositivos reales.",
+        "tip_3": "La verificación SSH comprueba alias locales existentes sin subir credenciales."
+      },
+      "isolationLiveness": {
+        "pill": "Seguridad y Liveness",
+        "title": "Aislamiento Worktree, carril urgente y protección de máquina",
+        "tagline": "Checkout principal limpio, `/stop` inmediato, aislamiento de autoridad e Incógnito.",
+        "pain": "Ediciones concurrentes rompen el árbol principal, hooks lentos bloquean `/stop`, usuarios invitados heredan permisos del dueño y sesiones sensibles dejan memoria.",
+        "solution": "Los Task Pairs trabajan en worktrees Git dedicados. Un carril urgente prioriza `/stop` y ACKs por encima de memoria y hooks. Shared-Machine Authority aísla turnos de participantes hasta el estado idle, y el modo Incógnito evita escribir memoria o historial en disco.",
+        "tip_1": "Deja que Brain fusione commits verificados desde el worktree en lugar de trabajar en la rama principal.",
+        "tip_2": "Activa el modo Incógnito para sesiones temporales confidenciales sin rastro persistente.",
+        "tip_3": "Envía `/stop` con confianza incluso bajo carga pesada: viaja por el carril prioritario."
+      },
+      "memoryIdentity": {
+        "pill": "Memoria e Identidad",
+        "title": "Memoria compartida e identidad determinista en 4 niveles",
+        "tagline": "Síntesis problema→solución multilingüe y contrato estricto User → Project → Pair → Session.",
+        "pain": "Los logs crudos saturan al modelo, cambiar de proveedor corta el hilo y las reglas blandas se diluyen con el tiempo.",
+        "solution": "IM.codes indexa resúmenes finales (`assistant.text`) con búsqueda semántica local y pgvector multilingüe opcional, mientras inyecta contratos deterministas en 4 capas: User (100k) → Project (300k) → Pair (200k) → Session (300k).",
+        "tip_1": "Registra convenciones del repositorio en Project Identity y hallazgos puntuales con `save_observation`.",
+        "tip_2": "Revisa tarjetas de recuerdo en la línea de tiempo y usa `get_memory_sources` cuando necesites pruebas exactas.",
+        "tip_3": "Consulta, archiva o restaura memorias desde el panel Shared Context en cualquier momento."
+      },
+      "autoCronMobile": {
+        "pill": "Auto Deliver, Cron y Watch",
+        "title": "OpenSpec Auto Deliver, Cron y móvil / Apple Watch",
+        "tagline": "Entrega supervisada completa, tareas programadas, OTA y alertas en la muñeca.",
+        "pain": "Las ejecuciones largas se detienen esperando un «continúa», las revisiones periódicas requieren intervención manual y perder una pregunta del agente retrasa horas.",
+        "solution": "OpenSpec Auto Deliver ejecuta auditoría de spec → bucle de implementación → puntuación automática y veredicto Team con entrega fail-closed controlada por el usuario. Cron programa envíos recurrentes; OTA, biometría móvil y Apple Watch mantienen el control al alcance.",
+        "tip_1": "Elige presets `fast`, `standard`, `strict` o `deep` en OpenSpec Auto Deliver según el riesgo.",
+        "tip_2": "Programa chequeos nocturnos o recordatorios con Cron o `cron_create_self`.",
+        "tip_3": "Ajusta las notificaciones push por grupo (Básicas, Ciclo de tareas y Seguridad) en Configuración."
+      }
+    }
   }
 }

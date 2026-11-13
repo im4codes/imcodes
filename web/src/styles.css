@@ -16078,3 +16078,562 @@ button.quick-agent-delegation-preset.active {
 .incognito-create-option label { display: flex; align-items: center; gap: 8px; }
 .incognito-create-option p { margin: 6px 0; font-size: 12px; color: #94a3b8; }
 .incognito-session-badge { align-self: flex-start; margin: 4px 12px; padding: 4px 10px; border-radius: 999px; border: 1px solid #8b5cf6; color: #ddd6fe; background: #2e1065; font-size: 12px; }
+
+/* SettingsPage & GuidePage — mobile-first scrolling overlay and structured guide */
+.settings-page-root {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: #0a0e1a;
+  color: #e2e8f0;
+  box-sizing: border-box;
+}
+
+.settings-page-header {
+  flex: 0 0 auto;
+  background: rgba(10, 14, 26, 0.96);
+  border-bottom: 1px solid rgba(148, 163, 184, 0.16);
+  padding: 12px 12px 10px;
+  min-width: 0;
+}
+
+.settings-page-header-inner {
+  max-width: 920px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.settings-page-header-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.settings-page-title {
+  margin: 0;
+  font-size: 19px;
+  font-weight: 700;
+  line-height: 1.25;
+  color: #f1f5f9;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.settings-tabs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  padding: 4px;
+  background: #0f172a;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 10px;
+}
+
+.settings-tab-btn {
+  min-height: 40px;
+  padding: 8px 12px;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-tab-btn.is-active {
+  background: #2563eb;
+  color: #ffffff;
+}
+
+.settings-page-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  width: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
+  touch-action: pan-y;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.35) transparent;
+}
+
+.settings-page-inner {
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 14px 12px 28px;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+.settings-card {
+  background: #1e293b;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 12px;
+  padding: 16px;
+  margin-bottom: 14px;
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+.settings-card-heading {
+  font-size: 16px;
+  font-weight: 600;
+  margin: 0 0 12px;
+  color: #94a3b8;
+}
+
+.settings-identity-value {
+  font-size: 15px;
+  margin-bottom: 14px;
+  color: #e2e8f0;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.settings-identity-inline {
+  margin-bottom: 0;
+  flex: 1 1 auto;
+}
+
+.settings-name-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.settings-action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.settings-input {
+  width: 100%;
+  max-width: 100%;
+  min-height: 44px;
+  padding: 10px 12px;
+  background: #0f172a;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  color: #e2e8f0;
+  font-size: 16px;
+  margin-bottom: 10px;
+  box-sizing: border-box;
+}
+
+.settings-btn-primary,
+.settings-btn-secondary {
+  min-height: 42px;
+  padding: 10px 16px;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+}
+
+.settings-btn-primary {
+  background: #3b82f6;
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.settings-btn-secondary {
+  background: #334155;
+  color: #e2e8f0;
+  font-weight: 500;
+}
+
+.settings-back-btn {
+  flex: 0 0 auto;
+  padding: 8px 14px;
+}
+
+.settings-submit-btn {
+  width: 100%;
+}
+
+.settings-checkbox-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  cursor: pointer;
+  padding: 10px 12px;
+  min-height: 44px;
+  border-radius: 8px;
+  background: #0f172a;
+  box-sizing: border-box;
+  min-width: 0;
+}
+
+.settings-checkbox-row-security {
+  background: rgba(239, 68, 68, 0.08);
+  border: 1px solid rgba(239, 68, 68, 0.35);
+}
+
+.settings-legal-footer {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 12px 20px;
+  margin-top: 22px;
+  margin-bottom: 8px;
+}
+
+.settings-legal-link {
+  color: #64748b;
+  font-size: 13px;
+  text-decoration: none;
+  padding: 6px 4px;
+}
+
+/* GuidePage */
+.guide-page {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.guide-hero {
+  background: linear-gradient(145deg, #102033 0%, #162238 60%, #111827 100%);
+  border: 1px solid rgba(96, 165, 250, 0.28);
+  border-radius: 14px;
+  padding: 16px;
+  min-width: 0;
+}
+
+.guide-hero-top {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+  min-width: 0;
+}
+
+.guide-hero-text {
+  min-width: 0;
+}
+
+.guide-kicker {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #60a5fa;
+  margin-bottom: 4px;
+}
+
+.guide-title {
+  margin: 0 0 6px;
+  font-size: 18px;
+  font-weight: 700;
+  color: #f1f5f9;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.guide-subtitle {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.55;
+  color: #cbd5e1;
+  overflow-wrap: anywhere;
+}
+
+.guide-toggle-all-btn {
+  min-height: 36px;
+  padding: 6px 12px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.72);
+  color: #cbd5e1;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.guide-quick-jump-label {
+  margin-top: 14px;
+  margin-bottom: 8px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: #94a3b8;
+}
+
+.guide-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.guide-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 36px;
+  max-width: 100%;
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  background: rgba(15, 23, 42, 0.8);
+  color: #cbd5e1;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+  box-sizing: border-box;
+}
+
+.guide-pill.is-active {
+  border-color: #38bdf8;
+  background: rgba(37, 99, 235, 0.28);
+  color: #f8fafc;
+}
+
+.guide-pill-num {
+  color: #60a5fa;
+  font-size: 11px;
+  font-weight: 700;
+  flex: 0 0 auto;
+}
+
+.guide-pill-label {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.guide-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.guide-card {
+  background: #162032;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 12px;
+  overflow: hidden;
+  scroll-margin-top: 10px;
+  min-width: 0;
+}
+
+.guide-card.is-active {
+  border-color: rgba(56, 189, 248, 0.45);
+}
+
+.guide-card-header {
+  width: 100%;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 14px 16px;
+  background: transparent;
+  border: none;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  box-sizing: border-box;
+  min-width: 0;
+}
+
+.guide-card-num {
+  flex: 0 0 auto;
+  min-width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  background: rgba(59, 130, 246, 0.18);
+  border: 1px solid rgba(96, 165, 250, 0.35);
+  color: #93c5fd;
+  font-size: 12px;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 1px;
+}
+
+.guide-card-heading {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.guide-card-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: #f1f5f9;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.guide-card-tagline {
+  font-size: 12px;
+  color: #94a3b8;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.guide-card-chevron {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #94a3b8;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.guide-card-body {
+  padding: 0 16px 16px;
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.guide-block {
+  border-radius: 9px;
+  padding: 11px 12px;
+  min-width: 0;
+}
+
+.guide-block-pain {
+  background: rgba(245, 158, 11, 0.08);
+  border: 1px solid rgba(245, 158, 11, 0.24);
+}
+
+.guide-block-solution {
+  background: rgba(34, 211, 238, 0.08);
+  border: 1px solid rgba(34, 211, 238, 0.24);
+}
+
+.guide-block-tips {
+  background: #0f172a;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+}
+
+.guide-block-label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 5px;
+  color: #94a3b8;
+}
+
+.guide-block-pain .guide-block-label {
+  color: #fbbf24;
+}
+
+.guide-block-solution .guide-block-label {
+  color: #38bdf8;
+}
+
+.guide-block-text {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.58;
+  color: #dbeafe;
+  overflow-wrap: anywhere;
+}
+
+.guide-tips-list {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 5px;
+  font-size: 13px;
+  line-height: 1.52;
+  color: #cbd5e1;
+  min-width: 0;
+}
+
+.guide-tips-list li {
+  overflow-wrap: anywhere;
+}
+
+@media (min-width: 640px) {
+  .settings-page-header {
+    padding: 16px 20px 12px;
+  }
+
+  .settings-page-header-inner {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .settings-page-title {
+    font-size: 22px;
+  }
+
+  .settings-tabs {
+    width: auto;
+    min-width: 240px;
+  }
+
+  .settings-page-inner {
+    padding: 20px;
+  }
+
+  .settings-card {
+    padding: 20px;
+    margin-bottom: 16px;
+  }
+
+  .settings-input {
+    font-size: 14px;
+  }
+
+  .settings-submit-btn {
+    width: auto;
+    min-width: 180px;
+  }
+
+  .guide-hero {
+    padding: 20px;
+  }
+
+  .guide-hero-top {
+    flex-direction: row;
+    align-items: flex-start;
+    justify-content: space-between;
+  }
+
+  .guide-title {
+    font-size: 20px;
+  }
+}
