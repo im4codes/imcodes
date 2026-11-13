@@ -912,4 +912,59 @@ describe('imcodes cloud-docs CLI', () => {
       rmSync(altHome, { recursive: true, force: true });
     }
   });
+
+  it('rejects contradictory save/export/version combinations pre-flight with zero HTTP requests', async () => {
+    const authEnv = { IMCODES_SERVER_URL: baseUrl, IMCODES_SERVER_ID: 'srv-1', IMCODES_TOKEN: 'tok-1' };
+    const localSrc = join(workDir, 'src.docx');
+    const localOut = join(workDir, 'export.docx');
+    writeFileSync(localSrc, Buffer.from('PK-src', 'utf8'));
+
+    const invalidCases: string[][] = [
+      ['builder', '--type', 'docx', '--script', 'builder.CreateFile("docx");', '--no-save'],
+      ['builder', '--type', 'docx', '--script', 'builder.CreateFile("docx");', '--no-save', '--out', localOut],
+      ['builder', '--type', 'docx', '--script', 'builder.CreateFile("docx");', '--out', localOut],
+      ['builder', '--type', 'docx', '--script', 'builder.CreateFile("docx");', '--version', '2'],
+      ['builder', 'doc-1', '--script', 'Api.Save();', '--out', localOut],
+      ['builder', 'doc-1', '--script', 'Api.Save();', '--save', '--out', localOut],
+      ['convert', 'doc-1', '--to', 'pdf', '--save-as-new', '--out', localOut],
+      ['upload', localSrc, '--version', '2'],
+      ['edit', 'doc-1', '--file', localSrc, '--timeout-ms', '5000'],
+    ];
+
+    for (const argv of invalidCases) {
+      const res = await runCloudDocsCli(argv, { env: authEnv });
+      expect(res.exitCode, `Expected failure for ${argv.join(' ')}`).toBe(1);
+      expect(res.errorReason).toBe(MCP_ERROR_REASONS.VALIDATION_FAILED);
+      expect(existsSync(localOut)).toBe(false);
+    }
+    expect(recorded).toHaveLength(0);
+
+    // Positive controls: normal create save and existing-doc --no-save --out still succeed accurately
+    responder = () => ({ status: 201, json: { doc: { id: 'doc-new', name: 'Saved.docx', ext: '.docx', docVersion: 1 }, bytesWritten: 120 } });
+    const createOk = await runCloudDocsCli(['builder', '--type', 'docx', '--name', 'Saved.docx', '--script', 'builder.CreateFile("docx");'], { env: authEnv });
+    expect(createOk.exitCode).toBe(0);
+    expect(recorded.at(-1)?.url).toBe('/api/cloud-docs/docbuilder');
+    expect(JSON.parse(recorded.at(-1)!.bodyText)).toEqual({ type: 'docx', name: 'Saved.docx', script: 'builder.CreateFile("docx");' });
+
+    const exportBytes = Buffer.from('PK-exported', 'utf8');
+    responder = () => ({
+      status: 200,
+      json: {
+        doc: { id: 'doc-1', name: 'Saved.docx', ext: '.docx', docVersion: 1 },
+        bytesBase64: exportBytes.toString('base64'),
+        outputName: 'export.docx',
+        mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        bytesWritten: exportBytes.length,
+      },
+    });
+    const exportOk = await runCloudDocsCli(['builder', 'doc-1', '--no-save', '--out', localOut, '--script', 'Api.GetDocument();'], { env: authEnv });
+    expect(exportOk.exitCode).toBe(0);
+    expect(recorded.at(-1)?.url).toBe('/api/cloud-docs/doc-1/docbuilder');
+    expect(JSON.parse(recorded.at(-1)!.bodyText)).toMatchObject({ save: false });
+    expect(readFileSync(localOut).equals(exportBytes)).toBe(true);
+
+    const editGuide = await runCloudDocsCli(['docs', '--topic', 'edit'], { env: {} });
+    expect(editGuide.exitCode).toBe(0);
+    expect(editGuide.stdout).toContain('--no-save and --out require an existing <docId>');
+  });
 });

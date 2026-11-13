@@ -262,6 +262,54 @@ describe('MCP cloud_docs CLI-passthrough tool', () => {
         targetUsername: 'bob',
         allowDownload: false,
       });
+
+      // 8. Builder / convert save-export validation parity across MCP args & command forms (zero HTTP on reject)
+      const mcpRejectOut = join(workDir, 'should-not-exist.docx');
+      const invalidMcpCalls: Array<{ args?: string[]; command?: string }> = [
+        { args: ['builder', '--type', 'docx', '--script', 'builder.CreateFile("docx");', '--no-save', '--out', mcpRejectOut] },
+        { command: 'builder --type docx --script "builder.CreateFile(\\"docx\\");" --no-save' },
+        { args: ['builder', 'doc-1', '--script', 'Api.Save();', '--out', mcpRejectOut] },
+        { command: `convert doc-1 --to pdf --save-as-new --out "${mcpRejectOut}"` },
+      ];
+      for (const argumentsPayload of invalidMcpCalls) {
+        lastRequest = null;
+        const rejectRes = await conn.client.callTool({
+          name: MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
+          arguments: argumentsPayload,
+        });
+        expect(rejectRes.isError).toBe(true);
+        expect(rejectRes.structuredContent).toMatchObject({
+          status: 'error',
+          reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+        });
+        expect(lastRequest).toBeNull();
+      }
+
+      mockJson = { doc: { id: 'doc-new', name: 'MCP.docx', ext: '.docx', docVersion: 1 }, bytesWritten: 64 };
+      const createSaveRes = await conn.client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
+        arguments: { args: ['builder', '--type', 'docx', '--script', 'builder.CreateFile("docx");'] },
+      });
+      expect(createSaveRes.isError).not.toBe(true);
+      expect(lastRequest?.url).toBe('/api/cloud-docs/docbuilder');
+
+      const builderExportBytes = Buffer.from('PK-mcp-builder-out', 'utf8');
+      mockJson = {
+        doc: { id: 'doc-1', name: 'Brief.docx', ext: '.docx', docVersion: 5 },
+        bytesBase64: builderExportBytes.toString('base64'),
+        outputName: 'builder-out.docx',
+        mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        bytesWritten: builderExportBytes.length,
+      };
+      const mcpBuilderOut = join(workDir, 'mcp-builder-out.docx');
+      const builderNoSaveRes = await conn.client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
+        arguments: { args: ['builder', 'doc-1', '--no-save', '--out', mcpBuilderOut, '--script', 'Api.GetDocument();'] },
+      });
+      expect(builderNoSaveRes.isError).not.toBe(true);
+      expect(lastRequest?.url).toBe('/api/cloud-docs/doc-1/docbuilder');
+      expect(JSON.parse(lastRequest!.body)).toMatchObject({ save: false });
+      expect(readFileSync(mcpBuilderOut).equals(builderExportBytes)).toBe(true);
     } finally {
       await conn.close();
     }

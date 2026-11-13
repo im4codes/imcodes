@@ -796,8 +796,8 @@ export async function runCloudDocsCli(
           : folderPair.value;
 
       if (opts.file !== undefined) {
-        if (contentRes.value !== undefined || scriptRes.value !== undefined || argRes.value !== undefined || opts.mode !== undefined || opts.save === false || opts.out !== undefined) {
-          return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, 'edit --file cannot be combined with --content, --script, --mode, --no-save, or --out', { json: flags.json });
+        if (contentRes.value !== undefined || scriptRes.value !== undefined || argRes.value !== undefined || timeoutRes.value !== undefined || opts.mode !== undefined || opts.save === false || opts.out !== undefined) {
+          return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, 'edit --file cannot be combined with --content, --script, --arg-json, --timeout-ms, --mode, --no-save, or --out', { json: flags.json });
         }
         const local = await readLocalUploadFile(opts.file, opts.name, cwd);
         if (!local.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, local.message, { json: flags.json });
@@ -901,11 +901,11 @@ export async function runCloudDocsCli(
     .option('--argument-file <path>', 'Read JSON Argument object from local file')
     .option('--output-type <ext>', 'Requested output format when editing/exporting existing doc (alias for --type)')
     .option('--output-name <name>', 'Expected filename produced by builder.SaveFile(...)')
-    .option('--save', 'Persist output back to the existing Cloud Doc (default true when docId supplied)', true)
-    .option('--no-save', 'Do not overwrite Cloud Doc; return/write exported bytes instead')
+    .option('--save', 'Persist output back to the existing Cloud Doc (default true)', true)
+    .option('--no-save', 'With existing <docId>, do not overwrite Cloud Doc; return/write exported bytes instead')
     .option('--version <n>', 'Optimistic CAS version check when saving existing doc')
     .option('--expected-version <n>', 'Alias for --version')
-    .option('--out <path>', 'Write exported bytes (when --no-save) to a local file')
+    .option('--out <path>', 'With existing <docId> and --no-save, write exported binary bytes to a local file')
     .option('--timeout-ms <ms>', `Execution timeout in ms (1..${CLOUD_DOC_DOCBUILDER_MAX_TIMEOUT_MS})`)
     .option('--timeout <ms>', 'Alias for --timeout-ms')
     .action(async (docId: string | undefined, opts: {
@@ -949,8 +949,17 @@ export async function runCloudDocsCli(
       if (!typePair.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, typePair.message, { json: flags.json });
 
       if (!docId) {
+        if (opts.save === false) {
+          return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, 'builder --no-save requires an existing <docId>; creating a new Cloud Doc always persists on the server', { json: flags.json });
+        }
+        if (opts.out !== undefined) {
+          return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, 'builder --out requires an existing <docId> with --no-save', { json: flags.json });
+        }
         if (opts.root) {
           return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, '--root requires an existing <docId>', { json: flags.json });
+        }
+        if (versionRes.value !== undefined) {
+          return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, '--version/--expected-version requires an existing <docId>', { json: flags.json });
         }
         let createType: CloudDocDocBuilderOutputType | undefined;
         if (typePair.value !== undefined) {
@@ -974,6 +983,10 @@ export async function runCloudDocsCli(
           succeed(ok, formatDocSummary(ok.doc, 'Created via DocBuilder'), ctx.flags.json);
         });
         return;
+      }
+
+      if (opts.save !== false && opts.out !== undefined) {
+        return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, '--out on builder requires --no-save (pass --no-save --out <path> to export without overwriting the Cloud Doc)', { json: flags.json });
       }
 
       let outputType: CloudDocDocBuilderOutputType | undefined;
@@ -1035,7 +1048,7 @@ export async function runCloudDocsCli(
   );
   convertCmd
     .requiredOption('--to <targetType>', `Target format (${CLOUD_DOC_CONVERT_TARGET_TYPES.join(', ')})`)
-    .option('--out <path>', 'Write converted binary output to local path')
+    .option('--out <path>', 'Write converted binary output to local path (cannot combine with --save-as-new)')
     .option('--save-as-new', 'Save converted document as a new Cloud Doc on the server')
     .option('--name <name>', 'Output filename')
     .option('--folder <folderId>', 'Destination folderId when --save-as-new is set')
@@ -1053,6 +1066,9 @@ export async function runCloudDocsCli(
       timeout?: string;
     }, cmd: Command) => {
       const flags = extractCommonFlags(cmd);
+      if (opts.saveAsNew && opts.out !== undefined) {
+        return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, 'convert --save-as-new cannot be combined with --out', { json: flags.json });
+      }
       const folderPair = resolveAliasPair(opts.folder, '--folder', opts.folderId, '--folder-id');
       if (!folderPair.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, folderPair.message, { json: flags.json });
       const targetType = opts.to.trim().replace(/^\./, '').toLowerCase();
@@ -1135,6 +1151,9 @@ export async function runCloudDocsCli(
       if (!docIdPair.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, docIdPair.message, { json: flags.json });
       const versionRes = readExpectedVersionOption(opts.version, opts.expectedVersion);
       if (!versionRes.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, versionRes.message, { json: flags.json });
+      if (!docIdPair.value && versionRes.value !== undefined) {
+        return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, 'upload --version/--expected-version requires --doc-id or --replace', { json: flags.json });
+      }
 
       const local = await readLocalUploadFile(rawPath, opts.name, cwd);
       if (!local.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, local.message, { json: flags.json });
