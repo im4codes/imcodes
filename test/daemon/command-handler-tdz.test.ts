@@ -77,12 +77,18 @@ describe('command-handler module initialization / TDZ invariants', () => {
         updatedAt: Date.now(),
       } as any;
 
-      await expect(commandHandler.clearTransportConversation(record)).resolves.toBeUndefined();
-      await expect(commandHandler.handoffSessionConversation(record)).resolves.toBeUndefined();
+      const sessionStore = await import('../../src/store/session-store.js');
+      sessionStore.upsertSession(record);
+      const storedRecord = sessionStore.getSession(record.name) ?? record;
+
+      await expect(commandHandler.clearTransportConversation(storedRecord)).resolves.toBeUndefined();
+      await expect(commandHandler.handoffSessionConversation(storedRecord)).resolves.toBeUndefined();
       expect(stopTransportRuntimeSession).toHaveBeenCalledWith(record.name);
       expect(launchTransportSession).toHaveBeenCalledTimes(1);
-      expect(relaunchSessionWithSettings).toHaveBeenCalledWith(record, { fresh: true, handoff: true });
+      expect(relaunchSessionWithSettings).toHaveBeenCalledWith(storedRecord, { fresh: true, handoff: true });
     } finally {
+      const sessionStore = await import('../../src/store/session-store.js');
+      sessionStore.removeSession('deck_tdz_probe_brain');
       vi.doUnmock('../../src/agent/session-manager.js');
     }
   });

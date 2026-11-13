@@ -724,6 +724,8 @@ const TRANSPORT_LIST_MODELS_TTL_ENV = 'IMCODES_TRANSPORT_LIST_MODELS_CACHE_TTL_M
 const transportListModelsCache = new Map<string, { expiresAt: number; generation: number; value: TransportListModelsResult }>();
 const transportListModelsInflight = new Map<string, { generation: number; promise: Promise<TransportListModelsResult> }>();
 let transportListModelsCacheGeneration = 0;
+const sessionResetGenerations = new Map<string, number>();
+let nextSessionResetGeneration = 0;
 
 function inFlightSessionSendKey(sessionName: string, clientMessageId: string): string {
   return `${sessionName}\u0000${clientMessageId}`;
@@ -1326,9 +1328,6 @@ export function supportsTransportClear(agentType: string | undefined): boolean {
 export function supportsProcessClear(agentType: string | undefined): agentType is 'claude-code' | 'codex' | 'opencode' {
   return agentType === 'claude-code' || agentType === 'codex' || agentType === 'opencode';
 }
-
-const sessionResetGenerations = new Map<string, number>();
-let nextSessionResetGeneration = 0;
 
 function allocateSessionResetToken(sessionName: string): number {
   const token = ++nextSessionResetGeneration;

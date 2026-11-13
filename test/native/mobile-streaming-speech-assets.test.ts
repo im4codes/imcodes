@@ -357,7 +357,7 @@ print("PROVIDERS:PASS")
 `);
   execFileSync(swiftCompiler!, ['-swift-version', '5', file, '-o', executable], { encoding: 'utf8', timeout: 60000 });
   expect(execFileSync(executable, [root], { encoding: 'utf8', timeout: 10000 }).trim()).toBe('PROVIDERS:PASS');
-});
+}, 95000);
 
 it.skipIf(!swiftCompiler)('executes the actual Swift bounded window through rollback, VAD, long speech and final short tails', async () => {
   await setup();
