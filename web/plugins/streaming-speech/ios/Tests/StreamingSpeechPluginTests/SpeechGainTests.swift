@@ -157,4 +157,73 @@ final class SpeechGainTests: XCTestCase {
             XCTAssertTrue(batch?.samples.allSatisfy { $0 > -1.0 && $0 < 1.0 } == true)
         }
     }
+
+    func testSustainedAndSlowlyVaryingQuietSpeechAreNotSwallowedAsNoise() throws {
+        // Counterexample 1: 2.0s (80 x 400-sample frames) of steady quiet speech (RMS 0.0025, 220Hz)
+        // must stay voiced well past the noise learning window without premature SpeechWindow pause commit.
+        do {
+            var inbox = SpeechInbox()
+            var window = SpeechWindow()
+            var maxDecodedSamples = 0
+            let decode: SpeechWindow.DecodeFn = { s, _ in
+                maxDecodedSamples = max(maxDecodedSamples, s.count)
+                return ("sustained", [1, 2])
+            }
+            _ = try inbox.offer([Float](repeating: 0, count: SpeechInbox.warmupSamples))
+            var voicedCount = 0
+            for step in 0..<80 {
+                let chunk = sineWave(count: 400, rms: 0.0025, freqHz: 220, phaseOffset: step * 400)
+                _ = try inbox.offer(chunk)
+                if inbox.lastVoiced { voicedCount += 1 }
+                if let batch = inbox.take() {
+                    try window.append(batch.samples, speech: batch.speech, trailingSilence: batch.trailingSilence, decode: decode) { _ in }
+                }
+            }
+            XCTAssertEqual(voicedCount, 80)
+            XCTAssertTrue(inbox.lastVoiced)
+            XCTAssertEqual(window.samples.count, 32000)
+            XCTAssertTrue(window.committed.isEmpty)
+            XCTAssertGreaterThanOrEqual(maxDecodedSamples, 24000)
+        }
+
+        // Counterexample 2: 2.0s of slowly amplitude-modulated multi-harmonic quiet speech strictly below 0.0040
+        // (RMS smoothly oscillating 0.0014..0.0036) must keep all 80 frames voiced and retain the trailing second.
+        do {
+            var inbox = SpeechInbox()
+            var window = SpeechWindow()
+            var maxDecodedSamples = 0
+            let decode: SpeechWindow.DecodeFn = { s, _ in
+                maxDecodedSamples = max(maxDecodedSamples, s.count)
+                return ("harmonic", [3, 4])
+            }
+            _ = try inbox.offer([Float](repeating: 0, count: SpeechInbox.warmupSamples))
+            var voicedCount = 0
+            for step in 0..<80 {
+                let targetRMS: Float = 0.0025 + 0.0011 * sin(2.0 * .pi * Float(step) / 40.0) // 0.0014 .. 0.0036
+                var raw = [Float](repeating: 0, count: 400)
+                var sumSq: Double = 0
+                for i in 0..<400 {
+                    let t = Float(step * 400 + i) / 16000.0
+                    let v = 0.45 * sin(2.0 * .pi * 145.0 * t)
+                        + 0.35 * sin(2.0 * .pi * 290.0 * t)
+                        + 0.25 * sin(2.0 * .pi * 580.0 * t)
+                        + 0.15 * sin(2.0 * .pi * 1160.0 * t)
+                    raw[i] = v
+                    sumSq += Double(v) * Double(v)
+                }
+                let actualRMS = Float(sqrt(sumSq / 400.0))
+                let scale = targetRMS / actualRMS
+                _ = try inbox.offer(raw.map { $0 * scale })
+                if inbox.lastVoiced { voicedCount += 1 }
+                if let batch = inbox.take() {
+                    try window.append(batch.samples, speech: batch.speech, trailingSilence: batch.trailingSilence, decode: decode) { _ in }
+                }
+            }
+            XCTAssertEqual(voicedCount, 80)
+            XCTAssertTrue(inbox.lastVoiced)
+            XCTAssertEqual(window.samples.count, 32000)
+            XCTAssertTrue(window.committed.isEmpty)
+            XCTAssertGreaterThanOrEqual(maxDecodedSamples, 24000)
+        }
+    }
 }

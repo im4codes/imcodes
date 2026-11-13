@@ -1140,12 +1140,19 @@ struct SpeechGain {
     static let voicedRawRMSFloor: Float = 0.0010
     static let voicedNoiseMultiplier: Float = 1.45
     static let voicedBoostedRMSFloor: Float = 0.0050
-    static let stationaryHoldSeconds: Float = 0.18
-    static let noiseFloorAttackTau: Float = 0.13
+    static let stationaryHoldSeconds: Float = 0.22
+    static let noiseFloorAttackTau: Float = 0.12
     static let noiseFloorReleaseTau: Float = 0.06
     static let gainAttackUpTau: Float = 0.018
     static let gainReleaseTau: Float = 0.125
     static let analysisSubframeSamples = 400 // 25 ms @ 16 kHz keeps tracker & gain chunk-size invariant
+    static let hpfCutoffHz: Float = 125.0
+    private static let hpfAlpha: Float = 1.0 / (1.0 + 2.0 * Float.pi * hpfCutoffHz / Float(sampleRate))
+    static let minSpeechBandRatio: Float = 0.50
+    static let minPitchPeriodicity: Float = 0.42
+    static let pitchLagMin = 40   // 400 Hz @ 16 kHz
+    static let pitchLagMax = 200  // 80 Hz @ 16 kHz
+    static let pitchLagStep = 2
     static let softKnee: Float = 0.75
     static let softHeadroom: Float = 0.24 // softKnee + softHeadroom = 0.99 < 1.0
     static let maxUpRampSamples = 80    // 5 ms at 16 kHz avoids step clicks without dropping onset
@@ -1163,7 +1170,15 @@ struct SpeechGain {
     private(set) var currentGain: Float = 1.0
     private(set) var noiseFloorRMS: Float = SpeechGain.initialNoiseFloorRMS
     private var prevSubframeRMS: Float = 0.0
+    private var stationaryAnchorRMS: Float = 0.0
     private var stationaryDuration: Float = 0.0
+    private var hpfPrevX: Float = 0.0
+    private var hpfStage1Y: Float = 0.0
+    private var hpfStage2PrevX: Float = 0.0
+    private var hpfStage2Y: Float = 0.0
+    private var hpHistory = [Float](repeating: 0, count: SpeechGain.analysisSubframeSamples)
+    private var hpHistoryCount: Int = 0
+    private var hpPrefixSq = [Double](repeating: 0, count: SpeechGain.analysisSubframeSamples + 1)
 
     static func rms(_ samples: ArraySlice<Float>) -> Float {
         guard !samples.isEmpty else { return 0 }
@@ -1197,30 +1212,133 @@ struct SpeechGain {
         return min(0.9999, max(-0.9999, limited))
     }
 
-    private mutating func updateNoiseFloor(rawRMS: Float, dt: Float) {
+    /// Computes raw RMS and updates the continuous 2-pole ~125 Hz HPF buffer in one pass.
+    private mutating func analyzeSubframe(_ subframe: ArraySlice<Float>) -> (rawRMS: Float, hpRatio: Float) {
+        let count = subframe.count
+        guard count > 0 else { return (0, 0) }
+        let cap = Self.analysisSubframeSamples
+        let writeStart: Int
+        if count >= cap {
+            writeStart = 0
+            hpHistoryCount = cap
+        } else {
+            let keep = min(hpHistoryCount, cap - count)
+            if keep > 0 {
+                let shift = hpHistoryCount - keep
+                for i in 0..<keep {
+                    hpHistory[i] = hpHistory[shift + i]
+                }
+            }
+            writeStart = keep
+            hpHistoryCount = keep + count
+        }
+
+        var sumSqRaw: Double = 0
+        var sumSqHp: Double = 0
+        let alpha = Self.hpfAlpha
+        var idx = subframe.startIndex
+        for i in 0..<count {
+            let s = subframe[idx]
+            idx += 1
+            let x = s.isFinite ? s : 0
+            let dx = Double(x)
+            sumSqRaw += dx * dx
+
+            let s1 = alpha * (hpfStage1Y + x - hpfPrevX)
+            hpfPrevX = x
+            hpfStage1Y = s1
+            let s2 = alpha * (hpfStage2Y + s1 - hpfStage2PrevX)
+            hpfStage2PrevX = s1
+            hpfStage2Y = s2
+            let ds2 = Double(s2)
+            sumSqHp += ds2 * ds2
+            if i < cap {
+                hpHistory[writeStart + i] = s2
+            }
+        }
+        let invN = 1.0 / Double(count)
+        let rawRMS = Float(sqrt(sumSqRaw * invN))
+        let hpRMS = Float(sqrt(sumSqHp * invN))
+        let hpRatio = rawRMS > 1e-7 ? (hpRMS / rawRMS) : 0
+        return (rawRMS, hpRatio)
+    }
+
+    /// Maximum normalized autocorrelation of the high-passed buffer over human speech pitch lags (80-400 Hz).
+    /// Broadband fan noise lacks periodicity here, while sustained quiet voiced tones/vowels score high.
+    private mutating func hpPitchPeriodicity() -> Float {
+        let n = hpHistoryCount
+        guard n >= Self.analysisSubframeSamples else { return 0 }
+        hpPrefixSq[0] = 0
+        for i in 0..<n {
+            let v = Double(hpHistory[i])
+            hpPrefixSq[i + 1] = hpPrefixSq[i] + v * v
+        }
+        let totalEndSq = hpPrefixSq[n]
+        var best: Double = 0
+        var lag = Self.pitchLagMin
+        while lag <= Self.pitchLagMax {
+            let m = n - lag
+            let e0 = hpPrefixSq[m]
+            let e1 = totalEndSq - hpPrefixSq[lag]
+            let prod = e0 * e1
+            if prod > 1e-18 {
+                var num: Double = 0
+                for i in 0..<m {
+                    num += Double(hpHistory[i]) * Double(hpHistory[i + lag])
+                }
+                let r = num / sqrt(prod)
+                if r > best { best = r }
+            }
+            lag += Self.pitchLagStep
+        }
+        return Float(best)
+    }
+
+    private mutating func updateNoiseFloor(rawRMS: Float, hpRatio: Float, dt: Float) {
         guard rawRMS.isFinite else { return }
         if rawRMS > Self.maxNoiseCeilingRMS {
             stationaryDuration = 0
+            stationaryAnchorRMS = 0
             prevSubframeRMS = rawRMS
             return
-        }
-        if prevSubframeRMS <= 0 {
-            prevSubframeRMS = rawRMS
-            stationaryDuration = 0
-        } else {
-            let ratio = rawRMS / prevSubframeRMS
-            if ratio >= 0.65 && ratio <= 1.54 {
-                stationaryDuration += dt
-                prevSubframeRMS += (rawRMS - prevSubframeRMS) * 0.35
-            } else {
-                stationaryDuration = 0
-                prevSubframeRMS = rawRMS
-            }
         }
         if rawRMS < noiseFloorRMS {
             let alpha = 1.0 - expf(-dt / Self.noiseFloorReleaseTau)
             noiseFloorRMS = max(Self.minNoiseFloorRMS, noiseFloorRMS + (rawRMS - noiseFloorRMS) * alpha)
-        } else if stationaryDuration >= Self.stationaryHoldSeconds {
+        }
+        let isEnvelopeCandidate: Bool
+        if prevSubframeRMS <= 0 || hpHistoryCount < Self.analysisSubframeSamples {
+            isEnvelopeCandidate = false
+            prevSubframeRMS = rawRMS
+            stationaryAnchorRMS = rawRMS
+            stationaryDuration = 0
+        } else {
+            let ratio = rawRMS / prevSubframeRMS
+            let anchorOk = stationaryAnchorRMS <= 0
+                || (rawRMS >= stationaryAnchorRMS * 0.58 && rawRMS <= stationaryAnchorRMS * 1.72)
+            if ratio >= 0.65 && ratio <= 1.54 && anchorOk {
+                isEnvelopeCandidate = true
+                prevSubframeRMS += (rawRMS - prevSubframeRMS) * 0.35
+                if stationaryAnchorRMS <= 0 { stationaryAnchorRMS = rawRMS }
+            } else {
+                isEnvelopeCandidate = false
+                stationaryDuration = 0
+                prevSubframeRMS = rawRMS
+                stationaryAnchorRMS = rawRMS
+            }
+        }
+        guard isEnvelopeCandidate else { return }
+
+        // Require independent non-speech acoustic evidence before treating stationary low-level audio as noise:
+        // either energy is mostly sub-bass hum (<125 Hz), or >125 Hz content lacks speech pitch periodicity.
+        if hpRatio >= Self.minSpeechBandRatio && hpPitchPeriodicity() >= Self.minPitchPeriodicity {
+            stationaryDuration = 0
+            stationaryAnchorRMS = rawRMS
+            return
+        }
+
+        stationaryDuration += dt
+        if rawRMS > noiseFloorRMS && stationaryDuration >= Self.stationaryHoldSeconds {
             let alpha = 1.0 - expf(-dt / Self.noiseFloorAttackTau)
             noiseFloorRMS = min(Self.maxNoiseFloorRMS, noiseFloorRMS + (rawRMS - noiseFloorRMS) * alpha)
         }
@@ -1233,8 +1351,8 @@ struct SpeechGain {
     ) -> (voiced: Bool, sumSqOut: Double) {
         let count = subframe.count
         let dt = Float(count) / Float(Self.sampleRate)
-        let rawRMS = Self.rms(subframe)
-        updateNoiseFloor(rawRMS: rawRMS, dt: dt)
+        let (rawRMS, hpRatio) = analyzeSubframe(subframe)
+        updateNoiseFloor(rawRMS: rawRMS, hpRatio: hpRatio, dt: dt)
 
         let confidence = Self.speechConfidence(rawRMS: rawRMS, noiseFloor: noiseFloorRMS)
         let speechDesired = min(Self.maxGain, max(Self.minGain, Self.targetRMS / max(rawRMS, 1e-4)))

@@ -1105,6 +1105,86 @@ do {
         require(batch.speech && SpeechGain.rms(batch.samples) >= rms * 3.0 && batch.samples.allSatisfy { $0 > -1.0 && $0 < 1.0 },
                 "L: modulated quiet speech gain/bounds invalid at rms=\\(rms)")
     }
+
+    // F1-R2 class test: sustained quiet speech (2.0s @ RMS 0.0025 / 220Hz) and slowly varying harmonic quiet speech (<0.004)
+    // must NOT be learned as stationary noise; all 80 frames remain voiced and SpeechWindow keeps full 32,000 samples.
+    do {
+        var sustainInbox = SpeechInbox()
+        var sustainWin = SpeechWindow()
+        var maxDecoded = 0
+        let dec: SpeechWindow.DecodeFn = { s, _ in
+            maxDecoded = max(maxDecoded, s.count)
+            return ("sustain", [1, 2])
+        }
+        _ = try! sustainInbox.offer([Float](repeating: 0, count: SpeechInbox.warmupSamples))
+        var voicedFrames = 0
+        for step in 0..<80 {
+            _ = try! sustainInbox.offer(tonePCM(400, rms: 0.0025, freqHz: 220, phaseOffset: step * 400))
+            if sustainInbox.lastVoiced { voicedFrames += 1 }
+            if let batch = sustainInbox.take() {
+                try! sustainWin.append(batch.samples, speech: batch.speech, trailingSilence: batch.trailingSilence, decode: dec) { _ in }
+            }
+        }
+        require(voicedFrames == 80 && sustainInbox.lastVoiced && sustainWin.samples.count == 32000 && sustainWin.committed.isEmpty && maxDecoded >= 24000,
+                "L: sustained quiet speech was swallowed as noise (voiced=\\(voicedFrames)/80 active=\\(sustainWin.samples.count) committed=\\(sustainWin.committed) maxDecoded=\\(maxDecoded))")
+    }
+    do {
+        var modInbox = SpeechInbox()
+        var modWin = SpeechWindow()
+        var maxDecoded = 0
+        let dec: SpeechWindow.DecodeFn = { s, _ in
+            maxDecoded = max(maxDecoded, s.count)
+            return ("harmonic", [3, 4])
+        }
+        _ = try! modInbox.offer([Float](repeating: 0, count: SpeechInbox.warmupSamples))
+        var voicedFrames = 0
+        for step in 0..<80 {
+            let targetRMS: Float = 0.0025 + 0.0011 * sin(2.0 * .pi * Float(step) / 40.0) // 0.0014..0.0036 (< 0.0040)
+            var raw = [Float](repeating: 0, count: 400)
+            var sumSq: Double = 0
+            for i in 0..<400 {
+                let t = Float(step * 400 + i) / 16000.0
+                let v = 0.45 * sin(2.0 * .pi * 145.0 * t)
+                    + 0.35 * sin(2.0 * .pi * 290.0 * t)
+                    + 0.25 * sin(2.0 * .pi * 580.0 * t)
+                    + 0.15 * sin(2.0 * .pi * 1160.0 * t)
+                raw[i] = v
+                sumSq += Double(v) * Double(v)
+            }
+            let scale = targetRMS / Float(sqrt(sumSq / 400.0))
+            _ = try! modInbox.offer(raw.map { $0 * scale })
+            if modInbox.lastVoiced { voicedFrames += 1 }
+            if let batch = modInbox.take() {
+                try! modWin.append(batch.samples, speech: batch.speech, trailingSilence: batch.trailingSilence, decode: dec) { _ in }
+            }
+        }
+        require(voicedFrames == 80 && modInbox.lastVoiced && modWin.samples.count == 32000 && modWin.committed.isEmpty && maxDecoded >= 24000,
+                "L: slowly modulated <0.004 quiet speech was swallowed (voiced=\\(voicedFrames)/80 active=\\(modWin.samples.count) committed=\\(modWin.committed) maxDecoded=\\(maxDecoded))")
+    }
+    // Mixed 60Hz hum + broadband fan noise (0.002 total) after 0.2s speech also learns noise and commits VAD pause.
+    do {
+        var mixInbox = SpeechInbox()
+        var mixWin = SpeechWindow()
+        let dec: SpeechWindow.DecodeFn = { _, _ in ("mixspeech", [5]) }
+        _ = try! mixInbox.offer([Float](repeating: 0, count: SpeechInbox.warmupSamples))
+        for step in 0..<8 {
+            _ = try! mixInbox.offer(tonePCM(400, rms: 0.005, freqHz: 220, phaseOffset: step * 400))
+            if let batch = mixInbox.take() {
+                try! mixWin.append(batch.samples, speech: batch.speech, trailingSilence: batch.trailingSilence, decode: dec) { _ in }
+            }
+        }
+        for step in 0..<48 {
+            let h = tonePCM(400, rms: 0.0014, freqHz: 60, phaseOffset: step * 400)
+            let f = fanPCM(400, rms: 0.0014, seed: UInt64(0xCC00_0001 + step))
+            let mixed = zip(h, f).map(+)
+            _ = try! mixInbox.offer(mixed)
+            if let batch = mixInbox.take() {
+                try! mixWin.append(batch.samples, speech: batch.speech, trailingSilence: batch.trailingSilence, decode: dec) { _ in }
+            }
+        }
+        require(!mixInbox.lastVoiced && mixWin.samples.isEmpty && mixWin.committed == "mixspeech",
+                "L: mixed hum+fan noise blocked VAD commit: left=\\(mixWin.samples.count) committed=\\(mixWin.committed)")
+    }
     print("SPEECH_GAIN_AND_INBOX_VAD:PASS")
 }
 `);
