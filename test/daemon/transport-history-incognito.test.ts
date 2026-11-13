@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
 import type { ProviderError, ProviderStatusUpdate, TransportProvider } from '../../src/agent/transport-provider.js';
 import { setSessionIncognito } from '../../shared/session-incognito-context.js';
-import { appendTransportEvent, replayTransportHistory } from '../../src/daemon/transport-history.js';
+import { appendTransportEvent, flushTransportHistory, replayTransportHistory } from '../../src/daemon/transport-history.js';
+import { timelineProjection } from '../../src/daemon/timeline-projection.js';
 import { timelineStore } from '../../src/daemon/timeline-store.js';
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
 import { flushStore, loadStore, removeSession, resetSessionStoreAuthorityForTests, upsertSession } from '../../src/store/session-store.js';
@@ -77,9 +78,14 @@ describe('transport-history + transport-relay + timelineStore incognito isolatio
   });
 
   afterEach(async () => {
-    setSessionIncognito(sessionName, false);
     forgetTransportRelaySession(sessionName);
     timelineEmitter.forgetSession(sessionName);
+    await flushTransportHistory();
+    await timelineStore.flushAll(5_000);
+    await timelineProjection.drain(5_000);
+    await timelineProjection.shutdown();
+    await timelineEmitter.drainUsageWrites(3_000);
+    setSessionIncognito(sessionName, false);
     removeSession(sessionName);
     await flushStore().catch(() => {});
     process.env.HOME = prevHome;
@@ -131,7 +137,7 @@ describe('transport-history + transport-relay + timelineStore incognito isolatio
     mock.emitError('provider-priv-1', { code: 'PROVIDER_ERROR', message: 'SECRET-PROVIDER-ERROR', recoverable: true });
     await appendTransportEvent(sessionName, { type: 'assistant.text', sessionId: sessionName, text: 'SECRET-DIRECT-BYPASS' });
 
-    await new Promise((resolve) => setTimeout(resolve, 60));
+    await flushTransportHistory();
     await timelineStore.flushSession(sessionName);
 
     // Prior normal disk history must be completely untouched and zero private bytes written
@@ -198,7 +204,7 @@ describe('transport-history + transport-relay + timelineStore incognito isolatio
     mock.emitDelta('provider-norm-1', { messageId: 'norm-msg', delta: 'ORDINARY-STREAM', role: 'assistant' });
     mock.emitComplete('provider-norm-1', { id: 'norm-msg', role: 'assistant', content: 'ORDINARY-FINAL' });
 
-    await new Promise((resolve) => setTimeout(resolve, 60));
+    await flushTransportHistory();
     await timelineStore.flushSession(sessionName);
 
     const transportPath = join(process.env.IMCODES_HOME!, 'transport', `${sessionName}.jsonl`);
@@ -206,5 +212,51 @@ describe('transport-history + transport-relay + timelineStore incognito isolatio
     const replayed = await replayTransportHistory(sessionName);
     expect(replayed.some((e) => e.text === 'ORDINARY-FINAL')).toBe(true);
     expect(JSON.stringify(replayed)).not.toContain('SECRET-UNFINISHED-INFLIGHT');
+  });
+
+  it('drains fire-and-forget transport/timeline writes cleanly across IMCODES_HOME switches so immediate tempHome cleanup never hits ENOTEMPTY', async () => {
+    for (let cycle = 0; cycle < 3; cycle += 1) {
+      const cycleHome = mkdtempSync(join(tmpdir(), `incognito-f1-cycle-${cycle}-`));
+      process.env.HOME = cycleHome;
+      process.env.IMCODES_HOME = join(cycleHome, '.imcodes');
+      resetSessionStoreAuthorityForTests();
+      await loadStore();
+
+      upsertSession({
+        name: sessionName,
+        projectName: 'f1_incognito',
+        role: 'brain',
+        agentType: 'claude-code-sdk',
+        state: 'running',
+        projectDir: cycleHome,
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        incognito: false,
+      });
+
+      const mock = createMockRelayProvider();
+      wireProviderToRelay(mock.provider);
+      routedSessions.set(`provider-cycle-${cycle}`, sessionName);
+
+      mock.emitComplete(`provider-cycle-${cycle}`, {
+        id: `cycle-msg-${cycle}`,
+        role: 'assistant',
+        content: `CYCLE-FINAL-${cycle}`,
+      });
+
+      await flushTransportHistory();
+      await timelineStore.flushAll(5_000);
+      await timelineProjection.drain(5_000);
+      await timelineProjection.shutdown();
+      forgetTransportRelaySession(sessionName);
+      timelineEmitter.forgetSession(sessionName);
+      removeSession(sessionName);
+      await flushStore();
+
+      expect(existsSync(join(cycleHome, '.imcodes', 'transport', `${sessionName}.jsonl`))).toBe(true);
+      expect(() => rmSync(cycleHome, { recursive: true, force: true })).not.toThrow();
+    }
   });
 });

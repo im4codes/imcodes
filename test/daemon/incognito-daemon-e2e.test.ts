@@ -69,8 +69,10 @@ import { stopProject, getTransportRuntime, resetProviderRegistryForTests } from 
 import { resetSessionStoreAuthorityForTests, loadStore, flushStore, getSession, removeSession } from '../../src/store/session-store.js';
 import { getTransportQueueStore, resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
 import { timelineStore } from '../../src/daemon/timeline-store.js';
+import { timelineProjection } from '../../src/daemon/timeline-projection.js';
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
-import { replayTransportHistory } from '../../src/daemon/transport-history.js';
+import { flushTransportHistory, replayTransportHistory } from '../../src/daemon/transport-history.js';
+import { resetContextStoreClientForTests } from '../../src/store/context-store-worker-client.js';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
 
 async function waitFor(fn: () => boolean, timeoutMs = 4000, describeFailure?: () => string): Promise<void> {
@@ -105,9 +107,15 @@ describe('daemon incognito end-to-end lifecycle (F3)', () => {
   });
 
   afterEach(async () => {
+    timelineEmitter.forgetSession('deck_privmode_brain');
+    await flushTransportHistory();
+    await timelineStore.flushAll(5_000);
+    await timelineProjection.drain(5_000);
+    await timelineProjection.shutdown();
+    await timelineEmitter.drainUsageWrites(3_000);
+    resetContextStoreClientForTests();
     setSessionIncognito('deck_privmode_brain', false);
     removeSession('deck_privmode_brain');
-    timelineEmitter.forgetSession('deck_privmode_brain');
     resetTransportQueueStoreForTests();
     await flushStore().catch(() => {});
     process.env.HOME = prevHome;

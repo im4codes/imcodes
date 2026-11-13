@@ -185,7 +185,7 @@ export function readTailLines(filePath: string, maxLines: number): string[] {
 }
 
 class TimelineStore {
-  private initialized = false;
+  private initializedDir: string | null = null;
   /**
    * Per-session async append chains. Each session has at most one
    * outstanding write Promise; appends are serialized per-session to
@@ -194,19 +194,21 @@ class TimelineStore {
   private sessionChains = new Map<string, Promise<void>>();
 
   private ensureDirSync(): void {
-    if (this.initialized) return;
+    const dir = timelineDir();
+    if (this.initializedDir === dir) return;
     try {
-      mkdirSync(timelineDir(), { recursive: true });
+      mkdirSync(dir, { recursive: true });
     } catch { /* exists */ }
-    this.initialized = true;
+    this.initializedDir = dir;
   }
 
   private async ensureDirAsync(): Promise<void> {
-    if (this.initialized) return;
+    const dir = timelineDir();
+    if (this.initializedDir === dir) return;
     try {
-      await mkdir(timelineDir(), { recursive: true });
+      await mkdir(dir, { recursive: true });
     } catch { /* exists */ }
-    this.initialized = true;
+    this.initializedDir = dir;
   }
 
   filePath(sessionName: string): string {
@@ -252,6 +254,7 @@ class TimelineStore {
         logger.debug({ err, sessionId: event.sessionId, eventId: event.eventId }, 'TimelineProjection: append mirror failed');
       });
     } catch (err) {
+      this.initializedDir = null;
       logger.debug({ err, sessionId: event.sessionId }, 'TimelineStore: append failed');
     }
   }

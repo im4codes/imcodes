@@ -52,12 +52,14 @@ export const TRANSPORT_HISTORY_TOOL_RESULT_PREVIEW_BYTES = 1024;
 const TRANSPORT_HISTORY_TRUNCATED_MARKER = '\n[transport result truncated]';
 const RENDERABLE_TRANSPORT_HISTORY_TYPES = new Set(['user.message', 'assistant.text', 'tool.call', 'tool.result']);
 
-let dirEnsured = false;
+let ensuredTransportDir: string | null = null;
+const pendingAppends = new Set<Promise<void>>();
 
 async function ensureDir(): Promise<void> {
-  if (dirEnsured) return;
-  await mkdir(transportDir(), { recursive: true });
-  dirEnsured = true;
+  const dir = transportDir();
+  if (ensuredTransportDir === dir) return;
+  await mkdir(dir, { recursive: true });
+  ensuredTransportDir = dir;
 }
 
 function sessionFile(sessionId: string): string {
@@ -226,15 +228,31 @@ function isPrivateTransportSession(sessionId: string, event?: Record<string, unk
 
 /** Append a transport event to the session's JSONL file. */
 export async function appendTransportEvent(sessionId: string, event: Record<string, unknown>): Promise<void> {
+  const op = (async () => {
+    try {
+      if (isPrivateTransportSession(sessionId, event)) return;
+      if (!shouldKeepTransportHistoryEvent(event)) return;
+      await ensureDir();
+      const line = JSON.stringify(sanitizeTransportHistoryEvent({ ...event, _ts: Date.now() })) + '\n';
+      await appendFile(sessionFile(sessionId), line, 'utf8');
+    } catch (err) {
+      ensuredTransportDir = null;
+      if (isPrivateTransportSession(sessionId, event)) return;
+      logger.debug({ sessionId, err }, 'transport-history: append failed');
+    }
+  })();
+  pendingAppends.add(op);
   try {
-    if (isPrivateTransportSession(sessionId, event)) return;
-    if (!shouldKeepTransportHistoryEvent(event)) return;
-    await ensureDir();
-    const line = JSON.stringify(sanitizeTransportHistoryEvent({ ...event, _ts: Date.now() })) + '\n';
-    await appendFile(sessionFile(sessionId), line, 'utf8');
-  } catch (err) {
-    if (isPrivateTransportSession(sessionId, event)) return;
-    logger.debug({ sessionId, err }, 'transport-history: append failed');
+    await op;
+  } finally {
+    pendingAppends.delete(op);
+  }
+}
+
+/** Wait for all in-flight transport history appends to settle on disk. */
+export async function flushTransportHistory(): Promise<void> {
+  while (pendingAppends.size > 0) {
+    await Promise.allSettled([...pendingAppends]);
   }
 }
 
