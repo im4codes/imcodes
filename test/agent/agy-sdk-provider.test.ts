@@ -1173,4 +1173,156 @@ describe('AgySdkProvider (fake agy process)', () => {
     expect(toolEvents.some((t) => t.detail?.meta?.agentPath === 'child-beta')).toBe(true);
     expect(toolEvents.some((t) => t.detail?.meta?.agentPath === 'child-anon')).toBe(true);
   });
+
+  it('upgrades pending anonymous steps to late-revealed wire identity across ACTIVE and DONE without orphan running subagents', async () => {
+    const sid = await provider.createSession({ sessionKey: 'late-id-upgrade-sess', cwd: dir });
+    const toolEvents: ToolCallEvent[] = [];
+    provider.onToolCall((_s, tool) => toolEvents.push(tool));
+    const state = (provider as any).sessions.get(sid);
+    state.conversationId = 'audit-late-id-parent';
+    const emitStep = (step: Record<string, unknown>) => {
+      (provider as any).handleLine(sid, state, JSON.stringify({ event: 'step_update', step_update: step }));
+    };
+
+    // 1. R2 counterexample: anonymous ACTIVE -> ACTIVE with newly revealed tool_call_id -> replay -> DONE.
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Role: 'LateId', Prompt: 'work late id' } },
+    });
+    expect(state.toolSteps.size).toBe(1);
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_call_id: 'newly-revealed-call-id',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Prompt: 'work late id', Role: 'LateId' } },
+    });
+    expect(state.toolSteps.size).toBe(1);
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_call_id: 'newly-revealed-call-id',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Role: 'LateId', Prompt: 'work late id' } },
+    });
+    expect(state.toolSteps.size).toBe(1);
+    emitStep({
+      step_type: 'tool',
+      state: 'DONE',
+      tool_call_id: 'newly-revealed-call-id',
+      tool_name: 'invoke_subagent',
+      tool_info: {
+        name: 'invoke_subagent',
+        parameters: { Role: 'LateId', Prompt: 'work late id' },
+        output: JSON.stringify({ conversationId: 'child-late-id', status: 'running' }),
+      },
+    });
+    expect(state.toolSteps.size).toBe(0);
+    const lateIdDone = state.subagents.snapshot({ conversationId: 'child-late-id', status: 'completed' }, 'native_completion');
+    expect(lateIdDone[0]?.detail?.meta?.terminal).toBe(true);
+    expect(state.subagents.interrupt()).toEqual([]);
+    const lateIdEvents = toolEvents.filter((t) => t.detail?.meta?.agentName === 'LateId');
+    expect(lateIdEvents).toHaveLength(4);
+    expect(new Set(lateIdEvents.map((t) => t.id)).size).toBe(1);
+
+    // 2. Same class via step_index revealed mid-flight on ACTIVE.
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Role: 'LateIdx', Prompt: 'work late idx' } },
+    });
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      step_index: 71,
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Role: 'LateIdx', Prompt: 'work late idx' } },
+    });
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      step_index: 71,
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Role: 'LateIdx', Prompt: 'work late idx' } },
+    });
+    expect(state.toolSteps.size).toBe(1);
+    emitStep({
+      step_type: 'tool',
+      state: 'DONE',
+      step_index: 71,
+      tool_name: 'invoke_subagent',
+      tool_info: {
+        name: 'invoke_subagent',
+        parameters: { Role: 'LateIdx', Prompt: 'work late idx' },
+        output: JSON.stringify({ conversationId: 'child-late-idx', status: 'completed' }),
+      },
+    });
+    expect(state.toolSteps.size).toBe(0);
+    expect(state.subagents.interrupt()).toEqual([]);
+    const lateIdxEvents = toolEvents.filter((t) => t.detail?.meta?.agentName === 'LateIdx');
+    expect(new Set(lateIdxEvents.map((t) => t.id)).size).toBe(1);
+
+    // 3. Call-id -> step_index upgrade preserves slot and cleans up.
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_call_id: 'call-to-index',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Role: 'CallToIdx' } },
+    });
+    emitStep({
+      step_type: 'tool',
+      state: 'DONE',
+      step_index: 72,
+      tool_call_id: 'call-to-index',
+      tool_name: 'invoke_subagent',
+      tool_info: {
+        name: 'invoke_subagent',
+        output: JSON.stringify({ conversationId: 'child-call-to-idx', status: 'completed' }),
+      },
+    });
+    expect(state.toolSteps.size).toBe(0);
+
+    // 4. Parallel distinct-input explicit call does NOT hijack an unrelated open anonymous call.
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Role: 'AnonOpen', Prompt: 'a' } },
+    });
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_call_id: 'explicit-other',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Role: 'ExplicitOther', Prompt: 'b' } },
+    });
+    expect(state.toolSteps.size).toBe(2);
+    emitStep({
+      step_type: 'tool',
+      state: 'DONE',
+      tool_call_id: 'explicit-other',
+      tool_name: 'invoke_subagent',
+      tool_info: {
+        name: 'invoke_subagent',
+        parameters: { Role: 'ExplicitOther', Prompt: 'b' },
+        output: JSON.stringify({ conversationId: 'child-explicit-other', status: 'completed' }),
+      },
+    });
+    emitStep({
+      step_type: 'tool',
+      state: 'DONE',
+      tool_name: 'invoke_subagent',
+      tool_info: {
+        name: 'invoke_subagent',
+        parameters: { Role: 'AnonOpen', Prompt: 'a' },
+        output: JSON.stringify({ conversationId: 'child-anon-open', status: 'completed' }),
+      },
+    });
+    expect(state.toolSteps.size).toBe(0);
+    expect(state.subagents.interrupt()).toEqual([]);
+  });
 });

@@ -885,40 +885,12 @@ export class AgySdkProvider implements TransportProvider {
       const done = stepState === AGY_STEP_STATE.DONE || failed;
       const toolCallId = asString(step.tool_call_id) ?? asString(info.tool_call_id) ?? asString(info.id);
       const inputKey = stableJson(info.parameters);
-      const nextSynthetic = () => {
-        const n = (state.nextSyntheticToolStep ?? 0) + 1;
-        state.nextSyntheticToolStep = n;
-        return `anon:${n}`;
-      };
-      const findAnonymousStepKey = (): string => {
-        const anonMatches = [...state.toolSteps.entries()].filter(([k, v]) => k.startsWith('anon:') && v.name === name);
-        if (inputKey !== undefined) {
-          const exact = anonMatches.find(([, v]) => v.inputKey === inputKey);
-          if (exact) return exact[0];
-          const unknownInputMatches = anonMatches.filter(([, v]) => v.inputKey === undefined);
-          if (unknownInputMatches.length === 1) return unknownInputMatches[0][0];
-          return nextSynthetic();
-        }
-        if (anonMatches.length > 0) return anonMatches[0][0];
-        return nextSynthetic();
-      };
-      let stepKey: string;
-      if (rawStepIndex !== undefined) {
-        stepKey = `step:${rawStepIndex}`;
-      } else if (toolCallId) {
-        const explicitCallKey = `call:${toolCallId}`;
-        if (!state.toolSteps.has(explicitCallKey) && done) {
-          const compatibleAnon = [...state.toolSteps.entries()].filter(
-            ([k, v]) => k.startsWith('anon:') && v.name === name
-              && (inputKey === undefined || v.inputKey === undefined || v.inputKey === inputKey),
-          );
-          stepKey = compatibleAnon.length === 1 ? compatibleAnon[0][0] : explicitCallKey;
-        } else {
-          stepKey = explicitCallKey;
-        }
-      } else {
-        stepKey = findAnonymousStepKey();
-      }
+      const stepKey = resolveAgyToolStepKey(state, {
+        rawStepIndex,
+        toolCallId,
+        name,
+        inputKey,
+      });
       let existingStep = state.toolSteps.get(stepKey);
       if (!existingStep || (rawStepIndex === undefined && existingStep.name !== name)) {
         const suffix = rawStepIndex ?? toolCallId ?? stepKey;
@@ -1145,4 +1117,83 @@ export class AgySdkProvider implements TransportProvider {
     if (details !== undefined) (err as any).details = details;
     return err;
   }
+}
+
+/**
+ * Resolve the stable `state.toolSteps` key for an incoming TOOL step update.
+ * Explicit wire identities (`step_index`, `tool_call_id`) take precedence; when
+ * a new wire key appears for a uniquely compatible pending anonymous call
+ * (during either ACTIVE progress/replay or DONE), the anonymous entry is
+ * upgraded/migrated in place so its emitted event/subagent ID stays identical
+ * and no stale `anon:*` alias remains behind.
+ */
+function resolveAgyToolStepKey(
+  state: AgySessionState,
+  opts: {
+    rawStepIndex: number | undefined;
+    toolCallId: string | undefined;
+    name: string;
+    inputKey: string | undefined;
+  },
+): string {
+  const { rawStepIndex, toolCallId, name, inputKey } = opts;
+  const indexKey = rawStepIndex !== undefined ? `step:${rawStepIndex}` : undefined;
+  const callKey = toolCallId ? `call:${toolCallId}` : undefined;
+
+  if (indexKey && state.toolSteps.has(indexKey)) return indexKey;
+  if (callKey && state.toolSteps.has(callKey)) {
+    if (indexKey) {
+      const existing = state.toolSteps.get(callKey)!;
+      state.toolSteps.delete(callKey);
+      state.toolSteps.set(indexKey, existing);
+      return indexKey;
+    }
+    return callKey;
+  }
+
+  const primaryExplicitKey = indexKey ?? callKey;
+  if (primaryExplicitKey) {
+    const anonOfName = [...state.toolSteps.entries()].filter(
+      ([k, v]) => k.startsWith('anon:') && v.name === name,
+    );
+    let upgradeCandidate: [string, { id: string; name: string; inputKey?: string }] | undefined;
+    if (inputKey !== undefined) {
+      const exact = anonOfName.filter(([, v]) => v.inputKey === inputKey);
+      if (exact.length === 1) {
+        upgradeCandidate = exact[0];
+      } else if (exact.length === 0) {
+        const compat = anonOfName.filter(([, v]) => v.inputKey === undefined);
+        if (compat.length === 1) upgradeCandidate = compat[0];
+      }
+    } else {
+      if (anonOfName.length === 1) upgradeCandidate = anonOfName[0];
+    }
+    if (upgradeCandidate) {
+      const [anonKey, anonEntry] = upgradeCandidate;
+      state.toolSteps.delete(anonKey);
+      if (anonEntry.inputKey === undefined && inputKey !== undefined) {
+        anonEntry.inputKey = inputKey;
+      }
+      state.toolSteps.set(primaryExplicitKey, anonEntry);
+    }
+    return primaryExplicitKey;
+  }
+
+  const nextSynthetic = (): string => {
+    const n = (state.nextSyntheticToolStep ?? 0) + 1;
+    state.nextSyntheticToolStep = n;
+    return `anon:${n}`;
+  };
+  const anonMatches = [...state.toolSteps.entries()].filter(
+    ([k, v]) => k.startsWith('anon:') && v.name === name,
+  );
+  if (inputKey !== undefined) {
+    const exact = anonMatches.find(([, v]) => v.inputKey === inputKey);
+    if (exact) return exact[0];
+    const unknownInputMatches = anonMatches.filter(([, v]) => v.inputKey === undefined);
+    if (unknownInputMatches.length === 1) return unknownInputMatches[0][0];
+    return nextSynthetic();
+  }
+  if (anonMatches.length > 0) return anonMatches[0][0];
+  return nextSynthetic();
 }
