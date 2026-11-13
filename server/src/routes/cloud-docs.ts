@@ -86,6 +86,7 @@ import {
   isConvertTargetType,
   isCreateCloudDocType,
   isDocBuilderOutputType,
+  isInternalUploadTempFilePath,
   normalizeCloudDocFolderName,
   normalizeCloudDocName,
   normalizeRecentFilePath,
@@ -2606,7 +2607,7 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
     if (body.sourceKind === 'server_file') {
       const serverId = body.serverId?.trim() || '';
       const normPath = normalizeRecentFilePath(body.filePath);
-      if (!serverId || !normPath) {
+      if (!serverId || !normPath || isInternalUploadTempFilePath(normPath)) {
         return c.json({ error: 'invalid_path' }, 400);
       }
 

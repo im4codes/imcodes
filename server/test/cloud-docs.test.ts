@@ -980,6 +980,120 @@ describe('cloud docs & recent documents', () => {
     expect(bobDel.status).toBe(200);
   });
 
+  it('rejects internal upload/pasted-text temp paths from Recent recording (POSIX & Windows) while recording created & shared Cloud Docs', async () => {
+    const bridge = WsBridge.get('srv-1');
+    class MockDaemonWs extends EventEmitter {
+      readyState = 1;
+      send(raw: string, _opts?: unknown, cb?: () => void) {
+        cb?.();
+        const msg = JSON.parse(raw) as Record<string, unknown>;
+        if (msg.type === 'fs.read') {
+          setTimeout(() => {
+            this.emit('message', Buffer.from(JSON.stringify({
+              type: 'fs.read_response',
+              requestId: msg.requestId,
+              status: 'ok',
+              path: msg.path,
+              content: 'doc-content',
+              encoding: 'utf8',
+              mtime: Date.now(),
+            })), false);
+          }, 1);
+        }
+      }
+      close() {}
+      ping() {}
+    }
+    const mockWs = new MockDaemonWs();
+    (bridge as unknown as { daemonWs: MockDaemonWs; authenticated: boolean }).daemonWs = mockWs;
+    (bridge as unknown as { authenticated: boolean }).authenticated = true;
+
+    const uploadTempPaths = [
+      '/home/k/.imcodes/uploads/237d57beb/pasted-text-2026-11-13T14-12-56-645Z.txt',
+      'C:\\Users\\k\\.imcodes\\uploads\\237d57beb\\pasted-text-2026-11-13T14-12-56-645Z.txt',
+      '/home/k/.imcodes/uploads/abc/spec.docx',
+      '~/.imcodes/uploads/abc/report.pdf',
+      '/tmp/pasted-text-2026-11-13T14-12-56-645Z.txt',
+    ];
+
+    for (const filePath of uploadTempPaths) {
+      const recRes = await app.request('/api/recent-documents/record', {
+        method: 'POST',
+        headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sourceKind: 'server_file',
+          serverId: 'srv-1',
+          filePath,
+          title: 'temp',
+        }),
+      });
+      expect(recRes.status, `expected 400 rejection for ${filePath}`).toBe(400);
+
+      const ooRes = await app.request(
+        `/api/server/srv-1/onlyoffice/config?path=${encodeURIComponent(filePath)}`,
+        { headers: bearerHeader('owner-1') },
+      );
+      expect([200, 400]).toContain(ooRes.status);
+    }
+
+    // Still zero recent documents for owner-1 after upload-temp opens
+    const ownerRecentEmpty = await app.request('/api/recent-documents', { headers: bearerHeader('owner-1') });
+    expect(((await ownerRecentEmpty.json()) as { items: unknown[] }).items).toHaveLength(0);
+
+    // Non-upload Office/PDF server file opened via ONLYOFFICE config DOES record
+    const validOoRes = await app.request(
+      `/api/server/srv-1/onlyoffice/config?path=${encodeURIComponent('/repo/report.pdf')}`,
+      { headers: bearerHeader('owner-1') },
+    );
+    expect(validOoRes.status).toBe(200);
+    const ownerRecentServer = await app.request('/api/recent-documents', { headers: bearerHeader('owner-1') });
+    const ownerServerItems = ((await ownerRecentServer.json()) as { items: Array<{ sourceKind: string; filePath?: string | null }> }).items;
+    expect(ownerServerItems).toHaveLength(1);
+    expect(ownerServerItems[0]).toMatchObject({ sourceKind: 'server_file', filePath: '/repo/report.pdf' });
+
+    // User/agent-created Cloud Doc + shared Cloud Doc open DOES record in recent_documents
+    const createRes = await app.request('/api/cloud-docs/blank', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'docx', name: 'Agent Spec.docx' }),
+    });
+    expect(createRes.status).toBe(201);
+    const { doc } = (await createRes.json()) as { doc: { id: string } };
+
+    // Share with Bob and open as both owner and shared collaborator
+    await app.request('/api/cloud-docs/shares', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetKind: 'doc',
+        targetId: doc.id,
+        shareMode: 'user',
+        targetUserId: 'user-bob',
+        role: 'editor',
+      }),
+    });
+
+    const ownerOpen = await app.request(`/api/cloud-docs/${doc.id}/onlyoffice/config`, {
+      headers: bearerHeader('owner-1'),
+    });
+    expect(ownerOpen.status).toBe(200);
+
+    const bobOpen = await app.request(`/api/cloud-docs/${doc.id}/onlyoffice/config`, {
+      headers: bearerHeader('user-bob'),
+    });
+    expect(bobOpen.status).toBe(200);
+
+    const ownerRecent = await app.request('/api/recent-documents', { headers: bearerHeader('owner-1') });
+    const ownerItems = ((await ownerRecent.json()) as { items: Array<{ sourceKind: string; cloudDocId?: string | null; title: string }> }).items;
+    expect(ownerItems).toHaveLength(2);
+    expect(ownerItems.some((it) => it.sourceKind === 'cloud_doc' && it.cloudDocId === doc.id && it.title === 'Agent Spec.docx')).toBe(true);
+
+    const bobRecent = await app.request('/api/recent-documents', { headers: bearerHeader('user-bob') });
+    const bobItems = ((await bobRecent.json()) as { items: Array<{ sourceKind: string; cloudDocId?: string | null; title: string }> }).items;
+    expect(bobItems).toHaveLength(1);
+    expect(bobItems[0]).toMatchObject({ sourceKind: 'cloud_doc', cloudDocId: doc.id, title: 'Agent Spec.docx' });
+  });
+
   it('reuses teams/team_members for sharing, overrides folder grants with doc grants, enforces viewer/allowDownload, and revokes live on callback/member removal/disable', async () => {
     const sqlPath = path.resolve(__dirname, '../src/db/migrations/105_cloud_docs_and_recent_documents.sql');
     const sql = fs.readFileSync(sqlPath, 'utf8');

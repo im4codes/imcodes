@@ -392,6 +392,23 @@ export function normalizeRecentFilePath(rawPath: string | undefined | null): str
   return normalized;
 }
 
+/**
+ * Returns true for internal daemon upload / chat pasted-text temporary paths
+ * (POSIX or Windows, e.g. `~/.imcodes/uploads/<id>/pasted-text-*.txt`),
+ * which must never auto-enter Cloud Docs Recent documents.
+ */
+export function isInternalUploadTempFilePath(rawPath: string | undefined | null): boolean {
+  if (!rawPath) return false;
+  const normalized = rawPath.replace(/\\/g, '/').trim();
+  if (!normalized) return false;
+  const collapsed = normalized.replace(/\/+/g, '/');
+  if (/(?:^|\/)\.imcodes\/uploads(?:\/|$)/i.test(collapsed)) {
+    return true;
+  }
+  const baseName = collapsed.split('/').pop() ?? '';
+  return /^pasted-text-\d{4}-\d{2}-\d{2}t[\d-]+z\.txt$/i.test(baseName);
+}
+
 export function buildRecentDocumentSourceKey(params: {
   sourceKind: RecentDocumentSourceKind;
   serverId?: string | null;

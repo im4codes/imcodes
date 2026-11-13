@@ -3412,7 +3412,14 @@ describe('FileBrowser — file-manager preview/folder sync', () => {
     }
   });
 
-  it('auto-records local document previews (.md/.txt, status=ok) in recent documents while skipping code files and failed reads', async () => {
+  it('does NOT auto-record pasted-text uploads or plain text/code/csv previews in recent documents, while recording non-temp Office/PDF and explicit ONLYOFFICE opens', async () => {
+    const prevResizeObserver = globalThis.ResizeObserver;
+    class MockResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    globalThis.ResizeObserver = MockResizeObserver as unknown as typeof ResizeObserver;
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ item: {} }), {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
@@ -3422,96 +3429,177 @@ describe('FileBrowser — file-manager preview/folder sync', () => {
     const recentCalls = () => fetchMock.mock.calls.filter(([url]) => String(url).includes('/api/recent-documents/record'));
 
     try {
-      await act(async () => {
-        render(
+      // Negative controls: plain text/code/csv previews and pasted-text / .imcodes/uploads paths MUST NOT auto-record
+      const plainCases = [
+        { path: '/home/k/.imcodes/uploads/237d57beb/pasted-text-2026-11-13T14-12-56-645Z.txt', content: 'pasted text' },
+        { path: 'C:\\Users\\k\\.imcodes\\uploads\\237d57beb\\pasted-text-2026-11-13T14-12-56-645Z.txt', content: 'win pasted' },
+        { path: '/repo/notes.txt', content: 'plain notes' },
+        { path: '/repo/README.md', content: '# Hello World' },
+        { path: '/repo/package.json', content: '{"name":"demo"}' },
+        { path: '/repo/data.csv', content: 'a,b\n1,2' },
+        { path: '/repo/app.log', content: '[info] ok' },
+        { path: '/repo/index.ts', content: 'export const x = 1;' },
+      ];
+
+      for (const tc of plainCases) {
+        const rendered = render(
           <FileBrowser
             ws={ws}
             serverId="srv-rec"
             mode="file-single"
             layout="panel"
             initialPath="/repo"
-            autoPreviewPath="/repo/README.md"
+            autoPreviewPath={tc.path}
             onConfirm={vi.fn()}
           />,
         );
-      });
+        await act(async () => {
+          sendMsg({
+            type: 'fs.read_response',
+            requestId: 'mock-read-id',
+            path: tc.path,
+            status: 'ok',
+            content: tc.content,
+            encoding: 'utf8',
+          } as unknown as ServerMessage);
+        });
+        await new Promise((r) => setTimeout(r, 15));
+        expect(recentCalls(), `expected zero recent calls for plain preview ${tc.path}`).toHaveLength(0);
+        rendered.unmount();
+      }
 
+      // Failed read MUST NOT record
+      const errView = render(
+        <FileBrowser
+          ws={ws}
+          serverId="srv-rec"
+          mode="file-single"
+          layout="panel"
+          initialPath="/repo"
+          autoPreviewPath="/repo/missing.txt"
+          onConfirm={vi.fn()}
+        />,
+      );
       await act(async () => {
         sendMsg({
           type: 'fs.read_response',
           requestId: 'mock-read-id',
-          path: '/repo/README.md',
-          status: 'ok',
-          content: '# Hello World',
-          encoding: 'utf8',
-        } as unknown as ServerMessage);
-      });
-
-      await waitFor(() => expect(recentCalls()).toHaveLength(1));
-      const payload = JSON.parse(String((recentCalls()[0]?.[1] as RequestInit | undefined)?.body ?? '{}'));
-      expect(payload).toMatchObject({
-        sourceKind: 'server_file',
-        serverId: 'srv-rec',
-        filePath: '/repo/README.md',
-        mimeType: 'text/markdown; charset=utf-8',
-        title: 'README.md',
-      });
-
-      fetchMock.mockClear();
-
-      // Non-document code file (.ts) MUST NOT be recorded even when status === 'ok'
-      await act(async () => {
-        render(
-          <FileBrowser
-            ws={ws}
-            serverId="srv-rec"
-            mode="file-single"
-            layout="panel"
-            initialPath="/repo"
-            autoPreviewPath="/repo/index.ts"
-            onConfirm={vi.fn()}
-          />,
-        );
-      });
-      await act(async () => {
-        sendMsg({
-          type: 'fs.read_response',
-          requestId: 'mock-read-id',
-          path: '/repo/index.ts',
-          status: 'ok',
-          content: 'export const x = 1;',
-          encoding: 'utf8',
-        } as unknown as ServerMessage);
-      });
-      await new Promise((r) => setTimeout(r, 20));
-      expect(recentCalls()).toHaveLength(0);
-
-      // Error / failed read on .txt MUST NOT be recorded
-      await act(async () => {
-        render(
-          <FileBrowser
-            ws={ws}
-            serverId="srv-rec"
-            mode="file-single"
-            layout="panel"
-            initialPath="/repo"
-            autoPreviewPath="/repo/notes.txt"
-            onConfirm={vi.fn()}
-          />,
-        );
-      });
-      await act(async () => {
-        sendMsg({
-          type: 'fs.read_response',
-          requestId: 'mock-read-id',
-          path: '/repo/notes.txt',
+          path: '/repo/missing.txt',
           status: 'error',
           error: 'not_found',
         } as unknown as ServerMessage);
       });
-      await new Promise((r) => setTimeout(r, 20));
+      await new Promise((r) => setTimeout(r, 15));
       expect(recentCalls()).toHaveLength(0);
+      errView.unmount();
+
+      // Upload/temp Office/PDF paths under .imcodes/uploads (POSIX & Windows) MUST NOT auto-record
+      for (const uploadOfficePath of [
+        '/home/k/.imcodes/uploads/abc123/spec.docx',
+        'C:\\Users\\k\\.imcodes\\uploads\\abc123\\report.pdf',
+      ]) {
+        const upView = render(
+          <FileBrowser
+            ws={ws}
+            serverId="srv-rec"
+            mode="file-single"
+            layout="panel"
+            initialPath="/repo"
+            autoPreviewPath={uploadOfficePath}
+            onConfirm={vi.fn()}
+          />,
+        );
+        await act(async () => {
+          sendMsg({
+            type: 'fs.read_response',
+            requestId: 'mock-read-id',
+            path: uploadOfficePath,
+            status: 'ok',
+            previewMode: 'stream',
+            downloadId: 'dl-up-1',
+            mimeType: uploadOfficePath.endsWith('.pdf')
+              ? 'application/pdf'
+              : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+          } as unknown as ServerMessage);
+        });
+        await new Promise((r) => setTimeout(r, 15));
+        expect(recentCalls(), `expected zero recent calls for upload office path ${uploadOfficePath}`).toHaveLength(0);
+        upView.unmount();
+      }
+
+      // Positive control 1: non-upload Office/PDF file (status=office) DOES record
+      const pdfView = render(
+        <FileBrowser
+          ws={ws}
+          serverId="srv-rec"
+          mode="file-single"
+          layout="panel"
+          initialPath="/repo"
+          autoPreviewPath="/repo/report.pdf"
+          onConfirm={vi.fn()}
+        />,
+      );
+      await act(async () => {
+        sendMsg({
+          type: 'fs.read_response',
+          requestId: 'mock-read-id',
+          path: '/repo/report.pdf',
+          status: 'ok',
+          previewMode: 'stream',
+          downloadId: 'dl-pdf-1',
+          mimeType: 'application/pdf',
+        } as unknown as ServerMessage);
+      });
+      await waitFor(() => expect(recentCalls()).toHaveLength(1));
+      const pdfPayload = JSON.parse(String((recentCalls()[0]?.[1] as RequestInit | undefined)?.body ?? '{}'));
+      expect(pdfPayload).toMatchObject({
+        sourceKind: 'server_file',
+        serverId: 'srv-rec',
+        filePath: '/repo/report.pdf',
+        mimeType: 'application/pdf',
+        title: 'report.pdf',
+      });
+      pdfView.unmount();
+      fetchMock.mockClear();
+
+      // Positive control 2: explicit ONLYOFFICE open on /repo/data.csv records AFTER clicking ONLYOFFICE button
+      const csvView = render(
+        <FileBrowser
+          ws={ws}
+          serverId="srv-rec"
+          mode="file-single"
+          layout="panel"
+          initialPath="/repo"
+          autoPreviewPath="/repo/data.csv"
+          onConfirm={vi.fn()}
+        />,
+      );
+      await act(async () => {
+        sendMsg({
+          type: 'fs.read_response',
+          requestId: 'mock-read-id',
+          path: '/repo/data.csv',
+          status: 'ok',
+          content: 'a,b\n1,2',
+          encoding: 'utf8',
+        } as unknown as ServerMessage);
+      });
+      await new Promise((r) => setTimeout(r, 15));
+      expect(recentCalls()).toHaveLength(0);
+
+      fireEvent.click(csvView.getByTestId('fb-open-csv-office-btn'));
+      await waitFor(() => expect(recentCalls()).toHaveLength(1));
+      const csvPayload = JSON.parse(String((recentCalls()[0]?.[1] as RequestInit | undefined)?.body ?? '{}'));
+      expect(csvPayload).toMatchObject({
+        sourceKind: 'server_file',
+        serverId: 'srv-rec',
+        filePath: '/repo/data.csv',
+        mimeType: 'text/csv',
+        title: 'data.csv',
+      });
+      csvView.unmount();
     } finally {
+      globalThis.ResizeObserver = prevResizeObserver;
       vi.unstubAllGlobals();
     }
   });

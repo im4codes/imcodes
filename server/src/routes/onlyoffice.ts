@@ -29,6 +29,7 @@ import { resolveHttpShareAccess, resolveHttpShareAccessForCoveredSession } from 
 import type { Database } from '../db/client.js';
 import { WsBridge } from '../ws/bridge.js';
 import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
+import { isInternalUploadTempFilePath } from '../../../shared/cloud-docs.js';
 import { upsertRecentDocument } from '../db/cloud-docs.js';
 
 export const onlyofficeRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
@@ -1443,8 +1444,9 @@ onlyofficeRoutes.get('/server/:id/onlyoffice/config', async (c): Promise<Respons
   // Include explicit ?serverId= on both file and callback URLs to satisfy pod-sticky routing
   const fileUrl = `${serverBaseUrl}/api/onlyoffice/file/${docToken}?serverId=${encodeURIComponent(serverId)}`;
 
-  // Record authenticated regular user document opens in recent_documents automatically (best-effort)
-  if (auth?.userId && auth.scope !== 'doc_collaborator' && !shareToken) {
+  // Record authenticated regular user document opens in recent_documents automatically (best-effort),
+  // excluding internal daemon upload/pasted-text temp paths.
+  if (auth?.userId && auth.scope !== 'doc_collaborator' && !shareToken && !isInternalUploadTempFilePath(normPath)) {
     try {
       const serverRow = await c.env.DB.queryOne<{ name: string | null }>(
         'SELECT name FROM servers WHERE id = $1',
