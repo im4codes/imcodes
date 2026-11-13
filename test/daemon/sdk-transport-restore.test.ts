@@ -3450,10 +3450,9 @@ describe('sdk transport session restore', () => {
     ] as any);
 
     await relaunchSessionWithSettings(record as any, { fresh: true, handoff: true });
-    const deadline = Date.now() + 5_000;
-    while (writePrivateInputMock.mock.calls.length === 0 && Date.now() < deadline) {
-      await flush();
-    }
+    await vi.waitFor(() => {
+      expect(writePrivateInputMock).toHaveBeenCalled();
+    }, { timeout: 15_000, interval: 10 });
 
     expect(mocks.store.get(name)?.ccSessionId).not.toBe('cc-old-handoff');
     expect(String(vi.mocked(newSession).mock.calls.at(-1)?.[1] ?? '')).not.toContain('cc-old-handoff');

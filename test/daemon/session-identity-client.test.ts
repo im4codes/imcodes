@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { join } from 'node:path';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { rm } from 'node:fs/promises';
 import {
   clearSessionIdentityProfile,
@@ -9,7 +11,7 @@ import {
   setSessionIdentityProfile,
 } from '../../src/daemon/session-identity-mcp-client.js';
 
-const home = join(process.cwd(), '.tmp-identity-client');
+const home = mkdtempSync(join(tmpdir(), 'imcodes-identity-client-'));
 const endpoint = { workerUrl: 'https://im.example.test/', serverId: 'srv-1', token: 'secret-token' };
 
 afterEach(async () => {

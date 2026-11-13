@@ -2,7 +2,7 @@ import { nextHistoryCleanupAt } from './history-retention-clock.mjs';
 import type { TimelineTextTailOptions } from './timeline-projection-types.js';
 import { parentPort, workerData } from 'node:worker_threads';
 import { createRequire } from 'node:module';
-import { mkdirSync, statSync, existsSync, readFileSync, openSync, readSync, closeSync, watch, type FSWatcher } from 'node:fs';
+import { mkdirSync, statSync, existsSync, readFileSync, openSync, readSync, closeSync, watch, watchFile, unwatchFile, type FSWatcher } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { TimelineEvent, TimelineEventType } from './timeline-event.js';
 import type {
@@ -52,6 +52,7 @@ let retentionRetryAfter = 0;
 let retentionTimer: NodeJS.Timeout | undefined;
 let retentionStopped = false;
 let retentionWatcher: FSWatcher | undefined;
+let retentionWatchFileActive = false;
 let retentionDebounce: NodeJS.Timeout | undefined;
 let retentionWatchRetry: NodeJS.Timeout | undefined;
 
@@ -791,6 +792,10 @@ async function handleShutdown(): Promise<true> {
   clearTimeout(retentionDebounce);
   clearTimeout(retentionWatchRetry);
   retentionWatcher?.close();
+  if (retentionWatchFileActive && retention) {
+    unwatchFile(retention.configPath);
+    retentionWatchFileActive = false;
+  }
   parentPort?.close();
   return true;
 }
@@ -854,9 +859,25 @@ parentPort.on('message', async (message: WorkerRequest) => {
 // No cron, poll loop, per-event expiry scan, or separate writer process.
 function watchRetentionSettings(): void {
   if (!retention || retentionStopped) return;
+  const triggerDebounce = (): void => {
+    clearTimeout(retentionDebounce);
+    retentionDebounce = setTimeout(scheduleRetention, 50);
+    retentionDebounce.unref();
+  };
   const retry = (err: Error): void => {
-    console.warn('SQLite history retention settings watcher failed; will retry:', err.message);
     retentionWatcher?.close();
+    retentionWatcher = undefined;
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'EMFILE' || code === 'ENOSPC') {
+      // Fall back to stat-based watchFile when OS inotify instances are exhausted.
+      if (!retentionWatchFileActive) {
+        retentionWatchFileActive = true;
+        watchFile(retention.configPath, { persistent: false, interval: 200 }, triggerDebounce);
+      }
+      scheduleRetention();
+      return;
+    }
+    console.warn('SQLite history retention settings watcher failed; will retry:', err.message);
     clearTimeout(retentionWatchRetry);
     retentionWatchRetry = setTimeout(watchRetentionSettings, retention.retryMs);
     retentionWatchRetry.unref();
@@ -865,9 +886,7 @@ function watchRetentionSettings(): void {
     mkdirSync(dirname(retention.configPath), { recursive: true });
     retentionWatcher = watch(dirname(retention.configPath), { persistent: false }, (_event, name) => {
       if (name !== null && name.toString() !== retention.configPath.split(/[\\/]/).pop()) return;
-      clearTimeout(retentionDebounce);
-      retentionDebounce = setTimeout(scheduleRetention, 50);
-      retentionDebounce.unref();
+      triggerDebounce();
     });
     retentionWatcher.on('error', retry);
     scheduleRetention();

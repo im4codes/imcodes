@@ -5,7 +5,7 @@ import { extname, join } from 'node:path';
 import type { TimelineEvent } from './timeline-event.js';
 import logger from '../util/logger.js';
 import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
-import { assertNotRealImcodesPathInTests } from '../util/test-home-guard.js';
+import { assertNotRealImcodesPathInTests, isUnderTestRunner } from '../util/test-home-guard.js';
 import type {
   ProjectionSessionMeta,
   ProjectionWorkerEnvelope,
@@ -97,7 +97,12 @@ class TimelineProjectionClient {
     if (this.cooldownUntil > Date.now()) return null;
     try {
       const worker = new Worker(getWorkerModuleUrl(), {
-        workerData: { dbPath: getProjectionDbPath(), stateDir: resolveImcodesHome(), retention: { ...HISTORY_RETENTION, configPath: historyRetentionPath() } },
+        workerData: {
+          dbPath: getProjectionDbPath(),
+          stateDir: resolveImcodesHome(),
+          // Skip background settings dir watcher in test runners so idle projection workers do not burn Linux inotify instances.
+          retention: isUnderTestRunner() ? undefined : { ...HISTORY_RETENTION, configPath: historyRetentionPath() },
+        },
         // Suppress the node:sqlite ExperimentalWarning at the worker boundary
         // (it fires on first node:sqlite load in every worker thread and floods
         // the log). Done via execArgv rather than a module-level emitWarning

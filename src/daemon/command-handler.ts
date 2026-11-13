@@ -207,7 +207,7 @@ import {
   pickUpgradeRegistry,
   type InstallerConfig,
 } from '../../shared/installer-contract.js';
-import { executeCronJob } from './cron-executor.js';
+// cron-executor.ts imports command-handler.ts; load it lazily in dispatch to keep the module graph acyclic.
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { copyFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
@@ -474,23 +474,256 @@ import {
   isMcpFeatureEnabled,
 } from '../../shared/memory-mcp-feature-flags.js';
 import { getProvider } from '../agent/provider-registry.js';
+import { handleRepoCommand } from './repo-handler.js';
+import {
+  handleFileUpload,
+  handleFileUploadFetch,
+  handleFileDownload,
+  handleFileDownloadStream,
+  handleFileDelete,
+  tryCreateProjectFileHandle,
+  lookupAttachment,
+} from './file-transfer-handler.js';
+import { getDefaultPreviewReadCoordinator, __resetPreviewReadCoordinatorForTests } from './file-preview-read-coordinator.js';
+import { isFilePreviewPathAllowed, resolveCanonical } from './file-preview-path-policy.js';
+import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
+import { FS_READ_ERROR_CODES } from '../../shared/fs-read-error-codes.js';
+import { FS_TRANSPORT_MSG } from '../../shared/fs-transport-messages.js';
+import { FS_WRITE_MAX_BYTES } from '../../shared/fs-write-limits.js';
+import { FILE_TRANSFER_MSG } from '../../shared/transport/file-transfer.js';
+import { isDirectFileTransferMessageType } from '../../shared/direct-file-transfer.js';
+import { isRemoteDesktopMessageType } from '../../shared/remote-desktop.js';
+import { REMOTE_DESKTOP_INSTALL_MSG } from '../../shared/remote-desktop-install.js';
+import { REMOTE_DESKTOP_LOGIN_SCREEN_MSG } from '../../shared/remote-desktop-login-screen.js';
+import { handleDaemonRemoteDesktopMessage } from './remote-desktop-registry.js';
+import { handleDirectFileTransferCommand, quiesceDirectFileTransferNative } from './direct-file-transfer.js';
+import { REPO_MSG } from '../shared/repo-types.js';
+import { SUPERVISION_TASK_CONSOLE_MSG } from '../../shared/supervision-task-console.js';
+import { handlePreviewCommand } from './preview-relay.js';
+import { PREVIEW_MSG } from '../../shared/preview-types.js';
+import type { TransportAttachment } from '../../shared/transport-attachments.js';
+import { resolveContextWindow } from '../util/model-context.js';
+import { QWEN_MODEL_IDS } from '../../shared/qwen-models.js';
+import { getQwenRuntimeConfig } from '../agent/qwen-runtime-config.js';
+import { getQwenDisplayMetadata } from '../agent/provider-display.js';
+import { buildRelatedPastWorkText, buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
+import { isMemoryInjectionEnabled } from '../context/memory-injection-toggle.js';
+import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
+import { getQwenOAuthQuotaUsageLabel, recordQwenOAuthRequest } from '../agent/provider-quota.js';
+import { listProviderSessions as listProviderSessionsImpl } from './provider-sessions.js';
+import { buildMemoryContextTimelinePayload, buildMemoryContextStatusPayload } from './memory-context-timeline.js';
+import { TERMINAL_CONTROL } from '../../shared/terminal-protocol.js';
+import {
+  loadDaemonP2pStaticPolicy,
+  readCachedHelloSnapshot,
+} from './p2p-workflow-static-policy.js';
+import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 
 const MAX_P2P_FILE_PULL_COUNT = 20;
 const TRANSPORT_QUEUE_SEND_SYNC_WAIT_MS = 15_000;
 const TRANSPORT_QUEUE_SEND_SYNC_POLL_MS = 25;
+
+// ── AsyncMutex (per-session serialized stdin writes) ─────────────────────────
+
+class AsyncMutex {
+  private queue: Array<() => void> = [];
+  private locked = false;
+
+  async acquire(): Promise<() => void> {
+    return new Promise<() => void>((resolve) => {
+      const tryLock = () => {
+        if (!this.locked) {
+          this.locked = true;
+          resolve(() => this.release());
+        } else {
+          this.queue.push(tryLock);
+        }
+      };
+      tryLock();
+    });
+  }
+
+  private release(): void {
+    this.locked = false;
+    const next = this.queue.shift();
+    if (next) next();
+  }
+}
+
+// ── CommandId dedup cache (100 entries / 5 min TTL per session) ──────────────
+
+class CommandDedup {
+  private entries = new Map<string, number>(); // commandId → timestamp
+  private readonly MAX_SIZE = 100;
+  private readonly TTL_MS = 5 * 60 * 1000;
+
+  has(commandId: string): boolean {
+    const ts = this.entries.get(commandId);
+    if (ts === undefined) return false;
+    if (Date.now() - ts > this.TTL_MS) {
+      this.entries.delete(commandId);
+      return false;
+    }
+    return true;
+  }
+
+  add(commandId: string): void {
+    if (this.entries.size >= this.MAX_SIZE) {
+      // Evict expired entries first
+      const now = Date.now();
+      for (const [id, ts] of this.entries) {
+        if (now - ts > this.TTL_MS) this.entries.delete(id);
+      }
+      // If still at max, evict the oldest
+      if (this.entries.size >= this.MAX_SIZE) {
+        const oldest = this.entries.keys().next().value;
+        if (oldest !== undefined) this.entries.delete(oldest);
+      }
+    }
+    this.entries.set(commandId, Date.now());
+  }
+}
 
 interface InFlightSessionSend {
   settled: Promise<void>;
   settle: () => void;
 }
 
-// A browser renders an optimistic queued row as soon as session.send receives
-// its receipt ack. The send handler may still be awaiting preference/context
-// work before it reaches TransportSessionRuntime.send(), so a quick follow-up
-// append command can otherwise overtake it and observe a false "not found".
-// Track the exact send command until its handler settles so append can wait for
-// the relevant queue registration without serializing unrelated messages.
+// Module-level state/constants hoisted above all function declarations so dynamic
+// imports (e.g. session-manager -> command-handler) never hit TDZ ReferenceErrors.
 const inFlightSessionSends = new Map<string, InFlightSessionSend>();
+const processRecallRepositoryIdentityService = new GitOriginRepositoryIdentityService();
+const DAEMON_LOCAL_PREFERENCE_USER_ID = 'daemon-local';
+const processPreferenceContextSignatures = new Map<string, string>();
+const TAGGED_ATTACHMENT_REFERENCE_RE = /#(\d+):\(([^)\r\n]+)\)/g;
+const pendingSessionRelaunches = new Map<string, Promise<void>>();
+const pendingMcpSessionRestarts = new Map<string, { reset: boolean; result: Promise<boolean> }>();
+const shellBootstrapRecoveryAttempts = new Map<string, number[]>();
+const SHELL_BOOTSTRAP_RECOVERY_WINDOW_MS = 60_000;
+const SHELL_BOOTSTRAP_RECOVERY_MAX_ATTEMPTS = 2;
+// Session names: alphanumeric + underscore only (matches deck_{project}_{role} and deck_sub_{id} patterns)
+const SESSION_NAME_RE = /[a-zA-Z0-9_]+/;
+const SINGLE_MODES = new Set(['audit', 'review', 'plan', 'brainstorm', 'discuss', 'config']);
+const VALID_MODES = SINGLE_MODES; // alias for parseAtTokens (individual session tokens always use single modes)
+const DISCUSS_TOKEN_RE = /@@discuss\(([^,]+),\s*([^)]+)\)/g;
+// @@all(mode) or @@all(mode, exclude-same-type)
+const ALL_TOKEN_RE = /@@all\(([^)]+)\)/g;
+const P2P_CONFIG_TOKEN_RE = /@@p2p-config\([^)]*\)/g;
+const FILE_TOKEN_RE = /@((?:[a-zA-Z0-9_.\-/]+\/)*[a-zA-Z0-9_.\-]+\.[a-zA-Z0-9]+)/g;
+const sessionMutexes = new Map<string, AsyncMutex>();
+const PROCESS_MEMORY_RECALL_DEADLINE_MS = 2_500;
+const processDeliveryChains = new Map<string, Promise<void>>();
+const sessionDedups = new Map<string, CommandDedup>();
+const activeSubscriptions = new Map<string, { subscriber: StreamSubscriber; unsubscribe: () => void }>();
+let routerCtx: RouterContext | null = null;
+// Model intent is independent of the ordinary send/process mutex. A slow
+// catalogue lookup must not let an older selection overwrite a newer one.
+const liveModelIntents = new WeakMap<TransportSessionRuntime, object>();
+/** Agents with sandboxed file access — temp files must be in project dir. */
+const SANDBOXED_AGENTS = new Set(['gemini']);
+const delegationTerminalAcks = new Map<string, DelegationTerminalAck>();
+const DELEGATION_UNSUPPORTED_TOP_LEVEL_FIELDS = [
+  'replyTo',
+  'originSession',
+  'originOverride',
+  'contextTail',
+  'delegationContext',
+  'files',
+  'attachments',
+  'quotes',
+  'fileRefs',
+  'fileReferences',
+  'broadcast',
+  'clone',
+  'idempotencyKey',
+  'delegationId',
+] as const;
+const DELETABLE_TOMBSTONE_TYPES: ReadonlySet<string> = new Set([
+  'user.message', 'assistant.text', 'assistant.thinking', 'tool.call', 'tool.result',
+]);
+const RAW_BATCH_FLUSH_MS = 42;           // ~24fps flush interval
+const RAW_BATCH_MAX_BYTES = 32 * 1024;   // flush immediately at 32KB
+/** Per-reply ceiling for timeline history/page responses while the server
+ *  link reports uplink congestion (see ServerLink.isUplinkCongested). */
+const CONGESTED_TIMELINE_RESPONSE_BUDGET_BYTES = 64 * 1024;
+const timelineReplayInflight = new Map<string, Promise<TimelineReplayBuildResult>>();
+const OPENCODE_SYNTH_HISTORY_OVERLAP_MS = 60_000;
+const timelineHistoryInflight = new Map<string, Promise<TimelineHistoryBuildResult>>();
+const TIMELINE_HISTORY_TRANSIENT_REASONS = new Set<string>([
+  TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY,
+  TIMELINE_HISTORY_ERROR_REASONS.TIMEOUT,
+  TIMELINE_HISTORY_ERROR_REASONS.DEADLINE_EXCEEDED,
+  TIMELINE_HISTORY_ERROR_REASONS.QUEUE_FULL,
+]);
+const askAnswerLedger = new AskAnswerLedger();
+const P2P_DISCUSSION_HISTORY_LIMIT = 50;
+const P2P_DISCUSSION_PREVIEW_BYTES = 64 * 1024;
+const P2P_DISCUSSION_FILE_STAT_CONCURRENCY = 24;
+const P2P_DISCUSSION_PREVIEW_CONCURRENCY = 8;
+const P2P_DISCUSSION_LIST_CACHE_TTL_MS = 2_000;
+const P2P_DISCUSSION_LIST_GLOBAL_KEY = '__global__';
+const p2pDiscussionListCache = new Map<string, { expiresAt: number; value: P2pDiscussionListResult }>();
+const p2pDiscussionListInflight = new Map<string, Promise<P2pDiscussionListResult>>();
+const MAX_UPGRADE_DEFER_MS = (() => {
+  const raw = parseInt(process.env.IMCODES_MAX_UPGRADE_DEFER_MS ?? '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 30 * 60 * 1000;
+})();
+let upgradeSessionBusyDeferredSince: number | null = null;
+const FS_DENIED_DIRS = ['.ssh', '.gnupg', '.pki'];
+const WINDOWS_DRIVES_PATH = ':drives:';
+const WINDOWS_DRIVES_ROOT = '__imcodes_windows_drives__';
+const FILE_SEARCH_EXCLUDES = new Set([
+  'node_modules', '.git', 'venv', '__pycache__', '.venv',
+  'dist', 'build', '.next', '.nuxt', 'vendor', 'target',
+]);
+const FILE_SEARCH_MAX = 20;
+const FILE_SEARCH_MAX_INDEXED_PATHS = 20_000;
+const FILE_SEARCH_CACHE_TTL_MS = 5_000;
+const FILE_SEARCH_CACHE_MAX_ENTRIES = 32;
+const fileSearchCache = new Map<string, { expiresAt: number; value: FileSearchSnapshot }>();
+const fileSearchInflight = new Map<string, Promise<FileSearchSnapshot>>();
+const fileSearchGenerations = new Map<string, number>();
+const TRANSPORT_IN_PROGRESS_STATUSES: ReadonlySet<string> = new Set(['thinking', 'streaming']);
+const TRANSPORT_STALE_TURN_MS = (() => {
+  const raw = parseInt(process.env.IMCODES_TRANSPORT_STALE_TURN_MS ?? '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 15 * 60 * 1000;
+})();
+const PROCESS_IN_PROGRESS_STATES: ReadonlySet<string> = new Set(['running', 'queued']);
+const FS_LIST_DEADLINE_MS = 10_000;
+const FS_LIST_CACHE_TTL_MS = 5_000;
+const FS_LIST_STALE_CACHE_TTL_MS = 30_000;
+const FS_LIST_CACHE_MAX_ENTRIES = 128;
+const FS_LIST_INFLIGHT_FANOUT_CAP = 32;
+const FS_LIST_METADATA_CONCURRENCY = 32;
+const fsListCache = new Map<string, FreshnessCacheEntry<FsLsSnapshot>>();
+const fsListInflight = new Map<string, InflightWork<FsLsSnapshot>>();
+const fsListGenerations = new Map<string, number>();
+const REPO_CONTEXT_CACHE_TTL_MS = 5_000;
+const GIT_STATUS_CACHE_TTL_MS = 5_000;
+const GIT_STATUS_STALE_CACHE_TTL_MS = 30_000;
+const GIT_STATUS_CACHE_MAX_ENTRIES = 128;
+const GIT_STATUS_DEADLINE_MS = 10_000;
+const GIT_STATUS_INFLIGHT_FANOUT_CAP = 32;
+const GIT_DIFF_CACHE_TTL_MS = 5_000;
+const repoContextCache = new Map<string, { expiresAt: number; value: RepoContextBase | null }>();
+const repoSignatureCache = new Map<string, RepoSignatureState>();
+const gitStatusCache = new Map<string, { expiresAt: number; value: GitStatusSnapshot }>();
+const gitStatusInflight = new Map<string, Promise<GitStatusSnapshot>>();
+const gitNumstatCache = new Map<string, { expiresAt: number; value: GitNumstatSnapshot }>();
+const gitNumstatInflight = new Map<string, Promise<GitNumstatSnapshot>>();
+const gitStatusResponseCache = new Map<string, FreshnessCacheEntry<GitStatusResponseSnapshot>>();
+const gitStatusResponseInflight = new Map<string, InflightWork<GitStatusResponseSnapshot>>();
+const gitDiffCache = new Map<string, { expiresAt: number; value: GitDiffSnapshot }>();
+const gitDiffInflight = new Map<string, Promise<GitDiffSnapshot>>();
+const gitRepoGenerations = new Map<string, number>();
+const gitDiffGenerations = new Map<string, number>();
+const TRANSPORT_LIST_MODELS_DEFAULT_TTL_MS = 5_000;
+const TRANSPORT_LIST_MODELS_MAX_TTL_MS = 60_000;
+const TRANSPORT_LIST_MODELS_TTL_ENV = 'IMCODES_TRANSPORT_LIST_MODELS_CACHE_TTL_MS';
+const transportListModelsCache = new Map<string, { expiresAt: number; generation: number; value: TransportListModelsResult }>();
+const transportListModelsInflight = new Map<string, { generation: number; promise: Promise<TransportListModelsResult> }>();
+let transportListModelsCacheGeneration = 0;
 
 function inFlightSessionSendKey(sessionName: string, clientMessageId: string): string {
   return `${sessionName}\u0000${clientMessageId}`;
@@ -612,9 +845,6 @@ async function waitForSelectedSessionSends(
   }
 }
 
-const processRecallRepositoryIdentityService = new GitOriginRepositoryIdentityService();
-const DAEMON_LOCAL_PREFERENCE_USER_ID = 'daemon-local';
-
 function isEligibleSupervisionTaskText(text: string): boolean {
   const trimmed = text.trim();
   return trimmed.length > 0 && !trimmed.startsWith('/');
@@ -678,8 +908,6 @@ function preferenceUserIdForSend(cmd: Record<string, unknown>, record: SessionRe
   return fromNamespace || DAEMON_LOCAL_PREFERENCE_USER_ID;
 }
 
-const processPreferenceContextSignatures = new Map<string, string>();
-
 function normalizePreferenceProviderContextSignature(context: string): string {
   return context.replace(/\s+/g, ' ').trim();
 }
@@ -706,8 +934,6 @@ function prepareProcessPreferenceProviderText(input: {
   processPreferenceContextSignatures.set(input.sessionName, signature);
   return prependPreferenceProviderContext(input.providerText, context);
 }
-
-const TAGGED_ATTACHMENT_REFERENCE_RE = /#(\d+):\(([^)\r\n]+)\)/g;
 
 /**
  * Build a short, agent-only retention reminder for the numbered upload
@@ -1549,47 +1775,6 @@ async function rewritePathsForSandbox(sessionName: string, text: string): Promis
 
   return result;
 }
-import { handleRepoCommand } from './repo-handler.js';
-import {
-  handleFileUpload,
-  handleFileUploadFetch,
-  handleFileDownload,
-  handleFileDownloadStream,
-  handleFileDelete,
-  tryCreateProjectFileHandle,
-  lookupAttachment,
-} from './file-transfer-handler.js';
-import { getDefaultPreviewReadCoordinator, __resetPreviewReadCoordinatorForTests } from './file-preview-read-coordinator.js';
-import { isFilePreviewPathAllowed, resolveCanonical } from './file-preview-path-policy.js';
-import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
-import { FS_READ_ERROR_CODES } from '../../shared/fs-read-error-codes.js';
-import { FS_TRANSPORT_MSG } from '../../shared/fs-transport-messages.js';
-import { FS_WRITE_MAX_BYTES } from '../../shared/fs-write-limits.js';
-import { FILE_TRANSFER_MSG } from '../../shared/transport/file-transfer.js';
-import { isDirectFileTransferMessageType } from '../../shared/direct-file-transfer.js';
-import { isRemoteDesktopMessageType } from '../../shared/remote-desktop.js';
-import { REMOTE_DESKTOP_INSTALL_MSG } from '../../shared/remote-desktop-install.js';
-import { REMOTE_DESKTOP_LOGIN_SCREEN_MSG } from '../../shared/remote-desktop-login-screen.js';
-import { handleDaemonRemoteDesktopMessage } from './remote-desktop-registry.js';
-import { handleDirectFileTransferCommand, quiesceDirectFileTransferNative } from './direct-file-transfer.js';
-import { REPO_MSG } from '../shared/repo-types.js';
-import { SUPERVISION_TASK_CONSOLE_MSG } from '../../shared/supervision-task-console.js';
-import { handlePreviewCommand } from './preview-relay.js';
-import { PREVIEW_MSG } from '../../shared/preview-types.js';
-import type { TransportAttachment } from '../../shared/transport-attachments.js';
-
-import { resolveContextWindow } from '../util/model-context.js';
-import { QWEN_MODEL_IDS } from '../../shared/qwen-models.js';
-import { getQwenRuntimeConfig } from '../agent/qwen-runtime-config.js';
-import { getQwenDisplayMetadata } from '../agent/provider-display.js';
-import { buildRelatedPastWorkText, buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
-import { isMemoryInjectionEnabled } from '../context/memory-injection-toggle.js';
-import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
-import { getQwenOAuthQuotaUsageLabel, recordQwenOAuthRequest } from '../agent/provider-quota.js';
-import { listProviderSessions as listProviderSessionsImpl } from './provider-sessions.js';
-import { buildMemoryContextTimelinePayload, buildMemoryContextStatusPayload } from './memory-context-timeline.js';
-import { TERMINAL_CONTROL } from '../../shared/terminal-protocol.js';
-
 function describeTransportSendError(err: unknown): string {
   if (err && typeof err === 'object') {
     const record = err as { message?: unknown };
@@ -1597,12 +1782,6 @@ function describeTransportSendError(err: unknown): string {
   }
   return err instanceof Error ? err.message : String(err);
 }
-
-const pendingSessionRelaunches = new Map<string, Promise<void>>();
-const pendingMcpSessionRestarts = new Map<string, { reset: boolean; result: Promise<boolean> }>();
-const shellBootstrapRecoveryAttempts = new Map<string, number[]>();
-const SHELL_BOOTSTRAP_RECOVERY_WINDOW_MS = 60_000;
-const SHELL_BOOTSTRAP_RECOVERY_MAX_ATTEMPTS = 2;
 
 function trackPendingSessionRelaunch(sessionName: string, pending: Promise<void>): Promise<void> {
   pendingSessionRelaunches.set(sessionName, pending);
@@ -1878,11 +2057,6 @@ function sendP2pTargetError(
   emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error });
 }
 
-// Session names: alphanumeric + underscore only (matches deck_{project}_{role} and deck_sub_{id} patterns)
-const SESSION_NAME_RE = /[a-zA-Z0-9_]+/;
-const SINGLE_MODES = new Set(['audit', 'review', 'plan', 'brainstorm', 'discuss', 'config']);
-const VALID_MODES = SINGLE_MODES; // alias for parseAtTokens (individual session tokens always use single modes)
-
 /** Validate a mode string — single mode or combo pipeline (e.g. "brainstorm>discuss>plan"). */
 function isValidP2pMode(mode: string): boolean {
   if (SINGLE_MODES.has(mode)) return true;
@@ -1890,11 +2064,6 @@ function isValidP2pMode(mode: string): boolean {
   const pipeline = parseModePipeline(mode);
   return pipeline.length > 1 && pipeline.every((m) => SINGLE_MODES.has(m) && m !== 'config');
 }
-const DISCUSS_TOKEN_RE = /@@discuss\(([^,]+),\s*([^)]+)\)/g;
-// @@all(mode) or @@all(mode, exclude-same-type)
-const ALL_TOKEN_RE = /@@all\(([^)]+)\)/g;
-const P2P_CONFIG_TOKEN_RE = /@@p2p-config\([^)]*\)/g;
-const FILE_TOKEN_RE = /@((?:[a-zA-Z0-9_.\-/]+\/)*[a-zA-Z0-9_.\-]+\.[a-zA-Z0-9]+)/g;
 
 export interface ParsedTokens {
   agents: P2pTarget[];
@@ -1974,34 +2143,6 @@ function packRawFrame(sessionName: string, data: Buffer): Buffer {
   return Buffer.concat([header, data]);
 }
 
-// ── AsyncMutex (per-session serialized stdin writes) ─────────────────────────
-
-class AsyncMutex {
-  private queue: Array<() => void> = [];
-  private locked = false;
-
-  async acquire(): Promise<() => void> {
-    return new Promise<() => void>((resolve) => {
-      const tryLock = () => {
-        if (!this.locked) {
-          this.locked = true;
-          resolve(() => this.release());
-        } else {
-          this.queue.push(tryLock);
-        }
-      };
-      tryLock();
-    });
-  }
-
-  private release(): void {
-    this.locked = false;
-    const next = this.queue.shift();
-    if (next) next();
-  }
-}
-
-const sessionMutexes = new Map<string, AsyncMutex>();
 function getMutex(sessionName: string): AsyncMutex {
   let mutex = sessionMutexes.get(sessionName);
   if (!mutex) {
@@ -2010,8 +2151,6 @@ function getMutex(sessionName: string): AsyncMutex {
   }
   return mutex;
 }
-
-const PROCESS_MEMORY_RECALL_DEADLINE_MS = 2_500;
 
 async function withDeadline<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -2032,8 +2171,6 @@ interface ProcessDeliveryTurn {
   waitForTurn(): Promise<void>;
   releaseTurn(): void;
 }
-
-const processDeliveryChains = new Map<string, Promise<void>>();
 
 function reserveProcessDeliveryTurn(sessionName: string): ProcessDeliveryTurn {
   const previous = processDeliveryChains.get(sessionName) ?? Promise.resolve();
@@ -2059,41 +2196,6 @@ function reserveProcessDeliveryTurn(sessionName: string): ProcessDeliveryTurn {
   };
 }
 
-// ── CommandId dedup cache (100 entries / 5 min TTL per session) ──────────────
-
-class CommandDedup {
-  private entries = new Map<string, number>(); // commandId → timestamp
-  private readonly MAX_SIZE = 100;
-  private readonly TTL_MS = 5 * 60 * 1000;
-
-  has(commandId: string): boolean {
-    const ts = this.entries.get(commandId);
-    if (ts === undefined) return false;
-    if (Date.now() - ts > this.TTL_MS) {
-      this.entries.delete(commandId);
-      return false;
-    }
-    return true;
-  }
-
-  add(commandId: string): void {
-    if (this.entries.size >= this.MAX_SIZE) {
-      // Evict expired entries first
-      const now = Date.now();
-      for (const [id, ts] of this.entries) {
-        if (now - ts > this.TTL_MS) this.entries.delete(id);
-      }
-      // If still at max, evict the oldest
-      if (this.entries.size >= this.MAX_SIZE) {
-        const oldest = this.entries.keys().next().value;
-        if (oldest !== undefined) this.entries.delete(oldest);
-      }
-    }
-    this.entries.set(commandId, Date.now());
-  }
-}
-
-const sessionDedups = new Map<string, CommandDedup>();
 function getDedup(sessionName: string): CommandDedup {
   let dedup = sessionDedups.get(sessionName);
   if (!dedup) {
@@ -2136,11 +2238,6 @@ function expandTilde(p: string): string {
   if (p.startsWith('~/') || p.startsWith('~\\')) return homedir() + p.slice(1);
   return p;
 }
-
-// Track active terminal subscriptions for proper cleanup
-const activeSubscriptions = new Map<string, { subscriber: StreamSubscriber; unsubscribe: () => void }>();
-
-let routerCtx: RouterContext | null = null;
 
 /** Set the router context for handling inbound chat messages. Must be called before messages arrive. */
 export function setRouterContext(ctx: RouterContext): void {
@@ -2719,7 +2816,9 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       void handleListProviderSessions(cmd, serverLink);
       break;
     case CRON_MSG.DISPATCH:
-      void executeCronJob(cmd as unknown as import('../../shared/cron-types.js').CronDispatchMessage, serverLink);
+      void import('./cron-executor.js')
+        .then(({ executeCronJob }) => executeCronJob(cmd as unknown as import('../../shared/cron-types.js').CronDispatchMessage, serverLink))
+        .catch((err) => { logger.warn({ err }, 'cron dispatch failed'); });
       break;
     case PREVIEW_MSG.REQUEST:
     case PREVIEW_MSG.REQUEST_END:
@@ -3302,10 +3401,6 @@ async function resolveValidatedModelList(record: SessionRecord): Promise<{ model
  * runtime, persists the record and posts the switched/refused notice into the
  * session's own timeline. The caller owns the per-session mutex and acks.
  */
-// Model intent is independent of the ordinary send/process mutex. A slow
-// catalogue lookup must not let an older selection overwrite a newer one.
-const liveModelIntents = new WeakMap<TransportSessionRuntime, object>();
-
 async function applyTransportModelSwitch(
   record: SessionRecord,
   /** Absent for an idle session not loaded yet: the stored model applies at its next start. */
@@ -3511,7 +3606,7 @@ async function applyTransportModelSwitch(
   upsertSession(nextRecord);
   persistSessionRecord(nextRecord, sessionName);
   if (serverLink) {
-    await handleGetSessions(serverLink);
+    void handleGetSessions(serverLink).catch(() => {});
     syncSubSessionIfNeeded(sessionName, serverLink);
   }
   if (agentType === AGY_SDK_PROVIDER_ID && !currentOwner()) return modelOwnerChanged(sessionName);
@@ -3924,9 +4019,6 @@ export function stopSessionNow(sessionName: string): boolean {
  * - codex: strip `!` and send the shell command directly (Codex has no `!` prefix)
  * - others: send as-is
  */
-/** Agents with sandboxed file access — temp files must be in project dir. */
-const SANDBOXED_AGENTS = new Set(['gemini']);
-
 function resolveProcessSendOptions(sessionName: string, agentType: string, verbatim?: boolean): SendKeysOptions | undefined {
   const record = getSession(sessionName);
   const cwd = SANDBOXED_AGENTS.has(agentType) ? record?.projectDir : undefined;
@@ -4203,13 +4295,6 @@ function buildAdvancedLaunchEnvelopeFromCommand(
 // dangerous caps as a hardcoded permissive default, which was a fail-OPEN
 // authorisation bug. The function itself lives in the daemon static-policy
 // module so compile/bind/recheck all share one source.
-import {
-  loadDaemonP2pStaticPolicy,
-  readCachedHelloSnapshot,
-} from './p2p-workflow-static-policy.js';
-import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
-import { imcodesStateDir } from '../util/imcodes-state-dir.js';
-
 function makeBindRuntimeContext(
   options: {
     runId: string;
@@ -4510,8 +4595,9 @@ type DelegationTerminalAck = {
   delegationContextStatus?: DelegationContextStatus;
 };
 
-const delegationTerminalAcks = new Map<string, DelegationTerminalAck>();
-const delegationAckKey = (sessionName: string, commandId: string): string => `${sessionName}:${commandId}`;
+function delegationAckKey(sessionName: string, commandId: string): string {
+  return `${sessionName}:${commandId}`;
+}
 
 function recordDelegationTerminalAck(payload: DelegationTerminalAck): void {
   delegationTerminalAcks.set(delegationAckKey(payload.sessionName, payload.commandId), payload);
@@ -4545,23 +4631,6 @@ function replayDelegationTerminalAckIfPresent(
   return true;
 }
 
-
-const DELEGATION_UNSUPPORTED_TOP_LEVEL_FIELDS = [
-  'replyTo',
-  'originSession',
-  'originOverride',
-  'contextTail',
-  'delegationContext',
-  'files',
-  'attachments',
-  'quotes',
-  'fileRefs',
-  'fileReferences',
-  'broadcast',
-  'clone',
-  'idempotencyKey',
-  'delegationId',
-] as const;
 
 function hasMixedDelegationP2pFields(cmd: Record<string, unknown>): boolean {
   return findMixedAgentDelegationP2pFields(cmd).length > 0;
@@ -6633,10 +6702,6 @@ async function handleAppendQueuedTransportMessages(cmd: Record<string, unknown>,
  * model already saw. Double-insurance write path: the server pod-routes the command
  * by serverId, and the daemon independently re-checks that it owns `sessionName`.
  */
-const DELETABLE_TOMBSTONE_TYPES: ReadonlySet<string> = new Set([
-  'user.message', 'assistant.text', 'assistant.thinking', 'tool.call', 'tool.result',
-]);
-
 function readTimelineDeleteTargets(cmd: Record<string, unknown>): { ids: string[]; tooMany: boolean } {
   const seen = new Set<string>();
   const add = (value: unknown): void => {
@@ -6865,9 +6930,6 @@ async function handleGetSessions(serverLink: ServerLink): Promise<void> {
   }
 }
 
-const RAW_BATCH_FLUSH_MS = 42;           // ~24fps flush interval
-const RAW_BATCH_MAX_BYTES = 32 * 1024;   // flush immediately at 32KB
-
 function handleSubscribe(cmd: Record<string, unknown>, serverLink: ServerLink): void {
   const session = cmd.session as string | undefined;
   if (!session) return;
@@ -7072,10 +7134,6 @@ function optionalFiniteNumber(value: unknown): number | undefined {
 function timelineHistoryResponseTypeForRequest(cmd: Record<string, unknown>): typeof TIMELINE_MESSAGES.HISTORY | typeof TIMELINE_MESSAGES.PAGE {
   return cmd.type === TIMELINE_MESSAGES.PAGE_REQUEST ? TIMELINE_MESSAGES.PAGE : TIMELINE_MESSAGES.HISTORY;
 }
-
-/** Per-reply ceiling for timeline history/page responses while the server
- *  link reports uplink congestion (see ServerLink.isUplinkCongested). */
-const CONGESTED_TIMELINE_RESPONSE_BUDGET_BYTES = 64 * 1024;
 
 function resolveTimelineHistoryBudgetBytes(cmd: Record<string, unknown>): number {
   const requested = optionalFiniteNumber(cmd.budgetBytes);
@@ -7284,10 +7342,9 @@ interface TimelineReplayBuildResult {
   detailRefs?: TimelinePayloadMetadata['detailRefs'];
 }
 
-const timelineReplayInflight = new Map<string, Promise<TimelineReplayBuildResult>>();
-
-const resolveTimelineSupervisionTaskProjection = (taskId: string, assignmentId: string) =>
-  getSupervisionTaskRegistry().getSupervisionTaskProjection(taskId, assignmentId);
+function resolveTimelineSupervisionTaskProjection(taskId: string, assignmentId: string) {
+  return getSupervisionTaskRegistry().getSupervisionTaskProjection(taskId, assignmentId);
+}
 
 function timelineReplayInflightKey(params: TimelineReplayRequestParams): string {
   return JSON.stringify({
@@ -7513,8 +7570,6 @@ function handleTimelineDetailRequest(cmd: Record<string, unknown>, serverLink: S
   } catch { /* not connected */ }
 }
 
-const OPENCODE_SYNTH_HISTORY_OVERLAP_MS = 60_000;
-
 export function getOpenCodeSynthesizedAfterTs(afterTs: number | undefined): number | undefined {
   return afterTs === undefined ? undefined : Math.max(0, afterTs - OPENCODE_SYNTH_HISTORY_OVERLAP_MS);
 }
@@ -7627,22 +7682,6 @@ interface TimelineHistoryBuildResult {
   recoverable?: boolean;
   detailRefs: TimelinePayloadMetadata['detailRefs'];
 }
-
-const timelineHistoryInflight = new Map<string, Promise<TimelineHistoryBuildResult>>();
-
-/**
- * Reasons that mean "the projection could not answer right now".
- *
- * These must never reach buildTimelineHistoryOnMain. Running the heavy path on
- * the event loop is the worst available response to saturation, and it is what
- * turned a worker timeout into a blocked main thread in production.
- */
-const TIMELINE_HISTORY_TRANSIENT_REASONS = new Set<string>([
-  TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY,
-  TIMELINE_HISTORY_ERROR_REASONS.TIMEOUT,
-  TIMELINE_HISTORY_ERROR_REASONS.DEADLINE_EXCEEDED,
-  TIMELINE_HISTORY_ERROR_REASONS.QUEUE_FULL,
-]);
 
 function timelineHistoryErrorResult(
   source: string,
@@ -8386,8 +8425,6 @@ async function handleSubSessionReadResponse(cmd: Record<string, unknown>, server
   } catch { /* not connected */ }
 }
 
-const askAnswerLedger = new AskAnswerLedger();
-
 /** Test seam: forget the in-process ask.answer bookkeeping, as a daemon restart does. */
 export function resetAskAnswerLedgerForTests(): void {
   askAnswerLedger.clear();
@@ -8630,11 +8667,6 @@ function isPathUnderDir(filePath: string, dir: string): boolean {
   return relative === '' || (!!relative && !relative.startsWith('..') && !nodePath.isAbsolute(relative));
 }
 
-const P2P_DISCUSSION_HISTORY_LIMIT = 50;
-const P2P_DISCUSSION_PREVIEW_BYTES = 64 * 1024;
-const P2P_DISCUSSION_FILE_STAT_CONCURRENCY = 24;
-const P2P_DISCUSSION_PREVIEW_CONCURRENCY = 8;
-
 interface P2pDiscussionHistoryCandidate {
   id: string;
   fileName: string;
@@ -8730,14 +8762,10 @@ async function materializeP2pDiscussionHistoryEntry(
 // top GC-pressure source under load). Web + mobile clients poll this list
 // frequently and in reconnect bursts; a 2s cache collapses sequential polls
 // and the in-flight map collapses simultaneous ones into a single scan.
-const P2P_DISCUSSION_LIST_CACHE_TTL_MS = 2_000;
-const P2P_DISCUSSION_LIST_GLOBAL_KEY = '__global__';
 interface P2pDiscussionListResult {
   discussions: P2pDiscussionHistoryEntry[];
   aggregated: boolean;
 }
-const p2pDiscussionListCache = new Map<string, { expiresAt: number; value: P2pDiscussionListResult }>();
-const p2pDiscussionListInflight = new Map<string, Promise<P2pDiscussionListResult>>();
 
 async function computeP2pDiscussionList(
   scope: { projectDir: string; canonicalProjectDir: string } | null,
@@ -9175,21 +9203,6 @@ export function evaluateAutoUpgradeCooldown(
 }
 
 /** How long the *session-busy* gate reports continuous deferral in logs before
- *  it marks the wait as capped. It is intentionally advisory only: a daemon
- *  self-upgrade must never force through an active turn, because restarting the
- *  daemon would kill or abandon the user's in-flight work. Override for tests
- *  via IMCODES_MAX_UPGRADE_DEFER_MS. */
-const MAX_UPGRADE_DEFER_MS = (() => {
-  const raw = parseInt(process.env.IMCODES_MAX_UPGRADE_DEFER_MS ?? '', 10);
-  return Number.isFinite(raw) && raw > 0 ? raw : 30 * 60 * 1000;
-})();
-
-/** Epoch ms when the session-busy gate FIRST blocked the current run of
- *  upgrade attempts, or null when the last attempt was not session-blocked.
- *  Persists across `handleDaemonUpgrade` calls (each server upgrade broadcast)
- *  so the backstop measures *continuous* deferral, not a single attempt. */
-let upgradeSessionBusyDeferredSince: number | null = null;
-
 /** Pure decision for the session-busy deferral backstop. Given whether the
  *  session gate is currently blocking and how long it has been blocking,
  *  decide whether to keep blocking and what the next "blocked since" marker
@@ -9873,17 +9886,6 @@ async function handleDaemonUpgrade(
 
 // ── File system browser ────────────────────────────────────────────────────
 
-// On Windows, don't restrict paths — projects commonly live on any drive (D:\code, etc.)
-// The daemon runs as the user, so OS-level permissions are the real security boundary.
-// Deny-list: block access to sensitive directories regardless of platform.
-// Everything else is allowed — the daemon runs as the user and inherits their permissions.
-const FS_DENIED_DIRS = ['.ssh', '.gnupg', '.pki'];
-
-/** Special sentinel path that browses Windows drive roots (C:\, D:\, ...).
- *  Distinct from `~` so the home directory remains accessible on Windows. */
-const WINDOWS_DRIVES_PATH = ':drives:';
-const WINDOWS_DRIVES_ROOT = '__imcodes_windows_drives__';
-
 function isPathAllowed(realPath: string): boolean {
   return isFilePreviewPathAllowed(realPath);
 }
@@ -10083,55 +10085,15 @@ async function handleP2pStatus(cmd: Record<string, unknown>, serverLink: ServerL
   }
 }
 
-// ── File search for @ picker ──────────────────────────────────────────────
-
-const FILE_SEARCH_EXCLUDES = new Set([
-  'node_modules', '.git', 'venv', '__pycache__', '.venv',
-  'dist', 'build', '.next', '.nuxt', 'vendor', 'target',
-]);
-
-const FILE_SEARCH_MAX = 20;
-const FILE_SEARCH_MAX_INDEXED_PATHS = 20_000;
-const FILE_SEARCH_CACHE_TTL_MS = 5_000;
-const FILE_SEARCH_CACHE_MAX_ENTRIES = 32;
-
 interface FileSearchSnapshot {
   root: string;
   dirSignature: string;
   paths: string[];
 }
 
-const fileSearchCache = new Map<string, { expiresAt: number; value: FileSearchSnapshot }>();
-const fileSearchInflight = new Map<string, Promise<FileSearchSnapshot>>();
-const fileSearchGenerations = new Map<string, number>();
-
 export function getActiveP2pRunsBlockingDaemonUpgrade(runs = listP2pRuns()) {
   return runs.filter((run) => !P2P_TERMINAL_RUN_STATUSES.has(run.status));
 }
-
-/** Transport-runtime statuses that represent a genuine in-flight turn the
- *  user is waiting on. `'error'` is intentionally NOT in this set — an
- *  errored runtime is *stuck*, not active, and forever-blocking daemon
- *  upgrades on it leaves the user no way out short of `imcodes service
- *  restart` (which is exactly what the upgrade wants to do anyway). */
-const TRANSPORT_IN_PROGRESS_STATUSES: ReadonlySet<string> = new Set(['thinking', 'streaming']);
-
-/** A transport turn that reports in-progress (thinking/streaming) or
- *  sending/pending but has produced NO provider activity (no delta /
- *  completion / error / tool call / session-info / dispatch) for this long is
- *  treated as a PHANTOM — the provider wedged mid-turn (classic symptom: a
- *  lost `onComplete` leaves `_status='streaming'` and `_sending=true`
- *  forever) — and must NOT block daemon upgrades. Observed in production: a
- *  codex-sdk sub-session stuck in 'streaming' for 8+ hours blocked every
- *  auto-upgrade, pinning the daemon on a stale version. A live turn refreshes
- *  its activity timestamp on every delta, so a real generation never trips
- *  this (the absolute deferral backstop in `handleDaemonUpgrade` is the final
- *  safety net for everything this doesn't catch, e.g. wedged process agents).
- *  Override for tests via IMCODES_TRANSPORT_STALE_TURN_MS. */
-const TRANSPORT_STALE_TURN_MS = (() => {
-  const raw = parseInt(process.env.IMCODES_TRANSPORT_STALE_TURN_MS ?? '', 10);
-  return Number.isFinite(raw) && raw > 0 ? raw : 15 * 60 * 1000;
-})();
 
 /** Snapshot of why a transport session is currently blocking daemon upgrade.
  *  Embedded in the upgrade-blocked log so future "why didn't it upgrade"
@@ -10213,8 +10175,6 @@ export function getTransportSessionUpgradeBlockReason(
  *  `'queued'` as busy; the upgrade gate previously did not, so a turn
  *  dispatched a few hundred ms before an `daemon.upgrade` broadcast would be
  *  silently killed. Including `'queued'` here closes that race. */
-const PROCESS_IN_PROGRESS_STATES: ReadonlySet<string> = new Set(['running', 'queued']);
-
 /** Per-session reason a daemon upgrade is currently blocked. Covers both
  *  transport-runtime sessions (claude-code-sdk, codex-sdk, qwen, …) and
  *  process-runtime sessions (claude-code, codex, opencode, gemini, shell)
@@ -10435,13 +10395,6 @@ function invalidateFileSearchCachesForPath(targetPath: string): void {
   }
 }
 
-const FS_LIST_DEADLINE_MS = 10_000;
-const FS_LIST_CACHE_TTL_MS = 5_000;
-const FS_LIST_STALE_CACHE_TTL_MS = 30_000;
-const FS_LIST_CACHE_MAX_ENTRIES = 128;
-const FS_LIST_INFLIGHT_FANOUT_CAP = 32;
-const FS_LIST_METADATA_CONCURRENCY = 32;
-
 interface FreshnessCacheEntry<T> {
   expiresAt: number;
   staleUntil?: number;
@@ -10470,10 +10423,6 @@ interface FsListRequestContext {
   markTerminal(): void;
   send(message: Record<string, unknown>): boolean;
 }
-
-const fsListCache = new Map<string, FreshnessCacheEntry<FsLsSnapshot>>();
-const fsListInflight = new Map<string, InflightWork<FsLsSnapshot>>();
-const fsListGenerations = new Map<string, number>();
 
 function sweepExpiredCache<T, E extends FreshnessCacheEntry<T>>(cache: Map<string, E>, now = Date.now()): void {
   for (const [key, entry] of cache) {
@@ -10923,8 +10872,6 @@ async function handleFsListInner(
   requestContext.send({ type: 'fs.ls_response', requestId, path: rawPath, resolvedPath: snapshot.resolvedPath, status: 'ok', entries });
 }
 
-const REPO_CONTEXT_CACHE_TTL_MS = 5_000;
-
 async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const rawPath = typeof cmd.path === 'string' ? cmd.path : '';
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : '';
@@ -11031,13 +10978,6 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
   getDefaultPreviewReadCoordinator().handle(rawPath, requestId, (message) => serverLink.send(message));
 }
 
-const GIT_STATUS_CACHE_TTL_MS = 5_000;
-const GIT_STATUS_STALE_CACHE_TTL_MS = 30_000;
-const GIT_STATUS_CACHE_MAX_ENTRIES = 128;
-const GIT_STATUS_DEADLINE_MS = 10_000;
-const GIT_STATUS_INFLIGHT_FANOUT_CAP = 32;
-const GIT_DIFF_CACHE_TTL_MS = 5_000;
-
 type GitStatusFile = { path: string; code: string; additions?: number; deletions?: number };
 
 interface RepoContext {
@@ -11086,19 +11026,6 @@ interface GitDiffSnapshot {
   fileSignature: string;
   diff: string;
 }
-
-const repoContextCache = new Map<string, { expiresAt: number; value: RepoContextBase | null }>();
-const repoSignatureCache = new Map<string, RepoSignatureState>();
-const gitStatusCache = new Map<string, { expiresAt: number; value: GitStatusSnapshot }>();
-const gitStatusInflight = new Map<string, Promise<GitStatusSnapshot>>();
-const gitNumstatCache = new Map<string, { expiresAt: number; value: GitNumstatSnapshot }>();
-const gitNumstatInflight = new Map<string, Promise<GitNumstatSnapshot>>();
-const gitStatusResponseCache = new Map<string, FreshnessCacheEntry<GitStatusResponseSnapshot>>();
-const gitStatusResponseInflight = new Map<string, InflightWork<GitStatusResponseSnapshot>>();
-const gitDiffCache = new Map<string, { expiresAt: number; value: GitDiffSnapshot }>();
-const gitDiffInflight = new Map<string, Promise<GitDiffSnapshot>>();
-const gitRepoGenerations = new Map<string, number>();
-const gitDiffGenerations = new Map<string, number>();
 
 function normalizeFsPath(value: string): string {
   return nodePath.resolve(value);
@@ -12346,20 +12273,12 @@ async function handleTransportListModels(
   }
 }
 
-const TRANSPORT_LIST_MODELS_DEFAULT_TTL_MS = 5_000;
-const TRANSPORT_LIST_MODELS_MAX_TTL_MS = 60_000;
-const TRANSPORT_LIST_MODELS_TTL_ENV = 'IMCODES_TRANSPORT_LIST_MODELS_CACHE_TTL_MS';
-
 type TransportListModelsResult = {
   models: Array<{ id: string; name?: string; supportsReasoningEffort?: boolean; supportedEffortLevels?: readonly TransportEffortLevel[] }>;
   defaultModel?: string;
   isAuthenticated?: boolean;
   error?: string;
 };
-
-const transportListModelsCache = new Map<string, { expiresAt: number; generation: number; value: TransportListModelsResult }>();
-const transportListModelsInflight = new Map<string, { generation: number; promise: Promise<TransportListModelsResult> }>();
-let transportListModelsCacheGeneration = 0;
 
 function resolveTransportListModelsCacheTtlMs(): number {
   const raw = process.env[TRANSPORT_LIST_MODELS_TTL_ENV];

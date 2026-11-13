@@ -11,6 +11,7 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { connectProvider, disconnectAll, getProvider } from '../../src/agent/provider-registry.js';
+import { setAgyUsageExecFn } from '../../src/agent/agy-usage-quota.js';
 import { launchTransportSession, getTransportRuntime, stopTransportRuntimeSession } from '../../src/agent/session-manager.js';
 import { getSession, flushStore, removeSession, authorizeEmptySessionStoreWrite } from '../../src/store/session-store.js';
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
@@ -35,6 +36,7 @@ let events: TimelineEvent[];
 const requests = async () => (await readFile(log, 'utf8')).trim().split('\n').map(x => JSON.parse(x));
 const finalized = () => events.filter(e => e.type === 'assistant.text' && e.payload.streaming === false && !e.payload.automation);
 beforeEach(async () => {
+  setAgyUsageExecFn(async () => ({ stdout: '', stderr: '' }));
   // Each case creates a new session owner with this synthetic name. Retire the
   // prior owner's latest-value dedupe snapshots before asserting new frames.
   timelineEmitter.forgetSession(NAME);
@@ -46,7 +48,7 @@ beforeEach(async () => {
   await connectProvider(AGY_SDK_PROVIDER_ID, { binaryPath: binary, env: { HOME: root, AGY_ACP_FIXTURE_AGENT_NAME: AGY_ACP_AGENT_NAME, AGY_ACP_FIXTURE_LOG: log } });
   await launchTransportSession({ name: NAME, projectName: PROJECT, projectDir: root, role: 'brain', agentType: AGY_SDK_PROVIDER_ID });
 });
-afterEach(async () => { off?.(); await stopTransportRuntimeSession(NAME); removeSession(NAME); await disconnectAll(); await rm(root, { recursive: true, force: true }); });
+afterEach(async () => { off?.(); await stopTransportRuntimeSession(NAME); removeSession(NAME); await disconnectAll(); setAgyUsageExecFn(null); await rm(root, { recursive: true, force: true }); });
 describe('real AG ACP SDK/runtime/durable store/relay', () => {
   it('projects a pre-native idle model choice immediately without starting an ACP session', async () => {
     const runtime = getTransportRuntime(NAME)!;
