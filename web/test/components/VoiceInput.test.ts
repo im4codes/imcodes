@@ -758,6 +758,82 @@ describe('mobile capture defenses', () => {
       vi.useRealTimers();
     }
   });
+
+  it('runs requestPermissions + available and all 4 addListener registrations concurrently, and cleans up handles on cancellation or partial failure', async () => {
+    const permGate = deferred<{ speechRecognition: string }>();
+    const availGate = deferred<{ available: boolean }>();
+    speechApi.requestPermissions.mockReturnValueOnce(permGate.promise);
+    speechApi.available.mockReturnValueOnce(availGate.promise);
+
+    const listenerGates: Record<string, ReturnType<typeof deferred<{ remove: ReturnType<typeof vi.fn> }>>> = {};
+    const removeSpies: Record<string, ReturnType<typeof vi.fn>> = {};
+    speechApi.addListener.mockImplementation((eventName: string, handler: (data: any) => void) => {
+      listeners[eventName] = handler;
+      const gate = deferred<{ remove: ReturnType<typeof vi.fn> }>();
+      listenerGates[eventName] = gate;
+      removeSpies[eventName] = vi.fn(async () => undefined);
+      return gate.promise;
+    });
+
+    try {
+      const startPromise = VoiceInput.startListening(vi.fn());
+      // Both permission and availability checks start concurrently in the initial round-trip.
+      expect(speechApi.requestPermissions).toHaveBeenCalledTimes(1);
+      expect(speechApi.available).toHaveBeenCalledTimes(1);
+
+      permGate.resolve({ speechRecognition: 'granted' });
+      availGate.resolve({ available: true });
+      await waitFor(() => expect(speechApi.addListener).toHaveBeenCalledTimes(4));
+
+      // Resolve 2 listeners and cancel before the remaining 2 settle.
+      listenerGates.partialResults.resolve({ remove: removeSpies.partialResults });
+      listenerGates.audioLevel.resolve({ remove: removeSpies.audioLevel });
+      const stopPromise = VoiceInput.stopListening();
+
+      listenerGates.listeningState.resolve({ remove: removeSpies.listeningState });
+      listenerGates.recognitionError.resolve({ remove: removeSpies.recognitionError });
+
+      await expect(startPromise).resolves.toBe(false);
+      await stopPromise;
+      expect(speechApi.start).not.toHaveBeenCalled();
+      for (const name of ['partialResults', 'audioLevel', 'listeningState', 'recognitionError']) {
+        expect(removeSpies[name]).toHaveBeenCalledOnce();
+      }
+
+      // Partial listener registration rejection cleans up resolved & late-resolving handles without leaking.
+      speechApi.addListener.mockReset();
+      const partialGates: Record<string, ReturnType<typeof deferred<{ remove: ReturnType<typeof vi.fn> }>>> = {};
+      const partialRemovals: Record<string, ReturnType<typeof vi.fn>> = {};
+      speechApi.addListener.mockImplementation((eventName: string) => {
+        const gate = deferred<{ remove: ReturnType<typeof vi.fn> }>();
+        partialGates[eventName] = gate;
+        partialRemovals[eventName] = vi.fn(async () => undefined);
+        return gate.promise;
+      });
+
+      const onError = vi.fn();
+      const failedStart = VoiceInput.startListening(vi.fn(), undefined, onError);
+      await waitFor(() => expect(speechApi.addListener).toHaveBeenCalledTimes(4));
+      partialGates.partialResults.resolve({ remove: partialRemovals.partialResults });
+      partialGates.audioLevel.reject(new Error('listener registration failed'));
+      await expect(failedStart).resolves.toBe(false);
+      expect(onError).toHaveBeenCalledWith('listener registration failed');
+      expect(partialRemovals.partialResults).toHaveBeenCalledOnce();
+
+      // Remaining listeners that resolve after abort are also immediately removed.
+      partialGates.listeningState.resolve({ remove: partialRemovals.listeningState });
+      partialGates.recognitionError.resolve({ remove: partialRemovals.recognitionError });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(partialRemovals.listeningState).toHaveBeenCalledOnce();
+      expect(partialRemovals.recognitionError).toHaveBeenCalledOnce();
+      expect(speechApi.start).not.toHaveBeenCalled();
+    } finally {
+      permGate.resolve({ speechRecognition: 'granted' });
+      availGate.resolve({ available: true });
+      await VoiceInput.stopListening();
+    }
+  });
 });
 
 

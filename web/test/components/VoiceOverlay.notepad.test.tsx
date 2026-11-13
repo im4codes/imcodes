@@ -815,4 +815,34 @@ describe('VoiceOverlay mobile microphone gestures', () => {
     expect(textarea().getAttribute('inputmode')).toBeNull();
     expect(document.activeElement).not.toBe(textarea());
   });
+
+  it('starts recognition immediately without a 150ms delay and clears voice.starting as soon as listening becomes true', async () => {
+    let emitListening!: (listening: boolean) => void;
+    let resolveStart!: (ok: boolean) => void;
+    voiceApi.startListening.mockImplementationOnce((
+      _handler: (partial: string) => void,
+      onListeningChange?: (listening: boolean) => void,
+    ) => {
+      emitListening = onListeningChange!;
+      return new Promise<boolean>((resolve) => {
+        resolveStart = resolve;
+      });
+    });
+
+    render(<VoiceOverlay open initialText="" onSend={vi.fn()} onClose={vi.fn()} />);
+
+    // Called synchronously inside mount effect without waiting 150ms.
+    expect(voiceApi.startListening).toHaveBeenCalledOnce();
+    expect(document.querySelector('.voice-overlay-status')?.textContent).toContain('voice.starting');
+
+    // Bridge emits listeningState='started' before startListening() resolves -> UI flips to listening immediately.
+    emitListening(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.querySelector('.voice-overlay-status')?.textContent).toContain('voice.listening');
+    expect(document.querySelector('.voice-overlay-status')?.textContent).not.toContain('voice.starting');
+
+    resolveStart(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.querySelector('.voice-overlay-status')?.textContent).toContain('voice.listening');
+  });
 });

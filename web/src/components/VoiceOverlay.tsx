@@ -109,7 +109,6 @@ export function VoiceOverlay({
   const programmaticWriteRef = useRef(false);
   // Guard: true while overlay is open
   const openRef = useRef(false);
-  const autoStartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Notepad mode: keep listening across recognizer segments until the user stops.
   const [notepad, setNotepad] = useState(false);
   const notepadRef = useRef(false);
@@ -232,7 +231,9 @@ export function VoiceOverlay({
     }
     listeningRef.current = next;
     setListening(next);
-    if (!next) {
+    if (next) {
+      setStarting(false);
+    } else {
       clearRecognizingTimer();
       setRecognizing(false);
     }
@@ -242,12 +243,6 @@ export function VoiceOverlay({
     if (!restartTimerRef.current) return;
     clearTimeout(restartTimerRef.current);
     restartTimerRef.current = null;
-  }, []);
-
-  const clearAutoStartTimer = useCallback(() => {
-    if (!autoStartTimerRef.current) return;
-    clearTimeout(autoStartTimerRef.current);
-    autoStartTimerRef.current = null;
   }, []);
 
   useEffect(() => {
@@ -333,18 +328,13 @@ export function VoiceOverlay({
     };
     vv?.addEventListener('resize', onResize);
 
-    // Start voice session at end of initial text (not 0). An unfinished
+    // Start voice session immediately at end of initial text (not 0). An unfinished
     // notepad waits for the user's choice instead: dictation starting on its
     // own would talk over the offer to resume it.
-    clearAutoStartTimer();
     if (!recoverable && autoStartListening) {
-      autoStartTimerRef.current = setTimeout(() => {
-        autoStartTimerRef.current = null;
-        void startSession(init.length);
-      }, 150);
+      void startSession(init.length);
     }
     return () => {
-      clearAutoStartTimer();
       clearRestartTimer();
       clearRecognizingTimer();
       if (holdTimerRef.current) clearTimeout(holdTimerRef.current);
@@ -372,7 +362,7 @@ export function VoiceOverlay({
       // ref truthful; the next open initializes both ref and rendered state.
       listeningRef.current = false;
     };
-  }, [open, clearAutoStartTimer, clearRestartTimer, setListeningState]);
+  }, [open, clearRestartTimer, setListeningState]);
 
   /** Stop current session and commit voice zone */
   const commitAndStop = useCallback((flush = false): Promise<boolean> => {
@@ -592,7 +582,6 @@ export function VoiceOverlay({
     voiceRetryPendingRef.current = true;
     pendingResumeAfterStopRef.current = false;
     try {
-      clearAutoStartTimer();
       clearRestartTimer();
       restartPausedRef.current = false;
       shortSegmentsRef.current = 0;
@@ -606,7 +595,7 @@ export function VoiceOverlay({
     } finally {
       voiceRetryPendingRef.current = false;
     }
-  }, [clearAutoStartTimer, clearRestartTimer, commitAndStop, startSession]);
+  }, [clearRestartTimer, commitAndStop, startSession]);
 
   const handleToggle = useCallback(async () => {
     if ((listeningRef.current || startingTokenRef.current !== null || restartTimerRef.current !== null || pendingFlushRef.current !== null) && notepadRef.current) {
@@ -623,7 +612,6 @@ export function VoiceOverlay({
       if (!committed) return;
     } else {
       if (voiceRetryPendingRef.current) return;
-      clearAutoStartTimer();
       restartPausedRef.current = false;
       shortSegmentsRef.current = 0;
       if (pendingFlushRef.current) {
@@ -660,7 +648,7 @@ export function VoiceOverlay({
       const pos = ta ? (ta.selectionStart ?? ta.value.length) : 0;
       void startSession(pos);
     }
-  }, [startSession, commitAndStop, clearAutoStartTimer, clearRestartTimer, openReview]);
+  }, [startSession, commitAndStop, clearRestartTimer, openReview]);
 
   const handleNotepadToggle = useCallback(() => {
     const next = !notepadRef.current;
@@ -687,10 +675,9 @@ export function VoiceOverlay({
     setNotepadStartedAt(draftStartedAtRef.current);
     setNow(Date.now());
     if (!listeningRef.current) {
-      clearAutoStartTimer();
       void startSession(taRef.current?.value.length ?? 0);
     }
-  }, [beginDraft, clearAutoStartTimer, clearRestartTimer, startSession]);
+  }, [beginDraft, clearRestartTimer, startSession]);
 
   // Elapsed-time clock while notepad mode is on.
   useEffect(() => {
@@ -735,7 +722,6 @@ export function VoiceOverlay({
     pendingResumeAfterStopRef.current = false;
     const sendOpenSeq = openSeqRef.current;
     try {
-      clearAutoStartTimer();
       clearRestartTimer();
       if (listeningRef.current || startingTokenRef.current !== null || restartTimerRef.current !== null || pendingFlushRef.current !== null) {
         if (!await commitAndStop(true)) return;
@@ -748,7 +734,7 @@ export function VoiceOverlay({
         onClose();
       }
     } finally { voiceSendPendingRef.current = false; }
-  }, [onSend, onClose, openReview, commitAndStop, clearAutoStartTimer, clearRestartTimer, settleDraft]);
+  }, [onSend, onClose, openReview, commitAndStop, clearRestartTimer, settleDraft]);
 
   const endMicPress = useCallback((pointerId: number, cancelled = false) => {
     if (micPointerRef.current !== pointerId) return;
@@ -874,7 +860,6 @@ export function VoiceOverlay({
     // Closing is neither sending nor discarding: the notepad stays on this
     // device and is offered again the next time voice input opens here.
     saveDraft();
-    clearAutoStartTimer();
     clearRestartTimer();
     pendingResumeAfterStopRef.current = false;
     pendingResumeWaiterRef.current = null;
@@ -885,7 +870,7 @@ export function VoiceOverlay({
     VoiceInput.stopListening();
     setListeningState(false);
     onClose();
-  }, [onClose, saveDraft, setListeningState, clearAutoStartTimer, clearRestartTimer]);
+  }, [onClose, saveDraft, setListeningState, clearRestartTimer]);
 
   /** User manually edited the textarea — commit voice zone and stop recognition */
   const handleInput = useCallback(() => {
@@ -929,7 +914,7 @@ export function VoiceOverlay({
         <div class="voice-overlay-status">
           <div class={`voice-status-dot${listening ? ' voice-status-dot-active' : ''}${recognizing ? ' voice-status-dot-recognizing' : ''}`} />
           <span role="status" aria-live="polite">
-            {starting ? t('voice.starting') : listening
+            {starting && !listening ? t('voice.starting') : listening
               ? t(recognizing ? 'voice.recognizing' : 'voice.listening')
               : t('voice.ready')}
           </span>

@@ -144,73 +144,72 @@ async function attachSessionListeners(
   session: NativeSession,
 ): Promise<boolean> {
   const { generation } = session;
-  const addTracked = async (
-    eventName: any,
-    handler: (data: any) => void,
-  ): Promise<boolean> => {
-    const handle = await recognition.addListener(eventName, handler);
-    if (generation !== _generation || _nativeSession !== session) {
-      await removeHandle(handle);
+  let aborted = false;
+
+  const registrations: Array<readonly [any, (data: any) => void]> = [
+    ['partialResults', (data: { matches?: string[]; isFinal?: boolean }) => {
+      if (_nativeSession !== session || session.final || !data.matches?.length) return;
+      const text = data.matches[0];
+      const final = data.isFinal === true;
+      // Native owns committed + unfixed text and emits a cumulative snapshot,
+      // not an append-only delta. Corrections may shorten the unfixed tail.
+      // Keep this listener through stop ACK so its final short tail is retained.
+      if (typeof text !== 'string' || (!final && session.text === text)) return;
+      session.text = text;
+      session.final = final;
+      _onResult?.(text, final);
+    }],
+    // Audio level listener (emitted from native at ~15-20fps; ignore after stop advances generation)
+    ['audioLevel', (data: any) => {
+      if (_nativeSession !== session || generation !== _generation) return;
+      _onLevel?.(data.level ?? 0);
+    }],
+    ['listeningState', (data: { status?: string }) => {
+      if (_nativeSession !== session || generation !== _generation) return;
+      if (data.status === 'started') {
+        setListening(true);
+        return;
+      }
+      // Serialize cleanup with the next start; a late stopped event from this
+      // recognizer cannot tear down a new language session.
+      void stopListening();
+    }],
+    ['recognitionError', (data: any) => {
+      if (_nativeSession !== session) return;
+      const message = typeof data?.message === 'string' && data.message.trim()
+        ? data.message.trim()
+        : 'Speech recognition error';
+      console.warn('[voice] recognitionError:', message);
+      reportError(message);
+      void stopListening();
+    }],
+  ];
+
+  try {
+    const outcomes = await Promise.all(
+      registrations.map(async ([eventName, handler]) => {
+        const handle = await recognition.addListener(eventName, handler);
+        if (aborted || generation !== _generation || _nativeSession !== session) {
+          await removeHandle(handle);
+          return false;
+        }
+        session.handles.push(handle);
+        return true;
+      }),
+    );
+
+    if (outcomes.some((ok) => !ok) || generation !== _generation || _nativeSession !== session) {
+      aborted = true;
+      await cleanupSessionListeners(session);
       return false;
     }
-    session.handles.push(handle);
+
     return true;
-  };
-
-  // Partial results listener
-  if (!(await addTracked('partialResults', (data: { matches?: string[]; isFinal?: boolean }) => {
-    if (_nativeSession !== session || session.final || !data.matches?.length) return;
-    const text = data.matches[0];
-    const final = data.isFinal === true;
-    // Native owns committed + unfixed text and emits a cumulative snapshot,
-    // not an append-only delta. Corrections may shorten the unfixed tail.
-    // Keep this listener through stop ACK so its final short tail is retained.
-    if (typeof text !== 'string' || (!final && session.text === text)) return;
-    session.text = text;
-    session.final = final;
-    _onResult?.(text, final);
-  }))) {
+  } catch (err) {
+    aborted = true;
     await cleanupSessionListeners(session);
-    return false;
+    throw err;
   }
-
-  // Audio level listener (emitted from native at ~15-20fps; ignore after stop advances generation)
-  if (!(await addTracked('audioLevel', (data: any) => {
-    if (_nativeSession !== session || generation !== _generation) return;
-    _onLevel?.(data.level ?? 0);
-  }))) {
-    await cleanupSessionListeners(session);
-    return false;
-  }
-
-  if (!(await addTracked('listeningState', (data: { status?: string }) => {
-    if (_nativeSession !== session || generation !== _generation) return;
-    if (data.status === 'started') {
-      setListening(true);
-      return;
-    }
-    // Serialize cleanup with the next start; a late stopped event from this
-    // recognizer cannot tear down a new language session.
-    void stopListening();
-  }))) {
-    await cleanupSessionListeners(session);
-    return false;
-  }
-
-  if (!(await addTracked('recognitionError', (data: any) => {
-    if (_nativeSession !== session) return;
-    const message = typeof data?.message === 'string' && data.message.trim()
-      ? data.message.trim()
-      : 'Speech recognition error';
-    console.warn('[voice] recognitionError:', message);
-    reportError(message);
-    void stopListening();
-  }))) {
-    await cleanupSessionListeners(session);
-    return false;
-  }
-
-  return true;
 }
 
 async function resolveUsableFallbackRecognizer(
@@ -219,11 +218,13 @@ async function resolveUsableFallbackRecognizer(
   const fallback = getPlatformFallbackSpeechRecognition();
   if (!fallback || fallback === primary || typeof fallback.available !== 'function') return null;
   try {
-    const perms = typeof fallback.requestPermissions === 'function'
-      ? await fallback.requestPermissions()
-      : { speechRecognition: 'granted' };
+    const [perms, avail] = await Promise.all([
+      typeof fallback.requestPermissions === 'function'
+        ? fallback.requestPermissions()
+        : Promise.resolve({ speechRecognition: 'granted' }),
+      fallback.available(),
+    ]);
     if (perms?.speechRecognition !== 'granted') return null;
-    const avail = await fallback.available();
     return avail?.available ? fallback : null;
   } catch {
     return null;
@@ -252,7 +253,10 @@ async function startListeningInternal(generation: number): Promise<boolean> {
   _nativeSession = session;
 
   try {
-    const perms = await recognition.requestPermissions();
+    const [perms, available] = await Promise.all([
+      recognition.requestPermissions(),
+      recognition.available().catch(() => ({ available: false })),
+    ]);
     if (generation !== _generation) {
       await cleanupSessionListeners(session);
       if (_nativeSession === session) _nativeSession = null;
@@ -261,18 +265,6 @@ async function startListeningInternal(generation: number): Promise<boolean> {
     if (perms.speechRecognition !== 'granted') {
       console.warn('[voice] microphone permission denied');
       reportError('permission_denied');
-      if (_nativeSession === session) _nativeSession = null;
-      return false;
-    }
-
-    let available = { available: false };
-    try {
-      available = await recognition.available();
-    } catch {
-      available = { available: false };
-    }
-    if (generation !== _generation) {
-      await cleanupSessionListeners(session);
       if (_nativeSession === session) _nativeSession = null;
       return false;
     }

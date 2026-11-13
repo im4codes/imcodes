@@ -554,6 +554,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     private var engine: AVAudioEngine?
     private var tapInstalled = false
     private var startingCall: CAPPluginCall? // main-thread only; ready after warmup
+    private var warmupWatchdog: DispatchWorkItem? // main-thread only; guards stalled CoreAudio warmup
     // Resident recognizer model kept across sessions on worker; Metal state is guarded for foreground use.
     private var recognizer: SpeechRecognizer?
 
@@ -562,6 +563,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         NotificationCenter.default.addObserver(self, selector: #selector(didEnterBackground(_:)), name: UIApplication.didEnterBackgroundNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(didBecomeActive(_:)), name: UIApplication.didBecomeActiveNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(interrupted(_:)), name: AVAudioSession.interruptionNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(engineConfigurationChanged(_:)), name: .AVAudioEngineConfigurationChange, object: nil)
         coordinator.worker.async { [weak self] in
             guard let self = self else { return }
             _ = self.ensureRecognizer()
@@ -569,11 +571,27 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     }
     deinit {
         NotificationCenter.default.removeObserver(self)
+        warmupWatchdog?.cancel()
+        warmupWatchdog = nil
         let retainedRecognizer = recognizer
         if retainedRecognizer != nil {
             coordinator.worker.async {
                 _ = retainedRecognizer
             }
+        }
+    }
+    private func cancelWarmupWatchdog() {
+        warmupWatchdog?.cancel()
+        warmupWatchdog = nil
+    }
+    private func settleStartingCall(errorMessage: String? = nil) {
+        cancelWarmupWatchdog()
+        guard let call = startingCall else { return }
+        startingCall = nil
+        if let errorMessage = errorMessage {
+            call.reject(errorMessage)
+        } else {
+            call.resolve()
         }
     }
     private func ensureRecognizer() -> SpeechRecognizer? {
@@ -603,13 +621,17 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
             guard UIApplication.shared.applicationState != .background else {
                 call.reject("Speech requires a foreground app"); return
             }
-            if self.engine?.isRunning == true { call.resolve(); return }
             guard AVAudioSession.sharedInstance().recordPermission == .granted else {
                 call.reject("Microphone permission denied"); return
             }
             guard self.modelAvailable else {
                 call.reject("Offline speech model missing"); return
             }
+            if self.engine != nil || self.tapInstalled || self.startingCall != nil {
+                self.settleStartingCall(errorMessage: "Offline speech superseded by new session")
+                self.endCapture(nil, deactivateSession: false)
+            }
+            let expectedCall = call
             self.startingCall = call
             let owner = self.coordinator.beginStart(
                 makeDecode: { [weak self] in
@@ -620,11 +642,13 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                         decoder.decode(samples: samples, shouldContinue: shouldContinue)
                     }
                 },
-                onStartReady: { [weak self] in
-                    self?.startingCall?.resolve()
-                    self?.startingCall = nil
+                onStartReady: { [weak self, weak expectedCall] in
+                    guard let self = self, let expectedCall = expectedCall,
+                          self.startingCall === expectedCall else { return }
+                    self.settleStartingCall()
                 },
                 onSetupFailureTeardown: { [weak self] in
+                    self?.settleStartingCall(errorMessage: "Offline speech model initialization failed")
                     self?.endCapture(nil)
                 }
             )
@@ -643,15 +667,29 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                     throw NSError(domain: "StreamingSpeech", code: 2, userInfo: nil)
                 }
                 self.engine = engine
-                input.installTap(onBus: 0, bufferSize: AVAudioFrameCount(format.sampleRate / 10), format: format) { [weak self] buffer, _ in
+                let tapFrames = AVAudioFrameCount(max(512, Int(format.sampleRate / 40)))
+                input.installTap(onBus: 0, bufferSize: tapFrames, format: format) { [weak self] buffer, _ in
                     self?.consume(buffer, owner: owner, converter: converter, mono: mono)
                 }
                 self.tapInstalled = true
                 try engine.start()
+                let watchdog = DispatchWorkItem { [weak self, weak expectedCall] in
+                    guard let self = self, let expectedCall = expectedCall,
+                          self.startingCall === expectedCall else { return }
+                    self.settleStartingCall(errorMessage: "Offline speech microphone failed to start")
+                    self.coordinator.cancelStartSetup(owner: owner)
+                    self.endCapture(nil)
+                }
+                self.cancelWarmupWatchdog()
+                self.warmupWatchdog = watchdog
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: watchdog)
                 // consume() signals ready only after startup PCM was discarded;
-                // the UI must not invite speech during that 100ms interval.
+                // ~25ms tap interval reaches the 20ms warmup threshold without long UI stall.
             } catch {
-                self.startingCall = nil
+                self.cancelWarmupWatchdog()
+                if self.startingCall === expectedCall {
+                    self.startingCall = nil
+                }
                 self.coordinator.cancelStartSetup(owner: owner)
                 self.endCapture(nil)
                 call.reject("Offline speech could not start", nil, error)
@@ -694,18 +732,41 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         } else if notification.name == AVAudioSession.interruptionNotification,
            let value = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
            value != AVAudioSession.InterruptionType.began.rawValue { return }
-        DispatchQueue.main.async { self.endCapture(nil) }
+        DispatchQueue.main.async {
+            if self.startingCall != nil {
+                self.settleStartingCall(errorMessage: "Offline speech interrupted during startup")
+            }
+            self.endCapture(nil)
+        }
     }
     @objc private func didEnterBackground(_ notification: Notification) {
         coordinator.setBackgrounded(true)
-        DispatchQueue.main.async { self.endCapture(nil) }
+        DispatchQueue.main.async {
+            if self.startingCall != nil {
+                self.settleStartingCall(errorMessage: "Speech requires a foreground app")
+            }
+            self.endCapture(nil)
+        }
+    }
+    @objc private func engineConfigurationChanged(_ notification: Notification) {
+        DispatchQueue.main.async {
+            guard let activeEngine = self.engine else { return }
+            if let notifiedEngine = notification.object as? AVAudioEngine, notifiedEngine !== activeEngine {
+                return
+            }
+            if self.startingCall != nil {
+                self.settleStartingCall(errorMessage: "Offline speech interrupted by audio configuration change")
+            }
+            self.endCapture(nil)
+        }
     }
     @objc private func didBecomeActive(_ notification: Notification) {
         coordinator.setBackgrounded(false)
     }
     @objc public func stop(_ call: CAPPluginCall) { DispatchQueue.main.async { self.endCapture(call) } }
     // Main-thread capture teardown; serial decoder flush precedes stopped and ACK.
-    private func endCapture(_ call: CAPPluginCall?) {
+    private func endCapture(_ call: CAPPluginCall?, deactivateSession: Bool = true) {
+        cancelWarmupWatchdog()
         coordinator.endCapture(
             stopCompletion: call.map { c in
                 { errorMsg in
@@ -716,7 +777,9 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
             stopAudio: {
                 if tapInstalled { engine?.inputNode.removeTap(onBus: 0); tapInstalled = false }
                 engine?.stop(); engine = nil
-                try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+                if deactivateSession {
+                    try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+                }
             }
         )
     }
