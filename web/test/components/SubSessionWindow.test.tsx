@@ -38,7 +38,7 @@ const sessionControlsSpy = vi.fn((props: any) => (
     data-state={props.activeSession?.state ?? ''}
     data-queued={(props.activeSession?.transportPendingMessages ?? []).join('|')}
   >
-    <div data-testid="session-composer" role="textbox" />
+    <div ref={props.inputRef} data-testid="session-composer" role="textbox" />
   </div>
 ));
 const usageFooterSpy = vi.fn((props: any) => (
@@ -2141,6 +2141,92 @@ describe('SDK window startup budget', () => {
     expect(sessionControlsSpy.mock.calls.at(-1)?.[0]).toMatchObject({
       keyboardActive: false,
       activeSession: { name: 'deck_sub_inactive-composer' },
+    });
+  });
+
+  it('keeps onInputRef registered across visible chat/terminal mode toggles and clears it only when hidden', async () => {
+    const onInputRef = vi.fn();
+    const sub = makeSubSession({
+      id: 'mode-reg-1',
+      sessionName: 'deck_sub_mode-reg-1',
+      type: 'codex',
+      runtimeType: 'process',
+    });
+
+    const view = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        visible={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        onInputRef={onInputRef}
+        zIndex={5000}
+        onFocus={vi.fn()}
+        serverId="srv-1"
+      />,
+    );
+
+    await waitFor(() => {
+      const lastEl = onInputRef.mock.calls.at(-1)?.[0] as HTMLElement | null;
+      expect(lastEl).not.toBeNull();
+      expect(lastEl?.closest('.subsession-window')?.getAttribute('data-view-mode')).toBe('chat');
+      expect(lastEl?.closest('.subsession-window')?.getAttribute('data-subsession-id')).toBe('mode-reg-1');
+    });
+
+    onInputRef.mockClear();
+
+    // Switch to terminal mode -> element stays registered so parent retains terminal mode ownership
+    const modeBtn = document.querySelector('.subsession-mode-btn') as HTMLButtonElement;
+    expect(modeBtn).toBeTruthy();
+    fireEvent.click(modeBtn);
+
+    await waitFor(() => {
+      expect(onInputRef).toHaveBeenCalled();
+      const lastEl = onInputRef.mock.calls.at(-1)?.[0] as HTMLElement | null;
+      expect(lastEl).not.toBeNull();
+      expect(lastEl?.closest('.subsession-window')?.getAttribute('data-view-mode')).toBe('terminal');
+    });
+    expect(onInputRef.mock.calls.some(([el]) => el === null)).toBe(false);
+
+    // Switch back to chat mode -> still registered and reflects data-view-mode="chat"
+    onInputRef.mockClear();
+    fireEvent.click(modeBtn);
+    await waitFor(() => {
+      const lastEl = onInputRef.mock.calls.at(-1)?.[0] as HTMLElement | null;
+      expect(lastEl?.closest('.subsession-window')?.getAttribute('data-view-mode')).toBe('chat');
+    });
+
+    // Hide window -> clears registration cleanly so hidden windows do not leave stale refs
+    onInputRef.mockClear();
+    view.rerender(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={false}
+        visible={false}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        onInputRef={onInputRef}
+        zIndex={5000}
+        onFocus={vi.fn()}
+        serverId="srv-1"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(onInputRef).toHaveBeenCalledWith(null);
     });
   });
 });

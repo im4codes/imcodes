@@ -97,6 +97,7 @@ import {
   isMacPlatform,
   matchNavigationShortcutAction,
   readLegacyTabOrder,
+  resolveFocusedKeyboardViewMode,
   resolveKeyboardShortcuts,
   sortSessionsByTabOrder,
   type KeyboardShortcutOverrides,
@@ -5950,7 +5951,17 @@ function InternalMainApp() {
       if (isTextEntryElement(target) || isTextEntryElement(el)) return;
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') return;
 
-      const currentViewMode = viewModesRef.current[session] ?? defaultViewMode;
+      const focusedSubRecord = focusedSubId ? subSessionsRef.current.find((item) => item.id === focusedSubId) : undefined;
+      const currentViewMode = resolveFocusedKeyboardViewMode({
+        target,
+        activeElement: el,
+        focusedSubId,
+        isFocusedSubOpen: Boolean(focusedSubId && openSubIdsRef.current.has(focusedSubId)),
+        focusedSubType: focusedSubRecord?.type ?? null,
+        focusedSubSessionName: focusedSubRecord?.sessionName ?? null,
+        inputRefs: inputRefsMap.current,
+        fallbackMainViewMode: viewModesRef.current[session] ?? defaultViewMode,
+      });
       if (currentViewMode === 'chat') {
         // In chat mode: route Up/Down/Enter to chat input (history nav + send)
         const chatInput = inputRefsMap.current.get(session) ?? null;
@@ -6011,7 +6022,17 @@ function InternalMainApp() {
       const target = e.target as HTMLElement | null;
       const el = document.activeElement as HTMLElement | null;
       if (isTextEntryElement(target) || isTextEntryElement(el)) return;
-      const currentViewMode = viewModesRef.current[session] ?? defaultViewMode;
+      const focusedSubRecord = focusedSubId ? subSessionsRef.current.find((item) => item.id === focusedSubId) : undefined;
+      const currentViewMode = resolveFocusedKeyboardViewMode({
+        target,
+        activeElement: el,
+        focusedSubId,
+        isFocusedSubOpen: Boolean(focusedSubId && openSubIdsRef.current.has(focusedSubId)),
+        focusedSubType: focusedSubRecord?.type ?? null,
+        focusedSubSessionName: focusedSubRecord?.sessionName ?? null,
+        inputRefs: inputRefsMap.current,
+        fallbackMainViewMode: viewModesRef.current[session] ?? defaultViewMode,
+      });
       if (currentViewMode !== 'terminal') return;
       const text = e.clipboardData?.getData('text/plain') ?? '';
       if (!text) return;
@@ -7195,13 +7216,17 @@ function InternalMainApp() {
       if (!action) return;
 
       const subId = focusedSubIdRef.current;
-      let targetViewMode: ViewMode = viewModeNavRef.current;
-      if (subId) {
-        const subEl = inputRefsMap.current.get(`deck_sub_${subId}`);
-        const subDomMode = subEl?.closest?.('.subsession-window')?.getAttribute('data-view-mode');
-        if (subDomMode === 'terminal') targetViewMode = 'terminal';
-        else if (subDomMode === 'chat') targetViewMode = 'chat';
-      }
+      const subRecord = subId ? subSessionsRef.current.find((item) => item.id === subId) : undefined;
+      const targetViewMode = resolveFocusedKeyboardViewMode({
+        target: e.target,
+        activeElement: document.activeElement,
+        focusedSubId: subId,
+        isFocusedSubOpen: Boolean(subId && openSubIdsRef.current.has(subId)),
+        focusedSubType: subRecord?.type ?? null,
+        focusedSubSessionName: subRecord?.sessionName ?? null,
+        inputRefs: inputRefsMap.current,
+        fallbackMainViewMode: viewModeNavRef.current,
+      });
 
       if (!canHandleGlobalNavigationShortcut(e.target, document.activeElement, {
         hasBlockingOverlay: hasBlockingComposerOverlayRef.current,
@@ -7326,6 +7351,10 @@ function InternalMainApp() {
   const registerComposerInputRef = useCallback((sessionName: string, el: HTMLDivElement | null) => {
     if (el) {
       inputRefsMap.current.set(sessionName, el);
+      const subWin = el.closest?.('.subsession-window');
+      if (subWin?.getAttribute('data-view-mode') === 'terminal' && lastAutoFocusedRef.current?.element === el) {
+        lastAutoFocusedRef.current = null;
+      }
       const pending = pendingAutoFocusTargetRef.current;
       if (pending && pending.sessionName === sessionName) {
         attemptAutoFocusForTarget(pending);

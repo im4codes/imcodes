@@ -15,6 +15,7 @@ import {
   matchNavigationShortcutAction,
   normalizeShortcutChordString,
   parseShortcutChord,
+  resolveFocusedKeyboardViewMode,
   resolveKeyboardShortcuts,
   sanitizeShortcutOverrides,
   serializeShortcutChord,
@@ -299,5 +300,77 @@ describe('keyboard-shortcuts core helpers', () => {
     expect(focusComposerElement(composer, { moveCaretToEnd: true })).toBe(true);
     expect(document.activeElement).toBe(composer);
     composer.remove();
+  });
+
+  it('authoritatively resolves terminal vs chat view mode for focused sub-sessions without falling back to main chat', () => {
+    const subWin = document.createElement('div');
+    subWin.className = 'subsession-window subsession-window-active';
+    subWin.setAttribute('data-subsession-id', 'sub-1');
+    subWin.setAttribute('data-view-mode', 'terminal');
+    const modeBtn = document.createElement('button');
+    const subComposer = document.createElement('div');
+    subWin.appendChild(modeBtn);
+    subWin.appendChild(subComposer);
+    document.body.appendChild(subWin);
+
+    const inputRefs = new Map<string, Element>([['deck_sub_sub-1', subComposer]]);
+
+    // Focus inside subwindow chrome (header mode button) -> terminal
+    expect(resolveFocusedKeyboardViewMode({
+      target: modeBtn,
+      activeElement: modeBtn,
+      focusedSubId: 'sub-1',
+      isFocusedSubOpen: true,
+      inputRefs,
+      fallbackMainViewMode: 'chat',
+      doc: document,
+    })).toBe('terminal');
+
+    // Focus on document.body while terminal subwindow is active -> still terminal via inputRefs/DOM
+    expect(resolveFocusedKeyboardViewMode({
+      target: document.body,
+      activeElement: document.body,
+      focusedSubId: 'sub-1',
+      isFocusedSubOpen: true,
+      inputRefs,
+      fallbackMainViewMode: 'chat',
+      doc: document,
+    })).toBe('terminal');
+
+    // Missing inputRef while subwindow is open in terminal -> DOM attribute / fail-closed still resolves terminal
+    expect(resolveFocusedKeyboardViewMode({
+      target: document.body,
+      activeElement: document.body,
+      focusedSubId: 'sub-1',
+      isFocusedSubOpen: true,
+      inputRefs: new Map(),
+      fallbackMainViewMode: 'chat',
+      doc: document,
+    })).toBe('terminal');
+
+    // Toggling subwindow to chat -> resolves chat even if main session is terminal
+    subWin.setAttribute('data-view-mode', 'chat');
+    expect(resolveFocusedKeyboardViewMode({
+      target: subComposer,
+      activeElement: subComposer,
+      focusedSubId: 'sub-1',
+      isFocusedSubOpen: true,
+      inputRefs,
+      fallbackMainViewMode: 'terminal',
+      doc: document,
+    })).toBe('chat');
+
+    // Once subwindow closes -> falls back cleanly to main view mode
+    expect(resolveFocusedKeyboardViewMode({
+      target: document.body,
+      activeElement: document.body,
+      focusedSubId: 'sub-1',
+      isFocusedSubOpen: false,
+      inputRefs,
+      fallbackMainViewMode: 'chat',
+      doc: document,
+    })).toBe('chat');
+
+    subWin.remove();
   });
 });

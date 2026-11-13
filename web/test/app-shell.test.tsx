@@ -794,11 +794,12 @@ vi.mock('../src/components/SubSessionWindow.js', () => ({
       if (visible) onInputRefLatest.current?.(subComposerRef.current);
       else onInputRefLatest.current?.(null);
       return () => onInputRefLatest.current?.(null);
-    }, [visible, active]);
+    }, [visible, active, sub?.viewMode]);
     return (
     <div
       class="subsession-window"
       data-testid={`sub-session-window-${sub?.id}`}
+      data-subsession-id={sub?.id}
       data-view-mode={sub?.type === 'shell' ? 'terminal' : (sub?.viewMode ?? 'chat')}
       data-active={String(active)}
       data-visible={String(visible)}
@@ -810,6 +811,7 @@ vi.mock('../src/components/SubSessionWindow.js', () => ({
       onMouseDown={onFocus}
     >
       sub-session-window
+      <button type="button" class="subsession-mode-btn">sub-window-mode-btn-{sub?.id}</button>
       <div
         ref={subComposerRef}
         class="controls-input"
@@ -8492,6 +8494,74 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       await waitFor(() => expect(localStorage.getItem('rcc_server')).toBe('srv-2'));
     } finally {
       syncedPrefs.enabled = false;
+    }
+  }, 15000);
+
+  it('blocks tab-switching shortcuts when terminal subwindow header chrome has focus, while preserving chat subwindow navigation', async () => {
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-guard-term',
+        serverId: 'srv-1',
+        sessionName: 'deck_sub_sub-guard-term',
+        parentSession: 'deck_alpha_brain',
+        label: 'Terminal Sub',
+        type: 'codex',
+        state: 'idle',
+        viewMode: 'terminal',
+      },
+      {
+        id: 'sub-guard-chat',
+        serverId: 'srv-1',
+        sessionName: 'deck_sub_sub-guard-chat',
+        parentSession: 'deck_alpha_brain',
+        label: 'Chat Sub',
+        type: 'codex',
+        state: 'idle',
+        viewMode: 'chat',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Win32' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      render(<App />);
+
+      const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+
+      // Open terminal subwindow -> focus its header chrome mode button -> Ctrl+ArrowRight must NOT switch main tab
+      fireEvent.click(screen.getByText('subbar-open-sub-guard-term'));
+      const termRoot = await screen.findByTestId('sub-session-window-sub-guard-term');
+      expect(termRoot.getAttribute('data-view-mode')).toBe('terminal');
+      const headerBtn = screen.getByText('sub-window-mode-btn-sub-guard-term');
+      headerBtn.focus();
+      expect(document.activeElement).toBe(headerBtn);
+
+      const navFromHeader = new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', ctrlKey: true, bubbles: true, cancelable: true });
+      headerBtn.dispatchEvent(navFromHeader);
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+
+      // Also when focus moves to document.body while terminal subwindow stays active -> main tab stays unchanged
+      headerBtn.blur();
+      document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', ctrlKey: true, bubbles: true, cancelable: true }));
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+
+      // Open chat subwindow -> composer auto-focuses and Ctrl+ArrowRight DOES navigate main tabs
+      fireEvent.click(screen.getByText('subbar-open-sub-guard-chat'));
+      const chatSubComposer = await screen.findByTestId('sub-window-controls-input-sub-guard-chat');
+      await waitFor(() => expect(document.activeElement).toBe(chatSubComposer));
+      const chatNavEvt = new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', ctrlKey: true, bubbles: true, cancelable: true });
+      chatSubComposer.dispatchEvent(chatNavEvt);
+      expect(chatNavEvt.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
     }
   }, 15000);
 });

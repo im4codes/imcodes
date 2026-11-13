@@ -537,6 +537,81 @@ export function canHandleGlobalNavigationShortcut(
   return true;
 }
 
+/**
+ * Authoritatively resolve whether keyboard handling (navigation shortcuts or key passthrough)
+ * targets `'terminal'` or `'chat'`, preventing a focused terminal sub-session window from
+ * ever falling back to the underlying main session's `'chat'` mode.
+ */
+export function resolveFocusedKeyboardViewMode(options: {
+  target: EventTarget | null;
+  activeElement: Element | null;
+  focusedSubId: string | null;
+  isFocusedSubOpen: boolean;
+  focusedSubType?: string | null;
+  focusedSubSessionName?: string | null;
+  inputRefs: ReadonlyMap<string, Element>;
+  fallbackMainViewMode: 'terminal' | 'chat';
+  doc?: Document;
+}): 'terminal' | 'chat' {
+  const {
+    target,
+    activeElement,
+    focusedSubId,
+    isFocusedSubOpen,
+    focusedSubType,
+    focusedSubSessionName,
+    inputRefs,
+    fallbackMainViewMode,
+  } = options;
+
+  const targetEl = target instanceof Element ? target : null;
+  const domSubWin = (typeof targetEl?.closest === 'function' ? targetEl.closest('.subsession-window') : null)
+    ?? (typeof (activeElement as HTMLElement | null)?.closest === 'function' ? activeElement?.closest('.subsession-window') : null);
+  const directMode = domSubWin?.getAttribute('data-view-mode');
+  if (directMode === 'terminal' || directMode === 'chat') {
+    return directMode;
+  }
+
+  if (focusedSubId && isFocusedSubOpen) {
+    if (focusedSubType === 'shell' || focusedSubType === 'script') {
+      return 'terminal';
+    }
+    const subEl = (focusedSubSessionName ? inputRefs.get(focusedSubSessionName) : undefined)
+      ?? inputRefs.get(`deck_sub_${focusedSubId}`);
+    const refMode = typeof (subEl as HTMLElement | null)?.closest === 'function'
+      ? subEl?.closest('.subsession-window')?.getAttribute('data-view-mode')
+      : null;
+    if (refMode === 'terminal' || refMode === 'chat') {
+      return refMode;
+    }
+
+    const doc = options.doc
+      ?? (activeElement?.ownerDocument ?? (target instanceof Node ? target.ownerDocument : undefined))
+      ?? (typeof document !== 'undefined' ? document : undefined);
+    if (doc) {
+      const subWindows = doc.querySelectorAll('.subsession-window');
+      let activeFallback: 'terminal' | 'chat' | null = null;
+      for (let i = 0; i < subWindows.length; i += 1) {
+        const win = subWindows[i];
+        const winMode = win.getAttribute('data-view-mode');
+        if (winMode !== 'terminal' && winMode !== 'chat') continue;
+        if (win.getAttribute('data-subsession-id') === focusedSubId) {
+          return winMode;
+        }
+        if (win.classList.contains('subsession-window-active')) {
+          activeFallback = winMode;
+        }
+      }
+      if (activeFallback) return activeFallback;
+    }
+
+    // Never silently fall back to main-session chat when an open subwindow's mode could not be read.
+    return 'terminal';
+  }
+
+  return fallbackMainViewMode;
+}
+
 /** Focus a contentEditable composer `.controls-input` without scrolling the viewport. */
 export function focusComposerElement(
   el: HTMLElement | null | undefined,

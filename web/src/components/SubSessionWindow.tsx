@@ -515,7 +515,7 @@ export function SubSessionWindow({
   const onInputRefRef = useRef(onInputRef);
   onInputRefRef.current = onInputRef;
   useEffect(() => {
-    if (!visible || viewMode !== 'chat') {
+    if (!visible) {
       onInputRefRef.current?.(null);
       return;
     }
@@ -1032,6 +1032,7 @@ export function SubSessionWindow({
     <div
       ref={swipeBackRef}
       class={rootClass}
+      data-subsession-id={sub.id}
       data-view-mode={viewMode}
       style={style}
       // Capture phase: an inner widget (xterm with mouse reporting on, a
