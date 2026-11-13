@@ -212,12 +212,48 @@ async function readTextOption(
   return { ok: true, value: undefined };
 }
 
+function resolveAliasPair<T extends string>(
+  primary: T | undefined,
+  primaryName: string,
+  alias: T | undefined,
+  aliasName: string,
+): { ok: true; value?: T } | { ok: false; message: string } {
+  if (primary !== undefined && alias !== undefined && primary !== alias) {
+    return { ok: false, message: `Pass either ${primaryName} or ${aliasName}, not conflicting values` };
+  }
+  return { ok: true, value: primary ?? alias };
+}
+
+function readTimeoutOption(
+  timeoutMsOpt: string | undefined,
+  timeoutAliasOpt: string | undefined,
+  maxTimeoutMs: number,
+): { ok: true; value?: number } | { ok: false; message: string } {
+  const pair = resolveAliasPair(timeoutMsOpt, '--timeout-ms', timeoutAliasOpt, '--timeout');
+  if (!pair.ok) return pair;
+  if (pair.value === undefined) return { ok: true, value: undefined };
+  return parsePositiveInt(pair.value, timeoutMsOpt !== undefined ? '--timeout-ms' : '--timeout', maxTimeoutMs);
+}
+
+function readExpectedVersionOption(
+  versionOpt: string | undefined,
+  expectedVersionOpt: string | undefined,
+): { ok: true; value?: number } | { ok: false; message: string } {
+  const pair = resolveAliasPair(versionOpt, '--version', expectedVersionOpt, '--expected-version');
+  if (!pair.ok) return pair;
+  if (pair.value === undefined) return { ok: true, value: undefined };
+  return parsePositiveInt(pair.value, versionOpt !== undefined ? '--version' : '--expected-version');
+}
+
 async function readArgumentObjectOption(
+  argJsonOpt: string | undefined,
   inlineJson: string | undefined,
   filePath: string | undefined,
   cwd: string,
 ): Promise<{ ok: true; value?: Record<string, unknown> } | { ok: false; message: string }> {
-  const textRes = await readTextOption(inlineJson, filePath, 'argument', cwd);
+  const jsonPair = resolveAliasPair(argJsonOpt, '--arg-json', inlineJson, '--argument');
+  if (!jsonPair.ok) return jsonPair;
+  const textRes = await readTextOption(jsonPair.value, filePath, 'argument', cwd);
   if (!textRes.ok) return textRes;
   if (textRes.value === undefined) return { ok: true, value: undefined };
   let parsed: unknown;
@@ -226,13 +262,44 @@ async function readArgumentObjectOption(
   } catch (err) {
     return {
       ok: false,
-      message: `Invalid JSON for --argument: ${err instanceof Error ? err.message : String(err)}`,
+      message: `Invalid JSON for --arg-json/--argument: ${err instanceof Error ? err.message : String(err)}`,
     };
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    return { ok: false, message: '--argument must decode to a JSON object' };
+    return { ok: false, message: '--arg-json/--argument must decode to a JSON object' };
   }
   return { ok: true, value: parsed as Record<string, unknown> };
+}
+
+async function readLocalUploadFile(
+  rawPath: string,
+  overrideName: string | undefined,
+  cwd: string,
+): Promise<{
+  ok: true;
+  fileBytes: Buffer;
+  fileName: string;
+  mimeType?: string;
+} | { ok: false; message: string }> {
+  const resolvedPath = resolve(cwd, rawPath);
+  let fileBytes: Buffer;
+  try {
+    fileBytes = await readFile(resolvedPath);
+  } catch (err) {
+    return {
+      ok: false,
+      message: `Failed to read local file "${rawPath}": ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  if (fileBytes.length > CLOUD_DOCS_MAX_UPLOAD_BYTES) {
+    return {
+      ok: false,
+      message: `File exceeds maximum Cloud Docs upload size (${CLOUD_DOCS_MAX_UPLOAD_BYTES} bytes)`,
+    };
+  }
+  const fileName = sanitizeCloudDocTransferFilename(overrideName ?? rawPath);
+  const mimeType = getCloudDocMeta(overrideName ?? fileName)?.mimeType;
+  return { ok: true, fileBytes, fileName, ...(mimeType ? { mimeType } : {}) };
 }
 
 async function resolveOutFilePath(
@@ -411,13 +478,17 @@ export async function runCloudDocsCli(
   );
   listCmd
     .option('--folder <folderId>', 'Filter owned documents by parent folderId')
+    .option('--folder-id <folderId>', 'Alias for --folder')
     .option('--search <query>', 'Case-insensitive filename or folder search filter')
     .option('--recent', 'Also include recent documents')
-    .action(async (opts: { folder?: string; search?: string; recent?: boolean }, cmd: Command) => {
+    .action(async (opts: { folder?: string; folderId?: string; search?: string; recent?: boolean }, cmd: Command) => {
+      const flags = extractCommonFlags(cmd);
+      const folderPair = resolveAliasPair(opts.folder, '--folder', opts.folderId, '--folder-id');
+      if (!folderPair.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, folderPair.message, { json: flags.json });
       const ctx = await acquireCreds(cmd);
       if (!ctx) return;
       const res = await cloudDocListClient(ctx.creds, {
-        ...(opts.folder ? { folderId: opts.folder } : {}),
+        ...(folderPair.value ? { folderId: folderPair.value } : {}),
         ...(opts.search ? { search: opts.search } : {}),
         ...(opts.recent ? { includeRecent: true } : {}),
       });
@@ -445,13 +516,49 @@ export async function runCloudDocsCli(
 
   // 2. read
   const readCmd = addAuthAndFormatOptions(
-    configureCmd(program.command('read <docId>').description('Read extracted text, spreadsheet sheets, or presentation slides')),
+    configureCmd(program.command('read <docId>').description('Read extracted text, spreadsheet sheets, slides, or export converted bytes')),
   );
   readCmd
     .option('--max-chars <n>', `Maximum extracted characters (1..${CLOUD_DOC_CONTENT_MAX_CHARS})`)
-    .option('--out <path>', 'Write extracted readable text to a local file')
-    .action(async (docId: string, opts: { maxChars?: string; out?: string }, cmd: Command) => {
+    .option('--convert-to <ext>', `Convert and read/export as target format (${CLOUD_DOC_CONVERT_TARGET_TYPES.join(', ')})`)
+    .option('--out <path>', 'Write extracted text or converted binary output to a local file')
+    .action(async (docId: string, opts: { maxChars?: string; convertTo?: string; out?: string }, cmd: Command) => {
       const flags = extractCommonFlags(cmd);
+      if (opts.convertTo !== undefined) {
+        if (opts.maxChars !== undefined) {
+          return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, '--convert-to cannot be combined with --max-chars', { json: flags.json });
+        }
+        const targetType = opts.convertTo.trim().replace(/^\./, '').toLowerCase();
+        if (!isConvertTargetType(targetType)) {
+          return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, `--convert-to must be one of ${CLOUD_DOC_CONVERT_TARGET_TYPES.join(', ')}`, { json: flags.json });
+        }
+        const ctx = await acquireCreds(cmd);
+        if (!ctx) return;
+        const res = await cloudDocConvertClient(ctx.creds, {
+          docId,
+          targetType: targetType as CloudDocConvertTargetType,
+        });
+        await finishClientResult(res, ctx.flags.json, async (ok) => {
+          if ('bytesBase64' in ok && typeof ok.bytesBase64 === 'string') {
+            let savedTo: string | undefined;
+            if (opts.out) {
+              const bytes = Buffer.from(ok.bytesBase64, 'base64');
+              savedTo = await writeBinaryOutFile(opts.out, ok.fileName, bytes, cwd);
+            }
+            const payload = savedTo
+              ? { docId, fileName: ok.fileName, mimeType: ok.mimeType, bytesWritten: ok.bytesWritten, savedTo }
+              : { docId, ...ok };
+            const summary = savedTo
+              ? `Read (converted) ${ok.fileName} (${ok.bytesWritten} bytes) -> ${savedTo}`
+              : `Converted ${ok.fileName} (${ok.bytesWritten} bytes; pass --out <path> to write locally)`;
+            succeed(payload, summary, ctx.flags.json);
+            return;
+          }
+          succeed(ok, 'Converted document', ctx.flags.json);
+        });
+        return;
+      }
+
       let maxChars: number | undefined;
       if (opts.maxChars !== undefined) {
         const parsed = parsePositiveInt(opts.maxChars, '--max-chars', CLOUD_DOC_CONTENT_MAX_CHARS);
@@ -479,32 +586,42 @@ export async function runCloudDocsCli(
 
   // 3. create
   const createCmd = addAuthAndFormatOptions(
-    configureCmd(program.command('create').description('Create a Cloud Doc (docx/xlsx/pptx/md/txt) with optional content or DocBuilder script')),
+    configureCmd(program.command('create').description('Create a Cloud Doc (docx/xlsx/pptx/md/txt) with content, DocBuilder script, or local file')),
   );
   createCmd
     .option('--type <type>', `Document format (${CLOUD_DOC_CREATE_TYPES.join(', ')})`)
     .option('--name <name>', 'Document filename')
-    .option('--folder-id <folderId>', 'Parent folderId (defaults to root)')
+    .option('--folder <folderId>', 'Parent folderId (defaults to root)')
+    .option('--folder-id <folderId>', 'Alias for --folder')
     .option('--content <text>', 'Initial text/table/slide content')
     .option('--content-file <path>', 'Read initial content from a local UTF-8 file')
     .option('--script <js>', 'Optional ONLYOFFICE DocBuilder JS script')
     .option('--script-file <path>', 'Read ONLYOFFICE DocBuilder JS script from file')
-    .option('--argument <json>', 'Optional JSON object passed as Argument to DocBuilder')
+    .option('--arg-json <json>', 'Optional JSON object passed as Argument to DocBuilder')
+    .option('--argument <json>', 'Alias for --arg-json')
     .option('--argument-file <path>', 'Read JSON Argument object from file')
-    .option('--timeout <ms>', `DocBuilder execution timeout in ms (1..${CLOUD_DOC_DOCBUILDER_MAX_TIMEOUT_MS})`)
+    .option('--file <localPath>', 'Create document by uploading a local file')
+    .option('--timeout-ms <ms>', `DocBuilder execution timeout in ms (1..${CLOUD_DOC_DOCBUILDER_MAX_TIMEOUT_MS})`)
+    .option('--timeout <ms>', 'Alias for --timeout-ms')
     .action(async (opts: {
       type?: string;
       name?: string;
+      folder?: string;
       folderId?: string;
       content?: string;
       contentFile?: string;
       script?: string;
       scriptFile?: string;
+      argJson?: string;
       argument?: string;
       argumentFile?: string;
+      file?: string;
+      timeoutMs?: string;
       timeout?: string;
     }, cmd: Command) => {
       const flags = extractCommonFlags(cmd);
+      const folderPair = resolveAliasPair(opts.folder, '--folder', opts.folderId, '--folder-id');
+      if (!folderPair.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, folderPair.message, { json: flags.json });
       const contentRes = await readTextOption(opts.content, opts.contentFile, 'content', cwd);
       if (!contentRes.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, contentRes.message, { json: flags.json });
       if (contentRes.value !== undefined && contentRes.value.length > CLOUD_DOC_CONTENT_MAX_CHARS) {
@@ -512,14 +629,37 @@ export async function runCloudDocsCli(
       }
       const scriptRes = await readTextOption(opts.script, opts.scriptFile, 'script', cwd);
       if (!scriptRes.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, scriptRes.message, { json: flags.json });
-      const argRes = await readArgumentObjectOption(opts.argument, opts.argumentFile, cwd);
+      const argRes = await readArgumentObjectOption(opts.argJson, opts.argument, opts.argumentFile, cwd);
       if (!argRes.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, argRes.message, { json: flags.json });
+      const timeoutRes = readTimeoutOption(opts.timeoutMs, opts.timeout, CLOUD_DOC_DOCBUILDER_MAX_TIMEOUT_MS);
+      if (!timeoutRes.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, timeoutRes.message, { json: flags.json });
 
-      let timeoutMs: number | undefined;
-      if (opts.timeout !== undefined) {
-        const parsed = parsePositiveInt(opts.timeout, '--timeout', CLOUD_DOC_DOCBUILDER_MAX_TIMEOUT_MS);
-        if (!parsed.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, parsed.message, { json: flags.json });
-        timeoutMs = parsed.value;
+      if (opts.file !== undefined) {
+        if (contentRes.value !== undefined || scriptRes.value !== undefined || argRes.value !== undefined) {
+          return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, 'create --file cannot be combined with --content, --script, or --arg-json', { json: flags.json });
+        }
+        const local = await readLocalUploadFile(opts.file, opts.name, cwd);
+        if (!local.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, local.message, { json: flags.json });
+        if (opts.type !== undefined) {
+          const normalizedType = opts.type.trim().replace(/^\./, '').toLowerCase();
+          const fileExt = getCloudDocExt(local.fileName)?.replace(/^\./, '').toLowerCase();
+          if (fileExt && normalizedType && fileExt !== normalizedType) {
+            return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, `--type "${normalizedType}" conflicts with uploaded file extension ".${fileExt}"`, { json: flags.json });
+          }
+        }
+        const ctx = await acquireCreds(cmd);
+        if (!ctx) return;
+        const res = await cloudDocUploadFileClient(ctx.creds, {
+          fileBytes: local.fileBytes,
+          fileName: local.fileName,
+          ...(opts.name !== undefined ? { name: opts.name } : {}),
+          ...(folderPair.value !== undefined ? { folderId: folderPair.value } : {}),
+          ...(local.mimeType ? { mimeType: local.mimeType } : {}),
+        });
+        await finishClientResult(res, ctx.flags.json, (ok) => {
+          succeed(ok, formatDocSummary(ok.doc, 'Created from file'), ctx.flags.json);
+        });
+        return;
       }
 
       let rawType = opts.type?.trim().replace(/^\./, '').toLowerCase();
@@ -530,7 +670,7 @@ export async function runCloudDocsCli(
       if (!rawType || !(CLOUD_DOC_CREATE_TYPES as readonly string[]).includes(rawType)) {
         return fail(
           MCP_ERROR_REASONS.VALIDATION_FAILED,
-          `--type must be one of ${CLOUD_DOC_CREATE_TYPES.join(', ')} (or provide --name with a matching extension)`,
+          `--type must be one of ${CLOUD_DOC_CREATE_TYPES.join(', ')} (or provide --name/--file with a matching extension)`,
           { json: flags.json },
         );
       }
@@ -541,11 +681,11 @@ export async function runCloudDocsCli(
         kind: 'doc',
         type: rawType as CloudDocCreateType,
         ...(opts.name !== undefined ? { name: opts.name } : {}),
-        ...(opts.folderId !== undefined ? { folderId: opts.folderId } : {}),
+        ...(folderPair.value !== undefined ? { folderId: folderPair.value } : {}),
         ...(contentRes.value !== undefined ? { content: contentRes.value } : {}),
         ...(scriptRes.value !== undefined ? { engine: 'docbuilder' as const, docbuilderScript: scriptRes.value } : {}),
         ...(argRes.value !== undefined ? { argument: argRes.value } : {}),
-        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+        ...(timeoutRes.value !== undefined ? { timeoutMs: timeoutRes.value } : {}),
       });
       await finishClientResult(res, ctx.flags.json, (ok) => {
         const text = ok.doc ? formatDocSummary(ok.doc, 'Created') : 'Created';
@@ -559,15 +699,20 @@ export async function runCloudDocsCli(
   );
   mkdirCmd
     .option('--parent <folderId>', 'Parent folderId')
+    .option('--folder <folderId>', 'Alias for --parent')
     .option('--folder-id <folderId>', 'Alias for --parent')
-    .action(async (name: string, opts: { parent?: string; folderId?: string }, cmd: Command) => {
+    .action(async (name: string, opts: { parent?: string; folder?: string; folderId?: string }, cmd: Command) => {
+      const flags = extractCommonFlags(cmd);
+      const folderAlias = resolveAliasPair(opts.folder, '--folder', opts.folderId, '--folder-id');
+      if (!folderAlias.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, folderAlias.message, { json: flags.json });
+      const parentPair = resolveAliasPair(opts.parent, '--parent', folderAlias.value, '--folder');
+      if (!parentPair.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, parentPair.message, { json: flags.json });
       const ctx = await acquireCreds(cmd);
       if (!ctx) return;
-      const parentId = opts.parent ?? opts.folderId;
       const res = await cloudDocCreateClient(ctx.creds, {
         kind: 'folder',
         name,
-        ...(parentId !== undefined ? { folderId: parentId } : {}),
+        ...(parentPair.value !== undefined ? { folderId: parentPair.value } : {}),
       });
       await finishClientResult(res, ctx.flags.json, (ok) => {
         const folder = ok.folder;
@@ -578,36 +723,54 @@ export async function runCloudDocsCli(
 
   // 5. edit
   const editCmd = addAuthAndFormatOptions(
-    configureCmd(program.command('edit <docId>').description('Edit document content/DocBuilder script, rename, or move')),
+    configureCmd(program.command('edit <docId>').description('Edit document content, run DocBuilder, replace file, rename, or move')),
   );
   editCmd
     .option('--content <text>', 'Updated text/table/slide content')
     .option('--content-file <path>', 'Read updated content from local UTF-8 file')
     .option('--mode <mode>', `Edit mode: ${CLOUD_DOC_EDIT_MODES.join(' | ')}`)
-    .option('--expected-version <n>', 'Optimistic CAS version check')
+    .option('--version <n>', 'Optimistic CAS version check')
+    .option('--expected-version <n>', 'Alias for --version')
     .option('--name <name>', 'Rename document')
-    .option('--folder-id <folderId>', 'Move document to destination folderId (use "null" for own root)')
+    .option('--folder <folderId>', 'Move document to destination folderId (use "null" for own root)')
+    .option('--folder-id <folderId>', 'Alias for --folder')
     .option('--root', 'Move document to owner root folder (folderId=null)')
+    .option('--file <localPath>', 'Replace Cloud Doc binary in-place from local file')
     .option('--script <js>', 'ONLYOFFICE DocBuilder JS script for engine=docbuilder edit')
     .option('--script-file <path>', 'Read ONLYOFFICE DocBuilder JS script from file')
-    .option('--argument <json>', 'Optional JSON object passed as Argument to DocBuilder')
+    .option('--arg-json <json>', 'Optional JSON object passed as Argument to DocBuilder')
+    .option('--argument <json>', 'Alias for --arg-json')
     .option('--argument-file <path>', 'Read JSON Argument object from file')
-    .option('--timeout <ms>', `DocBuilder timeout in ms (1..${CLOUD_DOC_DOCBUILDER_MAX_TIMEOUT_MS})`)
+    .option('--no-save', 'With --script/--script-file, run DocBuilder without overwriting the stored document')
+    .option('--out <path>', 'With --no-save, write exported binary bytes to local path')
+    .option('--timeout-ms <ms>', `DocBuilder timeout in ms (1..${CLOUD_DOC_DOCBUILDER_MAX_TIMEOUT_MS})`)
+    .option('--timeout <ms>', 'Alias for --timeout-ms')
     .action(async (docId: string, opts: {
       content?: string;
       contentFile?: string;
       mode?: string;
+      version?: string;
       expectedVersion?: string;
       name?: string;
+      folder?: string;
       folderId?: string;
       root?: boolean;
+      file?: string;
       script?: string;
       scriptFile?: string;
+      argJson?: string;
       argument?: string;
       argumentFile?: string;
+      save?: boolean;
+      out?: string;
+      timeoutMs?: string;
       timeout?: string;
     }, cmd: Command) => {
       const flags = extractCommonFlags(cmd);
+      const folderPair = resolveAliasPair(opts.folder, '--folder', opts.folderId, '--folder-id');
+      if (!folderPair.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, folderPair.message, { json: flags.json });
+      const versionRes = readExpectedVersionOption(opts.version, opts.expectedVersion);
+      if (!versionRes.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, versionRes.message, { json: flags.json });
       const contentRes = await readTextOption(opts.content, opts.contentFile, 'content', cwd);
       if (!contentRes.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, contentRes.message, { json: flags.json });
       if (contentRes.value !== undefined && contentRes.value.length > CLOUD_DOC_CONTENT_MAX_CHARS) {
@@ -615,36 +778,92 @@ export async function runCloudDocsCli(
       }
       const scriptRes = await readTextOption(opts.script, opts.scriptFile, 'script', cwd);
       if (!scriptRes.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, scriptRes.message, { json: flags.json });
-      const argRes = await readArgumentObjectOption(opts.argument, opts.argumentFile, cwd);
+      const argRes = await readArgumentObjectOption(opts.argJson, opts.argument, opts.argumentFile, cwd);
       if (!argRes.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, argRes.message, { json: flags.json });
+      const timeoutRes = readTimeoutOption(opts.timeoutMs, opts.timeout, CLOUD_DOC_DOCBUILDER_MAX_TIMEOUT_MS);
+      if (!timeoutRes.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, timeoutRes.message, { json: flags.json });
 
       if (opts.mode !== undefined && !(CLOUD_DOC_EDIT_MODES as readonly string[]).includes(opts.mode)) {
         return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, `--mode must be one of ${CLOUD_DOC_EDIT_MODES.join(', ')}`, { json: flags.json });
       }
-      let expectedVersion: number | undefined;
-      if (opts.expectedVersion !== undefined) {
-        const parsed = parsePositiveInt(opts.expectedVersion, '--expected-version');
-        if (!parsed.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, parsed.message, { json: flags.json });
-        expectedVersion = parsed.value;
-      }
-      let timeoutMs: number | undefined;
-      if (opts.timeout !== undefined) {
-        const parsed = parsePositiveInt(opts.timeout, '--timeout', CLOUD_DOC_DOCBUILDER_MAX_TIMEOUT_MS);
-        if (!parsed.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, parsed.message, { json: flags.json });
-        timeoutMs = parsed.value;
-      }
-
-      if (opts.root && opts.folderId !== undefined) {
-        return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, 'Pass either --root or --folder-id, not both', { json: flags.json });
+      if (opts.root && folderPair.value !== undefined) {
+        return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, 'Pass either --root or --folder/--folder-id, not both', { json: flags.json });
       }
       const folderId = opts.root
         ? null
-        : opts.folderId === 'null'
+        : folderPair.value === 'null'
           ? null
-          : opts.folderId;
+          : folderPair.value;
+
+      if (opts.file !== undefined) {
+        if (contentRes.value !== undefined || scriptRes.value !== undefined || argRes.value !== undefined || opts.mode !== undefined || opts.save === false || opts.out !== undefined) {
+          return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, 'edit --file cannot be combined with --content, --script, --mode, --no-save, or --out', { json: flags.json });
+        }
+        const local = await readLocalUploadFile(opts.file, opts.name, cwd);
+        if (!local.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, local.message, { json: flags.json });
+        const ctx = await acquireCreds(cmd);
+        if (!ctx) return;
+        const res = await cloudDocReplaceFileClient(ctx.creds, {
+          docId,
+          fileBytes: local.fileBytes,
+          fileName: local.fileName,
+          ...(opts.name !== undefined ? { name: opts.name } : {}),
+          ...(folderId !== undefined ? { folderId } : {}),
+          ...(versionRes.value !== undefined ? { expectedVersion: versionRes.value } : {}),
+          ...(local.mimeType ? { mimeType: local.mimeType } : {}),
+        });
+        await finishClientResult(res, ctx.flags.json, (ok) => {
+          succeed(ok, formatDocSummary(ok.doc, 'Replaced file'), ctx.flags.json);
+        });
+        return;
+      }
+
+      if (opts.save === false) {
+        if (!scriptRes.value || !scriptRes.value.trim()) {
+          return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, 'edit --no-save requires --script or --script-file', { json: flags.json });
+        }
+        if (contentRes.value !== undefined || opts.mode !== undefined) {
+          return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, 'edit --no-save cannot be combined with --content or --mode', { json: flags.json });
+        }
+        const ctx = await acquireCreds(cmd);
+        if (!ctx) return;
+        const res = await cloudDocDocBuilderEditClient(ctx.creds, {
+          docId,
+          script: scriptRes.value,
+          ...(argRes.value !== undefined ? { argument: argRes.value } : {}),
+          save: false,
+          ...(versionRes.value !== undefined ? { expectedVersion: versionRes.value } : {}),
+          ...(opts.name !== undefined ? { name: opts.name } : {}),
+          ...(folderId !== undefined ? { folderId } : {}),
+          ...(timeoutRes.value !== undefined ? { timeoutMs: timeoutRes.value } : {}),
+        });
+        await finishClientResult(res, ctx.flags.json, async (ok) => {
+          if ('bytesBase64' in ok && typeof ok.bytesBase64 === 'string') {
+            let savedTo: string | undefined;
+            if (opts.out) {
+              const bytes = Buffer.from(ok.bytesBase64, 'base64');
+              savedTo = await writeBinaryOutFile(opts.out, ok.outputName, bytes, cwd);
+            }
+            const payload = savedTo
+              ? { doc: ok.doc, outputName: ok.outputName, mimeType: ok.mimeType, bytesWritten: ok.bytesWritten, savedTo }
+              : ok;
+            const summary = savedTo
+              ? `Exported via edit --no-save: ${ok.outputName} (${ok.bytesWritten} bytes) -> ${savedTo}`
+              : `Exported via edit --no-save: ${ok.outputName} (${ok.bytesWritten} bytes; pass --out <path> to write locally)`;
+            succeed(payload, summary, ctx.flags.json);
+            return;
+          }
+          succeed(ok, formatDocSummary(ok.doc, 'Updated via DocBuilder'), ctx.flags.json);
+        });
+        return;
+      }
+
+      if (opts.out !== undefined) {
+        return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, '--out on edit requires --no-save', { json: flags.json });
+      }
 
       if (contentRes.value === undefined && scriptRes.value === undefined && opts.name === undefined && folderId === undefined) {
-        return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, 'edit requires --content/--content-file, --script/--script-file, --name, or --folder-id/--root', { json: flags.json });
+        return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, 'edit requires --content/--content-file, --script/--script-file, --file, --name, or --folder/--root', { json: flags.json });
       }
 
       const ctx = await acquireCreds(cmd);
@@ -653,12 +872,12 @@ export async function runCloudDocsCli(
         docId,
         ...(contentRes.value !== undefined ? { content: contentRes.value } : {}),
         ...(opts.mode !== undefined ? { mode: opts.mode as CloudDocEditMode } : {}),
-        ...(expectedVersion !== undefined ? { expectedVersion } : {}),
+        ...(versionRes.value !== undefined ? { expectedVersion: versionRes.value } : {}),
         ...(opts.name !== undefined ? { name: opts.name } : {}),
         ...(folderId !== undefined ? { folderId } : {}),
         ...(scriptRes.value !== undefined ? { engine: 'docbuilder' as const, docbuilderScript: scriptRes.value } : {}),
         ...(argRes.value !== undefined ? { argument: argRes.value } : {}),
-        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+        ...(timeoutRes.value !== undefined ? { timeoutMs: timeoutRes.value } : {}),
       });
       await finishClientResult(res, ctx.flags.json, (ok) => {
         succeed(ok, formatDocSummary(ok.doc, 'Updated'), ctx.flags.json);
@@ -670,61 +889,75 @@ export async function runCloudDocsCli(
     configureCmd(program.command('builder [docId]').description('Run an ONLYOFFICE Document Builder JS script (create new doc or edit/export existing doc)')),
   );
   builderCmd
-    .option('--type <ext>', `Target document format for new doc (${CLOUD_DOC_DOCBUILDER_OUTPUT_TYPES.join(', ')})`)
+    .option('--type <ext>', `Target document format (${CLOUD_DOC_DOCBUILDER_OUTPUT_TYPES.join(', ')})`)
     .option('--name <name>', 'Remote document filename')
-    .option('--folder-id <folderId>', 'Destination folderId')
+    .option('--folder <folderId>', 'Destination folderId')
+    .option('--folder-id <folderId>', 'Alias for --folder')
     .option('--root', 'Move existing doc to owner root folder (folderId=null)')
     .option('--script <js>', 'ONLYOFFICE DocBuilder JS script')
     .option('--script-file <path>', 'Read ONLYOFFICE DocBuilder JS script from local file')
-    .option('--argument <json>', 'JSON object passed as Argument in DocBuilder')
+    .option('--arg-json <json>', 'JSON object passed as Argument in DocBuilder')
+    .option('--argument <json>', 'Alias for --arg-json')
     .option('--argument-file <path>', 'Read JSON Argument object from local file')
-    .option('--output-type <ext>', 'Requested output format when editing/exporting existing doc')
+    .option('--output-type <ext>', 'Requested output format when editing/exporting existing doc (alias for --type)')
     .option('--output-name <name>', 'Expected filename produced by builder.SaveFile(...)')
     .option('--save', 'Persist output back to the existing Cloud Doc (default true when docId supplied)', true)
     .option('--no-save', 'Do not overwrite Cloud Doc; return/write exported bytes instead')
-    .option('--expected-version <n>', 'Optimistic CAS version check when saving existing doc')
+    .option('--version <n>', 'Optimistic CAS version check when saving existing doc')
+    .option('--expected-version <n>', 'Alias for --version')
     .option('--out <path>', 'Write exported bytes (when --no-save) to a local file')
-    .option('--timeout <ms>', `Execution timeout in ms (1..${CLOUD_DOC_DOCBUILDER_MAX_TIMEOUT_MS})`)
+    .option('--timeout-ms <ms>', `Execution timeout in ms (1..${CLOUD_DOC_DOCBUILDER_MAX_TIMEOUT_MS})`)
+    .option('--timeout <ms>', 'Alias for --timeout-ms')
     .action(async (docId: string | undefined, opts: {
       type?: string;
       name?: string;
+      folder?: string;
       folderId?: string;
       root?: boolean;
       script?: string;
       scriptFile?: string;
+      argJson?: string;
       argument?: string;
       argumentFile?: string;
       outputType?: string;
       outputName?: string;
       save?: boolean;
+      version?: string;
       expectedVersion?: string;
       out?: string;
+      timeoutMs?: string;
       timeout?: string;
     }, cmd: Command) => {
       const flags = extractCommonFlags(cmd);
+      const folderPair = resolveAliasPair(opts.folder, '--folder', opts.folderId, '--folder-id');
+      if (!folderPair.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, folderPair.message, { json: flags.json });
+      const versionRes = readExpectedVersionOption(opts.version, opts.expectedVersion);
+      if (!versionRes.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, versionRes.message, { json: flags.json });
       const scriptRes = await readTextOption(opts.script, opts.scriptFile, 'script', cwd);
       if (!scriptRes.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, scriptRes.message, { json: flags.json });
       if (!scriptRes.value || !scriptRes.value.trim()) {
         return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, 'builder requires --script or --script-file', { json: flags.json });
       }
-      const argRes = await readArgumentObjectOption(opts.argument, opts.argumentFile, cwd);
+      const argRes = await readArgumentObjectOption(opts.argJson, opts.argument, opts.argumentFile, cwd);
       if (!argRes.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, argRes.message, { json: flags.json });
+      const timeoutRes = readTimeoutOption(opts.timeoutMs, opts.timeout, CLOUD_DOC_DOCBUILDER_MAX_TIMEOUT_MS);
+      if (!timeoutRes.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, timeoutRes.message, { json: flags.json });
 
-      let timeoutMs: number | undefined;
-      if (opts.timeout !== undefined) {
-        const parsed = parsePositiveInt(opts.timeout, '--timeout', CLOUD_DOC_DOCBUILDER_MAX_TIMEOUT_MS);
-        if (!parsed.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, parsed.message, { json: flags.json });
-        timeoutMs = parsed.value;
-      }
+      const normalizedType = opts.type !== undefined ? opts.type.trim().replace(/^\./, '').toLowerCase() : undefined;
+      const normalizedOutputType = opts.outputType !== undefined ? opts.outputType.trim().replace(/^\./, '').toLowerCase() : undefined;
+      const typePair = resolveAliasPair(normalizedOutputType, '--output-type', normalizedType, '--type');
+      if (!typePair.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, typePair.message, { json: flags.json });
 
       if (!docId) {
+        if (opts.root) {
+          return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, '--root requires an existing <docId>', { json: flags.json });
+        }
         let createType: CloudDocDocBuilderOutputType | undefined;
-        if (opts.type !== undefined) {
-          const normalized = opts.type.trim().replace(/^\./, '').toLowerCase();
-          if (!isDocBuilderOutputType(normalized)) {
+        if (typePair.value !== undefined) {
+          if (!isDocBuilderOutputType(typePair.value)) {
             return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, `--type must be one of ${CLOUD_DOC_DOCBUILDER_OUTPUT_TYPES.join(', ')}`, { json: flags.json });
           }
-          createType = normalized;
+          createType = typePair.value;
         }
         const ctx = await acquireCreds(cmd);
         if (!ctx) return;
@@ -732,10 +965,10 @@ export async function runCloudDocsCli(
           script: scriptRes.value,
           ...(createType ? { type: createType } : {}),
           ...(opts.name !== undefined ? { name: opts.name } : {}),
-          ...(opts.folderId !== undefined ? { folderId: opts.folderId } : {}),
+          ...(folderPair.value !== undefined ? { folderId: folderPair.value } : {}),
           ...(argRes.value !== undefined ? { argument: argRes.value } : {}),
           ...(opts.outputName !== undefined ? { outputName: opts.outputName } : {}),
-          ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+          ...(timeoutRes.value !== undefined ? { timeoutMs: timeoutRes.value } : {}),
         });
         await finishClientResult(res, ctx.flags.json, (ok) => {
           succeed(ok, formatDocSummary(ok.doc, 'Created via DocBuilder'), ctx.flags.json);
@@ -744,23 +977,16 @@ export async function runCloudDocsCli(
       }
 
       let outputType: CloudDocDocBuilderOutputType | undefined;
-      if (opts.outputType !== undefined) {
-        const normalized = opts.outputType.trim().replace(/^\./, '').toLowerCase();
-        if (!isDocBuilderOutputType(normalized)) {
-          return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, `--output-type must be one of ${CLOUD_DOC_DOCBUILDER_OUTPUT_TYPES.join(', ')}`, { json: flags.json });
+      if (typePair.value !== undefined) {
+        if (!isDocBuilderOutputType(typePair.value)) {
+          return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, `--output-type/--type must be one of ${CLOUD_DOC_DOCBUILDER_OUTPUT_TYPES.join(', ')}`, { json: flags.json });
         }
-        outputType = normalized;
+        outputType = typePair.value;
       }
-      let expectedVersion: number | undefined;
-      if (opts.expectedVersion !== undefined) {
-        const parsed = parsePositiveInt(opts.expectedVersion, '--expected-version');
-        if (!parsed.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, parsed.message, { json: flags.json });
-        expectedVersion = parsed.value;
+      if (opts.root && folderPair.value !== undefined) {
+        return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, 'Pass either --root or --folder/--folder-id, not both', { json: flags.json });
       }
-      if (opts.root && opts.folderId !== undefined) {
-        return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, 'Pass either --root or --folder-id, not both', { json: flags.json });
-      }
-      const folderId = opts.root ? null : opts.folderId === 'null' ? null : opts.folderId;
+      const folderId = opts.root ? null : folderPair.value === 'null' ? null : folderPair.value;
 
       const ctx = await acquireCreds(cmd);
       if (!ctx) return;
@@ -771,10 +997,10 @@ export async function runCloudDocsCli(
         ...(outputType ? { outputType } : {}),
         ...(opts.outputName !== undefined ? { outputName: opts.outputName } : {}),
         save: opts.save !== false,
-        ...(expectedVersion !== undefined ? { expectedVersion } : {}),
+        ...(versionRes.value !== undefined ? { expectedVersion: versionRes.value } : {}),
         ...(opts.name !== undefined ? { name: opts.name } : {}),
         ...(folderId !== undefined ? { folderId } : {}),
-        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+        ...(timeoutRes.value !== undefined ? { timeoutMs: timeoutRes.value } : {}),
       });
       await finishClientResult(res, ctx.flags.json, async (ok) => {
         if ('bytesBase64' in ok && typeof ok.bytesBase64 === 'string') {
@@ -812,27 +1038,29 @@ export async function runCloudDocsCli(
     .option('--out <path>', 'Write converted binary output to local path')
     .option('--save-as-new', 'Save converted document as a new Cloud Doc on the server')
     .option('--name <name>', 'Output filename')
-    .option('--folder-id <folderId>', 'Destination folderId when --save-as-new is set')
-    .option('--timeout <ms>', `Conversion timeout in ms (1..${CLOUD_DOC_CONVERT_MAX_TIMEOUT_MS})`)
+    .option('--folder <folderId>', 'Destination folderId when --save-as-new is set')
+    .option('--folder-id <folderId>', 'Alias for --folder')
+    .option('--timeout-ms <ms>', `Conversion timeout in ms (1..${CLOUD_DOC_CONVERT_MAX_TIMEOUT_MS})`)
+    .option('--timeout <ms>', 'Alias for --timeout-ms')
     .action(async (docId: string, opts: {
       to: string;
       out?: string;
       saveAsNew?: boolean;
       name?: string;
+      folder?: string;
       folderId?: string;
+      timeoutMs?: string;
       timeout?: string;
     }, cmd: Command) => {
       const flags = extractCommonFlags(cmd);
+      const folderPair = resolveAliasPair(opts.folder, '--folder', opts.folderId, '--folder-id');
+      if (!folderPair.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, folderPair.message, { json: flags.json });
       const targetType = opts.to.trim().replace(/^\./, '').toLowerCase();
       if (!isConvertTargetType(targetType)) {
         return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, `--to must be one of ${CLOUD_DOC_CONVERT_TARGET_TYPES.join(', ')}`, { json: flags.json });
       }
-      let timeoutMs: number | undefined;
-      if (opts.timeout !== undefined) {
-        const parsed = parsePositiveInt(opts.timeout, '--timeout', CLOUD_DOC_CONVERT_MAX_TIMEOUT_MS);
-        if (!parsed.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, parsed.message, { json: flags.json });
-        timeoutMs = parsed.value;
-      }
+      const timeoutRes = readTimeoutOption(opts.timeoutMs, opts.timeout, CLOUD_DOC_CONVERT_MAX_TIMEOUT_MS);
+      if (!timeoutRes.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, timeoutRes.message, { json: flags.json });
 
       const ctx = await acquireCreds(cmd);
       if (!ctx) return;
@@ -841,8 +1069,8 @@ export async function runCloudDocsCli(
         targetType: targetType as CloudDocConvertTargetType,
         ...(opts.saveAsNew ? { saveAsNew: true } : {}),
         ...(opts.name !== undefined ? { name: opts.name } : {}),
-        ...(opts.folderId !== undefined ? { folderId: opts.folderId } : {}),
-        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+        ...(folderPair.value !== undefined ? { folderId: folderPair.value } : {}),
+        ...(timeoutRes.value !== undefined ? { timeoutMs: timeoutRes.value } : {}),
       });
       await finishClientResult(res, ctx.flags.json, async (ok) => {
         if ('bytesBase64' in ok && typeof ok.bytesBase64 === 'string') {
@@ -873,71 +1101,57 @@ export async function runCloudDocsCli(
   uploadCmd
     .option('--file <path>', 'Local file path to upload')
     .option('--name <name>', 'Override Cloud Doc filename')
-    .option('--folder-id <folderId>', 'Destination folderId')
-    .option('--root', 'When used with --replace, move doc to owner root folder (folderId=null)')
-    .option('--replace <docId>', 'Replace an existing Cloud Doc binary in-place (PUT /api/cloud-docs/:id/file)')
-    .option('--expected-version <n>', 'Optimistic CAS version check when using --replace')
+    .option('--folder <folderId>', 'Destination folderId')
+    .option('--folder-id <folderId>', 'Alias for --folder')
+    .option('--root', 'When used with --doc-id/--replace, move doc to owner root folder (folderId=null)')
+    .option('--doc-id <id>', 'Replace an existing Cloud Doc binary in-place (PUT /api/cloud-docs/:id/file)')
+    .option('--replace <id>', 'Alias for --doc-id')
+    .option('--version <n>', 'Optimistic CAS version check when replacing an existing Cloud Doc')
+    .option('--expected-version <n>', 'Alias for --version')
     .action(async (localFileArg: string | undefined, opts: {
       file?: string;
       name?: string;
+      folder?: string;
       folderId?: string;
       root?: boolean;
+      docId?: string;
       replace?: string;
+      version?: string;
       expectedVersion?: string;
     }, cmd: Command) => {
       const flags = extractCommonFlags(cmd);
-      if (localFileArg && opts.file && localFileArg !== opts.file) {
-        return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, 'Pass local file as positional arg or --file, not conflicting values', { json: flags.json });
-      }
-      const rawPath = (opts.file ?? localFileArg ?? '').trim();
+      const filePair = resolveAliasPair(localFileArg, '<localFile>', opts.file, '--file');
+      if (!filePair.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, filePair.message, { json: flags.json });
+      const rawPath = (filePair.value ?? '').trim();
       if (!rawPath) {
         return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, 'upload requires <localFile> or --file <path>', { json: flags.json });
       }
-      if (opts.root && opts.folderId !== undefined) {
-        return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, 'Pass either --root or --folder-id, not both', { json: flags.json });
+      const folderPair = resolveAliasPair(opts.folder, '--folder', opts.folderId, '--folder-id');
+      if (!folderPair.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, folderPair.message, { json: flags.json });
+      if (opts.root && folderPair.value !== undefined) {
+        return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, 'Pass either --root or --folder/--folder-id, not both', { json: flags.json });
       }
-      let expectedVersion: number | undefined;
-      if (opts.expectedVersion !== undefined) {
-        const parsed = parsePositiveInt(opts.expectedVersion, '--expected-version');
-        if (!parsed.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, parsed.message, { json: flags.json });
-        expectedVersion = parsed.value;
-      }
+      const docIdPair = resolveAliasPair(opts.docId, '--doc-id', opts.replace, '--replace');
+      if (!docIdPair.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, docIdPair.message, { json: flags.json });
+      const versionRes = readExpectedVersionOption(opts.version, opts.expectedVersion);
+      if (!versionRes.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, versionRes.message, { json: flags.json });
 
-      const resolvedPath = resolve(cwd, rawPath);
-      let fileBytes: Buffer;
-      try {
-        fileBytes = await readFile(resolvedPath);
-      } catch (err) {
-        return fail(
-          MCP_ERROR_REASONS.VALIDATION_FAILED,
-          `Failed to read local file "${rawPath}": ${err instanceof Error ? err.message : String(err)}`,
-          { json: flags.json },
-        );
-      }
-      if (fileBytes.length > CLOUD_DOCS_MAX_UPLOAD_BYTES) {
-        return fail(
-          MCP_ERROR_REASONS.VALIDATION_FAILED,
-          `File exceeds maximum Cloud Docs upload size (${CLOUD_DOCS_MAX_UPLOAD_BYTES} bytes)`,
-          { json: flags.json },
-        );
-      }
-
-      const inferredName = sanitizeCloudDocTransferFilename(opts.name ?? rawPath);
-      const mimeType = getCloudDocMeta(opts.name ?? inferredName)?.mimeType;
-      const folderId = opts.root ? null : opts.folderId === 'null' ? null : opts.folderId;
+      const local = await readLocalUploadFile(rawPath, opts.name, cwd);
+      if (!local.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, local.message, { json: flags.json });
+      const folderId = opts.root ? null : folderPair.value === 'null' ? null : folderPair.value;
 
       const ctx = await acquireCreds(cmd);
       if (!ctx) return;
 
-      if (opts.replace) {
+      if (docIdPair.value) {
         const res = await cloudDocReplaceFileClient(ctx.creds, {
-          docId: opts.replace,
-          fileBytes,
-          fileName: inferredName,
+          docId: docIdPair.value,
+          fileBytes: local.fileBytes,
+          fileName: local.fileName,
           ...(opts.name !== undefined ? { name: opts.name } : {}),
           ...(folderId !== undefined ? { folderId } : {}),
-          ...(expectedVersion !== undefined ? { expectedVersion } : {}),
-          ...(mimeType ? { mimeType } : {}),
+          ...(versionRes.value !== undefined ? { expectedVersion: versionRes.value } : {}),
+          ...(local.mimeType ? { mimeType: local.mimeType } : {}),
         });
         await finishClientResult(res, ctx.flags.json, (ok) => {
           succeed(ok, formatDocSummary(ok.doc, 'Replaced file'), ctx.flags.json);
@@ -946,11 +1160,11 @@ export async function runCloudDocsCli(
       }
 
       const res = await cloudDocUploadFileClient(ctx.creds, {
-        fileBytes,
-        fileName: inferredName,
+        fileBytes: local.fileBytes,
+        fileName: local.fileName,
         ...(opts.name !== undefined ? { name: opts.name } : {}),
         ...(folderId !== undefined ? { folderId } : {}),
-        ...(mimeType ? { mimeType } : {}),
+        ...(local.mimeType ? { mimeType: local.mimeType } : {}),
       });
       await finishClientResult(res, ctx.flags.json, (ok) => {
         succeed(ok, formatDocSummary(ok.doc, 'Uploaded'), ctx.flags.json);
@@ -1008,11 +1222,18 @@ export async function runCloudDocsCli(
   addAuthAndFormatOptions(shareCmd, true);
 
   addAuthAndFormatOptions(
-    configureCmd(shareCmd.command('list <targetId>').description('List active shares for a document or folder')),
+    configureCmd(shareCmd.command('list [targetId]').description('List active shares for a document or folder')),
   )
+    .option('--id <targetId>', 'Document or folder ID to list shares for')
     .option('--kind <kind>', 'Target kind: doc (default) or folder', 'doc')
-    .action(async (targetId: string, opts: { kind: string }, cmd: Command) => {
+    .action(async (targetIdArg: string | undefined, opts: { id?: string; kind: string }, cmd: Command) => {
       const flags = extractCommonFlags(cmd);
+      const idPair = resolveAliasPair(targetIdArg, '<targetId>', opts.id, '--id');
+      if (!idPair.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, idPair.message, { json: flags.json });
+      const targetId = idPair.value?.trim();
+      if (!targetId) {
+        return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, 'share list requires <targetId> or --id <targetId>', { json: flags.json });
+      }
       if (opts.kind !== 'doc' && opts.kind !== 'folder') {
         return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, '--kind must be doc or folder', { json: flags.json });
       }
@@ -1033,7 +1254,7 @@ export async function runCloudDocsCli(
     });
 
   addAuthAndFormatOptions(
-    configureCmd(shareCmd.command('teams').description('List teams available for Cloud Docs sharing')),
+    configureCmd(shareCmd.command('list-teams').alias('teams').description('List teams available for Cloud Docs sharing')),
   )
     .action(async (_opts: Record<string, unknown>, cmd: Command) => {
       const ctx = await acquireCreds(cmd);
@@ -1049,17 +1270,24 @@ export async function runCloudDocsCli(
     });
 
   addAuthAndFormatOptions(
-    configureCmd(shareCmd.command('grant <targetId>').description('Grant viewer or editor access to a user or team')),
+    configureCmd(shareCmd.command('grant [targetId]').description('Grant viewer or editor access to a user or team')),
   )
+    .option('--id <targetId>', 'Document or folder ID to share')
     .option('--kind <kind>', 'Target kind: doc (default) or folder', 'doc')
-    .option('--user <username>', 'Share with username / identifier')
+    .option('--mode <mode>', 'Recipient mode: user or team')
+    .option('--username <username>', 'Share with username / identifier')
+    .option('--user <username>', 'Alias for --username')
     .option('--user-id <userId>', 'Share with userId')
     .option('--team-id <teamId>', 'Share with teamId')
     .requiredOption('--role <role>', 'Granted role: viewer or editor')
     .option('--allow-download', 'Allow downloads/conversions for shared recipients')
-    .option('--no-download', 'Disallow downloads/conversions for shared recipients')
-    .action(async (targetId: string, opts: {
+    .option('--no-allow-download', 'Disallow downloads/conversions for shared recipients')
+    .option('--no-download', 'Alias for --no-allow-download')
+    .action(async (targetIdArg: string | undefined, opts: {
+      id?: string;
       kind: string;
+      mode?: string;
+      username?: string;
       user?: string;
       userId?: string;
       teamId?: string;
@@ -1068,29 +1296,64 @@ export async function runCloudDocsCli(
       allowDownload?: boolean;
     }, cmd: Command) => {
       const flags = extractCommonFlags(cmd);
+      const idPair = resolveAliasPair(targetIdArg, '<targetId>', opts.id, '--id');
+      if (!idPair.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, idPair.message, { json: flags.json });
+      const targetId = idPair.value?.trim();
+      if (!targetId) {
+        return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, 'share grant requires <targetId> or --id <targetId>', { json: flags.json });
+      }
       if (opts.kind !== 'doc' && opts.kind !== 'folder') {
         return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, '--kind must be doc or folder', { json: flags.json });
       }
       if (opts.role !== 'viewer' && opts.role !== 'editor') {
         return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, '--role must be viewer or editor', { json: flags.json });
       }
-      const hasUser = Boolean(opts.user || opts.userId);
+      const userPair = resolveAliasPair(opts.username, '--username', opts.user, '--user');
+      if (!userPair.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, userPair.message, { json: flags.json });
+      const hasUser = Boolean(userPair.value || opts.userId);
       const hasTeam = Boolean(opts.teamId);
-      if (hasUser === hasTeam) {
-        return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, 'Provide either --team-id OR (--user / --user-id)', { json: flags.json });
+
+      if (opts.mode !== undefined) {
+        if (opts.mode !== 'user' && opts.mode !== 'team') {
+          return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, '--mode must be user or team', { json: flags.json });
+        }
+        if (opts.mode === 'team' && (!hasTeam || hasUser)) {
+          return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, '--mode team requires --team-id and must not specify --username/--user-id', { json: flags.json });
+        }
+        if (opts.mode === 'user' && (!hasUser || hasTeam)) {
+          return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, '--mode user requires --username/--user-id and must not specify --team-id', { json: flags.json });
+        }
+      } else if (hasUser === hasTeam) {
+        return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, 'Provide either --team-id OR (--username / --user-id)', { json: flags.json });
       }
+
+      const allowSrc = cmd.getOptionValueSource('allowDownload');
+      const noDownloadSrc = cmd.getOptionValueSource('download');
+      if (allowSrc === 'cli' && opts.allowDownload === true && noDownloadSrc === 'cli') {
+        return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, 'Pass either --allow-download or --no-allow-download/--no-download, not both', { json: flags.json });
+      }
+      const allowDownload: boolean | undefined = allowSrc === 'cli'
+        ? Boolean(opts.allowDownload)
+        : noDownloadSrc === 'cli'
+          ? false
+          : undefined;
+
+      const shareMode = opts.mode === 'team' || opts.mode === 'user'
+        ? opts.mode
+        : hasTeam ? 'team' : 'user';
+
       const ctx = await acquireCreds(cmd);
       if (!ctx) return;
       const res = await cloudDocShareClient(ctx.creds, {
         action: 'grant',
         targetKind: opts.kind as CloudDocShareTargetKind,
         targetId,
-        shareMode: hasTeam ? 'team' : 'user',
+        shareMode,
         ...(opts.teamId ? { targetTeamId: opts.teamId } : {}),
         ...(opts.userId ? { targetUserId: opts.userId } : {}),
-        ...(opts.user ? { targetUsername: opts.user } : {}),
+        ...(userPair.value ? { targetUsername: userPair.value } : {}),
         role: opts.role,
-        ...(opts.download === false ? { allowDownload: false } : opts.allowDownload ? { allowDownload: true } : {}),
+        ...(allowDownload !== undefined ? { allowDownload } : {}),
       });
       await finishClientResult(res, ctx.flags.json, (ok) => {
         const share = ok.share;
@@ -1099,9 +1362,17 @@ export async function runCloudDocsCli(
     });
 
   addAuthAndFormatOptions(
-    configureCmd(shareCmd.command('revoke <shareId>').description('Revoke an existing share by shareId')),
+    configureCmd(shareCmd.command('revoke [shareId]').description('Revoke an existing share by shareId')),
   )
-    .action(async (shareId: string, _opts: Record<string, unknown>, cmd: Command) => {
+    .option('--share-id <shareId>', 'Share record ID to revoke')
+    .action(async (shareIdArg: string | undefined, opts: { shareId?: string }, cmd: Command) => {
+      const flags = extractCommonFlags(cmd);
+      const idPair = resolveAliasPair(shareIdArg, '<shareId>', opts.shareId, '--share-id');
+      if (!idPair.ok) return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, idPair.message, { json: flags.json });
+      const shareId = idPair.value?.trim();
+      if (!shareId) {
+        return fail(MCP_ERROR_REASONS.VALIDATION_FAILED, 'share revoke requires <shareId> or --share-id <shareId>', { json: flags.json });
+      }
       const ctx = await acquireCreds(cmd);
       if (!ctx) return;
       const res = await cloudDocShareClient(ctx.creds, { action: 'revoke', shareId });

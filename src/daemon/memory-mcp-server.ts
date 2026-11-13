@@ -1,4 +1,5 @@
 import { isIncognitoSessionName } from '../../shared/session-incognito-context.js';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 import { SESSION_INCOGNITO_MEMORY_DISABLED } from '../../shared/session-incognito-types.js';
 import { resolveTaskPairTitleTurn } from './task-pair-title-authority.js';
 import { installMcpErrorResultBoundary } from './mcp-error-result-boundary.js';
@@ -11,8 +12,14 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { createIdempotentShutdown, installMcpStdioLifecycle,
   IMCODES_MCP_PARENT_PID_ENV, IMCODES_MEMORY_MCP_BACKEND_ENV,
   MCP_PROCESS_START_PARENT_PID } from './mcp-stdio-lifecycle.js';
-import http from 'http';
 import { HookAuthorityUnavailableError, resolveHookAuthority, resolveLiveHookPort } from './hook-port.js';
+import {
+  HookRateLimitError,
+  createResourceOwnerHookWithEpochRefresh,
+  createSessionSharedMachineAuthorityLoader,
+  postHookSend,
+  sharedMachineAuthorityFromHookResponse,
+} from './shared-machine-authority.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
 import {
   MemoryMcpCallerEnvError,
@@ -34,7 +41,7 @@ import {
   SHARED_MACHINE_AUTHORITY_HOOK_PATH,
   SHARED_MACHINE_AUTHORITY_STALE_RUNTIME_ERROR,
 } from '../../shared/shared-machine-authority.js';
-import { getSession, loadStore, type SessionRecord } from '../store/session-store.js';
+import { loadStore, type SessionRecord } from '../store/session-store.js';
 import { DAEMON_MEMORY_WORKER_STALE_RUNTIME_ERROR } from './memory-mcp-error-codes.js';
 import { isDaemonCapabilityAdvertised } from './server-link.js';
 import { EXECUTION_CLONE_CAPABILITY_V1 } from '../../shared/execution-clone.js';
@@ -95,7 +102,6 @@ import {
   PARTICIPANT_TURN_TOOL_REFUSAL,
   isToolAllowedInParticipantTurn,
 } from '../../shared/participant-turn-tool-policy.js';
-import { hookCredentialHeaders } from '../../shared/hook-session-credential.js';
 
 export interface MemoryMcpServerOptions {
   env?: Record<string, string | undefined>;
@@ -126,6 +132,7 @@ export interface MemoryMcpDaemonBridgeDeps {
   resolveHookAuthority?: typeof resolveHookAuthority;
   enqueueTransportResend?: typeof enqueueDurableResend;
   now?: () => number;
+  env?: NodeJS.ProcessEnv;
 }
 
 const MEMORY_MCP_DEFAULT_MAX_CONCURRENT = 8;
@@ -376,13 +383,12 @@ export function participantTurnFromAuthorityHook(
   };
 }
 
-/** Node access alone requires an explicit, coherent hook answer; an unknown reply must never borrow the daemon owner. */
-export function sharedMachineAuthorityFromHookResponse(answer: Record<string, unknown>): string | null {
-  if (answer.ok !== true || typeof answer.required !== 'boolean') throw new Error('shared_machine_authority_invalid_response');
-  if (answer.required === false && answer.authority == null) return null;
-  if (answer.required === true && typeof answer.authority === 'string' && answer.authority) return answer.authority;
-  throw new Error('shared_machine_authority_invalid_response');
-}
+export {
+  HookRateLimitError,
+  createResourceOwnerHookWithEpochRefresh,
+  postHookSend,
+  sharedMachineAuthorityFromHookResponse,
+};
 
 /**
  * Refuse only exec_remote while the current turn belongs to a shared-session participant (shared/participant-turn-tool-policy.ts).
@@ -528,129 +534,6 @@ export async function resolveDaemonCapabilityIdentity(caller: McpRuntimeCaller):
 
 const DELEGATION_REPLY_HOOK_TIMEOUT_MS = 10_000;
 
-export async function postHookSend(
-  port: number,
-  body: Record<string, unknown>,
-  hookPath = '/send',
-  senderSessionName?: string,
-  timeoutMs?: number,
-  acceptStructuredError = false,
-): Promise<Record<string, unknown>> {
-  const data = JSON.stringify(body);
-  return new Promise((resolve, reject) => {
-    const req = http.request({
-      hostname: '127.0.0.1',
-      port,
-      path: hookPath,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(data),
-        ...(senderSessionName ? { 'x-imcodes-session': senderSessionName, ...hookCredentialHeaders() } : {}),
-      },
-    }, (res) => {
-      let raw = '';
-      res.setEncoding('utf8');
-      res.on('data', (chunk) => { raw += chunk; });
-      res.on('end', () => {
-        try {
-          const parsed = raw ? JSON.parse(raw) as Record<string, unknown> : {};
-          const statusCode = res.statusCode ?? 500;
-          const retryAfterHeader = res.headers['retry-after'];
-          const retryAfterSeconds = typeof retryAfterHeader === 'string' ? Number(retryAfterHeader) : Number(Array.isArray(retryAfterHeader) ? retryAfterHeader[0] : NaN);
-          const retryAfterMs = statusCode === 429 && Number.isFinite(retryAfterSeconds)
-            ? Math.max(0, Math.ceil(retryAfterSeconds * 1000))
-            : typeof parsed.retryAfterMs === 'number' ? parsed.retryAfterMs : undefined;
-          if (retryAfterMs !== undefined) parsed.retryAfterMs = retryAfterMs;
-          if ((statusCode >= 400 || parsed.ok === false) && !acceptStructuredError) {
-            if (statusCode === 429) {
-              const error = new HookRateLimitError(typeof parsed.error === 'string' ? parsed.error : 'rate limit exceeded', retryAfterMs);
-              reject(error);
-              return;
-            }
-            reject(new Error(typeof parsed.error === 'string' ? parsed.error : `hook send failed with status ${res.statusCode ?? 0}`));
-            return;
-          }
-          resolve(parsed);
-        } catch (err) {
-          reject(err);
-        }
-      });
-    });
-    if (timeoutMs && timeoutMs > 0) {
-      req.setTimeout(timeoutMs, () => {
-        req.destroy(new Error(`hook request timed out after ${timeoutMs}ms`));
-      });
-    }
-    req.on('error', reject);
-    req.write(data);
-    req.end();
-  });
-}
-
-/**
- * Post a resource-owner-bound hook request, refreshing only a bumped epoch for
- * the exact session instance that owns this stdio child.  The child captures
- * its owner from env at spawn, while an ordinary session restart can bump the
- * epoch without replacing the child.  A stale response is therefore safe to
- * retry only after the on-disk record proves the same instance is still the
- * named session; never adopt a replacement that reuses the name.
- */
-export function createResourceOwnerHookWithEpochRefresh(options: {
-  resourceOwner: SessionResourceOwner;
-  callerSessionName: string;
-  hookPath: string;
-  timeoutMs?: number;
-  body?: Record<string, unknown>;
-  staleRuntimeError: string;
-  rejectStopped?: boolean;
-  requireHookPort: (operation: string) => Promise<number>;
-}): ((body?: Record<string, unknown>) => Promise<Record<string, unknown>>) {
-  let runtimeEpoch = options.resourceOwner.runtimeEpoch;
-  return async (body = {}) => {
-    const sendOnce = () => options.requireHookPort(options.hookPath).then((port) => postHookSend(
-      port,
-      {
-        ...body,
-        sessionInstanceId: options.resourceOwner.sessionInstanceId,
-        runtimeEpoch,
-      },
-      options.hookPath,
-      options.callerSessionName,
-      options.timeoutMs,
-    ));
-
-    try {
-      return await sendOnce();
-    } catch (err) {
-      if (!(err instanceof Error) || err.message !== options.staleRuntimeError) throw err;
-      await loadStore();
-      const fresh = getSession(options.callerSessionName);
-      if (!fresh
-        || (options.rejectStopped && fresh.state === 'stopped')
-        || fresh.sessionInstanceId !== options.resourceOwner.sessionInstanceId
-        || !fresh.runtimeEpoch) {
-        throw err;
-      }
-      runtimeEpoch = fresh.runtimeEpoch;
-      return sendOnce();
-    }
-  };
-}
-
-export class HookRateLimitError extends Error {
-  readonly name = 'HookRateLimitError';
-  readonly statusCode = 429;
-  readonly retryAfterMs?: number;
-  readonly retryAt?: number;
-
-  constructor(message: string, retryAfterMs?: number) {
-    super(message);
-    this.retryAfterMs = retryAfterMs;
-    this.retryAt = retryAfterMs === undefined ? undefined : Date.now() + retryAfterMs;
-  }
-}
-
 /**
  * Compose the production stdio-MCP send defaults onto the (possibly test-injected)
  * `toolDeps`, PER FIELD. Every send-dep field independently preserves an injected
@@ -668,7 +551,8 @@ export function mergeDefaultToolDeps(
   bridgeDeps: MemoryMcpDaemonBridgeDeps = {},
 ): MemoryMcpToolDeps {
   const resolveHookPort = bridgeDeps.resolveHookPort ?? resolveLiveHookPort;
-  const resolveAuthority = bridgeDeps.resolveHookAuthority ?? resolveHookAuthority;
+  const resolveAuthority = bridgeDeps.resolveHookAuthority
+    ?? (() => resolveHookAuthority(bridgeDeps.env ? { home: imcodesStateDir(bridgeDeps.env) } : {}));
   /** Resolve the hook endpoint or throw the ACCURATE endpoint-authority error.
    *
    *  This replaces `if (!port) throw new Error('daemon_memory_worker_unavailable')`.
@@ -862,11 +746,13 @@ export function mergeDefaultToolDeps(
         : async () => null,
     }),
     cloudDocsDeps: toolDeps.cloudDocsDeps ?? createDaemonCloudDocsToolDeps({
-      loadSharedMachineAuthority: resourceOwner && caller.sessionName
-        ? async () => {
-            return sharedMachineAuthorityFromHookResponse(await postSharedMachineAuthorityHook!());
-          }
-        : async () => null,
+      ...(bridgeDeps.env ? { env: bridgeDeps.env } : {}),
+      loadSharedMachineAuthority: createSessionSharedMachineAuthorityLoader({
+        callerSessionName: caller.sessionName,
+        resourceOwner,
+        env: bridgeDeps.env,
+        requireHookPort,
+      }),
     }),
     sendDeps: {
       ...toolDeps.sendDeps,
@@ -1009,7 +895,7 @@ export function createMemoryMcpServerFromEnv(options: MemoryMcpServerOptions = {
   const admissionOwner = sessionResourceOwnerFromEnv(env as NodeJS.ProcessEnv);
   return createMemoryMcpServer(
     caller,
-    mergeDefaultToolDeps(caller, options.toolDeps ?? {}, admissionOwner),
+    mergeDefaultToolDeps(caller, options.toolDeps ?? {}, admissionOwner, { env: env as NodeJS.ProcessEnv }),
     options.messagePinToolDeps,
     // Fourth argument was MISSING, so supervisionToolDeps defaulted to {} and
     // every supervision tool reported `supervision registry not bound`.

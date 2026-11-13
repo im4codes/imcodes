@@ -1,4 +1,7 @@
 import http from 'node:http';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -12,15 +15,19 @@ import { createMemoryMcpServerFromEnv } from '../../src/daemon/memory-mcp-server
 
 describe('MCP cloud_docs CLI-passthrough tool', () => {
   let server: http.Server;
+  let workDir: string;
   let baseUrl: string;
   let lastRequest: { method: string; url: string; headers: http.IncomingHttpHeaders; body: string } | null;
   let mockStatus = 200;
   let mockJson: unknown = { folders: [], docs: [], sharedFolders: [], sharedDocs: [] };
+  let mockBody: Buffer | null = null;
 
   beforeEach(async () => {
+    workDir = mkdtempSync(join(tmpdir(), 'imcodes-cdoc-mcp-'));
     lastRequest = null;
     mockStatus = 200;
     mockJson = { folders: [], docs: [], sharedFolders: [], sharedDocs: [] };
+    mockBody = null;
     server = http.createServer((req, res) => {
       const chunks: Buffer[] = [];
       req.on('data', (c: Buffer) => chunks.push(c));
@@ -31,6 +38,11 @@ describe('MCP cloud_docs CLI-passthrough tool', () => {
           headers: req.headers,
           body: Buffer.concat(chunks).toString('utf8'),
         };
+        if (mockBody !== null) {
+          res.writeHead(mockStatus, { 'Content-Type': 'application/octet-stream' });
+          res.end(mockBody);
+          return;
+        }
         res.writeHead(mockStatus, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(mockJson));
       });
@@ -43,6 +55,7 @@ describe('MCP cloud_docs CLI-passthrough tool', () => {
 
   afterEach(async () => {
     await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    rmSync(workDir, { recursive: true, force: true });
   });
 
   async function openClient(opts: {
@@ -162,6 +175,92 @@ describe('MCP cloud_docs CLI-passthrough tool', () => {
       expect(conflictRes.structuredContent).toMatchObject({
         status: 'error',
         reason: MCP_ERROR_REASONS.REVISION_CONFLICT,
+      });
+
+      // 7. Brief CLI parity through MCP args & command forms (read --convert-to, create --file, edit --file/--no-save --out, --version, share)
+      const pdfBytes = Buffer.from('%PDF-mcp', 'utf8');
+      mockStatus = 200;
+      mockBody = null;
+      mockJson = {
+        fileName: 'mcp-read.pdf',
+        mimeType: 'application/pdf',
+        bytesWritten: pdfBytes.length,
+        bytesBase64: pdfBytes.toString('base64'),
+      };
+      const mcpPdfOut = join(workDir, 'mcp-read.pdf');
+      const readConvRes = await conn.client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
+        arguments: { args: ['read', 'doc-1', '--convert-to', 'pdf', '--out', mcpPdfOut] },
+      });
+      expect(readConvRes.isError).not.toBe(true);
+      expect(lastRequest?.method).toBe('POST');
+      expect(lastRequest?.url).toBe('/api/cloud-docs/doc-1/convert');
+      expect(JSON.parse(lastRequest!.body)).toEqual({ targetType: 'pdf' });
+      expect(readFileSync(mcpPdfOut).equals(pdfBytes)).toBe(true);
+
+      const srcDocx = join(workDir, 'mcp-src.docx');
+      writeFileSync(srcDocx, Buffer.from('PK-mcp-src', 'utf8'));
+      mockBody = null;
+      mockJson = { doc: { id: 'doc-new', docVersion: 1 }, created: true };
+      const createFileRes = await conn.client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
+        arguments: { command: `create --type docx --folder fld-m --file "${srcDocx}"` },
+      });
+      expect(createFileRes.isError).not.toBe(true);
+      expect(lastRequest?.method).toBe('POST');
+      expect(lastRequest?.url).toBe('/api/cloud-docs/files');
+
+      mockJson = { ok: true, doc: { id: 'doc-1', docVersion: 5 }, role: 'owner', bytesWritten: 10 };
+      const editFileRes = await conn.client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
+        arguments: { args: ['edit', 'doc-1', '--file', srcDocx, '--version', '4'] },
+      });
+      expect(editFileRes.isError).not.toBe(true);
+      expect(lastRequest?.method).toBe('PUT');
+      expect(lastRequest?.url).toBe('/api/cloud-docs/doc-1/file');
+      expect(lastRequest?.body).toContain('name="expectedVersion"\r\n\r\n4');
+
+      const previewDocx = Buffer.from('PK-mcp-preview', 'utf8');
+      mockJson = {
+        doc: { id: 'doc-1', name: 'Brief.docx', ext: '.docx', docVersion: 5 },
+        bytesBase64: previewDocx.toString('base64'),
+        outputName: 'mcp-preview.docx',
+        mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        bytesWritten: previewDocx.length,
+      };
+      const mcpPreviewOut = join(workDir, 'mcp-preview.docx');
+      const editNoSaveRes = await conn.client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
+        arguments: { args: ['edit', 'doc-1', '--script', 'Api.GetDocument();', '--no-save', '--out', mcpPreviewOut] },
+      });
+      expect(editNoSaveRes.isError).not.toBe(true);
+      expect(lastRequest?.url).toBe('/api/cloud-docs/doc-1/docbuilder');
+      expect(JSON.parse(lastRequest!.body)).toMatchObject({ script: 'Api.GetDocument();', save: false });
+      expect(readFileSync(mcpPreviewOut).equals(previewDocx)).toBe(true);
+
+      mockBody = null;
+      mockJson = { teams: [] };
+      const teamsRes = await conn.client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
+        arguments: { command: 'share list-teams' },
+      });
+      expect(teamsRes.isError).not.toBe(true);
+      expect(lastRequest?.url).toBe('/api/cloud-docs/teams');
+
+      mockJson = { share: { id: 'sh-2' } };
+      const grantRes = await conn.client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
+        arguments: { command: 'share grant --id doc-1 --mode user --username bob --role viewer --no-allow-download' },
+      });
+      expect(grantRes.isError).not.toBe(true);
+      expect(lastRequest?.url).toBe('/api/cloud-docs/shares');
+      expect(JSON.parse(lastRequest!.body)).toEqual({
+        targetKind: 'doc',
+        targetId: 'doc-1',
+        shareMode: 'user',
+        role: 'viewer',
+        targetUsername: 'bob',
+        allowDownload: false,
       });
     } finally {
       await conn.close();

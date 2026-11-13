@@ -4,6 +4,7 @@ import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
 import type { CloudDocsHttpCredentials } from './cloud-docs-mcp-client.js';
 import { loadDaemonCredential, type DaemonCredential } from './machine-mcp-deps.js';
+import { createSessionSharedMachineAuthorityLoader } from './shared-machine-authority.js';
 
 export interface CloudDocsCredentialResolutionOptions {
   serverUrl?: string;
@@ -92,18 +93,20 @@ export async function resolveCloudDocsCredentials(
     };
   }
 
-  // Fail closed if shared turn authority lookup errors: never silently drop delegated turn identity.
+  // Fail closed in any managed session/delegated context: direct shell CLI and
+  // MCP passthrough share the exact same authority resolver, and explicit
+  // --home / --token / env overrides must never bypass actor verification.
+  const authorityLoader = options.loadSharedMachineAuthority
+    ?? createSessionSharedMachineAuthorityLoader({ env: env as NodeJS.ProcessEnv });
   let sharedMachineAuthority: string | null = null;
-  if (options.loadSharedMachineAuthority) {
-    try {
-      sharedMachineAuthority = await options.loadSharedMachineAuthority();
-    } catch (err) {
-      return {
-        status: 'error',
-        reason: MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE,
-        message: err instanceof Error ? err.message : 'shared turn authority unavailable',
-      };
-    }
+  try {
+    sharedMachineAuthority = await authorityLoader();
+  } catch (err) {
+    return {
+      status: 'error',
+      reason: MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE,
+      message: err instanceof Error ? err.message : 'shared turn authority unavailable',
+    };
   }
 
   return {

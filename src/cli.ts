@@ -329,6 +329,7 @@ export function createProgram(): Command {
 const program = new Command()
   .name('imcodes')
   .description('Remote AI coding agent controller')
+  .enablePositionalOptions()
   .version(version);
 
 program.exitOverride();
@@ -1423,6 +1424,7 @@ program
   .command('cloud-docs [args...]')
   .description('Unified Cloud Docs & ONLYOFFICE Document Builder CLI (`imcodes cloud-docs docs` for guide)')
   .helpOption(false)
+  .passThroughOptions()
   .allowUnknownOption(true)
   .allowExcessArguments(true)
   .action(async (args: string[], _opts: Record<string, unknown>, cmd: Command) => {
