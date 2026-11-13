@@ -12,6 +12,7 @@ html {
 }
 :root {
   --sat: env(safe-area-inset-top, 0px);
+  --sab: env(safe-area-inset-bottom, 0px);
   --chrome-bg: #080d16;
   --chrome-panel: #0d1422;
   --chrome-panel-2: #111b2d;
@@ -3133,13 +3134,13 @@ html.native-ios-mac .chat-dl-btn {
 
 /* ── Voice Overlay (sci-fi 2/3 sheet) ── */
 .voice-overlay-backdrop {
-  position: fixed; inset: 0; z-index: 9998;
+  position: fixed; inset: 0; z-index: 2147483640;
   background: rgba(2, 6, 23, 0.78);
   -webkit-backdrop-filter: blur(16px);
   backdrop-filter: blur(16px);
 }
 .voice-overlay {
-  position: fixed; left: 0; right: 0; top: 0; z-index: 9999;
+  position: fixed; left: 0; right: 0; top: 0; z-index: 2147483641;
   height: 66vh;
   background: radial-gradient(ellipse at 50% 0%, #0c1929 0%, #020617 70%);
   display: flex; flex-direction: column; align-items: center;
@@ -3273,16 +3274,6 @@ html.native-ios-mac .chat-dl-btn {
       0 0 44px rgba(167,139,250,0.28);
   }
 }
-@media (prefers-reduced-motion: reduce) {
-  .voice-overlay, .voice-overlay-grid, .voice-status-dot-active,
-  .voice-editor-marquee::before, .voice-editor-marquee::after,
-  .voice-hold-hud-grid, .voice-hold-hud-card::before,
-  .controls-composer-voice-ready::after,
-  .controls-composer-voice-pending::after,
-  .controls-composer-voice-holding::after,
-  .controls-composer-voice-holding .controls-input { animation: none; }
-  .voice-editor-marquee::after { opacity: 0.6; }
-}
 .controls-composer-voice-ready::after {
   content: '';
   position: absolute;
@@ -3349,9 +3340,10 @@ html.native-ios-mac .chat-dl-btn {
   position: fixed;
   left: 12px;
   right: 12px;
-  bottom: calc(68px + env(safe-area-inset-bottom, 0px));
-  max-height: calc(100dvh - 84px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
-  z-index: 9998;
+  top: calc(16px + max(var(--sat, 0px), env(safe-area-inset-top, 0px)));
+  bottom: calc(68px + max(var(--sab, 0px), env(safe-area-inset-bottom, 0px)));
+  max-height: calc(var(--vvh, 100dvh) - 84px - max(var(--sat, 0px), env(safe-area-inset-top, 0px)) - max(var(--sab, 0px), env(safe-area-inset-bottom, 0px)));
+  z-index: 2147483642;
   display: flex;
   justify-content: center;
   align-items: flex-end;
@@ -3370,7 +3362,7 @@ html.native-ios-mac .chat-dl-btn {
   position: relative;
   width: 100%;
   max-width: 520px;
-  max-height: 100%;
+  max-height: min(100%, calc(var(--vvh, 100dvh) - 84px - max(var(--sat, 0px), env(safe-area-inset-top, 0px)) - max(var(--sab, 0px), env(safe-area-inset-bottom, 0px))));
   min-height: 0;
   padding: 16px;
   border-radius: 20px;
@@ -3468,9 +3460,8 @@ html.native-ios-mac .chat-dl-btn {
   font-size: 16px;
   line-height: 1.55;
   color: #f8fafc;
-  min-height: clamp(48px, calc(100dvh - 290px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)), 88px);
-  max-height: calc(100dvh - 290px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
-  flex: 1 1 auto;
+  min-height: clamp(44px, calc(var(--vvh, 100dvh) - 360px - max(var(--sat, 0px), env(safe-area-inset-top, 0px)) - max(var(--sab, 0px), env(safe-area-inset-bottom, 0px))), 88px);
+  flex: 0 1 auto;
   overflow-y: auto;
   word-break: break-word;
   white-space: pre-wrap;
@@ -3564,6 +3555,27 @@ html.native-ios-mac .chat-dl-btn {
   border-color: #93c5fd;
   box-shadow: 0 0 20px rgba(59,130,246,0.45);
   transform: translateX(3px) scale(1.03);
+}
+@media (prefers-reduced-motion: reduce) {
+  .btn-voice-active,
+  .voice-overlay,
+  .voice-overlay-grid,
+  .voice-status-dot-active,
+  .voice-recognizing-dots i,
+  .voice-editor-marquee::before,
+  .voice-editor-marquee::after,
+  .voice-hold-hud-grid,
+  .voice-hold-hud-card::before,
+  .controls-composer-voice-ready::after,
+  .controls-composer-voice-pending::after,
+  .controls-composer-voice-holding::after,
+  .controls-composer-voice-holding .controls-input {
+    animation: none;
+  }
+  .voice-editor-marquee::after { opacity: 0.6; }
+  .voice-status-dot,
+  .voice-hold-hud-active-hint,
+  .voice-hold-zone { transition: none; }
 }
 .voice-overlay-text::placeholder { color: #475569; font-style: italic; }
 .voice-overlay-text:focus { outline: none; border-color: rgba(56,189,248,0.25); }

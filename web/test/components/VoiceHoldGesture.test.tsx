@@ -1,7 +1,8 @@
 /**
  * @vitest-environment jsdom
  */
-import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -858,6 +859,264 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       expect(data.voice.slide_right_edit.trim().length).toBeGreaterThan(0);
       expect(data.voice.slide_left_cancel).not.toContain('👈');
       expect(data.voice.slide_right_edit).not.toContain('👉');
+    }
+  });
+
+  it('portals .voice-hold-hud directly to document.body outside .controls stacking context', async () => {
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    const view = render(
+      <div class="subcard">
+        <div class="controls-wrapper">
+          <SessionControls
+            ws={ws}
+            activeSession={makeSession()}
+            quickData={makeQuickData()}
+            sessions={[]}
+            subSessions={[]}
+            serverId="srv-1"
+          />
+        </div>
+      </div>,
+    );
+
+    const input = view.container.querySelector('.controls-input') as HTMLElement;
+    dispatchPointer(input, 'pointerdown', 200);
+    await vi.advanceTimersByTimeAsync(240);
+
+    const hud = document.body.querySelector(':scope > .voice-hold-hud') as HTMLElement | null;
+    expect(hud).not.toBeNull();
+    expect(hud?.parentElement).toBe(document.body);
+    expect(view.container.querySelector('.controls .voice-hold-hud')).toBeNull();
+    expect(view.container.querySelector('.voice-hold-hud')).toBeNull();
+
+    dispatchPointer(input, 'pointermove', 50);
+    await vi.advanceTimersByTimeAsync(0);
+    dispatchPointer(input, 'pointerup', 50);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.body.querySelector('.voice-hold-hud')).toBeNull();
+  });
+
+  it('disables animations/transitions under prefers-reduced-motion, fits all 7 locales safely, and stacks above isolated session activity strips in chromium', { timeout: 60000 }, async () => {
+    vi.useRealTimers();
+    const require = createRequire(import.meta.url);
+    const browserType = (require('playwright') as typeof import('playwright')).chromium;
+    if (!existsSync(browserType.executablePath())) {
+      return;
+    }
+    const stylesPath = resolve(dirname(fileURLToPath(import.meta.url)), '../../src/styles.css');
+    const css = readFileSync(stylesPath, 'utf8');
+    const localesDir = resolve(dirname(fileURLToPath(import.meta.url)), '../../src/i18n/locales');
+    const locales = ['en', 'es', 'ja', 'ko', 'ru', 'zh-CN', 'zh-TW'].map((code) => ({
+      code,
+      json: JSON.parse(readFileSync(resolve(localesDir, `${code}.json`), 'utf8')) as { voice: Record<string, string> },
+    }));
+    const barsHtml = Array.from({ length: 16 }, () => '<span class="voice-hold-hud-bar" style="height: 16px; opacity: 0.8"></span>').join('');
+    const longText = Array.from({ length: 40 }, (_, i) => `Line ${i + 1}: holding to dictate long technical text across multiple lines on iOS mobile viewport.`).join('\n');
+
+    const browser = await browserType.launch({ headless: true });
+    try {
+      for (const reducedMotion of ['reduce', 'no-preference'] as const) {
+        const context = await browser.newContext({ viewport: { width: 390, height: 844 }, reducedMotion });
+        const page = await context.newPage();
+        try {
+          await page.setContent(`<!doctype html><html><head><style>${css}</style></head><body>
+            <div class="controls-composer controls-composer-voice-ready controls-composer-voice-pending controls-composer-voice-holding">
+              <div class="controls-input"></div>
+            </div>
+            <button class="btn-voice btn-voice-active"></button>
+            <div class="voice-hold-hud voice-hold-hud-zone-send">
+              <div class="voice-hold-hud-card">
+                <div class="voice-hold-hud-grid"></div>
+                <div class="voice-hold-hud-header">
+                  <span class="voice-hold-hud-recognizing is-recognizing">
+                    <span class="voice-status-dot voice-status-dot-active voice-status-dot-recognizing"></span>
+                    <span class="voice-recognizing-dots"><i></i><i></i><i></i></span>
+                    <span>Listening</span>
+                  </span>
+                  <div class="voice-hold-hud-waveform">${barsHtml}</div>
+                </div>
+                <div class="voice-hold-hud-transcript">Hello</div>
+                <div class="voice-hold-hud-active-hint is-send">Hint</div>
+                <div class="voice-hold-hud-zones">
+                  <div class="voice-hold-zone voice-hold-zone-cancel"><span class="voice-hold-zone-label">Cancel</span></div>
+                  <div class="voice-hold-zone voice-hold-zone-send is-active"><span class="voice-hold-zone-label">Send</span></div>
+                  <div class="voice-hold-zone voice-hold-zone-edit"><span class="voice-hold-zone-label">Edit</span></div>
+                </div>
+              </div>
+            </div>
+          </body></html>`);
+
+          for (const zone of ['send', 'cancel', 'edit'] as const) {
+            const computed = await page.evaluate((z) => {
+              const hud = document.querySelector('.voice-hold-hud')!;
+              hud.className = `voice-hold-hud voice-hold-hud-zone-${z}`;
+              const hint = document.querySelector('.voice-hold-hud-active-hint')!;
+              hint.className = `voice-hold-hud-active-hint is-${z}`;
+              for (const k of ['cancel', 'send', 'edit']) {
+                document.querySelector(`.voice-hold-zone-${k}`)!.classList.toggle('is-active', k === z);
+              }
+              const gs = (sel: string, pseudo?: string) => getComputedStyle(document.querySelector(sel)!, pseudo);
+              return {
+                composerReadyAfter: gs('.controls-composer-voice-ready', '::after').animationName,
+                composerInput: gs('.controls-composer-voice-holding .controls-input').animationName,
+                btnVoiceActive: gs('.btn-voice-active').animationName,
+                hudCardBefore: gs('.voice-hold-hud-card', '::before').animationName,
+                hudGrid: gs('.voice-hold-hud-grid').animationName,
+                dotActive: gs('.voice-status-dot-active').animationName,
+                recDot: gs('.voice-recognizing-dots i').animationName,
+                dotTrans: gs('.voice-status-dot').transitionProperty,
+                hintTrans: gs('.voice-hold-hud-active-hint').transitionProperty,
+                zoneTrans: gs('.voice-hold-zone').transitionProperty,
+              };
+            }, zone);
+
+            if (reducedMotion === 'reduce') {
+              expect(computed.composerReadyAfter).toBe('none');
+              expect(computed.composerInput).toBe('none');
+              expect(computed.btnVoiceActive).toBe('none');
+              expect(computed.hudCardBefore).toBe('none');
+              expect(computed.hudGrid).toBe('none');
+              expect(computed.dotActive).toBe('none');
+              expect(computed.recDot).toBe('none');
+              expect(computed.dotTrans).toBe('none');
+              expect(computed.hintTrans).toBe('none');
+              expect(computed.zoneTrans).toBe('none');
+            } else {
+              expect(computed.composerReadyAfter).toBe('voice-editor-orbit');
+              expect(computed.composerInput).toBe('voice-composer-energy-pulse');
+              expect(computed.hudCardBefore).toBe('voice-editor-orbit');
+              expect(computed.hudGrid).toBe('voice-grid-scroll');
+              expect(computed.dotActive).toBe('voice-dot-pulse');
+              expect(computed.recDot).toBe('voice-recognizing-bounce');
+            }
+          }
+        } finally {
+          await context.close();
+        }
+      }
+
+      const viewports = [
+        { width: 320, height: 568, sat: 0, sab: 0 },
+        { width: 430, height: 932, sat: 59, sab: 34 },
+      ];
+      for (const vp of viewports) {
+        const context = await browser.newContext({ viewport: { width: vp.width, height: vp.height }, hasTouch: true });
+        const page = await context.newPage();
+        try {
+          await page.setContent(`<!doctype html><html style="--sat:${vp.sat}px;--sab:${vp.sab}px;"><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${css}</style></head><body>
+            <div class="subcard" style="isolation:isolate;position:relative;z-index:1;height:100vh;">
+              <div class="controls-wrapper" style="position:fixed;bottom:0;left:0;right:0;z-index:13;">
+                <span class="session-live-status-inline working" style="position:fixed;left:0;right:0;bottom:140px;height:44px;z-index:999999;">Running command</span>
+              </div>
+            </div>
+            <div class="voice-hold-hud voice-hold-hud-zone-send">
+              <div class="voice-hold-hud-card">
+                <div class="voice-hold-hud-grid"></div>
+                <div class="voice-hold-hud-header">
+                  <span class="voice-hold-hud-recognizing is-recognizing">
+                    <span class="voice-status-dot voice-status-dot-active voice-status-dot-recognizing"></span>
+                    <span class="voice-recognizing-dots"><i></i><i></i><i></i></span>
+                    <span class="test-rec-label"></span>
+                  </span>
+                  <div class="voice-hold-hud-waveform">${barsHtml}</div>
+                </div>
+                <div class="voice-hold-hud-transcript"></div>
+                <div class="voice-hold-hud-active-hint is-send"></div>
+                <div class="voice-hold-hud-zones">
+                  <div class="voice-hold-zone voice-hold-zone-cancel">
+                    <svg class="voice-hold-zone-arrow" viewBox="0 0 24 24" width="20" height="20"><path d="M19 12H5"/></svg>
+                    <span class="voice-hold-zone-label test-cancel-label"></span>
+                  </div>
+                  <div class="voice-hold-zone voice-hold-zone-send is-active">
+                    <span class="voice-hold-zone-label test-send-label"></span>
+                  </div>
+                  <div class="voice-hold-zone voice-hold-zone-edit">
+                    <span class="voice-hold-zone-label test-edit-label"></span>
+                    <svg class="voice-hold-zone-arrow" viewBox="0 0 24 24" width="20" height="20"><path d="M5 12h14"/></svg>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </body></html>`);
+
+          for (const { code, json } of locales) {
+            const v = json.voice;
+            for (const zone of ['send', 'cancel', 'edit'] as const) {
+              const activeHint = zone === 'cancel' ? v.release_to_cancel : zone === 'edit' ? v.release_to_edit : v.release_to_send;
+              for (const [mode, textVal] of [['short', 'Hello'], ['long', longText]] as const) {
+                const m = await page.evaluate(({ zone: z, recLabel, textVal: tv, activeHint: ah, cancelLabel, sendLabel, editLabel }) => {
+                  const hudEl = document.querySelector('.voice-hold-hud')!;
+                  hudEl.className = `voice-hold-hud voice-hold-hud-zone-${z}`;
+                  document.querySelector('.test-rec-label')!.textContent = recLabel;
+                  const trEl = document.querySelector('.voice-hold-hud-transcript')!;
+                  trEl.textContent = tv;
+                  const hintEl = document.querySelector('.voice-hold-hud-active-hint')!;
+                  hintEl.className = `voice-hold-hud-active-hint is-${z}`;
+                  hintEl.textContent = ah;
+                  document.querySelector('.test-cancel-label')!.textContent = cancelLabel;
+                  document.querySelector('.test-send-label')!.textContent = sendLabel;
+                  document.querySelector('.test-edit-label')!.textContent = editLabel;
+                  for (const k of ['cancel', 'send', 'edit']) {
+                    document.querySelector(`.voice-hold-zone-${k}`)!.classList.toggle('is-active', k === z);
+                  }
+                  const r = (sel: string) => document.querySelector(sel)!.getBoundingClientRect();
+                  const card = r('.voice-hold-hud-card');
+                  const header = r('.voice-hold-hud-header');
+                  const transcript = r('.voice-hold-hud-transcript');
+                  const hint = r('.voice-hold-hud-active-hint');
+                  const zones = r('.voice-hold-hud-zones');
+                  const strip = r('.session-live-status-inline');
+                  const stripMidX = strip.left + strip.width / 2;
+                  const stripMidY = strip.top + strip.height / 2;
+                  const prevPe = (hudEl as HTMLElement).style.pointerEvents;
+                  (hudEl as HTMLElement).style.pointerEvents = 'auto';
+                  const topAtStrip = document.elementFromPoint(stripMidX, stripMidY);
+                  (hudEl as HTMLElement).style.pointerEvents = prevPe;
+                  return {
+                    hudZ: getComputedStyle(hudEl).zIndex,
+                    cardTop: Math.round(card.top),
+                    cardBottom: Math.round(card.bottom),
+                    headerTop: Math.round(header.top),
+                    zonesBottom: Math.round(zones.bottom),
+                    hintBottom: Math.round(hint.bottom),
+                    transcriptH: Math.round(transcript.height),
+                    transcriptScrollH: trEl.scrollHeight,
+                    transcriptClientH: trEl.clientHeight,
+                    scrollOverflow: document.documentElement.scrollWidth > window.innerWidth,
+                    hudCoversStrip: card.top <= stripMidY && card.bottom >= stripMidY ? Boolean(topAtStrip?.closest('.voice-hold-hud')) : true,
+                  };
+                }, {
+                  zone,
+                  recLabel: v.recognizing,
+                  textVal,
+                  activeHint,
+                  cancelLabel: v.slide_left_cancel,
+                  sendLabel: v.release_to_send,
+                  editLabel: v.slide_right_edit,
+                });
+
+                expect(m.hudZ, `${code}/${zone}/${mode} z-index`).toBe('2147483642');
+                expect(m.hudCoversStrip, `${code}/${zone}/${mode} covered by live strip`).toBe(true);
+                expect(m.cardTop, `${code}/${zone}/${mode} cardTop`).toBeGreaterThanOrEqual(15 + vp.sat);
+                expect(m.cardBottom, `${code}/${zone}/${mode} cardBottom`).toBeLessThanOrEqual(vp.height - 67 - vp.sab);
+                expect(m.headerTop, `${code}/${zone}/${mode} headerTop`).toBeGreaterThanOrEqual(m.cardTop);
+                expect(m.zonesBottom, `${code}/${zone}/${mode} zonesBottom`).toBeLessThanOrEqual(m.cardBottom);
+                expect(m.hintBottom, `${code}/${zone}/${mode} hintBottom`).toBeLessThanOrEqual(m.cardBottom);
+                expect(m.scrollOverflow, `${code}/${zone}/${mode} overflow`).toBe(false);
+                if (mode === 'long') {
+                  expect(m.transcriptScrollH, `${code}/${zone}/long scrollable`).toBeGreaterThan(m.transcriptClientH);
+                } else {
+                  expect(m.transcriptH, `${code}/${zone}/short transcriptH`).toBeGreaterThanOrEqual(88);
+                }
+              }
+            }
+          }
+        } finally {
+          await context.close();
+        }
+      }
+    } finally {
+      await browser.close();
     }
   });
 });

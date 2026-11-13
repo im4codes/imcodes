@@ -8266,7 +8266,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           for contenteditable elements, unlike <input> or <textarea>.
         */}
         {mobileComposerExpanded && <div class="controls-composer-backdrop" onClick={() => setMobileComposerExpanded(false)} />}
-        {voiceHoldActive && (
+        {voiceHoldActive && typeof document !== 'undefined' && createPortal(
           <div
             class={`voice-hold-hud voice-hold-hud-zone-${voiceHoldZone}`}
             data-zone={voiceHoldZone}
@@ -8358,7 +8358,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 </div>
               </div>
             </div>
-          </div>
+          </div>,
+          document.body,
         )}
         <div class={`controls-composer${embeddedComposerActionCount > 0 ? ' controls-composer-with-trailing' : ''}${mobileComposerExpanded ? ' controls-composer-mobile-expanded' : ''}${voiceHoldReady ? ' controls-composer-voice-ready' : ''}${voiceHoldPending ? ' controls-composer-voice-pending' : ''}${voiceHoldActive ? ' controls-composer-voice-holding' : ''}`}>
           {!isMobileLayout && !compact && (
