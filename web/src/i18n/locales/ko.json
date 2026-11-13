@@ -4077,6 +4077,7 @@
   "featureAnnouncements": {
     "label": "새 기능",
     "messagePins": "메시지를 마우스 오른쪽 버튼으로 클릭하면 고정할 수 있습니다. 모바일에서는 길게 누르세요.",
+    "cloudDocs": "새 클라우드 문서: ONLYOFFICE에서 문서·스프레드시트·프레젠테이션을 온라인 편집하고 크기 조절·새 창 미리보기 및 팀 역할별 공유를 지원합니다. 채팅에서 'cloud doc' 또는 '云文档'을 언급하면 Agent가 MCP로 함께 읽고 편집합니다.",
     "dismiss": "확인"
   },
   "messagePins": {

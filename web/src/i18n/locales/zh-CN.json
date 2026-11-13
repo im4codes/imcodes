@@ -4079,6 +4079,7 @@
   "featureAnnouncements": {
     "label": "新功能",
     "messagePins": "右键消息即可固定；移动端请长按消息。",
+    "cloudDocs": "全新云文档：支持 ONLYOFFICE 在线编辑文档/表格/演示文稿与缩放、独立新窗口预览，按团队角色权限共享，在对话中提及“云文档”或“cloud doc”还可让 Agent 通过 MCP 协同读写。",
     "dismiss": "知道了"
   },
   "messagePins": {

@@ -4078,6 +4078,7 @@
   "featureAnnouncements": {
     "label": "新功能",
     "messagePins": "在訊息上按右鍵即可固定；行動裝置請長按訊息。",
+    "cloudDocs": "全新雲端文件：支援 ONLYOFFICE 線上編輯文件/試算表/簡報與縮放、獨立新視窗預覽，依團隊角色權限共用，在對話中提及「cloud doc」或「云文档」還可讓 Agent 透過 MCP 協同讀寫。",
     "dismiss": "知道了"
   },
   "messagePins": {

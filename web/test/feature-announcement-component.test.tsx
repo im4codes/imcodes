@@ -2,7 +2,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { FeatureAnnouncement, FeatureAnnouncementHost } from '../src/components/FeatureAnnouncement.js';
-import { FEATURE_ANNOUNCEMENTS_PREF_KEY } from '../src/feature-announcements.js';
+import {
+  FEATURE_ANNOUNCEMENTS,
+  FEATURE_ANNOUNCEMENTS_PREF_KEY,
+  featureAnnouncementKey,
+} from '../src/feature-announcements.js';
 
 const getUserPref = vi.fn();
 const saveUserPref = vi.fn();
@@ -33,8 +37,19 @@ describe('FeatureAnnouncement', () => {
 
     rerender(<FeatureAnnouncement announcement={announcement} open onDismiss={onDismiss} />);
     expect(screen.getByText('featureAnnouncements.messagePins')).toBeTruthy();
+    expect(screen.getByTestId('feature-announcement').querySelector('.feature-announcement-icon')?.textContent).toBe('📌');
     fireEvent.click(screen.getByText('featureAnnouncements.dismiss'));
     expect(onDismiss).toHaveBeenCalledTimes(1);
+
+    rerender(
+      <FeatureAnnouncement
+        announcement={{ id: 'cloud-docs', version: 1, messageKey: 'featureAnnouncements.cloudDocs', icon: '☁️' }}
+        open
+        onDismiss={onDismiss}
+      />,
+    );
+    expect(screen.getByText('featureAnnouncements.cloudDocs')).toBeTruthy();
+    expect(screen.getByTestId('feature-announcement').querySelector('.feature-announcement-icon')?.textContent).toBe('☁️');
   });
 
   it('does not flash before the server preference has hydrated', async () => {
@@ -53,7 +68,7 @@ describe('FeatureAnnouncement', () => {
     );
     expect(screen.queryByTestId('feature-announcement')).toBeNull();
 
-    resolvePreference(JSON.stringify({ v: { dismissed: ['message-pins@1'] }, t: 10 }));
+    resolvePreference(JSON.stringify({ v: { dismissed: FEATURE_ANNOUNCEMENTS.map(featureAnnouncementKey) }, t: 10 }));
     await waitFor(() => expect(onPendingChange).toHaveBeenLastCalledWith(false));
     expect(getUserPref).toHaveBeenCalledWith(FEATURE_ANNOUNCEMENTS_PREF_KEY, { strict: true, signal: expect.any(AbortSignal) });
     expect(screen.queryByTestId('feature-announcement')).toBeNull();
@@ -63,12 +78,17 @@ describe('FeatureAnnouncement', () => {
     getUserPref.mockResolvedValue(null);
     const { unmount } = render(<FeatureAnnouncementHost userId="user-a" sessionsLoaded hasActiveSession blockedByModal={false} />);
 
-    await waitFor(() => expect(screen.getByTestId('feature-announcement')).toBeTruthy());
-    fireEvent.click(screen.getByText('featureAnnouncements.dismiss'));
+    const expectedDismissed: string[] = [];
+    for (let i = 0; i < FEATURE_ANNOUNCEMENTS.length; i += 1) {
+      const entry = FEATURE_ANNOUNCEMENTS[i]!;
+      await waitFor(() => expect(screen.getByText(entry.messageKey)).toBeTruthy());
+      fireEvent.click(screen.getByText('featureAnnouncements.dismiss'));
+      expectedDismissed.push(featureAnnouncementKey(entry));
+      await waitFor(() => expect(saveUserPref).toHaveBeenCalledTimes(i + 1));
+      expect(saveUserPref.mock.calls[i]?.[0]).toBe(FEATURE_ANNOUNCEMENTS_PREF_KEY);
+      expect(JSON.parse(saveUserPref.mock.calls[i]?.[1] as string).v).toEqual({ dismissed: expectedDismissed });
+    }
     await waitFor(() => expect(screen.queryByTestId('feature-announcement')).toBeNull());
-    expect(saveUserPref).toHaveBeenCalledTimes(1);
-    expect(saveUserPref.mock.calls[0]?.[0]).toBe(FEATURE_ANNOUNCEMENTS_PREF_KEY);
-    expect(JSON.parse(saveUserPref.mock.calls[0]?.[1] as string).v).toEqual({ dismissed: ['message-pins@1'] });
 
     unmount();
     saveUserPref.mockClear();
@@ -85,6 +105,33 @@ describe('FeatureAnnouncement', () => {
     await waitFor(() => expect(onPendingChange).toHaveBeenLastCalledWith(false));
     expect(getUserPref).toHaveBeenCalledTimes(2);
     expect(screen.queryByTestId('feature-announcement')).toBeNull();
+  });
+
+  it('shows cloud-docs@1 when message-pins@1 was already dismissed and persists cloud-docs@1 on dismiss', async () => {
+    getUserPref.mockResolvedValue(JSON.stringify({ v: { dismissed: ['message-pins@1'] }, t: 10 }));
+    const onPendingChange = vi.fn();
+    render(
+      <FeatureAnnouncementHost
+        userId="user-a"
+        sessionsLoaded
+        hasActiveSession
+        blockedByModal={false}
+        onPendingChange={onPendingChange}
+      />,
+    );
+
+    const banner = await screen.findByTestId('feature-announcement');
+    expect(screen.getByText('featureAnnouncements.cloudDocs')).toBeTruthy();
+    expect(banner.querySelector('.feature-announcement-icon')?.textContent).toBe('☁️');
+    expect(onPendingChange).toHaveBeenLastCalledWith(true);
+
+    fireEvent.click(screen.getByText('featureAnnouncements.dismiss'));
+    await waitFor(() => expect(screen.queryByTestId('feature-announcement')).toBeNull());
+    expect(saveUserPref).toHaveBeenCalledTimes(1);
+    expect(saveUserPref.mock.calls[0]?.[0]).toBe(FEATURE_ANNOUNCEMENTS_PREF_KEY);
+    expect(JSON.parse(saveUserPref.mock.calls[0]?.[1] as string).v).toEqual({
+      dismissed: ['message-pins@1', 'cloud-docs@1'],
+    });
   });
 
   it('waits until a chat is usable and modal guides are out of the way', async () => {
@@ -124,8 +171,10 @@ describe('FeatureAnnouncement', () => {
   it('isolates the local acknowledgement cache by account', async () => {
     getUserPref.mockResolvedValue(null);
     const first = render(<FeatureAnnouncementHost userId="user-a" sessionsLoaded hasActiveSession blockedByModal={false} />);
-    await waitFor(() => expect(screen.getByTestId('feature-announcement')).toBeTruthy());
-    fireEvent.click(screen.getByText('featureAnnouncements.dismiss'));
+    for (const entry of FEATURE_ANNOUNCEMENTS) {
+      await waitFor(() => expect(screen.getByText(entry.messageKey)).toBeTruthy());
+      fireEvent.click(screen.getByText('featureAnnouncements.dismiss'));
+    }
     await waitFor(() => expect(screen.queryByTestId('feature-announcement')).toBeNull());
     first.unmount();
 

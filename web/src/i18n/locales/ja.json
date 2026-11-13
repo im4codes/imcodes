@@ -4077,6 +4077,7 @@
   "featureAnnouncements": {
     "label": "新機能",
     "messagePins": "メッセージを右クリックすると固定できます。モバイルでは長押ししてください。",
+    "cloudDocs": "新しいクラウドドキュメント：ONLYOFFICE で文書・表計算・スライドをオンライン編集し、サイズ変更や別ウィンドウ表示、チームロール別共有に対応。チャットで「cloud doc」/「云文档」と伝えると Agent が MCP で読み書きできます。",
     "dismiss": "了解"
   },
   "messagePins": {

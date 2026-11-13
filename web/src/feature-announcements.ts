@@ -3,6 +3,8 @@ export interface FeatureAnnouncement {
   id: string;
   version: number;
   messageKey: string;
+  /** Optional leading icon rendered in `.feature-announcement-icon` (defaults to `📌`). */
+  icon?: string;
 }
 
 export interface FeatureAnnouncementPreference {
@@ -25,6 +27,12 @@ export const FEATURE_ANNOUNCEMENTS: readonly FeatureAnnouncement[] = [
     id: 'message-pins',
     version: 1,
     messageKey: 'featureAnnouncements.messagePins',
+  },
+  {
+    id: 'cloud-docs',
+    version: 1,
+    messageKey: 'featureAnnouncements.cloudDocs',
+    icon: '☁️',
   },
 ];
 

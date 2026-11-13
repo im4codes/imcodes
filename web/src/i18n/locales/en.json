@@ -4079,6 +4079,7 @@
   "featureAnnouncements": {
     "label": "New feature",
     "messagePins": "Right-click a message to pin it. On mobile, press and hold.",
+    "cloudDocs": "New Cloud Docs: edit Docs, Sheets & Slides online in ONLYOFFICE with resizable/new-window preview, share by team roles, or mention \"cloud doc\" / \"云文档\" in chat so agents read & edit for you.",
     "dismiss": "Got it"
   },
   "messagePins": {

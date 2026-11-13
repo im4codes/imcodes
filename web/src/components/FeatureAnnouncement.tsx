@@ -32,7 +32,7 @@ export function FeatureAnnouncement({ announcement, open, onDismiss }: Props) {
       data-announcement-version={announcement.version}
     >
       <div class="feature-announcement-message">
-        <span class="feature-announcement-icon" aria-hidden="true">📌</span>
+        <span class="feature-announcement-icon" aria-hidden="true">{announcement.icon ?? '📌'}</span>
         <span>{t(announcement.messageKey)}</span>
       </div>
       <button type="button" class="feature-announcement-dismiss" onClick={onDismiss}>
