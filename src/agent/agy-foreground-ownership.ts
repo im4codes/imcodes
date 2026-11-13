@@ -406,14 +406,13 @@ export class AgyForegroundOwnership {
     const plainCandidates = unbound.filter(p => p.tagCount === 0);
     if (plainCandidates.length === 0) return undefined;
 
-    const exactPlain = plainCandidates.find(p =>
-      promptMatchTargets(p).some(t => t.tagCount === 0 && content.includes(t.text)),
-    );
+    // Legacy substring wrapper matching applies only to the original primary payload text,
+    // never to structured companion aliases (which must match via exact/normalized equality,
+    // strict Context paragraph relation, or explicit truncation markers).
+    const exactPlain = plainCandidates.find(p => p.text !== undefined && content.includes(p.text));
     if (exactPlain) return exactPlain;
 
-    const normPlain = plainCandidates.find(p =>
-      promptMatchTargets(p).some(t => t.tagCount === 0 && t.normText.length > 0 && normRaw.includes(t.normText)),
-    );
+    const normPlain = plainCandidates.find(p => p.normText !== undefined && p.normText.length > 0 && normRaw.includes(p.normText));
     if (normPlain) return normPlain;
 
     const companionPlain = plainCandidates.find(p =>

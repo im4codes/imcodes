@@ -831,6 +831,57 @@ describe('AG captured native foreground ownership', () => {
     expect(oForeign.latest).toBeUndefined();
   });
 
+  it('excludes structured aliases from unbound substring fallback while preserving exact alias and Context companion binding (F1-R2)', async () => {
+    const bareAlias = 'delete the database';
+    const ctxPrompt = `Context instructions:\nPolicy header.\n\n${bareAlias}`;
+    const foreignInputs = [
+      'Do not delete the database',
+      '<USER_REQUEST>Do not delete the database</USER_REQUEST>',
+      `Context instructions:\nPolicy header.\n\nDo not delete the database`,
+      `<USER_REQUEST>\nContext instructions:\nPolicy header.\n\nNever delete the database\n</USER_REQUEST>`,
+    ];
+
+    // Both when unbound as first prompt and when pending behind an already-bound G1.
+    for (const pendingBehindBound of [false, true]) {
+      for (const foreign of foreignInputs) {
+        const o = new AgyForegroundOwnership(30);
+        o.beginTurn();
+        if (pendingBehindBound) {
+          o.register(1, 'original task');
+          o.observe(row(1, 'USER_INPUT', '<USER_REQUEST>original task</USER_REQUEST>', 'USER_EXPLICIT'));
+        }
+        const g = pendingBehindBound ? 2 : 1;
+        o.register(g, ctxPrompt, pendingBehindBound, undefined, [bareAlias]);
+        o.observe(row(2, 'USER_INPUT', foreign, 'USER_EXPLICIT'));
+        expect(o.hasBoundInput(g)).toBe(false);
+        expect(o.observe(row(3, 'PLANNER_RESPONSE', 'FOREIGN OUTPUT'))).toBe(false);
+        expect(o.latest).toBeUndefined();
+        o.clear();
+      }
+
+      // Positive cases: exact plain alias, <USER_REQUEST>-wrapped alias, and Context companion still bind and attribute.
+      for (const validInput of [
+        bareAlias,
+        `<USER_REQUEST>\n${bareAlias}\n</USER_REQUEST>`,
+        `<USER_REQUEST>\nContext instructions:\nOther header.\n\n${bareAlias}\n</USER_REQUEST>`,
+      ]) {
+        const oPos = new AgyForegroundOwnership(100);
+        oPos.beginTurn();
+        if (pendingBehindBound) {
+          oPos.register(1, 'original task');
+          oPos.observe(row(1, 'USER_INPUT', '<USER_REQUEST>original task</USER_REQUEST>', 'USER_EXPLICIT'));
+        }
+        const g = pendingBehindBound ? 2 : 1;
+        oPos.register(g, ctxPrompt, pendingBehindBound, undefined, [bareAlias]);
+        oPos.observe(row(2, 'USER_INPUT', validInput, 'USER_EXPLICIT'));
+        expect(oPos.hasBoundInput(g)).toBe(true);
+        expect(oPos.observe(row(3, 'PLANNER_RESPONSE', 'OWNED ALIAS OUTPUT'))).toBe(true);
+        await expect(oPos.output(g)).resolves.toMatchObject({ content: 'OWNED ALIAS OUTPUT' });
+        oPos.clear();
+      }
+    }
+  });
+
   it('wakes shared-turn output waits without microtask starvation across G1->G2, G2->G1, and absorbed G2 before/after bind (F2)', async () => {
     // 1. G1->G2 absorbed G2 (G2 has no USER_EXPLICIT echo), both when G1 binds before output(2) and after output(2) starts waiting.
     for (const beginWaitBeforeBind of [false, true]) {
