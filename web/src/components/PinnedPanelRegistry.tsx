@@ -57,6 +57,8 @@ export interface PanelRenderContext {
   t: TFunction;
   /** Persist declarative pinned-panel props updates. */
   updatePanelProps?: (panelId: string, props: Record<string, unknown>) => void;
+  /** Open the Controlled Nodes management dialog/tab (e.g. from DocShareDialog when no groups exist). */
+  onOpenNodeGroups?: () => void;
 }
 
 export interface PanelTypeRegistration {

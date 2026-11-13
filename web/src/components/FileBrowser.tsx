@@ -28,6 +28,7 @@ import {
   saveFileBrowserSortPreference,
 } from '../file-browser-list-view.js';
 import { FileBrowserListHeader, FileBrowserListToolbar } from './FileBrowserListChrome.js';
+import { useNodeGroupsNav } from './node-groups-nav.js';
 /**
  * FileBrowser — universal reusable file/directory browser.
  *
@@ -609,6 +610,7 @@ export function FileBrowser({
   onOpenNodeGroups,
 }: FileBrowserProps) {
   const { t, i18n } = useTranslation();
+  const resolvedOnOpenNodeGroups = useNodeGroupsNav(onOpenNodeGroups);
   // react-i18next may provide a new `t` function after every render. Keep
   // preview callbacks stable: auto-preview effects depend on them, and a
   // changing callback would re-dispatch the same chat preview indefinitely.
@@ -3356,7 +3358,7 @@ export function FileBrowser({
       targetPath={shareDialogTarget.path}
       targetKind={shareDialogTarget.kind}
       onClose={() => setShareDialogTarget(null)}
-      onOpenNodeGroups={onOpenNodeGroups}
+      onOpenNodeGroups={resolvedOnOpenNodeGroups}
     />
   ) : null;
 

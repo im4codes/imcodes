@@ -48,6 +48,7 @@ import type { UsageContextWindowSource } from '@shared/usage-context-window.js';
 import type { MessagePin } from '@shared/message-pins.js';
 import { mapP2pRunToDiscussion, mergeP2pDiscussionUpdate, mergeP2pStatusResponseDiscussions } from './p2p-run-mapping.js';
 import { matchDiscussionIndex, reconcileDiscussionEntry, reconcileClassicList, isBarActiveDiscussion, makeOptimisticDiscussionEntry, discussionErrorReasonKey, shouldToastDiscussionError, classifyDiscussionStop, removeDiscussionByRequestId } from './discussion-reconcile.js';
+import { NodeGroupsNavContext } from './components/node-groups-nav.js';
 import { PENDING_START_TIMEOUT_MS, DISCUSSION_RECONCILE_HIDDEN_MS } from '@shared/discussion-ui.js';
 import {
   SUBSESSION_CREATED_BATCH_MSG,
@@ -2666,6 +2667,7 @@ function InternalMainApp() {
   const [userHasPassword, setUserHasPassword] = useState(false);
 
   const openControlledNodes = useCallback(() => {
+    setShowMobileFileBrowser(false);
     ensureDesktopWindow(DESKTOP_WINDOW_IDS.controlledNodes, {
       kind: DESKTOP_WINDOW_KINDS.controlledNodes,
       serverId: selectedServerId ?? undefined,
@@ -7276,6 +7278,7 @@ function InternalMainApp() {
         handlePreviewFileRequest({ ...request, sourcePreviewLive: false });
         onAfterPreview?.();
       },
+      onOpenNodeGroups: openControlledNodes,
       onOpenLocalWebPreview: openLocalWebPreviewFromChat,
       onPreviewStateChange: handlePreviewStateChange,
       activeSession,
@@ -7534,6 +7537,7 @@ function InternalMainApp() {
   );
 
   return (
+    <NodeGroupsNavContext.Provider value={openControlledNodes}>
     <div
       class={`layout${isMobile ? ' layout-mobile' : ''}${mobileRemoteSurfaceActive ? ' layout-mobile-remote-surface-active' : ''}`}
       key={selectedServerId ?? ''}
@@ -8177,6 +8181,7 @@ function InternalMainApp() {
                 onAfterAction={focusTerminal}
                 mobileFileBrowserOpen={s.name === activeSession ? showMobileFileBrowser : false}
                 onMobileFileBrowserClose={() => setShowMobileFileBrowser(false)}
+                onOpenNodeGroups={openControlledNodes}
                 pendingPrefillText={pendingPrefills[s.name] ?? null}
                 onPendingPrefillApplied={() => setPendingPrefills((prev) => {
                   if (!(s.name in prev)) return prev;
@@ -9608,5 +9613,6 @@ function InternalMainApp() {
         </div>
       )}
     </div>
+    </NodeGroupsNavContext.Provider>
   );
 }

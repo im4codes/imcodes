@@ -3146,4 +3146,184 @@ describe('Document sharing: Controlled Node Groups (team:<teamId>) isolation, li
     expect(atExactFileCarol.role).toBe('viewer');
     expect(atExactFileCarol.allowDownload).toBe(false);
   });
+
+  it('F1 counterexamples: hides bound foreign-private teams (machine_groups and legacy servers.team_id), rejects POST 403 including team:<id> alias, preserves historical shares without leaking name, and rejects mismatched targetTeamId/targetUserId', async () => {
+    // Bind srv-1 to third-party foreign-private team via machine_groups
+    store.machineGroups.add('srv-1:team-private-c');
+    // Also add legacy server owned by owner-1 whose legacy servers.team_id points to foreign-private team
+    store.servers.set('srv-legacy', {
+      id: 'srv-legacy',
+      user_id: 'owner-1',
+      team_id: 'team-private-c',
+      name: 'Legacy Server',
+    });
+
+    // Historical share referencing team-private-c already exists in DB (e.g. from before owner-1 was removed from that group)
+    store.shares.set('hist-foreign-1', {
+      id: 'hist-foreign-1',
+      server_id: 'srv-1',
+      target_kind: 'file',
+      target_path: '/docs/legacy-shared.docx',
+      label: null,
+      share_mode: 'team',
+      target_user_id: 'team:team-private-c',
+      participant_label: null,
+      share_token_hash: null,
+      access_code_hash: null,
+      device_lock_enabled: false,
+      bound_device_hash: null,
+      redeemed_by_user_id: null,
+      redeemed_at: null,
+      role: 'viewer',
+      allow_download: true,
+      created_by: 'owner-1',
+      created_at: 1700000000100,
+      updated_at: 1700000000100,
+      expires_at: null,
+      revoked_at: null,
+    });
+
+    // Removable group that owner-1 initially belongs to, creates a share for, then gets removed from
+    store.teams.set('team-removable', { id: 'team-removable', name: 'Removable Bound Group', owner_id: 'user-stranger' });
+    store.teamMembers.set('team-removable:user-stranger', 'owner');
+    store.teamMembers.set('team-removable:owner-1', 'member');
+    store.machineGroups.add('srv-1:team-removable');
+
+    const createRemovableRes = await app.request('/api/server/srv-1/doc-shares', {
+      method: 'POST',
+      headers: { Authorization: bearer('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetKind: 'file',
+        targetPath: '/docs/removable.docx',
+        shareMode: 'team',
+        targetTeamId: 'team-removable',
+        role: 'viewer',
+      }),
+    });
+    expect(createRemovableRes.status).toBe(201);
+
+    // Now remove owner-1 from team-removable while owner-1 remains owner of srv-1
+    store.teamMembers.delete('team-removable:owner-1');
+
+    // GET on srv-1: must omit BOTH team-private-c and team-removable from groups, must NOT leak either team name,
+    // and must preserve both existing shares with targetTeamName: null
+    const getSrv1 = await app.request('/api/server/srv-1/doc-shares', {
+      headers: { Authorization: bearer('owner-1') },
+    });
+    expect(getSrv1.status).toBe(200);
+    const bodySrv1Text = await getSrv1.text();
+    expect(bodySrv1Text).not.toContain('Secret Third Party');
+    expect(bodySrv1Text).not.toContain('Removable Bound Group');
+    const bodySrv1 = JSON.parse(bodySrv1Text) as {
+      groups: Array<{ id: string; name: string; boundToServer: boolean }>;
+      shares: Array<{ id: string; targetTeamId?: string | null; targetTeamName?: string | null }>;
+    };
+    expect(bodySrv1.groups.map((g) => g.id)).toEqual(['team-1', 'team-global-b']);
+    const histShare = bodySrv1.shares.find((s) => s.id === 'hist-foreign-1');
+    const remShare = bodySrv1.shares.find((s) => s.targetTeamId === 'team-removable');
+    expect(histShare).toBeDefined();
+    expect(histShare?.targetTeamName).toBeNull();
+    expect(remShare).toBeDefined();
+    expect(remShare?.targetTeamName).toBeNull();
+    expect(store.shares.has('hist-foreign-1')).toBe(true);
+
+    // GET on legacy server (servers.team_id = team-private-c): must not include team-private-c or leak its name
+    const getLegacy = await app.request('/api/server/srv-legacy/doc-shares', {
+      headers: { Authorization: bearer('owner-1') },
+    });
+    expect(getLegacy.status).toBe(200);
+    const bodyLegacyText = await getLegacy.text();
+    expect(bodyLegacyText).not.toContain('Secret Third Party');
+    const bodyLegacy = JSON.parse(bodyLegacyText) as {
+      groups: Array<{ id: string; boundToServer: boolean }>;
+    };
+    expect(bodyLegacy.groups.map((g) => g.id)).toEqual(['team-global-b', 'team-1']);
+    expect(bodyLegacy.groups.every((g) => g.boundToServer === false)).toBe(true);
+
+    // POST attempts to bound foreign-private / removed team (via targetTeamId OR targetUserId: 'team:<id>') must return 403 target_team_forbidden
+    for (const [serverPath, payload] of [
+      ['/api/server/srv-1/doc-shares', { targetTeamId: 'team-private-c' }],
+      ['/api/server/srv-1/doc-shares', { targetUserId: 'team:team-private-c' }],
+      ['/api/server/srv-1/doc-shares', { targetTeamId: 'team-removable' }],
+      ['/api/server/srv-legacy/doc-shares', { targetTeamId: 'team-private-c' }],
+      ['/api/server/srv-legacy/doc-shares', { targetUserId: 'team:team-private-c' }],
+    ] as const) {
+      const forbiddenRes = await app.request(serverPath, {
+        method: 'POST',
+        headers: { Authorization: bearer('owner-1'), 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          targetKind: 'file',
+          targetPath: '/docs/blocked.docx',
+          shareMode: 'team',
+          role: 'viewer',
+          ...payload,
+        }),
+      });
+      expect(forbiddenRes.status).toBe(403);
+      expect(await forbiddenRes.json()).toEqual({ error: 'target_team_forbidden' });
+    }
+
+    // Mismatched targetTeamId vs targetUserId: 'team:<other>' is rejected with 400 invalid_target_team
+    const mismatchRes = await app.request('/api/server/srv-1/doc-shares', {
+      method: 'POST',
+      headers: { Authorization: bearer('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetKind: 'file',
+        targetPath: '/docs/mismatch.docx',
+        shareMode: 'team',
+        targetTeamId: 'team-1',
+        targetUserId: 'team:team-global-b',
+        role: 'viewer',
+      }),
+    });
+    expect(mismatchRes.status).toBe(400);
+    expect(await mismatchRes.json()).toEqual({ error: 'invalid_target_team' });
+
+    // Admin via Group A (team-1) cannot inspect or grant shares to foreign-private Group B bound on the same server
+    store.users.set('user-admin-a', {
+      id: 'user-admin-a',
+      username: 'admin-a',
+      display_name: 'Admin A',
+      status: 'active',
+      sessions_valid_after: 0,
+      is_admin: false,
+    });
+    store.teamMembers.set('team-1:user-admin-a', 'admin');
+    const adminGet = await app.request('/api/server/srv-1/doc-shares', {
+      headers: { Authorization: bearer('user-admin-a') },
+    });
+    expect(adminGet.status).toBe(200);
+    const adminGetText = await adminGet.text();
+    expect(adminGetText).not.toContain('Secret Third Party');
+    const adminBody = JSON.parse(adminGetText) as { groups: Array<{ id: string }> };
+    expect(adminBody.groups.map((g) => g.id)).toEqual(['team-1']);
+
+    const adminPostForeign = await app.request('/api/server/srv-1/doc-shares', {
+      method: 'POST',
+      headers: { Authorization: bearer('user-admin-a'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetKind: 'file',
+        targetPath: '/docs/admin-blocked.docx',
+        shareMode: 'team',
+        targetTeamId: 'team-private-c',
+        role: 'viewer',
+      }),
+    });
+    expect(adminPostForeign.status).toBe(403);
+    expect(await adminPostForeign.json()).toEqual({ error: 'target_team_forbidden' });
+
+    // Plain 'member' of unbound global group (owner-1 is member of team-global-b) sees boundToServer=false and succeeds 201
+    const unboundCreate = await app.request('/api/server/srv-1/doc-shares', {
+      method: 'POST',
+      headers: { Authorization: bearer('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetKind: 'file',
+        targetPath: '/docs/unbound-ok.docx',
+        shareMode: 'team',
+        targetTeamId: 'team-global-b',
+        role: 'viewer',
+      }),
+    });
+    expect(unboundCreate.status).toBe(201);
+  });
 });

@@ -123,6 +123,8 @@ export interface SessionPaneProps {
   mobileFileBrowserOpen?: boolean;
   /** Mobile: called when the file browser overlay requests close. */
   onMobileFileBrowserClose?: () => void;
+  /** Open Controlled Nodes management (forwarded to SessionControls -> FileBrowser -> DocShareDialog). */
+  onOpenNodeGroups?: () => void;
   /** Text to prefill into the input when a navigation action carries a quote. */
   pendingPrefillText?: string | null;
   /** Called after pendingPrefillText has been consumed by the input. */
@@ -170,6 +172,7 @@ export function SessionPane({
   onOpenLocalWebPreview,
   mobileFileBrowserOpen,
   onMobileFileBrowserClose,
+  onOpenNodeGroups,
   pendingPrefillText,
   onPendingPrefillApplied,
   pendingSharedUpload,
@@ -591,6 +594,7 @@ export function SessionPane({
           keyboardActive={keyboardActive ?? isActive}
           mobileFileBrowserOpen={mobileFileBrowserOpen}
           onMobileFileBrowserClose={onMobileFileBrowserClose}
+          onOpenNodeGroups={onOpenNodeGroups}
           sessions={sessions}
           subSessions={subSessions}
           serverId={serverId}

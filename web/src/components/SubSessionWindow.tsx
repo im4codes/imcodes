@@ -14,6 +14,7 @@ import { TerminalView } from './TerminalView.js';
 import { ChatView } from './ChatView.js';
 import { SubSessionTaskTitle } from './SubSessionTaskTitle.js';
 import { FileBrowser, type FileBrowserPreviewRequest } from './FileBrowser.js';
+import { useNodeGroupsNav } from './node-groups-nav.js';
 import { StableSessionControls as SessionControls } from './StableSessionControls.js';
 import { UsageFooter } from './UsageFooter.js';
 import { FloatingPanel } from './FloatingPanel.js';
@@ -397,6 +398,11 @@ export function SubSessionWindow({
   // (not the parent main session's). The mobile overlay is portaled to body so
   // the sub-session's lower stacking context cannot trap it below app chrome.
   const [showFileBrowser, setShowFileBrowser] = useState(false);
+  const baseOpenNodeGroups = useNodeGroupsNav();
+  const handleOpenNodeGroupsFromBrowser = useCallback(() => {
+    if (isMobile) setShowFileBrowser(false);
+    baseOpenNodeGroups?.();
+  }, [isMobile, baseOpenNodeGroups]);
 
   // Sync the desktop child file-browser open/close into the shared window
   // stack via the parent-supplied callbacks. Mobile is a no-op (it renders
@@ -1311,6 +1317,7 @@ export function SubSessionWindow({
                 setShowFileBrowser(false);
               }}
               onClose={() => setShowFileBrowser(false)}
+              onOpenNodeGroups={baseOpenNodeGroups ? handleOpenNodeGroupsFromBrowser : undefined}
             />
           </div>,
           document.body,
@@ -1348,6 +1355,7 @@ export function SubSessionWindow({
                 }
               }}
               onClose={() => setShowFileBrowser(false)}
+              onOpenNodeGroups={baseOpenNodeGroups ? handleOpenNodeGroupsFromBrowser : undefined}
             />
           </FloatingPanel>
         )

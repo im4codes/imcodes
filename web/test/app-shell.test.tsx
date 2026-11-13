@@ -561,6 +561,7 @@ vi.mock('../src/components/SessionPane.js', () => ({
   SessionPane: ({
     isActive,
     session,
+    mobileFileBrowserOpen,
     onAfterAction,
     onChatScrollFn,
     onDiff,
@@ -569,6 +570,7 @@ vi.mock('../src/components/SessionPane.js', () => ({
     onHistory,
     onInputRef,
     onMobileFileBrowserClose,
+    onOpenNodeGroups,
     onPendingPrefillApplied,
     onPreviewFile,
     onOpenLocalWebPreview,
@@ -582,6 +584,7 @@ vi.mock('../src/components/SessionPane.js', () => ({
     <div
       data-testid={`session-pane-${session.name}`}
       data-is-active={String(Boolean(isActive))}
+      data-mobile-fb-open={String(Boolean(mobileFileBrowserOpen))}
       data-active-dispatch-id={session.sharedState?.activeDispatchId ?? ''}
       data-session-state={session.state ?? ''}
       data-supervision-mode={session.supervisionMode ?? ''}
@@ -605,6 +608,9 @@ vi.mock('../src/components/SessionPane.js', () => ({
       <button onClick={() => onTransportConfigSaved?.({ supervision: { mode: 'supervised' } })}>pane-config</button>
       <button onClick={onAfterAction}>pane-after-action</button>
       <button onClick={onMobileFileBrowserClose}>pane-close-mobile-files</button>
+      {mobileFileBrowserOpen && onOpenNodeGroups && (
+        <button onClick={onOpenNodeGroups}>pane-mobile-open-node-groups</button>
+      )}
       <button onClick={onPendingPrefillApplied}>pane-prefill-applied</button>
       <button onClick={() => onPreviewFile?.({
         path: '/home/ai/.imcodes/uploads/392836a75fc67a4ff38c2dcedc9afe32.png',
@@ -8068,5 +8074,35 @@ describe('App shell', () => {
 
     const nodesPanel = await screen.findByTestId('floating-panel-controlled-nodes');
     expect(nodesPanel.textContent).toContain('controlled-nodes-panel');
+  }, 15000);
+
+  it('closes mobile file browser overlay and opens ControlledNodesPanel via NodeGroupsNavContext', async () => {
+    const originalUA = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', {
+      configurable: true,
+      value: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
+    });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      render(<App />);
+
+      const pane = await screen.findByTestId('session-pane-deck_alpha_brain');
+      expect(pane.getAttribute('data-mobile-fb-open')).toBe('false');
+
+      fireEvent.click(screen.getByTitle('Files'));
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-mobile-fb-open')).toBe('true'));
+
+      fireEvent.click(within(screen.getByTestId('session-pane-deck_alpha_brain')).getByText('pane-mobile-open-node-groups'));
+
+      const nodesPanel = await screen.findByTestId('floating-panel-controlled-nodes');
+      expect(nodesPanel.textContent).toContain('controlled-nodes-panel');
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-mobile-fb-open')).toBe('false'));
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUA });
+    }
   }, 15000);
 });

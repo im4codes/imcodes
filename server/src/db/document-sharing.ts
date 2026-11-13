@@ -436,7 +436,29 @@ export async function listServerDocumentGroups(
   serverId: string,
   actorUserId: string,
 ): Promise<ServerDocumentGroup[]> {
-  const [machineGroupTeams, legacyServerTeams, managedTeams] = await Promise.all([
+  // Only global teams owned by or having caller as a member are eligible.
+  // machine_groups / legacy servers.team_id only annotate boundToServer for eligible groups.
+  const managedTeams = await db.query<{ id: string; name: string }>(
+    `SELECT t.id, t.name
+       FROM teams t
+      WHERE t.owner_id = $1
+         OR EXISTS (
+           SELECT 1 FROM team_members tm
+            WHERE tm.team_id = t.id AND tm.user_id = $1
+         )`,
+    [actorUserId],
+  );
+
+  const teamNames = new Map<string, string>();
+  for (const row of managedTeams) {
+    if (!row?.id) continue;
+    teamNames.set(row.id, row.name);
+  }
+
+  const teamIds = [...teamNames.keys()];
+  if (teamIds.length === 0) return [];
+
+  const [machineGroupTeams, legacyServerTeams, activeMemberRows] = await Promise.all([
     db.query<{ id: string; name: string }>(
       `SELECT t.id, t.name
          FROM machine_groups mg
@@ -451,46 +473,27 @@ export async function listServerDocumentGroups(
         WHERE s.id = $1 AND s.team_id IS NOT NULL`,
       [serverId],
     ),
-    db.query<{ id: string; name: string }>(
-      `SELECT t.id, t.name
-         FROM teams t
-        WHERE t.owner_id = $1
-           OR EXISTS (
-             SELECT 1 FROM team_members tm
-              WHERE tm.team_id = t.id AND tm.user_id = $1
-           )`,
-      [actorUserId],
+    db.query<{ team_id: string; user_id: string }>(
+      `SELECT tm.team_id, tm.user_id
+         FROM team_members tm
+         JOIN users u ON u.id = tm.user_id
+        WHERE tm.team_id = ANY($1::text[])
+          AND u.status = $2`,
+      [teamIds, USER_STATUS.ACTIVE],
     ),
   ]);
 
   const boundIds = new Set<string>();
-  const teamNames = new Map<string, string>();
   for (const row of machineGroupTeams) {
-    if (!row?.id) continue;
-    boundIds.add(row.id);
-    teamNames.set(row.id, row.name);
+    if (row?.id && teamNames.has(row.id)) {
+      boundIds.add(row.id);
+    }
   }
   for (const row of legacyServerTeams) {
-    if (!row?.id) continue;
-    boundIds.add(row.id);
-    if (!teamNames.has(row.id)) teamNames.set(row.id, row.name);
+    if (row?.id && teamNames.has(row.id)) {
+      boundIds.add(row.id);
+    }
   }
-  for (const row of managedTeams) {
-    if (!row?.id) continue;
-    if (!teamNames.has(row.id)) teamNames.set(row.id, row.name);
-  }
-
-  const teamIds = [...teamNames.keys()];
-  if (teamIds.length === 0) return [];
-
-  const activeMemberRows = await db.query<{ team_id: string; user_id: string }>(
-    `SELECT tm.team_id, tm.user_id
-       FROM team_members tm
-       JOIN users u ON u.id = tm.user_id
-      WHERE tm.team_id = ANY($1::text[])
-        AND u.status = $2`,
-    [teamIds, USER_STATUS.ACTIVE],
-  );
 
   const memberSets = new Map<string, Set<string>>();
   for (const row of activeMemberRows) {

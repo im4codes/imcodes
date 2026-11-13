@@ -199,6 +199,9 @@ documentSharingRoutes.post('/server/:id/doc-shares', requireAuth(), async (c): P
   if (rawUserField.startsWith('team:') && !rawTeamFromUserField) {
     return c.json({ error: 'invalid_target_team' }, 400);
   }
+  if (rawTargetTeamId && rawTeamFromUserField && rawTargetTeamId !== rawTeamFromUserField) {
+    return c.json({ error: 'invalid_target_team' }, 400);
+  }
   const requestedTeamId = rawTargetTeamId || rawTeamFromUserField;
 
   let shareMode: DocumentShareMode =

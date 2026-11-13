@@ -16,6 +16,7 @@ import {
   matchSlashCommandTrigger,
 } from '../quick-commands.js';
 import { FileBrowser } from './file-browser-lazy.js';
+import { useNodeGroupsNav } from './node-groups-nav.js';
 import { CloneSessionGroupDialog } from './CloneSessionGroupDialog.js';
 import { ConfirmButton } from './ConfirmButton.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
@@ -338,6 +339,8 @@ interface Props {
   /** Mobile: open full-screen file browser overlay. */
   mobileFileBrowserOpen?: boolean;
   onMobileFileBrowserClose?: () => void;
+  /** Open Controlled Nodes management (passed through to FileBrowser / DocShareDialog). */
+  onOpenNodeGroups?: () => void;
   /** All sessions — for @ picker agent list. */
   sessions?: SessionInfo[];
   /** Sub-sessions — for @ picker agent list (includes deck_sub_*).
@@ -1247,7 +1250,13 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onRemoveOptimisticMessage, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, transportTimelineEvents, timelineSettledQueuedIds: timelineSettledQueuedIdsProp, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, pendingSharedUpload, onPendingSharedUploadConsumed, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange }: Props) {
+export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onRemoveOptimisticMessage, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, transportTimelineEvents, timelineSettledQueuedIds: timelineSettledQueuedIdsProp, mobileFileBrowserOpen, onMobileFileBrowserClose, onOpenNodeGroups, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, pendingSharedUpload, onPendingSharedUploadConsumed, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange }: Props) {
+  const baseOpenNodeGroups = useNodeGroupsNav(onOpenNodeGroups);
+  const handleOpenNodeGroupsFromBrowser = useCallback(() => {
+    onMobileFileBrowserClose?.();
+    setOpenSpecFolderPath(null);
+    baseOpenNodeGroups?.();
+  }, [onMobileFileBrowserClose, baseOpenNodeGroups]);
   recordPerfRender(activeSession?.name?.startsWith('deck_sub_') ? 'SessionControls:sub' : 'SessionControls:main');
   const { t, i18n } = useTranslation();
   const deliveryModePref = usePref<SessionSendDeliveryMode>(SESSION_SEND_DELIVERY_USER_PREF_KEY, {
@@ -6523,6 +6532,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             onMobileFileBrowserClose?.();
           }}
           onClose={onMobileFileBrowserClose}
+          onOpenNodeGroups={baseOpenNodeGroups ? handleOpenNodeGroupsFromBrowser : undefined}
         />
       </div>,
       document.body,
@@ -6551,6 +6561,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               setOpenSpecFolderPath(null);
             }}
             onClose={() => setOpenSpecFolderPath(null)}
+            onOpenNodeGroups={baseOpenNodeGroups ? handleOpenNodeGroupsFromBrowser : undefined}
           />
         </div>
       </div>

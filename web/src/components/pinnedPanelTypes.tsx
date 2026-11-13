@@ -226,6 +226,7 @@ registerPanelType('filebrowser', {
         hideFooter={false}
         onPreviewStateChange={ctx.onPreviewStateChange}
         onPreviewFile={ctx.onPreviewFile ? (request) => ctx.onPreviewFile?.({ ...request, rootPath: projectDir }) : undefined}
+        onOpenNodeGroups={ctx.onOpenNodeGroups}
         onConfirm={(paths) => {
           const inputEl = activeSession && ctx.inputRefsMap?.current
             ? ctx.inputRefsMap.current.get(activeSession)
