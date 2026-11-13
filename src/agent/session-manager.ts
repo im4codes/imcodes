@@ -1,5 +1,6 @@
 import { isIncognitoSession, supportsSessionIncognito, SESSION_INCOGNITO_UNSUPPORTED, type SessionIncognitoConfig } from '../../shared/session-incognito-types.js';
 import { notifySessionTeardown, setSessionIncognito, withSessionPrivacy } from '../../shared/session-incognito-context.js';
+import { reclaimOrphanedAgyIncognitoHomesSync } from './agy-incognito-isolation.js';
 import { AGY_NATIVE_SESSION_STATE, AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { agyNativeStartNotAttemptedError, persistAgyNativeSessionStart } from './agy-session-persistence.js';
 import { queuedUserMessageAttribution } from './transport-queued-user-message.js';
@@ -546,6 +547,11 @@ export async function initOnStartup(): Promise<void> {
     await cleanupOrphanFifos();
   } catch (err) {
     logger.warn({ err }, 'cleanupOrphanFifos failed — daemon continues');
+  }
+  try {
+    reclaimOrphanedAgyIncognitoHomesSync();
+  } catch (err) {
+    logger.warn({ err }, 'reclaimOrphanedAgyIncognitoHomesSync failed — daemon continues');
   }
   try {
     await cleanupKnownTestTerminalSessions();

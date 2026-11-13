@@ -1,13 +1,16 @@
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AGY_ACP_AGENT_NAME, AGY_CLI_FLAG, AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { withSessionPrivacy } from '../../shared/session-incognito-context.js';
 import { supportsSessionIncognito } from '../../shared/session-incognito-types.js';
-import { createAgyIncognitoEnvSync } from '../../src/agent/agy-incognito-isolation.js';
-import { AgyAcpProvider } from '../../src/agent/providers/agy-acp.js';
+import { createAgyIncognitoEnvSync, reclaimOrphanedAgyIncognitoHomesSync } from '../../src/agent/agy-incognito-isolation.js';
+import { AgyAcpProvider, createAgyProvider } from '../../src/agent/providers/agy-acp.js';
 import { AgySdkProvider } from '../../src/agent/providers/agy-sdk.js';
+import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
 import { IMCODES_SESSION_ENV } from '../../shared/imcodes-send.js';
 
@@ -77,7 +80,7 @@ describe('AGY Incognito Isolation', () => {
     expect(isolated.env.USERPROFILE).toBe(isolated.homeDir);
     expect(isolated.env.GEMINI_CLI_HOME).toBe(isolated.homeDir);
     expect(isolated.acpFlags).toEqual([AGY_CLI_FLAG.DISABLE_TELEMETRY, AGY_CLI_FLAG.LOG_FILE, isolated.logFile]);
-    expect(isolated.streamFlags).toEqual([AGY_CLI_FLAG.LOG_FILE, isolated.logFile]);
+    expect(existsSync(path.join(isolated.homeDir, '.imcodes-owner.json'))).toBe(true);
 
     const copiedToken = path.join(isolated.homeDir, '.gemini', 'antigravity-cli', 'antigravity-oauth-token');
     expect(lstatSync(copiedToken).isSymbolicLink()).toBe(false);
@@ -268,82 +271,236 @@ rl.on('line', (line) => {
     expect(existsSync(incogHome2)).toBe(false);
   });
 
-  it('isolates AgySdkProvider stream-json incognito sessions without touching real HOME mcp_config or resuming', async () => {
-    const work = makeTempDir('imcodes-agy-incog-stream-');
+  it('reclaims SIGKILL-orphaned incognito homes on cold restart without touching live or unowned dirs, and retries failed cleanup', async () => {
+    const work = makeTempDir('imcodes-agy-orphan-');
+    const customTmp = path.join(work, 'tmp');
+    const sourceHome = path.join(work, 'real-home');
+    mkdirSync(customTmp, { recursive: true });
+    mkdirSync(path.join(sourceHome, '.gemini', 'antigravity-cli'), { recursive: true });
+    writeFileSync(path.join(sourceHome, '.gemini', 'antigravity-cli', 'antigravity-oauth-token'), 'orphan-auth');
+
+    // Unowned directory matching prefix must never be deleted by orphan sweeper.
+    const unownedDir = path.join(customTmp, 'imcodes-agy-incog-unowned');
+    mkdirSync(unownedDir, { recursive: true });
+    writeFileSync(path.join(unownedDir, 'keep.txt'), 'unowned');
+
+    const isolationUrl = pathToFileURL(path.resolve('src/agent/agy-incognito-isolation.ts')).href;
+    const loader = path.resolve('node_modules/tsx/dist/loader.mjs');
+    const workerScript = path.join(work, 'provision.mjs');
+    writeFileSync(workerScript, `
+import { writeFileSync } from 'node:fs';
+import { createAgyIncognitoEnvSync } from ${JSON.stringify(isolationUrl)};
+const iso = createAgyIncognitoEnvSync(process.env.SRC_HOME);
+writeFileSync(iso.homeDir + '/private-sentinel.txt', 'SECRET');
+process.stdout.write(iso.homeDir + '\\n');
+if (process.env.HOLD === '1') {
+  setInterval(() => {}, 1000);
+} else {
+  await iso.cleanup();
+  process.exit(0);
+}
+`);
+
+    const spawnAndReadLine = (hold: string) => {
+      const child = spawn(process.execPath, ['--import', loader, workerScript], {
+        env: { ...process.env, TMPDIR: customTmp, SRC_HOME: sourceHome, HOLD: hold },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      const linePromise = new Promise<string>((resolve, reject) => {
+        let out = '';
+        child.stdout.on('data', (d) => {
+          out += d.toString('utf8');
+          if (out.includes('\n')) resolve(out.trim().split('\n')[0]!);
+        });
+        child.once('error', reject);
+      });
+      return { child, linePromise };
+    };
+
+    // 1. Dead SIGKILL orphan + concurrent active sibling instance
+    const victim = spawnAndReadLine('1');
+    const orphanDir = await victim.linePromise;
+    const active = spawnAndReadLine('1');
+    const activeDir = await active.linePromise;
+
+    victim.child.kill('SIGKILL');
+    await new Promise((r) => victim.child.once('exit', r));
+    expect(existsSync(orphanDir)).toBe(true);
+
+    // 2. Cold restart / new provisioning sweeps only the dead victim's orphan dir
+    const cold = spawnSync(process.execPath, ['--import', loader, workerScript], {
+      env: { ...process.env, TMPDIR: customTmp, SRC_HOME: sourceHome, HOLD: '0' },
+      encoding: 'utf8',
+      timeout: 15_000,
+    });
+    expect(cold.status).toBe(0);
+    expect(existsSync(orphanDir)).toBe(false);
+    expect(existsSync(activeDir)).toBe(true);
+    expect(existsSync(unownedDir)).toBe(true);
+
+    active.child.kill('SIGTERM');
+    await new Promise((r) => active.child.once('exit', r));
+    expect(reclaimOrphanedAgyIncognitoHomesSync(customTmp)).toBe(1);
+    expect(existsSync(activeDir)).toBe(false);
+    expect(existsSync(unownedDir)).toBe(true);
+
+    // 3. Cleanup failure must not permanently mark cleaned=true
+    vi.stubEnv('TMPDIR', customTmp);
+    const locked = createAgyIncognitoEnvSync(sourceHome);
+    const nested = path.join(locked.homeDir, 'locked-sub');
+    mkdirSync(nested, { recursive: true });
+    writeFileSync(path.join(nested, 'secret.txt'), 'locked');
+    chmodSync(nested, 0o500);
+    try {
+      await locked.cleanup();
+      expect(existsSync(locked.homeDir)).toBe(true);
+    } finally {
+      chmodSync(nested, 0o700);
+    }
+    await locked.cleanup();
+    expect(existsSync(locked.homeDir)).toBe(false);
+  });
+
+  it('disposes isolated ACP dir on unexpected child exit and rejects resurrection, and cleans up on startup failure', async () => {
+    const work = makeTempDir('imcodes-agy-incog-crash-');
     const fakeRealHome = path.join(work, 'real-home');
     mkdirSync(path.join(fakeRealHome, '.gemini', 'antigravity-cli'), { recursive: true });
-    mkdirSync(path.join(fakeRealHome, '.gemini', 'config'), { recursive: true });
-    writeFileSync(path.join(fakeRealHome, '.gemini', 'antigravity-cli', 'antigravity-oauth-token'), 'stream-oauth');
-    const realMcpPath = path.join(fakeRealHome, '.gemini', 'config', 'mcp_config.json');
-    writeFileSync(realMcpPath, '{"mcpServers":{}}');
-    const snapshotBefore = listTree(fakeRealHome);
+    writeFileSync(path.join(fakeRealHome, '.gemini', 'antigravity-cli', 'antigravity-oauth-token'), 'crash-oauth');
 
-    const probeLog = path.join(work, 'stream-spawns.jsonl');
-    const script = path.join(work, 'fake-stream.mjs');
+    const record = path.join(work, 'crash-home.txt');
+    const script = path.join(work, 'crash-acp.mjs');
     const binary = path.join(work, 'agy');
     writeFileSync(script, `
 import readline from 'node:readline';
 import fs from 'node:fs';
-const args = process.argv.slice(2);
-if (args[0] === '--help') { console.log('Usage: agy'); process.exit(0); }
-fs.appendFileSync(process.env.PROBE_LOG, JSON.stringify({
-  args,
-  home: process.env.HOME,
-  userprofile: process.env.USERPROFILE,
-  geminiHome: process.env.GEMINI_CLI_HOME,
-  imcodesSession: process.env[${JSON.stringify(IMCODES_SESSION_ENV)}] ?? null,
-}) + '\\n');
-process.stdout.write(JSON.stringify({ event: 'init', conversation_id: 'conv-incog-1' }) + '\\n');
+fs.appendFileSync(process.env.PROBE_RECORD, process.env.HOME + '\\n');
+fs.writeFileSync(process.env.HOME + '/private-sentinel.txt', 'CRASH-SECRET');
+const send = (obj) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...obj }) + '\\n');
 const rl = readline.createInterface({ input: process.stdin });
 rl.on('line', (line) => {
   if (!line.trim()) return;
   const msg = JSON.parse(line);
-  const text = msg.message.content;
-  process.stdout.write(JSON.stringify({ event: 'result', result: { conversation_id: 'conv-incog-1', status: 'SUCCESS', response: 'STREAM:' + text } }) + '\\n');
+  if (msg.method === 'initialize') {
+    const version = process.env.MODE === 'old-acp' ? '1.4.0' : '1.5.8';
+    send({ id: msg.id, result: {
+      protocolVersion: 1,
+      agentInfo: { name: ${JSON.stringify(AGY_ACP_AGENT_NAME)}, version },
+      agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {}, list: {} } },
+    } });
+    return;
+  }
+  if (msg.method === 'session/new') {
+    if (process.env.MODE === 'fail-new') {
+      send({ id: msg.id, error: { code: -32000, message: 'new session failed' } });
+      return;
+    }
+    send({ id: msg.id, result: {
+      sessionId: 'acp-crash-1',
+      models: { currentModelId: 'model-a', availableModels: [{ modelId: 'model-a', name: 'Model A' }] },
+    } });
+    return;
+  }
+  if (msg.method === 'session/prompt') {
+    process.exit(17);
+  }
 });
 `);
     writeFileSync(binary, `#!/bin/sh\nexec '${process.execPath}' '${script}' "$@"\n`, { mode: 0o700 });
 
-    const provider = new AgySdkProvider();
-    providers.push(provider);
-    await withSessionPrivacy('deck_stream_incog_brain', true, () =>
-      provider.connect({ binaryPath: binary, env: { HOME: fakeRealHome, PROBE_LOG: probeLog } }),
+    // A) Crash during prompt -> error emitted, dir deleted, session non-resurrectable
+    const pCrash = new AgyAcpProvider();
+    providers.push(pCrash);
+    await withSessionPrivacy('deck_incog_crash_brain', true, () =>
+      pCrash.connect({ binaryPath: binary, env: { HOME: fakeRealHome, PROBE_RECORD: record } }),
     );
-    // Notice: ensureAgyMcpConfigHasImcodesEntry MUST NOT have modified realMcpPath
+    const errors: unknown[] = [];
+    pCrash.onError((_sid, err) => errors.push(err));
+    const sid = await pCrash.createSession({ sessionKey: 'deck_incog_crash_brain', cwd: work, incognito: true });
+    await pCrash.send(sid, 'BOOM');
+    await vi.waitFor(() => expect(errors.length).toBeGreaterThanOrEqual(1), { timeout: 5000 });
+    const crashHome = readFileSync(record, 'utf8').trim().split('\n')[0]!;
+    await vi.waitFor(() => expect(existsSync(crashHome)).toBe(false), { timeout: 5000 });
+    await expect(pCrash.send(sid, 'RESURRECT')).rejects.toThrow(/terminated|resum/i);
+    await expect(pCrash.createSession({ sessionKey: 'deck_incog_crash_brain', cwd: work, incognito: true })).rejects.toThrow(/ended|new session/i);
+
+    // B) Handshake / version failure during initialize -> dir cleaned up immediately
+    const pOld = new AgyAcpProvider();
+    providers.push(pOld);
+    await withSessionPrivacy('deck_incog_oldacp_brain', true, () =>
+      pOld.connect({ binaryPath: binary, env: { HOME: fakeRealHome, PROBE_RECORD: record, MODE: 'old-acp' } }),
+    );
+    const sidOld = await pOld.createSession({ sessionKey: 'deck_incog_oldacp_brain', cwd: work, incognito: true });
+    await expect(pOld.send(sidOld, 'HELLO')).rejects.toThrow(/version|restore/i);
+    const oldHome = readFileSync(record, 'utf8').trim().split('\n')[1]!;
+    expect(existsSync(oldHome)).toBe(false);
+
+    // C) session/new failure -> dir cleaned up immediately
+    const pFailNew = new AgyAcpProvider();
+    providers.push(pFailNew);
+    await withSessionPrivacy('deck_incog_failnew_brain', true, () =>
+      pFailNew.connect({ binaryPath: binary, env: { HOME: fakeRealHome, PROBE_RECORD: record, MODE: 'fail-new' } }),
+    );
+    const sidNew = await pFailNew.createSession({ sessionKey: 'deck_incog_failnew_brain', cwd: work, incognito: true });
+    await expect(pFailNew.send(sidNew, 'HELLO')).rejects.toThrow();
+    const failNewHome = readFileSync(record, 'utf8').trim().split('\n')[2]!;
+    expect(existsSync(failNewHome)).toBe(false);
+  });
+
+  it('fails closed for incognito on legacy stream AgySdkProvider (<1.5.0) while preserving ordinary stream mode and >=1.5.0 ACP incognito', async () => {
+    const work = makeTempDir('imcodes-agy-legacy-failclosed-');
+    const fakeRealHome = path.join(work, 'real-home');
+    mkdirSync(path.join(fakeRealHome, '.gemini', 'antigravity-cli'), { recursive: true });
+    mkdirSync(path.join(fakeRealHome, '.gemini', 'config'), { recursive: true });
+    const realMcpPath = path.join(fakeRealHome, '.gemini', 'config', 'mcp_config.json');
+    writeFileSync(realMcpPath, '{"mcpServers":{}}');
+
+    const script = path.join(work, 'legacy-stream.mjs');
+    const binary = path.join(work, 'agy');
+    writeFileSync(script, `
+import readline from 'node:readline';
+const args = process.argv.slice(2);
+if (args[0] === '--version') { console.log('1.4.12'); process.exit(0); }
+if (args[0] === '--help') { console.log('Usage: agy'); process.exit(0); }
+process.stdout.write(JSON.stringify({ event: 'init', conversation_id: 'conv-legacy-1' }) + '\\n');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  process.stdout.write(JSON.stringify({ event: 'result', result: { conversation_id: 'conv-legacy-1', status: 'SUCCESS', response: 'LEGACY:' + msg.message.content } }) + '\\n');
+});
+`);
+    writeFileSync(binary, `#!/bin/sh\nexec '${process.execPath}' '${script}' "$@"\n`, { mode: 0o700 });
+
+    const legacy = await createAgyProvider({ binaryPath: binary, env: { HOME: fakeRealHome } });
+    expect(legacy).toBeInstanceOf(AgySdkProvider);
+    providers.push(legacy);
+
+    await withSessionPrivacy('deck_legacy_incog_brain', true, () =>
+      legacy.connect({ binaryPath: binary, env: { HOME: fakeRealHome } }),
+    );
+    // connect() inside incognito context must NOT mutate real mcp_config.json before createSession rejects.
     expect(readFileSync(realMcpPath, 'utf8')).toBe('{"mcpServers":{}}');
 
+    await expect(legacy.createSession({
+      sessionKey: 'deck_legacy_incog_brain',
+      sessionName: 'deck_legacy_incog_brain',
+      cwd: work,
+      incognito: true,
+    })).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CONFIG_ERROR, recoverable: false });
+    await expect(withSessionPrivacy('deck_legacy_incog_ctx', true, () =>
+      legacy.createSession({ sessionKey: 'deck_legacy_incog_ctx', cwd: work }),
+    )).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CONFIG_ERROR, recoverable: false });
+
+    // Positive control: ordinary (non-incognito) old stream session continues working normally
     const complete = vi.fn();
-    provider.onComplete(complete);
-
-    const id = await provider.createSession({
-      sessionKey: 'deck_stream_incog_brain',
-      sessionName: 'deck_stream_incog_brain',
+    legacy.onComplete(complete);
+    const normId = await legacy.createSession({
+      sessionKey: 'deck_legacy_normal_brain',
+      sessionName: 'deck_legacy_normal_brain',
       cwd: work,
-      agentId: 'gemini-4-hydrogen-high',
-      incognito: true,
     });
-    await provider.send(id, 'SECRET-STREAM');
+    await legacy.send(normId, 'HELLO-LEGACY');
     await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
-    expect(complete.mock.calls[0]?.[1].content).toBe('STREAM:SECRET-STREAM');
-
-    const spawnRecord = JSON.parse(readFileSync(probeLog, 'utf8').trim());
-    expect(spawnRecord.home).not.toBe(fakeRealHome);
-    expect(spawnRecord.userprofile).toBe(spawnRecord.home);
-    expect(spawnRecord.geminiHome).toBe(spawnRecord.home);
-    expect(spawnRecord.imcodesSession).toBeNull();
-    expect(spawnRecord.args).toContain(AGY_CLI_FLAG.LOG_FILE);
-    expect(spawnRecord.args.at(-1)).toBe(AGY_CLI_FLAG.PRINT_STDIN);
-    expect(listTree(fakeRealHome)).toEqual(snapshotBefore);
-
-    expect(await provider.restoreSession(id)).toBe(false);
-    await expect(provider.createSession({
-      sessionKey: 'deck_stream_incog_resume',
-      cwd: work,
-      incognito: true,
-      resumeId: 'conv-old',
-    })).rejects.toThrow(/resumed/i);
-
-    await provider.endSession(id);
-    expect(existsSync(spawnRecord.home)).toBe(false);
+    expect(complete.mock.calls[0]?.[1].content).toBe('LEGACY:HELLO-LEGACY');
   });
 });

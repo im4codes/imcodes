@@ -51,6 +51,7 @@ import { confirmPromiseStop } from '../provider-stop-confirmation.js';
 
 import { gateChildStream } from '../../util/event-loop-backpressure.js';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { once } from 'node:events';
 import { Readable, Writable } from 'node:stream';
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
@@ -310,7 +311,9 @@ interface KimiSdkSessionState {
   agyBridging?: boolean;
   agyNativeTurnGeneration?: number;
   incognito?: boolean;
+  disposed?: boolean;
   isolatedTransport?: IsolatedAcpTransport;
+  isolatedDisposeInFlight?: Promise<void>;
 }
 
 interface AcpTransportSlot {
@@ -450,22 +453,84 @@ export class KimiSdkProvider implements TransportProvider {
     return state.incognito ? (state.isolatedTransport?.initPromise ?? null) : this.initPromise;
   }
 
-  private async teardownIsolatedTransport(state: KimiSdkSessionState): Promise<void> {
-    const transport = state.isolatedTransport;
-    if (!transport) return;
-    state.isolatedTransport = undefined;
-    const child = transport.child;
-    transport.child = null;
-    transport.connection = null;
-    transport.initPromise = null;
-    transport.sessionListSupported = false;
-    if (child && !child.killed) {
-      try { child.stdin.end(); } catch { /* noop */ }
-      await killProcessTree(child, { ownsProcessGroup: true });
+  private async disposeIsolatedSession(
+    state: KimiSdkSessionState,
+    opts?: { removeSession?: boolean; bestEffortCloseSession?: boolean },
+  ): Promise<void> {
+    if (state.isolatedDisposeInFlight) {
+      await state.isolatedDisposeInFlight;
+      if (opts?.removeSession && this.sessions.get(state.routeId) === state) {
+        this.sessions.delete(state.routeId);
+      }
+      return;
     }
-    if (transport.incognitoEnv) {
-      await transport.incognitoEnv.cleanup();
-      transport.incognitoEnv = undefined;
+    const run = (async () => {
+      this.closeAgyBridges(state);
+      if (state.incognito) state.disposed = true;
+      const transport = state.isolatedTransport;
+      const acpSessionId = state.acpSessionId;
+      const connection = transport?.connection ?? null;
+      const child = transport?.child ?? null;
+
+      if (
+        opts?.bestEffortCloseSession
+        && acpSessionId
+        && state.loaded
+        && connection
+        && child
+        && child.exitCode === null
+        && !child.killed
+      ) {
+        const closer = (connection as AcpAgent).closeSession;
+        if (typeof closer === 'function') {
+          await Promise.race([
+            closer.call(connection, { sessionId: acpSessionId }).catch(() => {}),
+            new Promise<void>((resolve) => setTimeout(resolve, 500)),
+          ]);
+        }
+      }
+
+      if (acpSessionId) this.releaseAcpRoute(acpSessionId, state.routeId);
+      state.acpSessionId = undefined;
+      state.loaded = false;
+      state.modeApplied = false;
+      state.sessionSystemTextInjected = undefined;
+      if (opts?.removeSession && this.sessions.get(state.routeId) === state) {
+        this.sessions.delete(state.routeId);
+      }
+
+      if (!transport) return;
+      state.isolatedTransport = undefined;
+      transport.child = null;
+      transport.connection = null;
+      transport.initPromise = null;
+      transport.sessionListSupported = false;
+
+      if (child) {
+        if (child.exitCode === null && child.signalCode === null) {
+          const exitPromise = once(child, 'exit').catch(() => {});
+          try { child.stdin.end(); } catch { /* noop */ }
+          await killProcessTree(child, { ownsProcessGroup: true });
+          if (child.exitCode === null && child.signalCode === null) {
+            await Promise.race([
+              exitPromise,
+              new Promise<void>((resolve) => setTimeout(resolve, 500)),
+            ]);
+          }
+        }
+      }
+      if (transport.incognitoEnv) {
+        await transport.incognitoEnv.cleanup();
+        transport.incognitoEnv = undefined;
+      }
+    })();
+    state.isolatedDisposeInFlight = run;
+    try {
+      await run;
+    } finally {
+      if (state.isolatedDisposeInFlight === run) {
+        state.isolatedDisposeInFlight = undefined;
+      }
     }
   }
 
@@ -541,7 +606,7 @@ export class KimiSdkProvider implements TransportProvider {
       for (const state of states) this.closeAgyBridges(state);
       await Promise.all([
         this.teardownChild(),
-        ...states.map((state) => this.teardownIsolatedTransport(state)),
+        ...states.map((state) => this.disposeIsolatedSession(state, { removeSession: true })),
       ]);
       this.acpToRoute.clear();
       this.acpRouteOrder.clear();
@@ -568,13 +633,14 @@ export class KimiSdkProvider implements TransportProvider {
     if (incognito && config.resumeId) {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Incognito conversation cannot be resumed; start a fresh session.', false);
     }
-    if (incognito && !config.fresh && prior?.acpSessionId) {
+    if (incognito && !config.fresh && (prior?.acpSessionId || prior?.disposed)) {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Incognito conversation ended; start a new session instead of resuming history.', false);
     }
     if (prior) {
-      this.closeAgyBridges(prior);
-      if (prior.isolatedTransport && (config.fresh || !incognito)) {
-        await this.teardownIsolatedTransport(prior);
+      if (prior.incognito && (config.fresh || !incognito || prior.disposed)) {
+        await this.disposeIsolatedSession(prior);
+      } else {
+        this.closeAgyBridges(prior);
       }
     }
     setSessionIncognito(routeId, incognito);
@@ -651,6 +717,10 @@ export class KimiSdkProvider implements TransportProvider {
     const state = this.sessions.get(sessionId);
     if (!state) return;
     this.cancelPendingApprovals(sessionId);
+    if (state.incognito) {
+      await this.disposeIsolatedSession(state, { removeSession: true, bestEffortCloseSession: true });
+      return;
+    }
     this.closeAgyBridges(state);
     this.sessions.delete(state.routeId);
     const removedSoleAcpRoute = state.acpSessionId
@@ -667,21 +737,19 @@ export class KimiSdkProvider implements TransportProvider {
         await closer.call(connection, { sessionId: state.acpSessionId }).catch(() => {});
       }
     }
-    if (state.isolatedTransport) {
-      await this.teardownIsolatedTransport(state);
-    }
   }
 
   async detachSession(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
     if (!state) return;
     this.cancelPendingApprovals(sessionId);
+    if (state.incognito) {
+      await this.disposeIsolatedSession(state, { removeSession: true });
+      return;
+    }
     this.closeAgyBridges(state);
     this.sessions.delete(state.routeId);
     if (state.acpSessionId) this.releaseAcpRoute(state.acpSessionId, state.routeId);
-    if (state.isolatedTransport) {
-      await this.teardownIsolatedTransport(state);
-    }
   }
 
   async restoreSession(sessionId: string): Promise<boolean> {
@@ -1149,6 +1217,9 @@ export class KimiSdkProvider implements TransportProvider {
       }
       throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Unknown ${this.profile.displayName} SDK session: ${sessionId}`, false);
     }
+    if (state.incognito && state.disposed) {
+      throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, 'Incognito session has been terminated; start a fresh session.', false);
+    }
     if (!state.incognito && !this.connection) {
       await this.ensureSharedAcpConnected();
       if (!this.connection) {
@@ -1420,8 +1491,12 @@ export class KimiSdkProvider implements TransportProvider {
     if (!this.config) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, `${this.profile.displayName} ACP server not connected`, false);
     }
+    if (state.disposed) {
+      throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, 'Incognito session has been terminated; start a fresh session.', false);
+    }
     if (state.isolatedTransport?.child) {
-      await this.teardownIsolatedTransport(state);
+      await this.disposeIsolatedSession(state);
+      state.disposed = false;
     }
     const sourceHome = state.isolatedTransport?.sourceHome
       ?? resolveAgySourceHome(state.env, this.config.env as Record<string, string> | undefined);
@@ -1439,7 +1514,7 @@ export class KimiSdkProvider implements TransportProvider {
     try {
       await this.startAcpServer(this.config, { sessionId, state, transport, incognitoEnv });
     } catch (error) {
-      await this.teardownIsolatedTransport(state);
+      await this.disposeIsolatedSession(state);
       throw error;
     }
   }
@@ -1457,19 +1532,29 @@ export class KimiSdkProvider implements TransportProvider {
       await this.teardownChild();
     }
 
+    const createSharedTransportSlot = (): AcpTransportSlot => {
+      const getChild = () => this.child;
+      const setChild = (value: ChildProcessWithoutNullStreams | null) => { this.child = value; };
+      const getConnection = () => this.connection;
+      const setConnection = (value: ClientSideConnection | null) => { this.connection = value; };
+      const getInitPromise = () => this.initPromise;
+      const setInitPromise = (value: Promise<void> | null) => { this.initPromise = value; };
+      const getSessionListSupported = () => this.sessionListSupported;
+      const setSessionListSupported = (value: boolean) => { this.sessionListSupported = value; };
+      return {
+        get child() { return getChild(); },
+        set child(value) { setChild(value); },
+        get connection() { return getConnection(); },
+        set connection(value) { setConnection(value); },
+        get initPromise() { return getInitPromise(); },
+        set initPromise(value) { setInitPromise(value); },
+        get sessionListSupported() { return getSessionListSupported(); },
+        set sessionListSupported(value) { setSessionListSupported(value); },
+      };
+    };
     const transport: AcpTransportSlot = isolatedFor
       ? isolatedFor.transport
-      : {
-        get child() { return providerSelf.child; },
-        set child(value) { providerSelf.child = value; },
-        get connection() { return providerSelf.connection; },
-        set connection(value) { providerSelf.connection = value; },
-        get initPromise() { return providerSelf.initPromise; },
-        set initPromise(value) { providerSelf.initPromise = value; },
-        get sessionListSupported() { return providerSelf.sessionListSupported; },
-        set sessionListSupported(value) { providerSelf.sessionListSupported = value; },
-      };
-    const providerSelf = this;
+      : createSharedTransportSlot();
 
     const resolved = this.resolveAcpExecutable(config);
     const args = [
@@ -1518,20 +1603,10 @@ export class KimiSdkProvider implements TransportProvider {
       if (isolatedFor) {
         const sid = isolatedFor.sessionId;
         this.cancelPendingApprovals(sid);
-        if (isolatedFor.state) isolatedFor.state.sessionSystemTextInjected = undefined;
         if (this.clearSessionWorkAfterFailure(sid)) {
           this.emitError(sid, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, err.message, true));
         }
-        isolatedFor.state.acpSessionId = undefined;
-        isolatedFor.state.loaded = false;
-        transport.child = null;
-        transport.connection = null;
-        transport.initPromise = null;
-        transport.sessionListSupported = false;
-        if (isolatedFor.state.isolatedTransport === isolatedFor.transport) {
-          isolatedFor.state.isolatedTransport = undefined;
-        }
-        void isolatedFor.incognitoEnv.cleanup();
+        void this.disposeIsolatedSession(isolatedFor.state);
         return;
       }
       this.cancelPendingApprovals();
@@ -1725,7 +1800,7 @@ export class KimiSdkProvider implements TransportProvider {
       await Promise.race([initPromise, spawnFailure, initTimeout]);
     } catch (error) {
       if (isolatedFor) {
-        await this.teardownIsolatedTransport(isolatedFor.state);
+        await this.disposeIsolatedSession(isolatedFor.state);
       } else {
         await this.teardownChild();
       }
@@ -2020,6 +2095,9 @@ export class KimiSdkProvider implements TransportProvider {
     state: KimiSdkSessionState,
   ): Promise<void> {
     if (state.incognito) {
+      if (state.disposed) {
+        throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, 'Incognito session has been terminated; start a fresh session.', false);
+      }
       if (state.acpSessionId && !state.loaded) {
         throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Incognito conversation cannot be resumed; start a new session.', false);
       }
@@ -2034,99 +2112,106 @@ export class KimiSdkProvider implements TransportProvider {
     if (!connection) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, `${this.profile.displayName} ACP connection not ready`, false);
     }
-    await this.initPromiseForState(state);
-    this.assertCurrentSession(sessionId, state, connection);
-
-    if (!state.loaded) {
-      await state.beforeNativeSessionStart?.();
+    try {
+      await this.initPromiseForState(state);
       this.assertCurrentSession(sessionId, state, connection);
-      if (state.acpSessionId) {
-        if (state.incognito) {
-          throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Incognito conversation cannot be resumed; start a new session.', false);
-        }
-        // Resume an existing session (survives across CLI restarts via
-        // ~/.kimi/tmp/<project>/chats/<id>.json).
-        try {
-          const loader = this.profile.resumeWithoutReplay
-            ? (connection as AcpAgent).resumeSession
-            : (connection as AcpAgent).loadSession;
-          if (typeof loader !== 'function') {
-            throw new Error('Agent does not implement loadSession (capability mismatch)');
+
+      if (!state.loaded) {
+        await state.beforeNativeSessionStart?.();
+        this.assertCurrentSession(sessionId, state, connection);
+        if (state.acpSessionId) {
+          if (state.incognito) {
+            throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Incognito conversation cannot be resumed; start a new session.', false);
           }
-          // `loadSession` streams the full message history back as
-          // session/update notifications *before* the RPC resolves. Set the
-          // replay flag so handleSessionUpdate drops those history chunks
-          // instead of forwarding them to the current-turn delta listeners.
-          state.replaying = true;
-          let loadResult: LoadSessionResponse | undefined;
+          // Resume an existing session (survives across CLI restarts via
+          // ~/.kimi/tmp/<project>/chats/<id>.json).
           try {
-            loadResult = await loader.call(connection, {
-              sessionId: state.acpSessionId,
-              cwd: state.cwd,
-              mcpServers: this.mcpServersForState(state),
-            });
-            if (state.wireOrderTail) await state.wireOrderTail;
-          } finally {
-            state.replaying = false;
+            const loader = this.profile.resumeWithoutReplay
+              ? (connection as AcpAgent).resumeSession
+              : (connection as AcpAgent).loadSession;
+            if (typeof loader !== 'function') {
+              throw new Error('Agent does not implement loadSession (capability mismatch)');
+            }
+            // `loadSession` streams the full message history back as
+            // session/update notifications *before* the RPC resolves. Set the
+            // replay flag so handleSessionUpdate drops those history chunks
+            // instead of forwarding them to the current-turn delta listeners.
+            state.replaying = true;
+            let loadResult: LoadSessionResponse | undefined;
+            try {
+              loadResult = await loader.call(connection, {
+                sessionId: state.acpSessionId,
+                cwd: state.cwd,
+                mcpServers: this.mcpServersForState(state),
+              });
+              if (state.wireOrderTail) await state.wireOrderTail;
+            } finally {
+              state.replaying = false;
+            }
+            this.assertCurrentSession(sessionId, state, connection);
+            state.loaded = true;
+            this.cacheModelsFromSessionResponse(loadResult);
+            this.applySessionMetadata(sessionId, state, loadResult);
+          } catch (err) {
+            if (this.profile.loadFailure === 'error') throw err;
+            logger.info(
+              {
+                provider: this.id,
+                sessionId,
+                acpSessionId: state.acpSessionId,
+                ...this.errorLogFields(err, 'err'),
+              },
+              `${this.profile.displayName} ACP loadSession failed; falling back to newSession`,
+            );
+            this.releaseAcpRoute(state.acpSessionId, state.routeId);
+            state.acpSessionId = undefined;
+            await this.createFreshAcpSession(sessionId, state);
           }
-          this.assertCurrentSession(sessionId, state, connection);
-          state.loaded = true;
-          this.cacheModelsFromSessionResponse(loadResult);
-          this.applySessionMetadata(sessionId, state, loadResult);
-        } catch (err) {
-          if (this.profile.loadFailure === 'error') throw err;
-          logger.info(
-            {
-              provider: this.id,
-              sessionId,
-              acpSessionId: state.acpSessionId,
-              ...this.errorLogFields(err, 'err'),
-            },
-            `${this.profile.displayName} ACP loadSession failed; falling back to newSession`,
-          );
-          this.releaseAcpRoute(state.acpSessionId, state.routeId);
-          state.acpSessionId = undefined;
+        } else {
           await this.createFreshAcpSession(sessionId, state);
         }
-      } else {
-        await this.createFreshAcpSession(sessionId, state);
       }
-    }
 
-    if (!state.modeApplied && this.profile.defaultMode && state.acpSessionId && connection) {
-      const modeSetter = (connection as AcpAgent).setSessionMode;
-      if (typeof modeSetter === 'function') {
-        await modeSetter.call(connection, {
-          sessionId: state.acpSessionId,
-          modeId: this.profile.defaultMode,
-        }).catch((err: unknown) => {
-          // Not fatal — Kimi's server already defaults to this mode.
-          logger.debug({
-            provider: this.id,
-            sessionId,
-            ...this.errorLogFields(err, 'err'),
-          }, 'setSessionMode(default) failed (non-fatal)');
-        });
+      if (!state.modeApplied && this.profile.defaultMode && state.acpSessionId && connection) {
+        const modeSetter = (connection as AcpAgent).setSessionMode;
+        if (typeof modeSetter === 'function') {
+          await modeSetter.call(connection, {
+            sessionId: state.acpSessionId,
+            modeId: this.profile.defaultMode,
+          }).catch((err: unknown) => {
+            // Not fatal — Kimi's server already defaults to this mode.
+            logger.debug({
+              provider: this.id,
+              sessionId,
+              ...this.errorLogFields(err, 'err'),
+            }, 'setSessionMode(default) failed (non-fatal)');
+          });
+        }
+        this.assertCurrentSession(sessionId, state, connection);
+        state.modeApplied = true;
+      }
+
+      if (this.profile.strictModelSelection) {
+        await this.confirmStrictSessionModel(sessionId, state);
+      } else if (state.model && state.acpSessionId && connection) {
+        const modelSetter = (connection as AcpAgent).unstable_setSessionModel;
+        if (typeof modelSetter === 'function') {
+          await modelSetter.call(connection, {
+            sessionId: state.acpSessionId,
+            modelId: state.model,
+          }).catch((err: unknown) => {
+            logger.debug({ provider: this.id, sessionId, ...this.errorLogFields(err, 'err') },
+              'unstable_setSessionModel pre-turn failed (non-fatal)');
+          });
+        }
       }
       this.assertCurrentSession(sessionId, state, connection);
-      state.modeApplied = true;
-    }
-
-    if (this.profile.strictModelSelection) {
-      await this.confirmStrictSessionModel(sessionId, state);
-    } else if (state.model && state.acpSessionId && connection) {
-      const modelSetter = (connection as AcpAgent).unstable_setSessionModel;
-      if (typeof modelSetter === 'function') {
-        await modelSetter.call(connection, {
-          sessionId: state.acpSessionId,
-          modelId: state.model,
-        }).catch((err: unknown) => {
-          logger.debug({ provider: this.id, sessionId, ...this.errorLogFields(err, 'err') },
-            'unstable_setSessionModel pre-turn failed (non-fatal)');
-        });
+    } catch (err) {
+      if (state.incognito && !state.loaded) {
+        await this.disposeIsolatedSession(state);
       }
+      throw err;
     }
-    this.assertCurrentSession(sessionId, state, connection);
   }
 
   private async createFreshAcpSession(sessionId: string, state: KimiSdkSessionState): Promise<void> {
