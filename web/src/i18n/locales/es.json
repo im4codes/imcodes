@@ -5249,7 +5249,9 @@
       "move": "Mover",
       "rename": "Renombrar",
       "remove_recent": "Quitar de recientes",
-      "share": "Compartir"
+      "share": "Compartir",
+      "more": "Más acciones",
+      "clear_search": "Limpiar búsqueda"
     },
     "blank_type": {
       "docx": "Word",
@@ -5294,6 +5296,48 @@
       "no_download": "Sin descarga",
       "submit": "Compartir",
       "revoke": "Revocar"
-    }
+    },
+    "untitled_name": {
+      "docx": "Documento sin título",
+      "xlsx": "Hoja de cálculo sin título",
+      "pptx": "Presentación sin título"
+    },
+    "gallery": {
+      "title": "Crear un documento nuevo",
+      "blank_docx": "Documento en blanco",
+      "blank_xlsx": "Hoja de cálculo en blanco",
+      "blank_pptx": "Presentación en blanco"
+    },
+    "view": {
+      "list": "Vista de lista",
+      "grid": "Vista de cuadrícula"
+    },
+    "sort": {
+      "label": "Ordenar por",
+      "updated": "Última modificación",
+      "name": "Nombre",
+      "size": "Tamaño"
+    },
+    "filter": {
+      "all": "Todos los tipos",
+      "word": "Documentos",
+      "cell": "Hojas de cálculo",
+      "slide": "Presentaciones",
+      "pdf": "Archivos PDF"
+    },
+    "columns": {
+      "name": "Nombre",
+      "details": "Ubicación / Propietario",
+      "modified": "Modificado",
+      "size": "Tamaño",
+      "actions": "Acciones"
+    },
+    "preview": {
+      "rename_aria": "Título del documento",
+      "saving": "Guardando...",
+      "saved": "Guardado",
+      "read_only": "Solo lectura"
+    },
+    "drop_hint": "Suelta un archivo Office o PDF compatible para subirlo"
   }
 }

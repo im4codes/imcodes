@@ -5248,7 +5248,9 @@
       "move": "移動",
       "rename": "名前変更",
       "remove_recent": "履歴から削除",
-      "share": "共有"
+      "share": "共有",
+      "more": "その他の操作",
+      "clear_search": "検索をクリア"
     },
     "blank_type": {
       "docx": "Word",
@@ -5293,6 +5295,48 @@
       "no_download": "ダウンロード禁止",
       "submit": "共有",
       "revoke": "取り消す"
-    }
+    },
+    "untitled_name": {
+      "docx": "無題のドキュメント",
+      "xlsx": "無題のスプレッドシート",
+      "pptx": "無題のプレゼンテーション"
+    },
+    "gallery": {
+      "title": "新しいドキュメントを作成",
+      "blank_docx": "空白のドキュメント",
+      "blank_xlsx": "空白のスプレッドシート",
+      "blank_pptx": "空白のプレゼンテーション"
+    },
+    "view": {
+      "list": "リスト表示",
+      "grid": "グリッド表示"
+    },
+    "sort": {
+      "label": "並べ替え",
+      "updated": "最終更新日",
+      "name": "名前",
+      "size": "サイズ"
+    },
+    "filter": {
+      "all": "すべての種類",
+      "word": "ドキュメント",
+      "cell": "スプレッドシート",
+      "slide": "プレゼンテーション",
+      "pdf": "PDF ファイル"
+    },
+    "columns": {
+      "name": "名前",
+      "details": "場所 / 所有者",
+      "modified": "更新日時",
+      "size": "サイズ",
+      "actions": "操作"
+    },
+    "preview": {
+      "rename_aria": "ドキュメントのタイトル",
+      "saving": "保存中...",
+      "saved": "保存済み",
+      "read_only": "読み取り専用"
+    },
+    "drop_hint": "対応している Office または PDF ファイルをドロップしてアップロード"
   }
 }

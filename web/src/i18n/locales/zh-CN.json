@@ -5259,7 +5259,9 @@
       "move": "移动",
       "rename": "重命名",
       "remove_recent": "移出最近列表",
-      "share": "共享"
+      "share": "共享",
+      "more": "更多操作",
+      "clear_search": "清除搜索"
     },
     "blank_type": {
       "docx": "Word",
@@ -5304,6 +5306,48 @@
       "no_download": "禁止下载",
       "submit": "确认共享",
       "revoke": "撤销"
-    }
+    },
+    "untitled_name": {
+      "docx": "无标题文档",
+      "xlsx": "无标题表格",
+      "pptx": "无标题演示文稿"
+    },
+    "gallery": {
+      "title": "新建空白文档",
+      "blank_docx": "空白文档",
+      "blank_xlsx": "空白表格",
+      "blank_pptx": "空白演示文稿"
+    },
+    "view": {
+      "list": "列表视图",
+      "grid": "网格视图"
+    },
+    "sort": {
+      "label": "排序方式",
+      "updated": "最近修改",
+      "name": "名称",
+      "size": "大小"
+    },
+    "filter": {
+      "all": "全部类型",
+      "word": "文档",
+      "cell": "表格",
+      "slide": "演示文稿",
+      "pdf": "PDF 文档"
+    },
+    "columns": {
+      "name": "名称",
+      "details": "来源 / 所有者",
+      "modified": "修改时间",
+      "size": "大小",
+      "actions": "操作"
+    },
+    "preview": {
+      "rename_aria": "文档标题",
+      "saving": "正在保存...",
+      "saved": "已保存",
+      "read_only": "只读"
+    },
+    "drop_hint": "松开即可上传支持的 Office 或 PDF 文件"
   }
 }

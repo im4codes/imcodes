@@ -200,21 +200,17 @@ describe('CloudDocsPanel', () => {
     });
 
     fireEvent.click(screen.getByTestId('cloud-docs-new-docx-btn'));
-    const docInput = screen.getByTestId('cloud-docs-new-doc-input');
-    fireEvent.input(docInput, {
-      target: { value: 'Onboarding' },
-    });
-    fireEvent.submit(docInput.closest('form')!);
 
     await waitFor(() => {
       expect(createBlankCloudDocApiMock).toHaveBeenCalledWith({
         type: 'docx',
-        name: 'Onboarding',
+        name: 'Untitled document.docx',
         folderId: null,
       });
       const preview = screen.getByTestId('mock-office-preview');
       expect(preview.getAttribute('data-cloud-doc-id')).toBe('doc-2');
       expect(preview.getAttribute('data-read-only')).toBe('false');
+      expect((screen.getByTestId('cloud-docs-preview-title-input') as HTMLInputElement).value).toBe('Onboarding.docx');
     });
 
     fireEvent.click(screen.getByTestId('cloud-docs-preview-back'));
@@ -629,5 +625,138 @@ describe('CloudDocsPanel', () => {
       expect(screen.getByTestId('cloud-docs-remove-blocked-recent')).toBeTruthy();
     });
     expect(screen.queryByTestId('mock-office-preview')).toBeNull();
+  });
+
+  it('auto-numbers 1-click blank docs and supports Google Docs style inline preview rename with Enter/Escape', async () => {
+    const existingUntitled = makeDoc({
+      id: 'doc-untitled-1',
+      name: 'Untitled document.docx',
+    });
+    const createdDoc = makeDoc({
+      id: 'doc-untitled-2',
+      name: 'Untitled document 2.docx',
+      updatedAt: 1_700_000_900_000,
+    });
+    const docs = [existingUntitled];
+    listCloudDocsApiMock.mockImplementation(async () => ({
+      folders: [],
+      docs: [...docs],
+      sharedFolders: [],
+      sharedDocs: [],
+    }));
+    createBlankCloudDocApiMock.mockImplementationOnce(async () => {
+      docs.push(createdDoc);
+      return { doc: createdDoc };
+    });
+    updateCloudDocApiMock.mockImplementationOnce(async (_id: string, body: { name?: string }) => ({
+      doc: { ...createdDoc, name: body.name ?? createdDoc.name },
+    }));
+
+    render(<CloudDocsPanel initialTab="my_docs" />);
+    await waitFor(() => expect(screen.getByTestId('cloud-doc-row-doc-untitled-1')).toBeTruthy());
+
+    fireEvent.click(screen.getByTestId('cloud-docs-new-docx-btn'));
+    await waitFor(() => {
+      expect(createBlankCloudDocApiMock).toHaveBeenCalledWith({
+        type: 'docx',
+        name: 'Untitled document 2.docx',
+        folderId: null,
+      });
+      expect(screen.getByTestId('mock-office-preview').getAttribute('data-cloud-doc-id')).toBe('doc-untitled-2');
+    });
+
+    const titleInput = screen.getByTestId('cloud-docs-preview-title-input') as HTMLInputElement;
+    expect(titleInput.value).toBe('Untitled document 2.docx');
+
+    // Escape reverts unsaved edit without calling API
+    fireEvent.input(titleInput, { target: { value: 'Temp Draft' } });
+    fireEvent.keyDown(titleInput, { key: 'Escape' });
+    expect(titleInput.value).toBe('Untitled document 2.docx');
+    expect(updateCloudDocApiMock).not.toHaveBeenCalled();
+
+    // Enter commits with extension preserved
+    fireEvent.input(titleInput, { target: { value: 'Q4 Plan' } });
+    fireEvent.keyDown(titleInput, { key: 'Enter' });
+    await waitFor(() => {
+      expect(updateCloudDocApiMock).toHaveBeenCalledWith('doc-untitled-2', { name: 'Q4 Plan.docx' });
+      expect(screen.getByTestId('cloud-docs-preview-saved')).toBeTruthy();
+      expect((screen.getByTestId('cloud-docs-preview-title-input') as HTMLInputElement).value).toBe('Q4 Plan.docx');
+    });
+  });
+
+  it('supports grid/list view toggle, type filter, overflow menu actions, and Share modal Escape dismissal', async () => {
+    const docWord = makeDoc({ id: 'doc-word', name: 'Alpha.docx', ext: 'docx', updatedAt: 1_700_000_100_000 });
+    const docCell = makeDoc({
+      id: 'doc-cell',
+      name: 'Budget.xlsx',
+      ext: 'xlsx',
+      mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      updatedAt: 1_700_000_500_000,
+    });
+    listCloudDocsApiMock.mockResolvedValue({
+      folders: [],
+      docs: [docWord, docCell],
+      sharedFolders: [],
+      sharedDocs: [],
+    });
+    deleteCloudDocApiMock.mockResolvedValue({ ok: true });
+
+    render(<CloudDocsPanel initialTab="my_docs" />);
+    await waitFor(() => {
+      expect(screen.getByTestId('cloud-doc-row-doc-word')).toBeTruthy();
+      expect(screen.getByTestId('cloud-doc-row-doc-cell')).toBeTruthy();
+    });
+
+    // Switch to grid view and back to list
+    fireEvent.click(screen.getByTestId('cloud-docs-view-grid'));
+    await waitFor(() => expect(screen.getByTestId('cloud-docs-my-docs-list').className).toContain('cloud-docs-grid'));
+    fireEvent.click(screen.getByTestId('cloud-docs-view-list'));
+    await waitFor(() => expect(screen.getByTestId('cloud-docs-my-docs-list').className).toContain('cloud-docs-list'));
+
+    // Type filter narrows visible docs
+    fireEvent.change(screen.getByTestId('cloud-docs-type-filter'), { target: { value: 'cell' } });
+    await waitFor(() => {
+      expect(screen.queryByTestId('cloud-doc-row-doc-word')).toBeNull();
+      expect(screen.getByTestId('cloud-doc-row-doc-cell')).toBeTruthy();
+    });
+
+    fireEvent.change(screen.getByTestId('cloud-docs-type-filter'), { target: { value: 'all' } });
+    await waitFor(() => expect(screen.getByTestId('cloud-doc-row-doc-word')).toBeTruthy());
+
+    // Overflow menu reveals delete button cleanly
+    fireEvent.click(screen.getByTestId('cloud-doc-more-doc-word'));
+    await waitFor(() => expect(screen.getByTestId('cloud-docs-row-menu')).toBeTruthy());
+    expect(screen.getByTestId('rename-cloud-doc-doc-word')).toBeTruthy();
+    expect(screen.getByTestId('move-cloud-doc-doc-word')).toBeTruthy();
+    fireEvent.click(screen.getByTestId('delete-cloud-doc-doc-word'));
+    await waitFor(() => expect(screen.getByTestId('cloud-docs-confirm-delete-btn')).toBeTruthy());
+    fireEvent.click(screen.getByTestId('cloud-docs-confirm-delete-btn'));
+    await waitFor(() => expect(deleteCloudDocApiMock).toHaveBeenCalledWith('doc-word'));
+
+    // Open preview and trigger elevated Share dialog, then close via Escape
+    const cellRow = await screen.findByTestId('cloud-doc-row-doc-cell');
+    fireEvent.click(cellRow.querySelector('button.cloud-docs-row-main')!);
+    await waitFor(() => expect(screen.getByTestId('cloud-docs-preview-share')).toBeTruthy());
+    fireEvent.click(screen.getByTestId('cloud-docs-preview-share'));
+    await waitFor(() => expect(screen.getByTestId('cloud-docs-share-panel')).toBeTruthy());
+    fireEvent.keyDown(document, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByTestId('cloud-docs-share-panel')).toBeNull());
+  });
+
+  it('handles drag-and-drop file upload with extension validation', async () => {
+    uploadCloudDocApiMock.mockResolvedValue({ doc: makeDoc({ id: 'doc-pdf', name: 'Spec.pdf', ext: 'pdf', mimeType: 'application/pdf' }) });
+
+    render(<CloudDocsPanel initialTab="my_docs" />);
+    await waitFor(() => expect(screen.getByTestId('cloud-docs-my-docs-list')).toBeTruthy());
+
+    const body = screen.getByTestId('cloud-docs-panel').querySelector('.cloud-docs-body')!;
+    const badFile = new File(['abc'], 'malware.exe', { type: 'application/octet-stream' });
+    fireEvent.drop(body, { dataTransfer: { files: [badFile] } });
+    await waitFor(() => expect(screen.getByTestId('cloud-docs-error')).toBeTruthy());
+    expect(uploadCloudDocApiMock).not.toHaveBeenCalled();
+
+    const pdfFile = new File(['%PDF'], 'Spec.pdf', { type: 'application/pdf' });
+    fireEvent.drop(body, { dataTransfer: { files: [pdfFile] } });
+    await waitFor(() => expect(uploadCloudDocApiMock).toHaveBeenCalledWith(pdfFile, { folderId: null }));
   });
 });

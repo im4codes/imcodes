@@ -5248,7 +5248,9 @@
       "move": "이동",
       "rename": "이름 변경",
       "remove_recent": "최근 목록에서 제거",
-      "share": "공유"
+      "share": "공유",
+      "more": "더보기",
+      "clear_search": "검색 지우기"
     },
     "blank_type": {
       "docx": "Word",
@@ -5293,6 +5295,48 @@
       "no_download": "다운로드 금지",
       "submit": "공유",
       "revoke": "철회"
-    }
+    },
+    "untitled_name": {
+      "docx": "제목 없는 문서",
+      "xlsx": "제목 없는 스프레드시트",
+      "pptx": "제목 없는 프레젠테이션"
+    },
+    "gallery": {
+      "title": "새 문서 시작하기",
+      "blank_docx": "빈 문서",
+      "blank_xlsx": "빈 스프레드시트",
+      "blank_pptx": "빈 프레젠테이션"
+    },
+    "view": {
+      "list": "목록 보기",
+      "grid": "그리드 보기"
+    },
+    "sort": {
+      "label": "정렬 기준",
+      "updated": "최근 수정일",
+      "name": "이름",
+      "size": "크기"
+    },
+    "filter": {
+      "all": "모든 형식",
+      "word": "문서",
+      "cell": "스프레드시트",
+      "slide": "프레젠테이션",
+      "pdf": "PDF 문서"
+    },
+    "columns": {
+      "name": "이름",
+      "details": "위치 / 소유자",
+      "modified": "수정일",
+      "size": "크기",
+      "actions": "작업"
+    },
+    "preview": {
+      "rename_aria": "문서 제목",
+      "saving": "저장 중...",
+      "saved": "저장됨",
+      "read_only": "읽기 전용"
+    },
+    "drop_hint": "지원되는 Office 또는 PDF 파일을 놓아 업로드하세요"
   }
 }

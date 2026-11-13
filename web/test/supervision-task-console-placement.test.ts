@@ -58,6 +58,11 @@ describe('toolbar placement & retired supervision task console toggle', () => {
 
     expect(cloudDocsBtn).toBeGreaterThan(computerBtn);
     expect(cloudDocsBtn).toBeLessThan(treeToggle);
+
+    const desktopCloudBtnBlock = block.slice(cloudDocsBtn, block.indexOf('</button>', cloudDocsBtn) + 9);
+    expect(desktopCloudBtnBlock).toContain('<CloudDocsGlyphIcon');
+    expect(desktopCloudBtnBlock).not.toContain('cloud_docs.button_label');
+    expect(desktopCloudBtnBlock).not.toContain('📄');
   });
 
   it('places ControlledNodeQuickMenu immediately right of DaemonRemoteDesktopControl and left of Files inside mobile-server-actions', () => {
@@ -87,6 +92,11 @@ describe('toolbar placement & retired supervision task console toggle', () => {
 
     expect(cloudDocsBtn).toBeGreaterThan(globe);
     expect(cloudDocsBtn).toBeLessThan(viewToggle);
+
+    const mobileCloudBtnBlock = block.slice(cloudDocsBtn, block.indexOf('</button>', cloudDocsBtn) + 9);
+    expect(mobileCloudBtnBlock).toContain('<CloudDocsGlyphIcon');
+    expect(mobileCloudBtnBlock).not.toContain('cloud_docs.button_label');
+    expect(mobileCloudBtnBlock).not.toContain('📄');
   });
 
   it('gates the panel with the shared visibility helper and never duplicates a local role predicate', () => {

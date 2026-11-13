@@ -5259,7 +5259,9 @@
       "move": "Move",
       "rename": "Rename",
       "remove_recent": "Remove from Recent",
-      "share": "Share"
+      "share": "Share",
+      "more": "More actions",
+      "clear_search": "Clear search"
     },
     "blank_type": {
       "docx": "Word",
@@ -5304,6 +5306,48 @@
       "no_download": "No Download",
       "submit": "Share",
       "revoke": "Revoke"
-    }
+    },
+    "untitled_name": {
+      "docx": "Untitled document",
+      "xlsx": "Untitled spreadsheet",
+      "pptx": "Untitled presentation"
+    },
+    "gallery": {
+      "title": "Start a new document",
+      "blank_docx": "Blank document",
+      "blank_xlsx": "Blank spreadsheet",
+      "blank_pptx": "Blank presentation"
+    },
+    "view": {
+      "list": "List view",
+      "grid": "Grid view"
+    },
+    "sort": {
+      "label": "Sort by",
+      "updated": "Last modified",
+      "name": "Name",
+      "size": "Size"
+    },
+    "filter": {
+      "all": "All types",
+      "word": "Documents",
+      "cell": "Spreadsheets",
+      "slide": "Presentations",
+      "pdf": "PDFs"
+    },
+    "columns": {
+      "name": "Name",
+      "details": "Location / Owner",
+      "modified": "Modified",
+      "size": "Size",
+      "actions": "Actions"
+    },
+    "preview": {
+      "rename_aria": "Document title",
+      "saving": "Saving...",
+      "saved": "Saved",
+      "read_only": "Read-only"
+    },
+    "drop_hint": "Drop supported Office or PDF file to upload"
   }
 }

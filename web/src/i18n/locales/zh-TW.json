@@ -5249,7 +5249,9 @@
       "move": "移動",
       "rename": "重新命名",
       "remove_recent": "移出最近列表",
-      "share": "共用"
+      "share": "共用",
+      "more": "更多操作",
+      "clear_search": "清除搜尋"
     },
     "blank_type": {
       "docx": "Word",
@@ -5294,6 +5296,48 @@
       "no_download": "禁止下載",
       "submit": "確認共用",
       "revoke": "撤銷"
-    }
+    },
+    "untitled_name": {
+      "docx": "未命名文件",
+      "xlsx": "未命名試算表",
+      "pptx": "未命名簡報"
+    },
+    "gallery": {
+      "title": "建立新文件",
+      "blank_docx": "空白文件",
+      "blank_xlsx": "空白試算表",
+      "blank_pptx": "空白簡報"
+    },
+    "view": {
+      "list": "清單檢視",
+      "grid": "格線檢視"
+    },
+    "sort": {
+      "label": "排序方式",
+      "updated": "上次修改",
+      "name": "名稱",
+      "size": "大小"
+    },
+    "filter": {
+      "all": "所有類型",
+      "word": "文件",
+      "cell": "試算表",
+      "slide": "簡報",
+      "pdf": "PDF 文件"
+    },
+    "columns": {
+      "name": "名稱",
+      "details": "位置 / 擁有者",
+      "modified": "修改時間",
+      "size": "大小",
+      "actions": "操作"
+    },
+    "preview": {
+      "rename_aria": "文件標題",
+      "saving": "儲存中...",
+      "saved": "已儲存",
+      "read_only": "唯讀"
+    },
+    "drop_hint": "拖放至此以上傳支援的 Office 或 PDF 檔案"
   }
 }

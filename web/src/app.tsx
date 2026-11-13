@@ -71,7 +71,7 @@ import {
   SupervisionTaskPairSnapshotBridge,
   supervisionTaskConsolePreferenceBounds,
 } from './components/SupervisionTaskConsole.js';
-import { CloudDocsPanel } from './components/CloudDocsPanel.js';
+import { CloudDocsGlyphIcon, CloudDocsPanel } from './components/CloudDocsPanel.js';
 import {
   loadSupervisionTaskConsolePreferences,
   saveSupervisionTaskConsolePreferences,
@@ -7955,12 +7955,17 @@ function InternalMainApp() {
                   background: showCloudDocs ? '#1d4ed8' : '#334155',
                   color: showCloudDocs ? '#ffffff' : '#e2e8f0',
                   fontSize: 12,
+                  padding: '4px 7px',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
                 }}
                 onClick={() => setShowCloudDocs((prev) => !prev)}
                 title={trans('cloud_docs.title', 'Cloud Docs')}
+                aria-label={trans('cloud_docs.title', 'Cloud Docs')}
                 aria-pressed={showCloudDocs}
               >
-                📄 {trans('cloud_docs.button_label', 'Cloud Docs')}
+                <CloudDocsGlyphIcon size={17} />
               </button>
               {/* Session-list show/hide toggle — same as the mobile sidebar ⊞ button */}
               <button
@@ -8321,10 +8326,11 @@ function InternalMainApp() {
                   class="view-toggle"
                   data-testid="mobile-cloud-docs-btn"
                   title={trans('cloud_docs.title', 'Cloud Docs')}
+                  aria-label={trans('cloud_docs.title', 'Cloud Docs')}
                   onClick={() => setShowCloudDocs((prev) => !prev)}
                   aria-pressed={showCloudDocs}
                 >
-                  📄
+                  <CloudDocsGlyphIcon size={17} />
                 </button>
                 {!isTransportSession && (
                   <button class="view-toggle" data-onboarding="view-toggle" onClick={toggleViewMode}>
