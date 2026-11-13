@@ -765,4 +765,133 @@ describe('AG captured native foreground ownership', () => {
     expect(o.settle(1)).toBeUndefined();
     await expect(o.output(1)).resolves.toBeUndefined();
   });
+
+  it('preempts bound lane on negation-prefixed or modified-body foreign inputs across plain, wrapped, and shared Context headers (F1)', async () => {
+    const sharedHeader = 'Context instructions:\nSame policy header.\nSecond policy line.';
+    const bare = 'delete the database';
+    const withCtx = `${sharedHeader}\n\n${bare}`;
+
+    const foreignVariants = [
+      'Do not delete the database',
+      '<USER_REQUEST>Do not delete the database</USER_REQUEST>',
+      `<USER_REQUEST>\n${sharedHeader}\n\nDo not delete the database\n</USER_REQUEST>`,
+      `<USER_REQUEST>\n${sharedHeader}\n\nNever delete the database or drop tables\n</USER_REQUEST>`,
+      'Please explain why someone might delete the database',
+    ];
+
+    for (const [registeredText, aliases] of [
+      [bare, undefined],
+      [withCtx, [bare]],
+    ] as const) {
+      for (const foreign of foreignVariants) {
+        const o = new AgyForegroundOwnership(30);
+        o.beginTurn();
+        o.register(1, registeredText, false, undefined, aliases);
+        o.observe(row(1, 'USER_INPUT', `<USER_REQUEST>${bare}</USER_REQUEST>`, 'USER_EXPLICIT'));
+        o.observe(row(2, 'USER_INPUT', foreign, 'USER_EXPLICIT'));
+        expect(o.observe(row(3, 'PLANNER_RESPONSE', 'FOREIGN OUTPUT'))).toBe(false);
+        expect(o.latest).toBeUndefined();
+        expect(o.settle(1)).toBeUndefined();
+        await expect(o.output(1)).resolves.toBeUndefined();
+        o.clear();
+
+        // Also verify preemption of retainedLane after release(1) when an absorbed G2 exists.
+        const oRetained = new AgyForegroundOwnership(30);
+        oRetained.beginTurn();
+        oRetained.register(1, registeredText, false, undefined, aliases);
+        oRetained.register(2, 'absorbed followup', true);
+        oRetained.observe(row(1, 'USER_INPUT', `<USER_REQUEST>${registeredText}</USER_REQUEST>`, 'USER_EXPLICIT'));
+        oRetained.release(1);
+        oRetained.observe(row(2, 'USER_INPUT', foreign, 'USER_EXPLICIT'));
+        expect(oRetained.observe(row(3, 'PLANNER_RESPONSE', 'FOREIGN OUTPUT'))).toBe(false);
+        expect(oRetained.latest).toBeUndefined();
+        await expect(oRetained.output(2)).resolves.toBeUndefined();
+        oRetained.clear();
+      }
+    }
+  });
+
+  it('matches short structured companion aliases with Context instructions while still rejecting modified foreign tails', async () => {
+    const shortBare = '部署';
+    const ctxWithShort = `Context instructions:\nPolicy header.\n\n${shortBare}`;
+    const o = new AgyForegroundOwnership(200);
+    o.beginTurn();
+    o.register(1, ctxWithShort, false, undefined, [shortBare]);
+    o.observe(row(1, 'USER_INPUT', `<USER_REQUEST>\n${shortBare}\n</USER_REQUEST>`, 'USER_EXPLICIT'));
+    o.observe(row(2, 'USER_INPUT', `<USER_REQUEST>\n${ctxWithShort}\n</USER_REQUEST>`, 'USER_EXPLICIT'));
+    o.observe(row(3, 'PLANNER_RESPONSE', 'deployed short prompt'));
+    await expect(o.output(1)).resolves.toMatchObject({ content: 'deployed short prompt' });
+
+    const oForeign = new AgyForegroundOwnership(30);
+    oForeign.beginTurn();
+    oForeign.register(1, ctxWithShort, false, undefined, [shortBare]);
+    oForeign.observe(row(1, 'USER_INPUT', `<USER_REQUEST>\n${shortBare}\n</USER_REQUEST>`, 'USER_EXPLICIT'));
+    oForeign.observe(row(2, 'USER_INPUT', `<USER_REQUEST>\nContext instructions:\nPolicy header.\n\n不要${shortBare}\n</USER_REQUEST>`, 'USER_EXPLICIT'));
+    expect(oForeign.observe(row(3, 'PLANNER_RESPONSE', 'FOREIGN OUTPUT'))).toBe(false);
+    expect(oForeign.latest).toBeUndefined();
+  });
+
+  it('wakes shared-turn output waits without microtask starvation across G1->G2, G2->G1, and absorbed G2 before/after bind (F2)', async () => {
+    // 1. G1->G2 absorbed G2 (G2 has no USER_EXPLICIT echo), both when G1 binds before output(2) and after output(2) starts waiting.
+    for (const beginWaitBeforeBind of [false, true]) {
+      const o = new AgyForegroundOwnership(500);
+      o.beginTurn();
+      o.register(1, 'first owned input');
+      o.register(2, 'absorbed steering note', true);
+
+      let bindTimer: ReturnType<typeof setTimeout> | undefined;
+      const bind = () => o.observe(row(1, 'USER_INPUT', '<USER_REQUEST>first owned input</USER_REQUEST>', 'USER_EXPLICIT'));
+      if (beginWaitBeforeBind) {
+        bindTimer = setTimeout(bind, 2);
+      } else {
+        bind();
+      }
+
+      let ticks = 0;
+      const heartbeat = setInterval(() => { ticks += 1; }, 4);
+      let responseArrived = false;
+      const responseTimer = setTimeout(() => {
+        responseArrived = true;
+        o.observe(row(2, 'PLANNER_RESPONSE', 'OWNED OUTPUT'));
+      }, 15);
+
+      const startedAt = Date.now();
+      const out = await o.output(2);
+      const elapsedMs = Date.now() - startedAt;
+      clearInterval(heartbeat);
+      clearTimeout(responseTimer);
+      clearTimeout(bindTimer);
+
+      expect(responseArrived).toBe(true);
+      expect(out?.content).toBe('OWNED OUTPUT');
+      expect(ticks).toBeGreaterThanOrEqual(1);
+      expect(elapsedMs).toBeLessThan(250);
+      o.clear();
+    }
+
+    // 2. Normal G1->G2 where G2 later takes over with its own USER_EXPLICIT while output(1) is waiting.
+    const oTakeover = new AgyForegroundOwnership(500);
+    oTakeover.beginTurn();
+    oTakeover.register(1, 'initial prompt');
+    oTakeover.register(2, 'takeover prompt', true);
+    oTakeover.observe(row(1, 'USER_INPUT', '<USER_REQUEST>initial prompt</USER_REQUEST>', 'USER_EXPLICIT'));
+
+    let takeoverTicks = 0;
+    const takeoverHeartbeat = setInterval(() => { takeoverTicks += 1; }, 4);
+    const g1Wait = oTakeover.output(1);
+    setTimeout(() => {
+      oTakeover.observe(row(2, 'USER_INPUT', '<USER_REQUEST>takeover prompt</USER_REQUEST>', 'USER_EXPLICIT'));
+      setTimeout(() => {
+        oTakeover.observe(row(3, 'PLANNER_RESPONSE', 'TAKEOVER OUTPUT'));
+      }, 10);
+    }, 10);
+
+    const g1Result = await g1Wait;
+    expect(g1Result).toBeUndefined();
+    expect(oTakeover.hasBoundSuccessor(1)).toBe(true);
+    const g2Out = await oTakeover.output(oTakeover.resolveAggregateGeneration(1));
+    clearInterval(takeoverHeartbeat);
+    expect(g2Out?.content).toBe('TAKEOVER OUTPUT');
+    expect(takeoverTicks).toBeGreaterThanOrEqual(1);
+  });
 });

@@ -15,11 +15,20 @@ const USER_REQUEST_TAG_RE = /<\/?USER_REQUEST>/gi;
 const TRAILING_META_RE = /^\s*(?:<(?:ADDITIONAL_METADATA|USER_SETTINGS_CHANGE)\b[\s\S]*)?$/i;
 const TRUNCATION_SUFFIX_RE = /(?:\s*\.{3,}|\s*…|\s*\[truncated\])+$/i;
 
+interface PromptAlias {
+  text: string;
+  normText: string;
+  tagCount: number;
+}
+
 interface Prompt {
   generation: number;
   text?: string;
   normText?: string;
   tagCount?: number;
+  aliases?: PromptAlias[];
+  boundBody?: string;
+  boundNormBody?: string;
   inputStep?: number;
   bindSeq?: number;
   output?: AgyTranscriptRow;
@@ -110,7 +119,6 @@ export function isTerminalForegroundRow(row: AgyTranscriptRow | undefined): bool
 }
 
 const CONTEXT_INSTRUCTIONS_PREFIX = 'Context instructions:';
-const COMPANION_COLLAPSED_MIN_LEN = 12;
 
 function normalizeNewlines(text: string): string {
   return text.replace(/\r\n/g, '\n').trim();
@@ -120,46 +128,79 @@ function hasContextCompanionRelation(aRaw: string, bRaw: string): boolean {
   const check = (withCtx: string, withoutCtx: string): boolean => {
     const w = normalizeNewlines(withCtx);
     const b = normalizeNewlines(withoutCtx);
-    if (!w.startsWith(CONTEXT_INSTRUCTIONS_PREFIX) || !b) return false;
+    const prefix = `${CONTEXT_INSTRUCTIONS_PREFIX}\n`;
+    if (!w.startsWith(prefix) || !b || b.startsWith(prefix)) return false;
     if (w.endsWith(`\n\n${b}`)) return true;
-    const wNorm = collapseWhitespace(w);
     const bNorm = collapseWhitespace(b);
-    return bNorm.length >= COMPANION_COLLAPSED_MIN_LEN && wNorm.endsWith(` ${bNorm}`);
+    if (!bNorm) return false;
+    let sep = w.indexOf('\n\n');
+    while (sep >= 0) {
+      const tail = w.slice(sep + 2).trim();
+      if (tail === b || collapseWhitespace(tail) === bNorm) return true;
+      sep = w.indexOf('\n\n', sep + 2);
+    }
+    return false;
   };
   return check(aRaw, bRaw) || check(bRaw, aRaw);
 }
 
-function promptMatchesExplicitContent(
+function extractBoundBody(content: string): string {
+  const envelope = parseNativeInputEnvelope(content);
+  return envelope.kind === 'wrapped' ? envelope.body : content;
+}
+
+function promptMatchTargets(prompt: Prompt): PromptAlias[] {
+  const targets: PromptAlias[] = [];
+  if (prompt.text) {
+    targets.push({
+      text: prompt.text,
+      normText: prompt.normText ?? collapseWhitespace(prompt.text),
+      tagCount: prompt.tagCount ?? countUserRequestTags(prompt.text),
+    });
+  }
+  if (prompt.aliases) targets.push(...prompt.aliases);
+  return targets;
+}
+
+function promptMatchesBoundCompanion(
   prompt: Prompt,
   content: string,
   normRaw: string,
   envelope: ParsedInputEnvelope,
 ): boolean {
-  if (!prompt.text) return false;
-  if (content === prompt.text || content.trim() === prompt.text.trim()) return true;
-  if (prompt.normText && normRaw === prompt.normText) return true;
+  const targets = promptMatchTargets(prompt);
+  if (prompt.boundBody) {
+    targets.push({
+      text: prompt.boundBody,
+      normText: prompt.boundNormBody ?? collapseWhitespace(prompt.boundBody),
+      tagCount: countUserRequestTags(prompt.boundBody),
+    });
+  }
+  if (targets.length === 0) return false;
+  const trimmedContent = content.trim();
+  if (targets.some(t => content === t.text || trimmedContent === t.text.trim() || (t.normText.length > 0 && normRaw === t.normText))) {
+    return true;
+  }
   if (envelope.kind === 'invalid') return false;
 
-  if (envelope.kind === 'wrapped') {
-    if (envelope.body === prompt.text || envelope.body.trim() === prompt.text.trim()) return true;
-    const normRow = collapseWhitespace(envelope.body);
-    if (!normRow) return false;
-    if (prompt.normText && normRow === prompt.normText) return true;
-    if (hasContextCompanionRelation(prompt.text, envelope.body)) return true;
-    const trimmedBody = envelope.body.trim();
-    if (!TRUNCATION_SUFFIX_RE.test(trimmedBody)) return false;
-    const strippedRow = collapseWhitespace(trimmedBody.replace(TRUNCATION_SUFFIX_RE, ''));
-    return matchesTruncatedEnvelopePrefix(strippedRow, prompt.normText ?? '');
+  const candidateBody = envelope.kind === 'wrapped' ? envelope.body : content;
+  const candidateTrim = candidateBody.trim();
+  const candidateNorm = envelope.kind === 'wrapped' ? collapseWhitespace(candidateBody) : normRaw;
+  if (!candidateNorm) return false;
+
+  for (const t of targets) {
+    if (candidateBody === t.text || candidateTrim === t.text.trim()) return true;
+    if (t.normText.length > 0 && candidateNorm === t.normText) return true;
+    if (hasContextCompanionRelation(t.text, candidateBody)) return true;
   }
 
-  if (prompt.tagCount !== 0) return false;
-  if (content.includes(prompt.text)) return true;
-  if (prompt.normText && normRaw.includes(prompt.normText)) return true;
-  if (hasContextCompanionRelation(prompt.text, content)) return true;
-  const trimmedContent = content.trim();
-  if (!TRUNCATION_SUFFIX_RE.test(trimmedContent)) return false;
-  const strippedRow = collapseWhitespace(trimmedContent.replace(TRUNCATION_SUFFIX_RE, ''));
-  return matchesTruncatedPlainPrefix(strippedRow, prompt.normText ?? '');
+  if (!TRUNCATION_SUFFIX_RE.test(candidateTrim)) return false;
+  const strippedRow = collapseWhitespace(candidateTrim.replace(TRUNCATION_SUFFIX_RE, ''));
+  if (!strippedRow) return false;
+  if (envelope.kind === 'wrapped') {
+    return targets.some(t => matchesTruncatedEnvelopePrefix(strippedRow, t.normText));
+  }
+  return targets.some(t => t.tagCount === 0 && matchesTruncatedPlainPrefix(strippedRow, t.normText));
 }
 
 /** Captured outbound RPC -> explicit native input -> native response. ACP
@@ -175,8 +216,26 @@ export class AgyForegroundOwnership {
   private latestBindSeq = 0;
   private turnStartGeneration?: number;
   private continuationWatermark?: AgyTranscriptCursor;
+  private stateChangeResolve?: () => void;
+  private stateChangePromise?: Promise<void>;
   latest?: { generation: number; row: AgyTranscriptRow };
   constructor(private deadlineMs = NATIVE_OUTPUT_DEADLINE_MS) {}
+
+  private getStateChangePromise(): Promise<void> {
+    if (!this.stateChangePromise) {
+      this.stateChangePromise = new Promise<void>(resolve => {
+        this.stateChangeResolve = resolve;
+      });
+    }
+    return this.stateChangePromise;
+  }
+
+  private notifyStateChange(): void {
+    const resolve = this.stateChangeResolve;
+    this.stateChangeResolve = undefined;
+    this.stateChangePromise = undefined;
+    resolve?.();
+  }
 
   beginTurn(): void {
     this.latest = undefined;
@@ -186,6 +245,7 @@ export class AgyForegroundOwnership {
     this.retainedLane = undefined;
     this.turnStartGeneration = undefined;
     this.continuationWatermark = undefined;
+    this.notifyStateChange();
   }
 
   register(
@@ -193,6 +253,7 @@ export class AgyForegroundOwnership {
     text: string,
     shareActiveTurn = false,
     continuationCursor?: AgyTranscriptCursor | number,
+    companionAliases?: readonly string[],
   ): void {
     let resolve!: () => void;
     const ready = new Promise<void>(r => { resolve = r; });
@@ -224,7 +285,22 @@ export class AgyForegroundOwnership {
     }
     const normText = collapseWhitespace(text);
     const tagCount = countUserRequestTags(text);
-    this.prompts.set(generation,{generation,text,normText,tagCount,ready,resolve});
+    const aliases = companionAliases
+      ?.map(alias => ({
+        text: alias,
+        normText: collapseWhitespace(alias),
+        tagCount: countUserRequestTags(alias),
+      }))
+      .filter(a => a.text.length > 0 && a.text !== text);
+    this.prompts.set(generation, {
+      generation,
+      text,
+      normText,
+      tagCount,
+      ...(aliases && aliases.length > 0 ? { aliases } : {}),
+      ready,
+      resolve,
+    });
   }
 
   private activeLanePrompt(): Prompt | undefined {
@@ -281,13 +357,17 @@ export class AgyForegroundOwnership {
     // 1. Direct raw payload fidelity (exact, trimmed, or whitespace-normalized full equality).
     // Preserves plain USER_EXPLICIT fixtures/inputs even when the prompt itself contains or
     // consists of literal <USER_REQUEST>...</USER_REQUEST> tags, in FIFO order.
-    const exactRaw = unbound.find(p => content === p.text || content.trim() === p.text!.trim());
+    const exactRaw = unbound.find(p =>
+      promptMatchTargets(p).some(t => content === t.text || content.trim() === t.text.trim()),
+    );
     if (exactRaw) return exactRaw;
 
     const normRaw = collapseWhitespace(content);
     if (!normRaw) return undefined;
 
-    const normRawMatch = unbound.find(p => p.normText !== undefined && p.normText.length > 0 && normRaw === p.normText);
+    const normRawMatch = unbound.find(p =>
+      promptMatchTargets(p).some(t => t.normText.length > 0 && normRaw === t.normText),
+    );
     if (normRawMatch) return normRawMatch;
 
     // 2. Native outer envelope extraction and context/prefix fallback.
@@ -295,22 +375,30 @@ export class AgyForegroundOwnership {
     if (envelope.kind === 'invalid') return undefined;
 
     if (envelope.kind === 'wrapped') {
-      const exactWrapped = unbound.find(p => envelope.body === p.text || envelope.body.trim() === p.text!.trim());
+      const exactWrapped = unbound.find(p =>
+        promptMatchTargets(p).some(t => envelope.body === t.text || envelope.body.trim() === t.text.trim()),
+      );
       if (exactWrapped) return exactWrapped;
 
       const normRow = collapseWhitespace(envelope.body);
       if (!normRow) return undefined;
 
-      const normFull = unbound.find(p => p.normText !== undefined && p.normText.length > 0 && normRow === p.normText);
+      const normFull = unbound.find(p =>
+        promptMatchTargets(p).some(t => t.normText.length > 0 && normRow === t.normText),
+      );
       if (normFull) return normFull;
 
-      const companion = unbound.find(p => p.text && hasContextCompanionRelation(p.text, envelope.body));
+      const companion = unbound.find(p =>
+        promptMatchTargets(p).some(t => hasContextCompanionRelation(t.text, envelope.body)),
+      );
       if (companion) return companion;
 
       const trimmedBody = envelope.body.trim();
       if (!TRUNCATION_SUFFIX_RE.test(trimmedBody)) return undefined;
       const strippedRow = collapseWhitespace(trimmedBody.replace(TRUNCATION_SUFFIX_RE, ''));
-      const prefixMatches = unbound.filter(p => matchesTruncatedEnvelopePrefix(strippedRow, p.normText ?? ''));
+      const prefixMatches = unbound.filter(p =>
+        promptMatchTargets(p).some(t => matchesTruncatedEnvelopePrefix(strippedRow, t.normText)),
+      );
       return selectUnambiguousPrefixMatch(prefixMatches);
     }
 
@@ -318,19 +406,27 @@ export class AgyForegroundOwnership {
     const plainCandidates = unbound.filter(p => p.tagCount === 0);
     if (plainCandidates.length === 0) return undefined;
 
-    const exactPlain = plainCandidates.find(p => content.includes(p.text!));
+    const exactPlain = plainCandidates.find(p =>
+      promptMatchTargets(p).some(t => t.tagCount === 0 && content.includes(t.text)),
+    );
     if (exactPlain) return exactPlain;
 
-    const normPlain = plainCandidates.find(p => p.normText !== undefined && p.normText.length > 0 && normRaw.includes(p.normText));
+    const normPlain = plainCandidates.find(p =>
+      promptMatchTargets(p).some(t => t.tagCount === 0 && t.normText.length > 0 && normRaw.includes(t.normText)),
+    );
     if (normPlain) return normPlain;
 
-    const companionPlain = plainCandidates.find(p => p.text && hasContextCompanionRelation(p.text, content));
+    const companionPlain = plainCandidates.find(p =>
+      promptMatchTargets(p).some(t => hasContextCompanionRelation(t.text, content)),
+    );
     if (companionPlain) return companionPlain;
 
     const trimmedContent = content.trim();
     if (!TRUNCATION_SUFFIX_RE.test(trimmedContent)) return undefined;
     const strippedRow = collapseWhitespace(trimmedContent.replace(TRUNCATION_SUFFIX_RE, ''));
-    const prefixMatches = plainCandidates.filter(p => matchesTruncatedPlainPrefix(strippedRow, p.normText ?? ''));
+    const prefixMatches = plainCandidates.filter(p =>
+      promptMatchTargets(p).some(t => t.tagCount === 0 && matchesTruncatedPlainPrefix(strippedRow, t.normText)),
+    );
     return selectUnambiguousPrefixMatch(prefixMatches);
   }
 
@@ -361,7 +457,7 @@ export class AgyForegroundOwnership {
       candidates.push(this.retainedLane);
     }
     if (candidates.length === 0) return undefined;
-    return candidates.find(p => promptMatchesExplicitContent(p, content, normRaw, envelope));
+    return candidates.find(p => promptMatchesBoundCompanion(p, content, normRaw, envelope));
   }
 
   private getTurnLatest(): { generation: number; row: AgyTranscriptRow } | undefined {
@@ -422,6 +518,7 @@ export class AgyForegroundOwnership {
       if (this.lane === prompt.generation) this.lane = undefined;
       if (this.retainedLane?.generation === prompt.generation) this.retainedLane = undefined;
       prompt.resolve();
+      this.notifyStateChange();
     }
     return prompt.output;
   }
@@ -443,10 +540,16 @@ export class AgyForegroundOwnership {
           this.retainedLane = undefined;
           superseded.resolve();
         }
+        this.notifyStateChange();
         return false;
       }
       this.lane = prompt.generation;
       prompt.inputStep = row.step_index;
+      const boundBody = extractBoundBody(row.content ?? '');
+      if (boundBody) {
+        prompt.boundBody = boundBody;
+        prompt.boundNormBody = collapseWhitespace(boundBody);
+      }
       prompt.bindSeq = ++this.bindSeq;
       this.latestBound = { generation: prompt.generation, bindSeq: prompt.bindSeq };
       this.lastBoundGeneration = Math.max(this.lastBoundGeneration, prompt.generation);
@@ -455,18 +558,9 @@ export class AgyForegroundOwnership {
         this.retainedLane = undefined;
         superseded.resolve();
       }
-      // Wake older or same-turn unresolved waits immediately so they yield to the bound
-      // leader instead of hanging until the failure deadline.
-      for (const existing of this.prompts.values()) {
-        if (
-          existing !== prompt
-          && !existing.output
-          && (existing.generation < prompt.generation
-            || (this.turnStartGeneration !== undefined && existing.generation >= this.turnStartGeneration))
-        ) {
-          existing.resolve();
-        }
-      }
+      // Wake active output() waiters via a re-armable state-change notification so they
+      // re-evaluate leader/adoptable state without leaving non-terminal prompts pre-resolved.
+      this.notifyStateChange();
       return false;
     } else if (row.type === 'USER_INPUT') {
       const prompt = this.activeLanePrompt();
@@ -501,6 +595,7 @@ export class AgyForegroundOwnership {
         if (this.lane === prompt.generation) this.lane = undefined;
         if (this.retainedLane?.generation === prompt.generation) this.retainedLane = undefined;
         prompt.resolve();
+        this.notifyStateChange();
         return true;
       }
       return false;
@@ -535,9 +630,10 @@ export class AgyForegroundOwnership {
         if (turnLatest) return turnLatest.row;
       }
       const adoptable = prompt.inputStep === undefined ? this.getAdoptableLane(generation) : undefined;
+      const stateWait = this.getStateChangePromise();
       const waitPromise = adoptable
-        ? Promise.race([prompt.ready, adoptable.ready])
-        : prompt.ready;
+        ? Promise.race([prompt.ready, adoptable.ready, stateWait])
+        : Promise.race([prompt.ready, stateWait]);
       const remainingMs = endAt === undefined ? this.deadlineMs : endAt - Date.now();
       const timedOut = endAt !== undefined && remainingMs <= 0
         ? true
@@ -575,6 +671,7 @@ export class AgyForegroundOwnership {
       this.lane = undefined;
       this.retainedLane?.resolve();
       this.retainedLane = undefined;
+      this.notifyStateChange();
       return;
     }
     if (this.lane === generation) {
@@ -595,6 +692,7 @@ export class AgyForegroundOwnership {
       }
       this.lane = undefined;
     }
+    this.notifyStateChange();
   }
   releaseTurn(): void {
     for (const prompt of this.prompts.values()) prompt.resolve();
@@ -608,6 +706,7 @@ export class AgyForegroundOwnership {
     this.turnStartGeneration = undefined;
     this.continuationWatermark = undefined;
     this.latest = undefined;
+    this.notifyStateChange();
   }
 
   clear(): void {

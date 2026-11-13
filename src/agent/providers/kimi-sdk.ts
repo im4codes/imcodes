@@ -1652,7 +1652,18 @@ export class KimiSdkProvider implements TransportProvider {
       // when the turn ends.  Publish the generation-scoped admission boundary
       // before returning from send(), then settle asynchronously.
       const connection = this.connection!;
-      if (this.id === AGY_SDK_PROVIDER_ID) (state.agyForeground ??= new AgyForegroundOwnership()).register(generation,promptBlocks.map(b => b.type === 'text' ? b.text : '').join(''));
+      if (this.id === AGY_SDK_PROVIDER_ID) {
+        const promptText = promptBlocks.map(b => b.type === 'text' ? b.text : '').join('');
+        const rawAlias = payload.assembledMessage.trim();
+        const companionAliases = rawAlias && rawAlias !== promptText.trim() ? [payload.assembledMessage] : undefined;
+        (state.agyForeground ??= new AgyForegroundOwnership()).register(
+          generation,
+          promptText,
+          false,
+          undefined,
+          companionAliases,
+        );
+      }
       const turn = connection.prompt({
         sessionId: state.acpSessionId!,
         prompt: promptBlocks,
