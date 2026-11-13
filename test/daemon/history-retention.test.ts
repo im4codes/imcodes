@@ -389,13 +389,16 @@ describe('real SQLite writer retention', () => {
 
     try {
       await vi.waitFor(() => expect(watchFileSpy).toHaveBeenCalledTimes(1));
+      // fs.watchFile schedules libuv's initial baseline stat asynchronously on a worker thread;
+      // settle past one poll interval so the first config write occurs after baseline capture.
+      await new Promise(resolve => setTimeout(resolve, 100));
       const beforeChange = schedules;
       config(home, 3);
-      await vi.waitFor(() => expect(schedules).toBeGreaterThan(beforeChange), { timeout: 2000 });
+      await vi.waitFor(() => expect(schedules).toBeGreaterThan(beforeChange), { timeout: 4000 });
 
       const afterEnable = schedules;
       config(home, null);
-      await vi.waitFor(() => expect(schedules).toBeGreaterThan(afterEnable), { timeout: 2000 });
+      await vi.waitFor(() => expect(schedules).toBeGreaterThan(afterEnable), { timeout: 4000 });
     } finally {
       handle.stop();
     }

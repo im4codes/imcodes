@@ -97,6 +97,12 @@ import { SessionControls } from '../../src/components/SessionControls.js';
 import { focusComposerElement } from '../../src/util/composer-focus.js';
 import type { SessionInfo } from '../../src/types.js';
 
+/** jsdom 28 drops non-standard `-webkit-user-modify` from `cssstyle`, keeping only `style.webkitUserModify`. */
+function readInlineWebkitUserModify(el: HTMLElement): string {
+  const style = el.style as CSSStyleDeclaration & { webkitUserModify?: string };
+  return style.getPropertyValue('-webkit-user-modify') || style.webkitUserModify || '';
+}
+
 const makeSession = (): SessionInfo => ({
   name: 'deck_main',
   project: 'main',
@@ -734,7 +740,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
 
       // Short tap: pending suppresses selectstart/contextmenu and sets inline -webkit-user-modify: read-only, then release transitions to contenteditable="true" + focus and clears lock
       dispatchPointer(input, 'pointerdown', 180);
-      expect(input.style.getPropertyValue('-webkit-user-modify')).toBe('read-only');
+      expect(readInlineWebkitUserModify(input)).toBe('read-only');
       const pendingSelect = new Event('selectstart', { bubbles: true, cancelable: true });
       const pendingMenu = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
       expect(fireEvent(input, pendingSelect)).toBe(false);
@@ -745,7 +751,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       await vi.advanceTimersByTimeAsync(0);
       expect(input.getAttribute('contenteditable')).toBe('true');
       expect(input.style.userSelect).toBe('');
-      expect(input.style.getPropertyValue('-webkit-user-modify')).toBe('');
+      expect(readInlineWebkitUserModify(input)).toBe('');
       expect(fireEvent(input, new Event('selectstart', { bubbles: true, cancelable: true }))).toBe(true);
       expect(fireEvent(input, new MouseEvent('contextmenu', { bubbles: true, cancelable: true }))).toBe(true);
       fireEvent.blur(input);
@@ -758,14 +764,14 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       await vi.advanceTimersByTimeAsync(0);
       expect(input.getAttribute('contenteditable')).toBe('false');
       expect(input.style.userSelect).toBe('');
-      expect(input.style.getPropertyValue('-webkit-user-modify')).toBe('');
+      expect(readInlineWebkitUserModify(input)).toBe('');
 
       // Active hold suppresses selectstart/contextmenu, sets inline read-only, prevents touchmove pan, then pointercancel restores cleanly
       dispatchPointer(input, 'pointerdown', 180);
       await vi.advanceTimersByTimeAsync(240);
       expect(removeAllRanges).toHaveBeenCalled();
       expect(input.getAttribute('contenteditable')).toBe('false');
-      expect(input.style.getPropertyValue('-webkit-user-modify')).toBe('read-only');
+      expect(readInlineWebkitUserModify(input)).toBe('read-only');
       expect(fireEvent(input, new Event('selectstart', { bubbles: true, cancelable: true }))).toBe(false);
       expect(fireEvent(input, new MouseEvent('contextmenu', { bubbles: true, cancelable: true }))).toBe(false);
       const activeTouchMove = new Event('touchmove', { bubbles: true, cancelable: true });
@@ -776,7 +782,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       await vi.advanceTimersByTimeAsync(0);
       expect(input.getAttribute('contenteditable')).toBe('false');
       expect(input.style.userSelect).toBe('');
-      expect(input.style.getPropertyValue('-webkit-user-modify')).toBe('');
+      expect(readInlineWebkitUserModify(input)).toBe('');
 
       // lostpointercapture during active hold MUST NOT cancel; window pointermove + pointerup finish cleanly
       dispatchPointer(input, 'pointerdown', 180);
@@ -806,23 +812,37 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       const idleTouchMove = new Event('touchmove', { bubbles: true, cancelable: true });
       window.dispatchEvent(idleTouchMove);
       expect(idleTouchMove.defaultPrevented).toBe(false);
-
-      // Unmount mid-drain restores contenteditable and inline userSelect on the composer element
-      let releaseDrain!: () => void;
-      voiceMock.stopListening.mockImplementationOnce(() => new Promise<void>((r) => { releaseDrain = r; }));
-      dispatchPointer(input, 'pointerdown', 180);
-      await vi.advanceTimersByTimeAsync(240);
-      dispatchPointer(input, 'pointerup', 180);
-      await vi.advanceTimersByTimeAsync(0);
-      view.unmount();
-      expect(input.getAttribute('contenteditable')).toBe('true');
-      expect(input.style.userSelect).toBe('');
-      expect(input.style.getPropertyValue('-webkit-user-modify')).toBe('');
-      releaseDrain();
-      await vi.advanceTimersByTimeAsync(0);
     } finally {
       Object.defineProperty(window, 'getSelection', { configurable: true, value: origGetSelection });
     }
+  });
+
+  it('restores contenteditable and inline touch lock when unmounted mid-drain', async () => {
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    const view = render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = document.querySelector('.controls-input') as HTMLElement;
+    let releaseDrain!: () => void;
+    voiceMock.stopListening.mockImplementationOnce(() => new Promise<void>((r) => { releaseDrain = r; }));
+    dispatchPointer(input, 'pointerdown', 180);
+    await vi.advanceTimersByTimeAsync(240);
+    dispatchPointer(input, 'pointerup', 180);
+    await vi.advanceTimersByTimeAsync(0);
+    view.unmount();
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(input.style.userSelect).toBe('');
+    expect(readInlineWebkitUserModify(input)).toBe('');
+    releaseDrain();
+    await vi.advanceTimersByTimeAsync(0);
   });
 
   it('tracks ±44px zone boundaries, clamps --voice-slide-x to ±84px, and auto-scrolls transcript on growth', async () => {
@@ -1362,7 +1382,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     await vi.advanceTimersByTimeAsync(240);
     expect(document.querySelector('.voice-hold-hud')).not.toBeNull();
     expect(input.getAttribute('contenteditable')).toBe('false');
-    expect(input.style.getPropertyValue('-webkit-user-modify')).toBe('read-only');
+    expect(readInlineWebkitUserModify(input)).toBe('read-only');
     expect(focusComposerElement(inputRef.current)).toBe(false);
     expect(input.getAttribute('contenteditable')).toBe('false');
 
