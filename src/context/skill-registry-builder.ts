@@ -12,6 +12,7 @@ import {
   isAgentSkillName,
 } from '../../shared/agent-skills.js';
 import {
+  SKILL_REGISTRY_DISCOVERY_VERSION,
   SKILL_REGISTRY_FILE_NAME,
   SKILL_REGISTRY_SCHEMA_VERSION,
   makeSkillUri,
@@ -151,9 +152,11 @@ function readSkillSource(path: string, layer: SkillLayer, fallback: { name?: str
   }
 }
 
-function writeRegistry(path: string, entries: SkillRegistryEntry[]): SkillRegistrySnapshot {
+function writeRegistry(path: string, entries: SkillRegistryEntry[], scanSignature: string): SkillRegistrySnapshot {
   const snapshot: SkillRegistrySnapshot = {
     schemaVersion: SKILL_REGISTRY_SCHEMA_VERSION,
+    discoveryVersion: SKILL_REGISTRY_DISCOVERY_VERSION,
+    scanSignature,
     generatedAt: Date.now(),
     entries: entries.sort((a, b) => `${a.layer}:${a.key}`.localeCompare(`${b.layer}:${b.key}`)),
   };
@@ -176,6 +179,79 @@ function statSyncSafe(path: string) {
   } catch {
     return null;
   }
+}
+
+function lstatSyncSafe(path: string) {
+  try {
+    return lstatSync(path);
+  } catch {
+    return null;
+  }
+}
+
+function computeScanSignature(input: {
+  managedRoot: string;
+  excludeManagedRootDirectories?: readonly string[];
+  scopeRoot: string;
+  rootSegmentsList: readonly (readonly [string, string])[];
+  lockPath?: string;
+  homeDir?: string;
+  projectDir?: string;
+}): string {
+  const parts: string[] = [`v:${SKILL_REGISTRY_DISCOVERY_VERSION}`];
+  if (input.lockPath) {
+    const lockStat = statSyncSafe(input.lockPath);
+    parts.push(lockStat ? `L:${lockStat.mtimeMs}:${lockStat.size}` : 'L:absent');
+  }
+  const managedFiles = listMarkdownFiles(input.managedRoot, {
+    excludeRootDirectories: input.excludeManagedRootDirectories,
+  });
+  for (const file of managedFiles) {
+    const s = statSyncSafe(file);
+    parts.push(s ? `M:${relative(input.managedRoot, file)}:${s.mtimeMs}:${s.size}` : `M:${relative(input.managedRoot, file)}:missing`);
+  }
+
+  const resolvedScopeRoot = resolve(input.scopeRoot);
+  for (const [dir, sub] of input.rootSegmentsList) {
+    const rootPath = join(resolvedScopeRoot, dir, sub);
+    const rootStat = statSyncSafe(rootPath);
+    if (!rootStat?.isDirectory()) {
+      parts.push(`R:${dir}/${sub}:absent`);
+      continue;
+    }
+    let names: string[];
+    try {
+      names = readdirSync(rootPath).sort((a, b) => a.localeCompare(b));
+    } catch {
+      parts.push(`R:${dir}/${sub}:unreadable`);
+      continue;
+    }
+    parts.push(`R:${dir}/${sub}:${rootStat.mtimeMs}:${names.length}`);
+    for (const name of names) {
+      if (name.startsWith('.') || !isAgentSkillName(name)) continue;
+      const skillDir = join(rootPath, name);
+      const skillFile = join(skillDir, AGENT_SKILL_FILE_NAME);
+      const dirLstat = lstatSyncSafe(skillDir);
+      const fileLstat = lstatSyncSafe(skillFile);
+      try {
+        const checked = assertReadableSkillPathSync({
+          path: skillFile,
+          homeDir: input.homeDir,
+          projectDir: input.projectDir,
+          maxBytes: SKILL_MAX_BYTES,
+        });
+        const realStat = statSyncSafe(checked.realPath);
+        parts.push(
+          `S:${dir}/${sub}/${name}:ok:${checked.realPath}:${realStat?.mtimeMs ?? 0}:${realStat?.size ?? checked.size}:${dirLstat?.mtimeMs ?? 0}:${fileLstat?.mtimeMs ?? 0}`,
+        );
+      } catch {
+        parts.push(
+          `S:${dir}/${sub}/${name}:skip:${dirLstat?.isSymbolicLink() ? 1 : 0}:${dirLstat?.mtimeMs ?? 0}:${fileLstat?.mtimeMs ?? 0}`,
+        );
+      }
+    }
+  }
+  return sha256(parts.join('\n'));
 }
 
 function collectExternalAgentEntries(input: {
@@ -315,7 +391,15 @@ export function buildUserSkillRegistry(input: { homeDir?: string; context?: Skil
     homeDir,
     seenRealFiles,
   }));
-  return writeRegistry(join(root, SKILL_REGISTRY_FILE_NAME), entries);
+  const scanSignature = computeScanSignature({
+    managedRoot: root,
+    excludeManagedRootDirectories: excludeRootDirectories,
+    scopeRoot: homeDir,
+    rootSegmentsList: AGENT_SKILLS_USER_ROOT_SEGMENTS,
+    lockPath: join(homeDir, ...AGENT_SKILLS_LOCK_FILE_SEGMENTS),
+    homeDir,
+  });
+  return writeRegistry(join(root, SKILL_REGISTRY_FILE_NAME), entries, scanSignature);
 }
 
 export function buildProjectSkillRegistry(input: { projectDir: string }): SkillRegistrySnapshot {
@@ -352,42 +436,50 @@ export function buildProjectSkillRegistry(input: { projectDir: string }): SkillR
     projectDir: input.projectDir,
     seenRealFiles,
   }));
-  return writeRegistry(join(root, SKILL_REGISTRY_FILE_NAME), entries);
+  const scanSignature = computeScanSignature({
+    managedRoot: root,
+    scopeRoot: input.projectDir,
+    rootSegmentsList: AGENT_SKILLS_PROJECT_ROOT_SEGMENTS,
+    lockPath: join(input.projectDir, AGENT_SKILLS_PROJECT_LOCK_FILE),
+    projectDir: input.projectDir,
+  });
+  return writeRegistry(join(root, SKILL_REGISTRY_FILE_NAME), entries, scanSignature);
 }
 
-function isRegistryFileStale(registryPath: string, roots: readonly string[], lockPath?: string): boolean {
-  const regStat = statSyncSafe(registryPath);
-  if (!regStat) return false;
-  if (lockPath) {
-    const lockStat = statSyncSafe(lockPath);
-    if (lockStat && lockStat.mtimeMs > regStat.mtimeMs) return true;
-  }
-  for (const root of roots) {
-    const rootStat = statSyncSafe(root);
-    if (rootStat && rootStat.mtimeMs > regStat.mtimeMs) return true;
-  }
+function isRegistrySnapshotFresh(registryPath: string, expectedSignature: string): boolean {
   try {
-    const parsed = JSON.parse(readFileSync(registryPath, 'utf8')) as { entries?: Array<{ path?: string }> };
-    const entries = Array.isArray(parsed.entries) ? parsed.entries : [];
-    for (const entry of entries) {
-      if (!entry.path) continue;
-      const entryStat = statSyncSafe(entry.path);
-      if (!entryStat || entryStat.mtimeMs > regStat.mtimeMs) return true;
-    }
+    const parsed = JSON.parse(readFileSync(registryPath, 'utf8')) as {
+      discoveryVersion?: unknown;
+      scanSignature?: unknown;
+    };
+    return parsed.discoveryVersion === SKILL_REGISTRY_DISCOVERY_VERSION
+      && typeof parsed.scanSignature === 'string'
+      && parsed.scanSignature === expectedSignature;
   } catch {
-    return true;
+    return false;
   }
-  return false;
 }
 
-function hasAnyExternalAgentSkill(scopeRoot: string, rootSegmentsList: readonly (readonly [string, string])[]): boolean {
+function hasAnyReadableExternalAgentSkill(
+  scopeRoot: string,
+  rootSegmentsList: readonly (readonly [string, string])[],
+  scope: { homeDir?: string; projectDir?: string },
+): boolean {
   for (const [dir, sub] of rootSegmentsList) {
     const rootPath = join(scopeRoot, dir, sub);
     if (!existsSync(rootPath)) continue;
     try {
       for (const name of readdirSync(rootPath)) {
         if (name.startsWith('.') || !isAgentSkillName(name)) continue;
-        if (statSyncSafe(join(rootPath, name, AGENT_SKILL_FILE_NAME))?.isFile()) return true;
+        try {
+          assertReadableSkillPathSync({
+            path: join(rootPath, name, AGENT_SKILL_FILE_NAME),
+            homeDir: scope.homeDir,
+            projectDir: scope.projectDir,
+            maxBytes: SKILL_MAX_BYTES,
+          });
+          return true;
+        } catch { /* unreadable or escaped */ }
       }
     } catch { /* ignore unreadable root */ }
   }
@@ -407,21 +499,29 @@ export function ensureFreshSkillRegistries(input: {
   const homeDir = input.homeDir ?? homedir();
   const userManagedRoot = getUserSkillRoot(homeDir, imcodesStateDirForHome(homeDir));
   const userRegPath = join(userManagedRoot, SKILL_REGISTRY_FILE_NAME);
-  const userRoots = [userManagedRoot, ...AGENT_SKILLS_USER_ROOT_SEGMENTS.map(([dir, sub]) => join(homeDir, dir, sub))];
-  const userLockPath = join(homeDir, ...AGENT_SKILLS_LOCK_FILE_SEGMENTS);
+  const excludeRootDirectories = isManagedSkillStoreEstablished(homeDir) ? [MANAGED_SKILL_DIRECTORY] : [];
 
   let rebuiltUser = false;
   if (!existsSync(userRegPath)) {
-    const excludeRootDirectories = isManagedSkillStoreEstablished(homeDir) ? [MANAGED_SKILL_DIRECTORY] : [];
     const hasUserSkills = listMarkdownFiles(userManagedRoot, { maxFiles: 1, excludeRootDirectories }).length > 0
-      || hasAnyExternalAgentSkill(homeDir, AGENT_SKILLS_USER_ROOT_SEGMENTS);
+      || hasAnyReadableExternalAgentSkill(homeDir, AGENT_SKILLS_USER_ROOT_SEGMENTS, { homeDir });
     if (hasUserSkills) {
       buildUserSkillRegistry({ homeDir, context: input.context });
       rebuiltUser = true;
     }
-  } else if (isRegistryFileStale(userRegPath, userRoots, userLockPath)) {
-    buildUserSkillRegistry({ homeDir, context: input.context });
-    rebuiltUser = true;
+  } else {
+    const expectedUserSig = computeScanSignature({
+      managedRoot: userManagedRoot,
+      excludeManagedRootDirectories: excludeRootDirectories,
+      scopeRoot: homeDir,
+      rootSegmentsList: AGENT_SKILLS_USER_ROOT_SEGMENTS,
+      lockPath: join(homeDir, ...AGENT_SKILLS_LOCK_FILE_SEGMENTS),
+      homeDir,
+    });
+    if (!isRegistrySnapshotFresh(userRegPath, expectedUserSig)) {
+      buildUserSkillRegistry({ homeDir, context: input.context });
+      rebuiltUser = true;
+    }
   }
 
   let rebuiltProject = false;
@@ -429,19 +529,26 @@ export function ensureFreshSkillRegistries(input: {
   if (projectDir) {
     const projManagedRoot = getProjectSkillEscapeHatchDir(projectDir);
     const projRegPath = join(projManagedRoot, SKILL_REGISTRY_FILE_NAME);
-    const projRoots = [projManagedRoot, ...AGENT_SKILLS_PROJECT_ROOT_SEGMENTS.map(([dir, sub]) => join(projectDir, dir, sub))];
-    const projLockPath = join(projectDir, AGENT_SKILLS_PROJECT_LOCK_FILE);
 
     if (!existsSync(projRegPath)) {
       const hasProjSkills = listMarkdownFiles(projManagedRoot, { maxFiles: 1 }).length > 0
-        || hasAnyExternalAgentSkill(projectDir, AGENT_SKILLS_PROJECT_ROOT_SEGMENTS);
+        || hasAnyReadableExternalAgentSkill(projectDir, AGENT_SKILLS_PROJECT_ROOT_SEGMENTS, { projectDir });
       if (hasProjSkills) {
         buildProjectSkillRegistry({ projectDir });
         rebuiltProject = true;
       }
-    } else if (isRegistryFileStale(projRegPath, projRoots, projLockPath)) {
-      buildProjectSkillRegistry({ projectDir });
-      rebuiltProject = true;
+    } else {
+      const expectedProjSig = computeScanSignature({
+        managedRoot: projManagedRoot,
+        scopeRoot: projectDir,
+        rootSegmentsList: AGENT_SKILLS_PROJECT_ROOT_SEGMENTS,
+        lockPath: join(projectDir, AGENT_SKILLS_PROJECT_LOCK_FILE),
+        projectDir,
+      });
+      if (!isRegistrySnapshotFresh(projRegPath, expectedProjSig)) {
+        buildProjectSkillRegistry({ projectDir });
+        rebuiltProject = true;
+      }
     }
   }
 

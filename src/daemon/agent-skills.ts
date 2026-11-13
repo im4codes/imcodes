@@ -27,19 +27,35 @@ import {
 import { isTopLevelAgentSkillEntry, parseAgentSkillMarkers, parseAgentSkillReference } from '../../shared/agent-skill-references.js';
 import { resolveNpmCliJs } from '../util/node-datachannel-repair.mjs';
 import { getSkillRegistryManagementSnapshot } from '../context/skill-registry.js';
+import { assertSafeRegistryPayloadPathSync } from '../context/managed-skill-path.js';
+import type { SkillLayer } from '../../shared/skill-store.js';
 
 /** A SKILL.md larger than this is not read for its description. */
 const MAX_SKILL_FILE_BYTES = 256 * 1024;
 
 const SKILL_CONTENT_START = '[skill:';
 
-async function registryPayloadPath(path: string): Promise<string | undefined> {
+async function validateRegistryPayloadPath(
+  path: string,
+  layer: SkillLayer,
+  context: { homeDir: string; projectDir?: string },
+): Promise<{ candidatePath: string; realPath: string } | undefined> {
   try {
-    if ((await stat(path)).isFile()) return path;
-    const payload = join(path, AGENT_SKILL_FILE_NAME);
-    if ((await stat(payload)).isFile()) return payload;
-  } catch { /* unavailable on this device */ }
-  return undefined;
+    let candidatePath = path;
+    if ((await stat(path)).isDirectory()) {
+      candidatePath = join(path, AGENT_SKILL_FILE_NAME);
+    }
+    const asserted = assertSafeRegistryPayloadPathSync({
+      path: candidatePath,
+      layer,
+      homeDir: context.homeDir,
+      projectDir: context.projectDir,
+      maxBytes: MAX_SKILL_FILE_BYTES,
+    });
+    return { candidatePath, realPath: asserted.realPath };
+  } catch {
+    return undefined;
+  }
 }
 
 export interface AgentSkillExpansion {
@@ -161,9 +177,14 @@ function isExternalAgentDisplayPath(displayPath: string | undefined): boolean {
   return false;
 }
 
+interface AgentSkillExpandTarget {
+  path: string;
+  layer: SkillLayer;
+}
+
 interface AgentSkillScanResult {
   skills: AgentSkillEntry[];
-  pathByEntry: WeakMap<AgentSkillEntry, string>;
+  targetByEntry: WeakMap<AgentSkillEntry, AgentSkillExpandTarget>;
 }
 
 /**
@@ -198,7 +219,7 @@ async function listAgentSkillsInternal(
   };
 
   const skills: AgentSkillEntry[] = [];
-  const pathByEntry = new WeakMap<AgentSkillEntry, string>();
+  const targetByEntry = new WeakMap<AgentSkillEntry, AgentSkillExpandTarget>();
   const seenRealDirs = new Set<string>();
   const seenRealFiles = new Set<string>();
   const seenScopeNames = new Set<string>();
@@ -296,7 +317,7 @@ async function listAgentSkillsInternal(
       seenScopeNames.add(scopeNameKey);
       seenRealDirs.add(realDir);
       seenRealFiles.add(realSkillFile);
-      pathByEntry.set(entry, realSkillFile);
+      targetByEntry.set(entry, { path: skillFile, layer: spec.layer });
       skills.push(entry);
     }
   }
@@ -304,13 +325,15 @@ async function listAgentSkillsInternal(
   try {
     const snapshot = getSkillRegistryManagementSnapshot({ projectDir: context.projectDir, homeDir });
     for (const entry of snapshot.entries) {
-      // The picker is device-local: registry metadata without a readable local
-      // payload must not be offered as an installable/expandable skill.
+      // The picker is device-local: registry metadata without a validated local
+      // payload inside scope must not be offered as an installable/expandable skill.
       if (!entry.path) continue;
-      const payload = await registryPayloadPath(entry.path);
+      const payload = await validateRegistryPayloadPath(entry.path, entry.layer, {
+        homeDir: resolvedHome,
+        projectDir,
+      });
       if (!payload) continue;
-      const realPayload = await realpath(payload).catch(() => undefined);
-      if (realPayload && seenRealFiles.has(realPayload)) continue;
+      if (seenRealFiles.has(payload.realPath)) continue;
       const name = entry.metadata.name?.trim() || entry.key;
       if (!name || skills.length >= AGENT_SKILLS_LIMITS.SKILLS * 2) break;
       const entryScope = entry.layer === 'project_escape_hatch' ? 'project' : 'user';
@@ -319,12 +342,12 @@ async function listAgentSkillsInternal(
 
       const listed = { name, description: entry.metadata.description ?? '', layer: entry.layer, displayPath: entry.displayPath, uri: entry.uri } satisfies AgentSkillEntry;
       if (topLevelOnly && !isTopLevelAgentSkillEntry(listed)) continue;
-      if (realPayload) seenRealFiles.add(realPayload);
-      pathByEntry.set(listed, realPayload ?? payload);
+      seenRealFiles.add(payload.realPath);
+      targetByEntry.set(listed, { path: payload.candidatePath, layer: entry.layer });
       skills.push(listed);
     }
   } catch { /* registry is optional; local skills remain available */ }
-  return { skills, pathByEntry };
+  return { skills, targetByEntry };
 }
 
 /** List only the direct skills that the composer should offer. */
@@ -348,7 +371,9 @@ export async function expandAgentSkillReferences(
   if (markers.length === 0) return { text, unresolved: [], expanded: [] };
   // Expansion keeps compatibility with explicit legacy/nested references;
   // only the picker-facing list is narrowed to top-level entries.
-  const { skills, pathByEntry } = await listAgentSkillsInternal(homeDir, context, false);
+  const { skills, targetByEntry } = await listAgentSkillsInternal(homeDir, context, false);
+  const resolvedHome = resolve(homeDir);
+  const resolvedProject = context.projectDir?.trim() ? resolve(context.projectDir.trim()) : undefined;
   const unresolved: string[] = [];
   const expanded: string[] = [];
   const emitted = new Set<string>();
@@ -370,13 +395,20 @@ export async function expandAgentSkillReferences(
     }
     if (emitted.has(body)) continue;
     try {
-      const skillPath = pathByEntry.get(skill);
-      if (!skillPath || (await stat(skillPath)).size > MAX_SKILL_FILE_BYTES) {
+      const target = targetByEntry.get(skill);
+      if (!target) {
         unresolved.push(body);
         result.push(match[0]);
         continue;
       }
-      const content = await readFile(skillPath, 'utf8');
+      const validated = assertSafeRegistryPayloadPathSync({
+        path: target.path,
+        layer: target.layer,
+        homeDir: resolvedHome,
+        projectDir: resolvedProject,
+        maxBytes: MAX_SKILL_FILE_BYTES,
+      });
+      const content = await readFile(validated.realPath, 'utf8');
       if (!content.trim() || Buffer.byteLength(content, 'utf8') > MAX_SKILL_FILE_BYTES) {
         unresolved.push(body);
         result.push(match[0]);

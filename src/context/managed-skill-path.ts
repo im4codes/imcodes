@@ -7,7 +7,11 @@ import {
   AGENT_SKILLS_USER_ROOT_SEGMENTS,
   isAgentSkillName,
 } from '../../shared/agent-skills.js';
-import { getProjectSkillEscapeHatchDir, getUserSkillRoot } from '../../shared/skill-store.js';
+import {
+  getProjectSkillEscapeHatchDir,
+  getUserSkillRoot,
+  type SkillLayer,
+} from '../../shared/skill-store.js';
 import { imcodesStateDirForHome } from '../util/imcodes-state-dir.js';
 
 export type ManagedSkillRootKind = 'user' | 'project';
@@ -54,6 +58,47 @@ function assertNoSymlinkDirectoryComponent(root: string, target: string): void {
   }
 }
 
+function assertNoSymlinkFileUnderRootSync(input: {
+  rootKind: ManagedSkillRootKind;
+  root: string;
+  absolute: string;
+  maxBytes?: number;
+}): ManagedSkillPathAssertion {
+  let realRoot: string;
+  try {
+    realRoot = realpathSync(input.root);
+  } catch {
+    throw new ManagedSkillPathError('managed_root_missing');
+  }
+  assertNoSymlinkDirectoryComponent(input.root, input.absolute);
+  let lstat;
+  try {
+    lstat = lstatSync(input.absolute);
+  } catch {
+    throw new ManagedSkillPathError('not_file');
+  }
+  if (!lstat.isFile() || lstat.isSymbolicLink()) throw new ManagedSkillPathError('not_file');
+  if (input.maxBytes !== undefined && lstat.size > input.maxBytes) throw new ManagedSkillPathError('oversize');
+  let realPath: string;
+  try {
+    realPath = realpathSync(input.absolute);
+  } catch {
+    throw new ManagedSkillPathError('not_file');
+  }
+  if (!isUnderRoot(realPath, realRoot)) throw new ManagedSkillPathError('outside_managed_root');
+  const stat = statSync(realPath);
+  if (!stat.isFile()) throw new ManagedSkillPathError('not_file');
+  if (input.maxBytes !== undefined && stat.size > input.maxBytes) throw new ManagedSkillPathError('oversize');
+  return {
+    rootKind: input.rootKind,
+    path: input.absolute,
+    realPath,
+    root: input.root,
+    realRoot,
+    size: stat.size,
+  };
+}
+
 export function assertManagedSkillPathSync(input: {
   path: string;
   projectDir?: string;
@@ -71,39 +116,12 @@ export function assertManagedSkillPathSync(input: {
 
   for (const candidate of candidates) {
     if (!isUnderRoot(absolute, candidate.root)) continue;
-    let realRoot: string;
-    try {
-      realRoot = realpathSync(candidate.root);
-    } catch {
-      throw new ManagedSkillPathError('managed_root_missing');
-    }
-    assertNoSymlinkDirectoryComponent(candidate.root, absolute);
-    let lstat;
-    try {
-      lstat = lstatSync(absolute);
-    } catch {
-      throw new ManagedSkillPathError('not_file');
-    }
-    if (!lstat.isFile() || lstat.isSymbolicLink()) throw new ManagedSkillPathError('not_file');
-    if (input.maxBytes !== undefined && lstat.size > input.maxBytes) throw new ManagedSkillPathError('oversize');
-    let realPath: string;
-    try {
-      realPath = realpathSync(absolute);
-    } catch {
-      throw new ManagedSkillPathError('not_file');
-    }
-    if (!isUnderRoot(realPath, realRoot)) throw new ManagedSkillPathError('outside_managed_root');
-    const stat = statSync(realPath);
-    if (!stat.isFile()) throw new ManagedSkillPathError('not_file');
-    if (input.maxBytes !== undefined && stat.size > input.maxBytes) throw new ManagedSkillPathError('oversize');
-    return {
+    return assertNoSymlinkFileUnderRootSync({
       rootKind: candidate.kind,
-      path: absolute,
-      realPath,
       root: candidate.root,
-      realRoot,
-      size: stat.size,
-    };
+      absolute,
+      maxBytes: input.maxBytes,
+    });
   }
   throw new ManagedSkillPathError('outside_managed_root');
 }
@@ -210,4 +228,66 @@ export function assertReadableSkillPathSync(input: {
   }
 
   throw new ManagedSkillPathError('outside_managed_root');
+}
+
+/**
+ * Validate a local registry `entry.path` payload before listing or reading it
+ * via fallback/expansion:
+ * - Managed stores (`~/.imcodes/skills`, `.imc/skills`) enforce strict
+ *   no-symlink containment via `assertManagedSkillPathSync`.
+ * - External agent roots enforce `assertReadableSkillPathSync` plus layer/scope
+ *   parity (`project_escape_hatch` -> project root, user layers -> home root).
+ * - Any legacy/custom non-managed non-agent registry path must stay strictly
+ *   within the matching scope root with zero symlink components.
+ */
+export function assertSafeRegistryPayloadPathSync(input: {
+  path: string;
+  layer: SkillLayer;
+  projectDir?: string;
+  homeDir?: string;
+  maxBytes?: number;
+}): ManagedSkillPathAssertion {
+  if (input.path.includes('\0')) throw new ManagedSkillPathError('nul_byte');
+  const absolute = resolve(input.path);
+  const homeDir = input.homeDir ?? homedir();
+  const resolvedHome = resolve(homeDir);
+  const resolvedProject = input.projectDir ? resolve(input.projectDir) : undefined;
+  const userManagedRoot = resolve(getUserSkillRoot(homeDir, imcodesStateDirForHome(homeDir)));
+  const projectManagedRoot = resolvedProject ? resolve(getProjectSkillEscapeHatchDir(resolvedProject)) : undefined;
+
+  const expectProject = input.layer === 'project_escape_hatch';
+  if (expectProject && !resolvedProject) {
+    throw new ManagedSkillPathError('outside_managed_root');
+  }
+
+  if (isUnderRoot(absolute, userManagedRoot) || (projectManagedRoot && isUnderRoot(absolute, projectManagedRoot))) {
+    const asserted = assertManagedSkillPathSync(input);
+    if (expectProject && asserted.rootKind !== 'project') throw new ManagedSkillPathError('outside_managed_root');
+    if (!expectProject && asserted.rootKind !== 'user') throw new ManagedSkillPathError('outside_managed_root');
+    return asserted;
+  }
+
+  const matchesExternalProject = Boolean(resolvedProject && AGENT_SKILLS_PROJECT_ROOT_SEGMENTS.some(
+    (segments) => isUnderRoot(absolute, resolve(resolvedProject, ...segments)),
+  ));
+  const matchesExternalUser = AGENT_SKILLS_USER_ROOT_SEGMENTS.some(
+    (segments) => isUnderRoot(absolute, resolve(resolvedHome, ...segments)),
+  );
+  if (matchesExternalProject || matchesExternalUser) {
+    const asserted = assertReadableSkillPathSync(input);
+    if (expectProject && asserted.rootKind !== 'project') throw new ManagedSkillPathError('outside_managed_root');
+    if (!expectProject && asserted.rootKind !== 'user') throw new ManagedSkillPathError('outside_managed_root');
+    return asserted;
+  }
+
+  const scopeRoot = expectProject ? resolvedProject : resolvedHome;
+  if (!scopeRoot || !isUnderRoot(absolute, scopeRoot)) {
+    throw new ManagedSkillPathError('outside_managed_root');
+  }
+  return assertNoSymlinkFileUnderRootSync({
+    rootKind: expectProject ? 'project' : 'user',
+    root: scopeRoot,
+    absolute,
+    maxBytes: input.maxBytes,
+  });
 }

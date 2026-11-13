@@ -3,8 +3,8 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { makeSkillUri } from '../../shared/skill-registry-types.js';
-import { buildUserSkillRegistry } from '../../src/context/skill-registry-builder.js';
-import { getSkillRegistryPathsForManagement, writeSkillRegistryManagementSnapshot } from '../../src/context/skill-registry.js';
+import { buildProjectSkillRegistry, buildUserSkillRegistry } from '../../src/context/skill-registry-builder.js';
+import { getSkillRegistryManagementSnapshot, getSkillRegistryPathsForManagement, writeSkillRegistryManagementSnapshot } from '../../src/context/skill-registry.js';
 import {
   AGENT_SKILLS_ACTION,
   AGENT_SKILLS_ERROR,
@@ -384,5 +384,101 @@ describe('composer skill references', () => {
     expect(expanded.expanded).toEqual(['openspec-explore', 'repo-workflow']);
     expect(expanded.text).toContain('# Explore body');
     expect(expanded.text).toContain('# Repo Workflow Body');
+  });
+
+  it('rejects redirected or tampered registry entries escaping homeDir/projectDir during list and expansion while keeping scoped links and nested managed skills', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-agent-skills-f2-'));
+    const outside = await mkdtemp(join(tmpdir(), 'imcodes-agent-skills-out-'));
+    cleanup.push(dir, outside);
+
+    const homeDir = join(dir, 'home');
+    const projectDir = join(dir, 'project');
+
+    await mkdir(join(homeDir, 'shared-store', 'user-linked'), { recursive: true });
+    await writeFile(join(homeDir, 'shared-store', 'user-linked', 'SKILL.md'), '---\nname: user-linked\ndescription: User link\n---\nUSER_OK\n');
+    await mkdir(join(homeDir, '.claude', 'skills'), { recursive: true });
+    await symlink(join(homeDir, 'shared-store', 'user-linked'), join(homeDir, '.claude', 'skills', 'user-linked'), 'dir');
+
+    await mkdir(join(homeDir, 'shared-store', 'linked-local'), { recursive: true });
+    await writeFile(join(homeDir, 'shared-store', 'linked-local', 'SKILL.md'), '---\nname: linked-local\ndescription: Scoped link\n---\nSCOPED_OK\n');
+    await symlink(join(homeDir, 'shared-store', 'linked-local'), join(homeDir, '.claude', 'skills', 'linked-local'), 'dir');
+
+    await mkdir(join(homeDir, '.codex', 'skills', 'good-user'), { recursive: true });
+    await writeFile(join(homeDir, '.codex', 'skills', 'good-user', 'SKILL.md'), '---\nname: good-user\ndescription: Good user\n---\nGOOD_USER_OK\n');
+
+    await mkdir(join(projectDir, 'proj-store', 'proj-linked'), { recursive: true });
+    await writeFile(join(projectDir, 'proj-store', 'proj-linked', 'SKILL.md'), '---\nname: proj-linked\ndescription: Project link\n---\nPROJ_OK\n');
+    await mkdir(join(projectDir, '.claude', 'skills'), { recursive: true });
+    await symlink(join(projectDir, 'proj-store', 'proj-linked'), join(projectDir, '.claude', 'skills', 'proj-linked'), 'dir');
+
+    await mkdir(join(projectDir, '.codex', 'skills', 'good-proj'), { recursive: true });
+    await writeFile(join(projectDir, '.codex', 'skills', 'good-proj', 'SKILL.md'), '---\nname: good-proj\ndescription: Good project\n---\nGOOD_PROJ_OK\n');
+
+    await mkdir(join(projectDir, '.imc', 'skills', 'nested'), { recursive: true });
+    await writeFile(join(projectDir, '.imc', 'skills', 'nested', 'child.md'), '---\nname: child\ndescription: Nested managed\n---\nNESTED_CHILD_OK\n');
+
+    await mkdir(join(outside, 'evil'), { recursive: true });
+    const outsideSkill = join(outside, 'evil', 'SKILL.md');
+    await writeFile(outsideSkill, '---\nname: evil\ndescription: Outside\n---\nOUTSIDE_SCOPE_SECRET\n');
+    await mkdir(join(homeDir, 'non-agent-dir'), { recursive: true });
+    await symlink(outsideSkill, join(homeDir, 'non-agent-dir', 'tampered.md'));
+
+    buildUserSkillRegistry({ homeDir });
+    buildProjectSkillRegistry({ projectDir });
+
+    // Redirect both user and project symlinks outside scope AFTER registry was built
+    await rm(join(homeDir, '.claude', 'skills', 'user-linked'), { recursive: true, force: true });
+    await symlink(join(outside, 'evil'), join(homeDir, '.claude', 'skills', 'user-linked'), 'dir');
+    await rm(join(projectDir, '.claude', 'skills', 'proj-linked'), { recursive: true, force: true });
+    await symlink(join(outside, 'evil'), join(projectDir, '.claude', 'skills', 'proj-linked'), 'dir');
+
+    // Also inject tampered direct + non-agent symlink entries into user registry.json
+    const currentEntries = getSkillRegistryManagementSnapshot({ homeDir }).entries;
+    expect(currentEntries.length).toBeGreaterThan(0);
+    const template = currentEntries[0]!;
+    const { user: userPath } = getSkillRegistryPathsForManagement({ homeDir });
+    writeSkillRegistryManagementSnapshot(userPath, [
+      ...currentEntries,
+      {
+        ...template,
+        key: 'tampered-direct',
+        uri: makeSkillUri('user', 'tampered-direct'),
+        metadata: { ...template.metadata, name: 'tampered-direct', description: 'Direct outside path' },
+        path: outsideSkill,
+        displayPath: 'tampered-direct',
+        updatedAt: Date.now(),
+      },
+      {
+        ...template,
+        key: 'tampered-non-agent-link',
+        uri: makeSkillUri('user', 'tampered-non-agent-link'),
+        metadata: { ...template.metadata, name: 'tampered-non-agent-link', description: 'Non-agent symlink' },
+        path: join(homeDir, 'non-agent-dir', 'tampered.md'),
+        displayPath: 'tampered-non-agent-link',
+        updatedAt: Date.now(),
+      },
+    ]);
+
+    const listed = await listAgentSkills(homeDir, { projectDir });
+    const listedNames = listed.map((item) => item.name);
+    expect(listedNames).toContain('good-user');
+    expect(listedNames).toContain('linked-local');
+    expect(listedNames).toContain('good-proj');
+    expect(listedNames).not.toContain('child');
+    expect(listedNames).not.toContain('user-linked');
+    expect(listedNames).not.toContain('proj-linked');
+    expect(listedNames).not.toContain('tampered-direct');
+    expect(listedNames).not.toContain('tampered-non-agent-link');
+
+    const expanded = await expandAgentSkillReferences(
+      '$$(user-linked) $$(proj-linked) $$(tampered-direct) $$(tampered-non-agent-link) $$(linked-local) $$(child)',
+      homeDir,
+      { projectDir },
+    );
+    expect(expanded.text).not.toContain('OUTSIDE_SCOPE_SECRET');
+    expect(expanded.text).toContain('SCOPED_OK');
+    expect(expanded.text).toContain('NESTED_CHILD_OK');
+    expect(expanded.expanded).toEqual(['linked-local', 'child']);
+    expect(expanded.unresolved).toEqual(['user-linked', 'proj-linked', 'tampered-direct', 'tampered-non-agent-link']);
   });
 });
