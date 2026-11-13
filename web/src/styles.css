@@ -17823,6 +17823,25 @@ button.quick-agent-delegation-preset.active {
   font-size: 13px;
 }
 
+.cloud-docs-standalone-root,
+.cloud-docs-standalone-root body,
+.cloud-docs-standalone-root #app {
+  width: 100vw;
+  height: 100dvh;
+  margin: 0;
+  overflow: hidden;
+  background: #0b1120;
+}
+
+.cloud-docs-panel.is-standalone {
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  border: 0;
+  border-radius: 0;
+}
+
 .cloud-docs-header {
   display: flex;
   align-items: center;

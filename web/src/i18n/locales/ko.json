@@ -5337,6 +5337,9 @@
       "saved": "저장됨",
       "read_only": "읽기 전용"
     },
-    "drop_hint": "지원되는 Office 또는 PDF 파일을 놓아 업로드하세요"
+    "drop_hint": "지원되는 Office 또는 PDF 파일을 놓아 업로드하세요",
+    "open_new_window": "새 창에서 열기",
+    "window_blocked": "브라우저가 클라우드 문서 창을 차단했습니다. 이 사이트의 팝업을 허용한 뒤 다시 시도하세요.",
+    "window_blocked_dismiss": "숨기기"
   }
 }

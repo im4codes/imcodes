@@ -5348,6 +5348,9 @@
       "saved": "已保存",
       "read_only": "只读"
     },
-    "drop_hint": "松开即可上传支持的 Office 或 PDF 文件"
+    "drop_hint": "松开即可上传支持的 Office 或 PDF 文件",
+    "open_new_window": "在新窗口中打开",
+    "window_blocked": "浏览器拦截了云文档窗口。请允许本站弹出窗口后重试。",
+    "window_blocked_dismiss": "忽略"
   }
 }

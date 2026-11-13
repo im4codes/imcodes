@@ -5338,6 +5338,9 @@
       "saved": "已儲存",
       "read_only": "唯讀"
     },
-    "drop_hint": "拖放至此以上傳支援的 Office 或 PDF 檔案"
+    "drop_hint": "拖放至此以上傳支援的 Office 或 PDF 檔案",
+    "open_new_window": "在新視窗中開啟",
+    "window_blocked": "瀏覽器封鎖了雲端文件視窗。請允許本網站的彈出視窗後重試。",
+    "window_blocked_dismiss": "忽略"
   }
 }

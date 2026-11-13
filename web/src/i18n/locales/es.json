@@ -5338,6 +5338,9 @@
       "saved": "Guardado",
       "read_only": "Solo lectura"
     },
-    "drop_hint": "Suelta un archivo Office o PDF compatible para subirlo"
+    "drop_hint": "Suelta un archivo Office o PDF compatible para subirlo",
+    "open_new_window": "Abrir en una nueva ventana",
+    "window_blocked": "El navegador bloqueó la ventana de Documentos en la nube. Permite las ventanas emergentes para este sitio e inténtalo de nuevo.",
+    "window_blocked_dismiss": "Descartar"
   }
 }

@@ -1224,4 +1224,35 @@ describe('CloudDocsPanel', () => {
     expect(css).toContain('grid-template-columns: minmax(0, 1fr)');
     expect(css).toContain('min-width: 0;');
   });
+
+  it('applies is-standalone class, syncs document.title, and auto-opens initialDocId when mounted standalone', async () => {
+    listCloudDocsApiMock.mockResolvedValue({
+      folders: [{ id: 'fld-1', name: 'Specs', parentId: null, createdAt: 1, updatedAt: 1 }],
+      docs: [{
+        id: 'doc-deep',
+        name: 'Architecture.docx',
+        folderId: 'fld-1',
+        mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        sizeBytes: 1200,
+        createdAt: 1,
+        updatedAt: 2,
+      }],
+      sharedFolders: [],
+      sharedDocs: [],
+    });
+
+    const view = render(
+      <CloudDocsPanel standalone initialTab="my_docs" initialFolderId="fld-1" initialDocId="doc-deep" />,
+    );
+
+    const panel = await screen.findByTestId('cloud-docs-panel');
+    expect(panel.className).toContain('is-standalone');
+    expect(document.title).toBe('Cloud Docs');
+
+    const preview = await screen.findByTestId('mock-office-preview');
+    expect(preview.getAttribute('data-cloud-doc-id')).toBe('doc-deep');
+    expect(screen.getByTestId('cloud-docs-panel').className).toContain('is-standalone');
+
+    view.unmount();
+  });
 });

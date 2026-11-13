@@ -44,6 +44,9 @@ describe('cloud_docs i18n translations across all 7 locales', () => {
     expect(enLeaves['actions.share']).toBeTruthy();
     expect(enLeaves['share.mode_team']).toBeTruthy();
     expect(enLeaves['share.allow_download']).toBeTruthy();
+    expect(enLeaves['open_new_window']).toBeTruthy();
+    expect(enLeaves['window_blocked']).toBeTruthy();
+    expect(enLeaves['window_blocked_dismiss']).toBeTruthy();
     expect(enLeaves['errors.server_offline']?.trim().length).toBeGreaterThan(0);
     expect(enOfficeLeaves['unavailable']?.trim().length).toBeGreaterThan(0);
   });

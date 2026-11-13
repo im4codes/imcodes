@@ -50,6 +50,9 @@ export type CloudDocsTypeFilter = 'all' | 'word' | 'cell' | 'slide' | 'pdf';
 export interface CloudDocsPanelProps {
   onClose?: () => void;
   initialTab?: CloudDocsTab;
+  standalone?: boolean;
+  initialFolderId?: string | null;
+  initialDocId?: string | null;
 }
 
 type PreviewTarget =
@@ -366,7 +369,13 @@ function formatTime(ts: number | null | undefined): string {
   }
 }
 
-export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPanelProps) {
+export function CloudDocsPanel({
+  onClose,
+  initialTab = 'recent',
+  standalone = false,
+  initialFolderId = null,
+  initialDocId = null,
+}: CloudDocsPanelProps) {
   const { t } = useTranslation();
   const tRef = useRef(t);
   tRef.current = t;
@@ -375,7 +384,7 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
   const [sortBy, setSortBy] = useState<CloudDocsSortBy>('updated');
   const [typeFilter, setTypeFilter] = useState<CloudDocsTypeFilter>('all');
   const [search, setSearch] = useState('');
-  const [currentFolderId, setCurrentFolderId] = useState<string | null>(null);
+  const [currentFolderId, setCurrentFolderId] = useState<string | null>(initialFolderId);
 
   const [folders, setFolders] = useState<CloudDocFolder[]>([]);
   const [docs, setDocs] = useState<CloudDocItem[]>([]);
@@ -596,6 +605,43 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
   useEffect(() => {
     void refreshData();
   }, [refreshData]);
+
+  useEffect(() => {
+    if (!standalone) return;
+    document.title = t('cloud_docs.title', 'Cloud Docs');
+  }, [standalone, t]);
+
+  const consumedInitialDocRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!initialDocId || consumedInitialDocRef.current === initialDocId || loading) return;
+    const ownDoc = docs.find((d) => d.id === initialDocId);
+    if (ownDoc) {
+      consumedInitialDocRef.current = initialDocId;
+      openPreview({
+        kind: 'cloud_doc',
+        id: ownDoc.id,
+        name: ownDoc.name,
+        mimeType: ownDoc.mimeType,
+        readOnly: false,
+        allowDownload: true,
+        isOwner: true,
+      });
+      return;
+    }
+    const sharedDoc = sharedDocs.find((d) => d.id === initialDocId);
+    if (sharedDoc) {
+      consumedInitialDocRef.current = initialDocId;
+      openPreview({
+        kind: 'cloud_doc',
+        id: sharedDoc.id,
+        name: sharedDoc.name,
+        mimeType: sharedDoc.mimeType,
+        readOnly: sharedDoc.role !== 'editor',
+        allowDownload: sharedDoc.allowDownload,
+        isOwner: false,
+      });
+    }
+  }, [initialDocId, loading, docs, sharedDocs, openPreview]);
 
   const folderMap = useMemo(() => new Map(folders.map((f) => [f.id, f])), [folders]);
 
@@ -1386,7 +1432,7 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
     const canShareInPreview = previewTarget.kind === 'cloud_doc' && previewTarget.isOwner;
 
     return (
-      <div class="cloud-docs-panel" data-testid="cloud-docs-panel">
+      <div class={`cloud-docs-panel${standalone ? ' is-standalone' : ''}`} data-testid="cloud-docs-panel">
         <div class="cloud-docs-preview-header">
           <button
             type="button"
@@ -1532,7 +1578,7 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
   const showGallery = activeTab === 'recent' || activeTab === 'my_docs';
 
   return (
-    <div class="cloud-docs-panel" data-testid="cloud-docs-panel">
+    <div class={`cloud-docs-panel${standalone ? ' is-standalone' : ''}`} data-testid="cloud-docs-panel">
       <div class="cloud-docs-header">
         <div class="cloud-docs-header-brand">
           <div class="cloud-docs-brand-mark">

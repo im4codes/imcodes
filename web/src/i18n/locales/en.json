@@ -5348,6 +5348,9 @@
       "saved": "Saved",
       "read_only": "Read-only"
     },
-    "drop_hint": "Drop supported Office or PDF file to upload"
+    "drop_hint": "Drop supported Office or PDF file to upload",
+    "open_new_window": "Open in new window",
+    "window_blocked": "Your browser blocked the Cloud Docs window. Allow pop-ups for this site and try again.",
+    "window_blocked_dismiss": "Dismiss"
   }
 }

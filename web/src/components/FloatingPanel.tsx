@@ -29,10 +29,14 @@ interface Props {
   onFocus?: () => void;
   onPin?: () => void;
   pinTooltip?: string;
+  onOpenNewWindow?: () => void;
+  openNewWindowTooltip?: string;
   defaultW?: number;
   defaultH?: number;
   minW?: number;
   minH?: number;
+  getDefaultGeometry?: () => WindowGeometry | null;
+  defaultVersion?: number;
   enableMaximize?: boolean;
   isMaximized?: boolean;
   onToggleMaximized?: () => void;
@@ -74,30 +78,59 @@ function clampGeomToViewport(
   });
 }
 
-function loadGeom(
-  id: string,
+interface StoredWindowGeometry extends WindowGeometry {
+  _dv?: number;
+}
+
+function resolveDefaultGeometry(
   dw: number,
   dh: number,
-  minW = MIN_W,
-  minH = MIN_H,
+  getDefaultGeometry?: () => WindowGeometry | null,
 ): WindowGeometry {
-  const fallback = {
+  const fallback: WindowGeometry = {
     x: Math.max(0, (window.innerWidth - dw) / 2),
     y: Math.max(0, (window.innerHeight - dh) / 2 - 40),
     w: dw,
     h: dh,
   };
   try {
-    const raw = localStorage.getItem(`rcc_float_${id}`);
-    if (raw) return clampGeomToViewport(
-      normalizeWindowGeometry(JSON.parse(raw), fallback), minW, minH,
-    );
+    const custom = getDefaultGeometry?.();
+    if (custom) return normalizeWindowGeometry(custom, fallback);
   } catch { /* ignore */ }
-  return clampGeomToViewport(fallback, minW, minH);
+  return fallback;
 }
 
-function saveGeom(id: string, geom: WindowGeometry) {
-  try { localStorage.setItem(`rcc_float_${id}`, JSON.stringify(geom)); } catch { /* ignore */ }
+function loadGeom(
+  id: string,
+  dw: number,
+  dh: number,
+  minW = MIN_W,
+  minH = MIN_H,
+  getDefaultGeometry?: () => WindowGeometry | null,
+  defaultVersion?: number,
+): WindowGeometry {
+  const computedDefault = resolveDefaultGeometry(dw, dh, getDefaultGeometry);
+  try {
+    const raw = localStorage.getItem(`rcc_float_${id}`);
+    if (raw) {
+      const parsed = JSON.parse(raw) as unknown;
+      const parsedObj = parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null;
+      const versionMatches = defaultVersion === undefined || (parsedObj !== null && parsedObj._dv === defaultVersion);
+      if (versionMatches) {
+        return clampGeomToViewport(
+          normalizeWindowGeometry(parsed, computedDefault), minW, minH,
+        );
+      }
+    }
+  } catch { /* ignore */ }
+  return clampGeomToViewport(computedDefault, minW, minH);
+}
+
+function saveGeom(id: string, geom: WindowGeometry, defaultVersion?: number) {
+  const payload: StoredWindowGeometry = defaultVersion !== undefined
+    ? { ...geom, _dv: defaultVersion }
+    : geom;
+  try { localStorage.setItem(`rcc_float_${id}`, JSON.stringify(payload)); } catch { /* ignore */ }
 }
 
 function fallbackMaximizedGeometry(minW: number, minH: number): WindowGeometry {
@@ -113,10 +146,14 @@ export function FloatingPanel({
   onFocus,
   onPin,
   pinTooltip,
+  onOpenNewWindow,
+  openNewWindowTooltip,
   defaultW = 700,
   defaultH = 520,
   minW = MIN_W,
   minH = MIN_H,
+  getDefaultGeometry,
+  defaultVersion,
   enableMaximize = false,
   isMaximized = false,
   onToggleMaximized,
@@ -131,15 +168,15 @@ export function FloatingPanel({
   const canUseDesktopMaximize = enableMaximize && desktopLayoutCapable;
   const isDesktopMaximized = canUseDesktopMaximize && isMaximized;
   const [geom, setGeom] = useState(() => loadGeom(
-    id, defaultW, defaultH, minW, minH,
+    id, defaultW, defaultH, minW, minH, getDefaultGeometry, defaultVersion,
   ));
   const [, forceWorkspaceRender] = useState(0);
   const geomRef = useRef(geom);
   geomRef.current = geom;
 
   useEffect(() => {
-    if (shouldPersistGeometry(isDesktopMaximized)) saveGeom(id, geom);
-  }, [id, geom, isDesktopMaximized]);
+    if (shouldPersistGeometry(isDesktopMaximized)) saveGeom(id, geom, defaultVersion);
+  }, [id, geom, isDesktopMaximized, defaultVersion]);
   useEffect(() => {
     const onResize = () => {
       if (isDesktopMaximized) {
@@ -363,6 +400,16 @@ export function FloatingPanel({
             class="subsession-minimize-btn"
             title={pinTooltip ?? t('sidebar.pin_to_sidebar')}
           >📌</button>
+        )}
+        {onOpenNewWindow && (
+          <button
+            type="button"
+            onClick={onOpenNewWindow}
+            class="subsession-minimize-btn"
+            data-testid="floating-open-new-window"
+            title={openNewWindowTooltip ?? t('cloud_docs.open_new_window')}
+            aria-label={openNewWindowTooltip ?? t('cloud_docs.open_new_window')}
+          >↗</button>
         )}
         {canUseDesktopMaximize && onToggleMaximized && (
           <DesktopWindowMaximizeButton

@@ -259,4 +259,186 @@ describe('FloatingPanel', () => {
 
     expect(screen.queryByTestId('floating-bottom-drag')).toBeNull();
   });
+
+  it('uses getDefaultGeometry on initial open and falls back to defaultW/defaultH when it returns null', () => {
+    vi.spyOn(window, 'innerWidth', 'get').mockReturnValue(1600);
+    vi.spyOn(window, 'innerHeight', 'get').mockReturnValue(1000);
+
+    const view = render(
+      <FloatingPanel
+        id="cloud-docs-default"
+        title="Cloud Docs"
+        onClose={() => {}}
+        defaultW={1080}
+        defaultH={760}
+        minW={640}
+        minH={440}
+        defaultVersion={2}
+        getDefaultGeometry={() => ({ x: 260, y: 48, w: 1200, h: 820 })}
+      >
+        <div>content</div>
+      </FloatingPanel>,
+    );
+
+    const panel = screen.getByTestId('floating-panel-cloud-docs-default') as HTMLElement;
+    expect(panel.style.left).toBe('260px');
+    expect(panel.style.top).toBe('48px');
+    expect(panel.style.width).toBe('1200px');
+    expect(panel.style.height).toBe('820px');
+    view.unmount();
+
+    localStorage.clear();
+    render(
+      <FloatingPanel
+        id="cloud-docs-null-default"
+        title="Cloud Docs"
+        onClose={() => {}}
+        defaultW={1080}
+        defaultH={760}
+        minW={640}
+        minH={440}
+        defaultVersion={2}
+        getDefaultGeometry={() => null}
+      >
+        <div>content</div>
+      </FloatingPanel>,
+    );
+    const fallbackPanel = screen.getByTestId('floating-panel-cloud-docs-null-default') as HTMLElement;
+    expect(fallbackPanel.style.width).toBe('1080px');
+    expect(fallbackPanel.style.height).toBe('760px');
+  });
+
+  it('migrates only versioned cloud-docs cache once while keeping unversioned panel caches intact', () => {
+    vi.spyOn(window, 'innerWidth', 'get').mockReturnValue(1600);
+    vi.spyOn(window, 'innerHeight', 'get').mockReturnValue(1000);
+
+    localStorage.setItem('rcc_float_cloud-docs', JSON.stringify({ x: 100, y: 100, w: 920, h: 660 }));
+    localStorage.setItem('rcc_float_filebrowser', JSON.stringify({ x: 75, y: 85, w: 720, h: 540 }));
+
+    const cloudView = render(
+      <FloatingPanel
+        id="cloud-docs"
+        title="Cloud Docs"
+        onClose={() => {}}
+        defaultW={1080}
+        defaultH={760}
+        minW={640}
+        minH={440}
+        defaultVersion={2}
+        getDefaultGeometry={() => ({ x: 280, y: 50, w: 1220, h: 800 })}
+      >
+        <div>docs</div>
+      </FloatingPanel>,
+    );
+
+    const cloudPanel = screen.getByTestId('floating-panel-cloud-docs') as HTMLElement;
+    expect(cloudPanel.style.width).toBe('1220px');
+    expect(cloudPanel.style.height).toBe('800px');
+    expect(JSON.parse(localStorage.getItem('rcc_float_cloud-docs') ?? '{}')).toEqual({
+      x: 280,
+      y: 50,
+      w: 1220,
+      h: 800,
+      _dv: 2,
+    });
+    cloudView.unmount();
+
+    const filesView = render(
+      <FloatingPanel id="filebrowser" title="Files" onClose={() => {}}>
+        <div>files</div>
+      </FloatingPanel>,
+    );
+    const filesPanel = screen.getByTestId('floating-panel-filebrowser') as HTMLElement;
+    expect(filesPanel.style.left).toBe('75px');
+    expect(filesPanel.style.top).toBe('85px');
+    expect(filesPanel.style.width).toBe('720px');
+    expect(filesPanel.style.height).toBe('540px');
+    expect(JSON.parse(localStorage.getItem('rcc_float_filebrowser') ?? '{}')._dv).toBeUndefined();
+    filesView.unmount();
+  });
+
+  it('persists manual resize and drag across close/reopen and clamps on shrunk viewport', () => {
+    vi.spyOn(window, 'innerWidth', 'get').mockReturnValue(1600);
+    vi.spyOn(window, 'innerHeight', 'get').mockReturnValue(1000);
+
+    const view1 = render(
+      <FloatingPanel
+        id="cloud-docs"
+        title="Cloud Docs"
+        onClose={() => {}}
+        defaultW={1080}
+        defaultH={760}
+        minW={640}
+        minH={440}
+        defaultVersion={2}
+        getDefaultGeometry={() => ({ x: 240, y: 50, w: 1200, h: 800 })}
+      >
+        <div>docs</div>
+      </FloatingPanel>,
+    );
+
+    // Manually resize SE inward (-200w, -150h) -> 1000x650
+    fireEvent.mouseDown(screen.getByTestId('floating-resize-se'), { clientX: 1440, clientY: 850 });
+    fireEvent.mouseMove(document, { clientX: 1240, clientY: 700 });
+    fireEvent.mouseUp(document);
+
+    // Manually drag from bottom strip (+40x, +30y) -> x: 280, y: 80
+    fireEvent.mouseDown(screen.getByTestId('floating-bottom-drag'), { clientX: 500, clientY: 700 });
+    fireEvent.mouseMove(document, { clientX: 540, clientY: 730 });
+    fireEvent.mouseUp(document);
+    view1.unmount();
+
+    // Close and reopen -> remembers 1000x650 at (280, 80), ignoring getDefaultGeometry
+    const view2 = render(
+      <FloatingPanel
+        id="cloud-docs"
+        title="Cloud Docs"
+        onClose={() => {}}
+        defaultW={1080}
+        defaultH={760}
+        minW={640}
+        minH={440}
+        defaultVersion={2}
+        getDefaultGeometry={() => ({ x: 240, y: 50, w: 1200, h: 800 })}
+      >
+        <div>docs</div>
+      </FloatingPanel>,
+    );
+    const reopened = screen.getByTestId('floating-panel-cloud-docs') as HTMLElement;
+    expect(reopened.style.left).toBe('280px');
+    expect(reopened.style.top).toBe('80px');
+    expect(reopened.style.width).toBe('1000px');
+    expect(reopened.style.height).toBe('650px');
+
+    // Shrink viewport -> clamps within new bounds
+    vi.spyOn(window, 'innerWidth', 'get').mockReturnValue(900);
+    vi.spyOn(window, 'innerHeight', 'get').mockReturnValue(600);
+    fireEvent(window, new Event('resize'));
+    expect(parseFloat(reopened.style.left) + parseFloat(reopened.style.width)).toBeLessThanOrEqual(900);
+    expect(parseFloat(reopened.style.top) + parseFloat(reopened.style.height)).toBeLessThanOrEqual(500);
+    view2.unmount();
+  });
+
+  it('renders open-in-new-window button on desktop titlebar and invokes callback without starting drag', () => {
+    const onOpenNewWindow = vi.fn();
+    render(
+      <FloatingPanel
+        id="cloud-docs-popout"
+        title="Cloud Docs"
+        onClose={() => {}}
+        onOpenNewWindow={onOpenNewWindow}
+        openNewWindowTooltip="Open in new window"
+      >
+        <div>docs</div>
+      </FloatingPanel>,
+    );
+
+    const btn = screen.getByTestId('floating-open-new-window');
+    expect(btn.getAttribute('title')).toBe('Open in new window');
+    fireEvent.mouseDown(btn, { clientX: 100, clientY: 20 });
+    fireEvent.mouseMove(document, { clientX: 250, clientY: 120 });
+    fireEvent.mouseUp(document);
+    fireEvent.click(btn);
+    expect(onOpenNewWindow).toHaveBeenCalledTimes(1);
+  });
 });

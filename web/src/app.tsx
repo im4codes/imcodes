@@ -351,6 +351,8 @@ import { createMapUpdateBatcher, type MapUpdateBatcher } from './map-update-batc
 import { useStructuralIdentity } from './hooks/useStructuralIdentity.js';
 import { CapabilityOperationNotice } from './components/CapabilityOperationNotice.js';
 import { RemoteDesktopWindowBlockedNotice } from './components/RemoteDesktopWindowBlockedNotice.js';
+import { CloudDocsWindowBlockedNotice } from './components/CloudDocsWindowBlockedNotice.js';
+import { openCloudDocsWindow } from './cloud-docs-window.js';
 import {
   APP_UPDATE_REQUIRED_EVENT,
   fetchCurrentAppBuildInfo,
@@ -1084,6 +1086,7 @@ function InternalMainApp() {
   const [showMobileServerMenu, setShowMobileServerMenu] = useState(false);
   const [showMobileFileBrowser, setShowMobileFileBrowser] = useState(false);
   const [showCloudDocs, setShowCloudDocs] = useState(false);
+  const [desktopCloudDocsMaximized, setDesktopCloudDocsMaximized] = useState(false);
   // On phones the console is a large overlay: never re-open it by itself at
   // launch (owner: load silently, no big box on open). Desktop keeps the remembered side-panel state.
   const [showSupervisionTaskConsole, setShowSupervisionTaskConsole] = useState(
@@ -9261,10 +9264,21 @@ function InternalMainApp() {
           id={DESKTOP_WINDOW_IDS.cloudDocs}
           title={trans('cloud_docs.title', 'Cloud Docs')}
           onClose={() => setShowCloudDocs(false)}
-          defaultW={920}
-          defaultH={660}
+          defaultW={1080}
+          defaultH={760}
+          minW={640}
+          minH={440}
+          getDefaultGeometry={getDesktopMaximizeBounds}
+          defaultVersion={2}
           zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.cloudDocs, 5102)}
           onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.cloudDocs)}
+          onOpenNewWindow={!isMobile ? () => {
+            if (openCloudDocsWindow()) setShowCloudDocs(false);
+          } : undefined}
+          openNewWindowTooltip={trans('cloud_docs.open_new_window', 'Open in new window')}
+          enableMaximize
+          isMaximized={desktopCloudDocsMaximized}
+          onToggleMaximized={() => setDesktopCloudDocsMaximized((current) => !current)}
           getMaximizeBounds={getDesktopMaximizeBounds}
           desktopLayoutCapable={desktopLayoutCapable}
         >
@@ -9920,6 +9934,8 @@ function InternalMainApp() {
       <CapabilityOperationNotice serverId={selectedServerId} />
 
       <RemoteDesktopWindowBlockedNotice />
+
+      <CloudDocsWindowBlockedNotice />
 
       {/* Toasts: idle completions + CC notifications */}
       {toasts.length > 0 && (

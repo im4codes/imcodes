@@ -21,6 +21,7 @@ vi.mock('react-i18next', () => ({
 afterEach(() => {
   cleanup();
   localStorage.clear();
+  vi.restoreAllMocks();
 });
 
 describe('FloatingPanel maximize integration', () => {
@@ -297,6 +298,65 @@ describe('FloatingPanel maximize integration', () => {
       );
       fireEvent.dblClick(screen.getByTitle('C'));
       expect(onToggleMaximized).not.toHaveBeenCalled();
+    });
+
+    it('preserves versioned manual cloud-docs geometry across maximize and restore', () => {
+      vi.spyOn(window, 'innerWidth', 'get').mockReturnValue(1600);
+      vi.spyOn(window, 'innerHeight', 'get').mockReturnValue(1000);
+      const saved = { x: 140, y: 90, w: 960, h: 610, _dv: 2 };
+      localStorage.setItem('rcc_float_cloud-docs', JSON.stringify(saved));
+
+      const view = render(
+        <FloatingPanel
+          id="cloud-docs"
+          title="Cloud Docs"
+          onClose={() => {}}
+          defaultW={1080}
+          defaultH={760}
+          minW={640}
+          minH={440}
+          defaultVersion={2}
+          getDefaultGeometry={() => ({ x: 240, y: 72, w: 1200, h: 760 })}
+          enableMaximize
+          isMaximized
+          onToggleMaximized={() => {}}
+          getMaximizeBounds={() => ({ x: 240, y: 72, w: 1280, h: 820 })}
+        >
+          <div>content</div>
+        </FloatingPanel>,
+      );
+
+      const maxPanel = screen.getByTestId('floating-panel-cloud-docs') as HTMLElement;
+      expect(maxPanel.style.width).toBe('1280px');
+      expect(maxPanel.style.height).toBe('820px');
+      expect(JSON.parse(localStorage.getItem('rcc_float_cloud-docs') ?? '{}')).toEqual(saved);
+
+      view.rerender(
+        <FloatingPanel
+          id="cloud-docs"
+          title="Cloud Docs"
+          onClose={() => {}}
+          defaultW={1080}
+          defaultH={760}
+          minW={640}
+          minH={440}
+          defaultVersion={2}
+          getDefaultGeometry={() => ({ x: 240, y: 72, w: 1200, h: 760 })}
+          enableMaximize
+          isMaximized={false}
+          onToggleMaximized={() => {}}
+          getMaximizeBounds={() => ({ x: 240, y: 72, w: 1280, h: 820 })}
+        >
+          <div>content</div>
+        </FloatingPanel>,
+      );
+
+      const restoredPanel = screen.getByTestId('floating-panel-cloud-docs') as HTMLElement;
+      expect(restoredPanel.style.left).toBe('140px');
+      expect(restoredPanel.style.top).toBe('90px');
+      expect(restoredPanel.style.width).toBe('960px');
+      expect(restoredPanel.style.height).toBe('610px');
+      expect(JSON.parse(localStorage.getItem('rcc_float_cloud-docs') ?? '{}')).toEqual(saved);
     });
 
     it('supports a hidden title bar through its declared drag handle (remote desktop window)', () => {
