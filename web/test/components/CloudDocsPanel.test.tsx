@@ -95,7 +95,7 @@ vi.mock('../../src/api.js', () => ({
   deleteRecentDocumentApi: (...args: unknown[]) => deleteRecentDocumentApiMock(...args),
 }));
 
-import { CloudDocsPanel, buildUniqueAutoDocName } from '../../src/components/CloudDocsPanel.js';
+import { CloudDocsPanel, buildUniqueAutoDocName, clampCloudDocsContextMenuPosition } from '../../src/components/CloudDocsPanel.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const stylesPath = resolve(__dirname, '../../src/styles.css');
@@ -1254,5 +1254,281 @@ describe('CloudDocsPanel', () => {
     expect(screen.getByTestId('cloud-docs-panel').className).toContain('is-standalone');
 
     view.unmount();
+  });
+
+  it('renders 3 compact horizontal icon + plus buttons for docx/xlsx/pptx across desktop and mobile styles', async () => {
+    render(<CloudDocsPanel initialTab="my_docs" />);
+    await waitFor(() => {
+      expect(screen.getByTestId('cloud-docs-new-docx-btn')).toBeTruthy();
+      expect(screen.getByTestId('cloud-docs-new-xlsx-btn')).toBeTruthy();
+      expect(screen.getByTestId('cloud-docs-new-pptx-btn')).toBeTruthy();
+    });
+
+    const strip = screen.getByTestId('cloud-docs-gallery-strip');
+    expect(strip.querySelectorAll('.cloud-docs-template-thumb')).toHaveLength(0);
+    for (const type of ['docx', 'xlsx', 'pptx'] as const) {
+      const btn = screen.getByTestId(`cloud-docs-new-${type}-btn`);
+      expect(btn.querySelector('.cloud-docs-template-plus')?.textContent).toBe('+');
+      expect(btn.querySelector('svg')).toBeTruthy();
+      expect(btn.getAttribute('aria-label')).toBeTruthy();
+    }
+
+    const css = readFileSync(stylesPath, 'utf8');
+    const mobileBlock = css.slice(css.indexOf('@media (max-width: 480px)'));
+    const galleryStart = css.indexOf('.cloud-docs-gallery-strip {');
+    const gallerySnippet = css.slice(galleryStart, galleryStart + 500);
+    expect(gallerySnippet).toContain('display: flex');
+    expect(gallerySnippet).toContain('height: 30px');
+    expect(mobileBlock).toContain('.cloud-docs-gallery-strip');
+    expect(mobileBlock).toContain('flex-wrap: nowrap');
+  });
+
+  it('supports right-click context menus across owned docs and folders in both list and grid views', async () => {
+    render(<CloudDocsPanel initialTab="my_docs" />);
+    await waitFor(() => {
+      expect(screen.getByTestId('cloud-folder-row-fld-1')).toBeTruthy();
+      expect(screen.getByTestId('cloud-doc-row-doc-1')).toBeTruthy();
+    });
+
+    // Owned doc right-click in list view prevents native menu & triggers Move / Rename / Share / Delete / Download / Edit
+    const docRow = screen.getByTestId('cloud-doc-row-doc-1');
+    const evDoc = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 120, clientY: 160 });
+    docRow.dispatchEvent(evDoc);
+    expect(evDoc.defaultPrevented).toBe(true);
+
+    const menu = await screen.findByTestId('cloud-docs-context-menu');
+    expect(menu.getAttribute('data-target-kind')).toBe('doc');
+    expect(screen.getByTestId('cloud-docs-ctx-open').textContent).toContain('Edit');
+    expect(screen.getByTestId('cloud-docs-ctx-download')).toBeTruthy();
+    expect(screen.getByTestId('cloud-docs-ctx-share')).toBeTruthy();
+    expect(screen.getByTestId('cloud-docs-ctx-rename')).toBeTruthy();
+    expect(screen.getByTestId('cloud-docs-ctx-move')).toBeTruthy();
+    expect(screen.getByTestId('cloud-docs-ctx-delete')).toBeTruthy();
+
+    fireEvent.click(screen.getByTestId('cloud-docs-ctx-move'));
+    expect(screen.queryByTestId('cloud-docs-context-menu')).toBeNull();
+    expect(screen.getByTestId('cloud-docs-move-select')).toBeTruthy();
+
+    // Switch to Grid view and verify owned folder & doc right-click actions work
+    fireEvent.click(screen.getByTestId('cloud-docs-view-grid'));
+    const folderRowGrid = screen.getByTestId('cloud-folder-row-fld-1');
+    fireEvent.contextMenu(folderRowGrid, { clientX: 80, clientY: 90 });
+    const folderMenu = await screen.findByTestId('cloud-docs-context-menu');
+    expect(folderMenu.getAttribute('data-target-kind')).toBe('folder');
+    expect(screen.queryByTestId('cloud-docs-ctx-move')).toBeNull();
+
+    fireEvent.click(screen.getByTestId('cloud-docs-ctx-rename'));
+    expect(screen.getByTestId('cloud-docs-rename-input')).toBeTruthy();
+
+    // Re-open folder menu for Share & Delete
+    fireEvent.contextMenu(folderRowGrid, { clientX: 80, clientY: 90 });
+    fireEvent.click(await screen.findByTestId('cloud-docs-ctx-share'));
+    expect(listCloudDocSharesApiMock).toHaveBeenCalledWith('folder', 'fld-1', expect.any(AbortSignal));
+
+    fireEvent.contextMenu(folderRowGrid, { clientX: 80, clientY: 90 });
+    fireEvent.click(await screen.findByTestId('cloud-docs-ctx-delete'));
+    expect(screen.getByTestId('cloud-docs-delete-confirm')).toBeTruthy();
+
+    // Doc download & open in grid view
+    fireEvent.contextMenu(screen.getByTestId('cloud-doc-row-doc-1'), { clientX: 110, clientY: 140 });
+    fireEvent.click(await screen.findByTestId('cloud-docs-ctx-download'));
+    expect(downloadCloudDocApiMock).toHaveBeenCalledWith('doc-1', 'quarterly.docx');
+
+    fireEvent.contextMenu(screen.getByTestId('cloud-doc-row-doc-1'), { clientX: 110, clientY: 140 });
+    fireEvent.click(await screen.findByTestId('cloud-docs-ctx-open'));
+    const preview = await screen.findByTestId('mock-office-preview');
+    expect(preview.getAttribute('data-cloud-doc-id')).toBe('doc-1');
+    expect(preview.getAttribute('data-read-only')).toBe('false');
+  });
+
+  it('enforces ACL parity on shared docs and supports shared folder right-click navigation', async () => {
+    const sharedFolder: SharedCloudFolderItem = {
+      id: 'sfld-1',
+      userId: 'owner-2',
+      parentId: null,
+      name: 'Team Specs',
+      createdAt: 1,
+      updatedAt: 2,
+      role: 'viewer',
+      allowDownload: false,
+      ownerName: 'Alice',
+      ownerUsername: 'alice',
+      sharedTeamName: 'Core',
+    };
+    const sharedEditorDoc: SharedCloudDocItem = {
+      id: 'sdoc-edit',
+      userId: 'owner-2',
+      folderId: null,
+      name: 'Roadmap.docx',
+      ext: '.docx',
+      mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      sizeBytes: 1024,
+      docVersion: 1,
+      createdAt: 1,
+      updatedAt: 2,
+      lastOpenedAt: null,
+      role: 'editor',
+      allowDownload: true,
+      ownerName: 'Alice',
+      ownerUsername: 'alice',
+      sharedVia: 'doc',
+      sharedTeamName: null,
+      folderName: null,
+    };
+    const sharedViewerDoc: SharedCloudDocItem = {
+      ...sharedEditorDoc,
+      id: 'sdoc-view',
+      name: 'Salary.xlsx',
+      ext: '.xlsx',
+      mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      role: 'viewer',
+      allowDownload: false,
+    };
+    listCloudDocsApiMock.mockResolvedValue({
+      folders: [],
+      docs: [],
+      sharedFolders: [sharedFolder],
+      sharedDocs: [sharedEditorDoc, sharedViewerDoc],
+    });
+
+    render(<CloudDocsPanel initialTab="shared" />);
+    await waitFor(() => {
+      expect(screen.getByTestId('shared-cloud-folder-row-sfld-1')).toBeTruthy();
+      expect(screen.getByTestId('shared-cloud-doc-row-sdoc-edit')).toBeTruthy();
+      expect(screen.getByTestId('shared-cloud-doc-row-sdoc-view')).toBeTruthy();
+    });
+
+    // Viewer with allowDownload: false -> View label, NO Download, opens read-only
+    fireEvent.contextMenu(screen.getByTestId('shared-cloud-doc-row-sdoc-view'), { clientX: 90, clientY: 120 });
+    const viewerMenu = await screen.findByTestId('cloud-docs-context-menu');
+    expect(viewerMenu.getAttribute('data-target-kind')).toBe('shared-doc');
+    expect(screen.getByTestId('cloud-docs-ctx-open').textContent).toContain('View');
+    expect(screen.queryByTestId('cloud-docs-ctx-download')).toBeNull();
+    expect(screen.queryByTestId('cloud-docs-ctx-share')).toBeNull();
+    expect(screen.queryByTestId('cloud-docs-ctx-delete')).toBeNull();
+
+    // Editor with allowDownload: true -> Edit label + Download
+    fireEvent.contextMenu(screen.getByTestId('shared-cloud-doc-row-sdoc-edit'), { clientX: 90, clientY: 120 });
+    expect(screen.getByTestId('cloud-docs-ctx-open').textContent).toContain('Edit');
+    expect(screen.getByTestId('cloud-docs-ctx-download')).toBeTruthy();
+    fireEvent.click(screen.getByTestId('cloud-docs-ctx-download'));
+    expect(downloadCloudDocApiMock).toHaveBeenCalledWith('sdoc-edit', 'Roadmap.docx');
+
+    // Shared folder Open navigates into folder
+    fireEvent.contextMenu(screen.getByTestId('shared-cloud-folder-row-sfld-1'), { clientX: 60, clientY: 80 });
+    expect(screen.getByTestId('cloud-docs-context-menu').getAttribute('data-target-kind')).toBe('shared-folder');
+    fireEvent.click(screen.getByTestId('cloud-docs-ctx-open'));
+    await waitFor(() => {
+      expect(screen.getByTestId('cloud-docs-shared-empty')).toBeTruthy();
+    });
+
+    // Shared tab blank canvas does not expose creation/upload actions
+    fireEvent.contextMenu(screen.getByTestId('cloud-docs-canvas'), { clientX: 50, clientY: 50 });
+    expect(screen.getByTestId('cloud-docs-context-menu').getAttribute('data-target-kind')).toBe('canvas');
+    expect(screen.queryByTestId('cloud-docs-ctx-new-docx')).toBeNull();
+    expect(screen.getByTestId('cloud-docs-ctx-toggle-view')).toBeTruthy();
+    expect(screen.getByTestId('cloud-docs-ctx-refresh')).toBeTruthy();
+  });
+
+  it('supports recent doc and blank canvas context menus, viewport clamping, and clean dismissal', async () => {
+    const recentOwned: RecentDocumentItem = {
+      id: 'rec-own',
+      userId: 'u1',
+      sourceKind: 'cloud_doc',
+      sourceKey: 'cloud:doc-1',
+      serverId: null,
+      serverName: null,
+      sessionName: null,
+      filePath: null,
+      cloudDocId: 'doc-1',
+      title: 'quarterly.docx',
+      mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      openMode: 'edit',
+      openCount: 3,
+      lastOpenedAt: 1_700_000_200_000,
+      createdAt: 1_700_000_000_000,
+      accessible: true,
+      serverOnline: true,
+      accessReason: null,
+      allowDownload: true,
+    };
+    const recentServerNoDl: RecentDocumentItem = {
+      ...recentOwned,
+      id: 'rec-srv',
+      sourceKind: 'server_file',
+      sourceKey: 'srv:s1:/tmp/spec.docx',
+      serverId: 's1',
+      serverName: 'devbox',
+      filePath: '/tmp/spec.docx',
+      cloudDocId: null,
+      title: 'spec.docx',
+      openMode: 'view',
+      role: 'viewer',
+      allowDownload: false,
+    };
+    listRecentDocumentsApiMock.mockResolvedValue({ items: [recentOwned, recentServerNoDl] });
+    deleteRecentDocumentApiMock.mockResolvedValue({ ok: true });
+    createBlankCloudDocApiMock.mockResolvedValue({ doc: makeDoc({ id: 'doc-new', name: 'Untitled spreadsheet.xlsx' }) });
+
+    Object.defineProperty(window, 'innerWidth', { value: 1024, configurable: true });
+    Object.defineProperty(window, 'innerHeight', { value: 768, configurable: true });
+
+    render(<CloudDocsPanel initialTab="recent" />);
+    await waitFor(() => {
+      expect(screen.getByTestId('recent-doc-row-rec-own')).toBeTruthy();
+      expect(screen.getByTestId('recent-doc-row-rec-srv')).toBeTruthy();
+    });
+
+    // Recent server file -> View + Remove only (no Share, no Download)
+    fireEvent.contextMenu(screen.getByTestId('recent-doc-row-rec-srv'), { clientX: 150, clientY: 160 });
+    expect(screen.getByTestId('cloud-docs-context-menu').getAttribute('data-target-kind')).toBe('recent-doc');
+    expect(screen.queryByTestId('cloud-docs-ctx-share')).toBeNull();
+    expect(screen.queryByTestId('cloud-docs-ctx-download')).toBeNull();
+    fireEvent.click(screen.getByTestId('cloud-docs-ctx-remove-recent'));
+    await waitFor(() => {
+      expect(deleteRecentDocumentApiMock).toHaveBeenCalledWith('rec-srv');
+    });
+
+    // Clamp near bottom-right corner on mobile/floating viewport dimensions
+    expect(clampCloudDocsContextMenuPosition(1200, 900, 390, 640, 210, 240)).toEqual({ x: 172, y: 392 });
+    expect(clampCloudDocsContextMenuPosition(-20, -10, 390, 640, 210, 240)).toEqual({ x: 8, y: 8 });
+
+    fireEvent.contextMenu(screen.getByTestId('recent-doc-row-rec-own'), { clientX: 2000, clientY: 2000 });
+    const clampedMenu = await screen.findByTestId('cloud-docs-context-menu');
+    expect(Number.parseInt(clampedMenu.style.left, 10)).toBeLessThanOrEqual(1024 - 216 - 8);
+    expect(Number.parseInt(clampedMenu.style.top, 10)).toBeLessThanOrEqual(768 - 260 - 8);
+
+    // Dismiss on Escape
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.queryByTestId('cloud-docs-context-menu')).toBeNull();
+
+    // Blank canvas on My Docs -> triggers New Folder, Refresh, New Sheet
+    fireEvent.click(screen.getByTestId('cloud-docs-tab-my-docs'));
+    await waitFor(() => expect(screen.getByTestId('cloud-docs-canvas')).toBeTruthy());
+
+    fireEvent.contextMenu(screen.getByTestId('cloud-docs-canvas'), { clientX: 40, clientY: 60 });
+    expect(screen.getByTestId('cloud-docs-context-menu').getAttribute('data-target-kind')).toBe('canvas');
+    expect(screen.getByTestId('cloud-docs-ctx-new-folder')).toBeTruthy();
+
+    // Outside click dismisses menu
+    fireEvent.mouseDown(document.body);
+    expect(screen.queryByTestId('cloud-docs-context-menu')).toBeNull();
+
+    // Reopen canvas menu and create spreadsheet
+    fireEvent.contextMenu(screen.getByTestId('cloud-docs-canvas'), { clientX: 40, clientY: 60 });
+    fireEvent.click(screen.getByTestId('cloud-docs-ctx-new-xlsx'));
+    await waitFor(() => {
+      expect(createBlankCloudDocApiMock).toHaveBeenCalledWith({
+        type: 'xlsx',
+        name: 'Untitled spreadsheet.xlsx',
+        folderId: null,
+      });
+    });
+
+    // Window blur dismisses menu
+    fireEvent.contextMenu(screen.getByTestId('cloud-docs-canvas'), { clientX: 40, clientY: 60 });
+    expect(screen.getByTestId('cloud-docs-context-menu')).toBeTruthy();
+    fireEvent(window, new Event('blur'));
+    expect(screen.queryByTestId('cloud-docs-context-menu')).toBeNull();
   });
 });

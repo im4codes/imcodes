@@ -5260,6 +5260,9 @@
     "confirm_delete": "确定删除“{{name}}”吗？",
     "actions": {
       "back_to_list": "返回列表",
+      "open": "打开",
+      "edit": "编辑",
+      "view": "查看",
       "download": "下载",
       "new_folder": "新建文件夹",
       "upload": "上传",

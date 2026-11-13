@@ -5249,6 +5249,9 @@
     "confirm_delete": "「{{name}}」を削除しますか？",
     "actions": {
       "back_to_list": "戻る",
+      "open": "開く",
+      "edit": "編集",
+      "view": "表示",
       "download": "ダウンロード",
       "new_folder": "新規フォルダ",
       "upload": "アップロード",

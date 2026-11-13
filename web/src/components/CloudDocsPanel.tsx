@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { lazy, Suspense } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import {
@@ -80,6 +80,49 @@ type PreviewTarget =
 type MenuTarget =
   | { kind: 'folder'; id: string }
   | { kind: 'doc'; id: string };
+
+type ContextMenuTarget =
+  | { kind: 'doc'; doc: CloudDocItem }
+  | { kind: 'folder'; folder: CloudDocFolder }
+  | { kind: 'shared-doc'; doc: SharedCloudDocItem }
+  | { kind: 'shared-folder'; folder: SharedCloudFolderItem }
+  | { kind: 'recent-doc'; item: RecentDocumentItem }
+  | { kind: 'canvas' };
+
+interface ContextMenuState {
+  rawX: number;
+  rawY: number;
+  x: number;
+  y: number;
+  target: ContextMenuTarget;
+}
+
+const CONTEXT_MENU_PADDING = 8;
+const DEFAULT_CONTEXT_MENU_WIDTH = 216;
+const DEFAULT_CONTEXT_MENU_HEIGHT = 260;
+
+/**
+ * Clamp right-click context menu coordinates cleanly inside the current viewport.
+ */
+export function clampCloudDocsContextMenuPosition(
+  rawX: number,
+  rawY: number,
+  viewportWidth: number,
+  viewportHeight: number,
+  menuWidth = DEFAULT_CONTEXT_MENU_WIDTH,
+  menuHeight = DEFAULT_CONTEXT_MENU_HEIGHT,
+): { x: number; y: number } {
+  const safeVw = Number.isFinite(viewportWidth) && viewportWidth > 0 ? viewportWidth : 1024;
+  const safeVh = Number.isFinite(viewportHeight) && viewportHeight > 0 ? viewportHeight : 768;
+  const safeW = Number.isFinite(menuWidth) && menuWidth > 0 ? menuWidth : DEFAULT_CONTEXT_MENU_WIDTH;
+  const safeH = Number.isFinite(menuHeight) && menuHeight > 0 ? menuHeight : DEFAULT_CONTEXT_MENU_HEIGHT;
+  const maxX = Math.max(CONTEXT_MENU_PADDING, safeVw - safeW - CONTEXT_MENU_PADDING);
+  const maxY = Math.max(CONTEXT_MENU_PADDING, safeVh - safeH - CONTEXT_MENU_PADDING);
+  return {
+    x: Math.min(Math.max(CONTEXT_MENU_PADDING, Math.round(rawX)), Math.round(maxX)),
+    y: Math.min(Math.max(CONTEXT_MENU_PADDING, Math.round(rawY)), Math.round(maxY)),
+  };
+}
 
 /**
  * Toolbar glyph depicting a folded document sheet with a cloud superscript badge.
@@ -288,41 +331,28 @@ function PrincipalIcon({ mode }: { mode: CloudDocShareMode }) {
   );
 }
 
-function TemplateThumbnail({ type }: { type: CloudDocBlankType }) {
-  if (type === 'xlsx') {
-    return (
-      <div class="cloud-docs-template-thumb is-xlsx" aria-hidden="true">
-        <div class="cloud-docs-thumb-sheet">
-          <div class="cloud-docs-thumb-bar is-green" />
-          <div class="cloud-docs-thumb-grid">
-            <span /><span /><span />
-            <span /><span /><span />
-            <span /><span /><span />
-          </div>
-        </div>
-      </div>
-    );
-  }
-  if (type === 'pptx') {
-    return (
-      <div class="cloud-docs-template-thumb is-pptx" aria-hidden="true">
-        <div class="cloud-docs-thumb-slide">
-          <div class="cloud-docs-thumb-bar is-amber" />
-          <div class="cloud-docs-thumb-line is-short" />
-          <div class="cloud-docs-thumb-box" />
-        </div>
-      </div>
-    );
-  }
+function OpenDocIcon() {
   return (
-    <div class="cloud-docs-template-thumb is-docx" aria-hidden="true">
-      <div class="cloud-docs-thumb-page">
-        <div class="cloud-docs-thumb-bar is-blue" />
-        <div class="cloud-docs-thumb-line" />
-        <div class="cloud-docs-thumb-line" />
-        <div class="cloud-docs-thumb-line is-short" />
-      </div>
-    </div>
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M14 4h6v6m0-6-9 9M19 13v5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+    </svg>
+  );
+}
+
+function MoveFolderIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M3.5 6.5A1.5 1.5 0 0 1 5 5h4l1.6 1.75H19a1.5 1.5 0 0 1 1.5 1.5V18A1.5 1.5 0 0 1 19 19.5H5A1.5 1.5 0 0 1 3.5 18V6.5Z" stroke="currentColor" stroke-width="1.8" />
+      <path d="M9.5 13h5m0 0-2-2m2 2-2 2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+    </svg>
+  );
+}
+
+function TrashIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M4.5 7h15M9.5 4.5h5M8 7v11.5a1.5 1.5 0 0 0 1.5 1.5h5a1.5 1.5 0 0 0 1.5-1.5V7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+    </svg>
   );
 }
 
@@ -414,6 +444,8 @@ export function CloudDocsPanel({
   const [previewTitleStatus, setPreviewTitleStatus] = useState<'idle' | 'saving' | 'saved'>('idle');
 
   const [openMenu, setOpenMenu] = useState<MenuTarget | null>(null);
+  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+  const contextMenuRef = useRef<HTMLDivElement>(null);
   const [newFolderMode, setNewFolderMode] = useState(false);
   const [newFolderName, setNewFolderName] = useState('');
   const [renamingTarget, setRenamingTarget] = useState<
@@ -501,6 +533,7 @@ export function CloudDocsPanel({
     }
     const nextPreviewSeq = activePreviewRef.current.previewSeq + 1;
     previewTitleCancelledRef.current = false;
+    setContextMenu(null);
     setPreviewTarget(target);
     if (!target) {
       activePreviewRef.current = {
@@ -531,28 +564,85 @@ export function CloudDocsPanel({
     }
   }, []);
 
-  // Close open overflow menu or share dialog cleanly on outside click / Escape.
+  // Close open overflow menu, right-click context menu, or share dialog cleanly on outside click / Escape / blur / resize.
   useEffect(() => {
-    if (!openMenu && !shareTarget) return;
-    const onPointerDown = (e: MouseEvent) => {
-      if (!openMenu) return;
+    if (!openMenu && !shareTarget && !contextMenu) return;
+    const onPointerDown = (e: Event) => {
       const target = e.target as HTMLElement | null;
-      if (!target?.closest('.cloud-docs-menu-wrap')) {
+      if (openMenu && !target?.closest('.cloud-docs-menu-wrap')) {
         setOpenMenu(null);
+      }
+      if (contextMenu && !target?.closest('[data-testid="cloud-docs-context-menu"]')) {
+        setContextMenu(null);
       }
     };
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
       if (openMenu) setOpenMenu(null);
+      if (contextMenu) setContextMenu(null);
       if (shareTarget) closeShareDialog();
     };
+    const onWindowDismiss = () => {
+      if (contextMenu) setContextMenu(null);
+    };
+    document.addEventListener('pointerdown', onPointerDown);
     document.addEventListener('mousedown', onPointerDown);
     document.addEventListener('keydown', onKeyDown);
+    window.addEventListener('blur', onWindowDismiss);
+    window.addEventListener('resize', onWindowDismiss);
     return () => {
+      document.removeEventListener('pointerdown', onPointerDown);
       document.removeEventListener('mousedown', onPointerDown);
       document.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('blur', onWindowDismiss);
+      window.removeEventListener('resize', onWindowDismiss);
     };
-  }, [openMenu, shareTarget]);
+  }, [openMenu, shareTarget, contextMenu]);
+
+  const contextMenuTargetKey = contextMenu
+    ? (
+      contextMenu.target.kind === 'canvas'
+        ? 'canvas'
+        : contextMenu.target.kind === 'recent-doc'
+          ? `recent:${contextMenu.target.item.id}`
+          : contextMenu.target.kind === 'folder' || contextMenu.target.kind === 'shared-folder'
+            ? `${contextMenu.target.kind}:${contextMenu.target.folder.id}`
+            : `${contextMenu.target.kind}:${contextMenu.target.doc.id}`
+    )
+    : null;
+
+  useLayoutEffect(() => {
+    if (!contextMenu || !contextMenuRef.current) return;
+    const rect = contextMenuRef.current.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return;
+    const clamped = clampCloudDocsContextMenuPosition(
+      contextMenu.rawX,
+      contextMenu.rawY,
+      window.innerWidth,
+      window.innerHeight,
+      rect.width,
+      rect.height,
+    );
+    if (clamped.x !== contextMenu.x || clamped.y !== contextMenu.y) {
+      setContextMenu((prev) => (prev ? { ...prev, x: clamped.x, y: clamped.y } : null));
+    }
+  }, [contextMenuTargetKey, contextMenu?.rawX, contextMenu?.rawY]);
+
+  const openContextMenu = useCallback((e: MouseEvent, target: ContextMenuTarget) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setOpenMenu(null);
+    const vw = typeof window !== 'undefined' ? window.innerWidth : 1024;
+    const vh = typeof window !== 'undefined' ? window.innerHeight : 768;
+    const clamped = clampCloudDocsContextMenuPosition(e.clientX, e.clientY, vw, vh);
+    setContextMenu({
+      rawX: e.clientX,
+      rawY: e.clientY,
+      x: clamped.x,
+      y: clamped.y,
+      target,
+    });
+  }, []);
 
   const refreshData = useCallback((): Promise<CloudDocItem[] | null> => {
     const seq = ++loadSeqRef.current;
@@ -1426,6 +1516,370 @@ export function CloudDocsPanel({
     );
   };
 
+  const renderContextMenu = () => {
+    if (!contextMenu) return null;
+    const { target, x, y } = contextMenu;
+    const runAction = (fn: () => void) => {
+      setContextMenu(null);
+      fn();
+    };
+
+    const renderOwnedDocItems = (doc: CloudDocItem) => (
+      <>
+        <button
+          type="button"
+          role="menuitem"
+          class="cloud-docs-popover-item"
+          data-testid="cloud-docs-ctx-open"
+          onClick={() => runAction(() => handleOpenCloudDoc(doc))}
+        >
+          <OpenDocIcon />
+          <span>{t('cloud_docs.actions.edit', 'Edit')}</span>
+        </button>
+        <button
+          type="button"
+          role="menuitem"
+          class="cloud-docs-popover-item"
+          data-testid="cloud-docs-ctx-download"
+          onClick={() => runAction(() => { void handleDownloadCloudDoc(doc.id, doc.name); })}
+        >
+          <DownloadIcon />
+          <span>{t('cloud_docs.actions.download', 'Download')}</span>
+        </button>
+        <button
+          type="button"
+          role="menuitem"
+          class="cloud-docs-popover-item"
+          data-testid="cloud-docs-ctx-share"
+          onClick={() => runAction(() => { void openShareDialog('doc', doc.id, doc.name); })}
+        >
+          <ShareIcon />
+          <span>{t('cloud_docs.actions.share', 'Share')}</span>
+        </button>
+        <div class="cloud-docs-context-divider" role="separator" />
+        <button
+          type="button"
+          role="menuitem"
+          class="cloud-docs-popover-item"
+          data-testid="cloud-docs-ctx-rename"
+          disabled={busy}
+          onClick={() => runAction(() => setRenamingTarget({ kind: 'doc', id: doc.id, value: doc.name }))}
+        >
+          <PencilIcon />
+          <span>{t('cloud_docs.actions.rename', 'Rename')}</span>
+        </button>
+        <button
+          type="button"
+          role="menuitem"
+          class="cloud-docs-popover-item"
+          data-testid="cloud-docs-ctx-move"
+          disabled={busy}
+          onClick={() => runAction(() => {
+            setMovingDocId(doc.id);
+            setMovingFolderTargetId(doc.folderId ?? '');
+          })}
+        >
+          <MoveFolderIcon />
+          <span>{t('cloud_docs.actions.move', 'Move')}</span>
+        </button>
+        <div class="cloud-docs-context-divider" role="separator" />
+        <button
+          type="button"
+          role="menuitem"
+          class="cloud-docs-popover-item is-danger"
+          data-testid="cloud-docs-ctx-delete"
+          disabled={busy}
+          onClick={() => runAction(() => setConfirmDelete({ kind: 'doc', id: doc.id, name: doc.name }))}
+        >
+          <TrashIcon />
+          <span>{t('common.delete', 'Delete')}</span>
+        </button>
+      </>
+    );
+
+    const renderOwnedFolderItems = (folder: CloudDocFolder) => (
+      <>
+        <button
+          type="button"
+          role="menuitem"
+          class="cloud-docs-popover-item"
+          data-testid="cloud-docs-ctx-open"
+          onClick={() => runAction(() => setCurrentFolderId(folder.id))}
+        >
+          <OpenDocIcon />
+          <span>{t('cloud_docs.actions.open', 'Open')}</span>
+        </button>
+        <button
+          type="button"
+          role="menuitem"
+          class="cloud-docs-popover-item"
+          data-testid="cloud-docs-ctx-share"
+          onClick={() => runAction(() => { void openShareDialog('folder', folder.id, folder.name); })}
+        >
+          <ShareIcon />
+          <span>{t('cloud_docs.actions.share', 'Share')}</span>
+        </button>
+        <div class="cloud-docs-context-divider" role="separator" />
+        <button
+          type="button"
+          role="menuitem"
+          class="cloud-docs-popover-item"
+          data-testid="cloud-docs-ctx-rename"
+          disabled={busy}
+          onClick={() => runAction(() => setRenamingTarget({ kind: 'folder', id: folder.id, value: folder.name }))}
+        >
+          <PencilIcon />
+          <span>{t('cloud_docs.actions.rename', 'Rename')}</span>
+        </button>
+        <div class="cloud-docs-context-divider" role="separator" />
+        <button
+          type="button"
+          role="menuitem"
+          class="cloud-docs-popover-item is-danger"
+          data-testid="cloud-docs-ctx-delete"
+          disabled={busy}
+          onClick={() => runAction(() => setConfirmDelete({ kind: 'folder', id: folder.id, name: folder.name }))}
+        >
+          <TrashIcon />
+          <span>{t('common.delete', 'Delete')}</span>
+        </button>
+      </>
+    );
+
+    const renderSharedDocItems = (doc: SharedCloudDocItem) => (
+      <>
+        <button
+          type="button"
+          role="menuitem"
+          class="cloud-docs-popover-item"
+          data-testid="cloud-docs-ctx-open"
+          onClick={() => runAction(() => handleOpenSharedCloudDoc(doc))}
+        >
+          <OpenDocIcon />
+          <span>
+            {doc.role === 'editor'
+              ? t('cloud_docs.actions.edit', 'Edit')
+              : t('cloud_docs.actions.view', 'View')}
+          </span>
+        </button>
+        {doc.allowDownload && (
+          <button
+            type="button"
+            role="menuitem"
+            class="cloud-docs-popover-item"
+            data-testid="cloud-docs-ctx-download"
+            onClick={() => runAction(() => { void handleDownloadCloudDoc(doc.id, doc.name); })}
+          >
+            <DownloadIcon />
+            <span>{t('cloud_docs.actions.download', 'Download')}</span>
+          </button>
+        )}
+      </>
+    );
+
+    const renderSharedFolderItems = (folder: SharedCloudFolderItem) => (
+      <button
+        type="button"
+        role="menuitem"
+        class="cloud-docs-popover-item"
+        data-testid="cloud-docs-ctx-open"
+        onClick={() => runAction(() => setSharedCurrentFolderId(folder.id))}
+      >
+        <OpenDocIcon />
+        <span>{t('cloud_docs.actions.open', 'Open')}</span>
+      </button>
+    );
+
+    const renderRecentDocItems = (item: RecentDocumentItem) => {
+      const isOwnedCloudDoc = Boolean(
+        item.sourceKind === 'cloud_doc'
+        && item.cloudDocId
+        && docs.some((d) => d.id === item.cloudDocId),
+      );
+      const ownedDoc = isOwnedCloudDoc ? docs.find((d) => d.id === item.cloudDocId) ?? null : null;
+      const canEdit = item.role ? item.role === 'editor' : item.openMode === 'edit';
+      const canDownloadCloud = Boolean(
+        item.sourceKind === 'cloud_doc'
+        && item.cloudDocId
+        && item.accessible
+        && item.allowDownload !== false,
+      );
+      return (
+        <>
+          <button
+            type="button"
+            role="menuitem"
+            class="cloud-docs-popover-item"
+            data-testid="cloud-docs-ctx-open"
+            onClick={() => runAction(() => handleOpenRecentItem(item))}
+          >
+            <OpenDocIcon />
+            <span>
+              {canEdit
+                ? t('cloud_docs.actions.edit', 'Edit')
+                : item.role === 'viewer' || item.openMode === 'view'
+                  ? t('cloud_docs.actions.view', 'View')
+                  : t('cloud_docs.actions.open', 'Open')}
+            </span>
+          </button>
+          {canDownloadCloud && item.cloudDocId && (
+            <button
+              type="button"
+              role="menuitem"
+              class="cloud-docs-popover-item"
+              data-testid="cloud-docs-ctx-download"
+              onClick={() => runAction(() => { void handleDownloadCloudDoc(item.cloudDocId!, item.title); })}
+            >
+              <DownloadIcon />
+              <span>{t('cloud_docs.actions.download', 'Download')}</span>
+            </button>
+          )}
+          {ownedDoc && (
+            <button
+              type="button"
+              role="menuitem"
+              class="cloud-docs-popover-item"
+              data-testid="cloud-docs-ctx-share"
+              onClick={() => runAction(() => { void openShareDialog('doc', ownedDoc.id, ownedDoc.name); })}
+            >
+              <ShareIcon />
+              <span>{t('cloud_docs.actions.share', 'Share')}</span>
+            </button>
+          )}
+          <div class="cloud-docs-context-divider" role="separator" />
+          <button
+            type="button"
+            role="menuitem"
+            class="cloud-docs-popover-item is-danger"
+            data-testid="cloud-docs-ctx-remove-recent"
+            disabled={busy}
+            onClick={() => runAction(() => { void handleDeleteRecent(item.id); })}
+          >
+            <CloseIcon size={13} />
+            <span>{t('cloud_docs.actions.remove_recent', 'Remove from Recent')}</span>
+          </button>
+        </>
+      );
+    };
+
+    const renderCanvasItems = () => (
+      <>
+        {activeTab !== 'shared' && (
+          <>
+            <button
+              type="button"
+              role="menuitem"
+              class="cloud-docs-popover-item"
+              data-testid="cloud-docs-ctx-new-docx"
+              disabled={busy}
+              onClick={() => runAction(() => { void handleCreateBlankInstant('docx'); })}
+            >
+              <DocKindIcon name="new.docx" size={14} />
+              <span>{t('cloud_docs.gallery.blank_docx', 'Blank document')}</span>
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              class="cloud-docs-popover-item"
+              data-testid="cloud-docs-ctx-new-xlsx"
+              disabled={busy}
+              onClick={() => runAction(() => { void handleCreateBlankInstant('xlsx'); })}
+            >
+              <DocKindIcon name="new.xlsx" size={14} />
+              <span>{t('cloud_docs.gallery.blank_xlsx', 'Blank spreadsheet')}</span>
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              class="cloud-docs-popover-item"
+              data-testid="cloud-docs-ctx-new-pptx"
+              disabled={busy}
+              onClick={() => runAction(() => { void handleCreateBlankInstant('pptx'); })}
+            >
+              <DocKindIcon name="new.pptx" size={14} />
+              <span>{t('cloud_docs.gallery.blank_pptx', 'Blank presentation')}</span>
+            </button>
+            {activeTab === 'my_docs' && (
+              <button
+                type="button"
+                role="menuitem"
+                class="cloud-docs-popover-item"
+                data-testid="cloud-docs-ctx-new-folder"
+                disabled={busy}
+                onClick={() => runAction(() => setNewFolderMode(true))}
+              >
+                <FolderPlusIcon />
+                <span>{t('cloud_docs.actions.new_folder', 'New Folder')}</span>
+              </button>
+            )}
+            <button
+              type="button"
+              role="menuitem"
+              class="cloud-docs-popover-item"
+              data-testid="cloud-docs-ctx-upload"
+              disabled={busy}
+              onClick={() => runAction(() => fileInputRef.current?.click())}
+            >
+              <UploadIcon />
+              <span>{t('cloud_docs.actions.upload', 'Upload')}</span>
+            </button>
+            <div class="cloud-docs-context-divider" role="separator" />
+          </>
+        )}
+        <button
+          type="button"
+          role="menuitem"
+          class="cloud-docs-popover-item"
+          data-testid="cloud-docs-ctx-toggle-view"
+          onClick={() => runAction(() => setViewMode((prev) => (prev === 'grid' ? 'list' : 'grid')))}
+        >
+          {viewMode === 'grid' ? <ViewListIcon /> : <ViewGridIcon />}
+          <span>
+            {viewMode === 'grid'
+              ? t('cloud_docs.view.list', 'List view')
+              : t('cloud_docs.view.grid', 'Grid view')}
+          </span>
+        </button>
+        <button
+          type="button"
+          role="menuitem"
+          class="cloud-docs-popover-item"
+          data-testid="cloud-docs-ctx-refresh"
+          disabled={loading || busy}
+          onClick={() => runAction(() => { void refreshData(); })}
+        >
+          <RefreshIcon />
+          <span>{t('common.refresh', 'Refresh')}</span>
+        </button>
+      </>
+    );
+
+    return (
+      <div
+        ref={contextMenuRef}
+        class="cloud-docs-context-menu"
+        data-testid="cloud-docs-context-menu"
+        data-target-kind={target.kind}
+        role="menu"
+        style={{ left: `${x}px`, top: `${y}px` }}
+        onClick={(e) => e.stopPropagation()}
+        onMouseDown={(e) => e.stopPropagation()}
+        onPointerDown={(e) => e.stopPropagation()}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+        }}
+      >
+        {target.kind === 'doc' && renderOwnedDocItems(target.doc)}
+        {target.kind === 'folder' && renderOwnedFolderItems(target.folder)}
+        {target.kind === 'shared-doc' && renderSharedDocItems(target.doc)}
+        {target.kind === 'shared-folder' && renderSharedFolderItems(target.folder)}
+        {target.kind === 'recent-doc' && renderRecentDocItems(target.item)}
+        {target.kind === 'canvas' && renderCanvasItems()}
+      </div>
+    );
+  };
+
   if (previewTarget) {
     const targetName = previewTarget.kind === 'cloud_doc' ? previewTarget.name : previewTarget.title;
     const canRenameInPreview = previewTarget.kind === 'cloud_doc' && !previewTarget.readOnly && previewTarget.isOwner;
@@ -1592,7 +2046,7 @@ export function CloudDocsPanel({
               aria-selected={activeTab === 'recent'}
               data-testid="cloud-docs-tab-recent"
               class={`cloud-docs-tab${activeTab === 'recent' ? ' is-active' : ''}`}
-              onClick={() => setActiveTab('recent')}
+              onClick={() => { setContextMenu(null); setActiveTab('recent'); }}
             >
               {t('cloud_docs.tabs.recent', 'Recent')}
             </button>
@@ -1602,7 +2056,7 @@ export function CloudDocsPanel({
               aria-selected={activeTab === 'my_docs'}
               data-testid="cloud-docs-tab-my-docs"
               class={`cloud-docs-tab${activeTab === 'my_docs' ? ' is-active' : ''}`}
-              onClick={() => setActiveTab('my_docs')}
+              onClick={() => { setContextMenu(null); setActiveTab('my_docs'); }}
             >
               {t('cloud_docs.tabs.my_docs', 'Cloud Docs')}
             </button>
@@ -1612,7 +2066,7 @@ export function CloudDocsPanel({
               aria-selected={activeTab === 'shared'}
               data-testid="cloud-docs-tab-shared"
               class={`cloud-docs-tab${activeTab === 'shared' ? ' is-active' : ''}`}
-              onClick={() => setActiveTab('shared')}
+              onClick={() => { setContextMenu(null); setActiveTab('shared'); }}
             >
               {t('cloud_docs.tabs.shared', 'Shared')}
               {(sharedFolders.length + sharedDocs.length) > 0 && (
@@ -1798,7 +2252,7 @@ export function CloudDocsPanel({
             </div>
           </div>
 
-          <div class="cloud-docs-gallery-strip">
+          <div class="cloud-docs-gallery-strip" data-testid="cloud-docs-gallery-strip">
             {CLOUD_DOC_BLANK_TYPES.map((type) => {
               const cardTitle = type === 'xlsx'
                 ? t('cloud_docs.gallery.blank_xlsx', 'Blank spreadsheet')
@@ -1813,12 +2267,12 @@ export function CloudDocsPanel({
                   data-testid={`cloud-docs-new-${type}-btn`}
                   onClick={() => void handleCreateBlankInstant(type)}
                   disabled={busy}
+                  title={cardTitle}
+                  aria-label={cardTitle}
                 >
-                  <TemplateThumbnail type={type} />
-                  <div class="cloud-docs-template-meta">
-                    <span class="cloud-docs-template-name">{cardTitle}</span>
-                    <span class="cloud-docs-template-ext">{t(`cloud_docs.blank_type.${type}`, type.toUpperCase())}</span>
-                  </div>
+                  <DocKindIcon name={`new.${type}`} size={16} />
+                  <span class="cloud-docs-template-plus" aria-hidden="true">+</span>
+                  <span class="cloud-docs-template-ext">{t(`cloud_docs.blank_type.${type}`, type.toUpperCase())}</span>
                 </button>
               );
             })}
@@ -1933,6 +2387,9 @@ export function CloudDocsPanel({
 
       <div
         class={`cloud-docs-body${dragActive ? ' is-drag-over' : ''}`}
+        data-testid="cloud-docs-canvas"
+        onContextMenu={(e) => openContextMenu(e as unknown as MouseEvent, { kind: 'canvas' })}
+        onScroll={() => { if (contextMenu) setContextMenu(null); }}
         onDragOver={(e) => {
           if (activeTab === 'shared') return;
           e.preventDefault();
@@ -1973,6 +2430,7 @@ export function CloudDocsPanel({
                   key={item.id}
                   class={`cloud-docs-row${viewMode === 'grid' ? ' is-card' : ''}${!item.accessible ? ' is-inaccessible' : ''}`}
                   data-testid={`recent-doc-row-${item.id}`}
+                  onContextMenu={(e) => openContextMenu(e as unknown as MouseEvent, { kind: 'recent-doc', item })}
                 >
                   <button
                     type="button"
@@ -2068,6 +2526,7 @@ export function CloudDocsPanel({
                     key={folder.id}
                     class={`cloud-docs-row${viewMode === 'grid' ? ' is-card' : ''}`}
                     data-testid={`shared-cloud-folder-row-${folder.id}`}
+                    onContextMenu={(e) => openContextMenu(e as unknown as MouseEvent, { kind: 'shared-folder', folder })}
                   >
                     <button
                       type="button"
@@ -2104,6 +2563,7 @@ export function CloudDocsPanel({
                     key={doc.id}
                     class={`cloud-docs-row${viewMode === 'grid' ? ' is-card' : ''}`}
                     data-testid={`shared-cloud-doc-row-${doc.id}`}
+                    onContextMenu={(e) => openContextMenu(e as unknown as MouseEvent, { kind: 'shared-doc', doc })}
                   >
                     <button
                       type="button"
@@ -2173,6 +2633,7 @@ export function CloudDocsPanel({
                   key={folder.id}
                   class={`cloud-docs-row${viewMode === 'grid' ? ' is-card' : ''}`}
                   data-testid={`cloud-folder-row-${folder.id}`}
+                  onContextMenu={(e) => openContextMenu(e as unknown as MouseEvent, { kind: 'folder', folder })}
                 >
                   <button
                     type="button"
@@ -2208,7 +2669,10 @@ export function CloudDocsPanel({
                         data-testid={`cloud-folder-more-${folder.id}`}
                         aria-expanded={isMenuOpen}
                         aria-label={t('cloud_docs.actions.more', 'More actions')}
-                        onClick={() => setOpenMenu(isMenuOpen ? null : { kind: 'folder', id: folder.id })}
+                        onClick={() => {
+                          setContextMenu(null);
+                          setOpenMenu(isMenuOpen ? null : { kind: 'folder', id: folder.id });
+                        }}
                       >
                         <MoreVertIcon />
                       </button>
@@ -2251,6 +2715,7 @@ export function CloudDocsPanel({
                   key={doc.id}
                   class={`cloud-docs-row${viewMode === 'grid' ? ' is-card' : ''}`}
                   data-testid={`cloud-doc-row-${doc.id}`}
+                  onContextMenu={(e) => openContextMenu(e as unknown as MouseEvent, { kind: 'doc', doc })}
                 >
                   <button
                     type="button"
@@ -2296,7 +2761,10 @@ export function CloudDocsPanel({
                         data-testid={`cloud-doc-more-${doc.id}`}
                         aria-expanded={isMenuOpen}
                         aria-label={t('cloud_docs.actions.more', 'More actions')}
-                        onClick={() => setOpenMenu(isMenuOpen ? null : { kind: 'doc', id: doc.id })}
+                        onClick={() => {
+                          setContextMenu(null);
+                          setOpenMenu(isMenuOpen ? null : { kind: 'doc', id: doc.id });
+                        }}
                       >
                         <MoreVertIcon />
                       </button>
@@ -2347,6 +2815,7 @@ export function CloudDocsPanel({
         )}
       </div>
 
+      {renderContextMenu()}
       {renderShareModal()}
     </div>
   );

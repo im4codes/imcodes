@@ -5249,6 +5249,9 @@
     "confirm_delete": "Удалить «{{name}}»?",
     "actions": {
       "back_to_list": "Назад",
+      "open": "Открыть",
+      "edit": "Редактировать",
+      "view": "Просмотр",
       "download": "Скачать",
       "new_folder": "Новая папка",
       "upload": "Загрузить",

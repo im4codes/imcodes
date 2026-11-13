@@ -5250,6 +5250,9 @@
     "confirm_delete": "確定刪除「{{name}}」嗎？",
     "actions": {
       "back_to_list": "返回列表",
+      "open": "開啟",
+      "edit": "編輯",
+      "view": "檢視",
       "download": "下載",
       "new_folder": "新增資料夾",
       "upload": "上傳",

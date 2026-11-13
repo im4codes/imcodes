@@ -5249,6 +5249,9 @@
     "confirm_delete": "\"{{name}}\" 항목을 삭제할까요?",
     "actions": {
       "back_to_list": "뒤로",
+      "open": "열기",
+      "edit": "편집",
+      "view": "보기",
       "download": "다운로드",
       "new_folder": "새 폴더",
       "upload": "업로드",

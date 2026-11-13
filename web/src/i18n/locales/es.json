@@ -5250,6 +5250,9 @@
     "confirm_delete": "¿Eliminar \"{{name}}\"?",
     "actions": {
       "back_to_list": "Volver",
+      "open": "Abrir",
+      "edit": "Editar",
+      "view": "Ver",
       "download": "Descargar",
       "new_folder": "Nueva carpeta",
       "upload": "Subir",

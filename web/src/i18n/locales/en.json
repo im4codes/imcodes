@@ -5260,6 +5260,9 @@
     "confirm_delete": "Delete \"{{name}}\"?",
     "actions": {
       "back_to_list": "Back",
+      "open": "Open",
+      "edit": "Edit",
+      "view": "View",
       "download": "Download",
       "new_folder": "New Folder",
       "upload": "Upload",
