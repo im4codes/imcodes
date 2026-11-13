@@ -931,6 +931,177 @@ describe('CloudDocsPanel', () => {
     });
   });
 
+  it('reconciles reopened same document rename across A -> Back -> A (success, newer local edit, and failure)', async () => {
+    const deferred = <T,>() => {
+      let resolve!: (v: T) => void;
+      let reject!: (err: unknown) => void;
+      const promise = new Promise<T>((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      return { promise, resolve, reject };
+    };
+    const docA = makeDoc({ id: 'doc-a', name: 'A.docx' });
+    listCloudDocsApiMock.mockResolvedValue({
+      folders: [],
+      docs: [docA],
+      sharedFolders: [],
+      sharedDocs: [],
+    });
+
+    // 1. A -> delayed rename -> Back -> reopen A -> ACK settles title & clears Saving...
+    const req1 = deferred<{ doc: CloudDocItem }>();
+    updateCloudDocApiMock.mockImplementationOnce(() => req1.promise);
+
+    render(<CloudDocsPanel initialTab="my_docs" />);
+    fireEvent.click((await screen.findByTestId('cloud-doc-row-doc-a')).querySelector('button.cloud-docs-row-main')!);
+    let input = (await screen.findByTestId('cloud-docs-preview-title-input')) as HTMLInputElement;
+    fireEvent.input(input, { target: { value: 'Renamed A' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    await waitFor(() => expect(updateCloudDocApiMock).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByTestId('cloud-docs-preview-back'));
+    fireEvent.click((await screen.findByTestId('cloud-doc-row-doc-a')).querySelector('button.cloud-docs-row-main')!);
+    input = (await screen.findByTestId('cloud-docs-preview-title-input')) as HTMLInputElement;
+    expect(input.value).toBe('Renamed A.docx');
+    expect(screen.queryByText('Saving...')).toBeTruthy();
+
+    req1.resolve({ doc: { ...docA, name: 'Renamed A.docx' } });
+    await waitFor(() => {
+      expect((screen.getByTestId('cloud-docs-preview-title-input') as HTMLInputElement).value).toBe('Renamed A.docx');
+      expect(screen.queryByText('Saving...')).toBeNull();
+      expect(screen.getByTestId('cloud-docs-preview-saved')).toBeTruthy();
+    });
+
+    // 2. A -> delayed rename -> Back -> reopen A -> newer local edit before ACK -> ACK settles Saving without clobbering new draft
+    const req2 = deferred<{ doc: CloudDocItem }>();
+    updateCloudDocApiMock.mockImplementationOnce(() => req2.promise);
+    input = screen.getByTestId('cloud-docs-preview-title-input') as HTMLInputElement;
+    fireEvent.input(input, { target: { value: 'Server Ack Name' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    await waitFor(() => expect(updateCloudDocApiMock).toHaveBeenCalledTimes(2));
+
+    fireEvent.click(screen.getByTestId('cloud-docs-preview-back'));
+    fireEvent.click((await screen.findByTestId('cloud-doc-row-doc-a')).querySelector('button.cloud-docs-row-main')!);
+    input = (await screen.findByTestId('cloud-docs-preview-title-input')) as HTMLInputElement;
+    fireEvent.input(input, { target: { value: 'Local After Reopen' } });
+
+    req2.resolve({ doc: { ...docA, name: 'Server Ack Name.docx' } });
+    await waitFor(() => expect(screen.queryByText('Saving...')).toBeNull());
+    expect((screen.getByTestId('cloud-docs-preview-title-input') as HTMLInputElement).value).toBe('Local After Reopen');
+    expect(screen.queryByTestId('cloud-docs-preview-saved')).toBeNull();
+
+    // 3. A -> delayed rename -> Back -> reopen A -> rejection clears Saving, preserves retryable input, and surfaces error
+    const req3 = deferred<{ doc: CloudDocItem }>();
+    updateCloudDocApiMock.mockImplementationOnce(() => req3.promise);
+    fireEvent.input(screen.getByTestId('cloud-docs-preview-title-input'), { target: { value: 'Failed Reopen' } });
+    fireEvent.keyDown(screen.getByTestId('cloud-docs-preview-title-input'), { key: 'Enter' });
+    await waitFor(() => expect(updateCloudDocApiMock).toHaveBeenCalledTimes(3));
+
+    fireEvent.click(screen.getByTestId('cloud-docs-preview-back'));
+    fireEvent.click((await screen.findByTestId('cloud-doc-row-doc-a')).querySelector('button.cloud-docs-row-main')!);
+    req3.reject(new Error('Reopen save failed'));
+    await waitFor(() => {
+      expect(screen.getByTestId('cloud-docs-error')).toBeTruthy();
+      expect(screen.queryByText('Saving...')).toBeNull();
+    });
+    expect((screen.getByTestId('cloud-docs-preview-title-input') as HTMLInputElement).value).toBe('Failed Reopen.docx');
+  });
+
+  it('projects mutations into list/naming cache across refresh failures, blocks stale create while offline, and recovers cleanly', async () => {
+    const fld1 = makeFolder({ id: 'fld-1', name: 'Archive' });
+    const docA = makeDoc({ id: 'doc-a', name: 'A.docx' });
+    const created1 = makeDoc({ id: 'created-1', name: 'Untitled document.docx', updatedAt: 1_700_000_200_000 });
+    const uploadedDoc = makeDoc({ id: 'uploaded-1', name: 'Spec.pdf', mimeType: 'application/pdf', updatedAt: 1_700_000_300_000 });
+    const renamedUpload = { ...uploadedDoc, name: 'FinalSpec.pdf' };
+    const movedUpload = { ...renamedUpload, folderId: 'fld-1' };
+
+    listCloudDocsApiMock
+      .mockResolvedValueOnce({ folders: [fld1], docs: [docA], sharedFolders: [], sharedDocs: [] })
+      .mockRejectedValueOnce(new Error('Refresh down 1'))
+      .mockRejectedValueOnce(new Error('Refresh down 2'))
+      .mockRejectedValueOnce(new Error('Refresh down 3'))
+      .mockRejectedValueOnce(new Error('Refresh down 4'))
+      .mockRejectedValueOnce(new Error('Refresh down 5'))
+      .mockRejectedValueOnce(new Error('Refresh down 6'))
+      .mockRejectedValueOnce(new Error('Refresh down 7'))
+      .mockResolvedValue({
+        folders: [fld1],
+        docs: [created1, movedUpload],
+        sharedFolders: [],
+        sharedDocs: [],
+      });
+
+    createBlankCloudDocApiMock
+      .mockResolvedValueOnce({ doc: created1 })
+      .mockResolvedValueOnce({ doc: makeDoc({ id: 'created-2', name: 'Untitled document 2.docx' }) });
+    uploadCloudDocApiMock.mockResolvedValueOnce({ doc: uploadedDoc });
+    updateCloudDocApiMock
+      .mockResolvedValueOnce({ doc: renamedUpload })
+      .mockResolvedValueOnce({ doc: movedUpload });
+    deleteCloudDocApiMock.mockResolvedValueOnce({ ok: true });
+
+    render(<CloudDocsPanel initialTab="my_docs" />);
+    await screen.findByTestId('cloud-doc-row-doc-a');
+
+    // 1. Create succeeds while follow-up refresh fails -> projects created1 & Back refresh fails
+    fireEvent.click(screen.getByTestId('cloud-docs-new-docx-btn'));
+    await screen.findByTestId('mock-office-preview');
+    expect(createBlankCloudDocApiMock).toHaveBeenNthCalledWith(1, {
+      type: 'docx',
+      name: 'Untitled document.docx',
+      folderId: null,
+    });
+
+    fireEvent.click(screen.getByTestId('cloud-docs-preview-back'));
+    // Projected doc stays rendered even when Back refresh fails!
+    await screen.findByTestId('cloud-doc-row-created-1');
+
+    // 2. Retry create while refresh still fails -> aborts with error instead of sending duplicate Untitled document.docx
+    fireEvent.click(screen.getByTestId('cloud-docs-new-docx-btn'));
+    await waitFor(() => expect(screen.getByTestId('cloud-docs-error')).toBeTruthy());
+    expect(createBlankCloudDocApiMock).toHaveBeenCalledTimes(1);
+
+    // 3. Upload, rename, move, and delete each project into visible list even while refresh rejects
+    const pdf = new File(['%PDF'], 'Spec.pdf', { type: 'application/pdf' });
+    fireEvent.drop(screen.getByTestId('cloud-docs-my-docs-list'), { dataTransfer: { files: [pdf] } });
+    await screen.findByTestId('cloud-doc-row-uploaded-1');
+
+    fireEvent.click(screen.getByTestId('cloud-doc-more-uploaded-1'));
+    fireEvent.click(screen.getByTestId('rename-cloud-doc-uploaded-1'));
+    fireEvent.input(screen.getByTestId('cloud-docs-rename-input'), { target: { value: 'FinalSpec.pdf' } });
+    fireEvent.click(screen.getByTestId('cloud-docs-rename-submit'));
+    await waitFor(() => {
+      expect(screen.getByTestId('cloud-doc-row-uploaded-1').textContent).toContain('FinalSpec.pdf');
+    });
+
+    fireEvent.click(screen.getByTestId('cloud-doc-more-uploaded-1'));
+    fireEvent.click(screen.getByTestId('move-cloud-doc-uploaded-1'));
+    fireEvent.change(screen.getByTestId('cloud-docs-move-select'), { target: { value: 'fld-1' } });
+    fireEvent.click(screen.getByTestId('cloud-docs-move-submit'));
+    await waitFor(() => {
+      expect(screen.queryByTestId('cloud-doc-row-uploaded-1')).toBeNull();
+    });
+
+    fireEvent.click(screen.getByTestId('cloud-doc-more-doc-a'));
+    fireEvent.click(screen.getByTestId('delete-cloud-doc-doc-a'));
+    fireEvent.click(screen.getByTestId('cloud-docs-confirm-delete-btn'));
+    await waitFor(() => {
+      expect(screen.queryByTestId('cloud-doc-row-doc-a')).toBeNull();
+      expect((screen.getByTestId('cloud-docs-new-docx-btn') as HTMLButtonElement).disabled).toBe(false);
+    });
+
+    // 4. Network recovers -> create refreshes authoritative server docs and allocates Untitled document 2.docx
+    fireEvent.click(screen.getByTestId('cloud-docs-new-docx-btn'));
+    await waitFor(() => {
+      expect(createBlankCloudDocApiMock).toHaveBeenNthCalledWith(2, {
+        type: 'docx',
+        name: 'Untitled document 2.docx',
+        folderId: null,
+      });
+    });
+  });
+
   it('uses shared 4-column list layout and min-width: 0 shrink rules across grid and list styles', () => {
     const css = readFileSync(stylesPath, 'utf8');
     expect(css).toContain('--cloud-docs-list-cols:');

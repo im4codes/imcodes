@@ -432,6 +432,7 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
   const shareTargetRef = useRef<{ kind: CloudDocShareTargetKind; id: string; name: string } | null>(null);
   const previewTitleCancelledRef = useRef(false);
   const savedStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const editGenCounterRef = useRef(0);
   const activePreviewRef = useRef<{ docId: string | null; previewSeq: number; editGen: number }>({
     docId: null,
     previewSeq: 0,
@@ -440,11 +441,11 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
   type TitleSaveIntent = {
     name: string;
     fallbackMime: string;
-    previewSeq: number;
     editGen: number;
   };
   type TitleSaveQueueEntry = {
     inFlight: boolean;
+    activeIntent: TitleSaveIntent | null;
     lastQueuedName: string;
     pending: TitleSaveIntent | null;
   };
@@ -463,26 +464,48 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
     };
   }, []);
 
+  const applyDocsProjection = useCallback((updater: (current: CloudDocItem[]) => CloudDocItem[]) => {
+    const next = updater(authoritativeDocsRef.current);
+    authoritativeDocsRef.current = next;
+    if (mountedRef.current) setDocs(next);
+  }, []);
+
+  const invalidateDocsAuthority = useCallback(() => {
+    docsHydratedRef.current = false;
+  }, []);
+
   const openPreview = useCallback((target: PreviewTarget | null) => {
     if (savedStatusTimerRef.current) {
       clearTimeout(savedStatusTimerRef.current);
       savedStatusTimerRef.current = null;
     }
-    activePreviewRef.current = {
-      docId: target?.kind === 'cloud_doc' ? target.id : null,
-      previewSeq: activePreviewRef.current.previewSeq + 1,
-      editGen: activePreviewRef.current.editGen + 1,
-    };
+    const nextPreviewSeq = activePreviewRef.current.previewSeq + 1;
     previewTitleCancelledRef.current = false;
     setPreviewTarget(target);
     if (!target) {
+      activePreviewRef.current = {
+        docId: null,
+        previewSeq: nextPreviewSeq,
+        editGen: ++editGenCounterRef.current,
+      };
       setPreviewTitleDraft('');
       setPreviewTitleStatus('idle');
     } else if (target.kind === 'cloud_doc') {
       const q = titleSaveQueueRef.current.get(target.id);
-      setPreviewTitleDraft(q?.pending?.name ?? target.name);
-      setPreviewTitleStatus(q?.inFlight || q?.pending ? 'saving' : 'idle');
+      const activeSave = q && (q.inFlight || q.pending) ? (q.pending ?? q.activeIntent) : null;
+      activePreviewRef.current = {
+        docId: target.id,
+        previewSeq: nextPreviewSeq,
+        editGen: activeSave ? activeSave.editGen : ++editGenCounterRef.current,
+      };
+      setPreviewTitleDraft(activeSave ? q!.lastQueuedName : target.name);
+      setPreviewTitleStatus(activeSave ? 'saving' : 'idle');
     } else {
+      activePreviewRef.current = {
+        docId: null,
+        previewSeq: nextPreviewSeq,
+        editGen: ++editGenCounterRef.current,
+      };
       setPreviewTitleDraft(target.title);
       setPreviewTitleStatus('idle');
     }
@@ -542,6 +565,7 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
       } catch (err: unknown) {
         if (!mountedRef.current || controller.signal.aborted || seq !== loadSeqRef.current) return null;
         if (err instanceof DOMException && err.name === 'AbortError') return null;
+        docsHydratedRef.current = false;
         const msg = err instanceof ApiError ? err.message : (err instanceof Error ? err.message : String(err));
         setError(msg || tRef.current('cloud_docs.errors.load_failed', 'Failed to load documents'));
         return null;
@@ -724,6 +748,11 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
         folderId: targetFolderId,
       });
       if (!mountedRef.current) return;
+      if (res?.doc) {
+        applyDocsProjection((prev) => [...prev.filter((d) => d.id !== res.doc.id), res.doc]);
+      } else {
+        invalidateDocsAuthority();
+      }
       await refreshData();
       if (!mountedRef.current) return;
       openPreview({
@@ -757,8 +786,13 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
     setBusy(true);
     setError(null);
     try {
-      await uploadCloudDocApi(file, { folderId: activeTab === 'my_docs' ? currentFolderId : null });
+      const res = await uploadCloudDocApi(file, { folderId: activeTab === 'my_docs' ? currentFolderId : null });
       if (!mountedRef.current) return;
+      if (res?.doc) {
+        applyDocsProjection((prev) => [...prev.filter((d) => d.id !== res.doc.id), res.doc]);
+      } else {
+        invalidateDocsAuthority();
+      }
       await refreshData();
     } catch (err: unknown) {
       if (!mountedRef.current) return;
@@ -797,7 +831,12 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
       if (renamingTarget.kind === 'folder') {
         await updateCloudDocFolderApi(renamingTarget.id, { name: trimmed });
       } else {
-        await updateCloudDocApi(renamingTarget.id, { name: trimmed });
+        const res = await updateCloudDocApi(renamingTarget.id, { name: trimmed });
+        if (mountedRef.current) {
+          applyDocsProjection((prev) =>
+            prev.map((d) => (d.id === renamingTarget.id ? (res?.doc ?? { ...d, name: trimmed }) : d)),
+          );
+        }
       }
       if (!mountedRef.current) return;
       setRenamingTarget(null);
@@ -839,12 +878,12 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
     const intent: TitleSaveIntent = {
       name: nextName,
       fallbackMime: previewTarget.mimeType,
-      previewSeq: activePreviewRef.current.previewSeq,
       editGen: activePreviewRef.current.editGen,
     };
 
     const entry: TitleSaveQueueEntry = existingEntry ?? {
       inFlight: false,
+      activeIntent: null,
       lastQueuedName: nextName,
       pending: null,
     };
@@ -866,7 +905,8 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
       while (entry.pending) {
         const currentIntent = entry.pending;
         entry.pending = null;
-        if (mountedRef.current && activePreviewRef.current.previewSeq === currentIntent.previewSeq) {
+        entry.activeIntent = currentIntent;
+        if (mountedRef.current && activePreviewRef.current.docId === docId) {
           setPreviewTitleStatus('saving');
         }
         const res = await updateCloudDocApi(docId, { name: currentIntent.name });
@@ -874,10 +914,9 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
         const finalName = res?.doc?.name || currentIntent.name;
         const finalMime = res?.doc?.mimeType || currentIntent.fallbackMime;
 
-        authoritativeDocsRef.current = authoritativeDocsRef.current.map((d) =>
-          d.id === docId ? { ...d, name: finalName, mimeType: finalMime } : d,
+        applyDocsProjection((prev) =>
+          prev.map((d) => (d.id === docId ? (res?.doc ?? { ...d, name: finalName, mimeType: finalMime }) : d)),
         );
-        setDocs((prev) => prev.map((d) => (d.id === docId ? { ...d, name: finalName, mimeType: finalMime } : d)));
         setRecentItems((prev) => prev.map((r) => (
           r.cloudDocId === docId ? { ...r, title: finalName, mimeType: finalMime } : r
         )));
@@ -887,30 +926,31 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
             : prev
         ));
 
-        const samePreview = activePreviewRef.current.previewSeq === currentIntent.previewSeq;
+        const sameDocActive = activePreviewRef.current.docId === docId;
         const hasMorePending = entry.pending !== null;
-        const sameEditGen = activePreviewRef.current.editGen === currentIntent.editGen;
-        if (samePreview && !hasMorePending && sameEditGen) {
+        const noNewerLocalEdit = activePreviewRef.current.editGen === currentIntent.editGen;
+        if (sameDocActive && !hasMorePending && noNewerLocalEdit) {
           setPreviewTitleDraft(finalName);
           setPreviewTitleStatus('saved');
           if (savedStatusTimerRef.current) clearTimeout(savedStatusTimerRef.current);
-          const timerPreviewSeq = currentIntent.previewSeq;
+          const timerDocId = docId;
           const timerEditGen = currentIntent.editGen;
           savedStatusTimerRef.current = setTimeout(() => {
             if (
               mountedRef.current
-              && activePreviewRef.current.previewSeq === timerPreviewSeq
+              && activePreviewRef.current.docId === timerDocId
               && activePreviewRef.current.editGen === timerEditGen
             ) {
               setPreviewTitleStatus('idle');
             }
           }, 1800);
-        } else if (samePreview && !hasMorePending && !sameEditGen) {
+        } else if (sameDocActive && !hasMorePending && !noNewerLocalEdit) {
           setPreviewTitleStatus('idle');
         }
       }
     } catch (err: unknown) {
       entry.pending = null;
+      entry.activeIntent = null;
       entry.lastQueuedName = '';
       if (!mountedRef.current) return;
       if (activePreviewRef.current.docId === docId) {
@@ -919,6 +959,7 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
       }
     } finally {
       entry.inFlight = false;
+      entry.activeIntent = null;
       if (!entry.pending) {
         titleSaveQueueRef.current.delete(docId);
       }
@@ -931,8 +972,12 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
     setBusy(true);
     setError(null);
     try {
-      await updateCloudDocApi(movingDocId, { folderId: movingFolderTargetId || null });
+      const nextFolderId = movingFolderTargetId || null;
+      const res = await updateCloudDocApi(movingDocId, { folderId: nextFolderId });
       if (!mountedRef.current) return;
+      applyDocsProjection((prev) =>
+        prev.map((d) => (d.id === movingDocId ? (res?.doc ?? { ...d, folderId: nextFolderId }) : d)),
+      );
       setMovingDocId(null);
       setMovingFolderTargetId('');
       await refreshData();
@@ -951,11 +996,15 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
     try {
       if (confirmDelete.kind === 'folder') {
         await deleteCloudDocFolderApi(confirmDelete.id);
+        invalidateDocsAuthority();
         if (currentFolderId === confirmDelete.id) {
           setCurrentFolderId(null);
         }
       } else {
         await deleteCloudDocApi(confirmDelete.id);
+        if (mountedRef.current) {
+          applyDocsProjection((prev) => prev.filter((d) => d.id !== confirmDelete.id));
+        }
       }
       if (!mountedRef.current) return;
       setConfirmDelete(null);
@@ -1345,7 +1394,7 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
                 onInput={(e) => {
                   const val = (e.currentTarget as HTMLInputElement).value;
                   previewTitleCancelledRef.current = false;
-                  activePreviewRef.current.editGen += 1;
+                  activePreviewRef.current.editGen = ++editGenCounterRef.current;
                   if (savedStatusTimerRef.current) {
                     clearTimeout(savedStatusTimerRef.current);
                     savedStatusTimerRef.current = null;
@@ -1362,7 +1411,7 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
                   } else if (e.key === 'Escape') {
                     e.preventDefault();
                     previewTitleCancelledRef.current = true;
-                    activePreviewRef.current.editGen += 1;
+                    activePreviewRef.current.editGen = ++editGenCounterRef.current;
                     if (savedStatusTimerRef.current) {
                       clearTimeout(savedStatusTimerRef.current);
                       savedStatusTimerRef.current = null;
