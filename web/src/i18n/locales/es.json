@@ -1024,6 +1024,7 @@
       "quickAuditLabel": "Auditoría",
       "modeSaved": "La supervisión automática ahora está en {{mode}}.",
       "modeSaveFailed": "No se pudo sincronizar la supervisión automática. Inténtalo de nuevo.",
+      "defaultsLoadFailed": "No se pudieron cargar los valores globales predeterminados de supervisión. Actualiza antes de guardar los cambios del grupo de ejecución.",
       "brainOnly": "Solo la sesión Brain puede activar la supervisión o auditoría automáticas.",
       "quickTitle": "Modo automático",
       "settingsTitle": "Configuración de supervisión y auditoría"

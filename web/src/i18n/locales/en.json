@@ -1024,6 +1024,7 @@
       "quickAuditLabel": "Audit",
       "modeSaved": "Automatic supervision is now {{mode}}.",
       "modeSaveFailed": "Automatic supervision could not be synchronized. Please retry.",
+      "defaultsLoadFailed": "Global supervision defaults failed to load. Refresh before saving execution pool changes.",
       "brainOnly": "Only the Brain session can enable automatic supervision or automatic audit.",
       "quickTitle": "Auto mode",
       "settingsTitle": "Supervision & Audit Settings"

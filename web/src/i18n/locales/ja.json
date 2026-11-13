@@ -1024,6 +1024,7 @@
       "quickAuditLabel": "監査",
       "modeSaved": "自動監督を{{mode}}に切り替えました。",
       "modeSaveFailed": "自動監督を同期できませんでした。もう一度お試しください。",
+      "defaultsLoadFailed": "グローバル監督の既定設定を読み込めませんでした。実行プールの変更を保存する前に再読み込みしてください。",
       "brainOnly": "自動監督または自動監査を有効にできるのは Brain セッションだけです。",
       "quickTitle": "自動モード",
       "settingsTitle": "監督・監査設定"

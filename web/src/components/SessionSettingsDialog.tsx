@@ -547,9 +547,6 @@ export function SessionSettingsDialog({
   const [supervision, setSupervision] = useState<SupervisionDraft>(initialSupervision);
   const agentTypeMountedRef = useRef(false);
   const providerModelManuallySelectedRef = useRef(false);
-  const [supervisorDefaults, setSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
-  const [initialSupervisorDefaults, setInitialSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
-  const supervisorDefaultsDirtyRef = useRef(false);
   useEffect(() => {
     if (canControlAutomaticSupervision || supervisionMode == null) return;
     setSupervision((current) => current.mode === supervisionMode
@@ -562,7 +559,7 @@ export function SessionSettingsDialog({
     setDescription(initDesc);
     setAgentType(type);
     setSupervision(initialSupervision);
-  }, [initLabel, initDesc, initCwd, type, initialSupervision, sessionName, subSessionId]);
+  }, [initLabel, initDesc, initCwd, type, initialSupervision, serverId, sessionName, subSessionId]);
 
   useEffect(() => {
     const observedModel = activeModel?.trim() || modelDisplay?.trim() || requestedModel?.trim() || '';
@@ -717,20 +714,40 @@ export function SessionSettingsDialog({
     sessionName,
   });
 
-  useEffect(() => {
-    if (!isSupportedTransport) return;
-    if (!supervisorDefaultsPref.loaded) return;
-    const resolvedDefaults = normalizeSupervisorDefaultConfig(supervisorDefaultsPref.value);
-    setInitialSupervisorDefaults(resolvedDefaults);
-    if (!supervisorDefaultsDirtyRef.current) {
-      setSupervisorDefaults(resolvedDefaults);
-    }
-  }, [isSupportedTransport, supervisorDefaultsPref.loaded, supervisorDefaultsPref.value]);
+  const defaultsScopeKey = isSupportedTransport ? `${serverId.trim()}\0${sessionName.trim()}` : '';
+  const supervisorDefaultsLoadedOk = isSupportedTransport
+    && supervisorDefaultsPref.loaded
+    && !supervisorDefaultsPref.loading
+    && supervisorDefaultsPref.error == null;
+  const supervisorDefaultsPending = isSupportedTransport
+    && (!supervisorDefaultsPref.loaded || supervisorDefaultsPref.loading);
+  const supervisorDefaultsLoadFailed = isSupportedTransport
+    && supervisorDefaultsPref.loaded
+    && !supervisorDefaultsPref.loading
+    && supervisorDefaultsPref.error != null;
 
-  const updateSupervisorDefaultsFromUser = (updater: (prev: SupervisionRuntimeDraft) => SupervisionRuntimeDraft): void => {
+  const authoritativeSupervisorDefaults = useMemo<SupervisionRuntimeDraft | null>(() => {
+    if (!supervisorDefaultsLoadedOk) return null;
+    return normalizeSupervisorDefaultConfig(supervisorDefaultsPref.value);
+  }, [supervisorDefaultsLoadedOk, supervisorDefaultsPref.value]);
+
+  const [editedExecutionPools, setEditedExecutionPools] = useState<{
+    scopeKey: string;
+    pools: SupervisionExecutionPoolsConfig;
+  } | null>(null);
+
+  useEffect(() => {
+    setEditedExecutionPools((current) => (current?.scopeKey === defaultsScopeKey ? current : null));
+    setError('');
+  }, [defaultsScopeKey]);
+
+  const activeEditedExecutionPools = editedExecutionPools?.scopeKey === defaultsScopeKey
+    ? editedExecutionPools.pools
+    : null;
+
+  const updateExecutionPoolsFromUser = (executionPools: SupervisionExecutionPoolsConfig): void => {
     if (!canControlAutomaticSupervision) return;
-    supervisorDefaultsDirtyRef.current = true;
-    setSupervisorDefaults(updater);
+    setEditedExecutionPools({ scopeKey: defaultsScopeKey, pools: executionPools });
   };
 
   const supervisionAuditBlockingSeverities = resolveSupervisionAuditBlockingSeverities(supervision);
@@ -764,13 +781,24 @@ export function SessionSettingsDialog({
     sessions: executionPoolSessions,
   }), [executionPoolParentSession, executionPoolSessions, sessionName]);
   const brainExecutionModel = resolvePeerAuditNormalizedModelId({ activeModel, requestedModel });
+  const rawExecutionPools = activeEditedExecutionPools
+    ?? authoritativeSupervisorDefaults?.executionPools
+    ?? normalizeSupervisionExecutionPools(undefined);
   const supervisorDefaultsExecutionPools = useMemo(() => withBrainPrimaryPoolDefault({
-    pools: supervisorDefaults.executionPools ?? normalizeSupervisionExecutionPools(undefined),
+    pools: rawExecutionPools,
     // A sub-session's model is not the Brain model and must never silently
     // become an account-wide primary-pool authorization.
     brainAgentType: parentSession ? '' : type,
     brainModel: brainExecutionModel,
-  }), [brainExecutionModel, parentSession, supervisorDefaults.executionPools, type]);
+  }), [brainExecutionModel, parentSession, rawExecutionPools, type]);
+
+  const draftSupervisorDefaults = useMemo<SupervisionRuntimeDraft | null>(() => {
+    if (!authoritativeSupervisorDefaults) return null;
+    return {
+      ...authoritativeSupervisorDefaults,
+      executionPools: supervisorDefaultsExecutionPools,
+    };
+  }, [authoritativeSupervisorDefaults, supervisorDefaultsExecutionPools]);
 
   const nextTransportConfig = useMemo(() => {
     if (!canControlAutomaticSupervision) return transportConfig ?? null;
@@ -783,9 +811,14 @@ export function SessionSettingsDialog({
       auditMode: _legacyAuditMode,
       ...preservedSupervision
     } = supervision;
+    // Never replace persisted session pools with an unhydrated fallback while
+    // account defaults are still pending or failed and the user hasn't edited pools.
+    const resolvedSessionExecutionPools = (activeEditedExecutionPools !== null || authoritativeSupervisorDefaults !== null)
+      ? supervisorDefaultsExecutionPools
+      : preservedSupervision.executionPools;
     return buildTransportConfigWithSupervision(transportConfig, {
       ...preservedSupervision,
-      executionPools: supervisorDefaultsExecutionPools,
+      ...(resolvedSessionExecutionPools ? { executionPools: resolvedSessionExecutionPools } : {}),
       ...(supervision.auditBlockingSeverities !== undefined
         ? { auditBlockingSeverities: supervision.auditBlockingSeverities }
         : {}),
@@ -795,6 +828,8 @@ export function SessionSettingsDialog({
         : { pairEngine: undefined, pairMaxConcurrency: undefined }),
     });
   }, [
+    activeEditedExecutionPools,
+    authoritativeSupervisorDefaults,
     canControlAutomaticSupervision,
     isMainSession,
     supervision,
@@ -822,14 +857,16 @@ export function SessionSettingsDialog({
     type,
   ]);
 
-  const hasGlobalDefaultsChanges = useMemo(() => JSON.stringify({
-    ...supervisorDefaults,
-    executionPools: supervisorDefaultsExecutionPools,
-  }) !== JSON.stringify(initialSupervisorDefaults), [
-    initialSupervisorDefaults,
-    supervisorDefaults,
-    supervisorDefaultsExecutionPools,
-  ]);
+  const hasGlobalDefaultsChanges = useMemo(() => {
+    if (!authoritativeSupervisorDefaults || !draftSupervisorDefaults) return false;
+    return JSON.stringify(draftSupervisorDefaults) !== JSON.stringify(authoritativeSupervisorDefaults);
+  }, [authoritativeSupervisorDefaults, draftSupervisorDefaults]);
+
+  const globalDefaultsSaveBlocked = isSupportedTransport
+    && canControlAutomaticSupervision
+    && surface !== 'session'
+    && activeEditedExecutionPools !== null
+    && !supervisorDefaultsLoadedOk;
 
   const hasChanges = hasSessionChanges
     || (surface !== 'session' && canControlAutomaticSupervision && hasGlobalDefaultsChanges);
@@ -860,14 +897,18 @@ export function SessionSettingsDialog({
   };
 
   const handleSave = async () => {
+    if (globalDefaultsSaveBlocked) {
+      setError(t('session.supervision.defaultsLoadFailed'));
+      return;
+    }
     setSaving(true);
     setError('');
     try {
       if (canControlAutomaticSupervision && surface !== 'session' && hasGlobalDefaultsChanges) {
-        await supervisorDefaultsPref.save({
-          ...supervisorDefaults,
-          executionPools: supervisorDefaultsExecutionPools,
-        });
+        if (!draftSupervisorDefaults) {
+          throw new Error(t('session.supervision.defaultsLoadFailed'));
+        }
+        await supervisorDefaultsPref.save(draftSupervisorDefaults);
       }
 
       const providerChanged = surface === 'session' && agentType !== type;
@@ -948,8 +989,26 @@ export function SessionSettingsDialog({
           pools={supervisorDefaultsExecutionPools}
           candidates={executionPoolCandidates}
           onAddPoolSession={onAddPoolSession}
-          onChange={(executionPools) => updateSupervisorDefaultsFromUser((prev) => ({ ...prev, executionPools }))}
+          onChange={updateExecutionPoolsFromUser}
         />
+
+        {canControlAutomaticSupervision && supervisorDefaultsLoadFailed && (
+          <div style={{ color: '#fbbf24', fontSize: 12, display: 'flex', alignItems: 'center', gap: 8 }} role="alert">
+            <span>{t('session.supervision.defaultsLoadFailed')}</span>
+            <button
+              type="button"
+              class="btn btn-secondary btn-sm"
+              disabled={saving}
+              onClick={() => { void supervisorDefaultsPref.reload().catch(() => undefined); }}
+            >
+              {t('common.refresh')}
+            </button>
+          </div>
+        )}
+
+        {canControlAutomaticSupervision && supervisorDefaultsPending && activeEditedExecutionPools !== null && (
+          <div class="session-settings-field-help">{t('common.loading')}</div>
+        )}
 
         {supervisorDefaultsExecutionPools.primaryDevelopmentPool.configs.length === 0 && (
           <div style={{ color: '#fbbf24', fontSize: 12 }}>
@@ -1193,7 +1252,7 @@ export function SessionSettingsDialog({
 
         <div class="dialog-footer session-settings-footer">
           <button type="button" class="btn btn-secondary" onClick={onClose} disabled={saving}>{t('common.cancel')}</button>
-          <button type="button" class="btn btn-primary" onClick={handleSave} disabled={saving || !hasChanges || (surface !== 'session' && (!supervisionValid || !globalDefaultsValid))}>
+          <button type="button" class="btn btn-primary" onClick={handleSave} disabled={saving || !hasChanges || (surface !== 'session' && (!supervisionValid || !globalDefaultsValid || globalDefaultsSaveBlocked))}>
             {saving ? t('common.loading') : t('common.save')}
           </button>
         </div>

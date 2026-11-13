@@ -1024,6 +1024,7 @@
       "quickAuditLabel": "审计",
       "modeSaved": "自动监督已切换为{{mode}}。",
       "modeSaveFailed": "自动监督同步失败，请重试。",
+      "defaultsLoadFailed": "全局监督默认配置加载失败，请刷新后再保存执行池修改。",
       "brainOnly": "只有 Brain 会话可以开启自动监督或自动审计。",
       "quickTitle": "自动模式",
       "settingsTitle": "监督与审计设置"
