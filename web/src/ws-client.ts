@@ -1911,6 +1911,11 @@ export class WsClient {
     buildRequest: (requestId: string) => Record<string, unknown>,
     buildOverloadResponse: (requestId: string) => ServerMessage,
   ): string {
+    if (!this._connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      // send() drops outbound frames when disconnected; return an untracked id
+      // without poisoning ownedDataRequests/ownedDataRequestStarts for the TTL.
+      return crypto.randomUUID();
+    }
     const now = Date.now();
     for (const [pendingKey, pending] of this.ownedDataRequests) {
       if (pending.expiresAt > now) continue;
@@ -2535,6 +2540,8 @@ export class WsClient {
     this.clearTransportHistoryReplayTimers();
     this.clearNonCriticalSendTimers();
     this.sessionListRequestInFlight = false;
+    this.ownedDataRequests.clear();
+    this.ownedDataRequestKeyById.clear();
     this.clearP2pWorkflowPendingRequests();
     // Capability state belongs to a single daemon WS; on socket teardown
     // the cached snapshot is no longer authoritative and must be cleared

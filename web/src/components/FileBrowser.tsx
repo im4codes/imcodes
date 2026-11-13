@@ -930,6 +930,10 @@ export function FileBrowser({
   }, [clearPendingPreviewRequest, handlePreviewRequestTimeout]);
 
   const fetchDir = useCallback((nodePath: string, fetchOptions?: { skipGitStatus?: boolean }) => {
+    if (ws.connected === false) {
+      setData((prev) => updateNode(prev, nodePath, { isLoading: false }));
+      return;
+    }
     if (loadedRef.current.has(nodePath)) return;
     const inFlight = [...pendingRef.current.values()].includes(nodePath);
     if (inFlight) return;
@@ -1013,6 +1017,8 @@ export function FileBrowser({
       if (msg.type === DAEMON_MSG.RECONNECTED || (msg.type === 'session.event' && (msg as any).event === 'connected')) {
         loadedRef.current.clear();
         pendingRef.current.clear();
+        for (const timer of timersRef.current.values()) clearTimeout(timer);
+        timersRef.current.clear();
         clearAllPendingPreviewRequests();
         pendingCreateFileRef.current.clear();
         pendingRenameRef.current.clear();

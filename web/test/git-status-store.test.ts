@@ -215,4 +215,19 @@ describe('git-status-store — refresh resilience', () => {
       sessionName: 'deck_proj_brain',
     });
   });
+
+  it('queues requests made while ws.connected is false and flushes on connected event', () => {
+    const { ws, emit } = makeFakeWs();
+    Object.defineProperty(ws, 'connected', { value: false, configurable: true, writable: true });
+    const listener = vi.fn();
+    subscribeSharedChanges(getSharedChangesKey(ws, '/srv/alpha'), listener);
+
+    requestSharedChanges(ws, '/srv/alpha', false);
+    expect(ws.fsGitStatus).not.toHaveBeenCalled();
+
+    Object.defineProperty(ws, 'connected', { value: true, configurable: true, writable: true });
+    emit({ type: 'session.event', event: 'connected', session: '', state: 'connected' } as unknown as ServerMessage);
+    expect(ws.fsGitStatus).toHaveBeenCalledTimes(1);
+    expect(ws.fsGitStatus).toHaveBeenCalledWith('/srv/alpha', { includeStats: true });
+  });
 });

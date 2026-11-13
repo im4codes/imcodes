@@ -3318,4 +3318,26 @@ describe('FileBrowser — file-manager preview/folder sync', () => {
     // ...and no "preview failed" error is rendered.
     expect(screen.queryByText('file_browser.preview_error')).toBeNull();
   });
+
+  it('skips fsListDir while ws.connected is false and fetches once connected event arrives', async () => {
+    const { ws, fsListDir, sendMsg, respond } = makeWsFactory();
+    let isConnected = false;
+    Object.defineProperty(ws, 'connected', { get: () => isConnected });
+
+    await act(async () => {
+      render(<FileBrowser ws={ws} mode="file-multi" layout="panel" initialPath="/srv/alpha" onConfirm={vi.fn()} />);
+    });
+    expect(fsListDir).not.toHaveBeenCalled();
+
+    isConnected = true;
+    await act(async () => {
+      sendMsg({ type: 'session.event', event: 'connected', session: '', state: 'connected' } as unknown as ServerMessage);
+    });
+    expect(fsListDir).toHaveBeenCalledWith('/srv/alpha', true, false);
+
+    await act(async () => {
+      respond([{ name: 'alpha_only.ts', isDir: false }]);
+    });
+    expect(screen.getByText('alpha_only.ts')).toBeTruthy();
+  });
 });

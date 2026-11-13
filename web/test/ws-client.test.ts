@@ -2633,4 +2633,58 @@ describe('WsClient', () => {
       expect(lastWs!.send).not.toHaveBeenCalled();
     });
   });
+
+  describe('beginOwnedDataRequest disconnect resilience', () => {
+    it('does not poison ownedDataRequests when called while disconnected before socket open', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      expect(client.connected).toBe(false);
+
+      const preConnectId = client.fsListDir('/srv/alpha', true, false);
+      const preConnectGitId = client.fsGitStatus('/srv/alpha', { includeStats: true });
+
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      lastWs!.send.mockClear();
+
+      const liveId = client.fsListDir('/srv/alpha', true, false);
+      const liveGitId = client.fsGitStatus('/srv/alpha', { includeStats: true });
+      expect(liveId).not.toBe(preConnectId);
+      expect(liveGitId).not.toBe(preConnectGitId);
+
+      await vi.advanceTimersByTimeAsync(500);
+      const sent = lastWs!.send.mock.calls.map(([raw]) => JSON.parse(String(raw)) as { type: string; requestId?: string });
+      expect(sent.find((m) => m.type === 'fs.ls')?.requestId).toBe(liveId);
+      expect(sent.find((m) => m.type === 'fs.git_status')?.requestId).toBe(liveGitId);
+
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('clears orphaned ownedDataRequests on socket close so reconnect retries hit the wire', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+
+      const firstId = client.fsListDir('/srv/alpha', true, false);
+      lastWs!.emit('close', { code: 1006 });
+
+      // Reconnect opens a new socket
+      await vi.advanceTimersByTimeAsync(1_500);
+      lastWs!.emit('open');
+      lastWs!.send.mockClear();
+
+      const retryId = client.fsListDir('/srv/alpha', true, false);
+      expect(retryId).not.toBe(firstId);
+      await vi.advanceTimersByTimeAsync(500);
+      const sent = lastWs!.send.mock.calls.map(([raw]) => JSON.parse(String(raw)) as { type: string; requestId?: string });
+      expect(sent.find((m) => m.type === 'fs.ls')?.requestId).toBe(retryId);
+
+      client.disconnect();
+      vi.useRealTimers();
+    });
+  });
 });
