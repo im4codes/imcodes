@@ -1,5 +1,7 @@
 models/*
 !models/.gitkeep
+ios-models/*
+!ios-models/.gitkeep
 android/libs/
 android/build/
 .build/
@@ -8,3 +10,7 @@ android/build/
 !models/LICENSE.sherpa.txt
 !models/LICENSE.onnxruntime.txt
 !models/hotwords.txt
+!ios-models/NOTICE.txt
+!ios-models/LICENSE.speech-swift.txt
+!ios-models/LICENSE.mlx-swift.txt
+!ios-models/hotwords.txt

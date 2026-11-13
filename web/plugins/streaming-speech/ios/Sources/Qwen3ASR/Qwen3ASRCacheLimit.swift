@@ -1,0 +1,3 @@
+import MLXCommon
+
+internal typealias Qwen3ASRCacheLimitCoordinator = MLXCacheLimitCoordinator

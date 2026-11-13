@@ -1,0 +1,9 @@
+IM.codes iOS offline streaming speech uses MLX Metal GPU inference:
+
+- MLX Swift runtime (MIT License, LICENSE.mlx-swift.txt):
+  https://github.com/ml-explore/mlx-swift (v0.33.0)
+- Qwen3-ASR Swift model implementation (Apache License 2.0, LICENSE.speech-swift.txt):
+  Adapted from https://github.com/soniqo/speech-swift
+- Quantized model weights (downloaded at build time by web/scripts/prepare-streaming-speech.mjs):
+  https://huggingface.co/aufklarer/Qwen3-ASR-0.6B-MLX-4bit
+  Revision: bc441bd1e4295c1f42d9879f056049a925b6e013

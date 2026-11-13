@@ -1,27 +1,28 @@
 # IM.codes offline streaming speech
 
-Android AudioRecord and iOS AVAudioEngine expose the same StreamingSpeech
+Android AudioRecord (`sherpa-onnx` ONNX in `models/`) and iOS AVAudioEngine (`mlx-swift` Metal GPU in `ios-models/`, iOS 17.0+) expose the same StreamingSpeech
 Capacitor events as VoiceInput/VoiceOverlay. All languages use **Qwen3-ASR-0.6B
 INT4** when this plugin is installed; only old shells without the plugin retain
 their platform recognizer. There is no cloud API/key, audio upload or language
 switching UI. Native multilingual recognition and punctuation come from Qwen3;
 no separate punctuation graph or transcript rewriting is used.
 
-Run `npm --prefix web run prepare:speech` before native sync/build. The script
-pins model revision `9012f07ac1ce43c7e9fbd3afd8cad90fe147f88e`, each graph, external
-weights, tokenizer file and the existing sherpa-onnx 2.0.1 AAR by SHA256 and size.
+Run `npm --prefix web run prepare:speech` before native sync/build (or pass `--ios` / `--android`). The script
+pins Android ONNX revision `9012f07ac1ce43c7e9fbd3afd8cad90fe147f88e` (`models/`, `sherpa-onnx-2.0.1.aar`) and
+iOS MLX revision `bc441bd1e4295c1f42d9879f056049a925b6e013` (`ios-models/` from `aufklarer/Qwen3-ASR-0.6B-MLX-4bit`) by SHA256 and size.
 Incomplete/corrupt downloads are never published. Obsolete Zipformer/punctuation
 assets are removed only after the replacement verifies; unrelated files remain.
 Binaries remain ignored, never committed. This requires a **new native build**;
 web-only OTA cannot replace installed native graphs or code.
 
-The resident recognizer uses at most two threads and a 24-token generation
-budget. New-audio cadence is 1.5s, with VAD/capacity/Stop able to flush earlier.
+The resident iOS recognizer runs Qwen3-ASR 4-bit MLX weights on Metal GPU with a 128-token
+generation budget (requiring iOS 17.0+ and a Metal GPU device); Android uses `sherpa-onnx`
+with a 24-token generation budget. New-audio cadence is 1.5s, with VAD/capacity/Stop able to flush earlier.
 Each worker turn drains the entire current inbox instead of replaying small
 queued steps. Stop waits for in-flight capture/decode and merges the remaining
 tail into at most one final decode before stopped/ACK. Each result is cumulative.
-iOS retains a bounded 4.5s overlapping window; Android commits at 3s/VAD. A drained
-backlog may extend one decode input by at most the 6.4s inbox bound. No audio
+iOS retains a bounded 6.0s overlapping window; Android commits at 3s/VAD. A drained
+backlog stays bounded by the inbox/window limits. No audio
 history grows with recording duration, and overload fails visibly.
 
 On iOS, app-owned Web playback is paused before capture, the audio session uses

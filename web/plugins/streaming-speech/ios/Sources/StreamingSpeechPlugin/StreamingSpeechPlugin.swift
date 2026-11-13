@@ -1,7 +1,9 @@
 import AVFoundation
 import Capacitor
-import SherpaOnnx
-import SherpaOnnxC
+import Metal
+import AudioCommon
+import MLXCommon
+import Qwen3ASR
 import UIKit
 
 /// The same Capacitor event contract as the existing voice input. No cloud service.
@@ -20,12 +22,13 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     private var generation: UInt64 = 0
     private var abortedOwner: UInt64 = 0
     private var eventOwner: UInt64 = 0
+    private var isAppBackgrounded = false
     // One scheduled drain, not one queued decode per 100ms microphone tap.
     private var inbox = SpeechInbox()
     private var engine: AVAudioEngine?
     private var tapInstalled = false
-    private var startingCall: CAPPluginCall? // main-thread only; ready after 100ms warmup
-    // Resident recognizer model kept across sessions on worker; stream is per-capture.
+    private var startingCall: CAPPluginCall? // main-thread only; ready after warmup
+    // Resident recognizer model kept across sessions on worker; Metal state is guarded for foreground use.
     private var recognizer: SpeechRecognizer?
     // Only accessed on worker; queued PCM drains before the stop/final barrier.
     private var decoder: SpeechDecoder?
@@ -34,6 +37,8 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
 
     public override func load() {
         NotificationCenter.default.addObserver(self, selector: #selector(interrupted(_:)), name: UIApplication.willResignActiveNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(didEnterBackground(_:)), name: UIApplication.didEnterBackgroundNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(didBecomeActive(_:)), name: UIApplication.didBecomeActiveNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(interrupted(_:)), name: AVAudioSession.interruptionNotification, object: nil)
         worker.async { [weak self] in
             guard let self = self else { return }
@@ -70,10 +75,17 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         lock.lock(); defer { lock.unlock() }
         return eventOwner == owner
     }
-    private var modelRoot: URL? { Bundle.module.resourceURL?.appendingPathComponent("models", isDirectory: true) }
+    private func canRunMetal(_ owner: UInt64) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return eventOwner == owner && !isAppBackgrounded
+    }
+    private func isMetalDeviceAvailable() -> Bool {
+        SpeechRecognizer.isMetalSupported
+    }
+    var modelRoot: URL? { Bundle.module.resourceURL?.appendingPathComponent("ios-models", isDirectory: true) }
     private var modelAvailable: Bool {
-        guard let root = modelRoot else { return false }
-        return ["conv_frontend.onnx", "encoder.int4.onnx", "encoder.int4.weights", "decoder.int4.onnx", "decoder.int4.weights", "tokenizer/vocab.json", "tokenizer/merges.txt", "tokenizer/tokenizer_config.json", "hotwords.txt"].allSatisfy {
+        guard isMetalDeviceAvailable(), let root = modelRoot else { return false }
+        return ["config.json", "model.safetensors", "vocab.json", "merges.txt", "tokenizer_config.json", "hotwords.txt"].allSatisfy {
             FileManager.default.isReadableFile(atPath: root.appendingPathComponent($0).path)
         }
     }
@@ -96,7 +108,11 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                 call.reject("Offline speech model missing"); return
             }
             let owner = self.nextOwner()
-            self.lock.lock(); self.eventOwner = owner; self.inbox = SpeechInbox(); self.lock.unlock()
+            self.lock.lock()
+            self.eventOwner = owner
+            self.isAppBackgrounded = false
+            self.inbox = SpeechInbox()
+            self.lock.unlock()
             // Enqueue decoder setup on the serial worker queue BEFORE starting AVAudioEngine
             // so any audio buffers captured while the model finishes warming up are queued
             // strictly behind this setup block and decoded in order without losing the first words.
@@ -241,11 +257,15 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                     speech: batch.speech,
                     trailingSilence: batch.trailingSilence,
                     shouldEmitNonFinal: { [weak self] in self?.isCurrent(owner) ?? false },
-                    shouldContinue: { [weak self] in self?.isEventOwner(owner) ?? false },
-                    decode: decoder.decode
+                    shouldContinue: { [weak self] in self?.canRunMetal(owner) ?? false },
+                    decode: { [weak self] samples in
+                        decoder.decode(samples: samples) { self?.canRunMetal(owner) ?? false }
+                    }
                 ) { text in
                     self.emitText(text, final: false, owner: owner)
                 }
+            } catch SpeechWindow.Failure.cancelled {
+                return
             } catch {
                 DispatchQueue.main.async {
                     if self.isCurrent(owner) {
@@ -267,10 +287,19 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     @objc private func interrupted(_ notification: Notification) {
-        if notification.name == AVAudioSession.interruptionNotification,
+        if notification.name == UIApplication.willResignActiveNotification {
+            lock.lock(); isAppBackgrounded = true; lock.unlock()
+        } else if notification.name == AVAudioSession.interruptionNotification,
            let value = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
            value != AVAudioSession.InterruptionType.began.rawValue { return }
         DispatchQueue.main.async { self.endCapture(nil) }
+    }
+    @objc private func didEnterBackground(_ notification: Notification) {
+        lock.lock(); isAppBackgrounded = true; lock.unlock()
+        DispatchQueue.main.async { self.endCapture(nil) }
+    }
+    @objc private func didBecomeActive(_ notification: Notification) {
+        lock.lock(); isAppBackgrounded = false; lock.unlock()
     }
     @objc public func stop(_ call: CAPPluginCall) { DispatchQueue.main.async { self.endCapture(call) } }
     // Main-thread capture teardown; serial decoder flush precedes stopped and ACK.
@@ -287,7 +316,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         worker.async {
             let owner = self.decoderOwner
-            if let decoder = self.decoder, self.isEventOwner(owner) {
+            if let decoder = self.decoder, self.canRunMetal(owner) {
                 do {
                     if let tail = tail {
                         try self.window.append(
@@ -295,13 +324,23 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                             speech: tail.speech,
                             trailingSilence: tail.trailingSilence,
                             final: true,
-                            shouldContinue: { [weak self] in self?.isEventOwner(owner) ?? false },
-                            decode: decoder.decode
+                            shouldContinue: { [weak self] in self?.canRunMetal(owner) ?? false },
+                            decode: { [weak self] samples in
+                                decoder.decode(samples: samples) { self?.canRunMetal(owner) ?? false }
+                            }
                         ) { _ in }
                     }
-                    if self.isEventOwner(owner) {
-                        let text = try self.window.finish(decode: decoder.decode)
+                    if self.canRunMetal(owner) {
+                        let text = try self.window.finish(shouldContinue: { [weak self] in self?.canRunMetal(owner) ?? false }) { samples in
+                            decoder.decode(samples: samples) { [weak self] in self?.canRunMetal(owner) ?? false }
+                        }
                         self.emitText(text, final: true, owner: owner)
+                    } else if self.isEventOwner(owner) {
+                        self.emitText(self.window.text, final: true, owner: owner)
+                    }
+                } catch SpeechWindow.Failure.cancelled {
+                    if self.isEventOwner(owner) {
+                        self.emitText(self.window.text, final: true, owner: owner)
                     }
                 } catch {
                     // Preserve the last successful hypothesis on a visible error;
@@ -312,6 +351,8 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                         if current { self.notifyListeners("recognitionError", data: ["message": "Offline speech final decoding failed"]) }
                     }
                 }
+            } else if self.decoder != nil && self.isEventOwner(owner) {
+                self.emitText(self.window.text, final: true, owner: owner)
             }
             self.window = SpeechWindow()
             self.decoder = nil
@@ -324,53 +365,47 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 }
 
-// Resident Qwen3 recognizer. Each partial/final uses a fresh bounded offline stream;
-// all access stays on the plugin's serial worker, including destruction.
-private final class SpeechRecognizer {
-    let pointer: OpaquePointer
-    init?(root: URL) {
-        let hotwords = ((try? String(contentsOf: root.appendingPathComponent("hotwords.txt"), encoding: .utf8)) ?? "")
-            .split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }.joined(separator: ",")
-        // Own dynamic C strings until the native constructor has consumed config.
-        let values = ["conv_frontend.onnx", "encoder.int4.onnx", "decoder.int4.onnx", "tokenizer"].map { root.appendingPathComponent($0).path } + [hotwords]
-        let strings = values.map { strdup($0) }
-        defer { strings.forEach { free($0) } }
-        guard strings.allSatisfy({ $0 != nil }) else { return nil }
-        var qwen = sherpaOnnxOfflineQwen3ASRModelConfig(maxTotalLen: 768, maxNewTokens: 24, temperature: 1e-6, topP: 0.8, seed: 42)
-        qwen.conv_frontend = UnsafePointer(strings[0]!)
-        qwen.encoder = UnsafePointer(strings[1]!)
-        qwen.decoder = UnsafePointer(strings[2]!)
-        qwen.tokenizer = UnsafePointer(strings[3]!)
-        qwen.hotwords = UnsafePointer(strings[4]!)
-        // CoreML delegates supported operators to Apple hardware; ORT keeps CPU
-        // kernels for the rest. Retry CPU if the accelerated session cannot load.
-        for provider in ["coreml", "cpu"] {
-            let model = sherpaOnnxOfflineModelConfig(tokens: "", numThreads: 4, provider: provider, qwen3Asr: qwen)
-            var config = sherpaOnnxOfflineRecognizerConfig(featConfig: sherpaOnnxFeatureConfig(), modelConfig: model)
-            if let pointer = SherpaOnnxCreateOfflineRecognizer(&config) {
-                self.pointer = pointer
-                return
-            }
-        }
-        return nil
+// Resident MLX Metal GPU Qwen3-ASR recognizer; all decode calls stay on the
+// plugin's serial worker and remain guarded against background Metal submission.
+final class SpeechRecognizer {
+    static var isMetalSupported: Bool {
+        #if targetEnvironment(simulator)
+        return false
+        #else
+        return MTLCreateSystemDefaultDevice() != nil
+        #endif
     }
-    deinit { SherpaOnnxDestroyOfflineRecognizer(pointer) }
+    let model: Qwen3ASRModel
+    let hotwords: String?
+    init?(root: URL) {
+        guard Self.isMetalSupported else { return nil }
+        let words = ((try? String(contentsOf: root.appendingPathComponent("hotwords.txt"), encoding: .utf8)) ?? "")
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        self.hotwords = words.isEmpty ? nil : words.joined(separator: ", ")
+        guard let loaded = try? Qwen3ASRModel.loadLocal(from: root) else { return nil }
+        self.model = loaded
+    }
 }
 
-private final class SpeechDecoder {
+final class SpeechDecoder {
     let recognizer: SpeechRecognizer
     init?(recognizer: SpeechRecognizer) { self.recognizer = recognizer }
-    func decode(samples: [Float]) -> String? {
+    func decode(samples: [Float], shouldContinue: () -> Bool = { true }) -> String? {
         if samples.isEmpty { return "" }
-        guard let stream = SherpaOnnxCreateOfflineStream(recognizer.pointer) else { return nil }
-        defer { SherpaOnnxDestroyOfflineStream(stream) }
-        SherpaOnnxAcceptWaveformOffline(stream, 16000, samples, Int32(samples.count))
-        SherpaOnnxDecodeOfflineStream(recognizer.pointer, stream)
-        guard let result = SherpaOnnxGetOfflineStreamResult(stream) else { return nil }
-        defer { SherpaOnnxDestroyOfflineRecognizerResult(result) }
-        guard let text = result.pointee.text else { return "" }
-        return String(cString: text).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard shouldContinue() else { return nil }
+        let options = Qwen3DecodingOptions(maxTokens: 128, language: nil, context: recognizer.hotwords)
+        do {
+            let text = try recognizer.model.transcribeWithCancellation(audio: samples, sampleRate: 16000, options: options) {
+                if !shouldContinue() { throw CancellationError() }
+            }
+            return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        } catch is CancellationError {
+            return nil
+        } catch {
+            return nil
+        }
     }
 }
 
@@ -382,13 +417,13 @@ private final class SpeechDecoder {
 struct SpeechWindow {
     static let sampleRate = 16000
     static let stride = sampleRate * 3 / 2 // 1.5s of NEW audio per partial decode
-    static let capacity = 3 * stride
+    static let capacity = 4 * stride // 6.0s bounded Metal GPU window (measured RTF=0.187, stepMax=369ms, CER=0.030)
     static let overlap = stride
     static let finalSilencePadding = sampleRate * 2 / 10 // 200ms (3200 zero samples) flushed once at final boundary
     static let rollbackCharacters = 5
     static let punctuationPause = sampleRate * 4 / 10
     static let vadPause = sampleRate * 7 / 10
-    enum Failure: Error { case decode }
+    enum Failure: Error { case decode, cancelled }
 
     private(set) var samples: [Float] = []
     private(set) var committed = ""
@@ -424,7 +459,7 @@ struct SpeechWindow {
             samples.append(contentsOf: chunk)
             newSamples += chunk.count
             silentSamples = speech ? (remaining.isEmpty ? trailingSilence : 0) : silentSamples + chunk.count
-            try evaluate(decode)
+            try evaluate(decode, shouldContinue: shouldContinue)
             let pause = Self.endsSentence(partial) ? Self.punctuationPause : Self.vadPause
             if silentSamples >= pause { commitSentence() }
             else { rollWindow() }
@@ -442,27 +477,30 @@ struct SpeechWindow {
         let pause = Self.endsSentence(partial) ? Self.punctuationPause : Self.vadPause
         let endpoint = silentSamples >= pause
         if endpoint || newSamples >= Self.stride || samples.count >= Self.capacity {
-            try evaluate(decode)
+            try evaluate(decode, shouldContinue: shouldContinue)
             if endpoint { commitSentence() }
             else if samples.count >= Self.capacity { rollWindow() }
             if text != lastEmitted { lastEmitted = text; emit(text) }
         }
     }
 
-    mutating func finish(decode: ([Float]) -> String?) throws -> String {
+    mutating func finish(shouldContinue: () -> Bool = { true }, decode: ([Float]) -> String?) throws -> String {
         // Accepted PCM drains on the serial worker before this call. A sub-stride
         // tail must be decoded with a single 200ms (3200-sample) trailing silence
         // flush; overlap-only audio must NOT be decoded twice.
         if newSamples > 0 {
             let padded = samples + Array(repeating: Float(0), count: Self.finalSilencePadding)
-            try evaluate({ _ in decode(padded) })
+            try evaluate({ _ in decode(padded) }, shouldContinue: shouldContinue)
         }
         commitSentence()
         return text
     }
 
-    private mutating func evaluate(_ decode: ([Float]) -> String?) throws {
-        guard let decoded = decode(samples) else { throw Failure.decode }
+    private mutating func evaluate(_ decode: ([Float]) -> String?, shouldContinue: () -> Bool = { true }) throws {
+        guard shouldContinue() else { throw Failure.cancelled }
+        guard let decoded = decode(samples) else {
+            throw shouldContinue() ? Failure.decode : Failure.cancelled
+        }
         let next = decoded.trimmingCharacters(in: .whitespacesAndNewlines)
         previousHypothesis = hypothesis
         hypothesis = next
@@ -473,24 +511,26 @@ struct SpeechWindow {
             // Empty anchor is NOT a new segment: retired PCM may still own the
             // entire <=5 Character tail. Reconcile against the frozen roll seam,
             // not the last partial (which also contains this window's new words).
-            let size: Int
+            let rawSize: Int?
             if let overlapText = overlapText, !overlapText.isEmpty, next.hasPrefix(overlapText) {
-                size = overlapText.count
+                rawSize = overlapText.count
             } else if let hint = overlapHint, !hint.isEmpty, next.hasPrefix(hint) {
-                size = hint.count
+                rawSize = hint.count
             } else {
-                size = Self.overlapCount(anchor + seamTail, next)
+                let exact = Self.overlapCount(anchor + seamTail, next)
+                rawSize = exact > 0 ? exact : nil
             }
-            matched = size
-            if size > seamTail.count {
-                // The shared acoustic text extends into the committed prefix.
-                partial = String(next.dropFirst(size - seamTail.count))
-            } else if size > 0 {
-                // Preserve text whose audio has retired, even if no characters
-                // could be committed at the preceding roll. The seam may be one
-                // CJK Character or a cut inside an ASCII word: concatenate exact
-                // slices, do not insert/trim a synthetic boundary space.
-                partial = String(seamTail.dropLast(size)) + next
+            if let size = rawSize {
+                matched = size
+                if size > seamTail.count {
+                    // The shared acoustic text extends into the committed prefix.
+                    partial = String(next.dropFirst(size - seamTail.count))
+                } else {
+                    partial = String(seamTail.dropLast(size)) + next
+                }
+            } else if let aligned = Self.normalizedOverlap(anchor: anchor, seamTail: seamTail, next: next) {
+                matched = aligned.matchedRawInNext
+                partial = aligned.reconciledPartial
             } else {
                 // Uncertain model revisions: preserve the frozen unfixed tail.
                 // This can repeat a seam, but cannot recursively re-append new
@@ -562,6 +602,54 @@ struct SpeechWindow {
     private static func endsSentence(_ text: String) -> Bool {
         guard let last = text.last else { return false }
         return "，、；,;.。！？!?".contains(last)
+    }
+
+    private static func isOverlapIgnorable(_ c: Character) -> Bool {
+        c.unicodeScalars.allSatisfy {
+            CharacterSet.punctuationCharacters.contains($0)
+                || CharacterSet.whitespacesAndNewlines.contains($0)
+                || CharacterSet.symbols.contains($0)
+        }
+    }
+
+    private static func normalizedOverlap(anchor: String, seamTail: String, next: String) -> (reconciledPartial: String, matchedRawInNext: Int)? {
+        let lhsChars = Array((anchor + seamTail).suffix(64 + rollbackCharacters))
+        let seamChars = Array(seamTail)
+        let rhsChars = Array(next.prefix(64 + rollbackCharacters))
+        let lhsNorm = lhsChars.filter { !isOverlapIgnorable($0) }.map { $0.lowercased() }
+        let seamNormCount = seamChars.filter { !isOverlapIgnorable($0) }.count
+        var rhsNorm: [String] = []
+        var rhsRawEndForNormLen: [Int] = [0]
+        for (idx, ch) in rhsChars.enumerated() {
+            if !isOverlapIgnorable(ch) {
+                rhsNorm.append(ch.lowercased())
+                rhsRawEndForNormLen.append(idx + 1)
+            }
+        }
+        let maxNorm = min(lhsNorm.count, rhsNorm.count)
+        guard maxNorm >= 2 else { return nil }
+        for len in Swift.stride(from: maxNorm, through: 2, by: -1) {
+            if lhsNorm.suffix(len).elementsEqual(rhsNorm.prefix(len)) {
+                let nextChars = Array(next)
+                let matchedRaw = rhsRawEndForNormLen[len]
+                if len > seamNormCount {
+                    let dropNorm = len - seamNormCount
+                    let dropRaw = rhsRawEndForNormLen[dropNorm]
+                    return (String(nextChars.dropFirst(dropRaw)), matchedRaw)
+                }
+                // Drop trailing `len` non-ignorable chars (and trailing punctuation on them) from seamTail.
+                var remainingNorm = len
+                var keepEnd = seamChars.count
+                while keepEnd > 0 && remainingNorm > 0 {
+                    keepEnd -= 1
+                    if !isOverlapIgnorable(seamChars[keepEnd]) {
+                        remainingNorm -= 1
+                    }
+                }
+                return (String(seamChars.prefix(keepEnd)) + next, matchedRaw)
+            }
+        }
+        return nil
     }
 
     private static func overlapCount(_ previous: String, _ next: String) -> Int {
