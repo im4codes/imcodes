@@ -5263,6 +5263,11 @@
       "my_docs": "我的雲端文件",
       "shared": "與我共用"
     },
+    "tabs_compact": {
+      "recent": "最近",
+      "my_docs": "我的",
+      "shared": "共用"
+    },
     "search_placeholder": "搜尋文件...",
     "root_folder": "根目錄",
     "folder_label": "資料夾",

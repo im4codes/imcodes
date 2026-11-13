@@ -5263,6 +5263,11 @@
       "my_docs": "Mis documentos",
       "shared": "Compartidos"
     },
+    "tabs_compact": {
+      "recent": "Rec.",
+      "my_docs": "Míos",
+      "shared": "Comp."
+    },
     "search_placeholder": "Buscar documentos...",
     "root_folder": "Raíz",
     "folder_label": "Carpeta",

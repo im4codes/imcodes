@@ -5262,6 +5262,11 @@
       "my_docs": "マイクラウド文書",
       "shared": "共有された項目"
     },
+    "tabs_compact": {
+      "recent": "最近",
+      "my_docs": "文書",
+      "shared": "共有"
+    },
     "search_placeholder": "文書を検索...",
     "root_folder": "ルート",
     "folder_label": "フォルダ",

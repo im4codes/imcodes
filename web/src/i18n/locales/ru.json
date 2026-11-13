@@ -5262,6 +5262,11 @@
       "my_docs": "Мои документы",
       "shared": "Общие со мной"
     },
+    "tabs_compact": {
+      "recent": "Нед.",
+      "my_docs": "Мои",
+      "shared": "Общ."
+    },
     "search_placeholder": "Поиск документов...",
     "root_folder": "Корень",
     "folder_label": "Папка",

@@ -1581,4 +1581,102 @@ describe('CloudDocsPanel', () => {
     expect(mobileCss).toContain('.cloud-docs-preview-title-input {');
     expect(mobileCss).toContain('border-bottom: 1px dashed rgba(148, 163, 184, 0.85);');
   });
+
+  it('merges main list header into a single compact row on <= 600px with collapsible mobile search while keeping desktop unchanged', async () => {
+    const budgetDoc = makeDoc({ id: 'doc-budget', name: 'Budget_2026.docx', updatedAt: 1_700_000_200_000 });
+    const notesDoc = makeDoc({ id: 'doc-notes', name: 'Notes.docx', updatedAt: 1_700_000_100_000 });
+    listCloudDocsApiMock.mockResolvedValue({
+      folders: [],
+      docs: [budgetDoc, notesDoc],
+      sharedFolders: [],
+      sharedDocs: [],
+    });
+
+    render(<CloudDocsPanel initialTab="my_docs" />);
+    await waitFor(() => expect(screen.getByTestId('cloud-doc-row-doc-budget')).toBeTruthy());
+
+    const header = screen.getByTestId('cloud-docs-header');
+    const recentTab = screen.getByTestId('cloud-docs-tab-recent');
+    const myDocsTab = screen.getByTestId('cloud-docs-tab-my-docs');
+    const sharedTab = screen.getByTestId('cloud-docs-tab-shared');
+    const searchPill = screen.getByTestId('cloud-docs-search-pill');
+    const searchToggle = screen.getByTestId('cloud-docs-search-toggle');
+    const searchInput = screen.getByTestId('cloud-docs-search') as HTMLInputElement;
+    const typeFilter = screen.getByTestId('cloud-docs-type-filter') as HTMLSelectElement;
+    const sortSelect = screen.getByTestId('cloud-docs-sort-select') as HTMLSelectElement;
+
+    expect(recentTab.querySelector('.cloud-docs-tab-label-desktop')?.textContent).toBe('Recent');
+    expect(myDocsTab.querySelector('.cloud-docs-tab-label-desktop')?.textContent).toBe('Cloud Docs');
+    expect(myDocsTab.querySelector('.cloud-docs-tab-label-compact')?.textContent).toBe('Docs');
+    expect(sharedTab.querySelector('.cloud-docs-tab-desktop')).toBeNull();
+    expect(sharedTab.querySelector('.cloud-docs-tab-label-desktop')?.textContent).toBe('Shared');
+    expect(screen.getByTestId('cloud-docs-view-list')).toBeTruthy();
+    expect(screen.getByTestId('cloud-docs-view-grid')).toBeTruthy();
+    expect(screen.getByTestId('cloud-docs-refresh')).toBeTruthy();
+    expect(typeFilter).toBeTruthy();
+    expect(sortSelect).toBeTruthy();
+
+    expect(header.classList.contains('is-mobile-search-open')).toBe(false);
+    expect(searchToggle.getAttribute('aria-expanded')).toBe('false');
+    expect(screen.queryByTestId('cloud-docs-search-collapse')).toBeNull();
+
+    // Tap mobile search trigger: expands inline search overlay and focuses input
+    fireEvent.click(searchToggle);
+    expect(header.classList.contains('is-mobile-search-open')).toBe(true);
+    expect(searchPill.classList.contains('is-mobile-open')).toBe(true);
+    expect(searchToggle.getAttribute('aria-expanded')).toBe('true');
+    expect(document.activeElement).toBe(searchInput);
+
+    // Search filters docs live; clear button clears text while keeping search open & focused
+    fireEvent.input(searchInput, { target: { value: 'Budget' } });
+    expect(screen.getByTestId('cloud-doc-row-doc-budget')).toBeTruthy();
+    expect(screen.queryByTestId('cloud-doc-row-doc-notes')).toBeNull();
+
+    const clearBtn = screen.getByTestId('cloud-docs-search-clear');
+    fireEvent.click(clearBtn);
+    expect(searchInput.value).toBe('');
+    expect(document.activeElement).toBe(searchInput);
+    expect(screen.getByTestId('cloud-doc-row-doc-notes')).toBeTruthy();
+
+    // Typing then collapsing preserves active search filter and marks toggle active
+    fireEvent.input(searchInput, { target: { value: 'Budget' } });
+    fireEvent.click(screen.getByTestId('cloud-docs-search-collapse'));
+    expect(header.classList.contains('is-mobile-search-open')).toBe(false);
+    expect(searchPill.classList.contains('has-search-value')).toBe(true);
+    expect(searchToggle.classList.contains('has-value')).toBe(true);
+    expect(screen.getByTestId('cloud-doc-row-doc-budget')).toBeTruthy();
+    expect(screen.queryByTestId('cloud-doc-row-doc-notes')).toBeNull();
+
+    // Reopen and verify Escape collapses cleanly without bubbling out
+    fireEvent.click(searchToggle);
+    expect(header.classList.contains('is-mobile-search-open')).toBe(true);
+    fireEvent.keyDown(searchInput, { key: 'Escape' });
+    expect(header.classList.contains('is-mobile-search-open')).toBe(false);
+    expect(searchInput.value).toBe('Budget');
+
+    // Verify CSS boundaries: desktop base untouched, @media (max-width: 480px) no longer stacks header-right,
+    // and single-row compact header rules live strictly inside @media (max-width: 600px).
+    const testDir = dirname(fileURLToPath(import.meta.url));
+    const css = readFileSync(resolve(testDir, '../../src/styles.css'), 'utf8');
+    const media480Idx = css.indexOf('@media (max-width: 480px)');
+    const media600Idx = css.indexOf('@media (max-width: 600px)');
+    expect(media480Idx).toBeGreaterThan(-1);
+    expect(media600Idx).toBeGreaterThan(media480Idx);
+
+    const desktopCss = css.slice(0, media480Idx);
+    const media480Block = css.slice(media480Idx, media600Idx);
+    const mobile600Css = css.slice(media600Idx);
+
+    expect(desktopCss).toContain('.cloud-docs-header {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 10px;\n  flex-wrap: wrap;');
+    expect(desktopCss).toContain('.cloud-docs-tab-label-compact,\n.cloud-docs-search-toggle,\n.cloud-docs-search-collapse {\n  display: none;\n}');
+    expect(media480Block).not.toContain('.cloud-docs-header-right');
+    expect(media480Block).not.toContain('.cloud-docs-search-pill');
+
+    expect(mobile600Css).toContain('.cloud-docs-header {\n    padding: 4px 8px;\n    gap: 4px;\n    min-height: 36px;\n    flex-wrap: nowrap;');
+    expect(mobile600Css).toContain('overflow-x: auto;\n    scrollbar-width: none;');
+    expect(mobile600Css).toContain('.cloud-docs-panel:not(.is-standalone) .cloud-docs-brand-mark {\n    display: none;\n  }');
+    expect(mobile600Css).toContain('.cloud-docs-panel.is-standalone .cloud-docs-brand-title {\n    display: none;\n  }');
+    expect(mobile600Css).toContain('.cloud-docs-header.is-mobile-search-open .cloud-docs-header-brand');
+    expect(mobile600Css).toContain('.cloud-docs-header .cloud-docs-select {\n    height: 26px;');
+  });
 });

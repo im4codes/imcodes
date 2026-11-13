@@ -5273,6 +5273,11 @@
       "my_docs": "我的云文档",
       "shared": "与我共享"
     },
+    "tabs_compact": {
+      "recent": "最近",
+      "my_docs": "我的",
+      "shared": "共享"
+    },
     "search_placeholder": "搜索文档...",
     "root_folder": "根目录",
     "folder_label": "文件夹",

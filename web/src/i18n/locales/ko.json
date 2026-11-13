@@ -5262,6 +5262,11 @@
       "my_docs": "내 클라우드 문서",
       "shared": "공유됨"
     },
+    "tabs_compact": {
+      "recent": "최근",
+      "my_docs": "문서",
+      "shared": "공유"
+    },
     "search_placeholder": "문서 검색...",
     "root_folder": "루트",
     "folder_label": "폴더",

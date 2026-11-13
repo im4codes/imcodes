@@ -415,6 +415,7 @@ export function CloudDocsPanel({
   const [sortBy, setSortBy] = useState<CloudDocsSortBy>('updated');
   const [typeFilter, setTypeFilter] = useState<CloudDocsTypeFilter>('all');
   const [search, setSearch] = useState('');
+  const [mobileSearchOpen, setMobileSearchOpen] = useState(false);
   const [currentFolderId, setCurrentFolderId] = useState<string | null>(initialFolderId);
 
   const [folders, setFolders] = useState<CloudDocFolder[]>([]);
@@ -473,6 +474,7 @@ export function CloudDocsPanel({
   const shareAbortRef = useRef<AbortController | null>(null);
   const shareTargetRef = useRef<{ kind: CloudDocShareTargetKind; id: string; name: string } | null>(null);
   const previewTitleInputRef = useRef<HTMLInputElement | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
   const previewTitleCancelledRef = useRef(false);
   const savedStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const editGenCounterRef = useRef(0);
@@ -513,6 +515,12 @@ export function CloudDocsPanel({
     }
   }, [standalone]);
 
+  useEffect(() => {
+    if (mobileSearchOpen) {
+      searchInputRef.current?.focus();
+    }
+  }, [mobileSearchOpen]);
+
   // Invalidates any pre-mutation list read so stale GET responses/errors cannot roll back newer projections.
   const invalidatePendingRefresh = useCallback(() => {
     loadSeqRef.current += 1;
@@ -542,6 +550,7 @@ export function CloudDocsPanel({
     const nextPreviewSeq = activePreviewRef.current.previewSeq + 1;
     previewTitleCancelledRef.current = false;
     setContextMenu(null);
+    setMobileSearchOpen(false);
     setPreviewTarget(target);
     if (!target) {
       activePreviewRef.current = {
@@ -2060,7 +2069,10 @@ export function CloudDocsPanel({
 
   return (
     <div class={`cloud-docs-panel${standalone ? ' is-standalone' : ''}`} data-testid="cloud-docs-panel">
-      <div class="cloud-docs-header">
+      <div
+        class={`cloud-docs-header${mobileSearchOpen ? ' is-mobile-search-open' : ''}`}
+        data-testid="cloud-docs-header"
+      >
         <div class="cloud-docs-header-brand">
           <div class="cloud-docs-brand-mark">
             <CloudDocsGlyphIcon size={20} />
@@ -2071,31 +2083,40 @@ export function CloudDocsPanel({
               type="button"
               role="tab"
               aria-selected={activeTab === 'recent'}
+              aria-label={t('cloud_docs.tabs.recent', 'Recent')}
+              title={t('cloud_docs.tabs.recent', 'Recent')}
               data-testid="cloud-docs-tab-recent"
               class={`cloud-docs-tab${activeTab === 'recent' ? ' is-active' : ''}`}
               onClick={() => { setContextMenu(null); setActiveTab('recent'); }}
             >
-              {t('cloud_docs.tabs.recent', 'Recent')}
+              <span class="cloud-docs-tab-label-desktop">{t('cloud_docs.tabs.recent', 'Recent')}</span>
+              <span class="cloud-docs-tab-label-compact" aria-hidden="true">{t('cloud_docs.tabs_compact.recent', 'Recent')}</span>
             </button>
             <button
               type="button"
               role="tab"
               aria-selected={activeTab === 'my_docs'}
+              aria-label={t('cloud_docs.tabs.my_docs', 'Cloud Docs')}
+              title={t('cloud_docs.tabs.my_docs', 'Cloud Docs')}
               data-testid="cloud-docs-tab-my-docs"
               class={`cloud-docs-tab${activeTab === 'my_docs' ? ' is-active' : ''}`}
               onClick={() => { setContextMenu(null); setActiveTab('my_docs'); }}
             >
-              {t('cloud_docs.tabs.my_docs', 'Cloud Docs')}
+              <span class="cloud-docs-tab-label-desktop">{t('cloud_docs.tabs.my_docs', 'Cloud Docs')}</span>
+              <span class="cloud-docs-tab-label-compact" aria-hidden="true">{t('cloud_docs.tabs_compact.my_docs', 'Docs')}</span>
             </button>
             <button
               type="button"
               role="tab"
               aria-selected={activeTab === 'shared'}
+              aria-label={t('cloud_docs.tabs.shared', 'Shared')}
+              title={t('cloud_docs.tabs.shared', 'Shared')}
               data-testid="cloud-docs-tab-shared"
               class={`cloud-docs-tab${activeTab === 'shared' ? ' is-active' : ''}`}
               onClick={() => { setContextMenu(null); setActiveTab('shared'); }}
             >
-              {t('cloud_docs.tabs.shared', 'Shared')}
+              <span class="cloud-docs-tab-label-desktop">{t('cloud_docs.tabs.shared', 'Shared')}</span>
+              <span class="cloud-docs-tab-label-compact" aria-hidden="true">{t('cloud_docs.tabs_compact.shared', 'Shared')}</span>
               {(sharedFolders.length + sharedDocs.length) > 0 && (
                 <span class="cloud-docs-tab-count">{sharedFolders.length + sharedDocs.length}</span>
               )}
@@ -2104,21 +2125,58 @@ export function CloudDocsPanel({
         </div>
 
         <div class="cloud-docs-header-right">
-          <div class="cloud-docs-search-pill">
-            <span class="cloud-docs-search-icon"><SearchIcon /></span>
+          <div
+            class={`cloud-docs-search-pill${mobileSearchOpen ? ' is-mobile-open' : ''}${search ? ' has-search-value' : ''}`}
+            data-testid="cloud-docs-search-pill"
+          >
+            <button
+              type="button"
+              class={`cloud-docs-search-toggle${search ? ' has-value' : ''}`}
+              data-testid="cloud-docs-search-toggle"
+              aria-label={t('cloud_docs.search_placeholder', 'Search documents...')}
+              aria-expanded={mobileSearchOpen}
+              title={search ? `${t('cloud_docs.search_placeholder', 'Search documents...')}: ${search}` : t('cloud_docs.search_placeholder', 'Search documents...')}
+              onClick={() => setMobileSearchOpen(true)}
+            >
+              <SearchIcon />
+            </button>
+            {mobileSearchOpen && (
+              <button
+                type="button"
+                class="cloud-docs-search-collapse"
+                data-testid="cloud-docs-search-collapse"
+                aria-label={t('cloud_docs.actions.back_to_list', 'Back')}
+                title={t('cloud_docs.actions.back_to_list', 'Back')}
+                onClick={() => setMobileSearchOpen(false)}
+              >
+                <BackArrowIcon />
+              </button>
+            )}
+            <span class="cloud-docs-search-icon" aria-hidden="true"><SearchIcon /></span>
             <input
+              ref={searchInputRef}
               type="search"
               class="cloud-docs-search"
               data-testid="cloud-docs-search"
               placeholder={t('cloud_docs.search_placeholder', 'Search documents...')}
               value={search}
               onInput={(e) => setSearch((e.currentTarget as HTMLInputElement).value)}
+              onKeyDown={(e) => {
+                if (mobileSearchOpen && (e.key === 'Escape' || e.key === 'Enter')) {
+                  e.stopPropagation();
+                  setMobileSearchOpen(false);
+                }
+              }}
             />
             {search && (
               <button
                 type="button"
                 class="cloud-docs-search-clear"
-                onClick={() => setSearch('')}
+                data-testid="cloud-docs-search-clear"
+                onClick={() => {
+                  setSearch('');
+                  if (mobileSearchOpen) searchInputRef.current?.focus();
+                }}
                 aria-label={t('cloud_docs.actions.clear_search', 'Clear search')}
               >
                 <CloseIcon size={12} />

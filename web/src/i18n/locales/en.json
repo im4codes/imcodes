@@ -5273,6 +5273,11 @@
       "my_docs": "My Cloud Docs",
       "shared": "Shared with me"
     },
+    "tabs_compact": {
+      "recent": "Recent",
+      "my_docs": "Docs",
+      "shared": "Shared"
+    },
     "search_placeholder": "Search documents...",
     "root_folder": "Root",
     "folder_label": "Folder",
