@@ -31,6 +31,11 @@ export function ServerSwitchWatermark({
   exitMs = SERVER_SWITCH_WATERMARK_EXIT_MS,
 }: ServerSwitchWatermarkProps) {
   const [exiting, setExiting] = useState(false);
+  const [trackedTriggerKey, setTrackedTriggerKey] = useState(triggerKey);
+  if (trackedTriggerKey !== triggerKey) {
+    setTrackedTriggerKey(triggerKey);
+    if (exiting) setExiting(false);
+  }
 
   useEffect(() => {
     if (!visible) {
