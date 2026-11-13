@@ -4,7 +4,7 @@ import { Hono } from 'hono';
 import type { Context } from 'hono';
 import type { Env } from '../env.js';
 import { authFailureResponse, resolveAuthOutcome } from '../security/authorization.js';
-import { sha256Hex, signJwt, verifyJwt } from '../security/crypto.js';
+import { randomHex, sha256Hex, signJwt, verifyJwt } from '../security/crypto.js';
 import { resolveUserByIdentifier } from '../db/user-lookup.js';
 import { WsBridge } from '../ws/bridge.js';
 import { resolveMachineOperationalUser } from '../share/shared-machine-authority.js';
@@ -21,10 +21,23 @@ import {
   extractCloudDocContent,
 } from '../services/cloud-doc-content.js';
 import {
+  OnlyOfficeServiceError,
+  convertViaOnlyOfficeConverter,
+  createDbDocBuilderScriptStore,
+  executeOnlyOfficeDocBuilder,
+  verifyDocBuilderScriptToken,
+} from '../services/onlyoffice-docbuilder.js';
+import {
+  PayloadTooLargeError,
+  readResponseBytesBounded,
+  readStreamBytesBounded,
+} from '../util/bounded-stream.js';
+import {
   type CloudDocStorage,
   buildCloudDocStorageKey,
 } from '../storage/cloud-doc-storage.js';
 import {
+  type CloudDocRow,
   commitCloudDocContent,
   createCloudDocFolder,
   deleteCloudDocFolderTree,
@@ -55,15 +68,24 @@ import {
   upsertRecentDocument,
 } from '../db/cloud-docs.js';
 import {
-  CLOUD_DOC_CONTENT_MAX_CHARS,
-  CLOUD_DOC_EDIT_MODES,
   CLOUD_DOCS_MAX_UPLOAD_BYTES,
+  CLOUD_DOCS_ONLYOFFICE_FILE_PATH,
   CLOUD_DOCS_RECENT_DEFAULT_LIMIT,
+  CLOUD_DOC_CONTENT_MAX_CHARS,
+  CLOUD_DOC_CONVERT_MAX_TIMEOUT_MS,
+  CLOUD_DOC_DOCBUILDER_MAX_ARGUMENT_BYTES,
+  CLOUD_DOC_DOCBUILDER_MAX_SCRIPT_BYTES,
+  CLOUD_DOC_DOCBUILDER_MAX_TIMEOUT_MS,
+  CLOUD_DOC_EDIT_MODES,
+  CLOUD_DOC_ERROR_CODES,
   type CloudDocEditMode,
   type RecentDocumentAccessReason,
   type RecentDocumentItem,
+  getCloudDocExt,
   getCloudDocMeta,
+  isConvertTargetType,
   isCreateCloudDocType,
+  isDocBuilderOutputType,
   normalizeCloudDocFolderName,
   normalizeCloudDocName,
   normalizeRecentFilePath,
@@ -184,65 +206,6 @@ export function verifyCloudDocDownloadTicket(
   };
 }
 
-class PayloadTooLargeError extends Error {
-  constructor() {
-    super(FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE);
-    this.name = 'PayloadTooLargeError';
-  }
-}
-
-async function readStreamBytesBounded(
-  stream: ReadableStream<Uint8Array>,
-  maxBytes: number,
-  onExceed?: () => void,
-): Promise<Buffer> {
-  const reader = stream.getReader();
-  const chunks: Buffer[] = [];
-  let total = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (!value || value.byteLength === 0) continue;
-      total += value.byteLength;
-      if (total > maxBytes) {
-        onExceed?.();
-        await reader.cancel('payload_too_large').catch(() => {});
-        throw new PayloadTooLargeError();
-      }
-      chunks.push(Buffer.from(value));
-    }
-    return Buffer.concat(chunks, total);
-  } finally {
-    reader.releaseLock();
-  }
-}
-
-async function readResponseBytesBounded(
-  res: Response,
-  maxBytes: number,
-  controller?: AbortController,
-): Promise<Buffer> {
-  const contentLengthHeader = res.headers.get('content-length');
-  if (contentLengthHeader) {
-    const declaredLength = Number(contentLengthHeader);
-    if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
-      controller?.abort('payload_too_large');
-      await res.body?.cancel?.('payload_too_large').catch(() => {});
-      throw new PayloadTooLargeError();
-    }
-  }
-  if (res.body) {
-    return readStreamBytesBounded(res.body, maxBytes, () => controller?.abort('payload_too_large'));
-  }
-  const arrayBuf = await res.arrayBuffer();
-  const buf = Buffer.from(arrayBuf);
-  if (buf.length > maxBytes) {
-    throw new PayloadTooLargeError();
-  }
-  return buf;
-}
-
 const cloudDocCommitLocks = new Map<string, Promise<void>>();
 async function lockCloudDocCommit<T>(docId: string, fn: () => Promise<T>): Promise<T> {
   const prev = cloudDocCommitLocks.get(docId) ?? Promise.resolve();
@@ -258,6 +221,270 @@ async function lockCloudDocCommit<T>(docId: string, fn: () => Promise<T>): Promi
       cloudDocCommitLocks.delete(docId);
     }
   }
+}
+
+function onlyOfficeErrorResponse(c: RouteContext, err: OnlyOfficeServiceError): Response {
+  return c.json(
+    {
+      error: err.code,
+      message: err.message,
+      ...(err.onlyofficeErrorCode !== undefined ? { onlyofficeErrorCode: err.onlyofficeErrorCode } : {}),
+    },
+    err.statusCode,
+  );
+}
+
+function validatePersistedOutputExt(
+  c: RouteContext,
+  actualOutputName: string,
+  expectedExt: string,
+): Response | null {
+  if (getCloudDocExt(actualOutputName) !== expectedExt) {
+    return c.json(
+      {
+        error: CLOUD_DOC_ERROR_CODES.DOCBUILDER_OUTPUT_MISMATCH,
+        message: `ONLYOFFICE DocBuilder produced "${actualOutputName}" instead of expected extension "${expectedExt}"`,
+      },
+      422,
+    );
+  }
+  return null;
+}
+
+function validateTimeoutMs(
+  raw: unknown,
+  maxMs: number,
+): { ok: true; value?: number } | { ok: false; error: string } {
+  if (raw === undefined) return { ok: true };
+  if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < 50 || raw > maxMs) {
+    return { ok: false, error: CLOUD_DOC_ERROR_CODES.INVALID_TIMEOUT };
+  }
+  return { ok: true, value: raw };
+}
+
+function validateDocBuilderScriptAndArgument(
+  c: RouteContext,
+  rawScript: unknown,
+  rawArgument: unknown,
+  rawTimeoutMs: unknown,
+): { script: string; argument?: Record<string, unknown>; timeoutMs?: number } | Response {
+  if (typeof rawScript !== 'string' || !rawScript.trim()) {
+    return c.json({ error: CLOUD_DOC_ERROR_CODES.INVALID_SCRIPT }, 400);
+  }
+  if (Buffer.byteLength(rawScript, 'utf8') > CLOUD_DOC_DOCBUILDER_MAX_SCRIPT_BYTES) {
+    return c.json(
+      { error: CLOUD_DOC_ERROR_CODES.SCRIPT_TOO_LARGE, maxBytes: CLOUD_DOC_DOCBUILDER_MAX_SCRIPT_BYTES },
+      413,
+    );
+  }
+  let argument: Record<string, unknown> | undefined;
+  if (rawArgument !== undefined) {
+    if (typeof rawArgument !== 'object' || rawArgument === null || Array.isArray(rawArgument)) {
+      return c.json({ error: CLOUD_DOC_ERROR_CODES.INVALID_ARGUMENT }, 400);
+    }
+    const serialized = JSON.stringify(rawArgument);
+    if (Buffer.byteLength(serialized, 'utf8') > CLOUD_DOC_DOCBUILDER_MAX_ARGUMENT_BYTES) {
+      return c.json(
+        { error: CLOUD_DOC_ERROR_CODES.INVALID_ARGUMENT, maxBytes: CLOUD_DOC_DOCBUILDER_MAX_ARGUMENT_BYTES },
+        413,
+      );
+    }
+    argument = rawArgument as Record<string, unknown>;
+  }
+  const timeout = validateTimeoutMs(rawTimeoutMs, CLOUD_DOC_DOCBUILDER_MAX_TIMEOUT_MS);
+  if (!timeout.ok) {
+    return c.json({ error: timeout.error }, 400);
+  }
+  return { script: rawScript, argument, timeoutMs: timeout.value };
+}
+
+async function resolveTargetFolderOwner(
+  c: RouteContext,
+  rawFolderId: unknown,
+  actorUserId: string,
+): Promise<{ folderId: string | null; docOwnerUserId: string } | Response> {
+  if (rawFolderId !== undefined && rawFolderId !== null && typeof rawFolderId !== 'string') {
+    return c.json({ error: 'invalid_folder_id' }, 400);
+  }
+  const folderId = typeof rawFolderId === 'string' && rawFolderId.trim() ? rawFolderId.trim() : null;
+  let docOwnerUserId = actorUserId;
+  if (folderId) {
+    const folderAccess = await resolveCloudDocFolderAccess(c.env.DB, folderId, actorUserId);
+    if (!folderAccess.allowed) return c.json({ error: 'folder_not_found' }, 404);
+    if (folderAccess.role !== 'editor') return c.json({ error: 'forbidden' }, 403);
+    docOwnerUserId = folderAccess.folder.user_id;
+  }
+  return { folderId, docOwnerUserId };
+}
+
+async function resolveExistingDocMoveFolder(
+  c: RouteContext,
+  rawFolderId: unknown,
+  actorUserId: string,
+  docOwnerUserId: string,
+  isOwner: boolean,
+): Promise<{ folderId: string | null } | Response> {
+  const nextFolderId = typeof rawFolderId === 'string' && rawFolderId.trim() ? rawFolderId.trim() : null;
+  if (!nextFolderId && !isOwner) {
+    return c.json({ error: 'forbidden' }, 403);
+  }
+  if (nextFolderId) {
+    const folderAccess = await resolveCloudDocFolderAccess(c.env.DB, nextFolderId, actorUserId);
+    if (!folderAccess.allowed) return c.json({ error: 'folder_not_found' }, 404);
+    if (folderAccess.role !== 'editor' || folderAccess.folder.user_id !== docOwnerUserId) {
+      return c.json({ error: 'forbidden' }, 403);
+    }
+  }
+  return { folderId: nextFolderId };
+}
+
+async function parseBoundedMultipartForm(c: RouteContext): Promise<FormData | Response> {
+  const maxMultipartBytes = CLOUD_DOCS_MAX_UPLOAD_BYTES + 1024 * 1024;
+  const rawLength = Number(c.req.header('Content-Length') ?? '0');
+  if (Number.isFinite(rawLength) && rawLength > maxMultipartBytes) {
+    return c.json({ error: FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE, maxBytes: CLOUD_DOCS_MAX_UPLOAD_BYTES }, 413);
+  }
+
+  try {
+    const rawBodyStream = c.req.raw.body;
+    if (rawBodyStream) {
+      const rawBytes = await readStreamBytesBounded(rawBodyStream, maxMultipartBytes);
+      const boundedHeaders = new Headers(c.req.raw.headers);
+      boundedHeaders.delete('content-length');
+      return await new Request(c.req.raw.url, {
+        method: c.req.raw.method,
+        headers: boundedHeaders,
+        body: new Uint8Array(rawBytes),
+      }).formData();
+    }
+    return await c.req.formData();
+  } catch (err) {
+    if (err instanceof PayloadTooLargeError) {
+      return c.json({ error: FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE, maxBytes: CLOUD_DOCS_MAX_UPLOAD_BYTES }, 413);
+    }
+    return c.json({ error: 'invalid_multipart' }, 400);
+  }
+}
+
+async function persistNewCloudDoc(
+  c: RouteContext,
+  storage: CloudDocStorage,
+  params: {
+    userId: string;
+    folderId: string | null;
+    name: string;
+    ext: string;
+    mimeType: string;
+    bytes: Buffer;
+  },
+): Promise<{ row: CloudDocRow; bytesWritten: number } | Response> {
+  const docId = `cdoc_${randomUUID().replace(/-/g, '').slice(0, 20)}`;
+  const storageKey = buildCloudDocStorageKey(params.userId, docId, 1);
+
+  let writeResult: { sizeBytes: number; sha256: string };
+  try {
+    writeResult = await storage.write(storageKey, params.bytes);
+  } catch {
+    return c.json({ error: 'cloud_doc_storage_error' }, 500);
+  }
+
+  try {
+    const row = await insertCloudDoc(c.env.DB, {
+      id: docId,
+      userId: params.userId,
+      folderId: params.folderId,
+      name: params.name,
+      ext: params.ext,
+      mimeType: params.mimeType,
+      sizeBytes: writeResult.sizeBytes,
+      contentSha256: writeResult.sha256,
+      storageKey,
+    });
+    return { row, bytesWritten: writeResult.sizeBytes };
+  } catch (err) {
+    if (isDefinitelyUncommittedDbError(err)) {
+      await storage.delete(storageKey).catch(() => {});
+    }
+    return c.json({ error: 'cloud_doc_db_error' }, 500);
+  }
+}
+
+async function commitUpdatedCloudDocBytes(
+  c: RouteContext,
+  storage: CloudDocStorage,
+  params: {
+    current: CloudDocRow;
+    currentVersion: number;
+    nextBytes: Buffer;
+    name?: string;
+    ext?: string;
+    mimeType?: string;
+    folderId?: string | null;
+    hasFolderId?: boolean;
+  },
+): Promise<{ doc: CloudDocRow; bytesWritten: number } | Response> {
+  const nextVersion = params.currentVersion + 1;
+  const newStorageKey = buildCloudDocStorageKey(params.current.user_id, params.current.id, nextVersion);
+  let writeResult: { sizeBytes: number; sha256: string };
+  try {
+    writeResult = await storage.write(newStorageKey, params.nextBytes);
+  } catch {
+    return c.json({ error: 'cloud_doc_storage_error' }, 500);
+  }
+
+  try {
+    const committed = await commitCloudDocContent(c.env.DB, {
+      docId: params.current.id,
+      userId: params.current.user_id,
+      expectedVersion: params.currentVersion,
+      bumpVersion: true,
+      newStorageKey,
+      sizeBytes: writeResult.sizeBytes,
+      contentSha256: writeResult.sha256,
+      name: params.name,
+      ext: params.ext,
+      mimeType: params.mimeType,
+      folderId: params.folderId,
+      hasFolderId: params.hasFolderId,
+    });
+    if (committed.status === 'conflict') {
+      await storage.delete(newStorageKey).catch(() => {});
+      return c.json({ error: 'version_conflict', currentVersion: params.currentVersion }, 409);
+    }
+    if (params.current.storage_key !== newStorageKey) {
+      await storage.delete(params.current.storage_key).catch(() => {});
+    }
+    return { doc: committed.doc, bytesWritten: writeResult.sizeBytes };
+  } catch (err) {
+    if (isDefinitelyUncommittedDbError(err)) {
+      await storage.delete(newStorageKey).catch(() => {});
+    }
+    return c.json({ error: 'cloud_doc_db_error' }, 500);
+  }
+}
+
+function buildInternalOnlyOfficeDocUrl(
+  c: RouteContext,
+  doc: CloudDocRow,
+  docVersion: number,
+  userId: string,
+  actorName: string,
+  ttlSeconds = 300,
+): string {
+  const documentKey = computeCloudDocDocumentKey(doc.id, docVersion);
+  const fileToken = signCloudDocOnlyOfficeToken(
+    {
+      cloudDocId: doc.id,
+      userId,
+      actorName,
+      docVersion,
+      documentKey,
+    },
+    c.env.JWT_SIGNING_KEY,
+    ttlSeconds,
+  );
+  const serverBaseUrl = (c.env.SERVER_URL || 'http://localhost:19138').replace(/\/$/, '');
+  return `${serverBaseUrl}${CLOUD_DOCS_ONLYOFFICE_FILE_PATH}/${fileToken}`;
 }
 
 async function requireRegularUser(c: RouteContext): Promise<{ userId: string } | Response> {
@@ -604,9 +831,18 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
     const auth = await requireRegularUser(c);
     if (auth instanceof Response) return auth;
 
-    let body: { type?: string; name?: string; folderId?: string | null; content?: unknown };
+    let body: {
+      type?: string;
+      name?: string;
+      folderId?: string | null;
+      content?: unknown;
+      engine?: unknown;
+      docbuilderScript?: unknown;
+      argument?: unknown;
+      timeoutMs?: unknown;
+    };
     try {
-      body = (await c.req.json()) as { type?: string; name?: string; folderId?: string | null; content?: unknown };
+      body = (await c.req.json()) as typeof body;
     } catch {
       return c.json({ error: 'invalid_json' }, 400);
     }
@@ -618,16 +854,23 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
       return c.json({ error: 'invalid_content' }, 400);
     }
 
-    const folderId = typeof body.folderId === 'string' && body.folderId.trim()
-      ? body.folderId.trim()
-      : null;
-    let docOwnerUserId = auth.userId;
-    if (folderId) {
-      const folderAccess = await resolveCloudDocFolderAccess(c.env.DB, folderId, auth.userId);
-      if (!folderAccess.allowed) return c.json({ error: 'folder_not_found' }, 404);
-      if (folderAccess.role !== 'editor') return c.json({ error: 'forbidden' }, 403);
-      docOwnerUserId = folderAccess.folder.user_id;
+    const useDocBuilder =
+      body.engine === 'docbuilder' ||
+      (typeof body.docbuilderScript === 'string' && body.docbuilderScript.trim().length > 0);
+    let validatedBuilder: { script: string; argument?: Record<string, unknown>; timeoutMs?: number } | null = null;
+    if (useDocBuilder) {
+      const checked = validateDocBuilderScriptAndArgument(
+        c,
+        body.docbuilderScript,
+        body.argument,
+        body.timeoutMs,
+      );
+      if (checked instanceof Response) return checked;
+      validatedBuilder = checked;
     }
+
+    const folderResult = await resolveTargetFolderOwner(c, body.folderId, auth.userId);
+    if (folderResult instanceof Response) return folderResult;
 
     const ext = `.${body.type}`;
     const defaultName = body.name?.trim() || `Untitled.${body.type}`;
@@ -638,45 +881,184 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
     if (!meta) return c.json({ error: 'unsupported_document_type' }, 400);
 
     let bytes: Buffer;
-    try {
-      bytes = buildCloudDocBytesFromContent(ext, body.content as string | undefined);
-    } catch (err) {
-      if (err instanceof CloudDocContentError) {
-        return c.json({ error: err.code, message: err.message }, err.statusCode);
+    if (validatedBuilder) {
+      try {
+        const mergedArg =
+          body.content !== undefined
+            ? { content: body.content, ...(validatedBuilder.argument ?? {}) }
+            : validatedBuilder.argument;
+        const result = await executeOnlyOfficeDocBuilder({
+          env: c.env,
+          db: c.env.DB,
+          script: validatedBuilder.script,
+          argument: mergedArg,
+          requiredExt: meta.ext,
+          timeoutMs: validatedBuilder.timeoutMs,
+        });
+        const extMismatch = validatePersistedOutputExt(c, result.outputName, meta.ext);
+        if (extMismatch) return extMismatch;
+        bytes = result.bytes;
+      } catch (err) {
+        if (err instanceof OnlyOfficeServiceError) {
+          return onlyOfficeErrorResponse(c, err);
+        }
+        return c.json({ error: CLOUD_DOC_ERROR_CODES.DOCBUILDER_FAILED }, 502);
       }
-      return c.json({ error: 'unsupported_document_type' }, 400);
+    } else {
+      try {
+        bytes = buildCloudDocBytesFromContent(ext, body.content as string | undefined);
+      } catch (err) {
+        if (err instanceof CloudDocContentError) {
+          return c.json({ error: err.code, message: err.message }, err.statusCode);
+        }
+        return c.json({ error: 'unsupported_document_type' }, 400);
+      }
     }
 
-    const docId = `cdoc_${randomUUID().replace(/-/g, '').slice(0, 20)}`;
-    const storageKey = buildCloudDocStorageKey(docOwnerUserId, docId, 1);
+    const persisted = await persistNewCloudDoc(c, storage, {
+      userId: folderResult.docOwnerUserId,
+      folderId: folderResult.folderId,
+      name: safeName,
+      ext: meta.ext,
+      mimeType: meta.mimeType,
+      bytes,
+    });
+    if (persisted instanceof Response) return persisted;
+    return c.json({ doc: rowToCloudDocItem(persisted.row) }, 201);
+  });
 
-    let writeResult: { sizeBytes: number; sha256: string };
+  // ── Cloud Docs: Create document via ONLYOFFICE Document Builder ─────────────
+  routes.post('/cloud-docs/docbuilder', async (c): Promise<Response> => {
+    const auth = await requireRegularUser(c);
+    if (auth instanceof Response) return auth;
+
+    let body: {
+      script?: unknown;
+      type?: unknown;
+      name?: unknown;
+      folderId?: unknown;
+      argument?: unknown;
+      outputName?: unknown;
+      timeoutMs?: unknown;
+    };
     try {
-      writeResult = await storage.write(storageKey, bytes);
+      body = (await c.req.json()) as typeof body;
     } catch {
-      return c.json({ error: 'cloud_doc_storage_error' }, 500);
+      return c.json({ error: 'invalid_json' }, 400);
     }
 
-    try {
-      const row = await insertCloudDoc(c.env.DB, {
-        id: docId,
-        userId: docOwnerUserId,
-        folderId,
-        name: safeName,
-        ext: meta.ext,
-        mimeType: meta.mimeType,
-        sizeBytes: writeResult.sizeBytes,
-        contentSha256: writeResult.sha256,
-        storageKey,
-      });
-      return c.json({ doc: rowToCloudDocItem(row) }, 201);
-    } catch (err) {
-      // Partial-failure rollback: only delete the written blob when DB guarantees no row was committed
-      if (isDefinitelyUncommittedDbError(err)) {
-        await storage.delete(storageKey).catch(() => {});
+    const validated = validateDocBuilderScriptAndArgument(
+      c,
+      body.script,
+      body.argument,
+      body.timeoutMs,
+    );
+    if (validated instanceof Response) return validated;
+
+    let requestedType: string | undefined;
+    if (body.type !== undefined) {
+      if (typeof body.type !== 'string' || !body.type.trim()) {
+        return c.json({ error: 'unsupported_document_type' }, 400);
       }
-      return c.json({ error: 'cloud_doc_db_error' }, 500);
+      const normType = body.type.trim().replace(/^\./, '').toLowerCase();
+      if (!isDocBuilderOutputType(normType) || !getCloudDocMeta(`.${normType}`)) {
+        return c.json({ error: 'unsupported_document_type' }, 400);
+      }
+      requestedType = normType;
     }
+
+    let outputName: string | undefined;
+    if (body.outputName !== undefined) {
+      if (typeof body.outputName !== 'string' || !body.outputName.trim() || body.outputName.includes('/') || body.outputName.includes('\\')) {
+        return c.json({ error: 'invalid_name' }, 400);
+      }
+      outputName = body.outputName.trim();
+    }
+
+    if (body.name !== undefined) {
+      if (typeof body.name !== 'string' || !body.name.trim() || body.name.includes('/') || body.name.includes('\\')) {
+        return c.json({ error: 'invalid_name' }, 400);
+      }
+      const preCheck = requestedType
+        ? normalizeCloudDocName(body.name, `.${requestedType}`)
+        : normalizeCloudDocName(body.name);
+      if (!preCheck) {
+        return c.json({ error: 'invalid_name' }, 400);
+      }
+    }
+
+    const requiredExt = requestedType
+      ? `.${requestedType}`
+      : (typeof body.name === 'string' && body.name.trim() ? getCloudDocMeta(body.name)?.ext : undefined);
+
+    if (outputName && requiredExt && getCloudDocExt(outputName) !== requiredExt) {
+      return c.json(
+        {
+          error: CLOUD_DOC_ERROR_CODES.DOCBUILDER_OUTPUT_MISMATCH,
+          message: `outputName "${outputName}" does not match required extension "${requiredExt}"`,
+        },
+        422,
+      );
+    }
+
+    const folderResult = await resolveTargetFolderOwner(c, body.folderId, auth.userId);
+    if (folderResult instanceof Response) return folderResult;
+
+    let result: Awaited<ReturnType<typeof executeOnlyOfficeDocBuilder>>;
+    try {
+      result = await executeOnlyOfficeDocBuilder({
+        env: c.env,
+        db: c.env.DB,
+        script: validated.script,
+        argument: validated.argument,
+        outputName,
+        requiredExt,
+        timeoutMs: validated.timeoutMs,
+      });
+    } catch (err) {
+      if (err instanceof OnlyOfficeServiceError) {
+        return onlyOfficeErrorResponse(c, err);
+      }
+      return c.json({ error: CLOUD_DOC_ERROR_CODES.DOCBUILDER_FAILED }, 502);
+    }
+
+    if (requiredExt) {
+      const extMismatch = validatePersistedOutputExt(c, result.outputName, requiredExt);
+      if (extMismatch) return extMismatch;
+    }
+
+    const meta = getCloudDocMeta(result.outputName);
+    if (!meta) {
+      return c.json({ error: CLOUD_DOC_ERROR_CODES.UNSUPPORTED_FORMAT }, 422);
+    }
+
+    const rawCandidateName =
+      (typeof body.name === 'string' && body.name.trim()) ||
+      result.outputName ||
+      `Untitled${meta.ext}`;
+    const safeName = normalizeCloudDocName(rawCandidateName, meta.ext);
+    if (!safeName) {
+      return c.json({ error: 'invalid_name' }, 400);
+    }
+
+    const persisted = await persistNewCloudDoc(c, storage, {
+      userId: folderResult.docOwnerUserId,
+      folderId: folderResult.folderId,
+      name: safeName,
+      ext: meta.ext,
+      mimeType: meta.mimeType,
+      bytes: result.bytes,
+    });
+    if (persisted instanceof Response) return persisted;
+
+    return c.json(
+      {
+        doc: rowToCloudDocItem(persisted.row),
+        bytesWritten: persisted.bytesWritten,
+        ...(result.onlyofficeUrls ? { onlyofficeUrls: result.onlyofficeUrls } : {}),
+      },
+      201,
+    );
   });
 
   // ── Cloud Docs: Upload file (multipart/form-data) ───────────────────────────
@@ -684,33 +1066,8 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
     const auth = await requireRegularUser(c);
     if (auth instanceof Response) return auth;
 
-    const maxMultipartBytes = CLOUD_DOCS_MAX_UPLOAD_BYTES + 1024 * 1024;
-    const rawLength = Number(c.req.header('Content-Length') ?? '0');
-    if (Number.isFinite(rawLength) && rawLength > maxMultipartBytes) {
-      return c.json({ error: FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE, maxBytes: CLOUD_DOCS_MAX_UPLOAD_BYTES }, 413);
-    }
-
-    let form: FormData;
-    try {
-      const rawBodyStream = c.req.raw.body;
-      if (rawBodyStream) {
-        const rawBytes = await readStreamBytesBounded(rawBodyStream, maxMultipartBytes);
-        const boundedHeaders = new Headers(c.req.raw.headers);
-        boundedHeaders.delete('content-length');
-        form = await new Request(c.req.raw.url, {
-          method: c.req.raw.method,
-          headers: boundedHeaders,
-          body: new Uint8Array(rawBytes),
-        }).formData();
-      } else {
-        form = await c.req.formData();
-      }
-    } catch (err) {
-      if (err instanceof PayloadTooLargeError) {
-        return c.json({ error: FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE, maxBytes: CLOUD_DOCS_MAX_UPLOAD_BYTES }, 413);
-      }
-      return c.json({ error: 'invalid_multipart' }, 400);
-    }
+    const form = await parseBoundedMultipartForm(c);
+    if (form instanceof Response) return form;
 
     const fileEntry = form.get('file');
     if (!fileEntry || typeof fileEntry === 'string' || typeof (fileEntry as Blob).arrayBuffer !== 'function') {
@@ -722,16 +1079,11 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
     }
 
     const rawFolderId = form.get('folderId');
-    const folderId = typeof rawFolderId === 'string' && rawFolderId.trim()
-      ? rawFolderId.trim()
-      : null;
-    let docOwnerUserId = auth.userId;
-    if (folderId) {
-      const folderAccess = await resolveCloudDocFolderAccess(c.env.DB, folderId, auth.userId);
-      if (!folderAccess.allowed) return c.json({ error: 'folder_not_found' }, 404);
-      if (folderAccess.role !== 'editor') return c.json({ error: 'forbidden' }, 403);
-      docOwnerUserId = folderAccess.folder.user_id;
+    if (rawFolderId !== null && typeof rawFolderId !== 'string') {
+      return c.json({ error: 'invalid_folder_id' }, 400);
     }
+    const folderResult = await resolveTargetFolderOwner(c, rawFolderId, auth.userId);
+    if (folderResult instanceof Response) return folderResult;
 
     const requestedName = form.get('name');
     const candidateName = typeof requestedName === 'string' && requestedName.trim()
@@ -759,38 +1111,55 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
       return c.json({ error: FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE, maxBytes: CLOUD_DOCS_MAX_UPLOAD_BYTES }, 413);
     }
 
-    const docId = `cdoc_${randomUUID().replace(/-/g, '').slice(0, 20)}`;
-    const storageKey = buildCloudDocStorageKey(docOwnerUserId, docId, 1);
-
-    let writeResult: { sizeBytes: number; sha256: string };
-    try {
-      writeResult = await storage.write(storageKey, bytes);
-    } catch {
-      return c.json({ error: 'cloud_doc_storage_error' }, 500);
-    }
-
-    try {
-      const row = await insertCloudDoc(c.env.DB, {
-        id: docId,
-        userId: docOwnerUserId,
-        folderId,
-        name: safeName,
-        ext: meta.ext,
-        mimeType: meta.mimeType,
-        sizeBytes: writeResult.sizeBytes,
-        contentSha256: writeResult.sha256,
-        storageKey,
-      });
-      return c.json({ doc: rowToCloudDocItem(row) }, 201);
-    } catch (err) {
-      if (isDefinitelyUncommittedDbError(err)) {
-        await storage.delete(storageKey).catch(() => {});
-      }
-      return c.json({ error: 'cloud_doc_db_error' }, 500);
-    }
+    const persisted = await persistNewCloudDoc(c, storage, {
+      userId: folderResult.docOwnerUserId,
+      folderId: folderResult.folderId,
+      name: safeName,
+      ext: meta.ext,
+      mimeType: meta.mimeType,
+      bytes,
+    });
+    if (persisted instanceof Response) return persisted;
+    return c.json({ doc: rowToCloudDocItem(persisted.row) }, 201);
   };
   routes.post('/cloud-docs/files', handleUploadCloudDoc);
   routes.post('/cloud-docs/upload', handleUploadCloudDoc);
+
+  // ── Cloud Docs: Ephemeral ONLYOFFICE DocBuilder script download ─────────────
+  routes.get('/cloud-docs/onlyoffice/script/:token', async (c): Promise<Response> => {
+    const token = c.req.param('token') ?? '';
+    const claims = verifyDocBuilderScriptToken(token, c.env.JWT_SIGNING_KEY);
+    if (!claims) {
+      return c.json({ error: 'invalid_script_token' }, 401);
+    }
+
+    const authHeader = c.req.header('Authorization');
+    if (authHeader?.startsWith('Bearer ')) {
+      const ooSecret = resolveOnlyOfficeJwtSecret(c.env);
+      const verified = verifyJwt(authHeader.slice(7), ooSecret);
+      if (!verified) {
+        return c.json({ error: 'invalid_onlyoffice_jwt' }, 401);
+      }
+    }
+
+    const scriptStore = createDbDocBuilderScriptStore(c.env.DB);
+    const script = await scriptStore.consume(claims.scriptId, {
+      peekOnly: c.req.method === 'HEAD',
+    });
+    if (!script) {
+      return c.json({ error: 'script_not_found' }, 404);
+    }
+
+    return new Response(script, {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/javascript; charset=utf-8',
+        'Content-Length': String(Buffer.byteLength(script, 'utf8')),
+        'X-Content-Type-Options': 'nosniff',
+        'Cache-Control': 'no-store',
+      },
+    });
+  });
 
   // ── Cloud Docs: ONLYOFFICE file download (token-authenticated) ─────────────
   routes.get('/cloud-docs/onlyoffice/file/:token', async (c): Promise<Response> => {
@@ -1347,22 +1716,37 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
       expectedVersion?: unknown;
       name?: unknown;
       folderId?: unknown;
+      engine?: unknown;
+      docbuilderScript?: unknown;
+      argument?: unknown;
+      timeoutMs?: unknown;
     };
     try {
-      body = (await c.req.json()) as {
-        content?: unknown;
-        mode?: unknown;
-        expectedVersion?: unknown;
-        name?: unknown;
-        folderId?: unknown;
-      };
+      body = (await c.req.json()) as typeof body;
     } catch {
       return c.json({ error: 'invalid_json' }, 400);
     }
 
-    if (typeof body.content !== 'string') {
+    const useDocBuilder =
+      body.engine === 'docbuilder' ||
+      (typeof body.docbuilderScript === 'string' && body.docbuilderScript.trim().length > 0);
+    let validatedBuilder: { script: string; argument?: Record<string, unknown>; timeoutMs?: number } | null = null;
+    if (useDocBuilder) {
+      const checked = validateDocBuilderScriptAndArgument(
+        c,
+        body.docbuilderScript,
+        body.argument,
+        body.timeoutMs,
+      );
+      if (checked instanceof Response) return checked;
+      validatedBuilder = checked;
+      if (body.content !== undefined && typeof body.content !== 'string') {
+        return c.json({ error: 'invalid_content' }, 400);
+      }
+    } else if (typeof body.content !== 'string') {
       return c.json({ error: 'invalid_content' }, 400);
     }
+
     const mode: CloudDocEditMode = body.mode === undefined ? 'replace' : (body.mode as CloudDocEditMode);
     if (!(CLOUD_DOC_EDIT_MODES as readonly string[]).includes(mode)) {
       return c.json({ error: 'invalid_mode' }, 400);
@@ -1412,91 +1796,569 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
 
       let nextFolderId: string | null = null;
       if (hasFolderId) {
-        nextFolderId = typeof body.folderId === 'string' && body.folderId.trim()
-          ? body.folderId.trim()
-          : null;
-        if (!nextFolderId && !liveAccess.isOwner) {
-          return c.json({ error: 'forbidden' }, 403);
-        }
-        if (nextFolderId) {
-          const folderAccess = await resolveCloudDocFolderAccess(c.env.DB, nextFolderId, auth.userId);
-          if (!folderAccess.allowed) return c.json({ error: 'folder_not_found' }, 404);
-          if (folderAccess.role !== 'editor' || folderAccess.folder.user_id !== current.user_id) {
-            return c.json({ error: 'forbidden' }, 403);
-          }
-        }
-      }
-
-      let existingBytes: Buffer = Buffer.alloc(0);
-      if (mode === 'append') {
-        if (!(await storage.exists(current.storage_key))) {
-          return c.json({ error: 'cloud_doc_file_missing' }, 404);
-        }
-        try {
-          existingBytes = await storage.read(current.storage_key);
-        } catch {
-          return c.json({ error: 'cloud_doc_storage_error' }, 500);
-        }
+        const moveResult = await resolveExistingDocMoveFolder(
+          c,
+          body.folderId,
+          auth.userId,
+          current.user_id,
+          liveAccess.isOwner,
+        );
+        if (moveResult instanceof Response) return moveResult;
+        nextFolderId = moveResult.folderId;
       }
 
       let nextBytes: Buffer;
-      try {
-        nextBytes = applyCloudDocContentEdit({
-          ext: current.ext,
-          existingBytes,
-          mode,
-          content: body.content as string,
-        });
-      } catch (err) {
-        if (err instanceof CloudDocContentError) {
-          return c.json({ error: err.code, message: err.message }, err.statusCode);
+      if (validatedBuilder) {
+        if (!(await storage.exists(current.storage_key))) {
+          return c.json({ error: 'cloud_doc_file_missing' }, 404);
         }
+        const inputUrl = buildInternalOnlyOfficeDocUrl(c, current, currentVersion, auth.userId, 'docbuilder');
+        const effectiveArgument: Record<string, unknown> = {
+          ...(validatedBuilder.argument ?? {}),
+          ...(body.content !== undefined ? { content: body.content } : {}),
+          mode,
+          inputUrl,
+          _imcodesInputUrl: inputUrl,
+        };
+        const effectiveScript = validatedBuilder.script.includes('{{INPUT_URL}}')
+          ? validatedBuilder.script.replaceAll('{{INPUT_URL}}', inputUrl)
+          : validatedBuilder.script;
+        const targetExt = nextExt ?? current.ext;
+        try {
+          const result = await executeOnlyOfficeDocBuilder({
+            env: c.env,
+            db: c.env.DB,
+            script: effectiveScript,
+            argument: effectiveArgument,
+            requiredExt: targetExt,
+            timeoutMs: validatedBuilder.timeoutMs,
+          });
+          const extMismatch = validatePersistedOutputExt(c, result.outputName, targetExt);
+          if (extMismatch) return extMismatch;
+          nextBytes = result.bytes;
+        } catch (err) {
+          if (err instanceof OnlyOfficeServiceError) {
+            return onlyOfficeErrorResponse(c, err);
+          }
+          return c.json({ error: CLOUD_DOC_ERROR_CODES.DOCBUILDER_FAILED }, 502);
+        }
+      } else {
+        let existingBytes: Buffer = Buffer.alloc(0);
+        if (mode === 'append') {
+          if (!(await storage.exists(current.storage_key))) {
+            return c.json({ error: 'cloud_doc_file_missing' }, 404);
+          }
+          try {
+            existingBytes = await storage.read(current.storage_key);
+          } catch {
+            return c.json({ error: 'cloud_doc_storage_error' }, 500);
+          }
+        }
+
+        try {
+          nextBytes = applyCloudDocContentEdit({
+            ext: current.ext,
+            existingBytes,
+            mode,
+            content: body.content as string,
+          });
+        } catch (err) {
+          if (err instanceof CloudDocContentError) {
+            return c.json({ error: err.code, message: err.message }, err.statusCode);
+          }
+          return c.json({ error: 'unsupported_document_type' }, 400);
+        }
+      }
+
+      const committed = await commitUpdatedCloudDocBytes(c, storage, {
+        current,
+        currentVersion,
+        nextBytes,
+        name: nextName,
+        ext: nextExt,
+        mimeType: nextMime,
+        folderId: nextFolderId,
+        hasFolderId,
+      });
+      if (committed instanceof Response) return committed;
+
+      return c.json({
+        ok: true,
+        doc: rowToCloudDocItem(committed.doc),
+        role: liveAccess.isOwner ? 'owner' : liveAccess.role,
+        bytesWritten: committed.bytesWritten,
+      });
+    });
+  });
+
+  // ── Cloud Docs: Run ONLYOFFICE DocBuilder against existing document ─────────
+  routes.post('/cloud-docs/:id/docbuilder', async (c): Promise<Response> => {
+    const auth = await requireRegularUser(c);
+    if (auth instanceof Response) return auth;
+
+    const docId = c.req.param('id');
+    const initialAccess = await resolveCloudDocAccess(c.env.DB, docId, auth.userId);
+    if (!initialAccess.allowed) {
+      return c.json({ error: 'not_found' }, 404);
+    }
+    if (initialAccess.role !== 'editor') {
+      return c.json({ error: 'forbidden' }, 403);
+    }
+
+    let body: {
+      script?: unknown;
+      argument?: unknown;
+      outputType?: unknown;
+      outputName?: unknown;
+      save?: unknown;
+      expectedVersion?: unknown;
+      name?: unknown;
+      folderId?: unknown;
+      timeoutMs?: unknown;
+    };
+    try {
+      body = (await c.req.json()) as typeof body;
+    } catch {
+      return c.json({ error: 'invalid_json' }, 400);
+    }
+
+    const validated = validateDocBuilderScriptAndArgument(
+      c,
+      body.script,
+      body.argument,
+      body.timeoutMs,
+    );
+    if (validated instanceof Response) return validated;
+
+    const save = body.save === undefined ? true : body.save;
+    if (typeof save !== 'boolean') {
+      return c.json({ error: 'invalid_save' }, 400);
+    }
+    if (body.expectedVersion !== undefined && (!Number.isInteger(body.expectedVersion) || (body.expectedVersion as number) < 1)) {
+      return c.json({ error: 'invalid_expected_version' }, 400);
+    }
+
+    let targetOutputExt: string | undefined;
+    if (body.outputType !== undefined) {
+      if (typeof body.outputType !== 'string' || !body.outputType.trim()) {
         return c.json({ error: 'unsupported_document_type' }, 400);
       }
+      const normType = body.outputType.trim().replace(/^\./, '').toLowerCase();
+      if (!isDocBuilderOutputType(normType) || (save && !getCloudDocMeta(`.${normType}`))) {
+        return c.json({ error: 'unsupported_document_type' }, 400);
+      }
+      targetOutputExt = `.${normType}`;
+    }
 
-      const nextVersion = currentVersion + 1;
-      const newStorageKey = buildCloudDocStorageKey(current.user_id, current.id, nextVersion);
-      let writeResult: { sizeBytes: number; sha256: string };
-      try {
-        writeResult = await storage.write(newStorageKey, nextBytes);
-      } catch {
-        return c.json({ error: 'cloud_doc_storage_error' }, 500);
+    let outputName: string | undefined;
+    if (body.outputName !== undefined) {
+      if (typeof body.outputName !== 'string' || !body.outputName.trim() || body.outputName.includes('/') || body.outputName.includes('\\')) {
+        return c.json({ error: 'invalid_name' }, 400);
+      }
+      outputName = body.outputName.trim();
+    }
+
+    if (body.name !== undefined && typeof body.name !== 'string') {
+      return c.json({ error: 'invalid_name' }, 400);
+    }
+    const hasFolderId = Object.prototype.hasOwnProperty.call(body, 'folderId') && body.folderId !== undefined;
+    if (hasFolderId && body.folderId !== null && typeof body.folderId !== 'string') {
+      return c.json({ error: 'invalid_folder_id' }, 400);
+    }
+
+    return lockCloudDocCommit(docId, async () => {
+      const liveAccess = await resolveCloudDocAccess(c.env.DB, docId, auth.userId);
+      if (!liveAccess.allowed) return c.json({ error: 'not_found' }, 404);
+      if (liveAccess.role !== 'editor') return c.json({ error: 'forbidden' }, 403);
+
+      const current = liveAccess.doc;
+      const currentVersion = parseCloudDocVersion(current.doc_version);
+      if (currentVersion === null) {
+        return c.json({ error: 'cloud_doc_invalid_version' }, 500);
+      }
+      if (typeof body.expectedVersion === 'number' && body.expectedVersion !== currentVersion) {
+        return c.json({ error: 'version_conflict', currentVersion }, 409);
+      }
+      if (!(await storage.exists(current.storage_key))) {
+        return c.json({ error: 'cloud_doc_file_missing' }, 404);
       }
 
+      let nextName: string | undefined;
+      let nextExt: string | undefined;
+      let nextMime: string | undefined;
+      let nextFolderId: string | null = null;
+      const effectiveExt = targetOutputExt ?? current.ext;
+
+      if (save) {
+        if (typeof body.name === 'string') {
+          if (body.name.includes('/') || body.name.includes('\\')) {
+            return c.json({ error: 'invalid_name' }, 400);
+          }
+          const normalized = normalizeCloudDocName(body.name, effectiveExt);
+          if (!normalized) return c.json({ error: 'invalid_name' }, 400);
+          const meta = getCloudDocMeta(normalized);
+          if (!meta) return c.json({ error: 'unsupported_document_type' }, 400);
+          nextName = normalized;
+          nextExt = meta.ext;
+          nextMime = meta.mimeType;
+        } else if (targetOutputExt && targetOutputExt !== current.ext) {
+          const meta = getCloudDocMeta(targetOutputExt);
+          if (!meta) return c.json({ error: 'unsupported_document_type' }, 400);
+          const stem = current.name.endsWith(current.ext)
+            ? current.name.slice(0, -current.ext.length)
+            : current.name;
+          const renamed = normalizeCloudDocName(`${stem || 'Untitled'}${targetOutputExt}`, targetOutputExt);
+          if (!renamed) return c.json({ error: 'invalid_name' }, 400);
+          nextName = renamed;
+          nextExt = meta.ext;
+          nextMime = meta.mimeType;
+        }
+
+        if (hasFolderId) {
+          const moveResult = await resolveExistingDocMoveFolder(
+            c,
+            body.folderId,
+            auth.userId,
+            current.user_id,
+            liveAccess.isOwner,
+          );
+          if (moveResult instanceof Response) return moveResult;
+          nextFolderId = moveResult.folderId;
+        }
+      }
+
+      const persistedExt = save ? (nextExt ?? current.ext) : targetOutputExt;
+      if (outputName && persistedExt && getCloudDocExt(outputName) !== persistedExt) {
+        return c.json(
+          {
+            error: CLOUD_DOC_ERROR_CODES.DOCBUILDER_OUTPUT_MISMATCH,
+            message: `outputName "${outputName}" does not match required extension "${persistedExt}"`,
+          },
+          422,
+        );
+      }
+
+      const inputUrl = buildInternalOnlyOfficeDocUrl(c, current, currentVersion, auth.userId, 'docbuilder');
+      const effectiveArgument: Record<string, unknown> = {
+        ...(validated.argument ?? {}),
+        inputUrl,
+        _imcodesInputUrl: inputUrl,
+      };
+      const effectiveScript = validated.script.includes('{{INPUT_URL}}')
+        ? validated.script.replaceAll('{{INPUT_URL}}', inputUrl)
+        : validated.script;
+
+      let result: Awaited<ReturnType<typeof executeOnlyOfficeDocBuilder>>;
       try {
-        const committed = await commitCloudDocContent(c.env.DB, {
-          docId: current.id,
-          userId: current.user_id,
-          expectedVersion: currentVersion,
-          bumpVersion: true,
-          newStorageKey,
-          sizeBytes: writeResult.sizeBytes,
-          contentSha256: writeResult.sha256,
-          name: nextName,
-          ext: nextExt,
-          mimeType: nextMime,
-          folderId: nextFolderId,
-          hasFolderId,
-        });
-        if (committed.status === 'conflict') {
-          await storage.delete(newStorageKey).catch(() => {});
-          return c.json({ error: 'version_conflict', currentVersion }, 409);
-        }
-        if (current.storage_key !== newStorageKey) {
-          await storage.delete(current.storage_key).catch(() => {});
-        }
-        return c.json({
-          ok: true,
-          doc: rowToCloudDocItem(committed.doc),
-          role: liveAccess.isOwner ? 'owner' : liveAccess.role,
-          bytesWritten: writeResult.sizeBytes,
+        result = await executeOnlyOfficeDocBuilder({
+          env: c.env,
+          db: c.env.DB,
+          script: effectiveScript,
+          argument: effectiveArgument,
+          outputName,
+          requiredExt: persistedExt,
+          timeoutMs: validated.timeoutMs,
         });
       } catch (err) {
-        if (isDefinitelyUncommittedDbError(err)) {
-          await storage.delete(newStorageKey).catch(() => {});
+        if (err instanceof OnlyOfficeServiceError) {
+          return onlyOfficeErrorResponse(c, err);
         }
-        return c.json({ error: 'cloud_doc_db_error' }, 500);
+        return c.json({ error: CLOUD_DOC_ERROR_CODES.DOCBUILDER_FAILED }, 502);
       }
+
+      if (!save) {
+        return c.json({
+          doc: rowToCloudDocItem(current),
+          bytesBase64: result.bytes.toString('base64'),
+          outputName: result.outputName,
+          mimeType: result.mimeType,
+          bytesWritten: result.bytes.length,
+          ...(result.onlyofficeUrls ? { onlyofficeUrls: result.onlyofficeUrls } : {}),
+        });
+      }
+
+      const saveExtMismatch = validatePersistedOutputExt(c, result.outputName, nextExt ?? current.ext);
+      if (saveExtMismatch) return saveExtMismatch;
+
+      const committed = await commitUpdatedCloudDocBytes(c, storage, {
+        current,
+        currentVersion,
+        nextBytes: result.bytes,
+        name: nextName,
+        ext: nextExt,
+        mimeType: nextMime,
+        folderId: nextFolderId,
+        hasFolderId,
+      });
+      if (committed instanceof Response) return committed;
+
+      return c.json({
+        doc: rowToCloudDocItem(committed.doc),
+        role: liveAccess.isOwner ? 'owner' : liveAccess.role,
+        bytesWritten: committed.bytesWritten,
+        ...(result.onlyofficeUrls ? { onlyofficeUrls: result.onlyofficeUrls } : {}),
+      });
+    });
+  });
+
+  // ── Cloud Docs: Convert document via ONLYOFFICE Converter ─────────────────
+  routes.post('/cloud-docs/:id/convert', async (c): Promise<Response> => {
+    const auth = await requireRegularUser(c);
+    if (auth instanceof Response) return auth;
+
+    const docId = c.req.param('id');
+    const access = await resolveCloudDocAccess(c.env.DB, docId, auth.userId);
+    if (!access.allowed) {
+      return c.json({ error: 'not_found' }, 404);
+    }
+    if (!access.allowDownload && access.role !== 'editor') {
+      return c.json({ error: CLOUD_DOC_ERROR_CODES.DOWNLOAD_FORBIDDEN }, 403);
+    }
+
+    let body: {
+      targetType?: unknown;
+      saveAsNew?: unknown;
+      name?: unknown;
+      folderId?: unknown;
+      timeoutMs?: unknown;
+    };
+    try {
+      body = (await c.req.json()) as typeof body;
+    } catch {
+      return c.json({ error: 'invalid_json' }, 400);
+    }
+
+    if (typeof body.targetType !== 'string' || !body.targetType.trim()) {
+      return c.json({ error: 'unsupported_document_type' }, 400);
+    }
+    const targetType = body.targetType.trim().replace(/^\./, '').toLowerCase();
+    if (!isConvertTargetType(targetType)) {
+      return c.json({ error: 'unsupported_document_type' }, 400);
+    }
+
+    if (body.saveAsNew !== undefined && typeof body.saveAsNew !== 'boolean') {
+      return c.json({ error: 'invalid_save_as_new' }, 400);
+    }
+    const saveAsNew = body.saveAsNew === true;
+    if (saveAsNew && !getCloudDocMeta(`.${targetType}`)) {
+      return c.json({ error: 'unsupported_document_type' }, 400);
+    }
+
+    const timeout = validateTimeoutMs(body.timeoutMs, CLOUD_DOC_CONVERT_MAX_TIMEOUT_MS);
+    if (!timeout.ok) {
+      return c.json({ error: timeout.error }, 400);
+    }
+
+    if (body.name !== undefined) {
+      if (typeof body.name !== 'string' || !body.name.trim() || body.name.includes('/') || body.name.includes('\\')) {
+        return c.json({ error: 'invalid_name' }, 400);
+      }
+      if (saveAsNew && !normalizeCloudDocName(body.name, `.${targetType}`)) {
+        return c.json({ error: 'invalid_name' }, 400);
+      }
+    }
+
+    let folderTarget: { folderId: string | null; docOwnerUserId: string } | null = null;
+    if (saveAsNew) {
+      const folderResult = await resolveTargetFolderOwner(c, body.folderId, auth.userId);
+      if (folderResult instanceof Response) return folderResult;
+      folderTarget = folderResult;
+    }
+
+    const current = access.doc;
+    if (!(await storage.exists(current.storage_key))) {
+      return c.json({ error: 'cloud_doc_file_missing' }, 404);
+    }
+
+    const currentVersion = parseCloudDocVersion(current.doc_version);
+    if (currentVersion === null) {
+      return c.json({ error: 'cloud_doc_invalid_version' }, 500);
+    }
+
+    const fileUrl = buildInternalOnlyOfficeDocUrl(c, current, currentVersion, auth.userId, 'converter');
+    const sourceFileType = current.ext.replace(/^\./, '').toLowerCase();
+    const convertKey = `${computeCloudDocDocumentKey(current.id, currentVersion)}_${randomHex(4)}`;
+
+    let converted: Awaited<ReturnType<typeof convertViaOnlyOfficeConverter>>;
+    try {
+      converted = await convertViaOnlyOfficeConverter({
+        env: c.env,
+        fileUrl,
+        filetype: sourceFileType,
+        outputtype: targetType,
+        title: current.name,
+        key: convertKey,
+        timeoutMs: timeout.value,
+      });
+    } catch (err) {
+      if (err instanceof OnlyOfficeServiceError) {
+        return onlyOfficeErrorResponse(c, err);
+      }
+      return c.json({ error: CLOUD_DOC_ERROR_CODES.CONVERTER_FAILED }, 502);
+    }
+
+    const stem = current.name.endsWith(current.ext)
+      ? current.name.slice(0, -current.ext.length)
+      : current.name;
+
+    if (saveAsNew && folderTarget) {
+      const rawName = (typeof body.name === 'string' && body.name.trim()) || `${stem || 'Untitled'}.${converted.fileType}`;
+      const safeName = normalizeCloudDocName(rawName, `.${converted.fileType}`);
+      if (!safeName) return c.json({ error: 'invalid_name' }, 400);
+      const meta = getCloudDocMeta(safeName);
+      if (!meta) return c.json({ error: 'unsupported_document_type' }, 400);
+
+      const persisted = await persistNewCloudDoc(c, storage, {
+        userId: folderTarget.docOwnerUserId,
+        folderId: folderTarget.folderId,
+        name: safeName,
+        ext: meta.ext,
+        mimeType: meta.mimeType,
+        bytes: converted.bytes,
+      });
+      if (persisted instanceof Response) return persisted;
+      return c.json({ doc: rowToCloudDocItem(persisted.row), bytesWritten: persisted.bytesWritten }, 201);
+    }
+
+    const fileName =
+      typeof body.name === 'string' && body.name.trim()
+        ? path.posix.basename(body.name.trim())
+        : `${stem || 'Untitled'}.${converted.fileType}`;
+
+    return c.json({
+      fileName,
+      mimeType: converted.mimeType,
+      bytesWritten: converted.bytes.length,
+      bytesBase64: converted.bytes.toString('base64'),
+    });
+  });
+
+  // ── Cloud Docs: In-place raw binary file update (multipart/form-data) ───────
+  routes.put('/cloud-docs/:id/file', async (c): Promise<Response> => {
+    const auth = await requireRegularUser(c);
+    if (auth instanceof Response) return auth;
+
+    const docId = c.req.param('id');
+    const initialAccess = await resolveCloudDocAccess(c.env.DB, docId, auth.userId);
+    if (!initialAccess.allowed) {
+      return c.json({ error: 'not_found' }, 404);
+    }
+    if (initialAccess.role !== 'editor') {
+      return c.json({ error: 'forbidden' }, 403);
+    }
+
+    const form = await parseBoundedMultipartForm(c);
+    if (form instanceof Response) return form;
+
+    const fileEntry = form.get('file');
+    if (!fileEntry || typeof fileEntry === 'string' || typeof (fileEntry as Blob).arrayBuffer !== 'function') {
+      return c.json({ error: 'missing_file' }, 400);
+    }
+    const uploadedFile = fileEntry as File;
+    if (uploadedFile.size > CLOUD_DOCS_MAX_UPLOAD_BYTES) {
+      return c.json({ error: FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE, maxBytes: CLOUD_DOCS_MAX_UPLOAD_BYTES }, 413);
+    }
+
+    let expectedVersion: number | undefined;
+    const rawExpectedVersion = form.get('expectedVersion');
+    if (rawExpectedVersion !== null) {
+      if (typeof rawExpectedVersion !== 'string') {
+        return c.json({ error: 'invalid_expected_version' }, 400);
+      }
+      const trimmed = rawExpectedVersion.trim();
+      if (trimmed.length > 0) {
+        if (!/^\d+$/.test(trimmed)) {
+          return c.json({ error: 'invalid_expected_version' }, 400);
+        }
+        const parsed = Number(trimmed);
+        if (!Number.isSafeInteger(parsed) || parsed < 1) {
+          return c.json({ error: 'invalid_expected_version' }, 400);
+        }
+        expectedVersion = parsed;
+      }
+    }
+
+    const rawName = form.get('name');
+    if (rawName !== null && typeof rawName !== 'string') {
+      return c.json({ error: 'invalid_name' }, 400);
+    }
+    let nextName: string | undefined;
+    let nextExt: string | undefined;
+    let nextMime: string | undefined;
+    if (typeof rawName === 'string' && rawName.trim()) {
+      if (rawName.includes('/') || rawName.includes('\\')) {
+        return c.json({ error: 'invalid_name' }, 400);
+      }
+      const normalized = normalizeCloudDocName(rawName.trim());
+      if (!normalized) {
+        return c.json({ error: 'unsupported_document_type' }, 400);
+      }
+      const meta = getCloudDocMeta(normalized);
+      if (!meta) {
+        return c.json({ error: 'unsupported_document_type' }, 400);
+      }
+      nextName = normalized;
+      nextExt = meta.ext;
+      nextMime = meta.mimeType;
+    }
+
+    const hasFolderId = form.has('folderId');
+    const rawFolderId = hasFolderId ? form.get('folderId') : undefined;
+    if (hasFolderId && rawFolderId !== null && typeof rawFolderId !== 'string') {
+      return c.json({ error: 'invalid_folder_id' }, 400);
+    }
+
+    const arrayBuf = await uploadedFile.arrayBuffer();
+    const bytes = Buffer.from(arrayBuf);
+    if (bytes.length > CLOUD_DOCS_MAX_UPLOAD_BYTES) {
+      return c.json({ error: FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE, maxBytes: CLOUD_DOCS_MAX_UPLOAD_BYTES }, 413);
+    }
+
+    return lockCloudDocCommit(docId, async () => {
+      const liveAccess = await resolveCloudDocAccess(c.env.DB, docId, auth.userId);
+      if (!liveAccess.allowed) return c.json({ error: 'not_found' }, 404);
+      if (liveAccess.role !== 'editor') return c.json({ error: 'forbidden' }, 403);
+
+      const current = liveAccess.doc;
+      const currentVersion = parseCloudDocVersion(current.doc_version);
+      if (currentVersion === null) {
+        return c.json({ error: 'cloud_doc_invalid_version' }, 500);
+      }
+      if (expectedVersion !== undefined && expectedVersion !== currentVersion) {
+        return c.json({ error: 'version_conflict', currentVersion }, 409);
+      }
+
+      let nextFolderId: string | null = null;
+      if (hasFolderId) {
+        const moveResult = await resolveExistingDocMoveFolder(
+          c,
+          rawFolderId,
+          auth.userId,
+          current.user_id,
+          liveAccess.isOwner,
+        );
+        if (moveResult instanceof Response) return moveResult;
+        nextFolderId = moveResult.folderId;
+      }
+
+      const committed = await commitUpdatedCloudDocBytes(c, storage, {
+        current,
+        currentVersion,
+        nextBytes: bytes,
+        name: nextName,
+        ext: nextExt,
+        mimeType: nextMime,
+        folderId: nextFolderId,
+        hasFolderId,
+      });
+      if (committed instanceof Response) return committed;
+
+      return c.json({
+        ok: true,
+        doc: rowToCloudDocItem(committed.doc),
+        role: liveAccess.isOwner ? 'owner' : liveAccess.role,
+        bytesWritten: committed.bytesWritten,
+      });
     });
   });
 

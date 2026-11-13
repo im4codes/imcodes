@@ -4,7 +4,13 @@ import { ALIAS_API_PATH } from './alias-types.js';
 import { VERIFICATION_MACHINE_API_PATH } from './verification-machine.js';
 import { MESSAGE_PINS_API_PATH } from './message-pins.js';
 import { CAPABILITY_HTTP_PATH } from './capability-management.js';
-import { CLOUD_DOCS_API_PATH, RECENT_DOCUMENTS_API_PATH } from './cloud-docs.js';
+import {
+  CLOUD_DOCS_API_PATH,
+  CLOUD_DOCS_CONVERT_SUBPATH,
+  CLOUD_DOCS_DOCBUILDER_SUBPATH,
+  CLOUD_DOCS_FILE_SUBPATH,
+  RECENT_DOCUMENTS_API_PATH,
+} from './cloud-docs.js';
 import { WORKER_SESSION_SNAPSHOT_ROUTE_SEGMENT } from './worker-session-snapshot.js';
 import { CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH } from './controlled-node-artifacts.js';
 import { USAGE_INGEST_ROUTE_SUFFIX } from './usage-analytics.js';
@@ -91,7 +97,11 @@ export const DAEMON_TOKEN_ROUTES: readonly DaemonTokenRoute[] = [
   full('PATCH', `${CLOUD_DOCS_API_PATH}/folders/:id`),
   full('DELETE', `${CLOUD_DOCS_API_PATH}/folders/:id`),
   full('POST', `${CLOUD_DOCS_API_PATH}/blank`),
+  full('POST', `${CLOUD_DOCS_API_PATH}${CLOUD_DOCS_DOCBUILDER_SUBPATH}`),
   full('POST', `${CLOUD_DOCS_API_PATH}/files`),
+  full('POST', `${CLOUD_DOCS_API_PATH}/:id${CLOUD_DOCS_DOCBUILDER_SUBPATH}`),
+  full('POST', `${CLOUD_DOCS_API_PATH}/:id${CLOUD_DOCS_CONVERT_SUBPATH}`),
+  full('PUT', `${CLOUD_DOCS_API_PATH}/:id${CLOUD_DOCS_FILE_SUBPATH}`),
   full('GET', `${CLOUD_DOCS_API_PATH}/:id/content`),
   full('PUT', `${CLOUD_DOCS_API_PATH}/:id/content`),
   full('GET', `${CLOUD_DOCS_API_PATH}/:id/download`),

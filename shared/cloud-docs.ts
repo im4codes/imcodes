@@ -1,6 +1,11 @@
 import { sanitizeUploadFilename } from './upload-filename.js';
 
 export const CLOUD_DOCS_API_PATH = '/api/cloud-docs';
+export const CLOUD_DOCS_DOCBUILDER_SUBPATH = '/docbuilder';
+export const CLOUD_DOCS_CONVERT_SUBPATH = '/convert';
+export const CLOUD_DOCS_FILE_SUBPATH = '/file';
+export const CLOUD_DOCS_ONLYOFFICE_FILE_PATH = `${CLOUD_DOCS_API_PATH}/onlyoffice/file`;
+export const CLOUD_DOCS_ONLYOFFICE_SCRIPT_PATH = `${CLOUD_DOCS_API_PATH}/onlyoffice/script`;
 export const RECENT_DOCUMENTS_API_PATH = '/api/recent-documents';
 export const CLOUD_DOCS_MAX_UPLOAD_BYTES = 50 * 1024 * 1024; // 50 MiB
 export const CLOUD_DOCS_FOLDER_NAME_MAX_LENGTH = 120;
@@ -9,6 +14,14 @@ export const CLOUD_DOCS_RECENT_MAX_LIMIT = 100;
 export const CLOUD_DOCS_DEFAULT_DIR = '/var/lib/imcodes/cloud-docs';
 
 export const CLOUD_DOC_CONTENT_MAX_CHARS = 512 * 1024; // 512 KiB readable text limit
+export const CLOUD_DOC_DOCBUILDER_MAX_SCRIPT_BYTES = 512 * 1024; // 512 KiB DocBuilder script limit
+export const CLOUD_DOC_DOCBUILDER_MAX_ARGUMENT_BYTES = 1024 * 1024; // 1 MiB Argument JSON limit
+export const CLOUD_DOC_DOCBUILDER_DEFAULT_TIMEOUT_MS = 60_000;
+export const CLOUD_DOC_DOCBUILDER_MAX_TIMEOUT_MS = 120_000;
+export const CLOUD_DOC_DOCBUILDER_SCRIPT_TTL_MS = 5 * 60_000;
+export const CLOUD_DOC_DOCBUILDER_POLL_INTERVAL_MS = 250;
+export const CLOUD_DOC_CONVERT_DEFAULT_TIMEOUT_MS = 60_000;
+export const CLOUD_DOC_CONVERT_MAX_TIMEOUT_MS = 120_000;
 export const CLOUD_DOC_ZIP_MAX_ENTRIES = 256;
 export const CLOUD_DOC_ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES = 10 * 1024 * 1024; // 10 MiB
 export const CLOUD_DOC_ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 32 * 1024 * 1024; // 32 MiB
@@ -23,6 +36,40 @@ export type CloudDocBlankType = (typeof CLOUD_DOC_BLANK_TYPES)[number];
 export const CLOUD_DOC_CREATE_TYPES = ['docx', 'xlsx', 'pptx', 'md', 'txt'] as const;
 export type CloudDocCreateType = (typeof CLOUD_DOC_CREATE_TYPES)[number];
 
+export const CLOUD_DOC_DOCBUILDER_OUTPUT_TYPES = [
+  'docx',
+  'xlsx',
+  'pptx',
+  'pdf',
+  'odt',
+  'ods',
+  'odp',
+  'rtf',
+  'txt',
+  'csv',
+] as const;
+export type CloudDocDocBuilderOutputType = (typeof CLOUD_DOC_DOCBUILDER_OUTPUT_TYPES)[number];
+
+export const CLOUD_DOC_CONVERT_TARGET_TYPES = [
+  'docx',
+  'doc',
+  'odt',
+  'rtf',
+  'txt',
+  'xlsx',
+  'xls',
+  'ods',
+  'csv',
+  'pptx',
+  'ppt',
+  'odp',
+  'pdf',
+  'html',
+  'png',
+  'jpg',
+] as const;
+export type CloudDocConvertTargetType = (typeof CLOUD_DOC_CONVERT_TARGET_TYPES)[number];
+
 export const CLOUD_DOC_EDIT_MODES = ['replace', 'append'] as const;
 export type CloudDocEditMode = (typeof CLOUD_DOC_EDIT_MODES)[number];
 
@@ -31,6 +78,14 @@ export const CLOUD_DOC_EDITABLE_EXTS = ['.docx', '.xlsx', '.pptx', '.md', '.txt'
 
 export function isCreateCloudDocType(value: unknown): value is CloudDocCreateType {
   return typeof value === 'string' && (CLOUD_DOC_CREATE_TYPES as readonly string[]).includes(value);
+}
+
+export function isDocBuilderOutputType(value: unknown): value is CloudDocDocBuilderOutputType {
+  return typeof value === 'string' && (CLOUD_DOC_DOCBUILDER_OUTPUT_TYPES as readonly string[]).includes(value);
+}
+
+export function isConvertTargetType(value: unknown): value is CloudDocConvertTargetType {
+  return typeof value === 'string' && (CLOUD_DOC_CONVERT_TARGET_TYPES as readonly string[]).includes(value);
 }
 
 export const RECENT_DOCUMENT_SOURCE_KINDS = ['server_file', 'cloud_doc'] as const;
@@ -52,6 +107,18 @@ export const CLOUD_DOC_ERROR_CODES = {
   CONTENT_TOO_LARGE: 'content_too_large',
   UNSUPPORTED_CONTENT_EDIT: 'unsupported_content_edit',
   INVALID_ARCHIVE: 'invalid_archive',
+  ONLYOFFICE_DISABLED: 'onlyoffice_disabled',
+  DOCBUILDER_FAILED: 'docbuilder_failed',
+  DOCBUILDER_OUTPUT_MISMATCH: 'docbuilder_output_mismatch',
+  DOCBUILDER_TIMEOUT: 'docbuilder_timeout',
+  CONVERTER_FAILED: 'converter_failed',
+  CONVERTER_TIMEOUT: 'converter_timeout',
+  VERSION_CONFLICT: 'version_conflict',
+  INVALID_SCRIPT: 'invalid_script',
+  INVALID_ARGUMENT: 'invalid_argument',
+  INVALID_TIMEOUT: 'invalid_timeout',
+  SCRIPT_TOO_LARGE: 'script_too_large',
+  UNTRUSTED_DOWNLOAD_URL: 'untrusted_download_url',
 } as const;
 
 export type CloudDocShareRole = 'viewer' | 'editor';
@@ -339,4 +406,75 @@ export function buildRecentDocumentSourceKey(params: {
   const normPath = normalizeRecentFilePath(params.filePath);
   if (!serverId || !normPath) return null;
   return `server:${serverId}:${normPath}`;
+}
+
+export interface CloudDocDocBuilderCreateRequest {
+  script: string;
+  type?: CloudDocDocBuilderOutputType | string;
+  name?: string;
+  folderId?: string | null;
+  argument?: Record<string, unknown>;
+  outputName?: string;
+  timeoutMs?: number;
+}
+
+export interface CloudDocDocBuilderCreateResponse {
+  doc: CloudDocItem;
+  bytesWritten: number;
+  onlyofficeUrls?: Record<string, string>;
+}
+
+export interface CloudDocDocBuilderEditRequest {
+  script: string;
+  argument?: Record<string, unknown>;
+  outputType?: CloudDocDocBuilderOutputType | string;
+  outputName?: string;
+  save?: boolean;
+  expectedVersion?: number;
+  name?: string;
+  folderId?: string | null;
+  timeoutMs?: number;
+}
+
+export type CloudDocDocBuilderEditResponse =
+  | {
+      doc: CloudDocItem;
+      role: CloudDocShareRole | 'owner';
+      bytesWritten: number;
+      onlyofficeUrls?: Record<string, string>;
+    }
+  | {
+      doc: CloudDocItem;
+      bytesBase64: string;
+      outputName: string;
+      mimeType: string;
+      bytesWritten: number;
+      onlyofficeUrls?: Record<string, string>;
+    };
+
+export interface CloudDocConvertRequest {
+  targetType: CloudDocConvertTargetType | string;
+  saveAsNew?: boolean;
+  name?: string;
+  folderId?: string | null;
+  timeoutMs?: number;
+}
+
+export type CloudDocConvertResponse =
+  | {
+      doc: CloudDocItem;
+      bytesWritten: number;
+    }
+  | {
+      fileName: string;
+      mimeType: string;
+      bytesWritten: number;
+      bytesBase64: string;
+    };
+
+export interface CloudDocFileUpdateResponse {
+  ok: true;
+  doc: CloudDocItem;
+  role: CloudDocShareRole | 'owner';
+  bytesWritten: number;
 }
