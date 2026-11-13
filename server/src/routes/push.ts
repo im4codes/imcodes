@@ -25,8 +25,11 @@ import {
   PUSH_PLATFORM_ANDROID_JPUSH,
   PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP,
   DEFAULT_PUSH_NOTIFICATION_TYPES,
+  DEFAULT_PUSH_ENABLED_SERVER_IDS,
   isPushPlatform,
   isPushNotificationType,
+  sanitizePushEnabledServerIds,
+  resolvePushPayloadServerId,
   type PushPlatform,
   type PushNotificationType,
 } from '../../../shared/push-notifications.js';
@@ -76,7 +79,7 @@ pushRoutes.post('/register', async (c) => {
   return c.json({ ok: true });
 });
 
-// GET /api/push/preferences — get notification types preferences
+// GET /api/push/preferences — get notification types and allowed servers preferences
 pushRoutes.get('/preferences', async (c) => {
   const userId = c.get('userId' as never) as string;
   const token = c.req.query('token');
@@ -93,37 +96,78 @@ pushRoutes.get('/preferences', async (c) => {
       [userId],
     );
   }
+  const userRow = await c.env.DB.queryOne<{ push_enabled_server_ids?: string[] | null }>(
+    'SELECT push_enabled_server_ids FROM users WHERE id = $1 LIMIT 1',
+    [userId],
+  );
   const types = (row && Array.isArray(row.notification_types))
     ? row.notification_types
     : DEFAULT_PUSH_NOTIFICATION_TYPES;
-  return c.json({ ok: true, types, defaultTypes: DEFAULT_PUSH_NOTIFICATION_TYPES });
+  const enabledServerIds = Array.isArray(userRow?.push_enabled_server_ids)
+    ? sanitizePushEnabledServerIds(userRow.push_enabled_server_ids)
+    : [...DEFAULT_PUSH_ENABLED_SERVER_IDS];
+  return c.json({
+    ok: true,
+    types,
+    defaultTypes: DEFAULT_PUSH_NOTIFICATION_TYPES,
+    enabledServerIds,
+  });
 });
 
-// POST /api/push/preferences — update notification types preferences
+// POST /api/push/preferences — update notification types and/or allowed servers preferences
 pushRoutes.post('/preferences', async (c) => {
   const userId = c.get('userId' as never) as string;
-  const body = await c.req.json<{ types?: string[]; token?: string }>().catch(() => null);
-  if (!body || !Array.isArray(body.types)) {
-    return c.json({ error: 'types array required' }, 400);
+  const body = await c.req.json<{ types?: unknown; enabledServerIds?: unknown; token?: string }>().catch(() => null);
+  if (!body) {
+    return c.json({ error: 'types or enabledServerIds array required' }, 400);
   }
-  const sanitizedTypes = body.types.filter(isPushNotificationType);
+  if (body.types !== undefined && !Array.isArray(body.types)) {
+    return c.json({ error: 'types must be an array' }, 400);
+  }
+  if (body.enabledServerIds !== undefined && !Array.isArray(body.enabledServerIds)) {
+    return c.json({ error: 'enabledServerIds must be an array' }, 400);
+  }
+  const hasTypes = Array.isArray(body.types);
+  const hasEnabledServerIds = Array.isArray(body.enabledServerIds);
+  if (!hasTypes && !hasEnabledServerIds) {
+    return c.json({ error: 'types or enabledServerIds array required' }, 400);
+  }
+
+  const sanitizedTypes = hasTypes ? (body.types as unknown[]).filter(isPushNotificationType) : undefined;
+  const sanitizedServerIds = hasEnabledServerIds
+    ? sanitizePushEnabledServerIds(body.enabledServerIds)
+    : undefined;
+
   try {
-    if (body.token) {
+    if (sanitizedTypes !== undefined) {
+      if (body.token) {
+        await c.env.DB.execute(
+          'UPDATE push_tokens SET notification_types = $1 WHERE user_id = $2 AND token = $3',
+          [sanitizedTypes, userId, body.token],
+        );
+      } else {
+        await c.env.DB.execute(
+          'UPDATE push_tokens SET notification_types = $1 WHERE user_id = $2',
+          [sanitizedTypes, userId],
+        );
+      }
+    }
+    if (sanitizedServerIds !== undefined) {
       await c.env.DB.execute(
-        'UPDATE push_tokens SET notification_types = $1 WHERE user_id = $2 AND token = $3',
-        [sanitizedTypes, userId, body.token],
-      );
-    } else {
-      await c.env.DB.execute(
-        'UPDATE push_tokens SET notification_types = $1 WHERE user_id = $2',
-        [sanitizedTypes, userId],
+        'UPDATE users SET push_enabled_server_ids = $1 WHERE id = $2',
+        [sanitizedServerIds, userId],
       );
     }
   } catch (err) {
     logger.error({ err, userId }, 'Failed to update push preferences');
     return c.json({ error: 'failed to update push preferences' }, 500);
   }
-  return c.json({ ok: true, types: sanitizedTypes });
+
+  return c.json({
+    ok: true,
+    ...(sanitizedTypes !== undefined ? { types: sanitizedTypes } : {}),
+    ...(sanitizedServerIds !== undefined ? { enabledServerIds: sanitizedServerIds } : {}),
+  });
 });
 
 // DELETE /api/push/unregister — remove device token
@@ -221,6 +265,7 @@ export interface PushPayload {
   badge?: number;
   data?: Record<string, string>;
   type?: PushNotificationType;
+  serverId?: string;
 }
 
 /**
@@ -241,11 +286,26 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
     env = maybeEnv!;
   }
 
-  let tokens: Array<{ token: string; platform: string; notification_types?: string[] | null }> = [];
+  const targetServerId = resolvePushPayloadServerId(payload);
+
+  let tokens: Array<{
+    token: string;
+    platform: string;
+    notification_types?: string[] | null;
+    push_enabled_server_ids?: string[] | null;
+  }> = [];
   try {
-    tokens = await db.query<{ token: string; platform: string; notification_types?: string[] | null }>(
+    tokens = await db.query<{
+      token: string;
+      platform: string;
+      notification_types?: string[] | null;
+      push_enabled_server_ids?: string[] | null;
+    }>(
       // A disabled user's devices receive nothing (security/user-status.ts); their registrations stay, so enabling the account resumes it.
-      `SELECT t.token, t.platform, t.notification_types FROM push_tokens t WHERE t.user_id = $1 AND ${activeUserExistsSql('t.user_id')}`,
+      `SELECT t.token, t.platform, t.notification_types, usr.push_enabled_server_ids
+       FROM push_tokens t
+       JOIN users usr ON usr.id = t.user_id
+       WHERE t.user_id = $1 AND ${activeUserExistsSql('t.user_id')}`,
       [payload.userId],
     );
   } catch (err) {
@@ -254,6 +314,13 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
   }
 
   if (tokens.length === 0) return;
+
+  if (targetServerId) {
+    const enabledServerIds = Array.isArray(tokens[0].push_enabled_server_ids)
+      ? sanitizePushEnabledServerIds(tokens[0].push_enabled_server_ids)
+      : [];
+    if (!enabledServerIds.includes(targetServerId)) return;
+  }
 
   const matchingTokens = tokens.filter((t) => {
     if (!payload.type) return true;

@@ -310,3 +310,76 @@ describe('push notification preferences', () => {
     expect(postBodies[postBodies.length - 1]).toEqual({ types: ['task_pair_audit'] });
   });
 });
+
+describe('push enabled servers preferences', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    apiFetchMock.mockReset();
+  });
+
+  it('defaults enabled servers to empty array [] when localStorage is empty', async () => {
+    const { getLocalPushEnabledServers } = await import('../src/push-notifications.js');
+    expect(getLocalPushEnabledServers()).toEqual([]);
+  });
+
+  it('fetches both types and enabledServerIds in fetchPushNotificationSettings without overwriting clean values', async () => {
+    const {
+      fetchPushNotificationSettings,
+      getLocalPushEnabledServers,
+      getLocalPushNotificationPreferences,
+    } = await import('../src/push-notifications.js');
+
+    apiFetchMock.mockResolvedValueOnce({
+      ok: true,
+      types: ['task_complete', 'remote_desktop'],
+      enabledServerIds: ['srv-1', 'srv-2'],
+    });
+
+    const snapshot = await fetchPushNotificationSettings();
+    expect(snapshot).toEqual({
+      types: ['task_complete', 'remote_desktop'],
+      enabledServerIds: ['srv-1', 'srv-2'],
+    });
+    expect(getLocalPushNotificationPreferences()).toEqual(['task_complete', 'remote_desktop']);
+    expect(getLocalPushEnabledServers()).toEqual(['srv-1', 'srv-2']);
+  });
+
+  it('syncs enabledServerIds via POST /api/push/preferences without sending types', async () => {
+    const { syncPushEnabledServers, getLocalPushEnabledServers } = await import('../src/push-notifications.js');
+    apiFetchMock.mockResolvedValueOnce({ ok: true, enabledServerIds: ['srv-1'] });
+
+    await syncPushEnabledServers([' srv-1 ', '', 'srv-1']);
+    expect(getLocalPushEnabledServers()).toEqual(['srv-1']);
+    expect(apiFetchMock).toHaveBeenCalledWith('/api/push/preferences', {
+      method: 'POST',
+      body: JSON.stringify({ enabledServerIds: ['srv-1'] }),
+    });
+  });
+
+  it('guards enabledServerIds against stale remote read while local edit is dirty', async () => {
+    const {
+      fetchPushNotificationSettings,
+      recordLocalPushEnabledServersEdit,
+      getLocalPushEnabledServers,
+    } = await import('../src/push-notifications.js');
+
+    let resolveFetch: (val: any) => void;
+    apiFetchMock.mockReturnValueOnce(new Promise((resolve) => { resolveFetch = resolve; }));
+
+    const pending = fetchPushNotificationSettings();
+    recordLocalPushEnabledServersEdit(['srv-2']);
+
+    resolveFetch!({
+      ok: true,
+      types: ['task_complete'],
+      enabledServerIds: ['srv-1'],
+    });
+
+    const snapshot = await pending;
+    expect(snapshot).toEqual({
+      types: ['task_complete'],
+      enabledServerIds: null,
+    });
+    expect(getLocalPushEnabledServers()).toEqual(['srv-2']);
+  });
+});

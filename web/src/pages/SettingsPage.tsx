@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { startAuthentication } from '@simplewebauthn/browser';
-import { ApiError, passwordChange, passkeyVerifyBegin, passwordSetupWithPasskey, updateDisplayName } from '../api.js';
+import { ApiError, apiFetch, passwordChange, passkeyVerifyBegin, passwordSetupWithPasskey, updateDisplayName } from '../api.js';
 import { isNative } from '../native.js';
 import { validatePasswordComplexity } from '@shared/password-rules.js';
 import { AUTH_ERROR_CODES } from '@shared/auth-error-codes.js';
@@ -16,15 +16,25 @@ import {
   type PushNotificationType,
 } from '@shared/push-notifications.js';
 import {
-  fetchPushNotificationPreferences,
+  fetchPushNotificationSettings,
   getLocalPushNotificationPreferences,
+  getLocalPushEnabledServers,
   syncPushNotificationPreferences,
+  syncPushEnabledServers,
   hasUnsyncedPushNotificationEdits,
+  hasUnsyncedPushEnabledServerEdits,
 } from '../push-notifications.js';
 import { GuidePage } from './GuidePage.js';
 import { PasskeyManager } from '../components/PasskeyManager.js';
 import { KeyboardShortcutsSection } from '../components/KeyboardShortcutsSection.js';
 import type { KeyboardShortcutOverrides } from '../keyboard-shortcuts.js';
+
+interface PushServerItem {
+  id: string;
+  name: string;
+  kind: 'daemon' | 'controlled';
+  online: boolean;
+}
 
 export type SettingsTab = 'profile' | 'notifications' | 'security' | 'shortcuts' | 'guide';
 
@@ -88,20 +98,77 @@ export function SettingsPage({
   const [pushPreferences, setPushPreferences] = useState<PushNotificationType[]>(() =>
     getLocalPushNotificationPreferences(),
   );
+  const [pushEnabledServers, setPushEnabledServers] = useState<string[]>(() =>
+    getLocalPushEnabledServers(),
+  );
+  const [pushServers, setPushServers] = useState<PushServerItem[]>([]);
+  const [pushServersLoading, setPushServersLoading] = useState(false);
 
   const userEditedPushRef = useRef(false);
+  const userEditedPushServersRef = useRef(false);
+  const pushServersFetchedRef = useRef(false);
 
   useEffect(() => {
     let unmounted = false;
-    void fetchPushNotificationPreferences().then((types) => {
-      if (!unmounted && types !== null && !userEditedPushRef.current && !hasUnsyncedPushNotificationEdits()) {
-        setPushPreferences(types);
+    void fetchPushNotificationSettings().then((snapshot) => {
+      if (unmounted || !snapshot) return;
+      if (snapshot.types !== null && !userEditedPushRef.current && !hasUnsyncedPushNotificationEdits()) {
+        setPushPreferences(snapshot.types);
+      }
+      if (snapshot.enabledServerIds !== null && !userEditedPushServersRef.current && !hasUnsyncedPushEnabledServerEdits()) {
+        setPushEnabledServers(snapshot.enabledServerIds);
       }
     });
     return () => {
       unmounted = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (activeTab !== 'notifications' || pushServersFetchedRef.current) return;
+    pushServersFetchedRef.current = true;
+    let unmounted = false;
+    setPushServersLoading(true);
+    void Promise.allSettled([
+      apiFetch<{ servers?: Array<{ id?: unknown; name?: unknown; status?: unknown }> }>('/api/server'),
+      apiFetch<{ machines?: Array<{ serverId?: unknown; displayName?: unknown; online?: unknown }> }>('/api/machines'),
+    ]).then(([serversRes, machinesRes]) => {
+      if (unmounted) return;
+      const merged = new Map<string, PushServerItem>();
+      if (serversRes.status === 'fulfilled' && Array.isArray(serversRes.value?.servers)) {
+        for (const srv of serversRes.value.servers) {
+          const id = typeof srv.id === 'string' ? srv.id.trim() : '';
+          if (!id) continue;
+          const name = typeof srv.name === 'string' && srv.name.trim() ? srv.name.trim() : id;
+          merged.set(id, {
+            id,
+            name,
+            kind: 'daemon',
+            online: srv.status === 'online',
+          });
+        }
+      }
+      if (machinesRes.status === 'fulfilled' && Array.isArray(machinesRes.value?.machines)) {
+        for (const machine of machinesRes.value.machines) {
+          const id = typeof machine.serverId === 'string' ? machine.serverId.trim() : '';
+          if (!id || merged.has(id)) continue;
+          const name = typeof machine.displayName === 'string' && machine.displayName.trim() ? machine.displayName.trim() : id;
+          merged.set(id, {
+            id,
+            name,
+            kind: 'controlled',
+            online: Boolean(machine.online),
+          });
+        }
+      }
+      setPushServers([...merged.values()]);
+    }).finally(() => {
+      if (!unmounted) setPushServersLoading(false);
+    });
+    return () => {
+      unmounted = true;
+    };
+  }, [activeTab]);
 
   const handleSelectTab = (tab: SettingsTab) => {
     setActiveTab(tab);
@@ -117,6 +184,29 @@ export function SettingsPage({
       void syncPushNotificationPreferences(next);
       return next;
     });
+  };
+
+  const togglePushServer = (serverId: string) => {
+    userEditedPushServersRef.current = true;
+    setPushEnabledServers((prev) => {
+      const next = prev.includes(serverId) ? prev.filter((item) => item !== serverId) : [...prev, serverId];
+      void syncPushEnabledServers(next);
+      return next;
+    });
+  };
+
+  const selectAllPushServers = () => {
+    if (pushServers.length === 0) return;
+    userEditedPushServersRef.current = true;
+    const next = pushServers.map((s) => s.id);
+    setPushEnabledServers(next);
+    void syncPushEnabledServers(next);
+  };
+
+  const clearAllPushServers = () => {
+    userEditedPushServersRef.current = true;
+    setPushEnabledServers([]);
+    void syncPushEnabledServers([]);
   };
 
   const applySetupErrorCode = (errorCode: string | null) => {
@@ -604,6 +694,70 @@ export function SettingsPage({
                     </div>
                   </label>
                 </div>
+              </div>
+
+              {/* Push Notification Allowed Servers */}
+              <div class="settings-card" data-testid="push-notification-servers-card">
+                <div style={inlineLabelStyle}>{t('settings.push_servers_label')}</div>
+                <h2 style={{ fontSize: '16px', fontWeight: '600', margin: '0 0 6px', color: '#e2e8f0' }}>
+                  {t('settings.push_servers_title')}
+                </h2>
+                <p style={{ color: '#94a3b8', fontSize: '13px', lineHeight: 1.5, margin: '0 0 12px' }}>
+                  {t('settings.push_servers_desc')}
+                </p>
+
+                <div class="settings-action-row" style={{ marginBottom: '12px' }}>
+                  <button
+                    type="button"
+                    class="settings-btn-secondary"
+                    style={{ minHeight: '32px', padding: '6px 12px', fontSize: '12px' }}
+                    disabled={pushServers.length === 0 || pushServers.every((s) => pushEnabledServers.includes(s.id))}
+                    onClick={selectAllPushServers}
+                  >
+                    {t('settings.push_servers_select_all')}
+                  </button>
+                  <button
+                    type="button"
+                    class="settings-btn-secondary"
+                    style={{ minHeight: '32px', padding: '6px 12px', fontSize: '12px' }}
+                    disabled={pushEnabledServers.length === 0}
+                    onClick={clearAllPushServers}
+                  >
+                    {t('settings.push_servers_clear')}
+                  </button>
+                </div>
+
+                {pushServersLoading && pushServers.length === 0 ? (
+                  <div style={{ color: '#94a3b8', fontSize: '13px' }}>{t('common.loading')}</div>
+                ) : pushServers.length === 0 ? (
+                  <div style={{ color: '#94a3b8', fontSize: '13px' }}>{t('settings.push_servers_empty')}</div>
+                ) : (
+                  <div style={{ display: 'grid', gap: '8px' }}>
+                    {pushServers.map((srv) => (
+                      <label key={srv.id} class="settings-checkbox-row">
+                        <input
+                          type="checkbox"
+                          aria-label={srv.name}
+                          checked={pushEnabledServers.includes(srv.id)}
+                          onChange={() => togglePushServer(srv.id)}
+                          style={checkboxStyle}
+                        />
+                        <div style={checkboxTextWrapStyle}>
+                          <div style={checkboxTitleStyle}>{srv.name}</div>
+                          <div style={checkboxDescStyle}>
+                            {srv.kind === 'controlled'
+                              ? t('settings.push_server_role_controlled')
+                              : t('settings.push_server_role_daemon')}
+                            {' · '}
+                            {srv.online
+                              ? t('settings.push_server_online')
+                              : t('settings.push_server_offline')}
+                          </div>
+                        </div>
+                      </label>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
           )}

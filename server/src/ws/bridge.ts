@@ -14203,6 +14203,7 @@ export class WsBridge {
     try {
       await dispatchPush({
         userId: server.user_id,
+        serverId: this.serverId,
         title,
         body,
         type: pushType,
@@ -14307,6 +14308,7 @@ export class WsBridge {
     try {
       await dispatchPush({
         userId: server.user_id,
+        serverId: this.serverId,
         title,
         body,
         type: notifType,

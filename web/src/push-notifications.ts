@@ -21,7 +21,9 @@ import {
   PUSH_PLATFORM_ANDROID_FCM,
   PUSH_PLATFORM_ANDROID_JPUSH,
   DEFAULT_PUSH_NOTIFICATION_TYPES,
+  DEFAULT_PUSH_ENABLED_SERVER_IDS,
   isPushNotificationType,
+  sanitizePushEnabledServerIds,
   type PushPlatform,
   type PushNotificationType,
 } from '@shared/push-notifications.js';
@@ -206,89 +208,222 @@ function handleNotificationOpen(data: Record<string, string> | undefined): void 
 }
 
 export const PUSH_NOTIFICATION_PREFERENCES_KEY = 'imcodes.push_notification_preferences';
+export const PUSH_ENABLED_SERVERS_PREFERENCES_KEY = 'imcodes.push_enabled_server_ids';
 
-let currentEditGeneration = 0;
-let lastSyncedGeneration = 0;
-let syncQueue: Promise<void> = Promise.resolve();
-let pendingSync: { types: PushNotificationType[]; generation: number } | null = null;
+interface SyncedLocalPreference<T extends string> {
+  hasUnsyncedEdits: () => boolean;
+  getLastSyncedGeneration: () => number;
+  getCurrentEditGeneration: () => number;
+  resetForTesting: () => void;
+  getLocal: () => T[];
+  setLocal: (value: T[]) => void;
+  recordEdit: (value: T[]) => number;
+  applyRemoteIfClean: (raw: unknown, startGen: number, wasDirtyAtStart: boolean) => T[] | null;
+  sync: (value: T[]) => Promise<void>;
+}
 
-export function hasUnsyncedPushNotificationEdits(): boolean {
-  if (pendingSync !== null) return true;
-  if (currentEditGeneration > lastSyncedGeneration) {
-    try {
-      if (typeof localStorage !== 'undefined' && localStorage.getItem(PUSH_NOTIFICATION_PREFERENCES_KEY) === null) {
-        currentEditGeneration = 0;
-        lastSyncedGeneration = 0;
-        return false;
+function createSyncedLocalPreference<T extends string>(options: {
+  storageKey: string;
+  getDefault: () => T[];
+  sanitize: (raw: unknown[]) => T[];
+  buildPostBody: (value: T[]) => Record<string, unknown>;
+}): SyncedLocalPreference<T> {
+  let currentEditGeneration = 0;
+  let lastSyncedGeneration = 0;
+  let syncQueue: Promise<void> = Promise.resolve();
+  let pendingSync: { value: T[]; generation: number } | null = null;
+
+  const hasUnsyncedEdits = (): boolean => {
+    if (pendingSync !== null) return true;
+    if (currentEditGeneration > lastSyncedGeneration) {
+      try {
+        if (typeof localStorage !== 'undefined' && localStorage.getItem(options.storageKey) === null) {
+          currentEditGeneration = 0;
+          lastSyncedGeneration = 0;
+          return false;
+        }
+      } catch {
+        // ignore
       }
+      return true;
+    }
+    return false;
+  };
+
+  const getLocal = (): T[] => {
+    try {
+      const raw = localStorage.getItem(options.storageKey);
+      if (raw !== null) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          return options.sanitize(parsed);
+        }
+      }
+    } catch {
+      // fallback
+    }
+    return options.getDefault();
+  };
+
+  const setLocal = (value: T[]): void => {
+    try {
+      localStorage.setItem(options.storageKey, JSON.stringify(value));
     } catch {
       // ignore
     }
-    return true;
-  }
-  return false;
+  };
+
+  const recordEdit = (value: T[]): number => {
+    currentEditGeneration++;
+    setLocal(value);
+    return currentEditGeneration;
+  };
+
+  const applyRemoteIfClean = (raw: unknown, startGen: number, wasDirtyAtStart: boolean): T[] | null => {
+    if (!Array.isArray(raw)) return null;
+    const valid = options.sanitize(raw);
+    // Guard against:
+    // 1. Reads initiated while dirty (un-ACKed/pending local edits) - cannot be upgraded by subsequent ACK;
+    // 2. Reads arriving after newer local edits were made;
+    // 3. Reads completing while local state is currently dirty.
+    if (wasDirtyAtStart || currentEditGeneration > startGen || hasUnsyncedEdits()) {
+      return null;
+    }
+    setLocal(valid);
+    return valid;
+  };
+
+  const sync = async (value: T[]): Promise<void> => {
+    const gen = recordEdit(value);
+    pendingSync = { value, generation: gen };
+
+    syncQueue = syncQueue.then(async () => {
+      if (!pendingSync || lastSyncedGeneration >= pendingSync.generation) return;
+      const targetGen = pendingSync.generation;
+      const toSend = pendingSync.value;
+      try {
+        const res = await apiFetch<{ ok?: boolean }>('/api/push/preferences', {
+          method: 'POST',
+          body: JSON.stringify(options.buildPostBody(toSend)),
+        });
+        if (res && res.ok !== false) {
+          if (lastSyncedGeneration < targetGen) {
+            lastSyncedGeneration = targetGen;
+          }
+          if (pendingSync && pendingSync.generation <= targetGen) {
+            pendingSync = null;
+          }
+        } else {
+          throw new Error('Push preferences update failed');
+        }
+      } catch (err) {
+        console.warn('Failed to sync push notification preferences:', err);
+        // Do NOT clear pendingSync on failure, retaining dirty state for subsequent sync/read guards
+      }
+    });
+
+    await syncQueue;
+  };
+
+  return {
+    hasUnsyncedEdits,
+    getLastSyncedGeneration: () => lastSyncedGeneration,
+    getCurrentEditGeneration: () => currentEditGeneration,
+    resetForTesting: () => {
+      currentEditGeneration = 0;
+      lastSyncedGeneration = 0;
+      pendingSync = null;
+      syncQueue = Promise.resolve();
+    },
+    getLocal,
+    setLocal,
+    recordEdit,
+    applyRemoteIfClean,
+    sync,
+  };
+}
+
+const pushTypesPref = createSyncedLocalPreference<PushNotificationType>({
+  storageKey: PUSH_NOTIFICATION_PREFERENCES_KEY,
+  getDefault: () => [...DEFAULT_PUSH_NOTIFICATION_TYPES],
+  sanitize: (raw) => raw.filter(isPushNotificationType),
+  buildPostBody: (types) => ({ types }),
+});
+
+const pushServersPref = createSyncedLocalPreference<string>({
+  storageKey: PUSH_ENABLED_SERVERS_PREFERENCES_KEY,
+  getDefault: () => [...DEFAULT_PUSH_ENABLED_SERVER_IDS],
+  sanitize: (raw) => sanitizePushEnabledServerIds(raw),
+  buildPostBody: (enabledServerIds) => ({ enabledServerIds }),
+});
+
+export function hasUnsyncedPushNotificationEdits(): boolean {
+  return pushTypesPref.hasUnsyncedEdits();
 }
 
 export function getLastSyncedPushNotificationGeneration(): number {
-  return lastSyncedGeneration;
+  return pushTypesPref.getLastSyncedGeneration();
+}
+
+export function hasUnsyncedPushEnabledServerEdits(): boolean {
+  return pushServersPref.hasUnsyncedEdits();
 }
 
 export function resetPushNotificationPreferencesStateForTesting(): void {
-  currentEditGeneration = 0;
-  lastSyncedGeneration = 0;
-  pendingSync = null;
-  syncQueue = Promise.resolve();
+  pushTypesPref.resetForTesting();
+  pushServersPref.resetForTesting();
 }
 
 export function getLocalPushNotificationPreferences(): PushNotificationType[] {
-  try {
-    const raw = localStorage.getItem(PUSH_NOTIFICATION_PREFERENCES_KEY);
-    if (raw !== null) {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) {
-        return parsed.filter(isPushNotificationType);
-      }
-    }
-  } catch {
-    // fallback
-  }
-  return [...DEFAULT_PUSH_NOTIFICATION_TYPES];
+  return pushTypesPref.getLocal();
 }
 
 export function setLocalPushNotificationPreferences(types: PushNotificationType[]): void {
-  try {
-    localStorage.setItem(PUSH_NOTIFICATION_PREFERENCES_KEY, JSON.stringify(types));
-  } catch {
-    // ignore
-  }
+  pushTypesPref.setLocal(types);
 }
 
 export function recordLocalPushNotificationEdit(types: PushNotificationType[]): number {
-  currentEditGeneration++;
-  setLocalPushNotificationPreferences(types);
-  return currentEditGeneration;
+  return pushTypesPref.recordEdit(types);
 }
 
 export function getCurrentPushNotificationEditGeneration(): number {
-  return currentEditGeneration;
+  return pushTypesPref.getCurrentEditGeneration();
 }
 
-export async function fetchPushNotificationPreferences(): Promise<PushNotificationType[] | null> {
-  const startGen = currentEditGeneration;
-  const wasDirtyAtStart = hasUnsyncedPushNotificationEdits();
+export function getLocalPushEnabledServers(): string[] {
+  return pushServersPref.getLocal();
+}
+
+export function setLocalPushEnabledServers(serverIds: string[]): void {
+  pushServersPref.setLocal(sanitizePushEnabledServerIds(serverIds));
+}
+
+export function recordLocalPushEnabledServersEdit(serverIds: string[]): number {
+  return pushServersPref.recordEdit(sanitizePushEnabledServerIds(serverIds));
+}
+
+export interface PushNotificationSettingsSnapshot {
+  types: PushNotificationType[] | null;
+  enabledServerIds: string[] | null;
+}
+
+export async function fetchPushNotificationSettings(): Promise<PushNotificationSettingsSnapshot | null> {
+  const typesStartGen = pushTypesPref.getCurrentEditGeneration();
+  const typesDirtyAtStart = pushTypesPref.hasUnsyncedEdits();
+  const serversStartGen = pushServersPref.getCurrentEditGeneration();
+  const serversDirtyAtStart = pushServersPref.hasUnsyncedEdits();
   try {
-    const res = await apiFetch<{ ok: boolean; types: PushNotificationType[] }>('/api/push/preferences');
+    const res = await apiFetch<{
+      ok: boolean;
+      types?: unknown;
+      enabledServerIds?: unknown;
+    }>('/api/push/preferences');
     if (res?.ok && Array.isArray(res.types)) {
-      const valid = res.types.filter(isPushNotificationType);
-      // Guard against:
-      // 1. Reads initiated while dirty (un-ACKed/pending local edits) - cannot be upgraded by subsequent ACK;
-      // 2. Reads arriving after newer local edits were made;
-      // 3. Reads completing while local state is currently dirty.
-      if (wasDirtyAtStart || currentEditGeneration > startGen || hasUnsyncedPushNotificationEdits()) {
-        return null;
-      }
-      setLocalPushNotificationPreferences(valid);
-      return valid;
+      const types = pushTypesPref.applyRemoteIfClean(res.types, typesStartGen, typesDirtyAtStart);
+      const enabledServerIds = Array.isArray(res.enabledServerIds)
+        ? pushServersPref.applyRemoteIfClean(res.enabledServerIds, serversStartGen, serversDirtyAtStart)
+        : null;
+      return { types, enabledServerIds };
     }
   } catch (err) {
     console.warn('Failed to fetch remote push notification preferences:', err);
@@ -296,36 +431,17 @@ export async function fetchPushNotificationPreferences(): Promise<PushNotificati
   return null;
 }
 
+export async function fetchPushNotificationPreferences(): Promise<PushNotificationType[] | null> {
+  const snapshot = await fetchPushNotificationSettings();
+  return snapshot?.types ?? null;
+}
+
 export async function syncPushNotificationPreferences(types: PushNotificationType[]): Promise<void> {
-  const gen = recordLocalPushNotificationEdit(types);
-  pendingSync = { types, generation: gen };
+  await pushTypesPref.sync(types);
+}
 
-  syncQueue = syncQueue.then(async () => {
-    if (!pendingSync || lastSyncedGeneration >= pendingSync.generation) return;
-    const targetGen = pendingSync.generation;
-    const toSend = pendingSync.types;
-    try {
-      const res = await apiFetch<{ ok?: boolean }>('/api/push/preferences', {
-        method: 'POST',
-        body: JSON.stringify({ types: toSend }),
-      });
-      if (res && res.ok !== false) {
-        if (lastSyncedGeneration < targetGen) {
-          lastSyncedGeneration = targetGen;
-        }
-        if (pendingSync && pendingSync.generation <= targetGen) {
-          pendingSync = null;
-        }
-      } else {
-        throw new Error('Push preferences update failed');
-      }
-    } catch (err) {
-      console.warn('Failed to sync push notification preferences:', err);
-      // Do NOT clear pendingSync on failure, retaining dirty state for subsequent sync/read guards
-    }
-  });
-
-  await syncQueue;
+export async function syncPushEnabledServers(serverIds: string[]): Promise<void> {
+  await pushServersPref.sync(sanitizePushEnabledServerIds(serverIds));
 }
 
 async function registerDeviceToken(

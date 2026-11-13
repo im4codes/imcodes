@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Hono } from 'hono';
 import {
   DEFAULT_PUSH_NOTIFICATION_TYPES,
+  DEFAULT_PUSH_ENABLED_SERVER_IDS,
   PUSH_NOTIFICATION_TYPE_TASK_COMPLETE,
   PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT,
   PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE,
@@ -10,6 +11,7 @@ import {
   PUSH_PLATFORM_IOS,
   PUSH_PLATFORM_ANDROID_JPUSH,
   classifyTaskPairNotificationType,
+  sanitizePushEnabledServerIds,
 } from '../../shared/push-notifications.js';
 
 const mockDb = {
@@ -65,6 +67,7 @@ describe('push preferences and registration routes', () => {
       expect(json.ok).toBe(true);
       expect(json.types).toEqual(DEFAULT_PUSH_NOTIFICATION_TYPES);
       expect(json.defaultTypes).toEqual(DEFAULT_PUSH_NOTIFICATION_TYPES);
+      expect(json.enabledServerIds).toEqual(DEFAULT_PUSH_ENABLED_SERVER_IDS);
     });
 
     it('returns empty array when user explicitly configured empty preferences', async () => {
@@ -81,10 +84,14 @@ describe('push preferences and registration routes', () => {
       expect(json.types).toEqual([]);
     });
 
-    it('returns saved preferences for the user', async () => {
-      mockDb.queryOne.mockResolvedValueOnce({
-        notification_types: ['task_complete', 'task_pair_done', 'remote_desktop'],
-      });
+    it('returns saved preferences for the user including enabledServerIds', async () => {
+      mockDb.queryOne
+        .mockResolvedValueOnce({
+          notification_types: ['task_complete', 'task_pair_done', 'remote_desktop'],
+        })
+        .mockResolvedValueOnce({
+          push_enabled_server_ids: ['srv-1', 'srv-2'],
+        });
 
       const res = await app.request('/api/push/preferences', {
         headers: { Authorization: 'Bearer valid-user-token' },
@@ -93,12 +100,17 @@ describe('push preferences and registration routes', () => {
       const json = await res.json();
       expect(json.ok).toBe(true);
       expect(json.types).toEqual(['task_complete', 'task_pair_done', 'remote_desktop']);
+      expect(json.enabledServerIds).toEqual(['srv-1', 'srv-2']);
     });
 
-    it('queries by specific token when token query param is provided', async () => {
-      mockDb.queryOne.mockResolvedValueOnce({
-        notification_types: ['task_pair_audit'],
-      });
+    it('queries by specific token when token query param is provided and still returns enabledServerIds', async () => {
+      mockDb.queryOne
+        .mockResolvedValueOnce({
+          notification_types: ['task_pair_audit'],
+        })
+        .mockResolvedValueOnce({
+          push_enabled_server_ids: ['srv-token-shared'],
+        });
 
       const res = await app.request('/api/push/preferences?token=dev-token-abc', {
         headers: { Authorization: 'Bearer valid-user-token' },
@@ -106,6 +118,7 @@ describe('push preferences and registration routes', () => {
       expect(res.status).toBe(200);
       const json = await res.json();
       expect(json.types).toEqual(['task_pair_audit']);
+      expect(json.enabledServerIds).toEqual(['srv-token-shared']);
       expect(mockDb.queryOne).toHaveBeenCalledWith(
         expect.stringContaining('WHERE user_id = $1 AND token = $2'),
         ['user-123', 'dev-token-abc'],
@@ -191,10 +204,72 @@ describe('push preferences and registration routes', () => {
         }),
       });
       expect(res.status).toBe(200);
+      expect(mockDb.execute).toHaveBeenCalledTimes(1);
       expect(mockDb.execute).toHaveBeenCalledWith(
         expect.stringContaining('WHERE user_id = $2 AND token = $3'),
         [['task_pair_audit'], 'user-123', 'token-xyz'],
       );
+    });
+
+    it('updates enabledServerIds alone without touching notification_types', async () => {
+      mockDb.execute.mockResolvedValueOnce({ changes: 1 });
+
+      const res = await app.request('/api/push/preferences', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer valid-user-token',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          enabledServerIds: [' srv-a ', '', 'srv-b', 'srv-a', 123],
+        }),
+      });
+      expect(res.status).toBe(200);
+      const json = await res.json();
+      expect(json).toEqual({ ok: true, enabledServerIds: ['srv-a', 'srv-b'] });
+      expect(mockDb.execute).toHaveBeenCalledTimes(1);
+      expect(mockDb.execute).toHaveBeenCalledWith(
+        'UPDATE users SET push_enabled_server_ids = $1 WHERE id = $2',
+        [['srv-a', 'srv-b'], 'user-123'],
+      );
+    });
+
+    it('rejects non-array enabledServerIds with 400', async () => {
+      const res = await app.request('/api/push/preferences', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer valid-user-token',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          enabledServerIds: 'srv-a',
+        }),
+      });
+      expect(res.status).toBe(400);
+    });
+
+    it('updates both types and enabledServerIds when both are provided', async () => {
+      mockDb.execute.mockResolvedValue({ changes: 1 });
+
+      const res = await app.request('/api/push/preferences', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer valid-user-token',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          types: ['task_complete'],
+          enabledServerIds: ['srv-1'],
+        }),
+      });
+      expect(res.status).toBe(200);
+      const json = await res.json();
+      expect(json).toEqual({
+        ok: true,
+        types: ['task_complete'],
+        enabledServerIds: ['srv-1'],
+      });
+      expect(mockDb.execute).toHaveBeenCalledTimes(2);
     });
   });
 
@@ -240,6 +315,7 @@ describe('push preferences and registration routes', () => {
         expect.stringContaining('INSERT INTO push_tokens'),
         expect.arrayContaining(['user-123', 'ios-device-token-2', PUSH_PLATFORM_IOS, DEFAULT_PUSH_NOTIFICATION_TYPES]),
       );
+      expect(mockDb.execute).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -359,6 +435,111 @@ describe('push preferences and registration routes', () => {
 
       fetchSpy.mockRestore();
     });
+
+    it('suppresses server push when push_enabled_server_ids is empty (default)', async () => {
+      const mockEnv = {
+        DB: mockDb,
+        JPUSH_APP_KEY: 'mock-key',
+        JPUSH_MASTER_SECRET: 'mock-secret',
+      } as any;
+
+      mockDb.query.mockResolvedValueOnce([
+        {
+          token: 'dev-token-default',
+          platform: PUSH_PLATFORM_ANDROID_JPUSH,
+          notification_types: DEFAULT_PUSH_NOTIFICATION_TYPES,
+          push_enabled_server_ids: [],
+        },
+      ]);
+
+      const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+      await dispatchPush(
+        {
+          userId: 'user-123',
+          serverId: 'srv-1',
+          title: 'Task complete',
+          body: 'Done',
+          type: PUSH_NOTIFICATION_TYPE_TASK_COMPLETE,
+          data: { serverId: 'srv-1' },
+        },
+        mockEnv,
+      );
+
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(mockDb.query).toHaveBeenCalledTimes(1); // no badge increment
+
+      fetchSpy.mockRestore();
+    });
+
+    it('dispatches push for checked server while suppressing unchecked server and ignoring deleted IDs', async () => {
+      const mockEnv = {
+        DB: mockDb,
+        JPUSH_APP_KEY: 'mock-key',
+        JPUSH_MASTER_SECRET: 'mock-secret',
+      } as any;
+
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response(JSON.stringify({ sendno: '1', msg_id: '123' }), { status: 200 }),
+      );
+
+      // Server A is allowed (alongside a deleted/unknown server ID)
+      mockDb.query
+        .mockResolvedValueOnce([
+          {
+            token: 'dev-token-1',
+            platform: PUSH_PLATFORM_ANDROID_JPUSH,
+            notification_types: DEFAULT_PUSH_NOTIFICATION_TYPES,
+            push_enabled_server_ids: ['deleted-srv-99', 'srv-a'],
+          },
+        ])
+        .mockResolvedValueOnce([{ badge_count: 1 }]);
+
+      await dispatchPush(
+        {
+          userId: 'user-123',
+          serverId: 'srv-a',
+          title: 'Server A',
+          body: 'Allowed',
+          type: PUSH_NOTIFICATION_TYPE_TASK_COMPLETE,
+          data: { serverId: 'srv-a' },
+        },
+        mockEnv,
+      );
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+      // Server B is not in push_enabled_server_ids (only data.serverId provided)
+      mockDb.query.mockResolvedValueOnce([
+        {
+          token: 'dev-token-1',
+          platform: PUSH_PLATFORM_ANDROID_JPUSH,
+          notification_types: DEFAULT_PUSH_NOTIFICATION_TYPES,
+          push_enabled_server_ids: ['deleted-srv-99', 'srv-a'],
+        },
+      ]);
+
+      await dispatchPush(
+        {
+          userId: 'user-123',
+          title: 'Server B',
+          body: 'Suppressed',
+          type: PUSH_NOTIFICATION_TYPE_TASK_COMPLETE,
+          data: { serverId: 'srv-b' },
+        },
+        mockEnv,
+      );
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+      fetchSpy.mockRestore();
+    });
+
+    it('sanitizes enabledServerIds cleanly', () => {
+      expect(sanitizePushEnabledServerIds(null)).toEqual([]);
+      expect(sanitizePushEnabledServerIds(['  srv-1  ', '', 'srv-2', 'srv-1', 42, 'x'.repeat(200)])).toEqual([
+        'srv-1',
+        'srv-2',
+      ]);
+    });
   });
 
   describe('POST /api/push/relay', () => {
@@ -440,6 +621,7 @@ describe('push preferences and registration routes', () => {
           token: 'dev-token',
           platform: PUSH_PLATFORM_ANDROID_JPUSH,
           notification_types: DEFAULT_PUSH_NOTIFICATION_TYPES,
+          push_enabled_server_ids: ['test-server-id'],
         },
       ]);
 

@@ -61,6 +61,16 @@ vi.mock('react-i18next', () => ({
         'settings.push_security_highest_badge': 'Highest Security Alert',
         'settings.push_remote_desktop_title': 'Remote Desktop Auto-Unlock Alert',
         'settings.push_remote_desktop_desc': 'Highest severity alert',
+        'settings.push_servers_label': 'Allowed Servers',
+        'settings.push_servers_title': 'Push Notification Servers',
+        'settings.push_servers_desc': 'All servers are disabled by default.',
+        'settings.push_servers_select_all': 'Select All',
+        'settings.push_servers_clear': 'Clear',
+        'settings.push_servers_empty': 'No servers found for this account.',
+        'settings.push_server_role_daemon': 'Daemon',
+        'settings.push_server_role_controlled': 'Controlled Node',
+        'settings.push_server_online': 'Online',
+        'settings.push_server_offline': 'Offline',
       };
       return dict[key] ?? key;
     },
@@ -168,6 +178,87 @@ describe('SettingsPage push notification settings', () => {
       const body = JSON.parse(lastCall[1].body as string);
       expect(body.types).not.toContain(PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE);
       expect(body.types).toContain(PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT);
+    });
+  });
+
+  it('renders server checklist unchecked by default, syncs server selection, and tolerates deleted server IDs', async () => {
+    apiFetchMock.mockImplementation((path: string) => {
+      if (path === '/api/push/preferences') {
+        return Promise.resolve({
+          ok: true,
+          types: DEFAULT_PUSH_NOTIFICATION_TYPES,
+          enabledServerIds: ['deleted-srv-99'],
+        });
+      }
+      if (path === '/api/server') {
+        return Promise.resolve({
+          servers: [
+            { id: 'srv-1', name: 'Office Mac', status: 'online' },
+            { id: 'srv-2', name: 'Small Node', status: 'offline' },
+          ],
+        });
+      }
+      if (path === '/api/machines') {
+        return Promise.resolve({
+          machines: [
+            { serverId: 'ctrl-1', displayName: 'Win Workstation', online: true },
+          ],
+        });
+      }
+      return Promise.resolve({ ok: true });
+    });
+
+    render(
+      <SettingsPage
+        displayName="Ada Lovelace"
+        username="ada"
+        hasPassword={true}
+        initialTab="notifications"
+        onBack={vi.fn()}
+        onDisplayNameChanged={vi.fn()}
+        onUserAuthUpdated={vi.fn()}
+      />,
+    );
+
+    const officeCb = await screen.findByLabelText('Office Mac') as HTMLInputElement;
+    const smallNodeCb = screen.getByLabelText('Small Node') as HTMLInputElement;
+    const winCb = screen.getByLabelText('Win Workstation') as HTMLInputElement;
+
+    // All visible servers start unchecked when enabledServerIds has no matching IDs
+    expect(officeCb.checked).toBe(false);
+    expect(smallNodeCb.checked).toBe(false);
+    expect(winCb.checked).toBe(false);
+
+    // Check Office Mac -> sends only enabledServerIds
+    fireEvent.click(officeCb);
+    expect(officeCb.checked).toBe(true);
+    await waitFor(() => {
+      const postCalls = apiFetchMock.mock.calls.filter(
+        ([path, opts]) => path === '/api/push/preferences' && (opts as { method?: string } | undefined)?.method === 'POST',
+      );
+      expect(postCalls.length).toBe(1);
+      expect(JSON.parse((postCalls[0][1] as { body: string }).body)).toEqual({
+        enabledServerIds: ['deleted-srv-99', 'srv-1'],
+      });
+    });
+
+    // Select All checks all visible servers
+    fireEvent.click(screen.getByRole('button', { name: 'Select All' }));
+    expect(officeCb.checked).toBe(true);
+    expect(smallNodeCb.checked).toBe(true);
+    expect(winCb.checked).toBe(true);
+
+    // Clear unchecks all servers
+    fireEvent.click(screen.getByRole('button', { name: 'Clear' }));
+    expect(officeCb.checked).toBe(false);
+    expect(smallNodeCb.checked).toBe(false);
+    expect(winCb.checked).toBe(false);
+    await waitFor(() => {
+      const postCalls = apiFetchMock.mock.calls.filter(
+        ([path, opts]) => path === '/api/push/preferences' && (opts as { method?: string } | undefined)?.method === 'POST',
+      );
+      const lastBody = JSON.parse((postCalls[postCalls.length - 1][1] as { body: string }).body);
+      expect(lastBody).toEqual({ enabledServerIds: [] });
     });
   });
 });

@@ -66,6 +66,7 @@ export async function notifyRemoteDesktopAutoUnlock(
       ?? (await import('../routes/push.js')).dispatchPush as (payload: PushPayload, db: Database, env: Env) => Promise<void>;
     await dispatch({
       userId: server.user_id,
+      serverId: event.serverId,
       title: `${REMOTE_DESKTOP_ALERT_PREFIX}远程桌面自动解锁`,
       body: `[🚨 最高安全警示] ${machine} was unlocked by auto unlock for ${await actorLabel(db, event)}.`,
       type: PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP,

@@ -82,6 +82,50 @@ export const DEFAULT_PUSH_NOTIFICATION_TYPES: readonly PushNotificationType[] = 
   PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP,
 ] as const;
 
+export const DEFAULT_PUSH_ENABLED_SERVER_IDS: readonly string[] = [] as const;
+export const MAX_PUSH_ENABLED_SERVER_IDS = 500;
+export const MAX_PUSH_SERVER_ID_LENGTH = 128;
+
+export interface PushNotificationPreferences {
+  types: PushNotificationType[];
+  enabledServerIds: string[];
+}
+
+export interface PushNotificationPreferencesResponse extends PushNotificationPreferences {
+  ok: boolean;
+  defaultTypes: readonly PushNotificationType[];
+}
+
+/**
+ * Sanitize an allowlist of server IDs: non-empty trimmed unique strings within bounds.
+ * Preserves first-seen order and drops invalid, empty, or overlong entries.
+ */
+export function sanitizePushEnabledServerIds(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const item of value) {
+    if (typeof item !== 'string') continue;
+    const trimmed = item.trim();
+    if (!trimmed || trimmed.length > MAX_PUSH_SERVER_ID_LENGTH || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    result.push(trimmed);
+    if (result.length >= MAX_PUSH_ENABLED_SERVER_IDS) break;
+  }
+  return result;
+}
+
+/** Extract the originating serverId from a push payload or its data map. */
+export function resolvePushPayloadServerId(payload: {
+  serverId?: string | null;
+  data?: Record<string, string>;
+}): string | null {
+  const direct = typeof payload.serverId === 'string' ? payload.serverId.trim() : '';
+  if (direct) return direct;
+  const fromData = typeof payload.data?.serverId === 'string' ? payload.data.serverId.trim() : '';
+  return fromData || null;
+}
+
 export const REMOTE_DESKTOP_ALERT_PREFIX = '🚨 [最高安全警示] ';
 
 export interface TaskPairNotificationContext {
