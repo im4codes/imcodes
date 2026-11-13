@@ -107,6 +107,8 @@ describe('shared MCP tool distribution contract', () => {
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('云文档');
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('cloud doc');
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('group:cloud-docs');
+    expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('cloud_docs');
+    expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('imcodes cloud-docs');
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('ONLYOFFICE');
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('every exact tool result includes its registered inputSchema');
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('computer_use_docs or computer_use_call');

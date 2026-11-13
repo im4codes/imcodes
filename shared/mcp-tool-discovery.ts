@@ -142,15 +142,10 @@ export const MCP_TOOL_GROUPS: readonly McpToolGroupDefinition[] = Object.freeze(
   }),
   Object.freeze({
     id: 'cloud-docs',
-    aliases: Object.freeze(['cloud doc', 'cloud docs', 'cloud-docs', '云文档', '共享文档', 'shared doc', 'shared docs', 'onlyoffice', 'documents', 'office', 'docx', 'xlsx', 'pptx']),
-    summary: 'List, read, create, edit, delete, and share Cloud Docs and ONLYOFFICE collaborative documents with frontend/actor ACL parity.',
+    aliases: Object.freeze(['cloud doc', 'cloud docs', 'cloud-docs', '云文档', '共享文档', 'shared doc', 'shared docs', 'onlyoffice', 'docbuilder', 'convert', 'documents', 'office', 'docx', 'xlsx', 'pptx']),
+    summary: 'Run the unified imcodes cloud-docs CLI (list, read, create, mkdir, edit, ONLYOFFICE DocBuilder, convert, upload/download, delete, share, docs).',
     tools: Object.freeze([
-      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_LIST,
-      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_READ,
-      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_CREATE,
-      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_EDIT,
-      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_DELETE,
-      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_SHARE,
+      MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
     ]),
   }),
 ]);

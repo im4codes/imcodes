@@ -1419,6 +1419,32 @@ memoryCmd
     }
   });
 
+program
+  .command('cloud-docs [args...]')
+  .description('Unified Cloud Docs & ONLYOFFICE Document Builder CLI (`imcodes cloud-docs docs` for guide)')
+  .helpOption(false)
+  .allowUnknownOption(true)
+  .allowExcessArguments(true)
+  .action(async (args: string[], _opts: Record<string, unknown>, cmd: Command) => {
+    const { runCloudDocsCli } = await import('./cli/cloud-docs.js');
+    const rawArgs = (cmd.parent as { rawArgs?: string[] } | undefined)?.rawArgs;
+    let forwarded = args;
+    if (Array.isArray(rawArgs)) {
+      const idx = rawArgs.indexOf('cloud-docs');
+      if (idx >= 0) {
+        forwarded = rawArgs.slice(idx + 1);
+      }
+    }
+    const result = await runCloudDocsCli(forwarded);
+    if (result.stdout) process.stdout.write(result.stdout);
+    if (result.stderr) process.stderr.write(result.stderr);
+    if (result.exitCode !== 0) {
+      const err = new Error(result.stderr.trim() || `cloud-docs exited with code ${result.exitCode}`) as Error & { exitCode?: number };
+      err.exitCode = result.exitCode;
+      throw err;
+    }
+  });
+
 return program;
 }
 

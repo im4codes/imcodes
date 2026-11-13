@@ -56,14 +56,14 @@ export const MCP_INJECTED_EXECUTION_BLOCK = Object.freeze({ taskSupport: 'forbid
 // the ceilings move deliberately and reviewably to accommodate them. The
 // pause/resume Cron controls add 503 measured authored bytes to the full
 // catalog, so retain bounded headroom above the resulting 53,503-byte surface.
-// The 6 Cloud Docs / ONLYOFFICE MCP tools (cloud_doc_list/read/create/edit/
-// delete/share) add ~4.4 KiB of authored schemas to the on-demand FULL catalog
-// without touching the dynamic bootstrap surface (they live in the `cloud-docs`
-// group). Move the ceiling reviewably above the resulting full catalog.
-export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 61_500;
-// Raw = authored + the MCP SDK framing. The 6 Cloud Docs tools bring the
-// measured full stdio wire surface (with alias + pool tools) to 67,616 bytes.
-export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 70_000;
+// Consolidating the 6 partial Cloud Docs MCP tools into the single unified
+// `cloud_docs` CLI-passthrough tool shrinks the measured full stdio surface
+// (with alias + pool tools) from 67,616 raw bytes down to 64,592 raw bytes
+// (51,915 authored without pool/alias; ~56.3 KiB authored on full stdio).
+// Keep tight reviewable headroom above that reduced surface.
+export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 58_500;
+// Raw = authored + the MCP SDK framing (measured 64,592 bytes on full stdio).
+export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 67_000;
 /**
  * Default model-visible surface: one discovery tool plus the stable minimal
  * delegation, supervision-task, basic-memory/source-expansion, scheduling,

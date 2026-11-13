@@ -1,9 +1,22 @@
+import { basename } from 'node:path';
 import {
   CLOUD_DOCS_API_PATH,
+  CLOUD_DOCS_CONVERT_SUBPATH,
+  CLOUD_DOCS_DOCBUILDER_SUBPATH,
+  CLOUD_DOCS_FILE_SUBPATH,
+  CLOUD_DOC_CONVERT_DEFAULT_TIMEOUT_MS,
+  CLOUD_DOC_DOCBUILDER_DEFAULT_TIMEOUT_MS,
   RECENT_DOCUMENTS_API_PATH,
   type CloudDocContentPayload,
+  type CloudDocConvertRequest,
+  type CloudDocConvertResponse,
   type CloudDocCreateType,
+  type CloudDocDocBuilderCreateRequest,
+  type CloudDocDocBuilderCreateResponse,
+  type CloudDocDocBuilderEditRequest,
+  type CloudDocDocBuilderEditResponse,
   type CloudDocEditMode,
+  type CloudDocFileUpdateResponse,
   type CloudDocFolder,
   type CloudDocItem,
   type CloudDocShareMode,
@@ -22,6 +35,8 @@ import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
 
 const DEFAULT_TIMEOUT_MS = 15_000;
+const HEAVY_TRANSFER_TIMEOUT_MS = 60_000;
+const LONG_RUNNING_TIMEOUT_HEADROOM_MS = 15_000;
 
 export interface CloudDocsHttpCredentials {
   serverUrl: string;
@@ -33,9 +48,33 @@ export interface CloudDocsHttpCredentials {
   signal?: AbortSignal;
 }
 
-export type CloudDocsClientResult<T extends Record<string, unknown>> =
+export type CloudDocsClientResult<T extends object> =
   | ({ status: 'ok' } & T)
-  | { status: 'error'; reason: MCPErrorReason; message: string };
+  | { status: 'error'; reason: MCPErrorReason; message: string; code?: string; httpStatus?: number };
+
+export function sanitizeCloudDocTransferFilename(raw: string): string {
+  const parts = raw.trim().split(/[/\\]+/).filter((part) => part.length > 0 && part !== '.' && part !== '..');
+  const last = parts.at(-1) ?? '';
+  return last ? basename(last) : 'document';
+}
+
+export function parseContentDispositionFileName(header: string | null | undefined): string | undefined {
+  if (!header) return undefined;
+  const starMatch = /filename\*\s*=\s*(?:UTF-8''|utf-8'')([^;\r\n]+)/i.exec(header);
+  if (starMatch?.[1]) {
+    try {
+      const decoded = decodeURIComponent(starMatch[1].trim().replace(/^["']|["']$/g, ''));
+      const clean = sanitizeCloudDocTransferFilename(decoded);
+      if (clean && clean !== 'document') return clean;
+    } catch {
+      // Fall through to plain filename parameter parsing.
+    }
+  }
+  const plainMatch = /filename\s*=\s*"([^"]+)"|filename\s*=\s*([^;\r\n]+)/i.exec(header);
+  const rawName = (plainMatch?.[1] ?? plainMatch?.[2] ?? '').trim();
+  if (!rawName) return undefined;
+  return sanitizeCloudDocTransferFilename(rawName);
+}
 
 function mapHttpFailure(status: number, body: Record<string, unknown>): CloudDocsClientResult<never> {
   const errCode = typeof body.error === 'string' ? body.error : '';
@@ -47,45 +86,82 @@ function mapHttpFailure(status: number, body: Record<string, unknown>): CloudDoc
         ? MCP_ERROR_REASONS.SCOPE_FORBIDDEN
         : status === 409
           ? MCP_ERROR_REASONS.REVISION_CONFLICT
-          : status === 400 || status === 404 || status === 413
+          : status === 400 || status === 404 || status === 413 || status === 422
             ? MCP_ERROR_REASONS.VALIDATION_FAILED
             : MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE;
   return {
     status: 'error',
     reason,
     message: sanitizeMcpErrorMessage(errMsg || `cloud docs request failed (${status})`),
+    ...(errCode ? { code: errCode } : {}),
+    httpStatus: status,
   };
 }
 
-async function cloudDocsRequest<T extends Record<string, unknown>>(
+async function executeCloudDocsFetch<T extends object>(
   creds: CloudDocsHttpCredentials,
   method: DaemonHttpMethod,
   apiPath: string,
-  bodyObj?: unknown,
-): Promise<CloudDocsClientResult<T>> {
+  init: { jsonBody?: unknown; formData?: FormData; binaryResponse?: false; timeoutMs?: number },
+): Promise<CloudDocsClientResult<T>>;
+async function executeCloudDocsFetch(
+  creds: CloudDocsHttpCredentials,
+  method: DaemonHttpMethod,
+  apiPath: string,
+  init: { binaryResponse: true; timeoutMs?: number },
+): Promise<CloudDocsClientResult<{ bytes: Buffer; fileName?: string; contentType?: string; bytesRead: number }>>;
+async function executeCloudDocsFetch<T extends object>(
+  creds: CloudDocsHttpCredentials,
+  method: DaemonHttpMethod,
+  apiPath: string,
+  init: { jsonBody?: unknown; formData?: FormData; binaryResponse?: boolean; timeoutMs?: number },
+): Promise<CloudDocsClientResult<T> | CloudDocsClientResult<{ bytes: Buffer; fileName?: string; contentType?: string; bytesRead: number }>> {
   const controller = new AbortController();
   const onAbort = () => controller.abort();
   creds.signal?.addEventListener('abort', onAbort, { once: true });
-  const timer = setTimeout(() => controller.abort(), creds.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const effectiveTimeoutMs = creds.timeoutMs ?? init.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const timer = setTimeout(() => controller.abort(), effectiveTimeoutMs);
   timer.unref?.();
 
   try {
     const url = daemonApiUrl(creds.serverUrl, method, apiPath);
+    const headers: Record<string, string> = {
+      ...daemonServerAuthHeaders({ serverId: creds.serverId, token: creds.token }),
+      ...(creds.sharedMachineAuthority ? { [SHARED_MACHINE_AUTHORITY_HEADER]: creds.sharedMachineAuthority } : {}),
+      ...(init.jsonBody !== undefined ? { 'Content-Type': 'application/json' } : {}),
+    };
+    const body = init.formData !== undefined
+      ? init.formData
+      : init.jsonBody !== undefined
+        ? JSON.stringify(init.jsonBody)
+        : undefined;
+
     const response = await (creds.fetchImpl ?? fetch)(url, {
       method,
-      headers: {
-        ...daemonServerAuthHeaders({ serverId: creds.serverId, token: creds.token }),
-        ...(creds.sharedMachineAuthority ? { [SHARED_MACHINE_AUTHORITY_HEADER]: creds.sharedMachineAuthority } : {}),
-        ...(bodyObj !== undefined ? { 'Content-Type': 'application/json' } : {}),
-      },
-      ...(bodyObj !== undefined ? { body: JSON.stringify(bodyObj) } : {}),
+      headers,
+      ...(body !== undefined ? { body } : {}),
       signal: controller.signal,
     });
 
-    const parsed = (await response.json().catch(() => ({}))) as Record<string, unknown>;
     if (!response.ok) {
+      const parsed = (await response.json().catch(() => ({}))) as Record<string, unknown>;
       return mapHttpFailure(response.status, parsed);
     }
+
+    if (init.binaryResponse) {
+      const bytes = Buffer.from(await response.arrayBuffer());
+      const contentType = response.headers.get('content-type') ?? undefined;
+      const fileName = parseContentDispositionFileName(response.headers.get('content-disposition'));
+      return {
+        status: 'ok',
+        bytes,
+        bytesRead: bytes.length,
+        ...(fileName ? { fileName } : {}),
+        ...(contentType ? { contentType } : {}),
+      };
+    }
+
+    const parsed = (await response.json().catch(() => ({}))) as Record<string, unknown>;
     return { status: 'ok', ...(parsed as T) };
   } catch (err) {
     return {
@@ -97,6 +173,23 @@ async function cloudDocsRequest<T extends Record<string, unknown>>(
     clearTimeout(timer);
     creds.signal?.removeEventListener('abort', onAbort);
   }
+}
+
+async function cloudDocsRequest<T extends object>(
+  creds: CloudDocsHttpCredentials,
+  method: DaemonHttpMethod,
+  apiPath: string,
+  bodyObj?: unknown,
+  timeoutMs?: number,
+): Promise<CloudDocsClientResult<T>> {
+  return executeCloudDocsFetch<T>(creds, method, apiPath, {
+    ...(bodyObj !== undefined ? { jsonBody: bodyObj } : {}),
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+  });
+}
+
+function longRunningClientTimeoutMs(serverTimeoutMs?: number, fallbackServerMs = CLOUD_DOC_DOCBUILDER_DEFAULT_TIMEOUT_MS): number {
+  return (serverTimeoutMs ?? fallbackServerMs) + LONG_RUNNING_TIMEOUT_HEADROOM_MS;
 }
 
 export async function cloudDocListClient(
@@ -152,6 +245,10 @@ export async function cloudDocCreateClient(
     name?: string;
     folderId?: string | null;
     content?: string;
+    engine?: 'docbuilder';
+    docbuilderScript?: string;
+    argument?: Record<string, unknown>;
+    timeoutMs?: number;
   },
 ): Promise<CloudDocsClientResult<{ doc?: CloudDocItem; folder?: CloudDocFolder }>> {
   if (input.kind === 'folder') {
@@ -160,12 +257,23 @@ export async function cloudDocCreateClient(
       ...(input.folderId !== undefined ? { parentId: input.folderId } : {}),
     });
   }
-  return cloudDocsRequest<{ doc: CloudDocItem }>(creds, 'POST', `${CLOUD_DOCS_API_PATH}/blank`, {
-    type: input.type,
-    ...(input.name !== undefined ? { name: input.name } : {}),
-    ...(input.folderId !== undefined ? { folderId: input.folderId } : {}),
-    ...(input.content !== undefined ? { content: input.content } : {}),
-  });
+  const usesBuilder = input.engine === 'docbuilder' || input.docbuilderScript !== undefined;
+  return cloudDocsRequest<{ doc: CloudDocItem }>(
+    creds,
+    'POST',
+    `${CLOUD_DOCS_API_PATH}/blank`,
+    {
+      type: input.type,
+      ...(input.name !== undefined ? { name: input.name } : {}),
+      ...(input.folderId !== undefined ? { folderId: input.folderId } : {}),
+      ...(input.content !== undefined ? { content: input.content } : {}),
+      ...(input.engine !== undefined ? { engine: input.engine } : {}),
+      ...(input.docbuilderScript !== undefined ? { docbuilderScript: input.docbuilderScript } : {}),
+      ...(input.argument !== undefined ? { argument: input.argument } : {}),
+      ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
+    },
+    usesBuilder ? longRunningClientTimeoutMs(input.timeoutMs) : undefined,
+  );
 }
 
 export async function cloudDocEditClient(
@@ -177,27 +285,41 @@ export async function cloudDocEditClient(
     expectedVersion?: number;
     name?: string;
     folderId?: string | null;
+    engine?: 'docbuilder';
+    docbuilderScript?: string;
+    argument?: Record<string, unknown>;
+    timeoutMs?: number;
   },
 ): Promise<CloudDocsClientResult<{ doc: CloudDocItem; role?: CloudDocShareRole | 'owner'; bytesWritten?: number }>> {
   let latestDoc: CloudDocItem | undefined;
   let role: CloudDocShareRole | 'owner' | undefined;
   let bytesWritten: number | undefined;
+  const usesBuilder = input.engine === 'docbuilder' || input.docbuilderScript !== undefined;
 
-  if (input.content !== undefined) {
-    const contentBody: Record<string, unknown> = {
-      content: input.content,
-    };
+  if (input.content !== undefined || usesBuilder) {
+    const contentBody: Record<string, unknown> = {};
+    if (input.content !== undefined) contentBody.content = input.content;
     if (input.mode !== undefined) contentBody.mode = input.mode;
     if (input.expectedVersion !== undefined) contentBody.expectedVersion = input.expectedVersion;
     if (input.name !== undefined) contentBody.name = input.name;
     if (input.folderId !== undefined) contentBody.folderId = input.folderId;
+    if (input.engine !== undefined) contentBody.engine = input.engine;
+    if (input.docbuilderScript !== undefined) contentBody.docbuilderScript = input.docbuilderScript;
+    if (input.argument !== undefined) contentBody.argument = input.argument;
+    if (input.timeoutMs !== undefined) contentBody.timeoutMs = input.timeoutMs;
 
     const contentRes = await cloudDocsRequest<{
       ok: true;
       doc: CloudDocItem;
       role?: CloudDocShareRole | 'owner';
       bytesWritten?: number;
-    }>(creds, 'PUT', `${CLOUD_DOCS_API_PATH}/${encodeURIComponent(input.docId)}/content`, contentBody);
+    }>(
+      creds,
+      'PUT',
+      `${CLOUD_DOCS_API_PATH}/${encodeURIComponent(input.docId)}/content`,
+      contentBody,
+      usesBuilder ? longRunningClientTimeoutMs(input.timeoutMs) : undefined,
+    );
     if (contentRes.status !== 'ok') return contentRes;
     latestDoc = contentRes.doc;
     role = contentRes.role;
@@ -221,7 +343,7 @@ export async function cloudDocEditClient(
     return {
       status: 'error',
       reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
-      message: 'cloud_doc_edit requires content, name, or folderId',
+      message: 'edit requires content, script, name, or folderId',
     };
   }
 
@@ -231,6 +353,118 @@ export async function cloudDocEditClient(
     ...(role ? { role } : {}),
     ...(bytesWritten !== undefined ? { bytesWritten } : {}),
   };
+}
+
+export async function cloudDocDocBuilderCreateClient(
+  creds: CloudDocsHttpCredentials,
+  input: CloudDocDocBuilderCreateRequest,
+): Promise<CloudDocsClientResult<CloudDocDocBuilderCreateResponse>> {
+  return cloudDocsRequest<CloudDocDocBuilderCreateResponse>(
+    creds,
+    'POST',
+    `${CLOUD_DOCS_API_PATH}${CLOUD_DOCS_DOCBUILDER_SUBPATH}`,
+    input,
+    longRunningClientTimeoutMs(input.timeoutMs),
+  );
+}
+
+export async function cloudDocDocBuilderEditClient(
+  creds: CloudDocsHttpCredentials,
+  input: { docId: string } & CloudDocDocBuilderEditRequest,
+): Promise<CloudDocsClientResult<CloudDocDocBuilderEditResponse>> {
+  const { docId, ...body } = input;
+  return cloudDocsRequest<CloudDocDocBuilderEditResponse>(
+    creds,
+    'POST',
+    `${CLOUD_DOCS_API_PATH}/${encodeURIComponent(docId)}${CLOUD_DOCS_DOCBUILDER_SUBPATH}`,
+    body,
+    longRunningClientTimeoutMs(body.timeoutMs),
+  );
+}
+
+export async function cloudDocConvertClient(
+  creds: CloudDocsHttpCredentials,
+  input: { docId: string } & CloudDocConvertRequest,
+): Promise<CloudDocsClientResult<CloudDocConvertResponse>> {
+  const { docId, ...body } = input;
+  return cloudDocsRequest<CloudDocConvertResponse>(
+    creds,
+    'POST',
+    `${CLOUD_DOCS_API_PATH}/${encodeURIComponent(docId)}${CLOUD_DOCS_CONVERT_SUBPATH}`,
+    body,
+    longRunningClientTimeoutMs(body.timeoutMs, CLOUD_DOC_CONVERT_DEFAULT_TIMEOUT_MS),
+  );
+}
+
+export async function cloudDocUploadFileClient(
+  creds: CloudDocsHttpCredentials,
+  input: {
+    fileBytes: Uint8Array | Buffer;
+    fileName: string;
+    name?: string;
+    folderId?: string | null;
+    mimeType?: string;
+  },
+): Promise<CloudDocsClientResult<{ doc: CloudDocItem }>> {
+  const form = new FormData();
+  const safeFileName = sanitizeCloudDocTransferFilename(input.fileName);
+  const blob = new Blob([Uint8Array.from(input.fileBytes)], input.mimeType ? { type: input.mimeType } : undefined);
+  form.append('file', blob, safeFileName);
+  if (input.name !== undefined) form.append('name', input.name);
+  if (input.folderId !== undefined && input.folderId !== null) form.append('folderId', input.folderId);
+
+  return executeCloudDocsFetch<{ doc: CloudDocItem }>(
+    creds,
+    'POST',
+    `${CLOUD_DOCS_API_PATH}/files`,
+    { formData: form, timeoutMs: HEAVY_TRANSFER_TIMEOUT_MS },
+  );
+}
+
+export async function cloudDocReplaceFileClient(
+  creds: CloudDocsHttpCredentials,
+  input: {
+    docId: string;
+    fileBytes: Uint8Array | Buffer;
+    fileName: string;
+    name?: string;
+    folderId?: string | null;
+    expectedVersion?: number;
+    mimeType?: string;
+  },
+): Promise<CloudDocsClientResult<CloudDocFileUpdateResponse>> {
+  const form = new FormData();
+  const safeFileName = sanitizeCloudDocTransferFilename(input.fileName);
+  const blob = new Blob([Uint8Array.from(input.fileBytes)], input.mimeType ? { type: input.mimeType } : undefined);
+  form.append('file', blob, safeFileName);
+  if (input.name !== undefined) form.append('name', input.name);
+  if (input.folderId === null) {
+    form.append('folderId', '');
+  } else if (input.folderId !== undefined) {
+    form.append('folderId', input.folderId);
+  }
+  if (input.expectedVersion !== undefined) {
+    form.append('expectedVersion', String(input.expectedVersion));
+  }
+
+  return executeCloudDocsFetch<CloudDocFileUpdateResponse>(
+    creds,
+    'PUT',
+    `${CLOUD_DOCS_API_PATH}/${encodeURIComponent(input.docId)}${CLOUD_DOCS_FILE_SUBPATH}`,
+    { formData: form, timeoutMs: HEAVY_TRANSFER_TIMEOUT_MS },
+  );
+}
+
+export async function cloudDocDownloadFileClient(
+  creds: CloudDocsHttpCredentials,
+  input: { docId: string },
+): Promise<CloudDocsClientResult<{ bytes: Buffer; fileName?: string; contentType?: string; bytesRead: number }>> {
+  return executeCloudDocsFetch(
+    creds,
+    'GET',
+    `${CLOUD_DOCS_API_PATH}/${encodeURIComponent(input.docId)}/download?download=1`,
+    { binaryResponse: true, timeoutMs: HEAVY_TRANSFER_TIMEOUT_MS },
+  );
 }
 
 export async function cloudDocDeleteClient(

@@ -102,24 +102,14 @@ describe('FULL-only role gate (10.12)', () => {
     const controlled = advertisedMcpToolNames(NODE_ROLE.CONTROLLED);
     expect(controlled).not.toContain(MEMORY_MCP_TOOL_NAMES.LIST_MACHINES);
     expect(controlled).not.toContain(MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE);
-    expect(controlled).not.toContain(MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_LIST);
-    expect(controlled).not.toContain(MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_READ);
-    expect(controlled).not.toContain(MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_CREATE);
-    expect(controlled).not.toContain(MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_EDIT);
-    expect(controlled).not.toContain(MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_DELETE);
-    expect(controlled).not.toContain(MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_SHARE);
+    expect(controlled).not.toContain(MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS);
     // and still advertises the rest
     expect(controlled).toContain(MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY);
   });
 
-  it('includes all 6 Cloud Docs tools in FULL_ONLY_MCP_TOOLS and advertises them only on FULL nodes', () => {
+  it('includes cloud_docs in FULL_ONLY_MCP_TOOLS and advertises it only on FULL nodes', () => {
     const cloudDocTools = [
-      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_LIST,
-      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_READ,
-      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_CREATE,
-      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_EDIT,
-      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_DELETE,
-      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_SHARE,
+      MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
     ] as const;
     const full = advertisedMcpToolNames(NODE_ROLE.FULL);
     const controlled = advertisedMcpToolNames(NODE_ROLE.CONTROLLED);

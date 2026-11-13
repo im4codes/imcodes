@@ -107,12 +107,7 @@ describe('exact MCP discovery fallback', () => {
 
   it('publishes only the bounded cloud-docs group for cloud doc / 云文档 / 共享文档 / onlyoffice aliases and tokenizes Chinese queries cleanly', async () => {
     const cloudDocNames = [
-      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_LIST,
-      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_READ,
-      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_CREATE,
-      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_EDIT,
-      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_DELETE,
-      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_SHARE,
+      MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
       'unrelated_hidden_tool',
     ];
     const targets = cloudDocNames.map((name) => registeredTool({
@@ -120,9 +115,9 @@ describe('exact MCP discovery fallback', () => {
       handler: vi.fn(async () => ({ content: [{ type: 'text' as const, text: 'ok' }] })),
     }));
     const { call, sendToolListChanged } = harness(targets);
-    const expected = cloudDocNames.slice(0, 6);
+    const expected = [MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS];
 
-    for (const query of ['cloud doc', 'cloud docs', 'cloud-docs', '云文档', '共享文档', 'shared doc', 'shared docs', 'onlyoffice', 'group:cloud-docs']) {
+    for (const query of ['cloud doc', 'cloud docs', 'cloud-docs', '云文档', '共享文档', 'shared doc', 'shared docs', 'onlyoffice', 'docbuilder', 'convert', 'group:cloud-docs']) {
       await expect(call({ query })).resolves.toMatchObject({
         structuredContent: {
           status: 'ok',
@@ -138,7 +133,7 @@ describe('exact MCP discovery fallback', () => {
       });
       expect(targets.find((tool) => tool.name === 'unrelated_hidden_tool')?.enabled).toBe(false);
     }
-    expect(sendToolListChanged).toHaveBeenCalledTimes(9);
+    expect(sendToolListChanged).toHaveBeenCalledTimes(11);
 
     // Multi-token query containing Chinese keywords matches preview metadata via Unicode tokenization without wildcard publishing
     const chinesePreview = await call({ query: '云文档 xlsx' });

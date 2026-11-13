@@ -1,5 +1,4 @@
 import { SESSION_TEXT_HISTORY_DEFAULT_LIMIT, SESSION_TEXT_HISTORY_MAX_LIMIT, SESSION_HISTORY_KINDS } from './session-history.js';
-import { CLOUD_DOC_CONTENT_MAX_CHARS, CLOUD_DOC_CREATE_TYPES, CLOUD_DOC_EDIT_MODES } from './cloud-docs.js';
 import { TASK_PAIR_MAX_DEPENDENCIES, TASK_PAIR_PAUSE_MODES } from './task-pair-suspension.js';
 import { TASK_PAIR_TITLE_ACCESS_MAX_USERS, TASK_PAIR_TITLE_ACCESS_MAX_USER_CHARS } from './task-pair-title-access.js';
 import { MCP_ERROR_REASONS, isRecoverableMcpErrorReason, type MCPErrorReason } from './memory-mcp-errors.js';
@@ -175,12 +174,7 @@ export const MEMORY_MCP_TOOL_NAMES = {
   FETCH_FILE_FROM_MACHINE: 'fetch_file_from_machine',
   COMPUTER_USE_DOCS: 'computer_use_docs',
   COMPUTER_USE_CALL: 'computer_use_call',
-  CLOUD_DOC_LIST: 'cloud_doc_list',
-  CLOUD_DOC_READ: 'cloud_doc_read',
-  CLOUD_DOC_CREATE: 'cloud_doc_create',
-  CLOUD_DOC_EDIT: 'cloud_doc_edit',
-  CLOUD_DOC_DELETE: 'cloud_doc_delete',
-  CLOUD_DOC_SHARE: 'cloud_doc_share',
+  CLOUD_DOCS: 'cloud_docs',
 } as const;
 
 /** Structured pair close actions; lifecycle semantics are delegated to the marker state machine. */
@@ -260,12 +254,7 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE,
   MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,
   MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
-  MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_LIST,
-  MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_READ,
-  MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_CREATE,
-  MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_EDIT,
-  MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_DELETE,
-  MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_SHARE,
+  MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
 ] as const satisfies readonly MemoryMcpToolName[];
 
 /**
@@ -322,12 +311,7 @@ export const FULL_ONLY_MCP_TOOLS: ReadonlySet<MemoryMcpToolName> = new Set([
   MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE,
   MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,
   MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
-  MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_LIST,
-  MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_READ,
-  MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_CREATE,
-  MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_EDIT,
-  MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_DELETE,
-  MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_SHARE,
+  MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
 ]);
 
 /** Whether a tool is available to a node of the given role. */
@@ -1523,74 +1507,17 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       result: { type: 'object', description: 'Bounded Computer Use result content when the target method returned.', additionalProperties: true },
     }, ['status', 'outcome']),
   },
-  [MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_LIST]: {
-    name: MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_LIST,
-    description: 'List own and shared Cloud Docs, folders, and optional recent documents with effective owner/editor/viewer permissions. FULL-node only.',
+  [MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS]: {
+    name: MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
+    description: 'Run the unified Cloud Docs & ONLYOFFICE CLI (`imcodes cloud-docs`). Quick start: `["list"]`, `["list","--search","q"]`, `["read","<docId>"]`, `["docs"]`. Load full ONLYOFFICE DocBuilder/convert/upload/share manuals on demand via `["docs","--topic","quickstart|docx|xlsx|pptx|edit|convert|share|troubleshooting"]`. FULL-node only.',
     inputSchema: objectSchema({
-      folderId: stringSchema('Optional folderId filter for owned docs; omit to list all folders and docs.'),
-      search: stringSchema('Optional case-insensitive filename or folder search filter.'),
-      includeRecent: booleanSchema('When true, also include recent documents accessible to the caller.'),
+      args: {
+        type: 'array',
+        description: 'Preferred CLI argv array (preserves Windows backslashes & spaces cleanly), e.g. ["list"] or ["builder","--type","docx","--name","Spec.docx","--script-file","C:\\work\\s.js"].',
+        items: { type: 'string' },
+      },
+      command: stringSchema('Single CLI command string split cleanly (quotes & Windows backslashes preserved), e.g. "read doc_123 --max-chars 4000". Defaults to "--help" when both args and command are omitted.'),
     }),
-    outputSchema: statusSchema,
-  },
-  [MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_READ]: {
-    name: MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_READ,
-    description: 'Read extracted text, spreadsheet sheets, or presentation slides from a Cloud Doc (.docx, .xlsx, .pptx, .md, .txt, .csv, .json, .log). FULL-node only.',
-    inputSchema: objectSchema({
-      docId: stringSchema('Cloud document ID to read.', { minLength: 1 }),
-      maxChars: numberSchema(`Optional max character limit (1..${CLOUD_DOC_CONTENT_MAX_CHARS}).`, { minimum: 1, maximum: CLOUD_DOC_CONTENT_MAX_CHARS }),
-    }, ['docId']),
-    outputSchema: statusSchema,
-  },
-  [MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_CREATE]: {
-    name: MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_CREATE,
-    description: 'Create a Cloud Doc (.docx, .xlsx, .pptx, .md, .txt) with optional initial content, or create a folder (kind=folder) in own or shared-editor folder. FULL-node only.',
-    inputSchema: objectSchema({
-      kind: stringSchema('Target kind: doc (default) or folder.', { enum: ['doc', 'folder'] }),
-      type: stringSchema(`Document format when kind=doc; one of ${CLOUD_DOC_CREATE_TYPES.join(', ')}.`, { enum: [...CLOUD_DOC_CREATE_TYPES] }),
-      name: stringSchema('Document filename or folder name.'),
-      folderId: { type: ['string', 'null'], description: 'Parent folderId; own root when omitted, or shared-editor folderId.' },
-      content: stringSchema(`Optional initial text/table/slide content (up to ${CLOUD_DOC_CONTENT_MAX_CHARS} chars) when kind=doc.`),
-    }),
-    outputSchema: statusSchema,
-  },
-  [MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_EDIT]: {
-    name: MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_EDIT,
-    description: 'Edit a Cloud Doc content (replace or append) and/or rename/move it. Owner has full control; shared editor may edit/rename/move inside editor tree; viewer is refused. FULL-node only.',
-    inputSchema: objectSchema({
-      docId: stringSchema('Cloud document ID to edit.', { minLength: 1 }),
-      content: stringSchema(`Updated text/table/slide content (up to ${CLOUD_DOC_CONTENT_MAX_CHARS} chars).`),
-      mode: stringSchema(`Edit mode when content is provided: ${CLOUD_DOC_EDIT_MODES.join(' | ')} (default replace).`, { enum: [...CLOUD_DOC_EDIT_MODES] }),
-      expectedVersion: numberSchema('Optional optimistic lock docVersion check.', { minimum: 1 }),
-      name: stringSchema('Optional new document filename.'),
-      folderId: { type: ['string', 'null'], description: 'Optional destination folderId (or null for own root).' },
-    }, ['docId']),
-    outputSchema: statusSchema,
-  },
-  [MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_DELETE]: {
-    name: MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_DELETE,
-    description: 'Delete an owned Cloud Doc or folder tree (owner-only; shared editors/viewers are refused). FULL-node only.',
-    inputSchema: objectSchema({
-      targetKind: stringSchema('Target kind: doc (default) or folder.', { enum: ['doc', 'folder'] }),
-      id: stringSchema('Cloud document or folder ID to delete.', { minLength: 1 }),
-    }, ['id']),
-    outputSchema: statusSchema,
-  },
-  [MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_SHARE]: {
-    name: MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_SHARE,
-    description: 'Manage Cloud Doc/folder sharing (list shares, list shareable teams, grant user/team viewer or editor role, or revoke shareId). Owner-only for mutations. FULL-node only.',
-    inputSchema: objectSchema({
-      action: stringSchema('Share action to perform.', { enum: ['list', 'list_teams', 'grant', 'revoke'] }),
-      targetKind: stringSchema('Target kind for list/grant: doc (default) or folder.', { enum: ['doc', 'folder'] }),
-      targetId: stringSchema('Target docId or folderId for list/grant.', { minLength: 1 }),
-      shareId: stringSchema('Existing shareId for revoke.', { minLength: 1 }),
-      shareMode: stringSchema('Share mode for grant: user or team.', { enum: ['user', 'team'] }),
-      targetTeamId: stringSchema('Target teamId when shareMode=team.', { minLength: 1 }),
-      targetUserId: stringSchema('Target userId when shareMode=user.', { minLength: 1 }),
-      targetUsername: stringSchema('Target username/identifier when shareMode=user.', { minLength: 1 }),
-      role: stringSchema('Granted access role: viewer (read-only) or editor (participant).', { enum: ['viewer', 'editor'] }),
-      allowDownload: booleanSchema('Whether recipients may download/export (default true).'),
-    }, ['action']),
     outputSchema: statusSchema,
   },
 };

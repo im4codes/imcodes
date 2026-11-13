@@ -1,116 +1,102 @@
-import {
-  type CloudDocContentPayload,
-  type CloudDocCreateType,
-  type CloudDocEditMode,
-  type CloudDocFolder,
-  type CloudDocItem,
-  type CloudDocShareMode,
-  type CloudDocShareRecord,
-  type CloudDocShareRole,
-  type CloudDocShareTargetKind,
-  type CloudDocTeamOption,
-  type RecentDocumentItem,
-  type SharedCloudDocItem,
-  type SharedCloudFolderItem,
-} from '../../shared/cloud-docs.js';
-import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
-import {
-  cloudDocCreateClient,
-  cloudDocDeleteClient,
-  cloudDocEditClient,
-  cloudDocListClient,
-  cloudDocReadClient,
-  cloudDocShareClient,
-  type CloudDocsClientResult,
-  type CloudDocsHttpCredentials,
-} from './cloud-docs-mcp-client.js';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
+import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
+import type { CloudDocsHttpCredentials } from './cloud-docs-mcp-client.js';
 import { loadDaemonCredential, type DaemonCredential } from './machine-mcp-deps.js';
 
-export interface CloudDocsToolDeps {
-  listDocs: (input: { folderId?: string; search?: string; includeRecent?: boolean; signal?: AbortSignal }) => Promise<CloudDocsClientResult<{
-    folders: CloudDocFolder[];
-    docs: CloudDocItem[];
-    sharedFolders: SharedCloudFolderItem[];
-    sharedDocs: SharedCloudDocItem[];
-    recentDocuments?: RecentDocumentItem[];
-  }>>;
-  readDoc: (input: { docId: string; maxChars?: number; signal?: AbortSignal }) => Promise<CloudDocsClientResult<CloudDocContentPayload>>;
-  createDoc: (input: {
-    kind?: 'doc' | 'folder';
-    type?: CloudDocCreateType;
-    name?: string;
-    folderId?: string | null;
-    content?: string;
-    signal?: AbortSignal;
-  }) => Promise<CloudDocsClientResult<{ doc?: CloudDocItem; folder?: CloudDocFolder }>>;
-  editDoc: (input: {
-    docId: string;
-    content?: string;
-    mode?: CloudDocEditMode;
-    expectedVersion?: number;
-    name?: string;
-    folderId?: string | null;
-    signal?: AbortSignal;
-  }) => Promise<CloudDocsClientResult<{ doc: CloudDocItem; role?: CloudDocShareRole | 'owner'; bytesWritten?: number }>>;
-  deleteDoc: (input: { targetKind?: CloudDocShareTargetKind; id: string; signal?: AbortSignal }) => Promise<CloudDocsClientResult<{ ok: true; deletedFolderIds?: string[] }>>;
-  shareDoc: (input: {
-    action: 'list' | 'list_teams' | 'grant' | 'revoke';
-    targetKind?: CloudDocShareTargetKind;
-    targetId?: string;
-    shareId?: string;
-    shareMode?: CloudDocShareMode;
-    targetTeamId?: string;
-    targetUserId?: string;
-    targetUsername?: string;
-    role?: CloudDocShareRole;
-    allowDownload?: boolean;
-    signal?: AbortSignal;
-  }) => Promise<CloudDocsClientResult<{
-    shares?: CloudDocShareRecord[];
-    teams?: CloudDocTeamOption[];
-    share?: CloudDocShareRecord;
-    ok?: boolean;
-  }>>;
-}
-
-export interface DaemonCloudDocsToolDepsOverrides {
-  loadCredential?: () => Promise<DaemonCredential | null>;
+export interface CloudDocsCredentialResolutionOptions {
+  serverUrl?: string;
+  serverId?: string;
+  token?: string;
+  home?: string;
+  env?: Record<string, string | undefined>;
+  loadCredential?: (homeDir?: string) => Promise<DaemonCredential | null>;
   loadSharedMachineAuthority?: () => Promise<string | null>;
   fetchImpl?: typeof fetch;
-  listDocsClient?: typeof cloudDocListClient;
-  readDocClient?: typeof cloudDocReadClient;
-  createDocClient?: typeof cloudDocCreateClient;
-  editDocClient?: typeof cloudDocEditClient;
-  deleteDocClient?: typeof cloudDocDeleteClient;
-  shareDocClient?: typeof cloudDocShareClient;
+  signal?: AbortSignal;
 }
 
-export function createDaemonCloudDocsToolDeps(overrides: DaemonCloudDocsToolDepsOverrides = {}): CloudDocsToolDeps {
-  const load = overrides.loadCredential ?? loadDaemonCredential;
-  const loadAuthority = overrides.loadSharedMachineAuthority ?? (async () => null);
-  const listFn = overrides.listDocsClient ?? cloudDocListClient;
-  const readFn = overrides.readDocClient ?? cloudDocReadClient;
-  const createFn = overrides.createDocClient ?? cloudDocCreateClient;
-  const editFn = overrides.editDocClient ?? cloudDocEditClient;
-  const deleteFn = overrides.deleteDocClient ?? cloudDocDeleteClient;
-  const shareFn = overrides.shareDocClient ?? cloudDocShareClient;
+export type CloudDocsCredentialResolutionResult =
+  | { status: 'ok'; credentials: CloudDocsHttpCredentials }
+  | { status: 'error'; reason: MCPErrorReason; message: string };
 
-  const resolveCreds = async (
-    signal?: AbortSignal,
-  ): Promise<CloudDocsHttpCredentials | { status: 'error'; reason: typeof MCP_ERROR_REASONS.FEATURE_DISABLED | typeof MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE; message: string }> => {
-    const creds = await load();
-    if (!creds) {
-      return {
-        status: 'error',
-        reason: MCP_ERROR_REASONS.FEATURE_DISABLED,
-        message: 'daemon is not bound to a server',
-      };
-    }
-
-    // Fail closed if shared turn authority lookup errors: never silently drop delegated turn identity.
-    let sharedMachineAuthority: string | null;
+export async function loadCloudDocsDaemonCredential(
+  homeDir?: string,
+  env: Record<string, string | undefined> = process.env,
+): Promise<DaemonCredential | null> {
+  const explicitHome = homeDir?.trim() || env.IMCODES_HOME?.trim();
+  if (explicitHome) {
     try {
-      sharedMachineAuthority = await loadAuthority();
+      const raw = await readFile(join(explicitHome, 'server.json'), 'utf8');
+      const parsed = JSON.parse(raw) as Partial<{ serverId: string; token: string; workerUrl: string; serverUrl: string }>;
+      const serverUrl = (parsed.workerUrl ?? parsed.serverUrl ?? '').trim();
+      const serverId = (parsed.serverId ?? '').trim();
+      const token = (parsed.token ?? '').trim();
+      if (!serverId || !token || !serverUrl) return null;
+      return { serverUrl, serverId, token };
+    } catch {
+      return null;
+    }
+  }
+  if (env === process.env) {
+    return loadDaemonCredential();
+  }
+  try {
+    const raw = await readFile(join(resolveImcodesHome(env), 'server.json'), 'utf8');
+    const parsed = JSON.parse(raw) as Partial<{ serverId: string; token: string; workerUrl: string; serverUrl: string }>;
+    const serverUrl = (parsed.workerUrl ?? parsed.serverUrl ?? '').trim();
+    const serverId = (parsed.serverId ?? '').trim();
+    const token = (parsed.token ?? '').trim();
+    if (!serverId || !token || !serverUrl) return null;
+    return { serverUrl, serverId, token };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve Cloud Docs HTTP credentials in strict priority order:
+ * 1. Explicit CLI flags (--server-url / --server-id / --token)
+ * 2. Environment variables (IMCODES_SERVER_URL / IMCODES_SERVER_ID / IMCODES_TOKEN)
+ * 3. Daemon bound credential in --home / IMCODES_HOME / ~/.imcodes/server.json
+ */
+export async function resolveCloudDocsCredentials(
+  options: CloudDocsCredentialResolutionOptions = {},
+): Promise<CloudDocsCredentialResolutionResult> {
+  const env = options.env ?? process.env;
+  let serverUrl = options.serverUrl?.trim() || env.IMCODES_SERVER_URL?.trim() || '';
+  let serverId = options.serverId?.trim() || env.IMCODES_SERVER_ID?.trim() || '';
+  let token = options.token?.trim() || env.IMCODES_TOKEN?.trim() || '';
+
+  if (!serverUrl || !serverId || !token) {
+    const loader = options.loadCredential
+      ?? ((homeDir?: string) => loadCloudDocsDaemonCredential(homeDir, env));
+    const stored = await loader(options.home?.trim() || undefined);
+    if (stored) {
+      if (!serverUrl) serverUrl = stored.serverUrl.trim();
+      if (!serverId) serverId = stored.serverId.trim();
+      if (!token) token = stored.token.trim();
+    }
+  }
+
+  const missing: string[] = [];
+  if (!serverUrl) missing.push('serverUrl (--server-url / IMCODES_SERVER_URL)');
+  if (!serverId) missing.push('serverId (--server-id / IMCODES_SERVER_ID)');
+  if (!token) missing.push('token (--token / IMCODES_TOKEN)');
+  if (missing.length > 0) {
+    return {
+      status: 'error',
+      reason: MCP_ERROR_REASONS.FEATURE_DISABLED,
+      message: `Cloud Docs credentials missing (${missing.join(', ')}) and no valid daemon binding found in server.json`,
+    };
+  }
+
+  // Fail closed if shared turn authority lookup errors: never silently drop delegated turn identity.
+  let sharedMachineAuthority: string | null = null;
+  if (options.loadSharedMachineAuthority) {
+    try {
+      sharedMachineAuthority = await options.loadSharedMachineAuthority();
     } catch (err) {
       return {
         status: 'error',
@@ -118,47 +104,53 @@ export function createDaemonCloudDocsToolDeps(overrides: DaemonCloudDocsToolDeps
         message: err instanceof Error ? err.message : 'shared turn authority unavailable',
       };
     }
-
-    return {
-      serverUrl: creds.serverUrl,
-      serverId: creds.serverId,
-      token: creds.token,
-      ...(sharedMachineAuthority ? { sharedMachineAuthority } : {}),
-      ...(overrides.fetchImpl ? { fetchImpl: overrides.fetchImpl } : {}),
-      ...(signal ? { signal } : {}),
-    };
-  };
+  }
 
   return {
-    async listDocs({ signal, ...input }) {
-      const creds = await resolveCreds(signal);
-      if ('status' in creds) return creds;
-      return listFn(creds, input);
+    status: 'ok',
+    credentials: {
+      serverUrl,
+      serverId,
+      token,
+      ...(sharedMachineAuthority ? { sharedMachineAuthority } : {}),
+      ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+      ...(options.signal ? { signal: options.signal } : {}),
     },
-    async readDoc({ signal, ...input }) {
-      const creds = await resolveCreds(signal);
-      if ('status' in creds) return creds;
-      return readFn(creds, input);
-    },
-    async createDoc({ signal, ...input }) {
-      const creds = await resolveCreds(signal);
-      if ('status' in creds) return creds;
-      return createFn(creds, input);
-    },
-    async editDoc({ signal, ...input }) {
-      const creds = await resolveCreds(signal);
-      if ('status' in creds) return creds;
-      return editFn(creds, input);
-    },
-    async deleteDoc({ signal, ...input }) {
-      const creds = await resolveCreds(signal);
-      if ('status' in creds) return creds;
-      return deleteFn(creds, input);
-    },
-    async shareDoc({ signal, ...input }) {
-      const creds = await resolveCreds(signal);
-      if ('status' in creds) return creds;
-      return shareFn(creds, input);
+  };
+}
+
+export interface CloudDocsCliExecutionResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  data?: unknown;
+  errorReason?: MCPErrorReason;
+}
+
+export interface CloudDocsToolDeps {
+  runCli: (argv: string[], opts?: { signal?: AbortSignal }) => Promise<CloudDocsCliExecutionResult>;
+}
+
+export interface DaemonCloudDocsToolDepsOverrides {
+  loadCredential?: (homeDir?: string) => Promise<DaemonCredential | null>;
+  loadSharedMachineAuthority?: () => Promise<string | null>;
+  fetchImpl?: typeof fetch;
+  env?: Record<string, string | undefined>;
+}
+
+export function createDaemonCloudDocsToolDeps(
+  overrides: DaemonCloudDocsToolDepsOverrides = {},
+): CloudDocsToolDeps {
+  return {
+    async runCli(argv, opts) {
+      const { runCloudDocsCli } = await import('../cli/cloud-docs.js');
+      return runCloudDocsCli(argv, {
+        ...(overrides.env ? { env: overrides.env } : {}),
+        ...(overrides.fetchImpl ? { fetchImpl: overrides.fetchImpl } : {}),
+        ...(overrides.loadCredential ? { loadCredential: overrides.loadCredential } : {}),
+        ...(overrides.loadSharedMachineAuthority ? { loadSharedMachineAuthority: overrides.loadSharedMachineAuthority } : {}),
+        ...(opts?.signal ? { signal: opts.signal } : {}),
+      });
     },
   };
 }
