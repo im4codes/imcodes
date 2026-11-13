@@ -63,7 +63,7 @@ vi.mock('../../src/util/imc-dir.js', () => ({ ensureImcDir: vi.fn().mockResolved
 vi.mock('../../src/daemon/supervision-broker.js', () => ({ supervisionBroker: { decide: vi.fn() } }));
 vi.mock('../../src/daemon/supervision-automation.js', () => ({ supervisionAutomation: { init: vi.fn(), setServerLink: vi.fn(), cancelSession: vi.fn(), queueTaskIntent: vi.fn(), updateQueuedTaskIntent: vi.fn(), removeQueuedTaskIntent: vi.fn(), registerTaskIntent: vi.fn(), applySnapshotUpdate: vi.fn() } }));
 
-import { handleWebCommand, handoffSessionConversation } from '../../src/daemon/command-handler.js';
+import { handleWebCommand, handoffSessionConversation, clearTransportConversation } from '../../src/daemon/command-handler.js';
 
 const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
@@ -488,5 +488,58 @@ describe('process session /clear handling', () => {
 
     expect(emitMock.mock.calls.filter(([name, type]) =>
       name === rec.name && (type === 'assistant.text' || type === 'session.state' || type === 'usage.update'))).toEqual([]);
+  });
+
+  it('rejected stale-owner reset admission does not supersede an in-flight valid owner reset or suppress its completion emits', async () => {
+    const recA = {
+      name: 'deck_proj_stale_admission',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'agy-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      projectDir: '/proj',
+      sessionInstanceId: 'inst-A',
+    };
+    const recB = {
+      ...recA,
+      sessionInstanceId: 'inst-B',
+    };
+    getSessionMock.mockReturnValue(recB);
+
+    let releaseB!: () => void;
+    relaunchSessionWithSettingsMock.mockImplementationOnce(() => new Promise<void>((resolve) => { releaseB = resolve; }));
+
+    handleWebCommand({ type: 'session.send', session: recB.name, text: '/handoff', commandId: 'cmd-b-valid' }, serverLink as any);
+    await flushAsync();
+    expect(relaunchSessionWithSettingsMock).toHaveBeenCalledTimes(1);
+
+    // Stale A admission (handoff + clearTransportConversation) arrives while B's valid reset is in flight.
+    await expect(handoffSessionConversation(recA as any, serverLink as any)).rejects.toThrow(/ownership changed/i);
+    await expect(clearTransportConversation(recA as any, serverLink as any)).rejects.toThrow(/ownership changed/i);
+
+    releaseB();
+    await flushAsync();
+    await flushAsync();
+
+    expect(relaunchSessionWithSettingsMock).toHaveBeenCalledTimes(1);
+    expect(emitMock).toHaveBeenCalledWith(
+      recB.name,
+      'usage.update',
+      expect.objectContaining({ inputTokens: 0, cacheTokens: 0, outputTokens: 0 }),
+      expect.objectContaining({ source: 'daemon' }),
+    );
+    expect(emitMock).toHaveBeenCalledWith(
+      recB.name,
+      'assistant.text',
+      expect.objectContaining({ noticeCode: DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED }),
+      expect.objectContaining({ source: 'daemon' }),
+    );
+    expect(emitMock).toHaveBeenCalledWith(
+      recB.name,
+      'session.state',
+      { state: 'idle' },
+      expect.objectContaining({ source: 'daemon' }),
+    );
   });
 });

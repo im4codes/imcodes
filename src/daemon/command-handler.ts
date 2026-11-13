@@ -1110,6 +1110,31 @@ function allocateSessionResetToken(sessionName: string): number {
   return token;
 }
 
+function assertSessionResetAdmitted(
+  sessionName: string,
+  expectedInstanceId?: string,
+): void {
+  const latest = getSession(sessionName);
+  if (!latest) {
+    throw new Error(`Session ${sessionName} no longer exists before reset`);
+  }
+  if (expectedInstanceId && latest.sessionInstanceId !== expectedInstanceId) {
+    throw new Error(`Session ${sessionName} ownership changed before reset`);
+  }
+}
+
+function admitAndAllocateSessionResetToken(
+  sessionName: string,
+  expectedInstanceId?: string,
+  existingToken?: number,
+): number {
+  assertSessionResetAdmitted(sessionName, expectedInstanceId);
+  if (existingToken !== undefined) {
+    return existingToken;
+  }
+  return allocateSessionResetToken(sessionName);
+}
+
 function isSessionResetOwnerCurrent(
   sessionName: string,
   expectedInstanceId?: string,
@@ -1184,7 +1209,16 @@ async function executeDaemonResetCommand(opts: {
   formatError: (err: unknown) => string;
 }): Promise<void> {
   const { sessionName, serverLink, effectiveId, isLegacy, label, expectedInstanceId, run, formatError } = opts;
-  const resetToken = allocateSessionResetToken(sessionName);
+  let resetToken: number;
+  try {
+    resetToken = admitAndAllocateSessionResetToken(sessionName, expectedInstanceId);
+  } catch (err) {
+    const errMsg = formatError(err);
+    logger.warn({ sessionName, effectiveId, expectedInstanceId, errMsg }, `${label} rejected at admission without modifying current owner`);
+    timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });
+    emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
+    return;
+  }
   // Emit receipt ack + starting progress immediately before teardown/relaunch
   // (and before any queued prior relaunch wait) so the UI never hangs silently.
   const clearStatus = isLegacy ? 'accepted_legacy' : 'accepted';
@@ -1228,7 +1262,7 @@ export async function clearTransportConversation(
   resetToken?: number,
 ): Promise<void> {
   const sessionName = record.name;
-  const token = resetToken ?? allocateSessionResetToken(sessionName);
+  const token = admitAndAllocateSessionResetToken(sessionName, record.sessionInstanceId, resetToken);
   await runSerializedSessionReset(sessionName, record, async (currentRecord) => {
     // Fresh conversation must not replay stale queued messages from the prior
     // offline window — drop anything we had buffered for resend.
@@ -1249,7 +1283,7 @@ export async function handoffSessionConversation(
   resetToken?: number,
 ): Promise<void> {
   const sessionName = record.name;
-  const token = resetToken ?? allocateSessionResetToken(sessionName);
+  const token = admitAndAllocateSessionResetToken(sessionName, record.sessionInstanceId, resetToken);
   await runSerializedSessionReset(sessionName, record, async (currentRecord) => {
     clearResend(sessionName);
     await relaunchSessionWithSettings(currentRecord, { fresh: true, handoff: true });
@@ -1263,7 +1297,7 @@ async function clearProcessConversation(
   resetToken?: number,
 ): Promise<void> {
   const sessionName = record.name;
-  const token = resetToken ?? allocateSessionResetToken(sessionName);
+  const token = admitAndAllocateSessionResetToken(sessionName, record.sessionInstanceId, resetToken);
   await runSerializedSessionReset(sessionName, record, async (currentRecord) => {
     clearResend(sessionName);
     await relaunchSessionWithSettings(currentRecord, { fresh: true });
