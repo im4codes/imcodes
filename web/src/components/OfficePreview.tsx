@@ -6,8 +6,10 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import {
   ApiError,
+  downloadCloudDocApi,
   fetchCloudDocOnlyOfficeConfig,
   fetchOnlyOfficeConfig,
+  mintCloudDocDownloadUrl,
   type OnlyOfficeConfigResponse,
 } from '../api.js';
 
@@ -331,6 +333,7 @@ function OnlyOfficeEmbeddedEditor({
   onAutoFallbackLocal,
   onOpenShare,
   downloadUrl,
+  onDownload,
 }: {
   ooConfig: OnlyOfficeConfigResponse;
   mode: 'view' | 'edit';
@@ -341,6 +344,7 @@ function OnlyOfficeEmbeddedEditor({
   onAutoFallbackLocal?: (reason: string) => void;
   onOpenShare?: () => void;
   downloadUrl?: string;
+  onDownload?: () => void;
 }) {
   const { t } = useTranslation();
   const holderIdRef = useRef(`onlyoffice-editor-${Math.random().toString(36).slice(2, 10)}`);
@@ -518,7 +522,24 @@ function OnlyOfficeEmbeddedEditor({
               {t('doc_share.share_button', 'Share & Permissions')}
             </button>
           )}
-          {allowDownload && effectiveDownloadUrl && (
+          {allowDownload && onDownload ? (
+            <button
+              type="button"
+              onClick={onDownload}
+              data-testid="onlyoffice-download-link"
+              style={{
+                padding: '3px 10px',
+                background: '#334155',
+                color: '#e2e8f0',
+                border: 'none',
+                borderRadius: 4,
+                cursor: 'pointer',
+                fontSize: 11,
+              }}
+            >
+              {t('office_preview.download', 'Download')}
+            </button>
+          ) : allowDownload && effectiveDownloadUrl ? (
             <a
               href={effectiveDownloadUrl}
               download={ooConfig.config?.document?.title || true}
@@ -534,7 +555,7 @@ function OnlyOfficeEmbeddedEditor({
             >
               {t('office_preview.download', 'Download')}
             </a>
-          )}
+          ) : null}
           {onFallbackLocal && (
             <button
               type="button"
@@ -609,6 +630,7 @@ function OfficePreviewDocument({
   const [data, setData] = useState<ArrayBuffer | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [authDeniedError, setAuthDeniedError] = useState<string | null>(null);
+  const [ooConfigError, setOoConfigError] = useState<string | null>(null);
   const [authorizedFileUrl, setAuthorizedFileUrl] = useState<string>('');
   const [fallbackNotice, setFallbackNotice] = useState<string | null>(null);
   const [ooRetryKey, setOoRetryKey] = useState(0);
@@ -639,6 +661,7 @@ function OfficePreviewDocument({
     let cancelled = false;
     setOoState((prev) => ({ ...prev, loading: true }));
     setAuthDeniedError(null);
+    setOoConfigError(null);
 
     const requestPromise = cloudDocId
       ? fetchCloudDocOnlyOfficeConfig(cloudDocId, { mode: readOnly ? 'view' : mode })
@@ -651,9 +674,17 @@ function OfficePreviewDocument({
         });
 
     requestPromise
-      .then((res) => {
+      .then(async (res) => {
         if (cancelled) return;
-        const resolvedUrl = res.fileUrl || res.config?.document?.url || '';
+        let resolvedUrl = res.fileUrl || res.config?.document?.url || '';
+        if (!resolvedUrl && cloudDocId && res.enabled === false && res.allowDownload !== false && isLocallyPreviewableFormat(path, mimeType)) {
+          try {
+            resolvedUrl = await mintCloudDocDownloadUrl(cloudDocId, true);
+          } catch {
+            // Fall through with empty resolvedUrl -> bounded error if local preview lacks source
+          }
+        }
+        if (cancelled) return;
         if (resolvedUrl) {
           setAuthorizedFileUrl(resolvedUrl);
         }
@@ -681,6 +712,7 @@ function OfficePreviewDocument({
           });
           return;
         }
+        setOoConfigError(msg || 'Preview service unavailable');
         // A missing/disabled ONLYOFFICE route is not a document permission
         // denial. Fall back on 404 as on 5xx/network errors; the authenticated
         // document download still enforces its own access checks. Structured
@@ -741,6 +773,15 @@ function OfficePreviewDocument({
     return <div style={{ color: '#64748b', padding: 12 }}>…</div>;
   }
 
+  const fileName = path.split('/').pop() || 'document';
+  const handleCloudDocDownload = cloudDocId
+    ? () => {
+        downloadCloudDocApi(cloudDocId, fileName).catch((dlErr: unknown) => {
+          setError(dlErr instanceof Error ? dlErr.message : String(dlErr));
+        });
+      }
+    : undefined;
+
   if (useOnlyOffice && ooState.config) {
     return (
       <OnlyOfficeEmbeddedEditor
@@ -768,7 +809,8 @@ function OfficePreviewDocument({
             : undefined
         }
         onOpenShare={onOpenShare}
-        downloadUrl={effectiveSrcUrl}
+        downloadUrl={handleCloudDocDownload ? undefined : effectiveSrcUrl}
+        onDownload={handleCloudDocDownload}
       />
     );
   }
@@ -779,6 +821,8 @@ function OfficePreviewDocument({
       data-testid="office-preview-retry-onlyoffice"
       onClick={() => {
         setFallbackNotice(null);
+        setOoConfigError(null);
+        setError(null);
         setOoState((s) => ({ ...s, forceLocal: false }));
         setOoRetryKey((k) => k + 1);
       }}
@@ -801,13 +845,29 @@ function OfficePreviewDocument({
     return (
       <div style={{ color: '#cbd5e1', padding: 16, textAlign: 'center' }} data-testid="office-preview-unsupported-local">
         <div style={{ marginBottom: 10 }}>
-          {t('office_preview.unsupported_local_format', 'Local preview is not available for this format')}: {path.split('/').pop()}
+          {t('office_preview.unsupported_local_format', 'Local preview is not available for this format')}: {fileName}
         </div>
         <div style={{ display: 'flex', justifyContent: 'center', gap: 8 }}>
-          {allowDl && effectiveSrcUrl && (
+          {allowDl && handleCloudDocDownload ? (
+            <button
+              type="button"
+              onClick={handleCloudDocDownload}
+              style={{
+                padding: '6px 14px',
+                background: '#2563eb',
+                color: '#fff',
+                border: 'none',
+                borderRadius: 4,
+                cursor: 'pointer',
+                fontSize: 12,
+              }}
+            >
+              {t('office_preview.download', 'Download')}
+            </button>
+          ) : allowDl && effectiveSrcUrl ? (
             <a
               href={effectiveSrcUrl}
-              download={path.split('/').pop() || true}
+              download={fileName || true}
               style={{
                 padding: '6px 14px',
                 background: '#2563eb',
@@ -819,9 +879,18 @@ function OfficePreviewDocument({
             >
               {t('office_preview.download', 'Download')}
             </a>
-          )}
+          ) : null}
           {retryOnlyOfficeButton}
         </div>
+      </div>
+    );
+  }
+
+  if (!effectiveSrcUrl) {
+    return (
+      <div style={{ color: '#ef4444', padding: 16, textAlign: 'center' }} data-testid="office-preview-unavailable">
+        <div>{ooConfigError || t('office_preview.unavailable', 'Document preview is currently unavailable')}</div>
+        {retryOnlyOfficeButton && <div style={{ marginTop: 8 }}>{retryOnlyOfficeButton}</div>}
       </div>
     );
   }

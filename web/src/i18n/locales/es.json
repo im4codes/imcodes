@@ -5238,6 +5238,7 @@
       "file_too_large": "El archivo supera el límite de 50 MB",
       "unsupported_format": "Formato de documento no compatible",
       "server_not_found": "Este servidor ya no existe o no está disponible.",
+      "server_offline": "El servidor está desconectado. Reconéctalo y actualiza, o quita esta entrada.",
       "doc_missing": "Este documento en la nube ya no está disponible.",
       "access_denied": "Ya no tienes permiso para abrir este documento."
     },

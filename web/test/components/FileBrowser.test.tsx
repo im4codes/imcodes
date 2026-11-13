@@ -3411,4 +3411,108 @@ describe('FileBrowser — file-manager preview/folder sync', () => {
       listSpy.mockRestore();
     }
   });
+
+  it('auto-records local document previews (.md/.txt, status=ok) in recent documents while skipping code files and failed reads', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ item: {} }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { ws, sendMsg } = makeWsFactory();
+    const recentCalls = () => fetchMock.mock.calls.filter(([url]) => String(url).includes('/api/recent-documents/record'));
+
+    try {
+      await act(async () => {
+        render(
+          <FileBrowser
+            ws={ws}
+            serverId="srv-rec"
+            mode="file-single"
+            layout="panel"
+            initialPath="/repo"
+            autoPreviewPath="/repo/README.md"
+            onConfirm={vi.fn()}
+          />,
+        );
+      });
+
+      await act(async () => {
+        sendMsg({
+          type: 'fs.read_response',
+          requestId: 'mock-read-id',
+          path: '/repo/README.md',
+          status: 'ok',
+          content: '# Hello World',
+          encoding: 'utf8',
+        } as unknown as ServerMessage);
+      });
+
+      await waitFor(() => expect(recentCalls()).toHaveLength(1));
+      const payload = JSON.parse(String((recentCalls()[0]?.[1] as RequestInit | undefined)?.body ?? '{}'));
+      expect(payload).toMatchObject({
+        sourceKind: 'server_file',
+        serverId: 'srv-rec',
+        filePath: '/repo/README.md',
+        mimeType: 'text/markdown; charset=utf-8',
+        title: 'README.md',
+      });
+
+      fetchMock.mockClear();
+
+      // Non-document code file (.ts) MUST NOT be recorded even when status === 'ok'
+      await act(async () => {
+        render(
+          <FileBrowser
+            ws={ws}
+            serverId="srv-rec"
+            mode="file-single"
+            layout="panel"
+            initialPath="/repo"
+            autoPreviewPath="/repo/index.ts"
+            onConfirm={vi.fn()}
+          />,
+        );
+      });
+      await act(async () => {
+        sendMsg({
+          type: 'fs.read_response',
+          requestId: 'mock-read-id',
+          path: '/repo/index.ts',
+          status: 'ok',
+          content: 'export const x = 1;',
+          encoding: 'utf8',
+        } as unknown as ServerMessage);
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(recentCalls()).toHaveLength(0);
+
+      // Error / failed read on .txt MUST NOT be recorded
+      await act(async () => {
+        render(
+          <FileBrowser
+            ws={ws}
+            serverId="srv-rec"
+            mode="file-single"
+            layout="panel"
+            initialPath="/repo"
+            autoPreviewPath="/repo/notes.txt"
+            onConfirm={vi.fn()}
+          />,
+        );
+      });
+      await act(async () => {
+        sendMsg({
+          type: 'fs.read_response',
+          requestId: 'mock-read-id',
+          path: '/repo/notes.txt',
+          status: 'error',
+          error: 'not_found',
+        } as unknown as ServerMessage);
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(recentCalls()).toHaveLength(0);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });

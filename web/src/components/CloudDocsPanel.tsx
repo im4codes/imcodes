@@ -8,7 +8,7 @@ import {
   deleteCloudDocApi,
   deleteCloudDocFolderApi,
   deleteRecentDocumentApi,
-  getCloudDocDownloadUrl,
+  downloadCloudDocApi,
   listCloudDocSharesApi,
   listCloudDocTeamsApi,
   listCloudDocsApi,
@@ -114,6 +114,7 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
   const [shareTarget, setShareTarget] = useState<{ kind: CloudDocShareTargetKind; id: string; name: string } | null>(null);
   const [shareList, setShareList] = useState<CloudDocShareRecord[]>([]);
   const [shareLoading, setShareLoading] = useState(false);
+  const [shareSubmitting, setShareSubmitting] = useState(false);
   const [shareMode, setShareMode] = useState<CloudDocShareMode>('team');
   const [shareTeamId, setShareTeamId] = useState('');
   const [shareUsername, setShareUsername] = useState('');
@@ -144,12 +145,19 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
   const mountedRef = useRef(true);
   const loadSeqRef = useRef(0);
   const loadAbortRef = useRef<AbortController | null>(null);
+  const shareSeqRef = useRef(0);
+  const shareAbortRef = useRef<AbortController | null>(null);
+  const shareTargetRef = useRef<{ kind: CloudDocShareTargetKind; id: string; name: string } | null>(null);
 
   useEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
       loadAbortRef.current?.abort();
+      shareSeqRef.current += 1;
+      shareAbortRef.current?.abort();
+      shareAbortRef.current = null;
+      shareTargetRef.current = null;
     };
   }, []);
 
@@ -446,7 +454,7 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
 
   const handleOpenRecentItem = (item: RecentDocumentItem) => {
     setRecentBlockedNotice(null);
-    if (!item.accessible) {
+    if (!item.accessible || (item.sourceKind === 'server_file' && !item.serverOnline)) {
       setRecentBlockedNotice(item);
       return;
     }
@@ -500,17 +508,52 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
     });
   };
 
+  const isCurrentShareTarget = (seq: number, kind: CloudDocShareTargetKind, id: string): boolean => (
+    mountedRef.current
+    && shareSeqRef.current === seq
+    && shareTargetRef.current?.kind === kind
+    && shareTargetRef.current?.id === id
+  );
+
+  const closeShareDialog = () => {
+    shareSeqRef.current += 1;
+    shareAbortRef.current?.abort();
+    shareAbortRef.current = null;
+    shareTargetRef.current = null;
+    setShareTarget(null);
+    setShareList([]);
+    setShareLoading(false);
+    setShareSubmitting(false);
+  };
+
+  const handleDownloadCloudDoc = async (docId: string, filename: string) => {
+    try {
+      await downloadCloudDocApi(docId, filename);
+    } catch (err: unknown) {
+      if (!mountedRef.current) return;
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
   const openShareDialog = async (kind: CloudDocShareTargetKind, id: string, name: string) => {
-    setShareTarget({ kind, id, name });
+    const seq = ++shareSeqRef.current;
+    shareAbortRef.current?.abort();
+    const controller = new AbortController();
+    shareAbortRef.current = controller;
+    const nextTarget = { kind, id, name };
+    shareTargetRef.current = nextTarget;
+
+    setShareTarget(nextTarget);
     setShareList([]);
     setShareLoading(true);
+    setShareSubmitting(false);
     setError(null);
     try {
       const [sharesRes, teamsRes] = await Promise.all([
-        listCloudDocSharesApi(kind, id),
-        listCloudDocTeamsApi().catch(() => ({ teams })),
+        listCloudDocSharesApi(kind, id, controller.signal),
+        listCloudDocTeamsApi(controller.signal).catch(() => ({ teams })),
       ]);
-      if (!mountedRef.current) return;
+      if (!isCurrentShareTarget(seq, kind, id) || controller.signal.aborted) return;
       setShareList(sharesRes.shares);
       setTeams(teamsRes.teams);
       if (teamsRes.teams.length > 0 && !shareTeamId) {
@@ -520,56 +563,75 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
         setShareMode('user');
       }
     } catch (err: unknown) {
-      if (!mountedRef.current) return;
+      if (!isCurrentShareTarget(seq, kind, id) || controller.signal.aborted) return;
+      if (err instanceof DOMException && err.name === 'AbortError') return;
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      if (mountedRef.current) setShareLoading(false);
+      if (isCurrentShareTarget(seq, kind, id)) {
+        setShareLoading(false);
+      }
     }
   };
 
   const handleCreateShare = async (e: Event) => {
     e.preventDefault();
-    if (!shareTarget) return;
+    const target = shareTargetRef.current ?? shareTarget;
+    if (!target || shareSubmitting) return;
     if (shareMode === 'team' && !shareTeamId) return;
     if (shareMode === 'user' && !shareUsername.trim()) return;
 
-    setBusy(true);
+    const seq = shareSeqRef.current;
+    const controller = shareAbortRef.current;
+    setShareSubmitting(true);
     setError(null);
     try {
-      await upsertCloudDocShareApi({
-        targetKind: shareTarget.kind,
-        targetId: shareTarget.id,
-        shareMode,
-        targetTeamId: shareMode === 'team' ? shareTeamId : undefined,
-        targetUsername: shareMode === 'user' ? shareUsername.trim() : undefined,
-        role: shareRole,
-        allowDownload: shareAllowDownload,
-      });
-      const res = await listCloudDocSharesApi(shareTarget.kind, shareTarget.id);
-      if (!mountedRef.current) return;
+      await upsertCloudDocShareApi(
+        {
+          targetKind: target.kind,
+          targetId: target.id,
+          shareMode,
+          targetTeamId: shareMode === 'team' ? shareTeamId : undefined,
+          targetUsername: shareMode === 'user' ? shareUsername.trim() : undefined,
+          role: shareRole,
+          allowDownload: shareAllowDownload,
+        },
+        controller?.signal,
+      );
+      if (!isCurrentShareTarget(seq, target.kind, target.id) || controller?.signal.aborted) return;
+      const res = await listCloudDocSharesApi(target.kind, target.id, controller?.signal);
+      if (!isCurrentShareTarget(seq, target.kind, target.id) || controller?.signal.aborted) return;
       setShareList(res.shares);
       setShareUsername('');
     } catch (err: unknown) {
-      if (!mountedRef.current) return;
+      if (!isCurrentShareTarget(seq, target.kind, target.id) || controller?.signal.aborted) return;
+      if (err instanceof DOMException && err.name === 'AbortError') return;
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      if (mountedRef.current) setBusy(false);
+      if (isCurrentShareTarget(seq, target.kind, target.id)) {
+        setShareSubmitting(false);
+      }
     }
   };
 
   const handleRevokeShare = async (shareId: string) => {
-    if (!shareTarget) return;
-    setBusy(true);
+    const target = shareTargetRef.current ?? shareTarget;
+    if (!target || shareSubmitting) return;
+    const seq = shareSeqRef.current;
+    const controller = shareAbortRef.current;
+    setShareSubmitting(true);
     setError(null);
     try {
-      await revokeCloudDocShareApi(shareId);
-      if (!mountedRef.current) return;
+      await revokeCloudDocShareApi(shareId, controller?.signal);
+      if (!isCurrentShareTarget(seq, target.kind, target.id) || controller?.signal.aborted) return;
       setShareList((prev) => prev.filter((s) => s.id !== shareId));
     } catch (err: unknown) {
-      if (!mountedRef.current) return;
+      if (!isCurrentShareTarget(seq, target.kind, target.id) || controller?.signal.aborted) return;
+      if (err instanceof DOMException && err.name === 'AbortError') return;
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      if (mountedRef.current) setBusy(false);
+      if (isCurrentShareTarget(seq, target.kind, target.id)) {
+        setShareSubmitting(false);
+      }
     }
   };
 
@@ -592,14 +654,14 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
             {previewTarget.kind === 'cloud_doc' ? previewTarget.name : previewTarget.title}
           </span>
           {previewTarget.kind === 'cloud_doc' && previewTarget.allowDownload && (
-            <a
+            <button
+              type="button"
               class="cloud-docs-btn"
               data-testid="cloud-docs-preview-download"
-              href={getCloudDocDownloadUrl(previewTarget.id)}
-              download={previewTarget.name}
+              onClick={() => void handleDownloadCloudDoc(previewTarget.id, previewTarget.name)}
             >
               {t('cloud_docs.actions.download', 'Download')}
-            </a>
+            </button>
           )}
         </div>
         <div class="cloud-docs-preview-stage">
@@ -607,7 +669,6 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
             {previewTarget.kind === 'cloud_doc' ? (
               <OfficePreview
                 cloudDocId={previewTarget.id}
-                srcUrl={previewTarget.allowDownload ? getCloudDocDownloadUrl(previewTarget.id, true) : undefined}
                 mimeType={previewTarget.mimeType}
                 path={previewTarget.name}
                 readOnly={previewTarget.readOnly}
@@ -708,20 +769,34 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
       {recentBlockedNotice && (
         <div class="cloud-docs-banner is-warning" data-testid="cloud-docs-recent-blocked">
           <span>
-            {recentBlockedNotice.accessReason === 'server_not_found'
-              ? t('cloud_docs.errors.server_not_found', 'This server no longer exists or is unavailable.')
-              : recentBlockedNotice.accessReason === 'cloud_doc_missing'
-                ? t('cloud_docs.errors.doc_missing', 'This cloud document is no longer available.')
-                : t('cloud_docs.errors.access_denied', 'You no longer have permission to open this document.')}
+            {recentBlockedNotice.accessReason === 'server_offline' || (recentBlockedNotice.sourceKind === 'server_file' && !recentBlockedNotice.serverOnline)
+              ? t('cloud_docs.errors.server_offline', 'The server is currently offline. Reconnect the server and refresh, or remove this entry.')
+              : recentBlockedNotice.accessReason === 'server_not_found'
+                ? t('cloud_docs.errors.server_not_found', 'This server no longer exists or is unavailable.')
+                : recentBlockedNotice.accessReason === 'cloud_doc_missing'
+                  ? t('cloud_docs.errors.doc_missing', 'This cloud document is no longer available.')
+                  : t('cloud_docs.errors.access_denied', 'You no longer have permission to open this document.')}
           </span>
-          <button
-            type="button"
-            class="cloud-docs-btn"
-            data-testid="cloud-docs-remove-blocked-recent"
-            onClick={() => void handleDeleteRecent(recentBlockedNotice.id)}
-          >
-            {t('cloud_docs.actions.remove_recent', 'Remove from Recent')}
-          </button>
+          <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+            {(recentBlockedNotice.accessReason === 'server_offline' || (recentBlockedNotice.sourceKind === 'server_file' && !recentBlockedNotice.serverOnline)) && (
+              <button
+                type="button"
+                class="cloud-docs-btn"
+                data-testid="cloud-docs-refresh-blocked-recent"
+                onClick={() => void refreshData()}
+              >
+                {t('common.refresh', 'Refresh')}
+              </button>
+            )}
+            <button
+              type="button"
+              class="cloud-docs-btn"
+              data-testid="cloud-docs-remove-blocked-recent"
+              onClick={() => void handleDeleteRecent(recentBlockedNotice.id)}
+            >
+              {t('cloud_docs.actions.remove_recent', 'Remove from Recent')}
+            </button>
+          </div>
         </div>
       )}
 
@@ -887,7 +962,12 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
             <span>
               {t('cloud_docs.share.title', 'Share "{{name}}"', { name: shareTarget.name })}
             </span>
-            <button type="button" class="cloud-docs-btn" onClick={() => setShareTarget(null)}>
+            <button
+              type="button"
+              class="cloud-docs-btn"
+              data-testid="cloud-docs-share-close"
+              onClick={closeShareDialog}
+            >
               ✕
             </button>
           </div>
@@ -954,7 +1034,7 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
               type="submit"
               class="cloud-docs-btn is-primary"
               data-testid="cloud-docs-share-submit"
-              disabled={busy || (shareMode === 'team' ? !shareTeamId : !shareUsername.trim())}
+              disabled={busy || shareSubmitting || (shareMode === 'team' ? !shareTeamId : !shareUsername.trim())}
             >
               {t('cloud_docs.share.submit', 'Share')}
             </button>
@@ -980,7 +1060,7 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
                     class="cloud-docs-btn is-danger"
                     data-testid={`revoke-cloud-share-${s.id}`}
                     onClick={() => void handleRevokeShare(s.id)}
-                    disabled={busy}
+                    disabled={busy || shareSubmitting}
                   >
                     {t('cloud_docs.share.revoke', 'Revoke')}
                   </button>
@@ -1147,14 +1227,14 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
                     </button>
                     <div class="cloud-docs-row-actions">
                       {doc.allowDownload && (
-                        <a
+                        <button
+                          type="button"
                           class="cloud-docs-btn"
                           data-testid={`download-shared-doc-${doc.id}`}
-                          href={getCloudDocDownloadUrl(doc.id)}
-                          download={doc.name}
+                          onClick={() => void handleDownloadCloudDoc(doc.id, doc.name)}
                         >
                           ↓
-                        </a>
+                        </button>
                       )}
                     </div>
                   </div>
@@ -1227,13 +1307,14 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
                   </div>
                 </button>
                 <div class="cloud-docs-row-actions">
-                  <a
+                  <button
+                    type="button"
                     class="cloud-docs-btn"
-                    href={getCloudDocDownloadUrl(doc.id)}
-                    download={doc.name}
+                    data-testid={`download-cloud-doc-${doc.id}`}
+                    onClick={() => void handleDownloadCloudDoc(doc.id, doc.name)}
                   >
                     ↓
-                  </a>
+                  </button>
                   <button
                     type="button"
                     class="cloud-docs-btn"

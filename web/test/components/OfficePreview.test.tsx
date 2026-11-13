@@ -805,4 +805,46 @@ describe('OfficePreview fallback document transitions', () => {
     await new Promise(resolve => setTimeout(resolve, 0));
     for (const [options] of pdfjsApi.getDocument.mock.calls) expect([...options.data]).toEqual([2]);
   });
+
+  it('shows bounded retryable error instead of infinite loading when config fails with no srcUrl, and mints tickets for disabled ONLYOFFICE cloud docs', async () => {
+    const api = await import('../../src/api.js');
+    const srvCfg = vi
+      .spyOn(api, 'fetchOnlyOfficeConfig')
+      .mockRejectedValueOnce(new api.ApiError(503, 'server_offline'))
+      .mockResolvedValueOnce({ enabled: true, fileUrl: 'https://files.test/recovered.xlsx', config: undefined } as unknown as Awaited<ReturnType<typeof api.fetchOnlyOfficeConfig>>);
+    installFetchStub();
+
+    const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
+    const view = render(
+      <OfficePreview
+        serverId="srv-off"
+        path="/repo/budget.xlsx"
+        mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      />,
+    );
+
+    await waitFor(() => expect(view.getByTestId('office-preview-unavailable')).toBeTruthy());
+    expect(view.container.textContent).not.toBe('…');
+
+    fireEvent.click(view.getByTestId('office-preview-retry-onlyoffice'));
+    await waitFor(() => expect(view.container.textContent).toContain('allowed-old-document'));
+    expect(srvCfg).toHaveBeenCalledTimes(2);
+
+    // CloudDoc with ONLYOFFICE disabled -> mints short-lived ticket for local fallback instead of stalling
+    const mintSpy = vi.spyOn(api, 'mintCloudDocDownloadUrl').mockResolvedValue('https://files.test/api/cloud-docs/download/ticket-123');
+    vi.spyOn(api, 'fetchCloudDocOnlyOfficeConfig').mockResolvedValueOnce({
+      enabled: false,
+      allowDownload: true,
+    } as unknown as Awaited<ReturnType<typeof api.fetchCloudDocOnlyOfficeConfig>>);
+
+    view.rerender(
+      <OfficePreview
+        cloudDocId="cdoc-local"
+        path="Notes.xlsx"
+        mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      />,
+    );
+    await waitFor(() => expect(mintSpy).toHaveBeenCalledWith('cdoc-local', true));
+    await waitFor(() => expect(view.container.textContent).toContain('allowed-old-document'));
+  });
 });

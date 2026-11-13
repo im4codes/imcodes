@@ -62,6 +62,7 @@ const createBlankCloudDocApiMock = vi.fn();
 const uploadCloudDocApiMock = vi.fn();
 const updateCloudDocApiMock = vi.fn();
 const deleteCloudDocApiMock = vi.fn();
+const downloadCloudDocApiMock = vi.fn();
 const listRecentDocumentsApiMock = vi.fn();
 const deleteRecentDocumentApiMock = vi.fn();
 
@@ -87,6 +88,7 @@ vi.mock('../../src/api.js', () => ({
   uploadCloudDocApi: (...args: unknown[]) => uploadCloudDocApiMock(...args),
   updateCloudDocApi: (...args: unknown[]) => updateCloudDocApiMock(...args),
   deleteCloudDocApi: (...args: unknown[]) => deleteCloudDocApiMock(...args),
+  downloadCloudDocApi: (...args: unknown[]) => downloadCloudDocApiMock(...args),
   getCloudDocDownloadUrl: (docId: string, inline?: boolean) =>
     `/api/cloud-docs/docs/${encodeURIComponent(docId)}/download${inline ? '?inline=1' : ''}`,
   listRecentDocumentsApi: (...args: unknown[]) => listRecentDocumentsApiMock(...args),
@@ -287,15 +289,18 @@ describe('CloudDocsPanel', () => {
     fireEvent.submit(roleSelect.closest('form')!);
 
     await waitFor(() => {
-      expect(upsertCloudDocShareApiMock).toHaveBeenCalledWith({
-        targetKind: 'doc',
-        targetId: 'doc-1',
-        shareMode: 'team',
-        targetTeamId: 'team-1',
-        targetUsername: undefined,
-        role: 'editor',
-        allowDownload: true,
-      });
+      expect(upsertCloudDocShareApiMock).toHaveBeenCalledWith(
+        {
+          targetKind: 'doc',
+          targetId: 'doc-1',
+          shareMode: 'team',
+          targetTeamId: 'team-1',
+          targetUsername: undefined,
+          role: 'editor',
+          allowDownload: true,
+        },
+        expect.any(AbortSignal),
+      );
       expect(screen.getByTestId('cloud-doc-share-item-share-1')).toBeTruthy();
     });
 
@@ -316,21 +321,24 @@ describe('CloudDocsPanel', () => {
     fireEvent.submit(userInput.closest('form')!);
 
     await waitFor(() => {
-      expect(upsertCloudDocShareApiMock).toHaveBeenLastCalledWith({
-        targetKind: 'doc',
-        targetId: 'doc-1',
-        shareMode: 'user',
-        targetTeamId: undefined,
-        targetUsername: 'bob',
-        role: 'viewer',
-        allowDownload: false,
-      });
+      expect(upsertCloudDocShareApiMock).toHaveBeenLastCalledWith(
+        {
+          targetKind: 'doc',
+          targetId: 'doc-1',
+          shareMode: 'user',
+          targetTeamId: undefined,
+          targetUsername: 'bob',
+          role: 'viewer',
+          allowDownload: false,
+        },
+        expect.any(AbortSignal),
+      );
       expect(screen.getByTestId('cloud-doc-share-item-share-2')).toBeTruthy();
     });
 
     fireEvent.click(screen.getByTestId('revoke-cloud-share-share-1'));
     await waitFor(() => {
-      expect(revokeCloudDocShareApiMock).toHaveBeenCalledWith('share-1');
+      expect(revokeCloudDocShareApiMock).toHaveBeenCalledWith('share-1', expect.any(AbortSignal));
       expect(screen.queryByTestId('cloud-doc-share-item-share-1')).toBeNull();
     });
   });
@@ -458,5 +466,168 @@ describe('CloudDocsPanel', () => {
     expect(css).toContain('@media (max-width: 420px)');
     expect(css).toContain('.cloud-docs-panel');
     expect(css).toContain('.cloud-docs-share-form');
+  });
+
+  it('uses ticket-based downloadCloudDocApi across My Docs, Shared Docs, and Preview header without raw cookie anchors', async () => {
+    downloadCloudDocApiMock.mockResolvedValue(undefined);
+    const sharedDoc: SharedCloudDocItem = {
+      id: 'sdoc-dl',
+      folderId: null,
+      name: 'shared-report.docx',
+      mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      sizeBytes: 2048,
+      docVersion: 1,
+      createdAt: 1_700_000_000_000,
+      updatedAt: 1_700_000_100_000,
+      ownerName: 'Alice',
+      role: 'viewer',
+      allowDownload: true,
+    };
+    listCloudDocsApiMock.mockResolvedValue({
+      folders: [],
+      docs: [makeDoc()],
+      sharedFolders: [],
+      sharedDocs: [sharedDoc],
+    });
+
+    const view = render(<CloudDocsPanel initialTab="my_docs" />);
+    await waitFor(() => expect(screen.getByTestId('download-cloud-doc-doc-1')).toBeTruthy());
+    expect(view.container.querySelector('a[href*="/download"]')).toBeNull();
+
+    fireEvent.click(screen.getByTestId('download-cloud-doc-doc-1'));
+    await waitFor(() => expect(downloadCloudDocApiMock).toHaveBeenCalledWith('doc-1', 'quarterly.docx'));
+
+    fireEvent.click(screen.getByTestId('cloud-docs-tab-shared'));
+    await waitFor(() => expect(screen.getByTestId('download-shared-doc-sdoc-dl')).toBeTruthy());
+    fireEvent.click(screen.getByTestId('download-shared-doc-sdoc-dl'));
+    await waitFor(() => expect(downloadCloudDocApiMock).toHaveBeenCalledWith('sdoc-dl', 'shared-report.docx'));
+
+    // Open preview -> OfficePreview receives NO raw /api/cloud-docs/:id/download srcUrl, header uses ticket button
+    fireEvent.click(screen.getByTestId('shared-cloud-doc-row-sdoc-dl').querySelector('button.cloud-docs-row-main')!);
+    await waitFor(() => {
+      const preview = screen.getByTestId('mock-office-preview');
+      expect(preview.getAttribute('data-has-src-url')).toBe('false');
+      expect(screen.getByTestId('cloud-docs-preview-download')).toBeTruthy();
+    });
+    fireEvent.click(screen.getByTestId('cloud-docs-preview-download'));
+    await waitFor(() => expect(downloadCloudDocApiMock).toHaveBeenCalledWith('sdoc-dl', 'shared-report.docx'));
+  });
+
+  it('drops stale share dialog responses & in-flight revokes when switching targets or closing dialog', async () => {
+    const docA = makeDoc({ id: 'doc-a', name: 'DocA.docx' });
+    const docB = makeDoc({ id: 'doc-b', name: 'DocB.docx' });
+    const shareA: CloudDocShareRecord = {
+      id: 'share-a',
+      targetKind: 'doc',
+      targetId: 'doc-a',
+      shareMode: 'user',
+      targetTeamId: null,
+      targetTeamName: null,
+      targetUserId: 'usr-a',
+      targetUserUsername: 'alice',
+      targetUserName: 'Alice',
+      role: 'viewer',
+      allowDownload: true,
+      createdAt: 1_700_000_000_000,
+    };
+    const shareB: CloudDocShareRecord = {
+      id: 'share-b',
+      targetKind: 'doc',
+      targetId: 'doc-b',
+      shareMode: 'user',
+      targetTeamId: null,
+      targetTeamName: null,
+      targetUserId: 'usr-b',
+      targetUserUsername: 'bob',
+      targetUserName: 'Bob',
+      role: 'editor',
+      allowDownload: true,
+      createdAt: 1_700_000_100_000,
+    };
+
+    listCloudDocsApiMock.mockResolvedValue({
+      folders: [],
+      docs: [docA, docB],
+      sharedFolders: [],
+      sharedDocs: [],
+    });
+
+    let rejectSlowA!: (err: Error) => void;
+    let signalA: AbortSignal | undefined;
+    let resolveRevokeA!: (v: { ok: boolean }) => void;
+
+    listCloudDocSharesApiMock.mockImplementation(async (_kind: string, id: string, signal?: AbortSignal) => {
+      if (id === 'doc-a') {
+        signalA = signal;
+        return new Promise((_resolve, reject) => { rejectSlowA = reject; });
+      }
+      return { shares: [shareB] };
+    });
+
+    render(<CloudDocsPanel initialTab="my_docs" />);
+    await waitFor(() => expect(screen.getByTestId('share-cloud-doc-doc-a')).toBeTruthy());
+
+    // 1. Open share for A (slow), immediately switch to B (fast)
+    fireEvent.click(screen.getByTestId('share-cloud-doc-doc-a'));
+    fireEvent.click(screen.getByTestId('share-cloud-doc-doc-b'));
+
+    await waitFor(() => expect(screen.getByTestId('cloud-doc-share-item-share-b')).toBeTruthy());
+    expect(signalA?.aborted).toBe(true);
+
+    // Late rejection from A must NOT clobber B's panel with an error or list
+    rejectSlowA(new Error('late failure from doc-a'));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(screen.queryByTestId('cloud-docs-error')).toBeNull();
+    expect(screen.getByTestId('cloud-doc-share-item-share-b')).toBeTruthy();
+
+    // 2. Slow revoke on B -> close dialog -> reopen A -> late revoke settles without mutating new dialog state
+    revokeCloudDocShareApiMock.mockImplementationOnce(
+      () => new Promise<{ ok: boolean }>((resolve) => { resolveRevokeA = resolve; }),
+    );
+    fireEvent.click(screen.getByTestId('revoke-cloud-share-share-b'));
+    fireEvent.click(screen.getByTestId('cloud-docs-share-close'));
+    listCloudDocSharesApiMock.mockImplementationOnce(async () => ({ shares: [shareA] }));
+    fireEvent.click(screen.getByTestId('share-cloud-doc-doc-a'));
+    await waitFor(() => expect(screen.getByTestId('cloud-doc-share-item-share-a')).toBeTruthy());
+
+    resolveRevokeA({ ok: true });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(screen.getByTestId('cloud-doc-share-item-share-a')).toBeTruthy();
+    expect((screen.getByTestId('revoke-cloud-share-share-a') as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('blocks opening offline server_file recent items into OfficePreview and shows refresh/remove notice', async () => {
+    const offlineRecent: RecentDocumentItem = {
+      id: 'rec-offline',
+      sourceKind: 'server_file',
+      sourceType: 'server_file',
+      sourceKey: 'server_file:srv-off:/docs/plan.docx',
+      title: 'plan.docx',
+      mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      serverId: 'srv-off',
+      serverName: 'Edge Node',
+      serverOnline: false,
+      sessionName: null,
+      filePath: '/docs/plan.docx',
+      cloudDocId: null,
+      lastOpenedAt: 1_700_000_600_000,
+      openCount: 1,
+      accessible: true,
+      accessReason: 'server_offline',
+    };
+    listRecentDocumentsApiMock.mockResolvedValue({ items: [offlineRecent] });
+
+    render(<CloudDocsPanel initialTab="recent" />);
+    await waitFor(() => expect(screen.getByTestId('recent-doc-row-rec-offline')).toBeTruthy());
+
+    fireEvent.click(screen.getByTestId('recent-doc-row-rec-offline').querySelector('button.cloud-docs-row-main')!);
+    await waitFor(() => {
+      expect(screen.getByTestId('cloud-docs-recent-blocked')).toBeTruthy();
+      expect(screen.getByTestId('cloud-docs-refresh-blocked-recent')).toBeTruthy();
+      expect(screen.getByTestId('cloud-docs-remove-blocked-recent')).toBeTruthy();
+    });
+    expect(screen.queryByTestId('mock-office-preview')).toBeNull();
   });
 });

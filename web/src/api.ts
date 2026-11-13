@@ -3673,10 +3673,11 @@ export async function listCloudDocTeamsApi(signal?: AbortSignal): Promise<{ team
 export async function listCloudDocSharesApi(
   targetKind: CloudDocShareTargetKind,
   targetId: string,
+  signal?: AbortSignal,
 ): Promise<{ shares: CloudDocShareRecord[] }> {
   return apiFetch<{ shares: CloudDocShareRecord[] }>(
     `/api/cloud-docs/shares/${encodeURIComponent(targetKind)}/${encodeURIComponent(targetId)}`,
-    { method: 'GET' },
+    { method: 'GET', signal },
   );
 }
 
@@ -3689,16 +3690,18 @@ export async function upsertCloudDocShareApi(body: {
   targetUsername?: string;
   role: CloudDocShareRole;
   allowDownload?: boolean;
-}): Promise<{ share: CloudDocShareRecord }> {
+}, signal?: AbortSignal): Promise<{ share: CloudDocShareRecord }> {
   return apiFetch<{ share: CloudDocShareRecord }>('/api/cloud-docs/shares', {
     method: 'POST',
     body: JSON.stringify(body),
+    signal,
   });
 }
 
-export async function revokeCloudDocShareApi(shareId: string): Promise<{ ok: boolean }> {
+export async function revokeCloudDocShareApi(shareId: string, signal?: AbortSignal): Promise<{ ok: boolean }> {
   return apiFetch<{ ok: boolean }>(`/api/cloud-docs/shares/${encodeURIComponent(shareId)}`, {
     method: 'DELETE',
+    signal,
   });
 }
 
@@ -3775,6 +3778,34 @@ export async function deleteCloudDocApi(docId: string): Promise<{ ok: boolean }>
 export function getCloudDocDownloadUrl(docId: string, inline = false): string {
   const qs = inline ? '' : '?download=1';
   return `${_baseUrl}/api/cloud-docs/${encodeURIComponent(docId)}/download${qs}`;
+}
+
+export async function mintCloudDocDownloadUrl(docId: string, inline = false): Promise<string> {
+  const res = await apiFetch<{
+    ticket: string;
+    downloadPath: string;
+    expiresInSeconds: number;
+  }>(`/api/cloud-docs/${encodeURIComponent(docId)}/download-ticket`, {
+    method: 'POST',
+    body: JSON.stringify({ inline }),
+  });
+  return `${_baseUrl}${res.downloadPath}`;
+}
+
+export async function downloadCloudDocApi(docId: string, filename?: string): Promise<void> {
+  const url = await mintCloudDocDownloadUrl(docId, false);
+  if (isNative()) {
+    const { Browser } = await import('@capacitor/browser');
+    await Browser.open({ url });
+    return;
+  }
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename ?? '';
+  anchor.style.display = 'none';
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
 }
 
 export async function fetchCloudDocOnlyOfficeConfig(

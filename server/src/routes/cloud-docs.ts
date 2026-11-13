@@ -27,6 +27,7 @@ import {
   getCloudDocById,
   getCloudDocFolderById,
   insertCloudDoc,
+  isDefinitelyUncommittedDbError,
   isDescendantFolder,
   listCloudDocFolders,
   listCloudDocSharesForTarget,
@@ -113,6 +114,118 @@ export function verifyCloudDocOnlyOfficeToken(
     iat: typeof payload.iat === 'number' ? payload.iat : undefined,
     exp: typeof payload.exp === 'number' ? payload.exp : undefined,
   };
+}
+
+export const CLOUD_DOC_DOWNLOAD_TICKET_TTL_SECONDS = 120;
+
+export interface CloudDocDownloadTicketClaims {
+  type: 'cloud-doc-download-ticket';
+  cloudDocId: string;
+  userId: string;
+  inline: boolean;
+  jti: string;
+  iat?: number;
+  exp?: number;
+}
+
+export function signCloudDocDownloadTicket(
+  claims: Omit<CloudDocDownloadTicketClaims, 'type' | 'jti' | 'iat' | 'exp'>,
+  signingKey: string,
+  ttlSeconds = CLOUD_DOC_DOWNLOAD_TICKET_TTL_SECONDS,
+): string {
+  return signJwt(
+    {
+      ...claims,
+      type: 'cloud-doc-download-ticket',
+      jti: randomUUID(),
+    },
+    signingKey,
+    ttlSeconds,
+  );
+}
+
+export function verifyCloudDocDownloadTicket(
+  token: string,
+  signingKey: string,
+): CloudDocDownloadTicketClaims | null {
+  const payload = verifyJwt(token, signingKey);
+  if (!payload || payload.type !== 'cloud-doc-download-ticket') return null;
+  if (
+    typeof payload.cloudDocId !== 'string' ||
+    typeof payload.userId !== 'string' ||
+    typeof payload.inline !== 'boolean' ||
+    typeof payload.jti !== 'string'
+  ) {
+    return null;
+  }
+  return {
+    type: 'cloud-doc-download-ticket',
+    cloudDocId: payload.cloudDocId,
+    userId: payload.userId,
+    inline: payload.inline,
+    jti: payload.jti,
+    iat: typeof payload.iat === 'number' ? payload.iat : undefined,
+    exp: typeof payload.exp === 'number' ? payload.exp : undefined,
+  };
+}
+
+class PayloadTooLargeError extends Error {
+  constructor() {
+    super('file_too_large');
+    this.name = 'PayloadTooLargeError';
+  }
+}
+
+async function readStreamBytesBounded(
+  stream: ReadableStream<Uint8Array>,
+  maxBytes: number,
+  onExceed?: () => void,
+): Promise<Buffer> {
+  const reader = stream.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        onExceed?.();
+        await reader.cancel('payload_too_large').catch(() => {});
+        throw new PayloadTooLargeError();
+      }
+      chunks.push(Buffer.from(value));
+    }
+    return Buffer.concat(chunks, total);
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+async function readResponseBytesBounded(
+  res: Response,
+  maxBytes: number,
+  controller?: AbortController,
+): Promise<Buffer> {
+  const contentLengthHeader = res.headers.get('content-length');
+  if (contentLengthHeader) {
+    const declaredLength = Number(contentLengthHeader);
+    if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+      controller?.abort('payload_too_large');
+      await res.body?.cancel?.('payload_too_large').catch(() => {});
+      throw new PayloadTooLargeError();
+    }
+  }
+  if (res.body) {
+    return readStreamBytesBounded(res.body, maxBytes, () => controller?.abort('payload_too_large'));
+  }
+  const arrayBuf = await res.arrayBuffer();
+  const buf = Buffer.from(arrayBuf);
+  if (buf.length > maxBytes) {
+    throw new PayloadTooLargeError();
+  }
+  return buf;
 }
 
 const cloudDocCommitLocks = new Map<string, Promise<void>>();
@@ -475,9 +588,11 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
         storageKey,
       });
       return c.json({ doc: rowToCloudDocItem(row) }, 201);
-    } catch {
-      // Partial-failure rollback: remove written blob if DB insert failed
-      await storage.delete(storageKey).catch(() => {});
+    } catch (err) {
+      // Partial-failure rollback: only delete the written blob when DB guarantees no row was committed
+      if (isDefinitelyUncommittedDbError(err)) {
+        await storage.delete(storageKey).catch(() => {});
+      }
       return c.json({ error: 'cloud_doc_db_error' }, 500);
     }
   });
@@ -487,15 +602,31 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
     const auth = await requireRegularUser(c);
     if (auth instanceof Response) return auth;
 
+    const maxMultipartBytes = CLOUD_DOCS_MAX_UPLOAD_BYTES + 1024 * 1024;
     const rawLength = Number(c.req.header('Content-Length') ?? '0');
-    if (Number.isFinite(rawLength) && rawLength > CLOUD_DOCS_MAX_UPLOAD_BYTES + 1024 * 1024) {
+    if (Number.isFinite(rawLength) && rawLength > maxMultipartBytes) {
       return c.json({ error: 'file_too_large', maxBytes: CLOUD_DOCS_MAX_UPLOAD_BYTES }, 413);
     }
 
     let form: FormData;
     try {
-      form = await c.req.formData();
-    } catch {
+      const rawBodyStream = c.req.raw.body;
+      if (rawBodyStream) {
+        const rawBytes = await readStreamBytesBounded(rawBodyStream, maxMultipartBytes);
+        const boundedHeaders = new Headers(c.req.raw.headers);
+        boundedHeaders.delete('content-length');
+        form = await new Request(c.req.raw.url, {
+          method: c.req.raw.method,
+          headers: boundedHeaders,
+          body: new Uint8Array(rawBytes),
+        }).formData();
+      } else {
+        form = await c.req.formData();
+      }
+    } catch (err) {
+      if (err instanceof PayloadTooLargeError) {
+        return c.json({ error: 'file_too_large', maxBytes: CLOUD_DOCS_MAX_UPLOAD_BYTES }, 413);
+      }
       return c.json({ error: 'invalid_multipart' }, 400);
     }
 
@@ -566,8 +697,10 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
         storageKey,
       });
       return c.json({ doc: rowToCloudDocItem(row) }, 201);
-    } catch {
-      await storage.delete(storageKey).catch(() => {});
+    } catch (err) {
+      if (isDefinitelyUncommittedDbError(err)) {
+        await storage.delete(storageKey).catch(() => {});
+      }
       return c.json({ error: 'cloud_doc_db_error' }, 500);
     }
   };
@@ -703,12 +836,19 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
       return c.json({ error: 1, message: 'untrusted_download_url' }, 400);
     }
 
+    const downloadController = new AbortController();
     let docRes: Response;
     try {
-      docRes = await fetch(trustedUrl.internalFetchUrl, { redirect: 'error' });
+      docRes = await fetch(trustedUrl.internalFetchUrl, {
+        redirect: 'error',
+        signal: downloadController.signal,
+      });
     } catch (fetchErr) {
       if (trustedUrl.fallbackPublicUrl && trustedUrl.fallbackPublicUrl !== trustedUrl.internalFetchUrl) {
-        docRes = await fetch(trustedUrl.fallbackPublicUrl, { redirect: 'error' });
+        docRes = await fetch(trustedUrl.fallbackPublicUrl, {
+          redirect: 'error',
+          signal: downloadController.signal,
+        });
       } else {
         throw fetchErr;
       }
@@ -718,10 +858,14 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
       return c.json({ error: 1, message: 'failed_to_download_edited_file' }, 502);
     }
 
-    const arrayBuf = await docRes.arrayBuffer();
-    const bytes = Buffer.from(arrayBuf);
-    if (bytes.length > CLOUD_DOCS_MAX_UPLOAD_BYTES) {
-      return c.json({ error: 1, message: 'file_too_large' }, 413);
+    let bytes: Buffer;
+    try {
+      bytes = await readResponseBytesBounded(docRes, CLOUD_DOCS_MAX_UPLOAD_BYTES, downloadController);
+    } catch (err) {
+      if (err instanceof PayloadTooLargeError) {
+        return c.json({ error: 1, message: 'file_too_large' }, 413);
+      }
+      return c.json({ error: 1, message: 'failed_to_download_edited_file' }, 502);
     }
 
     return lockCloudDocCommit(claims.cloudDocId, async () => {
@@ -767,12 +911,16 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
           sizeBytes: writeResult.sizeBytes,
           contentSha256: writeResult.sha256,
         });
-        if (!committed) {
-          await storage.delete(newStorageKey).catch(() => {});
+        if (committed.status === 'conflict') {
+          if (newStorageKey !== current.storage_key) {
+            await storage.delete(newStorageKey).catch(() => {});
+          }
           return c.json({ error: 1, message: 'stale_document_key' }, 409);
         }
-      } catch {
-        await storage.delete(newStorageKey).catch(() => {});
+      } catch (err) {
+        if (newStorageKey !== current.storage_key && isDefinitelyUncommittedDbError(err)) {
+          await storage.delete(newStorageKey).catch(() => {});
+        }
         return c.json({ error: 1, message: 'cloud_doc_commit_failed' }, 500);
       }
 
@@ -927,6 +1075,109 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
     });
   });
 
+  const serveCloudDocDownload = async (
+    storageKey: string,
+    mimeType: string | null,
+    fileName: string,
+    forceDownload: boolean,
+  ): Promise<Response> => {
+    let bytes: Buffer;
+    try {
+      bytes = await storage.read(storageKey);
+    } catch {
+      return new Response(JSON.stringify({ error: 'cloud_doc_file_missing' }), {
+        status: 404,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    const disposition = forceDownload ? 'attachment' : 'inline';
+    return new Response(new Uint8Array(bytes), {
+      status: 200,
+      headers: {
+        'Content-Type': mimeType || 'application/octet-stream',
+        'Content-Length': String(bytes.length),
+        'Content-Disposition': `${disposition}; filename="${encodeURIComponent(fileName)}"`,
+        'X-Content-Type-Options': 'nosniff',
+        'Cache-Control': 'no-store',
+      },
+    });
+  };
+
+  // ── Cloud Docs: Short-lived single-purpose download ticket (for native/cookie-less clients) ──
+  routes.post('/cloud-docs/:id/download-ticket', async (c): Promise<Response> => {
+    const auth = await requireRegularUser(c);
+    if (auth instanceof Response) return auth;
+
+    const docId = c.req.param('id');
+    const access = await resolveCloudDocAccess(c.env.DB, docId, auth.userId);
+    if (!access.allowed) return c.json({ error: 'not_found' }, 404);
+    if (!access.allowDownload) return c.json({ error: 'download_forbidden' }, 403);
+    if (!(await storage.exists(access.doc.storage_key))) {
+      return c.json({ error: 'cloud_doc_file_missing' }, 404);
+    }
+
+    let inline = c.req.query('inline') === '1';
+    try {
+      const contentType = c.req.header('Content-Type') ?? '';
+      if (contentType.includes('application/json')) {
+        const body = (await c.req.json()) as { inline?: unknown };
+        if (typeof body?.inline === 'boolean') inline = body.inline;
+      }
+    } catch {
+      // Ignore empty/malformed optional JSON body
+    }
+
+    const ticket = signCloudDocDownloadTicket(
+      {
+        cloudDocId: docId,
+        userId: auth.userId,
+        inline,
+      },
+      c.env.JWT_SIGNING_KEY,
+    );
+
+    return c.json({
+      ticket,
+      downloadPath: `/api/cloud-docs/download/${encodeURIComponent(ticket)}`,
+      expiresInSeconds: CLOUD_DOC_DOWNLOAD_TICKET_TTL_SECONDS,
+    });
+  });
+
+  // ── Cloud Docs: Ticket-authenticated download (re-checks live access & allowDownload) ──
+  routes.get('/cloud-docs/download/:ticket', async (c): Promise<Response> => {
+    const ticket = c.req.param('ticket') ?? '';
+    const claims = verifyCloudDocDownloadTicket(ticket, c.env.JWT_SIGNING_KEY);
+    if (!claims) {
+      return c.json({ error: 'invalid_download_ticket' }, 401);
+    }
+
+    const access = await resolveCloudDocAccess(c.env.DB, claims.cloudDocId, claims.userId);
+    if (!access.allowed) {
+      return c.json(
+        { error: access.reason === 'not_found' ? 'not_found' : 'access_denied' },
+        access.reason === 'not_found' ? 404 : 403,
+      );
+    }
+    if (!access.allowDownload) {
+      return c.json({ error: 'download_forbidden' }, 403);
+    }
+
+    const downloadQuery = c.req.query('download');
+    const forceDownload = downloadQuery === '1'
+      ? true
+      : downloadQuery === '0'
+        ? false
+        : !claims.inline;
+
+    return serveCloudDocDownload(
+      access.doc.storage_key,
+      access.doc.mime_type,
+      access.doc.name,
+      forceDownload,
+    );
+  });
+
   // ── Cloud Docs: Authenticated download ──────────────────────────────────────
   routes.get('/cloud-docs/:id/download', async (c): Promise<Response> => {
     const auth = await requireRegularUser(c);
@@ -938,25 +1189,8 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
     if (!access.allowDownload) return c.json({ error: 'download_forbidden' }, 403);
     const row = access.doc;
 
-    let bytes: Buffer;
-    try {
-      bytes = await storage.read(row.storage_key);
-    } catch {
-      return c.json({ error: 'cloud_doc_file_missing' }, 404);
-    }
-
     const forceDownload = c.req.query('download') === '1';
-    const disposition = forceDownload ? 'attachment' : 'inline';
-    return new Response(new Uint8Array(bytes), {
-      status: 200,
-      headers: {
-        'Content-Type': row.mime_type || 'application/octet-stream',
-        'Content-Length': String(bytes.length),
-        'Content-Disposition': `${disposition}; filename="${encodeURIComponent(row.name)}"`,
-        'X-Content-Type-Options': 'nosniff',
-        'Cache-Control': 'no-store',
-      },
-    });
+    return serveCloudDocDownload(row.storage_key, row.mime_type, row.name, forceDownload);
   });
 
   // ── Cloud Docs: Rename / Move ───────────────────────────────────────────────

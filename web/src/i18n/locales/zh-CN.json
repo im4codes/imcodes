@@ -5248,6 +5248,7 @@
       "file_too_large": "文件超过 50 MB 大小限制",
       "unsupported_format": "不支持的文档格式",
       "server_not_found": "目标服务器已不存在或不可用。",
+      "server_offline": "目标服务器当前离线，请等待服务器重连后刷新，或从最近浏览中移除。",
       "doc_missing": "该云文档已不存在或已被删除。",
       "access_denied": "您已无权访问此文档。"
     },

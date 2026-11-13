@@ -46,8 +46,8 @@ function createInMemoryCloudDocsDb() {
   const recents = new Map<string, RecentDocumentRow>();
   const shares = new Map<string, CloudDocShareRow>();
 
-  let failNextDocInsert = false;
-  let failNextDocCommit = false;
+  let failNextDocInsertMode: 'none' | 'pre_commit' | 'ambiguous' = 'none';
+  let failNextDocCommitMode: 'none' | 'pre_commit' | 'ambiguous' = 'none';
 
   const db: Database = {
     query: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T[]> => {
@@ -211,6 +211,49 @@ function createInMemoryCloudDocsDb() {
       if (s.includes('FROM cloud_docs WHERE id = $1') && !s.includes('user_id = $2')) {
         const d = docs.get(params[0] as string);
         return (d ? { ...d } : null) as unknown as T | null;
+      }
+
+      if (s.startsWith('INSERT INTO cloud_docs')) {
+        const mode = failNextDocInsertMode;
+        failNextDocInsertMode = 'none';
+        if (mode === 'pre_commit') {
+          const err = new Error('simulated_db_pre_commit_failure') as Error & { code: string };
+          err.code = '23505';
+          throw err;
+        }
+        const [id, user_id, folder_id, name, ext, mime_type, size_bytes, content_sha256, storage_key, doc_version, created_at, updated_at, last_opened_at] =
+          params as [string, string, string | null, string, string, string, number, string, string, number, number, number, number | null];
+        const row: CloudDocRow = { id, user_id, folder_id, name, ext, mime_type, size_bytes, content_sha256, storage_key, doc_version, created_at, updated_at, last_opened_at };
+        docs.set(id, row);
+        if (mode === 'ambiguous') {
+          throw new Error('simulated_post_commit_connection_drop');
+        }
+        return { ...row } as unknown as T;
+      }
+
+      if (s.startsWith('UPDATE cloud_docs SET storage_key = $1')) {
+        const mode = failNextDocCommitMode;
+        failNextDocCommitMode = 'none';
+        if (mode === 'pre_commit') {
+          const err = new Error('simulated_db_pre_commit_failure') as Error & { code: string };
+          err.code = '22P02';
+          throw err;
+        }
+        const [storage_key, size_bytes, content_sha256, doc_version, updated_at, id, userId, expectedVersion] =
+          params as [string, number, string, number, number, string, string, number];
+        const row = docs.get(id);
+        if (!row || row.user_id !== userId || Number(row.doc_version) !== expectedVersion) {
+          return null;
+        }
+        row.storage_key = storage_key;
+        row.size_bytes = size_bytes;
+        row.content_sha256 = content_sha256;
+        row.doc_version = doc_version;
+        row.updated_at = updated_at;
+        if (mode === 'ambiguous') {
+          throw new Error('simulated_post_commit_returning_failure');
+        }
+        return { ...row } as unknown as T;
       }
 
       if (s.includes('FROM recent_documents WHERE user_id = $1 AND source_key = $2')) {
@@ -413,8 +456,10 @@ function createInMemoryCloudDocsDb() {
     docs,
     recents,
     shares,
-    setFailNextDocInsert: (v: boolean) => { failNextDocInsert = v; },
-    setFailNextDocCommit: (v: boolean) => { failNextDocCommit = v; },
+    setFailNextDocInsert: (v: boolean) => { failNextDocInsertMode = v ? 'pre_commit' : 'none'; },
+    setFailNextDocInsertMode: (mode: 'none' | 'pre_commit' | 'ambiguous') => { failNextDocInsertMode = mode; },
+    setFailNextDocCommit: (v: boolean) => { failNextDocCommitMode = v ? 'pre_commit' : 'none'; },
+    setFailNextDocCommitMode: (mode: 'none' | 'pre_commit' | 'ambiguous') => { failNextDocCommitMode = mode; },
   };
 }
 
@@ -1015,5 +1060,365 @@ describe('cloud docs & recent documents', () => {
     });
     expect(cbValidEditor.status).toBe(200);
     expect(Number(memDb.docs.get(d1.id)?.doc_version)).toBe(2);
+  });
+
+  it('preserves committed blobs on ambiguous post-commit failures while rolling back proven pre-commit failures (status 2 & 6, blank, upload)', async () => {
+    // 1. blank & upload: ambiguous failure leaves committed DB row + blob readable (no 404); pre-commit failure removes blob
+    memDb.setFailNextDocInsertMode('ambiguous');
+    const ambBlankRes = await app.request('/api/cloud-docs/blank', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'docx', name: 'CommittedDespiteDrop.docx' }),
+    });
+    expect(ambBlankRes.status).toBe(500);
+    const committedDoc = [...memDb.docs.values()].find((d) => d.name === 'CommittedDespiteDrop.docx')!;
+    expect(committedDoc).toBeTruthy();
+    const dlAmbBlank = await app.request(`/api/cloud-docs/${committedDoc.id}/download`, {
+      headers: bearerHeader('owner-1'),
+    });
+    expect(dlAmbBlank.status).toBe(200);
+
+    memDb.setFailNextDocInsertMode('pre_commit');
+    const preUploadForm = new FormData();
+    preUploadForm.append('file', new File([Buffer.from('# Should Rollback')], 'Rollback.md', { type: 'text/markdown' }));
+    const preUploadRes = await app.request('/api/cloud-docs/files', {
+      method: 'POST',
+      headers: bearerHeader('owner-1'),
+      body: preUploadForm,
+    });
+    expect(preUploadRes.status).toBe(500);
+    expect(fs.readdirSync(path.join(tmpDir, 'owner-1'))).toHaveLength(1);
+
+    memDb.setFailNextDocInsertMode('ambiguous');
+    const ambUploadForm = new FormData();
+    ambUploadForm.append('file', new File([Buffer.from('# Committed Upload')], 'Kept.md', { type: 'text/markdown' }));
+    const ambUploadRes = await app.request('/api/cloud-docs/files', {
+      method: 'POST',
+      headers: bearerHeader('owner-1'),
+      body: ambUploadForm,
+    });
+    expect(ambUploadRes.status).toBe(500);
+    const keptDoc = [...memDb.docs.values()].find((d) => d.name === 'Kept.md')!;
+    const dlKept = await app.request(`/api/cloud-docs/${keptDoc.id}/download`, {
+      headers: bearerHeader('owner-1'),
+    });
+    expect(dlKept.status).toBe(200);
+    expect(await dlKept.text()).toBe('# Committed Upload');
+
+    // 2. callback status 6 & status 2: ambiguous post-commit failure NEVER deletes live blob
+    const cfgRes = await app.request(`/api/cloud-docs/${committedDoc.id}/onlyoffice/config`, {
+      headers: bearerHeader('owner-1'),
+    });
+    const cfg = (await cfgRes.json()) as {
+      config: { document: { key: string }; editorConfig: { callbackUrl: string } };
+    };
+    const callbackUrl = new URL(cfg.config.editorConfig.callbackUrl).pathname;
+    const docKey = cfg.config.document.key;
+    const ooSecret = resolveOnlyOfficeJwtSecret({ ONLYOFFICE_JWT_SECRET: OO_SECRET, JWT_SIGNING_KEY: JWT_KEY });
+
+    // Status 6 with pre_commit error must NOT delete existing v1 file because newStorageKey === current.storage_key
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      new Response(Buffer.from('force-save-attempt'), { status: 200 }),
+    );
+    memDb.setFailNextDocCommitMode('pre_commit');
+    const preForceJwt = signJwt({ status: 6, url: 'http://onlyoffice:80/cache/fs1.docx', key: docKey }, ooSecret, 300);
+    const preForceRes = await app.request(callbackUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: preForceJwt }),
+    });
+    expect(preForceRes.status).toBe(500);
+    expect(await storage.exists(committedDoc.storage_key)).toBe(true);
+
+    // Status 6 with ambiguous post-commit error -> row & blob stay readable
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      new Response(Buffer.from('force-save-ambiguous'), { status: 200 }),
+    );
+    memDb.setFailNextDocCommitMode('ambiguous');
+    const ambForceJwt = signJwt({ status: 6, url: 'http://onlyoffice:80/cache/fs2.docx', key: docKey }, ooSecret, 300);
+    const ambForceRes = await app.request(callbackUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: ambForceJwt }),
+    });
+    expect(ambForceRes.status).toBe(500);
+    const dlAfterForce = await app.request(`/api/cloud-docs/${committedDoc.id}/download`, {
+      headers: bearerHeader('owner-1'),
+    });
+    expect(dlAfterForce.status).toBe(200);
+    expect(await dlAfterForce.text()).toBe('force-save-ambiguous');
+
+    // Status 2 with ambiguous post-commit error: DB already moved to v2/storage_key=v2 -> v2 blob MUST NOT be deleted!
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      new Response(Buffer.from('final-v2-committed'), { status: 200 }),
+    );
+    memDb.setFailNextDocCommitMode('ambiguous');
+    const ambFinalJwt = signJwt({ status: 2, url: 'http://onlyoffice:80/cache/final.docx', key: docKey }, ooSecret, 300);
+    const ambFinalRes = await app.request(callbackUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: ambFinalJwt }),
+    });
+    expect(ambFinalRes.status).toBe(500);
+    expect(Number(memDb.docs.get(committedDoc.id)?.doc_version)).toBe(2);
+    const dlAfterAmbFinal = await app.request(`/api/cloud-docs/${committedDoc.id}/download`, {
+      headers: bearerHeader('owner-1'),
+    });
+    expect(dlAfterAmbFinal.status).toBe(200);
+    expect(await dlAfterAmbFinal.text()).toBe('final-v2-committed');
+  });
+
+  it('mints short-lived download tickets for cookie-less native downloads and enforces live access & allowDownload & token isolation', async () => {
+    const createRes = await app.request('/api/cloud-docs/blank', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'docx', name: 'NativeDownload.docx' }),
+    });
+    const { doc } = (await createRes.json()) as { doc: { id: string } };
+
+    // Share with Bob via team-1 (allowDownload = true initially)
+    const shareRes = await app.request('/api/cloud-docs/shares', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetKind: 'doc',
+        targetId: doc.id,
+        shareMode: 'team',
+        targetTeamId: 'team-1',
+        role: 'editor',
+        allowDownload: true,
+      }),
+    });
+    expect(shareRes.status).toBe(201);
+    const { share } = (await shareRes.json()) as { share: { id: string } };
+
+    // 1. Mint ticket with Bearer auth (no Cookie), redeem WITHOUT Authorization or Cookie headers!
+    const mintRes = await app.request(`/api/cloud-docs/${doc.id}/download-ticket`, {
+      method: 'POST',
+      headers: { ...bearerHeader('user-bob'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ inline: false }),
+    });
+    expect(mintRes.status).toBe(200);
+    const { ticket, downloadPath } = (await mintRes.json()) as { ticket: string; downloadPath: string };
+    expect(downloadPath).toBe(`/api/cloud-docs/download/${encodeURIComponent(ticket)}`);
+
+    const redeemNoAuth = await app.request(downloadPath);
+    expect(redeemNoAuth.status).toBe(200);
+    expect(redeemNoAuth.headers.get('content-disposition')).toContain('attachment');
+    expect((await redeemNoAuth.arrayBuffer()).byteLength).toBeGreaterThan(0);
+
+    // 2. Download ticket MUST NOT work as Bearer session token; ONLYOFFICE preview token MUST NOT work on download ticket route
+    const ticketAsBearer = await app.request('/api/cloud-docs', {
+      headers: { Authorization: `Bearer ${ticket}` },
+    });
+    expect(ticketAsBearer.status).toBe(401);
+
+    const cfgRes = await app.request(`/api/cloud-docs/${doc.id}/onlyoffice/config`, {
+      headers: bearerHeader('user-bob'),
+    });
+    const cfg = (await cfgRes.json()) as { docToken: string };
+    const ooAsTicket = await app.request(`/api/cloud-docs/download/${encodeURIComponent(cfg.docToken)}`);
+    expect(ooAsTicket.status).toBe(401);
+
+    // 3. Downgrade allowDownload=false AFTER mint -> existing unredeemed ticket MUST fail 403 on redeem, and new mint fails 403!
+    await app.request('/api/cloud-docs/shares', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetKind: 'doc',
+        targetId: doc.id,
+        shareMode: 'team',
+        targetTeamId: 'team-1',
+        role: 'viewer',
+        allowDownload: false,
+      }),
+    });
+    expect((await app.request(downloadPath)).status).toBe(403);
+    expect(
+      (
+        await app.request(`/api/cloud-docs/${doc.id}/download-ticket`, {
+          method: 'POST',
+          headers: bearerHeader('user-bob'),
+        })
+      ).status,
+    ).toBe(403);
+
+    // 4. Re-allow download, mint a new ticket, then remove Bob from team & disable Bob -> redeem MUST fail 403!
+    await app.request('/api/cloud-docs/shares', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetKind: 'doc',
+        targetId: doc.id,
+        shareMode: 'team',
+        targetTeamId: 'team-1',
+        role: 'viewer',
+        allowDownload: true,
+      }),
+    });
+    const mintRes2 = await app.request(`/api/cloud-docs/${doc.id}/download-ticket`, {
+      method: 'POST',
+      headers: bearerHeader('user-bob'),
+    });
+    const { downloadPath: dp2 } = (await mintRes2.json()) as { downloadPath: string };
+
+    memDb.teamMembers.delete('team-1:user-bob');
+    expect((await app.request(dp2)).status).toBe(403);
+
+    memDb.teamMembers.set('team-1:user-bob', 'member');
+    memDb.users.get('user-bob')!.status = 'disabled';
+    expect((await app.request(dp2)).status).toBe(403);
+
+    // Cleanup revoke check
+    await app.request(`/api/cloud-docs/shares/${share.id}`, {
+      method: 'DELETE',
+      headers: bearerHeader('owner-1'),
+    });
+  });
+
+  it('aborts oversized streams early without full buffering on callback & upload (exact bounds, spoofed Content-Length, mid-stream error)', async () => {
+    const createRes = await app.request('/api/cloud-docs/blank', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'docx', name: 'StreamLimit.docx' }),
+    });
+    const { doc } = (await createRes.json()) as { doc: { id: string } };
+    const cfgRes = await app.request(`/api/cloud-docs/${doc.id}/onlyoffice/config`, {
+      headers: bearerHeader('owner-1'),
+    });
+    const cfg = (await cfgRes.json()) as {
+      config: { document: { key: string }; editorConfig: { callbackUrl: string } };
+    };
+    const callbackUrl = new URL(cfg.config.editorConfig.callbackUrl).pathname;
+    const docKey = cfg.config.document.key;
+    const ooSecret = resolveOnlyOfficeJwtSecret({ ONLYOFFICE_JWT_SECRET: OO_SECRET, JWT_SIGNING_KEY: JWT_KEY });
+    const cbJwt = signJwt({ status: 2, url: 'http://onlyoffice:80/cache/big.docx', key: docKey }, ooSecret, 300);
+
+    // 1. Declared Content-Length > limit aborts before pulling stream chunks
+    let declaredCancelled = false;
+    let declaredPulls = 0;
+    const declaredBigStream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        declaredPulls += 1;
+        controller.enqueue(new Uint8Array(1024));
+      },
+      cancel() {
+        declaredCancelled = true;
+      },
+    });
+    let observedSignal: AbortSignal | undefined;
+    vi.spyOn(globalThis, 'fetch').mockImplementationOnce(async (_url, init) => {
+      observedSignal = init?.signal ?? undefined;
+      return new Response(declaredBigStream, {
+        status: 200,
+        headers: { 'Content-Length': String(CLOUD_DOCS_MAX_UPLOAD_BYTES + 1) },
+      });
+    });
+    const resDeclared = await app.request(callbackUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: cbJwt }),
+    });
+    expect(resDeclared.status).toBe(413);
+    expect(declaredCancelled).toBe(true);
+    expect(observedSignal?.aborted).toBe(true);
+    expect(declaredPulls).toBeLessThanOrEqual(1);
+
+    // 2. Spoofed tiny Content-Length (128 bytes) while streaming 1 MiB chunks past 50 MiB -> cancels & aborts early!
+    const chunkSize = 4 * 1024 * 1024;
+    const totalChunks = 20; // 80 MiB total if unstopped; cap is 50 MiB (crosses at chunk 13)
+    let pulled = 0;
+    let cancelledEarly = false;
+    const spoofedStream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulled += 1;
+        if (pulled > totalChunks) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(new Uint8Array(chunkSize));
+      },
+      cancel() {
+        cancelledEarly = true;
+      },
+    });
+    let spoofSignal: AbortSignal | undefined;
+    vi.spyOn(globalThis, 'fetch').mockImplementationOnce(async (_url, init) => {
+      spoofSignal = init?.signal ?? undefined;
+      return new Response(spoofedStream, {
+        status: 200,
+        headers: { 'Content-Length': '128' },
+      });
+    });
+    const resSpoofed = await app.request(callbackUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: cbJwt }),
+    });
+    expect(resSpoofed.status).toBe(413);
+    expect(cancelledEarly).toBe(true);
+    expect(spoofSignal?.aborted).toBe(true);
+    expect(pulled).toBeLessThan(totalChunks);
+
+    // 3. Exact max-1 bytes succeeds; mid-stream error returns 502 and leaves existing content intact
+    const midErrStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(1024));
+        controller.error(new Error('socket_reset_mid_transfer'));
+      },
+    });
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(midErrStream, { status: 200 }));
+    const resMidErr = await app.request(callbackUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: cbJwt }),
+    });
+    expect(resMidErr.status).toBe(502);
+    expect(Number(memDb.docs.get(doc.id)?.doc_version)).toBe(1);
+
+    // Exact max bytes succeeds (v1 -> v2)
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      new Response(new Uint8Array(CLOUD_DOCS_MAX_UPLOAD_BYTES), { status: 200 }),
+    );
+    const resExact = await app.request(callbackUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: cbJwt }),
+    });
+    expect(resExact.status).toBe(200);
+    expect(Number(memDb.docs.get(doc.id)?.doc_version)).toBe(2);
+
+    // 4. Chunked multipart upload with spoofed tiny Content-Length exceeding ceiling aborts early -> 413 & no DB/blob created
+    const docCountBefore = memDb.docs.size;
+    let uploadPulled = 0;
+    let uploadCancelled = false;
+    const hugeUploadStream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        uploadPulled += 1;
+        if (uploadPulled > 18) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(new Uint8Array(4 * 1024 * 1024));
+      },
+      cancel() {
+        uploadCancelled = true;
+      },
+    });
+    const reqInit: RequestInit & { duplex: 'half' } = {
+      method: 'POST',
+      headers: {
+        ...bearerHeader('owner-1'),
+        'Content-Type': 'multipart/form-data; boundary=----imcodesBoundary',
+        'Content-Length': '64',
+      },
+      body: hugeUploadStream,
+      duplex: 'half',
+    };
+    const hugeUploadRes = await app.request(new Request('http://localhost/api/cloud-docs/files', reqInit));
+    expect(hugeUploadRes.status).toBe(413);
+    expect(uploadCancelled).toBe(true);
+    expect(uploadPulled).toBeLessThan(18);
+    expect(memDb.docs.size).toBe(docCountBefore);
   });
 });

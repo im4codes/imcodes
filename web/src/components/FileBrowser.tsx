@@ -46,6 +46,7 @@ import { useTranslation } from 'react-i18next';
 import type { WsClient, ServerMessage } from '../ws-client.js';
 import { lazy, memo, Suspense } from 'preact/compat';
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
+import { getCloudDocMeta, isSupportedCloudDocFilename } from '@shared/cloud-docs.js';
 import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
 import { FS_SESSION_ROOT_PATH, FS_WRITE_ERROR } from '../../../src/shared/transport/fs.js';
 import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
@@ -1871,7 +1872,9 @@ export function FileBrowser({
 
   const lastRecordedRecentOfficeKeyRef = useRef<string | null>(null);
   useEffect(() => {
-    if (preview.status !== 'office') {
+    const isOfficePreview = preview.status === 'office';
+    const isSupportedTextDocPreview = preview.status === 'ok' && isSupportedCloudDocFilename(preview.path);
+    if (!isOfficePreview && !isSupportedTextDocPreview) {
       lastRecordedRecentOfficeKeyRef.current = null;
       return;
     }
@@ -1880,12 +1883,15 @@ export function FileBrowser({
     const key = `${targetServerId}:${preview.path}`;
     if (lastRecordedRecentOfficeKeyRef.current === key) return;
     lastRecordedRecentOfficeKeyRef.current = key;
+    const mimeType = isOfficePreview
+      ? preview.mimeType
+      : (getCloudDocMeta(preview.path)?.mimeType ?? 'text/plain');
     void recordRecentDocumentApi({
       sourceKind: 'server_file',
       serverId: targetServerId,
       sessionName: scopedSessionName,
       filePath: preview.path,
-      mimeType: preview.mimeType,
+      mimeType,
       title: preview.path.split(/[/\\]/).pop() || preview.path,
       openMode: (activeSharedDocReadOnly ?? readOnly) ? 'view' : 'edit',
     }).catch(() => {});

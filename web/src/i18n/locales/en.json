@@ -5248,6 +5248,7 @@
       "file_too_large": "File exceeds the 50 MB limit",
       "unsupported_format": "Unsupported document format",
       "server_not_found": "This server no longer exists or is unavailable.",
+      "server_offline": "The server is currently offline. Reconnect the server and refresh, or remove this entry.",
       "doc_missing": "This cloud document is no longer available.",
       "access_denied": "You no longer have permission to open this document."
     },

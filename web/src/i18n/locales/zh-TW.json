@@ -5238,6 +5238,7 @@
       "file_too_large": "檔案超過 50 MB 大小限制",
       "unsupported_format": "不支援的文件格式",
       "server_not_found": "目標伺服器已不存在或無法使用。",
+      "server_offline": "目標伺服器目前離線，請在伺服器重新連線後重新整理，或從最近瀏覽中移除。",
       "doc_missing": "此雲端文件已不存在或已被刪除。",
       "access_denied": "您已無權存取此文件。"
     },

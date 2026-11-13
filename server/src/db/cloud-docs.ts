@@ -333,6 +333,30 @@ export async function getCloudDocById(
   );
 }
 
+const PRE_COMMIT_PG_ERROR_CODES = new Set([
+  '22P02', // invalid_text_representation
+  '23502', // not_null_violation
+  '23503', // foreign_key_violation
+  '23505', // unique_violation
+  '23514', // check_violation
+  '40001', // serialization_failure
+  '40P01', // deadlock_detected
+  '42703', // undefined_column
+  '42P01', // undefined_table
+  'PRE_COMMIT_FAILURE',
+]);
+
+/**
+ * Returns true only when a thrown DB error proves the statement aborted before
+ * committing. Ambiguous/network/post-statement errors return false so callers do
+ * not delete newly written blobs that the committed row may already reference.
+ */
+export function isDefinitelyUncommittedDbError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const code = (err as { code?: unknown }).code;
+  return typeof code === 'string' && PRE_COMMIT_PG_ERROR_CODES.has(code);
+}
+
 export async function insertCloudDoc(
   db: Database,
   params: {
@@ -348,11 +372,13 @@ export async function insertCloudDoc(
   },
 ): Promise<CloudDocRow> {
   const now = Date.now();
-  await db.execute(
+  const row = await db.queryOne<CloudDocRow>(
     `INSERT INTO cloud_docs (
        id, user_id, folder_id, name, ext, mime_type, size_bytes, content_sha256,
        storage_key, doc_version, created_at, updated_at, last_opened_at
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+     RETURNING id, user_id, folder_id, name, ext, mime_type, size_bytes, content_sha256,
+       storage_key, doc_version, created_at, updated_at, last_opened_at`,
     [
       params.id,
       params.userId,
@@ -369,21 +395,10 @@ export async function insertCloudDoc(
       null,
     ],
   );
-  return {
-    id: params.id,
-    user_id: params.userId,
-    folder_id: params.folderId,
-    name: params.name,
-    ext: params.ext,
-    mime_type: params.mimeType,
-    size_bytes: params.sizeBytes,
-    content_sha256: params.contentSha256,
-    storage_key: params.storageKey,
-    doc_version: 1,
-    created_at: now,
-    updated_at: now,
-    last_opened_at: null,
-  };
+  if (!row) {
+    throw new Error('cloud_doc_insert_missing_returning_row');
+  }
+  return row;
 }
 
 export async function updateCloudDocMetadata(
@@ -424,6 +439,10 @@ export async function updateCloudDocMetadata(
   };
 }
 
+export type CommitCloudDocResult =
+  | { status: 'committed'; doc: CloudDocRow }
+  | { status: 'conflict' };
+
 export async function commitCloudDocContent(
   db: Database,
   params: {
@@ -435,13 +454,15 @@ export async function commitCloudDocContent(
     sizeBytes: number;
     contentSha256: string;
   },
-): Promise<CloudDocRow | null> {
+): Promise<CommitCloudDocResult> {
   const nextVersion = params.bumpVersion ? params.expectedVersion + 1 : params.expectedVersion;
   const now = Date.now();
-  const res = await db.execute(
+  const row = await db.queryOne<CloudDocRow>(
     `UPDATE cloud_docs
      SET storage_key = $1, size_bytes = $2, content_sha256 = $3, doc_version = $4, updated_at = $5
-     WHERE id = $6 AND user_id = $7 AND doc_version = $8`,
+     WHERE id = $6 AND user_id = $7 AND doc_version = $8
+     RETURNING id, user_id, folder_id, name, ext, mime_type, size_bytes, content_sha256,
+       storage_key, doc_version, created_at, updated_at, last_opened_at`,
     [
       params.newStorageKey,
       params.sizeBytes,
@@ -453,8 +474,8 @@ export async function commitCloudDocContent(
       params.expectedVersion,
     ],
   );
-  if (res.changes === 0) return null;
-  return getCloudDocById(db, params.docId, params.userId);
+  if (!row) return { status: 'conflict' };
+  return { status: 'committed', doc: row };
 }
 
 export async function touchCloudDocOpened(
