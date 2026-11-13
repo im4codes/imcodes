@@ -8729,4 +8729,122 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
     }
   }, 15000);
+
+  it('shows centered translucent server switch watermark on keyboard shortcut switch without stale session bleed, keeps focus, resets on rapid switch, and auto-dismisses', async () => {
+    let resolveSrv2Sessions!: (value: { sessions: Array<Record<string, unknown>> }) => void;
+    const srv2SessionsDeferred = new Promise<{ sessions: Array<Record<string, unknown>> }>((resolve) => {
+      resolveSrv2Sessions = resolve;
+    });
+    let deferSrv2Once = true;
+
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') {
+        return {
+          servers: [
+            { id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: Date.now() },
+            { id: 'srv-2', name: 'Server Two', status: 'online', lastHeartbeatAt: Date.now() },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/alpha', state: 'idle' },
+            { name: 'deck_gamma_brain', project_name: 'gamma', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/gamma', state: 'idle' },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-2/sessions') {
+        if (deferSrv2Once) {
+          deferSrv2Once = false;
+          return srv2SessionsDeferred;
+        }
+        return {
+          sessions: [
+            { name: 'deck_delta_brain', project_name: 'delta', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/delta', state: 'idle' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_gamma_brain');
+
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Win32' });
+    try {
+      const { App } = await importApp();
+      render(<App />);
+
+      const gammaComposer = await screen.findByTestId('pane-composer-deck_gamma_brain');
+      await waitFor(() => expect(document.activeElement).toBe(gammaComposer));
+      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+
+      // Switch to Server Two via Ctrl+ArrowDown while srv-2 sessions are still loading
+      const downEvt = new KeyboardEvent('keydown', { key: 'ArrowDown', code: 'ArrowDown', ctrlKey: true, bubbles: true, cancelable: true });
+      gammaComposer.dispatchEvent(downEvt);
+      expect(downEvt.defaultPrevented).toBe(true);
+
+      const hud = await screen.findByTestId('server-switch-watermark');
+      expect(hud.getAttribute('aria-hidden')).toBe('true');
+      expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server Two');
+      // Never leaks previous server's active session ('gamma') while switching
+      const loadingSessionText = screen.getByTestId('server-switch-watermark-session').textContent ?? '';
+      expect(loadingSessionText).not.toMatch(/gamma|alpha/i);
+
+      // Resolve srv-2 sessions -> HUD updates dynamically to target server's resolved session ('delta'), composer receives focus
+      await act(async () => {
+        resolveSrv2Sessions({
+          sessions: [
+            { name: 'deck_delta_brain', project_name: 'delta', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/delta', state: 'idle' },
+          ],
+        });
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('delta');
+      });
+      const deltaComposer = await screen.findByTestId('pane-composer-deck_delta_brain');
+      await waitFor(() => expect(document.activeElement).toBe(deltaComposer));
+
+      // Rapid switch back to Server One via Ctrl+ArrowUp updates the HUD immediately and restarts the timer
+      const upEvt = new KeyboardEvent('keydown', { key: 'ArrowUp', code: 'ArrowUp', ctrlKey: true, bubbles: true, cancelable: true });
+      deltaComposer.dispatchEvent(upEvt);
+      expect(upEvt.defaultPrevented).toBe(true);
+
+      await waitFor(() => {
+        expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server One');
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('gamma');
+      });
+
+      // Auto-dismisses after hold + exit (~1200ms)
+      await waitFor(() => {
+        expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+      }, { timeout: 3000 });
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  }, 15000);
+
+  it('does not show server switch watermark when switching servers via mouse click', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await screen.findByTestId('session-pane-deck_alpha_brain');
+    expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+
+    fireEvent.click(screen.getByText('server-select-srv-2'));
+    await screen.findByTestId('session-pane-deck_delta_brain');
+    expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+  }, 15000);
 });

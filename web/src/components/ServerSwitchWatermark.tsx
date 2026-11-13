@@ -1,0 +1,93 @@
+/**
+ * Centered translucent floating HUD watermark shown briefly after switching
+ * servers via keyboard shortcuts (`serverPrev` / `serverNext`).
+ */
+import { useEffect, useState } from 'preact/hooks';
+
+export const SERVER_SWITCH_WATERMARK_HOLD_MS = 1000;
+export const SERVER_SWITCH_WATERMARK_EXIT_MS = 200;
+
+export interface ServerSwitchWatermarkProps {
+  visible: boolean;
+  triggerKey: number;
+  serverName: string;
+  sessionName: string | null;
+  fallbackLabel?: string | null;
+  onDismiss: () => void;
+  holdMs?: number;
+  exitMs?: number;
+}
+
+export function ServerSwitchWatermark({
+  visible,
+  triggerKey,
+  serverName,
+  sessionName,
+  fallbackLabel = null,
+  onDismiss,
+  holdMs = SERVER_SWITCH_WATERMARK_HOLD_MS,
+  exitMs = SERVER_SWITCH_WATERMARK_EXIT_MS,
+}: ServerSwitchWatermarkProps) {
+  const [exiting, setExiting] = useState(false);
+
+  useEffect(() => {
+    if (!visible) {
+      setExiting(false);
+      return;
+    }
+    setExiting(false);
+    let exitTimer: ReturnType<typeof setTimeout> | null = null;
+    const holdTimer = setTimeout(() => {
+      setExiting(true);
+      exitTimer = setTimeout(() => {
+        onDismiss();
+      }, exitMs);
+    }, holdMs);
+
+    return () => {
+      clearTimeout(holdTimer);
+      if (exitTimer !== null) clearTimeout(exitTimer);
+    };
+  }, [visible, triggerKey, holdMs, exitMs, onDismiss]);
+
+  if (!visible) return null;
+
+  const secondaryText = sessionName || fallbackLabel || null;
+  const isFallback = !sessionName && Boolean(fallbackLabel);
+
+  return (
+    <div
+      class={`server-switch-watermark${exiting ? ' is-exiting' : ''}`}
+      data-testid="server-switch-watermark"
+      data-state={exiting ? 'exiting' : 'visible'}
+      aria-hidden="true"
+    >
+      <div class="server-switch-watermark-card">
+        <div class="server-switch-watermark-server">
+          <span class="server-switch-watermark-icon" aria-hidden="true">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="3" y="4" width="18" height="6" rx="1.5" />
+              <rect x="3" y="14" width="18" height="6" rx="1.5" />
+              <circle cx="7" cy="7" r="1" fill="currentColor" stroke="none" />
+              <circle cx="7" cy="17" r="1" fill="currentColor" stroke="none" />
+            </svg>
+          </span>
+          <span class="server-switch-watermark-server-name" data-testid="server-switch-watermark-server">
+            {serverName}
+          </span>
+        </div>
+        {secondaryText && (
+          <>
+            <div class="server-switch-watermark-divider" />
+            <div class={`server-switch-watermark-session${isFallback ? ' is-muted' : ''}`}>
+              <span class="server-switch-watermark-session-dot" aria-hidden="true" />
+              <span class="server-switch-watermark-session-name" data-testid="server-switch-watermark-session">
+                {secondaryText}
+              </span>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}

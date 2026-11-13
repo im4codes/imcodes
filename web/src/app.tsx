@@ -182,6 +182,7 @@ import { NewUserGuide, type NewUserGuideStep } from './components/NewUserGuide.j
 import { TeamDiscussionGuide } from './components/TeamDiscussionGuide.js';
 import { FeatureAnnouncementHost } from './components/FeatureAnnouncement.js';
 import { DownloadTransferCenter } from './components/DownloadTransferCenter.js';
+import { ServerSwitchWatermark } from './components/ServerSwitchWatermark.js';
 import { mergeUsageUpdate } from './usage-data.js';
 import { ServerIconBar } from './components/ServerIconBar.js';
 import { PushStatusBadge } from './components/PushStatusBadge.js';
@@ -7405,6 +7406,14 @@ function InternalMainApp() {
     || (remoteDesktopWallOpen && !remoteDesktopWallMinimized);
 
   // Global keyboard shortcuts: switch servers & session tabs (desktop only).
+  const [serverSwitchWatermark, setServerSwitchWatermark] = useState<{
+    serverId: string;
+    serverName: string;
+    nonce: number;
+  } | null>(null);
+  const dismissServerSwitchWatermark = useCallback(() => {
+    setServerSwitchWatermark(null);
+  }, []);
   const orderedServersNavRef = useRef(orderedServers);
   orderedServersNavRef.current = orderedServers;
   const orderedTabsNavRef = useRef(orderedVisibleMainSessions);
@@ -7462,6 +7471,11 @@ function InternalMainApp() {
         );
         const nextServer = nextId ? serversList.find((srv) => srv.id === nextId) : null;
         if (nextServer && nextServer.id !== selectedServerIdRef.current) {
+          setServerSwitchWatermark((prev) => ({
+            serverId: nextServer.id,
+            serverName: nextServer.name || nextServer.id,
+            nonce: (prev?.nonce ?? 0) + 1,
+          }));
           void handleSelectServerNavRef.current(nextServer.id, nextServer.name);
         }
         return;
@@ -7485,6 +7499,13 @@ function InternalMainApp() {
     window.addEventListener('keydown', handler, true);
     return () => window.removeEventListener('keydown', handler, true);
   }, [isMobile]);
+
+  useEffect(() => {
+    if (!serverSwitchWatermark) return;
+    if (manualDashboard || selectedShareTarget !== null || (selectedServerId && selectedServerId !== serverSwitchWatermark.serverId)) {
+      setServerSwitchWatermark(null);
+    }
+  }, [manualDashboard, selectedServerId, selectedShareTarget, serverSwitchWatermark]);
 
   // Desktop auto-focus composer input when switching servers, tabs, or sub-session windows.
   // Track requested navigation intent independently of whether the target is currently
@@ -10187,6 +10208,32 @@ function InternalMainApp() {
         onKeepMuted={() => void handleRespondToNewDevicePushPrompt('mute')}
         onDismiss={() => void handleRespondToNewDevicePushPrompt('dismiss')}
       />
+
+      {(() => {
+        const watermarkTargetMatches =
+          serverSwitchWatermark !== null
+          && !manualDashboard
+          && selectedShareTarget === null
+          && selectedServerId === serverSwitchWatermark.serverId;
+        const watermarkSessionName = watermarkTargetMatches && activeSessionInfo
+          ? (activeSessionInfo.label || activeSessionInfo.project || activeSessionInfo.name)
+          : null;
+        const watermarkFallbackLabel = watermarkTargetMatches && !activeSessionInfo
+          ? (sessionsLoaded
+            ? trans('session.no_session', { defaultValue: 'No session' })
+            : trans('common.loading', { defaultValue: 'Loading…' }))
+          : null;
+        return (
+          <ServerSwitchWatermark
+            visible={serverSwitchWatermark !== null}
+            triggerKey={serverSwitchWatermark?.nonce ?? 0}
+            serverName={serverSwitchWatermark?.serverName ?? ''}
+            sessionName={watermarkSessionName}
+            fallbackLabel={watermarkFallbackLabel}
+            onDismiss={dismissServerSwitchWatermark}
+          />
+        );
+      })()}
 
       {/* Toasts: idle completions + CC notifications */}
       {toasts.length > 0 && (
