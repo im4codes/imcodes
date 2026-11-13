@@ -1581,4 +1581,156 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       text: 'final drained phrase',
     }));
   });
+
+  it.each(['send', 'edit'] as const)('preserves finite slow %s final tail past 15s, prevents overlapping holds from stealing drain ownership, and keeps tap-to-type responsive', async (outcome) => {
+    let completeStop!: () => void;
+    voiceMock.stopListening.mockReturnValueOnce(new Promise<void>((resolve) => { completeStop = resolve; }));
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = document.querySelector('.controls-input') as HTMLElement;
+    dispatchPointer(input, 'pointerdown', 180);
+    await vi.advanceTimersByTimeAsync(120);
+    expect(voiceMock.startListening).toHaveBeenCalledTimes(1);
+    voiceMock.partialHandler?.('initial speech');
+    if (outcome === 'edit') {
+      dispatchPointer(input, 'pointermove', 260);
+    }
+    dispatchPointer(input, 'pointerup', outcome === 'edit' ? 260 : 180);
+
+    // Advance past 15s (16s) before stop ACK & trailing final arrive
+    await vi.advanceTimersByTimeAsync(16_000);
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+
+    // Attempt an overlapping long hold during drain: must NOT start a second recording or steal owner
+    dispatchPointer(input, 'pointerdown', 180, 500, 2);
+    await vi.advanceTimersByTimeAsync(150);
+    dispatchPointer(input, 'pointerup', 180, 500, 2);
+    expect(voiceMock.startListening).toHaveBeenCalledTimes(1);
+
+    // Short tap (<100ms) while drain is still active MUST still enter editable focus cleanly
+    dispatchPointer(input, 'pointerdown', 180, 500, 3);
+    await vi.advanceTimersByTimeAsync(45);
+    dispatchPointer(input, 'pointerup', 180, 500, 3);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(document.activeElement).toBe(input);
+
+    // Deliver trailing final tail and complete stop drain -> delivered intact once!
+    voiceMock.partialHandler?.('initial speech with final tail');
+    completeStop();
+    await vi.advanceTimersByTimeAsync(0);
+
+    if (outcome === 'send') {
+      expect(ws.sendSessionCommand).toHaveBeenCalledTimes(1);
+      expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+        text: 'initial speech with final tail',
+      }));
+    } else {
+      expect(document.querySelector('.mock-voice-overlay')?.getAttribute('data-initial-text')).toBe('initial speech with final tail');
+    }
+  });
+
+  it('recovers orphaned leases after lostpointercapture or swallowed pointerup (new/reused pointerId, pending/slop/capture error, and click-to-type), while ignoring genuine 2nd-finger and trailing post-up lostpointercapture', async () => {
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = document.querySelector('.controls-input') as HTMLElement;
+
+    // 1. Active hold -> genuine non-primary 2nd finger (isPrimary: false) MUST NOT steal/cancel active hold
+    dispatchPointer(input, 'pointerdown', 180, 500, 1);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(voiceMock.startListening).toHaveBeenCalledTimes(1);
+    const secondFinger = new Event('pointerdown', { bubbles: true, cancelable: true });
+    Object.assign(secondFinger, { clientX: 200, clientY: 500, pointerId: 2, button: 0, pointerType: 'touch', isPrimary: false });
+    fireEvent(input, secondFinger);
+    await vi.advanceTimersByTimeAsync(120);
+    expect(voiceMock.startListening).toHaveBeenCalledTimes(1);
+    expect(document.querySelector('.voice-hold-hud')).not.toBeNull();
+
+    // 2. Unexpected lostpointercapture (buttons=0) with swallowed pointerup -> next primary hold (pointerId=2) retires old hold & starts #2
+    const lost = new Event('lostpointercapture', { bubbles: true, cancelable: false });
+    Object.assign(lost, { pointerId: 1, pointerType: 'touch', isPrimary: true, buttons: 0 });
+    fireEvent(input, lost);
+    await vi.advanceTimersByTimeAsync(0);
+    dispatchPointer(input, 'pointerdown', 180, 500, 2);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(voiceMock.stopListening).toHaveBeenCalledWith({ abort: true });
+    expect(voiceMock.startListening).toHaveBeenCalledTimes(2);
+
+    // 3. Swallowed terminal event with NO lostpointercapture, then same/reused pointerId=2 -> recovers cleanly & starts #3
+    dispatchPointer(input, 'pointerdown', 180, 500, 2);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(voiceMock.startListening).toHaveBeenCalledTimes(3);
+
+    // 4. lostpointercapture (buttons=0) -> direct fireEvent.click(input) unlocks contenteditable="true" & focuses
+    const lost3 = new Event('lostpointercapture', { bubbles: true, cancelable: false });
+    Object.assign(lost3, { pointerId: 2, pointerType: 'touch', isPrimary: true, buttons: 0 });
+    fireEvent(input, lost3);
+    await vi.advanceTimersByTimeAsync(0);
+    fireEvent.click(input);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(document.activeElement).toBe(input);
+    input.textContent = 'Recovered via click';
+    fireEvent.input(input);
+    expect(input.textContent).toBe('Recovered via click');
+
+    // Blur back to voice-ready state
+    input.blur();
+    fireEvent.blur(input);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(input.getAttribute('contenteditable')).toBe('false');
+
+    // 5. setPointerCapture failure + swallowed pending pointerup (<100ms) -> new primary tap still enters typing cleanly
+    (input as any).setPointerCapture = () => { throw new Error('capture failed'); };
+    dispatchPointer(input, 'pointerdown', 180, 500, 4);
+    await vi.advanceTimersByTimeAsync(30); // no pointerup!
+    dispatchPointer(input, 'pointerdown', 180, 500, 4);
+    await vi.advanceTimersByTimeAsync(45);
+    dispatchPointer(input, 'pointerup', 180, 500, 4);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(document.activeElement).toBe(input);
+    expect(voiceMock.startListening).toHaveBeenCalledTimes(3);
+
+    // Blur back -> trailing lostpointercapture after normal pointerup MUST NOT abort send drain
+    input.blur();
+    fireEvent.blur(input);
+    let releaseSendDrain!: () => void;
+    voiceMock.stopListening.mockImplementationOnce(async () => {
+      await new Promise<void>((r) => { releaseSendDrain = r; });
+      voiceMock.partialHandler?.('tail survives trailing lostcapture');
+    });
+    dispatchPointer(input, 'pointerdown', 180, 500, 5);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(voiceMock.startListening).toHaveBeenCalledTimes(4);
+    dispatchPointer(input, 'pointerup', 180, 500, 5);
+    const trailingLost = new Event('lostpointercapture', { bubbles: true, cancelable: false });
+    Object.assign(trailingLost, { pointerId: 5, pointerType: 'touch', isPrimary: true, buttons: 0 });
+    fireEvent(input, trailingLost);
+    releaseSendDrain();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+      text: 'Recovered via click tail survives trailing lostcapture',
+    }));
+  });
 });

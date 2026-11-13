@@ -187,7 +187,6 @@ const VOICE_HOLD_CANCEL_THRESHOLD_PX = 44;
 const VOICE_HOLD_EDIT_THRESHOLD_PX = 44;
 const VOICE_HOLD_SLIDE_MAX_PX = 84;
 const VOICE_HOLD_FAILED_DRAIN_TIMEOUT_MS = 2500;
-const VOICE_HOLD_SETTLE_TIMEOUT_MS = 15_000;
 
 const VOICE_HOLD_FAN_CENTER_X = 180;
 const VOICE_HOLD_FAN_CENTER_Y = 204;
@@ -1420,7 +1419,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [voiceHoldBars, setVoiceHoldBars] = useState<number[]>(() => Array(16).fill(0));
   const voiceHoldTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const voiceHoldRecognizingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const voiceHoldPointerRef = useRef<{ id: number; startX: number; startY: number; wasFocused: boolean; downAt: number } | null>(null);
+  const voiceHoldPointerRef = useRef<{
+    id: number;
+    startX: number;
+    startY: number;
+    wasFocused: boolean;
+    downAt: number;
+    lastActivityAt: number;
+    captureLost: boolean;
+  } | null>(null);
   const voiceHoldPendingRef = useRef(false);
   const voiceHoldActiveRef = useRef(false);
   const voiceHoldZoneRef = useRef<'send' | 'cancel' | 'edit'>('send');
@@ -5347,11 +5354,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }, durationMs);
   }, []);
 
-  const finalizeVoiceHold = useCallback((
-    tx: NonNullable<typeof voiceHoldTxRef.current>,
-    outcome: 'send' | 'cancel' | 'edit' | 'failed',
-  ): Promise<void> => {
-    if (tx.drainPromise !== null) return tx.drainPromise;
+  const resetVoiceHoldInteractionState = useCallback(() => {
     voiceHoldPointerRef.current = null;
     voiceHoldPendingRef.current = false;
     voiceHoldActiveRef.current = false;
@@ -5369,6 +5372,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setVoiceHoldZone('send');
       setVoiceHoldDragX(0);
     }
+  }, [clearComposerVoiceWindowListeners, clearVoiceHoldTimers]);
+
+  const finalizeVoiceHold = useCallback((
+    tx: NonNullable<typeof voiceHoldTxRef.current>,
+    outcome: 'send' | 'cancel' | 'edit' | 'failed',
+  ): Promise<void> => {
+    if (tx.drainPromise !== null) return tx.drainPromise;
+    resetVoiceHoldInteractionState();
 
     const abortMode = outcome === 'cancel' || outcome === 'failed';
     if (outcome === 'cancel') {
@@ -5388,9 +5399,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
 
     tx.phase = outcome === 'failed' ? 'failed' : 'draining';
-    const maxDrainMs = outcome === 'failed'
-      ? VOICE_HOLD_FAILED_DRAIN_TIMEOUT_MS
-      : VOICE_HOLD_SETTLE_TIMEOUT_MS;
 
     tx.drainPromise = (async () => {
       let drainTimer: ReturnType<typeof setTimeout> | null = null;
@@ -5399,10 +5407,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         // awaiting startPromise:
         // 1. If native start is still pending (permission / first PCM / startingCall),
         //    stopListening immediately aborts it via the generation barrier.
-        // 2. If recording already started and failed at runtime (recognitionError),
-        //    stopListening joins the active native stop drain so voiceHoldTxRef is
-        //    not released until the underlying native session has fully stopped,
-        //    while capping stalled native calls via maxDrainMs.
+        // 2. For normal send/edit drains, await the finite stopListening() barrier
+        //    without an arbitrary timeout so delayed final tails are preserved and
+        //    delivered once, while keeping voiceHoldTxRef non-null against overlapping holds.
+        // 3. For failed outcomes, bound recovery with VOICE_HOLD_FAILED_DRAIN_TIMEOUT_MS.
         const stopTask = Promise.resolve(
           VoiceInput.stopListening(abortMode ? { abort: true } : undefined),
         ).catch(() => {});
@@ -5414,22 +5422,30 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           await stopTask;
           return started;
         })();
-        const raceResult = await Promise.race([
-          work.then((started) => ({ timedOut: false as const, started })),
-          new Promise<{ timedOut: true; started: false }>((resolve) => {
-            drainTimer = setTimeout(() => {
-              drainTimer = null;
-              resolve({ timedOut: true, started: false });
-            }, maxDrainMs);
-          }),
-        ]);
-        if (drainTimer !== null) {
-          clearTimeout(drainTimer);
-          drainTimer = null;
-        }
-        const started = raceResult.started;
 
-        if (raceResult.timedOut || tx.settled || outcome === 'failed' || !started || tx.error !== null || !mountedRef.current) {
+        let timedOut = false;
+        let started = false;
+        if (outcome === 'failed') {
+          const raceResult = await Promise.race([
+            work.then((ok) => ({ timedOut: false as const, started: ok })),
+            new Promise<{ timedOut: true; started: false }>((resolve) => {
+              drainTimer = setTimeout(() => {
+                drainTimer = null;
+                resolve({ timedOut: true, started: false });
+              }, VOICE_HOLD_FAILED_DRAIN_TIMEOUT_MS);
+            }),
+          ]);
+          if (drainTimer !== null) {
+            clearTimeout(drainTimer);
+            drainTimer = null;
+          }
+          timedOut = raceResult.timedOut;
+          started = raceResult.started;
+        } else {
+          started = await work;
+        }
+
+        if (timedOut || tx.settled || outcome === 'failed' || tx.phase === 'failed' || !started || tx.error !== null || !mountedRef.current) {
           tx.settled = true;
           tx.phase = 'settled';
           return;
@@ -5465,7 +5481,35 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     })();
 
     return tx.drainPromise;
-  }, [clearComposerVoiceWindowListeners, clearVoiceHoldTimers, handleVoiceSend]);
+  }, [handleVoiceSend, resetVoiceHoldInteractionState]);
+
+  const retireOrphanedVoiceHold = useCallback(() => {
+    const orphanTx = voiceHoldTxRef.current;
+    if (
+      orphanTx
+      && !orphanTx.settled
+      && orphanTx.drainPromise === null
+      && (orphanTx.phase === 'starting' || orphanTx.phase === 'recording')
+    ) {
+      void finalizeVoiceHold(orphanTx, 'cancel');
+      return;
+    }
+    resetVoiceHoldInteractionState();
+  }, [finalizeVoiceHold, resetVoiceHoldInteractionState]);
+
+  const handleComposerVoiceLostPointerCapture = useCallback((event: PointerEvent) => {
+    if (handledVoicePointerEventsRef.current.has(event)) return;
+    handledVoicePointerEventsRef.current.add(event);
+    if (event.isPrimary === false) return;
+    const ptr = voiceHoldPointerRef.current;
+    if (!ptr) return;
+    if (event.pointerId !== undefined && event.pointerId !== ptr.id) return;
+    const tx = voiceHoldTxRef.current;
+    if (tx && (tx.settled || tx.phase === 'draining' || tx.drainPromise !== null)) {
+      return;
+    }
+    ptr.captureLost = true;
+  }, []);
 
   const handleComposerVoicePointerDown = useCallback((event: PointerEvent) => {
     if (handledVoicePointerEventsRef.current.has(event)) return;
@@ -5478,19 +5522,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     const mobile = typeof window !== 'undefined' && window.innerWidth <= 640;
     if (!mobile || inputDisabled || voiceOpen || !VoiceInput.isAvailable()) return;
     if (event.button !== undefined && event.button !== 0) return;
-    if (voiceHoldActiveRef.current) return;
+    if (event.isPrimary === false) return;
 
-    const existingPtr = voiceHoldPointerRef.current;
-    if (existingPtr !== null) {
-      const pointerId = event.pointerId ?? 1;
-      const stalePending = !voiceHoldPendingRef.current
-        || (pointerId !== existingPtr.id && Date.now() - existingPtr.downAt > 500);
-      if (!stalePending) return;
-      clearVoiceHoldTimers();
-      clearComposerVoiceWindowListeners();
-      voiceHoldPointerRef.current = null;
-      voiceHoldPendingRef.current = false;
-      setVoiceHoldPending(false);
+    if (voiceHoldActiveRef.current || voiceHoldPendingRef.current || voiceHoldPointerRef.current !== null) {
+      // A primary pointerdown cannot legitimately begin while a previous primary pointer
+      // is still physically held; recover any orphaned pending/active lease whose
+      // terminal pointerup/pointercancel was lost after capture loss or OS interruption.
+      retireOrphanedVoiceHold();
     }
 
     const el = divRef.current;
@@ -5506,7 +5544,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     const pointerId = event.pointerId ?? 1;
     const startX = event.clientX ?? 0;
     const startY = event.clientY ?? 0;
-    voiceHoldPointerRef.current = { id: pointerId, startX, startY, wasFocused, downAt: Date.now() };
+    const now = Date.now();
+    voiceHoldPointerRef.current = {
+      id: pointerId,
+      startX,
+      startY,
+      wasFocused,
+      downAt: now,
+      lastActivityAt: now,
+      captureLost: false,
+    };
     voiceHoldPendingRef.current = true;
     setVoiceHoldPending(true);
     applyComposerVoiceTouchLock(el, false);
@@ -5624,32 +5671,28 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     attachComposerVoiceWindowListeners,
     clearComposerVoiceWindowListeners,
     pulseVoiceHoldRecognizing,
-    clearVoiceHoldTimers,
+    retireOrphanedVoiceHold,
     finalizeVoiceHold,
   ]);
 
   const handleComposerVoicePointerMove = useCallback((event: PointerEvent) => {
     if (handledVoicePointerEventsRef.current.has(event)) return;
     handledVoicePointerEventsRef.current.add(event);
+    if (event.isPrimary === false) return;
     const ptr = voiceHoldPointerRef.current;
     const tx = voiceHoldTxRef.current;
     if (ptr && event.pointerId !== undefined && event.pointerId !== ptr.id) return;
     if (!ptr && !tx) return;
+    if (ptr) {
+      ptr.lastActivityAt = Date.now();
+    }
 
     if (!tx) {
       if (!ptr) return;
       const dx = (event.clientX ?? 0) - ptr.startX;
       const dy = (event.clientY ?? 0) - ptr.startY;
       if (Math.hypot(dx, dy) > VOICE_HOLD_MOVE_SLOP_PX) {
-        clearVoiceHoldTimers();
-        clearComposerVoiceWindowListeners();
-        voiceHoldPointerRef.current = null;
-        voiceHoldPendingRef.current = false;
-        setVoiceHoldPending(false);
-        clearComposerVoiceTouchLock(
-          divRef.current,
-          inputDisabledRef.current || (voiceHoldReadyRef.current && !composerFocusedRef.current),
-        );
+        resetVoiceHoldInteractionState();
       }
       return;
     }
@@ -5675,7 +5718,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setVoiceHoldZone(nextZone);
       try { navigator.vibrate?.(12); } catch { /* ignore */ }
     }
-  }, [clearComposerVoiceWindowListeners, clearVoiceHoldTimers, finalizeVoiceHold]);
+  }, [finalizeVoiceHold, resetVoiceHoldInteractionState]);
 
   const disarmTouchTapCompatMouseShield = useCallback(() => {
     touchTapCompatShieldCleanupRef.current?.();
@@ -5728,6 +5771,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const handleComposerVoicePointerEnd = useCallback((event: PointerEvent, cancelled = false) => {
     if (handledVoicePointerEventsRef.current.has(event)) return;
     handledVoicePointerEventsRef.current.add(event);
+    if (event.isPrimary === false) return;
     const ptr = voiceHoldPointerRef.current;
     const tx = voiceHoldTxRef.current;
     if (ptr && event.pointerId !== undefined && event.pointerId !== ptr.id) return;
@@ -5782,6 +5826,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     const onMove = (e: Event) => handleComposerVoicePointerMove(e as PointerEvent);
     const onUp = (e: Event) => handleComposerVoicePointerEnd(e as PointerEvent, false);
     const onCancel = (e: Event) => handleComposerVoicePointerEnd(e as PointerEvent, true);
+    const onLostCapture = (e: Event) => handleComposerVoiceLostPointerCapture(e as PointerEvent);
     const onSelectStart = (e: Event) => {
       if (voiceHoldPendingRef.current || voiceHoldActiveRef.current) {
         e.preventDefault();
@@ -5791,15 +5836,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     el.addEventListener('pointermove', onMove);
     el.addEventListener('pointerup', onUp);
     el.addEventListener('pointercancel', onCancel);
+    el.addEventListener('lostpointercapture', onLostCapture);
     el.addEventListener('selectstart', onSelectStart);
     return () => {
       el.removeEventListener('pointerdown', onDown);
       el.removeEventListener('pointermove', onMove);
       el.removeEventListener('pointerup', onUp);
       el.removeEventListener('pointercancel', onCancel);
+      el.removeEventListener('lostpointercapture', onLostCapture);
       el.removeEventListener('selectstart', onSelectStart);
     };
-  }, [handleComposerVoicePointerDown, handleComposerVoicePointerMove, handleComposerVoicePointerEnd]);
+  }, [handleComposerVoiceLostPointerCapture, handleComposerVoicePointerDown, handleComposerVoicePointerMove, handleComposerVoicePointerEnd]);
 
   useEffect(() => {
     const initialEl = divRef.current;
@@ -8720,7 +8767,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             onClick={() => {
               const el = divRef.current;
               if (!el || suppressComposerClickFocusRef.current) return;
-              if (inputDisabledRef.current || voiceHoldPendingRef.current || voiceHoldActiveRef.current) return;
+              if (inputDisabledRef.current) return;
+              if (
+                (voiceHoldPendingRef.current || voiceHoldActiveRef.current)
+                && (voiceHoldPointerRef.current?.captureLost || voiceHoldPointerRef.current === null)
+              ) {
+                retireOrphanedVoiceHold();
+              }
+              if (voiceHoldPendingRef.current || voiceHoldActiveRef.current) return;
               if (!composerFocusedRef.current || el.getAttribute('contenteditable') !== 'true') {
                 focusComposerForTyping();
               }

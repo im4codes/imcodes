@@ -1098,4 +1098,99 @@ describe('Web Mobile final drain', () => {
     }
   });
 
+  it('fences retired native stop rejections/resolutions and hung starts from polluting a fresh post-abort owner, detaches handles immediately on abort, and still reports real errors to the current owner', async () => {
+    vi.useFakeTimers();
+    const removeSpies: Array<ReturnType<typeof vi.fn>> = [];
+    speechApi.addListener.mockImplementation(async (eventName: string, handler: (data: any) => void) => {
+      listeners[eventName] = handler;
+      const remove = vi.fn(async () => undefined);
+      removeSpies.push(remove);
+      return { remove };
+    });
+
+    const oldStop = deferred<void>();
+    speechApi.stop
+      .mockReturnValueOnce(oldStop.promise)
+      .mockResolvedValue(undefined);
+    try {
+      const staleError = vi.fn();
+      await expect(VoiceInput.startListening(vi.fn(), undefined, staleError)).resolves.toBe(true);
+      const sessionARemoveCount = removeSpies.length;
+      expect(sessionARemoveCount).toBe(4);
+
+      // 1. Real native stopped event starts an ordinary stop drain that hangs.
+      listeners.listeningState?.({ status: 'stopped' });
+      expect(speechApi.stop).toHaveBeenCalledTimes(1);
+
+      // 2. Abort retires session A and detaches session A listener handles immediately even while oldStop is still hung.
+      const cancelled = VoiceInput.stopListening({ abort: true });
+      await vi.advanceTimersByTimeAsync(0);
+      for (const remove of removeSpies.slice(0, sessionARemoveCount)) {
+        expect(remove).toHaveBeenCalledTimes(1);
+      }
+      await vi.advanceTimersByTimeAsync(VoiceInput.NATIVE_ABORT_DRAIN_MS);
+      await cancelled;
+
+      // 3. Fresh owner B starts cleanly.
+      const freshResult = vi.fn();
+      const freshListening = vi.fn();
+      const freshError = vi.fn();
+      await expect(VoiceInput.startListening(freshResult, freshListening, freshError)).resolves.toBe(true);
+      expect(VoiceInput.isListening()).toBe(true);
+
+      // 4. Retired stop from A rejects late -> MUST NOT reach freshError, overwrite getLastError, or corrupt B's listening state.
+      oldStop.reject(new Error('old owner stop failed late'));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(freshError).not.toHaveBeenCalled();
+      expect(staleError).not.toHaveBeenCalled();
+      expect(VoiceInput.getLastError()).toBeNull();
+      expect(VoiceInput.isListening()).toBe(true);
+      listeners.partialResults?.({ matches: ['fresh capture B'], isFinal: false });
+      expect(freshResult).toHaveBeenCalledWith('fresh capture B', false);
+
+      // 5. Positive control: a real stop failure belonging to the CURRENT owner IS still surfaced.
+      speechApi.stop.mockRejectedValueOnce(new Error('current owner decoder error'));
+      await VoiceInput.stopListening();
+      expect(freshError).toHaveBeenCalledWith('current owner decoder error');
+      expect(VoiceInput.getLastError()).toBe('current owner decoder error');
+      expect(VoiceInput.isListening()).toBe(false);
+    } finally {
+      oldStop.resolve();
+      await VoiceInput.stopListening({ abort: true });
+      vi.useRealTimers();
+    }
+  });
+
+  it('never lets a retired native hung start() stop a newer session when that old start finally resolves', async () => {
+    vi.useFakeTimers();
+    const hungA = deferred<Record<string, never>>();
+    speechApi.start.mockReturnValueOnce(hungA.promise).mockResolvedValue({});
+    speechApi.stop.mockImplementation(() => new Promise<void>(() => {}));
+    try {
+      const startAPromise = VoiceInput.startListening(vi.fn());
+      await vi.advanceTimersByTimeAsync(0);
+      const abortPromise = VoiceInput.stopListening({ abort: true });
+      await vi.advanceTimersByTimeAsync(VoiceInput.NATIVE_ABORT_DRAIN_MS);
+      await abortPromise;
+      expect(speechApi.stop).toHaveBeenCalledTimes(1);
+
+      speechApi.stop.mockResolvedValue(undefined);
+      const startBPromise = VoiceInput.startListening(vi.fn());
+      await vi.advanceTimersByTimeAsync(0);
+      await expect(startBPromise).resolves.toBe(true);
+      expect(VoiceInput.isListening()).toBe(true);
+
+      hungA.resolve({});
+      await vi.advanceTimersByTimeAsync(0);
+      await expect(startAPromise).resolves.toBe(false);
+      // Hung A resolving must NOT issue an extra stop() against active session B
+      expect(speechApi.stop).toHaveBeenCalledTimes(1);
+      expect(VoiceInput.isListening()).toBe(true);
+      await VoiceInput.stopListening({ abort: true });
+    } finally {
+      hungA.resolve({});
+      vi.useRealTimers();
+    }
+  });
+
 });
