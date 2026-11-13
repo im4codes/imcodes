@@ -289,6 +289,19 @@ class TimelineStore {
   }
 
   /**
+   * Unconditionally wait until all currently pending and newly queued
+   * per-session append/truncate chains settle. Unlike {@link flushAll} (used
+   * by SIGTERM shutdown to bound latency), this never returns early on a
+   * timeout while writers remain active, making it safe as a filesystem
+   * teardown barrier in tests.
+   */
+  async drainAll(): Promise<void> {
+    while (this.sessionChains.size > 0) {
+      await Promise.allSettled([...this.sessionChains.values()]);
+    }
+  }
+
+  /**
    * Wait for a single session's append chain to settle. Used by tests
    * that need synchronous visibility after a few `emit()` calls.
    */

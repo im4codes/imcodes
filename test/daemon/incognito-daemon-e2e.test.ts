@@ -109,10 +109,16 @@ describe('daemon incognito end-to-end lifecycle (F3)', () => {
   afterEach(async () => {
     timelineEmitter.forgetSession('deck_privmode_brain');
     await flushTransportHistory();
-    await timelineStore.flushAll(5_000);
+    await timelineStore.drainAll();
     await timelineProjection.drain(5_000);
     await timelineProjection.shutdown();
-    await timelineEmitter.drainUsageWrites(3_000);
+    const usageDrain = await timelineEmitter.drainUsageWrites(5_000);
+    if (usageDrain.abandoned > 0) {
+      throw new Error(`Aborted tempHome cleanup with ${usageDrain.abandoned} pending usage writes`);
+    }
+    if (timelineStore.getPendingSessionCount() > 0) {
+      throw new Error(`Aborted tempHome cleanup with ${timelineStore.getPendingSessionCount()} pending timeline chains`);
+    }
     resetContextStoreClientForTests();
     setSessionIncognito('deck_privmode_brain', false);
     removeSession('deck_privmode_brain');

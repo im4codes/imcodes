@@ -17,9 +17,46 @@ import {
   wireProviderToRelay,
 } from '../../src/daemon/transport-relay.js';
 
-const { routedSessions } = vi.hoisted(() => ({
+const { routedSessions, delayedMkdirGate } = vi.hoisted(() => ({
   routedSessions: new Map<string, string>(),
+  delayedMkdirGate: {
+    target: '',
+    entered: false,
+    release: null as null | (() => void),
+  },
 }));
+
+vi.mock('fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('fs/promises')>();
+  return {
+    ...actual,
+    mkdir: async (...args: Parameters<typeof actual.mkdir>) => {
+      if (delayedMkdirGate.target && String(args[0]) === delayedMkdirGate.target) {
+        delayedMkdirGate.entered = true;
+        await new Promise<void>((resolve) => {
+          delayedMkdirGate.release = resolve;
+        });
+      }
+      return actual.mkdir(...args);
+    },
+  };
+});
+
+async function drainAllSessionWritersStrict(targetSession: string): Promise<void> {
+  forgetTransportRelaySession(targetSession);
+  timelineEmitter.forgetSession(targetSession);
+  await flushTransportHistory();
+  await timelineStore.drainAll();
+  await timelineProjection.drain(5_000);
+  await timelineProjection.shutdown();
+  const usageDrain = await timelineEmitter.drainUsageWrites(5_000);
+  if (usageDrain.abandoned > 0) {
+    throw new Error(`Aborted tempHome cleanup with ${usageDrain.abandoned} pending usage writes`);
+  }
+  if (timelineStore.getPendingSessionCount() > 0) {
+    throw new Error(`Aborted tempHome cleanup with ${timelineStore.getPendingSessionCount()} pending timeline chains`);
+  }
+}
 
 vi.mock('../../src/agent/session-manager.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../src/agent/session-manager.js')>();
@@ -78,13 +115,12 @@ describe('transport-history + transport-relay + timelineStore incognito isolatio
   });
 
   afterEach(async () => {
-    forgetTransportRelaySession(sessionName);
-    timelineEmitter.forgetSession(sessionName);
-    await flushTransportHistory();
-    await timelineStore.flushAll(5_000);
-    await timelineProjection.drain(5_000);
-    await timelineProjection.shutdown();
-    await timelineEmitter.drainUsageWrites(3_000);
+    delayedMkdirGate.release?.();
+    delayedMkdirGate.release = null;
+    delayedMkdirGate.target = '';
+    delayedMkdirGate.entered = false;
+    vi.useRealTimers();
+    await drainAllSessionWritersStrict(sessionName);
     setSessionIncognito(sessionName, false);
     removeSession(sessionName);
     await flushStore().catch(() => {});
@@ -246,17 +282,129 @@ describe('transport-history + transport-relay + timelineStore incognito isolatio
         content: `CYCLE-FINAL-${cycle}`,
       });
 
-      await flushTransportHistory();
-      await timelineStore.flushAll(5_000);
-      await timelineProjection.drain(5_000);
-      await timelineProjection.shutdown();
-      forgetTransportRelaySession(sessionName);
-      timelineEmitter.forgetSession(sessionName);
+      await drainAllSessionWritersStrict(sessionName);
       removeSession(sessionName);
       await flushStore();
 
       expect(existsSync(join(cycleHome, '.imcodes', 'transport', `${sessionName}.jsonl`))).toBe(true);
       expect(() => rmSync(cycleHome, { recursive: true, force: true })).not.toThrow();
+    }
+  });
+
+  it('waits past 5000ms for delayed timeline mkdir/append before draining projection and deleting tempHome without directory recreation', async () => {
+    const slowHome = mkdtempSync(join(tmpdir(), 'incognito-f1-slow-'));
+    try {
+      process.env.HOME = slowHome;
+      process.env.IMCODES_HOME = join(slowHome, '.imcodes');
+      resetSessionStoreAuthorityForTests();
+      await loadStore();
+
+      // Negative control: incognito turn writes zero bytes to disk.
+      upsertSession({
+        name: sessionName,
+        projectName: 'f1_incognito',
+        role: 'brain',
+        agentType: 'claude-code-sdk',
+        state: 'running',
+        projectDir: slowHome,
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        incognito: true,
+      });
+      setSessionIncognito(sessionName, true);
+
+      const mock = createMockRelayProvider();
+      wireProviderToRelay(mock.provider);
+      routedSessions.set('provider-slow-priv', sessionName);
+      routedSessions.set('provider-slow-norm', sessionName);
+
+      mock.emitComplete('provider-slow-priv', {
+        id: 'slow-priv-1',
+        role: 'assistant',
+        content: 'SECRET-NEVER-PERSISTED',
+      });
+      await drainAllSessionWritersStrict(sessionName);
+
+      const timelinePath = join(slowHome, '.imcodes', 'timeline', `${sessionName}.jsonl`);
+      const transportPath = join(slowHome, '.imcodes', 'transport', `${sessionName}.jsonl`);
+      expect(existsSync(timelinePath)).toBe(false);
+      expect(existsSync(transportPath)).toBe(false);
+
+      // Ordinary control with delayed mkdir blocked across the old 5_000ms budget.
+      removeSession(sessionName);
+      setSessionIncognito(sessionName, false);
+      upsertSession({
+        name: sessionName,
+        projectName: 'f1_incognito',
+        role: 'brain',
+        agentType: 'claude-code-sdk',
+        state: 'running',
+        projectDir: slowHome,
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        incognito: false,
+      });
+
+      delayedMkdirGate.entered = false;
+      delayedMkdirGate.release = null;
+      delayedMkdirGate.target = join(slowHome, '.imcodes', 'timeline');
+
+      mock.emitComplete('provider-slow-norm', {
+        id: 'slow-norm-1',
+        role: 'assistant',
+        content: 'ORDINARY-AFTER-5S-DELAY',
+      });
+
+      for (let i = 0; i < 200 && !delayedMkdirGate.entered; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(delayedMkdirGate.entered).toBe(true);
+
+      vi.useFakeTimers();
+      let drained = false;
+      const drainPromise = drainAllSessionWritersStrict(sessionName).then(() => {
+        drained = true;
+      });
+      await vi.advanceTimersByTimeAsync(5_500);
+      expect(drained).toBe(false);
+      expect(timelineStore.getPendingSessionCount()).toBe(1);
+
+      vi.useRealTimers();
+      delayedMkdirGate.target = '';
+      delayedMkdirGate.release!();
+      delayedMkdirGate.release = null;
+      await drainPromise;
+
+      expect(drained).toBe(true);
+      expect(timelineStore.getPendingSessionCount()).toBe(0);
+      expect(timelineProjection.getPendingCount()).toBe(0);
+      expect(existsSync(timelinePath)).toBe(true);
+      expect(existsSync(transportPath)).toBe(true);
+      const timelineBody = readFileSync(timelinePath, 'utf8');
+      const transportBody = readFileSync(transportPath, 'utf8');
+      expect(timelineBody).toContain('ORDINARY-AFTER-5S-DELAY');
+      expect(transportBody).toContain('ORDINARY-AFTER-5S-DELAY');
+      expect(timelineBody).not.toContain('SECRET-NEVER-PERSISTED');
+      expect(transportBody).not.toContain('SECRET-NEVER-PERSISTED');
+
+      removeSession(sessionName);
+      await flushStore();
+      process.env.HOME = prevHome;
+      if (prevImcodesHome === undefined) delete process.env.IMCODES_HOME;
+      else process.env.IMCODES_HOME = prevImcodesHome;
+      rmSync(slowHome, { recursive: true, force: true });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(existsSync(slowHome)).toBe(false);
+    } finally {
+      delayedMkdirGate.target = '';
+      delayedMkdirGate.release?.();
+      delayedMkdirGate.release = null;
+      vi.useRealTimers();
+      rmSync(slowHome, { recursive: true, force: true });
     }
   });
 });
