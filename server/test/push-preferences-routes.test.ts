@@ -12,6 +12,8 @@ import {
   PUSH_PLATFORM_ANDROID_JPUSH,
   classifyTaskPairNotificationType,
   sanitizePushEnabledServerIds,
+  resolveEffectivePushEnabledServerIds,
+  isPushEnabledForServer,
 } from '../../shared/push-notifications.js';
 
 const mockDb = {
@@ -234,8 +236,8 @@ describe('push preferences and registration routes', () => {
       );
     });
 
-    it('rejects non-array enabledServerIds with 400', async () => {
-      const res = await app.request('/api/push/preferences', {
+    it('rejects non-array non-null enabledServerIds with 400 and allows null reset', async () => {
+      const badRes = await app.request('/api/push/preferences', {
         method: 'POST',
         headers: {
           Authorization: 'Bearer valid-user-token',
@@ -245,7 +247,25 @@ describe('push preferences and registration routes', () => {
           enabledServerIds: 'srv-a',
         }),
       });
-      expect(res.status).toBe(400);
+      expect(badRes.status).toBe(400);
+
+      mockDb.execute.mockResolvedValueOnce({ changes: 1 });
+      const nullRes = await app.request('/api/push/preferences', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer valid-user-token',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          enabledServerIds: null,
+        }),
+      });
+      expect(nullRes.status).toBe(200);
+      expect(await nullRes.json()).toEqual({ ok: true, enabledServerIds: null });
+      expect(mockDb.execute).toHaveBeenCalledWith(
+        'UPDATE users SET push_enabled_server_ids = $1 WHERE id = $2',
+        [null, 'user-123'],
+      );
     });
 
     it('updates both types and enabledServerIds when both are provided', async () => {
@@ -436,7 +456,7 @@ describe('push preferences and registration routes', () => {
       fetchSpy.mockRestore();
     });
 
-    it('suppresses server push when push_enabled_server_ids is empty (default)', async () => {
+    it('suppresses server push when user explicitly saved empty push_enabled_server_ids [] (even with 1 server)', async () => {
       const mockEnv = {
         DB: mockDb,
         JPUSH_APP_KEY: 'mock-key',
@@ -445,7 +465,7 @@ describe('push preferences and registration routes', () => {
 
       mockDb.query.mockResolvedValueOnce([
         {
-          token: 'dev-token-default',
+          token: 'dev-token-explicit-empty',
           platform: PUSH_PLATFORM_ANDROID_JPUSH,
           notification_types: DEFAULT_PUSH_NOTIFICATION_TYPES,
           push_enabled_server_ids: [],
@@ -467,9 +487,90 @@ describe('push preferences and registration routes', () => {
       );
 
       expect(fetchSpy).not.toHaveBeenCalled();
-      expect(mockDb.query).toHaveBeenCalledTimes(1); // no badge increment
+      expect(mockDb.query).toHaveBeenCalledTimes(1); // no extra queries or badge increment
 
       fetchSpy.mockRestore();
+    });
+
+    it('auto-allows 1 accessible server and suppresses >1 servers when push_enabled_server_ids is NULL', async () => {
+      const mockEnv = {
+        DB: mockDb,
+        JPUSH_APP_KEY: 'mock-key',
+        JPUSH_MASTER_SECRET: 'mock-secret',
+      } as any;
+
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response(JSON.stringify({ sendno: '1', msg_id: '123' }), { status: 200 }),
+      );
+
+      // 1 accessible server -> NULL auto-allows that single server
+      mockDb.query
+        .mockResolvedValueOnce([
+          {
+            token: 'dev-token-null',
+            platform: PUSH_PLATFORM_ANDROID_JPUSH,
+            notification_types: DEFAULT_PUSH_NOTIFICATION_TYPES,
+            push_enabled_server_ids: null,
+          },
+        ])
+        .mockResolvedValueOnce([{ id: 'srv-only', node_role: 'full' }]) // getFullServersByUserId ownRows
+        .mockResolvedValueOnce([]) // getFullServersByUserId teamRows
+        .mockResolvedValueOnce([]) // listAccessibleControlledMachines
+        .mockResolvedValueOnce([{ badge_count: 1 }]); // badge_count update
+
+      await dispatchPush(
+        {
+          userId: 'user-123',
+          serverId: 'srv-only',
+          title: 'Single server',
+          body: 'Auto enabled',
+          type: PUSH_NOTIFICATION_TYPE_TASK_COMPLETE,
+        },
+        mockEnv,
+      );
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+      // 2 accessible servers -> NULL auto-suppresses all servers until manually checked
+      mockDb.query
+        .mockResolvedValueOnce([
+          {
+            token: 'dev-token-null',
+            platform: PUSH_PLATFORM_ANDROID_JPUSH,
+            notification_types: DEFAULT_PUSH_NOTIFICATION_TYPES,
+            push_enabled_server_ids: null,
+          },
+        ])
+        .mockResolvedValueOnce([
+          { id: 'srv-only', node_role: 'full' },
+          { id: 'srv-two', node_role: 'full' },
+        ])
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([]);
+
+      await dispatchPush(
+        {
+          userId: 'user-123',
+          serverId: 'srv-only',
+          title: 'Multi server',
+          body: 'Should be suppressed',
+          type: PUSH_NOTIFICATION_TYPE_TASK_COMPLETE,
+        },
+        mockEnv,
+      );
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+      fetchSpy.mockRestore();
+    });
+
+    it('resolves shared effective enabledServerIds rules cleanly', () => {
+      expect(resolveEffectivePushEnabledServerIds(null, [])).toEqual([]);
+      expect(resolveEffectivePushEnabledServerIds(null, ['srv-1'])).toEqual(['srv-1']);
+      expect(resolveEffectivePushEnabledServerIds(null, ['srv-1', 'srv-2'])).toEqual([]);
+      expect(resolveEffectivePushEnabledServerIds([], ['srv-1'])).toEqual([]);
+      expect(resolveEffectivePushEnabledServerIds(['srv-2'], ['srv-1', 'srv-2'])).toEqual(['srv-2']);
+      expect(isPushEnabledForServer(null, 'srv-1', ['srv-1'])).toBe(true);
+      expect(isPushEnabledForServer(null, 'srv-1', ['srv-1', 'srv-2'])).toBe(false);
+      expect(isPushEnabledForServer([], 'srv-1', ['srv-1'])).toBe(false);
     });
 
     it('dispatches push for checked server while suppressing unchecked server and ignoring deleted IDs', async () => {

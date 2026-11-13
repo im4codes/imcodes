@@ -13,6 +13,7 @@ import {
   PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED,
   PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT,
   PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP,
+  resolveEffectivePushEnabledServerIds,
   type PushNotificationType,
 } from '@shared/push-notifications.js';
 import {
@@ -98,7 +99,7 @@ export function SettingsPage({
   const [pushPreferences, setPushPreferences] = useState<PushNotificationType[]>(() =>
     getLocalPushNotificationPreferences(),
   );
-  const [pushEnabledServers, setPushEnabledServers] = useState<string[]>(() =>
+  const [pushEnabledServers, setPushEnabledServers] = useState<string[] | null>(() =>
     getLocalPushEnabledServers(),
   );
   const [pushServers, setPushServers] = useState<PushServerItem[]>([]);
@@ -115,7 +116,7 @@ export function SettingsPage({
       if (snapshot.types !== null && !userEditedPushRef.current && !hasUnsyncedPushNotificationEdits()) {
         setPushPreferences(snapshot.types);
       }
-      if (snapshot.enabledServerIds !== null && !userEditedPushServersRef.current && !hasUnsyncedPushEnabledServerEdits()) {
+      if (snapshot.enabledServerIds !== undefined && !userEditedPushServersRef.current && !hasUnsyncedPushEnabledServerEdits()) {
         setPushEnabledServers(snapshot.enabledServerIds);
       }
     });
@@ -186,10 +187,14 @@ export function SettingsPage({
     });
   };
 
+  const accessibleServerIds = pushServers.map((s) => s.id);
+  const effectiveEnabledServers = resolveEffectivePushEnabledServerIds(pushEnabledServers, accessibleServerIds);
+
   const togglePushServer = (serverId: string) => {
     userEditedPushServersRef.current = true;
     setPushEnabledServers((prev) => {
-      const next = prev.includes(serverId) ? prev.filter((item) => item !== serverId) : [...prev, serverId];
+      const current = resolveEffectivePushEnabledServerIds(prev, accessibleServerIds);
+      const next = current.includes(serverId) ? current.filter((item) => item !== serverId) : [...current, serverId];
       void syncPushEnabledServers(next);
       return next;
     });
@@ -711,7 +716,7 @@ export function SettingsPage({
                     type="button"
                     class="settings-btn-secondary"
                     style={{ minHeight: '32px', padding: '6px 12px', fontSize: '12px' }}
-                    disabled={pushServers.length === 0 || pushServers.every((s) => pushEnabledServers.includes(s.id))}
+                    disabled={pushServers.length === 0 || pushServers.every((s) => effectiveEnabledServers.includes(s.id))}
                     onClick={selectAllPushServers}
                   >
                     {t('settings.push_servers_select_all')}
@@ -720,7 +725,7 @@ export function SettingsPage({
                     type="button"
                     class="settings-btn-secondary"
                     style={{ minHeight: '32px', padding: '6px 12px', fontSize: '12px' }}
-                    disabled={pushEnabledServers.length === 0}
+                    disabled={effectiveEnabledServers.length === 0}
                     onClick={clearAllPushServers}
                   >
                     {t('settings.push_servers_clear')}
@@ -738,7 +743,7 @@ export function SettingsPage({
                         <input
                           type="checkbox"
                           aria-label={srv.name}
-                          checked={pushEnabledServers.includes(srv.id)}
+                          checked={effectiveEnabledServers.includes(srv.id)}
                           onChange={() => togglePushServer(srv.id)}
                           style={checkboxStyle}
                         />

@@ -210,28 +210,29 @@ function handleNotificationOpen(data: Record<string, string> | undefined): void 
 export const PUSH_NOTIFICATION_PREFERENCES_KEY = 'imcodes.push_notification_preferences';
 export const PUSH_ENABLED_SERVERS_PREFERENCES_KEY = 'imcodes.push_enabled_server_ids';
 
-interface SyncedLocalPreference<T extends string> {
+interface SyncedLocalPreference<TValue> {
   hasUnsyncedEdits: () => boolean;
   getLastSyncedGeneration: () => number;
   getCurrentEditGeneration: () => number;
   resetForTesting: () => void;
-  getLocal: () => T[];
-  setLocal: (value: T[]) => void;
-  recordEdit: (value: T[]) => number;
-  applyRemoteIfClean: (raw: unknown, startGen: number, wasDirtyAtStart: boolean) => T[] | null;
-  sync: (value: T[]) => Promise<void>;
+  getLocal: () => TValue;
+  setLocal: (value: TValue) => void;
+  recordEdit: (value: TValue) => number;
+  applyRemoteIfClean: (raw: unknown, startGen: number, wasDirtyAtStart: boolean) => TValue | undefined;
+  sync: (value: TValue) => Promise<void>;
 }
 
-function createSyncedLocalPreference<T extends string>(options: {
+function createSyncedLocalPreference<TValue>(options: {
   storageKey: string;
-  getDefault: () => T[];
-  sanitize: (raw: unknown[]) => T[];
-  buildPostBody: (value: T[]) => Record<string, unknown>;
-}): SyncedLocalPreference<T> {
+  getDefault: () => TValue;
+  parseValue: (raw: unknown) => TValue | undefined;
+  serializeLocal: (value: TValue) => string | null;
+  buildPostBody: (value: TValue) => Record<string, unknown>;
+}): SyncedLocalPreference<TValue> {
   let currentEditGeneration = 0;
   let lastSyncedGeneration = 0;
   let syncQueue: Promise<void> = Promise.resolve();
-  let pendingSync: { value: T[]; generation: number } | null = null;
+  let pendingSync: { value: TValue; generation: number } | null = null;
 
   const hasUnsyncedEdits = (): boolean => {
     if (pendingSync !== null) return true;
@@ -250,13 +251,13 @@ function createSyncedLocalPreference<T extends string>(options: {
     return false;
   };
 
-  const getLocal = (): T[] => {
+  const getLocal = (): TValue => {
     try {
       const raw = localStorage.getItem(options.storageKey);
       if (raw !== null) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) {
-          return options.sanitize(parsed);
+        const parsed = options.parseValue(JSON.parse(raw));
+        if (parsed !== undefined) {
+          return parsed;
         }
       }
     } catch {
@@ -265,35 +266,40 @@ function createSyncedLocalPreference<T extends string>(options: {
     return options.getDefault();
   };
 
-  const setLocal = (value: T[]): void => {
+  const setLocal = (value: TValue): void => {
     try {
-      localStorage.setItem(options.storageKey, JSON.stringify(value));
+      const serialized = options.serializeLocal(value);
+      if (serialized === null) {
+        localStorage.removeItem(options.storageKey);
+      } else {
+        localStorage.setItem(options.storageKey, serialized);
+      }
     } catch {
       // ignore
     }
   };
 
-  const recordEdit = (value: T[]): number => {
+  const recordEdit = (value: TValue): number => {
     currentEditGeneration++;
     setLocal(value);
     return currentEditGeneration;
   };
 
-  const applyRemoteIfClean = (raw: unknown, startGen: number, wasDirtyAtStart: boolean): T[] | null => {
-    if (!Array.isArray(raw)) return null;
-    const valid = options.sanitize(raw);
+  const applyRemoteIfClean = (raw: unknown, startGen: number, wasDirtyAtStart: boolean): TValue | undefined => {
+    const valid = options.parseValue(raw);
+    if (valid === undefined) return undefined;
     // Guard against:
     // 1. Reads initiated while dirty (un-ACKed/pending local edits) - cannot be upgraded by subsequent ACK;
     // 2. Reads arriving after newer local edits were made;
     // 3. Reads completing while local state is currently dirty.
     if (wasDirtyAtStart || currentEditGeneration > startGen || hasUnsyncedEdits()) {
-      return null;
+      return undefined;
     }
     setLocal(valid);
     return valid;
   };
 
-  const sync = async (value: T[]): Promise<void> => {
+  const sync = async (value: TValue): Promise<void> => {
     const gen = recordEdit(value);
     pendingSync = { value, generation: gen };
 
@@ -343,18 +349,26 @@ function createSyncedLocalPreference<T extends string>(options: {
   };
 }
 
-const pushTypesPref = createSyncedLocalPreference<PushNotificationType>({
+const pushTypesPref = createSyncedLocalPreference<PushNotificationType[]>({
   storageKey: PUSH_NOTIFICATION_PREFERENCES_KEY,
   getDefault: () => [...DEFAULT_PUSH_NOTIFICATION_TYPES],
-  sanitize: (raw) => raw.filter(isPushNotificationType),
+  parseValue: (raw) => (Array.isArray(raw) ? raw.filter(isPushNotificationType) : undefined),
+  serializeLocal: (value) => JSON.stringify(value),
   buildPostBody: (types) => ({ types }),
 });
 
-const pushServersPref = createSyncedLocalPreference<string>({
+const pushServersPref = createSyncedLocalPreference<string[] | null>({
   storageKey: PUSH_ENABLED_SERVERS_PREFERENCES_KEY,
-  getDefault: () => [...DEFAULT_PUSH_ENABLED_SERVER_IDS],
-  sanitize: (raw) => sanitizePushEnabledServerIds(raw),
-  buildPostBody: (enabledServerIds) => ({ enabledServerIds }),
+  getDefault: () => (DEFAULT_PUSH_ENABLED_SERVER_IDS ? [...DEFAULT_PUSH_ENABLED_SERVER_IDS] : null),
+  parseValue: (raw) => {
+    if (raw === null) return null;
+    if (Array.isArray(raw)) return sanitizePushEnabledServerIds(raw);
+    return undefined;
+  },
+  serializeLocal: (value) => (value === null ? null : JSON.stringify(sanitizePushEnabledServerIds(value))),
+  buildPostBody: (enabledServerIds) => ({
+    enabledServerIds: enabledServerIds === null ? null : sanitizePushEnabledServerIds(enabledServerIds),
+  }),
 });
 
 export function hasUnsyncedPushNotificationEdits(): boolean {
@@ -390,21 +404,21 @@ export function getCurrentPushNotificationEditGeneration(): number {
   return pushTypesPref.getCurrentEditGeneration();
 }
 
-export function getLocalPushEnabledServers(): string[] {
+export function getLocalPushEnabledServers(): string[] | null {
   return pushServersPref.getLocal();
 }
 
-export function setLocalPushEnabledServers(serverIds: string[]): void {
-  pushServersPref.setLocal(sanitizePushEnabledServerIds(serverIds));
+export function setLocalPushEnabledServers(serverIds: string[] | null): void {
+  pushServersPref.setLocal(serverIds === null ? null : sanitizePushEnabledServerIds(serverIds));
 }
 
-export function recordLocalPushEnabledServersEdit(serverIds: string[]): number {
-  return pushServersPref.recordEdit(sanitizePushEnabledServerIds(serverIds));
+export function recordLocalPushEnabledServersEdit(serverIds: string[] | null): number {
+  return pushServersPref.recordEdit(serverIds === null ? null : sanitizePushEnabledServerIds(serverIds));
 }
 
 export interface PushNotificationSettingsSnapshot {
   types: PushNotificationType[] | null;
-  enabledServerIds: string[] | null;
+  enabledServerIds: string[] | null | undefined;
 }
 
 export async function fetchPushNotificationSettings(): Promise<PushNotificationSettingsSnapshot | null> {
@@ -419,10 +433,10 @@ export async function fetchPushNotificationSettings(): Promise<PushNotificationS
       enabledServerIds?: unknown;
     }>('/api/push/preferences');
     if (res?.ok && Array.isArray(res.types)) {
-      const types = pushTypesPref.applyRemoteIfClean(res.types, typesStartGen, typesDirtyAtStart);
-      const enabledServerIds = Array.isArray(res.enabledServerIds)
-        ? pushServersPref.applyRemoteIfClean(res.enabledServerIds, serversStartGen, serversDirtyAtStart)
-        : null;
+      const types = pushTypesPref.applyRemoteIfClean(res.types, typesStartGen, typesDirtyAtStart) ?? null;
+      const enabledServerIds = res.enabledServerIds === undefined
+        ? undefined
+        : pushServersPref.applyRemoteIfClean(res.enabledServerIds, serversStartGen, serversDirtyAtStart);
       return { types, enabledServerIds };
     }
   } catch (err) {
@@ -440,8 +454,8 @@ export async function syncPushNotificationPreferences(types: PushNotificationTyp
   await pushTypesPref.sync(types);
 }
 
-export async function syncPushEnabledServers(serverIds: string[]): Promise<void> {
-  await pushServersPref.sync(sanitizePushEnabledServerIds(serverIds));
+export async function syncPushEnabledServers(serverIds: string[] | null): Promise<void> {
+  await pushServersPref.sync(serverIds === null ? null : sanitizePushEnabledServerIds(serverIds));
 }
 
 async function registerDeviceToken(

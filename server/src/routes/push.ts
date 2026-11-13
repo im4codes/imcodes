@@ -25,14 +25,17 @@ import {
   PUSH_PLATFORM_ANDROID_JPUSH,
   PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP,
   DEFAULT_PUSH_NOTIFICATION_TYPES,
-  DEFAULT_PUSH_ENABLED_SERVER_IDS,
   isPushPlatform,
   isPushNotificationType,
   sanitizePushEnabledServerIds,
+  isPushEnabledForServer,
   resolvePushPayloadServerId,
   type PushPlatform,
   type PushNotificationType,
 } from '../../../shared/push-notifications.js';
+import { getFullServersByUserId } from '../db/queries.js';
+import { listAccessibleControlledMachines } from '../share/machine-access.js';
+import { MACHINE_LIST_MAX_ITEMS } from '../../../shared/remote-exec.js';
 
 export const pushRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -105,7 +108,7 @@ pushRoutes.get('/preferences', async (c) => {
     : DEFAULT_PUSH_NOTIFICATION_TYPES;
   const enabledServerIds = Array.isArray(userRow?.push_enabled_server_ids)
     ? sanitizePushEnabledServerIds(userRow.push_enabled_server_ids)
-    : [...DEFAULT_PUSH_ENABLED_SERVER_IDS];
+    : null;
   return c.json({
     ok: true,
     types,
@@ -124,19 +127,21 @@ pushRoutes.post('/preferences', async (c) => {
   if (body.types !== undefined && !Array.isArray(body.types)) {
     return c.json({ error: 'types must be an array' }, 400);
   }
-  if (body.enabledServerIds !== undefined && !Array.isArray(body.enabledServerIds)) {
-    return c.json({ error: 'enabledServerIds must be an array' }, 400);
+  if (body.enabledServerIds !== undefined && body.enabledServerIds !== null && !Array.isArray(body.enabledServerIds)) {
+    return c.json({ error: 'enabledServerIds must be an array or null' }, 400);
   }
   const hasTypes = Array.isArray(body.types);
-  const hasEnabledServerIds = Array.isArray(body.enabledServerIds);
+  const hasEnabledServerIds = body.enabledServerIds === null || Array.isArray(body.enabledServerIds);
   if (!hasTypes && !hasEnabledServerIds) {
     return c.json({ error: 'types or enabledServerIds array required' }, 400);
   }
 
   const sanitizedTypes = hasTypes ? (body.types as unknown[]).filter(isPushNotificationType) : undefined;
-  const sanitizedServerIds = hasEnabledServerIds
-    ? sanitizePushEnabledServerIds(body.enabledServerIds)
-    : undefined;
+  const sanitizedServerIds = body.enabledServerIds === null
+    ? null
+    : Array.isArray(body.enabledServerIds)
+      ? sanitizePushEnabledServerIds(body.enabledServerIds)
+      : undefined;
 
   try {
     if (sanitizedTypes !== undefined) {
@@ -268,6 +273,17 @@ export interface PushPayload {
   serverId?: string;
 }
 
+async function getAccessiblePushServerIds(db: Database, userId: string): Promise<string[]> {
+  const [fullServers, controlledMachines] = await Promise.all([
+    getFullServersByUserId(db, userId),
+    listAccessibleControlledMachines(db, userId, Date.now(), MACHINE_LIST_MAX_ITEMS + 1),
+  ]);
+  const ids = new Set<string>();
+  for (const s of fullServers) ids.add(s.id);
+  for (const m of controlledMachines) ids.add(m.id);
+  return [...ids];
+}
+
 /**
  * Dispatch push to all devices for a user.
  * Routes iOS to APNs, Android to FCM.
@@ -316,10 +332,13 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
   if (tokens.length === 0) return;
 
   if (targetServerId) {
-    const enabledServerIds = Array.isArray(tokens[0].push_enabled_server_ids)
-      ? sanitizePushEnabledServerIds(tokens[0].push_enabled_server_ids)
-      : [];
-    if (!enabledServerIds.includes(targetServerId)) return;
+    const rawEnabledServerIds = tokens[0].push_enabled_server_ids;
+    if (Array.isArray(rawEnabledServerIds)) {
+      if (!isPushEnabledForServer(rawEnabledServerIds, targetServerId, [])) return;
+    } else {
+      const accessibleServerIds = await getAccessiblePushServerIds(db, payload.userId);
+      if (!isPushEnabledForServer(null, targetServerId, accessibleServerIds)) return;
+    }
   }
 
   const matchingTokens = tokens.filter((t) => {

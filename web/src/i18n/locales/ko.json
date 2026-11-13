@@ -2250,7 +2250,7 @@
     "push_remote_desktop_desc": "원격 데스크톱 자동 잠금 해제에 자격 증명이 사용되었을 때 전송되는 최고 수준의 보안 경고입니다. 항상 켜두는 것을 강력히 권장합니다.",
     "push_servers_label": "허용된 서버",
     "push_servers_title": "푸시 알림 서버",
-    "push_servers_desc": "기본적으로 모든 서버의 푸시 알림이 꺼져 있습니다. 선택한 서버만 기기로 푸시 알림을 보냅니다.",
+    "push_servers_desc": "서버가 1대만 있을 때는 기본으로 켜집니다. 서버가 2대 이상이면 모두 기본으로 꺼지며 직접 선택해 켜야 합니다.",
     "push_servers_select_all": "전체 선택",
     "push_servers_clear": "지우기",
     "push_servers_empty": "이 계정에 연결된 서버가 없습니다.",

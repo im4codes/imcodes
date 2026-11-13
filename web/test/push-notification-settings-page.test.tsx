@@ -4,6 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { SettingsPage } from '../src/pages/SettingsPage.js';
+import { resetPushNotificationPreferencesStateForTesting } from '../src/push-notifications.js';
 import {
   DEFAULT_PUSH_NOTIFICATION_TYPES,
   PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT,
@@ -80,6 +81,7 @@ vi.mock('react-i18next', () => ({
 describe('SettingsPage push notification settings', () => {
   beforeEach(() => {
     localStorage.clear();
+    resetPushNotificationPreferencesStateForTesting();
     apiFetchMock.mockReset().mockResolvedValue({
       ok: true,
       types: DEFAULT_PUSH_NOTIFICATION_TYPES,
@@ -259,6 +261,104 @@ describe('SettingsPage push notification settings', () => {
       );
       const lastBody = JSON.parse((postCalls[postCalls.length - 1][1] as { body: string }).body);
       expect(lastBody).toEqual({ enabledServerIds: [] });
+    });
+  });
+
+  it('renders single server checked by default when enabledServerIds is null and persists [] on uncheck', async () => {
+    apiFetchMock.mockImplementation((path: string) => {
+      if (path === '/api/push/preferences') {
+        return Promise.resolve({
+          ok: true,
+          types: DEFAULT_PUSH_NOTIFICATION_TYPES,
+          enabledServerIds: null,
+        });
+      }
+      if (path === '/api/server') {
+        return Promise.resolve({
+          servers: [{ id: 'srv-only', name: 'Sole Node', status: 'online' }],
+        });
+      }
+      if (path === '/api/machines') {
+        return Promise.resolve({ machines: [] });
+      }
+      return Promise.resolve({ ok: true });
+    });
+
+    render(
+      <SettingsPage
+        displayName="Ada Lovelace"
+        username="ada"
+        hasPassword={true}
+        initialTab="notifications"
+        onBack={vi.fn()}
+        onDisplayNameChanged={vi.fn()}
+        onUserAuthUpdated={vi.fn()}
+      />,
+    );
+
+    const soleCb = await screen.findByLabelText('Sole Node') as HTMLInputElement;
+    expect(soleCb.checked).toBe(true);
+
+    // Manually unchecking the sole server sends explicit [] override
+    fireEvent.click(soleCb);
+    expect(soleCb.checked).toBe(false);
+    await waitFor(() => {
+      const postCalls = apiFetchMock.mock.calls.filter(
+        ([path, opts]) => path === '/api/push/preferences' && (opts as { method?: string } | undefined)?.method === 'POST',
+      );
+      expect(postCalls.length).toBe(1);
+      expect(JSON.parse((postCalls[0][1] as { body: string }).body)).toEqual({ enabledServerIds: [] });
+    });
+  });
+
+  it('renders multiple servers all unchecked by default when enabledServerIds is null', async () => {
+    apiFetchMock.mockImplementation((path: string) => {
+      if (path === '/api/push/preferences') {
+        return Promise.resolve({
+          ok: true,
+          types: DEFAULT_PUSH_NOTIFICATION_TYPES,
+          enabledServerIds: null,
+        });
+      }
+      if (path === '/api/server') {
+        return Promise.resolve({
+          servers: [
+            { id: 'srv-1', name: 'Primary', status: 'online' },
+            { id: 'srv-2', name: 'Secondary', status: 'online' },
+          ],
+        });
+      }
+      if (path === '/api/machines') {
+        return Promise.resolve({ machines: [] });
+      }
+      return Promise.resolve({ ok: true });
+    });
+
+    render(
+      <SettingsPage
+        displayName="Ada Lovelace"
+        username="ada"
+        hasPassword={true}
+        initialTab="notifications"
+        onBack={vi.fn()}
+        onDisplayNameChanged={vi.fn()}
+        onUserAuthUpdated={vi.fn()}
+      />,
+    );
+
+    const primaryCb = await screen.findByLabelText('Primary') as HTMLInputElement;
+    const secondaryCb = screen.getByLabelText('Secondary') as HTMLInputElement;
+    expect(primaryCb.checked).toBe(false);
+    expect(secondaryCb.checked).toBe(false);
+
+    fireEvent.click(primaryCb);
+    expect(primaryCb.checked).toBe(true);
+    await waitFor(() => {
+      const postCalls = apiFetchMock.mock.calls.filter(
+        ([path, opts]) => path === '/api/push/preferences' && (opts as { method?: string } | undefined)?.method === 'POST',
+      );
+      expect(postCalls.length).toBe(1);
+      expect(JSON.parse((postCalls[0][1] as { body: string }).body)).toEqual({ enabledServerIds: ['srv-1'] });
     });
   });
 });

@@ -2251,7 +2251,7 @@
     "push_remote_desktop_desc": "Alerta cuando se utilizan credenciales para el desbloqueo automático de escritorio remoto. Alerta de máxima seguridad; se recomienda encarecidamente mantener activada.",
     "push_servers_label": "Servidores permitidos",
     "push_servers_title": "Servidores con notificaciones push",
-    "push_servers_desc": "Todos los servidores están desactivados de forma predeterminada. Solo los servidores marcados enviarán notificaciones push a tus dispositivos.",
+    "push_servers_desc": "Se activa de forma predeterminada cuando solo tienes 1 servidor. Con más de 1 servidor, todos permanecen desactivados hasta que los marques manualmente.",
     "push_servers_select_all": "Seleccionar todo",
     "push_servers_clear": "Limpiar",
     "push_servers_empty": "No se encontraron servidores para esta cuenta.",

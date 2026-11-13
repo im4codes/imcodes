@@ -2251,7 +2251,7 @@
     "push_remote_desktop_desc": "检测到凭据被用于远程桌面自动解锁，属于最高安全告警级别，强烈建议保持开启",
     "push_servers_label": "推送服务器",
     "push_servers_title": "允许推送的服务器",
-    "push_servers_desc": "默认不开启任何服务器的推送通知。只有主动勾选的服务器才会向您的设备发送推送。",
+    "push_servers_desc": "仅有一台服务器时默认开启；超过一台服务器时默认全部关闭，需手动勾选允许推送的服务器。",
     "push_servers_select_all": "全选",
     "push_servers_clear": "清空",
     "push_servers_empty": "当前账号下暂无服务器。",

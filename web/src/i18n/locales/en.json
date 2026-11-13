@@ -2251,7 +2251,7 @@
     "push_remote_desktop_desc": "Alerts when credentials are used for remote desktop auto-unlock. Highest severity alert; strongly recommended to keep enabled.",
     "push_servers_label": "Allowed Servers",
     "push_servers_title": "Push Notification Servers",
-    "push_servers_desc": "All servers are disabled by default. Only checked servers will send push notifications to your devices.",
+    "push_servers_desc": "Enabled by default when you have only 1 server. With more than 1 server, all are disabled by default until manually checked.",
     "push_servers_select_all": "Select All",
     "push_servers_clear": "Clear",
     "push_servers_empty": "No servers found for this account.",

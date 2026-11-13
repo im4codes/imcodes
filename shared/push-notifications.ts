@@ -82,13 +82,13 @@ export const DEFAULT_PUSH_NOTIFICATION_TYPES: readonly PushNotificationType[] = 
   PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP,
 ] as const;
 
-export const DEFAULT_PUSH_ENABLED_SERVER_IDS: readonly string[] = [] as const;
+export const DEFAULT_PUSH_ENABLED_SERVER_IDS: readonly string[] | null = null;
 export const MAX_PUSH_ENABLED_SERVER_IDS = 500;
 export const MAX_PUSH_SERVER_ID_LENGTH = 128;
 
 export interface PushNotificationPreferences {
   types: PushNotificationType[];
-  enabledServerIds: string[];
+  enabledServerIds: string[] | null;
 }
 
 export interface PushNotificationPreferencesResponse extends PushNotificationPreferences {
@@ -113,6 +113,36 @@ export function sanitizePushEnabledServerIds(value: unknown): string[] {
     if (result.length >= MAX_PUSH_ENABLED_SERVER_IDS) break;
   }
   return result;
+}
+
+/**
+ * Resolve the effective allowlist of server IDs permitted to send push notifications.
+ * - Explicit array (`string[]`): returns sanitized allowlist (including `[]` when manually muted).
+ * - Untouched (`null` / `undefined`): auto-enables when there is exactly 1 accessible server;
+ *   when there are 0 or > 1 accessible servers, defaults to disabled (`[]`).
+ */
+export function resolveEffectivePushEnabledServerIds(
+  enabledServerIds: readonly string[] | null | undefined,
+  accessibleServerIds: readonly string[],
+): string[] {
+  if (Array.isArray(enabledServerIds)) {
+    return sanitizePushEnabledServerIds(enabledServerIds);
+  }
+  const sanitizedAccessible = sanitizePushEnabledServerIds(accessibleServerIds);
+  return sanitizedAccessible.length === 1 ? sanitizedAccessible : [];
+}
+
+/**
+ * Determine whether push dispatch is allowed for `targetServerId` given stored
+ * `enabledServerIds` (`null` = auto default) and the user's accessible servers.
+ */
+export function isPushEnabledForServer(
+  enabledServerIds: readonly string[] | null | undefined,
+  targetServerId: string | null | undefined,
+  accessibleServerIds: readonly string[],
+): boolean {
+  if (!targetServerId) return true;
+  return resolveEffectivePushEnabledServerIds(enabledServerIds, accessibleServerIds).includes(targetServerId);
 }
 
 /** Extract the originating serverId from a push payload or its data map. */

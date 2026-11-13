@@ -317,17 +317,33 @@ describe('push enabled servers preferences', () => {
     apiFetchMock.mockReset();
   });
 
-  it('defaults enabled servers to empty array [] when localStorage is empty', async () => {
+  it('defaults enabled servers to null (untouched auto-default) when localStorage is empty', async () => {
     const { getLocalPushEnabledServers } = await import('../src/push-notifications.js');
-    expect(getLocalPushEnabledServers()).toEqual([]);
+    expect(getLocalPushEnabledServers()).toBeNull();
   });
 
-  it('fetches both types and enabledServerIds in fetchPushNotificationSettings without overwriting clean values', async () => {
+  it('fetches both types and enabledServerIds (including null reset) in fetchPushNotificationSettings cleanly', async () => {
     const {
       fetchPushNotificationSettings,
+      setLocalPushEnabledServers,
       getLocalPushEnabledServers,
       getLocalPushNotificationPreferences,
     } = await import('../src/push-notifications.js');
+
+    // Stale local cache gets cleared when server returns null (untouched auto-default)
+    setLocalPushEnabledServers(['stale-srv']);
+    apiFetchMock.mockResolvedValueOnce({
+      ok: true,
+      types: ['task_complete', 'remote_desktop'],
+      enabledServerIds: null,
+    });
+
+    const snapshotNull = await fetchPushNotificationSettings();
+    expect(snapshotNull).toEqual({
+      types: ['task_complete', 'remote_desktop'],
+      enabledServerIds: null,
+    });
+    expect(getLocalPushEnabledServers()).toBeNull();
 
     apiFetchMock.mockResolvedValueOnce({
       ok: true,
@@ -378,7 +394,7 @@ describe('push enabled servers preferences', () => {
     const snapshot = await pending;
     expect(snapshot).toEqual({
       types: ['task_complete'],
-      enabledServerIds: null,
+      enabledServerIds: undefined,
     });
     expect(getLocalPushEnabledServers()).toEqual(['srv-2']);
   });

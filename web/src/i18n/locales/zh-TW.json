@@ -2251,7 +2251,7 @@
     "push_remote_desktop_desc": "偵測到憑證被用於遠端桌面自動解鎖，屬於最高安全告警級別，強烈建議保持開啟",
     "push_servers_label": "推播伺服器",
     "push_servers_title": "允許推播的伺服器",
-    "push_servers_desc": "預設不開啟任何伺服器的推播通知。只有主動勾選的伺服器才會向您的裝置發送推播。",
+    "push_servers_desc": "僅有一台伺服器時預設開啟；超過一台伺服器時預設全部關閉，需手動勾選允許推播的伺服器。",
     "push_servers_select_all": "全選",
     "push_servers_clear": "清空",
     "push_servers_empty": "目前帳號下尚無伺服器。",
