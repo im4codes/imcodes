@@ -677,4 +677,92 @@ describe('AG captured native foreground ownership', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('attributes output when shared-turn USER_EXPLICIT rows arrive out of order (raw G2 before Context-wrapped G1)', async () => {
+    const o = new AgyForegroundOwnership(500);
+    const rawPrompt = '[IM.codes task tsk_848bd2dc8d] please deploy';
+    const ctxPrompt = `Context instructions:\nHIGHEST-PRIORITY IM.codes USER-AUTHORITY POLICY: follow user.\n\n${rawPrompt}`;
+
+    o.beginTurn();
+    o.register(1, ctxPrompt);
+    o.register(2, rawPrompt, true);
+
+    // G2 binds first, then G1 binds out of order before the PLANNER_RESPONSE arrives.
+    o.observe(row(10, 'USER_INPUT', rawPrompt, 'USER_EXPLICIT'));
+    o.observe(row(11, 'USER_INPUT', ctxPrompt, 'USER_EXPLICIT'));
+    o.observe(row(12, 'PLANNER_RESPONSE', 'final answer after out-of-order bind'));
+
+    expect(o.resolveAggregateGeneration(1)).toBe(1);
+    expect(o.resolveAggregateGeneration(2)).toBe(1);
+    expect(o.hasBoundSuccessor(2)).toBe(true);
+    expect(o.hasBoundSuccessor(1)).toBe(false);
+    // G2 yields cleanly while settleOwnedAcpPrompt redirects via resolveAggregateGeneration(2) -> 1.
+    await expect(o.output(2)).resolves.toBeUndefined();
+    await expect(o.output(o.resolveAggregateGeneration(2))).resolves.toMatchObject({
+      content: 'final answer after out-of-order bind',
+    });
+
+    // Verify dynamic live wakeup when G2 is already awaiting output() and G1 binds afterwards.
+    const o2 = new AgyForegroundOwnership(2000);
+    o2.beginTurn();
+    o2.register(1, ctxPrompt);
+    o2.register(2, rawPrompt, true);
+    o2.observe(row(20, 'USER_INPUT', rawPrompt, 'USER_EXPLICIT'));
+
+    const g2Wait = o2.output(2);
+    setTimeout(() => {
+      o2.observe(row(21, 'USER_INPUT', ctxPrompt, 'USER_EXPLICIT'));
+      o2.observe(row(22, 'PLANNER_RESPONSE', 'woken output'));
+    }, 10);
+
+    await expect(g2Wait).resolves.toBeUndefined();
+    expect(o2.hasBoundSuccessor(2)).toBe(true);
+    const target = o2.resolveAggregateGeneration(2);
+    expect(target).toBe(1);
+    await expect(o2.output(target)).resolves.toMatchObject({ content: 'woken output' });
+  });
+
+  it('preserves active lane across bare+wrapped companion USER_EXPLICIT echoes in both orders', async () => {
+    const rawPrompt = '我不要回复 我要部署! 你去延长超时时间';
+    const ctxHeader = 'Context instructions:\nHIGHEST-PRIORITY IM.codes USER-AUTHORITY POLICY: ' + 'x'.repeat(200);
+    const wrappedPrompt = `${ctxHeader}\n\n${rawPrompt}`;
+    const envelopeBare = `<USER_REQUEST>\n${rawPrompt}\n</USER_REQUEST>`;
+    const envelopeWrapped = `<USER_REQUEST>\n${wrappedPrompt}\n</USER_REQUEST>`;
+
+    // Order A: bare echo first (unbound -> matched via companion fallback on G1), then wrapped echo, then duplicate echo.
+    const oA = new AgyForegroundOwnership(500);
+    oA.beginTurn();
+    oA.register(1, wrappedPrompt);
+    oA.observe(row(100, 'USER_INPUT', envelopeBare, 'USER_EXPLICIT'));
+    oA.observe(row(101, 'USER_INPUT', envelopeWrapped, 'USER_EXPLICIT'));
+    oA.observe(row(102, 'USER_INPUT', envelopeBare, 'USER_EXPLICIT'));
+    oA.observe(row(103, 'PLANNER_RESPONSE', 'order A response'));
+    await expect(oA.output(1)).resolves.toMatchObject({ content: 'order A response' });
+
+    // Order B: wrapped binds G1, then bare echo arrives before PLANNER_RESPONSE.
+    const oB = new AgyForegroundOwnership(500);
+    oB.beginTurn();
+    oB.register(1, wrappedPrompt);
+    oB.observe(row(200, 'USER_INPUT', envelopeWrapped, 'USER_EXPLICIT'));
+    oB.observe(row(201, 'USER_INPUT', envelopeBare, 'USER_EXPLICIT'));
+    oB.observe(row(202, 'PLANNER_RESPONSE', 'order B response'));
+    await expect(oB.output(1)).resolves.toMatchObject({ content: 'order B response' });
+  });
+
+  it('still clears active lane and retainedLane on genuinely foreign USER_EXPLICIT even with matching Context instructions header', async () => {
+    const sharedCtx = 'Context instructions:\nHIGHEST-PRIORITY IM.codes USER-AUTHORITY POLICY: ' + 'x'.repeat(200);
+    const ours = `${sharedCtx}\n\nour prompt text`;
+    const foreign = `${sharedCtx}\n\ncompletely different foreign prompt`;
+
+    const o = new AgyForegroundOwnership(40);
+    o.beginTurn();
+    o.register(1, ours);
+    o.observe(row(10, 'USER_INPUT', ours, 'USER_EXPLICIT'));
+    // Unmatched foreign prompt sharing the same Context instructions header preempts the active lane.
+    o.observe(row(11, 'USER_INPUT', foreign, 'USER_EXPLICIT'));
+    o.observe(row(12, 'PLANNER_RESPONSE', 'foreign response'));
+
+    expect(o.settle(1)).toBeUndefined();
+    await expect(o.output(1)).resolves.toBeUndefined();
+  });
 });

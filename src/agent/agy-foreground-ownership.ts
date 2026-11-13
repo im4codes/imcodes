@@ -21,6 +21,7 @@ interface Prompt {
   normText?: string;
   tagCount?: number;
   inputStep?: number;
+  bindSeq?: number;
   output?: AgyTranscriptRow;
   lastResponse?: AgyTranscriptRow;
   settling?: boolean;
@@ -108,6 +109,59 @@ export function isTerminalForegroundRow(row: AgyTranscriptRow | undefined): bool
   return Boolean(row.content?.trim());
 }
 
+const CONTEXT_INSTRUCTIONS_PREFIX = 'Context instructions:';
+const COMPANION_COLLAPSED_MIN_LEN = 12;
+
+function normalizeNewlines(text: string): string {
+  return text.replace(/\r\n/g, '\n').trim();
+}
+
+function hasContextCompanionRelation(aRaw: string, bRaw: string): boolean {
+  const check = (withCtx: string, withoutCtx: string): boolean => {
+    const w = normalizeNewlines(withCtx);
+    const b = normalizeNewlines(withoutCtx);
+    if (!w.startsWith(CONTEXT_INSTRUCTIONS_PREFIX) || !b) return false;
+    if (w.endsWith(`\n\n${b}`)) return true;
+    const wNorm = collapseWhitespace(w);
+    const bNorm = collapseWhitespace(b);
+    return bNorm.length >= COMPANION_COLLAPSED_MIN_LEN && wNorm.endsWith(` ${bNorm}`);
+  };
+  return check(aRaw, bRaw) || check(bRaw, aRaw);
+}
+
+function promptMatchesExplicitContent(
+  prompt: Prompt,
+  content: string,
+  normRaw: string,
+  envelope: ParsedInputEnvelope,
+): boolean {
+  if (!prompt.text) return false;
+  if (content === prompt.text || content.trim() === prompt.text.trim()) return true;
+  if (prompt.normText && normRaw === prompt.normText) return true;
+  if (envelope.kind === 'invalid') return false;
+
+  if (envelope.kind === 'wrapped') {
+    if (envelope.body === prompt.text || envelope.body.trim() === prompt.text.trim()) return true;
+    const normRow = collapseWhitespace(envelope.body);
+    if (!normRow) return false;
+    if (prompt.normText && normRow === prompt.normText) return true;
+    if (hasContextCompanionRelation(prompt.text, envelope.body)) return true;
+    const trimmedBody = envelope.body.trim();
+    if (!TRUNCATION_SUFFIX_RE.test(trimmedBody)) return false;
+    const strippedRow = collapseWhitespace(trimmedBody.replace(TRUNCATION_SUFFIX_RE, ''));
+    return matchesTruncatedEnvelopePrefix(strippedRow, prompt.normText ?? '');
+  }
+
+  if (prompt.tagCount !== 0) return false;
+  if (content.includes(prompt.text)) return true;
+  if (prompt.normText && normRaw.includes(prompt.normText)) return true;
+  if (hasContextCompanionRelation(prompt.text, content)) return true;
+  const trimmedContent = content.trim();
+  if (!TRUNCATION_SUFFIX_RE.test(trimmedContent)) return false;
+  const strippedRow = collapseWhitespace(trimmedContent.replace(TRUNCATION_SUFFIX_RE, ''));
+  return matchesTruncatedPlainPrefix(strippedRow, prompt.normText ?? '');
+}
+
 /** Captured outbound RPC -> explicit native input -> native response. ACP
  * parent text has no turn id, so async owners must not guess from body text. */
 export class AgyForegroundOwnership {
@@ -116,6 +170,9 @@ export class AgyForegroundOwnership {
   private lane?: number;
   private retainedLane?: Prompt;
   private lastBoundGeneration = 0;
+  private bindSeq = 0;
+  private latestBound?: { generation: number; bindSeq: number };
+  private latestBindSeq = 0;
   private turnStartGeneration?: number;
   private continuationWatermark?: AgyTranscriptCursor;
   latest?: { generation: number; row: AgyTranscriptRow };
@@ -123,6 +180,8 @@ export class AgyForegroundOwnership {
 
   beginTurn(): void {
     this.latest = undefined;
+    this.latestBound = undefined;
+    this.latestBindSeq = 0;
     this.retainedLane?.resolve();
     this.retainedLane = undefined;
     this.turnStartGeneration = undefined;
@@ -182,11 +241,32 @@ export class AgyForegroundOwnership {
     return this.prompts.get(generation)?.inputStep !== undefined;
   }
 
+  private currentTurnBoundLeader(): { generation: number; bindSeq: number } | undefined {
+    if (!this.latestBound) return undefined;
+    if (this.turnStartGeneration !== undefined && this.latestBound.generation < this.turnStartGeneration) {
+      return undefined;
+    }
+    return this.latestBound;
+  }
+
   hasBoundSuccessor(generation: number): boolean {
+    const leader = this.currentTurnBoundLeader();
+    if (leader) {
+      if (leader.generation === generation) return false;
+      const prompt = this.prompts.get(generation);
+      if (prompt?.bindSeq !== undefined) {
+        return leader.bindSeq > prompt.bindSeq;
+      }
+      return leader.generation > generation;
+    }
     return this.lastBoundGeneration > generation;
   }
 
   resolveAggregateGeneration(fallbackGeneration: number): number {
+    const leader = this.currentTurnBoundLeader();
+    if (leader && this.prompts.has(leader.generation)) {
+      return leader.generation;
+    }
     if (this.lastBoundGeneration > 0 && this.prompts.has(this.lastBoundGeneration)) {
       return this.lastBoundGeneration;
     }
@@ -210,7 +290,7 @@ export class AgyForegroundOwnership {
     const normRawMatch = unbound.find(p => p.normText !== undefined && p.normText.length > 0 && normRaw === p.normText);
     if (normRawMatch) return normRawMatch;
 
-    // 2. Native outer envelope extraction and prefix fallback.
+    // 2. Native outer envelope extraction and context/prefix fallback.
     const envelope = parseNativeInputEnvelope(content);
     if (envelope.kind === 'invalid') return undefined;
 
@@ -223,6 +303,9 @@ export class AgyForegroundOwnership {
 
       const normFull = unbound.find(p => p.normText !== undefined && p.normText.length > 0 && normRow === p.normText);
       if (normFull) return normFull;
+
+      const companion = unbound.find(p => p.text && hasContextCompanionRelation(p.text, envelope.body));
+      if (companion) return companion;
 
       const trimmedBody = envelope.body.trim();
       if (!TRUNCATION_SUFFIX_RE.test(trimmedBody)) return undefined;
@@ -241,6 +324,9 @@ export class AgyForegroundOwnership {
     const normPlain = plainCandidates.find(p => p.normText !== undefined && p.normText.length > 0 && normRaw.includes(p.normText));
     if (normPlain) return normPlain;
 
+    const companionPlain = plainCandidates.find(p => p.text && hasContextCompanionRelation(p.text, content));
+    if (companionPlain) return companionPlain;
+
     const trimmedContent = content.trim();
     if (!TRUNCATION_SUFFIX_RE.test(trimmedContent)) return undefined;
     const strippedRow = collapseWhitespace(trimmedContent.replace(TRUNCATION_SUFFIX_RE, ''));
@@ -248,10 +334,43 @@ export class AgyForegroundOwnership {
     return selectUnambiguousPrefixMatch(prefixMatches);
   }
 
+  private findBoundCompanionPrompt(content: string | undefined): Prompt | undefined {
+    if (!content) return undefined;
+    const normRaw = collapseWhitespace(content);
+    if (!normRaw) return undefined;
+    const envelope = parseNativeInputEnvelope(content);
+
+    const candidates: Prompt[] = [];
+    const active = this.activeLanePrompt();
+    if (active && active.inputStep !== undefined && !active.output && !active.timedOut && active.text) {
+      candidates.push(active);
+    }
+    for (const p of this.prompts.values()) {
+      if (p !== active && p.inputStep !== undefined && !p.output && !p.timedOut && p.text) {
+        candidates.push(p);
+      }
+    }
+    if (
+      this.retainedLane
+      && !candidates.includes(this.retainedLane)
+      && this.retainedLane.inputStep !== undefined
+      && !this.retainedLane.output
+      && !this.retainedLane.timedOut
+      && this.retainedLane.text
+    ) {
+      candidates.push(this.retainedLane);
+    }
+    if (candidates.length === 0) return undefined;
+    return candidates.find(p => promptMatchesExplicitContent(p, content, normRaw, envelope));
+  }
+
   private getTurnLatest(): { generation: number; row: AgyTranscriptRow } | undefined {
     if (!this.latest) return undefined;
-    const minGen = Math.max(this.turnStartGeneration ?? 0, this.lastBoundGeneration);
-    return this.latest.generation >= minGen ? this.latest : undefined;
+    const turnFloor = this.turnStartGeneration ?? 0;
+    if (this.latest.generation < turnFloor) return undefined;
+    const leader = this.currentTurnBoundLeader();
+    if (leader && this.latest.generation !== leader.generation) return undefined;
+    return this.latest;
   }
 
   private getAdoptableLane(generation: number): Prompt | undefined {
@@ -287,13 +406,19 @@ export class AgyForegroundOwnership {
     return undefined;
   }
 
+  private recordLatest(prompt: Prompt, row: AgyTranscriptRow): void {
+    const seq = prompt.bindSeq ?? 0;
+    if (!this.latest || seq > this.latestBindSeq || (seq === this.latestBindSeq && prompt.generation >= this.latest.generation)) {
+      this.latest = { generation: prompt.generation, row };
+      this.latestBindSeq = seq;
+    }
+  }
+
   private attributeLastResponse(prompt: Prompt): AgyTranscriptRow | undefined {
     prompt.settling = true;
     if (!prompt.output && isTerminalForegroundRow(prompt.lastResponse)) {
       prompt.output = prompt.lastResponse;
-      if (!this.latest || prompt.generation >= this.latest.generation) {
-        this.latest = { generation: prompt.generation, row: prompt.lastResponse! };
-      }
+      this.recordLatest(prompt, prompt.lastResponse!);
       if (this.lane === prompt.generation) this.lane = undefined;
       if (this.retainedLane?.generation === prompt.generation) this.retainedLane = undefined;
       prompt.resolve();
@@ -306,29 +431,40 @@ export class AgyForegroundOwnership {
       // The full native log wraps but retains the exact submitted payload.
       // FIFO unbound requests distinguish repeated identical user messages.
       const prompt = this.findMatchingPrompt(row.content);
-      this.lane = prompt?.generation;
-      if (!prompt && this.retainedLane) {
-        const superseded = this.retainedLane;
-        this.retainedLane = undefined;
-        superseded.resolve();
-      }
-      if (prompt) {
-        prompt.inputStep = row.step_index;
-        prompt.text = undefined;
-        prompt.normText = undefined;
-        prompt.tagCount = undefined;
-        this.lastBoundGeneration = Math.max(this.lastBoundGeneration, prompt.generation);
-        if (this.retainedLane && this.retainedLane.generation < prompt.generation) {
+      if (!prompt) {
+        // Ignore duplicate or Context-instructions companion echoes of the currently
+        // active incomplete bound prompt so they do not wipe the foreground lane.
+        if (this.findBoundCompanionPrompt(row.content)) {
+          return false;
+        }
+        this.lane = undefined;
+        if (this.retainedLane) {
           const superseded = this.retainedLane;
           this.retainedLane = undefined;
           superseded.resolve();
         }
-        // Wake older unresolved waits immediately so they yield to the bound successor
-        // instead of hanging until the failure deadline.
-        for (const existing of this.prompts.values()) {
-          if (existing.generation < prompt.generation && !existing.output) {
-            existing.resolve();
-          }
+        return false;
+      }
+      this.lane = prompt.generation;
+      prompt.inputStep = row.step_index;
+      prompt.bindSeq = ++this.bindSeq;
+      this.latestBound = { generation: prompt.generation, bindSeq: prompt.bindSeq };
+      this.lastBoundGeneration = Math.max(this.lastBoundGeneration, prompt.generation);
+      if (this.retainedLane && this.retainedLane.generation !== prompt.generation) {
+        const superseded = this.retainedLane;
+        this.retainedLane = undefined;
+        superseded.resolve();
+      }
+      // Wake older or same-turn unresolved waits immediately so they yield to the bound
+      // leader instead of hanging until the failure deadline.
+      for (const existing of this.prompts.values()) {
+        if (
+          existing !== prompt
+          && !existing.output
+          && (existing.generation < prompt.generation
+            || (this.turnStartGeneration !== undefined && existing.generation >= this.turnStartGeneration))
+        ) {
+          existing.resolve();
         }
       }
       return false;
@@ -361,9 +497,7 @@ export class AgyForegroundOwnership {
       prompt.lastResponse = row;
       if (!row.tool_calls?.length || (prompt.settling && isTerminalForegroundRow(row))) {
         prompt.output = row;
-        if (!this.latest || prompt.generation >= this.latest.generation) {
-          this.latest = { generation: prompt.generation, row: prompt.output };
-        }
+        this.recordLatest(prompt, prompt.output);
         if (this.lane === prompt.generation) this.lane = undefined;
         if (this.retainedLane?.generation === prompt.generation) this.retainedLane = undefined;
         prompt.resolve();
@@ -469,6 +603,8 @@ export class AgyForegroundOwnership {
     this.lane = undefined;
     this.retainedLane = undefined;
     this.lastBoundGeneration = 0;
+    this.latestBound = undefined;
+    this.latestBindSeq = 0;
     this.turnStartGeneration = undefined;
     this.continuationWatermark = undefined;
     this.latest = undefined;
