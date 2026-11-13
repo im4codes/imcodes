@@ -278,25 +278,32 @@ describe('VoiceInput', () => {
     }
   });
 
-  it('bounds a hung native stop() at NATIVE_FINAL_DRAIN_MS so Pause->Mic and Send recover cleanly', async () => {
+  it('bounds a hung native stop() at NATIVE_FINAL_DRAIN_MS, reports error before resolving, and lets next start recover', async () => {
     vi.useFakeTimers();
     try {
       const hungStop = deferred<void>();
+      let recordedLastErrorAtCallback: string | null = null;
+      const onErr = vi.fn(() => {
+        recordedLastErrorAtCallback = VoiceInput.getLastError();
+      });
       speechApi.stop.mockReturnValueOnce(hungStop.promise).mockResolvedValue(undefined);
 
-      await expect(VoiceInput.startListening(vi.fn())).resolves.toBe(true);
+      await expect(VoiceInput.startListening(vi.fn(), undefined, onErr)).resolves.toBe(true);
       expect(VoiceInput.isListening()).toBe(true);
 
       const stopping = VoiceInput.stopListening();
       expect(VoiceInput.isListening()).toBe(false);
 
-      // Next start queues cleanly behind _pendingStop, unblocking at NATIVE_FINAL_DRAIN_MS
+      // Next start queues behind _pendingStop, unblocking at NATIVE_FINAL_DRAIN_MS
       const resumed = VoiceInput.startListening(vi.fn());
       await vi.advanceTimersByTimeAsync(VoiceInput.NATIVE_FINAL_DRAIN_MS - 1);
       expect(speechApi.start).toHaveBeenCalledTimes(1);
+      expect(onErr).not.toHaveBeenCalled();
 
       await vi.advanceTimersByTimeAsync(1);
       await stopping;
+      expect(onErr).toHaveBeenCalledWith('Speech final drain timed out');
+      expect(recordedLastErrorAtCallback).toBe('Speech final drain timed out');
       await expect(resumed).resolves.toBe(true);
       expect(speechApi.start).toHaveBeenCalledTimes(2);
       expect(VoiceInput.isListening()).toBe(true);
@@ -402,16 +409,19 @@ describe('VoiceInput', () => {
       expect(speechApi.start).toHaveBeenCalledTimes(1);
       listeners.partialResults?.({ matches: ['captured text'], isFinal: true });
 
-      // Even if native stop() rejects, Pause cleanly returns UI to paused state without wedging Mic or Send
+      // If native stop() rejects on Pause, Pause stops capture, preserves draft, shows alert, and recovers cleanly
       speechApi.stop.mockRejectedValueOnce(new Error('native stop transient error'));
       const micBtn = document.querySelector('.voice-overlay-mic') as HTMLElement;
       fireEvent.click(micBtn);
       await vi.advanceTimersByTimeAsync(0);
       expect(VoiceInput.isListening()).toBe(false);
+      expect(document.querySelector('[role="alert"]')?.textContent).toContain('native stop transient error');
+      expect((document.querySelector('.voice-overlay-text') as HTMLTextAreaElement).value).toBe('captured text');
 
-      // Pause then Mic works normally afterward
+      // Pause then Mic clears the error and works normally afterward
       fireEvent.click(micBtn);
       await vi.advanceTimersByTimeAsync(0);
+      expect(document.querySelector('[role="alert"]')).toBeNull();
       expect(speechApi.start).toHaveBeenCalledTimes(2);
       expect(VoiceInput.isListening()).toBe(true);
 
@@ -429,6 +439,143 @@ describe('VoiceInput', () => {
       expect(onClose).toHaveBeenCalledTimes(1);
       view.unmount();
     } finally {
+      cleanup();
+      await VoiceInput.stopListening();
+      await vi.advanceTimersByTimeAsync(0);
+      vi.useRealTimers();
+    }
+  });
+
+  it('VoiceOverlay + VoiceInput: slow native final past NATIVE_FINAL_DRAIN_MS fails explicitly, keeps draft, never sends partial prefix, and recovers cleanly', async () => {
+    vi.useFakeTimers();
+    const drain = deferred<void>();
+    speechApi.stop.mockReturnValueOnce(drain.promise).mockResolvedValue(undefined);
+    const onSend = vi.fn(() => 'accepted' as const);
+    const onClose = vi.fn();
+    try {
+      const { VoiceOverlay } = await import('../../src/components/VoiceOverlay.js');
+      const view = render(h(VoiceOverlay, { open: true, initialText: '', onSend, onClose }));
+      await vi.advanceTimersByTimeAsync(150);
+      expect(speechApi.start).toHaveBeenCalledTimes(1);
+
+      listeners.partialResults?.({ matches: ['recognized prefix'], isFinal: false });
+      await vi.advanceTimersByTimeAsync(0);
+
+      fireEvent.click(document.querySelector('.voice-overlay-send') as HTMLElement);
+      await vi.advanceTimersByTimeAsync(VoiceInput.NATIVE_FINAL_DRAIN_MS + 500);
+
+      expect(onSend).not.toHaveBeenCalled();
+      expect(onClose).not.toHaveBeenCalled();
+      expect(document.querySelector('[role="alert"]')?.textContent).toContain('Speech final drain timed out');
+      expect((document.querySelector('.voice-overlay-text') as HTMLTextAreaElement).value).toBe('recognized prefix');
+      expect(VoiceInput.isListening()).toBe(false);
+
+      // Late native final / ACK after timeout does not auto-send or wipe the preserved draft
+      listeners.partialResults?.({ matches: ['recognized prefix with final tail'], isFinal: true });
+      drain.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(onSend).not.toHaveBeenCalled();
+      expect(onClose).not.toHaveBeenCalled();
+      expect((document.querySelector('.voice-overlay-text') as HTMLTextAreaElement).value).toBe('recognized prefix');
+
+      // Explicit Retry after timeout clears alert and captures remaining speech cleanly
+      fireEvent.click(document.querySelector('.voice-overlay-retry') as HTMLElement);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(speechApi.start).toHaveBeenCalledTimes(2);
+      expect(document.querySelector('[role="alert"]')).toBeNull();
+      listeners.partialResults?.({ matches: ['with final tail'], isFinal: true });
+      fireEvent.click(document.querySelector('.voice-overlay-send') as HTMLElement);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(onSend).toHaveBeenCalledTimes(1);
+      expect(onSend).toHaveBeenCalledWith('recognized prefix with final tail');
+      expect(onClose).toHaveBeenCalledTimes(1);
+      view.unmount();
+    } finally {
+      drain.resolve();
+      cleanup();
+      await VoiceInput.stopListening();
+      await vi.advanceTimersByTimeAsync(0);
+      vi.useRealTimers();
+    }
+  });
+
+  it('VoiceOverlay + VoiceInput: slow final within NATIVE_FINAL_DRAIN_MS sends merged final tail exactly once without alert', async () => {
+    vi.useFakeTimers();
+    const drain = deferred<void>();
+    speechApi.stop.mockReturnValueOnce(drain.promise).mockResolvedValue(undefined);
+    const onSend = vi.fn(() => 'accepted' as const);
+    const onClose = vi.fn();
+    try {
+      const { VoiceOverlay } = await import('../../src/components/VoiceOverlay.js');
+      const view = render(h(VoiceOverlay, { open: true, initialText: '', onSend, onClose }));
+      await vi.advanceTimersByTimeAsync(150);
+
+      listeners.partialResults?.({ matches: ['recognized prefix'], isFinal: false });
+      await vi.advanceTimersByTimeAsync(0);
+      fireEvent.click(document.querySelector('.voice-overlay-send') as HTMLElement);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(onSend).not.toHaveBeenCalled();
+
+      listeners.partialResults?.({ matches: ['recognized prefix with final tail'], isFinal: true });
+      drain.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(document.querySelector('[role="alert"]')).toBeNull();
+      expect(onSend).toHaveBeenCalledTimes(1);
+      expect(onSend).toHaveBeenCalledWith('recognized prefix with final tail');
+      expect(onClose).toHaveBeenCalledTimes(1);
+      view.unmount();
+    } finally {
+      drain.resolve();
+      cleanup();
+      await VoiceInput.stopListening();
+      await vi.advanceTimersByTimeAsync(0);
+      vi.useRealTimers();
+    }
+  });
+
+  it('VoiceOverlay + VoiceInput: queued Pause->Mic resume and notepad review respect drain failure without masking alert or clearing draft', async () => {
+    vi.useFakeTimers();
+    const slowDrain = deferred<void>();
+    speechApi.stop
+      .mockReturnValueOnce(slowDrain.promise)
+      .mockRejectedValueOnce(new Error('review stop failed'))
+      .mockResolvedValue(undefined);
+    const onSend = vi.fn(() => 'accepted' as const);
+    const onClose = vi.fn();
+    try {
+      const { VoiceOverlay } = await import('../../src/components/VoiceOverlay.js');
+      const view = render(h(VoiceOverlay, { open: true, initialText: '', onSend, onClose }));
+      await vi.advanceTimersByTimeAsync(150);
+      expect(speechApi.start).toHaveBeenCalledTimes(1);
+      listeners.partialResults?.({ matches: ['draft text'], isFinal: false });
+
+      // Pause -> Mic while drain is pending; drain times out -> queued resume aborts cleanly without hiding alert
+      const micBtn = document.querySelector('.voice-overlay-mic') as HTMLElement;
+      fireEvent.click(micBtn);
+      await vi.advanceTimersByTimeAsync(200);
+      fireEvent.click(micBtn);
+      await vi.advanceTimersByTimeAsync(VoiceInput.NATIVE_FINAL_DRAIN_MS);
+
+      expect(speechApi.start).toHaveBeenCalledTimes(1);
+      expect(document.querySelector('[role="alert"]')?.textContent).toContain('Speech final drain timed out');
+      expect((document.querySelector('.voice-overlay-text') as HTMLTextAreaElement).value).toBe('draft text');
+
+      // Recover via notepad toggle -> starts session cleanly, then Send/openReview hits stop rejection
+      fireEvent.click(document.querySelector('.voice-notepad-toggle') as HTMLElement);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(speechApi.start).toHaveBeenCalledTimes(2);
+      listeners.partialResults?.({ matches: ['notepad line'], isFinal: true });
+
+      fireEvent.click(document.querySelector('.voice-overlay-send') as HTMLElement);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(document.querySelector('.voice-notepad-review')).toBeNull();
+      expect(onSend).not.toHaveBeenCalled();
+      expect(document.querySelector('[role="alert"]')?.textContent).toContain('review stop failed');
+      expect((document.querySelector('.voice-overlay-text') as HTMLTextAreaElement).value).toContain('notepad line');
+      view.unmount();
+    } finally {
+      slowDrain.resolve();
       cleanup();
       await VoiceInput.stopListening();
       await vi.advanceTimersByTimeAsync(0);
@@ -505,6 +652,110 @@ describe('mobile capture defenses', () => {
     } finally {
       oldStop.resolve();
       await VoiceInput.stopListening();
+    }
+  });
+
+  for (const outcome of ['resolve', 'reject'] as const) {
+    it(`retires a cancelled pending native start on stop deadline (${outcome}) without wedging fresh start or clobbering the new owner`, async () => {
+      vi.useFakeTimers();
+      const startGate = deferred<Record<string, never>>();
+      speechApi.start.mockReturnValueOnce(startGate.promise).mockResolvedValue({});
+      try {
+        const oldErr = vi.fn();
+        const oldStart = VoiceInput.startListening(vi.fn(), undefined, oldErr);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(speechApi.start).toHaveBeenCalledTimes(1);
+
+        const stopped = VoiceInput.stopListening();
+        await vi.advanceTimersByTimeAsync(VoiceInput.NATIVE_FINAL_DRAIN_MS + 100);
+        await stopped;
+
+        const newResult = vi.fn();
+        const newErr = vi.fn();
+        const resumed = VoiceInput.startListening(newResult, undefined, newErr);
+        await expect(resumed).resolves.toBe(true);
+        expect(speechApi.start).toHaveBeenCalledTimes(2);
+        expect(VoiceInput.isListening()).toBe(true);
+        const stopCountBeforeLateSettle = speechApi.stop.mock.calls.length;
+
+        // Late settle of cancelled startGate must NOT stop, silence, remove listeners, or report error on new owner
+        if (outcome === 'resolve') startGate.resolve({});
+        else startGate.reject(new Error('late stale start failure'));
+        await expect(oldStart).resolves.toBe(false);
+
+        expect(speechApi.stop).toHaveBeenCalledTimes(stopCountBeforeLateSettle);
+        expect(VoiceInput.isListening()).toBe(true);
+        expect(newErr).not.toHaveBeenCalled();
+
+        listeners.partialResults?.({ matches: ['new owner live speech'], isFinal: false });
+        expect(newResult).toHaveBeenCalledWith('new owner live speech', false);
+      } finally {
+        startGate.resolve({});
+        await vi.advanceTimersByTimeAsync(0);
+        await VoiceInput.stopListening();
+        await vi.advanceTimersByTimeAsync(0);
+        vi.useRealTimers();
+      }
+    });
+  }
+
+  it('retires pending permission/available checks on stop deadline and lets Stop->Mic->Stop cancel a queued resume', async () => {
+    vi.useFakeTimers();
+    const permGate = deferred<{ speechRecognition: string }>();
+    const availGate = deferred<{ available: boolean }>();
+    speechApi.requestPermissions
+      .mockReturnValueOnce(permGate.promise)
+      .mockResolvedValue({ speechRecognition: 'granted' });
+    try {
+      // Hung requestPermissions retired on stop timeout -> next start succeeds, late perm grant cannot spawn session 1
+      const pStart = VoiceInput.startListening(vi.fn());
+      const pStop = VoiceInput.stopListening();
+      await vi.advanceTimersByTimeAsync(VoiceInput.NATIVE_FINAL_DRAIN_MS + 50);
+      await pStop;
+
+      await expect(VoiceInput.startListening(vi.fn())).resolves.toBe(true);
+      expect(speechApi.start).toHaveBeenCalledTimes(1);
+      permGate.resolve({ speechRecognition: 'granted' });
+      await expect(pStart).resolves.toBe(false);
+      expect(speechApi.start).toHaveBeenCalledTimes(1);
+      expect(VoiceInput.isListening()).toBe(true);
+
+      // Stop -> Mic (queued during hung stop) -> Stop (before timeout) cancels queued Mic cleanly
+      const hungStop = deferred<void>();
+      speechApi.stop.mockReturnValueOnce(hungStop.promise).mockResolvedValue(undefined);
+      const stop1 = VoiceInput.stopListening();
+      const queuedMic = VoiceInput.startListening(vi.fn());
+      const stop2 = VoiceInput.stopListening();
+      await vi.advanceTimersByTimeAsync(VoiceInput.NATIVE_FINAL_DRAIN_MS + 50);
+
+      await expect(queuedMic).resolves.toBe(false);
+      await stop1;
+      await stop2;
+      expect(speechApi.start).toHaveBeenCalledTimes(1);
+      expect(VoiceInput.isListening()).toBe(false);
+
+      // Hung available() check retired on stop timeout -> fresh start succeeds, late available cannot spawn stale session
+      speechApi.available
+        .mockReturnValueOnce(availGate.promise)
+        .mockResolvedValue({ available: true });
+      const availStart = VoiceInput.startListening(vi.fn());
+      await vi.advanceTimersByTimeAsync(0);
+      const availStop = VoiceInput.stopListening();
+      await vi.advanceTimersByTimeAsync(VoiceInput.NATIVE_FINAL_DRAIN_MS + 50);
+      await availStop;
+
+      await expect(VoiceInput.startListening(vi.fn())).resolves.toBe(true);
+      expect(speechApi.start).toHaveBeenCalledTimes(2);
+      availGate.resolve({ available: true });
+      await expect(availStart).resolves.toBe(false);
+      expect(speechApi.start).toHaveBeenCalledTimes(2);
+      expect(VoiceInput.isListening()).toBe(true);
+    } finally {
+      permGate.resolve({ speechRecognition: 'granted' });
+      availGate.resolve({ available: true });
+      await VoiceInput.stopListening();
+      await vi.advanceTimersByTimeAsync(0);
+      vi.useRealTimers();
     }
   });
 });
