@@ -18144,6 +18144,9 @@ button.quick-agent-delegation-preset.active {
   display: flex;
   align-items: center;
   gap: 11px;
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
   padding: 9px 10px;
   border-radius: 10px;
   border: 1px solid #1e293b;
@@ -18417,9 +18420,13 @@ button.quick-agent-delegation-preset.active {
   color: #60a5fa;
 }
 
+.cloud-docs-panel {
+  --cloud-docs-list-cols: minmax(0, 1.85fr) minmax(0, 1.15fr) minmax(90px, 0.75fr) 104px;
+}
+
 .cloud-docs-list-head {
   display: grid;
-  grid-template-columns: minmax(0, 1.7fr) minmax(0, 1fr) auto;
+  grid-template-columns: var(--cloud-docs-list-cols);
   align-items: center;
   gap: 12px;
   padding: 2px 12px 7px;
@@ -18429,25 +18436,39 @@ button.quick-agent-delegation-preset.active {
   color: #64748b;
   text-transform: uppercase;
   letter-spacing: 0.04em;
+  box-sizing: border-box;
+}
+
+.cloud-docs-list-head > span {
+  min-width: 0;
+}
+
+.cloud-docs-list-head > span:last-child {
+  text-align: right;
 }
 
 .cloud-docs-list {
   display: flex;
   flex-direction: column;
   gap: 5px;
+  min-width: 0;
 }
 
 .cloud-docs-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
   gap: 10px;
+  min-width: 0;
 }
 
 .cloud-docs-row {
-  display: flex;
+  display: grid;
+  grid-template-columns: var(--cloud-docs-list-cols);
   align-items: center;
-  justify-content: space-between;
   gap: 12px;
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
   padding: 9px 12px;
   border-radius: 10px;
   border: 1px solid rgba(30, 41, 59, 0.8);
@@ -18462,10 +18483,12 @@ button.quick-agent-delegation-preset.active {
 }
 
 .cloud-docs-row.is-card {
+  display: flex;
   flex-direction: column;
   align-items: stretch;
+  justify-content: space-between;
   padding: 12px;
-  gap: 10px;
+  gap: 8px;
   background: #10182b;
 }
 
@@ -18478,7 +18501,10 @@ button.quick-agent-delegation-preset.active {
   align-items: center;
   gap: 10px;
   flex: 1 1 auto;
+  width: 100%;
   min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
   border: none;
   background: transparent;
   color: inherit;
@@ -18506,6 +18532,8 @@ button.quick-agent-delegation-preset.active {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
   gap: 3px;
   flex: 1 1 auto;
 }
@@ -18514,16 +18542,22 @@ button.quick-agent-delegation-preset.active {
   font-size: 13px;
   font-weight: 500;
   color: #f1f5f9;
+  min-width: 0;
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.cloud-docs-row-col,
 .cloud-docs-row-sub {
   display: flex;
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
   font-size: 11.5px;
   color: #94a3b8;
 }
@@ -18582,6 +18616,7 @@ button.quick-agent-delegation-preset.active {
 .cloud-docs-row-actions {
   display: inline-flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 4px;
   flex-shrink: 0;
   position: relative;
@@ -18843,7 +18878,7 @@ button.quick-agent-delegation-preset.active {
   }
 
   .cloud-docs-gallery-strip {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .cloud-docs-list-head {
@@ -18851,17 +18886,19 @@ button.quick-agent-delegation-preset.active {
   }
 
   .cloud-docs-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .cloud-docs-row {
-    align-items: flex-start;
+    display: flex;
+    align-items: stretch;
     flex-direction: column;
     gap: 8px;
   }
 
   .cloud-docs-row-actions {
     align-self: flex-end;
+    justify-content: flex-end;
   }
 
   .cloud-docs-preview-header {

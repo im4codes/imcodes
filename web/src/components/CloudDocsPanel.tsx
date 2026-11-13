@@ -323,7 +323,7 @@ function TemplateThumbnail({ type }: { type: CloudDocBlankType }) {
   );
 }
 
-function buildUniqueAutoDocName(
+export function buildUniqueAutoDocName(
   type: CloudDocBlankType,
   existingDocs: readonly CloudDocItem[],
   folderId: string | null,
@@ -340,13 +340,14 @@ function buildUniqueAutoDocName(
   if (!existing.has(firstCandidate.toLowerCase())) {
     return firstCandidate;
   }
-  for (let idx = 2; idx < 1000; idx += 1) {
+  const maxAttempt = existing.size + 2;
+  for (let idx = 2; idx <= maxAttempt; idx += 1) {
     const candidate = normalizeCloudDocName(`${cleanBase} ${idx}${ext}`, ext);
     if (candidate && !existing.has(candidate.toLowerCase())) {
       return candidate;
     }
   }
-  return firstCandidate;
+  return normalizeCloudDocName(`${cleanBase} ${maxAttempt + 1}${ext}`, ext) ?? firstCandidate;
 }
 
 function formatBytes(bytes: number): string {
@@ -423,12 +424,31 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
   const mountedRef = useRef(true);
   const loadSeqRef = useRef(0);
   const loadAbortRef = useRef<AbortController | null>(null);
+  const docsHydratedRef = useRef(false);
+  const authoritativeDocsRef = useRef<CloudDocItem[]>([]);
+  const activeLoadPromiseRef = useRef<Promise<CloudDocItem[] | null> | null>(null);
   const shareSeqRef = useRef(0);
   const shareAbortRef = useRef<AbortController | null>(null);
   const shareTargetRef = useRef<{ kind: CloudDocShareTargetKind; id: string; name: string } | null>(null);
   const previewTitleCancelledRef = useRef(false);
-  const previewTitleSavingRef = useRef(false);
   const savedStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const activePreviewRef = useRef<{ docId: string | null; previewSeq: number; editGen: number }>({
+    docId: null,
+    previewSeq: 0,
+    editGen: 0,
+  });
+  type TitleSaveIntent = {
+    name: string;
+    fallbackMime: string;
+    previewSeq: number;
+    editGen: number;
+  };
+  type TitleSaveQueueEntry = {
+    inFlight: boolean;
+    lastQueuedName: string;
+    pending: TitleSaveIntent | null;
+  };
+  const titleSaveQueueRef = useRef<Map<string, TitleSaveQueueEntry>>(new Map());
 
   useEffect(() => {
     mountedRef.current = true;
@@ -444,23 +464,29 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
   }, []);
 
   const openPreview = useCallback((target: PreviewTarget | null) => {
-    setPreviewTarget(target);
+    if (savedStatusTimerRef.current) {
+      clearTimeout(savedStatusTimerRef.current);
+      savedStatusTimerRef.current = null;
+    }
+    activePreviewRef.current = {
+      docId: target?.kind === 'cloud_doc' ? target.id : null,
+      previewSeq: activePreviewRef.current.previewSeq + 1,
+      editGen: activePreviewRef.current.editGen + 1,
+    };
     previewTitleCancelledRef.current = false;
-    setPreviewTitleStatus('idle');
-    setPreviewTitleDraft(
-      !target ? '' : target.kind === 'cloud_doc' ? target.name : target.title,
-    );
-  }, []);
-
-  useEffect(() => {
-    if (!previewTarget) {
+    setPreviewTarget(target);
+    if (!target) {
       setPreviewTitleDraft('');
       setPreviewTitleStatus('idle');
-      return;
+    } else if (target.kind === 'cloud_doc') {
+      const q = titleSaveQueueRef.current.get(target.id);
+      setPreviewTitleDraft(q?.pending?.name ?? target.name);
+      setPreviewTitleStatus(q?.inFlight || q?.pending ? 'saving' : 'idle');
+    } else {
+      setPreviewTitleDraft(target.title);
+      setPreviewTitleStatus('idle');
     }
-    setPreviewTitleDraft(previewTarget.kind === 'cloud_doc' ? previewTarget.name : previewTarget.title);
-    setPreviewTitleStatus('idle');
-  }, [previewTarget?.kind, previewTarget?.kind === 'cloud_doc' ? previewTarget.id : '', previewTarget?.kind === 'cloud_doc' ? previewTarget.name : previewTarget?.title]);
+  }, []);
 
   // Close open overflow menu or share dialog cleanly on outside click / Escape.
   useEffect(() => {
@@ -485,7 +511,7 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
     };
   }, [openMenu, shareTarget]);
 
-  const refreshData = useCallback(async () => {
+  const refreshData = useCallback((): Promise<CloudDocItem[] | null> => {
     const seq = ++loadSeqRef.current;
     loadAbortRef.current?.abort();
     const controller = new AbortController();
@@ -493,32 +519,43 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
 
     setLoading(true);
     setError(null);
-    try {
-      const [cloudRes, recentRes, teamsRes] = await Promise.all([
-        listCloudDocsApi({ allFolders: true, signal: controller.signal }),
-        listRecentDocumentsApi({ signal: controller.signal }),
-        listCloudDocTeamsApi(controller.signal).catch(() => ({ teams: [] as CloudDocTeamOption[] })),
-      ]);
-      if (!mountedRef.current || controller.signal.aborted || seq !== loadSeqRef.current) return;
-      setFolders(cloudRes.folders);
-      setDocs(cloudRes.docs);
-      setSharedFolders(cloudRes.sharedFolders ?? []);
-      setSharedDocs(cloudRes.sharedDocs ?? []);
-      setRecentItems(recentRes.items);
-      setTeams(teamsRes.teams);
-      if (teamsRes.teams.length > 0) {
-        setShareTeamId((prev) => (prev && teamsRes.teams.some((tm) => tm.id === prev) ? prev : teamsRes.teams[0]!.id));
+    const promise = (async (): Promise<CloudDocItem[] | null> => {
+      try {
+        const [cloudRes, recentRes, teamsRes] = await Promise.all([
+          listCloudDocsApi({ allFolders: true, signal: controller.signal }),
+          listRecentDocumentsApi({ signal: controller.signal }),
+          listCloudDocTeamsApi(controller.signal).catch(() => ({ teams: [] as CloudDocTeamOption[] })),
+        ]);
+        if (!mountedRef.current || controller.signal.aborted || seq !== loadSeqRef.current) return null;
+        docsHydratedRef.current = true;
+        authoritativeDocsRef.current = cloudRes.docs;
+        setFolders(cloudRes.folders);
+        setDocs(cloudRes.docs);
+        setSharedFolders(cloudRes.sharedFolders ?? []);
+        setSharedDocs(cloudRes.sharedDocs ?? []);
+        setRecentItems(recentRes.items);
+        setTeams(teamsRes.teams);
+        if (teamsRes.teams.length > 0) {
+          setShareTeamId((prev) => (prev && teamsRes.teams.some((tm) => tm.id === prev) ? prev : teamsRes.teams[0]!.id));
+        }
+        return cloudRes.docs;
+      } catch (err: unknown) {
+        if (!mountedRef.current || controller.signal.aborted || seq !== loadSeqRef.current) return null;
+        if (err instanceof DOMException && err.name === 'AbortError') return null;
+        const msg = err instanceof ApiError ? err.message : (err instanceof Error ? err.message : String(err));
+        setError(msg || tRef.current('cloud_docs.errors.load_failed', 'Failed to load documents'));
+        return null;
+      } finally {
+        if (mountedRef.current && seq === loadSeqRef.current) {
+          setLoading(false);
+        }
+        if (seq === loadSeqRef.current) {
+          activeLoadPromiseRef.current = null;
+        }
       }
-    } catch (err: unknown) {
-      if (!mountedRef.current || controller.signal.aborted || seq !== loadSeqRef.current) return;
-      if (err instanceof DOMException && err.name === 'AbortError') return;
-      const msg = err instanceof ApiError ? err.message : (err instanceof Error ? err.message : String(err));
-      setError(msg || tRef.current('cloud_docs.errors.load_failed', 'Failed to load documents'));
-    } finally {
-      if (mountedRef.current && seq === loadSeqRef.current) {
-        setLoading(false);
-      }
-    }
+    })();
+    activeLoadPromiseRef.current = promise;
+    return promise;
   }, []);
 
   useEffect(() => {
@@ -671,8 +708,16 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
       : type === 'pptx'
         ? t('cloud_docs.untitled_name.pptx', 'Untitled presentation')
         : t('cloud_docs.untitled_name.docx', 'Untitled document');
-    const uniqueName = buildUniqueAutoDocName(type, docs, targetFolderId, baseTitle);
     try {
+      let currentDocs = authoritativeDocsRef.current;
+      if (!docsHydratedRef.current) {
+        const hydrated = activeLoadPromiseRef.current
+          ? await activeLoadPromiseRef.current
+          : await refreshData();
+        if (!mountedRef.current || hydrated === null) return;
+        currentDocs = hydrated;
+      }
+      const uniqueName = buildUniqueAutoDocName(type, currentDocs, targetFolderId, baseTitle);
       const res = await createBlankCloudDocApi({
         type,
         name: uniqueName,
@@ -765,10 +810,9 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
     }
   };
 
-  const commitPreviewTitleRename = async () => {
+  const commitPreviewTitleRename = async (explicitRaw?: string) => {
     if (!previewTarget || previewTarget.kind !== 'cloud_doc' || previewTarget.readOnly || !previewTarget.isOwner) return;
-    if (previewTitleSavingRef.current) return;
-    const raw = previewTitleDraft.trim();
+    const raw = (explicitRaw ?? previewTitleDraft).trim();
     if (!raw) {
       setPreviewTitleDraft(previewTarget.name);
       return;
@@ -779,39 +823,105 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
       setPreviewTitleDraft(previewTarget.name);
       return;
     }
-    if (nextName === previewTarget.name) {
-      setPreviewTitleDraft(previewTarget.name);
+
+    const docId = previewTarget.id;
+    const existingEntry = titleSaveQueueRef.current.get(docId);
+    const currentEffectiveName = existingEntry && (existingEntry.inFlight || existingEntry.pending)
+      ? existingEntry.lastQueuedName
+      : previewTarget.name;
+    if (nextName === currentEffectiveName) {
+      if (!existingEntry?.inFlight && !existingEntry?.pending) {
+        setPreviewTitleDraft(previewTarget.name);
+      }
       return;
     }
 
-    const docId = previewTarget.id;
-    previewTitleSavingRef.current = true;
+    const intent: TitleSaveIntent = {
+      name: nextName,
+      fallbackMime: previewTarget.mimeType,
+      previewSeq: activePreviewRef.current.previewSeq,
+      editGen: activePreviewRef.current.editGen,
+    };
+
+    const entry: TitleSaveQueueEntry = existingEntry ?? {
+      inFlight: false,
+      lastQueuedName: nextName,
+      pending: null,
+    };
+    entry.lastQueuedName = nextName;
+    entry.pending = intent;
+    titleSaveQueueRef.current.set(docId, entry);
+
+    if (savedStatusTimerRef.current) {
+      clearTimeout(savedStatusTimerRef.current);
+      savedStatusTimerRef.current = null;
+    }
     setPreviewTitleStatus('saving');
     setError(null);
+
+    if (entry.inFlight) return;
+    entry.inFlight = true;
+
     try {
-      const res = await updateCloudDocApi(docId, { name: nextName });
-      if (!mountedRef.current) return;
-      const finalName = res?.doc?.name || nextName;
-      const finalMime = res?.doc?.mimeType || previewTarget.mimeType;
-      setPreviewTarget((prev) => (
-        prev && prev.kind === 'cloud_doc' && prev.id === docId
-          ? { ...prev, name: finalName, mimeType: finalMime }
-          : prev
-      ));
-      setDocs((prev) => prev.map((d) => (d.id === docId ? { ...d, name: finalName, mimeType: finalMime } : d)));
-      setPreviewTitleDraft(finalName);
-      setPreviewTitleStatus('saved');
-      if (savedStatusTimerRef.current) clearTimeout(savedStatusTimerRef.current);
-      savedStatusTimerRef.current = setTimeout(() => {
-        if (mountedRef.current) setPreviewTitleStatus('idle');
-      }, 1800);
+      while (entry.pending) {
+        const currentIntent = entry.pending;
+        entry.pending = null;
+        if (mountedRef.current && activePreviewRef.current.previewSeq === currentIntent.previewSeq) {
+          setPreviewTitleStatus('saving');
+        }
+        const res = await updateCloudDocApi(docId, { name: currentIntent.name });
+        if (!mountedRef.current) return;
+        const finalName = res?.doc?.name || currentIntent.name;
+        const finalMime = res?.doc?.mimeType || currentIntent.fallbackMime;
+
+        authoritativeDocsRef.current = authoritativeDocsRef.current.map((d) =>
+          d.id === docId ? { ...d, name: finalName, mimeType: finalMime } : d,
+        );
+        setDocs((prev) => prev.map((d) => (d.id === docId ? { ...d, name: finalName, mimeType: finalMime } : d)));
+        setRecentItems((prev) => prev.map((r) => (
+          r.cloudDocId === docId ? { ...r, title: finalName, mimeType: finalMime } : r
+        )));
+        setPreviewTarget((prev) => (
+          prev && prev.kind === 'cloud_doc' && prev.id === docId
+            ? { ...prev, name: finalName, mimeType: finalMime }
+            : prev
+        ));
+
+        const samePreview = activePreviewRef.current.previewSeq === currentIntent.previewSeq;
+        const hasMorePending = entry.pending !== null;
+        const sameEditGen = activePreviewRef.current.editGen === currentIntent.editGen;
+        if (samePreview && !hasMorePending && sameEditGen) {
+          setPreviewTitleDraft(finalName);
+          setPreviewTitleStatus('saved');
+          if (savedStatusTimerRef.current) clearTimeout(savedStatusTimerRef.current);
+          const timerPreviewSeq = currentIntent.previewSeq;
+          const timerEditGen = currentIntent.editGen;
+          savedStatusTimerRef.current = setTimeout(() => {
+            if (
+              mountedRef.current
+              && activePreviewRef.current.previewSeq === timerPreviewSeq
+              && activePreviewRef.current.editGen === timerEditGen
+            ) {
+              setPreviewTitleStatus('idle');
+            }
+          }, 1800);
+        } else if (samePreview && !hasMorePending && !sameEditGen) {
+          setPreviewTitleStatus('idle');
+        }
+      }
     } catch (err: unknown) {
+      entry.pending = null;
+      entry.lastQueuedName = '';
       if (!mountedRef.current) return;
-      setPreviewTitleStatus('idle');
-      setPreviewTitleDraft(previewTarget.name);
-      setError(err instanceof Error ? err.message : String(err));
+      if (activePreviewRef.current.docId === docId) {
+        setPreviewTitleStatus('idle');
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
-      previewTitleSavingRef.current = false;
+      entry.inFlight = false;
+      if (!entry.pending) {
+        titleSaveQueueRef.current.delete(docId);
+      }
     }
   };
 
@@ -1213,7 +1323,7 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
             class="cloud-docs-btn"
             data-testid="cloud-docs-preview-back"
             onClick={() => {
-              setPreviewTarget(null);
+              openPreview(null);
               void refreshData();
             }}
           >
@@ -1229,25 +1339,45 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
                 data-testid="cloud-docs-preview-title-input"
                 aria-label={t('cloud_docs.preview.rename_aria', 'Document title')}
                 value={previewTitleDraft}
-                onInput={(e) => setPreviewTitleDraft((e.currentTarget as HTMLInputElement).value)}
+                onFocus={() => {
+                  previewTitleCancelledRef.current = false;
+                }}
+                onInput={(e) => {
+                  const val = (e.currentTarget as HTMLInputElement).value;
+                  previewTitleCancelledRef.current = false;
+                  activePreviewRef.current.editGen += 1;
+                  if (savedStatusTimerRef.current) {
+                    clearTimeout(savedStatusTimerRef.current);
+                    savedStatusTimerRef.current = null;
+                  }
+                  setPreviewTitleDraft(val);
+                  setPreviewTitleStatus((prev) => (prev === 'saved' ? 'idle' : prev));
+                }}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') {
                     e.preventDefault();
-                    void commitPreviewTitleRename();
+                    const val = (e.currentTarget as HTMLInputElement).value;
+                    void commitPreviewTitleRename(val);
                     (e.currentTarget as HTMLInputElement).blur();
                   } else if (e.key === 'Escape') {
                     e.preventDefault();
                     previewTitleCancelledRef.current = true;
+                    activePreviewRef.current.editGen += 1;
+                    if (savedStatusTimerRef.current) {
+                      clearTimeout(savedStatusTimerRef.current);
+                      savedStatusTimerRef.current = null;
+                    }
                     setPreviewTitleDraft(previewTarget.name);
+                    setPreviewTitleStatus('idle');
                     (e.currentTarget as HTMLInputElement).blur();
                   }
                 }}
-                onBlur={() => {
+                onBlur={(e) => {
                   if (previewTitleCancelledRef.current) {
                     previewTitleCancelledRef.current = false;
                     return;
                   }
-                  void commitPreviewTitleRename();
+                  void commitPreviewTitleRename((e.currentTarget as HTMLInputElement).value);
                 }}
               />
               <span class="cloud-docs-preview-edit-hint" aria-hidden="true"><PencilIcon /></span>
@@ -1735,28 +1865,30 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
                   >
                     <span class="cloud-docs-row-icon"><DocKindIcon name={item.title} size={viewMode === 'grid' ? 28 : 22} /></span>
                     <div class="cloud-docs-row-meta">
-                      <div class="cloud-docs-row-title">{item.title}</div>
-                      <div class="cloud-docs-row-sub">
-                        <span class={`cloud-docs-badge ${item.sourceKind === 'cloud_doc' ? 'is-cloud' : 'is-server'}`}>
-                          {item.sourceKind === 'cloud_doc'
-                            ? t('cloud_docs.source.cloud_doc', 'Cloud Doc')
-                            : (item.serverName || item.serverId || t('cloud_docs.source.server_file', 'Server'))}
-                        </span>
-                        {item.filePath && <span class="cloud-docs-path">{item.filePath}</span>}
-                        {!item.accessible && (
-                          <span class="cloud-docs-badge is-warn">
-                            {t('cloud_docs.badges.no_access', 'Unavailable')}
-                          </span>
-                        )}
-                        {item.accessible && item.sourceKind === 'server_file' && !item.serverOnline && (
-                          <span class="cloud-docs-badge is-muted">
-                            {t('cloud_docs.badges.server_offline', 'Offline')}
-                          </span>
-                        )}
-                        <span class="cloud-docs-time">{formatTime(item.lastOpenedAt)}</span>
-                      </div>
+                      <div class="cloud-docs-row-title" title={item.title}>{item.title}</div>
                     </div>
                   </button>
+                  <div class="cloud-docs-row-col is-details">
+                    <span class={`cloud-docs-badge ${item.sourceKind === 'cloud_doc' ? 'is-cloud' : 'is-server'}`}>
+                      {item.sourceKind === 'cloud_doc'
+                        ? t('cloud_docs.source.cloud_doc', 'Cloud Doc')
+                        : (item.serverName || item.serverId || t('cloud_docs.source.server_file', 'Server'))}
+                    </span>
+                    {item.filePath && <span class="cloud-docs-path" title={item.filePath}>{item.filePath}</span>}
+                    {!item.accessible && (
+                      <span class="cloud-docs-badge is-warn">
+                        {t('cloud_docs.badges.no_access', 'Unavailable')}
+                      </span>
+                    )}
+                    {item.accessible && item.sourceKind === 'server_file' && !item.serverOnline && (
+                      <span class="cloud-docs-badge is-muted">
+                        {t('cloud_docs.badges.server_offline', 'Offline')}
+                      </span>
+                    )}
+                  </div>
+                  <div class="cloud-docs-row-col is-metric">
+                    <span class="cloud-docs-time">{formatTime(item.lastOpenedAt)}</span>
+                  </div>
                   <div class="cloud-docs-row-actions">
                     <button
                       type="button"
@@ -1828,23 +1960,27 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
                     >
                       <span class="cloud-docs-row-icon"><FolderSvgIcon shared size={viewMode === 'grid' ? 28 : 22} /></span>
                       <div class="cloud-docs-row-meta">
-                        <div class="cloud-docs-row-title">{folder.name}</div>
-                        <div class="cloud-docs-row-sub">
-                          <span class="cloud-docs-badge is-cloud">
-                            {folder.role === 'editor'
-                              ? t('cloud_docs.share.role_editor', 'Editor')
-                              : t('cloud_docs.share.role_viewer', 'Viewer')}
-                          </span>
-                          <span>{folder.ownerName}</span>
-                          {folder.sharedTeamName && (
-                            <span class="cloud-docs-team-chip">
-                              <PrincipalIcon mode="team" />
-                              <span>{folder.sharedTeamName}</span>
-                            </span>
-                          )}
-                        </div>
+                        <div class="cloud-docs-row-title" title={folder.name}>{folder.name}</div>
                       </div>
                     </button>
+                    <div class="cloud-docs-row-col is-details">
+                      <span class="cloud-docs-badge is-cloud">
+                        {folder.role === 'editor'
+                          ? t('cloud_docs.share.role_editor', 'Editor')
+                          : t('cloud_docs.share.role_viewer', 'Viewer')}
+                      </span>
+                      <span>{folder.ownerName}</span>
+                      {folder.sharedTeamName && (
+                        <span class="cloud-docs-team-chip">
+                          <PrincipalIcon mode="team" />
+                          <span>{folder.sharedTeamName}</span>
+                        </span>
+                      )}
+                    </div>
+                    <div class="cloud-docs-row-col is-metric">
+                      <span class="cloud-docs-time">{t('cloud_docs.folder_label', 'Folder')}</span>
+                    </div>
+                    <div class="cloud-docs-row-actions" />
                   </div>
                 ))}
                 {visibleSharedDocs.map((doc) => (
@@ -1860,24 +1996,26 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
                     >
                       <span class="cloud-docs-row-icon"><DocKindIcon name={doc.name} size={viewMode === 'grid' ? 28 : 22} /></span>
                       <div class="cloud-docs-row-meta">
-                        <div class="cloud-docs-row-title">{doc.name}</div>
-                        <div class="cloud-docs-row-sub">
-                          <span class="cloud-docs-badge is-cloud">
-                            {doc.role === 'editor'
-                              ? t('cloud_docs.share.role_editor', 'Editor')
-                              : t('cloud_docs.share.role_viewer', 'Viewer')}
-                          </span>
-                          <span>{doc.ownerName}</span>
-                          {doc.sharedTeamName && (
-                            <span class="cloud-docs-team-chip">
-                              <PrincipalIcon mode="team" />
-                              <span>{doc.sharedTeamName}</span>
-                            </span>
-                          )}
-                          <span>{formatBytes(doc.sizeBytes)}</span>
-                        </div>
+                        <div class="cloud-docs-row-title" title={doc.name}>{doc.name}</div>
                       </div>
                     </button>
+                    <div class="cloud-docs-row-col is-details">
+                      <span class="cloud-docs-badge is-cloud">
+                        {doc.role === 'editor'
+                          ? t('cloud_docs.share.role_editor', 'Editor')
+                          : t('cloud_docs.share.role_viewer', 'Viewer')}
+                      </span>
+                      <span>{doc.ownerName}</span>
+                      {doc.sharedTeamName && (
+                        <span class="cloud-docs-team-chip">
+                          <PrincipalIcon mode="team" />
+                          <span>{doc.sharedTeamName}</span>
+                        </span>
+                      )}
+                    </div>
+                    <div class="cloud-docs-row-col is-metric">
+                      <span>{formatBytes(doc.sizeBytes)}</span>
+                    </div>
                     <div class="cloud-docs-row-actions">
                       {doc.allowDownload && (
                         <button
@@ -1927,12 +2065,15 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
                   >
                     <span class="cloud-docs-row-icon"><FolderSvgIcon size={viewMode === 'grid' ? 28 : 22} /></span>
                     <div class="cloud-docs-row-meta">
-                      <div class="cloud-docs-row-title">{folder.name}</div>
-                      <div class="cloud-docs-row-sub">
-                        <span>{t('cloud_docs.folder_label', 'Folder')}</span>
-                      </div>
+                      <div class="cloud-docs-row-title" title={folder.name}>{folder.name}</div>
                     </div>
                   </button>
+                  <div class="cloud-docs-row-col is-details">
+                    <span class="cloud-docs-time">{formatTime(folder.updatedAt) || t('cloud_docs.folder_label', 'Folder')}</span>
+                  </div>
+                  <div class="cloud-docs-row-col is-metric">
+                    <span class="cloud-docs-time">{t('cloud_docs.folder_label', 'Folder')}</span>
+                  </div>
                   <div class="cloud-docs-row-actions">
                     <button
                       type="button"
@@ -2002,13 +2143,15 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
                   >
                     <span class="cloud-docs-row-icon"><DocKindIcon name={doc.name} size={viewMode === 'grid' ? 28 : 22} /></span>
                     <div class="cloud-docs-row-meta">
-                      <div class="cloud-docs-row-title">{doc.name}</div>
-                      <div class="cloud-docs-row-sub">
-                        <span class="cloud-docs-time">{formatTime(doc.updatedAt)}</span>
-                        <span>{formatBytes(doc.sizeBytes)}</span>
-                      </div>
+                      <div class="cloud-docs-row-title" title={doc.name}>{doc.name}</div>
                     </div>
                   </button>
+                  <div class="cloud-docs-row-col is-details">
+                    <span class="cloud-docs-time">{formatTime(doc.updatedAt)}</span>
+                  </div>
+                  <div class="cloud-docs-row-col is-metric">
+                    <span>{formatBytes(doc.sizeBytes)}</span>
+                  </div>
                   <div class="cloud-docs-row-actions">
                     <button
                       type="button"
