@@ -277,6 +277,164 @@ describe('VoiceInput', () => {
       vi.useRealTimers();
     }
   });
+
+  it('bounds a hung native stop() at NATIVE_FINAL_DRAIN_MS so Pause->Mic and Send recover cleanly', async () => {
+    vi.useFakeTimers();
+    try {
+      const hungStop = deferred<void>();
+      speechApi.stop.mockReturnValueOnce(hungStop.promise).mockResolvedValue(undefined);
+
+      await expect(VoiceInput.startListening(vi.fn())).resolves.toBe(true);
+      expect(VoiceInput.isListening()).toBe(true);
+
+      const stopping = VoiceInput.stopListening();
+      expect(VoiceInput.isListening()).toBe(false);
+
+      // Next start queues cleanly behind _pendingStop, unblocking at NATIVE_FINAL_DRAIN_MS
+      const resumed = VoiceInput.startListening(vi.fn());
+      await vi.advanceTimersByTimeAsync(VoiceInput.NATIVE_FINAL_DRAIN_MS - 1);
+      expect(speechApi.start).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await stopping;
+      await expect(resumed).resolves.toBe(true);
+      expect(speechApi.start).toHaveBeenCalledTimes(2);
+      expect(VoiceInput.isListening()).toBe(true);
+    } finally {
+      await VoiceInput.stopListening();
+      await vi.advanceTimersByTimeAsync(0);
+      vi.useRealTimers();
+    }
+  });
+
+  it('VoiceOverlay + VoiceInput: coalesces Pause->Mic during slow drain, cancels queued resume on Send, and avoids false error on Pause during warmup', async () => {
+    vi.useFakeTimers();
+    try {
+      const permGate = deferred<{ speechRecognition: string }>();
+      speechApi.requestPermissions
+        .mockReturnValueOnce(permGate.promise)
+        .mockResolvedValue({ speechRecognition: 'granted' });
+      const onSend = vi.fn(() => 'accepted' as const);
+      const onClose = vi.fn();
+      const { VoiceOverlay } = await import('../../src/components/VoiceOverlay.js');
+
+      const view = render(h(VoiceOverlay, {
+        open: true,
+        initialText: '',
+        onSend,
+        onClose,
+      }));
+      await vi.advanceTimersByTimeAsync(150);
+      expect(speechApi.requestPermissions).toHaveBeenCalledTimes(1);
+
+      // Pause while warmup/permission is still in flight: no false permission_denied alert
+      const micBtn = document.querySelector('.voice-overlay-mic') as HTMLElement;
+      fireEvent.click(micBtn);
+      permGate.resolve({ speechRecognition: 'granted' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(document.querySelector('[role="alert"]')).toBeNull();
+
+      // Resume listening and capture speech
+      fireEvent.click(micBtn);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(speechApi.start).toHaveBeenCalledTimes(1);
+      listeners.partialResults?.({ matches: ['first sentence'], isFinal: false });
+
+      // Tap Pause -> slow native drain blocks stop()
+      const slowStop1 = deferred<void>();
+      speechApi.stop.mockReturnValueOnce(slowStop1.promise);
+      fireEvent.click(micBtn);
+      await vi.advanceTimersByTimeAsync(400);
+
+      // Tap Mic twice while stop drain is still in flight -> coalesces to one resume
+      fireEvent.click(micBtn);
+      fireEvent.click(micBtn);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(speechApi.start).toHaveBeenCalledTimes(1);
+
+      listeners.partialResults?.({ matches: ['first sentence final'], isFinal: true });
+      slowStop1.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(speechApi.start).toHaveBeenCalledTimes(2);
+      expect(VoiceInput.isListening()).toBe(true);
+
+      // Now Pause -> Mic (queued) -> Send BEFORE drain settles: Send cancels queued resume and sends cleanly
+      const slowStop2 = deferred<void>();
+      speechApi.stop.mockReturnValueOnce(slowStop2.promise);
+      fireEvent.click(micBtn);
+      await vi.advanceTimersByTimeAsync(400);
+      fireEvent.click(micBtn);
+      const sendBtn = document.querySelector('.voice-overlay-send') as HTMLElement;
+      fireEvent.click(sendBtn);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(onSend).not.toHaveBeenCalled();
+
+      listeners.partialResults?.({ matches: ['second sentence'], isFinal: true });
+      slowStop2.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(speechApi.start).toHaveBeenCalledTimes(2);
+      expect(onSend).toHaveBeenCalledTimes(1);
+      expect(onSend).toHaveBeenCalledWith('first sentence final second sentence');
+      expect(onClose).toHaveBeenCalledTimes(1);
+      view.unmount();
+    } finally {
+      cleanup();
+      await VoiceInput.stopListening();
+      await vi.advanceTimersByTimeAsync(0);
+      vi.useRealTimers();
+    }
+  });
+
+  it('VoiceOverlay + VoiceInput: sends immediately when already paused and recovers when native stop() rejects', async () => {
+    vi.useFakeTimers();
+    try {
+      const onSend = vi.fn(() => 'accepted' as const);
+      const onClose = vi.fn();
+      const { VoiceOverlay } = await import('../../src/components/VoiceOverlay.js');
+
+      const view = render(h(VoiceOverlay, {
+        open: true,
+        initialText: '',
+        onSend,
+        onClose,
+      }));
+      await vi.advanceTimersByTimeAsync(150);
+      expect(speechApi.start).toHaveBeenCalledTimes(1);
+      listeners.partialResults?.({ matches: ['captured text'], isFinal: true });
+
+      // Even if native stop() rejects, Pause cleanly returns UI to paused state without wedging Mic or Send
+      speechApi.stop.mockRejectedValueOnce(new Error('native stop transient error'));
+      const micBtn = document.querySelector('.voice-overlay-mic') as HTMLElement;
+      fireEvent.click(micBtn);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(VoiceInput.isListening()).toBe(false);
+
+      // Pause then Mic works normally afterward
+      fireEvent.click(micBtn);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(speechApi.start).toHaveBeenCalledTimes(2);
+      expect(VoiceInput.isListening()).toBe(true);
+
+      // Pause cleanly and wait for drain, then Send does not invoke another redundant stop()
+      fireEvent.click(micBtn);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(speechApi.stop).toHaveBeenCalledTimes(2);
+
+      const sendBtn = document.querySelector('.voice-overlay-send') as HTMLElement;
+      fireEvent.click(sendBtn);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(speechApi.stop).toHaveBeenCalledTimes(2);
+      expect(onSend).toHaveBeenCalledTimes(1);
+      expect(onSend).toHaveBeenCalledWith('captured text');
+      expect(onClose).toHaveBeenCalledTimes(1);
+      view.unmount();
+    } finally {
+      cleanup();
+      await VoiceInput.stopListening();
+      await vi.advanceTimersByTimeAsync(0);
+      vi.useRealTimers();
+    }
+  });
 });
 
 

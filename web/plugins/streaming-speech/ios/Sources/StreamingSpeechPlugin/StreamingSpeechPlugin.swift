@@ -66,6 +66,10 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         lock.lock(); defer { lock.unlock() }
         return generation == owner
     }
+    private func isEventOwner(_ owner: UInt64) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return eventOwner == owner
+    }
     private var modelRoot: URL? { Bundle.module.resourceURL?.appendingPathComponent("models", isDirectory: true) }
     private var modelAvailable: Bool {
         guard let root = modelRoot else { return false }
@@ -232,7 +236,14 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
             lock.unlock()
             guard decoderOwner == owner, let decoder = decoder else { return }
             do {
-                try window.append(batch.samples, speech: batch.speech, trailingSilence: batch.trailingSilence, decode: decoder.decode) { text in
+                try window.append(
+                    batch.samples,
+                    speech: batch.speech,
+                    trailingSilence: batch.trailingSilence,
+                    shouldEmitNonFinal: { [weak self] in self?.isCurrent(owner) ?? false },
+                    shouldContinue: { [weak self] in self?.isEventOwner(owner) ?? false },
+                    decode: decoder.decode
+                ) { text in
                     self.emitText(text, final: false, owner: owner)
                 }
             } catch {
@@ -276,13 +287,22 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         worker.async {
             let owner = self.decoderOwner
-            if let decoder = self.decoder {
+            if let decoder = self.decoder, self.isEventOwner(owner) {
                 do {
                     if let tail = tail {
-                        try self.window.append(tail.samples, speech: tail.speech, trailingSilence: tail.trailingSilence, final: true, decode: decoder.decode) { _ in }
+                        try self.window.append(
+                            tail.samples,
+                            speech: tail.speech,
+                            trailingSilence: tail.trailingSilence,
+                            final: true,
+                            shouldContinue: { [weak self] in self?.isEventOwner(owner) ?? false },
+                            decode: decoder.decode
+                        ) { _ in }
                     }
-                    let text = try self.window.finish(decode: decoder.decode)
-                    self.emitText(text, final: true, owner: owner)
+                    if self.isEventOwner(owner) {
+                        let text = try self.window.finish(decode: decoder.decode)
+                        self.emitText(text, final: true, owner: owner)
+                    }
                 } catch {
                     // Preserve the last successful hypothesis on a visible error;
                     // never silently replace the full transcript with an empty tail.
@@ -388,6 +408,8 @@ struct SpeechWindow {
     var text: String { rolling ? committed + partial : Self.join(committed, partial) }
 
     mutating func append(_ input: [Float], speech: Bool, trailingSilence: Int = 0, final: Bool = false,
+                         shouldEmitNonFinal: () -> Bool = { true },
+                         shouldContinue: () -> Bool = { true },
                          decode: ([Float]) -> String?, emit: (String) -> Void) throws {
         guard !input.isEmpty, !samples.isEmpty || speech else { return }
         // Chunk oversized batches (both live and final stop drain) at the bounded
@@ -395,6 +417,7 @@ struct SpeechWindow {
         // 32s inbox backlog ever exceeds the per-decode window capacity.
         var remaining = input[...]
         while samples.count + remaining.count > Self.capacity {
+            guard shouldContinue() else { return }
             let takeCount = max(1, Self.capacity - samples.count)
             let chunk = remaining.prefix(takeCount)
             remaining = remaining.dropFirst(takeCount)
@@ -405,14 +428,15 @@ struct SpeechWindow {
             let pause = Self.endsSentence(partial) ? Self.punctuationPause : Self.vadPause
             if silentSamples >= pause { commitSentence() }
             else { rollWindow() }
-            if !final && text != lastEmitted { lastEmitted = text; emit(text) }
+            if !final && shouldEmitNonFinal() && text != lastEmitted { lastEmitted = text; emit(text) }
         }
-        guard !remaining.isEmpty else { return }
+        guard !remaining.isEmpty, shouldContinue() else { return }
         samples.append(contentsOf: remaining)
         newSamples += remaining.count
         silentSamples = speech ? trailingSilence : silentSamples + remaining.count
-        if final {
-            // Stop flushes the final bounded window once in finish() with 200ms silence padding.
+        if final || !shouldEmitNonFinal() {
+            // Stop flushes the final bounded window once in finish() with 200ms silence padding;
+            // skip redundant non-final decodes once stop has already been requested.
             return
         }
         let pause = Self.endsSentence(partial) ? Self.punctuationPause : Self.vadPause

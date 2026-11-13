@@ -443,6 +443,8 @@ function startWebListening(): boolean {
 /** Stop-only deadline: browser engines may omit onend on device failure.
  * Never applied to an active recording and never used as a 60s duration cap. */
 const WEB_FINAL_DRAIN_MS = 2000;
+/** Stop-only deadline for native offline drain so Pause->Mic / Send never wedge forever. */
+export const NATIVE_FINAL_DRAIN_MS = 4000;
 function stopWebListening(): Promise<void> {
   setListening(false);
   stopWebLevelMeter();
@@ -564,15 +566,32 @@ export async function stopListening(): Promise<void> {
   }
 
   const stopPromise = (async () => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
     try {
-      await session?.recognition.stop();
-    } catch (err) {
-      console.warn('[voice] stop failed:', err);
-    }
+      const drain = (async () => {
+        try {
+          await session?.recognition.stop();
+        } catch (err) {
+          console.warn('[voice] stop failed:', err);
+        }
 
-    try {
-      await startPromise;
-    } catch { /* start failure already logged */ }
+        try {
+          await startPromise;
+        } catch { /* start failure already logged */ }
+      })();
+
+      const timedOut = await Promise.race([
+        drain.then(() => false),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(true), NATIVE_FINAL_DRAIN_MS);
+        }),
+      ]);
+      if (timedOut) {
+        console.warn('[voice] native final drain timed out');
+      }
+    } finally {
+      if (timer !== null) clearTimeout(timer);
+    }
 
     await removeRecognitionListeners();
     if (_nativeSession === session) _nativeSession = null;
