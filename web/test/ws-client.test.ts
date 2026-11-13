@@ -2496,6 +2496,51 @@ describe('WsClient', () => {
       expect(() => client.subscribeTerminal('s', false)).not.toThrow();
       expect(lastWs).toBeNull();
     });
+
+    it('resets _lastPongAt on forced resume so post-open timeline/terminal interactions do not loop reconnectNow', async () => {
+      vi.useFakeTimers();
+      try {
+        const client = new WsClient('http://localhost:8787', 'srv-1');
+        client.connect();
+        await vi.advanceTimersByTimeAsync(0);
+        const sock1 = lastWs!;
+        sock1.emit('open');
+        // Record a real pong, then sleep longer than 2x stale threshold (>60s).
+        sock1.emit('message', { data: JSON.stringify({ type: 'pong' }) });
+        vi.setSystemTime(Date.now() + 90_000);
+
+        const events: Array<{ event?: string; reason?: string }> = [];
+        client.onMessage((msg) => {
+          if (msg.type === 'session.event') events.push(msg);
+          if (msg.type === 'session.event' && msg.event === 'connected') {
+            // Mirrors App.tsx on('connected'): immediately refresh timeline + subscribe
+            // before the new socket's first pong arrives.
+            client.sendTimelineHistoryRequest('deck_sub_chat');
+            client.subscribeTerminal('deck_sub_term', false);
+          }
+        });
+
+        client.resumeConnection(true);
+        await vi.advanceTimersByTimeAsync(0);
+        const sock2 = lastWs!;
+        expect(sock2).not.toBe(sock1);
+        events.length = 0;
+
+        sock2.emit('open');
+        sock2.send.mockClear();
+        // Also simulate a focus probe right after open before first pong arrives.
+        client.probeConnection();
+
+        expect(sock2.readyState).toBe(MockWebSocket.OPEN);
+        expect(lastWs).toBe(sock2);
+        expect(client.connected).toBe(true);
+        expect(events.filter((e) => e.event === 'disconnected')).toHaveLength(0);
+
+        client.disconnect();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 
   describe('send() never throws on a disconnected socket (ChatView crash guard)', () => {

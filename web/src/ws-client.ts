@@ -2344,6 +2344,7 @@ export class WsClient {
       this.wsOpenStartedAt = 0;
       this._connected = true;
       this._probePending = false;
+      this._lastPongAt = 0;
       // Rebuild state is scoped to the actual WebSocket. Probe recovery keeps
       // this signature; a new socket receives one fresh rebuild payload.
       this.sentSubSessionRebuildSignature = null;
@@ -2548,6 +2549,7 @@ export class WsClient {
     this._visibilityListener = null;
     this._resumeProbeTimer = null;
     this._pingSentAt = null;
+    this._lastPongAt = 0;
     this._missedHeartbeatPongs = 0;
     this._resumeProbeMisses = 0;
   }
