@@ -21,7 +21,7 @@ import {
   getLocalPushNotificationPreferences,
   getLocalPushEnabledServers,
   syncPushNotificationPreferences,
-  syncPushEnabledServers,
+  commitPushEnabledServers,
   subscribePushEnabledServers,
   hasUnsyncedPushNotificationEdits,
   hasUnsyncedPushEnabledServerEdits,
@@ -103,6 +103,8 @@ export function SettingsPage({
   const [pushEnabledServers, setPushEnabledServers] = useState<string[] | null>(() =>
     getLocalPushEnabledServers(),
   );
+  const pushEnabledServersRef = useRef<string[] | null>(pushEnabledServers);
+  pushEnabledServersRef.current = pushEnabledServers;
   const [pushServers, setPushServers] = useState<PushServerItem[]>([]);
   const [pushServersLoading, setPushServersLoading] = useState(false);
   const [pushServersError, setPushServersError] = useState(false);
@@ -129,6 +131,7 @@ export function SettingsPage({
     const unsubscribe = typeof subscribePushEnabledServers === 'function'
       ? subscribePushEnabledServers((next) => {
         if (!unmounted) {
+          pushEnabledServersRef.current = next;
           setPushEnabledServers(next);
         }
       })
@@ -139,6 +142,7 @@ export function SettingsPage({
         setPushPreferences(snapshot.types);
       }
       if (snapshot.enabledServerIds !== undefined && !userEditedPushServersRef.current && !hasUnsyncedPushEnabledServerEdits()) {
+        pushEnabledServersRef.current = snapshot.enabledServerIds;
         setPushEnabledServers(snapshot.enabledServerIds);
       }
     });
@@ -238,28 +242,27 @@ export function SettingsPage({
   const accessibleServerIds = pushServers.map((s) => s.id);
   const effectiveEnabledServers = resolveEffectivePushEnabledServerIds(pushEnabledServers, accessibleServerIds);
 
-  const togglePushServer = (serverId: string) => {
+  const commitPushServerSelection = (next: string[]) => {
     userEditedPushServersRef.current = true;
-    setPushEnabledServers((prev) => {
-      const current = resolveEffectivePushEnabledServerIds(prev, accessibleServerIds);
-      const next = current.includes(serverId) ? current.filter((item) => item !== serverId) : [...current, serverId];
-      void syncPushEnabledServers(next);
-      return next;
-    });
+    const prevRaw = pushEnabledServersRef.current;
+    pushEnabledServersRef.current = next;
+    setPushEnabledServers(next);
+    void commitPushEnabledServers(next, prevRaw);
+  };
+
+  const togglePushServer = (serverId: string) => {
+    const current = resolveEffectivePushEnabledServerIds(pushEnabledServersRef.current, accessibleServerIds);
+    const next = current.includes(serverId) ? current.filter((item) => item !== serverId) : [...current, serverId];
+    commitPushServerSelection(next);
   };
 
   const selectAllPushServers = () => {
     if (pushServers.length === 0) return;
-    userEditedPushServersRef.current = true;
-    const next = pushServers.map((s) => s.id);
-    setPushEnabledServers(next);
-    void syncPushEnabledServers(next);
+    commitPushServerSelection(pushServers.map((s) => s.id));
   };
 
   const clearAllPushServers = () => {
-    userEditedPushServersRef.current = true;
-    setPushEnabledServers([]);
-    void syncPushEnabledServers([]);
+    commitPushServerSelection([]);
   };
 
   const applySetupErrorCode = (errorCode: string | null) => {

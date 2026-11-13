@@ -436,7 +436,170 @@ describe('push enabled servers preferences', () => {
     expect(ok1).toBe(false);
     expect(ok2).toBe(true);
     expect(getLocalPushEnabledServers()).toEqual(['srv-1', 'srv-2']);
+    expect(hasUnsyncedPushEnabledServerEdits()).toBe(false);
     expect(seen).toEqual([['srv-1'], ['srv-1', 'srv-2']]);
     unsubscribe();
+  });
+
+  it('rolls back concurrent double failures to the last confirmed snapshot instead of unconfirmed optimistic intermediate state', async () => {
+    const {
+      fetchPushNotificationSettings,
+      commitPushEnabledServers,
+      subscribePushEnabledServers,
+      getLocalPushEnabledServers,
+      hasUnsyncedPushEnabledServerEdits,
+      resetPushNotificationPreferencesStateForTesting,
+    } = await import('../src/push-notifications.js');
+
+    resetPushNotificationPreferencesStateForTesting();
+    let remoteServers: string[] | null = [];
+    apiFetchMock.mockResolvedValueOnce({
+      ok: true,
+      types: ['task_complete'],
+      enabledServerIds: [...remoteServers],
+    });
+    await fetchPushNotificationSettings();
+
+    const seen: Array<string[] | null> = [];
+    const unsubscribe = subscribePushEnabledServers((next) => seen.push(next));
+
+    let rejectFirst!: (err: Error) => void;
+    let rejectSecond!: (err: Error) => void;
+    apiFetchMock.mockImplementation((path: string, init?: { method?: string }) => {
+      if (path === '/api/push/preferences' && init?.method === 'POST') {
+        if (!rejectFirst) {
+          return new Promise((_, reject) => { rejectFirst = reject; });
+        }
+        return new Promise((_, reject) => { rejectSecond = reject; });
+      }
+      return Promise.resolve({ ok: true, types: ['task_complete'], enabledServerIds: [...(remoteServers ?? [])] });
+    });
+
+    const first = commitPushEnabledServers(['srv-1'], []);
+    await vi.waitFor(() => expect(rejectFirst).toBeTypeOf('function'));
+    const second = commitPushEnabledServers(['srv-1', 'srv-2'], ['srv-1']);
+
+    rejectFirst(new Error('network A down'));
+    await vi.waitFor(() => expect(rejectSecond).toBeTypeOf('function'));
+    rejectSecond(new Error('network B down'));
+
+    const [ok1, ok2] = await Promise.all([first, second]);
+    expect([ok1, ok2]).toEqual([false, false]);
+    expect(remoteServers).toEqual([]);
+    expect(getLocalPushEnabledServers()).toEqual([]);
+    expect(hasUnsyncedPushEnabledServerEdits()).toBe(false);
+    expect(seen).toEqual([['srv-1'], ['srv-1', 'srv-2'], []]);
+
+    // Clean subsequent GET still hydrates normally (dirty flag was not stuck)
+    remoteServers = ['srv-remote'];
+    const refreshed = await fetchPushNotificationSettings();
+    expect(refreshed?.enabledServerIds).toEqual(['srv-remote']);
+    expect(getLocalPushEnabledServers()).toEqual(['srv-remote']);
+    unsubscribe();
+  });
+
+  it('rolls back first-succeeds-then-second-fails to the first ACKed server snapshot', async () => {
+    const {
+      fetchPushNotificationSettings,
+      commitPushEnabledServers,
+      getLocalPushEnabledServers,
+      hasUnsyncedPushEnabledServerEdits,
+      resetPushNotificationPreferencesStateForTesting,
+    } = await import('../src/push-notifications.js');
+
+    resetPushNotificationPreferencesStateForTesting();
+    apiFetchMock.mockResolvedValueOnce({
+      ok: true,
+      types: ['task_complete'],
+      enabledServerIds: [],
+    });
+    await fetchPushNotificationSettings();
+
+    let resolveFirst!: (val: unknown) => void;
+    let rejectSecond!: (err: Error) => void;
+    let postIndex = 0;
+    apiFetchMock.mockImplementation((path: string, init?: { method?: string }) => {
+      if (path === '/api/push/preferences' && init?.method === 'POST') {
+        postIndex++;
+        if (postIndex === 1) {
+          return new Promise((resolve) => { resolveFirst = resolve; });
+        }
+        return new Promise((_, reject) => { rejectSecond = reject; });
+      }
+      return Promise.resolve({ ok: true });
+    });
+
+    const first = commitPushEnabledServers(['srv-1'], []);
+    await vi.waitFor(() => expect(resolveFirst).toBeTypeOf('function'));
+    // Overlapping second call passes stale pre-A `[]` as previous; ACK from A must still win!
+    const second = commitPushEnabledServers(['srv-1', 'srv-2'], []);
+
+    resolveFirst({ ok: true, enabledServerIds: ['srv-1'] });
+    await vi.waitFor(() => expect(rejectSecond).toBeTypeOf('function'));
+    rejectSecond(new Error('second POST failed'));
+
+    const [ok1, ok2] = await Promise.all([first, second]);
+    expect([ok1, ok2]).toEqual([true, false]);
+    expect(getLocalPushEnabledServers()).toEqual(['srv-1']);
+    expect(hasUnsyncedPushEnabledServerEdits()).toBe(false);
+  });
+
+  it('handles same-tick coalesced commit success and failure with accurate ACK, local state, and dirty bit', async () => {
+    const {
+      fetchPushNotificationSettings,
+      commitPushEnabledServers,
+      getLocalPushEnabledServers,
+      hasUnsyncedPushEnabledServerEdits,
+      resetPushNotificationPreferencesStateForTesting,
+    } = await import('../src/push-notifications.js');
+
+    resetPushNotificationPreferencesStateForTesting();
+    apiFetchMock.mockResolvedValueOnce({
+      ok: true,
+      types: ['task_complete'],
+      enabledServerIds: [],
+    });
+    await fetchPushNotificationSettings();
+
+    // Same-tick coalesced failure: single POST fails -> rolls back to confirmed [], not intermediate ['srv-1']
+    let postCount = 0;
+    apiFetchMock.mockImplementation((path: string, init?: { method?: string }) => {
+      if (path === '/api/push/preferences' && init?.method === 'POST') {
+        postCount++;
+        return Promise.reject(new Error('coalesced POST failed'));
+      }
+      return Promise.resolve({ ok: true });
+    });
+
+    const failResults = await Promise.all([
+      commitPushEnabledServers(['srv-1'], []),
+      commitPushEnabledServers(['srv-1', 'srv-2'], ['srv-1']),
+    ]);
+    expect(postCount).toBe(1);
+    expect(failResults).toEqual([false, false]);
+    expect(getLocalPushEnabledServers()).toEqual([]);
+    expect(hasUnsyncedPushEnabledServerEdits()).toBe(false);
+
+    // Same-tick coalesced success: single POST commits ['srv-1', 'srv-2'], clean dirty bit
+    postCount = 0;
+    const bodies: unknown[] = [];
+    apiFetchMock.mockImplementation((path: string, init?: { method?: string }) => {
+      if (path === '/api/push/preferences' && init?.method === 'POST') {
+        postCount++;
+        bodies.push(JSON.parse(String(init.body ?? '{}')));
+        return Promise.resolve({ ok: true });
+      }
+      return Promise.resolve({ ok: true });
+    });
+
+    const okResults = await Promise.all([
+      commitPushEnabledServers(['srv-1'], []),
+      commitPushEnabledServers(['srv-1', 'srv-2'], ['srv-1']),
+    ]);
+    expect(postCount).toBe(1);
+    expect(bodies).toEqual([{ enabledServerIds: ['srv-1', 'srv-2'] }]);
+    expect(okResults).toEqual([true, true]);
+    expect(getLocalPushEnabledServers()).toEqual(['srv-1', 'srv-2']);
+    expect(hasUnsyncedPushEnabledServerEdits()).toBe(false);
   });
 });

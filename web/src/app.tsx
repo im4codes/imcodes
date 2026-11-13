@@ -869,6 +869,7 @@ function InternalMainApp() {
   pushEnabledServersRef.current = pushEnabledServers;
   const [newDevicePushPrompts, setNewDevicePushPrompts] = useState<PendingNewDevicePushPrompt[]>([]);
   const [newDevicePushSaving, setNewDevicePushSaving] = useState(false);
+  const newDevicePushSavingRef = useRef(false);
   // Only successful share discovery updates this set; a transient fetch failure
   // must not erase navigation back to a server the user just left.
   const sharedNavigationServerIdsRef = useRef<Set<string>>(new Set());
@@ -1650,15 +1651,19 @@ function InternalMainApp() {
     if (!auth) return;
     const unsubscribe = typeof subscribePushEnabledServers === 'function'
       ? subscribePushEnabledServers((next) => {
+        pushEnabledServersRef.current = next;
         setPushEnabledServers(next);
       })
       : () => {};
     if (typeof getLocalPushEnabledServers === 'function') {
-      setPushEnabledServers(getLocalPushEnabledServers());
+      const localServers = getLocalPushEnabledServers();
+      pushEnabledServersRef.current = localServers;
+      setPushEnabledServers(localServers);
     }
     if (typeof fetchPushNotificationSettings === 'function') {
       void fetchPushNotificationSettings().then((snapshot) => {
         if (snapshot && snapshot.enabledServerIds !== undefined && (typeof hasUnsyncedPushEnabledServerEdits !== 'function' || !hasUnsyncedPushEnabledServerEdits())) {
+          pushEnabledServersRef.current = snapshot.enabledServerIds;
           setPushEnabledServers(snapshot.enabledServerIds);
         }
       });
@@ -2636,19 +2641,16 @@ function InternalMainApp() {
   const activeNewDevicePushPrompt = newDevicePushPrompts[0] ?? null;
   const handleRespondToNewDevicePushPrompt = useCallback(async (mode: 'enable' | 'mute' | 'dismiss') => {
     const prompt = newDevicePushPrompts[0];
-    if (!prompt) return;
-    if (mode === 'dismiss') {
-      markHandledNewDevicePushId(authRef.current, prompt.id);
-      setNewDevicePushPrompts((prev) => prev.filter((item) => item.id !== prompt.id));
-      return;
-    }
+    if (!prompt || newDevicePushSavingRef.current) return;
+    const shouldEnable = mode === 'enable';
     const prevRaw = pushEnabledServersRef.current;
     const baseEffective = Array.isArray(prevRaw)
       ? prevRaw
       : resolveEffectivePushEnabledServerIds(null, prompt.priorAccessibleServerIds);
-    const next = mode === 'enable'
+    const next = shouldEnable
       ? sanitizePushEnabledServerIds([...baseEffective, prompt.id])
       : sanitizePushEnabledServerIds(baseEffective.filter((id) => id !== prompt.id));
+    newDevicePushSavingRef.current = true;
     setNewDevicePushSaving(true);
     try {
       const ok = await commitPushEnabledServers(next, prevRaw);
@@ -2659,6 +2661,7 @@ function InternalMainApp() {
         showErrorToast(trans('server.push_preferences_save_failed'));
       }
     } finally {
+      newDevicePushSavingRef.current = false;
       setNewDevicePushSaving(false);
     }
   }, [newDevicePushPrompts, showErrorToast, trans]);

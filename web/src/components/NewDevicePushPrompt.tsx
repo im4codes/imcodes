@@ -44,6 +44,7 @@ export function NewDevicePushPrompt({ server, busy = false, onEnable, onKeepMute
           class="new-device-push-prompt-close"
           data-testid="new-device-push-dismiss"
           aria-label={t('common.close', { defaultValue: 'Close' })}
+          disabled={busy}
           onClick={onDismiss}
         >
           ×

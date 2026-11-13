@@ -56,6 +56,11 @@ interface MockState {
   pushTypes: string[];
   enabledServerIds: string[] | null;
   failNextPushSave: boolean;
+  deferPushSaves: Array<{
+    resolve: () => void;
+    reject: (err?: Error) => void;
+  }>;
+  holdPushSaves: boolean;
   pushPostPayloads: Array<{ types: string[]; enabledServerIds: string[] | null }>;
 }
 
@@ -66,6 +71,8 @@ const mockState: MockState = {
   pushTypes: [],
   enabledServerIds: null,
   failNextPushSave: false,
+  deferPushSaves: [],
+  holdPushSaves: false,
   pushPostPayloads: [],
 };
 
@@ -84,6 +91,11 @@ const apiFetchMock = vi.fn(async (path: string, init?: RequestInit) => {
     };
   }
   if (path === '/api/push/preferences' && init?.method === 'POST') {
+    if (mockState.holdPushSaves) {
+      await new Promise<void>((resolve, reject) => {
+        mockState.deferPushSaves.push({ resolve, reject });
+      });
+    }
     if (mockState.failNextPushSave) {
       mockState.failNextPushSave = false;
       throw new Error('push save failed');
@@ -427,6 +439,8 @@ describe('App server push controls integration', () => {
     mockState.pushTypes = ['session.idle', 'session.notification'];
     mockState.enabledServerIds = null;
     mockState.failNextPushSave = false;
+    mockState.deferPushSaves = [];
+    mockState.holdPushSaves = false;
     mockState.pushPostPayloads = [];
     pollCallbacks = [];
     const origSetInterval = globalThis.setInterval;
@@ -728,5 +742,208 @@ describe('App server push controls integration', () => {
     expect(container.querySelectorAll('.toast-error')[1]?.textContent).toContain(
       'Failed to update notification setting for this server.',
     );
+  }, 15_000);
+
+  it.each([
+    {
+      transition: '0->1',
+      initialServers: [] as MockServer[],
+      newServer: { id: 'srv-only', name: 'Solo Box', status: 'online' as const, lastHeartbeatAt: 1, createdAt: 1 },
+      actionTestId: 'new-device-push-enable',
+      expectedEnabledIds: ['srv-only'],
+      expectedNewBadgeState: 'enabled',
+    },
+    {
+      transition: '0->1',
+      initialServers: [] as MockServer[],
+      newServer: { id: 'srv-only', name: 'Solo Box', status: 'online' as const, lastHeartbeatAt: 1, createdAt: 1 },
+      actionTestId: 'new-device-push-mute',
+      expectedEnabledIds: [] as string[],
+      expectedNewBadgeState: 'muted',
+    },
+    {
+      transition: '0->1',
+      initialServers: [] as MockServer[],
+      newServer: { id: 'srv-only', name: 'Solo Box', status: 'online' as const, lastHeartbeatAt: 1, createdAt: 1 },
+      actionTestId: 'new-device-push-dismiss',
+      expectedEnabledIds: [] as string[],
+      expectedNewBadgeState: 'muted',
+    },
+    {
+      transition: '1->2',
+      initialServers: [{ id: 'srv-1', name: 'Office Mac', status: 'online' as const, lastHeartbeatAt: 1, createdAt: 1 }],
+      newServer: { id: 'srv-2', name: 'Build Box', status: 'online' as const, lastHeartbeatAt: 2, createdAt: 2 },
+      actionTestId: 'new-device-push-enable',
+      expectedEnabledIds: ['srv-1', 'srv-2'],
+      expectedNewBadgeState: 'enabled',
+    },
+    {
+      transition: '1->2',
+      initialServers: [{ id: 'srv-1', name: 'Office Mac', status: 'online' as const, lastHeartbeatAt: 1, createdAt: 1 }],
+      newServer: { id: 'srv-2', name: 'Build Box', status: 'online' as const, lastHeartbeatAt: 2, createdAt: 2 },
+      actionTestId: 'new-device-push-mute',
+      expectedEnabledIds: ['srv-1'],
+      expectedNewBadgeState: 'muted',
+    },
+    {
+      transition: '1->2',
+      initialServers: [{ id: 'srv-1', name: 'Office Mac', status: 'online' as const, lastHeartbeatAt: 1, createdAt: 1 }],
+      newServer: { id: 'srv-2', name: 'Build Box', status: 'online' as const, lastHeartbeatAt: 2, createdAt: 2 },
+      actionTestId: 'new-device-push-dismiss',
+      expectedEnabledIds: ['srv-1'],
+      expectedNewBadgeState: 'muted',
+    },
+  ])(
+    'persists new-device prompt $transition action ($actionTestId) with failure retry and busy dismiss lock',
+    async ({ initialServers, newServer, actionTestId, expectedEnabledIds, expectedNewBadgeState }) => {
+      mockState.servers = initialServers.map((s) => ({ ...s }));
+      mockState.enabledServerIds = null;
+
+      const view = renderApp();
+      await waitFor(() => {
+        expect(apiFetchMock).toHaveBeenCalledWith('/api/server');
+        expect(view.container.querySelectorAll('.server-icon-server').length).toBe(initialServers.length);
+      }, { timeout: 4000 });
+
+      mockState.servers = [...mockState.servers, { ...newServer }];
+      await triggerServerPoll();
+      await waitFor(() => expect(view.queryByTestId('new-device-push-prompt')).not.toBeNull());
+
+      // First attempt fails: must keep prompt retryable, NOT mark handled, and roll back local to null
+      mockState.failNextPushSave = true;
+      fireEvent.click(view.getByTestId(actionTestId));
+      await waitFor(() => {
+        expect(view.container.querySelector('.toast-error')).not.toBeNull();
+      });
+      expect(view.queryByTestId('new-device-push-prompt')).not.toBeNull();
+      expect(mockState.pushPostPayloads.length).toBe(0);
+      expect(mockState.enabledServerIds).toBeNull();
+
+      // Hold the retry POST in flight -> all 3 buttons including × close must be disabled
+      mockState.holdPushSaves = true;
+      fireEvent.click(view.getByTestId(actionTestId));
+      await waitFor(() => expect(mockState.deferPushSaves.length).toBe(1));
+      expect((view.getByTestId('new-device-push-enable') as HTMLButtonElement).disabled).toBe(true);
+      expect((view.getByTestId('new-device-push-mute') as HTMLButtonElement).disabled).toBe(true);
+      expect((view.getByTestId('new-device-push-dismiss') as HTMLButtonElement).disabled).toBe(true);
+
+      // Resolve in-flight POST -> handled persisted, prompt closes, badge & remote match
+      mockState.holdPushSaves = false;
+      await act(async () => {
+        mockState.deferPushSaves.shift()?.resolve();
+        await flushAsync();
+      });
+
+      await waitFor(() => {
+        expect(view.queryByTestId('new-device-push-prompt')).toBeNull();
+        expect(mockState.pushPostPayloads.length).toBe(1);
+      });
+      expect(mockState.pushPostPayloads[0].enabledServerIds).toEqual(expectedEnabledIds);
+      expect(mockState.enabledServerIds).toEqual(expectedEnabledIds);
+
+      const newBtn = Array.from(view.container.querySelectorAll('.server-icon-server'))
+        .find((b) => b.getAttribute('title')?.includes(newServer.name));
+      expect(newBtn?.querySelector('.server-icon-push-badge')?.getAttribute('data-push-state')).toBe(expectedNewBadgeState);
+
+      // Remount preserving localStorage -> must not re-prompt once succeeded
+      view.unmount();
+      const pushMod = await import('../src/push-notifications.js');
+      pushMod.resetPushNotificationPreferencesStateForTesting();
+      const reloaded = renderApp();
+      await waitFor(() => {
+        expect(reloaded.container.querySelectorAll('.server-icon-server').length).toBe(initialServers.length + 1);
+      }, { timeout: 4000 });
+      expect(reloaded.queryByTestId('new-device-push-prompt')).toBeNull();
+    },
+    15_000,
+  );
+
+  it('keeps Settings checkboxes and App badges at confirmed snapshot across concurrent App + Settings double failures', async () => {
+    mockState.servers = [
+      { id: 'srv-1', name: 'Alpha Server', status: 'online', lastHeartbeatAt: Date.now(), createdAt: 1 },
+      { id: 'srv-2', name: 'Beta Server', status: 'online', lastHeartbeatAt: Date.now(), createdAt: 2 },
+    ];
+    mockState.enabledServerIds = [];
+
+    const view = renderApp();
+    await waitFor(() => {
+      expect(view.container.querySelectorAll('.server-icon-server .server-icon-push-badge').length).toBe(2);
+    }, { timeout: 4000 });
+
+    const getDesktopBadge = (name: string) =>
+      Array.from(view.container.querySelectorAll('.server-icon-server'))
+        .find((b) => b.getAttribute('title')?.includes(name))
+        ?.querySelector('.server-icon-push-badge')
+        ?.getAttribute('data-push-state');
+
+    // Open Settings -> Notifications
+    const settingsBtn = Array.from(view.container.querySelectorAll('.server-icon-bar button'))
+      .find((btn) => btn.textContent?.includes('⚙')) as HTMLButtonElement;
+    fireEvent.click(settingsBtn);
+    const settingsOverlay = await waitFor(() => view.getByTestId('settings-page-overlay'));
+    fireEvent.click(within(settingsOverlay).getByRole('tab', { name: 'Notifications' }));
+    const alphaCb = await waitFor(() => within(settingsOverlay).getByLabelText(/Alpha Server/) as HTMLInputElement);
+    const betaCb = within(settingsOverlay).getByLabelText(/Beta Server/) as HTMLInputElement;
+    expect(alphaCb.checked).toBe(false);
+    expect(betaCb.checked).toBe(false);
+
+    // Hold POSTs: A (App context menu unmute srv-1) then B (Settings checkbox srv-2), both fail!
+    mockState.holdPushSaves = true;
+    const alphaBtn = Array.from(view.container.querySelectorAll('.server-icon-server'))
+      .find((b) => b.getAttribute('title')?.includes('Alpha Server')) as HTMLButtonElement;
+    fireEvent.contextMenu(alphaBtn);
+    const unmuteBtn = await waitFor(() => view.getByTestId('server-ctx-toggle-push-mute'));
+    fireEvent.click(unmuteBtn);
+    await waitFor(() => expect(mockState.deferPushSaves.length).toBe(1));
+
+    // While A is in flight, user clicks Beta Server in Settings (serialized behind A)
+    fireEvent.click(betaCb);
+
+    // Reject POST A -> serialized queue launches POST B -> reject POST B as well
+    await act(async () => {
+      mockState.deferPushSaves.shift()?.reject(new Error('App POST A failed'));
+      await flushAsync();
+    });
+    await waitFor(() => expect(mockState.deferPushSaves.length).toBe(1));
+    mockState.holdPushSaves = false;
+    await act(async () => {
+      mockState.deferPushSaves.shift()?.reject(new Error('Settings POST B failed'));
+      await flushAsync();
+    });
+
+    const pushMod = await import('../src/push-notifications.js');
+    await waitFor(() => {
+      expect(pushMod.getLocalPushEnabledServers()).toEqual([]);
+      expect(pushMod.hasUnsyncedPushEnabledServerEdits()).toBe(false);
+    });
+    expect(mockState.enabledServerIds).toEqual([]);
+    expect((within(settingsOverlay).getByLabelText(/Alpha Server/) as HTMLInputElement).checked).toBe(false);
+    expect((within(settingsOverlay).getByLabelText(/Beta Server/) as HTMLInputElement).checked).toBe(false);
+    expect(getDesktopBadge('Alpha Server')).toBe('muted');
+    expect(getDesktopBadge('Beta Server')).toBe('muted');
+
+    // Settings Select All + Clear double failure also cleanly reverts both Settings and App badges to []
+    mockState.holdPushSaves = true;
+    fireEvent.click(within(settingsOverlay).getByRole('button', { name: 'Select All' }));
+    await waitFor(() => expect(mockState.deferPushSaves.length).toBe(1));
+    fireEvent.click(within(settingsOverlay).getByRole('button', { name: 'Clear' }));
+    await act(async () => {
+      mockState.deferPushSaves.shift()?.reject(new Error('Settings Select All failed'));
+      await flushAsync();
+    });
+    await waitFor(() => expect(mockState.deferPushSaves.length).toBe(1));
+    mockState.holdPushSaves = false;
+    await act(async () => {
+      mockState.deferPushSaves.shift()?.reject(new Error('Settings Clear failed'));
+      await flushAsync();
+    });
+    await waitFor(() => {
+      expect(pushMod.getLocalPushEnabledServers()).toEqual([]);
+      expect(pushMod.hasUnsyncedPushEnabledServerEdits()).toBe(false);
+    });
+    expect((within(settingsOverlay).getByLabelText(/Alpha Server/) as HTMLInputElement).checked).toBe(false);
+    expect((within(settingsOverlay).getByLabelText(/Beta Server/) as HTMLInputElement).checked).toBe(false);
+    expect(getDesktopBadge('Alpha Server')).toBe('muted');
+    expect(getDesktopBadge('Beta Server')).toBe('muted');
   }, 15_000);
 });

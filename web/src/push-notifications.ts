@@ -222,6 +222,7 @@ interface SyncedLocalPreference<TValue> {
   subscribe: (listener: (value: TValue) => void) => () => void;
   applyRemoteIfClean: (raw: unknown, startGen: number, wasDirtyAtStart: boolean) => TValue | undefined;
   sync: (value: TValue) => Promise<boolean>;
+  commit: (value: TValue, fallbackPrevious?: TValue) => Promise<boolean>;
 }
 
 function createSyncedLocalPreference<TValue>(options: {
@@ -235,6 +236,15 @@ function createSyncedLocalPreference<TValue>(options: {
   let lastSyncedGeneration = 0;
   let syncQueue: Promise<void> = Promise.resolve();
   let pendingSync: { value: TValue; generation: number } | null = null;
+  let confirmedSnapshot: { hasValue: boolean; value: TValue } = {
+    hasValue: false,
+    value: options.getDefault(),
+  };
+  let preDirtyBaseline: { hasValue: boolean; value: TValue } = {
+    hasValue: false,
+    value: options.getDefault(),
+  };
+  let lastBatchAttempt: { coveredGen: number; ok: boolean } | null = null;
   const listeners = new Set<(value: TValue) => void>();
 
   const cloneValue = (value: TValue): TValue =>
@@ -292,7 +302,22 @@ function createSyncedLocalPreference<TValue>(options: {
     notify(value);
   };
 
+  const capturePreDirtyBaselineIfClean = (): void => {
+    if (
+      !confirmedSnapshot.hasValue
+      && !preDirtyBaseline.hasValue
+      && currentEditGeneration === lastSyncedGeneration
+      && pendingSync === null
+    ) {
+      preDirtyBaseline = {
+        hasValue: true,
+        value: cloneValue(getLocal()),
+      };
+    }
+  };
+
   const recordEdit = (value: TValue): number => {
+    capturePreDirtyBaselineIfClean();
     currentEditGeneration++;
     setLocal(value);
     return currentEditGeneration;
@@ -300,9 +325,19 @@ function createSyncedLocalPreference<TValue>(options: {
 
   const rollbackTo = (previousValue: TValue, expectedGen: number): boolean => {
     if (currentEditGeneration !== expectedGen) return false;
+    // Never roll back to an unconfirmed optimistic intermediate value supplied by a caller:
+    // prefer the last server-confirmed snapshot, else the clean pre-dirty baseline captured before
+    // this unconfirmed edit chain began.
+    const rollbackTarget = confirmedSnapshot.hasValue
+      ? cloneValue(confirmedSnapshot.value)
+      : preDirtyBaseline.hasValue
+        ? cloneValue(preDirtyBaseline.value)
+        : cloneValue(previousValue);
     pendingSync = null;
+    preDirtyBaseline = { hasValue: false, value: options.getDefault() };
+    lastBatchAttempt = null;
     lastSyncedGeneration = currentEditGeneration;
-    setLocal(previousValue);
+    setLocal(rollbackTarget);
     return true;
   };
 
@@ -323,6 +358,8 @@ function createSyncedLocalPreference<TValue>(options: {
     if (wasDirtyAtStart || currentEditGeneration > startGen || hasUnsyncedEdits()) {
       return undefined;
     }
+    confirmedSnapshot = { hasValue: true, value: cloneValue(valid) };
+    preDirtyBaseline = { hasValue: false, value: options.getDefault() };
     setLocal(valid);
     return valid;
   };
@@ -332,8 +369,15 @@ function createSyncedLocalPreference<TValue>(options: {
     pendingSync = { value, generation: gen };
     let ok = true;
 
-    syncQueue = syncQueue.then(async () => {
-      if (!pendingSync || lastSyncedGeneration >= pendingSync.generation) return;
+    const myAttempt = syncQueue.then(async () => {
+      if (!pendingSync || lastSyncedGeneration >= gen) {
+        ok = true;
+        return;
+      }
+      if (lastBatchAttempt && gen <= lastBatchAttempt.coveredGen) {
+        ok = lastBatchAttempt.ok;
+        return;
+      }
       const targetGen = pendingSync.generation;
       const toSend = pendingSync.value;
       try {
@@ -345,20 +389,35 @@ function createSyncedLocalPreference<TValue>(options: {
           if (lastSyncedGeneration < targetGen) {
             lastSyncedGeneration = targetGen;
           }
+          confirmedSnapshot = { hasValue: true, value: cloneValue(toSend) };
+          preDirtyBaseline = { hasValue: false, value: options.getDefault() };
           if (pendingSync && pendingSync.generation <= targetGen) {
             pendingSync = null;
           }
+          lastBatchAttempt = { coveredGen: targetGen, ok: true };
+          ok = true;
         } else {
           throw new Error('Push preferences update failed');
         }
       } catch (err) {
         ok = false;
+        lastBatchAttempt = { coveredGen: targetGen, ok: false };
         console.warn('Failed to sync push notification preferences:', err);
         // Do NOT clear pendingSync on failure, retaining dirty state for subsequent sync/read guards
       }
     });
 
-    await syncQueue;
+    syncQueue = myAttempt;
+    await myAttempt;
+    return ok;
+  };
+
+  const commit = async (value: TValue, fallbackPrevious?: TValue): Promise<boolean> => {
+    const expectedGen = currentEditGeneration + 1;
+    const ok = await sync(value);
+    if (!ok) {
+      rollbackTo(fallbackPrevious === undefined ? options.getDefault() : fallbackPrevious, expectedGen);
+    }
     return ok;
   };
 
@@ -369,8 +428,11 @@ function createSyncedLocalPreference<TValue>(options: {
     resetForTesting: () => {
       currentEditGeneration = 0;
       lastSyncedGeneration = 0;
-      pendingSync = null;
       syncQueue = Promise.resolve();
+      pendingSync = null;
+      confirmedSnapshot = { hasValue: false, value: options.getDefault() };
+      preDirtyBaseline = { hasValue: false, value: options.getDefault() };
+      lastBatchAttempt = null;
       listeners.clear();
     },
     getLocal,
@@ -380,6 +442,7 @@ function createSyncedLocalPreference<TValue>(options: {
     subscribe,
     applyRemoteIfClean,
     sync,
+    commit,
   };
 }
 
@@ -498,20 +561,16 @@ export function subscribePushEnabledServers(listener: (serverIds: string[] | nul
 
 /**
  * Optimistically apply `next` enabled server IDs, persist via POST /api/push/preferences,
- * and roll back to `previous` if the request fails (provided no newer edit superseded it).
+ * and roll back to the last confirmed snapshot (or clean pre-dirty baseline) if the
+ * request fails (provided no newer edit superseded it).
  */
 export async function commitPushEnabledServers(
   next: string[] | null,
-  previous: string[] | null,
+  previous: string[] | null = null,
 ): Promise<boolean> {
   const normalizedNext = next === null ? null : sanitizePushEnabledServerIds(next);
   const normalizedPrev = previous === null ? null : sanitizePushEnabledServerIds(previous);
-  const expectedGen = pushServersPref.getCurrentEditGeneration() + 1;
-  const ok = await pushServersPref.sync(normalizedNext);
-  if (!ok) {
-    pushServersPref.rollbackTo(normalizedPrev, expectedGen);
-  }
-  return ok;
+  return pushServersPref.commit(normalizedNext, normalizedPrev);
 }
 
 async function registerDeviceToken(
