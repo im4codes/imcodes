@@ -13860,6 +13860,11 @@ async function handleMemorySkillsQuery(cmd: Record<string, unknown>, serverLink:
       return;
     }
   }
+  const { ensureFreshSkillRegistries } = await import('../context/skill-registry-builder.js');
+  const refreshed = ensureFreshSkillRegistries({ projectDir });
+  if (refreshed.rebuiltUser || refreshed.rebuiltProject) {
+    publishRuntimeMemoryCacheInvalidation({ kind: 'skill_registry' });
+  }
   const { getSkillRegistryManagementSnapshot } = await import('../context/skill-registry.js');
   const snapshot = getSkillRegistryManagementSnapshot({ projectDir });
   serverLink.send({
@@ -13942,7 +13947,8 @@ async function handleMemorySkillRead(cmd: Record<string, unknown>, serverLink: S
     }
     let managedPath;
     try {
-      managedPath = assertManagedSkillPathSync({ path: entry.path, projectDir, maxBytes: SKILL_MAX_BYTES });
+      const { assertReadableSkillPathSync } = await import('../context/managed-skill-path.js');
+      managedPath = assertReadableSkillPathSync({ path: entry.path, projectDir, maxBytes: SKILL_MAX_BYTES });
     } catch (error) {
       const code = error instanceof ManagedSkillPathError && error.reason === 'oversize'
         ? MEMORY_MANAGEMENT_ERROR_CODES.SKILL_FILE_TOO_LARGE
@@ -14000,11 +14006,12 @@ async function handleMemorySkillDelete(cmd: Record<string, unknown>, serverLink:
       const code = typeof error === 'object' && error && 'code' in error ? String((error as { code?: unknown }).code) : '';
       if (code !== 'ENOENT') throw error;
     });
+    const { assertReadableSkillPathSync } = await import('../context/managed-skill-path.js');
     const paths = getSkillRegistryPathsForManagement({ projectDir });
     if (rootKind === 'user') {
       writeSkillRegistryManagementSnapshot(paths.user, snapshot.entries.filter((candidate) => {
         try {
-          if (candidate.path && assertManagedSkillPathSync({ path: candidate.path, projectDir }).rootKind !== 'user') return false;
+          if (candidate.path && assertReadableSkillPathSync({ path: candidate.path, projectDir }).rootKind !== 'user') return false;
         } catch {
           return false;
         }
@@ -14013,7 +14020,7 @@ async function handleMemorySkillDelete(cmd: Record<string, unknown>, serverLink:
     } else if (paths.project) {
       writeSkillRegistryManagementSnapshot(paths.project, snapshot.entries.filter((candidate) => {
         try {
-          if (candidate.path && assertManagedSkillPathSync({ path: candidate.path, projectDir }).rootKind !== 'project') return false;
+          if (candidate.path && assertReadableSkillPathSync({ path: candidate.path, projectDir }).rootKind !== 'project') return false;
         } catch {
           return false;
         }

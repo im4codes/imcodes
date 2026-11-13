@@ -24,6 +24,16 @@ describe('agent skill reference markers', () => {
 
   it('keeps direct payloads and rejects deeper registry paths cross-platform', () => {
     const topLevel = [
+      '~/.agents/skills/writer',
+      '~/.claude/skills/openspec-explore',
+      '~/.codex/skills/openspec-apply/SKILL.md',
+      '~/.gemini/skills/openspec-propose',
+      '~/.cursor/skills/cursor-skill',
+      '~/.qwen/skills/qwen-skill',
+      '~/.opencode/skills/opencode-skill',
+      '~/.openclaw/skills/claw-skill',
+      '.claude/skills/proj-skill',
+      '.codex\\skills\\proj-codex\\skill.md',
       '~/.imcodes/skills/writer.md',
       '~/.imcodes/skills/writer/SKILL.md',
       '.imc\\skills\\writer\\skill.md',
@@ -31,6 +41,8 @@ describe('agent skill reference markers', () => {
       'skill://user_default/writer%2FSKILL.md',
     ];
     const nested = [
+      '~/.claude/skills/group/sub/SKILL.md',
+      '.claude/skills/group/sub/SKILL.md',
       '~/.imcodes/skills/category/writer.md',
       '.imc/skills/category/writer/SKILL.md',
       'skill://user_default/category%2Fwriter',

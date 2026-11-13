@@ -16,11 +16,49 @@ export const AGENT_SKILLS_CLI_PACKAGE = 'skills@1.7.0' as const;
 /** `~/.agents/skills`, relative to the home directory. */
 export const AGENT_SKILLS_DIRECTORY_SEGMENTS = ['.agents', 'skills'] as const;
 
-/** How the directory is named to people and agents, whatever the platform. */
+/** All standard user-level agent skill roots, relative to the home directory. */
+export const AGENT_SKILLS_USER_ROOT_SEGMENTS = [
+  ['.agents', 'skills'],
+  ['.claude', 'skills'],
+  ['.codex', 'skills'],
+  ['.gemini', 'skills'],
+  ['.cursor', 'skills'],
+  ['.qwen', 'skills'],
+  ['.opencode', 'skills'],
+  ['.openclaw', 'skills'],
+] as const;
+
+/** All standard project-level agent skill roots, relative to a project directory. */
+export const AGENT_SKILLS_PROJECT_ROOT_SEGMENTS = [
+  ['.agents', 'skills'],
+  ['.claude', 'skills'],
+  ['.codex', 'skills'],
+  ['.gemini', 'skills'],
+  ['.cursor', 'skills'],
+  ['.qwen', 'skills'],
+  ['.opencode', 'skills'],
+] as const;
+
+/** Display prefixes for user-level skill roots (never host-absolute paths). */
+export const USER_AGENT_SKILL_DISPLAY_ROOTS = [
+  ...AGENT_SKILLS_USER_ROOT_SEGMENTS.map(([dir, sub]) => `~/${dir}/${sub}`),
+  '~/.imcodes/skills',
+] as const;
+
+/** Display prefixes for project-level skill roots (relative to project root). */
+export const PROJECT_AGENT_SKILL_DISPLAY_ROOTS = [
+  ...AGENT_SKILLS_PROJECT_ROOT_SEGMENTS.map(([dir, sub]) => `${dir}/${sub}`),
+  '.imc/skills',
+] as const;
+
+/** How the primary directory is named to people and agents, whatever the platform. */
 export const AGENT_SKILLS_DIRECTORY_DISPLAY = '~/.agents/skills' as const;
 
 /** Where the `skills` CLI records each global skill's source, beside the skills. */
 export const AGENT_SKILLS_LOCK_FILE_SEGMENTS = ['.agents', '.skill-lock.json'] as const;
+
+/** Project-level skills lockfile written by `skills` CLI at a repository root. */
+export const AGENT_SKILLS_PROJECT_LOCK_FILE = 'skills-lock.json' as const;
 
 export const AGENT_SKILL_FILE_NAME = 'SKILL.md' as const;
 

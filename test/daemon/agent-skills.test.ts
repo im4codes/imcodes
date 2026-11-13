@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { makeSkillUri } from '../../shared/skill-registry-types.js';
+import { buildUserSkillRegistry } from '../../src/context/skill-registry-builder.js';
 import { getSkillRegistryPathsForManagement, writeSkillRegistryManagementSnapshot } from '../../src/context/skill-registry.js';
 import {
   AGENT_SKILLS_ACTION,
@@ -285,5 +286,103 @@ describe('composer skill references', () => {
     const expanded = await expandAgentSkillReferences(marker, root, { projectDir: project });
     expect(expanded.expanded).toEqual(['project-writer@skill://project_escape_hatch/project-writer']);
     expect(expanded.text).toContain('# Project writer');
+  });
+
+  it('discovers skills across user/project agent roots, deduplicates copies and symlinks, skips dotdirs/non-skills, and rejects escapes', async () => {
+    const root = await home();
+    const project = join(root, 'workspace');
+    const outside = await home();
+    await mkdir(project, { recursive: true });
+
+    // Multi-agent duplicate copies (different files, same skill name)
+    for (const dir of ['.claude', '.codex', '.gemini']) {
+      const s = join(root, dir, 'skills', 'openspec-explore');
+      await mkdir(s, { recursive: true });
+      await writeFile(join(s, 'SKILL.md'), '---\nname: openspec-explore\ndescription: Explore codebase\n---\n# Explore body\n');
+    }
+    // Additional user roots
+    for (const [dir, name] of [
+      ['.cursor', 'cursor-only'],
+      ['.qwen', 'qwen-only'],
+      ['.opencode', 'opencode-only'],
+      ['.openclaw', 'openclaw-only'],
+    ] as const) {
+      const s = join(root, dir, 'skills', name);
+      await mkdir(s, { recursive: true });
+      await writeFile(join(s, 'SKILL.md'), `---\nname: ${name}\ndescription: From ${dir}\n---\n# ${name}\n`);
+    }
+    // Hidden dir and non-skill dir (no SKILL.md)
+    await mkdir(join(root, '.codex', 'skills', '.system', 'hidden-sys'), { recursive: true });
+    await writeFile(join(root, '.codex', 'skills', '.system', 'hidden-sys', 'SKILL.md'), '---\nname: hidden-sys\n---\n');
+    await mkdir(join(root, '.claude', 'skills', 'synced', 'nested'), { recursive: true });
+    await writeFile(join(root, '.claude', 'skills', 'synced', 'README.md'), 'not a skill');
+
+    // Cross-agent symlink inside homeDir -> should work cleanly and deduplicate
+    await mkdir(join(root, 'shared-store', 'linked-local'), { recursive: true });
+    await writeFile(join(root, 'shared-store', 'linked-local', 'SKILL.md'), '---\ndescription: Linked inside home\n---\n# Linked body\n');
+    await symlink(join(root, 'shared-store', 'linked-local'), join(root, '.claude', 'skills', 'linked-local'));
+
+    // Escapes: skill dir symlink outside homeDir, and SKILL.md symlink outside skill dir
+    await mkdir(join(outside, 'secret-skill'), { recursive: true });
+    await writeFile(join(outside, 'secret-skill', 'SKILL.md'), '---\ndescription: escape\n---\nsecret');
+    await symlink(join(outside, 'secret-skill'), join(root, '.claude', 'skills', 'escape-dir'));
+
+    await mkdir(join(root, '.claude', 'skills', 'escape-file'), { recursive: true });
+    await writeFile(join(outside, 'leak.md'), '---\ndescription: leak\n---\nsecret');
+    await symlink(join(outside, 'leak.md'), join(root, '.claude', 'skills', 'escape-file', 'SKILL.md'));
+
+    // Project root + skills-lock.json + project escape check
+    const projSkill = join(project, '.claude', 'skills', 'repo-workflow');
+    await mkdir(projSkill, { recursive: true });
+    await writeFile(join(projSkill, 'SKILL.md'), '---\ndescription: Repo workflow\n---\n# Repo Workflow Body\n');
+    await writeFile(join(project, 'skills-lock.json'), JSON.stringify({
+      version: 1,
+      skills: { 'repo-workflow': { source: 'acme/repo-skills' } },
+    }));
+    await symlink(join(outside, 'secret-skill'), join(project, '.claude', 'skills', 'proj-escape'));
+
+    // Indexing user registry must not cause duplicate entries in listAgentSkills!
+    buildUserSkillRegistry({ homeDir: root });
+
+    const listed = await listAgentSkills(root, { projectDir: project });
+    const names = listed.map((item) => item.name);
+
+    expect(names.filter((n) => n === 'openspec-explore')).toHaveLength(1);
+    expect(names).toContain('cursor-only');
+    expect(names).toContain('qwen-only');
+    expect(names).toContain('opencode-only');
+    expect(names).toContain('openclaw-only');
+    expect(names).toContain('linked-local');
+    expect(names).toContain('repo-workflow');
+    expect(names).not.toContain('.system');
+    expect(names).not.toContain('hidden-sys');
+    expect(names).not.toContain('synced');
+    expect(names).not.toContain('escape-dir');
+    expect(names).not.toContain('escape-file');
+    expect(names).not.toContain('proj-escape');
+
+    const projEntry = listed.find((item) => item.name === 'repo-workflow');
+    expect(projEntry).toMatchObject({
+      layer: 'project_escape_hatch',
+      displayPath: '.claude/skills/repo-workflow',
+      source: 'acme/repo-skills',
+    });
+
+    // No host absolute path leakage anywhere in browser-facing entries
+    for (const item of listed) {
+      expect(item.displayPath).not.toContain(root);
+      expect(item.uri).not.toContain(root);
+    }
+
+    // Expanding both ~/.claude and project .claude skills works via $$(...)
+    const expanded = await expandAgentSkillReferences(
+      'run $$(openspec-explore) and $$(repo-workflow)',
+      root,
+      { projectDir: project },
+    );
+    expect(expanded.unresolved).toEqual([]);
+    expect(expanded.expanded).toEqual(['openspec-explore', 'repo-workflow']);
+    expect(expanded.text).toContain('# Explore body');
+    expect(expanded.text).toContain('# Repo Workflow Body');
   });
 });

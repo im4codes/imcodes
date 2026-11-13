@@ -9,7 +9,8 @@ import { parseSkillMarkdown, type SkillProjectContext } from '../../shared/skill
 import { resolveSkillSelection } from '../../shared/skill-precedence.js';
 import { getSkillRegistrySnapshot } from './skill-registry.js';
 import { incrementCounter } from '../util/metrics.js';
-import { assertManagedSkillPathSync, ManagedSkillPathError } from './managed-skill-path.js';
+import { assertReadableSkillPathSync, ManagedSkillPathError } from './managed-skill-path.js';
+import { parseExternalAgentSkillMarkdown } from './agent-skill-markdown.js';
 import { MANAGED_SKILL_PACKAGE_LIMITS, parseAgentSkillMarkdown } from '../capability/agent-skill-package.js';
 import {
   readManagedSkillIndex,
@@ -199,7 +200,7 @@ export function resolveSkillByKey(options: SkillResolveOptions): SkillResolveRes
   }
   let managedPath;
   try {
-    managedPath = assertManagedSkillPathSync({
+    managedPath = assertReadableSkillPathSync({
       path: entry.path,
       projectDir: options.projectDir,
       homeDir: options.homeDir,
@@ -214,7 +215,9 @@ export function resolveSkillByKey(options: SkillResolveOptions): SkillResolveRes
   }
   try {
     const markdown = readFileSync(managedPath.realPath, 'utf8');
-    const parsed = parseSkillMarkdown(markdown, { name: entry.metadata.name, category: entry.metadata.category });
+    const parsed = managedPath.externalAgentRoot
+      ? parseExternalAgentSkillMarkdown(markdown, { name: entry.metadata.name, category: entry.metadata.category })
+      : parseSkillMarkdown(markdown, { name: entry.metadata.name, category: entry.metadata.category });
     try {
       return {
         ok: true,

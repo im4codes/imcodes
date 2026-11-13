@@ -1,18 +1,22 @@
 import { spawn } from 'node:child_process';
 import { constants } from 'node:fs';
-import { access, readFile, readdir, stat } from 'node:fs/promises';
+import { access, readFile, readdir, realpath, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { delimiter, join } from 'node:path';
+import { delimiter, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { parseDocument } from 'yaml';
 import {
   AGENT_SKILL_FILE_NAME,
   AGENT_SKILLS_ACTION,
   AGENT_SKILLS_CLI_PACKAGE,
-  AGENT_SKILLS_DIRECTORY_SEGMENTS,
   AGENT_SKILLS_ERROR,
   AGENT_SKILLS_LIMITS,
   AGENT_SKILLS_LOCK_FILE_SEGMENTS,
   AGENT_SKILLS_MSG,
+  AGENT_SKILLS_PROJECT_LOCK_FILE,
+  AGENT_SKILLS_PROJECT_ROOT_SEGMENTS,
+  AGENT_SKILLS_USER_ROOT_SEGMENTS,
+  PROJECT_AGENT_SKILL_DISPLAY_ROOTS,
+  USER_AGENT_SKILL_DISPLAY_ROOTS,
   isAgentSkillBinName,
   isAgentSkillName,
   readAgentSkillsRunRequest,
@@ -126,9 +130,9 @@ export async function hasCommand(
   return false;
 }
 
-async function readLock(homeDir: string): Promise<Record<string, Record<string, unknown>>> {
+async function readLockFile(lockPath: string): Promise<Record<string, Record<string, unknown>>> {
   try {
-    const value = JSON.parse(await readFile(join(homeDir, ...AGENT_SKILLS_LOCK_FILE_SEGMENTS), 'utf8')) as unknown;
+    const value = JSON.parse(await readFile(lockPath, 'utf8')) as unknown;
     const skills = (value as { skills?: unknown } | null)?.skills;
     return skills && typeof skills === 'object' && !Array.isArray(skills)
       ? skills as Record<string, Record<string, unknown>>
@@ -138,81 +142,200 @@ async function readLock(homeDir: string): Promise<Record<string, Record<string, 
   }
 }
 
+function isUnderDir(candidate: string, root: string): boolean {
+  const rel = relative(root, candidate);
+  return rel === '' || (!!rel && !rel.startsWith('..') && !isAbsolute(rel));
+}
+
+function isExternalAgentDisplayPath(displayPath: string | undefined): boolean {
+  if (!displayPath) return false;
+  const normalized = displayPath.trim().replace(/\\/gu, '/');
+  for (const root of USER_AGENT_SKILL_DISPLAY_ROOTS) {
+    if (root === '~/.imcodes/skills') continue;
+    if (normalized === root || normalized.startsWith(`${root}/`)) return true;
+  }
+  for (const root of PROJECT_AGENT_SKILL_DISPLAY_ROOTS) {
+    if (root === '.imc/skills') continue;
+    if (normalized === root || normalized.startsWith(`${root}/`)) return true;
+  }
+  return false;
+}
+
+interface AgentSkillScanResult {
+  skills: AgentSkillEntry[];
+  pathByEntry: WeakMap<AgentSkillEntry, string>;
+}
+
 /**
- * Every skill in `~/.agents/skills`: a directory (or a link to one -- a Windows
- * junction included, which `stat` follows) holding a SKILL.md.
+ * Every skill across project and user agent skill directories (plus IM.codes
+ * registry entries): a directory (or symlink/junction resolving inside
+ * homeDir/projectDir) holding a SKILL.md that resolves inside that skill
+ * directory. Pure offline filesystem scan (never spawns `npx`).
  */
 async function listAgentSkillsInternal(
   homeDir: string,
   context: { projectDir?: string },
   topLevelOnly: boolean,
-): Promise<AgentSkillEntry[]> {
-  const root = join(homeDir, ...AGENT_SKILLS_DIRECTORY_SEGMENTS);
-  let names: string[];
-  try {
-    names = await readdir(root);
-  } catch {
-    // A project may provide registry skills even when the user's local
-    // ~/.agents/skills root has never been created on this device.
-    names = [];
-  }
-  const lock = await readLock(homeDir);
+): Promise<AgentSkillScanResult> {
+  const resolvedHome = resolve(homeDir);
+  const realHome = await realpath(resolvedHome).catch(() => resolvedHome);
+  const userLockPromise = readLockFile(join(homeDir, ...AGENT_SKILLS_LOCK_FILE_SEGMENTS));
+
+  const projectDir = context.projectDir?.trim() ? resolve(context.projectDir.trim()) : undefined;
+  const realProjectPromise = projectDir ? realpath(projectDir).catch(() => projectDir) : Promise.resolve(undefined);
+  const projectLockPromise = projectDir ? readLockFile(join(projectDir, AGENT_SKILLS_PROJECT_LOCK_FILE)) : Promise.resolve({});
+
+  const [userLock, realProject, projectLock] = await Promise.all([userLockPromise, realProjectPromise, projectLockPromise]);
+
+  const commandCache = new Map<string, Promise<boolean>>();
+  const checkCommand = (bin: string): Promise<boolean> => {
+    let pending = commandCache.get(bin);
+    if (!pending) {
+      pending = hasCommand(bin);
+      commandCache.set(bin, pending);
+    }
+    return pending;
+  };
+
   const skills: AgentSkillEntry[] = [];
-  for (const name of names.sort((a, b) => a.localeCompare(b))) {
-    if (skills.length >= AGENT_SKILLS_LIMITS.SKILLS) break;
-    if (!isAgentSkillName(name)) continue;
-    const directory = join(root, name);
-    try {
-      if (!(await stat(directory)).isDirectory()) continue;
-      if (!(await stat(join(directory, AGENT_SKILL_FILE_NAME))).isFile()) continue;
-    } catch {
-      continue;
+  const pathByEntry = new WeakMap<AgentSkillEntry, string>();
+  const seenRealDirs = new Set<string>();
+  const seenRealFiles = new Set<string>();
+  const seenScopeNames = new Set<string>();
+
+  interface ScanRootSpec {
+    scope: 'project' | 'user';
+    layer: 'project_escape_hatch' | 'user_default';
+    rootPath: string;
+    realScopeRoot: string;
+    displayPrefix: string;
+    lock: Record<string, Record<string, unknown>>;
+  }
+
+  const scanSpecs: ScanRootSpec[] = [];
+  if (projectDir && realProject) {
+    for (const segments of AGENT_SKILLS_PROJECT_ROOT_SEGMENTS) {
+      scanSpecs.push({
+        scope: 'project',
+        layer: 'project_escape_hatch',
+        rootPath: join(projectDir, ...segments),
+        realScopeRoot: realProject,
+        displayPrefix: `${segments[0]}/${segments[1]}`,
+        lock: projectLock,
+      });
     }
-    const locked = lock[name] ?? {};
-    const frontMatter = await readFrontMatter(directory);
-    const missingBins: string[] = [];
-    for (const bin of frontMatter.bins) {
-      if (!(await hasCommand(bin))) missingBins.push(bin);
-    }
-    skills.push({
-      name,
-      description: frontMatter.description,
+  }
+  for (const segments of AGENT_SKILLS_USER_ROOT_SEGMENTS) {
+    scanSpecs.push({
+      scope: 'user',
       layer: 'user_default',
-      displayPath: `~/.agents/skills/${name}`,
-      uri: `skill://user_default/${encodeURIComponent(name)}`,
-      ...(missingBins.length > 0 ? { missingBins } : {}),
-      ...(firstString(locked, 'source', AGENT_SKILLS_LIMITS.SOURCE_CHARS) ? { source: firstString(locked, 'source', AGENT_SKILLS_LIMITS.SOURCE_CHARS) } : {}),
-      ...(firstString(locked, 'sourceUrl', AGENT_SKILLS_LIMITS.SOURCE_CHARS) ? { sourceUrl: firstString(locked, 'sourceUrl', AGENT_SKILLS_LIMITS.SOURCE_CHARS) } : {}),
-      ...(firstString(locked, 'installedAt', 40) ? { installedAt: firstString(locked, 'installedAt', 40) } : {}),
-      ...(firstString(locked, 'updatedAt', 40) ? { updatedAt: firstString(locked, 'updatedAt', 40) } : {}),
+      rootPath: join(resolvedHome, ...segments),
+      realScopeRoot: realHome,
+      displayPrefix: `~/${segments[0]}/${segments[1]}`,
+      lock: userLock,
     });
   }
+
+  // Read all candidate root directory listings concurrently for <20ms cold latency.
+  const rootListings = await Promise.all(
+    scanSpecs.map(async (spec) => {
+      try {
+        return await readdir(spec.rootPath);
+      } catch {
+        return [] as string[];
+      }
+    }),
+  );
+
+  for (let i = 0; i < scanSpecs.length; i++) {
+    if (skills.length >= AGENT_SKILLS_LIMITS.SKILLS) break;
+    const spec = scanSpecs[i]!;
+    const names = rootListings[i]!.sort((a, b) => a.localeCompare(b));
+    for (const name of names) {
+      if (skills.length >= AGENT_SKILLS_LIMITS.SKILLS) break;
+      if (name.startsWith('.') || !isAgentSkillName(name)) continue;
+      const scopeNameKey = `${spec.scope}\u0000${name.toLocaleLowerCase()}`;
+      if (seenScopeNames.has(scopeNameKey)) continue;
+
+      const directory = join(spec.rootPath, name);
+      const skillFile = join(directory, AGENT_SKILL_FILE_NAME);
+      let realDir: string;
+      let realSkillFile: string;
+      try {
+        if (!(await stat(directory)).isDirectory()) continue;
+        realDir = await realpath(directory);
+        if (!isUnderDir(realDir, spec.realScopeRoot)) continue;
+        if (seenRealDirs.has(realDir)) continue;
+        if (!(await stat(skillFile)).isFile()) continue;
+        realSkillFile = await realpath(skillFile);
+        if (dirname(realSkillFile) !== realDir) continue;
+        if (seenRealFiles.has(realSkillFile)) continue;
+      } catch {
+        continue;
+      }
+
+      const locked = spec.lock[name] ?? {};
+      const frontMatter = await readFrontMatter(realDir);
+      const missingBins: string[] = [];
+      for (const bin of frontMatter.bins) {
+        if (!(await checkCommand(bin))) missingBins.push(bin);
+      }
+
+      const entry: AgentSkillEntry = {
+        name,
+        description: frontMatter.description,
+        layer: spec.layer,
+        displayPath: `${spec.displayPrefix}/${name}`,
+        uri: `skill://${spec.layer}/${encodeURIComponent(name)}`,
+        ...(missingBins.length > 0 ? { missingBins } : {}),
+        ...(firstString(locked, 'source', AGENT_SKILLS_LIMITS.SOURCE_CHARS) ? { source: firstString(locked, 'source', AGENT_SKILLS_LIMITS.SOURCE_CHARS) } : {}),
+        ...(firstString(locked, 'sourceUrl', AGENT_SKILLS_LIMITS.SOURCE_CHARS) ? { sourceUrl: firstString(locked, 'sourceUrl', AGENT_SKILLS_LIMITS.SOURCE_CHARS) } : {}),
+        ...(firstString(locked, 'installedAt', 40) ? { installedAt: firstString(locked, 'installedAt', 40) } : {}),
+        ...(firstString(locked, 'updatedAt', 40) ? { updatedAt: firstString(locked, 'updatedAt', 40) } : {}),
+      };
+      seenScopeNames.add(scopeNameKey);
+      seenRealDirs.add(realDir);
+      seenRealFiles.add(realSkillFile);
+      pathByEntry.set(entry, realSkillFile);
+      skills.push(entry);
+    }
+  }
+
   try {
     const snapshot = getSkillRegistryManagementSnapshot({ projectDir: context.projectDir, homeDir });
     for (const entry of snapshot.entries) {
       // The picker is device-local: registry metadata without a readable local
       // payload must not be offered as an installable/expandable skill.
       if (!entry.path) continue;
-      if (!(await registryPayloadPath(entry.path))) continue;
+      const payload = await registryPayloadPath(entry.path);
+      if (!payload) continue;
+      const realPayload = await realpath(payload).catch(() => undefined);
+      if (realPayload && seenRealFiles.has(realPayload)) continue;
       const name = entry.metadata.name?.trim() || entry.key;
       if (!name || skills.length >= AGENT_SKILLS_LIMITS.SKILLS * 2) break;
+      const entryScope = entry.layer === 'project_escape_hatch' ? 'project' : 'user';
+      const scopeNameKey = `${entryScope}\u0000${name.toLocaleLowerCase()}`;
+      if (isExternalAgentDisplayPath(entry.displayPath) && seenScopeNames.has(scopeNameKey)) continue;
+
       const listed = { name, description: entry.metadata.description ?? '', layer: entry.layer, displayPath: entry.displayPath, uri: entry.uri } satisfies AgentSkillEntry;
       if (topLevelOnly && !isTopLevelAgentSkillEntry(listed)) continue;
+      if (realPayload) seenRealFiles.add(realPayload);
+      pathByEntry.set(listed, realPayload ?? payload);
       skills.push(listed);
     }
   } catch { /* registry is optional; local skills remain available */ }
-  return skills;
+  return { skills, pathByEntry };
 }
 
 /** List only the direct skills that the composer should offer. */
 export async function listAgentSkills(homeDir: string = homedir(), context: { projectDir?: string } = {}): Promise<AgentSkillEntry[]> {
-  return listAgentSkillsInternal(homeDir, context, true);
+  return (await listAgentSkillsInternal(homeDir, context, true)).skills;
 }
 
 /**
- * Expand composer `$$()` references using only known entries in this daemon's
- * own ~/.agents/skills directory. The marker remains in the timeline text;
- * this copy is provider-bound and never logged. Repeated references are
+ * Expand composer `$$()` references using discovered agent skills and
+ * validated registry entries on this daemon. The marker remains in the timeline
+ * text; this copy is provider-bound and never logged. Repeated references are
  * removed after the first expansion so retries/queue drains cannot duplicate
  * a skill body in one prompt.
  */
@@ -225,8 +348,7 @@ export async function expandAgentSkillReferences(
   if (markers.length === 0) return { text, unresolved: [], expanded: [] };
   // Expansion keeps compatibility with explicit legacy/nested references;
   // only the picker-facing list is narrowed to top-level entries.
-  const skills = await listAgentSkillsInternal(homeDir, context, false);
-  const root = join(homeDir, ...AGENT_SKILLS_DIRECTORY_SEGMENTS);
+  const { skills, pathByEntry } = await listAgentSkillsInternal(homeDir, context, false);
   const unresolved: string[] = [];
   const expanded: string[] = [];
   const emitted = new Set<string>();
@@ -248,11 +370,11 @@ export async function expandAgentSkillReferences(
     }
     if (emitted.has(body)) continue;
     try {
-      let skillPath = join(root, skill.name, AGENT_SKILL_FILE_NAME);
-      if (!skill.displayPath?.startsWith('~/.agents/skills/')) {
-        const registry = getSkillRegistryManagementSnapshot({ projectDir: context.projectDir, homeDir });
-        const entry = registry.entries.find((candidate) => candidate.uri === skill.uri);
-        if (entry?.path) skillPath = (await registryPayloadPath(entry.path)) ?? skillPath;
+      const skillPath = pathByEntry.get(skill);
+      if (!skillPath || (await stat(skillPath)).size > MAX_SKILL_FILE_BYTES) {
+        unresolved.push(body);
+        result.push(match[0]);
+        continue;
       }
       const content = await readFile(skillPath, 'utf8');
       if (!content.trim() || Buffer.byteLength(content, 'utf8') > MAX_SKILL_FILE_BYTES) {
