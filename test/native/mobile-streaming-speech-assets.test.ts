@@ -1038,6 +1038,73 @@ do {
     let evs = events()
     require(evs.contains(.final("q:6400")), "L: quiet speech dropped before final: \\(evs)")
     require(evs.contains { if case .audioLevel(let lvl) = $0 { return lvl > 0.015 }; return false }, "L: missing responsive audioLevel event: \\(evs)")
+
+    // F1 class test: steady 60Hz hum and broadband fan noise (0.0012..0.003) after 0.2s speech must adapt & allow SpeechWindow VAD pause commit.
+    func tonePCM(_ count: Int, rms: Float, freqHz: Float, phaseOffset: Int = 0) -> [Float] {
+        let peak = rms * sqrt(2.0)
+        return (0..<count).map { i in peak * sin(2.0 * .pi * freqHz * Float(phaseOffset + i) / 16000.0) }
+    }
+    func fanPCM(_ count: Int, rms: Float, seed: UInt64) -> [Float] {
+        var state = seed
+        var raw = [Float](repeating: 0, count: count)
+        var sumSq: Double = 0
+        for i in 0..<count {
+            state = state &* 6364136223846793005 &+ 1442695040888963407
+            let u = Float(Int32(bitPattern: UInt32(truncatingIfNeeded: state >> 32))) / Float(Int32.max)
+            raw[i] = u
+            sumSq += Double(u) * Double(u)
+        }
+        let actualRMS = Float(sqrt(sumSq / Double(max(1, count))))
+        let scale = actualRMS > 0 ? rms / actualRMS : 0
+        return raw.map { $0 * scale }
+    }
+    for chunkSize in [400, 1600, 19200] {
+        for (kind, rms) in [("hum60", Float(0.002)), ("hum60_low", Float(0.0012)), ("hum60_high", Float(0.003)), ("fan", Float(0.002))] {
+            var humInbox = SpeechInbox()
+            var humWin = SpeechWindow()
+            let decodeSpeech: SpeechWindow.DecodeFn = { _, _ in ("speech", [1, 2]) }
+            _ = try! humInbox.offer([Float](repeating: 0, count: SpeechInbox.warmupSamples))
+            for step in 0..<8 {
+                _ = try! humInbox.offer(tonePCM(400, rms: 0.005, freqHz: 220, phaseOffset: step * 400))
+                if let batch = humInbox.take() {
+                    try! humWin.append(batch.samples, speech: batch.speech, trailingSilence: batch.trailingSilence, decode: decodeSpeech) { _ in }
+                }
+            }
+            require(!humWin.samples.isEmpty, "L: speech failed to open window before noise (\\(kind)/\\(chunkSize))")
+            var voicedNoiseFrames = 0
+            var offset = 0
+            while offset < 19200 {
+                let n = min(chunkSize, 19200 - offset)
+                let noiseChunk = kind == "fan"
+                    ? fanPCM(n, rms: rms, seed: UInt64(0xAA00_0001 + offset))
+                    : tonePCM(n, rms: rms, freqHz: 60, phaseOffset: offset)
+                _ = try! humInbox.offer(noiseChunk)
+                if humInbox.lastVoiced { voicedNoiseFrames += 1 }
+                if let batch = humInbox.take() {
+                    try! humWin.append(batch.samples, speech: batch.speech, trailingSilence: batch.trailingSilence, decode: decodeSpeech) { _ in }
+                }
+                offset += n
+            }
+            require(!humInbox.lastVoiced && humWin.samples.isEmpty && humWin.committed == "speech",
+                    "L: steady noise blocked VAD commit (\\(kind)/\\(rms)/chunk=\\(chunkSize)): left=\\(humWin.samples.count) voiced=\\(voicedNoiseFrames)")
+        }
+    }
+
+    // Cold-start steady noise adapts, and modulated quiet speech (0.003..0.0055) over the noise still opens & boosts cleanly.
+    var ambientInbox = SpeechInbox()
+    _ = try! ambientInbox.offer([Float](repeating: 0, count: SpeechInbox.warmupSamples))
+    for step in 0..<48 {
+        _ = try! ambientInbox.offer(fanPCM(400, rms: 0.0015, seed: UInt64(0xBB00_0001 + step)))
+        _ = ambientInbox.take()
+    }
+    require(!ambientInbox.lastVoiced, "L: cold-start fan noise stayed voiced")
+    for (idx, rms) in [Float(0.0040), 0.0055, 0.0032, 0.0050, 0.0035].enumerated() {
+        _ = try! ambientInbox.offer(tonePCM(400, rms: rms, freqHz: 240, phaseOffset: idx * 400))
+        require(ambientInbox.lastVoiced, "L: modulated quiet speech blocked over noise at rms=\\(rms)")
+        let batch = ambientInbox.take()!
+        require(batch.speech && SpeechGain.rms(batch.samples) >= rms * 3.0 && batch.samples.allSatisfy { $0 > -1.0 && $0 < 1.0 },
+                "L: modulated quiet speech gain/bounds invalid at rms=\\(rms)")
+    }
     print("SPEECH_GAIN_AND_INBOX_VAD:PASS")
 }
 `);

@@ -1123,28 +1123,49 @@ struct SpeechWindow {
 }
 
 
-/// Bounded adaptive speech AGC + soft-knee tanh limiter for 16 kHz mono float PCM.
-/// Lifts quiet-to-normal handheld speech toward an ASR-friendly RMS while keeping
-/// room silence unboosted and bounding peaks strictly inside (-1.0, 1.0).
+/// Bounded adaptive speech AGC + adaptive pre-gain noise floor + soft-knee tanh limiter
+/// for 16 kHz mono float PCM. Lifts quiet-to-normal handheld speech toward an ASR-friendly
+/// RMS while adapting to stationary ambient noise/hum and bounding peaks inside (-1.0, 1.0).
 struct SpeechGain {
+    static let sampleRate = 16000
     static let targetRMS: Float = 0.14
     static let minGain: Float = 1.0
     static let maxGain: Float = 8.0
+    static let minNoiseFloorRMS: Float = 0.0004
+    static let initialNoiseFloorRMS: Float = 0.0005
+    static let maxNoiseFloorRMS: Float = 0.0038
+    static let maxNoiseCeilingRMS: Float = 0.0040
     static let noiseFloorLowRMS: Float = 0.0005
     static let noiseFloorHighRMS: Float = 0.0014
     static let voicedRawRMSFloor: Float = 0.0010
+    static let voicedNoiseMultiplier: Float = 1.45
     static let voicedBoostedRMSFloor: Float = 0.0050
+    static let stationaryHoldSeconds: Float = 0.18
+    static let noiseFloorAttackTau: Float = 0.13
+    static let noiseFloorReleaseTau: Float = 0.06
+    static let gainAttackUpTau: Float = 0.018
+    static let gainReleaseTau: Float = 0.125
+    static let analysisSubframeSamples = 400 // 25 ms @ 16 kHz keeps tracker & gain chunk-size invariant
     static let softKnee: Float = 0.75
     static let softHeadroom: Float = 0.24 // softKnee + softHeadroom = 0.99 < 1.0
-    static let attackUpAlpha: Float = 0.75
-    static let attackDownAlpha: Float = 1.0
-    static let releaseAlpha: Float = 0.18
     static let maxUpRampSamples = 80    // 5 ms at 16 kHz avoids step clicks without dropping onset
     static let maxDownRampSamples = 16  // 1 ms at 16 kHz pulls down loud transients immediately
 
-    private(set) var currentGain: Float = 1.0
+    struct Result {
+        let samples: [Float]
+        let rawRMS: Float
+        let boostedRMS: Float
+        let anyVoiced: Bool
+        let lastVoiced: Bool
+        let trailingUnvoicedSamples: Int
+    }
 
-    static func rms(_ samples: [Float]) -> Float {
+    private(set) var currentGain: Float = 1.0
+    private(set) var noiseFloorRMS: Float = SpeechGain.initialNoiseFloorRMS
+    private var prevSubframeRMS: Float = 0.0
+    private var stationaryDuration: Float = 0.0
+
+    static func rms(_ samples: ArraySlice<Float>) -> Float {
         guard !samples.isEmpty else { return 0 }
         var sumSq: Double = 0
         for sample in samples where sample.isFinite {
@@ -1154,10 +1175,16 @@ struct SpeechGain {
         return Float(sqrt(sumSq / Double(samples.count)))
     }
 
-    static func speechConfidence(rawRMS: Float) -> Float {
-        guard rawRMS.isFinite, rawRMS > noiseFloorLowRMS else { return 0 }
-        if rawRMS >= noiseFloorHighRMS { return 1 }
-        return (rawRMS - noiseFloorLowRMS) / (noiseFloorHighRMS - noiseFloorLowRMS)
+    static func rms(_ samples: [Float]) -> Float {
+        rms(samples[...])
+    }
+
+    static func speechConfidence(rawRMS: Float, noiseFloor: Float = initialNoiseFloorRMS) -> Float {
+        let low = max(noiseFloorLowRMS, noiseFloor * 1.15)
+        let high = max(noiseFloorHighRMS, noiseFloor * 1.75)
+        guard rawRMS.isFinite, rawRMS > low else { return 0 }
+        if rawRMS >= high { return 1 }
+        return (rawRMS - low) / max(high - low, 1e-6)
     }
 
     static func softLimit(_ x: Float) -> Float {
@@ -1166,34 +1193,71 @@ struct SpeechGain {
         if mag <= softKnee { return x }
         let sign: Float = x < 0 ? -1 : 1
         let excess = (mag - softKnee) / softHeadroom
-        let limited = sign * (softKnee + softHeadroom * tanh(excess))
+        let limited = sign * (softKnee + softHeadroom * tanhf(excess))
         return min(0.9999, max(-0.9999, limited))
     }
 
-    mutating func process(_ samples: [Float]) -> (samples: [Float], rawRMS: Float, boostedRMS: Float) {
-        guard !samples.isEmpty else { return ([], 0, 0) }
-        let rawRMS = Self.rms(samples)
-        let confidence = Self.speechConfidence(rawRMS: rawRMS)
+    private mutating func updateNoiseFloor(rawRMS: Float, dt: Float) {
+        guard rawRMS.isFinite else { return }
+        if rawRMS > Self.maxNoiseCeilingRMS {
+            stationaryDuration = 0
+            prevSubframeRMS = rawRMS
+            return
+        }
+        if prevSubframeRMS <= 0 {
+            prevSubframeRMS = rawRMS
+            stationaryDuration = 0
+        } else {
+            let ratio = rawRMS / prevSubframeRMS
+            if ratio >= 0.65 && ratio <= 1.54 {
+                stationaryDuration += dt
+                prevSubframeRMS += (rawRMS - prevSubframeRMS) * 0.35
+            } else {
+                stationaryDuration = 0
+                prevSubframeRMS = rawRMS
+            }
+        }
+        if rawRMS < noiseFloorRMS {
+            let alpha = 1.0 - expf(-dt / Self.noiseFloorReleaseTau)
+            noiseFloorRMS = max(Self.minNoiseFloorRMS, noiseFloorRMS + (rawRMS - noiseFloorRMS) * alpha)
+        } else if stationaryDuration >= Self.stationaryHoldSeconds {
+            let alpha = 1.0 - expf(-dt / Self.noiseFloorAttackTau)
+            noiseFloorRMS = min(Self.maxNoiseFloorRMS, noiseFloorRMS + (rawRMS - noiseFloorRMS) * alpha)
+        }
+    }
+
+    private mutating func processSubframe(
+        _ subframe: ArraySlice<Float>,
+        into out: inout [Float],
+        outOffset: Int
+    ) -> (voiced: Bool, sumSqOut: Double) {
+        let count = subframe.count
+        let dt = Float(count) / Float(Self.sampleRate)
+        let rawRMS = Self.rms(subframe)
+        updateNoiseFloor(rawRMS: rawRMS, dt: dt)
+
+        let confidence = Self.speechConfidence(rawRMS: rawRMS, noiseFloor: noiseFloorRMS)
         let speechDesired = min(Self.maxGain, max(Self.minGain, Self.targetRMS / max(rawRMS, 1e-4)))
         let desiredGain = Self.minGain + confidence * (speechDesired - Self.minGain)
 
         let startGain = currentGain
         let alpha: Float
         if desiredGain < currentGain {
-            alpha = confidence < 0.5 ? Self.releaseAlpha : Self.attackDownAlpha
+            alpha = confidence < 0.5 ? (1.0 - expf(-dt / Self.gainReleaseTau)) : 1.0
         } else {
-            alpha = Self.attackUpAlpha
+            alpha = 1.0 - expf(-dt / Self.gainAttackUpTau)
         }
         let nextGain = min(Self.maxGain, max(Self.minGain, currentGain + (desiredGain - currentGain) * alpha))
         currentGain = nextGain
 
         let rampLimit = nextGain < startGain ? Self.maxDownRampSamples : Self.maxUpRampSamples
-        let rampCount = min(samples.count, rampLimit)
-        var out = [Float](repeating: 0, count: samples.count)
-        var sumSq: Double = 0
+        let rampCount = min(count, rampLimit)
         let delta = nextGain - startGain
-        for i in 0..<samples.count {
-            let sample = samples[i]
+        var sumSqOut: Double = 0
+        var idx = subframe.startIndex
+        for i in 0..<count {
+            let sample = subframe[idx]
+            idx += 1
             let g: Float
             if i < rampCount && rampCount > 0 {
                 let t = Float(i + 1) / Float(rampCount)
@@ -1202,12 +1266,47 @@ struct SpeechGain {
                 g = nextGain
             }
             let y = Self.softLimit((sample.isFinite ? sample : 0) * g)
-            out[i] = y
+            out[outOffset + i] = y
             let dy = Double(y)
-            sumSq += dy * dy
+            sumSqOut += dy * dy
         }
-        let boostedRMS = Float(sqrt(sumSq / Double(out.count)))
-        return (out, rawRMS, boostedRMS)
+        let boostedRMS = Float(sqrt(sumSqOut / Double(count)))
+        let minSpeechFloor = max(Self.voicedRawRMSFloor, noiseFloorRMS * Self.voicedNoiseMultiplier)
+        let voiced = rawRMS >= minSpeechFloor && boostedRMS >= Self.voicedBoostedRMSFloor
+        return (voiced, sumSqOut)
+    }
+
+    mutating func process(_ samples: [Float]) -> Result {
+        guard !samples.isEmpty else {
+            return Result(samples: [], rawRMS: 0, boostedRMS: 0, anyVoiced: false, lastVoiced: false, trailingUnvoicedSamples: 0)
+        }
+        let overallRawRMS = Self.rms(samples)
+        var out = [Float](repeating: 0, count: samples.count)
+        var totalSumSqOut: Double = 0
+        var anyVoiced = false
+        var lastVoiced = false
+        var trailingUnvoiced = 0
+
+        var pos = 0
+        while pos < samples.count {
+            let end = min(samples.count, pos + Self.analysisSubframeSamples)
+            let (voiced, subSumSqOut) = processSubframe(samples[pos..<end], into: &out, outOffset: pos)
+            totalSumSqOut += subSumSqOut
+            let subCount = end - pos
+            anyVoiced = anyVoiced || voiced
+            lastVoiced = voiced
+            trailingUnvoiced = voiced ? 0 : (trailingUnvoiced + subCount)
+            pos = end
+        }
+        let overallBoostedRMS = Float(sqrt(totalSumSqOut / Double(out.count)))
+        return Result(
+            samples: out,
+            rawRMS: overallRawRMS,
+            boostedRMS: overallBoostedRMS,
+            anyVoiced: anyVoiced,
+            lastVoiced: lastVoiced,
+            trailingUnvoicedSamples: trailingUnvoiced
+        )
     }
 }
 
@@ -1233,14 +1332,17 @@ struct SpeechInbox {
         let audio = input.dropFirst(skip)
         guard !audio.isEmpty else { return false }
         guard audio.count <= Self.limit - pending.count else { throw Failure.overload }
-        let (boosted, rawRMS, boostedRMS) = gain.process(Array(audio))
-        let level = min(1, boostedRMS * 4)
+        let result = gain.process(Array(audio))
+        let level = min(1, result.boostedRMS * 4)
         pendingAudioLevel = level
-        let voiced = rawRMS >= SpeechGain.voicedRawRMSFloor && boostedRMS >= SpeechGain.voicedBoostedRMSFloor
-        lastVoiced = voiced
-        speech = speech || voiced
-        trailingSilence = voiced ? 0 : trailingSilence + boosted.count
-        pending.append(contentsOf: boosted)
+        lastVoiced = result.lastVoiced
+        speech = speech || result.anyVoiced
+        if result.anyVoiced {
+            trailingSilence = result.trailingUnvoicedSamples
+        } else {
+            trailingSilence += result.samples.count
+        }
+        pending.append(contentsOf: result.samples)
         if scheduled { return false }
         scheduled = true
         return true
