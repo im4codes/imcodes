@@ -1,5 +1,7 @@
 package com.imcodes.speech;
 
+import java.io.File;
+import java.io.FileOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -26,6 +28,7 @@ public final class Qwen3SpeechTests {
         testWhisperMelReferenceMatch();
         testWhisperMelEdgeCases();
         testTokenizerEncodeDecodeAndRollback();
+        testTokenizerFromDirectory();
         testSpeechInboxWarmupThrottleOverload();
         testSpeechWindowPrefixRollbackAndVad();
         testSpeechWindowLowestEnergySplit();
@@ -234,6 +237,86 @@ public final class Qwen3SpeechTests {
         // Rolling back >= speech token count returns empty instead of bleeding into header.
         int[] tooShort = tok.safePrefixTokensForRollback(full, 6);
         checkEquals(0, tooShort.length, "never roll back into <asr_text> header");
+    }
+
+    private static void writeUtf8(File file, String text) throws Exception {
+        try (FileOutputStream out = new FileOutputStream(file)) {
+            out.write(text.getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
+    private static void deleteTree(File f) {
+        if (f == null || !f.exists()) return;
+        File[] children = f.listFiles();
+        if (children != null) {
+            for (File c : children) deleteTree(c);
+        }
+        f.delete();
+    }
+
+    private static void testTokenizerFromDirectory() throws Exception {
+        String ni = byteToGpt2Unicode((byte) 0xE4) + byteToGpt2Unicode((byte) 0xBD) + byteToGpt2Unicode((byte) 0xA0);
+        String haoLead2 = byteToGpt2Unicode((byte) 0xE5) + byteToGpt2Unicode((byte) 0xA5);
+        String haoTail1 = byteToGpt2Unicode((byte) 0xBD);
+        StringBuilder vocab = new StringBuilder("{");
+        List<String> entries = new ArrayList<>();
+        for (int b = 0; b < 256; b++) {
+            entries.add(jsonEscape(byteToGpt2Unicode((byte) b)) + ":" + b);
+        }
+        entries.add(jsonEscape("ab") + ":300");
+        entries.add(jsonEscape(ni) + ":305");
+        entries.add(jsonEscape(haoLead2) + ":306");
+        entries.add(jsonEscape(haoTail1) + ":307");
+        entries.add(jsonEscape("<|endoftext|>") + ":151643");
+        entries.add(jsonEscape("<|im_start|>") + ":151644");
+        entries.add(jsonEscape("<|im_end|>") + ":151645");
+        entries.add(jsonEscape("<|audio_start|>") + ":151669");
+        entries.add(jsonEscape("<|audio_end|>") + ":151670");
+        entries.add(jsonEscape("<|audio_pad|>") + ":151676");
+        entries.add(jsonEscape("<asr_text>") + ":151704");
+        vocab.append(String.join(",", entries)).append("}");
+        String vocabJson = vocab.toString();
+        String merges = "#version: 0.2\na b\n";
+        String config = "{\"eos_token\":\"<|im_end|>\",\"pad_token\":\"<|endoftext|>\","
+            + "\"added_tokens_decoder\":{\"151704\":{\"content\":\"<asr_text>\",\"special\":false}}}";
+
+        File baseTmp = new File(System.getProperty("java.io.tmpdir"));
+        File dirWithConfig = new File(baseTmp, "qwen3_tok_dir_" + System.nanoTime());
+        File dirNoConfig = new File(baseTmp, "qwen3_tok_noconfig_" + System.nanoTime());
+        try {
+            check(dirWithConfig.mkdirs() && dirNoConfig.mkdirs(), "create temp tokenizer fixture dirs");
+            writeUtf8(new File(dirWithConfig, "vocab.json"), vocabJson);
+            writeUtf8(new File(dirWithConfig, "merges.txt"), merges);
+            writeUtf8(new File(dirWithConfig, "tokenizer_config.json"), config);
+
+            Qwen3Tokenizer expected = Qwen3Tokenizer.fromContents(vocabJson, merges, config);
+            Qwen3Tokenizer actual = Qwen3Tokenizer.fromDirectory(dirWithConfig);
+
+            checkEquals(expected.eosTokenId, actual.eosTokenId, "fromDirectory eosTokenId");
+            checkEquals(expected.padTokenId, actual.padTokenId, "fromDirectory padTokenId");
+            checkEquals(expected.asrTextTokenId, actual.asrTextTokenId, "fromDirectory asrTextTokenId");
+            check(Arrays.equals(expected.encode("ab<asr_text>"), actual.encode("ab<asr_text>")),
+                "fromDirectory encode matches fromContents");
+            int[] splitUtf8 = new int[] { 300, 305, 306 }; // "ab" + "你" + incomplete 2/3 bytes of '好' (U+FFFD)
+            checkEquals(expected.decode(splitUtf8), actual.decode(splitUtf8),
+                "fromDirectory decode matches fromContents");
+            int[] withHeader = new int[] { 151704, 300, 305, 306 };
+            check(Arrays.equals(
+                    expected.safePrefixTokensForRollback(withHeader, 0),
+                    actual.safePrefixTokensForRollback(withHeader, 0)),
+                "fromDirectory U+FFFD rollback matches fromContents");
+
+            // Optional tokenizer_config.json absent -> defaults still work without throwing
+            writeUtf8(new File(dirNoConfig, "vocab.json"), vocabJson);
+            writeUtf8(new File(dirNoConfig, "merges.txt"), merges);
+            Qwen3Tokenizer fallback = Qwen3Tokenizer.fromDirectory(dirNoConfig);
+            checkEquals(151704, fallback.asrTextTokenId, "fromDirectory without config still resolves <asr_text>");
+            checkEquals("ab你", fallback.decode(fallback.encode("ab你")),
+                "fromDirectory without config encodes/decodes UTF-8 normally");
+        } finally {
+            deleteTree(dirWithConfig);
+            deleteTree(dirNoConfig);
+        }
     }
 
     private static void testSpeechInboxWarmupThrottleOverload() throws Exception {

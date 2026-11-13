@@ -132,6 +132,8 @@ describe('Qwen3-ASR mobile assets', () => {
     const consumerRules = await readFile(new URL('android/consumer-rules.pro', base), 'utf8');
     const android = await readFile(new URL('android/src/main/java/com/imcodes/speech/StreamingSpeechPlugin.java', base), 'utf8');
     const androidDecoder = await readFile(new URL('android/src/main/java/com/imcodes/speech/Qwen3OnnxDecoder.java', base), 'utf8');
+    const androidTokenizer = await readFile(new URL('android/src/main/java/com/imcodes/speech/Qwen3Tokenizer.java', base), 'utf8');
+    const androidMel = await readFile(new URL('android/src/main/java/com/imcodes/speech/WhisperMelExtractor.java', base), 'utf8');
     const androidWindow = await readFile(new URL('android/src/main/java/com/imcodes/speech/Qwen3SpeechWindow.java', base), 'utf8');
     const ios = await readFile(new URL('ios/Sources/StreamingSpeechPlugin/StreamingSpeechPlugin.swift', base), 'utf8');
     const qwenAsr = await readFile(new URL('ios/Sources/Qwen3ASR/Qwen3ASR.swift', base), 'utf8');
@@ -149,7 +151,7 @@ describe('Qwen3-ASR mobile assets', () => {
     expect(android).toContain('READ_CHUNK_SAMPLES = 800');
     expect(android).toContain('new Qwen3OnnxDecoder(');
     expect(android).toContain('new Qwen3SpeechWindow()');
-    expect(android).toContain('new Qwen3SpeechWindow.SpeechInbox()');
+    expect(android).toContain('new Qwen3SpeechWindow.SpeechInbox(new SpeechGain())');
     expect(android).toContain('decoder.close()');
     expect(android).not.toContain('OfflineRecognizer');
     expect(android).not.toContain('OfflinePunctuation');
@@ -169,6 +171,12 @@ describe('Qwen3-ASR mobile assets', () => {
     expect(androidWindow).toContain('VAD_PAUSE = SAMPLE_RATE * 7 / 10');
     expect(androidWindow).toContain('WARMUP_SAMPLES = 320');
     expect(androidWindow).toContain('AUDIO_LEVEL_INTERVAL_NS = 50_000_000L');
+    // API 24 compatibility guard: no java.nio.file (API 26+) or InputStream.readAllBytes/Files.readString (API 33+/Java 11) in production sources without coreLibraryDesugaring
+    expect(androidTokenizer).toContain('readUtf8File(');
+    expect(androidTokenizer).toContain('FileInputStream');
+    for (const javaSrc of [android, androidDecoder, androidTokenizer, androidMel, androidWindow]) {
+      expect(javaSrc).not.toMatch(/\bjava\.nio\.file\b|\bFiles\b|\.toPath\s*\(|\breadAllBytes\s*\(|\bFiles\s*\.\s*(?:readString|writeString)\s*\(|\bByteArrayOutputStream[^;]*toString\s*\(\s*StandardCharsets/);
+    }
 
     expect(ios).toContain('import Qwen3ASR');
     expect(ios).toContain('import Metal');

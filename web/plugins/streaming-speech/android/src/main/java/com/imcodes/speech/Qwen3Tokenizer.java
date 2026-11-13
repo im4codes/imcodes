@@ -2,9 +2,9 @@ package com.imcodes.speech;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -135,15 +135,27 @@ public final class Qwen3Tokenizer {
         if (id != null) set.add(id);
     }
 
+    private static String readUtf8File(File file) throws IOException {
+        try (FileInputStream in = new FileInputStream(file);
+             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) >= 0) {
+                if (n > 0) {
+                    out.write(buf, 0, n);
+                }
+            }
+            return new String(out.toByteArray(), StandardCharsets.UTF_8);
+        }
+    }
+
     public static Qwen3Tokenizer fromDirectory(File dir) throws IOException {
         File vocabFile = new File(dir, "vocab.json");
         File mergesFile = new File(dir, "merges.txt");
         File configFile = new File(dir, "tokenizer_config.json");
-        String vocabJson = new String(Files.readAllBytes(vocabFile.toPath()), StandardCharsets.UTF_8);
-        String mergesTxt = new String(Files.readAllBytes(mergesFile.toPath()), StandardCharsets.UTF_8);
-        String configJson = configFile.isFile()
-            ? new String(Files.readAllBytes(configFile.toPath()), StandardCharsets.UTF_8)
-            : "{}";
+        String vocabJson = readUtf8File(vocabFile);
+        String mergesTxt = readUtf8File(mergesFile);
+        String configJson = configFile.isFile() ? readUtf8File(configFile) : "{}";
         return fromContents(vocabJson, mergesTxt, configJson);
     }
 
