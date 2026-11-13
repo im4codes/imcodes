@@ -2,7 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
-import { switchSessionModelNow, restartSessionNow } from '../../src/daemon/command-handler.js';
+import { switchSessionModelNow, restartSessionNow, handoffSessionConversation } from '../../src/daemon/command-handler.js';
+import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
+import { timelineStore } from '../../src/daemon/timeline-store.js';
 import { SESSION_MODEL_APPLIED } from '../../shared/session-model-control.js';
 import { AgyAcpProvider } from '../../src/agent/providers/agy-acp.js';
 import { AGY_ACP_AGENT_NAME } from '../../shared/agy-agent.js';
@@ -408,5 +410,50 @@ describe('AG provider-switch failure recovery', () => {
     await send(name, 'fresh-with-stale-input');
     expect(rows().some(row => row.method === 'session/resume')).toBe(false);
     expect(rows().filter(row => row.method === 'session/new')).toHaveLength(1);
+  });
+
+  it('handoff resets AG native conversation, zeros usage, and injects concise handoff pack once on fresh turn', async () => {
+    await acp();
+    const name = names[0];
+    await launchTransportSession({ name, projectName: 'realproj', role: 'brain', agentType: AGY_SDK_PROVIDER_ID, projectDir: home, identityPrompt: 'fixture', fresh: true });
+    await send(name, 'prior goal turn');
+    const oldNativeId = store.getSession(name)?.providerResumeId;
+    expect(oldNativeId).toBeTruthy();
+
+    vi.spyOn(timelineStore, 'readCompletedTextTail').mockResolvedValue([
+      { eventId: 'u1', sessionId: name, ts: 10, seq: 1, epoch: 1, source: 'daemon', confidence: 'high', type: 'user.message', payload: { text: 'HANDOFF_GOAL_ALPHA' } },
+      { eventId: 'a1', sessionId: name, ts: 20, seq: 2, epoch: 1, source: 'daemon', confidence: 'high', type: 'assistant.text', payload: { text: 'HANDOFF_REPLY_BETA', streaming: false } },
+    ]);
+    const emitted: Array<{ type: string; payload: Record<string, unknown> }> = [];
+    const unsub = timelineEmitter.on((ev) => {
+      if (ev.sessionId === name) emitted.push({ type: ev.type, payload: ev.payload });
+    });
+    try {
+      const started = performance.now();
+      await handoffSessionConversation(store.getSession(name)!);
+      const localHandoffMs = performance.now() - started;
+      expect(localHandoffMs).toBeLessThan(2000);
+    } finally {
+      unsub();
+    }
+
+    expect(store.getSession(name)?.providerResumeId).toBeUndefined();
+    expect(store.getSession(name)?.agyNativeSessionState).toBe(AGY_NATIVE_SESSION_STATE.UNSTARTED);
+    expect(emitted.some((e) => e.type === 'usage.update' && e.payload.inputTokens === 0 && e.payload.cacheTokens === 0)).toBe(true);
+
+    // First turn after handoff starts a brand-new session/new (never session/resume) and receives the handoff pack once.
+    await send(name, 'continue after handoff');
+    expect(rows().some((row) => row.method === 'session/resume')).toBe(false);
+    expect(rows().filter((row) => row.method === 'session/new')).toHaveLength(2);
+    expect(store.getSession(name)?.providerResumeId).not.toBe(oldNativeId);
+    const prompts = rows().filter((row) => row.method === 'session/prompt');
+    const handoffPrompt = JSON.stringify(prompts.at(-1));
+    expect(handoffPrompt).toContain('HANDOFF_GOAL_ALPHA');
+    expect(handoffPrompt).toContain('HANDOFF_REPLY_BETA');
+
+    // Second turn must NOT re-inject the one-shot handoff pack.
+    await send(name, 'second turn clean');
+    const secondPrompt = JSON.stringify(rows().filter((row) => row.method === 'session/prompt').at(-1));
+    expect(secondPrompt).not.toContain('HANDOFF_GOAL_ALPHA');
   });
 });

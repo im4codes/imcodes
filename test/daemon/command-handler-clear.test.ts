@@ -63,7 +63,7 @@ vi.mock('../../src/util/imc-dir.js', () => ({ ensureImcDir: vi.fn().mockResolved
 vi.mock('../../src/daemon/supervision-broker.js', () => ({ supervisionBroker: { decide: vi.fn() } }));
 vi.mock('../../src/daemon/supervision-automation.js', () => ({ supervisionAutomation: { init: vi.fn(), setServerLink: vi.fn(), cancelSession: vi.fn(), queueTaskIntent: vi.fn(), updateQueuedTaskIntent: vi.fn(), removeQueuedTaskIntent: vi.fn(), registerTaskIntent: vi.fn(), applySnapshotUpdate: vi.fn() } }));
 
-import { handleWebCommand } from '../../src/daemon/command-handler.js';
+import { handleWebCommand, handoffSessionConversation } from '../../src/daemon/command-handler.js';
 
 const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
@@ -205,5 +205,124 @@ describe('process session /clear handling', () => {
       memoryExcluded: true,
     }, expect.objectContaining({ source: 'daemon' }));
     expect(emitMock).toHaveBeenCalledWith('deck_proj_brain', 'command.ack', { commandId: 'cmd-handoff-process', status: 'accepted' });
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_proj_brain',
+      'usage.update',
+      expect.objectContaining({ inputTokens: 0, cacheTokens: 0, outputTokens: 0 }),
+      expect.objectContaining({ source: 'daemon' }),
+    );
+  });
+
+  it('emits immediate accepted ack and starting state before slow handoff completes, then resets usage to 0', async () => {
+    let resolveRelaunch!: () => void;
+    relaunchSessionWithSettingsMock.mockImplementationOnce(
+      () => new Promise<void>((resolve) => { resolveRelaunch = resolve; }),
+    );
+    getSessionMock.mockReturnValue({
+      name: 'deck_proj_ag',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'agy-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      projectDir: '/proj',
+      activeModel: 'claude-sonnet-4-6',
+      sessionInstanceId: 'inst-1',
+    });
+
+    handleWebCommand({ type: 'session.send', session: 'deck_proj_ag', text: '/handoff', commandId: 'cmd-handoff-immediate' }, serverLink as any);
+    await flushAsync();
+
+    // Immediate UX feedback is already emitted while relaunch is still blocked.
+    expect(emitMock).toHaveBeenCalledWith('deck_proj_ag', 'command.ack', { commandId: 'cmd-handoff-immediate', status: 'accepted' });
+    expect(emitMock).toHaveBeenCalledWith('deck_proj_ag', 'session.state', { state: 'starting' }, expect.objectContaining({ source: 'daemon' }));
+    expect(emitMock).not.toHaveBeenCalledWith(
+      'deck_proj_ag',
+      'assistant.text',
+      expect.objectContaining({ noticeCode: DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED }),
+      expect.anything(),
+    );
+
+    resolveRelaunch();
+    await flushAsync();
+
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_proj_ag',
+      'usage.update',
+      expect.objectContaining({ inputTokens: 0, cacheTokens: 0, outputTokens: 0, model: 'claude-sonnet-4-6' }),
+      expect.objectContaining({ source: 'daemon' }),
+    );
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_proj_ag',
+      'assistant.text',
+      expect.objectContaining({ noticeCode: DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED }),
+      expect.objectContaining({ source: 'daemon' }),
+    );
+    expect(emitMock).toHaveBeenCalledWith('deck_proj_ag', 'session.state', { state: 'idle' }, expect.objectContaining({ source: 'daemon' }));
+  });
+
+  it('surfaces error ack on handoff failure, allows clean retry, and serializes concurrent resets', async () => {
+    const rec = {
+      name: 'deck_proj_retry',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'agy-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      projectDir: '/proj',
+      sessionInstanceId: 'inst-retry',
+    };
+    getSessionMock.mockReturnValue(rec);
+    relaunchSessionWithSettingsMock.mockRejectedValueOnce(new Error('provider down'));
+
+    handleWebCommand({ type: 'session.send', session: 'deck_proj_retry', text: '/handoff', commandId: 'cmd-fail-1' }, serverLink as any);
+    await flushAsync();
+
+    expect(emitMock).toHaveBeenCalledWith('deck_proj_retry', 'command.ack', { commandId: 'cmd-fail-1', status: 'error', error: 'provider down' });
+    expect(emitMock).toHaveBeenCalledWith('deck_proj_retry', 'session.state', { state: 'idle', error: 'provider down' }, expect.objectContaining({ source: 'daemon' }));
+
+    // Retry succeeds cleanly and concurrent handoffs execute sequentially (never overlapping).
+    let active = 0;
+    let maxActive = 0;
+    relaunchSessionWithSettingsMock.mockImplementation(async () => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((r) => setTimeout(r, 15));
+      active -= 1;
+    });
+    await Promise.all([
+      handoffSessionConversation(rec as any, serverLink as any),
+      handoffSessionConversation(rec as any, serverLink as any),
+    ]);
+    expect(maxActive).toBe(1);
+    expect(relaunchSessionWithSettingsMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('isolates old vs new session owners when sessionInstanceId changes before/during handoff', async () => {
+    const oldRec = {
+      name: 'deck_proj_owner',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'agy-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      projectDir: '/proj',
+      sessionInstanceId: 'inst-old',
+    };
+    let releaseFirst!: () => void;
+    relaunchSessionWithSettingsMock.mockImplementationOnce(() => new Promise<void>((r) => { releaseFirst = r; }));
+    getSessionMock.mockReturnValue(oldRec);
+
+    const first = handoffSessionConversation(oldRec as any, serverLink as any);
+    await flushAsync();
+
+    // Simulate the session being replaced by a new owner while waiting.
+    getSessionMock.mockReturnValue({ ...oldRec, sessionInstanceId: 'inst-new' });
+    const staleSecond = handoffSessionConversation(oldRec as any, serverLink as any);
+    releaseFirst();
+    await first;
+    await expect(staleSecond).rejects.toThrow(/ownership changed/i);
+    // Only the first call ran; the stale second owner call aborted before relaunch.
+    expect(relaunchSessionWithSettingsMock).toHaveBeenCalledTimes(1);
   });
 });

@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   CROSS_VENDOR_HANDOFF_DEFAULTS,
   normalizeCrossVendorHandoffConfig,
@@ -7,6 +10,17 @@ import {
 } from '../../shared/cross-vendor-handoff.js';
 import { buildCrossVendorHandoffPack, resolveCrossVendorHandoffPack, shouldCreateCrossVendorHandoff, sourceConversationKey } from '../../src/daemon/cross-vendor-handoff.js';
 import { timelineStore } from '../../src/daemon/timeline-store.js';
+import * as tokenizer from '../../src/context/tokenizer.js';
+
+vi.mock('../../src/context/tokenizer.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/context/tokenizer.js')>();
+  return {
+    ...actual,
+    countTokensAsync: vi.fn((...args: Parameters<typeof actual.countTokensAsync>) => actual.countTokensAsync(...args)),
+  };
+});
+import { setTaskPairStoreForTests, TASK_PAIRS_DB_PATH_ENV, TaskPairStore } from '../../src/daemon/task-pairs/store.js';
+import { DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
 import type { TimelineEvent } from '../../src/daemon/timeline-event.js';
 
 const event = (type: TimelineEvent['type'], payload: Record<string, unknown>, seq: number, ts: number): TimelineEvent => ({
@@ -205,5 +219,80 @@ describe('reported lost provider-switch context counterexamples', () => {
     expect(pack!.text).toContain('Fix login retry backoff');
     expect(pack!.text).toContain('Updated backoff in auth.ts');
     expect(pack!.text).not.toContain('/handoff');
+  });
+
+  it('bounds tokenizer worker IPC to <= 2 calls on 100-turn CJK overload and preserves newest turns within budget', async () => {
+    const countMock = vi.mocked(tokenizer.countTokensAsync);
+    countMock.mockClear();
+    const rows = Array.from({ length: 100 }, (_, i) => event(
+      i % 2 ? 'assistant.text' : 'user.message',
+      { text: `第${i}轮：${'上下文交接正文测试内容。'.repeat(100)}` },
+      i + 1,
+      i + 1,
+    ));
+    vi.spyOn(timelineStore, 'readCompletedTextTail').mockResolvedValue(rows);
+    const started = performance.now();
+    const pack = await buildCrossVendorHandoffPack(
+      record('agy-sdk'),
+      { epoch: 7, seq: 100, ts: 100 },
+      'agy-sdk',
+      'transport',
+      { maxTokens: 16_000 },
+    );
+    const elapsedMs = performance.now() - started;
+    expect(pack).toBeDefined();
+    expect(pack!.tokenCount).toBeLessThanOrEqual(16_000);
+    expect(pack!.text).toContain('第99轮');
+    expect(countMock.mock.calls.length).toBeGreaterThanOrEqual(1);
+    expect(countMock.mock.calls.length).toBeLessThanOrEqual(2);
+    expect(elapsedMs).toBeLessThan(1000);
+  });
+
+  it('includes concise redacted active/recent task-pair state and excludes daemon reset notices', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-handoff-pairs-'));
+    try {
+      vi.stubEnv(TASK_PAIRS_DB_PATH_ENV, join(dir, 'task-pairs.sqlite'));
+      const store = new TaskPairStore(join(dir, 'task-pairs.sqlite'));
+      setTaskPairStoreForTests(store);
+      store.savePair('project', {
+        v: 1,
+        engine: 'pairs',
+        project: 'project',
+        taskId: 'tsk_active_handoff',
+        title: 'Handoff token=ghp_1234567890abcdefghij fix',
+        brief: 'Long brief omitted from summary',
+        brain: 'handoff-test',
+        executor: 'deck_sub_exec',
+        auditor: 'deck_sub_aud',
+        workspace: { kind: 'dir', path: '/repo' },
+        status: 'in_audit',
+        round: 2,
+        reworkCount: 0,
+        revision: '1',
+        createdAt: 100,
+        updatedAt: 200,
+      });
+      vi.spyOn(timelineStore, 'readCompletedTextTail').mockResolvedValue([
+        event('assistant.text', {
+          text: 'Started a fresh conversation',
+          noticeCode: DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED,
+          streaming: false,
+        }, 1, 10),
+        event('user.message', { text: 'Check pair progress' }, 2, 20),
+        event('assistant.text', { text: 'Verified test suite', streaming: false }, 3, 30),
+      ]);
+      const pack = await buildCrossVendorHandoffPack(record('agy-sdk'), { epoch: 1, seq: 3, ts: 30 }, 'agy-sdk', 'transport');
+      expect(pack).toBeDefined();
+      expect(pack!.text).toContain('Work state pointers:');
+      expect(pack!.text).toContain('tsk_active_handoff [in_audit]');
+      expect(pack!.text).not.toContain('ghp_1234567890abcdefghij');
+      expect(pack!.text).not.toContain('Long brief omitted from summary');
+      expect(pack!.text).not.toContain('Started a fresh conversation');
+      expect(pack!.text).toContain('Check pair progress');
+    } finally {
+      setTaskPairStoreForTests(undefined);
+      vi.unstubAllEnvs();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

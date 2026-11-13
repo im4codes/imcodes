@@ -1331,12 +1331,21 @@ export async function relaunchSessionWithSettings(
   overrides: SessionRelaunchOverrides = {},
 ): Promise<void> {
   const launchGeneration = advanceCrossVendorHandoffLaunchGeneration(record.name);
+  const isGenerationCurrent = (): boolean => crossVendorHandoffLaunchGenerations.get(record.name) === launchGeneration;
+  const assertSessionOwnership = (): void => {
+    if (!isGenerationCurrent()) {
+      throw new Error(`Session ${record.name} relaunch superseded by a newer launch`);
+    }
+    const latest = getSession(record.name);
+    if (latest && record.sessionInstanceId && latest.sessionInstanceId && latest.sessionInstanceId !== record.sessionInstanceId) {
+      throw new Error(`Session ${record.name} ownership changed during relaunch`);
+    }
+  };
   const targetAgentType = (overrides.agentType ?? record.agentType) as AgentType;
   const targetFresh = overrides.fresh === true;
   const targetProjectDir = overrides.projectDir ?? record.projectDir;
   const targetLabel = overrides.label !== undefined ? overrides.label : (record.label ?? null);
   const targetDescription = overrides.description !== undefined ? overrides.description : (record.description ?? null);
-  const targetIdentityPrompt = overrides.identityPrompt !== undefined ? overrides.identityPrompt : ((await resolveEffectiveIdentityPrompt(record)) ?? null);
   // A model id is provider-scoped. An AG switch without an explicit choice
   // must use AG's default, not the previous provider's (possibly invalid) id.
   const enteringAgy = targetAgentType === AGY_SDK_PROVIDER_ID && record.agentType !== AGY_SDK_PROVIDER_ID;
@@ -1352,19 +1361,21 @@ export async function relaunchSessionWithSettings(
   const forceHandoff = overrides.handoff === true;
   const handoffConfig = normalizeCrossVendorHandoffConfig(record.crossVendorHandoff?.config);
   const effectiveHandoffConfig = forceHandoff ? { ...handoffConfig, enabled: true } : handoffConfig;
+  const wantsHandoff = shouldCreateCrossVendorHandoff(record, targetAgentType, targetRuntimeType, targetFresh, forceHandoff) && effectiveHandoffConfig.enabled;
+  const [resolvedIdentityPrompt, cutoffEvents] = await Promise.all([
+    overrides.identityPrompt !== undefined ? Promise.resolve(overrides.identityPrompt) : resolveEffectiveIdentityPrompt(record),
+    wantsHandoff ? timelineStore.readPreferred(record.name, { limit: 1 }).catch(() => []) : Promise.resolve([]),
+  ]);
+  assertSessionOwnership();
+  const targetIdentityPrompt = resolvedIdentityPrompt ?? null;
   let handoffPromise: Promise<import('../../shared/cross-vendor-handoff.js').CrossVendorHandoffPack | undefined> | undefined;
   let handoffCutoff: CrossVendorHandoffCutoff | undefined;
-  if (shouldCreateCrossVendorHandoff(record, targetAgentType, targetRuntimeType, targetFresh, forceHandoff) && effectiveHandoffConfig.enabled) {
-    try {
-      const events = await timelineStore.readPreferred(record.name, { limit: 1 });
-      const last = events.at(-1);
-      handoffCutoff = last
-        ? { epoch: last.epoch, seq: last.seq, ts: last.ts }
-        : { epoch: timelineEmitter.epoch, seq: 0, ts: Date.now() };
-    } catch {
-      handoffCutoff = { epoch: timelineEmitter.epoch, seq: 0, ts: Date.now() };
-    }
-    const cutoff = handoffCutoff ?? { epoch: timelineEmitter.epoch, seq: 0, ts: Date.now() };
+  if (wantsHandoff) {
+    const last = cutoffEvents.at(-1);
+    handoffCutoff = last
+      ? { epoch: last.epoch, seq: last.seq, ts: last.ts }
+      : { epoch: timelineEmitter.epoch, seq: 0, ts: Date.now() };
+    const cutoff = handoffCutoff;
     const providerKey = targetAgentType;
     const priorCutoff = record.crossVendorHandoff?.cutoffs?.[providerKey];
     const persistedState = beginCrossVendorHandoffState(
@@ -1397,33 +1408,39 @@ export async function relaunchSessionWithSettings(
     && record.providerSessionId.length > 0;
 
   await teardownSessionRuntime(record);
+  assertSessionOwnership();
 
-  await launchSession({
-    name: record.name,
-    projectName: record.projectName,
-    role: record.role,
-    agentType: targetAgentType,
-    projectDir: targetProjectDir,
-    label: targetLabel ?? undefined,
-    description: targetDescription ?? undefined,
-    identityPrompt: targetIdentityPrompt ?? undefined,
-    requestedModel: targetRequestedModel ?? undefined,
-    effort: targetEffort ?? undefined,
-    transportConfig: targetTransportConfig ?? undefined,
-    ccPreset: targetCcPreset ?? undefined,
-    ...(preserveTransportBinding ? {
-      bindExistingKey: record.providerSessionId,
-      ...(!targetFresh ? { skipCreate: true } : {}),
-    } : {}),
-    ...(!targetFresh && record.agentType === targetAgentType && usesProviderResumeId(targetAgentType) && record.providerResumeId
-      ? { providerResumeId: record.providerResumeId }
-      : {}),
-    ...compatibleIds,
-    ...(record.parentSession ? { parentSession: record.parentSession } : {}),
-    ...(record.userCreated ? { userCreated: true } : {}),
-    ...(targetFresh ? { fresh: true } : {}),
-    handoffLaunchGeneration: launchGeneration,
-  });
+  try {
+    await launchSession({
+      name: record.name,
+      projectName: record.projectName,
+      role: record.role,
+      agentType: targetAgentType,
+      projectDir: targetProjectDir,
+      label: targetLabel ?? undefined,
+      description: targetDescription ?? undefined,
+      identityPrompt: targetIdentityPrompt ?? undefined,
+      requestedModel: targetRequestedModel ?? undefined,
+      effort: targetEffort ?? undefined,
+      transportConfig: targetTransportConfig ?? undefined,
+      ccPreset: targetCcPreset ?? undefined,
+      ...(preserveTransportBinding ? {
+        bindExistingKey: record.providerSessionId,
+        ...(!targetFresh ? { skipCreate: true } : {}),
+      } : {}),
+      ...(!targetFresh && record.agentType === targetAgentType && usesProviderResumeId(targetAgentType) && record.providerResumeId
+        ? { providerResumeId: record.providerResumeId }
+        : {}),
+      ...compatibleIds,
+      ...(record.parentSession ? { parentSession: record.parentSession } : {}),
+      ...(record.userCreated ? { userCreated: true } : {}),
+      ...(targetFresh ? { fresh: true } : {}),
+      handoffLaunchGeneration: launchGeneration,
+    });
+  } catch (err) {
+    if (isGenerationCurrent()) advanceCrossVendorHandoffLaunchGeneration(record.name);
+    throw err;
+  }
   const launchedTransport = targetRuntimeType === RUNTIME_TYPES.TRANSPORT
     ? transportRuntimes.get(record.name)
     : undefined;

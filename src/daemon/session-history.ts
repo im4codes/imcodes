@@ -7,12 +7,19 @@ import type { SessionRecord } from '../store/session-store.js';
 import type { TimelineTextTailOptions } from './timeline-projection-types.js';
 
 /** The same canonical text-only reader serves MCP and cross-provider handoffs. */
-export async function readSessionTextMessages(sessionName: string, limit = SESSION_TEXT_HISTORY_DEFAULT_LIMIT, through?: TimelineTextTailOptions['through'], redact = true): Promise<SessionTextMessage[]> {
+export async function readSessionTextMessages(
+  sessionName: string,
+  limit = SESSION_TEXT_HISTORY_DEFAULT_LIMIT,
+  through?: TimelineTextTailOptions['through'],
+  redact = true,
+  options?: { excludeDaemonNotices?: boolean },
+): Promise<SessionTextMessage[]> {
   if (!Number.isInteger(limit) || limit < 1 || limit > SESSION_TEXT_HISTORY_MAX_LIMIT) throw new Error(`limit must be 1..${SESSION_TEXT_HISTORY_MAX_LIMIT}`);
   const events = await timelineStore.readCompletedTextTail(sessionName, limit, { visibleOnly: true, ...(through ? { through } : {}) });
   const budget = Math.floor(SESSION_TEXT_HISTORY_MAX_CHARS / Math.max(1, events.length));
   return events.filter((event) => event.type === 'user.message' || (event.type === 'assistant.text' && event.payload.streaming !== true))
     .filter((event) => event.hidden !== true && event.payload.hidden !== true)
+    .filter((event) => !options?.excludeDaemonNotices || !(event.type === 'assistant.text' && typeof event.payload.noticeCode === 'string'))
     .map((event) => {
       const raw = event.payload.text ?? event.payload.content ?? event.payload.message;
       const text = typeof raw === 'string' ? (redact ? redactSensitiveText(raw) : raw) : '';

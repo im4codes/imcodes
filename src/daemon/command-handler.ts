@@ -1101,20 +1101,44 @@ export function supportsProcessClear(agentType: string | undefined): agentType i
   return agentType === 'claude-code' || agentType === 'codex' || agentType === 'opencode';
 }
 
-async function finalizeConversationReset(sessionName: string, serverLink?: ServerLink): Promise<void> {
+async function finalizeConversationReset(
+  sessionName: string,
+  serverLink?: ServerLink,
+  expectedInstanceId?: string,
+): Promise<void> {
+  const resetRecord = getSession(sessionName);
+  if (resetRecord && expectedInstanceId && resetRecord.sessionInstanceId
+    && resetRecord.sessionInstanceId !== expectedInstanceId) {
+    logger.warn({ sessionName, expectedInstanceId, actualInstanceId: resetRecord.sessionInstanceId }, 'Skipping reset finalization after session owner changed');
+    return;
+  }
   // Reset per-session memory injection history — fresh conversation should be
   // allowed to re-inject previously-shown memories again.
   clearRecentInjectionHistory(sessionName);
   clearSummarySyncHistory(sessionName);
-  if (serverLink) {
-    await handleGetSessions(serverLink);
-    await syncSubSessionIfNeeded(sessionName, serverLink);
-  }
+  const model = resetRecord?.activeModel ?? resetRecord?.requestedModel;
+  const contextWindow = resetRecord
+    ? resolveContextWindow(resetRecord.presetContextWindow, model, 1_000_000, {
+      preferExplicit: resetRecord.presetContextWindow !== undefined,
+    })
+    : undefined;
+  timelineEmitter.emit(sessionName, 'usage.update', {
+    inputTokens: 0,
+    cacheTokens: 0,
+    outputTokens: 0,
+    ...(model ? { model } : {}),
+    ...(contextWindow ? { contextWindow } : {}),
+  }, { source: 'daemon', confidence: 'high' });
   timelineEmitter.emit(sessionName, 'assistant.text', {
     ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED, 'Started a fresh conversation'),
     streaming: false,
     memoryExcluded: true,
   }, { source: 'daemon', confidence: 'high' });
+  timelineEmitter.emit(sessionName, 'session.state', { state: 'idle' }, { source: 'daemon', confidence: 'high' });
+  if (serverLink) {
+    void handleGetSessions(serverLink).catch(() => {});
+    void syncSubSessionIfNeeded(sessionName, serverLink).catch(() => {});
+  }
 }
 
 async function executeDaemonResetCommand(opts: {
@@ -1127,16 +1151,20 @@ async function executeDaemonResetCommand(opts: {
   formatError: (err: unknown) => string;
 }): Promise<void> {
   const { sessionName, serverLink, effectiveId, isLegacy, label, run, formatError } = opts;
+  // Emit receipt ack + starting progress immediately before teardown/relaunch
+  // so the UI never hangs silently; dual-ack turns the bubble failed on error.
+  const clearStatus = isLegacy ? 'accepted_legacy' : 'accepted';
+  timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: clearStatus });
+  emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: clearStatus });
+  timelineEmitter.emit(sessionName, 'session.state', { state: 'starting' }, { source: 'daemon', confidence: 'high' });
   try {
     await run();
-    const clearStatus = isLegacy ? 'accepted_legacy' : 'accepted';
-    timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: clearStatus });
-    emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: clearStatus });
   } catch (err) {
     const errMsg = formatError(err);
     logger.error({ sessionName, err }, `${label} failed`);
     timelineEmitter.emit(sessionName, 'assistant.text', { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_CLEAR_FAILED, `⚠️ Clear failed: ${errMsg}`, { detail: errMsg }), streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
     timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
+    timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });
     emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
   }
 }
@@ -1151,13 +1179,13 @@ async function executeDaemonResetCommand(opts: {
  */
 export async function clearTransportConversation(record: SessionRecord, serverLink?: ServerLink): Promise<void> {
   const sessionName = record.name;
-  // Fresh conversation must not replay stale queued messages from the prior
-  // offline window — drop anything we had buffered for resend.
-  clearResend(sessionName);
-  await runExclusiveSessionRelaunch(sessionName, async () => {
-    await relaunchFreshTransportConversation(record);
+  await runSerializedSessionReset(sessionName, record, async (currentRecord) => {
+    // Fresh conversation must not replay stale queued messages from the prior
+    // offline window — drop anything we had buffered for resend.
+    clearResend(sessionName);
+    await relaunchFreshTransportConversation(currentRecord);
   });
-  await finalizeConversationReset(sessionName, serverLink);
+  await finalizeConversationReset(sessionName, serverLink, record.sessionInstanceId);
 }
 
 /**
@@ -1167,11 +1195,20 @@ export async function clearTransportConversation(record: SessionRecord, serverLi
  */
 export async function handoffSessionConversation(record: SessionRecord, serverLink?: ServerLink): Promise<void> {
   const sessionName = record.name;
-  clearResend(sessionName);
-  await runExclusiveSessionRelaunch(sessionName, async () => {
-    await relaunchSessionWithSettings(record, { fresh: true, handoff: true });
+  await runSerializedSessionReset(sessionName, record, async (currentRecord) => {
+    clearResend(sessionName);
+    await relaunchSessionWithSettings(currentRecord, { fresh: true, handoff: true });
   });
-  await finalizeConversationReset(sessionName, serverLink);
+  await finalizeConversationReset(sessionName, serverLink, record.sessionInstanceId);
+}
+
+async function clearProcessConversation(record: SessionRecord, serverLink?: ServerLink): Promise<void> {
+  const sessionName = record.name;
+  await runSerializedSessionReset(sessionName, record, async (currentRecord) => {
+    clearResend(sessionName);
+    await relaunchSessionWithSettings(currentRecord, { fresh: true });
+  });
+  await finalizeConversationReset(sessionName, serverLink, record.sessionInstanceId);
 }
 
 async function relaunchFreshTransportConversation(record: SessionRecord): Promise<void> {
@@ -1479,6 +1516,23 @@ function runExclusiveSessionRelaunch(sessionName: string, factory: () => Promise
   const pending = pendingSessionRelaunches.get(sessionName);
   if (pending) return pending;
   return trackPendingSessionRelaunch(sessionName, factory());
+}
+
+async function runSerializedSessionReset(
+  sessionName: string,
+  expectedRecord: SessionRecord,
+  factory: (currentRecord: SessionRecord) => Promise<void>,
+): Promise<void> {
+  while (pendingSessionRelaunches.has(sessionName)) {
+    await waitForPendingSessionRelaunch(sessionName);
+  }
+  const latest = getSession(sessionName);
+  if (latest && expectedRecord.sessionInstanceId && latest.sessionInstanceId
+    && latest.sessionInstanceId !== expectedRecord.sessionInstanceId) {
+    throw new Error(`Session ${sessionName} ownership changed before reset`);
+  }
+  const currentRecord = latest ?? expectedRecord;
+  await trackPendingSessionRelaunch(sessionName, factory(currentRecord));
 }
 
 function canAttemptShellBootstrapRecovery(sessionName: string): boolean {
@@ -5099,6 +5153,40 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
       sessionName,
       status: 'error',
       error: 'session_missing',
+    });
+    return;
+  }
+
+  // Fast-path supported `/clear` and `/handoff` before skill/preference/path
+  // expansion so immediate ack + reset start with zero filesystem/DB latency.
+  const isTransportSessionFast = record.runtimeType === 'transport'
+    || (typeof record.agentType === 'string' && isTransportAgent(record.agentType));
+  const isResetClearFast = isSessionControlCommandText(trimmedText, 'clear');
+  const isResetHandoffFast = isSessionControlCommandText(trimmedText, 'handoff');
+  if (
+    (isResetClearFast || isResetHandoffFast)
+    && (
+      (isTransportSessionFast && supportsTransportClear(record.agentType))
+      || (record.runtimeType !== 'transport' && supportsProcessClear(record.agentType))
+    )
+  ) {
+    emitTransportUserMessage(text);
+    await executeDaemonResetCommand({
+      sessionName,
+      serverLink,
+      effectiveId,
+      isLegacy,
+      label: isResetHandoffFast
+        ? (isTransportSessionFast ? 'session.handoff (transport)' : 'session.handoff')
+        : (isTransportSessionFast ? 'session.clear (transport)' : 'session.clear'),
+      run: () => isResetHandoffFast
+        ? handoffSessionConversation(record, serverLink)
+        : isTransportSessionFast
+          ? clearTransportConversation(record, serverLink)
+          : clearProcessConversation(record, serverLink),
+      formatError: isTransportSessionFast
+        ? describeTransportSendError
+        : (err) => (err instanceof Error ? err.message : String(err)),
     });
     return;
   }
