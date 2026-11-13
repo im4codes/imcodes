@@ -444,6 +444,12 @@ function getOfficeType(path: string): string | null {
   return ext ? (OFFICE_EXTENSIONS[ext] ?? null) : null;
 }
 
+/** Keep `.csv` as plain text on automatic `fs.read_response` entry paths; ONLYOFFICE stays explicit opt-in. */
+function getAutoOfficePreviewType(path: string): string | null {
+  const mimeType = getOfficeType(path);
+  return mimeType && mimeType !== 'text/csv' ? mimeType : null;
+}
+
 function detectExternalDocShareToken(): string | null {
   if (typeof window === 'undefined') return null;
   try {
@@ -1179,7 +1185,7 @@ export function FileBrowser({
             previewRefreshBackoffUntilRef.current = Date.now() + PREVIEW_REFRESH_FAILURE_BACKOFF_MS;
             return;
           }
-          const officeErrorFallbackType = getOfficeType(filePath);
+          const officeErrorFallbackType = getAutoOfficePreviewType(filePath);
           if (
             officeErrorFallbackType
             && serverId
@@ -1268,7 +1274,7 @@ export function FileBrowser({
         // Office/image preview — same stream contract as video/audio: the daemon
         // sends metadata only and the bytes come over the chunked HTTP download
         // channel, so a large file can never monopolise the WebSocket.
-        const officeType = getOfficeType(filePath);
+        const officeType = getAutoOfficePreviewType(filePath);
         if (officeType && (msg as { previewMode?: string }).previewMode === 'stream' && dlId && serverId) {
           const mimeType = (msg.mimeType as string | undefined) ?? officeType;
           void buildAttachmentDownloadUrl(serverId, dlId, sessionName)
@@ -1286,7 +1292,7 @@ export function FileBrowser({
             });
           return;
         }
-        if (officeType && officeType !== 'text/csv' && serverId && typeof msg.content === 'string') {
+        if (officeType && serverId && typeof msg.content === 'string') {
           const inlineSrcUrl = `data:${officeType};charset=utf-8,${encodeURIComponent(msg.content)}`;
           setPreview({ status: 'office', path: filePath, srcUrl: inlineSrcUrl, mimeType: officeType, downloadId: dlId });
           return;

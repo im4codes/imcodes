@@ -3427,6 +3427,7 @@ describe('FileBrowser — file-manager preview/folder sync', () => {
     vi.stubGlobal('fetch', fetchMock);
     const { ws, sendMsg } = makeWsFactory();
     const recentCalls = () => fetchMock.mock.calls.filter(([url]) => String(url).includes('/api/recent-documents/record'));
+    const onlyofficeConfigCalls = () => fetchMock.mock.calls.filter(([url]) => String(url).includes('/onlyoffice/config'));
 
     try {
       // Negative controls: plain text/code/csv previews and pasted-text / .imcodes/uploads paths MUST NOT auto-record
@@ -3492,6 +3493,61 @@ describe('FileBrowser — file-manager preview/folder sync', () => {
       await new Promise((r) => setTimeout(r, 15));
       expect(recentCalls()).toHaveLength(0);
       errView.unmount();
+
+      // F1 counterexamples: .csv error fallback (e.g. PREVIEW_WORKER_TIMEOUT) and .csv stream preview
+      // MUST NOT auto-promote to OfficePreview or auto-record in Recent documents.
+      const csvErrView = render(
+        <FileBrowser
+          ws={ws}
+          serverId="srv-rec"
+          mode="file-single"
+          layout="panel"
+          initialPath="/repo"
+          autoPreviewPath="/repo/data.csv"
+          onConfirm={vi.fn()}
+        />,
+      );
+      await act(async () => {
+        sendMsg({
+          type: 'fs.read_response',
+          requestId: 'mock-read-id',
+          path: '/repo/data.csv',
+          status: 'error',
+          error: FS_READ_ERROR_CODES.PREVIEW_WORKER_TIMEOUT,
+        } as unknown as ServerMessage);
+      });
+      await new Promise((r) => setTimeout(r, 15));
+      expect(recentCalls(), 'expected zero recent calls for .csv error fallback').toHaveLength(0);
+      expect(onlyofficeConfigCalls(), 'expected zero onlyoffice config calls for .csv error fallback').toHaveLength(0);
+      expect(csvErrView.container.querySelector('.fb-preview-error')).toBeTruthy();
+      csvErrView.unmount();
+
+      const csvStreamView = render(
+        <FileBrowser
+          ws={ws}
+          serverId="srv-rec"
+          mode="file-single"
+          layout="panel"
+          initialPath="/repo"
+          autoPreviewPath="/repo/stream-data.csv"
+          onConfirm={vi.fn()}
+        />,
+      );
+      await act(async () => {
+        sendMsg({
+          type: 'fs.read_response',
+          requestId: 'mock-read-id',
+          path: '/repo/stream-data.csv',
+          status: 'ok',
+          previewMode: 'stream',
+          downloadId: 'dl-csv-stream-1',
+          mimeType: 'text/csv',
+        } as unknown as ServerMessage);
+      });
+      await new Promise((r) => setTimeout(r, 15));
+      expect(recentCalls(), 'expected zero recent calls for .csv stream preview').toHaveLength(0);
+      expect(onlyofficeConfigCalls(), 'expected zero onlyoffice config calls for .csv stream preview').toHaveLength(0);
+      csvStreamView.unmount();
 
       // Upload/temp Office/PDF paths under .imcodes/uploads (POSIX & Windows) MUST NOT auto-record
       for (const uploadOfficePath of [
