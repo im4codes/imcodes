@@ -1408,4 +1408,160 @@ rl.on('line', (line) => {
       expect(bound?.output ?? '').not.toContain('Tool is running as a background task');
     }, { timeout: 5000 });
   });
+
+  it('preserves authoritative ACP rawOutput across out-of-order parallel MCP GENERIC rows without duplicating or leaking outputs', async () => {
+    const { provider, root } = await setup('native-child-log');
+    const id = await route(provider, 'deck_test_f1_rawoutput_race');
+    const done = vi.fn();
+    const events: ToolCallEvent[] = [];
+    provider.onComplete(done);
+    provider.onToolCall((_, tool) => events.push(tool));
+
+    await provider.send(id, 'launch');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+
+    const state = (provider as any).sessions.get(id);
+    const nativeId = state.acpSessionId as string;
+    const file = path.join(root, '.gemini/antigravity-cli/brain', nativeId, '.system_generated/logs/transcript_full.jsonl');
+    const update = (u: any) => (provider as any).handleSessionUpdate({ sessionId: nativeId, update: u });
+
+    // Case 1: rawOutput-only subagent completes via ACP BEFORE sibling send_list_targets's
+    // GENERIC arrives and BEFORE send_list_targets's ACP update arrives.
+    update({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'f1-invoke-1',
+      title: 'Run invoke_subagent',
+      status: 'in_progress',
+      rawInput: { Role: 'RealWorker', Prompt: 'do work' },
+    });
+    update({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'f1-list-1',
+      title: 'send_list_targets',
+      status: 'in_progress',
+      rawInput: {},
+    });
+    update({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'f1-invoke-1',
+      status: 'completed',
+      rawOutput: { conversationId: 'real-child', status: 'running' },
+    });
+
+    const eventsBeforeGeneric = events.filter((e) => e.detail?.meta?.agentPath === 'real-child').length;
+    expect(eventsBeforeGeneric).toBe(1);
+
+    await appendFile(
+      file,
+      JSON.stringify({
+        step_index: 20,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: '',
+        tool_calls: [
+          { name: 'invoke_subagent', args: { Role: 'RealWorker', Prompt: 'do work' } },
+          { name: 'send_list_targets', args: {} },
+        ],
+      }) + '\n'
+      + JSON.stringify({
+        step_index: 21,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: 'Created At: 2026-11-13T20:18:29+08:00\nsend_list_targets: MCPPARALLEL_RESULT',
+      }) + '\n',
+    );
+
+    // Sibling MCP update arrives AFTER its transcript row; real-child must NOT receive MCPPARALLEL_RESULT.
+    await new Promise((r) => setTimeout(r, 150));
+    update({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'f1-list-1',
+      status: 'completed',
+      rawOutput: 'Created At: 2026-11-13T20:18:29+08:00\nsend_list_targets: MCPPARALLEL_RESULT',
+    });
+
+    // Now the real child's own GENERIC row arrives later.
+    await appendFile(
+      file,
+      JSON.stringify({
+        step_index: 22,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: 'Created the following subagent:\n' + JSON.stringify({ conversationId: 'real-child', status: 'running' }),
+      }) + '\n',
+    );
+
+    await vi.waitFor(() => {
+      expect(state.agyConsumedNativeTools?.has('f1-invoke-1')).toBe(true);
+    }, { timeout: 5000 });
+
+    const realChildEvents = events.filter((e) => e.detail?.meta?.agentPath === 'real-child');
+    expect(realChildEvents).toHaveLength(1);
+    expect(JSON.stringify(events)).not.toContain('"agentPath":"real-child","output":"Created At:');
+    expect(realChildEvents.some((e) => (e.output ?? '').includes('MCPPARALLEL_RESULT'))).toBe(false);
+    expect(state.agyNativeToolOrder).toEqual([]);
+
+    // Case 2: two parallel invoke_subagent calls (Alpha completes via ACP, Beta completes via
+    // transcript GENERIC first, Alpha's GENERIC arrives second).
+    update({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'f1-alpha',
+      title: 'Run invoke_subagent',
+      status: 'in_progress',
+      rawInput: { Role: 'Alpha', Prompt: 'alpha work' },
+    });
+    update({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'f1-beta',
+      title: 'Run invoke_subagent',
+      status: 'in_progress',
+      rawInput: { Role: 'Beta', Prompt: 'beta work' },
+    });
+    update({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'f1-alpha',
+      status: 'completed',
+      rawOutput: { conversationId: 'child-alpha', status: 'running' },
+    });
+
+    await appendFile(
+      file,
+      JSON.stringify({
+        step_index: 23,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: '',
+        tool_calls: [
+          { name: 'invoke_subagent', args: { Role: 'Alpha', Prompt: 'alpha work' } },
+          { name: 'invoke_subagent', args: { Role: 'Beta', Prompt: 'beta work' } },
+        ],
+      }) + '\n'
+      + JSON.stringify({
+        step_index: 24,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: 'Created the following subagent:\n' + JSON.stringify({ conversationId: 'child-beta', status: 'running' }),
+      }) + '\n'
+      + JSON.stringify({
+        step_index: 25,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: 'Created the following subagent:\n' + JSON.stringify({ conversationId: 'child-alpha', status: 'running' }),
+      }) + '\n',
+    );
+
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.detail?.meta?.agentPath === 'child-beta')).toBe(true);
+      expect(state.agyConsumedNativeTools?.has('f1-alpha')).toBe(true);
+      expect(state.agyConsumedNativeTools?.has('f1-beta')).toBe(true);
+    }, { timeout: 5000 });
+
+    const alphaEvents = events.filter((e) => e.detail?.meta?.agentPath === 'child-alpha');
+    const betaEvents = events.filter((e) => e.detail?.meta?.agentPath === 'child-beta');
+    expect(alphaEvents).toHaveLength(1);
+    expect(betaEvents).toHaveLength(1);
+    expect(alphaEvents[0].detail?.meta?.agentName).toBe('Alpha');
+    expect(betaEvents[0].detail?.meta?.agentName).toBe('Beta');
+    expect(state.agyNativeToolOrder).toEqual([]);
+  });
 });

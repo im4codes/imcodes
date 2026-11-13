@@ -12,6 +12,21 @@ export function normalizeAgyToolName(name: string): string {
   // Some ACP builds include the invocation JSON in the display title.
   return name.trim().split(/\s*[\[({]/, 1)[0].toLowerCase().replace(/^run\s+/, '').replace(/[-_\s]/g, '');
 }
+export function stableJson(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (value === null || typeof value !== 'object') {
+    try { return JSON.stringify(value); } catch { return undefined; }
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableJson(item) ?? 'null').join(',')}]`;
+  }
+  const obj = value as Record<string, unknown>;
+  const entries = Object.keys(obj).sort().flatMap((key) => {
+    const serialized = stableJson(obj[key]);
+    return serialized === undefined ? [] : [`${JSON.stringify(key)}:${serialized}`];
+  });
+  return `{${entries.join(',')}}`;
+}
 function toolInput(tool: ToolCallEvent): Record<string, unknown> {
   if (tool.input != null) return record(tool.input);
   const start = tool.name.indexOf('{');
@@ -25,6 +40,47 @@ function textLaunchResult(text: string): unknown {
   const labelled = new RegExp(`\\b(?:conversation[ _-]*id|subagent(?:[ _-]*id)?)\\s*[:=]\\s*["'\\x60]?(${uuid})(?![0-9a-f-])`, 'i').exec(text);
   const id = bare?.[0] ?? labelled?.[1];
   return id ? { conversationId: id } : undefined;
+}
+function parseAgySnapshotRows(value: unknown, allowTextLaunch: boolean): { rows: Record<string, unknown>[]; hasContainerHint: boolean } {
+  let parsedValue = value;
+  if (typeof parsedValue === 'string') {
+    const text = parsedValue;
+    try { parsedValue = JSON.parse(text); } catch {
+      // AG native tool results can wrap their JSON snapshot in prose.
+      let parsed = false;
+      for (const [open, close] of [['{', '}'], ['[', ']']]) {
+        const start = text.indexOf(open), end = text.lastIndexOf(close);
+        if (start < 0 || end < start) continue;
+        try { parsedValue = JSON.parse(text.slice(start, end + 1)); parsed = true; break; } catch { /* try the array snapshot */ }
+      }
+      if (!parsed) {
+        parsedValue = allowTextLaunch ? textLaunchResult(text) : undefined;
+        if (!parsedValue) return { rows: [], hasContainerHint: false };
+      }
+    }
+  }
+  let obj = record(parsedValue);
+  let hasContainerHint = false;
+  for (const key of ['subagent', 'subAgent', 'agent', 'notification', 'data', 'event', 'result']) {
+    if (obj[key] && typeof obj[key] === 'object') {
+      if (key === 'subagent' || key === 'subAgent' || key === 'agent') hasContainerHint = true;
+      obj = record(obj[key]);
+      break;
+    }
+  }
+  if (Array.isArray(obj.subagents) || Array.isArray(obj.agents)) hasContainerHint = true;
+  const list = Array.isArray(parsedValue) ? parsedValue : [obj.subagents, obj.agents, obj.members, obj.results].find(Array.isArray);
+  return { rows: (list ?? [obj]).map(record), hasContainerHint };
+}
+export function extractAgySubagentEvidenceChildIds(value: unknown): string[] {
+  const { rows, hasContainerHint } = parseAgySnapshotRows(value, true);
+  const ids: string[] = [];
+  for (const row of rows) {
+    const explicit = string(row.conversationId, row.conversation_id, row.ConversationId, row.agentId, row.agent_id, row.agentPath, row.agent_path);
+    const id = explicit ?? (hasContainerHint ? string(row.id) : undefined);
+    if (id && !ids.includes(id)) ids.push(id);
+  }
+  return ids;
 }
 export function isAgySubagentTool(name: string): boolean {
   return /^(invokesubagent|browsersubagent|managesubagents|definesubagent|swarm|sendmessage|subagent|agent)$/.test(normalizeAgyToolName(name));
@@ -78,31 +134,9 @@ export class AgySubagentTracker {
   }
 
   snapshot(value: unknown, action = 'manage_subagents', toolId?: string, defaultState?: SdkSubagentNormalizedStatus): ToolCallEvent[] {
-    if (typeof value === 'string') {
-      const text = value;
-      try { value = JSON.parse(text); } catch {
-        // AG native tool results can wrap their JSON snapshot in prose.
-        let parsed = false;
-        for (const [open,close] of [['{','}'],['[',']']]) {
-          const start = text.indexOf(open), end = text.lastIndexOf(close);
-          if (start < 0 || end < start) continue;
-          try { value = JSON.parse(text.slice(start,end+1)); parsed = true; break; } catch { /* try the array snapshot */ }
-        }
-        if (!parsed) {
-          value = defaultState ? textLaunchResult(text) : undefined;
-          if (!value) return [];
-        }
-      }
-    }
-    let obj = record(value);
-    for (const key of ['subagent', 'subAgent', 'agent', 'notification', 'data', 'event', 'result']) {
-      if (obj[key] && typeof obj[key] === 'object') { obj = record(obj[key]); break; }
-    }
-    const list = Array.isArray(value) ? value : [obj.subagents, obj.agents, obj.members, obj.results].find(Array.isArray);
-    const rows = list ?? [obj];
+    const rows = parseAgySnapshotRows(value, Boolean(defaultState)).rows;
     const result: ToolCallEvent[] = [];
-    for (const [index, raw] of rows.entries()) {
-      const row = record(raw);
+    for (const [index, row] of rows.entries()) {
       const id = string(row.conversationId, row.conversation_id, row.ConversationId, row.agentId, row.agent_id, row.agentPath, row.agent_path, row.id);
       if (!id) continue;
       const normalized = status(row.state ?? row.status ?? row.Status) ?? defaultState;

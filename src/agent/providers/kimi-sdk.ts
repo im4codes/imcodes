@@ -1,6 +1,6 @@
 import { AgyForegroundOwnership } from '../agy-foreground-ownership.js';
 import { AgyTranscriptBridge, agyTranscriptFile, type AgyTranscriptCursor, type AgyTranscriptRow } from '../agy-transcript-bridge.js';
-import { AgySubagentTracker, isAgySubagentTool, normalizeAgyToolName } from '../agy-subagents.js';
+import { AgySubagentTracker, extractAgySubagentEvidenceChildIds, isAgySubagentTool, normalizeAgyToolName, stableJson } from '../agy-subagents.js';
 import { AgyCompactionWatermark } from '../agy-compaction-watermark.js';
 import { AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
 import { AgyContextUsage } from '../agy-context-usage.js';
@@ -787,31 +787,37 @@ export class KimiSdkProvider implements TransportProvider {
       }
     }
     if (row.type === 'GENERIC' && row.content) {
-      const nativeTool = takeAgyNativeToolForGenericRow(state, row);
+      const matched = matchAgyGenericRowToNativeTool(state, row);
       this.updateAgyBackgroundTasks(sessionId, state, {
         text: row.content,
-        toolName: nativeTool?.name,
-        toolInput: nativeTool?.input,
+        toolName: matched?.orderEntry.name,
+        toolInput: matched?.orderEntry.input,
       });
-      if (nativeTool && isAgySubagentTool(nativeTool.name)) {
-        const nativeNormalized = normalizeAgyToolName(nativeTool.name);
-        const pendingList = [...(state.agyPendingNativeTools?.values() ?? [])]
-          .filter(tool => normalizeAgyToolName(tool.name) === nativeNormalized);
-        const nativeInputJson = safeStableJson(nativeTool.input);
-        const pending = (nativeInputJson
-          ? pendingList.find(tool => safeStableJson(tool.input) === nativeInputJson)
-          : undefined) ?? pendingList[0];
+      if (matched && isAgySubagentTool(matched.orderEntry.name)) {
+        const { orderEntry: nativeTool, pending } = matched;
         const toolId = pending?.id ?? `${state.acpSessionId}:native-tool:${nativeTool.step}:${nativeTool.index}`;
         state.agyPendingNativeTools?.delete(toolId);
         (state.agyConsumedNativeTools ??= new Set()).add(toolId);
-        // If ACP already delivered a distinct non-empty output for this tool call,
-        // keep it rather than overwriting with a transcript row that may have shifted.
-        const output = pending && pending.status !== 'running' && pending.output?.trim()
+        const pendingOutput = pending && pending.status !== 'running' && pending.output?.trim()
           ? pending.output
-          : row.content;
-        const events = tracker.tool({id:toolId,name:nativeTool.name,input:pending?.input ?? nativeTool.input,
-          status:pending?.status === 'error' ? 'error' : 'complete',output});
-        publish(events);
+          : undefined;
+        const pendingIds = pendingOutput ? extractAgySubagentEvidenceChildIds(pendingOutput) : [];
+        const rowIds = extractAgySubagentEvidenceChildIds(row.content);
+        const rowAddsChildId = rowIds.some((childId) => !pendingIds.includes(childId));
+        // If ACP already delivered non-empty terminal output and this transcript row
+        // reveals no new child ID, emitMergedToolCall already published it; avoid
+        // duplicating emissions or letting transcript prose replace ACP rawOutput.
+        if (!pendingOutput || rowAddsChildId) {
+          const output = rowAddsChildId ? row.content : (pendingOutput ?? row.content);
+          const events = tracker.tool({
+            id: toolId,
+            name: nativeTool.name,
+            input: pending?.input ?? nativeTool.input,
+            status: pending?.status === 'error' ? 'error' : 'complete',
+            output,
+          });
+          publish(events);
+        }
       }
     }
     if (row.type === 'USER_INPUT' || claimedByForeground) state.agyReactive = false;
@@ -2614,22 +2620,35 @@ export class KimiSdkProvider implements TransportProvider {
     if (this.id === AGY_SDK_PROVIDER_ID) {
       if (/^(invokesubagent|browsersubagent|sendmessage|swarm)$/.test(normalizeAgyToolName(merged.title))) this.useAgyNativeOutput(state);
       const tracker = state.agySubagents ??= new AgySubagentTracker(state.acpSessionId ?? sessionId);
-      const outputValue = merged.rawOutput !== undefined ? (typeof merged.rawOutput === 'string' ? merged.rawOutput : JSON.stringify(merged.rawOutput)) : evt.output;
+      const outputValue = normalizedStatus === 'running'
+        ? undefined
+        : (merged.rawOutput !== undefined
+          ? (typeof merged.rawOutput === 'string' ? merged.rawOutput : JSON.stringify(merged.rawOutput))
+          : evt.output);
+      const agEvt: ToolCallEvent = outputValue === evt.output
+        ? evt
+        : {
+            ...evt,
+            ...(outputValue !== undefined ? { output: outputValue } : {}),
+            detail: evt.detail
+              ? { ...evt.detail, ...(outputValue !== undefined ? { output: outputValue } : {}) }
+              : evt.detail,
+          };
       this.updateAgyBackgroundTasks(sessionId, state, {
         text: outputValue,
         toolName: merged.title,
         toolInput: merged.rawInput,
-        toolStatus: evt.status,
+        toolStatus: agEvt.status,
       });
       if (normalizedStatus !== 'running' && outputValue !== undefined && !isAgySubagentTool(merged.title)) {
         const recent = state.agyRecentAcpOutputs ??= [];
         recent.push({ normalizedName: normalizeAgyToolName(merged.title), output: outputValue });
         if (recent.length > 32) recent.splice(0, recent.length - 32);
       }
-      if (isAgySubagentTool(merged.title) && !state.agyConsumedNativeTools?.has(evt.id)) {
-        (state.agyPendingNativeTools ??= new Map()).set(evt.id,evt);
+      if (isAgySubagentTool(merged.title) && !state.agyConsumedNativeTools?.has(agEvt.id)) {
+        (state.agyPendingNativeTools ??= new Map()).set(agEvt.id, agEvt);
       }
-      const children = tracker.tool({ ...evt, ...(outputValue !== undefined ? { output: outputValue } : {}) });
+      const children = tracker.tool(agEvt);
       if (children.length) {
         this.publishAgySubagents(sessionId, state, children);
         return;
@@ -2976,41 +2995,125 @@ function extractAgyBackgroundTaskTerminalIds(
   return ids;
 }
 
-function safeStableJson(value: unknown): string | undefined {
-  if (value === undefined) return undefined;
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return undefined;
-  }
+interface AgyNativeOrderEntry {
+  name: string;
+  input: unknown;
+  step: number;
+  index: number;
 }
 
-function takeAgyNativeToolForGenericRow(
+function findMatchingPendingSubagent(
+  state: KimiSdkSessionState,
+  entry: AgyNativeOrderEntry,
+  evidenceChildIds?: string[],
+): { pending?: ToolCallEvent; conflicts: boolean } {
+  const normalized = normalizeAgyToolName(entry.name);
+  const candidates = [...(state.agyPendingNativeTools?.values() ?? [])]
+    .filter((tool) => normalizeAgyToolName(tool.name) === normalized);
+  if (!candidates.length) return { conflicts: false };
+  const entryInputJson = stableJson(entry.input);
+  const byInput = entryInputJson
+    ? candidates.filter((tool) => stableJson(tool.input) === entryInputJson)
+    : candidates;
+  const pool = byInput.length ? byInput : candidates;
+  if (evidenceChildIds?.length) {
+    const exactChild = pool.find((tool) => {
+      if (!tool.output?.trim()) return false;
+      const toolIds = extractAgySubagentEvidenceChildIds(tool.output);
+      return evidenceChildIds.some((id) => toolIds.includes(id));
+    });
+    if (exactChild) return { pending: exactChild, conflicts: false };
+    const compatible = pool.find((tool) => {
+      if (tool.status === 'running' || !tool.output?.trim()) return true;
+      const toolIds = extractAgySubagentEvidenceChildIds(tool.output);
+      return toolIds.length === 0 || evidenceChildIds.some((id) => toolIds.includes(id));
+    });
+    if (compatible) return { pending: compatible, conflicts: false };
+    return { pending: pool[0], conflicts: true };
+  }
+  return { pending: pool[0], conflicts: false };
+}
+
+function matchAgyGenericRowToNativeTool(
   state: KimiSdkSessionState,
   row: AgyTranscriptRow,
-): { name: string; input: unknown; step: number; index: number } | undefined {
+): { orderEntry: AgyNativeOrderEntry; pending?: ToolCallEvent } | undefined {
   const order = state.agyNativeToolOrder;
   if (!order?.length) return undefined;
   const content = row.content ?? '';
+
+  // 1. Exact non-subagent ACP output match.
   const recent = state.agyRecentAcpOutputs;
   if (recent?.length) {
-    const recentIdx = recent.findIndex(item => item.output === content);
+    const recentIdx = recent.findIndex((item) => item.output === content);
     if (recentIdx >= 0) {
       const matched = recent.splice(recentIdx, 1)[0];
-      const orderIdx = order.findIndex(entry => normalizeAgyToolName(entry.name) === matched.normalizedName);
-      if (orderIdx >= 0) return order.splice(orderIdx, 1)[0];
+      const orderIdx = order.findIndex((entry) => normalizeAgyToolName(entry.name) === matched.normalizedName);
+      if (orderIdx >= 0) return { orderEntry: order.splice(orderIdx, 1)[0] };
     }
   }
+
+  // 2. Background task notice belongs to non-subagent tools, never sub-agents.
   if (row.status === 'RUNNING' || extractAgyBackgroundTaskStartIds(content).length > 0) {
-    // Background task notices belong to background-capable tools (e.g. run_command / schedule),
-    // never to sub-agent tools; splicing the matching non-subagent entry keeps FIFO aligned.
     const bgIdx = order.findIndex((entry) => {
       const n = normalizeAgyToolName(entry.name);
       return !isAgySubagentTool(entry.name) && (n === 'runcommand' || n === 'schedule');
     });
-    if (bgIdx >= 0) return order.splice(bgIdx, 1)[0];
-    const nonSubagentIdx = order.findIndex(entry => !isAgySubagentTool(entry.name));
-    return nonSubagentIdx >= 0 ? order.splice(nonSubagentIdx, 1)[0] : undefined;
+    if (bgIdx >= 0) return { orderEntry: order.splice(bgIdx, 1)[0] };
+    const nonSubagentIdx = order.findIndex((entry) => !isAgySubagentTool(entry.name));
+    return nonSubagentIdx >= 0 ? { orderEntry: order.splice(nonSubagentIdx, 1)[0] } : undefined;
   }
-  return order.shift();
+
+  // 3. Exact ACP pending subagent match (identical output or shared child ID).
+  const evidenceChildIds = extractAgySubagentEvidenceChildIds(content);
+  for (const [orderIdx, entry] of order.entries()) {
+    if (!isAgySubagentTool(entry.name)) continue;
+    const { pending } = findMatchingPendingSubagent(state, entry, evidenceChildIds);
+    if (!pending || pending.status === 'running' || !pending.output?.trim()) continue;
+    const pendingIds = extractAgySubagentEvidenceChildIds(pending.output);
+    const matchesOutput = pending.output === content;
+    const sharesChildId = evidenceChildIds.length > 0 && evidenceChildIds.some((id) => pendingIds.includes(id));
+    if (matchesOutput || sharesChildId) {
+      return { orderEntry: order.splice(orderIdx, 1)[0], pending };
+    }
+  }
+
+  // 4. Transcript row has explicit subagent snapshot/launch evidence.
+  if (evidenceChildIds.length > 0) {
+    let matchedPending: ToolCallEvent | undefined;
+    const eligibleIdx = order.findIndex((entry) => {
+      if (!isAgySubagentTool(entry.name)) return false;
+      const match = findMatchingPendingSubagent(state, entry, evidenceChildIds);
+      if (match.conflicts) return false;
+      matchedPending = match.pending;
+      return true;
+    });
+    if (eligibleIdx >= 0) {
+      const orderEntry = order[eligibleIdx];
+      order.splice(eligibleIdx, 1);
+      return { orderEntry, pending: matchedPending };
+    }
+  }
+
+  // 5. No subagent evidence in row.content: prefer resolving an unconsumed
+  // non-subagent tool in the batch so parallel MCP/bash outputs never shift
+  // onto an unresolved or ACP-completed subagent call.
+  const nonSubagentIdx = order.findIndex((entry) => !isAgySubagentTool(entry.name));
+  if (nonSubagentIdx >= 0) {
+    return { orderEntry: order.splice(nonSubagentIdx, 1)[0] };
+  }
+
+  // 6. Only subagent entries remain and content has no snapshot evidence.
+  // Never consume/overwrite an ACP-completed subagent (already has output),
+  // an actively running ACP subagent, or a subagent launch call with plain prose;
+  // allow only single non-launch updates (e.g. send_message 'Message sent') or error rows.
+  const first = order[0];
+  const { pending } = findMatchingPendingSubagent(state, first);
+  if (pending?.status === 'running') return undefined;
+  if (pending?.output?.trim()) return undefined;
+  const normalized = normalizeAgyToolName(first.name);
+  const isLaunchTool = /^(invokesubagent|browsersubagent|swarm|subagent|agent)$/.test(normalized);
+  if (isLaunchTool && row.status !== 'ERROR') return undefined;
+  if (order.length > 1) return undefined;
+  return { orderEntry: order.splice(0, 1)[0], pending };
 }

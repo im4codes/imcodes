@@ -1,4 +1,4 @@
-import { AgySubagentTracker } from '../agy-subagents.js';
+import { AgySubagentTracker, stableJson } from '../agy-subagents.js';
 import { AgyCompactionWatermark } from '../agy-compaction-watermark.js';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -104,7 +104,7 @@ interface AgySessionState {
   compactionWatermark: AgyCompactionWatermark;
   sessionSystemTextInjected?: string;
   stderrTail: string;
-  toolSteps: Map<string, { id: string; name: string }>;
+  toolSteps: Map<string, { id: string; name: string; inputKey?: string }>;
   nextSyntheticToolStep?: number;
   mayHaveHistoricalError: boolean;
   /** An error result is being checked against durable history; cancellation wins over this read. */
@@ -884,27 +884,52 @@ export class AgySdkProvider implements TransportProvider {
       const failed = /^(ERROR|FAILED|CANCELLED)$/.test(stepState ?? '');
       const done = stepState === AGY_STEP_STATE.DONE || failed;
       const toolCallId = asString(step.tool_call_id) ?? asString(info.tool_call_id) ?? asString(info.id);
+      const inputKey = stableJson(info.parameters);
+      const nextSynthetic = () => {
+        const n = (state.nextSyntheticToolStep ?? 0) + 1;
+        state.nextSyntheticToolStep = n;
+        return `anon:${n}`;
+      };
+      const findAnonymousStepKey = (): string => {
+        const anonMatches = [...state.toolSteps.entries()].filter(([k, v]) => k.startsWith('anon:') && v.name === name);
+        if (inputKey !== undefined) {
+          const exact = anonMatches.find(([, v]) => v.inputKey === inputKey);
+          if (exact) return exact[0];
+          const unknownInputMatches = anonMatches.filter(([, v]) => v.inputKey === undefined);
+          if (unknownInputMatches.length === 1) return unknownInputMatches[0][0];
+          return nextSynthetic();
+        }
+        if (anonMatches.length > 0) return anonMatches[0][0];
+        return nextSynthetic();
+      };
       let stepKey: string;
       if (rawStepIndex !== undefined) {
         stepKey = `step:${rawStepIndex}`;
       } else if (toolCallId) {
-        stepKey = `call:${toolCallId}`;
+        const explicitCallKey = `call:${toolCallId}`;
+        if (!state.toolSteps.has(explicitCallKey) && done) {
+          const compatibleAnon = [...state.toolSteps.entries()].filter(
+            ([k, v]) => k.startsWith('anon:') && v.name === name
+              && (inputKey === undefined || v.inputKey === undefined || v.inputKey === inputKey),
+          );
+          stepKey = compatibleAnon.length === 1 ? compatibleAnon[0][0] : explicitCallKey;
+        } else {
+          stepKey = explicitCallKey;
+        }
       } else {
-        const nextSynthetic = () => {
-          const n = (state.nextSyntheticToolStep ?? 0) + 1;
-          state.nextSyntheticToolStep = n;
-          return `anon:${n}`;
-        };
-        const matchingUnindexed = done
-          ? [...state.toolSteps.entries()].find(([k, v]) => k.startsWith('anon:') && v.name === name)
-          : undefined;
-        stepKey = matchingUnindexed?.[0] ?? nextSynthetic();
+        stepKey = findAnonymousStepKey();
       }
       let existingStep = state.toolSteps.get(stepKey);
       if (!existingStep || (rawStepIndex === undefined && existingStep.name !== name)) {
         const suffix = rawStepIndex ?? toolCallId ?? stepKey;
-        existingStep = { id: `${state.conversationId ?? state.routeId}:${suffix}`, name };
+        existingStep = {
+          id: `${state.conversationId ?? state.routeId}:${suffix}`,
+          name,
+          ...(inputKey !== undefined ? { inputKey } : {}),
+        };
         state.toolSteps.set(stepKey, existingStep);
+      } else if (existingStep.inputKey === undefined && inputKey !== undefined) {
+        existingStep.inputKey = inputKey;
       }
       const id = existingStep.id;
       state.sawToolCall = true;

@@ -1046,4 +1046,131 @@ describe('AgySdkProvider (fake agy process)', () => {
       },
     });
   });
+
+  it('reuses synthetic identity for unindexed ACTIVE replays and separates parallel distinct inputs without leaving phantom running subagents', async () => {
+    const sid = await provider.createSession({ sessionKey: 'unindexed-replay-sess', cwd: dir });
+    const toolEvents: ToolCallEvent[] = [];
+    provider.onToolCall((_s, tool) => toolEvents.push(tool));
+    const state = (provider as any).sessions.get(sid);
+    state.conversationId = 'conv-unindexed-test';
+    const emitStep = (step: Record<string, unknown>) => {
+      (provider as any).handleLine(sid, state, JSON.stringify({ event: 'step_update', step_update: step }));
+    };
+
+    // 1. Repeat ACTIVE updates with no step_index and no tool_call_id for the same call must reuse one slot.
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Role: 'Alpha', Prompt: 'work alpha' } },
+    });
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Prompt: 'work alpha', Role: 'Alpha' } },
+    });
+    expect(state.toolSteps.size).toBe(1);
+
+    // 2. Concurrent anonymous call with distinct parameters gets its own slot, and replays reuse it.
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Role: 'Beta', Prompt: 'work beta' } },
+    });
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Role: 'Beta', Prompt: 'work beta' } },
+    });
+    expect(state.toolSteps.size).toBe(2);
+
+    // 3. Out-of-order DONE for Beta, then DONE for Alpha.
+    emitStep({
+      step_type: 'tool',
+      state: 'DONE',
+      tool_name: 'invoke_subagent',
+      tool_info: {
+        name: 'invoke_subagent',
+        parameters: { Role: 'Beta', Prompt: 'work beta' },
+        output: JSON.stringify({ conversationId: 'child-beta', status: 'running' }),
+      },
+    });
+    emitStep({
+      step_type: 'tool',
+      state: 'DONE',
+      tool_name: 'invoke_subagent',
+      tool_info: {
+        name: 'invoke_subagent',
+        parameters: { Role: 'Alpha', Prompt: 'work alpha' },
+        output: JSON.stringify({ conversationId: 'child-alpha', status: 'running' }),
+      },
+    });
+    expect(state.toolSteps.size).toBe(0);
+
+    // 4. Child completions leave zero active/orphan subagents.
+    const alphaDone = state.subagents.snapshot({ conversationId: 'child-alpha', status: 'completed' }, 'native_completion');
+    const betaDone = state.subagents.snapshot({ conversationId: 'child-beta', status: 'completed' }, 'native_completion');
+    expect(alphaDone[0]?.detail?.meta?.terminal).toBe(true);
+    expect(betaDone[0]?.detail?.meta?.terminal).toBe(true);
+    expect(state.subagents.interrupt()).toEqual([]);
+
+    // 5. Distinct wire call_id & step_index stay isolated alongside parameterless anonymous replay + late tool_call_id DONE.
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      step_index: 50,
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Role: 'Indexed' } },
+    });
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_call_id: 'call-explicit-1',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', parameters: { Role: 'CallId' } },
+    });
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent' },
+    });
+    emitStep({
+      step_type: 'tool',
+      state: 'ACTIVE',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent' },
+    });
+    expect(state.toolSteps.size).toBe(3);
+
+    emitStep({
+      step_type: 'tool',
+      state: 'DONE',
+      tool_call_id: 'late-call-id',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', output: JSON.stringify({ conversationId: 'child-anon', status: 'completed' }) },
+    });
+    emitStep({
+      step_type: 'tool',
+      state: 'DONE',
+      step_index: 50,
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', output: JSON.stringify({ conversationId: 'child-indexed', status: 'completed' }) },
+    });
+    emitStep({
+      step_type: 'tool',
+      state: 'DONE',
+      tool_call_id: 'call-explicit-1',
+      tool_name: 'invoke_subagent',
+      tool_info: { name: 'invoke_subagent', output: JSON.stringify({ conversationId: 'child-callid', status: 'completed' }) },
+    });
+    expect(state.toolSteps.size).toBe(0);
+    expect(state.subagents.interrupt()).toEqual([]);
+    expect(toolEvents.some((t) => t.detail?.meta?.agentPath === 'child-alpha')).toBe(true);
+    expect(toolEvents.some((t) => t.detail?.meta?.agentPath === 'child-beta')).toBe(true);
+    expect(toolEvents.some((t) => t.detail?.meta?.agentPath === 'child-anon')).toBe(true);
+  });
 });
