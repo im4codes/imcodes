@@ -19523,3 +19523,116 @@ button.quick-agent-delegation-preset.active {
     transform: none;
   }
 }
+
+/* Desktop Cloud Docs button: animated iridescent conic marquee border */
+.btn.desktop-cloud-docs-marquee-btn,
+html.native-ios-mac .btn.desktop-cloud-docs-marquee-btn {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: 7px;
+  font-size: 12px;
+  background: transparent;
+  color: #e2e8f0;
+  box-shadow:
+    0 0 10px rgba(34, 211, 238, 0.24),
+    0 0 16px rgba(192, 132, 252, 0.18),
+    0 0 10px rgba(244, 114, 182, 0.14);
+}
+
+.btn.desktop-cloud-docs-marquee-btn > * {
+  position: relative;
+  z-index: 2;
+}
+
+.btn.desktop-cloud-docs-marquee-btn::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: max(220%, 64px);
+  aspect-ratio: 1;
+  z-index: 0;
+  pointer-events: none;
+  background: conic-gradient(
+    from 0deg,
+    #22d3ee,
+    #38bdf8,
+    #818cf8,
+    #c084fc,
+    #f472b6,
+    #fb7185,
+    #f59e0b,
+    #facc15,
+    #34d399,
+    #22d3ee
+  );
+  transform: translate(-50%, -50%) rotate(0turn);
+  animation: desktop-cloud-docs-marquee-spin 2.8s linear infinite;
+  will-change: transform;
+}
+
+.btn.desktop-cloud-docs-marquee-btn::after {
+  content: '';
+  position: absolute;
+  inset: 2px;
+  z-index: 1;
+  border-radius: 5px;
+  pointer-events: none;
+  background: linear-gradient(180deg, rgba(71, 85, 105, 0.32), transparent 55%), #334155;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  transition: background-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.btn.desktop-cloud-docs-marquee-btn:hover:not(:disabled) {
+  color: #ffffff;
+  box-shadow:
+    0 0 14px rgba(34, 211, 238, 0.36),
+    0 0 20px rgba(192, 132, 252, 0.28),
+    0 0 14px rgba(244, 114, 182, 0.24);
+}
+
+.btn.desktop-cloud-docs-marquee-btn:hover:not(:disabled)::after {
+  background: linear-gradient(180deg, rgba(100, 116, 139, 0.35), transparent 55%), #3f4f66;
+}
+
+.btn.desktop-cloud-docs-marquee-btn:focus-visible {
+  outline: 2px solid #67e8f9;
+  outline-offset: 2px;
+}
+
+.btn.desktop-cloud-docs-marquee-btn[aria-pressed='true'] {
+  color: #ffffff;
+  box-shadow:
+    0 0 16px rgba(56, 189, 248, 0.42),
+    0 0 22px rgba(192, 132, 252, 0.30),
+    0 0 14px rgba(244, 114, 182, 0.24);
+}
+
+.btn.desktop-cloud-docs-marquee-btn[aria-pressed='true']::after {
+  background: linear-gradient(180deg, rgba(96, 165, 250, 0.24), transparent 55%), #1d4ed8;
+}
+
+.btn.desktop-cloud-docs-marquee-btn[aria-pressed='true']:hover:not(:disabled)::after {
+  background: linear-gradient(180deg, rgba(147, 197, 253, 0.28), transparent 55%), #2563eb;
+}
+
+@keyframes desktop-cloud-docs-marquee-spin {
+  from {
+    transform: translate(-50%, -50%) rotate(0turn);
+  }
+  to {
+    transform: translate(-50%, -50%) rotate(1turn);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .btn.desktop-cloud-docs-marquee-btn::before {
+    animation: none;
+  }
+}

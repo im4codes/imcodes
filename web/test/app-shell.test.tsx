@@ -8881,4 +8881,26 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
     }
   }, 15000);
+
+  it('applies the colorful marquee border class only to desktop-cloud-docs-btn and keeps click/pressed toggle intact', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const desktopBtn = await screen.findByTestId('desktop-cloud-docs-btn');
+    const mobileBtn = await screen.findByTestId('mobile-cloud-docs-btn');
+
+    expect(desktopBtn.classList.contains('btn')).toBe(true);
+    expect(desktopBtn.classList.contains('desktop-cloud-docs-marquee-btn')).toBe(true);
+    expect(desktopBtn.getAttribute('style')).toBeNull();
+    expect(desktopBtn.getAttribute('aria-pressed')).toBe('false');
+
+    expect(mobileBtn.classList.contains('desktop-cloud-docs-marquee-btn')).toBe(false);
+
+    fireEvent.click(desktopBtn);
+    await waitFor(() => expect(desktopBtn.getAttribute('aria-pressed')).toBe('true'));
+  }, 15000);
 });

@@ -8189,17 +8189,8 @@ function InternalMainApp() {
                 canSetUp={!selectedShareTarget}
               />
               <button
-                class="btn"
+                class="btn desktop-cloud-docs-marquee-btn"
                 data-testid="desktop-cloud-docs-btn"
-                style={{
-                  background: showCloudDocs ? '#1d4ed8' : '#334155',
-                  color: showCloudDocs ? '#ffffff' : '#e2e8f0',
-                  fontSize: 12,
-                  padding: '4px 7px',
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                }}
                 onClick={() => setShowCloudDocs((prev) => !prev)}
                 title={trans('cloud_docs.title', 'Cloud Docs')}
                 aria-label={trans('cloud_docs.title', 'Cloud Docs')}
