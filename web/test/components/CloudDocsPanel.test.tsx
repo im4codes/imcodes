@@ -1678,12 +1678,12 @@ describe('CloudDocsPanel', () => {
       expect(header.classList.contains('is-mobile-search-open')).toBe(true);
     }
 
-    fireEvent.compositionStart(searchInput);
+    fireEvent(searchInput, new CompositionEvent('compositionstart', { bubbles: true }));
     fireEvent.keyDown(searchInput, { key: 'Enter' });
     expect(header.classList.contains('is-mobile-search-open')).toBe(true);
     fireEvent.keyDown(searchInput, { key: 'Escape' });
     expect(header.classList.contains('is-mobile-search-open')).toBe(true);
-    fireEvent.compositionEnd(searchInput);
+    fireEvent(searchInput, new CompositionEvent('compositionend', { bubbles: true }));
 
     // After composition ends, ordinary Enter collapses search while retaining query and reopening focuses input
     fireEvent.keyDown(searchInput, { key: 'Enter' });

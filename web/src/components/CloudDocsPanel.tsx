@@ -523,6 +523,24 @@ export function CloudDocsPanel({
     }
   }, [mobileSearchOpen]);
 
+  useEffect(() => {
+    const el = searchInputRef.current;
+    if (!el) return;
+    const handleCompositionStart = () => {
+      searchComposingRef.current = true;
+    };
+    const handleCompositionEnd = () => {
+      searchComposingRef.current = false;
+    };
+    el.addEventListener('compositionstart', handleCompositionStart);
+    el.addEventListener('compositionend', handleCompositionEnd);
+    return () => {
+      el.removeEventListener('compositionstart', handleCompositionStart);
+      el.removeEventListener('compositionend', handleCompositionEnd);
+      searchComposingRef.current = false;
+    };
+  }, [previewTarget]);
+
   // Invalidates any pre-mutation list read so stale GET responses/errors cannot roll back newer projections.
   const invalidatePendingRefresh = useCallback(() => {
     loadSeqRef.current += 1;
@@ -2168,12 +2186,6 @@ export function CloudDocsPanel({
               placeholder={t('cloud_docs.search_placeholder', 'Search documents...')}
               value={search}
               onInput={(e) => setSearch((e.currentTarget as HTMLInputElement).value)}
-              onCompositionStart={() => {
-                searchComposingRef.current = true;
-              }}
-              onCompositionEnd={() => {
-                searchComposingRef.current = false;
-              }}
               onKeyDown={(e) => {
                 if (searchComposingRef.current || isImeComposingKeyEvent(e)) return;
                 if (mobileSearchOpen && (e.key === 'Escape' || e.key === 'Enter')) {
