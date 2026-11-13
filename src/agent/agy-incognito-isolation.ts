@@ -66,18 +66,27 @@ interface PsProcessRow {
   pid: number;
   ppid: number;
   pgid: number;
+  isZombie: boolean;
 }
 
 type ProcessIdentityStatus = 'dead' | 'alive' | 'recycled' | 'inconclusive';
 
-const activeIncognitoHomes = new Set<string>();
+const activeIncognitoHomes = new Map<string, AgyIncognitoOwnerMeta>();
 let exitHookRegistered = false;
 
 function registerExitCleanupHook(): void {
   if (exitHookRegistered) return;
   exitHookRegistered = true;
   process.on('exit', () => {
-    for (const dir of [...activeIncognitoHomes]) {
+    for (const [dir, inMemoryMeta] of [...activeIncognitoHomes.entries()]) {
+      const diskMeta = readOwnerMeta(dir);
+      const meta = diskMeta?.childPid !== undefined ? diskMeta : (inMemoryMeta ?? diskMeta);
+      if (meta?.childPid !== undefined && !reapVerifiedChildSync(meta)) {
+        // Keep the directory and intact owner marker when child identity or
+        // termination cannot be verified so cold reclaim can safely retry.
+        preserveOwnerMetaIfDirSurvives(dir, meta);
+        continue;
+      }
       try {
         rmSync(dir, { recursive: true, force: true });
       } catch {
@@ -85,9 +94,24 @@ function registerExitCleanupHook(): void {
       }
       if (!existsSync(dir)) {
         activeIncognitoHomes.delete(dir);
+      } else if (meta) {
+        preserveOwnerMetaIfDirSurvives(dir, meta);
       }
     }
   });
+}
+
+function readLinuxProcessState(pid: number): string | undefined {
+  if (process.platform !== 'linux') return undefined;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const rparen = stat.lastIndexOf(') ');
+    if (rparen < 0) return undefined;
+    const fields = stat.slice(rparen + 2).trim().split(/\s+/);
+    return fields[0] || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function readLinuxProcessStartTicks(pid: number): string | undefined {
@@ -224,13 +248,14 @@ function preserveOwnerMetaIfDirSurvives(dirPath: string, meta: AgyIncognitoOwner
 function parsePsProcessTable(stdout: string): PsProcessRow[] {
   const rows: PsProcessRow[] = [];
   for (const line of stdout.split('\n').slice(1)) {
-    const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)$/);
+    const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)/);
     if (!match) continue;
     const pid = Number(match[1]);
     const ppid = Number(match[2]);
     const pgid = Number(match[3]);
+    const isZombie = match[4].toUpperCase().startsWith('Z');
     if (Number.isInteger(pid) && Number.isInteger(ppid) && Number.isInteger(pgid)) {
-      rows.push({ pid, ppid, pgid });
+      rows.push({ pid, ppid, pgid, isZombie });
     }
   }
   return rows;
@@ -238,7 +263,7 @@ function parsePsProcessTable(stdout: string): PsProcessRow[] {
 
 function readPsTableSync(): PsProcessRow[] | null {
   try {
-    const stdout = execFileSync('ps', ['-A', '-o', 'pid,ppid,pgid'], {
+    const stdout = execFileSync('ps', ['-A', '-o', 'pid,ppid,pgid,stat'], {
       encoding: 'utf8',
       timeout: PS_TIMEOUT_MS,
     });
@@ -250,7 +275,7 @@ function readPsTableSync(): PsProcessRow[] | null {
 
 async function readPsTableAsync(): Promise<PsProcessRow[] | null> {
   try {
-    const { stdout } = await execFileOffMainIdempotent('ps', ['-A', '-o', 'pid,ppid,pgid'], {
+    const { stdout } = await execFileOffMainIdempotent('ps', ['-A', '-o', 'pid,ppid,pgid,stat'], {
       timeout: PS_TIMEOUT_MS,
     });
     return parsePsProcessTable(stdout);
@@ -283,7 +308,7 @@ function collectDescendantsFromTable(rootPid: number, rows: readonly PsProcessRo
 function countGroupMembersFromTable(pgid: number, rows: readonly PsProcessRow[]): number {
   let count = 0;
   for (const row of rows) {
-    if (row.pgid === pgid) count += 1;
+    if (!row.isZombie && row.pgid === pgid) count += 1;
   }
   return count;
 }
@@ -322,21 +347,51 @@ function sleepAsync(ms: number): Promise<void> {
   return new Promise((resolve) => { setTimeout(resolve, ms); });
 }
 
+function isLiveNonZombiePid(pid: number, rows: readonly PsProcessRow[]): boolean {
+  if (!isPidAlive(pid)) return false;
+  const row = rows.find((entry) => entry.pid === pid);
+  if (row) return !row.isZombie;
+  if (readLinuxProcessState(pid) === 'Z') return false;
+  return isPidAlive(pid);
+}
+
 function allTargetsCleared(
   childPid: number,
   descendants: readonly number[],
   ownsGroup: boolean,
   rows: readonly PsProcessRow[] | null,
 ): boolean {
-  if (isPidAlive(childPid)) return false;
+  if (rows === null) return false;
+  if (isLiveNonZombiePid(childPid, rows)) return false;
   for (const pid of descendants) {
-    if (isPidAlive(pid)) return false;
+    if (isLiveNonZombiePid(pid, rows)) return false;
   }
-  if (ownsGroup) {
-    if (rows === null) return false;
-    if (countGroupMembersFromTable(childPid, rows) > 0) return false;
+  if (ownsGroup && countGroupMembersFromTable(childPid, rows) > 0) {
+    return false;
   }
   return true;
+}
+
+function fetchTargetPsRowsSync(
+  childPid: number,
+  descendants: readonly number[],
+  ownsGroup: boolean,
+): PsProcessRow[] | null {
+  if (!ownsGroup && !isPidAlive(childPid) && !descendants.some(isPidAlive)) {
+    return [];
+  }
+  return readPsTableSync();
+}
+
+async function fetchTargetPsRowsAsync(
+  childPid: number,
+  descendants: readonly number[],
+  ownsGroup: boolean,
+): Promise<PsProcessRow[] | null> {
+  if (!ownsGroup && !isPidAlive(childPid) && !descendants.some(isPidAlive)) {
+    return [];
+  }
+  return await readPsTableAsync();
 }
 
 function issueTreeSignal(
@@ -374,7 +429,7 @@ function reapVerifiedPosixChildSync(childPid: number, ownsGroup: boolean, leader
   const graceDeadline = Date.now() + PROCESS_REAP_GRACEFUL_MS;
   while (Date.now() < graceDeadline) {
     sleepSync(PROCESS_REAP_POLL_MS);
-    const rows = ownsGroup ? readPsTableSync() : [];
+    const rows = fetchTargetPsRowsSync(childPid, descendants, ownsGroup);
     if (allTargetsCleared(childPid, descendants, ownsGroup, rows)) return true;
   }
 
@@ -384,11 +439,11 @@ function reapVerifiedPosixChildSync(childPid: number, ownsGroup: boolean, leader
 
   const killDeadline = Date.now() + PROCESS_KILL_SETTLE_MS;
   while (Date.now() < killDeadline) {
-    const rows = ownsGroup ? readPsTableSync() : [];
+    const rows = fetchTargetPsRowsSync(childPid, descendants, ownsGroup);
     if (allTargetsCleared(childPid, descendants, ownsGroup, rows)) return true;
     sleepSync(PROCESS_REAP_POLL_MS);
   }
-  const finalRows = ownsGroup ? readPsTableSync() : [];
+  const finalRows = fetchTargetPsRowsSync(childPid, descendants, ownsGroup);
   return allTargetsCleared(childPid, descendants, ownsGroup, finalRows);
 }
 
@@ -406,7 +461,7 @@ async function reapVerifiedPosixChildAsync(childPid: number, ownsGroup: boolean,
   const graceDeadline = Date.now() + PROCESS_REAP_GRACEFUL_MS;
   while (Date.now() < graceDeadline) {
     await sleepAsync(PROCESS_REAP_POLL_MS);
-    const rows = ownsGroup ? await readPsTableAsync() : [];
+    const rows = await fetchTargetPsRowsAsync(childPid, descendants, ownsGroup);
     if (allTargetsCleared(childPid, descendants, ownsGroup, rows)) return true;
   }
 
@@ -416,11 +471,11 @@ async function reapVerifiedPosixChildAsync(childPid: number, ownsGroup: boolean,
 
   const killDeadline = Date.now() + PROCESS_KILL_SETTLE_MS;
   while (Date.now() < killDeadline) {
-    const rows = ownsGroup ? await readPsTableAsync() : [];
+    const rows = await fetchTargetPsRowsAsync(childPid, descendants, ownsGroup);
     if (allTargetsCleared(childPid, descendants, ownsGroup, rows)) return true;
     await sleepAsync(PROCESS_REAP_POLL_MS);
   }
-  const finalRows = ownsGroup ? await readPsTableAsync() : [];
+  const finalRows = await fetchTargetPsRowsAsync(childPid, descendants, ownsGroup);
   return allTargetsCleared(childPid, descendants, ownsGroup, finalRows);
 }
 
@@ -585,9 +640,6 @@ export function createAgyIncognitoEnvSync(
 
   const homeDir = mkdtempSync(path.join(baseTempDir, AGY_INCOGNITO_DIR_PREFIX));
   const resolvedHomeDir = path.resolve(homeDir);
-  activeIncognitoHomes.add(resolvedHomeDir);
-  registerExitCleanupHook();
-
   const daemonTicks = readLinuxProcessStartTicks(process.pid);
   const daemonStart = daemonTicks ? undefined : readProcessStartSync(process.pid);
   let currentMeta: AgyIncognitoOwnerMeta = {
@@ -597,6 +649,8 @@ export function createAgyIncognitoEnvSync(
     ...(daemonStart ? { processStart: daemonStart } : {}),
     createdAt: Date.now(),
   };
+  activeIncognitoHomes.set(resolvedHomeDir, currentMeta);
+  registerExitCleanupHook();
 
   let cleaned = false;
   let cleaningOrDisposed = false;
@@ -616,6 +670,12 @@ export function createAgyIncognitoEnvSync(
   const cleanupSync = (): void => {
     cleaningOrDisposed = true;
     if (cleaned && !existsSync(homeDir)) return;
+    const diskMeta = readOwnerMeta(homeDir);
+    const meta = diskMeta?.childPid !== undefined ? diskMeta : currentMeta;
+    if (meta.childPid !== undefined && !reapVerifiedChildSync(meta)) {
+      finalizeCleanupState();
+      return;
+    }
     try {
       rmSync(homeDir, { recursive: true, force: true });
     } catch {
@@ -654,6 +714,7 @@ export function createAgyIncognitoEnvSync(
       ownsProcessGroup,
       ...(childTicks ? { childStartTicks: childTicks } : {}),
     };
+    activeIncognitoHomes.set(resolvedHomeDir, currentMeta);
     try {
       if (existsSync(homeDir)) {
         writeOwnerMetaAtomic(homeDir, currentMeta);
@@ -666,6 +727,7 @@ export function createAgyIncognitoEnvSync(
         .then((childStart) => {
           if (!childStart || cleaningOrDisposed || !existsSync(homeDir)) return;
           currentMeta = { ...currentMeta, childProcessStart: childStart };
+          activeIncognitoHomes.set(resolvedHomeDir, currentMeta);
           writeOwnerMetaAtomic(homeDir, currentMeta);
         })
         .catch(() => {})

@@ -734,4 +734,96 @@ setInterval(() => {}, 1000);
     unrelated.kill('SIGKILL');
     await new Promise((r) => unrelated.once('exit', r));
   });
+
+  it('reaps detached child processes on process.exit(17) before removing home, and preserves owner metadata for cold reclaim if verification fails', async () => {
+    const work = makeTempDir('imcodes-agy-r3-exit-');
+    const customTmp = path.join(work, 'tmp');
+    mkdirSync(customTmp, { recursive: true });
+    vi.stubEnv('TMPDIR', customTmp);
+
+    const isoUrl = pathToFileURL(path.resolve('src/agent/agy-incognito-isolation.ts')).href;
+    const loader = path.resolve('node_modules/tsx/dist/loader.mjs');
+
+    const writerScript = path.join(work, 'detached-writer.mjs');
+    writeFileSync(writerScript, `
+import fs from 'node:fs';
+import path from 'node:path';
+const file = path.join(process.env.HOME, '.gemini', 'antigravity-cli', 'history.jsonl');
+setInterval(() => {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.appendFileSync(file, 'PRIVATE-DATA\\n');
+}, 50);
+`);
+
+    const exitingOwner = path.join(work, 'exiting-owner.mjs');
+    writeFileSync(exitingOwner, `
+import { spawn } from 'node:child_process';
+import { createAgyIncognitoEnvSync } from ${JSON.stringify(isoUrl)};
+const iso = createAgyIncognitoEnvSync();
+let childPid = null;
+if (process.env.SPAWN_CHILD !== '0') {
+  const child = spawn(process.execPath, [${JSON.stringify(writerScript)}], {
+    env: { ...process.env, ...iso.env },
+    detached: true,
+    stdio: 'ignore',
+  });
+  iso.registerChildProcess(child.pid, true);
+  child.unref();
+  childPid = child.pid;
+}
+process.stdout.write(JSON.stringify({ home: iso.homeDir, pid: childPid }) + '\\n');
+setTimeout(() => process.exit(17), 120);
+`);
+
+    const runExitingOwner = async (extraEnv: Record<string, string>) => {
+      const proc = spawn(process.execPath, ['--import', loader, exitingOwner], {
+        env: { ...process.env, TMPDIR: customTmp, ...extraEnv },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      proc.stdout.on('data', (d) => { stdout += d.toString('utf8'); });
+      const [code] = await new Promise<[number | null]>((resolve) => proc.once('exit', (c) => resolve([c])));
+      const info = JSON.parse(stdout.trim()) as { home: string; pid: number | null };
+      if (info.pid) strayPids.push(info.pid);
+      return { code, info };
+    };
+
+    // Case 1: Normal process.exit(17) while detached writer is active -> kills writer before deleting home
+    const res1 = await runExitingOwner({ SPAWN_CHILD: '1' });
+    expect(res1.code).toBe(17);
+    expect(res1.info.pid).toBeTruthy();
+    await new Promise((r) => setTimeout(r, 350));
+    expect(pidAlive(res1.info.pid!)).toBe(false);
+    expect(existsSync(res1.info.home)).toBe(false);
+    expect(existsSync(path.join(res1.info.home, '.gemini', 'antigravity-cli', 'history.jsonl'))).toBe(false);
+    expect(existsSync(path.join(res1.info.home, '.imcodes-owner.json'))).toBe(false);
+    expect(await reclaimOrphanedAgyIncognitoHomes(customTmp)).toBe(0);
+
+    // Case 2: Construction/idle home with no registered child -> exit hook cleans home immediately
+    const res2 = await runExitingOwner({ SPAWN_CHILD: '0' });
+    expect(res2.code).toBe(17);
+    expect(res2.info.pid).toBeNull();
+    expect(existsSync(res2.info.home)).toBe(false);
+
+    // Case 3: Verification/termination cannot be confirmed on exit (PATH='' breaks ps in POSIX reaper) ->
+    // exit hook preserves directory and intact owner marker; subsequent cold reclaim kills writer and deletes home.
+    const res3 = await runExitingOwner({ SPAWN_CHILD: '1', PATH: '' });
+    expect(res3.code).toBe(17);
+    expect(res3.info.pid).toBeTruthy();
+    expect(pidAlive(res3.info.pid!)).toBe(true);
+    expect(existsSync(res3.info.home)).toBe(true);
+    const preservedMeta = JSON.parse(readFileSync(path.join(res3.info.home, '.imcodes-owner.json'), 'utf8')) as {
+      childPid?: number;
+      childStartTicks?: string;
+      ownsProcessGroup?: boolean;
+    };
+    expect(preservedMeta.childPid).toBe(res3.info.pid);
+    expect(preservedMeta.childStartTicks).toBeTruthy();
+    expect(preservedMeta.ownsProcessGroup).toBe(true);
+
+    expect(await reclaimOrphanedAgyIncognitoHomes(customTmp)).toBe(1);
+    await new Promise((r) => setTimeout(r, 250));
+    expect(pidAlive(res3.info.pid!)).toBe(false);
+    expect(existsSync(res3.info.home)).toBe(false);
+  });
 });
