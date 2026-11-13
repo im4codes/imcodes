@@ -5,6 +5,8 @@ import androidx.lifecycle.Lifecycle;
 import android.media.AudioFormat;
 import android.media.AudioRecord;
 import android.media.MediaRecorder;
+import android.media.audiofx.AudioEffect;
+import android.media.audiofx.AutomaticGainControl;
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.PermissionState;
@@ -162,28 +164,29 @@ public class StreamingSpeechPlugin extends Plugin {
             // Buffer at least 6 seconds of 16kHz 16-bit mono PCM (~192KB) so speech captured
             // while the worker thread finishes warming up the model is never lost.
             int bufferSizeInBytes = Math.max(min * 2, SAMPLE_RATE * 2 * 6);
-            AudioRecord audio = new AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, SAMPLE_RATE,
-                AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufferSizeInBytes);
-            if (audio.getState() != AudioRecord.STATE_INITIALIZED) {
-                audio.release();
+            AudioRecord audio = createAudioRecord(bufferSizeInBytes);
+            if (audio == null) {
                 call.reject("Offline speech could not start", new IOException("Microphone initialization failed"));
                 return;
             }
+            AutomaticGainControl agc = attachAutomaticGainControl(audio);
             try {
                 audio.startRecording();
             } catch (IllegalStateException e) {
+                releaseAutomaticGainControl(agc);
                 audio.release();
                 call.reject("Offline speech could not start", e);
                 return;
             }
             if (audio.getRecordingState() != AudioRecord.RECORDSTATE_RECORDING) {
+                releaseAutomaticGainControl(agc);
                 try { audio.stop(); } catch (IllegalStateException ignored) { }
                 audio.release();
                 call.reject("Offline speech could not start", new IOException("Microphone start failed"));
                 return;
             }
             long owner = generation.incrementAndGet();
-            CaptureSession session = new CaptureSession(owner, audio);
+            CaptureSession session = new CaptureSession(owner, audio, agc);
             activeSession = session;
             recorder = audio;
             listening = true;
@@ -197,8 +200,69 @@ public class StreamingSpeechPlugin extends Plugin {
         }
     }
 
+    private static AudioRecord createAudioRecord(int bufferSizeInBytes) {
+        int[] sources = {
+            MediaRecorder.AudioSource.MIC,
+            MediaRecorder.AudioSource.VOICE_RECOGNITION,
+        };
+        for (int source : sources) {
+            AudioRecord candidate = null;
+            try {
+                candidate = new AudioRecord(
+                    source,
+                    SAMPLE_RATE,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    bufferSizeInBytes
+                );
+                if (candidate.getState() == AudioRecord.STATE_INITIALIZED) {
+                    return candidate;
+                }
+            } catch (IllegalArgumentException | SecurityException ignored) {
+                // Fall back to next audio source when this source is rejected by the HAL.
+            }
+            if (candidate != null) {
+                try { candidate.release(); } catch (RuntimeException ignored) { }
+            }
+        }
+        return null;
+    }
+
+    private static AutomaticGainControl attachAutomaticGainControl(AudioRecord audio) {
+        try {
+            if (!AutomaticGainControl.isAvailable()) {
+                return null;
+            }
+            AutomaticGainControl effect = AutomaticGainControl.create(audio.getAudioSessionId());
+            if (effect == null) {
+                return null;
+            }
+            try {
+                if (effect.setEnabled(true) != AudioEffect.SUCCESS) {
+                    effect.release();
+                    return null;
+                }
+                return effect;
+            } catch (RuntimeException ignored) {
+                try { effect.release(); } catch (RuntimeException ignoredRelease) { }
+                return null;
+            }
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static void releaseAutomaticGainControl(AutomaticGainControl agc) {
+        if (agc == null) {
+            return;
+        }
+        try { agc.setEnabled(false); } catch (Throwable ignored) { }
+        try { agc.release(); } catch (Throwable ignored) { }
+    }
+
     private void runReader(CaptureSession session) {
         short[] pcm = new short[1600]; // 100ms chunks; bounded in-memory queue survives stop-before-warmup.
+        SpeechGain speechGain = new SpeechGain();
         session.markReaderStarted();
         try {
             while (!session.isDiscarded()) {
@@ -210,12 +274,10 @@ public class StreamingSpeechPlugin extends Plugin {
                     break;
                 }
                 float[] samples = new float[count];
-                double power = 0;
                 for (int i = 0; i < count; i++) {
                     samples[i] = pcm[i] / 32768.0f;
-                    power += samples[i] * samples[i];
                 }
-                double levelValue = Math.min(1, Math.sqrt(power / count) * 3);
+                double levelValue = speechGain.processChunk(samples, count);
                 if (!session.offerSamples(samples, () -> {
                     JSObject level = new JSObject();
                     level.put("level", levelValue);
@@ -235,8 +297,7 @@ public class StreamingSpeechPlugin extends Plugin {
         } finally {
             session.markFirstPassDone();
             synchronized (captureLock) {
-                try { session.audio.stop(); } catch (IllegalStateException ignored) { }
-                session.audio.release();
+                session.releaseAudioResources();
                 if (recorder == session.audio) recorder = null;
             }
             session.finishReader();
@@ -296,10 +357,7 @@ public class StreamingSpeechPlugin extends Plugin {
                 }
             }
             synchronized (captureLock) {
-                if (audio != null) {
-                    try { audio.stop(); } catch (IllegalStateException ignored) { }
-                    audio.release();
-                }
+                session.releaseAudioResources();
                 if (recorder == audio) recorder = null;
                 if (activeSession == session) {
                     activeSession = null;
@@ -541,13 +599,6 @@ public class StreamingSpeechPlugin extends Plugin {
         }
     }
 
-    private static double computeLevel(float[] samples) {
-        if (samples.length == 0) return 0;
-        double power = 0;
-        for (float s : samples) power += s * s;
-        return Math.min(1, Math.sqrt(power / samples.length) * 3);
-    }
-
     private static final class AudioBatch {
         final float[] samples;
         final boolean speech;
@@ -565,15 +616,27 @@ public class StreamingSpeechPlugin extends Plugin {
         private final ArrayDeque<float[]> pcmQueue = new ArrayDeque<>();
         private final CountDownLatch readerStarted = new CountDownLatch(1);
         private final CountDownLatch firstPassDone = new CountDownLatch(1);
+        private AutomaticGainControl agc;
+        private boolean audioReleased;
         private boolean stopRequested;
         private boolean discarded;
         private boolean readerDone;
         private boolean overflowed;
         private Exception readError;
 
-        CaptureSession(long owner, AudioRecord audio) {
+        CaptureSession(long owner, AudioRecord audio, AutomaticGainControl agc) {
             this.owner = owner;
             this.audio = audio;
+            this.agc = agc;
+        }
+
+        synchronized void releaseAudioResources() {
+            if (audioReleased) return;
+            audioReleased = true;
+            releaseAutomaticGainControl(agc);
+            agc = null;
+            try { audio.stop(); } catch (IllegalStateException ignored) { }
+            audio.release();
         }
 
         void markReaderStarted() {
@@ -638,7 +701,7 @@ public class StreamingSpeechPlugin extends Plugin {
                 boolean speech = false;
                 for (float[] chunk : pcmQueue) {
                     count += chunk.length;
-                    boolean voiced = computeLevel(chunk) >= 0.01;
+                    boolean voiced = SpeechGain.isVoiced(chunk);
                     speech |= voiced;
                     trailingSilence = voiced ? 0 : trailingSilence + chunk.length;
                 }
