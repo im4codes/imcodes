@@ -613,29 +613,4 @@ export function resolveFocusedKeyboardViewMode(options: {
 }
 
 /** Focus a contentEditable composer `.controls-input` without scrolling the viewport. */
-export function focusComposerElement(
-  el: HTMLElement | null | undefined,
-  options: { moveCaretToEnd?: boolean } = {},
-): boolean {
-  if (!el || !el.isConnected) return false;
-  try {
-    el.focus({ preventScroll: true });
-  } catch {
-    el.focus();
-  }
-  if (options.moveCaretToEnd && typeof window !== 'undefined' && typeof document !== 'undefined') {
-    try {
-      const sel = window.getSelection();
-      if (sel) {
-        const range = document.createRange();
-        range.selectNodeContents(el);
-        range.collapse(false);
-        sel.removeAllRanges();
-        sel.addRange(range);
-      }
-    } catch {
-      /* jsdom or partial Selection API */
-    }
-  }
-  return document.activeElement === el;
-}
+export { focusComposerElement } from './util/composer-focus.js';

@@ -92,7 +92,6 @@ import {
   KEYBOARD_SHORTCUTS_PREF_KEY,
   canHandleGlobalNavigationShortcut,
   cycleOrderedId,
-  focusComposerElement,
   hasDomBlockingOverlay,
   isMacPlatform,
   matchNavigationShortcutAction,

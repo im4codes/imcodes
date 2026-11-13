@@ -61,7 +61,6 @@ import { DEFAULT_SUBSESSION_ACCENT_COLOR } from '../subsession-accent-colors.js'
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 import type { SessionSettingsOpenIntent } from '../session-settings-open-intent.js';
 import { useStableCallback } from '../hooks/useStableCallback.js';
-import { focusComposerElement } from '../keyboard-shortcuts.js';
 import type { ChatLocalWebPreviewOpenHandler } from './ChatLoopbackLink.js';
 import { RESIZE_DIRS, resizeHandleClass, resizeHandleHoverEvents, type ResizeDir } from './window-resize.js';
 

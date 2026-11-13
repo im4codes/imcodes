@@ -1,6 +1,8 @@
 export interface FocusComposerOptions {
   /** Place the caret at the end of the composer's text after focusing. */
   moveCursorToEnd?: boolean;
+  /** Alias for `moveCursorToEnd` used by keyboard shortcut callers. */
+  moveCaretToEnd?: boolean;
 }
 
 type ComposerFocusHandler = (options?: FocusComposerOptions) => boolean;
@@ -45,10 +47,12 @@ export function focusComposerElement(
   el: HTMLElement | null | undefined,
   options?: FocusComposerOptions,
 ): boolean {
-  if (!el) return false;
+  if (!el || !el.isConnected) return false;
+  const shouldMoveToEnd = Boolean(options?.moveCursorToEnd || options?.moveCaretToEnd);
+  const normalizedOptions = shouldMoveToEnd ? { ...options, moveCursorToEnd: true } : options;
   const registered = composerFocusHandlers.get(el);
   if (registered) {
-    return registered(options);
+    return registered(normalizedOptions);
   }
   if (el.classList.contains('controls-input-disabled')) {
     return false;
@@ -56,8 +60,12 @@ export function focusComposerElement(
   if (el.getAttribute('contenteditable') !== 'true') {
     el.setAttribute('contenteditable', 'true');
   }
-  el.focus();
-  if (options?.moveCursorToEnd) {
+  try {
+    el.focus({ preventScroll: true });
+  } catch {
+    el.focus();
+  }
+  if (shouldMoveToEnd) {
     moveCaretToEnd(el);
   }
   return document.activeElement === el;
