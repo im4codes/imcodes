@@ -181,11 +181,13 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     const composer = document.querySelector('.controls-composer') as HTMLElement;
     expect(document.activeElement).not.toBe(input);
 
+    // Unfocused mobile voice-ready input starts contenteditable="false" to block iOS UIKit magnifying loupe.
+    expect(input.getAttribute('contenteditable')).toBe('false');
     // Must not call preventDefault on pointerdown so iOS/Android tap-to-open-IME still fires natively.
     expect(dispatchPointer(input, 'pointerdown', 180)).toBe(true);
     expect(composer.classList.contains('controls-composer-voice-pending')).toBe(true);
     expect(input.style.userSelect).toBe('none');
-    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(input.getAttribute('contenteditable')).toBe('false');
 
     await vi.advanceTimersByTimeAsync(120);
     dispatchPointer(input, 'pointerup', 180);
@@ -196,6 +198,10 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(composer.classList.contains('controls-composer-voice-pending')).toBe(false);
     expect(input.getAttribute('contenteditable')).toBe('true');
     expect(input.style.userSelect).toBe('');
+
+    // Blurring returns unfocused mobile voice-ready composer to contenteditable="false".
+    fireEvent.blur(input);
+    expect(input.getAttribute('contenteditable')).toBe('false');
   });
 
   it('shields composer focus from stale compatibility mousedown after a touch short tap while allowing genuine subsequent taps', async () => {
@@ -303,9 +309,11 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     voiceMock.levelHandler?.(0.4);
     voiceMock.partialHandler?.('你好 IM.codes');
     await vi.advanceTimersByTimeAsync(0);
-    expect(document.querySelector('.voice-hold-hud-transcript')?.textContent).toBe('你好 IM.codes');
+    const transcriptEl = document.querySelector('.voice-hold-hud-transcript') as HTMLElement;
+    expect(transcriptEl.textContent).toBe('你好 IM.codes');
+    expect(transcriptEl.querySelector('.voice-streaming-robot-cursor')).not.toBeNull();
 
-    // Release in center zone drains stopListening and sends immediately, restoring contenteditable
+    // Release in center zone drains stopListening and sends immediately, returning unfocused composer to contenteditable="false"
     voiceMock.stopListening.mockImplementationOnce(async () => {
       voiceMock.partialHandler?.('你好 IM.codes 最终');
     });
@@ -318,7 +326,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     }));
     expect(document.querySelector('.voice-hold-hud')).toBeNull();
     expect(composer.classList.contains('controls-composer-voice-holding')).toBe(false);
-    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(input.getAttribute('contenteditable')).toBe('false');
     expect(input.style.userSelect).toBe('');
   });
 
@@ -355,7 +363,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(voiceMock.stopListening).toHaveBeenCalledTimes(1);
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
     expect(document.querySelector('.mock-voice-overlay')).toBeNull();
-    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(input.getAttribute('contenteditable')).toBe('false');
   });
 
   it('holds 240ms -> slides right into edit zone -> highlights blue & opens VoiceOverlay in edit mode on release', async () => {
@@ -395,7 +403,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(overlay).not.toBeNull();
     expect(overlay.getAttribute('data-initial-text')).toBe('需要二次修改的文字');
     expect(overlay.getAttribute('data-auto-start')).toBe('false');
-    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(input.getAttribute('contenteditable')).toBe('false');
   });
 
   it('failed microphone start shows localized error banner and never sends existing unsent draft on release', async () => {
@@ -701,7 +709,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(voiceMock.startListening).not.toHaveBeenCalled();
   });
 
-  it('suppresses selectstart and contextmenu during pending/active hold and restores contenteditable/styles across fail, cancel, lostcapture, and unmount', async () => {
+  it('suppresses selectstart and contextmenu during pending/active hold, ignores lostpointercapture via window tracking, and restores cleanly on pointercancel and unmount', async () => {
     const removeAllRanges = vi.fn();
     const origGetSelection = window.getSelection;
     Object.defineProperty(window, 'getSelection', {
@@ -723,7 +731,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
 
       const input = document.querySelector('.controls-input') as HTMLElement;
 
-      // Short tap: pending suppresses selectstart/contextmenu, then release cleanly re-enables them
+      // Short tap: pending suppresses selectstart/contextmenu, then release transitions to contenteditable="true" + focus
       dispatchPointer(input, 'pointerdown', 180);
       const pendingSelect = new Event('selectstart', { bubbles: true, cancelable: true });
       const pendingMenu = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
@@ -737,36 +745,61 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       expect(input.style.userSelect).toBe('');
       expect(fireEvent(input, new Event('selectstart', { bubbles: true, cancelable: true }))).toBe(true);
       expect(fireEvent(input, new MouseEvent('contextmenu', { bubbles: true, cancelable: true }))).toBe(true);
+      fireEvent.blur(input);
+      expect(input.getAttribute('contenteditable')).toBe('false');
 
-      // Failed mic start restores contenteditable="true" and clears inline userSelect
+      // Failed mic start clears inline userSelect and keeps unfocused composer contenteditable="false"
       voiceMock.startListening.mockResolvedValueOnce(false);
       dispatchPointer(input, 'pointerdown', 180);
       await vi.advanceTimersByTimeAsync(240);
       await vi.advanceTimersByTimeAsync(0);
-      expect(input.getAttribute('contenteditable')).toBe('true');
+      expect(input.getAttribute('contenteditable')).toBe('false');
       expect(input.style.userSelect).toBe('');
 
-      // Active hold suppresses selectstart/contextmenu & calls removeAllRanges, then pointercancel restores
+      // Active hold suppresses selectstart/contextmenu, prevents touchmove pan, then pointercancel restores cleanly
       dispatchPointer(input, 'pointerdown', 180);
       await vi.advanceTimersByTimeAsync(240);
       expect(removeAllRanges).toHaveBeenCalled();
       expect(input.getAttribute('contenteditable')).toBe('false');
       expect(fireEvent(input, new Event('selectstart', { bubbles: true, cancelable: true }))).toBe(false);
       expect(fireEvent(input, new MouseEvent('contextmenu', { bubbles: true, cancelable: true }))).toBe(false);
+      const activeTouchMove = new Event('touchmove', { bubbles: true, cancelable: true });
+      window.dispatchEvent(activeTouchMove);
+      expect(activeTouchMove.defaultPrevented).toBe(true);
 
       dispatchPointer(input, 'pointercancel', 180);
       await vi.advanceTimersByTimeAsync(0);
-      expect(input.getAttribute('contenteditable')).toBe('true');
+      expect(input.getAttribute('contenteditable')).toBe('false');
       expect(input.style.userSelect).toBe('');
 
-      // lostpointercapture during active hold cancels & restores
+      // lostpointercapture during active hold MUST NOT cancel; window pointermove + pointerup finish cleanly
       dispatchPointer(input, 'pointerdown', 180);
       await vi.advanceTimersByTimeAsync(240);
       expect(input.getAttribute('contenteditable')).toBe('false');
+      expect(document.querySelector('.voice-hold-hud')).not.toBeNull();
+      const stopCallsBeforeLost = voiceMock.stopListening.mock.calls.length;
       dispatchPointer(input, 'lostpointercapture', 180);
       await vi.advanceTimersByTimeAsync(0);
-      expect(input.getAttribute('contenteditable')).toBe('true');
-      expect(input.style.userSelect).toBe('');
+      expect(document.querySelector('.voice-hold-hud')).not.toBeNull();
+      expect(voiceMock.stopListening).toHaveBeenCalledTimes(stopCallsBeforeLost);
+
+      voiceMock.partialHandler?.('Window slide text');
+      const winMove = new Event('pointermove', { bubbles: true, cancelable: true });
+      Object.assign(winMove, { clientX: 250, clientY: 500, pointerId: 1 });
+      window.dispatchEvent(winMove);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(document.querySelector('.voice-hold-hud')?.getAttribute('data-zone')).toBe('edit');
+
+      const winUp = new Event('pointerup', { bubbles: true, cancelable: true });
+      Object.assign(winUp, { clientX: 250, clientY: 500, pointerId: 1 });
+      window.dispatchEvent(winUp);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(document.querySelector('.voice-hold-hud')).toBeNull();
+      expect(document.querySelector('.mock-voice-overlay')?.getAttribute('data-initial-text')).toBe('Window slide text');
+      // After release, window touchmove listener is cleaned up and no longer blocks scrolling.
+      const idleTouchMove = new Event('touchmove', { bubbles: true, cancelable: true });
+      window.dispatchEvent(idleTouchMove);
+      expect(idleTouchMove.defaultPrevented).toBe(false);
 
       // Unmount mid-drain restores contenteditable and inline userSelect on the composer element
       let releaseDrain!: () => void;
@@ -855,6 +888,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       };
       expect(typeof data.session.send_placeholder_mobile_voice).toBe('string');
       expect(data.session.send_placeholder_mobile_voice.trim().length).toBeGreaterThan(0);
+      expect(data.session.send_placeholder_mobile_voice).not.toContain('·');
       expect(data.voice.slide_left_cancel.trim().length).toBeGreaterThan(0);
       expect(data.voice.slide_right_edit.trim().length).toBeGreaterThan(0);
       expect(data.voice.slide_left_cancel).not.toContain('👈');
@@ -921,8 +955,12 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
         try {
           await page.setContent(`<!doctype html><html><head><style>${css}</style></head><body>
             <div class="controls-composer controls-composer-voice-ready controls-composer-voice-pending controls-composer-voice-holding">
-              <div class="controls-input"></div>
+              <div class="controls-input controls-input-with-trailing-2" contenteditable="false"></div>
             </div>
+            <div class="controls-composer controls-composer-voice-ready test-idle-ready">
+              <div class="controls-input controls-input-with-trailing-1 test-idle-input" contenteditable="false"></div>
+            </div>
+            <div class="voice-overlay" style="display:none"></div>
             <button class="btn-voice btn-voice-active"></button>
             <div class="voice-hold-hud voice-hold-hud-zone-send">
               <div class="voice-hold-hud-card">
@@ -935,7 +973,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
                   </span>
                   <div class="voice-hold-hud-waveform">${barsHtml}</div>
                 </div>
-                <div class="voice-hold-hud-transcript">Hello</div>
+                <div class="voice-hold-hud-transcript">Hello<span class="voice-streaming-robot-cursor is-active"><svg><circle class="voice-robot-antenna"></circle></svg></span></div>
                 <div class="voice-hold-hud-active-hint is-send">Hint</div>
                 <div class="voice-hold-hud-zones">
                   <div class="voice-hold-zone voice-hold-zone-cancel"><span class="voice-hold-zone-label">Cancel</span></div>
@@ -964,11 +1002,26 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
                 hudGrid: gs('.voice-hold-hud-grid').animationName,
                 dotActive: gs('.voice-status-dot-active').animationName,
                 recDot: gs('.voice-recognizing-dots i').animationName,
+                robotCursor: gs('.voice-streaming-robot-cursor.is-active').animationName,
+                robotAntenna: gs('.voice-robot-antenna').animationName,
                 dotTrans: gs('.voice-status-dot').transitionProperty,
                 hintTrans: gs('.voice-hold-hud-active-hint').transitionProperty,
                 zoneTrans: gs('.voice-hold-zone').transitionProperty,
+                trailing2PaddingRight: gs('.controls-input-with-trailing-2').paddingRight,
+                trailing1PaddingRight: gs('.test-idle-input').paddingRight,
+                idleTouchAction: gs('.test-idle-input').touchAction,
+                idleUserSelect: gs('.test-idle-input').getPropertyValue('-webkit-user-select'),
+                overlayBorderRadius: gs('.voice-overlay').borderRadius,
+                overlayZIndex: gs('.voice-overlay').zIndex,
               };
             }, zone);
+
+            expect(computed.trailing2PaddingRight).toBe('96px');
+            expect(computed.trailing1PaddingRight).toBe('54px');
+            expect(computed.idleTouchAction).toBe('none');
+            expect(computed.idleUserSelect).toBe('none');
+            expect(computed.overlayBorderRadius).toBe('0px');
+            expect(computed.overlayZIndex).toBe('2147483021');
 
             if (reducedMotion === 'reduce') {
               expect(computed.composerReadyAfter).toBe('none');
@@ -978,6 +1031,8 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
               expect(computed.hudGrid).toBe('none');
               expect(computed.dotActive).toBe('none');
               expect(computed.recDot).toBe('none');
+              expect(computed.robotCursor).toBe('none');
+              expect(computed.robotAntenna).toBe('none');
               expect(computed.dotTrans).toBe('none');
               expect(computed.hintTrans).toBe('none');
               expect(computed.zoneTrans).toBe('none');
@@ -988,6 +1043,8 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
               expect(computed.hudGrid).toBe('voice-grid-scroll');
               expect(computed.dotActive).toBe('voice-dot-pulse');
               expect(computed.recDot).toBe('voice-recognizing-bounce');
+              expect(computed.robotCursor).toBe('voice-robot-bob');
+              expect(computed.robotAntenna).toBe('voice-robot-antenna-pulse');
             }
           }
         } finally {

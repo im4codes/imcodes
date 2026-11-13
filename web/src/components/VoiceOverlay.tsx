@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import * as VoiceInput from './VoiceInput.js';
+import { VoiceStreamingRobot } from './VoiceStreamingRobot.js';
 import { holdScreenAwake } from '../screen-awake.js';
 import {
   NOTEPAD_DRAFT_SAVE_INTERVAL_MS,
@@ -80,8 +81,10 @@ export function VoiceOverlay({
   const [recognizing, setRecognizing] = useState(false);
   const [hasText, setHasText] = useState(false);
   const [bars, setBars] = useState<number[]>(() => Array(BAR_COUNT).fill(0));
-  const [maxH, setMaxH] = useState('66vh');
+  const [maxH, setMaxH] = useState('var(--vvh, 100dvh)');
+  const [streamMirror, setStreamMirror] = useState<{ before: string; after: string }>({ before: '', after: '' });
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const mirrorRef = useRef<HTMLDivElement>(null);
   const recognizingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const holdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const heldRef = useRef(false);
@@ -245,6 +248,25 @@ export function VoiceOverlay({
     restartTimerRef.current = null;
   }, []);
 
+  const syncStreamMirror = useCallback((explicitPos?: number, explicitLen?: number) => {
+    const ta = taRef.current;
+    if (!ta) {
+      setStreamMirror({ before: '', after: '' });
+      return;
+    }
+    const value = ta.value;
+    const pos = explicitPos ?? insertPosRef.current;
+    const len = explicitLen ?? voiceLenRef.current;
+    const splitAt = Math.max(0, Math.min(value.length, pos + len));
+    setStreamMirror({
+      before: value.slice(0, splitAt),
+      after: value.slice(splitAt),
+    });
+    if (mirrorRef.current) {
+      mirrorRef.current.scrollTop = ta.scrollTop;
+    }
+  }, []);
+
   useEffect(() => {
     if (!open) {
       openRef.current = false;
@@ -268,7 +290,7 @@ export function VoiceOverlay({
     // occludes the Send button. The keyboard only opens when the user manually taps the textarea.
     if (taRef.current) { taRef.current.value = init; }
     setHasText(!!init.trim());
-    setMaxH('66vh');
+    setMaxH('var(--vvh, 100dvh)');
     setListening(false);
     setRecognizing(false);
     clearRecognizingTimer();
@@ -298,6 +320,7 @@ export function VoiceOverlay({
     setStarting(!recoverable && autoStartListening);
     insertPosRef.current = init.length;
     voiceLenRef.current = 0;
+    syncStreamMirror(init.length, 0);
     sessionTokenRef.current++;
     setBars(Array(BAR_COUNT).fill(0));
     barsRef.current = Array(BAR_COUNT).fill(0);
@@ -321,12 +344,17 @@ export function VoiceOverlay({
     });
 
     const vv = window.visualViewport;
-    const onResize = () => {
-      if (!vv) return;
+    const syncViewportHeight = () => {
+      if (!vv) {
+        setMaxH('var(--vvh, 100dvh)');
+        return;
+      }
       const kbOpen = window.innerHeight - vv.height > 50;
-      setMaxH(kbOpen ? `${vv.height}px` : '66vh');
+      setMaxH(kbOpen ? `${vv.height}px` : 'var(--vvh, 100dvh)');
     };
-    vv?.addEventListener('resize', onResize);
+    syncViewportHeight();
+    vv?.addEventListener('resize', syncViewportHeight);
+    vv?.addEventListener('scroll', syncViewportHeight);
 
     // Start voice session immediately at end of initial text (not 0). An unfinished
     // notepad waits for the user's choice instead: dictation starting on its
@@ -353,7 +381,8 @@ export function VoiceOverlay({
       stoppingTokenRef.current = null;
       stopErrorTokenRef.current = null;
       pendingFlushRef.current = null;
-      vv?.removeEventListener('resize', onResize);
+      vv?.removeEventListener('resize', syncViewportHeight);
+      vv?.removeEventListener('scroll', syncViewportHeight);
       VoiceInput.onAudioLevel(null);
       VoiceInput.stopListening();
       // Effect cleanup also runs during unmount. Updating hook state here queues
@@ -416,6 +445,7 @@ export function VoiceOverlay({
       const committedLen = voiceLenRef.current;
       insertPosRef.current += committedLen;
       voiceLenRef.current = 0;
+      syncStreamMirror(insertPosRef.current, 0);
       if (committedLen > 0 && taRef.current && document.activeElement === taRef.current) {
         const endPos = insertPosRef.current;
         taRef.current.setSelectionRange(endPos, endPos);
@@ -442,6 +472,7 @@ export function VoiceOverlay({
     setStarting(true);
     insertPosRef.current = atPos;
     voiceLenRef.current = 0;
+    syncStreamMirror(atPos, 0);
     segmentStartedAtRef.current = Date.now();
     setVoiceError(null);
 
@@ -478,6 +509,7 @@ export function VoiceOverlay({
         });
         ta.scrollTop = ta.scrollHeight;
         setHasText(!!ta.value.trim());
+        syncStreamMirror(actualPos, newVoiceLen);
         pulseRecognizing(900);
       }, (next) => {
         if (sessionTokenRef.current !== token) return;
@@ -825,6 +857,7 @@ export function VoiceOverlay({
     setHasText(!!text.trim());
     insertPosRef.current = text.length;
     voiceLenRef.current = 0;
+    syncStreamMirror(text.length, 0);
     notepadRef.current = true;
     setNotepad(true);
     setNotepadStartedAt(draft.startedAt);
@@ -875,6 +908,7 @@ export function VoiceOverlay({
   /** User manually edited the textarea — commit voice zone and stop recognition */
   const handleInput = useCallback(() => {
     setHasText(!!(taRef.current?.value?.trim()));
+    syncStreamMirror();
     // Ignore programmatic writes from partial callbacks
     if (programmaticWriteRef.current) return;
     // User typed/pasted/deleted — commit current voice segment and stop
@@ -883,7 +917,13 @@ export function VoiceOverlay({
       clearRestartTimer();
       void commitAndStop();
     }
-  }, [commitAndStop, clearRestartTimer]);
+  }, [commitAndStop, clearRestartTimer, syncStreamMirror]);
+
+  useEffect(() => {
+    if ((listening || starting) && mirrorRef.current && taRef.current) {
+      mirrorRef.current.scrollTop = taRef.current.scrollTop;
+    }
+  }, [streamMirror, listening, starting]);
 
   /** Cursor moved outside the active voice zone while listening — restart at new position */
   const handleCursorChange = useCallback(() => {
@@ -1031,14 +1071,30 @@ export function VoiceOverlay({
       )}
 
       <div class={`voice-overlay-editor-wrap${listening || recognizing ? ' voice-editor-marquee' : ''}`} style={review ? { display: 'none' } : undefined}>
+        {(listening || starting) && !review && (
+          <div
+            ref={mirrorRef}
+            class="voice-overlay-stream-mirror"
+            aria-hidden="true"
+          >
+            {streamMirror.before}
+            <VoiceStreamingRobot active={recognizing || listening} />
+            {streamMirror.after}
+          </div>
+        )}
         <textarea
           ref={taRef}
-          class="voice-overlay-text"
+          class={`voice-overlay-text${listening || starting ? ' voice-overlay-text-streaming' : ''}`}
           placeholder={t('voice.speak_now')}
           spellcheck={false}
           readOnly={listening || starting}
           inputMode={listening || starting ? 'none' : undefined}
           onInput={handleInput}
+          onScroll={() => {
+            if (mirrorRef.current && taRef.current) {
+              mirrorRef.current.scrollTop = taRef.current.scrollTop;
+            }
+          }}
           onSelect={handleCursorChange}
           onClick={handleCursorChange}
           onTouchEnd={handleCursorChange}

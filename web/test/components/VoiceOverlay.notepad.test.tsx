@@ -845,4 +845,72 @@ describe('VoiceOverlay mobile microphone gestures', () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(document.querySelector('.voice-overlay-status')?.textContent).toContain('voice.listening');
   });
+
+  it('defaults to fullscreen height when keyboard is closed, shrinks to visualViewport.height when IME opens, restores when closed, and cleans up viewport listeners', async () => {
+    const origInnerHeight = window.innerHeight;
+    const origVV = Object.getOwnPropertyDescriptor(window, 'visualViewport');
+    const vv = Object.assign(new EventTarget(), { height: 844, offsetTop: 0 });
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 844 });
+    Object.defineProperty(window, 'visualViewport', { configurable: true, value: vv });
+    const removeSpy = vi.spyOn(vv, 'removeEventListener');
+    try {
+      const view = render(<VoiceOverlay open initialText="" onSend={vi.fn()} onClose={vi.fn()} />);
+      const overlay = document.querySelector('.voice-overlay') as HTMLElement;
+      expect(overlay.style.height).toBe('var(--vvh, 100dvh)');
+
+      // Soft keyboard opens -> shrinks to vv.height via resize and handles scroll
+      vv.height = 510;
+      vv.dispatchEvent(new Event('resize'));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(overlay.style.height).toBe('510px');
+
+      vv.height = 480;
+      vv.dispatchEvent(new Event('scroll'));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(overlay.style.height).toBe('480px');
+
+      // Soft keyboard closes -> restores fullscreen height
+      vv.height = 844;
+      vv.dispatchEvent(new Event('resize'));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(overlay.style.height).toBe('var(--vvh, 100dvh)');
+
+      view.unmount();
+      expect(removeSpy).toHaveBeenCalledWith('resize', expect.any(Function));
+      expect(removeSpy).toHaveBeenCalledWith('scroll', expect.any(Function));
+    } finally {
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: origInnerHeight });
+      if (origVV) Object.defineProperty(window, 'visualViewport', origVV);
+      else Reflect.deleteProperty(window, 'visualViewport');
+    }
+  });
+
+  it('renders synchronized stream mirror with mini-robot cursor at insertPos + voiceLen while listening and hides it when paused', async () => {
+    render(<VoiceOverlay open initialText="Prefix text" onSend={vi.fn()} onClose={vi.fn()} />);
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Streaming mirror is visible while starting/listening, keeping textarea value exact and mirror synced.
+    const ta = textarea();
+    const mirror = document.querySelector('.voice-overlay-stream-mirror') as HTMLElement;
+    expect(mirror).not.toBeNull();
+    expect(mirror.querySelector('.voice-streaming-robot-cursor')).not.toBeNull();
+    expect(ta.classList.contains('voice-overlay-text-streaming')).toBe(true);
+
+    voiceApi.partialHandler?.('streamed phrase');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ta.value).toBe('Prefix text streamed phrase');
+    expect(mirror.textContent).toBe('Prefix text streamed phrase');
+    expect(mirror.querySelector('.voice-streaming-robot-cursor')).not.toBeNull();
+
+    // Syncs scrollTop cleanly from textarea to mirror
+    Object.defineProperty(ta, 'scrollTop', { configurable: true, writable: true, value: 140 });
+    fireEvent.scroll(ta);
+    expect(mirror.scrollTop).toBe(140);
+
+    // Pausing stops recognition and hides stream mirror so native textarea editing is unrestricted.
+    fireEvent.click(mic());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.querySelector('.voice-overlay-stream-mirror')).toBeNull();
+    expect(ta.classList.contains('voice-overlay-text-streaming')).toBe(false);
+  });
 });

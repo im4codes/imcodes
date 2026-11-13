@@ -718,7 +718,7 @@
     "transport_queue_append_failed": "No se pudo añadir el mensaje; sigue en la cola.",
     "stop_appended_queue": "Los mensajes en cola se añadieron; la sesión sigue en ejecución.",
     "send_placeholder": "Enviar a {{name}}…",
-    "send_placeholder_mobile_voice": "Mantén para hablar · toca para escribir",
+    "send_placeholder_mobile_voice": "Mantén para hablar",
     "send_placeholder_desktop_upload": "{{placeholder}} Admite carga rápida pegando o arrastrando varios archivos",
     "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ comandos · # frases · @ archivos/agentes · ; alias · ^ nodos · % tareas · pega o arrastra archivos",
     "composer_target_label": "Enviando a",

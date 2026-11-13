@@ -278,15 +278,12 @@ describe('VoiceInput', () => {
     }
   });
 
-  it('bounds a hung native stop() at NATIVE_FINAL_DRAIN_MS, reports error before resolving, and lets next start recover', async () => {
+  it('waits cleanly for a slow native stop() past 15s without timing out, lets next start serialize behind it, and still surfaces genuine stop errors', async () => {
     vi.useFakeTimers();
     try {
-      const hungStop = deferred<void>();
-      let recordedLastErrorAtCallback: string | null = null;
-      const onErr = vi.fn(() => {
-        recordedLastErrorAtCallback = VoiceInput.getLastError();
-      });
-      speechApi.stop.mockReturnValueOnce(hungStop.promise).mockResolvedValue(undefined);
+      const slowStop = deferred<void>();
+      const onErr = vi.fn();
+      speechApi.stop.mockReturnValueOnce(slowStop.promise).mockResolvedValue(undefined);
 
       await expect(VoiceInput.startListening(vi.fn(), undefined, onErr)).resolves.toBe(true);
       expect(VoiceInput.isListening()).toBe(true);
@@ -294,19 +291,49 @@ describe('VoiceInput', () => {
       const stopping = VoiceInput.stopListening();
       expect(VoiceInput.isListening()).toBe(false);
 
-      // Next start queues behind _pendingStop, unblocking at NATIVE_FINAL_DRAIN_MS
-      const resumed = VoiceInput.startListening(vi.fn());
-      await vi.advanceTimersByTimeAsync(VoiceInput.NATIVE_FINAL_DRAIN_MS - 1);
+      // Next start serializes behind slow stop even past 15s without ever emitting a timeout error.
+      const resumed = VoiceInput.startListening(vi.fn(), undefined, onErr);
+      await vi.advanceTimersByTimeAsync(15_000);
       expect(speechApi.start).toHaveBeenCalledTimes(1);
       expect(onErr).not.toHaveBeenCalled();
+      expect(VoiceInput.getLastError()).toBeNull();
 
-      await vi.advanceTimersByTimeAsync(1);
+      slowStop.resolve();
       await stopping;
-      expect(onErr).toHaveBeenCalledWith('Speech final drain timed out');
-      expect(recordedLastErrorAtCallback).toBe('Speech final drain timed out');
       await expect(resumed).resolves.toBe(true);
       expect(speechApi.start).toHaveBeenCalledTimes(2);
       expect(VoiceInput.isListening()).toBe(true);
+      expect(onErr).not.toHaveBeenCalled();
+
+      // Genuine native stop rejection STILL surfaces the underlying error.
+      speechApi.stop.mockRejectedValueOnce(new Error('native decoder error'));
+      await VoiceInput.stopListening();
+      expect(onErr).toHaveBeenCalledWith('native decoder error');
+      expect(VoiceInput.getLastError()).toBe('native decoder error');
+    } finally {
+      await VoiceInput.stopListening();
+      await vi.advanceTimersByTimeAsync(0);
+      vi.useRealTimers();
+    }
+  });
+
+  it('never times out during a 60s silent hold with zero recognition partials', async () => {
+    vi.useFakeTimers();
+    try {
+      const onResult = vi.fn();
+      const onErr = vi.fn();
+      await expect(VoiceInput.startListening(onResult, undefined, onErr)).resolves.toBe(true);
+      expect(VoiceInput.isListening()).toBe(true);
+
+      for (let i = 0; i < 6; i++) {
+        listeners.audioLevel?.({ level: 0 });
+        await vi.advanceTimersByTimeAsync(10_000);
+      }
+
+      expect(VoiceInput.isListening()).toBe(true);
+      expect(onErr).not.toHaveBeenCalled();
+      expect(VoiceInput.getLastError()).toBeNull();
+      expect(onResult).not.toHaveBeenCalled();
     } finally {
       await VoiceInput.stopListening();
       await vi.advanceTimersByTimeAsync(0);
@@ -446,7 +473,7 @@ describe('VoiceInput', () => {
     }
   });
 
-  it('VoiceOverlay + VoiceInput: slow native final past NATIVE_FINAL_DRAIN_MS fails explicitly, keeps draft, never sends partial prefix, and recovers cleanly', async () => {
+  it('VoiceOverlay + VoiceInput: slow native final past 15s waits cleanly without timeout alert and sends merged final tail once', async () => {
     vi.useFakeTimers();
     const drain = deferred<void>();
     speechApi.stop.mockReturnValueOnce(drain.promise).mockResolvedValue(undefined);
@@ -462,30 +489,18 @@ describe('VoiceInput', () => {
       await vi.advanceTimersByTimeAsync(0);
 
       fireEvent.click(document.querySelector('.voice-overlay-send') as HTMLElement);
-      await vi.advanceTimersByTimeAsync(VoiceInput.NATIVE_FINAL_DRAIN_MS + 500);
+      await vi.advanceTimersByTimeAsync(15_000);
 
       expect(onSend).not.toHaveBeenCalled();
       expect(onClose).not.toHaveBeenCalled();
-      expect(document.querySelector('[role="alert"]')?.textContent).toContain('Speech final drain timed out');
+      expect(document.querySelector('[role="alert"]')).toBeNull();
       expect((document.querySelector('.voice-overlay-text') as HTMLTextAreaElement).value).toBe('recognized prefix');
-      expect(VoiceInput.isListening()).toBe(false);
 
-      // Late native final / ACK after timeout does not auto-send or wipe the preserved draft
+      // Late native final arrives after >15s cold decode -> merges tail and sends cleanly without error.
       listeners.partialResults?.({ matches: ['recognized prefix with final tail'], isFinal: true });
       drain.resolve();
       await vi.advanceTimersByTimeAsync(0);
-      expect(onSend).not.toHaveBeenCalled();
-      expect(onClose).not.toHaveBeenCalled();
-      expect((document.querySelector('.voice-overlay-text') as HTMLTextAreaElement).value).toBe('recognized prefix');
-
-      // Explicit Retry after timeout clears alert and captures remaining speech cleanly
-      fireEvent.click(document.querySelector('.voice-overlay-retry') as HTMLElement);
-      await vi.advanceTimersByTimeAsync(0);
-      expect(speechApi.start).toHaveBeenCalledTimes(2);
       expect(document.querySelector('[role="alert"]')).toBeNull();
-      listeners.partialResults?.({ matches: ['with final tail'], isFinal: true });
-      fireEvent.click(document.querySelector('.voice-overlay-send') as HTMLElement);
-      await vi.advanceTimersByTimeAsync(0);
       expect(onSend).toHaveBeenCalledTimes(1);
       expect(onSend).toHaveBeenCalledWith('recognized prefix with final tail');
       expect(onClose).toHaveBeenCalledTimes(1);
@@ -499,7 +514,7 @@ describe('VoiceInput', () => {
     }
   });
 
-  it('VoiceOverlay + VoiceInput: slow final within NATIVE_FINAL_DRAIN_MS sends merged final tail exactly once without alert', async () => {
+  it('VoiceOverlay + VoiceInput: slow final within 4s sends merged final tail exactly once without alert', async () => {
     vi.useFakeTimers();
     const drain = deferred<void>();
     speechApi.stop.mockReturnValueOnce(drain.promise).mockResolvedValue(undefined);
@@ -549,18 +564,21 @@ describe('VoiceInput', () => {
       expect(speechApi.start).toHaveBeenCalledTimes(1);
       listeners.partialResults?.({ matches: ['draft text'], isFinal: false });
 
-      // Pause -> Mic while drain is pending; drain times out -> queued resume aborts cleanly without hiding alert
+      // Pause -> Mic while slow drain is pending; once slow drain settles, queued resume starts cleanly without error
       const micBtn = document.querySelector('.voice-overlay-mic') as HTMLElement;
       fireEvent.click(micBtn);
       await vi.advanceTimersByTimeAsync(200);
       fireEvent.click(micBtn);
-      await vi.advanceTimersByTimeAsync(VoiceInput.NATIVE_FINAL_DRAIN_MS);
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(document.querySelector('[role="alert"]')).toBeNull();
 
-      expect(speechApi.start).toHaveBeenCalledTimes(1);
-      expect(document.querySelector('[role="alert"]')?.textContent).toContain('Speech final drain timed out');
+      slowDrain.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(speechApi.start).toHaveBeenCalledTimes(2);
+      expect(document.querySelector('[role="alert"]')).toBeNull();
       expect((document.querySelector('.voice-overlay-text') as HTMLTextAreaElement).value).toBe('draft text');
 
-      // Recover via notepad toggle -> starts session cleanly, then Send/openReview hits stop rejection
+      // Switch to notepad cleanly -> Send/openReview hits genuine stop rejection
       fireEvent.click(document.querySelector('.voice-notepad-toggle') as HTMLElement);
       await vi.advanceTimersByTimeAsync(0);
       expect(speechApi.start).toHaveBeenCalledTimes(2);
@@ -656,7 +674,7 @@ describe('mobile capture defenses', () => {
   });
 
   for (const outcome of ['resolve', 'reject'] as const) {
-    it(`retires a cancelled pending native start on stop deadline (${outcome}) without wedging fresh start or clobbering the new owner`, async () => {
+    it(`retires a cancelled pending native start on stop (${outcome}) without wedging fresh start or clobbering the new owner`, async () => {
       vi.useFakeTimers();
       const startGate = deferred<Record<string, never>>();
       speechApi.start.mockReturnValueOnce(startGate.promise).mockResolvedValue({});
@@ -667,23 +685,17 @@ describe('mobile capture defenses', () => {
         expect(speechApi.start).toHaveBeenCalledTimes(1);
 
         const stopped = VoiceInput.stopListening();
-        await vi.advanceTimersByTimeAsync(VoiceInput.NATIVE_FINAL_DRAIN_MS + 100);
+        if (outcome === 'resolve') startGate.resolve({});
+        else startGate.reject(new Error('late stale start failure'));
+        await expect(oldStart).resolves.toBe(false);
         await stopped;
+        expect(oldErr).not.toHaveBeenCalled();
 
         const newResult = vi.fn();
         const newErr = vi.fn();
         const resumed = VoiceInput.startListening(newResult, undefined, newErr);
         await expect(resumed).resolves.toBe(true);
         expect(speechApi.start).toHaveBeenCalledTimes(2);
-        expect(VoiceInput.isListening()).toBe(true);
-        const stopCountBeforeLateSettle = speechApi.stop.mock.calls.length;
-
-        // Late settle of cancelled startGate must NOT stop, silence, remove listeners, or report error on new owner
-        if (outcome === 'resolve') startGate.resolve({});
-        else startGate.reject(new Error('late stale start failure'));
-        await expect(oldStart).resolves.toBe(false);
-
-        expect(speechApi.stop).toHaveBeenCalledTimes(stopCountBeforeLateSettle);
         expect(VoiceInput.isListening()).toBe(true);
         expect(newErr).not.toHaveBeenCalled();
 
@@ -699,7 +711,7 @@ describe('mobile capture defenses', () => {
     });
   }
 
-  it('retires pending permission/available checks on stop deadline and lets Stop->Mic->Stop cancel a queued resume', async () => {
+  it('retires pending permission/available checks on stop and lets Stop->Mic->Stop cancel a queued resume', async () => {
     vi.useFakeTimers();
     const permGate = deferred<{ speechRecognition: string }>();
     const availGate = deferred<{ available: boolean }>();
@@ -707,26 +719,24 @@ describe('mobile capture defenses', () => {
       .mockReturnValueOnce(permGate.promise)
       .mockResolvedValue({ speechRecognition: 'granted' });
     try {
-      // Hung requestPermissions retired on stop timeout -> next start succeeds, late perm grant cannot spawn session 1
+      // Cancelled requestPermissions -> once old permission resolves, fresh start succeeds and stale attempt returns false
       const pStart = VoiceInput.startListening(vi.fn());
       const pStop = VoiceInput.stopListening();
-      await vi.advanceTimersByTimeAsync(VoiceInput.NATIVE_FINAL_DRAIN_MS + 50);
+      permGate.resolve({ speechRecognition: 'granted' });
+      await expect(pStart).resolves.toBe(false);
       await pStop;
 
       await expect(VoiceInput.startListening(vi.fn())).resolves.toBe(true);
       expect(speechApi.start).toHaveBeenCalledTimes(1);
-      permGate.resolve({ speechRecognition: 'granted' });
-      await expect(pStart).resolves.toBe(false);
-      expect(speechApi.start).toHaveBeenCalledTimes(1);
       expect(VoiceInput.isListening()).toBe(true);
 
-      // Stop -> Mic (queued during hung stop) -> Stop (before timeout) cancels queued Mic cleanly
-      const hungStop = deferred<void>();
-      speechApi.stop.mockReturnValueOnce(hungStop.promise).mockResolvedValue(undefined);
+      // Stop -> Mic (queued during slow stop) -> Stop cancels queued Mic cleanly
+      const slowStop = deferred<void>();
+      speechApi.stop.mockReturnValueOnce(slowStop.promise).mockResolvedValue(undefined);
       const stop1 = VoiceInput.stopListening();
       const queuedMic = VoiceInput.startListening(vi.fn());
       const stop2 = VoiceInput.stopListening();
-      await vi.advanceTimersByTimeAsync(VoiceInput.NATIVE_FINAL_DRAIN_MS + 50);
+      slowStop.resolve();
 
       await expect(queuedMic).resolves.toBe(false);
       await stop1;
@@ -734,20 +744,18 @@ describe('mobile capture defenses', () => {
       expect(speechApi.start).toHaveBeenCalledTimes(1);
       expect(VoiceInput.isListening()).toBe(false);
 
-      // Hung available() check retired on stop timeout -> fresh start succeeds, late available cannot spawn stale session
+      // Cancelled available() check -> fresh start succeeds, stale available cannot spawn session 1
       speechApi.available
         .mockReturnValueOnce(availGate.promise)
         .mockResolvedValue({ available: true });
       const availStart = VoiceInput.startListening(vi.fn());
       await vi.advanceTimersByTimeAsync(0);
       const availStop = VoiceInput.stopListening();
-      await vi.advanceTimersByTimeAsync(VoiceInput.NATIVE_FINAL_DRAIN_MS + 50);
+      availGate.resolve({ available: true });
+      await expect(availStart).resolves.toBe(false);
       await availStop;
 
       await expect(VoiceInput.startListening(vi.fn())).resolves.toBe(true);
-      expect(speechApi.start).toHaveBeenCalledTimes(2);
-      availGate.resolve({ available: true });
-      await expect(availStart).resolves.toBe(false);
       expect(speechApi.start).toHaveBeenCalledTimes(2);
       expect(VoiceInput.isListening()).toBe(true);
     } finally {
@@ -881,8 +889,9 @@ describe('Web Mobile final drain', () => {
       expect(VoiceInput.isListening()).toBe(true);
       expect(instances[0].stop).not.toHaveBeenCalled();
       const stopped = VoiceInput.stopListening();
-      await vi.advanceTimersByTimeAsync(2000); await stopped;
+      await vi.advanceTimersByTimeAsync(VoiceInput.WEB_FINAL_DRAIN_MS); await stopped;
       expect(instances[0].abort).toHaveBeenCalledOnce();
+      expect(VoiceInput.getLastError()).toBeNull();
       expect(VoiceInput.isListening()).toBe(false);
     } finally { vi.useRealTimers(); vi.unstubAllGlobals(); }
   });
@@ -915,13 +924,13 @@ describe('Web Mobile final drain', () => {
     return { grants, frames, created, close, analyse, raf, stream };
   }
 
-  for (const terminal of ['onend', 'timeout']) {
-    it.each(['before', 'during', 'after'])('releases meter grant %s Stop with ' + terminal + ' while retaining final text', async (timing) => {
+  for (const terminal of ['onend', 'silent-fallback'] as const) {
+    it.each(['before', 'during', 'after'])('releases meter grant %s Stop with ' + terminal + ' while retaining final text without error', async (timing) => {
       vi.useFakeTimers();
-      const instances = browser(), meter = meterHarness(), media = meter.stream(), result = vi.fn(), levels = vi.fn();
+      const instances = browser(), meter = meterHarness(), media = meter.stream(), result = vi.fn(), levels = vi.fn(), onErr = vi.fn();
       try {
         VoiceInput.onAudioLevel(levels);
-        await VoiceInput.startListening(result);
+        await VoiceInput.startListening(result, undefined, onErr);
         if (timing === 'before') {
           meter.grants[0].resolve(media.value); await Promise.resolve(); await Promise.resolve();
           expect(meter.created).toHaveBeenCalledOnce();
@@ -943,12 +952,14 @@ describe('Web Mobile final drain', () => {
         final(instances[0], 'retained final tail');
         expect(result).toHaveBeenLastCalledWith('retained final tail', true);
         if (terminal === 'onend') instances[0].onend();
-        else await vi.advanceTimersByTimeAsync(2000);
+        else await vi.advanceTimersByTimeAsync(VoiceInput.WEB_FINAL_DRAIN_MS);
         await stopped;
         if (timing === 'after') {
           meter.grants[0].resolve(media.value); await Promise.resolve(); await Promise.resolve();
         }
         expect(VoiceInput.isListening()).toBe(false);
+        expect(onErr).not.toHaveBeenCalled();
+        expect(VoiceInput.getLastError()).toBeNull();
         expect(media.track.stop).toHaveBeenCalledOnce();
         expect(meter.created).toHaveBeenCalledTimes(timing === 'before' ? 1 : 0);
         expect(meter.close).toHaveBeenCalledTimes(timing === 'before' ? 1 : 0);
@@ -966,7 +977,7 @@ describe('Web Mobile final drain', () => {
         await VoiceInput.startListening(vi.fn());
         const stopped = VoiceInput.stopListening();
         if (terminal === 'onend') instances[0].onend();
-        else await vi.advanceTimersByTimeAsync(2000);
+        else await vi.advanceTimersByTimeAsync(VoiceInput.WEB_FINAL_DRAIN_MS);
         await stopped;
         await VoiceInput.startListening(vi.fn());
         meter.grants[1].resolve(current.value); await Promise.resolve(); await Promise.resolve();

@@ -483,11 +483,9 @@ function startWebListening(): boolean {
   }
 }
 
-/** Stop-only deadline: browser engines may omit onend on device failure.
- * Never applied to an active recording and never used as a 60s duration cap. */
-const WEB_FINAL_DRAIN_MS = 2000;
-/** Stop-only deadline for native offline drain so Pause->Mic / Send never wedge forever. */
-export const NATIVE_FINAL_DRAIN_MS = 4000;
+/** Silent cleanup delay in case a browser speech engine omits `onend` after `stop()`.
+ * Never emits a timeout error and never cuts off active recording. */
+export const WEB_FINAL_DRAIN_MS = 10_000;
 function stopWebListening(): Promise<void> {
   setListening(false);
   stopWebLevelMeter();
@@ -508,8 +506,8 @@ function stopWebListening(): Promise<void> {
       resolve();
     };
     const timer = setTimeout(() => {
-      console.warn('[voice] web final drain timed out');
-      reportError('Speech final drain timed out');
+      // Browser failed to fire onend after stop(); clean up silently without surfacing a timeout error.
+      console.warn('[voice] web final drain missing onend; cleaning up silently');
       finish();
       try { rec.abort?.(); } catch { /* already ended */ }
     }, WEB_FINAL_DRAIN_MS);
@@ -621,38 +619,21 @@ export async function stopListening(): Promise<void> {
 
   let stopPromise!: Promise<void>;
   stopPromise = (async () => {
-    let timer: ReturnType<typeof setTimeout> | null = null;
     let stopFailure: string | null = null;
-    let timedOut = false;
     try {
-      const drain = (async () => {
-        try {
-          await session?.recognition.stop();
-        } catch (err) {
-          console.warn('[voice] stop failed:', err);
-          const msg = err instanceof Error && err.message.trim() ? err.message.trim() : String(err ?? '');
-          stopFailure = msg || 'Speech recognition stop failed';
-        }
+      await session?.recognition.stop();
+    } catch (err) {
+      console.warn('[voice] stop failed:', err);
+      const msg = err instanceof Error && err.message.trim() ? err.message.trim() : String(err ?? '');
+      stopFailure = msg || 'Speech recognition stop failed';
+    }
 
-        try {
-          await startPromise;
-        } catch { /* start failure already handled */ }
-      })();
+    try {
+      await startPromise;
+    } catch { /* start failure already handled */ }
 
-      timedOut = await Promise.race([
-        drain.then(() => false),
-        new Promise<boolean>((resolve) => {
-          timer = setTimeout(() => resolve(true), NATIVE_FINAL_DRAIN_MS);
-        }),
-      ]);
-      if (timedOut) {
-        console.warn('[voice] native final drain timed out');
-        reportError('Speech final drain timed out');
-      } else if (stopFailure) {
-        reportError(stopFailure);
-      }
-    } finally {
-      if (timer !== null) clearTimeout(timer);
+    if (stopFailure) {
+      reportError(stopFailure);
     }
 
     await cleanupSessionListeners(session);

@@ -718,7 +718,7 @@
     "transport_queue_append_failed": "Could not append the message; it remains queued.",
     "stop_appended_queue": "Queued messages appended; the session is still running.",
     "send_placeholder": "Send to {{name}}…",
-    "send_placeholder_mobile_voice": "Hold to talk · tap to type",
+    "send_placeholder_mobile_voice": "Hold to talk",
     "send_placeholder_desktop_upload": "{{placeholder}} Supports fast multi-file paste or drag upload",
     "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ commands · # phrases · @ files/agents · ; aliases · ^ nodes · % tasks · paste or drag files",
     "composer_target_label": "Sending to",

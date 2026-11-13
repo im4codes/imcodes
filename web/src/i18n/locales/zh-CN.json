@@ -718,7 +718,7 @@
     "transport_queue_append_failed": "追加失败，消息仍保留在队列中。",
     "stop_appended_queue": "已追加队列消息，本次未停止会话。",
     "send_placeholder": "发送到 {{name}}…",
-    "send_placeholder_mobile_voice": "按住说话 · 轻点输入",
+    "send_placeholder_mobile_voice": "按住说话",
     "send_placeholder_desktop_upload": "{{placeholder}} 支持多文件粘贴或拖拽快速上传",
     "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ 命令 · # 短语 · @ 文件/Agent · ; 别名 · ^ 受控节点 · % 任务 · 可粘贴或拖入文件",
     "composer_target_label": "发送至",

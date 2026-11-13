@@ -682,7 +682,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                 }
                 self.cancelWarmupWatchdog()
                 self.warmupWatchdog = watchdog
-                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: watchdog)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 10.0, execute: watchdog)
                 // consume() signals ready only after startup PCM was discarded;
                 // ~25ms tap interval reaches the 20ms warmup threshold without long UI stall.
             } catch {

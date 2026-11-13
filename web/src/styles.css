@@ -1367,8 +1367,6 @@ html.native-ios-mac .chat-dl-btn {
   background: rgba(2, 6, 23, 0.72);
   z-index: 4090;
 }
-.controls-input-with-trailing-1 { padding-right: 54px; }
-.controls-input-with-trailing-2 { padding-right: 96px; }
 .btn-input-expand {
   width: 28px;
   height: 28px;
@@ -1978,6 +1976,8 @@ html.native-ios-mac .chat-dl-btn {
 .controls-input-p2p { background: linear-gradient(180deg, rgba(44,27,60,0.64), rgba(15,18,32,0.94)); }
 .controls-input-p2p:focus { border-color: inherit; }
 .controls-input-disabled { opacity: 0.4; pointer-events: none; }
+.controls-input.controls-input-with-trailing-1 { padding-right: 54px; }
+.controls-input.controls-input-with-trailing-2 { padding-right: 96px; }
 /* ── Desktop composer: one box, controls tucked underneath ────────────────
    The buttons live in the DOM as SIBLINGS of `.controls-composer`, not inside
    it, so this needs no markup change: letting `.controls` wrap and giving the
@@ -3132,7 +3132,7 @@ html.native-ios-mac .chat-dl-btn {
 .btn-voice-active { color: #ef4444; animation: voice-pulse 1s ease-in-out infinite; }
 @keyframes voice-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
 
-/* ── Voice Overlay (sci-fi 2/3 sheet) ── */
+/* ── Voice Overlay (fullscreen; shrinks to visualViewport.height when IME opens) ── */
 .voice-overlay-backdrop {
   position: fixed; inset: 0; z-index: 2147483020;
   background: rgba(2, 6, 23, 0.78);
@@ -3141,18 +3141,20 @@ html.native-ios-mac .chat-dl-btn {
 }
 .voice-overlay {
   position: fixed; left: 0; right: 0; top: 0; z-index: 2147483021;
-  height: 66vh;
+  height: 100dvh;
+  height: var(--vvh, 100dvh);
   background: radial-gradient(ellipse at 50% 0%, #0c1929 0%, #020617 70%);
   display: flex; flex-direction: column; align-items: center;
-  padding: var(--sat, 0px) 20px 20px; box-sizing: border-box;
+  padding: max(var(--sat, 0px), env(safe-area-inset-top, 0px)) 20px calc(20px + max(var(--sab, 0px), env(safe-area-inset-bottom, 0px)));
+  box-sizing: border-box;
   overflow: hidden;
-  border-radius: 0 0 24px 24px;
+  border-radius: 0;
   box-shadow: 0 4px 40px rgba(0,0,0,0.6);
   animation: voice-slide-down 0.3s ease-out;
 }
 @keyframes voice-slide-down { from { transform: translateY(-100%); } to { transform: translateY(0); } }
 .voice-overlay-grid {
-  position: absolute; inset: 0; opacity: 0.04; border-radius: 0 0 24px 24px;
+  position: absolute; inset: 0; opacity: 0.04; border-radius: 0;
   background-image:
     linear-gradient(rgba(56,189,248,0.4) 1px, transparent 1px),
     linear-gradient(90deg, rgba(56,189,248,0.4) 1px, transparent 1px);
@@ -3235,6 +3237,35 @@ html.native-ios-mac .chat-dl-btn {
   box-shadow: inset 0 0 30px rgba(56,189,248,0.03), 0 0 1px rgba(56,189,248,0.2);
   resize: none; font-family: inherit;
 }
+.voice-overlay-text-streaming {
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  caret-color: transparent;
+}
+.voice-overlay-text-streaming::placeholder {
+  color: #475569;
+  -webkit-text-fill-color: #475569;
+}
+.voice-overlay-stream-mirror {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  padding: 20px;
+  box-sizing: border-box;
+  font-size: 18px;
+  line-height: 1.7;
+  font-family: inherit;
+  color: #e2e8f0;
+  border: 1px solid transparent;
+  border-radius: 16px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: break-word;
+  overflow-y: auto;
+  pointer-events: none;
+  background: transparent;
+  z-index: 2;
+}
 /* Animate a masked ring only; the editor remains stationary and readable. */
 @property --voice-ring-angle {
   syntax: '<angle>';
@@ -3304,6 +3335,11 @@ html.native-ios-mac .chat-dl-btn {
     0 0 14px rgba(34,211,238,0.12);
 }
 .controls-composer-voice-ready .controls-input:empty::before {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: #93c5fd;
   letter-spacing: 0.015em;
 }
@@ -3313,11 +3349,13 @@ html.native-ios-mac .chat-dl-btn {
   opacity: 1;
   animation-duration: 2.2s;
 }
+.controls-composer-voice-ready .controls-input[contenteditable="false"],
 .controls-composer-voice-pending .controls-input,
 .controls-composer-voice-holding .controls-input {
   user-select: none !important;
   -webkit-user-select: none !important;
   -webkit-touch-callout: none !important;
+  touch-action: none !important;
   caret-color: transparent !important;
 }
 .controls-composer-voice-pending .controls-input {
@@ -3500,61 +3538,125 @@ html.native-ios-mac .chat-dl-btn {
   position: relative;
   z-index: 1;
   display: grid;
-  grid-template-columns: 1fr 0.9fr 1fr;
-  gap: 8px;
+  grid-template-columns: 1fr 1.25fr 1fr;
+  align-items: end;
+  gap: 6px;
+  padding: 12px 2px 0;
+  border-radius: 0 0 14px 14px;
+  background: radial-gradient(ellipse 92% 100% at 50% 100%, rgba(15,29,52,0.78) 0%, rgba(15,23,42,0.18) 68%, transparent 74%);
   flex-shrink: 0;
 }
 .voice-hold-zone {
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  min-height: 58px;
+  gap: 3px;
+  min-width: 0;
+  min-height: 60px;
   text-align: center;
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 700;
-  padding: 10px 8px;
-  border-radius: 14px;
+  line-height: 1.2;
+  padding: 8px 6px;
+  border-radius: 22px;
   color: #cbd5e1;
   background: rgba(15,23,42,0.86);
   border: 1.5px solid rgba(148,163,184,0.26);
   transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease, transform 0.14s ease, box-shadow 0.14s ease;
 }
 .voice-hold-zone-arrow {
-  width: 20px;
-  height: 20px;
+  width: 18px;
+  height: 18px;
   flex-shrink: 0;
 }
 .voice-hold-zone-cancel {
   color: #fca5a5;
   border-color: rgba(248,113,113,0.34);
-  background: rgba(127,29,29,0.28);
+  background: linear-gradient(155deg, rgba(127,29,29,0.34), rgba(15,23,42,0.9));
+  border-radius: 26px 48px 14px 18px;
+  transform: translateY(-6px) rotate(-4deg);
+  transform-origin: right bottom;
+}
+.voice-hold-zone-send {
+  min-height: 76px;
+  font-size: 13px;
+  padding: 14px 8px 10px;
+  border-radius: 50% 50% 16px 16px / 44% 44% 16px 16px;
+  background: radial-gradient(ellipse at 50% 18%, rgba(30,41,59,0.92), rgba(15,23,42,0.96));
+  border-top: 2px solid rgba(56,189,248,0.42);
 }
 .voice-hold-zone-edit {
   color: #93c5fd;
   border-color: rgba(96,165,250,0.34);
-  background: rgba(30,58,138,0.28);
+  background: linear-gradient(205deg, rgba(30,58,138,0.34), rgba(15,23,42,0.9));
+  border-radius: 48px 26px 18px 14px;
+  transform: translateY(-6px) rotate(4deg);
+  transform-origin: left bottom;
 }
 .voice-hold-zone-cancel.is-active {
   color: #ffffff;
-  background: linear-gradient(135deg, #ef4444, #dc2626);
+  background: radial-gradient(circle at 40% 30%, #f87171, #dc2626 70%);
   border-color: #fca5a5;
-  box-shadow: 0 0 20px rgba(239,68,68,0.45);
-  transform: translateX(-3px) scale(1.03);
+  box-shadow: 0 0 22px rgba(239,68,68,0.48);
+  transform: translateY(-8px) rotate(-4deg) scale(1.04);
 }
 .voice-hold-zone-send.is-active {
   color: #082f49;
-  background: linear-gradient(135deg, #67e8f9, #22d3ee);
+  background: radial-gradient(ellipse at 50% 20%, #67e8f9 0%, #22d3ee 65%, #0891b2 100%);
   border-color: #a5f3fc;
-  box-shadow: 0 0 18px rgba(34,211,238,0.38);
+  box-shadow: 0 -4px 22px rgba(34,211,238,0.42), inset 0 1px 0 rgba(255,255,255,0.45);
   transform: scale(1.03);
 }
 .voice-hold-zone-edit.is-active {
   color: #ffffff;
-  background: linear-gradient(135deg, #3b82f6, #2563eb);
+  background: radial-gradient(circle at 60% 30%, #60a5fa, #2563eb 70%);
   border-color: #93c5fd;
-  box-shadow: 0 0 20px rgba(59,130,246,0.45);
-  transform: translateX(3px) scale(1.03);
+  box-shadow: 0 0 22px rgba(59,130,246,0.48);
+  transform: translateY(-8px) rotate(4deg) scale(1.04);
+}
+.voice-streaming-robot-cursor {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  vertical-align: -0.18em;
+  width: 1.08em;
+  height: 1.08em;
+  margin-left: 4px;
+  filter: drop-shadow(0 0 6px rgba(34,211,238,0.55));
+}
+.voice-streaming-robot-svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.voice-streaming-robot-cursor.is-active {
+  animation: voice-robot-bob 1.2s ease-in-out infinite;
+}
+.voice-streaming-robot-cursor.is-active .voice-robot-antenna {
+  animation: voice-robot-antenna-pulse 0.9s ease-in-out infinite;
+}
+.voice-streaming-robot-cursor.is-active .voice-robot-aura {
+  animation: voice-robot-aura-pulse 0.9s ease-in-out infinite;
+}
+.voice-streaming-robot-cursor.is-active .voice-robot-eye {
+  animation: voice-robot-eye-glow 1.4s ease-in-out infinite;
+}
+@keyframes voice-robot-bob {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-2px); }
+}
+@keyframes voice-robot-antenna-pulse {
+  0%, 100% { opacity: 0.7; }
+  50% { opacity: 1; }
+}
+@keyframes voice-robot-aura-pulse {
+  0%, 100% { opacity: 0.25; }
+  50% { opacity: 0.78; }
+}
+@keyframes voice-robot-eye-glow {
+  0%, 100% { opacity: 0.82; }
+  50% { opacity: 1; }
 }
 @media (prefers-reduced-motion: reduce) {
   .btn-voice-active,
@@ -3569,7 +3671,11 @@ html.native-ios-mac .chat-dl-btn {
   .controls-composer-voice-ready::after,
   .controls-composer-voice-pending::after,
   .controls-composer-voice-holding::after,
-  .controls-composer-voice-holding .controls-input {
+  .controls-composer-voice-holding .controls-input,
+  .voice-streaming-robot-cursor.is-active,
+  .voice-streaming-robot-cursor.is-active .voice-robot-antenna,
+  .voice-streaming-robot-cursor.is-active .voice-robot-aura,
+  .voice-streaming-robot-cursor.is-active .voice-robot-eye {
     animation: none;
   }
   .voice-editor-marquee::after { opacity: 0.6; }

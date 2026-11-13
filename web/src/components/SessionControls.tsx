@@ -26,6 +26,7 @@ import { SessionActionMenuIcon } from './SessionActionMenuIcon.js';
 import { SupervisionHeartbeatBadge } from './SupervisionHeartbeatBadge.js';
 import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
+import { VoiceStreamingRobot } from './VoiceStreamingRobot.js';
 import { INLINE_PASTE_TEXT_CHAR_LIMIT } from '../composer-inline-limit.js';
 import {
   buildNotepadInlineMessage,
@@ -1331,6 +1332,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const voiceHoldBarsRef = useRef<number[]>(Array(16).fill(0));
   const voiceHoldTranscriptRef = useRef<HTMLDivElement | null>(null);
   const inputDisabledRef = useRef(false);
+  const voiceHoldReadyRef = useRef(false);
+  const composerFocusedRef = useRef(false);
+  const voiceWindowCleanupRef = useRef<(() => void) | null>(null);
+  const voicePointerMoveHandlerRef = useRef<(event: PointerEvent) => void>(() => {});
+  const voicePointerEndHandlerRef = useRef<(event: PointerEvent, cancelled?: boolean) => void>(() => {});
   const handledVoicePointerEventsRef = useRef<WeakSet<Event>>(new WeakSet());
   const touchTapCompatShieldCleanupRef = useRef<(() => void) | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -1918,6 +1924,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       el.dispatchEvent(new Event('input', { bubbles: true }));
     };
     const handleNativeBlur = () => {
+      composerFocusedRef.current = false;
       setComposerFocused(false);
       closeQuickSuggestions();
     };
@@ -5205,6 +5212,34 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
   }, []);
 
+  const clearComposerVoiceWindowListeners = useCallback(() => {
+    voiceWindowCleanupRef.current?.();
+    voiceWindowCleanupRef.current = null;
+  }, []);
+
+  const attachComposerVoiceWindowListeners = useCallback(() => {
+    clearComposerVoiceWindowListeners();
+    if (typeof window === 'undefined') return;
+    const onWinPointerMove = (e: Event) => voicePointerMoveHandlerRef.current(e as PointerEvent);
+    const onWinPointerUp = (e: Event) => voicePointerEndHandlerRef.current(e as PointerEvent, false);
+    const onWinPointerCancel = (e: Event) => voicePointerEndHandlerRef.current(e as PointerEvent, true);
+    const onWinTouchMove = (e: Event) => {
+      if ((voiceHoldPendingRef.current || voiceHoldActiveRef.current) && e.cancelable) {
+        e.preventDefault();
+      }
+    };
+    window.addEventListener('pointermove', onWinPointerMove);
+    window.addEventListener('pointerup', onWinPointerUp);
+    window.addEventListener('pointercancel', onWinPointerCancel);
+    window.addEventListener('touchmove', onWinTouchMove, { passive: false });
+    voiceWindowCleanupRef.current = () => {
+      window.removeEventListener('pointermove', onWinPointerMove);
+      window.removeEventListener('pointerup', onWinPointerUp);
+      window.removeEventListener('pointercancel', onWinPointerCancel);
+      window.removeEventListener('touchmove', onWinTouchMove);
+    };
+  }, [clearComposerVoiceWindowListeners]);
+
   const pulseVoiceHoldRecognizing = useCallback((durationMs = 1500) => {
     if (!voiceHoldActiveRef.current) return;
     setVoiceHoldRecognizing(true);
@@ -5226,7 +5261,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     voiceHoldPendingRef.current = false;
     voiceHoldActiveRef.current = false;
     clearVoiceHoldTimers();
-    clearComposerVoiceTouchLock(divRef.current, inputDisabledRef.current);
+    clearComposerVoiceWindowListeners();
+    clearComposerVoiceTouchLock(
+      divRef.current,
+      inputDisabledRef.current || (voiceHoldReadyRef.current && !composerFocusedRef.current),
+    );
     VoiceInput.onAudioLevel(null);
     if (mountedRef.current) {
       setVoiceHoldPending(false);
@@ -5290,7 +5329,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     })();
 
     return tx.drainPromise;
-  }, [clearVoiceHoldTimers, handleVoiceSend]);
+  }, [clearComposerVoiceWindowListeners, clearVoiceHoldTimers, handleVoiceSend]);
 
   const handleComposerVoicePointerDown = useCallback((event: PointerEvent) => {
     if (handledVoicePointerEventsRef.current.has(event)) return;
@@ -5315,6 +5354,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     voiceHoldPendingRef.current = true;
     setVoiceHoldPending(true);
     applyComposerVoiceTouchLock(el, false);
+    attachComposerVoiceWindowListeners();
     try {
       (event.currentTarget as HTMLElement | null)?.setPointerCapture?.(pointerId);
     } catch { /* ignore unsupported pointer capture */ }
@@ -5325,10 +5365,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       voiceHoldPendingRef.current = false;
       setVoiceHoldPending(false);
       if (!mountedRef.current || voiceHoldTxRef.current !== null) {
-        clearComposerVoiceTouchLock(divRef.current, inputDisabledRef.current);
+        clearComposerVoiceWindowListeners();
+        clearComposerVoiceTouchLock(
+          divRef.current,
+          inputDisabledRef.current || (voiceHoldReadyRef.current && !composerFocusedRef.current),
+        );
         return;
       }
       // Dismiss any active keyboard, selection, or iOS magnifying loupe before starting voice capture.
+      composerFocusedRef.current = false;
+      setComposerFocused(false);
       applyComposerVoiceTouchLock(divRef.current, true);
       try { divRef.current?.blur(); } catch { /* ignore */ }
       try { window.getSelection()?.removeAllRanges(); } catch { /* ignore */ }
@@ -5415,7 +5461,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         },
       );
     }, VOICE_HOLD_DELAY_MS);
-  }, [inputDisabled, voiceOpen, pulseVoiceHoldRecognizing, clearVoiceHoldTimers, finalizeVoiceHold]);
+  }, [
+    inputDisabled,
+    voiceOpen,
+    attachComposerVoiceWindowListeners,
+    clearComposerVoiceWindowListeners,
+    pulseVoiceHoldRecognizing,
+    clearVoiceHoldTimers,
+    finalizeVoiceHold,
+  ]);
 
   const handleComposerVoicePointerMove = useCallback((event: PointerEvent) => {
     if (handledVoicePointerEventsRef.current.has(event)) return;
@@ -5430,10 +5484,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       const dy = (event.clientY ?? 0) - ptr!.startY;
       if (Math.hypot(dx, dy) > VOICE_HOLD_MOVE_SLOP_PX) {
         clearVoiceHoldTimers();
+        clearComposerVoiceWindowListeners();
         voiceHoldPointerRef.current = null;
         voiceHoldPendingRef.current = false;
         setVoiceHoldPending(false);
-        clearComposerVoiceTouchLock(divRef.current, inputDisabledRef.current);
+        clearComposerVoiceTouchLock(
+          divRef.current,
+          inputDisabledRef.current || (voiceHoldReadyRef.current && !composerFocusedRef.current),
+        );
       }
       return;
     }
@@ -5459,7 +5517,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setVoiceHoldZone(nextZone);
       try { navigator.vibrate?.(12); } catch { /* ignore */ }
     }
-  }, [clearVoiceHoldTimers, finalizeVoiceHold]);
+  }, [clearComposerVoiceWindowListeners, clearVoiceHoldTimers, finalizeVoiceHold]);
 
   const disarmTouchTapCompatMouseShield = useCallback(() => {
     touchTapCompatShieldCleanupRef.current?.();
@@ -5523,22 +5581,36 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (voiceHoldTimerRef.current !== null) {
       clearTimeout(voiceHoldTimerRef.current);
       voiceHoldTimerRef.current = null;
-      clearComposerVoiceTouchLock(divRef.current, inputDisabledRef.current);
+      clearComposerVoiceWindowListeners();
       if (!cancelled && ptr && !ptr.wasFocused) {
+        clearComposerVoiceTouchLock(divRef.current, inputDisabledRef.current);
+        composerFocusedRef.current = true;
+        setComposerFocused(true);
         if (event.pointerType === 'touch') {
           armTouchTapCompatMouseShield();
         }
         divRef.current?.focus();
+      } else if (!cancelled) {
+        clearComposerVoiceTouchLock(divRef.current, inputDisabledRef.current);
+      } else {
+        clearComposerVoiceTouchLock(
+          divRef.current,
+          inputDisabledRef.current || (voiceHoldReadyRef.current && !composerFocusedRef.current),
+        );
       }
       return;
     }
 
+    clearComposerVoiceWindowListeners();
     if (!tx || tx.settled || tx.drainPromise !== null) return;
     event.preventDefault();
     try { divRef.current?.blur(); } catch { /* ignore */ }
     const finalZone: 'send' | 'cancel' | 'edit' = cancelled ? 'cancel' : tx.zone;
     void finalizeVoiceHold(tx, tx.error !== null ? 'failed' : finalZone);
-  }, [armTouchTapCompatMouseShield, finalizeVoiceHold]);
+  }, [armTouchTapCompatMouseShield, clearComposerVoiceWindowListeners, finalizeVoiceHold]);
+
+  voicePointerMoveHandlerRef.current = handleComposerVoicePointerMove;
+  voicePointerEndHandlerRef.current = handleComposerVoicePointerEnd;
 
   useEffect(() => {
     const el = divRef.current;
@@ -5556,14 +5628,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     el.addEventListener('pointermove', onMove);
     el.addEventListener('pointerup', onUp);
     el.addEventListener('pointercancel', onCancel);
-    el.addEventListener('lostpointercapture', onCancel);
     el.addEventListener('selectstart', onSelectStart);
     return () => {
       el.removeEventListener('pointerdown', onDown);
       el.removeEventListener('pointermove', onMove);
       el.removeEventListener('pointerup', onUp);
       el.removeEventListener('pointercancel', onCancel);
-      el.removeEventListener('lostpointercapture', onCancel);
       el.removeEventListener('selectstart', onSelectStart);
     };
   }, [handleComposerVoicePointerDown, handleComposerVoicePointerMove, handleComposerVoicePointerEnd]);
@@ -5573,6 +5643,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     return () => {
       disarmTouchTapCompatMouseShield();
       clearVoiceHoldTimers();
+      clearComposerVoiceWindowListeners();
       voiceHoldPendingRef.current = false;
       clearComposerVoiceTouchLock(divRef.current ?? initialEl, inputDisabledRef.current);
       const tx = voiceHoldTxRef.current;
@@ -5587,7 +5658,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         void VoiceInput.stopListening();
       }
     };
-  }, [clearVoiceHoldTimers, disarmTouchTapCompatMouseShield]);
+  }, [clearComposerVoiceWindowListeners, clearVoiceHoldTimers, disarmTouchTapCompatMouseShield]);
 
   useEffect(() => {
     if (!voiceHoldActive) return;
@@ -5814,6 +5885,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   // On mobile, focusing contenteditable can scroll the document body — force it back
   const handleFocus = () => {
+    composerFocusedRef.current = true;
     setComposerFocused(true);
     if (window.scrollY !== 0) window.scrollTo(0, 0);
     if (document.documentElement.scrollTop !== 0) document.documentElement.scrollTop = 0;
@@ -5821,6 +5893,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   };
 
   const handleBlur = () => {
+    composerFocusedRef.current = false;
     setComposerFocused(false);
     closeQuickSuggestions();
   };
@@ -6504,6 +6577,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     && !p2pOpen
     && !quickOpen;
   const voiceHoldReady = isMobileLayout && hasSession && connected && !inputDisabled && VoiceInput.isAvailable();
+  voiceHoldReadyRef.current = voiceHoldReady;
+  composerFocusedRef.current = composerFocused;
   const sessionTargetLabel = sessionDisplayName ?? activeSession?.label ?? activeSession?.project ?? 'session';
   const basePlaceholder = !hasSession
     ? t('session.no_session')
@@ -8299,6 +8374,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               </div>
               <div ref={voiceHoldTranscriptRef} class="voice-hold-hud-transcript">
                 {voiceHoldText.trim() ? voiceHoldText : t('voice.buffering_hint')}
+                <VoiceStreamingRobot active={voiceHoldRecognizing} />
               </div>
               <div class={`voice-hold-hud-active-hint is-${voiceHoldZone}`}>
                 {voiceHoldZone === 'cancel'
@@ -8383,7 +8459,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             ref={divRef}
             class={`controls-input${inputDisabled ? ' controls-input-disabled' : ''}${p2pMode !== 'solo' ? ' controls-input-p2p' : ''}${embeddedComposerActionCount > 0 ? ` controls-input-with-trailing controls-input-with-trailing-${embeddedComposerActionCount}` : ''}${fileDragActive ? ' controls-input-file-drag-over' : ''}`}
             data-onboarding="chat-input"
-            contenteditable={inputDisabled || voiceHoldActive ? 'false' : 'true'}
+            contenteditable={inputDisabled || voiceHoldActive || (voiceHoldReady && !composerFocused) ? 'false' : 'true'}
             role="textbox"
             aria-multiline="true"
             aria-label="Message input"
@@ -8404,7 +8480,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             onPointerMove={handleComposerVoicePointerMove}
             onPointerUp={(e) => handleComposerVoicePointerEnd(e, false)}
             onPointerCancel={(e) => handleComposerVoicePointerEnd(e, true)}
-            onLostPointerCapture={(e) => handleComposerVoicePointerEnd(e, true)}
             onContextMenu={(e) => {
               if (voiceHoldPending || voiceHoldPendingRef.current || voiceHoldActiveRef.current) {
                 e.preventDefault();
