@@ -32,8 +32,8 @@ describe('keyboard-shortcuts core helpers', () => {
     expect(getDefaultShortcuts(true)).toEqual({
       serverPrev: 'Meta+ArrowUp',
       serverNext: 'Meta+ArrowDown',
-      tabPrev: 'Meta+ArrowLeft',
-      tabNext: 'Meta+ArrowRight',
+      tabPrev: 'Meta+Shift+ArrowLeft',
+      tabNext: 'Meta+Shift+ArrowRight',
     });
 
     expect(getDefaultShortcuts(false)).toEqual({
@@ -71,6 +71,8 @@ describe('keyboard-shortcuts core helpers', () => {
     expect(normalizeShortcutChordString('')).toBeNull();
 
     expect(formatShortcutKeycaps('Meta+ArrowUp', true)).toEqual(['⌘', '↑']);
+    expect(formatShortcutKeycaps('Meta+Shift+ArrowLeft', true)).toEqual(['⇧', '⌘', '←']);
+    expect(formatShortcutKeycaps('Meta+Shift+ArrowRight', true)).toEqual(['⇧', '⌘', '→']);
     expect(formatShortcutKeycaps('Ctrl+ArrowLeft', false)).toEqual(['Ctrl', '←']);
     expect(formatShortcutKeycaps('Ctrl+Alt+Shift+k', false)).toEqual(['Ctrl', 'Alt', 'Shift', 'K']);
     expect(formatShortcutKeycaps('Ctrl+Shift+Plus', false)).toEqual(['Ctrl', 'Shift', '+']);
@@ -94,6 +96,12 @@ describe('keyboard-shortcuts core helpers', () => {
     expect(resolveKeyboardShortcuts(clean, true)).toEqual({
       serverPrev: 'Alt+ArrowUp',
       serverNext: null,
+      tabPrev: 'Meta+Shift+ArrowLeft',
+      tabNext: 'Meta+Shift+ArrowRight',
+    });
+    expect(resolveKeyboardShortcuts({ tabPrev: 'Meta+ArrowLeft', tabNext: 'Meta+ArrowRight' }, true)).toEqual({
+      serverPrev: 'Meta+ArrowUp',
+      serverNext: 'Meta+ArrowDown',
       tabPrev: 'Meta+ArrowLeft',
       tabNext: 'Meta+ArrowRight',
     });
@@ -125,6 +133,8 @@ describe('keyboard-shortcuts core helpers', () => {
     expect(chordFromKeyboardEvent({ key: 'F6', code: 'F6', metaKey: false, ctrlKey: false, altKey: false, shiftKey: false })).toBe('F6');
 
     expect(chordFromKeyboardEvent({ key: 'ArrowUp', code: 'ArrowUp', metaKey: true, ctrlKey: false, altKey: false, shiftKey: false })).toBe('Meta+ArrowUp');
+    expect(chordFromKeyboardEvent({ key: 'ArrowLeft', code: 'ArrowLeft', metaKey: true, ctrlKey: false, altKey: false, shiftKey: true })).toBe('Meta+Shift+ArrowLeft');
+    expect(chordFromKeyboardEvent({ key: 'ArrowRight', code: 'ArrowRight', metaKey: true, ctrlKey: false, altKey: false, shiftKey: true })).toBe('Meta+Shift+ArrowRight');
     expect(chordFromKeyboardEvent({ key: 'ArrowRight', code: 'ArrowRight', metaKey: false, ctrlKey: true, altKey: false, shiftKey: true })).toBe('Ctrl+Shift+ArrowRight');
     expect(chordFromKeyboardEvent({ key: '˚', code: 'KeyK', metaKey: false, ctrlKey: false, altKey: true, shiftKey: false })).toBe('Alt+k');
 
@@ -150,6 +160,18 @@ describe('keyboard-shortcuts core helpers', () => {
       { key: 'ArrowUp', code: 'ArrowUp', metaKey: true, ctrlKey: false, altKey: false, shiftKey: false },
       macShortcuts,
     )).toBe('serverPrev');
+    expect(matchNavigationShortcutAction(
+      { key: 'ArrowLeft', code: 'ArrowLeft', metaKey: true, ctrlKey: false, altKey: false, shiftKey: true },
+      macShortcuts,
+    )).toBe('tabPrev');
+    expect(matchNavigationShortcutAction(
+      { key: 'ArrowRight', code: 'ArrowRight', metaKey: true, ctrlKey: false, altKey: false, shiftKey: true },
+      macShortcuts,
+    )).toBe('tabNext');
+    expect(matchNavigationShortcutAction(
+      { key: 'ArrowLeft', code: 'ArrowLeft', metaKey: true, ctrlKey: false, altKey: false, shiftKey: false },
+      macShortcuts,
+    )).toBeNull();
     expect(matchNavigationShortcutAction(
       { key: 'ArrowUp', code: 'ArrowUp', metaKey: true, ctrlKey: false, altKey: false, shiftKey: true },
       macShortcuts,

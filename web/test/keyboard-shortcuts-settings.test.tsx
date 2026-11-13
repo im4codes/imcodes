@@ -112,6 +112,30 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     expect(screen.getByText('macOS defaults')).toBeDefined();
     expect(screen.getByTestId('shortcut-record-serverPrev').textContent).toContain('⌘');
     expect(screen.getByTestId('shortcut-record-serverPrev').textContent).toContain('↑');
+    expect(screen.getByTestId('shortcut-record-serverNext').textContent).toContain('⌘');
+    expect(screen.getByTestId('shortcut-record-serverNext').textContent).toContain('↓');
+    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('⇧');
+    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('⌘');
+    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('←');
+    expect(screen.getByTestId('shortcut-record-tabNext').textContent).toContain('⇧');
+    expect(screen.getByTestId('shortcut-record-tabNext').textContent).toContain('⌘');
+    expect(screen.getByTestId('shortcut-record-tabNext').textContent).toContain('→');
+    const resetTabPrev = screen.getByTestId('shortcut-reset-tabPrev') as HTMLButtonElement;
+    expect(resetTabPrev.disabled).toBe(true);
+
+    // Explicitly overriding tabPrev to Meta+ArrowLeft persists as a custom override
+    fireEvent.click(screen.getByTestId('shortcut-record-tabPrev'));
+    fireEvent.keyDown(document, { key: 'ArrowLeft', code: 'ArrowLeft', metaKey: true });
+    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('⌘');
+    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).not.toContain('⇧');
+    expect((screen.getByTestId('shortcut-reset-tabPrev') as HTMLButtonElement).disabled).toBe(false);
+
+    // Re-recording Cmd+Shift+ArrowLeft matches macOS default and clears the override
+    fireEvent.click(screen.getByTestId('shortcut-record-tabPrev'));
+    fireEvent.keyDown(document, { key: 'ArrowLeft', code: 'ArrowLeft', metaKey: true, shiftKey: true });
+    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('⇧');
+    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('⌘');
+    expect((screen.getByTestId('shortcut-reset-tabPrev') as HTMLButtonElement).disabled).toBe(true);
   });
 
   it('records custom shortcut via keydown, handles Esc cancel, rejects plain typing key, clears conflicts, and persists via useSyncedPreference', () => {

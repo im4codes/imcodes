@@ -135,12 +135,26 @@ export function isMacPlatform(nav?: {
 
 /** Platform default shortcut map. */
 export function getDefaultShortcuts(isMac = isMacPlatform()): Record<ShortcutActionId, string> {
-  const mod = isMac ? 'Meta' : 'Ctrl';
+  if (isMac) {
+    // On macOS, Meta+ArrowLeft/Right and Meta+Alt+ArrowLeft/Right collide with
+    // browser History Back/Forward and Browser Tab Switching at the AppKit menu
+    // layer before JS DOM keydown, while Ctrl+ArrowLeft/Right is reserved by
+    // Mission Control. Meta+Shift+ArrowLeft/Right (⌘⇧← / ⌘⇧→) avoids browser
+    // navigation accelerators and window.addEventListener(..., true) +
+    // e.preventDefault() intercepts composer line selection cleanly, while
+    // Meta+ArrowUp/Down stays intact for server switching.
+    return {
+      serverPrev: 'Meta+ArrowUp',
+      serverNext: 'Meta+ArrowDown',
+      tabPrev: 'Meta+Shift+ArrowLeft',
+      tabNext: 'Meta+Shift+ArrowRight',
+    };
+  }
   return {
-    serverPrev: `${mod}+ArrowUp`,
-    serverNext: `${mod}+ArrowDown`,
-    tabPrev: `${mod}+ArrowLeft`,
-    tabNext: `${mod}+ArrowRight`,
+    serverPrev: 'Ctrl+ArrowUp',
+    serverNext: 'Ctrl+ArrowDown',
+    tabPrev: 'Ctrl+ArrowLeft',
+    tabNext: 'Ctrl+ArrowRight',
   };
 }
 

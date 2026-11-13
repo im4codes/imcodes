@@ -463,6 +463,9 @@ vi.mock('../src/pages/SettingsPage.js', () => ({
       <button onClick={() => onChangeShortcutOverrides?.({ tabNext: 'Alt+ArrowRight', serverNext: 'Alt+ArrowDown' })}>
         settings-custom-shortcuts
       </button>
+      <button onClick={() => onChangeShortcutOverrides?.({ tabPrev: 'Meta+ArrowLeft', tabNext: 'Meta+ArrowRight' })}>
+        settings-meta-tab-shortcuts
+      </button>
       <button onClick={() => onChangeShortcutOverrides?.({ tabNext: 'Ctrl+Shift+Plus', serverNext: 'Shift+PageDown' })}>
         settings-plus-shortcuts
       </button>
@@ -8343,7 +8346,7 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     }
   }, 15000);
 
-  it('supports macOS Meta+Arrow defaults, blocks shortcuts during Settings/modal/terminal/recording, and applies customized shortcuts immediately', async () => {
+  it('supports macOS Meta+Shift+Arrow tab defaults and Meta+Arrow server defaults, blocks shortcuts during Settings/modal/terminal/recording/non-composer inputs, and preserves custom overrides', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
     localStorage.setItem('rcc_session', 'deck_alpha_brain');
@@ -8363,10 +8366,29 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       expect(ctrlEvt.defaultPrevented).toBe(false);
       expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
 
-      // macOS Meta+ArrowRight triggers tabNext
-      const metaRight = new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', metaKey: true, bubbles: true, cancelable: true });
-      alphaComposer.dispatchEvent(metaRight);
-      expect(metaRight.defaultPrevented).toBe(true);
+      // Bare Meta+ArrowRight should NOT trigger by default on macOS (avoids browser Back/Forward collision)
+      const bareMetaRight = new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', metaKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(bareMetaRight);
+      expect(bareMetaRight.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+
+      // macOS Meta+Shift+ArrowRight triggers tabNext inside composer
+      const metaShiftRight = new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', metaKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(metaShiftRight);
+      expect(metaShiftRight.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+
+      // Non-editable sidebar/button focus also responds to Meta+Shift+ArrowLeft (tabPrev via window capture)
+      const settingsBtn = screen.getByText('server-settings');
+      settingsBtn.focus();
+      const metaShiftLeft = new KeyboardEvent('keydown', { key: 'ArrowLeft', code: 'ArrowLeft', metaKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      settingsBtn.dispatchEvent(metaShiftLeft);
+      expect(metaShiftLeft.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
+
+      // Switch to beta so subsequent guards verify non-switching
+      const metaShiftRightAgain = new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', metaKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(metaShiftRightAgain);
       await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
 
       // Blocking guard: terminal xterm element does NOT intercept
@@ -8377,30 +8399,67 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       xtermWrap.appendChild(xtermInput);
       document.body.appendChild(xtermWrap);
       xtermInput.focus();
-      const termEvt = new KeyboardEvent('keydown', { key: 'ArrowLeft', code: 'ArrowLeft', metaKey: true, bubbles: true, cancelable: true });
+      const termEvt = new KeyboardEvent('keydown', { key: 'ArrowLeft', code: 'ArrowLeft', metaKey: true, shiftKey: true, bubbles: true, cancelable: true });
       xtermInput.dispatchEvent(termEvt);
       expect(termEvt.defaultPrevented).toBe(false);
       expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true');
       xtermWrap.remove();
 
-      // Open Settings -> Meta+ArrowLeft is blocked while Settings modal overlay is open -> customize to Alt+ArrowRight
+      // Blocking guard: non-composer text input does NOT intercept
+      const plainInput = document.createElement('input');
+      plainInput.type = 'text';
+      document.body.appendChild(plainInput);
+      plainInput.focus();
+      const inputEvt = new KeyboardEvent('keydown', { key: 'ArrowLeft', code: 'ArrowLeft', metaKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      plainInput.dispatchEvent(inputEvt);
+      expect(inputEvt.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true');
+      plainInput.remove();
+
+      // Blocking guard: shortcut recording button does NOT intercept
+      const recBtn = document.createElement('button');
+      recBtn.setAttribute('data-shortcut-recording', 'true');
+      document.body.appendChild(recBtn);
+      recBtn.focus();
+      const recEvt = new KeyboardEvent('keydown', { key: 'ArrowLeft', code: 'ArrowLeft', metaKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      recBtn.dispatchEvent(recEvt);
+      expect(recEvt.defaultPrevented).toBe(false);
+      recBtn.remove();
+
+      // Open Settings -> Meta+Shift+ArrowLeft is blocked while Settings overlay is open -> customize explicit Meta+ArrowLeft/Right override
       fireEvent.click(screen.getByText('server-settings'));
       expect(screen.getByText('settings-page')).toBeTruthy();
 
-      const whileSettingsEvt = new KeyboardEvent('keydown', { key: 'ArrowLeft', code: 'ArrowLeft', metaKey: true, bubbles: true, cancelable: true });
-      document.dispatchEvent(whileSettingsEvt);
+      const whileSettingsEvt = new KeyboardEvent('keydown', { key: 'ArrowLeft', code: 'ArrowLeft', metaKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(whileSettingsEvt);
       expect(whileSettingsEvt.defaultPrevented).toBe(false);
 
+      fireEvent.click(screen.getByText('settings-meta-tab-shortcuts'));
+      fireEvent.click(screen.getByText('settings-back'));
+
+      // Explicit custom Meta+ArrowLeft/Right override still works immediately (while unmapped Meta+Shift+ArrowLeft does not)
+      const betaComposer = screen.getByTestId('pane-composer-deck_beta_brain');
+      betaComposer.focus();
+      const unmappedMetaShift = new KeyboardEvent('keydown', { key: 'ArrowLeft', code: 'ArrowLeft', metaKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      betaComposer.dispatchEvent(unmappedMetaShift);
+      expect(unmappedMetaShift.defaultPrevented).toBe(false);
+
+      const customMetaLeft = new KeyboardEvent('keydown', { key: 'ArrowLeft', code: 'ArrowLeft', metaKey: true, bubbles: true, cancelable: true });
+      betaComposer.dispatchEvent(customMetaLeft);
+      expect(customMetaLeft.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
+
+      // Further customize to Alt+ArrowRight -> switches immediately from alpha -> beta
+      fireEvent.click(screen.getByText('server-settings'));
       fireEvent.click(screen.getByText('settings-custom-shortcuts'));
       fireEvent.click(screen.getByText('settings-back'));
 
-      // Now customized Alt+ArrowRight switches tab while Meta+ArrowRight no longer switches!
-      const betaComposer = screen.getByTestId('pane-composer-deck_beta_brain');
-      betaComposer.focus();
+      const alphaComposerAgain = screen.getByTestId('pane-composer-deck_alpha_brain');
+      alphaComposerAgain.focus();
       const customAltRight = new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', altKey: true, bubbles: true, cancelable: true });
-      betaComposer.dispatchEvent(customAltRight);
+      alphaComposerAgain.dispatchEvent(customAltRight);
       expect(customAltRight.defaultPrevented).toBe(true);
-      await waitFor(() => expect(screen.getByTestId('session-pane-deck_gamma_brain').getAttribute('data-is-active')).toBe('true'));
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
     } finally {
       Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
     }
