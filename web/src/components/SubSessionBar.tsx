@@ -33,7 +33,7 @@ import { reorderSubSessions } from '../api.js';
 import { formatLabel } from '../format-label.js';
 import { getAgentBadgeLabel } from '../agent-display.js';
 import { resolveContextWindow } from '../model-context.js';
-import { subSessionModelPresentation } from '../model-label.js';
+import { compactSubSessionModelLabel, subSessionModelPresentation } from '../model-label.js';
 import { P2pProgressCard } from './P2pProgressCard.js';
 import type { P2pProgressDiscussion } from './P2pProgressCard.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
@@ -405,6 +405,7 @@ function CollapsedSubSessionButtonImpl({ sub, accentColor, isOpen, isFocused, id
   const abbr = getAgentBadgeLabel(sub.type);
   const effectiveModel = resolveQuickAgentDelegationModel(sub, detectedModel, usage?.model);
   const { label: model, title: modelTitle } = subSessionModelPresentation(effectiveModel, usage?.model);
+  const compactModel = compactSubSessionModelLabel(model);
   let ctxPct = 0;
   if (usage) {
     const ctx = resolveContextWindow(
@@ -438,7 +439,7 @@ function CollapsedSubSessionButtonImpl({ sub, accentColor, isOpen, isFocused, id
       <span class="subsession-card-label">{sub.label ? formatLabel(sub.label).slice(0, 12) : agentTag.slice(0, 6)}</span>
       {inP2p && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
       <SharedStateIndicator state={sharedState} iconOnly />
-      {model && <span class="subsession-card-model" title={modelTitle}>{model}</span>}
+      {compactModel && <span class="subsession-card-model" title={modelTitle}>{compactModel}</span>}
       {sub.ccPresetId && <span class="subsession-card-custom-api" title={`Custom API: ${sub.ccPresetId}`}>◉</span>}
       {/* tsk_5zv: a static running mark so the running state never depends on the
           bottom marquee alone - it survives prefers-reduced-motion and reads at a

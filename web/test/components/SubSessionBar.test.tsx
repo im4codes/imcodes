@@ -202,7 +202,7 @@ describe('SubSessionBar', () => {
       subUsages: new Map([[sub.sessionName, { inputTokens: 100_000, cacheTokens: 0, contextWindow: 1_000_000, model: 'gemini-4-argon-high' }]]),
     };
     const view = render(<SubSessionBar {...props} />);
-    expect(view.container.querySelector('.subsession-card-model')?.textContent).toBe('argon-high');
+    expect(view.container.querySelector('.subsession-card-model')?.textContent).toBe('ar.n-high');
     expect(view.container.querySelector('.subsession-card-model')?.getAttribute('title')).toContain('gemini-4-argon-high');
     expect((view.container.querySelector('.subsession-card') as HTMLButtonElement).title).toContain('gemini-4-argon-high');
     expect((view.container.querySelector('.subsession-card') as HTMLButtonElement).title).toContain('ctx 10%');
@@ -215,7 +215,7 @@ describe('SubSessionBar', () => {
     view.rerender(<SubSessionBar {...props} subSessions={[{ ...sub, activeModel: null }]} subUsages={undefined} />);
     expect(view.container.querySelector('.subsession-card-model')).toBeNull();
     view.rerender(<SubSessionBar {...props} subSessions={[{ ...sub, activeModel: null }]} />);
-    expect(view.container.querySelector('.subsession-card-model')?.textContent).toBe('argon-high');
+    expect(view.container.querySelector('.subsession-card-model')?.textContent).toBe('ar.n-high');
     view.rerender(
       <SubSessionBar
         {...props}
@@ -223,8 +223,17 @@ describe('SubSessionBar', () => {
         subUsages={new Map([[sub.sessionName, { inputTokens: 100_000, cacheTokens: 0, contextWindow: 1_000_000, model: 'gemini-2.5-pro' }]])}
       />,
     );
-    expect(view.container.querySelector('.subsession-card-model')?.textContent).toBe('hydrogen-high');
+    expect(view.container.querySelector('.subsession-card-model')?.textContent).toBe('hy.n-high');
     expect(view.container.querySelector('.subsession-card-model')?.getAttribute('title')).toBe('gemini-4-hydrogen-high · gemini-2.5-pro');
+    expect((view.container.querySelector('.subsession-card') as HTMLButtonElement).title).toContain('gemini-4-hydrogen-high · gemini-2.5-pro');
+
+    const cssPath = join(process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web'), 'src/styles.css');
+    const css = readFileSync(cssPath, 'utf8');
+    const cardModelRule = /^\.subsession-card-model \{([^}]*)\}/m.exec(css)?.[1] ?? '';
+    expect(cardModelRule).toMatch(/white-space:\s*nowrap/);
+    expect(cardModelRule).toMatch(/overflow:\s*hidden/);
+    expect(cardModelRule).toMatch(/max-width:\s*100%/);
+    expect(cardModelRule).toMatch(/margin-left:\s*0/);
   });
 
   it('shows gray, green, and yellow daemon-bar connection states from the live broker', async () => {

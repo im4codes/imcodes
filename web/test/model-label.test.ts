@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { shortModelLabel, bestModelLabel, subSessionModelPresentation } from '../src/model-label.js';
+import {
+  shortModelLabel,
+  bestModelLabel,
+  subSessionModelPresentation,
+  compactSubSessionModelLabel,
+} from '../src/model-label.js';
 
 describe('shortModelLabel', () => {
   it('shows the last two parts of any GPT/Codex id, so version and variant both survive', () => {
@@ -141,5 +146,46 @@ describe('subSessionModelPresentation', () => {
     expect(bestModelLabel('gemini-4-hydrogen-high')).toBe('hydrogen-high');
     expect(bestModelLabel('gemini-4-argon-high')).toBe('argon-high');
     expect(bestModelLabel('qwen3-coder-next')).toBe('coder-next');
+  });
+});
+
+describe('compactSubSessionModelLabel', () => {
+  it('returns null for empty inputs and leaves labels within the 54px card budget unchanged', () => {
+    expect(compactSubSessionModelLabel(null)).toBeNull();
+    expect(compactSubSessionModelLabel(undefined)).toBeNull();
+    expect(compactSubSessionModelLabel('')).toBeNull();
+    expect(compactSubSessionModelLabel('   ')).toBeNull();
+    for (const shortLabel of ['a', 'flash', 'gpt-5.4', 'glm-4.7', '6.1-sol', 'opus-4.8', 'beta-fast', 'v3.2-chat', 'm2.5-high']) {
+      expect(compactSubSessionModelLabel(shortLabel)).toBe(shortLabel);
+    }
+  });
+
+  it('shortens long word segments with middle dots while preserving suffixes and version numbers', () => {
+    expect(compactSubSessionModelLabel('hydrogen-high')).toBe('hy.n-high');
+    expect(compactSubSessionModelLabel('argon-high')).toBe('ar.n-high');
+    expect(compactSubSessionModelLabel('coder-next')).toBe('co.r-next');
+    expect(compactSubSessionModelLabel('5.4-preview')).toBe('5.4-pr.ew');
+    expect(compactSubSessionModelLabel('sonnet-4.6')).toBe('so.et-4.6');
+    expect(compactSubSessionModelLabel('hydrogen-medium')).toBe('hy.n-me.m');
+  });
+
+  it('elides single long words and multi-segment fallbacks cleanly to fit maxLength', () => {
+    expect(compactSubSessionModelLabel('supercalifragilistic')).toBe('supe.stic');
+    expect(compactSubSessionModelLabel('qwen3-coder-next')).toBe('qwen.next');
+    expect(compactSubSessionModelLabel('deepseek-v3-beta-fast')).toBe('deep.fast');
+    expect(compactSubSessionModelLabel('claude-sonnet-4.6')).toBe('clau.-4.6');
+    expect(compactSubSessionModelLabel('alpha_omega_gamma')).toBe('alph.amma');
+    expect(compactSubSessionModelLabel('abcdef', 0)).toBe('');
+    expect(compactSubSessionModelLabel('abcdef', 1)).toBe('.');
+    expect(compactSubSessionModelLabel('abcdef', 2)).toBe('a.');
+    expect(compactSubSessionModelLabel('abcdef', 5)?.length).toBeLessThanOrEqual(5);
+  });
+
+  it('does not alter subSessionModelPresentation or bestModelLabel outputs used by UsageFooter', () => {
+    expect(subSessionModelPresentation('gemini-4-hydrogen-high')).toEqual({
+      label: 'hydrogen-high',
+      title: 'gemini-4-hydrogen-high',
+    });
+    expect(bestModelLabel('gemini-4-hydrogen-high')).toBe('hydrogen-high');
   });
 });

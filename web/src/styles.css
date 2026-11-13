@@ -7289,7 +7289,7 @@ html.native-ios-mac .chat-dl-btn {
 .subsession-card-label { font-size: 10px; color: #7b8797; position: relative; z-index: 1; }
 .subsession-card.open .subsession-card-label { color: #bfdbfe; }
 .subsession-card-badge { font-size: 10px; color: #f59e0b; }
-.subsession-card-model { font-size: 9px; color: #818cf8; margin-left: 2px; }
+.subsession-card-model { font-size: 9px; color: #818cf8; margin-left: 0; max-width: 100%; overflow: hidden; white-space: nowrap; }
 .subsession-card-custom-api { font-size: 9px; color: #f59e0b; margin-left: 2px; }
 .subsession-card-ctx { display: block; height: 3px; background: rgba(15,23,42,0.92); border-radius: 999px; overflow: hidden; margin-top: 2px; box-shadow: inset 0 0 5px rgba(0,0,0,0.42); }
 .subsession-card-ctx-fill { display: block; height: 100%; background: linear-gradient(90deg, var(--chrome-accent), var(--chrome-accent-2)); border-radius: 999px; transition: width 0.3s; box-shadow: 0 0 8px rgba(34,211,238,0.5); }
