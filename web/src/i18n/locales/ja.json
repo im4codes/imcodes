@@ -646,8 +646,8 @@
   "session": {
     "incognito": "シークレットセッション",
     "incognito_hint": "履歴はメモリ内のみで保持し、終了・切断時に消去します。メモリツールは無効です。エージェントが作成したプロジェクトファイルは残ります。",
-    "incognito_available": "現在は Claude SDK と Pi に対応しています。",
-    "incognito_unsupported": "更新済みのサーバーとデーモン、および対応ランタイム（Claude SDK または Pi）が必要です。他の実行環境では履歴の非保存を保証できません。",
+    "incognito_available": "現在は Claude SDK、Codex SDK、Pi に対応しています。",
+    "incognito_unsupported": "更新済みのサーバーとデーモン、および対応ランタイム（Claude SDK、Codex SDK、または Pi）が必要です。他の実行環境では履歴の非保存を保証できません。",
     "restart": "↺ 再起動",
     "restart_plain": "再起動",
     "terminal_recovery_exhausted": "ターミナルを自動復旧できませんでした。再起動して続行してください。",

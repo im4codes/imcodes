@@ -1,4 +1,5 @@
 import { ProviderStopConfirmation } from '../provider-stop-confirmation.js';
+import { setSessionIncognito, withSessionPrivacy } from '../../../shared/session-incognito-context.js';
 import { PendingQuestionRegistry } from '../pending-question-registry.js';
 import { ASK_QUESTION_WAIT_MS } from '../../../shared/ask-question-timing.js';
 import {
@@ -82,7 +83,12 @@ import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-p
 import { getCodexBaseInstructions } from '../codex-runtime-config.js';
 import { buildGeneratedImageReportingPrompt } from '../../../shared/transport-runtime-prompts.js';
 import { composeProviderSystemText, getProviderSystemTextParts, composeProviderSystemTextSpanned, getProviderSessionSystemTextSpanned } from '../provider-context-routing.js';
-import { getCodexAppServerArgs } from './getDefaultCodexMcpArgs.js';
+import {
+  collectCodexTomlMcpServerKeysForIncognito,
+  findEnabledImcodesMcpKeysFromConfig,
+  getCodexAppServerArgs,
+  getCodexIncognitoAppServerArgs,
+} from './getDefaultCodexMcpArgs.js';
 import {
   NativeAgentFenceSlot,
   fenceOf,
@@ -1106,6 +1112,7 @@ export interface CodexModelProviderConfig {
 
 interface CodexSdkSessionState {
   routeId: string;
+  incognito?: boolean;
   /**
    * Authorized IM.codes dispatch facts observed in the CURRENT turn. This is
    * the only evidence a delegation claim is ever built from; it is reset at
@@ -1272,7 +1279,7 @@ function buildCodexShellEnvironmentSet(config: SessionConfig): Record<string, st
 }
 
 export function buildCodexMcpThreadConfig(config: SessionConfig): Record<string, unknown> | undefined {
-  const server = getDefaultMcpServers(config)[IMCODES_MEMORY_MCP_SERVER_NAME];
+  const server = config.incognito ? undefined : getDefaultMcpServers(config)[IMCODES_MEMORY_MCP_SERVER_NAME];
   const shellEnvSet = buildCodexShellEnvironmentSet(config);
   if (!server && !shellEnvSet) return undefined;
   return {
@@ -2659,6 +2666,46 @@ export function toolFromItem(sessionId: string, item: Record<string, any>, lifec
   }
 }
 
+type CodexAppServerChannelKind = 'normal' | 'incognito';
+
+interface CodexAppServerChannel {
+  kind: CodexAppServerChannelKind;
+  child: ChildProcessWithoutNullStreams | null;
+  rl: ReadlineInterface | null;
+  nextRequestId: number;
+  pendingRequests: Map<number, PendingRequest>;
+  authFingerprint: string | null;
+  restart: Promise<void> | null;
+  /**
+   * Teardown of a disconnected app-server generation may outlive its exit
+   * event: the Codex wrapper can leave MCP stdio descendants behind after the
+   * leader has already exited. Keep that cleanup promise visible so a new
+   * generation never starts before the old process group has been signalled.
+   */
+  cleanup: Promise<void> | null;
+  generation: number;
+  startInFlight: Promise<void> | null;
+  disabledMcpKeys: string[];
+  threadToSession: Map<string, string>;
+}
+
+function createAppServerChannel(kind: CodexAppServerChannelKind): CodexAppServerChannel {
+  return {
+    kind,
+    child: null,
+    rl: null,
+    nextRequestId: 1,
+    pendingRequests: new Map(),
+    authFingerprint: null,
+    restart: null,
+    cleanup: null,
+    generation: 0,
+    startInFlight: null,
+    disabledMcpKeys: [],
+    threadToSession: new Map(),
+  };
+}
+
 export class CodexSdkProvider implements TransportProvider {
   readonly id = 'codex-sdk';
   readonly connectionMode = CONNECTION_MODES.LOCAL_SDK;
@@ -2698,7 +2745,26 @@ export class CodexSdkProvider implements TransportProvider {
   private readonly questions = new PendingQuestionRegistry<CodexUserInputResponse>();
   private readonly questionInputs = new Map<string, { requestId: number | string; turnId: string; questions: CodexUserInputQuestion[] }>();
   private readonly nativeAgentFence = new NativeAgentFenceSlot('codex-sdk');
-  private threadToSession = new Map<string, string>();
+  private readonly normalChannel = createAppServerChannel('normal');
+  private readonly incognitoChannel = createAppServerChannel('incognito');
+  private get child(): ChildProcessWithoutNullStreams | null {
+    return this.normalChannel.child;
+  }
+  private get rl(): ReadlineInterface | null {
+    return this.normalChannel.rl;
+  }
+  private get pendingRequests(): Map<number, PendingRequest> {
+    return this.normalChannel.pendingRequests;
+  }
+  private get threadToSession(): Map<string, string> {
+    return this.normalChannel.threadToSession;
+  }
+  private get appServerGeneration(): number {
+    return this.normalChannel.generation;
+  }
+  private get appServerCleanup(): Promise<void> | null {
+    return this.normalChannel.cleanup;
+  }
   private deltaCallbacks: Array<(sessionId: string, delta: MessageDelta) => void> = [];
   private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
   private errorCallbacks: Array<(sessionId: string, error: ProviderError) => void> = [];
@@ -2706,26 +2772,30 @@ export class CodexSdkProvider implements TransportProvider {
   private sessionInfoCallbacks: Array<(sessionId: string, info: SessionInfoUpdate) => void> = [];
   private statusCallbacks: Array<(sessionId: string, status: ProviderStatusUpdate) => void> = [];
   private usageCallbacks: Array<(sessionId: string, update: ProviderUsageUpdate) => void> = [];
-  private child: ChildProcessWithoutNullStreams | null = null;
-  private rl: ReadlineInterface | null = null;
-  private nextRequestId = 1;
-  private pendingRequests = new Map<number, PendingRequest>();
-  private appServerAuthFingerprint: string | null = null;
-  private appServerRestart: Promise<void> | null = null;
-  /**
-   * Teardown of a disconnected app-server generation may outlive its exit
-   * event: the Codex wrapper can leave MCP stdio descendants behind after the
-   * leader has already exited.  Keep that cleanup promise visible so a new
-   * generation never starts before the old process group has been signalled.
-   */
-  private appServerCleanup: Promise<void> | null = null;
-  private appServerGeneration = 0;
   private imcodesMcpReload: Promise<void> | null = null;
   private rawSpawnAgentCalls = new Map<string, CodexRawSpawnAgentCall>();
   private rawNativeCollabCalls = new Map<string, { sessionId: string; name: string }>();
   private trackedSubagentThreads = new Map<string, CodexTrackedSubagentThread>();
   private nextActiveTurnLeaseId = 1;
   private heartbeatInFlightCount = 0;
+
+  private getChannelForSession(state: Pick<CodexSdkSessionState, 'incognito'>): CodexAppServerChannel {
+    return state.incognito ? this.incognitoChannel : this.normalChannel;
+  }
+
+  private getSessionsForChannel(channel: CodexAppServerChannel): Array<[string, CodexSdkSessionState]> {
+    const wantIncognito = channel.kind === 'incognito';
+    return [...this.sessions.entries()].filter(([, state]) => Boolean(state.incognito) === wantIncognito);
+  }
+
+  private getSessionIdForThread(channel: CodexAppServerChannel, threadId?: string | null): string | undefined {
+    if (!threadId) return undefined;
+    const sessionId = channel.threadToSession.get(threadId);
+    if (!sessionId) return undefined;
+    const state = this.sessions.get(sessionId);
+    if (!state || Boolean(state.incognito) !== (channel.kind === 'incognito')) return undefined;
+    return sessionId;
+  }
 
   async connect(config: ProviderConfig): Promise<void> {
     const binaryPath = this.resolveBinaryPath(config);
@@ -2738,15 +2808,15 @@ export class CodexSdkProvider implements TransportProvider {
         execFile(resolved.executable, [...resolved.prependArgs, '--version'], { windowsHide: true }, (err) => (err ? reject(err) : resolve()));
       });
     });
-    await this.startAppServer(binaryPath, config, { clearSessions: true });
+    await this.startChannelAppServer(this.normalChannel, binaryPath, config, { clearSessions: true });
     logger.info({ provider: this.id, resolved: resolved.executable, prepend: resolved.prependArgs }, 'Codex SDK provider connected via app-server');
   }
 
   getMemoryMcpStatus(): MemoryMcpProviderStatusView {
     return {
       providerId: this.id,
-      status: this.config && this.child ? MEMORY_MCP_STATUS.READY : MEMORY_MCP_STATUS.UNKNOWN,
-      connected: Boolean(this.config && this.child),
+      status: this.config && this.normalChannel.child ? MEMORY_MCP_STATUS.READY : MEMORY_MCP_STATUS.UNKNOWN,
+      connected: Boolean(this.config && this.normalChannel.child),
       degradedReasons: [],
     };
   }
@@ -2775,9 +2845,10 @@ export class CodexSdkProvider implements TransportProvider {
     };
   }
 
-  private getActiveWorkSessionIds(excludeSessionId?: string): string[] {
+  private getActiveWorkSessionIds(excludeSessionId?: string, channel?: CodexAppServerChannel): string[] {
     const active: string[] = [];
     for (const [sessionId, state] of this.sessions) {
+      if (channel && Boolean(state.incognito) !== (channel.kind === 'incognito')) continue;
       if (sessionId === excludeSessionId) continue;
       const work = this.getCurrentTurnWorkState(state);
       if (work.activeWorkCount > 0 || Boolean(state.cancelTimer)) active.push(sessionId);
@@ -2788,6 +2859,7 @@ export class CodexSdkProvider implements TransportProvider {
   getSessionDiagnostics(sessionId: string): Record<string, unknown> | null {
     const state = this.sessions.get(sessionId);
     if (!state) return null;
+    const channel = this.getChannelForSession(state);
     const activeItemIds = state.activeItemIds ?? new Set<string>();
     const activeToolItemIds = state.activeToolItemIds ?? new Set<string>();
     const activeCompactionItemIds = state.activeCompactionItemIds ?? new Set<string>();
@@ -2806,9 +2878,9 @@ export class CodexSdkProvider implements TransportProvider {
               : null;
     return {
       provider: this.id,
-      appServerGeneration: this.appServerGeneration,
-      appServerPid: this.child?.pid ?? null,
-      appServerCleanupPending: Boolean(this.appServerCleanup),
+      appServerGeneration: channel.generation,
+      appServerPid: channel.child?.pid ?? null,
+      appServerCleanupPending: Boolean(channel.cleanup),
       // RSS is not a safe restart signal: Codex can hold a legitimate large
       // context and an active turn must never be torn down speculatively.
       appServerRecoveryPolicy: 'auth-change-or-disconnect-only',
@@ -2859,7 +2931,11 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   async disconnect(): Promise<void> {
-    await this.stopAppServer({ clearSessions: true });
+    await Promise.all([
+      this.stopChannelAppServer(this.normalChannel, { clearSessions: true }),
+      this.stopChannelAppServer(this.incognitoChannel, { clearSessions: true }),
+    ]);
+    this.config = null;
   }
 
   private extractCustomModelProvider(
@@ -2887,22 +2963,35 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   async createSession(config: SessionConfig): Promise<string> {
-    await this.refreshAppServerForLatestAuth('create-session');
     const routeId = config.bindExistingKey ?? config.sessionKey;
     const existing = config.fresh ? undefined : this.sessions.get(routeId);
-    const customModelProvider = this.extractCustomModelProvider(config, existing?.customModelProvider);
-    this.sessions.set(routeId, {
+    const incognito = config.incognito === true || existing?.incognito === true;
+    const targetChannel = incognito ? this.incognitoChannel : this.normalChannel;
+    if (!incognito || targetChannel.child) {
+      await this.refreshAppServerForLatestAuth('create-session', targetChannel);
+    }
+    if (incognito) {
+      if (config.resumeId || config.skipCreate || existing?.threadId) {
+        throw new Error('Incognito conversation ended; start a new session instead of resuming history.');
+      }
+      setSessionIncognito(routeId, true);
+      if (config.sessionName) setSessionIncognito(config.sessionName, true);
+    }
+    const effectiveConfig: SessionConfig = incognito ? { ...config, incognito: true } : config;
+    const customModelProvider = this.extractCustomModelProvider(effectiveConfig, existing?.customModelProvider);
+    const state: CodexSdkSessionState = {
       routeId,
-      ...(config.sessionName ? { imcodesSessionName: config.sessionName } : existing?.imcodesSessionName ? { imcodesSessionName: existing.imcodesSessionName } : {}),
-      cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
-      env: { ...(existing?.env ?? {}), ...((config.env as Record<string, string> | undefined) ?? {}) },
-      mcpConfig: buildCodexMcpThreadConfig(config) ?? existing?.mcpConfig,
+      ...(incognito ? { incognito: true } : {}),
+      ...(effectiveConfig.sessionName ? { imcodesSessionName: effectiveConfig.sessionName } : existing?.imcodesSessionName ? { imcodesSessionName: existing.imcodesSessionName } : {}),
+      cwd: normalizeTransportCwd(effectiveConfig.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
+      env: { ...(existing?.env ?? {}), ...((effectiveConfig.env as Record<string, string> | undefined) ?? {}) },
+      mcpConfig: buildCodexMcpThreadConfig(effectiveConfig) ?? (incognito ? undefined : existing?.mcpConfig),
       customModelProvider,
       imcodesMcpRecoveryRequired: false,
       imcodesMcpRecoveryPromise: undefined,
-      model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
-      effort: config.effort ?? existing?.effort,
-      threadId: config.resumeId ?? existing?.threadId,
+      model: typeof effectiveConfig.agentId === 'string' ? effectiveConfig.agentId : existing?.model,
+      effort: effectiveConfig.effort ?? existing?.effort,
+      threadId: incognito ? undefined : (effectiveConfig.resumeId ?? existing?.threadId),
       ...(existing?.nativeAgentFence ? { nativeAgentFence: existing.nativeAgentFence } : {}),
       loaded: false,
       runningTurnId: undefined,
@@ -2943,8 +3032,8 @@ export class CodexSdkProvider implements TransportProvider {
       generatedImageTracking: null,
       generatedImagePaths: [],
       rawChecklistStartedAt: Date.now(),
-      rawChecklistRolloutPath: existing?.rawChecklistRolloutPath,
-      rawChecklistRolloutOffset: existing?.rawChecklistRolloutOffset,
+      rawChecklistRolloutPath: incognito ? undefined : existing?.rawChecklistRolloutPath,
+      rawChecklistRolloutOffset: incognito ? undefined : existing?.rawChecklistRolloutOffset,
       rawChecklistSeenCallIds: existing?.rawChecklistSeenCallIds ?? new Set(),
       rawChecklistScanPromise: undefined,
       rawChecklistPollTimer: null,
@@ -2956,8 +3045,14 @@ export class CodexSdkProvider implements TransportProvider {
       childSubagentRolloutScanPromise: undefined,
       childSubagentRolloutTimer: null,
       childSubagentRolloutPollUntil: 0,
-    });
-    if (config.resumeId || config.effort) this.emitSessionInfo(routeId, { ...(config.resumeId ? { resumeId: config.resumeId } : {}), ...(config.effort ? { effort: config.effort } : {}) });
+    };
+    this.sessions.set(routeId, state);
+    if ((!incognito && effectiveConfig.resumeId) || effectiveConfig.effort) {
+      this.emitSessionInfo(routeId, {
+        ...(!incognito && effectiveConfig.resumeId ? { resumeId: effectiveConfig.resumeId } : {}),
+        ...(effectiveConfig.effort ? { effort: effectiveConfig.effort } : {}),
+      });
+    }
     return routeId;
   }
 
@@ -2970,10 +3065,14 @@ export class CodexSdkProvider implements TransportProvider {
     this.clearCompactTimers(state);
     this.clearRawChecklistPollTimer(state);
     this.clearChildSubagentRolloutPollTimer(state);
-    if (state.threadId && state.loaded) {
-      await this.request('thread/unsubscribe', { threadId: state.threadId }, CODEX_THREAD_UNSUBSCRIBE_TIMEOUT_MS).catch(() => {});
-      this.threadToSession.delete(state.threadId);
+    if (state.threadId) {
+      const channel = this.getChannelForSession(state);
+      if (state.loaded) {
+        await this.requestOnChannel(channel, 'thread/unsubscribe', { threadId: state.threadId }, CODEX_THREAD_UNSUBSCRIBE_TIMEOUT_MS).catch(() => {});
+      }
+      channel.threadToSession.delete(state.threadId);
     }
+    state.loaded = false;
     this.sessions.delete(sessionId);
   }
 
@@ -3034,7 +3133,8 @@ export class CodexSdkProvider implements TransportProvider {
     if (!state) return;
     if (state.model !== agentId) {
       state.model = agentId;
-      state.loaded = false;
+      // Ephemeral threads reject thread/resume; turn/start carries `state.model` in place.
+      if (!state.incognito) state.loaded = false;
     }
   }
 
@@ -3051,24 +3151,44 @@ export class CodexSdkProvider implements TransportProvider {
     // Preserve the exact durable thread id/history. The next turn crosses
     // ensureThreadLoaded and issues thread/resume with freshly assembled
     // baseInstructions, restoring prefix-cacheable identity immediately.
-    state.loaded = false;
+    // Ephemeral threads cannot be resumed via thread/resume; clearing
+    // lastInjectedSessionSystemText re-injects updated system text on the next turn.
+    if (!state.incognito) state.loaded = false;
     state.lastInjectedSessionSystemText = undefined;
     this.clearPendingSessionSystemTextUpdate(state);
   }
 
   async send(sessionId: string, payloadOrMessage: string | ProviderContextPayload, attachments?: TransportAttachment[], extraSystemPrompt?: string): Promise<void> {
-    if (!this.config || !this.child) {
+    if (!this.config) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server not connected', false);
     }
     const state = this.sessions.get(sessionId);
     if (!state) {
       throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Unknown Codex SDK session: ${sessionId}`, false);
     }
+    const channel = this.getChannelForSession(state);
+    if (channel.kind === 'normal' && !channel.child) {
+      throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server not connected', false);
+    }
+    return this.runWithPrivacy(sessionId, state, () => this.sendWithPrivacy(sessionId, state, payloadOrMessage, attachments, extraSystemPrompt));
+  }
+
+  private async sendWithPrivacy(sessionId: string, state: CodexSdkSessionState, payloadOrMessage: string | ProviderContextPayload, attachments?: TransportAttachment[], extraSystemPrompt?: string): Promise<void> {
     if (state.runningTurnId || state.runningCompact || state.turnStartInFlight || state.authRecoveryPending) {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Codex SDK session is already busy', true);
     }
-    await this.refreshAppServerForLatestAuth('send');
-    if (!this.config || !this.child) {
+    const channel = this.getChannelForSession(state);
+    if (channel.child) {
+      await this.refreshAppServerForLatestAuth('send', channel);
+    }
+    if (channel.kind === 'incognito') {
+      if (!this.config) {
+        throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server not connected', false);
+      }
+      if (!channel.child && !state.threadId) {
+        await this.ensureIncognitoChannelStarted();
+      }
+    } else if (!this.config || !channel.child) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server not connected', false);
     }
 
@@ -3101,7 +3221,7 @@ export class CodexSdkProvider implements TransportProvider {
     state.authRecoveryReplayUnsafe = false;
     let delegationRecoveryRetriesRemaining = CODEX_IM_DELEGATION_RECOVERY_RETRY_LIMIT;
     if (state.imcodesMcpRecoveryPromise) await state.imcodesMcpRecoveryPromise;
-    if (state.imcodesMcpRecoveryRequired && state.threadId) {
+    if (!state.incognito && state.imcodesMcpRecoveryRequired && state.threadId) {
       await this.recoverImcodesMcpAfterObservedClosure(sessionId, state, 'pre-turn-observed-closure');
     }
     for (;;) {
@@ -3142,7 +3262,7 @@ export class CodexSdkProvider implements TransportProvider {
       return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
     }
     try {
-      await this.request('turn/steer', {
+      await this.requestOnChannel(this.getChannelForSession(state), 'turn/steer', {
         threadId: state.threadId,
         expectedTurnId: turnId,
         clientUserMessageId: notification.notificationId,
@@ -3209,7 +3329,7 @@ export class CodexSdkProvider implements TransportProvider {
     }
     terminals.turnId = turnId;
     if (terminals.seen.has(turnId)) this.stopConfirmations.complete(terminals);
-    await this.request('turn/interrupt', { threadId: state.threadId, turnId }, CANCEL_INTERRUPT_TIMEOUT_MS);
+    await this.requestOnChannel(this.getChannelForSession(state), 'turn/interrupt', { threadId: state.threadId, turnId }, CANCEL_INTERRUPT_TIMEOUT_MS);
     // The shared confirmation waits for the parser's captured terminal source,
     // not this interrupt RPC receipt. Its expired outward wait can still accept
     // a late physical proof without reviving the cancelled start continuation.
@@ -3230,7 +3350,7 @@ export class CodexSdkProvider implements TransportProvider {
     if (state.runningCompact && state.compactCommandInFlight) {
       const turnId = state.runningTurnId;
       if (turnId) {
-        void this.request('turn/interrupt', {
+        void this.requestOnChannel(this.getChannelForSession(state), 'turn/interrupt', {
           threadId: state.threadId,
           turnId,
         }).catch(() => {});
@@ -3282,7 +3402,7 @@ export class CodexSdkProvider implements TransportProvider {
     // Fire-and-watchdog. Do not await turn/interrupt acknowledgement before
     // arming the local cancellation timer; an app-server/RPC hang must not
     // leave the UI stuck in "stopping" forever.
-    void this.request('turn/interrupt', {
+    void this.requestOnChannel(this.getChannelForSession(state), 'turn/interrupt', {
       threadId: state.threadId,
       turnId,
     }, CANCEL_INTERRUPT_TIMEOUT_MS).catch((err) => {
@@ -3372,46 +3492,59 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private handleAppServerDisconnect(
+    channel: CodexAppServerChannel,
     child: ChildProcessWithoutNullStreams,
     disconnectClass: Exclude<CodexAppServerDisconnectClass, 'intentional_shutdown' | 'no_current_work_disconnect'>,
     err: Error,
   ): void {
-    if (this.child !== child) return;
-    this.questions.releaseAll();
-    this.rejectPending(err);
+    if (channel.child !== child) return;
+    const channelSessions = this.getSessionsForChannel(channel);
+    for (const [sessionId] of channelSessions) {
+      this.questions.release(sessionId);
+    }
+    this.rejectChannelPending(channel, err);
     let emittedError = false;
-    for (const [sessionId, state] of this.sessions) {
+    for (const [sessionId, state] of channelSessions) {
       emittedError = this.settleSessionAfterAppServerDisconnect(sessionId, state, disconnectClass, err.message) || emittedError;
     }
     if (!emittedError) {
-      logger.info({ provider: this.id, disconnectClass }, 'Codex app-server disconnected with no current work');
+      logger.info({ provider: this.id, channel: channel.kind, disconnectClass }, 'Codex app-server disconnected with no current work');
     }
-    this.child = null;
-    this.rl = null;
-    this.appServerAuthFingerprint = null;
-    void this.reapAppServerGeneration(child);
+    channel.child = null;
+    channel.rl = null;
+    channel.authFingerprint = null;
+    void this.reapChannelGeneration(channel, child);
   }
 
-  private reapAppServerGeneration(child: ChildProcessWithoutNullStreams): Promise<void> {
-    if (this.appServerCleanup) return this.appServerCleanup;
+  private reapChannelGeneration(
+    channel: CodexAppServerChannel,
+    child: ChildProcessWithoutNullStreams,
+  ): Promise<void> {
+    if (channel.cleanup) return channel.cleanup;
     const cleanup = killProcessTree(child, { ownsProcessGroup: true }).catch((error) => {
-      logger.warn({ provider: this.id, err: error }, 'Codex app-server descendant cleanup failed');
+      logger.warn({ provider: this.id, channel: channel.kind, err: error }, 'Codex app-server descendant cleanup failed');
     });
     const tracked = cleanup.finally(() => {
-      if (this.appServerCleanup === tracked) this.appServerCleanup = null;
+      if (channel.cleanup === tracked) channel.cleanup = null;
     });
-    this.appServerCleanup = tracked;
+    channel.cleanup = tracked;
     return tracked;
   }
 
-  private async stopAppServer(options: { clearSessions: boolean }): Promise<void> {
-    this.questions.releaseAll();
-    this.rejectPending(new Error('Codex app-server disconnected'));
-    const child = this.child;
-    this.child = null;
-    this.rl?.close();
-    this.rl = null;
-    for (const [sessionId, state] of this.sessions) {
+  private async stopChannelAppServer(
+    channel: CodexAppServerChannel,
+    options: { clearSessions: boolean },
+  ): Promise<void> {
+    const channelSessions = this.getSessionsForChannel(channel);
+    for (const [sessionId] of channelSessions) {
+      this.questions.release(sessionId);
+    }
+    this.rejectChannelPending(channel, new Error('Codex app-server disconnected'));
+    const child = channel.child;
+    channel.child = null;
+    channel.rl?.close();
+    channel.rl = null;
+    for (const [sessionId, state] of channelSessions) {
       this.clearCancelTimer(state);
       this.clearActiveTurnLease(state);
       this.clearCompactTimers(state);
@@ -3427,20 +3560,23 @@ export class CodexSdkProvider implements TransportProvider {
     // `child.kill('SIGTERM')` only terminates the node wrapper; the native
     // codex binary it spawned lives on and leaks ~60MB per abandoned pair.
     // Walk the descendant tree and tree-kill instead.
-    if (child) await this.reapAppServerGeneration(child);
+    if (child) await this.reapChannelGeneration(channel, child);
     // A prior EOF/crash may have already detached the generation from
-    // `this.child`; wait for its process-tree cleanup before a replacement is
+    // `channel.child`; wait for its process-tree cleanup before a replacement is
     // spawned.  This closes the race that otherwise accumulated PPID=1 MCP
     // children across reconnect/auth-restart loops.
-    if (this.appServerCleanup) await this.appServerCleanup;
-    this.threadToSession.clear();
-    this.rawSpawnAgentCalls.clear();
-    this.rawNativeCollabCalls.clear();
-    this.trackedSubagentThreads.clear();
-    this.appServerAuthFingerprint = null;
+    if (channel.cleanup) await channel.cleanup;
+    channel.threadToSession.clear();
+    if (channel.kind === 'normal') {
+      this.rawSpawnAgentCalls.clear();
+      this.rawNativeCollabCalls.clear();
+      this.trackedSubagentThreads.clear();
+    }
+    channel.authFingerprint = null;
     if (options.clearSessions) {
-      this.sessions.clear();
-      this.config = null;
+      for (const [sessionId] of channelSessions) {
+        this.sessions.delete(sessionId);
+      }
     }
   }
 
@@ -3590,17 +3726,45 @@ export class CodexSdkProvider implements TransportProvider {
     return recovery;
   }
 
-  private async startAppServer(
+  private async readIncognitoEnabledImcodesMcpKeys(
+    channel: CodexAppServerChannel,
+    cwd?: string,
+  ): Promise<string[]> {
+    const result = await this.requestOnChannel(channel, 'config/read', {
+      includeLayers: false,
+      ...(cwd ? { cwd } : {}),
+    }, CODEX_IM_MCP_PROBE_TIMEOUT_MS) as unknown;
+    if (!isRecord(result) || !isRecord(result.config) || !isRecord(result.config.mcp_servers)) {
+      throw new Error('Incognito session blocked: invalid Codex config/read response');
+    }
+    return findEnabledImcodesMcpKeysFromConfig(result.config.mcp_servers);
+  }
+
+  private async startChannelAppServer(
+    channel: CodexAppServerChannel,
     binaryPath: string,
     config: ProviderConfig,
     options: { clearSessions: boolean },
+    allowIncognitoConfigRetry = true,
   ): Promise<void> {
-    await this.stopAppServer({ clearSessions: options.clearSessions }).catch(() => {});
+    await this.stopChannelAppServer(channel, { clearSessions: options.clearSessions }).catch(() => {});
     // Resolve npm .cmd shims into (node.exe, [scriptPath]) so spawn works
     // without shell:true (which has its own quoting issues on Windows).
     const resolved = resolveExecutableForSpawn(binaryPath);
-    const args = [...resolved.prependArgs, ...getCodexAppServerArgs()];
     const spawnEnv = this.buildSpawnEnv(config);
+    let disabledIncognitoKeys: string[] = [];
+    if (channel.kind === 'incognito') {
+      const configTomlPath = resolve(getCodexHome(spawnEnv), 'config.toml');
+      const tomlKeys = await readFile(configTomlPath, 'utf8')
+        .then((text) => collectCodexTomlMcpServerKeysForIncognito(text))
+        .catch(() => []);
+      disabledIncognitoKeys = [...new Set([...channel.disabledMcpKeys, ...tomlKeys])];
+      channel.disabledMcpKeys = disabledIncognitoKeys;
+    }
+    const channelArgs = channel.kind === 'incognito'
+      ? getCodexIncognitoAppServerArgs(disabledIncognitoKeys)
+      : getCodexAppServerArgs();
+    const args = [...resolved.prependArgs, ...channelArgs];
     const authFingerprint = await readCodexAuthFingerprint(spawnEnv);
     const child = spawn(resolved.executable, args, {
       // Own process group and session on POSIX. A reparented descendant keeps
@@ -3612,66 +3776,110 @@ export class CodexSdkProvider implements TransportProvider {
       env: spawnEnv,
       windowsHide: true,
     });
-    this.appServerGeneration += 1;
-    this.child = child;
-    this.rl = readline.createInterface({ input: gateChildStream(child.stdout) });
-    this.rl.on('line', (line) => this.handleLine(child, line));
-    this.rl.on('close', () => {
-      if (this.child !== child) return;
-      this.handleAppServerDisconnect(child, 'unexpected_eof', new Error('Codex app-server stdout closed'));
+    channel.generation += 1;
+    channel.child = child;
+    channel.rl = readline.createInterface({ input: gateChildStream(child.stdout) });
+    channel.rl.on('line', (line) => this.handleLine(channel, child, line));
+    channel.rl.on('close', () => {
+      if (channel.child !== child) return;
+      this.handleAppServerDisconnect(channel, child, 'unexpected_eof', new Error('Codex app-server stdout closed'));
     });
     child.stderr.on('data', (chunk) => {
       const text = chunk.toString();
-      if (text.trim()) logger.debug({ provider: this.id, stderr: text.trim() }, 'Codex app-server stderr');
+      if (text.trim()) logger.debug({ provider: this.id, channel: channel.kind, stderr: text.trim() }, 'Codex app-server stderr');
     });
     child.on('exit', (code) => {
-      if (this.child !== child) return;
-      this.handleAppServerDisconnect(child, 'unexpected_crash', new Error(`Codex app-server exited with code ${code ?? 'unknown'}`));
+      if (channel.child !== child) return;
+      this.handleAppServerDisconnect(channel, child, 'unexpected_crash', new Error(`Codex app-server exited with code ${code ?? 'unknown'}`));
     });
     // CRITICAL: must listen for 'error' or spawn failures (e.g. ENOENT) become
     // uncaughtException and crash the daemon.
     child.on('error', (err) => {
-      if (this.child !== child) return;
-      logger.error({ provider: this.id, err }, 'Codex app-server spawn error');
-      this.handleAppServerDisconnect(child, 'unexpected_crash', err);
+      if (channel.child !== child) return;
+      logger.error({ provider: this.id, channel: channel.kind, err }, 'Codex app-server spawn error');
+      this.handleAppServerDisconnect(channel, child, 'unexpected_crash', err);
     });
 
     try {
-      await this.request('initialize', {
+      await this.requestOnChannel(channel, 'initialize', {
         clientInfo: { name: 'imcodes', title: 'IM.codes', version: '0.1.0' },
         capabilities: { experimentalApi: true },
       }, CODEX_APP_SERVER_INITIALIZE_TIMEOUT_MS);
-      this.notify('initialized', {});
+      this.notifyOnChannel(channel, 'initialized', {});
       this.config = config;
-      this.appServerAuthFingerprint = authFingerprint;
+      channel.authFingerprint = authFingerprint;
+      if (channel.kind === 'incognito') {
+        const remainingEnabled = await this.readIncognitoEnabledImcodesMcpKeys(channel);
+        if (remainingEnabled.length > 0) {
+          const merged = [...new Set([...disabledIncognitoKeys, ...remainingEnabled])];
+          const discoveredNew = remainingEnabled.some((key) => !disabledIncognitoKeys.includes(key));
+          if (allowIncognitoConfigRetry && discoveredNew) {
+            channel.disabledMcpKeys = merged;
+            await this.startChannelAppServer(channel, binaryPath, config, options, false);
+            return;
+          }
+          throw new Error('Incognito session blocked: IM.codes memory MCP could not be disabled at Codex app-server boundary');
+        }
+      }
     } catch (err) {
-      await this.stopAppServer({ clearSessions: options.clearSessions }).catch(() => {});
+      await this.stopChannelAppServer(channel, { clearSessions: options.clearSessions }).catch(() => {});
       throw err;
     }
   }
 
-  private async refreshAppServerForLatestAuth(reason: string): Promise<void> {
-    if (this.appServerRestart) await this.appServerRestart;
-    if (!this.config || !this.child) return;
-    const current = await readCodexAuthFingerprint(this.buildSpawnEnv(this.config));
-    if (current === this.appServerAuthFingerprint) return;
-    logger.info({
-      provider: this.id,
-      reason,
-      previousAuthPresent: this.appServerAuthFingerprint !== null,
-      currentAuthPresent: current !== null,
-    }, 'Codex auth file changed; restarting app-server to load latest authentication');
-    await this.restartAppServerPreservingSessions(reason);
+  private async ensureIncognitoChannelStarted(): Promise<void> {
+    if (this.incognitoChannel.restart) await this.incognitoChannel.restart;
+    if (this.incognitoChannel.startInFlight) {
+      await this.incognitoChannel.startInFlight;
+      return;
+    }
+    if (this.incognitoChannel.child?.stdin.writable) return;
+    const config = this.config;
+    if (!config) {
+      throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server not connected', false);
+    }
+    const binaryPath = this.resolveBinaryPath(config);
+    const startPromise = this.startChannelAppServer(this.incognitoChannel, binaryPath, config, { clearSessions: false })
+      .finally(() => {
+        if (this.incognitoChannel.startInFlight === startPromise) {
+          this.incognitoChannel.startInFlight = null;
+        }
+      });
+    this.incognitoChannel.startInFlight = startPromise;
+    await startPromise;
   }
 
-  private async restartAppServerPreservingSessions(_reason: string, recoverySessionId?: string): Promise<void> {
-    if (this.appServerRestart) return this.appServerRestart;
+  private async refreshAppServerForLatestAuth(
+    reason: string,
+    channel: CodexAppServerChannel = this.normalChannel,
+  ): Promise<void> {
+    if (channel.restart) await channel.restart;
+    if (!this.config || !channel.child) return;
+    const current = await readCodexAuthFingerprint(this.buildSpawnEnv(this.config));
+    if (current === channel.authFingerprint) return;
+    logger.info({
+      provider: this.id,
+      channel: channel.kind,
+      reason,
+      previousAuthPresent: channel.authFingerprint !== null,
+      currentAuthPresent: current !== null,
+    }, 'Codex auth file changed; restarting app-server to load latest authentication');
+    await this.restartAppServerPreservingSessions(reason, undefined, channel);
+  }
+
+  private async restartAppServerPreservingSessions(
+    _reason: string,
+    recoverySessionId?: string,
+    channel: CodexAppServerChannel = this.normalChannel,
+  ): Promise<void> {
+    if (channel.restart) return channel.restart;
     const config = this.config;
     if (!config) return;
-    const activeSessionIds = this.getActiveWorkSessionIds(recoverySessionId);
+    const activeSessionIds = this.getActiveWorkSessionIds(recoverySessionId, channel);
     if (activeSessionIds.length > 0) {
       logger.warn({
         provider: this.id,
+        channel: channel.kind,
         reason: _reason,
         activeSessionCount: activeSessionIds.length,
         activeSessionIds: activeSessionIds.slice(0, 10),
@@ -3688,26 +3896,28 @@ export class CodexSdkProvider implements TransportProvider {
       );
     }
     const binaryPath = this.resolveBinaryPath(config);
-    this.appServerRestart = (async () => {
-      await this.startAppServer(binaryPath, config, { clearSessions: false });
+    channel.restart = (async () => {
+      await this.startChannelAppServer(channel, binaryPath, config, { clearSessions: false });
     })().finally(() => {
-      this.appServerRestart = null;
+      channel.restart = null;
     });
-    return this.appServerRestart;
+    return channel.restart;
   }
 
   private async restartAppServerAfterAuthFailure(
     reason: string,
     error: ProviderError,
     recoverySessionId?: string,
+    channel: CodexAppServerChannel = this.normalChannel,
   ): Promise<void> {
     logger.warn({
       provider: this.id,
+      channel: channel.kind,
       reason,
       code: error.code,
       message: error.message,
     }, 'Codex app-server authentication failed; restarting to load latest authentication');
-    await this.restartAppServerPreservingSessions(reason, recoverySessionId);
+    await this.restartAppServerPreservingSessions(reason, recoverySessionId, channel);
   }
 
   private clearCodexAuthRecoveryState(state: CodexSdkSessionState): void {
@@ -3768,7 +3978,7 @@ export class CodexSdkProvider implements TransportProvider {
       label: 'Refreshing Codex authentication...',
     });
     try {
-      await this.restartAppServerAfterAuthFailure(reason, error, sessionId);
+      await this.restartAppServerAfterAuthFailure(reason, error, sessionId, this.getChannelForSession(state));
     } catch (restartErr) {
       if (
         this.sessions.get(sessionId) !== state
@@ -3852,7 +4062,7 @@ export class CodexSdkProvider implements TransportProvider {
       // An existing thread may be bound to an IM MCP process that is already
       // gone (a resume of a loaded thread never respawns it). A thread started
       // just now spawned a fresh server and has nothing to heal.
-      if (reusesExistingThread && !state.imcodesMcpRecoveryRequired) {
+      if (!state.incognito && reusesExistingThread && !state.imcodesMcpRecoveryRequired) {
         await this.healImcodesMcpIfTransportDead(sessionId, state);
       }
       // A Brain must not begin a turn unless IM delegation is authoritatively
@@ -3860,7 +4070,7 @@ export class CodexSdkProvider implements TransportProvider {
       // fallback, so starting anyway would strand the user's delegation. The
       // snapshot is re-verified per Brain turn -- a cached `ready` can outlive a
       // restart, config change or tools-list invalidation.
-      if (payload.sessionRole === 'brain' && state.threadId) {
+      if (!state.incognito && payload.sessionRole === 'brain' && state.threadId) {
         await this.assertImcodesDelegationReady(state.threadId);
       }
       await this.prepareGeneratedImageTracking(sessionId, state);
@@ -3874,7 +4084,7 @@ export class CodexSdkProvider implements TransportProvider {
       // the session's own directory again: nothing needs undoing when a pair ends.
       state.turnCwd = payload.turnCwd;
       this.refreshActiveTurnLease(sessionId, state, { strong: true, turnStartInFlight: true });
-      const result = await this.request('turn/start', {
+      const result = await this.requestOnChannel(this.getChannelForSession(state), 'turn/start', {
         threadId: state.threadId,
         input: [{ type: 'text', text: inputText }],
         cwd: payload.turnCwd ?? state.cwd,
@@ -3950,7 +4160,8 @@ export class CodexSdkProvider implements TransportProvider {
         return;
       }
       if (
-        missingRolloutRecoveryRetriesRemaining > 0
+        !state.incognito
+        && missingRolloutRecoveryRetriesRemaining > 0
         && authReplaySafe
         && isCodexThreadNeverMaterializedError(error)
         && this.sessions.get(sessionId) === state
@@ -3979,12 +4190,13 @@ export class CodexSdkProvider implements TransportProvider {
         return;
       }
       if (
-        activeWriterRecoveryRetriesRemaining > 0
+        !state.incognito
+        && activeWriterRecoveryRetriesRemaining > 0
         && authReplaySafe
         && /already has an active writer/i.test(error.message)
       ) {
         const conflictedThreadId = state.threadId;
-        if (conflictedThreadId) this.threadToSession.delete(conflictedThreadId);
+        if (conflictedThreadId) this.getChannelForSession(state).threadToSession.delete(conflictedThreadId);
         state.threadId = undefined;
         state.loaded = false;
         state.currentText = '';
@@ -4024,7 +4236,12 @@ export class CodexSdkProvider implements TransportProvider {
           return;
         }
         if (!authReplaySafe && authRecoveryRetriesRemaining > 0) {
-          void this.restartAppServerAfterAuthFailure('start-turn-unsafe-replay', error, sessionId).catch((restartErr) => {
+          void this.restartAppServerAfterAuthFailure(
+            'start-turn-unsafe-replay',
+            error,
+            sessionId,
+            this.getChannelForSession(state),
+          ).catch((restartErr) => {
             logger.warn({ provider: this.id, err: restartErr }, 'Codex app-server auth refresh restart failed');
           });
           this.emitCodexAuthRecoveryError(
@@ -4074,7 +4291,7 @@ export class CodexSdkProvider implements TransportProvider {
         label: 'Compacting context...',
       });
       this.armCompactHardTimeout(sessionId, state);
-      const result = await this.request('thread/compact/start', {
+      const result = await this.requestOnChannel(this.getChannelForSession(state), 'thread/compact/start', {
         threadId: state.threadId,
       }, COMPACT_START_ACCEPT_TIMEOUT_MS);
       // Some Codex app-server builds accept `thread/compact/start` as a
@@ -4102,6 +4319,12 @@ export class CodexSdkProvider implements TransportProvider {
 
   private async ensureThreadLoaded(sessionId: string, state: CodexSdkSessionState, payload?: ProviderContextPayload): Promise<void> {
     if (state.threadId && state.loaded) return;
+    if (state.incognito && state.threadId) {
+      throw new Error('Incognito conversation ended; start a new session instead of resuming history.');
+    }
+    if (state.incognito && !this.incognitoChannel.child?.stdin.writable) {
+      await this.ensureIncognitoChannelStarted();
+    }
 
     // Always send `baseInstructions`. Catalog models get codex's full
     // per-model prompt (lifted from `~/.codex/models_cache.json`); unknown
@@ -4147,7 +4370,7 @@ export class CodexSdkProvider implements TransportProvider {
             ? 'Codex SDK stored thread has no rollout; starting replacement thread'
             : 'Codex SDK stored thread history is unreadable; starting replacement thread',
         );
-        if (oldThreadId) this.threadToSession.delete(oldThreadId);
+        if (oldThreadId) this.getChannelForSession(state).threadToSession.delete(oldThreadId);
         state.threadId = undefined;
         state.loaded = false;
       }
@@ -4158,14 +4381,18 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private async resumeThread(sessionId: string, state: CodexSdkSessionState, baseInstructions: string): Promise<void> {
+    if (state.incognito) {
+      throw new Error('Incognito conversation ended; start a new session instead of resuming history.');
+    }
     if (!state.threadId) throw new Error('Codex SDK resume requested without a thread id');
     // Resume must carry the same `baseInstructions`: previously-broken
     // threads were persisted with empty base_instructions, and codex's
     // resolution priority (override > stored history > model default)
     // means supplying it on resume is the only way to repair them
     // mid-flight.
+    const channel = this.getChannelForSession(state);
     const threadConfigParams = this.sessionThreadConfigParams(state, false);
-    const result = await this.request('thread/resume', {
+    const result = await this.requestOnChannel(channel, 'thread/resume', {
       threadId: state.threadId,
       ...this.sessionEnvironmentParams(state),
       ...threadConfigParams,
@@ -4183,7 +4410,7 @@ export class CodexSdkProvider implements TransportProvider {
     }, 'codex-sdk: thread resumed with baseInstructions');
     state.threadId = resumedId;
     state.loaded = true;
-    this.threadToSession.set(resumedId, sessionId);
+    channel.threadToSession.set(resumedId, sessionId);
     this.emitSessionInfo(sessionId, { resumeId: resumedId, ...(state.model ? { model: state.model } : {}) });
   }
 
@@ -4194,12 +4421,30 @@ export class CodexSdkProvider implements TransportProvider {
     const fenced = this.nativeAgentFence.required(sessionId, state.imcodesSessionName);
     const fence = fenceOf(fenced);
     state.pendingThreadFence = fence;
-    const threadConfigParams = this.sessionThreadConfigParams(state, fenced);
+    const channel = this.getChannelForSession(state);
+    let threadConfigParams = this.sessionThreadConfigParams(state, fenced);
+    if (state.incognito) {
+      const cwdEnabledKeys = await this.readIncognitoEnabledImcodesMcpKeys(channel, state.cwd);
+      if (cwdEnabledKeys.length > 0) {
+        const existingCfg = isRecord(threadConfigParams.config) ? { ...threadConfigParams.config } : {};
+        const disableMap: Record<string, { enabled: false }> = {};
+        // Passing config.mcp_servers on thread/start replaces the CLI -c mcp_servers layer in Codex,
+        // so re-assert every channel-disabled key alongside project cwd-discovered keys.
+        for (const key of [...channel.disabledMcpKeys, ...cwdEnabledKeys]) {
+          disableMap[key] = { enabled: false };
+        }
+        threadConfigParams = {
+          ...threadConfigParams,
+          config: { ...existingCfg, mcp_servers: disableMap },
+        };
+      }
+    }
     try {
-      const result = await this.request('thread/start', {
+      const result = await this.requestOnChannel(channel, 'thread/start', {
         cwd: state.cwd,
         ...this.sessionEnvironmentParams(state),
         ...threadConfigParams,
+        ...(state.incognito ? { ephemeral: true } : {}),
         approvalPolicy: 'never',
         sandbox: 'danger-full-access',
         personality: 'none',
@@ -4213,8 +4458,13 @@ export class CodexSdkProvider implements TransportProvider {
       state.threadId = threadId;
       state.nativeAgentFence = { threadId, fence };
       state.loaded = true;
-      this.threadToSession.set(threadId, sessionId);
-      this.emitSessionInfo(sessionId, { resumeId: threadId, ...(state.model ? { model: state.model } : {}) });
+      channel.threadToSession.set(threadId, sessionId);
+      if (!state.incognito || state.model) {
+        this.emitSessionInfo(sessionId, {
+          ...(!state.incognito ? { resumeId: threadId } : {}),
+          ...(state.model ? { model: state.model } : {}),
+        });
+      }
     } finally {
       state.pendingThreadFence = undefined;
     }
@@ -4239,6 +4489,7 @@ export class CodexSdkProvider implements TransportProvider {
         ?? this.nativeAgentFence.nextLaunchFence(providerSessionId, state.imcodesSessionName);
     }
     if (state.nativeAgentFence?.threadId === threadId) return state.nativeAgentFence.fence;
+    if (state.incognito) return state.pendingThreadFence ?? NATIVE_AGENT_FENCES.PROVIDER_DEFAULT;
     const fence = await readCodexThreadNativeAgentFence(threadId, { env: state.env });
     // Cache only a proven fence, and only for the thread that was read.
     if (fence === NATIVE_AGENT_FENCES.DISABLED
@@ -4276,6 +4527,7 @@ export class CodexSdkProvider implements TransportProvider {
   ): { config?: Record<string, unknown>; modelProvider?: string } {
     const rawMcp = fenced ? withCodexNativeAgentFence(state.mcpConfig) : (state.mcpConfig ?? {});
     const baseConfig = rawMcp ? { ...rawMcp } : {};
+    if (state.incognito) delete baseConfig.mcp_servers;
     const provider = state.customModelProvider;
     if (!provider) {
       return Object.keys(baseConfig).length > 0 ? { config: baseConfig } : {};
@@ -4360,11 +4612,11 @@ export class CodexSdkProvider implements TransportProvider {
     return freshPaths;
   }
 
-  private handleLine(child: ChildProcessWithoutNullStreams, line: string): void {
+  private handleLine(channel: CodexAppServerChannel, child: ChildProcessWithoutNullStreams, line: string): void {
     // A prior app-server generation can still have already-buffered stdout
     // callbacks after restart. Thread ids are deliberately preserved across
     // restart, so threadToSession alone cannot distinguish those stale events.
-    if (this.child !== child) return;
+    if (channel.child !== child) return;
     const trimmed = line.trim();
     if (!trimmed) return;
     let msg: JsonRpcResponse;
@@ -4373,17 +4625,18 @@ export class CodexSdkProvider implements TransportProvider {
     } catch (err) {
       const runtimeSubagentPayload = parseCodexRuntimeSubagentTag(trimmed);
       if (runtimeSubagentPayload) {
-        this.emitRuntimeSubagentNotification(runtimeSubagentPayload);
+        this.emitRuntimeSubagentNotification(channel, runtimeSubagentPayload);
         return;
       }
       const requestId = extractMalformedJsonRpcRequestId(trimmed);
-      const pending = requestId === null ? undefined : this.pendingRequests.get(requestId);
+      const pending = requestId === null ? undefined : channel.pendingRequests.get(requestId);
       if (pending && requestId !== null) {
-        this.pendingRequests.delete(requestId);
+        channel.pendingRequests.delete(requestId);
         pending.reject(new CodexMalformedRpcResponseError(requestId, pending.method));
       }
       logger.warn({
         provider: this.id,
+        channel: channel.kind,
         lineSummary: requestId === null
           ? (trimmed.startsWith('{') ? 'malformed JSON object' : 'non-JSON app-server output')
           : 'malformed JSON-RPC response with numeric request id',
@@ -4400,14 +4653,14 @@ export class CodexSdkProvider implements TransportProvider {
     // Server-originated requests have their OWN id namespace. Check method
     // first or a question can consume an unrelated outbound RPC with that id.
     if (msg.method === CODEX_USER_INPUT_METHOD && (typeof msg.id === 'number' || typeof msg.id === 'string')) {
-      this.handleUserInputRequest(child, msg.id, msg.params ?? {});
+      this.handleUserInputRequest(channel, child, msg.id, msg.params ?? {});
       return;
     }
 
     if (typeof msg.id === 'number' && !msg.method) {
-      const pending = this.pendingRequests.get(msg.id);
+      const pending = channel.pendingRequests.get(msg.id);
       if (!pending) return;
-      this.pendingRequests.delete(msg.id);
+      channel.pendingRequests.delete(msg.id);
       if (msg.error) {
         pending.reject(new CodexRpcResponseError(msg.error.message ?? 'Codex app-server request failed'));
       } else {
@@ -4417,8 +4670,8 @@ export class CodexSdkProvider implements TransportProvider {
     }
 
     if (!msg.method) return;
-    void this.handleNotification(msg.method, msg.params ?? {}).catch((err) => {
-      logger.warn({ provider: this.id, method: msg.method, err }, 'Codex app-server notification handler failed');
+    void this.handleNotification(channel, msg.method, msg.params ?? {}).catch((err) => {
+      logger.warn({ provider: this.id, channel: channel.kind, method: msg.method, err }, 'Codex app-server notification handler failed');
     });
   }
 
@@ -4431,8 +4684,13 @@ export class CodexSdkProvider implements TransportProvider {
     return false;
   }
 
-  private handleUserInputRequest(child: ChildProcessWithoutNullStreams, id: number | string, params: Record<string, any>): void {
-    const sessionId = this.threadToSession.get(params.threadId);
+  private handleUserInputRequest(
+    channel: CodexAppServerChannel,
+    child: ChildProcessWithoutNullStreams,
+    id: number | string,
+    params: Record<string, any>,
+  ): void {
+    const sessionId = this.getSessionIdForThread(channel, params.threadId);
     const state = sessionId ? this.sessions.get(sessionId) : undefined;
     const questions: CodexUserInputQuestion[] = Array.isArray(params.questions) ? params.questions : [];
     const validQuestions = questions.length > 0 && questions.every(q => q && typeof q.id === 'string' && q.id.length > 0
@@ -4454,27 +4712,28 @@ export class CodexSdkProvider implements TransportProvider {
     void waiting.then(result => {
       if (this.questionInputs.get(sessionId) === input) this.questionInputs.delete(sessionId);
       // A response must never leak into a replacement app-server generation.
-      if (this.child === child && child.stdin.writable) child.stdin.write(`${JSON.stringify({ id, result })}\n`);
+      if (channel.child === child && child.stdin.writable) child.stdin.write(`${JSON.stringify({ id, result })}\n`);
     });
     // Reuse the existing question-card relay and ask.answer control path.
-    for (const cb of this.toolCallCallbacks) cb(sessionId, {
+    this.emitToolCall(sessionId, {
       id: params.itemId, name: INTERACTIVE_QUESTION_TOOL_NAME, status: 'complete', input: { questions },
     });
   }
 
-  private resolveRuntimeSubagentSession(params: Record<string, any>): string | undefined {
+  private resolveRuntimeSubagentSession(channel: CodexAppServerChannel, params: Record<string, any>): string | undefined {
     const threadId = readParamThreadId(params);
-    if (threadId) return this.threadToSession.get(threadId);
-    const activeSessions = [...this.sessions.entries()]
+    if (threadId) return this.getSessionIdForThread(channel, threadId);
+    const channelSessions = this.getSessionsForChannel(channel);
+    const activeSessions = channelSessions
       .filter(([, state]) => state.runningTurnId || state.runningCompact)
       .map(([sessionId]) => sessionId);
     if (activeSessions.length === 1) return activeSessions[0];
-    if (this.sessions.size === 1) return [...this.sessions.keys()][0];
+    if (channelSessions.length === 1) return channelSessions[0]![0];
     return undefined;
   }
 
-  private emitRuntimeSubagentNotification(params: Record<string, any>): void {
-    const sessionId = this.resolveRuntimeSubagentSession(params);
+  private emitRuntimeSubagentNotification(channel: CodexAppServerChannel, params: Record<string, any>): void {
+    const sessionId = this.resolveRuntimeSubagentSession(channel, params);
     const state = sessionId ? this.sessions.get(sessionId) : null;
     if (!sessionId || !state) return;
     if (state.cancelled) return;
@@ -4497,7 +4756,7 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private async readRawChecklistHistoryChunk(state: CodexSdkSessionState): Promise<string | null> {
-    if (!state.threadId) return null;
+    if (state.incognito || !state.threadId) return null;
     const providerEnv = (this.config?.env as Record<string, string> | undefined) ?? {};
     const env = { ...process.env, ...providerEnv, ...(state.env ?? {}) };
     const rolloutPath = state.rawChecklistRolloutPath ?? await findCodexRolloutPathByUuid(state.threadId, { env });
@@ -4563,12 +4822,12 @@ export class CodexSdkProvider implements TransportProvider {
       if (!tool) continue;
       if (state.rawChecklistSeenCallIds.has(tool.id)) continue;
       state.rawChecklistSeenCallIds.add(tool.id);
-      for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
+      this.emitToolCall(sessionId, tool);
     }
   }
 
   private queueRawChecklistHistoryScan(sessionId: string, state: CodexSdkSessionState): void {
-    if (!state.threadId || state.rawChecklistScanPromise) return;
+    if (state.incognito || !state.threadId || state.rawChecklistScanPromise) return;
     state.rawChecklistScanPromise = this.scanRawChecklistHistory(sessionId, state)
       .catch((err) => logger.debug({ provider: this.id, sessionId, threadId: state.threadId, err }, 'Codex SDK raw checklist history scan failed'))
       .finally(() => {
@@ -4583,7 +4842,7 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private armRawChecklistPolling(sessionId: string, state: CodexSdkSessionState): void {
-    if (!state.threadId) return;
+    if (state.incognito || !state.threadId) return;
     state.rawChecklistPollUntil = Date.now() + CODEX_RAW_CHECKLIST_POLL_WINDOW_MS;
     if (state.rawChecklistPollTimer) return;
     const tick = () => {
@@ -4604,7 +4863,7 @@ export class CodexSdkProvider implements TransportProvider {
   // Dedicated fast poll so a zombie turn is settled from rollout evidence within
   // a few seconds instead of waiting for the next ~20s thread/read heartbeat.
   private armRolloutSettlePoll(sessionId: string, state: CodexSdkSessionState): void {
-    if (!state.threadId) return;
+    if (state.incognito || !state.threadId) return;
     if (state.rolloutSettlePollTimer) return;
     const tick = () => {
       state.rolloutSettlePollTimer = null;
@@ -4653,7 +4912,7 @@ export class CodexSdkProvider implements TransportProvider {
   // check on arm also self-heals a turn whose `task_complete` was already on disk
   // (e.g. the app-server went silent, or the record landed between events).
   private armRolloutAuthorityWatch(sessionId: string, state: CodexSdkSessionState, turnId: string | undefined): void {
-    if (!turnId || !state.threadId) return;
+    if (state.incognito || !turnId || !state.threadId) return;
     if (state.cancelled || state.runningCompact) return;
     if (this.isClosedCodexTurn(state, turnId)) return;
     // Already watching this exact turn — cheap no-op (called on every activity).
@@ -4803,7 +5062,7 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private queueChildSubagentRolloutScan(sessionId: string, state: CodexSdkSessionState): void {
-    if (!state.threadId || state.childSubagentRolloutScanPromise) return;
+    if (state.incognito || !state.threadId || state.childSubagentRolloutScanPromise) return;
     state.childSubagentRolloutScanPromise = this.scanChildSubagentRollouts(sessionId, state)
       .catch((err) => logger.debug({ provider: this.id, sessionId, threadId: state.threadId, err }, 'Codex SDK child subagent rollout scan failed'))
       .finally(() => {
@@ -4812,7 +5071,7 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private armChildSubagentRolloutPolling(sessionId: string, state: CodexSdkSessionState): void {
-    if (!state.threadId) return;
+    if (state.incognito || !state.threadId) return;
     state.childSubagentRolloutPollUntil = Date.now() + CODEX_CHILD_SUBAGENT_ROLLOUT_POLL_WINDOW_MS;
     this.queueChildSubagentRolloutScan(sessionId, state);
     if (state.childSubagentRolloutTimer) return;
@@ -4835,7 +5094,7 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private async scanChildSubagentRollouts(sessionId: string, state: CodexSdkSessionState): Promise<void> {
-    if (!state.threadId) return;
+    if (state.incognito || !state.threadId) return;
     const providerEnv = (this.config?.env as Record<string, string> | undefined) ?? {};
     const env = { ...process.env, ...providerEnv, ...(state.env ?? {}) };
     const discovered = await discoverCodexChildSubagentRolloutSnapshots(
@@ -4911,9 +5170,9 @@ export class CodexSdkProvider implements TransportProvider {
     }
   }
 
-  private handleRawResponseItem(params: Record<string, any>): boolean {
+  private handleRawResponseItem(channel: CodexAppServerChannel, params: Record<string, any>): boolean {
     const threadId = readParamThreadId(params);
-    const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
+    const sessionId = this.getSessionIdForThread(channel, threadId);
     const state = sessionId ? this.sessions.get(sessionId) : null;
     const item = isRecord(params.item) ? params.item : undefined;
     if (!sessionId || !state || !item) return false;
@@ -5001,7 +5260,7 @@ export class CodexSdkProvider implements TransportProvider {
       const checklistTool = rawChecklistToolFromFunctionCall(sessionId, item);
       if (checklistTool) {
         state.rawChecklistSeenCallIds.add(checklistTool.id);
-        for (const cb of this.toolCallCallbacks) cb(sessionId, checklistTool);
+        this.emitToolCall(sessionId, checklistTool);
         return true;
       }
       if (name && CODEX_NATIVE_COLLAB_FUNCTION_NAMES.has(name)) {
@@ -5069,7 +5328,7 @@ export class CodexSdkProvider implements TransportProvider {
     const outputRecord = parseJsonRecord(item.output) ?? {};
     const tool = rawSpawnAgentToolFromOutput(call, outputRecord);
     if (tool) {
-      for (const cb of this.toolCallCallbacks) cb(call.sessionId, tool);
+      this.emitToolCall(call.sessionId, tool);
     }
 
     const agentId = readRawSpawnAgentId(outputRecord);
@@ -5124,7 +5383,7 @@ export class CodexSdkProvider implements TransportProvider {
       backgrounded: true,
     });
     if (!tool) return null;
-    for (const cb of this.toolCallCallbacks) cb(tracked.sessionId, tool);
+    this.emitToolCall(tracked.sessionId, tool);
     return tool;
   }
 
@@ -5178,8 +5437,9 @@ export class CodexSdkProvider implements TransportProvider {
     return true;
   }
 
-  private async handleNotification(method: string, params: Record<string, any>): Promise<void> {
+  private async handleNotification(channel: CodexAppServerChannel, method: string, params: Record<string, any>): Promise<void> {
     if (method === CODEX_MCP_RPC_METHOD.STATUS_UPDATED) {
+      if (channel.kind === 'incognito') return;
       if (meaningfulString(params.name) !== IMCODES_DELEGATION_MCP_SERVER
         || !CODEX_MCP_TERMINAL_STARTUP_STATUS.has(meaningfulString(params.status) ?? '')) return;
       const threadId = meaningfulString(params.threadId);
@@ -5187,6 +5447,7 @@ export class CodexSdkProvider implements TransportProvider {
         ? [...this.sessions.entries()].filter(([, state]) => state.threadId === threadId)
         : [...this.sessions.entries()];
       for (const [, state] of targets) {
+        if (state.incognito) continue;
         // Never reload underneath an in-flight model turn. The startup event
         // only invalidates this thread's MCP generation; the next explicit
         // send performs the bounded reload + complete catalog hydration before
@@ -5199,24 +5460,26 @@ export class CodexSdkProvider implements TransportProvider {
     if (method === 'thread/started') {
       const threadId = params.thread?.id;
       if (!threadId) return;
-      const sessionId = this.threadToSession.get(threadId);
+      const sessionId = this.getSessionIdForThread(channel, threadId);
       if (!sessionId) return;
       const state = this.sessions.get(sessionId);
       if (!state) return;
       state.threadId = threadId;
       state.loaded = true;
       this.adoptServiceTier(sessionId, state, params.thread?.serviceTier);
-      this.emitSessionInfo(sessionId, {
-        resumeId: threadId,
-        ...(state.model ? { model: state.model } : {}),
-        ...(state.serviceTier ? { serviceTier: state.serviceTier } : {}),
-      });
+      if (!state.incognito || state.model || state.serviceTier) {
+        this.emitSessionInfo(sessionId, {
+          ...(!state.incognito ? { resumeId: threadId } : {}),
+          ...(state.model ? { model: state.model } : {}),
+          ...(state.serviceTier ? { serviceTier: state.serviceTier } : {}),
+        });
+      }
       return;
     }
 
     if (method === 'thread/settings/updated') {
       const threadId = readParamThreadId(params);
-      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
+      const sessionId = this.getSessionIdForThread(channel, threadId);
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
       // Fast can be switched on from the Codex TUI or the ChatGPT app while this
@@ -5231,13 +5494,13 @@ export class CodexSdkProvider implements TransportProvider {
     if (method === 'thread/tokenUsage/updated') {
       if (this.handleTrackedSubagentTokenUsage(params)) return;
       const threadId = readParamThreadId(params);
-      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
+      const sessionId = this.getSessionIdForThread(channel, threadId);
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;      const normalizedUsage = normalizeCodexTokenUsage(params);
       if (!normalizedUsage) return;
       state.lastUsage = normalizedUsage;
       this.recordWeakActivity(sessionId, state);
-      for (const cb of this.usageCallbacks) cb(sessionId, {
+      this.emitUsage(sessionId, {
         usage: normalizedUsage,
         ...(state.model ? { model: state.model } : {}),
       });
@@ -5247,7 +5510,7 @@ export class CodexSdkProvider implements TransportProvider {
 
     if (method === 'thread/compacted') {
       const threadId = readParamThreadId(params);
-      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
+      const sessionId = this.getSessionIdForThread(channel, threadId);
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state || !state.runningCompact) return;
       this.completeCompact(sessionId, state, readParamTurnId(params));
@@ -5257,7 +5520,7 @@ export class CodexSdkProvider implements TransportProvider {
     if (method === 'thread/status/changed') {
       if (this.handleTrackedSubagentThreadStatus(params)) return;
       const threadId = readParamThreadId(params);
-      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
+      const sessionId = this.getSessionIdForThread(channel, threadId);
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
       const status = readThreadStatus(params);
@@ -5313,13 +5576,13 @@ export class CodexSdkProvider implements TransportProvider {
     }
 
     if (isCodexRuntimeSubagentMethod(method, params)) {
-      this.emitRuntimeSubagentNotification(params);
+      this.emitRuntimeSubagentNotification(channel, params);
       return;
     }
 
     if (method === 'turn/started') {
       const threadId = readParamThreadId(params);
-      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
+      const sessionId = this.getSessionIdForThread(channel, threadId);
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state || state.cancelled || state.runningCompact) return;
       const turnId = readParamTurnId(params);
@@ -5329,13 +5592,13 @@ export class CodexSdkProvider implements TransportProvider {
     }
 
     if (method === 'rawResponseItem/completed') {
-      this.handleRawResponseItem(params);
+      this.handleRawResponseItem(channel, params);
       return;
     }
 
     if (method === 'turn/plan/updated') {
       const threadId = readParamThreadId(params);
-      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
+      const sessionId = this.getSessionIdForThread(channel, threadId);
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
       const turnId = readParamTurnId(params);
@@ -5355,7 +5618,7 @@ export class CodexSdkProvider implements TransportProvider {
 
     if (method === 'item/agentMessage/delta') {
       const threadId = readParamThreadId(params);
-      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
+      const sessionId = this.getSessionIdForThread(channel, threadId);
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
       if (state.cancelled) return;
@@ -5388,13 +5651,13 @@ export class CodexSdkProvider implements TransportProvider {
         delta: state.currentText,
         role: 'assistant',
       };
-      for (const cb of this.deltaCallbacks) cb(sessionId, delta);
+      this.emitDelta(sessionId, delta);
       return;
     }
 
     if (method === 'item/started' || method === 'item/completed') {
       const threadId = readParamThreadId(params);
-      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
+      const sessionId = this.getSessionIdForThread(channel, threadId);
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
       const turnId = readParamTurnId(params);
@@ -5406,7 +5669,7 @@ export class CodexSdkProvider implements TransportProvider {
 
       const item = params.item as Record<string, any> | undefined;
       if (!item) return;
-      if (method === 'item/completed' && isImcodesMcpTransportClosedItem(item)) {
+      if (!state.incognito && method === 'item/completed' && isImcodesMcpTransportClosedItem(item)) {
         // The failed MCP write has unknown outcome. Mark the generation stale,
         // but neither replay the call nor reload beneath the current turn. A
         // later explicit send crosses the pre-turn recovery boundary.
@@ -5506,7 +5769,7 @@ export class CodexSdkProvider implements TransportProvider {
               delta: item.text,
               role: 'assistant',
             };
-            for (const cb of this.deltaCallbacks) cb(sessionId, delta);
+            this.emitDelta(sessionId, delta);
           }        }
       }
       return;
@@ -5515,7 +5778,7 @@ export class CodexSdkProvider implements TransportProvider {
     if (method === 'turn/completed') {
       if (this.handleTrackedSubagentTurnCompleted(params)) return;
       const threadId = readParamThreadId(params);
-      const sessionId = threadId ? this.threadToSession.get(threadId) : undefined;
+      const sessionId = this.getSessionIdForThread(channel, threadId);
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;      const turn = isRecord(params.turn) ? params.turn : {};
       const status = turn.status;
@@ -5612,7 +5875,12 @@ export class CodexSdkProvider implements TransportProvider {
             return;
           }
           if (!authReplaySafe && authRecoveryRetriesRemaining > 0) {
-            void this.restartAppServerAfterAuthFailure('turn-failed-unsafe-replay', error, sessionId).catch((restartErr) => {
+            void this.restartAppServerAfterAuthFailure(
+              'turn-failed-unsafe-replay',
+              error,
+              sessionId,
+              this.getChannelForSession(state),
+            ).catch((restartErr) => {
               logger.warn({ provider: this.id, err: restartErr }, 'Codex app-server auth refresh restart failed');
             });
             this.emitCodexAuthRecoveryError(
@@ -5736,7 +6004,7 @@ export class CodexSdkProvider implements TransportProvider {
     const currentText = state.currentText;
     const usage = state.lastUsage;
     const model = state.model;
-    const resumeId = state.threadId;
+    const resumeId = state.incognito ? undefined : state.threadId;
     const generatedImageTracking = state.generatedImageTracking;
     const alreadyDetectedImagePaths = [...state.generatedImagePaths];
     state.runningTurnId = undefined;
@@ -5780,7 +6048,7 @@ export class CodexSdkProvider implements TransportProvider {
           : {}),
       },
     };
-    for (const cb of this.completeCallbacks) cb(sessionId, completed);
+    this.emitComplete(sessionId, completed);
   }
 
   private rememberCompletedTurn(state: CodexSdkSessionState, turnId?: string): void {
@@ -5911,7 +6179,7 @@ export class CodexSdkProvider implements TransportProvider {
       clearTimeout(lease.heartbeatTimer);
       lease.heartbeatTimer = undefined;
     }
-    if (!this.config || !this.child) return;
+    if (!this.config || !this.getChannelForSession(state).child) return;
     if (!this.isHeartbeatLeaseActive(sessionId, state, lease)) return;
     const now = Date.now();
     const strongWait = Math.max(0, CODEX_TURN_HEARTBEAT_STRONG_GRACE_MS - (now - lease.lastStrongActivityAtMs));
@@ -6029,7 +6297,7 @@ export class CodexSdkProvider implements TransportProvider {
     const requestStartedAtMs = Date.now();
     lease.lastHeartbeatAtMs = requestStartedAtMs;
     try {
-      const raw = await this.request('thread/read', {
+      const raw = await this.requestOnChannel(this.getChannelForSession(state), 'thread/read', {
         threadId: lease.threadId,
         includeTurns: true,
       }, CODEX_TURN_HEARTBEAT_TIMEOUT_MS);
@@ -6245,7 +6513,7 @@ export class CodexSdkProvider implements TransportProvider {
 
   /** Reads the tail of the thread's rollout file looking for a `task_complete` event for `turnId`. */
   private async rolloutTailReportsTaskComplete(state: CodexSdkSessionState, turnId: string): Promise<CodexRolloutTaskCompleteEvidence | null> {
-    if (!state.threadId) return null;
+    if (state.incognito || !state.threadId) return null;
     const providerEnv = (this.config?.env as Record<string, string> | undefined) ?? {};
     const env = { ...process.env, ...providerEnv, ...(state.env ?? {}) };
     const rolloutPath = state.rawChecklistRolloutPath ?? await findCodexRolloutPathByUuid(state.threadId, { env });
@@ -6313,7 +6581,7 @@ export class CodexSdkProvider implements TransportProvider {
     opts: ProviderRolloutCompletionReconcileOptions = {},
   ): Promise<boolean> {
     const state = this.sessions.get(sessionId);
-    if (!state) return false;
+    if (!state || state.incognito) return false;
     if (state.cancelled || state.runningCompact) return false;
     const evidence = await this.rolloutTailReportsTerminalTaskComplete(state);
     if (!evidence) return false;
@@ -6406,7 +6674,7 @@ export class CodexSdkProvider implements TransportProvider {
    * the tail's last marker is a `task_complete`, else null.
    */
   private async rolloutTailReportsTerminalTaskComplete(state: CodexSdkSessionState): Promise<CodexRolloutTerminalEvidence | null> {
-    if (!state.threadId) return null;
+    if (state.incognito || !state.threadId) return null;
     const providerEnv = (this.config?.env as Record<string, string> | undefined) ?? {};
     const env = { ...process.env, ...providerEnv, ...(state.env ?? {}) };
     const rolloutPath = state.rawChecklistRolloutPath ?? await findCodexRolloutPathByUuid(state.threadId, { env });
@@ -6563,21 +6831,31 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private request(method: string, params: Record<string, any>, timeoutMs?: number): Promise<any> {
-    if (!this.child?.stdin.writable) {
+    return this.requestOnChannel(this.normalChannel, method, params, timeoutMs);
+  }
+
+  private requestOnChannel(
+    channel: CodexAppServerChannel,
+    method: string,
+    params: Record<string, any>,
+    timeoutMs?: number,
+  ): Promise<any> {
+    const child = channel.child;
+    if (!child?.stdin.writable) {
       return Promise.reject(new Error('Codex app-server stdin is not writable'));
     }
-    const id = this.nextRequestId++;
+    const id = channel.nextRequestId++;
     const payload = JSON.stringify({ id, method, params });
     return new Promise((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout> | undefined;
       if (timeoutMs && timeoutMs > 0 && Number.isFinite(timeoutMs)) {
         timer = setTimeout(() => {
-          if (!this.pendingRequests.delete(id)) return;
+          if (!channel.pendingRequests.delete(id)) return;
           reject(new Error(`Codex app-server request ${method} did not settle within ${Math.round(timeoutMs)}ms`));
         }, timeoutMs);
         timer.unref?.();
       }
-      this.pendingRequests.set(id, {
+      channel.pendingRequests.set(id, {
         method,
         resolve: (value) => {
           if (timer) clearTimeout(timer);
@@ -6588,7 +6866,7 @@ export class CodexSdkProvider implements TransportProvider {
           reject(error);
         },
       });
-      this.child!.stdin.write(`${payload}\n`);
+      child.stdin.write(`${payload}\n`);
     });
   }
 
@@ -6657,11 +6935,11 @@ export class CodexSdkProvider implements TransportProvider {
         provider: this.id,
         event: 'thread/compacted',
         [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact',
-        ...(state.threadId ? { resumeId: state.threadId } : {}),
+        ...(!state.incognito && state.threadId ? { resumeId: state.threadId } : {}),
         ...(turnId ? { turnId } : {}),
       },
     };
-    for (const cb of this.completeCallbacks) cb(sessionId, completed);
+    this.emitComplete(sessionId, completed);
   }
 
   private rememberCompletedCompactTurn(state: CodexSdkSessionState, turnId?: string): void {
@@ -6785,14 +7063,14 @@ export class CodexSdkProvider implements TransportProvider {
     }
   }
 
-  private notify(method: string, params: Record<string, any>): void {
-    if (!this.child?.stdin.writable) return;
-    this.child.stdin.write(`${JSON.stringify({ method, params })}\n`);
+  private notifyOnChannel(channel: CodexAppServerChannel, method: string, params: Record<string, any>): void {
+    if (!channel.child?.stdin.writable) return;
+    channel.child.stdin.write(`${JSON.stringify({ method, params })}\n`);
   }
 
-  private rejectPending(err: Error): void {
-    for (const pending of this.pendingRequests.values()) pending.reject(err);
-    this.pendingRequests.clear();
+  private rejectChannelPending(channel: CodexAppServerChannel, err: Error): void {
+    for (const pending of channel.pendingRequests.values()) pending.reject(err);
+    channel.pendingRequests.clear();
   }
 
   /**
@@ -6817,15 +7095,50 @@ export class CodexSdkProvider implements TransportProvider {
     if (!state) throw new Error('codex_service_tier_unknown_session');
     await this.ensureThreadLoaded(sessionId, state);
     if (!state.threadId) throw new Error('codex_service_tier_no_thread');
-    await this.request('thread/settings/update', {
+    await this.requestOnChannel(this.getChannelForSession(state), 'thread/settings/update', {
       threadId: state.threadId,
       serviceTier: tier,
     });
     this.adoptServiceTier(sessionId, state, tier);
   }
 
+  private runWithPrivacy<T>(sessionId: string, state: CodexSdkSessionState | undefined, fn: () => T): T {
+    return withSessionPrivacy(state?.imcodesSessionName ?? sessionId, state?.incognito === true, fn);
+  }
+
+  private emitDelta(sessionId: string, delta: MessageDelta): void {
+    const state = this.sessions.get(sessionId);
+    this.runWithPrivacy(sessionId, state, () => {
+      for (const cb of this.deltaCallbacks) cb(sessionId, delta);
+    });
+  }
+
+  private emitComplete(sessionId: string, message: AgentMessage): void {
+    const state = this.sessions.get(sessionId);
+    this.runWithPrivacy(sessionId, state, () => {
+      for (const cb of this.completeCallbacks) cb(sessionId, message);
+    });
+  }
+
+  private emitUsage(sessionId: string, update: ProviderUsageUpdate): void {
+    const state = this.sessions.get(sessionId);
+    this.runWithPrivacy(sessionId, state, () => {
+      for (const cb of this.usageCallbacks) cb(sessionId, update);
+    });
+  }
+
+  private emitToolCall(sessionId: string, tool: ToolCallEvent): void {
+    const state = this.sessions.get(sessionId);
+    this.runWithPrivacy(sessionId, state, () => {
+      for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
+    });
+  }
+
   private emitSessionInfo(sessionId: string, info: SessionInfoUpdate): void {
-    for (const cb of this.sessionInfoCallbacks) cb(sessionId, info);
+    const state = this.sessions.get(sessionId);
+    this.runWithPrivacy(sessionId, state, () => {
+      for (const cb of this.sessionInfoCallbacks) cb(sessionId, info);
+    });
   }
 
   private emitStatus(sessionId: string, state: CodexSdkSessionState, status: ProviderStatusUpdate): void {
@@ -6835,7 +7148,9 @@ export class CodexSdkProvider implements TransportProvider {
     });
     if (state.lastStatusSignature === signature) return;
     state.lastStatusSignature = signature;
-    for (const cb of this.statusCallbacks) cb(sessionId, status);
+    this.runWithPrivacy(sessionId, state, () => {
+      for (const cb of this.statusCallbacks) cb(sessionId, status);
+    });
   }
 
   private clearStatus(sessionId: string, state: CodexSdkSessionState): void {
@@ -6858,7 +7173,7 @@ export class CodexSdkProvider implements TransportProvider {
     } else {
       state.openProviderToolCalls.delete(tool.id);
     }
-    for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
+    this.emitToolCall(sessionId, tool);
 
     if (tool.status !== 'running' && this.isCodexCollabSdkTool(tool)) {
       this.closeOpenCodexCollabProviderToolCalls(
@@ -7039,7 +7354,7 @@ export class CodexSdkProvider implements TransportProvider {
         this.pruneCustomToolLifecycleCache(state);
       }
     }
-    for (const cb of this.toolCallCallbacks) cb(sessionId, terminalTool);
+    this.emitToolCall(sessionId, terminalTool);
   }
 
   private commitPendingSessionSystemTextUpdate(state: CodexSdkSessionState, turnId?: string): void {
@@ -7072,7 +7387,10 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private emitError(sessionId: string, error: ProviderError): void {
-    for (const cb of this.errorCallbacks) cb(sessionId, error);
+    const state = this.sessions.get(sessionId);
+    this.runWithPrivacy(sessionId, state, () => {
+      for (const cb of this.errorCallbacks) cb(sessionId, error);
+    });
   }
 
   private resolveBinaryPath(config: ProviderConfig | null): string {

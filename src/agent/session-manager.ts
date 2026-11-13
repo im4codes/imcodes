@@ -2485,7 +2485,7 @@ function wireTransportSessionInfo(
         next.ccSessionId = info.resumeId;
         changed = true;
       }
-      if (agentType === 'codex-sdk' && next.codexSessionId !== info.resumeId) {
+      if (agentType === 'codex-sdk' && !isIncognitoSession(next) && next.codexSessionId !== info.resumeId) {
         next.codexSessionId = info.resumeId;
         changed = true;
       }
@@ -3887,8 +3887,10 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   } else if (agentType === 'codex-sdk') {
     effectiveSessionKey = randomUUID();
     effectiveBindExistingKey = undefined;
-    transportResumeId = opts.codexSessionId ?? (!opts.fresh ? getSession(name)?.codexSessionId : undefined);
-    if (!opts.fresh && transportResumeId) {
+    transportResumeId = opts.incognito
+      ? undefined
+      : (opts.codexSessionId ?? (!opts.fresh ? getSession(name)?.codexSessionId : undefined));
+    if (!opts.fresh && !opts.incognito && transportResumeId) {
       effectiveSkipCreate = true;
     }
     let availableCodexModels: string[] | undefined;
@@ -4074,7 +4076,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
           ? { providerResumeId: latestSessionInfo?.resumeId ?? transportResumeId }
           : {}),
         ...(isClaudeCodeSdkAgentType(agentType) && transportResumeId ? { ccSessionId: transportResumeId } : {}),
-        ...(agentType === 'codex-sdk' && transportResumeId ? { codexSessionId: transportResumeId } : {}),
+        ...(agentType === 'codex-sdk' && transportResumeId && !opts.incognito ? { codexSessionId: transportResumeId } : {}),
         contextNamespace: contextBootstrap.namespace,
         contextNamespaceDiagnostics: contextBootstrap.diagnostics,
         contextRemoteProcessedFreshness: contextBootstrap.remoteProcessedFreshness,

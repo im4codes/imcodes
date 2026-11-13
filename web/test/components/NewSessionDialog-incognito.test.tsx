@@ -336,4 +336,59 @@ describe('NewSessionDialog & SessionControls incognito UI contracts (F3)', () =>
     }));
     expect(norm.quickData.recordHistory).toHaveBeenCalledWith('NORMAL-QUICK-PROMPT', 'deck_norm_send');
   });
+
+  it('allows codex-sdk selection in incognito mode and keeps CLI runtimes disabled', async () => {
+    const wsCap = makeDialogWs([GIT_REMOTE_CLONE_CAPABILITY_V1, SESSION_INCOGNITO_CAPABILITY]);
+    const view = render(
+      <NewSessionDialog
+        ws={wsCap as any}
+        serverId="srv-1"
+        onClose={vi.fn()}
+        onSessionStarted={vi.fn()}
+      />,
+    );
+
+    const checkbox = view.container.querySelector('.incognito-create-option input[type="checkbox"]') as HTMLInputElement;
+    fireEvent.click(checkbox);
+    expect(checkbox.checked).toBe(true);
+
+    const codexSdkBtn = view.container.querySelector('[data-agent-type="codex-sdk"]') as HTMLButtonElement | null;
+    expect(codexSdkBtn).toBeTruthy();
+    expect(codexSdkBtn!.disabled).toBe(false);
+
+    const codexCliBtn = view.container.querySelector('[data-agent-type="codex"]') as HTMLButtonElement | null;
+    if (codexCliBtn) expect(codexCliBtn.disabled).toBe(true);
+    const claudeCliBtn = view.container.querySelector('[data-agent-type="claude-code"]') as HTMLButtonElement | null;
+    if (claudeCliBtn) expect(claudeCliBtn.disabled).toBe(true);
+
+    fireEvent.click(codexSdkBtn!);
+
+    const projectInput = view.container.querySelector('input[placeholder="my-project"]') as HTMLInputElement;
+    fireEvent.input(projectInput, { target: { value: 'privcodex' } });
+
+    const startBtn = view.container.querySelector('.dialog-footer .btn-primary') as HTMLButtonElement;
+    expect(startBtn.disabled).toBe(false);
+    fireEvent.click(startBtn);
+
+    await waitFor(() => {
+      expect(wsCap.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+        project: 'privcodex',
+        agentType: 'codex-sdk',
+        incognito: true,
+      }));
+    });
+    expect(saveSessionIdentityProfileMock).not.toHaveBeenCalled();
+  });
+
+  it('all 7 UI locales mention both Claude SDK and Codex SDK for incognito availability and unsupported strings', async () => {
+    const locales = ['en', 'es', 'ja', 'ko', 'ru', 'zh-CN', 'zh-TW'] as const;
+    for (const locale of locales) {
+      const mod = await import(`../../src/i18n/locales/${locale}.json`);
+      const data = mod.default as { session: { incognito_available: string; incognito_unsupported: string } };
+      expect(data.session.incognito_available, `${locale}.session.incognito_available`).toMatch(/claude/i);
+      expect(data.session.incognito_available, `${locale}.session.incognito_available`).toMatch(/codex/i);
+      expect(data.session.incognito_unsupported, `${locale}.session.incognito_unsupported`).toMatch(/claude/i);
+      expect(data.session.incognito_unsupported, `${locale}.session.incognito_unsupported`).toMatch(/codex/i);
+    }
+  });
 });

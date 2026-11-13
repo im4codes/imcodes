@@ -3156,6 +3156,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
     } else if (agentType === 'codex-sdk') {
       logger.info({ project }, 'SDK fresh session.start launching new Codex SDK main session');
       await launchTransportSession({
+        ...(cmd.incognito === true ? { incognito: true } : {}),
         name: `deck_${project}_brain`,
         projectName: project,
         role: 'brain',

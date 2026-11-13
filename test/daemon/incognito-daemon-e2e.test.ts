@@ -1,19 +1,109 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
+import { PassThrough, Writable } from 'node:stream';
 
 const sdkHarness = vi.hoisted(() => ({
   calls: [] as Array<{ options: Record<string, unknown> }>,
   turns: [] as string[],
 }));
 
+const codexHarness = vi.hoisted(() => ({
+  requests: [] as Array<{ id?: number; method?: string; params?: Record<string, any> }>,
+  turns: [] as string[],
+  threadCounter: 0,
+  turnCounter: 0,
+}));
+
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
   return {
     ...actual,
-    spawn: vi.fn(() => {
+    spawn: vi.fn((_cmd: unknown, args?: readonly string[]) => {
+      if (Array.isArray(args) && args.includes('app-server')) {
+        const stdout = new PassThrough();
+        const stderr = new PassThrough();
+        const emitMsg = (msg: Record<string, unknown>) => {
+          stdout.write(`${JSON.stringify(msg)}\n`);
+        };
+        const child = new EventEmitter() as EventEmitter & {
+          stdout: PassThrough;
+          stderr: PassThrough;
+          stdin: Writable;
+          killed: boolean;
+          kill: () => boolean;
+        };
+        const stdin = new Writable({
+          write(chunk, _encoding, callback) {
+            for (const line of chunk.toString().split('\n').filter(Boolean)) {
+              const message = JSON.parse(line) as { id?: number; method?: string; params?: Record<string, any> };
+              codexHarness.requests.push(message);
+              if (typeof message.id !== 'number') continue;
+              if (message.method === 'initialize') {
+                emitMsg({ id: message.id, result: { userAgent: 'codex-e2e-test' } });
+              } else if (message.method === 'config/read') {
+                emitMsg({ id: message.id, result: { config: { mcp_servers: {} } } });
+              } else if (message.method === 'thread/start') {
+                codexHarness.threadCounter += 1;
+                const threadId = `codex-e2e-thread-${codexHarness.threadCounter}`;
+                const ephemeral = message.params?.ephemeral === true;
+                emitMsg({
+                  id: message.id,
+                  result: { thread: { id: threadId, ephemeral, path: ephemeral ? null : `/tmp/${threadId}.jsonl` } },
+                });
+                emitMsg({
+                  method: 'thread/started',
+                  params: { thread: { id: threadId, ephemeral, path: ephemeral ? null : `/tmp/${threadId}.jsonl` } },
+                });
+              } else if (message.method === 'thread/resume') {
+                const threadId = String(message.params?.threadId ?? 'codex-e2e-thread-1');
+                emitMsg({ id: message.id, result: { thread: { id: threadId } } });
+              } else if (message.method === 'turn/start') {
+                codexHarness.turnCounter += 1;
+                const turnId = `codex-e2e-turn-${codexHarness.turnCounter}`;
+                const threadId = String(message.params?.threadId ?? 'codex-e2e-thread-1');
+                const inputText = String(message.params?.input?.[0]?.text ?? '');
+                codexHarness.turns.push(inputText);
+                const replyMatch = inputText.match(/(?:SECRET-TURN-[A-Za-z0-9_-]+|ORDINARY-AFTER-PRIVATE)/);
+                const replyTag = replyMatch ? replyMatch[0] : inputText.slice(0, 40);
+                emitMsg({
+                  id: message.id,
+                  result: { turn: { id: turnId, status: 'inProgress', items: [], error: null } },
+                });
+                setImmediate(() => {
+                  emitMsg({
+                    method: 'item/agentMessage/delta',
+                    params: { threadId, turnId, itemId: `msg-${turnId}`, delta: `REPLY:${replyTag}` },
+                  });
+                  emitMsg({
+                    method: 'turn/completed',
+                    params: { threadId, turn: { id: turnId, status: 'completed', items: [] } },
+                  });
+                });
+              } else if (message.method === 'mcpServerStatus/list') {
+                emitMsg({ id: message.id, result: { data: [] } });
+              } else if (message.method === 'config/mcpServer/reload') {
+                emitMsg({ id: message.id, result: {} });
+              } else if (message.method === 'thread/unsubscribe') {
+                emitMsg({ id: message.id, result: { status: 'unsubscribed' } });
+              } else if (message.method === 'turn/interrupt' || message.method === 'thread/compact/start') {
+                emitMsg({ id: message.id, result: {} });
+              }
+            }
+            callback();
+          },
+        });
+        Object.assign(child, { stdout, stderr, stdin, killed: false });
+        child.kill = () => {
+          child.killed = true;
+          setImmediate(() => child.emit('exit', null, 'SIGTERM'));
+          return true;
+        };
+        return child as never;
+      }
+
       const child = new EventEmitter() as EventEmitter & { killed: boolean; kill: () => boolean };
       child.killed = false;
       child.kill = () => {
@@ -25,6 +115,11 @@ vi.mock('node:child_process', async (importOriginal) => {
     }),
   };
 });
+
+vi.mock('../../src/agent/codex-runtime-config.js', () => ({
+  getCodexRuntimeConfig: vi.fn(async () => ({ availableModels: ['gpt-5.4'], models: [{ id: 'gpt-5.4' }] })),
+  getCodexBaseInstructions: vi.fn(async () => '[catalog-prompt]'),
+}));
 
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
   query: vi.fn((args: { prompt: AsyncIterable<{ message: { content: unknown } }>; options: Record<string, unknown> }) => {
@@ -89,6 +184,7 @@ describe('daemon incognito end-to-end lifecycle (F3)', () => {
   let workDir = '';
   let prevHome: string | undefined;
   let prevImcodesHome: string | undefined;
+  let prevCodexHome: string | undefined;
 
   beforeEach(async () => {
     tempHome = mkdtempSync(join(tmpdir(), 'incognito-e2e-'));
@@ -96,10 +192,22 @@ describe('daemon incognito end-to-end lifecycle (F3)', () => {
     mkdirSync(workDir, { recursive: true });
     prevHome = process.env.HOME;
     prevImcodesHome = process.env.IMCODES_HOME;
+    prevCodexHome = process.env.CODEX_HOME;
     process.env.HOME = tempHome;
     process.env.IMCODES_HOME = join(tempHome, '.imcodes');
+    mkdirSync(join(process.env.IMCODES_HOME, 'transport'), { recursive: true });
+    process.env.CODEX_HOME = join(tempHome, '.codex');
+    mkdirSync(process.env.CODEX_HOME, { recursive: true });
+    writeFileSync(
+      join(process.env.CODEX_HOME, 'auth.json'),
+      JSON.stringify({ tokens: { access_token: 'opaque-test-token', refresh_token: 'opaque-test-refresh' } }),
+    );
     sdkHarness.calls.length = 0;
     sdkHarness.turns.length = 0;
+    codexHarness.requests.length = 0;
+    codexHarness.turns.length = 0;
+    codexHarness.threadCounter = 0;
+    codexHarness.turnCounter = 0;
     resetProviderRegistryForTests?.();
     resetTransportQueueStoreForTests();
     resetSessionStoreAuthorityForTests();
@@ -122,11 +230,14 @@ describe('daemon incognito end-to-end lifecycle (F3)', () => {
     resetContextStoreClientForTests();
     setSessionIncognito('deck_privmode_brain', false);
     removeSession('deck_privmode_brain');
+    resetProviderRegistryForTests?.();
     resetTransportQueueStoreForTests();
     await flushStore().catch(() => {});
     process.env.HOME = prevHome;
     if (prevImcodesHome === undefined) delete process.env.IMCODES_HOME;
     else process.env.IMCODES_HOME = prevImcodesHome;
+    if (prevCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = prevCodexHome;
     rmSync(tempHome, { recursive: true, force: true });
   });
 
@@ -193,7 +304,7 @@ describe('daemon incognito end-to-end lifecycle (F3)', () => {
       await waitFor(() => {
         const err = sent.find((m) => m.type === 'session.error');
         if (err) throw new Error(`Unexpected session.error: ${JSON.stringify(err)}`);
-        return Boolean(getTransportRuntime('deck_privmode_brain'));
+        return Boolean(getTransportRuntime('deck_privmode_brain')) && getSession('deck_privmode_brain')?.agentType === 'claude-code-sdk';
       });
       expect(getSession('deck_privmode_brain')?.incognito).toBe(true);
 
@@ -270,6 +381,7 @@ describe('daemon incognito end-to-end lifecycle (F3)', () => {
       // Flush timelineStore and assert zero disk writes in sessions.sqlite / timeline / transport
       await timelineStore.flushSession('deck_privmode_brain');
       await flushStore();
+      expect(existsSync(join(process.env.IMCODES_HOME!, 'transport', 'deck_privmode_brain.jsonl'))).toBe(false);
       expect(await replayTransportHistory('deck_privmode_brain')).toEqual([]);
       expect(timelineStore.read('deck_privmode_brain')).toEqual([]);
 
@@ -291,7 +403,7 @@ describe('daemon incognito end-to-end lifecycle (F3)', () => {
       await waitFor(() => {
         const err = sent.find((m) => m.type === 'session.error');
         if (err) throw new Error(`Unexpected session.error: ${JSON.stringify(err)}`);
-        return Boolean(getTransportRuntime('deck_privmode_brain'));
+        return Boolean(getTransportRuntime('deck_privmode_brain')) && getSession('deck_privmode_brain')?.agentType === 'claude-code-sdk';
       });
       expect(getSession('deck_privmode_brain')?.incognito).not.toBe(true);
 
@@ -308,6 +420,149 @@ describe('daemon incognito end-to-end lifecycle (F3)', () => {
       const replayedNormal = await replayTransportHistory('deck_privmode_brain');
       expect(replayedNormal.some((e) => e.text === 'REPLY:ORDINARY-AFTER-PRIVATE')).toBe(true);
       expect(JSON.stringify(replayedNormal)).not.toContain('SECRET-TURN');
+      await stopProject('privmode', link);
+    } finally {
+      off();
+    }
+  });
+
+  it('runs full codex-sdk incognito lifecycle from command-handler through runtime with zero leaks, then normal codex-sdk recovers persistence', async () => {
+    const sent: Array<Record<string, unknown>> = [];
+    const link = {
+      send: (msg: Record<string, unknown>) => sent.push(msg),
+      supportsIncognitoSessions: () => true,
+    } as unknown as ServerLink;
+
+    const emittedEvents: Array<{ sessionId: string; type: string; payload: Record<string, unknown> }> = [];
+    const off = timelineEmitter.on((ev) => {
+      if (ev.sessionId === 'deck_privmode_brain') emittedEvents.push(ev);
+    });
+
+    try {
+      handleWebCommand({
+        type: 'session.start',
+        project: 'privmode',
+        dir: workDir,
+        agentType: 'codex-sdk',
+        incognito: true,
+      }, link);
+
+      await waitFor(() => {
+        const err = sent.find((m) => m.type === 'session.error');
+        if (err) throw new Error(`Unexpected session.error: ${JSON.stringify(err)}`);
+        return Boolean(getTransportRuntime('deck_privmode_brain')) && getSession('deck_privmode_brain')?.agentType === 'codex-sdk';
+      });
+      const rec = getSession('deck_privmode_brain');
+      expect(rec?.incognito).toBe(true);
+      expect(rec?.agentType).toBe('codex-sdk');
+
+      handleWebCommand({ type: 'get_sessions' }, link);
+      await waitFor(() => sent.some((m) => m.type === 'session_list'));
+      const sessionListMsg = [...sent].reverse().find((m) => m.type === 'session_list');
+      const listEntry = (sessionListMsg?.sessions as Array<Record<string, unknown>> | undefined)?.find((s) => s.name === 'deck_privmode_brain');
+      expect(listEntry?.incognito).toBe(true);
+
+      // Drive 2 live turns via command-handler session.send
+      handleWebCommand({
+        type: 'session.send',
+        sessionName: 'deck_privmode_brain',
+        text: 'SECRET-TURN-CODEX-1',
+        commandId: 'cmd-codex-priv-1',
+      }, link);
+      await waitFor(
+        () => codexHarness.turns.some((t) => t.includes('SECRET-TURN-CODEX-1')),
+        4000,
+        () => `Missing codex turn 1; turns=${JSON.stringify(codexHarness.turns)}`,
+      );
+      await waitFor(
+        () => emittedEvents.some((e) => e.type === 'assistant.text' && String(e.payload.text ?? '').includes('REPLY:SECRET-TURN-CODEX-1') && e.payload.streaming === false),
+        4000,
+        () => `Missing codex REPLY 1; events=${JSON.stringify(emittedEvents)}`,
+      );
+
+      handleWebCommand({
+        type: 'session.send',
+        sessionName: 'deck_privmode_brain',
+        text: 'SECRET-TURN-CODEX-2',
+        commandId: 'cmd-codex-priv-2',
+      }, link);
+      await waitFor(
+        () => codexHarness.turns.some((t) => t.includes('SECRET-TURN-CODEX-2')),
+        4000,
+        () => `Missing codex turn 2; turns=${JSON.stringify(codexHarness.turns)}`,
+      );
+      await waitFor(
+        () => emittedEvents.some((e) => e.type === 'assistant.text' && String(e.payload.text ?? '').includes('REPLY:SECRET-TURN-CODEX-2') && e.payload.streaming === false),
+        4000,
+        () => `Missing codex REPLY 2; events=${JSON.stringify(emittedEvents)}`,
+      );
+
+      // Assert protocol invariants: ephemeral:true, zero mcp_servers, single thread/start, zero thread/resume, zero persisted codexSessionId
+      const threadStarts = codexHarness.requests.filter((r) => r.method === 'thread/start');
+      expect(threadStarts).toHaveLength(1);
+      expect(threadStarts[0]?.params?.ephemeral).toBe(true);
+      expect(threadStarts[0]?.params?.config?.mcp_servers).toBeUndefined();
+      expect(codexHarness.requests.some((r) => r.method === 'thread/resume')).toBe(false);
+      expect(getSession('deck_privmode_brain')?.codexSessionId).toBeUndefined();
+
+      // Check memory MCP tools refuse calls
+      const handlers = createMemoryMcpToolHandlers({
+        userId: 'u',
+        sessionName: 'deck_privmode_brain',
+        projectName: 'privmode',
+        projectRoot: workDir,
+      });
+      const obsRes = await handlers.save_observation({ content: 'SECRET-CODEX-OBS', toolSummary: 'Save' } as any);
+      expect(JSON.stringify(obsRes)).toContain(SESSION_INCOGNITO_MEMORY_DISABLED);
+
+      // Flush and verify zero disk/timeline/transport persistence
+      await timelineStore.flushSession('deck_privmode_brain');
+      await flushStore();
+      expect(existsSync(join(process.env.IMCODES_HOME!, 'transport', 'deck_privmode_brain.jsonl'))).toBe(false);
+      expect(await replayTransportHistory('deck_privmode_brain')).toEqual([]);
+      expect(timelineStore.read('deck_privmode_brain')).toEqual([]);
+
+      await stopProject('privmode', link);
+      expect(getSession('deck_privmode_brain')).toBeUndefined();
+      const remainingBuffered = timelineEmitter.getBufferedEvents('deck_privmode_brain');
+      expect(remainingBuffered.filter((e) => !(e.type === 'session.state' && e.payload.state === 'stopped'))).toEqual([]);
+      expect(JSON.stringify(remainingBuffered)).not.toContain('SECRET');
+
+      // Launch ordinary codex-sdk session -> recovers normal persistence, mcp_servers, codexSessionId, non-ephemeral thread
+      codexHarness.requests.length = 0;
+      handleWebCommand({
+        type: 'session.start',
+        project: 'privmode',
+        dir: workDir,
+        agentType: 'codex-sdk',
+      }, link);
+      await waitFor(() => {
+        const err = sent.find((m) => m.type === 'session.error');
+        if (err) throw new Error(`Unexpected session.error: ${JSON.stringify(err)}`);
+        return Boolean(getTransportRuntime('deck_privmode_brain')) && getSession('deck_privmode_brain')?.agentType === 'codex-sdk';
+      });
+      expect(getSession('deck_privmode_brain')?.incognito).not.toBe(true);
+
+      handleWebCommand({
+        type: 'session.send',
+        sessionName: 'deck_privmode_brain',
+        text: 'ORDINARY-AFTER-PRIVATE',
+        commandId: 'cmd-codex-norm-1',
+      }, link);
+      await waitFor(() => codexHarness.turns.includes('ORDINARY-AFTER-PRIVATE'));
+      await waitFor(() => emittedEvents.some((e) => e.type === 'assistant.text' && e.payload.text === 'REPLY:ORDINARY-AFTER-PRIVATE' && e.payload.streaming === false));
+
+      const normalStart = codexHarness.requests.find((r) => r.method === 'thread/start');
+      expect(normalStart?.params?.ephemeral).toBeUndefined();
+      expect(normalStart?.params?.config?.mcp_servers?.['imcodes-memory']).toBeDefined();
+      expect(getSession('deck_privmode_brain')?.codexSessionId).toMatch(/^codex-e2e-thread-/);
+
+      await timelineStore.flushSession('deck_privmode_brain');
+      const replayedNormal = await replayTransportHistory('deck_privmode_brain');
+      expect(replayedNormal.some((e) => e.text === 'REPLY:ORDINARY-AFTER-PRIVATE')).toBe(true);
+      expect(JSON.stringify(replayedNormal)).not.toContain('SECRET-TURN');
+
+      await stopProject('privmode', link);
     } finally {
       off();
     }
