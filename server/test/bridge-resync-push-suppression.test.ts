@@ -151,4 +151,129 @@ describe('WsBridge — link-restore resync must not push', () => {
 
     expect(pendingIdlePushCount(bridge)).toBe(0);
   });
+
+  it('suppresses direct session.idle when suppressPush=true and for auto-created pair/send/clone sub-sessions', async () => {
+    const { bridge, daemon } = await authedDaemon();
+
+    // Direct session.idle with TIMELINE_SUPPRESS_PUSH_FIELD must not schedule push
+    daemon.emit('message', JSON.stringify({
+      type: 'session.idle',
+      session: SESSION,
+      lastText: 'internal pair message',
+      [TIMELINE_SUPPRESS_PUSH_FIELD]: true,
+    }));
+    expect(pendingIdlePushCount(bridge)).toBe(0);
+
+    // Auto-created pair / send sub-session name prefixes must not schedule push even on legacy daemons
+    for (const autoSession of ['deck_sub_pair_auto_0123456789abcdef', 'deck_sub_send_auto_0123456789abcdef']) {
+      daemon.emit('message', JSON.stringify({
+        type: 'session.idle',
+        session: autoSession,
+        lastText: 'pair chatter',
+      }));
+      daemon.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.EVENT,
+        event: {
+          eventId: `evt-${autoSession}`,
+          sessionId: autoSession,
+          ts: Date.now(),
+          seq: 1,
+          epoch: 1,
+          type: 'session.state',
+          payload: { state: 'idle' },
+        },
+      }));
+      expect(pendingIdlePushCount(bridge)).toBe(0);
+    }
+
+    // Sub-sessions synced with pairCreatedMetadata.autoCreated or executionCloneMetadata must not push
+    daemon.emit('message', JSON.stringify({
+      type: 'subsession.sync',
+      id: 'syncauto1',
+      sessionType: 'claude-code-sdk',
+      pairCreatedMetadata: { autoCreated: true, source: 'pair_create', createdBy: SESSION, reason: 'explicit_create', createdAt: 1 },
+    }));
+    daemon.emit('message', JSON.stringify({
+      type: 'subsession.sync',
+      id: 'syncclone1',
+      sessionType: 'claude-code-sdk',
+      executionCloneMetadata: { kind: 'execution_clone' },
+    }));
+    await flush();
+    daemon.emit('message', JSON.stringify({ type: 'session.idle', session: 'deck_sub_syncauto1', lastText: 'internal' }));
+    daemon.emit('message', JSON.stringify({ type: 'session.idle', session: 'deck_sub_syncclone1', lastText: 'internal' }));
+    expect(pendingIdlePushCount(bridge)).toBe(0);
+
+    // Manual non-pair sub-session without suppression STILL schedules idle push
+    daemon.emit('message', JSON.stringify({
+      type: 'subsession.sync',
+      id: 'manual1',
+      sessionType: 'claude-code-sdk',
+      parentSession: SESSION,
+    }));
+    await flush();
+    daemon.emit('message', JSON.stringify({ type: 'session.idle', session: 'deck_sub_manual1', lastText: 'done' }));
+    expect(pendingIdlePushCount(bridge)).toBe(1);
+    await flush();
+    await flush();
+  });
+
+  it('suppresses dispatchPush in dispatchEventPush when DB sub_sessions row marks an execution clone while allowing manual sub-sessions', async () => {
+    const { dispatchPush } = await import('../src/routes/push.js');
+    const db = {
+      queryOne: async (sql: string, params?: unknown[]) => {
+        if (sql.includes('FROM servers')) return { user_id: 'u1', name: 'srv', token_hash: 'valid-hash', owner_status: 'active', node_role: 'full', revoked_at: null };
+        if (sql.includes('FROM sub_sessions')) {
+          const subId = params?.[0];
+          if (subId === 'dbclone1') {
+            return {
+              id: 'dbclone1',
+              server_id: serverId,
+              type: 'codex-sdk',
+              execution_clone_metadata: { kind: 'execution_clone' },
+            };
+          }
+          return {
+            id: String(subId ?? 'manual2'),
+            server_id: serverId,
+            type: 'codex-sdk',
+            execution_clone_metadata: null,
+          };
+        }
+        return { token_hash: 'valid-hash', owner_status: 'active', node_role: 'full', revoked_at: null };
+      },
+      query: async () => [],
+      execute: async () => ({ changes: 1 }),
+      exec: async () => {},
+      transaction: async <T>(fn: (tx: unknown) => Promise<T>) => fn({}),
+      close: () => {},
+    } as unknown as import('../src/db/client.js').Database;
+
+    const bridge = WsBridge.get(serverId);
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, db as never, {} as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'tok' }));
+    await flush();
+
+    daemon.emit('message', JSON.stringify({
+      type: 'session.idle',
+      session: 'deck_sub_dbclone1',
+      lastText: 'clone output',
+    }));
+    await flush();
+    await flush();
+    expect(dispatchPush).not.toHaveBeenCalled();
+
+    daemon.emit('message', JSON.stringify({
+      type: 'session.idle',
+      session: 'deck_sub_manual2',
+      lastText: 'manual output',
+    }));
+    await flush();
+    await flush();
+    expect(dispatchPush).toHaveBeenCalledTimes(1);
+    expect(dispatchPush).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ session: 'deck_sub_manual2' }),
+    }), expect.anything());
+  });
 });

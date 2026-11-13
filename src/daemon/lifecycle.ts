@@ -6,6 +6,8 @@ import { evaluatePairMainCheckoutGitWrite, mainCheckoutWriteRefusal } from './ta
 import { setTransportToolExecutionEvaluator } from './transport-relay.js';
 import { taskPairAutomation } from './task-pairs/scheduler.js';
 import { getTaskPairStore } from './task-pairs/store.js';
+import { isAutoCreatedSubSessionName, isTerminalTaskPairStatus } from '../../shared/task-pair.js';
+import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 import { isSessionWorking } from './session-working.js';
 import { createSupervisionSessionPresentationResolver } from './supervision-session-presentation.js';
 import { createSupervisionPairRefreshScheduler } from './supervision-pair-refresh.js';
@@ -256,6 +258,33 @@ export function resolvePushDisplayContext(sessionName: string, sessions: Session
     ...(label ? { label } : {}),
     ...(parentLabel ? { parentLabel } : {}),
   };
+}
+
+/**
+ * Suppress `task_complete` push notifications when a session is a daemon/internal
+ * worker: auto-provisioned pair/send sub-sessions, execution clones, or active
+ * non-terminal Task Pair executors/auditors (while keeping Brain and manual
+ * interactive sessions firing normally).
+ */
+export function shouldSuppressSessionIdlePush(
+  sessionName: string,
+  record?: Pick<SessionRecord, 'pairCreatedMetadata' | 'executionCloneMetadata'> | null,
+): boolean {
+  if (record?.pairCreatedMetadata?.autoCreated === true) return true;
+  if (record?.executionCloneMetadata != null) return true;
+  if (isAutoCreatedSubSessionName(sessionName)) return true;
+  try {
+    const pairs = getTaskPairStore().pairsForSession(sessionName);
+    if (pairs.some((pair) => (
+      !isTerminalTaskPairStatus(pair.state.status)
+      && (pair.state.executor === sessionName || pair.state.auditor === sessionName)
+    ))) {
+      return true;
+    }
+  } catch {
+    // Store may be uninitialized in lightweight unit tests.
+  }
+  return false;
 }
 
 export interface DaemonContext {
@@ -1346,10 +1375,13 @@ export async function startup(): Promise<DaemonContext> {
       if (event.type === 'session.state' && (event.payload as Record<string, unknown>).state === 'idle') {
         const rec = listSessions().find((s) => s.name === event.sessionId);
         if (rec?.agentType === 'shell' || rec?.agentType === 'script') return;
+        const outgoingEvent = shouldSuppressSessionIdlePush(event.sessionId, rec)
+          ? { ...event, payload: { ...event.payload, [TIMELINE_SUPPRESS_PUSH_FIELD]: true } }
+          : event;
         void getLastAssistantText(event.sessionId).then((lastText) => {
-          serverLink!.send({ type: 'timeline.event', event, ...(lastText ? { lastText } : {}) });
+          serverLink!.send({ type: 'timeline.event', event: outgoingEvent, ...(lastText ? { lastText } : {}) });
         }).catch(() => {
-          serverLink!.send({ type: 'timeline.event', event });
+          serverLink!.send({ type: 'timeline.event', event: outgoingEvent });
         });
         return;
       }
@@ -1438,6 +1470,7 @@ export async function startup(): Promise<DaemonContext> {
         void reconcileDurableTransportQueues();
         // Shell/script sessions are always "idle" — skip to avoid noise
         if (record?.agentType === 'shell' || record?.agentType === 'script') return;
+        if (shouldSuppressSessionIdlePush(payload.session, record)) return;
         // notifySessionIdle is handled by the unified timeline listener below
         // Include last assistant text for push notification context
         void getLastAssistantText(payload.session).then((lastText) => {

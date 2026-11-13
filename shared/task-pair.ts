@@ -296,7 +296,18 @@ export type TaskPairCreatedSessionSource = typeof TASK_PAIR_CREATED_SESSION_SOUR
  * (removed) session frees its slot with nothing to reconcile.
  */
 /** Stable sub-session namespace, shared with legacy-label presentation. */
+export const SUBSESSION_NAME_PREFIX = 'deck_sub_' as const;
 export const TASK_PAIR_SESSION_ID_PREFIX = 'pair_auto_' as const;
+export const SEND_AUTO_SESSION_ID_PREFIX = 'send_auto_' as const;
+export const AUTO_CREATED_SUBSESSION_NAME_PREFIXES: readonly string[] = [
+  `${SUBSESSION_NAME_PREFIX}${TASK_PAIR_SESSION_ID_PREFIX}`,
+  `${SUBSESSION_NAME_PREFIX}${SEND_AUTO_SESSION_ID_PREFIX}`,
+] as const;
+
+/** Sub-sessions auto-provisioned for task pairs or send auto-provision never emit task_complete pushes. */
+export function isAutoCreatedSubSessionName(sessionName: string): boolean {
+  return AUTO_CREATED_SUBSESSION_NAME_PREFIXES.some((prefix) => sessionName.startsWith(prefix));
+}
 export const TASK_PAIR_AUTO_CREATED_PAIR_MAX_PER_PROJECT = 10;
 export const TASK_PAIR_AUTO_CREATED_SESSION_MAX_PER_PROJECT = TASK_PAIR_AUTO_CREATED_PAIR_MAX_PER_PROJECT * 2;
 export const TASK_PAIR_CREATED_SESSION_REASONS = { DEFAULT: 'default_same_vendor_secondary', EXPLICIT: 'explicit_create' } as const;

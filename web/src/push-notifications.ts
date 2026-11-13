@@ -580,15 +580,26 @@ async function registerDeviceToken(
   cfWorkerUrl: string,
 ): Promise<void> {
   try {
-    const notificationTypes = getLocalPushNotificationPreferences();
-    await fetch(`${cfWorkerUrl}/api/push/register`, {
+    const includeNotificationTypes = hasUnsyncedPushNotificationEdits();
+    const body: {
+      token: string;
+      platform: PushPlatform;
+      notificationTypes?: PushNotificationType[];
+    } = { token, platform };
+    if (includeNotificationTypes) {
+      body.notificationTypes = getLocalPushNotificationPreferences();
+    }
+    const res = await fetch(`${cfWorkerUrl}/api/push/register`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ token, platform, notificationTypes }),
+      body: JSON.stringify(body),
     });
+    if (!includeNotificationTypes && res?.ok) {
+      void fetchPushNotificationSettings();
+    }
   } catch (err) {
     console.warn('Failed to register push token:', err);
   }

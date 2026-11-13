@@ -603,3 +603,78 @@ describe('push enabled servers preferences', () => {
     expect(hasUnsyncedPushEnabledServerEdits()).toBe(false);
   });
 });
+
+describe('push device token registration', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    localStorage.clear();
+    apiFetchMock.mockReset();
+    pushAddListenerMock.mockReset().mockImplementation((eventName: string, handler: (payload: unknown) => unknown) => {
+      pushListeners[eventName] = handler;
+    });
+    pushCheckPermissionsMock.mockReset().mockResolvedValue({ receive: 'granted' });
+    pushRegisterMock.mockReset().mockResolvedValue(undefined);
+    pushRequestPermissionsMock.mockReset().mockResolvedValue({ receive: 'granted' });
+    for (const eventName of Object.keys(pushListeners)) delete pushListeners[eventName];
+    (globalThis as Record<string, unknown>).Capacitor = {
+      isNativePlatform: () => true,
+      getPlatform: () => 'ios',
+    };
+  });
+
+  it('omits notificationTypes on register when no local edits are pending and syncs server preferences', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchSpy);
+    apiFetchMock.mockResolvedValueOnce({
+      ok: true,
+      types: ['task_complete', 'remote_desktop'],
+      enabledServerIds: null,
+    });
+
+    try {
+      const { initPushNotifications, getLocalPushNotificationPreferences } = await import('../src/push-notifications.js');
+      await initPushNotifications('api-key', 'https://app.im.codes');
+      await pushListeners.registration?.({ value: 'apns-token-1' });
+      await vi.waitFor(() => expect(apiFetchMock).toHaveBeenCalledWith('/api/push/preferences'));
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+      expect(url).toBe('https://app.im.codes/api/push/register');
+      const sentBody = JSON.parse(String(init.body));
+      expect(sentBody).toEqual({ token: 'apns-token-1', platform: 'ios' });
+      expect('notificationTypes' in sentBody).toBe(false);
+      expect(getLocalPushNotificationPreferences()).toEqual(['task_complete', 'remote_desktop']);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('includes notificationTypes on register when unsynced local edits exist without overwriting them', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchSpy);
+
+    try {
+      const {
+        initPushNotifications,
+        recordLocalPushNotificationEdit,
+        getLocalPushNotificationPreferences,
+      } = await import('../src/push-notifications.js');
+
+      recordLocalPushNotificationEdit(['task_pair_done']);
+      await initPushNotifications('api-key', 'https://app.im.codes');
+      await pushListeners.registration?.({ value: 'apns-token-2' });
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      const [, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+      expect(JSON.parse(String(init.body))).toEqual({
+        token: 'apns-token-2',
+        platform: 'ios',
+        notificationTypes: ['task_pair_done'],
+      });
+      expect(apiFetchMock).not.toHaveBeenCalled();
+      expect(getLocalPushNotificationPreferences()).toEqual(['task_pair_done']);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});

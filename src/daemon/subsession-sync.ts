@@ -188,6 +188,7 @@ export async function buildSubSessionSyncPayload(
     ccSessionId: identity('ccSessionId'),
     geminiSessionId: identity('geminiSessionId'),
     executionCloneMetadata: cloneMetadata,
+    ...(r.pairCreatedMetadata ? { pairCreatedMetadata: r.pairCreatedMetadata } : {}),
     parentSession: r.parentSession ?? null,
     ccPresetId: r.ccPreset ?? null,
     description: r.description ?? null,

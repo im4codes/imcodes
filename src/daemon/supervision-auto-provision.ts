@@ -41,6 +41,7 @@ import { overlayCachedExecutionPools } from './supervisor-defaults-cache.js';
 import logger from '../util/logger.js';
 import type { SupervisionTaskRegistry } from './supervision-state-store.js';
 import {
+  SEND_AUTO_SESSION_ID_PREFIX,
   SEND_AUTO_PROVISION_CREATED_SESSION_SOURCE,
   TASK_PAIR_AUTO_CREATED_SESSION_MAX_PER_PROJECT,
   TASK_PAIR_CREATED_SESSION_REASONS,
@@ -51,7 +52,7 @@ import {
 
 const AUTO_SESSION_ID_PREFIX = 'sup_auto_';
 /** Sessions an explicit `task.autoProvision` call creates. Not `sup_auto_`: the automatic pool reaps its own children and must never touch these. */
-const FORCED_SESSION_ID_PREFIX = 'send_auto_';
+const FORCED_SESSION_ID_PREFIX = SEND_AUTO_SESSION_ID_PREFIX;
 export const SUPERVISION_AUTO_PROVISION_COOLDOWN_MS = 30_000;
 export const SUPERVISION_AUTO_PROVISION_READY_TIMEOUT_MS = 15_000;
 export const SUPERVISION_AUTO_PROVISION_IDLE_REAP_MS = 30 * 60_000;

@@ -335,7 +335,7 @@ import {
 import { isStreamingResponse } from '../../../shared/preview-stream-policy.js';
 import { getSessionRuntimeType } from '../../../shared/agent-types.js';
 import { LocalWebPreviewRegistry, setPreviewActiveRelayHook, setPreviewEvictedHook } from '../preview/registry.js';
-import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, createSubSessionsBatch, getSubSessionById, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent, getUserPref, setUserPref, deleteUserPref, getDbSessionsByServer, getUserById, insertDiscussionComment } from '../db/queries.js';
+import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, createSubSessionsBatch, getSubSessionById, isExecutionCloneRow, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent, getUserPref, setUserPref, deleteUserPref, getDbSessionsByServer, getUserById, insertDiscussionComment } from '../db/queries.js';
 import {
   SUBSESSION_CREATED_BATCH_MSG,
   SUBSESSION_SYNC_BATCH_MAX_ITEMS,
@@ -396,7 +396,11 @@ import {
   classifyTaskPairNotificationType,
   type PushNotificationType,
 } from '../../../shared/push-notifications.js';
-import { TASK_PAIR_TIMELINE_EVENT } from '../../../shared/task-pair.js';
+import {
+  TASK_PAIR_TIMELINE_EVENT,
+  SUBSESSION_NAME_PREFIX,
+  isAutoCreatedSubSessionName,
+} from '../../../shared/task-pair.js';
 import { isServerLinkResyncStatePayload } from '../../../shared/session-activity-types.js';
 import {
   DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION,
@@ -1255,6 +1259,8 @@ type WatchActiveSubSessionRow = {
   agentType?: string;
   runtimeType?: string;
   label?: string;
+  isExecutionClone?: boolean;
+  isAutoCreatedPairSession?: boolean;
 };
 
 interface DaemonP2pWorkflowCapabilities {
@@ -6555,6 +6561,7 @@ export class WsBridge {
       if (env && !privateSession) {
         const pushType = msg.type as string;
         if (pushType === 'session.idle') {
+          if (msg[TIMELINE_SUPPRESS_PUSH_FIELD] === true) return;
           this.scheduleIdleEventPush(db, env, msg);
         } else if (pushType === 'session.error') {
           this.dispatchEventPush(db, env, msg).catch((err) =>
@@ -10586,6 +10593,12 @@ export class WsBridge {
         : agentType
           ? getSessionRuntimeType(agentType)
           : undefined;
+      const execCloneMeta = msg.executionCloneMetadata && typeof msg.executionCloneMetadata === 'object'
+        ? (msg.executionCloneMetadata as Record<string, unknown>)
+        : null;
+      const pairCreatedMeta = msg.pairCreatedMetadata && typeof msg.pairCreatedMetadata === 'object'
+        ? (msg.pairCreatedMetadata as Record<string, unknown>)
+        : null;
       this.activeSubSessions.set(subSessionName, {
         name: subSessionName,
         state: typeof msg.state === 'string' ? msg.state : undefined,
@@ -10593,6 +10606,8 @@ export class WsBridge {
         parentSession,
         agentType,
         runtimeType,
+        ...(execCloneMeta?.kind === EXECUTION_CLONE_KIND ? { isExecutionClone: true } : {}),
+        ...(pairCreatedMeta?.autoCreated === true ? { isAutoCreatedPairSession: true } : {}),
       });
       const subIdentityProjectKey = sessionIdentityProjectKey({
         contextNamespace: msg.contextNamespace as { projectId?: unknown } | null | undefined,
@@ -14079,9 +14094,18 @@ export class WsBridge {
     return merged;
   }
 
+  private isSuppressedIdlePushSession(sessionName: string): boolean {
+    if (!sessionName) return false;
+    if (isAutoCreatedSubSessionName(sessionName)) return true;
+    const activeSub = this.activeSubSessions.get(sessionName);
+    return activeSub?.isExecutionClone === true || activeSub?.isAutoCreatedPairSession === true;
+  }
+
   private scheduleIdleEventPush(db: Database, env: Env, msg: Record<string, unknown>): void {
     const sessionName = String(msg.session ?? msg.sessionId ?? '');
     if (!sessionName) return;
+    if (msg[TIMELINE_SUPPRESS_PUSH_FIELD] === true) return;
+    if (this.isSuppressedIdlePushSession(sessionName)) return;
     const key = `session.idle:${sessionName}`;
     const existing = this.pendingIdlePushes.get(key);
     if (existing?.timer) clearTimeout(existing.timer);
@@ -14172,12 +14196,19 @@ export class WsBridge {
     let assistantEventId: string | undefined;
     let pushType: PushNotificationType;
     switch (eventType) {
-      case 'session.idle':
+      case 'session.idle': {
+        if (this.isSuppressedIdlePushSession(sessionName)) return;
+        if (sessionName.startsWith(SUBSESSION_NAME_PREFIX)) {
+          const subId = sessionName.slice(SUBSESSION_NAME_PREFIX.length);
+          const subRow = subId ? await getSubSessionById(db, subId, this.serverId).catch(() => null) : null;
+          if (subRow && isExecutionCloneRow(subRow)) return;
+        }
         title = titleParts.join(' · ');
         ({ text: body, eventId: assistantEventId } = this.resolveLatestAssistantForPush(sessionName, daemonLastText));
         body = body || 'Task complete — ready for input';
         pushType = PUSH_NOTIFICATION_TYPE_TASK_COMPLETE;
         break;
+      }
       case 'session.error':
         title = titleParts.join(' · ');
         body = `Error: ${String(msg.error ?? 'unknown')}`;
