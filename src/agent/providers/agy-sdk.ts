@@ -104,7 +104,8 @@ interface AgySessionState {
   compactionWatermark: AgyCompactionWatermark;
   sessionSystemTextInjected?: string;
   stderrTail: string;
-  toolSteps: Map<number, string>;
+  toolSteps: Map<string, { id: string; name: string }>;
+  nextSyntheticToolStep?: number;
   mayHaveHistoricalError: boolean;
   /** An error result is being checked against durable history; cancellation wins over this read. */
   historyReadInFlight: boolean;
@@ -697,9 +698,9 @@ export class AgySdkProvider implements TransportProvider {
 
   private clearOpenToolSteps(sessionId: string, state: AgySessionState): void {
     if (state.toolSteps.size === 0) return;
-    for (const [, id] of state.toolSteps) {
+    for (const [, entry] of state.toolSteps) {
       // Background children settle only on explicit child snapshots, not parent turn end.
-      const tool: ToolCallEvent = { id, name: 'tool', status: 'complete' };
+      const tool: ToolCallEvent = { id: entry.id, name: 'tool', status: 'complete' };
       for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
     }
     state.toolSteps.clear();
@@ -877,17 +878,36 @@ export class AgySdkProvider implements TransportProvider {
     }
 
     if (stepType === AGY_STEP_TYPE.TOOL) {
-      const stepIndex = asNumber(step.step_index) ?? -1;
+      const rawStepIndex = asNumber(step.step_index);
       const info = asRecord(step.tool_info);
       const name = asString(step.tool_name) ?? asString(info.name) ?? 'tool';
-      let id = state.toolSteps.get(stepIndex);
-      if (!id) {
-        id = `${state.conversationId ?? state.routeId}:${stepIndex}`;
-        state.toolSteps.set(stepIndex, id);
-      }
-      state.sawToolCall = true;
       const failed = /^(ERROR|FAILED|CANCELLED)$/.test(stepState ?? '');
       const done = stepState === AGY_STEP_STATE.DONE || failed;
+      const toolCallId = asString(step.tool_call_id) ?? asString(info.tool_call_id) ?? asString(info.id);
+      let stepKey: string;
+      if (rawStepIndex !== undefined) {
+        stepKey = `step:${rawStepIndex}`;
+      } else if (toolCallId) {
+        stepKey = `call:${toolCallId}`;
+      } else {
+        const nextSynthetic = () => {
+          const n = (state.nextSyntheticToolStep ?? 0) + 1;
+          state.nextSyntheticToolStep = n;
+          return `anon:${n}`;
+        };
+        const matchingUnindexed = done
+          ? [...state.toolSteps.entries()].find(([k, v]) => k.startsWith('anon:') && v.name === name)
+          : undefined;
+        stepKey = matchingUnindexed?.[0] ?? nextSynthetic();
+      }
+      let existingStep = state.toolSteps.get(stepKey);
+      if (!existingStep || (rawStepIndex === undefined && existingStep.name !== name)) {
+        const suffix = rawStepIndex ?? toolCallId ?? stepKey;
+        existingStep = { id: `${state.conversationId ?? state.routeId}:${suffix}`, name };
+        state.toolSteps.set(stepKey, existingStep);
+      }
+      const id = existingStep.id;
+      state.sawToolCall = true;
       const output = typeof info.output === 'string' ? info.output : info.output !== undefined ? JSON.stringify(info.output) : undefined;
       const tool: ToolCallEvent = {
         id,
@@ -905,7 +925,7 @@ export class AgySdkProvider implements TransportProvider {
 
 
       if (done) {
-        state.toolSteps.delete(stepIndex);
+        state.toolSteps.delete(stepKey);
         this.emitStatus(sessionId, state, {
           status: state.toolSteps.size > 0 ? 'tool_running' : 'thinking',
           label: state.toolSteps.size > 0 ? 'Running tool...' : 'Thinking...',

@@ -40,6 +40,12 @@ function status(value: unknown): SdkSubagentNormalizedStatus | undefined {
   if (/^(running|active|pending|queued|in_progress|working|thinking)$/.test(v)) return SDK_SUBAGENT_STATUS.RUNNING;
   return undefined;
 }
+const extractToolTarget = (row: Record<string, unknown>): string | undefined => string(
+  row.conversationId, row.conversation_id, row.ConversationId,
+  row.agentId, row.agent_id, row.agentPath, row.agent_path,
+  row.id, row.target, row.targetId, row.target_id, row.recipient, row.Recipient,
+);
+
 interface Child { key: string; id: string; name?: string; model?: string; prompt?: string; started: number; state: SdkSubagentNormalizedStatus; toolId?: string; }
 
 /** Shared AG tool/snapshot adapter. Parent tool completion is not proof that a
@@ -134,18 +140,27 @@ export class AgySubagentTracker {
     const input = toolInput(tool);
     const name = normalizeAgyToolName(tool.name);
     const action = string(input.action, input.Action, input.command, input.Command) ?? name;
+    const candidates = Array.isArray(input.Subagents) ? input.Subagents : Array.isArray(input.agents) ? input.agents : [input];
+    const definition = name === 'definesubagent';
+    const launch = name === 'invokesubagent' || name === 'browsersubagent' || name === 'subagent' || name === 'agent' || (name === 'swarm' && /^(add|start|create)$/.test(action));
+    const kill = /^(kill|stop|cancel|terminate)$/.test(action);
+    // send_message can only message an already-tracked child sub-agent; calls
+    // targeting external/IM.codes sessions (e.g. deck_sub_*) or unlaunched IDs
+    // must never invent a bogus Antigravity sub-agent entry.
+    if (name === 'sendmessage' && !candidates.some((entry) => {
+      const target = extractToolTarget(record(entry));
+      return Boolean(target && this.children.has(target));
+    })) {
+      return [];
+    }
     const launchResult = /^(invokesubagent|browsersubagent)$/.test(name) || name === 'swarm' && /^(add|start|create)$/.test(action);
     const snapshot = this.snapshot(tool.output, action, tool.id, launchResult ? tool.status === 'error' ? SDK_SUBAGENT_STATUS.ERROR : SDK_SUBAGENT_STATUS.RUNNING : undefined);
     if (snapshot.length) return snapshot;
-    const candidates = Array.isArray(input.Subagents) ? input.Subagents : Array.isArray(input.agents) ? input.agents : [input];
     const result: ToolCallEvent[] = [];
     for (let i = 0; i < candidates.length; i++) {
       const row = record(candidates[i]);
-      const target = string(row.conversationId, row.conversation_id, row.ConversationId, row.agentId, row.agent_id, row.agentPath, row.agent_path, row.id, row.target, row.targetId, row.target_id, row.recipient, row.Recipient);
-      const definition = name === 'definesubagent';
-      const launch = name === 'invokesubagent' || name === 'browsersubagent' || name === 'subagent' || name === 'agent' || (name === 'swarm' && /^(add|start|create)$/.test(action));
-      const kill = /^(kill|stop|cancel|terminate)$/.test(action);
-      if (!launch && !definition && !target) continue;
+      const target = extractToolTarget(row);
+      if (!launch && !definition && (!target || !this.children.has(target))) continue;
       if (definition && tool.status === 'running') continue;
       const id = target ?? this.toolChildren.get(tool.id)?.[i] ?? `${definition ? 'definition:' : ''}${tool.id}${candidates.length > 1 ? `:${i}` : ''}`;
       if (!target && !this.toolChildren.get(tool.id)?.[i]) this.unbound.add(id);

@@ -94,4 +94,51 @@ describe('AG native child lifecycle adapter', () => {
     expect(tracker.tool({id:'new-send',name:'send_message',status:'running',input:{Recipient:'finished'}})[0].detail?.meta?.active).toBe(true);
   });
 
+  it('ignores send_message and non-launch kill calls for unknown or IM.codes deck_sub_* targets', () => {
+    const tracker = new AgySubagentTracker('parent');
+    expect(tracker.tool({
+      id: 'send-deck-1',
+      name: 'send_message',
+      status: 'running',
+      input: { Recipient: 'deck_sub_602p4q1r', Message: 'hello sibling' },
+    })).toEqual([]);
+    expect(tracker.tool({
+      id: 'send-deck-1',
+      name: 'send_message',
+      status: 'error',
+      input: { Recipient: 'deck_sub_602p4q1r', Message: 'hello sibling' },
+      output: 'Created At: 2026-11-13T20:18:29+08:00\nsend_list_targets',
+    })).toEqual([]);
+    expect(tracker.tool({
+      id: 'send-deck-2',
+      name: 'send_message',
+      status: 'complete',
+      input: { Recipient: 'deck_sub_pair_auto_e4ba27483bf435b4', Message: 'audit' },
+      output: JSON.stringify({ id: 'msg_99', status: 'queued' }),
+    })).toEqual([]);
+    expect(tracker.tool({
+      id: 'kill-unknown',
+      name: 'manage_subagents',
+      status: 'complete',
+      input: { action: 'kill', conversationId: 'deck_sub_602p4q1r' },
+    })).toEqual([]);
+    expect(tracker.isNativeChild('deck_sub_602p4q1r')).toBe(false);
+
+    // Known children launched via invoke_subagent still track send_message normally.
+    tracker.tool({
+      id: 'launch-known',
+      name: 'invoke_subagent',
+      status: 'complete',
+      output: JSON.stringify({ conversationId: 'real-child', status: 'running' }),
+    });
+    const sendKnown = tracker.tool({
+      id: 'send-known',
+      name: 'send_message',
+      status: 'running',
+      input: { Recipient: 'real-child', Message: 'continue' },
+    });
+    expect(sendKnown).toHaveLength(1);
+    expect(sendKnown[0].detail?.meta).toMatchObject({ agentPath: 'real-child', active: true });
+  });
+
 });

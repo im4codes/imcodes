@@ -2985,6 +2985,8 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   const [filePanelWidth, setFilePanelWidth] = useState(() => readPanelWidth(sessionId));
   // GLOBAL toggle (not per-session): defaults open, synced across windows/tabs.
   const [desiredAgentsOpen, setDesiredAgentsOpen] = useState(readSdkAgentsOpen);
+  // Explicit manual inspection of recent terminal/diagnostic rows when runningCount === 0.
+  const [inspectRecentAgentsOpen, setInspectRecentAgentsOpen] = useState(false);
   const dragStateRef = useRef<{ startX: number; startWidth: number } | null>(null);
   const filePanelWidthRef = useRef(filePanelWidth);
   filePanelWidthRef.current = filePanelWidth;
@@ -3007,6 +3009,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     prevSessionIdRef.current = sessionId;
     setShowFilePanel(readPanelOpen(sessionId));
     setFilePanelWidth(readPanelWidth(sessionId));
+    setInspectRecentAgentsOpen(false);
   }, [sessionId]);
 
   const toggleFilePanel = useCallback(() => {
@@ -3021,10 +3024,6 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     // Persist + broadcast; every window's listener (incl. this one) updates state.
     writeSdkAgentsOpen(next);
   }, []);
-
-  const toggleAgentsPanel = useCallback(() => {
-    setDesiredAgentsPanelOpen(!desiredAgentsOpen);
-  }, [desiredAgentsOpen, setDesiredAgentsPanelOpen]);
 
   const onDragStart = useCallback((e: MouseEvent) => {
     e.preventDefault();
@@ -3382,26 +3381,43 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   useEffect(() => {
     if (!hasSdkAgentEvents) return;
     setSdkAgentsNow(Date.now());
-  }, [hasSdkAgentEvents, events]);
+  }, [hasSdkAgentEvents, events, visible]);
   const sdkAgentsStatus = useMemo(
     () => deriveSdkSubagentStatusRows(events, sdkAgentsNow),
     [events, sdkAgentsNow],
   );
+  const runningAgentsCount = sdkAgentsStatus.runningCount;
   const hasAgentsStatusRows = sdkAgentsStatus.rows.length > 0 || sdkAgentsStatus.diagnostics.length > 0;
   useEffect(() => {
     if (!visible || !hasAgentsStatusRows) return undefined;
     const timer = window.setInterval(() => setSdkAgentsNow(Date.now()), 1_000);
     return () => window.clearInterval(timer);
   }, [hasAgentsStatusRows, visible]);
+  useEffect(() => {
+    // Any transition back to active work or empty history clears manual idle peek
+    // so finishing sub-agents always auto-close cleanly once runningCount hits 0.
+    if ((runningAgentsCount > 0 || !hasAgentsStatusRows) && inspectRecentAgentsOpen) {
+      setInspectRecentAgentsOpen(false);
+    }
+  }, [hasAgentsStatusRows, inspectRecentAgentsOpen, runningAgentsCount]);
+  const toggleAgentsPanel = useCallback(() => {
+    if (runningAgentsCount === 0 && hasAgentsStatusRows) {
+      setInspectRecentAgentsOpen((open) => !open);
+      return;
+    }
+    setInspectRecentAgentsOpen(false);
+    setDesiredAgentsPanelOpen(!desiredAgentsOpen);
+  }, [desiredAgentsOpen, hasAgentsStatusRows, runningAgentsCount, setDesiredAgentsPanelOpen]);
   // Preview cards reuse the existing Agents panel when background work exists.
   // The aggregator only accepts sdkSubagent events, so ordinary Bash tool calls
   // never make this control or panel appear.
   const canShowAgentsControl = !preview || hasAgentsStatusRows;
-  // Keep the panel mounted for every retained sub-agent row, not only while at
-  // least one child is currently running. Otherwise a just-finished child (or
-  // a provider diagnostic) makes the entire list disappear even though the
-  // aggregator still has authoritative status to show.
-  const showAgentsPane = canShowAgentsControl && desiredAgentsOpen && hasAgentsStatusRows;
+  // Auto-open while runningCount > 0 (honoring desiredAgentsOpen). Once runningCount
+  // reaches 0, auto-close immediately instead of leaving "0 running" + retained rows
+  // open for minutes; users can still click the toolbar toggle to inspect recent rows.
+  const showAgentsPane = canShowAgentsControl
+    && hasAgentsStatusRows
+    && (runningAgentsCount > 0 ? desiredAgentsOpen : inspectRecentAgentsOpen);
   const canShowFilePanel = !preview && !!ws;
   useLayoutEffect(() => {
     const titlebar = chatTitlebarRef.current;
@@ -4626,7 +4642,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
           {canShowAgentsControl && (
             <button
               type="button"
-              class={`chat-panel-toggle chat-sdk-agents-toggle${desiredAgentsOpen ? ' active' : ''}`}
+              class={`chat-panel-toggle chat-sdk-agents-toggle${(desiredAgentsOpen || showAgentsPane) ? ' active' : ''}`}
               onClick={toggleAgentsPanel}
               title={t('chat.sdk_agents_toggle')}
               aria-label={t('chat.sdk_agents_toggle_aria', { count: sdkAgentsStatus.runningCount })}
@@ -5130,7 +5146,14 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
           diagnostics={sdkAgentsStatus.diagnostics}
           runningCount={sdkAgentsStatus.runningCount}
           now={sdkAgentsNow}
-          onClose={() => setDesiredAgentsPanelOpen(false)}
+          onClose={() => {
+            if (runningAgentsCount === 0) {
+              setInspectRecentAgentsOpen(false);
+            } else {
+              setInspectRecentAgentsOpen(false);
+              setDesiredAgentsPanelOpen(false);
+            }
+          }}
         />
       )}
       {canShowFilePanel && showFilePanel && ws && (

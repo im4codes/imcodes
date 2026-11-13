@@ -1285,4 +1285,127 @@ rl.on('line', (line) => {
     expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false);
     expect(errors).not.toHaveBeenCalled();
   });
+
+  it('does not create bogus Agent cards or bleed sibling background/MCP outputs onto parallel subagent tool calls', async () => {
+    const { provider, root } = await setup('native-child-log');
+    const id = await route(provider, 'deck_test_parallel_bleed');
+    const done = vi.fn();
+    const events: ToolCallEvent[] = [];
+    provider.onComplete(done);
+    provider.onToolCall((_, tool) => events.push(tool));
+
+    await provider.send(id, 'launch');
+    await vi.waitFor(() => expect(done).toHaveBeenCalledTimes(2), { timeout: 5000 });
+
+    const state = (provider as any).sessions.get(id);
+    const nativeId = state.acpSessionId as string;
+    const file = path.join(root, '.gemini/antigravity-cli/brain', nativeId, '.system_generated/logs/transcript_full.jsonl');
+    const beforeAgentCount = events.filter((e) => e.detail?.kind === SDK_SUBAGENT_DETAIL_KIND).length;
+    const update = (u: any) => (provider as any).handleSessionUpdate({ sessionId: nativeId, update: u });
+
+    // Case 1: send_message to IM.codes deck_sub_* in parallel with run_command background task & send_list_targets.
+    update({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'peer-send-1',
+      title: 'Run send_message',
+      status: 'in_progress',
+      rawInput: { Recipient: 'deck_sub_602p4q1r', Message: 'ping' },
+    });
+    update({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'peer-send-1',
+      status: 'failed',
+      rawOutput: 'recipient not found',
+    });
+    update({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'mcp-list-1',
+      title: 'send_list_targets',
+      status: 'completed',
+      rawOutput: 'Created At: 2026-11-13T20:18:29+08:00\nsend_list_targets: []',
+    });
+
+    await appendFile(
+      file,
+      JSON.stringify({
+        step_index: 10,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: '',
+        tool_calls: [
+          { name: 'send_message', args: { Recipient: 'deck_sub_602p4q1r', Message: 'ping' } },
+          { name: 'send_list_targets', args: {} },
+          { name: 'run_command', args: { CommandLine: 'sleep 10', WaitMsBeforeAsync: 5000 } },
+        ],
+      }) + '\n'
+      + JSON.stringify({
+        step_index: 11,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: `Tool is running as a background task with task id: ${nativeId}/task-999`,
+      }) + '\n'
+      + JSON.stringify({
+        step_index: 12,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: 'Created At: 2026-11-13T20:18:29+08:00\nsend_list_targets: []',
+      }) + '\n'
+      + JSON.stringify({
+        step_index: 13,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: 'checked',
+      }) + '\n',
+    );
+
+    await vi.waitFor(() => {
+      expect(provider.getActiveWorkSnapshot(id)?.busyReasons).toContain('background_monitor');
+    }, { timeout: 5000 });
+    expect(events.filter((e) => e.detail?.kind === SDK_SUBAGENT_DETAIL_KIND)).toHaveLength(beforeAgentCount);
+
+    // Case 2: parallel [invoke_subagent, run_command] where run_command's RUNNING row arrives first.
+    update({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'parallel-launch-1',
+      title: 'Run invoke_subagent',
+      status: 'in_progress',
+      rawInput: { Role: 'ParallelWorker', Prompt: 'work' },
+    });
+    update({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'parallel-launch-1',
+      status: 'completed',
+    });
+    await appendFile(
+      file,
+      JSON.stringify({
+        step_index: 14,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        content: '',
+        tool_calls: [
+          { name: 'invoke_subagent', args: { Role: 'ParallelWorker', Prompt: 'work' } },
+          { name: 'run_command', args: { CommandLine: 'npm test', WaitMsBeforeAsync: 5000 } },
+        ],
+      }) + '\n'
+      + JSON.stringify({
+        step_index: 15,
+        type: 'GENERIC',
+        status: 'RUNNING',
+        content: `Tool is running as a background task with task id: ${nativeId}/task-1000`,
+      }) + '\n'
+      + JSON.stringify({
+        step_index: 16,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: 'Created the following subagent:\n' + JSON.stringify({ conversationId: 'parallel-child-1', status: 'running' }),
+      }) + '\n',
+    );
+
+    await vi.waitFor(() => {
+      const bound = events.find((e) => e.detail?.meta?.agentPath === 'parallel-child-1');
+      expect(bound).toBeTruthy();
+      expect(bound?.output ?? '').not.toContain('Tool is running as a background task');
+    }, { timeout: 5000 });
+  });
 });

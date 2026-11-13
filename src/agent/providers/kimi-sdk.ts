@@ -297,6 +297,7 @@ interface KimiSdkSessionState {
   agyPendingNativeTools?: Map<string, ToolCallEvent>;
   agyConsumedNativeTools?: Set<string>;
   agyNativeToolOrder?: Array<{name:string;input:unknown;step:number;index:number}>;
+  agyRecentAcpOutputs?: Array<{normalizedName:string;output:string}>;
   agyReactive?: boolean;
   agyPendingResponses?: Map<number, AgyTranscriptRow>;
   // Receipts for pre-async ACP autonomous completions; native authority
@@ -674,6 +675,7 @@ export class KimiSdkProvider implements TransportProvider {
     if (state.agyForeground) state.agyForeground.authoritative = !!nativeAuthority;
     state.agyProvisionalAutoMessageId = undefined;
     state.agyPendingNativeTools?.clear(); state.agyConsumedNativeTools?.clear(); state.agyNativeToolOrder = [];
+    state.agyRecentAcpOutputs = [];
   }
 
   /**
@@ -771,25 +773,44 @@ export class KimiSdkProvider implements TransportProvider {
     }
     const claimedByForeground = state.agyForeground?.observe(row, cursor) === true;
     if (row.type === 'SYSTEM_MESSAGE' && /\[Message\].*sender=/.test(row.content ?? '')) this.useAgyNativeOutput(state);
-    if (row.type === 'PLANNER_RESPONSE' && row.tool_calls?.length) {
-      if (row.tool_calls.some(call => /^(invokesubagent|browsersubagent|sendmessage|swarm)$/.test(normalizeAgyToolName(call.name ?? '')))) this.useAgyNativeOutput(state);
-      for (const [index,call] of row.tool_calls.entries()) (state.agyNativeToolOrder ??= []).push({name:call.name ?? '',input:call.args,step:row.step_index,index});
+    if (row.type === 'USER_INPUT') {
+      state.agyNativeToolOrder = [];
+    }
+    if (row.type === 'PLANNER_RESPONSE') {
+      if (row.tool_calls?.length) {
+        if (row.tool_calls.some(call => /^(invokesubagent|browsersubagent|sendmessage|swarm)$/.test(normalizeAgyToolName(call.name ?? '')))) this.useAgyNativeOutput(state);
+        for (const [index,call] of row.tool_calls.entries()) (state.agyNativeToolOrder ??= []).push({name:call.name ?? '',input:call.args,step:row.step_index,index});
+      } else {
+        // Final response without tool_calls closes the tool batch so skipped/errored
+        // tool calls from an earlier step cannot misalign future GENERIC rows.
+        state.agyNativeToolOrder = [];
+      }
     }
     if (row.type === 'GENERIC' && row.content) {
-      const nativeTool = state.agyNativeToolOrder?.shift();
+      const nativeTool = takeAgyNativeToolForGenericRow(state, row);
       this.updateAgyBackgroundTasks(sessionId, state, {
         text: row.content,
         toolName: nativeTool?.name,
         toolInput: nativeTool?.input,
       });
       if (nativeTool && isAgySubagentTool(nativeTool.name)) {
-        const pending = [...(state.agyPendingNativeTools?.values() ?? [])]
-          .find(tool => normalizeAgyToolName(tool.name) === normalizeAgyToolName(nativeTool.name));
+        const nativeNormalized = normalizeAgyToolName(nativeTool.name);
+        const pendingList = [...(state.agyPendingNativeTools?.values() ?? [])]
+          .filter(tool => normalizeAgyToolName(tool.name) === nativeNormalized);
+        const nativeInputJson = safeStableJson(nativeTool.input);
+        const pending = (nativeInputJson
+          ? pendingList.find(tool => safeStableJson(tool.input) === nativeInputJson)
+          : undefined) ?? pendingList[0];
         const toolId = pending?.id ?? `${state.acpSessionId}:native-tool:${nativeTool.step}:${nativeTool.index}`;
         state.agyPendingNativeTools?.delete(toolId);
         (state.agyConsumedNativeTools ??= new Set()).add(toolId);
+        // If ACP already delivered a distinct non-empty output for this tool call,
+        // keep it rather than overwriting with a transcript row that may have shifted.
+        const output = pending && pending.status !== 'running' && pending.output?.trim()
+          ? pending.output
+          : row.content;
         const events = tracker.tool({id:toolId,name:nativeTool.name,input:pending?.input ?? nativeTool.input,
-          status:pending?.status === 'error' ? 'error' : 'complete',output:row.content});
+          status:pending?.status === 'error' ? 'error' : 'complete',output});
         publish(events);
       }
     }
@@ -2600,6 +2621,11 @@ export class KimiSdkProvider implements TransportProvider {
         toolInput: merged.rawInput,
         toolStatus: evt.status,
       });
+      if (normalizedStatus !== 'running' && outputValue !== undefined && !isAgySubagentTool(merged.title)) {
+        const recent = state.agyRecentAcpOutputs ??= [];
+        recent.push({ normalizedName: normalizeAgyToolName(merged.title), output: outputValue });
+        if (recent.length > 32) recent.splice(0, recent.length - 32);
+      }
       if (isAgySubagentTool(merged.title) && !state.agyConsumedNativeTools?.has(evt.id)) {
         (state.agyPendingNativeTools ??= new Map()).set(evt.id,evt);
       }
@@ -2948,4 +2974,43 @@ function extractAgyBackgroundTaskTerminalIds(
     }
   }
   return ids;
+}
+
+function safeStableJson(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function takeAgyNativeToolForGenericRow(
+  state: KimiSdkSessionState,
+  row: AgyTranscriptRow,
+): { name: string; input: unknown; step: number; index: number } | undefined {
+  const order = state.agyNativeToolOrder;
+  if (!order?.length) return undefined;
+  const content = row.content ?? '';
+  const recent = state.agyRecentAcpOutputs;
+  if (recent?.length) {
+    const recentIdx = recent.findIndex(item => item.output === content);
+    if (recentIdx >= 0) {
+      const matched = recent.splice(recentIdx, 1)[0];
+      const orderIdx = order.findIndex(entry => normalizeAgyToolName(entry.name) === matched.normalizedName);
+      if (orderIdx >= 0) return order.splice(orderIdx, 1)[0];
+    }
+  }
+  if (row.status === 'RUNNING' || extractAgyBackgroundTaskStartIds(content).length > 0) {
+    // Background task notices belong to background-capable tools (e.g. run_command / schedule),
+    // never to sub-agent tools; splicing the matching non-subagent entry keeps FIFO aligned.
+    const bgIdx = order.findIndex((entry) => {
+      const n = normalizeAgyToolName(entry.name);
+      return !isAgySubagentTool(entry.name) && (n === 'runcommand' || n === 'schedule');
+    });
+    if (bgIdx >= 0) return order.splice(bgIdx, 1)[0];
+    const nonSubagentIdx = order.findIndex(entry => !isAgySubagentTool(entry.name));
+    return nonSubagentIdx >= 0 ? order.splice(nonSubagentIdx, 1)[0] : undefined;
+  }
+  return order.shift();
 }

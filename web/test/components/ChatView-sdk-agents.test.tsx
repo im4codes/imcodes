@@ -252,13 +252,20 @@ describe('ChatView SDK agents panel', () => {
       .toBeLessThan(Array.from(actions?.children ?? []).indexOf(agentsButton as Element));
   });
 
-  it('remembers desired-open state, keeps all retained agent statuses visible, and honors manual close', () => {
+  it('auto-closes when runningCount drops to 0, allows manual recent inspect, and honors manual close', () => {
     const runningEvent = makeSdkEvent('agent-running', makeMeta({ childStatusSummary: 'Checking files' }));
     const terminalEvent = makeSdkEvent('agent-complete', makeMeta({
       normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
       active: false,
       terminal: true,
       childStatusSummary: 'Finished child work',
+    }));
+    const errorEvent = makeSdkEvent('agent-error', makeMeta({
+      canonicalKey: 'claude:deck_agents:task-error',
+      normalizedStatus: SDK_SUBAGENT_STATUS.ERROR,
+      active: false,
+      terminal: true,
+      childStatusSummary: 'Errored child work',
     }));
     const diagnosticEvent = makeSdkEvent('agent-diagnostic', makeMeta({
       canonicalKey: 'claude:deck_agents:diagnostic',
@@ -267,7 +274,7 @@ describe('ChatView SDK agents panel', () => {
       terminal: true,
       diagnosticCode: SDK_SUBAGENT_DIAGNOSTIC.UNKNOWN_STATE,
     }));
-    // Start from an explicit CLOSED state — the toggle now defaults OPEN globally.
+    // Start from an explicit CLOSED state — the toggle defaults OPEN globally.
     localStorage.setItem('chatSdkAgentsPanelOpen:desktop', '0');
     const { container, rerender } = render(
       <ChatView events={[]} loading={false} sessionId="deck_agents" />,
@@ -276,8 +283,6 @@ describe('ChatView SDK agents panel', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Toggle SDK agents status, 0 running' }));
     expect(localStorage.getItem('chatSdkAgentsPanelOpen:desktop')).toBe('1');
     expect(container.querySelector('.chat-sdk-agents-panel')).toBeNull();
-    // `.active` now reflects the OPEN/closed toggle state, not whether agents are
-    // running: toggled open with 0 agents is still active, and the badge shows 0.
     const openZeroButton = screen.getByRole('button', { name: 'Toggle SDK agents status, 0 running' });
     expect(openZeroButton.classList.contains('active')).toBe(true);
     expect(openZeroButton.textContent).toContain('0');
@@ -288,21 +293,31 @@ describe('ChatView SDK agents panel', () => {
     expect(screen.getByRole('button', { name: 'Toggle SDK agents status, 1 running' }).classList.contains('active')).toBe(true);
     expect(screen.getByText('Checking files')).toBeTruthy();
 
+    // When all agents finish (runningCount === 0), the panel closes automatically
+    // instead of remaining expanded with "0 running", while preserving desired-open = '1'.
     rerender(<ChatView events={[terminalEvent]} loading={false} sessionId="deck_agents" />);
-    expect(screen.getByRole('region', { name: 'Agents' })).toBeTruthy();
-    expect(screen.getByText('Finished child work')).toBeTruthy();
-    expect(container.querySelector('.chat-view-wrap')?.classList.contains('chat-split')).toBe(true);
+    expect(screen.queryByRole('region', { name: 'Agents' })).toBeNull();
+    expect(container.querySelector('.chat-view-wrap')?.classList.contains('chat-split')).toBe(false);
     expect(localStorage.getItem('chatSdkAgentsPanelOpen:desktop')).toBe('1');
-    // Finished agents remain visible while retained; the badge still reports
-    // only active children.
     expect(screen.getByRole('button', { name: 'Toggle SDK agents status, 0 running' }).classList.contains('active')).toBe(true);
 
-    rerender(<ChatView events={[diagnosticEvent]} loading={false} sessionId="deck_agents" />);
+    // Explicit click on the toolbar button while 0 running opens manual inspection of retained recent/error rows.
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle SDK agents status, 0 running' }));
     expect(screen.getByRole('region', { name: 'Agents' })).toBeTruthy();
+    expect(screen.getByText('Finished child work')).toBeTruthy();
+
+    // Retained diagnostics/errors also remain inspectable when explicitly opened.
+    rerender(<ChatView events={[errorEvent, diagnosticEvent]} loading={false} sessionId="deck_agents" />);
+    expect(screen.getByRole('region', { name: 'Agents' })).toBeTruthy();
+    expect(screen.getByText('Errored child work')).toBeTruthy();
     expect(screen.getByText('Diagnostics')).toBeTruthy();
-    expect(container.querySelector('.chat-view-wrap')?.classList.contains('chat-split')).toBe(true);
+
+    // Closing manual idle inspection leaves desired-open = '1' so future running agents still open.
+    fireEvent.click(screen.getByRole('button', { name: 'Close Agents panel' }));
+    expect(container.querySelector('.chat-sdk-agents-panel')).toBeNull();
     expect(localStorage.getItem('chatSdkAgentsPanelOpen:desktop')).toBe('1');
 
+    // A subsequent running agent opens automatically again, and closing while running persists '0'.
     rerender(<ChatView events={[runningEvent]} loading={false} sessionId="deck_agents" />);
     expect(screen.getByRole('region', { name: 'Agents' })).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'Close Agents panel' }));
@@ -575,5 +590,72 @@ describe('ChatView SDK agents panel', () => {
     expect(container.querySelector('.chat-sdk-agents-panel')).toBeTruthy();
     expect(screen.queryByText('Finished child work')).toBeNull();
     expect(localStorage.getItem('chatSdkAgentsPanelOpen:desktop')).toBe('1');
+  });
+
+  it('closes immediately when active work finishes even if manual recent inspect had been used beforehand', () => {
+    localStorage.setItem('chatSdkAgentsPanelOpen:desktop', '1');
+    const firstDone = makeSdkEvent('agent-done-1', makeMeta({
+      canonicalKey: 'claude:deck_agents:done-1',
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      active: false,
+      terminal: true,
+      childStatusSummary: 'First finished',
+    }));
+    const secondRunning = makeSdkEvent('agent-run-2', makeMeta({
+      canonicalKey: 'claude:deck_agents:run-2',
+      normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+      active: true,
+      terminal: false,
+      childStatusSummary: 'Second running',
+    }));
+    const secondDone = makeSdkEvent('agent-done-2', makeMeta({
+      canonicalKey: 'claude:deck_agents:run-2',
+      normalizedStatus: SDK_SUBAGENT_STATUS.COMPLETE,
+      active: false,
+      terminal: true,
+      childStatusSummary: 'Second finished',
+    }));
+
+    const { rerender } = render(
+      <ChatView events={[firstDone]} loading={false} sessionId="deck_agents" />,
+    );
+    expect(screen.queryByRole('region', { name: 'Agents' })).toBeNull();
+
+    // User manually opens while 0 running.
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle SDK agents status, 0 running' }));
+    expect(screen.getByRole('region', { name: 'Agents' })).toBeTruthy();
+    expect(screen.getByText('First finished')).toBeTruthy();
+
+    // New running agent starts, then finishes -> panel auto-closes instead of staying stuck in inspect mode.
+    rerender(<ChatView events={[firstDone, secondRunning]} loading={false} sessionId="deck_agents" />);
+    expect(screen.getByRole('region', { name: 'Agents' })).toBeTruthy();
+    expect(screen.getByText('Second running')).toBeTruthy();
+
+    rerender(<ChatView events={[firstDone, secondDone]} loading={false} sessionId="deck_agents" />);
+    expect(screen.queryByRole('region', { name: 'Agents' })).toBeNull();
+  });
+
+  it('refreshes active duration immediately when visible switches from false to true', () => {
+    const start = new Date('2026-05-31T12:00:00.000Z').getTime();
+    vi.useFakeTimers();
+    vi.setSystemTime(start);
+    localStorage.setItem('chatSdkAgentsPanelOpen:desktop', '1');
+    const running = makeSdkEvent('agent-visibility-sync', makeMeta({
+      canonicalKey: 'claude:deck_agents:vis-sync',
+      startedAtMs: start,
+      childStatusSummary: 'Background sync task',
+    }));
+    running.ts = start;
+
+    const { rerender } = render(
+      <ChatView events={[running]} loading={false} sessionId="deck_agents" visible={false} />,
+    );
+
+    act(() => {
+      vi.setSystemTime(start + 45_000);
+    });
+
+    rerender(<ChatView events={[running]} loading={false} sessionId="deck_agents" visible />);
+    expect(screen.getByText('45s')).toBeTruthy();
   });
 });
