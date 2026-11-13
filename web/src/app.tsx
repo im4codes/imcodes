@@ -93,6 +93,7 @@ import {
   KEYBOARD_SHORTCUTS_PREF_KEY,
   canHandleGlobalNavigationShortcut,
   cycleOrderedId,
+  formatShortcutKeycaps,
   hasDomBlockingOverlay,
   isMacPlatform,
   matchNavigationShortcutAction,
@@ -7409,6 +7410,7 @@ function InternalMainApp() {
   const [serverSwitchWatermark, setServerSwitchWatermark] = useState<{
     serverId: string;
     serverName: string;
+    shortcutKeycaps: string[];
     nonce: number;
   } | null>(null);
   const dismissServerSwitchWatermark = useCallback(() => {
@@ -7471,9 +7473,11 @@ function InternalMainApp() {
         );
         const nextServer = nextId ? serversList.find((srv) => srv.id === nextId) : null;
         if (nextServer && nextServer.id !== selectedServerIdRef.current) {
+          const shortcutKeycaps = formatShortcutKeycaps(resolvedShortcutsRef.current[action], isMacPlatform());
           setServerSwitchWatermark((prev) => ({
             serverId: nextServer.id,
             serverName: nextServer.name || nextServer.id,
+            shortcutKeycaps,
             nonce: (prev?.nonce ?? 0) + 1,
           }));
           void handleSelectServerNavRef.current(nextServer.id, nextServer.name);
@@ -10230,6 +10234,7 @@ function InternalMainApp() {
             serverName={serverSwitchWatermark?.serverName ?? ''}
             sessionName={watermarkSessionName}
             fallbackLabel={watermarkFallbackLabel}
+            shortcutKeycaps={serverSwitchWatermark?.shortcutKeycaps}
             onDismiss={dismissServerSwitchWatermark}
           />
         );

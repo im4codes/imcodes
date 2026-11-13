@@ -19263,6 +19263,32 @@ button.quick-agent-delegation-preset.active {
   white-space: nowrap;
 }
 
+.server-switch-watermark-shortcut {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+.server-switch-watermark-kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 5px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-bottom-width: 2px;
+  background: rgba(255, 255, 255, 0.06);
+  color: #cbd5e1;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+}
+
 @media (prefers-color-scheme: light) {
   .server-switch-watermark-card {
     background: rgba(248, 250, 252, 0.84);
@@ -19292,6 +19318,12 @@ button.quick-agent-delegation-preset.active {
   .server-switch-watermark-session-dot {
     background: #059669;
     box-shadow: 0 0 6px rgba(5, 150, 105, 0.35);
+  }
+
+  .server-switch-watermark-kbd {
+    border-color: rgba(15, 23, 42, 0.16);
+    background: rgba(15, 23, 42, 0.05);
+    color: #334155;
   }
 }
 

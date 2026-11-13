@@ -8657,6 +8657,8 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       betaComposer.dispatchEvent(pageDownEvt);
       expect(pageDownEvt.defaultPrevented).toBe(true);
       await waitFor(() => expect(localStorage.getItem('rcc_server')).toBe('srv-2'));
+      const customKeycaps = Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent);
+      expect(customKeycaps).toEqual(['Shift', 'PgDn']);
     } finally {
       syncedPrefs.enabled = false;
     }
@@ -8792,6 +8794,9 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       const hud = await screen.findByTestId('server-switch-watermark');
       expect(hud.getAttribute('aria-hidden')).toBe('true');
       expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server Two');
+      expect(
+        Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent),
+      ).toEqual(['Ctrl', '↓']);
       // Never leaks previous server's active session ('gamma') while switching
       const loadingSessionText = screen.getByTestId('server-switch-watermark-session').textContent ?? '';
       expect(loadingSessionText).not.toMatch(/gamma|alpha/i);
@@ -8811,7 +8816,7 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       const deltaComposer = await screen.findByTestId('pane-composer-deck_delta_brain');
       await waitFor(() => expect(document.activeElement).toBe(deltaComposer));
 
-      // Rapid switch back to Server One via Ctrl+ArrowUp updates the HUD immediately and restarts the timer
+      // Rapid switch back to Server One via Ctrl+ArrowUp updates the HUD & keycaps immediately and restarts the timer
       const upEvt = new KeyboardEvent('keydown', { key: 'ArrowUp', code: 'ArrowUp', ctrlKey: true, bubbles: true, cancelable: true });
       deltaComposer.dispatchEvent(upEvt);
       expect(upEvt.defaultPrevented).toBe(true);
@@ -8819,6 +8824,9 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       await waitFor(() => {
         expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server One');
       });
+      expect(
+        Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent),
+      ).toEqual(['Ctrl', '↑']);
       await waitFor(() => {
         expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('gamma');
       });
@@ -8846,5 +8854,31 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     fireEvent.click(screen.getByText('server-select-srv-2'));
     await screen.findByTestId('session-pane-deck_delta_brain');
     expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+  }, 15000);
+
+  it('displays macOS platform keycaps on Meta+ArrowDown server switch', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'MacIntel' });
+    try {
+      const { App } = await importApp();
+      render(<App />);
+
+      const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+
+      const metaDown = new KeyboardEvent('keydown', { key: 'ArrowDown', code: 'ArrowDown', metaKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(metaDown);
+      expect(metaDown.defaultPrevented).toBe(true);
+
+      await waitFor(() => expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server Two'));
+      const macKeycaps = Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent);
+      expect(macKeycaps).toEqual(['⌘', '↓']);
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
   }, 15000);
 });

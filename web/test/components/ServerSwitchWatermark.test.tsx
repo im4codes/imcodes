@@ -32,7 +32,7 @@ describe('ServerSwitchWatermark', () => {
     expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
   });
 
-  it('renders non-interactive aria-hidden HUD with server name above session name', () => {
+  it('renders non-interactive aria-hidden HUD with server name, session name, and triggered shortcut keycaps', () => {
     render(
       <ServerSwitchWatermark
         visible
@@ -40,6 +40,7 @@ describe('ServerSwitchWatermark', () => {
         serverName="prod-eu"
         sessionName="deck_api_brain"
         fallbackLabel="Loading…"
+        shortcutKeycaps={['Ctrl', '↓']}
         onDismiss={vi.fn()}
       />,
     );
@@ -54,9 +55,13 @@ describe('ServerSwitchWatermark', () => {
     const sessionEl = screen.getByTestId('server-switch-watermark-session');
     expect(sessionEl.textContent).toBe('deck_api_brain');
     expect(sessionEl.parentElement?.className).not.toContain('is-muted');
+
+    const shortcutRow = screen.getByTestId('server-switch-watermark-shortcut');
+    const kbds = Array.from(shortcutRow.querySelectorAll('kbd')).map((el) => el.textContent);
+    expect(kbds).toEqual(['Ctrl', '↓']);
   });
 
-  it('renders muted fallback when sessionName is null, and hides secondary row when both are null', () => {
+  it('renders muted fallback when sessionName is null, and omits session/shortcut rows when empty', () => {
     const { rerender } = render(
       <ServerSwitchWatermark
         visible
@@ -71,6 +76,7 @@ describe('ServerSwitchWatermark', () => {
     const fallbackEl = screen.getByTestId('server-switch-watermark-session');
     expect(fallbackEl.textContent).toBe('Loading…');
     expect(fallbackEl.parentElement?.className).toContain('is-muted');
+    expect(screen.queryByTestId('server-switch-watermark-shortcut')).toBeNull();
 
     rerender(
       <ServerSwitchWatermark
@@ -79,11 +85,15 @@ describe('ServerSwitchWatermark', () => {
         serverName="prod-eu"
         sessionName={null}
         fallbackLabel={null}
+        shortcutKeycaps={['⌘', '↑']}
         onDismiss={vi.fn()}
       />,
     );
     expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('prod-eu');
     expect(screen.queryByTestId('server-switch-watermark-session')).toBeNull();
+    expect(
+      Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent),
+    ).toEqual(['⌘', '↑']);
   });
 
   it('holds for holdMs, fades for exitMs, invokes onDismiss, and updates sessionName dynamically without resetting timer', () => {
@@ -154,6 +164,7 @@ describe('ServerSwitchWatermark', () => {
         triggerKey={1}
         serverName="Server One"
         sessionName="alpha"
+        shortcutKeycaps={['Ctrl', '↓']}
         onDismiss={onDismiss}
       />,
     );
@@ -164,18 +175,22 @@ describe('ServerSwitchWatermark', () => {
     });
     expect(screen.getByTestId('server-switch-watermark').getAttribute('data-state')).toBe('exiting');
 
-    // Rapid switch updates triggerKey -> exits exiting state immediately and restarts full holdMs window
+    // Rapid switch updates triggerKey -> exits exiting state immediately, updates keycaps, and restarts full holdMs window
     rerender(
       <ServerSwitchWatermark
         visible
         triggerKey={2}
         serverName="Server Two"
         sessionName="delta"
+        shortcutKeycaps={['Ctrl', '↑']}
         onDismiss={onDismiss}
       />,
     );
     expect(screen.getByTestId('server-switch-watermark').getAttribute('data-state')).toBe('visible');
     expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server Two');
+    expect(
+      Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent),
+    ).toEqual(['Ctrl', '↑']);
 
     act(() => {
       vi.advanceTimersByTime(SERVER_SWITCH_WATERMARK_HOLD_MS - 1);
@@ -218,6 +233,7 @@ describe('ServerSwitchWatermark', () => {
 
     expect(tail).toMatch(/\.server-switch-watermark\s*\{[\s\S]*position:\s*fixed;[\s\S]*inset:\s*0;[\s\S]*pointer-events:\s*none;[\s\S]*user-select:\s*none;/);
     expect(tail).toMatch(/\.server-switch-watermark-card\s*\{[\s\S]*backdrop-filter:\s*blur\(16px\)\s*saturate\(150%\);/);
+    expect(tail).toContain('.server-switch-watermark-kbd');
     expect(tail).toContain('@media (prefers-color-scheme: light)');
     expect(tail).toContain('@media (prefers-reduced-motion: reduce)');
   });

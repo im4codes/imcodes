@@ -13,6 +13,7 @@ export interface ServerSwitchWatermarkProps {
   serverName: string;
   sessionName: string | null;
   fallbackLabel?: string | null;
+  shortcutKeycaps?: readonly string[];
   onDismiss: () => void;
   holdMs?: number;
   exitMs?: number;
@@ -24,6 +25,7 @@ export function ServerSwitchWatermark({
   serverName,
   sessionName,
   fallbackLabel = null,
+  shortcutKeycaps = [],
   onDismiss,
   holdMs = SERVER_SWITCH_WATERMARK_HOLD_MS,
   exitMs = SERVER_SWITCH_WATERMARK_EXIT_MS,
@@ -86,6 +88,15 @@ export function ServerSwitchWatermark({
               </span>
             </div>
           </>
+        )}
+        {shortcutKeycaps.length > 0 && (
+          <div class="server-switch-watermark-shortcut" data-testid="server-switch-watermark-shortcut">
+            {shortcutKeycaps.map((cap, index) => (
+              <kbd class="server-switch-watermark-kbd" key={`${index}:${cap}`}>
+                {cap}
+              </kbd>
+            ))}
+          </div>
         )}
       </div>
     </div>
