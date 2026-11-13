@@ -7,7 +7,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AGY_ACP_AGENT_NAME, AGY_CLI_FLAG, AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { withSessionPrivacy } from '../../shared/session-incognito-context.js';
 import { supportsSessionIncognito } from '../../shared/session-incognito-types.js';
-import { createAgyIncognitoEnvSync, reclaimOrphanedAgyIncognitoHomesSync } from '../../src/agent/agy-incognito-isolation.js';
+import {
+  createAgyIncognitoEnvSync,
+  reclaimOrphanedAgyIncognitoHomes,
+  reclaimOrphanedAgyIncognitoHomesSync,
+} from '../../src/agent/agy-incognito-isolation.js';
 import { AgyAcpProvider, createAgyProvider } from '../../src/agent/providers/agy-acp.js';
 import { AgySdkProvider } from '../../src/agent/providers/agy-sdk.js';
 import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
@@ -16,8 +20,21 @@ import { IMCODES_SESSION_ENV } from '../../shared/imcodes-send.js';
 
 const tempDirs: string[] = [];
 const providers: Array<{ disconnect(): Promise<void> }> = [];
+const strayPids: number[] = [];
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 afterEach(async () => {
+  for (const pid of strayPids.splice(0)) {
+    try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+  }
   for (const provider of providers.splice(0)) {
     await provider.disconnect().catch(() => {});
   }
@@ -502,5 +519,219 @@ rl.on('line', (line) => {
     await legacy.send(normId, 'HELLO-LEGACY');
     await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
     expect(complete.mock.calls[0]?.[1].content).toBe('LEGACY:HELLO-LEGACY');
+  });
+
+  it('kills same-group descendants when ACP exits early, reaps orphaned ACP process groups after daemon SIGKILL, and rolls back failed env setup', async () => {
+    const work = makeTempDir('imcodes-agy-r2-f1-');
+    const customTmp = path.join(work, 'tmp');
+    const sourceHome = path.join(work, 'real-home');
+    mkdirSync(customTmp, { recursive: true });
+    mkdirSync(path.join(sourceHome, '.gemini', 'antigravity-cli'), { recursive: true });
+    writeFileSync(path.join(sourceHome, '.gemini', 'antigravity-cli', 'antigravity-oauth-token'), 'FAKE-AUTH');
+    vi.stubEnv('TMPDIR', customTmp);
+
+    // 1. Setup rollback: antigravity-oauth-token copies, then google_accounts.json as a directory throws -> zero leaks
+    const badSource = path.join(work, 'bad-source');
+    mkdirSync(path.join(badSource, '.gemini', 'antigravity-cli'), { recursive: true });
+    writeFileSync(path.join(badSource, '.gemini', 'antigravity-cli', 'antigravity-oauth-token'), 'FAKE-AUTH');
+    mkdirSync(path.join(badSource, '.gemini', 'google_accounts.json'), { recursive: true });
+    expect(() => createAgyIncognitoEnvSync(badSource)).toThrow();
+    expect(readdirSync(customTmp).filter((n) => n.startsWith('imcodes-agy-incog-'))).toEqual([]);
+
+    // Shared fake ACP + same-group native writer fixture
+    const workerScript = path.join(work, 'fake-native.mjs');
+    writeFileSync(workerScript, `
+import fs from 'node:fs';
+import path from 'node:path';
+const file = path.join(process.env.HOME, '.gemini', 'antigravity-cli', 'history.jsonl');
+setInterval(() => {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.appendFileSync(file, 'PRIVATE-DATA\\n');
+}, 50);
+`);
+    const acpScript = path.join(work, 'fake-acp.mjs');
+    writeFileSync(acpScript, `
+import fs from 'node:fs';
+import readline from 'node:readline';
+import { spawn } from 'node:child_process';
+const send = (o) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...o }) + '\\n');
+fs.writeFileSync(process.env.PROBE_HOME, process.env.HOME);
+readline.createInterface({ input: process.stdin }).on('line', (line) => {
+  const m = JSON.parse(line);
+  if (m.method === 'initialize') {
+    send({
+      id: m.id,
+      result: {
+        protocolVersion: 1,
+        agentInfo: { name: ${JSON.stringify(AGY_ACP_AGENT_NAME)}, version: '1.5.8' },
+        agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {}, list: {} } },
+      },
+    });
+  }
+  if (m.method === 'session/new') {
+    send({
+      id: m.id,
+      result: { sessionId: 'incog-r2-sid', models: { currentModelId: 'm1', availableModels: [{ modelId: 'm1', name: 'M1' }] } },
+    });
+  }
+  if (m.method === 'session/prompt') {
+    const w = spawn(${JSON.stringify(process.execPath)}, [${JSON.stringify(workerScript)}], {
+      env: process.env,
+      detached: false,
+      stdio: 'ignore',
+    });
+    fs.writeFileSync(process.env.PROBE_PID, String(w.pid));
+    w.unref();
+    if (process.env.STAY_ALIVE !== '1') {
+      setTimeout(() => process.exit(17), 80);
+    } else {
+      setTimeout(() => send({ id: m.id, result: { stopReason: 'end_turn' } }), 50);
+    }
+  }
+});
+`);
+    const binary = path.join(work, 'fake-agy');
+    writeFileSync(binary, `#!/bin/sh\nexec '${process.execPath}' '${acpScript}' "$@"\n`, { mode: 0o700 });
+
+    // 2. ACP root exits while same-group worker survives -> disposeIsolatedSession must kill group BEFORE removing home
+    const probeHome1 = path.join(work, 'home1.txt');
+    const probePid1 = path.join(work, 'pid1.txt');
+    const p1 = new AgyAcpProvider();
+    providers.push(p1);
+    await withSessionPrivacy('deck_r2_acp_exit', true, () =>
+      p1.connect({ binaryPath: binary, env: { HOME: sourceHome, TMPDIR: customTmp, PROBE_HOME: probeHome1, PROBE_PID: probePid1 } }),
+    );
+    const sid1 = await p1.createSession({ sessionKey: 'deck_r2_acp_exit', cwd: work, incognito: true, agentId: 'm1' });
+    const p1Err = new Promise<void>((resolve) => p1.onError(() => resolve()));
+    await p1.send(sid1, 'PRIVATE-PROMPT');
+    await Promise.race([p1Err, new Promise((_, reject) => setTimeout(() => reject(new Error('exit timeout')), 5000))]);
+    const workerPid1 = Number(readFileSync(probePid1, 'utf8'));
+    const privateHome1 = readFileSync(probeHome1, 'utf8');
+    strayPids.push(workerPid1);
+
+    await vi.waitFor(() => {
+      expect(pidAlive(workerPid1)).toBe(false);
+      expect(existsSync(privateHome1)).toBe(false);
+    }, { timeout: 5000 });
+    await new Promise((r) => setTimeout(r, 250));
+    expect(existsSync(privateHome1)).toBe(false);
+    expect(existsSync(path.join(privateHome1, '.gemini', 'antigravity-cli', 'history.jsonl'))).toBe(false);
+    expect(await reclaimOrphanedAgyIncognitoHomes(customTmp)).toBe(0);
+
+    // 3. Daemon SIGKILL leaves detached ACP leader + same-group worker alive -> startup sweep kills tree/group first,
+    //    never touches live siblings, unowned dirs, or recycled unrelated PIDs.
+    const providerUrl = pathToFileURL(path.resolve('src/agent/providers/agy-acp.ts')).href;
+    const ctxUrl = pathToFileURL(path.resolve('shared/session-incognito-context.ts')).href;
+    const loader = path.resolve('node_modules/tsx/dist/loader.mjs');
+    const daemonRunner = path.join(work, 'daemon-runner.mjs');
+    writeFileSync(daemonRunner, `
+import { withSessionPrivacy } from ${JSON.stringify(ctxUrl)};
+import { AgyAcpProvider } from ${JSON.stringify(providerUrl)};
+const p = new AgyAcpProvider();
+await withSessionPrivacy(process.env.SESS, true, () =>
+  p.connect({
+    binaryPath: process.env.BIN,
+    env: {
+      HOME: process.env.SRC_HOME,
+      TMPDIR: process.env.TMPDIR,
+      PROBE_HOME: process.env.PROBE_HOME,
+      PROBE_PID: process.env.PROBE_PID,
+      STAY_ALIVE: '1',
+    },
+  }),
+);
+const sid = await p.createSession({ sessionKey: process.env.SESS, cwd: process.env.WORK, incognito: true, agentId: 'm1' });
+const done = new Promise((resolve) => p.onComplete(() => resolve()));
+await p.send(sid, 'SPAWN-WORKER');
+await done;
+process.stdout.write('READY\\n');
+setInterval(() => {}, 1000);
+`);
+
+    const spawnDaemon = (tag: string) => {
+      const pHome = path.join(work, `home-${tag}.txt`);
+      const pPid = path.join(work, `pid-${tag}.txt`);
+      const proc = spawn(process.execPath, ['--import', loader, daemonRunner], {
+        env: {
+          ...process.env,
+          TMPDIR: customTmp,
+          SRC_HOME: sourceHome,
+          BIN: binary,
+          WORK: work,
+          SESS: `deck_r2_${tag}`,
+          PROBE_HOME: pHome,
+          PROBE_PID: pPid,
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      const ready = new Promise<void>((resolve, reject) => {
+        let out = '';
+        proc.stdout.on('data', (d) => {
+          out += d.toString('utf8');
+          if (out.includes('READY\n')) resolve();
+        });
+        proc.once('error', reject);
+        proc.once('exit', (code) => reject(new Error(`daemon ${tag} exited early (${code})`)));
+      });
+      return { proc, ready, pHome, pPid };
+    };
+
+    const victim = spawnDaemon('victim');
+    const sibling = spawnDaemon('sibling');
+    strayPids.push(victim.proc.pid!, sibling.proc.pid!);
+    await Promise.all([victim.ready, sibling.ready]);
+
+    const unownedDir = path.join(customTmp, 'imcodes-agy-incog-unowned');
+    mkdirSync(unownedDir, { recursive: true });
+    writeFileSync(path.join(unownedDir, 'keep.txt'), 'unowned');
+
+    const unrelated = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    strayPids.push(unrelated.pid!);
+    const recycledDir = path.join(customTmp, 'imcodes-agy-incog-recycled-pid');
+    mkdirSync(recycledDir, { recursive: true });
+    writeFileSync(path.join(recycledDir, '.imcodes-owner.json'), JSON.stringify({
+      version: 1,
+      pid: 999_999_999,
+      createdAt: Date.now() - 10_000,
+      childPid: unrelated.pid,
+      childStartTicks: '999999999',
+      childProcessStart: 'Thu Jan  1 00:00:00 1970',
+      ownsProcessGroup: true,
+    }));
+
+    const victimHome = readFileSync(victim.pHome, 'utf8');
+    const victimWorkerPid = Number(readFileSync(victim.pPid, 'utf8'));
+    const siblingHome = readFileSync(sibling.pHome, 'utf8');
+    const siblingWorkerPid = Number(readFileSync(sibling.pPid, 'utf8'));
+    strayPids.push(victimWorkerPid, siblingWorkerPid);
+
+    victim.proc.kill('SIGKILL');
+    await new Promise((r) => victim.proc.once('exit', r));
+    expect(pidAlive(victimWorkerPid)).toBe(true);
+    expect(existsSync(victimHome)).toBe(true);
+
+    // Cold startup reclaim sweeps victim + recycled-pid metadata dir, while preserving sibling, unrelated, and unowned
+    const reclaimed = await reclaimOrphanedAgyIncognitoHomes(customTmp);
+    expect(reclaimed).toBe(2);
+    expect(pidAlive(victimWorkerPid)).toBe(false);
+    expect(existsSync(victimHome)).toBe(false);
+    await new Promise((r) => setTimeout(r, 250));
+    expect(existsSync(victimHome)).toBe(false);
+
+    // Preserved targets remain alive and intact
+    expect(pidAlive(sibling.proc.pid!)).toBe(true);
+    expect(pidAlive(siblingWorkerPid)).toBe(true);
+    expect(existsSync(siblingHome)).toBe(true);
+    expect(pidAlive(unrelated.pid!)).toBe(true);
+    expect(existsSync(unownedDir)).toBe(true);
+
+    // Clean shutdown of remaining sibling & unrelated helper
+    sibling.proc.kill('SIGKILL');
+    await new Promise((r) => sibling.proc.once('exit', r));
+    await reclaimOrphanedAgyIncognitoHomes(customTmp);
+    expect(pidAlive(siblingWorkerPid)).toBe(false);
+    expect(existsSync(siblingHome)).toBe(false);
+    unrelated.kill('SIGKILL');
+    await new Promise((r) => unrelated.once('exit', r));
   });
 });

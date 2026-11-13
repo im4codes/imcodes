@@ -4,7 +4,12 @@ import { AgySubagentTracker, extractAgySubagentEvidenceChildIds, isAgySubagentTo
 import { AgyCompactionWatermark } from '../agy-compaction-watermark.js';
 import { AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
 import { AgyContextUsage } from '../agy-context-usage.js';
-import { createAgyIncognitoEnvSync, resolveAgySourceHome, type AgyIncognitoEnv } from '../agy-incognito-isolation.js';
+import {
+  createAgyIncognitoEnvSync,
+  reclaimOrphanedAgyIncognitoHomes,
+  resolveAgySourceHome,
+  type AgyIncognitoEnv,
+} from '../agy-incognito-isolation.js';
 import { inIncognitoContext, setSessionIncognito } from '../../../shared/session-incognito-context.js';
 import { confirmPromiseStop } from '../provider-stop-confirmation.js';
 /**
@@ -470,16 +475,16 @@ export class KimiSdkProvider implements TransportProvider {
       const transport = state.isolatedTransport;
       const acpSessionId = state.acpSessionId;
       const connection = transport?.connection ?? null;
-      const child = transport?.child ?? null;
+      const activeChild = transport?.child ?? null;
 
       if (
         opts?.bestEffortCloseSession
         && acpSessionId
         && state.loaded
         && connection
-        && child
-        && child.exitCode === null
-        && !child.killed
+        && activeChild
+        && activeChild.exitCode === null
+        && !activeChild.killed
       ) {
         const closer = (connection as AcpAgent).closeSession;
         if (typeof closer === 'function') {
@@ -500,6 +505,7 @@ export class KimiSdkProvider implements TransportProvider {
       }
 
       if (!transport) return;
+      const child = transport.child;
       state.isolatedTransport = undefined;
       transport.child = null;
       transport.connection = null;
@@ -507,16 +513,20 @@ export class KimiSdkProvider implements TransportProvider {
       transport.sessionListSupported = false;
 
       if (child) {
-        if (child.exitCode === null && child.signalCode === null) {
-          const exitPromise = once(child, 'exit').catch(() => {});
-          try { child.stdin.end(); } catch { /* noop */ }
-          await killProcessTree(child, { ownsProcessGroup: true });
-          if (child.exitCode === null && child.signalCode === null) {
-            await Promise.race([
-              exitPromise,
-              new Promise<void>((resolve) => setTimeout(resolve, 500)),
-            ]);
-          }
+        // Call killProcessTree even when the root ACP child already exited: same-group
+        // descendants/native workers can outlive the exited leader and must be reaped
+        // before deleting incognitoEnv.homeDir.
+        const alive = child.exitCode === null && child.signalCode === null;
+        const exitPromise = alive ? once(child, 'exit').catch(() => {}) : null;
+        if (alive) {
+          try { child.stdin?.end(); } catch { /* noop */ }
+        }
+        await killProcessTree(child, { ownsProcessGroup: true, gracefulMs: 200 });
+        if (exitPromise && child.exitCode === null && child.signalCode === null) {
+          await Promise.race([
+            exitPromise,
+            new Promise<void>((resolve) => setTimeout(resolve, 500)),
+          ]);
         }
       }
       if (transport.incognitoEnv) {
@@ -1494,13 +1504,14 @@ export class KimiSdkProvider implements TransportProvider {
     if (state.disposed) {
       throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, 'Incognito session has been terminated; start a fresh session.', false);
     }
-    if (state.isolatedTransport?.child) {
+    const sourceHome = state.isolatedTransport?.sourceHome
+      ?? resolveAgySourceHome(state.env, this.config.env as Record<string, string> | undefined);
+    if (state.isolatedTransport) {
       await this.disposeIsolatedSession(state);
       state.disposed = false;
     }
-    const sourceHome = state.isolatedTransport?.sourceHome
-      ?? resolveAgySourceHome(state.env, this.config.env as Record<string, string> | undefined);
-    const incognitoEnv = createAgyIncognitoEnvSync(sourceHome);
+    await reclaimOrphanedAgyIncognitoHomes().catch(() => 0);
+    const incognitoEnv = createAgyIncognitoEnvSync(sourceHome, { skipReclaim: true });
     state.env = { ...(state.env ?? {}), ...incognitoEnv.env };
     const transport: IsolatedAcpTransport = {
       child: null,
@@ -1580,6 +1591,9 @@ export class KimiSdkProvider implements TransportProvider {
       windowsHide: true,
     });
     transport.child = child;
+    if (isolatedFor && typeof child.pid === 'number' && child.pid > 0) {
+      isolatedFor.incognitoEnv.registerChildProcess(child.pid, process.platform !== 'win32');
+    }
     const spawnFailure = new Promise<never>((_resolve, reject) => {
       child.once('error', reject);
     });
