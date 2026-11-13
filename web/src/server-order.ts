@@ -30,6 +30,81 @@ export function normalizeServerOrder<T extends ServerOrderEntry>(
   return valid;
 }
 
+/** Check whether two string ID lists match element-for-element. */
+export function sameOrderIds(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((id, idx) => id === b[idx]);
+}
+
+/** Append missing IDs while preserving all existing/unseen IDs in their relative slots. */
+export function appendMissingOrderIds(
+  visibleIds: readonly string[],
+  order: readonly string[],
+): string[] {
+  const candidates = Array.isArray(order) ? order : [];
+  const next: string[] = [];
+  const seen = new Set<string>();
+  for (const id of candidates) {
+    if (typeof id !== 'string' || seen.has(id)) continue;
+    seen.add(id);
+    next.push(id);
+  }
+  for (const id of visibleIds) {
+    if (typeof id !== 'string' || seen.has(id)) continue;
+    seen.add(id);
+    next.push(id);
+  }
+  return next;
+}
+
+/** Non-destructively append newly discovered server IDs without pruning unseen/other-window IDs. */
+export function appendMissingServerOrder<T extends ServerOrderEntry>(
+  servers: readonly T[],
+  order: readonly string[],
+): string[] {
+  return appendMissingOrderIds(servers.map((server) => server.id), order);
+}
+
+/**
+ * Surgically move `fromId` before/after `toId` inside `prev` while keeping every
+ * unrelated, pinned/other-group, and unseen/other-window ID in its relative slot.
+ */
+export function reorderOrderIdsPreservingHidden(
+  prev: readonly string[],
+  visibleIds: readonly string[],
+  fromId: string,
+  toId: string,
+  insertAfter: boolean,
+): string[] {
+  if (!fromId || !toId || fromId === toId) return [...(Array.isArray(prev) ? prev : [])];
+  if (!visibleIds.includes(fromId) || !visibleIds.includes(toId)) {
+    return [...(Array.isArray(prev) ? prev : [])];
+  }
+  const base = appendMissingOrderIds(visibleIds, prev);
+  const fromPos = base.indexOf(fromId);
+  const withoutFrom = base.filter((_, idx) => idx !== fromPos);
+  const targetPos = withoutFrom.indexOf(toId);
+  if (targetPos === -1) return [...(Array.isArray(prev) ? prev : [])];
+  withoutFrom.splice(insertAfter ? targetPos + 1 : targetPos, 0, fromId);
+  return withoutFrom;
+}
+
+/** Explicit server drag that preserves unseen/offline/other-window server IDs. */
+export function reorderServerOrder<T extends ServerOrderEntry>(
+  prevOrder: readonly string[],
+  displayedServers: readonly T[],
+  fromId: string,
+  toId: string,
+  insertAfter: boolean,
+): string[] {
+  return reorderOrderIdsPreservingHidden(
+    prevOrder,
+    displayedServers.map((server) => server.id),
+    fromId,
+    toId,
+    insertAfter,
+  );
+}
+
 /** Sort pinned servers first, preserving pin priority and ordinary order. */
 export function sortServersByPreference<T extends ServerOrderEntry>(
   servers: readonly T[],

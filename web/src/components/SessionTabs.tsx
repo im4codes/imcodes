@@ -9,6 +9,7 @@ import { SessionActionMenuIcon } from './SessionActionMenuIcon.js';
 import { SharedStateIndicator } from './SharedStateIndicator.js';
 import { isWorkingSessionState } from '@shared/session-activity-types.js';
 import { recordPerfRender } from '../perf-render-debug.js';
+import { appendMissingOrderIds, reorderOrderIdsPreservingHidden, sameOrderIds } from '../server-order.js';
 
 interface Props {
   sessions: SessionInfo[];
@@ -107,6 +108,7 @@ function SessionTabsImpl({ sessions, activeSession, connected, latencyMs, idleAl
 
   // Drag state
   const dragIdx = useRef<number | null>(null);
+  const dragName = useRef<string | null>(null);
   const [dragOverIdx, setDragOverIdx] = useState<number | null>(null);
 
   // Merge visible sessions with persisted order without mutating entries belonging
@@ -139,20 +141,12 @@ function SessionTabsImpl({ sessions, activeSession, connected, latencyMs, idleAl
   // servers/views and never rewrite order simply because pinned tabs group first.
   useEffect(() => {
     if (!sessionsLoaded || !tabOrderHydrated || sessions.length === 0) return;
-    const existing = new Set(tabOrder);
-    const missingNames: string[] = [];
-    const seenMissing = new Set<string>();
-    for (const s of sessions) {
-      if (!existing.has(s.name) && !seenMissing.has(s.name)) {
-        seenMissing.add(s.name);
-        missingNames.push(s.name);
-      }
-    }
-    if (missingNames.length === 0) return;
+    const visibleNames = sessions.map((s) => s.name);
+    const nextOrder = appendMissingOrderIds(visibleNames, tabOrder);
+    if (sameOrderIds(nextOrder, tabOrder)) return;
     setTabOrder((prev) => {
-      const prevSet = new Set(prev);
-      const nextMissing = missingNames.filter((name) => !prevSet.has(name));
-      return nextMissing.length > 0 ? [...prev, ...nextMissing] : prev;
+      const merged = appendMissingOrderIds(visibleNames, prev);
+      return sameOrderIds(merged, prev) ? prev : merged;
     });
   }, [sessions, sessionsLoaded, tabOrder, tabOrderHydrated, setTabOrder]);
 
@@ -417,31 +411,34 @@ function SessionTabsImpl({ sessions, activeSession, connected, latencyMs, idleAl
     setCtx(null);
   }, [setPinnedArr]);
 
-  // Drag handlers — reorder only within the same group (pinned or unpinned).
+  // Drag handlers — reorder only within the same group (pinned or unpinned),
+  // surgically moving the dragged name inside persisted tab_order so other
+  // servers' IDs and unrelated/pinned entries keep their exact slots.
   const onDragStart = useCallback((e: DragEvent, idx: number) => {
     mousePressRef.current = null;
     dragIdx.current = idx;
+    dragName.current = orderedSessions[idx]?.name ?? null;
     if (e.dataTransfer) {
       e.dataTransfer.effectAllowed = 'move';
       e.dataTransfer.setData('text/plain', String(idx));
     }
     (e.currentTarget as HTMLElement).classList.add('tab-dragging');
-  }, []);
+  }, [orderedSessions]);
 
   const onDragEnd = useCallback((e: DragEvent) => {
     dragIdx.current = null;
+    dragName.current = null;
     setDragOverIdx(null);
     (e.currentTarget as HTMLElement).classList.remove('tab-dragging');
   }, []);
 
   const onDragOver = useCallback((e: DragEvent, idx: number) => {
     e.preventDefault();
-    const fromIdx = dragIdx.current;
-    if (fromIdx === null) return;
+    const fromName = dragName.current ?? (dragIdx.current !== null ? orderedSessions[dragIdx.current]?.name ?? null : null);
+    const toName = orderedSessions[idx]?.name ?? null;
+    if (!fromName || !toName) return;
     // Only allow drag within the same group.
-    const fromPinned = pinned.has(orderedSessions[fromIdx]?.name ?? '');
-    const toPinned = pinned.has(orderedSessions[idx]?.name ?? '');
-    if (fromPinned !== toPinned) {
+    if (pinned.has(fromName) !== pinned.has(toName)) {
       if (e.dataTransfer) e.dataTransfer.dropEffect = 'none';
       return;
     }
@@ -451,30 +448,28 @@ function SessionTabsImpl({ sessions, activeSession, connected, latencyMs, idleAl
 
   const onDrop = useCallback((e: DragEvent, dropIdx: number) => {
     e.preventDefault();
-    const fromIdx = dragIdx.current;
-    if (fromIdx === null || fromIdx === dropIdx) { setDragOverIdx(null); return; }
-
-    // Enforce same-group constraint.
-    const fromPinned = pinned.has(orderedSessions[fromIdx]?.name ?? '');
-    const toPinned = pinned.has(orderedSessions[dropIdx]?.name ?? '');
-    if (fromPinned !== toPinned) { setDragOverIdx(null); return; }
-
-    const names = orderedSessions.map((s) => s.name);
-    const [moved] = names.splice(fromIdx, 1);
-    names.splice(dropIdx, 0, moved);
-    const visibleSet = new Set(names);
-    setTabOrder((prev) => {
-      const otherNames: string[] = [];
-      const seenOther = new Set<string>();
-      for (const n of prev) {
-        if (visibleSet.has(n) || seenOther.has(n)) continue;
-        seenOther.add(n);
-        otherNames.push(n);
-      }
-      return [...names, ...otherNames];
-    });
+    const fallbackIdx = dragIdx.current;
+    const capturedName = dragName.current;
     setDragOverIdx(null);
     dragIdx.current = null;
+    dragName.current = null;
+
+    const fromName = capturedName ?? (fallbackIdx !== null ? orderedSessions[fallbackIdx]?.name ?? null : null);
+    const toName = orderedSessions[dropIdx]?.name ?? null;
+    if (!fromName || !toName || fromName === toName) return;
+
+    const currentFromIdx = orderedSessions.findIndex((s) => s.name === fromName);
+    if (currentFromIdx === -1 || currentFromIdx === dropIdx) return;
+
+    // Enforce same-group constraint without mutating tab_order.
+    if (pinned.has(fromName) !== pinned.has(toName)) return;
+
+    const visibleNames = orderedSessions.map((s) => s.name);
+    const insertAfter = currentFromIdx < dropIdx;
+    setTabOrder((prev) => {
+      const next = reorderOrderIdsPreservingHidden(prev, visibleNames, fromName, toName, insertAfter);
+      return sameOrderIds(next, prev) ? prev : next;
+    });
   }, [orderedSessions, pinned, setTabOrder]);
 
   const menuX = ctx ? Math.min(ctx.x, window.innerWidth - 160) : 0;

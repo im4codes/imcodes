@@ -1219,6 +1219,107 @@ describe('App shell', () => {
     await waitFor(() => expect(JSON.parse(localStorage.getItem('rcc_sync_user-1:server_pinned')!).v).toEqual(['temporarily-absent']));
   }, 20_000);
 
+  it.each(['partial', 'empty', 'error'])('server_order persistence: retains unseen shared/offline IDs through %s inventory without pruning or empty-writing', async (inventory) => {
+    syncedPrefs.enabled = true;
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    const existingOrder = ['shared-other-window', 'srv-1', 'hidden-offline'];
+    localStorage.setItem('rcc_sync_user-1:server_order', JSON.stringify({ v: existingOrder, t: 100 }));
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') {
+        if (inventory === 'error') throw new Error('offline');
+        return inventory === 'empty' ? { servers: [] } : serverList();
+      }
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      return {};
+    });
+    const { App } = await importApp();
+    render(<App />);
+    await waitFor(() => expect(syncedPrefs.get.mock.calls.some(([key]) => key === 'server_order')).toBe(true));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 150)); });
+    expect(JSON.parse(localStorage.getItem('rcc_sync_user-1:server_order')!).v).toEqual(existingOrder);
+    expect(
+      syncedPrefs.save.mock.calls.filter(
+        ([key, raw]) => key === 'server_order' && JSON.stringify(JSON.parse(raw as string).v) !== JSON.stringify(existingOrder),
+      ),
+    ).toEqual([]);
+  }, 20_000);
+
+  it('server_order persistence: partial shared inventory + multi-window storage updates converge without stripping or ping-pong', async () => {
+    syncedPrefs.enabled = true;
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    const sharedEntry = {
+      id: 'share-x',
+      serverId: 'srv-shared-x',
+      serverName: 'Shared Server X',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Shared Tab X',
+      target: { kind: 'main', serverId: 'srv-shared-x', sessionName: 'deck_x_brain' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+    openSharedEntryMock.mockResolvedValue({
+      server: { id: 'srv-shared-x', name: 'Shared Server X', status: 'online', lastHeartbeatAt: Date.now() },
+      target: sharedEntry.target,
+      coverage: {
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-x'],
+        primaryShareId: 'share-x',
+        authorizedAt: Date.now(),
+      },
+      sessions: [{
+        sessionName: 'deck_x_brain',
+        title: 'Shared Tab X',
+        state: 'idle',
+        agentType: 'codex-sdk',
+        activeDispatchId: 'dispatch-open-x',
+        supervisionMode: 'supervised_audit',
+      }],
+      subSessions: [],
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+    const entryLabel = await screen.findByText('Shared Tab X');
+    fireEvent.click(entryLabel.closest('button')!);
+    await waitFor(() => {
+      const saved = JSON.parse(localStorage.getItem('rcc_sync_user-1:server_order') ?? 'null')?.v;
+      expect(saved).toEqual(['srv-1', 'srv-shared-x']);
+    });
+
+    // Window B (which only has owned srv-1 + shared srv-shared-y) writes ['srv-shared-y', 'srv-1']
+    syncedPrefs.save.mockClear();
+    const fromWindowB = { v: ['srv-shared-y', 'srv-1'], t: Date.now() + 500 };
+    localStorage.setItem('rcc_sync_user-1:server_order', JSON.stringify(fromWindowB));
+    await act(async () => {
+      window.dispatchEvent(new StorageEvent('storage', {
+        key: 'rcc_sync_user-1:server_order',
+        newValue: JSON.stringify(fromWindowB),
+      }));
+    });
+
+    // Window A preserves srv-shared-y and appends its own srv-shared-x (never stripping srv-shared-y!)
+    await waitFor(() => {
+      const converged = JSON.parse(localStorage.getItem('rcc_sync_user-1:server_order') ?? 'null')?.v;
+      expect(converged).toEqual(['srv-shared-y', 'srv-1', 'srv-shared-x']);
+    });
+
+    // Once converged, alternating storage events from Window B trigger zero additional saves (no ping-pong)
+    syncedPrefs.save.mockClear();
+    const convergedPayload = { v: ['srv-shared-y', 'srv-1', 'srv-shared-x'], t: Date.now() + 1000 };
+    localStorage.setItem('rcc_sync_user-1:server_order', JSON.stringify(convergedPayload));
+    await act(async () => {
+      window.dispatchEvent(new StorageEvent('storage', {
+        key: 'rcc_sync_user-1:server_order',
+        newValue: JSON.stringify(convergedPayload),
+      }));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    });
+    expect(syncedPrefs.save.mock.calls.filter(([key]) => key === 'server_order')).toEqual([]);
+  }, 20_000);
+
   it('deletes an offline server from the dashboard without a daemon connection', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     let servers = [{ ...serverList().servers[0], status: 'offline', lastHeartbeatAt: null }];

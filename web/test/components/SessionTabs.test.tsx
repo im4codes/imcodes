@@ -855,7 +855,7 @@ describe('SessionTabs', () => {
     expect(saveUserPrefMock).not.toHaveBeenCalled();
     expect(JSON.parse(localStorage.getItem('rcc_sync_tab_order')!).v).toEqual(fromOtherTab.v);
 
-    // Drag in Server 1 preserves Server 2 entries alongside reordered Server 1 tabs
+    // Drag in Server 1 preserves Server 2 entries in their exact slots alongside reordered Server 1 tabs
     const wrappers = [...view.container.querySelectorAll('.tab-wrap')];
     fireEvent.dragStart(wrappers[1]);
     fireEvent.dragOver(wrappers[0]);
@@ -863,7 +863,182 @@ describe('SessionTabs', () => {
     fireEvent.dragEnd(wrappers[1]);
 
     const afterDrop = JSON.parse(localStorage.getItem('rcc_sync_tab_order')!).v as string[];
-    expect(afterDrop).toEqual(['srv1_beta', 'srv1_alpha', 'srv2_delta', 'srv2_gamma']);
+    expect(afterDrop).toEqual(['srv2_delta', 'srv2_gamma', 'srv1_beta', 'srv1_alpha']);
+  });
+
+  it('surgically moves only the dragged tab in interleaved pinned/unpinned/other-server order and keeps pin/unpin immutable', async () => {
+    const initial = { v: ['hidden_srv2', 'u1', 'p1', 'u2', 'p2'], t: 100 };
+    localStorage.setItem('rcc_sync_tab_order', JSON.stringify(initial));
+    getUserPrefMock.mockResolvedValue(JSON.stringify(initial));
+
+    const sessions = makeSessions([
+      { name: 'u1', label: 'U1' },
+      { name: 'p1', label: 'P1' },
+      { name: 'u2', label: 'U2' },
+      { name: 'p2', label: 'P2' },
+    ]);
+
+    const view = render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession="p1"
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+        pinned={new Set(['p1', 'p2'])}
+      />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    saveUserPrefMock.mockClear();
+
+    const getVisibleNames = () => screen.getAllByRole('tab').map((tab) => (
+      ['P1', 'P2', 'U1', 'U2'].find((lbl) => tab.textContent?.includes(lbl))
+    ));
+    // Displayed order is pinned-first [P1, P2], then unpinned [U1, U2]
+    expect(getVisibleNames()).toEqual(['P1', 'P2', 'U1', 'U2']);
+
+    // 1) Drag unpinned U2 (idx=3) before U1 (idx=2): hidden_srv2, P1, P2 must keep their exact slots in tab_order!
+    let wrappers = [...view.container.querySelectorAll('.tab-wrap')];
+    fireEvent.dragStart(wrappers[3]);
+    fireEvent.dragOver(wrappers[2]);
+    fireEvent.drop(wrappers[2]);
+    fireEvent.dragEnd(wrappers[3]);
+    expect(getVisibleNames()).toEqual(['P1', 'P2', 'U2', 'U1']);
+    expect(JSON.parse(localStorage.getItem('rcc_sync_tab_order')!).v).toEqual([
+      'hidden_srv2',
+      'u2',
+      'u1',
+      'p1',
+      'p2',
+    ]);
+
+    // 2) Drag pinned P2 (idx=1) before P1 (idx=0): hidden_srv2, U2, U1 must keep their exact slots in tab_order!
+    wrappers = [...view.container.querySelectorAll('.tab-wrap')];
+    fireEvent.dragStart(wrappers[1]);
+    fireEvent.dragOver(wrappers[0]);
+    fireEvent.drop(wrappers[0]);
+    fireEvent.dragEnd(wrappers[1]);
+    expect(getVisibleNames()).toEqual(['P2', 'P1', 'U2', 'U1']);
+    expect(JSON.parse(localStorage.getItem('rcc_sync_tab_order')!).v).toEqual([
+      'hidden_srv2',
+      'u2',
+      'u1',
+      'p2',
+      'p1',
+    ]);
+
+    // 3) Cross-group drag (unpinned U1 onto pinned P2) must be rejected without touching tab_order
+    saveUserPrefMock.mockClear();
+    const rawBeforeCrossGroup = localStorage.getItem('rcc_sync_tab_order');
+    wrappers = [...view.container.querySelectorAll('.tab-wrap')];
+    fireEvent.dragStart(wrappers[3]);
+    fireEvent.dragOver(wrappers[0]);
+    fireEvent.drop(wrappers[0]);
+    fireEvent.dragEnd(wrappers[3]);
+    expect(saveUserPrefMock).not.toHaveBeenCalled();
+    expect(localStorage.getItem('rcc_sync_tab_order')).toBe(rawBeforeCrossGroup);
+
+    // 4) Pinning / unpinning tabs later leaves saved drag bytes completely unchanged
+    view.rerender(
+      <SessionTabs
+        sessions={sessions}
+        activeSession="p1"
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+        pinned={new Set(['p1', 'p2', 'u1'])}
+      />,
+    );
+    expect(saveUserPrefMock).not.toHaveBeenCalled();
+    expect(localStorage.getItem('rcc_sync_tab_order')).toBe(rawBeforeCrossGroup);
+
+    view.rerender(
+      <SessionTabs
+        sessions={sessions}
+        activeSession="p1"
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+        pinned={new Set()}
+      />,
+    );
+    expect(saveUserPrefMock).not.toHaveBeenCalled();
+    expect(localStorage.getItem('rcc_sync_tab_order')).toBe(rawBeforeCrossGroup);
+    // Once unpinned, saved order reflects exact uncorrupted drag order [u2, u1, p2, p1]
+    expect(getVisibleNames()).toEqual(['U2', 'U1', 'P2', 'P1']);
+  });
+
+  it('safely handles storage updates mid-drag and treats stale/removed drag indices as no-ops', async () => {
+    const initial = { v: ['s1', 's2', 's3'], t: 100 };
+    localStorage.setItem('rcc_sync_tab_order', JSON.stringify(initial));
+    getUserPrefMock.mockResolvedValue(JSON.stringify(initial));
+
+    const sessions = makeSessions([
+      { name: 's1', label: 'S1' },
+      { name: 's2', label: 'S2' },
+      { name: 's3', label: 'S3' },
+    ]);
+
+    const view = render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession="s1"
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+      />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    saveUserPrefMock.mockClear();
+
+    // Start dragging S3 (idx=2)
+    let wrappers = [...view.container.querySelectorAll('.tab-wrap')];
+    fireEvent.dragStart(wrappers[2]);
+
+    // Another window prepends hidden_other via storage before drop
+    const remoteUpdate = { v: ['hidden_other', 's1', 's2', 's3'], t: 200 };
+    localStorage.setItem('rcc_sync_tab_order', JSON.stringify(remoteUpdate));
+    await act(async () => {
+      window.dispatchEvent(new StorageEvent('storage', {
+        key: 'rcc_sync_tab_order',
+        newValue: JSON.stringify(remoteUpdate),
+      }));
+    });
+
+    // Drop onto S1 (idx=0): S3 moves before S1 while preserving hidden_other at slot 0
+    wrappers = [...view.container.querySelectorAll('.tab-wrap')];
+    fireEvent.drop(wrappers[0]);
+    expect(JSON.parse(localStorage.getItem('rcc_sync_tab_order')!).v).toEqual([
+      'hidden_other',
+      's3',
+      's1',
+      's2',
+    ]);
+
+    // Start dragging S3 (now idx=0), then session list shrinks removing S3 before drop -> safe no-op
+    saveUserPrefMock.mockClear();
+    const rawBeforeRemoved = localStorage.getItem('rcc_sync_tab_order');
+    wrappers = [...view.container.querySelectorAll('.tab-wrap')];
+    fireEvent.dragStart(wrappers[0]);
+    view.rerender(
+      <SessionTabs
+        sessions={sessions.slice(0, 2)}
+        activeSession="s1"
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+      />,
+    );
+    wrappers = [...view.container.querySelectorAll('.tab-wrap')];
+    fireEvent.drop(wrappers[0]);
+    expect(saveUserPrefMock).not.toHaveBeenCalled();
+    expect(localStorage.getItem('rcc_sync_tab_order')).toBe(rawBeforeRemoved);
   });
 
   it('keeps dragged order of two pinned tabs fixed and moves unpinned tab without oscillating', async () => {

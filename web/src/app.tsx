@@ -223,7 +223,7 @@ import {
 } from './session-list-merge.js';
 import { resolveSessionInfoRuntimeType } from './runtime-type.js';
 import { useSyncedPreference } from './hooks/useSyncedPreference.js';
-import { normalizePinnedServers, normalizeServerOrder, toggleServerPin, sortServersByPreference } from './server-order.js';
+import { appendMissingServerOrder, normalizePinnedServers, sameOrderIds, toggleServerPin, sortServersByPreference } from './server-order.js';
 import { parseString, parseBooleanish, usePref } from './hooks/usePref.js';
 import { CLAUDE_WEEKLY_QUOTA_PREF_KEY } from '@shared/claude-quota.js';
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
@@ -2423,13 +2423,17 @@ function InternalMainApp() {
     [sharedEntries],
   );
   useEffect(() => {
-    if (!serversLoaded || !serverOrderHydrated || !serverPinnedHydrated) return;
-    const nextOrder = normalizeServerOrder(servers, serverOrder);
-    if (JSON.stringify(nextOrder) !== JSON.stringify(serverOrder)) setServerOrder(nextOrder);
+    if (!serversSynced || !serversLoaded || !serverOrderHydrated || !serverPinnedHydrated || servers.length === 0) return;
+    const nextOrder = appendMissingServerOrder(servers, serverOrder);
+    if (sameOrderIds(nextOrder, serverOrder)) return;
+    setServerOrder((previous) => {
+      const merged = appendMissingServerOrder(servers, previous);
+      return sameOrderIds(merged, previous) ? previous : merged;
+    });
     // Inventory may be partial (owned/shared discovery or an offline refresh).
     // Filter pins only for rendering, never persist that projection as intent.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [servers, serversLoaded, serverOrder, serverOrderHydrated, serverPinnedHydrated]);
+  }, [servers, serversLoaded, serversSynced, serverOrder, serverOrderHydrated, serverPinnedHydrated]);
   const toggleServerPinned = useCallback((serverId: string) => {
     setServerPinned((previous) => toggleServerPin(previous, serverId));
   }, [setServerPinned]);
