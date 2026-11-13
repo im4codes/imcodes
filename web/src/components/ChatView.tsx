@@ -2619,9 +2619,12 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
   // paint, re-rendered in a later task and never re-pinned after that render:
   // that frame showed a 15-42px gap/reverse jump.
   const lastCommitSignatureRef = useRef('');
+  const lastExternalSignatureRef = useRef('');
   const lastCommitClientHeightRef = useRef(0);
   const syncLayoutPassCountRef = useRef(0);
+  const rafRetryCountRef = useRef(0);
   const pendingLayoutRafRef = useRef<number | null>(null);
+  const MAX_VIRTUAL_LAYOUT_RAF_RETRIES = 2;
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
   const observedNodesRef = useRef<Set<HTMLElement>>(new Set());
   const latestLayoutHandlersRef = useRef({
@@ -2647,10 +2650,23 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
   useLayoutEffect(() => {
     if (!enabled) {
       syncLayoutPassCountRef.current = 0;
+      rafRetryCountRef.current = 0;
+      lastExternalSignatureRef.current = '';
+      if (pendingLayoutRafRef.current !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(pendingLayoutRafRef.current);
+        pendingLayoutRafRef.current = null;
+      }
       return;
     }
     const root = scrollRef.current;
     if (!root) return;
+    const clientHeight = root.clientHeight;
+    const externalSignature = `${items.length}:${items[0]?.key ?? ''}:${items[items.length - 1]?.key ?? ''}:${clientHeight}:${resetKey ?? ''}:${resumeGeneration}:${revealKey ?? ''}`;
+    if (externalSignature !== lastExternalSignatureRef.current) {
+      lastExternalSignatureRef.current = externalSignature;
+      syncLayoutPassCountRef.current = 0;
+      rafRetryCountRef.current = 0;
+    }
     const wasAtBottom = wasAtBottomRef.current;
     const changed = commitMeasuredRows(root.querySelectorAll<HTMLElement>('[data-virtual-key]'));
     // Only a commit that can have changed the scroll range acts: a row height
@@ -2659,7 +2675,6 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
     // this render was our own layout re-render. A render that changed nothing
     // visible (a non-rendered status/usage update) must leave the viewport alone.
     // (A 0 -> N height is a pane becoming measurable, not a resize.)
-    const clientHeight = root.clientHeight;
     const viewportResized = lastCommitClientHeightRef.current > 0 && clientHeight !== lastCommitClientHeightRef.current;
     lastCommitClientHeightRef.current = clientHeight;
     const signature = `${layoutVersion}:${items.length}:${items[0]?.key ?? ''}:${items[items.length - 1]?.key ?? ''}`;
@@ -2667,6 +2682,7 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
     lastCommitSignatureRef.current = signature;
     if (!layoutMayHaveChanged) {
       syncLayoutPassCountRef.current = 0;
+      rafRetryCountRef.current = 0;
       return;
     }
     onMeasuredLayout?.(root, wasAtBottom);
@@ -2674,25 +2690,25 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
     captureViewportAnchor();
     if (!changed) {
       syncLayoutPassCountRef.current = 0;
+      rafRetryCountRef.current = 0;
       return;
     }
-    // Bound consecutive synchronous pre-paint re-renders so subpixel/range-edge
-    // height oscillation (for example after desktop sleep/wake or zoom changes)
-    // cannot lock the main thread in a tight microtask layout loop.
+    // Bound both synchronous pre-paint re-renders and cross-frame rAF retries so
+    // oscillating row heights cannot lock the main thread in a tight loop or a
+    // 60Hz rAF spin; budgets replenish when external inputs/viewport change or settle.
     syncLayoutPassCountRef.current += 1;
     if (syncLayoutPassCountRef.current <= 3) {
       setLayoutVersion((v) => v + 1);
       return;
     }
-    if (pendingLayoutRafRef.current === null) {
+    if (rafRetryCountRef.current < MAX_VIRTUAL_LAYOUT_RAF_RETRIES && pendingLayoutRafRef.current === null) {
       if (typeof requestAnimationFrame === 'function') {
+        rafRetryCountRef.current += 1;
         pendingLayoutRafRef.current = requestAnimationFrame(() => {
           pendingLayoutRafRef.current = null;
           syncLayoutPassCountRef.current = 0;
           setLayoutVersion((v) => v + 1);
         });
-      } else {
-        syncLayoutPassCountRef.current = 0;
       }
     }
   });

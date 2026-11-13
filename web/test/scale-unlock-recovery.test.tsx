@@ -323,5 +323,96 @@ describe('scale & desktop unlock recovery', () => {
       rectSpy.mockRestore();
       delete (HTMLElement.prototype as any).clientHeight;
     });
+
+    it('stops cross-frame rAF retries under sustained row height oscillation and recovers on external item change', async () => {
+      class MockResizeObserver {
+        observe = vi.fn();
+        unobserve = vi.fn();
+        disconnect = vi.fn();
+      }
+      vi.stubGlobal('ResizeObserver', MockResizeObserver);
+
+      let currentClientHeight = 600;
+      let firstKey: string | null = null;
+      let targetKey: string | null = null;
+      let targetFlip = false;
+      const rectSpy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+        const vk = this?.dataset?.virtualKey;
+        if (vk) {
+          if (!firstKey) firstKey = vk;
+          else if (!targetKey && vk !== firstKey) targetKey = vk;
+          if (vk === targetKey) {
+            targetFlip = !targetFlip;
+            const h = targetFlip ? 42 : 56;
+            return { top: 0, bottom: h, height: h, left: 0, right: 400, width: 400, x: 0, y: 0, toJSON: () => ({}) } as DOMRect;
+          }
+          return { top: 0, bottom: 42, height: 42, left: 0, right: 400, width: 400, x: 0, y: 0, toJSON: () => ({}) } as DOMRect;
+        }
+        return { top: 0, bottom: currentClientHeight, height: currentClientHeight, left: 0, right: 400, width: 400, x: 0, y: 0, toJSON: () => ({}) } as DOMRect;
+      });
+      Object.defineProperty(HTMLElement.prototype, 'clientHeight', { configurable: true, get: () => currentClientHeight });
+
+      const makeEvents = (count: number) => Array.from({ length: count }, (_, i) => ({
+        eventId: `ev-${i}`,
+        type: 'user.message',
+        sessionId: 'desk-main',
+        ts: 1000 + i,
+        epoch: 1,
+        seq: i + 1,
+        source: 'daemon',
+        confidence: 'high',
+        payload: { text: `message ${i}` },
+      })) as any[];
+
+      const rafQueue: FrameRequestCallback[] = [];
+      let totalRafScheduled = 0;
+      vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+        totalRafScheduled += 1;
+        rafQueue.push(cb);
+        return totalRafScheduled;
+      });
+      vi.stubGlobal('cancelAnimationFrame', vi.fn());
+
+      const view = render(<ChatView events={makeEvents(40)} loading={false} sessionId="desk-main" visible={true} />);
+
+      // Drain every rAF scheduled under perpetual row height oscillation.
+      // Previously reset syncLayoutPassCountRef=0 in every rAF tick, spinning 60Hz forever.
+      let ticks = 0;
+      while (rafQueue.length > 0 && ticks < 20) {
+        ticks += 1;
+        const cb = rafQueue.shift()!;
+        await act(async () => {
+          cb(ticks * 16);
+        });
+      }
+      expect(rafQueue.length).toBe(0);
+      expect(totalRafScheduled).toBeLessThanOrEqual(5);
+      const scheduledAfterOscillationStop = totalRafScheduled;
+
+      // Once external events change, measurement budget replenishes cleanly.
+      await act(async () => {
+        view.rerender(<ChatView events={makeEvents(41)} loading={false} sessionId="desk-main" visible={true} />);
+      });
+      while (rafQueue.length > 0 && ticks < 40) {
+        ticks += 1;
+        const cb = rafQueue.shift()!;
+        await act(async () => {
+          cb(ticks * 16);
+        });
+      }
+      expect(rafQueue.length).toBe(0);
+      expect(totalRafScheduled).toBeGreaterThan(scheduledAfterOscillationStop);
+      const scheduledAfterEventChange = totalRafScheduled;
+
+      // Once viewport clientHeight changes, measurement budget also replenishes.
+      currentClientHeight = 720;
+      await act(async () => {
+        view.rerender(<ChatView events={makeEvents(41)} loading={false} sessionId="desk-main" visible={true} />);
+      });
+      expect(totalRafScheduled).toBeGreaterThan(scheduledAfterEventChange);
+
+      rectSpy.mockRestore();
+      delete (HTMLElement.prototype as any).clientHeight;
+    });
   });
 });

@@ -760,4 +760,184 @@ describe('SessionTabs', () => {
 
     expect(onRenameSession).toHaveBeenCalledWith('deck_proj_brain', null);
   });
+
+  it('never overwrites tab_order before sessionsLoaded and tabOrderHydrated, or when sessions is empty', async () => {
+    const existing = { v: ['srv2_a', 'srv1_b'], t: 500 };
+    localStorage.setItem('rcc_sync_tab_order', JSON.stringify(existing));
+
+    let resolveRemote!: (val: string | null) => void;
+    getUserPrefMock.mockImplementationOnce(() => new Promise<string | null>((res) => {
+      resolveRemote = res;
+    }));
+
+    const sessions = makeSessions([{ name: 'srv1_a', label: 'A' }]);
+    const view = render(
+      <SessionTabs
+        sessions={[]}
+        activeSession={null}
+        onSelect={vi.fn()}
+        sessionsLoaded={false}
+        {...defaultProps}
+      />,
+    );
+    expect(saveUserPrefMock).not.toHaveBeenCalled();
+    expect(JSON.parse(localStorage.getItem('rcc_sync_tab_order')!)).toEqual(existing);
+
+    // Dashboard / loaded-but-empty must not clear other servers' tab_order
+    view.rerender(
+      <SessionTabs
+        sessions={[]}
+        activeSession={null}
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+      />,
+    );
+    expect(saveUserPrefMock).not.toHaveBeenCalled();
+    expect(JSON.parse(localStorage.getItem('rcc_sync_tab_order')!)).toEqual(existing);
+
+    // Sessions loaded, but tab_order still waiting for remote hydration
+    view.rerender(
+      <SessionTabs
+        sessions={sessions}
+        activeSession={null}
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+      />,
+    );
+    expect(saveUserPrefMock).not.toHaveBeenCalled();
+    expect(JSON.parse(localStorage.getItem('rcc_sync_tab_order')!)).toEqual(existing);
+
+    // Once remote preference finishes hydrating, missing local session is appended WITHOUT wiping existing names
+    await act(async () => {
+      resolveRemote(JSON.stringify(existing));
+      await Promise.resolve();
+    });
+    const stored = JSON.parse(localStorage.getItem('rcc_sync_tab_order')!) as { v: string[]; t: number };
+    expect(stored.v).toEqual(['srv2_a', 'srv1_b', 'srv1_a']);
+  });
+
+  it('does not ping-pong or wipe non-overlapping/partially overlapping sessions across storage events', async () => {
+    const initial = { v: ['srv1_alpha', 'srv1_beta', 'srv2_gamma'], t: 100 };
+    localStorage.setItem('rcc_sync_tab_order', JSON.stringify(initial));
+    getUserPrefMock.mockResolvedValue(JSON.stringify(initial));
+
+    const server1Sessions = makeSessions([
+      { name: 'srv1_alpha', label: 'S1 Alpha' },
+      { name: 'srv1_beta', label: 'S1 Beta' },
+    ]);
+
+    const view = render(
+      <SessionTabs
+        sessions={server1Sessions}
+        activeSession={null}
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+      />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    saveUserPrefMock.mockClear();
+
+    // Non-overlapping / partially overlapping update from another server tab arrives via storage event
+    const fromOtherTab = { v: ['srv2_delta', 'srv2_gamma', 'srv1_alpha', 'srv1_beta'], t: 200 };
+    localStorage.setItem('rcc_sync_tab_order', JSON.stringify(fromOtherTab));
+    await act(async () => {
+      window.dispatchEvent(new StorageEvent('storage', {
+        key: 'rcc_sync_tab_order',
+        newValue: JSON.stringify(fromOtherTab),
+      }));
+    });
+    expect(saveUserPrefMock).not.toHaveBeenCalled();
+    expect(JSON.parse(localStorage.getItem('rcc_sync_tab_order')!).v).toEqual(fromOtherTab.v);
+
+    // Drag in Server 1 preserves Server 2 entries alongside reordered Server 1 tabs
+    const wrappers = [...view.container.querySelectorAll('.tab-wrap')];
+    fireEvent.dragStart(wrappers[1]);
+    fireEvent.dragOver(wrappers[0]);
+    fireEvent.drop(wrappers[0]);
+    fireEvent.dragEnd(wrappers[1]);
+
+    const afterDrop = JSON.parse(localStorage.getItem('rcc_sync_tab_order')!).v as string[];
+    expect(afterDrop).toEqual(['srv1_beta', 'srv1_alpha', 'srv2_delta', 'srv2_gamma']);
+  });
+
+  it('keeps dragged order of two pinned tabs fixed and moves unpinned tab without oscillating', async () => {
+    localStorage.removeItem('rcc_sync_tab_order');
+    const sessions = makeSessions([
+      { name: 'ag_aip', label: 'ag aip' },
+      { name: 'ag_cd', label: 'ag cd' },
+      { name: 'ag_worker', label: 'ag worker' },
+    ]);
+    getUserPrefMock.mockResolvedValue(null);
+
+    const view = render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession="ag_aip"
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+        pinned={new Set(['ag_aip', 'ag_cd'])}
+      />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const getOrder = () => screen.getAllByRole('tab').map((tab) => (
+      ['ag aip', 'ag cd', 'ag worker'].find((lbl) => tab.textContent?.includes(lbl))
+    ));
+    expect(getOrder()).toEqual(['ag aip', 'ag cd', 'ag worker']);
+
+    // Drag second pinned tab ("ag cd") before first pinned tab ("ag aip")
+    const wrappers = [...view.container.querySelectorAll('.tab-wrap')];
+    fireEvent.dragStart(wrappers[1]);
+    fireEvent.dragOver(wrappers[0]);
+    fireEvent.drop(wrappers[0]);
+    fireEvent.dragEnd(wrappers[1]);
+    expect(getOrder()).toEqual(['ag cd', 'ag aip', 'ag worker']);
+    expect(JSON.parse(localStorage.getItem('rcc_sync_tab_order')!).v).toEqual(['ag_cd', 'ag_aip', 'ag_worker']);
+
+    saveUserPrefMock.mockClear();
+
+    // Unrelated session activity re-renders must NOT swap pinned tabs or rewrite tab_order
+    const updatedSessions = makeSessions([
+      { name: 'ag_aip', label: 'ag aip', state: 'running' },
+      { name: 'ag_cd', label: 'ag cd', state: 'idle' },
+      { name: 'ag_worker', label: 'ag worker', state: 'idle' },
+    ]);
+    view.rerender(
+      <SessionTabs
+        sessions={updatedSessions}
+        activeSession="ag_aip"
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+        pinned={new Set(['ag_aip', 'ag_cd'])}
+      />,
+    );
+    expect(getOrder()).toEqual(['ag cd', 'ag aip', 'ag worker']);
+    expect(saveUserPrefMock).not.toHaveBeenCalled();
+
+    // Unpin "ag cd" while keeping "ag aip" pinned: "ag cd" moves cleanly to unpinned before "ag_worker" without oscillating
+    view.rerender(
+      <SessionTabs
+        sessions={updatedSessions}
+        activeSession="ag_aip"
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+        pinned={new Set(['ag_aip'])}
+      />,
+    );
+    expect(getOrder()).toEqual(['ag aip', 'ag cd', 'ag worker']);
+    expect(saveUserPrefMock).not.toHaveBeenCalled();
+    expect(JSON.parse(localStorage.getItem('rcc_sync_tab_order')!).v).toEqual(['ag_cd', 'ag_aip', 'ag_worker']);
+  });
 });

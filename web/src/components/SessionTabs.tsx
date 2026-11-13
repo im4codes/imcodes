@@ -96,7 +96,7 @@ function SessionTabsImpl({ sessions, activeSession, connected, latencyMs, idleAl
   // Persisted order via server-synced preferences. (Pinned state is lifted to
   // app.tsx so handleStopProject can guard against stopping pinned sessions.)
   // Default to legacy localStorage value so existing users don't lose their arrangement.
-  const [tabOrder, setTabOrder] = useSyncedPreference<string[]>(
+  const [tabOrder, setTabOrder, tabOrderHydrated] = useSyncedPreference<string[]>(
     'tab_order',
     readLegacyOrder(),
     // A drag/drop is a single discrete action. Persist it immediately so a
@@ -109,18 +109,24 @@ function SessionTabsImpl({ sessions, activeSession, connected, latencyMs, idleAl
   const dragIdx = useRef<number | null>(null);
   const [dragOverIdx, setDragOverIdx] = useState<number | null>(null);
 
-  // Merge sessions with persisted order: keep known positions, prune destroyed,
-  // append unknown sessions to the end.
+  // Merge visible sessions with persisted order without mutating entries belonging
+  // to other servers or currently offline views.
   const orderedSessions = useMemo(() => {
-    const nameSet = new Set(sessions.map((s) => s.name));
-    // Remove stale entries from order (destroyed sessions).
-    const validOrder = tabOrder.filter((n) => nameSet.has(n));
-    // Find new sessions not yet in order — append to end.
-    const newNames = sessions.filter((s) => !validOrder.includes(s.name)).map((s) => s.name);
-    const fullOrder = [...validOrder, ...newNames];
-
     const byName = new Map(sessions.map((s) => [s.name, s]));
-    const ordered = fullOrder.map((n) => byName.get(n)).filter(Boolean) as SessionInfo[];
+    const seen = new Set<string>();
+    const ordered: SessionInfo[] = [];
+    for (const name of tabOrder) {
+      if (seen.has(name)) continue;
+      const session = byName.get(name);
+      if (!session) continue;
+      seen.add(name);
+      ordered.push(session);
+    }
+    for (const session of sessions) {
+      if (seen.has(session.name)) continue;
+      seen.add(session.name);
+      ordered.push(session);
+    }
 
     // Pinned first, then unpinned — stable within each group.
     const pinnedArr = ordered.filter((s) => pinned.has(s.name));
@@ -128,17 +134,27 @@ function SessionTabsImpl({ sessions, activeSession, connected, latencyMs, idleAl
     return [...pinnedArr, ...unpinnedArr];
   }, [sessions, tabOrder, pinned]);
 
-  // Sync back: when orderedSessions changes (e.g. new session arrives), update
-  // the persisted order so the next render is stable.
+  // Append newly discovered session names only once both sessions and the
+  // synced tab_order preference are hydrated. Never strip entries from other
+  // servers/views and never rewrite order simply because pinned tabs group first.
   useEffect(() => {
-    const newOrder = orderedSessions.map((s) => s.name);
-    if (JSON.stringify(newOrder) !== JSON.stringify(tabOrder)) {
-      setTabOrder(newOrder);
+    if (!sessionsLoaded || !tabOrderHydrated || sessions.length === 0) return;
+    const existing = new Set(tabOrder);
+    const missingNames: string[] = [];
+    const seenMissing = new Set<string>();
+    for (const s of sessions) {
+      if (!existing.has(s.name) && !seenMissing.has(s.name)) {
+        seenMissing.add(s.name);
+        missingNames.push(s.name);
+      }
     }
-  // We intentionally omit tabOrder from deps to avoid a render loop — the
-  // comparison inside guards against infinite updates.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [orderedSessions]);
+    if (missingNames.length === 0) return;
+    setTabOrder((prev) => {
+      const prevSet = new Set(prev);
+      const nextMissing = missingNames.filter((name) => !prevSet.has(name));
+      return nextMissing.length > 0 ? [...prev, ...nextMissing] : prev;
+    });
+  }, [sessions, sessionsLoaded, tabOrder, tabOrderHydrated, setTabOrder]);
 
   useEffect(() => {
     if (!ctx) return;
@@ -446,7 +462,17 @@ function SessionTabsImpl({ sessions, activeSession, connected, latencyMs, idleAl
     const names = orderedSessions.map((s) => s.name);
     const [moved] = names.splice(fromIdx, 1);
     names.splice(dropIdx, 0, moved);
-    setTabOrder(names);
+    const visibleSet = new Set(names);
+    setTabOrder((prev) => {
+      const otherNames: string[] = [];
+      const seenOther = new Set<string>();
+      for (const n of prev) {
+        if (visibleSet.has(n) || seenOther.has(n)) continue;
+        seenOther.add(n);
+        otherNames.push(n);
+      }
+      return [...names, ...otherNames];
+    });
     setDragOverIdx(null);
     dragIdx.current = null;
   }, [orderedSessions, pinned, setTabOrder]);

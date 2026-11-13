@@ -18,6 +18,14 @@ function writeLocal<T>(storageKey: string, payload: SyncedPreferencePayload<T>):
   // Preferences are durable intent: quota recovery evicts volatile snapshots first.
   safeLocalStorageSetItem(storageKey, JSON.stringify(payload));
 }
+function samePrefValue(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  try {
+    return JSON.stringify(a) === JSON.stringify(b);
+  } catch {
+    return false;
+  }
+}
 
 /** Whole-value LWW cache. Inventory/render projections must never be saved here.
  * Reconcile on mount/resume/reconnect; a failed read is not a missing preference.
@@ -52,13 +60,24 @@ export function useSyncedPreference<T>(
     let running = false;
     let queued = false;
     const active = () => !cancelled && owner.current === identity;
-    const apply = (payload: SyncedPreferencePayload<T>) => {
+    const apply = (payload: SyncedPreferencePayload<T>, writeToDisk: boolean) => {
       if (!active()) return;
+      const prevPayload = latest.current?.identity === identity ? latest.current.payload : null;
+      const diskLocal = readLocal<T>(storageKey);
+      const matchesPrev = prevPayload !== null && samePrefValue(payload.v, prevPayload.v);
+      const matchesDisk = diskLocal !== null && samePrefValue(payload.v, diskLocal.v);
       latest.current = { identity, payload };
-      writeLocal(storageKey, payload);
-      setState({ identity, value: payload.v });
+      if (writeToDisk && !matchesDisk) {
+        writeLocal(storageKey, payload);
+      }
+      if (matchesPrev) return;
+      setState((prev) => (
+        prev.identity === identity && samePrefValue(prev.value, payload.v)
+          ? prev
+          : { identity, value: payload.v }
+      ));
     };
-    setState({ identity, value: localValue(storageKey, defaultValue) });
+    setState((prev) => (prev.identity === identity ? prev : { identity, value: localValue(storageKey, defaultValue) }));
 
     const reconcile = async () => {
       if (!active()) return;
@@ -72,7 +91,7 @@ export function useSyncedPreference<T>(
           const remote = parseSyncedPreference<T>(raw);
           const local = readLatest();
           if (raw != null && !remote) continue; // corrupt/legacy data is not a reset
-          if (remote && (!local || remote.t >= local.t)) apply(remote);
+          if (remote && (!local || remote.t >= local.t)) apply(remote, true);
           else if (local) await saveUserPref(key, JSON.stringify(local), { signal: abort.signal });
         } catch (error) {
           if (active()) console.warn(`[useSyncedPreference] failed to reconcile pref "${key}":`, error);
@@ -88,7 +107,7 @@ export function useSyncedPreference<T>(
       if (!active() || event.key !== storageKey) return;
       const incoming = parseSyncedPreference<T>(event.newValue);
       const local = readLatest();
-      if (incoming && (!local || incoming.t >= local.t)) apply(incoming);
+      if (incoming && (!local || incoming.t >= local.t)) apply(incoming, false);
       else if (local && incoming && incoming.t < local.t) {
         // An older tab may have overwritten the shared storage row already.
         // Restore known intent too, so an offline reload cannot resurrect it.
@@ -119,6 +138,15 @@ export function useSyncedPreference<T>(
     const previous = readLatest();
     const priorValue = previous ? previous.v : (state.identity === identity ? state.value : defaultValue);
     const next = typeof updater === 'function' ? (updater as (prev: T) => T)(priorValue) : updater;
+    if (previous && samePrefValue(next, previous.v)) {
+      latest.current = { identity, payload: previous };
+      setState((prev) => (
+        prev.identity === identity && samePrefValue(prev.value, next)
+          ? prev
+          : { identity, value: next }
+      ));
+      return;
+    }
     const payload: SyncedPreferencePayload<T> = { v: next, t: Math.max(Date.now(), (previous?.t ?? 0) + 1) };
     latest.current = { identity, payload };
     writeLocal(storageKey, payload);
