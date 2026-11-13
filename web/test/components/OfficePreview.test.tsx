@@ -909,4 +909,78 @@ describe('OfficePreview fallback document transitions', () => {
     expect(view.getByTestId('office-preview-unavailable').textContent).toContain(zhCn.office_preview.unavailable);
     expect(view.getByTestId('office-preview-unavailable').textContent).not.toContain('Document preview is currently unavailable');
   });
+
+  it('keeps desktop ONLYOFFICE inline toolbar unchanged while exposing mobile <=600px single-row CSS hooks and icons', async () => {
+    const api = await import('../../src/api.js');
+    vi.spyOn(api, 'fetchCloudDocOnlyOfficeConfig').mockResolvedValueOnce({
+      enabled: true,
+      role: 'editor',
+      canManageShare: true,
+      allowDownload: true,
+      scriptUrl: 'https://onlyoffice.test/web-apps/apps/api/documents/api.js',
+      config: {
+        documentType: 'word',
+        document: {
+          title: 'Spec.docx',
+          url: 'https://files.test/Spec.docx',
+          fileType: 'docx',
+          key: 'k1',
+        },
+        editorConfig: { mode: 'edit' },
+      },
+    } as unknown as Awaited<ReturnType<typeof api.fetchCloudDocOnlyOfficeConfig>>);
+
+    const script = document.createElement('script');
+    script.src = 'https://onlyoffice.test/web-apps/apps/api/documents/api.js';
+    document.head.appendChild(script);
+    const originalDocsApi = window.DocsAPI;
+    window.DocsAPI = {
+      DocEditor: vi.fn().mockImplementation(() => ({ destroyEditor: vi.fn() })),
+    };
+
+    try {
+      const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
+      const view = render(
+        <OfficePreview
+          cloudDocId="cdoc-oo"
+          path="Spec.docx"
+          mimeType="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+          onOpenShare={vi.fn()}
+        />,
+      );
+
+      const toolbar = await waitFor(() => view.getByTestId('onlyoffice-toolbar'));
+      expect(toolbar.style.padding).toBe('6px 12px');
+      expect(toolbar.style.flexWrap).toBe('wrap');
+      expect(toolbar.querySelector('.office-preview-toolbar-group')).toBeTruthy();
+      expect(toolbar.querySelector('.office-preview-toolbar-actions')).toBeTruthy();
+
+      for (const tid of [
+        'onlyoffice-mode-view',
+        'onlyoffice-mode-edit',
+        'onlyoffice-open-share',
+        'onlyoffice-download-link',
+        'onlyoffice-fallback-btn',
+        'onlyoffice-fullscreen-btn',
+      ]) {
+        const el = view.getByTestId(tid);
+        expect(el.getAttribute('aria-label')).toBeTruthy();
+        expect(el.querySelector('.office-preview-btn-icon svg')).toBeTruthy();
+        expect(el.querySelector('.office-preview-btn-label')?.textContent).toBeTruthy();
+      }
+
+      const testDir = dirname(fileURLToPath(import.meta.url));
+      const css = readFileSync(resolve(testDir, '../../src/styles.css'), 'utf8');
+      const media600Idx = css.indexOf('@media (max-width: 600px)');
+      expect(media600Idx).toBeGreaterThan(-1);
+      expect(css.slice(0, media600Idx)).toContain('.office-preview-btn-icon {\n  display: none;\n}');
+      const mobileCss = css.slice(media600Idx);
+      expect(mobileCss).toContain('flex-wrap: nowrap !important;');
+      expect(mobileCss).toContain('.office-preview-toolbar-group,\n  .office-preview-toolbar-actions {\n    gap: 4px !important;\n    flex-wrap: nowrap !important;\n    white-space: nowrap;\n    flex: 0 0 auto;\n  }');
+      expect(mobileCss).toContain('.office-preview-btn-label {\n    display: none;\n  }');
+    } finally {
+      window.DocsAPI = originalDocsApi;
+      script.remove();
+    }
+  });
 });

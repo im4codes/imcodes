@@ -39,6 +39,7 @@ import {
   isSupportedCloudDocFilename,
   normalizeCloudDocName,
 } from '@shared/cloud-docs.js';
+import { dismissHtmlSplashForDirectEntry } from '../html-splash.js';
 
 const OfficePreview = lazy(() => import('./OfficePreview.js'));
 
@@ -471,6 +472,7 @@ export function CloudDocsPanel({
   const shareSeqRef = useRef(0);
   const shareAbortRef = useRef<AbortController | null>(null);
   const shareTargetRef = useRef<{ kind: CloudDocShareTargetKind; id: string; name: string } | null>(null);
+  const previewTitleInputRef = useRef<HTMLInputElement | null>(null);
   const previewTitleCancelledRef = useRef(false);
   const savedStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const editGenCounterRef = useRef(0);
@@ -504,6 +506,12 @@ export function CloudDocsPanel({
       if (savedStatusTimerRef.current) clearTimeout(savedStatusTimerRef.current);
     };
   }, []);
+
+  useLayoutEffect(() => {
+    if (standalone) {
+      dismissHtmlSplashForDirectEntry();
+    }
+  }, [standalone]);
 
   // Invalidates any pre-mutation list read so stale GET responses/errors cannot roll back newer projections.
   const invalidatePendingRefresh = useCallback(() => {
@@ -1887,23 +1895,26 @@ export function CloudDocsPanel({
 
     return (
       <div class={`cloud-docs-panel${standalone ? ' is-standalone' : ''}`} data-testid="cloud-docs-panel">
-        <div class="cloud-docs-preview-header">
+        <div class="cloud-docs-preview-header" data-testid="cloud-docs-preview-header">
           <button
             type="button"
             class="cloud-docs-btn"
             data-testid="cloud-docs-preview-back"
+            aria-label={t('cloud_docs.actions.back_to_list', 'Back')}
+            title={t('cloud_docs.actions.back_to_list', 'Back')}
             onClick={() => {
               openPreview(null);
               void refreshData();
             }}
           >
             <BackArrowIcon />
-            <span>{t('cloud_docs.actions.back_to_list', 'Back')}</span>
+            <span class="cloud-docs-preview-btn-label">{t('cloud_docs.actions.back_to_list', 'Back')}</span>
           </button>
           <DocKindIcon name={targetName} size={22} />
           {canRenameInPreview ? (
-            <div class="cloud-docs-preview-title-wrap">
+            <div class="cloud-docs-preview-title-wrap" data-testid="cloud-docs-preview-title-wrap">
               <input
+                ref={previewTitleInputRef}
                 type="text"
                 class="cloud-docs-preview-title-input"
                 data-testid="cloud-docs-preview-title-input"
@@ -1950,9 +1961,17 @@ export function CloudDocsPanel({
                   void commitPreviewTitleRename((e.currentTarget as HTMLInputElement).value);
                 }}
               />
-              <span class="cloud-docs-preview-edit-hint" aria-hidden="true"><PencilIcon /></span>
+              <span
+                class="cloud-docs-preview-edit-hint"
+                aria-hidden="true"
+                onClick={() => previewTitleInputRef.current?.focus()}
+              >
+                <PencilIcon />
+              </span>
               {previewTitleStatus === 'saving' && (
-                <span class="cloud-docs-preview-save-state">{t('cloud_docs.preview.saving', 'Saving...')}</span>
+                <span class="cloud-docs-preview-save-state" data-testid="cloud-docs-preview-saving">
+                  {t('cloud_docs.preview.saving', 'Saving...')}
+                </span>
               )}
               {previewTitleStatus === 'saved' && (
                 <span class="cloud-docs-preview-save-state is-saved" data-testid="cloud-docs-preview-saved">
@@ -1961,8 +1980,12 @@ export function CloudDocsPanel({
               )}
             </div>
           ) : (
-            <div class="cloud-docs-preview-title-wrap">
-              <span class="cloud-docs-preview-title" title={previewTarget.kind === 'cloud_doc' ? previewTarget.name : previewTarget.path}>
+            <div class="cloud-docs-preview-title-wrap" data-testid="cloud-docs-preview-title-wrap">
+              <span
+                class="cloud-docs-preview-title"
+                data-testid="cloud-docs-preview-title"
+                title={previewTarget.kind === 'cloud_doc' ? previewTarget.name : previewTarget.path}
+              >
                 {targetName}
               </span>
               {previewTarget.readOnly && (
@@ -1976,10 +1999,12 @@ export function CloudDocsPanel({
                 type="button"
                 class="cloud-docs-btn is-primary"
                 data-testid="cloud-docs-preview-share"
+                aria-label={t('cloud_docs.actions.share', 'Share')}
+                title={t('cloud_docs.actions.share', 'Share')}
                 onClick={() => void openShareDialog('doc', previewTarget.id, previewTarget.name)}
               >
                 <ShareIcon />
-                <span>{t('cloud_docs.actions.share', 'Share')}</span>
+                <span class="cloud-docs-preview-btn-label">{t('cloud_docs.actions.share', 'Share')}</span>
               </button>
             )}
             {previewTarget.kind === 'cloud_doc' && previewTarget.allowDownload && (
@@ -1987,10 +2012,12 @@ export function CloudDocsPanel({
                 type="button"
                 class="cloud-docs-btn"
                 data-testid="cloud-docs-preview-download"
+                aria-label={t('cloud_docs.actions.download', 'Download')}
+                title={t('cloud_docs.actions.download', 'Download')}
                 onClick={() => void handleDownloadCloudDoc(previewTarget.id, previewTarget.name)}
               >
                 <DownloadIcon />
-                <span>{t('cloud_docs.actions.download', 'Download')}</span>
+                <span class="cloud-docs-preview-btn-label">{t('cloud_docs.actions.download', 'Download')}</span>
               </button>
             )}
           </div>

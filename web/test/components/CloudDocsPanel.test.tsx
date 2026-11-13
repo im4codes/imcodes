@@ -1531,4 +1531,54 @@ describe('CloudDocsPanel', () => {
     fireEvent(window, new Event('blur'));
     expect(screen.queryByTestId('cloud-docs-context-menu')).toBeNull();
   });
+
+  it('keeps desktop preview header unchanged and scopes compact single-row header + inline rename cues strictly to <= 600px', async () => {
+    const doc = makeDoc({ id: 'doc-compact', name: 'Quarterly_Budget_Plan.docx', allowDownload: true });
+    listCloudDocsApiMock.mockResolvedValue({
+      folders: [],
+      docs: [doc],
+      sharedFolders: [],
+      sharedDocs: [],
+    });
+
+    render(<CloudDocsPanel initialTab="my_docs" />);
+    fireEvent.click((await screen.findByTestId('cloud-doc-row-doc-compact')).querySelector('button.cloud-docs-row-main')!);
+
+    const header = await screen.findByTestId('cloud-docs-preview-header');
+    const titleWrap = screen.getByTestId('cloud-docs-preview-title-wrap');
+    const titleInput = screen.getByTestId('cloud-docs-preview-title-input') as HTMLInputElement;
+    const editHint = titleWrap.querySelector('.cloud-docs-preview-edit-hint') as HTMLElement | null;
+    const backBtn = screen.getByTestId('cloud-docs-preview-back');
+    const shareBtn = screen.getByTestId('cloud-docs-preview-share');
+    const downloadBtn = screen.getByTestId('cloud-docs-preview-download');
+
+    expect(header).toBeTruthy();
+    expect(backBtn.getAttribute('aria-label')).toBe('Back');
+    expect(shareBtn.getAttribute('aria-label')).toBe('Share');
+    expect(downloadBtn.getAttribute('aria-label')).toBe('Download');
+    expect(backBtn.querySelector('.cloud-docs-preview-btn-label')?.textContent).toBe('Back');
+    expect(shareBtn.querySelector('.cloud-docs-preview-btn-label')?.textContent).toBe('Share');
+    expect(downloadBtn.querySelector('.cloud-docs-preview-btn-label')?.textContent).toBe('Download');
+    expect(editHint).toBeTruthy();
+
+    fireEvent.click(editHint!);
+    expect(document.activeElement).toBe(titleInput);
+
+    // Check CSS boundaries: desktop rule untouched above media queries, mobile rules strictly inside @media (max-width: 600px)
+    const testDir = dirname(fileURLToPath(import.meta.url));
+    const css = readFileSync(resolve(testDir, '../../src/styles.css'), 'utf8');
+    const media600Idx = css.indexOf('@media (max-width: 600px)');
+    expect(media600Idx).toBeGreaterThan(-1);
+    const baseCss = css.slice(0, media600Idx);
+    const mobileCss = css.slice(media600Idx);
+
+    expect(baseCss).toContain('.cloud-docs-preview-header {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 10px;\n  padding: 10px 14px;');
+    expect(baseCss).not.toContain('.cloud-docs-preview-title-wrap {\n    flex: 1 1 100%;');
+    expect(baseCss).not.toContain('.cloud-docs-preview-actions {\n    width: 100%;');
+
+    expect(mobileCss).toContain('.cloud-docs-preview-header {\n    padding: 4px 8px;\n    gap: 4px;\n    min-height: 36px;\n    flex-wrap: nowrap;');
+    expect(mobileCss).toContain('.cloud-docs-preview-btn-label {\n    display: none;\n  }');
+    expect(mobileCss).toContain('.cloud-docs-preview-title-input {');
+    expect(mobileCss).toContain('border-bottom: 1px dashed rgba(148, 163, 184, 0.85);');
+  });
 });

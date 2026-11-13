@@ -323,6 +323,88 @@ function XlsxPreview({ data }: { data: ArrayBuffer }) {
   );
 }
 
+function PreviewEyeIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z" />
+      <circle cx="12" cy="12" r="3" />
+    </svg>
+  );
+}
+
+function EditDocIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 20h9" />
+      <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
+    </svg>
+  );
+}
+
+function ShareOutlineIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="18" cy="5" r="3" />
+      <circle cx="6" cy="12" r="3" />
+      <circle cx="18" cy="19" r="3" />
+      <path d="m8.6 13.5 6.8 4" />
+      <path d="m15.4 6.5-6.8 4" />
+    </svg>
+  );
+}
+
+function DownloadOutlineIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+      <path d="m7 10 5 5 5-5" />
+      <path d="M12 15V3" />
+    </svg>
+  );
+}
+
+function LocalViewIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="4" y="3" width="16" height="18" rx="2" />
+      <path d="M8 8h8" />
+      <path d="M8 12h8" />
+      <path d="M8 16h5" />
+    </svg>
+  );
+}
+
+function FullscreenEnterIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M8 3H5a2 2 0 0 0-2 2v3" />
+      <path d="M16 3h3a2 2 0 0 1 2 2v3" />
+      <path d="M8 21H5a2 2 0 0 1-2-2v-3" />
+      <path d="M16 21h3a2 2 0 0 0 2-2v-3" />
+    </svg>
+  );
+}
+
+function FullscreenExitIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 14h4v4" />
+      <path d="M20 10h-4V6" />
+      <path d="M14 20v-4h4" />
+      <path d="M10 4v4H6" />
+    </svg>
+  );
+}
+
+function RetryIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+      <path d="M21 3v6h-6" />
+    </svg>
+  );
+}
+
 function OnlyOfficeEmbeddedEditor({
   ooConfig,
   mode,
@@ -423,9 +505,18 @@ function OnlyOfficeEmbeddedEditor({
   const canEdit = ooConfig.role === 'editor';
   const allowDownload = ooConfig.allowDownload;
   const effectiveDownloadUrl = downloadUrl || ooConfig.config?.document?.url;
+  const modeViewLabel = t('office_preview.mode_view', 'Preview');
+  const modeEditLabel = t('office_preview.mode_edit', 'Co-Edit');
+  const shareLabel = t('doc_share.share_button', 'Share & Permissions');
+  const downloadLabel = t('office_preview.download', 'Download');
+  const localPreviewLabel = t('office_preview.local_preview', 'Local Preview');
+  const fullscreenLabel = isFullscreen
+    ? t('office_preview.exit_fullscreen', 'Exit Fullscreen')
+    : t('office_preview.fullscreen', 'Fullscreen');
 
   return (
     <div
+      className="office-preview-embedded"
       data-testid="onlyoffice-embedded-wrapper"
       style={{
         display: 'flex',
@@ -440,6 +531,8 @@ function OnlyOfficeEmbeddedEditor({
       }}
     >
       <div
+        className="office-preview-toolbar"
+        data-testid="onlyoffice-toolbar"
         style={{
           display: 'flex',
           alignItems: 'center',
@@ -453,8 +546,9 @@ function OnlyOfficeEmbeddedEditor({
           flexWrap: 'wrap',
         }}
       >
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <div className="office-preview-toolbar-group" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <span
+            className="office-preview-role-pill"
             style={{
               padding: '2px 8px',
               borderRadius: 999,
@@ -469,10 +563,13 @@ function OnlyOfficeEmbeddedEditor({
               : t('office_preview.role_viewer', 'Read-only Viewer')}
           </span>
           {canEdit && (
-            <div style={{ display: 'inline-flex', borderRadius: 4, overflow: 'hidden', border: '1px solid #475569' }}>
+            <div className="office-preview-mode-toggle" style={{ display: 'inline-flex', borderRadius: 4, overflow: 'hidden', border: '1px solid #475569' }}>
               <button
                 type="button"
+                className={`office-preview-mode-btn${mode === 'view' ? ' is-active' : ''}`}
                 data-testid="onlyoffice-mode-view"
+                aria-label={modeViewLabel}
+                title={modeViewLabel}
                 onClick={() => onModeChange('view')}
                 style={{
                   padding: '3px 10px',
@@ -483,11 +580,15 @@ function OnlyOfficeEmbeddedEditor({
                   color: mode === 'view' ? '#fff' : '#cbd5e1',
                 }}
               >
-                {t('office_preview.mode_view', 'Preview')}
+                <span className="office-preview-btn-icon" aria-hidden="true"><PreviewEyeIcon /></span>
+                <span className="office-preview-btn-label">{modeViewLabel}</span>
               </button>
               <button
                 type="button"
+                className={`office-preview-mode-btn${mode === 'edit' ? ' is-active' : ''}`}
                 data-testid="onlyoffice-mode-edit"
+                aria-label={modeEditLabel}
+                title={modeEditLabel}
                 onClick={() => onModeChange('edit')}
                 style={{
                   padding: '3px 10px',
@@ -498,16 +599,20 @@ function OnlyOfficeEmbeddedEditor({
                   color: mode === 'edit' ? '#fff' : '#cbd5e1',
                 }}
               >
-                {t('office_preview.mode_edit', 'Co-Edit')}
+                <span className="office-preview-btn-icon" aria-hidden="true"><EditDocIcon /></span>
+                <span className="office-preview-btn-label">{modeEditLabel}</span>
               </button>
             </div>
           )}
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <div className="office-preview-toolbar-actions" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           {onOpenShare && ooConfig.canManageShare && (
             <button
               type="button"
+              className="office-preview-tool-btn is-primary"
               data-testid="onlyoffice-open-share"
+              aria-label={shareLabel}
+              title={shareLabel}
               onClick={onOpenShare}
               style={{
                 padding: '3px 10px',
@@ -519,14 +624,18 @@ function OnlyOfficeEmbeddedEditor({
                 fontSize: 11,
               }}
             >
-              {t('doc_share.share_button', 'Share & Permissions')}
+              <span className="office-preview-btn-icon" aria-hidden="true"><ShareOutlineIcon /></span>
+              <span className="office-preview-btn-label">{shareLabel}</span>
             </button>
           )}
           {allowDownload && onDownload ? (
             <button
               type="button"
+              className="office-preview-tool-btn"
               onClick={onDownload}
               data-testid="onlyoffice-download-link"
+              aria-label={downloadLabel}
+              title={downloadLabel}
               style={{
                 padding: '3px 10px',
                 background: '#334155',
@@ -537,13 +646,17 @@ function OnlyOfficeEmbeddedEditor({
                 fontSize: 11,
               }}
             >
-              {t('office_preview.download', 'Download')}
+              <span className="office-preview-btn-icon" aria-hidden="true"><DownloadOutlineIcon /></span>
+              <span className="office-preview-btn-label">{downloadLabel}</span>
             </button>
           ) : allowDownload && effectiveDownloadUrl ? (
             <a
+              className="office-preview-tool-btn"
               href={effectiveDownloadUrl}
               download={ooConfig.config?.document?.title || true}
               data-testid="onlyoffice-download-link"
+              aria-label={downloadLabel}
+              title={downloadLabel}
               style={{
                 padding: '3px 10px',
                 background: '#334155',
@@ -553,13 +666,17 @@ function OnlyOfficeEmbeddedEditor({
                 fontSize: 11,
               }}
             >
-              {t('office_preview.download', 'Download')}
+              <span className="office-preview-btn-icon" aria-hidden="true"><DownloadOutlineIcon /></span>
+              <span className="office-preview-btn-label">{downloadLabel}</span>
             </a>
           ) : null}
           {onFallbackLocal && (
             <button
               type="button"
+              className="office-preview-tool-btn is-muted"
               data-testid="onlyoffice-fallback-btn"
+              aria-label={localPreviewLabel}
+              title={localPreviewLabel}
               onClick={onFallbackLocal}
               style={{
                 padding: '3px 10px',
@@ -571,12 +688,16 @@ function OnlyOfficeEmbeddedEditor({
                 fontSize: 11,
               }}
             >
-              {t('office_preview.local_preview', 'Local Preview')}
+              <span className="office-preview-btn-icon" aria-hidden="true"><LocalViewIcon /></span>
+              <span className="office-preview-btn-label">{localPreviewLabel}</span>
             </button>
           )}
           <button
             type="button"
+            className="office-preview-tool-btn"
             data-testid="onlyoffice-fullscreen-btn"
+            aria-label={fullscreenLabel}
+            title={fullscreenLabel}
             onClick={onToggleFullscreen}
             style={{
               padding: '3px 10px',
@@ -588,13 +709,14 @@ function OnlyOfficeEmbeddedEditor({
               fontSize: 11,
             }}
           >
-            {isFullscreen
-              ? t('office_preview.exit_fullscreen', 'Exit Fullscreen')
-              : t('office_preview.fullscreen', 'Fullscreen')}
+            <span className="office-preview-btn-icon" aria-hidden="true">
+              {isFullscreen ? <FullscreenExitIcon /> : <FullscreenEnterIcon />}
+            </span>
+            <span className="office-preview-btn-label">{fullscreenLabel}</span>
           </button>
         </div>
       </div>
-      <div style={{ flex: 1, width: '100%', minHeight: 420, position: 'relative' }}>
+      <div className="office-preview-editor-wrap" style={{ flex: 1, width: '100%', minHeight: 420, position: 'relative' }}>
         <div id={holderIdRef.current} data-testid="onlyoffice-editor-holder" style={{ width: '100%', height: '100%' }} />
       </div>
     </div>
@@ -815,10 +937,14 @@ function OfficePreviewDocument({
     );
   }
 
+  const retryLabel = t('common.retry', 'Retry ONLYOFFICE');
   const retryOnlyOfficeButton = hasRemoteTarget ? (
     <button
       type="button"
+      className="office-preview-tool-btn is-muted"
       data-testid="office-preview-retry-onlyoffice"
+      aria-label={retryLabel}
+      title={retryLabel}
       onClick={() => {
         setFallbackNotice(null);
         setOoConfigError(null);
@@ -836,7 +962,8 @@ function OfficePreviewDocument({
         fontSize: 11,
       }}
     >
-      {t('common.retry', 'Retry ONLYOFFICE')}
+      <span className="office-preview-btn-icon" aria-hidden="true"><RetryIcon /></span>
+      <span className="office-preview-btn-label">{retryLabel}</span>
     </button>
   ) : null;
 
@@ -952,6 +1079,7 @@ function OfficePreviewDocument({
     <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%' }}>
       {(fallbackNotice || ooState.forceLocal) && hasRemoteTarget && (
         <div
+          className="office-preview-toolbar is-fallback"
           data-testid="office-preview-local-fallback-bar"
           style={{
             display: 'flex',
@@ -965,7 +1093,7 @@ function OfficePreviewDocument({
             color: '#cbd5e1',
           }}
         >
-          <span>
+          <span className="office-preview-fallback-text">
             {fallbackNotice
               ? `${t('office_preview.onlyoffice_load_failed', 'ONLYOFFICE unavailable')} — ${t('office_preview.local_preview', 'Local Preview')}`
               : t('office_preview.local_preview', 'Local Preview')}
