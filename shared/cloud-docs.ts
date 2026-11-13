@@ -1,13 +1,33 @@
 import { sanitizeUploadFilename } from './upload-filename.js';
 
+export const CLOUD_DOCS_API_PATH = '/api/cloud-docs';
+export const RECENT_DOCUMENTS_API_PATH = '/api/recent-documents';
 export const CLOUD_DOCS_MAX_UPLOAD_BYTES = 50 * 1024 * 1024; // 50 MiB
 export const CLOUD_DOCS_FOLDER_NAME_MAX_LENGTH = 120;
 export const CLOUD_DOCS_RECENT_DEFAULT_LIMIT = 50;
 export const CLOUD_DOCS_RECENT_MAX_LIMIT = 100;
 export const CLOUD_DOCS_DEFAULT_DIR = '/var/lib/imcodes/cloud-docs';
 
+export const CLOUD_DOC_CONTENT_MAX_CHARS = 512 * 1024; // 512 KiB readable text limit
+export const CLOUD_DOC_ZIP_MAX_ENTRIES = 256;
+export const CLOUD_DOC_ZIP_MAX_ENTRY_UNCOMPRESSED_BYTES = 10 * 1024 * 1024; // 10 MiB
+export const CLOUD_DOC_ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 32 * 1024 * 1024; // 32 MiB
+
 export const CLOUD_DOC_BLANK_TYPES = ['docx', 'xlsx', 'pptx'] as const;
 export type CloudDocBlankType = (typeof CLOUD_DOC_BLANK_TYPES)[number];
+
+export const CLOUD_DOC_CREATE_TYPES = ['docx', 'xlsx', 'pptx', 'md', 'txt'] as const;
+export type CloudDocCreateType = (typeof CLOUD_DOC_CREATE_TYPES)[number];
+
+export const CLOUD_DOC_EDIT_MODES = ['replace', 'append'] as const;
+export type CloudDocEditMode = (typeof CLOUD_DOC_EDIT_MODES)[number];
+
+export const CLOUD_DOC_READABLE_TEXT_EXTS = ['.md', '.txt', '.csv', '.json', '.log'] as const;
+export const CLOUD_DOC_EDITABLE_EXTS = ['.docx', '.xlsx', '.pptx', '.md', '.txt', '.csv', '.json', '.log'] as const;
+
+export function isCreateCloudDocType(value: unknown): value is CloudDocCreateType {
+  return typeof value === 'string' && (CLOUD_DOC_CREATE_TYPES as readonly string[]).includes(value);
+}
 
 export const RECENT_DOCUMENT_SOURCE_KINDS = ['server_file', 'cloud_doc'] as const;
 export type RecentDocumentSourceKind = (typeof RECENT_DOCUMENT_SOURCE_KINDS)[number];
@@ -25,6 +45,9 @@ export const CLOUD_DOC_ERROR_CODES = {
   SERVER_OFFLINE: 'server_offline',
   MISSING_FILE: 'cloud_doc_file_missing',
   DOWNLOAD_FORBIDDEN: 'download_forbidden',
+  CONTENT_TOO_LARGE: 'content_too_large',
+  UNSUPPORTED_CONTENT_EDIT: 'unsupported_content_edit',
+  INVALID_ARCHIVE: 'invalid_archive',
 } as const;
 
 export type CloudDocShareRole = 'viewer' | 'editor';
@@ -202,6 +225,22 @@ export interface RecordRecentDocumentInput {
   mimeType?: string;
   openMode?: 'view' | 'edit';
 }
+
+export type CloudDocContentPayload = {
+  doc: CloudDocItem;
+  role: CloudDocShareRole | 'owner';
+  allowDownload: boolean;
+  ext: string;
+  format: 'docx' | 'xlsx' | 'pptx' | 'text';
+  editable: boolean;
+  content: string;
+  truncated: boolean;
+  totalChars: number;
+  byteLength: number;
+  maxChars: number;
+  sheets?: Array<{ name: string; rows: string[][] }>;
+  slides?: Array<{ index: number; title?: string; texts: string[] }>;
+};
 
 export function isBlankCloudDocType(value: unknown): value is CloudDocBlankType {
   return value === 'docx' || value === 'xlsx' || value === 'pptx';

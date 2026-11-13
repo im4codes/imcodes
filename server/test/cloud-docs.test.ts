@@ -8,8 +8,12 @@ import { WsBridge } from '../src/ws/bridge.js';
 import type { Database } from '../src/db/client.js';
 import type { Env } from '../src/env.js';
 import { isMigrationFile } from '../src/db/migrate.js';
-import { signJwt } from '../src/security/crypto.js';
+import { signJwt, sha256Hex } from '../src/security/crypto.js';
 import { resolveOnlyOfficeJwtSecret } from '../src/routes/onlyoffice.js';
+import { issueSharedMachineAuthority } from '../src/share/shared-machine-authority.js';
+import { NODE_ROLE } from '../../shared/remote-exec.js';
+import { SERVER_ID_HEADER } from '../../shared/http-header-names.js';
+import { SHARED_MACHINE_AUTHORITY_HEADER, SHARED_MACHINE_AUTHORITY_TYPE } from '../../shared/shared-machine-authority.js';
 import {
   LocalCloudDocStorage,
   type CloudDocStorage,
@@ -34,9 +38,25 @@ function createInMemoryCloudDocsDb() {
   const teams = new Map<string, { id: string; name: string; owner_id: string }>([
     ['team-1', { id: 'team-1', name: 'Ops Group', owner_id: 'owner-1' }],
   ]);
-  const servers = new Map<string, { id: string; name: string; user_id: string; team_id: string | null }>([
-    ['srv-1', { id: 'srv-1', name: 'Build Node 1', user_id: 'owner-1', team_id: 'team-1' }],
+  const servers = new Map<string, { id: string; name: string; user_id: string; team_id: string | null; token_hash?: string; node_role?: string; revoked_at?: number | null }>([
+    ['srv-1', { id: 'srv-1', name: 'Build Node 1', user_id: 'owner-1', team_id: 'team-1', token_hash: sha256Hex('srv-1-secret'), node_role: NODE_ROLE.FULL, revoked_at: null }],
+    ['srv-ctrl', { id: 'srv-ctrl', name: 'Controlled Node 1', user_id: 'owner-1', team_id: 'team-1', token_hash: sha256Hex('srv-ctrl-secret'), node_role: NODE_ROLE.CONTROLLED, revoked_at: null }],
   ]);
+  const sessions = new Map<string, { server_id: string; name: string; project_name: string }>([
+    ['srv-1:main-shared', { server_id: 'srv-1', name: 'main-shared', project_name: 'demo-proj' }],
+  ]);
+  const sessionShares: Array<{
+    id: string;
+    server_id: string;
+    session_name: string;
+    target_user_id: string;
+    role: 'viewer' | 'participant';
+    created_by: string;
+    created_at: number;
+    updated_at: number;
+    expires_at: number | null;
+    revoked_at: number | null;
+  }> = [];
   const teamMembers = new Map<string, string>([
     ['team-1:owner-1', 'owner'],
     ['team-1:user-bob', 'member'],
@@ -106,6 +126,23 @@ function createInMemoryCloudDocsDb() {
           .slice(0, limit ?? 50) as unknown as T[];
       }
 
+      if (s.includes('FROM session_shares')) {
+        const [now, userId, serverId, sessionName] = params as [number, string, string, string];
+        return sessionShares
+          .filter((r) =>
+            r.revoked_at === null &&
+            (r.expires_at === null || r.expires_at > now) &&
+            r.target_user_id === userId &&
+            r.server_id === serverId &&
+            r.session_name === sessionName,
+          )
+          .map((r) => ({ target_kind: 'main', ...r })) as unknown as T[];
+      }
+
+      if (s.includes('FROM server_shares') || s.includes('FROM sub_session_shares')) {
+        return [] as T[];
+      }
+
       return [] as T[];
     },
 
@@ -145,6 +182,46 @@ function createInMemoryCloudDocsDb() {
           (r) => r.revoked_at === null && r.target_kind === targetKind && r.target_id === targetId && r.share_mode === 'user' && r.target_user_id === userId,
         );
         return (row ?? null) as unknown as T | null;
+      }
+
+      if (s.includes('FROM cloud_doc_shares WHERE id = $1')) {
+        const row = shares.get(params[0] as string);
+        return (row ? { ...row } : null) as unknown as T | null;
+      }
+
+      // Daemon server bearer token lookup (resolveBearerOutcome)
+      if (s.includes('token_hash') && s.includes('node_role') && s.includes('FROM servers WHERE id = $1')) {
+        const srv = servers.get(params[0] as string);
+        if (!srv) return null;
+        const owner = users.get(srv.user_id);
+        return {
+          token_hash: srv.token_hash ?? '',
+          user_id: srv.user_id,
+          node_role: srv.node_role ?? NODE_ROLE.FULL,
+          revoked_at: srv.revoked_at ?? null,
+          owner_status: owner?.status ?? null,
+        } as unknown as T;
+      }
+
+      // Session existence & project binding (shared-machine-authority / tab-sharing)
+      if (s.includes('SELECT EXISTS (SELECT 1 FROM sessions WHERE server_id = $1 AND name = $2)')) {
+        const [serverId, name] = params as [string, string];
+        return { exists: sessions.has(`${serverId}:${name}`) } as unknown as T;
+      }
+      if (s === 'SELECT project_name FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1') {
+        const [serverId, name] = params as [string, string];
+        const sess = sessions.get(`${serverId}:${name}`);
+        return (sess ? { project_name: sess.project_name } : null) as unknown as T | null;
+      }
+      if (s.includes('AS actor_status') && s.includes('AS owner_status') && !s.includes('FROM servers WHERE id = $1')) {
+        const [actorId, serverId] = params as [string, string];
+        const actor = users.get(actorId);
+        const srv = servers.get(serverId);
+        const owner = srv ? users.get(srv.user_id) : undefined;
+        return {
+          actor_status: actor?.status ?? null,
+          owner_status: owner?.status ?? null,
+        } as unknown as T;
       }
 
       // Server name lookup
@@ -456,6 +533,8 @@ function createInMemoryCloudDocsDb() {
     docs,
     recents,
     shares,
+    sessions,
+    sessionShares,
     setFailNextDocInsert: (v: boolean) => { failNextDocInsertMode = v ? 'pre_commit' : 'none'; },
     setFailNextDocInsertMode: (mode: 'none' | 'pre_commit' | 'ambiguous') => { failNextDocInsertMode = mode; },
     setFailNextDocCommit: (v: boolean) => { failNextDocCommitMode = v ? 'pre_commit' : 'none'; },
@@ -1420,5 +1499,329 @@ describe('cloud docs & recent documents', () => {
     expect(uploadCancelled).toBe(true);
     expect(uploadPulled).toBeLessThan(18);
     expect(memDb.docs.size).toBe(docCountBefore);
+  });
+
+  function daemonHeaders(serverId = 'srv-1', secret = 'srv-1-secret', sharedAuthority?: string): Record<string, string> {
+    const h: Record<string, string> = {
+      [SERVER_ID_HEADER]: serverId,
+      Authorization: `Bearer ${secret}`,
+    };
+    if (sharedAuthority) h[SHARED_MACHINE_AUTHORITY_HEADER] = sharedAuthority;
+    return h;
+  }
+
+  function mintParticipantAuthority(actorUserId = 'user-bob', serverId = 'srv-1') {
+    const now = Date.now();
+    memDb.sessionShares.push({
+      id: `ss-${actorUserId}-${now}`,
+      server_id: serverId,
+      session_name: 'main-shared',
+      target_user_id: actorUserId,
+      role: 'participant',
+      created_by: 'owner-1',
+      created_at: now - 1000,
+      updated_at: now - 1000,
+      expires_at: now + 3600_000,
+      revoked_at: null,
+    });
+    return issueSharedMachineAuthority(
+      {
+        type: SHARED_MACHINE_AUTHORITY_TYPE,
+        sub: actorUserId,
+        sourceServerId: serverId,
+        sessionName: 'main-shared',
+        projectName: 'demo-proj',
+        shareTarget: { kind: 'main', serverId, sessionName: 'main-shared' },
+        actionId: `act-${now}`,
+      },
+      JWT_KEY,
+    );
+  }
+
+  it('enforces FULL vs controlled-node gating and fail-closed delegated authority parity', async () => {
+    // 1. Owner creates an unshared private doc via FULL daemon token
+    const createPrivateRes = await app.request('/api/cloud-docs/blank', {
+      method: 'POST',
+      headers: { ...daemonHeaders('srv-1', 'srv-1-secret'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'owner-secret', type: 'docx', content: 'Confidential line' }),
+    });
+    expect(createPrivateRes.status).toBe(201);
+    const privateDoc = (await createPrivateRes.json()).doc as { id: string; docVersion: number };
+
+    // 2. Non-FULL (controlled) node daemon token is denied on every cloud-docs endpoint
+    const ctrlHeaders = daemonHeaders('srv-ctrl', 'srv-ctrl-secret');
+    expect((await app.request('/api/cloud-docs', { headers: ctrlHeaders })).status).toBe(403);
+    expect(
+      (
+        await app.request('/api/cloud-docs/blank', {
+          method: 'POST',
+          headers: { ...ctrlHeaders, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: 'x', type: 'txt' }),
+        })
+      ).status,
+    ).toBe(403);
+    expect((await app.request(`/api/cloud-docs/${privateDoc.id}/content`, { headers: ctrlHeaders })).status).toBe(403);
+    expect(
+      (
+        await app.request(`/api/cloud-docs/${privateDoc.id}/content`, {
+          method: 'PUT',
+          headers: { ...ctrlHeaders, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: 'hack', mode: 'replace' }),
+        })
+      ).status,
+    ).toBe(403);
+    expect((await app.request(`/api/cloud-docs/${privateDoc.id}`, { method: 'DELETE', headers: ctrlHeaders })).status).toBe(403);
+
+    // 3. Valid participant authority acts strictly as user-bob (cannot see/edit/delete owner's unshared doc)
+    const bobAuthority = mintParticipantAuthority('user-bob');
+    const bobListRes = await app.request('/api/cloud-docs', {
+      headers: daemonHeaders('srv-1', 'srv-1-secret', bobAuthority),
+    });
+    expect(bobListRes.status).toBe(200);
+    const bobList = await bobListRes.json();
+    expect(bobList.docs.map((d: { id: string }) => d.id)).not.toContain(privateDoc.id);
+    expect(bobList.sharedDocs.map((d: { id: string }) => d.id)).not.toContain(privateDoc.id);
+
+    const bobReadPrivate = await app.request(`/api/cloud-docs/${privateDoc.id}/content`, {
+      headers: daemonHeaders('srv-1', 'srv-1-secret', bobAuthority),
+    });
+    expect(bobReadPrivate.status).toBe(404);
+
+    // 4. Tampered, wrong-server, or revoked delegated authority FAILS CLOSED (never falls back to host owner-1)
+    const invalidAuthorities = [
+      'not-a-jwt',
+      issueSharedMachineAuthority(
+        {
+          type: SHARED_MACHINE_AUTHORITY_TYPE,
+          sub: 'user-bob',
+          sourceServerId: 'srv-other',
+          sessionName: 'main-shared',
+          projectName: 'demo-proj',
+          shareTarget: { kind: 'main', serverId: 'srv-other', sessionName: 'main-shared' },
+          actionId: 'bad-srv',
+        },
+        JWT_KEY,
+      ),
+    ];
+    for (const badAuth of invalidAuthorities) {
+      const r = await app.request(`/api/cloud-docs/${privateDoc.id}/content`, {
+        headers: daemonHeaders('srv-1', 'srv-1-secret', badAuth),
+      });
+      expect(r.status).toBe(403);
+      const rList = await app.request('/api/cloud-docs', {
+        headers: daemonHeaders('srv-1', 'srv-1-secret', badAuth),
+      });
+      expect(rList.status).toBe(403);
+    }
+
+    // Revoking the live session share immediately invalidates the already-minted authority
+    memDb.sessionShares[0]!.revoked_at = Date.now();
+    const afterRevokeRes = await app.request('/api/cloud-docs', {
+      headers: daemonHeaders('srv-1', 'srv-1-secret', bobAuthority),
+    });
+    expect(afterRevokeRes.status).toBe(403);
+  });
+
+  it('enforces exact owner / shared editor / shared viewer ACL matrix across folders, docs, content, and shares', async () => {
+    const bobAuthority = mintParticipantAuthority('user-bob');
+    const bobAgentHeaders = daemonHeaders('srv-1', 'srv-1-secret', bobAuthority);
+
+    // Owner creates shared editor folder + sibling editor folder + viewer doc + owner-only doc
+    const f1Res = await app.request('/api/cloud-docs/folders', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'SharedWork' }),
+    });
+    const f1 = (await f1Res.json()).folder as { id: string };
+    const f2Res = await app.request('/api/cloud-docs/folders', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'SharedArchive' }),
+    });
+    const f2 = (await f2Res.json()).folder as { id: string };
+
+    // Share f1 & f2 as editor with bob, plus create a doc in f1 and a separate viewer doc shared with carol
+    await app.request('/api/cloud-docs/shares', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ shareMode: 'user', targetKind: 'folder', targetId: f1.id, targetUsername: 'bob', role: 'editor', allowDownload: true }),
+    });
+    await app.request('/api/cloud-docs/shares', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ shareMode: 'user', targetKind: 'folder', targetId: f2.id, targetUsername: 'bob', role: 'editor', allowDownload: true }),
+    });
+
+    const viewerDocRes = await app.request('/api/cloud-docs/blank', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'ReadonlyNotice', type: 'md', content: 'View only' }),
+    });
+    const viewerDoc = (await viewerDocRes.json()).doc as { id: string; docVersion: number };
+    await app.request('/api/cloud-docs/shares', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ shareMode: 'user', targetKind: 'doc', targetId: viewerDoc.id, targetUsername: 'bob', role: 'viewer', allowDownload: true }),
+    });
+
+    // Editor (bob agent): CAN create doc + subfolder inside shared editor folder f1
+    const bobDocRes = await app.request('/api/cloud-docs/blank', {
+      method: 'POST',
+      headers: { ...bobAgentHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'CollabSpec', type: 'docx', folderId: f1.id, content: 'Draft 1' }),
+    });
+    expect(bobDocRes.status).toBe(201);
+    const bobDoc = (await bobDocRes.json()).doc as { id: string; docVersion: number };
+
+    const bobSubfolderRes = await app.request('/api/cloud-docs/folders', {
+      method: 'POST',
+      headers: { ...bobAgentHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Subdir', parentId: f1.id }),
+    });
+    expect(bobSubfolderRes.status).toBe(201);
+    const bobSubfolder = (await bobSubfolderRes.json()).folder as { id: string };
+
+    // Owner sees doc created inside shared folder too (inherited under owner's tree)
+    const ownerListRes = await app.request('/api/cloud-docs', { headers: bearerHeader('owner-1') });
+    const ownerList = await ownerListRes.json();
+    expect(ownerList.docs.some((d: { id: string }) => d.id === bobDoc.id)).toBe(true);
+
+    // Editor CAN edit content, rename, and move within shared editor folders (f1 -> f2)
+    const editRes = await app.request(`/api/cloud-docs/${bobDoc.id}/content`, {
+      method: 'PUT',
+      headers: { ...bobAgentHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'Draft 2', mode: 'append', expectedVersion: 1 }),
+    });
+    expect(editRes.status).toBe(200);
+    expect((await editRes.json()).doc.docVersion).toBe(2);
+
+    const renameMoveRes = await app.request(`/api/cloud-docs/${bobDoc.id}`, {
+      method: 'PATCH',
+      headers: { ...bobAgentHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'CollabSpecRenamed', folderId: f2.id }),
+    });
+    expect(renameMoveRes.status).toBe(200);
+    expect((await renameMoveRes.json()).doc.folderId).toBe(f2.id);
+
+    // Editor CANNOT move shared doc to root (folderId: null), delete doc/folder, or inspect/manage shares
+    expect(
+      (
+        await app.request(`/api/cloud-docs/${bobDoc.id}`, {
+          method: 'PATCH',
+          headers: { ...bobAgentHeaders, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ folderId: null }),
+        })
+      ).status,
+    ).toBe(403);
+    expect((await app.request(`/api/cloud-docs/${bobDoc.id}`, { method: 'DELETE', headers: bobAgentHeaders })).status).toBe(403);
+    expect((await app.request(`/api/cloud-docs/folders/${bobSubfolder.id}`, { method: 'DELETE', headers: bobAgentHeaders })).status).toBe(403);
+    expect((await app.request(`/api/cloud-docs/shares/doc/${bobDoc.id}`, { headers: bobAgentHeaders })).status).toBe(403);
+    expect(
+      (
+        await app.request('/api/cloud-docs/shares', {
+          method: 'POST',
+          headers: { ...bobAgentHeaders, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ shareMode: 'user', targetKind: 'doc', targetId: bobDoc.id, targetUsername: 'carol', role: 'viewer' }),
+        })
+      ).status,
+    ).toBe(403);
+
+    // Viewer (bob on viewerDoc): CAN read/content, CANNOT edit/rename/delete/share
+    const viewReadRes = await app.request(`/api/cloud-docs/${viewerDoc.id}/content`, { headers: bobAgentHeaders });
+    expect(viewReadRes.status).toBe(200);
+    expect((await viewReadRes.json()).content).toBe('View only');
+
+    expect(
+      (
+        await app.request(`/api/cloud-docs/${viewerDoc.id}/content`, {
+          method: 'PUT',
+          headers: { ...bobAgentHeaders, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: 'overwrite', mode: 'replace' }),
+        })
+      ).status,
+    ).toBe(403);
+    expect(
+      (
+        await app.request(`/api/cloud-docs/${viewerDoc.id}`, {
+          method: 'PATCH',
+          headers: { ...bobAgentHeaders, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: 'tamper' }),
+        })
+      ).status,
+    ).toBe(403);
+    expect((await app.request(`/api/cloud-docs/${viewerDoc.id}`, { method: 'DELETE', headers: bobAgentHeaders })).status).toBe(403);
+  });
+
+  it('supports OOXML & text content read/write, optimistic CAS, unsupported format error, and storage/DB rollback', async () => {
+    const ownerDaemon = daemonHeaders('srv-1', 'srv-1-secret');
+
+    // Create docx, xlsx, pptx, txt with initial content and verify round-trips
+    const xlsxRes = await app.request('/api/cloud-docs/blank', {
+      method: 'POST',
+      headers: { ...ownerDaemon, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Budget', type: 'xlsx', content: 'Item\tCost\nHost\t42' }),
+    });
+    expect(xlsxRes.status).toBe(201);
+    const xlsxDoc = (await xlsxRes.json()).doc as { id: string; docVersion: number };
+
+    const xlsxRead = await app.request(`/api/cloud-docs/${xlsxDoc.id}/content`, { headers: ownerDaemon });
+    expect(xlsxRead.status).toBe(200);
+    const xlsxBody = await xlsxRead.json();
+    expect(xlsxBody.format).toBe('xlsx');
+    expect(xlsxBody.sheets).toEqual([{ name: 'Sheet1', rows: [['Item', 'Cost'], ['Host', '42']] }]);
+
+    // Append row + verify version 1 -> 2
+    const appendRes = await app.request(`/api/cloud-docs/${xlsxDoc.id}/content`, {
+      method: 'PUT',
+      headers: { ...ownerDaemon, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'Domain\t15', mode: 'append', expectedVersion: 1 }),
+    });
+    expect(appendRes.status).toBe(200);
+    const afterAppend = await appendRes.json();
+    expect(afterAppend.doc.docVersion).toBe(2);
+
+    // Stale expectedVersion -> 409 conflict & version stays 2
+    const conflictRes = await app.request(`/api/cloud-docs/${xlsxDoc.id}/content`, {
+      method: 'PUT',
+      headers: { ...ownerDaemon, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'stale', mode: 'replace', expectedVersion: 1 }),
+    });
+    expect(conflictRes.status).toBe(409);
+    expect((await conflictRes.json()).error).toBe('version_conflict');
+    expect(Number(memDb.docs.get(xlsxDoc.id)?.doc_version)).toBe(2);
+
+    // Pre-commit DB failure rolls back orphan blob and leaves v2 intact
+    const filesBefore = fs.readdirSync(tmpDir, { recursive: true }).length;
+    memDb.setFailNextDocCommitMode('pre_commit');
+    const failedWriteRes = await app.request(`/api/cloud-docs/${xlsxDoc.id}/content`, {
+      method: 'PUT',
+      headers: { ...ownerDaemon, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'should-rollback', mode: 'replace', expectedVersion: 2 }),
+    });
+    expect(failedWriteRes.status).toBe(500);
+    expect(Number(memDb.docs.get(xlsxDoc.id)?.doc_version)).toBe(2);
+    expect(fs.readdirSync(tmpDir, { recursive: true }).length).toBe(filesBefore);
+    const verifyIntact = await app.request(`/api/cloud-docs/${xlsxDoc.id}/content`, { headers: ownerDaemon });
+    expect((await verifyIntact.json()).content).toContain('Domain\t15');
+
+    // Unsupported format (.pdf) returns 400 unsupported_document_type on read & unsupported_content_edit on write
+    const form = new FormData();
+    form.set('file', new File([Buffer.from('%PDF-1.4\n')], 'manual.pdf', { type: 'application/pdf' }));
+    const pdfRes = await app.request('/api/cloud-docs/files', {
+      method: 'POST',
+      headers: ownerDaemon,
+      body: form,
+    });
+    const pdfDoc = (await pdfRes.json()).doc as { id: string };
+    const readPdfRes = await app.request(`/api/cloud-docs/${pdfDoc.id}/content`, { headers: ownerDaemon });
+    expect(readPdfRes.status).toBe(400);
+    expect((await readPdfRes.json()).error).toBe('unsupported_document_type');
+    const writePdfRes = await app.request(`/api/cloud-docs/${pdfDoc.id}/content`, {
+      method: 'PUT',
+      headers: { ...ownerDaemon, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'x', mode: 'replace' }),
+    });
+    expect(writePdfRes.status).toBe(400);
+    expect((await writePdfRes.json()).error).toBe('unsupported_content_edit');
   });
 });

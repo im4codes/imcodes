@@ -7,13 +7,19 @@ import { authFailureResponse, resolveAuthOutcome } from '../security/authorizati
 import { sha256Hex, signJwt, verifyJwt } from '../security/crypto.js';
 import { resolveUserByIdentifier } from '../db/user-lookup.js';
 import { WsBridge } from '../ws/bridge.js';
+import { resolveMachineOperationalUser } from '../share/shared-machine-authority.js';
 import {
-  buildBlankDocumentBytes,
   getOnlyOfficeDocumentMeta,
   resolveLiveOnlyOfficeAccess,
   resolveOnlyOfficeJwtSecret,
   resolveTrustedOnlyOfficeDownloadUrl,
 } from './onlyoffice.js';
+import {
+  CloudDocContentError,
+  applyCloudDocContentEdit,
+  buildCloudDocBytesFromContent,
+  extractCloudDocContent,
+} from '../services/cloud-doc-content.js';
 import {
   type CloudDocStorage,
   buildCloudDocStorageKey,
@@ -26,6 +32,7 @@ import {
   deleteRecentDocument,
   getCloudDocById,
   getCloudDocFolderById,
+  getCloudDocShareById,
   insertCloudDoc,
   isDefinitelyUncommittedDbError,
   isDescendantFolder,
@@ -36,6 +43,7 @@ import {
   listSharedCloudItemsForUser,
   listUserTeamsForCloudDocs,
   resolveCloudDocAccess,
+  resolveCloudDocFolderAccess,
   revokeCloudDocShare,
   rowToCloudDocItem,
   rowToRecentDocumentBase,
@@ -46,17 +54,22 @@ import {
   upsertRecentDocument,
 } from '../db/cloud-docs.js';
 import {
+  CLOUD_DOC_CONTENT_MAX_CHARS,
+  CLOUD_DOC_EDIT_MODES,
   CLOUD_DOCS_MAX_UPLOAD_BYTES,
   CLOUD_DOCS_RECENT_DEFAULT_LIMIT,
+  type CloudDocEditMode,
   type RecentDocumentAccessReason,
   type RecentDocumentItem,
   getCloudDocMeta,
-  isBlankCloudDocType,
+  isCreateCloudDocType,
   normalizeCloudDocFolderName,
   normalizeCloudDocName,
   normalizeRecentFilePath,
 } from '../../../shared/cloud-docs.js';
 import { FS_GENERIC_ERROR_CODES } from '../../../shared/fs-error-codes.js';
+import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-authority.js';
+import { NODE_ROLE } from '../../../shared/remote-exec.js';
 
 type RouteContext = Context<{ Bindings: Env; Variables: { userId: string; role: string } }>;
 
@@ -254,6 +267,22 @@ async function requireRegularUser(c: RouteContext): Promise<{ userId: string } |
   if (outcome.auth.scope === 'doc_collaborator') {
     return c.json({ error: 'forbidden' }, 403);
   }
+  if (outcome.auth.nodeRole !== undefined || outcome.auth.serverId !== undefined) {
+    if (outcome.auth.nodeRole !== NODE_ROLE.FULL || !outcome.auth.serverId) {
+      return c.json({ error: 'forbidden', reason: 'controlled_node_forbidden' }, 403);
+    }
+    const operational = await resolveMachineOperationalUser(c.env.DB, {
+      token: c.req.header(SHARED_MACHINE_AUTHORITY_HEADER),
+      signingKey: c.env.JWT_SIGNING_KEY,
+      authenticatedSourceServerId: outcome.auth.serverId,
+      sourceOwnerUserId: outcome.auth.userId,
+      now: Date.now(),
+    });
+    if (!operational) {
+      return c.json({ error: 'forbidden', reason: 'invalid_shared_machine_authority' }, 403);
+    }
+    return { userId: operational.delegatedActorUserId ?? operational.userId };
+  }
   return { userId: outcome.auth.userId };
 }
 
@@ -317,7 +346,8 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
     } else {
       const owned = await getCloudDocFolderById(c.env.DB, auth.userId, targetId);
       if (!owned) {
-        return c.json({ error: 'folder_not_found' }, 404);
+        const access = await resolveCloudDocFolderAccess(c.env.DB, targetId, auth.userId);
+        return c.json({ error: access.allowed ? 'forbidden' : 'folder_not_found' }, access.allowed ? 403 : 404);
       }
     }
 
@@ -373,7 +403,8 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
     } else {
       const owned = await getCloudDocFolderById(c.env.DB, auth.userId, targetId);
       if (!owned) {
-        return c.json({ error: 'folder_not_found' }, 404);
+        const access = await resolveCloudDocFolderAccess(c.env.DB, targetId, auth.userId);
+        return c.json({ error: access.allowed ? 'forbidden' : 'folder_not_found' }, access.allowed ? 403 : 404);
       }
     }
 
@@ -436,7 +467,18 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
       shareId,
       createdBy: auth.userId,
     });
-    if (!revoked) return c.json({ error: 'not_found' }, 404);
+    if (!revoked) {
+      const existingShare = await getCloudDocShareById(c.env.DB, shareId);
+      if (existingShare && existingShare.revoked_at === null) {
+        const targetAccess = existingShare.target_kind === 'doc'
+          ? await resolveCloudDocAccess(c.env.DB, existingShare.target_id, auth.userId)
+          : await resolveCloudDocFolderAccess(c.env.DB, existingShare.target_id, auth.userId);
+        if (targetAccess.allowed) {
+          return c.json({ error: 'forbidden' }, 403);
+        }
+      }
+      return c.json({ error: 'not_found' }, 404);
+    }
     return c.json({ ok: true });
   });
 
@@ -460,15 +502,20 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
     const parentId = typeof body.parentId === 'string' && body.parentId.trim()
       ? body.parentId.trim()
       : null;
+    let folderOwnerUserId = auth.userId;
     if (parentId) {
-      const parent = await getCloudDocFolderById(c.env.DB, auth.userId, parentId);
-      if (!parent) {
+      const parentAccess = await resolveCloudDocFolderAccess(c.env.DB, parentId, auth.userId);
+      if (!parentAccess.allowed) {
         return c.json({ error: 'folder_not_found' }, 404);
       }
+      if (parentAccess.role !== 'editor') {
+        return c.json({ error: 'forbidden' }, 403);
+      }
+      folderOwnerUserId = parentAccess.folder.user_id;
     }
 
     const folder = await createCloudDocFolder(c.env.DB, {
-      userId: auth.userId,
+      userId: folderOwnerUserId,
       name,
       parentId,
     });
@@ -480,6 +527,14 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
     if (auth instanceof Response) return auth;
 
     const folderId = c.req.param('id');
+    const folderAccess = await resolveCloudDocFolderAccess(c.env.DB, folderId, auth.userId);
+    if (!folderAccess.allowed) {
+      return c.json({ error: 'folder_not_found' }, 404);
+    }
+    if (folderAccess.role !== 'editor') {
+      return c.json({ error: 'forbidden' }, 403);
+    }
+
     let body: { name?: string; parentId?: string | null };
     try {
       body = (await c.req.json()) as { name?: string; parentId?: string | null };
@@ -500,17 +555,23 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
       nextParentId = typeof body.parentId === 'string' && body.parentId.trim()
         ? body.parentId.trim()
         : null;
+      if (!nextParentId && !folderAccess.isOwner) {
+        return c.json({ error: 'forbidden' }, 403);
+      }
       if (nextParentId) {
-        const targetParent = await getCloudDocFolderById(c.env.DB, auth.userId, nextParentId);
-        if (!targetParent) return c.json({ error: 'folder_not_found' }, 404);
-        if (await isDescendantFolder(c.env.DB, auth.userId, nextParentId, folderId)) {
+        const targetAccess = await resolveCloudDocFolderAccess(c.env.DB, nextParentId, auth.userId);
+        if (!targetAccess.allowed) return c.json({ error: 'folder_not_found' }, 404);
+        if (targetAccess.role !== 'editor' || targetAccess.folder.user_id !== folderAccess.folder.user_id) {
+          return c.json({ error: 'forbidden' }, 403);
+        }
+        if (await isDescendantFolder(c.env.DB, folderAccess.folder.user_id, nextParentId, folderId)) {
           return c.json({ error: 'invalid_move' }, 400);
         }
       }
     }
 
     const updated = await updateCloudDocFolder(c.env.DB, {
-      userId: auth.userId,
+      userId: folderAccess.folder.user_id,
       folderId,
       name: nextName,
       parentId: nextParentId,
@@ -525,6 +586,10 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
     if (auth instanceof Response) return auth;
 
     const folderId = c.req.param('id');
+    const folderAccess = await resolveCloudDocFolderAccess(c.env.DB, folderId, auth.userId);
+    if (!folderAccess.allowed) return c.json({ error: 'folder_not_found' }, 404);
+    if (!folderAccess.isOwner) return c.json({ error: 'forbidden' }, 403);
+
     const deleted = await deleteCloudDocFolderTree(c.env.DB, auth.userId, folderId);
     if (!deleted) return c.json({ error: 'folder_not_found' }, 404);
 
@@ -533,28 +598,34 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
     return c.json({ ok: true, deletedFolderIds: deleted.deletedFolderIds });
   });
 
-  // ── Cloud Docs: Create blank document ───────────────────────────────────────
+  // ── Cloud Docs: Create blank / initial-content document ─────────────────────
   routes.post('/cloud-docs/blank', async (c): Promise<Response> => {
     const auth = await requireRegularUser(c);
     if (auth instanceof Response) return auth;
 
-    let body: { type?: string; name?: string; folderId?: string | null };
+    let body: { type?: string; name?: string; folderId?: string | null; content?: unknown };
     try {
-      body = (await c.req.json()) as { type?: string; name?: string; folderId?: string | null };
+      body = (await c.req.json()) as { type?: string; name?: string; folderId?: string | null; content?: unknown };
     } catch {
       return c.json({ error: 'invalid_json' }, 400);
     }
 
-    if (!isBlankCloudDocType(body.type)) {
+    if (!isCreateCloudDocType(body.type)) {
       return c.json({ error: 'unsupported_document_type' }, 400);
+    }
+    if (body.content !== undefined && typeof body.content !== 'string') {
+      return c.json({ error: 'invalid_content' }, 400);
     }
 
     const folderId = typeof body.folderId === 'string' && body.folderId.trim()
       ? body.folderId.trim()
       : null;
+    let docOwnerUserId = auth.userId;
     if (folderId) {
-      const folder = await getCloudDocFolderById(c.env.DB, auth.userId, folderId);
-      if (!folder) return c.json({ error: 'folder_not_found' }, 404);
+      const folderAccess = await resolveCloudDocFolderAccess(c.env.DB, folderId, auth.userId);
+      if (!folderAccess.allowed) return c.json({ error: 'folder_not_found' }, 404);
+      if (folderAccess.role !== 'editor') return c.json({ error: 'forbidden' }, 403);
+      docOwnerUserId = folderAccess.folder.user_id;
     }
 
     const ext = `.${body.type}`;
@@ -565,9 +636,18 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
     const meta = getCloudDocMeta(safeName);
     if (!meta) return c.json({ error: 'unsupported_document_type' }, 400);
 
+    let bytes: Buffer;
+    try {
+      bytes = buildCloudDocBytesFromContent(ext, body.content as string | undefined);
+    } catch (err) {
+      if (err instanceof CloudDocContentError) {
+        return c.json({ error: err.code, message: err.message }, err.statusCode);
+      }
+      return c.json({ error: 'unsupported_document_type' }, 400);
+    }
+
     const docId = `cdoc_${randomUUID().replace(/-/g, '').slice(0, 20)}`;
-    const storageKey = buildCloudDocStorageKey(auth.userId, docId, 1);
-    const bytes = buildBlankDocumentBytes(ext);
+    const storageKey = buildCloudDocStorageKey(docOwnerUserId, docId, 1);
 
     let writeResult: { sizeBytes: number; sha256: string };
     try {
@@ -579,7 +659,7 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
     try {
       const row = await insertCloudDoc(c.env.DB, {
         id: docId,
-        userId: auth.userId,
+        userId: docOwnerUserId,
         folderId,
         name: safeName,
         ext: meta.ext,
@@ -644,9 +724,12 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
     const folderId = typeof rawFolderId === 'string' && rawFolderId.trim()
       ? rawFolderId.trim()
       : null;
+    let docOwnerUserId = auth.userId;
     if (folderId) {
-      const folder = await getCloudDocFolderById(c.env.DB, auth.userId, folderId);
-      if (!folder) return c.json({ error: 'folder_not_found' }, 404);
+      const folderAccess = await resolveCloudDocFolderAccess(c.env.DB, folderId, auth.userId);
+      if (!folderAccess.allowed) return c.json({ error: 'folder_not_found' }, 404);
+      if (folderAccess.role !== 'editor') return c.json({ error: 'forbidden' }, 403);
+      docOwnerUserId = folderAccess.folder.user_id;
     }
 
     const requestedName = form.get('name');
@@ -676,7 +759,7 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
     }
 
     const docId = `cdoc_${randomUUID().replace(/-/g, '').slice(0, 20)}`;
-    const storageKey = buildCloudDocStorageKey(auth.userId, docId, 1);
+    const storageKey = buildCloudDocStorageKey(docOwnerUserId, docId, 1);
 
     let writeResult: { sizeBytes: number; sha256: string };
     try {
@@ -688,7 +771,7 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
     try {
       const row = await insertCloudDoc(c.env.DB, {
         id: docId,
-        userId: auth.userId,
+        userId: docOwnerUserId,
         folderId,
         name: safeName,
         ext: meta.ext,
@@ -1194,18 +1277,173 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
     return serveCloudDocDownload(row.storage_key, row.mime_type, row.name, forceDownload);
   });
 
+  // ── Cloud Docs: Read extracted text / structured content ──────────────────
+  routes.get('/cloud-docs/:id/content', async (c): Promise<Response> => {
+    const auth = await requireRegularUser(c);
+    if (auth instanceof Response) return auth;
+
+    const docId = c.req.param('id');
+    const access = await resolveCloudDocAccess(c.env.DB, docId, auth.userId);
+    if (!access.allowed) {
+      return c.json({ error: 'not_found' }, 404);
+    }
+
+    if (!(await storage.exists(access.doc.storage_key))) {
+      return c.json({ error: 'cloud_doc_file_missing' }, 404);
+    }
+
+    const rawMaxChars = Number(c.req.query('maxChars'));
+    const maxChars = Number.isFinite(rawMaxChars) && rawMaxChars > 0
+      ? Math.min(Math.floor(rawMaxChars), CLOUD_DOC_CONTENT_MAX_CHARS)
+      : CLOUD_DOC_CONTENT_MAX_CHARS;
+
+    let bytes: Buffer;
+    try {
+      bytes = await storage.read(access.doc.storage_key);
+    } catch {
+      return c.json({ error: 'cloud_doc_storage_error' }, 500);
+    }
+
+    try {
+      const extracted = extractCloudDocContent(access.doc.ext, bytes, maxChars);
+      return c.json({
+        doc: rowToCloudDocItem(access.doc),
+        role: access.isOwner ? 'owner' : access.role,
+        allowDownload: access.allowDownload,
+        ...extracted,
+      });
+    } catch (err) {
+      if (err instanceof CloudDocContentError) {
+        return c.json({ error: err.code, message: err.message }, err.statusCode);
+      }
+      return c.json({ error: 'unsupported_document_type' }, 400);
+    }
+  });
+
+  // ── Cloud Docs: Edit / Replace / Append document content ────────────────────
+  routes.put('/cloud-docs/:id/content', async (c): Promise<Response> => {
+    const auth = await requireRegularUser(c);
+    if (auth instanceof Response) return auth;
+
+    const docId = c.req.param('id');
+    const initialAccess = await resolveCloudDocAccess(c.env.DB, docId, auth.userId);
+    if (!initialAccess.allowed) {
+      return c.json({ error: 'not_found' }, 404);
+    }
+    if (initialAccess.role !== 'editor') {
+      return c.json({ error: 'forbidden' }, 403);
+    }
+
+    let body: { content?: unknown; mode?: unknown; expectedVersion?: unknown };
+    try {
+      body = (await c.req.json()) as { content?: unknown; mode?: unknown; expectedVersion?: unknown };
+    } catch {
+      return c.json({ error: 'invalid_json' }, 400);
+    }
+
+    if (typeof body.content !== 'string') {
+      return c.json({ error: 'invalid_content' }, 400);
+    }
+    const mode: CloudDocEditMode = body.mode === undefined ? 'replace' : (body.mode as CloudDocEditMode);
+    if (!(CLOUD_DOC_EDIT_MODES as readonly string[]).includes(mode)) {
+      return c.json({ error: 'invalid_mode' }, 400);
+    }
+    if (body.expectedVersion !== undefined && (!Number.isInteger(body.expectedVersion) || (body.expectedVersion as number) < 1)) {
+      return c.json({ error: 'invalid_expected_version' }, 400);
+    }
+
+    return lockCloudDocCommit(docId, async () => {
+      const liveAccess = await resolveCloudDocAccess(c.env.DB, docId, auth.userId);
+      if (!liveAccess.allowed) return c.json({ error: 'not_found' }, 404);
+      if (liveAccess.role !== 'editor') return c.json({ error: 'forbidden' }, 403);
+
+      const current = liveAccess.doc;
+      if (typeof body.expectedVersion === 'number' && body.expectedVersion !== current.doc_version) {
+        return c.json({ error: 'version_conflict', currentVersion: current.doc_version }, 409);
+      }
+
+      let existingBytes = Buffer.alloc(0);
+      if (mode === 'append') {
+        if (!(await storage.exists(current.storage_key))) {
+          return c.json({ error: 'cloud_doc_file_missing' }, 404);
+        }
+        try {
+          existingBytes = await storage.read(current.storage_key);
+        } catch {
+          return c.json({ error: 'cloud_doc_storage_error' }, 500);
+        }
+      }
+
+      let nextBytes: Buffer;
+      try {
+        nextBytes = applyCloudDocContentEdit({
+          ext: current.ext,
+          existingBytes,
+          mode,
+          content: body.content as string,
+        });
+      } catch (err) {
+        if (err instanceof CloudDocContentError) {
+          return c.json({ error: err.code, message: err.message }, err.statusCode);
+        }
+        return c.json({ error: 'unsupported_document_type' }, 400);
+      }
+
+      const nextVersion = current.doc_version + 1;
+      const newStorageKey = buildCloudDocStorageKey(current.user_id, current.id, nextVersion);
+      let writeResult: { sizeBytes: number; sha256: string };
+      try {
+        writeResult = await storage.write(newStorageKey, nextBytes);
+      } catch {
+        return c.json({ error: 'cloud_doc_storage_error' }, 500);
+      }
+
+      try {
+        const committed = await commitCloudDocContent(c.env.DB, {
+          docId: current.id,
+          userId: current.user_id,
+          expectedVersion: current.doc_version,
+          bumpVersion: true,
+          newStorageKey,
+          sizeBytes: writeResult.sizeBytes,
+          contentSha256: writeResult.sha256,
+        });
+        if (committed.status === 'conflict') {
+          await storage.delete(newStorageKey).catch(() => {});
+          return c.json({ error: 'version_conflict', currentVersion: current.doc_version }, 409);
+        }
+        if (current.storage_key !== newStorageKey) {
+          await storage.delete(current.storage_key).catch(() => {});
+        }
+        return c.json({
+          ok: true,
+          doc: rowToCloudDocItem(committed.doc),
+          role: liveAccess.isOwner ? 'owner' : liveAccess.role,
+          bytesWritten: writeResult.sizeBytes,
+        });
+      } catch (err) {
+        if (isDefinitelyUncommittedDbError(err)) {
+          await storage.delete(newStorageKey).catch(() => {});
+        }
+        return c.json({ error: 'cloud_doc_db_error' }, 500);
+      }
+    });
+  });
+
   // ── Cloud Docs: Rename / Move ───────────────────────────────────────────────
   routes.patch('/cloud-docs/:id', async (c): Promise<Response> => {
     const auth = await requireRegularUser(c);
     if (auth instanceof Response) return auth;
 
     const docId = c.req.param('id');
-    const existing = await getCloudDocById(c.env.DB, docId, auth.userId);
-    if (!existing) {
-      const access = await resolveCloudDocAccess(c.env.DB, docId, auth.userId);
-      if (access.allowed) return c.json({ error: 'forbidden' }, 403);
+    const access = await resolveCloudDocAccess(c.env.DB, docId, auth.userId);
+    if (!access.allowed) {
       return c.json({ error: 'not_found' }, 404);
     }
+    if (access.role !== 'editor') {
+      return c.json({ error: 'forbidden' }, 403);
+    }
+    const existing = access.doc;
 
     let body: { name?: string; folderId?: string | null };
     try {
@@ -1233,14 +1471,20 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
       nextFolderId = typeof body.folderId === 'string' && body.folderId.trim()
         ? body.folderId.trim()
         : null;
+      if (!nextFolderId && !access.isOwner) {
+        return c.json({ error: 'forbidden' }, 403);
+      }
       if (nextFolderId) {
-        const folder = await getCloudDocFolderById(c.env.DB, auth.userId, nextFolderId);
-        if (!folder) return c.json({ error: 'folder_not_found' }, 404);
+        const folderAccess = await resolveCloudDocFolderAccess(c.env.DB, nextFolderId, auth.userId);
+        if (!folderAccess.allowed) return c.json({ error: 'folder_not_found' }, 404);
+        if (folderAccess.role !== 'editor' || folderAccess.folder.user_id !== existing.user_id) {
+          return c.json({ error: 'forbidden' }, 403);
+        }
       }
     }
 
     const updated = await updateCloudDocMetadata(c.env.DB, {
-      userId: auth.userId,
+      userId: existing.user_id,
       docId,
       name: nextName,
       ext: nextExt,

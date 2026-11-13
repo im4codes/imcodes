@@ -855,6 +855,19 @@ export async function upsertCloudDocShare(
   return found;
 }
 
+export async function getCloudDocShareById(
+  db: Database,
+  shareId: string,
+): Promise<CloudDocShareRow | null> {
+  return db.queryOne<CloudDocShareRow>(
+    `SELECT id, target_kind, target_id, share_mode, target_team_id, target_user_id,
+            role, allow_download, created_by, created_at, updated_at, revoked_at
+     FROM cloud_doc_shares
+     WHERE id = $1`,
+    [shareId],
+  );
+}
+
 export async function revokeCloudDocShare(
   db: Database,
   params: { shareId: string; createdBy: string },

@@ -1,6 +1,14 @@
 import { isIncognitoSessionName } from '../../shared/session-incognito-context.js';
 import { SESSION_INCOGNITO_MEMORY_DISABLED } from '../../shared/session-incognito-types.js';
 import { TASK_PAIR_DECISION_LIMITS, validateTaskPairDecisionDetails, type TaskPairDecisionDetails } from '../../shared/task-pair-decision.js';
+import {
+  CLOUD_DOC_CONTENT_MAX_CHARS,
+  CLOUD_DOC_CREATE_TYPES,
+  CLOUD_DOC_EDIT_MODES,
+  type CloudDocCreateType,
+  type CloudDocEditMode,
+} from '../../shared/cloud-docs.js';
+import type { CloudDocsToolDeps } from './cloud-docs-mcp-deps.js';
 import { readSessionTextMessages, readSessionSummaries, readSessionToolEvents, resolveHistorySession, canReadSessionHistory } from './session-history.js';
 import { SESSION_TEXT_HISTORY_DEFAULT_LIMIT, SESSION_TEXT_HISTORY_MAX_LIMIT, SESSION_HISTORY_KINDS } from '../../shared/session-history.js';
 import { pausePair, resumePair, initialPairWait, validatePairDependencies } from './task-pairs/suspension.js';
@@ -474,6 +482,8 @@ export interface MemoryMcpToolDeps {
    * wired in `mergeDefaultToolDeps` (relays via the daemon's own credential).
    */
   machineDeps?: MachineToolDeps;
+  /** FULL-node Cloud Docs / ONLYOFFICE document tools with frontend & delegated-turn actor parity. */
+  cloudDocsDeps?: CloudDocsToolDeps;
   /**
    * The node's own role. Only FULL nodes advertise the machine tools; a
    * controlled node excludes them from its tool surface (10.12). Defaults to
@@ -5029,6 +5039,191 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         ? { status: 'ok', outcome: result.outcome }
         : { status: 'ok', outcome: result.outcome, result: result.result };
     },
+    [MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_LIST]: async (input, context) => {
+      if (!deps.cloudDocsDeps?.listDocs) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'cloud docs tools are not available on this node');
+      const args = pickAllowedMcpArgs(input, ['folderId', 'search', 'includeRecent']);
+      const folderId = stringArg(args, 'folderId');
+      const search = stringArg(args, 'search');
+      const includeRecent = boolArg(args, 'includeRecent');
+      const result = await deps.cloudDocsDeps.listDocs({
+        ...(folderId !== undefined ? { folderId } : {}),
+        ...(search !== undefined ? { search } : {}),
+        ...(includeRecent !== undefined ? { includeRecent } : {}),
+        ...(context?.signal ? { signal: context.signal } : {}),
+      });
+      return result.status === 'ok' ? result : error(result.reason, result.message);
+    },
+    [MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_READ]: async (input, context) => {
+      if (!deps.cloudDocsDeps?.readDoc) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'cloud docs tools are not available on this node');
+      const args = pickAllowedMcpArgs(input, ['docId', 'maxChars']);
+      const docId = stringArg(args, 'docId');
+      const maxChars = numberArg(args, 'maxChars');
+      if (!docId) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'docId is required');
+      if (maxChars !== undefined && (!Number.isInteger(maxChars) || maxChars < 1 || maxChars > CLOUD_DOC_CONTENT_MAX_CHARS)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `maxChars must be an integer in [1, ${CLOUD_DOC_CONTENT_MAX_CHARS}]`);
+      }
+      const result = await deps.cloudDocsDeps.readDoc({
+        docId,
+        ...(maxChars !== undefined ? { maxChars } : {}),
+        ...(context?.signal ? { signal: context.signal } : {}),
+      });
+      return result.status === 'ok' ? result : error(result.reason, result.message);
+    },
+    [MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_CREATE]: async (input, context) => {
+      if (!deps.cloudDocsDeps?.createDoc) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'cloud docs tools are not available on this node');
+      const args = pickAllowedMcpArgs(input, ['kind', 'type', 'name', 'folderId', 'content']);
+      const kind = stringArg(args, 'kind') ?? 'doc';
+      if (kind !== 'doc' && kind !== 'folder') {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'kind must be doc or folder');
+      }
+      const name = stringArg(args, 'name');
+      const folderId = args.folderId === null ? null : stringArg(args, 'folderId');
+      if (args.folderId !== undefined && args.folderId !== null && !folderId) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'folderId must be a non-empty string or null');
+      }
+      if (kind === 'folder') {
+        if (!name) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'name is required when kind=folder');
+        const result = await deps.cloudDocsDeps.createDoc({
+          kind: 'folder',
+          name,
+          ...(folderId !== undefined ? { folderId } : {}),
+          ...(context?.signal ? { signal: context.signal } : {}),
+        });
+        return result.status === 'ok' ? result : error(result.reason, result.message);
+      }
+      const docType = stringArg(args, 'type');
+      if (!docType || !(CLOUD_DOC_CREATE_TYPES as readonly string[]).includes(docType)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `type must be one of ${CLOUD_DOC_CREATE_TYPES.join(', ')}`);
+      }
+      if (args.content !== undefined && typeof args.content !== 'string') {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'content must be a string');
+      }
+      if (typeof args.content === 'string' && args.content.length > CLOUD_DOC_CONTENT_MAX_CHARS) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `content exceeds max ${CLOUD_DOC_CONTENT_MAX_CHARS} characters`);
+      }
+      const result = await deps.cloudDocsDeps.createDoc({
+        kind: 'doc',
+        type: docType as CloudDocCreateType,
+        ...(name !== undefined ? { name } : {}),
+        ...(folderId !== undefined ? { folderId } : {}),
+        ...(args.content !== undefined ? { content: args.content } : {}),
+        ...(context?.signal ? { signal: context.signal } : {}),
+      });
+      return result.status === 'ok' ? result : error(result.reason, result.message);
+    },
+    [MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_EDIT]: async (input, context) => {
+      if (!deps.cloudDocsDeps?.editDoc) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'cloud docs tools are not available on this node');
+      const args = pickAllowedMcpArgs(input, ['docId', 'content', 'mode', 'expectedVersion', 'name', 'folderId']);
+      const docId = stringArg(args, 'docId');
+      if (!docId) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'docId is required');
+      if (args.content !== undefined && typeof args.content !== 'string') {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'content must be a string');
+      }
+      if (typeof args.content === 'string' && args.content.length > CLOUD_DOC_CONTENT_MAX_CHARS) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `content exceeds max ${CLOUD_DOC_CONTENT_MAX_CHARS} characters`);
+      }
+      const modeRaw = stringArg(args, 'mode');
+      if (modeRaw !== undefined && !(CLOUD_DOC_EDIT_MODES as readonly string[]).includes(modeRaw)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `mode must be one of ${CLOUD_DOC_EDIT_MODES.join(', ')}`);
+      }
+      const expectedVersion = numberArg(args, 'expectedVersion');
+      if (expectedVersion !== undefined && (!Number.isInteger(expectedVersion) || expectedVersion < 1)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'expectedVersion must be an integer >= 1');
+      }
+      const name = stringArg(args, 'name');
+      const folderId = args.folderId === undefined ? undefined : args.folderId === null ? null : stringArg(args, 'folderId');
+      if (args.folderId !== undefined && args.folderId !== null && !folderId) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'folderId must be a non-empty string or null');
+      }
+      if (args.content === undefined && name === undefined && folderId === undefined) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'at least one of content, name, or folderId is required');
+      }
+      const result = await deps.cloudDocsDeps.editDoc({
+        docId,
+        ...(args.content !== undefined ? { content: args.content } : {}),
+        ...(modeRaw !== undefined ? { mode: modeRaw as CloudDocEditMode } : {}),
+        ...(expectedVersion !== undefined ? { expectedVersion } : {}),
+        ...(name !== undefined ? { name } : {}),
+        ...(folderId !== undefined ? { folderId } : {}),
+        ...(context?.signal ? { signal: context.signal } : {}),
+      });
+      return result.status === 'ok' ? result : error(result.reason, result.message);
+    },
+    [MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_DELETE]: async (input, context) => {
+      if (!deps.cloudDocsDeps?.deleteDoc) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'cloud docs tools are not available on this node');
+      const args = pickAllowedMcpArgs(input, ['targetKind', 'id']);
+      const targetKind = stringArg(args, 'targetKind') ?? 'doc';
+      if (targetKind !== 'doc' && targetKind !== 'folder') {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'targetKind must be doc or folder');
+      }
+      const id = stringArg(args, 'id');
+      if (!id) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'id is required');
+      const result = await deps.cloudDocsDeps.deleteDoc({
+        targetKind,
+        id,
+        ...(context?.signal ? { signal: context.signal } : {}),
+      });
+      return result.status === 'ok' ? result : error(result.reason, result.message);
+    },
+    [MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_SHARE]: async (input, context) => {
+      if (!deps.cloudDocsDeps?.shareDoc) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'cloud docs tools are not available on this node');
+      const args = pickAllowedMcpArgs(input, [
+        'action', 'targetKind', 'targetId', 'shareId', 'shareMode',
+        'targetTeamId', 'targetUserId', 'targetUsername', 'role', 'allowDownload',
+      ]);
+      const action = stringArg(args, 'action');
+      if (action !== 'list' && action !== 'list_teams' && action !== 'grant' && action !== 'revoke') {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'action must be list, list_teams, grant, or revoke');
+      }
+      const targetKind = stringArg(args, 'targetKind') ?? 'doc';
+      if (targetKind !== 'doc' && targetKind !== 'folder') {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'targetKind must be doc or folder');
+      }
+      const targetId = stringArg(args, 'targetId');
+      const shareId = stringArg(args, 'shareId');
+      const shareMode = stringArg(args, 'shareMode');
+      const targetTeamId = stringArg(args, 'targetTeamId');
+      const targetUserId = stringArg(args, 'targetUserId');
+      const targetUsername = stringArg(args, 'targetUsername');
+      const role = stringArg(args, 'role');
+      const allowDownload = boolArg(args, 'allowDownload');
+
+      if ((action === 'list' || action === 'grant') && !targetId) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'targetId is required');
+      }
+      if (action === 'revoke' && !shareId) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'shareId is required');
+      }
+      if (action === 'grant') {
+        if (shareMode !== 'user' && shareMode !== 'team') {
+          return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'shareMode must be user or team');
+        }
+        if (role !== 'viewer' && role !== 'editor') {
+          return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'role must be viewer or editor');
+        }
+        if (shareMode === 'team' && !targetTeamId) {
+          return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'targetTeamId is required when shareMode=team');
+        }
+        if (shareMode === 'user' && !targetUserId && !targetUsername) {
+          return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'targetUserId or targetUsername is required when shareMode=user');
+        }
+      }
+
+      const result = await deps.cloudDocsDeps.shareDoc({
+        action,
+        targetKind,
+        ...(targetId !== undefined ? { targetId } : {}),
+        ...(shareId !== undefined ? { shareId } : {}),
+        ...(shareMode !== undefined ? { shareMode: shareMode as 'user' | 'team' } : {}),
+        ...(targetTeamId !== undefined ? { targetTeamId } : {}),
+        ...(targetUserId !== undefined ? { targetUserId } : {}),
+        ...(targetUsername !== undefined ? { targetUsername } : {}),
+        ...(role !== undefined ? { role: role as 'viewer' | 'editor' } : {}),
+        ...(allowDownload !== undefined ? { allowDownload } : {}),
+        ...(context?.signal ? { signal: context.signal } : {}),
+      });
+      return result.status === 'ok' ? result : error(result.reason, result.message);
+    },
   };
   if (deps.invokeDaemonMemoryTool) {
     for (const name of MEMORY_MCP_DAEMON_TOOL_NAMES) {
@@ -5553,6 +5748,46 @@ const schemas = {
     if (value.timeoutMs !== undefined && value.timeoutMs > computerUseMaxTimeoutMs(value.tool)) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['timeoutMs'], message: `timeoutMs exceeds the maximum for ${value.tool}` });
     }
+  }),
+  [MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_LIST]: z.strictObject({
+    folderId: z.string().trim().min(1).optional(),
+    search: z.string().trim().min(1).optional(),
+    includeRecent: z.boolean().optional(),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_READ]: z.strictObject({
+    docId: z.string().trim().min(1),
+    maxChars: z.number().int().min(1).max(CLOUD_DOC_CONTENT_MAX_CHARS).optional(),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_CREATE]: z.strictObject({
+    kind: z.enum(['doc', 'folder']).optional(),
+    type: z.enum(CLOUD_DOC_CREATE_TYPES).optional(),
+    name: z.string().trim().min(1).optional(),
+    folderId: z.string().trim().min(1).nullable().optional(),
+    content: z.string().max(CLOUD_DOC_CONTENT_MAX_CHARS).optional(),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_EDIT]: z.strictObject({
+    docId: z.string().trim().min(1),
+    content: z.string().max(CLOUD_DOC_CONTENT_MAX_CHARS).optional(),
+    mode: z.enum(CLOUD_DOC_EDIT_MODES).optional(),
+    expectedVersion: z.number().int().min(1).optional(),
+    name: z.string().trim().min(1).optional(),
+    folderId: z.string().trim().min(1).nullable().optional(),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_DELETE]: z.strictObject({
+    targetKind: z.enum(['doc', 'folder']).optional(),
+    id: z.string().trim().min(1),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_SHARE]: z.strictObject({
+    action: z.enum(['list', 'list_teams', 'grant', 'revoke']),
+    targetKind: z.enum(['doc', 'folder']).optional(),
+    targetId: z.string().trim().min(1).optional(),
+    shareId: z.string().trim().min(1).optional(),
+    shareMode: z.enum(['user', 'team']).optional(),
+    targetTeamId: z.string().trim().min(1).optional(),
+    targetUserId: z.string().trim().min(1).optional(),
+    targetUsername: z.string().trim().min(1).optional(),
+    role: z.enum(['viewer', 'editor']).optional(),
+    allowDownload: z.boolean().optional(),
   }),
 } as const;
 

@@ -29,6 +29,7 @@ import { registerMessagePinMcpTools, type MessagePinMcpToolDeps } from './messag
 import { registerSupervisionMcpTools, type SupervisionMcpToolDeps } from './supervision-mcp-tools.js';
 import { createSupervisionMcpToolDeps } from './supervision-registry-port.js';
 import { createDaemonMachineToolDeps } from './machine-mcp-deps.js';
+import { createDaemonCloudDocsToolDeps } from './cloud-docs-mcp-deps.js';
 import {
   SHARED_MACHINE_AUTHORITY_HOOK_PATH,
   SHARED_MACHINE_AUTHORITY_STALE_RUNTIME_ERROR,
@@ -854,6 +855,13 @@ export function mergeDefaultToolDeps(
     // (a controlled node never starts it — see registerMemoryMcpTools gate).
     machineDeps: toolDeps.machineDeps ?? createDaemonMachineToolDeps({
       resourceOwner,
+      loadSharedMachineAuthority: resourceOwner && caller.sessionName
+        ? async () => {
+            return sharedMachineAuthorityFromHookResponse(await postSharedMachineAuthorityHook!());
+          }
+        : async () => null,
+    }),
+    cloudDocsDeps: toolDeps.cloudDocsDeps ?? createDaemonCloudDocsToolDeps({
       loadSharedMachineAuthority: resourceOwner && caller.sessionName
         ? async () => {
             return sharedMachineAuthorityFromHookResponse(await postSharedMachineAuthorityHook!());

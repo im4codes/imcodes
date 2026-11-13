@@ -140,6 +140,19 @@ export const MCP_TOOL_GROUPS: readonly McpToolGroupDefinition[] = Object.freeze(
     summary: 'List, install, inspect, activate, update, disable, restore, or uninstall managed capabilities.',
     tools: Object.freeze([...CAPABILITY_MCP_TOOL_NAMES]),
   }),
+  Object.freeze({
+    id: 'cloud-docs',
+    aliases: Object.freeze(['cloud docs', 'onlyoffice', 'documents', 'office', 'docx', 'xlsx', 'pptx', '云文档']),
+    summary: 'List, read, create, edit, delete, and share Cloud Docs and ONLYOFFICE documents with user parity.',
+    tools: Object.freeze([
+      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_LIST,
+      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_READ,
+      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_CREATE,
+      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_EDIT,
+      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_DELETE,
+      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_SHARE,
+    ]),
+  }),
 ]);
 
 

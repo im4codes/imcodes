@@ -143,6 +143,12 @@ describe('memory MCP shared contracts', () => {
       'fetch_file_from_machine',
       'computer_use_docs',
       'computer_use_call',
+      'cloud_doc_list',
+      'cloud_doc_read',
+      'cloud_doc_create',
+      'cloud_doc_edit',
+      'cloud_doc_delete',
+      'cloud_doc_share',
     ]);
     expect(Object.keys(MEMORY_MCP_TOOL_CONTRACTS).filter((name) => MEMORY_MCP_TOOL_NAME_LIST.includes(name as never)))
       .toEqual([...MEMORY_MCP_TOOL_NAME_LIST]);
