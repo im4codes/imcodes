@@ -1,14 +1,17 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Worker } from 'node:worker_threads';
 import { createRequire } from 'node:module';
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { EventEmitter } from 'node:events';
+import { mkdirSync, watchFile, unwatchFile, appendFileSync, mkdtempSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
-import { HISTORY_RETENTION, getHistoryKeep, parseHistoryKeep, setHistoryKeep } from '../../src/store/history-retention.js';
+import { HISTORY_RETENTION, getHistoryKeep, historyRetentionPath, parseHistoryKeep, setHistoryKeep } from '../../src/store/history-retention.js';
 import { nextHistoryCleanupAt } from '../../src/daemon/history-retention-clock.mjs';
+import { startRetentionSettingsWatcher } from '../../src/daemon/history-retention-watcher.mjs';
+import { buildProjectionWorkerData } from '../../src/daemon/timeline-projection.js';
 import type { TimelineEvent } from '../../src/daemon/timeline-event.js';
 
 const require = createRequire(import.meta.url);
@@ -337,4 +340,106 @@ describe('real SQLite writer retention', () => {
     expect(await client.request('retentionTick', { now: due + 60_002 })).toMatchObject({ runs: 1, skipped: true });
     expect(inspect(home, 'PRAGMA integrity_check')[0].integrity_check).toBe('ok');
   }, 30_000);
+
+  it('skips workerData.retention under test runners, keeps it in normal env, and shuts down cleanly', async () => {
+    const home = makeHome();
+    process.env.IMCODES_HOME = home;
+    expect(buildProjectionWorkerData({ VITEST: '1' }).retention).toBeUndefined();
+    expect(buildProjectionWorkerData({ NODE_ENV: 'test' }).retention).toBeUndefined();
+    expect(buildProjectionWorkerData({ IMCODES_TEST_MODE: '1' }).retention).toBeUndefined();
+    expect(buildProjectionWorkerData({ NODE_ENV: 'production' }).retention).toEqual({
+      ...HISTORY_RETENTION,
+      configPath: historyRetentionPath(),
+    });
+
+    const client = start(home);
+    const exited = new Promise<number>((resolve) => client.worker.once('exit', resolve));
+    client.worker.postMessage({ id: 999, type: 'shutdown', payload: {} });
+    await expect(exited).resolves.toBe(0);
+  });
+
+  it.each(['EMFILE', 'ENOSPC'] as const)('falls back to stat-based watchFile on %s, reacts to atomic config updates, and unwatchFiles on stop', async (code) => {
+    const home = makeHome();
+    const configPath = join(home, HISTORY_RETENTION.fileName);
+    let schedules = 0;
+    const watchFileSpy = vi.fn(watchFile);
+    const unwatchFileSpy = vi.fn(unwatchFile);
+    const handle = startRetentionSettingsWatcher({
+      configPath,
+      retryMs: 60_000,
+      onSchedule: () => { schedules += 1; },
+      debounceMs: 10,
+      watchFileIntervalMs: 30,
+      fsOps: {
+        mkdirSync,
+        watch: (() => {
+          if (code === 'EMFILE') {
+            const err = Object.assign(new Error('too many open files'), { code: 'EMFILE' });
+            throw err;
+          }
+          const emitter = new EventEmitter() as EventEmitter & { close: () => void };
+          emitter.close = vi.fn();
+          queueMicrotask(() => emitter.emit('error', Object.assign(new Error('no inotify space'), { code: 'ENOSPC' })));
+          return emitter as any;
+        }) as any,
+        watchFile: watchFileSpy,
+        unwatchFile: unwatchFileSpy,
+      },
+    });
+
+    try {
+      await vi.waitFor(() => expect(watchFileSpy).toHaveBeenCalledTimes(1));
+      const beforeChange = schedules;
+      config(home, 3);
+      await vi.waitFor(() => expect(schedules).toBeGreaterThan(beforeChange), { timeout: 2000 });
+
+      const afterEnable = schedules;
+      config(home, null);
+      await vi.waitFor(() => expect(schedules).toBeGreaterThan(afterEnable), { timeout: 2000 });
+    } finally {
+      handle.stop();
+    }
+
+    expect(unwatchFileSpy).toHaveBeenCalledWith(configPath, expect.any(Function));
+    const stoppedCount = schedules;
+    config(home, 7);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    expect(schedules).toBe(stoppedCount);
+  });
+
+  it('retries non-inotify watcher errors on retryMs instead of falling back to watchFile', async () => {
+    const home = makeHome();
+    const configPath = join(home, HISTORY_RETENTION.fileName);
+    let attempts = 0;
+    const warnings: string[] = [];
+    const watchFileSpy = vi.fn(watchFile);
+    const emitter = new EventEmitter() as EventEmitter & { close: () => void };
+    emitter.close = vi.fn();
+
+    const handle = startRetentionSettingsWatcher({
+      configPath,
+      retryMs: 25,
+      onSchedule: vi.fn(),
+      onWarn: (err) => warnings.push(err.message),
+      fsOps: {
+        mkdirSync,
+        watch: (() => {
+          attempts += 1;
+          if (attempts === 1) throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+          return emitter as any;
+        }) as any,
+        watchFile: watchFileSpy,
+        unwatchFile,
+      },
+    });
+
+    try {
+      await vi.waitFor(() => expect(attempts).toBeGreaterThanOrEqual(2), { timeout: 2000 });
+      expect(watchFileSpy).not.toHaveBeenCalled();
+      expect(warnings).toEqual(['permission denied']);
+    } finally {
+      handle.stop();
+    }
+    expect(emitter.close).toHaveBeenCalledTimes(1);
+  });
 });

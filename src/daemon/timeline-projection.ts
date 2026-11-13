@@ -70,6 +70,19 @@ export class TimelineProjectionBusyError extends Error {
   }
 }
 
+export function buildProjectionWorkerData(env: NodeJS.ProcessEnv = process.env): {
+  dbPath: string;
+  stateDir: string;
+  retention: (typeof HISTORY_RETENTION & { configPath: string }) | undefined;
+} {
+  return {
+    dbPath: getProjectionDbPath(),
+    stateDir: resolveImcodesHome(),
+    // Skip background settings dir watcher in test runners so idle projection workers do not burn Linux inotify instances.
+    retention: isUnderTestRunner(env) ? undefined : { ...HISTORY_RETENTION, configPath: historyRetentionPath() },
+  };
+}
+
 class TimelineProjectionClient {
   private worker: Worker | null = null;
   private nextId = 1;
@@ -97,12 +110,7 @@ class TimelineProjectionClient {
     if (this.cooldownUntil > Date.now()) return null;
     try {
       const worker = new Worker(getWorkerModuleUrl(), {
-        workerData: {
-          dbPath: getProjectionDbPath(),
-          stateDir: resolveImcodesHome(),
-          // Skip background settings dir watcher in test runners so idle projection workers do not burn Linux inotify instances.
-          retention: isUnderTestRunner() ? undefined : { ...HISTORY_RETENTION, configPath: historyRetentionPath() },
-        },
+        workerData: buildProjectionWorkerData(),
         // Suppress the node:sqlite ExperimentalWarning at the worker boundary
         // (it fires on first node:sqlite load in every worker thread and floods
         // the log). Done via execArgv rather than a module-level emitWarning

@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID } from '../../shared/ack-protocol.js';
 import { ASK_ANSWER_ACK_ERRORS, ASK_ANSWER_COMMAND, ASK_ANSWER_DELIVERY } from '../../shared/ask-answer.js';
 import { DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
+import { SESSION_MODEL_CONTROL_ERROR } from '../../shared/session-model-control.js';
 import { TRANSPORT_SESSION_AGENT_TYPES } from '../../shared/agent-types.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import {
@@ -99,6 +100,7 @@ const {
   getPresetModelCatalogMock,
   loadPresetsMock,
   lookupAttachmentMock,
+  buildSessionListMock,
 } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
   upsertSessionMock: vi.fn(),
@@ -154,6 +156,7 @@ const {
   getPresetModelCatalogMock: vi.fn(),
   loadPresetsMock: vi.fn().mockResolvedValue([]),
   lookupAttachmentMock: vi.fn(() => undefined),
+  buildSessionListMock: vi.fn(async () => []),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -270,6 +273,10 @@ vi.mock('../../src/daemon/preview-relay.js', () => ({
 
 vi.mock('../../src/daemon/provider-sessions.js', () => ({
   listProviderSessions: vi.fn(() => []),
+}));
+
+vi.mock('../../src/daemon/session-list.js', () => ({
+  buildSessionList: buildSessionListMock,
 }));
 
 vi.mock('../../src/agent/qwen-runtime-config.js', () => ({
@@ -554,6 +561,8 @@ describe('handleWebCommand transport queue behavior', () => {
     getPresetModelCatalogMock.mockReset();
     lookupAttachmentMock.mockReset();
     lookupAttachmentMock.mockReturnValue(undefined);
+    buildSessionListMock.mockReset();
+    buildSessionListMock.mockResolvedValue([]);
     __resetTransportListModelsCacheForTests();
     clearAllTransportQueueRevisions();
     resetTransportQueueStoreForTests();
@@ -7021,6 +7030,88 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'assistant.text', expect.objectContaining({
       noticeCode: DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PROOF_GATED, streaming: false, automation: true, memoryExcluded: true,
     }), expect.any(Object));
+  });
+
+  it('acknowledges /model immediately without waiting for hanging or rejecting handleGetSessions quota probes', async () => {
+    const setAgentId = vi.fn();
+    let rejectSessionList!: (err: Error) => void;
+    buildSessionListMock.mockImplementationOnce(() => new Promise((_resolve, reject) => {
+      rejectSessionList = reject;
+    }));
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'copilot-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+      requestedModel: 'gpt-5.4',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'provider-route-1',
+      setAgentId,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/model gpt-5.4-mini',
+      commandId: 'cmd-model-nonblocking-ack',
+    }, serverLink as any);
+
+    await waitForAsync(() => serverLink.send.mock.calls.some(([msg]) => msg?.type === 'command.ack' && msg?.commandId === 'cmd-model-nonblocking-ack'));
+    expect(buildSessionListMock).toHaveBeenCalledTimes(1);
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_transport_brain',
+      requestedModel: 'gpt-5.4-mini',
+      activeModel: 'gpt-5.4-mini',
+    }));
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', expect.objectContaining({
+      commandId: 'cmd-model-nonblocking-ack',
+      status: 'accepted',
+    }));
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'assistant.text', expect.objectContaining({
+      noticeCode: DAEMON_USER_NOTICE_CODE.MODEL_SWITCHED,
+    }), expect.any(Object));
+
+    rejectSessionList(new Error('quota probe failed'));
+    await flushAsync();
+  });
+
+  it('preserves AGY session owner semantics while refreshing sessions asynchronously', async () => {
+    let releaseApply!: () => void;
+    const applyGate = new Promise<string>((resolve) => {
+      releaseApply = () => resolve('live');
+    });
+    const staleRuntime = {
+      supportsConfirmedModelSelection: true,
+      applyAgentId: vi.fn(() => applyGate),
+      pendingCount: 0,
+      sending: false,
+      getStatus: () => 'idle',
+    };
+    const agyRecord = {
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: AGY_SDK_PROVIDER_ID,
+      runtimeType: 'transport',
+      state: 'idle',
+      sessionInstanceId: 'inst-1',
+      runtimeEpoch: 1,
+      providerSessionId: 'agy-1',
+    };
+    getSessionMock.mockReturnValue(agyRecord);
+    getTransportRuntimeMock.mockReturnValue(staleRuntime);
+
+    const switching = switchSessionModelNow('deck_transport_brain', 'model-b', undefined, serverLink as any);
+    // Replace the session owner while native model selection is in flight.
+    getSessionMock.mockReturnValue({ ...agyRecord, sessionInstanceId: 'inst-2' });
+    releaseApply();
+
+    await expect(switching).resolves.toMatchObject({ ok: false, code: SESSION_MODEL_CONTROL_ERROR.SESSION_CHANGED });
+    expect(upsertSessionMock).not.toHaveBeenCalled();
+    expect(buildSessionListMock).not.toHaveBeenCalled();
   });
 
   it('rejects qoder-sdk thinking controls without forwarding them as prompts', async () => {

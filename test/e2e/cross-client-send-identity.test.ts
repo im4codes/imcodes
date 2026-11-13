@@ -1,10 +1,11 @@
-import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir, userInfo } from 'node:os';
+import { chmodSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { DatabaseSync } from 'node:sqlite';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { WebSocketServer, WebSocket } from 'ws';
+import { applyPlaywrightBrowsersOverride } from '../util/playwright-browsers-env.js';
 import { connectProvider, disconnectAll } from '../../src/agent/provider-registry.js';
 import { getTransportRuntime, launchTransportSession, stopTransportRuntimeSession } from '../../src/agent/session-manager.js';
 import { removeSession } from '../../src/store/session-store.js';
@@ -27,42 +28,12 @@ const SUB = 'deck_sub_e2e_cross_client_worker';
 const PORT = 52044;
 const requireWeb = createRequire(path.join(ROOT, 'web/package.json'));
 
-function resolvePlaywrightBrowsersOverride(env: NodeJS.ProcessEnv = process.env): string | undefined {
-  const existing = env.PLAYWRIGHT_BROWSERS_PATH;
-  if (existing !== undefined && existing.trim() !== '') {
-    // Respect explicit configuration verbatim (including '0' or relative paths).
-    return undefined;
-  }
-  const realHome = (() => {
-    try {
-      return userInfo().homedir;
-    } catch {
-      return undefined;
-    }
-  })();
-  const candidates: string[] = [];
-  if (process.platform === 'darwin') {
-    if (env.HOME?.trim()) candidates.push(path.join(env.HOME.trim(), 'Library', 'Caches', 'ms-playwright'));
-    if (realHome) candidates.push(path.join(realHome, 'Library', 'Caches', 'ms-playwright'));
-  } else if (process.platform === 'win32') {
-    if (env.LOCALAPPDATA?.trim()) candidates.push(path.join(env.LOCALAPPDATA.trim(), 'ms-playwright'));
-    if (realHome) candidates.push(path.join(realHome, 'AppData', 'Local', 'ms-playwright'));
-  } else {
-    if (env.XDG_CACHE_HOME?.trim()) candidates.push(path.join(env.XDG_CACHE_HOME.trim(), 'ms-playwright'));
-    if (env.HOME?.trim()) candidates.push(path.join(env.HOME.trim(), '.cache', 'ms-playwright'));
-    if (realHome) candidates.push(path.join(realHome, '.cache', 'ms-playwright'));
-  }
-  return candidates.find((dir) => existsSync(dir));
-}
-
 /** Real daemon dispatch/runtime/provider/SQLite and real independent browser
  * clients. Only the account/ticket/WS routing service and model app-server peer
  * are synthetic. This is not a production account or physical phone test. */
 describe('one stable send across independent desktop and phone clients', () => {
   let temp: string;
-  let touchedPlaywrightBrowsersPath = false;
-  let hadPlaywrightBrowsersPath = false;
-  let prevPlaywrightBrowsersPath: string | undefined;
+  let restorePlaywrightBrowsersEnv: (() => void) | undefined;
   let vite: any;
   let browser: any;
   let off: () => void;
@@ -189,14 +160,7 @@ describe('one stable send across independent desktop and phone clients', () => {
       });
     });
     await vite.listen();
-    hadPlaywrightBrowsersPath = Object.prototype.hasOwnProperty.call(process.env, 'PLAYWRIGHT_BROWSERS_PATH');
-    prevPlaywrightBrowsersPath = process.env.PLAYWRIGHT_BROWSERS_PATH;
-    touchedPlaywrightBrowsersPath = false;
-    const playwrightOverride = resolvePlaywrightBrowsersOverride();
-    if (playwrightOverride) {
-      process.env.PLAYWRIGHT_BROWSERS_PATH = playwrightOverride;
-      touchedPlaywrightBrowsersPath = true;
-    }
+    restorePlaywrightBrowsersEnv = applyPlaywrightBrowsersOverride();
     browser = await requireWeb('playwright').chromium.launch({ headless: true });
   }, 60_000);
 
@@ -209,14 +173,8 @@ describe('one stable send across independent desktop and phone clients', () => {
     for (const name of [MAIN, SUB]) { await stopTransportRuntimeSession(name); removeSession(name); }
     await disconnectAll();
     await timelineStore.flushAll(3000);
-    if (touchedPlaywrightBrowsersPath) {
-      if (hadPlaywrightBrowsersPath) {
-        process.env.PLAYWRIGHT_BROWSERS_PATH = prevPlaywrightBrowsersPath;
-      } else {
-        delete process.env.PLAYWRIGHT_BROWSERS_PATH;
-      }
-      touchedPlaywrightBrowsersPath = false;
-    }
+    restorePlaywrightBrowsersEnv?.();
+    restorePlaywrightBrowsersEnv = undefined;
     rmSync(temp, { recursive: true, force: true });
   });
 

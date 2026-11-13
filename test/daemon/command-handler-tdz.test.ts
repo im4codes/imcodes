@@ -35,7 +35,9 @@ describe('command-handler module initialization / TDZ invariants', () => {
     expect(importsCronExecutorStatically).toBe(false);
   });
 
-  it('loads dynamically alongside cron-executor and executes clear/handoff relaunch paths without pendingSessionRelaunches TDZ', async () => {
+  it('loads dynamically after cron-executor and runs clear/handoff relaunch paths without error', async () => {
+    // Structural hoisting + cycle guard above eliminates the circular static edge and mid-file
+    // imports; this smoke check verifies dynamic module load + clear/handoff execution end-to-end.
     vi.resetModules();
 
     const launchTransportSession = vi.fn(async () => undefined);
