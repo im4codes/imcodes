@@ -66,7 +66,18 @@ export function DashboardPage({
   const [keys, setKeys] = useState<KeyInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState<DashboardTab>('devices');
+  const [visitedTabs, setVisitedTabs] = useState<Set<DashboardTab>>(() => new Set(['devices']));
   const tabRefs = useRef<Partial<Record<DashboardTab, HTMLButtonElement | null>>>({});
+
+  const selectTab = (nextTab: DashboardTab) => {
+    setActiveTab(nextTab);
+    setVisitedTabs((prev) => {
+      if (prev.has(nextTab)) return prev;
+      const next = new Set(prev);
+      next.add(nextTab);
+      return next;
+    });
+  };
 
   useEffect(() => {
     if (externalServers) {
@@ -122,7 +133,7 @@ export function DashboardPage({
     if (nextIndex === null) return;
     e.preventDefault();
     const nextTab = TAB_ORDER[nextIndex];
-    setActiveTab(nextTab);
+    selectTab(nextTab);
     tabRefs.current[nextTab]?.focus();
   };
 
@@ -162,7 +173,7 @@ export function DashboardPage({
                   aria-controls={`dashboard-tabpanel-${tab.id}`}
                   tabIndex={selected ? 0 : -1}
                   class={`dashboard-tab${selected ? ' is-active' : ''}`}
-                  onClick={() => setActiveTab(tab.id)}
+                  onClick={() => selectTab(tab.id)}
                   onKeyDown={(e) => handleTabKeyDown(tab.id, e)}
                 >
                   <span class="dashboard-tab-label">{tab.label}</span>
@@ -174,13 +185,15 @@ export function DashboardPage({
             })}
           </div>
 
-          <div
-            role="tabpanel"
-            id={`dashboard-tabpanel-${activeTab}`}
-            aria-labelledby={`dashboard-tab-${activeTab}`}
-            class="dashboard-tabpanel"
-          >
-            {activeTab === 'devices' && (
+          {visitedTabs.has('devices') && (
+            <div
+              role="tabpanel"
+              id="dashboard-tabpanel-devices"
+              aria-labelledby="dashboard-tab-devices"
+              hidden={activeTab !== 'devices'}
+              aria-hidden={activeTab !== 'devices'}
+              class="dashboard-tabpanel"
+            >
               <div class="dashboard-section-stack">
                 {servers.length > 0 && (
                   <ServerList servers={servers} onSelectServer={onSelectServer} onDeleteServer={onDeleteServer} />
@@ -199,19 +212,37 @@ export function DashboardPage({
                   <GettingStarted keys={keys} onKeyCreated={loadData} onDeviceAppeared={loadData} />
                 )}
               </div>
-            )}
+            </div>
+          )}
 
-            {activeTab === 'keys' && (
+          {visitedTabs.has('keys') && (
+            <div
+              role="tabpanel"
+              id="dashboard-tabpanel-keys"
+              aria-labelledby="dashboard-tab-keys"
+              hidden={activeTab !== 'keys'}
+              aria-hidden={activeTab !== 'keys'}
+              class="dashboard-tabpanel"
+            >
               <ApiKeyManager keys={keys} onKeysChanged={loadData} />
-            )}
+            </div>
+          )}
 
-            {activeTab === 'account' && (
+          {visitedTabs.has('account') && (
+            <div
+              role="tabpanel"
+              id="dashboard-tabpanel-account"
+              aria-labelledby="dashboard-tab-account"
+              hidden={activeTab !== 'account'}
+              aria-hidden={activeTab !== 'account'}
+              class="dashboard-tabpanel"
+            >
               <div class="dashboard-section-stack">
                 <PasskeyManager />
                 <DeleteAccount onDeleted={onLogout} />
               </div>
-            )}
-          </div>
+            </div>
+          )}
         </>
       )}
     </div>

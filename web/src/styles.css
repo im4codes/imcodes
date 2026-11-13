@@ -16791,6 +16791,9 @@ button.quick-agent-delegation-preset.active {
 .dashboard-tabpanel {
   min-width: 0;
 }
+.dashboard-tabpanel[hidden] {
+  display: none;
+}
 .dashboard-section-stack {
   display: flex;
   flex-direction: column;
