@@ -2396,6 +2396,8 @@ describe('App shell', () => {
     expect(ws.connect).toHaveBeenCalled();
     expect(screen.getByText('featureAnnouncements.messagePins')).toBeTruthy();
     fireEvent.click(screen.getByText('featureAnnouncements.dismiss'));
+    expect(await screen.findByText('featureAnnouncements.cloudDocs')).toBeTruthy();
+    fireEvent.click(screen.getByText('featureAnnouncements.dismiss'));
     await waitFor(() => expect(screen.queryByTestId('feature-announcement')).toBeNull());
   }, 20_000);
 
