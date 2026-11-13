@@ -1102,6 +1102,121 @@ describe('CloudDocsPanel', () => {
     });
   });
 
+  it('prevents older Back-list success or error responses from rolling back newer mutation projections, while accepting fresh post-mutation refreshes', async () => {
+    const deferred = <T,>() => {
+      let resolve!: (v: T) => void;
+      let reject!: (err: unknown) => void;
+      const promise = new Promise<T>((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      return { promise, resolve, reject };
+    };
+
+    const docA = makeDoc({ id: 'doc-a', name: 'A.docx' });
+    const renamed = { ...docA, name: 'Untitled document.docx' };
+    const created2 = makeDoc({ id: 'doc-2', name: 'Untitled document 2.docx' });
+    const serverExtra = makeDoc({ id: 'doc-3', name: 'Untitled document 3.docx' });
+    const initialList = { folders: [], docs: [docA], sharedFolders: [], sharedDocs: [] };
+
+    const oldListSuccess = deferred<{ folders: CloudDocFolder[]; docs: CloudDocItem[]; sharedFolders: []; sharedDocs: [] }>();
+    const oldListFailure = deferred<{ folders: CloudDocFolder[]; docs: CloudDocItem[]; sharedFolders: []; sharedDocs: [] }>();
+    const freshRefresh = deferred<{ folders: CloudDocFolder[]; docs: CloudDocItem[]; sharedFolders: []; sharedDocs: [] }>();
+
+    listCloudDocsApiMock
+      .mockResolvedValueOnce(initialList)
+      .mockImplementationOnce(() => oldListSuccess.promise)
+      .mockImplementationOnce(() => freshRefresh.promise)
+      .mockImplementationOnce(() => oldListFailure.promise)
+      .mockResolvedValue({
+        folders: [],
+        docs: [renamed, created2, serverExtra],
+        sharedFolders: [],
+        sharedDocs: [],
+      });
+
+    const save1 = deferred<{ doc: CloudDocItem }>();
+    const save2 = deferred<{ doc: CloudDocItem }>();
+    updateCloudDocApiMock
+      .mockImplementationOnce(() => save1.promise)
+      .mockImplementationOnce(() => save2.promise);
+
+    createBlankCloudDocApiMock.mockImplementation(async (body) => ({
+      doc: makeDoc({
+        id: createBlankCloudDocApiMock.mock.calls.length === 1 ? 'doc-2' : `new-${createBlankCloudDocApiMock.mock.calls.length}`,
+        name: String(body.name),
+      }),
+    }));
+
+    render(<CloudDocsPanel initialTab="my_docs" />);
+    fireEvent.click((await screen.findByTestId('cloud-doc-row-doc-a')).querySelector('button.cloud-docs-row-main')!);
+    const input = (await screen.findByTestId('cloud-docs-preview-title-input')) as HTMLInputElement;
+    fireEvent.input(input, { target: { value: 'Untitled document' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    await waitFor(() => expect(updateCloudDocApiMock).toHaveBeenCalledTimes(1));
+
+    // Back starts list #2 capturing stale [A.docx] before rename ACK arrives
+    fireEvent.click(screen.getByTestId('cloud-docs-preview-back'));
+    await waitFor(() => expect(listCloudDocsApiMock).toHaveBeenCalledTimes(2));
+
+    // Rename ACK settles first; older list #2 resolves later and must not roll back projection or loading
+    save1.resolve({ doc: renamed });
+    await waitFor(() => {
+      expect(screen.getByTestId('cloud-doc-row-doc-a').textContent).toContain('Untitled document.docx');
+    });
+    oldListSuccess.resolve(initialList);
+    await new Promise((r) => setTimeout(r, 25));
+    expect(screen.getByTestId('cloud-doc-row-doc-a').textContent).toContain('Untitled document.docx');
+
+    // Blank create uses preserved projection -> allocates Untitled document 2.docx, then triggers fresh post-mutation GET #3
+    fireEvent.click(screen.getByTestId('cloud-docs-new-docx-btn'));
+    await waitFor(() => {
+      expect(createBlankCloudDocApiMock).toHaveBeenNthCalledWith(1, {
+        type: 'docx',
+        name: 'Untitled document 2.docx',
+        folderId: null,
+      });
+      expect(listCloudDocsApiMock).toHaveBeenCalledTimes(3);
+    });
+
+    // Fresh post-mutation GET #3 arrives with additional server doc Untitled document 3.docx
+    freshRefresh.resolve({
+      folders: [],
+      docs: [renamed, created2, serverExtra],
+      sharedFolders: [],
+      sharedDocs: [],
+    });
+    await screen.findByTestId('mock-office-preview');
+
+    // Rename doc-2 -> Untitled document 4.docx while Back GET #4 fails lazily after ACK #2
+    const input2 = (await screen.findByTestId('cloud-docs-preview-title-input')) as HTMLInputElement;
+    fireEvent.input(input2, { target: { value: 'Untitled document 4' } });
+    fireEvent.keyDown(input2, { key: 'Enter' });
+    await waitFor(() => expect(updateCloudDocApiMock).toHaveBeenCalledTimes(2));
+
+    fireEvent.click(screen.getByTestId('cloud-docs-preview-back'));
+    await waitFor(() => expect(listCloudDocsApiMock).toHaveBeenCalledTimes(4));
+
+    save2.resolve({ doc: { ...created2, name: 'Untitled document 4.docx' } });
+    await waitFor(() => {
+      expect(screen.getByTestId('cloud-doc-row-doc-2').textContent).toContain('Untitled document 4.docx');
+    });
+    oldListFailure.reject(new Error('Stale Back list failed'));
+    await new Promise((r) => setTimeout(r, 25));
+    expect(screen.queryByTestId('cloud-docs-error')).toBeNull();
+    expect(screen.getByTestId('cloud-doc-row-doc-3').textContent).toContain('Untitled document 3.docx');
+
+    // Hydrated list retains Untitled document.docx, serverExtra (Untitled document 3.docx), and projected Untitled document 4.docx -> allocates Untitled document 2.docx cleanly
+    fireEvent.click(screen.getByTestId('cloud-docs-new-docx-btn'));
+    await waitFor(() => {
+      expect(createBlankCloudDocApiMock).toHaveBeenNthCalledWith(2, {
+        type: 'docx',
+        name: 'Untitled document 2.docx',
+        folderId: null,
+      });
+    });
+  });
+
   it('uses shared 4-column list layout and min-width: 0 shrink rules across grid and list styles', () => {
     const css = readFileSync(stylesPath, 'utf8');
     expect(css).toContain('--cloud-docs-list-cols:');

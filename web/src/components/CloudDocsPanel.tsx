@@ -464,15 +464,26 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
     };
   }, []);
 
+  // Invalidates any pre-mutation list read so stale GET responses/errors cannot roll back newer projections.
+  const invalidatePendingRefresh = useCallback(() => {
+    loadSeqRef.current += 1;
+    loadAbortRef.current?.abort();
+    loadAbortRef.current = null;
+    activeLoadPromiseRef.current = null;
+    if (mountedRef.current) setLoading(false);
+  }, []);
+
   const applyDocsProjection = useCallback((updater: (current: CloudDocItem[]) => CloudDocItem[]) => {
+    invalidatePendingRefresh();
     const next = updater(authoritativeDocsRef.current);
     authoritativeDocsRef.current = next;
     if (mountedRef.current) setDocs(next);
-  }, []);
+  }, [invalidatePendingRefresh]);
 
   const invalidateDocsAuthority = useCallback(() => {
+    invalidatePendingRefresh();
     docsHydratedRef.current = false;
-  }, []);
+  }, [invalidatePendingRefresh]);
 
   const openPreview = useCallback((target: PreviewTarget | null) => {
     if (savedStatusTimerRef.current) {
@@ -735,9 +746,19 @@ export function CloudDocsPanel({ onClose, initialTab = 'recent' }: CloudDocsPane
     try {
       let currentDocs = authoritativeDocsRef.current;
       if (!docsHydratedRef.current) {
-        const hydrated = activeLoadPromiseRef.current
-          ? await activeLoadPromiseRef.current
-          : await refreshData();
+        let hydrated: CloudDocItem[] | null = null;
+        if (activeLoadPromiseRef.current) {
+          const prevSeq = loadSeqRef.current;
+          hydrated = await activeLoadPromiseRef.current;
+          if (!mountedRef.current) return;
+          if (hydrated === null && !docsHydratedRef.current && loadSeqRef.current !== prevSeq) {
+            hydrated = activeLoadPromiseRef.current
+              ? await activeLoadPromiseRef.current
+              : await refreshData();
+          }
+        } else {
+          hydrated = await refreshData();
+        }
         if (!mountedRef.current || hydrated === null) return;
         currentDocs = hydrated;
       }
