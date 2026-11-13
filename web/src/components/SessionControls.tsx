@@ -27,6 +27,7 @@ import { SupervisionHeartbeatBadge } from './SupervisionHeartbeatBadge.js';
 import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
 import { VoiceStreamingRobot } from './VoiceStreamingRobot.js';
+import { moveCaretToEnd, registerComposerFocusHandler, type FocusComposerOptions } from '../util/composer-focus.js';
 import { INLINE_PASTE_TEXT_CHAR_LIMIT } from '../composer-inline-limit.js';
 import {
   buildNotepadInlineMessage,
@@ -1910,9 +1911,31 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const effortClampAppliedRef = useRef<string | null>(null);
   const [localTransportConfig, setLocalTransportConfig] = useState<Record<string, unknown> | null>(activeSession?.transportConfig ?? null);
 
-  // Keep external inputRef in sync so parent can call .focus()
+  /**
+   * Intentionally transition the composer out of unfocused read-only voice lock
+   * into an editable `contenteditable="true"` state and focus it for typing.
+   * Refuses while disabled or during an active/pending voice hold gesture.
+   */
+  const focusComposerForTyping = useCallback((options?: FocusComposerOptions): boolean => {
+    const el = divRef.current;
+    if (!el) return false;
+    if (inputDisabledRef.current || voiceHoldPendingRef.current || voiceHoldActiveRef.current) {
+      return false;
+    }
+    clearComposerVoiceTouchLock(el, false);
+    composerFocusedRef.current = true;
+    setComposerFocused(true);
+    el.focus();
+    if (options?.moveCursorToEnd) {
+      moveCaretToEnd(el);
+    }
+    return true;
+  }, []);
+
+  // Keep external inputRef and focus handler in sync so external callers can enter typing mode.
   useEffect(() => {
     if (inputRef) (inputRef as { current: HTMLDivElement | null }).current = divRef.current;
+    return registerComposerFocusHandler(divRef.current, focusComposerForTyping);
   });
 
   useEffect(() => {
@@ -1968,17 +1991,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     setHasText(!!nextText.trim());
     publishComposerText(nextText);
     divRef.current.dispatchEvent(new Event('input', { bubbles: true }));
-    divRef.current.focus();
-    try {
-      const sel = window.getSelection();
-      const range = document.createRange();
-      range.selectNodeContents(divRef.current);
-      range.collapse(false);
-      sel?.removeAllRanges();
-      sel?.addRange(range);
-    } catch { /* ignore selection API failures */ }
+    focusComposerForTyping({ moveCursorToEnd: true });
     onPendingPrefillApplied?.();
-  }, [closeQuickSuggestions, pendingPrefillText, onPendingPrefillApplied, publishComposerText]);
+  }, [closeQuickSuggestions, focusComposerForTyping, pendingPrefillText, onPendingPrefillApplied, publishComposerText]);
 
   const clearSendWarning = useCallback(() => {
     if (sendWarningTimerRef.current) {
@@ -3298,14 +3313,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const fillInput = (text: string) => {
     if (divRef.current) {
       setComposerElementText(divRef.current, text);
-      // Place cursor at end
-      const sel = window.getSelection();
-      const range = document.createRange();
-      range.selectNodeContents(divRef.current);
-      range.collapse(false);
-      sel?.removeAllRanges();
-      sel?.addRange(range);
-      divRef.current.focus();
+      focusComposerForTyping({ moveCursorToEnd: true });
     }
     setHasText(!!text.trim());
     publishComposerText(text);
@@ -3344,13 +3352,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       const current = readComposerElementText(divRef.current);
       nextText = current ? `${current} ${suffix}` : suffix;
       setComposerElementText(divRef.current, nextText);
-      const sel = window.getSelection();
-      const range = document.createRange();
-      range.selectNodeContents(divRef.current);
-      range.collapse(false);
-      sel?.removeAllRanges();
-      sel?.addRange(range);
-      divRef.current.focus();
+      focusComposerForTyping({ moveCursorToEnd: true });
     }
     setHasText(true);
     publishComposerText(nextText);
@@ -3374,22 +3376,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       // such fragment is present (the `@别名` path), the text is unchanged.
       const stripped = current.replace(/(^|\s);[\p{L}\p{N}._-]{0,20}$/u, (_m, lead: string) => lead);
       setComposerElementText(el, stripped);
-      try {
-        const sel = window.getSelection();
-        const range = document.createRange();
-        range.selectNodeContents(el);
-        range.collapse(false);
-        sel?.removeAllRanges();
-        sel?.addRange(range);
-      } catch { /* jsdom lacks Selection API */ }
-      el.focus();
+      focusComposerForTyping({ moveCursorToEnd: true });
     }
     insertAliasMarkerAtCaret(name);
     const nextText = el ? readComposerElementText(el) : '';
     setHasText(!!nextText.trim());
     publishComposerText(nextText);
     syncMobileComposerMetrics();
-  }, [publishComposerText, syncMobileComposerMetrics]);
+  }, [focusComposerForTyping, publishComposerText, syncMobileComposerMetrics]);
 
   const insertTaskPairReference = useCallback((title: string) => {
     const el = divRef.current;
@@ -3415,22 +3409,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       // (the `@machine` path), the text is unchanged.
       const stripped = stripInlineMachineTrigger(current);
       setComposerElementText(el, stripped);
-      try {
-        const sel = window.getSelection();
-        const range = document.createRange();
-        range.selectNodeContents(el);
-        range.collapse(false);
-        sel?.removeAllRanges();
-        sel?.addRange(range);
-      } catch { /* jsdom lacks Selection API */ }
-      el.focus();
+      focusComposerForTyping({ moveCursorToEnd: true });
     }
     insertMachineMarkerAtCaret(nodeId, displayName);
     const nextText = el ? readComposerElementText(el) : '';
     setHasText(!!nextText.trim());
     publishComposerText(nextText);
     syncMobileComposerMetrics();
-  }, [publishComposerText, syncMobileComposerMetrics]);
+  }, [focusComposerForTyping, publishComposerText, syncMobileComposerMetrics]);
 
   const toComposerReference = useCallback((path: string) => {
     const cwd = activeSession?.projectDir;
@@ -5595,13 +5581,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       voiceHoldTimerRef.current = null;
       clearComposerVoiceWindowListeners();
       if (!cancelled && ptr && !ptr.wasFocused) {
-        clearComposerVoiceTouchLock(divRef.current, inputDisabledRef.current);
-        composerFocusedRef.current = true;
-        setComposerFocused(true);
         if (event.pointerType === 'touch') {
           armTouchTapCompatMouseShield();
         }
-        divRef.current?.focus();
+        focusComposerForTyping();
       } else if (!cancelled) {
         clearComposerVoiceTouchLock(divRef.current, inputDisabledRef.current);
       } else {
@@ -5619,7 +5602,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     try { divRef.current?.blur(); } catch { /* ignore */ }
     const finalZone: 'send' | 'cancel' | 'edit' = cancelled ? 'cancel' : tx.zone;
     void finalizeVoiceHold(tx, tx.error !== null ? 'failed' : finalZone);
-  }, [armTouchTapCompatMouseShield, clearComposerVoiceWindowListeners, finalizeVoiceHold]);
+  }, [armTouchTapCompatMouseShield, clearComposerVoiceWindowListeners, finalizeVoiceHold, focusComposerForTyping]);
 
   voicePointerMoveHandlerRef.current = handleComposerVoicePointerMove;
   voicePointerEndHandlerRef.current = handleComposerVoicePointerEnd;
@@ -6284,20 +6267,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       void uploadAttachmentFiles(pendingSharedUpload.files);
     }
 
-    divRef.current.focus();
-    try {
-      const sel = window.getSelection();
-      const range = document.createRange();
-      range.selectNodeContents(divRef.current);
-      range.collapse(false);
-      sel?.removeAllRanges();
-      sel?.addRange(range);
-    } catch { /* ignore selection API failures */ }
+    focusComposerForTyping({ moveCursorToEnd: true });
   }, [
     activeSession,
     attachmentDraftKey,
     closeQuickSuggestions,
     draftKey,
+    focusComposerForTyping,
     hydratedAttachmentDraftKey,
     onPendingSharedUploadConsumed,
     pendingSharedUpload,
@@ -6380,7 +6356,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         const uploaded = await uploadAttachmentFiles([textFile]);
         if (uploaded) {
           showSendWarning(t('upload.long_text_attached', { name: fileName }));
-          divRef.current?.focus();
+          focusComposerForTyping();
         }
       })();
       return;
@@ -7855,7 +7831,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               onMouseDown={(e) => e.preventDefault()}
               onClick={() => {
                 setMobileComposerExpanded((prev) => !prev);
-                setTimeout(() => divRef.current?.focus(), 0);
+                setTimeout(() => { focusComposerForTyping(); }, 0);
               }}
               title={mobileComposerExpanded ? 'collapse composer' : 'expand composer'}
               aria-label={mobileComposerExpanded ? 'collapse composer' : 'expand composer'}

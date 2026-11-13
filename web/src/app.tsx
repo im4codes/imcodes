@@ -1,4 +1,5 @@
 import { R2RelayToggle } from './components/R2RelayToggle.js';
+import { focusComposerElement } from './util/composer-focus.js';
 import { syncIncognitoTimelineSessions, forgetIncognitoTimelineSessions } from './hooks/useTimeline.js';
 import { useState, useEffect, useCallback, useRef, useMemo } from 'preact/hooks';
 import {
@@ -383,7 +384,7 @@ function appendContentEditableTextPreservingNewlines(element: HTMLElement, suffi
   const current = parts.join('').replace(/\n+$/g, '');
   element.textContent = `${current}${suffix}`.replace(/\r\n?/g, '\n');
   element.dispatchEvent(new Event('input', { bubbles: true }));
-  element.focus();
+  focusComposerElement(element, { moveCursorToEnd: true });
 }
 
 
@@ -4555,7 +4556,7 @@ function InternalMainApp() {
           // Steal focus from xterm textarea so it stops capturing keystrokes in chat mode.
           // Only on desktop — on mobile we don't want to pop up the keyboard automatically.
           if (!/iPhone|iPad|iPod|Android/i.test(navigator.userAgent)) {
-            inputRefsMap.current.get(activeSession)?.focus();
+            focusComposerElement(inputRefsMap.current.get(activeSession));
           }
         });
       }
@@ -5919,7 +5920,7 @@ function InternalMainApp() {
         if (!chatInput) return;
         if (e.key === 'Enter' || e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'Backspace') {
           e.preventDefault();
-          chatInput.focus();
+          focusComposerElement(chatInput);
           chatInput.dispatchEvent(new KeyboardEvent('keydown', {
             key: e.key, code: e.code, keyCode: e.keyCode,
             ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, altKey: e.altKey, metaKey: e.metaKey,
@@ -5928,7 +5929,7 @@ function InternalMainApp() {
         } else if (!e.ctrlKey && !e.metaKey && !e.altKey && e.key.length === 1) {
           // Printable chars: focus and insert text directly into contentEditable
           e.preventDefault();
-          chatInput.focus();
+          focusComposerElement(chatInput);
           document.execCommand('insertText', false, e.key);
         }
         return;

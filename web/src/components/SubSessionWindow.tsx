@@ -42,6 +42,7 @@ import { useExecutionCloneLaunch } from '../hooks/useExecutionCloneLaunch.js';
 import { resolveSubSessionRuntimeType } from '../runtime-type.js';
 import { shouldSuppressSubSessionBarForKeyboard } from '../mobile-keyboard.js';
 import { DESKTOP_WINDOW_IDS } from '../window-stack.js';
+import { focusComposerElement } from '../util/composer-focus.js';
 import {
   clampGeometryFullyIntoWorkspace,
   clampGeometryToWorkspace,
@@ -1312,7 +1313,7 @@ export function SubSessionWindow({
                 if (inputEl) {
                   inputEl.textContent = (inputEl.textContent || '') + rel.join('');
                   inputEl.dispatchEvent(new Event('input', { bubbles: true }));
-                  inputEl.focus();
+                  focusComposerElement(inputEl, { moveCursorToEnd: true });
                 }
                 setShowFileBrowser(false);
               }}
@@ -1351,7 +1352,7 @@ export function SubSessionWindow({
                 if (inputEl) {
                   inputEl.textContent = (inputEl.textContent || '') + rel.join('');
                   inputEl.dispatchEvent(new Event('input', { bubbles: true }));
-                  inputEl.focus();
+                  focusComposerElement(inputEl, { moveCursorToEnd: true });
                 }
               }}
               onClose={() => setShowFileBrowser(false)}

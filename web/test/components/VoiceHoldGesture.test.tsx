@@ -94,6 +94,7 @@ vi.mock('../../src/api.js', () => ({
 }));
 
 import { SessionControls } from '../../src/components/SessionControls.js';
+import { focusComposerElement } from '../../src/util/composer-focus.js';
 import type { SessionInfo } from '../../src/types.js';
 
 const makeSession = (): SessionInfo => ({
@@ -1277,5 +1278,106 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     } finally {
       await browser.close();
     }
+  });
+
+  it('programmatic focus intents (pendingPrefillText, quick fill, external inputRef) exit read-only mode on mobile while guarding active voice holds', async () => {
+    const inputRef: { current: HTMLDivElement | null } = { current: null };
+    const onPendingPrefillApplied = vi.fn();
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    const quickData = makeQuickData();
+
+    const { rerender } = render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={quickData}
+        inputRef={inputRef as any}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+        pendingPrefillText={null}
+        onPendingPrefillApplied={onPendingPrefillApplied}
+      />,
+    );
+
+    const input = document.querySelector('.controls-input') as HTMLDivElement;
+    expect(input.getAttribute('contenteditable')).toBe('false');
+    expect(document.activeElement).not.toBe(input);
+
+    // 1. pendingPrefillText enters editable typing state & focuses
+    rerender(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={quickData}
+        inputRef={inputRef as any}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+        pendingPrefillText="reply text"
+        onPendingPrefillApplied={onPendingPrefillApplied}
+      />,
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    expect(onPendingPrefillApplied).toHaveBeenCalledTimes(1);
+    expect(input.textContent).toBe('reply text');
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(document.activeElement).toBe(input);
+
+    // Clear prefill prop as parent does on onPendingPrefillApplied
+    rerender(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={quickData}
+        inputRef={inputRef as any}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+        pendingPrefillText={null}
+        onPendingPrefillApplied={onPendingPrefillApplied}
+      />,
+    );
+
+    // 2. Blur returns mobile composer to unfocused read-only voice-ready state
+    input.blur();
+    fireEvent.blur(input);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(input.getAttribute('contenteditable')).toBe('false');
+    expect(document.activeElement).not.toBe(input);
+
+    // 3. External inputRef via focusComposerElement enters editable state when idle
+    expect(focusComposerElement(inputRef.current, { moveCursorToEnd: true })).toBe(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(document.activeElement).toBe(input);
+
+    // 4. Blur again -> 240ms hold locks to read-only and refuses focusComposerElement interruption
+    input.blur();
+    fireEvent.blur(input);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(input.getAttribute('contenteditable')).toBe('false');
+    dispatchPointer(input, 'pointerdown', 180);
+    expect(focusComposerElement(inputRef.current)).toBe(false);
+    await vi.advanceTimersByTimeAsync(240);
+    expect(document.querySelector('.voice-hold-hud')).not.toBeNull();
+    expect(input.getAttribute('contenteditable')).toBe('false');
+    expect(input.style.getPropertyValue('-webkit-user-modify')).toBe('read-only');
+    expect(focusComposerElement(inputRef.current)).toBe(false);
+    expect(input.getAttribute('contenteditable')).toBe('false');
+
+    // Release hold in center/cancel -> returns cleanly to unfocused read-only voice-ready state
+    dispatchPointer(input, 'pointercancel', 180);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.querySelector('.voice-hold-hud')).toBeNull();
+    expect(input.getAttribute('contenteditable')).toBe('false');
+
+    // 5. Short tap still restores contenteditable="true" + focus after round trip
+    dispatchPointer(input, 'pointerdown', 180);
+    await vi.advanceTimersByTimeAsync(80);
+    dispatchPointer(input, 'pointerup', 180);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(document.activeElement).toBe(input);
   });
 });
