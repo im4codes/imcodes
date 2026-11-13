@@ -8,6 +8,7 @@ import {
   formatShortcutKeycaps,
   getDefaultShortcuts,
   isMacPlatform,
+  normalizeShortcutChordString,
   resolveKeyboardShortcuts,
   sanitizeShortcutOverrides,
   type KeyboardShortcutOverrides,
@@ -100,7 +101,8 @@ function KeyboardShortcutsSectionInner({
         return;
       }
 
-      const chord = chordFromKeyboardEvent(e, { requireModifier: true });
+      const captured = chordFromKeyboardEvent(e, { requireModifier: true });
+      const chord = captured ? normalizeShortcutChordString(captured) : null;
       if (!chord) {
         setStatusNotice({
           type: 'err',

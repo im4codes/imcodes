@@ -2259,7 +2259,7 @@
       "unassigned": "Sin asignar",
       "recording_prompt": "Pulsa un atajo…",
       "record_aria": "Grabar atajo para {{action}}",
-      "modifier_required": "Usa una tecla modificadora (Cmd, Ctrl o Alt) o una tecla de función (F1–F24).",
+      "modifier_required": "Usa una tecla modificadora (Cmd, Ctrl o Alt) o una tecla de navegación/función (Flechas, Home/End/PageUp/PageDown, F1–F24).",
       "reassigned_notice": "Atajo asignado y se quitó el conflicto en “{{action}}”.",
       "conflict_warning": "Conflicto con: {{actions}}",
       "hint": "Pulsa Esc para cancelar. Funciona incluso con el foco en el campo de mensaje; se ignora en ajustes, diálogos y terminales.",

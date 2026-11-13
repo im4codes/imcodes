@@ -2259,7 +2259,7 @@
       "unassigned": "未设置",
       "recording_prompt": "请按下快捷键…",
       "record_aria": "录制「{{action}}」快捷键",
-      "modifier_required": "请包含修饰键（Cmd、Ctrl 或 Alt）或使用功能键（F1–F24）。",
+      "modifier_required": "请包含修饰键（Cmd、Ctrl 或 Alt）或使用导航/功能键（方向键、Home/End/PageUp/PageDown、F1–F24）。",
       "reassigned_notice": "已设置新快捷键，并清除「{{action}}」的冲突绑定。",
       "conflict_warning": "与以下快捷键冲突：{{actions}}",
       "hint": "按 Esc 取消录制。在对话输入框聚焦时也可生效；在设置页、弹窗和终端内自动禁用。",

@@ -176,4 +176,51 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     expect(screen.getByTestId('shortcut-record-serverPrev').textContent).toContain('Ctrl');
     expect(screen.getByTestId('shortcut-record-tabNext').textContent).toContain('→');
   });
+
+  it('records Ctrl+Shift++ and bare/Shift navigation keys, rejects Shift+typing, and retains bindings across reload', () => {
+    render(<KeyboardShortcutsSection isMacOverride={false} />);
+
+    // Reject Shift+letter as normal typing
+    const tabNextBtn = screen.getByTestId('shortcut-record-tabNext');
+    fireEvent.click(tabNextBtn);
+    fireEvent.keyDown(document, { key: 'A', code: 'KeyA', shiftKey: true });
+    expect(screen.getByTestId('shortcuts-status-notice').textContent).toContain('Use a modifier key');
+    expect(tabNextBtn.getAttribute('data-shortcut-recording')).toBe('true');
+
+    // Capture Ctrl+Shift++ -> canonicalized, persisted, rendered as Ctrl / Shift / +
+    fireEvent.keyDown(document, { key: '+', code: 'Equal', ctrlKey: true, shiftKey: true });
+    expect(tabNextBtn.getAttribute('data-shortcut-recording')).toBeNull();
+    expect(tabNextBtn.textContent).toContain('Ctrl');
+    expect(tabNextBtn.textContent).toContain('Shift');
+    expect(tabNextBtn.textContent).toContain('+');
+
+    // Capture bare Home and Shift+PageDown for serverPrev / serverNext
+    const serverPrevBtn = screen.getByTestId('shortcut-record-serverPrev');
+    fireEvent.click(serverPrevBtn);
+    fireEvent.keyDown(document, { key: 'Home', code: 'Home' });
+    expect(serverPrevBtn.textContent).toContain('Home');
+
+    const serverNextBtn = screen.getByTestId('shortcut-record-serverNext');
+    fireEvent.click(serverNextBtn);
+    fireEvent.keyDown(document, { key: 'PageDown', code: 'PageDown', shiftKey: true });
+    expect(serverNextBtn.textContent).toContain('Shift');
+    expect(serverNextBtn.textContent).toContain('PgDn');
+
+    const stored = JSON.parse(localStorage.getItem(`rcc_sync_${KEYBOARD_SHORTCUTS_PREF_KEY}`) ?? '{}');
+    expect(stored.v).toEqual({
+      tabNext: 'Ctrl+Shift+Plus',
+      serverPrev: 'Home',
+      serverNext: 'Shift+PageDown',
+    });
+
+    // Simulate reload: unmount and remount KeyboardShortcutsSection, assert persisted keycaps survive intact
+    cleanup();
+    render(<KeyboardShortcutsSection isMacOverride={false} />);
+    const reloadedTabNext = screen.getByTestId('shortcut-record-tabNext');
+    expect(reloadedTabNext.textContent).toContain('Ctrl');
+    expect(reloadedTabNext.textContent).toContain('Shift');
+    expect(reloadedTabNext.textContent).toContain('+');
+    expect(screen.getByTestId('shortcut-record-serverPrev').textContent).toContain('Home');
+    expect(screen.getByTestId('shortcut-record-serverNext').textContent).toContain('PgDn');
+  });
 });

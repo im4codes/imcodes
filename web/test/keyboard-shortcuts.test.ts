@@ -59,12 +59,22 @@ describe('keyboard-shortcuts core helpers', () => {
       key: 'ArrowUp',
     })).toBe('Meta+Alt+ArrowUp');
     expect(normalizeShortcutChordString('control+alt+K')).toBe('Ctrl+Alt+k');
+    expect(normalizeShortcutChordString('ctrl+shift++')).toBe('Ctrl+Shift+Plus');
+    expect(normalizeShortcutChordString('Ctrl+Shift+Plus')).toBe('Ctrl+Shift+Plus');
+    expect(normalizeShortcutChordString('Shift+ArrowDown')).toBe('Shift+ArrowDown');
+    expect(normalizeShortcutChordString('ArrowUp')).toBe('ArrowUp');
+    expect(normalizeShortcutChordString('Shift+a')).toBeNull();
+    expect(normalizeShortcutChordString('Ctrl+')).toBeNull();
+    expect(normalizeShortcutChordString('Ctrl+++')).toBeNull();
     expect(normalizeShortcutChordString('Escape')).toBeNull();
     expect(normalizeShortcutChordString('')).toBeNull();
 
     expect(formatShortcutKeycaps('Meta+ArrowUp', true)).toEqual(['⌘', '↑']);
     expect(formatShortcutKeycaps('Ctrl+ArrowLeft', false)).toEqual(['Ctrl', '←']);
     expect(formatShortcutKeycaps('Ctrl+Alt+Shift+k', false)).toEqual(['Ctrl', 'Alt', 'Shift', 'K']);
+    expect(formatShortcutKeycaps('Ctrl+Shift+Plus', false)).toEqual(['Ctrl', 'Shift', '+']);
+    expect(formatShortcutKeycaps('Meta+Shift+Plus', true)).toEqual(['⇧', '⌘', '+']);
+    expect(formatShortcutKeycaps('Shift+Home', false)).toEqual(['Shift', 'Home']);
   });
 
   it('merges user overrides and preserves null cleared bindings across platform defaults', () => {
@@ -72,6 +82,7 @@ describe('keyboard-shortcuts core helpers', () => {
       serverPrev: 'Alt+ArrowUp',
       serverNext: null,
       tabPrev: 'invalid+escape',
+      tabNext: 'Shift+a',
       unknownAction: 'Ctrl+k',
     } as unknown);
     expect(clean).toEqual({
@@ -93,19 +104,43 @@ describe('keyboard-shortcuts core helpers', () => {
     });
   });
 
-  it('captures valid chords and rejects bare modifiers, Escape, IME, and bare typing keys', () => {
+  it('captures valid chords (modifiers or non-typing nav/function keys) and rejects bare typing, Shift+letter, modifiers, Escape, and IME', () => {
     expect(chordFromKeyboardEvent({ key: 'Meta', code: 'MetaLeft', metaKey: true, ctrlKey: false, altKey: false, shiftKey: false })).toBeNull();
     expect(chordFromKeyboardEvent({ key: 'Control', code: 'ControlLeft', metaKey: false, ctrlKey: true, altKey: false, shiftKey: false })).toBeNull();
     expect(chordFromKeyboardEvent({ key: 'Escape', code: 'Escape', metaKey: false, ctrlKey: false, altKey: false, shiftKey: false })).toBeNull();
+    expect(chordFromKeyboardEvent({ key: 'Escape', code: 'Escape', metaKey: false, ctrlKey: true, altKey: false, shiftKey: false })).toBeNull();
     expect(chordFromKeyboardEvent({ key: 'a', code: 'KeyA', metaKey: false, ctrlKey: false, altKey: false, shiftKey: false })).toBeNull();
     expect(chordFromKeyboardEvent({ key: 'A', code: 'KeyA', metaKey: false, ctrlKey: false, altKey: false, shiftKey: true })).toBeNull();
-    expect(chordFromKeyboardEvent({ key: 'ArrowUp', code: 'ArrowUp', metaKey: false, ctrlKey: false, altKey: false, shiftKey: false })).toBeNull();
+    expect(chordFromKeyboardEvent({ key: '+', code: 'Equal', metaKey: false, ctrlKey: false, altKey: false, shiftKey: true })).toBeNull();
+    expect(chordFromKeyboardEvent({ key: ' ', code: 'Space', metaKey: false, ctrlKey: false, altKey: false, shiftKey: false })).toBeNull();
+    expect(chordFromKeyboardEvent({ key: 'Enter', code: 'Enter', metaKey: false, ctrlKey: false, altKey: false, shiftKey: false })).toBeNull();
+    expect(chordFromKeyboardEvent({ key: 'Tab', code: 'Tab', metaKey: false, ctrlKey: false, altKey: false, shiftKey: true })).toBeNull();
     expect(chordFromKeyboardEvent({ key: 'k', code: 'KeyK', metaKey: false, ctrlKey: true, altKey: false, shiftKey: false, isComposing: true })).toBeNull();
+
+    // Non-typing navigation & function keys (with or without Shift) are allowed
+    expect(chordFromKeyboardEvent({ key: 'ArrowUp', code: 'ArrowUp', metaKey: false, ctrlKey: false, altKey: false, shiftKey: false })).toBe('ArrowUp');
+    expect(chordFromKeyboardEvent({ key: 'Home', code: 'Home', metaKey: false, ctrlKey: false, altKey: false, shiftKey: false })).toBe('Home');
+    expect(chordFromKeyboardEvent({ key: 'PageDown', code: 'PageDown', metaKey: false, ctrlKey: false, altKey: false, shiftKey: true })).toBe('Shift+PageDown');
+    expect(chordFromKeyboardEvent({ key: 'F6', code: 'F6', metaKey: false, ctrlKey: false, altKey: false, shiftKey: false })).toBe('F6');
 
     expect(chordFromKeyboardEvent({ key: 'ArrowUp', code: 'ArrowUp', metaKey: true, ctrlKey: false, altKey: false, shiftKey: false })).toBe('Meta+ArrowUp');
     expect(chordFromKeyboardEvent({ key: 'ArrowRight', code: 'ArrowRight', metaKey: false, ctrlKey: true, altKey: false, shiftKey: true })).toBe('Ctrl+Shift+ArrowRight');
     expect(chordFromKeyboardEvent({ key: '˚', code: 'KeyK', metaKey: false, ctrlKey: false, altKey: true, shiftKey: false })).toBe('Alt+k');
-    expect(chordFromKeyboardEvent({ key: 'F6', code: 'F6', metaKey: false, ctrlKey: false, altKey: false, shiftKey: false })).toBe('F6');
+
+    // Plus separator key round-trips cleanly across capture -> sanitize -> JSON storage -> match
+    const plusEvt = { key: '+', code: 'Equal', metaKey: false, ctrlKey: true, altKey: false, shiftKey: true };
+    const capturedPlus = chordFromKeyboardEvent(plusEvt);
+    expect(capturedPlus).toBe('Ctrl+Shift+Plus');
+    const persisted = JSON.parse(JSON.stringify(sanitizeShortcutOverrides({ tabNext: capturedPlus })));
+    expect(persisted.tabNext).toBe('Ctrl+Shift+Plus');
+    expect(matchesShortcutChord(plusEvt, persisted.tabNext)).toBe(true);
+    expect(matchesShortcutChord({ key: '=', code: 'Equal', metaKey: false, ctrlKey: true, altKey: false, shiftKey: false }, persisted.tabNext)).toBe(false);
+
+    const metaPlusEvt = { key: '+', code: 'NumpadAdd', metaKey: true, ctrlKey: false, altKey: false, shiftKey: false };
+    const capturedMetaPlus = chordFromKeyboardEvent(metaPlusEvt);
+    expect(capturedMetaPlus).toBe('Meta+Plus');
+    expect(sanitizeShortcutOverrides({ tabPrev: capturedMetaPlus }).tabPrev).toBe('Meta+Plus');
+    expect(matchesShortcutChord(metaPlusEvt, 'Meta+Plus')).toBe(true);
   });
 
   it('matches exact modifier combinations and detects conflicts', () => {

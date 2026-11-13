@@ -47,6 +47,8 @@ const IGNORED_KEYS = new Set([
 ]);
 
 const SPECIAL_KEY_ALIASES: Record<string, string> = {
+  '+': 'Plus',
+  plus: 'Plus',
   up: 'ArrowUp',
   arrowup: 'ArrowUp',
   down: 'ArrowDown',
@@ -74,7 +76,19 @@ const SPECIAL_KEY_ALIASES: Record<string, string> = {
   pagedown: 'PageDown',
 };
 
+const NON_TYPING_NAVIGATION_KEYS = new Set([
+  'ArrowUp',
+  'ArrowDown',
+  'ArrowLeft',
+  'ArrowRight',
+  'Home',
+  'End',
+  'PageUp',
+  'PageDown',
+]);
+
 const KEY_LABELS_MAC: Record<string, string> = {
+  Plus: '+',
   ArrowUp: '↑',
   ArrowDown: '↓',
   ArrowLeft: '←',
@@ -89,6 +103,7 @@ const KEY_LABELS_MAC: Record<string, string> = {
 };
 
 const KEY_LABELS_NON_MAC: Record<string, string> = {
+  Plus: '+',
   ArrowUp: '↑',
   ArrowDown: '↓',
   ArrowLeft: '←',
@@ -133,6 +148,27 @@ function isFunctionKeyName(key: string): boolean {
   return /^F([1-9]|1[0-9]|2[0-4])$/.test(key);
 }
 
+export function isNonTypingNavigationKey(key: string): boolean {
+  return NON_TYPING_NAVIGATION_KEYS.has(key);
+}
+
+/**
+ * Unified supported-chord validity contract shared by interactive capture,
+ * persisted-string parsing/sanitization, and event matching:
+ * - Rejects Escape, modifier-only keys, and IME composition tokens.
+ * - Requires at least one primary modifier (Meta/Ctrl/Alt), OR a non-typing
+ *   navigation/function key (`Arrow*`, `Home`, `End`, `PageUp`, `PageDown`, `F1`–`F24`,
+ *   with or without `Shift`).
+ */
+export function isSupportedShortcutChord(parsed: ParsedShortcutChord): boolean {
+  if (!parsed.key || parsed.key === 'Escape' || IGNORED_KEYS.has(parsed.key)) {
+    return false;
+  }
+  const hasPrimaryModifier = parsed.meta || parsed.ctrl || parsed.alt;
+  if (hasPrimaryModifier) return true;
+  return isFunctionKeyName(parsed.key) || isNonTypingNavigationKey(parsed.key);
+}
+
 /** Normalize a raw KeyboardEvent `key` / `code` token into our canonical key name. */
 export function normalizeKeyToken(rawKey: string, code?: string, altKey = false): string | null {
   if (!rawKey) return null;
@@ -142,6 +178,8 @@ export function normalizeKeyToken(rawKey: string, code?: string, altKey = false)
   if (SPECIAL_KEY_ALIASES[lower]) {
     return SPECIAL_KEY_ALIASES[lower];
   }
+
+  if (rawKey.trim() === '') return null;
 
   if (/^f([1-9]|1[0-9]|2[0-4])$/i.test(rawKey)) {
     return rawKey.toUpperCase();
@@ -175,14 +213,31 @@ export function serializeShortcutChord(parsed: ParsedShortcutChord): string {
   return parts.join('+');
 }
 
-/** Parse a stored shortcut string; returns null if empty or invalid. */
-export function parseShortcutChord(chord: string | null | undefined): ParsedShortcutChord | null {
+function splitShortcutChordParts(trimmed: string): string[] | null {
+  if (trimmed === '+') return ['Plus'];
+  if (trimmed.endsWith('++')) {
+    const prefix = trimmed.slice(0, -2);
+    if (!prefix) return null;
+    const prefixParts = prefix.split('+').map((part) => part.trim());
+    if (prefixParts.some((part) => part.length === 0)) return null;
+    return [...prefixParts, 'Plus'];
+  }
+  const parts = trimmed.split('+').map((part) => part.trim());
+  if (parts.length === 0 || parts.some((part) => part.length === 0)) return null;
+  return parts;
+}
+
+/** Parse a stored shortcut string; returns null if empty, malformed, or unsupported. */
+export function parseShortcutChord(
+  chord: string | null | undefined,
+  options: { requireSupported?: boolean } = {},
+): ParsedShortcutChord | null {
   if (typeof chord !== 'string') return null;
   const trimmed = chord.trim();
   if (!trimmed) return null;
 
-  const parts = trimmed.split('+').map((part) => part.trim()).filter(Boolean);
-  if (parts.length === 0) return null;
+  const parts = splitShortcutChordParts(trimmed);
+  if (!parts) return null;
 
   let meta = false;
   let ctrl = false;
@@ -205,7 +260,11 @@ export function parseShortcutChord(chord: string | null | undefined): ParsedShor
   }
 
   if (!key || key === 'Escape') return null;
-  return { meta, ctrl, alt, shift, key };
+  const parsed: ParsedShortcutChord = { meta, ctrl, alt, shift, key };
+  if (options.requireSupported !== false && !isSupportedShortcutChord(parsed)) {
+    return null;
+  }
+  return parsed;
 }
 
 /** Canonicalize a persisted shortcut string, or return null if invalid/disabled. */
@@ -251,6 +310,7 @@ export function resolveKeyboardShortcuts(
 /**
  * Capture a canonical shortcut chord from a `KeyboardEvent`.
  * - Returns `null` for bare modifiers, Escape, IME composition, or disallowed bare typing keys.
+ * - Guarantees captured strings round-trip through `parseShortcutChord` and `sanitizeShortcutOverrides`.
  */
 export function chordFromKeyboardEvent(
   e: Pick<KeyboardEvent, 'key' | 'code' | 'metaKey' | 'ctrlKey' | 'altKey' | 'shiftKey' | 'isComposing' | 'keyCode'>,
@@ -260,17 +320,23 @@ export function chordFromKeyboardEvent(
   const key = normalizeKeyToken(e.key, e.code, Boolean(e.altKey));
   if (!key || key === 'Escape') return null;
 
-  const meta = Boolean(e.metaKey);
-  const ctrl = Boolean(e.ctrlKey);
-  const alt = Boolean(e.altKey);
-  const shift = Boolean(e.shiftKey);
+  const parsed: ParsedShortcutChord = {
+    meta: Boolean(e.metaKey),
+    ctrl: Boolean(e.ctrlKey),
+    alt: Boolean(e.altKey),
+    shift: Boolean(e.shiftKey),
+    key,
+  };
 
   const requireModifier = options.requireModifier !== false;
-  if (requireModifier && !meta && !ctrl && !alt && !isFunctionKeyName(key)) {
+  if (requireModifier && !isSupportedShortcutChord(parsed)) {
     return null;
   }
 
-  return serializeShortcutChord({ meta, ctrl, alt, shift, key });
+  const serialized = serializeShortcutChord(parsed);
+  // Enforce capture/parse/persistence round-trip invariant.
+  const roundTripped = parseShortcutChord(serialized, { requireSupported: requireModifier });
+  return roundTripped ? serializeShortcutChord(roundTripped) : null;
 }
 
 /** Exact modifier + key match against a canonical shortcut chord string. */

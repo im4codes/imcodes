@@ -2258,7 +2258,7 @@
       "unassigned": "未設定",
       "recording_prompt": "キーを押してください…",
       "record_aria": "{{action}} のショートカットを登録",
-      "modifier_required": "修飾キー（Cmd / Ctrl / Alt）またはファンクションキー（F1–F24）を含めてください。",
+      "modifier_required": "修飾キー（Cmd / Ctrl / Alt）またはナビゲーション/ファンクションキー（矢印、Home/End/PageUp/PageDown、F1–F24）を使用してください。",
       "reassigned_notice": "ショートカットを設定し、「{{action}}」の重複割り当てを解除しました。",
       "conflict_warning": "競合: {{actions}}",
       "hint": "Esc キーで入力をキャンセルできます。チャット入力欄のフォーカス中も動作し、設定・ダイアログ・ターミナル内では無効になります。",

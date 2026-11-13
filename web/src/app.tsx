@@ -7249,7 +7249,27 @@ function InternalMainApp() {
   }, [isMobile]);
 
   // Desktop auto-focus composer input when switching servers, tabs, or sub-session windows.
-  const lastAutoFocusedTargetRef = useRef<string | null>(null);
+  // Track requested navigation intent independently of whether the target is currently
+  // focusable/blocked, so visiting a terminal, shell, dashboard, or blocked target
+  // invalidates prior dedup tokens and restores focus cleanly upon returning or unblocking.
+  const navigationIntentKey = useMemo(() => {
+    if (isMobile || !selectedServerId || manualDashboard) return null;
+    if (focusedSubId && openSubIds.has(focusedSubId)) {
+      return `srv:${selectedServerId}:sub:${focusedSubId}`;
+    }
+    if (activeSession) {
+      return `srv:${selectedServerId}:main:${activeSession}:view:${viewMode}`;
+    }
+    return null;
+  }, [isMobile, selectedServerId, manualDashboard, focusedSubId, openSubIds, activeSession, viewMode]);
+
+  const lastNavIntentKeyRef = useRef<string | null>(null);
+  const lastAutoFocusedRef = useRef<{ key: string; element: HTMLDivElement } | null>(null);
+  if (lastNavIntentKeyRef.current !== navigationIntentKey) {
+    lastNavIntentKeyRef.current = navigationIntentKey;
+    lastAutoFocusedRef.current = null;
+  }
+
   const autoFocusTarget = useMemo(() => {
     if (isMobile || !selectedServerId || manualDashboard) return null;
     if (focusedSubId && openSubIds.has(focusedSubId)) {
@@ -7267,7 +7287,7 @@ function InternalMainApp() {
       if (mainSession.agentType === 'shell' || mainSession.agentType === 'script') return null;
       if (viewMode !== 'chat') return null;
       return {
-        key: `srv:${selectedServerId}:main:${activeSession}`,
+        key: `srv:${selectedServerId}:main:${activeSession}:view:${viewMode}`,
         sessionName: activeSession,
         isSub: false,
       };
@@ -7282,16 +7302,23 @@ function InternalMainApp() {
     if (!target || isMobileRef.current || hasBlockingComposerOverlayRef.current || hasDomBlockingOverlay()) {
       return false;
     }
-    if (lastAutoFocusedTargetRef.current === target.key) return true;
     const inputEl = inputRefsMap.current.get(target.sessionName);
     if (!inputEl || !inputEl.isConnected) return false;
+    const prev = lastAutoFocusedRef.current;
+    if (prev && prev.key === target.key && prev.element === inputEl) {
+      return true;
+    }
     if (target.isSub) {
       const subWin = inputEl.closest?.('.subsession-window');
       if (subWin?.getAttribute('data-view-mode') === 'terminal') return false;
     }
+    if (document.activeElement === inputEl) {
+      lastAutoFocusedRef.current = { key: target.key, element: inputEl };
+      return true;
+    }
     const focused = focusComposerElement(inputEl);
     if (focused) {
-      lastAutoFocusedTargetRef.current = target.key;
+      lastAutoFocusedRef.current = { key: target.key, element: inputEl };
     }
     return focused;
   }, []);
@@ -7309,36 +7336,69 @@ function InternalMainApp() {
   }, [attemptAutoFocusForTarget]);
 
   useEffect(() => {
-    if (!autoFocusTarget) {
-      if (isMobile || !selectedServerId || manualDashboard) {
-        lastAutoFocusedTargetRef.current = null;
-      }
+    if (!autoFocusTarget || hasBlockingComposerOverlay) return;
+    const currentEl = inputRefsMap.current.get(autoFocusTarget.sessionName);
+    const prev = lastAutoFocusedRef.current;
+    if (prev && prev.key === autoFocusTarget.key && currentEl && prev.element === currentEl && currentEl.isConnected) {
       return;
     }
-    if (hasBlockingComposerOverlay || hasDomBlockingOverlay()) return;
-    if (lastAutoFocusedTargetRef.current === autoFocusTarget.key) return;
 
     let cancelled = false;
     let rafId: number | null = null;
+    let observer: MutationObserver | null = null;
+
+    const cleanupObservers = () => {
+      if (rafId !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+      observer?.disconnect();
+      observer = null;
+    };
 
     const attemptFocus = (): boolean => {
       if (cancelled) return false;
-      return attemptAutoFocusForTarget(autoFocusTarget);
+      const focused = attemptAutoFocusForTarget(autoFocusTarget);
+      if (focused) {
+        cleanupObservers();
+      }
+      return focused;
     };
 
-    if (!attemptFocus() && typeof requestAnimationFrame === 'function') {
-      rafId = requestAnimationFrame(() => {
-        attemptFocus();
+    const watchDomOverlayIfBlocked = () => {
+      if (cancelled || observer || typeof MutationObserver === 'undefined' || !document.body) return;
+      if (!hasDomBlockingOverlay()) return;
+      observer = new MutationObserver(() => {
+        if (cancelled) return;
+        if (!hasDomBlockingOverlay()) {
+          attemptFocus();
+        }
       });
+      observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['aria-modal', 'role', 'class', 'data-shortcut-recording'],
+      });
+    };
+
+    if (!attemptFocus()) {
+      watchDomOverlayIfBlocked();
+      if (typeof requestAnimationFrame === 'function') {
+        rafId = requestAnimationFrame(() => {
+          rafId = null;
+          if (!attemptFocus()) {
+            watchDomOverlayIfBlocked();
+          }
+        });
+      }
     }
 
     return () => {
       cancelled = true;
-      if (rafId !== null && typeof cancelAnimationFrame === 'function') {
-        cancelAnimationFrame(rafId);
-      }
+      cleanupObservers();
     };
-  }, [attemptAutoFocusForTarget, autoFocusTarget, hasBlockingComposerOverlay, isMobile, manualDashboard, selectedServerId]);
+  }, [attemptAutoFocusForTarget, autoFocusTarget, hasBlockingComposerOverlay]);
 
   const showTeamDiscussionGuide = shouldShowTeamDiscussionGuide(
     teamDiscussionGuidePref,

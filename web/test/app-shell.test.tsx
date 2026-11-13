@@ -327,7 +327,9 @@ vi.mock('../src/hooks/useSyncedPreference.js', async () => {
   const actual = await vi.importActual<typeof import('../src/hooks/useSyncedPreference.js')>('../src/hooks/useSyncedPreference.js');
   return {
     useSyncedPreference: (_key: string, initial: unknown, debounce?: number, scope?: string) => {
-      if (syncedPrefs.enabled && _key.startsWith('server_')) return actual.useSyncedPreference(_key, initial, debounce, scope);
+      if (syncedPrefs.enabled && (_key.startsWith('server_') || _key === 'keyboard_shortcuts_v1')) {
+        return actual.useSyncedPreference(_key, initial, debounce, scope);
+      }
       const [value, setValue] = useState(initial);
       return [value, setValue, true];
     },
@@ -460,6 +462,9 @@ vi.mock('../src/pages/SettingsPage.js', () => ({
       <button onClick={() => onUserAuthUpdated?.({ username: 'grace', hasPassword: false })}>settings-auth</button>
       <button onClick={() => onChangeShortcutOverrides?.({ tabNext: 'Alt+ArrowRight', serverNext: 'Alt+ArrowDown' })}>
         settings-custom-shortcuts
+      </button>
+      <button onClick={() => onChangeShortcutOverrides?.({ tabNext: 'Ctrl+Shift+Plus', serverNext: 'Shift+PageDown' })}>
+        settings-plus-shortcuts
       </button>
       <button onClick={onBack}>settings-back</button>
     </div>
@@ -794,7 +799,7 @@ vi.mock('../src/components/SubSessionWindow.js', () => ({
     <div
       class="subsession-window"
       data-testid={`sub-session-window-${sub?.id}`}
-      data-view-mode="chat"
+      data-view-mode={sub?.type === 'shell' ? 'terminal' : (sub?.viewMode ?? 'chat')}
       data-active={String(active)}
       data-visible={String(visible)}
       data-maximized={String(Boolean(maximized))}
@@ -8358,6 +8363,135 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       expect(mobileRight.defaultPrevented).toBe(false);
     } finally {
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUA });
+    }
+  }, 15000);
+
+  it('refocuses main composer after visiting a terminal sub-session and returning, and recovers focus once after an overlay blocks target switch', async () => {
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-term-1',
+        serverId: 'srv-1',
+        sessionName: 'deck_sub_sub-term-1',
+        parentSession: 'deck_alpha_brain',
+        label: 'Terminal Worker',
+        type: 'codex',
+        state: 'idle',
+        viewMode: 'terminal',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+    await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+
+    // Open terminal-mode subwindow -> composer is NOT focused and terminal retains focus across polling renders
+    fireEvent.click(screen.getByText('subbar-open'));
+    const subRoot = await screen.findByTestId('sub-session-window-sub-term-1');
+    expect(subRoot.getAttribute('data-view-mode')).toBe('terminal');
+    const termInput = document.createElement('textarea');
+    termInput.className = 'xterm-helper-textarea';
+    subRoot.appendChild(termInput);
+    termInput.focus();
+    expect(document.activeElement).toBe(termInput);
+
+    // Emit WS session_list polling update while terminal subwindow stays open -> terminal keeps focus
+    act(() => {
+      wsInstances[wsInstances.length - 1]?.emit({
+        type: 'session_list',
+        sessions: [
+          { name: 'deck_alpha_brain', project: 'alpha', role: 'brain', agentType: 'claude-code', state: 'running' },
+          { name: 'deck_beta_brain', project: 'beta', role: 'brain', agentType: 'codex-sdk', state: 'idle' },
+        ],
+      });
+    });
+    expect(document.activeElement).toBe(termInput);
+
+    // Click main tab deck_alpha_brain -> closes subwindow and refocuses main composer
+    fireEvent.click(screen.getByText('tabs-select-deck_alpha_brain'));
+    await waitFor(() => expect(subRoot.getAttribute('data-visible')).toBe('false'));
+    await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+
+    // While staying on deck_alpha_brain, if user focuses another control, polling must NOT steal focus back
+    const tabBtn = screen.getByText('tabs-select-deck_beta_brain');
+    const unrelatedBtn = screen.getByText('server-toggle-sidebar');
+    unrelatedBtn.focus();
+    expect(document.activeElement).toBe(unrelatedBtn);
+    act(() => {
+      wsInstances[wsInstances.length - 1]?.emit({
+        type: 'session_list',
+        sessions: [
+          { name: 'deck_alpha_brain', project: 'alpha', role: 'brain', agentType: 'claude-code', state: 'idle' },
+          { name: 'deck_beta_brain', project: 'beta', role: 'brain', agentType: 'codex-sdk', state: 'idle' },
+        ],
+      });
+    });
+    expect(document.activeElement).toBe(unrelatedBtn);
+
+    // Blocked-target recovery: open a modal overlay -> switch to deck_beta_brain while blocked -> close modal -> beta composer focuses
+    const modal = document.createElement('div');
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-modal', 'true');
+    const modalInput = document.createElement('input');
+    modal.appendChild(modalInput);
+    document.body.appendChild(modal);
+    modalInput.focus();
+
+    fireEvent.click(tabBtn);
+    await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+    expect(document.activeElement).toBe(modalInput);
+
+    modal.remove();
+    const betaComposer = screen.getByTestId('pane-composer-deck_beta_brain');
+    await waitFor(() => expect(document.activeElement).toBe(betaComposer));
+  }, 15000);
+
+  it('persists Ctrl+Shift++ and Shift+PageDown shortcut overrides across reload and uses them to navigate tabs and servers', async () => {
+    syncedPrefs.enabled = true;
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      render(<App />);
+
+      await screen.findByTestId('pane-composer-deck_alpha_brain');
+
+      // Configure Ctrl+Shift+Plus for tabNext and Shift+PageDown for serverNext via SettingsPage
+      fireEvent.click(screen.getByText('server-settings'));
+      fireEvent.click(screen.getByText('settings-plus-shortcuts'));
+      fireEvent.click(screen.getByText('settings-back'));
+
+      // Simulate reload with persisted keyboard_shortcuts_v1 preference intact
+      cleanup();
+      const reloadedMod = await importApp();
+      render(<reloadedMod.App />);
+
+      const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+
+      // Press Ctrl+Shift++ (`key: '+'`, `code: 'Equal'`) inside composer -> navigates to deck_beta_brain
+      const plusEvt = new KeyboardEvent('keydown', { key: '+', code: 'Equal', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(plusEvt);
+      expect(plusEvt.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+
+      // Press Shift+PageDown inside composer -> switches server to srv-2
+      const betaComposer = screen.getByTestId('pane-composer-deck_beta_brain');
+      await waitFor(() => expect(document.activeElement).toBe(betaComposer));
+      const pageDownEvt = new KeyboardEvent('keydown', { key: 'PageDown', code: 'PageDown', shiftKey: true, bubbles: true, cancelable: true });
+      betaComposer.dispatchEvent(pageDownEvt);
+      expect(pageDownEvt.defaultPrevented).toBe(true);
+      await waitFor(() => expect(localStorage.getItem('rcc_server')).toBe('srv-2'));
+    } finally {
+      syncedPrefs.enabled = false;
     }
   }, 15000);
 });

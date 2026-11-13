@@ -2259,7 +2259,7 @@
       "unassigned": "Not set",
       "recording_prompt": "Press shortcut…",
       "record_aria": "Record shortcut for {{action}}",
-      "modifier_required": "Use a modifier key (Cmd, Ctrl, or Alt) or a function key (F1–F24).",
+      "modifier_required": "Use a modifier key (Cmd, Ctrl, or Alt) or a navigation/function key (Arrows, Home/End/PageUp/PageDown, F1–F24).",
       "reassigned_notice": "Assigned shortcut and cleared conflicting binding from “{{action}}”.",
       "conflict_warning": "Conflicts with: {{actions}}",
       "hint": "Press Esc to cancel recording. Works even while the message input is focused; ignored inside settings, dialogs, and terminals.",

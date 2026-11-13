@@ -515,7 +515,7 @@ export function SubSessionWindow({
   const onInputRefRef = useRef(onInputRef);
   onInputRefRef.current = onInputRef;
   useEffect(() => {
-    if (!visible) {
+    if (!visible || viewMode !== 'chat') {
       onInputRefRef.current?.(null);
       return;
     }
@@ -530,7 +530,7 @@ export function SubSessionWindow({
       return () => cancelAnimationFrame(id);
     }
     return undefined;
-  }, [visible, active]);
+  }, [visible, active, viewMode]);
   useEffect(() => () => {
     onInputRefRef.current?.(null);
   }, []);
