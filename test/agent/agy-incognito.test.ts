@@ -65,11 +65,12 @@ function listTree(rootDir: string): string[] {
 }
 
 describe('AGY Incognito Isolation', () => {
-  it('supportsSessionIncognito enables agy-sdk and claude-code-sdk only', () => {
+  it('supportsSessionIncognito enables agy-sdk alongside integrated runtimes only', () => {
     expect(supportsSessionIncognito(AGY_SDK_PROVIDER_ID)).toBe(true);
     expect(supportsSessionIncognito('claude-code-sdk')).toBe(true);
+    expect(supportsSessionIncognito('codex-sdk')).toBe(true);
+    expect(supportsSessionIncognito('pi')).toBe(true);
     expect(supportsSessionIncognito('kimi-sdk')).toBe(false);
-    expect(supportsSessionIncognito('codex-sdk')).toBe(false);
     expect(supportsSessionIncognito('claude-code')).toBe(false);
     expect(supportsSessionIncognito('agy')).toBe(false);
   });
