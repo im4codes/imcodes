@@ -515,10 +515,12 @@ describe('process session /clear handling', () => {
     expect(relaunchSessionWithSettingsMock).toHaveBeenCalledTimes(1);
 
     // Stale A admission (handoff + clearTransportConversation) arrives while B's valid reset is in flight.
-    await expect(handoffSessionConversation(recA as any, serverLink as any)).rejects.toThrow(/ownership changed/i);
-    await expect(clearTransportConversation(recA as any, serverLink as any)).rejects.toThrow(/ownership changed/i);
+    const staleHandoff = handoffSessionConversation(recA as any, serverLink as any);
+    const staleClear = clearTransportConversation(recA as any, serverLink as any);
 
     releaseB();
+    await expect(staleHandoff).rejects.toThrow(/ownership changed/i);
+    await expect(staleClear).rejects.toThrow(/ownership changed/i);
     await flushAsync();
     await flushAsync();
 
