@@ -1,2 +1,2 @@
-# The upstream JNI layer looks up Kotlin config/data classes and native methods.
--keep class com.k2fsa.sherpa.onnx.** { *; }
+# Keep ONNX Runtime JNI callbacks and native wrapper classes.
+-keep class ai.onnxruntime.** { *; }

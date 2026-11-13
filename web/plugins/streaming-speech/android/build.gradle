@@ -18,7 +18,7 @@ android {
 dependencies {
     implementation project(':capacitor-android')
     implementation "androidx.appcompat:appcompat:${rootProject.ext.androidxAppCompatVersion}"
-    compileOnly files('libs/sherpa-onnx-2.0.1.aar')
+    implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.28.0'
     implementation 'org.jetbrains.kotlin:kotlin-stdlib:2.1.0'
 }
 

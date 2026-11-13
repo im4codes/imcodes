@@ -1,19 +1,14 @@
-IM.codes offline bilingual speech third-party notices
+IM.codes offline speech third-party notices
 
-sherpa-onnx runtime v2.0.1
-https://github.com/k2-fsa/sherpa-onnx
-Apache License 2.0; see LICENSE.sherpa.txt.
+Qwen3-ASR 0.6B INT4 ONNX export
+https://huggingface.co/goodpixelltd/qwen3-asr-0.6b-int4-sherpa-onnx
+Revision 9012f07ac1ce43c7e9fbd3afd8cad90fe147f88e.
+Apache License 2.0 (inherited from Qwen3-ASR).
 
-Streaming Zipformer bilingual Chinese/English model (INT8 encoder/joiner)
-https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20
-Revision 98590b7ed6443e77b714204da2757d75e1a642f4.
-The provider's model card declares Apache License 2.0; see LICENSE.sherpa.txt.
-Converted from a Chinese-English mixed Zipformer:
-https://huggingface.co/pfluo/k2fsa-zipformer-chinese-english-mixed
-
-ONNX Runtime
+ONNX Runtime Android (com.microsoft.onnxruntime:onnxruntime-android)
 https://github.com/microsoft/onnxruntime
 MIT License; see LICENSE.onnxruntime.txt.
 
-The bundled ONNX model bytes are unchanged from the above pinned export.
-This application supplies its own microphone and Capacitor adapters.
+The bundled ONNX model and tokenizer bytes are unchanged from the above pinned export.
+This application supplies its own Whisper mel extractor, BPE tokenizer, decoder loop,
+microphone capture, and Capacitor adapters.

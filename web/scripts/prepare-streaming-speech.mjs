@@ -23,7 +23,6 @@ export const ANDROID_SPEECH_ASSETS = [
   ['models/tokenizer/merges.txt', `${modelBase}/tokenizer/merges.txt`, '8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5', 1671853],
   ['models/tokenizer/tokenizer_config.json', `${modelBase}/tokenizer/tokenizer_config.json`, '4942d005604266809309cabc9f4e9cb89ce855d59b14681fdc0e1cc62ea26c4c', 12487],
   ['models/hotwords.txt', null, 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855', 0],
-  ['android/libs/sherpa-onnx-2.0.1.aar', 'https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/sherpa-onnx-2.0.1.aar', 'a8d09d1d32f3eb8520482c6d3d43fae674681c5b050385967c70a3c2c9bf0ee7', 49441341],
 ];
 
 export const IOS_SPEECH_ASSETS = [

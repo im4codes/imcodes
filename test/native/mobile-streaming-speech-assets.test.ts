@@ -31,18 +31,18 @@ describe('Qwen3-ASR mobile assets', () => {
   it('pins the Android INT4 ONNX and iOS 0.6B MLX 4-bit assets and platform routing', async () => {
     expect(MODEL_REVISION).toBe('9012f07ac1ce43c7e9fbd3afd8cad90fe147f88e');
     expect(IOS_MODEL_REVISION).toBe('bc441bd1e4295c1f42d9879f056049a925b6e013');
-    expect(ANDROID_SPEECH_ASSETS).toHaveLength(10);
+    expect(ANDROID_SPEECH_ASSETS).toHaveLength(9);
     expect(ANDROID_SPEECH_ASSETS.map((a: any) => a[2])).toEqual([
       'd22dc4423e0940e49884e903d2ea2f7e5567c14fc1aed97e4e26d6b8f208ef9e', '774e997d23a2f06c3f544666625c93a3b824fdd83d04c6acd88ee25f4e3b6e2e',
       'dc66975d9be10fbd31f89c76d33dd0bf4a8059ef14da4abf545bbf9895a5293d', 'c588d2a89460315f51ca8c65dbe85a0619891500fc853e5b673e3c914c25b2d3',
       '126c8e16074cc87250dacbf07602315e3bc5239c93ea414773b6e3a6fd4bf466', 'ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910',
       '8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5', '4942d005604266809309cabc9f4e9cb89ce855d59b14681fdc0e1cc62ea26c4c',
-      'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855', 'a8d09d1d32f3eb8520482c6d3d43fae674681c5b050385967c70a3c2c9bf0ee7',
+      'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
     ]);
-    expect(ANDROID_SPEECH_ASSETS.map((a: any) => a[0])).toEqual([...modelFiles.map(x => 'models/' + x), 'android/libs/sherpa-onnx-2.0.1.aar']);
+    expect(ANDROID_SPEECH_ASSETS.map((a: any) => a[0])).toEqual(modelFiles.map(x => 'models/' + x));
     expect(ANDROID_SPEECH_ASSETS.every((a: any) => /^[a-f\d]{64}$/.test(a[2]) && (a[0] === 'models/hotwords.txt' ? a[3] === 0 : a[3] > 0))).toBe(true);
     expect(ANDROID_SPEECH_ASSETS.slice(0, 8).every((a: any) => a[1].includes('/goodpixelltd/qwen3-asr-0.6b-int4-sherpa-onnx/resolve/' + MODEL_REVISION))).toBe(true);
-    expect(ANDROID_SPEECH_ASSETS.map((a: any) => a[3])).toEqual([44148281, 5622024, 110308864, 891837, 469962752, 2776833, 1671853, 12487, 0, 49441341]);
+    expect(ANDROID_SPEECH_ASSETS.map((a: any) => a[3])).toEqual([44148281, 5622024, 110308864, 891837, 469962752, 2776833, 1671853, 12487, 0]);
     expect(await matchesAsset(new URL('../../web/plugins/streaming-speech/models/hotwords.txt', import.meta.url), ANDROID_SPEECH_ASSETS[8][2], 0)).toBe(true);
 
     expect(IOS_SPEECH_ASSETS).toHaveLength(7);
@@ -66,7 +66,7 @@ describe('Qwen3-ASR mobile assets', () => {
     expect(IOS_SPEECH_ASSETS.map((a: any) => a[3])).toEqual([7187, 1671853, 708236945, 71814, 12487, 2776833, 0]);
     expect(await matchesAsset(new URL('../../web/plugins/streaming-speech/ios-models/hotwords.txt', import.meta.url), IOS_SPEECH_ASSETS[6][2], 0)).toBe(true);
 
-    expect(SPEECH_ASSETS).toHaveLength(17);
+    expect(SPEECH_ASSETS).toHaveLength(16);
     expect(SPEECH_ASSETS).toEqual([...ANDROID_SPEECH_ASSETS, ...IOS_SPEECH_ASSETS]);
     expect(selectSpeechAssets(['--android'])).toEqual(ANDROID_SPEECH_ASSETS);
     expect(selectSpeechAssets(['--ios'])).toEqual(IOS_SPEECH_ASSETS);
@@ -127,23 +127,48 @@ describe('Qwen3-ASR mobile assets', () => {
   });
   it('keeps native contracts, bounded offline segments, 0.6B MLX config, and stream ownership aligned', async () => {
     const base = new URL('../../web/plugins/streaming-speech/', import.meta.url);
+    const androidBuildGradle = await readFile(new URL('android/build.gradle', base), 'utf8');
+    const appBuildGradle = await readFile(new URL('../../web/android/app/build.gradle', import.meta.url), 'utf8');
+    const consumerRules = await readFile(new URL('android/consumer-rules.pro', base), 'utf8');
     const android = await readFile(new URL('android/src/main/java/com/imcodes/speech/StreamingSpeechPlugin.java', base), 'utf8');
+    const androidDecoder = await readFile(new URL('android/src/main/java/com/imcodes/speech/Qwen3OnnxDecoder.java', base), 'utf8');
+    const androidWindow = await readFile(new URL('android/src/main/java/com/imcodes/speech/Qwen3SpeechWindow.java', base), 'utf8');
     const ios = await readFile(new URL('ios/Sources/StreamingSpeechPlugin/StreamingSpeechPlugin.swift', base), 'utf8');
     const qwenAsr = await readFile(new URL('ios/Sources/Qwen3ASR/Qwen3ASR.swift', base), 'utf8');
+    expect(androidBuildGradle).toContain("com.microsoft.onnxruntime:onnxruntime-android:1.28.0");
+    expect(androidBuildGradle).not.toContain('sherpa-onnx');
+    expect(appBuildGradle).not.toContain('sherpa-onnx');
+    expect(consumerRules).toContain('ai.onnxruntime.**');
+    expect(consumerRules).not.toContain('sherpa');
     expect(android).toContain(`@CapacitorPlugin(name = "${STREAMING_SPEECH_PLUGIN_NAME}"`);
     expect(ios).toContain(`jsName = "${STREAMING_SPEECH_PLUGIN_NAME}"`);
     for (const name of modelFiles) { expect(android).toContain('"' + name + '"'); }
     for (const name of iosModelFiles) { expect(ios).toContain('"' + name + '"'); }
     for (const name of ['listeningState', 'audioLevel', 'partialResults', 'recognitionError']) { expect(android).toContain('"' + name + '"'); expect(ios).toContain('"' + name + '"'); }
-    expect(android).toContain('qwen.setMaxTotalLen(768)'); expect(android).toContain('new OfflineRecognizer(null, config)');
-    expect(android).toContain('getNoBackupFilesDir()'); expect(android).toContain('finally { stream.release(); }');
-    expect(android).toContain('qwen.setMaxNewTokens(24)');
-    expect(android).toContain('MAX_BUFFERED_CHUNKS = 320');
-    expect(android).toContain('model.setProvider("nnapi")');
-    expect(android).toContain('catch (RuntimeException | LinkageError accelerationUnavailable)');
-    expect(android).toContain('model.setProvider("cpu")');
-    expect(android).toContain('model.setNumThreads(4)');
-    expect(android).not.toContain('OfflinePunctuation'); expect(android).not.toContain('OnlineStream');
+    expect(android).toContain('getNoBackupFilesDir()');
+    expect(android).toContain('READ_CHUNK_SAMPLES = 800');
+    expect(android).toContain('new Qwen3OnnxDecoder(');
+    expect(android).toContain('new Qwen3SpeechWindow()');
+    expect(android).toContain('new Qwen3SpeechWindow.SpeechInbox()');
+    expect(android).toContain('decoder.close()');
+    expect(android).not.toContain('OfflineRecognizer');
+    expect(android).not.toContain('OfflinePunctuation');
+    expect(android).not.toContain('OnlineStream');
+    expect(android).not.toContain('ROLLBACK_CHARS');
+    expect(android).not.toContain('sherpa');
+    expect(androidDecoder).toContain('DEFAULT_MAX_TOTAL_LEN = 768');
+    expect(androidDecoder).toContain('DEFAULT_MAX_NEW_TOKENS = 192');
+    expect(androidDecoder).toContain('safePrefixTokensForRollback(');
+    expect(androidDecoder).toContain('applyKvDeltaInplace(');
+    expect(androidDecoder).toContain('isDegenerateRepetition(');
+    expect(androidWindow).toContain('SEGMENT_CAPACITY = SAMPLE_RATE * 27 / 2');
+    expect(androidWindow).toContain('SPLIT_SEARCH_WINDOW = SAMPLE_RATE * 5 / 2');
+    expect(androidWindow).toContain('UNFIXED_CHUNK_NUM = 2');
+    expect(androidWindow).toContain('UNFIXED_TOKEN_NUM = 5');
+    expect(androidWindow).toContain('PUNCTUATION_PAUSE = SAMPLE_RATE * 4 / 10');
+    expect(androidWindow).toContain('VAD_PAUSE = SAMPLE_RATE * 7 / 10');
+    expect(androidWindow).toContain('WARMUP_SAMPLES = 320');
+    expect(androidWindow).toContain('AUDIO_LEVEL_INTERVAL_NS = 50_000_000L');
 
     expect(ios).toContain('import Qwen3ASR');
     expect(ios).toContain('import Metal');
@@ -215,6 +240,25 @@ describe('Qwen3-ASR mobile assets', () => {
   });
   it('compiles and executes the production Android plugin through cold/warm/stop/segmentation/overflow/destroy', async () => {
     await setup(); const srcDir = join(root, 'src'), classesDir = join(root, 'classes'); await mkdir(classesDir, { recursive: true });
+    const minimalVocabJson = JSON.stringify({
+      '<|endoftext|>': 0, '<|im_start|>': 1, '<|im_end|>': 2, '<|audio_start|>': 3, '<|audio_end|>': 4, '<|audio_pad|>': 5, '<asr_text>': 6,
+      'language': 7, '\u0120English': 8, 'Hello': 9, '.': 10, '\u0120': 11, '\u010a': 12,
+      ...Object.fromEntries(Array.from({ length: 16 }, (_, i) => [`word${String(i).padStart(3, '0')}`, 13 + i])),
+      ...Object.fromEntries('abcdefghijklmnopqrstuvwxyz'.split('').map((ch, idx) => [ch, 29 + idx])),
+    });
+    const minimalConfigJson = JSON.stringify({
+      eos_token: '<|im_end|>',
+      pad_token: '<|endoftext|>',
+      added_tokens_decoder: {
+        '0': { content: '<|endoftext|>', special: true },
+        '1': { content: '<|im_start|>', special: true },
+        '2': { content: '<|im_end|>', special: true },
+        '3': { content: '<|audio_start|>', special: true },
+        '4': { content: '<|audio_end|>', special: true },
+        '5': { content: '<|audio_pad|>', special: true },
+        '6': { content: '<asr_text>', special: true },
+      },
+    });
     const files: Record<string, string> = {
       'android/Manifest.java': `package android; public class Manifest { public static class permission { public static final String RECORD_AUDIO="mic"; } }`,
       'android/media/AudioFormat.java': `package android.media; public class AudioFormat { public static final int CHANNEL_IN_MONO=1, ENCODING_PCM_16BIT=2; }`,
@@ -301,17 +345,27 @@ public class AudioRecord {
     if (remaining > 0) {
       remaining--;
       if (labelledWords) {
-        int halfPeriod = 4 + (deliveredVoiced / 15);
-        for (int i = 0; i < out.length; i++) {
-          out[i] = ((i / halfPeriod) % 2 == 0) ? (short) 1000 : (short) -1000;
+        int id = deliveredVoiced / 30;
+        int chunkInWord = deliveredVoiced % 30;
+        if (chunkInWord >= 27) {
+          java.util.Arrays.fill(out, off, off + n, (short) 0);
+        } else {
+          double freq = 400.0 + id * 400.0;
+          long baseSample = (long) deliveredVoiced * n;
+          for (int i = 0; i < n; i++) {
+            out[off + i] = (short) Math.round(8000.0 * Math.sin(2.0 * Math.PI * freq * (baseSample + i) / 16000.0));
+          }
         }
       } else {
-        java.util.Arrays.fill(out, (short) 1000);
+        long baseSample = (long) deliveredVoiced * n;
+        for (int i = 0; i < n; i++) {
+          out[off + i] = (short) Math.round(4000.0 * Math.sin(2.0 * Math.PI * 440.0 * (baseSample + i) / 16000.0));
+        }
       }
       deliveredVoiced++;
     } else {
       silentRemaining--;
-      java.util.Arrays.fill(out, (short) 0);
+      java.util.Arrays.fill(out, off, off + n, (short) 0);
     }
     delivered.countDown(); return n;
   }
@@ -333,87 +387,366 @@ public class Plugin {
   public Context getContext(){ return new Context(); }
   public Activity getActivity(){ return new Activity(); }
   public static class Context { public Assets getAssets(){ return new Assets(); } public java.io.File getNoBackupFilesDir(){ return new java.io.File(System.getProperty("java.io.tmpdir"),"speech-private"); } }
-  public static class Assets { public java.io.InputStream open(String path) throws java.io.IOException { return new java.io.ByteArrayInputStream(path.equals("hotwords.txt") ? new byte[0] : new byte[]{1}); } }
+  public static class Assets {
+    private static final String VOCAB_JSON = ${JSON.stringify(minimalVocabJson)};
+    private static final String CONFIG_JSON = ${JSON.stringify(minimalConfigJson)};
+    public java.io.InputStream open(String path) throws java.io.IOException {
+      byte[] bytes;
+      if (path.equals("hotwords.txt")) bytes = new byte[0];
+      else if (path.equals("tokenizer/vocab.json")) bytes = VOCAB_JSON.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+      else if (path.equals("tokenizer/merges.txt")) bytes = "#version: 0.2\\n".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+      else if (path.equals("tokenizer/tokenizer_config.json")) bytes = CONFIG_JSON.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+      else bytes = new byte[]{1};
+      return new java.io.ByteArrayInputStream(bytes);
+    }
+  }
   public static class Activity { public androidx.lifecycle.Lifecycle getLifecycle(){ return new androidx.lifecycle.Lifecycle(); } }
 }`,
       'com/getcapacitor/PluginMethod.java': `package com.getcapacitor; public @interface PluginMethod{}`,
       'com/getcapacitor/annotation/CapacitorPlugin.java': `package com.getcapacitor.annotation; public @interface CapacitorPlugin{ String name(); Permission[] permissions(); }`,
       'com/getcapacitor/annotation/Permission.java': `package com.getcapacitor.annotation; public @interface Permission{ String alias(); String[] strings(); }`,
       'com/getcapacitor/annotation/PermissionCallback.java': `package com.getcapacitor.annotation; public @interface PermissionCallback{}`,
-      'com/k2fsa/sherpa/onnx/OfflineRecognizerConfig.java': `package com.k2fsa.sherpa.onnx;
-public class OfflineRecognizerConfig {
-  private final Model model=new Model(); public Model getModelConfig(){return model;}
-  public static class Model { public void setNumThreads(int n){if(n!=4)throw new AssertionError();} public String provider; public void setProvider(String p){provider=p;} public Qwen getQwen3Asr(){return new Qwen();} }
-  public static class Qwen { public void setConvFrontend(String p){} public void setEncoder(String p){} public void setDecoder(String p){} public void setTokenizer(String p){} public void setMaxTotalLen(int n){if(n!=768)throw new AssertionError();} public void setMaxNewTokens(int n){} public void setTemperature(float n){} public void setTopP(float n){} public void setSeed(int n){} public void setHotwords(String s){if(!s.isEmpty())throw new AssertionError(s);} }
+      'ai/onnxruntime/OrtException.java': `package ai.onnxruntime; public class OrtException extends Exception { public OrtException(String msg){ super(msg); } }`,
+      'ai/onnxruntime/OrtLoggingLevel.java': `package ai.onnxruntime; public enum OrtLoggingLevel { ORT_LOGGING_LEVEL_ERROR }`,
+      'ai/onnxruntime/OnnxJavaType.java': `package ai.onnxruntime; public enum OnnxJavaType { FLOAT, FLOAT16, INT16, INT64, BOOL, UINT8 }`,
+      'ai/onnxruntime/OnnxValue.java': `package ai.onnxruntime; public interface OnnxValue extends AutoCloseable { @Override default void close() {} }`,
+      'ai/onnxruntime/TensorInfo.java': `package ai.onnxruntime;
+public class TensorInfo {
+  public final OnnxJavaType type;
+  public final long[] shape;
+  public TensorInfo(OnnxJavaType type, long[] shape){ this.type=type; this.shape=shape; }
+  public long[] getShape(){ return shape; }
+  public long getNumElements(){ long p=1; for(long s:shape) p*=s; return p; }
 }`,
-      'com/k2fsa/sherpa/onnx/OfflineStream.java': `package com.k2fsa/sherpa/onnx;`.replace(/\//g, '.').replace('package com.k2fsa.sherpa.onnx.;', 'package com.k2fsa.sherpa.onnx;') + `
-public class OfflineStream {
-  public float[] samples;
-  public static int created=0,released=0,maxSamples=0;
-  public static volatile float[] lastAcceptedSamples;
-  public static final java.util.List<Integer> acceptedLengths=java.util.Collections.synchronizedList(new java.util.ArrayList<>());
-  public OfflineStream(){created++;}
-  public void acceptWaveform(float[] s,int rate){
-    if(samples!=null||rate!=16000)throw new AssertionError();
-    samples=s;
-    lastAcceptedSamples=s;
-    acceptedLengths.add(s.length);
-    maxSamples=Math.max(maxSamples,s.length);
+      'ai/onnxruntime/NodeInfo.java': `package ai.onnxruntime;
+public class NodeInfo {
+  private final TensorInfo info;
+  public NodeInfo(TensorInfo info){ this.info=info; }
+  public TensorInfo getInfo(){ return info; }
+}`,
+      'ai/onnxruntime/OnnxTensor.java': `package ai.onnxruntime;
+import java.nio.*;
+import java.util.concurrent.atomic.AtomicInteger;
+public class OnnxTensor implements OnnxValue {
+  public static final AtomicInteger created = new AtomicInteger(0);
+  public static final AtomicInteger released = new AtomicInteger(0);
+  private final TensorInfo info;
+  private final ByteBuffer raw;
+  private boolean closed = false;
+  private OnnxTensor(TensorInfo info, ByteBuffer raw){ this.info=info; this.raw=raw; created.incrementAndGet(); }
+  public static OnnxTensor createTensor(OrtEnvironment env, FloatBuffer data, long[] shape){
+    FloatBuffer dup = data.duplicate();
+    ByteBuffer bb = ByteBuffer.allocateDirect(dup.remaining()*4).order(ByteOrder.nativeOrder());
+    bb.asFloatBuffer().put(dup);
+    return new OnnxTensor(new TensorInfo(OnnxJavaType.FLOAT, shape), bb);
   }
-  public void release(){released++;}
+  public static OnnxTensor createTensor(OrtEnvironment env, LongBuffer data, long[] shape){
+    LongBuffer dup = data.duplicate();
+    ByteBuffer bb = ByteBuffer.allocateDirect(dup.remaining()*8).order(ByteOrder.nativeOrder());
+    bb.asLongBuffer().put(dup);
+    return new OnnxTensor(new TensorInfo(OnnxJavaType.INT64, shape), bb);
+  }
+  public static OnnxTensor createTensor(OrtEnvironment env, ByteBuffer data, long[] shape, OnnxJavaType type){
+    ByteBuffer dup = data.duplicate().order(ByteOrder.nativeOrder());
+    return new OnnxTensor(new TensorInfo(type, shape), dup);
+  }
+  public static OnnxTensor createTensor(OrtEnvironment env, boolean[][] data){
+    int rows = data.length, cols = rows > 0 ? data[0].length : 0;
+    ByteBuffer bb = ByteBuffer.allocateDirect(rows * cols).order(ByteOrder.nativeOrder());
+    for (boolean[] row : data) for (boolean v : row) bb.put((byte)(v ? 1 : 0));
+    bb.clear();
+    return new OnnxTensor(new TensorInfo(OnnxJavaType.BOOL, new long[]{rows, cols}), bb);
+  }
+  public TensorInfo getInfo(){ return info; }
+  public ByteBuffer getByteBuffer(){ ByteBuffer dup = raw.duplicate().order(ByteOrder.nativeOrder()); dup.rewind(); return dup; }
+  public FloatBuffer getFloatBuffer(){ return getByteBuffer().asFloatBuffer(); }
+  public ShortBuffer getShortBuffer(){ return getByteBuffer().asShortBuffer(); }
+  public LongBuffer getLongBuffer(){ return getByteBuffer().asLongBuffer(); }
+  @Override public synchronized void close(){ if(!closed){ closed=true; released.incrementAndGet(); } }
 }`,
-      'com/k2fsa/sherpa/onnx/OfflineRecognizer.java': `package com.k2fsa.sherpa.onnx;
-public class OfflineRecognizer {
- public static java.util.concurrent.CountDownLatch entered=new java.util.concurrent.CountDownLatch(1),release=new java.util.concurrent.CountDownLatch(1),decoded=new java.util.concurrent.CountDownLatch(1);
- public static volatile int attempts=0,creations=0,releases=0; public static volatile int lastSamples=0; public static volatile boolean holdDecode=false; public static java.util.concurrent.CountDownLatch decoding=new java.util.concurrent.CountDownLatch(1),decodeRelease=new java.util.concurrent.CountDownLatch(1);
- public OfflineRecognizer(Object assets,OfflineRecognizerConfig config){if(assets!=null)throw new AssertionError("external weights require files");
- if(config.getModelConfig().provider.equals("nnapi")) {
-  attempts++;
-  String failure=System.getProperty("nnapiFailure", "none");
-  if(failure.equals("runtime"))throw new IllegalArgumentException("EP rejected");
-  if(failure.equals("linkage"))throw new UnsatisfiedLinkError("EP unavailable");
- } else if(!config.getModelConfig().provider.equals("cpu"))throw new AssertionError("unexpected provider");
- creations++;entered.countDown();try{release.await();}catch(InterruptedException e){throw new RuntimeException(e);}}
- public OfflineStream createStream(){return new OfflineStream();}
- public void decode(OfflineStream stream){lastSamples=stream.samples.length;decoded.countDown();if(holdDecode){decoding.countDown();try{decodeRelease.await();}catch(InterruptedException e){throw new RuntimeException(e);}}}
- public Result getResult(OfflineStream stream){
-  if (android.media.AudioRecord.labelledWords && stream.samples != null) {
-   StringBuilder sb = new StringBuilder();
-   int prev = -1;
-   for (int base = 0; base + 1600 <= stream.samples.length; base += 1600) {
-    int limit = base + 1580;
-    int i = base + 20;
-    while (i < limit && stream.samples[i] >= -1e-4f) i++;
-    while (i < limit && stream.samples[i] <= 1e-4f) i++;
-    int run = 0;
-    while (i < limit && stream.samples[i] > 1e-4f) { run++; i++; }
-    if (i >= limit || stream.samples[i] >= -1e-4f || run < 4) continue;
-    int id = run - 4;
-    if (id != prev) {
-     if (sb.length() > 0) sb.append(' ');
-     sb.append(String.format("word%03d", id));
-     prev = id;
+      'ai/onnxruntime/OrtSession.java': `package ai.onnxruntime;
+import java.nio.*;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+public class OrtSession implements AutoCloseable {
+  public enum Role { CONV, ENCODER, DECODER }
+  public static volatile CountDownLatch initEntered = null;
+  public static volatile CountDownLatch initRelease = null;
+  public static volatile CountDownLatch decoded = new CountDownLatch(1);
+  public static volatile boolean holdDecode = false;
+  public static volatile CountDownLatch decoding = new CountDownLatch(1);
+  public static volatile CountDownLatch decodeRelease = new CountDownLatch(1);
+  public static volatile int lastConvMelFrames = 0;
+  public static volatile int maxConvMelFrames = 0;
+  public static final List<Integer> convMelFrames = Collections.synchronizedList(new ArrayList<>());
+  public static final AtomicInteger closes = new AtomicInteger(0);
+  public static final AtomicInteger observedNonEmptyPrefixes = new AtomicInteger(0);
+
+  public static class SessionOptions implements AutoCloseable {
+    public enum OptLevel { ALL_OPT }
+    public OptLevel optLevel;
+    public int intraThreads;
+    public void setOptimizationLevel(OptLevel lvl){ this.optLevel = lvl; }
+    public void setIntraOpNumThreads(int n){ if (n != 4) throw new AssertionError("expected 4 threads, got "+n); this.intraThreads = n; }
+    @Override public void close(){}
+  }
+
+  public static class Result implements AutoCloseable {
+    public static final AtomicInteger created = new AtomicInteger(0);
+    public static final AtomicInteger released = new AtomicInteger(0);
+    private final Map<String, OnnxValue> map;
+    private boolean closed = false;
+    public Result(Map<String, OnnxValue> map){ this.map = map; created.incrementAndGet(); }
+    public Optional<OnnxValue> get(String name){ return Optional.ofNullable(map.get(name)); }
+    @Override public synchronized void close(){
+      if (!closed) {
+        closed = true;
+        released.incrementAndGet();
+        for (OnnxValue v : map.values()) { try { v.close(); } catch (Exception ignored) {} }
+      }
     }
-   }
-   return new Result(sb.toString());
   }
-  return new Result("你好 Hello.");
- }
- public static class Result { private final String text; public Result(String t){this.text=t;} public String getText(){return text;}}
- public void release(){releases++;}
+
+  private final Role role;
+  private final OnnxJavaType dtype;
+  private int[] plannedTokens = new int[0];
+  private int cursor = 0;
+  private boolean closed = false;
+
+  public OrtSession(Role role, OnnxJavaType dtype){ this.role = role; this.dtype = dtype; }
+
+  public Set<String> getInputNames(){
+    return role == Role.CONV ? Collections.singleton("input_features") : Collections.emptySet();
+  }
+  public Set<String> getOutputNames(){
+    if (role == Role.CONV) return Collections.singleton("conv_output");
+    if (role == Role.ENCODER) return Collections.singleton("audio_features");
+    Set<String> outs = new LinkedHashSet<>();
+    outs.add("logits");
+    for (int i = 0; i < 2; i++) { outs.add("key_delta_" + i); outs.add("value_delta_" + i); }
+    return outs;
+  }
+  public Map<String, NodeInfo> getInputInfo(){
+    Map<String, NodeInfo> info = new LinkedHashMap<>();
+    if (role == Role.ENCODER) {
+      info.put("conv_output", new NodeInfo(new TensorInfo(OnnxJavaType.FLOAT, new long[]{1, -1, 8})));
+      info.put("feature_attention_mask", new NodeInfo(new TensorInfo(OnnxJavaType.BOOL, new long[]{1, -1})));
+    } else if (role == Role.DECODER) {
+      info.put("audio_features", new NodeInfo(new TensorInfo(dtype, new long[]{1, -1, 8})));
+      for (int i = 0; i < 2; i++) {
+        info.put("cache_key_" + i, new NodeInfo(new TensorInfo(dtype, new long[]{1, 768, 2, 4})));
+        info.put("cache_value_" + i, new NodeInfo(new TensorInfo(dtype, new long[]{1, 768, 2, 4})));
+      }
+    }
+    return info;
+  }
+
+  private static double hzToMel(double hz){ return hz < 1000.0 ? 3.0*hz/200.0 : 15.0 + Math.log(hz/1000.0)*(27.0/Math.log(6.4)); }
+  private static int[] extractWordIdsFromMel(float[] mel, int frames){
+    double melMax = hzToMel(8000.0);
+    double[] expectedBin = new double[14];
+    for (int id = 0; id < 14; id++) expectedBin[id] = (hzToMel(400.0 + id * 400.0) / melMax) * 129.0 - 1.0;
+    List<Integer> rawIds = new ArrayList<>();
+    for (int f = 0; f < frames; f++) {
+      int off = f * 128;
+      int bestBin = 0;
+      float bestVal = Float.NEGATIVE_INFINITY, minVal = Float.POSITIVE_INFINITY;
+      for (int m = 0; m < 128; m++) {
+        float v = mel[off + m];
+        if (v > bestVal) { bestVal = v; bestBin = m; }
+        if (v < minVal) minVal = v;
+      }
+      if (bestVal - minVal < 0.25f) continue; // silent tail frame
+      int bestId = -1; double bestDist = Double.POSITIVE_INFINITY;
+      for (int id = 0; id < 14; id++) {
+        double d = Math.abs(bestBin - expectedBin[id]);
+        if (d < bestDist) { bestDist = d; bestId = id; }
+      }
+      if (bestDist <= 3.0) rawIds.add(bestId);
+    }
+    // Run-length filter >= 8 consecutive frames to avoid boundary straddle glitches.
+    List<Integer> stable = new ArrayList<>();
+    for (int i = 0; i < rawIds.size(); ) {
+      int id = rawIds.get(i), j = i;
+      while (j < rawIds.size() && rawIds.get(j) == id) j++;
+      if ((j - i) >= 8 && (stable.isEmpty() || stable.get(stable.size() - 1) != id)) stable.add(id);
+      i = j;
+    }
+    int[] arr = new int[stable.size()];
+    for (int i = 0; i < arr.length; i++) arr[i] = stable.get(i);
+    return arr;
+  }
+
+  private static short f2h(float val){
+    int bits = Float.floatToRawIntBits(val);
+    int sign = (bits >>> 16) & 0x8000;
+    int exp = ((bits >>> 23) & 0xFF) - 127 + 15;
+    int mant = bits & 0x007FFFFF;
+    if (exp <= 0) return (short) sign;
+    if (exp >= 31) return (short) (sign | 0x7C00);
+    return (short) (sign | (exp << 10) | (mant >>> 13));
+  }
+  private static float h2f(short halfBits){
+    int h = halfBits & 0xFFFF;
+    int sign = (h & 0x8000) << 16;
+    int exp = (h & 0x7C00) >>> 10;
+    int mant = h & 0x03FF;
+    if (exp == 0) return mant == 0 ? Float.intBitsToFloat(sign) : 0.0f;
+    return Float.intBitsToFloat(sign | ((exp + 112) << 23) | (mant << 13));
+  }
+
+  public Result run(Map<String, OnnxTensor> inputs) throws OrtException {
+    if (role == Role.CONV) {
+      OnnxTensor in = inputs.get("input_features");
+      long[] shape = in.getInfo().getShape();
+      int frames = (int) shape[1];
+      lastConvMelFrames = frames;
+      maxConvMelFrames = Math.max(maxConvMelFrames, frames);
+      convMelFrames.add(frames);
+      FloatBuffer fb = in.getFloatBuffer();
+      float[] mel = new float[fb.remaining()];
+      fb.get(mel);
+      int outFrames = Math.max(1, (frames / 100) * 13 + ((frames % 100) == 0 ? 0 : (((frames % 100) - 1) / 8 + 1)));
+      float[] convOut = new float[outFrames * 8];
+      if (android.media.AudioRecord.labelledWords) {
+        int[] ids = extractWordIdsFromMel(mel, frames);
+        int count = Math.min(ids.length, Math.max(0, outFrames - 1));
+        convOut[0] = count;
+        for (int i = 0; i < count; i++) convOut[(i + 1) * 8] = 100.0f + ids[i];
+      } else {
+        convOut[0] = -1.0f;
+      }
+      OnnxTensor outT = OnnxTensor.createTensor(OrtEnvironment.getEnvironment(OrtLoggingLevel.ORT_LOGGING_LEVEL_ERROR, ""), FloatBuffer.wrap(convOut), new long[]{1, outFrames, 8});
+      return new Result(Collections.singletonMap("conv_output", outT));
+    }
+    if (role == Role.ENCODER) {
+      OnnxTensor conv = inputs.get("conv_output");
+      long[] cShape = conv.getInfo().getShape();
+      int frames = (int) cShape[1];
+      FloatBuffer fb = conv.getFloatBuffer();
+      float[] enc = new float[frames * 8];
+      fb.get(enc);
+      for (int f = 0; f < frames; f++) {
+        // Ensure every frame passes countNonSilentFrames energy threshold without overwriting channel 0 metadata.
+        enc[f * 8 + 7] = 1.0f;
+      }
+      OnnxTensor encT = OnnxTensor.createTensor(OrtEnvironment.getEnvironment(OrtLoggingLevel.ORT_LOGGING_LEVEL_ERROR, ""), FloatBuffer.wrap(enc), new long[]{1, frames, 8});
+      return new Result(Collections.singletonMap("audio_features", encT));
+    }
+    // DECODER
+    OnnxTensor idsTensor = inputs.get("input_ids");
+    long[] idShape = idsTensor.getInfo().getShape();
+    int seqLen = (int) idShape[1];
+    if (seqLen > 1) {
+      // Prefill pass: determine full target tokens from audio_features metadata, align after prefixTokens.
+      decoded.countDown();
+      if (holdDecode) {
+        decoding.countDown();
+        try { decodeRelease.await(); } catch (InterruptedException e) { throw new RuntimeException(e); }
+      }
+      OnnxTensor af = inputs.get("audio_features");
+      int nElems = (int) af.getInfo().getNumElements();
+      float[] afVals = new float[nElems];
+      if (af.getInfo().type == OnnxJavaType.FLOAT16) {
+        ShortBuffer sb = af.getShortBuffer();
+        for (int i = 0; i < nElems; i++) afVals[i] = h2f(sb.get(i));
+      } else {
+        af.getFloatBuffer().get(afVals);
+      }
+      if (afVals.length > 0 && afVals[0] >= 0.0f) {
+        int count = Math.min(Math.round(afVals[0]), Math.max(0, (afVals.length / 8) - 1));
+        List<Integer> seq = new ArrayList<>();
+        seq.add(7); seq.add(8); seq.add(6); // language English <asr_text>
+        for (int i = 0; i < count; i++) {
+          if (i > 0) seq.add(11); // space
+          int wId = Math.round(afVals[(i + 1) * 8]) - 100;
+          seq.add(13 + wId);
+        }
+        seq.add(2); // EOS
+        plannedTokens = new int[seq.size()];
+        for (int i = 0; i < plannedTokens.length; i++) plannedTokens[i] = seq.get(i);
+      } else {
+        plannedTokens = new int[] { 7, 8, 6, 9, 10, 2 }; // language English <asr_text> Hello . <eos>
+      }
+      LongBuffer lb = idsTensor.getLongBuffer();
+      int prefixCount = 0;
+      for (int i = 0; i < seqLen; i++) {
+        if (lb.get(i) == 6L) {
+          // Prefix after <asr_text> (which itself is index 2 in plannedTokens)
+          prefixCount = 3 + (seqLen - 1 - i);
+          if (seqLen - 1 - i > 0) observedNonEmptyPrefixes.incrementAndGet();
+          break;
+        }
+      }
+      cursor = prefixCount;
+    }
+    int nextTok = (cursor < plannedTokens.length) ? plannedTokens[cursor++] : 2;
+    int vocab = 64;
+    int lastStep = seqLen - 1;
+    OrtEnvironment env = OrtEnvironment.getEnvironment(OrtLoggingLevel.ORT_LOGGING_LEVEL_ERROR, "");
+    OnnxTensor logitsT;
+    if (dtype == OnnxJavaType.FLOAT16) {
+      ByteBuffer bb = ByteBuffer.allocateDirect(seqLen * vocab * 2).order(ByteOrder.nativeOrder());
+      ShortBuffer sb = bb.asShortBuffer();
+      for (int s = 0; s < seqLen; s++) {
+        for (int v = 0; v < vocab; v++) {
+          sb.put((s == lastStep && v == nextTok) ? f2h(10.0f) : f2h(-10.0f));
+        }
+      }
+      logitsT = OnnxTensor.createTensor(env, bb, new long[]{1, seqLen, vocab}, OnnxJavaType.FLOAT16);
+    } else {
+      float[] logits = new float[seqLen * vocab];
+      Arrays.fill(logits, -10.0f);
+      logits[lastStep * vocab + nextTok] = 10.0f;
+      logitsT = OnnxTensor.createTensor(env, FloatBuffer.wrap(logits), new long[]{1, seqLen, vocab});
+    }
+    Map<String, OnnxValue> resMap = new LinkedHashMap<>();
+    resMap.put("logits", logitsT);
+    int elemBytes = (dtype == OnnxJavaType.FLOAT16) ? 2 : 4;
+    for (int l = 0; l < 2; l++) {
+      ByteBuffer dk = ByteBuffer.allocateDirect(seqLen * 2 * 4 * elemBytes).order(ByteOrder.nativeOrder());
+      ByteBuffer dv = ByteBuffer.allocateDirect(seqLen * 2 * 4 * elemBytes).order(ByteOrder.nativeOrder());
+      resMap.put("key_delta_" + l, OnnxTensor.createTensor(env, dk, new long[]{1, seqLen, 2, 4}, dtype));
+      resMap.put("value_delta_" + l, OnnxTensor.createTensor(env, dv, new long[]{1, seqLen, 2, 4}, dtype));
+    }
+    return new Result(resMap);
+  }
+
+  @Override public synchronized void close(){ if (!closed){ closed=true; closes.incrementAndGet(); } }
 }`,
-      'Harness.java': `import com.imcodes.speech.StreamingSpeechPlugin; import com.imcodes.speech.SpeechGainTest; import com.getcapacitor.PluginCall; import com.k2fsa.sherpa.onnx.*; import android.media.AudioRecord; import android.media.MediaRecorder; import android.media.audiofx.AutomaticGainControl; import java.util.concurrent.*;
+      'ai/onnxruntime/OrtEnvironment.java': `package ai.onnxruntime;
+import java.util.concurrent.atomic.AtomicInteger;
+public class OrtEnvironment {
+  private static final OrtEnvironment INSTANCE = new OrtEnvironment();
+  public static final AtomicInteger sessionCreations = new AtomicInteger(0);
+  public static OrtEnvironment getEnvironment(OrtLoggingLevel lvl, String name){ return INSTANCE; }
+  public OrtSession createSession(String path, OrtSession.SessionOptions opts) throws OrtException {
+    if (opts == null || opts.optLevel != OrtSession.SessionOptions.OptLevel.ALL_OPT || opts.intraThreads != 4) {
+      throw new AssertionError("SessionOptions must set ALL_OPT and 4 threads");
+    }
+    if (path.endsWith("conv_frontend.onnx")) {
+      if (OrtSession.initEntered != null) OrtSession.initEntered.countDown();
+      if (OrtSession.initRelease != null) {
+        try { OrtSession.initRelease.await(); } catch (InterruptedException e) { throw new RuntimeException(e); }
+      }
+      sessionCreations.incrementAndGet();
+      return new OrtSession(OrtSession.Role.CONV, OnnxJavaType.valueOf(System.getProperty("ortDtype", "FLOAT")));
+    }
+    if (path.endsWith("encoder.int4.onnx")) {
+      sessionCreations.incrementAndGet();
+      return new OrtSession(OrtSession.Role.ENCODER, OnnxJavaType.valueOf(System.getProperty("ortDtype", "FLOAT")));
+    }
+    sessionCreations.incrementAndGet();
+    return new OrtSession(OrtSession.Role.DECODER, OnnxJavaType.valueOf(System.getProperty("ortDtype", "FLOAT")));
+  }
+}`,
+      'Harness.java': `import com.imcodes.speech.StreamingSpeechPlugin; import com.imcodes.speech.SpeechGainTest; import com.getcapacitor.PluginCall; import ai.onnxruntime.*; import android.media.AudioRecord; import android.media.MediaRecorder; import android.media.audiofx.AutomaticGainControl; import java.util.concurrent.*;
 public class Harness {
  static class Subject extends StreamingSpeechPlugin {void destroy(){handleOnDestroy();}}
  static void await(CountDownLatch l)throws Exception{if(!l.await(4,TimeUnit.SECONDS))throw new AssertionError("timeout");}
  static void check(boolean b,Object message){if(!b)throw new AssertionError(message);}
  static long finals(Subject p){return p.events.stream().filter(x->x.contains("isFinal=true")).count();}
- static boolean hasTrailingZeroFlush(float[] s, int voicedCount) {
-  if (s == null || s.length != voicedCount + 3200) return false;
-  for (int i = 0; i < voicedCount; i++) if (s[i] == 0.0f) return false;
-  for (int i = voicedCount; i < s.length; i++) if (s[i] != 0.0f) return false;
-  return true;
- }
  public static void main(String[] args)throws Exception {
   Subject p=new Subject();
   // Empty optional bias is available; stale cached nonempty bias is replaced.
@@ -422,42 +755,45 @@ public class Harness {
   PluginCall available=new PluginCall();p.available(available);await(available.done);
   check(available.value.contains("available=true"),available.value);
   try {
-   p.load();await(OfflineRecognizer.entered);
-   check(cache.length()==0,"stale hotwords cache survived");
+   p.load();
    PluginCall start=new PluginCall();p.start(start);await(start.done);await(AudioRecord.delivered);
-   PluginCall stop=new PluginCall();p.stop(stop);OfflineRecognizer.release.countDown();await(stop.done);
-   check(OfflineRecognizer.lastSamples==1600+3200,"expected 1600+3200 final samples, got "+OfflineRecognizer.lastSamples);
-   check(hasTrailingZeroFlush(OfflineStream.lastAcceptedSamples, 1600),"final decode missing exact 3200 zero flush");
+   PluginCall stop=new PluginCall();p.stop(stop);await(stop.done);
+   check(cache.length()==0,"stale hotwords cache survived");
+   // 1 chunk (800) - 320 warmup + 3200 tail silence = 3680 samples -> floor(3680/160) = 23 mel frames
+   check(OrtSession.lastConvMelFrames==23,"expected 23 mel frames (3680 samples), got "+OrtSession.lastConvMelFrames);
    check(finals(p)==1,p.events);check(p.events.get(p.events.size()-1).contains("status=stopped"),p.events);
    System.out.println("COLD_STOP_OK");
-   p.events.clear();OfflineStream.acceptedLengths.clear();AudioRecord.chunksPerStart=18;OfflineRecognizer.decoded=new CountDownLatch(1);
-   p.start(new PluginCall());await(OfflineRecognizer.decoded);await(AudioRecord.delivered);PluginCall stop2=new PluginCall();p.stop(stop2);await(stop2.done);
-   check(OfflineRecognizer.creations==1,p.events);check(OfflineRecognizer.attempts==1,"NNAPI attempted again on warm reuse");check(finals(p)==1,p.events);check(p.events.stream().anyMatch(x->x.contains("isFinal=false")),p.events);System.out.println("WARM_REUSE_OK");
-   p.events.clear();OfflineStream.acceptedLengths.clear();OfflineStream.maxSamples=0;AudioRecord.chunksPerStart=55;OfflineRecognizer.holdDecode=true;
-   OfflineRecognizer.decoding=new CountDownLatch(1);OfflineRecognizer.decodeRelease=new CountDownLatch(1);
-   p.start(new PluginCall());await(OfflineRecognizer.decoding);await(AudioRecord.delivered);
+   p.events.clear();OrtSession.convMelFrames.clear();AudioRecord.chunksPerStart=35;OrtSession.decoded=new CountDownLatch(1);
+   p.start(new PluginCall());await(OrtSession.decoded);await(AudioRecord.delivered);PluginCall stop2=new PluginCall();p.stop(stop2);await(stop2.done);
+   check(OrtEnvironment.sessionCreations.get()==3,"expected warm decoder reuse (3 sessions total), got "+OrtEnvironment.sessionCreations.get());
+   check(finals(p)==1,p.events);check(p.events.stream().anyMatch(x->x.contains("isFinal=false")),p.events);System.out.println("WARM_REUSE_OK");
+   p.events.clear();OrtSession.convMelFrames.clear();OrtSession.maxConvMelFrames=0;AudioRecord.chunksPerStart=100;OrtSession.holdDecode=true;
+   OrtSession.decoding=new CountDownLatch(1);OrtSession.decodeRelease=new CountDownLatch(1);
+   p.start(new PluginCall());await(OrtSession.decoding);await(AudioRecord.delivered);
    PluginCall drainedStop=new PluginCall();p.stop(drainedStop);
    check(drainedStop.done.getCount()==1,"stop overtook in-flight decode");
-   OfflineRecognizer.decodeRelease.countDown();await(drainedStop.done);OfflineRecognizer.holdDecode=false;
-   check(OfflineStream.maxSamples<=72000+3200,"stop drain exceeded bounded 4.5s capacity: "+OfflineStream.maxSamples);
-   check(hasTrailingZeroFlush(OfflineStream.lastAcceptedSamples, 40000),"final bounded window missing 3200 zero flush");
+   OrtSession.decodeRelease.countDown();await(drainedStop.done);OrtSession.holdDecode=false;
+   check(OrtSession.maxConvMelFrames<=(216000+3200)/160,"stop drain exceeded bounded capacity frames: "+OrtSession.maxConvMelFrames);
    check(finals(p)==1,p.events);System.out.println("SINGLE_TAIL_DRAIN_OK");
-   p.events.clear();AudioRecord.chunksPerStart=15;AudioRecord.silentChunksPerStart=6;OfflineRecognizer.decoded=new CountDownLatch(1);
-   p.start(new PluginCall());await(OfflineRecognizer.decoded);await(AudioRecord.delivered);PluginCall stop3=new PluginCall();p.stop(stop3);await(stop3.done);
-   check(p.events.stream().filter(x->x.contains("isFinal=true")).anyMatch(x->x.contains("你好 Hello.")&&!x.contains("你好 Hello.你好")),p.events);System.out.println("SILENCE_SEGMENT_OK");
-   p.events.clear();OfflineStream.acceptedLengths.clear();OfflineStream.maxSamples=0;
-   AudioRecord.labelledWords=true;AudioRecord.chunksPerStart=205;AudioRecord.silentChunksPerStart=0;OfflineRecognizer.decoded=new CountDownLatch(1);
+   p.events.clear();AudioRecord.chunksPerStart=32;AudioRecord.silentChunksPerStart=15;OrtSession.decoded=new CountDownLatch(1);
+   p.start(new PluginCall());await(OrtSession.decoded);await(AudioRecord.delivered);PluginCall stop3=new PluginCall();p.stop(stop3);await(stop3.done);
+   check(p.events.stream().filter(x->x.contains("isFinal=true")).anyMatch(x->x.contains("Hello.")&&!x.contains("Hello.Hello")),p.events);System.out.println("SILENCE_SEGMENT_OK");
+   p.events.clear();OrtSession.convMelFrames.clear();OrtSession.maxConvMelFrames=0;OrtSession.observedNonEmptyPrefixes.set(0);
+   AudioRecord.labelledWords=true;AudioRecord.chunksPerStart=420;AudioRecord.silentChunksPerStart=0;OrtSession.decoded=new CountDownLatch(1);
    p.start(new PluginCall());await(AudioRecord.delivered);PluginCall stop4=new PluginCall();p.stop(stop4);await(stop4.done);
    AudioRecord.labelledWords=false;
-   check(OfflineStream.maxSamples>=48000 && OfflineStream.maxSamples<=72000+3200,"window capacity violated: "+OfflineStream.maxSamples);
-   for (int idx=0; idx<OfflineStream.acceptedLengths.size()-1; idx++) {
-    check(OfflineStream.acceptedLengths.get(idx)<=72000, "live/intermediate window exceeded 72000: "+OfflineStream.acceptedLengths.get(idx));
+   check(OrtSession.maxConvMelFrames>=300 && OrtSession.maxConvMelFrames<=(216000+3200)/160,"window capacity frames violated: "+OrtSession.maxConvMelFrames);
+   for (int idx=0; idx<OrtSession.convMelFrames.size()-1; idx++) {
+    check(OrtSession.convMelFrames.get(idx)<=(216000+3200)/160, "intermediate window exceeded 13.5s+pad frames: "+OrtSession.convMelFrames.get(idx));
    }
+   check(OrtSession.observedNonEmptyPrefixes.get()>0,"expected non-empty rollback prefixTokens to reach decoder");
    check(finals(p)==1,p.events);
    StringBuilder expectedWords = new StringBuilder();
    for (int w=0; w<=13; w++) { if (w>0) expectedWords.append(' '); expectedWords.append(String.format("word%03d", w)); }
    check(p.events.stream().filter(x->x.contains("isFinal=true")).anyMatch(x->x.contains(expectedWords.toString())),p.events);
-   check(OfflineStream.created==OfflineStream.released,p.events);System.out.println("WINDOW_AND_RELEASE_OK");
+   check(OnnxTensor.created.get()==OnnxTensor.released.get(),"tensor leak: "+OnnxTensor.created.get()+" vs "+OnnxTensor.released.get());
+   check(OrtSession.Result.created.get()==OrtSession.Result.released.get(),"result leak: "+OrtSession.Result.created.get()+" vs "+OrtSession.Result.released.get());
+   System.out.println("WINDOW_AND_RELEASE_OK");
    check(AutomaticGainControl.created>=1 && AutomaticGainControl.enabled==AutomaticGainControl.created, "AGC should attach and enable");
    check(AutomaticGainControl.disabled==AutomaticGainControl.created && AutomaticGainControl.released==AutomaticGainControl.created,
     "AGC must disable and release once per session: disabled="+AutomaticGainControl.disabled+" released="+AutomaticGainControl.released+" created="+AutomaticGainControl.created);
@@ -471,7 +807,7 @@ public class Harness {
     if (mode.equals("failEnable")) AutomaticGainControl.failEnable = true;
     if (mode.equals("throwEnable")) AutomaticGainControl.throwOnEnable = true;
     if (mode.equals("throwRelease")) AutomaticGainControl.throwOnRelease = true;
-    p.events.clear();AudioRecord.chunksPerStart=1;AudioRecord.silentChunksPerStart=0;OfflineRecognizer.decoded=new CountDownLatch(1);
+    p.events.clear();AudioRecord.chunksPerStart=1;AudioRecord.silentChunksPerStart=0;OrtSession.decoded=new CountDownLatch(1);
     PluginCall modeStart=new PluginCall();p.start(modeStart);await(modeStart.done);await(AudioRecord.delivered);
     check(modeStart.error==null, "AGC mode "+mode+" must be non-fatal: "+modeStart.error);
     PluginCall modeStop=new PluginCall();p.stop(modeStop);await(modeStop.done);
@@ -480,7 +816,7 @@ public class Harness {
    }
    AutomaticGainControl.reset();
    AudioRecord.failMicSource = true;
-   p.events.clear();AudioRecord.chunksPerStart=1;AudioRecord.silentChunksPerStart=0;OfflineRecognizer.decoded=new CountDownLatch(1);
+   p.events.clear();AudioRecord.chunksPerStart=1;AudioRecord.silentChunksPerStart=0;OrtSession.decoded=new CountDownLatch(1);
    PluginCall fbStart=new PluginCall();p.start(fbStart);await(fbStart.done);await(AudioRecord.delivered);
    check(AudioRecord.lastSource==MediaRecorder.AudioSource.VOICE_RECOGNITION, "MIC init failure must fall back to VOICE_RECOGNITION");
    PluginCall fbStop=new PluginCall();p.stop(fbStop);await(fbStop.done);
@@ -488,16 +824,19 @@ public class Harness {
    AudioRecord.failMicSource = false;
    System.out.println("AGC_FALLBACK_OK");
   } finally {p.destroy();}
-  for(int i=0;i<100&&OfflineRecognizer.releases==0;i++)Thread.sleep(5);check(OfflineRecognizer.releases==1,OfflineRecognizer.releases);
-  OfflineRecognizer.entered=new CountDownLatch(1);OfflineRecognizer.release=new CountDownLatch(1);AudioRecord.chunksPerStart=330;
-  Subject overflow=new Subject();try{overflow.load();await(OfflineRecognizer.entered);overflow.start(new PluginCall());for(int i=0;i<800&&AudioRecord.latest.getRecordingState()==AudioRecord.RECORDSTATE_RECORDING;i++)Thread.sleep(5);check(AudioRecord.latest.getRecordingState()!=AudioRecord.RECORDSTATE_RECORDING,"overflow did not stop intake");OfflineRecognizer.release.countDown();PluginCall end=new PluginCall();overflow.stop(end);await(end.done);check(overflow.events.stream().anyMatch(x->x.contains("processing overloaded")),overflow.events);System.out.println("OVERFLOW_OK");}finally{overflow.destroy();}
-  for(int i=0;i<100&&OfflineRecognizer.releases<2;i++)Thread.sleep(5);
-  OfflineRecognizer.holdDecode=true;OfflineRecognizer.decoding=new CountDownLatch(1);OfflineRecognizer.decodeRelease=new CountDownLatch(1);AudioRecord.chunksPerStart=15;
-  Subject retired=new Subject();retired.load();retired.start(new PluginCall());await(OfflineRecognizer.decoding);
-  retired.destroy();OfflineRecognizer.decodeRelease.countDown();
-  for(int i=0;i<100&&OfflineRecognizer.releases<3;i++)Thread.sleep(5);
+  for(int i=0;i<100&&OrtSession.closes.get()<3;i++)Thread.sleep(5);check(OrtSession.closes.get()==3,"expected 3 closed sessions, got "+OrtSession.closes.get());
+  OrtSession.initEntered=new CountDownLatch(1);OrtSession.initRelease=new CountDownLatch(1);AudioRecord.chunksPerStart=650;
+  Subject overflow=new Subject();try{overflow.load();await(OrtSession.initEntered);overflow.start(new PluginCall());for(int i=0;i<800&&AudioRecord.latest.getRecordingState()==AudioRecord.RECORDSTATE_RECORDING;i++)Thread.sleep(5);check(AudioRecord.latest.getRecordingState()!=AudioRecord.RECORDSTATE_RECORDING,"overflow did not stop intake");OrtSession.initRelease.countDown();PluginCall end=new PluginCall();overflow.stop(end);await(end.done);check(overflow.events.stream().anyMatch(x->x.contains("processing overloaded")),overflow.events);System.out.println("OVERFLOW_OK");}finally{overflow.destroy();}
+  for(int i=0;i<100&&OrtSession.closes.get()<6;i++)Thread.sleep(5);
+  OrtSession.initEntered=null;OrtSession.initRelease=null;
+  OrtSession.holdDecode=true;OrtSession.decoding=new CountDownLatch(1);OrtSession.decodeRelease=new CountDownLatch(1);AudioRecord.chunksPerStart=35;
+  Subject retired=new Subject();retired.load();retired.start(new PluginCall());await(OrtSession.decoding);
+  retired.destroy();OrtSession.decodeRelease.countDown();
+  for(int i=0;i<100&&OrtSession.closes.get()<9;i++)Thread.sleep(5);
   check(retired.events.stream().noneMatch(x->x.contains("partialResults")),retired.events);
-  check(OfflineStream.created==OfflineStream.released,retired.events);System.out.println("OWNER_RETIRE_OK");
+  check(OnnxTensor.created.get()==OnnxTensor.released.get(),"retired tensor leak");
+  check(OrtSession.Result.created.get()==OrtSession.Result.released.get(),"retired result leak");
+  System.out.println("OWNER_RETIRE_OK");
   SpeechGainTest.main(new String[0]);
  }
 }
@@ -505,13 +844,17 @@ public class Harness {
     };
     const sources: string[] = [];
     for (const [relative, content] of Object.entries(files)) { const full=join(srcDir, relative); await mkdir(dirname(full),{recursive:true});await writeFile(full,content);sources.push(full); }
-    sources.push(fileURLToPath(new URL('../../web/plugins/streaming-speech/android/src/main/java/com/imcodes/speech/SpeechGain.java',import.meta.url)));
-    sources.push(fileURLToPath(new URL('../../web/plugins/streaming-speech/android/src/main/java/com/imcodes/speech/StreamingSpeechPlugin.java',import.meta.url)));
-    sources.push(fileURLToPath(new URL('../../web/plugins/streaming-speech/android/src/test/java/com/imcodes/speech/SpeechGainTest.java',import.meta.url)));
+    for (const name of ['SpeechGain.java', 'StreamingSpeechPlugin.java', 'Qwen3OnnxDecoder.java', 'Qwen3SpeechWindow.java', 'Qwen3Tokenizer.java', 'WhisperMelExtractor.java']) {
+      sources.push(fileURLToPath(new URL(`../../web/plugins/streaming-speech/android/src/main/java/com/imcodes/speech/${name}`, import.meta.url)));
+    }
+    sources.push(fileURLToPath(new URL('../../web/plugins/streaming-speech/android/src/test/java/com/imcodes/speech/SpeechGainTest.java', import.meta.url)));
+    sources.push(fileURLToPath(new URL('../../web/plugins/streaming-speech/android/src/test/java/com/imcodes/speech/Qwen3SpeechTests.java', import.meta.url)));
     execFileSync('javac',['-d',classesDir,...sources],{stdio:'pipe',timeout:30000});
-    for (const failure of ['none', 'runtime', 'linkage']) {
-      const output=execFileSync('java',['-Djava.io.tmpdir='+root, '-DnnapiFailure='+failure, '-cp',classesDir,'Harness'],{encoding:'utf8',timeout:15000}).trim().split('\n');
-      expect(output, `NNAPI ${failure}`).toEqual(['COLD_STOP_OK','WARM_REUSE_OK','SINGLE_TAIL_DRAIN_OK','SILENCE_SEGMENT_OK','WINDOW_AND_RELEASE_OK','AGC_LIFECYCLE_OK','AGC_FALLBACK_OK','OVERFLOW_OK','OWNER_RETIRE_OK','SpeechGainTest: ALL 6 TESTS PASSED']);
+    const unitOut = execFileSync('java', ['-cp', classesDir, 'com.imcodes.speech.Qwen3SpeechTests'], { encoding: 'utf8', timeout: 15000 }).trim();
+    expect(unitOut).toBe('QWEN3_JAVA_UNIT_TESTS:PASS');
+    for (const dtype of ['FLOAT', 'FLOAT16']) {
+      const output=execFileSync('java',['-Djava.io.tmpdir='+root, '-DortDtype='+dtype, '-cp',classesDir,'Harness'],{encoding:'utf8',timeout:15000}).trim().split('\n');
+      expect(output, `ORT dtype ${dtype}`).toEqual(['COLD_STOP_OK','WARM_REUSE_OK','SINGLE_TAIL_DRAIN_OK','SILENCE_SEGMENT_OK','WINDOW_AND_RELEASE_OK','AGC_LIFECYCLE_OK','AGC_FALLBACK_OK','OVERFLOW_OK','OWNER_RETIRE_OK','SpeechGainTest: ALL 6 TESTS PASSED']);
     }
   });
 });
