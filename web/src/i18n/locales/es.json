@@ -2242,6 +2242,9 @@
     "push_remote_desktop_title": "Aviso de desbloqueo automático de escritorio remoto",
     "push_remote_desktop_desc": "Alerta cuando se utilizan credenciales para el desbloqueo automático de escritorio remoto. Alerta de máxima seguridad; se recomienda encarecidamente mantener activada.",
     "tab_settings": "Configuración",
+    "tab_profile": "Perfil",
+    "tab_notifications": "Notificaciones",
+    "tab_security": "Seguridad",
     "tab_guide": "Guía de uso"
   },
   "capabilities": {

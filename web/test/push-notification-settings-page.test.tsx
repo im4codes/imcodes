@@ -19,6 +19,10 @@ vi.mock('../src/api.js', () => ({
   passkeyVerifyBegin: vi.fn(),
   passwordSetupWithPasskey: vi.fn(),
   updateDisplayName: vi.fn(),
+  listPasskeys: vi.fn().mockResolvedValue({ credentials: [] }),
+  deletePasskey: vi.fn(),
+  passkeyRegisterBegin: vi.fn(),
+  passkeyRegisterComplete: vi.fn(),
 }));
 
 vi.mock('react-i18next', () => ({
@@ -27,6 +31,10 @@ vi.mock('react-i18next', () => ({
       const dict: Record<string, string> = {
         'settings.title': 'Settings',
         'settings.back': '← Back',
+        'settings.tab_profile': 'Profile',
+        'settings.tab_notifications': 'Notifications',
+        'settings.tab_security': 'Security',
+        'settings.tab_guide': 'User Guide',
         'settings.account_identity': 'Account Identity',
         'settings.username': 'Username',
         'settings.display_name': 'Display Name',
@@ -84,6 +92,9 @@ describe('SettingsPage push notification settings', () => {
       />,
     );
 
+    expect(screen.queryByTestId('push-notification-settings-card')).toBeNull();
+    fireEvent.click(screen.getByRole('tab', { name: 'Notifications' }));
+
     expect(screen.getByTestId('push-notification-settings-card')).toBeDefined();
     expect(screen.getByText('Push Notification Preferences')).toBeDefined();
 
@@ -118,6 +129,7 @@ describe('SettingsPage push notification settings', () => {
         displayName="Ada Lovelace"
         username="ada"
         hasPassword={true}
+        initialTab="notifications"
         onBack={vi.fn()}
         onDisplayNameChanged={vi.fn()}
         onUserAuthUpdated={vi.fn()}

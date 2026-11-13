@@ -22,8 +22,16 @@ import {
   hasUnsyncedPushNotificationEdits,
 } from '../push-notifications.js';
 import { GuidePage } from './GuidePage.js';
+import { PasskeyManager } from '../components/PasskeyManager.js';
 
-export type SettingsTab = 'settings' | 'guide';
+export type SettingsTab = 'profile' | 'notifications' | 'security' | 'guide';
+
+const SETTINGS_TABS: ReadonlyArray<{ id: SettingsTab; labelKey: string }> = [
+  { id: 'profile', labelKey: 'settings.tab_profile' },
+  { id: 'notifications', labelKey: 'settings.tab_notifications' },
+  { id: 'security', labelKey: 'settings.tab_security' },
+  { id: 'guide', labelKey: 'settings.tab_guide' },
+];
 
 interface Props {
   displayName: string | null;
@@ -41,7 +49,7 @@ export function SettingsPage({
   username,
   hasPassword,
   serverUrl,
-  initialTab = 'settings',
+  initialTab = 'profile',
   onBack,
   onDisplayNameChanged,
   onUserAuthUpdated,
@@ -333,24 +341,23 @@ export function SettingsPage({
           </div>
 
           <div class="settings-tabs" role="tablist" aria-label={t('settings.title')}>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={activeTab === 'settings'}
-              class={`settings-tab-btn${activeTab === 'settings' ? ' is-active' : ''}`}
-              onClick={() => handleSelectTab('settings')}
-            >
-              {t('settings.tab_settings')}
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={activeTab === 'guide'}
-              class={`settings-tab-btn${activeTab === 'guide' ? ' is-active' : ''}`}
-              onClick={() => handleSelectTab('guide')}
-            >
-              {t('settings.tab_guide')}
-            </button>
+            {SETTINGS_TABS.map((tab) => {
+              const selected = activeTab === tab.id;
+              return (
+                <button
+                  key={tab.id}
+                  type="button"
+                  role="tab"
+                  id={`settings-tab-${tab.id}`}
+                  aria-selected={selected}
+                  aria-controls={`settings-tabpanel-${tab.id}`}
+                  class={`settings-tab-btn${selected ? ' is-active' : ''}`}
+                  onClick={() => handleSelectTab(tab.id)}
+                >
+                  {t(tab.labelKey)}
+                </button>
+              );
+            })}
           </div>
         </div>
       </header>
@@ -376,12 +383,13 @@ export function SettingsPage({
             paddingBottom: 'calc(28px + max(var(--sab, 0px), env(safe-area-inset-bottom, 0px)))',
           }}
         >
-          {activeTab === 'guide' ? (
-            <div role="tabpanel" aria-label={t('settings.tab_guide')}>
-              <GuidePage />
-            </div>
-          ) : (
-            <div role="tabpanel" aria-label={t('settings.tab_settings')}>
+          {activeTab === 'profile' && (
+            <div
+              role="tabpanel"
+              id="settings-tabpanel-profile"
+              aria-labelledby="settings-tab-profile"
+              aria-label={t('settings.tab_profile')}
+            >
               <div class="settings-card">
                 <h2 class="settings-card-heading">
                   {t('settings.account_identity')}
@@ -437,6 +445,34 @@ export function SettingsPage({
                 )}
               </div>
 
+              <footer class="settings-legal-footer">
+                <a
+                  href="https://im.codes/privacy.html"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  class="settings-legal-link"
+                >
+                  {t('settings.privacy_policy')}
+                </a>
+                <a
+                  href="https://im.codes/terms.html"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  class="settings-legal-link"
+                >
+                  {t('settings.terms_of_service')}
+                </a>
+              </footer>
+            </div>
+          )}
+
+          {activeTab === 'notifications' && (
+            <div
+              role="tabpanel"
+              id="settings-tabpanel-notifications"
+              aria-labelledby="settings-tab-notifications"
+              aria-label={t('settings.tab_notifications')}
+            >
               {/* Push Notification Preferences */}
               <div class="settings-card" data-testid="push-notification-settings-card">
                 <div style={inlineLabelStyle}>{t('settings.push_notifications_label')}</div>
@@ -560,7 +596,16 @@ export function SettingsPage({
                   </label>
                 </div>
               </div>
+            </div>
+          )}
 
+          {activeTab === 'security' && (
+            <div
+              role="tabpanel"
+              id="settings-tabpanel-security"
+              aria-labelledby="settings-tab-security"
+              aria-label={t('settings.tab_security')}
+            >
               {!hasPassword ? (
                 <div class="settings-card">
                   <h2 class="settings-card-heading">
@@ -651,24 +696,18 @@ export function SettingsPage({
                 </div>
               )}
 
-              <footer class="settings-legal-footer">
-                <a
-                  href="https://im.codes/privacy.html"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  class="settings-legal-link"
-                >
-                  {t('settings.privacy_policy')}
-                </a>
-                <a
-                  href="https://im.codes/terms.html"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  class="settings-legal-link"
-                >
-                  {t('settings.terms_of_service')}
-                </a>
-              </footer>
+              <PasskeyManager />
+            </div>
+          )}
+
+          {activeTab === 'guide' && (
+            <div
+              role="tabpanel"
+              id="settings-tabpanel-guide"
+              aria-labelledby="settings-tab-guide"
+              aria-label={t('settings.tab_guide')}
+            >
+              <GuidePage />
             </div>
           )}
         </div>

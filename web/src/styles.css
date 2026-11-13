@@ -16183,18 +16183,29 @@ button.quick-agent-delegation-preset.active {
 }
 
 .settings-tabs {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  display: flex;
+  align-items: center;
   gap: 6px;
   padding: 4px;
   background: #0f172a;
   border: 1px solid rgba(148, 163, 184, 0.18);
   border-radius: 10px;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  box-sizing: border-box;
+}
+
+.settings-tabs::-webkit-scrollbar {
+  display: none;
 }
 
 .settings-tab-btn {
+  flex: 1 0 auto;
   min-height: 40px;
-  padding: 8px 12px;
+  padding: 8px 14px;
   border: none;
   border-radius: 7px;
   background: transparent;
@@ -16203,9 +16214,6 @@ button.quick-agent-delegation-preset.active {
   font-weight: 600;
   cursor: pointer;
   transition: background 0.15s ease, color 0.15s ease;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -16252,6 +16260,42 @@ button.quick-agent-delegation-preset.active {
   font-weight: 600;
   margin: 0 0 12px;
   color: #94a3b8;
+}
+
+.settings-page-inner .passkey-manager {
+  background: #1e293b;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 12px;
+  padding: 16px;
+  margin-bottom: 14px;
+  box-shadow: none;
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+.settings-page-inner .passkey-manager .dashboard-card-header {
+  margin-bottom: 12px;
+}
+
+.settings-page-inner .passkey-manager .dashboard-card-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: #94a3b8;
+}
+
+.settings-page-inner .passkey-manager .dashboard-inline-form {
+  margin-top: 4px;
+}
+
+.settings-page-inner .passkey-manager .input {
+  min-height: 44px;
+  background: #0f172a;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  color: #e2e8f0;
+  font-size: 16px;
+  box-sizing: border-box;
 }
 
 .settings-identity-value {
@@ -16635,6 +16679,11 @@ button.quick-agent-delegation-preset.active {
     flex-direction: row;
     align-items: center;
     justify-content: space-between;
+    gap: 16px;
+  }
+
+  .settings-page-header-row {
+    flex: 0 0 auto;
   }
 
   .settings-page-title {
@@ -16643,19 +16692,26 @@ button.quick-agent-delegation-preset.active {
 
   .settings-tabs {
     width: auto;
-    min-width: 240px;
+    flex: 0 1 auto;
+    min-width: 0;
+  }
+
+  .settings-tab-btn {
+    flex: 0 0 auto;
   }
 
   .settings-page-inner {
     padding: 20px;
   }
 
-  .settings-card {
+  .settings-card,
+  .settings-page-inner .passkey-manager {
     padding: 20px;
     margin-bottom: 16px;
   }
 
-  .settings-input {
+  .settings-input,
+  .settings-page-inner .passkey-manager .input {
     font-size: 14px;
   }
 

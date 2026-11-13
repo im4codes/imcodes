@@ -672,7 +672,9 @@ describe('generic i18n coverage guard', () => {
       'autoCronMobile',
     ] as const;
     const GUIDE_TOP_KEYS = [
-      'settings.tab_settings',
+      'settings.tab_profile',
+      'settings.tab_notifications',
+      'settings.tab_security',
       'settings.tab_guide',
       'guide.kicker',
       'guide.title',
@@ -698,6 +700,9 @@ describe('generic i18n coverage guard', () => {
       }
       if (locale !== 'en') {
         expect(readPath(messages, 'guide.title'), `${locale}:guide.title must be translated`).not.toBe(enTitle);
+        expect(readPath(messages, 'settings.tab_profile'), `${locale}:settings.tab_profile must be translated`).not.toBe('Profile');
+        expect(readPath(messages, 'settings.tab_notifications'), `${locale}:settings.tab_notifications must be translated`).not.toBe('Notifications');
+        expect(readPath(messages, 'settings.tab_security'), `${locale}:settings.tab_security must be translated`).not.toBe('Security');
         expect(readPath(messages, 'settings.tab_guide'), `${locale}:settings.tab_guide must be translated`).not.toBe('User Guide');
       }
       for (const id of GUIDE_SECTION_IDS) {

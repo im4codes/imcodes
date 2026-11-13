@@ -2242,6 +2242,9 @@
     "push_remote_desktop_title": "远程桌面自动解锁提醒",
     "push_remote_desktop_desc": "检测到凭据被用于远程桌面自动解锁，属于最高安全告警级别，强烈建议保持开启",
     "tab_settings": "设置",
+    "tab_profile": "个人信息",
+    "tab_notifications": "通知",
+    "tab_security": "安全设置",
     "tab_guide": "使用指南"
   },
   "capabilities": {

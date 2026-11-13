@@ -2242,6 +2242,9 @@
     "push_remote_desktop_title": "Remote Desktop Auto-Unlock Alert",
     "push_remote_desktop_desc": "Alerts when credentials are used for remote desktop auto-unlock. Highest severity alert; strongly recommended to keep enabled.",
     "tab_settings": "Settings",
+    "tab_profile": "Profile",
+    "tab_notifications": "Notifications",
+    "tab_security": "Security",
     "tab_guide": "User Guide"
   },
   "capabilities": {

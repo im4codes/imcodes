@@ -2242,6 +2242,9 @@
     "push_remote_desktop_title": "遠端桌面自動解鎖提醒",
     "push_remote_desktop_desc": "偵測到憑證被用於遠端桌面自動解鎖，屬於最高安全告警級別，強烈建議保持開啟",
     "tab_settings": "設定",
+    "tab_profile": "個人資訊",
+    "tab_notifications": "通知",
+    "tab_security": "安全設定",
     "tab_guide": "使用指南"
   },
   "capabilities": {

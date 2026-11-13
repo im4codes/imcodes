@@ -2241,6 +2241,9 @@
     "push_remote_desktop_title": "リモートデスクトップ自動ロック解除通知",
     "push_remote_desktop_desc": "資格情報を使用したリモートデスクトップ自動ロック解除が検出された際の最高重要度アラートです。有効のままにすることを強く推奨します。",
     "tab_settings": "設定",
+    "tab_profile": "プロフィール",
+    "tab_notifications": "通知",
+    "tab_security": "セキュリティ",
     "tab_guide": "利用ガイド"
   },
   "capabilities": {

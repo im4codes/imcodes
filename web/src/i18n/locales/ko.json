@@ -2241,6 +2241,9 @@
     "push_remote_desktop_title": "원격 데스크톱 자동 잠금 해제 알림",
     "push_remote_desktop_desc": "원격 데스크톱 자동 잠금 해제에 자격 증명이 사용되었을 때 전송되는 최고 수준의 보안 경고입니다. 항상 켜두는 것을 강력히 권장합니다.",
     "tab_settings": "설정",
+    "tab_profile": "프로필",
+    "tab_notifications": "알림",
+    "tab_security": "보안",
     "tab_guide": "사용 가이드"
   },
   "capabilities": {
