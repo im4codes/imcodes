@@ -30,6 +30,7 @@ import {
   sanitizePushEnabledServerIds,
   isPushEnabledForServer,
   resolvePushPayloadServerId,
+  shouldBypassServerPushMute,
   type PushPlatform,
   type PushNotificationType,
 } from '../../../shared/push-notifications.js';
@@ -331,7 +332,7 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
 
   if (tokens.length === 0) return;
 
-  if (targetServerId) {
+  if (targetServerId && !shouldBypassServerPushMute(payload.type)) {
     const rawEnabledServerIds = tokens[0].push_enabled_server_ids;
     if (Array.isArray(rawEnabledServerIds)) {
       if (!isPushEnabledForServer(rawEnabledServerIds, targetServerId, [])) return;

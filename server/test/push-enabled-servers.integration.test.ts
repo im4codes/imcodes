@@ -16,6 +16,7 @@ import { createUser, createServer } from '../src/db/queries.js';
 import { sha256Hex, randomHex } from '../src/security/crypto.js';
 import {
   DEFAULT_PUSH_NOTIFICATION_TYPES,
+  PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP,
   PUSH_NOTIFICATION_TYPE_TASK_COMPLETE,
   PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE,
   PUSH_PLATFORM_ANDROID_JPUSH,
@@ -329,6 +330,55 @@ describe('per-server push notification allowlist (PostgreSQL)', () => {
         body: 'Disabled user',
         type: PUSH_NOTIFICATION_TYPE_TASK_COMPLETE,
         data: { serverId: serverA },
+      }, env);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it('bypasses per-server mute for remote_desktop unless globally disabled in push_tokens.notification_types', async () => {
+    await db.execute(
+      'INSERT INTO push_tokens (user_id, token, platform, notification_types, created_at) VALUES ($1, $2, $3, $4, $5)',
+      [userId, 'jpush-rd-int', PUSH_PLATFORM_ANDROID_JPUSH, DEFAULT_PUSH_NOTIFICATION_TYPES, Date.now()],
+    );
+    await db.execute('UPDATE users SET push_enabled_server_ids = $1 WHERE id = $2', [[], userId]);
+
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ sendno: '1', msg_id: '123' }), { status: 200 }),
+    );
+    const env = { DB: db, JPUSH_APP_KEY: 'k', JPUSH_MASTER_SECRET: 's' } as never;
+
+    try {
+      // Muted server still delivers remote_desktop with serverId preserved
+      await dispatchPush({
+        userId,
+        serverId: serverB,
+        title: 'Auto unlock',
+        body: 'Server B unlocked',
+        type: PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP,
+        data: { serverId: serverB, type: 'auto_unlock_succeeded' },
+      }, env);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      const sent = JSON.parse(fetchSpy.mock.calls[0][1]!.body as string);
+      expect(sent.notification.android.extras).toEqual({
+        serverId: serverB,
+        type: 'auto_unlock_succeeded',
+      });
+
+      // Global toggle off suppresses remote_desktop even though serverId is set
+      await app.request('/api/push/preferences', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ types: [PUSH_NOTIFICATION_TYPE_TASK_COMPLETE] }),
+      });
+      await dispatchPush({
+        userId,
+        serverId: serverB,
+        title: 'Auto unlock',
+        body: 'Globally disabled',
+        type: PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP,
+        data: { serverId: serverB, type: 'auto_unlock_succeeded' },
       }, env);
       expect(fetchSpy).toHaveBeenCalledTimes(1);
     } finally {

@@ -14,6 +14,7 @@ import {
   sanitizePushEnabledServerIds,
   resolveEffectivePushEnabledServerIds,
   isPushEnabledForServer,
+  shouldBypassServerPushMute,
 } from '../../shared/push-notifications.js';
 
 const mockDb = {
@@ -640,6 +641,177 @@ describe('push preferences and registration routes', () => {
         'srv-1',
         'srv-2',
       ]);
+    });
+
+    it('shouldBypassServerPushMute returns true only for remote_desktop', () => {
+      expect(shouldBypassServerPushMute(PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP)).toBe(true);
+      expect(shouldBypassServerPushMute(PUSH_NOTIFICATION_TYPE_TASK_COMPLETE)).toBe(false);
+      expect(shouldBypassServerPushMute(PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE)).toBe(false);
+      expect(shouldBypassServerPushMute(null)).toBe(false);
+      expect(shouldBypassServerPushMute(undefined)).toBe(false);
+    });
+
+    it('dispatches remote_desktop alerts despite muted/mismatched/multi-server null push_enabled_server_ids while preserving serverId', async () => {
+      const mockEnv = {
+        DB: mockDb,
+        JPUSH_APP_KEY: 'mock-key',
+        JPUSH_MASTER_SECRET: 'mock-secret',
+      } as any;
+
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response(JSON.stringify({ sendno: '1', msg_id: '123' }), { status: 200 }),
+      );
+
+      for (const caseCfg of [
+        { label: 'explicit empty []', enabled: [] as string[], types: DEFAULT_PUSH_NOTIFICATION_TYPES },
+        { label: 'mismatch allowlist', enabled: ['other-srv'], types: [PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP] },
+        { label: 'null >1 servers default', enabled: null, types: null },
+      ]) {
+        mockDb.query.mockReset();
+        fetchSpy.mockClear();
+        mockDb.query
+          .mockResolvedValueOnce([
+            {
+              token: 'jpush-rd-token',
+              platform: PUSH_PLATFORM_ANDROID_JPUSH,
+              notification_types: caseCfg.types,
+              push_enabled_server_ids: caseCfg.enabled,
+            },
+          ])
+          .mockResolvedValueOnce([{ badge_count: 1 }]);
+
+        await dispatchPush(
+          {
+            userId: 'user-123',
+            serverId: 'muted-srv-1',
+            title: 'Remote unlock alert',
+            body: 'Unlocked',
+            type: PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP,
+            data: { serverId: 'muted-srv-1', type: 'auto_unlock_succeeded' },
+          },
+          mockEnv,
+        );
+
+        expect(fetchSpy, caseCfg.label).toHaveBeenCalledTimes(1);
+        const body = JSON.parse(fetchSpy.mock.calls[0][1]!.body as string);
+        expect(body.notification.android.extras).toEqual({
+          serverId: 'muted-srv-1',
+          type: 'auto_unlock_succeeded',
+        });
+        expect(body.notification.android.priority).toBe(2);
+      }
+
+      fetchSpy.mockRestore();
+    });
+
+    it('suppresses remote_desktop alerts when global notification_types disables remote_desktop (or is [])', async () => {
+      const mockEnv = {
+        DB: mockDb,
+        JPUSH_APP_KEY: 'mock-key',
+        JPUSH_MASTER_SECRET: 'mock-secret',
+      } as any;
+
+      const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+      for (const types of [[PUSH_NOTIFICATION_TYPE_TASK_COMPLETE], [] as string[]]) {
+        mockDb.query.mockReset();
+        mockDb.query.mockResolvedValueOnce([
+          {
+            token: 'jpush-rd-disabled',
+            platform: PUSH_PLATFORM_ANDROID_JPUSH,
+            notification_types: types,
+            push_enabled_server_ids: [],
+          },
+        ]);
+
+        await dispatchPush(
+          {
+            userId: 'user-123',
+            serverId: 'muted-srv-1',
+            title: 'Remote unlock alert',
+            body: 'Should be suppressed globally',
+            type: PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP,
+            data: { serverId: 'muted-srv-1', type: 'auto_unlock_succeeded' },
+          },
+          mockEnv,
+        );
+
+        expect(mockDb.query).toHaveBeenCalledTimes(1); // no badge_count increment
+      }
+
+      expect(fetchSpy).not.toHaveBeenCalled();
+      fetchSpy.mockRestore();
+    });
+
+    it('filters mixed device tokens by remote_desktop preference even when server is muted, while keeping task_complete suppressed', async () => {
+      const mockEnv = {
+        DB: mockDb,
+        JPUSH_APP_KEY: 'mock-key',
+        JPUSH_MASTER_SECRET: 'mock-secret',
+      } as any;
+
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response(JSON.stringify({ sendno: '1', msg_id: '123' }), { status: 200 }),
+      );
+
+      // Mixed tokens on muted server: only token-a enables remote_desktop
+      mockDb.query
+        .mockResolvedValueOnce([
+          {
+            token: 'token-a',
+            platform: PUSH_PLATFORM_ANDROID_JPUSH,
+            notification_types: [PUSH_NOTIFICATION_TYPE_TASK_COMPLETE, PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP],
+            push_enabled_server_ids: ['other-srv'],
+          },
+          {
+            token: 'token-b',
+            platform: PUSH_PLATFORM_ANDROID_JPUSH,
+            notification_types: [PUSH_NOTIFICATION_TYPE_TASK_COMPLETE],
+            push_enabled_server_ids: ['other-srv'],
+          },
+        ])
+        .mockResolvedValueOnce([{ badge_count: 1 }]);
+
+      await dispatchPush(
+        {
+          userId: 'user-123',
+          serverId: 'muted-srv-1',
+          title: 'Remote unlock alert',
+          body: 'Only token A',
+          type: PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP,
+          data: { serverId: 'muted-srv-1', type: 'auto_unlock_succeeded' },
+        },
+        mockEnv,
+      );
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      const sentBody = JSON.parse(fetchSpy.mock.calls[0][1]!.body as string);
+      expect(sentBody.audience.registration_id).toEqual(['token-a']);
+
+      // Regular non-exempt notification on the exact same muted server stays suppressed
+      mockDb.query.mockResolvedValueOnce([
+        {
+          token: 'token-a',
+          platform: PUSH_PLATFORM_ANDROID_JPUSH,
+          notification_types: DEFAULT_PUSH_NOTIFICATION_TYPES,
+          push_enabled_server_ids: ['other-srv'],
+        },
+      ]);
+
+      await dispatchPush(
+        {
+          userId: 'user-123',
+          serverId: 'muted-srv-1',
+          title: 'Task complete',
+          body: 'Still muted',
+          type: PUSH_NOTIFICATION_TYPE_TASK_COMPLETE,
+          data: { serverId: 'muted-srv-1' },
+        },
+        mockEnv,
+      );
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      fetchSpy.mockRestore();
     });
   });
 

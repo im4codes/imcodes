@@ -65,6 +65,11 @@ export function isPushNotificationType(value: unknown): value is PushNotificatio
   return typeof value === 'string' && (PUSH_NOTIFICATION_TYPES as readonly string[]).includes(value as PushNotificationType);
 }
 
+/** High-priority security alerts that must bypass per-server mute allowlists. */
+export function shouldBypassServerPushMute(type?: PushNotificationType | null): boolean {
+  return type === PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP;
+}
+
 /**
  * Default enabled notification types:
  * - Basic: task_complete, waiting_input, session_error
