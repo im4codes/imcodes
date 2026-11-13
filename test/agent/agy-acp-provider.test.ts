@@ -564,7 +564,8 @@ describe('AG native ACP', () => {
   it('ACKs busy selection without changing captured actual or steering, then uses B on the next turn', async () => {
     const { provider, requests, root } = await setup('model-late'); const id = await route(provider);
     const hold = path.join(root, 'rpc.jsonl.hold');
-    await writeFile(hold, 'hold');
+    const modelHold = path.join(root, 'rpc.jsonl.model-hold');
+    await Promise.all([writeFile(hold, 'hold'), writeFile(modelHold, 'hold')]);
     const complete = vi.fn(), info = vi.fn(); provider.onComplete(complete); provider.onSessionInfo(info);
     try {
       await provider.send(id, 'A');
@@ -573,6 +574,7 @@ describe('AG native ACP', () => {
       expect(info.mock.calls.some(call => call[1].model === 'model-b')).toBe(false);
       expect(complete).not.toHaveBeenCalled();
       const repeated = provider.applySessionModel(id, 'model-b');
+      await rm(modelHold, { force: true });
       expect(await switching).toBe(SESSION_MODEL_APPLIED.NEXT_START);
       expect(await repeated).toBe(SESSION_MODEL_APPLIED.NEXT_START);
       expect(await provider.applySessionModel(id, 'model-b')).toBe(SESSION_MODEL_APPLIED.NEXT_START);
@@ -580,7 +582,7 @@ describe('AG native ACP', () => {
       expect(info.mock.calls.some(call => call[1].model === 'model-b')).toBe(false);
       await provider.notifyActiveDelegation(id, notification('STEER_AFTER_SELECTION'));
       await vi.waitFor(async () => expect((await requests()).filter(row => row.fixture === 'prompt-model').map(row => row.model)).toEqual(['model-a', 'model-a']), { timeout: 5000 });
-    } finally { await unlink(hold); }
+    } finally { await Promise.all([rm(hold, { force: true }), rm(modelHold, { force: true })]); }
     await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
     expect(complete.mock.calls[0][1].metadata.model).toBe('model-a');
     await provider.send(id, 'NEXT_TURN');
@@ -591,24 +593,35 @@ describe('AG native ACP', () => {
   });
 
   it('orders C after a delayed B but never publishes the superseded B ACK', async () => {
-    const { provider, requests } = await setup('model-late'); const id = await route(provider); const info = vi.fn();
+    const { provider, requests, root } = await setup('model-late'); const id = await route(provider); const info = vi.fn();
     await provider.send(id, 'warm'); await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false), { timeout: 5000 });
     provider.onSessionInfo(info);
-    const first = provider.applySessionModel(id, 'model-b'); const rejected = expect(first).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CANCELLED });
-    await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/set_model')).toBe(true), { timeout: 5000 });
-    expect(await provider.applySessionModel(id, 'model-c')).toBe(SESSION_MODEL_APPLIED.LIVE); await rejected;
+    const modelHold = path.join(root, 'rpc.jsonl.model-hold');
+    await writeFile(modelHold, 'hold');
+    try {
+      const first = provider.applySessionModel(id, 'model-b'); const rejected = expect(first).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CANCELLED });
+      await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/set_model')).toBe(true), { timeout: 5000 });
+      const second = provider.applySessionModel(id, 'model-c');
+      await rm(modelHold, { force: true });
+      expect(await second).toBe(SESSION_MODEL_APPLIED.LIVE); await rejected;
+    } finally { await rm(modelHold, { force: true }); }
     expect(info.mock.calls.map(call => call[1].model)).toEqual(['model-c']);
     expect((await requests()).filter(row => row.method === 'session/set_model').map(row => row.params.modelId)).toEqual(['model-b', 'model-c']);
   });
   it.each(['cancel', 'replace', 'disconnect'])('rejects a delayed model ACK after %s without stale actual', async action => {
-    const { provider, requests } = await setup('model-late'); const id = await route(provider); const info = vi.fn();
+    const { provider, requests, root } = await setup('model-late'); const id = await route(provider); const info = vi.fn();
     await provider.send(id, 'A'); provider.onSessionInfo(info);
-    const switching = provider.applySessionModel(id, 'model-b'); const rejected = expect(switching).rejects.toBeTruthy();
-    await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/set_model')).toBe(true), { timeout: 5000 });
-    if (action === 'cancel') await provider.cancel(id);
-    else if (action === 'replace') await route(provider, id, { fresh: true });
-    else await provider.disconnect();
-    await rejected;
+    const modelHold = path.join(root, 'rpc.jsonl.model-hold');
+    await writeFile(modelHold, 'hold');
+    try {
+      const switching = provider.applySessionModel(id, 'model-b'); const rejected = expect(switching).rejects.toBeTruthy();
+      await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/set_model')).toBe(true), { timeout: 5000 });
+      if (action === 'cancel') await provider.cancel(id);
+      else if (action === 'replace') await route(provider, id, { fresh: true });
+      else await provider.disconnect();
+      await rm(modelHold, { force: true });
+      await rejected;
+    } finally { await rm(modelHold, { force: true }); }
     expect(info.mock.calls.some(call => call[1].model === 'model-b')).toBe(false);
   });
   it.each(['model-error', 'model-unsupported'])('does not report false model success on %s', async scenario => {
@@ -621,20 +634,32 @@ describe('AG native ACP', () => {
     await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false), { timeout: 5000 });
   });
   it('reapplies A after a delayed superseded B instead of trusting the old A cache', async () => {
-    const { provider, requests } = await setup('model-late'); const id = await route(provider);
+    const { provider, requests, root } = await setup('model-late'); const id = await route(provider);
     await provider.send(id, 'warm'); await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false), { timeout: 5000 });
-    const first = provider.applySessionModel(id, 'model-b'); const rejected = expect(first).rejects.toBeTruthy();
-    await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/set_model')).toBe(true), { timeout: 5000 });
-    expect(await provider.applySessionModel(id, 'model-a')).toBe(SESSION_MODEL_APPLIED.LIVE); await rejected;
+    const modelHold = path.join(root, 'rpc.jsonl.model-hold');
+    await writeFile(modelHold, 'hold');
+    try {
+      const first = provider.applySessionModel(id, 'model-b'); const rejected = expect(first).rejects.toBeTruthy();
+      await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/set_model')).toBe(true), { timeout: 5000 });
+      const second = provider.applySessionModel(id, 'model-a');
+      await rm(modelHold, { force: true });
+      expect(await second).toBe(SESSION_MODEL_APPLIED.LIVE); await rejected;
+    } finally { await rm(modelHold, { force: true }); }
     expect((await requests()).filter(row => row.method === 'session/set_model').map(row => row.params.modelId)).toEqual(['model-b', 'model-a']);
   });
   it('returns to the retained selection if C fails after superseding a pending B', async () => {
-    const { provider, requests } = await setup('model-late'); const id = await route(provider); const info = vi.fn();
+    const { provider, requests, root } = await setup('model-late'); const id = await route(provider); const info = vi.fn();
     await provider.send(id, 'warm'); await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false), { timeout: 5000 });
     provider.onSessionInfo(info);
-    const old = provider.applySessionModel(id, 'model-b'); const rejected = expect(old).rejects.toBeTruthy();
-    await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/set_model')).toBe(true), { timeout: 5000 });
-    await expect(provider.applySessionModel(id, 'invalid')).rejects.toBeTruthy(); await rejected;
+    const modelHold = path.join(root, 'rpc.jsonl.model-hold');
+    await writeFile(modelHold, 'hold');
+    try {
+      const old = provider.applySessionModel(id, 'model-b'); const rejected = expect(old).rejects.toBeTruthy();
+      await vi.waitFor(async () => expect((await requests()).some(row => row.method === 'session/set_model')).toBe(true), { timeout: 5000 });
+      const failed = provider.applySessionModel(id, 'invalid');
+      await rm(modelHold, { force: true });
+      await expect(failed).rejects.toBeTruthy(); await rejected;
+    } finally { await rm(modelHold, { force: true }); }
     await provider.send(id, 'after-failed-c');
     await vi.waitFor(() => expect(provider.getSessionDiagnostics(id)?.promptInFlight).toBe(false), { timeout: 5000 });
     expect((await requests()).filter(row => row.method === 'session/set_model').map(row => row.params.modelId)).toEqual(['model-b', 'invalid', 'model-a']);

@@ -102,7 +102,13 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       if (p.modelId === 'invalid' || (scenario === 'unsupported-carbon' && p.modelId === 'gemini-4-carbon-medium') || scenario === 'model-error'
         || (scenario === 'model-error-once' && modelAttempts++ === 0)) return error(req.id, 'Unknown model');
       if (scenario === 'model-unsupported') return error(req.id, 'Method unavailable');
-      const respond = () => { const state = sessions.get(p.sessionId); if (state) state.model = p.modelId; ok(req.id); };
+      const respond = () => {
+        if (logPath && fs.existsSync(logPath + '.model-hold')) {
+          setTimeout(respond, 10);
+          return;
+        }
+        const state = sessions.get(p.sessionId); if (state) state.model = p.modelId; ok(req.id);
+      };
       return setTimeout(respond, p.modelId === 'model-b' && scenario === 'model-late' ? 180 : p.modelId === 'model-b' && scenario === 'model-timeout' ? 5500 : 0);
     }
     case 'session/set_mode': return ok(req.id);
