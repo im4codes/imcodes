@@ -731,8 +731,9 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
 
       const input = document.querySelector('.controls-input') as HTMLElement;
 
-      // Short tap: pending suppresses selectstart/contextmenu, then release transitions to contenteditable="true" + focus
+      // Short tap: pending suppresses selectstart/contextmenu and sets inline -webkit-user-modify: read-only, then release transitions to contenteditable="true" + focus and clears lock
       dispatchPointer(input, 'pointerdown', 180);
+      expect(input.style.getPropertyValue('-webkit-user-modify')).toBe('read-only');
       const pendingSelect = new Event('selectstart', { bubbles: true, cancelable: true });
       const pendingMenu = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
       expect(fireEvent(input, pendingSelect)).toBe(false);
@@ -743,24 +744,27 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       await vi.advanceTimersByTimeAsync(0);
       expect(input.getAttribute('contenteditable')).toBe('true');
       expect(input.style.userSelect).toBe('');
+      expect(input.style.getPropertyValue('-webkit-user-modify')).toBe('');
       expect(fireEvent(input, new Event('selectstart', { bubbles: true, cancelable: true }))).toBe(true);
       expect(fireEvent(input, new MouseEvent('contextmenu', { bubbles: true, cancelable: true }))).toBe(true);
       fireEvent.blur(input);
       expect(input.getAttribute('contenteditable')).toBe('false');
 
-      // Failed mic start clears inline userSelect and keeps unfocused composer contenteditable="false"
+      // Failed mic start clears inline lock and keeps unfocused composer contenteditable="false"
       voiceMock.startListening.mockResolvedValueOnce(false);
       dispatchPointer(input, 'pointerdown', 180);
       await vi.advanceTimersByTimeAsync(240);
       await vi.advanceTimersByTimeAsync(0);
       expect(input.getAttribute('contenteditable')).toBe('false');
       expect(input.style.userSelect).toBe('');
+      expect(input.style.getPropertyValue('-webkit-user-modify')).toBe('');
 
-      // Active hold suppresses selectstart/contextmenu, prevents touchmove pan, then pointercancel restores cleanly
+      // Active hold suppresses selectstart/contextmenu, sets inline read-only, prevents touchmove pan, then pointercancel restores cleanly
       dispatchPointer(input, 'pointerdown', 180);
       await vi.advanceTimersByTimeAsync(240);
       expect(removeAllRanges).toHaveBeenCalled();
       expect(input.getAttribute('contenteditable')).toBe('false');
+      expect(input.style.getPropertyValue('-webkit-user-modify')).toBe('read-only');
       expect(fireEvent(input, new Event('selectstart', { bubbles: true, cancelable: true }))).toBe(false);
       expect(fireEvent(input, new MouseEvent('contextmenu', { bubbles: true, cancelable: true }))).toBe(false);
       const activeTouchMove = new Event('touchmove', { bubbles: true, cancelable: true });
@@ -771,6 +775,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       await vi.advanceTimersByTimeAsync(0);
       expect(input.getAttribute('contenteditable')).toBe('false');
       expect(input.style.userSelect).toBe('');
+      expect(input.style.getPropertyValue('-webkit-user-modify')).toBe('');
 
       // lostpointercapture during active hold MUST NOT cancel; window pointermove + pointerup finish cleanly
       dispatchPointer(input, 'pointerdown', 180);
@@ -811,6 +816,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       view.unmount();
       expect(input.getAttribute('contenteditable')).toBe('true');
       expect(input.style.userSelect).toBe('');
+      expect(input.style.getPropertyValue('-webkit-user-modify')).toBe('');
       releaseDrain();
       await vi.advanceTimersByTimeAsync(0);
     } finally {
@@ -1172,6 +1178,102 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
           await context.close();
         }
       }
+    } finally {
+      await browser.close();
+    }
+  });
+
+  it('enforces read-only CSS editing across ready/pending/holding/disabled voice states and restores plaintext editing on short tap and desktop in chromium', { timeout: 60_000 }, async () => {
+    vi.useRealTimers();
+    const require = createRequire(import.meta.url);
+    const browserType = (require('playwright') as typeof import('playwright')).chromium;
+    if (!existsSync(browserType.executablePath())) {
+      return;
+    }
+    const stylesCss = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../../src/styles.css'), 'utf8');
+    expect(stylesCss).toContain('-webkit-touch-callout: none');
+    const browser = await browserType.launch({ headless: true });
+    try {
+      const mobileContext = await browser.newContext({ viewport: { width: 390, height: 844 } });
+      const page = await mobileContext.newPage();
+
+      // Non-editable mobile states MUST enforce -webkit-user-modify: read-only and reject keyboard mutation
+      const lockedCases = [
+        { name: 'ready-unfocused', composerClass: 'controls-composer controls-composer-voice-ready', inputClass: 'controls-input', ce: 'false' },
+        { name: 'pending-unfocused', composerClass: 'controls-composer controls-composer-voice-ready controls-composer-voice-pending', inputClass: 'controls-input', ce: 'false' },
+        { name: 'pending-while-focused', composerClass: 'controls-composer controls-composer-voice-ready controls-composer-voice-pending', inputClass: 'controls-input', ce: 'true' },
+        { name: 'holding', composerClass: 'controls-composer controls-composer-voice-ready controls-composer-voice-holding', inputClass: 'controls-input', ce: 'false' },
+        { name: 'disabled', composerClass: 'controls-composer', inputClass: 'controls-input controls-input-disabled', ce: 'false' },
+      ];
+
+      for (const tc of lockedCases) {
+        await page.setContent(
+          `<!doctype html><html><head><style>${stylesCss}</style></head><body>` +
+          `<div class="${tc.composerClass}"><div class="${tc.inputClass}" contenteditable="${tc.ce}">hello</div></div>` +
+          `</body></html>`,
+        );
+        await page.$eval('.controls-input', (el) => (el as HTMLElement).focus());
+        await page.keyboard.type('X');
+        const result = await page.$eval('.controls-input', (el) => {
+          const cs = getComputedStyle(el);
+          return {
+            modify: cs.getPropertyValue('-webkit-user-modify'),
+            select: cs.getPropertyValue('-webkit-user-select'),
+            touchAction: cs.getPropertyValue('touch-action'),
+            text: el.textContent,
+          };
+        });
+        expect(result.modify, `${tc.name} -webkit-user-modify`).toBe('read-only');
+        expect(result.select, `${tc.name} -webkit-user-select`).toBe('none');
+        expect(result.text, `${tc.name} rejects typing`).toBe('hello');
+        if (tc.name !== 'disabled') {
+          expect(result.touchAction, `${tc.name} touch-action`).toBe('none');
+        }
+      }
+
+      // Short-tap focused mobile state MUST restore read-write-plaintext-only and accept typing
+      await page.setContent(
+        `<!doctype html><html><head><style>${stylesCss}</style></head><body>` +
+        `<div class="controls-composer controls-composer-voice-ready"><div class="controls-input" contenteditable="true">hello</div></div>` +
+        `</body></html>`,
+      );
+      await page.$eval('.controls-input', (el) => (el as HTMLElement).focus());
+      await page.keyboard.type('X');
+      const mobileFocused = await page.$eval('.controls-input', (el) => {
+        const cs = getComputedStyle(el);
+        return {
+          modify: cs.getPropertyValue('-webkit-user-modify'),
+          select: cs.getPropertyValue('-webkit-user-select'),
+          text: el.textContent,
+        };
+      });
+      expect(mobileFocused.modify).toBe('read-write-plaintext-only');
+      expect(mobileFocused.select).toBe('text');
+      expect(mobileFocused.text).toBe('Xhello');
+      await mobileContext.close();
+
+      // Desktop layout MUST keep read-write-plaintext-only editing intact
+      const desktopContext = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+      const desktopPage = await desktopContext.newPage();
+      await desktopPage.setContent(
+        `<!doctype html><html><head><style>${stylesCss}</style></head><body>` +
+        `<div class="controls-composer"><div class="controls-input" contenteditable="true">hello</div></div>` +
+        `</body></html>`,
+      );
+      await desktopPage.$eval('.controls-input', (el) => (el as HTMLElement).focus());
+      await desktopPage.keyboard.type('D');
+      const desktopState = await desktopPage.$eval('.controls-input', (el) => {
+        const cs = getComputedStyle(el);
+        return {
+          modify: cs.getPropertyValue('-webkit-user-modify'),
+          select: cs.getPropertyValue('-webkit-user-select'),
+          text: el.textContent,
+        };
+      });
+      expect(desktopState.modify).toBe('read-write-plaintext-only');
+      expect(desktopState.select).toBe('text');
+      expect(desktopState.text).toBe('Dhello');
+      await desktopContext.close();
     } finally {
       await browser.close();
     }

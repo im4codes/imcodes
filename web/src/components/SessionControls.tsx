@@ -188,12 +188,18 @@ const VOICE_HOLD_SLIDE_MAX_PX = 84;
 
 function applyComposerVoiceTouchLock(el: HTMLDivElement | null, lockContentEditable: boolean): void {
   if (!el) return;
-  const style = el.style as CSSStyleDeclaration & { webkitUserSelect?: string; webkitTouchCallout?: string };
+  const style = el.style as CSSStyleDeclaration & {
+    webkitUserSelect?: string;
+    webkitTouchCallout?: string;
+    webkitUserModify?: string;
+  };
   style.userSelect = 'none';
   style.setProperty('-webkit-user-select', 'none');
   style.webkitUserSelect = 'none';
   style.setProperty('-webkit-touch-callout', 'none');
   style.webkitTouchCallout = 'none';
+  style.setProperty('-webkit-user-modify', 'read-only');
+  style.webkitUserModify = 'read-only';
   if (lockContentEditable) {
     el.setAttribute('contenteditable', 'false');
   }
@@ -201,12 +207,18 @@ function applyComposerVoiceTouchLock(el: HTMLDivElement | null, lockContentEdita
 
 function clearComposerVoiceTouchLock(el: HTMLDivElement | null, disabled: boolean): void {
   if (!el) return;
-  const style = el.style as CSSStyleDeclaration & { webkitUserSelect?: string; webkitTouchCallout?: string };
+  const style = el.style as CSSStyleDeclaration & {
+    webkitUserSelect?: string;
+    webkitTouchCallout?: string;
+    webkitUserModify?: string;
+  };
   style.removeProperty('user-select');
   style.removeProperty('-webkit-user-select');
   style.removeProperty('-webkit-touch-callout');
+  style.removeProperty('-webkit-user-modify');
   style.webkitUserSelect = '';
   style.webkitTouchCallout = '';
+  style.webkitUserModify = '';
   el.setAttribute('contenteditable', disabled ? 'false' : 'true');
 }
 /**
