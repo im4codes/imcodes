@@ -469,13 +469,13 @@ describe('controlled-node executable release wiring', () => {
     const runner = readFileSync('src/node/computer-use-runner.ts', 'utf8');
     const workflow = readFileSync('.github/workflows/build-node-exe.yml', 'utf8');
 
-    expect(packageJson.devDependencies?.['open-computer-use']).toBe('0.3.3');
+    expect(packageJson.devDependencies?.['open-computer-use']).toBe('1.1.4');
     const packageLock = JSON.parse(readFileSync('package-lock.json', 'utf8')) as {
       packages?: Record<string, { version?: string; integrity?: string }>;
     };
     expect(packageLock.packages?.['node_modules/open-computer-use']).toMatchObject({
-      version: '0.3.3',
-      integrity: 'sha512-A4xCoXgu+Mwi2OdhL15FHY/VcnhhxIJwRgSmC2LwX9mTya85VO2NZN8PNholvgQeTeOlPpej+eEucHXtPhhVrA==',
+      version: '1.1.4',
+      integrity: 'sha512-rx2QUxvzb1ZFGKQjtk8J1eBIyUwv4xCSt7Pz7bA4Pq/zBNFGiGRe8Y36e/pxCDpvBXcZK7nZORSTv2P/0pPtWQ==',
     });
     expect(copyScript).toContain("require.resolve('open-computer-use/package.json')");
     expect(copyScript).toContain('open-computer-use must use an exact semver pin');
