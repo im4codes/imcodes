@@ -367,8 +367,10 @@ describe('mobile server menu shared-entry reachability', () => {
             await session.detach();
           }
 
-          await page.mouse.wheel(0, -10000);
-          await vi.waitFor(async () => expect(await page.locator('.mobile-server-menu-body').evaluate((element) => element.scrollTop)).toBe(0));
+          await vi.waitFor(async () => {
+            await page.mouse.wheel(0, -10000);
+            expect(await page.locator('.mobile-server-menu-body').evaluate((element) => element.scrollTop)).toBe(0);
+          }, { timeout: 5000, interval: 100 });
           await page.getByRole('button', { name: 'Owned 0', exact: false }).tap();
         }
       } finally { await browser.close(); }
