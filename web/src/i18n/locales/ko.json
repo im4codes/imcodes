@@ -718,6 +718,7 @@
     "transport_queue_append_failed": "메시지를 추가하지 못했습니다. 대기열에는 그대로 남아 있습니다.",
     "stop_appended_queue": "대기열 메시지를 추가했습니다. 세션은 계속 실행 중입니다.",
     "send_placeholder": "{{name}}에게 전송…",
+    "send_placeholder_mobile_voice": "길게 눌러 말하기 · 탭하여 입력",
     "send_placeholder_desktop_upload": "{{placeholder}} 여러 파일 붙여넣기 또는 드래그 빠른 업로드 지원",
     "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ 명령 · # 문구 · @ 파일/에이전트 · ; 별칭 · ^ 노드 · % 작업 · 파일 붙여넣기/드래그",
     "composer_target_label": "보낼 대상",
@@ -1551,8 +1552,8 @@
     "buffering_hint": "음성을 인식하는 중...",
     "hold_to_talk": "길게 눌러 말하기",
     "release_to_send": "놓아서 전송",
-    "slide_left_cancel": "👈 왼쪽으로 밀어 취소",
-    "slide_right_edit": "👉 오른쪽으로 밀어 편집",
+    "slide_left_cancel": "왼쪽 · 취소",
+    "slide_right_edit": "편집 · 오른쪽",
     "release_to_cancel": "놓아서 녹음 취소",
     "release_to_edit": "놓아서 텍스트 편집"
   },

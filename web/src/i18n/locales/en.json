@@ -718,6 +718,7 @@
     "transport_queue_append_failed": "Could not append the message; it remains queued.",
     "stop_appended_queue": "Queued messages appended; the session is still running.",
     "send_placeholder": "Send to {{name}}…",
+    "send_placeholder_mobile_voice": "Hold to talk · tap to type",
     "send_placeholder_desktop_upload": "{{placeholder}} Supports fast multi-file paste or drag upload",
     "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ commands · # phrases · @ files/agents · ; aliases · ^ nodes · % tasks · paste or drag files",
     "composer_target_label": "Sending to",
@@ -1551,8 +1552,8 @@
     "buffering_hint": "Recognizing speech...",
     "hold_to_talk": "Hold to talk",
     "release_to_send": "Release to send",
-    "slide_left_cancel": "👈 Slide left to cancel",
-    "slide_right_edit": "👉 Slide right to edit",
+    "slide_left_cancel": "Slide left · Cancel",
+    "slide_right_edit": "Edit · Slide right",
     "release_to_cancel": "Release to cancel recording",
     "release_to_edit": "Release to edit text"
   },

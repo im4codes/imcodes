@@ -718,6 +718,7 @@
     "transport_queue_append_failed": "No se pudo añadir el mensaje; sigue en la cola.",
     "stop_appended_queue": "Los mensajes en cola se añadieron; la sesión sigue en ejecución.",
     "send_placeholder": "Enviar a {{name}}…",
+    "send_placeholder_mobile_voice": "Mantén para hablar · toca para escribir",
     "send_placeholder_desktop_upload": "{{placeholder}} Admite carga rápida pegando o arrastrando varios archivos",
     "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ comandos · # frases · @ archivos/agentes · ; alias · ^ nodos · % tareas · pega o arrastra archivos",
     "composer_target_label": "Enviando a",
@@ -1551,8 +1552,8 @@
     "buffering_hint": "Reconociendo voz...",
     "hold_to_talk": "Mantén pulsado para hablar",
     "release_to_send": "Suelta para enviar",
-    "slide_left_cancel": "👈 Desliza a la izq. para cancelar",
-    "slide_right_edit": "👉 Desliza a la der. para editar",
+    "slide_left_cancel": "Izq. · Cancelar",
+    "slide_right_edit": "Editar · Der.",
     "release_to_cancel": "Suelta para cancelar la grabación",
     "release_to_edit": "Suelta para editar el texto"
   },

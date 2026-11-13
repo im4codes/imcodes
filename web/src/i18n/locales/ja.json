@@ -718,6 +718,7 @@
     "transport_queue_append_failed": "メッセージを追加できませんでした。キューには残っています。",
     "stop_appended_queue": "キューのメッセージを追加しました。セッションは実行中です。",
     "send_placeholder": "{{name}} へ送信…",
+    "send_placeholder_mobile_voice": "長押しで話す · タップで入力",
     "send_placeholder_desktop_upload": "{{placeholder}} 複数ファイルの貼り付け/ドラッグによる高速アップロードに対応",
     "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ コマンド · # フレーズ · @ ファイル/Agent · ; エイリアス · ^ ノード · % タスク · ファイルを貼り付け/ドラッグ",
     "composer_target_label": "送信先",
@@ -1551,8 +1552,8 @@
     "buffering_hint": "音声を認識しています...",
     "hold_to_talk": "長押しで話す",
     "release_to_send": "離して送信",
-    "slide_left_cancel": "👈 左スワイプでキャンセル",
-    "slide_right_edit": "👉 右スワイプで編集",
+    "slide_left_cancel": "左スワイプ · キャンセル",
+    "slide_right_edit": "編集 · 右スワイプ",
     "release_to_cancel": "離して録音をキャンセル",
     "release_to_edit": "離してテキストを編集"
   },

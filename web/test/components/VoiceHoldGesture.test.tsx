@@ -1,6 +1,9 @@
 /**
  * @vitest-environment jsdom
  */
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render } from '@testing-library/preact';
 
@@ -160,7 +163,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     document.body.innerHTML = '';
   });
 
-  it('short tap (<350ms) focuses composer input for keyboard typing without starting voice recording', async () => {
+  it('short tap (<240ms) focuses composer input for keyboard typing without starting voice recording', async () => {
     const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
     render(
       <SessionControls
@@ -174,16 +177,24 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     );
 
     const input = document.querySelector('.controls-input') as HTMLElement;
+    const composer = document.querySelector('.controls-composer') as HTMLElement;
     expect(document.activeElement).not.toBe(input);
 
     // Must not call preventDefault on pointerdown so iOS/Android tap-to-open-IME still fires natively.
     expect(dispatchPointer(input, 'pointerdown', 180)).toBe(true);
+    expect(composer.classList.contains('controls-composer-voice-pending')).toBe(true);
+    expect(input.style.userSelect).toBe('none');
+    expect(input.getAttribute('contenteditable')).toBe('true');
+
     await vi.advanceTimersByTimeAsync(120);
     dispatchPointer(input, 'pointerup', 180);
 
     expect(voiceMock.startListening).not.toHaveBeenCalled();
     expect(document.querySelector('.voice-hold-hud')).toBeNull();
     expect(document.activeElement).toBe(input);
+    expect(composer.classList.contains('controls-composer-voice-pending')).toBe(false);
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(input.style.userSelect).toBe('');
   });
 
   it('shields composer focus from stale compatibility mousedown after a touch short tap while allowing genuine subsequent taps', async () => {
@@ -240,7 +251,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(genuineMouseDown.defaultPrevented).toBe(false);
   });
 
-  it('holds 350ms -> vibrates & suppresses keyboard -> shows 3-zone HUD with recognizing feedback -> releases in center to auto-send', async () => {
+  it('holds 240ms -> vibrates & suppresses iOS loupe/keyboard -> shows 3-zone sci-fi HUD with SVG arrows -> releases in center to auto-send', async () => {
     const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
     render(
       <SessionControls
@@ -254,17 +265,34 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     );
 
     const input = document.querySelector('.controls-input') as HTMLElement;
+    const composer = document.querySelector('.controls-composer') as HTMLElement;
     dispatchPointer(input, 'pointerdown', 180);
-    await vi.advanceTimersByTimeAsync(350);
+
+    // Not triggered at 239ms; still pending with selection/callout lock
+    await vi.advanceTimersByTimeAsync(239);
+    expect(voiceMock.startListening).not.toHaveBeenCalled();
+    expect(composer.classList.contains('controls-composer-voice-pending')).toBe(true);
+    expect(composer.classList.contains('controls-composer-voice-holding')).toBe(false);
+
+    // Triggers exactly at 240ms (+1ms)
+    await vi.advanceTimersByTimeAsync(1);
 
     expect(vibrate).toHaveBeenCalledWith(20);
     expect(document.activeElement).not.toBe(input);
     expect(voiceMock.startListening).toHaveBeenCalledTimes(1);
+    expect(composer.classList.contains('controls-composer-voice-pending')).toBe(false);
+    expect(composer.classList.contains('controls-composer-voice-holding')).toBe(true);
+    expect(input.getAttribute('contenteditable')).toBe('false');
 
-    // HUD shows all 3 gesture prompts and recognizing status
+    // HUD shows all 3 gesture prompts, recognizing status, sci-fi grid, status dot, and SVG arrows
     const hud = document.querySelector('.voice-hold-hud') as HTMLElement;
     expect(hud).not.toBeNull();
     expect(hud.getAttribute('data-zone')).toBe('send');
+    expect(hud.style.getPropertyValue('--voice-slide-x')).toBe('0px');
+    expect(hud.querySelector('.voice-hold-hud-grid')).not.toBeNull();
+    expect(hud.querySelector('.voice-status-dot.voice-status-dot-active')).not.toBeNull();
+    expect(hud.querySelector('.voice-hold-zone-cancel svg')).not.toBeNull();
+    expect(hud.querySelector('.voice-hold-zone-edit svg')).not.toBeNull();
     expect(hud.textContent).toContain('voice.slide_left_cancel');
     expect(hud.textContent).toContain('voice.release_to_send');
     expect(hud.textContent).toContain('voice.slide_right_edit');
@@ -276,7 +304,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(document.querySelector('.voice-hold-hud-transcript')?.textContent).toBe('你好 IM.codes');
 
-    // Release in center zone drains stopListening and sends immediately
+    // Release in center zone drains stopListening and sends immediately, restoring contenteditable
     voiceMock.stopListening.mockImplementationOnce(async () => {
       voiceMock.partialHandler?.('你好 IM.codes 最终');
     });
@@ -288,9 +316,12 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       text: '你好 IM.codes 最终',
     }));
     expect(document.querySelector('.voice-hold-hud')).toBeNull();
+    expect(composer.classList.contains('controls-composer-voice-holding')).toBe(false);
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(input.style.userSelect).toBe('');
   });
 
-  it('holds 350ms -> slides left into cancel zone -> highlights red & discards recording on release', async () => {
+  it('holds 240ms -> slides left into cancel zone -> highlights red & discards recording on release', async () => {
     const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
     render(
       <SessionControls
@@ -305,7 +336,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
 
     const input = document.querySelector('.controls-input') as HTMLElement;
     dispatchPointer(input, 'pointerdown', 200);
-    await vi.advanceTimersByTimeAsync(350);
+    await vi.advanceTimersByTimeAsync(240);
 
     voiceMock.partialHandler?.('誤って話した内容');
     dispatchPointer(input, 'pointermove', 130); // dx = -70 <= -44 (left cancel zone)
@@ -313,6 +344,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
 
     const hud = document.querySelector('.voice-hold-hud') as HTMLElement;
     expect(hud.getAttribute('data-zone')).toBe('cancel');
+    expect(hud.style.getPropertyValue('--voice-slide-x')).toBe('-70px');
     expect(document.querySelector('.voice-hold-zone-cancel')?.classList.contains('is-active')).toBe(true);
     expect(document.querySelector('.voice-hold-hud-active-hint')?.textContent).toBe('voice.release_to_cancel');
 
@@ -322,9 +354,10 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(voiceMock.stopListening).toHaveBeenCalledTimes(1);
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
     expect(document.querySelector('.mock-voice-overlay')).toBeNull();
+    expect(input.getAttribute('contenteditable')).toBe('true');
   });
 
-  it('holds 350ms -> slides right into edit zone -> highlights blue & opens VoiceOverlay in edit mode on release', async () => {
+  it('holds 240ms -> slides right into edit zone -> highlights blue & opens VoiceOverlay in edit mode on release', async () => {
     const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
     render(
       <SessionControls
@@ -339,7 +372,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
 
     const input = document.querySelector('.controls-input') as HTMLElement;
     dispatchPointer(input, 'pointerdown', 160);
-    await vi.advanceTimersByTimeAsync(350);
+    await vi.advanceTimersByTimeAsync(240);
 
     voiceMock.partialHandler?.('需要二次修改的文字');
     dispatchPointer(input, 'pointermove', 230); // dx = +70 >= +44 (right edit zone)
@@ -347,6 +380,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
 
     const hud = document.querySelector('.voice-hold-hud') as HTMLElement;
     expect(hud.getAttribute('data-zone')).toBe('edit');
+    expect(hud.style.getPropertyValue('--voice-slide-x')).toBe('70px');
     expect(document.querySelector('.voice-hold-zone-edit')?.classList.contains('is-active')).toBe(true);
     expect(document.querySelector('.voice-hold-hud-active-hint')?.textContent).toBe('voice.release_to_edit');
 
@@ -360,6 +394,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(overlay).not.toBeNull();
     expect(overlay.getAttribute('data-initial-text')).toBe('需要二次修改的文字');
     expect(overlay.getAttribute('data-auto-start')).toBe('false');
+    expect(input.getAttribute('contenteditable')).toBe('true');
   });
 
   it('failed microphone start shows localized error banner and never sends existing unsent draft on release', async () => {
@@ -595,5 +630,234 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     dispatchPointer(input, 'pointerup', 180);
     await vi.advanceTimersByTimeAsync(0);
     expect(activeListening).toBe(false);
+  });
+
+  it('uses mobile voice hold placeholder and controls-composer-voice-ready only when mobile + connected + VoiceInput available', () => {
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    const { rerender } = render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const mobileInput = document.querySelector('.controls-input') as HTMLElement;
+    const mobileComposer = document.querySelector('.controls-composer') as HTMLElement;
+    expect(mobileInput.getAttribute('data-placeholder')).toBe('session.send_placeholder_mobile_voice');
+    expect(mobileComposer.classList.contains('controls-composer-voice-ready')).toBe(true);
+
+    // Non-voice mobile fallback keeps session.send_placeholder and omits voice-ready
+    voiceMock.isAvailable.mockReturnValue(false);
+    rerender(
+      <SessionControls
+        ws={{ ...ws, connected: true }}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+    expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('session.send_placeholder');
+    expect(document.querySelector('.controls-composer')?.classList.contains('controls-composer-voice-ready')).toBe(false);
+
+    // Disconnected mobile shows send_queued and omits voice-ready
+    voiceMock.isAvailable.mockReturnValue(true);
+    rerender(
+      <SessionControls
+        ws={{ ...ws, connected: false }}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+    expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('session.send_queued');
+    expect(document.querySelector('.controls-composer')?.classList.contains('controls-composer-voice-ready')).toBe(false);
+
+    // Desktop layout keeps desktop shortcuts placeholder and never marks voice-ready or starts 240ms voice hold
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1024 });
+    rerender(
+      <SessionControls
+        ws={{ ...ws, connected: true }}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+    const desktopInput = document.querySelector('.controls-input') as HTMLElement;
+    expect(desktopInput.getAttribute('data-placeholder')).toBe('session.send_placeholder_desktop_shortcuts');
+    expect(document.querySelector('.controls-composer')?.classList.contains('controls-composer-voice-ready')).toBe(false);
+    dispatchPointer(desktopInput, 'pointerdown', 180);
+    vi.advanceTimersByTime(300);
+    expect(voiceMock.startListening).not.toHaveBeenCalled();
+  });
+
+  it('suppresses selectstart and contextmenu during pending/active hold and restores contenteditable/styles across fail, cancel, lostcapture, and unmount', async () => {
+    const removeAllRanges = vi.fn();
+    const origGetSelection = window.getSelection;
+    Object.defineProperty(window, 'getSelection', {
+      configurable: true,
+      value: () => ({ removeAllRanges }),
+    });
+    try {
+      const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+      const view = render(
+        <SessionControls
+          ws={ws}
+          activeSession={makeSession()}
+          quickData={makeQuickData()}
+          sessions={[]}
+          subSessions={[]}
+          serverId="srv-1"
+        />,
+      );
+
+      const input = document.querySelector('.controls-input') as HTMLElement;
+
+      // Short tap: pending suppresses selectstart/contextmenu, then release cleanly re-enables them
+      dispatchPointer(input, 'pointerdown', 180);
+      const pendingSelect = new Event('selectstart', { bubbles: true, cancelable: true });
+      const pendingMenu = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+      expect(fireEvent(input, pendingSelect)).toBe(false);
+      expect(fireEvent(input, pendingMenu)).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(100);
+      dispatchPointer(input, 'pointerup', 180);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(input.getAttribute('contenteditable')).toBe('true');
+      expect(input.style.userSelect).toBe('');
+      expect(fireEvent(input, new Event('selectstart', { bubbles: true, cancelable: true }))).toBe(true);
+      expect(fireEvent(input, new MouseEvent('contextmenu', { bubbles: true, cancelable: true }))).toBe(true);
+
+      // Failed mic start restores contenteditable="true" and clears inline userSelect
+      voiceMock.startListening.mockResolvedValueOnce(false);
+      dispatchPointer(input, 'pointerdown', 180);
+      await vi.advanceTimersByTimeAsync(240);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(input.getAttribute('contenteditable')).toBe('true');
+      expect(input.style.userSelect).toBe('');
+
+      // Active hold suppresses selectstart/contextmenu & calls removeAllRanges, then pointercancel restores
+      dispatchPointer(input, 'pointerdown', 180);
+      await vi.advanceTimersByTimeAsync(240);
+      expect(removeAllRanges).toHaveBeenCalled();
+      expect(input.getAttribute('contenteditable')).toBe('false');
+      expect(fireEvent(input, new Event('selectstart', { bubbles: true, cancelable: true }))).toBe(false);
+      expect(fireEvent(input, new MouseEvent('contextmenu', { bubbles: true, cancelable: true }))).toBe(false);
+
+      dispatchPointer(input, 'pointercancel', 180);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(input.getAttribute('contenteditable')).toBe('true');
+      expect(input.style.userSelect).toBe('');
+
+      // lostpointercapture during active hold cancels & restores
+      dispatchPointer(input, 'pointerdown', 180);
+      await vi.advanceTimersByTimeAsync(240);
+      expect(input.getAttribute('contenteditable')).toBe('false');
+      dispatchPointer(input, 'lostpointercapture', 180);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(input.getAttribute('contenteditable')).toBe('true');
+      expect(input.style.userSelect).toBe('');
+
+      // Unmount mid-drain restores contenteditable and inline userSelect on the composer element
+      let releaseDrain!: () => void;
+      voiceMock.stopListening.mockImplementationOnce(() => new Promise<void>((r) => { releaseDrain = r; }));
+      dispatchPointer(input, 'pointerdown', 180);
+      await vi.advanceTimersByTimeAsync(240);
+      dispatchPointer(input, 'pointerup', 180);
+      await vi.advanceTimersByTimeAsync(0);
+      view.unmount();
+      expect(input.getAttribute('contenteditable')).toBe('true');
+      expect(input.style.userSelect).toBe('');
+      releaseDrain();
+      await vi.advanceTimersByTimeAsync(0);
+    } finally {
+      Object.defineProperty(window, 'getSelection', { configurable: true, value: origGetSelection });
+    }
+  });
+
+  it('tracks ±44px zone boundaries, clamps --voice-slide-x to ±84px, and auto-scrolls transcript on growth', async () => {
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = document.querySelector('.controls-input') as HTMLElement;
+    dispatchPointer(input, 'pointerdown', 200);
+    await vi.advanceTimersByTimeAsync(240);
+
+    const hud = document.querySelector('.voice-hold-hud') as HTMLElement;
+    const transcript = document.querySelector('.voice-hold-hud-transcript') as HTMLElement;
+    Object.defineProperty(transcript, 'scrollHeight', { configurable: true, value: 420 });
+
+    voiceMock.partialHandler?.('Line 1\nLine 2\nLine 3\nLine 4\nLine 5');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(transcript.scrollTop).toBe(420);
+
+    // -43 stays in send zone, -44 flips to cancel, -150 clamps --voice-slide-x to -84px
+    dispatchPointer(input, 'pointermove', 157);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(hud.getAttribute('data-zone')).toBe('send');
+    expect(hud.style.getPropertyValue('--voice-slide-x')).toBe('-43px');
+
+    dispatchPointer(input, 'pointermove', 156);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(hud.getAttribute('data-zone')).toBe('cancel');
+    expect(hud.style.getPropertyValue('--voice-slide-x')).toBe('-44px');
+
+    dispatchPointer(input, 'pointermove', 50);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(hud.getAttribute('data-zone')).toBe('cancel');
+    expect(hud.style.getPropertyValue('--voice-slide-x')).toBe('-84px');
+
+    // +43 stays in send zone, +44 flips to edit, +180 clamps --voice-slide-x to 84px
+    dispatchPointer(input, 'pointermove', 243);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(hud.getAttribute('data-zone')).toBe('send');
+    expect(hud.style.getPropertyValue('--voice-slide-x')).toBe('43px');
+
+    dispatchPointer(input, 'pointermove', 244);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(hud.getAttribute('data-zone')).toBe('edit');
+    expect(hud.style.getPropertyValue('--voice-slide-x')).toBe('44px');
+
+    dispatchPointer(input, 'pointermove', 380);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(hud.getAttribute('data-zone')).toBe('edit');
+    expect(hud.style.getPropertyValue('--voice-slide-x')).toBe('84px');
+
+    dispatchPointer(input, 'pointerup', 380);
+    await vi.advanceTimersByTimeAsync(0);
+  });
+
+  it('provides non-empty mobile voice placeholder and clean slide zone labels across all 7 locales', () => {
+    const localesDir = resolve(dirname(fileURLToPath(import.meta.url)), '../../src/i18n/locales');
+    for (const locale of ['en', 'es', 'ja', 'ko', 'ru', 'zh-CN', 'zh-TW']) {
+      const data = JSON.parse(readFileSync(resolve(localesDir, `${locale}.json`), 'utf8')) as {
+        session: Record<string, string>;
+        voice: Record<string, string>;
+      };
+      expect(typeof data.session.send_placeholder_mobile_voice).toBe('string');
+      expect(data.session.send_placeholder_mobile_voice.trim().length).toBeGreaterThan(0);
+      expect(data.voice.slide_left_cancel.trim().length).toBeGreaterThan(0);
+      expect(data.voice.slide_right_edit.trim().length).toBeGreaterThan(0);
+      expect(data.voice.slide_left_cancel).not.toContain('👈');
+      expect(data.voice.slide_right_edit).not.toContain('👉');
+    }
   });
 });

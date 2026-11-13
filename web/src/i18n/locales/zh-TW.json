@@ -718,6 +718,7 @@
     "transport_queue_append_failed": "追加失敗，訊息仍保留在佇列中。",
     "stop_appended_queue": "已追加佇列訊息，本次未停止工作階段。",
     "send_placeholder": "傳送給 {{name}}…",
+    "send_placeholder_mobile_voice": "按住說話 · 輕點輸入",
     "send_placeholder_desktop_upload": "{{placeholder}} 支援多檔案貼上或拖曳快速上傳",
     "send_placeholder_desktop_shortcuts": "{{placeholder}}\n/ 指令 · # 短語 · @ 檔案/Agent · ; 別名 · ^ 受控節點 · % 任務 · 可貼上或拖入檔案",
     "composer_target_label": "傳送至",
@@ -1551,8 +1552,8 @@
     "buffering_hint": "正在辨識語音...",
     "hold_to_talk": "按住說話",
     "release_to_send": "放開 傳送",
-    "slide_left_cancel": "👈 左滑 取消",
-    "slide_right_edit": "👉 右滑 編輯",
+    "slide_left_cancel": "左滑 取消",
+    "slide_right_edit": "右滑 編輯",
     "release_to_cancel": "放開取消錄音",
     "release_to_edit": "放開進入編輯"
   },

@@ -29,6 +29,7 @@ const { mockI18n, directFileTransferMocks, voiceOverlayMock } = vi.hoisted(() =>
     props: null as null | { draftScope?: string | null; sessionLabel?: string },
     notepad: { instruction: 'Summarize it', transcript: '', onAccepted: (() => {}) as () => void },
     result: null as Promise<'accepted' | 'pending' | 'rejected'> | null,
+    inputAvailable: true,
   },
 }));
 
@@ -124,6 +125,9 @@ vi.mock('react-i18next', () => ({
       if (key === 'share.role.system') return 'System';
       if (key === 'session.send_placeholder') {
         return `Send to ${String(opts?.name ?? 'session')}…`;
+      }
+      if (key === 'session.send_placeholder_mobile_voice') {
+        return 'Hold to talk · tap to type';
       }
       if (key === 'session.send_placeholder_desktop_upload') {
         return `${String(opts?.placeholder ?? '')} Supports fast multi-file paste or drag upload`;
@@ -258,7 +262,7 @@ vi.mock('../../src/components/VoiceOverlay.js', () => ({
 }));
 
 vi.mock('../../src/components/VoiceInput.js', () => ({
-  isAvailable: () => true,
+  isAvailable: () => voiceOverlayMock.inputAvailable,
 }));
 
 vi.mock('../../src/components/AtPicker.js', () => ({
@@ -1076,8 +1080,15 @@ afterEach(() => {
 
   it('keeps the placeholder short on mobile', () => {
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
-    render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
-    expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project…');
+    const view = render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Hold to talk · tap to type');
+    voiceOverlayMock.inputAvailable = false;
+    try {
+      view.rerender(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+      expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project…');
+    } finally {
+      voiceOverlayMock.inputAvailable = true;
+    }
   });
 
   it('shows the current desktop target on focus and tracks session switches', () => {
