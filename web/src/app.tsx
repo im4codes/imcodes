@@ -2908,27 +2908,37 @@ function InternalMainApp() {
     setSubSessionMaximized(id, false);
   }, [setSubSessionMaximized]);
 
+  const isPinnedPanelForServer = useCallback((panel: PinnedPanel, serverId: string | null | undefined): boolean => (
+    !panel.props?.serverId || !serverId || panel.props.serverId === serverId
+  ), []);
+
   const isSubSessionPinnedPanel = useCallback((id: string): boolean => {
     const sub = subSessionsRef.current.find((candidate) => candidate.id === id);
     if (!sub) return false;
+    const targetServerId = sub.serverId ?? selectedServerIdRef.current;
     return pinnedPanels.some((panel) => (
-      panel.type === 'subsession' && panel.props?.sessionName === sub.sessionName
+      panel.type === 'subsession'
+      && panel.props?.sessionName === sub.sessionName
+      && isPinnedPanelForServer(panel, targetServerId)
     ));
-  }, [pinnedPanels]);
+  }, [isPinnedPanelForServer, pinnedPanels]);
 
   const unpinSubSessionPanel = useCallback((id: string): boolean => {
     const sub = subSessionsRef.current.find((candidate) => candidate.id === id);
     if (!sub) return false;
+    const targetServerId = sub.serverId ?? selectedServerIdRef.current;
     let removed = false;
     setPinnedPanels((prev) => {
       const next = prev.filter((panel) => !(
-        panel.type === 'subsession' && panel.props?.sessionName === sub.sessionName
+        panel.type === 'subsession'
+        && panel.props?.sessionName === sub.sessionName
+        && isPinnedPanelForServer(panel, targetServerId)
       ));
       removed = next.length !== prev.length;
       return removed ? next : prev;
     });
     return removed;
-  }, [setPinnedPanels]);
+  }, [isPinnedPanelForServer, setPinnedPanels]);
 
   const minimizeSubSessionWindow = useCallback((id: string) => {
     clearSubSessionMaximized(id);
@@ -3727,6 +3737,55 @@ function InternalMainApp() {
     return states;
   }, [managedSharedSessionStateByName, managedSharedStateByTarget, selectedServerId, selectedServerSharedOutState, sharedActiveDispatchIds, subSessions]);
 
+  const resetServerScopedOverlaysAndTargets = useCallback(() => {
+    askAnswerTrackerRef.current?.dispose();
+    dismissedQuestionsRef.current.clear();
+    detectedModelsRef.current = new Map();
+    subUsageBatcherRef.current?.cancel();
+    activeSplitPairRef.current = null;
+    (window as Window & { __imcodesActiveSplitTaskId?: string | null }).__imcodesActiveSplitTaskId = null;
+    setActiveSplitPairTaskId(null);
+    setPendingQuestion(null);
+    setAskAnswerFailure(null);
+    setShareDialogTarget(null);
+    setSettingsTarget(null);
+    setCloneSessionTarget(null);
+    setPreviewFileRequest(null);
+    setPreviewFileCache({});
+    setShowRepoPage(false);
+    setRepoPanelTarget(null);
+    setRepoFocusLatestAction(null);
+    setShowCronManager(false);
+    setShowDiscussionsPage(false);
+    setDiscussionInitialId(null);
+    setDiscussionInitialTab('team');
+    setShowSharedContextManagement(false);
+    setSharedContextManagementProps({});
+    setShowSharedContextDiagnostics(false);
+    setSharedContextDiagnosticsProps({});
+    setShowDesktopFileBrowser(false);
+    setShowMobileFileBrowser(false);
+    setDesktopFileBrowserMaximized(false);
+    setShowDesktopLocalWebPreview(false);
+    setLocalWebPreviewPort('');
+    setLocalWebPreviewPath('/');
+    setShowNewSession(false);
+    setShowSubDialog(false);
+    setPoolAddTarget(null);
+    setShowDiscussionDialog(false);
+    setAppOpenSpecAutoDetailsOpen(false);
+    setRenameRequest(null);
+    setDeleteTarget(null);
+    setDaemonUpgradeConfirmTarget(null);
+    setIdleAlerts(new Set());
+    setIdleFlashTokens(new Map());
+    setDetectedModels(new Map());
+    setSubUsages(new Map());
+    setP2pSessionNames(new Set());
+    setPendingNav(null);
+    setPendingPrefills({});
+  }, []);
+
   const handleOpenSharedEntry = useCallback(async (
     entry: SharedEntrySummary,
     options?: {
@@ -3832,6 +3891,15 @@ function InternalMainApp() {
       for (const subSession of opened.subSessions) {
         if (subSession.activeDispatchId) openedDispatchIds.set(subSession.sessionName, subSession.activeDispatchId);
       }
+      if (opened.server.id !== selectedServerIdRef.current) {
+        resetServerScopedOverlaysAndTargets();
+        setOpenSubIds(new Set());
+        setRetainedOpenSubIds(new Set());
+        setMaximizedSubIds(new Set());
+        setDiscussions([]);
+        setRepoContexts(new Map());
+        setManagedShares([]);
+      }
       setSharedActiveDispatchIds(openedDispatchIds);
 
       setSelectedShareTarget(opened.target);
@@ -3914,7 +3982,7 @@ function InternalMainApp() {
         setOpeningSharedEntryId(null);
       }
     }
-  }, [hydrateSharedSubSessions, resolvedSelectedServerName, selectedServerId, selectedShareTarget, servers, setActiveSession, sharedReturnServer, trans]);
+  }, [hydrateSharedSubSessions, resetServerScopedOverlaysAndTargets, resolvedSelectedServerName, selectedServerId, selectedShareTarget, servers, setActiveSession, setOpenSubIds, sharedReturnServer, trans]);
 
   useEffect(() => {
     if (initialAuthVerificationPending || !sharedHashRestorePending || !auth || !serversLoaded) return;
@@ -4320,8 +4388,13 @@ function InternalMainApp() {
         setShowDesktopFileBrowser(true);
       });
     } else if (panel.type === 'repopage') {
-      const projectDir = typeof panel.props?.projectDir === 'string' ? panel.props.projectDir : undefined;
-      const sessionId = typeof panel.props?.sessionName === 'string' ? panel.props.sessionName : activeSession ?? null;
+      const tabShare = Boolean(selectedShareTarget && selectedShareTarget.kind !== 'server');
+      const allowCaptured = isPinnedPanelForServer(panel, selectedServerId);
+      const currentProjectDir = sessions.find((s) => s.name === activeSession)?.projectDir;
+      const projectDir = tabShare
+        ? FS_SESSION_ROOT_PATH
+        : currentProjectDir ?? (allowCaptured && typeof panel.props?.projectDir === 'string' ? panel.props.projectDir : undefined);
+      const sessionId = activeSession ?? (allowCaptured && typeof panel.props?.sessionName === 'string' ? panel.props.sessionName : null);
       if (projectDir) {
         runVersionSensitiveAction(trans('repo.info_title', { defaultValue: 'Repository information' }), () => {
           removePanel();
@@ -4330,9 +4403,12 @@ function InternalMainApp() {
             sessionId,
             projectDir,
             initialTabToken: repoPanelOpenTokenRef.current,
+            parentServerId: selectedServerId ?? null,
           });
           setShowRepoPage(true);
         });
+      } else {
+        removePanel();
       }
     } else if (panel.type === 'cronmanager') {
       runVersionSensitiveAction(trans('cron.title'), () => {
@@ -4341,33 +4417,41 @@ function InternalMainApp() {
       });
     } else if (panel.type === SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE) {
       removePanel();
-      setSharedContextManagementProps(panel.props);
-      setShowSharedContextManagement(true);
+      if (isPinnedPanelForServer(panel, selectedServerId)) {
+        setSharedContextManagementProps(panel.props);
+        setShowSharedContextManagement(true);
+      }
     } else if (panel.type === SHARED_CONTEXT_DIAGNOSTICS_PANEL_TYPE) {
       removePanel();
-      setSharedContextDiagnosticsProps({
-        enterpriseId: typeof panel.props?.enterpriseId === 'string' ? panel.props.enterpriseId : undefined,
-        canonicalRepoId: typeof panel.props?.canonicalRepoId === 'string' ? panel.props.canonicalRepoId : undefined,
-        workspaceId: typeof panel.props?.workspaceId === 'string' ? panel.props.workspaceId : undefined,
-        enrollmentId: typeof panel.props?.enrollmentId === 'string' ? panel.props.enrollmentId : undefined,
-        language: typeof panel.props?.language === 'string' ? panel.props.language : undefined,
-        filePath: typeof panel.props?.filePath === 'string' ? panel.props.filePath : undefined,
-      });
-      setShowSharedContextDiagnostics(true);
+      if (isPinnedPanelForServer(panel, selectedServerId)) {
+        setSharedContextDiagnosticsProps({
+          enterpriseId: typeof panel.props?.enterpriseId === 'string' ? panel.props.enterpriseId : undefined,
+          canonicalRepoId: typeof panel.props?.canonicalRepoId === 'string' ? panel.props.canonicalRepoId : undefined,
+          workspaceId: typeof panel.props?.workspaceId === 'string' ? panel.props.workspaceId : undefined,
+          enrollmentId: typeof panel.props?.enrollmentId === 'string' ? panel.props.enrollmentId : undefined,
+          language: typeof panel.props?.language === 'string' ? panel.props.language : undefined,
+          filePath: typeof panel.props?.filePath === 'string' ? panel.props.filePath : undefined,
+        });
+        setShowSharedContextDiagnostics(true);
+      }
     } else if (panel.type === LOCAL_WEB_PREVIEW_PANEL_TYPE) {
       removePanel();
-      setLocalWebPreviewPort(String(panel.props?.port ?? ''));
-      setLocalWebPreviewPath(String(panel.props?.path ?? '/'));
-      setShowDesktopLocalWebPreview(true);
+      if (isPinnedPanelForServer(panel, selectedServerId)) {
+        setLocalWebPreviewPort(String(panel.props?.port ?? ''));
+        setLocalWebPreviewPath(String(panel.props?.path ?? '/'));
+        setShowDesktopLocalWebPreview(true);
+      }
     } else if (panel.type === 'subsession') {
       removePanel();
-      const sub = subSessions.find((s) => s.sessionName === (panel.props?.sessionName as string));
-      if (sub) {
-        setOpenSubIds((prev) => new Set([...prev, sub.id]));
-        bringSubToFront(sub.id);
+      if (isPinnedPanelForServer(panel, selectedServerId)) {
+        const sub = subSessions.find((s) => s.sessionName === (panel.props?.sessionName as string));
+        if (sub) {
+          setOpenSubIds((prev) => new Set([...prev, sub.id]));
+          bringSubToFront(sub.id);
+        }
       }
     }
-  }, [activeSession, bringSubToFront, runVersionSensitiveAction, setPinnedPanels, subSessions, trans]);
+  }, [activeSession, bringSubToFront, isPinnedPanelForServer, runVersionSensitiveAction, selectedServerId, selectedShareTarget, sessions, setPinnedPanels, subSessions, trans]);
 
   const isMobile = isMobileDevice();
   isMobileRef.current = isMobile;
@@ -4397,16 +4481,24 @@ function InternalMainApp() {
   // the component instance alive.
   const openWindowSubs = useMemo(() => {
     return visibleSubSessions.filter((sub) => openSubIds.has(sub.id)
-      && (isMobile || !pinnedPanels.some((p) => p.type === 'subsession' && p.props?.sessionName === sub.sessionName)));
-  }, [visibleSubSessions, openSubIds, isMobile, pinnedPanels]);
+      && (isMobile || !pinnedPanels.some((p) => (
+        p.type === 'subsession'
+        && p.props?.sessionName === sub.sessionName
+        && isPinnedPanelForServer(p, sub.serverId ?? selectedServerId)
+      ))));
+  }, [visibleSubSessions, openSubIds, isMobile, pinnedPanels, isPinnedPanelForServer, selectedServerId]);
   const visibleOpenWindowIds = useMemo(
     () => new Set(openWindowSubs.map((sub) => sub.id)),
     [openWindowSubs],
   );
   const retainedWindowSubs = useMemo(() => (
     subSessions.filter((sub) => retainedOpenSubIds.has(sub.id)
-      && !pinnedPanels.some((p) => p.type === 'subsession' && p.props?.sessionName === sub.sessionName))
-  ), [pinnedPanels, retainedOpenSubIds, subSessions]);
+      && !pinnedPanels.some((p) => (
+        p.type === 'subsession'
+        && p.props?.sessionName === sub.sessionName
+        && isPinnedPanelForServer(p, sub.serverId ?? selectedServerId)
+      )))
+  ), [pinnedPanels, retainedOpenSubIds, subSessions, isPinnedPanelForServer, selectedServerId]);
   const mountedWindowCount = useProgressiveMount(retainedWindowSubs.length);
   const defaultViewMode: ViewMode = isMobile ? 'chat' : 'terminal';
   // Per-session view mode: Record<sessionName, ViewMode>
@@ -5996,7 +6088,6 @@ function InternalMainApp() {
     staleSubSessionsSnapshotRef.current = rawSubSessionsRef.current;
     managedSharesGenerationRef.current += 1;
     explicitSelectionServerRef.current = null;
-    askAnswerTrackerRef.current?.dispose();
     if (sessionListRetryRef.current) {
       clearTimeout(sessionListRetryRef.current);
       sessionListRetryRef.current = null;
@@ -6005,6 +6096,7 @@ function InternalMainApp() {
       clearTimeout(daemonOfflineGraceTimerRef.current);
       daemonOfflineGraceTimerRef.current = null;
     }
+    resetServerScopedOverlaysAndTargets();
     setSessions([]);
     setSessionsLoaded(false);
     setActiveSession(null, { remember: false });
@@ -6012,8 +6104,6 @@ function InternalMainApp() {
     setRetainedOpenSubIds(new Set());
     setMaximizedSubIds(new Set());
     setSharedActiveDispatchIds(new Map());
-    setPendingQuestion(null);
-    setAskAnswerFailure(null);
     setDaemonStats(null);
     setDaemonOnline(false);
     setConnected(false);
@@ -6022,14 +6112,7 @@ function InternalMainApp() {
     setDiscussions([]);
     setRepoContexts(new Map());
     setManagedShares([]);
-    setSettingsTarget(null);
-    setCloneSessionTarget(null);
-    setPreviewFileRequest(null);
-    setShowRepoPage(false);
-    setShowCronManager(false);
-    setShowDiscussionsPage(false);
-    setDesktopFileBrowserMaximized(false);
-  }, [setActiveSession, setOpenSubIds]);
+  }, [resetServerScopedOverlaysAndTargets, setActiveSession, setOpenSubIds]);
 
   const switchToOwnedServerInApp = useCallback((serverId: string, serverName?: string | null) => {
     setManualDashboard(false);
@@ -6292,6 +6375,12 @@ function InternalMainApp() {
         ? servers.find((server) => server.id === route.serverId)
         : undefined;
       if (ownedServer) {
+        const switchingServers = ownedServer.id !== selectedServerIdRef.current;
+        if (switchingServers) {
+          resetServerScopedStateForSwitch();
+        } else if (selectedShareTarget !== null) {
+          resetServerScopedOverlaysAndTargets();
+        }
         // Converge atomically onto the owned server; any prior shared authority
         // is dropped in the same turn so no privileged pane survives the move.
         setSelectedShareTarget(null);
@@ -6306,9 +6395,10 @@ function InternalMainApp() {
           sessionName: route.sessionName,
           sharedEntryId: null,
         };
+        selectedServerIdRef.current = ownedServer.id;
         setSelectedServerId(ownedServer.id);
         setSelectedServerName(ownedServer.name ?? null);
-        const routeSessionIsLoaded = route.sessionName
+        const routeSessionIsLoaded = !switchingServers && route.sessionName
           ? sessions.some((session) => session.name === route.sessionName && isNavigableMainSession(session))
           : false;
         setActiveSession(routeSessionIsLoaded ? route.sessionName : null);
@@ -6693,6 +6783,10 @@ function InternalMainApp() {
     externalRouteInFlightKeyRef.current = null;
     setOpeningSharedEntryId(null);
     autoEntryRunRef.current++;
+    resetServerScopedOverlaysAndTargets();
+    setOpenSubIds(new Set());
+    setRetainedOpenSubIds(new Set());
+    setMaximizedSubIds(new Set());
     setManualDashboard(true);
     localStorage.removeItem('rcc_server');
     localStorage.removeItem('rcc_server_name');
@@ -6704,7 +6798,7 @@ function InternalMainApp() {
     setSelectedSharedEntryId(null);
     setActiveSession(null);
     setShowMobileServerMenu(false);
-  }, [setActiveSession]);
+  }, [resetServerScopedOverlaysAndTargets, setActiveSession, setOpenSubIds]);
 
   const canStopProjectForCurrentShare = !selectedShareTarget || (
     selectedShareTarget.kind === 'server'
@@ -7135,14 +7229,64 @@ function InternalMainApp() {
   );
 
   const visiblePinnedPanels = useMemo(() =>
-    pinnedPanels.filter((p) => (
-      p.id
-      && p.props
-      && (p.type !== 'subsession' || !p.props.serverId || p.props.serverId === selectedServerId)
-      && (p.type !== LOCAL_WEB_PREVIEW_PANEL_TYPE || !p.props.serverId || p.props.serverId === selectedServerId)
-    )),
-    [pinnedPanels, selectedServerId]
+    pinnedPanels.filter((p) => {
+      if (!p.id || !p.props) return false;
+      if (
+        p.type === 'subsession'
+        || p.type === LOCAL_WEB_PREVIEW_PANEL_TYPE
+        || p.type === SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE
+        || p.type === SHARED_CONTEXT_DIAGNOSTICS_PANEL_TYPE
+      ) {
+        return isPinnedPanelForServer(p, selectedServerId);
+      }
+      return true;
+    }),
+    [isPinnedPanelForServer, pinnedPanels, selectedServerId]
   );
+
+  const renderSidebarPinnedPanels = (onAfterPreview?: () => void) => {
+    const sessionsLoading = !sessionsLoaded && Boolean(selectedServerId);
+    const sharedCtx: PanelRenderContext = {
+      ws: wsRef.current,
+      connected,
+      serverId: selectedServerId ?? '',
+      subSessions,
+      inputRefsMap,
+      onPreviewFile: (request) => {
+        handlePreviewFileRequest({ ...request, sourcePreviewLive: false });
+        onAfterPreview?.();
+      },
+      onOpenLocalWebPreview: openLocalWebPreviewFromChat,
+      onPreviewStateChange: handlePreviewStateChange,
+      activeSession,
+      activeProjectDir: activeSessionInfo?.projectDir,
+      sessionsLoading,
+      sharedAccessRole,
+      shareTargetKind: selectedShareTarget?.kind ?? null,
+      sharedSessionName: canonicalSharedSessionName,
+      sessions,
+      servers: orderedServers.map((s) => ({ id: s.id, name: s.name })),
+      onQuote: (text) => {
+        const inputEl = activeSession ? inputRefsMap.current.get(activeSession) : null;
+        if (inputEl) {
+          const quote = `> ${text.replace(/\n/g, '\n> ')}\n`;
+          appendContentEditableTextPreservingNewlines(inputEl, quote);
+        }
+      },
+      t: trans,
+      updatePanelProps: updatePinnedPanelProps,
+    };
+    return visiblePinnedPanels.map((panel) => (
+      <SidebarPinnedPanel
+        key={panel.id}
+        panel={panel}
+        height={pinnedPanelHeights[panel.id] ?? 240}
+        onUnpin={() => unpinPanel(panel)}
+        onResize={(h) => savePinnedPanelHeight(panel.id, h)}
+        ctx={sharedCtx}
+      />
+    ));
+  };
 
   // Auto-pin file browser to sidebar on first session activation.
   // Respects user preference: once they have any pinned panels saved, don't interfere.
@@ -7520,46 +7664,8 @@ function InternalMainApp() {
               />
             ))}
 
-            {/* Pinned panels — sub-session panels filtered by current server (WS/tmux bound); others always shown */}
-            {visiblePinnedPanels.map((panel) => {
-              const height = pinnedPanelHeights[panel.id] ?? 240;
-              const ctx: PanelRenderContext = {
-                ws: wsRef.current,
-                connected,
-                serverId: selectedServerId ?? '',
-                subSessions,
-                inputRefsMap,
-                onPreviewFile: (request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: false }),
-                onOpenLocalWebPreview: openLocalWebPreviewFromChat,
-                onPreviewStateChange: handlePreviewStateChange,
-                activeSession,
-                activeProjectDir: activeSessionInfo?.projectDir,
-                sharedAccessRole,
-                shareTargetKind: selectedShareTarget?.kind ?? null,
-                sharedSessionName: canonicalSharedSessionName,
-                sessions,
-                servers: orderedServers.map(s => ({ id: s.id, name: s.name })),
-                onQuote: (text) => {
-                  const inputEl = activeSession ? inputRefsMap.current.get(activeSession) : null;
-                  if (inputEl) {
-                    const quote = `> ${text.replace(/\n/g, '\n> ')}\n`;
-                    appendContentEditableTextPreservingNewlines(inputEl, quote);
-                  }
-                },
-                t: trans,
-                updatePanelProps: updatePinnedPanelProps,
-              };
-              return (
-                <SidebarPinnedPanel
-                  key={panel.id}
-                  panel={panel}
-                  height={height}
-                  onUnpin={() => unpinPanel(panel)}
-                  onResize={(h) => savePinnedPanelHeight(panel.id, h)}
-                  ctx={ctx}
-                />
-              );
-            })}
+            {/* Pinned panels — server-bound panels filtered by current server; follow-current panels wait until target server hydrates */}
+            {renderSidebarPinnedPanels()}
           </Sidebar>
         </>
       )}
@@ -8463,44 +8569,7 @@ function InternalMainApp() {
                 />
               ))}
               {/* Pinned panels — same as desktop sidebar */}
-              {selectedServerId && visiblePinnedPanels.map((panel) => {
-                const height = pinnedPanelHeights[panel.id] ?? 240;
-                const ctx: PanelRenderContext = {
-                  ws: wsRef.current,
-                  connected,
-                  serverId: selectedServerId ?? '',
-                  subSessions,
-                  inputRefsMap,
-                  onPreviewFile: (request) => { handlePreviewFileRequest({ ...request, sourcePreviewLive: false }); closeSidebar(); },
-                  onOpenLocalWebPreview: openLocalWebPreviewFromChat,
-                  onPreviewStateChange: handlePreviewStateChange,
-                  activeSession,
-                  activeProjectDir: activeSessionInfo?.projectDir,
-                  sharedAccessRole,
-                  shareTargetKind: selectedShareTarget?.kind ?? null,
-                  sessions,
-                  servers: orderedServers.map(s => ({ id: s.id, name: s.name })),
-                  onQuote: (text) => {
-                    const inputEl = activeSession ? inputRefsMap.current.get(activeSession) : null;
-                    if (inputEl) {
-                      const quote = `> ${text.replace(/\n/g, '\n> ')}\n`;
-                      appendContentEditableTextPreservingNewlines(inputEl, quote);
-                    }
-                  },
-                  t: trans,
-                  updatePanelProps: updatePinnedPanelProps,
-                };
-                return (
-                  <SidebarPinnedPanel
-                    key={panel.id}
-                    panel={panel}
-                    height={height}
-                    onUnpin={() => unpinPanel(panel)}
-                    onResize={(h) => savePinnedPanelHeight(panel.id, h)}
-                    ctx={ctx}
-                  />
-                );
-              })}
+              {selectedServerId && renderSidebarPinnedPanels(closeSidebar)}
               </ErrorBoundary>
             </div>
             {/* Footer */}

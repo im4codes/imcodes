@@ -30,6 +30,39 @@ export const LOCAL_WEB_PREVIEW_PANEL_TYPE = 'localwebpreview';
 export const SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE = 'sharedcontext-management';
 export const SHARED_CONTEXT_DIAGNOSTICS_PANEL_TYPE = 'sharedcontext-diagnostics';
 
+function isCapturedPanelServerMismatch(panel: PinnedPanel, ctx: PanelRenderContext): boolean {
+  const panelServerId = typeof panel.props?.serverId === 'string' && panel.props.serverId.trim()
+    ? panel.props.serverId.trim()
+    : undefined;
+  return Boolean(panelServerId && panelServerId !== ctx.serverId);
+}
+
+function canUseCapturedPanelProps(panel: PinnedPanel, ctx: PanelRenderContext): boolean {
+  if (ctx.sessionsLoading) return false;
+  if (isCapturedPanelServerMismatch(panel, ctx)) return false;
+  const hasExplicitServerId = typeof panel.props?.serverId === 'string' && panel.props.serverId.trim().length > 0;
+  if (!hasExplicitServerId && ctx.sessions && ctx.sessions.length === 0) return false;
+  return true;
+}
+
+function resolveFollowCurrentProjectScope(panel: PinnedPanel, ctx: PanelRenderContext): {
+  loading: boolean;
+  isTabShare: boolean;
+  projectDir: string | undefined;
+  activeSession: string | undefined;
+} {
+  const isTabShare = ctx.shareTargetKind ? ctx.shareTargetKind !== 'server' : Boolean(ctx.sharedAccessRole);
+  if (!isTabShare && ctx.sessionsLoading) {
+    return { loading: true, isTabShare, projectDir: undefined, activeSession: undefined };
+  }
+  const allowCaptured = canUseCapturedPanelProps(panel, ctx);
+  const projectDir = isTabShare
+    ? FS_SESSION_ROOT_PATH
+    : ctx.activeProjectDir ?? (allowCaptured ? panel.props?.projectDir as string | undefined : undefined);
+  const activeSession = ctx.activeSession ?? (allowCaptured ? panel.props?.sessionName as string | undefined : undefined);
+  return { loading: false, isTabShare, projectDir, activeSession };
+}
+
 // ── Sub-session panel ────────────────────────────────────────────────────
 
 // SubSessionContent — compact pinned session view.
@@ -167,13 +200,11 @@ registerPanelType('subsession', {
 registerPanelType('filebrowser', {
   title: () => '📁 Files',
   render: (panel, ctx) => {
-    // Follow active tab's project dir; fall back to captured dir at pin time
-    const isTabShare = ctx.shareTargetKind ? ctx.shareTargetKind !== 'server' : Boolean(ctx.sharedAccessRole);
-    const projectDir = isTabShare
-      ? FS_SESSION_ROOT_PATH
-      : ctx.activeProjectDir ?? (panel.props?.projectDir as string | undefined);
+    // Follow active tab's project dir; fall back to captured dir only when hydration has settled for the same server.
+    const scope = resolveFollowCurrentProjectScope(panel, ctx);
+    if (scope.loading) return <div class="sidebar-pinned-unavailable">{ctx.t('common.loading')}</div>;
+    const { isTabShare, projectDir, activeSession } = scope;
     if (!ctx.ws || !projectDir) return <div class="sidebar-pinned-unavailable">No project dir</div>;
-    const activeSession = ctx.activeSession ?? panel.props?.sessionName as string | undefined;
     return (
       <FileBrowser
         key={`${ctx.serverId}:${projectDir}`}
@@ -223,16 +254,15 @@ registerPanelType('repopage', {
   title: () => 'Repository',
   render: (panel, ctx) => {
     // Follow active tab's project dir — keep mounted during WS reconnect to preserve state
-    const isTabShare = ctx.shareTargetKind ? ctx.shareTargetKind !== 'server' : Boolean(ctx.sharedAccessRole);
-    const projectDir = isTabShare
-      ? FS_SESSION_ROOT_PATH
-      : ctx.activeProjectDir ?? (panel.props?.projectDir as string | undefined);
+    const scope = resolveFollowCurrentProjectScope(panel, ctx);
+    if (scope.loading) return <div class="sidebar-pinned-unavailable">{ctx.t('common.loading')}</div>;
+    const { isTabShare, projectDir, activeSession } = scope;
     if (!ctx.ws || !projectDir) return <div class="sidebar-pinned-unavailable">No project dir</div>;
     return (
       <RepoPage
         key={`${ctx.serverId}:${projectDir}`}
         ws={ctx.ws}
-        sessionId={ctx.activeSession ?? panel.props?.sessionName as string | undefined}
+        sessionId={activeSession}
         projectDir={projectDir}
         scopeToSessionRoot={isTabShare}
         readOnly={ctx.sharedAccessRole === 'viewer'}
@@ -248,14 +278,16 @@ registerPanelType('repopage', {
 registerPanelType('cronmanager', {
   title: () => 'Scheduled Tasks',
   render: (panel, ctx) => {
-    // Derive project from active session or subsession, fall back to pinned prop
+    if (ctx.sessionsLoading) return <div class="sidebar-pinned-unavailable">{ctx.t('common.loading')}</div>;
+    // Derive project from active session or subsession, fall back to pinned prop only for the same server.
+    const allowCaptured = canUseCapturedPanelProps(panel, ctx);
     const activeSub = ctx.subSessions?.find((s) => s.sessionName === ctx.activeSession);
     const activeMain = ctx.sessions?.find((s) => s.name === ctx.activeSession);
     const parentMain = activeSub ? ctx.sessions?.find((s) => s.name === activeSub.parentSession) : null;
     const projectName = (activeMain?.project
       ?? parentMain?.project
       ?? ctx.sessions?.[0]?.project
-      ?? panel.props?.projectName as string | undefined);
+      ?? (allowCaptured ? panel.props?.projectName as string | undefined : undefined));
     if (!projectName) return <div class="sidebar-pinned-unavailable">No project</div>;
     const subSessionsSlim = ctx.subSessions.map(s => ({
       sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession,
@@ -299,6 +331,9 @@ registerPanelType(LOCAL_WEB_PREVIEW_PANEL_TYPE, {
     return `🌐 ${label}${suffix}`;
   },
   render: (panel, ctx) => {
+    if (isCapturedPanelServerMismatch(panel, ctx)) {
+      return <div class="sidebar-pinned-unavailable">No server selected</div>;
+    }
     const serverId = (panel.props?.serverId as string | undefined) ?? ctx.serverId;
     if (!serverId) return <div class="sidebar-pinned-unavailable">No server selected</div>;
     return (
@@ -321,38 +356,48 @@ registerPanelType(LOCAL_WEB_PREVIEW_PANEL_TYPE, {
 
 registerPanelType(SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE, {
   title: (_panel, ctx) => ctx?.t('sharedContext.management.title') ?? 'Shared Context',
-  render: (panel, ctx) => (
-    <SharedContextManagementPanel
-      enterpriseId={typeof panel.props?.enterpriseId === 'string' ? panel.props.enterpriseId : undefined}
-      serverId={ctx.serverId}
-      ws={ctx.ws}
-      onEnterpriseChange={(enterpriseId) => ctx.updatePanelProps?.(panel.id, { ...panel.props, enterpriseId })}
-      activeProjectDir={ctx.activeProjectDir ?? null}
-      memoryProjectCandidates={(ctx.sessions ?? [])
-        .filter((session) => Boolean(session.projectDir))
-        .map((session) => ({
-          projectDir: session.projectDir,
-          canonicalRepoId: session.contextNamespace?.projectId,
-          displayName: session.label || session.project || session.name,
-          sessionName: session.name,
-          source: session.name === ctx.activeSession ? 'active_session' as const : 'recent_session' as const,
-        }))}
-    />
-  ),
+  render: (panel, ctx) => {
+    if (isCapturedPanelServerMismatch(panel, ctx)) {
+      return <div class="sidebar-pinned-unavailable">{ctx.t('common.loading')}</div>;
+    }
+    return (
+      <SharedContextManagementPanel
+        enterpriseId={typeof panel.props?.enterpriseId === 'string' ? panel.props.enterpriseId : undefined}
+        serverId={ctx.serverId}
+        ws={ctx.ws}
+        onEnterpriseChange={(enterpriseId) => ctx.updatePanelProps?.(panel.id, { ...panel.props, enterpriseId })}
+        activeProjectDir={ctx.activeProjectDir ?? null}
+        memoryProjectCandidates={(ctx.sessions ?? [])
+          .filter((session) => Boolean(session.projectDir))
+          .map((session) => ({
+            projectDir: session.projectDir,
+            canonicalRepoId: session.contextNamespace?.projectId,
+            displayName: session.label || session.project || session.name,
+            sessionName: session.name,
+            source: session.name === ctx.activeSession ? 'active_session' as const : 'recent_session' as const,
+          }))}
+      />
+    );
+  },
 });
 
 registerPanelType(SHARED_CONTEXT_DIAGNOSTICS_PANEL_TYPE, {
   title: (_panel, ctx) => ctx?.t('sharedContext.diagnostics.title') ?? 'Context Diagnostics',
-  render: (panel, ctx) => (
-    <ContextDiagnosticsPanel
-      enterpriseId={typeof panel.props?.enterpriseId === 'string' ? panel.props.enterpriseId : undefined}
-      canonicalRepoId={typeof panel.props?.canonicalRepoId === 'string' ? panel.props.canonicalRepoId : undefined}
-      workspaceId={typeof panel.props?.workspaceId === 'string' ? panel.props.workspaceId : undefined}
-      enrollmentId={typeof panel.props?.enrollmentId === 'string' ? panel.props.enrollmentId : undefined}
-      language={typeof panel.props?.language === 'string' ? panel.props.language : undefined}
-      filePath={typeof panel.props?.filePath === 'string' ? panel.props.filePath : undefined}
-      persistedSnapshot={panel.props?.persistedSnapshot as Parameters<typeof ContextDiagnosticsPanel>[0]['persistedSnapshot']}
-      onStateChange={(next) => ctx.updatePanelProps?.(panel.id, { ...panel.props, ...next })}
-    />
-  ),
+  render: (panel, ctx) => {
+    if (isCapturedPanelServerMismatch(panel, ctx)) {
+      return <div class="sidebar-pinned-unavailable">{ctx.t('common.loading')}</div>;
+    }
+    return (
+      <ContextDiagnosticsPanel
+        enterpriseId={typeof panel.props?.enterpriseId === 'string' ? panel.props.enterpriseId : undefined}
+        canonicalRepoId={typeof panel.props?.canonicalRepoId === 'string' ? panel.props.canonicalRepoId : undefined}
+        workspaceId={typeof panel.props?.workspaceId === 'string' ? panel.props.workspaceId : undefined}
+        enrollmentId={typeof panel.props?.enrollmentId === 'string' ? panel.props.enrollmentId : undefined}
+        language={typeof panel.props?.language === 'string' ? panel.props.language : undefined}
+        filePath={typeof panel.props?.filePath === 'string' ? panel.props.filePath : undefined}
+        persistedSnapshot={panel.props?.persistedSnapshot as Parameters<typeof ContextDiagnosticsPanel>[0]['persistedSnapshot']}
+        onStateChange={(next) => ctx.updatePanelProps?.(panel.id, { ...panel.props, ...next })}
+      />
+    );
+  },
 });

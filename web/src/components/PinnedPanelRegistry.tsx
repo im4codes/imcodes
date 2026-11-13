@@ -39,6 +39,8 @@ export interface PanelRenderContext {
   activeSession?: string | null;
   /** Current active session's project directory — follows tab switches */
   activeProjectDir?: string;
+  /** True while the active server's initial/switched session list is still loading. */
+  sessionsLoading?: boolean;
   /** Present only while connected through a received share entry. */
   sharedAccessRole?: 'viewer' | 'participant' | null;
   /** Share target kind: 'server' for whole-server share, 'main' or 'subsession' for tab share */

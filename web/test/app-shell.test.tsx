@@ -443,8 +443,8 @@ vi.mock('../src/pages/DiscussionsPage.js', () => ({
   ),
 }));
 vi.mock('../src/pages/RepoPage.js', () => ({
-  RepoPage: ({ onBack, onCiEvent }: any) => (
-    <div>
+  RepoPage: ({ onBack, onCiEvent, projectDir, sessionId }: any) => (
+    <div data-testid="mock-repo-page" data-project-dir={projectDir ?? ''} data-session-id={sessionId ?? ''}>
       repo-page
       <button onClick={() => onCiEvent?.({ status: 'failure', name: 'CI', failedJobName: 'test', failedStepName: 'unit' })}>repo-ci</button>
       <button onClick={onBack}>repo-back</button>
@@ -1001,11 +1001,21 @@ vi.mock('../src/components/NewUserGuide.js', () => ({
 }));
 vi.mock('../src/components/P2pRingProgress.js', () => ({ P2pRingProgress: textComponent('p2p-ring-progress') }));
 vi.mock('../src/components/SidebarPinnedPanel.js', () => ({
-  SidebarPinnedPanel: ({ onResize, onUnpin }: any) => (
-    <div>
+  SidebarPinnedPanel: ({ panel, ctx, onResize, onUnpin }: any) => (
+    <div
+      data-testid={`sidebar-pinned-${panel?.id ?? 'unknown'}`}
+      data-panel-type={panel?.type ?? ''}
+      data-panel-server={panel?.props?.serverId ?? ''}
+      data-panel-project-dir={panel?.props?.projectDir ?? ''}
+      data-ctx-server={ctx?.serverId ?? ''}
+      data-ctx-sessions-loading={String(Boolean(ctx?.sessionsLoading))}
+      data-ctx-active-session={ctx?.activeSession ?? ''}
+      data-ctx-active-project-dir={ctx?.sessions?.find((s: any) => s.name === ctx?.activeSession)?.projectDir ?? ''}
+      data-ctx-sessions-count={String(ctx?.sessions?.length ?? 0)}
+    >
       sidebar-pinned-panel
       <button onClick={() => onResize?.(333)}>pinned-resize</button>
-      <button onClick={onUnpin}>pinned-unpin</button>
+      <button data-testid={`pinned-unpin-${panel?.id ?? 'unknown'}`} onClick={onUnpin}>pinned-unpin</button>
     </div>
   ),
 }));
@@ -3888,6 +3898,141 @@ describe('App shell', () => {
       fireEvent.click(screen.getByTestId('shared-return-guide').querySelector('.shared-return-guide-return')!);
       expect(screen.queryByTestId('shared-return-guide')).toBeNull();
       await expectActive('deck_alpha_notes');
+    }, 30_000);
+
+    it('isolates server-bound and follow-current pinned panels across server switch without dropping srv-1 pins', async () => {
+      seedLogin('srv-1');
+      useSubSessionsState.loadedServerId = 'srv-1';
+      useSubSessionsState.subSessions = [{
+        id: 'sub-1',
+        sessionName: 'deck_sub_alpha_1',
+        parentSession: 'deck_alpha_brain',
+        label: 'Helper 1',
+        type: 'codex-sdk',
+        state: 'running',
+      }];
+      useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+      let releaseSrv2!: () => void;
+      const srv2Gate = new Promise<void>((resolve) => { releaseSrv2 = resolve; });
+      installApi({
+        sessions: async (serverId) => {
+          if (serverId === 'srv-2') {
+            await srv2Gate;
+          }
+          return { sessions: listFor(serverId) };
+        },
+      });
+      const { App } = await importApp();
+      render(<App />);
+
+      await expectActive('deck_alpha_brain');
+      // Wait for auto-pinned follow-current panels on srv-1
+      await waitFor(() => {
+        expect(screen.getByTestId('sidebar-pinned-filebrowser:deck_alpha_brain')).toBeTruthy();
+        expect(screen.getByTestId('sidebar-pinned-cronmanager:deck_alpha_brain')).toBeTruthy();
+      });
+
+      // Pin repopage, local-web-preview, shared-context-management, and subsession on srv-1
+      fireEvent.click(screen.getByText('subbar-repo'));
+      const repoWin = await screen.findByTestId('floating-panel-repo');
+      fireEvent.click(within(repoWin).getByText('floating-pin'));
+      await waitFor(() => expect(screen.getByTestId('sidebar-pinned-repopage:deck_alpha_brain')).toBeTruthy());
+
+      fireEvent.click(within(screen.getByTestId('session-pane-deck_alpha_brain')).getByText('pane-preview-loopback'));
+      const previewWin = await screen.findByTestId('floating-panel-local-web-preview-srv-1');
+      fireEvent.click(within(previewWin).getByText('floating-pin'));
+      const previewPin = await screen.findByTestId('sidebar-pinned-local-web-preview:srv-1:8787:/docs?q=1#intro');
+      expect(previewPin).toBeTruthy();
+
+      fireEvent.click(screen.getByText('sharedContext.management.title'));
+      const scMgmtWin = await screen.findByTestId('floating-panel-shared-context-management');
+      fireEvent.click(within(scMgmtWin).getByText('floating-pin'));
+      expect(await screen.findByTestId('sidebar-pinned-shared-context-management:srv-1')).toBeTruthy();
+
+      fireEvent.click(screen.getByText('sidebar-drop'));
+      expect(await screen.findByTestId('sidebar-pinned-subsession:deck_sub_alpha_1')).toBeTruthy();
+
+      // Switch to srv-2 while srv-2 REST is pending: server-bound pins hide, follow-current pins see sessionsLoading=true
+      fireEvent.click(screen.getByText('server-select-srv-2'));
+      await waitFor(() => {
+        expect(screen.getByTestId('sidebar-pinned-filebrowser:deck_alpha_brain').getAttribute('data-ctx-server')).toBe('srv-2');
+      });
+      expect(screen.queryByTestId('sidebar-pinned-subsession:deck_sub_alpha_1')).toBeNull();
+      expect(screen.queryByTestId('sidebar-pinned-local-web-preview:srv-1:8787:/docs?q=1#intro')).toBeNull();
+      expect(screen.queryByTestId('sidebar-pinned-shared-context-management:srv-1')).toBeNull();
+
+      for (const id of ['filebrowser:deck_alpha_brain', 'repopage:deck_alpha_brain', 'cronmanager:deck_alpha_brain']) {
+        const el = screen.getByTestId(`sidebar-pinned-${id}`);
+        expect(el.getAttribute('data-ctx-server')).toBe('srv-2');
+        expect(el.getAttribute('data-ctx-sessions-loading')).toBe('true');
+        expect(el.getAttribute('data-ctx-active-session')).toBe('');
+        expect(el.getAttribute('data-ctx-sessions-count')).toBe('0');
+      }
+
+      // Release srv-2 REST: follow-current pins bind to srv-2 sessions; server-bound srv-1 pins stay hidden
+      await act(async () => {
+        releaseSrv2();
+        await Promise.resolve();
+      });
+      await expectActive('deck_gamma_brain');
+
+      for (const id of ['filebrowser:deck_alpha_brain', 'repopage:deck_alpha_brain', 'cronmanager:deck_alpha_brain']) {
+        const el = screen.getByTestId(`sidebar-pinned-${id}`);
+        expect(el.getAttribute('data-ctx-server')).toBe('srv-2');
+        expect(el.getAttribute('data-ctx-sessions-loading')).toBe('false');
+        expect(el.getAttribute('data-ctx-active-session')).toBe('deck_gamma_brain');
+        expect(el.getAttribute('data-ctx-active-project-dir')).toBe('/work/deck_gamma_brain');
+      }
+
+      // Unpinning repopage on srv-2 opens srv-2's RepoPage (/work/deck_gamma_brain), never srv-1's /work/deck_alpha_brain
+      fireEvent.click(screen.getByTestId('pinned-unpin-repopage:deck_alpha_brain'));
+      await waitFor(() => expect(screen.queryByTestId('sidebar-pinned-repopage:deck_alpha_brain')).toBeNull());
+      const reopenedRepo = await screen.findByTestId('mock-repo-page');
+      expect(reopenedRepo.getAttribute('data-project-dir')).toBe('/work/deck_gamma_brain');
+      expect(reopenedRepo.getAttribute('data-session-id')).toBe('deck_gamma_brain');
+
+      // Switch back to srv-1 -> srv-1 server-bound pins reappear intact, and reopened srv-2 RepoPage resets
+      fireEvent.click(screen.getByText('server-select-srv-1'));
+      await expectActive('deck_alpha_brain');
+      expect(screen.queryByTestId('mock-repo-page')).toBeNull();
+      expect(screen.getByTestId('sidebar-pinned-subsession:deck_sub_alpha_1')).toBeTruthy();
+      expect(screen.getByTestId('sidebar-pinned-local-web-preview:srv-1:8787:/docs?q=1#intro')).toBeTruthy();
+      expect(screen.getByTestId('sidebar-pinned-shared-context-management:srv-1')).toBeTruthy();
+    }, 30_000);
+
+    it('closes server-scoped overlays and dialogs cleanly when switching servers in-app', async () => {
+      seedLogin('srv-1');
+      installApi();
+      const { App } = await importApp();
+      render(<App />);
+
+      await expectActive('deck_alpha_brain');
+
+      // Open server-scoped overlays/dialogs on srv-1
+      fireEvent.click(screen.getByText('subbar-repo'));
+      expect(await screen.findByTestId('floating-panel-repo')).toBeTruthy();
+      fireEvent.click(screen.getByText('subbar-cron'));
+      expect(await screen.findByTestId('floating-panel-cron')).toBeTruthy();
+      fireEvent.click(screen.getByText('sharedContext.management.title'));
+      expect(await screen.findByTestId('floating-panel-shared-context-management')).toBeTruthy();
+      fireEvent.click(screen.getByText('tabs-new-session'));
+      expect(await screen.findByText('new-session-dialog')).toBeTruthy();
+      fireEvent.click(screen.getByText('subbar-new'));
+      expect(await screen.findByText('start-sub-session-dialog')).toBeTruthy();
+      fireEvent.click(within(screen.getByTestId('session-pane-deck_alpha_brain')).getByText('pane-preview-loopback'));
+      expect(await screen.findByTestId('local-web-preview')).toBeTruthy();
+
+      // Switch to srv-2 -> all srv-1 overlays/dialogs reset cleanly
+      fireEvent.click(screen.getByText('server-select-srv-2'));
+      await expectActive('deck_gamma_brain');
+
+      expect(screen.queryByTestId('floating-panel-repo')).toBeNull();
+      expect(screen.queryByTestId('floating-panel-cron')).toBeNull();
+      expect(screen.queryByTestId('floating-panel-shared-context-management')).toBeNull();
+      expect(screen.queryByText('new-session-dialog')).toBeNull();
+      expect(screen.queryByText('start-sub-session-dialog')).toBeNull();
+      expect(screen.queryByTestId('local-web-preview')).toBeNull();
     }, 30_000);
   });
 
