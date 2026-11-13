@@ -58,6 +58,7 @@ vi.mock('../../src/components/FilePreviewPane.js', () => ({
 vi.mock('../../src/direct-file-transfer.js', () => directFileTransferMocks);
 
 import { FileBrowser, __resetFileBrowserSharedChangesForTests, mergePreviewState, getParentDir } from '../../src/components/FileBrowser.js';
+import * as api from '../../src/api.js';
 import { resolvePreviewPath } from '../../src/components/ChatView.js';
 import type { WsClient, ServerMessage } from '../../src/ws-client.js';
 import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
@@ -3339,5 +3340,39 @@ describe('FileBrowser — file-manager preview/folder sync', () => {
       respond([{ name: 'alpha_only.ts', isDir: false }]);
     });
     expect(screen.getByText('alpha_only.ts')).toBeTruthy();
+  });
+
+  it('opens real DocShareDialog from toolbar share button and routes Manage Node Groups to onOpenNodeGroups', async () => {
+    const listSpy = vi.spyOn(api, 'listDocumentShares').mockResolvedValue({ shares: [], groups: [] });
+    const onOpenNodeGroups = vi.fn();
+    try {
+      const { ws, respond } = makeWsFactory();
+      await act(async () => {
+        render(
+          <FileBrowser
+            ws={ws}
+            mode="file-multi"
+            layout="panel"
+            serverId="srv-1"
+            initialPath="/home/user"
+            onConfirm={vi.fn()}
+            onOpenNodeGroups={onOpenNodeGroups}
+          />,
+        );
+      });
+      await act(async () => {
+        respond([{ name: 'spec.docx', isDir: false }]);
+      });
+
+      fireEvent.click(screen.getByTestId('fb-toolbar-share-btn'));
+      expect(await screen.findByTestId('doc-share-dialog')).toBeTruthy();
+      expect(await screen.findByTestId('doc-share-no-groups-empty')).toBeTruthy();
+
+      fireEvent.click(screen.getByTestId('doc-share-open-node-groups-btn'));
+      expect(onOpenNodeGroups).toHaveBeenCalledTimes(1);
+      await waitFor(() => expect(screen.queryByTestId('doc-share-dialog')).toBeNull());
+    } finally {
+      listSpy.mockRestore();
+    }
   });
 });

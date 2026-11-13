@@ -213,7 +213,10 @@ export interface FileBrowserProps {
    * listing before cutting it to its entry limit). Only meaningful with
    * `listView`; without it the browser sorts and filters what it has.
    */
+  /** Enable live filename filter query input above the file list. */
   directoryQuery?: boolean;
+  /** Open Controlled Nodes → Groups management from the share dialog. */
+  onOpenNodeGroups?: () => void;
   /** The second argument exposes the already-loaded single-file preview so a
    * host can consume explicitly selected text without issuing a duplicate read. */
   onConfirm: (paths: string[], preview?: FileBrowserPreviewState) => void;
@@ -603,6 +606,7 @@ export function FileBrowser({
   quickAccess = false,
   listView = false,
   directoryQuery = false,
+  onOpenNodeGroups,
 }: FileBrowserProps) {
   const { t, i18n } = useTranslation();
   // react-i18next may provide a new `t` function after every render. Keep
@@ -3352,6 +3356,7 @@ export function FileBrowser({
       targetPath={shareDialogTarget.path}
       targetKind={shareDialogTarget.kind}
       onClose={() => setShareDialogTarget(null)}
+      onOpenNodeGroups={onOpenNodeGroups}
     />
   ) : null;
 

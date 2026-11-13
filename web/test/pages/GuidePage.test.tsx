@@ -16,17 +16,19 @@ describe('GuidePage', () => {
     cleanup();
   });
 
-  it('renders all 11 harness guide sections with pain points, solutions, and tips', () => {
+  it('renders all 11 concise feature guide sections with summaries and tips (without pain points)', () => {
     render(<GuidePage />);
 
     expect(screen.getByTestId('guide-page')).toBeDefined();
     expect(screen.getByText('guide.title')).toBeDefined();
+    expect(document.querySelector('.guide-block-pain')).toBeNull();
+    expect(screen.queryByText('guide.pain_label')).toBeNull();
 
     for (const id of GUIDE_SECTION_IDS) {
       expect(screen.getByText(`guide.sections.${id}.pill`)).toBeDefined();
       expect(screen.getByText(`guide.sections.${id}.title`)).toBeDefined();
-      expect(screen.getByText(`guide.sections.${id}.pain`)).toBeDefined();
-      expect(screen.getByText(`guide.sections.${id}.solution`)).toBeDefined();
+      expect(screen.getByText(`guide.sections.${id}.summary`)).toBeDefined();
+      expect(screen.queryByText(`guide.sections.${id}.pain`)).toBeNull();
       expect(screen.getByText(`guide.sections.${id}.tip_1`)).toBeDefined();
       expect(screen.getByText(`guide.sections.${id}.tip_2`)).toBeDefined();
       expect(screen.getByText(`guide.sections.${id}.tip_3`)).toBeDefined();
@@ -41,13 +43,13 @@ describe('GuidePage', () => {
     targetCard.scrollIntoView = scrollIntoViewMock;
 
     fireEvent.click(screen.getByRole('button', { name: 'guide.collapse_all' }));
-    expect(screen.queryByText('guide.sections.controlledNodes.pain')).toBeNull();
+    expect(screen.queryByText('guide.sections.controlledNodes.summary')).toBeNull();
 
     const pillBtn = screen.getByRole('button', { name: /guide\.sections\.controlledNodes\.pill/ });
     fireEvent.click(pillBtn);
 
     expect(pillBtn.getAttribute('aria-current')).toBe('location');
-    expect(screen.getByText('guide.sections.controlledNodes.pain')).toBeDefined();
+    expect(screen.getByText('guide.sections.controlledNodes.summary')).toBeDefined();
     expect(scrollIntoViewMock).toHaveBeenCalledWith({ behavior: 'smooth', block: 'start' });
   });
 });

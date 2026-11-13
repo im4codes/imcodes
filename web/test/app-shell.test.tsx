@@ -1028,7 +1028,7 @@ vi.mock('../src/components/LocalWebPreviewPanel.js', () => ({
   ),
 }));
 vi.mock('../src/components/file-browser-lazy.js', () => ({
-  FileBrowser: ({ autoPreviewPath, onClose, onConfirm, onPreviewStateChange, scopeToSessionRoot }: any) => (
+  FileBrowser: ({ autoPreviewPath, onClose, onConfirm, onOpenNodeGroups, onPreviewStateChange, scopeToSessionRoot }: any) => (
     <div
       data-testid={autoPreviewPath ? 'file-browser-preview' : 'file-browser'}
       data-scope-to-session-root={String(!!scopeToSessionRoot)}
@@ -1036,6 +1036,7 @@ vi.mock('../src/components/file-browser-lazy.js', () => ({
       file-browser
       <button onClick={() => onConfirm?.(['/work/alpha/src/index.ts'])}>file-confirm</button>
       <button onClick={() => onPreviewStateChange?.({ path: '/work/alpha/src/index.ts', preview: { status: 'loaded' } })}>file-preview-state</button>
+      {onOpenNodeGroups && <button onClick={onOpenNodeGroups}>file-open-node-groups</button>}
       <button onClick={onClose}>file-close</button>
     </div>
   ),
@@ -8048,5 +8049,24 @@ describe('App shell', () => {
     } finally {
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUA });
     }
+  }, 15000);
+
+  it('wires FileBrowser onOpenNodeGroups to open ControlledNodesPanel floating window', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await screen.findByTestId('session-pane-deck_alpha_brain');
+    expect(screen.queryByTestId('floating-panel-controlled-nodes')).toBeNull();
+
+    fireEvent.click(screen.getByTitle('picker.files'));
+    const fbPanel = await screen.findByTestId('floating-panel-filebrowser');
+    fireEvent.click(within(fbPanel).getByText('file-open-node-groups'));
+
+    const nodesPanel = await screen.findByTestId('floating-panel-controlled-nodes');
+    expect(nodesPanel.textContent).toContain('controlled-nodes-panel');
   }, 15000);
 });

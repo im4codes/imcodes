@@ -135,14 +135,8 @@ export function GuidePage({ initialSection }: GuidePageProps = {}) {
 
               {expanded && (
                 <div class="guide-card-body">
-                  <div class="guide-block guide-block-pain">
-                    <div class="guide-block-label">{t('guide.pain_label')}</div>
-                    <p class="guide-block-text">{t(`guide.sections.${section.id}.pain`)}</p>
-                  </div>
-
-                  <div class="guide-block guide-block-solution">
-                    <div class="guide-block-label">{t('guide.solution_label')}</div>
-                    <p class="guide-block-text">{t(`guide.sections.${section.id}.solution`)}</p>
+                  <div class="guide-block guide-block-summary">
+                    <p class="guide-block-text">{t(`guide.sections.${section.id}.summary`)}</p>
                   </div>
 
                   <div class="guide-block guide-block-tips">

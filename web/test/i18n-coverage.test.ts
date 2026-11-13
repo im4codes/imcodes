@@ -657,7 +657,7 @@ describe('generic i18n coverage guard', () => {
     }
   });
 
-  it('keeps settings tab labels and complete User Guide keys present and translated in all 7 locales', () => {
+  it('keeps settings tab labels and concise pain-free Feature Guide keys present and translated in all 7 locales', () => {
     const GUIDE_SECTION_IDS = [
       'overview',
       'team',
@@ -680,17 +680,17 @@ describe('generic i18n coverage guard', () => {
       'guide.quick_jump',
       'guide.expand_all',
       'guide.collapse_all',
-      'guide.pain_label',
-      'guide.solution_label',
       'guide.tips_label',
     ] as const;
-    const SECTION_FIELDS = ['pill', 'title', 'tagline', 'pain', 'solution', 'tip_1', 'tip_2', 'tip_3'] as const;
+    const SECTION_FIELDS = ['pill', 'title', 'tagline', 'summary', 'tip_1', 'tip_2', 'tip_3'] as const;
 
     const enMessages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales/en.json'), 'utf8')) as unknown;
     const enTitle = readPath(enMessages, 'guide.title');
 
     for (const locale of SUPPORTED_LOCALES) {
       const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as unknown;
+      expect(readPath(messages, 'guide.pain_label'), `${locale}:guide.pain_label must be removed`).toBeUndefined();
+      expect(readPath(messages, 'guide.solution_label'), `${locale}:guide.solution_label must be removed`).toBeUndefined();
       for (const key of GUIDE_TOP_KEYS) {
         const value = readPath(messages, key);
         expect(value, `${locale}:${key}`).toEqual(expect.any(String));
@@ -701,12 +701,57 @@ describe('generic i18n coverage guard', () => {
         expect(readPath(messages, 'settings.tab_guide'), `${locale}:settings.tab_guide must be translated`).not.toBe('User Guide');
       }
       for (const id of GUIDE_SECTION_IDS) {
+        expect(readPath(messages, `guide.sections.${id}.pain`), `${locale}:guide.sections.${id}.pain must be removed`).toBeUndefined();
+        expect(readPath(messages, `guide.sections.${id}.solution`), `${locale}:guide.sections.${id}.solution must be removed`).toBeUndefined();
         for (const field of SECTION_FIELDS) {
           const key = `guide.sections.${id}.${field}`;
           const value = readPath(messages, key);
           expect(value, `${locale}:${key}`).toEqual(expect.any(String));
           expect((value as string | undefined)?.trim().length, `${locale}:${key}`).toBeGreaterThan(0);
         }
+      }
+    }
+  });
+
+  it('keeps doc_share keys aligned across all 7 locales and covering every key used in DocShareDialog / FileBrowser / OfficePreview', () => {
+    const enMessages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales/en.json'), 'utf8')) as Record<string, any>;
+    const enDocShareKeys = Object.keys(enMessages.doc_share ?? {}).sort();
+    expect(enDocShareKeys.length).toBeGreaterThan(0);
+
+    const usedKeys = new Set<string>();
+    for (const relPath of [
+      'src/components/DocShareDialog.tsx',
+      'src/components/FileBrowser.tsx',
+      'src/components/OfficePreview.tsx',
+    ]) {
+      const content = readFileSync(join(WEB_ROOT, relPath), 'utf8');
+      for (const match of content.matchAll(/t\(['"](doc_share\.[^'"`]+)['"]/g)) {
+        usedKeys.add(match[1]!);
+      }
+    }
+    expect(usedKeys.size).toBeGreaterThan(0);
+
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as Record<string, any>;
+      const localeKeys = Object.keys(messages.doc_share ?? {}).sort();
+      expect(localeKeys, `${locale}:doc_share key parity`).toEqual(enDocShareKeys);
+
+      for (const fullKey of usedKeys) {
+        const val = readPath(messages, fullKey);
+        expect(val, `${locale}:${fullKey}`).toEqual(expect.any(String));
+        expect((val as string).trim().length, `${locale}:${fullKey}`).toBeGreaterThan(0);
+      }
+
+      if (locale !== 'en') {
+        expect(messages.doc_share.group_share_title, `${locale}:group_share_title translated`).not.toBe(
+          enMessages.doc_share.group_share_title,
+        );
+        expect(messages.doc_share.tab_team, `${locale}:tab_team translated`).not.toBe(
+          enMessages.doc_share.tab_team,
+        );
+        expect(messages.doc_share.manage_node_groups_btn, `${locale}:manage_node_groups_btn translated`).not.toBe(
+          enMessages.doc_share.manage_node_groups_btn,
+        );
       }
     }
   });

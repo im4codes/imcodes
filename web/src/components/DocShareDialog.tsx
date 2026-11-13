@@ -17,6 +17,7 @@ import {
   type DocShareTargetKind,
   type DocumentShareItem,
   type ExternalShareView,
+  type ServerDocGroup,
   type SharedWithMeDocItem,
 } from '../api.js';
 import OfficePreview from './OfficePreview.js';
@@ -26,6 +27,7 @@ export interface DocShareDialogProps {
   targetPath: string;
   targetKind: DocShareTargetKind;
   onClose: () => void;
+  onOpenNodeGroups?: () => void;
 }
 
 function guessMimeTypeFromPath(filePath: string): string {
@@ -44,14 +46,19 @@ export function DocShareDialog({
   targetPath,
   targetKind,
   onClose,
+  onOpenNodeGroups,
 }: DocShareDialogProps) {
   const { t } = useTranslation();
   const [activeTab, setActiveTab] = useState<'internal' | 'external' | 'relay'>('internal');
   const [shares, setShares] = useState<DocumentShareItem[]>([]);
+  const [groups, setGroups] = useState<ServerDocGroup[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Tab 1: Internal / Team state
+  // Tab 1: Controlled Node Group & Internal User state
+  const [selectedTeamId, setSelectedTeamId] = useState('');
+  const [teamRole, setTeamRole] = useState<DocShareRole>('viewer');
+  const [teamAllowDownload, setTeamAllowDownload] = useState(true);
   const [targetUsername, setTargetUsername] = useState('');
   const [internalRole, setInternalRole] = useState<DocShareRole>('viewer');
   const [internalAllowDownload, setInternalAllowDownload] = useState(true);
@@ -66,45 +73,107 @@ export function DocShareDialog({
   const [generatedLink, setGeneratedLink] = useState<{ url: string; label: string; mode: string } | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
+  // Guards async responses across serverId/targetPath switches and unmount/close so late responses never pollute new state.
+  const activeTargetRef = useRef({
+    serverId,
+    targetPath,
+    seq: 0,
+    mounted: true,
+  });
+
+  useEffect(() => {
+    return () => {
+      activeTargetRef.current.mounted = false;
+      activeTargetRef.current.seq += 1;
+    };
+  }, []);
+
+  const isCurrentTarget = useCallback((seq: number, reqServerId: string, reqPath: string): boolean => {
+    const cur = activeTargetRef.current;
+    return cur.mounted && cur.seq === seq && cur.serverId === reqServerId && cur.targetPath === reqPath;
+  }, []);
+
   const loadShares = useCallback(async () => {
+    const reqServerId = serverId;
+    const reqPath = targetPath;
+    const seq = activeTargetRef.current.seq;
     setLoading(true);
     setError(null);
     try {
-      const res = await listDocumentShares(serverId, targetPath);
-      setShares(res.shares);
+      const res = await listDocumentShares(reqServerId, reqPath);
+      if (!isCurrentTarget(seq, reqServerId, reqPath)) return;
+      const nextShares = Array.isArray(res.shares) ? res.shares : [];
+      const nextGroups = Array.isArray(res.groups) ? res.groups : [];
+      setShares(nextShares);
+      setGroups(nextGroups);
+      setSelectedTeamId((prev) => {
+        if (prev && nextGroups.some((g) => g.id === prev)) return prev;
+        const firstBound = nextGroups.find((g) => g.boundToServer);
+        return firstBound?.id ?? nextGroups[0]?.id ?? '';
+      });
     } catch (err) {
+      if (!isCurrentTarget(seq, reqServerId, reqPath)) return;
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
+      if (isCurrentTarget(seq, reqServerId, reqPath)) {
+        setLoading(false);
+      }
     }
-  }, [serverId, targetPath]);
+  }, [serverId, targetPath, isCurrentTarget]);
 
   useEffect(() => {
+    activeTargetRef.current.serverId = serverId;
+    activeTargetRef.current.targetPath = targetPath;
+    activeTargetRef.current.seq += 1;
+    setShares([]);
+    setGroups([]);
+    setSelectedTeamId('');
+    setTeamRole('viewer');
+    setTeamAllowDownload(true);
+    setError(null);
+    setGeneratedLink(null);
     void loadShares();
-  }, [loadShares]);
+  }, [serverId, targetPath, loadShares]);
 
-  const teamShare = shares.find((s) => s.shareMode === 'team' && s.targetUserId === '*' && !s.revokedAt);
-  const internalUserShares = shares.filter((s) => s.shareMode === 'user' && s.targetUserId !== '*' && !s.revokedAt);
+  const boundGroups = groups.filter((g) => g.boundToServer);
+  const selectedGroup = groups.find((g) => g.id === selectedTeamId) ?? null;
+  const groupNameById = new Map(groups.map((g) => [g.id, g.name]));
+  const teamGroupShares = shares.filter(
+    (s) =>
+      !s.revokedAt &&
+      (s.shareMode === 'team' || s.targetUserId === '*' || s.targetUserId.startsWith('team:')),
+  );
+  const internalUserShares = shares.filter(
+    (s) =>
+      !s.revokedAt &&
+      s.shareMode === 'user' &&
+      s.targetUserId !== '*' &&
+      !s.targetUserId.startsWith('team:'),
+  );
   const externalShares = shares.filter(
     (s) => (s.shareMode === 'external_link' || s.shareMode === 'magic_invite') && !s.revokedAt,
   );
 
-  const handleToggleTeamShare = async () => {
+  const handleAddTeamGroupShare = async (e: Event) => {
+    e.preventDefault();
+    if (!selectedTeamId) return;
+    const reqServerId = serverId;
+    const reqPath = targetPath;
+    const seq = activeTargetRef.current.seq;
     setError(null);
     try {
-      if (teamShare) {
-        await revokeDocumentShareApi(serverId, teamShare.id);
-      } else {
-        await createDocumentShareApi(serverId, {
-          targetKind,
-          targetPath,
-          shareMode: 'team',
-          role: 'viewer',
-          allowDownload: true,
-        });
-      }
+      await createDocumentShareApi(reqServerId, {
+        targetKind,
+        targetPath: reqPath,
+        shareMode: 'team',
+        targetTeamId: selectedTeamId,
+        role: teamRole,
+        allowDownload: teamAllowDownload,
+      });
+      if (!isCurrentTarget(seq, reqServerId, reqPath)) return;
       await loadShares();
     } catch (err) {
+      if (!isCurrentTarget(seq, reqServerId, reqPath)) return;
       setError(err instanceof Error ? err.message : String(err));
     }
   };
@@ -112,30 +181,38 @@ export function DocShareDialog({
   const handleAddInternalUser = async (e: Event) => {
     e.preventDefault();
     if (!targetUsername.trim()) return;
+    const reqServerId = serverId;
+    const reqPath = targetPath;
+    const seq = activeTargetRef.current.seq;
     setError(null);
     try {
-      await createDocumentShareApi(serverId, {
+      await createDocumentShareApi(reqServerId, {
         targetKind,
-        targetPath,
+        targetPath: reqPath,
         shareMode: 'user',
         targetUser: targetUsername.trim(),
         role: internalRole,
         allowDownload: internalAllowDownload,
       });
+      if (!isCurrentTarget(seq, reqServerId, reqPath)) return;
       setTargetUsername('');
       await loadShares();
     } catch (err) {
+      if (!isCurrentTarget(seq, reqServerId, reqPath)) return;
       setError(err instanceof Error ? err.message : String(err));
     }
   };
 
   const handleCreateExternalShare = async (e: Event) => {
     e.preventDefault();
+    const reqServerId = serverId;
+    const reqPath = targetPath;
+    const seq = activeTargetRef.current.seq;
     setError(null);
     try {
-      const res = await createDocumentShareApi(serverId, {
+      const res = await createDocumentShareApi(reqServerId, {
         targetKind,
-        targetPath,
+        targetPath: reqPath,
         shareMode: externalMode,
         participantLabel: participantLabel.trim() || undefined,
         accessCode: accessCode.trim() || undefined,
@@ -143,13 +220,14 @@ export function DocShareDialog({
         role: externalRole,
         allowDownload: externalAllowDownload,
       });
+      if (!isCurrentTarget(seq, reqServerId, reqPath)) return;
       if (res.sharePath || res.shareUrl) {
         const fullUrl =
           res.shareUrl ||
           (typeof window !== 'undefined' ? `${window.location.origin}${res.sharePath}` : res.sharePath!);
         setGeneratedLink({
           url: fullUrl,
-          label: participantLabel.trim() || t('doc_share.external_collaborator', 'External Collaborator'),
+          label: participantLabel.trim() || t('doc_share.external_collaborator'),
           mode: externalMode,
         });
       }
@@ -157,6 +235,7 @@ export function DocShareDialog({
       setAccessCode('');
       await loadShares();
     } catch (err) {
+      if (!isCurrentTarget(seq, reqServerId, reqPath)) return;
       setError(err instanceof Error ? err.message : String(err));
     }
   };
@@ -165,21 +244,31 @@ export function DocShareDialog({
     shareId: string,
     patch: { role?: DocShareRole; allowDownload?: boolean; resetDeviceLock?: boolean },
   ) => {
+    const reqServerId = serverId;
+    const reqPath = targetPath;
+    const seq = activeTargetRef.current.seq;
     setError(null);
     try {
-      await updateDocumentShareApi(serverId, shareId, patch);
+      await updateDocumentShareApi(reqServerId, shareId, patch);
+      if (!isCurrentTarget(seq, reqServerId, reqPath)) return;
       await loadShares();
     } catch (err) {
+      if (!isCurrentTarget(seq, reqServerId, reqPath)) return;
       setError(err instanceof Error ? err.message : String(err));
     }
   };
 
   const handleRevokeShare = async (shareId: string) => {
+    const reqServerId = serverId;
+    const reqPath = targetPath;
+    const seq = activeTargetRef.current.seq;
     setError(null);
     try {
-      await revokeDocumentShareApi(serverId, shareId);
+      await revokeDocumentShareApi(reqServerId, shareId);
+      if (!isCurrentTarget(seq, reqServerId, reqPath)) return;
       await loadShares();
     } catch (err) {
+      if (!isCurrentTarget(seq, reqServerId, reqPath)) return;
       setError(err instanceof Error ? err.message : String(err));
     }
   };
@@ -240,8 +329,8 @@ export function DocShareDialog({
           <div>
             <div style={{ fontSize: 15, fontWeight: 600 }}>
               {targetKind === 'folder'
-                ? t('doc_share.dialog_title_folder', 'Folder Sharing & Document Permissions')
-                : t('doc_share.dialog_title_file', 'Document Sharing & Permissions')}
+                ? t('doc_share.dialog_title_folder')
+                : t('doc_share.dialog_title_file')}
             </div>
             <div style={{ fontSize: 12, color: '#94a3b8', marginTop: 2, wordBreak: 'break-all' }}>
               {targetPath}
@@ -287,7 +376,7 @@ export function DocShareDialog({
               cursor: 'pointer',
             }}
           >
-            {t('doc_share.tab_internal', '1. Team & Internal Members')}
+            {t('doc_share.tab_team')}
           </button>
           <button
             type="button"
@@ -304,7 +393,7 @@ export function DocShareDialog({
               cursor: 'pointer',
             }}
           >
-            {t('doc_share.tab_external', '2. External Links & Magic Invite')}
+            {t('doc_share.tab_external')}
           </button>
           <button
             type="button"
@@ -321,7 +410,7 @@ export function DocShareDialog({
               cursor: 'pointer',
             }}
           >
-            {t('doc_share.tab_relay', '3. Key-Free OAuth Relay')}
+            {t('doc_share.tab_relay')}
           </button>
         </div>
 
@@ -345,7 +434,7 @@ export function DocShareDialog({
 
           {activeTab === 'internal' && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-              {/* All-Team Share Toggle */}
+              {/* Controlled Node Group Sharing */}
               <div
                 style={{
                   padding: 12,
@@ -353,34 +442,100 @@ export function DocShareDialog({
                   borderRadius: 8,
                   border: '1px solid #334155',
                   display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'space-between',
-                  gap: 12,
-                  flexWrap: 'wrap',
+                  flexDirection: 'column',
+                  gap: 10,
                 }}
               >
-                <div>
-                  <div style={{ fontWeight: 600 }}>
-                    {t('doc_share.team_all_members', 'Team All-Member Share (*)')}
+                <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
+                  <div style={{ flex: 1, minWidth: 220 }}>
+                    <div style={{ fontWeight: 600 }}>
+                      {t('doc_share.group_share_title')}
+                    </div>
+                    <div style={{ fontSize: 12, color: '#94a3b8', marginTop: 2, lineHeight: 1.5 }}>
+                      {t('doc_share.group_share_desc')}
+                    </div>
                   </div>
-                  <div style={{ fontSize: 12, color: '#94a3b8', marginTop: 2 }}>
-                    {targetKind === 'folder'
-                      ? t('doc_share.team_folder_hint', 'All internal members inherit access to files in this folder unless overridden on a single file.')
-                      : t('doc_share.team_file_hint', 'Overrides parent folder permissions for this specific document.')}
-                  </div>
+                  {onOpenNodeGroups && (
+                    <button
+                      type="button"
+                      data-testid="doc-share-open-node-groups-btn"
+                      onClick={() => {
+                        onClose();
+                        onOpenNodeGroups();
+                      }}
+                      style={{
+                        padding: '5px 10px',
+                        background: '#334155',
+                        color: '#e2e8f0',
+                        border: '1px solid #475569',
+                        borderRadius: 4,
+                        cursor: 'pointer',
+                        fontSize: 12,
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      {t('doc_share.manage_node_groups_btn')}
+                    </button>
+                  )}
                 </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  {teamShare && (
-                    <>
-                      <select
-                        value={teamShare.role}
-                        onChange={(e) =>
-                          void handleUpdateShare(teamShare.id, {
-                            role: (e.target as HTMLSelectElement).value as DocShareRole,
-                          })
-                        }
+
+                {/* Bound group badges */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', fontSize: 12 }}>
+                  <span style={{ color: '#94a3b8' }}>{t('doc_share.bound_groups_label')}</span>
+                  {boundGroups.length > 0 ? (
+                    boundGroups.map((g) => (
+                      <span
+                        key={g.id}
+                        data-testid="doc-share-bound-group-badge"
                         style={{
-                          padding: '4px 8px',
+                          padding: '2px 8px',
+                          borderRadius: 999,
+                          background: 'rgba(37, 99, 235, 0.18)',
+                          border: '1px solid #3b82f6',
+                          color: '#93c5fd',
+                          fontSize: 11,
+                          fontWeight: 500,
+                        }}
+                      >
+                        {g.name} ({t('doc_share.group_member_count', { count: g.memberCount })})
+                      </span>
+                    ))
+                  ) : (
+                    <span data-testid="doc-share-no-bound-groups" style={{ color: '#cbd5e1', fontSize: 12 }}>
+                      {t('doc_share.no_bound_groups_hint')}
+                    </span>
+                  )}
+                </div>
+
+                {groups.length === 0 ? (
+                  <div
+                    data-testid="doc-share-no-groups-empty"
+                    style={{
+                      padding: '8px 10px',
+                      background: '#0f172a',
+                      borderRadius: 6,
+                      border: '1px dashed #475569',
+                      color: '#94a3b8',
+                      fontSize: 12,
+                    }}
+                  >
+                    {t('doc_share.no_groups_available')}
+                  </div>
+                ) : (
+                  <form
+                    onSubmit={(e) => void handleAddTeamGroupShare(e)}
+                    style={{ display: 'flex', flexDirection: 'column', gap: 8 }}
+                  >
+                    <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                      <select
+                        data-testid="doc-share-group-select"
+                        aria-label={t('doc_share.group_select_label')}
+                        value={selectedTeamId}
+                        onChange={(e) => setSelectedTeamId((e.target as HTMLSelectElement).value)}
+                        style={{
+                          flex: 1,
+                          minWidth: 180,
+                          padding: '6px 8px',
                           background: '#0f172a',
                           color: '#e2e8f0',
                           border: '1px solid #475569',
@@ -388,41 +543,152 @@ export function DocShareDialog({
                           fontSize: 12,
                         }}
                       >
-                        <option value="viewer">{t('doc_share.role_viewer', 'Viewer (Read-Only)')}</option>
-                        <option value="editor">{t('doc_share.role_editor', 'Editor (Co-Edit)')}</option>
+                        {groups.map((g) => (
+                          <option key={g.id} value={g.id}>
+                            {g.boundToServer
+                              ? t('doc_share.group_option_bound', { name: g.name, count: g.memberCount })
+                              : t('doc_share.group_option_unbound', { name: g.name, count: g.memberCount })}
+                          </option>
+                        ))}
+                      </select>
+                      <select
+                        data-testid="doc-share-group-role"
+                        value={teamRole}
+                        onChange={(e) => setTeamRole((e.target as HTMLSelectElement).value as DocShareRole)}
+                        style={{
+                          padding: '6px 8px',
+                          background: '#0f172a',
+                          color: '#e2e8f0',
+                          border: '1px solid #475569',
+                          borderRadius: 4,
+                          fontSize: 12,
+                        }}
+                      >
+                        <option value="viewer">{t('doc_share.role_viewer')}</option>
+                        <option value="editor">{t('doc_share.role_editor')}</option>
                       </select>
                       <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12 }}>
                         <input
                           type="checkbox"
-                          checked={teamShare.allowDownload}
-                          onChange={(e) =>
-                            void handleUpdateShare(teamShare.id, {
-                              allowDownload: (e.target as HTMLInputElement).checked,
-                            })
-                          }
+                          data-testid="doc-share-group-download"
+                          checked={teamAllowDownload}
+                          onChange={(e) => setTeamAllowDownload((e.target as HTMLInputElement).checked)}
                         />
-                        {t('doc_share.allow_download', 'Allow Download')}
+                        {t('doc_share.allow_download')}
                       </label>
-                    </>
+                      <button
+                        type="submit"
+                        data-testid="doc-share-add-group-btn"
+                        disabled={!selectedTeamId}
+                        style={{
+                          padding: '6px 14px',
+                          background: '#2563eb',
+                          color: '#fff',
+                          border: 'none',
+                          borderRadius: 4,
+                          cursor: selectedTeamId ? 'pointer' : 'not-allowed',
+                          fontSize: 12,
+                        }}
+                      >
+                        {t('doc_share.add_group_share_btn')}
+                      </button>
+                    </div>
+                    {selectedGroup && !selectedGroup.boundToServer && (
+                      <div data-testid="doc-share-unbound-group-hint" style={{ fontSize: 11, color: '#fbbf24' }}>
+                        {t('doc_share.unbound_group_hint')}
+                      </div>
+                    )}
+                  </form>
+                )}
+
+                {/* Active group & legacy wildcard rules */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6, borderTop: '1px solid #334155', paddingTop: 8 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: '#94a3b8' }}>
+                    {t('doc_share.active_group_shares_title')} ({teamGroupShares.length})
+                  </div>
+                  {teamGroupShares.length === 0 ? (
+                    <div style={{ color: '#64748b', fontSize: 12 }}>
+                      {t('doc_share.no_group_shares_yet')}
+                    </div>
+                  ) : (
+                    teamGroupShares.map((item) => {
+                      const teamId =
+                        item.targetTeamId ??
+                        (item.targetUserId.startsWith('team:') ? item.targetUserId.slice(5) : null);
+                      const displayGroupLabel = teamId
+                        ? `${t('doc_share.group_badge_prefix')}: ${item.targetTeamName || groupNameById.get(teamId) || teamId}`
+                        : t('doc_share.legacy_all_members');
+                      return (
+                        <div
+                          key={item.id}
+                          data-testid="doc-share-group-rule-item"
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            padding: '8px 10px',
+                            background: '#0f172a',
+                            borderRadius: 6,
+                            border: '1px solid #334155',
+                            gap: 8,
+                            flexWrap: 'wrap',
+                          }}
+                        >
+                          <span style={{ fontWeight: 600, color: '#e2e8f0' }}>
+                            {displayGroupLabel}
+                          </span>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                            <select
+                              value={item.role}
+                              onChange={(e) =>
+                                void handleUpdateShare(item.id, {
+                                  role: (e.target as HTMLSelectElement).value as DocShareRole,
+                                })
+                              }
+                              style={{
+                                padding: '4px 8px',
+                                background: '#1e293b',
+                                color: '#e2e8f0',
+                                border: '1px solid #475569',
+                                borderRadius: 4,
+                                fontSize: 12,
+                              }}
+                            >
+                              <option value="viewer">{t('doc_share.role_viewer')}</option>
+                              <option value="editor">{t('doc_share.role_editor')}</option>
+                            </select>
+                            <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12 }}>
+                              <input
+                                type="checkbox"
+                                checked={item.allowDownload}
+                                onChange={(e) =>
+                                  void handleUpdateShare(item.id, {
+                                    allowDownload: (e.target as HTMLInputElement).checked,
+                                  })
+                                }
+                              />
+                              {t('doc_share.allow_download')}
+                            </label>
+                            <button
+                              type="button"
+                              onClick={() => void handleRevokeShare(item.id)}
+                              style={{
+                                padding: '4px 10px',
+                                background: '#7f1d1d',
+                                color: '#fecaca',
+                                border: 'none',
+                                borderRadius: 4,
+                                cursor: 'pointer',
+                                fontSize: 11,
+                              }}
+                            >
+                              {t('doc_share.revoke')}
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })
                   )}
-                  <button
-                    type="button"
-                    data-testid="doc-share-toggle-team"
-                    onClick={() => void handleToggleTeamShare()}
-                    style={{
-                      padding: '5px 12px',
-                      background: teamShare ? '#dc2626' : '#2563eb',
-                      color: '#fff',
-                      border: 'none',
-                      borderRadius: 4,
-                      cursor: 'pointer',
-                      fontSize: 12,
-                    }}
-                  >
-                    {teamShare
-                      ? t('doc_share.disable_team_share', 'Revoke Team Share')
-                      : t('doc_share.enable_team_share', 'Enable Team Share')}
-                  </button>
                 </div>
               </div>
 
@@ -445,7 +711,7 @@ export function DocShareDialog({
                   data-testid="doc-share-username-input"
                   value={targetUsername}
                   onInput={(e) => setTargetUsername((e.target as HTMLInputElement).value)}
-                  placeholder={t('doc_share.username_placeholder', 'Enter username or user ID...')}
+                  placeholder={t('doc_share.member_placeholder')}
                   style={{
                     flex: 1,
                     minWidth: 160,
@@ -469,8 +735,8 @@ export function DocShareDialog({
                     fontSize: 12,
                   }}
                 >
-                  <option value="viewer">{t('doc_share.role_viewer', 'Viewer (Read-Only)')}</option>
-                  <option value="editor">{t('doc_share.role_editor', 'Editor (Co-Edit)')}</option>
+                  <option value="viewer">{t('doc_share.role_viewer')}</option>
+                  <option value="editor">{t('doc_share.role_editor')}</option>
                 </select>
                 <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12 }}>
                   <input
@@ -478,7 +744,7 @@ export function DocShareDialog({
                     checked={internalAllowDownload}
                     onChange={(e) => setInternalAllowDownload((e.target as HTMLInputElement).checked)}
                   />
-                  {t('doc_share.allow_download', 'Allow Download')}
+                  {t('doc_share.allow_download')}
                 </label>
                 <button
                   type="submit"
@@ -493,20 +759,20 @@ export function DocShareDialog({
                     fontSize: 12,
                   }}
                 >
-                  {t('doc_share.add_member', 'Add Member')}
+                  {t('doc_share.add_btn')}
                 </button>
               </form>
 
               {/* Existing Internal Member Grants */}
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                 <div style={{ fontSize: 12, fontWeight: 600, color: '#94a3b8' }}>
-                  {t('doc_share.member_list_title', 'Authorized Members')} ({internalUserShares.length})
+                  {t('doc_share.active_internal_list')} ({internalUserShares.length})
                 </div>
                 {loading ? (
                   <div style={{ color: '#64748b', fontSize: 12 }}>…</div>
                 ) : internalUserShares.length === 0 ? (
                   <div style={{ color: '#64748b', fontSize: 12 }}>
-                    {t('doc_share.no_members_yet', 'No individual member overrides yet.')}
+                    {t('doc_share.no_internal_shares')}
                   </div>
                 ) : (
                   internalUserShares.map((item) => (
@@ -546,8 +812,8 @@ export function DocShareDialog({
                             fontSize: 12,
                           }}
                         >
-                          <option value="viewer">{t('doc_share.role_viewer', 'Viewer')}</option>
-                          <option value="editor">{t('doc_share.role_editor', 'Editor')}</option>
+                          <option value="viewer">{t('doc_share.role_viewer')}</option>
+                          <option value="editor">{t('doc_share.role_editor')}</option>
                         </select>
                         <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12 }}>
                           <input
@@ -559,7 +825,7 @@ export function DocShareDialog({
                               })
                             }
                           />
-                          {t('doc_share.allow_download', 'Download')}
+                          {t('doc_share.allow_download')}
                         </label>
                         <button
                           type="button"
@@ -574,7 +840,7 @@ export function DocShareDialog({
                             fontSize: 11,
                           }}
                         >
-                          {t('doc_share.revoke', 'Revoke')}
+                          {t('doc_share.revoke')}
                         </button>
                       </div>
                     </div>
@@ -599,7 +865,7 @@ export function DocShareDialog({
                 }}
               >
                 <div style={{ fontWeight: 600 }}>
-                  {t('doc_share.create_external_title', 'Generate Per-Person External Link or Magic Invite (No API Key Required)')}
+                  {t('doc_share.create_external_title')}
                 </div>
                 <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                   <input
@@ -607,7 +873,7 @@ export function DocShareDialog({
                     data-testid="doc-share-participant-label"
                     value={participantLabel}
                     onInput={(e) => setParticipantLabel((e.target as HTMLInputElement).value)}
-                    placeholder={t('doc_share.participant_label_placeholder', 'Collaborator name/remark (e.g. Finance-Wang, Client-Li)')}
+                    placeholder={t('doc_share.participant_placeholder')}
                     style={{
                       flex: 1,
                       minWidth: 200,
@@ -635,10 +901,10 @@ export function DocShareDialog({
                     }}
                   >
                     <option value="external_link">
-                      {t('doc_share.mode_external_link', 'Scheme 1: Dedicated Link + Device Lock')}
+                      {t('doc_share.mode_external_link')}
                     </option>
                     <option value="magic_invite">
-                      {t('doc_share.mode_magic_invite', 'Scheme 3: One-Time Magic Invite Link')}
+                      {t('doc_share.mode_magic_invite')}
                     </option>
                   </select>
                 </div>
@@ -649,7 +915,7 @@ export function DocShareDialog({
                     data-testid="doc-share-access-code"
                     value={accessCode}
                     onInput={(e) => setAccessCode((e.target as HTMLInputElement).value)}
-                    placeholder={t('doc_share.access_code_placeholder', 'Optional access code / PIN')}
+                    placeholder={t('doc_share.access_code_placeholder')}
                     style={{
                       width: 170,
                       padding: '6px 10px',
@@ -672,8 +938,8 @@ export function DocShareDialog({
                       fontSize: 12,
                     }}
                   >
-                    <option value="viewer">{t('doc_share.role_viewer', 'Viewer (Read-Only)')}</option>
-                    <option value="editor">{t('doc_share.role_editor', 'Editor (Co-Edit)')}</option>
+                    <option value="viewer">{t('doc_share.role_viewer')}</option>
+                    <option value="editor">{t('doc_share.role_editor')}</option>
                   </select>
                   <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12 }}>
                     <input
@@ -681,7 +947,7 @@ export function DocShareDialog({
                       checked={externalAllowDownload}
                       onChange={(e) => setExternalAllowDownload((e.target as HTMLInputElement).checked)}
                     />
-                    {t('doc_share.allow_download', 'Allow Download')}
+                    {t('doc_share.allow_download')}
                   </label>
                   {externalMode === 'external_link' && (
                     <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12 }}>
@@ -691,7 +957,7 @@ export function DocShareDialog({
                         checked={deviceLockEnabled}
                         onChange={(e) => setDeviceLockEnabled((e.target as HTMLInputElement).checked)}
                       />
-                      {t('doc_share.device_lock_label', 'Lock to first device / Passkey (anti-forwarding)')}
+                      {t('doc_share.device_lock_enable')}
                     </label>
                   )}
                   <button
@@ -708,7 +974,7 @@ export function DocShareDialog({
                       marginLeft: 'auto',
                     }}
                   >
-                    {t('doc_share.generate_link_btn', 'Generate Link')}
+                    {t('doc_share.generate_link_btn')}
                   </button>
                 </div>
               </form>
@@ -732,8 +998,8 @@ export function DocShareDialog({
                     <div style={{ fontSize: 12, fontWeight: 600, color: '#6ee7b7' }}>
                       {generatedLink.label} —{' '}
                       {generatedLink.mode === 'magic_invite'
-                        ? t('doc_share.mode_magic_invite', 'One-Time Magic Invite')
-                        : t('doc_share.mode_external_link', 'Dedicated External Link')}
+                        ? t('doc_share.mode_magic_invite')
+                        : t('doc_share.mode_external_link')}
                     </div>
                     <div
                       data-testid="doc-share-generated-url"
@@ -756,19 +1022,19 @@ export function DocShareDialog({
                     }}
                   >
                     {copiedId === 'latest'
-                      ? t('doc_share.copied', 'Copied!')
-                      : t('doc_share.copy_link', 'Copy Link')}
+                      ? t('doc_share.copied')
+                      : t('doc_share.copy_link')}
                   </button>
                 </div>
               )}
 
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                 <div style={{ fontSize: 12, fontWeight: 600, color: '#94a3b8' }}>
-                  {t('doc_share.external_list_title', 'Active External Collaborator Links')} ({externalShares.length})
+                  {t('doc_share.active_external_list')} ({externalShares.length})
                 </div>
                 {externalShares.length === 0 ? (
                   <div style={{ color: '#64748b', fontSize: 12 }}>
-                    {t('doc_share.no_external_links', 'No external links created yet.')}
+                    {t('doc_share.no_external_shares')}
                   </div>
                 ) : (
                   externalShares.map((item) => (
@@ -793,18 +1059,18 @@ export function DocShareDialog({
                         <div style={{ fontSize: 11, color: '#94a3b8', display: 'flex', gap: 8, marginTop: 2 }}>
                           <span>
                             {item.shareMode === 'magic_invite'
-                              ? t('doc_share.badge_magic', 'Magic Invite')
-                              : t('doc_share.badge_external', 'External Link')}
+                              ? t('doc_share.badge_magic')
+                              : t('doc_share.badge_ext_link')}
                           </span>
                           {item.deviceLockEnabled && (
                             <span>
                               {item.isDeviceBound
-                                ? t('doc_share.device_bound', 'Device Locked')
-                                : t('doc_share.device_pending', 'Locks on 1st Open')}
+                                ? t('doc_share.device_bound')
+                                : t('doc_share.device_awaiting')}
                             </span>
                           )}
                           {item.redeemedAt && (
-                            <span>{t('doc_share.redeemed', 'Redeemed')}</span>
+                            <span>{t('doc_share.redeemed')}</span>
                           )}
                         </div>
                       </div>
@@ -825,8 +1091,8 @@ export function DocShareDialog({
                             fontSize: 12,
                           }}
                         >
-                          <option value="viewer">{t('doc_share.role_viewer', 'Viewer')}</option>
-                          <option value="editor">{t('doc_share.role_editor', 'Editor')}</option>
+                          <option value="viewer">{t('doc_share.role_viewer')}</option>
+                          <option value="editor">{t('doc_share.role_editor')}</option>
                         </select>
                         <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12 }}>
                           <input
@@ -838,7 +1104,7 @@ export function DocShareDialog({
                               })
                             }
                           />
-                          {t('doc_share.allow_download', 'Download')}
+                          {t('doc_share.allow_download')}
                         </label>
                         {item.isDeviceBound && (
                           <button
@@ -854,7 +1120,7 @@ export function DocShareDialog({
                               fontSize: 11,
                             }}
                           >
-                            {t('doc_share.reset_device', 'Reset Device')}
+                            {t('doc_share.reset_device')}
                           </button>
                         )}
                         <button
@@ -870,7 +1136,7 @@ export function DocShareDialog({
                             fontSize: 11,
                           }}
                         >
-                          {t('doc_share.revoke', 'Revoke')}
+                          {t('doc_share.revoke')}
                         </button>
                       </div>
                     </div>
@@ -893,13 +1159,10 @@ export function DocShareDialog({
               }}
             >
               <div style={{ fontWeight: 600 }}>
-                {t('doc_share.relay_title', 'Scheme 2: Central Auth Relay Key-Free OAuth Login')}
+                {t('doc_share.relay_title')}
               </div>
               <div style={{ fontSize: 12, color: '#cbd5e1', lineHeight: 1.6 }}>
-                {t(
-                  'doc_share.relay_description',
-                  'Self-hosted IM.codes servers do not need to register Google or GitHub OAuth Client IDs. External collaborators can sign in via the central Auth Relay (or direct OAuth when configured) and bind their verified identity to shared documents.',
-                )}
+                {t('doc_share.relay_desc')}
               </div>
               <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
                 <a
@@ -915,7 +1178,7 @@ export function DocShareDialog({
                     fontWeight: 600,
                   }}
                 >
-                  {t('doc_share.login_google_relay', 'Sign in with Google (Auth Relay)')}
+                  {t('doc_share.relay_google_preview')}
                 </a>
                 <a
                   href={buildDocAuthRelayUrl('github')}
@@ -930,7 +1193,7 @@ export function DocShareDialog({
                     fontWeight: 600,
                   }}
                 >
-                  {t('doc_share.login_github_relay', 'Sign in with GitHub (Auth Relay)')}
+                  {t('doc_share.relay_github_preview')}
                 </a>
               </div>
             </div>
@@ -1240,11 +1503,11 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
       >
         <div>
           <div style={{ fontSize: 15, fontWeight: 600 }}>
-            {t('doc_share.external_space_title', 'IM.codes Shared Document Workspace')}
+            {t('doc_share.ext_workspace_title')}
           </div>
           {shareInfo && (
             <div style={{ fontSize: 12, color: '#94a3b8' }}>
-              {shareInfo.label} ({shareInfo.role === 'editor' ? t('doc_share.role_editor', 'Editor') : t('doc_share.role_viewer', 'Viewer')})
+              {shareInfo.label} ({shareInfo.role === 'editor' ? t('doc_share.role_editor') : t('doc_share.role_viewer')})
             </div>
           )}
         </div>
@@ -1261,7 +1524,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
               fontSize: 12,
             }}
           >
-            {t('doc_share.login_google_relay', 'Google Auth Relay')}
+            {t('doc_share.google_login')}
           </a>
           <a
             href={buildDocAuthRelayUrl('github', token, `/doc-share/${token}`)}
@@ -1275,7 +1538,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
               fontSize: 12,
             }}
           >
-            {t('doc_share.login_github_relay', 'GitHub Auth Relay')}
+            {t('doc_share.github_login')}
           </a>
         </div>
       </div>
@@ -1296,7 +1559,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
           }}
         >
           <div style={{ fontSize: 15, fontWeight: 600 }}>
-            {t('doc_share.verify_access_title', 'Verify External Collaborator Access')}
+            {t('doc_share.verify_access_title')}
           </div>
           {error && (
             <div style={{ color: '#f87171', fontSize: 12 }}>{error}</div>
@@ -1307,7 +1570,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
               data-testid="external-share-access-code-input"
               value={accessCode}
               onInput={(e) => setAccessCode((e.target as HTMLInputElement).value)}
-              placeholder={t('doc_share.access_code_placeholder', 'Access code (if required)')}
+              placeholder={t('doc_share.access_code_placeholder')}
               style={{
                 padding: '8px 10px',
                 background: '#1e293b',
@@ -1331,13 +1594,13 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
                 fontWeight: 600,
               }}
             >
-              {t('doc_share.verify_and_bind_btn', 'Verify & Bind Current Device / Passkey')}
+              {t('doc_share.verify_and_open')}
             </button>
           </form>
 
           <div style={{ borderTop: '1px solid #1e293b', paddingTop: 12 }}>
             <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>
-              {t('doc_share.magic_redeem_hint', 'Or redeem a one-time Magic Invite Link with your display name:')}
+              {t('doc_share.magic_redeem_label')}
             </div>
             <form onSubmit={(e) => void handleRedeemMagicLink(e)} style={{ display: 'flex', gap: 8 }}>
               <input
@@ -1345,7 +1608,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
                 data-testid="external-share-display-name-input"
                 value={displayName}
                 onInput={(e) => setDisplayName((e.target as HTMLInputElement).value)}
-                placeholder={t('doc_share.your_display_name', 'Your name (e.g. Li Ming)')}
+                placeholder={t('doc_share.magic_display_name_placeholder')}
                 style={{
                   flex: 1,
                   padding: '6px 10px',
@@ -1369,7 +1632,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
                   fontSize: 12,
                 }}
               >
-                {t('doc_share.redeem_magic_btn', 'Redeem Invite')}
+                {t('doc_share.redeem_and_enter')}
               </button>
             </form>
           </div>
@@ -1415,7 +1678,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
                       fontSize: 11,
                     }}
                   >
-                    ↑ {t('doc_share.up_dir', 'Up')}
+                    ↑ {t('doc_share.up_dir')}
                   </button>
                 )}
               </div>
@@ -1426,7 +1689,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
                     type="text"
                     value={newItemName}
                     onInput={(e) => setNewItemName((e.target as HTMLInputElement).value)}
-                    placeholder={t('doc_share.new_file_name', 'New name...')}
+                    placeholder={t('doc_share.new_file_name')}
                     style={{
                       flex: 1,
                       minWidth: 100,
@@ -1454,7 +1717,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
                     <option value="xlsx">.xlsx</option>
                     <option value="pptx">.pptx</option>
                     <option value="md">.md</option>
-                    <option value="folder">{t('doc_share.folder', 'Folder')}</option>
+                    <option value="folder">{t('doc_share.kind_folder')}</option>
                   </select>
                   <button
                     type="submit"
@@ -1583,7 +1846,7 @@ export function ExternalDocShareSpace({ token }: { token: string }) {
               />
             ) : (
               <div style={{ padding: 32, color: '#64748b', textAlign: 'center', fontSize: 13 }}>
-                {t('doc_share.select_document_prompt', 'Select a document on the left to preview or co-edit in ONLYOFFICE.')}
+                {t('doc_share.select_file_prompt')}
               </div>
             )}
           </div>

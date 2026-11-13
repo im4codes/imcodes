@@ -8289,6 +8289,7 @@ function InternalMainApp() {
                     }
                   }}
                   onClose={() => setShowDesktopFileBrowser(false)}
+                  onOpenNodeGroups={openControlledNodes}
                 />
               </FloatingPanel>
             )}
@@ -8774,6 +8775,7 @@ function InternalMainApp() {
             onPreviewStateChange={handlePreviewStateChange}
             onConfirm={() => {}}
             onClose={() => setPreviewFileRequest(null)}
+            onOpenNodeGroups={openControlledNodes}
           />
         </FloatingPanel>
       )}

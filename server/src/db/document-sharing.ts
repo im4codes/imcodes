@@ -77,9 +77,28 @@ export async function isUserInServerTeam(
   return memberRole !== 'none';
 }
 
+export const DOC_SHARE_TEAM_PREFIX = 'team:';
+
+export function toTeamShareTargetUserId(teamId: string): string {
+  return `${DOC_SHARE_TEAM_PREFIX}${teamId.trim()}`;
+}
+
+export function parseTeamShareTargetUserId(targetUserId: string): string | null {
+  if (!targetUserId.startsWith(DOC_SHARE_TEAM_PREFIX)) return null;
+  const teamId = targetUserId.slice(DOC_SHARE_TEAM_PREFIX.length).trim();
+  return teamId ? teamId : null;
+}
+
 export type DocumentShareTargetKind = 'file' | 'folder';
 export type DocumentShareMode = 'user' | 'team' | 'external_link' | 'magic_invite';
 export type DocumentShareRole = 'viewer' | 'editor';
+
+export interface ServerDocumentGroup {
+  id: string;
+  name: string;
+  memberCount: number;
+  boundToServer: boolean;
+}
 
 export interface DocumentShareRow {
   id: string;
@@ -89,6 +108,8 @@ export interface DocumentShareRow {
   label: string | null;
   shareMode: DocumentShareMode;
   targetUserId: string;
+  targetTeamId?: string | null;
+  targetTeamName?: string | null;
   targetUsername?: string | null;
   targetDisplayName?: string | null;
   participantLabel: string | null;
@@ -118,6 +139,7 @@ interface DbDocumentShareRow {
   target_user_id: string;
   target_username?: string | null;
   target_display_name?: string | null;
+  target_team_name?: string | null;
   participant_label: string | null;
   share_token_hash: string | null;
   access_code_hash: string | null;
@@ -141,6 +163,7 @@ function toNum(v: number | string | null | undefined): number | null {
 }
 
 function mapDbRow(row: DbDocumentShareRow): DocumentShareRow {
+  const targetTeamId = parseTeamShareTargetUserId(row.target_user_id);
   return {
     id: row.id,
     serverId: row.server_id,
@@ -149,6 +172,8 @@ function mapDbRow(row: DbDocumentShareRow): DocumentShareRow {
     label: row.label,
     shareMode: row.share_mode,
     targetUserId: row.target_user_id,
+    targetTeamId,
+    targetTeamName: row.target_team_name ?? null,
     targetUsername: row.target_username ?? null,
     targetDisplayName: row.target_display_name ?? null,
     participantLabel: row.participant_label,
@@ -221,6 +246,8 @@ export interface CreateDocumentShareInput {
   shareMode: DocumentShareMode;
   /** Required for `user` mode; ignored for `team` (`*`), `external_link`, and `magic_invite`. */
   targetUserId?: string;
+  /** Optional specific Controlled Node Group (`teams.id`) when `shareMode === 'team'`. */
+  targetTeamId?: string | null;
   participantLabel?: string | null;
   accessCode?: string | null;
   deviceLockEnabled?: boolean;
@@ -258,7 +285,14 @@ export async function createDocumentShare(
   let shareTokenHash: string | null = null;
 
   if (input.shareMode === 'team') {
-    targetUserId = '*';
+    const explicitTeamId = input.targetTeamId?.trim();
+    if (explicitTeamId) {
+      targetUserId = toTeamShareTargetUserId(explicitTeamId);
+    } else if (input.targetUserId && parseTeamShareTargetUserId(input.targetUserId)) {
+      targetUserId = toTeamShareTargetUserId(parseTeamShareTargetUserId(input.targetUserId)!);
+    } else {
+      targetUserId = '*';
+    }
   } else if (input.shareMode === 'user') {
     const uid = input.targetUserId?.trim();
     if (!uid || uid === '*') throw new Error('invalid_target_user');
@@ -397,6 +431,109 @@ export async function listDocumentSharesForServer(
   return rows.map(mapDbRow);
 }
 
+export async function listServerDocumentGroups(
+  db: Database,
+  serverId: string,
+  actorUserId: string,
+): Promise<ServerDocumentGroup[]> {
+  const [machineGroupTeams, legacyServerTeams, managedTeams] = await Promise.all([
+    db.query<{ id: string; name: string }>(
+      `SELECT t.id, t.name
+         FROM machine_groups mg
+         JOIN teams t ON t.id = mg.team_id
+        WHERE mg.server_id = $1`,
+      [serverId],
+    ),
+    db.query<{ id: string; name: string }>(
+      `SELECT t.id, t.name
+         FROM servers s
+         JOIN teams t ON t.id = s.team_id
+        WHERE s.id = $1 AND s.team_id IS NOT NULL`,
+      [serverId],
+    ),
+    db.query<{ id: string; name: string }>(
+      `SELECT t.id, t.name
+         FROM teams t
+        WHERE t.owner_id = $1
+           OR EXISTS (
+             SELECT 1 FROM team_members tm
+              WHERE tm.team_id = t.id AND tm.user_id = $1
+           )`,
+      [actorUserId],
+    ),
+  ]);
+
+  const boundIds = new Set<string>();
+  const teamNames = new Map<string, string>();
+  for (const row of machineGroupTeams) {
+    if (!row?.id) continue;
+    boundIds.add(row.id);
+    teamNames.set(row.id, row.name);
+  }
+  for (const row of legacyServerTeams) {
+    if (!row?.id) continue;
+    boundIds.add(row.id);
+    if (!teamNames.has(row.id)) teamNames.set(row.id, row.name);
+  }
+  for (const row of managedTeams) {
+    if (!row?.id) continue;
+    if (!teamNames.has(row.id)) teamNames.set(row.id, row.name);
+  }
+
+  const teamIds = [...teamNames.keys()];
+  if (teamIds.length === 0) return [];
+
+  const activeMemberRows = await db.query<{ team_id: string; user_id: string }>(
+    `SELECT tm.team_id, tm.user_id
+       FROM team_members tm
+       JOIN users u ON u.id = tm.user_id
+      WHERE tm.team_id = ANY($1::text[])
+        AND u.status = $2`,
+    [teamIds, USER_STATUS.ACTIVE],
+  );
+
+  const memberSets = new Map<string, Set<string>>();
+  for (const row of activeMemberRows) {
+    let set = memberSets.get(row.team_id);
+    if (!set) {
+      set = new Set<string>();
+      memberSets.set(row.team_id, set);
+    }
+    set.add(row.user_id);
+  }
+
+  return teamIds
+    .map((id) => ({
+      id,
+      name: teamNames.get(id) ?? id,
+      memberCount: memberSets.get(id)?.size ?? 0,
+      boundToServer: boundIds.has(id),
+    }))
+    .sort((a, b) => {
+      if (a.boundToServer !== b.boundToServer) return a.boundToServer ? -1 : 1;
+      const nameCmp = a.name.localeCompare(b.name);
+      return nameCmp !== 0 ? nameCmp : a.id.localeCompare(b.id);
+    });
+}
+
+export function enrichDocumentShareTeamNames(
+  shares: DocumentShareRow[],
+  groups: ServerDocumentGroup[],
+): DocumentShareRow[] {
+  const nameById = new Map(groups.map((g) => [g.id, g.name]));
+  return shares.map((s) => {
+    const teamId = s.targetTeamId ?? parseTeamShareTargetUserId(s.targetUserId);
+    if (!teamId) return s;
+    const resolvedName = nameById.get(teamId) ?? s.targetTeamName ?? null;
+    if (resolvedName === s.targetTeamName && teamId === s.targetTeamId) return s;
+    return {
+      ...s,
+      targetTeamId: teamId,
+      targetTeamName: resolvedName,
+    };
+  });
+}
+
 export interface SharedWithMeItem extends DocumentShareRow {
   serverName: string | null;
 }
@@ -406,6 +543,14 @@ export async function listDocumentsSharedWithUser(
   userId: string,
   now = Date.now(),
 ): Promise<SharedWithMeItem[]> {
+  const actor = await db.queryOne<{ status: string | null }>(
+    'SELECT status FROM users WHERE id = $1',
+    [userId],
+  );
+  if (actor && !isUserStatusActive(actor.status)) {
+    return [];
+  }
+
   const rows = await db.query<DbDocumentShareRow & { server_name: string | null }>(
     `SELECT ds.*, s.name AS server_name
        FROM document_shares ds
@@ -418,15 +563,38 @@ export async function listDocumentsSharedWithUser(
           ds.target_user_id = $2
           OR ds.redeemed_by_user_id = $2
           OR ds.target_user_id = '*'
+          OR ds.target_user_id LIKE 'team:%'
         )
       ORDER BY ds.updated_at DESC`,
     [now, userId],
   );
+  const hasGroupCandidate = rows.some((r) => parseTeamShareTargetUserId(r.target_user_id) !== null);
+  const userTeamRows = hasGroupCandidate
+    ? await db.query<{ team_id: string; name: string }>(
+        `SELECT tm.team_id, t.name
+           FROM team_members tm
+           JOIN teams t ON t.id = tm.team_id
+          WHERE tm.user_id = $1`,
+        [userId],
+      )
+    : [];
+  const userTeamNames = new Map(userTeamRows.map((t) => [t.team_id, t.name]));
+
   const teamMembershipByServer = new Map<string, boolean>();
   const filtered: Array<DbDocumentShareRow & { server_name: string | null }> = [];
   for (const r of rows) {
     if (r.target_user_id === userId || r.redeemed_by_user_id === userId) {
       filtered.push(r);
+      continue;
+    }
+    const targetTeamId = parseTeamShareTargetUserId(r.target_user_id);
+    if (targetTeamId) {
+      if (userTeamNames.has(targetTeamId)) {
+        filtered.push({
+          ...r,
+          target_team_name: userTeamNames.get(targetTeamId) ?? r.target_team_name ?? null,
+        });
+      }
       continue;
     }
     if (r.target_user_id === '*') {
@@ -1075,41 +1243,65 @@ export async function resolveEffectiveDocumentAccess(
           target_user_id = $3
           OR redeemed_by_user_id = $3
           OR target_user_id = '*'
+          OR target_user_id LIKE 'team:%'
         )`,
     [input.serverId, now, userId],
   );
 
-  // Team wildcard ('*') shares only apply if the user is a member of this server's team
+  // Team group ('team:<id>') shares apply to current active members of that group;
+  // legacy wildcard ('*') shares apply if the user is a member of this server's team.
+  const hasGroupCandidate = activeSharesRaw.some(
+    (r) => parseTeamShareTargetUserId(r.target_user_id) !== null,
+  );
+  const memberTeamRows = hasGroupCandidate
+    ? await db.query<{ team_id: string }>(
+        'SELECT team_id FROM team_members WHERE user_id = $1',
+        [userId],
+      )
+    : [];
+  const memberTeamSet = new Set(memberTeamRows.map((row) => row.team_id));
+
   const hasWildcardCandidate = activeSharesRaw.some(
     (r) => r.target_user_id === '*' && r.target_user_id !== userId && r.redeemed_by_user_id !== userId,
   );
   const userInServerTeam = hasWildcardCandidate
     ? await isUserInServerTeam(db, input.serverId, userId)
     : false;
-  const activeShares = activeSharesRaw.filter(
-    (r) =>
-      r.target_user_id === userId ||
-      r.redeemed_by_user_id === userId ||
-      (r.target_user_id === '*' && userInServerTeam),
-  );
+  const activeShares = activeSharesRaw.filter((r) => {
+    if (r.target_user_id === userId || r.redeemed_by_user_id === userId) return true;
+    const targetTeamId = parseTeamShareTargetUserId(r.target_user_id);
+    if (targetTeamId) return memberTeamSet.has(targetTeamId);
+    return r.target_user_id === '*' && userInServerTeam;
+  });
 
   if (activeShares.length === 0) {
     return denied('no_active_share');
   }
 
-  const isSpecificUserMatch = (r: DbDocumentShareRow): boolean =>
-    r.target_user_id === userId || r.redeemed_by_user_id === userId;
+  // Priority tier: specific user (0) > explicit group share team:<id> (1) > legacy wildcard * (2)
+  const sharePrincipalTier = (r: DbDocumentShareRow): number => {
+    if (r.target_user_id === userId || r.redeemed_by_user_id === userId) return 0;
+    if (parseTeamShareTargetUserId(r.target_user_id) !== null) return 1;
+    return 2;
+  };
+
+  const compareTieAtSameDepth = (a: DbDocumentShareRow, b: DbDocumentShareRow): number => {
+    const tierDiff = sharePrincipalTier(a) - sharePrincipalTier(b);
+    if (tierDiff !== 0) return tierDiff;
+    const updatedDiff = (toNum(b.updated_at) ?? 0) - (toNum(a.updated_at) ?? 0);
+    if (updatedDiff !== 0) return updatedDiff;
+    if (a.role !== b.role) return a.role === 'editor' ? -1 : 1;
+    if (Boolean(a.allow_download) !== Boolean(b.allow_download)) {
+      return a.allow_download ? -1 : 1;
+    }
+    return a.id.localeCompare(b.id);
+  };
 
   // Priority 3a: Exact single-file match (`target_kind = 'file'`) overrides folder inheritance!
-  // Specific user (`userId`) takes priority over team wildcard (`'*'`).
+  // Specific user (`userId`) takes priority over explicit group (`team:<id>`), which beats wildcard (`'*'`).
   const exactFileMatches = activeShares
     .filter((r) => r.target_kind === 'file' && r.target_path === normPath)
-    .sort((a, b) => {
-      const aSpec = isSpecificUserMatch(a) ? 0 : 1;
-      const bSpec = isSpecificUserMatch(b) ? 0 : 1;
-      if (aSpec !== bSpec) return aSpec - bSpec;
-      return (toNum(b.updated_at) ?? 0) - (toNum(a.updated_at) ?? 0);
-    });
+    .sort(compareTieAtSameDepth);
 
   if (exactFileMatches.length > 0) {
     const match = exactFileMatches[0]!;
@@ -1128,17 +1320,14 @@ export async function resolveEffectiveDocumentAccess(
   }
 
   // Priority 3b: Ancestor folder match (`target_kind = 'folder'`), deepest folder path first,
-  // then specific user (`userId`) before wildcard (`'*'`).
+  // then specific user (`userId`) before explicit group (`team:<id>`) before wildcard (`'*'`).
   const folderMatches = activeShares
     .filter((r) => r.target_kind === 'folder' && isPathWithinSharedFolder(normPath, r.target_path))
     .sort((a, b) => {
       if (b.target_path.length !== a.target_path.length) {
         return b.target_path.length - a.target_path.length;
       }
-      const aSpec = isSpecificUserMatch(a) ? 0 : 1;
-      const bSpec = isSpecificUserMatch(b) ? 0 : 1;
-      if (aSpec !== bSpec) return aSpec - bSpec;
-      return (toNum(b.updated_at) ?? 0) - (toNum(a.updated_at) ?? 0);
+      return compareTieAtSameDepth(a, b);
     });
 
   if (folderMatches.length > 0) {

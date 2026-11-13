@@ -11,11 +11,14 @@ import { ACCOUNT_SESSION_JWT_TYPE } from '../../../shared/auth-token-types.js';
 import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
 import {
   createDocumentShare,
+  enrichDocumentShareTeamNames,
   getDocumentShareByToken,
   isPathWithinSharedFolder,
   listDocumentSharesForServer,
   listDocumentsSharedWithUser,
+  listServerDocumentGroups,
   normalizeDocumentSharePath,
+  parseTeamShareTargetUserId,
   recordVerifiedExternalSharePin,
   redeemMagicInviteShare,
   resolveEffectiveDocumentAccess,
@@ -26,6 +29,7 @@ import {
   type DocumentShareRole,
   type DocumentShareRow,
   type DocumentShareTargetKind,
+  type ServerDocumentGroup,
 } from '../db/document-sharing.js';
 import {
   buildBlankDocumentBytes,
@@ -134,12 +138,18 @@ documentSharingRoutes.get('/server/:id/doc-shares', requireAuth(), async (c): Pr
 
   const targetPath = c.req.query('path')?.trim() || undefined;
   const includeRevoked = c.req.query('includeRevoked') === 'true';
-  const shares = await listDocumentSharesForServer(c.env.DB, serverId, {
-    targetPath,
-    includeRevoked,
-  });
+  const [shares, groups] = await Promise.all([
+    listDocumentSharesForServer(c.env.DB, serverId, {
+      targetPath,
+      includeRevoked,
+    }),
+    listServerDocumentGroups(c.env.DB, serverId, userId),
+  ]);
 
-  return c.json({ shares });
+  return c.json({
+    shares: enrichDocumentShareTeamNames(shares, groups),
+    groups,
+  });
 });
 
 // POST /api/server/:id/doc-shares
@@ -176,22 +186,47 @@ documentSharingRoutes.post('/server/:id/doc-shares', requireAuth(), async (c): P
     ? body.expiresAt
     : null;
 
+  const rawTargetTeamId =
+    typeof body.targetTeamId === 'string' ? body.targetTeamId.trim() : null;
+  if (typeof body.targetTeamId === 'string' && !rawTargetTeamId) {
+    return c.json({ error: 'invalid_target_team' }, 400);
+  }
+  const rawUserField =
+    (typeof body.targetUserId === 'string' && body.targetUserId.trim()) ||
+    (typeof body.targetUser === 'string' && body.targetUser.trim()) ||
+    '';
+  const rawTeamFromUserField = rawUserField ? parseTeamShareTargetUserId(rawUserField) : null;
+  if (rawUserField.startsWith('team:') && !rawTeamFromUserField) {
+    return c.json({ error: 'invalid_target_team' }, 400);
+  }
+  const requestedTeamId = rawTargetTeamId || rawTeamFromUserField;
+
   let shareMode: DocumentShareMode =
     body.shareMode === 'team' ||
     body.shareMode === 'external_link' ||
     body.shareMode === 'magic_invite' ||
     body.shareMode === 'user'
       ? body.shareMode
-      : body.targetUserId === '*' || body.targetUser === '*'
+      : requestedTeamId || body.targetUserId === '*' || body.targetUser === '*'
         ? 'team'
         : 'user';
 
+  if (requestedTeamId && shareMode !== 'team') {
+    return c.json({ error: 'invalid_share_mode' }, 400);
+  }
+
+  let matchedGroup: ServerDocumentGroup | undefined;
+  if (shareMode === 'team' && requestedTeamId) {
+    const groups = await listServerDocumentGroups(c.env.DB, serverId, userId);
+    matchedGroup = groups.find((g) => g.id === requestedTeamId);
+    if (!matchedGroup) {
+      return c.json({ error: 'target_team_forbidden' }, 403);
+    }
+  }
+
   let resolvedTargetUserId: string | undefined;
   if (shareMode === 'user') {
-    const rawUser =
-      (typeof body.targetUserId === 'string' && body.targetUserId.trim()) ||
-      (typeof body.targetUser === 'string' && body.targetUser.trim()) ||
-      '';
+    const rawUser = rawUserField;
     if (!rawUser) {
       return c.json({ error: 'missing_target_user' }, 400);
     }
@@ -207,13 +242,14 @@ documentSharingRoutes.post('/server/:id/doc-shares', requireAuth(), async (c): P
   }
 
   try {
-    const { share, rawShareToken } = await createDocumentShare(c.env.DB, {
+    const { share: createdShare, rawShareToken } = await createDocumentShare(c.env.DB, {
       serverId,
       targetKind,
       targetPath: normPath,
       label,
       shareMode,
       targetUserId: resolvedTargetUserId,
+      targetTeamId: matchedGroup?.id ?? null,
       participantLabel,
       accessCode,
       deviceLockEnabled,
@@ -222,6 +258,9 @@ documentSharingRoutes.post('/server/:id/doc-shares', requireAuth(), async (c): P
       createdBy: userId,
       expiresAt,
     });
+    const share = matchedGroup
+      ? { ...createdShare, targetTeamId: matchedGroup.id, targetTeamName: matchedGroup.name }
+      : createdShare;
 
     const serverBaseUrl = (c.env.SERVER_URL || '').replace(/\/$/, '');
     const sharePath = rawShareToken ? `/doc-share/${rawShareToken}` : null;
@@ -290,7 +329,10 @@ documentSharingRoutes.patch('/server/:id/doc-shares/:shareId', requireAuth(), as
     return c.json({ error: 'share_not_found' }, 404);
   }
 
-  return c.json({ share: updated });
+  const enriched = updated.targetTeamId
+    ? enrichDocumentShareTeamNames([updated], await listServerDocumentGroups(c.env.DB, serverId, userId))[0]!
+    : updated;
+  return c.json({ share: enriched });
 });
 
 // DELETE /api/server/:id/doc-shares/:shareId
@@ -308,7 +350,10 @@ documentSharingRoutes.delete('/server/:id/doc-shares/:shareId', requireAuth(), a
     return c.json({ error: 'share_not_found' }, 404);
   }
 
-  return c.json({ ok: true, share: revoked });
+  const enriched = revoked.targetTeamId
+    ? enrichDocumentShareTeamNames([revoked], await listServerDocumentGroups(c.env.DB, serverId, userId))[0]!
+    : revoked;
+  return c.json({ ok: true, share: enriched });
 });
 
 // ── 2. Scheme 1: External Dedicated Link Verify + Access Code + Device/Passkey Lock ──

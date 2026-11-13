@@ -16,8 +16,10 @@ import {
 } from '../src/routes/onlyoffice.js';
 import {
   clearVerifiedExternalSharePinsForTests,
+  createDocumentShare,
   isPathWithinSharedFolder,
   normalizeDocumentSharePath,
+  resolveEffectiveDocumentAccess,
   claimOnlyOfficeCommitOwner,
   commitOnlyOfficeRoom,
   type OnlyOfficeRoomRow,
@@ -82,6 +84,10 @@ function createInMemoryDb() {
   const servers = new Map<string, { id: string; name: string; user_id: string; team_id: string | null }>([
     ['srv-1', { id: 'srv-1', name: 'Primary Server', user_id: 'owner-1', team_id: 'team-1' }],
   ]);
+  const teams = new Map<string, { id: string; name: string; owner_id: string }>([
+    ['team-1', { id: 'team-1', name: 'Primary Team', owner_id: 'owner-1' }],
+  ]);
+  const machineGroups = new Set<string>(); // `${serverId}:${teamId}`
   // team-1 has owner-1, user-bob, user-carol, NOT user-stranger
   const teamMembers = new Map<string, string>([
     ['team-1:owner-1', 'owner'],
@@ -143,7 +149,8 @@ function createInMemoryDb() {
             return (
               r.target_user_id === userId ||
               r.redeemed_by_user_id === userId ||
-              r.target_user_id === '*'
+              r.target_user_id === '*' ||
+              r.target_user_id.startsWith('team:')
             );
           })
           .sort((a, b) => b.updated_at - a.updated_at)
@@ -185,9 +192,95 @@ function createInMemoryDb() {
             r.server_id === serverId &&
             r.revoked_at === null &&
             (r.expires_at === null || r.expires_at > nowNum) &&
-            (r.target_user_id === userId || r.redeemed_by_user_id === userId || r.target_user_id === '*'),
+            (r.target_user_id === userId ||
+              r.redeemed_by_user_id === userId ||
+              r.target_user_id === '*' ||
+              r.target_user_id.startsWith('team:')),
         );
         return list as unknown as T[];
+      }
+
+      // listServerDocumentGroups: machine_groups bound teams
+      if (normSql.includes('FROM machine_groups mg') && normSql.includes('JOIN teams t ON t.id = mg.team_id')) {
+        const serverId = params[0] as string;
+        const rows: Array<{ id: string; name: string }> = [];
+        for (const key of machineGroups) {
+          const [sid, tid] = key.split(':');
+          if (sid === serverId && tid) {
+            const t = teams.get(tid);
+            if (t) rows.push({ id: t.id, name: t.name });
+          }
+        }
+        return rows as unknown as T[];
+      }
+
+      // listServerDocumentGroups: legacy servers.team_id bound team
+      if (normSql.includes('FROM servers s') && normSql.includes('JOIN teams t ON t.id = s.team_id')) {
+        const serverId = params[0] as string;
+        const srv = servers.get(serverId);
+        if (!srv?.team_id) return [] as T[];
+        const t = teams.get(srv.team_id);
+        return (t ? [{ id: t.id, name: t.name }] : []) as unknown as T[];
+      }
+
+      // listServerDocumentGroups: caller's global groups (owner or member)
+      if (normSql.includes('FROM teams t') && normSql.includes('WHERE t.owner_id = $1')) {
+        const actorUserId = params[0] as string;
+        const rows: Array<{ id: string; name: string }> = [];
+        for (const t of teams.values()) {
+          if (t.owner_id === actorUserId || teamMembers.has(`${t.id}:${actorUserId}`)) {
+            rows.push({ id: t.id, name: t.name });
+          }
+        }
+        return rows as unknown as T[];
+      }
+
+      // listServerDocumentGroups: active member counts for teamIds
+      if (normSql.includes('FROM team_members tm') && normSql.includes('JOIN users u ON u.id = tm.user_id')) {
+        const [teamIds, activeStatus] = params as [string[], string];
+        const teamSet = new Set(teamIds);
+        const rows: Array<{ team_id: string; user_id: string }> = [];
+        for (const key of teamMembers.keys()) {
+          const idx = key.indexOf(':');
+          const tid = key.slice(0, idx);
+          const uid = key.slice(idx + 1);
+          const u = users.get(uid);
+          if (teamSet.has(tid) && u && u.status === activeStatus) {
+            rows.push({ team_id: tid, user_id: uid });
+          }
+        }
+        return rows as unknown as T[];
+      }
+
+      // listDocumentsSharedWithUser: user's team memberships with names
+      if (normSql.includes('SELECT tm.team_id, t.name FROM team_members tm JOIN teams t ON t.id = tm.team_id WHERE tm.user_id = $1')) {
+        const userId = params[0] as string;
+        const rows: Array<{ team_id: string; name: string }> = [];
+        for (const key of teamMembers.keys()) {
+          const idx = key.indexOf(':');
+          const tid = key.slice(0, idx);
+          const uid = key.slice(idx + 1);
+          if (uid === userId) {
+            const t = teams.get(tid);
+            if (t) rows.push({ team_id: tid, name: t.name });
+          }
+        }
+        return rows as unknown as T[];
+      }
+
+      // resolveEffectiveDocumentAccess: user's team_ids
+      if (normSql.startsWith('SELECT team_id FROM team_members WHERE user_id = $1')) {
+        const userId = params[0] as string;
+        const rows: Array<{ team_id: string }> = [];
+        for (const key of teamMembers.keys()) {
+          const idx = key.indexOf(':');
+          const tid = key.slice(0, idx);
+          const uid = key.slice(idx + 1);
+          if (uid === userId) {
+            rows.push({ team_id: tid });
+          }
+        }
+        return rows as unknown as T[];
       }
 
       return [] as T[];
@@ -203,7 +296,21 @@ function createInMemoryDb() {
       ) {
         const [serverId, userId] = params as [string, string];
         const srv = servers.get(serverId);
-        if (!srv || !srv.team_id) return null;
+        if (!srv) return null;
+        if (normSql.includes('FROM machine_groups mg')) {
+          let bestRole: string | null = null;
+          for (const key of machineGroups) {
+            const [sid, tid] = key.split(':');
+            if (sid === serverId && tid) {
+              const r = teamMembers.get(`${tid}:${userId}`);
+              if (r === 'owner') bestRole = 'owner';
+              else if (r === 'admin' && bestRole !== 'owner') bestRole = 'admin';
+              else if (r && !bestRole) bestRole = r;
+            }
+          }
+          if (bestRole) return { role: bestRole } as unknown as T;
+        }
+        if (!srv.team_id) return null;
         const role = teamMembers.get(`${srv.team_id}:${userId}`);
         return (role ? { role } : null) as unknown as T | null;
       }
@@ -786,6 +893,8 @@ function createInMemoryDb() {
     db,
     users,
     servers,
+    teams,
+    machineGroups,
     teamMembers,
     shares,
     refreshTokens,
@@ -2685,5 +2794,356 @@ describe('Real Daemon CommandHandler Integration: Atomic Binary Save & Symlink E
     expect(writeEscape.status).toBe('error');
     expect(writeEscape.error).toBe('forbidden_path');
     expect(fs.readFileSync(outsideSecret, 'utf8')).toBe('top-secret-outside');
+  });
+});
+
+describe('Document sharing: Controlled Node Groups (team:<teamId>) isolation, live membership & priority', () => {
+  let store: ReturnType<typeof createInMemoryDb>;
+  let app: ReturnType<typeof buildApp>;
+  const bearer = (userId: string) =>
+    `Bearer ${signJwt({ sub: userId, role: 'member' }, JWT_KEY, 3600)}`;
+
+  beforeEach(() => {
+    store = createInMemoryDb();
+    // Add users for Group A, Group B, inactive user, and private third-party Group C
+    store.users.set('user-group-b', {
+      id: 'user-group-b',
+      username: 'dave',
+      display_name: 'Dave GroupB',
+      status: 'active',
+      sessions_valid_after: 0,
+      is_admin: false,
+    });
+    store.users.set('user-inactive', {
+      id: 'user-inactive',
+      username: 'eve',
+      display_name: 'Eve Disabled',
+      status: 'disabled',
+      sessions_valid_after: 0,
+      is_admin: false,
+    });
+
+    // Global groups:
+    // team-1 ("Primary Team"): bound to srv-1 (owner-1, user-bob, user-carol)
+    // team-global-b ("Design Group"): NOT bound to srv-1; owner-1 is only a 'member', user-group-b is 'owner', user-inactive is 'member'
+    // team-private-c ("Private Third Party"): unrelated third-party group owned by user-stranger
+    store.teams.set('team-global-b', { id: 'team-global-b', name: 'Design Group', owner_id: 'user-group-b' });
+    store.teams.set('team-private-c', { id: 'team-private-c', name: 'Secret Third Party', owner_id: 'user-stranger' });
+    store.machineGroups.add('srv-1:team-1');
+
+    store.teamMembers.set('team-global-b:user-group-b', 'owner');
+    store.teamMembers.set('team-global-b:owner-1', 'member');
+    store.teamMembers.set('team-global-b:user-inactive', 'member');
+    store.teamMembers.set('team-private-c:user-stranger', 'owner');
+
+    WsBridge.getAll().clear();
+    app = buildApp(makeEnv(store.db));
+  });
+
+  afterEach(() => {
+    WsBridge.getAll().clear();
+    vi.restoreAllMocks();
+  });
+
+  it('returns bound & caller-eligible global groups (with memberCount & boundToServer), hides private third-party teams, and enforces 403 on unauthorized teamId', async () => {
+    // Unauthorized non-owner/non-admin user cannot list shares or groups
+    const bobListRes = await app.request('/api/server/srv-1/doc-shares', {
+      headers: { Authorization: bearer('user-bob') },
+    });
+    expect(bobListRes.status).toBe(403);
+
+    // Owner sees deduped bound group (team-1) + caller's unbound global group (team-global-b), never team-private-c
+    const listRes = await app.request('/api/server/srv-1/doc-shares', {
+      headers: { Authorization: bearer('owner-1') },
+    });
+    expect(listRes.status).toBe(200);
+    const listBody = (await listRes.json()) as {
+      shares: unknown[];
+      groups: Array<{ id: string; name: string; memberCount: number; boundToServer: boolean }>;
+    };
+    expect(listBody.groups.map((g) => g.id)).toEqual(['team-1', 'team-global-b']);
+    const team1 = listBody.groups.find((g) => g.id === 'team-1')!;
+    const groupB = listBody.groups.find((g) => g.id === 'team-global-b')!;
+    expect(team1).toEqual({ id: 'team-1', name: 'Primary Team', memberCount: 3, boundToServer: true });
+    // Active members only: user-group-b + owner-1 = 2 (user-inactive disabled excluded)
+    expect(groupB).toEqual({ id: 'team-global-b', name: 'Design Group', memberCount: 2, boundToServer: false });
+
+    // Third-party private teamId and unknown teamId both return identical 403 without leaking team existence or name
+    const privateCreate = await app.request('/api/server/srv-1/doc-shares', {
+      method: 'POST',
+      headers: { Authorization: bearer('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetKind: 'file',
+        targetPath: '/docs/a.docx',
+        shareMode: 'team',
+        targetTeamId: 'team-private-c',
+        role: 'viewer',
+      }),
+    });
+    const missingCreate = await app.request('/api/server/srv-1/doc-shares', {
+      method: 'POST',
+      headers: { Authorization: bearer('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetKind: 'file',
+        targetPath: '/docs/a.docx',
+        shareMode: 'team',
+        targetTeamId: 'team-nonexistent',
+        role: 'viewer',
+      }),
+    });
+    expect(privateCreate.status).toBe(403);
+    expect(missingCreate.status).toBe(403);
+    const privateBody = await privateCreate.json();
+    const missingBody = await missingCreate.json();
+    expect(privateBody).toEqual({ error: 'target_team_forbidden' });
+    expect(missingBody).toEqual({ error: 'target_team_forbidden' });
+    expect(JSON.stringify(privateBody)).not.toContain('Secret Third Party');
+  });
+
+  it('isolates Group A vs Group B shares, enforces live team_members + active status, allows independent PATCH/DELETE, and preserves legacy * compat', async () => {
+    // 1. Share /docs/spec.docx to Group A (team-1) as viewer, and separately to unbound global Group B (team-global-b) as editor
+    const resA = await app.request('/api/server/srv-1/doc-shares', {
+      method: 'POST',
+      headers: { Authorization: bearer('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetKind: 'file',
+        targetPath: '/docs/spec.docx',
+        shareMode: 'team',
+        targetTeamId: 'team-1',
+        role: 'viewer',
+        allowDownload: false,
+      }),
+    });
+    expect(resA.status).toBe(201);
+    const bodyA = (await resA.json()) as { share: { id: string; targetUserId: string; targetTeamId: string; targetTeamName: string } };
+    expect(bodyA.share.targetUserId).toBe('team:team-1');
+    expect(bodyA.share.targetTeamId).toBe('team-1');
+    expect(bodyA.share.targetTeamName).toBe('Primary Team');
+
+    // Share /docs/only-a.docx ONLY with team-1
+    const resOnlyA = await app.request('/api/server/srv-1/doc-shares', {
+      method: 'POST',
+      headers: { Authorization: bearer('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetKind: 'file',
+        targetPath: '/docs/only-a.docx',
+        shareMode: 'team',
+        targetTeamId: 'team-1',
+        role: 'editor',
+        allowDownload: true,
+      }),
+    });
+    expect(resOnlyA.status).toBe(201);
+
+    // 2. Group B user-group-b can access neither /docs/only-a.docx nor /docs/spec.docx yet
+    expect(
+      (await resolveEffectiveDocumentAccess(store.db, { serverId: 'srv-1', filePath: '/docs/only-a.docx', userId: 'user-group-b' })).allowed,
+    ).toBe(false);
+    expect(
+      (await resolveEffectiveDocumentAccess(store.db, { serverId: 'srv-1', filePath: '/docs/spec.docx', userId: 'user-group-b' })).allowed,
+    ).toBe(false);
+
+    // 3. Grant unbound global Group B editor on /docs/spec.docx
+    const resB = await app.request('/api/server/srv-1/doc-shares', {
+      method: 'POST',
+      headers: { Authorization: bearer('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetKind: 'file',
+        targetPath: '/docs/spec.docx',
+        shareMode: 'team',
+        targetTeamId: 'team-global-b',
+        role: 'editor',
+        allowDownload: true,
+      }),
+    });
+    expect(resB.status).toBe(201);
+    const bodyB = (await resB.json()) as { share: { id: string; targetTeamId: string; targetTeamName: string } };
+    expect(bodyB.share.targetTeamId).toBe('team-global-b');
+    expect(bodyB.share.targetTeamName).toBe('Design Group');
+
+    // Group B user now gets editor on /docs/spec.docx, still denied on /docs/only-a.docx
+    const accessSpecB = await resolveEffectiveDocumentAccess(store.db, {
+      serverId: 'srv-1',
+      filePath: '/docs/spec.docx',
+      userId: 'user-group-b',
+    });
+    expect(accessSpecB.allowed).toBe(true);
+    expect(accessSpecB.role).toBe('editor');
+    expect(accessSpecB.allowDownload).toBe(true);
+    expect(
+      (await resolveEffectiveDocumentAccess(store.db, { serverId: 'srv-1', filePath: '/docs/only-a.docx', userId: 'user-group-b' })).allowed,
+    ).toBe(false);
+
+    // Inactive member in Group B is denied immediately
+    const accessInactive = await resolveEffectiveDocumentAccess(store.db, {
+      serverId: 'srv-1',
+      filePath: '/docs/spec.docx',
+      userId: 'user-inactive',
+    });
+    expect(accessInactive.allowed).toBe(false);
+    expect(accessInactive.reason).toBe('user_inactive');
+
+    // Group A user (user-bob) sees only team-1 shares with targetTeamName populated in shared-with-me
+    const bobSharedRes = await app.request('/api/doc-shares/shared-with-me', {
+      headers: { Authorization: bearer('user-bob') },
+    });
+    expect(bobSharedRes.status).toBe(200);
+    const bobSharedBody = (await bobSharedRes.json()) as {
+      shares: Array<{ id: string; targetPath: string; targetTeamId?: string | null; targetTeamName?: string | null }>;
+    };
+    expect(bobSharedBody.shares.map((s) => s.targetPath).sort()).toEqual(['/docs/only-a.docx', '/docs/spec.docx']);
+    expect(bobSharedBody.shares.every((s) => s.targetTeamId === 'team-1' && s.targetTeamName === 'Primary Team')).toBe(true);
+
+    // Live team_members removal: removing user-bob from team-1 revokes access & shared-with-me immediately
+    store.teamMembers.delete('team-1:user-bob');
+    expect(
+      (await resolveEffectiveDocumentAccess(store.db, { serverId: 'srv-1', filePath: '/docs/only-a.docx', userId: 'user-bob' })).allowed,
+    ).toBe(false);
+    const bobAfterRemove = await app.request('/api/doc-shares/shared-with-me', {
+      headers: { Authorization: bearer('user-bob') },
+    });
+    const bobAfterBody = (await bobAfterRemove.json()) as { shares: unknown[] };
+    expect(bobAfterBody.shares).toHaveLength(0);
+
+    // Re-adding user-bob immediately restores access
+    store.teamMembers.set('team-1:user-bob', 'member');
+    expect(
+      (await resolveEffectiveDocumentAccess(store.db, { serverId: 'srv-1', filePath: '/docs/only-a.docx', userId: 'user-bob' })).allowed,
+    ).toBe(true);
+
+    // Independent PATCH & DELETE on Group B rule does not alter Group A rule
+    const patchB = await app.request(`/api/server/srv-1/doc-shares/${bodyB.share.id}`, {
+      method: 'PATCH',
+      headers: { Authorization: bearer('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ role: 'viewer', allowDownload: false }),
+    });
+    expect(patchB.status).toBe(200);
+    const accessSpecBAfterPatch = await resolveEffectiveDocumentAccess(store.db, {
+      serverId: 'srv-1',
+      filePath: '/docs/spec.docx',
+      userId: 'user-group-b',
+    });
+    expect(accessSpecBAfterPatch.role).toBe('viewer');
+    expect(accessSpecBAfterPatch.allowDownload).toBe(false);
+
+    const delB = await app.request(`/api/server/srv-1/doc-shares/${bodyB.share.id}`, {
+      method: 'DELETE',
+      headers: { Authorization: bearer('owner-1') },
+    });
+    expect(delB.status).toBe(200);
+    expect(
+      (await resolveEffectiveDocumentAccess(store.db, { serverId: 'srv-1', filePath: '/docs/spec.docx', userId: 'user-group-b' })).allowed,
+    ).toBe(false);
+    // Group A still holds /docs/spec.docx viewer access
+    const accessSpecA = await resolveEffectiveDocumentAccess(store.db, {
+      serverId: 'srv-1',
+      filePath: '/docs/spec.docx',
+      userId: 'user-bob',
+    });
+    expect(accessSpecA.allowed).toBe(true);
+    expect(accessSpecA.role).toBe('viewer');
+  });
+
+  it('preserves precedence: exact file > deeper folder > shallower folder AND specific user > team:<id> > legacy *', async () => {
+    const baseNow = 1700000000000;
+    // Legacy wildcard '*' on /repo (editor, allowDownload: true)
+    await createDocumentShare(store.db, {
+      serverId: 'srv-1',
+      targetKind: 'folder',
+      targetPath: '/repo',
+      shareMode: 'team',
+      role: 'editor',
+      allowDownload: true,
+      createdBy: 'owner-1',
+      now: baseNow,
+    });
+    // Group share team:team-1 on shallower /repo (viewer, allowDownload: false) -> beats '*' at same folder depth!
+    await createDocumentShare(store.db, {
+      serverId: 'srv-1',
+      targetKind: 'folder',
+      targetPath: '/repo',
+      shareMode: 'team',
+      targetTeamId: 'team-1',
+      role: 'viewer',
+      allowDownload: false,
+      createdBy: 'owner-1',
+      now: baseNow + 1,
+    });
+    const atShallow = await resolveEffectiveDocumentAccess(store.db, {
+      serverId: 'srv-1',
+      filePath: '/repo/readme.docx',
+      userId: 'user-bob',
+    });
+    expect(atShallow.allowed).toBe(true);
+    expect(atShallow.role).toBe('viewer');
+    expect(atShallow.allowDownload).toBe(false);
+
+    // Deeper folder /repo/sub for team-1 (editor, allowDownload: true) beats shallower /repo
+    await createDocumentShare(store.db, {
+      serverId: 'srv-1',
+      targetKind: 'folder',
+      targetPath: '/repo/sub',
+      shareMode: 'team',
+      targetTeamId: 'team-1',
+      role: 'editor',
+      allowDownload: true,
+      createdBy: 'owner-1',
+      now: baseNow + 2,
+    });
+    const atDeep = await resolveEffectiveDocumentAccess(store.db, {
+      serverId: 'srv-1',
+      filePath: '/repo/sub/plan.docx',
+      userId: 'user-bob',
+    });
+    expect(atDeep.role).toBe('editor');
+    expect(atDeep.allowDownload).toBe(true);
+
+    // Exact file override for team-1 (viewer, allowDownload: false) beats deeper folder
+    await createDocumentShare(store.db, {
+      serverId: 'srv-1',
+      targetKind: 'file',
+      targetPath: '/repo/sub/plan.docx',
+      shareMode: 'team',
+      targetTeamId: 'team-1',
+      role: 'viewer',
+      allowDownload: false,
+      createdBy: 'owner-1',
+      now: baseNow + 3,
+    });
+    const atExactFileGroup = await resolveEffectiveDocumentAccess(store.db, {
+      serverId: 'srv-1',
+      filePath: '/repo/sub/plan.docx',
+      userId: 'user-bob',
+    });
+    expect(atExactFileGroup.role).toBe('viewer');
+    expect(atExactFileGroup.allowDownload).toBe(false);
+
+    // Specific user override on /repo/sub/plan.docx beats group rule on exact file
+    await createDocumentShare(store.db, {
+      serverId: 'srv-1',
+      targetKind: 'file',
+      targetPath: '/repo/sub/plan.docx',
+      shareMode: 'user',
+      targetUserId: 'user-bob',
+      role: 'editor',
+      allowDownload: true,
+      createdBy: 'owner-1',
+      now: baseNow + 4,
+    });
+    const atExactFileUser = await resolveEffectiveDocumentAccess(store.db, {
+      serverId: 'srv-1',
+      filePath: '/repo/sub/plan.docx',
+      userId: 'user-bob',
+    });
+    expect(atExactFileUser.role).toBe('editor');
+    expect(atExactFileUser.allowDownload).toBe(true);
+    // Another member of team-1 (user-carol) still gets the group viewer rule
+    const atExactFileCarol = await resolveEffectiveDocumentAccess(store.db, {
+      serverId: 'srv-1',
+      filePath: '/repo/sub/plan.docx',
+      userId: 'user-carol',
+    });
+    expect(atExactFileCarol.role).toBe('viewer');
+    expect(atExactFileCarol.allowDownload).toBe(false);
   });
 });

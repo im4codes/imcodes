@@ -3255,6 +3255,13 @@ export interface OnlyOfficeConfigResponse {
   };
 }
 
+export interface ServerDocGroup {
+  id: string;
+  name: string;
+  memberCount: number;
+  boundToServer: boolean;
+}
+
 export interface DocumentShareItem {
   id: string;
   serverId: string;
@@ -3263,6 +3270,8 @@ export interface DocumentShareItem {
   label: string | null;
   shareMode: DocShareMode;
   targetUserId: string;
+  targetTeamId?: string | null;
+  targetTeamName?: string | null;
   targetUsername?: string | null;
   targetDisplayName?: string | null;
   participantLabel: string | null;
@@ -3338,11 +3347,11 @@ export async function fetchOnlyOfficeConfig(
 export async function listDocumentShares(
   serverId: string,
   targetPath?: string,
-): Promise<{ shares: DocumentShareItem[] }> {
+): Promise<{ shares: DocumentShareItem[]; groups?: ServerDocGroup[] }> {
   const qs = new URLSearchParams();
   if (targetPath) qs.set('path', targetPath);
   const query = qs.toString() ? `?${qs.toString()}` : '';
-  return apiFetch<{ shares: DocumentShareItem[] }>(
+  return apiFetch<{ shares: DocumentShareItem[]; groups?: ServerDocGroup[] }>(
     `/api/server/${encodeURIComponent(serverId)}/doc-shares${query}`,
     { method: 'GET' },
   );
@@ -3357,6 +3366,7 @@ export async function createDocumentShareApi(
     shareMode: DocShareMode;
     targetUser?: string;
     targetUserId?: string;
+    targetTeamId?: string;
     participantLabel?: string;
     accessCode?: string;
     deviceLockEnabled?: boolean;

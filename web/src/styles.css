@@ -16554,12 +16554,7 @@ button.quick-agent-delegation-preset.active {
   min-width: 0;
 }
 
-.guide-block-pain {
-  background: rgba(245, 158, 11, 0.08);
-  border: 1px solid rgba(245, 158, 11, 0.24);
-}
-
-.guide-block-solution {
+.guide-block-summary {
   background: rgba(34, 211, 238, 0.08);
   border: 1px solid rgba(34, 211, 238, 0.24);
 }
@@ -16576,14 +16571,6 @@ button.quick-agent-delegation-preset.active {
   letter-spacing: 0.04em;
   margin-bottom: 5px;
   color: #94a3b8;
-}
-
-.guide-block-pain .guide-block-label {
-  color: #fbbf24;
-}
-
-.guide-block-solution .guide-block-label {
-  color: #38bdf8;
 }
 
 .guide-block-text {
