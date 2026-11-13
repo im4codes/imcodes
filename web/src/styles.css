@@ -3134,13 +3134,13 @@ html.native-ios-mac .chat-dl-btn {
 
 /* ── Voice Overlay (sci-fi 2/3 sheet) ── */
 .voice-overlay-backdrop {
-  position: fixed; inset: 0; z-index: 2147483640;
+  position: fixed; inset: 0; z-index: 2147483020;
   background: rgba(2, 6, 23, 0.78);
   -webkit-backdrop-filter: blur(16px);
   backdrop-filter: blur(16px);
 }
 .voice-overlay {
-  position: fixed; left: 0; right: 0; top: 0; z-index: 2147483641;
+  position: fixed; left: 0; right: 0; top: 0; z-index: 2147483021;
   height: 66vh;
   background: radial-gradient(ellipse at 50% 0%, #0c1929 0%, #020617 70%);
   display: flex; flex-direction: column; align-items: center;
@@ -3343,7 +3343,7 @@ html.native-ios-mac .chat-dl-btn {
   top: calc(16px + max(var(--sat, 0px), env(safe-area-inset-top, 0px)));
   bottom: calc(68px + max(var(--sab, 0px), env(safe-area-inset-bottom, 0px)));
   max-height: calc(var(--vvh, 100dvh) - 84px - max(var(--sat, 0px), env(safe-area-inset-top, 0px)) - max(var(--sab, 0px), env(safe-area-inset-bottom, 0px)));
-  z-index: 2147483642;
+  z-index: 2147483022;
   display: flex;
   justify-content: center;
   align-items: flex-end;

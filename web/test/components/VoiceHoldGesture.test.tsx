@@ -1095,7 +1095,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
                   editLabel: v.slide_right_edit,
                 });
 
-                expect(m.hudZ, `${code}/${zone}/${mode} z-index`).toBe('2147483642');
+                expect(m.hudZ, `${code}/${zone}/${mode} z-index`).toBe('2147483022');
                 expect(m.hudCoversStrip, `${code}/${zone}/${mode} covered by live strip`).toBe(true);
                 expect(m.cardTop, `${code}/${zone}/${mode} cardTop`).toBeGreaterThanOrEqual(15 + vp.sat);
                 expect(m.cardBottom, `${code}/${zone}/${mode} cardBottom`).toBeLessThanOrEqual(vp.height - 67 - vp.sab);
