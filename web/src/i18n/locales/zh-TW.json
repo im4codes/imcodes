@@ -2246,7 +2246,42 @@
     "tab_profile": "個人資訊",
     "tab_notifications": "通知",
     "tab_security": "安全設定",
-    "tab_guide": "使用指南"
+    "tab_guide": "使用指南",
+    "tab_shortcuts": "快捷鍵",
+    "shortcuts": {
+      "title": "鍵盤快捷鍵",
+      "desc": "自訂桌面端切換快捷鍵。點擊對應快捷鍵即可直接按下按鍵進行錄製。",
+      "platform_mac": "macOS 預設方案",
+      "platform_other": "Windows / Linux 預設方案",
+      "reset_all": "全部重設",
+      "clear": "清除",
+      "reset": "恢復預設",
+      "unassigned": "未設定",
+      "recording_prompt": "請按下快捷鍵…",
+      "record_aria": "錄製「{{action}}」快捷鍵",
+      "modifier_required": "請包含修飾鍵（Cmd、Ctrl 或 Alt）或使用功能鍵（F1–F24）。",
+      "reassigned_notice": "已設定新快捷鍵，並清除「{{action}}」的衝突綁定。",
+      "conflict_warning": "與以下快捷鍵衝突：{{actions}}",
+      "hint": "按 Esc 取消錄製。在對話輸入框聚焦時亦可生效；在設定頁、彈窗及終端機內自動停用。",
+      "actions": {
+        "server_prev": {
+          "title": "上一個 Server",
+          "desc": "向上切換到側邊欄中的上一個 Server"
+        },
+        "server_next": {
+          "title": "下一個 Server",
+          "desc": "向下切換到側邊欄中的下一個 Server"
+        },
+        "tab_prev": {
+          "title": "上一個 Tab",
+          "desc": "向左切換到左側的會話分頁"
+        },
+        "tab_next": {
+          "title": "下一個 Tab",
+          "desc": "向右切換到右側的會話分頁"
+        }
+      }
+    }
   },
   "capabilities": {
     "eyebrow": "跨 Agent 的 AI 能力",

@@ -2246,7 +2246,42 @@
     "tab_profile": "个人信息",
     "tab_notifications": "通知",
     "tab_security": "安全设置",
-    "tab_guide": "使用指南"
+    "tab_guide": "使用指南",
+    "tab_shortcuts": "快捷键",
+    "shortcuts": {
+      "title": "键盘快捷键",
+      "desc": "自定义桌面端切换快捷键。点击对应快捷键即可直接按下按键进行录制。",
+      "platform_mac": "macOS 默认方案",
+      "platform_other": "Windows / Linux 默认方案",
+      "reset_all": "全部重置",
+      "clear": "清除",
+      "reset": "恢复默认",
+      "unassigned": "未设置",
+      "recording_prompt": "请按下快捷键…",
+      "record_aria": "录制「{{action}}」快捷键",
+      "modifier_required": "请包含修饰键（Cmd、Ctrl 或 Alt）或使用功能键（F1–F24）。",
+      "reassigned_notice": "已设置新快捷键，并清除「{{action}}」的冲突绑定。",
+      "conflict_warning": "与以下快捷键冲突：{{actions}}",
+      "hint": "按 Esc 取消录制。在对话输入框聚焦时也可生效；在设置页、弹窗和终端内自动禁用。",
+      "actions": {
+        "server_prev": {
+          "title": "上一个 Server",
+          "desc": "向上切换到侧边栏中的上一个 Server"
+        },
+        "server_next": {
+          "title": "下一个 Server",
+          "desc": "向下切换到侧边栏中的下一个 Server"
+        },
+        "tab_prev": {
+          "title": "上一个 Tab",
+          "desc": "向左切换到左侧的会话标签页"
+        },
+        "tab_next": {
+          "title": "下一个 Tab",
+          "desc": "向右切换到右侧的会话标签页"
+        }
+      }
+    }
   },
   "capabilities": {
     "eyebrow": "跨 Agent 的 AI 能力",

@@ -33,6 +33,7 @@ import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
 import type { FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
+import { focusComposerElement } from '../keyboard-shortcuts.js';
 import type { SessionSettingsOpenIntent } from '../session-settings-open-intent.js';
 import type { ChatLocalWebPreviewOpenHandler } from './ChatLoopbackLink.js';
 import type { PendingSharedSessionUpload } from '../services/share-receiver.js';
@@ -236,6 +237,13 @@ export function SessionPane({
   const [quotes, setQuotes] = useState<string[]>([]);
   const addQuote = useCallback((text: string) => {
     setQuotes((prev) => [...prev, text]);
+    const focusNow = () => {
+      focusComposerElement(inputRef.current);
+    };
+    focusNow();
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(focusNow);
+    }
   }, []);
   const removeQuote = useCallback((index: number) => {
     setQuotes((prev) => prev.filter((_, i) => i !== index));
@@ -364,20 +372,28 @@ export function SessionPane({
 
   // inputRef for SessionControls — expose to app.tsx via onInputRef
   const inputRef = useRef<HTMLDivElement>(null);
+  const onInputRefRef = useRef(onInputRef);
+  onInputRefRef.current = onInputRef;
   const fileDropTargetRef = useRef<HTMLDivElement>(null);
   // Re-register with app.tsx when session becomes active/inactive
   useEffect(() => {
-    if (!onInputRef) return;
     if (isActive) {
-      // SessionControls is now mounted — inputRef.current will be set after first render.
-      // Use rAF to ensure the DOM ref is populated before registering.
-      const id = requestAnimationFrame(() => { onInputRef(inputRef.current); });
-      return () => cancelAnimationFrame(id);
-    } else {
-      onInputRef(null);
+      if (inputRef.current) {
+        onInputRefRef.current?.(inputRef.current);
+        return undefined;
+      }
+      if (typeof requestAnimationFrame === 'function') {
+        const id = requestAnimationFrame(() => { onInputRefRef.current?.(inputRef.current); });
+        return () => cancelAnimationFrame(id);
+      }
       return undefined;
     }
-  }, [isActive, onInputRef]);
+    onInputRefRef.current?.(null);
+    return undefined;
+  }, [isActive]);
+  useEffect(() => () => {
+    onInputRefRef.current?.(null);
+  }, []);
 
   // ── Scroll to bottom in whichever view is active ────────────────────────────
   const scrollToBottom = useCallback(() => {

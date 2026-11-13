@@ -2245,7 +2245,42 @@
     "tab_profile": "プロフィール",
     "tab_notifications": "通知",
     "tab_security": "セキュリティ",
-    "tab_guide": "利用ガイド"
+    "tab_guide": "利用ガイド",
+    "tab_shortcuts": "ショートカット",
+    "shortcuts": {
+      "title": "キーボードショートカット",
+      "desc": "デスクトップ用の切り替えショートカットをカスタマイズします。ボタンをクリックしてキーを押すと登録できます。",
+      "platform_mac": "macOS 標準",
+      "platform_other": "Windows / Linux 標準",
+      "reset_all": "すべてリセット",
+      "clear": "クリア",
+      "reset": "リセット",
+      "unassigned": "未設定",
+      "recording_prompt": "キーを押してください…",
+      "record_aria": "{{action}} のショートカットを登録",
+      "modifier_required": "修飾キー（Cmd / Ctrl / Alt）またはファンクションキー（F1–F24）を含めてください。",
+      "reassigned_notice": "ショートカットを設定し、「{{action}}」の重複割り当てを解除しました。",
+      "conflict_warning": "競合: {{actions}}",
+      "hint": "Esc キーで入力をキャンセルできます。チャット入力欄のフォーカス中も動作し、設定・ダイアログ・ターミナル内では無効になります。",
+      "actions": {
+        "server_prev": {
+          "title": "前のサーバー",
+          "desc": "サイドバー上のひとつ前のサーバーに切り替え"
+        },
+        "server_next": {
+          "title": "次のサーバー",
+          "desc": "サイドバー上の次のサーバーに切り替え"
+        },
+        "tab_prev": {
+          "title": "前のタブ",
+          "desc": "左側のセッショントブに切り替え"
+        },
+        "tab_next": {
+          "title": "次のタブ",
+          "desc": "右側のセッショントブに切り替え"
+        }
+      }
+    }
   },
   "capabilities": {
     "eyebrow": "ポータブル AI 機能",

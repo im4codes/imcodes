@@ -89,6 +89,19 @@ import { MobileSharedEntriesMenu } from './components/MobileSharedEntriesMenu.js
 import { MobileServerMenuToolbar } from './components/MobileServerMenuToolbar.js';
 import { SharedStateIndicator } from './components/SharedStateIndicator.js';
 import {
+  KEYBOARD_SHORTCUTS_PREF_KEY,
+  canHandleGlobalNavigationShortcut,
+  cycleOrderedId,
+  focusComposerElement,
+  hasDomBlockingOverlay,
+  isMacPlatform,
+  matchNavigationShortcutAction,
+  readLegacyTabOrder,
+  resolveKeyboardShortcuts,
+  sortSessionsByTabOrder,
+  type KeyboardShortcutOverrides,
+} from './keyboard-shortcuts.js';
+import {
   projectUnifiedServerList,
   filterRestrictedSharedEntries,
   getServerPresence,
@@ -476,11 +489,15 @@ function readOpenSpecAutoRunbarCompactPreference(): boolean {
 export function isTextEntryElement(el: HTMLElement | null): boolean {
   if (!el) return false;
   const tag = el.tagName;
+  const ce = el.getAttribute?.('contenteditable');
   return tag === 'INPUT'
     || tag === 'TEXTAREA'
     || tag === 'SELECT'
     || el.isContentEditable
-    || !!el.closest?.('.cm-editor, .fb-editor-cm');
+    || ce === 'true'
+    || ce === ''
+    || ce === 'plaintext-only'
+    || !!el.closest?.('[contenteditable="true"], [contenteditable=""], [contenteditable="plaintext-only"], .cm-editor, .fb-editor-cm');
 }
 
 type SharedContextDiagnosticsWindowState = {
@@ -2352,6 +2369,24 @@ function InternalMainApp() {
     0,
   );
   const pinnedTabs = useMemo(() => new Set(pinnedTabsArr), [pinnedTabsArr]);
+  const [tabOrder, setTabOrder, tabOrderHydrated] = useSyncedPreference<string[]>(
+    'tab_order',
+    readLegacyTabOrder(),
+    0,
+  );
+  const orderedVisibleMainSessions = useMemo(
+    () => sortSessionsByTabOrder(visibleMainSessions, tabOrder, pinnedTabs),
+    [visibleMainSessions, tabOrder, pinnedTabs],
+  );
+  const [shortcutOverrides, setShortcutOverrides] = useSyncedPreference<KeyboardShortcutOverrides>(
+    KEYBOARD_SHORTCUTS_PREF_KEY,
+    {},
+    0,
+  );
+  const resolvedShortcuts = useMemo(
+    () => resolveKeyboardShortcuts(shortcutOverrides, isMacPlatform()),
+    [shortcutOverrides],
+  );
   const [pinnedSubSessionArr, setPinnedSubSessionArr] = useSyncedPreference<string[]>('subsession_pinned', [], 0);
   const pinnedSubSessionIds = useMemo(() => new Set(pinnedSubSessionArr), [pinnedSubSessionArr]);
   const togglePinnedSubSession = useCallback((id: string) => {
@@ -4178,6 +4213,7 @@ function InternalMainApp() {
   const historyApplyersRef = useRef<Map<string, (content: string) => void>>(new Map());
   // Per-session input refs (chat input element in SessionPane) — used by global keyboard handler
   const inputRefsMap = useRef<Map<string, HTMLDivElement>>(new Map());
+  const hasBlockingComposerOverlayRef = useRef(false);
   const termFocusFnsRef = useRef<Map<string, () => void>>(new Map());
   const termFitFnsRef = useRef<Map<string, () => void>>(new Map());
   const termScrollFnsRef = useRef<Map<string, () => void>>(new Map());
@@ -5908,6 +5944,7 @@ function InternalMainApp() {
       const focusedSubId = focusedSubIdRef.current;
       const session = focusedSubId ? `deck_sub_${focusedSubId}` : activeSession;
       if (!ws?.connected || !session) return;
+      if (hasBlockingComposerOverlayRef.current || hasDomBlockingOverlay()) return;
       const el = document.activeElement as HTMLElement | null;
       const target = e.target as HTMLElement | null;
       if (isTextEntryElement(target) || isTextEntryElement(el)) return;
@@ -7125,6 +7162,184 @@ function InternalMainApp() {
     || pendingQuestion !== null
     || pendingSharedPayload !== null
     || appUpdateNotice?.required === true;
+  const hasBlockingComposerOverlay = featureAnnouncementBlocked
+    || showDesktopFileBrowser
+    || showMobileFileBrowser
+    || previewFileRequest !== null
+    || renameRequest !== null
+    || (remoteDesktopWorkspace.open && !remoteDesktopWorkspaceMinimized)
+    || (remoteDesktopWallOpen && !remoteDesktopWallMinimized);
+
+  // Global keyboard shortcuts: switch servers & session tabs (desktop only).
+  const orderedServersNavRef = useRef(orderedServers);
+  orderedServersNavRef.current = orderedServers;
+  const orderedTabsNavRef = useRef(orderedVisibleMainSessions);
+  orderedTabsNavRef.current = orderedVisibleMainSessions;
+  const resolvedShortcutsRef = useRef(resolvedShortcuts);
+  resolvedShortcutsRef.current = resolvedShortcuts;
+  hasBlockingComposerOverlayRef.current = hasBlockingComposerOverlay;
+  const handleSelectServerNavRef = useRef(handleSelectServer);
+  handleSelectServerNavRef.current = handleSelectServer;
+  const selectMainSessionTabNavRef = useRef(selectMainSessionTab);
+  selectMainSessionTabNavRef.current = selectMainSessionTab;
+  const manualDashboardRef = useRef(manualDashboard);
+  manualDashboardRef.current = manualDashboard;
+  const viewModeNavRef = useRef(viewMode);
+  viewModeNavRef.current = viewMode;
+
+  useEffect(() => {
+    if (isMobile) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || isImeComposingKeyEvent(e)) return;
+      const action = matchNavigationShortcutAction(e, resolvedShortcutsRef.current);
+      if (!action) return;
+
+      const subId = focusedSubIdRef.current;
+      let targetViewMode: ViewMode = viewModeNavRef.current;
+      if (subId) {
+        const subEl = inputRefsMap.current.get(`deck_sub_${subId}`);
+        const subDomMode = subEl?.closest?.('.subsession-window')?.getAttribute('data-view-mode');
+        if (subDomMode === 'terminal') targetViewMode = 'terminal';
+        else if (subDomMode === 'chat') targetViewMode = 'chat';
+      }
+
+      if (!canHandleGlobalNavigationShortcut(e.target, document.activeElement, {
+        hasBlockingOverlay: hasBlockingComposerOverlayRef.current,
+        isMobile,
+        isComposing: isImeComposingKeyEvent(e),
+        viewMode: targetViewMode,
+      })) {
+        return;
+      }
+
+      if (action === 'serverPrev' || action === 'serverNext') {
+        const serversList = orderedServersNavRef.current;
+        if (serversList.length === 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const nextId = cycleOrderedId(
+          serversList.map((srv) => srv.id),
+          selectedServerIdRef.current,
+          action === 'serverNext' ? 1 : -1,
+        );
+        const nextServer = nextId ? serversList.find((srv) => srv.id === nextId) : null;
+        if (nextServer && nextServer.id !== selectedServerIdRef.current) {
+          void handleSelectServerNavRef.current(nextServer.id, nextServer.name);
+        }
+        return;
+      }
+
+      if (!selectedServerIdRef.current || manualDashboardRef.current) return;
+      const tabsList = orderedTabsNavRef.current;
+      if (tabsList.length === 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const nextName = cycleOrderedId(
+        tabsList.map((session) => session.name),
+        activeSessionRef.current,
+        action === 'tabNext' ? 1 : -1,
+      );
+      if (nextName && nextName !== activeSessionRef.current) {
+        selectMainSessionTabNavRef.current(nextName);
+      }
+    };
+
+    document.addEventListener('keydown', handler, true);
+    return () => document.removeEventListener('keydown', handler, true);
+  }, [isMobile]);
+
+  // Desktop auto-focus composer input when switching servers, tabs, or sub-session windows.
+  const lastAutoFocusedTargetRef = useRef<string | null>(null);
+  const autoFocusTarget = useMemo(() => {
+    if (isMobile || !selectedServerId || manualDashboard) return null;
+    if (focusedSubId && openSubIds.has(focusedSubId)) {
+      const sub = subSessions.find((item) => item.id === focusedSubId);
+      if (sub && (sub.type === 'shell' || sub.type === 'script')) return null;
+      return {
+        key: `srv:${selectedServerId}:sub:${focusedSubId}`,
+        sessionName: sub ? sub.sessionName : `deck_sub_${focusedSubId}`,
+        isSub: true,
+      };
+    }
+    if (activeSession) {
+      const mainSession = sessions.find((item) => item.name === activeSession);
+      if (!mainSession) return null;
+      if (mainSession.agentType === 'shell' || mainSession.agentType === 'script') return null;
+      if (viewMode !== 'chat') return null;
+      return {
+        key: `srv:${selectedServerId}:main:${activeSession}`,
+        sessionName: activeSession,
+        isSub: false,
+      };
+    }
+    return null;
+  }, [isMobile, selectedServerId, manualDashboard, focusedSubId, openSubIds, subSessions, activeSession, sessions, viewMode]);
+
+  const pendingAutoFocusTargetRef = useRef<{ key: string; sessionName: string; isSub: boolean } | null>(null);
+  pendingAutoFocusTargetRef.current = autoFocusTarget;
+
+  const attemptAutoFocusForTarget = useCallback((target: { key: string; sessionName: string; isSub: boolean } | null): boolean => {
+    if (!target || isMobileRef.current || hasBlockingComposerOverlayRef.current || hasDomBlockingOverlay()) {
+      return false;
+    }
+    if (lastAutoFocusedTargetRef.current === target.key) return true;
+    const inputEl = inputRefsMap.current.get(target.sessionName);
+    if (!inputEl || !inputEl.isConnected) return false;
+    if (target.isSub) {
+      const subWin = inputEl.closest?.('.subsession-window');
+      if (subWin?.getAttribute('data-view-mode') === 'terminal') return false;
+    }
+    const focused = focusComposerElement(inputEl);
+    if (focused) {
+      lastAutoFocusedTargetRef.current = target.key;
+    }
+    return focused;
+  }, []);
+
+  const registerComposerInputRef = useCallback((sessionName: string, el: HTMLDivElement | null) => {
+    if (el) {
+      inputRefsMap.current.set(sessionName, el);
+      const pending = pendingAutoFocusTargetRef.current;
+      if (pending && pending.sessionName === sessionName) {
+        attemptAutoFocusForTarget(pending);
+      }
+    } else {
+      inputRefsMap.current.delete(sessionName);
+    }
+  }, [attemptAutoFocusForTarget]);
+
+  useEffect(() => {
+    if (!autoFocusTarget) {
+      if (isMobile || !selectedServerId || manualDashboard) {
+        lastAutoFocusedTargetRef.current = null;
+      }
+      return;
+    }
+    if (hasBlockingComposerOverlay || hasDomBlockingOverlay()) return;
+    if (lastAutoFocusedTargetRef.current === autoFocusTarget.key) return;
+
+    let cancelled = false;
+    let rafId: number | null = null;
+
+    const attemptFocus = (): boolean => {
+      if (cancelled) return false;
+      return attemptAutoFocusForTarget(autoFocusTarget);
+    };
+
+    if (!attemptFocus() && typeof requestAnimationFrame === 'function') {
+      rafId = requestAnimationFrame(() => {
+        attemptFocus();
+      });
+    }
+
+    return () => {
+      cancelled = true;
+      if (rafId !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(rafId);
+      }
+    };
+  }, [attemptAutoFocusForTarget, autoFocusTarget, hasBlockingComposerOverlay, isMobile, manualDashboard, selectedServerId]);
+
   const showTeamDiscussionGuide = shouldShowTeamDiscussionGuide(
     teamDiscussionGuidePref,
     sessionsLoaded,
@@ -7297,6 +7512,13 @@ function InternalMainApp() {
         if (inputEl) {
           const quote = `> ${text.replace(/\n/g, '\n> ')}\n`;
           appendContentEditableTextPreservingNewlines(inputEl, quote);
+          if (typeof requestAnimationFrame === 'function') {
+            requestAnimationFrame(() => {
+              if (inputEl.isConnected) {
+                focusComposerElement(inputEl, { moveCaretToEnd: true });
+              }
+            });
+          }
         }
       },
       t: trans,
@@ -8076,6 +8298,9 @@ function InternalMainApp() {
               sessionsLoaded={sessionsLoaded}
               pinned={pinnedTabs}
               setPinnedArr={setPinnedTabsArr}
+              tabOrder={tabOrder}
+              setTabOrder={setTabOrder}
+              tabOrderHydrated={tabOrderHydrated}
             />
 
             <div
@@ -8177,7 +8402,7 @@ function InternalMainApp() {
                 onScrollBottomFn={(fn) => { termScrollFnsRef.current.set(s.name, fn); }}
                 onFocusFn={(fn) => { termFocusFnsRef.current.set(s.name, fn); }}
                 onChatScrollFn={(fn) => { chatScrollFnsRef.current.set(s.name, fn); }}
-                onInputRef={(el) => { if (el) inputRefsMap.current.set(s.name, el); else inputRefsMap.current.delete(s.name); }}
+                onInputRef={(el) => registerComposerInputRef(s.name, el)}
                 onDiff={(apply) => registerDiffApplyer(s.name, apply)}
                 onHistory={(apply) => registerHistoryApplyer(s.name, apply)}
                 onStopProject={handleStopProject}
@@ -8819,6 +9044,8 @@ function InternalMainApp() {
             username={username}
             hasPassword={userHasPassword}
             serverUrl={auth?.baseUrl ?? nativeServerUrl}
+            shortcutOverrides={shortcutOverrides}
+            onChangeShortcutOverrides={setShortcutOverrides}
             onBack={() => setShowSettingsPage(false)}
             onDisplayNameChanged={(name) => setUserDisplayName(name)}
             onUserAuthUpdated={(next) => {
@@ -9235,6 +9462,7 @@ function InternalMainApp() {
               }}
               onDesktopFileBrowserFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id))}
               onDesktopFileBrowserClose={() => removeDesktopWindow(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id))}
+              onInputRef={(el) => registerComposerInputRef(sub.sessionName, el)}
               onPin={(vm) => pinPanel('subsession', { sessionName: sub.sessionName, viewMode: vm, label: sub.label, serverId: selectedServerId }, () => minimizeSubSessionWindow(sub.id))}
               sessions={quickDelegationSessions}
               subSessions={subSessionsSlim}

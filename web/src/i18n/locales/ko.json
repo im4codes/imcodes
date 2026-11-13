@@ -2245,7 +2245,42 @@
     "tab_profile": "프로필",
     "tab_notifications": "알림",
     "tab_security": "보안",
-    "tab_guide": "사용 가이드"
+    "tab_guide": "사용 가이드",
+    "tab_shortcuts": "단축키",
+    "shortcuts": {
+      "title": "키보드 단축키",
+      "desc": "데스크톱 탐색 단축키를 사용자 지정합니다. 항목을 클릭한 뒤 원하는 키 조합을 눌러 설정하세요.",
+      "platform_mac": "macOS 기본값",
+      "platform_other": "Windows / Linux 기본값",
+      "reset_all": "모두 초기화",
+      "clear": "지우기",
+      "reset": "초기화",
+      "unassigned": "설정 안 됨",
+      "recording_prompt": "단축키를 누르세요…",
+      "record_aria": "{{action}} 단축키 기록",
+      "modifier_required": "보조 키(Cmd, Ctrl 또는 Alt) 또는 기능 키(F1–F24)를 사용하세요.",
+      "reassigned_notice": "새 단축키를 지정하고 “{{action}}”의 충돌 설정을 해제했습니다.",
+      "conflict_warning": "충돌 항목: {{actions}}",
+      "hint": "Esc 키로 기록을 취소합니다. 메시지 입력창에 포커스가 있어도 동작하며, 설정·대화상자·터미널 내부에서는 비활성화됩니다.",
+      "actions": {
+        "server_prev": {
+          "title": "이전 서버",
+          "desc": "사이드바에서 위쪽 서버로 전환"
+        },
+        "server_next": {
+          "title": "다음 서버",
+          "desc": "사이드바에서 아래쪽 서버로 전환"
+        },
+        "tab_prev": {
+          "title": "이전 탭",
+          "desc": "왼쪽 세션 탭으로 전환"
+        },
+        "tab_next": {
+          "title": "다음 탭",
+          "desc": "오른쪽 세션 탭으로 전환"
+        }
+      }
+    }
   },
   "capabilities": {
     "eyebrow": "이식 가능한 AI 기능",

@@ -2246,7 +2246,42 @@
     "tab_profile": "Profile",
     "tab_notifications": "Notifications",
     "tab_security": "Security",
-    "tab_guide": "User Guide"
+    "tab_guide": "User Guide",
+    "tab_shortcuts": "Shortcuts",
+    "shortcuts": {
+      "title": "Keyboard Shortcuts",
+      "desc": "Customize desktop navigation shortcuts. Click any shortcut to record a new key combination.",
+      "platform_mac": "macOS defaults",
+      "platform_other": "Windows / Linux defaults",
+      "reset_all": "Reset all",
+      "clear": "Clear",
+      "reset": "Reset",
+      "unassigned": "Not set",
+      "recording_prompt": "Press shortcut…",
+      "record_aria": "Record shortcut for {{action}}",
+      "modifier_required": "Use a modifier key (Cmd, Ctrl, or Alt) or a function key (F1–F24).",
+      "reassigned_notice": "Assigned shortcut and cleared conflicting binding from “{{action}}”.",
+      "conflict_warning": "Conflicts with: {{actions}}",
+      "hint": "Press Esc to cancel recording. Works even while the message input is focused; ignored inside settings, dialogs, and terminals.",
+      "actions": {
+        "server_prev": {
+          "title": "Previous Server",
+          "desc": "Switch to the server above in the sidebar"
+        },
+        "server_next": {
+          "title": "Next Server",
+          "desc": "Switch to the server below in the sidebar"
+        },
+        "tab_prev": {
+          "title": "Previous Tab",
+          "desc": "Switch to the session tab on the left"
+        },
+        "tab_next": {
+          "title": "Next Tab",
+          "desc": "Switch to the session tab on the right"
+        }
+      }
+    }
   },
   "capabilities": {
     "eyebrow": "Portable AI capabilities",

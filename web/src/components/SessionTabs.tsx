@@ -10,6 +10,7 @@ import { SharedStateIndicator } from './SharedStateIndicator.js';
 import { isWorkingSessionState } from '@shared/session-activity-types.js';
 import { recordPerfRender } from '../perf-render-debug.js';
 import { appendMissingOrderIds, reorderOrderIdsPreservingHidden, sameOrderIds } from '../server-order.js';
+import { readLegacyTabOrder, sortSessionsByTabOrder } from '../keyboard-shortcuts.js';
 
 interface Props {
   sessions: SessionInfo[];
@@ -41,12 +42,16 @@ interface Props {
   pinned: Set<string>;
   /** Setter for the pinned array (server-synced via useSyncedPreference) */
   setPinnedArr: (value: string[] | ((prev: string[]) => string[])) => void;
+  /** Optional lifted tab order array (synced via useSyncedPreference in app.tsx). */
+  tabOrder?: string[];
+  /** Optional setter for lifted tab order. */
+  setTabOrder?: (value: string[] | ((prev: string[]) => string[])) => void;
+  /** Whether lifted tabOrder has finished hydrating from the server. */
+  tabOrderHydrated?: boolean;
 }
 
 interface CtxMenu { x: number; y: number; session: SessionInfo }
 
-/** Legacy localStorage key — read once on first load for migration. */
-const LEGACY_LS_ORDER = 'rcc_tab_order';
 const TAB_LONG_PRESS_MS = 520;
 const TAB_LONG_PRESS_MOVE_CANCEL_PX = 10;
 const TAB_MOUSE_CLICK_MOVE_CANCEL_PX = 6;
@@ -73,11 +78,13 @@ interface MousePressState {
   startY: number;
 }
 
-function readLegacyOrder(): string[] {
-  try { return JSON.parse(localStorage.getItem(LEGACY_LS_ORDER) ?? '[]'); } catch { return []; }
-}
+type ControlledTabsProps = Omit<Props, 'tabOrder' | 'setTabOrder' | 'tabOrderHydrated'> & {
+  tabOrder: string[];
+  setTabOrder: (value: string[] | ((prev: string[]) => string[])) => void;
+  tabOrderHydrated: boolean;
+};
 
-function SessionTabsImpl({ sessions, activeSession, connected, latencyMs, idleAlerts, p2pSessionLabels, onAlertDismiss, onSelect, onNewSession, onStopProject, canStopProject = true, onRestartProject, onCloneSession, onOpenSessionSettings, onShareSession, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded, pinned, setPinnedArr }: Props) {
+function SessionTabsControlled({ sessions, activeSession, connected, latencyMs, idleAlerts, p2pSessionLabels, onAlertDismiss, onSelect, onNewSession, onStopProject, canStopProject = true, onRestartProject, onCloneSession, onOpenSessionSettings, onShareSession, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded, pinned, setPinnedArr, tabOrder, setTabOrder, tabOrderHydrated }: ControlledTabsProps) {
   recordPerfRender('SessionTabs');
   const { t } = useTranslation();
   const [ctx, setCtx] = useState<CtxMenu | null>(null);
@@ -94,18 +101,6 @@ function SessionTabsImpl({ sessions, activeSession, connected, latencyMs, idleAl
   const suppressNextClickRef = useRef(false);
   const suppressNextClickResetRef = useRef<number | null>(null);
 
-  // Persisted order via server-synced preferences. (Pinned state is lifted to
-  // app.tsx so handleStopProject can guard against stopping pinned sessions.)
-  // Default to legacy localStorage value so existing users don't lose their arrangement.
-  const [tabOrder, setTabOrder, tabOrderHydrated] = useSyncedPreference<string[]>(
-    'tab_order',
-    readLegacyOrder(),
-    // A drag/drop is a single discrete action. Persist it immediately so a
-    // refresh right after dropping cannot cancel a pending debounce and restore
-    // the previous pinned-tab order from the server.
-    0,
-  );
-
   // Drag state
   const dragIdx = useRef<number | null>(null);
   const dragName = useRef<string | null>(null);
@@ -113,28 +108,10 @@ function SessionTabsImpl({ sessions, activeSession, connected, latencyMs, idleAl
 
   // Merge visible sessions with persisted order without mutating entries belonging
   // to other servers or currently offline views.
-  const orderedSessions = useMemo(() => {
-    const byName = new Map(sessions.map((s) => [s.name, s]));
-    const seen = new Set<string>();
-    const ordered: SessionInfo[] = [];
-    for (const name of tabOrder) {
-      if (seen.has(name)) continue;
-      const session = byName.get(name);
-      if (!session) continue;
-      seen.add(name);
-      ordered.push(session);
-    }
-    for (const session of sessions) {
-      if (seen.has(session.name)) continue;
-      seen.add(session.name);
-      ordered.push(session);
-    }
-
-    // Pinned first, then unpinned — stable within each group.
-    const pinnedArr = ordered.filter((s) => pinned.has(s.name));
-    const unpinnedArr = ordered.filter((s) => !pinned.has(s.name));
-    return [...pinnedArr, ...unpinnedArr];
-  }, [sessions, tabOrder, pinned]);
+  const orderedSessions = useMemo(
+    () => sortSessionsByTabOrder(sessions, tabOrder, pinned),
+    [sessions, tabOrder, pinned],
+  );
 
   // Append newly discovered session names only once both sessions and the
   // synced tab_order preference are hydrated. Never strip entries from other
@@ -703,6 +680,36 @@ function sameTabSessions(a: SessionInfo[], b: SessionInfo[]): boolean {
   return true;
 }
 
+function SessionTabsWithOwnPref(props: Props) {
+  const [tabOrder, setTabOrder, tabOrderHydrated] = useSyncedPreference<string[]>(
+    'tab_order',
+    readLegacyTabOrder(),
+    0,
+  );
+  return (
+    <SessionTabsControlled
+      {...props}
+      tabOrder={tabOrder}
+      setTabOrder={setTabOrder}
+      tabOrderHydrated={tabOrderHydrated}
+    />
+  );
+}
+
+function SessionTabsImpl(props: Props) {
+  if (props.tabOrder !== undefined && props.setTabOrder !== undefined) {
+    return (
+      <SessionTabsControlled
+        {...props}
+        tabOrder={props.tabOrder}
+        setTabOrder={props.setTabOrder}
+        tabOrderHydrated={props.tabOrderHydrated ?? true}
+      />
+    );
+  }
+  return <SessionTabsWithOwnPref {...props} />;
+}
+
 export const SessionTabs = memo(SessionTabsImpl, (prev, next) => (
   sameTabSessions(prev.sessions, next.sessions)
   && prev.activeSession === next.activeSession
@@ -715,4 +722,6 @@ export const SessionTabs = memo(SessionTabsImpl, (prev, next) => (
   && prev.sessionsLoaded === next.sessionsLoaded
   && prev.pinned === next.pinned
   && prev.setPinnedArr === next.setPinnedArr
+  && prev.tabOrder === next.tabOrder
+  && prev.tabOrderHydrated === next.tabOrderHydrated
 ));

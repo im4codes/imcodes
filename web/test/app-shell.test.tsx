@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/preact';
 import { createPortal } from 'preact/compat';
+import { useEffect, useRef } from 'preact/hooks';
 import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 import { DAEMON_STATS_MSG } from '@shared/daemon-stats.js';
 import { SUPERVISION_TASK_CONSOLE_PREFERENCES_STORAGE_KEY } from '../src/supervision-task-console-preferences.js';
@@ -452,11 +453,14 @@ vi.mock('../src/pages/RepoPage.js', () => ({
   ),
 }));
 vi.mock('../src/pages/SettingsPage.js', () => ({
-  SettingsPage: ({ onBack, onDisplayNameChanged, onUserAuthUpdated }: any) => (
+  SettingsPage: ({ onBack, onDisplayNameChanged, onUserAuthUpdated, onChangeShortcutOverrides }: any) => (
     <div>
       settings-page
       <button onClick={() => onDisplayNameChanged?.('Grace')}>settings-display</button>
       <button onClick={() => onUserAuthUpdated?.({ username: 'grace', hasPassword: false })}>settings-auth</button>
+      <button onClick={() => onChangeShortcutOverrides?.({ tabNext: 'Alt+ArrowRight', serverNext: 'Alt+ArrowDown' })}>
+        settings-custom-shortcuts
+      </button>
       <button onClick={onBack}>settings-back</button>
     </div>
   ),
@@ -580,7 +584,16 @@ vi.mock('../src/components/SessionPane.js', () => ({
     onShareSession,
     onStopProject,
     onTransportConfigSaved,
-  }: any) => (
+  }: any) => {
+    const composerRef = useRef<HTMLDivElement>(null);
+    const onInputRefLatest = useRef(onInputRef);
+    onInputRefLatest.current = onInputRef;
+    useEffect(() => {
+      if (isActive) onInputRefLatest.current?.(composerRef.current);
+      else onInputRefLatest.current?.(null);
+      return () => onInputRefLatest.current?.(null);
+    }, [isActive]);
+    return (
     <div
       data-testid={`session-pane-${session.name}`}
       data-is-active={String(Boolean(isActive))}
@@ -595,6 +608,13 @@ vi.mock('../src/components/SessionPane.js', () => ({
       data-model-display={session.modelDisplay ?? ''}
     >
       session-pane:{session.name}
+      <div
+        ref={composerRef}
+        class="controls-input"
+        contentEditable="true"
+        tabIndex={-1}
+        data-testid={`pane-composer-${session.name}`}
+      />
       <button onClick={() => onFitFn?.(vi.fn())}>pane-fit-ref</button>
       <button onClick={() => onScrollBottomFn?.(vi.fn())}>pane-scroll-ref</button>
       <button onClick={() => onFocusFn?.(vi.fn())}>pane-focus-ref</button>
@@ -618,7 +638,8 @@ vi.mock('../src/components/SessionPane.js', () => ({
       })}>pane-preview-upload</button>
       <button onClick={() => onOpenLocalWebPreview?.({ port: 8787, path: '/docs?q=1#intro' })}>pane-preview-loopback</button>
     </div>
-  ),
+    );
+  },
 }));
 vi.mock('../src/components/SubSessionBar.js', () => ({
   SUBSESSION_BAR_COLLAPSED_STORAGE_KEY: 'subsession_bar_collapsed',
@@ -757,13 +778,23 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
   ),
 }));
 vi.mock('../src/components/SubSessionWindow.js', () => ({
-  SubSessionWindow: ({ sub, ws, active, visible, zIndex, maximized, onToggleMaximized, onFocus, onViewRepo, onShareSession, onSettings, sharedState, taskPairPanelVisitKey, onClosePairSplit }: any) => {
+  SubSessionWindow: ({ sub, ws, active, visible, zIndex, maximized, onToggleMaximized, onFocus, onInputRef, onViewRepo, onShareSession, onSettings, sharedState, taskPairPanelVisitKey, onClosePairSplit }: any) => {
     const incomingViewer = !!sharedState
       && sharedState.outgoing !== true
       && sharedState.effectiveRole !== 'participant';
+    const subComposerRef = useRef<HTMLDivElement>(null);
+    const onInputRefLatest = useRef(onInputRef);
+    onInputRefLatest.current = onInputRef;
+    useEffect(() => {
+      if (visible) onInputRefLatest.current?.(subComposerRef.current);
+      else onInputRefLatest.current?.(null);
+      return () => onInputRefLatest.current?.(null);
+    }, [visible, active]);
     return (
     <div
+      class="subsession-window"
       data-testid={`sub-session-window-${sub?.id}`}
+      data-view-mode="chat"
       data-active={String(active)}
       data-visible={String(visible)}
       data-maximized={String(Boolean(maximized))}
@@ -774,6 +805,13 @@ vi.mock('../src/components/SubSessionWindow.js', () => ({
       onMouseDown={onFocus}
     >
       sub-session-window
+      <div
+        ref={subComposerRef}
+        class="controls-input"
+        contentEditable="true"
+        tabIndex={-1}
+        data-testid={`sub-window-controls-input-${sub?.id}`}
+      />
       {onClosePairSplit && <button onClick={onClosePairSplit}>sub-window-close-split-{sub?.id}</button>}
       <button onClick={onToggleMaximized}>sub-window-toggle-max-{sub?.id}</button>
       <button onClick={onViewRepo}>sub-window-repo-{sub?.id}</button>
@@ -1022,6 +1060,7 @@ vi.mock('../src/components/SidebarPinnedPanel.js', () => ({
       sidebar-pinned-panel
       <button onClick={() => onResize?.(333)}>pinned-resize</button>
       <button data-testid={`pinned-unpin-${panel?.id ?? 'unknown'}`} onClick={onUnpin}>pinned-unpin</button>
+      <button data-testid={`pinned-quote-${panel?.id ?? 'unknown'}`} onClick={() => ctx?.onQuote?.('quoted from pinned')}>pinned-quote</button>
     </div>
   ),
 }));
@@ -8106,6 +8145,217 @@ describe('App shell', () => {
       const nodesPanel = await screen.findByTestId('floating-panel-controlled-nodes');
       expect(nodesPanel.textContent).toContain('controlled-nodes-panel');
       await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-mobile-fb-open')).toBe('false'));
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUA });
+    }
+  }, 15000);
+});
+
+describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote focus', () => {
+  beforeEach(() => {
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') {
+        return {
+          servers: [
+            { id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: Date.now() },
+            { id: 'srv-2', name: 'Server Two', status: 'online', lastHeartbeatAt: Date.now() },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/alpha', state: 'idle' },
+            { name: 'deck_beta_brain', project_name: 'beta', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/beta', state: 'idle' },
+            { name: 'deck_gamma_brain', project_name: 'gamma', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/gamma', state: 'idle' },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-2/sessions') {
+        return {
+          sessions: [
+            { name: 'deck_delta_brain', project_name: 'delta', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/delta', state: 'idle' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+  });
+
+  it('navigates tabs in visual SessionTabs order (pinned + tab_order) and servers via Cmd/Ctrl+Arrows while .controls-input has focus, auto-focusing target composers', async () => {
+    // Visual order should be: deck_gamma_brain (pinned), deck_beta_brain (first in tab_order), deck_alpha_brain
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_gamma_brain');
+    localStorage.setItem('rcc_tab_pinned', JSON.stringify(['deck_gamma_brain']));
+    localStorage.setItem('rcc_tab_order', JSON.stringify(['deck_beta_brain', 'deck_alpha_brain', 'deck_gamma_brain']));
+
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Win32' });
+    try {
+      const { App } = await importApp();
+      render(<App />);
+
+      const gammaComposer = await screen.findByTestId('pane-composer-deck_gamma_brain');
+      await waitFor(() => expect(document.activeElement).toBe(gammaComposer));
+
+      // Ctrl+ArrowRight from inside .controls-input switches to next visual tab (deck_beta_brain) & calls preventDefault()
+      const rightEvt = new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', ctrlKey: true, bubbles: true, cancelable: true });
+      gammaComposer.dispatchEvent(rightEvt);
+      expect(rightEvt.defaultPrevented).toBe(true);
+
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+      const betaComposer = screen.getByTestId('pane-composer-deck_beta_brain');
+      await waitFor(() => expect(document.activeElement).toBe(betaComposer));
+
+      // Ctrl+ArrowLeft wraps/steps back to deck_gamma_brain
+      const leftEvt = new KeyboardEvent('keydown', { key: 'ArrowLeft', code: 'ArrowLeft', ctrlKey: true, bubbles: true, cancelable: true });
+      betaComposer.dispatchEvent(leftEvt);
+      expect(leftEvt.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_gamma_brain').getAttribute('data-is-active')).toBe('true'));
+      await waitFor(() => expect(document.activeElement).toBe(gammaComposer));
+
+      // Ctrl+ArrowDown switches to next server (srv-2 -> deck_delta_brain) and auto-focuses its composer
+      const downEvt = new KeyboardEvent('keydown', { key: 'ArrowDown', code: 'ArrowDown', ctrlKey: true, bubbles: true, cancelable: true });
+      gammaComposer.dispatchEvent(downEvt);
+      expect(downEvt.defaultPrevented).toBe(true);
+
+      const deltaComposer = await screen.findByTestId('pane-composer-deck_delta_brain');
+      await waitFor(() => expect(document.activeElement).toBe(deltaComposer));
+
+      // Ctrl+ArrowUp switches back to srv-1
+      const upEvt = new KeyboardEvent('keydown', { key: 'ArrowUp', code: 'ArrowUp', ctrlKey: true, bubbles: true, cancelable: true });
+      deltaComposer.dispatchEvent(upEvt);
+      expect(upEvt.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain')).toBeTruthy());
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  }, 15000);
+
+  it('supports macOS Meta+Arrow defaults, blocks shortcuts during Settings/modal/terminal/recording, and applies customized shortcuts immediately', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'MacIntel' });
+    try {
+      const { App } = await importApp();
+      render(<App />);
+
+      const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+
+      // Non-Mac Ctrl+ArrowRight should NOT trigger on macOS default
+      const ctrlEvt = new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', ctrlKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(ctrlEvt);
+      expect(ctrlEvt.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+
+      // macOS Meta+ArrowRight triggers tabNext
+      const metaRight = new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', metaKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(metaRight);
+      expect(metaRight.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+
+      // Blocking guard: terminal xterm element does NOT intercept
+      const xtermWrap = document.createElement('div');
+      xtermWrap.className = 'xterm';
+      const xtermInput = document.createElement('textarea');
+      xtermInput.className = 'xterm-helper-textarea';
+      xtermWrap.appendChild(xtermInput);
+      document.body.appendChild(xtermWrap);
+      xtermInput.focus();
+      const termEvt = new KeyboardEvent('keydown', { key: 'ArrowLeft', code: 'ArrowLeft', metaKey: true, bubbles: true, cancelable: true });
+      xtermInput.dispatchEvent(termEvt);
+      expect(termEvt.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true');
+      xtermWrap.remove();
+
+      // Open Settings -> Meta+ArrowLeft is blocked while Settings modal overlay is open -> customize to Alt+ArrowRight
+      fireEvent.click(screen.getByText('server-settings'));
+      expect(screen.getByText('settings-page')).toBeTruthy();
+
+      const whileSettingsEvt = new KeyboardEvent('keydown', { key: 'ArrowLeft', code: 'ArrowLeft', metaKey: true, bubbles: true, cancelable: true });
+      document.dispatchEvent(whileSettingsEvt);
+      expect(whileSettingsEvt.defaultPrevented).toBe(false);
+
+      fireEvent.click(screen.getByText('settings-custom-shortcuts'));
+      fireEvent.click(screen.getByText('settings-back'));
+
+      // Now customized Alt+ArrowRight switches tab while Meta+ArrowRight no longer switches!
+      const betaComposer = screen.getByTestId('pane-composer-deck_beta_brain');
+      betaComposer.focus();
+      const customAltRight = new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', altKey: true, bubbles: true, cancelable: true });
+      betaComposer.dispatchEvent(customAltRight);
+      expect(customAltRight.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_gamma_brain').getAttribute('data-is-active')).toBe('true'));
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  }, 15000);
+
+  it('auto-focuses SubSessionWindow composer on desktop, skips auto-focus on mobile, and focuses composer on pinned-panel quote', async () => {
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-focus-1',
+        serverId: 'srv-1',
+        sessionName: 'deck_sub_sub-focus-1',
+        parentSession: 'deck_alpha_brain',
+        label: 'Focus Worker',
+        type: 'codex',
+        state: 'idle',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    localStorage.setItem('rcc_sync_sidebar_pinned_panels', JSON.stringify({
+      t: 10,
+      v: [{ id: 'pin-sub-1', type: 'subsession', serverId: 'srv-1', props: { sessionName: 'deck_sub_sub-focus-1', serverId: 'srv-1' } }],
+    }));
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+    await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+
+    // Clicking pinned-quote from sidebar button appends quote and returns focus to active composer
+    const pinnedQuoteBtn = await screen.findByTestId('pinned-quote-filebrowser:deck_alpha_brain');
+    pinnedQuoteBtn.focus();
+    fireEvent.click(pinnedQuoteBtn);
+    expect(alphaComposer.textContent).toContain('> quoted from pinned');
+    expect(document.activeElement).toBe(alphaComposer);
+
+    // Opening sub-session window on desktop auto-focuses sub-window composer .controls-input
+    fireEvent.click(screen.getByText('subbar-open'));
+    const subComposer = await screen.findByTestId('sub-window-controls-input-sub-focus-1');
+    await waitFor(() => expect(document.activeElement).toBe(subComposer));
+
+    cleanup();
+
+    // Mobile: auto-focus and desktop keyboard shortcuts MUST NOT trigger
+    const originalUA = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', {
+      configurable: true,
+      value: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
+    });
+    try {
+      const mobileMod = await importApp();
+      render(<mobileMod.App />);
+      const mobileComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(document.activeElement).not.toBe(mobileComposer);
+
+      const mobileRight = new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', ctrlKey: true, bubbles: true, cancelable: true });
+      document.dispatchEvent(mobileRight);
+      expect(mobileRight.defaultPrevented).toBe(false);
     } finally {
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUA });
     }

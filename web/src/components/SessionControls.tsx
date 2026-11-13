@@ -5835,7 +5835,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     // Use session-scoped history, falling back to global history if session has no entries.
     // Never look up per-session history under an incognito session's name.
     const history = getNavigableHistory(quickData.data, activeSessionIncognito ? undefined : activeSession?.name);
-    if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && history.length > 0) {
+    if (
+      (e.key === 'ArrowUp' || e.key === 'ArrowDown')
+      && !e.metaKey
+      && !e.ctrlKey
+      && !e.altKey
+      && !e.shiftKey
+      && history.length > 0
+    ) {
       // Only intercept when caret is on first/last visual line to avoid breaking multiline editing
       const atTop = getCaretLineBoundary('up');
       const atBottom = getCaretLineBoundary('down');

@@ -23,13 +23,16 @@ import {
 } from '../push-notifications.js';
 import { GuidePage } from './GuidePage.js';
 import { PasskeyManager } from '../components/PasskeyManager.js';
+import { KeyboardShortcutsSection } from '../components/KeyboardShortcutsSection.js';
+import type { KeyboardShortcutOverrides } from '../keyboard-shortcuts.js';
 
-export type SettingsTab = 'profile' | 'notifications' | 'security' | 'guide';
+export type SettingsTab = 'profile' | 'notifications' | 'security' | 'shortcuts' | 'guide';
 
 const SETTINGS_TABS: ReadonlyArray<{ id: SettingsTab; labelKey: string }> = [
   { id: 'profile', labelKey: 'settings.tab_profile' },
   { id: 'notifications', labelKey: 'settings.tab_notifications' },
   { id: 'security', labelKey: 'settings.tab_security' },
+  { id: 'shortcuts', labelKey: 'settings.tab_shortcuts' },
   { id: 'guide', labelKey: 'settings.tab_guide' },
 ];
 
@@ -39,6 +42,10 @@ interface Props {
   hasPassword: boolean;
   serverUrl?: string | null;
   initialTab?: SettingsTab;
+  shortcutOverrides?: KeyboardShortcutOverrides;
+  onChangeShortcutOverrides?: (
+    value: KeyboardShortcutOverrides | ((prev: KeyboardShortcutOverrides) => KeyboardShortcutOverrides),
+  ) => void;
   onBack: () => void;
   onDisplayNameChanged: (name: string) => void;
   onUserAuthUpdated: (next: { username: string | null; hasPassword: boolean }) => void;
@@ -50,6 +57,8 @@ export function SettingsPage({
   hasPassword,
   serverUrl,
   initialTab = 'profile',
+  shortcutOverrides,
+  onChangeShortcutOverrides,
   onBack,
   onDisplayNameChanged,
   onUserAuthUpdated,
@@ -697,6 +706,20 @@ export function SettingsPage({
               )}
 
               <PasskeyManager />
+            </div>
+          )}
+
+          {activeTab === 'shortcuts' && (
+            <div
+              role="tabpanel"
+              id="settings-tabpanel-shortcuts"
+              aria-labelledby="settings-tab-shortcuts"
+              aria-label={t('settings.tab_shortcuts')}
+            >
+              <KeyboardShortcutsSection
+                overrides={shortcutOverrides}
+                onChangeOverrides={onChangeShortcutOverrides}
+              />
             </div>
           )}
 

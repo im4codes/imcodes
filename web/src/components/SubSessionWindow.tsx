@@ -61,6 +61,7 @@ import { DEFAULT_SUBSESSION_ACCENT_COLOR } from '../subsession-accent-colors.js'
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 import type { SessionSettingsOpenIntent } from '../session-settings-open-intent.js';
 import { useStableCallback } from '../hooks/useStableCallback.js';
+import { focusComposerElement } from '../keyboard-shortcuts.js';
 import type { ChatLocalWebPreviewOpenHandler } from './ChatLoopbackLink.js';
 import { RESIZE_DIRS, resizeHandleClass, resizeHandleHoverEvents, type ResizeDir } from './window-resize.js';
 
@@ -127,6 +128,8 @@ interface Props {
   onDesktopFileBrowserOpen?: () => void;
   onDesktopFileBrowserFocus?: () => void;
   onDesktopFileBrowserClose?: () => void;
+  /** Optional: register this sub-session's composer `.controls-input` element with app.tsx. */
+  onInputRef?: (el: HTMLDivElement | null) => void;
   /** Optional: called to pin this sub-session to the sidebar. Passes current viewMode. */
   onPin?: (viewMode: 'terminal' | 'chat') => void;
   sessions?: SessionInfo[];
@@ -294,7 +297,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, visible = true, taskPairPanelVisitKey, showTaskPairPanel = true, pairTaskTitle = null, pairRole = null, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClosePairSplit, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onLiveSessionStateChange, onPreviewFile, onOpenLocalWebPreview, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop, remoteDesktopCanSetUp = true,
+  sub, ws, connected, active, visible = true, taskPairPanelVisitKey, showTaskPairPanel = true, pairTaskTitle = null, pairRole = null, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClosePairSplit, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onLiveSessionStateChange, onPreviewFile, onOpenLocalWebPreview, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onInputRef, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop, remoteDesktopCanSetUp = true,
 }: Props) {
   recordPerfRender(visible ? 'SubSessionWindow:visible' : 'SubSessionWindow:hidden');
   const { t } = useTranslation();
@@ -429,7 +432,16 @@ export function SubSessionWindow({
     sessionName: sub.sessionName,
     ownerSessionName: sub.parentSession ?? sub.sessionName,
   });
-  const addQuote = useCallback((text: string) => setQuotes((prev) => [...prev, text]), []);
+  const addQuote = useCallback((text: string) => {
+    setQuotes((prev) => [...prev, text]);
+    const focusNow = () => {
+      focusComposerElement(inputRef.current);
+    };
+    focusNow();
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(focusNow);
+    }
+  }, []);
   const removeQuote = useCallback((i: number) => setQuotes((prev) => prev.filter((_, j) => j !== i)), []);
 
   // ── Retry failed send ─────────────────────────────────────────────────────
@@ -500,6 +512,28 @@ export function SubSessionWindow({
   // confirmClose removed — × now minimizes instead of terminating
 
   const inputRef = useRef<HTMLDivElement>(null);
+  const onInputRefRef = useRef(onInputRef);
+  onInputRefRef.current = onInputRef;
+  useEffect(() => {
+    if (!visible) {
+      onInputRefRef.current?.(null);
+      return;
+    }
+    if (inputRef.current) {
+      onInputRefRef.current?.(inputRef.current);
+      return;
+    }
+    if (typeof requestAnimationFrame === 'function') {
+      const id = requestAnimationFrame(() => {
+        onInputRefRef.current?.(inputRef.current);
+      });
+      return () => cancelAnimationFrame(id);
+    }
+    return undefined;
+  }, [visible, active]);
+  useEffect(() => () => {
+    onInputRefRef.current?.(null);
+  }, []);
   const fileDropTargetRef = useRef<HTMLDivElement>(null);
   const termFitFnRef = useRef<(() => void) | null>(null);
   const geomRef = useRef(geom);
@@ -998,6 +1032,7 @@ export function SubSessionWindow({
     <div
       ref={swipeBackRef}
       class={rootClass}
+      data-view-mode={viewMode}
       style={style}
       // Capture phase: an inner widget (xterm with mouse reporting on, a
       // canvas, a future third-party embed) may stopPropagation on the way up,

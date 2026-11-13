@@ -16751,6 +16751,193 @@ button.quick-agent-delegation-preset.active {
   padding: 6px 4px;
 }
 
+/* Keyboard Shortcuts Settings */
+.settings-shortcuts-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.settings-shortcuts-desc {
+  color: #94a3b8;
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.settings-shortcuts-header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.settings-shortcuts-platform-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #93c5fd;
+  background: rgba(37, 99, 235, 0.16);
+  border: 1px solid rgba(96, 165, 250, 0.3);
+}
+
+.settings-shortcuts-notice {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.settings-shortcuts-notice.is-info {
+  color: #93c5fd;
+  background: rgba(37, 99, 235, 0.14);
+  border: 1px solid rgba(96, 165, 250, 0.3);
+}
+
+.settings-shortcuts-notice.is-err {
+  color: #fca5a5;
+  background: rgba(239, 68, 68, 0.14);
+  border: 1px solid rgba(239, 68, 68, 0.35);
+}
+
+.settings-shortcuts-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.settings-shortcut-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: #0f172a;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+}
+
+.settings-shortcut-row.is-recording {
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.25);
+}
+
+.settings-shortcut-row.has-conflict {
+  border-color: rgba(245, 158, 11, 0.55);
+}
+
+.settings-shortcut-info {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+.settings-shortcut-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #f1f5f9;
+}
+
+.settings-shortcut-desc {
+  font-size: 12px;
+  color: #94a3b8;
+  margin-top: 2px;
+  line-height: 1.45;
+}
+
+.settings-shortcut-conflict {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #fbbf24;
+}
+
+.settings-shortcut-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.settings-shortcut-capture-btn {
+  min-width: 148px;
+  min-height: 38px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  border: 1px solid #334155;
+  background: #1e293b;
+  color: #e2e8f0;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-size: 13px;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.settings-shortcut-capture-btn:hover {
+  border-color: #60a5fa;
+}
+
+.settings-shortcut-capture-btn.is-recording {
+  border-color: #60a5fa;
+  background: rgba(37, 99, 235, 0.22);
+  color: #bfdbfe;
+}
+
+.settings-shortcut-keycaps {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.settings-kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  height: 24px;
+  padding: 0 7px;
+  border-radius: 6px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-bottom-width: 2px;
+  background: #0f172a;
+  color: #f8fafc;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+.settings-shortcut-unassigned {
+  color: #64748b;
+  font-style: italic;
+}
+
+.settings-shortcut-recording-label {
+  font-weight: 600;
+}
+
+.settings-shortcut-mini-btn {
+  min-height: 36px;
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
+.settings-shortcuts-footnote {
+  margin: 12px 0 0;
+  font-size: 12px;
+  color: #64748b;
+  line-height: 1.45;
+}
+
 /* GuidePage */
 .guide-page {
   display: flex;
