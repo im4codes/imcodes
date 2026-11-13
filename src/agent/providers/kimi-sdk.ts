@@ -4,6 +4,8 @@ import { AgySubagentTracker, extractAgySubagentEvidenceChildIds, isAgySubagentTo
 import { AgyCompactionWatermark } from '../agy-compaction-watermark.js';
 import { AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
 import { AgyContextUsage } from '../agy-context-usage.js';
+import { createAgyIncognitoEnvSync, resolveAgySourceHome, type AgyIncognitoEnv } from '../agy-incognito-isolation.js';
+import { inIncognitoContext, setSessionIncognito } from '../../../shared/session-incognito-context.js';
 import { confirmPromiseStop } from '../provider-stop-confirmation.js';
 /**
  * KimiSdkProvider — TransportProvider that drives `kimi acp` over the
@@ -307,6 +309,20 @@ interface KimiSdkSessionState {
   agyProvisionalAutoMessageId?: string;
   agyBridging?: boolean;
   agyNativeTurnGeneration?: number;
+  incognito?: boolean;
+  isolatedTransport?: IsolatedAcpTransport;
+}
+
+interface AcpTransportSlot {
+  child: ChildProcessWithoutNullStreams | null;
+  connection: ClientSideConnection | null;
+  initPromise: Promise<void> | null;
+  sessionListSupported: boolean;
+}
+
+interface IsolatedAcpTransport extends AcpTransportSlot {
+  incognitoEnv?: AgyIncognitoEnv;
+  sourceHome?: string;
 }
 
 interface ActivePromptAdmission {
@@ -373,6 +389,7 @@ export class KimiSdkProvider implements TransportProvider {
   /** Negotiated ACP support for durable `session/list` discovery. */
   private sessionListSupported = false;
   private isDisconnecting = false;
+  private sharedConnectInFlight: Promise<void> | null = null;
 
   constructor(profile: AcpCliProviderProfile = KIMI_PROFILE) {
     this.profile = profile;
@@ -406,16 +423,58 @@ export class KimiSdkProvider implements TransportProvider {
   }
 
   async connect(config: ProviderConfig): Promise<void> {
+    if (this.id === AGY_SDK_PROVIDER_ID && inIncognitoContext()) {
+      // Never spawn a shared process against real HOME while launching an incognito session.
+      this.config = config;
+      logger.info({ provider: this.id }, `${this.profile.displayName} SDK provider connected lazily for incognito session`);
+      return;
+    }
     await this.startAcpServer(config);
     this.config = config;
     logger.info({ provider: this.id }, `${this.profile.displayName} SDK provider connected via ACP`);
   }
 
+  private async ensureSharedAcpConnected(): Promise<void> {
+    if (this.connection || !this.config || this.isDisconnecting) return;
+    const inflight = this.sharedConnectInFlight ??= this.startAcpServer(this.config).finally(() => {
+      if (this.sharedConnectInFlight === inflight) this.sharedConnectInFlight = null;
+    });
+    await inflight;
+  }
+
+  private connectionForState(state: KimiSdkSessionState): ClientSideConnection | null {
+    return state.incognito ? (state.isolatedTransport?.connection ?? null) : this.connection;
+  }
+
+  private initPromiseForState(state: KimiSdkSessionState): Promise<void> | null {
+    return state.incognito ? (state.isolatedTransport?.initPromise ?? null) : this.initPromise;
+  }
+
+  private async teardownIsolatedTransport(state: KimiSdkSessionState): Promise<void> {
+    const transport = state.isolatedTransport;
+    if (!transport) return;
+    state.isolatedTransport = undefined;
+    const child = transport.child;
+    transport.child = null;
+    transport.connection = null;
+    transport.initPromise = null;
+    transport.sessionListSupported = false;
+    if (child && !child.killed) {
+      try { child.stdin.end(); } catch { /* noop */ }
+      await killProcessTree(child, { ownsProcessGroup: true });
+    }
+    if (transport.incognitoEnv) {
+      await transport.incognitoEnv.cleanup();
+      transport.incognitoEnv = undefined;
+    }
+  }
+
   getMemoryMcpStatus(): MemoryMcpProviderStatusView {
+    const hasIsolated = [...this.sessions.values()].some((s) => Boolean(s.incognito && s.isolatedTransport?.connection));
     return {
       providerId: this.id,
-      status: this.config && this.connection ? MEMORY_MCP_STATUS.READY : MEMORY_MCP_STATUS.UNKNOWN,
-      connected: Boolean(this.config && this.connection),
+      status: this.config && (this.connection || hasIsolated) ? MEMORY_MCP_STATUS.READY : MEMORY_MCP_STATUS.UNKNOWN,
+      connected: Boolean(this.config && (this.connection || hasIsolated)),
       degradedReasons: [],
     };
   }
@@ -478,13 +537,18 @@ export class KimiSdkProvider implements TransportProvider {
     this.isDisconnecting = true;
     try {
       this.cancelPendingApprovals();
-      await this.teardownChild();
+      const states = [...this.sessions.values()];
+      for (const state of states) this.closeAgyBridges(state);
+      await Promise.all([
+        this.teardownChild(),
+        ...states.map((state) => this.teardownIsolatedTransport(state)),
+      ]);
       this.acpToRoute.clear();
       this.acpRouteOrder.clear();
-      for (const state of this.sessions.values()) this.closeAgyBridges(state);
       this.sessions.clear();
       this.config = null;
       this.initPromise = null;
+      this.sharedConnectInFlight = null;
       this.cachedModels = null;
       this.cachedDefaultModel = null;
       this.sessionListSupported = false;
@@ -496,14 +560,36 @@ export class KimiSdkProvider implements TransportProvider {
   async createSession(config: SessionConfig): Promise<string> {
     const routeId = config.bindExistingKey ?? config.sessionKey;
     const prior = this.sessions.get(routeId);
-    if (prior) this.closeAgyBridges(prior);
     const existing = config.fresh ? undefined : prior;
+    const incognito = config.incognito === true || existing?.incognito === true;
+    if (incognito && this.id !== AGY_SDK_PROVIDER_ID) {
+      throw this.makeError(PROVIDER_ERROR_CODES.CONFIG_ERROR, `${this.profile.displayName} does not support incognito sessions.`, false);
+    }
+    if (incognito && config.resumeId) {
+      throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Incognito conversation cannot be resumed; start a fresh session.', false);
+    }
+    if (incognito && !config.fresh && prior?.acpSessionId) {
+      throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Incognito conversation ended; start a new session instead of resuming history.', false);
+    }
+    if (prior) {
+      this.closeAgyBridges(prior);
+      if (prior.isolatedTransport && (config.fresh || !incognito)) {
+        await this.teardownIsolatedTransport(prior);
+      }
+    }
+    setSessionIncognito(routeId, incognito);
+    if (config.sessionName && config.sessionName !== routeId) {
+      setSessionIncognito(config.sessionName, incognito);
+    }
     const explicitAgentId = typeof config.agentId === 'string' && config.agentId.trim()
       ? config.agentId.trim()
       : undefined;
     const inheritedModel = existing?.model;
     const profileDefaultModel = !explicitAgentId && !inheritedModel && !config.resumeId
       ? this.profile.defaultModel
+      : undefined;
+    const baseSourceHome = incognito
+      ? (existing?.isolatedTransport?.sourceHome ?? resolveAgySourceHome(config.env, this.config?.env as Record<string, string> | undefined))
       : undefined;
     const state: KimiSdkSessionState = {
       routeId,
@@ -539,6 +625,16 @@ export class KimiSdkProvider implements TransportProvider {
       sessionSystemTextInjected: existing?.sessionSystemTextInjected,
       agyForeground: this.id === AGY_SDK_PROVIDER_ID && existing?.acpSessionId === (config.resumeId ?? existing?.acpSessionId) && existing?.agyForeground?.authoritative
         ? Object.assign(new AgyForegroundOwnership(),{authoritative:true}) : undefined,
+      ...(incognito ? {
+        incognito: true,
+        isolatedTransport: existing?.isolatedTransport ?? {
+          child: null,
+          connection: null,
+          initPromise: null,
+          sessionListSupported: false,
+          sourceHome: baseSourceHome,
+        },
+      } : {}),
     };
     if (prior?.acpSessionId && prior.acpSessionId !== state.acpSessionId) {
       this.releaseAcpRoute(prior.acpSessionId, routeId);
@@ -560,15 +656,19 @@ export class KimiSdkProvider implements TransportProvider {
     const removedSoleAcpRoute = state.acpSessionId
       ? this.releaseAcpRoute(state.acpSessionId, state.routeId)
       : false;
+    const connection = this.connectionForState(state);
     // ACP has a session/close RPC (optional capability). We call it best-effort
     // so the agent can free state; if it fails, the session is still gone on
     // our side. closeSession is optional on the Agent interface so we have to
     // feature-detect.
-    if (state.acpSessionId && state.loaded && this.connection && removedSoleAcpRoute) {
-      const closer = (this.connection as AcpAgent).closeSession;
+    if (state.acpSessionId && state.loaded && connection && removedSoleAcpRoute) {
+      const closer = (connection as AcpAgent).closeSession;
       if (typeof closer === 'function') {
-        await closer.call(this.connection, { sessionId: state.acpSessionId }).catch(() => {});
+        await closer.call(connection, { sessionId: state.acpSessionId }).catch(() => {});
       }
+    }
+    if (state.isolatedTransport) {
+      await this.teardownIsolatedTransport(state);
     }
   }
 
@@ -579,14 +679,18 @@ export class KimiSdkProvider implements TransportProvider {
     this.closeAgyBridges(state);
     this.sessions.delete(state.routeId);
     if (state.acpSessionId) this.releaseAcpRoute(state.acpSessionId, state.routeId);
+    if (state.isolatedTransport) {
+      await this.teardownIsolatedTransport(state);
+    }
   }
 
   async restoreSession(sessionId: string): Promise<boolean> {
     const state = this.sessions.get(sessionId)
       ?? [...this.sessions.values()].find((candidate) => candidate.acpSessionId === sessionId);
-    if (!state) return false;
+    if (!state || state.incognito) return false;
     if (state.loaded) return true;
     try {
+      await this.ensureSharedAcpConnected();
       await this.ensureSessionReady(state.routeId, state);
       if (this.profile.strictModelSelection && !state.promptInFlight && state.confirmedModel) {
         this.emitSessionInfo(state.routeId, { model: state.confirmedModel });
@@ -598,6 +702,7 @@ export class KimiSdkProvider implements TransportProvider {
   }
 
   async listSessions(options: RemoteSessionListOptions = {}): Promise<RemoteSessionInfo[]> {
+    await this.ensureSharedAcpConnected().catch(() => {});
     const directoryRequested = options.directory !== undefined;
     const queryDirectory = normalizeTransportCwd(options.directory);
     const expectedDirectory = canonicalizeTransportCwd(options.directory);
@@ -910,10 +1015,11 @@ export class KimiSdkProvider implements TransportProvider {
     // experimental RPC. Swallow errors: if the CLI version predates it,
     // subsequent prompts still use the original model — still correct, just
     // not the requested one.
-    if (state.acpSessionId && state.loaded && this.connection) {
-      const setter = (this.connection as AcpAgent).unstable_setSessionModel;
+    const connection = this.connectionForState(state);
+    if (state.acpSessionId && state.loaded && connection) {
+      const setter = (connection as AcpAgent).unstable_setSessionModel;
       if (typeof setter === 'function') {
-        void setter.call(this.connection, {
+        void setter.call(connection, {
           sessionId: state.acpSessionId,
           modelId: agentId,
         }).catch((err: unknown) => {
@@ -934,7 +1040,8 @@ export class KimiSdkProvider implements TransportProvider {
     if (!state) throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, 'ACP model session not found', false);
     const previous = state.modelControlIntent ? state.modelControlIntent.previous : state.model;
     this.setSessionAgentId(sessionId, model);
-    if (!state.loaded || !state.acpSessionId || !this.connection || state.cancelled) return SESSION_MODEL_APPLIED.NEXT_START;
+    const connection = this.connectionForState(state);
+    if (!state.loaded || !state.acpSessionId || !connection || state.cancelled) return SESSION_MODEL_APPLIED.NEXT_START;
     const intent = { previous };
     state.modelControlIntent = intent;
     try {
@@ -962,7 +1069,7 @@ export class KimiSdkProvider implements TransportProvider {
     const model = state.model;
     if (!model) return;
     const revision = state.modelRevision;
-    const connection = this.connection;
+    const connection = this.connectionForState(state);
     const nativeId = state.acpSessionId;
     const assertOwner = () => {
       this.assertCurrentSession(sessionId, state, connection);
@@ -992,7 +1099,7 @@ export class KimiSdkProvider implements TransportProvider {
           }
           // Even a superseded successful RPC changed native state. Invalidate
           // the old cached model before the intent check (A→B→A must reapply A).
-          if (this.sessions.get(sessionId) === state && this.connection === connection && state.acpSessionId === nativeId) {
+          if (this.sessions.get(sessionId) === state && this.connectionForState(state) === connection && state.acpSessionId === nativeId) {
             state.confirmedModel = undefined;
           }
           assertOwner();
@@ -1032,12 +1139,21 @@ export class KimiSdkProvider implements TransportProvider {
     attachments?: TransportAttachment[],
     extraSystemPrompt?: string,
   ): Promise<void> {
-    if (!this.config || !this.connection) {
+    if (!this.config) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, `${this.profile.displayName} ACP server not connected`, false);
     }
     const state = this.sessions.get(sessionId);
     if (!state) {
+      if (!this.connection) {
+        throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, `${this.profile.displayName} ACP server not connected`, false);
+      }
       throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Unknown ${this.profile.displayName} SDK session: ${sessionId}`, false);
+    }
+    if (!state.incognito && !this.connection) {
+      await this.ensureSharedAcpConnected();
+      if (!this.connection) {
+        throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, `${this.profile.displayName} ACP server not connected`, false);
+      }
     }
     if (state.promptInFlight) {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, `${this.profile.displayName} SDK session is already busy`, true);
@@ -1103,12 +1219,13 @@ export class KimiSdkProvider implements TransportProvider {
     this.closeAgyBridges(state);
     if (!state.promptInFlight) return;
     state.cancelled = true;
-    if (!state.acpSessionId || !this.connection) return;
+    const connection = this.connectionForState(state);
+    if (!state.acpSessionId || !connection) return;
     this.cancelPendingApprovals(sessionId);
     // `cancel` is a one-shot notification; the pending prompt() Promise or
     // autonomous `turn_completed` terminal will settle the captured run when
     // native work actually stops. Never fabricate physical stop proof locally.
-    await this.connection.cancel({ sessionId: state.acpSessionId }).catch((err: unknown) => {
+    await connection.cancel({ sessionId: state.acpSessionId }).catch((err: unknown) => {
       logger.debug({
         provider: this.id,
         sessionId,
@@ -1141,7 +1258,7 @@ export class KimiSdkProvider implements TransportProvider {
       || state.cancelled
       || !state.loaded
       || !state.acpSessionId
-      || !this.connection) {
+      || !this.connectionForState(state)) {
       return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
     }
 
@@ -1185,7 +1302,7 @@ export class KimiSdkProvider implements TransportProvider {
     state: KimiSdkSessionState,
     notification: ProviderDelegationNotification,
   ): Promise<AgentDelegationNotificationResult> {
-    const connection = this.connection;
+    const connection = this.connectionForState(state);
     if (!connection) return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
     let queuedGeneration: number | undefined;
     try {
@@ -1263,7 +1380,7 @@ export class KimiSdkProvider implements TransportProvider {
         }
         return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
       }
-      if (this.sessions.get(sessionId) !== state || state.cancelled || this.connection !== connection) {
+      if (this.sessions.get(sessionId) !== state || state.cancelled || this.connectionForState(state) !== connection) {
         // The write is already native-visible: never return STALE and replay it.
         return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
       }
@@ -1295,15 +1412,78 @@ export class KimiSdkProvider implements TransportProvider {
   // ── ACP client-side glue ────────────────────────────────────────────────
 
   /** Process arguments for the ACP agent. Override to adapt them to `config`. */
-  protected buildAcpArgs(_config: ProviderConfig): string[] {
-    return [...this.profile.args];
+  protected buildAcpArgs(_config: ProviderConfig, extraFlags: readonly string[] = []): string[] {
+    return [...this.profile.args, ...extraFlags];
   }
 
-  private async startAcpServer(config: ProviderConfig): Promise<void> {
-    await this.teardownChild();
+  private async startIsolatedAcpServer(sessionId: string, state: KimiSdkSessionState): Promise<void> {
+    if (!this.config) {
+      throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, `${this.profile.displayName} ACP server not connected`, false);
+    }
+    if (state.isolatedTransport?.child) {
+      await this.teardownIsolatedTransport(state);
+    }
+    const sourceHome = state.isolatedTransport?.sourceHome
+      ?? resolveAgySourceHome(state.env, this.config.env as Record<string, string> | undefined);
+    const incognitoEnv = createAgyIncognitoEnvSync(sourceHome);
+    state.env = { ...(state.env ?? {}), ...incognitoEnv.env };
+    const transport: IsolatedAcpTransport = {
+      child: null,
+      connection: null,
+      initPromise: null,
+      sessionListSupported: false,
+      incognitoEnv,
+      sourceHome,
+    };
+    state.isolatedTransport = transport;
+    try {
+      await this.startAcpServer(this.config, { sessionId, state, transport, incognitoEnv });
+    } catch (error) {
+      await this.teardownIsolatedTransport(state);
+      throw error;
+    }
+  }
+
+  private async startAcpServer(
+    config: ProviderConfig,
+    isolatedFor?: {
+      sessionId: string;
+      state: KimiSdkSessionState;
+      transport: IsolatedAcpTransport;
+      incognitoEnv: AgyIncognitoEnv;
+    },
+  ): Promise<void> {
+    if (!isolatedFor) {
+      await this.teardownChild();
+    }
+
+    const transport: AcpTransportSlot = isolatedFor
+      ? isolatedFor.transport
+      : {
+        get child() { return providerSelf.child; },
+        set child(value) { providerSelf.child = value; },
+        get connection() { return providerSelf.connection; },
+        set connection(value) { providerSelf.connection = value; },
+        get initPromise() { return providerSelf.initPromise; },
+        set initPromise(value) { providerSelf.initPromise = value; },
+        get sessionListSupported() { return providerSelf.sessionListSupported; },
+        set sessionListSupported(value) { providerSelf.sessionListSupported = value; },
+      };
+    const providerSelf = this;
 
     const resolved = this.resolveAcpExecutable(config);
-    const args = [...resolved.prependArgs, ...this.buildAcpArgs(config)];
+    const args = [
+      ...resolved.prependArgs,
+      ...this.buildAcpArgs(config, isolatedFor?.incognitoEnv.acpFlags),
+    ];
+    const env = isolatedFor
+      ? {
+        ...process.env,
+        ...((config.env as Record<string, string> | undefined) ?? {}),
+        ...(isolatedFor.state.env ?? {}),
+        ...isolatedFor.incognitoEnv.env,
+      }
+      : { ...process.env, ...((config.env as Record<string, string> | undefined) ?? {}) };
     const child = spawn(resolved.executable, args, {
       // Own process group and session on POSIX. A reparented descendant keeps
       // its PGID but loses its PPID, so after the agent parent dies this is the
@@ -1311,10 +1491,10 @@ export class KimiSdkProvider implements TransportProvider {
       // workers of the incident were unreachable on PPID=1.
       detached: process.platform !== 'win32',
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, ...((config.env as Record<string, string> | undefined) ?? {}) },
+      env,
       windowsHide: true,
     });
-    this.child = child;
+    transport.child = child;
     const spawnFailure = new Promise<never>((_resolve, reject) => {
       child.once('error', reject);
     });
@@ -1327,42 +1507,55 @@ export class KimiSdkProvider implements TransportProvider {
       logger.debug({ provider: this.id, stderrBytes: Buffer.byteLength(text) }, `${this.profile.displayName} ACP stderr`);
     });
 
-    child.on('exit', (code, signal) => {
-      if (this.isDisconnecting || this.child !== child) return;
-      const err = new Error(`${this.profile.displayName} ACP server exited with code=${code} signal=${signal}`);
+    const handleChildFailure = (err: Error, isSpawnError: boolean, errorCode?: string): void => {
+      if (this.isDisconnecting || transport.child !== child) return;
+      if (isSpawnError) {
+        logger.error(
+          { provider: this.id, errorCode: errorCode ?? 'spawn_failed' },
+          `${this.profile.displayName} ACP spawn error`,
+        );
+      }
+      if (isolatedFor) {
+        const sid = isolatedFor.sessionId;
+        this.cancelPendingApprovals(sid);
+        if (isolatedFor.state) isolatedFor.state.sessionSystemTextInjected = undefined;
+        if (this.clearSessionWorkAfterFailure(sid)) {
+          this.emitError(sid, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, err.message, true));
+        }
+        isolatedFor.state.acpSessionId = undefined;
+        isolatedFor.state.loaded = false;
+        transport.child = null;
+        transport.connection = null;
+        transport.initPromise = null;
+        transport.sessionListSupported = false;
+        if (isolatedFor.state.isolatedTransport === isolatedFor.transport) {
+          isolatedFor.state.isolatedTransport = undefined;
+        }
+        void isolatedFor.incognitoEnv.cleanup();
+        return;
+      }
       this.cancelPendingApprovals();
       const sessions = [...this.sessions.keys()];
       for (const sid of sessions) {
         const state = this.sessions.get(sid);
+        if (state?.incognito) continue;
         if (state) state.sessionSystemTextInjected = undefined;
         if (this.clearSessionWorkAfterFailure(sid)) {
           this.emitError(sid, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, err.message, true));
         }
       }
-      this.child = null;
-      this.connection = null;
-      this.initPromise = null;
-      this.sessionListSupported = false;
+      transport.child = null;
+      transport.connection = null;
+      transport.initPromise = null;
+      transport.sessionListSupported = false;
+    };
+
+    child.on('exit', (code, signal) => {
+      const err = new Error(`${this.profile.displayName} ACP server exited with code=${code} signal=${signal}`);
+      handleChildFailure(err, false);
     });
     child.on('error', (err) => {
-      if (this.isDisconnecting || this.child !== child) return;
-      logger.error(
-        { provider: this.id, errorCode: (err as NodeJS.ErrnoException).code ?? 'spawn_failed' },
-        `${this.profile.displayName} ACP spawn error`,
-      );
-      this.cancelPendingApprovals();
-      const sessions = [...this.sessions.keys()];
-      for (const sid of sessions) {
-        const state = this.sessions.get(sid);
-        if (state) state.sessionSystemTextInjected = undefined;
-        if (this.clearSessionWorkAfterFailure(sid)) {
-          this.emitError(sid, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, err.message, true));
-        }
-      }
-      this.child = null;
-      this.connection = null;
-      this.initPromise = null;
-      this.sessionListSupported = false;
+      handleChildFailure(err, true, (err as NodeJS.ErrnoException).code);
     });
 
     // `ndJsonStream` wants Web streams; convert the Node stdio streams. Filter
@@ -1488,12 +1681,13 @@ export class KimiSdkProvider implements TransportProvider {
     // Construct the ACP connection. The callback receives the Agent handle we
     // can use to call RPC methods; we return a Client impl that handles
     // reverse RPC (requestPermission + session notifications).
-    this.connection = new ClientSideConnection(() => this.createClientImpl(child), stream);
-    this.promptWriteQueues.set(this.connection, Object.assign(pendingPromptWrites, { reserveSlot }));
+    const connection = new ClientSideConnection(() => this.createClientImpl(child, isolatedFor?.transport), stream);
+    transport.connection = connection;
+    this.promptWriteQueues.set(connection, Object.assign(pendingPromptWrites, { reserveSlot }));
 
     // Kick off initialize once; all subsequent calls await the same promise.
-    this.initPromise = (async () => {
-      const result = await this.connection!.initialize({
+    const initPromise = (async () => {
+      const result = await connection.initialize({
         // Protocol version number. 1 is the current major; the agent tells us
         // what it supports in the response but for now we only talk 1.
         protocolVersion: 1,
@@ -1508,7 +1702,7 @@ export class KimiSdkProvider implements TransportProvider {
         { provider: this.id, agentInfo: result.agentInfo, caps: result.agentCapabilities },
         `${this.profile.displayName} ACP initialized`,
       );
-      this.sessionListSupported = result.agentCapabilities.sessionCapabilities?.list != null;
+      transport.sessionListSupported = result.agentCapabilities.sessionCapabilities?.list != null;
       await this.validateConnectedAgent(result as unknown as Record<string, unknown>, config);
     })().catch((err: unknown) => {
       logger.error(
@@ -1517,6 +1711,7 @@ export class KimiSdkProvider implements TransportProvider {
       );
       throw err;
     });
+    transport.initPromise = initPromise;
 
     let initTimer: ReturnType<typeof setTimeout> | undefined;
     const initTimeout = new Promise<never>((_resolve, reject) => {
@@ -1527,9 +1722,13 @@ export class KimiSdkProvider implements TransportProvider {
       initTimer.unref?.();
     });
     try {
-      await Promise.race([this.initPromise, spawnFailure, initTimeout]);
+      await Promise.race([initPromise, spawnFailure, initTimeout]);
     } catch (error) {
-      await this.teardownChild();
+      if (isolatedFor) {
+        await this.teardownIsolatedTransport(isolatedFor.state);
+      } else {
+        await this.teardownChild();
+      }
       if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
         throw this.makeError(
           PROVIDER_ERROR_CODES.CONFIG_ERROR,
@@ -1545,12 +1744,13 @@ export class KimiSdkProvider implements TransportProvider {
 
   /** Build the Client impl passed to ClientSideConnection. The SDK invokes
    *  these methods when the agent sends us requests/notifications. */
-  private createClientImpl(child?: ChildProcessWithoutNullStreams): AcpClient {
+  private createClientImpl(child?: ChildProcessWithoutNullStreams, isolatedTransport?: AcpTransportSlot): AcpClient {
+    const isCurrentChild = () => !child || (isolatedTransport ? isolatedTransport.child === child : this.child === child);
     return {
       requestPermission: async (
         params: RequestPermissionRequest,
       ): Promise<RequestPermissionResponse> => {
-        if (child && this.child !== child) return { outcome: { outcome: 'cancelled' } };
+        if (!isCurrentChild()) return { outcome: { outcome: 'cancelled' } };
         if (this.profile.approval === 'bridge') {
           return this.bridgePermissionRequest(params);
         }
@@ -1573,7 +1773,7 @@ export class KimiSdkProvider implements TransportProvider {
         return { outcome: { outcome: 'cancelled' } };
       },
       sessionUpdate: async (params: SessionNotification): Promise<void> => {
-        if (!child || this.child === child) this.enqueueSessionUpdate(params);
+        if (isCurrentChild()) this.enqueueSessionUpdate(params);
       },
       extNotification: async (method: string, _params: Record<string, unknown>): Promise<void> => {
         if (method === '_x.ai/models/update' && _params && typeof _params === 'object') {
@@ -1581,7 +1781,7 @@ export class KimiSdkProvider implements TransportProvider {
           return;
         }
         if ((method === '_x.ai/session/update' || method === '_imcodes/session/update') && _params && typeof _params === 'object') {
-          if (!child || this.child === child) this.enqueueSessionUpdate(_params as unknown as SessionNotification);
+          if (isCurrentChild()) this.enqueueSessionUpdate(_params as unknown as SessionNotification);
           return;
         }
         // Grok publishes MCP catalog refreshes through an xAI extension. The
@@ -1651,7 +1851,7 @@ export class KimiSdkProvider implements TransportProvider {
       // Long-lived call — invoking it submits A; its Promise resolves only
       // when the turn ends.  Publish the generation-scoped admission boundary
       // before returning from send(), then settle asynchronously.
-      const connection = this.connection!;
+      const connection = this.connectionForState(state)!;
       if (this.id === AGY_SDK_PROVIDER_ID) {
         const promptText = promptBlocks.map(b => b.type === 'text' ? b.text : '').join('');
         const rawAlias = payload.assembledMessage.trim();
@@ -1807,8 +2007,8 @@ export class KimiSdkProvider implements TransportProvider {
     this.emitError(sessionId, this.normalizeError(error));
   }
 
-  private assertCurrentSession(sessionId: string, state: KimiSdkSessionState, connection = this.connection): void {
-    if (this.sessions.get(sessionId) !== state || state.cancelled || !connection || this.connection !== connection) {
+  private assertCurrentSession(sessionId: string, state: KimiSdkSessionState, connection = this.connectionForState(state)): void {
+    if (this.sessions.get(sessionId) !== state || state.cancelled || !connection || this.connectionForState(state) !== connection) {
       throw this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'ACP session owner changed or stopped', true);
     }
   }
@@ -1819,23 +2019,37 @@ export class KimiSdkProvider implements TransportProvider {
     sessionId: string,
     state: KimiSdkSessionState,
   ): Promise<void> {
-    const connection = this.connection;
+    if (state.incognito) {
+      if (state.acpSessionId && !state.loaded) {
+        throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Incognito conversation cannot be resumed; start a new session.', false);
+      }
+      const existingTransport = state.isolatedTransport;
+      if (!existingTransport?.connection || !existingTransport.child || existingTransport.child.killed || existingTransport.child.exitCode !== null) {
+        await this.startIsolatedAcpServer(sessionId, state);
+      }
+    } else if (!this.connection && this.config) {
+      await this.ensureSharedAcpConnected();
+    }
+    const connection = this.connectionForState(state);
     if (!connection) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, `${this.profile.displayName} ACP connection not ready`, false);
     }
-    await this.initPromise;
+    await this.initPromiseForState(state);
     this.assertCurrentSession(sessionId, state, connection);
 
     if (!state.loaded) {
       await state.beforeNativeSessionStart?.();
       this.assertCurrentSession(sessionId, state, connection);
       if (state.acpSessionId) {
+        if (state.incognito) {
+          throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Incognito conversation cannot be resumed; start a new session.', false);
+        }
         // Resume an existing session (survives across CLI restarts via
         // ~/.kimi/tmp/<project>/chats/<id>.json).
         try {
           const loader = this.profile.resumeWithoutReplay
-            ? (this.connection as AcpAgent).resumeSession
-            : (this.connection as AcpAgent).loadSession;
+            ? (connection as AcpAgent).resumeSession
+            : (connection as AcpAgent).loadSession;
           if (typeof loader !== 'function') {
             throw new Error('Agent does not implement loadSession (capability mismatch)');
           }
@@ -1846,7 +2060,7 @@ export class KimiSdkProvider implements TransportProvider {
           state.replaying = true;
           let loadResult: LoadSessionResponse | undefined;
           try {
-            loadResult = await loader.call(this.connection, {
+            loadResult = await loader.call(connection, {
               sessionId: state.acpSessionId,
               cwd: state.cwd,
               mcpServers: this.mcpServersForState(state),
@@ -1879,10 +2093,10 @@ export class KimiSdkProvider implements TransportProvider {
       }
     }
 
-    if (!state.modeApplied && this.profile.defaultMode && state.acpSessionId && this.connection) {
-      const modeSetter = (this.connection as AcpAgent).setSessionMode;
+    if (!state.modeApplied && this.profile.defaultMode && state.acpSessionId && connection) {
+      const modeSetter = (connection as AcpAgent).setSessionMode;
       if (typeof modeSetter === 'function') {
-        await modeSetter.call(this.connection, {
+        await modeSetter.call(connection, {
           sessionId: state.acpSessionId,
           modeId: this.profile.defaultMode,
         }).catch((err: unknown) => {
@@ -1900,10 +2114,10 @@ export class KimiSdkProvider implements TransportProvider {
 
     if (this.profile.strictModelSelection) {
       await this.confirmStrictSessionModel(sessionId, state);
-    } else if (state.model && state.acpSessionId && this.connection) {
-      const modelSetter = (this.connection as AcpAgent).unstable_setSessionModel;
+    } else if (state.model && state.acpSessionId && connection) {
+      const modelSetter = (connection as AcpAgent).unstable_setSessionModel;
       if (typeof modelSetter === 'function') {
-        await modelSetter.call(this.connection, {
+        await modelSetter.call(connection, {
           sessionId: state.acpSessionId,
           modelId: state.model,
         }).catch((err: unknown) => {
@@ -1917,12 +2131,12 @@ export class KimiSdkProvider implements TransportProvider {
 
   private async createFreshAcpSession(sessionId: string, state: KimiSdkSessionState): Promise<void> {
     this.assertCurrentSession(sessionId, state);
-    const connection = this.connection!;
+    const connection = this.connectionForState(state)!;
     const result: NewSessionResponse = await connection.newSession({
       cwd: state.cwd,
       mcpServers: this.mcpServersForState(state),
     });
-    if (this.sessions.get(sessionId) !== state || state.cancelled || this.connection !== connection) {
+    if (this.sessions.get(sessionId) !== state || state.cancelled || this.connectionForState(state) !== connection) {
       // session/new crossed the native boundary before Stop/rebind. Release
       // only this newly created worker, never publish its ID to a newer owner.
       void connection.closeSession({ sessionId: result.sessionId }).catch(() => {});
@@ -1991,6 +2205,7 @@ export class KimiSdkProvider implements TransportProvider {
   }
 
   private mcpServersForState(state: KimiSdkSessionState): ReturnType<typeof getDefaultAcpMcpServers> {
+    if (state.incognito) return [];
     return getDefaultAcpMcpServers({
       sessionKey: state.routeId,
       sessionName: state.sessionName,
@@ -2008,6 +2223,7 @@ export class KimiSdkProvider implements TransportProvider {
       this.cachedDefaultModel = null;
     }
     if (!this.cachedModels && this.profile.modelDiscovery !== 'session-metadata-only') {
+      await this.ensureSharedAcpConnected().catch(() => {});
       if (this.connection) {
         await this.initPromise;
         try {

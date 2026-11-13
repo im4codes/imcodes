@@ -2489,7 +2489,7 @@ function wireTransportSessionInfo(
         next.codexSessionId = info.resumeId;
         changed = true;
       }
-      if (!isIncognitoSession(existing) && usesProviderResumeId(agentType) && next.providerResumeId !== info.resumeId) {
+      if (!isIncognitoSession(next) && usesProviderResumeId(agentType) && next.providerResumeId !== info.resumeId) {
         next.providerResumeId = info.resumeId;
         changed = true;
       }
@@ -3955,7 +3955,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   } else if (usesProviderResumeId(agentType)) {
     effectiveSessionKey = randomUUID();
     effectiveBindExistingKey = undefined;
-    transportResumeId = agentType === AGY_SDK_PROVIDER_ID && opts.fresh
+    transportResumeId = opts.incognito || (agentType === AGY_SDK_PROVIDER_ID && opts.fresh)
       ? undefined : opts.providerResumeId ?? storedProviderResumeId;
     // providerSessionId is only an IM.codes route key for this family. Durable
     // continuity comes exclusively from providerResumeId, so a stale route key
@@ -4032,7 +4032,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     bindExistingKey: effectiveBindExistingKey,
     skipCreate: effectiveSkipCreate,
     resumeId: transportResumeId,
-    ...(agentType === AGY_SDK_PROVIDER_ID && (!skipStore || existing) ? { beforeNativeSessionStart: agyNativeStartBarrier(runtime, name) } : {}),
+    ...(agentType === AGY_SDK_PROVIDER_ID && !opts.incognito && (!skipStore || existing) ? { beforeNativeSessionStart: agyNativeStartBarrier(runtime, name) } : {}),
     effort: effectiveEffort,
     ...(existing?.crossVendorHandoff?.pending && !opts.fresh
       ? { pendingHandoff: existing.crossVendorHandoff.pending }
@@ -4068,7 +4068,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
         runtimeType: RUNTIME_TYPES.TRANSPORT,
         providerId: provider.id,
         providerSessionId: runtime.providerSessionId ?? undefined,
-        ...(agentType === AGY_SDK_PROVIDER_ID ? {
+        ...(agentType === AGY_SDK_PROVIDER_ID && !opts.incognito ? {
           agyNativeSessionState: transportResumeId || latestSessionInfo?.resumeId
             ? AGY_NATIVE_SESSION_STATE.STARTED : AGY_NATIVE_SESSION_STATE.UNSTARTED,
         } : {}),
@@ -4169,7 +4169,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
       emitSessionPersist(persistedRecord ?? record, name);
     }
 
-    if (skipStore && agentType === AGY_SDK_PROVIDER_ID && existing) {
+    if (skipStore && agentType === AGY_SDK_PROVIDER_ID && existing && !opts.incognito) {
       const current = getSession(name);
       if (!current || current.sessionInstanceId !== existing.sessionInstanceId) throw new Error('AG launch owner changed');
       upsertSession({ ...current, providerSessionId: providerSid ?? undefined,

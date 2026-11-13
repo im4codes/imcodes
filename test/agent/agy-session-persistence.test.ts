@@ -217,4 +217,11 @@ describe('AG native start durable evidence (real SQLite and SDK child fixture)',
     store.upsertSession({...store.getSession(other)!,providerResumeId:native});await store.flushStore();
     await expect(start()).rejects.toThrow('belongs to another');
   });
+
+  it('skips native start persistence and disk writes for incognito sessions', async () => {
+    store.upsertSession(record(main, { incognito: true }));
+    await start(main);
+    expect(persistedSessions(home)[main]).toBeUndefined();
+    expect(store.getSession(main)?.agyNativeSessionState).toBe(AG.UNSTARTED);
+  });
 });

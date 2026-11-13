@@ -646,8 +646,8 @@
   "session": {
     "incognito": "Incognito session",
     "incognito_hint": "History stays in memory and is erased when the session closes or disconnects. Memory tools are disabled. Agent-created project files are kept.",
-    "incognito_available": "Available for Claude SDK, Codex SDK, and Pi.",
-    "incognito_unsupported": "Incognito requires an updated server and daemon and a supported runtime (Claude SDK, Codex SDK, or Pi). Other runtimes cannot guarantee private history.",
+    "incognito_available": "Available for Claude SDK, Codex SDK, Antigravity SDK, and Pi.",
+    "incognito_unsupported": "Incognito requires an updated server and daemon and a supported runtime (Claude SDK, Codex SDK, Antigravity SDK, or Pi). Other runtimes cannot guarantee private history.",
     "restart": "↺ Restart",
     "restart_plain": "Restart",
     "terminal_recovery_exhausted": "The terminal could not recover automatically. Restart it to continue.",

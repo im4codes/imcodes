@@ -63,6 +63,8 @@ import {
 import { recordAgyQuotaActivity, refreshAgyQuotaMetadata } from '../agy-usage-quota.js';
 import { AgyHistoryReader, hashAgyPrompt } from '../agy-native-history.js';
 import { AgyContextUsage } from '../agy-context-usage.js';
+import { createAgyIncognitoEnvSync, resolveAgySourceHome, type AgyIncognitoEnv } from '../agy-incognito-isolation.js';
+import { inIncognitoContext, setSessionIncognito } from '../../../shared/session-incognito-context.js';
 import { sessionSystemContractKey, shouldInjectSessionSystemContract } from '../session-system-contract.js';
 
 const MODEL_CACHE_TTL_MS = 10 * 60_000;
@@ -123,6 +125,9 @@ interface AgySessionState {
   latestStepUsage?: AgyUsage;
   turnOutputTokens?: number;
   subagents?: AgySubagentTracker;
+  incognito?: boolean;
+  incognitoEnv?: AgyIncognitoEnv;
+  sourceHome?: string;
 
 }
 
@@ -150,13 +155,14 @@ function buildAgyMemoryMcpEnv(config: SessionConfig): Record<string, string> | u
  * `--dangerously-skip-permissions` is mandatory: stream-json mode has no
  * approval channel, so without it every write tool would stall the turn.
  */
-export function buildAgyArgs(opts: { conversationId?: string; model?: string }): string[] {
+export function buildAgyArgs(opts: { conversationId?: string; model?: string; extraFlags?: readonly string[] }): string[] {
   return [
     AGY_CLI_FLAG.INPUT_FORMAT, AGY_CLI_FLAG.STREAM_JSON,
     AGY_CLI_FLAG.OUTPUT_FORMAT, AGY_CLI_FLAG.STREAM_JSON,
     AGY_CLI_FLAG.SKIP_PERMISSIONS,
     ...(opts.conversationId ? [AGY_CLI_FLAG.CONVERSATION, opts.conversationId] : []),
     AGY_CLI_FLAG.MODEL, opts.model || AGY_DEFAULT_MODEL_ID,
+    ...(opts.extraFlags ?? []),
     // Must stay last: `-p`/`--print` without `=` would swallow the next argv as its prompt.
     AGY_CLI_FLAG.PRINT_STDIN,
   ];
@@ -253,10 +259,12 @@ export class AgySdkProvider implements TransportProvider {
 
   async connect(config: ProviderConfig): Promise<void> {
     this.config = config;
-    this.mcpRegistration = await ensureAgyMcpConfigHasImcodesEntry(agyMcpEnsureOptionsFromConfig(config)).catch((err) => {
-      logger.warn({ err }, 'Failed to ensure Antigravity MCP configuration');
-      return null;
-    });
+    if (!inIncognitoContext()) {
+      this.mcpRegistration = await ensureAgyMcpConfigHasImcodesEntry(agyMcpEnsureOptionsFromConfig(config)).catch((err) => {
+        logger.warn({ err }, 'Failed to ensure Antigravity MCP configuration');
+        return null;
+      });
+    }
     const { executable, prependArgs } = this.resolveBinary();
     try {
       await execFileAsync(executable, [...prependArgs, '--help'], { timeout: 15_000, env: this.spawnEnv() });
@@ -276,7 +284,16 @@ export class AgySdkProvider implements TransportProvider {
   async disconnect(): Promise<void> {
     const states = [...this.sessions.values()];
     this.sessions.clear();
-    await Promise.all([this.historyReader.dispose(), ...states.map((state) => this.terminateChild(state))]);
+    await Promise.all([
+      this.historyReader.dispose(),
+      ...states.map(async (state) => {
+        await this.terminateChild(state);
+        if (state.incognitoEnv) {
+          await state.incognitoEnv.cleanup();
+          state.incognitoEnv = undefined;
+        }
+      }),
+    ]);
     this.config = null;
   }
 
@@ -284,11 +301,25 @@ export class AgySdkProvider implements TransportProvider {
     const routeId = config.bindExistingKey ?? config.sessionKey;
     const prior = this.sessions.get(routeId);
     const existing = config.fresh ? undefined : prior;
+    const incognito = config.incognito === true || existing?.incognito === true;
+    if (incognito && config.resumeId) {
+      throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Incognito conversation cannot be resumed; start a fresh session.', false);
+    }
+    if (incognito && !config.fresh && prior?.conversationId) {
+      throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Incognito conversation ended; start a new session instead of resuming history.', false);
+    }
+    setSessionIncognito(routeId, incognito);
+    if (config.sessionName && config.sessionName !== routeId) {
+      setSessionIncognito(config.sessionName, incognito);
+    }
+    const baseSourceHome = incognito
+      ? (existing?.sourceHome ?? resolveAgySourceHome(config.env, this.config?.env as Record<string, string> | undefined))
+      : undefined;
     const state: AgySessionState = {
       routeId,
       cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
       env: config.env ?? existing?.env,
-      mcpEnv: buildAgyMemoryMcpEnv(config) ?? existing?.mcpEnv,
+      mcpEnv: incognito ? undefined : (buildAgyMemoryMcpEnv(config) ?? existing?.mcpEnv),
       model: (typeof config.agentId === 'string' && config.agentId)
         || (typeof (config as { model?: string }).model === 'string' && (config as { model?: string }).model)
         || existing?.model || AGY_DEFAULT_MODEL_ID,
@@ -311,11 +342,17 @@ export class AgySdkProvider implements TransportProvider {
       mayHaveHistoricalError: !!(config.resumeId ?? existing?.conversationId) && !config.fresh,
       historyReadInFlight: existing?.historyReadInFlight ?? false,
       pendingInputs: [],
+      ...(incognito ? { incognito: true, sourceHome: baseSourceHome, incognitoEnv: existing?.incognitoEnv } : {}),
     };
     if (prior?.child && (config.fresh || prior.conversationId !== state.conversationId)) {
       await this.terminateChild(prior);
       state.child = null;
       state.inflightTurns = 0;
+    }
+    if (prior?.incognitoEnv && (config.fresh || !incognito)) {
+      await prior.incognitoEnv.cleanup();
+      prior.incognitoEnv = undefined;
+      if (state.incognitoEnv === prior.incognitoEnv) state.incognitoEnv = undefined;
     }
     if (existing?.child && existing.child === state.child) {
       existing.cwd = state.cwd;
@@ -335,7 +372,13 @@ export class AgySdkProvider implements TransportProvider {
   async endSession(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
     this.sessions.delete(sessionId);
-    if (state) await this.terminateChild(state);
+    if (state) {
+      await this.terminateChild(state);
+      if (state.incognitoEnv) {
+        await state.incognitoEnv.cleanup();
+        state.incognitoEnv = undefined;
+      }
+    }
   }
 
   async detachSession(sessionId: string): Promise<void> {
@@ -345,7 +388,8 @@ export class AgySdkProvider implements TransportProvider {
 
   async restoreSession(sessionId: string): Promise<boolean> {
     const state = this.sessions.get(sessionId);
-    return !!state?.conversationId;
+    if (!state || state.incognito) return false;
+    return !!state.conversationId;
   }
 
   // ── Messaging ──────────────────────────────────────────────────────────────
@@ -356,9 +400,9 @@ export class AgySdkProvider implements TransportProvider {
     attachments?: TransportAttachment[],
     extraSystemPrompt?: string,
   ): Promise<void> {
-    recordAgyQuotaActivity();
     const state = this.sessions.get(sessionId);
     if (!state) throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Session ${sessionId} not found`, false);
+    if (!state.incognito) recordAgyQuotaActivity();
     const generationBeforeProbe = state.cancelGeneration;
     await this.checkSessionCompaction(sessionId);
     if (this.sessions.get(sessionId) !== state || state.cancelGeneration !== generationBeforeProbe) {
@@ -620,11 +664,20 @@ export class AgySdkProvider implements TransportProvider {
 
   private ensureChild(sessionId: string, state: AgySessionState): ChildProcess {
     if (state.child && !state.child.killed && state.child.exitCode === null) return state.child;
+    if (state.incognito && !state.incognitoEnv) {
+      const sourceHome = state.sourceHome ?? resolveAgySourceHome(state.env, this.config?.env as Record<string, string> | undefined);
+      state.incognitoEnv = createAgyIncognitoEnvSync(sourceHome);
+      state.env = { ...(state.env ?? {}), ...state.incognitoEnv.env };
+    }
     const { executable, prependArgs } = this.resolveBinary();
-    const args = [...prependArgs, ...buildAgyArgs({ conversationId: state.conversationId, model: state.model })];
+    const args = [...prependArgs, ...buildAgyArgs({
+      conversationId: state.conversationId,
+      model: state.model,
+      extraFlags: state.incognitoEnv?.streamFlags,
+    })];
     const child = spawn(executable, args, {
       cwd: state.cwd,
-      env: this.spawnEnv(state.env, state.mcpEnv),
+      env: this.spawnEnv(state.env, state.incognito ? undefined : state.mcpEnv, state.incognitoEnv?.env),
       stdio: ['pipe', 'pipe', 'pipe'],
       // Own process group so killProcessTree can reap agy's tool subprocesses.
       detached: process.platform !== 'win32',
@@ -1068,8 +1121,10 @@ export class AgySdkProvider implements TransportProvider {
       },
     };
     for (const cb of this.completeCallbacks) cb(sessionId, message);
-    recordAgyQuotaActivity();
-    void refreshAgyQuotaMetadata().catch(() => {});
+    if (!state.incognito) {
+      recordAgyQuotaActivity();
+      void refreshAgyQuotaMetadata().catch(() => {});
+    }
   }
 
   // ── Emit helpers ───────────────────────────────────────────────────────────

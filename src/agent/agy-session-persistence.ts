@@ -1,5 +1,6 @@
 import { AGY_NATIVE_SESSION_STATE, AGY_SDK_PROVIDER_ID, AGY_NATIVE_START_NOT_ATTEMPTED } from '../../shared/agy-agent.js';
 import { PROVIDER_ERROR_CODES } from '../../shared/provider-error-codes.js';
+import { isIncognitoSession } from '../../shared/session-incognito-types.js';
 import { flushStore, getSession, upsertSession, listSessions, type SessionRecord } from '../store/session-store.js';
 
 export function agyNativeStartNotAttemptedError(message: string, code: string): Error {
@@ -24,6 +25,7 @@ export async function persistAgyNativeSessionStart(
     return record;
   };
   const record = current();
+  if (isIncognitoSession(record)) return;
   if (record.providerResumeId && listSessions().some((other) => other.name !== name
     && other.agentType === AGY_SDK_PROVIDER_ID && other.providerResumeId === record.providerResumeId)) {
     throw agyNativeStartNotAttemptedError('AG resume id belongs to another local session', PROVIDER_ERROR_CODES.CONFIG_ERROR);

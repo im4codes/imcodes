@@ -106,6 +106,10 @@ describe('NewSessionDialog & SessionControls incognito UI contracts (F3)', () =>
     const cliButton = view.container.querySelector('[data-agent-type="claude-code"]') as HTMLButtonElement | null;
     if (cliButton) expect(cliButton.disabled).toBe(true);
 
+    // Supported Antigravity SDK card ('agy-sdk') stays enabled in incognito mode
+    const agyButton = view.container.querySelector('[data-agent-type="agy-sdk"]') as HTMLButtonElement | null;
+    if (agyButton) expect(agyButton.disabled).toBe(false);
+
     const projectInput = view.container.querySelector('input[placeholder="my-project"]') as HTMLInputElement;
     fireEvent.input(projectInput, { target: { value: 'privproj' } });
 

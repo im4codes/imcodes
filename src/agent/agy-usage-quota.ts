@@ -22,6 +22,7 @@ import {
   AGY_USAGE_WINDOW_MINS,
 } from '../../shared/agy-usage.js';
 import { resolveAgyBinary } from './providers/agy-sdk.js';
+import { isIncognitoSession } from '../../shared/session-incognito-types.js';
 import { execFileOffMain } from '../util/exec-helper.js';
 import { imcodesStateDir, imcodesStatePath } from '../util/imcodes-state-dir.js';
 import logger from '../util/logger.js';
@@ -545,7 +546,7 @@ export async function refreshAgyQuotaMetadata(
   const { persistSessionRecord } = await import('./session-manager.js');
   const { providerQuotaMetaEquals } = await import('../../shared/provider-quota.js');
   for (const session of listSessions()) {
-    if (session.agentType !== 'agy-sdk') continue;
+    if (session.agentType !== 'agy-sdk' || isIncognitoSession(session)) continue;
     if (
       session.quotaLabel !== quota.quotaLabel
       || !providerQuotaMetaEquals(session.quotaMeta, quota.quotaMeta)

@@ -646,8 +646,8 @@
   "session": {
     "incognito": "无痕会话",
     "incognito_hint": "聊天仅保留在内存中，关闭或断线即清除，不写入记忆。禁用记忆工具；Agent 生成的项目文件仍会保留。",
-    "incognito_available": "目前仅支持 Claude SDK、Codex SDK 与 Pi。",
-    "incognito_unsupported": "无痕模式需要新版服务端、Daemon 与受支持的运行时（Claude SDK、Codex SDK 或 Pi）。其他运行时尚不能保证聊天不落盘。",
+    "incognito_available": "目前支持 Claude SDK、Codex SDK、Antigravity SDK 与 Pi。",
+    "incognito_unsupported": "无痕模式需要新版服务端、Daemon 与受支持的运行时（Claude SDK、Codex SDK、Antigravity SDK 或 Pi）。其他运行时尚不能保证聊天不落盘。",
     "restart": "↺ 重启",
     "restart_plain": "重启",
     "terminal_recovery_exhausted": "终端无法自动恢复。请重启后继续。",

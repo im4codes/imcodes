@@ -646,8 +646,8 @@
   "session": {
     "incognito": "Sesión de incógnito",
     "incognito_hint": "El historial solo permanece en memoria y se borra al cerrar o desconectar. Las herramientas de memoria están desactivadas. Los archivos del proyecto creados por el agente se conservan.",
-    "incognito_available": "Disponible para Claude SDK, Codex SDK y Pi.",
-    "incognito_unsupported": "Requiere servidor y daemon actualizados y un entorno compatible (Claude SDK, Codex SDK o Pi). Otros entornos no garantizan un historial privado.",
+    "incognito_available": "Disponible para Claude SDK, Codex SDK, Antigravity SDK y Pi.",
+    "incognito_unsupported": "Requiere servidor y daemon actualizados y un entorno compatible (Claude SDK, Codex SDK, Antigravity SDK o Pi). Otros entornos no garantizan un historial privado.",
     "restart": "↺ Reiniciar",
     "restart_plain": "Reiniciar",
     "terminal_recovery_exhausted": "El terminal no pudo recuperarse automáticamente. Reinícialo para continuar.",

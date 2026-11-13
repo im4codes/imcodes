@@ -67,6 +67,8 @@ export const AGY_CLI_FLAG = {
   MODEL: '--model',
   EFFORT: '--effort',
   ADD_DIR: '--add-dir',
+  DISABLE_TELEMETRY: '--disable-telemetry',
+  LOG_FILE: '--log-file',
   /** `-p` swallows the next argv as its prompt; the `=` form keeps the prompt empty and stdin-driven. */
   PRINT_STDIN: '--print=',
 } as const;

@@ -1,3 +1,5 @@
+import { AGY_SDK_PROVIDER_ID } from './agy-agent.js';
+
 /** Privacy intent is immutable for the lifetime of a session. Missing means normal. */
 export interface SessionIncognitoConfig {
   incognito?: boolean;
@@ -18,10 +20,10 @@ export function isIncognitoSession(value: unknown): boolean {
 }
 
 export const SESSION_INCOGNITO_SERVER_READY = 'session-incognito.ready';
-export const SESSION_INCOGNITO_UNSUPPORTED = 'Incognito requires a compatible server and daemon and a supported runtime (claude-code-sdk, codex-sdk, or pi).';
+export const SESSION_INCOGNITO_UNSUPPORTED = 'Incognito requires a compatible server and daemon and a supported runtime (claude-code-sdk, codex-sdk, pi, or agy-sdk).';
 export const SESSION_INCOGNITO_MEMORY_DISABLED = 'Memory tools are disabled in incognito sessions.';
 export const SESSION_INCOGNITO_AGENT_TYPE = 'claude-code-sdk';
-export const SESSION_INCOGNITO_AGENT_TYPES = [SESSION_INCOGNITO_AGENT_TYPE, 'codex-sdk', 'pi'] as const;
+export const SESSION_INCOGNITO_AGENT_TYPES = [SESSION_INCOGNITO_AGENT_TYPE, 'codex-sdk', 'pi', AGY_SDK_PROVIDER_ID] as const;
 export function supportsSessionIncognito(agentType: unknown): boolean {
   return typeof agentType === 'string' && (SESSION_INCOGNITO_AGENT_TYPES as readonly string[]).includes(agentType);
 }

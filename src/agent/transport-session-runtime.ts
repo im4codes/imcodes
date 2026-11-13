@@ -2739,7 +2739,9 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   async initialize(config: SessionConfig): Promise<void> {
     this.incognito = config.incognito === true;
-    config = withMemoryMcpSessionEnv({ ...config, providerId: this.provider.id });
+    config = this.incognito
+      ? { ...config, providerId: this.provider.id }
+      : withMemoryMcpSessionEnv({ ...config, providerId: this.provider.id });
     this._pendingHandoff = config.pendingHandoff ?? null;
     // When resuming/restoring an existing conversation, mark startup memory
     // injected BEFORE applyContextBootstrap runs so the bootstrap's
