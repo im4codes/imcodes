@@ -1,7 +1,8 @@
 import 'fake-indexeddb/auto';
 import { IDBFactory } from 'fake-indexeddb';
-import { beforeEach, describe, it, expect } from 'vitest';
-import { TimelineDB } from '../src/timeline-db.js';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
+import { IdbTimeoutError, runIdbTx, TimelineDB } from '../src/timeline-db.js';
+import { IDB_OPEN_TIMEOUT_MS, IDB_TX_TIMEOUT_MS } from '../../shared/scale-limits.js';
 import type { TimelineEvent } from '../src/ws-client.js';
 
 /**
@@ -424,6 +425,268 @@ describe('TimelineDB — real IndexedDB (fake-indexeddb)', () => {
     const row = got.find((e) => e.eventId === 'gone');
     expect(row?.hidden).toBe(true); // a cache reload must not bring the deleted message back
     expect(row?.payload.userDeleted).toBe(true);
+  });
+});
+
+describe('TimelineDB — timeout heartbeat, wedged stall abort & recovery', () => {
+  const realIndexedDB = globalThis.indexedDB;
+
+  beforeEach(() => {
+    globalThis.indexedDB = new IDBFactory();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    globalThis.indexedDB = realIndexedDB;
+  });
+
+  it('runIdbTx rejects with IdbTimeoutError, aborts the tx, and clears timers when stalled', async () => {
+    vi.useFakeTimers();
+    const abort = vi.fn();
+    const mockTx = { abort } as unknown as IDBTransaction;
+
+    const txPromise = runIdbTx<string>(() => mockTx, 'idb_stall_test', 1_000);
+    const rejection = expect(txPromise).rejects.toMatchObject({
+      name: 'IdbTimeoutError',
+      message: 'idb_stall_test',
+    });
+
+    await vi.advanceTimersByTimeAsync(999);
+    expect(abort).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    await rejection;
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('runIdbTx keeps extending the stall deadline across active touch() progress past timeoutMs', async () => {
+    vi.useFakeTimers();
+    const abort = vi.fn();
+    const mockTx = { abort } as unknown as IDBTransaction;
+
+    let step!: () => void;
+    let finish!: (v: string) => void;
+    const txPromise = runIdbTx<string>((resolve, _reject, touch) => {
+      step = touch;
+      finish = resolve;
+      return mockTx;
+    }, 'idb_active_test', 1_000);
+
+    // Total elapsed = 2_400ms (> 2x timeoutMs), with every step < 1_000ms apart.
+    for (let i = 0; i < 4; i += 1) {
+      await vi.advanceTimersByTimeAsync(600);
+      step();
+    }
+    expect(abort).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(600);
+    finish('completed');
+    await expect(txPromise).resolves.toBe('completed');
+    expect(abort).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('aborts a genuinely silent IDB open stall after IDB_OPEN_TIMEOUT_MS and recovers on resetAndReopen()', async () => {
+    vi.useFakeTimers();
+    const workingFactory = globalThis.indexedDB;
+    // Simulate Safari/WebKit suspend where open() never fires onsuccess/onerror/onblocked.
+    globalThis.indexedDB = {
+      open: vi.fn(() => ({} as IDBOpenDBRequest)),
+    } as unknown as IDBFactory;
+
+    const db = new TimelineDB();
+    const openPromise = db.open();
+
+    await vi.advanceTimersByTimeAsync(IDB_OPEN_TIMEOUT_MS - 1);
+    expect(db.memoryOnly).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await openPromise;
+    expect(db.memoryOnly).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+
+    // While in transient memoryOnly backoff, writes stay readable in memory.
+    await db.putEvents([ev('mem-1', 's', 1)]);
+    expect((await db.getRecentEvents('s', { limit: 10 })).map((e) => e.eventId)).toEqual(['mem-1']);
+
+    // Once IDB recovers and resetAndReopen() runs, real storage works and flushes fallback.
+    globalThis.indexedDB = workingFactory;
+    vi.useRealTimers();
+    const reopened = await db.resetAndReopen();
+    expect(reopened).not.toBeNull();
+    expect(db.memoryOnly).toBe(false);
+    expect((await new TimelineDB().getRecentEvents('s', { limit: 10 })).map((e) => e.eventId)).toEqual(['mem-1']);
+  });
+
+  it('aborts a wedged IDB transaction after IDB_TX_TIMEOUT_MS, degrades to memoryOnly, and recovers on resetAndReopen()', async () => {
+    const db = new TimelineDB();
+    await db.putEvents([ev('durable-1', 's', 1)]);
+    expect(db.memoryOnly).toBe(false);
+
+    vi.useFakeTimers();
+    const originalTx = IDBDatabase.prototype.transaction;
+    const wedgedAbort = vi.fn();
+    let wedgeNextTx = true;
+    IDBDatabase.prototype.transaction = function wedgedTransaction(
+      this: IDBDatabase,
+      ...args: Parameters<IDBDatabase['transaction']>
+    ) {
+      if (wedgeNextTx) {
+        wedgeNextTx = false;
+        const fakeReq = {} as IDBRequest;
+        const fakeIndex = {
+          getAll: () => fakeReq,
+          getAllKeys: () => fakeReq,
+          openCursor: () => fakeReq,
+        };
+        const fakeStore = {
+          index: () => fakeIndex,
+          getAll: () => fakeReq,
+          get: () => fakeReq,
+          put: () => fakeReq,
+          delete: () => fakeReq,
+        };
+        return {
+          objectStore: () => fakeStore,
+          abort: wedgedAbort,
+        } as unknown as IDBTransaction;
+      }
+      return originalTx.apply(this, args);
+    } as IDBDatabase['transaction'];
+
+    try {
+      const readPromise = db.getRecentEvents('s', { limit: 10 });
+      await vi.advanceTimersByTimeAsync(IDB_TX_TIMEOUT_MS);
+      const got = await readPromise;
+      expect(got).toEqual([]);
+      expect(wedgedAbort).toHaveBeenCalledTimes(1);
+      expect(db.memoryOnly).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      IDBDatabase.prototype.transaction = originalTx;
+      vi.useRealTimers();
+    }
+
+    const recovered = await db.resetAndReopen();
+    expect(recovered).not.toBeNull();
+    expect(db.memoryOnly).toBe(false);
+    expect((await db.getRecentEvents('s', { limit: 10 })).map((e) => e.eventId)).toEqual(['durable-1']);
+    expect(IdbTimeoutError).toBeDefined();
+  });
+
+  it('invalidates a wedged connection hit during drainLegacySignals and recovers cleanly', async () => {
+    const db = new TimelineDB();
+    await db.putEvents([ev('durable-before-drain', 's', 1)]);
+
+    vi.useFakeTimers();
+    const originalTx = IDBDatabase.prototype.transaction;
+    const wedgedAbort = vi.fn();
+    IDBDatabase.prototype.transaction = function wedgedDrainTx() {
+      const fakeReq = {} as IDBRequest;
+      return {
+        objectStore: () => ({
+          index: () => ({ openCursor: () => fakeReq }),
+        }),
+        abort: wedgedAbort,
+      } as unknown as IDBTransaction;
+    } as unknown as IDBDatabase['transaction'];
+
+    try {
+      const drainPromise = db.drainLegacySignals('s');
+      await vi.advanceTimersByTimeAsync(IDB_TX_TIMEOUT_MS);
+      await expect(drainPromise).resolves.toBeNull();
+      expect(wedgedAbort).toHaveBeenCalledTimes(1);
+      expect(db.memoryOnly).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      IDBDatabase.prototype.transaction = originalTx;
+      vi.useRealTimers();
+    }
+
+    await db.resetAndReopen();
+    expect(db.memoryOnly).toBe(false);
+    expect((await db.getRecentEvents('s', { limit: 10 })).map((e) => e.eventId)).toEqual(['durable-before-drain']);
+  });
+
+  it('keeps TimelineDB.getRecentEvents alive when slow cursor steps advance past IDB_TX_TIMEOUT_MS', async () => {
+    const db = new TimelineDB();
+    await db.open();
+
+    vi.useFakeTimers();
+    const rows = [ev('e3', 's', 3), ev('e2', 's', 2), ev('e1', 's', 1)];
+    const originalTx = IDBDatabase.prototype.transaction;
+    const abortSpy = vi.fn();
+
+    IDBDatabase.prototype.transaction = function slowSteppedReadTx(
+      this: IDBDatabase,
+      storeName: string | string[],
+    ) {
+      if (storeName === 'signals') {
+        const sigReq: {
+          result: TimelineEvent[];
+          error: null;
+          onsuccess: (() => void) | null;
+          onerror: (() => void) | null;
+        } = { result: [], error: null, onsuccess: null, onerror: null };
+        Promise.resolve().then(() => sigReq.onsuccess?.());
+        return {
+          abort: vi.fn(),
+          objectStore: () => ({ getAll: () => sigReq }),
+        } as unknown as IDBTransaction;
+      }
+      const req: {
+        result: unknown;
+        error: null;
+        onsuccess: (() => void) | null;
+        onerror: (() => void) | null;
+      } = { result: null, error: null, onsuccess: null, onerror: null };
+      let idx = 0;
+      const scheduleStep = (): void => {
+        setTimeout(() => {
+          if (idx < rows.length) {
+            req.result = {
+              value: rows[idx],
+              continue: () => {
+                idx += 1;
+                scheduleStep();
+              },
+            };
+          } else {
+            req.result = null;
+          }
+          req.onsuccess?.();
+        }, Math.floor(IDB_TX_TIMEOUT_MS * 0.6));
+      };
+      return {
+        abort: abortSpy,
+        objectStore: () => ({
+          index: () => ({
+            openCursor: () => {
+              scheduleStep();
+              return req;
+            },
+          }),
+        }),
+      } as unknown as IDBTransaction;
+    } as IDBDatabase['transaction'];
+
+    try {
+      const readPromise = db.getRecentEvents('s', { limit: 10 });
+      // 4 cursor callbacks * 0.6 * IDB_TX_TIMEOUT_MS = 2.4x single tx timeout!
+      for (let step = 0; step < 4; step += 1) {
+        await vi.advanceTimersByTimeAsync(Math.floor(IDB_TX_TIMEOUT_MS * 0.6));
+      }
+      const got = await readPromise;
+      expect(got.map((e) => e.eventId)).toEqual(['e1', 'e2', 'e3']);
+      expect(abortSpy).not.toHaveBeenCalled();
+      expect(db.memoryOnly).toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      IDBDatabase.prototype.transaction = originalTx;
+      vi.useRealTimers();
+    }
   });
 });
 

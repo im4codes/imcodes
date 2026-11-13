@@ -27,14 +27,16 @@ export const WATCH_RECENT_TEXT_CONCURRENCY = 20;
 export const SUBSESSION_BAR_MAX_EXPANDED_CARDS = 24;
 
 /**
- * Bounded IndexedDB open and transaction timeouts (ms). iOS/Safari WebKit and
- * suspended desktop tabs can leave IDB open/transaction requests pending
- * forever without firing `onsuccess`, `onerror`, `onblocked`, or `oncomplete`
- * across lock/sleep. Timing out and invalidating the connection lets callers
- * fall back cleanly and recover via `resetAndReopen()`.
+ * Bounded IndexedDB open and transaction inactivity timeouts (ms). iOS/Safari
+ * WebKit and suspended desktop tabs can leave IDB open/transaction requests
+ * pending forever without firing `onsuccess`, `onerror`, `onblocked`, or
+ * `oncomplete` across lock/sleep. `IDB_TX_TIMEOUT_MS` bounds stall time
+ * between progress heartbeats (`touch()`) so large legitimate batches are not
+ * aborted mid-flight while wedged transactions still fail fast and recover via
+ * `resetAndReopen()`.
  */
-export const IDB_OPEN_TIMEOUT_MS = 2_000;
-export const IDB_TX_TIMEOUT_MS = 2_000;
+export const IDB_OPEN_TIMEOUT_MS = 10_000;
+export const IDB_TX_TIMEOUT_MS = 8_000;
 
 /**
  * Wall-clock threshold (ms) after which an in-flight WebSocket ticket/connect
