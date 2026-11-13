@@ -86,7 +86,8 @@ import { ShareSessionDialog } from './components/ShareSessionDialog.js';
 import { ExternalDocShareSpace } from './components/DocShareDialog.js';
 import { SharedEntriesPanel } from './components/SharedEntriesPanel.js';
 import { MobileSharedEntriesMenu } from './components/MobileSharedEntriesMenu.js';
-import { MobileServerMenuToolbar } from './components/MobileServerMenuToolbar.js';
+import { MobileServerMenuToolbar, type MobileServerMenuTab } from './components/MobileServerMenuToolbar.js';
+import { MobileRemoteDesktopMenuList } from './components/MobileRemoteDesktopMenuList.js';
 import { SharedStateIndicator } from './components/SharedStateIndicator.js';
 import {
   KEYBOARD_SHORTCUTS_PREF_KEY,
@@ -1084,6 +1085,10 @@ function InternalMainApp() {
   const [manualDashboard, setManualDashboard] = useState(false);
   const autoEntryRunRef = useRef(0);
   const [showMobileServerMenu, setShowMobileServerMenu] = useState(false);
+  const [mobileServerMenuTab, setMobileServerMenuTab] = useState<MobileServerMenuTab>('servers');
+  useEffect(() => {
+    if (!showMobileServerMenu) setMobileServerMenuTab('servers');
+  }, [showMobileServerMenu]);
   const [showMobileFileBrowser, setShowMobileFileBrowser] = useState(false);
   const [showCloudDocs, setShowCloudDocs] = useState(false);
   const [desktopCloudDocsMaximized, setDesktopCloudDocsMaximized] = useState(false);
@@ -8203,7 +8208,13 @@ function InternalMainApp() {
               <div class="mobile-server-switcher-wrap">
                 <button
                   class="mobile-server-btn"
-                  onClick={() => setShowMobileServerMenu((o) => !o)}
+                  onClick={() => {
+                    setShowMobileServerMenu((o) => {
+                      const next = !o;
+                      if (next) setMobileServerMenuTab('servers');
+                      return next;
+                    });
+                  }}
                   title={resolvedSelectedServerName ?? 'Server'}
                 >
                   <span class="mobile-server-btn-icon" aria-hidden="true">☁</span>
@@ -8231,58 +8242,71 @@ function InternalMainApp() {
                         setShowMobileServerMenu(false);
                         openControlledNodes();
                       }}
+                      activeTab={mobileServerMenuTab}
+                      onTabChange={setMobileServerMenuTab}
                     />
-                    {unifiedServers.map((s) => {
-                      const presence = getServerPresence(s);
-                      const online = presence === 'online';
-                      const presenceColor = online ? '#4ade80' : presence === 'offline' ? '#475569' : '#94a3b8';
-                      const presenceSymbol = online ? '●' : presence === 'offline' ? '○' : '◌';
-                      const presenceLabel = online
-                        ? trans('server.online', { defaultValue: 'Online' })
-                        : presence === 'offline'
-                          ? trans('server.offline', { defaultValue: 'Offline' })
-                          : trans('server.status_unknown', { defaultValue: 'Status unknown' });
-                      return (
-                        <button
-                          key={s.id}
-                          class={`mobile-server-menu-item mobile-server-menu-server${s.id === selectedServerId ? ' active' : ''}${pinnedServerIds.has(s.id) ? ' pinned' : ''}${showSharedReturnGuide && s.id === sharedReturnServer?.id ? ' server-return-hint' : ''}`}
-                          onClick={() => { handleUnifiedServerSelect(s); setShowMobileServerMenu(false); }}
-                          onContextMenu={s.isSharedIn ? (e) => e.preventDefault() : (e) => {
-                            e.preventDefault();
-                            setShowMobileServerMenu(false);
-                            const ownedServer = s.server || servers.find((srv) => srv.id === s.id && ownedServerIdsRef.current.has(srv.id));
-                            if (ownedServer) setServerCtxMenu({ server: ownedServer as ServerInfo, x: e.clientX, y: e.clientY });
-                          }}
-                        >
-                          <span
-                            class={`mobile-server-menu-dot mobile-server-menu-dot-${presence}`}
-                            style={{ color: presenceColor }}
-                            title={presenceLabel}
-                            aria-label={presenceLabel}
-                          >
-                            {presenceSymbol}
-                          </span>
-                          <span class="mobile-server-menu-name">{s.name}</span>
-                          {s.isSharedIn ? (
-                            <SharedStateIndicator variant="shared-in" iconOnly />
-                          ) : (
-                            <SharedStateIndicator state={managedSharedServerStateById.get(s.id) ?? null} iconOnly variant="shared-out" />
-                          )}
-                        </button>
-                      );
-                    })}
-                    {(restrictedSharedEntries.length > 0 || sharedEntriesError !== null) && (
-                      <MobileSharedEntriesMenu
-                        entries={restrictedSharedEntries}
-                        loading={sharedEntriesLoading}
-                        error={sharedEntriesError}
-                        openingEntryId={openingSharedEntryId}
-                        onOpen={(entry) => {
-                          void handleOpenSharedEntry(entry);
+                    {mobileServerMenuTab === 'remote' ? (
+                      <MobileRemoteDesktopMenuList
+                        onSelect={(machine) => {
                           setShowMobileServerMenu(false);
+                          openRemoteDesktop(machine);
                         }}
-                        onRefresh={() => void refreshSharedEntries()}
                       />
+                    ) : (
+                      <>
+                        {unifiedServers.map((s) => {
+                          const presence = getServerPresence(s);
+                          const online = presence === 'online';
+                          const presenceColor = online ? '#4ade80' : presence === 'offline' ? '#475569' : '#94a3b8';
+                          const presenceSymbol = online ? '●' : presence === 'offline' ? '○' : '◌';
+                          const presenceLabel = online
+                            ? trans('server.online', { defaultValue: 'Online' })
+                            : presence === 'offline'
+                              ? trans('server.offline', { defaultValue: 'Offline' })
+                              : trans('server.status_unknown', { defaultValue: 'Status unknown' });
+                          return (
+                            <button
+                              key={s.id}
+                              class={`mobile-server-menu-item mobile-server-menu-server${s.id === selectedServerId ? ' active' : ''}${pinnedServerIds.has(s.id) ? ' pinned' : ''}${showSharedReturnGuide && s.id === sharedReturnServer?.id ? ' server-return-hint' : ''}`}
+                              onClick={() => { handleUnifiedServerSelect(s); setShowMobileServerMenu(false); }}
+                              onContextMenu={s.isSharedIn ? (e) => e.preventDefault() : (e) => {
+                                e.preventDefault();
+                                setShowMobileServerMenu(false);
+                                const ownedServer = s.server || servers.find((srv) => srv.id === s.id && ownedServerIdsRef.current.has(srv.id));
+                                if (ownedServer) setServerCtxMenu({ server: ownedServer as ServerInfo, x: e.clientX, y: e.clientY });
+                              }}
+                            >
+                              <span
+                                class={`mobile-server-menu-dot mobile-server-menu-dot-${presence}`}
+                                style={{ color: presenceColor }}
+                                title={presenceLabel}
+                                aria-label={presenceLabel}
+                              >
+                                {presenceSymbol}
+                              </span>
+                              <span class="mobile-server-menu-name">{s.name}</span>
+                              {s.isSharedIn ? (
+                                <SharedStateIndicator variant="shared-in" iconOnly />
+                              ) : (
+                                <SharedStateIndicator state={managedSharedServerStateById.get(s.id) ?? null} iconOnly variant="shared-out" />
+                              )}
+                            </button>
+                          );
+                        })}
+                        {(restrictedSharedEntries.length > 0 || sharedEntriesError !== null) && (
+                          <MobileSharedEntriesMenu
+                            entries={restrictedSharedEntries}
+                            loading={sharedEntriesLoading}
+                            error={sharedEntriesError}
+                            openingEntryId={openingSharedEntryId}
+                            onOpen={(entry) => {
+                              void handleOpenSharedEntry(entry);
+                              setShowMobileServerMenu(false);
+                            }}
+                            onRefresh={() => void refreshSharedEntries()}
+                          />
+                        )}
+                      </>
                     )}
                   </MobileServerMenu>
                   </>

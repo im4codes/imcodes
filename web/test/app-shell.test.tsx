@@ -3855,6 +3855,105 @@ describe('App shell', () => {
       }
     }, 30_000);
 
+    it('defaults mobile server dropdown to Servers on every open and connects direct remote desktop nodes from the Remote tab', async () => {
+      const originalUA = navigator.userAgent;
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+      const { __resetMachinesForTests } = await import('../src/hooks/useMachines.js');
+      const { REMOTE_DESKTOP_CAPABILITY } = await import('@shared/remote-desktop.js');
+      __resetMachinesForTests();
+      try {
+        seedLogin('srv-1');
+        installApi();
+        const prevImpl = apiFetchMock.getMockImplementation()!;
+        apiFetchMock.mockImplementation(async (path: string, init?: { signal?: AbortSignal }) => {
+          if (path === '/api/machines') {
+            return {
+              machines: [
+                {
+                  serverId: 'rd-win',
+                  nodeId: '1000000101',
+                  refName: 'win-desk',
+                  displayName: 'Studio Desktop',
+                  os: 'windows',
+                  online: true,
+                  execEnabled: true,
+                  accessRole: 'owner',
+                  capabilities: [REMOTE_DESKTOP_CAPABILITY],
+                },
+                {
+                  serverId: 'rd-off',
+                  nodeId: '1000000102',
+                  refName: 'off-box',
+                  displayName: 'Offline Laptop',
+                  os: 'macos',
+                  online: false,
+                  execEnabled: true,
+                  accessRole: 'owner',
+                  capabilities: [],
+                },
+              ],
+            };
+          }
+          return prevImpl(path, init);
+        });
+
+        const { App } = await importApp();
+        const view = render(<App />);
+        await expectActive('deck_alpha_brain');
+
+        // 1. Open menu -> Servers tab active by default, AI Desk on the left, 2 icon-only SVG tabs on the right
+        fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+        await waitFor(() => expect(view.container.querySelector('.mobile-server-menu')).toBeTruthy());
+        const serversTab = screen.getByTestId('mobile-menu-tab-servers');
+        const remoteTab = screen.getByTestId('mobile-menu-tab-remote');
+        expect(serversTab.getAttribute('aria-selected')).toBe('true');
+        expect(serversTab.querySelector('svg')).toBeTruthy();
+        expect((serversTab.textContent ?? '').trim()).toBe('');
+        expect(serversTab.getAttribute('aria-label')).toBeTruthy();
+        expect(remoteTab.getAttribute('aria-selected')).toBe('false');
+        expect(remoteTab.querySelector('svg')).toBeTruthy();
+        expect((remoteTab.textContent ?? '').trim()).toBe('');
+        expect(remoteTab.getAttribute('aria-label')).toBeTruthy();
+        expect(view.container.querySelectorAll('.mobile-server-menu .mobile-server-menu-server').length).toBeGreaterThan(0);
+
+        // 2. Switch to Remote tab, close via backdrop, reopen -> MUST reset back to Servers tab
+        fireEvent.click(screen.getByTestId('mobile-menu-tab-remote'));
+        await waitFor(() => expect(screen.getByTestId('mobile-menu-panel-remote')).toBeTruthy());
+        expect(screen.getByTestId('mobile-menu-tab-remote').getAttribute('aria-selected')).toBe('true');
+
+        fireEvent.click(view.container.querySelector('.mobile-server-backdrop')!);
+        await waitFor(() => expect(view.container.querySelector('.mobile-server-menu')).toBeNull());
+
+        fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+        await waitFor(() => expect(view.container.querySelector('.mobile-server-menu')).toBeTruthy());
+        expect(screen.getByTestId('mobile-menu-tab-servers').getAttribute('aria-selected')).toBe('true');
+        expect(screen.queryByTestId('mobile-menu-panel-remote')).toBeNull();
+
+        // 3. Switch to Remote tab, offline node does nothing, online eligible node opens Remote Desktop & closes dropdown
+        fireEvent.click(screen.getByTestId('mobile-menu-tab-remote'));
+        const offlineNode = await screen.findByTestId('mobile-remote-node-rd-off');
+        expect(offlineNode.getAttribute('aria-disabled')).toBe('true');
+        fireEvent.click(offlineNode);
+        expect(screen.queryByTestId('remote-desktop-workspace')).toBeNull();
+        expect(view.container.querySelector('.mobile-server-menu')).toBeTruthy();
+
+        const onlineNode = await screen.findByTestId('mobile-remote-node-rd-win');
+        expect(onlineNode.getAttribute('aria-disabled')).toBeNull();
+        fireEvent.click(onlineNode);
+        await waitFor(() => expect(screen.getByTestId('remote-desktop-workspace')).toBeTruthy());
+        expect(view.container.querySelector('.mobile-server-menu')).toBeNull();
+
+        // 4. Reopening dropdown after closing via node select ALSO resets to Servers tab
+        fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+        await waitFor(() => expect(view.container.querySelector('.mobile-server-menu')).toBeTruthy());
+        expect(screen.getByTestId('mobile-menu-tab-servers').getAttribute('aria-selected')).toBe('true');
+        expect(screen.getByTestId('mobile-menu-tab-remote').getAttribute('aria-selected')).toBe('false');
+      } finally {
+        __resetMachinesForTests();
+        Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUA });
+      }
+    }, 30_000);
+
     it('ignores delayed REST responses and closing WS events across rapid A -> B -> A switches', async () => {
       seedLogin('srv-2');
       let srv1RestCount = 0;

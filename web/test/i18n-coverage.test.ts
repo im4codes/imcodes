@@ -760,4 +760,48 @@ describe('generic i18n coverage guard', () => {
       }
     }
   });
+
+  it('keeps mobile_menu keys aligned across all 7 locales and translated outside English', () => {
+    const enMessages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales/en.json'), 'utf8')) as Record<string, any>;
+    const enKeys = Object.keys(enMessages.mobile_menu ?? {}).sort();
+    expect(enKeys).toEqual(
+      expect.arrayContaining(['home', 'change_server', 'switch_view', 'tab_servers', 'tab_remote', 'remote_connect', 'remote_connect_label', 'remote_unavailable']),
+    );
+
+    const usedKeys = new Set<string>();
+    for (const relPath of [
+      'src/components/MobileServerMenuToolbar.tsx',
+      'src/components/MobileRemoteDesktopMenuList.tsx',
+    ]) {
+      const content = readFileSync(join(WEB_ROOT, relPath), 'utf8');
+      for (const match of content.matchAll(/t\(['"](mobile_menu\.[^'"`]+)['"]/g)) {
+        usedKeys.add(match[1]!);
+      }
+    }
+    expect(usedKeys.size).toBeGreaterThan(0);
+
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as Record<string, any>;
+      const localeKeys = Object.keys(messages.mobile_menu ?? {}).sort();
+      expect(localeKeys, `${locale}:mobile_menu key parity`).toEqual(enKeys);
+
+      for (const fullKey of usedKeys) {
+        const val = readPath(messages, fullKey);
+        expect(val, `${locale}:${fullKey}`).toEqual(expect.any(String));
+        expect((val as string).trim().length, `${locale}:${fullKey}`).toBeGreaterThan(0);
+      }
+
+      if (locale !== 'en') {
+        expect(messages.mobile_menu.tab_servers, `${locale}:tab_servers translated`).not.toBe(
+          enMessages.mobile_menu.tab_servers,
+        );
+        expect(messages.mobile_menu.tab_remote, `${locale}:tab_remote translated`).not.toBe(
+          enMessages.mobile_menu.tab_remote,
+        );
+        expect(messages.mobile_menu.remote_connect, `${locale}:remote_connect translated`).not.toBe(
+          enMessages.mobile_menu.remote_connect,
+        );
+      }
+    }
+  });
 });

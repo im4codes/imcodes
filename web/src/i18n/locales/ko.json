@@ -1153,7 +1153,13 @@
   },
   "mobile_menu": {
     "home": "← 홈",
-    "change_server": "⇄ 클라우드 서버 전환"
+    "change_server": "⇄ 클라우드 서버 전환",
+    "switch_view": "목록 보기 전환",
+    "tab_servers": "서버",
+    "tab_remote": "원격",
+    "remote_connect": "연결",
+    "remote_connect_label": "원격 데스크톱 열기: {{name}}",
+    "remote_unavailable": "원격 데스크톱 사용 불가"
   },
   "quick_input": {
     "title": "빠른 입력",

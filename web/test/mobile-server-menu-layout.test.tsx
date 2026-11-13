@@ -123,15 +123,29 @@ describe('mobile server menu shared-entry reachability', () => {
     expect(onOpen).toHaveBeenCalledWith(entries[35]);
   });
 
-  it('compresses mobile server menu top-row: Home on left, Switch Cloud Server on right in native mode, AI Desk on row 2', () => {
+  it('compresses mobile server menu top-row and places AI Desk on the left with Servers | Remote tabs on the right', () => {
     const onClose = vi.fn();
     const onChangeServer = vi.fn();
     const onOpenControlledNodes = vi.fn();
-    const view = menu(vi.fn(), vi.fn(), onClose, {
-      isNative: true,
-      onChangeServer,
-      onOpenControlledNodes,
-    });
+    const onTabChange = vi.fn();
+    const view = render(
+      <div class="layout-mobile">
+        <div class="mobile-server-bar">
+          <div class="mobile-server-switcher-wrap">
+            <MobileServerMenu footer={<button>Language</button>}>
+              <MobileServerMenuToolbar
+                onHome={onClose}
+                onChangeServer={onChangeServer}
+                onOpenControlledNodes={onOpenControlledNodes}
+                activeTab="servers"
+                onTabChange={onTabChange}
+                isNativeApp={true}
+              />
+            </MobileServerMenu>
+          </div>
+        </div>
+      </div>,
+    );
 
     const topRow = view.container.querySelector('.mobile-server-menu-top-row')!;
     expect(topRow).toBeTruthy();
@@ -142,10 +156,33 @@ describe('mobile server menu shared-entry reachability', () => {
     expect(buttons[1].classList.contains('mobile-server-menu-change')).toBe(true);
     expect(buttons[1].textContent).toContain('Switch Cloud Server');
 
-    const aiDesk = view.container.querySelector('.mobile-server-menu-controlled-nodes')!;
+    const deskRow = view.container.querySelector('.mobile-server-menu-desk-row')!;
+    expect(deskRow).toBeTruthy();
+    expect(deskRow.previousElementSibling).toBe(topRow);
+
+    const aiDesk = deskRow.querySelector('.mobile-server-menu-controlled-nodes')!;
     expect(aiDesk).toBeTruthy();
     expect(aiDesk.textContent).toContain('AI Desk');
-    expect(aiDesk.previousElementSibling).toBe(topRow);
+
+    const tablist = deskRow.querySelector('[role="tablist"]')!;
+    expect(tablist).toBeTruthy();
+    expect(aiDesk.nextElementSibling).toBe(tablist);
+
+    const serversTab = screen.getByTestId('mobile-menu-tab-servers');
+    const remoteTab = screen.getByTestId('mobile-menu-tab-remote');
+    expect(serversTab.getAttribute('role')).toBe('tab');
+    expect(serversTab.getAttribute('aria-selected')).toBe('true');
+    expect(serversTab.getAttribute('aria-label')).toBe('Servers');
+    expect(serversTab.getAttribute('title')).toBe('Servers');
+    expect(serversTab.querySelector('svg')).toBeTruthy();
+    expect((serversTab.textContent ?? '').trim()).toBe('');
+
+    expect(remoteTab.getAttribute('role')).toBe('tab');
+    expect(remoteTab.getAttribute('aria-selected')).toBe('false');
+    expect(remoteTab.getAttribute('aria-label')).toBe('Remote');
+    expect(remoteTab.getAttribute('title')).toBe('Remote');
+    expect(remoteTab.querySelector('svg')).toBeTruthy();
+    expect((remoteTab.textContent ?? '').trim()).toBe('');
 
     fireEvent.click(buttons[0]);
     expect(onClose).toHaveBeenCalledOnce();
@@ -155,9 +192,15 @@ describe('mobile server menu shared-entry reachability', () => {
 
     fireEvent.click(aiDesk);
     expect(onOpenControlledNodes).toHaveBeenCalledOnce();
+
+    fireEvent.click(remoteTab);
+    expect(onTabChange).toHaveBeenCalledWith('remote');
+
+    fireEvent.click(serversTab);
+    expect(onTabChange).toHaveBeenCalledWith('servers');
   });
 
-  it('suppresses Switch Cloud Server button in non-native web mode while retaining Home and AI Desk', () => {
+  it('suppresses Switch Cloud Server button in non-native web mode while retaining Home, AI Desk, and menu tabs', () => {
     const view = menu(vi.fn(), vi.fn(), vi.fn(), {
       isNative: false,
     });
@@ -167,9 +210,12 @@ describe('mobile server menu shared-entry reachability', () => {
     expect(topRow.querySelector('.mobile-server-menu-home')).toBeTruthy();
     expect(topRow.querySelector('.mobile-server-menu-change')).toBeNull();
 
-    const aiDesk = view.container.querySelector('.mobile-server-menu-controlled-nodes')!;
-    expect(aiDesk).toBeTruthy();
-    expect(aiDesk.previousElementSibling).toBe(topRow);
+    const deskRow = view.container.querySelector('.mobile-server-menu-desk-row')!;
+    expect(deskRow).toBeTruthy();
+    expect(deskRow.previousElementSibling).toBe(topRow);
+    expect(deskRow.querySelector('.mobile-server-menu-controlled-nodes')).toBeTruthy();
+    expect(deskRow.querySelector('[data-testid="mobile-menu-tab-servers"]')?.getAttribute('aria-selected')).toBe('true');
+    expect(deskRow.querySelector('[data-testid="mobile-menu-tab-remote"]')?.getAttribute('aria-selected')).toBe('false');
   });
 
   it('renders authoritative online (●), offline (○), and unknown (◌) dots with consistent color coding across owned and shared servers', () => {
@@ -231,7 +277,7 @@ describe('mobile server menu shared-entry reachability', () => {
     }
   });
 
-  it('bounds mobile server menu top-row at 320px and 390px across all 7 locales with zero horizontal overflow in chromium', { timeout: 30000 }, async () => {
+  it('bounds mobile server menu top-row and AI Desk + tabs row at 320px and 390px across all 7 locales with zero horizontal overflow in chromium', { timeout: 30000 }, async () => {
     const browserType = (require('playwright') as typeof import('playwright')).chromium;
     if (!require('node:fs').existsSync(browserType.executablePath())) {
       return;
@@ -244,6 +290,8 @@ describe('mobile server menu shared-entry reachability', () => {
         const homeText = localeJson.mobile_menu?.home ?? '← Home';
         const changeText = localeJson.mobile_menu?.change_server ?? '⇄ Switch Cloud Server';
         const aiDeskText = localeJson.controlled_nodes?.title ?? 'AI Desk';
+        const tabServersText = localeJson.mobile_menu?.tab_servers ?? 'Servers';
+        const tabRemoteText = localeJson.mobile_menu?.tab_remote ?? 'Remote';
 
         for (const viewport of [{ width: 320, height: 640 }, { width: 390, height: 844 }]) {
           const page = await browser.newPage({ viewport, hasTouch: true });
@@ -256,9 +304,19 @@ describe('mobile server menu shared-entry reachability', () => {
                       <button type="button" class="mobile-server-menu-item mobile-server-menu-home">${homeText}</button>
                       <button type="button" class="mobile-server-menu-item mobile-server-menu-change" title="${changeText}">${changeText}</button>
                     </div>
-                    <button type="button" class="mobile-server-menu-item mobile-server-menu-controlled-nodes">
-                      <span>🖥</span><span>${aiDeskText}</span>
-                    </button>
+                    <div class="mobile-server-menu-desk-row">
+                      <button type="button" class="mobile-server-menu-item mobile-server-menu-controlled-nodes">
+                        <span>🖥</span><span>${aiDeskText}</span>
+                      </button>
+                      <div class="mobile-server-menu-tabs" role="tablist">
+                        <button type="button" role="tab" aria-selected="true" aria-label="${tabServersText}" title="${tabServersText}" class="mobile-server-menu-tab mobile-server-menu-tab-servers active">
+                          <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><rect x="3" y="4" width="18" height="6" rx="1.5" /></svg>
+                        </button>
+                        <button type="button" role="tab" aria-selected="false" aria-label="${tabRemoteText}" title="${tabRemoteText}" class="mobile-server-menu-tab mobile-server-menu-tab-remote">
+                          <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><rect x="2.5" y="3.5" width="19" height="13" rx="2" /></svg>
+                        </button>
+                      </div>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -269,23 +327,34 @@ describe('mobile server menu shared-entry reachability', () => {
           const metrics = await page.evaluate(() => {
             const menu = document.querySelector('.mobile-server-menu')!;
             const topRow = document.querySelector('.mobile-server-menu-top-row')!;
+            const deskRow = document.querySelector('.mobile-server-menu-desk-row')!;
             const home = document.querySelector('.mobile-server-menu-home')!;
             const change = document.querySelector('.mobile-server-menu-change')!;
+            const aiDesk = document.querySelector('.mobile-server-menu-controlled-nodes')!;
+            const tabRemote = document.querySelector('.mobile-server-menu-tab-remote')!;
             return {
               menuOverflow: menu.scrollWidth - menu.clientWidth,
               topRowOverflow: topRow.scrollWidth - topRow.clientWidth,
+              deskRowOverflow: deskRow.scrollWidth - deskRow.clientWidth,
               menuRight: menu.getBoundingClientRect().right,
               changeRight: change.getBoundingClientRect().right,
+              remoteTabRight: tabRemote.getBoundingClientRect().right,
               homeVisible: home.getBoundingClientRect().width > 0,
               changeVisible: change.getBoundingClientRect().width > 0,
+              aiDeskVisible: aiDesk.getBoundingClientRect().width > 0,
+              remoteTabVisible: tabRemote.getBoundingClientRect().width > 0,
             };
           });
 
           expect(metrics.menuOverflow, `${loc} at ${viewport.width}px menu horizontal overflow`).toBeLessThanOrEqual(1);
           expect(metrics.topRowOverflow, `${loc} at ${viewport.width}px top-row horizontal overflow`).toBeLessThanOrEqual(1);
+          expect(metrics.deskRowOverflow, `${loc} at ${viewport.width}px desk-row horizontal overflow`).toBeLessThanOrEqual(1);
           expect(metrics.changeRight, `${loc} at ${viewport.width}px change button right edge`).toBeLessThanOrEqual(metrics.menuRight + 1);
+          expect(metrics.remoteTabRight, `${loc} at ${viewport.width}px remote tab right edge`).toBeLessThanOrEqual(metrics.menuRight + 1);
           expect(metrics.homeVisible).toBe(true);
           expect(metrics.changeVisible).toBe(true);
+          expect(metrics.aiDeskVisible).toBe(true);
+          expect(metrics.remoteTabVisible).toBe(true);
 
           await page.close();
         }

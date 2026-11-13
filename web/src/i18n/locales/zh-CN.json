@@ -1153,7 +1153,13 @@
   },
   "mobile_menu": {
     "home": "← 首页",
-    "change_server": "⇄ 切换云服务器"
+    "change_server": "⇄ 切换云服务器",
+    "switch_view": "切换列表视图",
+    "tab_servers": "服务器",
+    "tab_remote": "远桌",
+    "remote_connect": "连接",
+    "remote_connect_label": "连接远程桌面：{{name}}",
+    "remote_unavailable": "远程桌面不可用"
   },
   "quick_input": {
     "title": "快捷输入",

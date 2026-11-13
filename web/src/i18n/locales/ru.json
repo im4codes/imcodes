@@ -1153,7 +1153,13 @@
   },
   "mobile_menu": {
     "home": "← Главная",
-    "change_server": "⇄ Сменить облачный сервер"
+    "change_server": "⇄ Сменить облачный сервер",
+    "switch_view": "Переключить вид",
+    "tab_servers": "Серверы",
+    "tab_remote": "Удалённо",
+    "remote_connect": "Подкл.",
+    "remote_connect_label": "Открыть удалённый рабочий стол: {{name}}",
+    "remote_unavailable": "Удалённый рабочий стол недоступен"
   },
   "quick_input": {
     "title": "Быстрый ввод",

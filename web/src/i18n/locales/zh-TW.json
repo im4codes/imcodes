@@ -1153,7 +1153,13 @@
   },
   "mobile_menu": {
     "home": "← 首頁",
-    "change_server": "⇄ 切換雲端伺服器"
+    "change_server": "⇄ 切換雲端伺服器",
+    "switch_view": "切換列表檢視",
+    "tab_servers": "伺服器",
+    "tab_remote": "遠桌",
+    "remote_connect": "連線",
+    "remote_connect_label": "連線遠端桌面：{{name}}",
+    "remote_unavailable": "遠端桌面無法使用"
   },
   "quick_input": {
     "title": "快速輸入",

@@ -1153,7 +1153,13 @@
   },
   "mobile_menu": {
     "home": "← Home",
-    "change_server": "⇄ Switch Cloud Server"
+    "change_server": "⇄ Switch Cloud Server",
+    "switch_view": "Menu view",
+    "tab_servers": "Servers",
+    "tab_remote": "Remote",
+    "remote_connect": "Connect",
+    "remote_connect_label": "Open remote desktop: {{name}}",
+    "remote_unavailable": "Remote desktop unavailable"
   },
   "quick_input": {
     "title": "Quick input",

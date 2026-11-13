@@ -1153,7 +1153,13 @@
   },
   "mobile_menu": {
     "home": "← Inicio",
-    "change_server": "⇄ Cambiar servidor en la nube"
+    "change_server": "⇄ Cambiar servidor en la nube",
+    "switch_view": "Vista del menú",
+    "tab_servers": "Servidores",
+    "tab_remote": "Remoto",
+    "remote_connect": "Conectar",
+    "remote_connect_label": "Abrir escritorio remoto: {{name}}",
+    "remote_unavailable": "Escritorio remoto no disponible"
   },
   "quick_input": {
     "title": "Entrada rápida",
