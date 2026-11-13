@@ -4962,7 +4962,8 @@
     "fullscreen": "Pantalla completa",
     "exit_fullscreen": "Salir de pantalla completa",
     "unsupported_local_format": "La vista previa local no está disponible para este formato",
-    "open_in_onlyoffice": "ONLYOFFICE"
+    "open_in_onlyoffice": "ONLYOFFICE",
+    "unavailable": "La vista previa del documento no está disponible actualmente"
   },
   "doc_share": {
     "share_btn": "Compartir",

@@ -4961,7 +4961,8 @@
     "fullscreen": "全画面",
     "exit_fullscreen": "全画面終了",
     "unsupported_local_format": "この形式はローカルプレビューに対応していません",
-    "open_in_onlyoffice": "ONLYOFFICE"
+    "open_in_onlyoffice": "ONLYOFFICE",
+    "unavailable": "現在、ドキュメントのプレビューを表示できません"
   },
   "doc_share": {
     "share_btn": "共有",

@@ -4961,7 +4961,8 @@
     "fullscreen": "전체 화면",
     "exit_fullscreen": "전체 화면 종료",
     "unsupported_local_format": "이 형식은 로컬 미리보기를 지원하지 않습니다",
-    "open_in_onlyoffice": "ONLYOFFICE"
+    "open_in_onlyoffice": "ONLYOFFICE",
+    "unavailable": "현재 문서 미리보기를 사용할 수 없습니다"
   },
   "doc_share": {
     "share_btn": "공유",

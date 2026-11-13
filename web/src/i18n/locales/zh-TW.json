@@ -4962,7 +4962,8 @@
     "fullscreen": "全螢幕",
     "exit_fullscreen": "離開全螢幕",
     "unsupported_local_format": "目前格式暫不支援本地預覽",
-    "open_in_onlyoffice": "ONLYOFFICE 表格"
+    "open_in_onlyoffice": "ONLYOFFICE 表格",
+    "unavailable": "目前無法預覽此文件"
   },
   "doc_share": {
     "share_btn": "共用權限",

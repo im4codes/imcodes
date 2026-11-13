@@ -27,25 +27,30 @@ describe('cloud_docs i18n translations across all 7 locales', () => {
       loc,
       JSON.parse(readFileSync(resolve(localesDir, `${loc}.json`), 'utf8')) as {
         cloud_docs?: Record<string, unknown>;
+        office_preview?: Record<string, unknown>;
       },
     ]),
   );
 
   const enLeaves = flattenLeafStrings(loaded.en.cloud_docs);
   const enKeys = Object.keys(enLeaves).sort();
+  const enOfficeLeaves = flattenLeafStrings(loaded.en.office_preview);
+  const enOfficeKeys = Object.keys(enOfficeLeaves).sort();
 
-  it('defines non-empty cloud_docs keys in en.json including share & shared keys', () => {
+  it('defines non-empty cloud_docs and new office_preview error keys in en.json', () => {
     expect(enKeys.length).toBeGreaterThan(30);
     expect(enLeaves['title']).toBeTruthy();
     expect(enLeaves['tabs.shared']).toBeTruthy();
     expect(enLeaves['actions.share']).toBeTruthy();
     expect(enLeaves['share.mode_team']).toBeTruthy();
     expect(enLeaves['share.allow_download']).toBeTruthy();
+    expect(enLeaves['errors.server_offline']?.trim().length).toBeGreaterThan(0);
+    expect(enOfficeLeaves['unavailable']?.trim().length).toBeGreaterThan(0);
   });
 
   for (const locale of LOCALES) {
     if (locale === 'en') continue;
-    it(`has exact cloud_docs key parity and localized strings in ${locale}.json`, () => {
+    it(`has exact cloud_docs and office_preview key parity and localized strings in ${locale}.json`, () => {
       const leaves = flattenLeafStrings(loaded[locale].cloud_docs);
       const keys = Object.keys(leaves).sort();
       expect(keys).toEqual(enKeys);
@@ -58,8 +63,14 @@ describe('cloud_docs i18n translations across all 7 locales', () => {
           untranslatedCount++;
         }
       }
+      expect(leaves['errors.server_offline']).not.toBe(enLeaves['errors.server_offline']);
       // Every non-English locale should translate the vast majority of strings (no bulk English copy).
       expect(untranslatedCount).toBeLessThanOrEqual(1);
+
+      const officeLeaves = flattenLeafStrings(loaded[locale].office_preview);
+      expect(Object.keys(officeLeaves).sort()).toEqual(enOfficeKeys);
+      expect(officeLeaves['unavailable']?.trim().length).toBeGreaterThan(0);
+      expect(officeLeaves['unavailable']).not.toBe(enOfficeLeaves['unavailable']);
     });
   }
 });

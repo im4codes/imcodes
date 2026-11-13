@@ -4972,7 +4972,8 @@
     "fullscreen": "Fullscreen",
     "exit_fullscreen": "Exit Fullscreen",
     "unsupported_local_format": "Local preview is not available for this format",
-    "open_in_onlyoffice": "ONLYOFFICE"
+    "open_in_onlyoffice": "ONLYOFFICE",
+    "unavailable": "Document preview is currently unavailable"
   },
   "doc_share": {
     "share_btn": "Share",

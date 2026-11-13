@@ -1,13 +1,20 @@
 /**
  * @vitest-environment jsdom
  */
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+const i18nMockState = vi.hoisted(() => ({
+  overrides: null as Record<string, string> | null,
+}));
+
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
-    t: (key: string, fallback?: string) => (typeof fallback === 'string' ? fallback : key),
-    i18n: { language: 'en' },
+    t: (key: string, fallback?: string) => i18nMockState.overrides?.[key] ?? (typeof fallback === 'string' ? fallback : key),
+    i18n: { language: i18nMockState.overrides ? 'zh-CN' : 'en' },
   }),
 }));
 
@@ -652,7 +659,12 @@ describe('OfficePreview config failure classification and isolation', () => {
     xlsxApi.html = '<table><tr><td>unavailable-office-local-cell</td></tr></table>';
     pdfjsApi.getDocument.mockReturnValue({ promise: Promise.resolve({ numPages: 0, getPage: vi.fn() }) });
   });
-  afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+  afterEach(() => {
+    i18nMockState.overrides = null;
+    cleanup();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
 
   async function rejectConfig(status: number | null, body = 'not_found') {
     const api = await import('../../src/api.js');
@@ -759,7 +771,12 @@ describe('OfficePreview fallback document transitions', () => {
     vi.resetModules(); vi.clearAllMocks();
     xlsxApi.html = '<table><tr><td>allowed-old-document</td></tr></table>';
   });
-  afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+  afterEach(() => {
+    i18nMockState.overrides = null;
+    cleanup();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
   it('rechecks permissions before fetching a new source after an earlier 404 fallback', async () => {
     const api = await import('../../src/api.js');
     const deny = deferred<never>();
@@ -846,5 +863,50 @@ describe('OfficePreview fallback document transitions', () => {
     );
     await waitFor(() => expect(mintSpy).toHaveBeenCalledWith('cdoc-local', true));
     await waitFor(() => expect(view.container.textContent).toContain('allowed-old-document'));
+  });
+
+  it('uses localized office_preview.unavailable instead of English fallback for empty config errors and disabled no-URL responses', async () => {
+    const testDir = dirname(fileURLToPath(import.meta.url));
+    const zhCn = JSON.parse(readFileSync(resolve(testDir, '../../src/i18n/locales/zh-CN.json'), 'utf8')) as {
+      office_preview: { unavailable: string };
+    };
+    expect(zhCn.office_preview.unavailable).toBeTruthy();
+    i18nMockState.overrides = {
+      'office_preview.unavailable': zhCn.office_preview.unavailable,
+    };
+
+    const api = await import('../../src/api.js');
+    vi.spyOn(api, 'fetchOnlyOfficeConfig').mockRejectedValueOnce(new Error(''));
+
+    const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
+    const view = render(
+      <OfficePreview
+        serverId="srv-empty-err"
+        path="/repo/empty.xlsx"
+        mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      />,
+    );
+
+    await waitFor(() => expect(view.getByTestId('office-preview-unavailable')).toBeTruthy());
+    expect(view.getByTestId('office-preview-unavailable').textContent).toContain(zhCn.office_preview.unavailable);
+    expect(view.getByTestId('office-preview-unavailable').textContent).not.toContain('Preview service unavailable');
+    expect(view.getByTestId('office-preview-unavailable').textContent).not.toContain('Document preview is currently unavailable');
+
+    vi.spyOn(api, 'fetchCloudDocOnlyOfficeConfig').mockResolvedValueOnce({
+      enabled: false,
+      allowDownload: false,
+    } as unknown as Awaited<ReturnType<typeof api.fetchCloudDocOnlyOfficeConfig>>);
+
+    view.rerender(
+      <OfficePreview
+        cloudDocId="cdoc-disabled-nodl"
+        path="Disabled.xlsx"
+        mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      />,
+    );
+
+    await waitFor(() => expect(view.getByTestId('office-preview-unavailable')).toBeTruthy());
+    expect(view.getByTestId('office-preview-unavailable').textContent).toContain(zhCn.office_preview.unavailable);
+    expect(view.getByTestId('office-preview-unavailable').textContent).not.toContain('Document preview is currently unavailable');
   });
 });

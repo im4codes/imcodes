@@ -712,7 +712,7 @@ function OfficePreviewDocument({
           });
           return;
         }
-        setOoConfigError(msg || 'Preview service unavailable');
+        setOoConfigError(msg || null);
         // A missing/disabled ONLYOFFICE route is not a document permission
         // denial. Fall back on 404 as on 5xx/network errors; the authenticated
         // document download still enforces its own access checks. Structured

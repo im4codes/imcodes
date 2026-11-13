@@ -4961,7 +4961,8 @@
     "fullscreen": "На весь экран",
     "exit_fullscreen": "Выйти из полноэкранного режима",
     "unsupported_local_format": "Локальный предварительный просмотр недоступен для этого формата",
-    "open_in_onlyoffice": "ONLYOFFICE"
+    "open_in_onlyoffice": "ONLYOFFICE",
+    "unavailable": "Предварительный просмотр документа сейчас недоступен"
   },
   "doc_share": {
     "share_btn": "Доступ",
