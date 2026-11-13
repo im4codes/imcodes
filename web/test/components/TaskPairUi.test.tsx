@@ -1613,50 +1613,29 @@ describe('TaskPairEventChip status colours', () => {
 describe('TaskPairSettingsSection', () => {
   afterEach(() => cleanup());
 
-  it('edits engine and limit starting from the defaults', () => {
+  it('retires the supervision engine selector and edits max parallel pairs from default 5', () => {
     let value: TaskPairSettingsValue = {};
     const onChange = vi.fn((next: TaskPairSettingsValue) => { value = next; });
     render(<TaskPairSettingsSection value={value} onChange={onChange} />);
-    // An unconfigured project is inert (owner decision, 2026-09-26), not
-    // 'pairs' -- the select must show that truthfully, or choosing 'pairs'
-    // fires no input event because it already matches the shown value.
-    expect((screen.getByTestId('task-pair-engine') as HTMLSelectElement).value).toBe('');
+    expect(screen.queryByTestId('task-pair-engine')).toBeNull();
     expect((screen.getByTestId('task-pair-max-concurrency') as HTMLInputElement).value).toBe('5');
-    // Who does executor/auditor work is not configured here -- it is the
-    // execution pool's per-entry role, in SessionSettingsDialog's pool editor.
     expect(screen.queryByTestId(/task-pair-allowlist-row-/)).toBeNull();
 
-    const engine = screen.getByTestId('task-pair-engine') as HTMLSelectElement;
-    expect([...engine.options].map((option) => option.value)).not.toContain('legacy');
     fireEvent.input(screen.getByTestId('task-pair-max-concurrency'), { target: { value: '8' } });
     expect(value.pairMaxConcurrency).toBe(8);
   });
 
-  it('renders a stored legacy value as inert unset without offering it again', () => {
-    render(<TaskPairSettingsSection value={{ pairEngine: 'legacy' }} onChange={vi.fn()} />);
-    const engine = screen.getByTestId('task-pair-engine') as HTMLSelectElement;
-    expect(engine.value).toBe('');
-    expect([...engine.options].map((option) => option.value)).not.toContain('legacy');
-  });
+  it('transparently preserves hidden pairEngine values when updating max parallel pairs', () => {
+    for (const persistedEngine of ['pairs', 'legacy'] as const) {
+      cleanup();
+      let value: TaskPairSettingsValue = { pairEngine: persistedEngine, pairMaxConcurrency: 3 };
+      const onChange = vi.fn((next: TaskPairSettingsValue) => { value = next; });
+      render(<TaskPairSettingsSection value={value} onChange={onChange} />);
+      expect(screen.queryByTestId('task-pair-engine')).toBeNull();
 
-  it('lets the user opt an unconfigured project into pairs, and back out to not-enabled', () => {
-    let value: TaskPairSettingsValue = {};
-    const onChange = vi.fn((next: TaskPairSettingsValue) => { value = next; });
-    const view = render(<TaskPairSettingsSection value={value} onChange={onChange} />);
-    const engine = screen.getByTestId('task-pair-engine') as HTMLSelectElement;
-    expect(engine.value).toBe('');
-
-    engine.value = 'pairs';
-    fireEvent.input(engine);
-    expect(onChange).toHaveBeenCalled();
-    expect(value.pairEngine).toBe('pairs');
-
-    view.rerender(<TaskPairSettingsSection value={value} onChange={onChange} />);
-    const reselected = screen.getByTestId('task-pair-engine') as HTMLSelectElement;
-    expect(reselected.value).toBe('pairs');
-    reselected.value = '';
-    fireEvent.input(reselected);
-    expect(value.pairEngine).toBeUndefined();
+      fireEvent.input(screen.getByTestId('task-pair-max-concurrency'), { target: { value: '6' } });
+      expect(onChange).toHaveBeenCalledWith({ pairEngine: persistedEngine, pairMaxConcurrency: 6 });
+    }
   });
 });
 

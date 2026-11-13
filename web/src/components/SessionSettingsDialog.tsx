@@ -9,7 +9,6 @@ import { patchSession, patchSubSession } from '../api.js';
 import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
 import { readCachedTransportModels, supportsDynamicTransportModels, useTransportModels } from '../hooks/useTransportModels.js';
 import type { WsClient } from '../ws-client.js';
-import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, SESSION_AGENT_TYPES, TRANSPORT_SESSION_AGENT_TYPES, getSessionRuntimeType, type SessionAgentType } from '@shared/agent-types.js';
 import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
@@ -18,38 +17,19 @@ import { isDelegationReplyCapableAgentType } from '@shared/agent-delegation.js';
 import type { SharedContextRuntimeBackend } from '@shared/context-types.js';
 import {
   doesSharedContextBackendSupportPresets,
-  isKnownSharedContextModelForBackend,
   normalizeSharedContextRuntimeBackend,
 } from '@shared/shared-context-runtime-config.js';
 import {
-  CC_PRESET_MSG,
-  getCcPresetAvailableModelIds,
-} from '@shared/cc-presets.js';
-import {
-  DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
-  DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
   buildTransportConfigWithSupervision,
-  DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS,
-  DEFAULT_SUPERVISION_MAX_PARSE_RETRIES,
-  DEFAULT_SUPERVISION_TIMEOUT_MS,
-  getSupportedSupervisionBackendOptions,
-  getSupervisionModelOptions,
   hasInvalidSessionSupervisionSnapshot,
   isSupportedSupervisionBackend,
-  mergeSupervisionCustomInstructions,
   normalizeSupervisorDefaultConfig,
   readSupervisionSnapshotFromTransportConfig,
   resolveSupervisionAuditBlockingSeverities,
-  resolveSupervisionModelForBackend,
-  SUPERVISION_PROMPT_VERSION,
-  SUPERVISION_REPAIR_PROMPT_VERSION,
   SUPERVISION_MODE,
-  SUPERVISION_MODES,
-  SUPERVISION_MIN_TIMEOUT_MS,
-  TASK_RUN_PROMPT_VERSION,
+  type SessionSupervisionSnapshot,
   type SupervisionMode,
 } from '@shared/supervision-config.js';
-import type { TaskPairEngine } from '@shared/task-pair.js';
 import { TaskPairSettingsSection } from './TaskPairSettingsSection.js';
 import {
   buildSupervisionExecutionCapabilityId,
@@ -71,10 +51,6 @@ import {
 import {
   type SessionSettingsOpenIntent,
 } from '../session-settings-open-intent.js';
-import {
-  RuntimeModelPresetSelector,
-  type RuntimeModelPresetEntry,
-} from './RuntimeModelPresetSelector.js';
 import { AGY_MODEL_IDS, CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, mergeModelSuggestions } from '../../../src/shared/models/options.js';
 import { getKnownQwenModelOptions } from '@shared/qwen-models.js';
 import { SessionIdentityTabs } from './SessionIdentityTabs.js';
@@ -152,59 +128,24 @@ export interface PeerAuditSettingsSession {
   ownerCatalog?: true;
 }
 
-type SupervisionDraft = {
+type SupervisionDraft = Partial<SessionSupervisionSnapshot> & {
   mode: SupervisionMode;
+};
+
+type SupervisionRuntimeDraft = {
   backend?: SharedContextRuntimeBackend;
   model?: string;
-  /**
-   * Optional preset name — only meaningful when
-   * `doesSharedContextBackendSupportPresets(backend)` returns true. The daemon broker routes the supervisor session
-   * through the preset's env bundle when set.
-   */
   preset?: string;
   timeoutMs?: number;
   promptVersion?: string;
   customInstructions?: string;
-  /**
-   * Session-level switch. When `true`, only the session `customInstructions`
-   * is sent to the supervisor; the global value is ignored for this session.
-   * When `false` (or missing), the daemon merges global + session.
-   */
-  customInstructionsOverride?: boolean;
-  maxParseRetries?: number;
   maxAutoContinueStreak?: number;
   maxAutoContinueTotal?: number;
-  maxAuditLoops?: number;
-  auditBlockingSeverities?: AuditSeverity[];
-  taskRunPromptVersion?: string;
-  pairEngine?: TaskPairEngine;
-  pairMaxConcurrency?: number;
-};
-
-// Account-level automatic-supervision runtime. Sessions can still customize
-// mode, audit target, limits and instructions, but never own a separate model.
-type SupervisionRuntimeDraft = Pick<
-  SupervisionDraft,
-  'backend' | 'model' | 'preset' | 'timeoutMs' | 'promptVersion' | 'customInstructions' | 'maxAutoContinueStreak' | 'maxAutoContinueTotal'
-> & {
   backupBackend?: SharedContextRuntimeBackend;
   backupModel?: string;
   backupPreset?: string;
   executionPools?: SupervisionExecutionPoolsConfig;
 };
-
-type CcPresetSummary = RuntimeModelPresetEntry;
-
-function timeoutMsToUiSeconds(timeoutMs: number | undefined): number {
-  const safeMs = typeof timeoutMs === 'number' && Number.isFinite(timeoutMs)
-    ? Math.max(timeoutMs, SUPERVISION_MIN_TIMEOUT_MS)
-    : DEFAULT_SUPERVISION_TIMEOUT_MS;
-  return Math.round(safeMs / 1000);
-}
-
-function timeoutUiSecondsToMs(seconds: number): number {
-  return Math.max(SUPERVISION_MIN_TIMEOUT_MS, Math.round(seconds) * 1000);
-}
 
 function labelForBackend(t: (key: string, params?: Record<string, unknown>) => string, backend: SharedContextRuntimeBackend): string {
   return t({
@@ -225,236 +166,6 @@ function labelForPoolAgentType(
   return isSupportedSupervisionBackend(agentType)
     ? labelForBackend(t, agentType)
     : agentType;
-}
-
-function labelForMode(t: (key: string, params?: Record<string, unknown>) => string, mode: SupervisionMode): string {
-  return t(`session.supervision.mode.${mode}`);
-}
-
-function normalizeBackendValue(value: string): SharedContextRuntimeBackend | '' {
-  return isSupportedSupervisionBackend(value) ? value : '';
-}
-
-// localStorage key tracking whether the per-user has hidden the intro block.
-// The intro card summarizes how Auto supervision works across three short
-// paragraphs; users who already understand it asked to hide it by default,
-// and we persist the choice across sessions so the dialog reopens small.
-const SUPERVISION_INTRO_COLLAPSED_KEY = 'imcodes:supervision-intro-collapsed';
-
-function readIntroCollapsedPref(): boolean {
-  if (typeof window === 'undefined') return true;
-  try {
-    const raw = window.localStorage.getItem(SUPERVISION_INTRO_COLLAPSED_KEY);
-    // Default to collapsed on first open — the intro block is long and most
-    // users will only need it once. They can expand it any time.
-    return raw === null ? true : raw === '1';
-  } catch {
-    return true;
-  }
-}
-
-function writeIntroCollapsedPref(collapsed: boolean): void {
-  if (typeof window === 'undefined') return;
-  try {
-    window.localStorage.setItem(SUPERVISION_INTRO_COLLAPSED_KEY, collapsed ? '1' : '0');
-  } catch {
-    // storage unavailable (private mode / quota) — fall through; UI still works,
-    // state just won't persist across reloads.
-  }
-}
-
-function SupervisionIntroCard({ t }: { t: (key: string, params?: Record<string, unknown>) => string }) {
-  const [collapsed, setCollapsed] = useState<boolean>(() => readIntroCollapsedPref());
-
-  const toggleCollapsed = () => {
-    setCollapsed((prev) => {
-      const next = !prev;
-      writeIntroCollapsedPref(next);
-      return next;
-    });
-  };
-
-  const sections = [
-    {
-      title: t('session.supervision.intro.howToUseTitle'),
-      body: t('session.supervision.intro.howToUseBody'),
-    },
-    {
-      title: t('session.supervision.intro.purposeTitle'),
-      body: t('session.supervision.intro.purposeBody'),
-    },
-    {
-      title: t('session.supervision.intro.howItWorksTitle'),
-      body: t('session.supervision.intro.howItWorksBody'),
-    },
-  ];
-
-  return (
-    <div class={`session-settings-intro${collapsed ? ' is-collapsed' : ''}`}>
-      <button
-        type="button"
-        onClick={toggleCollapsed}
-        aria-expanded={!collapsed}
-        aria-controls="supervision-intro-body"
-        data-testid="supervision-intro-toggle"
-        class="session-settings-intro-toggle"
-      >
-        <span
-          aria-hidden="true"
-          class="session-settings-intro-arrow"
-        >
-          ▾
-        </span>
-        <span class="session-settings-intro-title">{t('session.supervision.intro.title')}</span>
-        <span class="session-settings-intro-hint">
-          {t(collapsed ? 'session.supervision.intro.expandHint' : 'session.supervision.intro.collapseHint')}
-        </span>
-      </button>
-      {!collapsed && (
-        <div id="supervision-intro-body" class="session-settings-intro-body">
-          {sections.map((section) => (
-            <div key={section.title} class="session-settings-intro-item">
-              <div class="session-settings-intro-item-title">{section.title}</div>
-              <div class="session-settings-intro-item-body">{section.body}</div>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function getPresetModelOptions(
-  presets: readonly CcPresetSummary[],
-  presetName: string | undefined,
-): string[] {
-  if (!presetName) return [];
-  const target = presetName.trim().toLowerCase();
-  if (!target) return [];
-  const match = presets.find((p) => p.name.trim().toLowerCase() === target);
-  if (!match) return [];
-  return getCcPresetAvailableModelIds(match);
-}
-
-function resolvePresetModel(
-  presets: readonly CcPresetSummary[],
-  presetName: string | undefined,
-  currentModel: string | undefined,
-): string | undefined {
-  const options = getPresetModelOptions(presets, presetName);
-  if (options.length === 0) return undefined;
-  const current = currentModel?.trim();
-  return current && options.includes(current) ? current : options[0];
-}
-
-function SupervisionRuntimeFields({
-  t,
-  saving,
-  backend,
-  model,
-  preset,
-  presets,
-  timeoutSeconds,
-  modelOptions,
-  isFallbackModelList = false,
-  idPrefix,
-  onBackendChange,
-  onModelChange,
-  onRuntimeChange,
-  onTimeoutChange,
-}: {
-  t: (key: string, params?: Record<string, unknown>) => string;
-  saving: boolean;
-  backend: SharedContextRuntimeBackend | '';
-  model: string;
-  preset: string;
-  presets: readonly CcPresetSummary[];
-  timeoutSeconds?: number;
-  modelOptions: readonly string[];
-  isFallbackModelList?: boolean;
-  idPrefix: string;
-  onBackendChange: (backend: string) => void;
-  onModelChange: (model: string) => void;
-  onRuntimeChange: (next: { model: string; preset: string }) => void;
-  onTimeoutChange?: (seconds: number) => void;
-}) {
-  const handleBackendSelect = (e: Event): void => {
-    onBackendChange((e.target as HTMLSelectElement).value);
-  };
-  return (
-    <div class="supervision-runtime-fields">
-      <div class="supervision-runtime-grid" style={{ gridTemplateColumns: backend === 'openclaw' ? `repeat(${onTimeoutChange ? 3 : 2}, minmax(0, 1fr))` : `repeat(${onTimeoutChange ? 2 : 1}, minmax(0, 1fr))` }}>
-        <div class="session-settings-field">
-          <div class="session-settings-label">{t('session.supervision.backend')}</div>
-          <select
-            class="input"
-            aria-label={`${idPrefix}:backend`}
-            value={backend}
-            onInput={handleBackendSelect}
-            onChange={handleBackendSelect}
-            style={{ width: '100%' }}
-            disabled={saving}
-          >
-            <option value="">{t('session.supervision.selectBackend')}</option>
-            {getSupportedSupervisionBackendOptions().map((option) => (
-              <option key={option} value={option}>{labelForBackend(t, option)}</option>
-            ))}
-          </select>
-        </div>
-
-        {backend === 'openclaw' && (
-          <div class="session-settings-field">
-            <div class="session-settings-label">{t('session.supervision.model')}</div>
-          <input
-            class="input"
-            aria-label={`${idPrefix}:model`}
-            value={model}
-            onInput={(e) => onModelChange((e.target as HTMLInputElement).value)}
-            style={{ width: '100%' }}
-            disabled={saving}
-            placeholder={t('session.supervision.selectModel')}
-          />
-          </div>
-        )}
-
-        {onTimeoutChange && timeoutSeconds != null && <div class="session-settings-field">
-          <div class="session-settings-label">{t('session.supervision.timeout')}</div>
-          <input
-            class="input"
-            aria-label={`${idPrefix}:timeout`}
-            type="number"
-            min={SUPERVISION_MIN_TIMEOUT_MS / 1000}
-            step={1}
-            value={String(timeoutSeconds)}
-            onInput={(e) => {
-              const value = Number.parseInt((e.target as HTMLInputElement).value, 10);
-              onTimeoutChange(
-                Number.isFinite(value)
-                  ? Math.max(value, SUPERVISION_MIN_TIMEOUT_MS / 1000)
-                  : timeoutSeconds,
-              );
-            }}
-            style={{ width: '100%' }}
-            disabled={saving}
-          />
-        </div>}
-      </div>
-
-      {backend && backend !== 'openclaw' && (
-        <RuntimeModelPresetSelector
-          backend={backend}
-          model={model}
-          preset={preset}
-          presets={presets}
-          modelOptions={modelOptions}
-          isFallbackModelList={isFallbackModelList}
-          onChange={onRuntimeChange}
-          idPrefix={idPrefix}
-          disabled={saving}
-        />
-      )}
-    </div>
-  );
 }
 
 function buildPoolConfig(backend: SharedContextRuntimeBackend, model: string): SupervisionExecutionConfig {
@@ -818,23 +529,9 @@ export function SessionSettingsDialog({
     const persisted: SupervisionDraft = hasPersistedSupervision
       ? readSupervisionSnapshotFromTransportConfig(transportConfig)
       : { mode: supervisionMode ?? SUPERVISION_MODE.OFF };
-    if (!canControlAutomaticSupervision) return persisted;
-    if (!openIntent?.supervisionMode) return persisted;
-    if (openIntent.supervisionMode === 'off' || (persisted.backend && persisted.model)) {
-      return { ...persisted, mode: openIntent.supervisionMode };
-    }
-    // Quick-open must be usable before the async user-pref request resolves.
-    // Seed the same canonical fallback used by the daemon so Save is never
-    // held hostage by a slow/offline preference request.
-    const immediateDefaults = normalizeSupervisorDefaultConfig(
-      isSupportedSupervisionBackend(type) ? { backend: type } : null,
-    );
-    return {
-      ...immediateDefaults,
-      ...persisted,
-      mode: openIntent.supervisionMode,
-    };
-  }, [canControlAutomaticSupervision, hasPersistedSupervision, openIntent?.supervisionMode, supervisionMode, transportConfig, type]);
+    if (!canControlAutomaticSupervision || !openIntent?.supervisionMode) return persisted;
+    return { ...persisted, mode: openIntent.supervisionMode };
+  }, [canControlAutomaticSupervision, hasPersistedSupervision, openIntent?.supervisionMode, supervisionMode, transportConfig]);
 
   const [label, setLabel] = useState(initLabel);
   const [description, setDescription] = useState(initDesc);
@@ -848,7 +545,6 @@ export function SessionSettingsDialog({
   const [modelApplyError, setModelApplyError] = useState('');
   const [pendingSessionModel, setPendingSessionModel] = useState<string | null>(null);
   const [supervision, setSupervision] = useState<SupervisionDraft>(initialSupervision);
-  const ccPresetListRequestIdRef = useRef<string | null>(null);
   const agentTypeMountedRef = useRef(false);
   const providerModelManuallySelectedRef = useRef(false);
   const [supervisorDefaults, setSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
@@ -860,10 +556,6 @@ export function SessionSettingsDialog({
       ? current
       : { ...current, mode: supervisionMode });
   }, [canControlAutomaticSupervision, supervisionMode]);
-  // Qwen presets (env bundles) fetched from the daemon via the same
-  // `cc.presets.list` WS channel the Shared Context panel uses. Stays empty
-  // when `ws` is not provided — the picker hides itself in that case.
-  const [ccPresets, setCcPresets] = useState<CcPresetSummary[]>([]);
 
   useEffect(() => {
     setLabel(initLabel);
@@ -1019,84 +711,11 @@ export function SessionSettingsDialog({
     }
   };
 
-  const hasSupervision = supervision.mode !== 'off';
   const isSupportedTransport = TRANSPORT_SESSION_AGENT_TYPES.includes(agentType as typeof TRANSPORT_SESSION_AGENT_TYPES[number]);
-  const isAuditMode = supervision.mode === 'supervised_audit';
   const supervisorDefaultsPref = useSupervisorDefaults(isSupportedTransport, {
     serverId,
     sessionName,
   });
-
-
-  // Subscribe to `cc.presets.list_response` for as long as the dialog is
-  // mounted with a valid `ws`. We fire the list request once on mount and
-  // again whenever `ws` changes — the daemon response is idempotent.
-  useEffect(() => {
-    if (!ws) return;
-    // A dialog can move between covered sessions without remounting. Presets
-    // are owner-machine data, so never retain the previous owner's catalogue
-    // while the new scoped request is in flight (or if it is denied).
-    setCcPresets([]);
-    const requestPresets = (): void => {
-      const requestId = globalThis.crypto?.randomUUID?.()
-        ?? `cc-presets-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-      ccPresetListRequestIdRef.current = requestId;
-      // A reconnect can race this effect. Keep the settings dialog usable and
-      // let the next RECONNECTED notification retry instead of turning a
-      // transient transport failure into a render-time exception.
-      try {
-        ws.send({
-          type: CC_PRESET_MSG.LIST,
-          requestId,
-          sessionName,
-        });
-      } catch {
-        // Retry is driven by the reconnect notification above.
-      }
-    };
-    const unsub = ws.onMessage((msg) => {
-      const m = msg as { type?: string; requestId?: string; presets?: CcPresetSummary[] };
-      if (m.type === DAEMON_MSG.RECONNECTED) {
-        requestPresets();
-        return;
-      }
-      if (
-        m.type === CC_PRESET_MSG.LIST_RESPONSE
-        && (!m.requestId || m.requestId === ccPresetListRequestIdRef.current)
-      ) {
-        setCcPresets(m.presets ?? []);
-      }
-    });
-    requestPresets();
-    return unsub;
-  }, [sessionName, ws]);
-
-  useEffect(() => {
-    if (ccPresets.length === 0) return;
-    if (supervisorDefaultsDirtyRef.current) return;
-    setSupervisorDefaults((prev) => {
-      const backend = normalizeBackendValue(String(prev.backend ?? ''));
-      if (!backend || !doesSharedContextBackendSupportPresets(backend) || !prev.preset) return prev;
-      const resolvedModel = resolvePresetModel(ccPresets, prev.preset, prev.model);
-      if (!resolvedModel || prev.model === resolvedModel) return prev;
-      return { ...prev, model: resolvedModel };
-    });
-    setSupervisorDefaults((prev) => {
-      const backend = normalizeBackendValue(String(prev.backupBackend ?? ''));
-      if (!backend || !doesSharedContextBackendSupportPresets(backend) || !prev.backupPreset) return prev;
-      const resolvedModel = resolvePresetModel(ccPresets, prev.backupPreset, prev.backupModel);
-      if (!resolvedModel || prev.backupModel === resolvedModel) return prev;
-      return { ...prev, backupModel: resolvedModel };
-    });
-  }, [
-    ccPresets,
-    supervisorDefaults.backend,
-    supervisorDefaults.model,
-    supervisorDefaults.preset,
-    supervisorDefaults.backupBackend,
-    supervisorDefaults.backupModel,
-    supervisorDefaults.backupPreset,
-  ]);
 
   useEffect(() => {
     if (!isSupportedTransport) return;
@@ -1106,56 +725,17 @@ export function SessionSettingsDialog({
     if (!supervisorDefaultsDirtyRef.current) {
       setSupervisorDefaults(resolvedDefaults);
     }
-    setSupervision((prev) => {
-      const missingBackend = !prev.backend;
-      const missingModel = !prev.model?.trim();
-      if (!missingBackend && !missingModel) return prev;
-      const nextBackend = prev.backend ?? resolvedDefaults.backend;
-      const nextModel = missingModel
-        ? (nextBackend === resolvedDefaults.backend
-            ? resolvedDefaults.model
-            : resolveSupervisionModelForBackend(nextBackend, '', prev.backend))
-        : prev.model;
-      const shouldSeedAutoContinueStreak = prev.maxAutoContinueStreak == null
-        || prev.maxAutoContinueStreak === DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK;
-      const shouldSeedAutoContinueTotal = prev.maxAutoContinueTotal == null
-        || prev.maxAutoContinueTotal === DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL;
-      return {
-        ...prev,
-        backend: nextBackend,
-        model: nextModel,
-        // Seed preset from defaults when the backend supports it. If the
-        // backend doesn't support presets the normalizer already stripped
-        // it, so copying is safe either way.
-        preset: prev.preset ?? (nextBackend === resolvedDefaults.backend ? resolvedDefaults.preset : undefined),
-        timeoutMs: resolvedDefaults.timeoutMs,
-        promptVersion: resolvedDefaults.promptVersion,
-        maxAutoContinueStreak: shouldSeedAutoContinueStreak
-          ? resolvedDefaults.maxAutoContinueStreak
-          : prev.maxAutoContinueStreak,
-        maxAutoContinueTotal: shouldSeedAutoContinueTotal
-          ? resolvedDefaults.maxAutoContinueTotal
-          : prev.maxAutoContinueTotal,
-        maxParseRetries: prev.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES,
-        maxAuditLoops: prev.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS,
-        taskRunPromptVersion: prev.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION,
-      };
-    });
   }, [isSupportedTransport, supervisorDefaultsPref.loaded, supervisorDefaultsPref.value]);
 
   const updateSupervisorDefaultsFromUser = (updater: (prev: SupervisionRuntimeDraft) => SupervisionRuntimeDraft): void => {
+    if (!canControlAutomaticSupervision) return;
     supervisorDefaultsDirtyRef.current = true;
     setSupervisorDefaults(updater);
   };
 
-  const supervisionCustomInstructions = typeof supervision.customInstructions === 'string' ? supervision.customInstructions : '';
-  const supervisionCustomInstructionsOverride = supervision.customInstructionsOverride === true;
-  const supervisionParseRetries = supervision.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES;
-  const supervisionAutoContinueStreak = supervision.maxAutoContinueStreak ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK;
-  const supervisionAutoContinueTotal = supervision.maxAutoContinueTotal ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL;
-  const supervisionAuditLoops = supervision.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS;
   const supervisionAuditBlockingSeverities = resolveSupervisionAuditBlockingSeverities(supervision);
   const toggleAuditBlockingSeverity = (level: AuditSeverity, checked: boolean): void => {
+    if (!canControlAutomaticSupervision) return;
     setSupervision((prev) => {
       const current = resolveSupervisionAuditBlockingSeverities(prev);
       const next = checked
@@ -1183,40 +763,6 @@ export function SessionSettingsDialog({
     parentSession: executionPoolParentSession,
     sessions: executionPoolSessions,
   }), [executionPoolParentSession, executionPoolSessions, sessionName]);
-  const taskRunPromptVersion = supervision.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION;
-  const supervisorDefaultsBackend = normalizeBackendValue(String(supervisorDefaults.backend ?? ''));
-  const supervisorDefaultsModel = typeof supervisorDefaults.model === 'string' ? supervisorDefaults.model : '';
-  const supervisorDefaultsPreset = typeof supervisorDefaults.preset === 'string' ? supervisorDefaults.preset : '';
-  const supervisorDefaultsTimeout = supervisorDefaults.timeoutMs ?? DEFAULT_SUPERVISION_TIMEOUT_MS;
-  const supervisorDefaultsTimeoutSeconds = timeoutMsToUiSeconds(supervisorDefaultsTimeout);
-  const supervisorDefaultsPromptVersion = supervisorDefaults.promptVersion ?? SUPERVISION_PROMPT_VERSION;
-  const supervisorDefaultsPresetEntry = ccPresets.find((p) => p.name === (typeof supervisorDefaults.preset === 'string' ? supervisorDefaults.preset.trim() : ''));
-  const supervisorDefaultsPresetModelOptions = getPresetModelOptions(ccPresets, supervisorDefaults.preset);
-  const supervisorDefaultsDynamicModels = useTransportModels(
-    ws ?? null,
-    supportsDynamicTransportModels(supervisorDefaultsBackend)
-      ? supervisorDefaultsBackend
-      : null,
-    supervisorDefaultsPreset || undefined,
-    sessionName,
-  );
-  const supervisorDefaultsModelOptions = supervisorDefaultsBackend
-    ? (supervisorDefaultsPresetEntry
-        ? mergeModelSuggestions(
-            supervisorDefaultsPresetModelOptions,
-            supervisorDefaultsDynamicModels.models.map((entry) => entry.id),
-          )
-        : mergeModelSuggestions(
-            supervisorDefaultsDynamicModels.models.map((entry) => entry.id),
-            getSupervisionModelOptions(supervisorDefaultsBackend),
-          ))
-    : [];
-  const supervisorDefaultsCustomInstructions = typeof supervisorDefaults.customInstructions === 'string' ? supervisorDefaults.customInstructions : '';
-  const supervisorDefaultsAutoContinueStreak = supervisorDefaults.maxAutoContinueStreak ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK;
-  const supervisorDefaultsAutoContinueTotal = supervisorDefaults.maxAutoContinueTotal ?? DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL;
-  const supervisorDefaultsBackupBackend = normalizeBackendValue(String(supervisorDefaults.backupBackend ?? ''));
-  const supervisorDefaultsBackupModel = typeof supervisorDefaults.backupModel === 'string' ? supervisorDefaults.backupModel : '';
-  const supervisorDefaultsBackupPreset = typeof supervisorDefaults.backupPreset === 'string' ? supervisorDefaults.backupPreset : '';
   const brainExecutionModel = resolvePeerAuditNormalizedModelId({ activeModel, requestedModel });
   const supervisorDefaultsExecutionPools = useMemo(() => withBrainPrimaryPoolDefault({
     pools: supervisorDefaults.executionPools ?? normalizeSupervisionExecutionPools(undefined),
@@ -1225,119 +771,34 @@ export function SessionSettingsDialog({
     brainAgentType: parentSession ? '' : type,
     brainModel: brainExecutionModel,
   }), [brainExecutionModel, parentSession, supervisorDefaults.executionPools, type]);
-  const supervisorDefaultsBackupPresetEntry = ccPresets.find((p) => p.name === supervisorDefaultsBackupPreset.trim());
-  const supervisorDefaultsBackupPresetModelOptions = getPresetModelOptions(ccPresets, supervisorDefaultsBackupPreset);
-  const supervisorDefaultsBackupDynamicModels = useTransportModels(
-    ws ?? null,
-    supportsDynamicTransportModels(supervisorDefaultsBackupBackend)
-      ? supervisorDefaultsBackupBackend
-      : null,
-    supervisorDefaultsBackupPreset || undefined,
-    sessionName,
-  );
-  const supervisorDefaultsBackupModelOptions = supervisorDefaultsBackupBackend
-    ? (supervisorDefaultsBackupPresetEntry
-        ? mergeModelSuggestions(
-            supervisorDefaultsBackupPresetModelOptions,
-            supervisorDefaultsBackupDynamicModels.models.map((entry) => entry.id),
-          )
-        : mergeModelSuggestions(
-            supervisorDefaultsBackupDynamicModels.models.map((entry) => entry.id),
-            getSupervisionModelOptions(supervisorDefaultsBackupBackend),
-          ))
-    : [];
-  // Preset persistence is valid only for runtime backends that can resolve the
-  // same third-party endpoint bundles used by memory processing.
-  const defaultsSupportsPreset = !!supervisorDefaultsBackend && doesSharedContextBackendSupportPresets(supervisorDefaultsBackend);
-  const defaultsBackupSupportsPreset = !!supervisorDefaultsBackupBackend
-    && doesSharedContextBackendSupportPresets(supervisorDefaultsBackupBackend);
-  // Merged preview shown only when override is unchecked AND both sides have
-  // non-empty trimmed content. Any other case is redundant (the effective
-  // value equals one or the other side, visible in the textarea already).
-  const supervisionMergedPreview = useMemo(
-    () => mergeSupervisionCustomInstructions(
-      supervisorDefaultsCustomInstructions,
-      supervisionCustomInstructions,
-      supervisionCustomInstructionsOverride,
-    ),
-    [supervisionCustomInstructions, supervisionCustomInstructionsOverride, supervisorDefaultsCustomInstructions],
-  );
-  const shouldShowMergedPreview = !supervisionCustomInstructionsOverride
-    && supervisorDefaultsCustomInstructions.trim().length > 0
-    && supervisionCustomInstructions.trim().length > 0;
 
-  const nextTransportConfig = useMemo(() => canControlAutomaticSupervision
-    ? buildTransportConfigWithSupervision(transportConfig, {
-    mode: supervision.mode,
-    // Session snapshots retain a runtime mirror for cold-start compatibility,
-    // but the UI has one global source of truth and the daemon refreshes it
-    // continuously and applies it to every decision.
-    backend: supervisorDefaultsBackend || undefined,
-    model: supervisorDefaultsModel.trim() || undefined,
-    ...(defaultsSupportsPreset && supervisorDefaultsPreset.trim() ? { preset: supervisorDefaultsPreset.trim() } : {}),
-    ...(supervisorDefaultsBackupBackend && supervisorDefaultsBackupModel.trim() ? {
-      backupBackend: supervisorDefaultsBackupBackend,
-      backupModel: supervisorDefaultsBackupModel.trim(),
-      ...(defaultsBackupSupportsPreset && supervisorDefaultsBackupPreset.trim()
-        ? { backupPreset: supervisorDefaultsBackupPreset.trim() }
+  const nextTransportConfig = useMemo(() => {
+    if (!canControlAutomaticSupervision) return transportConfig ?? null;
+    // Strip legacy manual-auditor target fields while transparently preserving
+    // hidden legacy snapshot fields (mode, pairEngine, runtime, limits, etc.).
+    const {
+      auditTargetSessionName: _legacyTarget,
+      auditTargetFingerprint: _legacyFingerprint,
+      peerAuditPromptVersion: _legacyPeerPrompt,
+      auditMode: _legacyAuditMode,
+      ...preservedSupervision
+    } = supervision;
+    return buildTransportConfigWithSupervision(transportConfig, {
+      ...preservedSupervision,
+      executionPools: supervisorDefaultsExecutionPools,
+      ...(supervision.auditBlockingSeverities !== undefined
+        ? { auditBlockingSeverities: supervision.auditBlockingSeverities }
         : {}),
-    } : {}),
-    timeoutMs: supervisorDefaultsTimeout,
-    promptVersion: supervisorDefaultsPromptVersion,
-    executionPools: supervisorDefaultsExecutionPools,
-    customInstructions: supervisionCustomInstructions.trim() || undefined,
-    // Only write the flag when true to keep default payloads minimal.
-    ...(supervisionCustomInstructionsOverride ? { customInstructionsOverride: true } : {}),
-    // Snapshot cache mirror of the global custom instructions. The daemon
-    // merges this with the session value at dispatch time; the field is
-    // intentionally re-populated on every save so it stays in sync when the
-    // user edits the global textarea in the same dialog.
-    ...(supervisorDefaultsCustomInstructions.trim()
-      ? { globalCustomInstructions: supervisorDefaultsCustomInstructions.trim() }
-      : {}),
-    maxParseRetries: supervisionParseRetries,
-    maxAutoContinueStreak: supervisionAutoContinueStreak,
-    maxAutoContinueTotal: supervisionAutoContinueTotal,
-    // Automatic audit routing is resolved from auditPolicy + the live pool.
-    // Omitting all legacy manual-auditor fields retires stale target data on
-    // every save instead of preserving an invisible picker.
-    ...(isAuditMode
-      ? {
-          maxAuditLoops: supervisionAuditLoops,
-          auditBlockingSeverities: supervisionAuditBlockingSeverities,
-          taskRunPromptVersion,
-        }
-      : {}),
-    // Marker-driven task-pair settings live on the project Brain only.
-    ...(isMainSession ? pairSettingsOf(supervision) : {}),
-    })
-    : transportConfig ?? null, [
+      // Marker-driven task-pair settings live on the project Brain only.
+      ...(isMainSession
+        ? pairSettingsOf(supervision)
+        : { pairEngine: undefined, pairMaxConcurrency: undefined }),
+    });
+  }, [
     canControlAutomaticSupervision,
-    isAuditMode,
-    defaultsBackupSupportsPreset,
-    defaultsSupportsPreset,
-    supervision.mode,
-    supervisionAuditBlockingSeverities.join(','),
     isMainSession,
-    supervision.pairEngine,
-    supervision.pairMaxConcurrency,
-    supervisionAuditLoops,
-    supervisionAutoContinueStreak,
-    supervisionAutoContinueTotal,
-    supervisionCustomInstructions,
-    supervisionCustomInstructionsOverride,
-    supervisionParseRetries,
-    supervisorDefaultsBackend,
-    supervisorDefaultsBackupBackend,
-    supervisorDefaultsBackupModel,
-    supervisorDefaultsBackupPreset,
-    supervisorDefaultsModel,
-    supervisorDefaultsPreset,
-    supervisorDefaultsPromptVersion,
-    supervisorDefaultsTimeout,
+    supervision,
     supervisorDefaultsExecutionPools,
-    supervisorDefaultsCustomInstructions,
-    taskRunPromptVersion,
     transportConfig,
   ]);
 
@@ -1370,7 +831,8 @@ export function SessionSettingsDialog({
     supervisorDefaultsExecutionPools,
   ]);
 
-  const hasChanges = hasSessionChanges || (surface !== 'session' && hasGlobalDefaultsChanges);
+  const hasChanges = hasSessionChanges
+    || (surface !== 'session' && canControlAutomaticSupervision && hasGlobalDefaultsChanges);
 
   const renderTypeLabel = (value: string): string => {
     switch (value) {
@@ -1397,115 +859,13 @@ export function SessionSettingsDialog({
     }
   };
 
-  const handleModeChange = (nextMode: SupervisionMode) => {
-    setSupervision((prev) => {
-      if (nextMode === 'off') {
-        return {
-          mode: 'off',
-          backend: prev.backend,
-          model: prev.model,
-          timeoutMs: prev.timeoutMs ?? DEFAULT_SUPERVISION_TIMEOUT_MS,
-          promptVersion: prev.promptVersion ?? SUPERVISION_PROMPT_VERSION,
-          customInstructions: prev.customInstructions,
-          maxAutoContinueStreak: prev.maxAutoContinueStreak ?? supervisorDefaultsAutoContinueStreak,
-          maxAutoContinueTotal: prev.maxAutoContinueTotal ?? supervisorDefaultsAutoContinueTotal,
-          maxParseRetries: prev.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES,
-          maxAuditLoops: prev.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS,
-          ...(prev.auditBlockingSeverities ? { auditBlockingSeverities: prev.auditBlockingSeverities } : {}),
-          taskRunPromptVersion: prev.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION,
-          ...pairSettingsOf(prev),
-        };
-      }
-      if (nextMode === 'supervised_audit') {
-        return {
-          mode: nextMode,
-          backend: prev.backend,
-          model: prev.model,
-          timeoutMs: prev.timeoutMs ?? DEFAULT_SUPERVISION_TIMEOUT_MS,
-          promptVersion: prev.promptVersion ?? SUPERVISION_PROMPT_VERSION,
-          customInstructions: prev.customInstructions,
-          maxAutoContinueStreak: prev.maxAutoContinueStreak == null || prev.maxAutoContinueStreak === DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK
-            ? supervisorDefaultsAutoContinueStreak
-            : prev.maxAutoContinueStreak,
-          maxAutoContinueTotal: prev.maxAutoContinueTotal == null || prev.maxAutoContinueTotal === DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL
-            ? supervisorDefaultsAutoContinueTotal
-            : prev.maxAutoContinueTotal,
-          maxParseRetries: prev.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES,
-          maxAuditLoops: prev.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS,
-          ...(prev.auditBlockingSeverities ? { auditBlockingSeverities: prev.auditBlockingSeverities } : {}),
-          taskRunPromptVersion: prev.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION,
-          ...pairSettingsOf(prev),
-        };
-      }
-      return {
-        mode: nextMode,
-        backend: prev.backend,
-        model: prev.model,
-        timeoutMs: prev.timeoutMs ?? DEFAULT_SUPERVISION_TIMEOUT_MS,
-        promptVersion: prev.promptVersion ?? SUPERVISION_PROMPT_VERSION,
-        customInstructions: prev.customInstructions,
-        maxAutoContinueStreak: prev.maxAutoContinueStreak == null || prev.maxAutoContinueStreak === DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK
-          ? supervisorDefaultsAutoContinueStreak
-          : prev.maxAutoContinueStreak,
-        maxAutoContinueTotal: prev.maxAutoContinueTotal == null || prev.maxAutoContinueTotal === DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL
-          ? supervisorDefaultsAutoContinueTotal
-          : prev.maxAutoContinueTotal,
-        maxParseRetries: prev.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES,
-        taskRunPromptVersion: prev.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION,
-        ...pairSettingsOf(prev),
-      };
-    });
-  };
-
-  const updateRuntimeDraft = (
-    previous: SupervisionRuntimeDraft,
-    nextBackendValue: string,
-  ): SupervisionRuntimeDraft => {
-    if (!isSupportedSupervisionBackend(nextBackendValue)) {
-      // Clearing the backend also clears preset — otherwise a stale preset
-      // would round-trip to the server and the normalizer would strip it
-      // anyway, leaving the dialog's diff out of sync with storage.
-      return { ...previous, backend: undefined, model: undefined, preset: undefined };
-    }
-    const nextSupportsPreset = doesSharedContextBackendSupportPresets(nextBackendValue);
-    return {
-      ...previous,
-      backend: nextBackendValue,
-      model: resolveSupervisionModelForBackend(nextBackendValue, previous.model ?? '', previous.backend),
-      // Switch to a non-preset backend → drop preset. Switch between preset
-      // backends (future case) → keep the previous preset for continuity.
-      preset: nextSupportsPreset ? previous.preset : undefined,
-    };
-  };
-
   const handleSave = async () => {
     setSaving(true);
     setError('');
     try {
-      if (surface !== 'session' && hasGlobalDefaultsChanges) {
+      if (canControlAutomaticSupervision && surface !== 'session' && hasGlobalDefaultsChanges) {
         await supervisorDefaultsPref.save({
-          backend: supervisorDefaultsBackend || undefined,
-          model: supervisorDefaultsModel.trim(),
-          timeoutMs: supervisorDefaultsTimeout,
-          promptVersion: supervisorDefaultsPromptVersion,
-          maxAutoContinueStreak: supervisorDefaultsAutoContinueStreak,
-          maxAutoContinueTotal: supervisorDefaultsAutoContinueTotal,
-          // Optional free-text global supervision instructions. Empty string
-          // is normalized to undefined by the shared helper.
-          customInstructions: supervisorDefaultsCustomInstructions.trim() || undefined,
-          // Only forward preset when the current defaults backend supports it.
-          // The shared normalizer would strip it anyway for non-preset backends,
-          // but scrubbing here keeps the wire payload tidy.
-          ...(defaultsSupportsPreset && supervisorDefaultsPreset.trim()
-            ? { preset: supervisorDefaultsPreset.trim() }
-            : {}),
-          ...(supervisorDefaultsBackupBackend && supervisorDefaultsBackupModel.trim() ? {
-            backupBackend: supervisorDefaultsBackupBackend,
-            backupModel: supervisorDefaultsBackupModel.trim(),
-            ...(defaultsBackupSupportsPreset && supervisorDefaultsBackupPreset.trim()
-              ? { backupPreset: supervisorDefaultsBackupPreset.trim() }
-              : {}),
-          } : {}),
+          ...supervisorDefaults,
           executionPools: supervisorDefaultsExecutionPools,
         });
       }
@@ -1569,121 +929,22 @@ export function SessionSettingsDialog({
     }
   };
 
-  const supervisionModeLabel = labelForMode(t, supervision.mode);
-  const handleSessionModeSelect = (e: Event): void => {
-    handleModeChange((e.target as HTMLSelectElement).value as SupervisionMode);
-  };
   const globalDefaultsValid = useMemo(() => {
     if (!isSupportedTransport) return true;
-    if (!supervisorDefaultsBackend) return false;
-    if (!supervisorDefaultsModel.trim()) return false;
-    if (supervisorDefaultsBackend !== 'openclaw' && !isKnownSharedContextModelForBackend(supervisorDefaultsBackend, supervisorDefaultsModel.trim(), supervisorDefaultsPreset.trim() || undefined)) return false;
-    if (supervisorDefaultsBackupBackend) {
-      if (!supervisorDefaultsBackupModel.trim()) return false;
-      if (
-        supervisorDefaultsBackupBackend !== 'openclaw'
-        && !isKnownSharedContextModelForBackend(
-          supervisorDefaultsBackupBackend,
-          supervisorDefaultsBackupModel.trim(),
-          supervisorDefaultsBackupPreset.trim() || undefined,
-        )
-      ) return false;
-    }
-    if (supervisorDefaultsTimeout < SUPERVISION_MIN_TIMEOUT_MS) return false;
-    if (supervisorDefaultsExecutionPools.state !== 'configured'
-      || supervisorDefaultsExecutionPools.primaryDevelopmentPool.configs.length === 0) return false;
-    return true;
-  }, [
-    isSupportedTransport,
-    supervisorDefaultsBackend,
-    supervisorDefaultsBackupBackend,
-    supervisorDefaultsBackupModel,
-    supervisorDefaultsBackupPreset,
-    supervisorDefaultsModel,
-    supervisorDefaultsPreset,
-    supervisorDefaultsTimeout,
-    supervisorDefaultsExecutionPools,
-  ]);
+    return supervisorDefaultsExecutionPools.state === 'configured'
+      && supervisorDefaultsExecutionPools.primaryDevelopmentPool.configs.length > 0;
+  }, [isSupportedTransport, supervisorDefaultsExecutionPools]);
 
   const supervisionPanel = isSupportedTransport ? (
     <div class="session-settings-supervision-panel">
-      <SupervisionIntroCard t={t} />
-
-      <div class="session-settings-help">
-        {t('session.supervision.help')}
-      </div>
-
       <div class="session-settings-card session-settings-card-primary">
         <div class="session-settings-card-title">
           {t('session.supervision.globalDefaultsTitle')}
         </div>
-        <div class="session-settings-help">
-          {t('session.supervision.globalDefaultsHelp')}
-        </div>
-        <div class="session-settings-subtitle">
-          {t('session.supervision.globalPrimaryRuntime')}
-        </div>
-        <SupervisionRuntimeFields
-          t={t}
-          saving={saving}
-          backend={supervisorDefaultsBackend}
-          model={supervisorDefaultsModel}
-          preset={supervisorDefaultsPreset}
-          presets={ccPresets}
-          timeoutSeconds={supervisorDefaultsTimeoutSeconds}
-          modelOptions={supervisorDefaultsModelOptions}
-          isFallbackModelList={supervisorDefaultsDynamicModels.models.length === 0}
-          idPrefix="supervision-defaults"
-          onBackendChange={(nextBackend) => {
-            updateSupervisorDefaultsFromUser((prev) => ({ ...prev, ...updateRuntimeDraft(prev, nextBackend) }));
-          }}
-          onModelChange={(model) => updateSupervisorDefaultsFromUser((prev) => ({ ...prev, model }))}
-          onRuntimeChange={({ model, preset }) => updateSupervisorDefaultsFromUser((prev) => ({ ...prev, model, preset: preset || undefined }))}
-          onTimeoutChange={(seconds) => updateSupervisorDefaultsFromUser((prev) => ({ ...prev, timeoutMs: timeoutUiSecondsToMs(seconds) }))}
-        />
-
-        <div class="session-settings-subsection">
-          <div class="session-settings-subtitle">
-            {t('session.supervision.globalBackupRuntime')}
-          </div>
-          <div class="session-settings-muted">
-            {t('session.supervision.globalBackupHelp')}
-          </div>
-          <SupervisionRuntimeFields
-            t={t}
-            saving={saving}
-            backend={supervisorDefaultsBackupBackend}
-            model={supervisorDefaultsBackupModel}
-            preset={supervisorDefaultsBackupPreset}
-            presets={ccPresets}
-            modelOptions={supervisorDefaultsBackupModelOptions}
-            isFallbackModelList={supervisorDefaultsBackupDynamicModels.models.length === 0}
-            idPrefix="supervision-defaults-backup"
-            onBackendChange={(nextBackend) => {
-              updateSupervisorDefaultsFromUser((prev) => {
-                if (!isSupportedSupervisionBackend(nextBackend)) {
-                  return { ...prev, backupBackend: undefined, backupModel: undefined, backupPreset: undefined };
-                }
-                return {
-                  ...prev,
-                  backupBackend: nextBackend,
-                  backupModel: resolveSupervisionModelForBackend(nextBackend, prev.backupModel ?? '', prev.backupBackend),
-                  backupPreset: doesSharedContextBackendSupportPresets(nextBackend) ? prev.backupPreset : undefined,
-                };
-              });
-            }}
-            onModelChange={(backupModel) => updateSupervisorDefaultsFromUser((prev) => ({ ...prev, backupModel }))}
-            onRuntimeChange={({ model, preset }) => updateSupervisorDefaultsFromUser((prev) => ({
-              ...prev,
-              backupModel: model,
-              backupPreset: preset || undefined,
-            }))}
-          />
-        </div>
 
         <SupervisionExecutionPoolsEditor
           t={t}
-          saving={saving}
+          saving={saving || !canControlAutomaticSupervision}
           pools={supervisorDefaultsExecutionPools}
           candidates={executionPoolCandidates}
           onAddPoolSession={onAddPoolSession}
@@ -1695,251 +956,48 @@ export function SessionSettingsDialog({
             {t('session.supervision.validation.modelRequired')}
           </div>
         )}
-
-        <div class="session-settings-grid">
-          <div class="session-settings-field">
-            <div class="session-settings-label">{t('session.supervision.maxAutoContinueStreak')}</div>
-            <input
-              class="input"
-              type="number"
-              min={0}
-              value={String(supervisorDefaultsAutoContinueStreak)}
-              onInput={(e) => {
-                const value = Number.parseInt((e.target as HTMLInputElement).value, 10);
-                updateSupervisorDefaultsFromUser((prev) => ({ ...prev, maxAutoContinueStreak: Number.isFinite(value) && value >= 0 ? value : DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK }));
-              }}
-              style={{ width: '100%' }}
-              disabled={saving}
-            />
-            <div class="session-settings-field-help">{t('session.supervision.maxAutoContinueStreakHelp')}</div>
-          </div>
-          <div class="session-settings-field">
-            <div class="session-settings-label">{t('session.supervision.maxAutoContinueTotal')}</div>
-            <input
-              class="input"
-              type="number"
-              min={0}
-              value={String(supervisorDefaultsAutoContinueTotal)}
-              onInput={(e) => {
-                const value = Number.parseInt((e.target as HTMLInputElement).value, 10);
-                updateSupervisorDefaultsFromUser((prev) => ({ ...prev, maxAutoContinueTotal: Number.isFinite(value) && value >= 0 ? value : DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL }));
-              }}
-              style={{ width: '100%' }}
-              disabled={saving}
-            />
-            <div class="session-settings-field-help">{t('session.supervision.maxAutoContinueTotalHelp')}</div>
-          </div>
-        </div>
-
-        <div class="session-settings-field">
-          <div class="session-settings-label">
-            {t('session.supervision.globalCustomInstructionsLabel')}
-          </div>
-          <textarea
-            class="input"
-            value={supervisorDefaultsCustomInstructions}
-            onInput={(e) => updateSupervisorDefaultsFromUser((prev) => ({ ...prev, customInstructions: (e.target as HTMLTextAreaElement).value }))}
-            rows={3}
-            style={{ width: '100%', resize: 'vertical' }}
-            disabled={saving}
-            placeholder={t('session.supervision.globalCustomInstructionsPlaceholder')}
-          />
-          <div class="session-settings-field-help">
-            {t('session.supervision.globalCustomInstructionsHelp')}
-          </div>
-        </div>
-
-        {!supervisorDefaultsBackend && (
-          <div style={{ color: '#fbbf24', fontSize: 12 }}>
-            {t('session.supervision.validation.backendRequired')}
-          </div>
-        )}
-
-        {supervisorDefaultsBackend && !supervisorDefaultsModel.trim() && (
-          <div style={{ color: '#fbbf24', fontSize: 12 }}>
-            {t('session.supervision.validation.modelRequired')}
-          </div>
-        )}
-
-        {supervisorDefaultsBackend && supervisorDefaultsModel.trim() && supervisorDefaultsBackend !== 'openclaw' && !isKnownSharedContextModelForBackend(supervisorDefaultsBackend, supervisorDefaultsModel.trim(), supervisorDefaultsPreset.trim() || undefined) && (
-          <div style={{ color: '#f87171', fontSize: 12 }}>
-            {t('session.supervision.validation.modelInvalid', { backend: labelForBackend(t, supervisorDefaultsBackend) })}
-          </div>
-        )}
       </div>
 
       <div class="session-settings-card session-settings-card-session">
         <div class="session-settings-card-title">
           {t('session.supervision.sessionConfigTitle')}
         </div>
-        <div class="session-settings-help">
-          {t('session.supervision.sessionConfigHelp')}
-        </div>
 
-        <div class="session-settings-field">
-          <div class="session-settings-label">{t('session.supervision.modeLabel')}</div>
-          <select
-            class="input"
-            aria-label="supervision-session:mode"
-            value={supervision.mode}
-            onInput={handleSessionModeSelect}
-            onChange={handleSessionModeSelect}
-            style={{ width: '100%' }}
-            disabled={saving || !canControlAutomaticSupervision}
-          >
-            {SUPERVISION_MODES.map((mode) => (
-              <option key={mode} value={mode}>{t(`session.supervision.mode.${mode}`)}</option>
-            ))}
-          </select>
-          {!canControlAutomaticSupervision && (
-            <div class="session-settings-field-help">{t('session.supervision.brainOnly')}</div>
-          )}
-        </div>
-
-        {hasSupervision && canControlAutomaticSupervision && (
-          <>
-            <div class="session-settings-notice">
-              {t('session.supervision.usesGlobalRuntime')}
-            </div>
-
-            <div class="session-settings-grid">
-              <div class="session-settings-field">
-                <div class="session-settings-label">{t('session.supervision.maxAutoContinueStreak')}</div>
-                <input
-                  class="input"
-                  type="number"
-                  min={0}
-                  value={String(supervisionAutoContinueStreak)}
-                  onInput={(e) => {
-                    const value = Number.parseInt((e.target as HTMLInputElement).value, 10);
-                    setSupervision((prev) => ({ ...prev, maxAutoContinueStreak: Number.isFinite(value) && value >= 0 ? value : DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK }));
-                  }}
-                  style={{ width: '100%' }}
-                  disabled={saving}
-                />
-                <div class="session-settings-field-help">{t('session.supervision.maxAutoContinueStreakHelp')}</div>
-              </div>
-
-              <div class="session-settings-field">
-                <div class="session-settings-label">{t('session.supervision.maxAutoContinueTotal')}</div>
-                <input
-                  class="input"
-                  type="number"
-                  min={0}
-                  value={String(supervisionAutoContinueTotal)}
-                  onInput={(e) => {
-                    const value = Number.parseInt((e.target as HTMLInputElement).value, 10);
-                    setSupervision((prev) => ({ ...prev, maxAutoContinueTotal: Number.isFinite(value) && value >= 0 ? value : DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL }));
-                  }}
-                  style={{ width: '100%' }}
-                  disabled={saving}
-                />
-                <div class="session-settings-field-help">{t('session.supervision.maxAutoContinueTotalHelp')}</div>
+        {!canControlAutomaticSupervision ? (
+          <div class="session-settings-field-help">{t('session.supervision.brainOnly')}</div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <div class="session-settings-audit-severities" data-testid="audit-blocking-severities">
+              <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.auditBlockingSeverities')}</div>
+              <div style={{ fontSize: 11, color: '#64748b', marginBottom: 6 }}>{t('session.supervision.auditBlockingSeveritiesHelp')}</div>
+              {AUDIT_SEVERITY_LEVELS.map((level) => {
+                const checked = supervisionAuditBlockingSeverities.includes(level);
+                const lastSelected = checked && supervisionAuditBlockingSeverities.length === 1;
+                return (
+                  <label key={level} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 12, color: '#cbd5e1', marginBottom: 4 }}>
+                    <input
+                      type="checkbox"
+                      data-testid={`audit-blocking-severity-${level}`}
+                      checked={checked}
+                      disabled={saving || lastSelected}
+                      title={lastSelected ? t('session.supervision.auditBlockingSeveritiesAtLeastOne') : undefined}
+                      onChange={(e) => toggleAuditBlockingSeverity(level, (e.target as HTMLInputElement).checked)}
+                    />
+                    <span>
+                      <strong>{level}</strong>{' '}
+                      <span style={{ color: '#94a3b8' }} data-testid={`audit-blocking-severity-description-${level}`}>{t(`session.supervision.auditSeverity.${level}`)}</span>
+                    </span>
+                  </label>
+                );
+              })}
+              <div
+                data-testid="audit-non-finding-policy"
+                style={{ marginTop: 8, padding: '8px 10px', borderRadius: 6, background: '#0f172a', color: '#94a3b8', fontSize: 11, lineHeight: 1.5 }}
+              >
+                <strong style={{ color: '#cbd5e1' }}>{t('session.supervision.auditNonFindingTitle')}</strong>
+                <div>{t('session.supervision.auditNonFindingHelp')}</div>
               </div>
             </div>
-
-            <div class="session-settings-field">
-              <div class="session-settings-label">{t('session.supervision.customInstructionsLabel')}</div>
-              <textarea
-                class="input"
-                value={supervisionCustomInstructions}
-                onInput={(e) => setSupervision((prev) => ({ ...prev, customInstructions: (e.target as HTMLTextAreaElement).value }))}
-                rows={4}
-                style={{ width: '100%', resize: 'vertical' }}
-                disabled={saving}
-                placeholder={t('session.supervision.customInstructionsPlaceholder')}
-              />
-              <div class="session-settings-field-help">
-                {t('session.supervision.customInstructionsHelp')}
-              </div>
-
-              <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginTop: 8, cursor: saving ? 'not-allowed' : 'pointer' }}>
-                <input
-                  type="checkbox"
-                  checked={supervisionCustomInstructionsOverride}
-                  disabled={saving}
-                  onChange={(e) => {
-                    const checked = (e.target as HTMLInputElement).checked;
-                    setSupervision((prev) => ({ ...prev, customInstructionsOverride: checked }));
-                  }}
-                  style={{ marginTop: 2 }}
-                />
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                  <span style={{ fontSize: 12, color: '#e2e8f0' }}>
-                    {t('session.supervision.customInstructionsOverrideLabel')}
-                  </span>
-                  <span style={{ fontSize: 11, color: '#64748b' }}>
-                    {t('session.supervision.customInstructionsOverrideHelp')}
-                  </span>
-                </div>
-              </label>
-
-              {shouldShowMergedPreview && (
-                <div
-                  data-testid="supervision-merged-preview"
-                  style={{ marginTop: 8, padding: 10, borderRadius: 8, background: 'rgba(15, 23, 42, 0.6)', border: '1px dashed rgba(148, 163, 184, 0.24)' }}
-                >
-                  <div style={{ fontSize: 11, color: '#cbd5e1', fontWeight: 600, marginBottom: 4 }}>
-                    {t('session.supervision.customInstructionsMergedPreviewHeading')}
-                  </div>
-                  <pre style={{ margin: 0, fontSize: 11, color: '#94a3b8', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-                    {supervisionMergedPreview}
-                  </pre>
-                </div>
-              )}
-            </div>
-
-            {isAuditMode && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                <div style={{ maxWidth: 200 }}>
-                  <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.maxAuditLoops')}</div>
-                  <input
-                    class="input"
-                    type="number"
-                    min={0}
-                    value={String(supervisionAuditLoops)}
-                    onInput={(e) => {
-                      const value = Number.parseInt((e.target as HTMLInputElement).value, 10);
-                      setSupervision((prev) => ({ ...prev, maxAuditLoops: Number.isFinite(value) && value >= 0 ? value : DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS }));
-                    }}
-                    style={{ width: '100%' }}
-                    disabled={saving}
-                  />
-                </div>
-                <div class="session-settings-audit-severities" data-testid="audit-blocking-severities">
-                  <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.supervision.auditBlockingSeverities')}</div>
-                  <div style={{ fontSize: 11, color: '#64748b', marginBottom: 6 }}>{t('session.supervision.auditBlockingSeveritiesHelp')}</div>
-                  {AUDIT_SEVERITY_LEVELS.map((level) => {
-                    const checked = supervisionAuditBlockingSeverities.includes(level);
-                    const lastSelected = checked && supervisionAuditBlockingSeverities.length === 1;
-                    return (
-                      <label key={level} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 12, color: '#cbd5e1', marginBottom: 4 }}>
-                        <input
-                          type="checkbox"
-                          data-testid={`audit-blocking-severity-${level}`}
-                          checked={checked}
-                          disabled={saving || lastSelected}
-                          title={lastSelected ? t('session.supervision.auditBlockingSeveritiesAtLeastOne') : undefined}
-                          onChange={(e) => toggleAuditBlockingSeverity(level, (e.target as HTMLInputElement).checked)}
-                        />
-                        <span>
-                          <strong>{level}</strong>{' '}
-                          <span style={{ color: '#94a3b8' }} data-testid={`audit-blocking-severity-description-${level}`}>{t(`session.supervision.auditSeverity.${level}`)}</span>
-                        </span>
-                      </label>
-                    );
-                  })}
-                  <div
-                    data-testid="audit-non-finding-policy"
-                    style={{ marginTop: 8, padding: '8px 10px', borderRadius: 6, background: '#0f172a', color: '#94a3b8', fontSize: 11, lineHeight: 1.5 }}
-                  >
-                    <strong style={{ color: '#cbd5e1' }}>{t('session.supervision.auditNonFindingTitle')}</strong>
-                    <div>{t('session.supervision.auditNonFindingHelp')}</div>
-                  </div>
-                </div>
-
-              </div>
-            )}
 
             {isMainSession && (
               <TaskPairSettingsSection
@@ -1952,61 +1010,6 @@ export function SessionSettingsDialog({
                 }))}
               />
             )}
-
-            <div class="session-settings-summary">
-              <div style={{ fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>{t('session.supervision.summaryTitle')}</div>
-              <div style={{ fontSize: 12, color: '#94a3b8' }}>{t('session.supervision.summaryMode', { value: supervisionModeLabel })}</div>
-              <div style={{ fontSize: 12, color: '#94a3b8' }}>
-                {t('session.supervision.summaryBackendModel', {
-                  backend: supervisorDefaultsBackend ? labelForBackend(t, supervisorDefaultsBackend) : t('session.supervision.summaryUnset'),
-                  model: supervisorDefaultsModel.trim() || t('session.supervision.summaryUnset'),
-                })}
-              </div>
-              <div style={{ fontSize: 12, color: '#94a3b8' }}>
-                {t('session.supervision.summaryTimeout', { value: `${supervisorDefaultsTimeoutSeconds} s` })}
-              </div>
-              <div style={{ fontSize: 12, color: '#94a3b8' }}>
-                {t('session.supervision.summaryContinueLimits', {
-                  streak: supervisionAutoContinueStreak,
-                  total: supervisionAutoContinueTotal,
-                })}
-              </div>
-              <div style={{ fontSize: 12, color: '#94a3b8' }}>
-                {t('session.supervision.summaryCustomInstructions', {
-                  value: supervisionCustomInstructions.trim()
-                    ? t('session.supervision.summaryCustomInstructionsSet')
-                    : t('session.supervision.summaryUnset'),
-                })}
-              </div>
-              {isAuditMode && (
-                <div style={{ fontSize: 12, color: '#94a3b8' }}>
-                  {t('session.supervision.summaryAudit', {
-                    loops: supervisionAuditLoops,
-                  })}
-                </div>
-              )}
-              {isAuditMode && (
-                <div style={{ fontSize: 12, color: '#94a3b8' }} data-testid="audit-blocking-summary">
-                  {t('session.supervision.summaryAuditBlocking', {
-                    value: supervisionAuditBlockingSeverities.join(', '),
-                  })}
-                </div>
-              )}
-              <div style={{ fontSize: 11, color: '#64748b' }}>
-                {t('session.supervision.summaryMeta', {
-                  promptVersion: supervisorDefaultsPromptVersion,
-                  repairVersion: SUPERVISION_REPAIR_PROMPT_VERSION,
-                  parseRetries: supervisionParseRetries,
-                  taskRunVersion: taskRunPromptVersion,
-                })}
-              </div>
-            </div>
-          </>
-        )}
-
-        {!hasSupervision && (
-          <div style={{ fontSize: 12, color: '#64748b' }}>
-            {t('session.supervision.disabledHint')}
           </div>
         )}
       </div>
@@ -2016,7 +1019,6 @@ export function SessionSettingsDialog({
           {t('session.supervision.invalidStoredConfig')}
         </div>
       )}
-
     </div>
   ) : (
     <div style={{ color: '#fca5a5', fontSize: 12 }}>
@@ -2026,17 +1028,8 @@ export function SessionSettingsDialog({
 
   const supervisionValid = useMemo(() => {
     if (!isSupportedTransport) return true;
-    if (!hasSupervision) return true;
-    if (!globalDefaultsValid) return false;
-    if (isAuditMode) {
-      // The auditor is routed from auditPolicy + the live pool, so the legacy
-      // manual picker is not a precondition for a valid supervision config.
-      // Requiring an eligible candidate here made Save unreachable whenever no
-      // peer session happened to be open.
-      if (supervisionAuditLoops < 0) return false;
-    }
-    return true;
-  }, [globalDefaultsValid, hasSupervision, isAuditMode, isSupportedTransport, supervisionAuditLoops]);
+    return globalDefaultsValid;
+  }, [globalDefaultsValid, isSupportedTransport]);
 
   const dialog = (
     <div class={`dialog-overlay session-settings-overlay${poolSessionDialogOpen ? ' has-child-dialog' : ''}`} onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>

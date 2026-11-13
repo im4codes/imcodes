@@ -1792,10 +1792,12 @@ export function buildTransportConfigWithSupervision(
       || normalized.executionPools.economyTaskPool.configs.length > 0);
   const hasPairSettings = normalized.pairEngine !== undefined
     || normalized.pairMaxConcurrency !== undefined;
+  const hasAuditSettings = normalized.auditBlockingSeverities !== undefined;
   if (normalized.mode === SUPERVISION_MODE.OFF
     && !normalized.auditTargetSessionName
     && !hasConfiguredExecutionPools
-    && !hasPairSettings) {
+    && !hasPairSettings
+    && !hasAuditSettings) {
     if (!transportConfig) return null;
     const next = { ...transportConfig };
     delete next[SUPERVISION_TRANSPORT_CONFIG_KEY];
