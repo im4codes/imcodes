@@ -2,8 +2,10 @@ import {
   REPO_CALLBACK_PREF_KEYS,
   createDefaultRepoCallbackConfig,
   normalizeRepoCallbackGlobalPrefs,
+  normalizeRepoCallbackLookbackWindow,
   normalizeRepoCallbackServerPrefs,
   repoCallbackServerPrefKey,
+  resolveRepoCallbackSinceAtMsForSave,
   type RepoCallbackGlobalPrefs,
   type RepoCallbackRepoConfig,
   type RepoCallbackServerPrefs,
@@ -45,14 +47,24 @@ export async function saveRepoCallbackRepoConfig(
 ): Promise<RepoCallbackServerPrefs> {
   const existingRaw = await getUserPref(repoCallbackServerPrefKey(serverId));
   const current = normalizeRepoCallbackServerPrefs(existingRaw);
+  const nowMs = Date.now();
+  const prevConfig = current.repos[config.projectDir];
+  const nextDraft: RepoCallbackRepoConfig = {
+    ...config,
+    lookbackWindow: normalizeRepoCallbackLookbackWindow(config.lookbackWindow),
+    updatedAt: nowMs,
+  };
+  const sinceAtMs = resolveRepoCallbackSinceAtMsForSave(prevConfig, nextDraft, nowMs);
+  if (sinceAtMs === undefined) {
+    delete nextDraft.sinceAtMs;
+  } else {
+    nextDraft.sinceAtMs = sinceAtMs;
+  }
   const next = normalizeRepoCallbackServerPrefs({
     version: 1,
     repos: {
       ...current.repos,
-      [config.projectDir]: {
-        ...config,
-        updatedAt: Date.now(),
-      },
+      [config.projectDir]: nextDraft,
     },
   });
   await saveUserPref(repoCallbackServerPrefKey(serverId), next);

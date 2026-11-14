@@ -94,6 +94,7 @@ export interface CallbackCheckpointRecord {
   syncNextPage: number;
   syncHighSeq: number | null;
   pendingSeqs: CallbackPendingSeqEntry[];
+  sinceAtMs: number | null;
   updatedAt: number;
 }
 
@@ -107,6 +108,7 @@ interface CallbackCheckpointRow {
   sync_next_page: number;
   sync_high_seq: number | null;
   pending_seqs_json: string | null;
+  since_at_ms: number | null;
   updated_at: number;
 }
 
@@ -217,6 +219,7 @@ export class CallbackTaskStore {
         sync_next_page INTEGER NOT NULL DEFAULT 1,
         sync_high_seq INTEGER,
         pending_seqs_json TEXT,
+        since_at_ms INTEGER,
         updated_at INTEGER NOT NULL,
         PRIMARY KEY (source, scope_key, event_type)
       );
@@ -232,6 +235,10 @@ export class CallbackTaskStore {
         PRIMARY KEY (source, scope_key, run_id)
       );
     `);
+    const cpCols = this.db.prepare('PRAGMA table_info(callback_checkpoints)').all() as Array<{ name?: string }>;
+    if (!cpCols.some((c) => c.name === 'since_at_ms')) {
+      this.db.exec('ALTER TABLE callback_checkpoints ADD COLUMN since_at_ms INTEGER;');
+    }
   }
 
   close(): void {
@@ -492,7 +499,7 @@ export class CallbackTaskStore {
     const normalized = normalizeCallbackSource(source) ?? source;
     const row = this.db.prepare(`
       SELECT source, scope_key, event_type, baseline_complete, baseline_next_page,
-             watermark_seq, sync_next_page, sync_high_seq, pending_seqs_json, updated_at
+             watermark_seq, sync_next_page, sync_high_seq, pending_seqs_json, since_at_ms, updated_at
         FROM callback_checkpoints
        WHERE source = ? AND scope_key = ? AND event_type = ?
        LIMIT 1
@@ -522,6 +529,7 @@ export class CallbackTaskStore {
       syncNextPage: Math.max(1, row.sync_next_page),
       syncHighSeq: row.sync_high_seq ?? null,
       pendingSeqs,
+      sinceAtMs: row.since_at_ms ?? null,
       updatedAt: row.updated_at,
     };
   }
@@ -537,8 +545,8 @@ export class CallbackTaskStore {
     const cpStmt = this.db.prepare(`
       INSERT INTO callback_checkpoints (
         source, scope_key, event_type, baseline_complete, baseline_next_page,
-        watermark_seq, sync_next_page, sync_high_seq, pending_seqs_json, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        watermark_seq, sync_next_page, sync_high_seq, pending_seqs_json, since_at_ms, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT (source, scope_key, event_type) DO UPDATE SET
         baseline_complete = excluded.baseline_complete,
         baseline_next_page = excluded.baseline_next_page,
@@ -546,6 +554,7 @@ export class CallbackTaskStore {
         sync_next_page = excluded.sync_next_page,
         sync_high_seq = excluded.sync_high_seq,
         pending_seqs_json = excluded.pending_seqs_json,
+        since_at_ms = excluded.since_at_ms,
         updated_at = excluded.updated_at
     `);
     this.db.exec('BEGIN');
@@ -563,6 +572,7 @@ export class CallbackTaskStore {
         Math.max(1, checkpoint.syncNextPage),
         checkpoint.syncHighSeq,
         checkpoint.pendingSeqs.length > 0 ? JSON.stringify(checkpoint.pendingSeqs) : null,
+        checkpoint.sinceAtMs ?? null,
         checkpoint.updatedAt,
       );
       this.db.exec('COMMIT');

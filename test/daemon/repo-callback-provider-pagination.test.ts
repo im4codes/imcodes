@@ -532,4 +532,89 @@ describe('RepoCallbackMonitor + real GitLabProvider & GitHubProvider CI run gene
 
     store.close();
   });
+
+  it('stops multi-page CI history crawl on cutoff without fetching page 2 when page 1 has pre-cutoff runs', async () => {
+    const cutoff = 1_700_000_500_000;
+    const page1Runs = [
+      {
+        id: 202,
+        name: 'CI',
+        status: 'completed',
+        branch: 'main',
+        commitSha: 'new11111',
+        commitMessage: 'post cutoff',
+        actor: 'alice',
+        url: 'https://github.com/acme/widget/actions/runs/202',
+        createdAt: cutoff + 2_000,
+        updatedAt: cutoff + 3_000,
+        runNumber: 202,
+        event: 'push',
+        conclusion: 'failure',
+        runAttempt: 1,
+      },
+      {
+        id: 201,
+        name: 'CI',
+        status: 'completed',
+        branch: 'main',
+        commitSha: 'old00000',
+        commitMessage: 'pre cutoff',
+        actor: 'bob',
+        url: 'https://github.com/acme/widget/actions/runs/201',
+        createdAt: cutoff - 10_000,
+        updatedAt: cutoff - 5_000,
+        runNumber: 201,
+        event: 'push',
+        conclusion: 'failure',
+        runAttempt: 1,
+      },
+    ];
+    const requestedPages: number[] = [];
+
+    repoExecMock.mockImplementation(async (_cmd: string, args: string[]) => {
+      const url = String(args[1] ?? '');
+      if (url.includes('/jobs')) {
+        return { stdout: JSON.stringify({ runId: 202, jobs: [] }), stderr: '' };
+      }
+      if (url.includes('/actions/runs?')) {
+        const pageMatch = url.match(/[?&]page=(\d+)/);
+        const page = pageMatch ? Number(pageMatch[1]) : 1;
+        requestedPages.push(page);
+        if (page > 1) {
+          throw new Error('Must not fetch page 2 when page 1 already crossed cutoff');
+        }
+        return { stdout: JSON.stringify(page1Runs), stderr: '' };
+      }
+      throw new Error(`Unexpected gh api call: ${url}`);
+    });
+
+    const store = new CallbackTaskStore(':memory:');
+    const projectDir = '/tmp/repo-gh-cutoff-stop';
+    const config = createDefaultRepoCallbackConfig(projectDir);
+    config.enabled = true;
+    config.lookbackWindow = 'now';
+    config.sinceAtMs = cutoff;
+    config.updatedAt = cutoff;
+    config.events.ci_failed.enabled = true;
+    config.events.issue_new.enabled = false;
+    config.events.pr_new.enabled = false;
+
+    const monitor = new RepoCallbackMonitor({
+      store,
+      detect: async () => makeGhContext(),
+      createProvider: (ctx, dir) => new GitHubProvider(ctx.info!.owner, ctx.info!.repo, dir),
+      listSessions: () => [makeSession(projectDir)],
+      sendToSession: async () => {},
+      perPage: 2,
+      maxPagesPerPoll: 3,
+    });
+    monitor.setConfigsForTesting({ repos: { [projectDir]: config } });
+
+    const res = await monitor.checkProject(projectDir);
+    expect(res.dispatched).toBe(1);
+    expect(requestedPages).toEqual([1]);
+    expect(store.listCallbacks({ scopeKey: projectDir }).map((c) => c.entityKey)).toEqual(['run#202#1']);
+
+    store.close();
+  });
 });

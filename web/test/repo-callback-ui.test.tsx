@@ -4,11 +4,18 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/preact';
 import { REPO_MSG } from '@shared/repo-types.js';
-import { REPO_CALLBACK_PREF_KEYS, repoCallbackServerPrefKey, resolveRepoCallbackPromptTemplate, type RepoCallbackRepoConfig, type RepoCallbackTemplate } from '@shared/repo-callback.js';
+import {
+  REPO_CALLBACK_PREF_KEYS,
+  normalizeRepoCallbackRepoConfig,
+  repoCallbackServerPrefKey,
+  resolveRepoCallbackPromptTemplate,
+  type RepoCallbackRepoConfig,
+  type RepoCallbackTemplate,
+} from '@shared/repo-callback.js';
 import type { CallbackTaskRecord } from '@shared/callback-types.js';
 import type { WsClient, ServerMessage } from '../src/ws-client.js';
 import { RepoPage } from '../src/pages/RepoPage.js';
-import { buildRepoCallbackTargetOptions } from '../src/repo-callback-prefs.js';
+import { buildRepoCallbackTargetOptions, saveRepoCallbackRepoConfig } from '../src/repo-callback-prefs.js';
 import { getUserPref } from '../src/api.js';
 
 const prefStore = new Map<string, unknown>();
@@ -30,6 +37,11 @@ vi.mock('react-i18next', () => ({
       if (key === 'repo.callback_enabled') return 'Enable background repository monitoring';
       if (key === 'repo.callback_interval_label') return 'Poll interval';
       if (key === 'repo.callback_interval_minutes') return `Every ${opts?.minutes ?? ''}`;
+      if (key === 'repo.callback_lookback_label') return 'Monitor from';
+      if (key === 'repo.callback_lookback_now') return 'From now (after enabled)';
+      if (key === 'repo.callback_lookback_1d') return 'Last 1 day';
+      if (key === 'repo.callback_lookback_3d') return 'Last 3 days';
+      if (key === 'repo.callback_lookback_7d') return 'Last 7 days';
       if (key === 'repo.callback_target_label') return 'Callback target session';
       if (key === 'repo.callback_target_brain') return 'Project Brain (default)';
       if (key === 'repo.callback_events_title') return 'Monitored events';
@@ -449,8 +461,132 @@ describe('RepoCallbackModal & RepoPage callback integration', () => {
       // ci_failed starts expanded; verify template select fits container
       const selectEl = screen.getByLabelText('New CI failure (Actions / Pipelines) Prompt template') as HTMLSelectElement;
       expect(selectEl.style.maxWidth).toBe('100%');
+      // Monitor from selector should also be present in the settings grid
+      const lookbackSelect = screen.getByLabelText('Monitor from') as HTMLSelectElement;
+      expect(lookbackSelect.value).toBe('now');
     } finally {
       Object.defineProperty(window, 'innerWidth', { value: origInnerWidth, configurable: true, writable: true });
     }
+  });
+
+  it('anchors sinceAtMs on enable, preserves it on unrelated saves, re-anchors on lookback change, and persists modal selection', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const t0 = 1_700_500_000_000;
+      vi.setSystemTime(t0);
+
+      // 1. Default normalization uses lookbackWindow: 'now'
+      const normalized = normalizeRepoCallbackRepoConfig({ projectDir: '/work/repo-a', enabled: true, intervalMs: 120_000, target: 'brain', events: {} });
+      expect(normalized?.lookbackWindow).toBe('now');
+      expect(normalized?.sinceAtMs).toBeUndefined();
+
+      // 2. Enable via modal with '3d' lookback -> sets sinceAtMs = now - 3d
+      const ws = createMockWs();
+      render(<RepoPage ws={ws} serverId="srv-1" projectDir="/work/repo-a" />);
+      await openModalAndAwaitPrefs();
+
+      const lookbackSelect = screen.getByLabelText('Monitor from') as HTMLSelectElement;
+      expect(lookbackSelect.value).toBe('now');
+
+      fireEvent.click(screen.getByLabelText('Enable background repository monitoring'));
+      changeSelect(lookbackSelect, '3d');
+      await waitFor(() => {
+        expect((screen.getByLabelText('Monitor from') as HTMLSelectElement).value).toBe('3d');
+      });
+      const statusCallsBeforeSave = vi.mocked(ws.repoCallbackStatus).mock.calls.length;
+      fireEvent.click(screen.getByText('Save settings'));
+
+      const serverKey = repoCallbackServerPrefKey('srv-1');
+      await waitFor(() => {
+        const saved = (prefStore.get(serverKey) as { repos: Record<string, RepoCallbackRepoConfig> } | undefined)?.repos['/work/repo-a'];
+        expect(saved?.enabled).toBe(true);
+        expect(saved?.lookbackWindow).toBe('3d');
+        expect(saved?.sinceAtMs).toBeGreaterThanOrEqual(t0 - 3 * 86_400_000);
+        expect(saved?.sinceAtMs).toBeLessThanOrEqual(t0 - 3 * 86_400_000 + 2_000);
+        expect(ws.repoCallbackSync).toHaveBeenCalledWith('/work/repo-a');
+      });
+      // Must NOT fire a racing concurrent repoCallbackStatus immediately on save
+      expect(vi.mocked(ws.repoCallbackStatus).mock.calls.length).toBe(statusCallsBeforeSave);
+
+      const anchoredSince = ((prefStore.get(serverKey) as { repos: Record<string, RepoCallbackRepoConfig> }).repos['/work/repo-a']!).sinceAtMs!;
+
+      // 3. Unrelated save (interval change) while enabled with same lookbackWindow preserves sinceAtMs
+      const t1 = t0 + 60_000;
+      vi.setSystemTime(t1);
+      const savedAfterInterval = await saveRepoCallbackRepoConfig('srv-1', {
+        ...((prefStore.get(serverKey) as { repos: Record<string, RepoCallbackRepoConfig> }).repos['/work/repo-a']!),
+        intervalMs: 300_000,
+      });
+      expect(savedAfterInterval.repos['/work/repo-a']?.sinceAtMs).toBe(anchoredSince);
+
+      // 4. Changing lookbackWindow from '3d' to '1d' re-anchors sinceAtMs
+      const t2 = t0 + 120_000;
+      vi.setSystemTime(t2);
+      const savedAfterLookback = await saveRepoCallbackRepoConfig('srv-1', {
+        ...savedAfterInterval.repos['/work/repo-a']!,
+        lookbackWindow: '1d',
+      });
+      expect(savedAfterLookback.repos['/work/repo-a']?.sinceAtMs).toBeGreaterThanOrEqual(t2 - 86_400_000);
+      expect(savedAfterLookback.repos['/work/repo-a']?.sinceAtMs).toBeLessThanOrEqual(t2 - 86_400_000 + 2_000);
+
+      // 5. Disabling clears sinceAtMs so later re-enable anchors fresh
+      const savedDisabled = await saveRepoCallbackRepoConfig('srv-1', {
+        ...savedAfterLookback.repos['/work/repo-a']!,
+        enabled: false,
+      });
+      expect(savedDisabled.repos['/work/repo-a']?.sinceAtMs).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('initializes callbackRuntimeEnabled green dot from persisted prefs before CALLBACK_STATUS_RESPONSE arrives, and lets live daemon response govern', async () => {
+    const serverKey = repoCallbackServerPrefKey('srv-1');
+    prefStore.set(serverKey, {
+      version: 1,
+      repos: {
+        '/work/repo-green': {
+          projectDir: '/work/repo-green',
+          enabled: true,
+          intervalMs: 120_000,
+          target: 'brain',
+          lookbackWindow: 'now',
+          sinceAtMs: 1_700_000_000_000,
+          events: {
+            ci_failed: { enabled: true, templateScope: 'default' },
+            pr_new: { enabled: false, templateScope: 'default' },
+            issue_new: { enabled: false, templateScope: 'default' },
+          },
+          templates: [],
+          updatedAt: 1_700_000_000_000,
+        },
+      },
+    });
+
+    const ws = createMockWs();
+    const { container } = render(<RepoPage ws={ws} serverId="srv-1" projectDir="/work/repo-green" />);
+
+    const findDot = () => {
+      const btn = screen.getByText('Monitor & Callback').closest('button')!;
+      return btn.querySelector('span') as HTMLSpanElement;
+    };
+
+    // Even before daemon sends CALLBACK_STATUS_RESPONSE, green dot should reflect persisted enabled=true
+    await waitFor(() => {
+      expect(findDot().style.background).toBe('rgb(34, 197, 94)');
+    });
+
+    // When live daemon CALLBACK_STATUS_RESPONSE arrives with enabled=false, live daemon state governs
+    ws.emit({
+      type: REPO_MSG.CALLBACK_STATUS_RESPONSE,
+      projectDir: '/work/repo-green',
+      enabled: false,
+      checking: false,
+      callbacks: [],
+    });
+    await waitFor(() => {
+      expect(findDot().style.background).toBe('rgb(100, 116, 139)');
+    });
+    expect(container).toBeTruthy();
   });
 });

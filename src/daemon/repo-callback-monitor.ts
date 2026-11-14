@@ -11,7 +11,9 @@ import {
   REPO_CALLBACK_RECENT_HISTORY_LIMIT,
   REPO_CALLBACK_TARGET_BRAIN,
   buildRepoCallbackDedupKey,
+  computeRepoCallbackSinceAtMs,
   normalizeRepoCallbackGlobalPrefs,
+  normalizeRepoCallbackLookbackWindow,
   normalizeRepoCallbackServerPrefs,
   renderRepoCallbackPrompt,
   resolveRepoCallbackPromptTemplate,
@@ -332,6 +334,7 @@ export class RepoCallbackMonitor {
   private syncTimer: ReturnType<typeof setInterval> | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private refreshPromise: Promise<boolean> | null = null;
+  private hasCompletedInitialRefresh = false;
   private started = false;
 
   constructor(deps: RepoCallbackMonitorDeps = {}) {
@@ -417,12 +420,26 @@ export class RepoCallbackMonitor {
     }
   }
 
-  async refreshConfig(options: { pollNewlyEnabled?: boolean } = {}): Promise<boolean> {
-    if (this.refreshPromise) return this.refreshPromise;
+  async refreshConfig(options: { pollNewlyEnabled?: boolean; forceFresh?: boolean } = {}): Promise<boolean> {
+    if (this.refreshPromise) {
+      if (!options.forceFresh) return this.refreshPromise;
+      await this.refreshPromise.catch(() => false);
+      if (this.refreshPromise) return this.refreshPromise;
+    }
     this.refreshPromise = this.doRefreshConfig(options).finally(() => {
       this.refreshPromise = null;
     });
     return this.refreshPromise;
+  }
+
+  async ensureConfigLoadedForStatus(): Promise<void> {
+    if (this.refreshPromise) {
+      await this.refreshPromise;
+      return;
+    }
+    if (!this.hasCompletedInitialRefresh && this.repoConfigs.size === 0) {
+      await this.refreshConfig({ pollNewlyEnabled: false });
+    }
   }
 
   private async doRefreshConfig(options: { pollNewlyEnabled?: boolean }): Promise<boolean> {
@@ -471,6 +488,7 @@ export class RepoCallbackMonitor {
         }
       }
 
+      this.hasCompletedInitialRefresh = true;
       if (options.pollNewlyEnabled && newlyEnabledDirs.length > 0) {
         for (const dir of newlyEnabledDirs) {
           void this.checkProject(dir);
@@ -558,6 +576,16 @@ export class RepoCallbackMonitor {
     }
   }
 
+  private resolveEffectiveSinceMs(config: RepoCallbackRepoConfig): number | null {
+    if (typeof config.sinceAtMs === 'number' && Number.isFinite(config.sinceAtMs) && config.sinceAtMs > 0) {
+      return Math.floor(config.sinceAtMs);
+    }
+    if (typeof config.updatedAt === 'number' && Number.isFinite(config.updatedAt) && config.updatedAt > 0) {
+      return computeRepoCallbackSinceAtMs(normalizeRepoCallbackLookbackWindow(config.lookbackWindow), config.updatedAt);
+    }
+    return null;
+  }
+
   private async pollEventWithCheckpoint(
     provider: RepoProvider,
     config: RepoCallbackRepoConfig,
@@ -566,15 +594,28 @@ export class RepoCallbackMonitor {
     eventType: RepoCallbackEventType,
   ): Promise<number> {
     const checkpoint = this.store.getCheckpoint(CALLBACK_SOURCES.REPO, projectDir, eventType);
+    const effectiveSinceMs = this.resolveEffectiveSinceMs(config);
+    const lookbackWindow = normalizeRepoCallbackLookbackWindow(config.lookbackWindow);
+    const prevSinceMs = checkpoint?.sinceAtMs ?? null;
+    const expandedBackwards =
+      effectiveSinceMs !== null
+      && checkpoint !== null
+      && (
+        (prevSinceMs !== null && effectiveSinceMs < prevSinceMs)
+        || (prevSinceMs === null && lookbackWindow !== 'now')
+      );
+
     const pendingMap = new Map<number, number | undefined>();
     for (const entry of checkpoint?.pendingSeqs ?? []) {
+      if (effectiveSinceMs !== null && entry.createdAt !== undefined && entry.createdAt < effectiveSinceMs) {
+        continue;
+      }
       pendingMap.set(entry.seq, entry.createdAt);
     }
 
-    // 1. Cold-start / resumable historical baseline sweep.
-    // Never marks baselineComplete=true until provider pagination actually reaches EOF (!hasMore);
-    // bounded per poll via maxPagesPerPoll and persisted via baselineNextPage across ticks/restarts.
-    if (!checkpoint || !checkpoint.baselineComplete) {
+    // 1. Cold-start / resumable historical baseline sweep (unanchored legacy configs without a cutoff only).
+    // When effectiveSinceMs is set, items created before the cutoff are ignored and newer items are evaluated directly.
+    if (effectiveSinceMs === null && (!checkpoint || !checkpoint.baselineComplete)) {
       let currentPage = checkpoint?.baselineNextPage ?? 1;
       let watermarkSeq = checkpoint?.watermarkSeq ?? null;
       let pagesFetched = 0;
@@ -613,6 +654,7 @@ export class RepoCallbackMonitor {
             syncNextPage: 1,
             syncHighSeq: null,
             pendingSeqs: nextPending,
+            sinceAtMs: null,
             updatedAt: this.now(),
           },
           dedupKeysToMark,
@@ -625,10 +667,14 @@ export class RepoCallbackMonitor {
       return 0;
     }
 
-    // 2. Steady-state incremental & resumable multi-page polling.
-    let watermarkSeq = checkpoint.watermarkSeq ?? 0;
-    let currentPage = checkpoint.syncNextPage;
-    let syncHighSeq = checkpoint.syncHighSeq;
+    // 2. Steady-state / cutoff-bounded incremental & resumable multi-page polling.
+    const resetCursorForCutoff =
+      !checkpoint
+      || !checkpoint.baselineComplete
+      || expandedBackwards;
+    let watermarkSeq = resetCursorForCutoff ? 0 : (checkpoint.watermarkSeq ?? 0);
+    let currentPage = resetCursorForCutoff ? 1 : checkpoint.syncNextPage;
+    let syncHighSeq = resetCursorForCutoff ? null : checkpoint.syncHighSeq;
     let pagesFetched = 0;
     let detailFetches = 0;
     let dispatched = 0;
@@ -637,18 +683,26 @@ export class RepoCallbackMonitor {
       hasMore: boolean;
       minSeqOnPage: number | null;
       maxSeqOnPage: number | null;
+      sawBelowCutoff: boolean;
     }> => {
       const pageResult = await this.fetchEventPage(provider, projectDir, eventType, page);
       pagesFetched += 1;
 
       let minSeqOnPage: number | null = null;
       let maxSeqOnPage: number | null = null;
+      let sawBelowCutoff = false;
       const pageCandidates: Array<{ candidate: DetectedEventCandidate; ciStateUpsert?: CallbackCiRunStateRecord }> = [];
       const nonCandidateCiUpserts: CallbackCiRunStateRecord[] = [];
 
       for (const item of pageResult.items) {
         minSeqOnPage = minSeqOnPage === null ? item.seq : Math.min(minSeqOnPage, item.seq);
         maxSeqOnPage = maxSeqOnPage === null ? item.seq : Math.max(maxSeqOnPage, item.seq);
+
+        if (effectiveSinceMs !== null && item.createdAtMs !== undefined && item.createdAtMs < effectiveSinceMs) {
+          sawBelowCutoff = true;
+          pendingMap.delete(item.seq);
+          continue;
+        }
 
         if (item.pending) {
           pendingMap.set(item.seq, item.createdAtMs);
@@ -702,12 +756,13 @@ export class RepoCallbackMonitor {
         hasMore: pageResult.hasMore,
         minSeqOnPage,
         maxSeqOnPage,
+        sawBelowCutoff,
       };
     };
 
     if (eventType !== 'ci_failed') {
       // PRs and issues are ordered by creation descending and creations are immutable,
-      // so scanning stops once we hit our creation watermark (still never stopping on filtered-empty pages when hasMore is true).
+      // so scanning stops once we hit our creation watermark or cutoff (still never stopping on filtered-empty pages when hasMore is true and cutoff is not hit).
       while (pagesFetched < this.maxPagesPerPoll) {
         const pageInfo = await processPage(currentPage);
         if (pageInfo.maxSeqOnPage !== null) {
@@ -719,8 +774,10 @@ export class RepoCallbackMonitor {
           ? Math.min(...nextPending.map((entry) => entry.seq))
           : Infinity;
         const stopSeqThreshold = Math.min(watermarkSeq, oldestPendingSeq - 1);
+        const stoppedAtCutoff = effectiveSinceMs !== null && pageInfo.sawBelowCutoff;
         const reachedWatermark =
           !pageInfo.hasMore
+          || stoppedAtCutoff
           || (pageInfo.minSeqOnPage !== null && pageInfo.minSeqOnPage <= stopSeqThreshold);
 
         this.store.saveCheckpointProgress({
@@ -733,6 +790,7 @@ export class RepoCallbackMonitor {
           syncNextPage: reachedWatermark ? 1 : currentPage + 1,
           syncHighSeq: reachedWatermark ? null : syncHighSeq,
           pendingSeqs: nextPending,
+          sinceAtMs: effectiveSinceMs,
           updatedAt: this.now(),
         });
 
@@ -744,15 +802,17 @@ export class RepoCallbackMonitor {
 
     // CI workflow runs / pipelines are sorted by creation/id descending, NOT rerun/updated order:
     // an older run on page 2+ can be re-run (new runAttempt / state change) without changing its ID.
-    // Therefore CI polling must never early-stop on creation watermark; instead it maintains a bounded,
-    // resumable full-history sweep (`syncNextPage`) while still peeking page 1 when resuming deeper pages.
+    // Therefore CI polling maintains a bounded, resumable sweep (`syncNextPage`) while peeking page 1,
+    // stopping early once runs fall below `effectiveSinceMs`.
     let inHeadCatchup = syncHighSeq !== null && syncHighSeq > watermarkSeq;
 
     if (!inHeadCatchup && currentPage > 1 && this.maxPagesPerPoll >= 2) {
       const page1 = await processPage(1);
+      const page1StoppedAtCutoff = effectiveSinceMs !== null && page1.sawBelowCutoff;
       if (page1.maxSeqOnPage !== null && page1.maxSeqOnPage > watermarkSeq) {
         const page1ClearedBurst =
           !page1.hasMore
+          || page1StoppedAtCutoff
           || (page1.minSeqOnPage !== null && page1.minSeqOnPage <= watermarkSeq);
         if (page1ClearedBurst) {
           watermarkSeq = page1.maxSeqOnPage;
@@ -763,7 +823,7 @@ export class RepoCallbackMonitor {
           currentPage = 2;
         }
       }
-      if (!page1.hasMore) {
+      if (!page1.hasMore || page1StoppedAtCutoff) {
         currentPage = 1;
         syncHighSeq = null;
         inHeadCatchup = false;
@@ -778,9 +838,10 @@ export class RepoCallbackMonitor {
         syncNextPage: currentPage,
         syncHighSeq,
         pendingSeqs: prunePendingMap(pendingMap, this.now()),
+        sinceAtMs: effectiveSinceMs,
         updatedAt: this.now(),
       });
-      if (!page1.hasMore) {
+      if (!page1.hasMore || page1StoppedAtCutoff) {
         return dispatched;
       }
     }
@@ -791,8 +852,10 @@ export class RepoCallbackMonitor {
         syncHighSeq = syncHighSeq === null ? pageInfo.maxSeqOnPage : Math.max(syncHighSeq, pageInfo.maxSeqOnPage);
       }
 
+      const stoppedAtCutoff = effectiveSinceMs !== null && pageInfo.sawBelowCutoff;
       const caughtUpToWatermark =
         !pageInfo.hasMore
+        || stoppedAtCutoff
         || (pageInfo.minSeqOnPage !== null && pageInfo.minSeqOnPage <= watermarkSeq);
       if (caughtUpToWatermark && syncHighSeq !== null) {
         watermarkSeq = Math.max(watermarkSeq, syncHighSeq);
@@ -802,7 +865,7 @@ export class RepoCallbackMonitor {
         inHeadCatchup = true;
       }
 
-      const wrapped = !pageInfo.hasMore;
+      const wrapped = !pageInfo.hasMore || stoppedAtCutoff;
       const nextPage = wrapped ? 1 : currentPage + 1;
       if (wrapped) {
         if (syncHighSeq !== null) {
@@ -822,6 +885,7 @@ export class RepoCallbackMonitor {
         syncNextPage: nextPage,
         syncHighSeq,
         pendingSeqs: prunePendingMap(pendingMap, this.now()),
+        sinceAtMs: effectiveSinceMs,
         updatedAt: this.now(),
       });
 
@@ -1101,22 +1165,24 @@ export function refreshRepoCallbackMonitor(): Promise<boolean> {
 
 export async function handleRepoCallbackCommand(
   cmd: Record<string, unknown>,
-  serverLink: ServerLink,
+  serverLink: { send: (msg: Record<string, unknown>) => void },
+  opts?: { monitor?: RepoCallbackMonitor; listSessionsFn?: () => SessionRecord[] },
 ): Promise<void> {
-  const monitor = getRepoCallbackMonitor();
+  const monitor = opts?.monitor ?? getRepoCallbackMonitor();
+  const resolveSessions = opts?.listSessionsFn ?? listSessions;
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
   let rawProjectDir = typeof cmd.projectDir === 'string' ? cmd.projectDir.trim() : '';
   if (rawProjectDir === FS_SESSION_ROOT_PATH) {
     const sessionBinding = cmd.sessionName ?? cmd.sessionId ?? cmd.session ?? cmd.activeSessionName ?? cmd.activeSessionId;
     if (typeof sessionBinding === 'string' && sessionBinding.trim()) {
-      rawProjectDir = listSessions().find((s) => s.name === sessionBinding.trim())?.projectDir ?? '';
+      rawProjectDir = resolveSessions().find((s) => s.name === sessionBinding.trim())?.projectDir ?? '';
     } else {
       rawProjectDir = '';
     }
   }
 
   if (cmd.type === REPO_MSG.CALLBACK_SYNC) {
-    await monitor.refreshConfig({ pollNewlyEnabled: true });
+    await monitor.refreshConfig({ pollNewlyEnabled: true, forceFresh: true });
     if (rawProjectDir) {
       try {
         serverLink.send(monitor.buildStatusSnapshot(rawProjectDir, requestId));
@@ -1133,7 +1199,7 @@ export async function handleRepoCallbackCommand(
   }
 
   // Scope check: projectDir must match an active session directory in this daemon.
-  const knownDirs = new Set(listSessions().map((s) => s.projectDir));
+  const knownDirs = new Set(resolveSessions().map((s) => s.projectDir));
   if (!knownDirs.has(rawProjectDir)) {
     serverLink.send({ type: REPO_MSG.ERROR, requestId, projectDir: rawProjectDir, error: 'unauthorized' });
     return;
@@ -1147,6 +1213,7 @@ export async function handleRepoCallbackCommand(
   }
 
   if (cmd.type === REPO_MSG.CALLBACK_STATUS_REQUEST) {
+    await monitor.ensureConfigLoadedForStatus();
     serverLink.send(monitor.buildStatusSnapshot(rawProjectDir, requestId));
   }
 }

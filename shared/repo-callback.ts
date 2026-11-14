@@ -24,6 +24,16 @@ export const REPO_CALLBACK_DEFAULT_INTERVAL_MS = 120_000;
 export const REPO_CALLBACK_MAX_INTERVAL_MS = 3_600_000;
 export const REPO_CALLBACK_INTERVAL_PRESETS_MS = [60_000, 120_000, 300_000, 900_000] as const;
 
+export const REPO_CALLBACK_LOOKBACK_WINDOWS = ['now', '1d', '3d', '7d'] as const;
+export type RepoCallbackLookbackWindow = (typeof REPO_CALLBACK_LOOKBACK_WINDOWS)[number];
+export const REPO_CALLBACK_DEFAULT_LOOKBACK_WINDOW: RepoCallbackLookbackWindow = 'now';
+export const REPO_CALLBACK_LOOKBACK_MS: Record<RepoCallbackLookbackWindow, number> = {
+  now: 0,
+  '1d': 86_400_000,
+  '3d': 3 * 86_400_000,
+  '7d': 7 * 86_400_000,
+};
+
 export const REPO_CALLBACK_MAX_TEMPLATES_PER_SCOPE = 30;
 export const REPO_CALLBACK_MAX_PROMPT_CHARS = 4_000;
 export const REPO_CALLBACK_MAX_TEMPLATE_NAME_CHARS = 80;
@@ -62,6 +72,8 @@ export interface RepoCallbackRepoConfig {
   enabled: boolean;
   intervalMs: number;
   target: string;
+  lookbackWindow?: RepoCallbackLookbackWindow;
+  sinceAtMs?: number;
   events: Record<RepoCallbackEventType, RepoCallbackEventSetting>;
   templates: RepoCallbackTemplate[];
   updatedAt: number;
@@ -152,6 +164,38 @@ export function clampRepoCallbackIntervalMs(raw: unknown): number {
   return Math.max(REPO_CALLBACK_MIN_INTERVAL_MS, Math.min(REPO_CALLBACK_MAX_INTERVAL_MS, num));
 }
 
+export function normalizeRepoCallbackLookbackWindow(raw: unknown): RepoCallbackLookbackWindow {
+  return typeof raw === 'string' && (REPO_CALLBACK_LOOKBACK_WINDOWS as readonly string[]).includes(raw)
+    ? (raw as RepoCallbackLookbackWindow)
+    : REPO_CALLBACK_DEFAULT_LOOKBACK_WINDOW;
+}
+
+export function computeRepoCallbackSinceAtMs(
+  lookbackWindow: RepoCallbackLookbackWindow,
+  nowMs: number,
+): number {
+  const offset = REPO_CALLBACK_LOOKBACK_MS[lookbackWindow] ?? 0;
+  return Math.max(1, Math.floor(nowMs) - offset);
+}
+
+export function resolveRepoCallbackSinceAtMsForSave(
+  prev: RepoCallbackRepoConfig | undefined,
+  next: RepoCallbackRepoConfig,
+  nowMs: number,
+): number | undefined {
+  if (!next.enabled) return undefined;
+  const nextWindow = normalizeRepoCallbackLookbackWindow(next.lookbackWindow);
+  const prevWindow = normalizeRepoCallbackLookbackWindow(prev?.lookbackWindow);
+  const prevSinceAtMs =
+    typeof prev?.sinceAtMs === 'number' && Number.isFinite(prev.sinceAtMs) && prev.sinceAtMs > 0
+      ? Math.floor(prev.sinceAtMs)
+      : undefined;
+  if (!prev?.enabled || prevSinceAtMs === undefined || prevWindow !== nextWindow) {
+    return computeRepoCallbackSinceAtMs(nextWindow, nowMs);
+  }
+  return prevSinceAtMs;
+}
+
 export function createDefaultRepoCallbackEventSetting(eventType: RepoCallbackEventType): RepoCallbackEventSetting {
   return {
     enabled: eventType === 'ci_failed',
@@ -165,6 +209,7 @@ export function createDefaultRepoCallbackConfig(projectDir: string): RepoCallbac
     enabled: false,
     intervalMs: REPO_CALLBACK_DEFAULT_INTERVAL_MS,
     target: REPO_CALLBACK_TARGET_BRAIN,
+    lookbackWindow: REPO_CALLBACK_DEFAULT_LOOKBACK_WINDOW,
     events: {
       pr_new: createDefaultRepoCallbackEventSetting('pr_new'),
       issue_new: createDefaultRepoCallbackEventSetting('issue_new'),
@@ -245,11 +290,18 @@ export function normalizeRepoCallbackRepoConfig(raw: unknown, projectDirFallback
   const target = typeof obj.target === 'string' && obj.target.trim()
     ? obj.target.trim()
     : REPO_CALLBACK_TARGET_BRAIN;
+  const lookbackWindow = normalizeRepoCallbackLookbackWindow(obj.lookbackWindow);
+  const sinceAtMs =
+    typeof obj.sinceAtMs === 'number' && Number.isFinite(obj.sinceAtMs) && obj.sinceAtMs > 0
+      ? Math.floor(obj.sinceAtMs)
+      : undefined;
   return {
     projectDir,
     enabled: obj.enabled === true,
     intervalMs: clampRepoCallbackIntervalMs(obj.intervalMs),
     target,
+    lookbackWindow,
+    ...(sinceAtMs !== undefined ? { sinceAtMs } : {}),
     events: {
       pr_new: normalizeEventSetting(rawEvents.pr_new, 'pr_new'),
       issue_new: normalizeEventSetting(rawEvents.issue_new, 'issue_new'),

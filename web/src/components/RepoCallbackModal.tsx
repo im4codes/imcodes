@@ -2,15 +2,19 @@ import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { CallbackStatus, CallbackTaskRecord } from '@shared/callback-types.js';
 import {
+  REPO_CALLBACK_DEFAULT_LOOKBACK_WINDOW,
   REPO_CALLBACK_DEFAULT_PROMPTS,
   REPO_CALLBACK_INTERVAL_PRESETS_MS,
+  REPO_CALLBACK_LOOKBACK_WINDOWS,
   REPO_CALLBACK_MAX_PROMPT_CHARS,
   REPO_CALLBACK_MAX_TEMPLATE_NAME_CHARS,
   REPO_CALLBACK_TARGET_BRAIN,
   REPO_CALLBACK_TEMPLATE_VARIABLES,
   createDefaultRepoCallbackConfig,
+  normalizeRepoCallbackLookbackWindow,
   resolveRepoCallbackPromptTemplate,
   type RepoCallbackEventType,
+  type RepoCallbackLookbackWindow,
   type RepoCallbackRepoConfig,
   type RepoCallbackTemplate,
   type RepoCallbackTemplateScope,
@@ -316,10 +320,15 @@ export function RepoCallbackModal({
         };
         setDraft(nextDraft);
         if (serverId) {
-          await saveRepoCallbackRepoConfig(serverId, nextDraft);
+          const savedServer = await saveRepoCallbackRepoConfig(serverId, nextDraft);
+          const savedRepo = savedServer.repos[projectDir] ?? nextDraft;
+          setDraft(savedRepo);
+          ws.repoCallbackSync?.(projectDir);
+          onConfigSaved?.(savedRepo, savedGlobal.templates);
+        } else {
+          ws.repoCallbackSync?.(projectDir);
+          onConfigSaved?.(nextDraft, savedGlobal.templates);
         }
-        ws.repoCallbackSync?.();
-        onConfigSaved?.(nextDraft, savedGlobal.templates);
         setFeedback({ kind: 'success', text: t('repo.callback_tpl_saved_global', { name }) });
       } else {
         const nextTemplates = [
@@ -341,9 +350,11 @@ export function RepoCallbackModal({
         };
         setDraft(nextDraft);
         if (serverId) {
-          await saveRepoCallbackRepoConfig(serverId, nextDraft);
-          ws.repoCallbackSync?.();
-          onConfigSaved?.(nextDraft, globalTemplates);
+          const savedServer = await saveRepoCallbackRepoConfig(serverId, nextDraft);
+          const savedRepo = savedServer.repos[projectDir] ?? nextDraft;
+          setDraft(savedRepo);
+          ws.repoCallbackSync?.(projectDir);
+          onConfigSaved?.(savedRepo, globalTemplates);
         }
         setFeedback({ kind: 'success', text: t('repo.callback_tpl_saved_repo', { name }) });
       }
@@ -383,9 +394,11 @@ export function RepoCallbackModal({
       };
       setDraft(nextDraft);
       if (serverId) {
-        await saveRepoCallbackRepoConfig(serverId, nextDraft);
+        const savedServer = await saveRepoCallbackRepoConfig(serverId, nextDraft);
+        const savedRepo = savedServer.repos[projectDir] ?? nextDraft;
+        setDraft(savedRepo);
       }
-      ws.repoCallbackSync?.();
+      ws.repoCallbackSync?.(projectDir);
       setFeedback({ kind: 'success', text: t('repo.callback_tpl_deleted') });
     } catch (err) {
       setFeedback({ kind: 'error', text: err instanceof Error ? err.message : t('repo.callback_save_error') });
@@ -407,10 +420,11 @@ export function RepoCallbackModal({
         projectDir,
         updatedAt: Date.now(),
       };
-      await saveRepoCallbackRepoConfig(serverId, nextConfig);
-      ws.repoCallbackSync?.();
-      ws.repoCallbackStatus?.(projectDir);
-      onConfigSaved?.(nextConfig, globalTemplates);
+      const savedServer = await saveRepoCallbackRepoConfig(serverId, nextConfig);
+      const savedRepo = savedServer.repos[projectDir] ?? nextConfig;
+      setDraft(savedRepo);
+      ws.repoCallbackSync?.(projectDir);
+      onConfigSaved?.(savedRepo, globalTemplates);
       setFeedback({ kind: 'success', text: t('repo.callback_saved') });
     } catch (err) {
       setFeedback({ kind: 'error', text: err instanceof Error ? err.message : t('repo.callback_save_error') });
@@ -574,6 +588,28 @@ export function RepoCallbackModal({
                   {REPO_CALLBACK_INTERVAL_PRESETS_MS.map((ms) => (
                     <option key={ms} value={String(ms)}>
                       {t('repo.callback_interval_minutes', { minutes: formatIntervalLabel(ms) })}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12, color: '#cbd5e1' }}>
+                <span>{t('repo.callback_lookback_label')}</span>
+                <select
+                  aria-label={t('repo.callback_lookback_label')}
+                  value={normalizeRepoCallbackLookbackWindow(draft.lookbackWindow ?? REPO_CALLBACK_DEFAULT_LOOKBACK_WINDOW)}
+                  disabled={readOnly}
+                  onChange={(e) => {
+                    const lookbackWindow: RepoCallbackLookbackWindow = normalizeRepoCallbackLookbackWindow(
+                      (e.target as HTMLSelectElement).value,
+                    );
+                    setDraft((prev) => ({ ...prev, lookbackWindow }));
+                  }}
+                  style={{ background: '#0f172a', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '6px 8px', fontSize: 12 }}
+                >
+                  {REPO_CALLBACK_LOOKBACK_WINDOWS.map((win) => (
+                    <option key={win} value={win}>
+                      {t(`repo.callback_lookback_${win}`)}
                     </option>
                   ))}
                 </select>

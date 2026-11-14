@@ -9,6 +9,7 @@ import {
 import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import {
+  computeRepoCallbackSinceAtMs,
   createDefaultRepoCallbackConfig,
   renderRepoCallbackPrompt,
   resolveRepoCallbackPromptTemplate,
@@ -17,7 +18,8 @@ import {
 import { CallbackTaskStore } from '../../src/daemon/callback-task-store.js';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
-import { RepoCallbackMonitor } from '../../src/daemon/repo-callback-monitor.js';
+import { RepoCallbackMonitor, handleRepoCallbackCommand } from '../../src/daemon/repo-callback-monitor.js';
+import { REPO_MSG } from '../../shared/repo-types.js';
 import type { RepoProvider } from '../../src/repo/provider.js';
 import type {
   RepoActionDetail,
@@ -1230,6 +1232,364 @@ describe('RepoCallbackMonitor background polling & delivery', () => {
     cp = store.getCheckpoint(CALLBACK_SOURCES.REPO, '/tmp/repo-a', 'pr_new');
     expect(cp?.baselineComplete).toBe(true);
     expect(sent).toHaveLength(0);
+
+    store.close();
+  });
+
+  it('ignores pre-cutoff PRs, Issues, and pending/failed/rerun CI runs by default and stops paging at cutoff', async () => {
+    const store = new CallbackTaskStore(':memory:');
+    const sent: Array<{ sessionName: string; text: string }> = [];
+    const cutoff = 1_700_000_100_000;
+
+    let prs: RepoPR[] = [
+      {
+        number: 20,
+        title: 'Post-cutoff PR',
+        author: 'alice',
+        state: 'open',
+        draft: false,
+        head: 'feat/new',
+        base: 'main',
+        labels: [],
+        createdAt: cutoff + 1_000,
+        updatedAt: cutoff + 1_000,
+        url: 'https://github.com/acme/widget/pull/20',
+      },
+      {
+        number: 19,
+        title: 'Pre-cutoff PR',
+        author: 'alice',
+        state: 'open',
+        draft: false,
+        head: 'feat/old',
+        base: 'main',
+        labels: [],
+        createdAt: cutoff - 10_000,
+        updatedAt: cutoff - 5_000,
+        url: 'https://github.com/acme/widget/pull/19',
+      },
+      {
+        number: 18,
+        title: 'Page 2 PR',
+        author: 'alice',
+        state: 'open',
+        draft: false,
+        head: 'feat/older',
+        base: 'main',
+        labels: [],
+        createdAt: cutoff - 20_000,
+        updatedAt: cutoff - 20_000,
+        url: 'https://github.com/acme/widget/pull/18',
+      },
+    ];
+
+    let issues: RepoIssue[] = [
+      {
+        number: 9,
+        title: 'Old issue',
+        author: 'bob',
+        state: 'open',
+        labels: [],
+        createdAt: cutoff - 5_000,
+        updatedAt: cutoff - 5_000,
+        url: 'https://github.com/acme/widget/issues/9',
+      },
+    ];
+
+    let actions: RepoWorkflowRun[] = [
+      {
+        id: 200,
+        name: 'CI',
+        status: 'in_progress',
+        branch: 'main',
+        commitSha: 'aaaa2222',
+        commitMessage: 'new commit',
+        actor: 'alice',
+        url: 'https://github.com/acme/widget/actions/runs/200',
+        createdAt: cutoff + 500,
+        updatedAt: cutoff + 500,
+        runNumber: 200,
+        event: 'push',
+        runAttempt: 1,
+      },
+      {
+        id: 199,
+        name: 'CI',
+        status: 'in_progress',
+        branch: 'main',
+        commitSha: 'bbbb1111',
+        commitMessage: 'pre-cutoff pending run',
+        actor: 'bob',
+        url: 'https://github.com/acme/widget/actions/runs/199',
+        createdAt: cutoff - 1_000,
+        updatedAt: cutoff - 500,
+        runNumber: 199,
+        event: 'push',
+        runAttempt: 1,
+      },
+      {
+        id: 198,
+        name: 'CI',
+        status: 'completed',
+        conclusion: 'failure',
+        branch: 'main',
+        commitSha: 'cccc0000',
+        commitMessage: 'old failed run',
+        actor: 'bob',
+        url: 'https://github.com/acme/widget/actions/runs/198',
+        createdAt: cutoff - 60_000,
+        updatedAt: cutoff - 50_000,
+        runNumber: 198,
+        event: 'push',
+        runAttempt: 1,
+      },
+    ];
+
+    const prPagesFetched: number[] = [];
+    const actionPagesFetched: number[] = [];
+    const provider: RepoProvider = {
+      ...createMockProvider({}),
+      listPRs: vi.fn(async (opts) => {
+        const page = opts?.page ?? 1;
+        prPagesFetched.push(page);
+        const start = (page - 1) * 2;
+        return {
+          items: prs.slice(start, start + 2),
+          page,
+          hasMore: start + 2 < prs.length,
+          projectDir: '/tmp/repo-cutoff',
+        };
+      }),
+      listIssues: vi.fn(async (opts) => {
+        const page = opts?.page ?? 1;
+        return { items: page === 1 ? issues : [], page, hasMore: false, projectDir: '/tmp/repo-cutoff' };
+      }),
+      listActions: vi.fn(async (opts) => {
+        const page = opts?.page ?? 1;
+        actionPagesFetched.push(page);
+        return { items: page === 1 ? actions : [], page, hasMore: page === 1, projectDir: '/tmp/repo-cutoff' };
+      }),
+      getActionDetail: vi.fn(async () => null),
+    };
+
+    const config = createDefaultRepoCallbackConfig('/tmp/repo-cutoff');
+    config.enabled = true;
+    config.lookbackWindow = 'now';
+    config.sinceAtMs = cutoff;
+    config.updatedAt = cutoff;
+    config.events.pr_new.enabled = true;
+    config.events.issue_new.enabled = true;
+    config.events.ci_failed.enabled = true;
+
+    const monitor = new RepoCallbackMonitor({
+      store,
+      detect: async () => createOkContext('/tmp/repo-cutoff'),
+      createProvider: () => provider,
+      listSessions: () => [makeSession({ projectDir: '/tmp/repo-cutoff' })],
+      sendToSession: async (sessionName, text) => {
+        sent.push({ sessionName, text });
+      },
+      perPage: 2,
+      maxPagesPerPoll: 3,
+      now: () => cutoff + 2_000,
+    });
+    monitor.setConfigsForTesting({ repos: { '/tmp/repo-cutoff': config } });
+
+    // Poll 1: immediately dispatches PR #20 (>= cutoff), ignores PR #19 & Issue #9 & CI #198/#199,
+    // stops before fetching PR page 2 or CI page 2 because sawBelowCutoff fired on page 1!
+    await monitor.checkProject('/tmp/repo-cutoff');
+    expect(prPagesFetched).toEqual([1]);
+    expect(actionPagesFetched).toEqual([1]);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.text).toContain('PR #20');
+
+    // Poll 2: CI #199 (pre-cutoff) fails, CI #198 (pre-cutoff) is re-run and fails again, AND CI #200 (post-cutoff) fails.
+    // ONLY CI #200 should dispatch!
+    actions = [
+      { ...actions[0]!, status: 'completed', conclusion: 'failure', updatedAt: cutoff + 5_000 },
+      { ...actions[1]!, status: 'completed', conclusion: 'failure', updatedAt: cutoff + 5_000 },
+      { ...actions[2]!, status: 'completed', conclusion: 'failure', runAttempt: 2, updatedAt: cutoff + 5_000 },
+    ];
+    await monitor.checkProject('/tmp/repo-cutoff');
+    expect(sent).toHaveLength(2);
+    expect(sent[1]?.text).toContain('Run: #200');
+    expect(sent[1]?.text).toContain('aaaa222');
+
+    store.close();
+  });
+
+  it('supports lookback windows (1d/3d/7d) and expands from now -> 3d without duplicating already-dispatched events', async () => {
+    const store = new CallbackTaskStore(':memory:');
+    const sent: Array<{ sessionName: string; text: string }> = [];
+    const nowMs = 1_700_800_000_000;
+    const oneDayMs = 86_400_000;
+
+    const prs: RepoPR[] = [
+      {
+        number: 30,
+        title: 'After enable PR',
+        author: 'alice',
+        state: 'open',
+        draft: false,
+        head: 'b/30',
+        base: 'main',
+        labels: [],
+        createdAt: nowMs + 1_000,
+        updatedAt: nowMs + 1_000,
+        url: 'https://github.com/acme/widget/pull/30',
+      },
+      {
+        number: 29,
+        title: 'Two days ago PR',
+        author: 'bob',
+        state: 'open',
+        draft: false,
+        head: 'b/29',
+        base: 'main',
+        labels: [],
+        createdAt: nowMs - 2 * oneDayMs,
+        updatedAt: nowMs - 2 * oneDayMs,
+        url: 'https://github.com/acme/widget/pull/29',
+      },
+      {
+        number: 28,
+        title: 'Five days ago PR',
+        author: 'carol',
+        state: 'open',
+        draft: false,
+        head: 'b/28',
+        base: 'main',
+        labels: [],
+        createdAt: nowMs - 5 * oneDayMs,
+        updatedAt: nowMs - 5 * oneDayMs,
+        url: 'https://github.com/acme/widget/pull/28',
+      },
+    ];
+
+    const provider: RepoProvider = {
+      ...createMockProvider({}),
+      listPRs: vi.fn(async () => ({ items: prs, page: 1, hasMore: false, projectDir: '/tmp/repo-lookback' })),
+    };
+
+    const config = createDefaultRepoCallbackConfig('/tmp/repo-lookback');
+    config.enabled = true;
+    config.lookbackWindow = 'now';
+    config.sinceAtMs = computeRepoCallbackSinceAtMs('now', nowMs);
+    config.updatedAt = nowMs;
+    config.events.pr_new.enabled = true;
+    config.events.ci_failed.enabled = false;
+    config.events.issue_new.enabled = false;
+
+    const monitor = new RepoCallbackMonitor({
+      store,
+      detect: async () => createOkContext('/tmp/repo-lookback'),
+      createProvider: () => provider,
+      listSessions: () => [makeSession({ projectDir: '/tmp/repo-lookback' })],
+      sendToSession: async (sessionName, text) => {
+        sent.push({ sessionName, text });
+      },
+      now: () => nowMs + 2_000,
+    });
+    monitor.setConfigsForTesting({ repos: { '/tmp/repo-lookback': config } });
+
+    // Start with 'now': only PR #30 fires
+    await monitor.checkProject('/tmp/repo-lookback');
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.text).toContain('PR #30');
+
+    // Expand lookback from 'now' to '3d': PR #29 (2d ago) fires, PR #30 does NOT duplicate, PR #28 (5d ago) stays ignored
+    config.lookbackWindow = '3d';
+    config.sinceAtMs = computeRepoCallbackSinceAtMs('3d', nowMs + 5_000);
+    config.updatedAt = nowMs + 5_000;
+    monitor.setConfigsForTesting({ repos: { '/tmp/repo-lookback': config } });
+
+    await monitor.checkProject('/tmp/repo-lookback');
+    expect(sent).toHaveLength(2);
+    expect(sent[1]?.text).toContain('PR #29');
+
+    store.close();
+  });
+
+  it('CALLBACK_STATUS_REQUEST awaits in-flight refreshConfig instead of returning stale enabled=false, and CALLBACK_SYNC emits snapshot', async () => {
+    const store = new CallbackTaskStore(':memory:');
+    const projectDir = '/tmp/repo-status-race';
+    const enabledConfig = createDefaultRepoCallbackConfig(projectDir);
+    enabledConfig.enabled = true;
+    enabledConfig.sinceAtMs = 1_700_000_000_000;
+
+    let releaseFetch!: () => void;
+    const fetchGate = new Promise<void>((resolve) => {
+      releaseFetch = resolve;
+    });
+    let fetchCalls = 0;
+
+    const monitor = new RepoCallbackMonitor({
+      store,
+      loadCreds: async () => ({ serverId: 'srv-1', token: 'tok-1', workerUrl: 'https://worker.test' }),
+      fetchImpl: (async () => {
+        fetchCalls += 1;
+        if (fetchCalls === 1) {
+          await fetchGate;
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            globalTemplates: [],
+            repos: { [projectDir]: enabledConfig },
+          }),
+        } as unknown as Response;
+      }) as typeof fetch,
+      detect: async () => createOkContext(projectDir),
+      createProvider: () => createMockProvider({}),
+      listSessions: () => [makeSession({ projectDir })],
+      sendToSession: async () => {},
+    });
+
+    const emitted: Array<Record<string, unknown>> = [];
+    const serverLink = {
+      send: (msg: Record<string, unknown>) => {
+        emitted.push(msg);
+      },
+    };
+    const cmdOpts = { monitor, listSessionsFn: () => [makeSession({ projectDir })] };
+
+    // Start refreshConfig() in background while CALLBACK_STATUS_REQUEST arrives concurrently
+    const refreshInFlight = monitor.refreshConfig({ pollNewlyEnabled: false });
+    const statusPromise = handleRepoCallbackCommand(
+      { type: REPO_MSG.CALLBACK_STATUS_REQUEST, requestId: 'req-1', projectDir },
+      serverLink,
+      cmdOpts,
+    );
+
+    // Status response must NOT be emitted before refreshConfig finishes!
+    await Promise.resolve();
+    expect(emitted).toHaveLength(0);
+
+    releaseFetch();
+    await Promise.all([refreshInFlight, statusPromise]);
+
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toMatchObject({
+      type: REPO_MSG.CALLBACK_STATUS_RESPONSE,
+      requestId: 'req-1',
+      projectDir,
+      enabled: true,
+    });
+
+    // CALLBACK_SYNC with projectDir refreshes and pushes updated snapshot
+    await handleRepoCallbackCommand(
+      { type: REPO_MSG.CALLBACK_SYNC, requestId: 'req-sync', projectDir },
+      serverLink,
+      cmdOpts,
+    );
+    expect(emitted).toHaveLength(2);
+    expect(emitted[1]).toMatchObject({
+      type: REPO_MSG.CALLBACK_STATUS_RESPONSE,
+      requestId: 'req-sync',
+      projectDir,
+      enabled: true,
+    });
 
     store.close();
   });

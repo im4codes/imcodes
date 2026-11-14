@@ -11,6 +11,7 @@ import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { forceRefreshSharedChangesForCheckout } from '../git-status-store.js';
 import { ingestSessionRepoContext, getSessionRepoContext } from '../session-repo-context-store.js';
 import { RepoCallbackModal, type RepoCallbackTargetOption } from '../components/RepoCallbackModal.js';
+import { loadRepoCallbackPrefs } from '../repo-callback-prefs.js';
 
 // ── Pull-to-refresh component ────────────────────────────────────────────
 
@@ -253,6 +254,7 @@ export function RepoPage({ ws, sessionId, projectDir, serverId, callbackTargets,
   const deliveredCiEventRef = useRef<Set<string>>(new Set());
   const lastFocusTokenRef = useRef<number | undefined>(undefined);
   const actionJobRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const callbackLiveStatusReceivedRef = useRef(false);
   const actionStepRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const [focusedActionTargetKey, setFocusedActionTargetKey] = useState<string | null>(null);
   const [focusedActionTargetReplayClass, setFocusedActionTargetReplayClass] = useState<'repo-action-focus-a' | 'repo-action-focus-b'>('repo-action-focus-a');
@@ -578,14 +580,30 @@ export function RepoPage({ ws, sessionId, projectDir, serverId, callbackTargets,
 
   useEffect(() => {
     if (scopeToSessionRoot) return;
+    let cancelled = false;
+    callbackLiveStatusReceivedRef.current = false;
     setCallbacks([]);
+    setCallbackRuntimeEnabled(false);
     setCallbackLastError(undefined);
+    if (serverId && requestProjectDir) {
+      void loadRepoCallbackPrefs(serverId, requestProjectDir)
+        .then((loaded) => {
+          if (cancelled || callbackLiveStatusReceivedRef.current) return;
+          setCallbackRuntimeEnabled(Boolean(loaded.repoConfig.enabled));
+        })
+        .catch(() => {
+          // Ignore until live CALLBACK_STATUS_RESPONSE arrives.
+        });
+    }
     try {
       ws.repoCallbackStatus?.(requestProjectDir);
     } catch {
       // Ignore while connecting; RECONNECTED handler refreshes once live.
     }
-  }, [ws, requestProjectDir, scopeToSessionRoot]);
+    return () => {
+      cancelled = true;
+    };
+  }, [ws, serverId, requestProjectDir, scopeToSessionRoot]);
 
   // ── Message handler ──────────────────────────────────────────────────────
 
@@ -880,6 +898,7 @@ export function RepoPage({ ws, sessionId, projectDir, serverId, callbackTargets,
 
       if (msg.type === REPO_MSG.CALLBACK_STATUS_RESPONSE) {
         if (!responseMatchesProject(msg.projectDir)) return;
+        callbackLiveStatusReceivedRef.current = true;
         setCallbacks(Array.isArray(msg.callbacks) ? msg.callbacks : []);
         setCallbackRuntimeEnabled(Boolean(msg.enabled));
         setCallbackChecking(Boolean(msg.checking));

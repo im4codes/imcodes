@@ -2147,8 +2147,11 @@ export class WsClient {
   }
 
   /** Notify daemon to refresh repo callback monitoring config from server preferences. */
-  repoCallbackSync(): void {
-    this.send({ type: REPO_MSG.CALLBACK_SYNC });
+  repoCallbackSync(projectDir?: string): void {
+    this.send({
+      type: REPO_MSG.CALLBACK_SYNC,
+      ...(projectDir ? { projectDir } : {}),
+    });
   }
 
   /** Trigger an immediate repo callback poll for a project directory. Returns requestId. */
