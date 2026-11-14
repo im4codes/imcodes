@@ -210,12 +210,24 @@ export type StaticLookupResult =
   | { kind: 'cached'; entry: StaticCacheEntry }
   | { kind: 'stream'; size: bigint; etag: string; lastModified: string };
 
+export interface StaticStatResult {
+  isFile(): boolean;
+  size: bigint;
+  mtimeNs: bigint;
+  mtime: Date;
+}
+
 export interface StaticAssetCacheOptions {
   maxEntries?: number;
   maxTotalBytes?: number;
   maxCacheableFileBytes?: number;
   minGzipBytes?: number;
   maxGzipBytes?: number;
+  /** Optional filesystem seam for deterministic concurrency tests. */
+  fs?: {
+    stat?: (filePath: string) => Promise<StaticStatResult>;
+    readFile?: (filePath: string) => Promise<Buffer>;
+  };
 }
 
 /**
@@ -298,6 +310,8 @@ export class StaticAssetCache {
   readonly maxCacheableFileBytes: number;
   readonly minGzipBytes: number;
   readonly maxGzipBytes: number;
+  private readonly statFn: (filePath: string) => Promise<StaticStatResult>;
+  private readonly readFileFn: (filePath: string) => Promise<Buffer>;
 
   constructor(options: StaticAssetCacheOptions = {}) {
     this.maxEntries = Math.max(1, options.maxEntries ?? DEFAULT_STATIC_CACHE_MAX_ENTRIES);
@@ -305,6 +319,8 @@ export class StaticAssetCache {
     this.maxCacheableFileBytes = Math.max(1, options.maxCacheableFileBytes ?? MAX_CACHEABLE_ASSET_BYTES);
     this.minGzipBytes = Math.max(0, options.minGzipBytes ?? MIN_GZIP_BYTES);
     this.maxGzipBytes = Math.max(this.minGzipBytes, options.maxGzipBytes ?? MAX_GZIP_BYTES);
+    this.statFn = options.fs?.stat ?? ((p) => stat(p, { bigint: true }));
+    this.readFileFn = options.fs?.readFile ?? ((p) => readFile(p));
   }
 
   get size(): number {
@@ -313,6 +329,19 @@ export class StaticAssetCache {
 
   get byteSize(): number {
     return this.totalBytes;
+  }
+
+  has(filePath: string): boolean {
+    return this.entries.has(filePath);
+  }
+
+  /** Exact byte sum computed directly from retained Map entries (invariant: === byteSize <= maxTotalBytes). */
+  retainedByteSum(): number {
+    let sum = 0;
+    for (const entry of this.entries.values()) {
+      sum += entry.memBytes;
+    }
+    return sum;
   }
 
   delete(filePath: string): boolean {
@@ -328,13 +357,21 @@ export class StaticAssetCache {
     this.totalBytes = 0;
   }
 
-  private touch(filePath: string, entry: StaticCacheEntry): StaticCacheEntry {
+  private touchIfCurrent(filePath: string, expected: StaticCacheEntry): boolean {
+    // Only refresh LRU position if `expected` is still the live entry for `filePath`;
+    // never resurrect an entry that was evicted or replaced during an async `await`.
+    if (this.entries.get(filePath) !== expected) return false;
     this.entries.delete(filePath);
-    this.entries.set(filePath, entry);
-    return entry;
+    this.entries.set(filePath, expected);
+    return true;
   }
 
   private set(filePath: string, entry: StaticCacheEntry): void {
+    const current = this.entries.get(filePath);
+    if (current && current.mtimeNs > entry.mtimeNs) {
+      // Do not overwrite a newer concurrently populated entry with an older read.
+      return;
+    }
     this.delete(filePath);
     if (entry.memBytes > this.maxTotalBytes) return;
     while (
@@ -352,24 +389,37 @@ export class StaticAssetCache {
   async resolve(filePath: string, opts: { immutable: boolean }): Promise<StaticLookupResult | null> {
     const cached = this.entries.get(filePath);
     if (opts.immutable && cached) {
-      return { kind: 'cached', entry: this.touch(filePath, cached) };
+      this.touchIfCurrent(filePath, cached);
+      return { kind: 'cached', entry: cached };
     }
 
-    let s: Awaited<ReturnType<typeof stat>> & { size: bigint; mtimeNs: bigint; mtime: Date };
+    let s: StaticStatResult;
     try {
-      const rawStat = await stat(filePath, { bigint: true });
+      const rawStat = await this.statFn(filePath);
       if (!rawStat.isFile()) {
-        this.delete(filePath);
+        if (!cached || this.entries.get(filePath) === cached) {
+          this.delete(filePath);
+        }
         return null;
       }
       s = rawStat;
     } catch {
-      this.delete(filePath);
+      if (!cached || this.entries.get(filePath) === cached) {
+        this.delete(filePath);
+      }
       return null;
     }
 
     if (cached && cached.mtimeNs === s.mtimeNs && cached.size === s.size) {
-      return { kind: 'cached', entry: this.touch(filePath, cached) };
+      this.touchIfCurrent(filePath, cached);
+      return { kind: 'cached', entry: cached };
+    }
+
+    // Re-check whether a concurrent request already loaded the exact same disk version while we waited on `stat`.
+    const afterStat = this.entries.get(filePath);
+    if (afterStat && afterStat !== cached && afterStat.mtimeNs === s.mtimeNs && afterStat.size === s.size) {
+      this.touchIfCurrent(filePath, afterStat);
+      return { kind: 'cached', entry: afterStat };
     }
 
     if (s.size > BigInt(this.maxCacheableFileBytes)) {
@@ -384,9 +434,11 @@ export class StaticAssetCache {
 
     let body: Buffer;
     try {
-      body = await readFile(filePath);
+      body = await this.readFileFn(filePath);
     } catch {
-      this.delete(filePath);
+      if (!afterStat || this.entries.get(filePath) === afterStat) {
+        this.delete(filePath);
+      }
       return null;
     }
 

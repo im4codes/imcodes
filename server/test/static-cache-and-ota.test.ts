@@ -1,14 +1,21 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, unlinkSync, writeFileSync, utimesSync } from 'node:fs';
+import { stat as fsStat, readFile as fsReadFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
+import type * as IndexModule from '../src/index.js';
 
-const tempDirs: string[] = [];
+let suiteRoot = '';
+let webDist = '';
+let landingDist = '';
+let updatesDist = '';
+let indexMod: typeof IndexModule;
+const extraTempDirs: string[] = [];
 
 function makeTempDir(prefix: string): string {
   const dir = mkdtempSync(join(tmpdir(), prefix));
-  tempDirs.push(dir);
+  extraTempDirs.push(dir);
   return dir;
 }
 
@@ -25,19 +32,48 @@ function makeEnv(overrides: Record<string, string | undefined> = {}) {
   };
 }
 
+function resetDir(dir: string): void {
+  rmSync(dir, { recursive: true, force: true });
+  mkdirSync(dir, { recursive: true });
+}
+
 describe('static asset cache, landing cache, path traversal guard, and OTA streaming', () => {
-  afterEach(() => {
+  beforeAll(async () => {
+    suiteRoot = mkdtempSync(join(tmpdir(), 'imcodes-static-suite-'));
+    webDist = join(suiteRoot, 'web-dist');
+    landingDist = join(suiteRoot, 'landing-dist');
+    updatesDist = join(suiteRoot, 'updates-dist');
+    mkdirSync(webDist, { recursive: true });
+    mkdirSync(landingDist, { recursive: true });
+    mkdirSync(updatesDist, { recursive: true });
+
+    process.env.WEB_DIST_PATH = webDist;
+    process.env.LANDING_DIST_PATH = landingDist;
+    process.env.UPDATES_DIST_PATH = updatesDist;
+    vi.resetModules();
+    indexMod = await import('../src/index.js');
+  }, 30_000);
+
+  beforeEach(() => {
+    resetDir(webDist);
+    resetDir(landingDist);
+    resetDir(updatesDist);
+    writeFileSync(join(suiteRoot, 'secret.txt'), 'TOP_SECRET');
+  });
+
+  afterAll(() => {
     delete process.env.WEB_DIST_PATH;
     delete process.env.LANDING_DIST_PATH;
     delete process.env.UPDATES_DIST_PATH;
     vi.resetModules();
-    for (const dir of tempDirs.splice(0)) {
+    if (suiteRoot) rmSync(suiteRoot, { recursive: true, force: true });
+    for (const dir of extraTempDirs.splice(0)) {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it('resolveSafeAssetPath blocks directory traversal, backslashes, NUL bytes, and malformed encodings', async () => {
-    const { resolveSafeAssetPath } = await import('../src/index.js');
+  it('resolveSafeAssetPath blocks directory traversal, backslashes, NUL bytes, and malformed encodings', () => {
+    const { resolveSafeAssetPath } = indexMod;
     const root = makeTempDir('imcodes-safe-path-');
 
     expect(resolveSafeAssetPath(root, '/')).toBe(join(root, 'index.html'));
@@ -48,10 +84,10 @@ describe('static asset cache, landing cache, path traversal guard, and OTA strea
     expect(resolveSafeAssetPath(root, '/foo%00bar.js')).toBeNull();
     expect(resolveSafeAssetPath(root, '/foo%5cbar.js')).toBeNull();
     expect(resolveSafeAssetPath(root, '/%ZZ')).toBeNull();
-  }, 15_000);
+  });
 
   it('StaticAssetCache enforces maxEntries + maxTotalBytes LRU eviction and handles disk deletion', async () => {
-    const { StaticAssetCache } = await import('../src/index.js');
+    const { StaticAssetCache } = indexMod;
     const dir = makeTempDir('imcodes-cache-lru-');
     const f1 = join(dir, 'a.bin');
     const f2 = join(dir, 'b.bin');
@@ -67,12 +103,14 @@ describe('static asset cache, landing cache, path traversal guard, and OTA strea
     await cache.resolve(f2, { immutable: false });
     expect(cache.size).toBe(2);
     expect(cache.byteSize).toBe(80);
+    expect(cache.retainedByteSum()).toBe(80);
 
     // Touch f1 so f2 becomes LRU, then insert f3 -> f2 is evicted
     await cache.resolve(f1, { immutable: false });
     await cache.resolve(f3, { immutable: false });
     expect(cache.size).toBe(2);
     expect(cache.byteSize).toBe(80);
+    expect(cache.retainedByteSum()).toBe(80);
 
     // Oversized against maxTotalBytes must not wipe existing cache
     const huge = await cache.resolve(big, { immutable: false });
@@ -85,19 +123,145 @@ describe('static asset cache, landing cache, path traversal guard, and OTA strea
     expect(await cache.resolve(f3, { immutable: false })).toBeNull();
     expect(cache.size).toBe(1);
     expect(cache.byteSize).toBe(40);
+    expect(cache.retainedByteSum()).toBe(40);
+  });
+
+  it('does not resurrect evicted entry or exceed budget when mutable stat suspends across LRU eviction', async () => {
+    const { StaticAssetCache } = indexMod;
+    const dir = makeTempDir('imcodes-cache-race-stat-');
+    const fileA = join(dir, 'a.bin');
+    const fileB = join(dir, 'b.bin');
+    writeFileSync(fileA, Buffer.from('AAAA')); // 4 bytes
+    writeFileSync(fileB, Buffer.from('BBBB')); // 4 bytes
+
+    let holdStatA = false;
+    let releaseStatA!: () => void;
+    const statAHoldPromise = new Promise<void>((resolve) => {
+      releaseStatA = resolve;
+    });
+    let statAHung!: () => void;
+    const statAHungPromise = new Promise<void>((resolve) => {
+      statAHung = resolve;
+    });
+
+    const cache = new StaticAssetCache({
+      maxEntries: 1,
+      maxTotalBytes: 4,
+      maxCacheableFileBytes: 64,
+      fs: {
+        stat: async (p) => {
+          const real = await fsStat(p, { bigint: true });
+          if (p === fileA && holdStatA) {
+            holdStatA = false;
+            statAHung();
+            await statAHoldPromise;
+          }
+          return real;
+        },
+      },
+    });
+
+    // Populate fileA first (4 bytes; budget 1 entry / 4 bytes)
+    const warmA = await cache.resolve(fileA, { immutable: false });
+    expect(warmA?.kind).toBe('cached');
+    expect(cache.size).toBe(1);
+    expect(cache.byteSize).toBe(4);
+
+    // Suspend fileA mutable revalidation mid-`await stat`, then evict fileA by loading fileB
+    holdStatA = true;
+    const pendingA = cache.resolve(fileA, { immutable: false });
+    await statAHungPromise;
+
+    const loadedB = await cache.resolve(fileB, { immutable: false });
+    expect(loadedB?.kind).toBe('cached');
+    expect(cache.has(fileA)).toBe(false);
+    expect(cache.has(fileB)).toBe(true);
+
+    // Release fileA's stat: in-flight request still receives verified A bytes,
+    // but cache MUST NOT resurrect A or exceed maxEntries=1 / maxTotalBytes=4.
+    releaseStatA();
+    const resA = await pendingA;
+    expect(resA?.kind).toBe('cached');
+    if (resA?.kind === 'cached') {
+      expect(resA.entry.body.toString('utf8')).toBe('AAAA');
+    }
+
+    expect(cache.size).toBe(1);
+    expect(cache.byteSize).toBe(4);
+    expect(cache.retainedByteSum()).toBe(4);
+    expect(cache.has(fileA)).toBe(false);
+    expect(cache.has(fileB)).toBe(true);
+  });
+
+  it('does not overwrite newer version with stale readFile result under concurrent updates', async () => {
+    const { StaticAssetCache } = indexMod;
+    const dir = makeTempDir('imcodes-cache-race-read-');
+    const fileA = join(dir, 'index.html');
+    writeFileSync(fileA, 'v1-old');
+
+    let holdFirstRead = true;
+    let releaseFirstRead!: () => void;
+    const firstReadGate = new Promise<void>((resolve) => {
+      releaseFirstRead = resolve;
+    });
+    let firstReadStarted!: () => void;
+    const firstReadStartedPromise = new Promise<void>((resolve) => {
+      firstReadStarted = resolve;
+    });
+
+    const cache = new StaticAssetCache({
+      maxEntries: 2,
+      maxTotalBytes: 64,
+      fs: {
+        stat: async (p) => fsStat(p, { bigint: true }),
+        readFile: async (p) => {
+          const buf = await fsReadFile(p);
+          if (holdFirstRead) {
+            holdFirstRead = false;
+            firstReadStarted();
+            await firstReadGate;
+          }
+          return buf;
+        },
+      },
+    });
+
+    const staleReq = cache.resolve(fileA, { immutable: false });
+    await firstReadStartedPromise;
+
+    // Update fileA with newer mtime/content while first request is paused at readFile
+    writeFileSync(fileA, 'v2-newest');
+    const future = new Date(Date.now() + 5000);
+    utimesSync(fileA, future, future);
+
+    const freshReq = await cache.resolve(fileA, { immutable: false });
+    expect(freshReq?.kind).toBe('cached');
+    if (freshReq?.kind === 'cached') {
+      expect(freshReq.entry.body.toString('utf8')).toBe('v2-newest');
+    }
+
+    releaseFirstRead();
+    await staleReq;
+
+    // Cached entry must stay on v2-newest and byte accounting must remain exact
+    const after = await cache.resolve(fileA, { immutable: false });
+    expect(after?.kind).toBe('cached');
+    if (after?.kind === 'cached') {
+      expect(after.entry.body.toString('utf8')).toBe('v2-newest');
+    }
+    expect(cache.size).toBe(1);
+    expect(cache.byteSize).toBe(Buffer.byteLength('v2-newest'));
+    expect(cache.retainedByteSum()).toBe(cache.byteSize);
   });
 
   it('serves /assets/* as immutable with ETag, 304, gzip+Vary, and zero-disk-read immutable hits', async () => {
-    const webDist = makeTempDir('imcodes-web-immutable-');
+    const { buildApp } = indexMod;
     mkdirSync(join(webDist, 'assets'), { recursive: true });
     writeFileSync(join(webDist, 'index.html'), '<html><body>app</body></html>');
     const jsPayload = `export const banner = "${'imcodes-static-cache-'.repeat(80)}";\n`;
     const assetFile = join(webDist, 'assets', 'index-Hash123.js');
     writeFileSync(assetFile, jsPayload);
 
-    process.env.WEB_DIST_PATH = webDist;
-    vi.resetModules();
-    const { buildApp } = await import('../src/index.js');
     const app = buildApp(makeEnv() as never);
 
     // Identity request
@@ -145,19 +309,12 @@ describe('static asset cache, landing cache, path traversal guard, and OTA strea
   });
 
   it('revalidates non-hashed index.html, SPA fallback, and /api/app-build on disk updates, preserves CSP, and blocks traversal', async () => {
-    const parent = makeTempDir('imcodes-web-parent-');
-    const webDist = join(parent, 'dist');
-    mkdirSync(webDist, { recursive: true });
-    writeFileSync(join(parent, 'secret.txt'), 'TOP_SECRET');
-
+    const { buildApp } = indexMod;
     const htmlV1 = '<!doctype html><html><body>v1</body></html>';
     const buildV1 = JSON.stringify({ buildId: 'build-1' });
     writeFileSync(join(webDist, 'index.html'), htmlV1);
     writeFileSync(join(webDist, 'app-build.json'), buildV1);
 
-    process.env.WEB_DIST_PATH = webDist;
-    vi.resetModules();
-    const { buildApp } = await import('../src/index.js');
     const app = buildApp(makeEnv() as never);
 
     // Initial index + SPA fallback + /api/app-build
@@ -183,8 +340,6 @@ describe('static asset cache, landing cache, path traversal guard, and OTA strea
     expect(await apiBuild1.text()).toBe(buildV1);
 
     // Traversal must never leak files outside webDist:
-    // - %5c / %00 sequences reach resolveSafeAssetPath and return 404 directly (never SPA fallback)
-    // - %2e%2e is normalized by WHATWG URL before routing, and never reads parent/secret.txt
     const trav1 = await app.request('http://localhost/%5c..%5csecret.txt');
     expect(trav1.status).toBe(404);
     expect(await trav1.text()).not.toContain('TOP_SECRET');
@@ -220,14 +375,11 @@ describe('static asset cache, landing cache, path traversal guard, and OTA strea
   });
 
   it('streams oversized files above maxCacheableFileBytes with ETag and 304 without caching in RAM', async () => {
-    const webDist = makeTempDir('imcodes-web-stream-');
+    const { buildApp, StaticAssetCache } = indexMod;
     const largeAsset = Buffer.alloc(1024, 0x61);
     mkdirSync(join(webDist, 'assets'), { recursive: true });
     writeFileSync(join(webDist, 'assets', 'big-chunk.js'), largeAsset);
 
-    process.env.WEB_DIST_PATH = webDist;
-    vi.resetModules();
-    const { buildApp, StaticAssetCache } = await import('../src/index.js');
     const cache = new StaticAssetCache({ maxCacheableFileBytes: 256 });
     const app = buildApp(makeEnv() as never, { staticCache: cache });
 
@@ -246,19 +398,12 @@ describe('static asset cache, landing cache, path traversal guard, and OTA strea
   });
 
   it('caches Landing host responses with no-cache, ETag, 304, gzip, CSP headers, and blocks traversal', async () => {
-    const parent = makeTempDir('imcodes-landing-parent-');
-    const landingDist = join(parent, 'landing');
-    mkdirSync(landingDist, { recursive: true });
-    writeFileSync(join(parent, 'secret.txt'), 'LANDING_SECRET');
-
+    const { buildApp } = indexMod;
     const landingHtml = `<html><body><h1>Welcome</h1><p>${'hero-copy '.repeat(150)}</p></body></html>`;
     const installScript = '#!/bin/sh\necho "install imcodes"\n';
     writeFileSync(join(landingDist, 'index.html'), landingHtml);
     writeFileSync(join(landingDist, 'install.sh'), installScript);
 
-    process.env.LANDING_DIST_PATH = landingDist;
-    vi.resetModules();
-    const { buildApp } = await import('../src/index.js');
     const app = buildApp(makeEnv({ LANDING_HOST: 'im.codes' }) as never);
 
     const res = await app.request('http://im.codes/', {
@@ -289,24 +434,21 @@ describe('static asset cache, landing cache, path traversal guard, and OTA strea
       headers: { Host: 'im.codes' },
     });
     expect(travRes.status).toBe(404);
-    expect(await travRes.text()).not.toContain('LANDING_SECRET');
+    expect(await travRes.text()).not.toContain('TOP_SECRET');
 
     const travDotRes = await app.request('http://im.codes/%2e%2e/secret.txt', {
       headers: { Host: 'im.codes' },
     });
-    expect(await travDotRes.text()).not.toContain('LANDING_SECRET');
+    expect(await travDotRes.text()).not.toContain('TOP_SECRET');
   });
 
   it('streams /api/updates/:file with ETag, Last-Modified, Content-Length, and 304 support', async () => {
-    const updatesDist = makeTempDir('imcodes-updates-');
+    const { buildApp } = indexMod;
     const manifest = JSON.stringify({ version: '1.2.3' });
     const bundle = Buffer.from('PK\x03\x04dummy-zip-payload-0123456789');
     writeFileSync(join(updatesDist, 'manifest.json'), manifest);
     writeFileSync(join(updatesDist, 'bundle.zip'), bundle);
 
-    process.env.UPDATES_DIST_PATH = updatesDist;
-    vi.resetModules();
-    const { buildApp } = await import('../src/index.js');
     const app = buildApp(makeEnv() as never);
 
     const res = await app.request('http://localhost/api/updates/bundle.zip');

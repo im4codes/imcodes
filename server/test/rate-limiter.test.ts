@@ -120,22 +120,59 @@ describe('MemoryRateLimiter', () => {
       }
     });
 
-    it('enforces maxWindows bound when unique keys flood within an active window', () => {
-      const capped = new MemoryRateLimiter({ maxWindows: 3 });
+    it('fails closed on new window keys at maxWindows without evicting active rate limits, and recovers after expiry', () => {
+      const capped = new MemoryRateLimiter({ maxWindows: 1 });
       try {
-        expect(capped.check('k1', 2, 10_000)).toBe(true);
-        expect(capped.check('k2', 2, 10_000)).toBe(true);
-        expect(capped.check('k3', 2, 10_000)).toBe(true);
-        expect(capped.windowCount()).toBe(3);
+        expect(capped.check('A', 1, 30_000)).toBe(true);
+        // Capacity saturated with unexpired window A: new key B is denied (fail-closed)
+        expect(capped.check('B', 1, 30_000)).toBe(false);
+        expect(capped.windowCount()).toBe(1);
+        // Active window A is never evicted, so repeat check on A remains rate-limited
+        expect(capped.check('A', 1, 30_000)).toBe(false);
 
-        // Accessing k1 refreshes LRU order so k2 becomes oldest and gets evicted when k4 arrives
-        expect(capped.check('k1', 2, 10_000)).toBe(true);
-        expect(capped.check('k4', 2, 10_000)).toBe(true);
-        expect(capped.windowCount()).toBe(3);
+        // Once A expires, pruning reclaims capacity and new key B succeeds
+        vi.advanceTimersByTime(30_001);
+        expect(capped.check('B', 1, 30_000)).toBe(true);
+        expect(capped.windowCount()).toBe(1);
+      } finally {
+        capped.stop();
+      }
+    });
 
-        // k1 still remembers 2 requests (limit 2 -> next rejected), whereas evicted k2 starts fresh
-        expect(capped.check('k1', 2, 10_000)).toBe(false);
-        expect(capped.check('k2', 2, 10_000)).toBe(true);
+    it('fails closed on new JTIs at maxJtis without evicting unexpired replay protection, and recovers after expiry', () => {
+      const capped = new MemoryRateLimiter({ maxJtis: 1 });
+      try {
+        expect(capped.consumeJti('jti-A', 30_000)).toBe(true);
+        // Unexpired JTI A saturates cap: new JTI B fails closed without evicting A
+        expect(capped.consumeJti('jti-B', 30_000)).toBe(false);
+        // Replaying JTI A must still be blocked
+        expect(capped.consumeJti('jti-A', 30_000)).toBe(false);
+
+        // Once JTI A expires, pruning reclaims capacity and JTI B can be consumed
+        vi.advanceTimersByTime(30_001);
+        expect(capped.consumeJti('jti-B', 30_000)).toBe(true);
+      } finally {
+        capped.stop();
+      }
+    });
+
+    it('fails closed on new identities at maxLockouts without evicting active lockouts, and recovers after expiry', () => {
+      const capped = new MemoryRateLimiter({ maxLockouts: 1 });
+      try {
+        for (let i = 0; i < 4; i++) {
+          expect(capped.recordAuthFailure('user-A').locked).toBe(false);
+        }
+        expect(capped.recordAuthFailure('user-A').locked).toBe(true);
+        expect(capped.checkLockout('user-A').locked).toBe(true);
+
+        // Unrelated failure for user-B at capacity must fail closed and must NOT clear user-A lockout
+        expect(capped.recordAuthFailure('user-B').locked).toBe(true);
+        expect(capped.checkLockout('user-A').locked).toBe(true);
+
+        // Once user-A lockout expires, pruning frees capacity and user-B starts fresh
+        vi.advanceTimersByTime(15 * 60 * 1000 + 1);
+        expect(capped.checkLockout('user-A').locked).toBe(false);
+        expect(capped.recordAuthFailure('user-B').locked).toBe(false);
       } finally {
         capped.stop();
       }

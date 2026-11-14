@@ -57,26 +57,50 @@ export class MemoryRateLimiter {
     const safeWindowMs = Math.max(0, windowMs);
     const cutoff = now - safeWindowMs;
     const existing = this.windows.get(key);
-    const entries = existing ? existing.ts.filter((t) => t > cutoff) : [];
 
-    if (entries.length >= limit) {
-      if (entries.length === 0) {
-        this.windows.delete(key);
-      } else {
-        this.setWindowEntry(key, {
-          ts: entries,
-          expiresAt: entries[entries.length - 1]! + safeWindowMs,
-        }, now);
-        this.ensureCleanupRunning();
+    if (existing !== undefined) {
+      const entries = existing.ts.filter((t) => t > cutoff);
+      if (entries.length >= limit) {
+        if (entries.length === 0) {
+          this.windows.delete(key);
+          this.stopIfEmpty();
+        } else {
+          this.windows.delete(key);
+          this.windows.set(key, {
+            ts: entries,
+            expiresAt: entries[entries.length - 1]! + safeWindowMs,
+          });
+          this.ensureCleanupRunning();
+        }
+        return false;
       }
+
+      entries.push(now);
+      this.windows.delete(key);
+      this.windows.set(key, {
+        ts: entries,
+        expiresAt: now + safeWindowMs,
+      });
+      this.ensureCleanupRunning();
+      return true;
+    }
+
+    if (limit <= 0) {
       return false;
     }
 
-    entries.push(now);
-    this.setWindowEntry(key, {
-      ts: entries,
+    if (this.windows.size >= this.maxWindows) {
+      this.pruneExpiredWindows(now);
+      if (this.windows.size >= this.maxWindows) {
+        // Capacity saturated by unexpired windows: fail closed without evicting active rate limits.
+        return false;
+      }
+    }
+
+    this.windows.set(key, {
+      ts: [now],
       expiresAt: now + safeWindowMs,
-    }, now);
+    });
     this.ensureCleanupRunning();
     return true;
   }
@@ -90,9 +114,7 @@ export class MemoryRateLimiter {
       this.consumedJtis.clear();
       this.lockouts.clear();
     }
-    if (this.windows.size === 0 && this.consumedJtis.size === 0 && this.lockouts.size === 0) {
-      this.stop();
-    }
+    this.stopIfEmpty();
   }
 
   /** Number of active window keys currently retained in memory. */
@@ -109,10 +131,9 @@ export class MemoryRateLimiter {
       this.consumedJtis.delete(jti);
     } else if (this.consumedJtis.size >= this.maxJtis) {
       this.pruneExpiredJtis(now);
-      while (this.consumedJtis.size >= this.maxJtis) {
-        const oldest = this.consumedJtis.keys().next().value;
-        if (oldest === undefined) break;
-        this.consumedJtis.delete(oldest);
+      if (this.consumedJtis.size >= this.maxJtis) {
+        // Capacity saturated by unexpired JTIs: fail closed so live replay protection is never evicted.
+        return false;
       }
     }
     this.consumedJtis.set(jti, now + Math.max(0, ttlMs));
@@ -126,10 +147,9 @@ export class MemoryRateLimiter {
     const existing = this.lockouts.get(identity);
     if (!existing && this.lockouts.size >= this.maxLockouts) {
       this.pruneExpiredLockouts(now);
-      while (this.lockouts.size >= this.maxLockouts) {
-        const oldest = this.lockouts.keys().next().value;
-        if (oldest === undefined) break;
-        this.lockouts.delete(oldest);
+      if (this.lockouts.size >= this.maxLockouts) {
+        // Capacity saturated by active lockouts/failure counters: fail closed without evicting live state.
+        return { locked: true, lockedUntil: now + LOCKOUT_DURATION_MS };
       }
     }
     const entry = existing ?? { failedAttempts: 0, lockedUntil: null, lastAttemptAt: now };
@@ -168,18 +188,10 @@ export class MemoryRateLimiter {
     return { locked: false };
   }
 
-  private setWindowEntry(key: string, entry: WindowEntry, now: number): void {
-    if (this.windows.has(key)) {
-      this.windows.delete(key);
-    } else if (this.windows.size >= this.maxWindows) {
-      this.pruneExpiredWindows(now);
-      while (this.windows.size >= this.maxWindows) {
-        const oldest = this.windows.keys().next().value;
-        if (oldest === undefined) break;
-        this.windows.delete(oldest);
-      }
+  private stopIfEmpty(): void {
+    if (this.windows.size === 0 && this.consumedJtis.size === 0 && this.lockouts.size === 0) {
+      this.stop();
     }
-    this.windows.set(key, entry);
   }
 
   private ensureCleanupRunning(): void {
