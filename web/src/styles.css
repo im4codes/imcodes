@@ -349,6 +349,7 @@ html.native-ios-mac .chat-tool-activity-total,
 html.native-ios-mac .chat-tool-activity-stats,
 html.native-ios-mac .chat-tool-activity-stat,
 html.native-ios-mac .chat-tool-activity-time,
+html.native-ios-mac .chat-tool-activity-start-time,
 html.native-ios-mac .chat-tool-activity-last,
 html.native-ios-mac .chat-tool-activity-last-name,
 html.native-ios-mac .chat-tool-activity-last-input,
@@ -6439,6 +6440,14 @@ html.native-ios-mac .chat-dl-btn {
 .chat-tool-activity-segment.is-failed { background: linear-gradient(90deg, #be123c, #fb7185); }
 /* Elapsed time of the newest tool. Shown on every client: during a long wait
    "how long has this been going" is the question the counters cannot answer. */
+.chat-tool-activity-start-time {
+  flex: 0 0 auto;
+  color: #94a3b8;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+  font-size: 10px;
+  line-height: 1;
+}
 .chat-tool-activity-time {
   flex: 0 0 auto;
   color: #7dd3fc;
@@ -6573,6 +6582,8 @@ html.native-ios-mac .chat-dl-btn {
   border-color: rgba(248, 113, 113, 0.36);
   background: rgba(190, 18, 60, 0.2);
 }
+.chat-tool-peek-start-time { margin-left: auto; flex: 0 0 auto; color: #94a3b8; font-variant-numeric: tabular-nums; font-size: 10px; }
+.chat-tool-peek-start-time + .chat-tool-peek-duration { margin-left: 0; }
 .chat-tool-peek-duration { margin-left: auto; color: #64748b; font-variant-numeric: tabular-nums; }
 .chat-tool-peek-body { display: flex; flex-direction: column; gap: 10px; min-height: 0; overflow-y: auto; padding: 10px 12px 12px; }
 .chat-tool-peek-body::-webkit-scrollbar { width: 6px; }
@@ -6680,6 +6691,11 @@ html.native-ios-mac .chat-dl-btn {
 @media (max-width: 420px) {
   .chat-tool-activity { min-width: 0; gap: 5px; }
   .chat-tool-activity-rail { width: 44px; min-width: 36px; }
+}
+/* At phone widths the date+time can consume the descriptor’s entire flex space.
+   Counters already carry the rail’s information, so keep the text readable. */
+@media (max-width: 360px) {
+  .chat-tool-activity-rail { display: none; }
 }
 @media (prefers-reduced-motion: reduce) {
   .chat-tool-activity.is-running::before,

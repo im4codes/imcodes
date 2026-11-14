@@ -5363,6 +5363,7 @@ function getToolActivityCounts(events: TimelineEvent[]) {
  * finished one reports how long it took.
  */
 function getLastToolActivity(events: TimelineEvent[], nowMs: number): {
+  startedAt: number | null;
   running: boolean;
   failed: boolean;
   durationMs: number | null;
@@ -5384,7 +5385,7 @@ function getLastToolActivity(events: TimelineEvent[], nowMs: number): {
 
   const { toolName, toolInput } = deriveToolCallDisplay(call);
 
-  const startedAt = typeof call.ts === 'number' ? call.ts : null;
+  const startedAt = typeof call.ts === 'number' && Number.isFinite(call.ts) ? call.ts : null;
   // Merging is what pairs a call with its result, so a merged event is finished
   // and carries the result's timestamp; anything unmerged is still in flight.
   // (An explicit "look for a trailing result" branch was tried here and removed:
@@ -5415,7 +5416,7 @@ function getLastToolActivity(events: TimelineEvent[], nowMs: number): {
       || formatToolOutputPreview(call.payload._resultPayloadOutput)
       || null;
 
-  return { running, failed, durationMs, toolName, toolInput, toolOutput, toolError };
+  return { startedAt, running, failed, durationMs, toolName, toolInput, toolOutput, toolError };
 }
 
 let toolPeekIdCounter = 0;
@@ -5439,6 +5440,7 @@ function ToolActivityPeek({
   running,
   failed,
   duration,
+  startTime,
   chatContainerRect,
 }: {
   anchor: DOMRect;
@@ -5450,6 +5452,7 @@ function ToolActivityPeek({
   running: boolean;
   failed: boolean;
   duration: string | null;
+  startTime?: string | null;
   chatContainerRect?: DOMRect | null;
 }) {
   const { t } = useTranslation();
@@ -5519,6 +5522,7 @@ function ToolActivityPeek({
         <span class="chat-tool-peek-dot" aria-hidden="true" />
         <span class="chat-tool-peek-tool">{toolName}</span>
         <span class="chat-tool-peek-status">{status}</span>
+        {startTime && <span class="chat-tool-peek-start-time">{startTime}</span>}
         {duration && <span class="chat-tool-peek-duration">{duration}</span>}
       </div>
       <div class="chat-tool-peek-body">
@@ -5566,7 +5570,8 @@ function ToolActivitySummary({
   onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
   serverId?: string;
 }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const locale = resolveI18nLocale(i18n);
   const [expanded, setExpanded] = useState(false);
   // Anchor rect, not a boolean: the peek is portalled out of the scroller, so it
   // needs the chip's viewport position. Re-measured on every open so scrolling
@@ -5586,6 +5591,7 @@ function ToolActivitySummary({
   // a timer alive, and the shared ticker stops once its last listener leaves.
   const nowMs = useNowTicker(visible && counts.running > 0);
   const last = getLastToolActivity(events, nowMs);
+  const lastStartTime = last?.startedAt != null ? formatChatDateTime(last.startedAt, nowMs, locale) : null;
   const lastDuration = last?.durationMs != null ? formatToolDuration(last.durationMs) : null;
   // Same one-line preview the full row shows, so this reads as a miniature of it
   // rather than a different rendering of the same data.
@@ -5679,6 +5685,7 @@ function ToolActivitySummary({
             {lastInput && <span class="chat-tool-activity-last-input">{lastInput}</span>}
           </span>
         )}
+        {lastStartTime && <span class="chat-tool-activity-start-time" aria-hidden="true">{lastStartTime}</span>}
         {lastDuration && (
           <span
             class={`chat-tool-activity-time${last?.running ? ' is-running' : ''}`}
@@ -5708,6 +5715,7 @@ function ToolActivitySummary({
           error={last.toolError}
           running={last.running}
           failed={last.failed}
+          startTime={lastStartTime}
           duration={lastDuration}
           chatContainerRect={chatContainerRect}
         />

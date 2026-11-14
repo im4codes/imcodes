@@ -52,7 +52,7 @@ vi.mock('../src/hooks/usePref.js', () => ({
   }),
 }));
 
-import { ChatView, __ToolActivityPeekForTests } from '../src/components/ChatView.js';
+import { ChatView, formatChatDateTime, __ToolActivityPeekForTests } from '../src/components/ChatView.js';
 import type { TimelineEvent } from '../src/ws-client.js';
 
 function makeEvent(
@@ -94,6 +94,47 @@ describe('ChatView compact tool activity', () => {
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it.each([false, true])('shows today’s start immediately before duration (running=%s), including in the peek', (running) => {
+    const now = new Date(2026, 10, 14, 12, 30).getTime();
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    stubHover(true);
+    const call = { ...makeEvent('start-call', 'tool.call', { tool: 'Bash', input: { command: 'build' } }, 1), ts: now - 42_000 };
+    const result = { ...makeEvent('start-result', 'tool.result', { output: 'done' }, 2), ts: now - 40_500 };
+    const { container } = render(<ChatView events={running ? [call] : [call, result]} loading={false} />);
+    const start = container.querySelector('.chat-tool-activity-start-time');
+    const duration = container.querySelector('.chat-tool-activity-time');
+    expect(start?.textContent).toBe(formatChatDateTime(call.ts, now));
+    expect(start?.nextElementSibling).toBe(duration);
+    expect(duration?.textContent).toBe(running ? '42s' : '1.5s');
+    fireEvent.mouseEnter(container.querySelector('.chat-tool-activity')!);
+    const peekStart = document.querySelector('.chat-tool-peek-start-time');
+    expect(peekStart?.textContent).toBe(start?.textContent);
+    expect(peekStart?.nextElementSibling).toBe(document.querySelector('.chat-tool-peek-duration'));
+  });
+
+  it('includes yesterday’s date and keeps a start time when a finished call has no duration', () => {
+    const now = new Date(2026, 10, 14, 0, 0, 10).getTime();
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    stubHover(true);
+    const call = { ...makeEvent('yesterday-call', 'tool.call', { tool: 'Read', _merged: true }, 1), ts: now - 20_000 };
+    const { container } = render(<ChatView events={[call]} loading={false} />);
+    const expected = formatChatDateTime(call.ts, now);
+    expect(expected).not.toBe(formatChatDateTime(call.ts, call.ts));
+    expect(container.querySelector('.chat-tool-activity-start-time')?.textContent).toBe(expected);
+    expect(container.querySelector('.chat-tool-activity-time')).toBeNull();
+    fireEvent.mouseEnter(container.querySelector('.chat-tool-activity')!);
+    expect(document.querySelector('.chat-tool-peek-start-time')?.textContent).toBe(expected);
+    expect(document.querySelector('.chat-tool-peek-duration')).toBeNull();
+  });
+
+  it('omits unknown start timestamps instead of inventing a time', () => {
+    const call = makeEvent('unknown-start', 'tool.call', { tool: 'Read' }, 1);
+    (call as unknown as { ts: undefined }).ts = undefined;
+    const { container } = render(<ChatView events={[call]} loading={false} />);
+    expect(container.querySelector('.chat-tool-activity-start-time')).toBeNull();
   });
 
   it('shows live aggregate counts and expands exact tool details on demand', () => {
