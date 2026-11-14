@@ -174,4 +174,49 @@ describe('cloud-docs & migration 105 PostgreSQL integration', () => {
       expect(committed[0].doc.storage_key).toMatch(/^cd-owner\/cd-pg-cas-1\/v2-writer-/);
     }
   });
+
+  it('migration 108 cleans up unverified .md rows idempotently while preserving ONLYOFFICE-verified .md and Office docs', async () => {
+    const now = Date.now();
+    // Ensure table starts from pre-108 state (Test 1 recreated recent_documents at migration 105)
+    await db.exec('ALTER TABLE recent_documents DROP COLUMN IF EXISTS opened_with_onlyoffice');
+    await db.execute(
+      `INSERT INTO recent_documents (
+         id, user_id, source_kind, source_key, server_id, server_name, session_name,
+         file_path, cloud_doc_id, title, mime_type, open_mode, open_count, last_opened_at, created_at
+       ) VALUES
+       ('rdoc_legacy_md', 'cd-owner', 'server_file', 'srv:srv-1:/repo/LEGACY.MD', 'srv-1', 'Node', NULL, '/repo/LEGACY.MD', NULL, 'LEGACY.MD', 'text/markdown', 'view', 1, $1, $1),
+       ('rdoc_valid_docx', 'cd-owner', 'server_file', 'srv:srv-1:/repo/Valid.docx', 'srv-1', 'Node', NULL, '/repo/Valid.docx', NULL, 'Valid.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'edit', 1, $1, $1)`,
+      [now],
+    );
+
+    // Apply migration 108 on pre-existing polluted data
+    await db.execute("DELETE FROM _migrations WHERE name = '108_cleanup_non_onlyoffice_md_recent_documents.sql'");
+    await runMigrations(db);
+
+    const afterFirstRun = await db.query<{ id: string }>(
+      'SELECT id FROM recent_documents WHERE user_id = $1 ORDER BY id ASC',
+      ['cd-owner'],
+    );
+    expect(afterFirstRun.map((r) => r.id)).toEqual(['rdoc_valid_docx']);
+
+    // Now insert a genuine ONLYOFFICE-opened .md entry AND another unverified .md entry, then re-run 108 (idempotency)
+    await db.execute(
+      `INSERT INTO recent_documents (
+         id, user_id, source_kind, source_key, server_id, server_name, session_name,
+         file_path, cloud_doc_id, title, mime_type, open_mode, open_count, last_opened_at, created_at, opened_with_onlyoffice
+       ) VALUES
+       ('rdoc_oo_md', 'cd-owner', 'server_file', 'srv:srv-1:/repo/OO.md', 'srv-1', 'Node', NULL, '/repo/OO.md', NULL, 'OO.md', 'text/markdown', 'edit', 1, $1, $1, TRUE),
+       ('rdoc_unverified_md', 'cd-owner', 'server_file', 'srv:srv-1:/repo/BAD.md', 'srv-1', 'Node', NULL, '/repo/BAD.md', NULL, 'BAD.md', 'text/markdown', 'view', 1, $1, $1, FALSE)`,
+      [now],
+    );
+
+    await db.execute("DELETE FROM _migrations WHERE name = '108_cleanup_non_onlyoffice_md_recent_documents.sql'");
+    await runMigrations(db);
+
+    const remaining = await db.query<{ id: string }>(
+      'SELECT id FROM recent_documents WHERE user_id = $1 ORDER BY id ASC',
+      ['cd-owner'],
+    );
+    expect(remaining.map((r) => r.id)).toEqual(['rdoc_oo_md', 'rdoc_valid_docx']);
+  });
 });

@@ -13,6 +13,7 @@ import {
   listCloudDocTeamsApi,
   listCloudDocsApi,
   listRecentDocumentsApi,
+  recordRecentDocumentApi,
   revokeCloudDocShareApi,
   updateCloudDocApi,
   updateCloudDocFolderApi,
@@ -36,6 +37,7 @@ import {
   type SharedCloudFolderItem,
   getCloudDocExt,
   getCloudDocMeta,
+  isMarkdownFilePath,
   isSupportedCloudDocFilename,
   normalizeCloudDocName,
 } from '@shared/cloud-docs.js';
@@ -446,6 +448,44 @@ export function CloudDocsPanel({
   const [previewTarget, setPreviewTarget] = useState<PreviewTarget | null>(null);
   const [previewTitleDraft, setPreviewTitleDraft] = useState('');
   const [previewTitleStatus, setPreviewTitleStatus] = useState<'idle' | 'saving' | 'saved'>('idle');
+  const lastRecordedOnlyOfficeKeyRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    lastRecordedOnlyOfficeKeyRef.current = null;
+  }, [previewTarget]);
+
+  const handleOnlyOfficeOpened = useCallback((info: { mode: 'view' | 'edit' }) => {
+    if (!previewTarget || typeof recordRecentDocumentApi !== 'function') return;
+    if (previewTarget.kind === 'cloud_doc') {
+      if (!isMarkdownFilePath(previewTarget.name, previewTarget.mimeType)) return;
+      const key = `cloud_doc:${previewTarget.id}`;
+      if (lastRecordedOnlyOfficeKeyRef.current === key) return;
+      lastRecordedOnlyOfficeKeyRef.current = key;
+      void recordRecentDocumentApi({
+        sourceKind: 'cloud_doc',
+        cloudDocId: previewTarget.id,
+        title: previewTarget.name,
+        mimeType: previewTarget.mimeType,
+        openMode: info.mode,
+        openedWithOnlyOffice: true,
+      }).catch(() => {});
+      return;
+    }
+    if (!isMarkdownFilePath(previewTarget.path, previewTarget.mimeType)) return;
+    const key = `server_file:${previewTarget.serverId}:${previewTarget.path}`;
+    if (lastRecordedOnlyOfficeKeyRef.current === key) return;
+    lastRecordedOnlyOfficeKeyRef.current = key;
+    void recordRecentDocumentApi({
+      sourceKind: 'server_file',
+      serverId: previewTarget.serverId,
+      sessionName: previewTarget.sessionName,
+      filePath: previewTarget.path,
+      title: previewTarget.title,
+      mimeType: previewTarget.mimeType,
+      openMode: info.mode,
+      openedWithOnlyOffice: true,
+    }).catch(() => {});
+  }, [previewTarget]);
 
   const [openMenu, setOpenMenu] = useState<MenuTarget | null>(null);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
@@ -2073,6 +2113,7 @@ export function CloudDocsPanel({
                 path={previewTarget.name}
                 readOnly={previewTarget.readOnly}
                 initialMode={previewTarget.readOnly ? 'view' : 'edit'}
+                onOnlyOfficeOpened={handleOnlyOfficeOpened}
               />
             ) : (
               <OfficePreview
@@ -2082,6 +2123,7 @@ export function CloudDocsPanel({
                 path={previewTarget.path}
                 readOnly={previewTarget.readOnly}
                 initialMode={previewTarget.readOnly ? 'view' : 'edit'}
+                onOnlyOfficeOpened={handleOnlyOfficeOpened}
               />
             )}
           </Suspense>

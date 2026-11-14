@@ -29,7 +29,7 @@ import { resolveHttpShareAccess, resolveHttpShareAccessForCoveredSession } from 
 import type { Database } from '../db/client.js';
 import { WsBridge } from '../ws/bridge.js';
 import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
-import { isInternalUploadTempFilePath } from '../../../shared/cloud-docs.js';
+import { isInternalUploadTempFilePath, isMarkdownFilePath } from '../../../shared/cloud-docs.js';
 import { upsertRecentDocument } from '../db/cloud-docs.js';
 
 export const onlyofficeRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
@@ -1465,9 +1465,31 @@ onlyofficeRoutes.get('/server/:id/onlyoffice/config', async (c): Promise<Respons
   // Include explicit ?serverId= on both file and callback URLs to satisfy pod-sticky routing
   const fileUrl = `${serverBaseUrl}/api/onlyoffice/file/${docToken}?serverId=${encodeURIComponent(serverId)}`;
 
-  // Record authenticated regular user document opens in recent_documents automatically (best-effort),
-  // excluding internal daemon upload/pasted-text temp paths.
-  if (auth?.userId && auth.scope !== 'doc_collaborator' && !shareToken && !isInternalUploadTempFilePath(normPath)) {
+  if (c.env.ONLYOFFICE_ENABLED !== 'true') {
+    return c.json({
+      enabled: false,
+      fallbackReason: 'onlyoffice_disabled',
+      role: access.role,
+      allowDownload: access.allowDownload,
+      canManageShare: access.canManageShare,
+      isOwner: access.isOwner,
+      mode: effectiveMode,
+      docToken,
+      fileUrl,
+    });
+  }
+
+  // Record authenticated regular user non-Markdown document opens in recent_documents
+  // automatically (best-effort), excluding internal daemon upload/pasted-text temp paths.
+  // Markdown (.md) files are only recorded after the frontend ONLYOFFICE component actually
+  // initializes DocsAPI.DocEditor cleanly, preventing fallback local previews from entering Recent.
+  if (
+    auth?.userId
+    && auth.scope !== 'doc_collaborator'
+    && !shareToken
+    && !isInternalUploadTempFilePath(normPath)
+    && !isMarkdownFilePath(normPath, meta.mimeType)
+  ) {
     try {
       const serverRow = await c.env.DB.queryOne<{ name: string | null }>(
         'SELECT name FROM servers WHERE id = $1',
@@ -1483,24 +1505,11 @@ onlyofficeRoutes.get('/server/:id/onlyoffice/config', async (c): Promise<Respons
         title: path.posix.basename(normPath),
         mimeType: meta.mimeType,
         openMode: effectiveMode,
+        openedWithOnlyOffice: true,
       });
     } catch {
       // Best-effort history recording must never block document preview/editing
     }
-  }
-
-  if (c.env.ONLYOFFICE_ENABLED !== 'true') {
-    return c.json({
-      enabled: false,
-      fallbackReason: 'onlyoffice_disabled',
-      role: access.role,
-      allowDownload: access.allowDownload,
-      canManageShare: access.canManageShare,
-      isOwner: access.isOwner,
-      mode: effectiveMode,
-      docToken,
-      fileUrl,
-    });
   }
 
   const callbackUrl = `${serverBaseUrl}/api/onlyoffice/callback/${docToken}?serverId=${encodeURIComponent(serverId)}`;

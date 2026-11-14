@@ -295,6 +295,7 @@ export interface RecordRecentDocumentInput {
   title?: string;
   mimeType?: string;
   openMode?: 'view' | 'edit';
+  openedWithOnlyOffice?: boolean;
 }
 
 export type CloudDocContentPayload = {
@@ -494,4 +495,17 @@ export interface CloudDocFileUpdateResponse {
   doc: CloudDocItem;
   role: CloudDocShareRole | 'owner';
   bytesWritten: number;
+}
+
+/**
+ * Returns true if the given filename/path or MIME type represents a Markdown document.
+ * Markdown files must only be recorded into recent_documents when genuinely opened via ONLYOFFICE.
+ */
+export function isMarkdownFilePath(
+  filePathOrTitle?: string | null,
+  mimeType?: string | null,
+): boolean {
+  if (getCloudDocExt(String(filePathOrTitle ?? '')) === '.md') return true;
+  const normalizedMime = String(mimeType ?? '').toLowerCase().split(';')[0]?.trim() ?? '';
+  return normalizedMime === 'text/markdown';
 }

@@ -87,6 +87,7 @@ import {
   isCreateCloudDocType,
   isDocBuilderOutputType,
   isInternalUploadTempFilePath,
+  isMarkdownFilePath,
   normalizeCloudDocFolderName,
   normalizeCloudDocName,
   normalizeRecentFilePath,
@@ -1446,21 +1447,6 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
     const fileUrl = `${serverBaseUrl}/api/cloud-docs/onlyoffice/file/${docToken}`;
     const callbackUrl = `${serverBaseUrl}/api/cloud-docs/onlyoffice/callback/${docToken}`;
 
-    // Automatically record open into recent_documents & touch last_opened_at (best-effort)
-    try {
-      await touchCloudDocOpened(c.env.DB, row.id);
-      await upsertRecentDocument(c.env.DB, {
-        userId: auth.userId,
-        sourceKind: 'cloud_doc',
-        cloudDocId: row.id,
-        title: row.name,
-        mimeType: row.mime_type,
-        openMode: effectiveMode,
-      });
-    } catch {
-      // Do not block opening document if recent history write fails transiently
-    }
-
     if (c.env.ONLYOFFICE_ENABLED !== 'true') {
       return c.json({
         enabled: false,
@@ -1473,6 +1459,25 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
         docToken,
         fileUrl,
       });
+    }
+
+    // Automatically record non-Markdown ONLYOFFICE opens into recent_documents & touch last_opened_at (best-effort).
+    // Markdown (.md) docs are recorded only after the frontend ONLYOFFICE component confirms DocsAPI initialization.
+    try {
+      await touchCloudDocOpened(c.env.DB, row.id);
+      if (!isMarkdownFilePath(row.name, row.mime_type)) {
+        await upsertRecentDocument(c.env.DB, {
+          userId: auth.userId,
+          sourceKind: 'cloud_doc',
+          cloudDocId: row.id,
+          title: row.name,
+          mimeType: row.mime_type,
+          openMode: effectiveMode,
+          openedWithOnlyOffice: true,
+        });
+      }
+    } catch {
+      // Do not block opening document if recent history write fails transiently
     }
 
     const canEdit = effectiveMode === 'edit' && canUserEdit;
@@ -2561,12 +2566,15 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
       title?: string;
       mimeType?: string;
       openMode?: 'view' | 'edit';
+      openedWithOnlyOffice?: boolean;
     };
     try {
       body = (await c.req.json()) as typeof body;
     } catch {
       return c.json({ error: 'invalid_json' }, 400);
     }
+
+    const openedWithOnlyOffice = body.openedWithOnlyOffice === true;
 
     if (body.sourceKind === 'cloud_doc') {
       const cloudDocId = body.cloudDocId?.trim();
@@ -2579,6 +2587,14 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
         );
       }
       const doc = access.doc;
+      if (isMarkdownFilePath(doc.name, doc.mime_type)) {
+        if (c.env.ONLYOFFICE_ENABLED !== 'true') {
+          return c.json({ error: 'onlyoffice_disabled' }, 400);
+        }
+        if (!openedWithOnlyOffice) {
+          return c.json({ error: 'markdown_requires_onlyoffice' }, 400);
+        }
+      }
       const effectiveMode: 'view' | 'edit' =
         access.role === 'editor' && body.openMode !== 'view' ? 'edit' : 'view';
 
@@ -2590,6 +2606,7 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
         title: doc.name,
         mimeType: doc.mime_type,
         openMode: effectiveMode,
+        openedWithOnlyOffice,
       });
       if (!row) return c.json({ error: 'record_failed' }, 400);
       return c.json({
@@ -2629,6 +2646,14 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
       const meta = getOnlyOfficeDocumentMeta(normPath);
       const title = body.title?.trim() || path.posix.basename(normPath) || normPath;
       const mimeType = meta?.mimeType || body.mimeType?.trim() || 'application/octet-stream';
+      if (isMarkdownFilePath(normPath, mimeType) || isMarkdownFilePath(title, mimeType)) {
+        if (c.env.ONLYOFFICE_ENABLED !== 'true') {
+          return c.json({ error: 'onlyoffice_disabled' }, 400);
+        }
+        if (!openedWithOnlyOffice) {
+          return c.json({ error: 'markdown_requires_onlyoffice' }, 400);
+        }
+      }
       const effectiveMode: 'view' | 'edit' =
         access.role === 'editor' && (meta?.isEditable ?? false) && body.openMode !== 'view'
           ? 'edit'
@@ -2644,6 +2669,7 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
         title,
         mimeType,
         openMode: effectiveMode,
+        openedWithOnlyOffice,
       });
       if (!row) return c.json({ error: 'record_failed' }, 400);
 

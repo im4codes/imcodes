@@ -46,7 +46,7 @@ import { useTranslation } from 'react-i18next';
 import type { WsClient, ServerMessage } from '../ws-client.js';
 import { lazy, memo, Suspense } from 'preact/compat';
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
-import { isInternalUploadTempFilePath } from '@shared/cloud-docs.js';
+import { isInternalUploadTempFilePath, isMarkdownFilePath } from '@shared/cloud-docs.js';
 import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
 import { FS_SESSION_ROOT_PATH, FS_WRITE_ERROR } from '../../../src/shared/transport/fs.js';
 import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
@@ -1889,7 +1889,13 @@ export function FileBrowser({
     // Only record non-temp Office/PDF/Cloud Docs previews into Recent; plain text/code
     // previews (`status === 'ok'`) and internal daemon uploads (`~/.imcodes/uploads/...`)
     // must never auto-enter Cloud Docs Recent.
+    // Markdown (.md) files must NOT record merely on preview.status === 'office' (ONLYOFFICE
+    // might be disabled or fail & fall back locally); they record only inside handleOnlyOfficeOpened.
     if (preview.status !== 'office' || isInternalUploadTempFilePath(preview.path)) {
+      lastRecordedRecentOfficeKeyRef.current = null;
+      return;
+    }
+    if (isMarkdownFilePath(preview.path, preview.mimeType)) {
       lastRecordedRecentOfficeKeyRef.current = null;
       return;
     }
@@ -1908,6 +1914,26 @@ export function FileBrowser({
       openMode: (activeSharedDocReadOnly ?? readOnly) ? 'view' : 'edit',
     }).catch(() => {});
   }, [preview, activeSharedDocServerId, serverId, scopedSessionName, activeSharedDocReadOnly, readOnly]);
+
+  const handleOnlyOfficeOpened = useCallback((info: { mode: 'view' | 'edit' }) => {
+    if (preview.status !== 'office' || isInternalUploadTempFilePath(preview.path)) return;
+    if (!isMarkdownFilePath(preview.path, preview.mimeType)) return;
+    const targetServerId = activeSharedDocServerId || serverId;
+    if (!targetServerId || typeof recordRecentDocumentApi !== 'function') return;
+    const key = `${targetServerId}:${preview.path}`;
+    if (lastRecordedRecentOfficeKeyRef.current === key) return;
+    lastRecordedRecentOfficeKeyRef.current = key;
+    void recordRecentDocumentApi({
+      sourceKind: 'server_file',
+      serverId: targetServerId,
+      sessionName: scopedSessionName,
+      filePath: preview.path,
+      mimeType: preview.mimeType,
+      title: preview.path.split(/[/\\]/).pop() || preview.path,
+      openMode: info.mode,
+      openedWithOnlyOffice: true,
+    }).catch(() => {});
+  }, [preview, activeSharedDocServerId, serverId, scopedSessionName]);
 
   // Auto-preview file on open (e.g. when clicking a path link in chat)
   useEffect(() => {
@@ -2714,6 +2740,7 @@ export function FileBrowser({
               readOnly={activeSharedDocReadOnly ?? readOnly}
               initialMode={(activeSharedDocReadOnly ?? readOnly) ? 'view' : undefined}
               onOpenShare={serverId && !readOnly ? () => setShareDialogTarget({ path: preview.path, kind: 'file' }) : undefined}
+              onOnlyOfficeOpened={handleOnlyOfficeOpened}
             />
           </Suspense>
         )}

@@ -17,6 +17,7 @@ import {
   CLOUD_DOCS_RECENT_DEFAULT_LIMIT,
   CLOUD_DOCS_RECENT_MAX_LIMIT,
   buildRecentDocumentSourceKey,
+  isMarkdownFilePath,
   normalizeRecentFilePath,
 } from '../../../shared/cloud-docs.js';
 
@@ -59,6 +60,7 @@ export interface RecentDocumentRow {
   mime_type: string;
   open_mode: 'view' | 'edit';
   open_count: number | string;
+  opened_with_onlyoffice?: boolean;
   last_opened_at: number | string;
   created_at: number | string;
 }
@@ -581,6 +583,7 @@ export interface UpsertRecentDocumentParams {
   title: string;
   mimeType: string;
   openMode?: 'view' | 'edit';
+  openedWithOnlyOffice?: boolean;
 }
 
 export async function upsertRecentDocument(
@@ -590,6 +593,11 @@ export async function upsertRecentDocument(
   const normFilePath = params.sourceKind === 'server_file'
     ? normalizeRecentFilePath(params.filePath)
     : null;
+  const isMarkdown = isMarkdownFilePath(normFilePath, params.mimeType)
+    || isMarkdownFilePath(params.title, params.mimeType);
+  if (isMarkdown && !params.openedWithOnlyOffice) {
+    return null;
+  }
   const sourceKey = buildRecentDocumentSourceKey({
     sourceKind: params.sourceKind,
     serverId: params.serverId,
@@ -601,12 +609,13 @@ export async function upsertRecentDocument(
   const now = Date.now();
   const id = `rdoc_${randomUUID().replace(/-/g, '').slice(0, 20)}`;
   const openMode: 'view' | 'edit' = params.openMode === 'view' ? 'view' : 'edit';
+  const openedWithOnlyOffice = params.openedWithOnlyOffice === true;
 
   await db.execute(
     `INSERT INTO recent_documents (
        id, user_id, source_kind, source_key, server_id, server_name, session_name,
-       file_path, cloud_doc_id, title, mime_type, open_mode, open_count, last_opened_at, created_at
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 1, $13, $14)
+       file_path, cloud_doc_id, title, mime_type, open_mode, open_count, last_opened_at, created_at, opened_with_onlyoffice
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 1, $13, $14, $15)
      ON CONFLICT (user_id, source_key) DO UPDATE SET
        server_name = COALESCE(EXCLUDED.server_name, recent_documents.server_name),
        session_name = COALESCE(EXCLUDED.session_name, recent_documents.session_name),
@@ -614,7 +623,8 @@ export async function upsertRecentDocument(
        mime_type = EXCLUDED.mime_type,
        open_mode = EXCLUDED.open_mode,
        open_count = recent_documents.open_count + 1,
-       last_opened_at = EXCLUDED.last_opened_at`,
+       last_opened_at = EXCLUDED.last_opened_at,
+       opened_with_onlyoffice = recent_documents.opened_with_onlyoffice OR EXCLUDED.opened_with_onlyoffice`,
     [
       id,
       params.userId,
@@ -630,12 +640,13 @@ export async function upsertRecentDocument(
       openMode,
       now,
       now,
+      openedWithOnlyOffice,
     ],
   );
 
   return db.queryOne<RecentDocumentRow>(
     `SELECT id, user_id, source_kind, source_key, server_id, server_name, session_name,
-            file_path, cloud_doc_id, title, mime_type, open_mode, open_count, last_opened_at, created_at
+            file_path, cloud_doc_id, title, mime_type, open_mode, open_count, opened_with_onlyoffice, last_opened_at, created_at
      FROM recent_documents
      WHERE user_id = $1 AND source_key = $2`,
     [params.userId, sourceKey],
@@ -650,7 +661,7 @@ export async function listRecentDocumentsRaw(
   const clamped = Math.max(1, Math.min(CLOUD_DOCS_RECENT_MAX_LIMIT, Math.floor(limit || CLOUD_DOCS_RECENT_DEFAULT_LIMIT)));
   return db.query<RecentDocumentRow>(
     `SELECT id, user_id, source_kind, source_key, server_id, server_name, session_name,
-            file_path, cloud_doc_id, title, mime_type, open_mode, open_count, last_opened_at, created_at
+            file_path, cloud_doc_id, title, mime_type, open_mode, open_count, opened_with_onlyoffice, last_opened_at, created_at
      FROM recent_documents
      WHERE user_id = $1
      ORDER BY last_opened_at DESC, created_at DESC

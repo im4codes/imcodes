@@ -42,6 +42,8 @@ export interface OfficePreviewProps {
   initialMode?: 'view' | 'edit';
   /** Optional callback to open the document share dialog. */
   onOpenShare?: () => void;
+  /** Fired once when ONLYOFFICE DocsAPI.DocEditor actually initializes cleanly. */
+  onOnlyOfficeOpened?: (info: { mode: 'view' | 'edit'; fileType?: string }) => void;
 }
 
 async function fetchArrayBuffer(url: string, signal: AbortSignal): Promise<ArrayBuffer> {
@@ -367,6 +369,7 @@ function OnlyOfficeEmbeddedEditor({
   onFallbackLocal,
   onAutoFallbackLocal,
   onOpenShare,
+  onOnlyOfficeOpened,
   downloadUrl,
   onDownload,
 }: {
@@ -378,12 +381,17 @@ function OnlyOfficeEmbeddedEditor({
   onFallbackLocal?: () => void;
   onAutoFallbackLocal?: (reason: string) => void;
   onOpenShare?: () => void;
+  onOnlyOfficeOpened?: (info: { mode: 'view' | 'edit'; fileType?: string }) => void;
   downloadUrl?: string;
   onDownload?: () => void;
 }) {
   const { t } = useTranslation();
   const holderIdRef = useRef(`onlyoffice-editor-${Math.random().toString(36).slice(2, 10)}`);
   const editorInstanceRef = useRef<{ destroyEditor?: () => void } | null>(null);
+  const onOnlyOfficeOpenedRef = useRef(onOnlyOfficeOpened);
+  onOnlyOfficeOpenedRef.current = onOnlyOfficeOpened;
+  const modeRef = useRef(mode);
+  modeRef.current = mode;
   const [scriptError, setScriptError] = useState<string | null>(null);
   const [retryCount, setRetryCount] = useState(0);
 
@@ -406,6 +414,12 @@ function OnlyOfficeEmbeddedEditor({
           holderIdRef.current,
           ooConfig.config as unknown as Record<string, unknown>,
         );
+        if (!cancelled) {
+          onOnlyOfficeOpenedRef.current?.({
+            mode: modeRef.current,
+            fileType: ooConfig.config?.document?.fileType,
+          });
+        }
       } catch (err) {
         if (!cancelled) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -699,6 +713,7 @@ function OfficePreviewDocument({
   readOnly,
   initialMode,
   onOpenShare,
+  onOnlyOfficeOpened,
 }: OfficePreviewProps) {
   const { t } = useTranslation();
   const hasRemoteTarget = Boolean(cloudDocId || serverId);
@@ -884,6 +899,7 @@ function OfficePreviewDocument({
             : undefined
         }
         onOpenShare={onOpenShare}
+        onOnlyOfficeOpened={onOnlyOfficeOpened}
         downloadUrl={handleCloudDocDownload ? undefined : effectiveSrcUrl}
         onDownload={handleCloudDocDownload}
       />

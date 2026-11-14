@@ -1109,4 +1109,119 @@ describe('OfficePreview fallback document transitions', () => {
       delete (window as unknown as { DocsAPI?: unknown }).DocsAPI;
     }
   });
+
+  it('fires onOnlyOfficeOpened only when DocsAPI.DocEditor initializes cleanly, never on disabled or fallback failures', async () => {
+    const apiMod = await import('../../src/api.js');
+    const cfgSpy = vi.spyOn(apiMod, 'fetchOnlyOfficeConfig');
+    const origDocsApi = window.DocsAPI;
+    const { resetOnlyOfficePrewarm } = await import('../../src/onlyoffice-preload.js');
+    resetOnlyOfficePrewarm({ clearScriptCache: true, removeDomNodes: true });
+    let activeScriptSpy: ReturnType<typeof vi.spyOn> | null = null;
+
+    try {
+      // 1. ONLYOFFICE disabled on server -> onOnlyOfficeOpened must NOT fire
+      cfgSpy.mockResolvedValueOnce({
+        enabled: false,
+        fallbackReason: 'onlyoffice_disabled',
+        role: 'editor',
+        allowDownload: true,
+        canManageShare: false,
+        isOwner: true,
+        mode: 'view',
+        fileUrl: 'https://files.test/README.md',
+      } as unknown as Awaited<ReturnType<typeof apiMod.fetchOnlyOfficeConfig>>);
+      vi.stubGlobal('fetch', vi.fn(async () => new Response('# hello', { status: 200 })));
+
+      const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
+      const onOpenedDisabled = vi.fn();
+      const v1 = render(
+        <OfficePreview
+          serverId="srv-1"
+          path="/repo/README.md"
+          mimeType="text/markdown"
+          onOnlyOfficeOpened={onOpenedDisabled}
+        />,
+      );
+      await waitFor(() => expect(v1.getByTestId('office-preview-text-fallback')).toBeTruthy());
+      expect(onOpenedDisabled).not.toHaveBeenCalled();
+      v1.unmount();
+
+      // 2. ONLYOFFICE enabled, but DocsAPI.DocEditor throws -> falls back locally and onOnlyOfficeOpened must NOT fire
+      resetOnlyOfficePrewarm({ clearScriptCache: true, removeDomNodes: true });
+      cfgSpy.mockResolvedValueOnce({
+        enabled: true,
+        role: 'editor',
+        allowDownload: true,
+        canManageShare: false,
+        isOwner: true,
+        mode: 'edit',
+        scriptUrl: 'https://onlyoffice.test/web-apps/apps/api/documents/api.js',
+        fileUrl: 'https://files.test/README.md',
+        config: {
+          documentType: 'word',
+          document: { title: 'README.md', url: 'https://files.test/README.md', fileType: 'txt', key: 'k-throw' },
+          editorConfig: { mode: 'edit' },
+        },
+      } as unknown as Awaited<ReturnType<typeof apiMod.fetchOnlyOfficeConfig>>);
+      const throwEditor = vi.fn().mockImplementation(() => {
+        throw new Error('DocEditor init failed');
+      });
+      activeScriptSpy = installOnlyOfficeScriptLoadMock(throwEditor);
+
+      const onOpenedThrow = vi.fn();
+      const v2 = render(
+        <OfficePreview
+          serverId="srv-1"
+          path="/repo/README.md"
+          mimeType="text/markdown"
+          onOnlyOfficeOpened={onOpenedThrow}
+        />,
+      );
+      await waitFor(() => expect(v2.getByTestId('office-preview-text-fallback')).toBeTruthy());
+      expect(throwEditor).toHaveBeenCalledTimes(1);
+      expect(onOpenedThrow).not.toHaveBeenCalled();
+      v2.unmount();
+      activeScriptSpy.mockRestore();
+      activeScriptSpy = null;
+
+      // 3. ONLYOFFICE enabled and DocsAPI.DocEditor succeeds -> onOnlyOfficeOpened fires once
+      resetOnlyOfficePrewarm({ clearScriptCache: true, removeDomNodes: true });
+      cfgSpy.mockResolvedValueOnce({
+        enabled: true,
+        role: 'editor',
+        allowDownload: true,
+        canManageShare: false,
+        isOwner: true,
+        mode: 'edit',
+        scriptUrl: 'https://onlyoffice.test/web-apps/apps/api/documents/api.js',
+        fileUrl: 'https://files.test/README.md',
+        config: {
+          documentType: 'word',
+          document: { title: 'README.md', url: 'https://files.test/README.md', fileType: 'txt', key: 'k-ok' },
+          editorConfig: { mode: 'edit' },
+        },
+      } as unknown as Awaited<ReturnType<typeof apiMod.fetchOnlyOfficeConfig>>);
+      const okEditor = vi.fn().mockImplementation(() => ({ destroyEditor: vi.fn() }));
+      activeScriptSpy = installOnlyOfficeScriptLoadMock(okEditor);
+
+      const onOpenedOk = vi.fn();
+      const v3 = render(
+        <OfficePreview
+          serverId="srv-1"
+          path="/repo/README.md"
+          mimeType="text/markdown"
+          onOnlyOfficeOpened={onOpenedOk}
+        />,
+      );
+      await waitFor(() => expect(onOpenedOk).toHaveBeenCalledTimes(1));
+      expect(onOpenedOk).toHaveBeenCalledWith({ mode: 'edit', fileType: 'txt' });
+      v3.unmount();
+    } finally {
+      activeScriptSpy?.mockRestore();
+      resetOnlyOfficePrewarm({ clearScriptCache: true, removeDomNodes: true });
+      window.DocsAPI = origDocsApi;
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+    }
+  });
 });

@@ -64,6 +64,7 @@ const updateCloudDocApiMock = vi.fn();
 const deleteCloudDocApiMock = vi.fn();
 const downloadCloudDocApiMock = vi.fn();
 const listRecentDocumentsApiMock = vi.fn();
+const recordRecentDocumentApiMock = vi.fn();
 const deleteRecentDocumentApiMock = vi.fn();
 
 vi.mock('../../src/api.js', () => ({
@@ -92,6 +93,7 @@ vi.mock('../../src/api.js', () => ({
   getCloudDocDownloadUrl: (docId: string, inline?: boolean) =>
     `/api/cloud-docs/docs/${encodeURIComponent(docId)}/download${inline ? '?inline=1' : ''}`,
   listRecentDocumentsApi: (...args: unknown[]) => listRecentDocumentsApiMock(...args),
+  recordRecentDocumentApi: (...args: unknown[]) => recordRecentDocumentApiMock(...args),
   deleteRecentDocumentApi: (...args: unknown[]) => deleteRecentDocumentApiMock(...args),
 }));
 
@@ -1719,5 +1721,57 @@ describe('CloudDocsPanel', () => {
     expect(mobile600Css).toContain('.cloud-docs-panel.is-standalone .cloud-docs-brand-title {\n    display: none;\n  }');
     expect(mobile600Css).toContain('.cloud-docs-header.is-mobile-search-open .cloud-docs-header-brand');
     expect(mobile600Css).toContain('.cloud-docs-header .cloud-docs-select {\n    height: 26px;');
+  });
+
+  it('records .md Cloud Docs into Recent only when OfficePreview invokes onOnlyOfficeOpened', async () => {
+    recordRecentDocumentApiMock.mockReset();
+    recordRecentDocumentApiMock.mockResolvedValue({ item: {} });
+    officePreviewPropsSpy.mockClear();
+
+    const mdDoc = makeDoc({
+      id: 'doc-md-1',
+      name: 'Notes.md',
+      ext: '.md',
+      mimeType: 'text/markdown',
+    });
+    const docxDoc = makeDoc({
+      id: 'doc-docx-1',
+      name: 'Spec.docx',
+      ext: '.docx',
+      mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    });
+
+    listCloudDocsApiMock.mockResolvedValue({
+      folders: [],
+      docs: [mdDoc, docxDoc],
+      sharedFolders: [],
+      sharedDocs: [],
+    });
+    listRecentDocumentsApiMock.mockResolvedValue({ items: [] });
+    listCloudDocTeamsApiMock.mockResolvedValue({ teams: [] });
+
+    render(<CloudDocsPanel initialTab="my_docs" />);
+    await waitFor(() => expect(screen.getByText('Notes.md')).toBeTruthy());
+
+    // Open Notes.md -> OfficePreview mounts without calling recordRecentDocumentApi until onOnlyOfficeOpened fires
+    fireEvent.click(screen.getByText('Notes.md'));
+    await waitFor(() => expect(screen.getByTestId('mock-office-preview')).toBeTruthy());
+    expect(recordRecentDocumentApiMock).not.toHaveBeenCalled();
+
+    const lastMdProps = officePreviewPropsSpy.mock.calls.at(-1)?.[0] as {
+      onOnlyOfficeOpened?: (info: { mode: 'view' | 'edit' }) => void;
+    };
+    expect(typeof lastMdProps?.onOnlyOfficeOpened).toBe('function');
+    lastMdProps.onOnlyOfficeOpened!({ mode: 'edit' });
+
+    expect(recordRecentDocumentApiMock).toHaveBeenCalledTimes(1);
+    expect(recordRecentDocumentApiMock).toHaveBeenCalledWith({
+      sourceKind: 'cloud_doc',
+      cloudDocId: 'doc-md-1',
+      title: 'Notes.md',
+      mimeType: 'text/markdown',
+      openMode: 'edit',
+      openedWithOnlyOffice: true,
+    });
   });
 });

@@ -3659,4 +3659,183 @@ describe('FileBrowser — file-manager preview/folder sync', () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it('never records .md when ONLYOFFICE is disabled or falls back locally, and records .md only when ONLYOFFICE DocEditor actually opens', async () => {
+    const prevResizeObserver = globalThis.ResizeObserver;
+    class MockResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    globalThis.ResizeObserver = MockResizeObserver as unknown as typeof ResizeObserver;
+    const origDocsApi = window.DocsAPI;
+    const { resetOnlyOfficePrewarm } = await import('../../src/onlyoffice-preload.js');
+    resetOnlyOfficePrewarm({ clearScriptCache: true, removeDomNodes: true });
+
+    let nextDocEditor: unknown = vi.fn().mockImplementation(() => ({ destroyEditor: vi.fn() }));
+    const originalAppend = document.head.appendChild.bind(document.head);
+    const appendSpy = vi.spyOn(document.head, 'appendChild').mockImplementation((node: Node) => {
+      const res = originalAppend(node);
+      const el = node as HTMLScriptElement;
+      if (el.tagName === 'SCRIPT' && el.dataset?.onlyofficeSrc) {
+        setTimeout(() => {
+          (window as unknown as { DocsAPI: { DocEditor: unknown } }).DocsAPI = { DocEditor: nextDocEditor };
+          el.onload?.(new Event('load'));
+        }, 0);
+      }
+      return res;
+    });
+
+    let configScenario: 'disabled' | 'throw' | 'ok' = 'disabled';
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/onlyoffice/config')) {
+        if (configScenario === 'disabled') {
+          return new Response(JSON.stringify({
+            enabled: false,
+            fallbackReason: 'onlyoffice_disabled',
+            role: 'editor',
+            allowDownload: true,
+            canManageShare: false,
+            isOwner: true,
+            mode: 'view',
+            fileUrl: 'https://files.test/README.md',
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }
+        return new Response(JSON.stringify({
+          enabled: true,
+          role: 'editor',
+          allowDownload: true,
+          canManageShare: false,
+          isOwner: true,
+          mode: 'edit',
+          scriptUrl: 'https://onlyoffice.test/web-apps/apps/api/documents/api.js',
+          fileUrl: 'https://files.test/README.md',
+          config: {
+            documentType: 'word',
+            document: { title: 'README.md', url: 'https://files.test/README.md', fileType: 'txt', key: 'k-md' },
+            editorConfig: { mode: 'edit' },
+          },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (url.includes('https://files.test/README.md')) {
+        return new Response('# Markdown Body', { status: 200 });
+      }
+      return new Response(JSON.stringify({ item: {} }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const recentCalls = () => fetchMock.mock.calls.filter(([url]) => String(url).includes('/api/recent-documents/record'));
+    const { ws, sendMsg } = makeWsFactory();
+
+    try {
+      // Case 1: Click ONLYOFFICE button on README.md when ONLYOFFICE is disabled -> falls back locally, ZERO recent calls
+      configScenario = 'disabled';
+      const vDisabled = render(
+        <FileBrowser
+          ws={ws}
+          serverId="srv-md"
+          mode="file-single"
+          layout="panel"
+          initialPath="/repo"
+          autoPreviewPath="/repo/README.md"
+          onConfirm={vi.fn()}
+        />,
+      );
+      await act(async () => {
+        sendMsg({
+          type: 'fs.read_response',
+          requestId: 'mock-read-id',
+          path: '/repo/README.md',
+          status: 'ok',
+          content: '# Markdown Body',
+          encoding: 'utf8',
+        } as unknown as ServerMessage);
+      });
+      fireEvent.click(vDisabled.getByTestId('fb-open-csv-office-btn'));
+      await waitFor(() => expect(vDisabled.getByTestId('office-preview-text-fallback')).toBeTruthy());
+      expect(recentCalls()).toHaveLength(0);
+      vDisabled.unmount();
+
+      // Case 2: ONLYOFFICE enabled, but DocsAPI.DocEditor throws & falls back locally -> ZERO recent calls
+      resetOnlyOfficePrewarm({ clearScriptCache: true, removeDomNodes: true });
+      configScenario = 'throw';
+      nextDocEditor = vi.fn().mockImplementation(() => {
+        throw new Error('DocEditor init failed');
+      });
+      const vThrow = render(
+        <FileBrowser
+          ws={ws}
+          serverId="srv-md"
+          mode="file-single"
+          layout="panel"
+          initialPath="/repo"
+          autoPreviewPath="/repo/README.md"
+          onConfirm={vi.fn()}
+        />,
+      );
+      await act(async () => {
+        sendMsg({
+          type: 'fs.read_response',
+          requestId: 'mock-read-id',
+          path: '/repo/README.md',
+          status: 'ok',
+          content: '# Markdown Body',
+          encoding: 'utf8',
+        } as unknown as ServerMessage);
+      });
+      fireEvent.click(vThrow.getByTestId('fb-open-csv-office-btn'));
+      await waitFor(() => expect(vThrow.getByTestId('office-preview-text-fallback')).toBeTruthy());
+      expect(recentCalls()).toHaveLength(0);
+      vThrow.unmount();
+
+      // Case 3: ONLYOFFICE enabled and DocsAPI.DocEditor initializes cleanly -> records ONCE with openedWithOnlyOffice: true
+      resetOnlyOfficePrewarm({ clearScriptCache: true, removeDomNodes: true });
+      configScenario = 'ok';
+      nextDocEditor = vi.fn().mockImplementation(() => ({ destroyEditor: vi.fn() }));
+      const vOk = render(
+        <FileBrowser
+          ws={ws}
+          serverId="srv-md"
+          mode="file-single"
+          layout="panel"
+          initialPath="/repo"
+          autoPreviewPath="/repo/README.md"
+          onConfirm={vi.fn()}
+        />,
+      );
+      await act(async () => {
+        sendMsg({
+          type: 'fs.read_response',
+          requestId: 'mock-read-id',
+          path: '/repo/README.md',
+          status: 'ok',
+          content: '# Markdown Body',
+          encoding: 'utf8',
+        } as unknown as ServerMessage);
+      });
+      fireEvent.click(vOk.getByTestId('fb-open-csv-office-btn'));
+      await waitFor(() => expect(recentCalls()).toHaveLength(1));
+      const mdPayload = JSON.parse(String((recentCalls()[0]?.[1] as RequestInit | undefined)?.body ?? '{}'));
+      expect(mdPayload).toMatchObject({
+        sourceKind: 'server_file',
+        serverId: 'srv-md',
+        filePath: '/repo/README.md',
+        mimeType: 'text/markdown',
+        title: 'README.md',
+        openMode: 'edit',
+        openedWithOnlyOffice: true,
+      });
+      vOk.unmount();
+    } finally {
+      appendSpy.mockRestore();
+      resetOnlyOfficePrewarm({ clearScriptCache: true, removeDomNodes: true });
+      window.DocsAPI = origDocsApi;
+      globalThis.ResizeObserver = prevResizeObserver;
+      vi.unstubAllGlobals();
+    }
+  });
 });

@@ -527,8 +527,13 @@ function createInMemoryCloudDocsDb() {
       }
 
       if (s.startsWith('INSERT INTO recent_documents')) {
-        const [id, user_id, source_kind, source_key, server_id, server_name, session_name, file_path, cloud_doc_id, title, mime_type, open_mode, last_opened_at, created_at] =
-          params as [string, string, 'server_file' | 'cloud_doc', string, string | null, string | null, string | null, string | null, string | null, string, string, 'view' | 'edit', number, number];
+        const [
+          id, user_id, source_kind, source_key, server_id, server_name, session_name,
+          file_path, cloud_doc_id, title, mime_type, open_mode, last_opened_at, created_at, opened_with_onlyoffice,
+        ] = params as [
+          string, string, 'server_file' | 'cloud_doc', string, string | null, string | null, string | null,
+          string | null, string | null, string, string, 'view' | 'edit', number, number, boolean?,
+        ];
         const compositeKey = `${user_id}:${source_key}`;
         const existing = recents.get(compositeKey);
         if (existing) {
@@ -539,10 +544,12 @@ function createInMemoryCloudDocsDb() {
           existing.open_mode = open_mode;
           existing.open_count = Number(existing.open_count) + 1;
           existing.last_opened_at = last_opened_at;
+          existing.opened_with_onlyoffice = Boolean(existing.opened_with_onlyoffice || opened_with_onlyoffice);
         } else {
           recents.set(compositeKey, {
             id, user_id, source_kind, source_key, server_id, server_name, session_name,
             file_path, cloud_doc_id, title, mime_type, open_mode, open_count: 1,
+            opened_with_onlyoffice: Boolean(opened_with_onlyoffice),
             last_opened_at, created_at,
           });
         }
@@ -920,9 +927,9 @@ describe('cloud docs & recent documents', () => {
     (bridge as unknown as { daemonWs: MockDaemonWs; authenticated: boolean }).daemonWs = mockWs;
     (bridge as unknown as { authenticated: boolean }).authenticated = true;
 
-    // 1. Bob opens server file via ONLYOFFICE config -> automatically recorded in Bob's recent_documents
+    // 1. Bob opens server Office file via ONLYOFFICE config -> automatically recorded in Bob's recent_documents
     const srvCfgRes = await app.request(
-      `/api/server/srv-1/onlyoffice/config?path=${encodeURIComponent('/repo/README.md')}`,
+      `/api/server/srv-1/onlyoffice/config?path=${encodeURIComponent('/repo/README.docx')}`,
       { headers: bearerHeader('user-bob') },
     );
     expect(srvCfgRes.status).toBe(200);
@@ -934,8 +941,8 @@ describe('cloud docs & recent documents', () => {
       body: JSON.stringify({
         sourceKind: 'server_file',
         serverId: 'srv-1',
-        filePath: '/repo/README.md',
-        title: 'README.md',
+        filePath: '/repo/README.docx',
+        title: 'README.docx',
       }),
     });
 
@@ -978,6 +985,180 @@ describe('cloud docs & recent documents', () => {
       headers: bearerHeader('user-bob'),
     });
     expect(bobDel.status).toBe(200);
+  });
+
+  it('blocks non-ONLYOFFICE .md previews and disabled-ONLYOFFICE config calls from recent_documents while recording verified ONLYOFFICE .md opens and registering migration 108', async () => {
+    expect(isMigrationFile('108_cleanup_non_onlyoffice_md_recent_documents.sql')).toBe(true);
+    const mig108Sql = fs.readFileSync(
+      path.resolve(__dirname, '../src/db/migrations/108_cleanup_non_onlyoffice_md_recent_documents.sql'),
+      'utf8',
+    );
+    expect(mig108Sql).toContain('ADD COLUMN IF NOT EXISTS opened_with_onlyoffice BOOLEAN NOT NULL DEFAULT FALSE');
+    expect(mig108Sql).toContain('DELETE FROM recent_documents');
+    expect(mig108Sql).toContain('opened_with_onlyoffice = FALSE');
+
+    const bridge = WsBridge.get('srv-1');
+    class MockDaemonWs extends EventEmitter {
+      readyState = 1;
+      send(raw: string, _opts?: unknown, cb?: () => void) {
+        cb?.();
+        const msg = JSON.parse(raw) as Record<string, unknown>;
+        if (msg.type === 'fs.read') {
+          setTimeout(() => {
+            this.emit('message', Buffer.from(JSON.stringify({
+              type: 'fs.read_response',
+              requestId: msg.requestId,
+              status: 'ok',
+              path: msg.path,
+              content: '# Server Readme',
+              encoding: 'utf8',
+              mtime: Date.now(),
+            })), false);
+          }, 1);
+        }
+      }
+      close() {}
+      ping() {}
+    }
+    const mockWs = new MockDaemonWs();
+    (bridge as unknown as { daemonWs: MockDaemonWs; authenticated: boolean }).daemonWs = mockWs;
+    (bridge as unknown as { authenticated: boolean }).authenticated = true;
+
+    // Create a Markdown Cloud Doc for disabled/fallback tests
+    const mdCloudRes = await app.request('/api/cloud-docs/blank', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'md', name: 'Notes.md' }),
+    });
+    expect(mdCloudRes.status).toBe(201);
+    const { doc: mdCloudDoc } = (await mdCloudRes.json()) as { doc: { id: string } };
+
+    const docxCloudRes = await app.request('/api/cloud-docs/blank', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'docx', name: 'Spec.docx' }),
+    });
+    expect(docxCloudRes.status).toBe(201);
+    const { doc: docxCloudDoc } = (await docxCloudRes.json()) as { doc: { id: string } };
+
+    // 1. When ONLYOFFICE_ENABLED !== 'true', config endpoints must NOT write any recent_documents (including .md or .docx)
+    const disabledApp = buildApp(
+      {
+        DB: memDb.db,
+        DATABASE_URL: 'postgres://localhost/test',
+        JWT_SIGNING_KEY: JWT_KEY,
+        BOT_ENCRYPTION_KEY: 'test-bot-key',
+        SERVER_URL: 'https://app.im.codes',
+        ONLYOFFICE_ENABLED: 'false',
+        ONLYOFFICE_JWT_SECRET: OO_SECRET,
+        ONLYOFFICE_PUBLIC_URL: 'https://app.im.codes/onlyoffice',
+        ONLYOFFICE_INTERNAL_URL: 'http://onlyoffice:80',
+        IMCODES_CLOUD_DOCS_DIR: tmpDir,
+        NODE_ENV: 'test',
+      },
+      { cloudDocStorage: storage },
+    );
+
+    for (const url of [
+      `/api/server/srv-1/onlyoffice/config?path=${encodeURIComponent('/repo/README.md')}`,
+      `/api/server/srv-1/onlyoffice/config?path=${encodeURIComponent('/repo/spec.docx')}`,
+      `/api/cloud-docs/${mdCloudDoc.id}/onlyoffice/config`,
+      `/api/cloud-docs/${docxCloudDoc.id}/onlyoffice/config`,
+    ]) {
+      const res = await disabledApp.request(url, { headers: bearerHeader('owner-1') });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ enabled: false, fallbackReason: 'onlyoffice_disabled' });
+    }
+
+    // Even with openedWithOnlyOffice: true, recording .md while ONLYOFFICE is disabled must be rejected
+    const disabledMdRec = await disabledApp.request('/api/recent-documents/record', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceKind: 'server_file',
+        serverId: 'srv-1',
+        filePath: '/repo/README.md',
+        title: 'README.md',
+        openedWithOnlyOffice: true,
+      }),
+    });
+    expect(disabledMdRec.status).toBe(400);
+    expect(await disabledMdRec.json()).toMatchObject({ error: 'onlyoffice_disabled' });
+
+    const disabledMdCloudRec = await disabledApp.request('/api/recent-documents/record', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceKind: 'cloud_doc',
+        cloudDocId: mdCloudDoc.id,
+        openedWithOnlyOffice: true,
+      }),
+    });
+    expect(disabledMdCloudRec.status).toBe(400);
+    expect(await disabledMdCloudRec.json()).toMatchObject({ error: 'onlyoffice_disabled' });
+
+    // 2. When ONLYOFFICE_ENABLED === 'true', fetching config alone for .md must NOT record yet (frontend might fall back on api.js failure)
+    const mdSrvCfg = await app.request(
+      `/api/server/srv-1/onlyoffice/config?path=${encodeURIComponent('/repo/README.md')}`,
+      { headers: bearerHeader('owner-1') },
+    );
+    expect(mdSrvCfg.status).toBe(200);
+    expect(await mdSrvCfg.json()).toMatchObject({ enabled: true });
+
+    const mdCloudCfg = await app.request(`/api/cloud-docs/${mdCloudDoc.id}/onlyoffice/config`, {
+      headers: bearerHeader('owner-1'),
+    });
+    expect(mdCloudCfg.status).toBe(200);
+    expect(await mdCloudCfg.json()).toMatchObject({ enabled: true });
+
+    // 3. Direct POST /api/recent-documents/record for .md without openedWithOnlyOffice: true must be rejected
+    for (const payload of [
+      { sourceKind: 'server_file', serverId: 'srv-1', filePath: '/repo/README.md', title: 'README.md' },
+      { sourceKind: 'server_file', serverId: 'srv-1', filePath: '/repo/GUIDE.MD', title: 'GUIDE.MD' },
+      { sourceKind: 'server_file', serverId: 'srv-1', filePath: '/repo/notes', title: 'notes', mimeType: 'text/markdown; charset=utf-8' },
+      { sourceKind: 'cloud_doc', cloudDocId: mdCloudDoc.id },
+    ]) {
+      const badRec = await app.request('/api/recent-documents/record', {
+        method: 'POST',
+        headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      expect(badRec.status).toBe(400);
+      expect(await badRec.json()).toMatchObject({ error: 'markdown_requires_onlyoffice' });
+    }
+
+    const emptyRecent = await app.request('/api/recent-documents', { headers: bearerHeader('owner-1') });
+    expect(((await emptyRecent.json()) as { items: unknown[] }).items).toHaveLength(0);
+
+    // 4. Verified ONLYOFFICE open of .md (openedWithOnlyOffice: true while ONLYOFFICE_ENABLED === 'true') DOES record
+    const okSrvMd = await app.request('/api/recent-documents/record', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceKind: 'server_file',
+        serverId: 'srv-1',
+        filePath: '/repo/README.md',
+        title: 'README.md',
+        openedWithOnlyOffice: true,
+      }),
+    });
+    expect(okSrvMd.status).toBe(200);
+
+    const okCloudMd = await app.request('/api/recent-documents/record', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceKind: 'cloud_doc',
+        cloudDocId: mdCloudDoc.id,
+        openedWithOnlyOffice: true,
+      }),
+    });
+    expect(okCloudMd.status).toBe(200);
+
+    const populatedRecent = await app.request('/api/recent-documents', { headers: bearerHeader('owner-1') });
+    const items = ((await populatedRecent.json()) as { items: Array<{ sourceKind: string; title: string }> }).items;
+    expect(items).toHaveLength(2);
+    expect(items.map((i) => i.title).sort()).toEqual(['Notes.md', 'README.md']);
   });
 
   it('rejects internal upload/pasted-text temp paths from Recent recording (POSIX & Windows) while recording created & shared Cloud Docs', async () => {
