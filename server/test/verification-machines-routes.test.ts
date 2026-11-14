@@ -294,13 +294,14 @@ describe('/api/verification-machines', () => {
       { scopeKey: '😀'.repeat(512), alias: '🚀'.repeat(80), nodeId: '1000000003' },
     ];
     for (const c of cases) {
-      for (const suffix of ['1', '2']) {
+      const aliasChars = Array.from(c.alias);
+      for (const alias of [`${aliasChars.slice(0, -1).join('')}1`, c.alias]) {
         const res = await app.request('/api/verification-machines', { method: 'PUT', headers: {
           Authorization: bearer(), 'Content-Type': 'application/json',
         }, body: JSON.stringify({
           scope: 'project',
           scopeKey: c.scopeKey,
-          alias: `${c.alias.slice(0, -1)}${suffix}`,
+          alias,
           kind: 'ssh',
           target: ALIAS_ID,
         }) });
