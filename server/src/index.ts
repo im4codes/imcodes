@@ -11,13 +11,17 @@ import { applyMachineGroupInvalidation, failClosedMachineGroupConnections } from
 import { startAccountConnectionWatch } from './ws/account-watch.js';
 import { serve } from '@hono/node-server';
 import { getConnInfo } from '@hono/node-server/conninfo';
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { WebSocketServer } from 'ws';
 import proxyAddr from 'proxy-addr';
 import cron from 'node-cron';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { stat, readFile } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { Readable } from 'node:stream';
+import { createHash } from 'node:crypto';
+import { gzipSync } from 'node:zlib';
 import type { IncomingMessage } from 'node:http';
 
 import { loadEnv, type Env, type EnvConfig } from './env.js';
@@ -155,6 +159,326 @@ const remoteDesktopGuestConnectLimiter = new MemoryRateLimiter();
 let unauthenticatedDaemonCount = 0;
 const MAX_UNAUTH_CONNECTIONS = 1000;
 
+// ── Static asset cache & path safety ──────────────────────────────────────────
+
+export const DEFAULT_STATIC_CACHE_MAX_ENTRIES = 512;
+export const DEFAULT_STATIC_CACHE_MAX_BYTES = 64 * 1024 * 1024; // 64 MiB
+export const MAX_CACHEABLE_ASSET_BYTES = 8 * 1024 * 1024; // 8 MiB
+export const MIN_GZIP_BYTES = 1024;
+export const MAX_GZIP_BYTES = 4 * 1024 * 1024; // 4 MiB
+
+const STATIC_MIME_TYPES: Record<string, string> = {
+  html: 'text/html',
+  js: 'application/javascript',
+  css: 'text/css',
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  svg: 'image/svg+xml',
+  woff2: 'font/woff2',
+  ico: 'image/x-icon',
+  json: 'application/json',
+  webmanifest: REMOTE_DESKTOP_APP_MANIFEST_MIME,
+  // Install scripts served raw so `irm`/`curl` pipe clean UTF-8 text.
+  ps1: 'text/plain; charset=utf-8',
+  sh: 'text/plain; charset=utf-8',
+  txt: 'text/plain; charset=utf-8',
+};
+
+const COMPRESSIBLE_EXTENSIONS = new Set([
+  'html',
+  'js',
+  'css',
+  'svg',
+  'json',
+  'webmanifest',
+  'ps1',
+  'sh',
+  'txt',
+]);
+
+export interface StaticCacheEntry {
+  body: Buffer;
+  gzip: Buffer | null;
+  etag: string;
+  gzipEtag: string;
+  mtimeNs: bigint;
+  size: bigint;
+  memBytes: number;
+}
+
+export type StaticLookupResult =
+  | { kind: 'cached'; entry: StaticCacheEntry }
+  | { kind: 'stream'; size: bigint; etag: string; lastModified: string };
+
+export interface StaticAssetCacheOptions {
+  maxEntries?: number;
+  maxTotalBytes?: number;
+  maxCacheableFileBytes?: number;
+  minGzipBytes?: number;
+  maxGzipBytes?: number;
+}
+
+/**
+ * Resolve a URL pathname safely inside `rootDir`, returning `null` for malformed
+ * encodings, NUL bytes, backslashes, `..` segments, or paths escaping `rootDir`.
+ */
+export function resolveSafeAssetPath(rootDir: string, reqPath: string): string | null {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(reqPath);
+  } catch {
+    return null;
+  }
+  if (decoded.includes('\0') || decoded.includes('\\')) return null;
+  const segments = decoded.split('/');
+  if (segments.some((seg) => seg === '..')) return null;
+
+  const resolvedRoot = resolve(rootDir);
+  const relative = decoded.replace(/^\/+/, '');
+  const target = resolve(resolvedRoot, relative || 'index.html');
+  if (target !== resolvedRoot && !target.startsWith(resolvedRoot + sep)) return null;
+  return target;
+}
+
+function getFileExtension(filePath: string): string {
+  const lastSlash = filePath.lastIndexOf('/');
+  const dot = filePath.lastIndexOf('.');
+  return dot > lastSlash ? filePath.slice(dot + 1) : '';
+}
+
+function acceptsGzip(header: string | undefined): boolean {
+  if (!header) return false;
+  for (const part of header.split(',')) {
+    const [rawCoding, ...params] = part.trim().toLowerCase().split(';');
+    if (rawCoding?.trim() !== 'gzip') continue;
+    let q = 1;
+    for (const p of params) {
+      const trimmed = p.trim();
+      if (trimmed.startsWith('q=')) {
+        const parsed = Number.parseFloat(trimmed.slice(2));
+        if (!Number.isNaN(parsed)) q = parsed;
+      }
+    }
+    if (q > 0) return true;
+  }
+  return false;
+}
+
+function stripWeakPrefix(etag: string): string {
+  const trimmed = etag.trim();
+  return trimmed.startsWith('W/') ? trimmed.slice(2).trim() : trimmed;
+}
+
+function isIfNoneMatchHit(header: string | undefined, ...candidateEtags: string[]): boolean {
+  if (!header) return false;
+  const trimmed = header.trim();
+  if (!trimmed) return false;
+  if (trimmed === '*') return true;
+  const candidates = new Set(candidateEtags.map(stripWeakPrefix));
+  for (const part of trimmed.split(',')) {
+    const tag = stripWeakPrefix(part);
+    if (tag && candidates.has(tag)) return true;
+  }
+  return false;
+}
+
+function toBodyBytes(buf: Buffer): Uint8Array<ArrayBuffer> {
+  return new Uint8Array(buf.buffer as ArrayBuffer, buf.byteOffset, buf.byteLength);
+}
+
+/**
+ * Bounded LRU in-memory static file cache with precomputed ETag + gzip buffers
+ * and `stat` mtime/size revalidation for mutable entry files.
+ */
+export class StaticAssetCache {
+  private readonly entries = new Map<string, StaticCacheEntry>();
+  private totalBytes = 0;
+  readonly maxEntries: number;
+  readonly maxTotalBytes: number;
+  readonly maxCacheableFileBytes: number;
+  readonly minGzipBytes: number;
+  readonly maxGzipBytes: number;
+
+  constructor(options: StaticAssetCacheOptions = {}) {
+    this.maxEntries = Math.max(1, options.maxEntries ?? DEFAULT_STATIC_CACHE_MAX_ENTRIES);
+    this.maxTotalBytes = Math.max(1, options.maxTotalBytes ?? DEFAULT_STATIC_CACHE_MAX_BYTES);
+    this.maxCacheableFileBytes = Math.max(1, options.maxCacheableFileBytes ?? MAX_CACHEABLE_ASSET_BYTES);
+    this.minGzipBytes = Math.max(0, options.minGzipBytes ?? MIN_GZIP_BYTES);
+    this.maxGzipBytes = Math.max(this.minGzipBytes, options.maxGzipBytes ?? MAX_GZIP_BYTES);
+  }
+
+  get size(): number {
+    return this.entries.size;
+  }
+
+  get byteSize(): number {
+    return this.totalBytes;
+  }
+
+  delete(filePath: string): boolean {
+    const existing = this.entries.get(filePath);
+    if (!existing) return false;
+    this.entries.delete(filePath);
+    this.totalBytes -= existing.memBytes;
+    return true;
+  }
+
+  clear(): void {
+    this.entries.clear();
+    this.totalBytes = 0;
+  }
+
+  private touch(filePath: string, entry: StaticCacheEntry): StaticCacheEntry {
+    this.entries.delete(filePath);
+    this.entries.set(filePath, entry);
+    return entry;
+  }
+
+  private set(filePath: string, entry: StaticCacheEntry): void {
+    this.delete(filePath);
+    if (entry.memBytes > this.maxTotalBytes) return;
+    while (
+      this.entries.size > 0
+      && (this.entries.size >= this.maxEntries || this.totalBytes + entry.memBytes > this.maxTotalBytes)
+    ) {
+      const oldestKey = this.entries.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.delete(oldestKey);
+    }
+    this.entries.set(filePath, entry);
+    this.totalBytes += entry.memBytes;
+  }
+
+  async resolve(filePath: string, opts: { immutable: boolean }): Promise<StaticLookupResult | null> {
+    const cached = this.entries.get(filePath);
+    if (opts.immutable && cached) {
+      return { kind: 'cached', entry: this.touch(filePath, cached) };
+    }
+
+    let s: Awaited<ReturnType<typeof stat>> & { size: bigint; mtimeNs: bigint; mtime: Date };
+    try {
+      const rawStat = await stat(filePath, { bigint: true });
+      if (!rawStat.isFile()) {
+        this.delete(filePath);
+        return null;
+      }
+      s = rawStat;
+    } catch {
+      this.delete(filePath);
+      return null;
+    }
+
+    if (cached && cached.mtimeNs === s.mtimeNs && cached.size === s.size) {
+      return { kind: 'cached', entry: this.touch(filePath, cached) };
+    }
+
+    if (s.size > BigInt(this.maxCacheableFileBytes)) {
+      this.delete(filePath);
+      return {
+        kind: 'stream',
+        size: s.size,
+        etag: `"${s.size.toString(16)}-${s.mtimeNs.toString(16)}"`,
+        lastModified: s.mtime.toUTCString(),
+      };
+    }
+
+    let body: Buffer;
+    try {
+      body = await readFile(filePath);
+    } catch {
+      this.delete(filePath);
+      return null;
+    }
+
+    const digest = createHash('sha256').update(body).digest('base64url').slice(0, 22);
+    const etag = `"${digest}"`;
+    const gzipEtag = `W/"${digest}"`;
+    const ext = getFileExtension(filePath);
+    let gzip: Buffer | null = null;
+    if (
+      COMPRESSIBLE_EXTENSIONS.has(ext)
+      && body.byteLength >= this.minGzipBytes
+      && body.byteLength <= this.maxGzipBytes
+    ) {
+      const compressed = gzipSync(body);
+      if (compressed.byteLength < body.byteLength) {
+        gzip = compressed;
+      }
+    }
+
+    const entry: StaticCacheEntry = {
+      body,
+      gzip,
+      etag,
+      gzipEtag,
+      mtimeNs: s.mtimeNs,
+      size: s.size,
+      memBytes: body.byteLength + (gzip?.byteLength ?? 0),
+    };
+    this.set(filePath, entry);
+    return { kind: 'cached', entry };
+  }
+}
+
+async function serveStaticFromCache(
+  c: Context<{ Bindings: Env }>,
+  cache: StaticAssetCache,
+  filePath: string,
+  options: {
+    immutable: boolean;
+    extraHeaders?: Record<string, string>;
+    cacheControlOverride?: string;
+  },
+): Promise<Response | null> {
+  const lookup = await cache.resolve(filePath, { immutable: options.immutable });
+  if (!lookup) return null;
+
+  const ext = getFileExtension(filePath);
+  const contentType = STATIC_MIME_TYPES[ext] ?? 'application/octet-stream';
+  const cacheControl = options.cacheControlOverride
+    ?? (options.immutable ? 'public, max-age=31536000, immutable' : 'no-cache');
+
+  const headers: Record<string, string> = {
+    'Content-Type': contentType,
+    'Cache-Control': cacheControl,
+  };
+  if (options.extraHeaders) {
+    Object.assign(headers, options.extraHeaders);
+  }
+
+  if (lookup.kind === 'stream') {
+    headers['ETag'] = lookup.etag;
+    headers['Last-Modified'] = lookup.lastModified;
+    if (isIfNoneMatchHit(c.req.header('if-none-match'), lookup.etag)) {
+      return new Response(null, { status: 304, headers });
+    }
+    headers['Content-Length'] = lookup.size.toString();
+    const stream = Readable.toWeb(createReadStream(filePath)) as unknown as ReadableStream<Uint8Array>;
+    return new Response(stream, { status: 200, headers });
+  }
+
+  const { entry } = lookup;
+  const useGzip = entry.gzip !== null && acceptsGzip(c.req.header('accept-encoding'));
+  const etag = useGzip ? entry.gzipEtag : entry.etag;
+  headers['ETag'] = etag;
+  if (entry.gzip !== null) {
+    headers['Vary'] = 'Accept-Encoding';
+  }
+
+  if (isIfNoneMatchHit(c.req.header('if-none-match'), entry.etag, entry.gzipEtag)) {
+    return new Response(null, { status: 304, headers });
+  }
+
+  if (useGzip && entry.gzip) {
+    headers['Content-Encoding'] = 'gzip';
+    headers['Content-Length'] = String(entry.gzip.byteLength);
+    return new Response(toBodyBytes(entry.gzip), { status: 200, headers });
+  }
+
+  headers['Content-Length'] = String(entry.body.byteLength);
+  return new Response(toBodyBytes(entry.body), { status: 200, headers });
+}
+
 // ── Hono app ──────────────────────────────────────────────────────────────────
 
 export interface BuildAppOptions {
@@ -162,10 +486,13 @@ export interface BuildAppOptions {
   unattendedPasswordProofService?: Pick<RemoteDesktopUnattendedPasswordProofService, 'prove'>;
   /** Test seam for Cloud Docs blob persistence (defaults to LocalCloudDocStorage). */
   cloudDocStorage?: CloudDocStorage;
+  /** Optional static asset cache instance or limits (for focused tests). */
+  staticCache?: StaticAssetCache;
 }
 
 export function buildApp(env: Env, options: BuildAppOptions = {}) {
   const app = new Hono<{ Bindings: Env }>();
+  const staticCache = options.staticCache ?? new StaticAssetCache();
   const durableRemoteDesktopEndpointEligible = createPostgresRemoteDesktopEndpointEligibility({ db: env.DB });
   const unattendedPasswordProofService = options.unattendedPasswordProofService
     ?? createLazyPostgresUnattendedPasswordProofService({
@@ -294,6 +621,48 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
     await next();
   });
 
+  // OTA update assets (manifest + bundle zip) — registered before `/api` sub-routers
+  // so wildcard sub-router middlewares (e.g. `Cache-Control: no-store`) do not overwrite `no-cache` + `ETag`.
+  app.get('/api/updates/:file', async (c) => {
+    const file = c.req.param('file');
+    if (file !== 'manifest.json' && file !== 'bundle.zip') {
+      return c.json({ error: 'not_found' }, 404);
+    }
+    const filePath = join(UPDATES_DIST, file);
+    try {
+      const s = await stat(filePath, { bigint: true });
+      if (!s.isFile()) {
+        return c.json({ error: 'not_found' }, 404);
+      }
+      const etag = `"${s.size.toString(16)}-${s.mtimeNs.toString(16)}"`;
+      const lastModified = s.mtime.toUTCString();
+      const mime = file.endsWith('.json') ? 'application/json' : 'application/zip';
+      const headers: Record<string, string> = {
+        'Content-Type': mime,
+        'Cache-Control': 'no-cache',
+        ETag: etag,
+        'Last-Modified': lastModified,
+      };
+      const ifNoneMatch = c.req.header('if-none-match');
+      const ifModifiedSince = c.req.header('if-modified-since');
+      let notModified = isIfNoneMatchHit(ifNoneMatch, etag);
+      if (!notModified && !ifNoneMatch && ifModifiedSince) {
+        const parsed = Date.parse(ifModifiedSince);
+        if (!Number.isNaN(parsed) && parsed >= Math.floor(s.mtime.getTime() / 1000) * 1000) {
+          notModified = true;
+        }
+      }
+      if (notModified) {
+        return new Response(null, { status: 304, headers });
+      }
+      headers['Content-Length'] = s.size.toString();
+      const stream = Readable.toWeb(createReadStream(filePath)) as unknown as ReadableStream<Uint8Array>;
+      return new Response(stream, { status: 200, headers });
+    } catch {
+      return c.json({ error: 'not_found' }, 404);
+    }
+  });
+
   app.route('/api/auth', authRoutes);
   app.route('/api/auth/github', githubAuthRoutes);
   app.route('/api/auth/google', googleAuthRoutes);
@@ -364,19 +733,14 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
   app.get('/health', (c) => c.json({ ok: true, ts: Date.now() }));
 
   app.get('/api/app-build', async (c) => {
-    try {
-      const content = await readFile(join(WEB_DIST, 'app-build.json'), 'utf8');
-      return new Response(content, {
-        headers: {
-          'Content-Type': 'application/json',
-          'Cache-Control': 'no-store',
-        },
-      });
-    } catch {
-      return c.json({ error: 'not_found' }, 404, {
-        'Cache-Control': 'no-store',
-      });
-    }
+    const res = await serveStaticFromCache(c, staticCache, join(WEB_DIST, 'app-build.json'), {
+      immutable: false,
+      cacheControlOverride: 'no-store',
+    });
+    if (res) return res;
+    return c.json({ error: 'not_found' }, 404, {
+      'Cache-Control': 'no-store',
+    });
   });
 
   // Apple App Site Association — required for iOS Associated Domains (webcredentials) to work.
@@ -410,49 +774,21 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
     if (url.searchParams.has('native_callback') || url.searchParams.has('desktop_callback')) return next();
     if (url.pathname === '/api/auth/passkey/native') return next();
 
-    const reqPath = new URL(c.req.url).pathname;
-    const filePath = join(LANDING_DIST, reqPath === '/' ? 'index.html' : reqPath);
-    try {
-      const s = await stat(filePath);
-      if (s.isFile()) {
-        const ext = filePath.split('.').pop() ?? '';
-        const mime: Record<string, string> = {
-          html: 'text/html', js: 'application/javascript', css: 'text/css',
-          png: 'image/png', jpg: 'image/jpeg', svg: 'image/svg+xml',
-          ico: 'image/x-icon',
-          // Install scripts served raw so `irm`/`curl` pipe clean UTF-8 text.
-          ps1: 'text/plain; charset=utf-8', sh: 'text/plain; charset=utf-8',
-          txt: 'text/plain; charset=utf-8',
-        };
-        const isInstallScript = ext === 'sh' || ext === 'ps1' || ext === 'txt';
-        const content = await readFile(filePath);
-        return new Response(content, {
-          headers: {
-            'Content-Type': mime[ext] ?? 'application/octet-stream',
-            ...SECURITY_HEADERS,
-            ...(isInstallScript ? { 'Cache-Control': 'no-cache' } : {}),
-          },
-        });
-      }
-    } catch { /* fall through to landing index */ }
-    const html = await readFile(join(LANDING_DIST, 'index.html'));
-    return new Response(html, { headers: { 'Content-Type': 'text/html', ...SECURITY_HEADERS } });
-  });
+    const reqPath = url.pathname;
+    const filePath = resolveSafeAssetPath(LANDING_DIST, reqPath);
+    if (!filePath) return c.text('Not found', 404);
 
-  // OTA update assets (manifest + bundle zip)
-  app.get('/api/updates/:file', async (c) => {
-    const file = c.req.param('file');
-    if (file !== 'manifest.json' && file !== 'bundle.zip') {
-      return c.json({ error: 'not_found' }, 404);
-    }
-    const filePath = join(UPDATES_DIST, file);
-    try {
-      const content = await readFile(filePath);
-      const mime = file.endsWith('.json') ? 'application/json' : 'application/zip';
-      return new Response(content, { headers: { 'Content-Type': mime, 'Cache-Control': 'no-cache' } });
-    } catch {
-      return c.json({ error: 'not_found' }, 404);
-    }
+    const direct = await serveStaticFromCache(c, staticCache, filePath, {
+      immutable: false,
+      extraHeaders: { ...SECURITY_HEADERS },
+    });
+    if (direct) return direct;
+
+    const fallback = await serveStaticFromCache(c, staticCache, join(LANDING_DIST, 'index.html'), {
+      immutable: false,
+      extraHeaders: { ...SECURITY_HEADERS },
+    });
+    return fallback ?? c.text('Not found', 404);
   });
 
   // Static file serving + SPA fallback
@@ -462,37 +798,31 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
       return c.json({ error: 'not_found' }, 404);
     }
 
-    const filePath = join(WEB_DIST, reqPath === '/' ? 'index.html' : reqPath);
-    try {
-      const s = await stat(filePath);
-      if (s.isFile()) {
-        const ext = filePath.split('.').pop() ?? '';
-        const mime: Record<string, string> = {
-          html: 'text/html', js: 'application/javascript', css: 'text/css',
-          png: 'image/png', jpg: 'image/jpeg', svg: 'image/svg+xml',
-          woff2: 'font/woff2', ico: 'image/x-icon', json: 'application/json',
-          webmanifest: REMOTE_DESKTOP_APP_MANIFEST_MIME,
-        };
-        const content = await readFile(filePath);
-        const headers: Record<string, string> = { 'Content-Type': mime[ext] ?? 'application/octet-stream' };
-        if (ext === 'html') Object.assign(headers, SECURITY_HEADERS);
-        // The installable remote-desktop app's manifest is revalidated on every use, so a change to it reaches installed apps promptly.
-        if (ext === 'webmanifest') headers['Cache-Control'] = 'no-cache';
-        return new Response(content, { headers });
-      }
-    } catch { /* fall through */ }
+    const filePath = resolveSafeAssetPath(WEB_DIST, reqPath);
+    if (!filePath) {
+      return c.text('Not found', 404);
+    }
+
+    const ext = getFileExtension(filePath);
+    const headers: Record<string, string> = {};
+    if (ext === 'html') Object.assign(headers, SECURITY_HEADERS);
+    const isImmutable = reqPath.startsWith('/assets/');
+    const direct = await serveStaticFromCache(c, staticCache, filePath, {
+      immutable: isImmutable,
+      extraHeaders: headers,
+    });
+    if (direct) return direct;
 
     // The remote-desktop app's manifest and icons: a missing file is a 404. Falling through to index.html would hand the browser an HTML
     // page as a manifest or an icon (a silent install failure), so these paths never reach the SPA fallback.
     if (isRemoteDesktopAppAssetPath(reqPath)) return c.text('Not found', 404);
 
     // SPA fallback
-    try {
-      const html = await readFile(join(WEB_DIST, 'index.html'));
-      return new Response(html, { headers: { 'Content-Type': 'text/html', ...SECURITY_HEADERS } });
-    } catch {
-      return c.text('Not found', 404);
-    }
+    const fallback = await serveStaticFromCache(c, staticCache, join(WEB_DIST, 'index.html'), {
+      immutable: false,
+      extraHeaders: { ...SECURITY_HEADERS },
+    });
+    return fallback ?? c.text('Not found', 404);
   });
 
   return app;

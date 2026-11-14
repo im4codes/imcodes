@@ -8,9 +8,23 @@ export interface LockoutResult {
   lockedUntil?: number;
 }
 
+export interface MemoryRateLimiterOptions {
+  maxWindows?: number;
+  maxJtis?: number;
+  maxLockouts?: number;
+}
+
 const LOCKOUT_THRESHOLD = 5;
 const LOCKOUT_DURATION_MS = 15 * 60 * 1000; // 15 min
 const CLEANUP_INTERVAL_MS = 60_000;
+const DEFAULT_MAX_WINDOWS = 50_000;
+const DEFAULT_MAX_JTIS = 100_000;
+const DEFAULT_MAX_LOCKOUTS = 50_000;
+
+interface WindowEntry {
+  ts: number[];
+  expiresAt: number;
+}
 
 interface LockoutEntry {
   failedAttempts: number;
@@ -19,32 +33,71 @@ interface LockoutEntry {
 }
 
 export class MemoryRateLimiter {
-  /** key → sorted timestamps in window */
-  private windows = new Map<string, number[]>();
+  /** key → sliding window timestamps and bucket expiration epoch ms */
+  private windows = new Map<string, WindowEntry>();
   /** jti → expireAt epoch ms */
   private consumedJtis = new Map<string, number>();
   /** identity → lockout state */
   private lockouts = new Map<string, LockoutEntry>();
 
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly maxWindows: number;
+  private readonly maxJtis: number;
+  private readonly maxLockouts: number;
 
-  constructor() {
-    this.startCleanup();
+  constructor(options: MemoryRateLimiterOptions = {}) {
+    this.maxWindows = Math.max(1, options.maxWindows ?? DEFAULT_MAX_WINDOWS);
+    this.maxJtis = Math.max(1, options.maxJtis ?? DEFAULT_MAX_JTIS);
+    this.maxLockouts = Math.max(1, options.maxLockouts ?? DEFAULT_MAX_LOCKOUTS);
   }
 
   /** Sliding window check. Returns true if under limit, records timestamp. */
   check(key: string, limit: number, windowMs: number): boolean {
     const now = Date.now();
-    const cutoff = now - windowMs;
-    let entries = this.windows.get(key) ?? [];
-    entries = entries.filter((t) => t > cutoff);
+    const safeWindowMs = Math.max(0, windowMs);
+    const cutoff = now - safeWindowMs;
+    const existing = this.windows.get(key);
+    const entries = existing ? existing.ts.filter((t) => t > cutoff) : [];
+
     if (entries.length >= limit) {
-      this.windows.set(key, entries);
+      if (entries.length === 0) {
+        this.windows.delete(key);
+      } else {
+        this.setWindowEntry(key, {
+          ts: entries,
+          expiresAt: entries[entries.length - 1]! + safeWindowMs,
+        }, now);
+        this.ensureCleanupRunning();
+      }
       return false;
     }
+
     entries.push(now);
-    this.windows.set(key, entries);
+    this.setWindowEntry(key, {
+      ts: entries,
+      expiresAt: now + safeWindowMs,
+    }, now);
+    this.ensureCleanupRunning();
     return true;
+  }
+
+  /** Reset one tracked window key or clear all tracked limiter state. */
+  reset(key?: string): void {
+    if (key !== undefined) {
+      this.windows.delete(key);
+    } else {
+      this.windows.clear();
+      this.consumedJtis.clear();
+      this.lockouts.clear();
+    }
+    if (this.windows.size === 0 && this.consumedJtis.size === 0 && this.lockouts.size === 0) {
+      this.stop();
+    }
+  }
+
+  /** Number of active window keys currently retained in memory. */
+  windowCount(): number {
+    return this.windows.size;
   }
 
   /** Consume a JTI. Returns true if new (not yet consumed), false if replay. */
@@ -52,14 +105,34 @@ export class MemoryRateLimiter {
     const now = Date.now();
     const existing = this.consumedJtis.get(jti);
     if (existing !== undefined && existing > now) return false;
-    this.consumedJtis.set(jti, now + ttlMs);
+    if (existing !== undefined) {
+      this.consumedJtis.delete(jti);
+    } else if (this.consumedJtis.size >= this.maxJtis) {
+      this.pruneExpiredJtis(now);
+      while (this.consumedJtis.size >= this.maxJtis) {
+        const oldest = this.consumedJtis.keys().next().value;
+        if (oldest === undefined) break;
+        this.consumedJtis.delete(oldest);
+      }
+    }
+    this.consumedJtis.set(jti, now + Math.max(0, ttlMs));
+    this.ensureCleanupRunning();
     return true;
   }
 
   /** Record an auth failure. Returns current lockout state. */
   recordAuthFailure(identity: string): LockoutResult {
     const now = Date.now();
-    const entry = this.lockouts.get(identity) ?? { failedAttempts: 0, lockedUntil: null, lastAttemptAt: now };
+    const existing = this.lockouts.get(identity);
+    if (!existing && this.lockouts.size >= this.maxLockouts) {
+      this.pruneExpiredLockouts(now);
+      while (this.lockouts.size >= this.maxLockouts) {
+        const oldest = this.lockouts.keys().next().value;
+        if (oldest === undefined) break;
+        this.lockouts.delete(oldest);
+      }
+    }
+    const entry = existing ?? { failedAttempts: 0, lockedUntil: null, lastAttemptAt: now };
 
     // Reset if previous lockout has expired
     if (entry.lockedUntil !== null && entry.lockedUntil <= now) {
@@ -74,7 +147,9 @@ export class MemoryRateLimiter {
       entry.lockedUntil = now + LOCKOUT_DURATION_MS;
     }
 
+    this.lockouts.delete(identity);
     this.lockouts.set(identity, entry);
+    this.ensureCleanupRunning();
 
     if (entry.lockedUntil !== null) {
       return { locked: true, lockedUntil: entry.lockedUntil };
@@ -93,33 +168,56 @@ export class MemoryRateLimiter {
     return { locked: false };
   }
 
-  private startCleanup(): void {
+  private setWindowEntry(key: string, entry: WindowEntry, now: number): void {
+    if (this.windows.has(key)) {
+      this.windows.delete(key);
+    } else if (this.windows.size >= this.maxWindows) {
+      this.pruneExpiredWindows(now);
+      while (this.windows.size >= this.maxWindows) {
+        const oldest = this.windows.keys().next().value;
+        if (oldest === undefined) break;
+        this.windows.delete(oldest);
+      }
+    }
+    this.windows.set(key, entry);
+  }
+
+  private ensureCleanupRunning(): void {
+    if (this.cleanupTimer) return;
     this.cleanupTimer = setInterval(() => this.cleanup(), CLEANUP_INTERVAL_MS);
     // Allow process to exit even if this timer is running
     if (this.cleanupTimer.unref) this.cleanupTimer.unref();
   }
 
-  cleanup(): void {
-    const now = Date.now();
-
-    // Prune expired sliding window entries
-    for (const [key, entries] of this.windows) {
-      // We don't know the window size here, so keep last 60s as a safe bound.
-      // Each call to check() already handles pruning per-window.
-      // Just remove empty entries.
-      if (entries.length === 0) this.windows.delete(key);
+  private pruneExpiredWindows(now: number): void {
+    for (const [key, entry] of this.windows) {
+      if (entry.expiresAt <= now) this.windows.delete(key);
     }
+  }
 
-    // Prune expired JTIs
+  private pruneExpiredJtis(now: number): void {
     for (const [jti, expireAt] of this.consumedJtis) {
       if (expireAt <= now) this.consumedJtis.delete(jti);
     }
+  }
 
-    // Prune expired lockouts
+  private pruneExpiredLockouts(now: number): void {
     for (const [identity, entry] of this.lockouts) {
-      if (entry.lockedUntil !== null && entry.lockedUntil <= now) {
+      const lockedExpired = entry.lockedUntil !== null && entry.lockedUntil <= now;
+      const staleAttempt = entry.lockedUntil === null && entry.lastAttemptAt + LOCKOUT_DURATION_MS <= now;
+      if (lockedExpired || staleAttempt) {
         this.lockouts.delete(identity);
       }
+    }
+  }
+
+  cleanup(now = Date.now()): void {
+    this.pruneExpiredWindows(now);
+    this.pruneExpiredJtis(now);
+    this.pruneExpiredLockouts(now);
+
+    if (this.windows.size === 0 && this.consumedJtis.size === 0 && this.lockouts.size === 0) {
+      this.stop();
     }
   }
 

@@ -86,6 +86,80 @@ describe('MemoryRateLimiter', () => {
       // After cleanup, old-jti is gone — can be consumed again
       expect(rl.consumeJti('old-jti', 100)).toBe(true);
     });
+
+    it('evicts expired sliding window keys even though entries.length >= 1 (regression for permanent map leak)', () => {
+      expect(rl.check('ip-1', 5, 10_000)).toBe(true);
+      expect(rl.check('ip-2', 5, 20_000)).toBe(true);
+      expect(rl.windowCount()).toBe(2);
+
+      // Before ip-1 expires, cleanup keeps both active windows
+      vi.advanceTimersByTime(5_000);
+      rl.cleanup();
+      expect(rl.windowCount()).toBe(2);
+
+      // Refresh ip-2 so its expiresAt extends; let ip-1 expire at +10_000
+      expect(rl.check('ip-2', 5, 20_000)).toBe(true);
+      vi.advanceTimersByTime(5_001);
+      rl.cleanup();
+      expect(rl.windowCount()).toBe(1);
+
+      // Eventually ip-2 expires as well
+      vi.advanceTimersByTime(20_000);
+      rl.cleanup();
+      expect(rl.windowCount()).toBe(0);
+    });
+
+    it('evicts stale partial lockout entries below lockout threshold', () => {
+      rl.recordAuthFailure('partial-user');
+      expect(rl.checkLockout('partial-user').locked).toBe(false);
+      vi.advanceTimersByTime(15 * 60 * 1000 + 1);
+      rl.cleanup();
+      // After cleanup, 4 more failures must not trigger immediate lockout (counter started fresh)
+      for (let i = 0; i < 4; i++) {
+        expect(rl.recordAuthFailure('partial-user').locked).toBe(false);
+      }
+    });
+
+    it('enforces maxWindows bound when unique keys flood within an active window', () => {
+      const capped = new MemoryRateLimiter({ maxWindows: 3 });
+      try {
+        expect(capped.check('k1', 2, 10_000)).toBe(true);
+        expect(capped.check('k2', 2, 10_000)).toBe(true);
+        expect(capped.check('k3', 2, 10_000)).toBe(true);
+        expect(capped.windowCount()).toBe(3);
+
+        // Accessing k1 refreshes LRU order so k2 becomes oldest and gets evicted when k4 arrives
+        expect(capped.check('k1', 2, 10_000)).toBe(true);
+        expect(capped.check('k4', 2, 10_000)).toBe(true);
+        expect(capped.windowCount()).toBe(3);
+
+        // k1 still remembers 2 requests (limit 2 -> next rejected), whereas evicted k2 starts fresh
+        expect(capped.check('k1', 2, 10_000)).toBe(false);
+        expect(capped.check('k2', 2, 10_000)).toBe(true);
+      } finally {
+        capped.stop();
+      }
+    });
+
+    it('does not run an idle interval until written to, and stops interval once cleaned empty', () => {
+      const setIntervalSpy = vi.spyOn(globalThis, 'setInterval');
+      const clearIntervalSpy = vi.spyOn(globalThis, 'clearInterval');
+      const lazy = new MemoryRateLimiter();
+      try {
+        expect(setIntervalSpy).not.toHaveBeenCalled();
+        lazy.check('temp', 5, 1_000);
+        expect(setIntervalSpy).toHaveBeenCalledTimes(1);
+
+        vi.advanceTimersByTime(60_000);
+        // Periodic timer fired cleanup, deleted 'temp', and stopped the idle timer
+        expect(lazy.windowCount()).toBe(0);
+        expect(clearIntervalSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        lazy.stop();
+        setIntervalSpy.mockRestore();
+        clearIntervalSpy.mockRestore();
+      }
+    });
   });
 });
 
