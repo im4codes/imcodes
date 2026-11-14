@@ -236,5 +236,6 @@ describe('ServerSwitchWatermark', () => {
     expect(tail).toContain('.server-switch-watermark-kbd');
     expect(tail).toContain('@media (prefers-color-scheme: light)');
     expect(tail).toContain('@media (prefers-reduced-motion: reduce)');
+    expect(tail).toContain('@media (max-width: 480px)');
   });
 });

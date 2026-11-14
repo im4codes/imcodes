@@ -105,6 +105,10 @@ import {
   type KeyboardShortcutOverrides,
 } from './keyboard-shortcuts.js';
 import {
+  attachMobileNavigationGestures,
+  MOBILE_NAVIGATION_GESTURE_KEYCAPS,
+} from './mobile-navigation-gestures.js';
+import {
   projectUnifiedServerList,
   filterRestrictedSharedEntries,
   getServerPresence,
@@ -7418,10 +7422,11 @@ function InternalMainApp() {
     || (remoteDesktopWorkspace.open && !remoteDesktopWorkspaceMinimized)
     || (remoteDesktopWallOpen && !remoteDesktopWallMinimized);
 
-  // Global keyboard shortcuts: switch servers & session tabs (desktop only).
+  // Global keyboard shortcuts & mobile 2-finger navigation gestures: switch servers & session tabs.
   const [serverSwitchWatermark, setServerSwitchWatermark] = useState<{
     serverId: string;
     serverName: string;
+    sessionName?: string | null;
     shortcutKeycaps: string[];
     nonce: number;
   } | null>(null);
@@ -7435,14 +7440,75 @@ function InternalMainApp() {
   const resolvedShortcutsRef = useRef(resolvedShortcuts);
   resolvedShortcutsRef.current = resolvedShortcuts;
   hasBlockingComposerOverlayRef.current = hasBlockingComposerOverlay;
+  const hasBlockingMobileGestureOverlayRef = useRef(false);
+  hasBlockingMobileGestureOverlayRef.current = hasBlockingComposerOverlay
+    || mobileSidebarOpen
+    || mobileRemoteSurfaceActive;
   const handleSelectServerNavRef = useRef(handleSelectServer);
   handleSelectServerNavRef.current = handleSelectServer;
   const selectMainSessionTabNavRef = useRef(selectMainSessionTab);
   selectMainSessionTabNavRef.current = selectMainSessionTab;
   const manualDashboardRef = useRef(manualDashboard);
   manualDashboardRef.current = manualDashboard;
+  const selectedShareTargetNavRef = useRef(selectedShareTarget);
+  selectedShareTargetNavRef.current = selectedShareTarget;
+  const resolvedSelectedServerNameNavRef = useRef(resolvedSelectedServerName);
+  resolvedSelectedServerNameNavRef.current = resolvedSelectedServerName;
   const viewModeNavRef = useRef(viewMode);
   viewModeNavRef.current = viewMode;
+
+  const navigateServerByStep = useCallback((direction: 1 | -1, shortcutKeycaps: readonly string[]): boolean => {
+    const serversList = orderedServersNavRef.current;
+    if (serversList.length === 0) return false;
+    const nextId = cycleOrderedId(
+      serversList.map((srv) => srv.id),
+      selectedServerIdRef.current,
+      direction,
+    );
+    const nextServer = nextId ? serversList.find((srv) => srv.id === nextId) : null;
+    if (nextServer && nextServer.id !== selectedServerIdRef.current) {
+      setServerSwitchWatermark((prev) => ({
+        serverId: nextServer.id,
+        serverName: nextServer.name || nextServer.id,
+        shortcutKeycaps: [...shortcutKeycaps],
+        nonce: (prev?.nonce ?? 0) + 1,
+      }));
+      void handleSelectServerNavRef.current(nextServer.id, nextServer.name);
+    }
+    return true;
+  }, []);
+
+  const navigateTabByStep = useCallback((direction: 1 | -1, watermarkKeycaps?: readonly string[]): boolean => {
+    const serverId = selectedServerIdRef.current;
+    if (!serverId || manualDashboardRef.current) return false;
+    const tabsList = orderedTabsNavRef.current;
+    if (tabsList.length === 0) return false;
+    const nextName = cycleOrderedId(
+      tabsList.map((session) => session.name),
+      activeSessionRef.current,
+      direction,
+    );
+    if (nextName && nextName !== activeSessionRef.current) {
+      if (watermarkKeycaps && selectedShareTargetNavRef.current === null) {
+        const nextSession = tabsList.find((session) => session.name === nextName);
+        const serverName = resolvedSelectedServerNameNavRef.current
+          || orderedServersNavRef.current.find((srv) => srv.id === serverId)?.name
+          || serverId;
+        const sessionLabel = nextSession
+          ? (nextSession.label || nextSession.project || nextSession.name)
+          : nextName;
+        setServerSwitchWatermark((prev) => ({
+          serverId,
+          serverName,
+          sessionName: sessionLabel,
+          shortcutKeycaps: [...watermarkKeycaps],
+          nonce: (prev?.nonce ?? 0) + 1,
+        }));
+      }
+      selectMainSessionTabNavRef.current(nextName);
+    }
+    return true;
+  }, []);
 
   useEffect(() => {
     if (isMobile) return;
@@ -7474,47 +7540,36 @@ function InternalMainApp() {
       }
 
       if (action === 'serverPrev' || action === 'serverNext') {
-        const serversList = orderedServersNavRef.current;
-        if (serversList.length === 0) return;
+        const shortcutKeycaps = formatShortcutKeycaps(resolvedShortcutsRef.current[action], isMacPlatform());
+        if (!navigateServerByStep(action === 'serverNext' ? 1 : -1, shortcutKeycaps)) return;
         e.preventDefault();
         e.stopPropagation();
-        const nextId = cycleOrderedId(
-          serversList.map((srv) => srv.id),
-          selectedServerIdRef.current,
-          action === 'serverNext' ? 1 : -1,
-        );
-        const nextServer = nextId ? serversList.find((srv) => srv.id === nextId) : null;
-        if (nextServer && nextServer.id !== selectedServerIdRef.current) {
-          const shortcutKeycaps = formatShortcutKeycaps(resolvedShortcutsRef.current[action], isMacPlatform());
-          setServerSwitchWatermark((prev) => ({
-            serverId: nextServer.id,
-            serverName: nextServer.name || nextServer.id,
-            shortcutKeycaps,
-            nonce: (prev?.nonce ?? 0) + 1,
-          }));
-          void handleSelectServerNavRef.current(nextServer.id, nextServer.name);
-        }
         return;
       }
 
-      if (!selectedServerIdRef.current || manualDashboardRef.current) return;
-      const tabsList = orderedTabsNavRef.current;
-      if (tabsList.length === 0) return;
+      if (!navigateTabByStep(action === 'tabNext' ? 1 : -1)) return;
       e.preventDefault();
       e.stopPropagation();
-      const nextName = cycleOrderedId(
-        tabsList.map((session) => session.name),
-        activeSessionRef.current,
-        action === 'tabNext' ? 1 : -1,
-      );
-      if (nextName && nextName !== activeSessionRef.current) {
-        selectMainSessionTabNavRef.current(nextName);
-      }
     };
 
     window.addEventListener('keydown', handler, true);
     return () => window.removeEventListener('keydown', handler, true);
-  }, [isMobile]);
+  }, [isMobile, navigateServerByStep, navigateTabByStep]);
+
+  useEffect(() => {
+    return attachMobileNavigationGestures({
+      isMobile,
+      isBlocked: () => hasBlockingMobileGestureOverlayRef.current,
+      onAction: (action) => {
+        const keycaps = MOBILE_NAVIGATION_GESTURE_KEYCAPS[action];
+        if (action === 'serverPrev' || action === 'serverNext') {
+          navigateServerByStep(action === 'serverNext' ? 1 : -1, keycaps);
+          return;
+        }
+        navigateTabByStep(action === 'tabNext' ? 1 : -1, keycaps);
+      },
+    });
+  }, [isMobile, navigateServerByStep, navigateTabByStep]);
 
   useEffect(() => {
     if (!serverSwitchWatermark) return;
@@ -10222,10 +10277,14 @@ function InternalMainApp() {
           && !manualDashboard
           && selectedShareTarget === null
           && selectedServerId === serverSwitchWatermark.serverId;
-        const watermarkSessionName = watermarkTargetMatches && activeSessionInfo
-          ? (activeSessionInfo.label || activeSessionInfo.project || activeSessionInfo.name)
+        const watermarkSessionName = watermarkTargetMatches
+          ? (serverSwitchWatermark.sessionName !== undefined
+            ? serverSwitchWatermark.sessionName
+            : (activeSessionInfo
+              ? (activeSessionInfo.label || activeSessionInfo.project || activeSessionInfo.name)
+              : null))
           : null;
-        const watermarkFallbackLabel = watermarkTargetMatches && !activeSessionInfo
+        const watermarkFallbackLabel = watermarkTargetMatches && !watermarkSessionName && !activeSessionInfo
           ? (sessionsLoaded
             ? trans('session.no_session', { defaultValue: 'No session' })
             : trans('common.loading', { defaultValue: 'Loading…' }))

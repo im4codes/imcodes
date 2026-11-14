@@ -8902,4 +8902,186 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     fireEvent.click(desktopBtn);
     await waitFor(() => expect(desktopBtn.getAttribute('aria-pressed')).toBe('true'));
   }, 15000);
+
+  it('switches servers (up/down) and tabs (left/right) via mobile 2-finger swipes with watermark HUD', async () => {
+    const dispatchTwoFingerSwipe = (
+      target: EventTarget,
+      start: Array<{ identifier: number; clientX: number; clientY: number }>,
+      move: Array<{ identifier: number; clientX: number; clientY: number }>,
+    ) => {
+      const mkEvent = (type: string, touches: typeof start) => {
+        const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & { touches: typeof start };
+        Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
+        return evt;
+      };
+      target.dispatchEvent(mkEvent('touchstart', start));
+      target.dispatchEvent(mkEvent('touchmove', move));
+      target.dispatchEvent(mkEvent('touchend', []));
+    };
+
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      const view = render(<App />);
+      const alphaPane = await screen.findByTestId('session-pane-deck_alpha_brain');
+      expect(alphaPane.getAttribute('data-is-active')).toBe('true');
+
+      // 2-finger swipe Right -> tabNext (deck_beta_brain) + watermark
+      dispatchTwoFingerSwipe(
+        alphaPane,
+        [{ identifier: 1, clientX: 80, clientY: 200 }, { identifier: 2, clientX: 84, clientY: 250 }],
+        [{ identifier: 1, clientX: 160, clientY: 202 }, { identifier: 2, clientX: 164, clientY: 252 }],
+      );
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server One');
+      expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('beta');
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['2F', '→']);
+
+      // 2-finger swipe Left -> tabPrev (deck_alpha_brain) + watermark
+      const betaPane = screen.getByTestId('session-pane-deck_beta_brain');
+      dispatchTwoFingerSwipe(
+        betaPane,
+        [{ identifier: 1, clientX: 200, clientY: 200 }, { identifier: 2, clientX: 204, clientY: 250 }],
+        [{ identifier: 1, clientX: 120, clientY: 202 }, { identifier: 2, clientX: 124, clientY: 248 }],
+      );
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server One');
+      expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('alpha');
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['2F', '←']);
+
+      // 2-finger swipe Down -> serverNext (Server Two) + watermark
+      dispatchTwoFingerSwipe(
+        view.container,
+        [{ identifier: 1, clientX: 120, clientY: 160 }, { identifier: 2, clientX: 170, clientY: 164 }],
+        [{ identifier: 1, clientX: 122, clientY: 240 }, { identifier: 2, clientX: 172, clientY: 244 }],
+      );
+      await screen.findByTestId('session-pane-deck_delta_brain');
+      expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server Two');
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['2F', '↓']);
+
+      // Single-tab server (srv-2 has only deck_delta_brain): 2-finger Left/Right safely no-ops
+      // Wait for watermark update or reset server-switch-watermark state by checking delta stays active and no 2F ← badge appears
+      dispatchTwoFingerSwipe(
+        view.container,
+        [{ identifier: 1, clientX: 200, clientY: 200 }, { identifier: 2, clientX: 204, clientY: 250 }],
+        [{ identifier: 1, clientX: 120, clientY: 202 }, { identifier: 2, clientX: 124, clientY: 252 }],
+      );
+      expect(screen.getByTestId('session-pane-deck_delta_brain').getAttribute('data-is-active')).toBe('true');
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['2F', '↓']);
+
+      // 2-finger swipe Up -> serverPrev (Server One) + watermark
+      dispatchTwoFingerSwipe(
+        view.container,
+        [{ identifier: 1, clientX: 120, clientY: 260 }, { identifier: 2, clientX: 170, clientY: 264 }],
+        [{ identifier: 1, clientX: 118, clientY: 180 }, { identifier: 2, clientX: 168, clientY: 184 }],
+      );
+      await waitFor(() => expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server One'));
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['2F', '↑']);
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 15000);
+
+  it('blocks mobile 2-finger navigation on open sidebar, blocking modal/settings, 1-finger scroll, pinch, and desktop', async () => {
+    const dispatchTouches = (
+      target: EventTarget,
+      start: Array<{ identifier: number; clientX: number; clientY: number }>,
+      move: Array<{ identifier: number; clientX: number; clientY: number }>,
+    ) => {
+      const mkEvent = (type: string, touches: typeof start) => {
+        const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & { touches: typeof start };
+        Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
+        return evt;
+      };
+      target.dispatchEvent(mkEvent('touchstart', start));
+      target.dispatchEvent(mkEvent('touchmove', move));
+      target.dispatchEvent(mkEvent('touchend', []));
+    };
+
+    // Desktop (!isMobile) ignores 2-finger swipe completely
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    {
+      const { App } = await importApp();
+      const desktopView = render(<App />);
+      const alphaPane = await screen.findByTestId('session-pane-deck_alpha_brain');
+      dispatchTouches(
+        alphaPane,
+        [{ identifier: 1, clientX: 80, clientY: 200 }, { identifier: 2, clientX: 84, clientY: 250 }],
+        [{ identifier: 1, clientX: 160, clientY: 202 }, { identifier: 2, clientX: 164, clientY: 252 }],
+      );
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+      desktopView.unmount();
+    }
+
+    // Mobile guards
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      const { App } = await importApp();
+      const mobileView = render(<App />);
+      const alphaPane = await screen.findByTestId('session-pane-deck_alpha_brain');
+
+      // 1-finger scroll ignored
+      dispatchTouches(
+        alphaPane,
+        [{ identifier: 1, clientX: 200, clientY: 200 }],
+        [{ identifier: 1, clientX: 80, clientY: 200 }],
+      );
+      // Pinch/spread ignored
+      dispatchTouches(
+        alphaPane,
+        [{ identifier: 1, clientX: 140, clientY: 200 }, { identifier: 2, clientX: 160, clientY: 200 }],
+        [{ identifier: 1, clientX: 100, clientY: 200 }, { identifier: 2, clientX: 200, clientY: 200 }],
+      );
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+
+      // Blocking DOM dialog -> 2-finger swipe Down blocked
+      const modal = document.createElement('div');
+      modal.setAttribute('role', 'dialog');
+      document.body.appendChild(modal);
+      dispatchTouches(
+        alphaPane,
+        [{ identifier: 1, clientX: 120, clientY: 160 }, { identifier: 2, clientX: 170, clientY: 164 }],
+        [{ identifier: 1, clientX: 122, clientY: 240 }, { identifier: 2, clientX: 172, clientY: 244 }],
+      );
+      expect(screen.queryByTestId('session-pane-deck_delta_brain')).toBeNull();
+      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+      modal.remove();
+
+      // Open mobile sidebar -> 2-finger swipe Right blocked
+      fireEvent.click(mobileView.container.querySelector('.mobile-sidebar-toggle')!);
+      await waitFor(() => expect(mobileView.container.querySelector('.mobile-sidebar-overlay.open')).toBeTruthy());
+      dispatchTouches(
+        alphaPane,
+        [{ identifier: 1, clientX: 80, clientY: 200 }, { identifier: 2, clientX: 84, clientY: 250 }],
+        [{ identifier: 1, clientX: 160, clientY: 202 }, { identifier: 2, clientX: 164, clientY: 252 }],
+      );
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+
+      // Close mobile sidebar by selecting current session, then verify mobile file browser overlay blocks 2-finger swipe Down
+      fireEvent.click(screen.getByText('tree-select-session-deck_alpha_brain'));
+      await waitFor(() => expect(mobileView.container.querySelector('.mobile-sidebar-overlay.open')).toBeNull());
+
+      fireEvent.click(mobileView.container.querySelector('.view-toggle[title="Files"]')!);
+      dispatchTouches(
+        mobileView.container,
+        [{ identifier: 1, clientX: 120, clientY: 160 }, { identifier: 2, clientX: 170, clientY: 164 }],
+        [{ identifier: 1, clientX: 122, clientY: 240 }, { identifier: 2, clientX: 172, clientY: 244 }],
+      );
+      expect(screen.queryByTestId('session-pane-deck_delta_brain')).toBeNull();
+      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 15000);
 });

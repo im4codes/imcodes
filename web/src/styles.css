@@ -19558,6 +19558,28 @@ button.quick-agent-delegation-preset.active {
   }
 }
 
+@media (max-width: 480px) {
+  .server-switch-watermark {
+    padding: 16px;
+  }
+
+  .server-switch-watermark-card {
+    min-width: 196px;
+    max-width: calc(100vw - 32px);
+    padding: 12px 16px;
+    gap: 6px;
+    border-radius: 14px;
+  }
+
+  .server-switch-watermark-server {
+    font-size: 15px;
+  }
+
+  .server-switch-watermark-session {
+    font-size: 12px;
+  }
+}
+
 /* Desktop Cloud Docs button: animated iridescent conic marquee border */
 .btn.desktop-cloud-docs-marquee-btn,
 html.native-ios-mac .btn.desktop-cloud-docs-marquee-btn {
