@@ -7515,6 +7515,8 @@ function InternalMainApp() {
   const orderedVisibleSubSessionsRef = useRef(visibleSubSessions);
   const openSubSessionWindowRef = useRef(openSubSessionWindow);
   openSubSessionWindowRef.current = openSubSessionWindow;
+  const minimizeSubSessionWindowRef = useRef(minimizeSubSessionWindow);
+  minimizeSubSessionWindowRef.current = minimizeSubSessionWindow;
   const closeAllSubSessionWindowsRef = useRef(closeAllSubSessionWindows);
   closeAllSubSessionWindowsRef.current = closeAllSubSessionWindows;
   hasBlockingComposerOverlayRef.current = hasBlockingComposerOverlay;
@@ -7641,18 +7643,17 @@ function InternalMainApp() {
       }
 
       if (quickSubMatch) {
-        if (quickSubMatch.kind === 'closeAll') {
-          e.preventDefault();
-          e.stopPropagation();
-          closeAllSubSessionWindowsRef.current();
-          return;
-        }
         if (!selectedServerIdRef.current || manualDashboardRef.current) return;
         const targetSub = orderedVisibleSubSessionsRef.current[quickSubMatch.index];
         if (!targetSub) return;
         e.preventDefault();
         e.stopPropagation();
         lastAutoFocusedRef.current = null;
+        if (openSubIdsRef.current.has(targetSub.id)) {
+          minimizeSubSessionWindowRef.current(targetSub.id);
+          setSubQuickFocusTick((prev) => prev + 1);
+          return;
+        }
         openSubSessionWindowRef.current(targetSub.id);
         setSubQuickFocusTick((prev) => prev + 1);
         if (targetSub.type === 'shell' || targetSub.type === 'script') {
@@ -7668,6 +7669,12 @@ function InternalMainApp() {
       }
 
       if (!matched) return;
+      if (matched.action === 'subSessionCloseAll') {
+        e.preventDefault();
+        e.stopPropagation();
+        closeAllSubSessionWindowsRef.current();
+        return;
+      }
       const shortcutKeycaps = formatShortcutKeycaps(matched.chord, isMacPlatform());
       if (matched.action === 'serverPrev' || matched.action === 'serverNext') {
         if (!navigateServerByStep(matched.action === 'serverNext' ? 1 : -1, shortcutKeycaps)) return;

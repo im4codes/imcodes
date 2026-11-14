@@ -369,32 +369,35 @@ test('renders sub-session sequence badges, opens & focuses composer via configur
     ],
   });
 
-  // Sequence badges appear on sub-session strip items in display order (1, 2) without overlapping labels/icons
+  // Sequence badges appear on sub-session strip items in display order (1, 2) floating at bottom-left without inflating card height
   await expect(page.getByTestId('subsession-seq-sub-e2e-1')).toHaveText('1');
   await expect(page.getByTestId('subsession-seq-sub-e2e-2')).toHaveText('2');
   const liveSeqGeometry = await page.evaluate(() => {
-    const overlap = (a: DOMRect, b: DOMRect) =>
-      Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left))
-      * Math.max(0, Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top));
     return ['sub-e2e-1', 'sub-e2e-2'].map((id) => {
       const card = document.querySelector(`[data-sub-id="${id}"]`) as HTMLElement;
       const seq = card.querySelector('.subsession-card-seq') as HTMLElement;
-      const icon = card.querySelector('.subsession-card-icon') as HTMLElement;
-      const label = card.querySelector('.subsession-card-label') as HTMLElement;
+      const clone = card.cloneNode(true) as HTMLElement;
+      clone.classList.remove('has-seq');
+      clone.querySelector('.subsession-card-seq')?.remove();
+      clone.style.visibility = 'hidden';
+      card.parentElement?.appendChild(clone);
       const cr = card.getBoundingClientRect();
+      const unbadgedHeight = clone.getBoundingClientRect().height;
+      clone.remove();
       const sr = seq.getBoundingClientRect();
+      const seqStyle = getComputedStyle(seq);
       return {
         id,
         inside: sr.left >= cr.left - 0.5 && sr.right <= cr.right + 0.5 && sr.top >= cr.top - 0.5 && sr.bottom <= cr.bottom + 0.5,
-        bottomLeft: sr.left < cr.left + cr.width / 2 && sr.top >= cr.top + cr.height / 2 - 4,
-        overlapIcon: overlap(sr, icon.getBoundingClientRect()),
-        overlapLabel: overlap(sr, label.getBoundingClientRect()),
+        bottomLeft: sr.left < cr.left + cr.width / 2 && sr.top >= cr.top + cr.height / 2,
+        sameHeightAsUnbadged: Math.abs(cr.height - unbadgedHeight) < 0.5,
+        floating: seqStyle.position === 'absolute' && seqStyle.pointerEvents === 'none',
       };
     });
   });
   expect(liveSeqGeometry).toEqual([
-    { id: 'sub-e2e-1', inside: true, bottomLeft: true, overlapIcon: 0, overlapLabel: 0 },
-    { id: 'sub-e2e-2', inside: true, bottomLeft: true, overlapIcon: 0, overlapLabel: 0 },
+    { id: 'sub-e2e-1', inside: true, bottomLeft: true, sameHeightAsUnbadged: true, floating: true },
+    { id: 'sub-e2e-2', inside: true, bottomLeft: true, sameHeightAsUnbadged: true, floating: true },
   ]);
 
   // Ctrl+1 while focused in main composer opens sub-e2e-1 and auto-focuses its .controls-input
@@ -414,21 +417,32 @@ test('renders sub-session sequence badges, opens & focuses composer via configur
   await expect(subWin2).toBeVisible();
   await expect(subWin2.locator('.controls-input')).toBeFocused();
 
-  // Ctrl+0 closes all open sub-session windows
+  // Repeated Ctrl+2 toggles sub-e2e-2 closed while leaving sub-e2e-1 open
+  await page.keyboard.press('Control+Digit2');
+  await expect(subWin2).toBeHidden();
+  await expect(subWin1).toBeVisible();
+
+  // Ctrl+2 again re-opens sub-e2e-2, then Ctrl+0 closes all open sub-session windows
+  await page.keyboard.press('Control+Digit2');
+  await expect(subWin2).toBeVisible();
   await page.keyboard.press('Control+Digit0');
   await expect(page.locator('.subsession-window:visible')).toHaveCount(0);
   await expect(subWin1).toBeHidden();
   await expect(subWin2).toBeHidden();
 
-  // Configure custom Ctrl+Shift modifier in Settings -> Shortcuts
+  // Configure custom Ctrl+Shift modifier for 1–9 and Alt+Shift+X for Close All in Settings -> Shortcuts
   await page.locator('button.server-icon[title="Settings"]').click();
   await page.locator('#settings-tab-shortcuts').click();
   await expect(page.getByTestId('subsession-quick-shortcuts-section')).toBeVisible();
+  await expect(page.getByTestId('subsession-quick-preview-close')).toHaveCount(0);
+  await page.getByTestId('shortcut-record-subSessionCloseAll').click();
+  await page.keyboard.press('Alt+Shift+KeyX');
+  await expect(page.getByTestId('shortcut-record-subSessionCloseAll')).toContainText('X');
   await page.getByTestId('subsession-mod-shift').click();
   await expect(page.getByTestId('subsession-quick-preview-open')).toContainText('Shift');
   await page.locator('.settings-back-btn').click();
 
-  // Plain Ctrl+1 no longer opens sub-session 1, while Ctrl+Shift+1 opens and focuses it
+  // Plain Ctrl+1 and Ctrl+0 no longer trigger, while Ctrl+Shift+1 toggles open/close and Alt+Shift+X closes all
   await page.locator('.controls-input').first().click();
   await page.keyboard.press('Control+Digit1');
   await expect(page.locator('.subsession-window:visible')).toHaveCount(0);
@@ -437,12 +451,20 @@ test('renders sub-session sequence badges, opens & focuses composer via configur
   await expect(subWin1).toBeVisible();
   await expect(subWin1.locator('.controls-input')).toBeFocused();
 
-  await page.keyboard.press('Control+Shift+Digit0');
+  await page.keyboard.press('Control+Shift+Digit1');
+  await expect(subWin1).toBeHidden();
+
+  await page.keyboard.press('Control+Shift+Digit1');
+  await expect(subWin1).toBeVisible();
+  await page.keyboard.press('Control+Digit0');
+  await expect(subWin1).toBeVisible();
+
+  await page.keyboard.press('Alt+Shift+KeyX');
   await expect(page.locator('.subsession-window:visible')).toHaveCount(0);
   expect(errors).toEqual([]);
 });
 
-test('bottom-left sequence badges never overlap icons, labels, models, context bars, pins, or share indicators across pill/rail/overflow/expanded layouts and mobile widths', async ({ page }) => {
+test('floating bottom-left sequence badges do not increase sub-session button height and remain non-overlapping in expanded headers', async ({ page }) => {
   await openDesktopApp(page, 'Linux x86_64');
 
   const inspectGeometry = async () => page.evaluate(() => {
@@ -458,6 +480,13 @@ test('bottom-left sequence badges never overlap icons, labels, models, context b
     host.style.background = '#080d16';
     host.innerHTML = `
       <div class="subsession-bar">
+        <button id="geom-h-noseq" class="subsession-card mobile">
+          <span class="subsession-card-icon">CC</span>
+          <span class="subsession-card-label">Sub One</span>
+          <span class="subsession-card-pin">📌</span>
+          <span class="share-state-indicator">S</span>
+          <span class="subsession-card-ctx" style="width:100%"><span class="subsession-card-ctx-fill" style="width:50%"></span></span>
+        </button>
         <button id="geom-h1" class="subsession-card has-seq mobile">
           <sup class="subsession-card-seq">1</sup>
           <span class="subsession-card-icon">CC</span>
@@ -479,6 +508,11 @@ test('bottom-left sequence badges never overlap icons, labels, models, context b
       <div class="subsession-vertical-rail-host" style="height:260px">
         <div class="subsession-vertical-rail">
           <div class="subsession-vertical-rail-scroll">
+            <button id="geom-r-noseq" class="subsession-card subsession-card-rail mobile">
+              <span class="subsession-card-icon">CC</span>
+              <span class="subsession-card-label">Sub One</span>
+              <span class="subsession-card-ctx" style="width:100%"><span class="subsession-card-ctx-fill" style="width:45%"></span></span>
+            </button>
             <button id="geom-r1" class="subsession-card subsession-card-rail has-seq mobile">
               <sup class="subsession-card-seq">1</sup>
               <span class="subsession-card-icon">CC</span>
@@ -498,6 +532,12 @@ test('bottom-left sequence badges never overlap icons, labels, models, context b
         </div>
       </div>
       <div class="subsession-overflow-pills" style="display:flex;flex-wrap:wrap;gap:6px;padding:4px 6px">
+        <button id="geom-o-noseq" class="subsession-card mobile subsession-pill">
+          <span class="subsession-card-icon">OC</span>
+          <span class="subsession-card-label">Overflow12</span>
+          <span class="subsession-card-model">gpt</span>
+          <span class="subsession-card-ctx" style="width:100%"><span class="subsession-card-ctx-fill" style="width:35%"></span></span>
+        </button>
         <button id="geom-o12" class="subsession-card has-seq mobile subsession-pill">
           <sup class="subsession-card-seq">12</sup>
           <span class="subsession-card-icon">OC</span>
@@ -529,25 +569,25 @@ test('bottom-left sequence badges never overlap icons, labels, models, context b
       Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left))
       * Math.max(0, Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top));
 
+    const heightPairs = [
+      ['geom-h-noseq', 'geom-h1'],
+      ['geom-r-noseq', 'geom-r1'],
+      ['geom-o-noseq', 'geom-o12'],
+    ].map(([noSeqId, withSeqId]) => ({
+      id: withSeqId,
+      withoutHeight: document.getElementById(noSeqId)!.getBoundingClientRect().height,
+      withHeight: document.getElementById(withSeqId)!.getBoundingClientRect().height,
+    }));
+
     const compactIds = ['geom-h1', 'geom-h12', 'geom-r1', 'geom-r12', 'geom-o12'];
     const compactResults = compactIds.map((id) => {
       const card = document.getElementById(id)!;
       const cr = card.getBoundingClientRect();
       const seq = card.querySelector('.subsession-card-seq')!.getBoundingClientRect();
-      const ctx = card.querySelector('.subsession-card-ctx')?.getBoundingClientRect() ?? null;
-      const pin = card.querySelector('.subsession-card-pin')?.getBoundingClientRect() ?? null;
-      const overlaps: Record<string, number> = {};
-      for (const sel of ['.subsession-card-icon', '.subsession-card-label', '.subsession-card-model', '.subsession-card-ctx', '.subsession-card-pin', '.share-state-indicator']) {
-        const child = card.querySelector(sel);
-        if (child) overlaps[sel] = overlapArea(seq, child.getBoundingClientRect());
-      }
       return {
         id,
         inside: seq.left >= cr.left - 0.5 && seq.right <= cr.right + 0.5 && seq.top >= cr.top - 0.5 && seq.bottom <= cr.bottom + 0.5,
         bottomLeft: seq.left < cr.left + cr.width / 2 && seq.top >= cr.top + cr.height / 2,
-        aboveCtx: ctx ? seq.bottom <= ctx.top - 0.5 : true,
-        belowPin: pin ? pin.bottom <= seq.top - 0.5 : true,
-        overlaps,
       };
     });
 
@@ -569,20 +609,18 @@ test('bottom-left sequence badges never overlap icons, labels, models, context b
     });
 
     host.remove();
-    return { compactResults, expandedResults };
+    return { heightPairs, compactResults, expandedResults };
   });
 
   for (const viewport of [{ width: 1280, height: 720 }, { width: 390, height: 844 }]) {
     await page.setViewportSize(viewport);
-    const { compactResults, expandedResults } = await inspectGeometry();
+    const { heightPairs, compactResults, expandedResults } = await inspectGeometry();
+    for (const pair of heightPairs) {
+      expect(pair.withHeight, `${viewport.width}px ${pair.id} same height as unbadged`).toBeCloseTo(pair.withoutHeight, 1);
+    }
     for (const r of compactResults) {
       expect(r.inside, `${viewport.width}px ${r.id} inside`).toBe(true);
       expect(r.bottomLeft, `${viewport.width}px ${r.id} bottomLeft`).toBe(true);
-      expect(r.aboveCtx, `${viewport.width}px ${r.id} aboveCtx`).toBe(true);
-      expect(r.belowPin, `${viewport.width}px ${r.id} belowPin`).toBe(true);
-      for (const [sel, area] of Object.entries(r.overlaps)) {
-        expect(area, `${viewport.width}px ${r.id} vs ${sel}`).toBe(0);
-      }
     }
     for (const r of expandedResults) {
       expect(r.inside, `${viewport.width}px ${r.id} inside`).toBe(true);

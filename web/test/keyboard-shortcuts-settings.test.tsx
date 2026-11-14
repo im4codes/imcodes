@@ -65,10 +65,11 @@ vi.mock('react-i18next', () => ({
         'settings.shortcuts.actions.tab_prev.desc': 'Switch left',
         'settings.shortcuts.actions.tab_next.title': 'Next Tab',
         'settings.shortcuts.actions.tab_next.desc': 'Switch right',
+        'settings.shortcuts.actions.subsession_close_all.title': 'Close All Sub-Sessions',
+        'settings.shortcuts.actions.subsession_close_all.desc': 'Minimize all open sub-session windows',
         'settings.shortcuts.subsession_quick.title': 'Sub-session Quick Shortcuts',
-        'settings.shortcuts.subsession_quick.desc': 'Choose modifiers for 1–9 open and 0 close all.',
-        'settings.shortcuts.subsession_quick.open_label': 'Open & focus sub-session #',
-        'settings.shortcuts.subsession_quick.close_all_label': 'Close all sub-session windows',
+        'settings.shortcuts.subsession_quick.desc': 'Choose modifiers for 1–9 open or minimize.',
+        'settings.shortcuts.subsession_quick.open_label': 'Toggle sub-session #',
         'settings.shortcuts.subsession_quick.modifiers_aria': 'Sub-session quick shortcut modifier keys',
         'settings.shortcuts.subsession_quick.min_one_hint': 'Keep at least one modifier key selected.',
         'settings.shortcuts.subsession_quick.reset_aria': 'Reset sub-session quick shortcut modifiers',
@@ -119,6 +120,7 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     expect(screen.getByText('Next Server')).toBeDefined();
     expect(screen.getByText('Previous Tab')).toBeDefined();
     expect(screen.getByText('Next Tab')).toBeDefined();
+    expect(screen.getByText('Close All Sub-Sessions')).toBeDefined();
 
     cleanup();
     render(<KeyboardShortcutsSection isMacOverride={true} />);
@@ -131,6 +133,9 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('J');
     expect(screen.getByTestId('shortcut-record-tabNext').textContent).toContain('⌥');
     expect(screen.getByTestId('shortcut-record-tabNext').textContent).toContain('L');
+    expect(screen.getByTestId('shortcut-record-subSessionCloseAll').textContent).toContain('⌃');
+    expect(screen.getByTestId('shortcut-record-subSessionCloseAll').textContent).toContain('0');
+    expect(screen.getByTestId('shortcut-record-subSessionCloseAll-secondary').textContent).toContain('Not set');
     // macOS secondary defaults preserve Ctrl+W/S/A/D
     expect(screen.getByTestId('shortcut-record-serverPrev-secondary').textContent).toContain('⌃');
     expect(screen.getByTestId('shortcut-record-serverPrev-secondary').textContent).toContain('W');
@@ -198,6 +203,8 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('J');
     expect(screen.getByTestId('shortcut-record-tabNext').textContent).toContain('Alt');
     expect(screen.getByTestId('shortcut-record-tabNext').textContent).toContain('L');
+    expect(screen.getByTestId('shortcut-record-subSessionCloseAll').textContent).toContain('Ctrl');
+    expect(screen.getByTestId('shortcut-record-subSessionCloseAll').textContent).toContain('0');
     // Windows / Linux secondary defaults are unassigned
     expect(screen.getByTestId('shortcut-record-tabPrev-secondary').textContent).toContain('Not set');
     expect((screen.getByTestId('shortcut-clear-tabPrev-secondary') as HTMLButtonElement).disabled).toBe(true);
@@ -353,7 +360,7 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     const shiftBtn = screen.getByTestId('subsession-mod-shift') as HTMLButtonElement;
     const resetAllBtn = screen.getByTestId('shortcuts-reset-all') as HTMLButtonElement;
 
-    // Default: only Ctrl active, disabled as last modifier, preview shows Ctrl + 1–9 and Ctrl + 0
+    // Default: only Ctrl active, disabled as last modifier, preview shows Ctrl + 1–9 (no static + 0 preview)
     expect(ctrlBtn.getAttribute('aria-pressed')).toBe('true');
     expect(ctrlBtn.disabled).toBe(true);
     expect(altBtn.getAttribute('aria-pressed')).toBe('false');
@@ -361,8 +368,7 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     expect(screen.queryByTestId('subsession-mod-reset')).toBeNull();
     expect(screen.getByTestId('subsession-quick-preview-open').textContent).toContain('Ctrl');
     expect(screen.getByTestId('subsession-quick-preview-open').textContent).toContain('1–9');
-    expect(screen.getByTestId('subsession-quick-preview-close').textContent).toContain('Ctrl');
-    expect(screen.getByTestId('subsession-quick-preview-close').textContent).toContain('0');
+    expect(screen.queryByTestId('subsession-quick-preview-close')).toBeNull();
 
     // Toggle Alt on -> Ctrl + Alt active; now Ctrl is unlocked
     fireEvent.click(altBtn);
@@ -400,5 +406,37 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     expect(screen.getByTestId('subsession-mod-shift').getAttribute('aria-pressed')).toBe('false');
     expect(screen.queryByTestId('subsession-mod-reset')).toBeNull();
     expect((screen.getByTestId('shortcuts-reset-all') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('supports interactive recording, clearing, resetting, and conflict reassignment on subSessionCloseAll', () => {
+    render(<KeyboardShortcutsSection isMacOverride={false} />);
+
+    const closeAllBtn = screen.getByTestId('shortcut-record-subSessionCloseAll');
+    expect(closeAllBtn.textContent).toContain('Ctrl');
+    expect(closeAllBtn.textContent).toContain('0');
+
+    // Record custom Alt+Shift+x on subSessionCloseAll
+    fireEvent.click(closeAllBtn);
+    expect(closeAllBtn.getAttribute('data-shortcut-recording')).toBe('true');
+    fireEvent.keyDown(document, { key: 'x', code: 'KeyX', altKey: true, shiftKey: true });
+    expect(closeAllBtn.getAttribute('data-shortcut-recording')).toBeNull();
+    expect(closeAllBtn.textContent).toContain('Alt');
+    expect(closeAllBtn.textContent).toContain('Shift');
+    expect(closeAllBtn.textContent).toContain('X');
+
+    // Assigning Alt+i (default serverPrev) to subSessionCloseAll clears serverPrev cleanly
+    fireEvent.click(closeAllBtn);
+    fireEvent.keyDown(document, { key: 'i', code: 'KeyI', altKey: true });
+    expect(closeAllBtn.textContent).toContain('Alt');
+    expect(closeAllBtn.textContent).toContain('I');
+    expect(screen.getByTestId('shortcut-record-serverPrev').textContent).toContain('Not set');
+    expect(screen.getByTestId('shortcuts-status-notice').textContent).toContain('Previous Server');
+
+    // Clear and reset subSessionCloseAll back to Ctrl+0
+    fireEvent.click(screen.getByTestId('shortcut-clear-subSessionCloseAll'));
+    expect(closeAllBtn.textContent).toContain('Not set');
+    fireEvent.click(screen.getByTestId('shortcut-reset-subSessionCloseAll'));
+    expect(closeAllBtn.textContent).toContain('Ctrl');
+    expect(closeAllBtn.textContent).toContain('0');
   });
 });

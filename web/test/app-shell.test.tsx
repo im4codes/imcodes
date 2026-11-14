@@ -486,6 +486,9 @@ vi.mock('../src/pages/SettingsPage.js', () => ({
       <button onClick={() => onChangeShortcutOverrides?.({ subSessionQuickModifiers: ['ctrl', 'shift'] })}>
         settings-subsession-ctrl-shift
       </button>
+      <button onClick={() => onChangeShortcutOverrides?.({ subSessionCloseAll: 'Alt+Shift+x' })}>
+        settings-close-all-alt-shift-x
+      </button>
       <button onClick={onBack}>settings-back</button>
     </div>
   ),
@@ -8953,10 +8956,23 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       const sub2Input = await screen.findByTestId('sub-window-controls-input-sub-quick-2');
       await waitFor(() => expect(document.activeElement).toBe(sub2Input));
 
-      // Blur sub-2 input and re-press Ctrl+2 -> re-focuses sub-quick-2 composer cleanly
-      (document.activeElement as HTMLElement | null)?.blur?.();
+      // Re-pressing Ctrl+2 toggles sub-quick-2 closed (minimized) and returns focus to sub1Input
+      const toggleClose2Evt = new KeyboardEvent('keydown', { key: '2', code: 'Digit2', ctrlKey: true, bubbles: true, cancelable: true });
+      sub2Input.dispatchEvent(toggleClose2Evt);
+      expect(toggleClose2Evt.defaultPrevented).toBe(true);
+      await waitFor(() => {
+        expect(screen.getByTestId('sub-session-window-sub-quick-2').getAttribute('data-visible')).toBe('false');
+        expect(screen.getByTestId('sub-session-window-sub-quick-1').getAttribute('data-visible')).toBe('true');
+        expect(document.activeElement).toBe(sub1Input);
+      });
+
+      // Re-pressing Ctrl+2 opens & auto-focuses sub-quick-2 again
       window.dispatchEvent(new KeyboardEvent('keydown', { key: '2', code: 'Digit2', ctrlKey: true, bubbles: true, cancelable: true }));
-      await waitFor(() => expect(document.activeElement).toBe(sub2Input));
+      const reopenedSub2Input = await screen.findByTestId('sub-window-controls-input-sub-quick-2');
+      await waitFor(() => {
+        expect(screen.getByTestId('sub-session-window-sub-quick-2').getAttribute('data-visible')).toBe('true');
+        expect(document.activeElement).toBe(reopenedSub2Input);
+      });
 
       // Blocking guards: IME composing / xterm must NOT fire Ctrl+0
       const imeEvt = new KeyboardEvent('keydown', { key: '0', code: 'Digit0', ctrlKey: true, isComposing: true, bubbles: true, cancelable: true });
@@ -8995,9 +9011,9 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
         expect(document.activeElement).toBe(reorderedFirstInput);
       });
 
-      // Configure Ctrl+Alt -> plain Ctrl+0 stops triggering, Ctrl+Alt+0 closes all
+      // Customize subSessionCloseAll to Alt+Shift+x -> plain Ctrl+0 stops triggering, Alt+Shift+x closes all
       fireEvent.click(screen.getByText('server-settings'));
-      fireEvent.click(await screen.findByText('settings-subsession-ctrl-alt'));
+      fireEvent.click(await screen.findByText('settings-close-all-alt-shift-x'));
       fireEvent.click(screen.getByText('settings-back'));
 
       const plainCtrl0 = new KeyboardEvent('keydown', { key: '0', code: 'Digit0', ctrlKey: true, bubbles: true, cancelable: true });
@@ -9005,12 +9021,12 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       expect(plainCtrl0.defaultPrevented).toBe(false);
       expect(screen.getByTestId('sub-session-window-sub-quick-2').getAttribute('data-visible')).toBe('true');
 
-      const ctrlAlt0 = new KeyboardEvent('keydown', { key: '0', code: 'Digit0', ctrlKey: true, altKey: true, bubbles: true, cancelable: true });
-      window.dispatchEvent(ctrlAlt0);
-      expect(ctrlAlt0.defaultPrevented).toBe(true);
+      const customCloseAllEvt = new KeyboardEvent('keydown', { key: 'X', code: 'KeyX', altKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(customCloseAllEvt);
+      expect(customCloseAllEvt.defaultPrevented).toBe(true);
       await waitFor(() => expect(screen.getByTestId('sub-session-window-sub-quick-2').getAttribute('data-visible')).toBe('false'));
 
-      // Configure Ctrl+Shift -> Ctrl+Shift+Digit1 (key '!') opens first visual sub-session and focuses its composer
+      // Configure Ctrl+Shift -> Ctrl+Shift+Digit1 (key '!') toggles open and then toggles closed again
       fireEvent.click(screen.getByText('server-settings'));
       fireEvent.click(await screen.findByText('settings-subsession-ctrl-shift'));
       fireEvent.click(screen.getByText('settings-back'));
@@ -9022,6 +9038,14 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       await waitFor(() => {
         expect(screen.getByTestId('sub-session-window-sub-quick-2').getAttribute('data-visible')).toBe('true');
         expect(document.activeElement).toBe(reopenedInput);
+      });
+
+      const ctrlShift1Close = new KeyboardEvent('keydown', { key: '!', code: 'Digit1', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(ctrlShift1Close);
+      expect(ctrlShift1Close.defaultPrevented).toBe(true);
+      await waitFor(() => {
+        expect(screen.getByTestId('sub-session-window-sub-quick-2').getAttribute('data-visible')).toBe('false');
+        expect(document.activeElement).toBe(mainInput);
       });
     } finally {
       Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });

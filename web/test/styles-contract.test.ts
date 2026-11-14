@@ -146,6 +146,17 @@ describe('styles.css regression contracts', () => {
     expect(cssWithoutComments).not.toMatch(/\.subsession-vertical-rail-host\s*\{[^}]*(?:136px|148px)/);
   });
 
+  it('floats compact sub-session sequence badges at bottom-left without increasing card height', () => {
+    expect(cssWithoutComments).not.toMatch(/\.subsession-card\.has-seq[^{]*\{[^}]*(?:min-height|padding)/);
+    expect(cssWithoutComments).not.toMatch(/\.subsession-card-rail\.has-seq[^{]*\{[^}]*(?:min-height|padding)/);
+    const seqRule = cssWithoutComments.match(/\.subsession-card-seq\s*\{[^}]*\}/)?.[0];
+    expect(seqRule).toBeTruthy();
+    expect(seqRule).toMatch(/position:\s*absolute/);
+    expect(seqRule).toMatch(/bottom:\s*2px/);
+    expect(seqRule).toMatch(/left:\s*3px/);
+    expect(seqRule).toMatch(/pointer-events:\s*none/);
+  });
+
   it('keeps the Team discussion rail narrow, in root flex flow, and independently scrollable', () => {
     const rootRule = cssWithoutComments.match(/:root\s*\{[^}]*\}/)?.[0];
     expect(rootRule).toMatch(/--team-discussion-rail-width:\s*clamp\(184px,\s*17vw,\s*220px\)/);

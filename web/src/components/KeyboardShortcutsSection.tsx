@@ -55,6 +55,10 @@ const ACTION_LABELS: Record<ShortcutActionId, { titleKey: string; descKey: strin
     titleKey: 'settings.shortcuts.actions.tab_next.title',
     descKey: 'settings.shortcuts.actions.tab_next.desc',
   },
+  subSessionCloseAll: {
+    titleKey: 'settings.shortcuts.actions.subsession_close_all.title',
+    descKey: 'settings.shortcuts.actions.subsession_close_all.desc',
+  },
 };
 
 function KeyboardShortcutsSectionInner({
@@ -456,17 +460,6 @@ function KeyboardShortcutsSectionInner({
                     <kbd key={`open-${cap}`} class="settings-kbd">{cap}</kbd>
                   ))}
                   <kbd class="settings-kbd">1–9</kbd>
-                </span>
-              </div>
-              <div class="settings-shortcut-preview-item" data-testid="subsession-quick-preview-close">
-                <span class="settings-shortcut-preview-label">
-                  {t('settings.shortcuts.subsession_quick.close_all_label')}
-                </span>
-                <span class="settings-shortcut-keycaps">
-                  {subSessionModifierCaps.map((cap) => (
-                    <kbd key={`close-${cap}`} class="settings-kbd">{cap}</kbd>
-                  ))}
-                  <kbd class="settings-kbd">0</kbd>
                 </span>
               </div>
             </div>

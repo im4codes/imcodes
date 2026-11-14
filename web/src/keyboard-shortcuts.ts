@@ -1,13 +1,19 @@
 export const KEYBOARD_SHORTCUTS_PREF_KEY = 'keyboard_shortcuts_v1';
 export const LEGACY_TAB_ORDER_STORAGE_KEY = 'rcc_tab_order';
 
-export type ShortcutActionId = 'serverPrev' | 'serverNext' | 'tabPrev' | 'tabNext';
+export type ShortcutActionId =
+  | 'serverPrev'
+  | 'serverNext'
+  | 'tabPrev'
+  | 'tabNext'
+  | 'subSessionCloseAll';
 
 export const SHORTCUT_ACTION_IDS: readonly ShortcutActionId[] = [
   'serverPrev',
   'serverNext',
   'tabPrev',
   'tabNext',
+  'subSessionCloseAll',
 ];
 
 export type ShortcutSlot = 'primary' | 'secondary';
@@ -168,7 +174,7 @@ export function isMacPlatform(nav?: {
   return /Macintosh|Mac OS/i.test(userAgent);
 }
 
-/** Unified default primary shortcut map across all desktop platforms (`Alt+I/K/J/L`). */
+/** Unified default primary shortcut map across all desktop platforms (`Alt+I/K/J/L`, `Ctrl+0`). */
 export function getDefaultShortcuts(isMac = isMacPlatform()): Record<ShortcutActionId, string> {
   void isMac;
   return {
@@ -176,6 +182,7 @@ export function getDefaultShortcuts(isMac = isMacPlatform()): Record<ShortcutAct
     serverNext: 'Alt+k',
     tabPrev: 'Alt+j',
     tabNext: 'Alt+l',
+    subSessionCloseAll: 'Ctrl+0',
   };
 }
 
@@ -187,6 +194,7 @@ export function getDefaultSecondaryShortcuts(isMac = isMacPlatform()): Record<Sh
       serverNext: 'Ctrl+s',
       tabPrev: 'Ctrl+a',
       tabNext: 'Ctrl+d',
+      subSessionCloseAll: null,
     };
   }
   return {
@@ -194,6 +202,7 @@ export function getDefaultSecondaryShortcuts(isMac = isMacPlatform()): Record<Sh
     serverNext: null,
     tabPrev: null,
     tabNext: null,
+    subSessionCloseAll: null,
   };
 }
 
@@ -539,7 +548,7 @@ export function matchNavigationShortcutAction(
   return null;
 }
 
-/** Detect duplicate shortcut assignments across all 8 `(action, slot)` bindings. */
+/** Detect duplicate shortcut assignments across all action/slot bindings. */
 export function findShortcutSlotConflicts(
   resolvedSlots: ResolvedKeyboardShortcutSlots,
 ): ResolvedShortcutSlotConflicts {
@@ -911,9 +920,7 @@ export function formatSubSessionQuickModifierKeycaps(
   return caps;
 }
 
-export type SubSessionQuickShortcutMatch =
-  | { kind: 'open'; index: number }
-  | { kind: 'closeAll' };
+export type SubSessionQuickShortcutMatch = { kind: 'open'; index: number };
 
 function extractDigitFromKeyboardEvent(
   e: Pick<KeyboardEvent, 'key' | 'code'>,
@@ -929,9 +936,10 @@ function extractDigitFromKeyboardEvent(
 }
 
 /**
- * Match `<Modifier> + 1..9` (open N-th sub-session) or `<Modifier> + 0` (close all sub-sessions)
- * against the user's configured modifier combination. Matches exact modifier sets and checks
- * `e.code` (`Digit0..9`, `Numpad0..9`) before `e.key` so Shift-modified combos still match digits.
+ * Match `<Modifier> + 1..9` (toggle/open+focus N-th sub-session) against the user's
+ * configured modifier combination. Matches exact modifier sets and checks `e.code`
+ * (`Digit1..9`, `Numpad1..9`) before `e.key` so Shift-modified combos still match digits.
+ * Close-all (`subSessionCloseAll`) is bound as a customizable shortcut action.
  */
 export function matchSubSessionQuickShortcut(
   e: Pick<KeyboardEvent, 'key' | 'code' | 'metaKey' | 'ctrlKey' | 'altKey' | 'shiftKey'> & {
@@ -955,8 +963,6 @@ export function matchSubSessionQuickShortcut(
     return null;
   }
   const digit = extractDigitFromKeyboardEvent(e);
-  if (digit === null) return null;
-  if (digit === 0) return { kind: 'closeAll' };
-  if (digit >= 1 && digit <= 9) return { kind: 'open', index: digit - 1 };
-  return null;
+  if (digit === null || digit < 1 || digit > 9) return null;
+  return { kind: 'open', index: digit - 1 };
 }

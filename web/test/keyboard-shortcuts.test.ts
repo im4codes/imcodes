@@ -46,6 +46,7 @@ describe('keyboard-shortcuts core helpers', () => {
       serverNext: 'Alt+k',
       tabPrev: 'Alt+j',
       tabNext: 'Alt+l',
+      subSessionCloseAll: 'Ctrl+0',
     });
 
     expect(getDefaultShortcuts(false)).toEqual({
@@ -53,6 +54,7 @@ describe('keyboard-shortcuts core helpers', () => {
       serverNext: 'Alt+k',
       tabPrev: 'Alt+j',
       tabNext: 'Alt+l',
+      subSessionCloseAll: 'Ctrl+0',
     });
 
     expect(getDefaultSecondaryShortcuts(true)).toEqual({
@@ -60,6 +62,7 @@ describe('keyboard-shortcuts core helpers', () => {
       serverNext: 'Ctrl+s',
       tabPrev: 'Ctrl+a',
       tabNext: 'Ctrl+d',
+      subSessionCloseAll: null,
     });
 
     expect(getDefaultSecondaryShortcuts(false)).toEqual({
@@ -67,6 +70,7 @@ describe('keyboard-shortcuts core helpers', () => {
       serverNext: null,
       tabPrev: null,
       tabNext: null,
+      subSessionCloseAll: null,
     });
   });
 
@@ -137,18 +141,21 @@ describe('keyboard-shortcuts core helpers', () => {
       serverNext: null,
       tabPrev: 'Alt+j',
       tabNext: 'Alt+l',
+      subSessionCloseAll: 'Ctrl+0',
     });
     expect(resolveKeyboardShortcuts({ tabPrev: 'Meta+ArrowLeft', tabNext: 'Meta+ArrowRight' }, true)).toEqual({
       serverPrev: 'Alt+i',
       serverNext: 'Alt+k',
       tabPrev: 'Meta+ArrowLeft',
       tabNext: 'Meta+ArrowRight',
+      subSessionCloseAll: 'Ctrl+0',
     });
     expect(resolveKeyboardShortcuts(clean, false)).toEqual({
       serverPrev: 'Alt+ArrowUp',
       serverNext: null,
       tabPrev: 'Alt+j',
       tabNext: 'Alt+l',
+      subSessionCloseAll: 'Ctrl+0',
     });
 
     // Dual-slot sanitization, legacy backward compatibility, and non-resurrecting clear semantics
@@ -157,6 +164,7 @@ describe('keyboard-shortcuts core helpers', () => {
       serverNext: { primary: 'Alt+k', secondary: 'Ctrl+s' },
       tabPrev: { primary: 'Meta+ArrowLeft', secondary: 'Ctrl+a' },
       tabNext: { primary: 'Alt+l', secondary: 'Ctrl+d' },
+      subSessionCloseAll: { primary: 'Ctrl+0', secondary: null },
     });
 
     const dirtyDual = sanitizeShortcutOverrides({
@@ -180,12 +188,14 @@ describe('keyboard-shortcuts core helpers', () => {
       serverNext: { primary: 'Alt+k', secondary: 'Ctrl+s' },
       tabPrev: { primary: 'Meta+ArrowLeft', secondary: null },
       tabNext: { primary: 'Alt+l', secondary: 'Ctrl+ArrowRight' },
+      subSessionCloseAll: { primary: 'Ctrl+0', secondary: null },
     });
     expect(resolveKeyboardShortcutSlots({}, false)).toEqual({
       serverPrev: { primary: 'Alt+i', secondary: null },
       serverNext: { primary: 'Alt+k', secondary: null },
       tabPrev: { primary: 'Alt+j', secondary: null },
       tabNext: { primary: 'Alt+l', secondary: null },
+      subSessionCloseAll: { primary: 'Ctrl+0', secondary: null },
     });
 
     // applyShortcutSlotOverride persists explicit null for cleared non-null defaults and prunes redundant defaults
@@ -365,6 +375,7 @@ describe('keyboard-shortcuts core helpers', () => {
       serverNext: 'Ctrl+ArrowDown',
       tabPrev: 'Ctrl+ArrowUp',
       tabNext: null,
+      subSessionCloseAll: 'Ctrl+0',
     })).toEqual({
       serverPrev: ['tabPrev'],
       tabPrev: ['serverPrev'],
@@ -408,11 +419,27 @@ describe('keyboard-shortcuts core helpers', () => {
       winPrimaryClearedSecondaryBound,
     )).toEqual({ action: 'tabPrev', slot: 'secondary', chord: 'Ctrl+ArrowLeft' });
 
+    expect(matchNavigationShortcutBinding(
+      { key: '0', code: 'Digit0', metaKey: false, ctrlKey: true, altKey: false, shiftKey: false },
+      macSlots,
+    )).toEqual({ action: 'subSessionCloseAll', slot: 'primary', chord: 'Ctrl+0' });
+
+    const customCloseAllSlots = resolveKeyboardShortcutSlots({ subSessionCloseAll: 'Alt+Shift+x' }, false);
+    expect(matchNavigationShortcutBinding(
+      { key: '0', code: 'Digit0', metaKey: false, ctrlKey: true, altKey: false, shiftKey: false },
+      customCloseAllSlots,
+    )).toBeNull();
+    expect(matchNavigationShortcutBinding(
+      { key: 'X', code: 'KeyX', metaKey: false, ctrlKey: false, altKey: true, shiftKey: true },
+      customCloseAllSlots,
+    )).toEqual({ action: 'subSessionCloseAll', slot: 'primary', chord: 'Alt+Shift+x' });
+
     expect(findShortcutSlotConflicts({
       serverPrev: { primary: 'Alt+i', secondary: 'Ctrl+w' },
       serverNext: { primary: 'Alt+k', secondary: 'Ctrl+w' },
       tabPrev: { primary: 'Alt+j', secondary: 'Alt+j' },
       tabNext: { primary: 'Alt+l', secondary: null },
+      subSessionCloseAll: { primary: 'Ctrl+0', secondary: 'Alt+l' },
     })).toEqual({
       serverPrev: { secondary: [{ action: 'serverNext', slot: 'secondary' }] },
       serverNext: { secondary: [{ action: 'serverPrev', slot: 'secondary' }] },
@@ -420,6 +447,8 @@ describe('keyboard-shortcuts core helpers', () => {
         primary: [{ action: 'tabPrev', slot: 'secondary' }],
         secondary: [{ action: 'tabPrev', slot: 'primary' }],
       },
+      tabNext: { primary: [{ action: 'subSessionCloseAll', slot: 'secondary' }] },
+      subSessionCloseAll: { secondary: [{ action: 'tabNext', slot: 'primary' }] },
     });
   });
 
@@ -692,6 +721,7 @@ describe('keyboard-shortcuts core helpers', () => {
       shiftKey: false,
       metaKey: false,
     }, ['ctrl'])).toEqual({ kind: 'open', index: 8 });
+    // 0 is no longer hardcoded in matchSubSessionQuickShortcut; it is a normal configurable ShortcutActionId (subSessionCloseAll)
     expect(matchSubSessionQuickShortcut({
       key: '0',
       code: 'Digit0',
@@ -699,7 +729,7 @@ describe('keyboard-shortcuts core helpers', () => {
       altKey: false,
       shiftKey: false,
       metaKey: false,
-    }, ['ctrl'])).toEqual({ kind: 'closeAll' });
+    }, ['ctrl'])).toBeNull();
 
     // Exact modifier match: Ctrl+Shift+Digit1 must NOT fire when configured modifier is ['ctrl']
     expect(matchSubSessionQuickShortcut({
@@ -721,7 +751,7 @@ describe('keyboard-shortcuts core helpers', () => {
       metaKey: false,
     }, ['ctrl', 'shift'])).toEqual({ kind: 'open', index: 0 });
 
-    // Ctrl+Alt+0 closes all when configured as ['ctrl', 'alt']
+    // 0 remains ignored by matchSubSessionQuickShortcut regardless of modifier combo
     expect(matchSubSessionQuickShortcut({
       key: '0',
       code: 'Numpad0',
@@ -729,7 +759,7 @@ describe('keyboard-shortcuts core helpers', () => {
       altKey: true,
       shiftKey: false,
       metaKey: false,
-    }, ['ctrl', 'alt'])).toEqual({ kind: 'closeAll' });
+    }, ['ctrl', 'alt'])).toBeNull();
 
     // IME composing is ignored
     expect(matchSubSessionQuickShortcut({

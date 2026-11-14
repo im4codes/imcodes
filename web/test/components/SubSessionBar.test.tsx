@@ -2260,13 +2260,14 @@ describe('SubSessionBar', () => {
         'title',
         'desc',
         'open_label',
-        'close_all_label',
         'modifiers_aria',
         'min_one_hint',
         'reset_aria',
       ]) {
         expect(raw.settings?.shortcuts?.subsession_quick?.[key], `${locale}: settings.shortcuts.subsession_quick.${key}`).toBeTruthy();
       }
+      expect(raw.settings?.shortcuts?.actions?.subsession_close_all?.title, `${locale}: settings.shortcuts.actions.subsession_close_all.title`).toBeTruthy();
+      expect(raw.settings?.shortcuts?.actions?.subsession_close_all?.desc, `${locale}: settings.shortcuts.actions.subsession_close_all.desc`).toBeTruthy();
     }
   });
 
