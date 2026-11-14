@@ -84,8 +84,18 @@ function finish(sid, state) {
 readline.createInterface({ input: process.stdin }).on('line', line => {
   const req = JSON.parse(line); const p = req.params || {}; record(req);
   switch (req.method) {
-    case 'initialize': return ok(req.id, { protocolVersion: 1, agentInfo: { name: process.env.AGY_ACP_FIXTURE_AGENT_NAME, version: '1.5.4' }, agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {}, close: {}, list: {} } } });
+    case 'initialize': {
+      if (logPath && fs.existsSync(logPath + '.worker-enoent-clear-on-init')) {
+        try { fs.unlinkSync(logPath + '.worker-enoent'); } catch {}
+        try { fs.unlinkSync(logPath + '.worker-enoent-clear-on-init'); } catch {}
+      }
+      record({ fixture: 'boot', pid: process.pid, version: process.env.AGY_ACP_FIXTURE_VERSION || '1.5.4' });
+      return ok(req.id, { protocolVersion: 1, agentInfo: { name: process.env.AGY_ACP_FIXTURE_AGENT_NAME, version: process.env.AGY_ACP_FIXTURE_VERSION || '1.5.4' }, agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {}, close: {}, list: {} } } });
+    }
     case 'session/new': {
+      if (logPath && fs.existsSync(logPath + '.worker-enoent')) {
+        return send({ id: req.id, error: { code: -32603, message: `Failed to start a Antigravity process for the session: starting worker: fork/exec ${process.env.AGY_ACP_FIXTURE_DELETED_EXE || '/secret/private/path/agy.1731.old'} (deleted): no such file or directory` } });
+      }
       if (scenario === 'new-crash-once' && !fs.existsSync(logPath + '.new-failed')) {
         fs.writeFileSync(logPath + '.new-failed', 'unknown'); process.exit(1);
       }
@@ -96,6 +106,9 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       return setTimeout(() => ok(req.id, { sessionId, models }), scenario === 'late-new' ? 150 : 0);
     }
     case 'session/resume': {
+      if (logPath && fs.existsSync(logPath + '.worker-enoent')) {
+        return send({ id: req.id, error: { code: -32603, message: `Failed to start a Antigravity process for the session: starting worker: fork/exec ${process.env.AGY_ACP_FIXTURE_DELETED_EXE || '/secret/private/path/agy.1731.old'} (deleted): no such file or directory` } });
+      }
       if (p.sessionId === 'missing-native') return error(req.id, 'Session not found');
       sessions.set(p.sessionId, { pending: [], inputs: [] });
       if (scenario === 'resume-history') note(p.sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'OLD_ERROR from history' } });

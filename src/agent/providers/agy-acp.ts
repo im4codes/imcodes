@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import type {
   ProviderConfig, ProviderDelegationNotification, SessionConfig, TransportProvider,
 } from '../transport-provider.js';
@@ -46,15 +47,27 @@ export function supportsAgyAcp(version: string): boolean {
 /** Official AG ACP. Older stream-json stays a separate implementation, never
  * a retry after ACP authentication, resume, network or prompt failures. */
 export class AgyAcpProvider extends KimiSdkProvider {
-  constructor(private readonly probedBinary?: ReturnType<typeof resolveAgyBinary>) {
+  constructor(private probedBinary?: ReturnType<typeof resolveAgyBinary>) {
     super(PROFILE);
     this.capabilities.nativeAgentAdmission = NATIVE_AGENT_ADMISSION_MODES.SESSION_FENCE;
   }
 
-  protected override resolveAcpExecutable(config: ProviderConfig): ReturnType<typeof resolveAgyBinary> {
+  protected override resolveAcpExecutable(
+    config: ProviderConfig,
+    options?: { refresh?: boolean },
+  ): ReturnType<typeof resolveAgyBinary> {
     // Freeze the complete entrypoint/argv chosen for --version, including any
     // Windows shim's Node script argument. Direct adapter use shares AG's
-    // existing env/HOME candidate resolver as well.
+    // existing env/HOME candidate resolver as well. When recycling a stale
+    // shared ACP server after a CLI update, re-resolve candidates on disk while
+    // retaining the probed binary if no new candidate exists (e.g. test stubs).
+    if (options?.refresh && this.probedBinary) {
+      const fresh = resolveAgyBinary(config);
+      if (existsSync(fresh.executable)) {
+        this.probedBinary = fresh;
+      }
+      return this.probedBinary;
+    }
     return this.probedBinary ?? resolveAgyBinary(config);
   }
 

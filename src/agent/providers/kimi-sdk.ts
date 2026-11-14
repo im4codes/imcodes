@@ -57,6 +57,7 @@ import { confirmPromiseStop } from '../provider-stop-confirmation.js';
 
 import { gateChildStream } from '../../util/event-loop-backpressure.js';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { realpathSync, statSync } from 'node:fs';
 import { once } from 'node:events';
 import { Readable, Writable } from 'node:stream';
 import { createHash, randomUUID } from 'node:crypto';
@@ -324,6 +325,21 @@ interface KimiSdkSessionState {
   isolatedDisposeInFlight?: Promise<void>;
 }
 
+interface AcpFileFingerprint {
+  realpath: string | null;
+  dev: number;
+  ino: number;
+  size: number;
+  mtimeMs: number;
+}
+
+interface AcpExecutableFingerprint {
+  executable: string;
+  primary: AcpFileFingerprint;
+  scriptPath?: string;
+  script?: AcpFileFingerprint | null;
+}
+
 interface AcpTransportSlot {
   child: ChildProcessWithoutNullStreams | null;
   connection: ClientSideConnection | null;
@@ -402,6 +418,11 @@ export class KimiSdkProvider implements TransportProvider {
   private sessionListSupported = false;
   private isDisconnecting = false;
   private sharedConnectInFlight: Promise<void> | null = null;
+  private sharedRecycleInFlight: Promise<void> | null = null;
+  private pendingSharedRecycle = false;
+  private sharedExecutableFingerprint: AcpExecutableFingerprint | null = null;
+  private sharedHasStartedOnce = false;
+  private readonly sharedSessionReadyInFlight = new Set<string>();
 
   constructor(profile: AcpCliProviderProfile = KIMI_PROFILE) {
     this.profile = profile;
@@ -447,8 +468,13 @@ export class KimiSdkProvider implements TransportProvider {
   }
 
   private async ensureSharedAcpConnected(): Promise<void> {
+    if (this.sharedRecycleInFlight) {
+      await this.sharedRecycleInFlight.catch(() => {});
+    }
     if (this.connection || !this.config || this.isDisconnecting) return;
-    const inflight = this.sharedConnectInFlight ??= this.startAcpServer(this.config).finally(() => {
+    const inflight = this.sharedConnectInFlight ??= this.startAcpServer(this.config, undefined, {
+      refreshExecutable: this.sharedHasStartedOnce,
+    }).finally(() => {
       if (this.sharedConnectInFlight === inflight) this.sharedConnectInFlight = null;
     });
     await inflight;
@@ -619,6 +645,8 @@ export class KimiSdkProvider implements TransportProvider {
   async disconnect(): Promise<void> {
     this.isDisconnecting = true;
     try {
+      await this.sharedRecycleInFlight?.catch(() => {});
+      await this.sharedConnectInFlight?.catch(() => {});
       this.cancelPendingApprovals();
       const states = [...this.sessions.values()];
       for (const state of states) this.closeAgyBridges(state);
@@ -632,6 +660,11 @@ export class KimiSdkProvider implements TransportProvider {
       this.config = null;
       this.initPromise = null;
       this.sharedConnectInFlight = null;
+      this.sharedRecycleInFlight = null;
+      this.pendingSharedRecycle = false;
+      this.sharedExecutableFingerprint = null;
+      this.sharedHasStartedOnce = false;
+      this.sharedSessionReadyInFlight.clear();
       this.cachedModels = null;
       this.cachedDefaultModel = null;
       this.sessionListSupported = false;
@@ -755,6 +788,7 @@ export class KimiSdkProvider implements TransportProvider {
         await closer.call(connection, { sessionId: state.acpSessionId }).catch(() => {});
       }
     }
+    this.scheduleDeferredSharedRecycleIfDrained();
   }
 
   async detachSession(sessionId: string): Promise<void> {
@@ -768,6 +802,7 @@ export class KimiSdkProvider implements TransportProvider {
     this.closeAgyBridges(state);
     this.sessions.delete(state.routeId);
     if (state.acpSessionId) this.releaseAcpRoute(state.acpSessionId, state.routeId);
+    this.scheduleDeferredSharedRecycleIfDrained();
   }
 
   async restoreSession(sessionId: string): Promise<boolean> {
@@ -903,6 +938,7 @@ export class KimiSdkProvider implements TransportProvider {
       // signature, allowing TransportSessionRuntime to transition tool_running -> idle.
       state.lastStatusSignature = null;
       this.clearStatus(sessionId, state);
+      this.scheduleDeferredSharedRecycleIfDrained();
     }
   }
 
@@ -1328,10 +1364,15 @@ export class KimiSdkProvider implements TransportProvider {
     if (state.incognito && state.disposed) {
       throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, 'Incognito session has been terminated; start a fresh session.', false);
     }
-    if (!state.incognito && !this.connection) {
-      await this.ensureSharedAcpConnected();
+    if (!state.incognito) {
+      if (this.sharedRecycleInFlight) {
+        await this.sharedRecycleInFlight.catch(() => {});
+      }
       if (!this.connection) {
-        throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, `${this.profile.displayName} ACP server not connected`, false);
+        await this.ensureSharedAcpConnected();
+        if (!this.connection) {
+          throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, `${this.profile.displayName} ACP server not connected`, false);
+        }
       }
     }
     if (state.promptInFlight) {
@@ -1416,6 +1457,7 @@ export class KimiSdkProvider implements TransportProvider {
         state.lastStatusSignature = null;
         this.clearStatus(sessionId, state);
       }
+      this.scheduleDeferredSharedRecycleIfDrained();
       return;
     }
     state.cancelled = true;
@@ -1656,6 +1698,7 @@ export class KimiSdkProvider implements TransportProvider {
       transport: IsolatedAcpTransport;
       incognitoEnv: AgyIncognitoEnv;
     },
+    options?: { refreshExecutable?: boolean },
   ): Promise<void> {
     if (!isolatedFor) {
       await this.teardownChild();
@@ -1685,7 +1728,15 @@ export class KimiSdkProvider implements TransportProvider {
       ? isolatedFor.transport
       : createSharedTransportSlot();
 
-    const resolved = this.resolveAcpExecutable(config);
+    const resolved = this.resolveAcpExecutable(
+      config,
+      !isolatedFor && options?.refreshExecutable ? { refresh: true } : undefined,
+    );
+    if (!isolatedFor) {
+      this.sharedHasStartedOnce = true;
+      this.sharedExecutableFingerprint = captureExecutableFingerprint(resolved.executable, resolved.prependArgs[0]);
+      this.pendingSharedRecycle = false;
+    }
     const args = [
       ...resolved.prependArgs,
       ...this.buildAcpArgs(config, isolatedFor?.incognitoEnv.acpFlags),
@@ -2216,6 +2267,7 @@ export class KimiSdkProvider implements TransportProvider {
     run?.complete();
     if (this.isDisconnecting) return;
     this.emitError(sessionId, this.normalizeError(error));
+    this.scheduleDeferredSharedRecycleIfDrained();
   }
 
   private assertCurrentSession(sessionId: string, state: KimiSdkSessionState, connection = this.connectionForState(state)): void {
@@ -2237,117 +2289,159 @@ export class KimiSdkProvider implements TransportProvider {
       if (state.acpSessionId && !state.loaded) {
         throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Incognito conversation cannot be resumed; start a new session.', false);
       }
-      const existingTransport = state.isolatedTransport;
-      if (!existingTransport?.connection || !existingTransport.child || existingTransport.child.killed || existingTransport.child.exitCode !== null) {
-        await this.startIsolatedAcpServer(sessionId, state);
-      }
-    } else if (!this.connection && this.config) {
-      await this.ensureSharedAcpConnected();
     }
-    const connection = this.connectionForState(state);
-    if (!connection) {
-      throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, `${this.profile.displayName} ACP connection not ready`, false);
-    }
-    try {
-      await this.initPromiseForState(state);
-      this.assertCurrentSession(sessionId, state, connection);
 
-      if (!state.loaded) {
-        await state.beforeNativeSessionStart?.();
-        this.assertCurrentSession(sessionId, state, connection);
-        if (state.acpSessionId) {
-          if (state.incognito) {
-            throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Incognito conversation cannot be resumed; start a new session.', false);
+    let beforeNativeStartRan = false;
+    let sharedRecycleRetried = false;
+
+    while (true) {
+      if (state.incognito) {
+        const existingTransport = state.isolatedTransport;
+        if (!existingTransport?.connection || !existingTransport.child || existingTransport.child.killed || existingTransport.child.exitCode !== null) {
+          await this.startIsolatedAcpServer(sessionId, state);
+        }
+      } else {
+        if (!state.loaded && (this.pendingSharedRecycle || this.hasSharedExecutableChanged())) {
+          if (this.hasActiveSharedSessionWork(sessionId)) {
+            this.pendingSharedRecycle = true;
+          } else {
+            await this.recycleSharedAcpServer(this.pendingSharedRecycle ? 'deferred_drain' : 'binary_changed', sessionId);
           }
-          // Resume an existing session (survives across CLI restarts via
-          // ~/.kimi/tmp/<project>/chats/<id>.json).
-          try {
-            const loader = this.profile.resumeWithoutReplay
-              ? (connection as AcpAgent).resumeSession
-              : (connection as AcpAgent).loadSession;
-            if (typeof loader !== 'function') {
-              throw new Error('Agent does not implement loadSession (capability mismatch)');
-            }
-            // `loadSession` streams the full message history back as
-            // session/update notifications *before* the RPC resolves. Set the
-            // replay flag so handleSessionUpdate drops those history chunks
-            // instead of forwarding them to the current-turn delta listeners.
-            state.replaying = true;
-            let loadResult: LoadSessionResponse | undefined;
-            try {
-              loadResult = await this.withAcpDiagnostics(this.profile.resumeWithoutReplay
-                ? ACP_ERROR_PHASE.RESUME_SESSION : ACP_ERROR_PHASE.LOAD_SESSION, () => loader.call(connection, {
-                sessionId: state.acpSessionId,
-                cwd: state.cwd,
-                mcpServers: this.mcpServersForState(state),
-              }));
-              if (state.wireOrderTail) await state.wireOrderTail;
-            } finally {
-              state.replaying = false;
-            }
+        }
+        if (!this.connection && this.config) {
+          await this.ensureSharedAcpConnected();
+        }
+      }
+      const connection = this.connectionForState(state);
+      if (!connection) {
+        throw this.makeError(
+          PROVIDER_ERROR_CODES.CONNECTION_LOST,
+          `${this.profile.displayName} ACP connection not ready`,
+          false,
+        );
+      }
+      if (!state.incognito) this.sharedSessionReadyInFlight.add(sessionId);
+      try {
+        await this.initPromiseForState(state);
+        this.assertCurrentSession(sessionId, state, connection);
+
+        if (!state.loaded) {
+          if (!beforeNativeStartRan) {
+            beforeNativeStartRan = true;
+            await state.beforeNativeSessionStart?.();
             this.assertCurrentSession(sessionId, state, connection);
-            state.loaded = true;
-            this.cacheModelsFromSessionResponse(loadResult);
-            this.applySessionMetadata(sessionId, state, loadResult);
-          } catch (err) {
-            if (this.profile.loadFailure === 'error') throw err;
-            logger.info(
-              {
-                provider: this.id,
-                sessionId,
-                acpSessionId: state.acpSessionId,
-                ...this.errorLogFields(err, 'err'),
-              },
-              `${this.profile.displayName} ACP loadSession failed; falling back to newSession`,
-            );
-            this.releaseAcpRoute(state.acpSessionId, state.routeId);
-            state.acpSessionId = undefined;
+          }
+          if (state.acpSessionId) {
+            if (state.incognito) {
+              throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Incognito conversation cannot be resumed; start a new session.', false);
+            }
+            // Resume an existing session (survives across CLI restarts via
+            // ~/.kimi/tmp/<project>/chats/<id>.json).
+            try {
+              const loader = this.profile.resumeWithoutReplay
+                ? (connection as AcpAgent).resumeSession
+                : (connection as AcpAgent).loadSession;
+              if (typeof loader !== 'function') {
+                throw new Error('Agent does not implement loadSession (capability mismatch)');
+              }
+              // `loadSession` streams the full message history back as
+              // session/update notifications *before* the RPC resolves. Set the
+              // replay flag so handleSessionUpdate drops those history chunks
+              // instead of forwarding them to the current-turn delta listeners.
+              state.replaying = true;
+              let loadResult: LoadSessionResponse | undefined;
+              try {
+                loadResult = await this.withAcpDiagnostics(this.profile.resumeWithoutReplay
+                  ? ACP_ERROR_PHASE.RESUME_SESSION : ACP_ERROR_PHASE.LOAD_SESSION, () => loader.call(connection, {
+                  sessionId: state.acpSessionId,
+                  cwd: state.cwd,
+                  mcpServers: this.mcpServersForState(state),
+                }));
+                if (state.wireOrderTail) await state.wireOrderTail;
+              } finally {
+                state.replaying = false;
+              }
+              this.assertCurrentSession(sessionId, state, connection);
+              state.loaded = true;
+              this.cacheModelsFromSessionResponse(loadResult);
+              this.applySessionMetadata(sessionId, state, loadResult);
+            } catch (err) {
+              if (isWorkerSpawnMissingExecutableError(err)) throw err;
+              if (this.profile.loadFailure === 'error') throw err;
+              logger.info(
+                {
+                  provider: this.id,
+                  sessionId,
+                  acpSessionId: state.acpSessionId,
+                  ...this.errorLogFields(err, 'err'),
+                },
+                `${this.profile.displayName} ACP loadSession failed; falling back to newSession`,
+              );
+              this.releaseAcpRoute(state.acpSessionId, state.routeId);
+              state.acpSessionId = undefined;
+              await this.createFreshAcpSession(sessionId, state);
+            }
+          } else {
             await this.createFreshAcpSession(sessionId, state);
           }
-        } else {
-          await this.createFreshAcpSession(sessionId, state);
         }
-      }
 
-      if (!state.modeApplied && this.profile.defaultMode && state.acpSessionId && connection) {
-        const modeSetter = (connection as AcpAgent).setSessionMode;
-        if (typeof modeSetter === 'function') {
-          await modeSetter.call(connection, {
-            sessionId: state.acpSessionId,
-            modeId: this.profile.defaultMode,
-          }).catch((err: unknown) => {
-            // Not fatal — Kimi's server already defaults to this mode.
-            logger.debug({
-              provider: this.id,
-              sessionId,
-              ...this.errorLogFields(err, 'err'),
-            }, 'setSessionMode(default) failed (non-fatal)');
-          });
+        if (!state.modeApplied && this.profile.defaultMode && state.acpSessionId && connection) {
+          const modeSetter = (connection as AcpAgent).setSessionMode;
+          if (typeof modeSetter === 'function') {
+            await modeSetter.call(connection, {
+              sessionId: state.acpSessionId,
+              modeId: this.profile.defaultMode,
+            }).catch((err: unknown) => {
+              // Not fatal — Kimi's server already defaults to this mode.
+              logger.debug({
+                provider: this.id,
+                sessionId,
+                ...this.errorLogFields(err, 'err'),
+              }, 'setSessionMode(default) failed (non-fatal)');
+            });
+          }
+          this.assertCurrentSession(sessionId, state, connection);
+          state.modeApplied = true;
+        }
+
+        if (this.profile.strictModelSelection) {
+          await this.confirmStrictSessionModel(sessionId, state);
+        } else if (state.model && state.acpSessionId && connection) {
+          const modelSetter = (connection as AcpAgent).unstable_setSessionModel;
+          if (typeof modelSetter === 'function') {
+            await modelSetter.call(connection, {
+              sessionId: state.acpSessionId,
+              modelId: state.model,
+            }).catch((err: unknown) => {
+              logger.debug({ provider: this.id, sessionId, ...this.errorLogFields(err, 'err') },
+                'unstable_setSessionModel pre-turn failed (non-fatal)');
+            });
+          }
         }
         this.assertCurrentSession(sessionId, state, connection);
-        state.modeApplied = true;
-      }
-
-      if (this.profile.strictModelSelection) {
-        await this.confirmStrictSessionModel(sessionId, state);
-      } else if (state.model && state.acpSessionId && connection) {
-        const modelSetter = (connection as AcpAgent).unstable_setSessionModel;
-        if (typeof modelSetter === 'function') {
-          await modelSetter.call(connection, {
-            sessionId: state.acpSessionId,
-            modelId: state.model,
-          }).catch((err: unknown) => {
-            logger.debug({ provider: this.id, sessionId, ...this.errorLogFields(err, 'err') },
-              'unstable_setSessionModel pre-turn failed (non-fatal)');
-          });
+        return;
+      } catch (err) {
+        if (!state.incognito && !state.loaded && isWorkerSpawnMissingExecutableError(err)) {
+          if (this.hasActiveSharedSessionWork(sessionId)) {
+            this.pendingSharedRecycle = true;
+            throw err;
+          }
+          if (!sharedRecycleRetried) {
+            sharedRecycleRetried = true;
+            this.sharedSessionReadyInFlight.delete(sessionId);
+            await this.recycleSharedAcpServer('worker_spawn_enoent', sessionId);
+            this.assertCurrentSession(sessionId, state);
+            continue;
+          }
         }
+        if (state.incognito && !state.loaded) {
+          await this.disposeIsolatedSession(state);
+        }
+        throw err;
+      } finally {
+        if (!state.incognito) this.sharedSessionReadyInFlight.delete(sessionId);
       }
-      this.assertCurrentSession(sessionId, state, connection);
-    } catch (err) {
-      if (state.incognito && !state.loaded) {
-        await this.disposeIsolatedSession(state);
-      }
-      throw err;
     }
   }
 
@@ -2363,7 +2457,11 @@ export class KimiSdkProvider implements TransportProvider {
     } catch (error) {
       // Even a clean RPC rejection need not mean the upstream did not persist
       // a conversation. Never undo the durable start proof or retry fresh.
-      if (this.id !== AGY_SDK_PROVIDER_ID || state.incognito) throw error;
+      // Worker-spawn missing-executable errors fail before any native session
+      // starts and must reach ensureSessionReady un-wrapped for recycle/retry.
+      if (this.id !== AGY_SDK_PROVIDER_ID || state.incognito || isWorkerSpawnMissingExecutableError(error)) {
+        throw error;
+      }
       const normalized = this.normalizeError(error);
       throw { ...normalized, message: `${normalized.message} ${AGY_NATIVE_START_RECOVERY_HINT}` };
     }
@@ -2609,51 +2707,74 @@ export class KimiSdkProvider implements TransportProvider {
     // only this captured run; callbacks may already have started a successor.
     run?.complete();
 
-    if (steeringFailure !== undefined) {
-      state.cancelled = false;
-      state.stoppedByCancel = true;
-      this.emitError(sessionId, this.normalizeError(steeringFailure));
-      return;
-    }
-    if (stopReason === 'cancelled' || state.cancelled) {
-      this.closeAgyBridges(state);
-      for (const event of state.agySubagents?.interrupt() ?? []) {
-        for (const cb of this.toolCallCallbacks) cb(sessionId, event);
+    try {
+      if (steeringFailure !== undefined) {
+        state.cancelled = false;
+        state.stoppedByCancel = true;
+        this.emitError(sessionId, this.normalizeError(steeringFailure));
+        return;
       }
-      state.cancelled = false;
-      state.stoppedByCancel = true;
-      state.activePromptGenerations?.clear();
-      state.autonomousTurnGeneration = undefined;
-      state.promptInFlight = false;
-      state.promptSubmittedGeneration = null;
-      state.settledGeneration = state.turnGeneration;
-      this.emitError(
-        sessionId,
-        this.makeError(PROVIDER_ERROR_CODES.CANCELLED, `${this.profile.displayName} turn cancelled`, true),
-      );
-      return;
-    }
-    if (stopReason === 'refusal') {
-      this.emitError(
-        sessionId,
-        this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, `${this.profile.displayName} refused the request`, false),
-      );
-      return;
-    }
-    // Snapshot + clear the per-turn ACP usage so each onComplete carries its
-    // OWN token counts (not the previous turn's). Transport-relay's
-    // normalizeUsageUpdatePayload reads `metadata.usage` to emit usage.update
-    // → recorded in context_turn_usage with the turn's eventId.
-    const turnUsage = this.id === AGY_SDK_PROVIDER_ID
-      ? { ...state.lastTurnUsage, ...(state.agyContextUsage ??= new AgyContextUsage()).normalize(state.lastTurnUsage) }
-      : state.lastTurnUsage;
-    state.lastTurnUsage = undefined;
-    this.emitAgyUsage(sessionId, state, turnUsage, true);
-    if (sessionSystemTextToCommit) state.sessionSystemTextInjected = sessionSystemTextToCommit;
+      if (stopReason === 'cancelled' || state.cancelled) {
+        this.closeAgyBridges(state);
+        for (const event of state.agySubagents?.interrupt() ?? []) {
+          for (const cb of this.toolCallCallbacks) cb(sessionId, event);
+        }
+        state.cancelled = false;
+        state.stoppedByCancel = true;
+        state.activePromptGenerations?.clear();
+        state.autonomousTurnGeneration = undefined;
+        state.promptInFlight = false;
+        state.promptSubmittedGeneration = null;
+        state.settledGeneration = state.turnGeneration;
+        this.emitError(
+          sessionId,
+          this.makeError(PROVIDER_ERROR_CODES.CANCELLED, `${this.profile.displayName} turn cancelled`, true),
+        );
+        return;
+      }
+      if (stopReason === 'refusal') {
+        this.emitError(
+          sessionId,
+          this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, `${this.profile.displayName} refused the request`, false),
+        );
+        return;
+      }
+      // Snapshot + clear the per-turn ACP usage so each onComplete carries its
+      // OWN token counts (not the previous turn's). Transport-relay's
+      // normalizeUsageUpdatePayload reads `metadata.usage` to emit usage.update
+      // → recorded in context_turn_usage with the turn's eventId.
+      const turnUsage = this.id === AGY_SDK_PROVIDER_ID
+        ? { ...state.lastTurnUsage, ...(state.agyContextUsage ??= new AgyContextUsage()).normalize(state.lastTurnUsage) }
+        : state.lastTurnUsage;
+      state.lastTurnUsage = undefined;
+      this.emitAgyUsage(sessionId, state, turnUsage, true);
+      if (sessionSystemTextToCommit) state.sessionSystemTextInjected = sessionSystemTextToCommit;
 
-    if (stopReason === 'max_tokens' || stopReason === 'max_turn_requests') {
-      // Still emit whatever text we accumulated — it's a partial but useful
-      // response — and mark metadata so the UI can show the truncation cause.
+      if (stopReason === 'max_tokens' || stopReason === 'max_turn_requests') {
+        // Still emit whatever text we accumulated — it's a partial but useful
+        // response — and mark metadata so the UI can show the truncation cause.
+        const msg: AgentMessage = {
+          id: messageId,
+          sessionId,
+          kind: 'text',
+          role: 'assistant',
+          content: text,
+          timestamp: Date.now(),
+          status: 'complete',
+          metadata: {
+            stopReason,
+            ...((this.profile.strictModelSelection ? state.turnModel : state.model)
+              ? { model: this.profile.strictModelSelection ? state.turnModel : state.model } : {}),
+            ...(state.acpSessionId ? { resumeId: state.acpSessionId } : {}),
+            ...(turnUsage ? { usage: turnUsage } : {}),
+          },
+        };
+        for (const cb of this.completeCallbacks) cb(sessionId, msg);
+        return;
+      }
+
+      // stopReason === 'end_turn' (happy path).
+      if (compactControl) state.sessionSystemTextInjected = undefined;
       const msg: AgentMessage = {
         id: messageId,
         sessionId,
@@ -2663,36 +2784,17 @@ export class KimiSdkProvider implements TransportProvider {
         timestamp: Date.now(),
         status: 'complete',
         metadata: {
-          stopReason,
+          ...(compactControl ? { [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact' } : {}),
           ...((this.profile.strictModelSelection ? state.turnModel : state.model)
-            ? { model: this.profile.strictModelSelection ? state.turnModel : state.model } : {}),
+              ? { model: this.profile.strictModelSelection ? state.turnModel : state.model } : {}),
           ...(state.acpSessionId ? { resumeId: state.acpSessionId } : {}),
           ...(turnUsage ? { usage: turnUsage } : {}),
         },
       };
       for (const cb of this.completeCallbacks) cb(sessionId, msg);
-      return;
+    } finally {
+      this.scheduleDeferredSharedRecycleIfDrained();
     }
-
-    // stopReason === 'end_turn' (happy path).
-    if (compactControl) state.sessionSystemTextInjected = undefined;
-    const msg: AgentMessage = {
-      id: messageId,
-      sessionId,
-      kind: 'text',
-      role: 'assistant',
-      content: text,
-      timestamp: Date.now(),
-      status: 'complete',
-      metadata: {
-        ...(compactControl ? { [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact' } : {}),
-        ...((this.profile.strictModelSelection ? state.turnModel : state.model)
-            ? { model: this.profile.strictModelSelection ? state.turnModel : state.model } : {}),
-        ...(state.acpSessionId ? { resumeId: state.acpSessionId } : {}),
-        ...(turnUsage ? { usage: turnUsage } : {}),
-      },
-    };
-    for (const cb of this.completeCallbacks) cb(sessionId, msg);
   }
 
   // ── sessionUpdate dispatch ──────────────────────────────────────────────
@@ -3156,14 +3258,116 @@ export class KimiSdkProvider implements TransportProvider {
   private async teardownChild(): Promise<void> {
     // Closing the ACP connection is implicit when we close stdin. The SDK's
     // internal readers finish when stdout ends. tree-kill the CLI so its
-    // node wrapper doesn't leave grandchildren behind.
-    if (this.child && !this.child.killed) {
-      try { this.child.stdin.end(); } catch { /* noop */ }
-      await killProcessTree(this.child, { ownsProcessGroup: true });
-    }
+    // node wrapper doesn't leave grandchildren behind. Clear shared transport
+    // handles before killing so the child 'exit' handler never emits spurious
+    // CONNECTION_LOST errors during an intentional teardown or recycle.
+    const child = this.child;
     this.child = null;
     this.connection = null;
+    this.initPromise = null;
     this.sessionListSupported = false;
+    if (child && !child.killed) {
+      try { child.stdin.end(); } catch { /* noop */ }
+      await killProcessTree(child, { ownsProcessGroup: true });
+    }
+  }
+
+  private hasActiveSharedSessionWork(excludeSessionId?: string): boolean {
+    for (const [routeId, state] of this.sessions) {
+      if (state.incognito || routeId === excludeSessionId) continue;
+      if (
+        state.promptInFlight
+        || state.replaying
+        || this.sharedSessionReadyInFlight.has(routeId)
+        || (state.activePromptGenerations?.size ?? 0) > 0
+        || state.autonomousTurnGeneration !== undefined
+        || (state.agyBackgroundTasks?.size ?? 0) > 0
+        || [...state.toolCalls.values()].some((tool) => tool.status === 'pending' || tool.status === 'in_progress')
+        || [...this.pendingApprovals.values()].some((approval) => approval.routeId === routeId)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private hasSharedExecutableChanged(): boolean {
+    const prev = this.sharedExecutableFingerprint;
+    if (!prev || !this.config) return false;
+    const fresh = this.resolveAcpExecutable(this.config, { refresh: true });
+    if (fresh.executable !== prev.executable) {
+      const freshPrimary = captureFileFingerprint(fresh.executable);
+      return freshPrimary !== null;
+    }
+    const currentPrimary = captureFileFingerprint(prev.executable);
+    if (currentPrimary && hasFileFingerprintChanged(prev.primary, currentPrimary)) {
+      return true;
+    }
+    if (prev.scriptPath && prev.script) {
+      const nextScriptPath = fresh.prependArgs[0] ?? prev.scriptPath;
+      if (nextScriptPath !== prev.scriptPath) {
+        return captureFileFingerprint(nextScriptPath) !== null;
+      }
+      const currentScript = captureFileFingerprint(prev.scriptPath);
+      if (currentScript && hasFileFingerprintChanged(prev.script, currentScript)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private scheduleDeferredSharedRecycleIfDrained(): void {
+    if (!this.pendingSharedRecycle || this.isDisconnecting || !this.config) return;
+    if (this.hasActiveSharedSessionWork()) return;
+    void this.recycleSharedAcpServer('deferred_drain').catch((err) => {
+      logger.warn({ provider: this.id, ...this.errorLogFields(err) }, `${this.profile.displayName} deferred shared ACP recycle failed`);
+    });
+  }
+
+  private async recycleSharedAcpServer(
+    reason: 'binary_changed' | 'worker_spawn_enoent' | 'deferred_drain',
+    excludeSessionId?: string,
+  ): Promise<void> {
+    if (this.isDisconnecting || !this.config) return;
+    if (this.sharedRecycleInFlight) {
+      await this.sharedRecycleInFlight;
+      return;
+    }
+    const recyclePromise = (async () => {
+      if (this.sharedConnectInFlight) {
+        await this.sharedConnectInFlight.catch(() => {});
+      }
+      if (this.isDisconnecting || !this.config) return;
+      if (this.hasActiveSharedSessionWork(excludeSessionId)) {
+        this.pendingSharedRecycle = true;
+        return;
+      }
+      this.pendingSharedRecycle = false;
+      for (const state of this.sessions.values()) {
+        if (state.incognito) continue;
+        this.closeAgyBridges(state);
+        state.loaded = false;
+        state.modeApplied = false;
+        state.sessionSystemTextInjected = undefined;
+      }
+      this.cachedModels = null;
+      this.cachedDefaultModel = null;
+      logger.info({ provider: this.id, reason }, `${this.profile.displayName} recycling shared ACP server`);
+      await this.teardownChild();
+      if (this.isDisconnecting || !this.config) return;
+      const connectPromise = (this.sharedConnectInFlight = this.startAcpServer(
+        this.config,
+        undefined,
+        { refreshExecutable: true },
+      ).finally(() => {
+        if (this.sharedConnectInFlight === connectPromise) this.sharedConnectInFlight = null;
+      }));
+      await connectPromise;
+    })().finally(() => {
+      if (this.sharedRecycleInFlight === recyclePromise) this.sharedRecycleInFlight = null;
+    });
+    this.sharedRecycleInFlight = recyclePromise;
+    await recyclePromise;
   }
 
   private emitSessionInfo(sessionId: string, info: SessionInfoUpdate): void {
@@ -3189,7 +3393,10 @@ export class KimiSdkProvider implements TransportProvider {
     for (const cb of this.errorCallbacks) cb(sessionId, error);
   }
 
-  protected resolveAcpExecutable(config: ProviderConfig): ReturnType<typeof resolveExecutableForSpawn> {
+  protected resolveAcpExecutable(
+    config: ProviderConfig,
+    _options?: { refresh?: boolean },
+  ): ReturnType<typeof resolveExecutableForSpawn> {
     return resolveExecutableForSpawn(this.resolveBinaryPath(config));
   }
 
@@ -3255,9 +3462,9 @@ export class KimiSdkProvider implements TransportProvider {
       // Already a ProviderError.
       return err as ProviderError;
     }
-    const message = err instanceof Error ? err.message : String(err);
+    const message = extractErrorMessage(err);
     const isConnectionLost = /closed|epipe|econnreset|broken pipe|stream (?:closed|ended)|socket closed|server exited|process exited|channel closed|connection (?:lost|closed|ended|reset)|premature close|unexpected end of json/i.test(message);
-    if (isConnectionLost || this.isDisconnecting) {
+    if (isConnectionLost || isWorkerSpawnMissingExecutableError(err) || this.isDisconnecting) {
       return this.makeError(
         PROVIDER_ERROR_CODES.CONNECTION_LOST,
         this.profile.privacySafeErrors ? `${this.profile.displayName} connection was lost.` : message,
@@ -3640,4 +3847,76 @@ function matchAgyGenericRowToNativeTool(
   if (isLaunchTool && row.status !== 'ERROR') return undefined;
   if (order.length > 1) return undefined;
   return { orderEntry: order.splice(0, 1)[0], pending };
+}
+
+const WORKER_SPAWN_MISSING_EXEC_RE = /(?:starting worker:.*(?:no such file or directory|enoent|executable file not found)|fork\/exec .*: (?:no such file or directory|executable file not found))/i;
+
+function extractErrorMessage(err: unknown): string {
+  if (err instanceof Error) {
+    const data = (err as { data?: unknown }).data;
+    if (typeof data === 'string' && data.trim()) return `${err.message} ${data}`;
+    if (data && typeof data === 'object' && 'details' in data && typeof (data as { details?: unknown }).details === 'string') {
+      return `${err.message} ${(data as { details: string }).details}`;
+    }
+    return err.message;
+  }
+  if (err && typeof err === 'object') {
+    const record = err as { message?: unknown; data?: unknown };
+    const msg = typeof record.message === 'string' ? record.message : '';
+    const data = typeof record.data === 'string'
+      ? record.data
+      : (record.data && typeof record.data === 'object' && 'details' in record.data && typeof (record.data as { details?: unknown }).details === 'string')
+        ? (record.data as { details: string }).details
+        : '';
+    const combined = [msg, data].filter(Boolean).join(' ').trim();
+    if (combined) return combined;
+  }
+  return String(err);
+}
+
+function isWorkerSpawnMissingExecutableError(err: unknown): boolean {
+  if (!err) return false;
+  return WORKER_SPAWN_MISSING_EXEC_RE.test(extractErrorMessage(err));
+}
+
+function captureFileFingerprint(filePath: string): AcpFileFingerprint | null {
+  try {
+    let resolvedPath: string | null = null;
+    try {
+      resolvedPath = realpathSync(filePath);
+    } catch {
+      resolvedPath = null;
+    }
+    const st = statSync(resolvedPath ?? filePath);
+    if (!st.isFile()) return null;
+    return {
+      realpath: resolvedPath,
+      dev: st.dev,
+      ino: st.ino,
+      size: st.size,
+      mtimeMs: st.mtimeMs,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function captureExecutableFingerprint(executable: string, firstArg?: string): AcpExecutableFingerprint | null {
+  const primary = captureFileFingerprint(executable);
+  if (!primary) return null;
+  const scriptPath = firstArg && !firstArg.startsWith('-') ? firstArg : undefined;
+  const script = scriptPath ? captureFileFingerprint(scriptPath) : undefined;
+  return {
+    executable,
+    primary,
+    ...(script ? { scriptPath, script } : {}),
+  };
+}
+
+function hasFileFingerprintChanged(prev: AcpFileFingerprint, next: AcpFileFingerprint): boolean {
+  return prev.realpath !== next.realpath
+    || prev.dev !== next.dev
+    || prev.ino !== next.ino
+    || prev.size !== next.size
+    || prev.mtimeMs !== next.mtimeMs;
 }

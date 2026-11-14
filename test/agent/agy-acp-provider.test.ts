@@ -6,7 +6,7 @@ import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-que
 import { readFileSync } from 'node:fs';
 import { AGY_ACP_AGENT_NAME, AGY_CLI_PATH_ENV } from '../../shared/agy-agent.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, writeFile, readFile, rm, mkdir, unlink, appendFile } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile, rm, mkdir, unlink, appendFile, rename } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { AgyAcpProvider, createAgyProvider, supportsAgyAcp } from '../../src/agent/providers/agy-acp.js';
@@ -14,7 +14,7 @@ import { AgySdkProvider, resolveAgyBinary } from '../../src/agent/providers/agy-
 import { AGENT_DELEGATION_NOTIFICATION_RESULTS } from '../../shared/agent-delegation.js';
 import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../shared/memory-mcp-contracts.js';
 import { PROVIDER_ERROR_CODES, normalizeProviderPayload } from '../../src/agent/transport-provider.js';
-import { AGY_NATIVE_START_NOT_ATTEMPTED } from '../../shared/agy-agent.js';
+import { AGY_NATIVE_START_RECOVERY_HINT, AGY_NATIVE_START_NOT_ATTEMPTED } from '../../shared/agy-agent.js';
 import { SESSION_MODEL_APPLIED } from '../../shared/session-model-control.js';
 import { onConfirmedProviderStop } from '../../src/agent/provider-stop-confirmation.js';
 import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
@@ -2034,5 +2034,270 @@ rl.on('line', (line) => {
     } finally {
       await runtime.kill();
     }
+  });
+
+  it('proactively recycles idle shared ACP server when agy binary is replaced on disk (including createAgyProvider)', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'imcodes-test-agy-upgrade-idle-'));
+    const binary = path.join(root, 'agy');
+    const staging = path.join(root, 'agy.next');
+    const fixture = path.resolve('test/fixtures/agy-acp.mjs');
+    const log = path.join(root, 'rpc.jsonl');
+    const writeBinary = (target: string, version: string) => writeFile(
+      target,
+      `#!/bin/sh\nAGY_ACP_FIXTURE_VERSION='${version}' exec '${process.execPath}' '${fixture}' "$@"\n`,
+      { mode: 0o700 },
+    );
+
+    await writeBinary(binary, '1.5.8');
+    vi.stubEnv(AGY_CLI_PATH_ENV, binary);
+    const config = {
+      env: {
+        HOME: root,
+        PATH: '/usr/bin:/bin',
+        AGY_ACP_FIXTURE_AGENT_NAME: AGY_ACP_AGENT_NAME,
+        AGY_ACP_FIXTURE_LOG: log,
+      },
+    };
+    const provider = await createAgyProvider(config) as AgyAcpProvider;
+    resources.push({ provider, root });
+    await provider.connect(config);
+
+    const complete = vi.fn();
+    const errors = vi.fn();
+    provider.onComplete(complete);
+    provider.onError(errors);
+
+    const idA = await route(provider, 'deck_test_agy_upgrade_a');
+    await provider.send(idA, 'A1');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(provider.getSessionDiagnostics(idA)?.promptInFlight).toBe(false);
+
+    // Replace binary atomically on disk while session A is idle.
+    await writeBinary(staging, '1.5.9');
+    await rename(staging, binary);
+
+    const idB = await route(provider, 'deck_test_agy_upgrade_b');
+    await provider.send(idB, 'B1');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+
+    // Session A's loaded flag was cleared by recycle, so A transparently resumes on v2.
+    await provider.send(idA, 'A2');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(3), { timeout: 5000 });
+    expect(errors).not.toHaveBeenCalled();
+
+    const rows = (await readFile(log, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    const boots = rows.filter(r => r.fixture === 'boot');
+    expect(boots.map(b => b.version)).toEqual(['1.5.8', '1.5.9']);
+    expect(boots[0].pid).not.toBe(boots[1].pid);
+    expect(rows.filter(r => r.method === 'session/new')).toHaveLength(2);
+    expect(rows.filter(r => r.method === 'session/resume')).toHaveLength(1);
+  });
+
+  it('reactively recycles once and retries on worker spawn missing executable for session/new and session/resume without recovery hint', async () => {
+    const { provider, root, requests } = await setup();
+    const log = path.join(root, 'rpc.jsonl');
+    const complete = vi.fn();
+    const errors = vi.fn();
+    provider.onComplete(complete);
+    provider.onError(errors);
+
+    // 1. session/new fails once with worker spawn ENOENT; beforeNativeSessionStart runs only once.
+    const beforeNativeSessionStart = vi.fn(async () => {});
+    await route(provider, 'deck_test_reactive_new', { beforeNativeSessionStart });
+    await writeFile(log + '.worker-enoent', '1');
+    await writeFile(log + '.worker-enoent-clear-on-init', '1');
+
+    await provider.send('deck_test_reactive_new', 'HELLO_NEW');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(beforeNativeSessionStart).toHaveBeenCalledTimes(1);
+
+    // 2. session/resume fails once with worker spawn ENOENT; preserves resumeId (no fallback to newSession).
+    await route(provider, 'deck_test_reactive_resume', { resumeId: 'native-existing-99' });
+    await writeFile(log + '.worker-enoent', '1');
+    await writeFile(log + '.worker-enoent-clear-on-init', '1');
+
+    await provider.send('deck_test_reactive_resume', 'HELLO_RESUME');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(errors).not.toHaveBeenCalled();
+
+    const rows = await requests();
+    const boots = rows.filter(r => r.fixture === 'boot');
+    expect(boots).toHaveLength(3);
+    expect(new Set(boots.map(b => b.pid)).size).toBe(3);
+    expect(rows.filter(r => r.method === 'session/resume' && r.params?.sessionId === 'native-existing-99')).toHaveLength(2);
+  });
+
+  it('defers shared recycle while sibling is busy, returns privacy-safe CONNECTION_LOST, and auto-recycles on drain', async () => {
+    const { provider, root, binary, requests } = await setup();
+    const log = path.join(root, 'rpc.jsonl');
+    const holdFile = log + '.hold';
+    const complete = vi.fn();
+    const errors = vi.fn();
+    provider.onComplete(complete);
+    provider.onError(errors);
+
+    const idA = await route(provider, 'deck_test_busy_sibling_a');
+    await writeFile(holdFile, 'hold');
+    try {
+      await provider.send(idA, 'A_LONG');
+      await vi.waitFor(() => expect(provider.getSessionDiagnostics(idA)?.promptInFlight).toBe(true), { timeout: 5000 });
+
+      // Simulate binary update while sibling A is mid-turn and stale front fails worker spawn for new sessions.
+      const staging = path.join(root, 'agy.next');
+      const fixture = path.resolve('test/fixtures/agy-acp.mjs');
+      await writeFile(
+        staging,
+        `#!/bin/sh\nAGY_ACP_FIXTURE_VERSION='1.5.9' exec '${process.execPath}' '${fixture}' "$@"\n`,
+        { mode: 0o700 },
+      );
+      await rename(staging, binary);
+      await writeFile(log + '.worker-enoent', '1');
+
+      const idB = await route(provider, 'deck_test_busy_sibling_b');
+      let rejectedError: any;
+      try {
+        await provider.send(idB, 'B_NEW');
+      } catch (err) {
+        rejectedError = err;
+      }
+
+      // Sibling B fails cleanly with privacy-safe CONNECTION_LOST (no path leak, no AGY_NATIVE_START_RECOVERY_HINT).
+      expect(rejectedError).toMatchObject({
+        code: PROVIDER_ERROR_CODES.CONNECTION_LOST,
+        recoverable: true,
+      });
+      expect(rejectedError.message).not.toContain('/secret/private/path');
+      expect(rejectedError.message).not.toContain(AGY_NATIVE_START_RECOVERY_HINT);
+      expect(JSON.stringify(rejectedError)).not.toContain('/secret/private/path');
+      expect(errors).toHaveBeenCalledTimes(1);
+      expect(provider.getActiveWorkSnapshot(idB)?.activeWorkCount).toBe(0);
+
+      // Sibling A was NOT killed and has only 1 boot so far.
+      expect(provider.getSessionDiagnostics(idA)?.promptInFlight).toBe(true);
+      expect((await requests()).filter(r => r.fixture === 'boot')).toHaveLength(1);
+
+      // Clear .worker-enoent for the new binary and release A's hold; drain triggers automatic recycle.
+      await unlink(log + '.worker-enoent').catch(() => {});
+      await unlink(holdFile);
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+
+      await vi.waitFor(async () => {
+        const boots = (await requests()).filter(r => r.fixture === 'boot');
+        expect(boots).toHaveLength(2);
+        expect(boots[1].version).toBe('1.5.9');
+      }, { timeout: 5000 });
+
+      // Subsequent retry on B succeeds cleanly against the recycled 1.5.9 server.
+      await provider.send(idB, 'B_RETRY');
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    } finally {
+      await unlink(holdFile).catch(() => {});
+    }
+  });
+
+  it('bounds worker spawn recycle+retry to once per ensureSessionReady when ENOENT persists', async () => {
+    const { provider, root, requests } = await setup();
+    const log = path.join(root, 'rpc.jsonl');
+    const errors = vi.fn();
+    provider.onError(errors);
+
+    const id = await route(provider, 'deck_test_bounded_retry');
+    await writeFile(log + '.worker-enoent', '1');
+
+    let thrown: any;
+    try {
+      await provider.send(id, 'SHOULD_FAIL_AFTER_ONE_RECYCLE');
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toMatchObject({
+      code: PROVIDER_ERROR_CODES.CONNECTION_LOST,
+      recoverable: true,
+    });
+    expect(thrown.message).not.toContain('/secret/private/path');
+    expect(thrown.message).not.toContain(AGY_NATIVE_START_RECOVERY_HINT);
+    expect(errors).toHaveBeenCalledTimes(1);
+
+    const rows = await requests();
+    const boots = rows.filter(r => r.fixture === 'boot');
+    // Initial boot + max 1 recycle boot (never infinite loop).
+    expect(boots).toHaveLength(2);
+    expect(rows.filter(r => r.method === 'session/new')).toHaveLength(2);
+  });
+
+  it('drains deferred recycle when busy sibling closes via endSession', async () => {
+    const { provider, root, binary, requests } = await setup();
+    const log = path.join(root, 'rpc.jsonl');
+    const holdFile = log + '.hold';
+
+    const idA = await route(provider, 'deck_test_drain_end_a');
+    await writeFile(holdFile, 'hold');
+    try {
+      await provider.send(idA, 'A_HELD');
+      await vi.waitFor(() => expect(provider.getSessionDiagnostics(idA)?.promptInFlight).toBe(true), { timeout: 5000 });
+
+      const staging = path.join(root, 'agy.next');
+      const fixture = path.resolve('test/fixtures/agy-acp.mjs');
+      await writeFile(
+        staging,
+        `#!/bin/sh\nAGY_ACP_FIXTURE_VERSION='1.5.9' exec '${process.execPath}' '${fixture}' "$@"\n`,
+        { mode: 0o700 },
+      );
+      await rename(staging, binary);
+      await writeFile(log + '.worker-enoent', '1');
+
+      const idB = await route(provider, 'deck_test_drain_end_b');
+      await expect(provider.send(idB, 'B_DEFER')).rejects.toMatchObject({
+        code: PROVIDER_ERROR_CODES.CONNECTION_LOST,
+        recoverable: true,
+      });
+
+      await unlink(log + '.worker-enoent').catch(() => {});
+      await provider.endSession(idA);
+
+      await vi.waitFor(async () => {
+        const boots = (await requests()).filter(r => r.fixture === 'boot');
+        expect(boots).toHaveLength(2);
+        expect(boots[1].version).toBe('1.5.9');
+      }, { timeout: 5000 });
+    } finally {
+      await unlink(holdFile).catch(() => {});
+    }
+  });
+
+  it('keeps incognito sessions isolated from shared ACP binary detection and recycle', async () => {
+    const { provider, root, binary, requests } = await setup();
+    const log = path.join(root, 'rpc.jsonl');
+    const complete = vi.fn();
+    provider.onComplete(complete);
+
+    const idShared = await route(provider, 'deck_test_shared_for_incog');
+    await provider.send(idShared, 'SHARED_1');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    const sharedChildPidBefore = (provider as any).child?.pid;
+    expect(sharedChildPidBefore).toBeTypeOf('number');
+
+    const staging = path.join(root, 'agy.next');
+    const fixture = path.resolve('test/fixtures/agy-acp.mjs');
+    await writeFile(
+      staging,
+      `#!/bin/sh\nAGY_ACP_FIXTURE_VERSION='1.5.9' exec '${process.execPath}' '${fixture}' "$@"\n`,
+      { mode: 0o700 },
+    );
+    await rename(staging, binary);
+
+    const idIncog = await route(provider, 'deck_test_incog_isolated', { incognito: true });
+    await provider.send(idIncog, 'INCOG_1');
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2), { timeout: 5000 });
+
+    // Shared ACP server was NOT recycled by starting or closing the incognito session,
+    // and shared session state remained loaded until a shared ensureSessionReady ran.
+    expect((provider as any).child?.pid).toBe(sharedChildPidBefore);
+    expect((provider as any).sessions.get(idShared)?.loaded).toBe(true);
+    expect((provider as any).pendingSharedRecycle).toBe(false);
+    expect((await requests()).filter(r => r.fixture === 'boot' && r.version === '1.5.9')).toHaveLength(1);
+    await provider.endSession(idIncog);
+    expect((provider as any).child?.pid).toBe(sharedChildPidBefore);
   });
 });
