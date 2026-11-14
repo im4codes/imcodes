@@ -12,6 +12,7 @@ import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../shared/shared-machine-authority.js';
 import { createDaemonCloudDocsToolDeps } from '../../src/daemon/cloud-docs-mcp-deps.js';
 import { createMemoryMcpServerFromEnv } from '../../src/daemon/memory-mcp-server.js';
+import { formatCloudDocQuoteBadge } from '../../web/src/cloud-docs-reference.js';
 
 describe('MCP cloud_docs CLI-passthrough tool', () => {
   let server: http.Server;
@@ -116,6 +117,11 @@ describe('MCP cloud_docs CLI-passthrough tool', () => {
   it('routes args, command strings, omitted help, shared authority, and non-zero failures through runCloudDocsCli', async () => {
     const conn = await openClient({ catalogMode: 'static_full', sharedMachineAuthority: 'delegated-sma-1' });
     try {
+      const canonicalPattern = formatCloudDocQuoteBadge({ kind: 'cloud_doc', name: '<name>', docId: '<docId>' });
+      const publishedCloudDocs = (await conn.client.listTools()).tools.find((t) => t.name === MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS);
+      expect(publishedCloudDocs?.description).toContain(canonicalPattern);
+      expect(publishedCloudDocs?.description).toContain('id=<docId>');
+
       // 1. Omitted args/command defaults to --help (exit 0)
       const helpRes = await conn.client.callTool({
         name: MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
@@ -123,7 +129,10 @@ describe('MCP cloud_docs CLI-passthrough tool', () => {
       });
       expect(helpRes.isError).not.toBe(true);
       expect(helpRes.structuredContent).toMatchObject({ status: 'ok', exitCode: 0 });
-      expect(String((helpRes.structuredContent as { stdout?: string }).stdout)).toContain('Unified CLI for IM.codes Cloud Docs');
+      const helpStdout = String((helpRes.structuredContent as { stdout?: string }).stdout);
+      expect(helpStdout).toContain('Unified CLI for IM.codes Cloud Docs');
+      expect(helpStdout).toContain(canonicalPattern);
+      expect(helpStdout).toContain('id=<docId>');
 
       // 2. Embedded docs progressive disclosure
       const docsRes = await conn.client.callTool({

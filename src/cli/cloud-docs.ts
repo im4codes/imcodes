@@ -468,7 +468,18 @@ export async function runCloudDocsCli(
   };
 
   const program = configureCmd(
-    new Command('imcodes cloud-docs').description('Unified CLI for IM.codes Cloud Docs & ONLYOFFICE Document Builder / Converter'),
+    new Command('imcodes cloud-docs')
+      .description('Unified CLI for IM.codes Cloud Docs & ONLYOFFICE Document Builder / Converter')
+      .addHelpText(
+        'after',
+        [
+          '',
+          'Chat citation format:',
+          '  When creating, editing, or mentioning a Cloud Doc in chat replies, always cite it as:',
+          '  [CloudDoc: <name> | id=<docId>]',
+          '  (Must include `id=<docId>`; never output a bare filename or local path alone.)',
+        ].join('\n'),
+      ),
   );
   addAuthAndFormatOptions(program, true);
 

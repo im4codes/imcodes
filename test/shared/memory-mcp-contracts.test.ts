@@ -13,6 +13,7 @@ import {
   stripForbiddenMcpArgs,
 } from '../../shared/memory-mcp-contracts.js';
 import { PREFERENCE_MAX_BYTES } from '../../shared/preference-ingest.js';
+import { formatCloudDocQuoteBadge } from '../../web/src/cloud-docs-reference.js';
 
 function collectDescriptions(schema: { description?: string; properties?: Readonly<Record<string, unknown>> }): string[] {
   const descriptions: string[] = [];
@@ -455,6 +456,14 @@ describe('memory MCP shared contracts', () => {
     expect(cronUpdate.description).toContain('5 minutes');
     expect((updateProps.action as { description?: string }).description).toContain('send action');
     expect((updateProps.expiresAt as { description?: string }).description).toContain('future sends only');
+  });
+
+  it('documents the canonical CloudDoc chat citation format matching formatCloudDocQuoteBadge', () => {
+    const cloudDocs = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS];
+    const canonicalPattern = formatCloudDocQuoteBadge({ kind: 'cloud_doc', name: '<name>', docId: '<docId>' });
+    expect(canonicalPattern).toBe('[CloudDoc: <name> | id=<docId>]');
+    expect(cloudDocs.description).toContain(canonicalPattern);
+    expect(cloudDocs.description).toContain('id=<docId>');
   });
 
   // ── memory-source-server-routing change ─────────────────────────────

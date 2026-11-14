@@ -35,6 +35,11 @@ const GUIDE_SECTIONS: Record<Exclude<CloudDocsGuideTopic, 'all'>, string> = {
     '  imcodes cloud-docs list [--search <query>] [--folder <id>] [--recent] [--json]',
     '  imcodes cloud-docs read <docId> [--max-chars <n>] [--convert-to <ext>] [--out <path>] [--json]',
     '',
+    'Chat citation format (mandatory when reporting/referencing Cloud Docs in chat replies):',
+    '  [CloudDoc: <name> | id=<docId>]',
+    '  Example: [CloudDoc: Quarterly Report.docx | id=cdoc_01JXYZ...]',
+    '  Must include `id=<docId>`; never emit only a bare filename or local path.',
+    '',
     'All subcommands:',
     '  list       List own/shared Cloud Docs & folders',
     '  read       Extract readable text/tables/slides or convert (--convert-to <ext> --out <path>)',
@@ -82,7 +87,12 @@ const GUIDE_SECTIONS: Record<Exclude<CloudDocsGuideTopic, 'all'>, string> = {
     '   - Single-string MCP `command` preserves Windows backslashes cleanly:',
     '     upload --file "C:\\Users\\Alice\\My Docs\\Plan.docx"',
     '',
-    '4. Exit codes:',
+    '4. Chat citation format (for creating, editing, or mentioning a Cloud Doc in chat):',
+    '   - Always format chat references as: `[CloudDoc: <name> | id=<docId>]`',
+    '   - Example: `[CloudDoc: Q4 Plan.docx | id=cdoc_01JXYZ...]`',
+    '   - Must include `id=<docId>`; never write only a bare filename or local path (so chat preview resolves cleanly).',
+    '',
+    '5. Exit codes:',
     '   - 0 on success',
     '   - Non-zero (1 for API/auth/validation/conflict failures, 2 for CLI syntax errors)',
   ].join('\n'),
@@ -223,6 +233,8 @@ const GUIDE_SECTIONS: Record<Exclude<CloudDocsGuideTopic, 'all'>, string> = {
     '   imcodes cloud-docs edit <docId> --file ./revised.docx --version 2',
     '   imcodes cloud-docs upload ./revised.docx --doc-id <docId> --version 2',
     `   Max upload size: ${Math.floor(CLOUD_DOCS_MAX_UPLOAD_BYTES / (1024 * 1024))} MiB.`,
+    '',
+    'Chat citation format: when reporting a created or edited Cloud Doc in chat, cite `[CloudDoc: <name> | id=<docId>]` (never a bare filename alone).',
   ].join('\n'),
 
   convert: [
@@ -259,6 +271,8 @@ const GUIDE_SECTIONS: Record<Exclude<CloudDocsGuideTopic, 'all'>, string> = {
     '  imcodes cloud-docs share grant --id <docId> --mode user --username alice --role editor',
     '  imcodes cloud-docs share grant --id <folderId> --kind folder --mode team --team-id <teamId> --role viewer --no-allow-download',
     '  imcodes cloud-docs share revoke --share-id <shareId>',
+    '',
+    'Chat citation format: when sharing or mentioning a Cloud Doc in chat, cite `[CloudDoc: <name> | id=<docId>]` (include `id=<docId>`; never output a bare filename alone).',
   ].join('\n'),
 
   troubleshooting: [

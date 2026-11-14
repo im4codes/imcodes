@@ -18,6 +18,7 @@ import {
   IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
 } from '../../src/agent/providers/getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
+import { formatCloudDocQuoteBadge } from '../../web/src/cloud-docs-reference.js';
 
 describe('shared MCP tool distribution contract', () => {
   it('classifies every runtime without making provider activity an activation gate', () => {
@@ -115,5 +116,8 @@ describe('shared MCP tool distribution contract', () => {
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('never infer unavailability from the initial callable list');
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('wildcard/prefix fallback');
     expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('full long-tail publication must fail closed');
+    const canonicalPattern = formatCloudDocQuoteBadge({ kind: 'cloud_doc', name: '<name>', docId: '<docId>' });
+    expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain(canonicalPattern);
+    expect(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS).toContain('id=<docId>');
   });
 });

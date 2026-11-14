@@ -1532,7 +1532,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS]: {
     name: MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
-    description: 'Run the unified Cloud Docs & ONLYOFFICE CLI (`imcodes cloud-docs`). Quick start: `["list"]`, `["list","--search","q"]`, `["read","<docId>"]`, `["docs"]`. Load full ONLYOFFICE DocBuilder/convert/upload/share manuals on demand via `["docs","--topic","quickstart|docx|xlsx|pptx|edit|convert|share|troubleshooting"]`. FULL-node only.',
+    description: 'Run the unified Cloud Docs & ONLYOFFICE CLI (`imcodes cloud-docs`). Quick start: `["list"]`, `["list","--search","q"]`, `["read","<docId>"]`, `["docs"]`. Load full ONLYOFFICE DocBuilder/convert/upload/share manuals on demand via `["docs","--topic","quickstart|docx|xlsx|pptx|edit|convert|share|troubleshooting"]`. When citing or reporting any Cloud Doc in chat replies, use `[CloudDoc: <name> | id=<docId>]` (must include `id=<docId>`; never output a bare filename alone). FULL-node only.',
     inputSchema: objectSchema({
       args: {
         type: 'array',

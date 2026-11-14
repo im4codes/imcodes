@@ -33,6 +33,7 @@ import { sanitizeCloudDocTransferFilename } from '../../src/daemon/cloud-docs-mc
 import { currentDaemonProcessIdentity } from '../../src/daemon/instance-lock.js';
 import { publishHookAuthority } from '../../src/daemon/hook-port.js';
 import { createMemoryMcpServerFromEnv } from '../../src/daemon/memory-mcp-server.js';
+import { formatCloudDocQuoteBadge } from '../../web/src/cloud-docs-reference.js';
 
 interface RecordedHttpRequest {
   method: string;
@@ -141,16 +142,30 @@ describe('imcodes cloud-docs CLI', () => {
   });
 
   it('ships offline progressive-disclosure docs without credentials', async () => {
+    const canonicalPattern = formatCloudDocQuoteBadge({ kind: 'cloud_doc', name: '<name>', docId: '<docId>' });
+    const help = await runCloudDocsCli(['--help'], { env: {} });
+    expect(help.exitCode).toBe(0);
+    expect(help.stdout).toContain('Chat citation format:');
+    expect(help.stdout).toContain(canonicalPattern);
+    expect(help.stdout).toContain('id=<docId>');
+
     const idx = await runCloudDocsCli(['docs'], { env: {} });
     expect(idx.exitCode).toBe(0);
     expect(idx.stdout).toContain('imcodes cloud-docs list');
     expect(idx.stdout).toContain('imcodes cloud-docs read <docId>');
     expect(idx.stdout).toContain('docs --topic docx');
+    expect(idx.stdout).toContain('Chat citation format');
+    expect(idx.stdout).toContain(canonicalPattern);
+    expect(idx.stdout).toContain('id=<docId>');
 
     for (const topic of ['quickstart', 'docx', 'xlsx', 'pptx', 'edit', 'convert', 'share', 'troubleshooting', 'all']) {
       const res = await runCloudDocsCli(['docs', '--topic', topic], { env: {} });
       expect(res.exitCode).toBe(0);
       expect(res.stdout.length).toBeGreaterThan(100);
+      if (topic === 'quickstart' || topic === 'edit' || topic === 'share' || topic === 'all') {
+        expect(res.stdout).toContain(canonicalPattern);
+        expect(res.stdout).toContain('id=<docId>');
+      }
     }
 
     const docxJson = await runCloudDocsCli(['docs', 'docx', '--json'], { env: {} });
