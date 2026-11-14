@@ -315,4 +315,37 @@ final class SpeechGainTests: XCTestCase {
         XCTAssertGreaterThan(finalDecoded, 0)
         XCTAssertLessThanOrEqual(finalDecoded, 400, "Warmup samples must remain discarded before decoding")
     }
+
+    func testRequestRecordPermissionRunsOffMainOnAudioQueueAndResolvesOnMain() {
+        let plugin = StreamingSpeechPlugin()
+        let requesterExp = expectation(description: "requester runs on serial audioQueue off main")
+        let completionExp = expectation(description: "completion resolves back on main")
+
+        var requesterOnMain = true
+        var requesterOnAudioQueue = false
+        var completionOnMain = false
+        var grantedResult = false
+
+        plugin.requestRecordPermission(
+            requester: { finish in
+                requesterOnMain = Thread.isMainThread
+                requesterOnAudioQueue = plugin.isOnAudioQueueForTesting
+                requesterExp.fulfill()
+                DispatchQueue.global(qos: .utility).async {
+                    finish(true)
+                }
+            },
+            completion: { allowed in
+                completionOnMain = Thread.isMainThread
+                grantedResult = allowed
+                completionExp.fulfill()
+            }
+        )
+
+        wait(for: [requesterExp, completionExp], timeout: 2.0)
+        XCTAssertFalse(requesterOnMain)
+        XCTAssertTrue(requesterOnAudioQueue)
+        XCTAssertTrue(completionOnMain)
+        XCTAssertTrue(grantedResult)
+    }
 }

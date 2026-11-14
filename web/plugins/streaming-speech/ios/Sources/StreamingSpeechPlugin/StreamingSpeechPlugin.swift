@@ -584,7 +584,15 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
             self.notifyListeners("recognitionError", data: ["message": message])
         }
     }
-    private let audioQueue = DispatchQueue(label: "com.imcodes.streaming-speech.audio", qos: .userInteractive)
+    private static let audioQueueKey = DispatchSpecificKey<Bool>()
+    private let audioQueue: DispatchQueue = {
+        let queue = DispatchQueue(label: "com.imcodes.streaming-speech.audio", qos: .userInteractive)
+        queue.setSpecific(key: StreamingSpeechPlugin.audioQueueKey, value: true)
+        return queue
+    }()
+    var isOnAudioQueueForTesting: Bool {
+        DispatchQueue.getSpecific(key: Self.audioQueueKey) == true
+    }
     // Audio capture graph & AVAudioSession state are owned strictly by audioQueue.
     private var engine: AVAudioEngine?
     private var tapInstalled = false
@@ -663,8 +671,24 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
     @objc public func available(_ call: CAPPluginCall) { call.resolve(["available": modelAvailable]) }
+    func requestRecordPermission(
+        requester: @escaping (@escaping (Bool) -> Void) -> Void = { completion in
+            AVAudioSession.sharedInstance().requestRecordPermission(completion)
+        },
+        completion: @escaping (Bool) -> Void
+    ) {
+        audioQueue.async {
+            dispatchPrecondition(condition: .onQueue(self.audioQueue))
+            requester { allowed in
+                DispatchQueue.main.async {
+                    completion(allowed)
+                }
+            }
+        }
+    }
+
     @objc public override func requestPermissions(_ call: CAPPluginCall) {
-        AVAudioSession.sharedInstance().requestRecordPermission { allowed in
+        requestRecordPermission { allowed in
             call.resolve(["speechRecognition": allowed ? "granted" : "denied"])
         }
     }
@@ -689,6 +713,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     private func configureAudioSessionCategoryIfNeeded(session: AVAudioSession) throws {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
         let desiredOptions: AVAudioSession.CategoryOptions = [.mixWithOthers, .defaultToSpeaker, .allowBluetooth]
         if audioSessionCategoryConfigured,
            session.category == .playAndRecord,
@@ -705,6 +730,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     private func invalidateEngineOnAudioQueue() {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
         if tapInstalled {
             engine?.inputNode.removeTap(onBus: 0)
             tapInstalled = false
@@ -722,6 +748,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         mono: AVAudioFormat,
         converter: AVAudioConverter
     ) {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
         if let existing = engine {
             let format = existing.inputNode.outputFormat(forBus: 0)
             if format.sampleRate > 0, format.channelCount > 0 {
@@ -764,6 +791,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     private func prewarmAudioOnAudioQueue() {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
         guard !tapInstalled else { return }
         let session = AVAudioSession.sharedInstance()
         try? configureAudioSessionCategoryIfNeeded(session: session)
@@ -781,6 +809,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     private func installTapAndStartOnAudioQueue(owner: UInt64) throws {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
         let installAndStart: (AVAudioEngine, AVAudioFormat, AVAudioFormat, AVAudioConverter) throws -> Void = { eng, fmt, mono, conv in
             if self.tapInstalled {
                 eng.inputNode.removeTap(onBus: 0)
@@ -807,6 +836,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     private func stopCaptureAudioOnAudioQueue(deactivateSession: Bool, forceTeardown: Bool) {
+        dispatchPrecondition(condition: .onQueue(audioQueue))
         if tapInstalled {
             engine?.inputNode.removeTap(onBus: 0)
             tapInstalled = false
