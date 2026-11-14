@@ -730,8 +730,9 @@ public class OrtEnvironment {
   public static final AtomicInteger sessionCreations = new AtomicInteger(0);
   public static OrtEnvironment getEnvironment(OrtLoggingLevel lvl, String name){ return INSTANCE; }
   public OrtSession createSession(String path, OrtSession.SessionOptions opts) throws OrtException {
-    if (opts == null || opts.optLevel != OrtSession.SessionOptions.OptLevel.ALL_OPT || opts.intraThreads != 4) {
-      throw new AssertionError("SessionOptions must set ALL_OPT and 4 threads");
+    int expectedThreads = Math.min(4, Math.max(2, Runtime.getRuntime().availableProcessors() / 2));
+    if (opts == null || opts.optLevel != OrtSession.SessionOptions.OptLevel.ALL_OPT || opts.intraThreads != expectedThreads) {
+      throw new AssertionError("SessionOptions must set ALL_OPT and " + expectedThreads + " threads");
     }
     if (path.endsWith("conv_frontend.onnx")) {
       if (OrtSession.initEntered != null) OrtSession.initEntered.countDown();

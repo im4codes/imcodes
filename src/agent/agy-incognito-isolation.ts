@@ -44,7 +44,7 @@ const AGY_INCOGNITO_DIR_PREFIX = 'imcodes-agy-incog-';
 const OWNER_META_FILENAME = '.imcodes-owner.json';
 const PROCESS_REAP_GRACEFUL_MS = 250;
 const PROCESS_REAP_POLL_MS = 25;
-const PROCESS_KILL_SETTLE_MS = 200;
+const PROCESS_KILL_SETTLE_MS = 500;
 const PS_TIMEOUT_MS = 5_000;
 
 interface AgyIncognitoOwnerMeta {
@@ -320,13 +320,20 @@ function signalPidSafe(pid: number, signal: NodeJS.Signals): boolean {
   }
 }
 
-function signalGroupSafe(pgid: number, signal: NodeJS.Signals): boolean {
+type GroupSignalOutcome = 'ok' | 'eperm' | 'error';
+
+function signalGroupSafe(pgid: number, signal: NodeJS.Signals): GroupSignalOutcome {
   try {
     process.kill(-pgid, signal);
-    return true;
+    return 'ok';
   } catch (err) {
     const code = (err as NodeJS.ErrnoException)?.code;
-    return code === 'ESRCH';
+    if (code === 'ESRCH') return 'ok';
+    // On macOS (XNU), kill(-pgid, sig) can throw EPERM if the group contains
+    // zombie/exited processes. Keep EPERM distinguishable so callers can fall back
+    // to per-PID signaling and ps verification instead of aborting prematurely.
+    if (code === 'EPERM') return 'eperm';
+    return 'error';
   }
 }
 
@@ -397,10 +404,25 @@ function issueTreeSignal(
   ownsGroup: boolean,
   leaderNeedsSignal: boolean,
   signal: NodeJS.Signals,
+  fallbackRows?: readonly PsProcessRow[],
 ): boolean {
   let ok = true;
+  const targetedPids = new Set<number>(orderedDescendants);
+  if (leaderNeedsSignal) targetedPids.add(childPid);
+
   if (ownsGroup) {
-    ok = signalGroupSafe(childPid, signal) && ok;
+    const groupOutcome = signalGroupSafe(childPid, signal);
+    if (groupOutcome === 'eperm') {
+      if (fallbackRows) {
+        for (const row of fallbackRows) {
+          if (!row.isZombie && row.pgid === childPid && !targetedPids.has(row.pid) && isPidAlive(row.pid)) {
+            ok = signalPidSafe(row.pid, signal) && ok;
+          }
+        }
+      }
+    } else if (groupOutcome === 'error') {
+      ok = false;
+    }
   }
   for (const pid of orderedDescendants) {
     if (!isPidAlive(pid)) continue;
@@ -419,18 +441,19 @@ function reapVerifiedPosixChildSync(childPid: number, ownsGroup: boolean, leader
   if (allTargetsCleared(childPid, descendants, ownsGroup, initialRows)) return true;
 
   const orderedDescendants = [...descendants].reverse();
-  if (!issueTreeSignal(childPid, orderedDescendants, ownsGroup, leaderAlive, 'SIGTERM')) {
+  if (!issueTreeSignal(childPid, orderedDescendants, ownsGroup, leaderAlive, 'SIGTERM', initialRows)) {
     return false;
   }
 
+  let latestRows: PsProcessRow[] | null = initialRows;
   const graceDeadline = Date.now() + PROCESS_REAP_GRACEFUL_MS;
   while (Date.now() < graceDeadline) {
     sleepSync(PROCESS_REAP_POLL_MS);
-    const rows = fetchTargetPsRowsSync(childPid, descendants, ownsGroup);
-    if (allTargetsCleared(childPid, descendants, ownsGroup, rows)) return true;
+    latestRows = fetchTargetPsRowsSync(childPid, descendants, ownsGroup);
+    if (allTargetsCleared(childPid, descendants, ownsGroup, latestRows)) return true;
   }
 
-  if (!issueTreeSignal(childPid, orderedDescendants, ownsGroup, true, 'SIGKILL')) {
+  if (!issueTreeSignal(childPid, orderedDescendants, ownsGroup, true, 'SIGKILL', latestRows ?? undefined)) {
     return false;
   }
 
@@ -451,18 +474,19 @@ async function reapVerifiedPosixChildAsync(childPid: number, ownsGroup: boolean,
   if (allTargetsCleared(childPid, descendants, ownsGroup, initialRows)) return true;
 
   const orderedDescendants = [...descendants].reverse();
-  if (!issueTreeSignal(childPid, orderedDescendants, ownsGroup, leaderAlive, 'SIGTERM')) {
+  if (!issueTreeSignal(childPid, orderedDescendants, ownsGroup, leaderAlive, 'SIGTERM', initialRows)) {
     return false;
   }
 
+  let latestRows: PsProcessRow[] | null = initialRows;
   const graceDeadline = Date.now() + PROCESS_REAP_GRACEFUL_MS;
   while (Date.now() < graceDeadline) {
     await sleepAsync(PROCESS_REAP_POLL_MS);
-    const rows = await fetchTargetPsRowsAsync(childPid, descendants, ownsGroup);
-    if (allTargetsCleared(childPid, descendants, ownsGroup, rows)) return true;
+    latestRows = await fetchTargetPsRowsAsync(childPid, descendants, ownsGroup);
+    if (allTargetsCleared(childPid, descendants, ownsGroup, latestRows)) return true;
   }
 
-  if (!issueTreeSignal(childPid, orderedDescendants, ownsGroup, true, 'SIGKILL')) {
+  if (!issueTreeSignal(childPid, orderedDescendants, ownsGroup, true, 'SIGKILL', latestRows ?? undefined)) {
     return false;
   }
 

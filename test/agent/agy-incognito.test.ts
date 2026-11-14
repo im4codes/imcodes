@@ -888,7 +888,99 @@ process.kill(process.pid, 'SIGKILL');
 
     expect(await reclaimOrphanedAgyIncognitoHomes(customTmp)).toBe(1);
     await new Promise((r) => setTimeout(r, 250));
-    expect(pidAlive(info.pid)).toBe(false);
+    expect(pidAlive(info.pid!)).toBe(false);
     expect(existsSync(info.home)).toBe(false);
+  });
+
+  it('handles macOS XNU EPERM on kill(-pgid) for zombie/exited process groups while failing closed on live-PID EPERM', async () => {
+    const customTmp = makeTempDir('agy-incog-eperm-');
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    strayPids.push(child.pid!);
+
+    // 1. Simulated XNU group-kill EPERM when group is zombie/exited after SIGTERM (individual PID kills still work):
+    const orphanDir = path.join(customTmp, 'imcodes-agy-incog-xnu-eperm');
+    mkdirSync(orphanDir, { recursive: true });
+    const startRes = spawnSync('ps', ['-o', 'lstart=', '-p', String(child.pid!)], { encoding: 'utf8' });
+    const lstart = startRes.stdout.trim();
+    writeFileSync(path.join(orphanDir, '.imcodes-owner.json'), JSON.stringify({
+      version: 1,
+      pid: 999_999_999,
+      createdAt: Date.now() - 10_000,
+      childPid: child.pid,
+      ...(process.platform === 'linux' ? {} : { childProcessStart: lstart }),
+      ownsProcessGroup: true,
+    }));
+    // On Linux, also populate childStartTicks so identity verifies:
+    if (process.platform === 'linux') {
+      const stat = readFileSync(`/proc/${child.pid}/stat`, 'utf8');
+      const ticks = stat.slice(stat.lastIndexOf(') ') + 2).trim().split(/\s+/)[19];
+      writeFileSync(path.join(orphanDir, '.imcodes-owner.json'), JSON.stringify({
+        version: 1,
+        pid: 999_999_999,
+        createdAt: Date.now() - 10_000,
+        childPid: child.pid,
+        childStartTicks: ticks,
+        ownsProcessGroup: true,
+      }));
+    }
+
+    const origKill = process.kill.bind(process);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation((pid: number, sig?: string | number) => {
+      if (pid < 0 && sig !== 0) {
+        const err = new Error('Operation not permitted') as NodeJS.ErrnoException;
+        err.code = 'EPERM';
+        throw err;
+      }
+      return origKill(pid, sig as NodeJS.Signals);
+    });
+    try {
+      expect(await reclaimOrphanedAgyIncognitoHomes(customTmp)).toBe(1);
+      expect(existsSync(orphanDir)).toBe(false);
+    } finally {
+      killSpy.mockRestore();
+    }
+
+    // 2. Real EPERM on an individual live PID must still fail closed and preserve the directory:
+    const guarded = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    strayPids.push(guarded.pid!);
+    const guardedDir = path.join(customTmp, 'imcodes-agy-incog-live-eperm');
+    mkdirSync(guardedDir, { recursive: true });
+    let guardedMeta: Record<string, unknown> = {
+      version: 1,
+      pid: 999_999_999,
+      createdAt: Date.now() - 10_000,
+      childPid: guarded.pid,
+      ownsProcessGroup: true,
+    };
+    if (process.platform === 'linux') {
+      const stat = readFileSync(`/proc/${guarded.pid}/stat`, 'utf8');
+      guardedMeta = { ...guardedMeta, childStartTicks: stat.slice(stat.lastIndexOf(') ') + 2).trim().split(/\s+/)[19] };
+    } else {
+      const s = spawnSync('ps', ['-o', 'lstart=', '-p', String(guarded.pid!)], { encoding: 'utf8' });
+      guardedMeta = { ...guardedMeta, childProcessStart: s.stdout.trim() };
+    }
+    writeFileSync(path.join(guardedDir, '.imcodes-owner.json'), JSON.stringify(guardedMeta));
+
+    const pidEpermSpy = vi.spyOn(process, 'kill').mockImplementation((pid: number, sig?: string | number) => {
+      if ((pid === guarded.pid || pid === -guarded.pid!) && sig !== 0) {
+        const err = new Error('Operation not permitted') as NodeJS.ErrnoException;
+        err.code = 'EPERM';
+        throw err;
+      }
+      return origKill(pid, sig as NodeJS.Signals);
+    });
+    try {
+      expect(await reclaimOrphanedAgyIncognitoHomes(customTmp)).toBe(0);
+      expect(existsSync(guardedDir)).toBe(true);
+    } finally {
+      pidEpermSpy.mockRestore();
+      try { origKill(guarded.pid!, 'SIGKILL'); } catch { /* noop */ }
+    }
   });
 });

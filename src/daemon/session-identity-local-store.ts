@@ -101,14 +101,17 @@ registerMemoryProbe('identityStore', () => ({
 
 let activeDb: DatabaseSyncInstance | null = null;
 let activeDbPath: string | null = null;
-let lastExportedJsonMtime = 0;
+let lastSyncedJsonSignature = '';
+
+function formatJsonStatSignature(st: { ino: number | bigint; size: number | bigint; mtimeMs: number }): string {
+  return `${st.ino}:${st.size}:${st.mtimeMs}`;
+}
 
 function currentJsonSignature(): string {
   const jsonPath = localSessionIdentityStorePath();
   if (!existsSync(jsonPath)) return '0:0:0';
   try {
-    const st = statSync(jsonPath);
-    return `${st.ino}:${st.size}:${st.mtimeMs}`;
+    return formatJsonStatSignature(statSync(jsonPath));
   } catch {
     return '0:0:0';
   }
@@ -161,9 +164,9 @@ function migrateLegacyJson(db: DatabaseSyncInstance): void {
         db.prepare(`INSERT OR REPLACE INTO session_identity_meta (key, value) VALUES ('legacy_json_migrated', '1')`).run();
         db.exec('COMMIT');
         try {
-          lastExportedJsonMtime = statSync(jsonPath).mtimeMs;
+          lastSyncedJsonSignature = formatJsonStatSignature(statSync(jsonPath));
         } catch {
-          lastExportedJsonMtime = Date.now();
+          lastSyncedJsonSignature = '';
         }
         logger.info({ profiles: Object.keys(parsed.profiles).length }, 'Migrated session-identities.json to SQLite');
       } catch (err) {
@@ -187,7 +190,8 @@ function syncExternalJsonChangesIfAny(db: DatabaseSyncInstance): void {
   } catch {
     return;
   }
-  if (Math.abs(st.mtimeMs - lastExportedJsonMtime) < 1) return;
+  const jsonSignature = formatJsonStatSignature(st);
+  if (jsonSignature === lastSyncedJsonSignature) return;
 
   let raw: string;
   try {
@@ -205,7 +209,7 @@ function syncExternalJsonChangesIfAny(db: DatabaseSyncInstance): void {
     try {
       db.exec('DELETE FROM session_identity_profiles');
       db.exec('COMMIT');
-      lastExportedJsonMtime = st.mtimeMs;
+      lastSyncedJsonSignature = jsonSignature;
     } catch {
       db.exec('ROLLBACK');
     }
@@ -240,7 +244,7 @@ function syncExternalJsonChangesIfAny(db: DatabaseSyncInstance): void {
         db.prepare(`DELETE FROM session_identity_meta WHERE key = 'migrated_at'`).run();
       }
       db.exec('COMMIT');
-      lastExportedJsonMtime = st.mtimeMs;
+      lastSyncedJsonSignature = jsonSignature;
     } catch (err) {
       db.exec('ROLLBACK');
       throw err;
@@ -296,9 +300,9 @@ function exportCompatJsonSync(db: DatabaseSyncInstance): void {
   renameSync(temporary, jsonPath);
 
   try {
-    lastExportedJsonMtime = statSync(jsonPath).mtimeMs;
+    lastSyncedJsonSignature = formatJsonStatSignature(statSync(jsonPath));
   } catch {
-    lastExportedJsonMtime = Date.now();
+    lastSyncedJsonSignature = '';
   }
 }
 
@@ -731,7 +735,7 @@ export function resetIdentityStoreCacheForTests(): void {
   activeDbPath = null;
   cachedSnapshot = null;
   inFlightLoad = null;
-  lastExportedJsonMtime = 0;
+  lastSyncedJsonSignature = '';
   readStats.loads = 0;
   readStats.cacheHits = 0;
   readStats.sharedLoads = 0;

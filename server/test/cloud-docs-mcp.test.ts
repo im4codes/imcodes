@@ -437,39 +437,28 @@ describe('cloud docs MCP tools', () => {
     );
   }
 
-  it('registers Cloud Docs tools lazily behind mcp_tool_search on FULL nodes and excludes them on CONTROLLED nodes', async () => {
+  it('registers Cloud Docs tool lazily behind mcp_tool_search on FULL nodes and excludes it on CONTROLLED nodes', async () => {
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     const server = createMemoryMcpServer(makeCaller(), { nodeRole: NODE_ROLE.FULL });
     const client = new Client({ name: 'test-client', version: '1.0.0' });
     await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
 
     const initialTools = (await client.listTools()).tools.map((t) => t.name);
-    expect(initialTools).not.toContain(MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_LIST);
+    expect(initialTools).not.toContain(MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS);
 
     await client.callTool({ name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: 'group:cloud-docs' } });
     const expandedTools = (await client.listTools()).tools.map((t) => t.name);
-    for (const tool of [
-      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_LIST,
-      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_READ,
-      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_CREATE,
-      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_EDIT,
-      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_DELETE,
-      MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_SHARE,
-    ]) {
-      expect(expandedTools).toContain(tool);
-    }
+    expect(expandedTools).toContain(MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS);
     await Promise.all([client.close(), server.close()]);
 
-    // Controlled node excludes all 6 tools even after group:cloud-docs search
+    // Controlled node excludes cloud_docs even after group:cloud-docs search
     const [ctrlClientT, ctrlServerT] = InMemoryTransport.createLinkedPair();
     const ctrlServer = createMemoryMcpServer(makeCaller(), { nodeRole: NODE_ROLE.CONTROLLED });
     const ctrlClient = new Client({ name: 'ctrl-client', version: '1.0.0' });
     await Promise.all([ctrlServer.connect(ctrlServerT), ctrlClient.connect(ctrlClientT)]);
     await ctrlClient.callTool({ name: MCP_TOOL_DISCOVERY_NAME, arguments: { query: 'group:cloud-docs' } });
     const ctrlTools = (await ctrlClient.listTools()).tools.map((t) => t.name);
-    expect(ctrlTools).not.toContain(MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_LIST);
-    expect(ctrlTools).not.toContain(MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_CREATE);
-    expect(ctrlTools).not.toContain(MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_SHARE);
+    expect(ctrlTools).not.toContain(MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS);
     await Promise.all([ctrlClient.close(), ctrlServer.close()]);
   });
 
@@ -481,9 +470,9 @@ describe('cloud docs MCP tools', () => {
       loadCredential: async () => null,
       fetchImpl: fetchSpy,
     });
-    expect(await unboundDeps.listDocs({})).toMatchObject({
-      status: 'error',
-      reason: MCP_ERROR_REASONS.FEATURE_DISABLED,
+    expect(await unboundDeps.runCli(['list'])).toMatchObject({
+      exitCode: 1,
+      errorReason: MCP_ERROR_REASONS.FEATURE_DISABLED,
     });
     expect(fetchSpy).not.toHaveBeenCalled();
 
@@ -493,9 +482,9 @@ describe('cloud docs MCP tools', () => {
       loadSharedMachineAuthority: async () => { throw new Error('hook_unreachable'); },
       fetchImpl: fetchSpy,
     });
-    expect(await brokenAuthDeps.readDoc({ docId: 'd1' })).toMatchObject({
-      status: 'error',
-      reason: MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE,
+    expect(await brokenAuthDeps.runCli(['read', 'd1'])).toMatchObject({
+      exitCode: 1,
+      errorReason: MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE,
     });
     expect(fetchSpy).not.toHaveBeenCalled();
 
@@ -516,18 +505,18 @@ describe('cloud docs MCP tools', () => {
         return new Response(JSON.stringify({ error: 'conflict' }), { status: 409 });
       },
     });
-    expect(await dynamicDeps.editDoc({ docId: 'd1', content: 'x' })).toMatchObject({
-      status: 'error',
-      reason: MCP_ERROR_REASONS.REVISION_CONFLICT,
+    expect(await dynamicDeps.runCli(['edit', 'd1', '--content', 'x'])).toMatchObject({
+      exitCode: 1,
+      errorReason: MCP_ERROR_REASONS.REVISION_CONFLICT,
     });
     currentAuthority = null;
-    expect(await dynamicDeps.deleteDoc({ id: 'd1' })).toMatchObject({
-      status: 'error',
-      reason: MCP_ERROR_REASONS.REVISION_CONFLICT,
+    expect(await dynamicDeps.runCli(['delete', 'd1'])).toMatchObject({
+      exitCode: 1,
+      errorReason: MCP_ERROR_REASONS.REVISION_CONFLICT,
     });
   });
 
-  it('executes full end-to-end owner and shared participant workflows across all 6 MCP tools against server routes', async () => {
+  it('executes full end-to-end owner and shared participant workflows through cloud_docs MCP tool against server routes', async () => {
     let activeTurnAuthority: string | null = null;
     const cloudDocsDeps = createDaemonCloudDocsToolDeps({
       loadCredential: async () => ({ serverUrl: SERVER_URL, serverId: 'srv-1', token: 'srv-1-token' }),
@@ -538,167 +527,139 @@ describe('cloud docs MCP tools', () => {
       nodeRole: NODE_ROLE.FULL,
       cloudDocsDeps,
     });
+    const cloudDocs = handlers[MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS];
 
     // Owner creates private doc, shared folder, and viewer doc
-    const privateCreate = await handlers[MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_CREATE]({
-      type: 'docx',
-      name: 'OwnerRoadmap',
-      content: 'Q4 Launch Plan',
+    const privateCreate = await cloudDocs({
+      args: ['create', '--type', 'docx', '--name', 'OwnerRoadmap', '--content', 'Q4 Launch Plan'],
     });
-    expect(privateCreate).toMatchObject({ status: 'ok', doc: { name: 'OwnerRoadmap.docx', docVersion: 1 } });
-    const privateDocId = (privateCreate as { doc: { id: string } }).doc.id;
+    expect(privateCreate).toMatchObject({ status: 'ok', data: { doc: { name: 'OwnerRoadmap.docx', docVersion: 1 } } });
+    const privateDocId = (privateCreate as { data: { doc: { id: string } } }).data.doc.id;
 
-    const folderCreate = await handlers[MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_CREATE]({
-      kind: 'folder',
-      name: 'TeamWorkspace',
+    const folderCreate = await cloudDocs({
+      args: ['mkdir', 'TeamWorkspace'],
     });
-    expect(folderCreate).toMatchObject({ status: 'ok', folder: { name: 'TeamWorkspace' } });
-    const folderId = (folderCreate as { folder: { id: string } }).folder.id;
+    expect(folderCreate).toMatchObject({ status: 'ok', data: { folder: { name: 'TeamWorkspace' } } });
+    const folderId = (folderCreate as { data: { folder: { id: string } } }).data.folder.id;
 
-    const viewerDocCreate = await handlers[MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_CREATE]({
-      type: 'md',
-      name: 'Handbook',
-      content: 'Readonly Policy',
+    const viewerDocCreate = await cloudDocs({
+      args: ['create', '--type', 'md', '--name', 'Handbook', '--content', 'Readonly Policy'],
     });
-    const viewerDocId = (viewerDocCreate as { doc: { id: string } }).doc.id;
+    const viewerDocId = (viewerDocCreate as { data: { doc: { id: string } } }).data.doc.id;
 
     // Owner reads teams, grants editor share on folder + viewer share on doc, lists shares
-    const teamsRes = await handlers[MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_SHARE]({ action: 'list_teams' });
-    expect(teamsRes).toMatchObject({ status: 'ok', teams: [{ id: 'team-1', name: 'Docs Team' }] });
+    const teamsRes = await cloudDocs({ args: ['share', 'list-teams'] });
+    expect(teamsRes).toMatchObject({ status: 'ok', data: { teams: [{ id: 'team-1', name: 'Docs Team' }] } });
 
-    const grantFolderShare = await handlers[MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_SHARE]({
-      action: 'grant',
-      targetKind: 'folder',
-      targetId: folderId,
-      shareMode: 'user',
-      targetUsername: 'bob',
-      role: 'editor',
-      allowDownload: true,
+    const grantFolderShare = await cloudDocs({
+      args: ['share', 'grant', '--kind', 'folder', '--id', folderId, '--mode', 'user', '--username', 'bob', '--role', 'editor', '--allow-download'],
     });
-    expect(grantFolderShare).toMatchObject({ status: 'ok', share: { role: 'editor', targetKind: 'folder' } });
+    expect(grantFolderShare).toMatchObject({ status: 'ok', data: { share: { role: 'editor', targetKind: 'folder' } } });
 
-    const grantViewerShare = await handlers[MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_SHARE]({
-      action: 'grant',
-      targetKind: 'doc',
-      targetId: viewerDocId,
-      shareMode: 'user',
-      targetUsername: 'bob',
-      role: 'viewer',
-      allowDownload: true,
+    const grantViewerShare = await cloudDocs({
+      args: ['share', 'grant', '--kind', 'doc', '--id', viewerDocId, '--mode', 'user', '--username', 'bob', '--role', 'viewer', '--allow-download'],
     });
-    expect(grantViewerShare).toMatchObject({ status: 'ok', share: { role: 'viewer' } });
-    const viewerShareId = (grantViewerShare as { share: { id: string } }).share.id;
+    expect(grantViewerShare).toMatchObject({ status: 'ok', data: { share: { role: 'viewer' } } });
+    const viewerShareId = (grantViewerShare as { data: { share: { id: string } } }).data.share.id;
 
     // Switch turn to participant bob
     activeTurnAuthority = mintBobParticipantToken();
 
-    const bobList = await handlers[MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_LIST]({});
+    const bobList = await cloudDocs({ args: ['list'] });
     expect(bobList).toMatchObject({ status: 'ok' });
-    const bobListPayload = bobList as { docs: Array<{ id: string }>; sharedDocs: Array<{ id: string }>; sharedFolders: Array<{ id: string }> };
+    const bobListPayload = (bobList as {
+      data: { docs: Array<{ id: string }>; sharedDocs: Array<{ id: string }>; sharedFolders: Array<{ id: string }> };
+    }).data;
     expect(bobListPayload.docs.map((d) => d.id)).not.toContain(privateDocId);
     expect(bobListPayload.sharedFolders.map((f) => f.id)).toContain(folderId);
     expect(bobListPayload.sharedDocs.map((d) => d.id)).toContain(viewerDocId);
 
     // Participant bob reads viewer doc cleanly, but edit/delete/share fail closed with scope_forbidden
-    const bobReadViewer = await handlers[MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_READ]({ docId: viewerDocId });
-    expect(bobReadViewer).toMatchObject({ status: 'ok', content: 'Readonly Policy', role: 'viewer' });
+    const bobReadViewer = await cloudDocs({ args: ['read', viewerDocId] });
+    expect(bobReadViewer).toMatchObject({ status: 'ok', data: { content: 'Readonly Policy', role: 'viewer' } });
 
-    const bobEditViewer = await handlers[MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_EDIT]({
-      docId: viewerDocId,
-      content: 'Tamper',
-      mode: 'replace',
+    const bobEditViewer = await cloudDocs({
+      args: ['edit', viewerDocId, '--content', 'Tamper', '--mode', 'replace'],
     });
     expect(bobEditViewer).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN });
 
     // Participant bob creates + reads + appends .xlsx inside shared editor folder
-    const bobCreateXlsx = await handlers[MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_CREATE]({
-      type: 'xlsx',
-      name: 'Metrics',
-      folderId,
-      content: 'KPI\tValue\nLatency\t12',
+    const bobCreateXlsx = await cloudDocs({
+      args: ['create', '--type', 'xlsx', '--name', 'Metrics', '--folder', folderId, '--content', 'KPI\tValue\nLatency\t12'],
     });
-    expect(bobCreateXlsx).toMatchObject({ status: 'ok', doc: { name: 'Metrics.xlsx', folderId, docVersion: 1 } });
-    const metricsDocId = (bobCreateXlsx as { doc: { id: string } }).doc.id;
+    expect(bobCreateXlsx).toMatchObject({ status: 'ok', data: { doc: { name: 'Metrics.xlsx', folderId, docVersion: 1 } } });
+    const metricsDocId = (bobCreateXlsx as { data: { doc: { id: string } } }).data.doc.id;
 
-    const bobEditMetrics = await handlers[MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_EDIT]({
-      docId: metricsDocId,
-      content: 'Throughput\t450',
-      mode: 'append',
-      expectedVersion: 1,
+    const bobEditMetrics = await cloudDocs({
+      args: ['edit', metricsDocId, '--content', 'Throughput\t450', '--mode', 'append', '--version', '1'],
     });
-    expect(bobEditMetrics).toMatchObject({ status: 'ok', doc: { docVersion: 2 }, role: 'editor' });
+    expect(bobEditMetrics).toMatchObject({ status: 'ok', data: { doc: { docVersion: 2 }, role: 'editor' } });
 
     // F4 regression counterexample: combined content + forbidden root move rejects atomically
     // with zero partial mutation to content, docVersion, or name.
-    const forbiddenComboEdit = await handlers[MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_EDIT]({
-      docId: metricsDocId,
-      content: 'SHOULD_NOT_PERSIST\t999',
-      mode: 'append',
-      name: 'ShouldNotRename',
-      folderId: null,
-      expectedVersion: 2,
+    const forbiddenComboEdit = await cloudDocs({
+      args: ['edit', metricsDocId, '--content', 'SHOULD_NOT_PERSIST\t999', '--mode', 'append', '--name', 'ShouldNotRename', '--root', '--version', '2'],
     });
     expect(forbiddenComboEdit).toMatchObject({
       status: 'error',
       reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN,
     });
-    const afterRejectedCombo = await handlers[MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_READ]({ docId: metricsDocId });
+    const afterRejectedCombo = await cloudDocs({ args: ['read', metricsDocId] });
     expect(afterRejectedCombo).toMatchObject({
       status: 'ok',
-      doc: { docVersion: 2, name: 'Metrics.xlsx', folderId },
-      sheets: [{ name: 'Sheet1', rows: [['KPI', 'Value'], ['Latency', '12'], ['Throughput', '450']] }],
+      data: {
+        doc: { docVersion: 2, name: 'Metrics.xlsx', folderId },
+        sheets: [{ name: 'Sheet1', rows: [['KPI', 'Value'], ['Latency', '12'], ['Throughput', '450']] }],
+      },
     });
 
     // Valid combined content append + rename succeeds atomically in a single version bump (2 -> 3)
-    const validComboEdit = await handlers[MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_EDIT]({
-      docId: metricsDocId,
-      content: 'Availability\t99.9',
-      mode: 'append',
-      name: 'MetricsRenamed',
-      expectedVersion: 2,
+    const validComboEdit = await cloudDocs({
+      args: ['edit', metricsDocId, '--content', 'Availability\t99.9', '--mode', 'append', '--name', 'MetricsRenamed', '--version', '2'],
     });
     expect(validComboEdit).toMatchObject({
       status: 'ok',
-      doc: { docVersion: 3, name: 'MetricsRenamed.xlsx', folderId },
-      role: 'editor',
+      data: { doc: { docVersion: 3, name: 'MetricsRenamed.xlsx', folderId }, role: 'editor' },
     });
 
-    const bobReadMetrics = await handlers[MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_READ]({ docId: metricsDocId });
+    const bobReadMetrics = await cloudDocs({ args: ['read', metricsDocId] });
     expect(bobReadMetrics).toMatchObject({
       status: 'ok',
-      format: 'xlsx',
-      sheets: [{
-        name: 'Sheet1',
-        rows: [['KPI', 'Value'], ['Latency', '12'], ['Throughput', '450'], ['Availability', '99.9']],
-      }],
+      data: {
+        format: 'xlsx',
+        sheets: [{
+          name: 'Sheet1',
+          rows: [['KPI', 'Value'], ['Latency', '12'], ['Throughput', '450'], ['Availability', '99.9']],
+        }],
+      },
     });
 
     // Participant bob cannot delete or manage shares on shared doc
-    expect(await handlers[MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_DELETE]({ id: metricsDocId })).toMatchObject({
+    expect(await cloudDocs({ args: ['delete', metricsDocId] })).toMatchObject({
       status: 'error',
       reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN,
     });
-    expect(await handlers[MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_SHARE]({ action: 'list', targetKind: 'doc', targetId: metricsDocId })).toMatchObject({
+    expect(await cloudDocs({ args: ['share', 'list', metricsDocId] })).toMatchObject({
       status: 'error',
       reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN,
     });
 
     // Tampered authority fails closed (never falls back to host owner)
     activeTurnAuthority = 'tampered.authority.jwt';
-    expect(await handlers[MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_READ]({ docId: privateDocId })).toMatchObject({
+    expect(await cloudDocs({ args: ['read', privateDocId] })).toMatchObject({
       status: 'error',
       reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN,
     });
 
     // Return to host owner turn -> can revoke share and delete private doc
     activeTurnAuthority = null;
-    expect(await handlers[MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_SHARE]({ action: 'revoke', shareId: viewerShareId })).toMatchObject({
+    expect(await cloudDocs({ args: ['share', 'revoke', viewerShareId] })).toMatchObject({
       status: 'ok',
-      ok: true,
+      data: { ok: true },
     });
-    expect(await handlers[MEMORY_MCP_TOOL_NAMES.CLOUD_DOC_DELETE]({ id: privateDocId })).toMatchObject({
+    expect(await cloudDocs({ args: ['delete', privateDocId] })).toMatchObject({
       status: 'ok',
-      ok: true,
+      data: { ok: true },
     });
 
     // Controlled node credentials are still rejected at the server boundary
@@ -706,9 +667,9 @@ describe('cloud docs MCP tools', () => {
       loadCredential: async () => ({ serverUrl: SERVER_URL, serverId: 'srv-ctrl', token: 'srv-ctrl-token' }),
       fetchImpl: appFetchAdapter(),
     });
-    expect(await ctrlDeps.listDocs({})).toMatchObject({
-      status: 'error',
-      reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN,
+    expect(await ctrlDeps.runCli(['list'])).toMatchObject({
+      exitCode: 1,
+      errorReason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN,
     });
     expect(createMemoryMcpServerFromEnv).toBeTypeOf('function');
   });
