@@ -4205,6 +4205,7 @@ function InternalMainApp() {
       setSelectedSharedEntryId(entry.id);
       rememberSharedTab(entry);
       setManualDashboard(false);
+      selectedServerIdRef.current = opened.server.id;
       setSelectedServerId(opened.server.id);
       setSelectedServerName(opened.server.name);
       setServers((prev) => (
@@ -7455,6 +7456,7 @@ function InternalMainApp() {
     serverId: string;
     serverName: string;
     sessionName?: string | null;
+    sharedEntryId?: string | null;
     switchKind: 'server' | 'session';
     shortcutKeycaps: string[];
     nonce: number;
@@ -7462,8 +7464,8 @@ function InternalMainApp() {
   const dismissServerSwitchWatermark = useCallback(() => {
     setServerSwitchWatermark(null);
   }, []);
-  const orderedServersNavRef = useRef(orderedServers);
-  orderedServersNavRef.current = orderedServers;
+  const unifiedServersNavRef = useRef(unifiedServers);
+  unifiedServersNavRef.current = unifiedServers;
   const orderedTabsNavRef = useRef(orderedVisibleMainSessions);
   orderedTabsNavRef.current = orderedVisibleMainSessions;
   const resolvedShortcutSlotsRef = useRef(resolvedShortcutSlots);
@@ -7475,6 +7477,8 @@ function InternalMainApp() {
     || mobileRemoteSurfaceActive;
   const handleSelectServerNavRef = useRef(handleSelectServer);
   handleSelectServerNavRef.current = handleSelectServer;
+  const handleOpenSharedEntryNavRef = useRef(handleOpenSharedEntry);
+  handleOpenSharedEntryNavRef.current = handleOpenSharedEntry;
   const selectMainSessionTabNavRef = useRef(selectMainSessionTab);
   selectMainSessionTabNavRef.current = selectMainSessionTab;
   const manualDashboardRef = useRef(manualDashboard);
@@ -7491,23 +7495,30 @@ function InternalMainApp() {
     shortcutKeycaps: readonly string[],
     minCount = 1,
   ): boolean => {
-    const serversList = orderedServersNavRef.current;
+    const serversList = unifiedServersNavRef.current;
     if (serversList.length < minCount) return false;
+    const currentServerId = sharedOpenIntentRef.current?.serverId ?? selectedServerIdRef.current;
     const nextId = cycleOrderedId(
       serversList.map((srv) => srv.id),
-      selectedServerIdRef.current,
+      currentServerId,
       direction,
     );
     const nextServer = nextId ? serversList.find((srv) => srv.id === nextId) : null;
-    if (nextServer && nextServer.id !== selectedServerIdRef.current) {
+    if (nextServer && (nextServer.id !== currentServerId || (selectedShareTargetNavRef.current !== null && !nextServer.isSharedIn))) {
+      const targetSharedEntry = nextServer.isSharedIn ? (nextServer.sharedEntry ?? null) : null;
       setServerSwitchWatermark((prev) => ({
         serverId: nextServer.id,
         serverName: nextServer.name || nextServer.id,
+        sharedEntryId: targetSharedEntry?.id ?? null,
         switchKind: 'server',
         shortcutKeycaps: [...shortcutKeycaps],
         nonce: (prev?.nonce ?? 0) + 1,
       }));
-      void handleSelectServerNavRef.current(nextServer.id, nextServer.name);
+      if (targetSharedEntry) {
+        void handleOpenSharedEntryNavRef.current(targetSharedEntry);
+      } else {
+        void handleSelectServerNavRef.current(nextServer.id, nextServer.name);
+      }
     }
     return true;
   }, []);
@@ -7527,10 +7538,11 @@ function InternalMainApp() {
       direction,
     );
     if (nextName && nextName !== activeSessionRef.current) {
-      if (watermarkKeycaps && selectedShareTargetNavRef.current === null) {
+      const shareTarget = selectedShareTargetNavRef.current;
+      if (watermarkKeycaps && (!shareTarget || shareTarget.kind === 'server')) {
         const nextSession = tabsList.find((session) => session.name === nextName);
         const serverName = resolvedSelectedServerNameNavRef.current
-          || orderedServersNavRef.current.find((srv) => srv.id === serverId)?.name
+          || unifiedServersNavRef.current.find((srv) => srv.id === serverId)?.name
           || serverId;
         const sessionLabel = nextSession
           ? (nextSession.label || nextSession.project || nextSession.name)
@@ -7612,10 +7624,22 @@ function InternalMainApp() {
 
   useEffect(() => {
     if (!serverSwitchWatermark) return;
-    if (manualDashboard || selectedShareTarget !== null || (selectedServerId && selectedServerId !== serverSwitchWatermark.serverId)) {
+    const isRestrictedTabWatermark =
+      serverSwitchWatermark.switchKind !== 'server'
+      && selectedShareTarget !== null
+      && selectedShareTarget.kind !== 'server';
+    const isPendingSharedTarget = Boolean(
+      serverSwitchWatermark.sharedEntryId
+      && openingSharedEntryId === serverSwitchWatermark.sharedEntryId,
+    );
+    if (
+      manualDashboard
+      || (isRestrictedTabWatermark && !isPendingSharedTarget)
+      || (selectedServerId && selectedServerId !== serverSwitchWatermark.serverId && !isPendingSharedTarget)
+    ) {
       setServerSwitchWatermark(null);
     }
-  }, [manualDashboard, selectedServerId, selectedShareTarget, serverSwitchWatermark]);
+  }, [manualDashboard, openingSharedEntryId, selectedServerId, selectedShareTarget, serverSwitchWatermark]);
 
   // Desktop auto-focus composer input when switching servers, tabs, or sub-session windows.
   // Track requested navigation intent independently of whether the target is currently
@@ -10311,11 +10335,23 @@ function InternalMainApp() {
       />
 
       {(() => {
+        const isAllowedWatermarkTarget =
+          serverSwitchWatermark?.switchKind === 'server'
+          || selectedShareTarget === null
+          || selectedShareTarget.kind === 'server';
         const watermarkTargetMatches =
           serverSwitchWatermark !== null
           && !manualDashboard
-          && selectedShareTarget === null
+          && isAllowedWatermarkTarget
           && selectedServerId === serverSwitchWatermark.serverId;
+        const isPendingSharedWatermark =
+          serverSwitchWatermark !== null
+          && !manualDashboard
+          && selectedServerId !== serverSwitchWatermark.serverId
+          && Boolean(
+            serverSwitchWatermark.sharedEntryId
+            && openingSharedEntryId === serverSwitchWatermark.sharedEntryId,
+          );
         const watermarkSessionName = watermarkTargetMatches
           ? (serverSwitchWatermark.sessionName !== undefined
             ? serverSwitchWatermark.sessionName
@@ -10327,7 +10363,9 @@ function InternalMainApp() {
           ? (sessionsLoaded
             ? trans('session.no_session', { defaultValue: 'No session' })
             : trans('common.loading', { defaultValue: 'Loading…' }))
-          : null;
+          : isPendingSharedWatermark
+            ? trans('common.loading', { defaultValue: 'Loading…' })
+            : null;
         return (
           <ServerSwitchWatermark
             visible={serverSwitchWatermark !== null}

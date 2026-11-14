@@ -136,7 +136,8 @@ export function getServerPresence(
 }
 
 function grantScore(grant: SharedEntrySummary): number {
-  return (grant.target.kind === 'server' ? 10 : 0) + (grant.role === 'participant' ? 2 : 1);
+  const kindScore = grant.target.kind === 'server' ? 20 : grant.target.kind === 'main' ? 10 : 0;
+  return kindScore + (grant.role === 'participant' ? 2 : 1);
 }
 
 function compareGrants(a: SharedEntrySummary, b: SharedEntrySummary): number {
@@ -145,8 +146,16 @@ function compareGrants(a: SharedEntrySummary, b: SharedEntrySummary): number {
   return a.id.localeCompare(b.id);
 }
 
+function resolveSharedServerDisplayName(grant: SharedEntrySummary, inventoryServerName?: string | null): string {
+  if (grant.target.kind === 'server') {
+    return grant.targetLabel?.trim() || grant.serverName || inventoryServerName?.trim() || grant.serverId;
+  }
+  return grant.serverName?.trim() || inventoryServerName?.trim() || grant.targetLabel?.trim() || grant.serverId;
+}
+
 /**
- * Project a unified server list combining owned/opened servers with active whole-server shared entries.
+ * Project a unified server list combining owned/opened servers with deduplicated active shared entries
+ * (both whole-server shares and merged per-server session/subsession shares).
  * Deduplicates by serverId: owned servers take precedence and never downgrade ownership.
  * Non-owned servers in inventory retain their active shared grant to preserve scoped navigation proof.
  * Shared entries without prior verified heartbeat classify distinctly as presence: 'unknown'.
@@ -199,9 +208,7 @@ export function projectUnifiedServerList<T extends OnlineServerInfo>(
       const grant = bestGrantByServerId.get(server.id);
       if (grant) {
         seenServerIds.add(server.id);
-        const displayName = (grant.target.kind === 'server' && grant.targetLabel && grant.targetLabel.trim())
-          ? grant.targetLabel.trim()
-          : (server.name || grant.serverName);
+        const displayName = resolveSharedServerDisplayName(grant, server.name);
 
         const observation = resolveCoherentPresenceObservation(server, grant);
         const presence = classifyServerPresence(observation, now);
@@ -230,15 +237,13 @@ export function projectUnifiedServerList<T extends OnlineServerInfo>(
     }
   }
 
-  // 3. Newly discovered whole-server shares not yet in servers inventory
+  // 3. Newly discovered shared-in entries (whole-server OR merged session/subsession shares) not yet in inventory
   for (const [serverId, grant] of bestGrantByServerId.entries()) {
-    if (grant.target.kind !== 'server' || seenServerIds.has(serverId) || ownedServerIds.has(serverId)) {
+    if (seenServerIds.has(serverId) || ownedServerIds.has(serverId)) {
       continue;
     }
     seenServerIds.add(serverId);
-    const displayName = (grant.targetLabel && grant.targetLabel.trim())
-      ? grant.targetLabel.trim()
-      : grant.serverName;
+    const displayName = resolveSharedServerDisplayName(grant);
 
     const observation = resolveCoherentPresenceObservation(null, grant);
     const presence = classifyServerPresence(observation, now);

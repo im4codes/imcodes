@@ -142,6 +142,58 @@ describe('ServerIconBar navigation with unified servers', () => {
     const returnArrow = sharedBtn.querySelector('.share-state-indicator-shared-in svg.share-state-icon-return');
     expect(returnArrow).not.toBeNull();
   });
+
+  it('renders deduplicated merged shared-session virtual servers once per serverId in ServerIconBar and routes click to best grant', () => {
+    const sharedSessionGrants: SharedEntrySummary[] = [
+      {
+        id: 'grant-sub-1',
+        serverId: 'srv-cluster',
+        serverName: 'Merged Cluster',
+        role: 'participant',
+        status: 'active',
+        target: { kind: 'subsession', serverId: 'srv-cluster', sessionName: 'deck_sub_1', subSessionId: 'sub1' },
+        targetLabel: 'Sub 1',
+      },
+      {
+        id: 'grant-main-1',
+        serverId: 'srv-cluster',
+        serverName: 'Merged Cluster',
+        role: 'viewer',
+        status: 'active',
+        target: { kind: 'main', serverId: 'srv-cluster', sessionName: 'deck_main_1' },
+        targetLabel: 'Main 1',
+      },
+      {
+        id: 'grant-sub-2',
+        serverId: 'srv-cluster',
+        serverName: 'Merged Cluster',
+        role: 'viewer',
+        status: 'active',
+        target: { kind: 'subsession', serverId: 'srv-cluster', sessionName: 'deck_sub_2', subSessionId: 'sub2' },
+        targetLabel: 'Sub 2',
+      },
+    ];
+    const projected = projectUnifiedServerList(
+      [{ id: 'srv-owned', name: 'Primary Node', status: 'online', lastHeartbeatAt: Date.now(), createdAt: 1000 }],
+      sharedSessionGrants,
+      new Set(['srv-owned']),
+    );
+    const onOpenSharedEntry = vi.fn();
+
+    const { getAllByTitle } = render(
+      <ServerIconBar
+        servers={projected}
+        activeServerId="srv-owned"
+        onSelectServer={vi.fn()}
+        onOpenSharedEntry={onOpenSharedEntry}
+      />,
+    );
+
+    const clusterButtons = getAllByTitle('Merged Cluster');
+    expect(clusterButtons).toHaveLength(1);
+    fireEvent.click(clusterButtons[0]);
+    expect(onOpenSharedEntry).toHaveBeenCalledWith(sharedSessionGrants[1]); // main grant chosen
+  });
 });
 
 describe('Mobile 3-column server menu with unified servers and deduplicated shared panel', () => {
@@ -164,13 +216,22 @@ describe('Mobile 3-column server menu with unified servers and deduplicated shar
       target: { kind: 'main', serverId: 'srv-univ', sessionName: 'university' },
       targetLabel: 'university',
     },
+    {
+      id: 'share-sub-univ',
+      serverId: 'srv-univ',
+      serverName: 'Univ Cluster',
+      role: 'participant',
+      status: 'active',
+      target: { kind: 'subsession', serverId: 'srv-univ', sessionName: 'deck_sub_jdzs', subSessionId: 'jdzs' },
+      targetLabel: 'jdzs',
+    },
   ];
 
   const owned = [
     { id: 'srv-1', name: 'MacBook Pro', status: 'online', lastHeartbeatAt: Date.now(), createdAt: 100 },
   ];
 
-  it('merges whole-server share into 3-column list and removes it from the shared panel', () => {
+  it('merges whole-server and deduplicated shared-session grants into 3-column list without duplicating server buttons', () => {
     const ownedIds = new Set(['srv-1']);
     const unified = projectUnifiedServerList(owned, allShares, ownedIds);
     const restricted = filterRestrictedSharedEntries(allShares);
@@ -204,23 +265,28 @@ describe('Mobile 3-column server menu with unified servers and deduplicated shar
       </MobileServerMenu>,
     );
 
-    // 1. Both servers are in the top server grid
+    // 1. Owned + whole-server + single merged shared-session server in the top grid (not 4!)
     const serverButtons = container.querySelectorAll('.mobile-server-menu-server');
-    expect(serverButtons).toHaveLength(2);
+    expect(serverButtons).toHaveLength(3);
     expect(serverButtons[0].textContent).toContain('MacBook Pro');
     expect(serverButtons[1].textContent).toContain('Whole Server Project');
+    expect(serverButtons[2].textContent).toContain('Univ Cluster');
 
-    // 2. Shared server item has the return arrow indicator
+    // 2. Shared server items have the return arrow indicator
     expect(serverButtons[1].querySelector('.share-state-indicator-shared-in')).not.toBeNull();
+    expect(serverButtons[2].querySelector('.share-state-indicator-shared-in')).not.toBeNull();
 
-    // 3. Clicking shared server calls onOpenShared with the full server grant
+    // 3. Clicking whole-server calls onOpenShared with the full server grant; clicking Univ Cluster uses preferred main grant
     fireEvent.click(serverButtons[1]);
     expect(onOpenShared).toHaveBeenCalledWith(allShares[0]);
+    fireEvent.click(serverButtons[2]);
+    expect(onOpenShared).toHaveBeenCalledWith(allShares[1]);
 
-    // 4. Restricted panel only contains 'university' (whole-server is NOT duplicated here)
+    // 4. Restricted panel keeps individual restricted entries (whole-server is NOT duplicated here)
     const sharedPanelRows = container.querySelectorAll('.shared-entry-row');
-    expect(sharedPanelRows).toHaveLength(1);
+    expect(sharedPanelRows).toHaveLength(2);
     expect(sharedPanelRows[0].textContent).toContain('university');
+    expect(sharedPanelRows[1].textContent).toContain('jdzs');
     expect(sharedPanelRows[0].textContent).not.toContain('Whole Server Project');
   });
 });

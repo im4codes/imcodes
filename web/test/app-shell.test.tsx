@@ -9596,4 +9596,401 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       Object.defineProperty(navigator, 'maxTouchPoints', { configurable: true, value: prevMaxTouch });
     }
   }, 15000);
+
+  it('cycles keyboard shortcuts across 1 owned + 1 shared-in full server, shows HUD for shared server & tabs, and returns cleanly', async () => {
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return { servers: [serverList().servers[0]] };
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/alpha', state: 'idle' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const sharedServerEntry = {
+      id: 'share-srv-2',
+      serverId: 'srv-shared',
+      serverName: 'Shared Beta',
+      role: 'participant' as const,
+      status: 'active' as const,
+      targetLabel: 'Shared Beta',
+      lastHeartbeatAt: Date.now(),
+      target: { kind: 'server' as const, serverId: 'srv-shared' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedServerEntry]);
+
+    let resolveSharedOpen!: (value: unknown) => void;
+    openSharedEntryMock.mockImplementation(() => new Promise((resolve) => {
+      resolveSharedOpen = resolve;
+    }));
+
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Win32' });
+    try {
+      const { App } = await importApp();
+      render(<App />);
+
+      const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+      // Wait for shared discovery to project srv-shared into unifiedServers
+      await screen.findByText('server-select-srv-shared');
+
+      // Press Alt+k (serverNext) with 1 owned + 1 shared-in server -> switches to srv-shared
+      const nextEvt = new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(nextEvt);
+      expect(nextEvt.defaultPrevented).toBe(true);
+
+      await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(sharedServerEntry.target));
+      const pendingHud = await screen.findByTestId('server-switch-watermark');
+      expect(pendingHud.getAttribute('data-switch-kind')).toBe('server');
+      expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Shared Beta');
+      expect(screen.getByTestId('server-switch-watermark-session').textContent).not.toMatch(/alpha/i);
+
+      await act(async () => {
+        resolveSharedOpen({
+          server: { id: 'srv-shared', name: 'Shared Beta', status: 'active', lastHeartbeatAt: Date.now() },
+          target: sharedServerEntry.target,
+          coverage: {
+            effectiveRole: 'participant',
+            historyCutoffAt: 0,
+            nextCoverageRecheckAt: null,
+            coveringShareIds: ['share-srv-2'],
+            primaryShareId: 'share-srv-2',
+            authorizedAt: Date.now(),
+          },
+          sessions: [
+            { sessionName: 'deck_shared_one', title: 'Shared One', state: 'idle', agentType: 'codex-sdk', activeDispatchId: null, supervisionMode: null },
+            { sessionName: 'deck_shared_two', title: 'Shared Two', state: 'idle', agentType: 'codex-sdk', activeDispatchId: null, supervisionMode: null },
+          ],
+          subSessions: [],
+        });
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('Shared One');
+      });
+      const sharedOneComposer = await screen.findByTestId('pane-composer-deck_shared_one');
+      await waitFor(() => expect(document.activeElement).toBe(sharedOneComposer));
+
+      // Tab switching inside shared-in full server shows session watermark with server name
+      const tabNextEvt = new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
+      sharedOneComposer.dispatchEvent(tabNextEvt);
+      expect(tabNextEvt.defaultPrevented).toBe(true);
+
+      await waitFor(() => {
+        expect(screen.getByTestId('session-pane-deck_shared_two').getAttribute('data-is-active')).toBe('true');
+      });
+      expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('session');
+      expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Shared Beta');
+      expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('Shared Two');
+
+      const sharedTwoComposer = await screen.findByTestId('pane-composer-deck_shared_two');
+      // Press Alt+i (serverPrev) -> switches back to owned Alpha Server via handleSelectServer
+      const prevEvt = new KeyboardEvent('keydown', { key: 'i', code: 'KeyI', altKey: true, bubbles: true, cancelable: true });
+      sharedTwoComposer.dispatchEvent(prevEvt);
+      expect(prevEvt.defaultPrevented).toBe(true);
+
+      await waitFor(() => {
+        expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('server');
+        expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Alpha Server');
+      });
+      const alphaPane = await screen.findByTestId('session-pane-deck_alpha_brain');
+      expect(alphaPane.getAttribute('data-is-active')).toBe('true');
+      expect(alphaPane.getAttribute('data-share-target-kind')).toBe('');
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  }, 15000);
+
+  it('toggles mobile 2-finger vertical swipes between 1 owned server and 1 shared-in server', async () => {
+    const dispatchSwipe = (
+      target: EventTarget,
+      start: Array<{ identifier: number; clientX: number; clientY: number }>,
+      move: Array<{ identifier: number; clientX: number; clientY: number }>,
+    ) => {
+      const mkEvent = (type: string, touches: typeof start, changedTouches: typeof start = []) => {
+        const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
+          touches: typeof start;
+          changedTouches: typeof start;
+        };
+        Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
+        Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
+        return evt;
+      };
+      target.dispatchEvent(mkEvent('touchstart', start));
+      target.dispatchEvent(mkEvent('touchmove', move));
+      target.dispatchEvent(mkEvent('touchend', [], move));
+    };
+
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return { servers: [serverList().servers[0]] };
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/alpha', state: 'idle' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const sharedServerEntry = {
+      id: 'share-mob-2',
+      serverId: 'srv-shared',
+      serverName: 'Shared Mobile',
+      role: 'participant' as const,
+      status: 'active' as const,
+      targetLabel: 'Shared Mobile',
+      lastHeartbeatAt: Date.now(),
+      target: { kind: 'server' as const, serverId: 'srv-shared' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedServerEntry]);
+    openSharedEntryMock.mockResolvedValue({
+      server: { id: 'srv-shared', name: 'Shared Mobile', status: 'active', lastHeartbeatAt: Date.now() },
+      target: sharedServerEntry.target,
+      coverage: {
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-mob-2'],
+        primaryShareId: 'share-mob-2',
+        authorizedAt: Date.now(),
+      },
+      sessions: [
+        { sessionName: 'deck_shared_mob', title: 'Shared Mob Tab', state: 'idle', agentType: 'codex-sdk', activeDispatchId: null, supervisionMode: null },
+      ],
+      subSessions: [],
+    });
+
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      const view = render(<App />);
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+      await waitFor(() => expect(view.container.querySelectorAll('.mobile-server-btn')).toHaveLength(1));
+      // Wait for shared entry projection to include srv-shared in unifiedServers
+      await waitFor(() => expect(discoverSharedEntriesMock).toHaveBeenCalled());
+      await act(async () => {
+        await Promise.resolve();
+      });
+
+      // 2-finger swipe Down -> switches owned srv-1 -> shared srv-shared
+      dispatchSwipe(
+        view.container,
+        [{ identifier: 1, clientX: 120, clientY: 160 }, { identifier: 2, clientX: 170, clientY: 162 }],
+        [{ identifier: 1, clientX: 120, clientY: 250 }, { identifier: 2, clientX: 170, clientY: 252 }],
+      );
+
+      await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(sharedServerEntry.target));
+      await waitFor(() => expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Shared Mobile'));
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['2F', '↓']);
+      await screen.findByTestId('session-pane-deck_shared_mob');
+
+      // 2-finger swipe Up -> switches shared srv-shared -> owned srv-1
+      dispatchSwipe(
+        view.container,
+        [{ identifier: 1, clientX: 120, clientY: 260 }, { identifier: 2, clientX: 170, clientY: 262 }],
+        [{ identifier: 1, clientX: 120, clientY: 160 }, { identifier: 2, clientX: 170, clientY: 162 }],
+      );
+
+      await waitFor(() => expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Alpha Server'));
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['2F', '↑']);
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 15000);
+
+  it('suppresses watermark on restricted main-tab shares while allowing Alt+k/i fallback into unifiedServers', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const restrictedEntry = {
+      id: 'share-restricted-1',
+      serverId: 'srv-restricted',
+      serverName: 'Restricted Host',
+      role: 'participant' as const,
+      status: 'active' as const,
+      targetLabel: 'Restricted Main',
+      target: { kind: 'main' as const, serverId: 'srv-restricted', sessionName: 'deck_restricted_main' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([restrictedEntry]);
+    openSharedEntryMock.mockResolvedValue({
+      server: { id: 'srv-restricted', name: 'Restricted Host', status: 'active', lastHeartbeatAt: Date.now() },
+      target: restrictedEntry.target,
+      coverage: {
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-restricted-1'],
+        primaryShareId: 'share-restricted-1',
+        authorizedAt: Date.now(),
+      },
+      sessions: [
+        { sessionName: 'deck_restricted_main', title: 'Restricted Main', state: 'idle', agentType: 'codex-sdk', activeDispatchId: null, supervisionMode: null },
+      ],
+      subSessions: [],
+    });
+
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Win32' });
+    try {
+      const { App } = await importApp();
+      render(<App />);
+
+      const entryBtn = (await screen.findByText('Restricted Main')).closest('button')!;
+      fireEvent.click(entryBtn);
+
+      const restrictedPane = await screen.findByTestId('session-pane-deck_restricted_main');
+      expect(restrictedPane.getAttribute('data-share-target-kind')).toBe('main');
+      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+
+      // Even if a restricted target is not in unifiedServers or wraps at the end, Alt+k cycles cleanly to srv-1
+      const restrictedComposer = await screen.findByTestId('pane-composer-deck_restricted_main');
+      await waitFor(() => expect(document.activeElement).toBe(restrictedComposer));
+      const evt = new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true });
+      restrictedComposer.dispatchEvent(evt);
+      expect(evt.defaultPrevented).toBe(true);
+
+      await waitFor(() => {
+        expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('server');
+        expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server One');
+      });
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  }, 15000);
+
+  it('deduplicates 3 shared sessions on 1 remote server into 1 virtual server when cycling Alt+k / Alt+i across owned + whole-server + merged shared-session servers', async () => {
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return { servers: [serverList().servers[0]] };
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/alpha', state: 'idle' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const wholeShare = {
+      id: 'share-whole',
+      serverId: 'srv-whole',
+      serverName: 'Whole Remote',
+      role: 'participant' as const,
+      status: 'active' as const,
+      targetLabel: 'Whole Remote',
+      lastHeartbeatAt: Date.now(),
+      target: { kind: 'server' as const, serverId: 'srv-whole' },
+    };
+    const subShareOne = {
+      id: 'share-sub-1',
+      serverId: 'srv-virtual',
+      serverName: 'Virtual Cluster',
+      role: 'participant' as const,
+      status: 'active' as const,
+      targetLabel: 'Sub One',
+      target: { kind: 'subsession' as const, serverId: 'srv-virtual', sessionName: 'deck_sub_1', subSessionId: 'sub1' },
+    };
+    const mainShare = {
+      id: 'share-main-best',
+      serverId: 'srv-virtual',
+      serverName: 'Virtual Cluster',
+      role: 'viewer' as const,
+      status: 'active' as const,
+      targetLabel: 'Main Session',
+      target: { kind: 'main' as const, serverId: 'srv-virtual', sessionName: 'deck_virt_main' },
+    };
+    const subShareTwo = {
+      id: 'share-sub-2',
+      serverId: 'srv-virtual',
+      serverName: 'Virtual Cluster',
+      role: 'viewer' as const,
+      status: 'active' as const,
+      targetLabel: 'Sub Two',
+      target: { kind: 'subsession' as const, serverId: 'srv-virtual', sessionName: 'deck_sub_2', subSessionId: 'sub2' },
+    };
+
+    discoverSharedEntriesMock.mockResolvedValue([wholeShare, subShareOne, mainShare, subShareTwo]);
+    openSharedEntryMock.mockImplementation(async (target: { kind: string; serverId: string; sessionName?: string }) => {
+      if (target.serverId === 'srv-whole') {
+        return {
+          server: { id: 'srv-whole', name: 'Whole Remote', status: 'active', lastHeartbeatAt: Date.now() },
+          target,
+          coverage: { effectiveRole: 'participant', historyCutoffAt: 0, nextCoverageRecheckAt: null, coveringShareIds: ['share-whole'], primaryShareId: 'share-whole', authorizedAt: Date.now() },
+          sessions: [{ sessionName: 'deck_whole_one', title: 'Whole One', state: 'idle', agentType: 'codex-sdk', activeDispatchId: null, supervisionMode: null }],
+          subSessions: [],
+        };
+      }
+      return {
+        server: { id: 'srv-virtual', name: 'Virtual Cluster', status: 'active', lastHeartbeatAt: Date.now() },
+        target,
+        coverage: { effectiveRole: 'viewer', historyCutoffAt: 0, nextCoverageRecheckAt: null, coveringShareIds: ['share-main-best'], primaryShareId: 'share-main-best', authorizedAt: Date.now() },
+        sessions: [{ sessionName: 'deck_virt_main', title: 'Main Session', state: 'idle', agentType: 'codex-sdk', activeDispatchId: null, supervisionMode: null }],
+        subSessions: [],
+      };
+    });
+
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Win32' });
+    try {
+      const { App } = await importApp();
+      render(<App />);
+
+      const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+      // Only 1 virtual server button is projected for the 3 shared grants on srv-virtual
+      await screen.findByText('server-select-srv-whole');
+      expect(screen.getAllByText('Virtual Cluster').length).toBeGreaterThanOrEqual(1);
+      expect(screen.getAllByText(/server-select-srv-virtual/)).toHaveLength(1);
+
+      // Step 1: srv-1 -> srv-whole
+      alphaComposer.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true }));
+      await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(wholeShare.target));
+      await waitFor(() => expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Whole Remote'));
+      const wholeComposer = await screen.findByTestId('pane-composer-deck_whole_one');
+
+      // Step 2: srv-whole -> srv-virtual (opens representative main grant, displays serverName 'Virtual Cluster')
+      wholeComposer.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true }));
+      await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(mainShare.target));
+      await waitFor(() => {
+        expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('server');
+        expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Virtual Cluster');
+      });
+      await screen.findByTestId('session-pane-deck_virt_main');
+
+      // Step 3: Pressing Alt+k from srv-virtual jumps directly back to srv-1 (NOT cycling 3 times through subShareOne/subShareTwo!)
+      const virtPane = await screen.findByTestId('session-pane-deck_virt_main');
+      virtPane.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true }));
+      await waitFor(() => expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Alpha Server'));
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  }, 15000);
 });

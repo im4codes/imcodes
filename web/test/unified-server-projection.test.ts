@@ -213,17 +213,8 @@ describe('projectUnifiedServerList', () => {
     expect(result[0].id).toBe('server-active');
   });
 
-  it('does not project restricted tab/subsession shares into the whole-server list', () => {
+  it('deduplicates and merges active main/subsession shares per serverId into a single virtual shared-in server using serverName', () => {
     const ownedIds = new Set<string>();
-    const tabShare: SharedEntrySummary = {
-      id: 'share-tab-univ',
-      serverId: 'server-restricted',
-      serverName: 'University Machine',
-      role: 'viewer',
-      status: 'active',
-      target: { kind: 'main', serverId: 'server-restricted', sessionName: 'university' },
-      targetLabel: 'university',
-    };
     const subShare: SharedEntrySummary = {
       id: 'share-sub-jdzs',
       serverId: 'server-restricted',
@@ -233,9 +224,94 @@ describe('projectUnifiedServerList', () => {
       target: { kind: 'subsession', serverId: 'server-restricted', sessionName: 'deck_sub_jdzs', subSessionId: 'jdzs' },
       targetLabel: 'jdzs',
     };
+    const subShareTwo: SharedEntrySummary = {
+      id: 'share-sub-zhilan',
+      serverId: 'server-restricted',
+      serverName: 'University Machine',
+      role: 'viewer',
+      status: 'active',
+      target: { kind: 'subsession', serverId: 'server-restricted', sessionName: 'deck_sub_zhilan', subSessionId: 'zhilan' },
+      targetLabel: 'zhilan',
+    };
+    const tabShare: SharedEntrySummary = {
+      id: 'share-tab-univ',
+      serverId: 'server-restricted',
+      serverName: 'University Machine',
+      role: 'viewer',
+      status: 'active',
+      target: { kind: 'main', serverId: 'server-restricted', sessionName: 'university' },
+      targetLabel: 'university',
+    };
 
-    const result = projectUnifiedServerList([], [tabShare, subShare], ownedIds);
-    expect(result).toHaveLength(0);
+    const result = projectUnifiedServerList([], [subShare, subShareTwo, tabShare], ownedIds);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      id: 'server-restricted',
+      name: 'University Machine',
+      isSharedIn: true,
+      online: false,
+      sharedEntry: tabShare, // main (10+1=11) outranks subsession (0+2=2)
+    });
+
+    // If all restricted grants become revoked/expired, the virtual server drops cleanly
+    const revokedOnly = projectUnifiedServerList(
+      [],
+      [
+        { ...subShare, status: 'revoked' },
+        { ...tabShare, status: 'expired' },
+      ],
+      ownedIds,
+    );
+    expect(revokedOnly).toHaveLength(0);
+  });
+
+  it('prioritizes server > main > subsession, then participant > viewer when deduplicating grants for a serverId', () => {
+    const ownedIds = new Set<string>();
+    const subParticipant: SharedEntrySummary = {
+      id: 'g-sub-p',
+      serverId: 'srv-ranked',
+      serverName: 'Ranked Host',
+      role: 'participant',
+      status: 'active',
+      target: { kind: 'subsession', serverId: 'srv-ranked', sessionName: 'deck_sub', subSessionId: 'sub1' },
+      targetLabel: 'sub1',
+    };
+    const mainViewer: SharedEntrySummary = {
+      id: 'g-main-v',
+      serverId: 'srv-ranked',
+      serverName: 'Ranked Host',
+      role: 'viewer',
+      status: 'active',
+      target: { kind: 'main', serverId: 'srv-ranked', sessionName: 'deck_main' },
+      targetLabel: 'main-tab',
+    };
+    const mainParticipant: SharedEntrySummary = {
+      id: 'g-main-p',
+      serverId: 'srv-ranked',
+      serverName: 'Ranked Host',
+      role: 'participant',
+      status: 'active',
+      target: { kind: 'main', serverId: 'srv-ranked', sessionName: 'deck_main2' },
+      targetLabel: 'main-tab-2',
+    };
+    const wholeViewer: SharedEntrySummary = {
+      id: 'g-srv-v',
+      serverId: 'srv-ranked',
+      serverName: 'Ranked Host',
+      role: 'viewer',
+      status: 'active',
+      target: { kind: 'server', serverId: 'srv-ranked' },
+      targetLabel: 'Whole Ranked Label',
+    };
+
+    // Without server grant: main participant > main viewer > subsession participant
+    expect(projectUnifiedServerList([], [subParticipant, mainViewer], ownedIds)[0].sharedEntry?.id).toBe('g-main-v');
+    expect(projectUnifiedServerList([], [mainViewer, mainParticipant, subParticipant], ownedIds)[0].sharedEntry?.id).toBe('g-main-p');
+    // Whole-server grant beats any main/subsession grant and uses its targetLabel
+    const withWhole = projectUnifiedServerList([], [subParticipant, mainParticipant, wholeViewer], ownedIds);
+    expect(withWhole).toHaveLength(1);
+    expect(withWhole[0].sharedEntry?.id).toBe('g-srv-v');
+    expect(withWhole[0].name).toBe('Whole Ranked Label');
   });
 
   it('retains visited unowned servers with their active scoped grant, and excludes them once the grant is revoked', () => {
