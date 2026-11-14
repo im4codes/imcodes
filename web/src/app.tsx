@@ -3,7 +3,8 @@ import { setFileRelayUser, setServerR2RelayEnabled } from './r2-relay-preference
 import { DesktopAuthBridge } from './pages/DesktopAuthBridge.js';
 import { DESKTOP_SETUP_CALLBACK_QUERY_PARAM, parseDesktopSetupCallbackUrl } from '@shared/desktop-setup-auth.js';
 import { focusComposerElement } from './util/composer-focus.js';
-import { syncIncognitoTimelineSessions, forgetIncognitoTimelineSessions } from './hooks/useTimeline.js';
+import { syncIncognitoTimelineSessions, forgetIncognitoTimelineSessions, isIncognitoTimelineSession } from './hooks/useTimeline.js';
+import { isIncognitoSession } from '@shared/session-incognito-types.js';
 import { useState, useEffect, useCallback, useRef, useMemo } from 'preact/hooks';
 import {
   MutableDesktopWindowStack,
@@ -5482,17 +5483,25 @@ function InternalMainApp() {
         setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 8000);
       }
       if (msg.type === 'session.error') {
-        void watchProjectionStore.pushDurableEvent({
-          type: 'session.error',
-          project: msg.project,
-          message: msg.message,
-        });
+        const errTargetSession = typeof msg.sessionName === 'string' && msg.sessionName
+          ? msg.sessionName
+          : (typeof msg.session === 'string' && msg.session
+            ? msg.session
+            : (typeof msg.id === 'string' && msg.id ? `deck_sub_${msg.id}` : ''));
+        if (!isIncognitoSession(msg) && !(errTargetSession && isIncognitoTimelineSession(selectedServerId, errTargetSession))) {
+          void watchProjectionStore.pushDurableEvent({
+            type: 'session.error',
+            project: msg.project ?? '',
+            message: msg.message,
+          });
+        }
       }
       if (msg.type === 'subsession.created' || msg.type === SUBSESSION_CREATED_BATCH_MSG) {
         const items = msg.type === SUBSESSION_CREATED_BATCH_MSG
           ? (Array.isArray(msg.items) ? msg.items : [])
           : [msg];
         for (const item of items) {
+          if (isIncognitoSession(item)) continue;
           watchProjectionStore.addSubSession({
             sessionName: item.sessionName,
             sessionType: item.sessionType,

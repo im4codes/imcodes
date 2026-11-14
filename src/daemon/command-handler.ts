@@ -8172,11 +8172,20 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
   const incognito = cmd.incognito === true;
   const id = cmd.id as string | undefined;
   const type = cmd.sessionType as string | undefined;
+  const sessionName = id ? subSessionName(id) : undefined;
   if (incognito && (!type || !supportsSessionIncognito(type) || !serverLink.supportsIncognitoSessions())) {
-    serverLink.send({ type: 'session.error', message: SESSION_INCOGNITO_UNSUPPORTED });
+    serverLink.send({
+      type: 'session.error',
+      message: SESSION_INCOGNITO_UNSUPPORTED,
+      ...(id && sessionName ? { id, session: sessionName, sessionName } : {}),
+      ...(typeof cmd.parentSession === 'string' && cmd.parentSession ? { project: cmd.parentSession } : {}),
+    });
+    if (id && sessionName) {
+      serverLink.send({ type: 'subsession.closed', id, sessionName, incognito: true });
+    }
     return;
   }
-  if (!id || !type) {
+  if (!id || !type || !sessionName) {
     logger.warn('subsession.start: missing id or type');
     return;
   }
@@ -8213,7 +8222,6 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
     parentSession ? getSession(parentSession)?.projectDir : undefined,
   );
   const requestedEffort: unknown = cmd.thinking ?? cmd.effort;
-  const sessionName = subSessionName(id);
   const existingSub = getSession(sessionName);
   const effort = isTransportEffortLevel(requestedEffort)
     ? requestedEffort
@@ -8223,6 +8231,17 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
     : sessionName;
   if (isKnownTestSessionName(parentSession)) {
     logger.warn({ id, type, cwd, parentSession }, 'subsession.start rejected by test-session guard');
+    serverLink.send({
+      type: 'session.error',
+      message: `Refusing to start known test sub-session pattern: ${sessionName}`,
+      id,
+      session: sessionName,
+      sessionName,
+      ...(parentSession ? { project: parentSession } : {}),
+    });
+    if (incognito) {
+      serverLink.send({ type: 'subsession.closed', id, sessionName, incognito: true });
+    }
     return;
   }
 

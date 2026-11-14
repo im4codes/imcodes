@@ -174,7 +174,7 @@ describe('daemon sub-session incognito lifecycle', () => {
     rmSync(tempHome, { recursive: true, force: true });
   });
 
-  it('rejects unsupported sub-session runtime or uncapable server fail-closed', async () => {
+  it('rejects unsupported sub-session runtime or uncapable server fail-closed and keeps stop idempotent', async () => {
     const sent: Array<Record<string, unknown>> = [];
     const linkNoCap = {
       send: (msg: Record<string, unknown>) => sent.push(msg),
@@ -186,11 +186,35 @@ describe('daemon sub-session incognito lifecycle', () => {
       id: 'subnocap',
       sessionType: 'claude-code-sdk',
       cwd: workDir,
+      parentSession: 'deck_main_brain',
       incognito: true,
     }, linkNoCap);
-    await waitFor(() => sent.some((m) => m.type === 'session.error'));
-    expect(sent.find((m) => m.type === 'session.error')?.message).toBe(SESSION_INCOGNITO_UNSUPPORTED);
+    await waitFor(() => sent.some((m) => m.type === 'session.error') && sent.some((m) => m.type === 'subsession.closed'));
+    expect(sent.find((m) => m.type === 'session.error')).toMatchObject({
+      type: 'session.error',
+      message: SESSION_INCOGNITO_UNSUPPORTED,
+      id: 'subnocap',
+      session: 'deck_sub_subnocap',
+      sessionName: 'deck_sub_subnocap',
+      project: 'deck_main_brain',
+    });
+    expect(sent.find((m) => m.type === 'subsession.closed')).toMatchObject({
+      type: 'subsession.closed',
+      id: 'subnocap',
+      sessionName: 'deck_sub_subnocap',
+      incognito: true,
+    });
     expect(getSession('deck_sub_subnocap')).toBeUndefined();
+
+    // Closing a rejected/non-existent ephemeral sub-session is idempotent and notifies bridge
+    sent.length = 0;
+    const stopRes = await stopSubSession('deck_sub_subnocap', linkNoCap);
+    expect(stopRes.ok).toBe(true);
+    expect(sent).toContainEqual({
+      type: 'subsession.closed',
+      id: 'subnocap',
+      sessionName: 'deck_sub_subnocap',
+    });
 
     sent.length = 0;
     const linkCap = {
@@ -205,8 +229,14 @@ describe('daemon sub-session incognito lifecycle', () => {
       cwd: workDir,
       incognito: true,
     }, linkCap);
-    await waitFor(() => sent.some((m) => m.type === 'session.error'));
-    expect(sent.find((m) => m.type === 'session.error')?.message).toBe(SESSION_INCOGNITO_UNSUPPORTED);
+    await waitFor(() => sent.some((m) => m.type === 'session.error') && sent.some((m) => m.type === 'subsession.closed'));
+    expect(sent.find((m) => m.type === 'session.error')).toMatchObject({
+      type: 'session.error',
+      message: SESSION_INCOGNITO_UNSUPPORTED,
+      id: 'subsh01',
+      session: 'deck_sub_subsh01',
+      sessionName: 'deck_sub_subsh01',
+    });
     expect(getSession('deck_sub_subsh01')).toBeUndefined();
   });
 

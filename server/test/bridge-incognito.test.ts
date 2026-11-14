@@ -14,7 +14,13 @@ vi.mock('../src/routes/push.js', () => ({
 
 import { WsBridge } from '../src/ws/bridge.js';
 import logger from '../src/util/logger.js';
-import { TIMELINE_MESSAGES } from '../../shared/timeline-protocol.js';
+import {
+  TIMELINE_MESSAGES,
+  TIMELINE_RESPONSE_STATUS,
+} from '../../shared/timeline-protocol.js';
+import { TIMELINE_REQUEST_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
+import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
+import { SESSION_INCOGNITO_UNSUPPORTED } from '../../shared/session-incognito-types.js';
 
 class MockWs extends EventEmitter {
   sent: Array<string | Buffer> = [];
@@ -58,8 +64,11 @@ describe('server WsBridge incognito privacy isolation (F3)', () => {
   async function setupBridge() {
     const executedSql: Array<{ sql: string; params: unknown[] }> = [];
     const db = {
-      queryOne: async (sql: string) => {
-        if (sql.includes('FROM sessions WHERE')) return { ok: 1 };
+      queryOne: async (sql: string, params: unknown[] = []) => {
+        if (sql.includes('FROM sessions WHERE')) {
+          return params[1] === 'deck_priv_brain' ? { ok: 1 } : null;
+        }
+        if (sql.includes('FROM sub_sessions WHERE')) return null;
         return {
           token_hash: 'valid-hash',
           owner_status: 'active',
@@ -271,5 +280,196 @@ describe('server WsBridge incognito privacy isolation (F3)', () => {
 
     expect(executedSql.filter((q) => q.sql.includes('sub_sessions'))).toEqual([]);
     expect(browserWs.sent.map((item) => String(item)).join('\n')).toContain('subsession.removed');
+  });
+
+  it('rejects ephemeral incognito subsession.start when daemon lacks incognito capability and denies subsequent ownership/timeline access', async () => {
+    const { bridge, daemonWs, browserWs, executedSql } = await setupBridge();
+
+    // Daemon advertises capabilities WITHOUT session-incognito-v1 (stale daemon)
+    daemonWs.emit('message', JSON.stringify({
+      type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+      daemonId: serverId,
+      capabilities: ['timeline.v1'],
+      helloEpoch: 1,
+      sentAt: Date.now(),
+    }));
+    await flushAsync();
+    daemonWs.sent.length = 0;
+    browserWs.sent.length = 0;
+
+    browserWs.emit('message', JSON.stringify({
+      type: 'subsession.start',
+      id: 'stale01',
+      sessionType: 'claude-code-sdk',
+      cwd: '/tmp/secret-sub',
+      label: 'Stale Sub',
+      parentSession: 'deck_priv_brain',
+      incognito: true,
+    }));
+    await flushAsync();
+
+    // Never forwarded to stale daemon; zero DB writes; browser receives targeted error + removal
+    expect(daemonWs.sent).toEqual([]);
+    expect(executedSql.filter((q) => q.sql.includes('sub_sessions'))).toEqual([]);
+    const frames = browserWs.sent.map((item) => JSON.parse(String(item)) as Record<string, unknown>);
+    expect(frames).toContainEqual(expect.objectContaining({
+      type: 'session.error',
+      id: 'stale01',
+      sessionName: 'deck_sub_stale01',
+      message: SESSION_INCOGNITO_UNSUPPORTED,
+    }));
+    expect(frames).toContainEqual({
+      type: 'subsession.removed',
+      id: 'stale01',
+      sessionName: 'deck_sub_stale01',
+    });
+
+    // No bridge state or ownership/timeline access remains
+    expect((bridge as unknown as { incognitoSessions: Set<string> }).incognitoSessions.has('deck_sub_stale01')).toBe(false);
+    expect((bridge as unknown as { activeSubSessions: Map<string, unknown> }).activeSubSessions.has('deck_sub_stale01')).toBe(false);
+
+    browserWs.sent.length = 0;
+    daemonWs.sent.length = 0;
+    browserWs.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+      sessionName: 'deck_sub_stale01',
+      requestId: 'hist-denied-stale',
+      limit: 50,
+    }));
+    await flushAsync();
+    expect(daemonWs.sent).toEqual([]);
+    const histFrames = browserWs.sent.map((item) => JSON.parse(String(item)) as Record<string, unknown>);
+    expect(histFrames).toContainEqual(expect.objectContaining({
+      type: TIMELINE_MESSAGES.HISTORY,
+      requestId: 'hist-denied-stale',
+      sessionName: 'deck_sub_stale01',
+      status: TIMELINE_RESPONSE_STATUS.ERROR,
+      errorReason: TIMELINE_REQUEST_ERROR_REASONS.REQUEST_UNAUTHORIZED,
+    }));
+  });
+
+  it('rolls back pending incognito sub-session on stale daemon rejection (untargeted session.error) and idempotent close', async () => {
+    const { bridge, daemonWs, browserWs, executedSql } = await setupBridge();
+
+    browserWs.emit('message', JSON.stringify({
+      type: 'subsession.start',
+      id: 'stale02',
+      sessionType: 'claude-code-sdk',
+      cwd: '/tmp/secret-sub',
+      label: 'Ghost Sub 2',
+      parentSession: 'deck_priv_brain',
+      incognito: true,
+    }));
+    await flushAsync();
+
+    // Browser subscribes before daemon rejection arrives
+    browserWs.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: 'deck_sub_stale02',
+      mode: 'full',
+    }));
+    await flushAsync();
+    browserWs.sent.length = 0;
+
+    // Stale daemon rejects without id/sessionName or subsession.closed
+    daemonWs.emit('message', JSON.stringify({
+      type: 'session.error',
+      message: SESSION_INCOGNITO_UNSUPPORTED,
+    }));
+    await flushAsync();
+
+    const browserMsgs = browserWs.sent.map((item) => JSON.parse(String(item)) as Record<string, unknown>);
+    expect(browserMsgs).toContainEqual({
+      type: 'subsession.removed',
+      id: 'stale02',
+      sessionName: 'deck_sub_stale02',
+    });
+    expect(browserMsgs).toContainEqual(expect.objectContaining({
+      type: 'session.error',
+      message: SESSION_INCOGNITO_UNSUPPORTED,
+    }));
+    expect((bridge as unknown as { incognitoSessions: Set<string> }).incognitoSessions.has('deck_sub_stale02')).toBe(false);
+    expect((bridge as unknown as { activeSubSessions: Map<string, unknown> }).activeSubSessions.has('deck_sub_stale02')).toBe(false);
+
+    // Even if daemon later sends subsession.closed or user retries subsession.stop, zero DB writes happen
+    browserWs.emit('message', JSON.stringify({
+      type: 'subsession.stop',
+      sessionName: 'deck_sub_stale02',
+    }));
+    daemonWs.emit('message', JSON.stringify({
+      type: 'subsession.closed',
+      id: 'stale02',
+      sessionName: 'deck_sub_stale02',
+      incognito: true,
+    }));
+    await flushAsync();
+    expect(executedSql.filter((q) => q.sql.includes('sub_sessions'))).toEqual([]);
+
+    // Subsequent timeline access is denied
+    browserWs.sent.length = 0;
+    daemonWs.sent.length = 0;
+    browserWs.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+      sessionName: 'deck_sub_stale02',
+      requestId: 'hist-denied-2',
+      limit: 50,
+    }));
+    await flushAsync();
+    expect(daemonWs.sent).toEqual([]);
+    const histFrames = browserWs.sent.map((item) => JSON.parse(String(item)) as Record<string, unknown>);
+    expect(histFrames).toContainEqual(expect.objectContaining({
+      type: TIMELINE_MESSAGES.HISTORY,
+      requestId: 'hist-denied-2',
+      sessionName: 'deck_sub_stale02',
+      status: TIMELINE_RESPONSE_STATUS.ERROR,
+      errorReason: TIMELINE_REQUEST_ERROR_REASONS.REQUEST_UNAUTHORIZED,
+    }));
+  });
+
+  it('cleans up pending unconfirmed incognito sub-session immediately on browser subsession.stop even without daemon ack', async () => {
+    const { bridge, daemonWs, browserWs, executedSql } = await setupBridge();
+
+    browserWs.emit('message', JSON.stringify({
+      type: 'subsession.start',
+      id: 'stale03',
+      sessionType: 'claude-code-sdk',
+      cwd: '/tmp/secret-sub',
+      label: 'Ghost Sub 3',
+      parentSession: 'deck_priv_brain',
+      incognito: true,
+    }));
+    await flushAsync();
+    browserWs.sent.length = 0;
+
+    browserWs.emit('message', JSON.stringify({
+      type: 'subsession.stop',
+      sessionName: 'deck_sub_stale03',
+    }));
+    await flushAsync();
+
+    expect(executedSql.filter((q) => q.sql.includes('sub_sessions'))).toEqual([]);
+    expect((bridge as unknown as { incognitoSessions: Set<string> }).incognitoSessions.has('deck_sub_stale03')).toBe(false);
+    expect((bridge as unknown as { activeSubSessions: Map<string, unknown> }).activeSubSessions.has('deck_sub_stale03')).toBe(false);
+    expect(browserWs.sent.map((item) => JSON.parse(String(item)))).toContainEqual({
+      type: 'subsession.removed',
+      id: 'stale03',
+      sessionName: 'deck_sub_stale03',
+    });
+
+    browserWs.sent.length = 0;
+    daemonWs.sent.length = 0;
+    browserWs.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+      sessionName: 'deck_sub_stale03',
+      requestId: 'hist-denied-3',
+      limit: 50,
+    }));
+    await flushAsync();
+    expect(daemonWs.sent).toEqual([]);
+    expect(browserWs.sent.map((item) => JSON.parse(String(item)))).toContainEqual(expect.objectContaining({
+      type: TIMELINE_MESSAGES.HISTORY,
+      requestId: 'hist-denied-3',
+      errorReason: TIMELINE_REQUEST_ERROR_REASONS.REQUEST_UNAUTHORIZED,
+    }));
   });
 });

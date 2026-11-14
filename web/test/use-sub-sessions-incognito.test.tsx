@@ -10,6 +10,7 @@ import {
   syncIncognitoTimelineSessions,
   __resetTimelineCacheForTests,
 } from '../src/hooks/useTimeline.js';
+import { SESSION_INCOGNITO_UNSUPPORTED } from '../../shared/session-incognito-types.js';
 
 vi.mock('../src/api.js', () => ({
   listSubSessions: vi.fn().mockResolvedValue([]),
@@ -142,5 +143,64 @@ describe('useSubSessions incognito lifecycle', () => {
     expect(apiRef!.subSessions.length).toBe(1);
     view.rerender(<Harness ws={ws} connected={false} />);
     await waitFor(() => expect(apiRef!.subSessions).toEqual([]));
+  });
+
+  it('removes rejected incognito sub-session on targeted or untargeted session.error and clears incognito timeline registration', async () => {
+    vi.mocked(createSubSession).mockResolvedValue({
+      id: 'subnocap',
+      sessionName: 'deck_sub_subnocap',
+      subSession: {
+        id: 'subnocap',
+        server_id: 'srv1',
+        type: 'claude-code-sdk',
+        shell_bin: null,
+        cwd: '/tmp/secret',
+        label: 'NoCap',
+        closed_at: null,
+        cc_session_id: null,
+        gemini_session_id: null,
+        parent_session: 'deck_main_brain',
+        incognito: true,
+      },
+    } as any);
+
+    const { ws, emit } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(apiRef).toBeTruthy());
+
+    await act(async () => {
+      await apiRef!.create('claude-code-sdk', undefined, '/tmp/secret', 'NoCap', {
+        parentSession: 'deck_main_brain',
+        incognito: true,
+      });
+    });
+    expect(apiRef!.subSessions.some((s) => s.id === 'subnocap')).toBe(true);
+    expect(isIncognitoTimelineSession('srv1', 'deck_sub_subnocap')).toBe(true);
+
+    // Untargeted session.error from stale daemon removes pending incognito sub-session
+    act(() => {
+      emit({ type: 'session.error', message: SESSION_INCOGNITO_UNSUPPORTED });
+    });
+    expect(apiRef!.subSessions).toEqual([]);
+    expect(isIncognitoTimelineSession('srv1', 'deck_sub_subnocap')).toBe(false);
+
+    // Targeted session.error with id/sessionName also removes cleanly
+    await act(async () => {
+      await apiRef!.create('claude-code-sdk', undefined, '/tmp/secret', 'NoCap 2', {
+        parentSession: 'deck_main_brain',
+        incognito: true,
+      });
+    });
+    expect(apiRef!.subSessions.some((s) => s.id === 'subnocap')).toBe(true);
+    act(() => {
+      emit({
+        type: 'session.error',
+        id: 'subnocap',
+        sessionName: 'deck_sub_subnocap',
+        message: SESSION_INCOGNITO_UNSUPPORTED,
+      });
+    });
+    expect(apiRef!.subSessions).toEqual([]);
+    expect(isIncognitoTimelineSession('srv1', 'deck_sub_subnocap')).toBe(false);
   });
 });

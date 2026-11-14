@@ -182,7 +182,7 @@ export type ServerMessage =
   | { type: typeof TERMINAL_CONTROL.STREAM_RESET; session: string; reason: string }
   | { type: typeof TERMINAL_CONTROL.RECOVERY_EXHAUSTED; session: string; reason: string }
   | { type: 'session.event'; event: string; session: string; state: string; reason?: SessionEventReason }
-  | { type: 'session.error'; project: string; message: string }
+  | { type: 'session.error'; project?: string; id?: string; session?: string; sessionName?: string; message: string }
   | { type: 'session.idle'; session: string; project: string; agentType: string; label?: string; parentLabel?: string }
   | { type: 'session.notification'; session: string; project: string; title: string; message: string; agentType?: string; label?: string; parentLabel?: string }
   | { type: 'session.tool'; session: string; tool: string | null }

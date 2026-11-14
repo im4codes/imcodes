@@ -33,6 +33,7 @@ import { TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE, type QueueEvent } from '@shared/tr
 import { isValidTransportQueueWireEvent } from '@shared/transport-queue-wire.js';
 import { isActiveTurnFinishedError } from '../session-live-status.js';
 import { SUBSESSION_CREATED_BATCH_MSG } from '@shared/scale-limits.js';
+import { SESSION_INCOGNITO_UNSUPPORTED } from '@shared/session-incognito-types.js';
 import { forgetIncognitoTimelineSessions, registerIncognitoTimelineSession } from './useTimeline.js';
 
 export interface SubSession extends SubSessionData {
@@ -146,12 +147,18 @@ export function useSubSessions(
   const [subSessions, setSubSessions] = useState<SubSession[]>([]);
   const [loadedServerId, setLoadedServerId] = useState<string | null>(null);
   const rebuiltRef = useRef(false);
+  const pendingIncognitoCreateIdsRef = useRef<Set<string>>(new Set());
   // Load from PG — retries indefinitely with backoff until successful.
   // Re-triggers when serverId changes or the WS performs a real reconnect.
   const loadGenRef = useRef(0);
   const loadedGenRef = useRef(0);
   useEffect(() => {
-    if (!serverId) { setSubSessions([]); setLoadedServerId(null); return; }
+    if (!serverId) {
+      pendingIncognitoCreateIdsRef.current.clear();
+      setSubSessions([]);
+      setLoadedServerId(null);
+      return;
+    }
     if (disableHttpLoad) {
       const gen = ++loadGenRef.current;
       loadedGenRef.current = gen;
@@ -161,6 +168,7 @@ export function useSubSessions(
     }
     if (!connected) {
       rebuiltRef.current = false;
+      pendingIncognitoCreateIdsRef.current.clear();
       setSubSessions((prev) => {
         if (!prev.some((s) => s.incognito)) return prev;
         for (const s of prev) {
@@ -439,10 +447,40 @@ export function useSubSessions(
 
       // Sub-session removed by daemon (stopped/cleaned up server-side)
       if (msg.type === 'subsession.removed') {
-        const removedId = (msg as any).id as string;
+        const m = msg as { id?: unknown; sessionName?: unknown };
+        const rawSession = typeof m.sessionName === 'string' ? m.sessionName : '';
+        const removedId = typeof m.id === 'string' && m.id
+          ? m.id
+          : (rawSession.startsWith('deck_sub_') ? rawSession.slice('deck_sub_'.length) : '');
         if (removedId) {
-          forgetIncognitoTimelineSessions(serverId, toSessionName(removedId));
+          pendingIncognitoCreateIdsRef.current.delete(removedId);
+          forgetIncognitoTimelineSessions(serverId, rawSession || toSessionName(removedId));
           setSubSessions((prev) => prev.filter((s) => s.id !== removedId));
+        }
+        return;
+      }
+
+      if (msg.type === 'session.error') {
+        const m = msg as { id?: unknown; session?: unknown; sessionName?: unknown; message?: unknown };
+        const rawSession = typeof m.sessionName === 'string' && m.sessionName
+          ? m.sessionName
+          : (typeof m.session === 'string' && m.session ? m.session : '');
+        const errId = typeof m.id === 'string' && m.id
+          ? m.id
+          : (rawSession.startsWith('deck_sub_') ? rawSession.slice('deck_sub_'.length) : '');
+        const messageText = typeof m.message === 'string' ? m.message : '';
+        const isIncognitoError = messageText === SESSION_INCOGNITO_UNSUPPORTED || /incognito/i.test(messageText);
+        if (errId && (pendingIncognitoCreateIdsRef.current.has(errId) || isIncognitoError)) {
+          pendingIncognitoCreateIdsRef.current.delete(errId);
+          forgetIncognitoTimelineSessions(serverId, rawSession || toSessionName(errId));
+          setSubSessions((prev) => prev.filter((s) => s.id !== errId));
+        } else if (!errId && isIncognitoError && pendingIncognitoCreateIdsRef.current.size > 0) {
+          const rollbackIds = new Set(pendingIncognitoCreateIdsRef.current);
+          pendingIncognitoCreateIdsRef.current.clear();
+          for (const id of rollbackIds) {
+            forgetIncognitoTimelineSessions(serverId, toSessionName(id));
+          }
+          setSubSessions((prev) => prev.filter((s) => !rollbackIds.has(s.id)));
         }
         return;
       }
@@ -646,6 +684,9 @@ export function useSubSessions(
       }
 
       if (!sessionName || !sessionName.startsWith('deck_sub_')) return;
+      if (state && state !== 'starting' && state !== 'error') {
+        pendingIncognitoCreateIdsRef.current.delete(sessionName.slice('deck_sub_'.length));
+      }
       if (state === 'queued' || state === 'running' || state === 'idle') {
         // Streaming text, tool calls and repeated session.state frames say
         // "running"/"idle" again and again: keep the same array when nothing
@@ -749,8 +790,12 @@ export function useSubSessions(
         ...(incognito ? { incognito: true } : {}),
       });
       const isPrivate = incognito || res.subSession.incognito === true;
+      if (isPrivate && (!ws || !connected)) {
+        return null;
+      }
       if (isPrivate) {
         registerIncognitoTimelineSession(serverId, res.sessionName);
+        pendingIncognitoCreateIdsRef.current.add(res.id);
       }
       const sub: SubSession = {
         ...res.subSession,
@@ -805,19 +850,25 @@ export function useSubSessions(
       alert(`Failed to create session: ${msg}`);
       return null;
     }
-  }, [serverId, ws, activeSession, subSessions]);
+  }, [serverId, ws, connected, activeSession, subSessions]);
 
   const close = useCallback(async (id: string) => {
     if (!serverId) return;
     const sub = subSessions.find((s) => s.id === id);
     if (!sub) return;
-    // Stop the tmux session
+    // Stop the session
     ws?.subSessionStop(sub.sessionName);
+    if (sub.incognito && (!ws || !connected)) {
+      pendingIncognitoCreateIdsRef.current.delete(id);
+      forgetIncognitoTimelineSessions(serverId, sub.sessionName);
+      setSubSessions((prev) => prev.filter((s) => s.id !== id));
+      return;
+    }
     // Keep the sub-session visible until daemon/server confirm successful close.
     setSubSessions((prev) => prev.map((s) =>
       s.id === id ? { ...s, state: 'stopping' } : s,
     ));
-  }, [serverId, ws, subSessions]);
+  }, [serverId, ws, connected, subSessions]);
 
   const restart = useCallback(async (id: string) => {
     if (!serverId || !ws) return;

@@ -1,5 +1,11 @@
 import { R2_RELAY_MSG } from '../../../shared/r2-relay.js';
-import { isIncognitoSession, SESSION_INCOGNITO_SERVER_READY, supportsSessionIncognito } from '../../../shared/session-incognito-types.js';
+import {
+  isIncognitoSession,
+  SESSION_INCOGNITO_CAPABILITY,
+  SESSION_INCOGNITO_SERVER_READY,
+  SESSION_INCOGNITO_UNSUPPORTED,
+  supportsSessionIncognito,
+} from '../../../shared/session-incognito-types.js';
 import { withSessionPrivacy } from '../../../shared/session-incognito-context.js';
 import { machineGroupInvalidationReady, machineGroupInvalidationRevision } from '../services/machine-group-invalidation.js';
 import {
@@ -2227,6 +2233,8 @@ function heartbeatAckWithClock(
 export class WsBridge {
   // Session names are only unique within a daemon, never across owners.
   private readonly incognitoSessions = new Set<string>();
+  private readonly pendingIncognitoSubSessionStarts = new Map<string, { id: string; sessionName: string }>();
+  private readonly rejectedIncognitoSubSessions = new Set<string>();
   private static instances = new Map<string, WsBridge>();
   private static remoteDesktopReconnectRevalidator: ((serverId: string) => Promise<void>) | null = null;
 
@@ -6358,8 +6366,11 @@ export class WsBridge {
         this.daemonVersion = typeof msg.daemonVersion === 'string' ? msg.daemonVersion : null;
         this.recentTextBySession.clear();
         this.incognitoSessions.clear();
+        this.pendingIncognitoSubSessionStarts.clear();
+        this.rejectedIncognitoSubSessions.clear();
         this.clearPendingIdlePushes();
         this.activeMainSessions.clear();
+        this.activeSubSessions.clear();
         this.invalidateSessionOwnershipCache();
         this.hasActiveMainSessionSnapshot = false;
         // This connection's own credentials are verified: a controlled node's heartbeat may be acknowledged now.
@@ -6877,12 +6888,18 @@ export class WsBridge {
         });
       }
 
+      if (msg.type === 'session.error') {
+        this.rollbackIncognitoSubSessionsOnDaemonError(msg);
+      }
+
       this.relayToBrowsers(msg);
 
       // Push notifications for key events
       const eventForPrivacy = msg.event as { sessionId?: unknown; payload?: unknown } | undefined;
+      const sessionHint = eventForPrivacy?.sessionId ?? msg.session ?? msg.sessionName
+        ?? (typeof msg.id === 'string' && msg.id ? `deck_sub_${msg.id}` : undefined);
       const privateSession = isIncognitoSession(eventForPrivacy?.payload)
-        || this.incognitoSessions.has(String(eventForPrivacy?.sessionId ?? msg.session ?? msg.sessionName));
+        || (sessionHint ? this.incognitoSessions.has(String(sessionHint)) : false);
       if (env && !privateSession) {
         const pushType = msg.type as string;
         if (pushType === 'session.idle') {
@@ -6964,6 +6981,8 @@ export class WsBridge {
         this.upgradeBlockedSyncCompleteGeneration = null;
         this.recentTextBySession.clear();
         this.incognitoSessions.clear();
+        this.pendingIncognitoSubSessionStarts.clear();
+        this.rejectedIncognitoSubSessions.clear();
         this.clearPendingIdlePushes();
         this.activeMainSessions.clear();
         this.activeSubSessions.clear();
@@ -7865,17 +7884,55 @@ export class WsBridge {
       }
       if (browserMessageType === 'subsession.start' && msg.incognito === true && typeof msg.id === 'string' && msg.id) {
         const agentType = typeof msg.sessionType === 'string' && msg.sessionType ? msg.sessionType : undefined;
-        if (supportsSessionIncognito(agentType)) {
-          const subSessionName = `deck_sub_${msg.id}`;
-          this.incognitoSessions.add(subSessionName);
-          this.activeSubSessions.set(subSessionName, {
-            name: subSessionName,
-            state: 'starting',
-            label: typeof msg.label === 'string' && msg.label.trim() ? msg.label.trim() : undefined,
-            parentSession: typeof msg.parentSession === 'string' && msg.parentSession ? msg.parentSession : undefined,
-            agentType,
-            runtimeType: agentType ? getSessionRuntimeType(agentType) : undefined,
+        const parentSession = typeof msg.parentSession === 'string' && msg.parentSession ? msg.parentSession : undefined;
+        const subSessionName = `deck_sub_${msg.id}`;
+        const daemonCapable = !this.daemonP2pWorkflowCapabilities
+          || this.daemonP2pWorkflowCapabilities.capabilities.includes(SESSION_INCOGNITO_CAPABILITY);
+        if (
+          !supportsSessionIncognito(agentType)
+          || !this.daemonWs
+          || !this.authenticated
+          || this.daemonWs.readyState !== WebSocket.OPEN
+          || !daemonCapable
+        ) {
+          this.cleanupIncognitoSubSession(subSessionName, msg.id);
+          const errorFrame = JSON.stringify({
+            type: 'session.error',
+            id: msg.id,
+            session: subSessionName,
+            sessionName: subSessionName,
+            ...(parentSession ? { project: parentSession } : {}),
+            message: SESSION_INCOGNITO_UNSUPPORTED,
           });
+          this.broadcastToBrowsers(errorFrame);
+          this.broadcastToBrowsers(JSON.stringify({
+            type: 'subsession.removed',
+            id: msg.id,
+            sessionName: subSessionName,
+          }));
+          return;
+        }
+        this.rejectedIncognitoSubSessions.delete(subSessionName);
+        this.incognitoSessions.add(subSessionName);
+        this.pendingIncognitoSubSessionStarts.set(subSessionName, { id: msg.id, sessionName: subSessionName });
+        this.activeSubSessions.set(subSessionName, {
+          name: subSessionName,
+          state: 'starting',
+          label: typeof msg.label === 'string' && msg.label.trim() ? msg.label.trim() : undefined,
+          parentSession,
+          agentType,
+          runtimeType: agentType ? getSessionRuntimeType(agentType) : undefined,
+        });
+      }
+      if (browserMessageType === 'subsession.stop' && typeof msg.sessionName === 'string' && msg.sessionName) {
+        const stopTarget = msg.sessionName;
+        const isIncognitoTarget = this.incognitoSessions.has(stopTarget)
+          || this.pendingIncognitoSubSessionStarts.has(stopTarget);
+        const daemonUnavailable = !this.daemonWs
+          || !this.authenticated
+          || this.daemonWs.readyState !== WebSocket.OPEN;
+        if (isIncognitoTarget && (this.pendingIncognitoSubSessionStarts.has(stopTarget) || daemonUnavailable)) {
+          this.cleanupIncognitoSubSession(stopTarget);
         }
       }
       if (browserMessageType === 'subsession.rebuild_all') {
@@ -9507,6 +9564,9 @@ export class WsBridge {
         return;
       }
       if (isIncognitoSession(rawEvent.payload)) this.incognitoSessions.add(sessionId);
+      if (rawEvent.type !== 'session.state' || (rawEvent.payload as Record<string, unknown> | undefined)?.state !== 'error') {
+        this.markIncognitoSubSessionStarted(sessionId);
+      }
       const isPrivate = isIncognitoSession(rawEvent.payload) || this.incognitoSessions.has(sessionId);
       withSessionPrivacy(undefined, isPrivate, () => {
         if (rawEvent.type === 'user.message') {
@@ -9588,6 +9648,7 @@ export class WsBridge {
         logger.warn({ serverId: this.serverId }, 'subsession.response missing sessionName — discarded');
         return;
       }
+      this.markIncognitoSubSessionStarted(sessionName);
       // Control-plane: bypass the PTY queue.
       this.sendJsonToSessionSubscribers(sessionName, JSON.stringify(msg));
       return;
@@ -9600,6 +9661,7 @@ export class WsBridge {
         logger.warn({ serverId: this.serverId, type }, 'session notification missing session — discarded');
         return;
       }
+      this.markIncognitoSubSessionStarted(sessionName);
       // Control-plane: bypass the PTY queue. session.idle is the WS twin
       // of the cancel/stop push notification — must arrive without queueing
       // behind PTY frames so the browser spinner clears in lockstep with
@@ -9739,12 +9801,22 @@ export class WsBridge {
     if (type === 'subsession.closed') {
       const id = typeof msg.id === 'string' ? msg.id : '';
       const incognitoSubName = id ? `deck_sub_${id}` : '';
-      if (id && this.incognitoSessions.has(incognitoSubName)) {
-        this.incognitoSessions.delete(incognitoSubName);
-        this.recentTextBySession.delete(incognitoSubName);
-        this.activeSubSessions.delete(incognitoSubName);
-        this.invalidateSessionOwnershipCache(incognitoSubName);
-        this.broadcastToBrowsers(JSON.stringify({ type: 'subsession.removed', id, sessionName: msg.sessionName ?? incognitoSubName }));
+      if (
+        id
+        && (
+          this.incognitoSessions.has(incognitoSubName)
+          || this.pendingIncognitoSubSessionStarts.has(incognitoSubName)
+          || this.rejectedIncognitoSubSessions.has(incognitoSubName)
+          || msg.incognito === true
+        )
+      ) {
+        const hadLiveEntry = this.incognitoSessions.has(incognitoSubName)
+          || this.activeSubSessions.has(incognitoSubName)
+          || this.pendingIncognitoSubSessionStarts.has(incognitoSubName);
+        this.cleanupIncognitoSubSession(incognitoSubName, id);
+        if (!hadLiveEntry) {
+          this.broadcastToBrowsers(JSON.stringify({ type: 'subsession.removed', id, sessionName: msg.sessionName ?? incognitoSubName }));
+        }
         return;
       }
       if (id && this.db) {
@@ -10066,6 +10138,71 @@ export class WsBridge {
       helloEpoch,
       sentAt,
     }));
+  }
+
+  private markIncognitoSubSessionStarted(sessionName: string): void {
+    if (!sessionName) return;
+    this.pendingIncognitoSubSessionStarts.delete(sessionName);
+  }
+
+  private cleanupIncognitoSubSession(sessionName: string, explicitId?: string): void {
+    const id = explicitId || rawSubSessionIdFromDisplayName(sessionName) || '';
+    const canonicalName = sessionName || (id ? `deck_sub_${id}` : '');
+    if (!canonicalName) return;
+    const wasTracked = this.incognitoSessions.delete(canonicalName);
+    const hadActive = this.activeSubSessions.delete(canonicalName);
+    const wasPending = this.pendingIncognitoSubSessionStarts.delete(canonicalName);
+    if (this.rejectedIncognitoSubSessions.size >= 256) {
+      this.rejectedIncognitoSubSessions.clear();
+    }
+    this.rejectedIncognitoSubSessions.add(canonicalName);
+    this.recentTextBySession.delete(canonicalName);
+    this.activeDispatchIds.delete(canonicalName);
+    this.sessionRuntimeTypes.delete(canonicalName);
+    for (const [ws, subs] of this.timelineSubscriptions) {
+      subs.delete(canonicalName);
+      this.clearTimelineLatestValueFingerprints(ws, canonicalName);
+    }
+    for (const [ws, subs] of this.browserSubscriptions) {
+      if (subs.has(canonicalName)) this.removeBrowserSessionSubscription(ws, canonicalName);
+    }
+    for (const subs of this.transportSubscriptions.values()) {
+      subs.delete(canonicalName);
+    }
+    this.invalidateSessionOwnershipCache(canonicalName);
+    if ((wasTracked || hadActive || wasPending) && id) {
+      this.broadcastToBrowsers(JSON.stringify({
+        type: 'subsession.removed',
+        id,
+        sessionName: canonicalName,
+      }));
+    }
+  }
+
+  private rollbackIncognitoSubSessionsOnDaemonError(msg: Record<string, unknown>): void {
+    const errorId = typeof msg.id === 'string' && msg.id ? msg.id : '';
+    const rawSession = typeof msg.sessionName === 'string' && msg.sessionName
+      ? msg.sessionName
+      : (typeof msg.session === 'string' && msg.session ? msg.session : '');
+    const targetSession = rawSession || (errorId ? `deck_sub_${errorId}` : '');
+    const messageText = typeof msg.message === 'string' ? msg.message : '';
+    if (targetSession) {
+      if (
+        this.pendingIncognitoSubSessionStarts.has(targetSession)
+        || (this.incognitoSessions.has(targetSession) && messageText === SESSION_INCOGNITO_UNSUPPORTED)
+      ) {
+        this.cleanupIncognitoSubSession(targetSession, errorId || undefined);
+      }
+      return;
+    }
+    if (
+      this.pendingIncognitoSubSessionStarts.size > 0
+      && (messageText === SESSION_INCOGNITO_UNSUPPORTED || /incognito/i.test(messageText))
+    ) {
+      for (const [subName, pending] of [...this.pendingIncognitoSubSessionStarts]) {
+        this.cleanupIncognitoSubSession(subName, pending.id);
+      }
+    }
   }
 
   private routeBinaryFrame(data: Buffer): void {

@@ -37,7 +37,7 @@ import {
   shouldAutoRespawnDeadProcessSubSession,
 } from './restart-continuation.js';
 import { isIncognitoSession } from '../../shared/session-incognito-types.js';
-import { isIncognitoSessionName, notifySessionTeardown } from '../../shared/session-incognito-context.js';
+import { isIncognitoSessionName, notifySessionTeardown, setSessionIncognito } from '../../shared/session-incognito-context.js';
 import { getTransportQueueStore } from './transport-queue-store.js';
 import { getDefaultTimelineDetailStore } from './timeline-detail-store.js';
 import { hookCredentialEnv, mintHookCredential } from './hook-session-credential.js';
@@ -490,6 +490,17 @@ export async function stopSubSession(
 ): Promise<CloseTreeResult> {
   const record = getSession(sessionName);
   if (!record) {
+    const id = sessionName.replace(/^deck_sub_/, '');
+    if (serverLink && id !== sessionName) {
+      try { serverLink.send({ type: 'subsession.closed', id, sessionName }); } catch { /* ignore */ }
+    }
+    clearResend(sessionName, 'session_removed');
+    clearSessionRestartContinuation(sessionName);
+    timelineEmitter.forgetSession(sessionName);
+    notifySessionTeardown(sessionName);
+    getTransportQueueStore().discardSessionQueueState(sessionName);
+    getDefaultTimelineDetailStore().forgetSession(sessionName);
+    setSessionIncognito(sessionName, false);
     return { ok: true, closed: [], failed: [] };
   }
 
