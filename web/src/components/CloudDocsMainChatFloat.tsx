@@ -35,9 +35,14 @@ export interface CloudDocsMainChatContext {
 interface CloudDocsMainChatFloatProps {
   mainChat: CloudDocsMainChatContext;
   activePreviewQuote?: CloudDocQuoteTarget | null;
+  onOpenDoc?: (docId: string) => void;
 }
 
-export function CloudDocsMainChatFloat({ mainChat, activePreviewQuote = null }: CloudDocsMainChatFloatProps) {
+export function CloudDocsMainChatFloat({
+  mainChat,
+  activePreviewQuote = null,
+  onOpenDoc,
+}: CloudDocsMainChatFloatProps) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
   const [dismissedDocKey, setDismissedDocKey] = useState<string | null>(null);
@@ -267,6 +272,7 @@ export function CloudDocsMainChatFloat({ mainChat, activePreviewQuote = null }: 
               scopeFilesToSession={!!session.sharedState && session.sharedState.targetKind !== 'server'}
               readOnlyFiles={!!session.sharedState && session.sharedState.effectiveRole !== 'participant'}
               onQuote={(text) => setExtraQuotes((prev) => [...prev, text])}
+              onCloudDocClick={onOpenDoc}
               agentType={session.agentType}
               onResendFailed={handleResendFailed}
               preview

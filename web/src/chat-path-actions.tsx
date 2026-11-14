@@ -7,9 +7,19 @@ import {
   isLocalChatPath,
 } from '@shared/chat-local-path.js';
 import {
+  splitPlainTextByCloudDocIds,
+  splitTextByCloudDocQuoteTags,
+  type CloudDocTextSegment,
+} from './cloud-docs-reference.js';
+import { splitTextByHttpUrls } from './link-detection.js';
+import {
   ChatLocalImagePreview,
   type ChatLocalImagePreviewLoader,
 } from './components/ChatLocalImagePreview.js';
+import {
+  ChatLoopbackLink,
+  type ChatLocalWebPreviewOpenHandler,
+} from './components/ChatLoopbackLink.js';
 
 export type ChatPathDownloadHandler = (path: string) => void | string | Promise<void | string>;
 
@@ -175,4 +185,178 @@ function ChatPathActions({
 export function renderChatPathActions(options: ChatPathActionOptions): h.JSX.Element {
   const { key, ...rest } = options;
   return <ChatPathActions key={key} {...rest} />;
+}
+
+export interface ChatCloudDocActionOptions {
+  key?: string | number;
+  docId: string;
+  content: ComponentChildren;
+  kind?: CloudDocTextSegment['kind'];
+  code?: boolean;
+  onCloudDocClick?: (docId: string) => void;
+}
+
+/** Render a clickable Cloud Doc chip or inline reference without local-file download/preview chrome. */
+export function renderCloudDocAction({
+  key,
+  docId,
+  content,
+  kind = 'id',
+  code = false,
+  onCloudDocClick,
+}: ChatCloudDocActionOptions): h.JSX.Element {
+  const labelText = typeof content === 'string' ? content : docId;
+  const title = kind === 'quote'
+    ? `[CloudDoc: ${labelText} | id=${docId}]`
+    : docId;
+  const handleActivate = (e: Event) => {
+    if (!onCloudDocClick) return;
+    e.stopPropagation();
+    onCloudDocClick(docId);
+  };
+  const handleKeyDown = (e: KeyboardEvent) => {
+    if (!onCloudDocClick) return;
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      e.stopPropagation();
+      onCloudDocClick(docId);
+    }
+  };
+
+  if (kind === 'quote') {
+    return (
+      <button
+        key={key}
+        type="button"
+        class="chat-cloud-doc-chip"
+        data-testid="chat-cloud-doc-link"
+        data-cloud-doc-id={docId}
+        data-cloud-doc-kind={kind}
+        title={title}
+        aria-label={title}
+        disabled={!onCloudDocClick}
+        onClick={handleActivate}
+      >
+        <svg class="chat-cloud-doc-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path
+            d="M5.5 3.5h7.25L16.5 7.25V19a1.5 1.5 0 0 1-1.5 1.5H5.5A1.5 1.5 0 0 1 4 19V5a1.5 1.5 0 0 1 1.5-1.5Z"
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linejoin="round"
+          />
+          <path d="M12.5 3.75v3.5h3.5" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" />
+          <path
+            d="M15.7 9.8h4.2a2.1 2.1 0 0 0 .25-4.18 2.85 2.85 0 0 0-5.4-.52A2.35 2.35 0 0 0 15.7 9.8Z"
+            fill="#38bdf8"
+            stroke="#0f172a"
+            stroke-width="1.2"
+            stroke-linejoin="round"
+          />
+        </svg>
+        <span class="chat-cloud-doc-label">{content}</span>
+      </button>
+    );
+  }
+
+  const className = code
+    ? `chat-inline-code chat-cloud-doc-link${onCloudDocClick ? ' is-clickable' : ''}`
+    : `chat-cloud-doc-link${onCloudDocClick ? ' is-clickable' : ''}`;
+
+  if (code) {
+    return (
+      <code
+        key={key}
+        role={onCloudDocClick ? 'button' : undefined}
+        tabIndex={onCloudDocClick ? 0 : undefined}
+        class={className}
+        data-testid="chat-cloud-doc-link"
+        data-cloud-doc-id={docId}
+        data-cloud-doc-kind={kind}
+        title={title}
+        onClick={handleActivate}
+        onKeyDown={handleKeyDown}
+      >
+        {content}
+      </code>
+    );
+  }
+
+  return (
+    <span
+      key={key}
+      role={onCloudDocClick ? 'button' : undefined}
+      tabIndex={onCloudDocClick ? 0 : undefined}
+      class={className}
+      data-testid="chat-cloud-doc-link"
+      data-cloud-doc-id={docId}
+      data-cloud-doc-kind={kind}
+      title={title}
+      onClick={handleActivate}
+      onKeyDown={handleKeyDown}
+    >
+      {content}
+    </span>
+  );
+}
+
+/**
+ * Split plain text by Cloud Doc quote tags, HTTP(S) URLs, `cdoc_...` IDs, and
+ * filenames paired with `cdoc_...`, delegating only remaining non-URL text chunks
+ * to `renderPlainText` for local path detection.
+ */
+export function splitTextWithCloudDocsAndUrls(
+  text: string,
+  options: {
+    onCloudDocClick?: (docId: string) => void;
+    onUrlClick?: (url: string) => void;
+    onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
+    renderPlainText: (chunkText: string, baseOffset: number) => h.JSX.Element[];
+  },
+): h.JSX.Element[] {
+  const parts: h.JSX.Element[] = [];
+  for (const quoteSeg of splitTextByCloudDocQuoteTags(text)) {
+    if (quoteSeg.type === 'cloud_doc' && quoteSeg.docId) {
+      parts.push(renderCloudDocAction({
+        key: `cdq${quoteSeg.start}`,
+        docId: quoteSeg.docId,
+        content: quoteSeg.label ?? quoteSeg.value,
+        kind: 'quote',
+        onCloudDocClick: options.onCloudDocClick,
+      }));
+      continue;
+    }
+
+    for (const urlChunk of splitTextByHttpUrls(quoteSeg.value)) {
+      const urlBase = quoteSeg.start + urlChunk.start;
+      if (urlChunk.type === 'url') {
+        parts.push(
+          <ChatLoopbackLink
+            key={`u${urlBase}`}
+            href={urlChunk.value}
+            onOpenLocalWebPreview={options.onOpenLocalWebPreview}
+            onUrlClick={options.onUrlClick}
+          >
+            {urlChunk.value}
+          </ChatLoopbackLink>,
+        );
+        continue;
+      }
+
+      for (const idSeg of splitPlainTextByCloudDocIds(urlChunk.value)) {
+        const segBase = urlBase + idSeg.start;
+        if (idSeg.type === 'cloud_doc' && idSeg.docId) {
+          parts.push(renderCloudDocAction({
+            key: `cd${segBase}`,
+            docId: idSeg.docId,
+            content: idSeg.label ?? idSeg.value,
+            kind: idSeg.kind ?? 'id',
+            onCloudDocClick: options.onCloudDocClick,
+          }));
+        } else {
+          parts.push(...options.renderPlainText(idSeg.value, segBase));
+        }
+      }
+    }
+  }
+  return parts.length ? parts : [<span>{text}</span>];
 }

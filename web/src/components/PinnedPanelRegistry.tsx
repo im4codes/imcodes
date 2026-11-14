@@ -33,6 +33,8 @@ export interface PanelRenderContext {
   onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
   /** Open a loopback URL in the shared local-web-preview host. */
   onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
+  /** Open a Cloud Docs preview by document ID. */
+  onCloudDocClick?: (docId: string) => void;
   /** Sync preview state from a source FileBrowser into the floating preview host/cache. */
   onPreviewStateChange?: (update: FileBrowserPreviewUpdate) => void;
   /** Current active session name — for file browser to follow tab switches */

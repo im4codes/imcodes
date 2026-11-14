@@ -1200,6 +1200,11 @@ function InternalMainApp() {
   const [showCloudDocs, setShowCloudDocs] = useState(false);
   const showCloudDocsRef = useRef(showCloudDocs);
   showCloudDocsRef.current = showCloudDocs;
+  const [cloudDocsRequest, setCloudDocsRequest] = useState<{ docId: string; seq: number } | null>(null);
+  const cloudDocsRequestSeqRef = useRef(0);
+  useEffect(() => {
+    if (!showCloudDocs) setCloudDocsRequest(null);
+  }, [showCloudDocs]);
   const [desktopCloudDocsMaximized, setDesktopCloudDocsMaximized] = useState(false);
   const [cloudDocsGeometryRequest, setCloudDocsGeometryRequest] = useState<{
     version: number;
@@ -2905,6 +2910,14 @@ function InternalMainApp() {
   const bringDesktopWindowToFront = useCallback((id: string) => {
     if (stackRef.current!.bringToFront(id)) bumpStack();
   }, []);
+
+  const openCloudDocPreview = useCallback((docId: string) => {
+    const trimmed = docId.trim();
+    if (!trimmed) return;
+    setCloudDocsRequest({ docId: trimmed, seq: ++cloudDocsRequestSeqRef.current });
+    setShowCloudDocs(true);
+    bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.cloudDocs);
+  }, [bringDesktopWindowToFront]);
 
   const focusFilePreviewWindow = useCallback(() => {
     ensureDesktopWindow(DESKTOP_WINDOW_IDS.filePreview, {
@@ -8234,6 +8247,7 @@ function InternalMainApp() {
       },
       onOpenNodeGroups: openControlledNodes,
       onOpenLocalWebPreview: openLocalWebPreviewFromChat,
+      onCloudDocClick: openCloudDocPreview,
       onPreviewStateChange: handlePreviewStateChange,
       activeSession,
       activeProjectDir: activeSessionInfo?.projectDir,
@@ -9168,6 +9182,7 @@ function InternalMainApp() {
                 }}
                 onPreviewFile={(request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: false })}
                 onOpenLocalWebPreview={openLocalWebPreviewFromChat}
+                onCloudDocClick={openCloudDocPreview}
                 onAfterAction={focusTerminal}
                 mobileFileBrowserOpen={s.name === activeSession ? showMobileFileBrowser : false}
                 onMobileFileBrowserClose={() => setShowMobileFileBrowser(false)}
@@ -9915,7 +9930,7 @@ function InternalMainApp() {
           minH={360}
           getDefaultGeometry={getDesktopMaximizeBounds}
           defaultVersion={2}
-          zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.cloudDocs, 5102)}
+          zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.cloudDocs, isMobile ? 6520 : 5102)}
           onFocus={() => bringDesktopWindowToFront(DESKTOP_WINDOW_IDS.cloudDocs)}
           onOpenNewWindow={!isMobile ? () => {
             if (openCloudDocsWindow()) setShowCloudDocs(false);
@@ -9929,6 +9944,7 @@ function InternalMainApp() {
           geometryRequest={cloudDocsGeometryRequest}
         >
           <CloudDocsPanel
+            docRequest={cloudDocsRequest}
             onQuoteDoc={handleQuoteCloudDoc}
             mainChat={cloudDocsMainChatContext}
           />
@@ -10226,6 +10242,7 @@ function InternalMainApp() {
               })}
               onPreviewFile={(request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: false })}
               onOpenLocalWebPreview={openLocalWebPreviewFromChat}
+              onCloudDocClick={openCloudDocPreview}
               zIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.subSession(sub.id), 6000)}
               onFocus={() => bringSubToFront(sub.id)}
               desktopFileBrowserZIndex={getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.subsessionFileBrowser(sub.id), getDesktopWindowZIndex(DESKTOP_WINDOW_IDS.subSession(sub.id), 6000) + 1)}

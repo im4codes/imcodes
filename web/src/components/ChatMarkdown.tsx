@@ -24,10 +24,17 @@ import { copyToClipboard } from '../util/clipboard.js';
 import { shouldSkipRichTextEnhancement } from '../chat-render-limits.js';
 import { repairStreamingMarkdown, STREAMING_MARKDOWN_REFRESH_MS } from '../streaming-markdown.js';
 import {
-  isImagePreviewPath,
   renderChatPathActions,
+  renderCloudDocAction,
+  isImagePreviewPath,
+  splitTextWithCloudDocsAndUrls,
   type ChatPathDownloadHandler,
 } from '../chat-path-actions.js';
+import {
+  extractCloudDocIdToken,
+  findPairedCloudDocIdInTrailingText,
+  parseCloudDocQuoteTag,
+} from '../cloud-docs-reference.js';
 import type { ChatLocalImagePreviewLoader } from './ChatLocalImagePreview.js';
 import {
   ChatLoopbackLink,
@@ -41,6 +48,7 @@ interface Props {
   /** Streaming blocks re-parse at most 10Hz (always rendered as Markdown); finalized blocks update immediately. */
   streaming?: boolean;
   onPathClick?: (path: string) => void;
+  onCloudDocClick?: (docId: string) => void;
   onUrlClick?: (url: string) => void;
   /** Called to download a file path. Only shown for paths with extensions. */
   onDownload?: ChatPathDownloadHandler;
@@ -51,6 +59,7 @@ interface Props {
 
 interface RenderContext {
   onPathClick?: (path: string) => void;
+  onCloudDocClick?: (docId: string) => void;
   onUrlClick?: (url: string) => void;
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
@@ -58,6 +67,7 @@ interface RenderContext {
   onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
   downloadLabel: string;
   htmlPreviewLabel: string;
+  trailingCloudDocId?: string | null;
 }
 
 // ── Code block with copy button ────────────────────────────────────────────
@@ -66,6 +76,7 @@ function CodeBlock({
   lang,
   text,
   onPathClick,
+  onCloudDocClick,
   onUrlClick,
   onDownload,
   onHtmlPreview,
@@ -77,6 +88,7 @@ function CodeBlock({
   lang?: string;
   text: string;
   onPathClick?: (path: string) => void;
+  onCloudDocClick?: (docId: string) => void;
   onUrlClick?: (url: string) => void;
   onDownload?: ChatPathDownloadHandler;
   onHtmlPreview?: (path: string) => void;
@@ -98,6 +110,7 @@ function CodeBlock({
 
   const renderContext: RenderContext = {
     onPathClick,
+    onCloudDocClick,
     onUrlClick,
     onDownload,
     onHtmlPreview,
@@ -139,21 +152,44 @@ function CodeBlock({
 
 // ── Token rendering ─────────────────────────────────────────────────────────
 
+const INLINE_CLOUD_DOC_PAIRABLE_TYPES = new Set(['codespan', 'text', 'strong', 'em', 'del']);
+
+function trailingRawTextAfterToken(tokens: Token[], index: number): string {
+  let raw = '';
+  for (let i = index + 1; i < tokens.length && raw.length < 140; i += 1) {
+    raw += String((tokens[i] as { raw?: string }).raw ?? '');
+  }
+  return raw;
+}
+
 function renderTokens(
   tokens: Token[],
   ctx: RenderContext,
   inLink = false,
+  propagateTrailingDoc = false,
 ): h.JSX.Element[] {
-  return tokens.map((token, i) => renderToken(token, i, ctx, inLink));
+  const baseCtx = ctx.trailingCloudDocId ? { ...ctx, trailingCloudDocId: undefined } : ctx;
+  return tokens.map((token, i) => {
+    const inheritedTrailing = propagateTrailingDoc && i === tokens.length - 1
+      ? (ctx.trailingCloudDocId ?? null)
+      : null;
+    const lookaheadDocId = !inLink && INLINE_CLOUD_DOC_PAIRABLE_TYPES.has(token.type)
+      ? findPairedCloudDocIdInTrailingText(trailingRawTextAfterToken(tokens, i))
+      : null;
+    const trailingCloudDocId = lookaheadDocId ?? inheritedTrailing;
+    const tokenCtx = trailingCloudDocId ? { ...baseCtx, trailingCloudDocId } : baseCtx;
+    return renderToken(token, i, tokenCtx, inLink);
+  });
 }
 
 function renderInlineTokens(
   tokens: Token[] | undefined,
   ctx: RenderContext,
   inLink = false,
+  propagateTrailingDoc = false,
 ): h.JSX.Element[] {
   if (!tokens || tokens.length === 0) return [];
-  return renderTokens(tokens, ctx, inLink);
+  return renderTokens(tokens, ctx, inLink, propagateTrailingDoc);
 }
 
 function renderToken(
@@ -182,7 +218,7 @@ function renderToken(
       const t = token as Tokens.Text;
       // Text tokens may have sub-tokens (e.g. from inline parsing)
       if ('tokens' in t && t.tokens && t.tokens.length > 0) {
-        return <span key={key}>{renderInlineTokens(t.tokens, ctx, inLink)}</span>;
+        return <span key={key}>{renderInlineTokens(t.tokens, ctx, inLink, !!ctx.trailingCloudDocId)}</span>;
       }
       // Plain text — apply path/URL detection IF NOT already inside a link
       if (inLink) return <span key={key}>{t.raw}</span>;
@@ -191,40 +227,75 @@ function renderToken(
 
     case 'strong': {
       const t = token as Tokens.Strong;
-      return <strong key={key}>{renderInlineTokens(t.tokens, ctx, inLink)}</strong>;
+      return <strong key={key}>{renderInlineTokens(t.tokens, ctx, inLink, !!ctx.trailingCloudDocId)}</strong>;
     }
 
     case 'em': {
       const t = token as Tokens.Em;
-      return <em key={key}>{renderInlineTokens(t.tokens, ctx, inLink)}</em>;
+      return <em key={key}>{renderInlineTokens(t.tokens, ctx, inLink, !!ctx.trailingCloudDocId)}</em>;
     }
 
     case 'del': {
       const t = token as Tokens.Del;
-      return <del key={key}>{renderInlineTokens(t.tokens, ctx, inLink)}</del>;
+      return <del key={key}>{renderInlineTokens(t.tokens, ctx, inLink, !!ctx.trailingCloudDocId)}</del>;
     }
 
     case 'codespan': {
       const t = token as Tokens.Codespan;
+      if (!inLink) {
+        const quoteTag = parseCloudDocQuoteTag(t.text);
+        if (quoteTag) {
+          return renderCloudDocAction({
+            key,
+            docId: quoteTag.docId,
+            content: quoteTag.name,
+            kind: 'quote',
+            onCloudDocClick: ctx.onCloudDocClick,
+          });
+        }
+        const cloudDocIdToken = extractCloudDocIdToken(t.text);
+        if (cloudDocIdToken) {
+          return renderCloudDocAction({
+            key,
+            docId: cloudDocIdToken.docId,
+            content: t.text,
+            kind: 'id',
+            code: true,
+            onCloudDocClick: ctx.onCloudDocClick,
+          });
+        }
+      }
       if (!inLink && splitTextByHttpUrls(t.text).some((chunk) => chunk.type === 'url')) {
-        return <code key={key} class="chat-inline-code">{splitPathsAndUrlsInternal(t.text, ctx)}</code>;
+        return <code key={key} class="chat-inline-code">{splitPathsAndUrlsInternal(t.text, { ...ctx, trailingCloudDocId: undefined })}</code>;
       }
       // Detect complete file references inside backtick code spans — agents
       // commonly use this old output format, including source `path:line`.
       const codePath = normalizeChatFileReference(t.text);
-      if ((ctx.onPathClick || ctx.onImagePreview) && codePath && chatPathHasFileExtension(codePath)) {
-        return renderChatPathActions({
-          key,
-          path: codePath,
-          content: t.text,
-          code: true,
-          onPathClick: ctx.onPathClick,
-          onDownload: ctx.onDownload,
-          onHtmlPreview: ctx.onHtmlPreview,
-          onImagePreview: ctx.onImagePreview,
-          downloadLabel: ctx.downloadLabel,
-          htmlPreviewLabel: ctx.htmlPreviewLabel,
-        });
+      if (codePath && chatPathHasFileExtension(codePath)) {
+        if (!inLink && ctx.trailingCloudDocId) {
+          return renderCloudDocAction({
+            key,
+            docId: ctx.trailingCloudDocId,
+            content: t.text,
+            kind: 'paired_file',
+            code: true,
+            onCloudDocClick: ctx.onCloudDocClick,
+          });
+        }
+        if (ctx.onPathClick || ctx.onImagePreview) {
+          return renderChatPathActions({
+            key,
+            path: codePath,
+            content: t.text,
+            code: true,
+            onPathClick: ctx.onPathClick,
+            onDownload: ctx.onDownload,
+            onHtmlPreview: ctx.onHtmlPreview,
+            onImagePreview: ctx.onImagePreview,
+            downloadLabel: ctx.downloadLabel,
+            htmlPreviewLabel: ctx.htmlPreviewLabel,
+          });
+        }
       }
       return <code key={key} class="chat-inline-code">{t.text}</code>;
     }
@@ -237,6 +308,7 @@ function renderToken(
           lang={t.lang}
           text={t.text}
           onPathClick={ctx.onPathClick}
+          onCloudDocClick={ctx.onCloudDocClick}
           onUrlClick={ctx.onUrlClick}
           onDownload={ctx.onDownload}
           onHtmlPreview={ctx.onHtmlPreview}
@@ -250,6 +322,16 @@ function renderToken(
 
     case 'link': {
       const t = token as Tokens.Link;
+      const cloudHref = !inLink ? extractCloudDocIdToken(t.href) : null;
+      if (cloudHref) {
+        return renderCloudDocAction({
+          key,
+          docId: cloudHref.docId,
+          content: renderInlineTokens(t.tokens, ctx, true),
+          kind: 'id',
+          onCloudDocClick: ctx.onCloudDocClick,
+        });
+      }
       const path = markdownLocalPath(t.raw, t.href);
       if (path !== null) {
         return renderChatPathActions({
@@ -394,82 +476,114 @@ function splitPathsAndUrlsInternal(
   text: string,
   ctx: RenderContext,
 ): h.JSX.Element[] {
-  if (!ctx.onPathClick && !ctx.onUrlClick && !ctx.onImagePreview) return [<span>{text}</span>];
+  const hasCloudDocText = text.includes('cdoc_') || text.includes('[CloudDoc:');
+  if (
+    !ctx.onPathClick
+    && !ctx.onUrlClick
+    && !ctx.onImagePreview
+    && !ctx.onOpenLocalWebPreview
+    && !ctx.onCloudDocClick
+    && !ctx.trailingCloudDocId
+    && !hasCloudDocText
+  ) {
+    return [<span>{text}</span>];
+  }
 
   // A complete path occupying the text/code line has an unambiguous boundary,
   // so preserve spaces and Unicode instead of letting the inline regex stop at
   // the first space. Prose containing a path still follows the conservative
   // token scanner below.
-  const standaloneRaw = text.trim();
-  const standaloneMatches = findChatFileReferencesInText(standaloneRaw);
-  const standaloneMatch = standaloneMatches.length === 1
-    && standaloneMatches[0].start === 0
-    && standaloneMatches[0].end === standaloneRaw.length
-    ? standaloneMatches[0]
-    : null;
-  const standalonePath = standaloneMatch?.path ?? null;
-  if (standalonePath) {
-    const leadingLength = text.indexOf(standaloneRaw);
-    const trailingStart = leadingLength + standaloneRaw.length;
-    return [
-      ...(leadingLength > 0 ? [<span key="standalone-leading">{text.slice(0, leadingLength)}</span>] : []),
-      renderChatPathActions({
-        key: 'standalone-path',
-        path: standalonePath,
-        content: standaloneRaw,
-        onPathClick: ctx.onPathClick,
-        onDownload: ctx.onDownload,
-        onHtmlPreview: ctx.onHtmlPreview,
-        onImagePreview: ctx.onImagePreview,
-        downloadLabel: ctx.downloadLabel,
-        htmlPreviewLabel: ctx.htmlPreviewLabel,
-      }),
-      ...(trailingStart < text.length ? [<span key="standalone-trailing">{text.slice(trailingStart)}</span>] : []),
-    ];
-  }
-
-  const parts: h.JSX.Element[] = [];
-  const chunks = splitTextByHttpUrls(text);
-
-  for (const chunk of chunks) {
-    if (chunk.type === 'url') {
-      parts.push(
-        <ChatLoopbackLink
-          key={`u${chunk.start}`}
-          href={chunk.value}
-          onOpenLocalWebPreview={ctx.onOpenLocalWebPreview}
-          onUrlClick={ctx.onUrlClick}
-        >
-          {chunk.value}
-        </ChatLoopbackLink>,
-      );
-    } else if (ctx.onPathClick || ctx.onImagePreview) {
-      let pathLast = 0;
-      for (const match of findChatFileReferencesInText(chunk.value)) {
-        const { path } = match;
-        if (match.start > pathLast) parts.push(<span key={`t${chunk.start + pathLast}`}>{chunk.value.slice(pathLast, match.start)}</span>);
-        parts.push(
-          renderChatPathActions({
-            key: `p${chunk.start + match.start}`,
-            path,
-            content: match.raw,
+  if (!hasCloudDocText) {
+    const standaloneRaw = text.trim();
+    const standaloneMatches = findChatFileReferencesInText(standaloneRaw);
+    const standaloneMatch = standaloneMatches.length === 1
+      && standaloneMatches[0].start === 0
+      && standaloneMatches[0].end === standaloneRaw.length
+      ? standaloneMatches[0]
+      : null;
+    const standalonePath = standaloneMatch?.path ?? null;
+    if (standalonePath) {
+      const leadingLength = text.indexOf(standaloneRaw);
+      const trailingStart = leadingLength + standaloneRaw.length;
+      const actionEl = ctx.trailingCloudDocId
+        ? renderCloudDocAction({
+            key: 'standalone-cloud-doc',
+            docId: ctx.trailingCloudDocId,
+            content: standaloneRaw,
+            kind: 'paired_file',
+            onCloudDocClick: ctx.onCloudDocClick,
+          })
+        : renderChatPathActions({
+            key: 'standalone-path',
+            path: standalonePath,
+            content: standaloneRaw,
             onPathClick: ctx.onPathClick,
             onDownload: ctx.onDownload,
             onHtmlPreview: ctx.onHtmlPreview,
             onImagePreview: ctx.onImagePreview,
             downloadLabel: ctx.downloadLabel,
             htmlPreviewLabel: ctx.htmlPreviewLabel,
-          }),
-        );
-        pathLast = match.end;
-      }
-      if (pathLast < chunk.value.length) parts.push(<span key={`t${chunk.start + pathLast}`}>{chunk.value.slice(pathLast)}</span>);
-    } else {
-      parts.push(<span key={`t${chunk.start}`}>{chunk.value}</span>);
+          });
+      return [
+        ...(leadingLength > 0 ? [<span key="standalone-leading">{text.slice(0, leadingLength)}</span>] : []),
+        actionEl,
+        ...(trailingStart < text.length ? [<span key="standalone-trailing">{text.slice(trailingStart)}</span>] : []),
+      ];
     }
   }
 
-  return parts.length ? parts : [<span>{text}</span>];
+  return splitTextWithCloudDocsAndUrls(text, {
+    onCloudDocClick: ctx.onCloudDocClick,
+    onUrlClick: ctx.onUrlClick,
+    onOpenLocalWebPreview: ctx.onOpenLocalWebPreview,
+    renderPlainText: (chunkText, baseOffset) => {
+      const canPairTrailingFile = Boolean(ctx.trailingCloudDocId) && baseOffset + chunkText.length === text.length;
+      if (!ctx.onPathClick && !ctx.onImagePreview && !canPairTrailingFile) {
+        return [<span key={`t${baseOffset}`}>{chunkText}</span>];
+      }
+      const parts: h.JSX.Element[] = [];
+      let pathLast = 0;
+      const trimmedChunkLen = chunkText.trimEnd().length;
+      for (const match of findChatFileReferencesInText(chunkText)) {
+        const { path } = match;
+        if (match.start > pathLast) {
+          parts.push(<span key={`t${baseOffset + pathLast}`}>{chunkText.slice(pathLast, match.start)}</span>);
+        }
+        if (canPairTrailingFile && ctx.trailingCloudDocId && match.end === trimmedChunkLen) {
+          parts.push(
+            renderCloudDocAction({
+              key: `cd${baseOffset + match.start}`,
+              docId: ctx.trailingCloudDocId,
+              content: match.raw,
+              kind: 'paired_file',
+              onCloudDocClick: ctx.onCloudDocClick,
+            }),
+          );
+        } else if (ctx.onPathClick || ctx.onImagePreview) {
+          parts.push(
+            renderChatPathActions({
+              key: `p${baseOffset + match.start}`,
+              path,
+              content: match.raw,
+              onPathClick: ctx.onPathClick,
+              onDownload: ctx.onDownload,
+              onHtmlPreview: ctx.onHtmlPreview,
+              onImagePreview: ctx.onImagePreview,
+              downloadLabel: ctx.downloadLabel,
+              htmlPreviewLabel: ctx.htmlPreviewLabel,
+            }),
+          );
+        } else {
+          parts.push(<span key={`t${baseOffset + match.start}`}>{match.raw}</span>);
+        }
+        pathLast = match.end;
+      }
+      if (pathLast < chunkText.length) {
+        parts.push(<span key={`t${baseOffset + pathLast}`}>{chunkText.slice(pathLast)}</span>);
+      }
+      return parts.length ? parts : [<span key={`t${baseOffset}`}>{chunkText}</span>];
+    },
+  });
 }
 
 // ── Public component ────────────────────────────────────────────────────────
@@ -519,7 +633,7 @@ function parseMarkdownTokens(text: string, cacheKey?: string): Token[] {
   return tokens;
 }
 
-export function ChatMarkdown({ text, cacheKey, streaming = false, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, onOpenLocalWebPreview }: Props) {
+export function ChatMarkdown({ text, cacheKey, streaming = false, onPathClick, onCloudDocClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, onOpenLocalWebPreview }: Props) {
   const { t } = useTranslation();
   // A streaming block re-parses at most every STREAMING_MARKDOWN_REFRESH_MS
   // (a THROTTLE with a trailing update: a steady stream can never starve it, and
@@ -557,6 +671,7 @@ export function ChatMarkdown({ text, cacheKey, streaming = false, onPathClick, o
   ), [skipRichTextEnhancement, effectiveParsedText, cacheKey]);
   const renderContext = useMemo<RenderContext>(() => ({
     onPathClick,
+    onCloudDocClick,
     onUrlClick,
     onDownload,
     onHtmlPreview,
@@ -564,7 +679,7 @@ export function ChatMarkdown({ text, cacheKey, streaming = false, onPathClick, o
     onOpenLocalWebPreview,
     downloadLabel: t('upload.download_file'),
     htmlPreviewLabel: t('chat.html_preview', 'Render HTML'),
-  }), [onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, onOpenLocalWebPreview, t]);
+  }), [onPathClick, onCloudDocClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, onOpenLocalWebPreview, t]);
 
   if (skipRichTextEnhancement) {
     return (

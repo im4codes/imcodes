@@ -363,7 +363,7 @@ export type FileBrowserPreviewState =
   // event, so a slow or never-loading handle can never look like a rendered
   // (but empty) image.
   | { status: 'image'; path: string; dataUrl: string; downloadId?: string; settling?: boolean }
-  | { status: 'office'; path: string; srcUrl: string; mimeType: string; downloadId?: string }
+  | { status: 'office'; path: string; srcUrl: string; mimeType: string; downloadId?: string; verified?: boolean }
   | { status: 'video'; path: string; streamUrl: string; mimeType: string; downloadId?: string }
   | { status: 'audio'; path: string; streamUrl: string; mimeType: string; downloadId?: string }
   | { status: 'error'; path: string; error: string; downloadId?: string };
@@ -1194,29 +1194,30 @@ export function FileBrowser({
             return;
           }
           const officeErrorFallbackType = getAutoOfficePreviewType(filePath);
+          const errorCodeOrMessage = String(msg.error ?? '');
+          const isMissingFileError = msg.error === FS_READ_ERROR_CODES.PARENT_NOT_FOUND
+            || /not[_ -]?found|enoent|no such file/i.test(errorCodeOrMessage);
           if (
             officeErrorFallbackType
             && serverId
+            && dlId
+            && !isMissingFileError
             && msg.error !== FS_READ_ERROR_CODES.FORBIDDEN_PATH
             && msg.error !== FS_READ_ERROR_CODES.FILE_TOO_LARGE
           ) {
-            if (dlId) {
-              void buildAttachmentDownloadUrl(serverId, dlId, sessionName)
-                .then((streamUrl) => {
-                  if (!mountedRef.current) return;
-                  const stillActive = getActivePreviewCycle(filePath);
-                  if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
-                  setPreview({ status: 'office', path: filePath, srcUrl: streamUrl, mimeType: officeErrorFallbackType, downloadId: dlId });
-                })
-                .catch(() => {
-                  if (!mountedRef.current) return;
-                  const stillActive = getActivePreviewCycle(filePath);
-                  if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
-                  setPreview({ status: 'office', path: filePath, srcUrl: '', mimeType: officeErrorFallbackType, downloadId: dlId });
-                });
-            } else {
-              setPreview({ status: 'office', path: filePath, srcUrl: '', mimeType: officeErrorFallbackType });
-            }
+            void buildAttachmentDownloadUrl(serverId, dlId, sessionName)
+              .then((streamUrl) => {
+                if (!mountedRef.current) return;
+                const stillActive = getActivePreviewCycle(filePath);
+                if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
+                setPreview({ status: 'office', path: filePath, srcUrl: streamUrl, mimeType: officeErrorFallbackType, downloadId: dlId, verified: false });
+              })
+              .catch(() => {
+                if (!mountedRef.current) return;
+                const stillActive = getActivePreviewCycle(filePath);
+                if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
+                finishPreviewError(filePath, t('file_browser.preview_error'), dlId);
+              });
             return;
           }
           const errKey = msg.error === FS_READ_ERROR_CODES.FILE_TOO_LARGE ? 'file_browser.preview_too_large'
@@ -1290,7 +1291,7 @@ export function FileBrowser({
               if (!mountedRef.current) return;
               const stillActive = getActivePreviewCycle(filePath);
               if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
-              setPreview({ status: 'office', path: filePath, srcUrl: streamUrl, mimeType, downloadId: dlId });
+              setPreview({ status: 'office', path: filePath, srcUrl: streamUrl, mimeType, downloadId: dlId, verified: true });
             })
             .catch(() => {
               if (!mountedRef.current) return;
@@ -1302,7 +1303,7 @@ export function FileBrowser({
         }
         if (officeType && serverId && typeof msg.content === 'string') {
           const inlineSrcUrl = `data:${officeType};charset=utf-8,${encodeURIComponent(msg.content)}`;
-          setPreview({ status: 'office', path: filePath, srcUrl: inlineSrcUrl, mimeType: officeType, downloadId: dlId });
+          setPreview({ status: 'office', path: filePath, srcUrl: inlineSrcUrl, mimeType: officeType, downloadId: dlId, verified: true });
           return;
         }
 
@@ -1891,7 +1892,7 @@ export function FileBrowser({
     // must never auto-enter Cloud Docs Recent.
     // Markdown (.md) files must NOT record merely on preview.status === 'office' (ONLYOFFICE
     // might be disabled or fail & fall back locally); they record only inside handleOnlyOfficeOpened.
-    if (preview.status !== 'office' || isInternalUploadTempFilePath(preview.path)) {
+    if (preview.status !== 'office' || !preview.verified || isInternalUploadTempFilePath(preview.path)) {
       lastRecordedRecentOfficeKeyRef.current = null;
       return;
     }
@@ -1917,7 +1918,7 @@ export function FileBrowser({
 
   const handleOnlyOfficeOpened = useCallback((info: { mode: 'view' | 'edit' }) => {
     if (preview.status !== 'office' || isInternalUploadTempFilePath(preview.path)) return;
-    if (!isMarkdownFilePath(preview.path, preview.mimeType)) return;
+    if (preview.verified && !isMarkdownFilePath(preview.path, preview.mimeType)) return;
     const targetServerId = activeSharedDocServerId || serverId;
     if (!targetServerId || typeof recordRecentDocumentApi !== 'function') return;
     const key = `${targetServerId}:${preview.path}`;
@@ -2557,6 +2558,7 @@ export function FileBrowser({
                 srcUrl: '',
                 mimeType: mime,
                 downloadId: preview.downloadId,
+                verified: true,
               });
             }}
           >

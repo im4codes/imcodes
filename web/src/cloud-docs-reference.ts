@@ -259,3 +259,173 @@ export function executeCloudDocQuote(input: ExecuteCloudDocQuoteInput): Resolved
 
   return destination;
 }
+
+export interface CloudDocTextSegment {
+  type: 'text' | 'cloud_doc';
+  value: string;
+  start: number;
+  end: number;
+  docId?: string;
+  label?: string;
+  kind?: 'quote' | 'id' | 'paired_file';
+}
+
+const CLOUD_DOC_ID_BODY = 'cdoc_[A-Za-z0-9_-]{4,}';
+const CLOUD_DOC_QUOTE_TAG_EXACT_RE = /^\s*\[CloudDoc:\s*([^\]|\n]+?)\s*\|\s*id=([^\]\s]+)\]\s*$/;
+const CLOUD_DOC_QUOTE_TAG_GLOBAL_RE = /\[CloudDoc:\s*([^\]|\n]+?)\s*\|\s*id=([^\]\s]+)\]/g;
+const CLOUD_DOC_ID_EXACT_RE = new RegExp(`^\\s*(?:id\\s*=\\s*)?(${CLOUD_DOC_ID_BODY})\\s*$`);
+const CLOUD_DOC_ID_GLOBAL_RE = new RegExp(`(?<![A-Za-z0-9_])(?:id\\s*=\\s*)?(${CLOUD_DOC_ID_BODY})(?![A-Za-z0-9_-])`, 'g');
+const CLOUD_DOC_FIRST_ID_RE = new RegExp(`(?<![A-Za-z0-9_])(?:id\\s*=\\s*)?(${CLOUD_DOC_ID_BODY})(?![A-Za-z0-9_-])`);
+const CLOUD_DOC_TRAILING_CANDIDATE_FILE_RE = /(?:\\\\[\w.$ -]+\\[\w.$ \\-]+|[A-Za-z]:\\(?:[\w.$ -]+\\)*[\w.$ -]+|(?:\.{1,2}[/\\]|~[/\\]|[/\\])?[^\s`'"<>()[\]{}（）【】《》「」『』,，;；:：!?！？。]+\.[A-Za-z0-9]{1,10})/g;
+const CLOUD_DOC_GAP_OPEN_RE = /^[ \t]*(?:[`*_]+[ \t]*)?[（([【:：,，—-]/;
+const CLOUD_DOC_GAP_DIRECT_ID_RE = /^[ \t]*(?:[`*_]+[ \t]*)?(?:id[ \t]*=[ \t]*)?$/;
+const CLOUD_DOC_GAP_FORBIDDEN_RE = /[\r\n)）\]】。；;！？!?]|\.[A-Za-z0-9]{1,10}(?![A-Za-z0-9])/;
+
+/** Parse an exact `[CloudDoc: <name> | id=<docId>]` quote token. */
+export function parseCloudDocQuoteTag(text: string): { docId: string; name: string } | null {
+  const match = CLOUD_DOC_QUOTE_TAG_EXACT_RE.exec(text);
+  if (!match) return null;
+  const name = match[1]!.trim();
+  const docId = match[2]!.trim();
+  if (!name || !docId) return null;
+  return { docId, name };
+}
+
+/** Extract an exact `cdoc_...` or `id=cdoc_...` token (trimmed). */
+export function extractCloudDocIdToken(text: string): { docId: string; raw: string } | null {
+  const match = CLOUD_DOC_ID_EXACT_RE.exec(text);
+  if (!match) return null;
+  return { docId: match[1]!, raw: text.trim() };
+}
+
+/**
+ * Determine whether text immediately following a file reference pairs that file
+ * with a `cdoc_...` Cloud Doc ID on the same clause/line.
+ */
+export function findPairedCloudDocIdInTrailingText(followingText: string): string | null {
+  if (!followingText) return null;
+  const newlineIdx = followingText.search(/[\r\n]/);
+  const sameLine = newlineIdx >= 0 ? followingText.slice(0, newlineIdx) : followingText;
+  const window = sameLine.slice(0, 120);
+  const idMatch = CLOUD_DOC_FIRST_ID_RE.exec(window);
+  if (!idMatch || idMatch.index === undefined) return null;
+  const gap = window.slice(0, idMatch.index);
+  if (gap.length > 80) return null;
+  if (!CLOUD_DOC_GAP_OPEN_RE.test(gap) && !CLOUD_DOC_GAP_DIRECT_ID_RE.test(gap)) {
+    return null;
+  }
+  if (CLOUD_DOC_GAP_FORBIDDEN_RE.test(gap)) return null;
+  return idMatch[1]!;
+}
+
+/** Split text by `[CloudDoc: <name> | id=<docId>]` quote tags first (before URL/path parsing). */
+export function splitTextByCloudDocQuoteTags(text: string): CloudDocTextSegment[] {
+  if (!text.includes('[CloudDoc:')) {
+    return text ? [{ type: 'text', value: text, start: 0, end: text.length }] : [];
+  }
+  const segments: CloudDocTextSegment[] = [];
+  let last = 0;
+  CLOUD_DOC_QUOTE_TAG_GLOBAL_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = CLOUD_DOC_QUOTE_TAG_GLOBAL_RE.exec(text)) !== null) {
+    const start = match.index;
+    const end = start + match[0].length;
+    if (start > last) {
+      segments.push({ type: 'text', value: text.slice(last, start), start: last, end: start });
+    }
+    const name = match[1]!.trim();
+    const docId = match[2]!.trim();
+    segments.push({
+      type: 'cloud_doc',
+      value: match[0],
+      start,
+      end,
+      docId,
+      label: name,
+      kind: 'quote',
+    });
+    last = end;
+  }
+  if (last < text.length) {
+    segments.push({ type: 'text', value: text.slice(last), start: last, end: text.length });
+  }
+  return segments;
+}
+
+/**
+ * Split a non-URL plain-text segment into `cdoc_...` references, paired filename+cdoc_...
+ * references, and plain text. Unpaired ordinary file paths remain in `'text'` segments.
+ */
+export function splitPlainTextByCloudDocIds(text: string): CloudDocTextSegment[] {
+  if (!text || !text.includes('cdoc_')) {
+    return text ? [{ type: 'text', value: text, start: 0, end: text.length }] : [];
+  }
+
+  const idMatches: Array<{ start: number; end: number; raw: string; docId: string }> = [];
+  CLOUD_DOC_ID_GLOBAL_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = CLOUD_DOC_ID_GLOBAL_RE.exec(text)) !== null) {
+    idMatches.push({
+      start: m.index,
+      end: m.index + m[0].length,
+      raw: m[0],
+      docId: m[1]!,
+    });
+  }
+  if (idMatches.length === 0) {
+    return [{ type: 'text', value: text, start: 0, end: text.length }];
+  }
+
+  const cloudSpans: CloudDocTextSegment[] = [];
+  let searchFloor = 0;
+  for (const idHit of idMatches) {
+    const windowStart = Math.max(searchFloor, idHit.start - 120);
+    const prefix = text.slice(windowStart, idHit.start);
+    let lastCand: { start: number; end: number; raw: string } | null = null;
+    CLOUD_DOC_TRAILING_CANDIDATE_FILE_RE.lastIndex = 0;
+    let fm: RegExpExecArray | null;
+    while ((fm = CLOUD_DOC_TRAILING_CANDIDATE_FILE_RE.exec(prefix)) !== null) {
+      lastCand = {
+        start: windowStart + fm.index,
+        end: windowStart + fm.index + fm[0].length,
+        raw: fm[0],
+      };
+    }
+    if (lastCand && findPairedCloudDocIdInTrailingText(text.slice(lastCand.end)) === idHit.docId) {
+      cloudSpans.push({
+        type: 'cloud_doc',
+        value: lastCand.raw,
+        start: lastCand.start,
+        end: lastCand.end,
+        docId: idHit.docId,
+        label: lastCand.raw,
+        kind: 'paired_file',
+      });
+    }
+    cloudSpans.push({
+      type: 'cloud_doc',
+      value: idHit.raw,
+      start: idHit.start,
+      end: idHit.end,
+      docId: idHit.docId,
+      label: idHit.raw,
+      kind: 'id',
+    });
+    searchFloor = idHit.end;
+  }
+
+  const out: CloudDocTextSegment[] = [];
+  let cursor = 0;
+  for (const span of cloudSpans) {
+    if (span.start < cursor) continue;
+    if (span.start > cursor) {
+      out.push({ type: 'text', value: text.slice(cursor, span.start), start: cursor, end: span.start });
+    }
+    out.push(span);
+    cursor = span.end;
+  }
+  if (cursor < text.length) {
+    out.push({ type: 'text', value: text.slice(cursor), start: cursor, end: text.length });
+  }
+  return out;
+}

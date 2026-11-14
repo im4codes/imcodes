@@ -120,6 +120,8 @@ export interface SessionPaneProps {
   onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
   /** Open a loopback URL in the shared local-web-preview host. */
   onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
+  /** Open a Cloud Docs preview by document ID. */
+  onCloudDocClick?: (docId: string) => void;
   /** Mobile: whether the file browser overlay is open. */
   mobileFileBrowserOpen?: boolean;
   /** Mobile: called when the file browser overlay requests close. */
@@ -171,6 +173,7 @@ export function SessionPane({
   onAfterAction,
   onPreviewFile,
   onOpenLocalWebPreview,
+  onCloudDocClick,
   mobileFileBrowserOpen,
   onMobileFileBrowserClose,
   onOpenNodeGroups,
@@ -500,6 +503,7 @@ export function SessionPane({
           onViewRepo={onViewRepo}
           onPreviewFile={onPreviewFile}
           onOpenLocalWebPreview={onOpenLocalWebPreview}
+          onCloudDocClick={onCloudDocClick}
           ws={connected ? ws : null}
           serverId={serverId}
           scopeFilesToSession={!!session.sharedState && session.sharedState.targetKind !== 'server'}

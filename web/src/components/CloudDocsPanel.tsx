@@ -61,6 +61,7 @@ export interface CloudDocsPanelProps {
   standalone?: boolean;
   initialFolderId?: string | null;
   initialDocId?: string | null;
+  docRequest?: { docId: string; seq: number } | null;
   onQuoteDoc?: (target: CloudDocQuoteTarget) => void;
   mainChat?: CloudDocsMainChatContext | null;
 }
@@ -429,6 +430,7 @@ export function CloudDocsPanel({
   standalone = false,
   initialFolderId = null,
   initialDocId = null,
+  docRequest = null,
   onQuoteDoc,
   mainChat = null,
 }: CloudDocsPanelProps) {
@@ -874,12 +876,43 @@ export function CloudDocsPanel({
     document.title = t('cloud_docs.title', 'Cloud Docs');
   }, [standalone, t]);
 
-  const consumedInitialDocRef = useRef<string | null>(null);
+  const miniDocReqSeqRef = useRef(0);
+  const [pendingDocRequest, setPendingDocRequest] = useState<{ key: string; docId: string } | null>(() => {
+    if (docRequest?.docId) return { key: `req:${docRequest.seq}:${docRequest.docId}`, docId: docRequest.docId };
+    if (initialDocId) return { key: `init:${initialDocId}`, docId: initialDocId };
+    return null;
+  });
+
   useEffect(() => {
-    if (!initialDocId || consumedInitialDocRef.current === initialDocId || loading) return;
-    const ownDoc = docs.find((d) => d.id === initialDocId);
+    if (!docRequest?.docId) return;
+    setPendingDocRequest({
+      key: `req:${docRequest.seq}:${docRequest.docId}`,
+      docId: docRequest.docId,
+    });
+  }, [docRequest]);
+
+  useEffect(() => {
+    if (!initialDocId) return;
+    setPendingDocRequest((prev) => (prev ? prev : { key: `init:${initialDocId}`, docId: initialDocId }));
+  }, [initialDocId]);
+
+  const handleOpenDocFromMiniChat = useCallback((docId: string) => {
+    const trimmed = docId.trim();
+    if (!trimmed) return;
+    setPendingDocRequest({
+      key: `mini:${++miniDocReqSeqRef.current}:${trimmed}`,
+      docId: trimmed,
+    });
+  }, []);
+
+  const resolvedDocRequestKeyRef = useRef<string | null>(null);
+  const refreshedDocRequestKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!pendingDocRequest || resolvedDocRequestKeyRef.current === pendingDocRequest.key || loading) return;
+    const { key: requestKey, docId: targetDocId } = pendingDocRequest;
+    const ownDoc = docs.find((d) => d.id === targetDocId);
     if (ownDoc) {
-      consumedInitialDocRef.current = initialDocId;
+      resolvedDocRequestKeyRef.current = requestKey;
       openPreview({
         kind: 'cloud_doc',
         id: ownDoc.id,
@@ -891,9 +924,9 @@ export function CloudDocsPanel({
       });
       return;
     }
-    const sharedDoc = sharedDocs.find((d) => d.id === initialDocId);
+    const sharedDoc = sharedDocs.find((d) => d.id === targetDocId);
     if (sharedDoc) {
-      consumedInitialDocRef.current = initialDocId;
+      resolvedDocRequestKeyRef.current = requestKey;
       openPreview({
         kind: 'cloud_doc',
         id: sharedDoc.id,
@@ -903,8 +936,18 @@ export function CloudDocsPanel({
         allowDownload: sharedDoc.allowDownload,
         isOwner: false,
       });
+      return;
     }
-  }, [initialDocId, loading, docs, sharedDocs, openPreview]);
+    if (refreshedDocRequestKeyRef.current !== requestKey) {
+      refreshedDocRequestKeyRef.current = requestKey;
+      void refreshData();
+      return;
+    }
+    resolvedDocRequestKeyRef.current = requestKey;
+    if (docsHydratedRef.current) {
+      setError(tRef.current('cloud_docs.errors.doc_not_found', 'Document not found or inaccessible'));
+    }
+  }, [pendingDocRequest, loading, docs, sharedDocs, openPreview, refreshData]);
 
   const folderMap = useMemo(() => new Map(folders.map((f) => [f.id, f])), [folders]);
 
@@ -2290,6 +2333,7 @@ export function CloudDocsPanel({
           <CloudDocsMainChatFloat
             mainChat={mainChat}
             activePreviewQuote={previewQuoteTarget}
+            onOpenDoc={handleOpenDocFromMiniChat}
           />
         )}
         {renderShareModal()}
@@ -3196,6 +3240,7 @@ export function CloudDocsPanel({
         <CloudDocsMainChatFloat
           mainChat={mainChat}
           activePreviewQuote={previewQuoteTarget}
+          onOpenDoc={handleOpenDocFromMiniChat}
         />
       )}
       {renderContextMenu()}

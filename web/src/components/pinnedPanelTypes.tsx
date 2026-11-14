@@ -145,6 +145,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           serverId={ctx.serverId}
           onPreviewFile={ctx.onPreviewFile}
           onOpenLocalWebPreview={ctx.onOpenLocalWebPreview}
+          onCloudDocClick={ctx.onCloudDocClick}
           onQuote={ctx.onQuote}
           agentType={liveSub.type}
           messagePinsEnabled={false}

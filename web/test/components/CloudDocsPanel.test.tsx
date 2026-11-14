@@ -6,7 +6,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { h } from 'preact';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import type {
   CloudDocFolder,
   CloudDocItem,
@@ -1998,5 +1998,82 @@ describe('CloudDocsPanel', () => {
     } finally {
       vi.stubGlobal('BroadcastChannel', origBC);
     }
+  });
+
+  it('opens docRequest targets on mount, switches targets when already open, and refreshes missing newly-created docs once', async () => {
+    const doc1 = makeDoc({ id: 'cdoc-1', name: 'Inventory-v1.xlsx' });
+    const doc2 = makeDoc({ id: 'cdoc-2', name: 'Inventory-v2.xlsx' });
+    const docNew = makeDoc({ id: 'cdoc-new', name: '芝加哥机房配件箱设备清单.xlsx' });
+
+    listCloudDocsApiMock
+      .mockResolvedValueOnce({
+        folders: [],
+        docs: [doc1, doc2],
+        sharedFolders: [],
+        sharedDocs: [],
+      })
+      .mockResolvedValueOnce({
+        folders: [],
+        docs: [doc1, doc2, docNew],
+        sharedFolders: [],
+        sharedDocs: [],
+      });
+    listRecentDocumentsApiMock.mockResolvedValue({ items: [] });
+    listCloudDocTeamsApiMock.mockResolvedValue({ teams: [] });
+
+    const fakeMainChat = {
+      session: { name: 'deck_cd_brain', project: 'app', state: 'idle' },
+      sessions: [],
+      subSessions: [],
+      ws: null,
+      connected: true,
+      serverId: 'srv-1',
+      quickData: { loaded: true, history: [], commands: [], phrases: [], reload: vi.fn(), recordHistory: vi.fn(), addCommand: vi.fn(), updateCommand: vi.fn(), removeCommand: vi.fn(), addPhrase: vi.fn(), removePhrase: vi.fn() },
+    } as unknown as NonNullable<Parameters<typeof CloudDocsPanel>[0]['mainChat']>;
+
+    mainChatFloatSpy.mockClear();
+    const { rerender } = render(
+      <CloudDocsPanel
+        docRequest={{ docId: 'cdoc-1', seq: 1 }}
+        mainChat={fakeMainChat}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('mock-office-preview').getAttribute('data-cloud-doc-id')).toBe('cdoc-1');
+    });
+
+    // Updating docRequest while CloudDocsPanel is already open switches the preview target
+    rerender(
+      <CloudDocsPanel
+        docRequest={{ docId: 'cdoc-2', seq: 2 }}
+        mainChat={fakeMainChat}
+      />,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId('mock-office-preview').getAttribute('data-cloud-doc-id')).toBe('cdoc-2');
+    });
+
+    // A doc created after initial mount triggers one refresh and opens once present
+    rerender(
+      <CloudDocsPanel
+        docRequest={{ docId: 'cdoc-new', seq: 3 }}
+        mainChat={fakeMainChat}
+      />,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId('mock-office-preview').getAttribute('data-cloud-doc-id')).toBe('cdoc-new');
+    });
+    expect(listCloudDocsApiMock).toHaveBeenCalledTimes(2);
+
+    // Mini-chat inside CloudDocsPanel also wires onOpenDoc to switch preview targets
+    const lastMainChatProps = mainChatFloatSpy.mock.calls.at(-1)?.[0] as { onOpenDoc?: (id: string) => void } | undefined;
+    expect(typeof lastMainChatProps?.onOpenDoc).toBe('function');
+    await act(async () => {
+      lastMainChatProps?.onOpenDoc?.('cdoc-1');
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('mock-office-preview').getAttribute('data-cloud-doc-id')).toBe('cdoc-1');
+    });
   });
 });

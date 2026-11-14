@@ -3859,4 +3859,58 @@ describe('FileBrowser — file-manager preview/folder sync', () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it('never records non-existent or failed .xlsx/.docx server_file previews into Cloud Docs Recent', async () => {
+    const prevResizeObserver = globalThis.ResizeObserver;
+    class MockResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    globalThis.ResizeObserver = MockResizeObserver as unknown as typeof ResizeObserver;
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ item: {} }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { ws, sendMsg } = makeWsFactory();
+    const recentCalls = () => fetchMock.mock.calls.filter(([url]) => String(url).includes('/api/recent-documents/record'));
+
+    try {
+      const errorCases = [
+        { path: '/Users/k/Documents/clawd/芝加哥机房配件箱设备清单.xlsx', error: 'not_found' },
+        { path: '/Users/k/Documents/clawd/missing-dir/Report.docx', error: FS_READ_ERROR_CODES.PARENT_NOT_FOUND },
+        { path: '/Users/k/Documents/clawd/no-dl.xlsx', error: FS_READ_ERROR_CODES.BINARY_FILE },
+      ];
+
+      for (const tc of errorCases) {
+        const view = render(
+          <FileBrowser
+            ws={ws}
+            serverId="srv-missing-xlsx"
+            mode="file-single"
+            layout="panel"
+            initialPath="/Users/k/Documents/clawd"
+            autoPreviewPath={tc.path}
+            onConfirm={vi.fn()}
+          />,
+        );
+        await act(async () => {
+          sendMsg({
+            type: 'fs.read_response',
+            requestId: 'mock-read-id',
+            path: tc.path,
+            status: 'error',
+            error: tc.error,
+          } as unknown as ServerMessage);
+        });
+        await waitFor(() => expect(view.container.querySelector('.fb-preview-error')).toBeTruthy());
+        expect(recentCalls(), `expected zero recent calls for failed office read (${tc.error})`).toHaveLength(0);
+        view.unmount();
+      }
+    } finally {
+      globalThis.ResizeObserver = prevResizeObserver;
+      vi.unstubAllGlobals();
+    }
+  });
 });

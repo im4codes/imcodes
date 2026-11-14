@@ -10964,6 +10964,45 @@ html.mobile-nav-gesture-active .chat-view * {
 /* inline path links in chat */
 .chat-path-link { color: #818cf8; cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
 .chat-path-link:hover { color: #a5b4fc; }
+.chat-cloud-doc-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  padding: 2px 8px;
+  margin: 1px 2px;
+  border-radius: 6px;
+  border: 1px solid rgba(56, 189, 248, 0.42);
+  background: rgba(14, 165, 233, 0.14);
+  color: #e0f2fe;
+  font: inherit;
+  font-size: 0.92em;
+  line-height: 1.35;
+  vertical-align: middle;
+  cursor: pointer;
+  text-align: left;
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+.chat-cloud-doc-chip:hover:not(:disabled) {
+  background: rgba(14, 165, 233, 0.24);
+  border-color: rgba(56, 189, 248, 0.72);
+}
+.chat-cloud-doc-chip:disabled {
+  cursor: default;
+  opacity: 0.85;
+}
+.chat-cloud-doc-icon { flex-shrink: 0; color: #bae6fd; }
+.chat-cloud-doc-label {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.chat-cloud-doc-link {
+  color: #38bdf8;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+.chat-cloud-doc-link.is-clickable { cursor: pointer; }
+.chat-cloud-doc-link.is-clickable:hover { color: #7dd3fc; }
 .chat-dl-btn { background: none; border: none; color: #64748b; cursor: pointer; font-size: 11px; padding: 0 2px; margin-left: 2px; vertical-align: middle; line-height: 1; }
 .chat-dl-btn:hover { color: #818cf8; }
 .chat-dl-btn:disabled { cursor: wait; opacity: 0.8; }

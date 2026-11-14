@@ -111,6 +111,8 @@ interface Props {
   onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
   /** Open a loopback URL in the shared local-web-preview host. */
   onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
+  /** Open a Cloud Docs preview by document ID. */
+  onCloudDocClick?: (docId: string) => void;
   zIndex: number;
   onFocus: () => void;
   /**
@@ -296,7 +298,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, visible = true, taskPairPanelVisitKey, showTaskPairPanel = true, pairTaskTitle = null, pairRole = null, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClosePairSplit, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onLiveSessionStateChange, onPreviewFile, onOpenLocalWebPreview, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onInputRef, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop, remoteDesktopCanSetUp = true,
+  sub, ws, connected, active, visible = true, taskPairPanelVisitKey, showTaskPairPanel = true, pairTaskTitle = null, pairRole = null, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClosePairSplit, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onLiveSessionStateChange, onPreviewFile, onOpenLocalWebPreview, onCloudDocClick, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onInputRef, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop, remoteDesktopCanSetUp = true,
 }: Props) {
   recordPerfRender(visible ? 'SubSessionWindow:visible' : 'SubSessionWindow:hidden');
   const { t } = useTranslation();
@@ -664,6 +666,7 @@ export function SubSessionWindow({
   const stableOnViewRepo = useStableCallback(onViewRepo);
   const stableOnPreviewFile = useStableCallback(onPreviewFile);
   const stableOnOpenLocalWebPreview = useStableCallback(onOpenLocalWebPreview);
+  const stableOnCloudDocClick = useStableCallback(onCloudDocClick);
 
   // Non-shell window: subscribe raw only while focused (full-fidelity view); when
   // unfocused it falls back to the passive (non-raw) subscription app.tsx keeps.
@@ -1181,6 +1184,7 @@ export function SubSessionWindow({
             onViewRepo={stableOnViewRepo}
             onPreviewFile={stableOnPreviewFile}
             onOpenLocalWebPreview={onOpenLocalWebPreview ? stableOnOpenLocalWebPreview : undefined}
+            onCloudDocClick={onCloudDocClick ? stableOnCloudDocClick : undefined}
             serverId={serverId}
             scopeTaskPairs={showTaskPairPanel}
             taskPairPanelVisitKey={taskPairPanelVisitKey}

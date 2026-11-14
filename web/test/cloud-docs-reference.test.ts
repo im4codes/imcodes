@@ -5,11 +5,16 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   computeRightHalfUnobstructedCloudDocsGeometry,
   executeCloudDocQuote,
+  extractCloudDocIdToken,
+  findPairedCloudDocIdInTrailingText,
   formatCloudDocQuoteBadge,
   formatCloudDocQuoteText,
   getCloudDocQuoteKey,
   mergeCloudDocQuoteText,
+  parseCloudDocQuoteTag,
   resolveCloudDocQuoteTarget,
+  splitPlainTextByCloudDocIds,
+  splitTextByCloudDocQuoteTags,
 } from '../src/cloud-docs-reference.js';
 import { publishCloudDocQuote, subscribeCloudDocQuotes } from '../src/cloud-docs-window.js';
 import {
@@ -350,5 +355,52 @@ describe('cloud-docs-reference helpers', () => {
       if (prevBC === undefined) delete (globalThis as { BroadcastChannel?: unknown }).BroadcastChannel;
       else (globalThis as { BroadcastChannel?: unknown }).BroadcastChannel = prevBC;
     }
+  });
+
+  it('parses [CloudDoc: ...] quote tags, bare/prefixed cdoc IDs, and filenames paired with cdoc IDs', () => {
+    expect(parseCloudDocQuoteTag('[CloudDoc: 无标题表格.xlsx | id=cdoc_503c1c6e391e458b9e56]')).toEqual({
+      name: '无标题表格.xlsx',
+      docId: 'cdoc_503c1c6e391e458b9e56',
+    });
+    expect(parseCloudDocQuoteTag('[CloudDoc: empty | id=]')).toBeNull();
+
+    expect(extractCloudDocIdToken('cdoc_503c1c6e391e458b9e56')).toEqual({
+      docId: 'cdoc_503c1c6e391e458b9e56',
+      raw: 'cdoc_503c1c6e391e458b9e56',
+    });
+    expect(extractCloudDocIdToken('id=cdoc_503c1c6e391e458b9e56')).toEqual({
+      docId: 'cdoc_503c1c6e391e458b9e56',
+      raw: 'id=cdoc_503c1c6e391e458b9e56',
+    });
+    expect(extractCloudDocIdToken('cdoc_abc')).toBeNull();
+    expect(extractCloudDocIdToken('local.xlsx')).toBeNull();
+
+    expect(findPairedCloudDocIdInTrailingText('（id=cdoc_503c1c6e391e458b9e56，版本 v2）')).toBe('cdoc_503c1c6e391e458b9e56');
+    expect(findPairedCloudDocIdInTrailingText(' (cdoc_503c1c6e391e458b9e56)')).toBe('cdoc_503c1c6e391e458b9e56');
+    expect(findPairedCloudDocIdInTrailingText('\n(id=cdoc_503c1c6e391e458b9e56)')).toBeNull();
+    expect(findPairedCloudDocIdInTrailingText('，这是普通说明文字')).toBeNull();
+
+    expect(
+      splitTextByCloudDocQuoteTags('请看 [CloudDoc: 无标题表格.xlsx | id=cdoc_503c1c6e391e458b9e56] 内容'),
+    ).toMatchObject([
+      { type: 'text', value: '请看 ' },
+      { type: 'cloud_doc', value: '[CloudDoc: 无标题表格.xlsx | id=cdoc_503c1c6e391e458b9e56]', label: '无标题表格.xlsx', docId: 'cdoc_503c1c6e391e458b9e56', kind: 'quote' },
+      { type: 'text', value: ' 内容' },
+    ]);
+
+    expect(
+      splitPlainTextByCloudDocIds('已改名为 芝加哥机房配件箱设备清单.xlsx（id=cdoc_503c1c6e391e458b9e56，版本 v2）完成'),
+    ).toMatchObject([
+      { type: 'text', value: '已改名为 ' },
+      { type: 'cloud_doc', value: '芝加哥机房配件箱设备清单.xlsx', docId: 'cdoc_503c1c6e391e458b9e56', label: '芝加哥机房配件箱设备清单.xlsx', kind: 'paired_file' },
+      { type: 'text', value: '（' },
+      { type: 'cloud_doc', value: 'id=cdoc_503c1c6e391e458b9e56', docId: 'cdoc_503c1c6e391e458b9e56', label: 'id=cdoc_503c1c6e391e458b9e56', kind: 'id' },
+      { type: 'text', value: '，版本 v2）完成' },
+    ]);
+
+    // Unpaired ordinary filenames stay plain text
+    expect(splitPlainTextByCloudDocIds('请检查 budget.xlsx 与 notes.docx')).toEqual([
+      { type: 'text', value: '请检查 budget.xlsx 与 notes.docx', start: 0, end: 28 },
+    ]);
   });
 });

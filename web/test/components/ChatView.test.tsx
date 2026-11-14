@@ -591,27 +591,34 @@ describe('repeated supervision heartbeat and WAITING presentation', () => {
   });
 });
 
-vi.mock('../../src/components/ChatMarkdown.js', () => ({
-  ChatMarkdown: ({ text, onUrlClick }: { text: string; onUrlClick?: (url: string) => void }) => {
-    chatMarkdownRenderSpy(text);
-    const url = text.match(/https?:\/\/\S+/)?.[0];
-    if (url) {
-      return (
-        <a
-          class="chat-external-link"
-          href={url}
-          onClick={(e) => {
-            e.preventDefault();
-            onUrlClick?.(url);
-          }}
-        >
-          {url}
-        </a>
-      );
-    }
-    return <div>{text}</div>;
-  },
-}));
+vi.mock('../../src/components/ChatMarkdown.js', async () => {
+  const actual = await vi.importActual<typeof import('../../src/components/ChatMarkdown.js')>('../../src/components/ChatMarkdown.js');
+  return {
+    ChatMarkdown: (props: Parameters<typeof actual.ChatMarkdown>[0]) => {
+      chatMarkdownRenderSpy(props.text);
+      if (props.onCloudDocClick) {
+        return <actual.ChatMarkdown {...props} />;
+      }
+      const { text, onUrlClick } = props;
+      const url = text.match(/https?:\/\/\S+/)?.[0];
+      if (url) {
+        return (
+          <a
+            class="chat-external-link"
+            href={url}
+            onClick={(e) => {
+              e.preventDefault();
+              onUrlClick?.(url);
+            }}
+          >
+            {url}
+          </a>
+        );
+      }
+      return <div>{text}</div>;
+    },
+  };
+});
 
 vi.mock('../../src/components/FileBrowser.js', () => ({
   FileBrowser: () => null,
@@ -3304,5 +3311,66 @@ describe('ChatView', () => {
     } finally {
       if (hadTouchStart) (window as Window & { ontouchstart?: unknown }).ontouchstart = originalTouchStart;
     }
+  });
+
+  it('renders CloudDoc quote chips in user messages and pairs CloudDoc filenames/IDs in assistant replies without triggering local file preview', () => {
+    const onCloudDocClick = vi.fn();
+    const onPreviewFile = vi.fn();
+    const { container } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-user-clouddoc',
+            type: 'user.message',
+            ts: new Date('2026-04-17T12:34:00Z').getTime(),
+            payload: { text: '[CloudDoc: 无标题表格.xlsx | id=cdoc_503c1c6e391e458b9e56] 帮我填一下' },
+          },
+          {
+            eventId: 'evt-assistant-clouddoc',
+            type: 'assistant.text',
+            ts: new Date('2026-04-17T12:35:00Z').getTime(),
+            payload: {
+              text: '已改名为 `芝加哥机房配件箱设备清单.xlsx`（`id=cdoc_503c1c6e391e458b9e56`，版本 `v2`）。另附本地文件 `/tmp/local.xlsx`。',
+            },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+        serverId="srv-1"
+        ws={{ fsReadFile: vi.fn() } as any}
+        onPreviewFile={onPreviewFile}
+        onCloudDocClick={onCloudDocClick}
+      />,
+    );
+
+    const chip = container.querySelector('.chat-user .chat-cloud-doc-chip') as HTMLElement | null;
+    expect(chip).toBeTruthy();
+    expect(chip?.textContent).toContain('无标题表格.xlsx');
+    expect(container.querySelector('.chat-user .chat-dl-btn')).toBeNull();
+
+    const cloudLinks = Array.from(container.querySelectorAll('.chat-assistant .chat-cloud-doc-link'));
+    expect(cloudLinks.map((el) => el.textContent)).toEqual([
+      '芝加哥机房配件箱设备清单.xlsx',
+      'id=cdoc_503c1c6e391e458b9e56',
+    ]);
+
+    // Only /tmp/local.xlsx should keep the local path action & download icon
+    const assistantDlBtns = Array.from(container.querySelectorAll('.chat-assistant .chat-dl-btn'));
+    expect(assistantDlBtns).toHaveLength(1);
+    const localLink = container.querySelector('.chat-assistant .chat-path-link') as HTMLElement | null;
+    expect(localLink?.textContent).toBe('/tmp/local.xlsx');
+
+    fireEvent.click(chip!);
+    fireEvent.click(cloudLinks[0]!);
+    fireEvent.click(cloudLinks[1]!);
+    expect(onCloudDocClick).toHaveBeenCalledTimes(3);
+    expect(onCloudDocClick).toHaveBeenNthCalledWith(1, 'cdoc_503c1c6e391e458b9e56');
+    expect(onCloudDocClick).toHaveBeenNthCalledWith(2, 'cdoc_503c1c6e391e458b9e56');
+    expect(onCloudDocClick).toHaveBeenNthCalledWith(3, 'cdoc_503c1c6e391e458b9e56');
+    expect(onPreviewFile).not.toHaveBeenCalled();
+
+    fireEvent.click(localLink!);
+    expect(onPreviewFile).toHaveBeenCalledTimes(1);
+    expect(onPreviewFile.mock.calls[0]?.[0]).toMatchObject({ path: '/tmp/local.xlsx' });
   });
 });
