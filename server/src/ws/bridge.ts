@@ -7700,14 +7700,18 @@ export class WsBridge {
       // Explicit per-socket timeline quality. This is intentionally separate
       // from terminal/chat subscriptions: a companion tab can subscribe to a
       // session in summary mode without inheriting another socket's stream.
-      if (msg.type === TIMELINE_MESSAGES.SUBSCRIBE && typeof msg.sessionName === 'string') {
-        await this.handleTimelineSubscription(ws, msg);
+      if (msg.type === TIMELINE_MESSAGES.SUBSCRIBE) {
+        if (typeof msg.sessionName === 'string') {
+          await this.handleTimelineSubscription(ws, msg);
+        }
         return;
       }
-      if (msg.type === TIMELINE_MESSAGES.UNSUBSCRIBE && typeof msg.sessionName === 'string') {
-        this.timelineProtocolSockets.add(ws);
-        this.timelineSubscriptions.get(ws)?.delete(msg.sessionName);
-        this.clearTimelineLatestValueFingerprints(ws, msg.sessionName);
+      if (msg.type === TIMELINE_MESSAGES.UNSUBSCRIBE) {
+        if (typeof msg.sessionName === 'string') {
+          this.timelineProtocolSockets.add(ws);
+          this.timelineSubscriptions.get(ws)?.delete(msg.sessionName);
+          this.clearTimelineLatestValueFingerprints(ws, msg.sessionName);
+        }
         return;
       }
 

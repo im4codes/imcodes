@@ -26,6 +26,7 @@ import { REPO_MSG } from '../../shared/repo-types.js';
 import { FS_SESSION_ROOT_PATH } from '../../src/shared/transport/fs.js';
 import { resetSharedCommandRateLimitsForTests } from '../src/share/share-rate-limit.js';
 import { TIMELINE_MESSAGES } from '../../shared/timeline-protocol.js';
+import { TASK_PAIR_TIMELINE_EVENT } from '../../shared/task-pair.js';
 import {
   DIRECT_FILE_TRANSFER_DIRECTION,
   DIRECT_FILE_TRANSFER_MSG,
@@ -1479,6 +1480,8 @@ describe('WsBridge share-scoped sockets', () => {
       TRANSPORT_MSG.CHAT_SUBSCRIBE,
       TRANSPORT_MSG.CHAT_UNSUBSCRIBE,
       TRANSPORT_MSG.CHAT_HISTORY,
+      TIMELINE_MESSAGES.SUBSCRIBE,
+      TIMELINE_MESSAGES.UNSUBSCRIBE,
       TIMELINE_MESSAGES.HISTORY_REQUEST,
       TIMELINE_MESSAGES.REPLAY_REQUEST,
       TIMELINE_MESSAGES.PAGE_REQUEST,
@@ -3014,5 +3017,241 @@ describe('WsBridge share-scoped sockets', () => {
       expect.objectContaining({ type: 'fs.ls', requestId: 'member-fs-ls', path: '/repo' }),
       expect.objectContaining({ type: 'fs.git_status', requestId: 'member-git-status', projectDir: '/repo' }),
     ]));
+  });
+
+  it('allows covered viewer/participant timeline.subscribe and timeline.unsubscribe in full and summary modes with share redaction', async () => {
+    const bridge = WsBridge.get(serverId);
+    const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+    bridge.setShareCoverageResolverForTests(async () => coverage(target, 'viewer', now));
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, makeDb(), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.sent.length = 0;
+
+    const viewerSummary = new MockWs();
+    bridge.handleShareBrowserConnection(viewerSummary as never, 'shared-viewer-summary', makeDb(), {
+      ticketId: 'share-ticket-tl-summary',
+      target,
+      snapshot: coverage(target, 'viewer', now),
+    });
+    const viewerFull = new MockWs();
+    bridge.handleShareBrowserConnection(viewerFull as never, 'shared-viewer-full', makeDb(), {
+      ticketId: 'share-ticket-tl-full',
+      target,
+      snapshot: coverage(target, 'viewer', now),
+    });
+
+    viewerSummary.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: 'deck_proj_brain',
+      mode: 'summary',
+    }));
+    viewerFull.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: 'deck_proj_brain',
+      mode: 'full',
+    }));
+    await flushAsync();
+    await flushAsync();
+
+    expect(viewerSummary.sentJson.some((msg) => msg.type === 'error')).toBe(false);
+    expect(viewerFull.sentJson.some((msg) => msg.type === 'error')).toBe(false);
+    expect(daemon.sentJson.some((msg) => msg.type === TIMELINE_MESSAGES.SUBSCRIBE)).toBe(false);
+
+    // 1. Streaming assistant delta: full receives it, summary drops it
+    daemon.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.EVENT,
+      event: {
+        eventId: 'evt-stream-1',
+        sessionId: 'deck_proj_brain',
+        seq: 1,
+        epoch: 1,
+        ts: now + 1,
+        type: 'assistant.text',
+        payload: { text: 'streaming chunk', streaming: true },
+      },
+    }));
+    // 2. Final assistant text + 3. Tool result (summarized in summary mode) + 4. Private pair event (redacted for viewer)
+    daemon.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.EVENT,
+      event: {
+        eventId: 'evt-tool-2',
+        sessionId: 'deck_proj_brain',
+        seq: 2,
+        epoch: 1,
+        ts: now + 2,
+        type: 'tool.result',
+        payload: { name: 'bash', status: 'ok', output: 'A'.repeat(300) },
+      },
+    }));
+    daemon.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.EVENT,
+      event: {
+        eventId: 'evt-pair-3',
+        sessionId: 'deck_proj_brain',
+        seq: 3,
+        epoch: 1,
+        ts: now + 3,
+        type: TASK_PAIR_TIMELINE_EVENT,
+        payload: { taskId: 'tsk_secret', verb: 'DISPATCH', title: 'Secret Title', executorModel: 'secret-model' },
+      },
+    }));
+    // 4. Uncovered session must never reach either viewer
+    daemon.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.EVENT,
+      event: {
+        eventId: 'evt-other-4',
+        sessionId: 'deck_other_brain',
+        seq: 1,
+        epoch: 1,
+        ts: now + 4,
+        type: 'assistant.text',
+        payload: { text: 'other session secret', streaming: false },
+      },
+    }));
+    await flushAsync();
+    await flushAsync();
+
+    const fullEvents = viewerFull.sentJson
+      .filter((msg) => msg.type === TIMELINE_MESSAGES.EVENT)
+      .map((msg) => msg.event as Record<string, unknown>);
+    expect(fullEvents.map((e) => e.eventId)).toEqual(['evt-stream-1', 'evt-tool-2', 'evt-pair-3']);
+    const fullTool = fullEvents.find((e) => e.eventId === 'evt-tool-2') as { payload: Record<string, unknown> };
+    expect(fullTool.payload.output).toBe('A'.repeat(300));
+    const fullPair = fullEvents.find((e) => e.eventId === 'evt-pair-3') as { payload: Record<string, unknown> };
+    expect(fullPair.payload.taskId).toBe('tsk_secret');
+    expect(fullPair.payload).not.toHaveProperty('title');
+    expect(fullPair.payload).not.toHaveProperty('executorModel');
+
+    const summaryEvents = viewerSummary.sentJson
+      .filter((msg) => msg.type === TIMELINE_MESSAGES.EVENT)
+      .map((msg) => msg.event as Record<string, unknown>);
+    expect(summaryEvents.map((e) => e.eventId)).toEqual(['evt-tool-2', 'evt-pair-3']);
+    expect(summaryEvents[0]!.summary).toBe(true);
+    expect(summaryEvents[0]!.detailAvailable).toBe(true);
+    expect(((summaryEvents[0]!.payload as Record<string, unknown>).preview as Record<string, unknown>).output).toBe(`${'A'.repeat(256)}…`);
+    const summaryPair = summaryEvents.find((e) => e.eventId === 'evt-pair-3') as { payload: Record<string, unknown> };
+    expect(summaryPair.payload).not.toHaveProperty('title');
+    expect(summaryPair.payload).not.toHaveProperty('executorModel');
+
+    // Unsubscribe stops further live delivery without forwarding unsubscribe to daemon
+    viewerFull.sent.length = 0;
+    viewerFull.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.UNSUBSCRIBE,
+      sessionName: 'deck_proj_brain',
+    }));
+    await flushAsync();
+    expect(viewerFull.sentJson.some((msg) => msg.type === 'error')).toBe(false);
+    expect(daemon.sentJson.some((msg) => msg.type === TIMELINE_MESSAGES.UNSUBSCRIBE)).toBe(false);
+
+    daemon.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.EVENT,
+      event: {
+        eventId: 'evt-after-unsub-5',
+        sessionId: 'deck_proj_brain',
+        seq: 4,
+        epoch: 1,
+        ts: now + 5,
+        type: 'assistant.text',
+        payload: { text: 'after unsubscribe', streaming: false },
+      },
+    }));
+    await flushAsync();
+    await flushAsync();
+    expect(viewerFull.sentJson.some((msg) => msg.type === TIMELINE_MESSAGES.EVENT)).toBe(false);
+  });
+
+  it('denies timeline.subscribe/unsubscribe for uncovered sessions and revoked/expired shares', async () => {
+    const bridge = WsBridge.get(serverId);
+    const target: ShareTarget = { kind: 'subsession', serverId, subSessionId: 'covered_sub' };
+    let liveCoverage: EffectiveCoverage | null = coverage(target, 'participant', now, now + 60_000);
+    bridge.setShareCoverageResolverForTests(async () => liveCoverage);
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, makeDb(), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.sent.length = 0;
+
+    const shared = new MockWs();
+    bridge.handleShareBrowserConnection(shared as never, 'shared-sub', makeDb(), {
+      ticketId: 'share-ticket-sub-tl',
+      target,
+      snapshot: coverage(target, 'participant', now, now + 60_000),
+    });
+
+    shared.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: 'deck_proj_brain',
+      mode: 'full',
+      requestId: 'uncovered-sub',
+    }));
+    shared.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.UNSUBSCRIBE,
+      sessionName: 'deck_sub_other',
+      requestId: 'uncovered-unsub',
+    }));
+    await flushAsync();
+
+    expect(shared.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'error',
+        code: SHARE_REASONS.DIRECT_SURFACE_DENIED,
+        originalType: TIMELINE_MESSAGES.SUBSCRIBE,
+        requestId: 'uncovered-sub',
+      }),
+      expect.objectContaining({
+        type: 'error',
+        code: SHARE_REASONS.DIRECT_SURFACE_DENIED,
+        originalType: TIMELINE_MESSAGES.UNSUBSCRIBE,
+        requestId: 'uncovered-unsub',
+      }),
+    ]));
+
+    // Revoked share denies and closes socket once hot-path cache refreshes
+    shared.sent.length = 0;
+    liveCoverage = null;
+    now += 5_000;
+    shared.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: 'deck_sub_covered_sub',
+      mode: 'full',
+      requestId: 'revoked-sub',
+    }));
+    await flushAsync();
+    expect(shared.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'error',
+        code: SHARE_REASONS.REVOKED,
+        originalType: TIMELINE_MESSAGES.SUBSCRIBE,
+        requestId: 'revoked-sub',
+      }),
+    ]));
+    expect(shared.closed).toBe(true);
+
+    // Expired share denies with SHARE_REASONS.EXPIRED and closes socket
+    const expiredSocket = new MockWs();
+    bridge.handleShareBrowserConnection(expiredSocket as never, 'shared-expired', makeDb(), {
+      ticketId: 'share-ticket-expired-tl',
+      target,
+      snapshot: coverage(target, 'viewer', now, now + 10_000),
+    });
+    now += 10_000;
+    expiredSocket.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: 'deck_sub_covered_sub',
+      mode: 'summary',
+      requestId: 'expired-sub',
+    }));
+    await flushAsync();
+    expect(expiredSocket.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'error',
+        code: SHARE_REASONS.EXPIRED,
+        originalType: TIMELINE_MESSAGES.SUBSCRIBE,
+        requestId: 'expired-sub',
+      }),
+    ]));
+    expect(expiredSocket.closed).toBe(true);
   });
 });
