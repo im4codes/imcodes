@@ -743,6 +743,26 @@ export const TASK_PAIR_SPLIT_UNRELATED_RULE: string =
 export const TASK_PAIR_SPLIT_UNRELATED_TOKEN =
   'split_unrelated_tasks_into_separate_pairs_never_mix_unrelated_work_in_one_pair' as const;
 
+/**
+ * Built-in rule: single pairs rely on daemon pair heartbeats (never create
+ * per-pair cron_create_self nudges), whereas multi-phase long tasks require
+ * Brain to automatically schedule a bounded cron_create_self supervisor
+ * (completionPolicy="until_complete") and auto-cancel it once all phases
+ * complete.
+ */
+export const TASK_PAIR_MULTI_PHASE_CRON_RULE: string =
+  'Multi-phase long-task supervisor cron (Brain): single pairs use the '
+  + 'built-in daemon pair heartbeat (never create per-pair cron_create_self '
+  + 'nudges). For a multi-phase long task spanning multiple phases or dependent '
+  + 'pairs, Brain MUST automatically create a supervisor cron via '
+  + 'cron_create_self with completionPolicy="until_complete" to track phase '
+  + 'advancement and recover stalls, and automatically cancel it via '
+  + 'cron_cancel_self once all phases are complete.';
+
+/** Compact snake_case token used by the Brain duty tables in supervision-prompts.ts. */
+export const TASK_PAIR_MULTI_PHASE_CRON_TOKEN =
+  'single_pair_no_cron_multi_phase_long_task_must_cron_create_self_completionPolicy_until_complete_auto_cancel_when_all_phases_done' as const;
+
 /** Short liveness rule shown with Brain decision notices. */
 export const TASK_PAIR_BRAIN_REPLY_RESOLUTION_RULE: string =
   'A plain reply to the participant (including delegation_reply) resolves the wait and stops reminders.';
@@ -2683,6 +2703,7 @@ export function buildTaskPairMarkerContract(): string {
     TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE,
     TASK_PAIR_BRAIN_PAIR_CREATE_RULE,
     TASK_PAIR_SPLIT_UNRELATED_RULE,
+    TASK_PAIR_MULTI_PHASE_CRON_RULE,
     TASK_PAIR_BRIEF_STRUCTURE_RULE,
     TASK_PAIR_ENVIRONMENT_PREFLIGHT_RULE,
     TASK_PAIR_BOUNDARY_AUDIT_RULE,

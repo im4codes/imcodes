@@ -35,7 +35,7 @@ import {
   SUPERVISION_BRAIN_REVISION_RESET_FORBID,
 } from '../../shared/supervision-config.js';
 import { SUPERVISION_IMCODES_BACKGROUND_DOCS } from './imcodes-workflow-docs.js';
-import { TASK_PAIR_BRAIN_CONTRACT_ID, TASK_PAIR_INERT_AUTHORIZATION_RULE, TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE, TASK_PAIR_SPLIT_UNRELATED_TOKEN, type TaskPairEngineState } from '../../shared/task-pair.js';
+import { TASK_PAIR_BRAIN_CONTRACT_ID, TASK_PAIR_INERT_AUTHORIZATION_RULE, TASK_PAIR_MULTI_PHASE_CRON_TOKEN, TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE, TASK_PAIR_SPLIT_UNRELATED_TOKEN, type TaskPairEngineState } from '../../shared/task-pair.js';
 import { TASK_PAIR_WORKTREE_ONLY_WHEN_NECESSARY_TOKEN } from '../../shared/task-pair-workspace.js';
 import { FILE_OUTPUT_CONTRACT_ID } from '../../shared/file-output-contract.js';
 import {
@@ -293,6 +293,7 @@ export const BRAIN_PAIRS_SUPERVISED_WORK = {
   newWork: 'pair_create_with_brief_and_roles_then_pair_dispatch_if_queued',
   sameWork: 'append_to_the_same_executor_same_taskId',
   taskSplitting: TASK_PAIR_SPLIT_UNRELATED_TOKEN,
+  multiPhaseCron: TASK_PAIR_MULTI_PHASE_CRON_TOKEN,
   material: 'executor_workspace_on_READY_FOR_AUDIT_relayed_by_daemon_worktree_and_head_or_task_dir_path',
   workspace: `${TASK_PAIR_WORKTREE_ONLY_WHEN_NECESSARY_TOKEN}_removed_7d_after_end`,
   deliverables: 'judge_by_task_type_keep_via_DONE_output=_copied_into_project_user_told_temporary_plain_DONE',
@@ -544,6 +545,7 @@ export const BRAIN_MANUAL_AUDITED_WORK = {
     route: 'task_pair',
     open: ['pair_create with brief/executor/auditor', 'pair_dispatch only when pair_create returns queued'],
     taskSplitting: TASK_PAIR_SPLIT_UNRELATED_TOKEN,
+    multiPhaseCron: TASK_PAIR_MULTI_PHASE_CRON_TOKEN,
     auditor: 'named_or_daemon_auto_pick',
     heartbeat: 'daemon_pair_heartbeat_when_supervision_on_see_pair_create_result',
     brainCronSelf: 'forbidden',
