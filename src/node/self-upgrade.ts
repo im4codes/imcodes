@@ -37,6 +37,12 @@ import {
 } from '../../shared/controlled-node-service.js';
 import { REMOTE_DESKTOP_PROTOCOL_VERSION } from '../../shared/remote-desktop.js';
 import {
+  releaseTargetFromRuntime,
+  validateDesktopReleaseManifest,
+  verifyDesktopReleaseComponentIdentity,
+  type DesktopReleaseManifest,
+} from '../../shared/desktop-release-manifest.js';
+import {
   REMOTE_DESKTOP_MACOS_COMPONENT_ORDER,
   REMOTE_DESKTOP_MACOS_COMPONENT_SET_MANIFEST_MAX_BYTES,
   REMOTE_DESKTOP_MACOS_COMPONENT_SET_MAX_BYTES,
@@ -762,7 +768,7 @@ async function downloadArtifact(input: {
   /** Default true: the generic `<file>.manifest.json` record beside the download. Assets that have their own manifest turn it off. */
   writeManifest?: boolean;
   onProgress?: (phase: ControlledNodeArtifactDownloadPhase) => Promise<void>;
-}): Promise<{ artifactPath: string; manifestPath: string; sha256: string; sizeBytes: number; filename: string; version?: string }> {
+}): Promise<{ artifactPath: string; manifestPath: string; sha256: string; sizeBytes: number; filename: string; version?: string; releaseManifestSha256?: string }> {
   const asset = input.asset ?? CONTROLLED_NODE_ARTIFACT_ASSETS.NODE;
   await input.onProgress?.('artifact_request_started');
   const response = await input.fetchImpl(controlledNodeArtifactUpgradeUrl(input.credential, input.target, asset), {
@@ -790,6 +796,10 @@ async function downloadArtifact(input: {
   const authenticodeSignerSha256 = readHeader(
     response.headers,
     CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256,
+  )?.trim().toLowerCase();
+  const releaseManifestSha256 = readHeader(
+    response.headers,
+    CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256,
   )?.trim().toLowerCase();
   if (!expectedSha || !/^[0-9a-f]{64}$/i.test(expectedSha)) throw new Error('missing_artifact_sha256');
   const expectedSize = sizeHeader && /^\d+$/.test(sizeHeader) ? Number(sizeHeader) : null;
@@ -837,6 +847,7 @@ async function downloadArtifact(input: {
       sizeBytes: downloaded.sizeBytes,
       filename: basename(filename),
       ...(versionHeader ? { version: versionHeader } : {}),
+      ...(releaseManifestSha256 ? { releaseManifestSha256 } : {}),
     };
   }
   await writeFile(manifestPath, `${JSON.stringify({
@@ -862,6 +873,7 @@ async function downloadArtifact(input: {
     sizeBytes: downloaded.sizeBytes,
     filename: basename(filename),
     ...(versionHeader ? { version: versionHeader } : {}),
+    ...(releaseManifestSha256 ? { releaseManifestSha256 } : {}),
   };
 }
 
@@ -950,6 +962,88 @@ export async function downloadControlledNodeAideskLocalUiFile(input: {
     if (/^download_failed_(400|404|503)$/.test(message)) return undefined;
     throw error;
   }
+}
+
+const RELEASE_MANIFEST_MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024;
+
+/**
+ * Fetch and verify the unified Desktop Release Manifest when published by the server.
+ * Returns `undefined` if the server does not publish one (403/404/501/503 or legacy binary fallback).
+ */
+export async function downloadDesktopReleaseManifest(input: {
+  credential: ArtifactDownloadCredential;
+  target: ControlledNodeArtifactTarget;
+  fetchImpl: typeof fetch;
+  expectedVersion?: string;
+  expectedSha256?: string;
+}): Promise<DesktopReleaseManifest | undefined> {
+  const response = await input.fetchImpl(
+    controlledNodeArtifactUpgradeUrl(
+      input.credential,
+      input.target,
+      CONTROLLED_NODE_ARTIFACT_ASSETS.DESKTOP_RELEASE_MANIFEST,
+    ),
+    {
+      headers: {
+        Authorization: `Bearer ${input.credential.token}`,
+        'X-Server-Id': input.credential.serverId,
+        [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: String(REMOTE_DESKTOP_PROTOCOL_VERSION),
+      },
+    },
+  );
+  if (response.status === 403 || response.status === 404 || response.status === 501 || response.status === 503) {
+    await response.body?.cancel().catch(() => {});
+    if (input.expectedSha256) {
+      throw new Error(`release_manifest_unavailable_${response.status}`);
+    }
+    return undefined;
+  }
+  if (!response.ok) {
+    throw new Error(`download_failed_${response.status}`);
+  }
+  const filenameHeader = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME)?.trim();
+  if (filenameHeader && !filenameHeader.endsWith('.manifest.json')) {
+    await response.body?.cancel().catch(() => {});
+    if (input.expectedSha256) {
+      throw new Error('release_manifest_unexpected_filename');
+    }
+    return undefined;
+  }
+  const sizeHeader = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES);
+  const declaredSize = sizeHeader && /^\d+$/.test(sizeHeader) ? Number(sizeHeader) : null;
+  if (declaredSize !== null && (!Number.isSafeInteger(declaredSize) || declaredSize > RELEASE_MANIFEST_MAX_DOWNLOAD_BYTES)) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error('release_manifest_too_large');
+  }
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (bytes.length === 0 || bytes.length > RELEASE_MANIFEST_MAX_DOWNLOAD_BYTES) {
+    throw new Error('release_manifest_invalid_size');
+  }
+  if (declaredSize !== null && bytes.length !== declaredSize) {
+    throw new Error('release_manifest_size_mismatch');
+  }
+  const actualSha = createHash('sha256').update(bytes).digest('hex');
+  const shaHeader = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256)?.trim().toLowerCase();
+  if (shaHeader) {
+    if (!/^[0-9a-f]{64}$/.test(shaHeader)) {
+      throw new Error('release_manifest_invalid_sha256_header');
+    }
+    if (actualSha !== shaHeader) {
+      throw new Error('release_manifest_sha256_mismatch');
+    }
+  }
+  if (input.expectedSha256 && actualSha !== input.expectedSha256.toLowerCase()) {
+    throw new Error('release_manifest_pinned_sha256_mismatch');
+  }
+  const manifest = validateDesktopReleaseManifest(JSON.parse(bytes.toString('utf8')));
+  if (
+    input.expectedVersion
+    && input.expectedVersion !== DAEMON_UPGRADE_TARGET_LATEST
+    && manifest.releaseVersion !== input.expectedVersion
+  ) {
+    throw new Error(`release_manifest_version_mismatch:expected_${input.expectedVersion}_got_${manifest.releaseVersion}`);
+  }
+  return manifest;
 }
 
 export async function downloadControlledNodeComputerUseHelper(input: {
@@ -2059,6 +2153,68 @@ export async function startControlledNodeSelfUpgrade(
       fetchImpl,
       expectedVersion: downloaded.version,
     }), { sleep: deps.sleep }));
+    if (abiProfile !== CONTROLLED_NODE_ABI_GLIBC217 && downloaded.releaseManifestSha256) {
+      const releaseTarget = releaseTargetFromRuntime(platform, arch);
+      if (releaseTarget) {
+        const manifestTarget: ControlledNodeArtifactTarget = {
+          os: target.os,
+          arch: platform === 'darwin' && (arch === 'x64' || arch === 'arm64') ? arch : target.arch,
+        };
+        const releaseManifest = await withArtifactDownloadRetries(
+          () => downloadDesktopReleaseManifest({
+            credential,
+            target: manifestTarget,
+            fetchImpl,
+            expectedVersion: downloaded.version,
+            expectedSha256: downloaded.releaseManifestSha256,
+          }),
+          { sleep: deps.sleep },
+        );
+        if (!releaseManifest) {
+          throw new Error('release_manifest_missing_after_announcement');
+        }
+        const downloadedNodeManifest = JSON.parse(await readFile(downloaded.manifestPath, 'utf8')) as {
+          artifact?: { authenticodeSignerSha256?: string };
+        };
+        const nodeCheck = verifyDesktopReleaseComponentIdentity(releaseManifest, releaseTarget, 'imcodes-node', {
+          version: downloaded.version,
+          fileName: downloaded.filename,
+          sha256: downloaded.sha256,
+          sizeBytes: downloaded.sizeBytes,
+          ...(downloadedNodeManifest.artifact?.authenticodeSignerSha256
+            ? { authenticodeSignerSha256: downloadedNodeManifest.artifact.authenticodeSignerSha256 }
+            : {}),
+        });
+        if (!nodeCheck.ok) throw new Error(`release_manifest_${nodeCheck.reason}`);
+
+        if (helper) {
+          const helperCheck = verifyDesktopReleaseComponentIdentity(releaseManifest, releaseTarget, 'open-computer-use', {
+            sha256: helper.sha256,
+            sizeBytes: helper.sizeBytes,
+          });
+          if (!helperCheck.ok) throw new Error(`release_manifest_${helperCheck.reason}`);
+        }
+
+        if (remoteDesktopWorker) {
+          const rdManifest = JSON.parse(await readFile(remoteDesktopWorker.manifestPath, 'utf8')) as {
+            workerVersion?: string;
+            protocolVersion?: number;
+            authenticodeSignerSha256?: string;
+            build?: { version?: string };
+          };
+          const rdVersion = rdManifest.workerVersion ?? rdManifest.build?.version;
+          const rdCheck = verifyDesktopReleaseComponentIdentity(releaseManifest, releaseTarget, 'remote-desktop', {
+            ...(rdVersion ? { version: rdVersion } : {}),
+            sha256: remoteDesktopWorker.sha256,
+            ...(typeof rdManifest.protocolVersion === 'number' ? { protocolVersion: rdManifest.protocolVersion } : {}),
+            ...(rdManifest.authenticodeSignerSha256
+              ? { authenticodeSignerSha256: rdManifest.authenticodeSignerSha256 }
+              : {}),
+          });
+          if (!rdCheck.ok) throw new Error(`release_manifest_${rdCheck.reason}`);
+        }
+      }
+    }
     const destinationPath = deps.execPath ?? defaultStagedExecutablePath(platform);
     const destinationManifestPath = `${destinationPath}.manifest.json`;
     const destinationJournalPath = deps.journalPath ?? join(dirname(defaultCredentialPath(platform)), 'install-journal.json');

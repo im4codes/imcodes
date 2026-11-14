@@ -9612,6 +9612,22 @@ async function handleDaemonUpgrade(
       'daemon.upgrade: installed version is at or newer than target, refusing to downgrade');
     return;
   }
+
+  const { inspectDaemonRuntimeMode, upgradeBundledDaemonRuntime } = await import('./daemon-runtime-upgrade.js');
+  const runtimeMode = inspectDaemonRuntimeMode({ entryScriptPath: process.argv[1] });
+  if (runtimeMode.mode === 'dev_exempt') {
+    logger.warn({ devCheckoutPath: runtimeMode.devCheckoutPath },
+      'daemon.upgrade: refusing auto-upgrade for development checkout/symlink (dev_symlink_exempt)');
+    try {
+      serverLink?.send({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: 'dev_symlink_exempt',
+        detail: runtimeMode.devCheckoutPath ?? '',
+      });
+    } catch { /* ignore */ }
+    return;
+  }
+
   // For untargeted / `latest` upgrades, pre-flight against the npm registry —
   // if our running version is already at or newer than what the registry
   // resolves `imcodes@latest` to, skip the whole upgrade. This stops servers
@@ -9626,7 +9642,7 @@ async function handleDaemonUpgrade(
   const upgradeRegistry = normalizedRegistryOverride
     ? { base: normalizedRegistryOverride, explicit: normalizedRegistryOverride !== INSTALLER_OFFICIAL_NPM_REGISTRY }
     : await resolveUpgradeRegistry();
-  if (!targetVersion || targetVersion === 'latest') {
+  if (runtimeMode.mode !== 'bundled' && (!targetVersion || targetVersion === 'latest')) {
     try {
       const res = await fetch(`${upgradeRegistry.base}imcodes/latest`, {
         headers: { accept: 'application/json' },
@@ -9776,6 +9792,46 @@ async function handleDaemonUpgrade(
       } catch { /* ignore */ }
       return;
     }
+
+  if (runtimeMode.mode === 'bundled') {
+    const bundledResult = await upgradeBundledDaemonRuntime({
+      currentVersion: DAEMON_VERSION,
+      targetVersion,
+      entryScriptPath: process.argv[1],
+      allowLegacyCliFallback: true,
+      detachedHandoff: true,
+    });
+    if (bundledResult.status === 'upgraded') {
+      logger.info({
+        targetVersion: bundledResult.targetVersion,
+        runtimeRoot: bundledResult.runtimeRoot,
+        writableRootKind: bundledResult.writableRootKind,
+        scriptDir: bundledResult.detachedScriptDir,
+      }, 'daemon.upgrade: bundled daemon-runtime detached switch runner spawned');
+      upgradeScriptSpawned = true;
+      announceUpgrading();
+      scheduleUpgradeMemoryFreezeRelease();
+      return;
+    }
+    if (bundledResult.status === 'up_to_date') {
+      logger.info({ daemonVersion: DAEMON_VERSION }, 'daemon.upgrade: bundled daemon-runtime already up to date');
+      return;
+    }
+    if (bundledResult.status === 'blocked' || bundledResult.status === 'rolled_back') {
+      logger.warn({ bundledResult }, 'daemon.upgrade: bundled daemon-runtime upgrade stopped cleanly');
+      if (bundledResult.status === 'blocked') {
+        try {
+          serverLink?.send({
+            type: DAEMON_MSG.UPGRADE_BLOCKED,
+            reason: bundledResult.reason,
+            detail: bundledResult.message,
+          });
+        } catch { /* ignore */ }
+      }
+      return;
+    }
+    logger.warn({ reason: bundledResult.reason }, 'daemon.upgrade: falling back to legacy CLI upgrade path');
+  }
   logger.info('daemon.upgrade: preparing upgrade script');
 
   const scriptDir = mkdtempSync(join(tmpdir(), 'imcodes-upgrade-'));

@@ -533,6 +533,44 @@ jobs:
           } finally {
             Remove-Item -LiteralPath $isoRoot -Recurse -Force -ErrorAction SilentlyContinue
           }
+      - name: Build and verify unified desktop release manifest (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            TARGET="darwin-arm64"
+          else
+            TARGET="linux-x64"
+          fi
+          node scripts/desktop-release-manifest.mjs build \
+            --target "$TARGET" \
+            --dist-dir dist-node-exe \
+            --release-version "$IMCODES_BUILD_VERSION" \
+            --git-sha "$GITHUB_SHA"
+          node scripts/desktop-release-manifest.mjs verify \
+            "dist-node-exe/desktop-release-${TARGET}.manifest.json" \
+            --dist-dir dist-node-exe \
+            --expected-version "$IMCODES_BUILD_VERSION" \
+            --expected-git-sha "$GITHUB_SHA" \
+            --target "$TARGET"
+      - name: Build and verify unified desktop release manifest (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          node scripts/desktop-release-manifest.mjs build `
+            --target win32-x64 `
+            --dist-dir dist-node-exe `
+            --release-version $env:IMCODES_BUILD_VERSION `
+            --git-sha $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw 'Windows desktop release manifest build failed.' }
+          node scripts/desktop-release-manifest.mjs verify `
+            dist-node-exe\desktop-release-win32-x64.manifest.json `
+            --dist-dir dist-node-exe `
+            --expected-version $env:IMCODES_BUILD_VERSION `
+            --expected-git-sha $env:GITHUB_SHA `
+            --target win32-x64
+          if ($LASTEXITCODE -ne 0) { throw 'Windows desktop release manifest verification failed.' }
       - name: Upload executable artifact
         uses: actions/upload-artifact@v4
         with:
@@ -540,6 +578,7 @@ jobs:
           path: |
             dist-node-exe/${{ matrix.artifact }}
             dist-node-exe/${{ matrix.artifact }}.manifest.json
+            dist-node-exe/desktop-release*.manifest.json
             dist-node-exe/computer-use-helper/**
             dist-node-exe/*.dmg
             dist-node-exe/remote-desktop-worker/**

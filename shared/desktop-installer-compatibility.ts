@@ -585,6 +585,55 @@ resolve_node_for_dev() {
 
 SELECTED_NODE=""
 SELECTED_ENTRY=""
+SELECTED_PKG=""
+
+pick_higher_runtime() {
+  cand_node="$1"
+  cand_entry="$2"
+  cand_pkg="$3"
+  if [ -z "$SELECTED_NODE" ]; then
+    SELECTED_NODE="$cand_node"
+    SELECTED_ENTRY="$cand_entry"
+    SELECTED_PKG="$cand_pkg"
+    return 0
+  fi
+  if [ -f "$SELECTED_PKG" ] && [ -f "$cand_pkg" ]; then
+    cmp=$("$cand_node" -e '
+      const fs = require("fs");
+      const p = (v) => {
+        const m = String(v || "").trim().match(/^(\\d+)\\.(\\d+)\\.(\\d+)(?:-([0-9A-Za-z.-]+))?$/);
+        return m ? { a: [+m[1], +m[2], +m[3]], pre: m[4] ? m[4].split(".") : [] } : null;
+      };
+      const cmp = (x, y) => {
+        if (!x || !y) return 0;
+        for (let i = 0; i < 3; i++) if (x.a[i] !== y.a[i]) return x.a[i] > y.a[i] ? 1 : -1;
+        if (!x.pre.length && !y.pre.length) return 0;
+        if (!x.pre.length) return 1;
+        if (!y.pre.length) return -1;
+        for (let i = 0; i < Math.max(x.pre.length, y.pre.length); i++) {
+          const u = x.pre[i], v = y.pre[i];
+          if (u === undefined) return -1;
+          if (v === undefined) return 1;
+          const un = /^\\d+$/.test(u), vn = /^\\d+$/.test(v);
+          if (un && vn && +u !== +v) return +u > +v ? 1 : -1;
+          if (un !== vn) return un ? -1 : 1;
+          if (u !== v) return u > v ? 1 : -1;
+        }
+        return 0;
+      };
+      try {
+        const c = p(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).version);
+        const b = p(JSON.parse(fs.readFileSync(process.argv[2], "utf8")).version);
+        process.stdout.write(cmp(c, b) > 0 ? "1" : "0");
+      } catch { process.stdout.write("0"); }
+    ' "$cand_pkg" "$SELECTED_PKG" 2>/dev/null || printf '0')
+    if [ "$cmp" = "1" ]; then
+      SELECTED_NODE="$cand_node"
+      SELECTED_ENTRY="$cand_entry"
+      SELECTED_PKG="$cand_pkg"
+    fi
+  fi
+}
 
 select_runtime_root() {
   root="$1"
@@ -592,9 +641,9 @@ select_runtime_root() {
   for layout in "$root/current" "$root"; do
     node_bin="$layout/bin/node"
     entry="$layout/package/dist/src/index.js"
+    pkg="$layout/package/package.json"
     if [ -x "$node_bin" ] && [ -f "$entry" ]; then
-      SELECTED_NODE="$node_bin"
-      SELECTED_ENTRY="$entry"
+      pick_higher_runtime "$node_bin" "$entry" "$pkg"
       return 0
     fi
   done
@@ -608,14 +657,18 @@ if [ -n "\${IMCODES_CLI_DEV_ENTRY:-}" ] && [ -f "$IMCODES_CLI_DEV_ENTRY" ]; then
   fi
 fi
 
-# 2. Bundled daemon-runtime (env -> relative -> system default): current/ first, then direct
+# 2. Bundled daemon-runtime: explicit env -> highest valid version among user, relative, and system defaults (current/ first)
 if [ -n "\${IMCODES_DAEMON_RUNTIME_DIR:-}" ] && select_runtime_root "$IMCODES_DAEMON_RUNTIME_DIR"; then
   exec "$SELECTED_NODE" "$SELECTED_ENTRY" "$@"
 fi
-if select_runtime_root "$SELF_DIR/${relSubpath}"; then
-  exec "$SELECTED_NODE" "$SELECTED_ENTRY" "$@"
+if [ -n "\${IMCODES_HOME:-}" ]; then
+  select_runtime_root "$IMCODES_HOME/daemon-runtime" || true
+elif [ -n "\${HOME:-}" ]; then
+  select_runtime_root "$HOME/.imcodes/daemon-runtime" || true
 fi
-if select_runtime_root "${defaultRuntimeRoot}"; then
+select_runtime_root "$SELF_DIR/${relSubpath}" || true
+select_runtime_root "${defaultRuntimeRoot}" || true
+if [ -n "$SELECTED_NODE" ] && [ -n "$SELECTED_ENTRY" ]; then
   exec "$SELECTED_NODE" "$SELECTED_ENTRY" "$@"
 fi
 
@@ -680,12 +733,16 @@ export function renderWindowsImcodesCliWrapper(options: RenderWindowsCliWrapperO
     'exit /b %IMCODES_EXIT%',
     '',
     ':check_bundled',
-    'REM 2. Bundled daemon-runtime (current\\ first, then direct)',
+    'REM 2. Bundled daemon-runtime (explicit env, else highest valid version among user, relative, system)',
     'set "SELECTED_NODE="',
     'set "SELECTED_ENTRY="',
+    'set "SELECTED_PKG="',
     'if defined IMCODES_DAEMON_RUNTIME_DIR call :select_runtime "%IMCODES_DAEMON_RUNTIME_DIR%"',
-    `if not defined SELECTED_NODE call :select_runtime "%SELF_DIR%\\${relSubpath}"`,
-    `if not defined SELECTED_NODE call :select_runtime "${defaultRuntimeRoot}"`,
+    'if defined SELECTED_NODE goto :run_bundled',
+    'if defined IMCODES_HOME (call :select_runtime "%IMCODES_HOME%\\daemon-runtime") else if defined USERPROFILE (call :select_runtime "%USERPROFILE%\\.imcodes\\daemon-runtime")',
+    `call :select_runtime "%SELF_DIR%\\${relSubpath}"`,
+    `call :select_runtime "${defaultRuntimeRoot}"`,
+    ':run_bundled',
     'if not defined SELECTED_NODE goto :check_npm',
     '"%SELECTED_NODE%" "%SELECTED_ENTRY%" %*',
     'set "IMCODES_EXIT=%ERRORLEVEL%"',
@@ -724,14 +781,35 @@ export function renderWindowsImcodesCliWrapper(options: RenderWindowsCliWrapperO
     'set "RT_ROOT=%~1"',
     'if not exist "%RT_ROOT%\\current\\node.exe" goto :select_runtime_direct',
     'if not exist "%RT_ROOT%\\current\\package\\dist\\src\\index.js" goto :select_runtime_direct',
-    'set "SELECTED_NODE=%RT_ROOT%\\current\\node.exe"',
-    'set "SELECTED_ENTRY=%RT_ROOT%\\current\\package\\dist\\src\\index.js"',
+    'call :pick_higher_runtime "%RT_ROOT%\\current\\node.exe" "%RT_ROOT%\\current\\package\\dist\\src\\index.js" "%RT_ROOT%\\current\\package\\package.json"',
     'exit /b 0',
     ':select_runtime_direct',
     'if not exist "%RT_ROOT%\\node.exe" exit /b 0',
     'if not exist "%RT_ROOT%\\package\\dist\\src\\index.js" exit /b 0',
-    'set "SELECTED_NODE=%RT_ROOT%\\node.exe"',
-    'set "SELECTED_ENTRY=%RT_ROOT%\\package\\dist\\src\\index.js"',
+    'call :pick_higher_runtime "%RT_ROOT%\\node.exe" "%RT_ROOT%\\package\\dist\\src\\index.js" "%RT_ROOT%\\package\\package.json"',
+    'exit /b 0',
+    ':pick_higher_runtime',
+    'if not defined SELECTED_NODE (',
+    '  set "SELECTED_NODE=%~1"',
+    '  set "SELECTED_ENTRY=%~2"',
+    '  set "SELECTED_PKG=%~3"',
+    '  exit /b 0',
+    ')',
+    'if not exist "%~3" exit /b 0',
+    'if not exist "%SELECTED_PKG%" exit /b 0',
+    'set "CAND_NEWER=0"',
+    'setlocal EnableDelayedExpansion',
+    'set "IMCODES_CAND_NODE=%~1"',
+    'set "IMCODES_CAND_PKG=%~3"',
+    'set "IMCODES_BEST_PKG=%SELECTED_PKG%"',
+    'set "IMCODES_CMP_JS=const fs=require(\'fs\');const p=v=>{const m=String(v||\'\').trim().match(/^(\\d+)\\.(\\d+)\\.(\\d+)(?:-([0-9A-Za-z.-]+))?$/);return m?{a:[+m[1],+m[2],+m[3]],pre:m[4]?m[4].split(\'.\'):[]}:null;};const cmp=(x,y)=>{if(!x||!y)return 0;for(let i=0;i<3;i++)if(x.a[i]!==y.a[i])return x.a[i]>y.a[i]?1:-1;if(!x.pre.length&&!y.pre.length)return 0;if(!x.pre.length)return 1;if(!y.pre.length)return -1;for(let i=0;i<Math.max(x.pre.length,y.pre.length);i++){const u=x.pre[i],v=y.pre[i];if(u===undefined)return -1;if(v===undefined)return 1;const un=/^\\d+$/.test(u),vn=/^\\d+$/.test(v);if(un&&vn&&+u!==+v)return +u>+v?1:-1;if(un!==vn)return un?-1:1;if(u!==v)return u>v?1:-1;}return 0;};try{const c=p(JSON.parse(fs.readFileSync(process.argv[1],\'utf8\')).version),b=p(JSON.parse(fs.readFileSync(process.argv[2],\'utf8\')).version);process.stdout.write(cmp(c,b)>0?\'1\':\'0\');}catch{process.stdout.write(\'0\');}"',
+    'for /f "usebackq delims=" %%C in (`""!IMCODES_CAND_NODE!" -e "!IMCODES_CMP_JS!" "!IMCODES_CAND_PKG!" "!IMCODES_BEST_PKG!""`) do set "CAND_NEWER=%%C"',
+    'endlocal & set "CAND_NEWER=%CAND_NEWER%"',
+    'if "%CAND_NEWER%"=="1" (',
+    '  set "SELECTED_NODE=%~1"',
+    '  set "SELECTED_ENTRY=%~2"',
+    '  set "SELECTED_PKG=%~3"',
+    ')',
     'exit /b 0',
     '',
     ':resolve_node',

@@ -1028,9 +1028,64 @@ program
       registry = normalizeRegistryBase((JSON.parse(raw) as { npmRegistry?: unknown }).npmRegistry);
     } catch { /* no install.json — use npm's ambient/default registry */ }
 
-    // Detect package manager: npm global or from a git clone?
+    // Detect package manager / runtime mode: bundled daemon-runtime, npm global, or git clone
+    const { inspectDaemonRuntimeMode, upgradeBundledDaemonRuntime } = await import('./daemon/daemon-runtime-upgrade.js');
+    const runtimeMode = inspectDaemonRuntimeMode({ entryScriptPath: process.argv[1] });
     const selfPath = realpathSync(process.argv[1]);
     const isGlobal = selfPath.includes('node_modules');
+
+    if (runtimeMode.mode === 'bundled') {
+      console.log(`Checking bundled daemon-runtime upgrade (target: ${/^\d/.test(pkgTag) ? pkgTag : 'latest'})...`);
+      const res = await upgradeBundledDaemonRuntime({
+        currentVersion: version,
+        targetVersion: /^\d/.test(pkgTag) ? pkgTag : 'latest',
+        entryScriptPath: process.argv[1],
+        allowLegacyCliFallback: true,
+        detachedHandoff: false,
+        restartService: async () => {
+          ensureServiceForeground();
+          await ensureMacosLaunchTarget();
+          if (platform === 'darwin') {
+            const plist = resolvePosixDaemonServicePaths().launchAgentPath;
+            if (existsSync(plist)) {
+              try { execSync(`launchctl unload "${plist}" 2>/dev/null`, { stdio: 'pipe' }); } catch { /* ok */ }
+              killStaleImcodesProcesses();
+              execSync(`launchctl load "${plist}"`, { stdio: 'inherit' });
+            }
+          } else if (platform === 'linux') {
+            const userService = resolvePosixDaemonServicePaths().systemdUnitPath;
+            if (existsSync(userService)) {
+              execSync(`systemctl --user daemon-reload && systemctl --user restart ${resolvePosixDaemonServicePaths().systemdUnitName}`, { stdio: 'inherit' });
+            }
+          } else if (platform === 'win32') {
+            const pidFile = resolve(resolveImcodesHome(), 'daemon.pid');
+            try {
+              const pid = parseInt(readFileSync(pidFile, 'utf8').trim(), 10);
+              if (pid && pid !== process.pid) {
+                try { execSync(`taskkill /f /pid ${pid}`, { stdio: 'ignore' }); } catch { /* not running */ }
+              }
+            } catch { /* no PID file */ }
+          }
+        },
+      });
+      if (res.status === 'upgraded') {
+        console.log(`Upgraded daemon-runtime to v${res.targetVersion} (${res.writableRootKind}: ${res.runtimeRoot})`);
+        process.exit(0);
+      }
+      if (res.status === 'up_to_date') {
+        console.log(`Already at daemon-runtime v${res.currentVersion}.`);
+        process.exit(0);
+      }
+      if (res.status === 'blocked') {
+        console.error(res.message);
+        process.exit(1);
+      }
+      if (res.status === 'rolled_back') {
+        console.error(`daemon-runtime upgrade failed health check (${res.reason}); rolled back to previous version.`);
+        process.exit(1);
+      }
+      console.log(`Bundled daemon-runtime feed unavailable (${res.reason}); falling back to legacy CLI upgrade...`);
+    }
 
     console.log(`Upgrading to ${pkg}  (${channelLabel})${registry ? `  via ${registry}` : ''}...`);
 

@@ -38,6 +38,7 @@ import {
   type RemoteDesktopLocalDaemonStatus,
 } from '../../shared/remote-desktop-local-management.js';
 import { xmlEscapeText } from '../../shared/macos-daemon-launch.js';
+import { compareImcodesVersions, parseImcodesVersion } from '../../shared/imcodes-version.js';
 import { parseDaemonRuntimeStatus, type DaemonRuntimeStatus } from '../util/daemon-status.js';
 import { IMCODES_HOME_ENV, imcodesStateDir, imcodesStateDirForHome } from '../util/imcodes-state-dir.js';
 import { resolvePosixDaemonServicePaths } from '../util/posix-daemon-service.js';
@@ -286,10 +287,20 @@ export function discoverCodingDaemonRuntime(options: {
   const execPath = options.execPath ?? process.execPath;
   const execDir = dirname(execPath);
 
+  const resolvedUserHome = options.userHome?.trim() || env.HOME?.trim() || env.USERPROFILE?.trim();
+  const userStateDir = options.userHome?.trim()
+    ? imcodesStateDirForHome(options.userHome.trim(), env)
+    : env.IMCODES_HOME?.trim()
+      ? resolve(env.IMCODES_HOME.trim())
+      : resolvedUserHome
+        ? imcodesStateDirForHome(resolvedUserHome, env)
+        : undefined;
+
   const defaultBundleDirs: Array<string | undefined> = options.bundleDirs !== undefined
     ? [...options.bundleDirs]
     : [
       env.IMCODES_DAEMON_RUNTIME_DIR,
+      ...(userStateDir ? [join(userStateDir, 'daemon-runtime')] : []),
       join(execDir, 'daemon-runtime'),
       join(execDir, '..', 'daemon-runtime'),
       join(execDir, '..', '..', 'daemon-runtime'),
@@ -302,12 +313,13 @@ export function discoverCodingDaemonRuntime(options: {
     uniquePaths(defaultBundleDirs).flatMap((dir) => [join(dir, 'current'), dir]),
   );
 
+  let bestBundle: DiscoveredCodingDaemonRuntime | null = null;
   for (const bundleDir of expandedBundleDirs) {
     const nodeBin = join(bundleDir, platform === 'win32' ? 'node.exe' : join('bin', 'node'));
     const entry = join(bundleDir, 'package', 'dist', 'src', 'index.js');
     if (isExecutableFile(nodeBin, platform) && existsSync(entry)) {
       const version = readPackageVersion(join(bundleDir, 'package', 'package.json')) ?? readManifestVersion(bundleDir);
-      return {
+      const candidate: DiscoveredCodingDaemonRuntime = {
         source: REMOTE_DESKTOP_LOCAL_DAEMON_RUNTIME_SOURCE.BUNDLE,
         ...(version ? { version } : {}),
         bundleDir,
@@ -315,8 +327,23 @@ export function discoverCodingDaemonRuntime(options: {
         prefixArgs: [entry],
         foregroundArgs: [entry, 'start', '--foreground'],
       };
+      if (!bestBundle) {
+        bestBundle = candidate;
+        continue;
+      }
+      if (candidate.version && parseImcodesVersion(candidate.version)) {
+        if (!bestBundle.version || !parseImcodesVersion(bestBundle.version)) {
+          bestBundle = candidate;
+        } else {
+          const cmp = compareImcodesVersions(candidate.version, bestBundle.version);
+          if (cmp !== null && cmp > 0) {
+            bestBundle = candidate;
+          }
+        }
+      }
     }
   }
+  if (bestBundle) return bestBundle;
 
   const cliCandidates: Array<string | undefined> = options.cliCandidates !== undefined ? [...options.cliCandidates] : [];
   if (options.cliCandidates === undefined) {

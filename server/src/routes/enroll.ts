@@ -36,6 +36,8 @@ import {
   CONTROLLED_NODE_ARTIFACT_COMPRESSION_ENCODING,
   CONTROLLED_NODE_ARTIFACT_ASSETS,
   CONTROLLED_NODE_ARTIFACT_HEADERS,
+  CONTROLLED_NODE_ARCH_ARM64,
+  CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL,
   CONTROLLED_NODE_ENROLL_AUDIT_ACTION,
   CONTROLLED_NODE_OS_LINUX,
   CONTROLLED_NODE_OS_MAC,
@@ -54,7 +56,10 @@ import {
   isControlledNodeOs,
   isControlledNodeTicketDelivery,
   isAideskLocalUiArtifactAsset,
+  isDaemonRuntimeArtifactAsset,
+  isDesktopReleaseManifestAsset,
   isRemoteDesktopArtifactAsset,
+  controlledNodeDaemonRuntimeTarget,
   normalizeControlledNodeArtifactPair,
   type AideskLocalUiArtifactAsset,
   type ControlledNodeArtifactArch,
@@ -94,6 +99,8 @@ import {
 import {
   createArtifactCatalog,
   defaultArtifactCatalog,
+  openDaemonRuntimeArtifact,
+  openDesktopReleaseManifestArtifact,
   type ArtifactCatalog,
 } from '../services/controlled-node-artifact-catalog.js';
 import {
@@ -1021,6 +1028,9 @@ const NODE_ARTIFACT_QUERY = z.object({
     CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI,
     CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI_MANIFEST,
     CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI_NOTICES,
+    CONTROLLED_NODE_ARTIFACT_ASSETS.DAEMON_RUNTIME,
+    CONTROLLED_NODE_ARTIFACT_ASSETS.DAEMON_RUNTIME_MANIFEST,
+    CONTROLLED_NODE_ARTIFACT_ASSETS.DESKTOP_RELEASE_MANIFEST,
   ])
     .default(CONTROLLED_NODE_ARTIFACT_ASSETS.NODE),
 }).strict();
@@ -1599,8 +1609,16 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
   }
   const abiProfile = normalizeControlledNodeAbiProfile(parsed.data.abiProfile);
   if ((c.req.queries(CONTROLLED_NODE_ABI_PROFILE_FIELD) ?? []).length > 1 || !abiProfile) return c.json({ error: 'invalid_query' }, 400);
+  const releaseTarget =
+    isDaemonRuntimeArtifactAsset(asset) || isDesktopReleaseManifestAsset(asset)
+      ? controlledNodeDaemonRuntimeTarget(os, arch)
+      : null;
   const artifactTarget = normalizeControlledNodeArtifactPair(os, arch, abiProfile);
-  if (!artifactTarget) {
+  if (isDaemonRuntimeArtifactAsset(asset)) {
+    if (!releaseTarget) return c.json({ error: 'invalid_query' }, 400);
+  } else if (isDesktopReleaseManifestAsset(asset)) {
+    if (!releaseTarget && !artifactTarget) return c.json({ error: 'invalid_query' }, 400);
+  } else if (!artifactTarget) {
     return c.json({ error: 'invalid_query' }, 400);
   }
 
@@ -1646,7 +1664,12 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
   // test the daemon server list uses.
   if (server.node_role !== NODE_ROLE.CONTROLLED
     && !isRemoteDesktopArtifactAsset(asset)
-    && asset !== CONTROLLED_NODE_ARTIFACT_ASSETS.NODE) {
+    && asset !== CONTROLLED_NODE_ARTIFACT_ASSETS.NODE
+    && !isDaemonRuntimeArtifactAsset(asset)
+    && !isDesktopReleaseManifestAsset(asset)) {
+    return c.json({ error: 'forbidden' }, 403);
+  }
+  if (server.node_role === NODE_ROLE.CONTROLLED && isDaemonRuntimeArtifactAsset(asset)) {
     return c.json({ error: 'forbidden' }, 403);
   }
   if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET
@@ -1655,7 +1678,11 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
     && server.node_role !== NODE_ROLE.CONTROLLED) {
     return c.json({ error: 'forbidden' }, 403);
   }
-  // The OS is checked; the enrolled ARCH deliberately is not.
+  if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET
+    && server.os !== null && server.os !== CONTROLLED_NODE_OS_MAC) {
+    return c.json({ error: 'forbidden' }, 403);
+  }
+  // The OS is checked; the enrolled ARCH deliberately is not for macOS.
   //
   // The macOS controlled-node executable is universal, so the arch recorded at
   // enrollment is `process.arch` of whichever slice happened to run the
@@ -1669,23 +1696,89 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
   // rejects a set whose manifest or binaries do not match what it asked for.
   // The worst a wrong request can achieve is a set its own verification
   // refuses to install.
-  if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET
-    && server.os !== null && server.os !== CONTROLLED_NODE_OS_MAC) {
-    return c.json({ error: 'forbidden' }, 403);
-  }
-  if ((server.os && server.arch
-      && !isControlledNodeArtifactCompatibleWithRuntime(artifactTarget.os, artifactTarget.arch, server.os, server.arch))
-    || (server.os && !server.arch && server.os !== artifactTarget.os)
-    || (!server.os && server.arch)) {
-    return c.json({ error: 'platform_mismatch' }, 403);
-  }
+  if (isDaemonRuntimeArtifactAsset(asset) || isDesktopReleaseManifestAsset(asset)) {
+    const reqOs = os === 'darwin' ? CONTROLLED_NODE_OS_MAC : os === 'win32' ? CONTROLLED_NODE_OS_WIN : os;
+    const srvOs = server.os === 'darwin' ? CONTROLLED_NODE_OS_MAC : server.os === 'win32' ? CONTROLLED_NODE_OS_WIN : server.os;
+    if ((srvOs && srvOs !== reqOs)
+      || (srvOs && server.arch && reqOs !== CONTROLLED_NODE_OS_MAC && server.arch !== arch)
+      || (!server.os && server.arch)) {
+      return c.json({ error: 'platform_mismatch' }, 403);
+    }
+    if (normalizeControlledNodeAbiProfile(server.abi_profile) !== abiProfile
+      || (isDaemonRuntimeArtifactAsset(asset) && abiProfile === CONTROLLED_NODE_ABI_GLIBC217)) {
+      return c.json({ error: 'abi_profile_mismatch' }, 409);
+    }
+  } else {
+    if ((server.os && server.arch
+        && !isControlledNodeArtifactCompatibleWithRuntime(artifactTarget!.os, artifactTarget!.arch, server.os, server.arch))
+      || (server.os && !server.arch && server.os !== artifactTarget!.os)
+      || (!server.os && server.arch)) {
+      return c.json({ error: 'platform_mismatch' }, 403);
+    }
 
-  if (normalizeControlledNodeAbiProfile(server.abi_profile) !== abiProfile
-    || (abiProfile === CONTROLLED_NODE_ABI_GLIBC217 && asset !== CONTROLLED_NODE_ARTIFACT_ASSETS.NODE)) {
-    return c.json({ error: 'abi_profile_mismatch' }, 409);
+    if (normalizeControlledNodeAbiProfile(server.abi_profile) !== abiProfile
+      || (abiProfile === CONTROLLED_NODE_ABI_GLIBC217 && asset !== CONTROLLED_NODE_ARTIFACT_ASSETS.NODE)) {
+      return c.json({ error: 'abi_profile_mismatch' }, 409);
+    }
   }
   const dir = process.env.IMCODES_NODE_EXE_DIR;
   if (!dir) return c.json({ error: 'executable_dir_not_configured' }, 503);
+  if (isDesktopReleaseManifestAsset(asset)) {
+    const openedReleaseManifest = await openDesktopReleaseManifestArtifact(dir, releaseTarget);
+    if (openedReleaseManifest.status === 'not_published') {
+      return c.json({ error: 'desktop_release_manifest_not_published' }, 404);
+    }
+    if (openedReleaseManifest.status === 'invalid') {
+      return c.json({ error: 'desktop_release_manifest_invalid', reason: openedReleaseManifest.reason }, 503);
+    }
+    c.header('Content-Length', String(openedReleaseManifest.sizeBytes));
+    c.header('Content-Type', 'application/octet-stream');
+    c.header('Content-Disposition', `attachment; filename="${openedReleaseManifest.filename}"`);
+    c.header('Cache-Control', 'private, no-store');
+    c.header('Referrer-Policy', 'no-referrer');
+    c.header('X-Content-Type-Options', 'nosniff');
+    c.header('Accept-Ranges', 'none');
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256, openedReleaseManifest.sha256);
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES, String(openedReleaseManifest.sizeBytes));
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME, openedReleaseManifest.filename);
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION, openedReleaseManifest.version);
+    return c.body(buildBufferArtifactStream(openedReleaseManifest.bytes, openedReleaseManifest.close) as unknown as ReadableStream, 200);
+  }
+  if (isDaemonRuntimeArtifactAsset(asset)) {
+    const openedRuntime = await openDaemonRuntimeArtifact(
+      dir,
+      releaseTarget!,
+      asset === CONTROLLED_NODE_ARTIFACT_ASSETS.DAEMON_RUNTIME_MANIFEST,
+    );
+    if (openedRuntime.status === 'not_published') {
+      return c.json({ error: 'daemon_runtime_not_published', target: releaseTarget }, 404);
+    }
+    if (openedRuntime.status === 'invalid') {
+      return c.json({ error: 'daemon_runtime_invalid', reason: openedRuntime.reason }, 503);
+    }
+    c.header('Content-Length', String(openedRuntime.sizeBytes));
+    c.header('Content-Type', 'application/octet-stream');
+    c.header('Content-Disposition', `attachment; filename="${openedRuntime.filename}"`);
+    c.header('Cache-Control', 'private, no-store');
+    c.header('Referrer-Policy', 'no-referrer');
+    c.header('X-Content-Type-Options', 'nosniff');
+    c.header('Accept-Ranges', 'none');
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256, openedRuntime.sha256);
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES, String(openedRuntime.sizeBytes));
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME, openedRuntime.filename);
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION, openedRuntime.version);
+    if (openedRuntime.authenticodeSignerSha256) {
+      c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256, openedRuntime.authenticodeSignerSha256);
+    }
+    if (openedRuntime.releaseManifestSha256) {
+      c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256, openedRuntime.releaseManifestSha256);
+    }
+    const stream = openedRuntime.bytes
+      ? buildBufferArtifactStream(openedRuntime.bytes, openedRuntime.close)
+      : buildBareArtifactStream(openedRuntime.handle!, openedRuntime.sizeBytes, openedRuntime.close);
+    return c.body(stream as unknown as ReadableStream, 200);
+  }
+  if (!artifactTarget) return c.json({ error: 'invalid_query' }, 400);
   if (isAideskLocalUiArtifactAsset(asset)) {
     // Only the Windows x64 host exists; every other target (and anything not published) is "nothing to fetch", never an error to retry.
     const target = AIDESK_LOCAL_UI_SIDECAR_TARGET;
@@ -1842,6 +1935,28 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
     }
   }
   await artifactCatalog.persistDescriptor(c.env.DB as Database, v.descriptor).catch(() => {});
+  let nodeReleaseManifestSha256: string | undefined;
+  if (abiProfile === CONTROLLED_NODE_ABI_MODERN) {
+    const nodeReleaseTarget = controlledNodeDaemonRuntimeTarget(
+      artifactTarget.os,
+      artifactTarget.arch === CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL ? CONTROLLED_NODE_ARCH_ARM64 : artifactTarget.arch,
+    );
+    const releaseCheck = await openDesktopReleaseManifestArtifact(dir, nodeReleaseTarget);
+    if (releaseCheck.status === 'invalid') {
+      return c.json({ error: 'desktop_release_manifest_invalid', reason: releaseCheck.reason }, 503);
+    }
+    if (releaseCheck.status === 'ok') {
+      await releaseCheck.close();
+      const targetForCheck = nodeReleaseTarget;
+      if (targetForCheck) {
+        const entry = releaseCheck.manifest.targets[targetForCheck]?.components['imcodes-node'];
+        if (entry && (entry.sha256 !== v.descriptor.sha256 || entry.sizeBytes !== v.descriptor.sizeBytes || entry.version !== v.descriptor.version)) {
+          return c.json({ error: 'desktop_release_manifest_mismatch' }, 503);
+        }
+      }
+      nodeReleaseManifestSha256 = releaseCheck.sha256;
+    }
+  }
   const opened = await artifactCatalog.openPinned(dir, v.descriptor);
   if (!opened) {
     artifactCatalog.invalidate(dir, artifactTarget.os, artifactTarget.arch, abiProfile);
@@ -1860,6 +1975,9 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
   c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME, v.descriptor.filename);
   c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION, v.descriptor.version);
   c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.ABI_PROFILE, abiProfile);
+  if (nodeReleaseManifestSha256) {
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256, nodeReleaseManifestSha256);
+  }
   if (v.descriptor.authenticodeSignerSha256) {
     c.header(
       CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256,

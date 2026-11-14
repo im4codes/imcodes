@@ -11,13 +11,25 @@
 import { createHash } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import { lstat, open, type FileHandle } from 'node:fs/promises';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import {
   CONTROLLED_NODE_ARTIFACT_VARIANTS,
   controlledNodeArtifactKey,
   type ControlledNodeArtifactArch,
   type ControlledNodeOs,
 } from '../../../shared/controlled-node-artifacts.js';
+import {
+  DESKTOP_RELEASE_BUILD_VERSION_RE,
+  DESKTOP_RELEASE_MANIFEST_FILENAME,
+  DESKTOP_RELEASE_SHA256_RE,
+  desktopReleaseTargetManifestFilename,
+  isSafeManifestRelativePath,
+  parseDesktopReleaseTarget,
+  validateDesktopReleaseManifest,
+  verifyDesktopReleaseComponentIdentity,
+  type DesktopReleaseManifest,
+  type DesktopReleaseTarget,
+} from '../../../shared/desktop-release-manifest.js';
 import { DAEMON_UPGRADE_TARGET_LATEST, normalizeDaemonUpgradeTargetVersion } from '../../../shared/daemon-upgrade.js';
 import {
   CONTROLLED_NODE_ABI_MODERN,
@@ -414,8 +426,297 @@ export function makeSafeCloseOnce(handle: FileHandle, onClosed?: () => void): ()
       await handle.close();
     } catch {
       // Closing an already-closed/erroring descriptor must not hide the primary error.
-    } finally {
+      } finally {
       onClosed?.();
     }
   };
+}
+
+const RELEASE_MANIFEST_MAX_BYTES = 2 * 1024 * 1024;
+const DAEMON_RUNTIME_MANIFEST_MAX_BYTES = 4 * 1024 * 1024;
+const DAEMON_RUNTIME_CRITICAL_ENTRY_PATHS = [
+  'package/package.json',
+  'package/config/default.yaml',
+  'package/dist/src/index.js',
+  'package/dist/src/cli.js',
+] as const;
+
+export type OpenedCatalogReleaseManifest =
+  | {
+      status: 'ok';
+      bytes: Buffer;
+      close: () => Promise<void>;
+      filename: string;
+      sizeBytes: number;
+      sha256: string;
+      version: string;
+      manifest: DesktopReleaseManifest;
+    }
+  | { status: 'not_published' }
+  | { status: 'invalid'; reason: string };
+
+export type OpenedCatalogDaemonRuntime =
+  | {
+      status: 'ok';
+      handle?: FileHandle;
+      bytes?: Buffer;
+      close: () => Promise<void>;
+      filename: string;
+      sizeBytes: number;
+      sha256: string;
+      version: string;
+      releaseManifestSha256?: string;
+      authenticodeSignerSha256?: string;
+    }
+  | { status: 'not_published' }
+  | { status: 'invalid'; reason: string };
+
+function isEnoent(error: unknown): boolean {
+  return Boolean(error && typeof error === 'object' && 'code' in error && (error as { code?: string }).code === 'ENOENT');
+}
+
+async function readPinnedRegularFile(
+  filePath: string,
+  maxBytes: number,
+): Promise<{ ok: true; bytes: Buffer; sha256: string } | { ok: false; kind: 'not_published' | 'invalid'; reason: string }> {
+  let handle: FileHandle | null = null;
+  try {
+    const pathStat = await lstat(filePath);
+    if (!pathStat.isFile() || pathStat.isSymbolicLink() || pathStat.size <= 0 || pathStat.size > maxBytes) {
+      return { ok: false, kind: 'invalid', reason: 'invalid_file_stat' };
+    }
+    handle = await openReadNoFollow(filePath);
+    const fdStat = await handle.stat();
+    if (!fdStat.isFile() || !sameIdentity(fileIdentity(pathStat), fileIdentity(fdStat))) {
+      return { ok: false, kind: 'invalid', reason: 'file_identity_changed' };
+    }
+    const bytes = await handle.readFile();
+    if (bytes.length !== fdStat.size) {
+      return { ok: false, kind: 'invalid', reason: 'short_read' };
+    }
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    return { ok: true, bytes, sha256 };
+  } catch (error) {
+    if (isEnoent(error)) return { ok: false, kind: 'not_published', reason: 'not_found' };
+    return { ok: false, kind: 'invalid', reason: 'read_failed' };
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+export async function openDesktopReleaseManifestArtifact(
+  dir: string,
+  target: DesktopReleaseTarget | null,
+): Promise<OpenedCatalogReleaseManifest> {
+  const candidates = target
+    ? [desktopReleaseTargetManifestFilename(target), DESKTOP_RELEASE_MANIFEST_FILENAME]
+    : [DESKTOP_RELEASE_MANIFEST_FILENAME];
+
+  for (const filename of candidates) {
+    const filePath = join(dir, filename);
+    const read = await readPinnedRegularFile(filePath, RELEASE_MANIFEST_MAX_BYTES);
+    if (!read.ok) {
+      if (read.kind === 'not_published') continue;
+      return { status: 'invalid', reason: read.reason };
+    }
+    let manifest: DesktopReleaseManifest;
+    try {
+      manifest = validateDesktopReleaseManifest(JSON.parse(read.bytes.toString('utf8')));
+    } catch (error) {
+      return { status: 'invalid', reason: error instanceof Error ? error.message : 'invalid_manifest' };
+    }
+    if (target && !manifest.targets[target]) {
+      return { status: 'invalid', reason: `missing_target_${target}` };
+    }
+    return {
+      status: 'ok',
+      bytes: read.bytes,
+      close: async () => {},
+      filename,
+      sizeBytes: read.bytes.length,
+      sha256: read.sha256,
+      version: manifest.releaseVersion,
+      manifest,
+    };
+  }
+  return { status: 'not_published' };
+}
+
+function validateDaemonRuntimeManifestRecord(
+  raw: unknown,
+  target: DesktopReleaseTarget,
+): {
+  fileName: string;
+  size: number;
+  sha256: string;
+  version: string;
+  authenticodeSignerSha256?: string;
+} | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const obj = raw as Record<string, unknown>;
+  if (obj.schemaVersion !== 1) return null;
+  const { os, arch } = parseDesktopReleaseTarget(target);
+  const expectedFormat = os === 'win32' ? 'zip' : 'tar.gz';
+  const expectedFilename = `daemon-runtime-${target}.${expectedFormat}`;
+
+  const artifact = obj.artifact;
+  if (!artifact || typeof artifact !== 'object' || Array.isArray(artifact)) return null;
+  const a = artifact as Record<string, unknown>;
+  if (a.fileName !== expectedFilename || basename(String(a.fileName)) !== expectedFilename) return null;
+  if (a.os !== os || a.arch !== arch || a.format !== expectedFormat) return null;
+  if (typeof a.size !== 'number' || !Number.isSafeInteger(a.size) || a.size <= 0) return null;
+  if (typeof a.sha256 !== 'string' || !DESKTOP_RELEASE_SHA256_RE.test(a.sha256)) return null;
+  const signer =
+    typeof a.authenticodeSignerSha256 === 'string' && DESKTOP_RELEASE_SHA256_RE.test(a.authenticodeSignerSha256)
+      ? a.authenticodeSignerSha256
+      : undefined;
+  if (a.authenticodeSignerSha256 !== undefined && !signer) return null;
+
+  const entrypoint = obj.entrypoint as Record<string, unknown> | undefined;
+  const expectedNode = os === 'win32' ? 'node.exe' : 'bin/node';
+  if (!entrypoint || entrypoint.node !== expectedNode || entrypoint.script !== 'package/dist/src/index.js') return null;
+
+  const build = obj.build as Record<string, unknown> | undefined;
+  if (!build || typeof build.version !== 'string' || !DESKTOP_RELEASE_BUILD_VERSION_RE.test(build.version)) return null;
+
+  if (!Array.isArray(obj.files) || obj.files.length === 0) return null;
+  const filePaths = new Set<string>();
+  for (const fileEntry of obj.files) {
+    if (!fileEntry || typeof fileEntry !== 'object') return null;
+    const f = fileEntry as Record<string, unknown>;
+    if (!isSafeManifestRelativePath(f.path)) return null;
+    if (typeof f.sha256 !== 'string' || !DESKTOP_RELEASE_SHA256_RE.test(f.sha256)) return null;
+    if (typeof f.size !== 'number' || !Number.isSafeInteger(f.size) || f.size < 0) return null;
+    filePaths.add(f.path);
+  }
+  if (!filePaths.has(expectedNode)) return null;
+  for (const reqPath of DAEMON_RUNTIME_CRITICAL_ENTRY_PATHS) {
+    if (!filePaths.has(reqPath)) return null;
+  }
+
+  return {
+    fileName: expectedFilename,
+    size: a.size,
+    sha256: a.sha256,
+    version: build.version,
+    ...(signer ? { authenticodeSignerSha256: signer } : {}),
+  };
+}
+
+export async function openDaemonRuntimeArtifact(
+  dir: string,
+  target: DesktopReleaseTarget,
+  wantManifest: boolean,
+): Promise<OpenedCatalogDaemonRuntime> {
+  const runtimeDir = join(dir, 'daemon-runtime');
+  const manifestFilename = `daemon-runtime-${target}.manifest.json`;
+  const manifestPath = join(runtimeDir, manifestFilename);
+  const readManifest = await readPinnedRegularFile(manifestPath, DAEMON_RUNTIME_MANIFEST_MAX_BYTES);
+  if (!readManifest.ok) {
+    return readManifest.kind === 'not_published'
+      ? { status: 'not_published' }
+      : { status: 'invalid', reason: readManifest.reason };
+  }
+
+  let parsedManifest: ReturnType<typeof validateDaemonRuntimeManifestRecord> = null;
+  try {
+    parsedManifest = validateDaemonRuntimeManifestRecord(JSON.parse(readManifest.bytes.toString('utf8')), target);
+  } catch {
+    return { status: 'invalid', reason: 'malformed_daemon_runtime_manifest' };
+  }
+  if (!parsedManifest) {
+    return { status: 'invalid', reason: 'invalid_daemon_runtime_manifest' };
+  }
+
+  // Always verify the archive itself exists and matches the manifest before serving either manifest or archive.
+  const archivePath = join(runtimeDir, parsedManifest.fileName);
+  let archiveHandle: FileHandle | null = null;
+  try {
+    const archivePathStat = await lstat(archivePath);
+    if (!archivePathStat.isFile() || archivePathStat.isSymbolicLink() || archivePathStat.size !== parsedManifest.size) {
+      return { status: 'invalid', reason: 'daemon_runtime_archive_stat_mismatch' };
+    }
+    archiveHandle = await openReadNoFollow(archivePath);
+    const fdStat = await archiveHandle.stat();
+    if (!fdStat.isFile() || !sameIdentity(fileIdentity(archivePathStat), fileIdentity(fdStat))) {
+      await archiveHandle.close().catch(() => {});
+      return { status: 'invalid', reason: 'daemon_runtime_archive_identity_changed' };
+    }
+    const hash = createHash('sha256');
+    const buf = Buffer.allocUnsafe(HASH_BUFFER_BYTES);
+    let position = 0;
+    while (position < parsedManifest.size) {
+      const { bytesRead } = await archiveHandle.read(buf, 0, Math.min(buf.length, parsedManifest.size - position), position);
+      if (bytesRead <= 0) {
+        await archiveHandle.close().catch(() => {});
+        return { status: 'invalid', reason: 'daemon_runtime_archive_short_read' };
+      }
+      hash.update(buf.subarray(0, bytesRead));
+      position += bytesRead;
+    }
+    const actualSha = hash.digest('hex');
+    if (actualSha !== parsedManifest.sha256) {
+      await archiveHandle.close().catch(() => {});
+      return { status: 'invalid', reason: 'daemon_runtime_archive_sha256_mismatch' };
+    }
+
+    // Cross-check unified release manifest when published alongside artifacts.
+    const releaseCheck = await openDesktopReleaseManifestArtifact(dir, target);
+    if (releaseCheck.status === 'invalid') {
+      await archiveHandle.close().catch(() => {});
+      return { status: 'invalid', reason: `release_manifest_invalid:${releaseCheck.reason}` };
+    }
+    if (releaseCheck.status === 'ok') {
+      const check = verifyDesktopReleaseComponentIdentity(releaseCheck.manifest, target, 'daemon-runtime', {
+        version: parsedManifest.version,
+        fileName: parsedManifest.fileName,
+        sha256: parsedManifest.sha256,
+        sizeBytes: parsedManifest.size,
+        ...(parsedManifest.authenticodeSignerSha256
+          ? { authenticodeSignerSha256: parsedManifest.authenticodeSignerSha256 }
+          : {}),
+      });
+      await releaseCheck.close();
+      if (!check.ok) {
+        await archiveHandle.close().catch(() => {});
+        return { status: 'invalid', reason: check.reason };
+      }
+    }
+
+    if (wantManifest) {
+      await archiveHandle.close().catch(() => {});
+      return {
+        status: 'ok',
+        bytes: readManifest.bytes,
+        close: async () => {},
+        filename: manifestFilename,
+        sizeBytes: readManifest.bytes.length,
+        sha256: readManifest.sha256,
+        version: parsedManifest.version,
+        ...(parsedManifest.authenticodeSignerSha256
+          ? { authenticodeSignerSha256: parsedManifest.authenticodeSignerSha256 }
+          : {}),
+      };
+    }
+
+    const pinned = archiveHandle;
+    archiveHandle = null;
+    return {
+      status: 'ok',
+      handle: pinned,
+      close: makeSafeCloseOnce(pinned),
+      filename: parsedManifest.fileName,
+      sizeBytes: parsedManifest.size,
+      sha256: parsedManifest.sha256,
+      version: parsedManifest.version,
+      ...(releaseCheck.status === 'ok' ? { releaseManifestSha256: releaseCheck.sha256 } : {}),
+      ...(parsedManifest.authenticodeSignerSha256
+        ? { authenticodeSignerSha256: parsedManifest.authenticodeSignerSha256 }
+        : {}),
+    };
+  } catch (error) {
+    await archiveHandle?.close().catch(() => {});
+    if (isEnoent(error)) return { status: 'not_published' };
+    return { status: 'invalid', reason: 'daemon_runtime_open_failed' };
+  }
 }

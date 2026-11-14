@@ -7,6 +7,7 @@ import {
   type DesktopInstallerPlatform,
   type ResolvedImcodesCliTarget,
 } from '../../shared/desktop-installer-compatibility.js';
+import { compareImcodesVersions, parseImcodesVersion } from '../../shared/imcodes-version.js';
 import { assertSafeNodeIsolatedTargetPath, isPathInsideGitCheckout } from './desktop-installer-probe.js';
 
 export interface InstallImcodesCliWrapperOptions {
@@ -101,23 +102,78 @@ export function installImcodesCliWrapper(
   return { status: 'installed', wrapperPath };
 }
 
+function readBundledLayoutVersion(layoutDir: string): string | undefined {
+  try {
+    const raw = JSON.parse(readFileSync(join(layoutDir, 'package', 'package.json'), 'utf8')) as { version?: unknown };
+    return typeof raw.version === 'string' && raw.version.trim() ? raw.version.trim() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Inspect local filesystem paths to determine which `imcodes` runtime target would execute.
+ * When `userRuntimeRoot` is provided, compares user-level and system `daemon-runtime` candidates
+ * and prefers the strictly higher valid version (`userRuntimeRoot` wins ties).
  */
 export function inspectImcodesCliResolution(options: {
   platform: DesktopInstallerPlatform;
   runtimeRoot: string;
+  userRuntimeRoot?: string;
   wrapperPath?: string;
   devEntryOverride?: string;
   npmFallbackEntry?: string;
   npmFallbackExecutable?: string;
 }): ResolvedImcodesCliTarget | null {
   const nodeRel = options.platform === 'win32' ? 'node.exe' : join('bin', 'node');
-  const currentDir = join(options.runtimeRoot, 'current');
-  const currentNode = join(currentDir, nodeRel);
-  const currentEntry = join(currentDir, 'package', 'dist', 'src', 'index.js');
-  const directNode = join(options.runtimeRoot, nodeRel);
-  const directEntry = join(options.runtimeRoot, 'package', 'dist', 'src', 'index.js');
+  const roots = options.userRuntimeRoot ? [options.userRuntimeRoot, options.runtimeRoot] : [options.runtimeRoot];
+  const candidates: Array<{
+    kind: 'current' | 'direct';
+    nodePath: string;
+    entryPath: string;
+    version?: string;
+  }> = [];
+
+  for (const root of roots) {
+    const currentDir = join(root, 'current');
+    const currentNode = join(currentDir, nodeRel);
+    const currentEntry = join(currentDir, 'package', 'dist', 'src', 'index.js');
+    if (existsSync(currentNode) && existsSync(currentEntry)) {
+      candidates.push({
+        kind: 'current',
+        nodePath: currentNode,
+        entryPath: currentEntry,
+        version: readBundledLayoutVersion(currentDir),
+      });
+      continue;
+    }
+    const directNode = join(root, nodeRel);
+    const directEntry = join(root, 'package', 'dist', 'src', 'index.js');
+    if (existsSync(directNode) && existsSync(directEntry)) {
+      candidates.push({
+        kind: 'direct',
+        nodePath: directNode,
+        entryPath: directEntry,
+        version: readBundledLayoutVersion(root),
+      });
+    }
+  }
+
+  let bestBundled: (typeof candidates)[number] | undefined;
+  for (const cand of candidates) {
+    if (!bestBundled) {
+      bestBundled = cand;
+      continue;
+    }
+    if (cand.version && parseImcodesVersion(cand.version)) {
+      if (!bestBundled.version || !parseImcodesVersion(bestBundled.version)) {
+        bestBundled = cand;
+      } else {
+        const cmp = compareImcodesVersions(cand.version, bestBundled.version);
+        if (cmp !== null && cmp > 0) bestBundled = cand;
+      }
+    }
+  }
 
   let selfIsDevSymlink = false;
   let selfRealEntryPath: string | undefined;
@@ -146,16 +202,22 @@ export function inspectImcodesCliResolution(options: {
     devOverrideExists: Boolean(options.devEntryOverride && existsSync(options.devEntryOverride)),
     selfIsDevSymlink,
     selfRealEntryPath,
-    bundledCurrent: {
-      exists: existsSync(currentNode) && existsSync(currentEntry),
-      nodePath: currentNode,
-      entryPath: currentEntry,
-    },
-    bundledDirect: {
-      exists: existsSync(directNode) && existsSync(directEntry),
-      nodePath: directNode,
-      entryPath: directEntry,
-    },
+    bundledCurrent:
+      bestBundled?.kind === 'current'
+        ? {
+            exists: true,
+            nodePath: bestBundled.nodePath,
+            entryPath: bestBundled.entryPath,
+          }
+        : undefined,
+    bundledDirect:
+      bestBundled?.kind === 'direct'
+        ? {
+            exists: true,
+            nodePath: bestBundled.nodePath,
+            entryPath: bestBundled.entryPath,
+          }
+        : undefined,
     npmFallback: {
       exists: Boolean(
         (options.npmFallbackEntry && existsSync(options.npmFallbackEntry)) ||

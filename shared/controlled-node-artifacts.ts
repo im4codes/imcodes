@@ -11,6 +11,7 @@ import {
   type ControlledNodeAbiProfile,
 } from './controlled-node-abi.js';
 import { AUTH_IDENTITY_ERRORS } from './auth-identity.js';
+import type { DesktopReleaseTarget } from './desktop-release-manifest.js';
 
 export const CONTROLLED_NODE_OS_WIN = 'win' as const;
 export const CONTROLLED_NODE_OS_MAC = 'mac' as const;
@@ -130,7 +131,38 @@ export const CONTROLLED_NODE_ARTIFACT_ASSETS = {
   AIDESK_LOCAL_UI: 'aidesk-local-ui',
   AIDESK_LOCAL_UI_MANIFEST: 'aidesk-local-ui-manifest',
   AIDESK_LOCAL_UI_NOTICES: 'aidesk-local-ui-notices',
+  DAEMON_RUNTIME: 'daemon-runtime',
+  DAEMON_RUNTIME_MANIFEST: 'daemon-runtime-manifest',
+  DESKTOP_RELEASE_MANIFEST: 'desktop-release-manifest',
 } as const;
+
+export type DaemonRuntimeArtifactAsset =
+  | typeof CONTROLLED_NODE_ARTIFACT_ASSETS.DAEMON_RUNTIME
+  | typeof CONTROLLED_NODE_ARTIFACT_ASSETS.DAEMON_RUNTIME_MANIFEST;
+
+export function isDaemonRuntimeArtifactAsset(asset: string): asset is DaemonRuntimeArtifactAsset {
+  return asset === CONTROLLED_NODE_ARTIFACT_ASSETS.DAEMON_RUNTIME
+    || asset === CONTROLLED_NODE_ARTIFACT_ASSETS.DAEMON_RUNTIME_MANIFEST;
+}
+
+export function isDesktopReleaseManifestAsset(
+  asset: string,
+): asset is typeof CONTROLLED_NODE_ARTIFACT_ASSETS.DESKTOP_RELEASE_MANIFEST {
+  return asset === CONTROLLED_NODE_ARTIFACT_ASSETS.DESKTOP_RELEASE_MANIFEST;
+}
+
+export function controlledNodeDaemonRuntimeTarget(
+  os: string,
+  arch: string,
+): DesktopReleaseTarget | null {
+  const normOs = os === 'darwin' ? CONTROLLED_NODE_OS_MAC : os === 'win32' ? CONTROLLED_NODE_OS_WIN : os;
+  if (normOs === CONTROLLED_NODE_OS_WIN && arch === CONTROLLED_NODE_ARCH_X64) return 'win32-x64';
+  if (normOs === CONTROLLED_NODE_OS_MAC && arch === CONTROLLED_NODE_ARCH_ARM64) return 'darwin-arm64';
+  if (normOs === CONTROLLED_NODE_OS_MAC && arch === CONTROLLED_NODE_ARCH_X64) return 'darwin-x64';
+  if (normOs === CONTROLLED_NODE_OS_LINUX && arch === CONTROLLED_NODE_ARCH_X64) return 'linux-x64';
+  if (normOs === CONTROLLED_NODE_OS_LINUX && arch === CONTROLLED_NODE_ARCH_ARM64) return 'linux-arm64';
+  return null;
+}
 
 export type AideskLocalUiArtifactAsset =
   | typeof CONTROLLED_NODE_ARTIFACT_ASSETS.AIDESK_LOCAL_UI
@@ -183,6 +215,7 @@ export const CONTROLLED_NODE_ARTIFACT_HEADERS = {
   ABI_PROFILE: 'x-imcodes-node-artifact-abi-profile',
   AUTHENTICODE_SIGNER_SHA256: 'x-imcodes-node-artifact-authenticode-signer-sha256',
   REMOTE_DESKTOP_PROTOCOL_VERSION: 'x-imcodes-remote-desktop-protocol-version',
+  RELEASE_MANIFEST_SHA256: 'x-imcodes-node-release-manifest-sha256',
 } as const;
 
 export function controlledNodeArtifactKey(
