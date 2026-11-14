@@ -1321,9 +1321,9 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF]: {
     name: MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF,
-    description: `Preferred self-wakeup for the current session; Identity is automatic. Recurring is default, until_complete is bounded; minimum ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes.`,
+    description: `Preferred self-wakeup for the current session; Identity is automatic. Recurring is default, until_complete is bounded; technical minimum ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes. Task/execution supervision keepalive crons are fallback-only, never polling, and MUST be >=20 minutes unless the user explicitly requests shorter.`,
     inputSchema: objectSchema({
-      cronExpr: stringSchema(`Cron expression; minimum interval is ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes.`),
+      cronExpr: stringSchema(`Cron expression; technical minimum interval is ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes. For task/supervision keepalive with until_complete, use >=20 minutes (*/20 * * * * minimum) unless the user explicitly requests shorter; keepalive is never polling.`),
       message: stringSchema('Message delivered to the current session.'),
       name: stringSchema('Optional job name; derived from message when omitted.'),
       timezone: stringSchema('Optional cron timezone.'),
@@ -1339,7 +1339,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     description: 'Update current-session self-wakeup by id.',
     inputSchema: objectSchema({
       id: stringSchema('Current-session cron job id.'),
-      cronExpr: stringSchema(`Optional cron expression; minimum interval is ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes.`),
+      cronExpr: stringSchema(`Optional cron expression; technical minimum interval is ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} minutes. Task/supervision keepalive with until_complete must be >=20 minutes unless the user explicitly requests shorter; never use it for polling.`),
       message: stringSchema('Optional replacement message.'),
       name: stringSchema('Optional replacement name.'),
       timezone: stringSchema('Optional replacement timezone.'),

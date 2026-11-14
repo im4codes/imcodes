@@ -554,7 +554,7 @@ export const BRAIN_MANUAL_AUDITED_WORK = {
     precedence: TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
   },
   legacy: {
-    heartbeat: 'cron_create_self_every_10_min_checks_executor_and_auditor_nudges_idle_side',
+    heartbeat: 'cron_create_self_min_20m_keepalive_fallback_checks_executor_and_auditor_nudges_idle_side',
     stop: 'cron_cancel_self_when_finished',
     oneSourcePerTask: true,
   },
