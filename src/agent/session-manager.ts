@@ -153,6 +153,7 @@ import {
   emitSystemContinueUserMessage,
   hasPendingRestartContinuation,
   retireRestartContinuation,
+  shouldAutoRespawnDeadProcessSubSession,
 } from '../daemon/restart-continuation.js';
 
 function maybeDispatchProcessRestartContinuation(sessionName: string): Promise<{ dispatched: boolean; reason: string; commandId?: string }> {
@@ -261,7 +262,9 @@ function startStructuredWatcher(
   ids?: { ccSessionId?: string; codexSessionId?: string; geminiSessionId?: string; opencodeSessionId?: string },
 ): void {
   if (agentType === 'claude-code') {
-    startCCWatcher(name, projectDir, ids?.ccSessionId);
+    if (!name.startsWith('deck_sub_') || ids?.ccSessionId) {
+      startCCWatcher(name, projectDir, ids?.ccSessionId);
+    }
   } else if (agentType === 'codex') {
     if (ids?.codexSessionId) {
       findRolloutPathByUuid(ids.codexSessionId).then((rolloutPath) => {
@@ -751,9 +754,18 @@ export async function restoreFromStore(): Promise<void> {
         upsertSession({ ...s, state: 'stopped', updatedAt: Date.now() });
         continue;
       }
-      if (await isPaneAlive(s.name)) {
-        consumeRestartContinuation(s.name);
+      if (!(await isPaneAlive(s.name))) {
+        if (shouldAutoRespawnDeadProcessSubSession(s)) {
+          logger.info({ session: s.name, agentType: s.agentType }, 'Sub-session pane dead on restore with pending continuation, respawning');
+          try {
+            await respawnSession(s);
+          } catch (err) {
+            logger.warn({ err, session: s.name }, 'Failed to respawn dead-pane sub-session on restore');
+          }
+        }
+        continue;
       }
+      consumeRestartContinuation(s.name);
       if (s.agentType === 'claude-code' && s.ccSessionId && s.projectDir && !isWatching(s.name)) {
         startCCWatcher(s.name, s.projectDir, s.ccSessionId);
       } else if (s.agentType === 'codex' && s.codexSessionId && !isCodexWatching(s.name)) {

@@ -3928,7 +3928,9 @@ function cancelTransportTurnNow(
   // calls are idempotent no-ops when nothing is armed.
   supervisionAutomation.cancelForUserStop(sessionName);
   peerAuditService.invalidateCancel(sessionName);
-  markSessionUserStopped(sessionName);
+  if (!markSessionUserStopped(sessionName)) {
+    logger.warn({ sessionName }, 'Failed to persist userStopped restart-continuation state on transport cancel');
+  }
   const isTransportStop = !!stopRuntime
     || stopRecord?.runtimeType === 'transport'
     || (typeof stopRecord?.agentType === 'string' && isTransportAgent(stopRecord.agentType));
@@ -4042,7 +4044,9 @@ export function stopSessionNow(sessionName: string): boolean {
   if (cancelTransportTurnNow(sessionName, undefined, undefined)) return true;
   const record = getSession(sessionName);
   if (!record) return false;
-  markSessionUserStopped(sessionName);
+  if (!markSessionUserStopped(sessionName)) {
+    logger.warn({ sessionName }, 'Failed to persist userStopped restart-continuation state on stopSessionNow');
+  }
   const agentType = record.agentType;
   // ESC interrupts CC/opencode; Codex, Gemini and shell only stop on Ctrl+C.
   const interruptKey = (agentType === 'codex' || agentType === 'gemini' || agentType === 'shell')
@@ -4920,7 +4924,9 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
   }
   if (!wantsStructuredP2pRouting && !wantsLegacyP2pRouting && !isDaemonHandledControlSend) {
     emitAcceptedReceiptAck();
-    retireRestartContinuation(sessionName);
+    if (!retireRestartContinuation(sessionName)) {
+      logger.warn({ sessionName }, 'Failed to persist restart-continuation retirement on user send');
+    }
   }
 
   // Persist UI locale only after the daemon-receipt ack has reached the client.
@@ -6905,7 +6911,9 @@ async function handleInputBound(cmd: Record<string, unknown>, serverLink: Server
     const agentType = getSession(sessionName)?.agentType;
     const isEsc = data === '\x1b';
     if (agentType && agentType !== 'shell' && agentType !== 'script' && (isEsc || data === '\x03')) {
-      markSessionUserStopped(sessionName);
+      if (!markSessionUserStopped(sessionName)) {
+        logger.warn({ sessionName }, 'Failed to persist userStopped restart-continuation state on terminal interrupt');
+      }
     }
     if (isEsc && (agentType === 'codex' || agentType === 'gemini')) {
       await sendRawInput(sessionName, '\x03'); // Ctrl+C

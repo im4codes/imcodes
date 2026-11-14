@@ -16,7 +16,7 @@ import { markDaemonProcess } from './process-role.js';
 import { stopProject, restoreFromStore, setSessionEventCallback, setSessionPersistCallback, setTransportSessionRestoredCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute, resyncTransportSessionStatesAfterLinkRestore, ensureTransportRuntimeForPendingResend } from '../agent/session-manager.js';
 import { beginUpgradeReadinessTracking, markGracefulShutdownStarted, markStartupPhaseDone } from './upgrade-readiness.js';
 import {
-  captureRestartContinuationsBeforeShutdown,
+  captureRestartContinuationsBeforeShutdownDetailed,
   captureUncleanRestartContinuations,
   hasPendingRestartContinuation,
 } from './restart-continuation.js';
@@ -1938,27 +1938,42 @@ export function shutdown(exitCode = 0): Promise<void> {
   return shutdownInFlight;
 }
 
-async function performShutdown(exitCode: number): Promise<void> {
-  logger.info('Daemon shutting down');
-  // First thing, before any teardown can be slow or fail: this exit is on purpose (SIGTERM from `systemctl restart`,
-  // which the upgrade script itself uses, included), so the next process is not "recovering from a crash".
-  markGracefulShutdownStarted();
+export function captureShutdownRestartContinuationsAndMarkExit(opts?: { filePath?: string }): { persisted: boolean; count: number } {
+  let continuationsPersisted = false;
+  let capturedCount = 0;
   try {
     const activeDispatchSessions = new Set(getTransportQueueStore().listActiveDispatchSessionNames());
-    const captured = captureRestartContinuationsBeforeShutdown({
+    const result = captureRestartContinuationsBeforeShutdownDetailed({
       sessions: listSessions(),
       getRuntime: (name) => getTransportRuntime(name),
       activeDispatchSessions,
+      ...(opts?.filePath ? { filePath: opts.filePath } : {}),
     });
-    if (captured.length > 0) {
+    continuationsPersisted = result.persisted;
+    capturedCount = result.captured.length;
+    if (result.captured.length > 0) {
       logger.info(
-        { count: captured.length, sessions: captured.map((c) => c.sessionName) },
+        { count: result.captured.length, sessions: result.captured.map((c) => c.sessionName) },
         'Captured active sessions before daemon shutdown for auto-continue',
       );
     }
   } catch (err) {
     logger.warn({ err }, 'Pre-shutdown restart-continuation capture failed');
   }
+  if (continuationsPersisted) {
+    markGracefulShutdownStarted();
+  } else {
+    logger.warn('Leaving daemon run-state unclean because restart-continuation persistence failed');
+  }
+  return { persisted: continuationsPersisted, count: capturedCount };
+}
+
+async function performShutdown(exitCode: number): Promise<void> {
+  logger.info('Daemon shutting down');
+  // Capture active sessions BEFORE marking graceful shutdown and BEFORE any teardown:
+  // if continuation persistence fails, keep run-state as `running` so the next startup
+  // triggers unclean-exit recovery instead of silently dropping interrupted turns.
+  captureShutdownRestartContinuationsAndMarkExit();
   const orderedShutdown = await runOrderedDaemonShutdown({
     session: async () => {
       logger.info({ shutdownPhase: 'session' }, 'Daemon shutdown phase session started');

@@ -28,10 +28,13 @@ import { resolveSubSessionCwd } from './subsession-cwd.js';
 import { clearResend } from './transport-resend-queue.js';
 import {
   clearSessionRestartContinuation,
+  consumeRestartContinuation,
   dispatchProcessRestartContinuation,
   emitSystemContinueUserMessage,
   retireRestartContinuation,
+  shouldAutoRespawnDeadProcessSubSession,
 } from './restart-continuation.js';
+import { isIncognitoSession } from '../../shared/session-incognito-types.js';
 import { hookCredentialEnv, mintHookCredential } from './hook-session-credential.js';
 import { registerTmuxSessionResource, releaseSessionResources, resourceOwnerEnv } from './session-resource-service.js';
 import { markSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
@@ -698,9 +701,12 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
     }
     const exists = await sessionExists(sessionName);
     if (!exists) {
+      if (existing && (existing.state === 'error' || isIncognitoSession(existing))) {
+        continue;
+      }
       await startSubSession({ ...sub, ccPreset: rebuildCcPreset }).catch(() => {});
     } else {
-      const stored = existing ?? getSession(sessionName);
+      let stored = existing ?? getSession(sessionName);
       // A sub-session already marked stopped must never have its watcher
       // (re)started here just because its tmux artifact still exists on
       // disk (e.g. remain-on-exit) — rebuildSubSessions is replayed on every
@@ -708,6 +714,30 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
       // watcher gets restarted repeatedly, free to adopt another live
       // session's file via directory scan.
       const isStoppedSubSession = stored?.state === 'stopped';
+      const tmuxMod = await import('../agent/tmux.js');
+      const isPaneAliveFn = Object.prototype.hasOwnProperty.call(tmuxMod, 'isPaneAlive') && typeof tmuxMod.isPaneAlive === 'function'
+        ? tmuxMod.isPaneAlive
+        : null;
+      const paneAlive = isStoppedSubSession || !isPaneAliveFn
+        ? true
+        : await isPaneAliveFn(sessionName);
+      if (!isStoppedSubSession && !paneAlive) {
+        if (shouldAutoRespawnDeadProcessSubSession(stored)) {
+          const sm = await import('../agent/session-manager.js');
+          if (Object.prototype.hasOwnProperty.call(sm, 'respawnSession') && typeof sm.respawnSession === 'function') {
+            await sm.respawnSession(stored!).catch((err) => {
+              logger.warn({ err, sessionName }, 'Failed to respawn dead-pane sub-session during rebuild');
+            });
+            stored = getSession(sessionName) ?? stored;
+          }
+        } else {
+          // Dead pane not eligible for continuation respawn (error, incognito, shell,
+          // script, userStopped, or no pending marker): never resurrect or attach watchers.
+          continue;
+        }
+      } else if (!isStoppedSubSession && paneAlive) {
+        consumeRestartContinuation(sessionName);
+      }
       const effectiveCcSessionId = sub.ccSessionId ?? stored?.ccSessionId;
       if (!isStoppedSubSession && sub.type === 'claude-code' && effectiveCcSessionId && sub.cwd && !isWatching(sessionName)) {
         // Pre-claim before seed creation to prevent main session's watchDir from stealing the file
@@ -784,6 +814,8 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         ...(stored?.recentInjectionHistory && stored.recentInjectionHistory.length > 0
           ? { recentInjectionHistory: stored.recentInjectionHistory }
           : {}),
+        ...(stored?.hookCredential ? { hookCredential: stored.hookCredential } : {}),
+        ...(stored?.nativeAgentLaunchFence ? { nativeAgentLaunchFence: stored.nativeAgentLaunchFence } : {}),
         ...(stored?.summarySyncFingerprints && stored.summarySyncFingerprints.length > 0
           ? { summarySyncFingerprints: stored.summarySyncFingerprints }
           : {}),

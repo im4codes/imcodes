@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/chat-message-origin.js';
 import {
   DAEMON_RESTART_CONTINUATION_COMMAND_PREFIX,
@@ -10,7 +10,10 @@ import {
 import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 import {
   captureRestartContinuationsBeforeShutdown,
+  captureRestartContinuationsBeforeShutdownDetailed,
   captureUncleanRestartContinuations,
+  captureUncleanRestartContinuationsDetailed,
+  clearSessionRestartContinuation,
   consumeRestartContinuation,
   dispatchProcessRestartContinuation,
   dispatchTransportRestartContinuation,
@@ -382,5 +385,194 @@ describe('restart-continuation dispatch & safety guards', () => {
     expect(res2).toEqual({ dispatched: false, reason: 'none' });
     expect(sendKeys).toHaveBeenCalledTimes(1);
     expect(restartContinuationPath()).toContain(tempHome);
+  });
+
+  it('propagates store persistence failure on consume/mutations and dispatches continue strictly once after recovery', async () => {
+    const now = 600_000;
+    const tSession = makeSession({
+      name: 'deck_eacces_t',
+      agentType: 'claude-code-sdk',
+      providerId: 'claude-code-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+    });
+    const pSession = makeSession({
+      name: 'deck_eacces_p',
+      agentType: 'claude-code',
+      runtimeType: 'process',
+      state: 'running',
+    });
+
+    const cap = captureRestartContinuationsBeforeShutdownDetailed({
+      sessions: [tSession, pSession],
+      getRuntime: () => ({ sending: true, getStatus: () => 'streaming' }),
+      now,
+      epoch: 'ep-eacces',
+    });
+    expect(cap.persisted).toBe(true);
+    expect(cap.captured).toHaveLength(2);
+
+    const storeDir = dirname(restartContinuationPath());
+    const tSend = vi.fn();
+    const tEmit = vi.fn();
+    const pSendKeys = vi.fn(async () => {});
+    const pEmit = vi.fn();
+
+    chmodSync(storeDir, 0o500);
+    try {
+      // Failed consume must refuse dispatch, preserve pending on disk, and allow clean retry later.
+      expect(consumeRestartContinuation('deck_eacces_t', 'ep-eacces', now + 100)).toBeNull();
+      expect(hasPendingRestartContinuation('deck_eacces_t', now + 100)).toBe(true);
+
+      const tFail = await dispatchTransportRestartContinuation({
+        preRestoreSession: tSession,
+        currentSession: { ...tSession, state: 'idle' },
+        runtime: { sending: false, pendingCount: 0, getStatus: () => 'idle', send: tSend },
+        getResendCount: () => 0,
+        hasQueuedDurableEntries: () => false,
+        emitUserMessage: (sName, commandId) => emitSystemContinueUserMessage(tEmit, sName, commandId, 'transport'),
+        now: now + 100,
+      });
+      expect(tFail).toEqual({ dispatched: false, reason: 'consume_persist_failed' });
+      expect(tSend).not.toHaveBeenCalled();
+      expect(tEmit).not.toHaveBeenCalled();
+      expect(hasPendingRestartContinuation('deck_eacces_t', now + 100)).toBe(true);
+
+      const pFail = await dispatchProcessRestartContinuation({
+        sessionName: 'deck_eacces_p',
+        currentSession: { ...pSession, state: 'idle' },
+        sendKeys: pSendKeys,
+        emitUserMessage: (sName, commandId) => emitSystemContinueUserMessage(pEmit, sName, commandId, 'process'),
+        now: now + 100,
+      });
+      expect(pFail).toEqual({ dispatched: false, reason: 'consume_persist_failed' });
+      expect(pSendKeys).not.toHaveBeenCalled();
+      expect(pEmit).not.toHaveBeenCalled();
+      expect(hasPendingRestartContinuation('deck_eacces_p', now + 100)).toBe(true);
+
+      // Every other store mutation also propagates persistence failure cleanly.
+      expect(markSessionUserStopped('deck_eacces_u', now + 100)).toBe(false);
+      expect(retireRestartContinuation('deck_eacces_t', now + 100)).toBe(false);
+      expect(clearSessionRestartContinuation('deck_eacces_t', now + 100)).toBe(false);
+    } finally {
+      chmodSync(storeDir, 0o700);
+    }
+
+    // Once writable again, each session dispatches 'continue' strictly once.
+    const tOk1 = await dispatchTransportRestartContinuation({
+      preRestoreSession: tSession,
+      currentSession: { ...tSession, state: 'idle' },
+      runtime: { sending: false, pendingCount: 0, getStatus: () => 'idle', send: tSend },
+      getResendCount: () => 0,
+      hasQueuedDurableEntries: () => false,
+      emitUserMessage: (sName, commandId) => emitSystemContinueUserMessage(tEmit, sName, commandId, 'transport'),
+      now: now + 200,
+    });
+    const tOk2 = await dispatchTransportRestartContinuation({
+      preRestoreSession: tSession,
+      currentSession: { ...tSession, state: 'idle' },
+      runtime: { sending: false, pendingCount: 0, getStatus: () => 'idle', send: tSend },
+      getResendCount: () => 0,
+      hasQueuedDurableEntries: () => false,
+      emitUserMessage: tEmit,
+      now: now + 300,
+    });
+    expect(tOk1.dispatched).toBe(true);
+    expect(tOk2).toEqual({ dispatched: false, reason: 'none' });
+    expect(tSend).toHaveBeenCalledTimes(1);
+    expect(tEmit).toHaveBeenCalledTimes(1);
+
+    const pOk1 = await dispatchProcessRestartContinuation({
+      sessionName: 'deck_eacces_p',
+      currentSession: { ...pSession, state: 'idle' },
+      sendKeys: pSendKeys,
+      emitUserMessage: (sName, commandId) => emitSystemContinueUserMessage(pEmit, sName, commandId, 'process'),
+      now: now + 200,
+    });
+    const pOk2 = await dispatchProcessRestartContinuation({
+      sessionName: 'deck_eacces_p',
+      currentSession: { ...pSession, state: 'idle' },
+      sendKeys: pSendKeys,
+      emitUserMessage: pEmit,
+      now: now + 300,
+    });
+    expect(pOk1.dispatched).toBe(true);
+    expect(pOk2).toEqual({ dispatched: false, reason: 'none' });
+    expect(pSendKeys).toHaveBeenCalledTimes(1);
+    expect(pEmit).toHaveBeenCalledTimes(1);
+
+    expect(markSessionUserStopped('deck_eacces_u', now + 400)).toBe(true);
+    captureRestartContinuationsBeforeShutdown({
+      sessions: [tSession],
+      getRuntime: () => ({ sending: true, getStatus: () => 'streaming' }),
+      now: now + 400,
+      epoch: 'ep-clear-retire',
+    });
+    expect(clearSessionRestartContinuation('deck_eacces_t', now + 410)).toBe(true);
+    expect(hasPendingRestartContinuation('deck_eacces_t', now + 410)).toBe(false);
+    captureRestartContinuationsBeforeShutdown({
+      sessions: [tSession],
+      getRuntime: () => ({ sending: true, getStatus: () => 'streaming' }),
+      now: now + 420,
+      epoch: 'ep-retire',
+    });
+    expect(retireRestartContinuation('deck_eacces_t', now + 430)).toBe(true);
+    expect(retireRestartContinuation('deck_eacces_t', now + 430)).toBe(true);
+  });
+
+  it('reports capture persistence failure instead of claiming capture or clearing stale store succeeded', () => {
+    const now = 700_000;
+    const session = makeSession({
+      name: 'deck_cap_fail',
+      agentType: 'claude-code-sdk',
+      providerId: 'claude-code-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+    });
+
+    // Seed an existing store file first.
+    const initial = captureRestartContinuationsBeforeShutdownDetailed({
+      sessions: [session],
+      getRuntime: () => ({ sending: true, getStatus: () => 'streaming' }),
+      now,
+      epoch: 'ep-seed',
+    });
+    expect(initial.persisted).toBe(true);
+
+    const storeDir = dirname(restartContinuationPath());
+    chmodSync(storeDir, 0o500);
+    try {
+      // Shutdown capture with empty sessions (dirty due to clearing stale entry) fails closed.
+      const clearFail = captureRestartContinuationsBeforeShutdownDetailed({
+        sessions: [],
+        getRuntime: () => undefined,
+        now: now + 100,
+        epoch: 'ep-clear-fail',
+      });
+      expect(clearFail).toEqual({ captured: [], persisted: false });
+      expect(hasPendingRestartContinuation('deck_cap_fail', now + 100)).toBe(true);
+
+      // Unclean capture with a fresh active session fails closed.
+      const uncleanFail = captureUncleanRestartContinuationsDetailed({
+        uncleanPreviousExit: true,
+        sessions: [makeSession({ name: 'deck_cap_fail_2', agentType: 'opencode', runtimeType: 'process', state: 'running' })],
+        now: now + 100,
+        epoch: 'ep-unclean-fail',
+      });
+      expect(uncleanFail).toEqual({ captured: [], persisted: false });
+      expect(hasPendingRestartContinuation('deck_cap_fail_2', now + 100)).toBe(false);
+    } finally {
+      chmodSync(storeDir, 0o700);
+    }
+
+    const uncleanOk = captureUncleanRestartContinuationsDetailed({
+      uncleanPreviousExit: true,
+      sessions: [makeSession({ name: 'deck_cap_fail_2', agentType: 'opencode', runtimeType: 'process', state: 'running' })],
+      now: now + 200,
+      epoch: 'ep-unclean-ok',
+    });
+    expect(uncleanOk.persisted).toBe(true);
+    expect(uncleanOk.captured).toHaveLength(1);
+    expect(hasPendingRestartContinuation('deck_cap_fail_2', now + 200)).toBe(true);
   });
 });

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/chat-message-origin.js';
@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => {
   const store = new Map<string, SessionRecord>();
   const tmuxLive = new Set<string>();
   const tmuxPaneAlive = new Set<string>();
+  const respawnCalls: string[] = [];
   const sendKeysCalls: Array<{ session: string; keys: string }> = [];
   const timelineEvents: Array<{ session: string; type: string; payload: Record<string, unknown> }> = [];
   const providerSends: Array<{ sessionId: string; message: string }> = [];
@@ -19,6 +20,7 @@ const mocks = vi.hoisted(() => {
     store,
     tmuxLive,
     tmuxPaneAlive,
+    respawnCalls,
     sendKeysCalls,
     timelineEvents,
     providerSends,
@@ -74,6 +76,7 @@ vi.mock('../../src/agent/tmux.js', () => ({
   sessionExists: async (name: string) => mocks.tmuxLive.has(name),
   isPaneAlive: async (name: string) => mocks.tmuxPaneAlive.has(name),
   respawnPane: async (name: string) => {
+    mocks.respawnCalls.push(name);
     mocks.tmuxPaneAlive.add(name);
   },
   capturePane: async () => ['❯ '],
@@ -86,6 +89,7 @@ vi.mock('../../src/agent/tmux.js', () => ({
   resizeSession: vi.fn(async () => {}),
   getPaneCwd: vi.fn(async () => '/tmp/proj'),
   getPaneId: vi.fn(async () => '%1'),
+  getPanePids: vi.fn(async () => []),
   getPaneStartCommand: vi.fn(async () => 'claude --dangerously-skip-permissions'),
   showBuffer: vi.fn(async () => ''),
   cleanupOrphanFifos: vi.fn(async () => {}),
@@ -173,6 +177,14 @@ vi.mock('../../src/daemon/session-identity-resolver.js', () => ({
   resolveEffectiveIdentityPrompt: vi.fn(async () => undefined),
 }));
 
+vi.mock('../../src/agent/agent-version.js', () => ({
+  getAgentVersion: vi.fn(async () => undefined),
+}));
+
+vi.mock('../../src/daemon/memory-inject.js', () => ({
+  injectGeminiMemoryWithTimeline: vi.fn(async () => undefined),
+}));
+
 vi.mock('../../src/agent/runtime-context-bootstrap.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../src/agent/runtime-context-bootstrap.js')>();
   return {
@@ -223,9 +235,19 @@ vi.mock('../../src/agent/provider-registry.js', async (importOriginal) => {
 
 const {
   captureRestartContinuationsBeforeShutdown,
+  captureUncleanRestartContinuations,
   hasPendingRestartContinuation,
   markSessionUserStopped,
+  restartContinuationPath,
 } = await import('../../src/daemon/restart-continuation.js');
+const {
+  captureShutdownRestartContinuationsAndMarkExit,
+} = await import('../../src/daemon/lifecycle.js');
+const {
+  __resetUpgradeReadinessForTests,
+  beginUpgradeReadinessTracking,
+  readPreviousExitWasUnclean,
+} = await import('../../src/daemon/upgrade-readiness.js');
 const {
   markDaemonProcess,
   resetProcessRoleForTests,
@@ -243,6 +265,9 @@ const {
   restoreTransportSessions,
   stopTransportRuntimeSession,
 } = await import('../../src/agent/session-manager.js');
+const {
+  rebuildSubSessions,
+} = await import('../../src/daemon/subsession-manager.js');
 
 let tempHome = '';
 const origHome = process.env.IMCODES_HOME;
@@ -250,12 +275,14 @@ const origHome = process.env.IMCODES_HOME;
 beforeEach(() => {
   tempHome = mkdtempSync(join(tmpdir(), 'imcodes-restore-cont-'));
   process.env.IMCODES_HOME = tempHome;
+  __resetUpgradeReadinessForTests();
   resetTransportQueueStoreForTests();
   clearAllResend();
   markDaemonProcess();
   mocks.store.clear();
   mocks.tmuxLive.clear();
   mocks.tmuxPaneAlive.clear();
+  mocks.respawnCalls.length = 0;
   mocks.sendKeysCalls.length = 0;
   mocks.timelineEvents.length = 0;
   mocks.providerSends.length = 0;
@@ -453,5 +480,234 @@ describe('restoreFromStore & restoreTransportSessions restart continuation wirin
     ]);
     expect(hasPendingRestartContinuation('deck_codex_done')).toBe(false);
     expect(hasPendingRestartContinuation('deck_queued_msg')).toBe(false);
+  });
+
+  it('shutdown capture persistence failure skips graceful_shutdown mark so next startup unclean fallback recovers', async () => {
+    const active = makeRecord({
+      name: 'deck_shutdown_fail_proc',
+      agentType: 'opencode',
+      runtimeType: 'process',
+      state: 'running',
+      updatedAt: Date.now(),
+      opencodeSessionId: 'oc-sd-fail',
+    });
+    mocks.store.set(active.name, active);
+
+    // 1) Daemon starts cleanly -> initial start was clean, run-state on disk is now 'running'.
+    const initialBoot = beginUpgradeReadinessTracking({ startedAt: Date.now() - 1_000 });
+    expect(initialBoot.uncleanPreviousExit).toBe(false);
+    expect(readPreviousExitWasUnclean()).toBe(true);
+
+    // 2) Shutdown continuation capture fails to persist (EACCES on target dir).
+    const readonlyDir = join(tempHome, 'readonly-cont');
+    mkdirSync(readonlyDir, { recursive: true });
+    const failFilePath = join(readonlyDir, 'restart-continuation.json');
+    chmodSync(readonlyDir, 0o500);
+    let shutdownRes: { persisted: boolean; count: number };
+    try {
+      shutdownRes = captureShutdownRestartContinuationsAndMarkExit({ filePath: failFilePath });
+    } finally {
+      chmodSync(readonlyDir, 0o700);
+    }
+    expect(shutdownRes).toEqual({ persisted: false, count: 0 });
+
+    // 3) Next startup sees uncleanPreviousExit === true because graceful_shutdown was NOT written.
+    __resetUpgradeReadinessForTests();
+    const uncleanStartup = beginUpgradeReadinessTracking({ startedAt: Date.now() }).uncleanPreviousExit;
+    expect(uncleanStartup).toBe(true);
+
+    // Unclean fallback recovers active session and restoreFromStore sends continue once.
+    const fallback = captureUncleanRestartContinuations({
+      uncleanPreviousExit: uncleanStartup,
+      sessions: [active],
+      epoch: 'ep-fallback-recover',
+    });
+    expect(fallback).toHaveLength(1);
+    await restoreFromStore();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(mocks.sendKeysCalls).toEqual([
+      { session: 'deck_shutdown_fail_proc', keys: 'continue' },
+    ]);
+
+    // 4) When writable, shutdown capture marks graceful_shutdown cleanly.
+    mocks.store.set(active.name, { ...active, state: 'running' });
+    beginUpgradeReadinessTracking({ startedAt: Date.now() });
+    const okRes = captureShutdownRestartContinuationsAndMarkExit({ filePath: restartContinuationPath() });
+    expect(okRes).toEqual({ persisted: true, count: 1 });
+    __resetUpgradeReadinessForTests();
+    expect(readPreviousExitWasUnclean()).toBe(false);
+  });
+
+  it('process sub-session restore & rebuildSubSessions: respawns dead pane once, launches missing once, skips live & negative controls', async () => {
+    const subMissing = makeRecord({
+      name: 'deck_sub_missing1',
+      role: 'w1',
+      agentType: 'opencode',
+      runtimeType: 'process',
+      state: 'running',
+      opencodeSessionId: 'oc-sub-miss',
+    });
+    const subDead = makeRecord({
+      name: 'deck_sub_dead1',
+      role: 'w1',
+      agentType: 'opencode',
+      runtimeType: 'process',
+      state: 'running',
+      opencodeSessionId: 'oc-sub-dead',
+    });
+    const subDeadStandalone = makeRecord({
+      name: 'deck_sub_deadstandalone1',
+      role: 'w1',
+      agentType: 'opencode',
+      runtimeType: 'process',
+      state: 'running',
+      opencodeSessionId: 'oc-sub-dead-sa',
+    });
+    const subLive = makeRecord({
+      name: 'deck_sub_live1',
+      role: 'w1',
+      agentType: 'opencode',
+      runtimeType: 'process',
+      state: 'running',
+      opencodeSessionId: 'oc-sub-live',
+    });
+    const subStopped = makeRecord({
+      name: 'deck_sub_stopped1',
+      role: 'w1',
+      agentType: 'opencode',
+      runtimeType: 'process',
+      state: 'stopped',
+      opencodeSessionId: 'oc-sub-stop',
+    });
+    const subErr = makeRecord({
+      name: 'deck_sub_err1',
+      role: 'w1',
+      agentType: 'opencode',
+      runtimeType: 'process',
+      state: 'error',
+      opencodeSessionId: 'oc-sub-err',
+    });
+    const subIncog = makeRecord({
+      name: 'deck_sub_incog1',
+      role: 'w1',
+      agentType: 'opencode',
+      runtimeType: 'process',
+      state: 'running',
+      incognito: true,
+      opencodeSessionId: 'oc-sub-incog',
+    });
+    const subShell = makeRecord({
+      name: 'deck_sub_shell1',
+      role: 'w1',
+      agentType: 'shell',
+      runtimeType: 'process',
+      state: 'running',
+    });
+    const subScript = makeRecord({
+      name: 'deck_sub_script1',
+      role: 'w1',
+      agentType: 'script',
+      runtimeType: 'process',
+      state: 'running',
+    });
+    const subUserStop = makeRecord({
+      name: 'deck_sub_userstop1',
+      role: 'w1',
+      agentType: 'opencode',
+      runtimeType: 'process',
+      state: 'running',
+      opencodeSessionId: 'oc-sub-ustop',
+    });
+
+    const restoreSet = [
+      subMissing,
+      subDead,
+      subLive,
+      subStopped,
+      subErr,
+      subIncog,
+      subShell,
+      subScript,
+      subUserStop,
+    ];
+    for (const r of restoreSet) mocks.store.set(r.name, r);
+
+    // Live tmux state: subLive is alive; subDead + negative controls exist as remain-on-exit dead panes; subMissing does not exist.
+    for (const deadName of [
+      subDead.name,
+      subStopped.name,
+      subErr.name,
+      subIncog.name,
+      subShell.name,
+      subScript.name,
+      subUserStop.name,
+    ]) {
+      mocks.tmuxLive.add(deadName);
+    }
+    mocks.tmuxLive.add(subLive.name);
+    mocks.tmuxPaneAlive.add(subLive.name);
+
+    markSessionUserStopped(subUserStop.name, Date.now() - 100);
+    captureRestartContinuationsBeforeShutdown({
+      sessions: restoreSet,
+      getRuntime: () => undefined,
+      epoch: 'ep-sub-restore',
+    });
+
+    // 1) Daemon restoreFromStore followed by server sync rebuildSubSessions (active sub-sessions only, matching syncSubSessions).
+    await restoreFromStore();
+    await new Promise((r) => setTimeout(r, 30));
+
+    const rebuildDtos: Parameters<typeof rebuildSubSessions>[0] = [
+      { id: 'missing1', type: 'opencode', cwd: '/tmp/proj', opencodeSessionId: 'oc-sub-miss' },
+      { id: 'dead1', type: 'opencode', cwd: '/tmp/proj', opencodeSessionId: 'oc-sub-dead' },
+      { id: 'live1', type: 'opencode', cwd: '/tmp/proj', opencodeSessionId: 'oc-sub-live' },
+      { id: 'err1', type: 'opencode', cwd: '/tmp/proj', opencodeSessionId: 'oc-sub-err' },
+      { id: 'incog1', type: 'opencode', cwd: '/tmp/proj', opencodeSessionId: 'oc-sub-incog' },
+      { id: 'shell1', type: 'shell', cwd: '/tmp/proj' },
+      { id: 'script1', type: 'script', cwd: '/tmp/proj' },
+      { id: 'userstop1', type: 'opencode', cwd: '/tmp/proj', opencodeSessionId: 'oc-sub-ustop' },
+    ];
+    await rebuildSubSessions(rebuildDtos);
+    // Replay rebuildSubSessions (simulates reconnect) — must NEVER double-respawn or double-continue.
+    await rebuildSubSessions(rebuildDtos);
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(mocks.respawnCalls).toEqual(['deck_sub_dead1']);
+    expect(mocks.tmuxPaneAlive.has('deck_sub_dead1')).toBe(true);
+    expect(mocks.tmuxPaneAlive.has('deck_sub_missing1')).toBe(true);
+    for (const neg of [subStopped.name, subErr.name, subIncog.name, subShell.name, subScript.name, subUserStop.name]) {
+      expect(mocks.tmuxPaneAlive.has(neg)).toBe(false);
+    }
+    expect(mocks.store.get(subStopped.name)?.state).toBe('stopped');
+    expect(mocks.store.get(subErr.name)?.state).toBe('error');
+
+    const sentSessions = mocks.sendKeysCalls.map((c) => `${c.session}:${c.keys}`).sort();
+    expect(sentSessions).toEqual([
+      'deck_sub_dead1:continue',
+      'deck_sub_missing1:continue',
+    ]);
+    expect(hasPendingRestartContinuation('deck_sub_dead1')).toBe(false);
+    expect(hasPendingRestartContinuation('deck_sub_missing1')).toBe(false);
+    expect(hasPendingRestartContinuation('deck_sub_live1')).toBe(false);
+
+    // 2) Standalone rebuildSubSessions without prior restoreFromStore also recovers a dead-pane sub-session once.
+    mocks.store.set(subDeadStandalone.name, subDeadStandalone);
+    mocks.tmuxLive.add(subDeadStandalone.name);
+    captureRestartContinuationsBeforeShutdown({
+      sessions: [subDeadStandalone],
+      getRuntime: () => undefined,
+      epoch: 'ep-sub-standalone',
+    });
+    const standaloneDtos: Parameters<typeof rebuildSubSessions>[0] = [
+      { id: 'deadstandalone1', type: 'opencode', cwd: '/tmp/proj', opencodeSessionId: 'oc-sub-dead-sa' },
+    ];
+    await rebuildSubSessions(standaloneDtos);
+    await rebuildSubSessions(standaloneDtos);
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(mocks.respawnCalls.filter((n) => n === 'deck_sub_deadstandalone1')).toHaveLength(1);
+    expect(mocks.tmuxPaneAlive.has('deck_sub_deadstandalone1')).toBe(true);
+    expect(mocks.sendKeysCalls.filter((c) => c.session === 'deck_sub_deadstandalone1' && c.keys === 'continue')).toHaveLength(1);
   });
 });

@@ -23,7 +23,7 @@
  *      `postLaunch` + init context injection finish.
  */
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/chat-message-origin.js';
 import {
@@ -147,13 +147,18 @@ function readStore(now = Date.now(), path = restartContinuationPath()): RestartC
 
 function writeStore(data: RestartContinuationStoreData, now = Date.now(), path = restartContinuationPath()): boolean {
   pruneStoreData(data, now);
+  const tmp = `${path}.${process.pid}.tmp`;
   try {
     mkdirSync(dirname(path), { recursive: true });
-    const tmp = `${path}.${process.pid}.tmp`;
     writeFileSync(tmp, JSON.stringify(data), { encoding: 'utf8', mode: 0o600 });
     renameSync(tmp, path);
     return true;
   } catch (err) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      // ignore cleanup failure
+    }
     logger.warn({ err, path }, 'restart-continuation: failed to write store');
     return false;
   }
@@ -179,34 +184,35 @@ export function isEligibleRestartContinuationSession(session: SessionRecord | un
 
 /**
  * Record an explicit user stop/cancel so shutdown or crash recovery will never
- * auto-continue this interrupted turn.
+ * auto-continue this interrupted turn. Returns whether the state change was persisted.
  */
-export function markSessionUserStopped(sessionName: string, now = Date.now(), path = restartContinuationPath()): void {
-  if (!sessionName) return;
+export function markSessionUserStopped(sessionName: string, now = Date.now(), path = restartContinuationPath()): boolean {
+  if (!sessionName) return false;
   const data = readStore(now, path);
   data.userStopped[sessionName] = now;
   delete data.pending[sessionName];
-  writeStore(data, now, path);
+  return writeStore(data, now, path);
 }
 
 /**
  * Retire any pending continuation marker and clear `userStopped` once a new
- * message or explicit reset/clear supersedes the previous turn.
+ * message or explicit reset/clear supersedes the previous turn. Returns whether
+ * the retirement succeeded (true if already absent or persisted cleanly).
  */
-export function retireRestartContinuation(sessionName: string, now = Date.now(), path = restartContinuationPath()): void {
-  if (!sessionName) return;
+export function retireRestartContinuation(sessionName: string, now = Date.now(), path = restartContinuationPath()): boolean {
+  if (!sessionName) return false;
   const data = readStore(now, path);
   const hadPending = Object.prototype.hasOwnProperty.call(data.pending, sessionName);
   const hadStopped = Object.prototype.hasOwnProperty.call(data.userStopped, sessionName);
-  if (!hadPending && !hadStopped) return;
+  if (!hadPending && !hadStopped) return true;
   delete data.pending[sessionName];
   delete data.userStopped[sessionName];
-  writeStore(data, now, path);
+  return writeStore(data, now, path);
 }
 
 /** Clear all restart-continuation state when a session is removed/closed. */
-export function clearSessionRestartContinuation(sessionName: string, now = Date.now(), path = restartContinuationPath()): void {
-  retireRestartContinuation(sessionName, now, path);
+export function clearSessionRestartContinuation(sessionName: string, now = Date.now(), path = restartContinuationPath()): boolean {
+  return retireRestartContinuation(sessionName, now, path);
 }
 
 export function isSessionUserStopped(sessionName: string, now = Date.now(), path = restartContinuationPath()): boolean {
@@ -237,9 +243,56 @@ export function hasPendingRestartContinuation(
   return getPendingRestartContinuation(sessionName, now, path) !== null;
 }
 
+/** Whether a dead-pane process sub-session should be auto-respawned on restore. */
+export function shouldAutoRespawnDeadProcessSubSession(
+  session: SessionRecord | undefined,
+  now = Date.now(),
+  filePath = restartContinuationPath(),
+): boolean {
+  if (!session?.name) return false;
+  if (session.runtimeType === 'transport' || isTransportAgent(session.agentType)) return false;
+  if (!isEligibleRestartContinuationSession(session)) return false;
+  if (isSessionUserStopped(session.name, now, filePath)) return false;
+  return hasPendingRestartContinuation(session.name, now, filePath);
+}
+
+type ConsumeOutcome = {
+  entry: PendingRestartContinuation | null;
+  reason: 'consumed' | 'missing' | 'epoch_mismatch' | 'already_consumed' | 'expired' | 'persist_failed';
+};
+
+function consumeRestartContinuationDetailed(
+  sessionName: string,
+  expectedEpoch?: string,
+  now = Date.now(),
+  path = restartContinuationPath(),
+): ConsumeOutcome {
+  if (!sessionName) return { entry: null, reason: 'missing' };
+  const data = readStore(now, path);
+  const entry = data.pending[sessionName];
+  if (!entry) return { entry: null, reason: 'missing' };
+  if (expectedEpoch && entry.epoch !== expectedEpoch) return { entry: null, reason: 'epoch_mismatch' };
+  const key = epochKey(sessionName, entry.epoch);
+  const alreadyConsumed = data.consumedEpochs.includes(key);
+  delete data.pending[sessionName];
+  if (!alreadyConsumed) data.consumedEpochs.push(key);
+  const written = writeStore(data, now, path);
+  if (!written) {
+    logger.warn(
+      { sessionName, epoch: entry.epoch, path },
+      'restart-continuation: failed to persist marker consumption; keeping pending marker and skipping dispatch',
+    );
+    return { entry: null, reason: 'persist_failed' };
+  }
+  if (alreadyConsumed) return { entry: null, reason: 'already_consumed' };
+  if (now >= entry.expiresAt) return { entry: null, reason: 'expired' };
+  return { entry, reason: 'consumed' };
+}
+
 /**
  * Atomically consume a pending continuation marker so any subsequent restore,
- * retry, or restart cannot fire it a second time.
+ * retry, or restart cannot fire it a second time. Returns `null` if missing,
+ * already consumed, expired, or if persisting the consumption failed.
  */
 export function consumeRestartContinuation(
   sessionName: string,
@@ -247,18 +300,7 @@ export function consumeRestartContinuation(
   now = Date.now(),
   path = restartContinuationPath(),
 ): PendingRestartContinuation | null {
-  if (!sessionName) return null;
-  const data = readStore(now, path);
-  const entry = data.pending[sessionName];
-  if (!entry) return null;
-  if (expectedEpoch && entry.epoch !== expectedEpoch) return null;
-  const key = epochKey(sessionName, entry.epoch);
-  const alreadyConsumed = data.consumedEpochs.includes(key);
-  delete data.pending[sessionName];
-  if (!alreadyConsumed) data.consumedEpochs.push(key);
-  writeStore(data, now, path);
-  if (alreadyConsumed || now >= entry.expiresAt) return null;
-  return entry;
+  return consumeRestartContinuationDetailed(sessionName, expectedEpoch, now, path).entry;
 }
 
 function isTransportRuntimeActiveAtShutdown(
@@ -281,12 +323,7 @@ function isTransportRuntimeActiveAtShutdown(
   return true;
 }
 
-/**
- * Capture sessions whose active turns will be interrupted by a daemon shutdown
- * (upgrades, `systemctl restart`, SIGTERM/SIGINT). Must run BEFORE transports or
- * ConPTY sessions are torn down.
- */
-export function captureRestartContinuationsBeforeShutdown(opts: {
+export function captureRestartContinuationsBeforeShutdownDetailed(opts: {
   sessions: readonly SessionRecord[];
   getRuntime: (sessionName: string) => RestartContinuationRuntimeProbe | undefined;
   activeDispatchSessions?: ReadonlySet<string>;
@@ -294,7 +331,7 @@ export function captureRestartContinuationsBeforeShutdown(opts: {
   epoch?: string;
   staleTurnMs?: number;
   filePath?: string;
-}): PendingRestartContinuation[] {
+}): { captured: PendingRestartContinuation[]; persisted: boolean } {
   const now = opts.now ?? Date.now();
   const epoch = opts.epoch ?? randomUUID();
   const staleTurnMs = opts.staleTurnMs ?? DEFAULT_STALE_TURN_MS;
@@ -344,10 +381,31 @@ export function captureRestartContinuationsBeforeShutdown(opts: {
     dirty = true;
   }
 
+  let persisted = true;
   if (dirty || existsSync(path)) {
-    writeStore(data, now, path);
+    persisted = writeStore(data, now, path);
   }
-  return captured;
+  return {
+    captured: persisted ? captured : [],
+    persisted,
+  };
+}
+
+/**
+ * Capture sessions whose active turns will be interrupted by a daemon shutdown
+ * (upgrades, `systemctl restart`, SIGTERM/SIGINT). Must run BEFORE transports or
+ * ConPTY sessions are torn down.
+ */
+export function captureRestartContinuationsBeforeShutdown(opts: {
+  sessions: readonly SessionRecord[];
+  getRuntime: (sessionName: string) => RestartContinuationRuntimeProbe | undefined;
+  activeDispatchSessions?: ReadonlySet<string>;
+  now?: number;
+  epoch?: string;
+  staleTurnMs?: number;
+  filePath?: string;
+}): PendingRestartContinuation[] {
+  return captureRestartContinuationsBeforeShutdownDetailed(opts).captured;
 }
 
 /**
@@ -355,21 +413,21 @@ export function captureRestartContinuationsBeforeShutdown(opts: {
  * inspects persisted store/SQLite state BEFORE `restoreFromStore` or
  * `restoreTransportSessions` resets `state` to `'idle'`.
  */
-export function captureUncleanRestartContinuations(opts: {
+export function captureUncleanRestartContinuationsDetailed(opts: {
   uncleanPreviousExit: boolean;
   sessions: readonly SessionRecord[];
   activeDispatchSessions?: ReadonlySet<string>;
   now?: number;
   epoch?: string;
   filePath?: string;
-}): PendingRestartContinuation[] {
+}): { captured: PendingRestartContinuation[]; persisted: boolean } {
   const now = opts.now ?? Date.now();
   const path = opts.filePath ?? restartContinuationPath();
   const data = readStore(now, path);
   if (!opts.uncleanPreviousExit) {
     // Still prune expired markers on clean startup if the file exists.
-    if (existsSync(path)) writeStore(data, now, path);
-    return [];
+    const persisted = existsSync(path) ? writeStore(data, now, path) : true;
+    return { captured: [], persisted };
   }
 
   const epoch = opts.epoch ?? randomUUID();
@@ -402,10 +460,22 @@ export function captureUncleanRestartContinuations(opts: {
     dirty = true;
   }
 
-  if (dirty) {
-    writeStore(data, now, path);
-  }
-  return captured;
+  const persisted = dirty ? writeStore(data, now, path) : true;
+  return {
+    captured: persisted ? captured : [],
+    persisted,
+  };
+}
+
+export function captureUncleanRestartContinuations(opts: {
+  uncleanPreviousExit: boolean;
+  sessions: readonly SessionRecord[];
+  activeDispatchSessions?: ReadonlySet<string>;
+  now?: number;
+  epoch?: string;
+  filePath?: string;
+}): PendingRestartContinuation[] {
+  return captureUncleanRestartContinuationsDetailed(opts).captured;
 }
 
 export async function dispatchTransportRestartContinuation(opts: {
@@ -459,17 +529,22 @@ export async function dispatchTransportRestartContinuation(opts: {
     }
   }
 
-  const consumed = consumeRestartContinuation(sessionName, entry.epoch, now, path);
-  if (!consumed) return { dispatched: false, reason: 'already_consumed' };
+  const consumed = consumeRestartContinuationDetailed(sessionName, entry.epoch, now, path);
+  if (!consumed.entry) {
+    return {
+      dispatched: false,
+      reason: consumed.reason === 'persist_failed' ? 'consume_persist_failed' : 'already_consumed',
+    };
+  }
 
-  const commandId = buildRestartContinuationCommandId(sessionName, consumed.epoch);
+  const commandId = buildRestartContinuationCommandId(sessionName, consumed.entry.epoch);
   opts.emitUserMessage(sessionName, commandId);
   opts.runtime.send('continue', commandId, undefined, undefined, {
     queuePlacement: 'front',
     timelineCommitted: true,
     messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
   });
-  return { dispatched: true, reason: consumed.reason, commandId };
+  return { dispatched: true, reason: consumed.entry.reason, commandId };
 }
 
 export async function dispatchProcessRestartContinuation(opts: {
@@ -496,13 +571,18 @@ export async function dispatchProcessRestartContinuation(opts: {
     return { dispatched: false, reason: 'already_running' };
   }
 
-  const consumed = consumeRestartContinuation(opts.sessionName, entry.epoch, now, path);
-  if (!consumed) return { dispatched: false, reason: 'already_consumed' };
+  const consumed = consumeRestartContinuationDetailed(opts.sessionName, entry.epoch, now, path);
+  if (!consumed.entry) {
+    return {
+      dispatched: false,
+      reason: consumed.reason === 'persist_failed' ? 'consume_persist_failed' : 'already_consumed',
+    };
+  }
 
-  const commandId = buildRestartContinuationCommandId(opts.sessionName, consumed.epoch);
+  const commandId = buildRestartContinuationCommandId(opts.sessionName, consumed.entry.epoch);
   opts.emitUserMessage(opts.sessionName, commandId);
   await opts.sendKeys(opts.sessionName, 'continue');
-  return { dispatched: true, reason: consumed.reason, commandId };
+  return { dispatched: true, reason: consumed.entry.reason, commandId };
 }
 
 export function emitSystemContinueUserMessage(
