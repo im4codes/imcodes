@@ -99,7 +99,7 @@ export type ShareCommandDecision =
   | { allowed: false; reason: ShareReason; closeSocket?: boolean };
 
 type ShareCommandPolicy =
-  | { kind: 'allow-covered-read'; requireTarget: boolean }
+  | { kind: 'allow-covered-read'; requireTarget: boolean; requireCanonicalSessionName?: boolean }
   | { kind: 'allow-main-covered-read' }
   | { kind: 'participant-covered-action' }
   | { kind: 'participant-bound-action' }
@@ -176,8 +176,8 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
   { bridgeCommand: TRANSPORT_MSG.CHAT_SUBSCRIBE, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true } },
   { bridgeCommand: TRANSPORT_MSG.CHAT_UNSUBSCRIBE, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true } },
   { bridgeCommand: TRANSPORT_MSG.CHAT_HISTORY, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true } },
-  { bridgeCommand: TIMELINE_MESSAGES.SUBSCRIBE, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true } },
-  { bridgeCommand: TIMELINE_MESSAGES.UNSUBSCRIBE, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true } },
+  { bridgeCommand: TIMELINE_MESSAGES.SUBSCRIBE, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true, requireCanonicalSessionName: true } },
+  { bridgeCommand: TIMELINE_MESSAGES.UNSUBSCRIBE, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true, requireCanonicalSessionName: true } },
   { bridgeCommand: TIMELINE_MESSAGES.HISTORY_REQUEST, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true } },
   { bridgeCommand: TIMELINE_MESSAGES.REPLAY_REQUEST, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true } },
   { bridgeCommand: TIMELINE_MESSAGES.PAGE_REQUEST, sharedCommand: SHARE_BROWSER_COMMANDS.CHAT_HISTORY, policy: { kind: 'allow-covered-read', requireTarget: true } },
@@ -607,6 +607,21 @@ export function evaluateShareCommand(input: {
         sharedActor: buildSharedActorEnvelope(input.state, actionId, input.now),
       },
     };
+  }
+
+  if (policy.kind === 'allow-covered-read' && policy.requireCanonicalSessionName) {
+    const rawSessionName = input.msg.sessionName;
+    const canonicalSessionName = typeof rawSessionName === 'string'
+      && rawSessionName.trim().length > 0
+      && rawSessionName.trim() === rawSessionName
+      ? rawSessionName
+      : null;
+    if (!canonicalSessionName) {
+      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    }
+    return shareStateCoversSession(input.state, canonicalSessionName)
+      ? { allowed: true }
+      : { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
   }
 
   const sessionName = commandSessionName(input.msg);
