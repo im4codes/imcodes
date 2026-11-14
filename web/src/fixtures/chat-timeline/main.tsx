@@ -483,6 +483,7 @@ function FixtureSubBar() {
         onRestart={() => {}}
         ws={subBarWs}
         connected={true}
+        serverId="fixture-server"
         onDiff={() => {}}
         onHistory={() => {}}
         quickData={useFallbackInput ? undefined : (quickData as any)}

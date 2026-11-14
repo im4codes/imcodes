@@ -1359,6 +1359,130 @@ afterEach(() => {
     expect(container.querySelector('.controls-composer-backdrop')).toBeTruthy();
   });
 
+  it('keeps embedded attachment and hides expand button when styled 16px mobile single-line variance reaches 44px', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    const { container } = render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv-mobile-single-line-variance"
+        activeSession={makeTransportSession({ name: 'transport-mobile-single-line-variance' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.style.lineHeight = '23.2px';
+    input.style.paddingTop = '7px';
+    input.style.paddingBottom = '7px';
+    // 44px on a 16px mobile composer (23.2px lineHeight + 14px vertical padding) is within
+    // single-line ascender/subpixel variance and must NOT promote to multiline.
+    Object.defineProperty(input, 'clientHeight', { configurable: true, value: 44 });
+    Object.defineProperty(input, 'scrollHeight', { configurable: true, value: 44 });
+    input.textContent = '你好世界';
+    fireEvent.input(input);
+
+    expect(container.querySelector('.controls-mobile-multiline')).toBeNull();
+    expect(container.querySelector('.controls-composer .btn-attachment-embedded')).toBeTruthy();
+    expect(container.querySelector('.btn-attachment-mobile-stacked')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'expand composer' })).toBeNull();
+  });
+
+  it('restores embedded attachment after sending a multiline message clears the styled mobile composer', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    let scrollHeightValue = 60;
+    const ws = makeWs();
+    const { container } = render(
+      <SessionControls
+        ws={ws as any}
+        serverId="srv-mobile-clear-recover"
+        activeSession={makeTransportSession({ name: 'transport-mobile-clear-recover' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.style.lineHeight = '23.2px';
+    input.style.paddingTop = '7px';
+    input.style.paddingBottom = '7px';
+    Object.defineProperty(input, 'clientHeight', { configurable: true, get: () => scrollHeightValue });
+    Object.defineProperty(input, 'scrollHeight', { configurable: true, get: () => scrollHeightValue });
+    input.textContent = 'line 1\nline 2';
+    fireEvent.input(input);
+
+    expect(container.querySelector('.controls-mobile-multiline')).toBeTruthy();
+    expect(container.querySelector('.btn-attachment-mobile-stacked')).toBeTruthy();
+
+    // Even if a post-clear layout still reports elevated container height (e.g. 56px flex/font stretch),
+    // an empty styled composer (childNodes.length === 0) recovers embedded attachment.
+    scrollHeightValue = 56;
+    fireEvent.keyDown(input, { key: 'Enter' });
+
+    expect(input.textContent).toBe('');
+    expect(container.querySelector('.controls-mobile-multiline')).toBeNull();
+    expect(container.querySelector('.controls-composer .btn-attachment-embedded')).toBeTruthy();
+    expect(container.querySelector('.btn-attachment-mobile-stacked')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'expand composer' })).toBeNull();
+  });
+
+  it('recovers single-line state when clearing text inside expanded fullscreen mobile composer and collapsing', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    let scrollHeightValue = 60;
+    const { container } = render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv-mobile-expand-collapse"
+        activeSession={makeTransportSession({ name: 'transport-mobile-expand-collapse' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.style.lineHeight = '23.2px';
+    input.style.paddingTop = '7px';
+    input.style.paddingBottom = '7px';
+    Object.defineProperty(input, 'clientHeight', { configurable: true, get: () => scrollHeightValue });
+    Object.defineProperty(input, 'scrollHeight', { configurable: true, get: () => scrollHeightValue });
+    input.textContent = 'line 1\nline 2';
+    fireEvent.input(input);
+
+    expect(container.querySelector('.controls-mobile-multiline')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'expand composer' }));
+    expect(container.querySelector('.controls-composer-mobile-expanded')).toBeTruthy();
+
+    // Fullscreen composer has full-height scrollHeight while user deletes back to empty.
+    scrollHeightValue = 640;
+    input.textContent = '';
+    fireEvent.input(input);
+    scrollHeightValue = 37;
+    fireEvent.click(screen.getByRole('button', { name: 'collapse composer' }));
+
+    expect(container.querySelector('.controls-composer-mobile-expanded')).toBeNull();
+    expect(container.querySelector('.controls-mobile-multiline')).toBeNull();
+    expect(container.querySelector('.controls-composer .btn-attachment-embedded')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'expand composer' })).toBeNull();
+  });
+
+  it('keeps mobileComposerMultiline disabled when window.innerWidth > 640', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1280 });
+    const { container } = render(
+      <SessionControls
+        ws={makeWs() as any}
+        serverId="srv-desktop-no-multiline"
+        activeSession={makeTransportSession({ name: 'transport-desktop-no-multiline' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.style.lineHeight = '23.2px';
+    input.style.paddingTop = '7px';
+    input.style.paddingBottom = '7px';
+    Object.defineProperty(input, 'clientHeight', { configurable: true, value: 60 });
+    Object.defineProperty(input, 'scrollHeight', { configurable: true, value: 60 });
+    input.textContent = 'line 1\nline 2';
+    fireEvent.input(input);
+
+    expect(container.querySelector('.controls-mobile-multiline')).toBeNull();
+    expect(container.querySelector('.btn-attachment-mobile-stacked')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'expand composer' })).toBeNull();
+  });
+
   it('renders menu button (⋯)', () => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
     // The ⋯ menu button has title from t('session.actions') → 'actions'

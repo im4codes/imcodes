@@ -1844,6 +1844,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [settledQueuedIds, setSettledQueuedIds] = useState<ReadonlySet<string>>(() => new Set());
   const [mobileComposerMultiline, setMobileComposerMultiline] = useState(false);
   const [mobileComposerExpanded, setMobileComposerExpanded] = useState(false);
+  const mobileComposerExpandedRef = useRef(false);
   const sharedComposerHeight = useSharedComposerHeight();
   const composerResizeCleanupRef = useRef<(() => void) | null>(null);
   const [confirm, setConfirm] = useState<MenuAction | null>(null);
@@ -2379,6 +2380,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     } else {
       publishComposerText('');
     }
+    syncMobileComposerMetrics();
     return () => {
       const text = divRef.current ? readComposerElementText(divRef.current) : '';
       if (draftKey) safeSessionStorageSetItem(draftKey, text);
@@ -3608,19 +3610,53 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     // every compositionupdate / candidate-bar toggle (a major "focus jumps"
     // cause when typing CJK). The `input` event fired after `compositionend`
     // (imeComposingRef already false) runs the deferred final sync.
-    if (imeComposingRef.current) return;
+    if (imeComposingRef.current || mobileComposerExpandedRef.current) return;
     const root = divRef.current;
     if (!root) return;
     const computed = window.getComputedStyle(root);
     const lineHeight = Number.parseFloat(computed.lineHeight || '') || 20;
     const verticalPadding = (Number.parseFloat(computed.paddingTop || '') || 0)
       + (Number.parseFloat(computed.paddingBottom || '') || 0);
-    // Treat the composer as multiline as soon as it wraps onto a second line.
-    // This keeps the mobile side controls out of the text area once horizontal
-    // space becomes scarce, instead of waiting until a third line appears.
-    const multilineThreshold = lineHeight + verticalPadding + 4;
-    setMobileComposerMultiline(root.scrollHeight > multilineThreshold);
-  }, []);
+    // When real styles are active (verticalPadding > 0) and the composer has no
+    // child nodes at all, empty placeholder text must never trigger multiline.
+    // (Keeps unstyled jsdom metric mocks where verticalPadding === 0 intact.)
+    if (verticalPadding > 0 && root.childNodes.length === 0) {
+      setMobileComposerMultiline(false);
+      return;
+    }
+    const currentHasText = !!readComposerElementText(root).trim();
+    const singleLineTrailingCount = serverId
+      ? (VoiceInput.isAvailable() && !currentHasText ? 2 : 1)
+      : 0;
+    // Require real second-line clearance beyond single-line font/ascender/subpixel
+    // variance (mobile 16px * 1.45 = 23.2px + 14px padding = 37.2px for 1 line vs
+    // 60.4px for 2 lines; ~52.3px avoids both false positives and late flips).
+    const multilineThreshold = lineHeight + verticalPadding + Math.max(lineHeight * 0.65, 12);
+    let measuredScrollHeight = root.scrollHeight;
+    if (singleLineTrailingCount > 0) {
+      // Measure against the single-line trailing padding so removing the embedded
+      // attachment button in multiline mode does not reclaim padding-right width
+      // and cause single/multiline oscillation near the right edge.
+      const desiredClass = `controls-input-with-trailing-${singleLineTrailingCount}`;
+      const hasTrailing = root.classList.contains('controls-input-with-trailing');
+      const hasDesired = root.classList.contains(desiredClass);
+      const otherClass = singleLineTrailingCount === 1
+        ? 'controls-input-with-trailing-2'
+        : 'controls-input-with-trailing-1';
+      const hasOther = root.classList.contains(otherClass);
+      if (!hasTrailing || !hasDesired || hasOther) {
+        const prevClassName = root.className;
+        root.classList.remove('controls-input-with-trailing-1', 'controls-input-with-trailing-2');
+        root.classList.add('controls-input-with-trailing', desiredClass);
+        try {
+          measuredScrollHeight = root.scrollHeight;
+        } finally {
+          root.className = prevClassName;
+        }
+      }
+    }
+    setMobileComposerMultiline(measuredScrollHeight > multilineThreshold);
+  }, [serverId]);
 
   const fillInput = (text: string) => {
     if (divRef.current) {
@@ -7134,6 +7170,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
     queueMicrotask(() => { quickPhraseInputSuppressRef.current = false; });
     setHasText(!!(divRef.current ? readComposerElementText(divRef.current).trim() : ''));
+    if (!inserted) syncMobileComposerMetrics();
   };
 
   const handleShortcut = (data: string) => {
@@ -7275,10 +7312,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         mobileLayoutRef.current = next;
         setResponsiveLayoutTick((tick) => tick + 1);
       }
+      if (next) syncMobileComposerMetrics();
     };
     window.addEventListener('resize', onResize);
     return () => window.removeEventListener('resize', onResize);
-  }, []);
+  }, [syncMobileComposerMetrics]);
   const showEmbeddedVoiceButton = isMobileLayout && VoiceInput.isAvailable() && !hasText;
   const showMobileStackedAttachmentButton = isMobileLayout
     && isTransport
@@ -7337,6 +7375,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const voiceHoldReady = isMobileLayout && hasSession && connected && !inputDisabled && VoiceInput.isAvailable();
   voiceHoldReadyRef.current = voiceHoldReady;
   composerFocusedRef.current = composerFocused;
+  mobileComposerExpandedRef.current = mobileComposerExpanded;
   const sessionTargetLabel = sessionDisplayName ?? activeSession?.label ?? activeSession?.project ?? 'session';
   const basePlaceholder = !hasSession
     ? t('session.no_session')
@@ -7371,7 +7410,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       return;
     }
     syncMobileComposerMetrics();
-  }, [hasText, isMobileLayout, syncMobileComposerMetrics]);
+  }, [hasText, isMobileLayout, mobileComposerExpanded, isTransport, serverId, syncMobileComposerMetrics]);
 
   useEffect(() => {
     if (voiceHoldReady && !composerFocused) {

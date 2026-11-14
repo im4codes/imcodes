@@ -2846,6 +2846,13 @@ html.native-ios-mac .chat-dl-btn {
   .controls { align-items: center; }
   .controls-mobile-multiline { align-items: flex-end; }
   .controls-composer { min-height: 32px; }
+  .controls-input:empty::before {
+    display: block;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .shortcuts-row { overflow: visible; }
   .shortcuts { gap: 3px; padding: 4px 4px 4px 6px; }
   .shortcuts-transport { flex: 0 0 auto; min-width: 0; max-width: none; overflow: visible; padding-left: 0; }
