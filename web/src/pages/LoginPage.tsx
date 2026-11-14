@@ -29,6 +29,8 @@ interface Props {
   onLoginSuccess?: (userId: string, serverUrl: string, r2RelayEnabled?: boolean) => void;
   onChangeServer?: () => void | Promise<void>;
   beginAuthAttempt?: () => LoginAuthAttempt;
+  /** Completion strategy after web auth: reload the page (default) or run callback in-place. */
+  completionMode?: 'reload' | 'callback';
   /** Initial surface for a trusted same-origin flow such as invite resumption. */
   initialMode?: LoginMode;
   /** Disable external OAuth when a caller must resume exact in-tab state. */
@@ -89,10 +91,19 @@ export function LoginPage({
   onLoginSuccess,
   onChangeServer,
   beginAuthAttempt,
+  completionMode = 'reload',
   initialMode = 'buttons',
   showGithub = true,
   sessionNotStuck = false,
 }: Props) {
+  const completeWebLogin = (options?: { markSessionNotStuck?: boolean }) => {
+    onLogin?.();
+    if (completionMode === 'callback') return;
+    if (options?.markSessionNotStuck) {
+      try { sessionStorage.setItem(LOGIN_SESSION_NOT_STUCK_KEY, '1'); } catch { /* ignore */ }
+    }
+    window.location.reload();
+  };
   const { t } = useTranslation();
   const [mode, setMode] = useState<LoginMode>(initialMode);
   const [displayName, setDisplayName] = useState('');
@@ -302,8 +313,7 @@ export function LoginPage({
       const authResponse = await startAuthentication(options as never);
       await passkeyLoginComplete(challengeId, authResponse);
       if (!attempt.isCurrent()) return;
-      onLogin?.();
-      window.location.reload();
+      completeWebLogin();
     } catch (err: unknown) {
       if (!attempt.isCurrent()) return;
       const msg = err instanceof Error ? err.message : String(err);
@@ -331,8 +341,7 @@ export function LoginPage({
       const regResponse = await startRegistration(options as never);
       await passkeyRegisterComplete(challengeId, regResponse, deviceName.trim() || undefined);
       if (!attempt.isCurrent()) return;
-      onLogin?.();
-      window.location.reload();
+      completeWebLogin();
     } catch (err: unknown) {
       if (!attempt.isCurrent()) return;
       const msg = err instanceof Error ? err.message : String(err);
@@ -377,9 +386,7 @@ export function LoginPage({
       } else if (res.passwordMustChange) {
         setMode('change_password');
       } else {
-        onLogin?.();
-        try { sessionStorage.setItem(LOGIN_SESSION_NOT_STUCK_KEY, '1'); } catch { /* ignore */ }
-        window.location.reload();
+        completeWebLogin({ markSessionNotStuck: true });
       }
     } catch (err: unknown) {
       if (!attempt.isCurrent()) return;
@@ -424,9 +431,7 @@ export function LoginPage({
         if (!attempt.isCurrent()) return;
         onLoginSuccess?.(res.userId, serverUrl!);
       } else {
-        onLogin?.();
-        try { sessionStorage.setItem(LOGIN_SESSION_NOT_STUCK_KEY, '1'); } catch { /* ignore */ }
-        window.location.reload();
+        completeWebLogin({ markSessionNotStuck: true });
       }
     } catch (err: unknown) {
       if (!attempt.isCurrent()) return;
@@ -482,8 +487,7 @@ export function LoginPage({
           return;
         }
       }
-      onLogin?.();
-      window.location.reload();
+      completeWebLogin();
     } catch (err: unknown) {
       if (!attempt.isCurrent()) return;
       setError(authErrorMessage(err));

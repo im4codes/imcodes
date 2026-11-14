@@ -31,8 +31,23 @@ const {
   storeAuthKeyIdMock: vi.fn(),
 }));
 
-const passwordLoginMock = vi.hoisted(() => vi.fn());
-const passwordRegisterMock = vi.hoisted(() => vi.fn());
+const {
+  passkeyLoginBeginMock,
+  passkeyLoginCompleteMock,
+  passkeyRegisterBeginMock,
+  passkeyRegisterCompleteMock,
+  passwordLoginMock,
+  passwordChangeMock,
+  passwordRegisterMock,
+} = vi.hoisted(() => ({
+  passkeyLoginBeginMock: vi.fn(),
+  passkeyLoginCompleteMock: vi.fn(),
+  passkeyRegisterBeginMock: vi.fn(),
+  passkeyRegisterCompleteMock: vi.fn(),
+  passwordLoginMock: vi.fn(),
+  passwordChangeMock: vi.fn(),
+  passwordRegisterMock: vi.fn(),
+}));
 const ApiErrorMock = vi.hoisted(() => class ApiErrorMock extends Error {
   code: string | null;
   constructor(public status: number, public body: string) {
@@ -44,12 +59,12 @@ const ApiErrorMock = vi.hoisted(() => class ApiErrorMock extends Error {
 vi.mock('../../src/api.js', () => ({
   configureApiKey: (...args: unknown[]) => configureApiKeyMock(...args),
   exchangeNonceWithRetry: (...args: unknown[]) => exchangeNonceWithRetryMock(...args),
-  passkeyLoginBegin: vi.fn(),
-  passkeyLoginComplete: vi.fn(),
-  passkeyRegisterBegin: vi.fn(),
-  passkeyRegisterComplete: vi.fn(),
+  passkeyLoginBegin: (...args: unknown[]) => passkeyLoginBeginMock(...args),
+  passkeyLoginComplete: (...args: unknown[]) => passkeyLoginCompleteMock(...args),
+  passkeyRegisterBegin: (...args: unknown[]) => passkeyRegisterBeginMock(...args),
+  passkeyRegisterComplete: (...args: unknown[]) => passkeyRegisterCompleteMock(...args),
   passwordLogin: (...args: unknown[]) => passwordLoginMock(...args),
-  passwordChange: vi.fn(),
+  passwordChange: (...args: unknown[]) => passwordChangeMock(...args),
   passwordRegister: (...args: unknown[]) => passwordRegisterMock(...args),
   ApiError: ApiErrorMock,
 }));
@@ -555,5 +570,106 @@ describe('LoginPage OAuth desktop_callback forwarding', () => {
     const navUrl = new URL(window.location.href, 'https://app.im.codes');
     expect(navUrl.pathname).toBe('/api/auth/github');
     expect(navUrl.searchParams.get('desktop_callback')).toBe(validCallback);
+  });
+});
+
+describe('LoginPage completionMode', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    nativeState.value = false;
+    localStorage.clear();
+    sessionStorage.clear();
+    vi.stubGlobal('location', {
+      ...window.location,
+      reload: vi.fn(),
+      assign: vi.fn(),
+      replace: vi.fn(),
+      href: window.location.href,
+    } as Partial<Location>);
+    vi.stubGlobal('PublicKeyCredential', function PublicKeyCredential() {});
+  });
+
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+    sessionStorage.clear();
+    vi.unstubAllGlobals();
+  });
+
+  it('calls onLogin without reloading across password, passkey, register, and change-password when completionMode="callback"', async () => {
+    const onLogin = vi.fn();
+
+    // 1. Password login
+    passwordLoginMock.mockResolvedValueOnce({});
+    const view1 = render(<LoginPage serverUrl="https://app.im.codes" completionMode="callback" onLogin={onLogin} />);
+    fireEvent.click(screen.getByRole('button', { name: 'login.password_signin' }));
+    fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'alice' } });
+    fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'secret' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+    await waitFor(() => expect(onLogin).toHaveBeenCalledTimes(1));
+    expect(window.location.reload).not.toHaveBeenCalled();
+    view1.unmount();
+
+    // 2. Password register
+    passwordRegisterMock.mockResolvedValueOnce({ ok: true });
+    const view2 = render(<LoginPage serverUrl="https://app.im.codes" completionMode="callback" onLogin={onLogin} />);
+    fireEvent.click(screen.getByRole('button', { name: 'login.password_signin' }));
+    fireEvent.click(screen.getByRole('button', { name: 'login.password_register' }));
+    fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'bobuser' } });
+    fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'Passw0rd1!' } });
+    fireEvent.input(screen.getByPlaceholderText('login.confirm_password_placeholder'), { target: { value: 'Passw0rd1!' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.password_register_btn' }));
+    await waitFor(() => expect(onLogin).toHaveBeenCalledTimes(2));
+    expect(window.location.reload).not.toHaveBeenCalled();
+    view2.unmount();
+
+    // 3. Passkey login
+    passkeyLoginBeginMock.mockResolvedValueOnce({ challengeId: 'c1' });
+    startAuthenticationMock.mockResolvedValueOnce({ id: 'cred-1' });
+    passkeyLoginCompleteMock.mockResolvedValueOnce({ ok: true });
+    const view3 = render(<LoginPage serverUrl="https://app.im.codes" completionMode="callback" onLogin={onLogin} />);
+    fireEvent.click(screen.getByRole('button', { name: 'login.passkey_signin' }));
+    await waitFor(() => expect(onLogin).toHaveBeenCalledTimes(3));
+    expect(window.location.reload).not.toHaveBeenCalled();
+    view3.unmount();
+
+    // 4. Passkey register
+    passkeyRegisterBeginMock.mockResolvedValueOnce({ challengeId: 'c2' });
+    startRegistrationMock.mockResolvedValueOnce({ id: 'cred-2' });
+    passkeyRegisterCompleteMock.mockResolvedValueOnce({ ok: true });
+    const view4 = render(<LoginPage serverUrl="https://app.im.codes" completionMode="callback" initialMode="register" onLogin={onLogin} />);
+    fireEvent.input(screen.getByPlaceholderText('login.display_name_placeholder'), { target: { value: 'Alice' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.passkey_register_btn' }));
+    await waitFor(() => expect(onLogin).toHaveBeenCalledTimes(4));
+    expect(window.location.reload).not.toHaveBeenCalled();
+    view4.unmount();
+
+    // 5. Forced password change
+    passwordLoginMock.mockResolvedValueOnce({ passwordMustChange: true });
+    passwordChangeMock.mockResolvedValueOnce(undefined);
+    const view5 = render(<LoginPage serverUrl="https://app.im.codes" completionMode="callback" onLogin={onLogin} />);
+    fireEvent.click(screen.getByRole('button', { name: 'login.password_signin' }));
+    fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'alice' } });
+    fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'oldpass' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+    await screen.findByText('login.must_change_password');
+    fireEvent.input(screen.getByPlaceholderText('login.new_password_placeholder'), { target: { value: 'NewPassw0rd1!' } });
+    fireEvent.input(screen.getByPlaceholderText('login.confirm_password_placeholder'), { target: { value: 'NewPassw0rd1!' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.change_password_btn' }));
+    await waitFor(() => expect(onLogin).toHaveBeenCalledTimes(5));
+    expect(window.location.reload).not.toHaveBeenCalled();
+    view5.unmount();
+  });
+
+  it('keeps default reload completion behavior for ordinary/standalone login', async () => {
+    const onLogin = vi.fn();
+    passwordLoginMock.mockResolvedValueOnce({});
+    render(<LoginPage serverUrl="https://app.im.codes" onLogin={onLogin} />);
+    fireEvent.click(screen.getByRole('button', { name: 'login.password_signin' }));
+    fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'alice' } });
+    fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'secret' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+    await waitFor(() => expect(window.location.reload).toHaveBeenCalledTimes(1));
+    expect(onLogin).toHaveBeenCalledTimes(1);
   });
 });

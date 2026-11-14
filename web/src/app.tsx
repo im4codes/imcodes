@@ -7269,6 +7269,25 @@ function InternalMainApp() {
     });
   }, [activeSessionInfo?.name, activeSessionInfo?.project, auth?.userId, canViewTaskConsole, selectedServerId]);
 
+  const handleAppLoginSuccess = (userId: string, url: string, r2RelayEnabled?: boolean) => {
+    const authState: AuthState = { userId, baseUrl: url };
+    const nextGeneration = authMutationGenerationRef.current + 1;
+    authMutationGenerationRef.current = nextGeneration;
+    configureExpectedUserId(userId);
+    setFileRelayUser(userId);
+    setServerR2RelayEnabled(r2RelayEnabled === true);
+    localStorage.setItem('rcc_auth', JSON.stringify(authState));
+    setAuth((prev) => (
+      prev && prev.userId === authState.userId && prev.baseUrl === authState.baseUrl ? prev : authState
+    ));
+    if (r2RelayEnabled === undefined) {
+      void apiFetch<{ id: string; r2RelayEnabled?: boolean }>('/api/auth/user/me').then((me) => {
+        if (authMutationGenerationRef.current !== nextGeneration || me.id !== userId) return;
+        setServerR2RelayEnabled(me.r2RelayEnabled === true);
+      }).catch(() => { /* fail-closed false already set */ });
+    }
+  };
+
   if (!nativeReady || !splashDone) {
     return null; // Wait for startup readiness while the HTML splash remains visible
   }
@@ -7309,22 +7328,7 @@ function InternalMainApp() {
         serverUrl={nativeServerUrl}
         beginAuthAttempt={beginAuthAttempt}
         sessionNotStuck={sessionNotStuck}
-        onLoginSuccess={(userId, url, r2RelayEnabled) => {
-          const authState: AuthState = { userId, baseUrl: url };
-          const nextGeneration = authMutationGenerationRef.current + 1;
-          authMutationGenerationRef.current = nextGeneration;
-          configureExpectedUserId(userId);
-          setFileRelayUser(userId);
-          setServerR2RelayEnabled(r2RelayEnabled === true);
-          localStorage.setItem('rcc_auth', JSON.stringify(authState));
-          setAuth(authState);
-          if (r2RelayEnabled === undefined) {
-            void apiFetch<{ id: string; r2RelayEnabled?: boolean }>('/api/auth/user/me').then((me) => {
-              if (authMutationGenerationRef.current !== nextGeneration || me.id !== userId) return;
-              setServerR2RelayEnabled(me.r2RelayEnabled === true);
-            }).catch(() => { /* fail-closed false already set */ });
-          }
-        }}
+        onLoginSuccess={handleAppLoginSuccess}
         onChangeServer={isNative() ? handleChangeServer : undefined}
       />
     );
@@ -9892,6 +9896,14 @@ function InternalMainApp() {
         <RemoteDesktopGuestAccess
           standalone={false}
           initialPublicNodeId={remoteDesktopGuestAccess.publicNodeId}
+          serverUrl={auth?.baseUrl ?? nativeServerUrl}
+          beginAuthAttempt={beginAuthAttempt}
+          onLoginSuccess={handleAppLoginSuccess}
+          onWebLogin={() => {
+            void apiFetch<{ id: string; r2RelayEnabled?: boolean }>('/api/auth/user/me').then((me) => {
+              handleAppLoginSuccess(me.id, auth?.baseUrl ?? nativeServerUrl ?? window.location.origin, me.r2RelayEnabled === true);
+            }).catch(() => {});
+          }}
           zIndex={20000}
           onExit={() => setRemoteDesktopGuestAccess(null)}
         />
