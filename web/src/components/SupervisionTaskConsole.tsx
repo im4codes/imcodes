@@ -1,6 +1,6 @@
 import { TaskPairDecisionPanel } from './TaskPairDecisionPanel.js';
 import { taskPairWaitKind } from '@shared/task-pair-suspension.js';
-import { taskPairDisplayTitle, taskPairDisplaySessionLabel } from '@shared/task-pair-display.js';
+import { collectTaskPairTitles, taskPairDisplayTitle, taskPairDisplaySessionLabel, type TaskPairTitleLookup } from '@shared/task-pair-display.js';
 import type { ComponentChildren, RefObject } from 'preact';
 import { useMemo, useRef, useState, useEffect } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
@@ -104,8 +104,16 @@ export function taskConsoleStateToPairSnapshot(state: SupervisionTaskConsoleRedu
       pair: snapshotPair,
     }];
   });
+  const taskTitles: Record<string, string> = {};
+  for (const taskId of Object.keys(state.tasks).sort()) {
+    const task = state.tasks[taskId];
+    if (!task) continue;
+    const display = taskPairDisplayTitle(task.title, task.taskId, task.pair?.brief);
+    if (display) taskTitles[task.taskId] = display;
+  }
   return {
     tasks,
+    taskTitles,
     assignments: Object.values(state.assignments),
     authoritative: true,
   };
@@ -395,6 +403,7 @@ function TaskCard(props: {
   task: SupervisionTaskConsoleTaskRow;
   assignments: readonly SupervisionTaskConsoleAssignmentRow[];
   events: readonly SupervisionTaskConsoleEventEvidence[];
+  taskTitles?: TaskPairTitleLookup;
   expanded: boolean;
   onToggle: () => void;
   onNavigateSession: (sessionName: string) => void;
@@ -471,7 +480,7 @@ function TaskCard(props: {
           {auditor && <SessionButton assignment={auditor} taskStatus={props.task.status} taskTab={taskTab} lane="auditor" onNavigateSession={props.onNavigateSession} />}
         </div>
       </div>
-      {props.task.pair && <TaskPairDecisionPanel taskId={props.task.taskId} pair={props.task.pair} />}
+      {props.task.pair && <TaskPairDecisionPanel taskId={props.task.taskId} pair={props.task.pair} taskTitles={props.taskTitles} />}
       {props.task.pair && <TaskPairConsoleDetails pair={props.task.pair} taskId={props.task.taskId} />}
       {!props.task.pair && (props.task.blocker || props.task.currentAction || props.task.nextAction) && <div class="supervision-task-console-task-meta">
         {props.task.blocker && <span class="is-blocker">{props.task.blocker}</span>}
@@ -539,6 +548,7 @@ export function SupervisionTaskConsoleView(props: {
     return grouped;
   }, [props.state.assignments]);
   const allTasks = useMemo(() => Object.values(props.state.tasks), [props.state.tasks]);
+  const taskTitles = useMemo(() => collectTaskPairTitles(allTasks), [allTasks]);
   const historyTasks = useMemo(() => allTasks
     .filter((task) => supervisionConsoleTabForTask(task, assignmentsByTask.get(task.taskId) ?? []) === 'history')
     .sort((left, right) => right.updatedAt - left.updatedAt || left.taskId.localeCompare(right.taskId)), [allTasks]);
@@ -659,7 +669,7 @@ export function SupervisionTaskConsoleView(props: {
         >
           {visibleTasks.map((task) => <TaskCard
             key={JSON.stringify([props.scopeKey, props.state.scope, task.taskId])} task={task} assignments={assignmentsByTask.get(task.taskId) ?? []}
-            events={props.state.eventsByTask[task.taskId] ?? []} expanded={expanded.has(task.taskId)}
+            events={props.state.eventsByTask[task.taskId] ?? []} taskTitles={taskTitles} expanded={expanded.has(task.taskId)}
             onToggle={() => setExpanded((previous) => { const next = new Set(previous); if (next.has(task.taskId)) next.delete(task.taskId); else next.add(task.taskId); return next; })}
             onNavigateSession={props.onNavigateSession} language={language} now={now}
           />)}

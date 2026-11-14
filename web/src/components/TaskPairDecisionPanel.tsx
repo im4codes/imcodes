@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { TASK_PAIR_TERMINAL_STATUSES } from '@shared/task-pair.js';
+import { formatTaskPairDependencyTasks, type TaskPairTitleLookup } from '@shared/task-pair-display.js';
 import { readPairScheduling, taskPairWaitKind } from '@shared/task-pair-suspension.js';
 import {
   TASK_PAIR_DECISION_ERROR,
@@ -83,7 +84,12 @@ export function getScopedRulingId(
 }
 
 /** A reply is persisted feedback to Brain, never PASS, resume or a lifecycle transition. */
-export function TaskPairDecisionPanel(props: { taskId: string; pair: SupervisionConsolePairInfo; readOnly?: boolean }) {
+export function TaskPairDecisionPanel(props: {
+  taskId: string;
+  pair: SupervisionConsolePairInfo;
+  readOnly?: boolean;
+  taskTitles?: TaskPairTitleLookup;
+}) {
   const { taskId, pair } = props;
   const [recovery, setRecovery] = useState<{
     basis: string; context: string; pair: SupervisionConsolePairInfo;
@@ -132,8 +138,9 @@ export function TaskPairDecisionPanel(props: { taskId: string; pair: Supervision
     }} />;
 }
 
-function DecisionPanel({ taskId, pair, context, readOnly, initialRecovery, onRecover }: {
+function DecisionPanel({ taskId, pair, context, readOnly, taskTitles, initialRecovery, onRecover }: {
   taskId: string; pair: SupervisionConsolePairInfo; context: string; readOnly?: boolean;
+  taskTitles?: TaskPairTitleLookup;
   initialRecovery?: { text: string; decisions: TaskPairDecisionRecord[] };
   onRecover(pair: SupervisionConsolePairInfo, decisions: TaskPairDecisionRecord[], text: string): void;
 }) {
@@ -216,7 +223,9 @@ function DecisionPanel({ taskId, pair, context, readOnly, initialRecovery, onRec
       const note = scheduling?.note;
       const dependsOn = scheduling?.dependsOn ?? pair.scheduling?.dependsOn ?? [];
       const waitingTasksText = dependsOn.length > 0
-        ? t('taskPair.decision.waiting_for_tasks', { tasks: dependsOn.join(', ') })
+        ? t('taskPair.decision.waiting_for_tasks', {
+          tasks: formatTaskPairDependencyTasks(dependsOn, taskTitles, scheduling?.dependencyTitles),
+        })
         : '';
       reason = [note, pair.blockedNote, waitingTasksText].filter(Boolean).join('\n');
       responsible = t('taskPair.decision.responsible_brain');

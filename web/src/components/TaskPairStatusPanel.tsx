@@ -1,7 +1,7 @@
 import { TaskPairDecisionPanel } from './TaskPairDecisionPanel.js';
 import type { SupervisionConsolePairInfo } from '@shared/supervision-task-console.js';
 import { taskPairWaitKind, readPairScheduling, TASK_PAIR_WAIT_KINDS, type TaskPairScheduling } from '@shared/task-pair-suspension.js';
-import { taskPairDisplayTitle, taskPairResolveDisplaySessionLabel } from '@shared/task-pair-display.js';
+import { taskPairDisplayTitle, taskPairResolveDisplaySessionLabel, collectTaskPairTitlesFromSnapshot, formatTaskPairDependencyTasks } from '@shared/task-pair-display.js';
 import { isMobileLayout, subscribeDeviceLayoutChange } from '../mobile-device.js';
 import { applyTaskPairPanelFit, bindTaskPairPanelFit } from '../task-pair-panel-fit.js';
 import { useTaskPairPanelWidth } from '../task-pair-panel-width.js';
@@ -197,6 +197,10 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     const detail = (window as Window & { __imcodesTaskPairSnapshot?: { tasks?: readonly Record<string, unknown>[]; assignments?: readonly Record<string, unknown>[] } }).__imcodesTaskPairSnapshot;
     return detail ? normalizeSnapshot(detail) : null;
   });
+  const [snapshotTitles, setSnapshotTitles] = useState<Map<string, string>>(() => {
+    const detail = (window as Window & { __imcodesTaskPairSnapshot?: { scopeReset?: unknown; authorityUnavailable?: unknown; taskTitles?: Record<string, string>; tasks?: readonly Record<string, unknown>[] } }).__imcodesTaskPairSnapshot;
+    return collectTaskPairTitlesFromSnapshot(detail);
+  });
   const [activeSplitTaskId, setActiveSplitTaskId] = useState<string | null>(() => {
     return (window as Window & { __imcodesActiveSplitTaskId?: string | null }).__imcodesActiveSplitTaskId ?? null;
   });
@@ -210,12 +214,18 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
   }, []);
   useEffect(() => {
     const onSnapshot = (event: Event) => {
-      const detail = (event as CustomEvent).detail as { tasks?: readonly Record<string, unknown>[]; assignments?: readonly Record<string, unknown>[]; scopeReset?: boolean } | undefined;
+      const detail = (event as CustomEvent).detail as { tasks?: readonly Record<string, unknown>[]; taskTitles?: Record<string, string>; assignments?: readonly Record<string, unknown>[]; scopeReset?: boolean; authorityUnavailable?: boolean } | undefined;
       if (!detail) return;
       if (detail.scopeReset) {
         (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = undefined;
         setSnapshotRows(null);
+        setSnapshotTitles(new Map());
         return;
+      }
+      if (detail.authorityUnavailable) {
+        setSnapshotTitles(new Map());
+      } else if (Array.isArray(detail.tasks) || detail.taskTitles) {
+        setSnapshotTitles(collectTaskPairTitlesFromSnapshot(detail));
       }
       if (Array.isArray(detail.tasks)) {
         const normalized = normalizeSnapshot(detail);
@@ -227,13 +237,19 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
   }, []);
   const latest = new Map<string, { payload: Record<string, unknown>; startedAt: number; updatedAt: number }>();
   const reworkCounts = new Map<string, number>();
+  const taskTitles = new Map<string, string>();
   for (const event of events) {
     if (event.type !== TASK_PAIR_TIMELINE_EVENT) continue;
     const eventPayload = event.payload as Record<string, unknown>;
-    if (typeof eventPayload.taskId === 'string' && eventPayload.verb === 'REWORK') {
-      reworkCounts.set(eventPayload.taskId, (reworkCounts.get(eventPayload.taskId) ?? 0) + 1);
+    if (typeof eventPayload.taskId === 'string') {
+      const eventTitle = taskPairDisplayTitle(eventPayload.title, eventPayload.taskId, eventPayload.brief);
+      if (eventTitle) taskTitles.set(eventPayload.taskId, eventTitle);
+      if (eventPayload.verb === 'REWORK') {
+        reworkCounts.set(eventPayload.taskId, (reworkCounts.get(eventPayload.taskId) ?? 0) + 1);
+      }
     }
   }
+  for (const [id, resolved] of snapshotTitles) taskTitles.set(id, resolved);
   if (snapshotRows) for (const payload of snapshotRows) if (typeof payload.taskId === 'string') latest.set(payload.taskId, { payload, startedAt: Number(payload.startedAt), updatedAt: Number(payload.updatedAt) });
   for (const event of events) {
     if (snapshotRows) break;
@@ -243,6 +259,10 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
       const old = latest.get(payload.taskId);
       latest.set(payload.taskId, { payload, startedAt: old?.startedAt ?? event.ts, updatedAt: event.ts });
     }
+  }
+  for (const [id, row] of latest.entries()) {
+    const resolved = taskPairDisplayTitle(row.payload.title, id, row.payload.brief);
+    if (resolved) taskTitles.set(id, resolved);
   }
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 1000); return () => window.clearInterval(timer); }, []);
@@ -359,10 +379,16 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
             {queued && payload.urgent === true && <span class="task-pair-status-urgent">!</span>}
           </div>
           <strong class="task-pair-status-row-title">{queued && <em>#{Number(payload.queuePosition ?? index + 1)} </em>}{title}</strong>
-          {waitKind(payload) && <small class="task-pair-status-row-meta">{(payload.scheduling as TaskPairScheduling).note}{(payload.scheduling as TaskPairScheduling).dependsOn.length > 0 && t('taskPair.waiting_for_tasks', { tasks: (payload.scheduling as TaskPairScheduling).dependsOn.map((id) => String(latest.get(id)?.payload.title ?? id)).join(', ') })}</small>}
+          {(() => {
+            const rowWaitKind = waitKind(payload);
+            if (!rowWaitKind) return null;
+            const rowScheduling = readPairScheduling(payload.scheduling as TaskPairScheduling | undefined);
+            const deps = rowScheduling?.dependsOn ?? [];
+            return <small class="task-pair-status-row-meta">{rowScheduling?.note}{deps.length > 0 && t('taskPair.waiting_for_tasks', { tasks: formatTaskPairDependencyTasks(deps, taskTitles, rowScheduling?.dependencyTitles) })}</small>;
+          })()}
           <TaskPairDecisionPanel taskId={String(payload.taskId)} pair={{ ...payload,
             status: payload.toStatus, flags: payload.flags ?? [], round: payload.round ?? 0,
-          } as SupervisionConsolePairInfo} />
+          } as SupervisionConsolePairInfo} taskTitles={taskTitles} />
           <TaskPairBrief key={JSON.stringify([serverId, scopeSessionId, String(payload.taskId)])} brief={typeof payload.brief === 'string' ? payload.brief : undefined} briefRevision={typeof payload.briefRevision === 'string' ? payload.briefRevision : undefined} checklist={payload.checklist as { total: number; implemented: number; audited: number } | undefined} taskId={String(payload.taskId)} defaultOpen={String(payload.taskId) === String(scopedDefaultTaskId)} />
           {duration !== undefined && <small class="task-pair-status-row-meta"><span class="task-pair-status-row-meta-icon" aria-hidden="true">⏱</span>{Number.isFinite(row.startedAt) && <>{t('taskPair.panel_started', { time: new Date(row.startedAt).toLocaleTimeString() })} · </>}{queued ? t('taskPair.panel_queued', { duration }) : t('taskPair.panel_elapsed', { duration })}</small>}
           <div class="task-pair-status-row-roles">

@@ -316,7 +316,7 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
         {previewRole(event.auditor, event.auditorLabel, event.auditorModel, event.auditorThinking, 'auditor')}
         {previewNoticeText && <p>{previewNoticeText}{noticeText.length > 320 ? '…' : ''}</p>}
         {isCancelledEvent && <p>{t('taskPair.card_cancel_reason', { value: cancelReason })}</p>}
-        {isStatus(event.toStatus) && <TaskPairEventDecisions key={taskId} taskId={taskId} status={event.toStatus} />}
+        {isStatus(event.toStatus) && <TaskPairEventDecisions key={taskId} taskId={taskId} status={event.toStatus} scheduling={event.scheduling as never} />}
       </div>
     </div>, document.body);
   };
@@ -426,7 +426,7 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
           {verb && <span class="task-pair-card-event-meta"><span>{t('taskPair.card_event')}</span>{verb}</span>}
           {isMobile && roleLabel(event.executor, event.executorLabel, event.executorModel, event.executorThinking, 'executor')}
           {isMobile && roleLabel(event.auditor, event.auditorLabel, event.auditorModel, event.auditorThinking, 'auditor')}
-          {isStatus(event.toStatus) && <TaskPairEventDecisions key={taskId} taskId={taskId} status={event.toStatus} />}
+          {isStatus(event.toStatus) && <TaskPairEventDecisions key={taskId} taskId={taskId} status={event.toStatus} scheduling={event.scheduling as never} />}
           {isCancelledEvent && <div class="task-pair-card-cancel-meta" data-cancel-provenance="true">
             <span>{t('taskPair.card_cancel_actor', { value: cancelActor || t('taskPair.card_cancel_unknown') })}</span>
             <span>{t('taskPair.card_cancel_source', { value: cancelSource ? t(`taskPair.cancel_source.${cancelSource}`, { defaultValue: cancelSource }) : t('taskPair.card_cancel_unknown') })}</span>

@@ -274,3 +274,42 @@ it('a missing resume target releases capacity without a CAS-listener retry spin'
   expect(get('task').scheduling!.resumeRetryAt).toBeGreaterThan(now);
   await automation.reconcileSuspensions(); expect(messages).toEqual([]);
 });
+
+it('projects dependencyTitles into buildPairConsoleRow and timeline events under details.brief while omitting raw-ID titles', async () => {
+  const { buildPairConsoleRow } = await import('../../../src/daemon/supervision-console-pair-projection.js');
+  const { buildDependencyTitleRecord } = await import('../../../shared/task-pair-display.js');
+
+  putTaskPairFixture(getTaskPairStore(), P, { ...state('tsk_upstream_done', 'done'), title: 'Upstream completed fix' });
+  putTaskPairFixture(getTaskPairStore(), P, { ...state('tsk_placeholder', 'working'), title: 'tsk_placeholder', brief: '' });
+  putTaskPairFixture(getTaskPairStore(), P, { ...state('tsk_child_proj', 'queued'), title: 'Child task' });
+  pausePair(P, 'tsk_child_proj', B, 'dependencies', ['tsk_upstream_done', 'tsk_placeholder']);
+
+  const stored = getTaskPairStore().getPair(P, 'tsk_child_proj')!;
+  const dependencyTitles = buildDependencyTitleRecord(['tsk_upstream_done', 'tsk_placeholder', 'tsk_unknown'], (id) => getTaskPairStore().getPair(P, id)?.state);
+  expect(dependencyTitles).toEqual({ tsk_upstream_done: 'Upstream completed fix' });
+
+  const row = buildPairConsoleRow(stored, { inlineBrief: false, dependencyTitles });
+  expect(row.task.pair?.scheduling?.dependencyTitles).toBeUndefined();
+  expect(row.task.pair?.scheduling?.details?.brief?.dependencyTitles).toEqual({
+    tsk_upstream_done: 'Upstream completed fix',
+  });
+
+  // Ensure service timeline emission also includes dependencyTitles in details.brief
+  const { timelineEmitter } = await import('../../../src/daemon/timeline-emitter.js');
+  const { TASK_PAIR_TIMELINE_EVENT } = await import('../../../shared/task-pair.js');
+  const emitted: Array<{ type: string; payload: Record<string, unknown> }> = [];
+  const off = timelineEmitter.on((ev) => {
+    if (ev.type === TASK_PAIR_TIMELINE_EVENT) emitted.push({ type: ev.type, payload: ev.payload as Record<string, unknown> });
+  });
+  try {
+    pausePair(P, 'tsk_child_proj', B, 'manual', [], 'check emit');
+    const last = emitted[emitted.length - 1];
+    const emittedScheduling = last?.payload?.scheduling as { dependencyTitles?: unknown; details?: { brief?: { dependencyTitles?: unknown } } } | undefined;
+    expect(emittedScheduling?.dependencyTitles).toBeUndefined();
+    expect(emittedScheduling?.details?.brief?.dependencyTitles).toEqual({
+      tsk_upstream_done: 'Upstream completed fix',
+    });
+  } finally {
+    off();
+  }
+});

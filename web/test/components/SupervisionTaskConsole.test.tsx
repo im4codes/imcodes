@@ -72,7 +72,8 @@ afterAll(() => {
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
-    t: (key: string) => key,
+    t: (key: string, opts?: Record<string, unknown>) =>
+      opts && typeof opts === 'object' && 'tasks' in opts ? `${key}:${JSON.stringify(opts)}` : key,
     i18n: { language: 'en', resolvedLanguage: 'en' },
   }),
 }));
@@ -1283,5 +1284,103 @@ describe('SupervisionTaskConsole', () => {
     const app = readFileSync(resolve(import.meta.dirname, '../../src/app.tsx'), 'utf8');
     expect(app).toMatch(/onNavigateSession=\{\(sessionName\) => \{\s*navigateToSession\(sessionName\);/);
     expect(app).toMatch(/<SupervisionTaskConsole[\s\S]*?connected=\{connected && daemonOnline\}/);
+  });
+
+  it('resolves dependsOn task IDs to finished and active task titles in TaskCard and snapshot bridge', async () => {
+    const { taskConsoleStateToPairSnapshot } = await import('../../src/components/SupervisionTaskConsole.js');
+    const depsState = state({
+      tasks: {
+        tsk_dep_done: {
+          taskId: 'tsk_dep_done',
+          title: 'Adapt macOS desktop window',
+          status: 'finalized',
+          phase: 'history',
+          validationState: 'unknown',
+          currentAction: 'Done',
+          updatedAt: NOW - 10,
+          lastEventId: 1,
+          pair: {
+            status: 'done',
+            round: 1,
+            flags: [],
+            blocking: ['P0'],
+            createdAt: NOW - 100,
+            updatedAt: NOW - 10,
+          },
+        },
+        tsk_dep_active: {
+          taskId: 'tsk_dep_active',
+          title: 'Fix auth retry',
+          status: 'implementing',
+          phase: 'active',
+          validationState: 'unknown',
+          currentAction: 'Working',
+          updatedAt: NOW - 5,
+          lastEventId: 2,
+          pair: {
+            status: 'working',
+            round: 0,
+            flags: [],
+            blocking: ['P0'],
+            createdAt: NOW - 50,
+            updatedAt: NOW - 5,
+          },
+        },
+        tsk_child: {
+          taskId: 'tsk_child',
+          title: 'Display dependency titles',
+          status: 'planned',
+          phase: 'pending',
+          validationState: 'unknown',
+          currentAction: 'Waiting on dependencies',
+          updatedAt: NOW,
+          lastEventId: 3,
+          pair: {
+            status: 'queued',
+            round: 0,
+            flags: [],
+            blocking: ['P0'],
+            createdAt: NOW - 20,
+            updatedAt: NOW,
+            scheduling: {
+              epoch: 1,
+              manual: false,
+              dependsOn: ['tsk_dep_done', 'tsk_dep_active', 'tsk_missing'],
+              admitted: false,
+              resumePending: false,
+            },
+          },
+        },
+      },
+      assignments: {},
+    });
+
+    const snapshot = taskConsoleStateToPairSnapshot(depsState);
+    expect(snapshot?.tasks.map((row) => row.taskId)).toEqual(['tsk_dep_active', 'tsk_child']);
+    expect(snapshot?.taskTitles).toEqual({
+      tsk_child: 'Display dependency titles',
+      tsk_dep_active: 'Fix auth retry',
+      tsk_dep_done: 'Adapt macOS desktop window',
+    });
+
+    render(
+      <SupervisionTaskConsoleView
+        state={depsState}
+        mobile={false}
+        now={NOW}
+        onClose={() => {}}
+        onNavigateSession={() => {}}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('tab', { name: /supervision_task_console\.tab_pending/ }));
+    fireEvent.click(screen.getByText('Display dependency titles').closest('button')!);
+
+    const cardText = screen.getByTestId('task-card-tsk_child').textContent ?? '';
+    expect(cardText).toContain('Adapt macOS desktop window');
+    expect(cardText).toContain('Fix auth retry');
+    expect(cardText).toContain('tsk_missing');
+    expect(cardText).not.toContain('tsk_dep_done');
+    expect(cardText).not.toContain('tsk_dep_active');
   });
 });

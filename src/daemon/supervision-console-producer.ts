@@ -12,6 +12,7 @@
  * the only way to show the transaction actually holds.
  */
 import { getTaskPairStore } from './task-pairs/store.js';
+import { buildDependencyTitleRecord } from '../../shared/task-pair-display.js';
 import {
   buildPairConsoleRow,
   computePairQueuePositions,
@@ -965,6 +966,7 @@ export class SupervisionConsoleProducer {
   ): { tasks: SupervisionTaskConsoleTaskRow[]; assignments: SupervisionTaskConsoleAssignmentRow[]; entries: SupervisionTaskConsolePairUpsert[] } {
     const inlineBrief = options.inlineBrief !== false;
     const pairs = getTaskPairStore().listPairs(projectName);
+    const pairById = new Map(pairs.map((p) => [p.state.taskId, p.state] as const));
     const queuePositions = computePairQueuePositions(pairs);
     const tasks: SupervisionTaskConsoleTaskRow[] = [];
     const assignments: SupervisionTaskConsoleAssignmentRow[] = [];
@@ -978,6 +980,7 @@ export class SupervisionConsoleProducer {
         decisionRequest: activeRequest,
         queuePosition: queuePositions.get(stored.state.taskId),
         resolvePresentation: this.#resolveSessionPresentation,
+        dependencyTitles: buildDependencyTitleRecord(stored.state.scheduling?.dependsOn, (id) => pairById.get(id) ?? getTaskPairStore().getPair(projectName, id)?.state),
       });
       entries.push(entry);
       tasks.push(entry.task);
@@ -1076,6 +1079,7 @@ export class SupervisionConsoleProducer {
           decisionRequest: activeRequest,
           queuePosition: queuePositions.get(taskId),
           resolvePresentation: this.#resolveSessionPresentation,
+          dependencyTitles: buildDependencyTitleRecord(stored.state.scheduling?.dependsOn, (id) => store.getPair(scope.projectName, id)?.state),
         });
         const json = pairRowJson(upsert);
         const previous = view.rows.get(taskId);

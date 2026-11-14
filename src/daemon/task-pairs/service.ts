@@ -1,5 +1,6 @@
 import { TASK_PAIR_DECISION_BRAIN_NOTICE_REASON, TASK_PAIR_DECISION_KIND, validateTaskPairDecisionDetails } from '../../../shared/task-pair-decision.js';
 import { projectPairScheduling, type TaskPairScheduling } from '../../../shared/task-pair-suspension.js';
+import { buildDependencyTitleRecord } from '../../../shared/task-pair-display.js';
 import { TASK_PAIR_TITLE_ACCESS_MAX_USERS, TASK_PAIR_TITLE_ACCESS_VERSION, taskPairTitleWireAccess, isTaskPairTitleAccess } from '../../../shared/task-pair-title-access.js';
 /**
  * Marker ingestion for the `pairs` supervision engine.
@@ -2885,10 +2886,23 @@ export function emitTaskPairTimelineEvent(
   pair: TaskPairState | undefined,
   eventId: string,
 ): void {
+  const store = getTaskPairStore();
+  const brainPairs = pair?.brain && (pair.scheduling?.dependsOn.length || pair.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION)
+    ? store.pairsForSession(pair.brain)
+    : undefined;
+  const project = pair?.brain
+    ? (brainPairs?.find((stored) => stored.state.taskId === pair.taskId)?.project ?? brainPairs?.[0]?.project ?? getSession(pair.brain)?.projectName)
+    : undefined;
+  const dependencyTitles = pair?.scheduling?.dependsOn.length
+    ? buildDependencyTitleRecord(
+      pair.scheduling.dependsOn,
+      (id) => brainPairs?.find((stored) => stored.state.taskId === id)?.state ?? (project ? store.getPair(project, id)?.state : undefined),
+    )
+    : undefined;
   const payload: TaskPairEventPayload = {
     ...base,
     ...(pair ? {
-      ...(pair.scheduling ? { scheduling: projectPairScheduling(pair.scheduling) } : {}),
+      ...(pair.scheduling ? { scheduling: projectPairScheduling(pair.scheduling, dependencyTitles) } : {}),
       ...(pair.title ? { title: pair.title } : {}),
       ...(pair.titleAccess ? { titleAccess: taskPairTitleWireAccess(pair.titleAccess) } : {}),
       ...(pair.executor ? { executor: pair.executor } : {}),
@@ -2939,7 +2953,7 @@ export function emitTaskPairTimelineEvent(
   // A pair waiting on Brain: say what became of the last notice to Brain, so
   // the card is not mistaken for a delivery (it only projects the event).
   if (pair?.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION && pair.brain) {
-    const owner = getTaskPairStore().pairsForSession(pair.brain).find((stored) => stored.state.taskId === pair.taskId && stored.state.brain === pair.brain);
+    const owner = (brainPairs ?? getTaskPairStore().pairsForSession(pair.brain)).find((stored) => stored.state.taskId === pair.taskId && stored.state.brain === pair.brain);
     const brainNotice = brainNoticeForCard(owner);
     if (brainNotice) payload.brainNotice = brainNotice;
   }

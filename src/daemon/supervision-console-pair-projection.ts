@@ -68,7 +68,14 @@ export function computePairQueuePositions(pairs: readonly StoredTaskPair[]): Map
  */
 export function buildPairConsoleRow(
   stored: StoredTaskPair,
-  options: { queuePosition?: number; inlineBrief: boolean; resolvePresentation?: PairPresentationResolver; decisionRequest?: TaskPairDecisionRecord; latestDecision?: TaskPairDecisionRecord },
+  options: {
+    queuePosition?: number;
+    inlineBrief: boolean;
+    resolvePresentation?: PairPresentationResolver;
+    decisionRequest?: TaskPairDecisionRecord;
+    latestDecision?: TaskPairDecisionRecord;
+    dependencyTitles?: Record<string, string>;
+  },
 ): SupervisionTaskConsolePairUpsert {
   const pair = stored.state;
   const status = TASK_PAIR_CONSOLE_LEGACY_STATUS[pair.status];
@@ -97,7 +104,7 @@ export function buildPairConsoleRow(
       decisionRevision: taskPairDecisionRevision(pair),
       ...(options.latestDecision ? { latestDecision: options.latestDecision } : {}),
       ...(options.decisionRequest ? { decisionRequest: options.decisionRequest } : {}),
-      ...(pair.scheduling ? { scheduling: projectPairScheduling(pair.scheduling) } : {}),
+      ...(pair.scheduling ? { scheduling: projectPairScheduling(pair.scheduling, options.dependencyTitles) } : {}),
       status: pair.status,
       flags: [...pair.flags],
       ...(pair.flagSides ? { flagSides: { ...pair.flagSides } } : {}),

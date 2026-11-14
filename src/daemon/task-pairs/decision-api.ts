@@ -5,6 +5,7 @@ import type { SupervisionTaskConsoleScope } from '../../../shared/supervision-ta
 import { getTaskPairStore } from './store.js';
 import { taskPairService } from './service.js';
 import { buildPairConsoleRow } from '../supervision-console-pair-projection.js';
+import { buildDependencyTitleRecord } from '../../../shared/task-pair-display.js';
 import { taskPairDecisionRevision } from './decision-context.js';
 
 /** A rejected write must remain rejected; clients can refresh before confirming again. */
@@ -59,6 +60,7 @@ export function taskPairDecisionApi(scope: SupervisionTaskConsoleScope, input: R
   const snapshot = buildPairConsoleRow(current, {
     inlineBrief: false, decisionRequest: activeQuestion,
     latestDecision: store.latestDecision(scope.projectName, taskId),
+    dependencyTitles: buildDependencyTitleRecord(current.state.scheduling?.dependsOn, (id) => store.getPair(scope.projectName, id)?.state),
   }).task.pair;
   return { decisions: store.listDecisions(scope.projectName, [taskId], TASK_PAIR_DECISION_LIMITS.HISTORY),
     revision: taskPairDecisionRevision(current.state), pair: snapshot };
