@@ -94,18 +94,39 @@ if [[ "$(uname -s)" == "Linux" ]]; then
 fi
 
 # Spawn the restart fully detached:
-#   - setsid (or `nohup` fallback) puts it in a new session so SIGHUP from the
-#     parent shell exiting won't kill it.
+#   - Linux user systemd owns the restart outside the calling process tree and
+#     imcodes.service cgroup. setsid/nohup alone cannot escape cgroup teardown.
+#   - setsid (or `nohup` fallback) protects against SIGHUP only, best effort when
+#     the user manager is unavailable.
 #   - stdout/stderr go to a log so we can inspect failures.
 #   - `&` + `disown` releases it from the current shell's job table.
 LOG="${TMPDIR:-/tmp}/imcodes-restart-daemon.log"
 echo "Detaching restart; logs: $LOG"
 
 if [[ "$(uname -s)" == "Linux" ]]; then
+  LINUX_RESTART='
+    exec >>"$1" 2>&1
+    echo "=== Linux daemon restart started at $(date -Is)"
+    status=0
+    systemctl --user daemon-reload && systemctl --user restart imcodes || status=$?
+    echo "=== Linux daemon restart finished at $(date -Is) (status=$status)"
+    exit "$status"
+  '
+  RESTART_UNIT="imcodes-restart-$(date +%s)-$$"
+  # Keep dispatch synchronous until the manager accepts the transient service;
+  # do not --wait for restart, which may stop the very daemon running this tool.
+  if command -v systemd-run >/dev/null 2>&1 && \
+    systemd-run --user --unit="$RESTART_UNIT" --collect --quiet \
+      --property=Type=exec --setenv="PATH=$PATH" \
+      "$BASH" -c "$LINUX_RESTART" imcodes-restart "$LOG" >>"$LOG" 2>&1; then
+    echo "Restart dispatched via user systemd unit $RESTART_UNIT. Logs: $LOG"
+    exit 0
+  fi
+  echo "User systemd dispatch unavailable; using best-effort setsid/nohup fallback (cannot escape service cgroup teardown)." | tee -a "$LOG" >&2
   if command -v setsid >/dev/null 2>&1; then
-    setsid bash -c 'systemctl --user daemon-reload && systemctl --user restart imcodes' </dev/null >>"$LOG" 2>&1 &
+    setsid bash -c "$LINUX_RESTART" imcodes-restart "$LOG" </dev/null >>"$LOG" 2>&1 &
   else
-    nohup bash -c 'systemctl --user daemon-reload && systemctl --user restart imcodes' </dev/null >>"$LOG" 2>&1 &
+    nohup bash -c "$LINUX_RESTART" imcodes-restart "$LOG" </dev/null >>"$LOG" 2>&1 &
   fi
 elif [[ "$(uname -s)" == "Darwin" ]]; then
   # Do not call the nested CLI service-restart path from here. When this
