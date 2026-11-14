@@ -192,7 +192,8 @@ describe('Qwen3-ASR mobile assets', () => {
     for (const javaSrc of [mainActivity, android, androidDecoder, androidTokenizer, androidMel, androidWindow]) {
       expect(javaSrc).not.toMatch(/\bjava\.nio\.file\b|\bFiles\b|\.toPath\s*\(|\breadAllBytes\s*\(|\bFiles\s*\.\s*(?:readString|writeString)\s*\(|\bByteArrayOutputStream[^;]*toString\s*\(\s*StandardCharsets/);
     }
-    // Android ICU Pattern compatibility guard: reject flags unsupported on Android ART (<clinit> ExceptionInInitializerError)
+    // Android ICU Pattern & minSdk 24 (Java 8 / no coreLibraryDesugaring) compatibility guard:
+    // reject Pattern flags unsupported on Android ART and Java 9+ collection/String/Optional APIs (API 30+/33+)
     const androidJavaDir = fileURLToPath(new URL('../../web/plugins/streaming-speech/android/src/main/java', import.meta.url));
     const androidJavaFiles = (await readdir(androidJavaDir, { recursive: true }))
       .filter((entry) => entry.endsWith('.java'))
@@ -200,7 +201,8 @@ describe('Qwen3-ASR mobile assets', () => {
     expect(androidJavaFiles.length).toBeGreaterThanOrEqual(6);
     for (const javaFile of androidJavaFiles) {
       const javaSrc = await readFile(javaFile, 'utf8');
-      expect(javaSrc).not.toMatch(/\bUNICODE_CHARACTER_CLASS\b|\bCANON_EQ\b/);
+      expect(javaSrc, javaFile).not.toMatch(/\bUNICODE_CHARACTER_CLASS\b|\bCANON_EQ\b/);
+      expect(javaSrc, javaFile).not.toMatch(/\b(?:Map|List|Set)\s*\.\s*(?:of|ofEntries|entry|copyOf)\b|\.(?:isBlank|strip|stripLeading|stripTrailing|repeat)\s*\(|\bOptional\b[^;]*\.isEmpty\s*\(/);
     }
 
     expect(ios).toContain('import Qwen3ASR');

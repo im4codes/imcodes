@@ -18,6 +18,7 @@ import java.nio.LongBuffer;
 import java.nio.ShortBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
@@ -45,71 +46,76 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
     private static final String SYSTEM_SUFFIX = "<|im_end|>\n<|im_start|>user\n<|audio_start|>";
     private static final String ASSISTANT_SUFFIX = "<|audio_end|><|im_end|>\n<|im_start|>assistant\n";
 
-    private static final Map<String, String> LANGUAGE_MAP = Map.ofEntries(
-        Map.entry("zh", "Chinese"),
-        Map.entry("cmn", "Chinese"),
-        Map.entry("chinese", "Chinese"),
-        Map.entry("yue", "Cantonese"),
-        Map.entry("cantonese", "Cantonese"),
-        Map.entry("en", "English"),
-        Map.entry("english", "English"),
-        Map.entry("ja", "Japanese"),
-        Map.entry("jp", "Japanese"),
-        Map.entry("japanese", "Japanese"),
-        Map.entry("ko", "Korean"),
-        Map.entry("korean", "Korean"),
-        Map.entry("es", "Spanish"),
-        Map.entry("spanish", "Spanish"),
-        Map.entry("ru", "Russian"),
-        Map.entry("russian", "Russian"),
-        Map.entry("fr", "French"),
-        Map.entry("french", "French"),
-        Map.entry("de", "German"),
-        Map.entry("german", "German"),
-        Map.entry("it", "Italian"),
-        Map.entry("italian", "Italian"),
-        Map.entry("pt", "Portuguese"),
-        Map.entry("portuguese", "Portuguese"),
-        Map.entry("ar", "Arabic"),
-        Map.entry("arabic", "Arabic"),
-        Map.entry("tr", "Turkish"),
-        Map.entry("turkish", "Turkish"),
-        Map.entry("vi", "Vietnamese"),
-        Map.entry("vietnamese", "Vietnamese"),
-        Map.entry("th", "Thai"),
-        Map.entry("thai", "Thai"),
-        Map.entry("id", "Indonesian"),
-        Map.entry("indonesian", "Indonesian"),
-        Map.entry("ms", "Malay"),
-        Map.entry("malay", "Malay"),
-        Map.entry("hi", "Hindi"),
-        Map.entry("hindi", "Hindi"),
-        Map.entry("nl", "Dutch"),
-        Map.entry("dutch", "Dutch"),
-        Map.entry("pl", "Polish"),
-        Map.entry("polish", "Polish"),
-        Map.entry("sv", "Swedish"),
-        Map.entry("swedish", "Swedish"),
-        Map.entry("da", "Danish"),
-        Map.entry("danish", "Danish"),
-        Map.entry("fi", "Finnish"),
-        Map.entry("finnish", "Finnish"),
-        Map.entry("cs", "Czech"),
-        Map.entry("czech", "Czech"),
-        Map.entry("el", "Greek"),
-        Map.entry("greek", "Greek"),
-        Map.entry("hu", "Hungarian"),
-        Map.entry("hungarian", "Hungarian"),
-        Map.entry("ro", "Romanian"),
-        Map.entry("romanian", "Romanian"),
-        Map.entry("fa", "Persian"),
-        Map.entry("persian", "Persian"),
-        Map.entry("fil", "Filipino"),
-        Map.entry("tl", "Filipino"),
-        Map.entry("filipino", "Filipino"),
-        Map.entry("mk", "Macedonian"),
-        Map.entry("macedonian", "Macedonian")
-    );
+    private static final Map<String, String> LANGUAGE_MAP = buildLanguageMap();
+
+    // Use HashMap + Collections.unmodifiableMap for minSdk 24 compatibility (avoid Java 9+ factory helpers).
+    private static Map<String, String> buildLanguageMap() {
+        Map<String, String> m = new HashMap<>(64);
+        m.put("zh", "Chinese");
+        m.put("cmn", "Chinese");
+        m.put("chinese", "Chinese");
+        m.put("yue", "Cantonese");
+        m.put("cantonese", "Cantonese");
+        m.put("en", "English");
+        m.put("english", "English");
+        m.put("ja", "Japanese");
+        m.put("jp", "Japanese");
+        m.put("japanese", "Japanese");
+        m.put("ko", "Korean");
+        m.put("korean", "Korean");
+        m.put("es", "Spanish");
+        m.put("spanish", "Spanish");
+        m.put("ru", "Russian");
+        m.put("russian", "Russian");
+        m.put("fr", "French");
+        m.put("french", "French");
+        m.put("de", "German");
+        m.put("german", "German");
+        m.put("it", "Italian");
+        m.put("italian", "Italian");
+        m.put("pt", "Portuguese");
+        m.put("portuguese", "Portuguese");
+        m.put("ar", "Arabic");
+        m.put("arabic", "Arabic");
+        m.put("tr", "Turkish");
+        m.put("turkish", "Turkish");
+        m.put("vi", "Vietnamese");
+        m.put("vietnamese", "Vietnamese");
+        m.put("th", "Thai");
+        m.put("thai", "Thai");
+        m.put("id", "Indonesian");
+        m.put("indonesian", "Indonesian");
+        m.put("ms", "Malay");
+        m.put("malay", "Malay");
+        m.put("hi", "Hindi");
+        m.put("hindi", "Hindi");
+        m.put("nl", "Dutch");
+        m.put("dutch", "Dutch");
+        m.put("pl", "Polish");
+        m.put("polish", "Polish");
+        m.put("sv", "Swedish");
+        m.put("swedish", "Swedish");
+        m.put("da", "Danish");
+        m.put("danish", "Danish");
+        m.put("fi", "Finnish");
+        m.put("finnish", "Finnish");
+        m.put("cs", "Czech");
+        m.put("czech", "Czech");
+        m.put("el", "Greek");
+        m.put("greek", "Greek");
+        m.put("hu", "Hungarian");
+        m.put("hungarian", "Hungarian");
+        m.put("ro", "Romanian");
+        m.put("romanian", "Romanian");
+        m.put("fa", "Persian");
+        m.put("persian", "Persian");
+        m.put("fil", "Filipino");
+        m.put("tl", "Filipino");
+        m.put("filipino", "Filipino");
+        m.put("mk", "Macedonian");
+        m.put("macedonian", "Macedonian");
+        return Collections.unmodifiableMap(m);
+    }
 
     /**
      * Maps a BCP-47 locale tag or canonical language name to the canonical Qwen3-ASR
@@ -346,7 +352,7 @@ public final class Qwen3OnnxDecoder implements AutoCloseable {
                 FloatBuffer.wrap(mel.data),
                 new long[] { 1L, mel.numFrames, WhisperMelExtractor.N_MELS }
             );
-            convRes = convSession.run(Map.of(convInputName, convInput));
+            convRes = convSession.run(Collections.singletonMap(convInputName, convInput));
             convInput.close();
             convInput = null;
 
