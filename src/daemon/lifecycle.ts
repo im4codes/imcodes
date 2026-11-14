@@ -15,6 +15,11 @@ import { loadStore, flushStore, listSessions, getSession, upsertSession, removeS
 import { markDaemonProcess } from './process-role.js';
 import { stopProject, restoreFromStore, setSessionEventCallback, setSessionPersistCallback, setTransportSessionRestoredCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute, resyncTransportSessionStatesAfterLinkRestore, ensureTransportRuntimeForPendingResend } from '../agent/session-manager.js';
 import { beginUpgradeReadinessTracking, markGracefulShutdownStarted, markStartupPhaseDone } from './upgrade-readiness.js';
+import {
+  captureRestartContinuationsBeforeShutdown,
+  captureUncleanRestartContinuations,
+  hasPendingRestartContinuation,
+} from './restart-continuation.js';
 import { DAEMON_STARTUP_PHASE } from '../../shared/daemon-upgrade.js';
 import { sessionExists, isPaneAlive, BACKEND, killSession, createTmuxHealthProbe, type TmuxHealthProbe } from '../agent/tmux.js';
 import { detectRepo } from '../repo/detector.js';
@@ -664,7 +669,7 @@ export async function startup(): Promise<DaemonContext> {
   configureSessionStoreWriteAuthority(lockServer.identity, lockServer.metadataPath);
   // Only the process that owns the lock records its start and reads how its predecessor ended: a server-driven
   // upgrade is held back while this process is new or recovering from a crash (see upgrade-readiness.ts).
-  beginUpgradeReadinessTracking();
+  const { uncleanPreviousExit } = beginUpgradeReadinessTracking();
   markDaemonProcess();
   cgroupValidationProbes = startDaemonCgroupValidationProbes();
   installDaemonRuntimeDiagnosticsProvider();
@@ -680,6 +685,21 @@ export async function startup(): Promise<DaemonContext> {
   // not replace it with a disk snapshot.
   markSessionStoreAuthoritative();
   logger.info('Session store loaded');
+  try {
+    const uncleanCaptured = captureUncleanRestartContinuations({
+      uncleanPreviousExit,
+      sessions: listSessions(),
+      activeDispatchSessions: new Set(getTransportQueueStore().listActiveDispatchSessionNames()),
+    });
+    if (uncleanCaptured.length > 0) {
+      logger.info(
+        { count: uncleanCaptured.length, sessions: uncleanCaptured.map((c) => c.sessionName) },
+        'Captured interrupted active sessions after unclean exit for auto-continue',
+      );
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Unclean-exit restart-continuation capture failed');
+  }
   updateInstanceLockDiagnostics(lockServer, {
     sessionIds: listSessions().map((session) => session.name),
     residualResources: [
@@ -1807,7 +1827,8 @@ function hasRestorableLocalTransportSessions(
     if (!s.providerSessionId) return false;
     if (options.onlyWithPendingResend
       && getResendCount(s.name) === 0
-      && !getTransportQueueStore().listLiveQueueSessions().some((item) => item.sessionName === s.name)) return false;
+      && !getTransportQueueStore().listLiveQueueSessions().some((item) => item.sessionName === s.name)
+      && !hasPendingRestartContinuation(s.name)) return false;
     if (options.onlyMissingRuntime && getTransportRuntime(s.name)?.providerSessionId) return false;
     return true;
   });
@@ -1922,6 +1943,22 @@ async function performShutdown(exitCode: number): Promise<void> {
   // First thing, before any teardown can be slow or fail: this exit is on purpose (SIGTERM from `systemctl restart`,
   // which the upgrade script itself uses, included), so the next process is not "recovering from a crash".
   markGracefulShutdownStarted();
+  try {
+    const activeDispatchSessions = new Set(getTransportQueueStore().listActiveDispatchSessionNames());
+    const captured = captureRestartContinuationsBeforeShutdown({
+      sessions: listSessions(),
+      getRuntime: (name) => getTransportRuntime(name),
+      activeDispatchSessions,
+    });
+    if (captured.length > 0) {
+      logger.info(
+        { count: captured.length, sessions: captured.map((c) => c.sessionName) },
+        'Captured active sessions before daemon shutdown for auto-continue',
+      );
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Pre-shutdown restart-continuation capture failed');
+  }
   const orderedShutdown = await runOrderedDaemonShutdown({
     session: async () => {
       logger.info({ shutdownPhase: 'session' }, 'Daemon shutdown phase session started');

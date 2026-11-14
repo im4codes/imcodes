@@ -6665,6 +6665,17 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   /**
+   * Read-only post-restart check: returns true iff the thread's rollout tail
+   * already ends with a terminal `task_complete` marker (with no later
+   * `task_started` or `turn_aborted`), proving the prior turn finished.
+   */
+  async hasCompletedRolloutTurn(sessionId: string): Promise<boolean> {
+    const state = this.sessions.get(sessionId);
+    if (!state || state.incognito || state.cancelled) return false;
+    return (await this.rolloutTailReportsTerminalTaskComplete(state)) !== null;
+  }
+
+  /**
    * Reads the tail of the thread's rollout looking for the LAST turn-lifecycle
    * marker. `task_started` (with no later completion) => a turn is in flight;
    * `task_complete` / `turn_aborted` => the turn is closed. Deriving terminality

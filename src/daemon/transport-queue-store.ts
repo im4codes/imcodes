@@ -805,6 +805,22 @@ export class TransportQueueStore {
     }));
   }
 
+  /** Whether durable queue has strictly queued (not yet dispatched) user entries for a session. */
+  hasQueuedEntries(sessionName: string): boolean {
+    const row = this.db.prepare(
+      `SELECT 1 FROM queue_entries WHERE session_name = ? AND status = 'queued' LIMIT 1`,
+    ).get(sessionName);
+    return Boolean(row);
+  }
+
+  /** Session names with active mid-dispatch rows (`handoff_inflight` or `dispatching`). */
+  listActiveDispatchSessionNames(): string[] {
+    const rows = this.db.prepare(
+      `SELECT DISTINCT session_name AS sessionName FROM queue_entries WHERE status IN ('handoff_inflight', 'dispatching')`,
+    ).all() as Array<{ sessionName: string }>;
+    return rows.map((row) => String(row.sessionName));
+  }
+
   /** Sessions with any durable rows, including terminal failures left by a
    * crashed test/runtime. The lifecycle sweep uses this to quarantine an
    * ownerless session's complete row set, not only its still-live messages. */

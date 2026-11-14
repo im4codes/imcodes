@@ -48,6 +48,7 @@ import { drainTransportResendQueueForDispatch, ensureTransportRuntimeForPendingR
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { buildTransportQueueSnapshotPayload } from './transport-queue-projection.js';
 import { clearResend, enqueueResend, recipientFromSessionRecord } from './transport-resend-queue.js';
+import { retireRestartContinuation } from './restart-continuation.js';
 import { injectPeerAuditBriefIntoProcessSession, type PeerAuditProcessInjectError } from './peer-audit-process-injector.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { isPairsEngineSession } from './task-pairs/engine.js';
@@ -312,6 +313,7 @@ export async function dispatchSessionMessage(
     stopSessionNow(target.name);
     return 'sent';
   }
+  retireRestartContinuation(target.name);
   // Inter-session traffic is append-by-default. Callers that explicitly need
   // ordinary FIFO waiting must opt into `deliveryMode=queue`; keeping the
   // normalization at this runtime-neutral boundary prevents task-pair,

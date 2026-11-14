@@ -26,6 +26,12 @@ import { closeSingleSession, type CloseFailure, type CloseTreeResult } from '../
 import { emitSessionInlineError } from './session-error.js';
 import { resolveSubSessionCwd } from './subsession-cwd.js';
 import { clearResend } from './transport-resend-queue.js';
+import {
+  clearSessionRestartContinuation,
+  dispatchProcessRestartContinuation,
+  emitSystemContinueUserMessage,
+  retireRestartContinuation,
+} from './restart-continuation.js';
 import { hookCredentialEnv, mintHookCredential } from './hook-session-credential.js';
 import { registerTmuxSessionResource, releaseSessionResources, resourceOwnerEnv } from './session-resource-service.js';
 import { markSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
@@ -353,6 +359,9 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   if (initIdentity) initParts.push(initIdentity);
   if (presetInitMessage) initParts.push(presetInitMessage);
   if (sub.ccInitPrompt) initParts.push(sub.ccInitPrompt);
+  if (sub.fresh) {
+    retireRestartContinuation(sessionName);
+  }
   const injectInit = async () => {
     // Wait for CC to pass trust-folder / settings-error dialogs
     if (driver.postLaunch) {
@@ -366,6 +375,20 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
       const { sendKeys } = await import('../agent/tmux.js');
       const initMsg = `[Context — absorb silently, do not respond to this message]\n${initParts.join('\n\n')}`;
       try { await sendKeys(sessionName, initMsg); } catch { /* ignore */ }
+    }
+    if (!sub.fresh && agentType !== 'shell' && agentType !== 'script') {
+      try {
+        const { sendKeys } = await import('../agent/tmux.js');
+        await dispatchProcessRestartContinuation({
+          sessionName,
+          currentSession: getSession(sessionName),
+          sendKeys: (name, keys) => sendKeys(name, keys),
+          emitUserMessage: (name, commandId) =>
+            emitSystemContinueUserMessage(timelineEmitter.emit.bind(timelineEmitter), name, commandId, 'process'),
+        });
+      } catch (err) {
+        logger.warn({ err, sessionName }, 'Process sub-session restart continuation failed');
+      }
     }
   };
   void injectInit();
@@ -508,6 +531,7 @@ export async function stopSubSession(
         serverLink.send({ type: 'subsession.closed', id, sessionName });
       }
       clearResend(sessionName, 'session_removed');
+      clearSessionRestartContinuation(sessionName);
       removeSession(sessionName);
       timelineEmitter.forgetSession(sessionName);
     },

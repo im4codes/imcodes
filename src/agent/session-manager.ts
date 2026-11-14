@@ -145,6 +145,25 @@ import { SESSION_ERROR_WORKING_DIRECTORY_NOT_FOUND } from '../../shared/session-
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 import { resolveEffectiveIdentityPrompt } from '../daemon/session-identity-resolver.js';
 import { identityPromptHash } from '../util/identity-prompt-hash.js';
+import {
+  clearSessionRestartContinuation,
+  consumeRestartContinuation,
+  dispatchProcessRestartContinuation,
+  dispatchTransportRestartContinuation,
+  emitSystemContinueUserMessage,
+  hasPendingRestartContinuation,
+  retireRestartContinuation,
+} from '../daemon/restart-continuation.js';
+
+function maybeDispatchProcessRestartContinuation(sessionName: string): Promise<{ dispatched: boolean; reason: string; commandId?: string }> {
+  return dispatchProcessRestartContinuation({
+    sessionName,
+    currentSession: getSession(sessionName),
+    sendKeys: (name, keys) => sendKeys(name, keys),
+    emitUserMessage: (name, commandId) =>
+      emitSystemContinueUserMessage(timelineEmitter.emit.bind(timelineEmitter), name, commandId, 'process'),
+  });
+}
 
 function isStoredTransportSession(record: Pick<SessionRecord, 'runtimeType' | 'agentType'>): boolean {
   return record.runtimeType === RUNTIME_TYPES.TRANSPORT
@@ -477,6 +496,7 @@ export async function stopProject(
         timelineEmitter.forgetSession(record.name);
         notifySessionTeardown(record.name);
         clearResend(record.name, 'session_removed');
+        clearSessionRestartContinuation(record.name);
         if (isIncognitoSession(record)) {
           getTransportQueueStore().discardSessionQueueState(record.name);
           getDefaultTimelineDetailStore().forgetSession(record.name);
@@ -731,6 +751,9 @@ export async function restoreFromStore(): Promise<void> {
         upsertSession({ ...s, state: 'stopped', updatedAt: Date.now() });
         continue;
       }
+      if (await isPaneAlive(s.name)) {
+        consumeRestartContinuation(s.name);
+      }
       if (s.agentType === 'claude-code' && s.ccSessionId && s.projectDir && !isWatching(s.name)) {
         startCCWatcher(s.name, s.projectDir, s.ccSessionId);
       } else if (s.agentType === 'codex' && s.codexSessionId && !isCodexWatching(s.name)) {
@@ -840,7 +863,10 @@ export async function restoreFromStore(): Promise<void> {
         updateSessionState(hydrated.name, 'error', message);
         emitSessionEvent('error', hydrated.name, message);
       }
-    } else if (hydrated.agentType === 'claude-code' && hydrated.projectDir && !isWatching(hydrated.name)) {
+    } else {
+      // Live CLI process survived daemon restart intact — discard any captured marker so it is never nudged.
+      consumeRestartContinuation(hydrated.name);
+      if (hydrated.agentType === 'claude-code' && hydrated.projectDir && !isWatching(hydrated.name)) {
       if (hydrated.ccSessionId) {
         startCCWatcher(hydrated.name, hydrated.projectDir, hydrated.ccSessionId);
       } else {
@@ -896,6 +922,7 @@ export async function restoreFromStore(): Promise<void> {
       startOpenCodeWatching(hydrated.name, hydrated.projectDir, hydrated.opencodeSessionId).catch((e) =>
         logger.warn({ err: e, session: hydrated.name }, 'opencode-watcher start failed (restore)'),
       );
+    }
     }
   }
 
@@ -1007,6 +1034,7 @@ export async function restartSession(record: SessionRecord): Promise<boolean> {
       codexSessionId: effectiveRecord.codexSessionId,
       geminiSessionId: effectiveRecord.geminiSessionId,
       opencodeSessionId: effectiveRecord.opencodeSessionId,
+      onPostLaunchReady: () => maybeDispatchProcessRestartContinuation(effectiveRecord.name),
     });
     } catch (error) {
       throw markLaunchFailure(record, error);
@@ -1171,6 +1199,11 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
       const initMsg = `[Context — absorb silently, do not respond to this message]\n${initParts.join('\n\n')}`;
       try { await sendKeys(record.name, initMsg); } catch { /* ignore */ }
     }
+    try {
+      await maybeDispatchProcessRestartContinuation(record.name);
+    } catch (err) {
+      logger.warn({ err, session: record.name }, 'Process respawn restart continuation failed');
+    }
   };
   void injectInit();
 
@@ -1224,6 +1257,8 @@ export interface LaunchOpts extends SessionIncognitoConfig {
   userCreated?: boolean;
   /** Internal: launch generation already allocated by `relaunchSessionWithSettings`. */
   handoffLaunchGeneration?: number;
+  /** Internal: invoked after `postLaunch` and initial context injection finish. */
+  onPostLaunchReady?: () => Promise<unknown> | unknown;
 }
 
 export interface SessionRelaunchOverrides {
@@ -3015,7 +3050,10 @@ export async function restoreTransportSessions(
     && (s.providerId ?? s.agentType) === providerId
     && !!s.providerSessionId
     && (!options.sessionName || s.name === options.sessionName)
-    && (!options.onlyWithPendingResend || getResendCount(s.name) > 0 || hasDurableTransportQueueEntries(s.name)),
+    && (!options.onlyWithPendingResend
+      || getResendCount(s.name) > 0
+      || hasDurableTransportQueueEntries(s.name)
+      || hasPendingRestartContinuation(s.name)),
   ).map((s) => ({ ...s, providerId, providerSessionId: s.providerSessionId! } as Restorable));
   // A permanent-by-construction failure (see transport-restore-backoff.ts):
   // recorded so on-demand callers stop retrying it every few seconds, and
@@ -3558,6 +3596,25 @@ export async function restoreTransportSessions(
         await recoverPersistedTransportQueue(runtime, s.name, 'reconnect');
       } catch (err) {
         logger.warn({ err, session: s.name }, 'Failed to recover transport queue after restart');
+      }
+      try {
+        const cont = await dispatchTransportRestartContinuation({
+          preRestoreSession: s,
+          currentSession: getSession(s.name) ?? persistedRestoredRecord,
+          runtime,
+          getResendCount,
+          hasQueuedDurableEntries: (name) => getTransportQueueStore().hasQueuedEntries(name),
+          emitUserMessage: (name, commandId) =>
+            emitSystemContinueUserMessage(timelineEmitter.emit.bind(timelineEmitter), name, commandId, 'transport'),
+        });
+        if (cont.dispatched) {
+          logger.info(
+            { session: s.name, commandId: cont.commandId, reason: cont.reason },
+            'Dispatched automatic restart continue for transport session',
+          );
+        }
+      } catch (err) {
+        logger.warn({ err, session: s.name }, 'Failed to dispatch restart continuation after restore');
       }
     } catch (err) {
       logger.warn({ err, session: s.name }, 'Failed to restore transport session runtime');
@@ -4622,15 +4679,26 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       }
     }
     if (agentType === 'shell' || agentType === 'script') return;
+    if (fresh) {
+      retireRestartContinuation(name);
+    }
     // The same session reference as a restore uses: its PROJECT-scope identity is keyed by the context namespace's project id
     // when the session has one, so leaving it out would look up the project NAME and miss that profile.
     const launchIdentity = opts.identityPrompt ?? await resolveEffectiveIdentityPrompt({ name, projectName, contextNamespace: storedBeforeLaunch?.contextNamespace });
     const initialContext = [opts.description, launchIdentity].filter(Boolean).join('\n\n');
-    if (!initialContext) return;
-    try {
-      await sendKeys(name, `[Context — absorb silently, do not respond to this message]\n${initialContext}`);
-    } catch (error) {
-      logger.warn({ err: error, session: name }, 'Initial session identity injection failed');
+    if (initialContext) {
+      try {
+        await sendKeys(name, `[Context — absorb silently, do not respond to this message]\n${initialContext}`);
+      } catch (error) {
+        logger.warn({ err: error, session: name }, 'Initial session identity injection failed');
+      }
+    }
+    if (!fresh && opts.onPostLaunchReady) {
+      try {
+        await opts.onPostLaunchReady();
+      } catch (err) {
+        logger.warn({ err, session: name }, 'Post-launch continuation hook failed');
+      }
     }
   })();
 }

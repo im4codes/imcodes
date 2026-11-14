@@ -1582,6 +1582,20 @@ export class TransportSessionRuntime implements SessionRuntime {
     });
   }
 
+  /**
+   * Post-restart check: returns true if the provider's Codex rollout tail
+   * proves the interrupted turn already reached `task_complete`.
+   */
+  async hasCompletedCodexRolloutTurn(): Promise<boolean> {
+    const sid = this._providerSessionId;
+    if (!sid) return false;
+    const provider = this.provider as unknown as {
+      hasCompletedRolloutTurn?: (sessionId: string) => Promise<boolean>;
+    };
+    if (typeof provider.hasCompletedRolloutTurn !== 'function') return false;
+    return provider.hasCompletedRolloutTurn(sid);
+  }
+
   private supportsCodexRolloutBackstop(): boolean {
     return typeof (this.provider as unknown as {
       settleCompletedTurnFromRolloutBackstop?: unknown;
