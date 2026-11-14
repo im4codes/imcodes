@@ -722,7 +722,7 @@ describe('TaskPairStatusPanel', () => {
   });
 
   it('mobile: an expanded panel is bounded to the measured chat area; when almost nothing is left it presents the strip without touching the stored choice', async () => {
-    const events = [{ eventId: 'fit-1', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'fit-1', title: 'Fit task', toStatus: 'working' } }] as never;
+    const events = [{ eventId: 'fit-1', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'fit-1', title: 'Fit task', toStatus: 'working', executor: 'sub-fit' } }] as never;
     const originalMedia = window.matchMedia;
     const originalRaf = window.requestAnimationFrame;
     const originalObserver = globalThis.ResizeObserver;
@@ -745,7 +745,7 @@ describe('TaskPairStatusPanel', () => {
     titlebar.getBoundingClientRect = () => rect(40, 80);
     const flush = async () => { const pending = frames.splice(0); await waitFor(() => { pending.forEach((cb) => cb(0)); }); };
     try {
-      render(<TaskPairStatusPanel events={events} serverId="fit-server" />, { container: titlebar });
+      render(<TaskPairStatusPanel events={events} serverId="fit-server" scopeSessionId="sub-fit" />, { container: titlebar });
       const panel = () => titlebar.querySelector('.task-pair-status-panel') as HTMLElement;
       expect(panel().classList.contains('is-collapsed')).toBe(false);
       expect(panel().style.getPropertyValue('--task-pair-panel-max-h')).toBe(`${600 - 84 - 8}px`);

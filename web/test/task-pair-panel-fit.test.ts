@@ -230,5 +230,16 @@ describe('stylesheet: mobile expanded panel is bounded by the measured variable'
     expect(consoleMobile).toMatch(/height:\s*var\(--vvh,\s*100dvh\)/);
     expect(consoleMobile).toMatch(/safe-area-inset-top/);
     expect(consoleMobile).toMatch(/safe-area-inset-bottom/);
+
+    const panelFullscreen = /\.task-pair-status-panel\.is-mobile\.is-fullscreen:not\(\.is-collapsed\),\s*\.chat-titlebar > \.task-pair-status-panel\.is-mobile\.is-fullscreen:not\(\.is-collapsed\),\s*\.chat-main > \.task-pair-status-panel\.is-mobile\.is-fullscreen:not\(\.is-collapsed\)\s*\{([^}]*)\}/.exec(css)?.[1] ?? '';
+    expect(panelFullscreen).toMatch(/position:\s*fixed/);
+    expect(panelFullscreen).toMatch(/inset:\s*0/);
+    expect(panelFullscreen).toMatch(/height:\s*var\(--vvh,\s*100dvh\)/);
+    expect(panelFullscreen).toMatch(/safe-area-inset-top/);
+    expect(panelFullscreen).toMatch(/safe-area-inset-bottom/);
+    expect(panelFullscreen).toMatch(/z-index:\s*calc\(var\(--mobile-fullscreen-window-z\)\s*\+\s*2\)/);
+
+    const panelFullscreenRows = /\.task-pair-status-panel\.is-mobile\.is-fullscreen:not\(\.is-collapsed\)\s+\.task-pair-status-rows\s*\{([^}]*)\}/.exec(css)?.[1] ?? '';
+    expect(panelFullscreenRows).toMatch(/safe-area-inset-bottom/);
   });
 });

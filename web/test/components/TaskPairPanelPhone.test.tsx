@@ -464,4 +464,129 @@ describe('everything that is not a phone sub-session is unchanged', () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it('expands main chat task panel to fullscreen on mobile without cramped collapse, auto-collapses on deck:navigate and collapse toggle', () => {
+    setDevice('phone');
+    const host = document.createElement('div');
+    host.className = 'chat-main';
+    const titlebar = document.createElement('div');
+    titlebar.className = 'chat-titlebar';
+    host.appendChild(titlebar);
+    document.body.appendChild(host);
+    // Cramped inline chat height (< TASK_PAIR_PANEL_MIN_USABLE_PX) simulating open keyboard
+    host.getBoundingClientRect = () => ({ top: 140, bottom: 210, left: 0, right: 390, width: 390, height: 70, x: 0, y: 140, toJSON: () => ({}) } as DOMRect);
+    titlebar.getBoundingClientRect = () => ({ top: 140, bottom: 180, left: 0, right: 390, width: 390, height: 40, x: 0, y: 140, toJSON: () => ({}) } as DOMRect);
+    const anchorRef = { current: titlebar };
+    const mountTarget = document.createElement('div');
+    host.appendChild(mountTarget);
+
+    const navigateEvents: string[] = [];
+    const onNavigate = (e: Event) => navigateEvents.push((e as CustomEvent<{ session: string }>).detail.session);
+    window.addEventListener('deck:navigate', onNavigate);
+    try {
+      render(
+        <TaskPairStatusPanelHost
+          events={live}
+          serverId="srv"
+          mobileAnchorRef={anchorRef}
+        />,
+        { container: mountTarget },
+      );
+      const panel = titlebar.querySelector('[data-testid="task-pair-status-panel"]') as HTMLElement;
+      expect(panel.classList.contains('is-collapsed')).toBe(true);
+      expect(panel.classList.contains('is-fullscreen')).toBe(false);
+
+      // Expand -> fullscreen class added, not collapsed by cramped height, no --task-pair-panel-max-h written
+      fireEvent.click(titlebar.querySelector('.task-pair-status-compact') as HTMLElement);
+      expect(panel.classList.contains('is-collapsed')).toBe(false);
+      expect(panel.classList.contains('is-mobile')).toBe(true);
+      expect(panel.classList.contains('is-fullscreen')).toBe(true);
+      expect(panel.style.getPropertyValue(TASK_PAIR_PANEL_MAX_HEIGHT_VAR)).toBe('');
+
+      // Collapse via ⌃ toggle
+      fireEvent.click(titlebar.querySelector('button.task-pair-status-toggle') as HTMLElement);
+      expect(panel.classList.contains('is-collapsed')).toBe(true);
+      expect(panel.classList.contains('is-fullscreen')).toBe(false);
+
+      // Re-expand and click session pill -> dispatches deck:navigate and auto-collapses fullscreen panel
+      fireEvent.click(titlebar.querySelector('.task-pair-status-compact') as HTMLElement);
+      expect(panel.classList.contains('is-fullscreen')).toBe(true);
+      const sessionBtn = titlebar.querySelector('.task-pair-status-session[data-session-name="deck_sub_a"]') as HTMLElement;
+      expect(sessionBtn).toBeTruthy();
+      fireEvent.click(sessionBtn);
+      expect(navigateEvents).toEqual(['deck_sub_a']);
+      expect(panel.classList.contains('is-collapsed')).toBe(true);
+      expect(panel.classList.contains('is-fullscreen')).toBe(false);
+    } finally {
+      window.removeEventListener('deck:navigate', onNavigate);
+      host.remove();
+    }
+  });
+
+  it('keeps mobile sub-window task panel inline without is-fullscreen and preserves fit/cramped measurement', () => {
+    setDevice('phone');
+    const host = document.createElement('div');
+    host.className = 'chat-main';
+    const titlebar = document.createElement('div');
+    titlebar.className = 'chat-titlebar';
+    host.appendChild(titlebar);
+    document.body.appendChild(host);
+    host.getBoundingClientRect = () => ({ top: 140, bottom: 637, left: 0, right: 390, width: 390, height: 497, x: 0, y: 140, toJSON: () => ({}) } as DOMRect);
+    titlebar.getBoundingClientRect = () => ({ top: 140, bottom: 193, left: 0, right: 390, width: 390, height: 53, x: 0, y: 140, toJSON: () => ({}) } as DOMRect);
+    const anchorRef = { current: titlebar };
+    const mountTarget = document.createElement('div');
+    host.appendChild(mountTarget);
+
+    try {
+      render(
+        <TaskPairStatusPanelHost
+          events={live}
+          serverId="srv"
+          scopeSessionId="deck_sub_a"
+          mobileAnchorRef={anchorRef}
+        />,
+        { container: mountTarget },
+      );
+      const panel = titlebar.querySelector('[data-testid="task-pair-status-panel"]') as HTMLElement;
+      expect(panel.classList.contains('is-collapsed')).toBe(true);
+      expect(panel.classList.contains('is-fullscreen')).toBe(false);
+
+      fireEvent.click(titlebar.querySelector('.task-pair-status-compact') as HTMLElement);
+      expect(panel.classList.contains('is-collapsed')).toBe(false);
+      expect(panel.classList.contains('is-mobile')).toBe(true);
+      expect(panel.classList.contains('is-fullscreen')).toBe(false);
+      expect(panel.style.getPropertyValue(TASK_PAIR_PANEL_MAX_HEIGHT_VAR)).toBe('432px');
+    } finally {
+      host.remove();
+    }
+  });
+
+  it('keeps desktop main chat and sub-window panels docked/inline without is-fullscreen and does not collapse on session click', () => {
+    setDevice('desktop');
+    const navigateEvents: string[] = [];
+    const onNavigate = (e: Event) => navigateEvents.push((e as CustomEvent<{ session: string }>).detail.session);
+    window.addEventListener('deck:navigate', onNavigate);
+    try {
+      const mainView = render(<TaskPairStatusPanel events={live} serverId="srv" />);
+      const mainPanel = mainView.container.querySelector('[data-testid="task-pair-status-panel"]') as HTMLElement;
+      expect(mainPanel.classList.contains('is-desktop')).toBe(true);
+      expect(mainPanel.classList.contains('is-fullscreen')).toBe(false);
+      expect(mainPanel.classList.contains('is-collapsed')).toBe(false);
+      expect(mainPanel.querySelector('.task-pair-status-resize')).toBeTruthy();
+
+      fireEvent.click(mainPanel.querySelector('.task-pair-status-session[data-session-name="deck_sub_a"]') as HTMLElement);
+      expect(navigateEvents).toEqual(['deck_sub_a']);
+      expect(mainPanel.classList.contains('is-collapsed')).toBe(false);
+      mainView.unmount();
+
+      const subView = render(<TaskPairStatusPanel events={live} serverId="srv" scopeSessionId="deck_sub_a" />);
+      const subPanel = subView.container.querySelector('[data-testid="task-pair-status-panel"]') as HTMLElement;
+      expect(subPanel.classList.contains('is-desktop')).toBe(true);
+      expect(subPanel.classList.contains('is-fullscreen')).toBe(false);
+      expect(subPanel.classList.contains('is-collapsed')).toBe(false);
+      subView.unmount();
+    } finally {
+      window.removeEventListener('deck:navigate', onNavigate);
+    }
+  });
 });

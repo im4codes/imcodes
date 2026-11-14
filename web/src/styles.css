@@ -16134,6 +16134,8 @@ button.quick-agent-delegation-preset.active {
 .chat-view-wrap:has(.task-pair-status-panel) .chat-pinned-last-sent { margin-right: calc(var(--task-pair-panel-width) + 12px); }
 .chat-view-wrap:has(.task-pair-status-panel.is-collapsed) .chat-view { padding-right: 12px; }
 .chat-view-wrap:has(.task-pair-status-panel.is-collapsed) .chat-pinned-last-sent { margin-right: 10px; }
+.chat-view-wrap:has(.task-pair-status-panel.is-mobile.is-fullscreen) .chat-view { padding-right: 12px; }
+.chat-view-wrap:has(.task-pair-status-panel.is-mobile.is-fullscreen) .chat-pinned-last-sent { margin-right: 10px; }
 /* Owner rule: the collapsed mobile task status is a bare inline strip in
    the titlebar -- no border/background, no expand button, and it must not
    make the titlebar any taller. Keyed on the panel's .is-mobile class (not a
@@ -16242,6 +16244,38 @@ button.quick-agent-delegation-preset.active {
 .task-pair-status-summary { display: flex; flex-wrap: wrap; gap: 4px; min-width: 0; }
 .task-pair-status-body { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
 .task-pair-status-rows { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; scrollbar-gutter: stable; scroll-padding-bottom: 16px; padding: 0 8px 16px; }
+/* Mobile main-chat task panel opens full-screen (sub-windows remain inline
+   under their own .is-mobile rules above because they never carry .is-fullscreen). */
+.task-pair-status-panel.is-mobile.is-fullscreen:not(.is-collapsed),
+.chat-titlebar > .task-pair-status-panel.is-mobile.is-fullscreen:not(.is-collapsed),
+.chat-main > .task-pair-status-panel.is-mobile.is-fullscreen:not(.is-collapsed) {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  max-width: none;
+  height: var(--vvh, 100dvh);
+  max-height: var(--vvh, 100dvh);
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  padding-top: max(var(--sat, 0px), env(safe-area-inset-top, 0px));
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  z-index: calc(var(--mobile-fullscreen-window-z) + 2);
+  overflow: hidden;
+  box-sizing: border-box;
+}
+.task-pair-status-panel.is-mobile.is-fullscreen:not(.is-collapsed) > .task-pair-status-toggle {
+  padding: 10px max(12px, env(safe-area-inset-right, 0px)) 10px max(12px, env(safe-area-inset-left, 0px));
+  border-bottom: 1px solid color-mix(in srgb, var(--status-info-border, var(--chrome-accent)) 28%, transparent);
+}
+.task-pair-status-panel.is-mobile.is-fullscreen:not(.is-collapsed) .task-pair-status-body {
+  min-height: 0;
+  padding-bottom: 0;
+}
+.task-pair-status-panel.is-mobile.is-fullscreen:not(.is-collapsed) .task-pair-status-rows {
+  padding: 4px max(10px, env(safe-area-inset-right, 0px)) max(16px, env(safe-area-inset-bottom, 0px)) max(10px, env(safe-area-inset-left, 0px));
+}
 .task-pair-status-group { margin: 0 0 6px; }
 .task-pair-status-group h4 { display: flex; align-items: center; gap: 5px; margin: 6px 0 0; padding-top: 3px; border-top: 1px solid color-mix(in srgb, currentColor 22%, transparent); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; opacity: .78; }
 .task-pair-status-group h4 small { display: inline-flex; align-items: center; justify-content: center; min-width: 15px; height: 15px; padding: 0 4px; border-radius: 999px; background: color-mix(in srgb, currentColor 16%, transparent); font-family: ui-monospace, SFMono-Regular, monospace; font-size: 9px; opacity: .85; }
