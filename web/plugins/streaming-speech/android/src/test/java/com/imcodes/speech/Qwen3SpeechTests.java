@@ -6,6 +6,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.regex.Matcher;
 
 /**
  * Standalone JDK-21 unit tests for pure-Java Whisper mel extraction, Qwen3 BPE
@@ -34,6 +35,7 @@ public final class Qwen3SpeechTests {
         testSpeechWindowLowestEnergySplit();
         testOnnxDecoderPureHelpers();
         testLanguagePromptMappingAndEncoding();
+        testPretokenizePatternAndMultiScript();
         System.out.println("QWEN3_JAVA_UNIT_TESTS:PASS");
     }
 
@@ -495,5 +497,56 @@ public final class Qwen3SpeechTests {
         // When auto-detect leaves <asr_text> out of prompt, decoder emits header + text which extractFinalText strips
         int[] generatedWithHeader = new int[] { 300, 301, 151704, 305, 306, 307, 151645 };
         checkEquals("你好", tok.extractFinalText(generatedWithHeader), "extractFinalText still strips auto-detected header");
+    }
+
+    private static List<String> pretokenizeChunks(String input) {
+        List<String> chunks = new ArrayList<>();
+        Matcher matcher = Qwen3Tokenizer.QWEN3_PRETOKENIZE_PATTERN.matcher(input);
+        while (matcher.find()) {
+            chunks.add(matcher.group());
+        }
+        return chunks;
+    }
+
+    private static void testPretokenizePatternAndMultiScript() throws Exception {
+        checkEquals(0, Qwen3Tokenizer.QWEN3_PRETOKENIZE_PATTERN.flags(), "QWEN3_PRETOKENIZE_PATTERN must compile with flags=0 for Android ICU compatibility");
+
+        // Contractions (mixed case)
+        checkEquals(
+            Arrays.asList("I", "'m", " don", "'t", " YOU", "'RE", " we", "'ve", " they", "'ll", " he", "'d", " it", "'s"),
+            pretokenizeChunks("I'm don't YOU'RE we've they'll he'd it's"),
+            "English contractions pretokenize cleanly"
+        );
+
+        // CJK + punctuation + digits + newlines
+        checkEquals(
+            Arrays.asList("你好", "，世界", "!", " abc", "1", "2", "3", "\r\n\r\n", " ", " line", "2", "\n"),
+            pretokenizeChunks("你好，世界! abc123\r\n\r\n  line2\n"),
+            "CJK, punctuation, digits, and CRLF/LF pretokenize cleanly"
+        );
+
+        // Unicode spaces (NBSP U+00A0 and ideographic space U+3000) across single, multi-space lookahead, CR/LF prefix, and trailing whitespace branches
+        checkEquals(
+            Arrays.asList("hello", "\u00A0world", "，你好", "\u3000世界"),
+            pretokenizeChunks("hello\u00A0world，你好\u3000世界"),
+            "NBSP and ideographic spaces attach identically to ASCII spaces"
+        );
+        checkEquals(
+            Arrays.asList("a", "\u00A0", "\u3000b"),
+            pretokenizeChunks("a\u00A0\u3000b"),
+            "multi Unicode spaces preserve single leading separator before next word"
+        );
+        checkEquals(
+            Arrays.asList("x", "\u3000\n", "end", "\u00A0\u3000"),
+            pretokenizeChunks("x\u3000\nend\u00A0\u3000"),
+            "Unicode spaces before newline and at end of string"
+        );
+
+        // Full Qwen3Tokenizer encode/decode round-trip across contractions, CJK, punctuation, digits, newlines, and Unicode spaces
+        Qwen3Tokenizer tok = buildFixtureTokenizer();
+        String multiScript = "I'm ready: 你好，世界 123\r\nhello\u00A0world\u3000测试!\n";
+        int[] ids = tok.encode(multiScript);
+        check(ids.length > 0, "multi-script sample encodes non-empty");
+        checkEquals(multiScript, tok.decode(ids), "multi-script sample with Unicode spaces round-trips cleanly");
     }
 }

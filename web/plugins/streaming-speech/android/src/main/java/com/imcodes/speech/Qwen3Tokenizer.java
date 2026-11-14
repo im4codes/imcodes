@@ -32,9 +32,10 @@ public final class Qwen3Tokenizer {
     public static final int DEFAULT_AUDIO_PAD_TOKEN_ID = 151676;
     public static final int DEFAULT_ASR_TEXT_TOKEN_ID = 151704;
 
-    private static final Pattern QWEN3_PRETOKENIZE_PATTERN = Pattern.compile(
-        "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
-        Pattern.UNICODE_CHARACTER_CLASS
+    // Android ICU regex rejects the Java Unicode-character-class Pattern flag at <clinit>,
+    // so include Unicode separator class \p{Z} alongside \s explicitly with default flags.
+    static final Pattern QWEN3_PRETOKENIZE_PATTERN = Pattern.compile(
+        "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{Z}\\p{L}\\p{N}]+[\\r\\n]*|[\\s\\p{Z}]*[\\r\\n]+|[\\s\\p{Z}]+(?![^\\s\\p{Z}])|[\\s\\p{Z}]+"
     );
 
     private static final String[] BYTE_TO_UNICODE = new String[256];
