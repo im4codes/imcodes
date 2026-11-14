@@ -54,6 +54,8 @@ describe('SubSessionBar mobile footer status real Chromium layout & base/head he
       window.__mountBar = async (props) => {
         await i18n.changeLanguage('en');
         const noop = () => {};
+        const root = document.getElementById('root');
+        render(null, root);
         render(
           <SubSessionBar
             onOpen={noop}
@@ -70,7 +72,7 @@ describe('SubSessionBar mobile footer status real Chromium layout & base/head he
             {...props}
             openIds={new Set(props.openIds || [])}
           />,
-          document.getElementById('root'),
+          root,
         );
       };
     `;
@@ -148,23 +150,27 @@ describe('SubSessionBar mobile footer status real Chromium layout & base/head he
         { name: 'expanded_open_card', baseMaxBySab: { 0: 299, 34: 299 }, inline: false, hasRow: true, props: { subSessions, openIds: ['sub-1'], collapsed: false, desktopLayoutCapable: false, daemonBadgeState: 'online' } },
         { name: 'empty_collapsed', baseMaxBySab: { 0: 34, 34: 34 }, inline: true, hasRow: false, props: { subSessions: [], collapsed: true, desktopLayoutCapable: false, daemonBadgeState: 'offline' } },
         { name: 'empty_expanded_onNew', baseMaxBySab: { 0: 64, 34: 64 }, inline: false, hasRow: false, props: { subSessions: [], collapsed: false, desktopLayoutCapable: false, daemonBadgeState: 'connecting' } },
+        { name: 'empty_expanded_no_onNew', baseMaxBySab: { 0: 34, 34: 34 }, inline: true, hasRow: false, props: { subSessions: [], collapsed: false, withOnNew: false, desktopLayoutCapable: false, daemonBadgeState: 'online' } },
       ] as const;
 
       for (const sab of [0, 34] as const) {
-        for (const item of matrix) {
-          let baseHeight: number = item.baseMaxBySab[sab];
-          if (baseBundle && baseCss) {
-            await page.setContent(`<!doctype html><html style="--sab:${sab}px;"><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${replaceEnvSab(baseCss, sab)}</style></head><body style="margin:0;background:#080d16;"><div id="root"></div></body></html>`);
-            await page.addScriptTag({ content: baseBundle });
+        const baseHeightByName: Record<string, number> = {};
+        if (baseBundle && baseCss) {
+          await page.setContent(`<!doctype html><html style="--sab:${sab}px;"><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${replaceEnvSab(baseCss, sab)}</style></head><body style="margin:0;background:#080d16;"><div id="root" style="position:fixed;left:0;right:0;bottom:0;display:flex;flex-direction:column;"></div></body></html>`);
+          await page.addScriptTag({ content: baseBundle });
+          for (const item of matrix) {
             await page.evaluate(async (p) => {
               const w = window as unknown as { __mountBar: (props: Record<string, unknown>) => Promise<void> };
               await w.__mountBar(p as Record<string, unknown>);
             }, item.props);
-            baseHeight = await page.locator('.subcard-bar').evaluate((el) => el.getBoundingClientRect().height);
+            baseHeightByName[item.name] = await page.locator('.subcard-bar').evaluate((el) => el.getBoundingClientRect().height);
           }
+        }
 
-          await page.setContent(`<!doctype html><html style="--sab:${sab}px;"><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${replaceEnvSab(headCss, sab)}</style></head><body style="margin:0;background:#080d16;"><div id="root"></div></body></html>`);
-          await page.addScriptTag({ content: headBundle });
+        await page.setContent(`<!doctype html><html style="--sab:${sab}px;"><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${replaceEnvSab(headCss, sab)}</style></head><body style="margin:0;background:#080d16;"><div id="root" style="position:fixed;left:0;right:0;bottom:0;display:flex;flex-direction:column;"></div></body></html>`);
+        await page.addScriptTag({ content: headBundle });
+        for (const item of matrix) {
+          const baseHeight: number = baseHeightByName[item.name] ?? item.baseMaxBySab[sab];
           await page.evaluate(async (p) => {
             const w = window as unknown as { __mountBar: (props: Record<string, unknown>) => Promise<void> };
             await w.__mountBar(p as Record<string, unknown>);
@@ -186,6 +192,15 @@ describe('SubSessionBar mobile footer status real Chromium layout & base/head he
             const vr = ver.getBoundingClientRect();
             const cr = card?.getBoundingClientRect() ?? null;
             const ir = inputArea?.getBoundingClientRect() ?? null;
+            const contentRight = Math.max(bg.right, vr.right);
+            const contentLeft = Math.min(bg.left, vr.left);
+            const contentTop = Math.min(bg.top, vr.top);
+            const contentBottom = Math.max(bg.bottom, vr.bottom);
+            const toolbarOverlap = Array.from(toolbar.querySelectorAll('button')).some((btn) => {
+              const r = btn.getBoundingClientRect();
+              return r.width > 0 && r.height > 0
+                && !(r.right <= contentLeft + 0.5 || r.left >= contentRight - 0.5 || r.bottom <= contentTop + 0.5 || r.top >= contentBottom - 0.5);
+            });
             return {
               barHeight: br.height,
               rowBottom: rr?.bottom ?? null,
@@ -199,7 +214,8 @@ describe('SubSessionBar mobile footer status real Chromium layout & base/head he
               overflowBar: bar.scrollWidth > bar.clientWidth,
               overflowToolbar: toolbar.scrollWidth > toolbar.clientWidth,
               overflowFooter: footer.scrollWidth > footer.clientWidth,
-              bottomClearance: fr.bottom - Math.max(bg.bottom, vr.bottom),
+              viewportBottomClearance: window.innerHeight - contentBottom,
+              toolbarOverlap,
               inputClipped: cr && ir ? ir.bottom > cr.bottom + 0.5 : false,
               verText: ver.textContent,
             };
@@ -209,19 +225,18 @@ describe('SubSessionBar mobile footer status real Chromium layout & base/head he
           expect(geom.overflowBar, `${item.name} sab=${sab} bar overflow`).toBe(false);
           expect(geom.overflowToolbar, `${item.name} sab=${sab} toolbar overflow`).toBe(false);
           expect(geom.overflowFooter, `${item.name} sab=${sab} footer overflow`).toBe(false);
+          expect(geom.toolbarOverlap, `${item.name} sab=${sab} toolbar button overlap`).toBe(false);
           expect(geom.inputClipped, `${item.name} sab=${sab} input clipped`).toBe(false);
           expect(Math.abs(geom.badgeMidY - geom.verMidY)).toBeLessThanOrEqual(2);
           expect(geom.badgeRight).toBeLessThan(geom.verLeft);
           expect(geom.barHeight, `${item.name} sab=${sab} height`).toBeLessThanOrEqual(baseHeight + 0.01);
+          expect(Math.abs(geom.groupCenterX - geom.barCenterX), `${item.name} sab=${sab} centered`).toBeLessThanOrEqual(2);
 
           if (item.hasRow && geom.rowBottom !== null) {
             expect(geom.footerTop).toBeGreaterThanOrEqual(geom.rowBottom - 0.5);
           }
-          if (!item.inline) {
-            expect(Math.abs(geom.groupCenterX - geom.barCenterX)).toBeLessThanOrEqual(2);
-            if (sab === 34) {
-              expect(geom.bottomClearance).toBeGreaterThanOrEqual(16);
-            }
+          if (sab === 34) {
+            expect(geom.viewportBottomClearance, `${item.name} sab=34 viewport bottom clearance`).toBeGreaterThanOrEqual(16);
           }
         }
       }
@@ -258,5 +273,5 @@ describe('SubSessionBar mobile footer status real Chromium layout & base/head he
     } finally {
       await browser.close();
     }
-  });
+  }, 90_000);
 });

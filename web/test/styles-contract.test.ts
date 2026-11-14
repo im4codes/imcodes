@@ -1748,7 +1748,14 @@ describe('styles.css regression contracts', () => {
     expect(expandedCardRule).toBeTruthy();
     expect(expandedCardRule).toMatch(/max-height:\s*calc\(var\(--subcard-h,\s*250px\)/);
     expect(cssWithoutComments).toMatch(/\.subcard-bar-mobile-expanded\s+\.subcard-preview\s*\{\s*min-height:\s*0;\s*\}/);
-    expect(cssWithoutComments).toMatch(/\.subcard-mobile-footer-status\.subcard-mobile-footer-status-inline\s*\{[^}]*margin:\s*0 auto/);
+    const inlineFooterContainerRule = cssWithoutComments.match(/^\.subcard-bar-mobile-inline-footer\s*\{[^}]*\}/m)?.[0];
+    expect(inlineFooterContainerRule).toBeTruthy();
+    expect(inlineFooterContainerRule).toMatch(/safe-area-inset-bottom/);
+
+    const inlineFooterRule = cssWithoutComments.match(/\.subcard-mobile-footer-status\.subcard-mobile-footer-status-inline\s*\{[^}]*\}/)?.[0];
+    expect(inlineFooterRule).toBeTruthy();
+    expect(inlineFooterRule).toMatch(/left:\s*50%/);
+    expect(inlineFooterRule).toMatch(/transform:\s*translate\(-50%,\s*-50%\)/);
 
     // Keyboard open / input-focused continues to hide the entire .subcard-bar (including the footer inside it)
     expect(cssWithoutComments).toMatch(/:root:not\(\.subcard-input-focused\)\.input-focused\s+\.subcard-bar:not\(:focus-within\)\s*\{\s*display:\s*none/);

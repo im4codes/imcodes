@@ -1971,7 +1971,12 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
             </button>
           );
         })()}
-        {inlineMobileFooterInToolbar && renderMobileFooterStatus(true)}
+        {inlineMobileFooterInToolbar && (
+          <>
+            {renderMobileFooterStatus(true)}
+            <span class="subcard-toolbar-spacer" aria-hidden="true" />
+          </>
+        )}
         {onNew && (
           <button
             class={`subcard-toolbar-add${desktopLayoutCapable ? ' subcard-toolbar-add-desktop' : ''}`}
