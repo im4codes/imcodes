@@ -629,3 +629,177 @@ describe('TerminalView — Mac native host scaling modes', () => {
     expect(fitInstance.fit).not.toHaveBeenCalled();
   });
 });
+
+describe('TerminalView — Space / window resume fit debouncing', () => {
+  const prevRaf = globalThis.requestAnimationFrame;
+  const prevCancelRaf = globalThis.cancelAnimationFrame;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.clearAllMocks();
+    Object.defineProperty(globalThis, 'requestAnimationFrame', {
+      value: (cb: FrameRequestCallback) => window.setTimeout(() => cb(Date.now()), 16),
+      configurable: true,
+      writable: true,
+    });
+    Object.defineProperty(globalThis, 'cancelAnimationFrame', {
+      value: (id: number) => { window.clearTimeout(id); },
+      configurable: true,
+      writable: true,
+    });
+  });
+
+  afterEach(() => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' });
+    Object.defineProperty(globalThis, 'requestAnimationFrame', { value: prevRaf, configurable: true, writable: true });
+    Object.defineProperty(globalThis, 'cancelAnimationFrame', { value: prevCancelRaf, configurable: true, writable: true });
+    vi.useRealTimers();
+  });
+
+  async function mountLaidOutTerminal(initialProposed = { cols: 80, rows: 24 }) {
+    let proposed = { ...initialProposed };
+    const { FitAddon } = await import('@xterm/addon-fit');
+    (FitAddon as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+      fit: vi.fn(),
+      proposeDimensions: vi.fn(() => proposed),
+    }));
+    const sendSnapshotRequest = vi.fn();
+    const ws = {
+      onTerminalRaw: vi.fn(() => vi.fn()),
+      onMessage: vi.fn(() => vi.fn()),
+      sendSnapshotRequest,
+      sendResize: vi.fn(),
+    };
+    const rendered = render(<TerminalView sessionName="space-resume" ws={ws as any} connected={true} />);
+    const container = rendered.container.querySelector('.terminal-container') as HTMLElement;
+    Object.defineProperty(container, 'clientWidth', { value: 800, configurable: true });
+    Object.defineProperty(container, 'clientHeight', { value: 600, configurable: true });
+
+    // Drain initial mount timers (including 400ms fallback fitTimer) and rAF fits so baselines start at zero.
+    vi.advanceTimersByTime(500);
+    const termInstance = (TerminalMock as unknown as ReturnType<typeof vi.fn>).mock.results.at(-1)?.value;
+    const fitInstance = (FitAddon as unknown as ReturnType<typeof vi.fn>).mock.results.at(-1)?.value;
+    fitInstance.fit.mockClear();
+    termInstance.scrollToBottom.mockClear();
+    sendSnapshotRequest.mockClear();
+
+    return {
+      ...rendered,
+      termInstance,
+      fitInstance,
+      sendSnapshotRequest,
+      setProposedDimensions(next: { cols: number; rows: number }) {
+        proposed = next;
+      },
+    };
+  }
+
+  function setVisibility(state: 'hidden' | 'visible') {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => state });
+    document.dispatchEvent(new Event('visibilitychange'));
+  }
+
+  it('skips redundant fit() and scrollToBottom() on short < 3000ms Space switch when dims are unchanged (all event orders)', async () => {
+    const view = await mountLaidOutTerminal({ cols: 80, rows: 24 });
+
+    // Order 1: hidden + blur -> visible -> focus (< 3000ms)
+    setVisibility('hidden');
+    window.dispatchEvent(new Event('blur'));
+    vi.advanceTimersByTime(500);
+    setVisibility('visible');
+    window.dispatchEvent(new Event('focus'));
+    vi.advanceTimersByTime(50);
+    expect(view.fitInstance.fit).not.toHaveBeenCalled();
+    expect(view.termInstance.scrollToBottom).not.toHaveBeenCalled();
+    expect(view.sendSnapshotRequest).not.toHaveBeenCalled();
+
+    // Order 2: blur + hidden -> focus (while still hidden) -> visible (< 3000ms)
+    window.dispatchEvent(new Event('blur'));
+    setVisibility('hidden');
+    vi.advanceTimersByTime(2_999);
+    window.dispatchEvent(new Event('focus'));
+    setVisibility('visible');
+    vi.advanceTimersByTime(50);
+    expect(view.fitInstance.fit).not.toHaveBeenCalled();
+    expect(view.termInstance.scrollToBottom).not.toHaveBeenCalled();
+    expect(view.sendSnapshotRequest).not.toHaveBeenCalled();
+
+    // Order 3: blur -> focus only (visibilityState remains 'visible', < 3000ms)
+    window.dispatchEvent(new Event('blur'));
+    vi.advanceTimersByTime(800);
+    window.dispatchEvent(new Event('focus'));
+    vi.advanceTimersByTime(50);
+    expect(view.fitInstance.fit).not.toHaveBeenCalled();
+    expect(view.termInstance.scrollToBottom).not.toHaveBeenCalled();
+
+    view.unmount();
+  });
+
+  it('still fits when container cols/rows actually changed during a short < 3000ms Space switch', async () => {
+    const view = await mountLaidOutTerminal({ cols: 80, rows: 24 });
+
+    setVisibility('hidden');
+    window.dispatchEvent(new Event('blur'));
+    vi.advanceTimersByTime(400);
+    view.setProposedDimensions({ cols: 100, rows: 30 });
+    setVisibility('visible');
+    window.dispatchEvent(new Event('focus'));
+    vi.advanceTimersByTime(50);
+
+    expect(view.fitInstance.fit).toHaveBeenCalledTimes(1);
+    expect(view.termInstance.scrollToBottom).toHaveBeenCalledTimes(1);
+    expect(view.sendSnapshotRequest).not.toHaveBeenCalled();
+
+    view.unmount();
+  });
+
+  it('forces one coalesced fit + snapshot at >= 3000ms and cleans up all resume listeners on unmount', async () => {
+    const view = await mountLaidOutTerminal({ cols: 80, rows: 24 });
+
+    // Threshold 3000ms with duplicate resume events (visible + focus + extra focus)
+    setVisibility('hidden');
+    window.dispatchEvent(new Event('blur'));
+    vi.advanceTimersByTime(3_000);
+    setVisibility('visible');
+    window.dispatchEvent(new Event('focus'));
+    window.dispatchEvent(new Event('focus'));
+    vi.advanceTimersByTime(50);
+
+    expect(view.fitInstance.fit).toHaveBeenCalledTimes(1);
+    expect(view.termInstance.scrollToBottom).toHaveBeenCalledTimes(1);
+    expect(view.sendSnapshotRequest).toHaveBeenCalledTimes(1);
+
+    // Focus arriving right before visibilitychange (>= 3000ms) also coalesces to one fit + one snapshot
+    view.fitInstance.fit.mockClear();
+    view.termInstance.scrollToBottom.mockClear();
+    view.sendSnapshotRequest.mockClear();
+    window.dispatchEvent(new Event('blur'));
+    setVisibility('hidden');
+    vi.advanceTimersByTime(4_000);
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' });
+    window.dispatchEvent(new Event('focus'));
+    document.dispatchEvent(new Event('visibilitychange'));
+    vi.advanceTimersByTime(50);
+
+    expect(view.fitInstance.fit).toHaveBeenCalledTimes(1);
+    expect(view.termInstance.scrollToBottom).toHaveBeenCalledTimes(1);
+    expect(view.sendSnapshotRequest).toHaveBeenCalledTimes(1);
+
+    // Unmount detaches blur, focus, and visibilitychange listeners cleanly.
+    view.fitInstance.fit.mockClear();
+    view.termInstance.scrollToBottom.mockClear();
+    view.sendSnapshotRequest.mockClear();
+    view.unmount();
+
+    window.dispatchEvent(new Event('blur'));
+    setVisibility('hidden');
+    vi.advanceTimersByTime(5_000);
+    setVisibility('visible');
+    window.dispatchEvent(new Event('focus'));
+    vi.advanceTimersByTime(50);
+
+    expect(view.fitInstance.fit).not.toHaveBeenCalled();
+    expect(view.termInstance.scrollToBottom).not.toHaveBeenCalled();
+    expect(view.sendSnapshotRequest).not.toHaveBeenCalled();
+  });
+});

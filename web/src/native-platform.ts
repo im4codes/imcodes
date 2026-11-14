@@ -33,6 +33,7 @@ export type NativePlatformEnvironment = {
 };
 
 export const NATIVE_HOST_EVENT = 'imcodes:native-host';
+export const IOS_MAC_DESKTOP_CLASS = 'native-mac-desktop';
 export const IOS_MAC_TEXT_SCALE_CLASS = 'native-ios-mac';
 export const IOS_MAC_TERMINAL_FONT_SIZE = 15;
 
@@ -118,5 +119,6 @@ export function applyNativePlatformClasses(
   const platform = getNativePlatform(env);
   if (platform) root.dataset.nativePlatform = platform;
   else delete root.dataset.nativePlatform;
+  root.classList.toggle(IOS_MAC_DESKTOP_CLASS, isNativeMacDesktop(env));
   root.classList.toggle(IOS_MAC_TEXT_SCALE_CLASS, shouldUseIosMacTextScale(env));
 }

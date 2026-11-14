@@ -10,6 +10,8 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
     private var didRegisterLocalPlugins = false
     private var didConfigureWebViewChrome = false
     private static let macDesignedForIpadPageZoom: CGFloat = 1.0 / 0.77
+    // #080d16 (--chrome-bg) — prevents light/black host flashes during macOS Space transitions.
+    private static let macHostBackgroundColor = UIColor(red: 8.0 / 255.0, green: 13.0 / 255.0, blue: 22.0 / 255.0, alpha: 1.0)
 
     override init() {
         super.init()
@@ -27,6 +29,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
 
         WatchBridge.shared.activate()
 
+        self.configureMacHostAppearance()
         self.registerLocalPluginsIfNeeded()
         ShareReceiverPlugin.shared.drainInboxFilesIfNeeded()
         if let launchURL = launchOptions?[.url] as? URL, launchURL.isFileURL {
@@ -35,6 +38,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
 
         // Register local Capacitor plugins after the bridge initializes
         DispatchQueue.main.async {
+            self.configureMacHostAppearance()
             self.registerLocalPluginsIfNeeded()
             ShareReceiverPlugin.shared.flushToWebView()
         }
@@ -98,6 +102,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
 
     func applicationWillEnterForeground(_ application: UIApplication) {
         // Called as part of the transition from the background to the active state; here you can undo many of the changes made on entering the background.
+        self.configureMacHostAppearance()
     }
 
     func applicationDidBecomeActive(_ application: UIApplication) {
@@ -110,10 +115,12 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
 
         WatchBridge.shared.activate()
 
+        self.configureMacHostAppearance()
         self.registerLocalPluginsIfNeeded()
         ShareReceiverPlugin.shared.drainInboxFilesIfNeeded()
 
         DispatchQueue.main.async {
+            self.configureMacHostAppearance()
             self.registerLocalPluginsIfNeeded()
             ShareReceiverPlugin.shared.flushToWebView()
         }
@@ -228,6 +235,23 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
         )
     }
 
+    private func configureMacHostAppearance(webView: WKWebView? = nil) {
+        guard #available(iOS 14.0, *), ProcessInfo.processInfo.isiOSAppOnMac else { return }
+        let bg = Self.macHostBackgroundColor
+        window?.backgroundColor = bg
+        if let rootVC = window?.rootViewController {
+            rootVC.view.backgroundColor = bg
+        }
+        let targetWebView = webView ?? (window?.rootViewController as? CAPBridgeViewController)?.bridge?.webView
+        if let targetWebView {
+            targetWebView.backgroundColor = bg
+            targetWebView.scrollView.backgroundColor = bg
+            if #available(iOS 15.0, *) {
+                targetWebView.underPageBackgroundColor = bg
+            }
+        }
+    }
+
     /// Removes the leading/trailing shortcuts-bar button groups -- the
     /// Previous/Next field-navigation chevrons and Done/checkmark button
     /// WebKit draws above the keyboard for any focused text field -- from
@@ -238,6 +262,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
     /// exact same bar shows up identically on a real iPhone/iPad, so it now
     /// always runs.
     private func configureInputChrome(_ webView: WKWebView?) {
+        self.configureMacHostAppearance(webView: webView)
         let hostFlags = Self.currentMacHostFlags()
         var pageZoomApplied = false
         if #available(iOS 14.0, *), hostFlags.needsDesignedForIpadPageZoom, let webView = webView {

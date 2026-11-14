@@ -479,7 +479,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
       // dimensions, so skip entirely until the element is laid out again.
       if (!el || el.clientWidth === 0 || el.clientHeight === 0) return false;
       if (!force) {
-        const proposed = fitAddon.proposeDimensions();
+        const proposed = fitAddon.proposeDimensions?.();
         if (!proposed || !Number.isFinite(proposed.cols) || !Number.isFinite(proposed.rows)) return false;
         if (proposed.cols === term.cols && proposed.rows === term.rows) return false;
       }
@@ -517,23 +517,88 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
     const doFitAndSnap = () => { scheduleFit(true); };
     onFitFn?.(doFitAndSnap);
 
-    // Re-fit when window regains focus or tab becomes visible.
-    const onWindowFocus = () => { doFitAndSnap(); };
-    let hiddenAt: number | null = null;
-    const onVisibilityChange = () => {
-      if (document.visibilityState === 'hidden') { hiddenAt = Date.now(); return; }
-      const hiddenFor = hiddenAt === null ? 0 : Date.now() - hiddenAt;
-      hiddenAt = null;
-      if (!activeRef.current || document.visibilityState !== 'visible') return;
-      doFitAndSnap();
-      // A hidden tab is throttled hard (timers, rendering, sometimes the socket
-      // itself). Whatever it missed or dropped there, the screen it comes back
-      // to must be verified against the pane rather than trusted. Governed by
-      // the socket client's per-session request spacing.
-      if (hiddenFor >= VISIBILITY_RESYNC_MIN_HIDDEN_MS) {
-        try { wsRef.current?.sendSnapshotRequest(sessionName); } catch { /* the next trigger recovers */ }
-      }
+    // Track window blur and tab visibility deactivation separately, because
+    // macOS Space / app switches can deliver blur->focus without hiding or
+    // interleave hidden/blur and focus/visible in either order.
+    let hiddenAt: number | null = document.visibilityState === 'hidden' ? Date.now() : null;
+    let blurredAt: number | null = null;
+    let forcedResumeThisCycle = false;
+
+    const onWindowBlur = () => {
+      if (blurredAt === null) blurredAt = Date.now();
+      forcedResumeThisCycle = false;
     };
+
+    const onWindowFocus = () => {
+      if (!activeRef.current) {
+        blurredAt = null;
+        return;
+      }
+      // If the document is still hidden, wait for visibilityState === 'visible'
+      // so we don't fit/scroll prematurely or clear hiddenAt before snapshot resync runs.
+      if (document.visibilityState === 'hidden') return;
+
+      const now = Date.now();
+      const blurredFor = blurredAt === null ? null : Math.max(0, now - blurredAt);
+      const hiddenFor = hiddenAt === null ? null : Math.max(0, now - hiddenAt);
+      blurredAt = null;
+
+      const inactiveFor = blurredFor === null && hiddenFor === null
+        ? null
+        : Math.max(blurredFor ?? 0, hiddenFor ?? 0);
+
+      if (inactiveFor !== null && inactiveFor >= VISIBILITY_RESYNC_MIN_HIDDEN_MS) {
+        if (!forcedResumeThisCycle) {
+          forcedResumeThisCycle = hiddenAt !== null;
+          doFitAndSnap();
+        }
+        return;
+      }
+
+      // Short deactivation (< 3000ms) or repeat focus: avoid forced reflow/scroll;
+      // scheduleFit(false) only fits when container dimensions or cols/rows changed.
+      scheduleFit(false);
+    };
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        if (hiddenAt === null) hiddenAt = Date.now();
+        forcedResumeThisCycle = false;
+        return;
+      }
+      if (document.visibilityState !== 'visible') return;
+
+      const now = Date.now();
+      const hiddenFor = hiddenAt === null ? null : Math.max(0, now - hiddenAt);
+      const blurredFor = blurredAt === null ? null : Math.max(0, now - blurredAt);
+      hiddenAt = null;
+      blurredAt = null;
+      const alreadyForced = forcedResumeThisCycle;
+      forcedResumeThisCycle = false;
+
+      if (!activeRef.current) return;
+
+      const inactiveFor = hiddenFor === null && blurredFor === null
+        ? null
+        : Math.max(hiddenFor ?? 0, blurredFor ?? 0);
+
+      if (inactiveFor !== null && inactiveFor >= VISIBILITY_RESYNC_MIN_HIDDEN_MS) {
+        if (!alreadyForced) doFitAndSnap();
+        // A hidden tab is throttled hard (timers, rendering, sometimes the socket
+        // itself). Whatever it missed or dropped there, the screen it comes back
+        // to must be verified against the pane rather than trusted. Governed by
+        // the socket client's per-session request spacing.
+        if (hiddenFor !== null && hiddenFor >= VISIBILITY_RESYNC_MIN_HIDDEN_MS) {
+          try { wsRef.current?.sendSnapshotRequest(sessionName); } catch { /* the next trigger recovers */ }
+        }
+        return;
+      }
+
+      // Short deactivation (< 3000ms) or duplicate resume: only fit if dims changed.
+      scheduleFit(false);
+    };
+
+    window.addEventListener('blur', onWindowBlur);
     window.addEventListener('focus', onWindowFocus);
     document.addEventListener('visibilitychange', onVisibilityChange);
 
@@ -564,6 +629,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
       cancelPendingFit();
       discardPendingRaw();
       containerRef.current?.removeEventListener('paste', handlePaste, { capture: true });
+      window.removeEventListener('blur', onWindowBlur);
       window.removeEventListener('focus', onWindowFocus);
       document.removeEventListener('visibilitychange', onVisibilityChange);
       observer.disconnect();

@@ -6,6 +6,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
+  IOS_MAC_DESKTOP_CLASS,
   IOS_MAC_TEXT_SCALE_CLASS,
   IOS_MAC_TERMINAL_FONT_SIZE,
   NATIVE_HOST_EVENT,
@@ -61,6 +62,7 @@ describe('native platform text scaling', () => {
   it('applies and removes the html marker class from the same contract', () => {
     const root = document.createElement('html');
     applyNativePlatformClasses(root, env());
+    expect(root.classList.contains(IOS_MAC_DESKTOP_CLASS)).toBe(true);
     expect(root.classList.contains(IOS_MAC_TEXT_SCALE_CLASS)).toBe(true);
     expect(root.dataset.nativePlatform).toBe('ios');
 
@@ -70,6 +72,7 @@ describe('native platform text scaling', () => {
         getPlatform: () => 'web',
       },
     }));
+    expect(root.classList.contains(IOS_MAC_DESKTOP_CLASS)).toBe(false);
     expect(root.classList.contains(IOS_MAC_TEXT_SCALE_CLASS)).toBe(false);
     expect(root.dataset.nativePlatform).toBeUndefined();
   });
@@ -176,6 +179,36 @@ describe('native platform text scaling', () => {
     });
     expect(shouldUseIosMacTextScale(explicitLegacy)).toBe(true);
     applyNativePlatformClasses(root, explicitLegacy);
+    expect(root.classList.contains(IOS_MAC_DESKTOP_CLASS)).toBe(true);
     expect(root.classList.contains(IOS_MAC_TEXT_SCALE_CLASS)).toBe(true);
+
+    // Real iPadOS / iOS must never receive native-mac-desktop or native-ios-mac.
+    const realIpad = env({
+      navigator: {
+        platform: 'iPad',
+        userAgent: 'Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X)',
+        maxTouchPoints: 5,
+      },
+      matchMedia: () => ({ matches: true }),
+    });
+    applyNativePlatformClasses(root, realIpad);
+    expect(root.classList.contains(IOS_MAC_DESKTOP_CLASS)).toBe(false);
+    expect(root.classList.contains(IOS_MAC_TEXT_SCALE_CLASS)).toBe(false);
+  });
+
+  it('sets #080d16 host, rootVC, webView, scrollView, and underPageBackgroundColor under isiOSAppOnMac', () => {
+    const dir = dirname(fileURLToPath(import.meta.url));
+    const appDelegate = readFileSync(resolve(dir, '../ios/App/App/AppDelegate.swift'), 'utf8');
+    expect(appDelegate).toContain('macHostBackgroundColor');
+    expect(appDelegate).toContain('8.0 / 255.0');
+    expect(appDelegate).toContain('13.0 / 255.0');
+    expect(appDelegate).toContain('22.0 / 255.0');
+    expect(appDelegate).toContain('configureMacHostAppearance');
+    expect(appDelegate).toContain('window?.backgroundColor = bg');
+    expect(appDelegate).toContain('rootVC.view.backgroundColor = bg');
+    expect(appDelegate).toContain('targetWebView.backgroundColor = bg');
+    expect(appDelegate).toContain('targetWebView.scrollView.backgroundColor = bg');
+    expect(appDelegate).toContain('targetWebView.underPageBackgroundColor = bg');
+    expect(appDelegate).toContain('applicationWillEnterForeground');
   });
 });

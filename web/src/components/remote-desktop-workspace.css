@@ -731,3 +731,10 @@
   }
 
 }
+
+/* Native macOS Designed-for-iPad / Mac desktop host: disable backdrop-filter compositor blur
+   to prevent costly WebKit re-rasterization hitches on macOS Space switches. */
+:is(html.native-ios-mac, html.native-mac-desktop) .remote-desktop-wall-context-menu {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}

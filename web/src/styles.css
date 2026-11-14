@@ -19692,3 +19692,120 @@ html.native-ios-mac .btn.desktop-cloud-docs-marquee-btn {
     animation: none;
   }
 }
+
+/* Native macOS Designed-for-iPad / Mac desktop host: align root chrome background with the
+   #080d16 native window/WKWebView backdrop and eliminate expensive backdrop-filter blur layers
+   that force WebKit compositor re-rasterization hitches on macOS Space switches.
+   Both html.native-ios-mac (legacy fallback) and html.native-mac-desktop (pageZoom / 1x host)
+   are targeted; real iPhone/iPad and desktop web browsers never receive either class. */
+:is(html.native-ios-mac, html.native-mac-desktop),
+:is(html.native-ios-mac, html.native-mac-desktop) body,
+:is(html.native-ios-mac, html.native-mac-desktop) #app {
+  background-color: var(--chrome-bg);
+}
+
+:is(html.native-ios-mac, html.native-mac-desktop) .queue-append-success-toast,
+:is(html.native-ios-mac, html.native-mac-desktop) .session-file-drop-overlay,
+:is(html.native-ios-mac, html.native-mac-desktop) .agent-todos,
+:is(html.native-ios-mac, html.native-mac-desktop) .openspec-auto-details-backdrop,
+:is(html.native-ios-mac, html.native-mac-desktop) .voice-overlay-backdrop,
+:is(html.native-ios-mac, html.native-mac-desktop) .voice-overlay-text,
+:is(html.native-ios-mac, html.native-mac-desktop) .voice-hold-hud-atmosphere,
+:is(html.native-ios-mac, html.native-mac-desktop) .chat-tool-peek,
+:is(html.native-ios-mac, html.native-mac-desktop) .chat-history-overlay,
+:is(html.native-ios-mac, html.native-mac-desktop) .daemon-details-backdrop,
+:is(html.native-ios-mac, html.native-mac-desktop) .session-settings-overlay,
+:is(html.native-ios-mac, html.native-mac-desktop) .session-settings-footer,
+:is(html.native-ios-mac, html.native-mac-desktop) .controlled-node-quick-menu,
+:is(html.native-ios-mac, html.native-mac-desktop) .fb-lightbox-nav,
+:is(html.native-ios-mac, html.native-mac-desktop) .fb-lightbox-actions,
+:is(html.native-ios-mac, html.native-mac-desktop) .html-fullscreen-preview-close,
+:is(html.native-ios-mac, html.native-mac-desktop) .html-fullscreen-preview-open-window,
+:is(html.native-ios-mac, html.native-mac-desktop) .external-link-overlay,
+:is(html.native-ios-mac, html.native-mac-desktop) .zoom-text-overlay,
+:is(html.native-ios-mac, html.native-mac-desktop) .peer-audit-overlay,
+:is(html.native-ios-mac, html.native-mac-desktop) .cron-manager--history .cron-manager-toolbar,
+:is(html.native-ios-mac, html.native-mac-desktop) .remote-desktop-media-recovery,
+:is(html.native-ios-mac, html.native-mac-desktop) .remote-desktop-touch-hint,
+:is(html.native-ios-mac, html.native-mac-desktop) .download-transfer-center,
+:is(html.native-ios-mac, html.native-mac-desktop) .capability-global-operation .capability-operation-card,
+:is(html.native-ios-mac, html.native-mac-desktop) .task-pair-card-hover-preview,
+:is(html.native-ios-mac, html.native-mac-desktop) .cloud-docs-modal-backdrop,
+:is(html.native-ios-mac, html.native-mac-desktop) .server-switch-watermark-card {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+:is(html.native-ios-mac, html.native-mac-desktop) .shared-context-shell-tech * {
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+}
+
+/* Preserve contrast and readability for translucent modals, floating controls, and tooltops
+   when compositor blur is disabled. */
+:is(html.native-ios-mac, html.native-mac-desktop) .openspec-auto-details-backdrop,
+:is(html.native-ios-mac, html.native-mac-desktop) .peer-audit-overlay,
+:is(html.native-ios-mac, html.native-mac-desktop) .cloud-docs-modal-backdrop {
+  background: rgba(2, 6, 23, 0.88);
+}
+
+:is(html.native-ios-mac, html.native-mac-desktop) .voice-overlay-backdrop,
+:is(html.native-ios-mac, html.native-mac-desktop) .zoom-text-overlay {
+  background: rgba(2, 6, 23, 0.90);
+}
+
+:is(html.native-ios-mac, html.native-mac-desktop) .daemon-details-backdrop {
+  background:
+    radial-gradient(circle at 50% 76%, rgba(8, 145, 178, 0.16), transparent 44%),
+    rgba(2, 6, 23, 0.88);
+}
+
+:is(html.native-ios-mac, html.native-mac-desktop) .session-settings-overlay {
+  background:
+    radial-gradient(circle at 14% 8%, rgba(34, 211, 238, 0.14), transparent 34%),
+    radial-gradient(circle at 88% 92%, rgba(99, 102, 241, 0.14), transparent 38%),
+    rgba(2, 6, 23, 0.92);
+}
+
+:is(html.native-ios-mac, html.native-mac-desktop) .session-settings-footer {
+  background: linear-gradient(180deg, rgba(7, 16, 29, 0.95), rgba(6, 13, 25, 0.99));
+}
+
+:is(html.native-ios-mac, html.native-mac-desktop) .external-link-overlay {
+  background:
+    radial-gradient(circle at 50% 0%, rgba(59, 130, 246, 0.18), transparent 34%),
+    rgba(2, 6, 23, 0.88);
+}
+
+:is(html.native-ios-mac, html.native-mac-desktop) .chat-tool-peek {
+  background:
+    linear-gradient(180deg, rgba(8, 47, 73, 0.96), rgba(2, 6, 23, 0.98)),
+    repeating-linear-gradient(0deg, rgba(103, 232, 249, 0.05) 0 1px, transparent 1px 3px);
+}
+
+:is(html.native-ios-mac, html.native-mac-desktop) .chat-history-overlay,
+:is(html.native-ios-mac, html.native-mac-desktop) .fb-lightbox-actions {
+  background: rgba(15, 23, 42, 0.92);
+}
+
+:is(html.native-ios-mac, html.native-mac-desktop) .fb-lightbox-nav,
+:is(html.native-ios-mac, html.native-mac-desktop) .html-fullscreen-preview-close,
+:is(html.native-ios-mac, html.native-mac-desktop) .html-fullscreen-preview-open-window {
+  background: rgba(15, 23, 42, 0.82);
+}
+
+:is(html.native-ios-mac, html.native-mac-desktop) .cron-manager--history .cron-manager-toolbar {
+  background: linear-gradient(180deg, rgba(2, 6, 23, 0.99) 72%, rgba(2, 6, 23, 0.94));
+}
+
+:is(html.native-ios-mac, html.native-mac-desktop) .remote-desktop-media-recovery {
+  background: rgb(4 19 30 / 92%);
+}
+
+:is(html.native-ios-mac, html.native-mac-desktop) .remote-desktop-touch-hint {
+  background: rgb(5 20 34 / 86%);
+}
+
+:is(html.native-ios-mac, html.native-mac-desktop) .server-switch-watermark-card {
+  background: rgba(13, 20, 34, 0.94);
+}

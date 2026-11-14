@@ -1603,4 +1603,48 @@ describe('styles.css regression contracts', () => {
     const bubbleTimeRule = cssWithoutComments.match(/\n\.chat-bubble-time\s*\{[^}]*\}/)?.[0] ?? '';
     expect(bubbleTimeRule).toMatch(/font-size:\s*10px/);
   });
+
+  it('disables compositor backdrop-filter blur under Mac iOS-on-Mac / desktop classes across all blurred selectors without affecting normal browsers or mobile', () => {
+    const blurRuleRe = /([^{}]+)\{([^{}]*backdrop-filter:\s*blur\([^{}]*)\}/g;
+    const blurredSelectors: string[] = [];
+    for (const match of cssWithoutComments.matchAll(blurRuleRe)) {
+      for (const sel of match[1].split(',')) {
+        const trimmed = sel.trim().replace(/\s+/g, ' ');
+        if (trimmed) blurredSelectors.push(trimmed);
+      }
+    }
+    expect(blurredSelectors.length).toBeGreaterThanOrEqual(27);
+
+    const disableBlockMatch = cssWithoutComments.match(
+      /(:is\(html\.native-ios-mac,\s*html\.native-mac-desktop\)[^\{]+)\{([^}]*backdrop-filter:\s*none[^}]*)\}/,
+    );
+    expect(disableBlockMatch, 'native-ios-mac / native-mac-desktop backdrop-filter: none block missing').toBeTruthy();
+    expect(disableBlockMatch![2]).toMatch(/-webkit-backdrop-filter:\s*none/);
+    expect(disableBlockMatch![2]).toMatch(/backdrop-filter:\s*none/);
+
+    const overriddenSelectors = new Set(
+      disableBlockMatch![1]
+        .split(/,(?![^()]*\))/)
+        .map((s) => s.trim().replace(/^:is\(html\.native-ios-mac,\s*html\.native-mac-desktop\)\s+/, '').replace(/\s+/g, ' ')),
+    );
+    for (const selector of blurredSelectors) {
+      expect(overriddenSelectors.has(selector), `Missing backdrop-filter: none override for ${selector}`).toBe(true);
+    }
+
+    // SharedContextManagementPanel uses inline backdropFilter styles inside .shared-context-shell-tech.
+    expect(cssWithoutComments).toMatch(
+      /:is\(html\.native-ios-mac,\s*html\.native-mac-desktop\)\s+\.shared-context-shell-tech\s+\*\s*\{[^}]*backdrop-filter:\s*none\s*!important/,
+    );
+
+    // remote-desktop-workspace.css context menu must also disable backdrop-filter under Mac host classes.
+    const rdCss = readFileSync(resolve(process.cwd(), 'src/components/remote-desktop-workspace.css'), 'utf8');
+    expect(rdCss).toMatch(
+      /:is\(html\.native-ios-mac,\s*html\.native-mac-desktop\)\s+\.remote-desktop-wall-context-menu\s*\{[^}]*backdrop-filter:\s*none/,
+    );
+
+    // Root background aligns with #080d16 under native-ios-mac / native-mac-desktop only.
+    expect(cssWithoutComments).toMatch(
+      /:is\(html\.native-ios-mac,\s*html\.native-mac-desktop\),\s*:is\(html\.native-ios-mac,\s*html\.native-mac-desktop\)\s+body,\s*:is\(html\.native-ios-mac,\s*html\.native-mac-desktop\)\s+#app\s*\{[^}]*background-color:\s*var\(--chrome-bg\)/,
+    );
+  });
 });
