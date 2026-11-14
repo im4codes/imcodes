@@ -1516,7 +1516,10 @@
     "errorNotHttps": "URL сервера должен использовать HTTPS",
     "changeServer": "Сменить сервер",
     "addServer": "+ Добавить сервер",
-    "httpWarning": "Внимание: HTTP-соединения небезопасны. Используйте HTTPS для серверов, отличных от localhost."
+    "httpWarning": "Внимание: HTTP-соединения небезопасны. Используйте HTTPS для серверов, отличных от localhost.",
+    "paste": "Вставить",
+    "pasteEmpty": "Буфер обмена пуст",
+    "pasteUnavailable": "Не удалось прочитать буфер обмена — вставьте адрес в поле вручную"
   },
   "passkey": {
     "title": "Passkey",

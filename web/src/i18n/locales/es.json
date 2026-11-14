@@ -1516,7 +1516,10 @@
     "errorNotHttps": "La URL del servidor debe usar HTTPS",
     "changeServer": "Cambiar servidor",
     "addServer": "+ Agregar servidor",
-    "httpWarning": "Advertencia: las conexiones HTTP no son seguras. Usa HTTPS para servidores que no sean localhost."
+    "httpWarning": "Advertencia: las conexiones HTTP no son seguras. Usa HTTPS para servidores que no sean localhost.",
+    "paste": "Pegar",
+    "pasteEmpty": "El portapapeles está vacío",
+    "pasteUnavailable": "No se pudo leer el portapapeles; pega directamente en el campo"
   },
   "passkey": {
     "title": "Passkeys",

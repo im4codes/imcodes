@@ -2,8 +2,15 @@ package com.im.codes;
 
 import android.content.Intent;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.util.Log;
+import android.view.View;
+import android.view.ViewGroup;
+
+import androidx.core.graphics.Insets;
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowInsetsCompat;
 
 import com.getcapacitor.BridgeActivity;
 import com.getcapacitor.Plugin;
@@ -16,6 +23,7 @@ public class MainActivity extends BridgeActivity {
         // Register custom plugins before super.onCreate (which initializes the bridge)
         registerPlugin(AuthSessionPlugin.class);
         registerPlugin(ShareReceiverPlugin.class);
+        registerPlugin(NativeClipboardPlugin.class);
         // JPushPlugin only exists in the `china` flavor source set. Load it via
         // reflection so the `global` flavor compiles and runs without any JPush
         // class dependency. (BuildConfig.HAS_JPUSH is set per-flavor in app/build.gradle.)
@@ -32,6 +40,28 @@ public class MainActivity extends BridgeActivity {
             }
         }
         super.onCreate(savedInstanceState);
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.VANILLA_ICE_CREAM
+                && getBridge() != null && getBridge().getWebView() != null) {
+            View webViewParent = (View) getBridge().getWebView().getParent();
+            if (webViewParent != null) {
+                ViewCompat.setOnApplyWindowInsetsListener(webViewParent, (v, insets) -> {
+                    int bottom = 0;
+                    if (insets.isVisible(WindowInsetsCompat.Type.ime())) {
+                        Insets imeInsets = insets.getInsets(WindowInsetsCompat.Type.ime());
+                        bottom = Math.max(0, imeInsets.bottom);
+                    }
+                    ViewGroup.LayoutParams rawLp = v.getLayoutParams();
+                    if (rawLp instanceof ViewGroup.MarginLayoutParams) {
+                        ViewGroup.MarginLayoutParams lp = (ViewGroup.MarginLayoutParams) rawLp;
+                        if (lp.bottomMargin != bottom) {
+                            lp.bottomMargin = bottom;
+                            v.setLayoutParams(lp);
+                        }
+                    }
+                    return ViewCompat.onApplyWindowInsets(v, insets);
+                });
+            }
+        }
         ShareReceiverPlugin.handleShareIntent(this, getIntent());
     }
 

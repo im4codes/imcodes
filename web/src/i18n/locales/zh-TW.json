@@ -1516,7 +1516,10 @@
     "errorNotHttps": "伺服器地址必須使用 HTTPS",
     "changeServer": "更換伺服器",
     "addServer": "+ 新增伺服器",
-    "httpWarning": "警告：HTTP 連線不安全。非本地伺服器請使用 HTTPS。"
+    "httpWarning": "警告：HTTP 連線不安全。非本地伺服器請使用 HTTPS。",
+    "paste": "貼上",
+    "pasteEmpty": "剪貼簿為空",
+    "pasteUnavailable": "無法讀取剪貼簿，請長按輸入框貼上"
   },
   "passkey": {
     "title": "Passkey 管理",

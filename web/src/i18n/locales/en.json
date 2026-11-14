@@ -1516,7 +1516,10 @@
     "errorNotHttps": "Server URL must use HTTPS",
     "changeServer": "Change Server",
     "addServer": "+ Add Server",
-    "httpWarning": "Warning: HTTP connections are not secure. Use HTTPS for non-localhost servers."
+    "httpWarning": "Warning: HTTP connections are not secure. Use HTTPS for non-localhost servers.",
+    "paste": "Paste",
+    "pasteEmpty": "Clipboard is empty",
+    "pasteUnavailable": "Cannot read clipboard — paste directly into the box"
   },
   "passkey": {
     "title": "Passkeys",

@@ -1516,7 +1516,10 @@
     "errorNotHttps": "서버 URL은 HTTPS를 사용해야 합니다",
     "changeServer": "서버 변경",
     "addServer": "+ 서버 추가",
-    "httpWarning": "경고: HTTP 연결은 안전하지 않습니다. localhost가 아닌 서버에는 HTTPS를 사용하세요."
+    "httpWarning": "경고: HTTP 연결은 안전하지 않습니다. localhost가 아닌 서버에는 HTTPS를 사용하세요.",
+    "paste": "붙여넣기",
+    "pasteEmpty": "클립보드가 비어 있습니다",
+    "pasteUnavailable": "클립보드를 읽을 수 없습니다. 입력창에 직접 붙여넣으세요"
   },
   "passkey": {
     "title": "패스키 관리",

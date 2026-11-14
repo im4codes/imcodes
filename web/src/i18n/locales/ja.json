@@ -1516,7 +1516,10 @@
     "errorNotHttps": "サーバーURLはHTTPSを使用する必要があります",
     "changeServer": "サーバーを変更",
     "addServer": "+ サーバーを追加",
-    "httpWarning": "警告：HTTP接続は安全ではありません。localhost以外のサーバーにはHTTPSを使用してください。"
+    "httpWarning": "警告：HTTP接続は安全ではありません。localhost以外のサーバーにはHTTPSを使用してください。",
+    "paste": "貼り付け",
+    "pasteEmpty": "クリップボードが空です",
+    "pasteUnavailable": "クリップボードを読み取れません。入力欄に直接貼り付けてください"
   },
   "passkey": {
     "title": "パスキー管理",

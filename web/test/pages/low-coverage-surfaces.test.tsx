@@ -223,6 +223,47 @@ describe('low-coverage page and component surfaces', () => {
     await waitFor(() => expect(nativeApi.removeServerFromList).toHaveBeenCalledWith('https://self-hosted.example'));
   });
 
+  it('ServerSetupPage renders tech card layout, keeps add panel visible, and handles one-tap clipboard paste', async () => {
+    const readTextMock = vi.fn().mockResolvedValue('  https://pasted.example/  ');
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { readText: readTextMock },
+    });
+    const scrollIntoViewMock = vi.fn();
+    Element.prototype.scrollIntoView = scrollIntoViewMock;
+
+    const onConnect = vi.fn();
+    const { container } = render(<ServerSetupPage onConnect={onConnect} />);
+
+    expect(await screen.findByText('https://cloud.im.codes')).toBeTruthy();
+    const card = container.querySelector('.login-card.server-setup-card') as HTMLElement;
+    expect(card).toBeTruthy();
+    expect(card.getAttribute('style')).toBeNull();
+
+    fireEvent.click(screen.getByText('serverSetup.addServer'));
+    expect(scrollIntoViewMock).toHaveBeenCalledWith({ block: 'nearest' });
+
+    // Invalid URL error clears when one-tap paste fills trimmed clipboard URL
+    const input = screen.getByPlaceholderText('serverSetup.placeholder') as HTMLInputElement;
+    fireEvent.input(input, { target: { value: 'not-a-url' } });
+    fireEvent.click(screen.getByText('serverSetup.connect'));
+    expect(screen.getByText('serverSetup.errorNotHttps')).toBeTruthy();
+
+    fireEvent.click(screen.getByText('serverSetup.paste'));
+    await waitFor(() => expect(input.value).toBe('https://pasted.example/'));
+    expect(screen.queryByText('serverSetup.errorNotHttps')).toBeNull();
+
+    // Empty clipboard shows non-blocking hint
+    readTextMock.mockResolvedValueOnce('   ');
+    fireEvent.click(screen.getByText('serverSetup.paste'));
+    expect(await screen.findByText('serverSetup.pasteEmpty')).toBeTruthy();
+
+    // Denied / unavailable clipboard shows fallback hint
+    readTextMock.mockRejectedValueOnce(new Error('denied'));
+    fireEvent.click(screen.getByText('serverSetup.paste'));
+    expect(await screen.findByText('serverSetup.pasteUnavailable')).toBeTruthy();
+  });
+
   it('AutoFixControls starts task mode and stops a running pipeline', async () => {
     const onStarted = vi.fn();
     const { rerender } = render(
