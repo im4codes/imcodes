@@ -42,17 +42,18 @@ describe('verification-machines API client pagination', () => {
   });
 
   it('aggregates all management pages via nextCursor across >100 multi-project profiles and deduplicates/guards cursor loops', async () => {
-    const page1Items = Array.from({ length: 100 }, (_, i) => makeProfile(i + 1, i < 51 ? 'repo-a' : 'repo-b'));
-    const page2Items = [makeProfile(101, 'repo-b')];
+    const page1Items = Array.from({ length: 100 }, (_, i) => makeProfile(i + 1, i < 51 ? 'repo-a' : '😀'.repeat(512)));
+    const page2Items = [makeProfile(101, '😀'.repeat(512))];
+    const longCursor = 'A'.repeat(2840);
     apiFetchMock
-      .mockResolvedValueOnce({ profiles: page1Items, nextCursor: 'cursor-1' })
+      .mockResolvedValueOnce({ profiles: page1Items, nextCursor: longCursor })
       .mockResolvedValueOnce({ profiles: page2Items });
 
     const all = await listVerificationMachines(undefined, { includeAllProjects: true });
     expect(all).toHaveLength(101);
     expect(all[100]!.id).toBe(page2Items[0]!.id);
     expect(apiFetchMock).toHaveBeenNthCalledWith(1, `${VERIFICATION_MACHINE_API_PATH}?includeAllProjects=1`);
-    expect(apiFetchMock).toHaveBeenNthCalledWith(2, `${VERIFICATION_MACHINE_API_PATH}?includeAllProjects=1&cursor=cursor-1`);
+    expect(apiFetchMock).toHaveBeenNthCalledWith(2, `${VERIFICATION_MACHINE_API_PATH}?includeAllProjects=1&cursor=${longCursor}`);
   });
 
   it('listVerificationMachinesPage preserves optional nextCursor and rejects infinite cursor loops safely', async () => {

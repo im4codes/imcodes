@@ -42,22 +42,32 @@ function normalizedScopeKey(scope: VerificationMachineScope, value: unknown): st
   return scope === VERIFICATION_MACHINE_SCOPES.USER ? '' : String(value).trim();
 }
 
+// Worst-case unpadded base64url cursor size for legal values:
+// 77-byte JSON envelope + 4 UTF-8 bytes per code point for scopeKey (512) and alias (80).
+const CURSOR_JSON_OVERHEAD_BYTES = 80;
+const MAX_CURSOR_JSON_BYTES = CURSOR_JSON_OVERHEAD_BYTES
+  + VERIFICATION_MACHINE_LIMITS.SCOPE_KEY_MAX_CHARS * 4
+  + VERIFICATION_MACHINE_LIMITS.ALIAS_MAX_CHARS * 4;
+const MAX_CURSOR_ENCODED_CHARS = Math.ceil((MAX_CURSOR_JSON_BYTES * 4) / 3);
+
 function encodeCursor(cursor: VerificationMachineCursor): string {
   return Buffer.from(JSON.stringify(cursor), 'utf8').toString('base64url');
 }
 
 function decodeCursor(raw: string): VerificationMachineCursor | null {
-  if (!raw || raw.length > 2048) return null;
+  if (!raw || raw.length > MAX_CURSOR_ENCODED_CHARS || !/^[A-Za-z0-9_-]+$/u.test(raw)) return null;
   try {
     const parsed = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8')) as Record<string, unknown>;
     if (!parsed || typeof parsed !== 'object') return null;
     if (typeof parsed.bucket !== 'number' || !Number.isInteger(parsed.bucket) || parsed.bucket < 0 || parsed.bucket > 2) {
       return null;
     }
-    if (typeof parsed.scopeKey !== 'string' || parsed.scopeKey.length > VERIFICATION_MACHINE_LIMITS.SCOPE_KEY_MAX_CHARS * 2) {
+    if (typeof parsed.scopeKey !== 'string'
+      || Array.from(parsed.scopeKey).length > VERIFICATION_MACHINE_LIMITS.SCOPE_KEY_MAX_CHARS) {
       return null;
     }
-    if (typeof parsed.alias !== 'string' || parsed.alias.length > VERIFICATION_MACHINE_LIMITS.ALIAS_MAX_CHARS * 4) {
+    if (typeof parsed.alias !== 'string'
+      || Array.from(parsed.alias).length > VERIFICATION_MACHINE_LIMITS.ALIAS_MAX_CHARS) {
       return null;
     }
     if (!isVerificationMachineId(parsed.id)) return null;

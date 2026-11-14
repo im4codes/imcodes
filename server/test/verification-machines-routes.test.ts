@@ -263,8 +263,20 @@ describe('/api/verification-machines', () => {
     expect(delRes.status).toBe(200);
     expect(await delRes.json()).toEqual({ deleted: true });
 
-    // Rejects malformed cursor or out-of-range limit with 400.
-    expect((await app.request('/api/verification-machines?includeAllProjects=1&cursor=not-valid', {
+    // Rejects malformed, oversized, or out-of-range cursor / limit with 400.
+    expect((await app.request('/api/verification-machines?includeAllProjects=1&cursor=not-valid!', {
+      headers: { Authorization: bearer() },
+    })).status).toBe(400);
+    expect((await app.request(`/api/verification-machines?includeAllProjects=1&cursor=${'A'.repeat(4000)}`, {
+      headers: { Authorization: bearer() },
+    })).status).toBe(400);
+    const oversizedFieldCursor = Buffer.from(JSON.stringify({
+      bucket: 1,
+      scopeKey: 'x'.repeat(513),
+      alias: 'a',
+      id: 'a'.repeat(32),
+    }), 'utf8').toString('base64url');
+    expect((await app.request(`/api/verification-machines?includeAllProjects=1&cursor=${oversizedFieldCursor}`, {
       headers: { Authorization: bearer() },
     })).status).toBe(400);
     expect((await app.request('/api/verification-machines?includeAllProjects=1&limit=101', {
@@ -273,6 +285,81 @@ describe('/api/verification-machines', () => {
     expect((await app.request('/api/verification-machines?includeAllProjects=1&limit=0', {
       headers: { Authorization: bearer() },
     })).status).toBe(400);
+  });
+
+  it('round-trips maximum legal ASCII, CJK, and astral Unicode scopeKey and alias cursors across small and default 100-item pages', async () => {
+    const cases = [
+      { scopeKey: 'A'.repeat(512), alias: 'N'.repeat(80), nodeId: '1000000001' },
+      { scopeKey: '项'.repeat(512), alias: '机'.repeat(80), nodeId: '1000000002' },
+      { scopeKey: '😀'.repeat(512), alias: '🚀'.repeat(80), nodeId: '1000000003' },
+    ];
+    for (const c of cases) {
+      for (const suffix of ['1', '2']) {
+        const res = await app.request('/api/verification-machines', { method: 'PUT', headers: {
+          Authorization: bearer(), 'Content-Type': 'application/json',
+        }, body: JSON.stringify({
+          scope: 'project',
+          scopeKey: c.scopeKey,
+          alias: `${c.alias.slice(0, -1)}${suffix}`,
+          kind: 'ssh',
+          target: ALIAS_ID,
+        }) });
+        expect(res.status).toBe(200);
+      }
+    }
+
+    // Small-page traversal (limit=1) visits all 6 entries with zero skips/duplicates despite >2840-char cursors.
+    const visitedIds: string[] = [];
+    let cursor: string | undefined;
+    let sawLongCursor = false;
+    while (true) {
+      const url = `/api/verification-machines?includeAllProjects=1&limit=1${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`;
+      const res = await app.request(url, { headers: { Authorization: bearer() } });
+      expect(res.status).toBe(200);
+      const body = await res.json() as { profiles: Row[]; nextCursor?: string };
+      expect(body.profiles).toHaveLength(1);
+      visitedIds.push(body.profiles[0]!.id);
+      if (body.nextCursor && body.nextCursor.length > 2048) sawLongCursor = true;
+      if (!body.nextCursor) break;
+      cursor = body.nextCursor;
+    }
+    expect(sawLongCursor).toBe(true);
+    expect(visitedIds).toHaveLength(6);
+    expect(new Set(visitedIds).size).toBe(6);
+
+    // Fill up to 101 total items using default page size (100) ending on an astral 512/80 boundary item.
+    for (let i = 0; i < 95; i += 1) {
+      const res = await app.request('/api/verification-machines', { method: 'PUT', headers: {
+        Authorization: bearer(), 'Content-Type': 'application/json',
+      }, body: JSON.stringify({
+        scope: 'project',
+        scopeKey: '😀'.repeat(512),
+        alias: `${'🚀'.repeat(76)}${String(i).padStart(4, '0')}`,
+        kind: 'ssh',
+        target: ALIAS_ID,
+      }) });
+      expect(res.status).toBe(200);
+    }
+
+    const defaultPage1Res = await app.request('/api/verification-machines?includeAllProjects=1', {
+      headers: { Authorization: bearer() },
+    });
+    expect(defaultPage1Res.status).toBe(200);
+    const defaultPage1 = await defaultPage1Res.json() as { profiles: Row[]; nextCursor?: string };
+    expect(defaultPage1.profiles).toHaveLength(100);
+    expect(defaultPage1.nextCursor).toBeTruthy();
+    expect(defaultPage1.nextCursor!.length).toBeGreaterThan(2048);
+
+    const defaultPage2Res = await app.request(
+      `/api/verification-machines?includeAllProjects=1&cursor=${encodeURIComponent(defaultPage1.nextCursor!)}`,
+      { headers: { Authorization: bearer() } },
+    );
+    expect(defaultPage2Res.status).toBe(200);
+    const defaultPage2 = await defaultPage2Res.json() as { profiles: Row[]; nextCursor?: string };
+    expect(defaultPage2.profiles).toHaveLength(1);
+    expect(defaultPage2.nextCursor).toBeUndefined();
+    const combinedIds = [...defaultPage1.profiles, ...defaultPage2.profiles].map((p) => p.id);
+    expect(new Set(combinedIds).size).toBe(101);
   });
 
   it('isolates users and rejects unsafe SSH option injection', async () => {
