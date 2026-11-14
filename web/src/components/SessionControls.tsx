@@ -5474,10 +5474,19 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           started = await work;
         }
 
-        if (timedOut || tx.settled || outcome === 'failed' || tx.phase === 'failed' || !started || tx.error !== null || !mountedRef.current) {
+        if (
+          timedOut
+          || tx.settled
+          || outcome === 'failed'
+          || tx.phase === 'failed'
+          || !started
+          || (!tx.didStartRecording && !tx.transcript.trim())
+          || tx.error !== null
+          || !mountedRef.current
+        ) {
           if (
             !didPreRecordingFallback
-            && (!started || tx.error !== null || timedOut)
+            && (!started || !tx.didStartRecording || tx.error !== null || timedOut)
             && !tx.didStartRecording
             && mountedRef.current
           ) {
@@ -5653,7 +5662,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           pulseVoiceHoldRecognizing(900);
         }
       },
-      undefined,
+      (listening) => {
+        if (!listening) return;
+        if (voiceHoldTxRef.current !== tx || tx.settled || tx.error !== null) return;
+        if (tx.phase !== 'starting' && tx.phase !== 'recording') return;
+        tx.didStartRecording = true;
+        tx.phase = 'recording';
+      },
       (err) => {
         failTransaction(err || 'permission_denied');
       },
@@ -5666,8 +5681,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           }
           return false;
         }
-        tx.didStartRecording = true;
-        if (tx.phase === 'starting') {
+        if (tx.didStartRecording && tx.phase === 'starting') {
           tx.phase = 'recording';
         }
         return true;

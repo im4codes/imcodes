@@ -1528,9 +1528,11 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
         (window as any).__voiceCalls = { start: 0, stop: 0, nextStartResult: true };
         (window as any).__voiceMock = {
           prewarm: async () => {},
-          startListening: async () => {
+          startListening: async (_onResult: unknown, onListeningChange?: (listening: boolean) => void) => {
             (window as any).__voiceCalls.start += 1;
-            return (window as any).__voiceCalls.nextStartResult;
+            const ok = !!(window as any).__voiceCalls.nextStartResult;
+            if (ok) onListeningChange?.(true);
+            return ok;
           },
           stopListening: async () => {
             (window as any).__voiceCalls.stop += 1;
@@ -2291,6 +2293,120 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       expect(input.getAttribute('contenteditable')).toBe('true');
       expect(document.activeElement).toBe(input);
       await resetToUnfocused();
+    }
+  });
+
+  it('fixes Round 2 F1-R2 with real VoiceInput: async Web Speech not-allowed after synchronous rec.start() restores focus, while actual audiostart + cancel keeps keyboard closed and fences stale sessions', async () => {
+    const realVoice = await vi.importActual<typeof import('../../src/components/VoiceInput.js')>('../../src/components/VoiceInput.js');
+    const instances: Array<{
+      onstart?: () => void;
+      onaudiostart?: () => void;
+      onresult?: (e: any) => void;
+      onerror?: (e: any) => void;
+      onend?: () => void;
+      start: () => void;
+      stop: () => void;
+      abort: () => void;
+    }> = [];
+    class FakeSpeechRecognition {
+      onstart?: () => void;
+      onaudiostart?: () => void;
+      onresult?: (e: any) => void;
+      onerror?: (e: any) => void;
+      onend?: () => void;
+      start = vi.fn();
+      stop = vi.fn();
+      abort = vi.fn();
+      constructor() {
+        instances.push(this);
+      }
+    }
+
+    const origIsAvailable = voiceMock.isAvailable.getMockImplementation();
+    const origPrewarm = voiceMock.prewarm.getMockImplementation();
+    const origStart = voiceMock.startListening.getMockImplementation();
+    const origStop = voiceMock.stopListening.getMockImplementation();
+    const origLevel = voiceMock.onAudioLevel.getMockImplementation();
+
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => false });
+    vi.stubGlobal('SpeechRecognition', FakeSpeechRecognition);
+    voiceMock.isAvailable.mockImplementation((...a: Parameters<typeof realVoice.isAvailable>) => realVoice.isAvailable(...a));
+    voiceMock.prewarm.mockImplementation((...a: Parameters<typeof realVoice.prewarm>) => realVoice.prewarm(...a));
+    voiceMock.startListening.mockImplementation((...a: Parameters<typeof realVoice.startListening>) => realVoice.startListening(...a));
+    voiceMock.stopListening.mockImplementation((...a: Parameters<typeof realVoice.stopListening>) => realVoice.stopListening(...a));
+    voiceMock.onAudioLevel.mockImplementation((...a: Parameters<typeof realVoice.onAudioLevel>) => realVoice.onAudioLevel(...a));
+
+    try {
+      const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+      render(
+        <SessionControls
+          ws={ws}
+          activeSession={makeSession()}
+          quickData={makeQuickData()}
+          sessions={[]}
+          subSessions={[]}
+          serverId="srv-1"
+        />,
+      );
+
+      const input = document.querySelector('.controls-input') as HTMLElement;
+      const resetToUnfocused = async () => {
+        input.blur();
+        fireEvent.blur(input);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(input.getAttribute('contenteditable')).toBe('false');
+      };
+
+      // 1. Auditor exact counterexample: 175ms -> rec.start() returns without onstart/onaudiostart -> 176ms async not-allowed -> pointerup -> error banner, no send, CE=true & focused!
+      dispatchPointer(input, 'pointerdown', 180, 500, 1);
+      await vi.advanceTimersByTimeAsync(175);
+      expect(instances).toHaveLength(1);
+      expect(instances[0].start).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      instances[0].onerror?.({ error: 'not-allowed' });
+      await vi.advanceTimersByTimeAsync(0);
+      dispatchPointer(input, 'pointerup', 180, 500, 1);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(document.querySelector('.voice-hold-error-banner')).not.toBeNull();
+      expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+      expect(input.getAttribute('contenteditable')).toBe('true');
+      expect(document.activeElement).toBe(input);
+      await resetToUnfocused();
+
+      // 2. Stale old rec1.onstart/onaudiostart firing after new session starts MUST NOT taint rec2 -> async not-allowed on rec2 STILL focuses!
+      dispatchPointer(input, 'pointerdown', 180, 500, 2);
+      await vi.advanceTimersByTimeAsync(175);
+      expect(instances).toHaveLength(2);
+      instances[0].onstart?.();
+      instances[0].onaudiostart?.();
+      instances[1].onerror?.({ error: 'service-not-allowed' });
+      await vi.advanceTimersByTimeAsync(0);
+      dispatchPointer(input, 'pointerup', 180, 500, 2);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(input.getAttribute('contenteditable')).toBe('true');
+      expect(document.activeElement).toBe(input);
+      await resetToUnfocused();
+
+      // 3. Positive control: actual rec.onaudiostart fires -> genuine capture -> slide left into cancel & release keeps keyboard closed (CE=false, unfocused)
+      dispatchPointer(input, 'pointerdown', 180, 500, 3);
+      await vi.advanceTimersByTimeAsync(175);
+      expect(instances).toHaveLength(3);
+      instances[2].onaudiostart?.();
+      dispatchPointer(input, 'pointermove', 90, 500, 3);
+      dispatchPointer(input, 'pointerup', 90, 500, 3);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(instances[2].abort).toHaveBeenCalled();
+      expect(input.getAttribute('contenteditable')).toBe('false');
+      expect(document.activeElement).not.toBe(input);
+      expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+    } finally {
+      await realVoice.stopListening({ abort: true });
+      vi.unstubAllGlobals();
+      if (origIsAvailable) voiceMock.isAvailable.mockImplementation(origIsAvailable);
+      if (origPrewarm) voiceMock.prewarm.mockImplementation(origPrewarm);
+      if (origStart) voiceMock.startListening.mockImplementation(origStart);
+      if (origStop) voiceMock.stopListening.mockImplementation(origStop);
+      if (origLevel) voiceMock.onAudioLevel.mockImplementation(origLevel);
     }
   });
 });

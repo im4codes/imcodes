@@ -894,11 +894,16 @@ describe('mobile capture defenses', () => {
 
 
 describe('Web Mobile final drain', () => {
-  function browser() {
+  function browser(opts: { autoStart?: boolean } = {}) {
+    const autoStart = opts.autoStart ?? true;
     const instances: any[] = [];
     class Recognizer {
-      onresult: any; onend: any; onerror: any;
-      start = vi.fn(); stop = vi.fn(); abort = vi.fn();
+      onstart: any; onaudiostart: any; onresult: any; onend: any; onerror: any;
+      start = vi.fn(() => {
+        if (autoStart) this.onaudiostart?.();
+      });
+      stop = vi.fn();
+      abort = vi.fn();
       constructor() { instances.push(this); }
     }
     vi.stubGlobal('Capacitor', { isNativePlatform: () => false });
@@ -1096,6 +1101,61 @@ describe('Web Mobile final drain', () => {
     } finally {
       await VoiceInput.stopListening({ abort: true });
       vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('does not confirm Web Speech capture on synchronous rec.start() alone, surfaces async not-allowed cleanly, deduplicates onstart+onaudiostart, and fences retired sessions', async () => {
+    const instances = browser({ autoStart: false });
+    const meter = meterHarness();
+    const listeningEvents: boolean[] = [];
+    const errors: string[] = [];
+    try {
+      // 1. Async permission denial after rec.start() returns synchronously
+      const accepted = await VoiceInput.startListening(
+        vi.fn(),
+        (v) => listeningEvents.push(v),
+        (err) => errors.push(err),
+      );
+      expect(accepted).toBe(true);
+      expect(instances).toHaveLength(1);
+      expect(VoiceInput.isListening()).toBe(false);
+      expect(listeningEvents).toEqual([]);
+      expect(meter.grants).toHaveLength(0);
+
+      // Browser rejects permission asynchronously before onstart/onaudiostart
+      instances[0].onerror?.({ error: 'not-allowed' });
+      expect(errors).toEqual(['permission_denied']);
+      expect(listeningEvents).toEqual([]);
+      expect(VoiceInput.isListening()).toBe(false);
+      instances[0].onend?.();
+      await Promise.resolve();
+
+      // 2. Old aborted session's late onstart/onaudiostart must NOT taint a fresh pending session
+      const secondListening: boolean[] = [];
+      const secondErrors: string[] = [];
+      await VoiceInput.startListening(vi.fn(), (v) => secondListening.push(v), (e) => secondErrors.push(e));
+      expect(instances).toHaveLength(2);
+      const staleRec = instances[0];
+      const freshRec = instances[1];
+      staleRec.onstart?.();
+      staleRec.onaudiostart?.();
+      expect(secondListening).toEqual([]);
+      expect(VoiceInput.isListening()).toBe(false);
+
+      // 3. Real capture confirmation via onstart + onaudiostart fires listening(true) once & starts meter
+      freshRec.onstart?.();
+      freshRec.onaudiostart?.();
+      expect(secondListening).toEqual([true]);
+      expect(VoiceInput.isListening()).toBe(true);
+      expect(meter.grants).toHaveLength(1);
+
+      // Clean abort retires capture and ignores late handlers
+      await VoiceInput.stopListening({ abort: true });
+      expect(VoiceInput.isListening()).toBe(false);
+      expect(secondErrors).toEqual([]);
+    } finally {
+      await VoiceInput.stopListening({ abort: true });
       vi.unstubAllGlobals();
     }
   });

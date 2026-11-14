@@ -109,6 +109,7 @@ interface WebSession {
   owner: CaptureOwner;
   rec: any;
   retired: boolean;
+  captureStarted: boolean;
 }
 
 let _listening = false;
@@ -652,6 +653,15 @@ async function startWebLevelMeter(generation: number): Promise<void> {
   } catch { /* no level meter; recognition still works */ }
 }
 
+function clearWebRecHandlers(rec: any): void {
+  if (!rec) return;
+  rec.onstart = null;
+  rec.onaudiostart = null;
+  rec.onend = null;
+  rec.onresult = null;
+  rec.onerror = null;
+}
+
 function startWebListening(owner: CaptureOwner): boolean {
   const Ctor = getWebSpeechCtor();
   if (!Ctor) {
@@ -668,10 +678,8 @@ function startWebListening(owner: CaptureOwner): boolean {
     _webSession.retired = true;
     const prevRec = _webSession.rec;
     _webSession = null;
+    clearWebRecHandlers(prevRec);
     try {
-      prevRec.onend = null;
-      prevRec.onresult = null;
-      prevRec.onerror = null;
       prevRec.abort();
     } catch { /* best effort */ }
   }
@@ -680,13 +688,23 @@ function startWebListening(owner: CaptureOwner): boolean {
   const generation = ++_generation;
   try {
     const rec = new Ctor();
-    const session: WebSession = { generation, owner, rec, retired: false };
+    const session: WebSession = { generation, owner, rec, retired: false, captureStarted: false };
+    const confirmWebCapture = (): void => {
+      if (session.retired || generation !== _generation || !isOwnerCurrent(session.owner)) return;
+      if (session.captureStarted) return;
+      session.captureStarted = true;
+      setOwnerListening(session.owner, true);
+      void startWebLevelMeter(generation);
+    };
     rec.lang = pickWebLocale();
     rec.continuous = true;
     rec.interimResults = true;
     rec.maxAlternatives = 1;
+    rec.onstart = confirmWebCapture;
+    rec.onaudiostart = confirmWebCapture;
     rec.onresult = (event: any): void => {
       if (session.retired || generation !== _generation || !isOwnerCurrent(session.owner)) return;
+      confirmWebCapture();
       let txt = '';
       for (let i = 0; i < event.results.length; i++) {
         txt += event.results[i][0]?.transcript ?? '';
@@ -707,6 +725,17 @@ function startWebListening(owner: CaptureOwner): boolean {
     };
     rec.onend = (): void => {
       if (session.retired || generation !== _generation || !isOwnerCurrent(session.owner)) return;
+      if (!session.captureStarted) {
+        const err = _lastError ?? 'permission_denied';
+        session.retired = true;
+        clearWebRecHandlers(rec);
+        if (_webSession === session) _webSession = null;
+        _generation++;
+        reportOwnerError(session.owner, err);
+        retireOwner(session.owner);
+        stopWebLevelMeter();
+        return;
+      }
       // Browser auto-ends on silence; reflect not-listening so the UI updates.
       setOwnerListening(session.owner, false);
       stopWebLevelMeter();
@@ -714,8 +743,9 @@ function startWebListening(owner: CaptureOwner): boolean {
     _webSession = session;
     pauseBackgroundAudio();
     rec.start();
-    setOwnerListening(session.owner, true);
-    void startWebLevelMeter(generation);
+    // Do NOT mark _listening / invoke onListeningChange(true) here: in Web Speech API,
+    // rec.start() only submits the request; browser permission rejection (not-allowed)
+    // arrives asynchronously before onstart/onaudiostart ever fires.
     return true;
   } catch (err) {
     console.warn('[voice] web start failed:', err);
@@ -740,7 +770,9 @@ export interface StopListeningOptions {
 function stopWebListening(abort = false): Promise<void> {
   const session = _webSession;
   const owner = session?.owner ?? _activeOwner;
-  setOwnerListening(owner, false);
+  if (_listening) {
+    setOwnerListening(owner, false);
+  }
   stopWebLevelMeter();
   if (abort) {
     _webDrainCancel?.();
@@ -754,9 +786,7 @@ function stopWebListening(abort = false): Promise<void> {
   }
   if (abort) {
     session.retired = true;
-    rec.onend = null;
-    rec.onresult = null;
-    rec.onerror = null;
+    clearWebRecHandlers(rec);
     if (_webSession === session) _webSession = null;
     _generation++;
     retireOwner(owner);
@@ -765,6 +795,9 @@ function stopWebListening(abort = false): Promise<void> {
     }
     return Promise.resolve();
   }
+  // Ignore any late onstart/onaudiostart once capture drain has been requested.
+  rec.onstart = null;
+  rec.onaudiostart = null;
   return new Promise((resolve) => {
     let finished = false;
     const finish = (): void => {
@@ -774,9 +807,7 @@ function stopWebListening(abort = false): Promise<void> {
       if (_webDrainCancel === finish) _webDrainCancel = null;
       session.retired = true;
       stopWebLevelMeter();
-      rec.onend = null;
-      rec.onresult = null;
-      rec.onerror = null;
+      clearWebRecHandlers(rec);
       if (_webSession === session) _webSession = null;
       _generation++;
       if (isOwnerCurrent(session.owner)) {
