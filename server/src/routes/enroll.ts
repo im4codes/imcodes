@@ -11,7 +11,7 @@ import { controlledNodeInstallCommand } from '../services/controlled-node-instal
 import { compress } from 'hono/compress';
 import { z } from 'zod';
 import { lstat, open, readdir, type FileHandle } from 'node:fs/promises';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { join } from 'node:path';
 import type { Env } from '../env.js';
 import type { Database } from '../db/client.js';
@@ -21,7 +21,23 @@ import { requireAuth } from '../security/authorization.js';
 import logger from '../util/logger.js';
 import { AUTH_IDENTITY_ERRORS } from '../../../shared/auth-identity.js';
 import { EXPECTED_USER_ID_HEADER, SERVER_ID_HEADER } from '../../../shared/http-header-names.js';
-import { ENROLLMENT_OWNER_NAME_MAX_CHARS, NODE_ROLE, encodeEnrollmentTrailer, isEnrollmentNodeTokenHash } from '../../../shared/remote-exec.js';
+import {
+  NODE_ROLE,
+  encodeEnrollmentTrailer,
+  isEnrollmentNodeTokenHash,
+  sanitizeEnrollmentOwnerName,
+  type EnrollmentBlob,
+} from '../../../shared/remote-exec.js';
+import {
+  CONTROLLED_NODE_INSTALL_EXECUTABLE_SUBPATH,
+  CONTROLLED_NODE_INSTALL_EXECUTABLE_PATH,
+  CONTROLLED_NODE_INSTALL_EXECUTABLE_TOKEN_DOMAIN,
+  CONTROLLED_NODE_INSTALL_EXECUTABLE_TOKEN_PARAM,
+  CONTROLLED_NODE_INSTALL_EXECUTABLE_TOKEN_TTL_MS,
+  CONTROLLED_NODE_INSTALL_PAYLOAD_SUBPATH,
+  CONTROLLED_NODE_INSTALL_TICKET_FIELD,
+  type ControlledNodeInstallPayloadResponse,
+} from '../../../shared/controlled-node-install.js';
 import { REMOTE_DESKTOP_PROTOCOL_VERSION } from '../../../shared/remote-desktop.js';
 import { buildWindowsAuthenticodeEnrollmentPlan } from '../../../shared/windows-authenticode-enrollment.js';
 import {
@@ -102,6 +118,7 @@ import {
   openDaemonRuntimeArtifact,
   openDesktopReleaseManifestArtifact,
   type ArtifactCatalog,
+  type ArtifactDescriptor,
 } from '../services/controlled-node-artifact-catalog.js';
 import {
   insertControlledServerWithNodeId,
@@ -220,6 +237,7 @@ export function createEnrollRoutes(
   });
   enrollRoutes.use('/v2/download', compressArtifactDownload);
   enrollRoutes.use('/v2/node-artifact', compressArtifactDownload);
+  enrollRoutes.use(CONTROLLED_NODE_INSTALL_EXECUTABLE_SUBPATH, compressArtifactDownload);
 
 enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
   const originCheck = checkOrigin(c);
@@ -469,7 +487,7 @@ async function readTicket(c: Context): Promise<string | null> {
     } else if (contentType.includes('application/x-www-form-urlencoded')) {
       const raw = await c.req.text();
       const params = new URLSearchParams(raw);
-      const t = params.get('ticket');
+      const t = params.get(CONTROLLED_NODE_INSTALL_TICKET_FIELD);
       if (t && t.length >= 8 && t.length <= 128 && /^[A-Za-z0-9_-]+$/.test(t)) return t;
     }
   }
@@ -805,7 +823,27 @@ async function readDownloadAbiProfile(c: Context): Promise<{ valid: boolean; val
     ? { valid: true, value } : { valid: false };
 }
 
-async function consumeAndStream(c: Context, rawTicket: string, rawProfile?: unknown): Promise<Response> {
+interface PreparedEnrollmentConsume {
+  ok: true;
+  now: number;
+  ip: string;
+  dir: string;
+  profile: ControlledNodeAbiProfile;
+  downloadOs: ControlledNodeOs;
+  downloadArch: ControlledNodeArtifactArch;
+  reservation: DownloadCommit;
+  descriptor: ArtifactDescriptor;
+  encryptionKey: string;
+  enrollmentBlob: EnrollmentBlob;
+}
+
+type PrepareEnrollmentConsumeResult = PreparedEnrollmentConsume | { ok: false; response: Response };
+
+async function prepareVerifiedEnrollmentConsume(
+  c: Context,
+  rawTicket: string,
+  rawProfile?: unknown,
+): Promise<PrepareEnrollmentConsumeResult> {
   const ticketHash = sha256Hex(rawTicket);
   const now = Date.now();
   const ip = (c.get('clientIp' as never) as string) ?? 'unknown';
@@ -814,16 +852,14 @@ async function consumeAndStream(c: Context, rawTicket: string, rawProfile?: unkn
   // concurrent requests for the same ticket via SELECT ... FOR UPDATE.
   const reservation = await reserveAttempt(c.env.DB as Database, ticketHash, ip, now);
   if (!reservation) {
-    return c.json({ error: 'invalid_or_expired_ticket' }, 401);
+    return { ok: false, response: c.json({ error: 'invalid_or_expired_ticket' }, 401) };
   }
 
-  // Step 2: single-flight hash + open FD. Use the same (dir, os, arch) key
-  // the catalog already keyed on for ticket mint; concurrent downloads of
-  // the same ticket and concurrent mints will share the verification.
+  // Step 2: single-flight hash + digest verification against the catalog.
   const dir = process.env.IMCODES_NODE_EXE_DIR;
   if (!dir) {
     await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
-    return c.json({ error: 'executable_dir_not_configured' }, 503);
+    return { ok: false, response: c.json({ error: 'executable_dir_not_configured' }, 503) };
   }
   const profile = normalizeControlledNodeAbiProfile(rawProfile);
   const pinnedDigest = profile ? enrollmentAbiDigest({
@@ -834,13 +870,13 @@ async function consumeAndStream(c: Context, rawTicket: string, rawProfile?: unkn
   }, profile) : null;
   if (!profile || !pinnedDigest) {
     await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
-    return c.json({ error: 'abi_profile_mismatch' }, 409);
+    return { ok: false, response: c.json({ error: 'abi_profile_mismatch' }, 409) };
   }
   reservation.artifactSha256 = pinnedDigest;
   const downloadTarget = normalizeControlledNodeArtifactPair(reservation.os, reservation.arch, profile);
   if (!downloadTarget) {
     await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
-    return c.json({ error: 'unsupported_artifact' }, 500);
+    return { ok: false, response: c.json({ error: 'unsupported_artifact' }, 500) };
   }
   const downloadOs: ControlledNodeOs = downloadTarget.os;
   const downloadArch: ControlledNodeArtifactArch = downloadTarget.arch;
@@ -858,19 +894,19 @@ async function consumeAndStream(c: Context, rawTicket: string, rawProfile?: unkn
         reason: v.reason,
       },
     }, c.env.DB).catch(() => {});
-    return c.json({ error: 'artifact_digest_mismatch' }, 503);
+    return { ok: false, response: c.json({ error: 'artifact_digest_mismatch' }, 503) };
   }
   const stableRemoteLink = reservation.delivery === CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK;
   if (!stableRemoteLink && v.descriptor.sha256 !== reservation.artifactSha256) {
     // Stale manifest pin; release the slot and surface the mismatch.
     artifactCatalog.invalidate(dir, downloadOs, downloadArch, profile);
     await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
-    return c.json({ error: 'artifact_digest_mismatch' }, 503);
+    return { ok: false, response: c.json({ error: 'artifact_digest_mismatch' }, 503) };
   }
   // A stable remote link is an owner credential, not a pin to one release.
   // The catalog still verifies the current artifact before any authority is
   // consumed; only the old mint-time digest comparison is omitted. Audit the
-  // exact verified bytes that are actually streamed below.
+  // exact verified bytes that are actually consumed below.
   if (stableRemoteLink) reservation.artifactSha256 = v.descriptor.sha256;
 
   // Step 3: cheap post-verify transforms. No stream descriptor is open yet.
@@ -879,7 +915,7 @@ async function consumeAndStream(c: Context, rawTicket: string, rawProfile?: unkn
     encryptionKey = resolveTicketEncryptionKey(c);
   } catch {
     await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
-    return c.json({ error: 'ticket_encryption_key_unavailable' }, 500);
+    return { ok: false, response: c.json({ error: 'ticket_encryption_key_unavailable' }, 500) };
   }
   let enrollCode: string;
   let serverUrl: string;
@@ -906,38 +942,114 @@ async function consumeAndStream(c: Context, rawTicket: string, rawProfile?: unkn
         arch: reservation.arch,
       },
     }, c.env.DB).catch(() => {});
-    return c.json({ error: 'ticket_decrypt_failed' }, 500);
+    return { ok: false, response: c.json({ error: 'ticket_decrypt_failed' }, 500) };
   }
 
-  const filename = v.descriptor.filename;
-  const actualSize = v.descriptor.sizeBytes;
   // Name the person this machine is being bound to, so the consent screen can
-  // say whose account it is joining. The nickname, never the username: someone
-  // deciding whether to trust an install recognises a person, not a login
-  // handle. Read from the ticket's owner rather than anything the caller
-  // supplies, and bounded because the trailer body has a hard byte ceiling.
-  // Absent or blank degrades to the unnamed wording rather than blocking.
+  // say whose account it is joining. Read from the ticket's owner rather than
+  // anything the caller supplies, and sanitized to a bounded single line.
   const ownerRow = await (c.env.DB as Database).queryOne<{ display_name: string | null }>(
     `SELECT u.display_name FROM controlled_node_enrollments_v2 e
        JOIN users u ON u.id = e.owner_user_id
       WHERE e.id = $1`,
     [reservation.ticketId],
   ).catch(() => null);
-  const ownerName = ownerRow?.display_name?.trim().slice(0, ENROLLMENT_OWNER_NAME_MAX_CHARS) || undefined;
-  let trailer: Buffer;
-  try {
-    trailer = encodeEnrollmentTrailer({
+  const ownerName = ownerRow?.display_name ? sanitizeEnrollmentOwnerName(ownerRow.display_name) : '';
+
+  return {
+    ok: true,
+    now,
+    ip,
+    dir,
+    profile,
+    downloadOs,
+    downloadArch,
+    reservation,
+    descriptor: v.descriptor,
+    encryptionKey,
+    enrollmentBlob: {
       serverUrl,
       enrollToken: enrollCode,
       ...(profile !== CONTROLLED_NODE_ABI_MODERN ? { abiProfile: profile } : {}),
       ...(ownerName ? { ownerName } : {}),
-    });
+    },
+  };
+}
+
+interface InstallExecutableTokenClaims {
+  os: ControlledNodeOs;
+  arch: ControlledNodeArtifactArch;
+  abiProfile: ControlledNodeAbiProfile;
+  sha256: string;
+  exp: number;
+}
+
+function mintInstallExecutableToken(claims: InstallExecutableTokenClaims, signingKey: string): string {
+  const payloadPart = Buffer.from(JSON.stringify(claims), 'utf8').toString('base64url');
+  const sigPart = createHmac('sha256', signingKey)
+    .update(`${CONTROLLED_NODE_INSTALL_EXECUTABLE_TOKEN_DOMAIN}${payloadPart}`)
+    .digest('base64url');
+  return `${payloadPart}.${sigPart}`;
+}
+
+function verifyInstallExecutableToken(
+  rawToken: string,
+  signingKey: string,
+  now: number,
+): InstallExecutableTokenClaims | null {
+  const parts = rawToken.split('.');
+  if (parts.length !== 2) return null;
+  const [payloadPart, sigPart] = parts;
+  if (!payloadPart || !sigPart || !/^[A-Za-z0-9_-]+$/.test(payloadPart) || !/^[A-Za-z0-9_-]+$/.test(sigPart)) {
+    return null;
+  }
+  const expectedSig = createHmac('sha256', signingKey)
+    .update(`${CONTROLLED_NODE_INSTALL_EXECUTABLE_TOKEN_DOMAIN}${payloadPart}`)
+    .digest();
+  const actualSig = Buffer.from(sigPart, 'base64url');
+  if (actualSig.length !== expectedSig.length || actualSig.toString('base64url') !== sigPart || !timingSafeEqual(expectedSig, actualSig)) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(Buffer.from(payloadPart, 'base64url').toString('utf8')) as Partial<InstallExecutableTokenClaims>;
+    if (typeof parsed !== 'object' || parsed === null) return null;
+    if (typeof parsed.exp !== 'number' || !Number.isFinite(parsed.exp) || parsed.exp <= now) return null;
+    if (typeof parsed.os !== 'string' || typeof parsed.arch !== 'string'
+      || !isControlledNodeOs(parsed.os) || !isControlledNodeArtifactArch(parsed.arch)) {
+      return null;
+    }
+    const abiProfile = normalizeControlledNodeAbiProfile(parsed.abiProfile);
+    if (!abiProfile || parsed.abiProfile !== abiProfile) return null;
+    if (!isCanonicalControlledNodePair(parsed.os, parsed.arch, abiProfile)) return null;
+    if (typeof parsed.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(parsed.sha256)) return null;
+    return {
+      os: parsed.os,
+      arch: parsed.arch,
+      abiProfile,
+      sha256: parsed.sha256,
+      exp: parsed.exp,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function consumeAndStream(c: Context, rawTicket: string, rawProfile?: unknown): Promise<Response> {
+  const prepared = await prepareVerifiedEnrollmentConsume(c, rawTicket, rawProfile);
+  if (!prepared.ok) return prepared.response;
+
+  const { now, ip, dir, profile, downloadOs, downloadArch, reservation, descriptor, enrollmentBlob } = prepared;
+  const filename = descriptor.filename;
+  const actualSize = descriptor.sizeBytes;
+  let trailer: Buffer;
+  try {
+    trailer = encodeEnrollmentTrailer(enrollmentBlob);
   } catch {
     await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
     return c.json({ error: 'enrollment_trailer_failed' }, 500);
   }
 
-  const opened = await artifactCatalog.openPinned(dir, v.descriptor);
+  const opened = await artifactCatalog.openPinned(dir, descriptor);
   if (!opened) {
     artifactCatalog.invalidate(dir, downloadOs, downloadArch, profile);
     await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
@@ -946,7 +1058,7 @@ async function consumeAndStream(c: Context, rawTicket: string, rawProfile?: unkn
 
   let streamSuffix = trailer;
   let streamPatch: { offset: number; bytes: Buffer } | undefined;
-  if (downloadTarget.os === CONTROLLED_NODE_OS_WIN) {
+  if (downloadOs === CONTROLLED_NODE_OS_WIN) {
     const header = Buffer.alloc(Math.min(actualSize, 4096));
     const { bytesRead } = await opened.handle.read(header, 0, header.length, 0);
     const personalization = bytesRead === header.length
@@ -990,6 +1102,101 @@ async function consumeAndStream(c: Context, rawTicket: string, rawProfile?: unkn
   const stream = buildArtifactStream(opened.handle, actualSize, streamSuffix, opened.close, streamPatch);
   return c.body(stream as unknown as ReadableStream, 200);
 }
+
+async function exchangeInstallPayload(c: Context, rawTicket: string, rawProfile?: unknown): Promise<Response> {
+  const canonicalServerUrl = resolveCanonicalServerUrl(c);
+  if (!canonicalServerUrl) return c.json({ error: 'canonical_server_url_required' }, 403);
+
+  const prepared = await prepareVerifiedEnrollmentConsume(c, rawTicket, rawProfile);
+  if (!prepared.ok) return prepared.response;
+
+  const { now, ip, profile, downloadOs, downloadArch, reservation, descriptor, encryptionKey, enrollmentBlob } = prepared;
+  try {
+    const committed = await commitAttempt(c.env.DB as Database, reservation, now);
+    if (!committed) throw new Error('download_attempt_not_reserved');
+  } catch {
+    await releaseAttempt(c.env.DB as Database, reservation.attemptId, reservation.ticketId, ip, now);
+    return c.json({ error: 'ticket_consume_unavailable' }, 503);
+  }
+
+  const token = mintInstallExecutableToken(
+    {
+      os: downloadOs,
+      arch: downloadArch,
+      abiProfile: profile,
+      sha256: descriptor.sha256,
+      exp: now + CONTROLLED_NODE_INSTALL_EXECUTABLE_TOKEN_TTL_MS,
+    },
+    encryptionKey,
+  );
+  const artifactUrl = `${canonicalServerUrl}${CONTROLLED_NODE_INSTALL_EXECUTABLE_PATH}?${CONTROLLED_NODE_INSTALL_EXECUTABLE_TOKEN_PARAM}=${encodeURIComponent(token)}`;
+  const payload: ControlledNodeInstallPayloadResponse = {
+    artifactUrl,
+    sha256: descriptor.sha256,
+    sizeBytes: descriptor.sizeBytes,
+    abiProfile: profile,
+    ...(descriptor.authenticodeSignerSha256
+      ? { windowsAuthenticodeSignerSha256: descriptor.authenticodeSignerSha256 }
+      : {}),
+    enrollment: enrollmentBlob,
+  };
+  c.header('Cache-Control', 'private, no-store');
+  c.header('Referrer-Policy', 'no-referrer');
+  return c.json(payload, 200);
+}
+
+enrollRoutes.post(CONTROLLED_NODE_INSTALL_PAYLOAD_SUBPATH, async (c) => {
+  const gate = await preConsumeGate(c);
+  if (gate) return gate;
+  const rawTicket = await readTicket(c);
+  if (!rawTicket) return c.json({ error: 'missing_ticket' }, 401);
+  const profile = await readDownloadAbiProfile(c);
+  if (!profile.valid) return c.json({ error: 'invalid_body' }, 400);
+  return exchangeInstallPayload(c, rawTicket, profile.value);
+});
+
+enrollRoutes.get(CONTROLLED_NODE_INSTALL_EXECUTABLE_SUBPATH, async (c) => {
+  const gate = await preConsumeGate(c);
+  if (gate) return gate;
+  const rawToken = c.req.query(CONTROLLED_NODE_INSTALL_EXECUTABLE_TOKEN_PARAM);
+  if (!rawToken) return c.json({ error: 'missing_install_executable_token' }, 401);
+  let signingKey: string;
+  try {
+    signingKey = resolveTicketEncryptionKey(c);
+  } catch {
+    return c.json({ error: 'ticket_encryption_key_unavailable' }, 500);
+  }
+  const claims = verifyInstallExecutableToken(rawToken, signingKey, Date.now());
+  if (!claims) {
+    return c.json({ error: 'invalid_or_expired_install_executable_token' }, 401);
+  }
+  const dir = process.env.IMCODES_NODE_EXE_DIR;
+  if (!dir) {
+    return c.json({ error: 'executable_dir_not_configured' }, 503);
+  }
+  const v = await artifactCatalog.ensureVerified(dir, claims.os, claims.arch, claims.abiProfile);
+  if (!v.ok || v.descriptor.sha256 !== claims.sha256) {
+    if (v.ok) artifactCatalog.invalidate(dir, claims.os, claims.arch, claims.abiProfile);
+    return c.json({ error: 'artifact_digest_mismatch' }, 503);
+  }
+  const opened = await artifactCatalog.openPinned(dir, v.descriptor);
+  if (!opened) {
+    artifactCatalog.invalidate(dir, claims.os, claims.arch, claims.abiProfile);
+    return c.json({ error: 'artifact_digest_mismatch' }, 503);
+  }
+  c.header('Content-Length', String(v.descriptor.sizeBytes));
+  c.header('Content-Type', 'application/octet-stream');
+  c.header('Content-Disposition', `attachment; filename="${v.descriptor.filename}"`);
+  c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.ABI_PROFILE, claims.abiProfile);
+  c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256, v.descriptor.sha256);
+  c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES, String(v.descriptor.sizeBytes));
+  c.header('Cache-Control', 'private, no-store');
+  c.header('Referrer-Policy', 'no-referrer');
+  c.header('X-Content-Type-Options', 'nosniff');
+  c.header('Accept-Ranges', 'none');
+  const stream = buildBareArtifactStream(opened.handle, v.descriptor.sizeBytes, opened.close);
+  return c.body(stream as unknown as ReadableStream, 200);
+});
 
 enrollRoutes.post('/v2/download', async (c) => {
   const gate = await preConsumeGate(c);

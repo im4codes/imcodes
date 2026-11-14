@@ -57,6 +57,12 @@ import {
 } from '../../shared/controlled-node-artifacts.js';
 import { controlledNodeInstallCommandRoutes } from '../src/routes/controlled-node-install.js';
 import {
+  CONTROLLED_NODE_INSTALL_EXECUTABLE_PATH,
+  CONTROLLED_NODE_INSTALL_PAYLOAD_PATH,
+  validateEnrollmentPayload,
+  type ControlledNodeInstallPayloadResponse,
+} from '../../shared/controlled-node-install.js';
+import {
   REMOTE_DESKTOP_LEGACY_UPGRADE_PROTOCOL_VERSION,
   REMOTE_DESKTOP_MACOS_COMPONENT_ORDER,
   REMOTE_DESKTOP_MACOS_DISCLOSURE_FILENAME,
@@ -3403,5 +3409,152 @@ describe('HEAD /api/enroll/v2/node-artifact', () => {
       { ...validHeaders, [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: '2' },
       503,
     );
+  });
+});
+
+describe('command-based install-payload + static install-executable routes (real PostgreSQL)', () => {
+  it('exchanges a ticket for static artifact metadata + enrollment payload, serves unmodified bytes, and redeems cleanly', async () => {
+    const { app, bytes, ticket, userId } = await abiTicketFixture(CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND);
+    await db.execute('UPDATE users SET display_name = $1 WHERE id = $2', ['Test Desk Owner', userId]);
+
+    const exchange = await app.request(CONTROLLED_NODE_INSTALL_PAYLOAD_PATH, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: `ticket=${encodeURIComponent(ticket.ticket)}&${CONTROLLED_NODE_ABI_PROFILE_FIELD}=${CONTROLLED_NODE_ABI_GLIBC217}`,
+    });
+    expect(exchange.status).toBe(200);
+    expect(exchange.headers.get('cache-control')).toBe('private, no-store');
+    expect(exchange.headers.get('referrer-policy')).toBe('no-referrer');
+
+    const payload = await exchange.json() as ControlledNodeInstallPayloadResponse;
+    expect(payload.abiProfile).toBe(CONTROLLED_NODE_ABI_GLIBC217);
+    expect(payload.sha256).toBe(sha256(bytes));
+    expect(payload.sizeBytes).toBe(bytes.length);
+    expect(payload.artifactUrl).toContain(CONTROLLED_NODE_INSTALL_EXECUTABLE_PATH);
+
+    const validatedBlob = validateEnrollmentPayload(payload.enrollment);
+    expect(validatedBlob.ok).toBe(true);
+    expect(payload.enrollment).toMatchObject({
+      abiProfile: CONTROLLED_NODE_ABI_GLIBC217,
+      ownerName: 'Test Desk Owner',
+    });
+
+    // Ticket consume counter incremented & audited once on install-payload.
+    expect(await db.queryOne('SELECT consumed_count FROM controlled_node_enrollments_v2 WHERE id=$1', [ticket.ticketId])).toEqual({ consumed_count: 1 });
+    const audit = await db.queryOne<{ action: string }>(
+      `SELECT action FROM audit_log WHERE user_id=$1 AND action='enroll.v2.ticket.consume' ORDER BY created_at DESC LIMIT 1`,
+      [userId],
+    );
+    expect(audit?.action).toBe('enroll.v2.ticket.consume');
+
+    // Download static binary via minted HMAC-signed artifactUrl (stripping origin for Hono request).
+    const artifactPath = new URL(payload.artifactUrl).pathname + new URL(payload.artifactUrl).search;
+    const binRes = await app.request(artifactPath);
+    expect(binRes.status).toBe(200);
+    expect(binRes.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.ABI_PROFILE)).toBe(CONTROLLED_NODE_ABI_GLIBC217);
+    expect(binRes.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256)).toBe(payload.sha256);
+    expect(binRes.headers.get('accept-ranges')).toBe('none');
+    const downloaded = Buffer.from(await binRes.arrayBuffer());
+    expect(downloaded).toEqual(bytes);
+    expect(decodeEnrollmentTrailer(downloaded)).toBeNull();
+
+    // Enrollment payload from install-payload redeems cleanly into a controlled server.
+    const nodeToken = hex(32);
+    const redeemRes = await app.request('/api/enroll/v2/redeem', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2,
+        installId: `stdin-${hex(8)}`,
+        nodeTokenHash: sha256(nodeToken),
+        hostname: 'stdin-host',
+        os: 'linux',
+        arch: 'x64',
+        enrollToken: payload.enrollment.enrollToken,
+        abiProfile: payload.enrollment.abiProfile,
+      }),
+    });
+    expect(redeemRes.status).toBe(200);
+    const redeemed = await redeemRes.json() as { serverId: string; nodeRole: string; abiProfile: string };
+    expect(redeemed.nodeRole).toBe(NODE_ROLE.CONTROLLED);
+    expect(redeemed.abiProfile).toBe(CONTROLLED_NODE_ABI_GLIBC217);
+  });
+
+  it('returns windowsAuthenticodeSignerSha256 and unpatched PE bytes on Windows install-payload', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+    const mint = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST',
+      headers: ticketHeaders(userId, o),
+      body: JSON.stringify({
+        version: 2,
+        os: 'win',
+        arch: 'x64',
+        delivery: CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND,
+      }),
+    });
+    expect(mint.status).toBe(200);
+    const ticket = await mint.json() as { ticket: string; ticketId: string };
+
+    const exchange = await app.request(CONTROLLED_NODE_INSTALL_PAYLOAD_PATH, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ticket: ticket.ticket }),
+    });
+    expect(exchange.status).toBe(200);
+    const payload = await exchange.json() as ControlledNodeInstallPayloadResponse;
+    expect(payload.windowsAuthenticodeSignerSha256).toBe('c'.repeat(64));
+    expect(payload.sha256).toBe(sha256(FAKE_WINDOWS_SIGNED_PE));
+
+    const artifactUrl = new URL(payload.artifactUrl);
+    const binRes = await app.request(artifactUrl.pathname + artifactUrl.search);
+    expect(binRes.status).toBe(200);
+    const downloaded = Buffer.from(await binRes.arrayBuffer());
+    expect(downloaded).toEqual(FAKE_WINDOWS_SIGNED_PE);
+  });
+
+  it('rejects tampered/missing/range install-executable requests and enforces ticket limits on install-payload', async () => {
+    const { app, ticket } = await abiTicketFixture(CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND);
+    // Range rejected before touching reservation.
+    const rangeRes = await app.request(CONTROLLED_NODE_INSTALL_PAYLOAD_PATH, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', range: 'bytes=0-10' },
+      body: `ticket=${encodeURIComponent(ticket.ticket)}`,
+    });
+    expect(rangeRes.status).toBe(416);
+
+    // Mismatched ABI profile fails closed without consuming a slot.
+    const badAbi = await app.request(CONTROLLED_NODE_INSTALL_PAYLOAD_PATH, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ticket: ticket.ticket, abiProfile: 'bad-profile' }),
+    });
+    expect(badAbi.status).toBe(400);
+    expect(await db.queryOne('SELECT consumed_count FROM controlled_node_enrollments_v2 WHERE id=$1', [ticket.ticketId])).toEqual({ consumed_count: 0 });
+
+    // Missing or tampered token on install-executable fails closed with 401.
+    expect((await app.request(CONTROLLED_NODE_INSTALL_EXECUTABLE_PATH)).status).toBe(401);
+    const validExchange = await app.request(CONTROLLED_NODE_INSTALL_PAYLOAD_PATH, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ticket: ticket.ticket }),
+    });
+    const validPayload = await validExchange.json() as ControlledNodeInstallPayloadResponse;
+    const tokenUrl = new URL(validPayload.artifactUrl);
+    const origToken = tokenUrl.searchParams.get('token')!;
+    const tampered = `${origToken.slice(0, -1)}${origToken.endsWith('A') ? 'B' : 'A'}`;
+    expect((await app.request(`${tokenUrl.pathname}?token=${encodeURIComponent(tampered)}`)).status).toBe(401);
+    expect((await app.request(tokenUrl.pathname + tokenUrl.search, { headers: { range: 'bytes=0-3' } })).status).toBe(416);
+
+    // Revoked ticket is rejected cleanly by install-payload.
+    await db.execute('UPDATE controlled_node_enrollments_v2 SET revoked_at = $1 WHERE id = $2', [Date.now(), ticket.ticketId]);
+    const revokedExchange = await app.request(CONTROLLED_NODE_INSTALL_PAYLOAD_PATH, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ticket: ticket.ticket }),
+    });
+    expect(revokedExchange.status).toBe(401);
   });
 });

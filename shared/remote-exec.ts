@@ -362,7 +362,15 @@ export function decodeEnrollmentTrailer(tail: Buffer): EnrollmentBlob | null {
 }
 
 /**
- * Decode the enrollment blob and its exact byte range within the executable.
+ * Sanitize a human-authored owner/desk name into a bounded single line without
+ * control characters so it cannot forge extra lines in pre-install warnings.
+ */
+export function sanitizeEnrollmentOwnerName(raw: string): string {
+  // eslint-disable-next-line no-control-regex
+  return raw.replace(/[\u0000-\u001f\u007f\u2028\u2029]/gu, ' ').trim().slice(0, ENROLLMENT_OWNER_NAME_MAX_CHARS);
+}
+
+/** Decode the enrollment blob and its exact byte range within the executable.
  * `tailFileOffset` is the absolute file offset of `tail[0]` (defaults to 0 for
  * buffers that start at file origin). Never reads beyond the bounded tail window.
  */
@@ -395,8 +403,7 @@ export function decodeEnrollmentTrailerWithRange(
       // control characters, otherwise a name containing newlines could forge
       // extra lines inside the very block that warns about being scammed.
       const ownerName = typeof parsed.ownerName === 'string'
-        // eslint-disable-next-line no-control-regex
-        ? parsed.ownerName.replace(/[\u0000-\u001f\u007f\u2028\u2029]/gu, ' ').trim().slice(0, ENROLLMENT_OWNER_NAME_MAX_CHARS)
+        ? sanitizeEnrollmentOwnerName(parsed.ownerName)
         : '';
       return {
         blob: {

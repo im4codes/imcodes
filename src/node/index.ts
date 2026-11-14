@@ -2,6 +2,9 @@
 import { dirname, join } from 'node:path';
 import { REMOTE_DESKTOP_TRAFFIC } from '../../shared/remote-desktop-traffic.js';
 import { CONTROLLED_NODE_ABI_GLIBC217, CONTROLLED_NODE_RUNTIME_ABI_PROFILE } from '../../shared/controlled-node-abi.js';
+import { CONTROLLED_NODE_INSTALL_SUBCOMMAND } from '../../shared/controlled-node-install.js';
+import type { EnrollmentBlob } from '../../shared/remote-exec.js';
+import { parseInstallSubcommandArgs, readEnrollmentBlobFromStdin } from './install-cli.js';
 import { AIDESK_UI_LOG } from '../../shared/aidesk-ui-log.js';
 import { execFileSync } from 'node:child_process';
 import { bootstrapControlledNodeWithDisposition, defaultBootstrapDeps, journalPathFor, markServiceHealthy } from './bootstrap.js';
@@ -154,11 +157,11 @@ async function holdConsoleForReader(): Promise<void> {
  * person being talked at by a caller a one-key way out, which is easier to do
  * than typing while someone is telling you not to.
  */
-async function warnBeforeInstall(): Promise<boolean> {
-  // Read straight off this installer's own trailer: the origin the human is
-  // about to hand the machine to is the one fact they can independently check,
-  // and a tail read must never be able to fail the install.
-  const blob = await readEnrollmentBlob(process.execPath).catch(() => null);
+async function warnBeforeInstall(explicitBlob?: EnrollmentBlob | null): Promise<boolean> {
+  // Read straight off this installer's own trailer (or validated stdin blob): the
+  // origin the human is about to hand the machine to is the one fact they can
+  // independently check, and a tail read must never be able to fail the install.
+  const blob = explicitBlob ?? await readEnrollmentBlob(process.execPath).catch(() => null);
   const serverUrl = blob?.serverUrl;
   // Naming the exact Desk is strictly better than the product label alone, but
   // only when the installer actually carries it: an older installer has no name
@@ -171,7 +174,7 @@ async function warnBeforeInstall(): Promise<boolean> {
     ...(ownerName ? { ownerName } : {}),
   })}\n`);
 
-  const interactive = Boolean(process.stdin.isTTY);
+  const interactive = Boolean(process.stdin.isTTY) && !process.stdin.readableEnded;
   return new Promise<boolean>((resolve) => {
     let left = CONTROLLED_NODE_INSTALL_WARNING_SECONDS;
     let settled = false;
@@ -252,18 +255,23 @@ async function main(): Promise<void> {
     return;
   }
   // Decided before any other install work, so that a failure raised while
-  // building deps is still reported as an install failure rather than a bare
-  // stderr line nobody sees.
-  installerLaunch = isInstallerLaunch(
+  // reading stdin enrollment or building deps is still reported as an install
+  // failure rather than a bare stderr line nobody sees.
+  installerLaunch = process.argv[2] === CONTROLLED_NODE_INSTALL_SUBCOMMAND || isInstallerLaunch(
     process.platform, process.execPath, defaultStagedExecutablePath(),
   );
-  if (installerLaunch && await readEnrollmentBlob() && !await warnBeforeInstall()) {
+  const isInstallCommand = parseInstallSubcommandArgs(process.argv);
+  const stdinEnrollmentBlob = isInstallCommand ? await readEnrollmentBlobFromStdin() : null;
+  if (installerLaunch && (stdinEnrollmentBlob || await readEnrollmentBlob()) && !await warnBeforeInstall(stdinEnrollmentBlob)) {
     process.stdout.write(`${controlledNodeInstallDeclined(installerLocale())}\n`);
     await holdConsoleForReader();
     return;
   }
   const now = Date.now();
-  const deps = defaultBootstrapDeps(now);
+  const deps = {
+    ...defaultBootstrapDeps(now),
+    ...(stdinEnrollmentBlob ? { enrollmentBlob: stdinEnrollmentBlob } : {}),
+  };
   if (installerLaunch) {
     process.stdout.write(`${controlledNodeInstallStatus(installerLocale())}\n`);
   }
@@ -285,7 +293,7 @@ async function main(): Promise<void> {
       publisherTrustError: bootstrap.publisherTrustError,
     })}\n`);
   }
-  if (bootstrap.disposition === 'handoff_complete') {
+  if (bootstrap.disposition === 'handoff_complete' || stdinEnrollmentBlob !== null) {
     await holdConsoleForReader();
     return;
   }

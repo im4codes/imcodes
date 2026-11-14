@@ -582,10 +582,11 @@ describe('the copied one-liner pins its own transport', () => {
 });
 
 describe('generated installer runs against a loopback HTTP origin', () => {
-  const PAYLOAD = '#!/bin/sh\necho INSTALLED-OK\n';
+  const PAYLOAD = '#!/bin/sh\necho "ARGS=$*"\necho "STDIN=$(cat)"\necho INSTALLED-OK\n';
   let server: Server;
   let origin: string;
   let dir: string;
+  let tamperNextDownload = false;
 
   beforeAll(async () => {
     dir = await mkdtemp(join(tmpdir(), 'imcodes-installer-exec-'));
@@ -593,15 +594,43 @@ describe('generated installer runs against a loopback HTTP origin', () => {
       let body = '';
       req.on('data', (chunk) => { body += chunk; });
       req.on('end', () => {
-        const ok = req.method === 'POST'
-          && (req.url ?? '').startsWith('/api/enroll/v2/download')
-          && body.includes('ticket=');
-        res.writeHead(ok ? 200 : 401, {
-          'content-type': 'application/octet-stream',
-          'content-length': String(ok ? PAYLOAD.length : 4),
+        if (req.method === 'POST' && (req.url ?? '').startsWith('/api/enroll/v2/install-payload') && body.includes('ticket=')) {
+          const json = JSON.stringify({
+            artifactUrl: `${origin}/api/enroll/v2/install-executable?token=mocktok`,
+            sha256: sha256(PAYLOAD),
+            sizeBytes: Buffer.byteLength(PAYLOAD),
+            abiProfile: 'modern',
+            enrollment: {
+              serverUrl: origin,
+              enrollToken: 'tok_loopback_secret',
+              ownerName: 'Alice { } "Desk"',
+            },
+          });
+          res.writeHead(200, {
+            'content-type': 'application/json',
+            'content-length': String(Buffer.byteLength(json)),
+            connection: 'close',
+          });
+          res.end(json);
+          return;
+        }
+        if (req.method === 'GET' && (req.url ?? '').startsWith('/api/enroll/v2/install-executable?token=mocktok')) {
+          const served = tamperNextDownload ? '#!/bin/sh\necho PWNED-INSTALLED-OK\n' : PAYLOAD;
+          tamperNextDownload = false;
+          res.writeHead(200, {
+            'content-type': 'application/octet-stream',
+            'content-length': String(Buffer.byteLength(served)),
+            connection: 'close',
+          });
+          res.end(served);
+          return;
+        }
+        res.writeHead(401, {
+          'content-type': 'application/json',
+          'content-length': '16',
           connection: 'close',
         });
-        res.end(ok ? PAYLOAD : 'nope');
+        res.end('{"error":"nope"}');
       });
     });
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -651,10 +680,28 @@ describe('generated installer runs against a loopback HTTP origin', () => {
     const { body } = renderControlledNodeInstallScript({
       serverUrl: origin, installCode: code, os: 'linux', arch: 'x64',
     });
+    expect(body).not.toContain('tok_loopback_secret');
+    expect(body).toContain('install --enroll-stdin');
     const run = await runScript(body);
     expect(run.stderr).not.toContain('Protocol "http" disabled');
+    expect(run.stdout).toContain('ARGS=install --enroll-stdin');
+    expect(run.stdout).toContain('STDIN=');
+    expect(run.stdout).toContain('"enrollToken":"tok_loopback_secret"');
+    expect(run.stdout).toContain('"ownerName":"Alice { } \\"Desk\\""');
     expect(run.stdout).toContain('INSTALLED-OK');
     expect(run.code).toBe(0);
+  }, 40_000);
+
+  it('refuses to execute a binary whose sha256 does not match the payload', async () => {
+    const code = freshCode();
+    const { body } = renderControlledNodeInstallScript({
+      serverUrl: origin, installCode: code, os: 'linux', arch: 'x64',
+    });
+    tamperNextDownload = true;
+    const run = await runScript(body);
+    expect(run.code).not.toBe(0);
+    expect(run.stderr).toContain('checksum mismatch');
+    expect(run.stdout).not.toContain('PWNED-INSTALLED-OK');
   }, 40_000);
 
   it('would have aborted before the request with the HTTPS-only flag', async () => {
