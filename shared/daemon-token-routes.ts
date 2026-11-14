@@ -87,6 +87,7 @@ export const DAEMON_TOKEN_ROUTES: readonly DaemonTokenRoute[] = [
   full('POST', `${server}/shared-context/resolve-namespace`),
   full('GET', `${server}/supervision/user-defaults/daemon`),
   full('PUT', `${server}/supervision/user-defaults/daemon`),
+  full('GET', `${server}/repo-callbacks/daemon`),
   full('POST', `${server}/${USAGE_INGEST_ROUTE_SUFFIX}`),
   full('POST', '/api/outbound'),
   full('GET', CLOUD_DOCS_API_PATH),

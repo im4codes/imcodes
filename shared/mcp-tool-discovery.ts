@@ -68,6 +68,7 @@ export const MCP_TOOL_GROUPS: readonly McpToolGroupDefinition[] = Object.freeze(
       MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE,
       MEMORY_MCP_TOOL_NAMES.PAIR_TASK_GET, MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE, MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK,
       MEMORY_MCP_TOOL_NAMES.PAIR_RESOURCE_CLAIM,
+      MEMORY_MCP_TOOL_NAMES.CALLBACK_UPDATE,
     ]),
   }),
   Object.freeze({
@@ -214,6 +215,8 @@ export const MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE: readonly string[] = Object.freez
   ALIAS_MCP_TOOLS.LIST,
   ALIAS_MCP_TOOLS.RESOLVE,
   ALIAS_MCP_TOOLS.DELETE,
+  // Callback status updates are invoked directly from callback prompts.
+  MEMORY_MCP_TOOL_NAMES.CALLBACK_UPDATE,
 ]);
 
 export function isDefaultActiveMcpTool(name: string): boolean {

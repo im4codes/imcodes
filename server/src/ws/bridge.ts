@@ -2070,6 +2070,8 @@ const REPO_REQUEST_TYPES = new Set<string>([
   REPO_MSG.COMMIT_DETAIL,
   REPO_MSG.PR_DETAIL,
   REPO_MSG.ISSUE_DETAIL,
+  REPO_MSG.CALLBACK_CHECK_NOW,
+  REPO_MSG.CALLBACK_STATUS_REQUEST,
 ]);
 
 // Periodic cleanup interval handle (module-level, shared across all bridge instances)

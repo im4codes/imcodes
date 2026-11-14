@@ -222,6 +222,19 @@ import { supervisionCallerParticipates } from './supervision-mcp-tools.js';
 import { getTaskPairStore } from './task-pairs/store.js';
 import type { StoredTaskPair } from './task-pairs/store.js';
 import { compareQueuedTaskPairs, type TaskPairState } from '../../shared/task-pair.js';
+import { getCallbackTaskStore, type CallbackTaskStore } from './callback-task-store.js';
+import {
+  CALLBACK_MAX_METADATA_BYTES,
+  CALLBACK_MAX_RELATED_TASK_ID_CHARS,
+  CALLBACK_MAX_SOURCE_CHARS,
+  CALLBACK_MAX_SUMMARY_CHARS,
+  CALLBACK_UPDATE_STATUSES,
+  isCallbackUpdateStatus,
+  isValidCallbackId,
+  normalizeCallbackSource,
+  validateCallbackMetadata,
+  type CallbackTaskRecord,
+} from '../../shared/callback-types.js';
 import {
   aliasMcpList,
   aliasMcpResolve,
@@ -367,6 +380,8 @@ export interface MemoryMcpToolDeps {
   ) => Promise<Record<string, unknown>> | Record<string, unknown>;
   /** Registered-node AI-managed MCP/Skill service. Capability tools are absent when unavailable. */
   capabilityService?: CapabilityService;
+  /** Override lightweight callback store (tests inject an isolated :memory: store). */
+  callbackStore?: CallbackTaskStore;
   /** Caller context resolver used only when activating binding-scoped Skill instructions. */
   resolveCapabilityIdentity?: (caller: McpRuntimeCaller) => Promise<CapabilityRuntimeIdentity | null>;
   /** Installs a Skill into this machine's `~/.agents/skills`; tests replace it. */
@@ -1672,6 +1687,39 @@ function pairAccessError(access: PairChecklistAccess, caller?: McpRuntimeCaller)
   return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
 }
 
+function isCallbackCallerAuthorized(
+  caller: McpRuntimeCaller,
+  record: CallbackTaskRecord,
+  sessions: readonly SessionRecord[],
+): boolean {
+  const callerName = caller.sessionName?.trim();
+  if (!callerName) return false;
+  if (callerName === record.targetSession) {
+    return true;
+  }
+  const callerRecord = sessions.find((s) => s.name === callerName);
+  const targetRecord = sessions.find((s) => s.name === record.targetSession);
+  const callerProject = callerRecord
+    ? resolveEffectiveProjectName(callerRecord, sessions)
+    : (caller.projectName ?? projectOfSession(callerName));
+  const targetProject = targetRecord
+    ? resolveEffectiveProjectName(targetRecord, sessions)
+    : projectOfSession(record.targetSession);
+  const isBrain = callerRecord?.role === 'brain'
+    || (!callerRecord && !!callerProject && callerName === projectBrainSession(callerProject));
+  if (!isBrain) return false;
+  if (callerRecord?.projectDir && callerRecord.projectDir === record.scopeKey) {
+    return true;
+  }
+  if (callerProject && callerProject === record.scopeKey) {
+    return true;
+  }
+  if (callerProject && targetProject && callerProject === targetProject) {
+    return true;
+  }
+  return false;
+}
+
 function pairChecklistView(pair: ReturnType<typeof pairChecklistTarget>) {
   if (!pair) return undefined;
   const markdown = pair.state.brief ?? '';
@@ -2310,6 +2358,70 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const result = taskPairService.claimResource({ project: pair.project, taskId: pair.state.taskId, owner: caller.sessionName ?? 'unknown', resource, mode, ttlMs });
       if (!result.ok) return { status: 'error', reason: 'resource_conflict', message: 'resource is already held', conflict: result.conflict };
       return { status: 'ok', claimed: true, claim: result.claim, claims: result.pair.resourceClaims ?? [] };
+    },
+    [MEMORY_MCP_TOOL_NAMES.CALLBACK_UPDATE]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['callbackId', 'status', 'summary', 'source', 'relatedTaskId', 'metadata']);
+      const callbackId = typeof args.callbackId === 'string' ? args.callbackId.trim() : '';
+      if (!isValidCallbackId(callbackId)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'valid callbackId (cb_...) is required');
+      }
+      if (!isCallbackUpdateStatus(args.status)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `status must be one of: ${CALLBACK_UPDATE_STATUSES.join(', ')}`);
+      }
+      const summary = typeof args.summary === 'string' ? args.summary.trim() : '';
+      if (!summary || summary.length > CALLBACK_MAX_SUMMARY_CHARS) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `summary is required and must be <= ${CALLBACK_MAX_SUMMARY_CHARS} chars`);
+      }
+      let sourceFilter: string | undefined;
+      if (args.source !== undefined) {
+        const normalizedSource = normalizeCallbackSource(args.source);
+        if (!normalizedSource) {
+          return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'invalid callback source');
+        }
+        sourceFilter = normalizedSource;
+      }
+      let relatedTaskId: string | undefined;
+      if (args.relatedTaskId !== undefined) {
+        if (typeof args.relatedTaskId !== 'string' || !args.relatedTaskId.trim() || args.relatedTaskId.trim().length > CALLBACK_MAX_RELATED_TASK_ID_CHARS) {
+          return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `relatedTaskId must be a non-empty string <= ${CALLBACK_MAX_RELATED_TASK_ID_CHARS} chars`);
+        }
+        relatedTaskId = args.relatedTaskId.trim();
+      }
+      const metaCheck = validateCallbackMetadata(args.metadata);
+      if (!metaCheck.ok) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, metaCheck.error);
+      }
+      const callbackStore = deps.callbackStore ?? getCallbackTaskStore();
+      const record = callbackStore.getCallback(callbackId);
+      if (!record) {
+        return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'callback not found');
+      }
+      if (sourceFilter && record.source !== sourceFilter) {
+        return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, `callback source mismatch: expected ${record.source}`);
+      }
+      const sessions = await sendSessions();
+      if (!isCallbackCallerAuthorized(caller, record, sessions)) {
+        return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the matching project Brain or assigned callback targetSession may update this callback');
+      }
+      const updated = callbackStore.updateCallback({
+        callbackId,
+        status: args.status,
+        summary,
+        ...(sourceFilter ? { source: sourceFilter } : {}),
+        ...(relatedTaskId !== undefined ? { relatedTaskId } : {}),
+        ...(metaCheck.value !== undefined ? { metadata: metaCheck.value } : {}),
+      });
+      if (!updated.ok) {
+        return error(
+          updated.reason === 'not_found'
+            ? MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE
+            : updated.reason === 'source_mismatch'
+              ? MCP_ERROR_REASONS.SCOPE_FORBIDDEN
+              : MCP_ERROR_REASONS.VALIDATION_FAILED,
+          updated.error,
+        );
+      }
+      return { status: 'ok', callback: updated.record };
     },
     [MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]: async (input) => {
       const gate = memoryGate(deps, MEMORY_FEATURE_FLAGS_BY_NAME.quickSearch, MEMORY_MCP_DISABLED_FLAGS.QUICK_SEARCH, { items: [] });
@@ -5160,6 +5272,14 @@ const schemas = {
   [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE]: z.object({ taskId: z.string().optional().describe('Pair task id.'), markdown: z.string().optional().describe('Complete Markdown brief.'), title: z.string().min(1).optional().describe('Short specific title in the owner UI language; Brain only.'), titleViewerUserIds: z.array(z.string().min(1).max(TASK_PAIR_TITLE_ACCESS_MAX_USER_CHARS)).min(1).max(TASK_PAIR_TITLE_ACCESS_MAX_USERS).optional().describe('Brain only: update legacy title viewer metadata. Not required for Pair access or display.') }).refine((value) => value.markdown !== undefined || value.title !== undefined || value.titleViewerUserIds !== undefined, { message: 'markdown, title or titleViewerUserIds is required' }),
   [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK]: z.object({ taskId: z.string().optional().describe('Pair task id.'), items: z.array(z.number().int().positive()).describe('1-based checklist item numbers.'), box: z.enum(['implemented', 'audited']).describe('Box to update.'), checked: z.boolean().describe('New state.') }),
   [MEMORY_MCP_TOOL_NAMES.PAIR_RESOURCE_CLAIM]: z.object({ taskId: z.string().optional(), resource: z.string().min(1).max(500), mode: z.enum(['exclusive', 'shared']), ttlMs: z.number().int().min(60000).max(86400000).optional(), renew: z.boolean().optional() }),
+  [MEMORY_MCP_TOOL_NAMES.CALLBACK_UPDATE]: z.object({
+    callbackId: z.string().min(1).describe('Callback id (cb_...).'),
+    status: z.enum(CALLBACK_UPDATE_STATUSES).describe('New callback status.'),
+    summary: z.string().min(1).max(CALLBACK_MAX_SUMMARY_CHARS).describe('Concise handling summary.'),
+    source: z.string().min(1).max(CALLBACK_MAX_SOURCE_CHARS).optional().describe('Optional callback source guard (e.g. repo, webhook).'),
+    relatedTaskId: z.string().min(1).max(CALLBACK_MAX_RELATED_TASK_ID_CHARS).optional().describe('Optional related taskId (e.g. tsk_...).'),
+    metadata: z.record(z.string(), z.unknown()).optional().describe(`Optional bounded JSON metadata (max ${CALLBACK_MAX_METADATA_BYTES} bytes).`),
+  }),
   [MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]: z.object({
     query: z.string().describe('Text query; hits include sourceLookup for expansion.'),
     limit: z.number().int().min(1).max(100).optional().describe('Maximum hits.'),

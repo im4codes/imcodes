@@ -8,6 +8,7 @@ import { apiFetch, ApiError } from './api.js';
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
 import { markPerfFrame } from './perf-render-debug.js';
 import { DAEMON_LIVENESS_MSG, DAEMON_STATS_MSG } from '@shared/daemon-stats.js';
+import type { CallbackTaskRecord } from '@shared/callback-types.js';
 import { REPO_MSG } from '@shared/repo-types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { DAEMON_UPGRADE_BLOCK_REASON } from '@shared/daemon-upgrade.js';
@@ -309,6 +310,21 @@ export type ServerMessage =
   | { type: 'repo.commit_detail_response'; requestId?: string; projectDir: string; detail: any }
   | { type: 'repo.pr_detail_response'; requestId?: string; projectDir: string; detail: any }
   | { type: 'repo.issue_detail_response'; requestId?: string; projectDir: string; detail: any }
+  | {
+    type: typeof REPO_MSG.CALLBACK_STATUS_RESPONSE;
+    requestId?: string;
+    projectDir: string;
+    enabled: boolean;
+    checking: boolean;
+    lastCheckedAt?: number;
+    lastError?: string;
+    callbacks: CallbackTaskRecord[];
+  }
+  | {
+    type: typeof REPO_MSG.CALLBACK_EVENT;
+    projectDir: string;
+    callback: CallbackTaskRecord;
+  }
   | { type: 'repo.error'; requestId: string; projectDir?: string; error: string }
   | { type: 'repo.detected'; projectDir: string; context: any }
   | { type: typeof TRANSPORT_MSG.CHAT_HISTORY; sessionId: string; events: Array<Record<string, unknown>> }
@@ -1689,6 +1705,8 @@ export class WsClient {
     'session_list',
     REPO_MSG.DETECTED,
     REPO_MSG.CHECKOUT_BRANCH_RESPONSE,
+    REPO_MSG.CALLBACK_STATUS_RESPONSE,
+    REPO_MSG.CALLBACK_EVENT,
     TRANSPORT_MSG.PROVIDER_STATUS,
     TRANSPORT_MSG.CHAT_HISTORY,
     TRANSPORT_EVENT.CHAT_DELTA,
@@ -2125,6 +2143,35 @@ export class WsClient {
   repoIssueDetail(projectDir: string, number: number, opts?: { sessionName?: string }): string {
     const requestId = crypto.randomUUID();
     this.send({ type: REPO_MSG.ISSUE_DETAIL, projectDir, number, requestId, ...(opts?.sessionName ? { sessionName: opts.sessionName } : {}) });
+    return requestId;
+  }
+
+  /** Notify daemon to refresh repo callback monitoring config from server preferences. */
+  repoCallbackSync(): void {
+    this.send({ type: REPO_MSG.CALLBACK_SYNC });
+  }
+
+  /** Trigger an immediate repo callback poll for a project directory. Returns requestId. */
+  repoCallbackCheckNow(projectDir: string, opts?: { sessionName?: string }): string {
+    const requestId = crypto.randomUUID();
+    this.send({
+      type: REPO_MSG.CALLBACK_CHECK_NOW,
+      requestId,
+      projectDir,
+      ...(opts?.sessionName ? { sessionName: opts.sessionName } : {}),
+    });
+    return requestId;
+  }
+
+  /** Request current repo callback status & recent records for a project directory. Returns requestId. */
+  repoCallbackStatus(projectDir: string, opts?: { sessionName?: string }): string {
+    const requestId = crypto.randomUUID();
+    this.send({
+      type: REPO_MSG.CALLBACK_STATUS_REQUEST,
+      requestId,
+      projectDir,
+      ...(opts?.sessionName ? { sessionName: opts.sessionName } : {}),
+    });
     return requestId;
   }
 

@@ -7,6 +7,7 @@ import { ChatView } from './ChatView.js';
 import { TerminalView } from './TerminalView.js';
 import { FileBrowser } from './file-browser-lazy.js';
 import { RepoPage } from '../pages/RepoPage.js';
+import { buildRepoCallbackTargetOptions } from '../repo-callback-prefs.js';
 import { CronManager } from '../pages/CronManager.js';
 import { LocalWebPreviewPanel } from './LocalWebPreviewPanel.js';
 import { useTimeline } from '../hooks/useTimeline.js';
@@ -270,6 +271,8 @@ registerPanelType('repopage', {
         ws={ctx.ws}
         sessionId={activeSession}
         projectDir={projectDir}
+        serverId={ctx.serverId}
+        callbackTargets={buildRepoCallbackTargetOptions(projectDir, ctx.sessions, ctx.subSessions)}
         scopeToSessionRoot={isTabShare}
         readOnly={ctx.sharedAccessRole === 'viewer'}
         onBack={() => {}}

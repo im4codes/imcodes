@@ -30,6 +30,11 @@ export const REPO_MSG = {
   COMMIT_DETAIL_RESPONSE: 'repo.commit_detail_response',
   PR_DETAIL_RESPONSE: 'repo.pr_detail_response',
   ISSUE_DETAIL_RESPONSE: 'repo.issue_detail_response',
+  CALLBACK_SYNC: 'repo.callback_sync',
+  CALLBACK_CHECK_NOW: 'repo.callback_check_now',
+  CALLBACK_STATUS_REQUEST: 'repo.callback_status_request',
+  CALLBACK_STATUS_RESPONSE: 'repo.callback_status_response',
+  CALLBACK_EVENT: 'repo.callback_event',
   ERROR: 'repo.error',
 } as const;
 
@@ -47,6 +52,8 @@ export const REPO_RELAY_TYPES = new Set([
   REPO_MSG.COMMIT_DETAIL_RESPONSE,
   REPO_MSG.PR_DETAIL_RESPONSE,
   REPO_MSG.ISSUE_DETAIL_RESPONSE,
+  REPO_MSG.CALLBACK_STATUS_RESPONSE,
+  REPO_MSG.CALLBACK_EVENT,
   REPO_MSG.ERROR,
 ]);
 

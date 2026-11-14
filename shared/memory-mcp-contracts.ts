@@ -93,6 +93,14 @@ import {
   VERIFICATION_MACHINE_MCP_TOOLS,
   VERIFICATION_MACHINE_SCOPE_LIST,
 } from './verification-machine.js';
+import {
+  CALLBACK_MAX_METADATA_BYTES,
+  CALLBACK_MAX_RELATED_TASK_ID_CHARS,
+  CALLBACK_MAX_SOURCE_CHARS,
+  CALLBACK_MAX_SUMMARY_CHARS,
+  CALLBACK_MCP_TOOLS,
+  CALLBACK_UPDATE_STATUSES,
+} from './callback-types.js';
 export {
   MEMORY_MCP_SEND_DELIVERY_MODES,
   type MemoryMcpSendDeliveryMode,
@@ -154,6 +162,7 @@ export const MEMORY_MCP_TOOL_NAMES = {
   PAIR_TASK_UPDATE: 'pair_task_update',
   PAIR_TASK_CHECK: 'pair_task_check',
   PAIR_RESOURCE_CLAIM: 'pair_resource_claim',
+  CALLBACK_UPDATE: CALLBACK_MCP_TOOLS.UPDATE,
   SEND_STOP: 'send_stop',
   DESTROY_EXECUTION_CLONE: 'destroy_execution_clone',
   CRON_CREATE_SELF: 'cron_create_self',
@@ -235,6 +244,7 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE,
   MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK,
   MEMORY_MCP_TOOL_NAMES.PAIR_RESOURCE_CLAIM,
+  MEMORY_MCP_TOOL_NAMES.CALLBACK_UPDATE,
   MEMORY_MCP_TOOL_NAMES.SEND_STOP,
   MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE,
   MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF,
@@ -1518,6 +1528,19 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       },
       command: stringSchema('Single CLI command string split cleanly (quotes & Windows backslashes preserved), e.g. "read doc_123 --max-chars 4000". Defaults to "--help" when both args and command are omitted.'),
     }),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.CALLBACK_UPDATE]: {
+    name: MEMORY_MCP_TOOL_NAMES.CALLBACK_UPDATE,
+    description: 'Update status and summary for a callback item (in_progress, done, ignored, failed), optionally linking relatedTaskId or metadata.',
+    inputSchema: objectSchema({
+      callbackId: stringSchema('Callback id (cb_...).'),
+      status: stringSchema('New callback status.', { enum: [...CALLBACK_UPDATE_STATUSES] }),
+      summary: { type: 'string', maxLength: CALLBACK_MAX_SUMMARY_CHARS, description: 'Concise handling summary.' },
+      source: { type: 'string', maxLength: CALLBACK_MAX_SOURCE_CHARS, description: 'Optional callback source guard (e.g. repo, webhook).' },
+      relatedTaskId: { type: 'string', maxLength: CALLBACK_MAX_RELATED_TASK_ID_CHARS, description: 'Optional related taskId (e.g. tsk_...).' },
+      metadata: { type: 'object', additionalProperties: true, description: `Optional bounded JSON metadata (max ${CALLBACK_MAX_METADATA_BYTES} bytes).` },
+    }, ['callbackId', 'status', 'summary']),
     outputSchema: statusSchema,
   },
 };

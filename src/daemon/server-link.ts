@@ -813,6 +813,12 @@ export class ServerLink {
         } catch (err) {
           logger.debug({ err }, 'supervisor-defaults-cache: reconnect refresh failed');
         }
+        try {
+          const { refreshRepoCallbackMonitor } = await import('./repo-callback-monitor.js');
+          await refreshRepoCallbackMonitor();
+        } catch (err) {
+          logger.debug({ err }, 'repo-callback-monitor: reconnect refresh failed');
+        }
       })();
     });
 

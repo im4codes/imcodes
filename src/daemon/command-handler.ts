@@ -2892,6 +2892,13 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case REPO_MSG.ISSUE_DETAIL:
       void handleRepoCommand(cmd, serverLink);
       break;
+    case REPO_MSG.CALLBACK_SYNC:
+    case REPO_MSG.CALLBACK_CHECK_NOW:
+    case REPO_MSG.CALLBACK_STATUS_REQUEST:
+      void import('./repo-callback-monitor.js')
+        .then(({ handleRepoCallbackCommand }) => handleRepoCallbackCommand(cmd, serverLink))
+        .catch((err) => { logger.debug({ err }, 'repo callback command failed'); });
+      break;
     default:
       if (typeof cmd.type === 'string') {
         logger.warn({ type: cmd.type }, 'Unknown web command type');

@@ -52,6 +52,13 @@ import { sanitizePostgresJson, PostgresJsonSafetyError } from '../../../shared/p
 import logger from '../util/logger.js';
 import { SUPERVISION_USER_DEFAULT_PREF_KEY, parseSupervisorDefaultConfig, normalizeSupervisorDefaultConfig } from '../../../shared/supervision-config.js';
 import {
+  REPO_CALLBACK_PREF_KEYS,
+  normalizeRepoCallbackGlobalPrefs,
+  normalizeRepoCallbackServerPrefs,
+  repoCallbackServerPrefKey,
+  type RepoCallbackDaemonSyncPayload,
+} from '../../../shared/repo-callback.js';
+import {
   MEMORY_FEATURE_CONFIG_PREF_KEY,
   parseMemoryFeatureFlagValuesJson,
 } from '../../../shared/feature-flags.js';
@@ -584,6 +591,34 @@ serverRoutes.put('/:id/supervision/user-defaults/daemon', async (c) => {
     logger.debug({ serverId, err }, 'daemon supervisor defaults push failed');
   }
   return c.json({ ok: true, defaults });
+});
+
+/**
+ * GET /:id/repo-callbacks/daemon
+ *
+ * Daemon-scoped (Bearer server token) read of account-level global callback
+ * prompt templates and this server's repo callback monitor configs.
+ */
+serverRoutes.get('/:id/repo-callbacks/daemon', async (c) => {
+  const serverId = c.req.param('id');
+  const authed = await authenticateDaemonServer(c, serverId);
+  if (!authed.ok) return daemonAuthFailure(c, authed);
+  const serverRow = authed.auth;
+  const [rawGlobal, rawServer] = await Promise.all([
+    getUserPref(c.env.DB, serverRow.userId, REPO_CALLBACK_PREF_KEYS.GLOBAL_TEMPLATES),
+    getUserPref(c.env.DB, serverRow.userId, repoCallbackServerPrefKey(serverId)),
+  ]);
+  const parseJsonSafe = (raw: string | null): unknown => {
+    if (!raw) return null;
+    try { return JSON.parse(raw); } catch { return null; }
+  };
+  const globalPrefs = normalizeRepoCallbackGlobalPrefs(parseJsonSafe(rawGlobal));
+  const serverPrefs = normalizeRepoCallbackServerPrefs(parseJsonSafe(rawServer));
+  const payload: RepoCallbackDaemonSyncPayload = {
+    globalTemplates: globalPrefs.templates,
+    repos: serverPrefs.repos,
+  };
+  return c.json(payload);
 });
 
 /**

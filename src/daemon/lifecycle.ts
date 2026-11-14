@@ -1565,6 +1565,15 @@ export async function startup(): Promise<DaemonContext> {
   });
   taskPairService.setScheduler(taskPairAutomation);
   taskPairAutomation.start();
+  if (creds && serverLink) {
+    void import('./repo-callback-monitor.js')
+      .then(({ startRepoCallbackMonitor }) => {
+        startRepoCallbackMonitor(serverLink);
+      })
+      .catch((err) => {
+        logger.debug({ err }, 'repo-callback-monitor: startup prime failed');
+      });
+  }
   // In-flight legacy tasks of `pairs` projects are imported once; off the startup path.
   setImmediate(() => {
     void (async () => {
@@ -2178,6 +2187,8 @@ async function performShutdown(exitCode: number): Promise<void> {
     configureSharedContextRuntime(null);
     const { stopSupervisorDefaultsCacheRefresh } = await import('./supervisor-defaults-cache.js');
     stopSupervisorDefaultsCacheRefresh();
+    const { stopRepoCallbackMonitor } = await import('./repo-callback-monitor.js');
+    stopRepoCallbackMonitor();
     await flushStore();
     logger.info('Store flushed');
   } catch (e) {

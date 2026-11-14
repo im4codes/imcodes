@@ -3,11 +3,14 @@ import { useTranslation } from 'react-i18next';
 import type { ComponentChildren } from 'preact';
 import type { WsClient, ServerMessage } from '../ws-client.js';
 import { ChatMarkdown } from '../components/ChatMarkdown.js';
+import type { CallbackTaskRecord } from '@shared/callback-types.js';
+import { REPO_CALLBACK_RECENT_HISTORY_LIMIT } from '@shared/repo-callback.js';
 import { REPO_MSG } from '@shared/repo-types.js';
 import { FS_SESSION_ROOT_PATH } from '../../../src/shared/transport/fs.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { forceRefreshSharedChangesForCheckout } from '../git-status-store.js';
 import { ingestSessionRepoContext, getSessionRepoContext } from '../session-repo-context-store.js';
+import { RepoCallbackModal, type RepoCallbackTargetOption } from '../components/RepoCallbackModal.js';
 
 // ── Pull-to-refresh component ────────────────────────────────────────────
 
@@ -75,6 +78,8 @@ interface Props {
   ws: WsClient;
   sessionId?: string | null;
   projectDir: string;
+  serverId?: string | null;
+  callbackTargets?: RepoCallbackTargetOption[];
   onBack?: () => void;
   focusLatestAction?: { token: number; failedJobName?: string; failedStepName?: string } | null;
   /** Called when a CI/CD run completes (success/failure). */
@@ -187,7 +192,7 @@ function isTransientWsSendError(err: unknown): boolean {
 
 // ── Component ────────────────────────────────────────────────────────────────
 
-export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEvent, initialTab, initialTabToken, scopeToSessionRoot = false, readOnly = false }: Props) {
+export function RepoPage({ ws, sessionId, projectDir, serverId, callbackTargets, focusLatestAction, onCiEvent, initialTab, initialTabToken, scopeToSessionRoot = false, readOnly = false }: Props) {
   const { t } = useTranslation();
   const requestProjectDir = scopeToSessionRoot ? FS_SESSION_ROOT_PATH : projectDir;
   const sessionScope = scopeToSessionRoot && sessionId ? { sessionName: sessionId } : {};
@@ -219,6 +224,12 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
   const [detailState, setDetailState] = useState<Map<string, 'loading' | 'loaded' | 'error'>>(new Map());
   const [checkoutPendingBranch, setCheckoutPendingBranch] = useState<string | null>(null);
   const [checkoutFeedback, setCheckoutFeedback] = useState<CheckoutFeedback>(null);
+  const [callbackModalOpen, setCallbackModalOpen] = useState(false);
+  const [callbacks, setCallbacks] = useState<CallbackTaskRecord[]>([]);
+  const [callbackRuntimeEnabled, setCallbackRuntimeEnabled] = useState(false);
+  const [callbackChecking, setCallbackChecking] = useState(false);
+  const [callbackLastCheckedAt, setCallbackLastCheckedAt] = useState<number | undefined>(undefined);
+  const [callbackLastError, setCallbackLastError] = useState<string | undefined>(undefined);
 
   // Track pending requestIds to discard stale responses
   const pendingRef = useRef<Set<string>>(new Set());
@@ -565,6 +576,17 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
     localStorage.setItem('repo-active-tab', 'actions');
   }, [focusLatestAction]);
 
+  useEffect(() => {
+    if (scopeToSessionRoot) return;
+    setCallbacks([]);
+    setCallbackLastError(undefined);
+    try {
+      ws.repoCallbackStatus?.(requestProjectDir);
+    } catch {
+      // Ignore while connecting; RECONNECTED handler refreshes once live.
+    }
+  }, [ws, requestProjectDir, scopeToSessionRoot]);
+
   // ── Message handler ──────────────────────────────────────────────────────
 
   useEffect(() => {
@@ -582,6 +604,13 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
         if (detectRetryTimerRef.current) clearTimeout(detectRetryTimerRef.current);
         detectRetryTimerRef.current = null;
         detectRetryCountRef.current = 0;
+        if (!scopeToSessionRoot) {
+          try {
+            ws.repoCallbackStatus?.(requestProjectDir);
+          } catch {
+            // ignore
+          }
+        }
         for (const timer of tabRetryTimersRef.current.values()) clearTimeout(timer);
         tabRetryTimersRef.current.clear();
         tabRetryCountRef.current.clear();
@@ -846,6 +875,26 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
         detailDataRef.current = new Map(detailDataRef.current).set(`issues:${m.detail.number}`, m.detail);
         setDetailData(prev => new Map(prev).set(`issues:${m.detail.number}`, m.detail));
         setDetailState(prev => new Map(prev).set(`issues:${m.detail.number}`, 'loaded'));
+        return;
+      }
+
+      if (msg.type === REPO_MSG.CALLBACK_STATUS_RESPONSE) {
+        if (!responseMatchesProject(msg.projectDir)) return;
+        setCallbacks(Array.isArray(msg.callbacks) ? msg.callbacks : []);
+        setCallbackRuntimeEnabled(Boolean(msg.enabled));
+        setCallbackChecking(Boolean(msg.checking));
+        setCallbackLastCheckedAt(msg.lastCheckedAt);
+        setCallbackLastError(msg.lastError);
+        return;
+      }
+      if (msg.type === REPO_MSG.CALLBACK_EVENT) {
+        if (!responseMatchesProject(msg.projectDir)) return;
+        const incoming = msg.callback;
+        setCallbacks((prev) => {
+          const next = [incoming, ...prev.filter((item) => item.callbackId !== incoming.callbackId)];
+          next.sort((a, b) => (b.updatedAt - a.updatedAt) || (b.createdAt - a.createdAt));
+          return next.slice(0, REPO_CALLBACK_RECENT_HISTORY_LIMIT);
+        });
         return;
       }
 
@@ -1928,6 +1977,51 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
             {formatTime(context.lastRefresh)}
           </span>
         )}
+
+        {!scopeToSessionRoot && (
+          <button
+            type="button"
+            class="btn btn-sm"
+            onClick={() => setCallbackModalOpen(true)}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 6,
+              fontSize: 11,
+              flexShrink: 0,
+              padding: '3px 8px',
+            }}
+          >
+            <span
+              style={{
+                width: 7,
+                height: 7,
+                borderRadius: 9999,
+                background: callbackLastError ? '#ef4444' : callbackRuntimeEnabled ? '#22c55e' : '#64748b',
+                display: 'inline-block',
+              }}
+            />
+            <span>{t('repo.callback_button')}</span>
+            {(() => {
+              const activeCount = callbacks.filter((cb) => cb.status === 'pending' || cb.status === 'in_progress').length;
+              const failedCount = callbacks.filter((cb) => cb.status === 'failed').length;
+              const badgeCount = failedCount > 0 ? failedCount : activeCount;
+              if (badgeCount === 0) return null;
+              return (
+                <span style={{
+                  fontSize: 10,
+                  fontWeight: 600,
+                  padding: '0 5px',
+                  borderRadius: 9999,
+                  background: failedCount > 0 ? 'rgba(239,68,68,0.22)' : 'rgba(59,130,246,0.22)',
+                  color: failedCount > 0 ? '#fca5a5' : '#93c5fd',
+                }}>
+                  {badgeCount}
+                </span>
+              );
+            })()}
+          </button>
+        )}
       </div>
 
       {checkoutFeedback && (
@@ -1989,6 +2083,24 @@ export function RepoPage({ ws, sessionId, projectDir, focusLatestAction, onCiEve
       <div style={{ flex: 1, overflow: 'auto' }}>
         {renderTabContent(activeTab)}
       </div>
+
+      {!scopeToSessionRoot && (
+        <RepoCallbackModal
+          open={callbackModalOpen}
+          onClose={() => setCallbackModalOpen(false)}
+          ws={ws}
+          serverId={serverId}
+          projectDir={projectDir}
+          readOnly={readOnly}
+          callbackTargets={callbackTargets}
+          callbacks={callbacks}
+          runtimeEnabled={callbackRuntimeEnabled}
+          checking={callbackChecking}
+          lastCheckedAt={callbackLastCheckedAt}
+          lastError={callbackLastError}
+          onConfigSaved={(cfg) => setCallbackRuntimeEnabled(cfg.enabled)}
+        />
+      )}
     </div>
   );
 }
