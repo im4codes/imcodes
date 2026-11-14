@@ -32,7 +32,12 @@ import type { RepoProvider } from '../repo/provider.js';
 import type { RepoActionDetail, RepoContext, RepoIssue, RepoPR, RepoWorkflowRun } from '../repo/types.js';
 import { listSessions, type SessionRecord } from '../store/session-store.js';
 import logger from '../util/logger.js';
-import { getCallbackTaskStore, type CallbackPendingSeqEntry, type CallbackTaskStore } from './callback-task-store.js';
+import {
+  getCallbackTaskStore,
+  type CallbackCiRunStateRecord,
+  type CallbackPendingSeqEntry,
+  type CallbackTaskStore,
+} from './callback-task-store.js';
 import type { ServerLink } from './server-link.js';
 import { dispatchSessionMessage } from './session-dispatch.js';
 import { projectBrainSession } from './task-pairs/engine.js';
@@ -87,6 +92,7 @@ interface PollPageItem {
   runAttempt?: number;
   createdAtMs?: number;
   dedupKey: string;
+  ciStateUpsert?: CallbackCiRunStateRecord;
   candidate?: DetectedEventCandidate;
 }
 
@@ -160,6 +166,109 @@ function toTimestampMs(raw: unknown): number | undefined {
     if (Number.isFinite(parsed)) return parsed;
   }
   return undefined;
+}
+
+function hasNativeRunAttempt(run: RepoWorkflowRun): boolean {
+  return typeof run.runAttempt === 'number' && Number.isFinite(run.runAttempt) && run.runAttempt >= 1;
+}
+
+/**
+ * Resolve effective execution generation for providers without native `runAttempt` (e.g. GitLab Pipelines).
+ * Uses persisted run state in SQLite so observed pending transitions (`failed -> running -> failed`),
+ * unobserved fast retries (`updatedAt` advances), or terminal status changes (`success -> failure`)
+ * produce a distinct monotonic generation across polls and restarts while repeating identical polls do not.
+ */
+function resolveCiRunStateTransition(
+  existing: CallbackCiRunStateRecord | undefined,
+  projectDir: string,
+  run: RepoWorkflowRun,
+  pending: boolean,
+  nowMs: number,
+): { attempt: number; upsert?: CallbackCiRunStateRecord } {
+  if (hasNativeRunAttempt(run)) {
+    return { attempt: Math.trunc(run.runAttempt!) };
+  }
+
+  const updatedAtMs = Math.trunc(toTimestampMs(run.updatedAt) ?? 0);
+  if (pending) {
+    if (!existing) {
+      return {
+        attempt: 1,
+        upsert: {
+          source: CALLBACK_SOURCES.REPO,
+          scopeKey: projectDir,
+          runId: run.id,
+          generation: 1,
+          sawPending: true,
+          lastTerminalStatus: null,
+          lastUpdatedAt: updatedAtMs,
+          updatedAt: nowMs,
+        },
+      };
+    }
+    if (!existing.sawPending) {
+      return {
+        attempt: existing.generation,
+        upsert: {
+          ...existing,
+          sawPending: true,
+          updatedAt: nowMs,
+        },
+      };
+    }
+    return { attempt: existing.generation };
+  }
+
+  if (!existing) {
+    return {
+      attempt: 1,
+      upsert: {
+        source: CALLBACK_SOURCES.REPO,
+        scopeKey: projectDir,
+        runId: run.id,
+        generation: 1,
+        sawPending: false,
+        lastTerminalStatus: run.status,
+        lastUpdatedAt: updatedAtMs,
+        updatedAt: nowMs,
+      },
+    };
+  }
+
+  if (existing.lastTerminalStatus === null) {
+    return {
+      attempt: existing.generation,
+      upsert: {
+        ...existing,
+        sawPending: false,
+        lastTerminalStatus: run.status,
+        lastUpdatedAt: updatedAtMs,
+        updatedAt: nowMs,
+      },
+    };
+  }
+
+  const advancedAfterTerminal =
+    existing.sawPending
+    || (updatedAtMs > 0 && existing.lastUpdatedAt > 0 && updatedAtMs > existing.lastUpdatedAt)
+    || existing.lastTerminalStatus !== run.status;
+
+  if (advancedAfterTerminal) {
+    const nextGen = existing.generation + 1;
+    return {
+      attempt: nextGen,
+      upsert: {
+        ...existing,
+        generation: nextGen,
+        sawPending: false,
+        lastTerminalStatus: run.status,
+        lastUpdatedAt: updatedAtMs > 0 ? updatedAtMs : existing.lastUpdatedAt,
+        updatedAt: nowMs,
+      },
+    };
+  }
+
+  return { attempt: existing.generation };
 }
 
 function prunePendingMap(pendingMap: Map<number, number | undefined>, nowMs: number): CallbackPendingSeqEntry[] {
@@ -475,8 +584,12 @@ export class RepoCallbackMonitor {
         pagesFetched += 1;
 
         const dedupKeysToMark: string[] = [];
+        const ciStateUpserts: CallbackCiRunStateRecord[] = [];
         for (const item of pageResult.items) {
           watermarkSeq = watermarkSeq === null ? item.seq : Math.max(watermarkSeq, item.seq);
+          if (item.ciStateUpsert) {
+            ciStateUpserts.push(item.ciStateUpsert);
+          }
           if (item.pending) {
             pendingMap.set(item.seq, item.createdAtMs);
           } else {
@@ -504,6 +617,7 @@ export class RepoCallbackMonitor {
           },
           dedupKeysToMark,
         );
+        this.store.upsertCiRunStates(ciStateUpserts);
 
         if (reachedEnd) break;
         currentPage += 1;
@@ -529,7 +643,8 @@ export class RepoCallbackMonitor {
 
       let minSeqOnPage: number | null = null;
       let maxSeqOnPage: number | null = null;
-      const pageCandidates: DetectedEventCandidate[] = [];
+      const pageCandidates: Array<{ candidate: DetectedEventCandidate; ciStateUpsert?: CallbackCiRunStateRecord }> = [];
+      const nonCandidateCiUpserts: CallbackCiRunStateRecord[] = [];
 
       for (const item of pageResult.items) {
         minSeqOnPage = minSeqOnPage === null ? item.seq : Math.min(minSeqOnPage, item.seq);
@@ -537,20 +652,25 @@ export class RepoCallbackMonitor {
 
         if (item.pending) {
           pendingMap.set(item.seq, item.createdAtMs);
+          if (item.ciStateUpsert) nonCandidateCiUpserts.push(item.ciStateUpsert);
           continue;
         }
 
         pendingMap.delete(item.seq);
         if (!item.candidate) {
+          if (item.ciStateUpsert) nonCandidateCiUpserts.push(item.ciStateUpsert);
           continue;
         }
         if (this.store.hasSeenDedupKey(CALLBACK_SOURCES.REPO, item.dedupKey)) {
+          if (item.ciStateUpsert) nonCandidateCiUpserts.push(item.ciStateUpsert);
           continue;
         }
-        pageCandidates.push(item.candidate);
+        pageCandidates.push({ candidate: item.candidate, ciStateUpsert: item.ciStateUpsert });
       }
 
-      for (const candidate of pageCandidates) {
+      this.store.upsertCiRunStates(nonCandidateCiUpserts);
+
+      for (const { candidate, ciStateUpsert } of pageCandidates) {
         if (
           eventType === 'ci_failed'
           && typeof candidate.metadata.runId === 'number'
@@ -569,8 +689,11 @@ export class RepoCallbackMonitor {
         }
         delete candidate.metadata._run;
 
-        // Mark seen immediately before dispatch so overlapping ticks or errors after send never double-fire.
+        // Mark seen + commit CI state immediately before dispatch so overlapping ticks or restarts never double-fire or lose generation.
         this.store.markSeenDedupKeys(CALLBACK_SOURCES.REPO, projectDir, [candidate.dedupKey], this.now());
+        if (ciStateUpsert) {
+          this.store.upsertCiRunStates([ciStateUpsert]);
+        }
         await this.dispatchCandidate(config, repoSlug, candidate);
         dispatched += 1;
       }
@@ -774,14 +897,27 @@ export class RepoCallbackMonitor {
     }
 
     const res = await provider.listActions({ page, perPage: this.perPage });
+    const noAttemptIds = res.items.filter((run) => !hasNativeRunAttempt(run)).map((run) => run.id);
+    const persistedStates = noAttemptIds.length > 0
+      ? this.store.getCiRunStates(CALLBACK_SOURCES.REPO, projectDir, noAttemptIds)
+      : new Map<number, CallbackCiRunStateRecord>();
+    const nowMs = this.now();
+
     return {
       hasMore: res.hasMore,
       items: res.items.map((run: RepoWorkflowRun) => {
-        const attempt = run.runAttempt ?? 1;
-        const attemptStr = String(attempt);
-        const dedupKey = buildRepoCallbackDedupKey(projectDir, 'ci_failed', String(run.id), attemptStr);
         const pending = isPendingWorkflowRun(run);
         const failed = !pending && isFailedWorkflowRun(run);
+        const stateResolution = resolveCiRunStateTransition(
+          persistedStates.get(run.id),
+          projectDir,
+          run,
+          pending,
+          nowMs,
+        );
+        const attempt = stateResolution.attempt;
+        const attemptStr = String(attempt);
+        const dedupKey = buildRepoCallbackDedupKey(projectDir, 'ci_failed', String(run.id), attemptStr);
         return {
           seq: run.id,
           pending,
@@ -789,6 +925,7 @@ export class RepoCallbackMonitor {
           runAttempt: attempt,
           createdAtMs: toTimestampMs(run.createdAt),
           dedupKey,
+          ciStateUpsert: stateResolution.upsert,
           candidate: failed
             ? {
                 eventType: 'ci_failed',

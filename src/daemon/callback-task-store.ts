@@ -73,6 +73,17 @@ export interface CallbackPendingSeqEntry {
   createdAt?: number;
 }
 
+export interface CallbackCiRunStateRecord {
+  source: string;
+  scopeKey: string;
+  runId: number;
+  generation: number;
+  sawPending: boolean;
+  lastTerminalStatus: string | null;
+  lastUpdatedAt: number;
+  updatedAt: number;
+}
+
 export interface CallbackCheckpointRecord {
   source: string;
   scopeKey: string;
@@ -208,6 +219,17 @@ export class CallbackTaskStore {
         pending_seqs_json TEXT,
         updated_at INTEGER NOT NULL,
         PRIMARY KEY (source, scope_key, event_type)
+      );
+      CREATE TABLE IF NOT EXISTS callback_ci_run_states (
+        source TEXT NOT NULL,
+        scope_key TEXT NOT NULL,
+        run_id INTEGER NOT NULL,
+        generation INTEGER NOT NULL DEFAULT 1,
+        saw_pending INTEGER NOT NULL DEFAULT 0,
+        last_terminal_status TEXT,
+        last_updated_at INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (source, scope_key, run_id)
       );
     `);
   }
@@ -543,6 +565,81 @@ export class CallbackTaskStore {
         checkpoint.pendingSeqs.length > 0 ? JSON.stringify(checkpoint.pendingSeqs) : null,
         checkpoint.updatedAt,
       );
+      this.db.exec('COMMIT');
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+  }
+
+  getCiRunStates(
+    source: CallbackSource,
+    scopeKey: string,
+    runIds: readonly number[],
+  ): Map<number, CallbackCiRunStateRecord> {
+    const out = new Map<number, CallbackCiRunStateRecord>();
+    if (runIds.length === 0) return out;
+    const normalized = normalizeCallbackSource(source) ?? source;
+    const uniqueIds = Array.from(new Set(runIds.filter((id) => Number.isFinite(id))));
+    if (uniqueIds.length === 0) return out;
+    const placeholders = uniqueIds.map(() => '?').join(', ');
+    const rows = this.db.prepare(`
+      SELECT source, scope_key, run_id, generation, saw_pending, last_terminal_status, last_updated_at, updated_at
+        FROM callback_ci_run_states
+       WHERE source = ? AND scope_key = ? AND run_id IN (${placeholders})
+    `).all(normalized, scopeKey, ...uniqueIds) as Array<{
+      source: string;
+      scope_key: string;
+      run_id: number;
+      generation: number;
+      saw_pending: number;
+      last_terminal_status: string | null;
+      last_updated_at: number;
+      updated_at: number;
+    }>;
+    for (const row of rows) {
+      out.set(row.run_id, {
+        source: row.source,
+        scopeKey: row.scope_key,
+        runId: row.run_id,
+        generation: Math.max(1, row.generation),
+        sawPending: row.saw_pending === 1,
+        lastTerminalStatus: row.last_terminal_status ?? null,
+        lastUpdatedAt: Number.isFinite(row.last_updated_at) ? row.last_updated_at : 0,
+        updatedAt: row.updated_at,
+      });
+    }
+    return out;
+  }
+
+  upsertCiRunStates(records: readonly CallbackCiRunStateRecord[]): void {
+    if (records.length === 0) return;
+    const stmt = this.db.prepare(`
+      INSERT INTO callback_ci_run_states (
+        source, scope_key, run_id, generation, saw_pending, last_terminal_status, last_updated_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT (source, scope_key, run_id) DO UPDATE SET
+        generation = excluded.generation,
+        saw_pending = excluded.saw_pending,
+        last_terminal_status = excluded.last_terminal_status,
+        last_updated_at = excluded.last_updated_at,
+        updated_at = excluded.updated_at
+    `);
+    this.db.exec('BEGIN');
+    try {
+      for (const rec of records) {
+        const normalized = normalizeCallbackSource(rec.source) ?? rec.source;
+        stmt.run(
+          normalized,
+          rec.scopeKey,
+          rec.runId,
+          Math.max(1, Math.trunc(rec.generation)),
+          rec.sawPending ? 1 : 0,
+          rec.lastTerminalStatus,
+          Number.isFinite(rec.lastUpdatedAt) ? Math.trunc(rec.lastUpdatedAt) : 0,
+          rec.updatedAt,
+        );
+      }
       this.db.exec('COMMIT');
     } catch (err) {
       this.db.exec('ROLLBACK');
