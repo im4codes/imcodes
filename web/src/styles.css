@@ -6695,6 +6695,8 @@ html.native-ios-mac .chat-dl-btn {
 /* At phone widths the date+time can consume the descriptor’s entire flex space.
    Counters already carry the rail’s information, so keep the text readable. */
 @media (max-width: 360px) {
+  .chat-tool-activity { gap: 3px; }
+  .chat-tool-activity-label { max-width: 44px; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
   .chat-tool-activity-rail { display: none; }
 }
 @media (prefers-reduced-motion: reduce) {
