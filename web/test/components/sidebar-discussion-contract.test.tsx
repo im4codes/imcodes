@@ -210,7 +210,8 @@ describe('StartDiscussionDialog contract', () => {
     expect(screen.getAllByText('discussion.arbiter')).toHaveLength(1);
 
     const comboboxes = screen.getAllByRole('combobox');
-    changeSelect(comboboxes[2], 'gemini');
+    expect(comboboxes[2].querySelector('option[value="gemini"]')).toBeNull();
+    changeSelect(comboboxes[2], 'codex');
     expect(screen.getAllByDisplayValue('Sonnet').length).toBeGreaterThan(0);
 
     const overlay = container.querySelector('.dialog-overlay') as HTMLElement;

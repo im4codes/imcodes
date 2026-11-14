@@ -182,6 +182,8 @@ describe('low-coverage page and component surfaces', () => {
     render(<AddProject apiKey="key-1" serverId="srv-1" onAdded={onAdded} onCancel={vi.fn()} />);
 
     expect(document.querySelector(`option[value="${CLAUDE_CODE_CLI_SDK_AGENT_TYPE}"]`)).toBeNull();
+    expect(document.querySelector('option[value="gemini-sdk"]')).toBeNull();
+    expect(document.querySelector('option[value="gemini"]')).toBeNull();
     expect(screen.getAllByRole('option', { name: 'claude-code-sdk' })).toHaveLength(2);
     expect(screen.getAllByRole('option', { name: 'claude-code' })).toHaveLength(2);
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'alpha' } });
@@ -323,6 +325,8 @@ describe('low-coverage page and component surfaces', () => {
 
     const branch = await screen.findByDisplayValue('main');
     expect(document.querySelector(`option[value="${CLAUDE_CODE_CLI_SDK_AGENT_TYPE}"]`)).toBeNull();
+    expect(document.querySelector('option[value="gemini-sdk"]')).toBeNull();
+    expect(document.querySelector('option[value="gemini"]')).toBeNull();
     expect(screen.getAllByRole('option', { name: 'claude-code-sdk' })).toHaveLength(2);
     expect(screen.getAllByRole('option', { name: 'claude-code' })).toHaveLength(2);
     fireEvent.input(branch, { target: { value: 'release' } });

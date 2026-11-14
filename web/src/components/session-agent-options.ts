@@ -102,6 +102,7 @@ const SESSION_AGENT_CHOICES: SessionAgentChoice[] = [
     icon: '♊',
     fallbackLabel: 'Gemini SDK',
     labelKey: 'session.agentType.gemini_sdk',
+    hidden: true,
     group: 'transport',
     surfaces: ['new-session', 'sub-session'],
   },
@@ -213,6 +214,7 @@ const SESSION_AGENT_CHOICES: SessionAgentChoice[] = [
     id: 'gemini',
     icon: '♊',
     fallbackLabel: 'Gemini CLI',
+    hidden: true,
     group: 'process',
     surfaces: ['new-session', 'sub-session'],
   },
@@ -254,7 +256,7 @@ export function getSessionAgentLabel(
 
 /** Frontend selection policy only; historical types and backend parsing stay intact. */
 export function isSessionAgentTypeSelectable(agentType: string): boolean {
-  return agentType !== CLAUDE_CODE_CLI_SDK_AGENT_TYPE;
+  return agentType !== CLAUDE_CODE_CLI_SDK_AGENT_TYPE && agentType !== 'gemini-sdk' && agentType !== 'gemini';
 }
 
 /**

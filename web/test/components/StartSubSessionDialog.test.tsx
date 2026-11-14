@@ -61,9 +61,14 @@ describe('StartSubSessionDialog', () => {
     expect(screen.getByRole('button', { name: /deepseek_harness/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /^pi$/i })).toBeDefined();
     expect(screen.queryByRole('button', { name: /cc_cli_sdk/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /gemini_sdk/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /gemini cli/i })).toBeNull();
   });
 
-  it.each([{ allowedAgentTypes: undefined }, { allowedAgentTypes: [CLAUDE_CODE_CLI_SDK_AGENT_TYPE, 'claude-code-sdk', 'claude-code'] }])('never restores CC CLI SDK via an allow-list (%j)', async ({ allowedAgentTypes }) => {
+  it.each([
+    { allowedAgentTypes: undefined },
+    { allowedAgentTypes: [CLAUDE_CODE_CLI_SDK_AGENT_TYPE, 'gemini-sdk', 'gemini', 'claude-code-sdk', 'claude-code'] },
+  ])('never restores unavailable CC CLI SDK, Gemini SDK, or Gemini CLI via an allow-list (%j)', async ({ allowedAgentTypes }) => {
     const onStart = vi.fn();
     const { container } = render(
       <StartSubSessionDialog ws={makeWs() as any} defaultCwd="/tmp" allowedAgentTypes={allowedAgentTypes}
@@ -71,11 +76,15 @@ describe('StartSubSessionDialog', () => {
         onStart={onStart} onClose={vi.fn()} />,
     );
     expect(screen.queryByRole('button', { name: /cc_cli_sdk/i })).toBeNull();
-    const unavailable = container.querySelector<HTMLButtonElement>(`[data-agent-type="${CLAUDE_CODE_CLI_SDK_AGENT_TYPE}"]`);
-    if (unavailable) {
-      expect(unavailable.style.display).toBe('none');
-      expect(unavailable.disabled).toBe(true);
-      fireEvent.click(unavailable);
+    expect(screen.queryByRole('button', { name: /gemini_sdk/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /gemini cli/i })).toBeNull();
+    for (const hiddenType of [CLAUDE_CODE_CLI_SDK_AGENT_TYPE, 'gemini-sdk', 'gemini']) {
+      const unavailable = container.querySelector<HTMLButtonElement>(`[data-agent-type="${hiddenType}"]`);
+      if (unavailable) {
+        expect(unavailable.style.display).toBe('none');
+        expect(unavailable.disabled).toBe(true);
+        fireEvent.click(unavailable);
+      }
     }
     await waitFor(() => expect(container.querySelector('.session-agent-card.active')?.getAttribute('data-agent-type')).toBe('claude-code-sdk'));
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
@@ -85,12 +94,19 @@ describe('StartSubSessionDialog', () => {
     expect(onStart).toHaveBeenLastCalledWith('claude-code', undefined, '/tmp', undefined, undefined);
   });
 
-  it('cannot launch when the only allowed type is unavailable CC CLI SDK', () => {
+  it.each([
+    [CLAUDE_CODE_CLI_SDK_AGENT_TYPE],
+    ['gemini-sdk'],
+    ['gemini'],
+    ['gemini-sdk', 'gemini'],
+  ])('cannot launch when the only allowed types are unavailable (%j)', (...allowedAgentTypes) => {
     const onStart = vi.fn();
     render(<StartSubSessionDialog ws={makeWs() as any} defaultCwd="/tmp"
-      allowedAgentTypes={[CLAUDE_CODE_CLI_SDK_AGENT_TYPE]} isProviderConnected={() => false}
+      allowedAgentTypes={allowedAgentTypes} isProviderConnected={() => false}
       getRemoteSessions={() => []} refreshSessions={vi.fn()} onStart={onStart} onClose={vi.fn()} />);
     expect(screen.queryByRole('button', { name: /cc_cli_sdk/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /gemini_sdk/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /gemini cli/i })).toBeNull();
     const launch = screen.getByRole('button', { name: /launch/i }) as HTMLButtonElement;
     expect(launch.disabled).toBe(true);
     fireEvent.click(launch);
@@ -813,30 +829,6 @@ describe('StartSubSessionDialog', () => {
     });
   });
 
-  it('passes requestedModel for gemini-sdk sub-sessions', () => {
-    const onStart = vi.fn();
-    render(
-      <StartSubSessionDialog
-        ws={makeWs() as any}
-        defaultCwd="/tmp"
-        isProviderConnected={() => false}
-        getRemoteSessions={() => []}
-        refreshSessions={vi.fn()}
-        onStart={onStart}
-        onClose={vi.fn()}
-      />,
-    );
-
-    fireEvent.click(screen.getByRole('button', { name: /gemini_sdk/i }));
-    const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
-    fireEvent.input(selects[0], { target: { value: 'auto' } });
-    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
-
-    expect(onStart).toHaveBeenCalledWith('gemini-sdk', undefined, '/tmp', undefined, {
-      requestedModel: 'auto',
-    });
-  });
-
   it('passes requestedModel for kimi-sdk sub-sessions', () => {
     const onStart = vi.fn();
     render(
@@ -995,29 +987,6 @@ describe('StartSubSessionDialog', () => {
 
     expect(onStart).toHaveBeenCalledWith('cursor-headless', undefined, '/tmp', undefined, {
       requestedModel: 'gpt-5.2',
-    });
-  });
-
-  it('passes requestedModel for gemini-sdk sub-sessions', () => {
-    const onStart = vi.fn();
-    render(
-      <StartSubSessionDialog
-        ws={makeWs() as any}
-        defaultCwd="/tmp"
-        isProviderConnected={() => false}
-        getRemoteSessions={() => []}
-        refreshSessions={vi.fn()}
-        onStart={onStart}
-        onClose={vi.fn()}
-      />,
-    );
-
-    fireEvent.click(screen.getByRole('button', { name: /gemini_sdk/i }));
-    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'gemini-2.5-pro' } });
-    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
-
-    expect(onStart).toHaveBeenCalledWith('gemini-sdk', undefined, '/tmp', undefined, {
-      requestedModel: 'gemini-2.5-pro',
     });
   });
 });
