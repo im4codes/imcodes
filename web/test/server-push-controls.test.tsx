@@ -662,9 +662,12 @@ describe('App server push controls integration', () => {
     expect(alphaBtn.querySelector('.server-icon-push-badge')?.getAttribute('data-push-state')).toBe('enabled');
     expect(betaBtn.querySelector('.server-icon-push-badge')?.getAttribute('data-push-state')).toBe('muted');
 
-    // Right-clicking shared-in server must not open ServerContextMenu
+    // Right-clicking shared-in server opens Pin-only context menu and never shows push-mute or owner controls
     fireEvent.contextMenu(sharedBtn);
+    const sharedPinBtn = await waitFor(() => getByTestId('server-ctx-toggle-pin'));
+    expect(sharedPinBtn.textContent).toContain('Pin');
     expect(queryByTestId('server-ctx-toggle-push-mute')).toBeNull();
+    expect(container.querySelectorAll('.server-ctx-item').length).toBe(1);
 
     // Right-click Alpha Server -> Mute notifications
     fireEvent.contextMenu(alphaBtn);

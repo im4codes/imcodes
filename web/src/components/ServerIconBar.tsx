@@ -103,9 +103,7 @@ export function ServerIconBar({
             }}
             onContextMenu={(e: MouseEvent) => {
               e.preventDefault();
-              if (!isSharedIn) {
-                onServerContextMenu?.(server, e.clientX, e.clientY);
-              }
+              onServerContextMenu?.(server, e.clientX, e.clientY);
             }}
           >
             <span class={`server-icon-letter server-icon-label-${label.size}`} aria-hidden="true">

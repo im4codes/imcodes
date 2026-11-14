@@ -666,6 +666,55 @@ describe('projectUnifiedServerList', () => {
     console.log(`[benchmark] 60-server projection 10000 iterations: ${elapsed.toFixed(2)}ms (${(elapsed / 10000).toFixed(4)}ms/iter)`);
     expect(elapsed).toBeLessThan(2500);
   });
+
+  it('sorts pinned shared-in servers alongside pinned owned servers ahead of unpinned servers in pin order', () => {
+    const now = Date.now();
+    const owned1 = { id: 'owned-1', name: 'Owned 1', status: 'online', lastHeartbeatAt: now };
+    const owned2 = { id: 'owned-2', name: 'Owned 2', status: 'online', lastHeartbeatAt: now };
+    const shared1: SharedEntrySummary = {
+      id: 'share-1',
+      serverId: 'shared-1',
+      serverName: 'Shared Cloud 1',
+      role: 'participant',
+      status: 'active',
+      target: { kind: 'server', serverId: 'shared-1' },
+      targetLabel: 'Shared Cloud 1',
+      serverStatus: 'online',
+      lastHeartbeatAt: now,
+    };
+    const shared2: SharedEntrySummary = {
+      id: 'share-2',
+      serverId: 'shared-2',
+      serverName: 'Shared Cloud 2',
+      role: 'viewer',
+      status: 'active',
+      target: { kind: 'main', serverId: 'shared-2', sessionName: 'deck_shared' },
+      targetLabel: 'deck_shared',
+      serverStatus: 'online',
+      lastHeartbeatAt: now,
+    };
+    const ownedIds = new Set(['owned-1', 'owned-2']);
+
+    // Pin a shared-in server first, then an owned server
+    const pinnedResult = projectUnifiedServerList(
+      [owned1, owned2],
+      [shared1, shared2],
+      ownedIds,
+      ['owned-1', 'owned-2', 'shared-1', 'shared-2'],
+      ['shared-2', 'owned-2'],
+    );
+    expect(pinnedResult.map((s) => s.id)).toEqual(['shared-2', 'owned-2', 'owned-1', 'shared-1']);
+
+    // Unpin restores ordinary order
+    const unpinnedResult = projectUnifiedServerList(
+      [owned1, owned2],
+      [shared1, shared2],
+      ownedIds,
+      ['owned-1', 'owned-2', 'shared-1', 'shared-2'],
+      [],
+    );
+    expect(unpinnedResult.map((s) => s.id)).toEqual(['owned-1', 'owned-2', 'shared-1', 'shared-2']);
+  });
 });
 
 describe('filterRestrictedSharedEntries', () => {

@@ -87,4 +87,39 @@ describe('ServerContextMenu', () => {
     expect(top).toBeLessThanOrEqual(80);
     expect(top).toBeGreaterThanOrEqual(4);
   });
+
+  it('renders only Pin/Unpin when owner-only actions are omitted for shared-in servers', () => {
+    const onTogglePin = vi.fn();
+    const onClose = vi.fn();
+    const { container, rerender } = render(
+      <ServerContextMenu
+        x={24}
+        y={32}
+        pinned={false}
+        onTogglePin={onTogglePin}
+        onClose={onClose}
+      />,
+    );
+
+    const items = container.querySelectorAll('.server-ctx-item');
+    expect(items).toHaveLength(1);
+    expect(items[0]?.textContent).toBe('server.pin');
+    expect(container.querySelector('.menu-divider')).toBeNull();
+    expect(container.querySelector('.server-ctx-item-danger')).toBeNull();
+    fireEvent.click(items[0]!);
+    expect(onTogglePin).toHaveBeenCalledTimes(1);
+    expect(onClose).toHaveBeenCalledTimes(1);
+
+    rerender(
+      <ServerContextMenu
+        x={24}
+        y={32}
+        pinned
+        onTogglePin={onTogglePin}
+        onClose={onClose}
+      />,
+    );
+    expect(container.querySelectorAll('.server-ctx-item')).toHaveLength(1);
+    expect(container.querySelector('.server-ctx-item')?.textContent).toBe('server.unpin');
+  });
 });

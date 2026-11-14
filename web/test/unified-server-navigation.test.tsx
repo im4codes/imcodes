@@ -121,12 +121,17 @@ describe('ServerIconBar navigation with unified servers', () => {
     fireEvent.click(getByTitle('Partner Cloud'));
     expect(onOpenSharedEntry).toHaveBeenCalledWith(unifiedServers[1].sharedEntry);
 
-    // 3. Right-click context menu: allowed on owned, suppressed on shared-in
+    // 3. Right-click context menu: works on both owned and shared-in servers
     fireEvent.contextMenu(getByTitle('Primary Node'));
     expect(onServerContextMenu).toHaveBeenCalledTimes(1);
 
     fireEvent.contextMenu(getByTitle('Partner Cloud'));
-    expect(onServerContextMenu).toHaveBeenCalledTimes(1); // Not called for shared-in
+    expect(onServerContextMenu).toHaveBeenCalledTimes(2);
+    expect(onServerContextMenu).toHaveBeenLastCalledWith(
+      expect.objectContaining({ id: 'srv-shared', isSharedIn: true }),
+      expect.any(Number),
+      expect.any(Number),
+    );
   });
 
   it('renders shared-in return arrow indicator on the shared icon button', () => {

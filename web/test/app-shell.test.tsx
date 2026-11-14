@@ -506,7 +506,7 @@ vi.mock('../src/pages/CronManager.js', () => ({
 }));
 
 vi.mock('../src/components/ServerIconBar.js', () => ({
-  ServerIconBar: ({ servers, returnHintServerId, onSelectServer, onOpenSharedEntry, onSettings, onAdmin, onHome, onToggleSidebar, onServerContextMenu }: any) => (
+  ServerIconBar: ({ servers, returnHintServerId, pinnedServerIds, onSelectServer, onOpenSharedEntry, onSettings, onAdmin, onHome, onToggleSidebar, onServerContextMenu }: any) => (
     <div data-testid="server-icon-bar" data-return-hint-server-id={returnHintServerId ?? ''}>
       server-icon-bar
       <button onClick={onSettings}>server-settings</button>
@@ -517,6 +517,12 @@ vi.mock('../src/components/ServerIconBar.js', () => ({
       {servers?.map((server: any) => (
         <button
           key={server.id}
+          data-testid={`server-icon-${server.id}`}
+          data-pinned={pinnedServerIds?.has(server.id) ? 'true' : 'false'}
+          onContextMenu={(e: MouseEvent) => {
+            e.preventDefault();
+            onServerContextMenu?.(server, 11, 22);
+          }}
           onClick={() => {
             if (server.isSharedIn) {
               if (server.sharedEntry && onOpenSharedEntry) {
@@ -961,14 +967,15 @@ vi.mock('../src/components/ServerContextMenu.js', () => ({
       <button onClick={onCancel}>delete-cancel</button>
     </div>
   ),
-  ServerContextMenu: ({ onClose, onDelete, onRename, onUpgrade, onUpgradeAll, onTogglePin }: any) => (
+  ServerContextMenu: ({ pinned, onClose, onDelete, onRename, onUpgrade, onUpgradeAll, onTogglePin, onTogglePushMute }: any) => (
     <div>
       server-context-menu
-      <button onClick={onTogglePin}>server-menu-pin</button>
-      <button onClick={onRename}>server-menu-rename</button>
-      <button onClick={onUpgrade}>server-menu-upgrade</button>
-      <button onClick={onUpgradeAll}>server-menu-upgrade-all</button>
-      <button onClick={onDelete}>server-menu-delete</button>
+      <button data-pinned={String(Boolean(pinned))} onClick={onTogglePin}>server-menu-pin</button>
+      {onTogglePushMute && <button onClick={onTogglePushMute}>server-menu-push-mute</button>}
+      {onRename && <button onClick={onRename}>server-menu-rename</button>}
+      {onUpgrade && <button onClick={onUpgrade}>server-menu-upgrade</button>}
+      {onUpgradeAll && <button onClick={onUpgradeAll}>server-menu-upgrade-all</button>}
+      {onDelete && <button onClick={onDelete}>server-menu-delete</button>}
       <button onClick={onClose}>server-menu-close</button>
     </div>
   ),
@@ -7861,7 +7868,7 @@ describe('App shell', () => {
     expect(screen.queryByText('server-select-srv-shared')).toBeNull();
   }, 20_000);
 
-  it('audit-owned-context-menu: mobile server dropdown opens ServerContextMenu for owned server and suppresses for shared-in server', async () => {
+  it('audit-owned-context-menu: mobile server dropdown opens full menu for owned server and pin-only menu for shared-in server (plus pin/unpin reorder & indicators)', async () => {
     const originalUserAgent = navigator.userAgent;
     Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
     try {
@@ -7890,23 +7897,134 @@ describe('App shell', () => {
       });
       fireEvent.click(mobileBtn);
 
-      // 2. Owned server contextmenu opens management menu
+      // 2. Owned server contextmenu opens full management menu
       const menu = view.container.querySelector('.mobile-server-menu')!;
       const alphaBtn = within(menu as HTMLElement).getByText('Alpha Server').closest('button')!;
       fireEvent.contextMenu(alphaBtn);
       expect(await screen.findByText('server-context-menu')).toBeTruthy();
+      expect(screen.getByText('server-menu-pin')).toBeTruthy();
+      expect(screen.getByText('server-menu-rename')).toBeTruthy();
+      expect(screen.getByText('server-menu-upgrade')).toBeTruthy();
+      expect(screen.getByText('server-menu-delete')).toBeTruthy();
       fireEvent.click(screen.getByText('server-menu-close'));
       expect(screen.queryByText('server-context-menu')).toBeNull();
 
-      // 3. Negative control: shared server contextmenu does NOT open management menu
+      // 3. Shared-in server contextmenu opens Pin-only menu without owner actions
       fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
       const menuAgain = view.container.querySelector('.mobile-server-menu')!;
       const sharedItemBtn = within(menuAgain as HTMLElement).getByText('Shared Server Ctx').closest('button')!;
       fireEvent.contextMenu(sharedItemBtn);
-      expect(screen.queryByText('server-context-menu')).toBeNull();
+      expect(await screen.findByText('server-context-menu')).toBeTruthy();
+      const pinBtn = screen.getByText('server-menu-pin');
+      expect(pinBtn.getAttribute('data-pinned')).toBe('false');
+      expect(screen.queryByText('server-menu-push-mute')).toBeNull();
+      expect(screen.queryByText('server-menu-rename')).toBeNull();
+      expect(screen.queryByText('server-menu-upgrade')).toBeNull();
+      expect(screen.queryByText('server-menu-upgrade-all')).toBeNull();
+      expect(screen.queryByText('server-menu-delete')).toBeNull();
+
+      // 4. Click Pin -> shared-in server moves to the top and shows pinned state in mobile dropdown and mobile drawer
+      fireEvent.click(pinBtn);
+      fireEvent.click(screen.getByText('server-menu-close'));
+
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+      await waitFor(() => {
+        const pinnedMenuItems = Array.from(view.container.querySelectorAll('.mobile-server-menu .mobile-server-menu-server'));
+        expect(pinnedMenuItems[0]?.textContent).toContain('Shared Server Ctx');
+        expect(pinnedMenuItems[0]?.classList.contains('pinned')).toBe(true);
+      });
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+
+      // Check mobile sidebar drawer shows server-item-pin and pin-only context menu on shared-in item
+      fireEvent.click(view.container.querySelector('.mobile-sidebar-toggle')!);
+      const sharedDrawerBtn = await waitFor(() => {
+        const btns = Array.from(view.container.querySelectorAll('.mobile-sidebar-body .server-item'));
+        const shared = btns.find((el) => el.textContent?.includes('Shared Server Ctx'));
+        if (!shared) throw new Error('no shared drawer button');
+        expect(btns[0]).toBe(shared);
+        expect(shared.querySelector('.server-item-pin')?.textContent).toBe('📌');
+        return shared;
+      });
+      fireEvent.contextMenu(sharedDrawerBtn);
+      expect(await screen.findByText('server-context-menu')).toBeTruthy();
+      const unpinBtn = screen.getByText('server-menu-pin');
+      expect(unpinBtn.getAttribute('data-pinned')).toBe('true');
+      expect(screen.queryByText('server-menu-rename')).toBeNull();
+
+      // 5. Click Unpin -> restores original order
+      fireEvent.click(unpinBtn);
+      fireEvent.click(screen.getByText('server-menu-close'));
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+      await waitFor(() => {
+        const restoredMenuItems = Array.from(view.container.querySelectorAll('.mobile-server-menu .mobile-server-menu-server'));
+        expect(restoredMenuItems.map((el) => el.textContent)).toEqual([
+          expect.stringContaining('Alpha Server'),
+          expect.stringContaining('Shared Server Ctx'),
+        ]);
+        expect(restoredMenuItems[1]?.classList.contains('pinned')).toBe(false);
+      });
     } finally {
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
     }
+  }, 20_000);
+
+  it('desktop ServerIconBar opens pin-only context menu on shared-in server and moves it to top', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    const sharedGrant = {
+      id: 'share-desktop-pin',
+      serverId: 'srv-shared-desktop',
+      serverName: 'Desktop Shared',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Desktop Shared',
+      target: { kind: 'server', serverId: 'srv-shared-desktop' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([sharedGrant]);
+    const { App } = await importApp();
+    const view = render(<App />);
+    await screen.findByTestId('session-pane-deck_alpha_brain');
+
+    const sharedIcon = await waitFor(() => view.getByTestId('server-icon-srv-shared-desktop'));
+    expect(sharedIcon.getAttribute('data-pinned')).toBe('false');
+    fireEvent.contextMenu(sharedIcon);
+
+    expect(await screen.findByText('server-context-menu')).toBeTruthy();
+    const pinBtn = screen.getByText('server-menu-pin');
+    expect(pinBtn.getAttribute('data-pinned')).toBe('false');
+    expect(screen.queryByText('server-menu-push-mute')).toBeNull();
+    expect(screen.queryByText('server-menu-rename')).toBeNull();
+    expect(screen.queryByText('server-menu-upgrade')).toBeNull();
+    expect(screen.queryByText('server-menu-upgrade-all')).toBeNull();
+    expect(screen.queryByText('server-menu-delete')).toBeNull();
+
+    fireEvent.click(pinBtn);
+    fireEvent.click(screen.getByText('server-menu-close'));
+    await waitFor(() => {
+      const iconButtons = Array.from(view.container.querySelectorAll('[data-testid^="server-icon-srv-"]'));
+      expect(iconButtons.map((el) => el.getAttribute('data-testid'))).toEqual([
+        'server-icon-srv-shared-desktop',
+        'server-icon-srv-1',
+      ]);
+      expect(view.getByTestId('server-icon-srv-shared-desktop').getAttribute('data-pinned')).toBe('true');
+    });
+
+    fireEvent.contextMenu(view.getByTestId('server-icon-srv-shared-desktop'));
+    expect(await screen.findByText('server-context-menu')).toBeTruthy();
+    const unpinBtn = screen.getByText('server-menu-pin');
+    expect(unpinBtn.getAttribute('data-pinned')).toBe('true');
+    fireEvent.click(unpinBtn);
+    fireEvent.click(screen.getByText('server-menu-close'));
+
+    await waitFor(() => {
+      const iconButtons = Array.from(view.container.querySelectorAll('[data-testid^="server-icon-srv-"]'));
+      expect(iconButtons.map((el) => el.getAttribute('data-testid'))).toEqual([
+        'server-icon-srv-1',
+        'server-icon-srv-shared-desktop',
+      ]);
+      expect(view.getByTestId('server-icon-srv-shared-desktop').getAttribute('data-pinned')).toBe('false');
+    });
   }, 20_000);
 
   it('audit-owned-context-menu: mobile sidebar drawer opens ServerContextMenu for owned server', async () => {

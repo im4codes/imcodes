@@ -2649,13 +2649,13 @@ function InternalMainApp() {
     () => sortServersByPreference(servers, serverOrder, serverPinned),
     [servers, serverOrder, serverPinned],
   );
-  const pinnedServerIds = useMemo(
-    () => new Set(normalizePinnedServers(servers, serverPinned)),
-    [servers, serverPinned],
-  );
   const unifiedServers = useMemo(
     () => projectUnifiedServerList(servers, sharedEntries, ownedServerIdsRef.current, serverOrder, serverPinned),
     [servers, sharedEntries, serverOrder, serverPinned, presenceTick],
+  );
+  const pinnedServerIds = useMemo(
+    () => new Set(normalizePinnedServers(unifiedServers, serverPinned)),
+    [unifiedServers, serverPinned],
   );
   const restrictedSharedEntries = useMemo(
     () => filterRestrictedSharedEntries(sharedEntries),
@@ -2676,6 +2676,25 @@ function InternalMainApp() {
   const toggleServerPinned = useCallback((serverId: string) => {
     setServerPinned((previous) => toggleServerPin(previous, serverId));
   }, [setServerPinned]);
+  const openUnifiedServerContextMenu = useCallback((item: UnifiedServerItem, x: number, y: number) => {
+    const matched = item.server || servers.find((srv) => srv.id === item.id && ownedServerIdsRef.current.has(srv.id));
+    if (matched) {
+      setServerCtxMenu({ server: matched as ServerInfo, x, y });
+      return;
+    }
+    if (!item.isSharedIn) return;
+    setServerCtxMenu({
+      server: {
+        id: item.id,
+        name: item.name,
+        status: item.status,
+        lastHeartbeatAt: item.lastHeartbeatAt ?? null,
+        createdAt: item.lastHeartbeatAt ?? 0,
+      },
+      x,
+      y,
+    });
+  }, [servers]);
   const accessiblePushServerIds = useMemo(
     () => sanitizePushEnabledServerIds([
       ...servers.filter((s) => ownedServerIdsRef.current.has(s.id)).map((s) => s.id),
@@ -8698,11 +8717,10 @@ function InternalMainApp() {
                               key={s.id}
                               class={`mobile-server-menu-item mobile-server-menu-server${s.id === selectedServerId ? ' active' : ''}${pinnedServerIds.has(s.id) ? ' pinned' : ''}${showSharedReturnGuide && s.id === sharedReturnServer?.id ? ' server-return-hint' : ''}`}
                               onClick={() => { handleUnifiedServerSelect(s); setShowMobileServerMenu(false); }}
-                              onContextMenu={s.isSharedIn ? (e) => e.preventDefault() : (e) => {
+                              onContextMenu={(e) => {
                                 e.preventDefault();
                                 setShowMobileServerMenu(false);
-                                const ownedServer = s.server || servers.find((srv) => srv.id === s.id && ownedServerIdsRef.current.has(srv.id));
-                                if (ownedServer) setServerCtxMenu({ server: ownedServer as ServerInfo, x: e.clientX, y: e.clientY });
+                                openUnifiedServerContextMenu(s, e.clientX, e.clientY);
                               }}
                             >
                               <span
@@ -9311,11 +9329,10 @@ function InternalMainApp() {
                         key={s.id}
                         class={`server-item${s.id === selectedServerId ? ' active' : ''}${online ? '' : ' offline'}${showSharedReturnGuide && s.id === sharedReturnServer?.id ? ' server-return-hint' : ''}`}
                         onClick={() => { handleUnifiedServerSelect(s); closeSidebar(); }}
-                        onContextMenu={s.isSharedIn ? (e) => e.preventDefault() : (e) => {
+                        onContextMenu={(e) => {
                           e.preventDefault();
                           closeSidebar();
-                          const ownedServer = s.server || servers.find((srv) => srv.id === s.id && ownedServerIdsRef.current.has(srv.id));
-                          if (ownedServer) setServerCtxMenu({ server: ownedServer as ServerInfo, x: e.clientX, y: e.clientY });
+                          openUnifiedServerContextMenu(s, e.clientX, e.clientY);
                         }}
                       >
                         <span
@@ -10115,25 +10132,28 @@ function InternalMainApp() {
         />
       )}
 
-      {serverCtxMenu && (
-        <ServerContextMenu
-          x={serverCtxMenu.x}
-          y={serverCtxMenu.y}
-          pinned={normalizePinnedServers(servers, serverPinned).includes(serverCtxMenu.server.id)}
-          pushMuted={!effectivePushEnabledServerIdSet.has(serverCtxMenu.server.id)}
-          onTogglePin={() => toggleServerPinned(serverCtxMenu.server.id)}
-          onTogglePushMute={
-            ownedServerIdsRef.current.has(serverCtxMenu.server.id)
-              ? () => void handleToggleServerPushMute(serverCtxMenu.server.id)
-              : undefined
-          }
-          onRename={() => handleRenameServer(serverCtxMenu.server)}
-          onUpgrade={() => handleUpgradeDaemon(serverCtxMenu.server)}
-          onUpgradeAll={servers.length > 1 ? handleUpgradeAll : undefined}
-          onDelete={() => setDeleteTarget(serverCtxMenu.server)}
-          onClose={() => setServerCtxMenu(null)}
-        />
-      )}
+      {serverCtxMenu && (() => {
+        const isOwned = ownedServerIdsRef.current.has(serverCtxMenu.server.id);
+        return (
+          <ServerContextMenu
+            x={serverCtxMenu.x}
+            y={serverCtxMenu.y}
+            pinned={pinnedServerIds.has(serverCtxMenu.server.id)}
+            pushMuted={!effectivePushEnabledServerIdSet.has(serverCtxMenu.server.id)}
+            onTogglePin={() => toggleServerPinned(serverCtxMenu.server.id)}
+            onTogglePushMute={
+              isOwned
+                ? () => void handleToggleServerPushMute(serverCtxMenu.server.id)
+                : undefined
+            }
+            onRename={isOwned ? () => handleRenameServer(serverCtxMenu.server) : undefined}
+            onUpgrade={isOwned ? () => handleUpgradeDaemon(serverCtxMenu.server) : undefined}
+            onUpgradeAll={isOwned && servers.length > 1 ? handleUpgradeAll : undefined}
+            onDelete={isOwned ? () => setDeleteTarget(serverCtxMenu.server) : undefined}
+            onClose={() => setServerCtxMenu(null)}
+          />
+        );
+      })()}
 
       {daemonUpgradeConfirmTarget && (
         <DaemonUpgradeConfirmDialog

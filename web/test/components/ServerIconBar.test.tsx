@@ -97,7 +97,7 @@ describe('ServerIconBar labels', () => {
     expect(labelOf(container.querySelector('.server-icon-server')!)).toBe('?');
   });
 
-  it('renders enabled speaker badge vs muted ban badge and excludes shared-in servers', () => {
+  it('renders enabled speaker badge vs muted ban badge on owned servers while allowing context menu and pins on shared-in servers', () => {
     const onMenu = vi.fn();
     const { container } = render(
       <ServerIconBar
@@ -107,6 +107,7 @@ describe('ServerIconBar labels', () => {
           server('c', 'vm-shared', { isSharedIn: true }),
         ]}
         activeServerId="a"
+        pinnedServerIds={new Set(['c'])}
         pushEnabledServerIds={new Set(['a', 'c'])}
         onSelectServer={() => {}}
         onServerContextMenu={onMenu}
@@ -125,9 +126,10 @@ describe('ServerIconBar labels', () => {
     expect(badgeB?.classList.contains('is-muted')).toBe(true);
     expect(badgeB?.getAttribute('data-push-state')).toBe('muted');
     expect(badgeC).toBeNull();
+    expect(btnC.querySelector('.server-icon-pin')?.textContent).toBe('📌');
 
-    // Right-click on shared-in server must not invoke context menu
+    // Right-click on shared-in server invokes context menu (for Pin/Unpin in ServerContextMenu)
     fireEvent.contextMenu(btnC, { clientX: 10, clientY: 20 });
-    expect(onMenu).not.toHaveBeenCalled();
+    expect(onMenu).toHaveBeenCalledWith(expect.objectContaining({ id: 'c', isSharedIn: true }), 10, 20);
   });
 });
