@@ -2413,6 +2413,10 @@ describe('cloud docs & recent documents', () => {
       toolbarNoTabs: true,
       hideRightMenu: true,
       hideRulers: true,
+      layout: {
+        leftMenu: false,
+        rightMenu: false,
+      },
       help: false,
       feedback: false,
       chat: false,

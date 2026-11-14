@@ -2734,6 +2734,10 @@ describe('Document Sharing & ONLYOFFICE Integration Routes', () => {
       toolbarNoTabs: true,
       hideRightMenu: true,
       hideRulers: true,
+      layout: {
+        leftMenu: false,
+        rightMenu: false,
+      },
       help: false,
       feedback: false,
       chat: false,

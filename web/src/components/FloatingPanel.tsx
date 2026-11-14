@@ -344,7 +344,7 @@ export function FloatingPanel({
     return (
       <div className={['floating-panel', className].filter(Boolean).join(' ')} style={{ position: 'fixed', inset: 0, zIndex: mobileZIndex, background: '#0f172a', display: 'flex', flexDirection: 'column' }}>
         <div className="floating-panel-safe-area" style={{ height: 'env(safe-area-inset-top, 0px)', flexShrink: 0, background: '#0f172a' }} />
-        {!hideTitleBar && <div className="floating-panel-titlebar" style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', background: '#1e293b', borderBottom: '1px solid #334155', flexShrink: 0 }}>
+        {!hideTitleBar && <div className="floating-panel-titlebar" style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '3px 10px', minHeight: 28, background: '#1e293b', borderBottom: '1px solid #334155', flexShrink: 0 }}>
           <span
             title={title}
             style={{
@@ -353,7 +353,8 @@ export function FloatingPanel({
               overflow: 'hidden',
               textOverflow: 'ellipsis',
               whiteSpace: 'nowrap',
-              fontSize: 13,
+              fontSize: 12,
+              lineHeight: 1.2,
               color: '#94a3b8',
               fontWeight: 600,
             }}
@@ -364,7 +365,21 @@ export function FloatingPanel({
             onClick={onClose}
             title={t('window.close')}
             aria-label={t('window.close')}
-            style={{ background: 'none', border: 'none', color: '#94a3b8', cursor: 'pointer', fontSize: 18, padding: '4px 8px', flexShrink: 0 }}
+            style={{
+              background: 'none',
+              border: 'none',
+              color: '#94a3b8',
+              cursor: 'pointer',
+              fontSize: 15,
+              lineHeight: 1.1,
+              padding: '2px 6px',
+              minWidth: 28,
+              minHeight: 22,
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              flexShrink: 0,
+            }}
           >✕</button>
         </div>}
         <div className="floating-panel-content" style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>

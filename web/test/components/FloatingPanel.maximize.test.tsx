@@ -383,4 +383,34 @@ describe('FloatingPanel maximize integration', () => {
       expect(onToggleMaximized).toHaveBeenCalledTimes(1);
     });
   });
+
+  it('uses a compact mobile title bar while keeping safe-area and close control tappable', () => {
+    vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)');
+    const onClose = vi.fn();
+
+    render(
+      <FloatingPanel id="cloud-docs" title="Cloud Docs" onClose={onClose}>
+        <div>content</div>
+      </FloatingPanel>,
+    );
+
+    const safeArea = document.querySelector('.floating-panel-safe-area') as HTMLElement;
+    expect(safeArea).toBeTruthy();
+
+    const titlebar = document.querySelector('.floating-panel-titlebar') as HTMLElement;
+    expect(titlebar).toBeTruthy();
+    expect(titlebar.style.padding).toBe('3px 10px');
+    expect(titlebar.style.minHeight).toBe('28px');
+
+    const title = screen.getByTitle('Cloud Docs') as HTMLElement;
+    expect(title.style.fontSize).toBe('12px');
+
+    const closeBtn = screen.getByRole('button', { name: 'Close' }) as HTMLElement;
+    expect(closeBtn.style.fontSize).toBe('15px');
+    expect(closeBtn.style.padding).toBe('2px 6px');
+    expect(closeBtn.style.minWidth).toBe('28px');
+    expect(closeBtn.style.minHeight).toBe('22px');
+    fireEvent.click(closeBtn);
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
 });

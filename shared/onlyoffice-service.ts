@@ -43,6 +43,10 @@ export interface OnlyOfficeEditorPresentation {
     toolbarHideFileName?: boolean;
     hideRightMenu?: boolean;
     hideRulers?: boolean;
+    layout?: {
+      leftMenu?: boolean;
+      rightMenu?: boolean;
+    };
     help?: boolean;
     feedback?: boolean;
     chat?: boolean;
@@ -91,6 +95,10 @@ export function buildOnlyOfficeEditorPresentation(options: {
       toolbarNoTabs: true,
       hideRightMenu: true,
       hideRulers: true,
+      layout: {
+        leftMenu: false,
+        rightMenu: false,
+      },
       help: false,
       feedback: false,
       chat: false,
