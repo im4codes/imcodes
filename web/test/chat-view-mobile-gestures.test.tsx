@@ -8,6 +8,7 @@ import type { TimelineEvent } from '../src/ws-client.js';
 import {
   attachMobileNavigationGestures,
   MOBILE_LONG_PRESS_MS,
+  type MobileNavigationGestureProgress,
   type TouchPointSnapshot,
 } from '../src/mobile-navigation-gestures.js';
 
@@ -238,6 +239,78 @@ describe('ChatView mobile navigation gesture isolation', () => {
 
     expect(actions).toEqual([]);
     expect(container.querySelector('.chat-scroll-btn')).toBeTruthy();
+
+    detach();
+  });
+
+  it('triggers fast direct left/right tab switch on ChatView, ignores sub-threshold swipe, and skips scrollable <pre>', () => {
+    vi.useFakeTimers();
+    window.matchMedia = makeCoarseMatchMedia();
+    const actions: string[] = [];
+    const progressLog: Array<MobileNavigationGestureProgress | null> = [];
+    const detach = attachMobileNavigationGestures({
+      isMobile: true,
+      viewportWidth: 390,
+      onAction: (a) => actions.push(a),
+      onProgress: (p) => progressLog.push(p),
+    });
+
+    const { container } = render(
+      <ChatView events={[makeAssistantEvent(1, 'Normal message')]} loading={false} sessionId="sess-mobile" />,
+    );
+    act(() => {});
+    makeScrollableChatView(container);
+    const bubble = container.querySelector('.chat-event') as HTMLElement;
+    expect(bubble).toBeTruthy();
+
+    // Fast swipe left (< 150ms, dx = -130px) -> tabNext (right tab)
+    act(() => {
+      dispatchTouch(bubble, 'touchstart', [{ identifier: 1, clientX: 280, clientY: 220, target: bubble }]);
+      vi.advanceTimersByTime(40);
+      const m = dispatchTouch(bubble, 'touchmove', [{ identifier: 1, clientX: 150, clientY: 222, target: bubble }]);
+      expect(m.defaultPrevented).toBe(true);
+      expect(progressLog.at(-1)).toMatchObject({
+        mode: 'direct_horizontal',
+        swipeAction: 'tabNext',
+        armed: true,
+      });
+      dispatchTouch(bubble, 'touchend', [], [{ identifier: 1, clientX: 150, clientY: 222, target: bubble }]);
+    });
+    expect(actions).toEqual(['tabNext']);
+    expect(container.querySelector('.chat-scroll-btn')).toBeNull();
+
+    // Fast swipe right (< 150ms, dx = +130px) -> tabPrev (left tab)
+    act(() => {
+      dispatchTouch(bubble, 'touchstart', [{ identifier: 2, clientX: 90, clientY: 220, target: bubble }]);
+      vi.advanceTimersByTime(40);
+      dispatchTouch(bubble, 'touchmove', [{ identifier: 2, clientX: 220, clientY: 220, target: bubble }]);
+      dispatchTouch(bubble, 'touchend', [], [{ identifier: 2, clientX: 220, clientY: 220, target: bubble }]);
+    });
+    expect(actions).toEqual(['tabNext', 'tabPrev']);
+
+    // Small swipe (~56px < 109px) does NOT switch tabs
+    act(() => {
+      dispatchTouch(bubble, 'touchstart', [{ identifier: 3, clientX: 220, clientY: 220, target: bubble }]);
+      vi.advanceTimersByTime(40);
+      dispatchTouch(bubble, 'touchmove', [{ identifier: 3, clientX: 164, clientY: 220, target: bubble }]);
+      expect(progressLog.at(-1)?.armed).toBe(false);
+      dispatchTouch(bubble, 'touchend', []);
+    });
+    expect(actions).toEqual(['tabNext', 'tabPrev']);
+
+    // Horizontally scrollable <pre> inside ChatView preserves native horizontal scroll
+    const pre = document.createElement('pre');
+    Object.defineProperty(pre, 'scrollWidth', { configurable: true, value: 700 });
+    Object.defineProperty(pre, 'clientWidth', { configurable: true, value: 280 });
+    bubble.appendChild(pre);
+    act(() => {
+      dispatchTouch(pre, 'touchstart', [{ identifier: 4, clientX: 280, clientY: 220, target: pre }]);
+      vi.advanceTimersByTime(40);
+      const m = dispatchTouch(pre, 'touchmove', [{ identifier: 4, clientX: 120, clientY: 220, target: pre }]);
+      expect(m.defaultPrevented).toBe(false);
+      dispatchTouch(pre, 'touchend', []);
+    });
+    expect(actions).toEqual(['tabNext', 'tabPrev']);
 
     detach();
   });

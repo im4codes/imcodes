@@ -170,6 +170,67 @@ export function MobileSwipeHud({ progress, targets }: MobileSwipeHudProps) {
 
   if (!progress) return null;
 
+  if (progress.mode === 'direct_horizontal') {
+    const directAction = progress.swipeAction
+      ?? (progress.action === 'tabNext' || progress.action === 'tabPrev'
+        ? progress.action
+        : (progress.dx < 0 ? 'tabNext' : (progress.dx > 0 ? 'tabPrev' : null)));
+    if (!directAction) return null;
+
+    const isNext = directAction === 'tabNext';
+    const edge = isNext ? 'right' : 'left';
+    const targetDir: 'left' | 'right' = isNext ? 'right' : 'left';
+    const hasTargetSlot = Boolean(targets && Object.prototype.hasOwnProperty.call(targets, targetDir));
+    const targetEntries = hasTargetSlot ? normalizeDirectionTargets(targets?.[targetDir]) : [];
+    if (hasTargetSlot && targetEntries.length === 0) return null;
+
+    const targetLabel = targetEntries[0]?.label
+      ?? t(isNext ? 'mobile_gesture.hud.right' : 'mobile_gesture.hud.left', {
+        defaultValue: isNext ? 'Next Session' : 'Previous Session',
+      });
+    const clampedProgress = Math.max(0, Math.min(1, progress.progress));
+    const pct = Math.round(clampedProgress * 100);
+    const pullOffsetPx = (clampedProgress * 20).toFixed(1);
+
+    return (
+      <div
+        class={`mobile-swipe-hud is-direct is-${edge}${progress.armed ? ' is-armed' : ''}`}
+        data-testid="mobile-swipe-hud"
+        data-mode="direct_horizontal"
+        data-direction={progress.direction ?? edge}
+        data-edge={edge}
+        data-action={directAction}
+        data-armed={progress.armed ? 'true' : 'false'}
+        data-step={String(progress.step)}
+        data-progress={String(pct)}
+        aria-hidden="true"
+      >
+        <div
+          class={`mobile-swipe-edge-indicator is-${edge}${progress.armed ? ' is-armed' : ''}`}
+          data-testid="mobile-swipe-edge-indicator"
+          data-edge={edge}
+          data-action={directAction}
+          data-armed={progress.armed ? 'true' : 'false'}
+          data-progress={String(pct)}
+          style={{
+            '--mobile-swipe-pull': `${pullOffsetPx}px`,
+            '--mobile-swipe-progress': String(clampedProgress),
+          } as Record<string, string>}
+        >
+          {edge === 'left' && (
+            <span class="mobile-swipe-edge-arrow" data-testid="mobile-swipe-edge-arrow" aria-hidden="true">←</span>
+          )}
+          <span class="mobile-swipe-edge-label" data-testid="mobile-swipe-edge-label">
+            {targetLabel}
+          </span>
+          {edge === 'right' && (
+            <span class="mobile-swipe-edge-arrow" data-testid="mobile-swipe-edge-arrow" aria-hidden="true">→</span>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   const pct = Math.max(0, Math.min(100, Math.round(progress.progress * 100)));
   const activeStep = Math.max(0, Math.trunc(progress.step ?? (progress.armed ? 1 : 0)));
   const maxSteps = Math.max(0, Math.trunc(progress.maxSteps ?? 3));
@@ -182,6 +243,7 @@ export function MobileSwipeHud({ progress, targets }: MobileSwipeHudProps) {
     <div
       class={`mobile-swipe-hud is-${activeKind}${progress.armed ? ' is-armed' : ''}`}
       data-testid="mobile-swipe-hud"
+      data-mode={progress.mode ?? 'long_press'}
       data-direction={progress.direction ?? 'none'}
       data-armed={progress.armed ? 'true' : 'false'}
       data-step={String(activeStep)}

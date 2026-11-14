@@ -3,6 +3,8 @@
  */
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import {
+  MOBILE_DIRECT_SWIPE_DEFAULT_THRESHOLD_PX,
+  MOBILE_DIRECT_SWIPE_START_PX,
   MOBILE_LONG_PRESS_DRAG_START_PX,
   MOBILE_LONG_PRESS_MS,
   MOBILE_LONG_PRESS_STILL_TOLERANCE_PX,
@@ -19,9 +21,11 @@ import {
   TwoFingerSwipeTracker,
   attachMobileNavigationGestures,
   canHandleMobileNavigationGesture,
+  canStartDirectHorizontalChatSwipe,
   getMobileNavigationGestureKeycaps,
   getMobileSwipeStepThresholdPx,
   isMobileNavigationGestureActive,
+  resolveMobileDirectSwipeThresholdPx,
   resolveMobileSwipeVerticalMaxSteps,
   type MobileNavigationAction,
   type MobileNavigationGestureProgress,
@@ -695,6 +699,178 @@ describe('mobile-navigation-gestures', () => {
     detach();
     vi.advanceTimersByTime(500);
     expect(isMobileNavigationGestureActive(document)).toBe(false);
+  });
+
+  it('resolves responsive direct horizontal swipe thresholds and rejects < threshold', () => {
+    expect(resolveMobileDirectSwipeThresholdPx(undefined)).toBe(MOBILE_DIRECT_SWIPE_DEFAULT_THRESHOLD_PX);
+    expect(resolveMobileDirectSwipeThresholdPx(320)).toBe(108);
+    expect(resolveMobileDirectSwipeThresholdPx(375)).toBe(108);
+    expect(resolveMobileDirectSwipeThresholdPx(390)).toBe(109);
+    expect(resolveMobileDirectSwipeThresholdPx(430)).toBe(120);
+    expect(resolveMobileDirectSwipeThresholdPx(768)).toBe(152);
+    expect(resolveMobileDirectSwipeThresholdPx(390, 140)).toBe(140);
+  });
+
+  it('supports direct horizontal left/right tab swipe inside .chat-view without waiting 380ms and rejects sub-threshold, diagonal, and horizontal scrollers', () => {
+    vi.useFakeTimers();
+    const wrap = document.createElement('div');
+    wrap.className = 'chat-view-wrap';
+    const pane = document.createElement('div');
+    pane.className = 'chat-view';
+    const msg = document.createElement('div');
+    msg.className = 'chat-event';
+    const pre = document.createElement('pre');
+    Object.defineProperty(pre, 'scrollWidth', { configurable: true, value: 640 });
+    Object.defineProperty(pre, 'clientWidth', { configurable: true, value: 300 });
+    msg.appendChild(pre);
+    pane.appendChild(msg);
+    wrap.appendChild(pane);
+
+    const previewPane = document.createElement('div');
+    previewPane.className = 'chat-view chat-view-preview';
+    const nonChatPane = document.createElement('div');
+    nonChatPane.className = 'session-pane';
+    document.body.append(wrap, previewPane, nonChatPane);
+
+    expect(canStartDirectHorizontalChatSwipe(msg)).toBe(true);
+    expect(canStartDirectHorizontalChatSwipe(pre)).toBe(false);
+    expect(canStartDirectHorizontalChatSwipe(previewPane)).toBe(false);
+    expect(canStartDirectHorizontalChatSwipe(nonChatPane)).toBe(false);
+
+    const actions: Array<{ action: MobileNavigationAction; step: number }> = [];
+    const progressLog: Array<MobileNavigationGestureProgress | null> = [];
+    const detach = attachMobileNavigationGestures({
+      isMobile: true,
+      viewportWidth: 390,
+      onAction: (action, step) => actions.push({ action, step }),
+      onProgress: (p) => progressLog.push(p),
+    });
+
+    // 1) Fast direct left swipe (dx = -130 in < 100ms) -> tabNext (right tab)
+    dispatchTouch(msg, 'touchstart', [{ identifier: 1, clientX: 280, clientY: 300, target: msg }]);
+    vi.advanceTimersByTime(30);
+    // Intermediate horizontal movement past stillTolerance (14px) and past START_PX (24px) shows direct arrow immediately
+    const earlyMove = dispatchTouch(msg, 'touchmove', [{ identifier: 1, clientX: 266, clientY: 300, target: msg }]);
+    expect(earlyMove.defaultPrevented).toBe(false);
+    const startDirect = dispatchTouch(msg, 'touchmove', [{
+      identifier: 1,
+      clientX: 280 - (MOBILE_DIRECT_SWIPE_START_PX + 6),
+      clientY: 300,
+      target: msg,
+    }]);
+    expect(startDirect.defaultPrevented).toBe(true);
+    expect(progressLog.at(-1)).toMatchObject({
+      mode: 'direct_horizontal',
+      direction: 'left',
+      swipeAction: 'tabNext',
+      action: 'tabNext',
+      armed: false,
+      step: 0,
+      threshold: 109,
+    });
+
+    // Cross commit threshold -> armed=true, step=1
+    vi.advanceTimersByTime(50);
+    dispatchTouch(msg, 'touchmove', [{ identifier: 1, clientX: 150, clientY: 305, target: msg }]);
+    expect(progressLog.at(-1)).toMatchObject({
+      mode: 'direct_horizontal',
+      direction: 'left',
+      swipeAction: 'tabNext',
+      action: 'tabNext',
+      armed: true,
+      step: 1,
+      progress: 1,
+    });
+    expect(actions).toEqual([]);
+    const endLeft = dispatchTouch(msg, 'touchend', [], [{ identifier: 1, clientX: 150, clientY: 305, target: msg }]);
+    expect(endLeft.defaultPrevented).toBe(true);
+    expect(actions).toEqual([{ action: 'tabNext', step: 1 }]);
+    expect(progressLog.at(-1)).toBeNull();
+
+    // 2) Fast direct right swipe (dx = +130 in < 100ms) -> tabPrev (left tab)
+    dispatchTouch(msg, 'touchstart', [{ identifier: 2, clientX: 80, clientY: 300, target: msg }]);
+    vi.advanceTimersByTime(60);
+    dispatchTouch(msg, 'touchmove', [{ identifier: 2, clientX: 210, clientY: 304, target: msg }]);
+    expect(progressLog.at(-1)).toMatchObject({
+      mode: 'direct_horizontal',
+      direction: 'right',
+      swipeAction: 'tabPrev',
+      action: 'tabPrev',
+      armed: true,
+      step: 1,
+    });
+    dispatchTouch(msg, 'touchend', [], [{ identifier: 2, clientX: 210, clientY: 304, target: msg }]);
+    expect(actions).toEqual([
+      { action: 'tabNext', step: 1 },
+      { action: 'tabPrev', step: 1 },
+    ]);
+
+    // 3) Small horizontal swipe (~56px < 109px threshold) shows unarmed indicator and never switches
+    dispatchTouch(msg, 'touchstart', [{ identifier: 3, clientX: 220, clientY: 300, target: msg }]);
+    vi.advanceTimersByTime(40);
+    dispatchTouch(msg, 'touchmove', [{ identifier: 3, clientX: 164, clientY: 302, target: msg }]);
+    expect(progressLog.at(-1)).toMatchObject({
+      mode: 'direct_horizontal',
+      swipeAction: 'tabNext',
+      armed: false,
+      step: 0,
+    });
+    dispatchTouch(msg, 'touchend', [], [{ identifier: 3, clientX: 164, clientY: 302, target: msg }]);
+    expect(actions).toHaveLength(2);
+    expect(progressLog.at(-1)).toBeNull();
+
+    // 4) Diagonal scroll locks out immediately without triggering
+    const logLenBeforeDiag = progressLog.length;
+    dispatchTouch(msg, 'touchstart', [{ identifier: 4, clientX: 220, clientY: 300, target: msg }]);
+    vi.advanceTimersByTime(40);
+    const diagEvt = dispatchTouch(msg, 'touchmove', [{ identifier: 4, clientX: 150, clientY: 360, target: msg }]);
+    expect(diagEvt.defaultPrevented).toBe(false);
+    dispatchTouch(msg, 'touchend', []);
+    expect(actions).toHaveLength(2);
+    expect(progressLog.length).toBe(logLenBeforeDiag);
+
+    // 5) Touch starting inside horizontally scrollable <pre> does NOT hijack scroll
+    dispatchTouch(pre, 'touchstart', [{ identifier: 5, clientX: 280, clientY: 300, target: pre }]);
+    vi.advanceTimersByTime(40);
+    const preMove = dispatchTouch(pre, 'touchmove', [{ identifier: 5, clientX: 120, clientY: 300, target: pre }]);
+    expect(preMove.defaultPrevented).toBe(false);
+    dispatchTouch(pre, 'touchend', []);
+    expect(actions).toHaveLength(2);
+
+    // 6) Quick swipe outside .chat-view (.session-pane) stays locked out
+    dispatchTouch(nonChatPane, 'touchstart', [{ identifier: 6, clientX: 280, clientY: 300, target: nonChatPane }]);
+    vi.advanceTimersByTime(40);
+    dispatchTouch(nonChatPane, 'touchmove', [{ identifier: 6, clientX: 120, clientY: 300, target: nonChatPane }]);
+    dispatchTouch(nonChatPane, 'touchend', []);
+    expect(actions).toHaveLength(2);
+
+    detach();
+  });
+
+  it('does not arm or trigger direct horizontal swipe when getAvailableSteps returns 0 for target direction', () => {
+    vi.useFakeTimers();
+    const pane = document.createElement('div');
+    pane.className = 'chat-view';
+    document.body.appendChild(pane);
+
+    const actions: Array<{ action: MobileNavigationAction; step: number }> = [];
+    const progressLog: Array<MobileNavigationGestureProgress | null> = [];
+    const detach = attachMobileNavigationGestures({
+      isMobile: true,
+      viewportWidth: 390,
+      getAvailableSteps: () => 0,
+      onAction: (action, step) => actions.push({ action, step }),
+      onProgress: (p) => progressLog.push(p),
+    });
+
+    dispatchTouch(pane, 'touchstart', [{ identifier: 1, clientX: 280, clientY: 300, target: pane }]);
+    vi.advanceTimersByTime(40);
+    const moveEvt = dispatchTouch(pane, 'touchmove', [{ identifier: 1, clientX: 120, clientY: 300, target: pane }]);
+    expect(moveEvt.defaultPrevented).toBe(false);
+    dispatchTouch(pane, 'touchend', []);
+    expect(actions).toEqual([]);
+    expect(progressLog).toEqual([]);
+    detach();
   });
 });
 

@@ -174,4 +174,95 @@ describe('mobile-navigation-gestures real Chromium touch & unmount recovery', ()
       await browser.close();
     }
   });
+
+  it('triggers direct horizontal swipe inside .chat-view without waiting 380ms and rejects sub-threshold / vertical scroll in Chromium CDP', { timeout: 45000 }, async () => {
+    const require = createRequire(import.meta.url);
+    const { chromium } = require('playwright') as typeof import('playwright');
+    if (!existsSync(chromium.executablePath())) {
+      return;
+    }
+    const { buildSync } = require('esbuild') as typeof import('esbuild');
+    const here = dirname(fileURLToPath(import.meta.url));
+    const gesturesPath = resolve(here, '../src/mobile-navigation-gestures.ts');
+
+    const compiled = buildSync({
+      stdin: {
+        contents: `
+          import { attachMobileNavigationGestures } from ${JSON.stringify(gesturesPath)};
+          window.__directActions = [];
+          window.__progress = [];
+          document.body.innerHTML = '<div class="chat-view" style="position:fixed;inset:0;overflow-y:auto;"><div class="msg">hello</div></div>';
+          attachMobileNavigationGestures({
+            isMobile: true,
+            longPressMs: 380,
+            onProgress: (p) => window.__progress.push(p),
+            onAction: (action, step) => {
+              window.__directActions.push({ action, step });
+            },
+          });
+        `,
+        resolveDir: resolve(here, '..'),
+        loader: 'ts',
+      },
+      bundle: true,
+      write: false,
+      platform: 'browser',
+    });
+
+    const browser = await chromium.launch({ headless: true });
+    try {
+      const context = await browser.newContext({
+        viewport: { width: 390, height: 844 },
+        hasTouch: true,
+        isMobile: true,
+      });
+      const page = await context.newPage();
+      await page.setContent('<body></body>');
+      await page.addScriptTag({ content: compiled.outputFiles[0].text });
+
+      const cdp = await context.newCDPSession(page);
+      const send = (type: 'touchStart' | 'touchMove' | 'touchEnd', x: number, y: number) =>
+        cdp.send('Input.dispatchTouchEvent', {
+          type,
+          touchPoints: [{ id: 0, x, y }],
+        });
+
+      // Fast direct swipe LEFT (-130px, 0ms hold) -> tabNext step 1
+      await send('touchStart', 300, 320);
+      await send('touchMove', 260, 322);
+      await send('touchMove', 170, 324);
+      await send('touchEnd', 170, 324);
+
+      // Fast direct swipe RIGHT (+130px, 0ms hold) -> tabPrev step 1
+      await send('touchStart', 80, 320);
+      await send('touchMove', 130, 320);
+      await send('touchMove', 210, 322);
+      await send('touchEnd', 210, 322);
+
+      // Sub-threshold horizontal swipe (56px < 109px) -> no trigger
+      await send('touchStart', 240, 320);
+      await send('touchMove', 184, 320);
+      await send('touchEnd', 184, 320);
+
+      // Vertical scroll (-150px Y) -> no trigger
+      await send('touchStart', 200, 420);
+      await send('touchMove', 200, 270);
+      await send('touchEnd', 200, 270);
+
+      const result = await page.evaluate(() => ({
+        actions: (window as unknown as { __directActions: Array<{ action: string; step: number }> }).__directActions,
+        sawDirectMode: (window as unknown as { __progress: Array<{ mode?: string; swipeAction?: string } | null> }).__progress.some(
+          (p) => p?.mode === 'direct_horizontal' && p?.swipeAction === 'tabNext',
+        ),
+      }));
+
+      expect(result.sawDirectMode).toBe(true);
+      expect(result.actions).toEqual([
+        { action: 'tabNext', step: 1 },
+        { action: 'tabPrev', step: 1 },
+      ]);
+    } finally {
+      await browser.close();
+    }
+  });
 });

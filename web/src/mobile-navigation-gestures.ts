@@ -2,12 +2,15 @@ import { hasDomBlockingOverlay } from './keyboard-shortcuts.js';
 
 export type MobileNavigationAction = 'serverPrev' | 'serverNext' | 'tabPrev' | 'tabNext';
 export type MobileNavigationDirection = 'up' | 'down' | 'left' | 'right';
+export type MobileNavigationGestureMode = 'long_press' | 'direct_horizontal';
 
 export interface MobileNavigationGestureProgress {
   readonly dx: number;
   readonly dy: number;
   readonly direction: MobileNavigationDirection | null;
   readonly action: MobileNavigationAction | null;
+  readonly swipeAction?: 'tabPrev' | 'tabNext' | null;
+  readonly mode?: MobileNavigationGestureMode;
   readonly distance: number;
   readonly threshold: number;
   readonly progress: number;
@@ -50,10 +53,33 @@ export const MOBILE_SWIPE_DOMINANCE_RATIO = 1.35;
 export const MOBILE_LONG_PRESS_MS = 380;
 export const MOBILE_LONG_PRESS_STILL_TOLERANCE_PX = 12;
 export const MOBILE_LONG_PRESS_DRAG_START_PX = 10;
+export const MOBILE_DIRECT_SWIPE_START_PX = 18;
+export const MOBILE_DIRECT_SWIPE_DOMINANCE_RATIO = 1.65;
+export const MOBILE_DIRECT_SWIPE_MAX_VERTICAL_DRIFT_PX = 44;
+export const MOBILE_DIRECT_SWIPE_MIN_THRESHOLD_PX = 108;
+export const MOBILE_DIRECT_SWIPE_MAX_THRESHOLD_PX = 152;
+export const MOBILE_DIRECT_SWIPE_DEFAULT_THRESHOLD_PX = 116;
+export const MOBILE_DIRECT_SWIPE_VIEWPORT_RATIO = 0.28;
+const MOBILE_DIRECT_SWIPE_TRACKING_DOMINANCE_RATIO = 1.35;
 export const MOBILE_NAV_GESTURE_ACTIVE_CLASS = 'mobile-nav-gesture-active';
 export const MOBILE_NAV_GESTURE_ACTIVE_EVENT = 'imcodes:mobile-nav-gesture-active';
 const MOBILE_SWIPE_DIRECTION_DEADZONE_PX = 4;
 const MOBILE_GESTURE_RECENT_WINDOW_MS = 350;
+
+export function resolveMobileDirectSwipeThresholdPx(viewportWidth?: number, overridePx?: number): number {
+  if (overridePx !== undefined && Number.isFinite(overridePx) && overridePx > 0) {
+    return Math.round(overridePx);
+  }
+  if (viewportWidth !== undefined && Number.isFinite(viewportWidth) && viewportWidth > 0) {
+    return Math.round(
+      Math.max(
+        MOBILE_DIRECT_SWIPE_MIN_THRESHOLD_PX,
+        Math.min(MOBILE_DIRECT_SWIPE_MAX_THRESHOLD_PX, viewportWidth * MOBILE_DIRECT_SWIPE_VIEWPORT_RATIO),
+      ),
+    );
+  }
+  return MOBILE_DIRECT_SWIPE_DEFAULT_THRESHOLD_PX;
+}
 
 export function resolveMobileSwipeVerticalMaxSteps(viewportHeight?: number): number {
   if (viewportHeight === undefined || !Number.isFinite(viewportHeight) || viewportHeight <= 0) {
@@ -210,19 +236,79 @@ export interface MobileNavigationGestureGuardOptions {
   readonly document?: Document;
 }
 
+interface ElementLike {
+  tagName?: string;
+  classList?: { contains?: (token: string) => boolean };
+  closest?: (selector: string) => unknown;
+  querySelector?: (selector: string) => unknown;
+  parentElement?: ElementLike | null;
+  scrollWidth?: number;
+  clientWidth?: number;
+  ownerDocument?: Document | null;
+}
+
 function resolveElementTarget(
   target: EventTarget | null | undefined,
-): { closest?: (selector: string) => unknown } | null {
+): ElementLike | null {
   if (!target || typeof target !== 'object') return null;
-  const candidate = target as {
-    closest?: (selector: string) => unknown;
-    parentElement?: { closest?: (selector: string) => unknown } | null;
-  };
+  const candidate = target as ElementLike;
   if (typeof candidate.closest === 'function') return candidate;
   if (candidate.parentElement && typeof candidate.parentElement.closest === 'function') {
     return candidate.parentElement;
   }
   return null;
+}
+
+/**
+ * Direct 1-finger horizontal swipe-to-switch-tab is enabled only inside the main chat scroll area
+ * (excluding preview bubbles and any horizontally scrollable ancestor along the touch path).
+ */
+export function canStartDirectHorizontalChatSwipe(target: EventTarget | null | undefined): boolean {
+  const el = resolveElementTarget(target);
+  if (!el || typeof el.closest !== 'function') return false;
+  if (el.closest('.chat-view-preview')) return false;
+
+  const chatView = el.closest('.chat-view') as ElementLike | null;
+  const chatWrap = chatView ?? (el.closest('.chat-view-wrap') as ElementLike | null);
+  if (!chatWrap) return false;
+  if (!chatView && typeof chatWrap.querySelector === 'function' && chatWrap.querySelector('.chat-view-preview')) {
+    return false;
+  }
+
+  const win = el.ownerDocument?.defaultView ?? (typeof window !== 'undefined' ? window : undefined);
+  let cursor: ElementLike | null = el;
+  while (cursor && cursor !== chatWrap) {
+    if (
+      typeof cursor.scrollWidth === 'number'
+      && typeof cursor.clientWidth === 'number'
+      && cursor.scrollWidth > cursor.clientWidth + 2
+    ) {
+      let overflowX = '';
+      if (win && typeof win.getComputedStyle === 'function') {
+        try {
+          overflowX = win.getComputedStyle(cursor as unknown as Element).overflowX ?? '';
+        } catch {
+          overflowX = '';
+        }
+      }
+      const isExplicitHidden = overflowX === 'hidden' || overflowX === 'clip';
+      const isScrollableElement = (
+        overflowX === 'auto'
+        || overflowX === 'scroll'
+        || overflowX === ''
+        || cursor.tagName === 'PRE'
+        || cursor.tagName === 'TABLE'
+        || Boolean(cursor.classList?.contains?.('chat-code-block'))
+        || Boolean(cursor.classList?.contains?.('chat-table'))
+      );
+      if (!isExplicitHidden && isScrollableElement) {
+        return false;
+      }
+    }
+    cursor = cursor.parentElement ?? null;
+  }
+
+  return true;
 }
 
 export function canHandleMobileNavigationGesture(
@@ -247,6 +333,7 @@ type TrackerPhase =
   | 'idle'
   | 'long_press_pending'
   | 'long_press_ready'
+  | 'direct_horizontal'
   | 'tracking'
   | 'triggered'
   | 'locked_out';
@@ -258,6 +345,9 @@ export interface TwoFingerSwipeTrackerOptions {
   readonly longPressMs?: number;
   readonly stillTolerancePx?: number;
   readonly dragStartPx?: number;
+  readonly viewportWidth?: number;
+  readonly getViewportWidth?: () => number | undefined;
+  readonly directSwipeThresholdPx?: number;
   readonly viewportHeight?: number;
   readonly getViewportHeight?: () => number | undefined;
   readonly getAvailableSteps?: (direction: MobileNavigationDirection) => number;
@@ -293,6 +383,7 @@ export class TwoFingerSwipeTracker {
   private pendingLastPoint: { x: number; y: number } | null = null;
   private longPressAnchor: { x: number; y: number } | null = null;
   private pendingTarget: EventTarget | null = null;
+  private pendingDirectHorizontalEligible = false;
   private longPressTimer: ReturnType<typeof setTimeout> | null = null;
   private hudVisible = false;
   private activeNotified = false;
@@ -305,6 +396,9 @@ export class TwoFingerSwipeTracker {
   private readonly longPressMs: number;
   private readonly stillTolerancePx: number;
   private readonly dragStartPx: number;
+  private readonly viewportWidth?: number;
+  private readonly getViewportWidth?: () => number | undefined;
+  private readonly directSwipeThresholdPx?: number;
   private readonly viewportHeight?: number;
   private readonly getViewportHeight?: () => number | undefined;
   private readonly getAvailableSteps?: (direction: MobileNavigationDirection) => number;
@@ -318,6 +412,9 @@ export class TwoFingerSwipeTracker {
     this.longPressMs = options.longPressMs ?? MOBILE_LONG_PRESS_MS;
     this.stillTolerancePx = options.stillTolerancePx ?? MOBILE_LONG_PRESS_STILL_TOLERANCE_PX;
     this.dragStartPx = options.dragStartPx ?? MOBILE_LONG_PRESS_DRAG_START_PX;
+    this.viewportWidth = options.viewportWidth;
+    this.getViewportWidth = options.getViewportWidth;
+    this.directSwipeThresholdPx = options.directSwipeThresholdPx;
     this.viewportHeight = options.viewportHeight;
     this.getViewportHeight = options.getViewportHeight;
     this.getAvailableSteps = options.getAvailableSteps;
@@ -326,7 +423,7 @@ export class TwoFingerSwipeTracker {
   }
 
   isActive(): boolean {
-    return this.phase === 'tracking' || this.phase === 'triggered';
+    return this.phase === 'tracking' || this.phase === 'direct_horizontal' || this.phase === 'triggered';
   }
 
   getLastTriggeredResult(): MobileNavigationTrigger | null {
@@ -382,6 +479,7 @@ export class TwoFingerSwipeTracker {
     this.pendingLastPoint = null;
     this.longPressAnchor = null;
     this.pendingTarget = null;
+    this.pendingDirectHorizontalEligible = false;
   }
 
   private clearTrackedPoints(): void {
@@ -551,6 +649,7 @@ export class TwoFingerSwipeTracker {
         dy,
         direction,
         action,
+        mode: 'long_press',
         distance,
         threshold: MOBILE_SWIPE_PRIMARY_THRESHOLD_PX,
         progress,
@@ -563,14 +662,86 @@ export class TwoFingerSwipeTracker {
     };
   }
 
-  private evaluateTrackedState(): GestureEvaluation {
+  private resolveDirectThresholdPx(): number {
+    return resolveMobileDirectSwipeThresholdPx(
+      this.viewportWidth ?? this.getViewportWidth?.(),
+      this.directSwipeThresholdPx,
+    );
+  }
+
+  private buildDirectHorizontalEvaluation(dx: number, dy: number): GestureEvaluation {
+    const threshold = this.resolveDirectThresholdPx();
+    const absDx = Math.abs(dx);
+    const absDy = Math.abs(dy);
+    const isHorizontalDominant = (
+      absDx >= MOBILE_SWIPE_DIRECTION_DEADZONE_PX
+      && absDx >= absDy * MOBILE_DIRECT_SWIPE_TRACKING_DOMINANCE_RATIO
+    );
+
+    const direction: MobileNavigationDirection | null = isHorizontalDominant
+      ? (dx < 0 ? 'left' : 'right')
+      : null;
+    // Natural carousel mapping: swipe LEFT -> switch to right/next tab; swipe RIGHT -> switch to left/prev tab.
+    const swipeAction: 'tabPrev' | 'tabNext' | null = direction === 'left'
+      ? 'tabNext'
+      : (direction === 'right' ? 'tabPrev' : null);
+    const targetDirection: MobileNavigationDirection | null = swipeAction === 'tabNext'
+      ? 'right'
+      : (swipeAction === 'tabPrev' ? 'left' : null);
+
+    let maxSteps = 0;
+    if (targetDirection) {
+      if (!this.getAvailableSteps) {
+        maxSteps = 1;
+      } else {
+        const available = this.getAvailableSteps(targetDirection);
+        maxSteps = Number.isFinite(available) && available > 0 ? 1 : 0;
+      }
+    }
+
+    const distance = direction ? absDx : 0;
+    const armed = Boolean(swipeAction && maxSteps > 0 && distance >= threshold);
+    const step = armed ? 1 : 0;
+    const committedAction = armed ? swipeAction : null;
+    const progress = armed
+      ? 1
+      : (swipeAction && maxSteps > 0 ? Math.min(0.99, distance / threshold) : 0);
+
+    return {
+      opposing: false,
+      action: committedAction,
+      step,
+      progress: {
+        dx,
+        dy,
+        direction,
+        action: swipeAction,
+        swipeAction,
+        mode: 'direct_horizontal',
+        distance,
+        threshold,
+        progress,
+        armed,
+        step,
+        maxSteps,
+        horizontalMaxSteps: 1,
+        verticalMaxSteps: 1,
+      },
+    };
+  }
+
+  private evaluateTrackedState(directHorizontal = false): GestureEvaluation {
     const ids = Array.from(this.startPoints.keys());
     if (ids.length !== 1) return { opposing: false, progress: null, action: null, step: 0 };
     const id = ids[0]!;
     const start = this.startPoints.get(id);
     const end = this.lastPoints.get(id);
     if (!start || !end) return { opposing: false, progress: null, action: null, step: 0 };
-    return this.buildEvaluation(end.x - start.x, end.y - start.y);
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    return directHorizontal
+      ? this.buildDirectHorizontalEvaluation(dx, dy)
+      : this.buildEvaluation(dx, dy);
   }
 
   private lockOutActiveGesture(event: TouchEventLike): void {
@@ -607,6 +778,7 @@ export class TwoFingerSwipeTracker {
       this.pendingLastPoint = { x: first.clientX, y: first.clientY };
       this.longPressAnchor = null;
       this.pendingTarget = first.target ?? event.target ?? null;
+      this.pendingDirectHorizontalEligible = canStartDirectHorizontalChatSwipe(this.pendingTarget);
       this.phase = 'long_press_pending';
       this.longPressTimer = this.setTimer(() => {
         this.longPressTimer = null;
@@ -643,12 +815,48 @@ export class TwoFingerSwipeTracker {
         this.lockOutActiveGesture(event);
         return null;
       }
-      const moveDist = Math.hypot(
-        touch.clientX - this.pendingStartPoint.x,
-        touch.clientY - this.pendingStartPoint.y,
-      );
+      const dx = touch.clientX - this.pendingStartPoint.x;
+      const dy = touch.clientY - this.pendingStartPoint.y;
+      const absDx = Math.abs(dx);
+      const absDy = Math.abs(dy);
+      const moveDist = Math.hypot(dx, dy);
+
+      if (
+        this.pendingDirectHorizontalEligible
+        && absDx >= MOBILE_DIRECT_SWIPE_START_PX
+        && absDx >= absDy * MOBILE_DIRECT_SWIPE_DOMINANCE_RATIO
+        && absDy <= MOBILE_DIRECT_SWIPE_MAX_VERTICAL_DRIFT_PX
+      ) {
+        const targetDirection: MobileNavigationDirection = dx < 0 ? 'right' : 'left';
+        if (this.getAvailableSteps && this.getAvailableSteps(targetDirection) <= 0) {
+          this.lockOutActiveGesture(event);
+          return null;
+        }
+        const startPoint = this.pendingStartPoint;
+        this.clearPendingOneFinger();
+        this.clearTrackedPoints();
+        this.startPoints.set(touch.identifier, startPoint);
+        this.lastPoints.set(touch.identifier, { x: touch.clientX, y: touch.clientY });
+        this.phase = 'direct_horizontal';
+        this.setActive(true);
+        const evaluation = this.evaluateTrackedState(true);
+        this.emitProgress(evaluation.progress);
+        return null;
+      }
+
       if (moveDist > this.stillTolerancePx) {
-        // User is scrolling/dragging before long-press armed: cancel & lock out for this touch sequence.
+        // Inside chat view, allow brief horizontal displacement between stillTolerancePx and START_PX
+        // while horizontal direction cleanly dominates vertical drift; cancel long-press timer right away.
+        if (
+          this.pendingDirectHorizontalEligible
+          && absDx >= absDy * MOBILE_DIRECT_SWIPE_DOMINANCE_RATIO
+          && absDy <= MOBILE_DIRECT_SWIPE_MAX_VERTICAL_DRIFT_PX
+        ) {
+          this.clearLongPressTimer();
+          this.pendingLastPoint = { x: touch.clientX, y: touch.clientY };
+          return null;
+        }
+        // User is scrolling vertically/diagonally or outside chat direct-swipe surface: cancel & lock out.
         this.lockOutActiveGesture(event);
         return null;
       }
@@ -683,7 +891,7 @@ export class TwoFingerSwipeTracker {
       return null;
     }
 
-    if (this.phase !== 'tracking') {
+    if (this.phase !== 'tracking' && this.phase !== 'direct_horizontal') {
       if (
         this.lockedTouches.size > 0
         && !this.hasMatchingLockedTouch(event.touches)
@@ -703,14 +911,14 @@ export class TwoFingerSwipeTracker {
       return null;
     }
     this.updateTrackedPositions(event.touches);
-    const evaluation = this.evaluateTrackedState();
+    const evaluation = this.evaluateTrackedState(this.phase === 'direct_horizontal');
     this.emitProgress(evaluation.progress);
     return null;
   }
 
   evaluateTouchEnd(event: TouchEventLike): MobileNavigationTrigger | null {
     const remainingCount = event.touches.length;
-    if (this.phase !== 'tracking') {
+    if (this.phase !== 'tracking' && this.phase !== 'direct_horizontal') {
       if (remainingCount === 0) {
         this.reset();
       } else if (this.phase === 'long_press_pending' || this.phase === 'long_press_ready') {
@@ -734,8 +942,9 @@ export class TwoFingerSwipeTracker {
       return null;
     }
 
+    const isDirect = this.phase === 'direct_horizontal';
     this.updateTrackedPositions(event.changedTouches);
-    const evaluation = this.evaluateTrackedState();
+    const evaluation = this.evaluateTrackedState(isDirect);
 
     if (!evaluation.opposing && evaluation.action && evaluation.step > 0) {
       const trigger: MobileNavigationTrigger = {
@@ -772,6 +981,9 @@ export interface AttachMobileNavigationGesturesOptions {
   readonly onAction: (action: MobileNavigationAction, step: number) => void;
   readonly onProgress?: (progress: MobileNavigationGestureProgress | null) => void;
   readonly longPressMs?: number;
+  readonly viewportWidth?: number;
+  readonly getViewportWidth?: () => number | undefined;
+  readonly directSwipeThresholdPx?: number;
   readonly viewportHeight?: number;
   readonly getViewportHeight?: () => number | undefined;
   readonly getAvailableSteps?: (direction: MobileNavigationDirection) => number;
@@ -798,6 +1010,9 @@ export function attachMobileNavigationGestures(options: AttachMobileNavigationGe
     onProgress: options.onProgress,
     onActiveChange: (active) => setMobileNavigationGestureActiveState(doc, active),
     longPressMs: options.longPressMs,
+    viewportWidth: options.viewportWidth,
+    getViewportWidth: options.getViewportWidth ?? (() => (win.innerWidth > 0 && win.innerWidth <= 600 ? win.innerWidth : undefined)),
+    directSwipeThresholdPx: options.directSwipeThresholdPx,
     viewportHeight: options.viewportHeight,
     getViewportHeight: options.getViewportHeight ?? (() => win.innerHeight),
     getAvailableSteps: options.getAvailableSteps,

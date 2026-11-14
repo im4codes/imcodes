@@ -20471,6 +20471,98 @@ button.quick-agent-delegation-preset.active {
   user-select: none;
 }
 
+.mobile-swipe-hud.is-direct {
+  padding: 0;
+}
+
+.mobile-swipe-edge-indicator {
+  position: fixed;
+  top: 50%;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: min(56vw, 200px);
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: rgba(8, 13, 26, 0.88);
+  border: 1.5px solid rgba(52, 211, 153, 0.44);
+  box-shadow:
+    0 12px 32px rgba(2, 6, 23, 0.56),
+    inset 0 1px 0 rgba(167, 243, 208, 0.14);
+  backdrop-filter: blur(14px) saturate(150%);
+  -webkit-backdrop-filter: blur(14px) saturate(150%);
+  color: rgba(236, 253, 245, 0.94);
+  opacity: calc(0.76 + 0.24 * var(--mobile-swipe-progress, 0));
+  pointer-events: none;
+  transition: border-color 120ms ease, box-shadow 120ms ease, background-color 120ms ease;
+}
+
+.mobile-swipe-edge-indicator.is-left {
+  left: 10px;
+  transform: translate3d(var(--mobile-swipe-pull, 0px), -50%, 0);
+}
+
+.mobile-swipe-edge-indicator.is-right {
+  right: 10px;
+  transform: translate3d(calc(var(--mobile-swipe-pull, 0px) * -1), -50%, 0);
+}
+
+.mobile-swipe-edge-indicator.is-left.is-armed {
+  transform: translate3d(var(--mobile-swipe-pull, 0px), -50%, 0) scale(1.06);
+}
+
+.mobile-swipe-edge-indicator.is-right.is-armed {
+  transform: translate3d(calc(var(--mobile-swipe-pull, 0px) * -1), -50%, 0) scale(1.06);
+}
+
+.mobile-swipe-edge-indicator.is-armed {
+  border-color: rgba(52, 211, 153, 0.96);
+  background:
+    linear-gradient(135deg, rgba(6, 182, 212, 0.24), rgba(16, 185, 129, 0.30)),
+    rgba(8, 13, 26, 0.95);
+  box-shadow:
+    0 14px 36px rgba(2, 6, 23, 0.68),
+    0 0 20px rgba(52, 211, 153, 0.36),
+    inset 0 1px 0 rgba(167, 243, 208, 0.26);
+  color: #ffffff;
+}
+
+.mobile-swipe-edge-arrow {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  background: rgba(52, 211, 153, 0.18);
+  color: #6ee7b7;
+  font-size: 14px;
+  font-weight: 800;
+  line-height: 1;
+  transition: background-color 120ms ease, color 120ms ease, transform 120ms ease;
+}
+
+.mobile-swipe-edge-indicator.is-armed .mobile-swipe-edge-arrow {
+  background: #34d399;
+  color: #064e3b;
+  box-shadow: 0 0 12px rgba(52, 211, 153, 0.65);
+}
+
+.mobile-swipe-edge-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.mobile-swipe-edge-indicator.is-armed .mobile-swipe-edge-label {
+  font-weight: 700;
+}
+
 .mobile-swipe-hud-card {
   position: relative;
   overflow: hidden;
@@ -21126,6 +21218,36 @@ button.quick-agent-delegation-preset.active {
     border-color: rgba(5, 150, 105, 0.78);
   }
 
+  .mobile-swipe-edge-indicator {
+    background: rgba(248, 250, 252, 0.94);
+    border-color: rgba(5, 150, 105, 0.42);
+    box-shadow:
+      0 12px 30px rgba(15, 23, 42, 0.16),
+      inset 0 1px 0 rgba(255, 255, 255, 0.92);
+    color: rgba(15, 23, 42, 0.94);
+  }
+
+  .mobile-swipe-edge-indicator.is-armed {
+    border-color: rgba(5, 150, 105, 0.94);
+    background:
+      linear-gradient(135deg, rgba(8, 145, 178, 0.14), rgba(5, 150, 105, 0.18)),
+      rgba(255, 255, 255, 0.98);
+    box-shadow:
+      0 14px 34px rgba(15, 23, 42, 0.2),
+      0 0 18px rgba(5, 150, 105, 0.24);
+    color: rgba(6, 78, 59, 0.98);
+  }
+
+  .mobile-swipe-edge-arrow {
+    background: rgba(5, 150, 105, 0.14);
+    color: rgba(5, 150, 105, 0.96);
+  }
+
+  .mobile-swipe-edge-indicator.is-armed .mobile-swipe-edge-arrow {
+    background: #059669;
+    color: #ffffff;
+  }
+
   .mobile-swipe-hud-header,
   .mobile-swipe-hud-hint {
     color: rgba(51, 65, 85, 0.94);
@@ -21286,13 +21408,23 @@ button.quick-agent-delegation-preset.active {
   .mobile-swipe-hud-ring-fill,
   .mobile-swipe-hud-dir,
   .mobile-swipe-hud-dir-target-row,
-  .mobile-swipe-hud-bar-fill {
+  .mobile-swipe-hud-bar-fill,
+  .mobile-swipe-edge-indicator,
+  .mobile-swipe-edge-arrow {
     animation: none;
     transition: none;
   }
 
   .mobile-swipe-hud-dir.is-armed:not(.is-unavailable) {
     transform: none;
+  }
+
+  .mobile-swipe-edge-indicator.is-left.is-armed {
+    transform: translate3d(var(--mobile-swipe-pull, 0px), -50%, 0);
+  }
+
+  .mobile-swipe-edge-indicator.is-right.is-armed {
+    transform: translate3d(calc(var(--mobile-swipe-pull, 0px) * -1), -50%, 0);
   }
 }
 
@@ -21449,7 +21581,8 @@ html.native-ios-mac .btn.desktop-cloud-docs-marquee-btn {
 :is(html.native-ios-mac, html.native-mac-desktop) .task-pair-card-hover-preview,
 :is(html.native-ios-mac, html.native-mac-desktop) .cloud-docs-modal-backdrop,
 :is(html.native-ios-mac, html.native-mac-desktop) .server-switch-watermark-card,
-:is(html.native-ios-mac, html.native-mac-desktop) .mobile-swipe-hud-card {
+:is(html.native-ios-mac, html.native-mac-desktop) .mobile-swipe-hud-card,
+:is(html.native-ios-mac, html.native-mac-desktop) .mobile-swipe-edge-indicator {
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
 }

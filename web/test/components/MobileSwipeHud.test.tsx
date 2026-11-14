@@ -258,6 +258,123 @@ describe('MobileSwipeHud', () => {
     expect(screen.getByTestId('mobile-swipe-hud-dir-target-left').textContent).toBe('No other target');
     expect(screen.getByTestId('mobile-swipe-hud-dir-target-right').textContent).toBe('No other target');
   });
+
+  it('renders instant directional edge arrow indicator in direct_horizontal mode with carousel-matched target labels', async () => {
+    await act(async () => {
+      await i18n.changeLanguage('en');
+    });
+
+    const targets = {
+      left: [{ step: 1, id: 'tab-left', label: 'left-session' }],
+      right: [{ step: 1, id: 'tab-right', label: 'right-session' }],
+    };
+
+    // Swiping left (dx < 0) -> right edge indicator with '→' + next right tab label
+    const view = render(
+      <MobileSwipeHud
+        progress={makeProgress({
+          mode: 'direct_horizontal',
+          dx: -60,
+          dy: 0,
+          direction: 'left',
+          action: 'tabNext',
+          swipeAction: 'tabNext',
+          distance: 60,
+          threshold: 116,
+          progress: 60 / 116,
+          armed: false,
+          step: 0,
+          maxSteps: 1,
+          horizontalMaxSteps: 1,
+          verticalMaxSteps: 1,
+        })}
+        targets={targets}
+      />,
+    );
+
+    expect(document.querySelector('.mobile-swipe-hud-card')).toBeNull();
+    const hud = screen.getByTestId('mobile-swipe-hud');
+    expect(hud.getAttribute('data-mode')).toBe('direct_horizontal');
+    const indicator = screen.getByTestId('mobile-swipe-edge-indicator');
+    expect(indicator.getAttribute('data-edge')).toBe('right');
+    expect(indicator.getAttribute('data-action')).toBe('tabNext');
+    expect(indicator.getAttribute('data-armed')).toBe('false');
+    expect(screen.getByTestId('mobile-swipe-edge-arrow').textContent).toBe('→');
+    expect(screen.getByTestId('mobile-swipe-edge-label').textContent).toBe('right-session');
+
+    // Crossing threshold sets armed=true
+    view.rerender(
+      <MobileSwipeHud
+        progress={makeProgress({
+          mode: 'direct_horizontal',
+          dx: -128,
+          dy: 0,
+          direction: 'left',
+          action: 'tabNext',
+          swipeAction: 'tabNext',
+          distance: 128,
+          threshold: 116,
+          progress: 1,
+          armed: true,
+          step: 1,
+          maxSteps: 1,
+          horizontalMaxSteps: 1,
+          verticalMaxSteps: 1,
+        })}
+        targets={targets}
+      />,
+    );
+    expect(screen.getByTestId('mobile-swipe-edge-indicator').getAttribute('data-armed')).toBe('true');
+    expect(screen.getByTestId('mobile-swipe-edge-indicator').className).toContain('is-armed');
+
+    // Swiping right (dx > 0) -> left edge indicator with '←' + previous left tab label
+    view.rerender(
+      <MobileSwipeHud
+        progress={makeProgress({
+          mode: 'direct_horizontal',
+          dx: 128,
+          dy: 0,
+          direction: 'right',
+          action: 'tabPrev',
+          swipeAction: 'tabPrev',
+          distance: 128,
+          threshold: 116,
+          progress: 1,
+          armed: true,
+          step: 1,
+          maxSteps: 1,
+          horizontalMaxSteps: 1,
+          verticalMaxSteps: 1,
+        })}
+        targets={targets}
+      />,
+    );
+    const leftIndicator = screen.getByTestId('mobile-swipe-edge-indicator');
+    expect(leftIndicator.getAttribute('data-edge')).toBe('left');
+    expect(leftIndicator.getAttribute('data-action')).toBe('tabPrev');
+    expect(screen.getByTestId('mobile-swipe-edge-arrow').textContent).toBe('←');
+    expect(screen.getByTestId('mobile-swipe-edge-label').textContent).toBe('left-session');
+
+    // Empty target slot hides edge indicator cleanly
+    view.rerender(
+      <MobileSwipeHud
+        progress={makeProgress({
+          mode: 'direct_horizontal',
+          dx: -60,
+          dy: 0,
+          direction: 'left',
+          action: 'tabNext',
+          swipeAction: 'tabNext',
+          distance: 60,
+          threshold: 116,
+          progress: 0.5,
+          armed: false,
+        })}
+        targets={{ left: [], right: [] }}
+      />,
+    );
+    expect(screen.queryByTestId('mobile-swipe-edge-indicator')).toBeNull();
+  });
 });
 
 describe('resolveMobileSwipeTargets', () => {
