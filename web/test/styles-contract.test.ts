@@ -1727,4 +1727,24 @@ describe('styles.css regression contracts', () => {
     ).toMatch(/display:\s*none/);
     expect(extractDirectStyleRule(mobilePreviewBlock!, /\.office-preview-role-pill\s*/)).not.toMatch(/display:\s*none/);
   });
+
+  it('centers the mobile sub-session footer status inline and transfers bottom safe-area inset from .subsession-bar', () => {
+    const mobile640Blocks = extractBalancedAtRuleBlocks(cssWithoutComments, /@media\s*\(max-width:\s*640px\)/);
+    const mobileSubBarBlock = mobile640Blocks.find((b) => b.includes('.subsession-bar'));
+    expect(mobileSubBarBlock).toBeTruthy();
+    const mobileSubBarRule = extractDirectStyleRule(mobileSubBarBlock!, /\.subsession-bar\s*/);
+    expect(mobileSubBarRule).not.toMatch(/safe-area-inset-bottom/);
+
+    const footerRule = cssWithoutComments.match(/\.subcard-mobile-footer-status\s*\{[^}]*\}/)?.[0];
+    expect(footerRule).toBeTruthy();
+    expect(footerRule).toMatch(/display:\s*flex/);
+    expect(footerRule).toMatch(/align-items:\s*center/);
+    expect(footerRule).toMatch(/justify-content:\s*center/);
+    expect(footerRule).toMatch(/white-space:\s*nowrap/);
+    expect(footerRule).toMatch(/safe-area-inset-bottom/);
+
+    // Keyboard open / input-focused continues to hide the entire .subcard-bar (including the footer inside it)
+    expect(cssWithoutComments).toMatch(/:root:not\(\.subcard-input-focused\)\.input-focused\s+\.subcard-bar:not\(:focus-within\)\s*\{\s*display:\s*none/);
+    expect(cssWithoutComments).toMatch(/:root:not\(\.subcard-input-focused\)\.kb-open\s+\.subcard-bar:not\(:focus-within\)\s*\{\s*display:\s*none/);
+  });
 });

@@ -718,6 +718,7 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
     teamDiscussionLayout,
     onTeamDiscussionLayoutChange,
     teamDiscussionRailHost,
+    daemonBadgeState,
   }: any) => (
     <div
       data-testid="app-shell-subsession-bar"
@@ -726,6 +727,7 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
       data-desktop-layout={desktopLayout}
       data-desktop-dock-side={desktopDockSide}
       data-team-discussion-layout={teamDiscussionLayout}
+      data-daemon-badge-state={daemonBadgeState ?? ''}
     >
       {verticalRailHost && desktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL && createPortal(
         <div data-testid="app-shell-subsession-vertical-rail">mock vertical rail</div>,
@@ -11174,6 +11176,53 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     } finally {
       loginAttemptState.mode = 'native';
       loginAttemptState.webReloads = 0;
+    }
+  }, 20_000);
+
+  it('omits Online/version from mobile top-right .mobile-server-actions and passes daemonBadgeState to SubSessionBar', async () => {
+    const originalUserAgent = navigator.userAgent;
+    const originalInnerWidth = window.innerWidth;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'Android' });
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      const view = render(<App />);
+      const ws = await getActiveWsClient();
+
+      await waitFor(() => expect(view.container.querySelector('.mobile-server-actions')).toBeTruthy());
+      const topActions = view.container.querySelector('.mobile-server-actions')!;
+      expect(topActions.querySelector('.badge')).toBeNull();
+      expect(topActions.textContent ?? '').not.toContain('Online');
+      expect(topActions.textContent ?? '').not.toContain('Connecting');
+      expect(topActions.textContent ?? '').not.toContain('Daemon Offline');
+      expect(topActions.textContent ?? '').not.toMatch(/v\d+\/\d+\s+\d{2}:\d{2}/);
+
+      const barBefore = await screen.findByTestId('app-shell-subsession-bar');
+      expect(['connecting', 'offline']).toContain(barBefore.getAttribute('data-daemon-badge-state'));
+
+      await act(async () => {
+        ws.emit({ type: 'session.event', event: 'connected', session: '', state: 'connected' });
+        ws.emit({
+          type: 'daemon.stats',
+          daemonVersion: '2026.9.4508-dev',
+          cpu: 10, memUsed: 1, memTotal: 2, load1: 0.5, load5: 0, load15: 0, uptime: 10,
+        });
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId('app-shell-subsession-bar').getAttribute('data-daemon-badge-state')).toBe('online');
+      });
+      expect(topActions.querySelector('.badge')).toBeNull();
+      expect(topActions.textContent ?? '').not.toContain('Online');
+      expect(topActions.textContent ?? '').not.toMatch(/v\d+\/\d+\s+\d{2}:\d{2}/);
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalInnerWidth });
     }
   }, 20_000);
 });

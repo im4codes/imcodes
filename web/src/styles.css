@@ -8013,7 +8013,35 @@ html.mobile-nav-gesture-active .chat-view * {
 
 @media (max-width: 640px) {
   .subsession-card:not(.subsession-card-rail) { min-height: 42px; gap: 1px; padding: 2px 1px; }
-  .subsession-bar { gap: 4px; padding: 3px 8px calc(3px + env(safe-area-inset-bottom, 0px)); }
+  .subsession-bar { gap: 4px; padding: 2px 8px; }
+}
+.subcard-bar-mobile .subcard-toolbar { padding: 1px 8px; gap: 6px; }
+.subcard-bar-mobile .subcard-toolbar-btn { padding: 1px 6px; line-height: 1.25; }
+.subcard-bar-mobile .subcard-toolbar-add { font-size: 15px; line-height: 1.15; }
+.subcard-bar-mobile .subsession-close-all-strip { min-height: 30px; margin: 1px 0 1px 8px; }
+.subcard-bar-mobile .subsession-bar { gap: 4px; padding: 1px 8px 0; }
+.subcard-bar-mobile .subcard-scroll { padding: 3px 10px 2px; }
+.subcard-bar-mobile .subcard-empty-state { padding: 2px 12px 1px; }
+.subcard-mobile-footer-status {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 8px max(1px, calc(max(var(--sab, 0px), env(safe-area-inset-bottom, 0px)) - 14px));
+  line-height: 1;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.subcard-mobile-footer-status .badge {
+  font-size: 9px;
+  padding: 0 5px;
+  line-height: 1.15;
+}
+.subcard-mobile-footer-version {
+  font-size: 9px;
+  line-height: 1.15;
+  color: #475569;
+  white-space: nowrap;
 }
 
 /* Desktop vertical sub-session rail. It is an ordinary flex child between the

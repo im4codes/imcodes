@@ -2573,4 +2573,116 @@ describe('SubSessionBar', () => {
       styleEl.remove();
     }
   });
+
+  it('renders centered mobile footer status + build version below sub-sessions on mobile only and hides on desktop', () => {
+    const prevBuildTime = (globalThis as { __BUILD_TIME__?: string }).__BUILD_TIME__;
+    const sampleDate = new Date(2026, 10, 14, 22, 5, 0);
+    Object.defineProperty(globalThis, '__BUILD_TIME__', {
+      configurable: true,
+      writable: true,
+      value: sampleDate.toISOString(),
+    });
+    const sub = makeSubSession({ id: 'sub-footer', sessionName: 'deck_sub_footer', label: 'worker' });
+
+    try {
+      // 1. Mobile collapsed with sub-sessions -> footer renders after .subsession-row-with-close
+      const collapsedMobile = render(
+        <SubSessionBar
+          subSessions={[sub]}
+          openIds={new Set()}
+          collapsed
+          desktopLayoutCapable={false}
+          daemonBadgeState="online"
+          onOpen={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+        />,
+      );
+      const mobileBar = collapsedMobile.container.querySelector('.subcard-bar')!;
+      expect(mobileBar.classList.contains('subcard-bar-mobile')).toBe(true);
+      const row = mobileBar.querySelector('.subsession-row-with-close')!;
+      const footer = collapsedMobile.getByTestId('mobile-subsession-footer-status');
+      expect(row.compareDocumentPosition(footer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      const badge = collapsedMobile.getByTestId('mobile-subsession-footer-badge');
+      expect(badge.classList.contains('badge-online')).toBe(true);
+      expect(badge.textContent).toBe('● Online');
+      expect(collapsedMobile.getByTestId('mobile-subsession-footer-version').textContent).toBe('v11/14 22:05');
+
+      // Connecting & offline state transitions
+      collapsedMobile.rerender(
+        <SubSessionBar
+          subSessions={[sub]}
+          openIds={new Set()}
+          collapsed
+          desktopLayoutCapable={false}
+          daemonBadgeState="connecting"
+          onOpen={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected={false}
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+        />,
+      );
+      expect(collapsedMobile.getByTestId('mobile-subsession-footer-badge').classList.contains('badge-connecting')).toBe(true);
+      expect(collapsedMobile.getByTestId('mobile-subsession-footer-badge').textContent).toContain('Connecting');
+
+      collapsedMobile.rerender(
+        <SubSessionBar
+          subSessions={[]}
+          openIds={new Set()}
+          collapsed={false}
+          desktopLayoutCapable={false}
+          daemonBadgeState="offline"
+          onOpen={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected={false}
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+        />,
+      );
+      expect(collapsedMobile.getByTestId('mobile-subsession-footer-badge').classList.contains('badge-offline')).toBe(true);
+      expect(collapsedMobile.getByTestId('mobile-subsession-footer-badge').textContent).toContain('Daemon Offline');
+      collapsedMobile.unmount();
+
+      // 2. Desktop horizontal & vertical rail -> never renders mobile footer status
+      const desktopView = render(
+        <SubSessionBar
+          subSessions={[sub]}
+          openIds={new Set()}
+          collapsed={false}
+          desktopLayoutCapable
+          desktopLayout={SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL}
+          daemonBadgeState="online"
+          onOpen={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+        />,
+      );
+      expect(desktopView.container.querySelector('.subcard-bar-mobile')).toBeNull();
+      expect(desktopView.queryByTestId('mobile-subsession-footer-status')).toBeNull();
+      desktopView.unmount();
+    } finally {
+      if (prevBuildTime === undefined) {
+        delete (globalThis as { __BUILD_TIME__?: string }).__BUILD_TIME__;
+      } else {
+        Object.defineProperty(globalThis, '__BUILD_TIME__', {
+          configurable: true,
+          writable: true,
+          value: prevBuildTime,
+        });
+      }
+    }
+  });
 });

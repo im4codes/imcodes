@@ -46,7 +46,7 @@ import type { EmbeddingStatus } from '@shared/embedding-status.js';
 import { SUBSESSION_BAR_MAX_EXPANDED_CARDS } from '@shared/scale-limits.js';
 import type { DiskUsage } from '@shared/disk-usage.js';
 import type { MemoryShortRefHealth } from '@shared/memory-short-ref-health.js';
-import { formatDaemonVersionMobile, formatDaemonVersionShort } from '../util/format-version.js';
+import { formatDaemonVersionMobile, formatDaemonVersionShort, getBuildTimeCompact } from '../util/format-version.js';
 import { isAuthoritativeUsageContextWindowSource, type UsageContextWindowSource } from '@shared/usage-context-window.js';
 import { resolveQuickAgentDelegationModel } from '../quick-agent-delegation-model.js';
 import {
@@ -219,6 +219,8 @@ interface Props {
   /** Set of sub-session labels participating in active P2P discussions. */
   p2pSessionLabels?: Set<string>;
   onSubTransportConfigSaved?: (subId: string, transportConfig: Record<string, unknown> | null) => void;
+  /** Daemon connection badge state rendered inside the mobile bottom footer strip. */
+  daemonBadgeState?: 'online' | 'connecting' | 'offline';
 }
 
 type Layout = 'single' | 'double';
@@ -837,7 +839,7 @@ function DaemonStatsModal({
   );
 }
 
-export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, desktopLayout: requestedDesktopLayout, onDesktopLayoutChange, desktopDockSide = SUBSESSION_DESKTOP_DOCK_SIDE.LEFT, onDesktopDockSideChange, verticalRailHost, teamDiscussionLayout = TEAM_DISCUSSION_LAYOUT.BOTTOM, onTeamDiscussionLayoutChange, teamDiscussionRailHost, idleFlashTokens, sharedSubSessionStates, onOpen, onFocus, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onRenameSubSession, pinnedSubSessionIds, onToggleSubSessionPin, onNew, onViewAutoDeliver, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, openSpecAutoProjection, openSpecAutoStopPending = false, openSpecAutoCompact = false, onOpenSpecAutoView, onOpenSpecAutoStop, onOpenSpecAutoToggleCompact, onOpenSpecAutoHide, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, quickClosePersistenceScope, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
+export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, desktopLayout: requestedDesktopLayout, onDesktopLayoutChange, desktopDockSide = SUBSESSION_DESKTOP_DOCK_SIDE.LEFT, onDesktopDockSideChange, verticalRailHost, teamDiscussionLayout = TEAM_DISCUSSION_LAYOUT.BOTTOM, onTeamDiscussionLayoutChange, teamDiscussionRailHost, idleFlashTokens, sharedSubSessionStates, onOpen, onFocus, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onRenameSubSession, pinnedSubSessionIds, onToggleSubSessionPin, onNew, onViewAutoDeliver, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, openSpecAutoProjection, openSpecAutoStopPending = false, openSpecAutoCompact = false, onOpenSpecAutoView, onOpenSpecAutoStop, onOpenSpecAutoToggleCompact, onOpenSpecAutoHide, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, quickClosePersistenceScope, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved, daemonBadgeState }: Props) {
   recordPerfRender('SubSessionBar');
   const { t } = useTranslation();
   const isMobile = !desktopLayoutCapable;
@@ -1742,7 +1744,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     <>
     {verticalRail}
     {teamDiscussionRail}
-    <div class={`subcard-bar${isVerticalRail ? ' subcard-bar-vertical-mode' : ''}`}>
+    <div class={`subcard-bar${isVerticalRail ? ' subcard-bar-vertical-mode' : ''}${isMobile ? ' subcard-bar-mobile' : ''}`}>
       {/* Toolbar */}
       <div class="subcard-toolbar">
         {!isVerticalRail && <button class="subcard-toolbar-btn" onClick={() => setCollapsed(!collapsed)} title={collapsed ? t('subsessionBar.show') : t('subsessionBar.hide')}>
@@ -2233,6 +2235,34 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
           </div>
         </div>
       )}
+      {isMobile && daemonBadgeState && (() => {
+        const buildTimeLabel = getBuildTimeCompact();
+        return (
+          <div class="subcard-mobile-footer-status" data-testid="mobile-subsession-footer-status">
+            <span
+              class={`badge ${
+                daemonBadgeState === 'online'
+                  ? 'badge-online'
+                  : daemonBadgeState === 'connecting'
+                    ? 'badge-connecting'
+                    : 'badge-offline'
+              }`}
+              data-testid="mobile-subsession-footer-badge"
+            >
+              {daemonBadgeState === 'online'
+                ? '● Online'
+                : daemonBadgeState === 'connecting'
+                  ? (<><span class="connecting-dot" />{' Connecting'}</>)
+                  : (<><span class="connecting-dot" />{' Daemon Offline'}</>)}
+            </span>
+            {buildTimeLabel && (
+              <span class="subcard-mobile-footer-version" data-testid="mobile-subsession-footer-version">
+                {`v${buildTimeLabel}`}
+              </span>
+            )}
+          </div>
+        );
+      })()}
       {showDaemonDetails && stats && (
         <DaemonStatsModal
           stats={stats}

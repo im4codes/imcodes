@@ -32,3 +32,20 @@ export function formatDaemonVersionMobile(version: string | null | undefined): s
   if (!/-dev(?:$|\.)/.test(short)) return short;
   return short.replace(/^[^.]+\./, '');
 }
+
+/** Format a build timestamp string/epoch as `M/D HH:MM` in local time, returning `''` when absent/invalid. */
+export function formatBuildTimeCompact(buildTime?: string | number | null): string {
+  if (buildTime == null || buildTime === '') return '';
+  try {
+    const d = new Date(buildTime);
+    if (Number.isNaN(d.getTime())) return '';
+    return `${d.getMonth() + 1}/${d.getDate()} ${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}`;
+  } catch {
+    return '';
+  }
+}
+
+/** Read and format global `__BUILD_TIME__` safely (tolerating test environments without Vite define). */
+export function getBuildTimeCompact(): string {
+  return formatBuildTimeCompact(typeof __BUILD_TIME__ !== 'undefined' ? __BUILD_TIME__ : '');
+}
