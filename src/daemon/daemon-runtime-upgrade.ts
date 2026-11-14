@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import {
   closeSync,
@@ -42,6 +42,7 @@ import {
 } from '../../shared/desktop-release-manifest.js';
 import { compareImcodesVersions } from '../../shared/imcodes-version.js';
 import { isPathInsideGitCheckout } from '../node/desktop-installer-probe.js';
+import { execFileOffMain } from '../util/exec-helper.js';
 import { imcodesStateDir, imcodesStateDirForHome, IMCODES_HOME_ENV } from '../util/imcodes-state-dir.js';
 import { renderSystemdExecStart } from '../util/launch-target.js';
 import { resolvePosixDaemonServicePaths } from '../util/posix-daemon-service.js';
@@ -61,6 +62,7 @@ import {
   readCurrentPointerTarget,
   readPackageVersionSync,
   readVerifiedDaemonIdentity,
+  recoverInterruptedDaemonRuntimeSwitch,
   releaseRuntimeUpgradeLock,
   restartDaemonService,
   restoreServiceLaunchTarget,
@@ -69,6 +71,7 @@ import {
   switchDaemonRuntimeCurrentPointer,
   transferRuntimeUpgradeLock,
   waitForHealthyTargetDaemon,
+  writeSwitchStateRecord,
   writeUpgradeCooldownSentinel,
   type DaemonRuntimePlatform,
   type ServiceLaunchBackup,
@@ -88,6 +91,7 @@ export {
   pruneOldDaemonRuntimeReleases,
   readCurrentPointerTarget,
   readVerifiedDaemonIdentity,
+  recoverInterruptedDaemonRuntimeSwitch,
   releaseRuntimeUpgradeLock,
   restartDaemonService,
   restoreServiceLaunchTarget,
@@ -217,6 +221,8 @@ export type DaemonRuntimeUpgradeResult =
       runtimeRoot: string;
       reason: string;
       rolledBack: true;
+      rollbackVerified?: boolean;
+      rollbackError?: string;
     }
   | {
       status: 'up_to_date';
@@ -317,6 +323,14 @@ export function resolveDaemonRuntimeSwitchHelperPath(): string {
   const sibling = resolve(here, 'daemon-runtime-switch-helper.mjs');
   if (existsSync(sibling)) return sibling;
   const srcFallback = resolve(here, '..', '..', 'src', 'daemon', 'daemon-runtime-switch-helper.mjs');
+  return existsSync(srcFallback) ? srcFallback : sibling;
+}
+
+export function resolveDaemonLockIdentityPath(): string {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const sibling = resolve(here, 'daemon-lock-identity.mjs');
+  if (existsSync(sibling)) return sibling;
+  const srcFallback = resolve(here, '..', '..', 'src', 'daemon', 'daemon-lock-identity.mjs');
   return existsSync(srcFallback) ? srcFallback : sibling;
 }
 
@@ -669,50 +683,50 @@ export function verifyStagedDaemonRuntimeTree(
 /**
  * Extract a verified `daemon-runtime` archive into `destDir`.
  */
-export function extractDaemonRuntimeArchive(
+export async function extractDaemonRuntimeArchive(
   archivePath: string,
   format: 'tar.gz' | 'zip',
   destDir: string,
   platform: DaemonRuntimePlatform,
-): void {
+): Promise<void> {
   mkdirSync(destDir, { recursive: true });
   if (format === 'tar.gz') {
-    execFileSync('tar', ['-xzf', archivePath, '-C', destDir], { stdio: 'pipe' });
+    await execFileOffMain('tar', ['-xzf', archivePath, '-C', destDir]);
     return;
   }
   if (platform === 'win32') {
     const psScript = `Expand-Archive -LiteralPath '${archivePath.replace(/'/gu, "''")}' -DestinationPath '${destDir.replace(/'/gu, "''")}' -Force`;
-    execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', psScript], { stdio: 'pipe' });
+    await execFileOffMain('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', psScript]);
     return;
   }
-  execFileSync('unzip', ['-q', archivePath, '-d', destDir], { stdio: 'pipe' });
+  await execFileOffMain('unzip', ['-q', archivePath, '-d', destDir]);
 }
 
 /**
  * Default pre-switch (and stopped-daemon fallback) binary probe: verify bundled `node --version`
  * and `package/dist/src/index.js --version`.
  */
-export function runDefaultRuntimeBinaryProbe(
+export async function runDefaultRuntimeBinaryProbe(
   nodePath: string,
   entryPath: string,
   expectedVersion: string,
   timeoutMs = 15_000,
-): void {
-  const nodeRes = execFileSync(nodePath, ['--version'], {
+): Promise<void> {
+  const { stdout: nodeOut } = await execFileOffMain(nodePath, ['--version'], {
     encoding: 'utf8',
     timeout: timeoutMs,
     windowsHide: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
   });
+  const nodeRes = String(nodeOut ?? '');
   if (!/^v\d+\.\d+\.\d+/u.test(nodeRes.trim())) {
     throw new Error(`daemon_runtime_node_probe_invalid_output:${nodeRes.trim()}`);
   }
-  const appRes = execFileSync(nodePath, [entryPath, '--version'], {
+  const { stdout: appOut } = await execFileOffMain(nodePath, [entryPath, '--version'], {
     encoding: 'utf8',
     timeout: timeoutMs,
     windowsHide: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  }).trim();
+  });
+  const appRes = String(appOut ?? '').trim();
   if (!appRes) {
     throw new Error('daemon_runtime_entry_probe_empty_output');
   }
@@ -1021,6 +1035,10 @@ export function launchDetachedDaemonRuntimeSwitchRunner(input: {
   runtimeRoot: string;
   stagedReleaseDir: string;
   previousTarget?: string;
+  previousVersion?: string;
+  previousNodePath?: string;
+  previousEntryPath?: string;
+  wasRunning?: boolean;
   targetVersion: string;
   stateDir: string;
   homeDir: string;
@@ -1038,8 +1056,10 @@ export function launchDetachedDaemonRuntimeSwitchRunner(input: {
   const configPath = join(scriptDir, 'runtime-upgrade.json');
   const scriptPath = join(scriptDir, 'switch-runner.mjs');
   const helperDestPath = join(scriptDir, 'daemon-runtime-switch-helper.mjs');
+  const lockIdentityDestPath = join(scriptDir, 'daemon-lock-identity.mjs');
 
   copyFileSync(resolveDaemonRuntimeSwitchHelperPath(), helperDestPath);
+  copyFileSync(resolveDaemonLockIdentityPath(), lockIdentityDestPath);
 
   const env = input.env ?? process.env;
   const targetCurrent = join(resolve(input.runtimeRoot), 'current');
@@ -1052,12 +1072,16 @@ export function launchDetachedDaemonRuntimeSwitchRunner(input: {
     env,
   });
 
-  const previousNodePath = input.previousTarget
-    ? join(resolve(input.previousTarget), input.platform === 'win32' ? 'node.exe' : join('bin', 'node'))
-    : undefined;
-  const previousEntryPath = input.previousTarget
-    ? join(resolve(input.previousTarget), 'package', 'dist', 'src', 'index.js')
-    : undefined;
+  const previousNodePath =
+    input.previousNodePath
+    ?? (input.previousTarget
+      ? join(resolve(input.previousTarget), input.platform === 'win32' ? 'node.exe' : join('bin', 'node'))
+      : undefined);
+  const previousEntryPath =
+    input.previousEntryPath
+    ?? (input.previousTarget
+      ? join(resolve(input.previousTarget), 'package', 'dist', 'src', 'index.js')
+      : undefined);
 
   writeFileSync(
     configPath,
@@ -1066,6 +1090,7 @@ export function launchDetachedDaemonRuntimeSwitchRunner(input: {
       runtimeRoot: resolve(input.runtimeRoot),
       stagedReleaseDir: resolve(input.stagedReleaseDir),
       previousTarget: input.previousTarget ? resolve(input.previousTarget) : null,
+      ...(input.previousVersion ? { previousVersion: input.previousVersion } : {}),
       targetVersion: input.targetVersion,
       stateDir: resolve(input.stateDir),
       keepTargets: input.keepTargets.map((t) => resolve(t)),
@@ -1074,6 +1099,7 @@ export function launchDetachedDaemonRuntimeSwitchRunner(input: {
       targetEntryPath: launchCfg.targetEntryPath,
       ...(previousNodePath ? { previousNodePath } : {}),
       ...(previousEntryPath ? { previousEntryPath } : {}),
+      ...(typeof input.wasRunning === 'boolean' ? { wasRunning: input.wasRunning } : {}),
       ...(launchCfg.systemdUnitPath ? { systemdUnitPath: launchCfg.systemdUnitPath } : {}),
       ...(launchCfg.systemdUnitName ? { systemdUnitName: launchCfg.systemdUnitName } : {}),
       ...(launchCfg.launchAgentPath ? { launchAgentPath: launchCfg.launchAgentPath } : {}),
@@ -1146,7 +1172,7 @@ export function resolveLegacyNpmCliFallback(options: {
     .filter(Boolean);
 
   for (const dirEntry of pathEntries) {
-    const binNames = platform === 'win32' ? ['imcodes.cmd', 'imcodes.exe', 'imcodes'] : ['imcodes'];
+    const binNames = platform === 'win32' ? ['imcodes.cmd', 'imcodes.exe', 'imcodes.ps1', 'imcodes'] : ['imcodes'];
     for (const binName of binNames) {
       const candidateBin = join(dirEntry, binName);
       if (!existsSync(candidateBin)) continue;
@@ -1160,7 +1186,9 @@ export function resolveLegacyNpmCliFallback(options: {
           message: `Legacy CLI binary resolves into git checkout (${realBin}); refusing automated fallback`,
         };
       }
-      const nmIdx = norm.lastIndexOf('/node_modules/imcodes/');
+      const nmIdx = platform === 'win32'
+        ? norm.toLowerCase().lastIndexOf('/node_modules/imcodes/')
+        : norm.lastIndexOf('/node_modules/imcodes/');
       if (nmIdx !== -1) {
         const prefixGuess =
           platform === 'win32'
@@ -1169,9 +1197,45 @@ export function resolveLegacyNpmCliFallback(options: {
               ? dirname(realBin.slice(0, nmIdx))
               : realBin.slice(0, nmIdx);
         addPrefix(prefixGuess, true);
+      } else if (platform === 'win32') {
+        // Windows npm global shims (`imcodes.cmd` / `.ps1`) live directly inside `<prefix>`.
+        addPrefix(dirEntry, false);
+        const realDir = dirname(realBin);
+        if (realDir !== resolve(dirEntry)) {
+          addPrefix(realDir, false);
+        }
       } else {
         addPrefix(dirname(dirEntry), false);
       }
+    }
+  }
+
+  if (platform === 'win32') {
+    if (env.APPDATA?.trim()) {
+      addPrefix(join(env.APPDATA.trim(), 'npm'), false);
+    }
+    const winHome = options.userHome?.trim() || env.USERPROFILE?.trim() || env.HOME?.trim();
+    if (winHome) {
+      addPrefix(join(winHome, 'AppData', 'Roaming', 'npm'), false);
+    }
+    if (options.execPath?.trim()) {
+      const execDir = dirname(resolve(options.execPath.trim()));
+      if (!execDir.replace(/\\/gu, '/').includes('/daemon-runtime/')) {
+        addPrefix(execDir, false);
+      }
+    }
+  } else {
+    if (options.execPath?.trim()) {
+      const execBinDir = dirname(resolve(options.execPath.trim()));
+      if (basename(execBinDir) === 'bin' && !execBinDir.replace(/\\/gu, '/').includes('/daemon-runtime/')) {
+        addPrefix(dirname(execBinDir), false);
+      }
+    }
+    const posixHome = options.userHome?.trim() || env.HOME?.trim();
+    if (posixHome) {
+      addPrefix(join(posixHome, '.npm-global'), false);
+      addPrefix(join(posixHome, '.npm-packages'), false);
+      addPrefix(join(posixHome, '.local'), false);
     }
   }
 
@@ -1334,6 +1398,7 @@ export async function upgradeBundledDaemonRuntime(
     mode: options.detachedHandoff ? 'detached_handoff_parent' : 'in_process',
   });
   let lockHandedOff = false;
+  recoverInterruptedDaemonRuntimeSwitch(writableResolution.targetRoot, platform);
 
   const workTmpDir = mkdtempSync(join(tmpdir(), 'imcodes-daemon-rt-dl-'));
   let stagingDir: string | undefined;
@@ -1406,7 +1471,7 @@ export async function upgradeBundledDaemonRuntime(
         platform,
       });
     } else {
-      extractDaemonRuntimeArchive(
+      await extractDaemonRuntimeArchive(
         downloaded.archivePath,
         downloaded.manifest.artifact.format,
         stagingDir,
@@ -1430,7 +1495,7 @@ export async function upgradeBundledDaemonRuntime(
         expectedVersion: targetVer,
       });
     } else {
-      runDefaultRuntimeBinaryProbe(
+      await runDefaultRuntimeBinaryProbe(
         verified.nodePath,
         verified.entryPath,
         targetVer,
@@ -1453,9 +1518,23 @@ export async function upgradeBundledDaemonRuntime(
     const prevTargetForHandoff = prev.targetPath && prev.targetPath !== join(resolve(writableResolution.targetRoot), 'current')
       ? prev.targetPath
       : undefined;
+    const previousVersion = prev.version ?? options.currentVersion;
     const keepTargets = [releaseDir, prevTargetForHandoff].filter((v): v is string => Boolean(v));
 
     if (options.detachedHandoff) {
+      const fallbackLayout = prevTargetForHandoff ?? inspection.activeLayout ?? writableResolution.activeRoot;
+      const layoutNodeCandidate = join(
+        resolve(fallbackLayout),
+        platform === 'win32' ? 'node.exe' : join('bin', 'node'),
+      );
+      const layoutEntryCandidate = join(resolve(fallbackLayout), 'package', 'dist', 'src', 'index.js');
+      const fallbackPreviousNodePath = existsSync(layoutNodeCandidate)
+        ? layoutNodeCandidate
+        : (options.execPath ?? process.execPath);
+      const fallbackPreviousEntryPath = existsSync(layoutEntryCandidate)
+        ? layoutEntryCandidate
+        : (options.entryScriptPath ? resolve(options.entryScriptPath) : undefined);
+
       transferRuntimeUpgradeLock(stateDir, lockHandle.ownerToken, {
         mode: 'detached_handoff_pending',
         targetVersion: targetVer,
@@ -1466,6 +1545,10 @@ export async function upgradeBundledDaemonRuntime(
           runtimeRoot: writableResolution.targetRoot,
           stagedReleaseDir: releaseDir,
           previousTarget: prevTargetForHandoff,
+          previousVersion,
+          previousNodePath: fallbackPreviousNodePath,
+          previousEntryPath: fallbackPreviousEntryPath,
+          wasRunning: true,
           targetVersion: targetVer,
           stateDir,
           homeDir,
@@ -1480,7 +1563,7 @@ export async function upgradeBundledDaemonRuntime(
         return {
           status: 'upgraded',
           targetVersion: targetVer,
-          ...(prev.version ?? options.currentVersion ? { previousVersion: prev.version ?? options.currentVersion } : {}),
+          ...(previousVersion ? { previousVersion } : {}),
           ...(prevTargetForHandoff ? { previousTarget: prevTargetForHandoff } : {}),
           runtimeRoot: writableResolution.targetRoot,
           releaseDir,
@@ -1566,7 +1649,7 @@ export async function upgradeBundledDaemonRuntime(
           settleMs: options.settleMs,
         });
       } else {
-        runDefaultRuntimeBinaryProbe(
+        await runDefaultRuntimeBinaryProbe(
           switchedNodePath,
           switchedEntryPath,
           targetVer,
@@ -1574,6 +1657,8 @@ export async function upgradeBundledDaemonRuntime(
         );
       }
     } catch (healthErr) {
+      const rollbackBeganAtMs = Date.now();
+      const postRbIdentity = readVerifiedDaemonIdentity(stateDir, platform);
       const restored = rollbackDaemonRuntimeCurrentPointer(
         writableResolution.targetRoot,
         switched.previousTarget,
@@ -1584,28 +1669,39 @@ export async function upgradeBundledDaemonRuntime(
         restoreServiceLaunchTarget(launchBackup);
         launchBackup = null;
       }
+      let rollbackVerified: boolean | undefined;
+      let rollbackError: string | undefined;
+      const expectedPrevVer = switched.previousVersion ?? options.currentVersion;
+
       if (options.restartService) {
         try {
           await options.restartService({
             platform,
             runtimeRoot: writableResolution.targetRoot,
             releaseDir: restored.restoredTarget ?? writableResolution.activeRoot,
-            targetVersion: switched.previousVersion ?? options.currentVersion,
+            targetVersion: expectedPrevVer,
             previousVersion: targetVer,
             previousTarget: releaseDir,
           });
-        } catch {
-          // rollback pointer already restored; best-effort restart attempt recorded
+          rollbackVerified = true;
+        } catch (rbErr) {
+          rollbackVerified = false;
+          rollbackError = rbErr instanceof Error ? rbErr.message : String(rbErr);
         }
       } else if (oldIdentity || executedOsServiceRestart) {
-        const prevRoot = restored.restoredTarget ?? writableResolution.activeRoot;
-        const postRbIdentity = readVerifiedDaemonIdentity(stateDir, platform);
+        const prevRoot = restored.restoredTarget ?? inspection.activeLayout ?? writableResolution.activeRoot;
+        const candidatePrevNode = join(resolve(prevRoot), platform === 'win32' ? 'node.exe' : join('bin', 'node'));
+        const candidatePrevEntry = join(resolve(prevRoot), 'package', 'dist', 'src', 'index.js');
+        const prevNode = existsSync(candidatePrevNode) ? candidatePrevNode : (options.execPath ?? process.execPath);
+        const prevEntry = existsSync(candidatePrevEntry)
+          ? candidatePrevEntry
+          : (options.entryScriptPath ? resolve(options.entryScriptPath) : candidatePrevEntry);
         try {
-          restartDaemonService({
+          const rbRestartRes = restartDaemonService({
             platform,
             stateDir,
-            nodePath: join(prevRoot, platform === 'win32' ? 'node.exe' : join('bin', 'node')),
-            entryPath: join(prevRoot, 'package', 'dist', 'src', 'index.js'),
+            nodePath: prevNode,
+            entryPath: prevEntry,
             systemdUnitPath: launchCfg.systemdUnitPath,
             systemdUnitName: launchCfg.systemdUnitName,
             launchAgentPath: launchCfg.launchAgentPath,
@@ -1614,26 +1710,55 @@ export async function upgradeBundledDaemonRuntime(
             oldIdentity: postRbIdentity ?? oldIdentity,
             wasRunning: Boolean(oldIdentity || executedOsServiceRestart),
           });
-        } catch {
-          // rollback pointer + launcher already restored
+          if (!rbRestartRes.ok) {
+            rollbackVerified = false;
+            rollbackError = `daemon_rollback_restart_failed:${rbRestartRes.mode}`;
+          } else if (!options.healthCheck && (oldIdentity || executedOsServiceRestart)) {
+            waitForHealthyTargetDaemon({
+              stateDir,
+              expectedVersion: expectedPrevVer,
+              oldIdentity: postRbIdentity ?? oldIdentity,
+              restartBeganAtMs: rollbackBeganAtMs,
+              platform,
+              timeoutMs: options.healthCheckTimeoutMs,
+              settleMs: options.settleMs,
+            });
+            rollbackVerified = true;
+          } else {
+            rollbackVerified = true;
+          }
+        } catch (rbErr) {
+          rollbackVerified = false;
+          rollbackError = rbErr instanceof Error ? rbErr.message : String(rbErr);
         }
       }
       return {
         status: 'rolled_back',
         targetVersion: targetVer,
-        ...(switched.previousVersion ?? options.currentVersion
-          ? { previousVersion: switched.previousVersion ?? options.currentVersion }
-          : {}),
+        ...(expectedPrevVer ? { previousVersion: expectedPrevVer } : {}),
         ...(restored.restoredTarget ? { restoredTarget: restored.restoredTarget } : {}),
         runtimeRoot: writableResolution.targetRoot,
         reason: healthErr instanceof Error ? healthErr.message : String(healthErr),
         rolledBack: true,
+        ...(typeof rollbackVerified === 'boolean' ? { rollbackVerified } : {}),
+        ...(rollbackError ? { rollbackError } : {}),
       };
     }
 
-    writeUpgradeCooldownSentinel(stateDir, options.now?.() ?? Date.now());
+    const completedAtMs = options.now?.() ?? Date.now();
+    writeUpgradeCooldownSentinel(stateDir, completedAtMs);
+    writeSwitchStateRecord(resolve(writableResolution.targetRoot), {
+      phase: 'completed',
+      targetRelease: releaseDir,
+      targetVersion: targetVer,
+      previousTarget: switched.previousTarget ?? null,
+      previousVersion: switched.previousVersion ?? options.currentVersion ?? null,
+      completedAt: completedAtMs,
+    });
+    const currentPtr = readCurrentPointerTarget(writableResolution.targetRoot);
     pruneOldDaemonRuntimeReleases(writableResolution.targetRoot, [
       releaseDir,
+      currentPtr.targetPath,
       switched.previousTarget,
     ]);
 

@@ -25,10 +25,13 @@ export interface RuntimeUpgradeLockOwnerRecord {
   handoffDeadlineAt?: number;
 }
 
+import type { ProcessLiveness } from './daemon-lock-identity.mjs';
+
 export interface VerifiedDaemonIdentity {
   pid: number;
-  startToken: string | null;
-  source: 'instance_lock' | 'daemon_pid';
+  startToken: string;
+  source: 'daemon_lock';
+  socketPath?: string;
   version: string | null;
   startedAt: number | null;
 }
@@ -91,6 +94,7 @@ export interface DetachedSwitchConfig {
   runtimeRoot: string;
   stagedReleaseDir: string;
   previousTarget: string | null;
+  previousVersion?: string | null;
   targetVersion: string;
   stateDir: string;
   keepTargets: string[];
@@ -99,6 +103,7 @@ export interface DetachedSwitchConfig {
   targetEntryPath?: string;
   previousNodePath?: string;
   previousEntryPath?: string;
+  wasRunning?: boolean;
   systemdUnitPath?: string;
   systemdUnitName?: string;
   launchAgentPath?: string;
@@ -114,6 +119,7 @@ export interface DetachedSwitchConfig {
 
 export declare function sleepSync(ms: number): void;
 export declare function isProcessAlive(pid: number): boolean;
+export declare function probeProcessLiveness(pid: number, platform?: NodeJS.Platform): ProcessLiveness;
 export declare function probeProcessStartToken(pid: number, platform?: NodeJS.Platform): string | null;
 export declare function readPackageVersionSync(layoutDir: string): string | undefined;
 
@@ -134,13 +140,23 @@ export declare function claimHandoffRuntimeUpgradeLock(
 export declare function releaseRuntimeUpgradeLock(stateDir: string, expectedOwnerToken: string | null | undefined): boolean;
 
 export declare function writeUpgradeCooldownSentinel(stateDir: string, nowMs?: number): string;
-export declare function readVerifiedDaemonIdentity(stateDir: string, platform?: NodeJS.Platform): VerifiedDaemonIdentity | null;
+export declare function readVerifiedDaemonIdentity(
+  stateDir: string,
+  platform?: NodeJS.Platform,
+  options?: { probeLiveness?: (pid: number) => ProcessLiveness },
+): VerifiedDaemonIdentity | null;
 export declare function stopVerifiedDaemon(
   identity: VerifiedDaemonIdentity | null | undefined,
-  options?: { platform?: NodeJS.Platform; graceMs?: number },
+  options?: { platform?: NodeJS.Platform; graceMs?: number; probeLiveness?: (pid: number) => ProcessLiveness },
 ): boolean;
 
 export declare function readCurrentPointerTarget(runtimeRoot: string): CurrentPointerTarget;
+export declare function writeSwitchStateRecord(resolvedRoot: string, record: Record<string, unknown>): void;
+export declare function recoverInterruptedDaemonRuntimeSwitch(
+  runtimeRoot: string,
+  platform?: DaemonRuntimePlatform,
+  options?: { nowMs?: number; rollbackUnconfirmed?: boolean },
+): { recovered: boolean; restoredTarget?: string; previousVersion?: string };
 export declare function switchDaemonRuntimeCurrentPointer(
   runtimeRoot: string,
   releaseDir: string,
@@ -174,7 +190,7 @@ export declare function restartDaemonService(spec: RestartDaemonServiceSpec): {
 };
 export declare function waitForHealthyTargetDaemon(spec: {
   stateDir: string;
-  expectedVersion: string;
+  expectedVersion?: string;
   oldIdentity: VerifiedDaemonIdentity | null | undefined;
   restartBeganAtMs: number;
   platform?: NodeJS.Platform;

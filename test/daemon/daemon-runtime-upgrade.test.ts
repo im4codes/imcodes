@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   chmodSync,
@@ -30,20 +30,33 @@ import {
   DAEMON_RUNTIME_CRITICAL_ENTRY_PATHS,
   DAEMON_RUNTIME_FILES_FILENAME,
   DAEMON_RUNTIME_LOCK_DIR_NAME,
+  DAEMON_RUNTIME_SWITCH_STATE_FILE,
   UPGRADE_COOLDOWN_SENTINEL_FILE,
   acquireRuntimeUpgradeLock,
   inspectDaemonRuntimeMode,
   launchDetachedDaemonRuntimeSwitchRunner,
   readCurrentPointerTarget,
+  readVerifiedDaemonIdentity,
+  recoverInterruptedDaemonRuntimeSwitch,
   releaseRuntimeUpgradeLock,
   resolveLegacyNpmCliFallback,
   rollbackDaemonRuntimeCurrentPointer,
+  stopVerifiedDaemon,
   switchDaemonRuntimeCurrentPointer,
   upgradeBundledDaemonRuntime,
 } from '../../src/daemon/daemon-runtime-upgrade.js';
+import {
+  linuxProcStatLiveness,
+  ownerMatchesLiveProcess,
+  probeProcessLivenessWithExec,
+  psLiveness,
+} from '../../src/daemon/daemon-lock-identity.mjs';
+import { acquireInstanceLock, releaseInstanceLock } from '../../src/daemon/instance-lock.js';
+import { runDetachedPosixUpgrade, runDetachedWindowsUpgrade } from '../../src/cli/upgrade-detached.js';
 import { inspectImcodesCliResolution, installImcodesCliWrapper } from '../../src/node/imcodes-cli-wrapper.js';
 import { discoverCodingDaemonRuntime } from '../../src/node/local-daemon-control.js';
-import { buildPosixRestartCommand } from '../../src/util/posix-upgrade-script.js';
+import { buildPosixRestartCommand, buildPosixUpgradeScript } from '../../src/util/posix-upgrade-script.js';
+import { launchWindowsUpgrade } from '../../src/util/windows-upgrade-script.js';
 import { imcodesStateDirForHome } from '../../src/util/imcodes-state-dir.js';
 
 const tempDirs: string[] = [];
@@ -57,6 +70,37 @@ function makeTempDir(prefix: string): string {
   const dir = mkdtempSync(join(tmpdir(), prefix));
   tempDirs.push(dir);
   return dir;
+}
+
+function writeFakeDaemonScript(scriptPath: string, stateDir: string, version: string, includeLockMetadata = true): void {
+  const statusPath = JSON.stringify(join(stateDir, 'daemon-runtime.json'));
+  const lockPath = JSON.stringify(join(stateDir, 'daemon.lock.json'));
+  const pidPath = JSON.stringify(join(stateDir, 'daemon.pid'));
+  const socketPath = JSON.stringify(join(stateDir, 'daemon.sock'));
+  const nodeScript = [
+    "const fs=require('fs');",
+    'const p=Number(process.argv[1]);',
+    'const s=Date.now();',
+    `fs.writeFileSync(${statusPath}, JSON.stringify({pid:p,startedAt:s,updatedAt:s,restartCount:1,version:${JSON.stringify(version)}}));`,
+    ...(includeLockMetadata
+      ? [
+          "const stat=fs.readFileSync('/proc/'+p+'/stat','utf8');",
+          "const after=stat.slice(stat.lastIndexOf(')')+2).trim().split(/\\s+/);",
+          "const startTicks=after[19];",
+          `fs.writeFileSync(${lockPath}, JSON.stringify({version:1,pid:p,startToken:'linux:'+startTicks,acquiredAt:s,socketPath:${socketPath},sessionIds:[],residualResources:[]}));`,
+        ]
+      : []),
+  ].join('');
+  writeFileSync(
+    scriptPath,
+    `#!/bin/sh
+sleep 15 >/dev/null 2>&1 &
+PID=$!
+echo "$PID" > ${pidPath}
+${JSON.stringify(process.execPath)} -e ${JSON.stringify(nodeScript)} "$PID"
+`,
+    { mode: 0o755 },
+  );
 }
 
 /**
@@ -700,18 +744,9 @@ describe('daemon-runtime atomic self-upgrade, rollback, discovery priority & fal
     expect(sleepStatus).toBe(1);
     expect(realpathSync(join(runtimeRoot, 'current'))).toBe(realpathSync(rel110));
 
-    // Counterexample 2: daemon starts on OLD version 1.1.0 when 1.2.0 was expected -> MUST FAIL & roll back!
+    // Counterexample 2: daemon starts on OLD version 1.1.0 (with valid daemon.lock.json) when 1.2.0 was expected -> MUST FAIL & roll back!
     const oldVerScript = join(root, 'old-ver-restart.sh');
-    writeFileSync(
-      oldVerScript,
-      `#!/bin/sh
-sleep 15 >/dev/null 2>&1 &
-PID=$!
-echo "$PID" > "${join(stateDir, 'daemon.pid')}"
-"${process.execPath}" -e "const fs=require('fs');const p=Number(process.argv[1]);const s=Date.now();fs.writeFileSync('${join(stateDir, 'daemon-runtime.json')}', JSON.stringify({pid:p,startedAt:s,updatedAt:s,restartCount:1,version:'1.1.0'}));" "$PID"
-`,
-      { mode: 0o755 },
-    );
+    writeFakeDaemonScript(oldVerScript, stateDir, '1.1.0', true);
     const scriptDirOldVer = mkdtempSync(join(root, 'script-oldver-'));
     const launchedOldVer = launchDetachedDaemonRuntimeSwitchRunner({
       scriptDir: scriptDirOldVer,
@@ -741,18 +776,9 @@ echo "$PID" > "${join(stateDir, 'daemon.pid')}"
     expect(oldVerStatus).toBe(1);
     expect(realpathSync(join(runtimeRoot, 'current'))).toBe(realpathSync(rel110));
 
-    // Happy detached path: restart spawns a live daemon writing daemon.pid + daemon-runtime.json with target version 1.2.0
+    // Happy detached path: restart spawns a live daemon writing daemon.pid + daemon.lock.json + daemon-runtime.json with target version 1.2.0
     const happyRestartScript = join(root, 'happy-restart.sh');
-    writeFileSync(
-      happyRestartScript,
-      `#!/bin/sh
-sleep 15 >/dev/null 2>&1 &
-PID=$!
-echo "$PID" > "${join(stateDir, 'daemon.pid')}"
-"${process.execPath}" -e "const fs=require('fs');const p=Number(process.argv[1]);const s=Date.now();fs.writeFileSync('${join(stateDir, 'daemon-runtime.json')}', JSON.stringify({pid:p,startedAt:s,updatedAt:s,restartCount:1,version:'1.2.0'}));" "$PID"
-`,
-      { mode: 0o755 },
-    );
+    writeFakeDaemonScript(happyRestartScript, stateDir, '1.2.0', true);
 
     const scriptDirOk = mkdtempSync(join(root, 'script-ok-'));
     const launchedOk = launchDetachedDaemonRuntimeSwitchRunner({
@@ -1245,5 +1271,541 @@ echo "$PID" > "${join(stateDir, 'daemon.pid')}"
       userHome: root,
     });
     expect(roRes).toMatchObject({ eligible: false, reason: 'legacy_npm_cli_read_only' });
+  });
+
+  it('[F3-R2] verifies real daemon.lock.json identity, fails closed on PID reuse/probe errors, and recovers unserviced + first user_fallback rollbacks', async () => {
+    const root = makeTempDir('imcodes-rt-f3r2-');
+    const stateDir = join(root, 'state');
+    mkdirSync(stateDir, { recursive: true });
+
+    // 1. Positive matched-owner identity using acquireInstanceLock + real kill via stopVerifiedDaemon
+    const liveChild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000);'], { stdio: 'ignore' });
+    try {
+      const liveStat = readFileSync(`/proc/${liveChild.pid}/stat`, 'utf8');
+      const liveTicks = liveStat.slice(liveStat.lastIndexOf(')') + 2).trim().split(/\s+/)[19];
+      writeFileSync(join(stateDir, 'daemon.pid'), `${liveChild.pid}\n`);
+      writeFileSync(
+        join(stateDir, 'daemon.lock.json'),
+        JSON.stringify({
+          version: 1,
+          pid: liveChild.pid,
+          startToken: `linux:${liveTicks}`,
+          acquiredAt: Date.now(),
+          socketPath: join(stateDir, 'daemon.sock'),
+          sessionIds: [],
+          residualResources: [],
+        }),
+      );
+      const verified = readVerifiedDaemonIdentity(stateDir, 'linux');
+      expect(verified).toMatchObject({
+        pid: liveChild.pid,
+        startToken: `linux:${liveTicks}`,
+        source: 'daemon_lock',
+      });
+
+      // Own-lock sanity via real acquireInstanceLock on current process
+      const lockStateDir = join(root, 'own-lock');
+      mkdirSync(lockStateDir, { recursive: true });
+      const lockHandle = await acquireInstanceLock({
+        socketPath: join(lockStateDir, 'daemon.sock'),
+        metadataPath: join(lockStateDir, 'daemon.lock.json'),
+        pidPath: join(lockStateDir, 'daemon.pid'),
+      });
+      try {
+        const ownVerified = readVerifiedDaemonIdentity(lockStateDir, process.platform);
+        expect(ownVerified?.pid).toBe(process.pid);
+        expect(ownVerified?.startToken).toBe(lockHandle.identity.startToken);
+      } finally {
+        await releaseInstanceLock(lockHandle);
+      }
+
+      // 2. PID-reuse & missing/malformed/cross-scheme fail-closed negative counterexamples:
+      // 2a. Mismatched startToken on live child MUST return null and MUST NOT kill unrelated live process!
+      writeFileSync(
+        join(stateDir, 'daemon.lock.json'),
+        JSON.stringify({
+          version: 1,
+          pid: liveChild.pid,
+          startToken: 'linux:0',
+          acquiredAt: Date.now(),
+          socketPath: join(stateDir, 'daemon.sock'),
+          sessionIds: [],
+          residualResources: [],
+        }),
+      );
+      expect(readVerifiedDaemonIdentity(stateDir, 'linux')).toBeNull();
+      expect(stopVerifiedDaemon({ pid: liveChild.pid!, startToken: 'linux:0' }, { platform: 'linux', graceMs: 100 })).toBe(false);
+      expect(() => process.kill(liveChild.pid!, 0)).not.toThrow();
+
+      // 2b. Legacy runtime:* scheme and cross-scheme rejected fail-closed
+      writeFileSync(
+        join(stateDir, 'daemon.lock.json'),
+        JSON.stringify({
+          version: 1,
+          pid: liveChild.pid,
+          startToken: 'runtime:12345',
+          acquiredAt: Date.now(),
+          socketPath: join(stateDir, 'daemon.sock'),
+          sessionIds: [],
+          residualResources: [],
+        }),
+      );
+      expect(readVerifiedDaemonIdentity(stateDir, 'linux')).toBeNull();
+      expect(ownerMatchesLiveProcess({ pid: liveChild.pid!, startToken: 'ps:Mon Jan  1 00:00:00 2026' }, 'linux')).toBe(false);
+
+      // 2c. Bare daemon.pid with missing daemon.lock.json rejected fail-closed
+      rmSync(join(stateDir, 'daemon.lock.json'), { force: true });
+      expect(readVerifiedDaemonIdentity(stateDir, 'linux')).toBeNull();
+
+      // 2d. Stop actually terminates when verified identity matches
+      writeFileSync(
+        join(stateDir, 'daemon.lock.json'),
+        JSON.stringify({
+          version: 1,
+          pid: liveChild.pid,
+          startToken: `linux:${liveTicks}`,
+          acquiredAt: Date.now(),
+          socketPath: join(stateDir, 'daemon.sock'),
+          sessionIds: [],
+          residualResources: [],
+        }),
+      );
+      expect(stopVerifiedDaemon({ pid: liveChild.pid!, startToken: `linux:${liveTicks}` }, { platform: 'linux', graceMs: 1000 })).toBe(true);
+    } finally {
+      try { liveChild.kill('SIGKILL'); } catch { /* ignore */ }
+    }
+
+    // 3. Reaped Z/X states and 3-platform probe failures fail closed as unknown (never alive spoof)
+    expect(linuxProcStatLiveness('123 (node) Z 1 1 1 0 -1 0 0 0 0 0 0 0 0 20 0 1 0 9999 0')).toEqual({
+      status: 'reclaimable',
+      reason: 'reaped',
+      startToken: 'linux:0',
+    });
+    expect(psLiveness('X   Mon Nov 14 10:00:00 2026')).toEqual({
+      status: 'reclaimable',
+      reason: 'reaped',
+      startToken: 'ps:Mon Nov 14 10:00:00 2026',
+    });
+    expect(linuxProcStatLiveness('malformed-proc-stat')).toEqual({ status: 'unknown', reason: 'proc-stat-malformed' });
+    expect(probeProcessLivenessWithExec(999999999, 'linux')).toEqual({ status: 'reclaimable', reason: 'absent' });
+    expect(probeProcessLivenessWithExec(-1, 'linux')).toEqual({ status: 'unknown', reason: 'invalid-pid' });
+    expect(probeProcessLivenessWithExec(process.pid, 'darwin', () => { throw new Error('ps_denied'); })).toEqual({
+      status: 'unknown',
+      reason: 'ps-failed:unknown',
+    });
+    expect(probeProcessLivenessWithExec(process.pid, 'win32', () => { throw new Error('ps_denied'); })).toEqual({
+      status: 'unknown',
+      reason: 'powershell-failed',
+    });
+    expect(ownerMatchesLiveProcess({ pid: 999999999, startToken: 'linux:1' }, 'linux')).toBe(false);
+
+    // 4. First user_fallback rollback restarts old daemon and verifies recovered daemon.lock.json + daemon-runtime.json
+    const sysRoot = join(root, 'sys', 'daemon-runtime');
+    const rel110 = join(sysRoot, 'releases', '1.1.0');
+    const sysLayout = writeRunnableTree(rel110, '1.1.0');
+    writeFileSync(
+      sysLayout.entryPath,
+      [
+        "const fs = require('fs');",
+        "const path = require('path');",
+        "if (process.argv.includes('--version')) { console.log('1.1.0'); process.exit(0); }",
+        'const home = process.env.IMCODES_HOME;',
+        'fs.mkdirSync(home, { recursive: true });',
+        'const pid = process.pid;',
+        'const now = Date.now();',
+        "const stat = fs.readFileSync('/proc/' + pid + '/stat', 'utf8');",
+        "const ticks = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\\s+/)[19];",
+        "fs.writeFileSync(path.join(home, 'daemon.pid'), pid + '\\n');",
+        "fs.writeFileSync(path.join(home, 'daemon-runtime.json'), JSON.stringify({ pid, startedAt: now, updatedAt: now, restartCount: 1, version: '1.1.0' }));",
+        "fs.writeFileSync(path.join(home, 'daemon.lock.json'), JSON.stringify({ version: 1, pid, startToken: 'linux:' + ticks, acquiredAt: now, socketPath: path.join(home, 'daemon.sock'), sessionIds: [], residualResources: [] }));",
+        'setInterval(() => {}, 1000);',
+      ].join('\n'),
+    );
+    switchDaemonRuntimeCurrentPointer(sysRoot, rel110, 'linux');
+    chmodSync(sysRoot, 0o555);
+    chmodRestore.push({ path: sysRoot, mode: 0o755 });
+
+    const rbHome = join(root, 'home-rb');
+    const rbStateDir = join(rbHome, '.imcodes');
+    mkdirSync(rbStateDir, { recursive: true });
+    const oldDaemonChild = spawn(sysLayout.nodePath, [sysLayout.entryPath, 'start', '--foreground'], {
+      detached: true,
+      stdio: 'ignore',
+      env: { ...process.env, IMCODES_HOME: rbStateDir },
+    });
+    oldDaemonChild.unref();
+    const waitStart = Date.now();
+    while (!existsSync(join(rbStateDir, 'daemon.lock.json')) && Date.now() - waitStart < 3_000) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+
+    const build120 = makeTempDir('imcodes-rt-f3r2-120-');
+    const feed120 = makeTempDir('imcodes-rt-f3r2-feed-');
+    await buildRuntimeFeedArtifact(build120, '1.2.0', { archiveOut: { dir: feed120 } });
+
+    let userFbRollback: Awaited<ReturnType<typeof upgradeBundledDaemonRuntime>>;
+    try {
+      userFbRollback = await upgradeBundledDaemonRuntime({
+        platform: 'linux',
+        arch: process.arch,
+        currentVersion: '1.1.0',
+        execPath: sysLayout.nodePath,
+        entryScriptPath: sysLayout.entryPath,
+        runtimeRootOverride: sysRoot,
+        userHome: rbHome,
+        env: { IMCODES_HOME: rbStateDir },
+        source: { kind: 'local', dir: feed120 },
+        healthCheckTimeoutMs: 1000,
+        settleMs: 100,
+      });
+    } finally {
+      try { process.kill(oldDaemonChild.pid!, 'SIGKILL'); } catch { /* ignore */ }
+      try {
+        const rbNewPid = Number(readFileSync(join(rbStateDir, 'daemon.pid'), 'utf8').trim());
+        if (rbNewPid > 0) process.kill(rbNewPid, 'SIGKILL');
+      } catch { /* cleanup */ }
+    }
+    expect(userFbRollback!).toMatchObject({ status: 'rolled_back', rolledBack: true, rollbackVerified: true });
+    expect(existsSync(join(rbStateDir, 'daemon-runtime', 'current'))).toBe(false);
+
+    // 5. Detached rollback unserviced recovery + rollback_failed state when old daemon fails to restart
+    const detRoot = makeTempDir('imcodes-rt-f3r2-det-');
+    const detState = join(detRoot, 'state');
+    mkdirSync(detState, { recursive: true });
+    const detRuntime = join(detRoot, 'daemon-runtime');
+    const det110 = join(detRuntime, 'releases', '1.1.0');
+    const det120 = join(detRuntime, 'releases', '1.2.0');
+    const lay110 = writeRunnableTree(det110, '1.1.0');
+    writeRunnableTree(det120, '1.2.0');
+    switchDaemonRuntimeCurrentPointer(detRuntime, det110, 'linux');
+
+    const detStateRestoreScript = join(detRoot, 'det-old-110.sh');
+    writeFakeDaemonScript(detStateRestoreScript, detState, '1.1.0', true);
+    const failThenRestoreScript = join(detRoot, 'fail-new-restore-old.sh');
+    writeFileSync(
+      failThenRestoreScript,
+      `#!/bin/sh
+TARGET="$(readlink ${JSON.stringify(join(detRuntime, 'current'))})"
+case "$TARGET" in
+  *1.2.0*) exit 1 ;;
+  *) exec ${JSON.stringify(detStateRestoreScript)} ;;
+esac
+`,
+      { mode: 0o755 },
+    );
+    const detScriptDir = mkdtempSync(join(detRoot, 'script-'));
+    const launchedUnserviced = launchDetachedDaemonRuntimeSwitchRunner({
+      scriptDir: detScriptDir,
+      platform: 'linux',
+      runtimeRoot: detRuntime,
+      stagedReleaseDir: det120,
+      previousTarget: det110,
+      previousVersion: '1.1.0',
+      previousNodePath: lay110.nodePath,
+      previousEntryPath: lay110.entryPath,
+      wasRunning: true,
+      targetVersion: '1.2.0',
+      stateDir: detState,
+      homeDir: detRoot,
+      keepTargets: [det120, det110],
+      restartCommand: JSON.stringify(failThenRestoreScript).slice(1, -1),
+      healthCheckTimeoutMs: 1200,
+      settleMs: 100,
+      spawnRunner: () => {},
+    });
+    let detExit = 0;
+    try {
+      execFileSync(process.execPath, [launchedUnserviced.scriptPath, join(detScriptDir, 'runtime-upgrade.json')], {
+        stdio: 'pipe',
+        timeout: 15_000,
+      });
+    } catch (err) {
+      detExit = (err as { status?: number }).status ?? 1;
+    }
+    const restoredDetPid = Number(readFileSync(join(detState, 'daemon.pid'), 'utf8').trim());
+    try { process.kill(restoredDetPid, 'SIGKILL'); } catch { /* cleanup */ }
+    expect(detExit).toBe(1);
+    expect(realpathSync(join(detRuntime, 'current'))).toBe(realpathSync(det110));
+    const swStateOk = JSON.parse(readFileSync(join(detRuntime, DAEMON_RUNTIME_SWITCH_STATE_FILE), 'utf8'));
+    expect(swStateOk.phase).toBe('rolled_back');
+
+    // Also test rollback_failed when rollback daemon never becomes healthy
+    const alwaysFailScript = join(detRoot, 'always-fail.sh');
+    writeFileSync(alwaysFailScript, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    const detFailScriptDir = mkdtempSync(join(detRoot, 'script-rb-fail-'));
+    const launchedRbFail = launchDetachedDaemonRuntimeSwitchRunner({
+      scriptDir: detFailScriptDir,
+      platform: 'linux',
+      runtimeRoot: detRuntime,
+      stagedReleaseDir: det120,
+      previousTarget: det110,
+      previousVersion: '1.1.0',
+      wasRunning: true,
+      targetVersion: '1.2.0',
+      stateDir: detState,
+      homeDir: detRoot,
+      keepTargets: [det120, det110],
+      restartCommand: alwaysFailScript,
+      healthCheckTimeoutMs: 800,
+      settleMs: 100,
+      spawnRunner: () => {},
+    });
+    let rbFailExit = 0;
+    try {
+      execFileSync(process.execPath, [launchedRbFail.scriptPath, join(detFailScriptDir, 'runtime-upgrade.json')], {
+        stdio: 'pipe',
+        timeout: 15_000,
+      });
+    } catch (err) {
+      rbFailExit = (err as { status?: number }).status ?? 1;
+    }
+    expect(rbFailExit).toBe(1);
+    const swStateFail = JSON.parse(readFileSync(join(detRuntime, DAEMON_RUNTIME_SWITCH_STATE_FILE), 'utf8'));
+    expect(swStateFail.phase).toBe('rollback_failed');
+  });
+
+  it('[F4-R2] preserves migrated real-dir current target in detached switch/prune/rollback and recovers crash between renames', () => {
+    const root = makeTempDir('imcodes-rt-f4r2-');
+    const stateDir = join(root, 'state');
+    mkdirSync(stateDir, { recursive: true });
+    const runtimeRoot = join(root, 'daemon-runtime');
+    const realCurrent = join(runtimeRoot, 'current');
+    const rel100 = join(runtimeRoot, 'releases', '1.0.0');
+    const rel120 = join(runtimeRoot, 'releases', '1.2.0');
+    writeRunnableTree(realCurrent, '1.1.0');
+    writeFileSync(join(realCurrent, 'package', 'sentinel.txt'), 'preserve-me-1.1.0', 'utf8');
+    writeRunnableTree(rel100, '1.0.0');
+    writeRunnableTree(rel120, '1.2.0');
+
+    // 1. Detached switch with real-dir current and NO cfg.previousTarget:
+    // MUST preserve migrated releases/1.1.0 while pruning 1.0.0, and allow explicit rollback!
+    const happyScript = join(root, 'happy-120.sh');
+    writeFakeDaemonScript(happyScript, stateDir, '1.2.0', true);
+    const scriptDirHappy = mkdtempSync(join(root, 'script-happy-'));
+    const launchedHappy = launchDetachedDaemonRuntimeSwitchRunner({
+      scriptDir: scriptDirHappy,
+      platform: 'linux',
+      runtimeRoot,
+      stagedReleaseDir: rel120,
+      targetVersion: '1.2.0',
+      stateDir,
+      homeDir: root,
+      keepTargets: [rel120],
+      restartCommand: happyScript,
+      settleMs: 100,
+      spawnRunner: () => {},
+    });
+    execFileSync(process.execPath, [launchedHappy.scriptPath, join(scriptDirHappy, 'runtime-upgrade.json')], {
+      stdio: 'pipe',
+      timeout: 15_000,
+    });
+    const happyPid = Number(readFileSync(join(stateDir, 'daemon.pid'), 'utf8').trim());
+    try { process.kill(happyPid, 'SIGKILL'); } catch { /* cleanup */ }
+
+    expect(realpathSync(join(runtimeRoot, 'current'))).toBe(realpathSync(rel120));
+    expect(existsSync(join(runtimeRoot, 'releases', '1.0.0'))).toBe(false);
+    expect(readFileSync(join(runtimeRoot, 'releases', '1.1.0', 'package', 'sentinel.txt'), 'utf8')).toBe('preserve-me-1.1.0');
+
+    const explicitRb = rollbackDaemonRuntimeCurrentPointer(runtimeRoot, undefined, 'linux');
+    expect(realpathSync(explicitRb.restoredTarget!)).toBe(realpathSync(join(runtimeRoot, 'releases', '1.1.0')));
+    expect(readFileSync(join(runtimeRoot, 'current', 'package', 'sentinel.txt'), 'utf8')).toBe('preserve-me-1.1.0');
+
+    // 2. Crash-between-renames simulation (.switch-state.json phase='switching', missing current) recovers cleanly
+    const rel110 = join(runtimeRoot, 'releases', '1.1.0');
+    rmSync(join(runtimeRoot, 'current'), { force: true });
+    writeFileSync(
+      join(runtimeRoot, DAEMON_RUNTIME_SWITCH_STATE_FILE),
+      JSON.stringify({
+        version: 1,
+        phase: 'switching',
+        previousTarget: rel110,
+        previousVersion: '1.1.0',
+        targetDir: rel120,
+        startedAt: Date.now(),
+      }),
+    );
+    const recovered = recoverInterruptedDaemonRuntimeSwitch(runtimeRoot, 'linux');
+    expect(recovered.recovered).toBe(true);
+    expect(realpathSync(join(runtimeRoot, 'current'))).toBe(realpathSync(rel110));
+
+    // 3. Detached switch on a new real-dir current where target 1.2.0 starts with wrong version -> auto-rollback restores migrated 1.1.0!
+    const rootBad = makeTempDir('imcodes-rt-f4r2-bad-');
+    const stateBad = join(rootBad, 'state');
+    mkdirSync(stateBad, { recursive: true });
+    const rtBad = join(rootBad, 'daemon-runtime');
+    const curBad = join(rtBad, 'current');
+    const bad120 = join(rtBad, 'releases', '1.2.0');
+    writeRunnableTree(curBad, '1.1.0');
+    writeFileSync(join(curBad, 'package', 'sentinel.txt'), 'preserve-on-bad-1.1.0', 'utf8');
+    writeRunnableTree(bad120, '1.2.0');
+    const badVerScript = join(rootBad, 'bad-ver.sh');
+    writeFakeDaemonScript(badVerScript, stateBad, '1.1.0', true);
+    const scriptDirBad = mkdtempSync(join(rootBad, 'script-bad-'));
+    const launchedBad = launchDetachedDaemonRuntimeSwitchRunner({
+      scriptDir: scriptDirBad,
+      platform: 'linux',
+      runtimeRoot: rtBad,
+      stagedReleaseDir: bad120,
+      targetVersion: '1.2.0',
+      stateDir: stateBad,
+      homeDir: rootBad,
+      keepTargets: [bad120],
+      restartCommand: badVerScript,
+      healthCheckTimeoutMs: 1000,
+      settleMs: 100,
+      spawnRunner: () => {},
+    });
+    let badExit = 0;
+    try {
+      execFileSync(process.execPath, [launchedBad.scriptPath, join(scriptDirBad, 'runtime-upgrade.json')], {
+        stdio: 'pipe',
+        timeout: 15_000,
+      });
+    } catch (err) {
+      badExit = (err as { status?: number }).status ?? 1;
+    }
+    const badPid = Number(readFileSync(join(stateBad, 'daemon.pid'), 'utf8').trim());
+    try { process.kill(badPid, 'SIGKILL'); } catch { /* cleanup */ }
+    expect(badExit).toBe(1);
+    expect(readFileSync(join(rtBad, 'current', 'package', 'sentinel.txt'), 'utf8')).toBe('preserve-on-bad-1.1.0');
+  });
+
+  it('[F6-R2] resolves Windows .cmd PATH/AppData/custom prefixes without NPM_CONFIG_PREFIX and binds targets in POSIX/Windows runners without git pull', async () => {
+    const root = makeTempDir('imcodes-rt-f6r2-');
+
+    const createWinPrefix = (prefixDir: string, ver = '0.1.2') => {
+      mkdirSync(join(prefixDir, 'node_modules', 'imcodes', 'dist', 'src'), { recursive: true });
+      writeFileSync(join(prefixDir, 'imcodes.cmd'), '@echo off\nnode "%~dp0\\node_modules\\imcodes\\dist\\src\\cli.js" %*\n');
+      writeFileSync(join(prefixDir, 'node.exe'), 'fake-node');
+      writeFileSync(join(prefixDir, 'node_modules', 'imcodes', 'package.json'), JSON.stringify({ name: 'imcodes', version: ver }));
+      writeFileSync(join(prefixDir, 'node_modules', 'imcodes', 'dist', 'src', 'cli.js'), '// cli\n');
+    };
+
+    // 1. Windows normal `<prefix>\\imcodes.cmd` on PATH without NPM_CONFIG_PREFIX
+    const pathPrefix = join(root, 'win-path-prefix');
+    createWinPrefix(pathPrefix);
+    const winPathRes = resolveLegacyNpmCliFallback({
+      platform: 'win32',
+      env: { PATH: `${pathPrefix};C:\\Windows\\System32` },
+      userHome: root,
+    });
+    expect(winPathRes).toMatchObject({
+      eligible: true,
+      prefixDir: pathPrefix,
+      pkgDir: join(pathPrefix, 'node_modules', 'imcodes'),
+      nodeBin: join(pathPrefix, 'node.exe'),
+    });
+
+    // 2. Windows %APPDATA%\\npm fallback when PATH and NPM_CONFIG_PREFIX are absent
+    const roamingDir = join(root, 'Roaming');
+    const appDataPrefix = join(roamingDir, 'npm');
+    createWinPrefix(appDataPrefix);
+    const appDataRes = resolveLegacyNpmCliFallback({
+      platform: 'win32',
+      env: { APPDATA: roamingDir, PATH: '' },
+      userHome: root,
+    });
+    expect(appDataRes).toMatchObject({
+      eligible: true,
+      prefixDir: appDataPrefix,
+    });
+
+    // 3. Windows custom NPM_CONFIG_PREFIX takes precedence over AppData multi-install
+    const customPrefix = join(root, 'custom-npm-prefix');
+    createWinPrefix(customPrefix);
+    const customWinRes = resolveLegacyNpmCliFallback({
+      platform: 'win32',
+      env: { NPM_CONFIG_PREFIX: customPrefix, APPDATA: roamingDir, PATH: pathPrefix },
+      userHome: root,
+    });
+    expect(customWinRes).toMatchObject({
+      eligible: true,
+      prefixDir: customPrefix,
+      nodeBin: join(customPrefix, 'node.exe'),
+    });
+
+    // 4. POSIX detached runner binds npmPrefix + nodeBin explicitly and never invokes git pull
+    const posixScript = buildPosixUpgradeScript({
+      logFile: join(root, 'upgrade.log'),
+      scriptDir: join(root, 'script-dir'),
+      statusFile: join(root, 'upgrade-status.json'),
+      registryArg: '',
+      pkgSpec: 'imcodes@latest',
+      targetVer: 'latest',
+      currentVer: '0.1.2',
+      oldDaemonPid: null,
+      nodeBin: join(pathPrefix, 'bin', 'node'),
+      nodeDir: join(pathPrefix, 'bin'),
+      stateDir: join(root, 'state'),
+      restartCmd: 'true',
+      cleanupAfterSec: 60,
+      atomicInstallerPath: join(root, 'staged-package-install.mjs'),
+      npmPrefix: customPrefix,
+    });
+    expect(posixScript).toContain('PINNED_NPM_PREFIX=');
+    expect(posixScript).toContain(customPrefix);
+    expect(posixScript).toContain('export NPM_CONFIG_PREFIX="$PINNED_NPM_PREFIX"');
+    expect(posixScript).not.toContain('git pull');
+
+    let launchedPosixOpts: Record<string, unknown> | null = null;
+    const fakeScriptDir = makeTempDir('imcodes-rt-f6r2-posix-');
+    writeFileSync(join(fakeScriptDir, 'upgrade-result'), 'ok\n');
+    await runDetachedPosixUpgrade(
+      {
+        pkgSpec: 'imcodes@latest',
+        targetVer: 'latest',
+        registry: null,
+        currentVer: '0.1.2',
+        platform: 'linux',
+        stateDir: join(root, 'state'),
+        home: root,
+        nodeBin: '/custom/bin/node',
+        npmPrefix: '/custom/npm-prefix',
+      },
+      {
+        launch: ((opts) => {
+          launchedPosixOpts = opts as unknown as Record<string, unknown>;
+          return {
+            scriptDir: fakeScriptDir,
+            logFile: join(fakeScriptDir, 'upgrade.log'),
+            statusFile: join(fakeScriptDir, 'upgrade-status.json'),
+            resultFile: join(fakeScriptDir, 'upgrade-result'),
+            scriptPath: join(fakeScriptDir, 'upgrade.sh'),
+            child: { unref: () => {}, on: () => {} } as unknown as ReturnType<typeof import('../../src/util/posix-upgrade-script.js').launchPosixUpgrade>['child'],
+          };
+        }),
+      },
+    );
+    expect(launchedPosixOpts).toMatchObject({
+      nodeBin: '/custom/bin/node',
+      npmPrefix: '/custom/npm-prefix',
+    });
+
+    // 5. Windows detached launcher forwards bound npmPrefix + nodeBin cleanly
+    let launchedWinOpts: Record<string, unknown> | null = null;
+    const winPromise = runDetachedWindowsUpgrade(
+      {
+        pkgSpec: 'imcodes@latest',
+        targetVer: 'latest',
+        registry: null,
+        npmPrefix: customPrefix,
+        nodeBin: join(customPrefix, 'node.exe'),
+      },
+      {
+        followLimitMs: 50,
+        pollMs: 10,
+        write: () => {},
+        launch: ((opts) => {
+          launchedWinOpts = opts as unknown as Record<string, unknown>;
+          writeFileSync(opts.logFile, '[upgrade-result] ok\n');
+          return { runnerCopy: join(opts.scriptDir, 'windows-upgrade-runner.mjs') };
+        }) as typeof launchWindowsUpgrade,
+      },
+    );
+    expect(await winPromise).toBe(0);
+    expect(launchedWinOpts).toMatchObject({
+      npmPrefix: customPrefix,
+      nodeBin: join(customPrefix, 'node.exe'),
+    });
   });
 });

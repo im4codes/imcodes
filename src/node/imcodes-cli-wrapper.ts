@@ -8,6 +8,7 @@ import {
   type ResolvedImcodesCliTarget,
 } from '../../shared/desktop-installer-compatibility.js';
 import { compareImcodesVersions, parseImcodesVersion } from '../../shared/imcodes-version.js';
+import { IMCODES_STATE_DIR_NAME } from '../util/imcodes-state-dir.js';
 import { assertSafeNodeIsolatedTargetPath, isPathInsideGitCheckout } from './desktop-installer-probe.js';
 
 export interface InstallImcodesCliWrapperOptions {
@@ -15,6 +16,7 @@ export interface InstallImcodesCliWrapperOptions {
   wrapperPath: string;
   runtimeRoot?: string;
   relativeRuntimeSubpath?: string;
+  userStateDirName?: string;
   forceTakeover?: boolean;
   allowSystemRoot?: boolean;
   isolatedRoot?: string;
@@ -74,16 +76,19 @@ export function installImcodesCliWrapper(
   }
 
   mkdirSync(dirname(wrapperPath), { recursive: true });
+  const userStateDirName = options.userStateDirName ?? IMCODES_STATE_DIR_NAME;
   const content =
     options.platform === 'win32'
       ? renderWindowsImcodesCliWrapper({
           runtimeRoot: options.runtimeRoot,
           relativeRuntimeSubpath: options.relativeRuntimeSubpath,
+          userStateDirName,
         })
       : renderPosixImcodesCliWrapper({
           platform: options.platform,
           runtimeRoot: options.runtimeRoot,
           relativeRuntimeSubpath: options.relativeRuntimeSubpath,
+          userStateDirName,
         });
   const tmpWrapperPath = join(
     dirname(wrapperPath),

@@ -127,11 +127,20 @@ export function launchWindowsUpgrade(input: {
   registryArg: string;
   /** Running version for the `latest` downgrade guard; '' disables it (an explicit CLI request). */
   currentVer: string;
+  /** Explicit npm global prefix override (used when bundled daemon-runtime falls back to a legacy npm install). */
+  npmPrefix?: string;
+  /** Explicit Node executable override matching the fallback legacy install. */
+  nodeBin?: string;
 }): { runnerCopy: string } {
-  const npmBin = join(dirname(process.execPath), 'npm.cmd');
-  const npmCmd = existsSync(npmBin) ? npmBin : 'npm';
+  const nodeExe = input.nodeBin?.trim() || process.execPath;
+  const npmBin = join(dirname(nodeExe), 'npm.cmd');
+  const trimmedPrefix = input.npmPrefix?.trim() || '';
+  const prefixNpmBin = trimmedPrefix ? join(trimmedPrefix, 'npm.cmd') : '';
+  const npmCmd = existsSync(npmBin)
+    ? npmBin
+    : (prefixNpmBin && existsSync(prefixNpmBin) ? prefixNpmBin : 'npm');
   const runnerSrc = resolveWindowsUpgradeRunnerPath();
-  const npmPrefix = resolveWindowsUpgradePrefix(runnerSrc);
+  const npmPrefix = trimmedPrefix || resolveWindowsUpgradePrefix(runnerSrc);
   // Stage the runner with its complete relative-import closure because npm can
   // replace the installed package while the upgrade is running.
   const runnerCopy = stageWindowsUpgradeRunner(input.scriptDir, runnerSrc).runnerPath;
@@ -141,7 +150,7 @@ export function launchWindowsUpgrade(input: {
   // after a successful run and deliberately keeps it, log included, after a failed one.
   const upgradeVbsPath = join(input.scriptDir, 'upgrade.vbs');
   writeFileSync(upgradeVbsPath, encodeVbsAsUtf16(buildWindowsUpgradeRunnerVbs({
-    nodeExe: process.execPath,
+    nodeExe,
     runnerPath: runnerCopy,
     args: [input.logFile, npmCmd, input.pkgSpec, input.targetVer, input.scriptDir, input.registryArg, input.currentVer, npmPrefix ?? ''],
   })));

@@ -1039,6 +1039,7 @@ program
     const selfPath = realpathSync(process.argv[1]);
     const isGlobal = selfPath.includes('node_modules');
     let fallbackNodeBin: string | undefined;
+    let fallbackPrefixDir: string | undefined;
 
     if (runtimeMode.mode === 'bundled') {
       console.log(`Checking bundled daemon-runtime upgrade (target: ${/^\d/.test(pkgTag) ? pkgTag : 'latest'})...`);
@@ -1077,6 +1078,7 @@ program
         process.exit(1);
       }
       fallbackNodeBin = fallback.nodeBin;
+      fallbackPrefixDir = fallback.prefixDir;
       console.log(`Bundled daemon-runtime feed unavailable (${res.reason}); falling back to legacy CLI upgrade (${fallback.prefixDir})...`);
     }
 
@@ -1100,6 +1102,7 @@ program
         stateDir: imcodesStateDir(),
         home: homedir(),
         ...(fallbackNodeBin ? { nodeBin: fallbackNodeBin } : {}),
+        ...(fallbackPrefixDir ? { npmPrefix: fallbackPrefixDir } : {}),
       });
       process.exit(code);
     }
@@ -1111,6 +1114,8 @@ program
         pkgSpec: pkg,
         targetVer: /^\d/.test(pkgTag) ? pkgTag : 'latest',
         registry,
+        ...(fallbackPrefixDir ? { npmPrefix: fallbackPrefixDir } : {}),
+        ...(fallbackNodeBin ? { nodeBin: fallbackNodeBin } : {}),
       }));
     }
     if (isGlobal || Boolean(fallbackNodeBin)) {

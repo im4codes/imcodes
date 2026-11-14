@@ -11,8 +11,19 @@ import {
 import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { resolveImcodesHome, windowsDaemonLockPipeName } from '../util/windows-daemon-lock.js';
+import {
+  daemonProcessAppearsRunning as daemonProcessAppearsRunningWithProbe,
+  isReapedProcessState,
+  linuxProcStatLiveness,
+  ownerRemainsAuthoritative,
+  probeProcessLivenessWithExec,
+  psLiveness,
+  readInstanceLockMetadata as readInstanceLockMetadataFromPath,
+  type ProcessLiveness,
+} from './daemon-lock-identity.mjs';
 
 export { WINDOWS_DAEMON_LOCK_PIPE, normalizeWindowsLockPath, resolveImcodesHome, resolveWindowsDefaultHome, windowsDaemonLockPipeName } from '../util/windows-daemon-lock.js';
+export { isReapedProcessState, linuxProcStatLiveness, ownerRemainsAuthoritative, psLiveness, type ProcessLiveness } from './daemon-lock-identity.mjs';
 
 export interface DaemonProcessIdentity {
   pid: number;
@@ -61,122 +72,14 @@ export class DaemonInstanceLockError extends Error {
 
 const fallbackCurrentStartToken = `runtime:${Date.now() - Math.floor(process.uptime() * 1_000)}`;
 
-/** `/proc/<pid>/stat` state characters proving the PID entry survives only as a
- *  corpse awaiting its parent's `wait()`. A zombie keeps its `/proc` entry and its
- *  original `starttime`, so a starttime-only probe reports it as the same live
- *  process forever; it also cannot be signalled away, so SIGTERM/SIGKILL recovery
- *  never converges. Positive proof of one of these states is the ONLY evidence that
- *  makes a recorded owner reclaimable on the basis of death-in-place. */
-const REAPED_PROCESS_STATES = new Set(['Z', 'X', 'x']);
-
-/** Start-token schemes this build can emit. Two different KNOWN schemes describe
- *  the same PID in incomparable units, so they must never be read as a mismatch. */
-const KNOWN_START_TOKEN_SCHEMES = new Set(['linux', 'ps', 'windows']);
-
-export function isReapedProcessState(state: string): boolean {
-  // `ps` may decorate the state with scheduling flags (`Z+`, `Ss`); only the
-  // leading character carries the process state itself.
-  return REAPED_PROCESS_STATES.has(state.charAt(0));
-}
-
-/**
- * Liveness of a recorded lock owner.
- *
- * `reclaimable` requires positive proof — the process is gone, or the kernel
- * reports it in a reaped state. Everything else is `unknown` and MUST fail
- * closed: wrongly declaring a live owner dead admits a second daemon, which is
- * strictly worse than leaving a stale lock for an operator to clear.
- */
-export type ProcessLiveness =
-  | { status: 'alive'; startToken: string }
-  | { status: 'reclaimable'; reason: 'absent' }
-  | { status: 'reclaimable'; reason: 'reaped'; startToken: string }
-  | { status: 'unknown'; reason: string };
-
 export type LinuxProcStatLiveness = ProcessLiveness;
 
-/** Classify a raw `/proc/<pid>/stat` payload. Exported so the exact production
- *  decision is testable on any platform against real kernel-shaped input. */
-export function linuxProcStatLiveness(statText: string): ProcessLiveness {
-  // `comm` is parenthesised and may itself contain spaces or parentheses, so the
-  // fixed-position fields only begin after its final `)`.
-  const closeParen = statText.lastIndexOf(')');
-  if (closeParen < 0) return { status: 'unknown', reason: 'proc-stat-malformed' };
-  const fields = statText.slice(closeParen + 2).trim().split(/\s+/);
-  const state = fields[0];
-  if (!state) return { status: 'unknown', reason: 'proc-stat-missing-state' };
-  const startTicks = fields[19];
-  if (!startTicks) return { status: 'unknown', reason: 'proc-stat-missing-starttime' };
-  if (!/^\d+$/.test(startTicks)) return { status: 'unknown', reason: 'proc-stat-nonnumeric-starttime' };
-  if (isReapedProcessState(state)) {
-    return { status: 'reclaimable', reason: 'reaped', startToken: `linux:${startTicks}` };
-  }
-  return { status: 'alive', startToken: `linux:${startTicks}` };
-}
-
-/** Classify one `ps -o state= -o lstart=` line. */
-export function psLiveness(output: string): ProcessLiveness {
-  const trimmed = output.trim();
-  // `ps` prints nothing for a PID it cannot find; that absence is authoritative.
-  if (!trimmed) return { status: 'reclaimable', reason: 'absent' };
-  const boundary = trimmed.search(/\s/);
-  if (boundary < 0) return { status: 'unknown', reason: 'ps-malformed' };
-  const started = trimmed.slice(boundary + 1).trim().replace(/\s+/g, ' ');
-  if (!started) return { status: 'unknown', reason: 'ps-missing-lstart' };
-  if (isReapedProcessState(trimmed.slice(0, boundary))) {
-    return { status: 'reclaimable', reason: 'reaped', startToken: `ps:${started}` };
-  }
-  return { status: 'alive', startToken: `ps:${started}` };
-}
-
 export function probeProcessLiveness(pid: number): ProcessLiveness {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return { status: 'unknown', reason: 'invalid-pid' };
-  if (process.platform === 'linux') {
-    // `/proc` is authoritative on Linux and is never mixed with `ps`, so a
-    // recorded `linux:` token can never be compared against a `ps:` token.
-    try {
-      return linuxProcStatLiveness(readFileSync(`/proc/${pid}/stat`, 'utf8'));
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === 'ENOENT') return { status: 'reclaimable', reason: 'absent' };
-      return { status: 'unknown', reason: `proc-stat-unreadable:${code ?? 'unknown'}` };
-    }
-  }
-  if (process.platform === 'win32') {
-    try {
-      process.kill(pid, 0);
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      // EPERM means it exists in another security context; only ESRCH proves absence.
-      if (code === 'ESRCH') return { status: 'reclaimable', reason: 'absent' };
-    }
-    try {
-      const started = execFileSync('powershell.exe', [
-        '-NoProfile',
-        '-NonInteractive',
-        '-Command',
-        `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks`,
-      ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-      if (!started) return { status: 'unknown', reason: 'powershell-empty' };
-      return { status: 'alive', startToken: `windows:${started}` };
-    } catch {
-      return { status: 'unknown', reason: 'powershell-failed' };
-    }
-  }
-  try {
-    const output = execFileSync('ps', ['-o', 'state=', '-o', 'lstart=', '-p', String(pid)], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    return psLiveness(output);
-  } catch (error) {
-    const status = (error as { status?: number }).status;
-    const code = (error as NodeJS.ErrnoException).code;
-    // `ps` exits 1 with no output when the PID does not exist. Any other
-    // failure (missing binary, EACCES, signal) leaves liveness undetermined.
-    if (code === undefined && status === 1) return { status: 'reclaimable', reason: 'absent' };
-    return { status: 'unknown', reason: `ps-failed:${code ?? status ?? 'unknown'}` };
-  }
+  return probeProcessLivenessWithExec(
+    pid,
+    process.platform,
+    (file, args, options) => execFileSync(file, args, options),
+  );
 }
 
 /** Back-compatible string probe. `null` means "not the recorded process"; callers
@@ -207,53 +110,11 @@ export function daemonProcessAppearsRunning(
   pid: number,
   probe: (pid: number) => ProcessLiveness = probeProcessLiveness,
 ): boolean {
-  return probe(pid).status !== 'reclaimable';
-}
-
-function startTokenScheme(token: string): string {
-  const separator = token.indexOf(':');
-  return separator < 0 ? '' : token.slice(0, separator);
-}
-
-/**
- * Whether a recorded owner must still be treated as the authoritative daemon.
- *
- * Returns `true` (refuse reclaim) for anything short of positive proof, so an
- * unreadable `/proc`, a failed `ps`, or two incomparable token schemes can never
- * authorise stealing the lock from a process that is actually alive.
- */
-export function ownerRemainsAuthoritative(
-  owner: Pick<DaemonProcessIdentity, 'startToken'>,
-  liveness: ProcessLiveness,
-): boolean {
-  if (liveness.status === 'unknown') return true;
-  if (liveness.status === 'reclaimable') return false;
-  const recordedScheme = startTokenScheme(owner.startToken);
-  const observedScheme = startTokenScheme(liveness.startToken);
-  if (recordedScheme !== observedScheme
-    && KNOWN_START_TOKEN_SCHEMES.has(recordedScheme)
-    && KNOWN_START_TOKEN_SCHEMES.has(observedScheme)) {
-    // Same PID measured in two incomparable units: indeterminate, so fail closed.
-    return true;
-  }
-  return liveness.startToken === owner.startToken;
-}
-
-function isStringArray(value: unknown): value is string[] {
-  return Array.isArray(value) && value.length <= 10_000 && value.every((item) => typeof item === 'string');
+  return daemonProcessAppearsRunningWithProbe(pid, probe);
 }
 
 export function readInstanceLockMetadata(metadataPath = join(resolveImcodesHome(), 'daemon.lock.json')): InstanceLockMetadata | null {
-  try {
-    const parsed = JSON.parse(readFileSync(metadataPath, 'utf8')) as Partial<InstanceLockMetadata>;
-    if (parsed.version !== 1 || !Number.isSafeInteger(parsed.pid) || (parsed.pid ?? 0) <= 0
-      || typeof parsed.startToken !== 'string' || !parsed.startToken
-      || typeof parsed.acquiredAt !== 'number' || typeof parsed.socketPath !== 'string'
-      || !isStringArray(parsed.sessionIds) || !isStringArray(parsed.residualResources)) return null;
-    return parsed as InstanceLockMetadata;
-  } catch {
-    return null;
-  }
+  return readInstanceLockMetadataFromPath(metadataPath) as InstanceLockMetadata | null;
 }
 
 export function isRecordedProcessIdentityCurrent(

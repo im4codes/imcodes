@@ -41,6 +41,20 @@ export async function loadDesktopCompatibilityModule() {
   }
 }
 
+let cachedStateDirName;
+export async function loadImcodesStateDirName() {
+  if (cachedStateDirName) return cachedStateDirName;
+  const distPath = join(REPO_ROOT, 'dist', 'src', 'util', 'imcodes-state-dir.js');
+  if (existsSync(distPath)) {
+    const mod = await import(distPath);
+    cachedStateDirName = mod.IMCODES_STATE_DIR_NAME;
+    return cachedStateDirName;
+  }
+  const mod = await import('../src/util/imcodes-state-dir.js');
+  cachedStateDirName = mod.IMCODES_STATE_DIR_NAME;
+  return cachedStateDirName;
+}
+
 export function resolveDesktopInstallerVersion(explicitVersion) {
   if (explicitVersion && String(explicitVersion).trim()) {
     return normalizeNodeExeBuildVersion(String(explicitVersion).trim());

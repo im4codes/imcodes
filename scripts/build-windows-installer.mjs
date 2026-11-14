@@ -22,6 +22,7 @@ import process from 'node:process';
 import { parseDaemonRuntimeTarget } from './daemon-runtime-artifacts.mjs';
 import {
   loadDesktopCompatibilityModule,
+  loadImcodesStateDirName,
   REPO_ROOT,
   resolveDesktopInstallerVersion,
   stageDaemonRuntimePayload,
@@ -1381,7 +1382,8 @@ export async function buildWindowsInstaller(options) {
   mkdirSync(outDir, { recursive: true });
 
   const compat = await loadDesktopCompatibilityModule();
-  const cliWrapperContent = compat.renderWindowsImcodesCliWrapper();
+  const userStateDirName = await loadImcodesStateDirName();
+  const cliWrapperContent = compat.renderWindowsImcodesCliWrapper({ userStateDirName });
   const ps1Content = renderWindowsPhaseAInstallerPs1({
     version,
     cliWrapperContent,

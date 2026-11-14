@@ -9795,6 +9795,7 @@ async function handleDaemonUpgrade(
     }
 
   let legacyFallbackNodeBin: string | undefined;
+  let legacyFallbackPrefix: string | undefined;
   if (runtimeMode.mode === 'bundled') {
     const bundledResult = await upgradeBundledDaemonRuntime({
       currentVersion: DAEMON_VERSION,
@@ -9855,6 +9856,7 @@ async function handleDaemonUpgrade(
       return;
     }
     legacyFallbackNodeBin = fallback.nodeBin;
+    legacyFallbackPrefix = fallback.prefixDir;
     logger.warn({ reason: bundledResult.reason, fallbackPrefix: fallback.prefixDir },
       'daemon.upgrade: falling back to legacy CLI upgrade path');
   }
@@ -9884,6 +9886,8 @@ async function handleDaemonUpgrade(
         registryArg: upgradeRegistry.explicit ? upgradeRegistry.base : '-',
         // Lets the runner apply the post-install downgrade guard for `latest`.
         currentVer: DAEMON_VERSION,
+        ...(legacyFallbackPrefix ? { npmPrefix: legacyFallbackPrefix } : {}),
+        ...(legacyFallbackNodeBin ? { nodeBin: legacyFallbackNodeBin } : {}),
       });
       logger.info({ log: logFile, runnerCopy: launched.runnerCopy }, 'daemon.upgrade: Windows JS upgrade runner spawned');
     } catch (err) {
@@ -9971,6 +9975,7 @@ async function handleDaemonUpgrade(
     stateDir: imcodesStateDir(),
     restartCmd,
     cleanupAfterSec: CLEANUP_AFTER_SEC,
+    ...(legacyFallbackPrefix ? { npmPrefix: legacyFallbackPrefix } : {}),
   });
   child.on('exit', (code, signal) => {
     if (code !== POSIX_UPGRADE_INSTALL_FAILURE_EXIT_CODE) return;

@@ -25,6 +25,7 @@ import process from 'node:process';
 import { parseDaemonRuntimeTarget } from './daemon-runtime-artifacts.mjs';
 import {
   loadDesktopCompatibilityModule,
+  loadImcodesStateDirName,
   REPO_ROOT,
   renderMacosControlledNodeLaunchDaemonPlist,
   renderMacosControlledNodeWatchdogLaunchDaemonPlist,
@@ -118,7 +119,8 @@ export async function stageMacosInstallerTree(options) {
   mkdirSync(stageDir, { recursive: true });
 
   const compat = await loadDesktopCompatibilityModule();
-  const cliWrapperContent = compat.renderPosixImcodesCliWrapper({ platform: 'darwin' });
+  const userStateDirName = await loadImcodesStateDirName();
+  const cliWrapperContent = compat.renderPosixImcodesCliWrapper({ platform: 'darwin', userStateDirName });
   const runnerScriptText = renderPosixPhaseARunnerScript({
     platform: 'darwin',
     version,

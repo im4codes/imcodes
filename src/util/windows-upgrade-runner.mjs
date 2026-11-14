@@ -820,6 +820,7 @@ async function main() {
     // our setlocal value; that bug is gone now (we don't mutate process
     // env, we just pass a fresh env object to the npm child).
     NODE_OPTIONS: '--max-old-space-size=4096',
+    ...(NPM_PREFIX ? { NPM_CONFIG_PREFIX: NPM_PREFIX } : {}),
   };
 
   // The prefix must be known up front: the stage and the swap live inside it.

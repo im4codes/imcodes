@@ -27,6 +27,8 @@ export interface DetachedUpgradeInput {
   home: string;
   /** Optional node binary override (used when bundled daemon-runtime falls back to a legacy npm install). */
   nodeBin?: string;
+  /** Optional npm global prefix override (used when bundled daemon-runtime falls back to a legacy npm install). */
+  npmPrefix?: string;
 }
 
 export interface DetachedUpgradeDeps {
@@ -90,6 +92,7 @@ export async function runDetachedPosixUpgrade(input: DetachedUpgradeInput, deps:
     cleanupAfterSec: 24 * 60 * 60,
     // Someone asked for exactly this version: an older one is not a mistake to refuse.
     allowDowngrade: true,
+    ...(input.npmPrefix ? { npmPrefix: input.npmPrefix } : {}),
     ...deps.scriptOverrides,
   });
   started.child.unref();
@@ -178,7 +181,7 @@ export function readWindowsUpgradeResult(logFile: string): UpgradeResult | null 
  * watchdog/daemon restart and the health check; this process only follows its log.
  */
 export async function runDetachedWindowsUpgrade(
-  input: { pkgSpec: string; targetVer: string; registry: string | null },
+  input: { pkgSpec: string; targetVer: string; registry: string | null; npmPrefix?: string; nodeBin?: string },
   deps: { write?: (line: string) => void; pollMs?: number; followLimitMs?: number; launch?: typeof launchWindowsUpgrade } = {},
 ): Promise<number> {
   const write = deps.write ?? ((line: string) => { console.log(line); });
@@ -192,6 +195,8 @@ export async function runDetachedWindowsUpgrade(
     targetVer: input.targetVer,
     registryArg: input.registry ?? '-',
     currentVer: '', // an explicit request: no automatic downgrade guard
+    ...(input.npmPrefix ? { npmPrefix: input.npmPrefix } : {}),
+    ...(input.nodeBin ? { nodeBin: input.nodeBin } : {}),
   });
   write(`Upgrade started in the background (it keeps going if this session ends). Log: ${logFile}`);
   return followUpgrade({

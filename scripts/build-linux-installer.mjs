@@ -23,6 +23,7 @@ import process from 'node:process';
 import { parseDaemonRuntimeTarget } from './daemon-runtime-artifacts.mjs';
 import {
   loadDesktopCompatibilityModule,
+  loadImcodesStateDirName,
   REPO_ROOT,
   renderLinuxAideskDesktopFile,
   renderLinuxControlledNodeSystemdUnit,
@@ -170,7 +171,8 @@ export async function buildLinuxInstallers(options) {
   mkdirSync(outDir, { recursive: true });
 
   const compat = await loadDesktopCompatibilityModule();
-  const cliWrapperContent = compat.renderPosixImcodesCliWrapper({ platform: 'linux' });
+  const userStateDirName = await loadImcodesStateDirName();
+  const cliWrapperContent = compat.renderPosixImcodesCliWrapper({ platform: 'linux', userStateDirName });
   const runnerScriptText = renderPosixPhaseARunnerScript({
     platform: 'linux',
     version,

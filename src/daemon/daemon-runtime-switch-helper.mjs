@@ -18,6 +18,16 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
+import {
+  defaultDaemonLockMetadataPath,
+  ownerMatchesLiveProcess,
+  ownerRemainsAuthoritative,
+  probeProcessLiveness,
+  probeProcessStartToken,
+  readInstanceLockMetadata,
+} from './daemon-lock-identity.mjs';
+
+export { probeProcessLiveness, probeProcessStartToken };
 
 export const DAEMON_RUNTIME_STAGING_PREFIX = '.staging-';
 export const DAEMON_RUNTIME_PREVIOUS_STATE_FILE = '.previous-target.json';
@@ -55,35 +65,6 @@ export function isProcessAlive(pid) {
     }
     return false;
   }
-}
-
-export function probeProcessStartToken(pid, platform = process.platform) {
-  if (!Number.isInteger(pid) || pid <= 1) return null;
-  if (platform === 'linux') {
-    try {
-      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
-      const rparen = stat.lastIndexOf(')');
-      if (rparen === -1) return null;
-      const fields = stat.slice(rparen + 2).trim().split(/\s+/u);
-      // field 22 in /proc/<pid>/stat is index 19 after ') state'
-      return fields[19] || null;
-    } catch {
-      return null;
-    }
-  }
-  if (platform === 'darwin') {
-    try {
-      const out = execFileSync('ps', ['-p', String(pid), '-o', 'lstart='], {
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'ignore'],
-        timeout: 2_000,
-      }).trim();
-      return out || null;
-    } catch {
-      return null;
-    }
-  }
-  return null;
 }
 
 export function readPackageVersionSync(layoutDir) {
@@ -127,10 +108,13 @@ function isLockOwnerStale(owner, staleMs) {
     return true;
   }
   const pid = typeof owner.pid === 'number' ? owner.pid : null;
-  if (!pid || !isProcessAlive(pid)) return true;
+  if (!pid || pid <= 1) return true;
+  const liveness = probeProcessLiveness(pid);
+  if (liveness.status === 'reclaimable') return true;
   if (typeof owner.startToken === 'string' && owner.startToken.length > 0) {
-    const liveToken = probeProcessStartToken(pid);
-    if (liveToken && liveToken !== owner.startToken) return true;
+    if (!ownerRemainsAuthoritative({ startToken: owner.startToken }, liveness)) {
+      return true;
+    }
   }
   if (typeof owner.acquiredAt === 'number' && Date.now() - owner.acquiredAt > staleMs) {
     return true;
@@ -259,43 +243,28 @@ export function writeUpgradeCooldownSentinel(stateDir, nowMs = Date.now()) {
   return sentinelPath;
 }
 
-export function readVerifiedDaemonIdentity(stateDir, platform = process.platform) {
+export function readVerifiedDaemonIdentity(stateDir, platform = process.platform, options = {}) {
   const resolvedState = resolve(stateDir);
-  const lockMeta = readJsonSafe(join(resolvedState, 'instance-lock.json'));
+  const lockMeta = readInstanceLockMetadata(defaultDaemonLockMetadataPath(resolvedState));
   const runtimeMeta = readJsonSafe(join(resolvedState, 'daemon-runtime.json'));
 
-  let pid = null;
-  let startToken = null;
-  let source = null;
-
-  if (lockMeta && typeof lockMeta === 'object' && typeof lockMeta.pid === 'number' && Number.isInteger(lockMeta.pid) && lockMeta.pid > 1) {
-    pid = lockMeta.pid;
-    startToken = typeof lockMeta.startToken === 'string' && lockMeta.startToken.length > 0 ? lockMeta.startToken : null;
-    source = 'instance_lock';
-  } else {
-    try {
-      const rawPid = Number(readFileSync(join(resolvedState, 'daemon.pid'), 'utf8').trim());
-      if (Number.isInteger(rawPid) && rawPid > 1) {
-        pid = rawPid;
-        source = 'daemon_pid';
-      }
-    } catch {
-      pid = null;
-    }
+  if (!lockMeta || !Number.isInteger(lockMeta.pid) || lockMeta.pid <= 1) {
+    return null;
   }
 
-  if (!pid || !isProcessAlive(pid)) return null;
-  if (startToken) {
-    const actualToken = probeProcessStartToken(pid, platform);
-    if (actualToken && actualToken !== startToken) {
-      return null;
-    }
+  const probe = typeof options.probeLiveness === 'function'
+    ? options.probeLiveness
+    : (pid) => probeProcessLiveness(pid, platform);
+  const liveness = probe(lockMeta.pid);
+  if (!ownerMatchesLiveProcess(lockMeta, liveness)) {
+    return null;
   }
 
   return {
-    pid,
-    startToken,
-    source,
+    pid: lockMeta.pid,
+    startToken: lockMeta.startToken,
+    source: 'daemon_lock',
+    socketPath: lockMeta.socketPath,
     version: runtimeMeta && typeof runtimeMeta.version === 'string' ? runtimeMeta.version.trim() : null,
     startedAt: runtimeMeta && typeof runtimeMeta.startedAt === 'number' ? runtimeMeta.startedAt : null,
   };
@@ -303,15 +272,16 @@ export function readVerifiedDaemonIdentity(stateDir, platform = process.platform
 
 export function stopVerifiedDaemon(identity, options = {}) {
   if (!identity || !Number.isInteger(identity.pid) || identity.pid <= 1) return false;
+  if (typeof identity.startToken !== 'string' || !identity.startToken) return false;
   const platform = options.platform ?? process.platform;
   const pid = identity.pid;
-  if (!isProcessAlive(pid)) return false;
+  const probe = typeof options.probeLiveness === 'function'
+    ? options.probeLiveness
+    : (targetPid) => probeProcessLiveness(targetPid, platform);
 
-  if (identity.startToken) {
-    const liveToken = probeProcessStartToken(pid, platform);
-    if (liveToken && liveToken !== identity.startToken) {
-      return false;
-    }
+  // Fail-closed: only signal a PID when live liveness positively matches the recorded startToken.
+  if (!ownerMatchesLiveProcess(identity, probe(pid))) {
+    return false;
   }
 
   if (platform === 'win32') {
@@ -335,11 +305,9 @@ export function stopVerifiedDaemon(identity, options = {}) {
     sleepSync(100);
   }
   if (isProcessAlive(pid)) {
-    if (identity.startToken) {
-      const liveToken = probeProcessStartToken(pid, platform);
-      if (liveToken && liveToken !== identity.startToken) {
-        return true;
-      }
+    const liveAfterGrace = probe(pid);
+    if (!ownerMatchesLiveProcess(identity, liveAfterGrace)) {
+      return liveAfterGrace.status === 'reclaimable';
     }
     try { process.kill(pid, 'SIGKILL'); } catch {}
     sleepSync(200);
@@ -389,6 +357,152 @@ function choosePreservedRealDirDestination(resolvedRoot, resolvedRelease, prevVe
   return join(releasesDir, `.prev-${safeTag}-${nonce}`);
 }
 
+function cleanupTransientCurrentEntries(resolvedRoot) {
+  try {
+    for (const entry of readdirSync(resolvedRoot)) {
+      if (entry.startsWith('.current-next-') || entry.startsWith('.current-prev-')) {
+        rmSync(join(resolvedRoot, entry), { recursive: true, force: true });
+      }
+    }
+  } catch {
+    // ignore missing runtime root
+  }
+}
+
+export function writeSwitchStateRecord(resolvedRoot, record) {
+  writeFileAtomicSync(
+    join(resolvedRoot, DAEMON_RUNTIME_SWITCH_STATE_FILE),
+    JSON.stringify(record, null, 2),
+    'utf8',
+  );
+}
+
+/**
+ * Recover an interrupted `daemon-runtime` switch transaction before inspecting or
+ * mutating `current` (notably crashes between rename #1 and rename #2 where
+ * `current` is absent/dangling while `.switch-state.json` records `switching`).
+ */
+export function recoverInterruptedDaemonRuntimeSwitch(runtimeRoot, platform = process.platform, options = {}) {
+  const resolvedRoot = resolve(runtimeRoot);
+  if (!existsSync(resolvedRoot)) return { recovered: false };
+
+  const nowMs = typeof options.nowMs === 'number' ? options.nowMs : Date.now();
+  const currentLink = join(resolvedRoot, 'current');
+  const switchState = readJsonSafe(join(resolvedRoot, DAEMON_RUNTIME_SWITCH_STATE_FILE));
+  const prevState = readPreviousStateFile(resolvedRoot);
+
+  let currentSt = null;
+  try {
+    currentSt = lstatSync(currentLink);
+  } catch {
+    currentSt = null;
+  }
+
+  const currentDanglingSymlink = Boolean(currentSt && currentSt.isSymbolicLink() && !existsSync(currentLink));
+  const currentMissingOrDangling = !currentSt || currentDanglingSymlink;
+
+  const candidatePrev =
+    (switchState && typeof switchState.previousTarget === 'string' && switchState.previousTarget.trim()
+      ? switchState.previousTarget.trim()
+      : undefined)
+    ?? prevState.previousTarget;
+  const prevVer =
+    (switchState && typeof switchState.previousVersion === 'string' && switchState.previousVersion.trim()
+      ? switchState.previousVersion.trim()
+      : undefined)
+    ?? prevState.previousVersion;
+
+  if (currentMissingOrDangling) {
+    // Look first for an orphaned Windows `.current-prev-*` backup directory if `previousTarget` is absent.
+    let backupPrevEntry = null;
+    try {
+      const backups = readdirSync(resolvedRoot).filter((name) => name.startsWith('.current-prev-'));
+      if (backups.length > 0) backupPrevEntry = join(resolvedRoot, backups[0]);
+    } catch {
+      backupPrevEntry = null;
+    }
+
+    const resolvedPrev = candidatePrev ? resolve(candidatePrev) : null;
+    if (resolvedPrev && resolvedPrev !== resolve(currentLink) && existsSync(resolvedPrev)) {
+      if (currentDanglingSymlink) {
+        try { unlinkSync(currentLink); } catch {}
+      }
+      const nonce = `${process.pid}-${randomBytes(4).toString('hex')}`;
+      const tempRestore = join(resolvedRoot, `.current-next-${nonce}`);
+      symlinkSync(resolvedPrev, tempRestore, platform === 'win32' ? 'junction' : 'dir');
+      renameSync(tempRestore, currentLink);
+      cleanupTransientCurrentEntries(resolvedRoot);
+      writeSwitchStateRecord(resolvedRoot, {
+        phase: 'recovered',
+        recoveredFromPhase: switchState?.phase ?? 'missing_current',
+        restoredTarget: resolvedPrev,
+        previousTarget: resolvedPrev,
+        previousVersion: prevVer ?? readPackageVersionSync(resolvedPrev) ?? null,
+        recoveredAt: nowMs,
+      });
+      return {
+        recovered: true,
+        restoredTarget: resolvedPrev,
+        ...(prevVer ? { previousVersion: prevVer } : {}),
+      };
+    }
+
+    if (backupPrevEntry && existsSync(backupPrevEntry)) {
+      if (currentDanglingSymlink) {
+        try { unlinkSync(currentLink); } catch {}
+      }
+      renameSync(backupPrevEntry, currentLink);
+      cleanupTransientCurrentEntries(resolvedRoot);
+      const ptr = readCurrentPointerTarget(resolvedRoot);
+      writeSwitchStateRecord(resolvedRoot, {
+        phase: 'recovered',
+        recoveredFromPhase: switchState?.phase ?? 'missing_current_backup',
+        restoredTarget: ptr.targetPath ?? resolve(currentLink),
+        recoveredAt: nowMs,
+      });
+      return {
+        recovered: true,
+        restoredTarget: ptr.targetPath ?? resolve(currentLink),
+        ...(ptr.version ? { previousVersion: ptr.version } : {}),
+      };
+    }
+  }
+
+  if (options.rollbackUnconfirmed === true && switchState && (switchState.phase === 'switching' || switchState.phase === 'switched')) {
+    const resolvedPrev = candidatePrev ? resolve(candidatePrev) : null;
+    if (resolvedPrev && resolvedPrev !== resolve(currentLink) && existsSync(resolvedPrev)) {
+      const nonce = `${process.pid}-${randomBytes(4).toString('hex')}`;
+      const tempRestore = join(resolvedRoot, `.current-next-${nonce}`);
+      symlinkSync(resolvedPrev, tempRestore, platform === 'win32' ? 'junction' : 'dir');
+      if (platform === 'win32' && currentSt) {
+        const backup = join(resolvedRoot, `.current-prev-${nonce}`);
+        renameSync(currentLink, backup);
+        renameSync(tempRestore, currentLink);
+        rmSync(backup, { recursive: true, force: true });
+      } else {
+        renameSync(tempRestore, currentLink);
+      }
+      cleanupTransientCurrentEntries(resolvedRoot);
+      writeSwitchStateRecord(resolvedRoot, {
+        phase: 'recovered',
+        recoveredFromPhase: switchState.phase,
+        restoredTarget: resolvedPrev,
+        previousTarget: resolvedPrev,
+        previousVersion: prevVer ?? readPackageVersionSync(resolvedPrev) ?? null,
+        recoveredAt: nowMs,
+      });
+      return {
+        recovered: true,
+        restoredTarget: resolvedPrev,
+        ...(prevVer ? { previousVersion: prevVer } : {}),
+      };
+    }
+  }
+
+  cleanupTransientCurrentEntries(resolvedRoot);
+  return { recovered: false };
+}
+
 export function switchDaemonRuntimeCurrentPointer(runtimeRoot, releaseDir, platform = process.platform, nowMs = Date.now()) {
   const resolvedRoot = resolve(runtimeRoot);
   const resolvedRelease = resolve(releaseDir);
@@ -397,6 +511,7 @@ export function switchDaemonRuntimeCurrentPointer(runtimeRoot, releaseDir, platf
     throw new Error('daemon_runtime_invalid_self_target');
   }
   mkdirSync(resolvedRoot, { recursive: true });
+  recoverInterruptedDaemonRuntimeSwitch(resolvedRoot, platform, { nowMs });
 
   const nonce = `${process.pid}-${randomBytes(4).toString('hex')}`;
   let existingSt = null;
@@ -420,18 +535,14 @@ export function switchDaemonRuntimeCurrentPointer(runtimeRoot, releaseDir, platf
     previousTarget = choosePreservedRealDirDestination(resolvedRoot, resolvedRelease, prevVersion, nonce);
   }
 
-  writeFileAtomicSync(
-    join(resolvedRoot, DAEMON_RUNTIME_SWITCH_STATE_FILE),
-    JSON.stringify({
-      phase: 'switching',
-      targetRelease: resolvedRelease,
-      previousTarget: previousTarget ?? null,
-      previousVersion: prevVersion ?? null,
-      previousWasRealDir,
-      startedAt: nowMs,
-    }, null, 2),
-    'utf8',
-  );
+  writeSwitchStateRecord(resolvedRoot, {
+    phase: 'switching',
+    targetRelease: resolvedRelease,
+    previousTarget: previousTarget ?? null,
+    previousVersion: prevVersion ?? null,
+    previousWasRealDir,
+    startedAt: nowMs,
+  });
 
   if (previousTarget && previousTarget !== resolve(currentLink)) {
     writeFileAtomicSync(
@@ -443,6 +554,12 @@ export function switchDaemonRuntimeCurrentPointer(runtimeRoot, releaseDir, platf
       }, null, 2),
       'utf8',
     );
+  } else {
+    try {
+      unlinkSync(join(resolvedRoot, DAEMON_RUNTIME_PREVIOUS_STATE_FILE));
+    } catch {
+      // ignore absent
+    }
   }
 
   const tempLink = join(resolvedRoot, `.current-next-${nonce}`);
@@ -498,18 +615,14 @@ export function switchDaemonRuntimeCurrentPointer(runtimeRoot, releaseDir, platf
     }
   }
 
-  writeFileAtomicSync(
-    join(resolvedRoot, DAEMON_RUNTIME_SWITCH_STATE_FILE),
-    JSON.stringify({
-      phase: 'switched',
-      targetRelease: resolvedRelease,
-      previousTarget: previousTarget ?? null,
-      previousVersion: prevVersion ?? null,
-      previousWasRealDir,
-      switchedAt: nowMs,
-    }, null, 2),
-    'utf8',
-  );
+  writeSwitchStateRecord(resolvedRoot, {
+    phase: 'switched',
+    targetRelease: resolvedRelease,
+    previousTarget: previousTarget ?? null,
+    previousVersion: prevVersion ?? null,
+    previousWasRealDir,
+    switchedAt: nowMs,
+  });
 
   return {
     currentLink,
@@ -527,6 +640,7 @@ export function rollbackDaemonRuntimeCurrentPointer(
 ) {
   const resolvedRoot = resolve(runtimeRoot);
   const currentLink = resolve(join(resolvedRoot, 'current'));
+  recoverInterruptedDaemonRuntimeSwitch(resolvedRoot, platform, { nowMs });
   const switchState = readJsonSafe(join(resolvedRoot, DAEMON_RUNTIME_SWITCH_STATE_FILE));
   const candidate =
     previousTarget
@@ -535,7 +649,14 @@ export function rollbackDaemonRuntimeCurrentPointer(
 
   const resolvedPrev = candidate ? resolve(candidate) : undefined;
   if (resolvedPrev && resolvedPrev !== currentLink && existsSync(resolvedPrev)) {
+    const prevVersion = readPackageVersionSync(resolvedPrev);
     switchDaemonRuntimeCurrentPointer(resolvedRoot, resolvedPrev, platform, nowMs);
+    writeSwitchStateRecord(resolvedRoot, {
+      phase: 'rolled_back',
+      restoredTarget: resolvedPrev,
+      previousVersion: prevVersion ?? null,
+      rolledBackAt: nowMs,
+    });
     return { restoredTarget: resolvedPrev };
   }
 
@@ -551,6 +672,11 @@ export function rollbackDaemonRuntimeCurrentPointer(
   } catch {
     // ignore
   }
+  writeSwitchStateRecord(resolvedRoot, {
+    phase: 'rolled_back',
+    restoredTarget: null,
+    rolledBackAt: nowMs,
+  });
   return {};
 }
 
@@ -898,7 +1024,10 @@ export function waitForHealthyTargetDaemon({
       sleepSync(250);
       continue;
     }
-    if (typeof runtimeStatus.version !== 'string' || !versionsMatch(runtimeStatus.version, expectedVersion)) {
+    const versionOk = expectedVersion
+      ? typeof runtimeStatus.version === 'string' && versionsMatch(runtimeStatus.version, expectedVersion)
+      : typeof runtimeStatus.version === 'string' && runtimeStatus.version.trim().length > 0;
+    if (!versionOk) {
       lastReason = `daemon_runtime_version_mismatch:expected_${expectedVersion}_got_${String(runtimeStatus.version)}`;
       sleepSync(250);
       continue;
@@ -913,18 +1042,21 @@ export function waitForHealthyTargetDaemon({
     sleepSync(settleMs);
     const settled = readVerifiedDaemonIdentity(resolvedState, platform);
     const settledStatus = readJsonSafe(join(resolvedState, 'daemon-runtime.json'));
+    const settledVersionOk = expectedVersion
+      ? settledStatus && versionsMatch(settledStatus.version, expectedVersion)
+      : Boolean(settledStatus && typeof settledStatus.version === 'string' && settledStatus.version.trim().length > 0);
     if (
       settled
       && settled.pid === identity.pid
-      && (!identity.startToken || !settled.startToken || settled.startToken === identity.startToken)
+      && Boolean(identity.startToken && settled.startToken && settled.startToken === identity.startToken)
       && settledStatus
       && settledStatus.pid === settled.pid
-      && versionsMatch(settledStatus.version, expectedVersion)
+      && settledVersionOk
     ) {
       return {
         pid: settled.pid,
         version: settledStatus.version,
-        startToken: settled.startToken ?? null,
+        startToken: settled.startToken,
       };
     }
     lastReason = 'daemon_exited_during_settle_window';
@@ -944,14 +1076,20 @@ export function runDetachedSwitchTransaction(cfg) {
   };
 
   const stateDir = resolve(cfg.stateDir);
+  const resolvedRoot = resolve(cfg.runtimeRoot);
   let ownedToken = cfg.lockOwnerToken || null;
   let launchBackup = null;
   let switched = false;
+  let oldIdentity = null;
+  let effectivePreviousTarget = cfg.previousTarget || null;
+  let effectivePreviousVersion = cfg.previousVersion || null;
 
   const restoreAll = (oldIdentityForRollback) => {
+    const rollbackBeganAtMs = Date.now();
+    const preRbIdentity = readVerifiedDaemonIdentity(stateDir, cfg.platform);
     try {
-      log(`rolling back current -> ${cfg.previousTarget || 'system/default fallback'}`);
-      rollbackDaemonRuntimeCurrentPointer(cfg.runtimeRoot, cfg.previousTarget || undefined, cfg.platform);
+      log(`rolling back current -> ${effectivePreviousTarget || 'system/default fallback'}`);
+      rollbackDaemonRuntimeCurrentPointer(cfg.runtimeRoot, effectivePreviousTarget || undefined, cfg.platform);
     } catch (rbErr) {
       log(`pointer rollback failed: ${rbErr instanceof Error ? rbErr.message : String(rbErr)}`);
     }
@@ -959,14 +1097,23 @@ export function runDetachedSwitchTransaction(cfg) {
       restoreServiceLaunchTarget(launchBackup);
       launchBackup = null;
     }
-    const postRbIdentity = readVerifiedDaemonIdentity(stateDir, cfg.platform);
-    const prevNode = cfg.previousTarget
-      ? join(cfg.previousTarget, cfg.platform === 'win32' ? 'node.exe' : join('bin', 'node'))
-      : cfg.previousNodePath;
-    const prevEntry = cfg.previousTarget
-      ? join(cfg.previousTarget, 'package', 'dist', 'src', 'index.js')
-      : cfg.previousEntryPath;
-    restartDaemonService({
+
+    const candidatePrevNode = effectivePreviousTarget
+      ? join(effectivePreviousTarget, cfg.platform === 'win32' ? 'node.exe' : join('bin', 'node'))
+      : null;
+    const candidatePrevEntry = effectivePreviousTarget
+      ? join(effectivePreviousTarget, 'package', 'dist', 'src', 'index.js')
+      : null;
+    const prevNode = candidatePrevNode && existsSync(candidatePrevNode)
+      ? candidatePrevNode
+      : (cfg.previousNodePath ?? candidatePrevNode ?? undefined);
+    const prevEntry = candidatePrevEntry && existsSync(candidatePrevEntry)
+      ? candidatePrevEntry
+      : (cfg.previousEntryPath ?? candidatePrevEntry ?? undefined);
+    const rbOldIdentity = preRbIdentity ?? oldIdentityForRollback;
+    const wasRunningBeforeRollback = cfg.wasRunning !== false || Boolean(rbOldIdentity) || Boolean(launchBackup);
+
+    const rbRestartRes = restartDaemonService({
       platform: cfg.platform,
       stateDir,
       nodePath: prevNode,
@@ -977,10 +1124,58 @@ export function runDetachedSwitchTransaction(cfg) {
       windowsTask: cfg.windowsTask,
       vbsPath: cfg.vbsPath,
       restartCommand: cfg.rollbackRestartCommand ?? cfg.restartCommand,
-      oldIdentity: postRbIdentity ?? oldIdentityForRollback,
-      wasRunning: true,
+      oldIdentity: rbOldIdentity,
+      wasRunning: wasRunningBeforeRollback,
       log,
     });
+
+    if (!rbRestartRes.ok) {
+      log(`rollback restart failed: ${rbRestartRes.mode}`);
+      writeSwitchStateRecord(resolvedRoot, {
+        phase: 'rollback_failed',
+        restoredTarget: effectivePreviousTarget,
+        previousVersion: effectivePreviousVersion,
+        error: `daemon_rollback_restart_failed:${rbRestartRes.mode}`,
+        failedAt: Date.now(),
+      });
+      return false;
+    }
+
+    if (wasRunningBeforeRollback || rbRestartRes.mode !== 'noop_stopped') {
+      try {
+        const rbHealth = waitForHealthyTargetDaemon({
+          stateDir,
+          expectedVersion: effectivePreviousVersion || undefined,
+          oldIdentity: rbOldIdentity,
+          restartBeganAtMs: rollbackBeganAtMs,
+          platform: cfg.platform,
+          timeoutMs: cfg.healthCheckTimeoutMs ?? DEFAULT_HEALTH_TIMEOUT_MS,
+          settleMs: cfg.settleMs ?? DEFAULT_SETTLE_MS,
+        });
+        log(`rollback health verified: pid=${rbHealth.pid} version=${rbHealth.version}`);
+        writeSwitchStateRecord(resolvedRoot, {
+          phase: 'rolled_back',
+          restoredTarget: effectivePreviousTarget,
+          previousVersion: rbHealth.version,
+          pid: rbHealth.pid,
+          rolledBackAt: Date.now(),
+        });
+        return true;
+      } catch (rbHealthErr) {
+        const msg = rbHealthErr instanceof Error ? rbHealthErr.message : String(rbHealthErr);
+        log(`rollback health check failed: ${msg}`);
+        writeSwitchStateRecord(resolvedRoot, {
+          phase: 'rollback_failed',
+          restoredTarget: effectivePreviousTarget,
+          previousVersion: effectivePreviousVersion,
+          error: msg,
+          failedAt: Date.now(),
+        });
+        return false;
+      }
+    }
+
+    return true;
   };
 
   try {
@@ -991,10 +1186,20 @@ export function runDetachedSwitchTransaction(cfg) {
       ownedToken = acquired.ownerToken;
     }
 
-    const oldIdentity = readVerifiedDaemonIdentity(stateDir, cfg.platform);
+    recoverInterruptedDaemonRuntimeSwitch(cfg.runtimeRoot, cfg.platform);
+    oldIdentity = readVerifiedDaemonIdentity(stateDir, cfg.platform);
+    if (!effectivePreviousVersion) {
+      const ptrBefore = readCurrentPointerTarget(cfg.runtimeRoot);
+      effectivePreviousVersion = ptrBefore.version ?? oldIdentity?.version ?? null;
+    }
+
     log(`switching current -> ${cfg.stagedReleaseDir}`);
-    switchDaemonRuntimeCurrentPointer(cfg.runtimeRoot, cfg.stagedReleaseDir, cfg.platform);
+    const switchRes = switchDaemonRuntimeCurrentPointer(cfg.runtimeRoot, cfg.stagedReleaseDir, cfg.platform);
     switched = true;
+
+    const prevStateFile = readPreviousStateFile(cfg.runtimeRoot);
+    effectivePreviousTarget = switchRes.previousTarget ?? effectivePreviousTarget ?? prevStateFile.previousTarget ?? null;
+    effectivePreviousVersion = switchRes.previousVersion ?? effectivePreviousVersion ?? prevStateFile.previousVersion ?? null;
 
     if (cfg.launchTargetSpec) {
       launchBackup = prepareServiceLaunchTarget(cfg.launchTargetSpec);
@@ -1013,7 +1218,7 @@ export function runDetachedSwitchTransaction(cfg) {
       vbsPath: cfg.vbsPath,
       restartCommand: cfg.restartCommand,
       oldIdentity,
-      wasRunning: true,
+      wasRunning: cfg.wasRunning !== false,
       log,
     });
 
@@ -1033,18 +1238,29 @@ export function runDetachedSwitchTransaction(cfg) {
 
     log(`post-restart health passed: pid=${health.pid} version=${health.version}`);
     writeUpgradeCooldownSentinel(stateDir);
+    writeSwitchStateRecord(resolvedRoot, {
+      phase: 'completed',
+      targetRelease: resolve(cfg.stagedReleaseDir),
+      targetVersion: cfg.targetVersion,
+      previousTarget: effectivePreviousTarget,
+      previousVersion: effectivePreviousVersion,
+      pid: health.pid,
+      completedAt: Date.now(),
+    });
 
     const keepTargets = Array.isArray(cfg.keepTargets) ? [...cfg.keepTargets] : [];
     const cur = readCurrentPointerTarget(cfg.runtimeRoot);
     if (cur.targetPath) keepTargets.push(cur.targetPath);
-    if (cfg.previousTarget) keepTargets.push(cfg.previousTarget);
+    if (effectivePreviousTarget) keepTargets.push(effectivePreviousTarget);
+    const persistedPrev = readPreviousStateFile(cfg.runtimeRoot).previousTarget;
+    if (persistedPrev) keepTargets.push(persistedPrev);
     pruneOldDaemonRuntimeReleases(cfg.runtimeRoot, keepTargets);
 
     return true;
   } catch (err) {
     log(`switch transaction failed: ${err && err.stack ? err.stack : String(err)}`);
     if (switched) {
-      restoreAll(null);
+      restoreAll(oldIdentity);
     } else if (launchBackup) {
       restoreServiceLaunchTarget(launchBackup);
     }

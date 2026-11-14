@@ -545,6 +545,8 @@ export interface RenderCliWrapperOptions {
   runtimeRoot?: string;
   /** Optional relative runtime root from wrapper parent dir (for isolated/relocated installs). */
   relativeRuntimeSubpath?: string;
+  /** State directory name under `$HOME` (injected from `IMCODES_STATE_DIR_NAME` by callers). */
+  userStateDirName?: string;
 }
 
 /**
@@ -555,6 +557,16 @@ export function renderPosixImcodesCliWrapper(options: RenderCliWrapperOptions): 
   const defaultRuntimeRoot =
     options.runtimeRoot ?? DESKTOP_INSTALLER_DEFAULT_PATHS[options.platform].daemonRuntimeRoot;
   const relSubpath = options.relativeRuntimeSubpath ?? '../daemon-runtime';
+  const userStateDirName = options.userStateDirName?.trim();
+  const userHomeRuntimeLines = userStateDirName
+    ? `if [ -n "\${IMCODES_HOME:-}" ]; then
+  select_runtime_root "$IMCODES_HOME/daemon-runtime" || true
+elif [ -n "\${HOME:-}" ]; then
+  select_runtime_root "$HOME/${userStateDirName}/daemon-runtime" || true
+fi`
+    : `if [ -n "\${IMCODES_HOME:-}" ]; then
+  select_runtime_root "$IMCODES_HOME/daemon-runtime" || true
+fi`;
   return `#!/bin/sh
 set -eu
 
@@ -661,11 +673,7 @@ fi
 if [ -n "\${IMCODES_DAEMON_RUNTIME_DIR:-}" ] && select_runtime_root "$IMCODES_DAEMON_RUNTIME_DIR"; then
   exec "$SELECTED_NODE" "$SELECTED_ENTRY" "$@"
 fi
-if [ -n "\${IMCODES_HOME:-}" ]; then
-  select_runtime_root "$IMCODES_HOME/daemon-runtime" || true
-elif [ -n "\${HOME:-}" ]; then
-  select_runtime_root "$HOME/.imcodes/daemon-runtime" || true
-fi
+${userHomeRuntimeLines}
 select_runtime_root "$SELF_DIR/${relSubpath}" || true
 select_runtime_root "${defaultRuntimeRoot}" || true
 if [ -n "$SELECTED_NODE" ] && [ -n "$SELECTED_ENTRY" ]; then
@@ -707,6 +715,8 @@ exit 127
 export interface RenderWindowsCliWrapperOptions {
   runtimeRoot?: string;
   relativeRuntimeSubpath?: string;
+  /** State directory name under `%USERPROFILE%` (injected from `IMCODES_STATE_DIR_NAME` by callers). */
+  userStateDirName?: string;
 }
 
 /**
@@ -717,6 +727,10 @@ export function renderWindowsImcodesCliWrapper(options: RenderWindowsCliWrapperO
   const defaultRuntimeRoot =
     options.runtimeRoot ?? DESKTOP_INSTALLER_DEFAULT_PATHS.win32.daemonRuntimeRoot;
   const relSubpath = options.relativeRuntimeSubpath ?? '..\\daemon-runtime';
+  const userStateDirName = options.userStateDirName?.trim();
+  const userHomeRuntimeLine = userStateDirName
+    ? `if defined IMCODES_HOME (call :select_runtime "%IMCODES_HOME%\\daemon-runtime") else if defined USERPROFILE (call :select_runtime "%USERPROFILE%\\${userStateDirName}\\daemon-runtime")`
+    : 'if defined IMCODES_HOME call :select_runtime "%IMCODES_HOME%\\daemon-runtime"';
   const lines = [
     '@echo off',
     'setlocal EnableExtensions',
@@ -739,7 +753,7 @@ export function renderWindowsImcodesCliWrapper(options: RenderWindowsCliWrapperO
     'set "SELECTED_PKG="',
     'if defined IMCODES_DAEMON_RUNTIME_DIR call :select_runtime "%IMCODES_DAEMON_RUNTIME_DIR%"',
     'if defined SELECTED_NODE goto :run_bundled',
-    'if defined IMCODES_HOME (call :select_runtime "%IMCODES_HOME%\\daemon-runtime") else if defined USERPROFILE (call :select_runtime "%USERPROFILE%\\.imcodes\\daemon-runtime")',
+    userHomeRuntimeLine,
     `call :select_runtime "%SELF_DIR%\\${relSubpath}"`,
     `call :select_runtime "${defaultRuntimeRoot}"`,
     ':run_bundled',

@@ -110,6 +110,8 @@ export interface PosixUpgradeScriptParams {
   allowDowngrade?: boolean;
   /** Test seam: skip the launch-chain and CLI-wrapper rewrites (they touch $HOME). */
   skipLaunchChain?: boolean;
+  /** Explicit npm global prefix override (used when bundled daemon-runtime falls back to a legacy npm install). */
+  npmPrefix?: string;
 }
 
 export function buildPosixUpgradeScript(params: PosixUpgradeScriptParams): string {
@@ -141,6 +143,7 @@ log() { echo "[$(date '+%Y-%m-%dT%H:%M:%S%z')] $*" >> "$LOG"; }
 # what this script exists to prevent.
 trap '' HUP
 ATOMIC_INSTALLER=${shellQuote(atomicInstallerPath)}
+PINNED_NPM_PREFIX=${params.npmPrefix?.trim() ? shellQuote(params.npmPrefix.trim()) : '""'}
 SKIP_LAUNCH_CHAIN=${params.skipLaunchChain ? 1 : 0}
 ALLOW_DOWNGRADE=${params.allowDowngrade ? 1 : 0}
 SETTLE_SEC=${params.timing?.settleSec ?? 3}
@@ -390,12 +393,20 @@ log "[step 0] npm runner: $NPM_RUN"
 sleep "$SETTLE_SEC"
 
 log "[step 1] discover global package root"
-GLOBAL_ROOT=$(eval "$NPM_RUN root -g" 2>>"$LOG")
-log "[step 1] global root: $GLOBAL_ROOT"
+if [ -n "$PINNED_NPM_PREFIX" ]; then
+  export NPM_CONFIG_PREFIX="$PINNED_NPM_PREFIX"
+  NPM_GLOBAL_PREFIX="$PINNED_NPM_PREFIX"
+  GLOBAL_ROOT="$PINNED_NPM_PREFIX/lib/node_modules"
+  BIN_DIR="$PINNED_NPM_PREFIX/bin"
+  log "[step 1] pinned npm prefix: $NPM_GLOBAL_PREFIX (global root: $GLOBAL_ROOT)"
+else
+  GLOBAL_ROOT=$(eval "$NPM_RUN root -g" 2>>"$LOG")
+  log "[step 1] global root: $GLOBAL_ROOT"
+  NPM_GLOBAL_PREFIX=$(eval "$NPM_RUN prefix -g" 2>>"$LOG")
+  BIN_DIR=""
+  if [ -n "$NPM_GLOBAL_PREFIX" ]; then BIN_DIR="$NPM_GLOBAL_PREFIX/bin"; fi
+fi
 GLOBAL_PKG="$GLOBAL_ROOT/imcodes"
-NPM_GLOBAL_PREFIX=$(eval "$NPM_RUN prefix -g" 2>>"$LOG")
-BIN_DIR=""
-if [ -n "$NPM_GLOBAL_PREFIX" ]; then BIN_DIR="$NPM_GLOBAL_PREFIX/bin"; fi
 # The stage lives next to the global root (same filesystem: the switch is two renames).
 STAGE_PREFIX="$(dirname "$GLOBAL_ROOT")/.imcodes-stage.$$"
 UPGRADE_TAG="$$"
