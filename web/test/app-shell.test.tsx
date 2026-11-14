@@ -10619,6 +10619,10 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       expect(screen.getByTestId('mobile-swipe-hud-dir-down')).toBeTruthy();
       expect(screen.getByTestId('mobile-swipe-hud-dir-left')).toBeTruthy();
       expect(screen.getByTestId('mobile-swipe-hud-dir-right').getAttribute('data-active')).toBe('true');
+      expect(screen.getByTestId('mobile-swipe-hud-dir-target-up').textContent).toBe('Server Two');
+      expect(screen.getByTestId('mobile-swipe-hud-dir-target-down').textContent).toBe('Server Two');
+      expect(screen.getByTestId('mobile-swipe-hud-dir-target-left').textContent).toBe('gamma');
+      expect(screen.getByTestId('mobile-swipe-hud-dir-target-right').textContent).toBe('beta');
       expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
 
       // 3) Drag past threshold -> armed, STILL does not switch mid-drag

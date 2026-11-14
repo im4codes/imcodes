@@ -5407,7 +5407,8 @@
       "left": "이전 세션",
       "right": "다음 세션",
       "drag_to_threshold": "임계값까지 드래그하여 전환",
-      "release_to_switch": "놓아서 전환"
+      "release_to_switch": "놓아서 전환",
+      "no_target": "다른 대상 없음"
     }
   }
 }

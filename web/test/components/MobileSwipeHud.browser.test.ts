@@ -16,7 +16,7 @@ const TEST_VIEWPORTS = [
 const TEST_LOCALES = ['en', 'es', 'ru', 'zh-CN', 'zh-TW', 'ja', 'ko'] as const;
 
 describe('MobileSwipeHud real Chromium geometry & responsive wrapping', () => {
-  it('renders all 4 directional labels without ellipsis, clipping, overlap, or card overflow across 320/375/390px and all 7 locales', { timeout: 45000 }, async () => {
+  it('renders all 4 directional labels and truncated targets without clipping, overlap, or card overflow across 320/375/390px and all 7 locales', { timeout: 45000 }, async () => {
     const require = createRequire(import.meta.url);
     const { chromium } = require('playwright') as typeof import('playwright');
     if (!existsSync(chromium.executablePath())) {
@@ -34,9 +34,9 @@ describe('MobileSwipeHud real Chromium geometry & responsive wrapping', () => {
           import { render } from 'preact';
           import i18n from ${JSON.stringify(i18nPath)};
           import { MobileSwipeHud } from ${JSON.stringify(componentPath)};
-          window.__mountSwipeHud = async (locale, progress) => {
+          window.__mountSwipeHud = async (locale, progress, targets) => {
             await i18n.changeLanguage(locale);
-            render(<MobileSwipeHud progress={progress} />, document.getElementById('root'));
+            render(<MobileSwipeHud progress={progress} targets={targets} />, document.getElementById('root'));
           };
         `,
         resolveDir: resolve(here, '../..'),
@@ -66,7 +66,7 @@ describe('MobileSwipeHud real Chromium geometry & responsive wrapping', () => {
 
       const cases = [
         {
-          name: 'unarmed-left',
+          name: 'unarmed-left-with-targets',
           progress: {
             dx: -28,
             dy: 0,
@@ -77,9 +77,15 @@ describe('MobileSwipeHud real Chromium geometry & responsive wrapping', () => {
             progress: 0.5,
             armed: false,
           },
+          targets: {
+            up: 'mini-2',
+            down: 'mac-studio-prod',
+            left: 'cd',
+            right: 'clawd',
+          },
         },
         {
-          name: 'armed-right',
+          name: 'armed-right-long-mixed-cjk-ascii',
           progress: {
             dx: 68,
             dy: 0,
@@ -90,9 +96,15 @@ describe('MobileSwipeHud real Chromium geometry & responsive wrapping', () => {
             progress: 1,
             armed: true,
           },
+          targets: {
+            up: '生产环境主机-ap-northeast-1-ultra-long-server-name-01',
+            down: '测试环境节点-us-west-2-very-long-hostname-99',
+            left: '超长中文混合会话名称-codedeck-frontend-mobile-swipe-hud',
+            right: 'AnotherExtremelyLongSessionProjectNameWithMixed文字123456',
+          },
         },
         {
-          name: 'armed-up',
+          name: 'armed-up-with-unavailable-session-axis',
           progress: {
             dx: 0,
             dy: -64,
@@ -103,6 +115,12 @@ describe('MobileSwipeHud real Chromium geometry & responsive wrapping', () => {
             progress: 1,
             armed: true,
           },
+          targets: {
+            up: 'mini-2',
+            down: 'prod-box-02',
+            left: null,
+            right: null,
+          },
         },
       ] as const;
 
@@ -111,11 +129,11 @@ describe('MobileSwipeHud real Chromium geometry & responsive wrapping', () => {
         for (const locale of TEST_LOCALES) {
           for (const testCase of cases) {
             await page.evaluate(
-              ({ lang, progress }) =>
+              ({ lang, progress, targets }) =>
                 (window as unknown as {
-                  __mountSwipeHud: (l: string, p: unknown) => Promise<void>;
-                }).__mountSwipeHud(lang, progress),
-              { lang: locale, progress: testCase.progress },
+                  __mountSwipeHud: (l: string, p: unknown, t: unknown) => Promise<void>;
+                }).__mountSwipeHud(lang, progress, targets),
+              { lang: locale, progress: testCase.progress, targets: testCase.targets },
             );
 
             const metrics = await page.evaluate(() => {
@@ -128,12 +146,15 @@ describe('MobileSwipeHud real Chromium geometry & responsive wrapping', () => {
               const dirs = (['up', 'down', 'left', 'right'] as const).map((dir) => {
                 const pill = document.querySelector(`[data-testid="mobile-swipe-hud-dir-${dir}"]`) as HTMLElement;
                 const label = pill.querySelector('.mobile-swipe-hud-dir-label') as HTMLElement;
+                const target = pill.querySelector('.mobile-swipe-hud-dir-target') as HTMLElement | null;
                 const pillRect = pill.getBoundingClientRect();
                 const labelRect = label.getBoundingClientRect();
                 const labelStyle = getComputedStyle(label);
+                const targetStyle = target ? getComputedStyle(target) : null;
                 return {
                   dir,
                   text: label.textContent?.trim() ?? '',
+                  targetText: target?.textContent?.trim() ?? '',
                   pillRect: {
                     left: pillRect.left,
                     right: pillRect.right,
@@ -154,6 +175,11 @@ describe('MobileSwipeHud real Chromium geometry & responsive wrapping', () => {
                   textOverflow: labelStyle.textOverflow,
                   overflowX: labelStyle.overflowX,
                   fontSize: parseFloat(labelStyle.fontSize),
+                  targetWhiteSpace: targetStyle?.whiteSpace ?? null,
+                  targetTextOverflow: targetStyle?.textOverflow ?? null,
+                  targetOverflowX: targetStyle?.overflowX ?? null,
+                  targetHeight: target ? target.getBoundingClientRect().height : 0,
+                  targetLineHeight: targetStyle ? parseFloat(targetStyle.lineHeight) : 0,
                 };
               });
 
@@ -198,6 +224,14 @@ describe('MobileSwipeHud real Chromium geometry & responsive wrapping', () => {
               );
               expect(d.whiteSpace, `${tag}/${d.dir}: allows multi-line wrapping`).not.toBe('nowrap');
               expect(d.textOverflow, `${tag}/${d.dir}: must not use ellipsis`).not.toBe('ellipsis');
+              // Target name stays single-line with ellipsis truncation and never expands pill past card
+              expect(d.targetText.length, `${tag}/${d.dir}: non-empty target text`).toBeGreaterThan(0);
+              expect(d.targetWhiteSpace, `${tag}/${d.dir}: target uses single-line nowrap`).toBe('nowrap');
+              expect(d.targetTextOverflow, `${tag}/${d.dir}: target uses ellipsis`).toBe('ellipsis');
+              expect(d.targetOverflowX, `${tag}/${d.dir}: target clips overflow`).toBe('hidden');
+              expect(d.targetHeight, `${tag}/${d.dir}: target stays single-line`).toBeLessThanOrEqual(
+                d.targetLineHeight + 4,
+              );
               expect(d.pillRect.left, `${tag}/${d.dir}: pill inside card left`).toBeGreaterThanOrEqual(
                 metrics.cardRect.left - 0.5,
               );

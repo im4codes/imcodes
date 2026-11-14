@@ -20021,72 +20021,237 @@ button.quick-agent-delegation-preset.active {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 20px;
+  padding: 16px;
   pointer-events: none;
   user-select: none;
 }
 
 .mobile-swipe-hud-card {
+  position: relative;
+  overflow: hidden;
   box-sizing: border-box;
   display: flex;
   flex-direction: column;
   align-items: stretch;
-  gap: 12px;
-  width: min(92vw, 360px);
-  padding: 14px 16px;
-  border-radius: 18px;
-  background: rgba(15, 23, 42, 0.84);
-  border: 1.5px solid rgba(148, 163, 184, 0.36);
+  gap: 11px;
+  width: min(92vw, 376px);
+  padding: 13px 14px;
+  border-radius: 16px;
+  background:
+    radial-gradient(circle at 50% 48%, rgba(56, 189, 248, 0.14), transparent 60%),
+    linear-gradient(rgba(56, 189, 248, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(56, 189, 248, 0.05) 1px, transparent 1px),
+    rgba(8, 13, 26, 0.90);
+  background-size: 100% 100%, 18px 18px, 18px 18px, 100% 100%;
+  border: 1.5px solid rgba(56, 189, 248, 0.34);
   box-shadow:
-    0 24px 60px rgba(2, 6, 23, 0.58),
-    inset 0 1px 0 rgba(255, 255, 255, 0.08);
-  backdrop-filter: blur(16px) saturate(150%);
-  -webkit-backdrop-filter: blur(16px) saturate(150%);
-  color: rgba(248, 250, 252, 0.94);
+    0 24px 64px rgba(2, 6, 23, 0.72),
+    0 0 24px rgba(14, 165, 233, 0.12),
+    inset 0 1px 0 rgba(186, 230, 253, 0.16),
+    inset 0 0 24px rgba(14, 165, 233, 0.06);
+  backdrop-filter: blur(18px) saturate(160%);
+  -webkit-backdrop-filter: blur(18px) saturate(160%);
+  color: rgba(248, 250, 252, 0.96);
   animation: server-switch-hud-in 120ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
   transition: border-color 140ms ease, box-shadow 140ms ease;
 }
 
+.mobile-swipe-hud-card.is-server {
+  border-color: rgba(56, 189, 248, 0.52);
+}
+
+.mobile-swipe-hud-card.is-session {
+  border-color: rgba(52, 211, 153, 0.52);
+  background:
+    radial-gradient(circle at 50% 48%, rgba(52, 211, 153, 0.14), transparent 60%),
+    linear-gradient(rgba(34, 211, 238, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(34, 211, 238, 0.05) 1px, transparent 1px),
+    rgba(8, 13, 26, 0.90);
+  background-size: 100% 100%, 18px 18px, 18px 18px, 100% 100%;
+}
+
 .mobile-swipe-hud-card.is-server.is-armed {
-  border-color: rgba(56, 189, 248, 0.92);
+  border-color: rgba(251, 191, 36, 0.92);
   box-shadow:
-    0 24px 60px rgba(2, 6, 23, 0.62),
-    0 0 26px rgba(56, 189, 248, 0.28),
-    inset 0 1px 0 rgba(255, 255, 255, 0.12);
+    0 24px 64px rgba(2, 6, 23, 0.76),
+    0 0 30px rgba(56, 189, 248, 0.28),
+    0 0 18px rgba(251, 191, 36, 0.24),
+    inset 0 1px 0 rgba(254, 243, 199, 0.24);
 }
 
 .mobile-swipe-hud-card.is-session.is-armed {
-  border-color: rgba(251, 191, 36, 0.92);
+  border-color: rgba(52, 211, 153, 0.94);
   box-shadow:
-    0 24px 60px rgba(2, 6, 23, 0.62),
-    0 0 26px rgba(251, 191, 36, 0.28),
-    inset 0 1px 0 rgba(255, 255, 255, 0.12);
+    0 24px 64px rgba(2, 6, 23, 0.76),
+    0 0 30px rgba(52, 211, 153, 0.28),
+    0 0 18px rgba(34, 211, 238, 0.22),
+    inset 0 1px 0 rgba(167, 243, 208, 0.24);
+}
+
+.mobile-swipe-hud-corner {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  pointer-events: none;
+  border-color: rgba(56, 189, 248, 0.65);
+  border-style: solid;
+  border-width: 0;
+}
+
+.mobile-swipe-hud-corner.is-tl {
+  top: 5px;
+  left: 5px;
+  border-top-width: 1.5px;
+  border-left-width: 1.5px;
+  border-top-left-radius: 3px;
+}
+
+.mobile-swipe-hud-corner.is-tr {
+  top: 5px;
+  right: 5px;
+  border-top-width: 1.5px;
+  border-right-width: 1.5px;
+  border-top-right-radius: 3px;
+}
+
+.mobile-swipe-hud-corner.is-bl {
+  bottom: 5px;
+  left: 5px;
+  border-bottom-width: 1.5px;
+  border-left-width: 1.5px;
+  border-bottom-left-radius: 3px;
+}
+
+.mobile-swipe-hud-corner.is-br {
+  bottom: 5px;
+  right: 5px;
+  border-bottom-width: 1.5px;
+  border-right-width: 1.5px;
+  border-bottom-right-radius: 3px;
+}
+
+.mobile-swipe-hud-card.is-server.is-armed .mobile-swipe-hud-corner {
+  border-color: rgba(251, 191, 36, 0.95);
+}
+
+.mobile-swipe-hud-card.is-session .mobile-swipe-hud-corner {
+  border-color: rgba(52, 211, 153, 0.7);
+}
+
+.mobile-swipe-hud-card.is-session.is-armed .mobile-swipe-hud-corner {
+  border-color: rgba(110, 231, 183, 0.98);
 }
 
 .mobile-swipe-hud-header {
+  position: relative;
+  z-index: 1;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 600;
-  letter-spacing: 0.02em;
-  color: rgba(203, 213, 225, 0.9);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: rgba(186, 230, 253, 0.88);
+}
+
+.mobile-swipe-hud-title-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.mobile-swipe-hud-status-dot {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: #38bdf8;
+  box-shadow: 0 0 8px rgba(56, 189, 248, 0.9);
+}
+
+.mobile-swipe-hud-card.is-server.is-armed .mobile-swipe-hud-status-dot {
+  background: #fbbf24;
+  box-shadow: 0 0 10px rgba(251, 191, 36, 0.95);
+}
+
+.mobile-swipe-hud-card.is-session .mobile-swipe-hud-status-dot {
+  background: #34d399;
+  box-shadow: 0 0 10px rgba(52, 211, 153, 0.95);
 }
 
 .mobile-swipe-hud-pct {
+  flex: 0 0 auto;
+  padding: 2px 7px;
+  border-radius: 6px;
+  border: 1px solid rgba(56, 189, 248, 0.34);
+  background: rgba(15, 23, 42, 0.72);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-variant-numeric: tabular-nums;
-  color: rgba(248, 250, 252, 0.95);
+  font-weight: 700;
+  color: rgba(224, 242, 254, 0.98);
+}
+
+.mobile-swipe-hud-card.is-server.is-armed .mobile-swipe-hud-pct {
+  border-color: rgba(251, 191, 36, 0.72);
+  color: #fef3c7;
+}
+
+.mobile-swipe-hud-card.is-session.is-armed .mobile-swipe-hud-pct {
+  border-color: rgba(52, 211, 153, 0.75);
+  color: #d1fae5;
 }
 
 .mobile-swipe-hud-compass {
+  position: relative;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 52px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) 56px minmax(0, 1fr);
   grid-template-rows: auto auto auto;
   align-items: center;
   justify-items: stretch;
-  gap: 8px;
+  gap: 10px 8px;
+}
+
+.mobile-swipe-hud-reticle {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.mobile-swipe-hud-axis {
+  position: absolute;
+  transition: opacity 140ms ease, box-shadow 140ms ease, background 140ms ease;
+}
+
+.mobile-swipe-hud-axis.is-vertical {
+  left: 50%;
+  top: 12px;
+  bottom: 12px;
+  width: 1px;
+  transform: translateX(-0.5px);
+  background: linear-gradient(180deg, rgba(56, 189, 248, 0.14), rgba(56, 189, 248, 0.44), rgba(56, 189, 248, 0.14));
+}
+
+.mobile-swipe-hud-axis.is-horizontal {
+  top: 50%;
+  left: 14px;
+  right: 14px;
+  height: 1px;
+  transform: translateY(-0.5px);
+  background: linear-gradient(90deg, rgba(52, 211, 153, 0.14), rgba(52, 211, 153, 0.44), rgba(52, 211, 153, 0.14));
+}
+
+.mobile-swipe-hud-card.is-server .mobile-swipe-hud-axis.is-vertical {
+  background: linear-gradient(180deg, rgba(56, 189, 248, 0.28), rgba(251, 191, 36, 0.85), rgba(56, 189, 248, 0.28));
+  box-shadow: 0 0 8px rgba(56, 189, 248, 0.45);
+}
+
+.mobile-swipe-hud-card.is-session .mobile-swipe-hud-axis.is-horizontal {
+  background: linear-gradient(90deg, rgba(34, 211, 238, 0.28), rgba(52, 211, 153, 0.88), rgba(34, 211, 238, 0.28));
+  box-shadow: 0 0 8px rgba(52, 211, 153, 0.45);
 }
 
 .mobile-swipe-hud-center {
@@ -20094,11 +20259,29 @@ button.quick-agent-delegation-preset.active {
   grid-column: 2;
   justify-self: center;
   position: relative;
+  z-index: 1;
   width: 52px;
   height: 52px;
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+.mobile-swipe-hud-orbit {
+  position: absolute;
+  width: 58px;
+  height: 58px;
+  border-radius: 999px;
+  border: 1px dashed rgba(56, 189, 248, 0.34);
+  pointer-events: none;
+}
+
+.mobile-swipe-hud-card.is-session .mobile-swipe-hud-orbit {
+  border-color: rgba(52, 211, 153, 0.4);
+}
+
+.mobile-swipe-hud-card.is-server.is-armed .mobile-swipe-hud-orbit {
+  border-color: rgba(251, 191, 36, 0.72);
 }
 
 .mobile-swipe-hud-ring {
@@ -20108,25 +20291,32 @@ button.quick-agent-delegation-preset.active {
 }
 
 .mobile-swipe-hud-ring-track {
-  fill: none;
+  fill: rgba(8, 13, 26, 0.76);
   stroke: rgba(148, 163, 184, 0.24);
-  stroke-width: 4;
+  stroke-width: 3.5;
 }
 
 .mobile-swipe-hud-ring-fill {
   fill: none;
-  stroke: rgba(148, 163, 184, 0.85);
-  stroke-width: 4;
+  stroke: rgba(56, 189, 248, 0.9);
+  stroke-width: 3.5;
   stroke-linecap: round;
+  filter: drop-shadow(0 0 4px rgba(56, 189, 248, 0.55));
   transition: stroke-dashoffset 60ms linear, stroke 140ms ease;
 }
 
 .mobile-swipe-hud-card.is-server .mobile-swipe-hud-ring-fill {
-  stroke: rgba(56, 189, 248, 0.96);
+  stroke: #38bdf8;
+}
+
+.mobile-swipe-hud-card.is-server.is-armed .mobile-swipe-hud-ring-fill {
+  stroke: #fbbf24;
+  filter: drop-shadow(0 0 6px rgba(251, 191, 36, 0.72));
 }
 
 .mobile-swipe-hud-card.is-session .mobile-swipe-hud-ring-fill {
-  stroke: rgba(251, 191, 36, 0.96);
+  stroke: #34d399;
+  filter: drop-shadow(0 0 6px rgba(52, 211, 153, 0.65));
 }
 
 .mobile-swipe-hud-center-badge {
@@ -20134,10 +20324,13 @@ button.quick-agent-delegation-preset.active {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 11px;
   font-weight: 700;
-  color: rgba(248, 250, 252, 0.92);
+  letter-spacing: 0.04em;
+  color: rgba(224, 242, 254, 0.96);
 }
 
 .mobile-swipe-hud-dir {
+  position: relative;
+  z-index: 1;
   box-sizing: border-box;
   display: flex;
   flex-direction: column;
@@ -20148,11 +20341,17 @@ button.quick-agent-delegation-preset.active {
   width: 100%;
   padding: 7px 8px;
   border-radius: 10px;
-  border: 1px solid rgba(148, 163, 184, 0.22);
-  background: rgba(255, 255, 255, 0.05);
-  color: rgba(203, 213, 225, 0.82);
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  background: rgba(10, 17, 32, 0.96);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  color: rgba(203, 213, 225, 0.88);
   text-align: center;
-  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease, transform 120ms ease;
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease,
+    box-shadow 120ms ease,
+    color 120ms ease,
+    transform 120ms ease;
 }
 
 .mobile-swipe-hud-dir.is-up {
@@ -20160,8 +20359,8 @@ button.quick-agent-delegation-preset.active {
   grid-column: 1 / -1;
   justify-self: center;
   width: auto;
-  min-width: min(140px, 100%);
-  max-width: 100%;
+  min-width: min(176px, 100%);
+  max-width: min(248px, 100%);
 }
 
 .mobile-swipe-hud-dir.is-left {
@@ -20179,53 +20378,135 @@ button.quick-agent-delegation-preset.active {
   grid-column: 1 / -1;
   justify-self: center;
   width: auto;
-  min-width: min(140px, 100%);
-  max-width: 100%;
+  min-width: min(176px, 100%);
+  max-width: min(248px, 100%);
+}
+
+.mobile-swipe-hud-dir-head {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  width: 100%;
+  min-width: 0;
 }
 
 .mobile-swipe-hud-dir-arrow {
-  font-size: 15px;
+  flex: 0 0 auto;
+  font-size: 12px;
   font-weight: 700;
   line-height: 1;
 }
 
+.mobile-swipe-hud-dir.is-server .mobile-swipe-hud-dir-arrow {
+  color: rgba(125, 211, 252, 0.94);
+}
+
+.mobile-swipe-hud-dir.is-session .mobile-swipe-hud-dir-arrow {
+  color: rgba(110, 231, 183, 0.94);
+}
+
 .mobile-swipe-hud-dir-label {
-  font-size: 11px;
+  min-width: 0;
+  font-size: 10.5px;
   font-weight: 600;
   line-height: 1.25;
   max-width: 100%;
   white-space: normal;
   overflow-wrap: anywhere;
   word-break: normal;
+  opacity: 0.88;
 }
 
-.mobile-swipe-hud-dir.is-server.is-active {
-  border-color: rgba(56, 189, 248, 0.58);
-  background: rgba(56, 189, 248, 0.14);
-  color: rgba(224, 242, 254, 0.96);
+.mobile-swipe-hud-dir-target {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  font-size: 12.5px;
+  font-weight: 700;
+  line-height: 1.25;
+  letter-spacing: 0.01em;
+  color: rgba(248, 250, 252, 0.98);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-.mobile-swipe-hud-dir.is-server.is-armed {
-  border-color: rgba(56, 189, 248, 0.95);
-  background: rgba(56, 189, 248, 0.28);
-  color: #ffffff;
-  transform: scale(1.03);
+.mobile-swipe-hud-dir-target.is-empty {
+  font-size: 11px;
+  font-weight: 500;
+  color: rgba(148, 163, 184, 0.74);
 }
 
-.mobile-swipe-hud-dir.is-session.is-active {
-  border-color: rgba(251, 191, 36, 0.58);
-  background: rgba(251, 191, 36, 0.14);
-  color: rgba(254, 243, 199, 0.96);
+.mobile-swipe-hud-dir.is-server {
+  border-color: rgba(56, 189, 248, 0.26);
 }
 
-.mobile-swipe-hud-dir.is-session.is-armed {
+.mobile-swipe-hud-dir.is-session {
+  border-color: rgba(52, 211, 153, 0.24);
+}
+
+.mobile-swipe-hud-dir.is-unavailable {
+  border-style: dashed;
+  border-color: rgba(148, 163, 184, 0.2);
+  background: rgba(10, 17, 32, 0.86);
+  opacity: 0.62;
+}
+
+.mobile-swipe-hud-dir.is-unavailable .mobile-swipe-hud-dir-arrow {
+  color: rgba(148, 163, 184, 0.72);
+}
+
+.mobile-swipe-hud-dir.is-server.is-active:not(.is-unavailable) {
+  border-color: rgba(56, 189, 248, 0.78);
+  background:
+    linear-gradient(135deg, rgba(14, 165, 233, 0.20), rgba(14, 165, 233, 0.14)),
+    rgba(10, 17, 32, 0.97);
+  box-shadow: 0 0 14px rgba(56, 189, 248, 0.22);
+  color: rgba(224, 242, 254, 0.98);
+}
+
+.mobile-swipe-hud-dir.is-server.is-armed:not(.is-unavailable) {
   border-color: rgba(251, 191, 36, 0.95);
-  background: rgba(251, 191, 36, 0.28);
+  background:
+    linear-gradient(135deg, rgba(14, 165, 233, 0.30), rgba(245, 158, 11, 0.28)),
+    rgba(10, 17, 32, 0.98);
+  box-shadow:
+    0 0 18px rgba(56, 189, 248, 0.30),
+    0 0 12px rgba(251, 191, 36, 0.28);
   color: #ffffff;
-  transform: scale(1.03);
+  transform: scale(1.02);
+}
+
+.mobile-swipe-hud-dir.is-session.is-active:not(.is-unavailable) {
+  border-color: rgba(52, 211, 153, 0.78);
+  background:
+    linear-gradient(135deg, rgba(16, 185, 129, 0.20), rgba(6, 182, 212, 0.14)),
+    rgba(10, 17, 32, 0.97);
+  box-shadow: 0 0 14px rgba(52, 211, 153, 0.22);
+  color: rgba(209, 250, 229, 0.98);
+}
+
+.mobile-swipe-hud-dir.is-session.is-armed:not(.is-unavailable) {
+  border-color: rgba(52, 211, 153, 0.96);
+  background:
+    linear-gradient(135deg, rgba(6, 182, 212, 0.28), rgba(16, 185, 129, 0.32)),
+    rgba(10, 17, 32, 0.98);
+  box-shadow:
+    0 0 18px rgba(52, 211, 153, 0.32),
+    0 0 12px rgba(34, 211, 238, 0.26);
+  color: #ffffff;
+  transform: scale(1.02);
+}
+
+.mobile-swipe-hud-dir.is-unavailable.is-active,
+.mobile-swipe-hud-dir.is-unavailable.is-armed {
+  opacity: 0.78;
 }
 
 .mobile-swipe-hud-footer {
+  position: relative;
+  z-index: 1;
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -20235,30 +20516,32 @@ button.quick-agent-delegation-preset.active {
   height: 4px;
   width: 100%;
   border-radius: 999px;
-  background: rgba(148, 163, 184, 0.22);
+  background: rgba(148, 163, 184, 0.20);
   overflow: hidden;
 }
 
 .mobile-swipe-hud-bar-fill {
   height: 100%;
   border-radius: 999px;
-  background: rgba(148, 163, 184, 0.85);
+  background: linear-gradient(90deg, rgba(56, 189, 248, 0.8), rgba(125, 211, 252, 0.95));
   transition: width 60ms linear, background-color 140ms ease;
 }
 
 .mobile-swipe-hud-card.is-server .mobile-swipe-hud-bar-fill {
-  background: rgba(56, 189, 248, 0.96);
+  background: linear-gradient(90deg, #38bdf8, #fbbf24);
+  box-shadow: 0 0 10px rgba(251, 191, 36, 0.45);
 }
 
 .mobile-swipe-hud-card.is-session .mobile-swipe-hud-bar-fill {
-  background: rgba(251, 191, 36, 0.96);
+  background: linear-gradient(90deg, #22d3ee, #34d399);
+  box-shadow: 0 0 10px rgba(52, 211, 153, 0.45);
 }
 
 .mobile-swipe-hud-hint {
-  font-size: 12px;
+  font-size: 11.5px;
   font-weight: 500;
   text-align: center;
-  color: rgba(203, 213, 225, 0.88);
+  color: rgba(186, 230, 253, 0.86);
 }
 
 .mobile-swipe-hud.is-armed .mobile-swipe-hud-hint {
@@ -20268,72 +20551,133 @@ button.quick-agent-delegation-preset.active {
 
 @media (prefers-color-scheme: light) {
   .mobile-swipe-hud-card {
-    background: rgba(255, 255, 255, 0.9);
-    border-color: rgba(15, 23, 42, 0.16);
+    background:
+      radial-gradient(circle at 50% 48%, rgba(2, 132, 199, 0.08), transparent 60%),
+      linear-gradient(rgba(2, 132, 199, 0.05) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(2, 132, 199, 0.05) 1px, transparent 1px),
+      rgba(248, 250, 252, 0.93);
+    background-size: 100% 100%, 18px 18px, 18px 18px, 100% 100%;
+    border-color: rgba(2, 132, 199, 0.30);
     box-shadow:
       0 24px 60px rgba(15, 23, 42, 0.18),
-      inset 0 1px 0 rgba(255, 255, 255, 0.92);
-    color: rgba(15, 23, 42, 0.92);
+      inset 0 1px 0 rgba(255, 255, 255, 0.94);
+    color: rgba(15, 23, 42, 0.94);
   }
 
   .mobile-swipe-hud-card.is-server.is-armed {
-    border-color: rgba(2, 132, 199, 0.9);
-    box-shadow:
-      0 24px 60px rgba(15, 23, 42, 0.18),
-      0 0 24px rgba(2, 132, 199, 0.2);
-  }
-
-  .mobile-swipe-hud-card.is-session.is-armed {
     border-color: rgba(217, 119, 6, 0.9);
     box-shadow:
       0 24px 60px rgba(15, 23, 42, 0.18),
-      0 0 24px rgba(217, 119, 6, 0.2);
+      0 0 24px rgba(2, 132, 199, 0.20);
+  }
+
+  .mobile-swipe-hud-card.is-session {
+    border-color: rgba(5, 150, 105, 0.42);
+  }
+
+  .mobile-swipe-hud-card.is-session.is-armed {
+    border-color: rgba(5, 150, 105, 0.92);
+    box-shadow:
+      0 24px 60px rgba(15, 23, 42, 0.18),
+      0 0 24px rgba(5, 150, 105, 0.22);
+  }
+
+  .mobile-swipe-hud-corner {
+    border-color: rgba(2, 132, 199, 0.55);
+  }
+
+  .mobile-swipe-hud-card.is-server.is-armed .mobile-swipe-hud-corner {
+    border-color: rgba(217, 119, 6, 0.92);
+  }
+
+  .mobile-swipe-hud-card.is-session .mobile-swipe-hud-corner {
+    border-color: rgba(5, 150, 105, 0.65);
   }
 
   .mobile-swipe-hud-header,
   .mobile-swipe-hud-hint {
-    color: rgba(51, 65, 85, 0.86);
+    color: rgba(51, 65, 85, 0.9);
   }
 
-  .mobile-swipe-hud-pct,
-  .mobile-swipe-hud-center-badge,
-  .mobile-swipe-hud.is-armed .mobile-swipe-hud-hint {
+  .mobile-swipe-hud-pct {
+    background: rgba(226, 232, 240, 0.85);
+    border-color: rgba(2, 132, 199, 0.28);
     color: rgba(15, 23, 42, 0.95);
   }
 
+  .mobile-swipe-hud-center-badge,
+  .mobile-swipe-hud.is-armed .mobile-swipe-hud-hint {
+    color: rgba(15, 23, 42, 0.96);
+  }
+
+  .mobile-swipe-hud-ring-track {
+    fill: rgba(248, 250, 252, 0.9);
+    stroke: rgba(15, 23, 42, 0.14);
+  }
+
   .mobile-swipe-hud-dir {
-    border-color: rgba(15, 23, 42, 0.14);
-    background: rgba(15, 23, 42, 0.04);
-    color: rgba(51, 65, 85, 0.88);
+    border-color: rgba(15, 23, 42, 0.16);
+    background: rgba(255, 255, 255, 0.96);
+    color: rgba(51, 65, 85, 0.9);
   }
 
-  .mobile-swipe-hud-dir.is-server.is-active {
-    border-color: rgba(2, 132, 199, 0.55);
-    background: rgba(2, 132, 199, 0.12);
-    color: rgba(12, 74, 110, 0.96);
+  .mobile-swipe-hud-dir.is-server .mobile-swipe-hud-dir-arrow {
+    color: rgba(2, 132, 199, 0.95);
   }
 
-  .mobile-swipe-hud-dir.is-server.is-armed {
-    border-color: rgba(2, 132, 199, 0.92);
-    background: rgba(2, 132, 199, 0.22);
-    color: rgba(12, 74, 110, 1);
+  .mobile-swipe-hud-dir.is-session .mobile-swipe-hud-dir-arrow {
+    color: rgba(5, 150, 105, 0.95);
   }
 
-  .mobile-swipe-hud-dir.is-session.is-active {
-    border-color: rgba(217, 119, 6, 0.55);
-    background: rgba(217, 119, 6, 0.12);
-    color: rgba(120, 53, 15, 0.96);
+  .mobile-swipe-hud-dir-target {
+    color: rgba(15, 23, 42, 0.96);
   }
 
-  .mobile-swipe-hud-dir.is-session.is-armed {
+  .mobile-swipe-hud-dir-target.is-empty {
+    color: rgba(100, 116, 139, 0.85);
+  }
+
+  .mobile-swipe-hud-dir.is-unavailable {
+    background: rgba(241, 245, 249, 0.9);
+    border-color: rgba(100, 116, 139, 0.24);
+  }
+
+  .mobile-swipe-hud-dir.is-server.is-active:not(.is-unavailable) {
+    border-color: rgba(2, 132, 199, 0.65);
+    background:
+      linear-gradient(135deg, rgba(2, 132, 199, 0.14), rgba(2, 132, 199, 0.08)),
+      rgba(255, 255, 255, 0.97);
+    color: rgba(12, 74, 110, 0.98);
+  }
+
+  .mobile-swipe-hud-dir.is-server.is-armed:not(.is-unavailable) {
     border-color: rgba(217, 119, 6, 0.92);
-    background: rgba(217, 119, 6, 0.22);
-    color: rgba(120, 53, 15, 1);
+    background:
+      linear-gradient(135deg, rgba(2, 132, 199, 0.18), rgba(217, 119, 6, 0.20)),
+      rgba(255, 255, 255, 0.98);
+    color: rgba(15, 23, 42, 1);
+  }
+
+  .mobile-swipe-hud-dir.is-session.is-active:not(.is-unavailable) {
+    border-color: rgba(5, 150, 105, 0.65);
+    background:
+      linear-gradient(135deg, rgba(5, 150, 105, 0.14), rgba(8, 145, 178, 0.08)),
+      rgba(255, 255, 255, 0.97);
+    color: rgba(6, 78, 59, 0.98);
+  }
+
+  .mobile-swipe-hud-dir.is-session.is-armed:not(.is-unavailable) {
+    border-color: rgba(5, 150, 105, 0.92);
+    background:
+      linear-gradient(135deg, rgba(8, 145, 178, 0.18), rgba(5, 150, 105, 0.22)),
+      rgba(255, 255, 255, 0.98);
+    color: rgba(6, 78, 59, 1);
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .mobile-swipe-hud-card,
+  .mobile-swipe-hud-axis,
   .mobile-swipe-hud-ring-fill,
   .mobile-swipe-hud-dir,
   .mobile-swipe-hud-bar-fill {
@@ -20341,7 +20685,7 @@ button.quick-agent-delegation-preset.active {
     transition: none;
   }
 
-  .mobile-swipe-hud-dir.is-armed {
+  .mobile-swipe-hud-dir.is-armed:not(.is-unavailable) {
     transform: none;
   }
 }
@@ -20578,8 +20922,14 @@ html.native-ios-mac .btn.desktop-cloud-docs-marquee-btn {
   background: rgba(13, 20, 34, 0.94);
 }
 
-:is(html.native-ios-mac, html.native-mac-desktop) .mobile-swipe-hud-card {
-  background: rgba(13, 20, 34, 0.94);
+:is(html.native-ios-mac, html.native-mac-desktop) .mobile-swipe-hud-card,
+:is(html.native-ios-mac, html.native-mac-desktop) .mobile-swipe-hud-card.is-session {
+  background:
+    radial-gradient(circle at 50% 48%, rgba(56, 189, 248, 0.12), transparent 60%),
+    linear-gradient(rgba(56, 189, 248, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(56, 189, 248, 0.04) 1px, transparent 1px),
+    rgba(8, 13, 26, 0.96);
+  background-size: 100% 100%, 18px 18px, 18px 18px, 100% 100%;
 }
 
 :is(html.native-ios-mac, html.native-mac-desktop) .voice-hold-hud-transcript {
@@ -20599,7 +20949,13 @@ html.native-ios-mac .btn.desktop-cloud-docs-marquee-btn {
     background: rgba(255, 255, 255, 0.94);
   }
 
-  :is(html.native-ios-mac, html.native-mac-desktop) .mobile-swipe-hud-card {
-    background: rgba(255, 255, 255, 0.94);
+  :is(html.native-ios-mac, html.native-mac-desktop) .mobile-swipe-hud-card,
+  :is(html.native-ios-mac, html.native-mac-desktop) .mobile-swipe-hud-card.is-session {
+    background:
+      radial-gradient(circle at 50% 48%, rgba(2, 132, 199, 0.07), transparent 60%),
+      linear-gradient(rgba(2, 132, 199, 0.045) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(2, 132, 199, 0.045) 1px, transparent 1px),
+      rgba(248, 250, 252, 0.96);
+    background-size: 100% 100%, 18px 18px, 18px 18px, 100% 100%;
   }
 }

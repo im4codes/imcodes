@@ -194,7 +194,7 @@ import { TeamDiscussionGuide } from './components/TeamDiscussionGuide.js';
 import { FeatureAnnouncementHost } from './components/FeatureAnnouncement.js';
 import { DownloadTransferCenter } from './components/DownloadTransferCenter.js';
 import { ServerSwitchWatermark } from './components/ServerSwitchWatermark.js';
-import { MobileSwipeHud } from './components/MobileSwipeHud.js';
+import { MobileSwipeHud, resolveMobileSwipeTargets } from './components/MobileSwipeHud.js';
 import { mergeUsageUpdate } from './usage-data.js';
 import { ServerIconBar } from './components/ServerIconBar.js';
 import { PushStatusBadge } from './components/PushStatusBadge.js';
@@ -10478,7 +10478,22 @@ function InternalMainApp() {
             : null;
         return (
           <>
-            {isMobile && <MobileSwipeHud progress={mobileGestureProgress} />}
+            {isMobile && (
+              <MobileSwipeHud
+                progress={mobileGestureProgress}
+                targets={mobileGestureProgress
+                  ? resolveMobileSwipeTargets({
+                    servers: unifiedServers,
+                    currentServerId: sharedOpenIntentRef.current?.serverId ?? selectedServerId,
+                    hasActiveShareTarget: selectedShareTarget !== null,
+                    tabs: orderedVisibleMainSessions,
+                    activeSession,
+                    selectedServerId,
+                    manualDashboard,
+                  })
+                  : null}
+              />
+            )}
             <ServerSwitchWatermark
               visible={serverSwitchWatermark !== null}
               triggerKey={serverSwitchWatermark?.nonce ?? 0}

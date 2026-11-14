@@ -5408,7 +5408,8 @@
       "left": "上一個工作階段",
       "right": "下一個工作階段",
       "drag_to_threshold": "拖曳超過閾值即可切換",
-      "release_to_switch": "放開立即切換"
+      "release_to_switch": "放開立即切換",
+      "no_target": "無其他目標"
     }
   }
 }

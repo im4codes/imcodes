@@ -5418,7 +5418,8 @@
       "left": "Previous Session",
       "right": "Next Session",
       "drag_to_threshold": "Drag past threshold to switch",
-      "release_to_switch": "Release to switch"
+      "release_to_switch": "Release to switch",
+      "no_target": "No other target"
     }
   }
 }

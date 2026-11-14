@@ -5418,7 +5418,8 @@
       "left": "上一个会话",
       "right": "下一个会话",
       "drag_to_threshold": "拖动超过阈值即可切换",
-      "release_to_switch": "松手立即切换"
+      "release_to_switch": "松手立即切换",
+      "no_target": "无其他目标"
     }
   }
 }

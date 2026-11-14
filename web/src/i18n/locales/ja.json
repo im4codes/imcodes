@@ -5407,7 +5407,8 @@
       "left": "前のセッション",
       "right": "次のセッション",
       "drag_to_threshold": "しきい値までドラッグして切り替え",
-      "release_to_switch": "離して切り替え"
+      "release_to_switch": "離して切り替え",
+      "no_target": "他の対象なし"
     }
   }
 }

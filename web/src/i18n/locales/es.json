@@ -5408,7 +5408,8 @@
       "left": "Sesión anterior",
       "right": "Siguiente sesión",
       "drag_to_threshold": "Arrastra hasta el umbral para cambiar",
-      "release_to_switch": "Suelta para cambiar"
+      "release_to_switch": "Suelta para cambiar",
+      "no_target": "Sin otro destino"
     }
   }
 }

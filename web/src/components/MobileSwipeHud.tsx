@@ -1,15 +1,96 @@
 /**
- * Interactive 4-direction threshold guide HUD shown while dragging 2 fingers
- * on mobile to preview server/session switching and threshold arming.
+ * Interactive 4-direction tactical HUD shown while dragging 2 fingers on mobile
+ * to preview exact target server/session switching and threshold arming.
  */
 import { useTranslation } from 'react-i18next';
+import { cycleOrderedId } from '../keyboard-shortcuts.js';
 import type {
   MobileNavigationDirection,
   MobileNavigationGestureProgress,
 } from '../mobile-navigation-gestures.js';
 
+export interface MobileSwipeServerTargetInput {
+  readonly id: string;
+  readonly name?: string | null;
+  readonly isSharedIn?: boolean;
+}
+
+export interface MobileSwipeSessionTargetInput {
+  readonly name: string;
+  readonly label?: string | null;
+  readonly project?: string | null;
+}
+
+export interface MobileSwipeTargetResolutionInput {
+  readonly servers: readonly MobileSwipeServerTargetInput[];
+  readonly currentServerId: string | null | undefined;
+  readonly hasActiveShareTarget?: boolean;
+  readonly tabs: readonly MobileSwipeSessionTargetInput[];
+  readonly activeSession: string | null | undefined;
+  readonly selectedServerId: string | null | undefined;
+  readonly manualDashboard: boolean;
+}
+
+export type MobileSwipeTargets = Record<MobileNavigationDirection, string | null>;
+
+/**
+ * Resolves preview labels for all 4 gesture directions using the exact ordering,
+ * cycling, naming, and minCount=2 guards used by `navigateServerByStep` and
+ * `navigateTabByStep` in `app.tsx`.
+ */
+export function resolveMobileSwipeTargets(input: MobileSwipeTargetResolutionInput): MobileSwipeTargets {
+  const {
+    servers,
+    currentServerId,
+    hasActiveShareTarget = false,
+    tabs,
+    activeSession,
+    selectedServerId,
+    manualDashboard,
+  } = input;
+
+  const resolveServerDirection = (step: -1 | 1): string | null => {
+    if (servers.length < 2) return null;
+    const normalizedCurrent = currentServerId ?? null;
+    const nextId = cycleOrderedId(
+      servers.map((srv) => srv.id),
+      normalizedCurrent,
+      step,
+    );
+    const nextServer = nextId ? servers.find((srv) => srv.id === nextId) : null;
+    if (!nextServer) return null;
+    if (nextServer.id !== normalizedCurrent || (hasActiveShareTarget && !nextServer.isSharedIn)) {
+      return nextServer.name || nextServer.id;
+    }
+    return null;
+  };
+
+  const resolveSessionDirection = (step: -1 | 1): string | null => {
+    if (!selectedServerId || manualDashboard || tabs.length < 2) return null;
+    const normalizedActive = activeSession ?? null;
+    const nextName = cycleOrderedId(
+      tabs.map((session) => session.name),
+      normalizedActive,
+      step,
+    );
+    if (!nextName || nextName === normalizedActive) return null;
+    const nextSession = tabs.find((session) => session.name === nextName);
+    return nextSession
+      ? (nextSession.label || nextSession.project || nextSession.name)
+      : nextName;
+  };
+
+  return {
+    up: resolveServerDirection(-1),
+    down: resolveServerDirection(1),
+    left: resolveSessionDirection(-1),
+    right: resolveSessionDirection(1),
+  };
+}
+
 export interface MobileSwipeHudProps {
   progress: MobileNavigationGestureProgress | null;
+  targets?: Partial<MobileSwipeTargets> | null;
 }
 
 interface DirectionDescriptor {
@@ -30,7 +111,7 @@ const DIRECTION_ITEMS: readonly DirectionDescriptor[] = [
 const RING_RADIUS = 20;
 const RING_CIRCUMFERENCE = 2 * Math.PI * RING_RADIUS;
 
-export function MobileSwipeHud({ progress }: MobileSwipeHudProps) {
+export function MobileSwipeHud({ progress, targets }: MobileSwipeHudProps) {
   const { t } = useTranslation();
 
   if (!progress) return null;
@@ -51,9 +132,17 @@ export function MobileSwipeHud({ progress }: MobileSwipeHudProps) {
       aria-hidden="true"
     >
       <div class={`mobile-swipe-hud-card is-${activeKind}${progress.armed ? ' is-armed' : ''}`}>
+        <span class="mobile-swipe-hud-corner is-tl" aria-hidden="true" />
+        <span class="mobile-swipe-hud-corner is-tr" aria-hidden="true" />
+        <span class="mobile-swipe-hud-corner is-bl" aria-hidden="true" />
+        <span class="mobile-swipe-hud-corner is-br" aria-hidden="true" />
+
         <div class="mobile-swipe-hud-header">
-          <span class="mobile-swipe-hud-title">
-            {t('mobile_gesture.hud.title', { defaultValue: '2-Finger Navigation' })}
+          <span class="mobile-swipe-hud-title-wrap">
+            <span class="mobile-swipe-hud-status-dot" aria-hidden="true" />
+            <span class="mobile-swipe-hud-title">
+              {t('mobile_gesture.hud.title', { defaultValue: '2-Finger Navigation' })}
+            </span>
           </span>
           <span class="mobile-swipe-hud-pct" data-testid="mobile-swipe-hud-progress">
             {pct}%
@@ -61,7 +150,13 @@ export function MobileSwipeHud({ progress }: MobileSwipeHudProps) {
         </div>
 
         <div class="mobile-swipe-hud-compass">
+          <div class="mobile-swipe-hud-reticle" aria-hidden="true">
+            <span class="mobile-swipe-hud-axis is-vertical" />
+            <span class="mobile-swipe-hud-axis is-horizontal" />
+          </div>
+
           <div class="mobile-swipe-hud-center">
+            <span class="mobile-swipe-hud-orbit" aria-hidden="true" />
             <svg class="mobile-swipe-hud-ring" viewBox="0 0 48 48" width="48" height="48">
               <circle
                 class="mobile-swipe-hud-ring-track"
@@ -84,18 +179,33 @@ export function MobileSwipeHud({ progress }: MobileSwipeHudProps) {
           {DIRECTION_ITEMS.map((item) => {
             const isActive = progress.direction === item.dir;
             const isArmed = isActive && progress.armed;
+            const hasTargetSlot = Boolean(targets && Object.prototype.hasOwnProperty.call(targets, item.dir));
+            const targetValue = hasTargetSlot ? (targets?.[item.dir] ?? null) : undefined;
+            const isUnavailable = hasTargetSlot && targetValue === null;
             return (
               <div
                 key={item.dir}
-                class={`mobile-swipe-hud-dir is-${item.dir} is-${item.kind}${isActive ? ' is-active' : ''}${isArmed ? ' is-armed' : ''}`}
+                class={`mobile-swipe-hud-dir is-${item.dir} is-${item.kind}${isActive ? ' is-active' : ''}${isArmed ? ' is-armed' : ''}${isUnavailable ? ' is-unavailable' : ''}`}
                 data-testid={`mobile-swipe-hud-dir-${item.dir}`}
                 data-active={isActive ? 'true' : 'false'}
                 data-armed={isArmed ? 'true' : 'false'}
+                data-available={hasTargetSlot ? (isUnavailable ? 'false' : 'true') : undefined}
               >
-                <span class="mobile-swipe-hud-dir-arrow">{item.arrow}</span>
-                <span class="mobile-swipe-hud-dir-label">
-                  {t(item.i18nKey, { defaultValue: item.fallback })}
-                </span>
+                <div class="mobile-swipe-hud-dir-head">
+                  <span class="mobile-swipe-hud-dir-arrow">{item.arrow}</span>
+                  <span class="mobile-swipe-hud-dir-label">
+                    {t(item.i18nKey, { defaultValue: item.fallback })}
+                  </span>
+                </div>
+                {hasTargetSlot && (
+                  <span
+                    class={`mobile-swipe-hud-dir-target${isUnavailable ? ' is-empty' : ''}`}
+                    data-testid={`mobile-swipe-hud-dir-target-${item.dir}`}
+                    data-available={isUnavailable ? 'false' : 'true'}
+                  >
+                    {targetValue ?? t('mobile_gesture.hud.no_target', { defaultValue: 'No other target' })}
+                  </span>
+                )}
               </div>
             );
           })}

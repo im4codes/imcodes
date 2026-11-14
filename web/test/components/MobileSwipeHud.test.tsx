@@ -20,7 +20,10 @@ vi.mock('react-i18next', async () => {
 
 import i18n from '../../src/i18n/index.js';
 import { SUPPORTED_LOCALES } from '../../src/i18n/locales/index.js';
-import { MobileSwipeHud } from '../../src/components/MobileSwipeHud.js';
+import {
+  MobileSwipeHud,
+  resolveMobileSwipeTargets,
+} from '../../src/components/MobileSwipeHud.js';
 import type { MobileNavigationGestureProgress } from '../../src/mobile-navigation-gestures.js';
 
 const WEB_ROOT = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
@@ -32,6 +35,7 @@ const HUD_KEYS = [
   'right',
   'drag_to_threshold',
   'release_to_switch',
+  'no_target',
 ] as const;
 
 describe('MobileSwipeHud', () => {
@@ -147,5 +151,146 @@ describe('MobileSwipeHud', () => {
       expect(screen.getByTestId('mobile-swipe-hud-hint').textContent).toBe(hudStrings!.release_to_switch as string);
       cleanup();
     }
+  });
+
+  it('renders resolved server and session target names and dims unavailable null directions', async () => {
+    await act(async () => {
+      await i18n.changeLanguage('en');
+    });
+
+    const progress: MobileNavigationGestureProgress = {
+      dx: 0,
+      dy: -60,
+      direction: 'up',
+      action: 'serverPrev',
+      distance: 60,
+      threshold: 56,
+      progress: 1,
+      armed: true,
+    };
+
+    const view = render(
+      <MobileSwipeHud
+        progress={progress}
+        targets={{
+          up: 'mini-2',
+          down: 'prod-eu-west',
+          left: 'cd',
+          right: 'clawd',
+        }}
+      />,
+    );
+
+    expect(screen.getByTestId('mobile-swipe-hud-dir-target-up').textContent).toBe('mini-2');
+    expect(screen.getByTestId('mobile-swipe-hud-dir-target-down').textContent).toBe('prod-eu-west');
+    expect(screen.getByTestId('mobile-swipe-hud-dir-target-left').textContent).toBe('cd');
+    expect(screen.getByTestId('mobile-swipe-hud-dir-target-right').textContent).toBe('clawd');
+    expect(screen.getByTestId('mobile-swipe-hud-dir-up').getAttribute('data-available')).toBe('true');
+
+    // Unavailable dimension renders localized placeholder + unavailable state
+    view.rerender(
+      <MobileSwipeHud
+        progress={progress}
+        targets={{
+          up: 'mini-2',
+          down: 'prod-eu-west',
+          left: null,
+          right: null,
+        }}
+      />,
+    );
+
+    expect(screen.getByTestId('mobile-swipe-hud-dir-left').className).toContain('is-unavailable');
+    expect(screen.getByTestId('mobile-swipe-hud-dir-left').getAttribute('data-available')).toBe('false');
+    expect(screen.getByTestId('mobile-swipe-hud-dir-target-left').textContent).toBe('No other target');
+    expect(screen.getByTestId('mobile-swipe-hud-dir-target-right').textContent).toBe('No other target');
+  });
+});
+
+describe('resolveMobileSwipeTargets', () => {
+  const servers = [
+    { id: 'srv-1', name: 'mini-1' },
+    { id: 'srv-2', name: 'mini-2' },
+    { id: 'srv-3', name: '' },
+  ];
+  const tabs = [
+    { name: 'deck_cd_brain', label: 'cd', project: 'codedeck' },
+    { name: 'deck_clawd_brain', label: null, project: 'clawd' },
+    { name: 'deck_raw_brain', label: null, project: null },
+  ];
+
+  it('cycles servers and sessions matching app navigation rules and naming fallbacks', () => {
+    expect(
+      resolveMobileSwipeTargets({
+        servers,
+        currentServerId: 'srv-2',
+        tabs,
+        activeSession: 'deck_cd_brain',
+        selectedServerId: 'srv-2',
+        manualDashboard: false,
+      }),
+    ).toEqual({
+      up: 'mini-1',
+      down: 'srv-3', // falls back to srv.id when name is empty
+      left: 'deck_raw_brain', // wraps around and falls back to session.name
+      right: 'clawd', // falls back to session.project
+    });
+  });
+
+  it('handles shared-in server selection and wraps to owned server with same id if share target active', () => {
+    expect(
+      resolveMobileSwipeTargets({
+        servers: [
+          { id: 'srv-1', name: 'Owned Host', isSharedIn: false },
+          { id: 'srv-1', name: 'Shared Entry', isSharedIn: true },
+        ],
+        currentServerId: 'srv-1',
+        hasActiveShareTarget: true,
+        tabs,
+        activeSession: 'deck_cd_brain',
+        selectedServerId: 'srv-1',
+        manualDashboard: false,
+      }),
+    ).toEqual({
+      up: 'Owned Host',
+      down: 'Owned Host',
+      left: 'deck_raw_brain',
+      right: 'clawd',
+    });
+  });
+
+  it('returns null for single server, single session, missing server, and manualDashboard mode', () => {
+    expect(
+      resolveMobileSwipeTargets({
+        servers: [{ id: 'srv-1', name: 'only-host' }],
+        currentServerId: 'srv-1',
+        tabs: [{ name: 'deck_one', label: 'one' }],
+        activeSession: 'deck_one',
+        selectedServerId: 'srv-1',
+        manualDashboard: false,
+      }),
+    ).toEqual({
+      up: null,
+      down: null,
+      left: null,
+      right: null,
+    });
+
+    // Manual dashboard: servers remain switchable while sessions are blocked
+    expect(
+      resolveMobileSwipeTargets({
+        servers,
+        currentServerId: null,
+        tabs,
+        activeSession: 'deck_cd_brain',
+        selectedServerId: null,
+        manualDashboard: true,
+      }),
+    ).toEqual({
+      up: 'srv-3',
+      down: 'mini-1',
+      left: null,
+      right: null,
+    });
   });
 });
