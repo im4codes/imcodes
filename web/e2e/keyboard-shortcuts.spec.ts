@@ -112,53 +112,80 @@ async function openDesktopApp(page: Page, platform: 'MacIntel' | 'Linux x86_64')
   return { errors };
 }
 
-test('macOS defaults use Ctrl+w/s/a/d for servers & tabs, work in composer & sidebar, and respect overrides', async ({ page }) => {
+/**
+ * Wait for a server switch to finish WS/session hydration into transport chat mode so
+ * global navigation shortcuts are no longer blocked by the pre-hydration terminal fallback.
+ */
+async function expectActiveServerAndTabReady(page: Page, serverName: string, tabLabel: string) {
+  await expect(page.locator('.server-icon-server.server-icon-active')).toContainText(serverName);
+  await expect(page.locator('.tab.active')).toContainText(tabLabel);
+  await expect(page.locator('.tab.active .tab-ws-dot')).toHaveAttribute('title', /ms$/, { timeout: 15_000 });
+  await expect(page.locator('.controls-input').first()).toBeVisible();
+}
+
+test('macOS defaults use Alt+i/k/j/l for servers & tabs without intercepting Ctrl+w/s/a/d, work in composer & sidebar, and respect overrides', async ({ page }) => {
   const { errors } = await openDesktopApp(page, 'MacIntel');
 
-  // Verify macOS Settings keycaps render Ctrl+A/D for tabs and Ctrl+W/S for servers
+  // Verify macOS Settings keycaps render ⌥+J/L for tabs and ⌥+I/K for servers
   await page.locator('button.server-icon[title="Settings"]').click();
   await page.locator('#settings-tab-shortcuts').click();
-  await expect(page.getByTestId('shortcut-record-tabPrev')).toContainText('⌃');
-  await expect(page.getByTestId('shortcut-record-tabPrev')).toContainText('A');
-  await expect(page.getByTestId('shortcut-record-tabNext')).toContainText('⌃');
-  await expect(page.getByTestId('shortcut-record-tabNext')).toContainText('D');
-  await expect(page.getByTestId('shortcut-record-serverPrev')).toContainText('⌃');
-  await expect(page.getByTestId('shortcut-record-serverPrev')).toContainText('W');
-  await expect(page.getByTestId('shortcut-record-serverNext')).toContainText('⌃');
-  await expect(page.getByTestId('shortcut-record-serverNext')).toContainText('S');
+  await expect(page.getByTestId('shortcut-record-tabPrev')).toContainText('⌥');
+  await expect(page.getByTestId('shortcut-record-tabPrev')).toContainText('J');
+  await expect(page.getByTestId('shortcut-record-tabNext')).toContainText('⌥');
+  await expect(page.getByTestId('shortcut-record-tabNext')).toContainText('L');
+  await expect(page.getByTestId('shortcut-record-serverPrev')).toContainText('⌥');
+  await expect(page.getByTestId('shortcut-record-serverPrev')).toContainText('I');
+  await expect(page.getByTestId('shortcut-record-serverNext')).toContainText('⌥');
+  await expect(page.getByTestId('shortcut-record-serverNext')).toContainText('K');
 
   // Settings overlay blocks tab switching shortcuts
-  await page.keyboard.press('Control+d');
+  await page.keyboard.press('Alt+l');
   await page.locator('.settings-back-btn').click();
   await expect(page.locator('.tab.active')).toContainText('Gamma Tab');
 
-  // Visual order is Gamma (pinned), Beta (tab_order[0]), Alpha (tab_order[1])
-  // Inside composer (.controls-input): Ctrl+d switches Gamma -> Beta -> Alpha
+  // Inside composer (.controls-input): Ctrl+w/s/a/d MUST NOT be intercepted (preserves macOS Ctrl+A/D/W/S bindings)
   const composer = page.locator('.controls-input').first();
   await composer.click();
-  await page.keyboard.press('Control+d');
+  const ctrlIntercepted = await composer.evaluate((el) => {
+    const prevented: string[] = [];
+    for (const [key, code] of [
+      ['w', 'KeyW'],
+      ['s', 'KeyS'],
+      ['a', 'KeyA'],
+      ['d', 'KeyD'],
+    ] as const) {
+      const evt = new KeyboardEvent('keydown', { key, code, ctrlKey: true, bubbles: true, cancelable: true });
+      el.dispatchEvent(evt);
+      if (evt.defaultPrevented) prevented.push(key);
+    }
+    return prevented;
+  });
+  expect(ctrlIntercepted).toEqual([]);
+  await expect(page.locator('.tab.active')).toContainText('Gamma Tab');
+
+  // Visual order is Gamma (pinned), Beta (tab_order[0]), Alpha (tab_order[1])
+  // Inside composer (.controls-input): Alt+l switches Gamma -> Beta -> Alpha
+  await page.keyboard.press('Alt+l');
   await expect(page.locator('.tab.active')).toContainText('Beta Tab');
-  await page.keyboard.press('Control+d');
+  await page.keyboard.press('Alt+l');
   await expect(page.locator('.tab.active')).toContainText('Alpha Tab');
 
-  // Legacy Meta+ArrowLeft does NOT trigger tab switch under unified WASD defaults
+  // Legacy Meta+ArrowLeft does NOT trigger tab switch under unified Alt+IKJL defaults
   await page.keyboard.press('Meta+ArrowLeft');
   await expect(page.locator('.tab.active')).toContainText('Alpha Tab');
 
-  // With non-editable sidebar control focused: Ctrl+a switches Alpha -> Beta -> Gamma
+  // With non-editable sidebar control focused: Alt+j switches Alpha -> Beta -> Gamma
   await page.locator('.sidebar-toggle-icon').first().focus();
-  await page.keyboard.press('Control+a');
+  await page.keyboard.press('Alt+j');
   await expect(page.locator('.tab.active')).toContainText('Beta Tab');
-  await page.keyboard.press('Control+a');
+  await page.keyboard.press('Alt+j');
   await expect(page.locator('.tab.active')).toContainText('Gamma Tab');
 
-  // Server switching uses Ctrl+s / Ctrl+w
-  await page.keyboard.press('Control+s');
-  await expect(page.locator('.server-icon-server.server-icon-active')).toContainText('Beta Server');
-  await expect(page.locator('.tab.active')).toContainText('Second Server Tab');
-  await page.keyboard.press('Control+w');
-  await expect(page.locator('.server-icon-server.server-icon-active')).toContainText('Alpha Server');
-  await expect(page.locator('.tab.active')).toContainText('Gamma Tab');
+  // Server switching uses Alt+k / Alt+i
+  await page.keyboard.press('Alt+k');
+  await expectActiveServerAndTabReady(page, 'Beta Server', 'Second Server Tab');
+  await page.keyboard.press('Alt+i');
+  await expectActiveServerAndTabReady(page, 'Alpha Server', 'Gamma Tab');
 
   // Explicitly overriding tabNext to Meta+ArrowRight applies immediately
   await page.locator('button.server-icon[title="Settings"]').click();
@@ -199,9 +226,8 @@ test('non-macOS defaults use Alt+i/k/j/l and do not intercept Ctrl+w/s/a/d', asy
   await expect(page.locator('.tab.active')).toContainText('Gamma Tab');
 
   await page.keyboard.press('Alt+k');
-  await expect(page.locator('.server-icon-server.server-icon-active')).toContainText('Beta Server');
-  await expect(page.locator('.tab.active')).toContainText('Second Server Tab');
+  await expectActiveServerAndTabReady(page, 'Beta Server', 'Second Server Tab');
   await page.keyboard.press('Alt+i');
-  await expect(page.locator('.server-icon-server.server-icon-active')).toContainText('Alpha Server');
+  await expectActiveServerAndTabReady(page, 'Alpha Server', 'Gamma Tab');
   expect(errors).toEqual([]);
 });
