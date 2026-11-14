@@ -419,5 +419,6 @@ describe('db queries contracts', () => {
     });
     expect(upsertParams?.[3]).toBe(3);
     expect(upsertParams?.[4]).toBe(queries.SESSION_TEXT_TAIL_CACHE_LIMIT);
+    expect(upsertParams?.[5]).toBe(queries.SESSION_TEXT_TAIL_TEXT_MAX_CHARS);
   });
 });

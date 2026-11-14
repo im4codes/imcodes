@@ -809,6 +809,9 @@ export async function updateSession(
   );
 }
 
+const SESSION_TEXT_TAIL_PG_TRIM_CHARS =
+  "E' \\t\\n\\v\\f\\r\\u00a0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff'";
+
 export async function upsertSessionTextTailCacheEvent(
   db: Database,
   serverId: string,
@@ -823,43 +826,92 @@ export async function upsertSessionTextTailCacheEvent(
      ON CONFLICT (server_id, session_name)
      DO UPDATE SET (events, latest_ts, updated_at) = (
        SELECT
-         COALESCE(jsonb_agg(t.item ORDER BY t.ts ASC, t.event_id COLLATE "C" ASC), '[]'::jsonb),
-         MAX(t.ts),
+         COALESCE(
+           jsonb_agg(
+             t.item
+             ORDER BY t.ts ASC, t.event_id COLLATE "und-x-icu" ASC, t.first_ord ASC
+           ),
+           '[]'::jsonb
+         ),
+         TRUNC(MAX(t.ts))::bigint,
          NOW()
        FROM (
          SELECT
-           combined.elem AS item,
-           (combined.elem->>'ts')::bigint AS ts,
-           (combined.elem->>'eventId') AS event_id
+           deduped.item,
+           deduped.ts,
+           deduped.event_id,
+           deduped.first_ord
          FROM (
-           SELECT elem
-           FROM jsonb_array_elements(
-             CASE
-               WHEN jsonb_typeof(session_text_tail_cache.events) = 'array'
-                AND NOT EXISTS (
-                  SELECT 1
-                  FROM jsonb_array_elements(session_text_tail_cache.events) AS chk
-                  WHERE jsonb_typeof(chk) <> 'object'
-                     OR jsonb_typeof(chk->'eventId') <> 'string'
-                     OR jsonb_typeof(chk->'ts') <> 'number'
-                     OR NOT ((chk->>'ts') ~ '^-?[0-9]+$')
-                     OR (chk->>'type') NOT IN ('user.message', 'assistant.text')
-                     OR jsonb_typeof(chk->'text') <> 'string'
-                     OR btrim(chk->>'text') = ''
-                )
-               THEN session_text_tail_cache.events
-               ELSE '[]'::jsonb
-             END
-           ) AS elem
-           WHERE (elem->>'eventId') <> ($3::jsonb->>'eventId')
-           UNION ALL
-           SELECT $3::jsonb AS elem
-         ) AS combined
-         ORDER BY (combined.elem->>'ts')::bigint DESC, (combined.elem->>'eventId') COLLATE "C" DESC
+           SELECT
+             all_rows.item,
+             all_rows.ts,
+             all_rows.event_id,
+             MIN(all_rows.ord) OVER (PARTITION BY all_rows.event_id) AS first_ord,
+             ROW_NUMBER() OVER (PARTITION BY all_rows.event_id ORDER BY all_rows.ord DESC) AS rn
+           FROM (
+             SELECT
+               jsonb_strip_nulls(
+                 jsonb_build_object(
+                   'eventId', e.elem->>'eventId',
+                   'ts', e.elem->'ts',
+                   'type', e.elem->>'type',
+                   'text', left(btrim(e.elem->>'text', ${SESSION_TEXT_TAIL_PG_TRIM_CHARS}), $6),
+                   'source', CASE
+                     WHEN jsonb_typeof(e.elem->'source') IS NOT DISTINCT FROM 'string'
+                      AND btrim(e.elem->>'source', ${SESSION_TEXT_TAIL_PG_TRIM_CHARS}) <> ''
+                     THEN btrim(e.elem->>'source', ${SESSION_TEXT_TAIL_PG_TRIM_CHARS})
+                     ELSE NULL
+                   END,
+                   'confidence', CASE
+                     WHEN jsonb_typeof(e.elem->'confidence') IS NOT DISTINCT FROM 'string'
+                      AND btrim(e.elem->>'confidence', ${SESSION_TEXT_TAIL_PG_TRIM_CHARS}) <> ''
+                     THEN btrim(e.elem->>'confidence', ${SESSION_TEXT_TAIL_PG_TRIM_CHARS})
+                     ELSE NULL
+                   END
+                 )
+               ) AS item,
+               (e.elem->>'ts')::numeric AS ts,
+               e.elem->>'eventId' AS event_id,
+               e.ord::bigint AS ord
+             FROM jsonb_array_elements(
+               CASE
+                 WHEN jsonb_typeof(session_text_tail_cache.events) IS NOT DISTINCT FROM 'array'
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM jsonb_array_elements(session_text_tail_cache.events) AS chk
+                    WHERE jsonb_typeof(chk) IS DISTINCT FROM 'object'
+                       OR jsonb_typeof(chk->'eventId') IS DISTINCT FROM 'string'
+                       OR jsonb_typeof(chk->'ts') IS DISTINCT FROM 'number'
+                       OR jsonb_typeof(chk->'type') IS DISTINCT FROM 'string'
+                       OR NOT COALESCE((chk->>'type') IN ('user.message', 'assistant.text'), FALSE)
+                       OR jsonb_typeof(chk->'text') IS DISTINCT FROM 'string'
+                       OR COALESCE(btrim(chk->>'text', ${SESSION_TEXT_TAIL_PG_TRIM_CHARS}) = '', TRUE)
+                  )
+                 THEN session_text_tail_cache.events
+                 ELSE '[]'::jsonb
+               END
+             ) WITH ORDINALITY AS e(elem, ord)
+             UNION ALL
+             SELECT
+               $3::jsonb AS item,
+               ($3::jsonb->>'ts')::numeric AS ts,
+               $3::jsonb->>'eventId' AS event_id,
+               9223372036854775807::bigint AS ord
+           ) AS all_rows
+         ) AS deduped
+         WHERE deduped.rn = 1
+         ORDER BY deduped.ts DESC, deduped.event_id COLLATE "und-x-icu" DESC, deduped.first_ord DESC
          LIMIT $5
        ) AS t
      )`,
-    [serverId, classified.sessionName, serializedItem, classified.item.ts, SESSION_TEXT_TAIL_CACHE_LIMIT],
+    [
+      serverId,
+      classified.sessionName,
+      serializedItem,
+      classified.item.ts,
+      SESSION_TEXT_TAIL_CACHE_LIMIT,
+      SESSION_TEXT_TAIL_TEXT_MAX_CHARS,
+    ],
   );
 }
 

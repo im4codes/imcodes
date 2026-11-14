@@ -56,6 +56,8 @@ import {
   getSessionTextTailCache,
   upsertSessionTextTailCacheEvent,
   SESSION_TEXT_TAIL_CACHE_LIMIT,
+  SESSION_TEXT_TAIL_TEXT_MAX_CHARS,
+  type SessionTextTailCacheItem,
   upsertOrchestrationRun,
   getOrchestrationRunById,
   getActiveOrchestrationRuns,
@@ -461,6 +463,201 @@ describe('session_text_tail_cache', () => {
       [serverId, concurrentSession],
     );
     expect(row?.latest_ts).toBe(1003);
+  });
+
+  it('matches legacy JS parse+Map+localeCompare+slice merge semantics across differential counterexamples and bounds', async () => {
+    const legacyParse = (raw: unknown): SessionTextTailCacheItem[] => {
+      if (!Array.isArray(raw)) return [];
+      const items: SessionTextTailCacheItem[] = [];
+      for (const entry of raw) {
+        if (!entry || typeof entry !== 'object') return [];
+        const r = entry as Record<string, unknown>;
+        if (
+          typeof r.eventId !== 'string'
+          || typeof r.ts !== 'number'
+          || (r.type !== 'user.message' && r.type !== 'assistant.text')
+          || typeof r.text !== 'string'
+        ) {
+          return [];
+        }
+        const trimmed = r.text.trim();
+        if (!trimmed) return [];
+        const text = trimmed.length > SESSION_TEXT_TAIL_TEXT_MAX_CHARS
+          ? trimmed.slice(0, SESSION_TEXT_TAIL_TEXT_MAX_CHARS)
+          : trimmed;
+        const item: SessionTextTailCacheItem = { eventId: r.eventId, ts: r.ts, type: r.type, text };
+        if (typeof r.source === 'string' && r.source.trim()) item.source = r.source.trim();
+        if (typeof r.confidence === 'string' && r.confidence.trim()) item.confidence = r.confidence.trim();
+        items.push(item);
+      }
+      return items;
+    };
+
+    const legacyMerge = (rawExisting: unknown, rawIncoming: Record<string, unknown>): SessionTextTailCacheItem[] => {
+      const parsedExisting = legacyParse(rawExisting);
+      const classified = classifySessionTextTailEvent(rawIncoming)!;
+      const deduped = new Map<string, SessionTextTailCacheItem>();
+      for (const item of parsedExisting) deduped.set(item.eventId, item);
+      deduped.set(classified.item.eventId, classified.item);
+      const merged = [...deduped.values()].sort((a, b) => {
+        if (a.ts !== b.ts) return a.ts - b.ts;
+        return a.eventId.localeCompare(b.eventId);
+      });
+      return merged.length > SESSION_TEXT_TAIL_CACHE_LIMIT
+        ? merged.slice(merged.length - SESSION_TEXT_TAIL_CACHE_LIMIT)
+        : merged;
+    };
+
+    const cases: Array<{ name: string; existing: unknown; incoming: Omit<Record<string, unknown>, 'sessionId'> }> = [
+      {
+        name: 'same-ts mixed case and non-ASCII localeCompare ordering',
+        existing: [
+          { eventId: 'A', ts: 100, type: 'assistant.text', text: 'upper A' },
+          { eventId: 'a', ts: 100, type: 'assistant.text', text: 'lower a' },
+          { eventId: 'é', ts: 100, type: 'user.message', text: 'accent e' },
+          { eventId: 'e', ts: 100, type: 'user.message', text: 'plain e' },
+          { eventId: '中', ts: 100, type: 'assistant.text', text: 'cjk' },
+        ],
+        incoming: { eventId: 'z-new', ts: 200, type: 'assistant.text', payload: { text: 'incoming' } },
+      },
+      {
+        name: 'same-ts mixed case cutoff at 50-item limit',
+        existing: [
+          { eventId: 'a', ts: 100, type: 'user.message', text: 'lower-a-first-in-localeCompare' },
+          { eventId: 'A', ts: 100, type: 'user.message', text: 'upper-A-kept' },
+          ...Array.from({ length: 48 }, (_, i) => ({
+            eventId: `keep-${String(i).padStart(2, '0')}`,
+            ts: 200 + i,
+            type: 'assistant.text',
+            text: `msg-${i}`,
+          })),
+        ],
+        incoming: { eventId: 'z-cap', ts: 999, type: 'assistant.text', payload: { text: 'triggers cutoff' } },
+      },
+      {
+        name: 'duplicate eventIds already present inside existing array keep last existing then incoming',
+        existing: [
+          { eventId: 'dup', ts: 10, type: 'assistant.text', text: 'first' },
+          { eventId: 'other', ts: 20, type: 'user.message', text: 'middle' },
+          { eventId: 'dup', ts: 30, type: 'assistant.text', text: 'last' },
+        ],
+        incoming: { eventId: 'z-new', ts: 40, type: 'assistant.text', payload: { text: 'fresh' } },
+      },
+      {
+        name: 'duplicate existing eventIds overwritten by incoming',
+        existing: [
+          { eventId: 'dup', ts: 50, type: 'assistant.text', text: 'first' },
+          { eventId: 'dup', ts: 60, type: 'assistant.text', text: 'second' },
+        ],
+        incoming: { eventId: 'dup', ts: 25, type: 'assistant.text', payload: { text: 'incoming lower ts' } },
+      },
+      {
+        name: 'missing ts in existing array resets corrupt cache cleanly',
+        existing: [{ eventId: 'bad', type: 'assistant.text', text: 'bad old item' }],
+        incoming: { eventId: 'z-recover', ts: 500, type: 'assistant.text', payload: { text: 'recovered' } },
+      },
+      {
+        name: 'missing eventId / null type / non-object / float ts in existing resets corrupt cache cleanly',
+        existing: [
+          { eventId: 'ok', ts: 10, type: 'user.message', text: 'ok' },
+          { eventId: null, ts: 11, type: 'user.message', text: 'null id' },
+        ],
+        incoming: { eventId: 'z-recover-null', ts: 501, type: 'user.message', payload: { text: 'recovered' } },
+      },
+      {
+        name: 'float ts in existing element matches legacy number check and preserves item',
+        existing: [
+          { eventId: 'float-ts', ts: 12.5, type: 'assistant.text', text: 'float ts' },
+        ],
+        incoming: { eventId: 'z-after-float', ts: 502, type: 'assistant.text', payload: { text: 'recovered' } },
+      },
+      {
+        name: 'unknown type / wrong text type / string ts / non-object array element resets cache cleanly',
+        existing: [
+          { eventId: 'ok', ts: 10, type: 'user.message', text: 'ok' },
+          { eventId: 'bad-type', ts: 11, type: 'tool.call', text: 'bad type' },
+        ],
+        incoming: { eventId: 'z-recover-type', ts: 503, type: 'assistant.text', payload: { text: 'recovered' } },
+      },
+      {
+        name: 'wrong text type in existing resets cache cleanly',
+        existing: [
+          { eventId: 'bad-text', ts: 11, type: 'assistant.text', text: 123 },
+        ],
+        incoming: { eventId: 'z-recover-text-type', ts: 504, type: 'assistant.text', payload: { text: 'recovered' } },
+      },
+      {
+        name: 'string ts in existing resets cache cleanly',
+        existing: [
+          { eventId: 'bad-ts-str', ts: '11', type: 'assistant.text', text: 'string ts' },
+        ],
+        incoming: { eventId: 'z-recover-ts-str', ts: 505, type: 'assistant.text', payload: { text: 'recovered' } },
+      },
+      {
+        name: 'non-object array element in existing resets cache cleanly',
+        existing: [
+          { eventId: 'ok', ts: 10, type: 'user.message', text: 'ok' },
+          null,
+        ],
+        incoming: { eventId: 'z-recover-non-obj', ts: 506, type: 'assistant.text', payload: { text: 'recovered' } },
+      },
+      {
+        name: 'unicode whitespace-only existing item resets corrupt cache cleanly',
+        existing: [
+          { eventId: 'ws', ts: 10, type: 'assistant.text', text: '\t\n\u00a0\u3000\ufeff' },
+        ],
+        incoming: { eventId: 'z-recover-ws', ts: 503, type: 'assistant.text', payload: { text: 'recovered' } },
+      },
+      {
+        name: 'unicode whitespace trimming, 1024-char truncation, source/confidence normalization, extra field stripping',
+        existing: [
+          {
+            eventId: 'norm-1',
+            ts: 50,
+            type: 'assistant.text',
+            text: `\u00a0\t ${'x'.repeat(1100)} \u3000\n`,
+            source: '  daemon  ',
+            confidence: '   ',
+            extraNoise: 'drop-me',
+          },
+        ],
+        incoming: {
+          eventId: 'norm-2',
+          ts: 60,
+          type: 'user.message',
+          payload: { text: `\ufeff  ${'y'.repeat(1100)} \t` },
+          source: ' web ',
+          confidence: ' high ',
+        },
+      },
+    ];
+
+    for (let i = 0; i < cases.length; i++) {
+      const c = cases[i]!;
+      const diffSession = `${sessionName}-diff-${i}`;
+      await db.execute('DELETE FROM session_text_tail_cache WHERE server_id = $1 AND session_name = $2', [serverId, diffSession]);
+      await db.execute(
+        `INSERT INTO session_text_tail_cache (server_id, session_name, events, latest_ts, updated_at)
+         VALUES ($1, $2, $3::jsonb, $4, NOW())`,
+        [serverId, diffSession, JSON.stringify(c.existing), 1],
+      );
+
+      const fullIncoming = { ...c.incoming, sessionId: diffSession };
+      const expectedEvents = legacyMerge(c.existing, fullIncoming);
+      const expectedLatestTs = expectedEvents.at(-1)?.ts ?? null;
+
+      await upsertSessionTextTailCacheEvent(db, serverId, fullIncoming);
+
+      const actualEvents = await getSessionTextTailCache(db, serverId, diffSession);
+      const rawRow = await db.queryOne<{ events: unknown; latest_ts: number | null }>(
+        'SELECT events, latest_ts FROM session_text_tail_cache WHERE server_id = $1 AND session_name = $2',
+        [serverId, diffSession],
+      );
+
+      expect(actualEvents, `case=${c.name} getSessionTextTailCache`).toEqual(expectedEvents);
+      expect(rawRow?.events, `case=${c.name} stored jsonb`).toEqual(expectedEvents);
+      expect(rawRow?.latest_ts, `case=${c.name} latest_ts`).toBe(expectedLatestTs);
+    }
   });
 });
 
