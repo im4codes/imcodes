@@ -1599,6 +1599,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const voiceHoldTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const voiceHoldSlideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const voiceHoldStartTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const voiceHoldStartTimeoutOwnerRef = useRef<NonNullable<typeof voiceHoldTxRef.current> | null>(null);
   const voiceHoldRecognizingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const voiceHoldPointerRef = useRef<{
     id: number;
@@ -5528,11 +5529,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     setVoiceOpen(true);
   }, [hasVoiceNotepadDraft]);
 
-  const clearVoiceHoldStartTimeout = useCallback(() => {
+  const clearVoiceHoldStartTimeout = useCallback((expectedTx?: NonNullable<typeof voiceHoldTxRef.current>) => {
+    if (expectedTx && voiceHoldStartTimeoutOwnerRef.current !== expectedTx) {
+      return;
+    }
     if (voiceHoldStartTimeoutRef.current !== null) {
       clearTimeout(voiceHoldStartTimeoutRef.current);
       voiceHoldStartTimeoutRef.current = null;
     }
+    voiceHoldStartTimeoutOwnerRef.current = null;
   }, []);
 
   const clearVoiceHoldTimers = useCallback(() => {
@@ -5953,8 +5958,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
 
     const failTransaction = (errCode: string) => {
-      if (tx.settled || tx.error !== null) return;
-      clearVoiceHoldStartTimeout();
+      if (voiceHoldTxRef.current !== tx || tx.settled || tx.error !== null) return;
+      clearVoiceHoldStartTimeout(tx);
       tx.phase = 'failed';
       tx.error = errCode || 'permission_denied';
       if (mountedRef.current) {
@@ -5963,8 +5968,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       void finalizeVoiceHold(tx, 'failed');
     };
 
+    clearVoiceHoldStartTimeout();
+    voiceHoldStartTimeoutOwnerRef.current = tx;
     voiceHoldStartTimeoutRef.current = setTimeout(() => {
+      if (voiceHoldStartTimeoutOwnerRef.current !== tx) return;
       voiceHoldStartTimeoutRef.current = null;
+      voiceHoldStartTimeoutOwnerRef.current = null;
       if (
         voiceHoldTxRef.current === tx
         && tx.phase === 'starting'
@@ -5997,10 +6006,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
     tx.startPromise = VoiceInput.startListening(
       (partial) => {
-        if (tx.settled || tx.error !== null) return;
+        if (voiceHoldTxRef.current !== tx || tx.settled || tx.error !== null) return;
         tx.transcript = partial;
         if (tx.phase === 'starting' && partial.trim()) {
-          clearVoiceHoldStartTimeout();
+          clearVoiceHoldStartTimeout(tx);
           tx.didStartRecording = true;
           tx.phase = 'recording';
           if (mountedRef.current) {
@@ -6016,7 +6025,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         if (voiceHoldTxRef.current !== tx || tx.settled || tx.error !== null) return;
         if (listening) {
           if (tx.phase !== 'starting' && tx.phase !== 'recording') return;
-          clearVoiceHoldStartTimeout();
+          clearVoiceHoldStartTimeout(tx);
           tx.didStartRecording = true;
           tx.phase = 'recording';
           if (mountedRef.current) {
@@ -6050,22 +6059,28 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     ).then(
       (started) => {
         tx.startSettled = true;
+        if (voiceHoldTxRef.current !== tx || tx.settled) {
+          return false;
+        }
         if (!started || tx.error !== null) {
-          clearVoiceHoldStartTimeout();
+          clearVoiceHoldStartTimeout(tx);
           if (tx.drainPromise === null) {
             failTransaction(tx.error ?? 'permission_denied');
           }
           return false;
         }
         if (tx.didStartRecording && tx.phase === 'starting') {
-          clearVoiceHoldStartTimeout();
+          clearVoiceHoldStartTimeout(tx);
           tx.phase = 'recording';
         }
         return true;
       },
       (err) => {
         tx.startSettled = true;
-        clearVoiceHoldStartTimeout();
+        if (voiceHoldTxRef.current !== tx || tx.settled) {
+          return false;
+        }
+        clearVoiceHoldStartTimeout(tx);
         if (tx.drainPromise === null) {
           failTransaction(err instanceof Error ? err.message : 'permission_denied');
         }

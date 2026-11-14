@@ -1681,4 +1681,111 @@ describe('Web Mobile final drain', () => {
     }
   });
 
+  it('retired native start timeout never stops a newer session in either catch branch (F1)', async () => {
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
+    vi.useFakeTimers();
+    try {
+      // Subcase 1: primary recognition.start() hangs past abort drain, B starts, then A's 8s timeout fires (startErr catch)
+      const hungStartA = deferred<Record<string, never>>();
+      speechApi.start.mockReturnValueOnce(hungStartA.promise);
+      const errorsA: string[] = [];
+      const startA = VoiceInput.startListening(vi.fn(), vi.fn(), (e) => errorsA.push(e));
+      await vi.advanceTimersByTimeAsync(100);
+      expect(speechApi.start).toHaveBeenCalledTimes(1);
+
+      const abortA = VoiceInput.stopListening({ abort: true });
+      expect(speechApi.stop).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(VoiceInput.NATIVE_ABORT_DRAIN_MS);
+      await abortA;
+
+      const resultsB: Array<[string, boolean]> = [];
+      const listeningB: boolean[] = [];
+      const errorsB: string[] = [];
+      speechApi.start.mockResolvedValueOnce({});
+      const startedB = await VoiceInput.startListening(
+        (t, f) => resultsB.push([t, f]),
+        (v) => listeningB.push(v),
+        (e) => errorsB.push(e),
+      );
+      expect(startedB).toBe(true);
+      expect(VoiceInput.isListening()).toBe(true);
+      expect(speechApi.stop).toHaveBeenCalledTimes(1);
+
+      // Advance past A's 8s start timeout while B is actively recording
+      await vi.advanceTimersByTimeAsync(VoiceInput.NATIVE_START_TIMEOUT_MS + 100);
+      await expect(startA).resolves.toBe(false);
+      expect(speechApi.stop).toHaveBeenCalledTimes(1);
+      expect(VoiceInput.isListening()).toBe(true);
+      expect(errorsB).toEqual([]);
+      expect(listeningB).not.toContain(false);
+
+      // B completes cleanly
+      await VoiceInput.stopListening();
+      expect(speechApi.stop).toHaveBeenCalledTimes(2);
+
+      // Subcase 2: requestPermissions() hangs past abort drain, B starts, then A's 5s permission timeout fires (outer catch)
+      await VoiceInput.stopListening({ abort: true });
+      speechApi.stop.mockClear();
+      const hungPermsA = deferred<{ speechRecognition: string }>();
+      speechApi.requestPermissions.mockReturnValueOnce(hungPermsA.promise);
+      const startA2 = VoiceInput.startListening(vi.fn(), vi.fn(), vi.fn());
+      await vi.advanceTimersByTimeAsync(50);
+
+      const abortA2 = VoiceInput.stopListening({ abort: true });
+      await vi.advanceTimersByTimeAsync(VoiceInput.NATIVE_ABORT_DRAIN_MS);
+      await abortA2;
+      const stopCountBeforeB2 = speechApi.stop.mock.calls.length;
+
+      speechApi.requestPermissions.mockResolvedValueOnce({ speechRecognition: 'granted' });
+      speechApi.start.mockResolvedValueOnce({});
+      await expect(VoiceInput.startListening(vi.fn(), vi.fn(), vi.fn())).resolves.toBe(true);
+      expect(VoiceInput.isListening()).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(VoiceInput.NATIVE_PERMISSION_TIMEOUT_MS + 100);
+      await expect(startA2).resolves.toBe(false);
+      expect(speechApi.stop).toHaveBeenCalledTimes(stopCountBeforeB2);
+      expect(VoiceInput.isListening()).toBe(true);
+    } finally {
+      await VoiceInput.stopListening({ abort: true });
+      vi.useRealTimers();
+    }
+  });
+
+  it('cleans up late-resolving native addListener handle after registration timeout (F2)', async () => {
+    vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
+    vi.useFakeTimers();
+    try {
+      const delayedListener = deferred<{ remove: ReturnType<typeof vi.fn> }>();
+      const lateRemoveSpy = vi.fn(async () => undefined);
+      const earlyRemoveSpies: Array<ReturnType<typeof vi.fn>> = [];
+      speechApi.addListener.mockImplementation(async (eventName: string) => {
+        if (eventName === 'listeningState') {
+          return delayedListener.promise;
+        }
+        const remove = vi.fn(async () => undefined);
+        earlyRemoveSpies.push(remove);
+        return { remove };
+      });
+
+      const errors: string[] = [];
+      const startPromise = VoiceInput.startListening(vi.fn(), vi.fn(), (e) => errors.push(e));
+      await vi.advanceTimersByTimeAsync(VoiceInput.NATIVE_PREWARM_CALL_TIMEOUT_MS + 50);
+
+      await expect(startPromise).resolves.toBe(false);
+      expect(errors).toEqual(['Speech listener registration timed out']);
+      for (const remove of earlyRemoveSpies) {
+        expect(remove).toHaveBeenCalledTimes(1);
+      }
+      expect(lateRemoveSpy).not.toHaveBeenCalled();
+
+      // Plugin finally resolves addListener well after timeout expired -> handle must be removed immediately
+      delayedListener.resolve({ remove: lateRemoveSpy });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(lateRemoveSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      await VoiceInput.stopListening({ abort: true });
+      vi.useRealTimers();
+    }
+  });
+
 });

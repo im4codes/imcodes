@@ -221,9 +221,39 @@ function emitOwnerResult(owner: CaptureOwner | null, text: string, isFinal: bool
   owner!.onResult?.(text, isFinal);
 }
 
+const _stoppedSessionRecognitions = new WeakMap<NativeSession, WeakSet<NativeSpeechRecognition>>();
+
+function canSessionStopRecognition(
+  session: NativeSession,
+  targetRecognition: NativeSpeechRecognition,
+): boolean {
+  if (session.generation !== _generation) return false;
+  if (session.retired || session.aborted || session.stopStarted || session.owner.retired) return false;
+  if (_nativeSession !== session) return false;
+  if (_pendingStop) return false;
+  if (_pendingStart && _pendingStart.session !== session) return false;
+  if (_stoppedSessionRecognitions.get(session)?.has(targetRecognition)) return false;
+  return true;
+}
+
+/** Stop the shared native plugin at most once per timed-out recognizer while this session still owns hardware. */
+function stopRecognitionOnceIfOwned(
+  session: NativeSession,
+  targetRecognition: NativeSpeechRecognition,
+): void {
+  if (!canSessionStopRecognition(session, targetRecognition)) return;
+  let stopped = _stoppedSessionRecognitions.get(session);
+  if (!stopped) {
+    stopped = new WeakSet<NativeSpeechRecognition>();
+    _stoppedSessionRecognitions.set(session, stopped);
+  }
+  stopped.add(targetRecognition);
+  void Promise.resolve(targetRecognition.stop()).catch(() => {});
+}
+
 function reportOwnerError(owner: CaptureOwner | null, error: string): void {
-  _prewarmCache = null;
   if (!isOwnerCurrent(owner)) return;
+  _prewarmCache = null;
   _lastError = error;
   (owner!.onError ?? _onError)?.(error);
 }
@@ -337,13 +367,28 @@ async function attachSessionListeners(
   try {
     const outcomes = await Promise.all(
       registrations.map(async ([eventName, handler]) => {
+        let abandoned = false;
+        const registrationPromise = Promise.resolve(recognition.addListener(eventName, handler)).then(
+          async (handle) => {
+            if (abandoned || aborted || !isSessionLive() || generation !== _generation) {
+              await removeHandle(handle);
+              return null;
+            }
+            return handle;
+          },
+        );
         const handle = await withTimeout(
-          recognition.addListener(eventName, handler),
+          registrationPromise,
           NATIVE_PREWARM_CALL_TIMEOUT_MS,
           'Speech listener registration timed out',
-        );
-        if (!isSessionLive() || generation !== _generation) {
-          await removeHandle(handle);
+        ).catch((err) => {
+          abandoned = true;
+          throw err;
+        });
+        if (!handle || !isSessionLive() || generation !== _generation) {
+          if (handle) {
+            await removeHandle(handle);
+          }
           return false;
         }
         session.handles.push(handle);
@@ -650,11 +695,16 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
         'Speech recognition timed out',
       );
     } catch (startErr) {
+      if (!isSessionStarting()) {
+        session.retired = true;
+        await cleanupSessionListeners(session);
+        if (_nativeSession === session) _nativeSession = null;
+        return false;
+      }
       _prewarmCache = null;
       if (startErr instanceof VoiceTimeoutError) {
-        void Promise.resolve(recognition.stop()).catch(() => {});
+        stopRecognitionOnceIfOwned(session, recognition);
       }
-      if (!isSessionStarting()) throw startErr;
       const startMsg = startErr instanceof Error ? startErr.message : String(startErr ?? '');
       if (!/permission|denied|not allowed/i.test(startMsg)) {
         const fallback = await resolveUsableFallbackRecognizer(recognition);
@@ -710,7 +760,7 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
   } catch (err) {
     console.warn('[voice] start failed:', err);
     if (err instanceof VoiceTimeoutError) {
-      void Promise.resolve(recognition.stop()).catch(() => {});
+      stopRecognitionOnceIfOwned(session, session.recognition);
     }
     if (isSessionStarting()) {
       const msg = err instanceof Error ? err.message : String(err ?? 'Failed to start speech recognition');

@@ -3221,4 +3221,83 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       text: 'hello mobile',
     }));
   });
+
+  it('retired cancelled hold startPromise false/reject cannot disarm next hold 10s starting watchdog (F1)', async () => {
+    vi.useFakeTimers();
+    try {
+      const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+      render(
+        <SessionControls
+          ws={ws}
+          activeSession={makeSession()}
+          quickData={makeQuickData()}
+          sessions={[]}
+          subSessions={[]}
+          serverId="srv-1"
+        />,
+      );
+      const input = document.querySelector('.controls-input') as HTMLElement;
+      const runScenario = async (
+        settleA: (resolve: (v: boolean) => void, reject: (err: unknown) => void) => void,
+        pointerBase: number,
+      ) => {
+        expect(input.getAttribute('contenteditable')).toBe('false');
+        // Hold A starts and leaves its startListening promise pending
+        let resolveA!: (v: boolean) => void;
+        let rejectA!: (err: unknown) => void;
+        const startPromiseA = new Promise<boolean>((resolve, reject) => {
+          resolveA = resolve;
+          rejectA = reject;
+        });
+        voiceMock.startListening.mockReturnValueOnce(startPromiseA);
+
+        dispatchPointer(input, 'pointerdown', 180, 500, pointerBase);
+        await vi.advanceTimersByTimeAsync(175);
+        expect(document.querySelector('.voice-hold-hud')?.getAttribute('data-phase')).toBe('starting');
+
+        // User slides left into cancel zone and releases pointer -> Hold A cancelled while startPromiseA is pending
+        dispatchPointer(input, 'pointermove', 30, 500, pointerBase);
+        await vi.advanceTimersByTimeAsync(0);
+        dispatchPointer(input, 'pointerup', 30, 500, pointerBase);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(voiceMock.stopListening).toHaveBeenCalledWith({ abort: true });
+        expect(document.querySelector('.voice-hold-hud')).toBeNull();
+
+        // Pre-recording cancel restores typing focus; blur back to unfocused voice-ready mode for Hold B
+        input.blur();
+        fireEvent.blur(input);
+        await vi.advanceTimersByTimeAsync(0);
+
+        // Hold B starts: startListening resolves true, but no listeningState/partial event arrives yet (stays 'starting')
+        expect(input.getAttribute('contenteditable')).toBe('false');
+        voiceMock.startListening.mockResolvedValueOnce(true);
+        dispatchPointer(input, 'pointerdown', 180, 500, pointerBase + 1);
+        await vi.advanceTimersByTimeAsync(175);
+        const hudB = document.querySelector('.voice-hold-hud') as HTMLElement;
+        expect(hudB?.getAttribute('data-phase')).toBe('starting');
+
+        // Stale Hold A startPromise now resolves false / rejects late
+        settleA(resolveA, rejectA);
+        await vi.advanceTimersByTimeAsync(0);
+
+        // Hold B must still be in 'starting' with its 10s watchdog intact (not failed by A, not disarmed!)
+        expect(document.querySelector('.voice-hold-hud')?.getAttribute('data-phase')).toBe('starting');
+        await vi.advanceTimersByTimeAsync(10_000);
+
+        // B's 10s watchdog MUST fire cleanly instead of hanging permanently on 'starting'
+        expect(document.querySelector('.voice-hold-hud')).toBeNull();
+        expect(document.querySelector('.voice-hold-error-banner')?.textContent).toBe('voice.error');
+
+        dispatchPointer(input, 'pointerup', 180, 500, pointerBase + 1);
+        input.blur();
+        fireEvent.blur(input);
+        await vi.advanceTimersByTimeAsync(0);
+      };
+
+      await runScenario((resolve) => resolve(false), 10);
+      await runScenario((_resolve, reject) => reject(new Error('late A reject')), 20);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
