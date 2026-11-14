@@ -329,11 +329,13 @@ describe('AG manager start ownership (real runtime, SQLite and SDK child)', () =
       projectDir: home, requestedModel: 'fixture-A', identityPrompt: 'fixture', fresh: true });
     const runtime = getTransportRuntime(name)!;
     runtime.send('fixture-hold', 'cancel-old');
+    await vi.waitFor(() => expect(readFileSync(path.join(home, 'inputs'), 'utf8')).toContain('fixture-hold'), { timeout: 5000 });
     await vi.waitFor(() => expect(store.getSession(name)?.providerResumeId).toBeTruthy(), { timeout: 5000 });
     const native = store.getSession(name)!.providerResumeId;
     await switchSessionModelNow(name, 'fixture-B');
     await runtime.cancel({ waitForProvider: true });
     runtime.send('after cancel', 'cancel-new');
+    await vi.waitFor(() => expect(readFileSync(path.join(home, 'inputs'), 'utf8')).toContain('after cancel'), { timeout: 5000 });
     await vi.waitFor(() => expect(runtime.sending).toBe(false), { timeout: 5000 });
     expect(store.getSession(name)).toMatchObject({ providerResumeId: native, requestedModel: 'fixture-B', activeModel: 'fixture-B' });
     expect(readFileSync(path.join(home, 'models'), 'utf8').trim().split('\n').map(s => JSON.parse(s))).toEqual(['fixture-A', 'fixture-B']);
