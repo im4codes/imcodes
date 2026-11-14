@@ -157,11 +157,13 @@ describe('styles.css regression contracts', () => {
   it('floats compact sub-session sequence badges at bottom-left without increasing card height', () => {
     expect(cssWithoutComments).not.toMatch(/\.subsession-card\.has-seq[^{]*\{[^}]*(?:min-height|padding)/);
     expect(cssWithoutComments).not.toMatch(/\.subsession-card-rail\.has-seq[^{]*\{[^}]*(?:min-height|padding)/);
+    const cardRule = cssWithoutComments.match(/\.subsession-card\s*\{[^}]*\}/)?.[0];
+    expect(cardRule).toMatch(/overflow:\s*visible/);
     const seqRule = cssWithoutComments.match(/\.subsession-card-seq\s*\{[^}]*\}/)?.[0];
     expect(seqRule).toBeTruthy();
     expect(seqRule).toMatch(/position:\s*absolute/);
-    expect(seqRule).toMatch(/bottom:\s*2px/);
-    expect(seqRule).toMatch(/left:\s*3px/);
+    expect(seqRule).toMatch(/bottom:\s*-4px/);
+    expect(seqRule).toMatch(/left:\s*-3px/);
     expect(seqRule).toMatch(/pointer-events:\s*none/);
   });
 
@@ -169,8 +171,8 @@ describe('styles.css regression contracts', () => {
     const teamRule = cssWithoutComments.match(/\.subsession-card-team\s*\{[^}]*\}/)?.[0];
     expect(teamRule).toBeTruthy();
     expect(teamRule).toMatch(/position:\s*absolute/);
-    expect(teamRule).toMatch(/bottom:\s*2px/);
-    expect(teamRule).toMatch(/right:\s*3px/);
+    expect(teamRule).toMatch(/bottom:\s*-4px/);
+    expect(teamRule).toMatch(/right:\s*-3px/);
     expect(teamRule).toMatch(/font-size:\s*9px/);
     expect(teamRule).toMatch(/font-weight:\s*700/);
     expect(teamRule).toMatch(/line-height:\s*1/);

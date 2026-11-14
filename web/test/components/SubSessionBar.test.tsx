@@ -2462,8 +2462,8 @@ describe('SubSessionBar', () => {
       const soloComputed = window.getComputedStyle(soloBtn);
       const teamBadgeComputed = window.getComputedStyle(teamBadge);
       expect(teamBadgeComputed.position).toBe('absolute');
-      expect(teamBadgeComputed.bottom).toBe('2px');
-      expect(teamBadgeComputed.right).toBe('3px');
+      expect(teamBadgeComputed.bottom).toBe('-4px');
+      expect(teamBadgeComputed.right).toBe('-3px');
       expect(teamComputed.minHeight).toBe('54px');
       expect(teamComputed.minHeight).toBe(soloComputed.minHeight);
       expect(teamComputed.paddingTop).toBe(soloComputed.paddingTop);
