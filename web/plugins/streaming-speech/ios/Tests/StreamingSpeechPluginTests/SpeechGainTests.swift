@@ -236,7 +236,7 @@ final class SpeechGainTests: XCTestCase {
         let lock = NSLock()
         var events: [SpeechCoordinator.Event] = []
         var readyCount = 0
-        var decodedSamplesCount = 0
+        var decodedSampleCounts: [Int] = []
 
         let coordinator = SpeechCoordinator(emitQueue: emitQueue) { event in
             lock.lock()
@@ -254,7 +254,7 @@ final class SpeechGainTests: XCTestCase {
                 SpeechCoordinator.Decoder(
                     decode: { samples, _, _ in
                         lock.lock()
-                        decodedSamplesCount += samples.count
+                        decodedSampleCounts.append(samples.count)
                         lock.unlock()
                         return ("hello", [1, 2])
                     },
@@ -282,12 +282,25 @@ final class SpeechGainTests: XCTestCase {
             now: 1.0,
             onOverloadTeardown: { XCTFail("Unexpected overload") }
         )
+        emitQueue.sync {}
+        coordinator.worker.sync {}
+        lock.lock()
+        let warmupAudioLevels = events.filter {
+            if case .audioLevel = $0 { return true }
+            return false
+        }.count
+        let warmupDecodedCount = decodedSampleCounts.count
+        lock.unlock()
+        XCTAssertEqual(warmupAudioLevels, 0, "Warmup samples must not emit audioLevel")
+        XCTAssertEqual(warmupDecodedCount, 0, "Warmup samples must not reach decoder")
+
         coordinator.offerSamples(
             sineWave(count: 400, rms: 0.05),
             owner: owner,
             now: 2.0,
             onOverloadTeardown: { XCTFail("Unexpected overload") }
         )
+        emitQueue.sync {}
 
         let stopAckExp = expectation(description: "stop completion resolved")
         coordinator.endCapture(
@@ -306,14 +319,13 @@ final class SpeechGainTests: XCTestCase {
             return false
         }.count
         let finalReadyCount = readyCount
-        let finalDecoded = decodedSamplesCount
+        let finalDecodedCounts = decodedSampleCounts
         lock.unlock()
 
         XCTAssertEqual(finalReadyCount, 1)
         XCTAssertEqual(startedCount, 1)
         XCTAssertEqual(audioLevelCount, 1, "Only post-warmup audio should emit audioLevel")
-        XCTAssertGreaterThan(finalDecoded, 0)
-        XCTAssertLessThanOrEqual(finalDecoded, 400, "Warmup samples must remain discarded before decoding")
+        XCTAssertEqual(finalDecodedCounts, [400 + SpeechWindow.finalSilencePadding], "Only post-warmup samples + finalSilencePadding should reach decoder")
     }
 
     func testRequestRecordPermissionRunsOffMainOnAudioQueueAndResolvesOnMain() {
