@@ -32,7 +32,7 @@ import type { RepoProvider } from '../repo/provider.js';
 import type { RepoActionDetail, RepoContext, RepoIssue, RepoPR, RepoWorkflowRun } from '../repo/types.js';
 import { listSessions, type SessionRecord } from '../store/session-store.js';
 import logger from '../util/logger.js';
-import { getCallbackTaskStore, type CallbackTaskStore } from './callback-task-store.js';
+import { getCallbackTaskStore, type CallbackPendingSeqEntry, type CallbackTaskStore } from './callback-task-store.js';
 import type { ServerLink } from './server-link.js';
 import { dispatchSessionMessage } from './session-dispatch.js';
 import { projectBrainSession } from './task-pairs/engine.js';
@@ -40,6 +40,30 @@ import { projectBrainSession } from './task-pairs/engine.js';
 const DEFAULT_CONFIG_SYNC_INTERVAL_MS = 120_000;
 const DEFAULT_POLL_TICK_MS = 15_000;
 const FETCH_TIMEOUT_MS = 15_000;
+export const REPO_CALLBACK_DEFAULT_PER_PAGE = 30;
+export const REPO_CALLBACK_DEFAULT_MAX_PAGES_PER_POLL = 5;
+export const REPO_CALLBACK_DEFAULT_MAX_BASELINE_PAGES = 100;
+export const REPO_CALLBACK_MAX_DETAIL_FETCHES_PER_POLL = 10;
+const PENDING_RUN_TTL_MS = 24 * 60 * 60 * 1000;
+const MAX_TRACKED_PENDING_RUNS = 50;
+
+const FAILED_CI_CONCLUSIONS = new Set([
+  'failure',
+  'failed',
+  'timed_out',
+  'startup_failure',
+]);
+
+const PENDING_CI_CONCLUSIONS = new Set([
+  'queued',
+  'in_progress',
+  'running',
+  'pending',
+  'waiting_for_resource',
+  'preparing',
+  'created',
+  'scheduled',
+]);
 
 interface DetectedEventCandidate {
   eventType: RepoCallbackEventType;
@@ -56,6 +80,15 @@ interface DetectedEventCandidate {
   metadata: Record<string, unknown>;
 }
 
+interface PollPageItem {
+  seq: number;
+  pending: boolean;
+  runAttempt?: number;
+  createdAtMs?: number;
+  dedupKey: string;
+  candidate?: DetectedEventCandidate;
+}
+
 export interface RepoCallbackMonitorDeps {
   store?: CallbackTaskStore;
   getServerLink?: () => ServerLink | null;
@@ -68,6 +101,10 @@ export interface RepoCallbackMonitorDeps {
   now?: () => number;
   configSyncIntervalMs?: number;
   pollTickMs?: number;
+  perPage?: number;
+  maxPagesPerPoll?: number;
+  maxBaselinePages?: number;
+  maxDetailFetchesPerPoll?: number;
 }
 
 function defaultCreateProvider(ctx: RepoContext, projectDir: string): RepoProvider | null {
@@ -90,10 +127,49 @@ async function defaultSendToSession(sessionName: string, text: string, resolvedR
   });
 }
 
+/**
+ * Classify CI workflow run, job, or step outcomes.
+ * Prefer explicit raw `conclusion` whenever present because normalized provider statuses
+ * (e.g. GitHubProvider) map non-success/non-cancelled outcomes like `skipped` or `neutral`
+ * to `status='failure'`. Fall back to `status === 'failure'` only when no conclusion exists.
+ */
+export function isFailedCiOutcome(status: string, conclusion?: string | null): boolean {
+  const rawConclusion = typeof conclusion === 'string' ? conclusion.trim().toLowerCase() : '';
+  if (rawConclusion) {
+    return FAILED_CI_CONCLUSIONS.has(rawConclusion);
+  }
+  return status.trim().toLowerCase() === 'failure';
+}
+
+function isPendingWorkflowRun(run: RepoWorkflowRun): boolean {
+  if (run.status === 'queued' || run.status === 'running') return true;
+  const rawConclusion = typeof run.conclusion === 'string' ? run.conclusion.trim().toLowerCase() : '';
+  return rawConclusion ? PENDING_CI_CONCLUSIONS.has(rawConclusion) : false;
+}
+
 function isFailedWorkflowRun(run: RepoWorkflowRun): boolean {
-  if (run.status === 'failure') return true;
-  const conclusion = (run.conclusion ?? '').toLowerCase();
-  return conclusion === 'failure' || conclusion === 'timed_out' || conclusion === 'startup_failure';
+  return isFailedCiOutcome(run.status, run.conclusion);
+}
+
+function toTimestampMs(raw: unknown): number | undefined {
+  if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+  if (typeof raw === 'string' && raw.trim()) {
+    const parsed = Date.parse(raw);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+}
+
+function prunePendingMap(pendingMap: Map<number, number | undefined>, nowMs: number): CallbackPendingSeqEntry[] {
+  const entries: CallbackPendingSeqEntry[] = [];
+  for (const [seq, createdAt] of pendingMap) {
+    if (createdAt !== undefined && nowMs - createdAt > PENDING_RUN_TTL_MS) {
+      continue;
+    }
+    entries.push(createdAt !== undefined ? { seq, createdAt } : { seq });
+  }
+  entries.sort((a, b) => b.seq - a.seq);
+  return entries.slice(0, MAX_TRACKED_PENDING_RUNS);
 }
 
 function formatActionFailureDetails(run: RepoWorkflowRun, detail: RepoActionDetail | null): string {
@@ -105,10 +181,10 @@ function formatActionFailureDetails(run: RepoWorkflowRun, detail: RepoActionDeta
     lines.push(`Trigger: ${run.event}${run.workflowPath ? ` (${run.workflowPath})` : ''}`);
   }
   if (detail && detail.jobs.length > 0) {
-    const failedJobs = detail.jobs.filter((job) => job.status === 'failure' || (job.conclusion ?? '').toLowerCase() === 'failure');
+    const failedJobs = detail.jobs.filter((job) => isFailedCiOutcome(job.status, job.conclusion));
     for (const job of failedJobs.slice(0, 5)) {
       const failedSteps = job.steps
-        .filter((step) => step.status === 'failure' || (step.conclusion ?? '').toLowerCase() === 'failure')
+        .filter((step) => isFailedCiOutcome(step.status, step.conclusion))
         .map((step) => `${step.number}. ${step.name}`);
       lines.push(
         failedSteps.length > 0
@@ -118,10 +194,6 @@ function formatActionFailureDetails(run: RepoWorkflowRun, detail: RepoActionDeta
     }
   }
   return lines.join('\n') || 'CI run failed.';
-}
-
-function buildBaselineKey(projectDir: string, eventType: RepoCallbackEventType): string {
-  return buildRepoCallbackDedupKey(projectDir, eventType, '__baseline__');
 }
 
 export class RepoCallbackMonitor {
@@ -136,6 +208,10 @@ export class RepoCallbackMonitor {
   private readonly now: () => number;
   private readonly configSyncIntervalMs: number;
   private readonly pollTickMs: number;
+  private readonly perPage: number;
+  private readonly maxPagesPerPoll: number;
+  private readonly maxBaselinePages: number;
+  private readonly maxDetailFetchesPerPoll: number;
 
   private globalTemplates: RepoCallbackTemplate[] = [];
   private repoConfigs = new Map<string, RepoCallbackRepoConfig>();
@@ -160,6 +236,10 @@ export class RepoCallbackMonitor {
     this.now = deps.now ?? (() => Date.now());
     this.configSyncIntervalMs = deps.configSyncIntervalMs ?? DEFAULT_CONFIG_SYNC_INTERVAL_MS;
     this.pollTickMs = deps.pollTickMs ?? DEFAULT_POLL_TICK_MS;
+    this.perPage = Math.max(1, deps.perPage ?? REPO_CALLBACK_DEFAULT_PER_PAGE);
+    this.maxPagesPerPoll = Math.max(1, deps.maxPagesPerPoll ?? REPO_CALLBACK_DEFAULT_MAX_PAGES_PER_POLL);
+    this.maxBaselinePages = Math.max(1, deps.maxBaselinePages ?? REPO_CALLBACK_DEFAULT_MAX_BASELINE_PAGES);
+    this.maxDetailFetchesPerPoll = Math.max(0, deps.maxDetailFetchesPerPoll ?? REPO_CALLBACK_MAX_DETAIL_FETCHES_PER_POLL);
   }
 
   start(): void {
@@ -341,42 +421,15 @@ export class RepoCallbackMonitor {
 
       for (const eventType of enabledEvents) {
         try {
-          const candidates = await this.fetchEventCandidates(provider, projectDir, eventType);
-          const baselineKey = buildBaselineKey(projectDir, eventType);
-          const hasBaseline = this.store.hasSeenDedupKey(CALLBACK_SOURCES.REPO, baselineKey);
-          const allKeys = [baselineKey, ...candidates.map((c) => c.dedupKey)];
-
-          if (!hasBaseline) {
-            // Cold-start baseline: record all current open/failed items as already seen
-            // without triggering a historical flood.
-            this.store.markSeenDedupKeys(CALLBACK_SOURCES.REPO, projectDir, allKeys, this.now());
-            continue;
-          }
-
-          for (const candidate of candidates) {
-            if (this.store.hasSeenDedupKey(CALLBACK_SOURCES.REPO, candidate.dedupKey)) {
-              continue;
-            }
-            if (eventType === 'ci_failed' && typeof candidate.metadata.runId === 'number') {
-              try {
-                const detail = await provider.getActionDetail(candidate.metadata.runId);
-                candidate.details = formatActionFailureDetails(
-                  candidate.metadata._run as RepoWorkflowRun,
-                  detail,
-                );
-              } catch {
-                // Keep summary details already computed from run metadata.
-              }
-            }
-            delete candidate.metadata._run;
-
-            // Mark seen immediately before dispatch so overlapping ticks or errors after send never double-fire.
-            this.store.markSeenDedupKeys(CALLBACK_SOURCES.REPO, projectDir, [candidate.dedupKey], this.now());
-            await this.dispatchCandidate(config, repoSlug, candidate);
-            dispatched += 1;
-          }
+          dispatched += await this.pollEventWithCheckpoint(
+            provider,
+            config,
+            repoSlug,
+            projectDir,
+            eventType,
+          );
         } catch (err) {
-          // Never write anything into callback_seen when provider fetch fails.
+          // Never write anything into callback_seen or advance checkpoint past a failed page.
           const msg = err instanceof Error ? err.message : String(err);
           eventErrors.push(`${eventType}: ${msg}`);
           logger.warn({ err, projectDir, eventType }, 'repo-callback-monitor: event poll failed');
@@ -396,73 +449,265 @@ export class RepoCallbackMonitor {
     }
   }
 
-  private async fetchEventCandidates(
+  private async pollEventWithCheckpoint(
+    provider: RepoProvider,
+    config: RepoCallbackRepoConfig,
+    repoSlug: string,
+    projectDir: string,
+    eventType: RepoCallbackEventType,
+  ): Promise<number> {
+    const checkpoint = this.store.getCheckpoint(CALLBACK_SOURCES.REPO, projectDir, eventType);
+    const pendingMap = new Map<number, number | undefined>();
+    for (const entry of checkpoint?.pendingSeqs ?? []) {
+      pendingMap.set(entry.seq, entry.createdAt);
+    }
+
+    // 1. Cold-start / resumable historical baseline sweep (never sets baselineComplete=true
+    // until pagination completes or archival cap is reached without error).
+    if (!checkpoint || !checkpoint.baselineComplete) {
+      let currentPage = checkpoint?.baselineNextPage ?? 1;
+      let watermarkSeq = checkpoint?.watermarkSeq ?? null;
+      let pagesFetched = 0;
+
+      while (pagesFetched < this.maxPagesPerPoll) {
+        const pageResult = await this.fetchEventPage(provider, projectDir, eventType, currentPage);
+        pagesFetched += 1;
+
+        const dedupKeysToMark: string[] = [];
+        for (const item of pageResult.items) {
+          if (currentPage === 1 || watermarkSeq === null) {
+            watermarkSeq = watermarkSeq === null ? item.seq : Math.max(watermarkSeq, item.seq);
+          }
+          if (item.pending) {
+            pendingMap.set(item.seq, item.createdAtMs);
+          } else {
+            pendingMap.delete(item.seq);
+            dedupKeysToMark.push(item.dedupKey);
+          }
+        }
+
+        const reachedEnd = !pageResult.hasMore || pageResult.items.length === 0 || currentPage >= this.maxBaselinePages;
+        const nextPending = prunePendingMap(pendingMap, this.now());
+        this.store.saveCheckpointProgress(
+          {
+            source: CALLBACK_SOURCES.REPO,
+            scopeKey: projectDir,
+            eventType,
+            baselineComplete: reachedEnd,
+            baselineNextPage: reachedEnd ? 1 : currentPage + 1,
+            watermarkSeq: reachedEnd ? (watermarkSeq ?? 0) : watermarkSeq,
+            syncNextPage: 1,
+            syncHighSeq: null,
+            pendingSeqs: nextPending,
+            updatedAt: this.now(),
+          },
+          dedupKeysToMark,
+        );
+
+        if (reachedEnd) break;
+        currentPage += 1;
+      }
+      return 0;
+    }
+
+    // 2. Steady-state incremental & resumable multi-page polling.
+    const watermarkSeq = checkpoint.watermarkSeq ?? 0;
+    let currentPage = checkpoint.syncNextPage;
+    let syncHighSeq = checkpoint.syncHighSeq;
+    let pagesFetched = 0;
+    let detailFetches = 0;
+    let dispatched = 0;
+
+    while (pagesFetched < this.maxPagesPerPoll) {
+      const pageResult = await this.fetchEventPage(provider, projectDir, eventType, currentPage);
+      pagesFetched += 1;
+
+      let minSeqOnPage: number | null = null;
+      const pageCandidates: DetectedEventCandidate[] = [];
+
+      for (const item of pageResult.items) {
+        if (currentPage === 1) {
+          syncHighSeq = syncHighSeq === null ? item.seq : Math.max(syncHighSeq, item.seq);
+        }
+        minSeqOnPage = minSeqOnPage === null ? item.seq : Math.min(minSeqOnPage, item.seq);
+
+        if (item.pending) {
+          pendingMap.set(item.seq, item.createdAtMs);
+          continue;
+        }
+
+        const wasTrackedPending = pendingMap.delete(item.seq);
+        if (!item.candidate) {
+          continue;
+        }
+        if (this.store.hasSeenDedupKey(CALLBACK_SOURCES.REPO, item.dedupKey)) {
+          continue;
+        }
+        const isAboveWatermark = item.seq > watermarkSeq;
+        const isCiRerun = eventType === 'ci_failed' && (item.runAttempt ?? 1) > 1;
+        if (!isAboveWatermark && !wasTrackedPending && !isCiRerun) {
+          continue;
+        }
+        pageCandidates.push(item.candidate);
+      }
+
+      for (const candidate of pageCandidates) {
+        if (
+          eventType === 'ci_failed'
+          && typeof candidate.metadata.runId === 'number'
+          && detailFetches < this.maxDetailFetchesPerPoll
+        ) {
+          detailFetches += 1;
+          try {
+            const detail = await provider.getActionDetail(candidate.metadata.runId);
+            candidate.details = formatActionFailureDetails(
+              candidate.metadata._run as RepoWorkflowRun,
+              detail,
+            );
+          } catch {
+            // Keep summary details already computed from run metadata.
+          }
+        }
+        delete candidate.metadata._run;
+
+        // Mark seen immediately before dispatch so overlapping ticks or errors after send never double-fire.
+        this.store.markSeenDedupKeys(CALLBACK_SOURCES.REPO, projectDir, [candidate.dedupKey], this.now());
+        await this.dispatchCandidate(config, repoSlug, candidate);
+        dispatched += 1;
+      }
+
+      const nextPending = prunePendingMap(pendingMap, this.now());
+      const oldestPendingSeq = nextPending.length > 0
+        ? Math.min(...nextPending.map((entry) => entry.seq))
+        : Infinity;
+      const stopSeqThreshold = Math.min(watermarkSeq, oldestPendingSeq - 1);
+      const reachedWatermark =
+        pageResult.items.length === 0
+        || !pageResult.hasMore
+        || (minSeqOnPage !== null && minSeqOnPage <= stopSeqThreshold);
+
+      this.store.saveCheckpointProgress({
+        source: CALLBACK_SOURCES.REPO,
+        scopeKey: projectDir,
+        eventType,
+        baselineComplete: true,
+        baselineNextPage: 1,
+        watermarkSeq: reachedWatermark ? Math.max(watermarkSeq, syncHighSeq ?? watermarkSeq) : watermarkSeq,
+        syncNextPage: reachedWatermark ? 1 : currentPage + 1,
+        syncHighSeq: reachedWatermark ? null : syncHighSeq,
+        pendingSeqs: nextPending,
+        updatedAt: this.now(),
+      });
+
+      if (reachedWatermark) break;
+      currentPage += 1;
+    }
+
+    return dispatched;
+  }
+
+  private async fetchEventPage(
     provider: RepoProvider,
     projectDir: string,
     eventType: RepoCallbackEventType,
-  ): Promise<DetectedEventCandidate[]> {
+    page: number,
+  ): Promise<{ items: PollPageItem[]; hasMore: boolean }> {
     if (eventType === 'pr_new') {
-      const res = await provider.listPRs({ state: 'open', page: 1 });
-      return res.items.map((pr: RepoPR) => ({
-        eventType: 'pr_new',
-        entityKey: `pr#${pr.number}`,
-        dedupKey: buildRepoCallbackDedupKey(projectDir, 'pr_new', String(pr.number)),
-        title: `PR #${pr.number}: ${pr.title}`,
-        url: pr.url,
-        number: String(pr.number),
-        author: pr.author,
-        branch: `${pr.head} -> ${pr.base}`,
-        status: pr.state,
-        conclusion: pr.reviewDecision ?? '',
-        details: pr.draft ? 'Draft PR' : 'Open PR',
-        metadata: { number: pr.number, head: pr.head, base: pr.base },
-      }));
+      const res = await provider.listPRs({ state: 'all', page, perPage: this.perPage });
+      return {
+        hasMore: res.hasMore,
+        items: res.items.map((pr: RepoPR) => ({
+          seq: pr.number,
+          pending: false,
+          createdAtMs: toTimestampMs(pr.createdAt),
+          dedupKey: buildRepoCallbackDedupKey(projectDir, 'pr_new', String(pr.number)),
+          candidate: {
+            eventType: 'pr_new',
+            entityKey: `pr#${pr.number}`,
+            dedupKey: buildRepoCallbackDedupKey(projectDir, 'pr_new', String(pr.number)),
+            title: `PR #${pr.number}: ${pr.title}`,
+            url: pr.url,
+            number: String(pr.number),
+            author: pr.author,
+            branch: `${pr.head} -> ${pr.base}`,
+            status: pr.state,
+            conclusion: pr.reviewDecision ?? '',
+            details: pr.draft ? 'Draft PR' : (pr.state === 'open' ? 'Open PR' : `PR (${pr.state})`),
+            metadata: { number: pr.number, head: pr.head, base: pr.base, state: pr.state },
+          },
+        })),
+      };
     }
 
     if (eventType === 'issue_new') {
-      const res = await provider.listIssues({ state: 'open', page: 1 });
-      return res.items.map((issue: RepoIssue) => ({
-        eventType: 'issue_new',
-        entityKey: `issue#${issue.number}`,
-        dedupKey: buildRepoCallbackDedupKey(projectDir, 'issue_new', String(issue.number)),
-        title: `Issue #${issue.number}: ${issue.title}`,
-        url: issue.url,
-        number: String(issue.number),
-        author: issue.author,
-        branch: '',
-        status: issue.state,
-        conclusion: '',
-        details: issue.labels.length > 0 ? `Labels: ${issue.labels.join(', ')}` : 'Open issue',
-        metadata: { number: issue.number, labels: issue.labels },
-      }));
+      const res = await provider.listIssues({ state: 'all', page, perPage: this.perPage });
+      return {
+        hasMore: res.hasMore,
+        items: res.items.map((issue: RepoIssue) => ({
+          seq: issue.number,
+          pending: false,
+          createdAtMs: toTimestampMs(issue.createdAt),
+          dedupKey: buildRepoCallbackDedupKey(projectDir, 'issue_new', String(issue.number)),
+          candidate: {
+            eventType: 'issue_new',
+            entityKey: `issue#${issue.number}`,
+            dedupKey: buildRepoCallbackDedupKey(projectDir, 'issue_new', String(issue.number)),
+            title: `Issue #${issue.number}: ${issue.title}`,
+            url: issue.url,
+            number: String(issue.number),
+            author: issue.author,
+            branch: '',
+            status: issue.state,
+            conclusion: '',
+            details: issue.labels.length > 0
+              ? `Labels: ${issue.labels.join(', ')}`
+              : (issue.state === 'open' ? 'Open issue' : `Issue (${issue.state})`),
+            metadata: { number: issue.number, labels: issue.labels, state: issue.state },
+          },
+        })),
+      };
     }
 
-    const res = await provider.listActions({ page: 1 });
-    return res.items
-      .filter(isFailedWorkflowRun)
-      .map((run: RepoWorkflowRun) => {
-        const attempt = String(run.runAttempt ?? 1);
+    const res = await provider.listActions({ page, perPage: this.perPage });
+    return {
+      hasMore: res.hasMore,
+      items: res.items.map((run: RepoWorkflowRun) => {
+        const attempt = run.runAttempt ?? 1;
+        const attemptStr = String(attempt);
+        const dedupKey = buildRepoCallbackDedupKey(projectDir, 'ci_failed', String(run.id), attemptStr);
+        const pending = isPendingWorkflowRun(run);
+        const failed = !pending && isFailedWorkflowRun(run);
         return {
-          eventType: 'ci_failed',
-          entityKey: `run#${run.id}#${attempt}`,
-          dedupKey: buildRepoCallbackDedupKey(projectDir, 'ci_failed', String(run.id), attempt),
-          title: `CI failed: ${run.name}`,
-          url: run.url,
-          number: String(run.runNumber ?? run.id),
-          author: run.actor,
-          branch: run.branch,
-          status: run.status,
-          conclusion: run.conclusion ?? 'failure',
-          details: formatActionFailureDetails(run, null),
-          metadata: {
-            runId: run.id,
-            runAttempt: Number(attempt),
-            branch: run.branch,
-            commitSha: run.commitSha,
-            _run: run,
-          },
+          seq: run.id,
+          pending,
+          runAttempt: attempt,
+          createdAtMs: toTimestampMs(run.createdAt),
+          dedupKey,
+          candidate: failed
+            ? {
+                eventType: 'ci_failed',
+                entityKey: `run#${run.id}#${attemptStr}`,
+                dedupKey,
+                title: `CI failed: ${run.name}`,
+                url: run.url,
+                number: String(run.runNumber ?? run.id),
+                author: run.actor,
+                branch: run.branch,
+                status: run.status,
+                conclusion: run.conclusion ?? 'failure',
+                details: formatActionFailureDetails(run, null),
+                metadata: {
+                  runId: run.id,
+                  runAttempt: attempt,
+                  branch: run.branch,
+                  commitSha: run.commitSha,
+                  _run: run,
+                },
+              }
+            : undefined,
         };
-      });
+      }),
+    };
   }
 
   private resolveTargetSession(config: RepoCallbackRepoConfig): { sessionName: string; record?: SessionRecord; error?: string } {

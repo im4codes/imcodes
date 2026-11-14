@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import {
   CALLBACK_SOURCES,
@@ -620,5 +623,430 @@ describe('RepoCallbackMonitor background polling & delivery', () => {
     expect(rendered).toContain('[Callback ID: cb_repo_x | source: repo]');
 
     store.close();
+  });
+
+  it('F1: completes multi-page historical baseline, prevents shifted old PRs from refiring, detects closed new items, survives mid-pagination failures & restarts, and bounds API calls per poll', async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'imcodes-cb-restart-'));
+    const dbPath = join(tmpDir, 'callback-tasks.sqlite');
+    const sessions = [makeSession()];
+    const sent: Array<{ sessionName: string; text: string }> = [];
+
+    const makePR = (num: number, state: 'open' | 'closed' | 'merged' = 'open'): RepoPR => ({
+      number: num,
+      title: `PR ${num}`,
+      author: 'alice',
+      state,
+      draft: false,
+      head: `feat/${num}`,
+      base: 'main',
+      labels: [],
+      createdAt: 1_700_000_000_000 + num * 1000,
+      updatedAt: 1_700_000_000_000 + num * 1000,
+      url: `https://github.com/acme/widget/pull/${num}`,
+    });
+
+    // Scenario A: 6 open PRs (#6..#1) with perPage=5 -> page 1 [#6..#2], page 2 [#1].
+    // Closing #6 shifts #1 onto page 1, which must NOT fire as pr_new.
+    const allPrs: RepoPR[] = [6, 5, 4, 3, 2, 1].map((n) => makePR(n, 'open'));
+    let failPrPage: number | null = null;
+    const requestedPages: number[] = [];
+
+    const provider: RepoProvider = {
+      ...createMockProvider({}),
+      listPRs: vi.fn(async (opts) => {
+        const page = opts?.page ?? 1;
+        requestedPages.push(page);
+        if (failPrPage === page) throw new Error(`transient error on page ${page}`);
+        const stateFilter = opts?.state ?? 'open';
+        const filtered = (stateFilter === 'all' ? allPrs : allPrs.filter((p) => p.state === stateFilter))
+          .slice()
+          .sort((a, b) => b.number - a.number);
+        const pageSize = 5;
+        const start = (page - 1) * pageSize;
+        const slice = filtered.slice(start, start + pageSize);
+        return {
+          items: slice,
+          page,
+          hasMore: start + pageSize < filtered.length,
+          projectDir: '/tmp/repo-a',
+        };
+      }),
+    };
+
+    try {
+      let store = new CallbackTaskStore(dbPath);
+      const config = createDefaultRepoCallbackConfig('/tmp/repo-a');
+      config.enabled = true;
+      config.events.pr_new.enabled = true;
+      config.events.ci_failed.enabled = false;
+      config.events.issue_new.enabled = false;
+
+      const buildMonitor = (s: CallbackTaskStore, maxPagesPerPoll = 2) => {
+        const m = new RepoCallbackMonitor({
+          store: s,
+          detect: async () => createOkContext('/tmp/repo-a'),
+          createProvider: () => provider,
+          listSessions: () => sessions,
+          sendToSession: async (sessionName, text) => {
+            sent.push({ sessionName, text });
+          },
+          perPage: 5,
+          maxPagesPerPoll,
+        });
+        m.setConfigsForTesting({ repos: { '/tmp/repo-a': config } });
+        return m;
+      };
+
+      // Fail mid-baseline on page 2 -> baseline must remain incomplete!
+      let monitor = buildMonitor(store, 2);
+      failPrPage = 2;
+      const partialErr = await monitor.checkProject('/tmp/repo-a');
+      expect(partialErr.error).toContain('transient error on page 2');
+      expect(sent).toHaveLength(0);
+      expect(store.getCheckpoint(CALLBACK_SOURCES.REPO, '/tmp/repo-a', 'pr_new')?.baselineComplete).toBe(false);
+
+      // Simulate daemon restart on the same SQLite DB; next poll finishes page 2 and completes baseline.
+      store.close();
+      store = new CallbackTaskStore(dbPath);
+      monitor = buildMonitor(store, 2);
+      failPrPage = null;
+      const completeBaseline = await monitor.checkProject('/tmp/repo-a');
+      expect(completeBaseline.error).toBeUndefined();
+      expect(sent).toHaveLength(0);
+      expect(store.getCheckpoint(CALLBACK_SOURCES.REPO, '/tmp/repo-a', 'pr_new')?.baselineComplete).toBe(true);
+
+      // Close #6 so #1 shifts onto page 1 -> zero historical callbacks!
+      allPrs[0] = makePR(6, 'closed');
+      await monitor.checkProject('/tmp/repo-a');
+      expect(sent).toHaveLength(0);
+
+      // Add 12 new PRs (#7..#18), including #11 already closed/merged between polls,
+      // with maxPagesPerPoll = 2 (perPage=5 => max 10 items per poll tick -> 3 pages total).
+      // Also inject failure on page 3 on tick 1 to verify bounded resumable catch-up across restart!
+      for (let n = 7; n <= 18; n += 1) {
+        allPrs.push(makePR(n, n === 11 ? 'closed' : 'open'));
+      }
+      requestedPages.length = 0;
+      const tick1 = await monitor.checkProject('/tmp/repo-a');
+      // Bounded: at most maxPagesPerPoll (2) API calls in one poll -> collects #18..#9 (10 PRs)
+      expect(requestedPages).toEqual([1, 2]);
+      expect(tick1.dispatched).toBe(10);
+
+      // Restart daemon while catch-up is at syncNextPage = 3; fail page 3 once, then succeed.
+      store.close();
+      store = new CallbackTaskStore(dbPath);
+      monitor = buildMonitor(store, 2);
+      failPrPage = 3;
+      const tick2Fail = await monitor.checkProject('/tmp/repo-a');
+      expect(tick2Fail.error).toContain('transient error on page 3');
+
+      failPrPage = null;
+      requestedPages.length = 0;
+      const tick3 = await monitor.checkProject('/tmp/repo-a');
+      expect(requestedPages).toEqual([3]);
+      // Remaining new PRs #8 and #7 are recovered, hitting #6 watermark without losing them or duplicating #18..#9!
+      expect(tick3.dispatched).toBe(2);
+      expect(sent).toHaveLength(12);
+      const deliveredTitles = sent.map((m) => m.text);
+      expect(deliveredTitles.some((t) => t.includes('PR #11:'))).toBe(true);
+      expect(deliveredTitles.some((t) => t.includes('PR #7:'))).toBe(true);
+      expect(deliveredTitles.some((t) => t.includes('PR #1:'))).toBe(false);
+
+      // Re-poll settles to 1 API call and 0 dispatches
+      requestedPages.length = 0;
+      const tick4 = await monitor.checkProject('/tmp/repo-a');
+      expect(requestedPages).toEqual([1]);
+      expect(tick4.dispatched).toBe(0);
+
+      // Pending CI run #300 during baseline shifts onto page 2 before failing -> must still fire
+      config.events.pr_new.enabled = false;
+      config.events.ci_failed.enabled = true;
+      config.events.issue_new.enabled = true;
+      monitor.setConfigsForTesting({ repos: { '/tmp/repo-a': { ...config } } });
+
+      const issues: RepoIssue[] = [];
+      const actions: RepoWorkflowRun[] = [
+        {
+          id: 300,
+          name: 'Slow E2E',
+          status: 'running',
+          conclusion: undefined,
+          branch: 'main',
+          commitSha: '111',
+          commitMessage: 'init',
+          actor: 'alice',
+          url: 'https://github.com/acme/widget/actions/runs/300',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          runAttempt: 1,
+        },
+      ];
+      (provider.listIssues as ReturnType<typeof vi.fn>).mockImplementation(async (opts) => {
+        const page = opts?.page ?? 1;
+        const sorted = issues.slice().sort((a, b) => b.number - a.number);
+        const start = (page - 1) * 5;
+        return { items: sorted.slice(start, start + 5), page, hasMore: start + 5 < sorted.length, projectDir: '/tmp/repo-a' };
+      });
+      (provider.listActions as ReturnType<typeof vi.fn>).mockImplementation(async (opts) => {
+        const page = opts?.page ?? 1;
+        const sorted = actions.slice().sort((a, b) => b.id - a.id);
+        const start = (page - 1) * 5;
+        return { items: sorted.slice(start, start + 5), page, hasMore: start + 5 < sorted.length, projectDir: '/tmp/repo-a' };
+      });
+
+      const beforeCiIssueCount = sent.length;
+      await monitor.checkProject('/tmp/repo-a'); // baseline empty issues + running CI #300
+      expect(sent).toHaveLength(beforeCiIssueCount);
+
+      // 6 newer green runs push #300 onto page 2, and #300 fails; Issue #1 is opened & closed between polls
+      for (let id = 301; id <= 306; id += 1) {
+        actions.push({
+          id,
+          name: `Quick CI ${id}`,
+          status: 'success',
+          conclusion: 'success',
+          branch: 'main',
+          commitSha: String(id),
+          commitMessage: 'ok',
+          actor: 'bob',
+          url: `https://github.com/acme/widget/actions/runs/${id}`,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          runAttempt: 1,
+        });
+      }
+      actions[0] = { ...actions[0]!, status: 'failure', conclusion: 'failure' };
+      issues.push({
+        id: 'iss-1',
+        number: 1,
+        title: 'Quickly closed bug',
+        body: '',
+        state: 'closed',
+        author: 'bob',
+        labels: [],
+        url: 'https://github.com/acme/widget/issues/1',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+
+      const ciIssueTick = await monitor.checkProject('/tmp/repo-a');
+      expect(ciIssueTick.dispatched).toBe(2);
+      expect(sent.slice(beforeCiIssueCount).map((m) => m.text).some((t) => t.includes('Slow E2E'))).toBe(true);
+      expect(sent.slice(beforeCiIssueCount).map((m) => m.text).some((t) => t.includes('Quickly closed bug'))).toBe(true);
+
+      store.close();
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('F2: treats explicit non-failure CI conclusions (skipped/neutral) as non-failures even when status is failure, while alerting failure/timed_out/startup_failure', async () => {
+    const store = new CallbackTaskStore(':memory:');
+    const sent: Array<{ sessionName: string; text: string }> = [];
+    const actions: RepoWorkflowRun[] = [];
+    const actionDetails: Record<number, RepoActionDetail> = {};
+    const provider = createMockProvider({ actions, actionDetails });
+
+    const config = createDefaultRepoCallbackConfig('/tmp/repo-a');
+    config.enabled = true;
+    config.events.ci_failed.enabled = true;
+    config.events.pr_new.enabled = false;
+    config.events.issue_new.enabled = false;
+
+    const monitor = new RepoCallbackMonitor({
+      store,
+      detect: async () => createOkContext('/tmp/repo-a'),
+      createProvider: () => provider,
+      listSessions: () => [makeSession()],
+      sendToSession: async (sessionName, text) => {
+        sent.push({ sessionName, text });
+      },
+    });
+    monitor.setConfigsForTesting({ repos: { '/tmp/repo-a': config } });
+
+    // Empty baseline
+    await monitor.checkProject('/tmp/repo-a');
+
+    const baseRun = {
+      branch: 'main',
+      commitSha: 'abcdef1',
+      commitMessage: 'chore: test',
+      actor: 'alice',
+      url: 'https://github.com/acme/widget/actions/runs/',
+      createdAt: 1_700_000_000_000,
+      updatedAt: 1_700_000_010_000,
+    };
+
+    // Normalized GitHub status='failure' with skipped/neutral MUST NOT fire!
+    actions.unshift(
+      { ...baseRun, id: 201, name: 'Skipped optional CI', status: 'failure', conclusion: 'skipped', runAttempt: 1 },
+      { ...baseRun, id: 202, name: 'Neutral check', status: 'failure', conclusion: 'neutral', runAttempt: 1 },
+      { ...baseRun, id: 203, name: 'Green build', status: 'success', conclusion: 'success', runAttempt: 1 },
+      { ...baseRun, id: 204, name: 'Cancelled build', status: 'cancelled', conclusion: 'cancelled', runAttempt: 1 },
+      { ...baseRun, id: 205, name: 'Timed out suite', status: 'failure', conclusion: 'timed_out', runAttempt: 1 },
+      { ...baseRun, id: 206, name: 'Startup failure', status: 'failure', conclusion: 'startup_failure', runAttempt: 1 },
+      { ...baseRun, id: 207, name: 'Hard failure', status: 'failure', conclusion: 'failure', runAttempt: 1 },
+    );
+
+    actionDetails[207] = {
+      runId: 207,
+      jobs: [
+        {
+          id: 1,
+          name: 'Skipped Job',
+          status: 'failure',
+          conclusion: 'skipped',
+          steps: [{ number: 1, name: 'Skipped Step', status: 'failure', conclusion: 'skipped' }],
+        },
+        {
+          id: 2,
+          name: 'Test Job',
+          status: 'failure',
+          conclusion: 'failure',
+          steps: [
+            { number: 1, name: 'Skipped sub-step', status: 'failure', conclusion: 'skipped' },
+            { number: 2, name: 'Failing vitest', status: 'failure', conclusion: 'failure' },
+          ],
+        },
+      ],
+    };
+
+    const res = await monitor.checkProject('/tmp/repo-a');
+    expect(res).toEqual({ checked: true, dispatched: 3 });
+    const texts = sent.map((s) => s.text).join('\n');
+    expect(texts).not.toContain('Skipped optional CI');
+    expect(texts).not.toContain('Neutral check');
+    expect(texts).not.toContain('Green build');
+    expect(texts).not.toContain('Cancelled build');
+    expect(texts).toContain('Timed out suite');
+    expect(texts).toContain('Startup failure');
+    expect(texts).toContain('Hard failure');
+    expect(texts).not.toContain('Skipped Job');
+    expect(texts).not.toContain('Skipped sub-step');
+    expect(texts).toContain('Failed job "Test Job" -> steps: 2. Failing vitest');
+
+    store.close();
+  });
+
+  it('F3 & F4: prioritizes customPrompt over templateId and unconditionally appends current callbackId envelope', () => {
+    const config = createDefaultRepoCallbackConfig('/tmp/repo-a');
+    config.templates = [
+      { id: 'repo_1', name: 'Repo tpl', scope: 'repo', eventType: 'pr_new', prompt: 'Original repo prompt', updatedAt: 1 },
+    ];
+    const globalTemplates: RepoCallbackTemplate[] = [
+      { id: 'global_1', name: 'Global tpl', scope: 'global', eventType: 'pr_new', prompt: 'Original global prompt', updatedAt: 1 },
+    ];
+
+    // Even if templateScope/templateId is present alongside customPrompt, customPrompt MUST win
+    config.events.pr_new = {
+      enabled: true,
+      templateScope: 'global',
+      templateId: 'global_1',
+      customPrompt: 'Edited prompt that user saved',
+    };
+    expect(resolveRepoCallbackPromptTemplate(config, 'pr_new', globalTemplates)).toBe('Edited prompt that user saved');
+
+    config.events.pr_new = {
+      enabled: true,
+      templateScope: 'repo',
+      templateId: 'repo_1',
+      customPrompt: 'Edited repo prompt',
+    };
+    expect(resolveRepoCallbackPromptTemplate(config, 'pr_new', globalTemplates)).toBe('Edited repo prompt');
+
+    // Without customPrompt, live global template updates take effect automatically
+    config.events.pr_new = { enabled: true, templateScope: 'global', templateId: 'global_1' };
+    globalTemplates[0] = { ...globalTemplates[0]!, prompt: 'Updated global prompt v2' };
+    expect(resolveRepoCallbackPromptTemplate(config, 'pr_new', globalTemplates)).toBe('Updated global prompt v2');
+
+    // F4: template or remote title containing callback_update or stale cb_repo_old MUST still emit current callbackId
+    const ctx = {
+      repo: 'acme/widget',
+      projectDir: '/tmp/repo-a',
+      event: 'pr_new' as const,
+      title: 'Fix callback_update bug',
+      number: '42',
+      url: 'https://github.com/acme/widget/pull/42',
+      author: 'alice',
+      branch: 'fix -> main',
+      status: 'open',
+      conclusion: '',
+      details: 'Mentions callback_update in details',
+      callbackId: 'cb_repo_test123',
+    };
+
+    const withToolName = renderRepoCallbackPrompt('After triage call callback_update with your summary.', ctx);
+    expect(withToolName).toContain('After triage call callback_update with your summary.');
+    expect(withToolName).toContain('cb_repo_test123');
+    expect(withToolName).toContain('callbackId="cb_repo_test123"');
+
+    const withStaleId = renderRepoCallbackPrompt('call callback_update for cb_repo_old999 on {{title}} ({{details}})', ctx);
+    expect(withStaleId).toContain('Fix callback_update bug');
+    expect(withStaleId).toContain('callbackId="cb_repo_test123"');
+  });
+
+  it('runs autonomous timer polling via start() / stop() without frontend connections', async () => {
+    vi.useFakeTimers();
+    try {
+      const store = new CallbackTaskStore(':memory:');
+      const prs: RepoPR[] = [];
+      const sent: Array<{ sessionName: string; text: string }> = [];
+      const provider = createMockProvider({ prs });
+
+      const config = createDefaultRepoCallbackConfig('/tmp/repo-a');
+      config.enabled = true;
+      config.intervalMs = 60_000;
+      config.events.pr_new.enabled = true;
+      config.events.ci_failed.enabled = false;
+      config.events.issue_new.enabled = false;
+
+      const monitor = new RepoCallbackMonitor({
+        store,
+        getServerLink: () => null,
+        detect: async () => createOkContext('/tmp/repo-a'),
+        createProvider: () => provider,
+        listSessions: () => [makeSession()],
+        sendToSession: async (sessionName, text) => {
+          sent.push({ sessionName, text });
+        },
+        pollTickMs: 10_000,
+        configSyncIntervalMs: 300_000,
+      });
+      monitor.setConfigsForTesting({ repos: { '/tmp/repo-a': config } });
+      monitor.start();
+
+      // First interval completes cold-start baseline autonomously
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(provider.listPRs).toHaveBeenCalledTimes(1);
+      expect(sent).toHaveLength(0);
+
+      // Push PR #55 and advance past intervalMs -> timer triggers poll & dispatch
+      prs.push({
+        number: 55,
+        title: 'Timer dispatched PR',
+        author: 'alice',
+        state: 'open',
+        draft: false,
+        head: 'feat/timer',
+        base: 'main',
+        labels: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        url: 'https://github.com/acme/widget/pull/55',
+      });
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(sent).toHaveLength(1);
+      expect(sent[0]!.text).toContain('Timer dispatched PR');
+
+      // stop() clears timers cleanly -> no further polling occurs
+      const callsBeforeStop = (provider.listPRs as ReturnType<typeof vi.fn>).mock.calls.length;
+      monitor.stop();
+      await vi.advanceTimersByTimeAsync(180_000);
+      expect((provider.listPRs as ReturnType<typeof vi.fn>).mock.calls.length).toBe(callsBeforeStop);
+
+      store.close();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -68,6 +68,37 @@ export type UpdateCallbackTaskResult =
 
 export type CallbackUpdatedListener = (record: CallbackTaskRecord) => void;
 
+export interface CallbackPendingSeqEntry {
+  seq: number;
+  createdAt?: number;
+}
+
+export interface CallbackCheckpointRecord {
+  source: string;
+  scopeKey: string;
+  eventType: string;
+  baselineComplete: boolean;
+  baselineNextPage: number;
+  watermarkSeq: number | null;
+  syncNextPage: number;
+  syncHighSeq: number | null;
+  pendingSeqs: CallbackPendingSeqEntry[];
+  updatedAt: number;
+}
+
+interface CallbackCheckpointRow {
+  source: string;
+  scope_key: string;
+  event_type: string;
+  baseline_complete: number;
+  baseline_next_page: number;
+  watermark_seq: number | null;
+  sync_next_page: number;
+  sync_high_seq: number | null;
+  pending_seqs_json: string | null;
+  updated_at: number;
+}
+
 interface CallbackTaskRow {
   callback_id: string;
   source: string;
@@ -165,6 +196,19 @@ export class CallbackTaskStore {
       );
       CREATE INDEX IF NOT EXISTS idx_callback_seen_scope
         ON callback_seen (source, scope_key);
+      CREATE TABLE IF NOT EXISTS callback_checkpoints (
+        source TEXT NOT NULL,
+        scope_key TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        baseline_complete INTEGER NOT NULL DEFAULT 0,
+        baseline_next_page INTEGER NOT NULL DEFAULT 1,
+        watermark_seq INTEGER,
+        sync_next_page INTEGER NOT NULL DEFAULT 1,
+        sync_high_seq INTEGER,
+        pending_seqs_json TEXT,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (source, scope_key, event_type)
+      );
     `);
   }
 
@@ -415,6 +459,90 @@ export class CallbackTaskStore {
       for (const dedupKey of dedupKeys) {
         stmt.run(normalized, dedupKey, scopeKey, seenAt);
       }
+      this.db.exec('COMMIT');
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+  }
+
+  getCheckpoint(source: CallbackSource, scopeKey: string, eventType: string): CallbackCheckpointRecord | null {
+    const normalized = normalizeCallbackSource(source) ?? source;
+    const row = this.db.prepare(`
+      SELECT source, scope_key, event_type, baseline_complete, baseline_next_page,
+             watermark_seq, sync_next_page, sync_high_seq, pending_seqs_json, updated_at
+        FROM callback_checkpoints
+       WHERE source = ? AND scope_key = ? AND event_type = ?
+       LIMIT 1
+    `).get(normalized, scopeKey, eventType) as CallbackCheckpointRow | undefined;
+    if (!row) return null;
+    let pendingSeqs: CallbackPendingSeqEntry[] = [];
+    if (row.pending_seqs_json) {
+      try {
+        const parsed = JSON.parse(row.pending_seqs_json) as unknown;
+        if (Array.isArray(parsed)) {
+          pendingSeqs = parsed.filter(
+            (entry): entry is CallbackPendingSeqEntry =>
+              Boolean(entry && typeof entry === 'object' && typeof (entry as { seq?: unknown }).seq === 'number' && Number.isFinite((entry as { seq: number }).seq)),
+          );
+        }
+      } catch {
+        pendingSeqs = [];
+      }
+    }
+    return {
+      source: row.source,
+      scopeKey: row.scope_key,
+      eventType: row.event_type,
+      baselineComplete: row.baseline_complete === 1,
+      baselineNextPage: Math.max(1, row.baseline_next_page),
+      watermarkSeq: row.watermark_seq ?? null,
+      syncNextPage: Math.max(1, row.sync_next_page),
+      syncHighSeq: row.sync_high_seq ?? null,
+      pendingSeqs,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  saveCheckpointProgress(
+    checkpoint: CallbackCheckpointRecord,
+    dedupKeysToMark: readonly string[] = [],
+  ): void {
+    const normalized = normalizeCallbackSource(checkpoint.source) ?? checkpoint.source;
+    const seenStmt = this.db.prepare(
+      'INSERT OR IGNORE INTO callback_seen (source, dedup_key, scope_key, first_seen_at) VALUES (?, ?, ?, ?)',
+    );
+    const cpStmt = this.db.prepare(`
+      INSERT INTO callback_checkpoints (
+        source, scope_key, event_type, baseline_complete, baseline_next_page,
+        watermark_seq, sync_next_page, sync_high_seq, pending_seqs_json, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT (source, scope_key, event_type) DO UPDATE SET
+        baseline_complete = excluded.baseline_complete,
+        baseline_next_page = excluded.baseline_next_page,
+        watermark_seq = excluded.watermark_seq,
+        sync_next_page = excluded.sync_next_page,
+        sync_high_seq = excluded.sync_high_seq,
+        pending_seqs_json = excluded.pending_seqs_json,
+        updated_at = excluded.updated_at
+    `);
+    this.db.exec('BEGIN');
+    try {
+      for (const dedupKey of dedupKeysToMark) {
+        seenStmt.run(normalized, dedupKey, checkpoint.scopeKey, checkpoint.updatedAt);
+      }
+      cpStmt.run(
+        normalized,
+        checkpoint.scopeKey,
+        checkpoint.eventType,
+        checkpoint.baselineComplete ? 1 : 0,
+        Math.max(1, checkpoint.baselineNextPage),
+        checkpoint.watermarkSeq,
+        Math.max(1, checkpoint.syncNextPage),
+        checkpoint.syncHighSeq,
+        checkpoint.pendingSeqs.length > 0 ? JSON.stringify(checkpoint.pendingSeqs) : null,
+        checkpoint.updatedAt,
+      );
       this.db.exec('COMMIT');
     } catch (err) {
       this.db.exec('ROLLBACK');

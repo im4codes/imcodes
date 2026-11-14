@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'preact/hooks';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { CallbackStatus, CallbackTaskRecord } from '@shared/callback-types.js';
 import {
@@ -92,7 +92,10 @@ export function RepoCallbackModal({
   onConfigSaved,
 }: Props) {
   const { t } = useTranslation();
+  const tRef = useRef(t);
+  tRef.current = t;
   const [loading, setLoading] = useState(false);
+  const editedSourceTemplateRef = useRef<Partial<Record<RepoCallbackEventType, { scope: RepoCallbackTemplateScope; id: string; name: string }>>>({});
   const [saving, setSaving] = useState(false);
   const [feedback, setFeedback] = useState<{ kind: 'success' | 'error'; text: string } | null>(null);
   const [globalTemplates, setGlobalTemplates] = useState<RepoCallbackTemplate[]>([]);
@@ -114,7 +117,7 @@ export function RepoCallbackModal({
       })
       .catch((err) => {
         if (cancelled) return;
-        setFeedback({ kind: 'error', text: err instanceof Error ? err.message : t('repo.callback_load_error') });
+        setFeedback({ kind: 'error', text: err instanceof Error ? err.message : tRef.current('repo.callback_load_error') });
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -127,7 +130,7 @@ export function RepoCallbackModal({
     return () => {
       cancelled = true;
     };
-  }, [open, serverId, projectDir, ws, t]);
+  }, [open, serverId, projectDir, ws]);
 
   const filteredCallbacks = useMemo(() => {
     return callbacks.filter((cb) => {
@@ -176,6 +179,9 @@ export function RepoCallbackModal({
 
   const selectedTemplateKey = (eventType: RepoCallbackEventType): string => {
     const setting = draft.events[eventType];
+    if (setting.customPrompt?.trim()) {
+      return 'default';
+    }
     if (setting.templateScope === 'global' && setting.templateId) {
       return `global:${setting.templateId}`;
     }
@@ -188,6 +194,7 @@ export function RepoCallbackModal({
   const handleSelectTemplate = (eventType: RepoCallbackEventType, value: string) => {
     setFeedback(null);
     if (value === 'default') {
+      delete editedSourceTemplateRef.current[eventType];
       setDraft((prev) => ({
         ...prev,
         events: {
@@ -202,36 +209,61 @@ export function RepoCallbackModal({
       }));
       return;
     }
-    const [scope, ...rest] = value.split(':');
+    const [scopeRaw, ...rest] = value.split(':');
+    const scope: RepoCallbackTemplateScope = scopeRaw === 'global' ? 'global' : 'repo';
     const templateId = rest.join(':');
     const pool = scope === 'global' ? globalTemplates : draft.templates;
     const found = pool.find((tpl) => tpl.id === templateId);
+    if (found) {
+      editedSourceTemplateRef.current[eventType] = { scope, id: found.id, name: found.name };
+      setTemplateNameDraft(found.name);
+    } else {
+      delete editedSourceTemplateRef.current[eventType];
+    }
+    // Keep customPrompt undefined on template selection so saved config references
+    // the live reusable template until the user explicitly edits the textarea.
     setDraft((prev) => ({
       ...prev,
       events: {
         ...prev.events,
         [eventType]: {
           ...prev.events[eventType],
-          templateScope: scope === 'global' ? 'global' : 'repo',
+          templateScope: scope,
           templateId,
-          customPrompt: found ? found.prompt : prev.events[eventType].customPrompt,
+          customPrompt: undefined,
         },
       },
     }));
-    if (found) setTemplateNameDraft(found.name);
   };
 
   const handlePromptChange = (eventType: RepoCallbackEventType, value: string) => {
-    setDraft((prev) => ({
-      ...prev,
-      events: {
-        ...prev.events,
-        [eventType]: {
-          ...prev.events[eventType],
-          customPrompt: value.slice(0, REPO_CALLBACK_MAX_PROMPT_CHARS),
+    const nextValue = value.slice(0, REPO_CALLBACK_MAX_PROMPT_CHARS);
+    setDraft((prev) => {
+      const current = prev.events[eventType];
+      if (current.templateScope !== 'default' && current.templateId) {
+        const pool = current.templateScope === 'global' ? globalTemplates : prev.templates;
+        const found = pool.find((tpl) => tpl.id === current.templateId);
+        if (found) {
+          editedSourceTemplateRef.current[eventType] = {
+            scope: current.templateScope,
+            id: found.id,
+            name: found.name,
+          };
+        }
+      }
+      return {
+        ...prev,
+        events: {
+          ...prev.events,
+          [eventType]: {
+            ...current,
+            templateScope: 'default',
+            templateId: undefined,
+            customPrompt: nextValue,
+          },
         },
-      },
-    }));
+      };
+    });
   };
 
   const handleSaveTemplate = async (eventType: RepoCallbackEventType, scope: RepoCallbackTemplateScope) => {
@@ -244,11 +276,12 @@ export function RepoCallbackModal({
     const now = Date.now();
     const setting = draft.events[eventType];
     const pool = scope === 'global' ? globalTemplates : draft.templates;
-    const existingSameScope = setting.templateScope === scope && setting.templateId
+    const priorRef = editedSourceTemplateRef.current[eventType];
+    const activeSameScope = setting.templateScope === scope && setting.templateId
       ? pool.find((tpl) => tpl.id === setting.templateId)
-      : undefined;
-    const targetId = existingSameScope && existingSameScope.name === name
-      ? existingSameScope.id
+      : (priorRef?.scope === scope ? pool.find((tpl) => tpl.id === priorRef.id) : undefined);
+    const targetId = activeSameScope && activeSameScope.name === name
+      ? activeSameScope.id
       : makeTemplateId(scope);
     const nextTemplate: RepoCallbackTemplate = {
       id: targetId,
@@ -648,7 +681,7 @@ export function RepoCallbackModal({
                           value={tplKey}
                           disabled={readOnly}
                           onChange={(e) => handleSelectTemplate(eventType, (e.target as HTMLSelectElement).value)}
-                          style={{ flex: 1, minWidth: 180, background: '#0f172a', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '5px 8px', fontSize: 12 }}
+                          style={{ flex: 1, minWidth: 160, maxWidth: '100%', background: '#0f172a', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '5px 8px', fontSize: 12 }}
                         >
                           <option value="default">{t('repo.callback_tpl_source_default')}</option>
                           {eligibleGlobal.map((tpl) => (
@@ -842,12 +875,12 @@ export function RepoCallbackModal({
                       </div>
 
                       {cb.summary && (
-                        <div style={{ fontSize: 12, color: '#cbd5e1', whiteSpace: 'pre-wrap' }}>
+                        <div style={{ fontSize: 12, color: '#cbd5e1', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
                           {cb.summary}
                         </div>
                       )}
                       {cb.lastError && (
-                        <div style={{ fontSize: 11, color: '#fca5a5' }}>
+                        <div style={{ fontSize: 11, color: '#fca5a5', overflowWrap: 'anywhere' }}>
                           {cb.lastError}
                         </div>
                       )}

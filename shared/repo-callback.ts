@@ -279,6 +279,10 @@ export function resolveRepoCallbackPromptTemplate(
   globalTemplates: readonly RepoCallbackTemplate[],
 ): string {
   const setting = config.events[eventType];
+  // An explicit per-repo custom override takes precedence over template references.
+  if (setting.customPrompt?.trim()) {
+    return setting.customPrompt.trim();
+  }
   if (setting.templateScope === 'repo' && setting.templateId) {
     const found = config.templates.find((tpl) => tpl.id === setting.templateId);
     if (found?.prompt.trim()) return found.prompt;
@@ -286,9 +290,6 @@ export function resolveRepoCallbackPromptTemplate(
   if (setting.templateScope === 'global' && setting.templateId) {
     const found = globalTemplates.find((tpl) => tpl.id === setting.templateId);
     if (found?.prompt.trim()) return found.prompt;
-  }
-  if (setting.customPrompt?.trim()) {
-    return setting.customPrompt.trim();
   }
   return REPO_CALLBACK_DEFAULT_PROMPTS[eventType];
 }
@@ -313,15 +314,15 @@ export function renderRepoCallbackPrompt(template: string, ctx: RepoCallbackProm
     rendered = rendered.split(token).join(value);
   }
   const toolName = CALLBACK_MCP_TOOLS.UPDATE;
-  if (!rendered.includes(toolName)) {
-    rendered = [
-      rendered.trimEnd(),
-      '',
-      `[Callback ID: ${ctx.callbackId} | source: ${CALLBACK_SOURCES.REPO}]`,
-      `Call MCP tool \`${toolName}\` with callbackId="${ctx.callbackId}", status="in_progress"|"done"|"ignored"|"failed", and a concise summary (optional: source="${CALLBACK_SOURCES.REPO}", relatedTaskId if you call pair_create for code changes, metadata).`,
-    ].join('\n');
-  }
-  return rendered.trim();
+  // Unconditionally attach the daemon-authored callback envelope so custom prompts
+  // or remote titles/details containing "callback_update" or stale IDs never strip
+  // the authoritative callbackId and MCP parameter instructions.
+  const envelope = [
+    `[Callback ID: ${ctx.callbackId} | source: ${CALLBACK_SOURCES.REPO}]`,
+    `Call MCP tool \`${toolName}\` with callbackId="${ctx.callbackId}", status="in_progress"|"done"|"ignored"|"failed", and a concise summary (optional: source="${CALLBACK_SOURCES.REPO}", relatedTaskId if you call pair_create for code changes, metadata).`,
+  ].join('\n');
+  const trimmedBody = rendered.trimEnd();
+  return trimmedBody ? `${trimmedBody}\n\n${envelope}` : envelope;
 }
 
 export function buildRepoCallbackDedupKey(

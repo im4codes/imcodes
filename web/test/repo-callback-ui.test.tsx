@@ -4,11 +4,12 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/preact';
 import { REPO_MSG } from '@shared/repo-types.js';
-import { REPO_CALLBACK_PREF_KEYS, repoCallbackServerPrefKey } from '@shared/repo-callback.js';
+import { REPO_CALLBACK_PREF_KEYS, repoCallbackServerPrefKey, resolveRepoCallbackPromptTemplate, type RepoCallbackRepoConfig, type RepoCallbackTemplate } from '@shared/repo-callback.js';
 import type { CallbackTaskRecord } from '@shared/callback-types.js';
 import type { WsClient, ServerMessage } from '../src/ws-client.js';
 import { RepoPage } from '../src/pages/RepoPage.js';
 import { buildRepoCallbackTargetOptions } from '../src/repo-callback-prefs.js';
+import { getUserPref } from '../src/api.js';
 
 const prefStore = new Map<string, unknown>();
 
@@ -117,6 +118,26 @@ beforeEach(() => {
 
 afterEach(cleanup);
 
+async function openModalAndAwaitPrefs() {
+  const prevCalls = vi.mocked(getUserPref).mock.calls.length;
+  fireEvent.click(screen.getByText('Monitor & Callback'));
+  expect(screen.getByRole('dialog')).toBeTruthy();
+  await waitFor(() => {
+    expect(vi.mocked(getUserPref).mock.calls.length).toBeGreaterThanOrEqual(prevCalls + 2);
+  });
+  await new Promise((r) => setTimeout(r, 0));
+  await waitFor(() => {
+    expect((screen.getByRole('button', { name: 'Save settings' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+}
+
+// Dispatch a native DOM 'change' event for <select> controls regardless of whether another
+// mounted component in the same Vitest process has flipped @testing-library/preact's isCompat flag.
+function changeSelect(selectEl: HTMLSelectElement, value: string) {
+  selectEl.value = value;
+  selectEl.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
 describe('RepoCallbackModal & RepoPage callback integration', () => {
   it('configures events, reuses global templates across repos, isolates repo templates, switches Brain/sub-session target, and renders independent callbacks', async () => {
     const ws = createMockWs();
@@ -185,9 +206,8 @@ describe('RepoCallbackModal & RepoPage callback integration', () => {
       callbacks: initialCallbacks,
     });
 
-    // Open Monitor & Callback modal from RepoPage header
-    fireEvent.click(screen.getByText('Monitor & Callback'));
-    expect(screen.getByRole('dialog')).toBeTruthy();
+    // Open Monitor & Callback modal from RepoPage header and wait for initial prefs load
+    await openModalAndAwaitPrefs();
 
     // Critical CI event indicator is visible and default target is Project Brain
     expect(screen.getByText('Critical')).toBeTruthy();
@@ -283,5 +303,154 @@ describe('RepoCallbackModal & RepoPage callback integration', () => {
     fireEvent.change(tplSelectB, { target: { value: globalOption!.value } });
     const promptB = screen.getByLabelText('New CI failure (Actions / Pipelines) Callback prompt') as HTMLTextAreaElement;
     expect(promptB.value).toContain('Triage CI {{title}}');
+  });
+
+  it('F3: preserves edited overrides over selected global/repo templates after save+reload while keeping unedited template references live-updatable', async () => {
+    const serverKey = repoCallbackServerPrefKey('srv-1');
+    prefStore.set(REPO_CALLBACK_PREF_KEYS.GLOBAL_TEMPLATES, {
+      version: 1,
+      templates: [
+        {
+          id: 'global_g1',
+          name: 'Global Base',
+          scope: 'global',
+          eventType: 'pr_new',
+          prompt: 'Original global prompt',
+          updatedAt: 100,
+        },
+      ],
+    });
+    prefStore.set(serverKey, {
+      version: 1,
+      repos: {
+        '/work/repo-a': {
+          projectDir: '/work/repo-a',
+          enabled: true,
+          intervalMs: 120_000,
+          target: 'brain',
+          events: {
+            pr_new: { enabled: true, templateScope: 'default' },
+            issue_new: { enabled: false, templateScope: 'default' },
+            ci_failed: { enabled: true, templateScope: 'default' },
+          },
+          templates: [
+            {
+              id: 'repo_r1',
+              name: 'Repo Base',
+              scope: 'repo',
+              eventType: 'issue_new',
+              prompt: 'Original repo prompt',
+              updatedAt: 100,
+            },
+          ],
+          updatedAt: 100,
+        },
+      },
+    });
+
+    const ws1 = createMockWs();
+    const { unmount } = render(<RepoPage ws={ws1} serverId="srv-1" projectDir="/work/repo-a" />);
+    await openModalAndAwaitPrefs();
+
+    // Expand PR prompt editor (initially ci_failed is expanded, so Edit prompt buttons are [0]=pr_new, [1]=issue_new)
+    const editButtons = screen.getAllByText('Edit prompt');
+    fireEvent.click(editButtons[0]!);
+
+    await waitFor(() => {
+      expect(screen.getByText('[Global] Global Base')).toBeTruthy();
+    });
+    const prTplSelect = screen.getByLabelText('New Pull Request Prompt template') as HTMLSelectElement;
+    changeSelect(prTplSelect, 'global:global_g1');
+    const prTextarea = await waitFor(() => {
+      const ta = screen.getByLabelText('New Pull Request Callback prompt') as HTMLTextAreaElement;
+      expect(ta.value).toBe('Original global prompt');
+      return ta;
+    });
+    fireEvent.input(prTextarea, { target: { value: 'Edited global prompt saved' } });
+
+    // Also select Repo Base for issue_new, edit text, and save settings (now [0]=ci_failed, [1]=issue_new)
+    fireEvent.click(screen.getAllByText('Edit prompt')[1]!);
+    const issueTplSelect = await waitFor(() => screen.getByLabelText('New Issue Prompt template') as HTMLSelectElement);
+    changeSelect(issueTplSelect, 'repo:repo_r1');
+    const issueTextarea = screen.getByLabelText('New Issue Callback prompt') as HTMLTextAreaElement;
+    fireEvent.input(issueTextarea, { target: { value: 'Edited repo prompt saved' } });
+
+    fireEvent.click(screen.getByText('Save settings'));
+    await waitFor(() => {
+      expect(ws1.repoCallbackSync).toHaveBeenCalled();
+    });
+
+    const savedServerPrefs = prefStore.get(serverKey) as { repos: Record<string, RepoCallbackRepoConfig> };
+    const savedGlobal = prefStore.get(REPO_CALLBACK_PREF_KEYS.GLOBAL_TEMPLATES) as { templates: RepoCallbackTemplate[] };
+    const savedRepoCfg = savedServerPrefs.repos['/work/repo-a']!;
+    expect(resolveRepoCallbackPromptTemplate(savedRepoCfg, 'pr_new', savedGlobal.templates)).toBe('Edited global prompt saved');
+    expect(resolveRepoCallbackPromptTemplate(savedRepoCfg, 'issue_new', savedGlobal.templates)).toBe('Edited repo prompt saved');
+
+    // Unmount & reload modal: edited text must remain visible
+    unmount();
+    const ws2 = createMockWs();
+    const view2 = render(<RepoPage ws={ws2} serverId="srv-1" projectDir="/work/repo-a" />);
+    await openModalAndAwaitPrefs();
+    fireEvent.click(screen.getAllByText('Edit prompt')[0]!);
+    await waitFor(() => {
+      expect((screen.getByLabelText('New Pull Request Callback prompt') as HTMLTextAreaElement).value).toBe('Edited global prompt saved');
+    });
+
+    // Now re-select global:global_g1 WITHOUT editing, save, then update global template externally
+    changeSelect(screen.getByLabelText('New Pull Request Prompt template') as HTMLSelectElement, 'global:global_g1');
+    await waitFor(() => {
+      expect((screen.getByLabelText('New Pull Request Callback prompt') as HTMLTextAreaElement).value).toBe('Original global prompt');
+    });
+    fireEvent.click(screen.getByText('Save settings'));
+    await waitFor(() => {
+      expect(ws2.repoCallbackSync).toHaveBeenCalled();
+    });
+    view2.unmount();
+
+    prefStore.set(REPO_CALLBACK_PREF_KEYS.GLOBAL_TEMPLATES, {
+      version: 1,
+      templates: [
+        {
+          id: 'global_g1',
+          name: 'Global Base',
+          scope: 'global',
+          eventType: 'pr_new',
+          prompt: 'Global prompt v2 live',
+          updatedAt: 200,
+        },
+      ],
+    });
+
+    const savedAfterLive = (prefStore.get(serverKey) as { repos: Record<string, RepoCallbackRepoConfig> }).repos['/work/repo-a']!;
+    const globalV2 = (prefStore.get(REPO_CALLBACK_PREF_KEYS.GLOBAL_TEMPLATES) as { templates: RepoCallbackTemplate[] }).templates;
+    expect(resolveRepoCallbackPromptTemplate(savedAfterLive, 'pr_new', globalV2)).toBe('Global prompt v2 live');
+
+    const ws3 = createMockWs();
+    render(<RepoPage ws={ws3} serverId="srv-1" projectDir="/work/repo-a" />);
+    await openModalAndAwaitPrefs();
+    fireEvent.click(screen.getAllByText('Edit prompt')[0]!);
+    await waitFor(() => {
+      expect((screen.getByLabelText('New Pull Request Callback prompt') as HTMLTextAreaElement).value).toBe('Global prompt v2 live');
+    });
+  });
+
+  it('renders callback modal controls cleanly at 375px narrow viewport without fixed wide minWidth overflows', async () => {
+    const origInnerWidth = window.innerWidth;
+    Object.defineProperty(window, 'innerWidth', { value: 375, configurable: true, writable: true });
+    try {
+      const ws = createMockWs();
+      render(<RepoPage ws={ws} serverId="srv-1" projectDir="/work/repo-a" />);
+      await openModalAndAwaitPrefs();
+
+      const dialog = screen.getByRole('dialog');
+      const modalCard = dialog.firstElementChild as HTMLElement | null;
+      expect(modalCard?.style.width).toBe('100%');
+      expect(modalCard?.style.overflow).toBe('hidden');
+      // ci_failed starts expanded; verify template select fits container
+      const selectEl = screen.getByLabelText('New CI failure (Actions / Pipelines) Prompt template') as HTMLSelectElement;
+      expect(selectEl.style.maxWidth).toBe('100%');
+    } finally {
+      Object.defineProperty(window, 'innerWidth', { value: origInnerWidth, configurable: true, writable: true });
+    }
   });
 });
