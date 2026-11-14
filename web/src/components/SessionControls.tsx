@@ -181,7 +181,7 @@ import { recordPerfRender } from '../perf-render-debug.js';
 export const COMPOSER_HEIGHT_STORAGE_KEY = 'imcodes_composer_height_v1';
 export const ATTACHMENT_BADGE_COLLAPSE_THRESHOLD = 3;
 export const ATTACHMENT_BADGE_COLLAPSED_VISIBLE_COUNT = 2;
-const VOICE_HOLD_DELAY_MS = 45;
+const VOICE_HOLD_DELAY_MS = 240;
 const VOICE_HOLD_MOVE_SLOP_PX = 18;
 const VOICE_HOLD_CANCEL_THRESHOLD_PX = 44;
 const VOICE_HOLD_EDIT_THRESHOLD_PX = 44;
@@ -5445,8 +5445,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     // iOS/Android native tap-to-focus and prevents the soft keyboard / IME
     // from opening when tapping the composer. Note that even while an earlier
     // voice hold drain (voiceHoldTxRef.current) is still settling, pointerdown
-    // tracks short taps (<45ms) so tap-to-type is never locked out. If the
-    // press reaches 45ms without an active drain, the timer disables
+    // tracks short taps (<240ms) so tap-to-type is never locked out. If the
+    // press reaches 240ms without an active drain, the timer disables
     // contenteditable and blurs to suppress iOS loupe/keyboard.
     setVoiceHoldError(null);
     const pointerId = event.pointerId ?? 1;
