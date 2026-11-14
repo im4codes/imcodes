@@ -8972,11 +8972,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               <div class="voice-hold-hud-aurora" />
               <div class="voice-hold-hud-aurora-core" />
             </div>
-            <div class="voice-hold-hud-card">
+            <div class="voice-hold-hud-transcript-stage">
               <div ref={voiceHoldTranscriptRef} class="voice-hold-hud-transcript">
                 {voiceHoldText.trim() ? voiceHoldText : t('voice.buffering_hint')}
                 <VoiceStreamingRobot active={voiceHoldRecognizing} />
               </div>
+            </div>
+            <div class="voice-hold-hud-card">
               <div class="voice-hold-hud-header">
                 <span class={`voice-hold-hud-recognizing${voiceHoldRecognizing ? ' is-recognizing' : ''}`}>
                   <span

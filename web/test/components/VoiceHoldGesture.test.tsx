@@ -333,6 +333,8 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(hud.querySelector('.voice-hold-hud-atmosphere')).not.toBeNull();
     expect(hud.querySelector('.voice-hold-hud-aurora')).not.toBeNull();
     expect(hud.querySelector('.voice-hold-hud-aurora-core')).not.toBeNull();
+    expect(hud.querySelector('.voice-hold-hud-transcript-stage .voice-hold-hud-transcript')).not.toBeNull();
+    expect(hud.querySelector('.voice-hold-hud-card .voice-hold-hud-transcript')).toBeNull();
     expect(hud.querySelector('.voice-hold-hud-grid')).toBeNull();
     expect(hud.querySelector('.voice-hold-fan-svg')).toBeNull();
     expect(hud.querySelector('.voice-hold-fan-sector')).toBeNull();
@@ -1103,8 +1105,10 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
                 <div class="voice-hold-hud-aurora"></div>
                 <div class="voice-hold-hud-aurora-core"></div>
               </div>
-              <div class="voice-hold-hud-card">
+              <div class="voice-hold-hud-transcript-stage">
                 <div class="voice-hold-hud-transcript">Hello<span class="voice-streaming-robot-cursor is-active"><svg><circle class="voice-robot-antenna"></circle></svg></span></div>
+              </div>
+              <div class="voice-hold-hud-card">
                 <div class="voice-hold-hud-header">
                   <span class="voice-hold-hud-recognizing is-recognizing">
                     <span class="voice-status-dot voice-status-dot-active voice-status-dot-recognizing"></span>
@@ -1120,7 +1124,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
           </body></html>`);
 
           for (const zone of ['send', 'cancel', 'edit'] as const) {
-            const computed = await page.evaluate((z) => {
+            const computed = await page.evaluate(async ({ z, waitMs }) => {
               const hud = document.querySelector('.voice-hold-hud') as HTMLElement;
               hud.className = `voice-hold-hud voice-hold-hud-zone-${z}`;
               hud.style.setProperty('--voice-slide-x', z === 'cancel' ? '-52px' : z === 'edit' ? '52px' : '0px');
@@ -1128,6 +1132,9 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
               hint.className = `voice-hold-hud-active-hint is-${z}`;
               for (const k of ['cancel', 'send', 'edit']) {
                 document.querySelector(`.voice-hold-zone-${k}`)!.classList.toggle('is-active', k === z);
+              }
+              if (waitMs > 0) {
+                await new Promise((resolve) => setTimeout(resolve, waitMs));
               }
               const gs = (sel: string, pseudo?: string) => getComputedStyle(document.querySelector(sel)!, pseudo);
               return {
@@ -1141,8 +1148,10 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
                 robotCursor: gs('.voice-streaming-robot-cursor.is-active').animationName,
                 robotAntenna: gs('.voice-robot-antenna').animationName,
                 atmosphereTrans: gs('.voice-hold-hud-atmosphere').transitionProperty,
+                hudTrans: gs('.voice-hold-hud').transitionProperty,
                 auroraTrans: gs('.voice-hold-hud-aurora').transitionProperty,
                 auroraCoreTrans: gs('.voice-hold-hud-aurora-core').transitionProperty,
+                transcriptTrans: gs('.voice-hold-hud-transcript').transitionProperty,
                 barTrans: gs('.voice-hold-hud-bar').transitionProperty,
                 dotTrans: gs('.voice-status-dot').transitionProperty,
                 hintTrans: gs('.voice-hold-hud-active-hint').transitionProperty,
@@ -1153,6 +1162,14 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
                 cardBorderTopStyle: gs('.voice-hold-hud-card').borderTopStyle,
                 cardBorderTopWidth: gs('.voice-hold-hud-card').borderTopWidth,
                 transcriptBorderTopStyle: gs('.voice-hold-hud-transcript').borderTopStyle,
+                transcriptBorderTopWidth: gs('.voice-hold-hud-transcript').borderTopWidth,
+                transcriptBorderTopColor: gs('.voice-hold-hud-transcript').borderTopColor,
+                transcriptBorderRadius: gs('.voice-hold-hud-transcript').borderRadius,
+                transcriptBackgroundImage: gs('.voice-hold-hud-transcript').backgroundImage,
+                transcriptBoxShadow: gs('.voice-hold-hud-transcript').boxShadow,
+                transcriptBackdropFilter: gs('.voice-hold-hud-transcript').backdropFilter || gs('.voice-hold-hud-transcript').getPropertyValue('-webkit-backdrop-filter'),
+                transcriptPointerEvents: gs('.voice-hold-hud-transcript').pointerEvents,
+                hudPointerEvents: gs('.voice-hold-hud').pointerEvents,
                 hintBorderTopStyle: gs('.voice-hold-hud-active-hint').borderTopStyle,
                 zoneBorderTopStyle: gs(`.voice-hold-zone-${z}`).borderTopStyle,
                 trailing2PaddingRight: gs('.controls-input-with-trailing-2').paddingRight,
@@ -1162,7 +1179,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
                 overlayBorderRadius: gs('.voice-overlay').borderRadius,
                 overlayZIndex: gs('.voice-overlay').zIndex,
               };
-            }, zone);
+            }, { z: zone, waitMs: reducedMotion === 'no-preference' && zone !== 'send' ? 240 : 0 });
 
             expect(computed.trailing2PaddingRight).toBe('96px');
             expect(computed.trailing1PaddingRight).toBe('54px');
@@ -1175,7 +1192,17 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
             expect(computed.auroraFilter).toContain('blur(');
             expect(computed.cardBorderTopStyle).toBe('none');
             expect(computed.cardBorderTopWidth).toBe('0px');
-            expect(computed.transcriptBorderTopStyle).toBe('none');
+            expect(computed.transcriptBorderTopStyle).toBe('solid');
+            expect(computed.transcriptBorderTopWidth).toBe('1px');
+            expect(computed.transcriptBorderRadius).toBe('20px');
+            expect(computed.transcriptBackgroundImage).toContain('linear-gradient');
+            expect(computed.transcriptBoxShadow).not.toBe('none');
+            expect(computed.transcriptBackdropFilter).toContain('blur(');
+            expect(computed.transcriptPointerEvents).toBe('none');
+            expect(computed.hudPointerEvents).toBe('none');
+            if (zone === 'send') expect(computed.transcriptBorderTopColor).toContain('56, 189, 248');
+            if (zone === 'cancel') expect(computed.transcriptBorderTopColor).toContain('248, 113, 113');
+            if (zone === 'edit') expect(computed.transcriptBorderTopColor).toContain('52, 211, 153');
             expect(computed.hintBorderTopStyle).toBe('none');
             expect(computed.zoneBorderTopStyle).toBe('none');
 
@@ -1189,9 +1216,11 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
               expect(computed.recDot).toBe('none');
               expect(computed.robotCursor).toBe('none');
               expect(computed.robotAntenna).toBe('none');
+              expect(computed.hudTrans).toBe('none');
               expect(computed.atmosphereTrans).toBe('none');
               expect(computed.auroraTrans).toBe('none');
               expect(computed.auroraCoreTrans).toBe('none');
+              expect(computed.transcriptTrans).toBe('none');
               expect(computed.barTrans).toBe('none');
               expect(computed.dotTrans).toBe('none');
               expect(computed.hintTrans).toBe('none');
@@ -1214,6 +1243,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
 
       const viewports = [
         { width: 320, height: 568, sat: 0, sab: 0 },
+        { width: 390, height: 500, sat: 0, sab: 0 },
         { width: 390, height: 844, sat: 47, sab: 34 },
         { width: 430, height: 932, sat: 59, sab: 34 },
       ];
@@ -1232,8 +1262,10 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
                 <div class="voice-hold-hud-aurora"></div>
                 <div class="voice-hold-hud-aurora-core"></div>
               </div>
-              <div class="voice-hold-hud-card">
+              <div class="voice-hold-hud-transcript-stage">
                 <div class="voice-hold-hud-transcript"></div>
+              </div>
+              <div class="voice-hold-hud-card">
                 <div class="voice-hold-hud-header">
                   <span class="voice-hold-hud-recognizing is-recognizing">
                     <span class="voice-status-dot voice-status-dot-active voice-status-dot-recognizing"></span>
@@ -1303,6 +1335,10 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
                     cancelLeft: cancelCue.left,
                     editRight: editCue.right,
                     hintBottom: Math.round(hint.bottom),
+                    transcriptTop: Math.round(transcript.top),
+                    transcriptBottom: Math.round(transcript.bottom),
+                    transcriptCenterX: Math.round(transcript.left + transcript.width / 2),
+                    transcriptCenterY: Math.round(transcript.top + transcript.height / 2),
                     transcriptH: Math.round(transcript.height),
                     transcriptScrollH: trEl.scrollHeight,
                     transcriptClientH: trEl.clientHeight,
@@ -1327,6 +1363,15 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
                 expect(m.headerTop, `${code}/${zone}/${mode} headerTop`).toBeGreaterThanOrEqual(m.cardTop);
                 expect(m.zonesBottom, `${code}/${zone}/${mode} zonesBottom`).toBeLessThanOrEqual(vp.height - 20 - vp.sab);
                 expect(m.hintBottom, `${code}/${zone}/${mode} hintBottom`).toBeLessThanOrEqual(m.cardBottom);
+                expect(m.transcriptTop, `${code}/${zone}/${mode} transcriptTop`).toBeGreaterThanOrEqual(12 + vp.sat);
+                expect(m.transcriptBottom, `${code}/${zone}/${mode} transcriptBottom vs cardTop`).toBeLessThanOrEqual(m.cardTop);
+                expect(Math.abs(m.transcriptCenterX - vp.width / 2), `${code}/${zone}/${mode} transcriptCenterX`).toBeLessThanOrEqual(2);
+                if (vp.height >= 800) {
+                  expect(m.transcriptCenterY, `${code}/${zone}/${mode} transcriptCenterY`).toBeGreaterThanOrEqual(vp.height * 0.38);
+                  expect(m.transcriptCenterY, `${code}/${zone}/${mode} transcriptCenterY`).toBeLessThanOrEqual(vp.height * 0.56);
+                } else {
+                  expect(m.transcriptCenterY, `${code}/${zone}/${mode} short-screen transcriptCenterY`).toBeLessThan(m.cardTop);
+                }
                 expect(m.scrollOverflow, `${code}/${zone}/${mode} overflow`).toBe(false);
                 expect(m.cancelCenterX).toBeLessThan(m.sendCenterX);
                 expect(m.sendCenterX).toBeLessThan(m.editCenterX);
