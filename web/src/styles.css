@@ -3408,10 +3408,11 @@ html.native-ios-mac .chat-dl-btn {
   padding-top: calc(12px + max(var(--sat, 0px), env(safe-area-inset-top, 0px)));
   box-sizing: border-box;
   z-index: 2147483022;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: flex-end;
+  container-type: size;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  justify-items: center;
+  align-items: stretch;
   background: radial-gradient(
     ellipse 92% 62% at 50% 48%,
     rgba(2, 6, 23, 0.56) 0%,
@@ -3535,7 +3536,7 @@ html.native-ios-mac .chat-dl-btn {
   z-index: 1;
   width: 100%;
   max-width: 520px;
-  flex: 0 0 auto;
+  max-height: calc(100cqh - 48px);
   min-height: 0;
   box-sizing: border-box;
   padding: 12px 20px calc(22px + max(var(--sab, 0px), env(safe-area-inset-bottom, 0px)));
@@ -3586,6 +3587,7 @@ html.native-ios-mac .chat-dl-btn {
 .voice-hold-hud-bar {
   width: 3px;
   min-height: 5px;
+  max-height: 100%;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.94);
   box-shadow: 0 0 10px rgba(103, 232, 249, 0.45);
@@ -3602,8 +3604,8 @@ html.native-ios-mac .chat-dl-btn {
   z-index: 2;
   width: 100%;
   max-width: 520px;
-  flex: 1 1 0;
   min-height: 0;
+  height: 100%;
   padding: 8px 20px 10px;
   box-sizing: border-box;
   display: flex;
@@ -3629,7 +3631,7 @@ html.native-ios-mac .chat-dl-btn {
   width: fit-content;
   min-width: min(210px, 100%);
   max-width: min(100%, 440px);
-  min-height: min(48px, 100%);
+  min-height: 0;
   max-height: min(320px, 100%);
   box-sizing: border-box;
   flex: 0 1 auto;
@@ -3776,6 +3778,66 @@ html.native-ios-mac .chat-dl-btn {
   background: radial-gradient(ellipse at center, rgba(16, 185, 129, 0.36) 0%, transparent 74%);
   filter: drop-shadow(0 0 12px rgba(52, 211, 153, 0.58));
   transform: scale(1.04);
+}
+@container (max-height: 420px) {
+  .voice-hold-hud-transcript-stage {
+    padding: 4px 16px 6px;
+  }
+  .voice-hold-hud-transcript {
+    padding: 10px 16px;
+    border-radius: 16px;
+    font-size: 15px;
+    line-height: 1.45;
+  }
+  .voice-hold-hud-card {
+    padding: 6px 18px calc(10px + max(var(--sab, 0px), env(safe-area-inset-bottom, 0px)));
+    gap: 5px;
+  }
+  .voice-hold-hud-waveform {
+    height: 20px;
+  }
+  .voice-hold-hud-active-hint {
+    font-size: 13px;
+  }
+  .voice-hold-zone {
+    padding: 4px 6px;
+  }
+}
+@container (max-height: 300px) {
+  .voice-hold-hud-transcript-stage {
+    padding: 2px 16px 4px;
+  }
+  .voice-hold-hud-transcript {
+    padding: 5px 12px;
+    border-radius: 14px;
+    font-size: 13px;
+    line-height: 1.35;
+  }
+  .voice-hold-hud-card {
+    padding: 4px 16px calc(6px + max(var(--sab, 0px), env(safe-area-inset-bottom, 0px)));
+    gap: 3px;
+    overflow-y: auto;
+  }
+  .voice-hold-hud-recognizing {
+    font-size: 11px;
+  }
+  .voice-hold-hud-active-hint {
+    font-size: 12px;
+    padding: 0 8px;
+  }
+  .voice-hold-hud-waveform {
+    height: 14px;
+  }
+  .voice-hold-hud-zones {
+    padding-top: 0;
+  }
+  .voice-hold-zone {
+    padding: 2px 6px;
+  }
+  .voice-hold-zone-label {
+    font-size: 11px;
+    line-height: 1.15;
+  }
 }
 .voice-streaming-robot-cursor {
   display: inline-flex;

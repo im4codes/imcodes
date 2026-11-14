@@ -1389,6 +1389,120 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
           await context.close();
         }
       }
+
+      // Compressed --vvh portrait/landscape counterexamples: physical viewport height unchanged, only --vvh shrinks
+      const compressedCases = [
+        { width: 390, height: 844, sat: 47, sab: 34, vvh: 250 },
+        { width: 844, height: 390, sat: 0, sab: 21, vvh: 200 },
+        { width: 844, height: 390, sat: 0, sab: 21, vvh: undefined },
+      ];
+      for (const vc of compressedCases) {
+        const effectiveH = vc.vvh ?? vc.height;
+        const context = await browser.newContext({ viewport: { width: vc.width, height: vc.height }, hasTouch: true });
+        const page = await context.newPage();
+        try {
+          const vvhStyle = vc.vvh !== undefined ? `--vvh:${vc.vvh}px;` : '';
+          await page.setContent(`<!doctype html><html style="--sat:${vc.sat}px;--sab:${vc.sab}px;${vvhStyle}"><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${css}</style></head><body>
+            <div class="voice-hold-hud voice-hold-hud-zone-send">
+              <div class="voice-hold-hud-atmosphere">
+                <div class="voice-hold-hud-aurora"></div>
+                <div class="voice-hold-hud-aurora-core"></div>
+              </div>
+              <div class="voice-hold-hud-transcript-stage">
+                <div class="voice-hold-hud-transcript"></div>
+              </div>
+              <div class="voice-hold-hud-card">
+                <div class="voice-hold-hud-header">
+                  <span class="voice-hold-hud-recognizing is-recognizing">
+                    <span class="voice-status-dot voice-status-dot-active voice-status-dot-recognizing"></span>
+                    <span class="voice-recognizing-dots"><i></i><i></i><i></i></span>
+                    <span class="test-rec-label"></span>
+                  </span>
+                </div>
+                <div class="voice-hold-hud-active-hint is-send"></div>
+                <div class="voice-hold-hud-waveform">${barsHtml}</div>
+                <div class="voice-hold-hud-zones">${zonesHtml}</div>
+              </div>
+            </div>
+          </body></html>`);
+
+          for (const { code, json } of locales) {
+            const v = json.voice;
+            for (const zone of ['send', 'cancel', 'edit'] as const) {
+              const activeHint = zone === 'cancel' ? v.release_to_cancel : zone === 'edit' ? v.release_to_edit : v.release_to_send;
+              for (const [mode, textVal] of [['short', 'Hello'], ['long', longText]] as const) {
+                const m = await page.evaluate(({ zone: z, recLabel, textVal: tv, activeHint: ah, cancelLabel, sendLabel, editLabel }) => {
+                  const hudEl = document.querySelector('.voice-hold-hud') as HTMLElement;
+                  hudEl.className = `voice-hold-hud voice-hold-hud-zone-${z}`;
+                  document.querySelector('.test-rec-label')!.textContent = recLabel;
+                  const trEl = document.querySelector('.voice-hold-hud-transcript') as HTMLElement;
+                  trEl.textContent = tv;
+                  const hintEl = document.querySelector('.voice-hold-hud-active-hint')!;
+                  hintEl.className = `voice-hold-hud-active-hint is-${z}`;
+                  hintEl.textContent = ah;
+                  document.querySelector('.test-cancel-label')!.textContent = cancelLabel;
+                  document.querySelector('.test-send-label')!.textContent = sendLabel;
+                  document.querySelector('.test-edit-label')!.textContent = editLabel;
+                  for (const k of ['cancel', 'send', 'edit']) {
+                    document.querySelector(`.voice-hold-zone-${k}`)!.classList.toggle('is-active', k === z);
+                  }
+                  const cardEl = document.querySelector('.voice-hold-hud-card') as HTMLElement;
+                  const stageEl = document.querySelector('.voice-hold-hud-transcript-stage') as HTMLElement;
+                  const r = (el: Element) => el.getBoundingClientRect();
+                  const hud = r(hudEl);
+                  const stage = r(stageEl);
+                  const transcript = r(trEl);
+                  const card = r(cardEl);
+                  const zones = r(document.querySelector('.voice-hold-hud-zones')!);
+                  return {
+                    hudBottom: Math.round(hud.bottom),
+                    stageTop: Math.round(stage.top),
+                    transcriptTop: Math.round(transcript.top),
+                    transcriptBottom: Math.round(transcript.bottom),
+                    transcriptCenterX: Math.round(transcript.left + transcript.width / 2),
+                    cardTop: Math.round(card.top),
+                    cardBottom: Math.round(card.bottom),
+                    cardScrollH: cardEl.scrollHeight,
+                    cardClientH: cardEl.clientHeight,
+                    zonesBottom: Math.round(zones.bottom),
+                    transcriptScrollH: trEl.scrollHeight,
+                    transcriptClientH: trEl.clientHeight,
+                    scrollOverflow: document.documentElement.scrollWidth > window.innerWidth,
+                    hudPointerEvents: getComputedStyle(hudEl).pointerEvents,
+                    transcriptPointerEvents: getComputedStyle(trEl).pointerEvents,
+                  };
+                }, {
+                  zone,
+                  recLabel: v.recognizing,
+                  textVal,
+                  activeHint,
+                  cancelLabel: v.slide_left_cancel,
+                  sendLabel: v.release_to_send,
+                  editLabel: v.slide_right_edit,
+                });
+
+                const label = `${vc.width}x${vc.height}/vvh=${vc.vvh ?? 'none'}/${code}/${zone}/${mode}`;
+                expect(m.hudBottom, `${label} hudBottom`).toBe(effectiveH);
+                expect(m.stageTop, `${label} stageTop`).toBeGreaterThanOrEqual(12 + vc.sat);
+                expect(m.transcriptTop, `${label} transcriptTop`).toBeGreaterThanOrEqual(12 + vc.sat);
+                expect(m.transcriptBottom, `${label} transcriptBottom <= cardTop`).toBeLessThanOrEqual(m.cardTop);
+                expect(m.cardBottom, `${label} cardBottom`).toBeLessThanOrEqual(effectiveH);
+                expect(m.cardScrollH, `${label} card not clipped`).toBeLessThanOrEqual(m.cardClientH + 1);
+                expect(m.zonesBottom, `${label} zonesBottom`).toBeLessThanOrEqual(effectiveH - vc.sab);
+                expect(Math.abs(m.transcriptCenterX - vc.width / 2), `${label} centerX`).toBeLessThanOrEqual(2);
+                expect(m.scrollOverflow, `${label} overflow`).toBe(false);
+                expect(m.hudPointerEvents).toBe('none');
+                expect(m.transcriptPointerEvents).toBe('none');
+                if (mode === 'long') {
+                  expect(m.transcriptScrollH, `${label} scrollable`).toBeGreaterThan(m.transcriptClientH);
+                }
+              }
+            }
+          }
+        } finally {
+          await context.close();
+        }
+      }
     } finally {
       await browser.close();
     }
