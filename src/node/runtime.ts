@@ -1372,6 +1372,13 @@ export function createControlledNodeRuntime(
     const repair = options.repairMissingRemoteDesktopWorker
       ?? ((targetVersion: string) => startControlledNodeSelfUpgrade(credential, targetVersion));
     void repair(DAEMON_VERSION).then((result) => {
+      if (result.alreadyCurrent) {
+        clearUpgradeGate();
+        refreshRemoteDesktopCapabilityState();
+        republishCapabilitiesIfChanged();
+        logger.info({ targetVersion: result.targetVersion }, 'controlled node release artifacts already match disk; skipping repair handoff');
+        return;
+      }
       if (result.ok) {
         client.send({
           type: DAEMON_MSG.UPGRADING,
@@ -1542,6 +1549,13 @@ export function createControlledNodeRuntime(
     pendingDaemonUpgradeTarget = undefined;
     const startSelfUpgrade = options.startSelfUpgrade ?? startControlledNodeSelfUpgrade;
     void startSelfUpgrade(credential, targetVersion).then((result) => {
+      if (result.alreadyCurrent) {
+        clearUpgradeGate();
+        refreshRemoteDesktopCapabilityState();
+        republishCapabilitiesIfChanged();
+        logger.info({ targetVersion: result.targetVersion, artifactSha256: result.artifactSha256 }, 'controlled node release artifacts already match disk; skipping self-upgrade handoff');
+        return;
+      }
       if (result.ok) {
         client.send({ type: DAEMON_MSG.UPGRADING, targetVersion: result.targetVersion, artifactSha256: result.artifactSha256 });
         armUpgradeHandoffWatchdog();

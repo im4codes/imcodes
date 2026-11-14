@@ -1114,6 +1114,63 @@ describe('controlled node enrollment and runtime', () => {
     runtime.stop();
   });
 
+  it('clears upgradeInFlight without emitting UPGRADING or timing out when self-upgrade reports alreadyCurrent', async () => {
+    const socket = new MockSocket();
+    let now = 10_000;
+    const remoteDesktopWorker = {
+      available: vi.fn(() => false),
+      handle: vi.fn(async () => false),
+      applyAutoUnlockSecret: vi.fn(async () => false),
+      autoUnlockConfigured: vi.fn(async () => false),
+      close: vi.fn(),
+    };
+    const repairMissingRemoteDesktopWorker = vi.fn(async () => ({
+      ok: true as const,
+      alreadyCurrent: true as const,
+      targetVersion: DAEMON_VERSION,
+      artifactSha256: 'a'.repeat(64),
+    }));
+    const startSelfUpgrade = vi.fn(async () => ({
+      ok: true as const,
+      alreadyCurrent: true as const,
+      targetVersion: DAEMON_VERSION,
+      artifactSha256: 'a'.repeat(64),
+    }));
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, {
+      platform: 'win32',
+      arch: 'x64',
+      remoteDesktopWorker,
+      repairMissingRemoteDesktopWorker,
+      startSelfUpgrade,
+      now: () => now,
+    });
+    runtime.start();
+    socket.open();
+
+    // First heartbeat_ack arms remoteDesktopWorkerRepairEligibleAt = now + 10_000.
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await Promise.resolve();
+    expect(repairMissingRemoteDesktopWorker).not.toHaveBeenCalled();
+
+    now += 10_000;
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(repairMissingRemoteDesktopWorker).toHaveBeenCalledOnce());
+
+    // Gate was released immediately: a manual upgrade command right afterwards is admitted (not ALREADY_IN_PROGRESS).
+    socket.emit('message', JSON.stringify({ type: 'daemon.upgrade', targetVersion: DAEMON_VERSION }));
+    await vi.waitFor(() => expect(startSelfUpgrade).toHaveBeenCalledOnce());
+
+    const sentTypes = socket.sent.map((raw) => (JSON.parse(raw) as { type: string }).type);
+    expect(sentTypes).not.toContain(DAEMON_MSG.UPGRADING);
+    expect(sentTypes).not.toContain(DAEMON_MSG.UPGRADE_BLOCKED);
+    runtime.stop();
+  });
+
   it('self-repairs a missing Linux worker even when the main version already matches', async () => {
     // A Linux node that upgraded to a version whose own self-upgrade.ts did
     // not yet know how to fetch the worker sidecar (i.e. it upgraded through
