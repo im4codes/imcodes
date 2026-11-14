@@ -10758,4 +10758,203 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
     }
   }, 15000);
+
+  it('switches tabs ±3 in App via 1-finger long-press drag distance on a 4-tab server', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const mkTouchEvent = (
+      type: 'touchstart' | 'touchmove' | 'touchend',
+      touches: Array<{ identifier: number; clientX: number; clientY: number }>,
+      changedTouches: Array<{ identifier: number; clientX: number; clientY: number }> = [],
+    ) => {
+      const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
+        touches: typeof touches;
+        changedTouches: typeof touches;
+      };
+      Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
+      Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
+      return evt;
+    };
+
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') {
+        return {
+          servers: [
+            { id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: Date.now() },
+            { id: 'srv-2', name: 'Server Two', status: 'online', lastHeartbeatAt: Date.now() },
+          ],
+        };
+      }
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/alpha', state: 'idle' },
+            { name: 'deck_beta_brain', project_name: 'beta', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/beta', state: 'idle' },
+            { name: 'deck_gamma_brain', project_name: 'gamma', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/gamma', state: 'idle' },
+            { name: 'deck_delta_brain', project_name: 'delta', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/delta', state: 'idle' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      render(<App />);
+      const alphaPane = await screen.findByTestId('session-pane-deck_alpha_brain');
+      expect(alphaPane.getAttribute('data-is-active')).toBe('true');
+
+      // Right +3: alpha -> delta (155px >= 144px step-3 threshold)
+      await act(async () => {
+        alphaPane.dispatchEvent(mkTouchEvent('touchstart', [{ identifier: 1, clientX: 60, clientY: 200 }]));
+        vi.advanceTimersByTime(400);
+        alphaPane.dispatchEvent(mkTouchEvent('touchmove', [{ identifier: 1, clientX: 215, clientY: 200 }]));
+      });
+      expect(screen.getByTestId('mobile-swipe-hud').getAttribute('data-direction')).toBe('right');
+      expect(screen.getByTestId('mobile-swipe-hud').getAttribute('data-armed')).toBe('true');
+      expect(screen.getByTestId('mobile-swipe-hud').getAttribute('data-step')).toBe('3');
+      expect(screen.getByTestId('mobile-swipe-hud-dir-target-right-3').textContent).toBe('delta');
+      expect(screen.getByTestId('mobile-swipe-hud-dir-target-right-3').getAttribute('data-selected')).toBe('true');
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+
+      await act(async () => {
+        alphaPane.dispatchEvent(mkTouchEvent('touchend', [], [{ identifier: 1, clientX: 215, clientY: 200 }]));
+      });
+      expect(screen.queryByTestId('mobile-swipe-hud')).toBeNull();
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_delta_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('delta');
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['→', '×3']);
+
+      // Left -3: delta -> alpha (-155px)
+      const deltaPane = screen.getByTestId('session-pane-deck_delta_brain');
+      await act(async () => {
+        deltaPane.dispatchEvent(mkTouchEvent('touchstart', [{ identifier: 1, clientX: 240, clientY: 200 }]));
+        vi.advanceTimersByTime(400);
+        deltaPane.dispatchEvent(mkTouchEvent('touchmove', [{ identifier: 1, clientX: 85, clientY: 200 }]));
+      });
+      expect(screen.getByTestId('mobile-swipe-hud').getAttribute('data-direction')).toBe('left');
+      expect(screen.getByTestId('mobile-swipe-hud').getAttribute('data-armed')).toBe('true');
+      expect(screen.getByTestId('mobile-swipe-hud').getAttribute('data-step')).toBe('3');
+      expect(screen.getByTestId('mobile-swipe-hud-dir-target-left-3').textContent).toBe('alpha');
+      expect(screen.getByTestId('mobile-swipe-hud-dir-target-left-3').getAttribute('data-selected')).toBe('true');
+      expect(screen.getByTestId('session-pane-deck_delta_brain').getAttribute('data-is-active')).toBe('true');
+
+      await act(async () => {
+        deltaPane.dispatchEvent(mkTouchEvent('touchend', [], [{ identifier: 1, clientX: 85, clientY: 200 }]));
+      });
+      expect(screen.queryByTestId('mobile-swipe-hud')).toBeNull();
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('alpha');
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['←', '×3']);
+    } finally {
+      vi.useRealTimers();
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 15000);
+
+  it.each([
+    { direction: 'down' as const, step: 2, dy: 115, startServerId: 'srv-1', startSession: 'deck_s1_brain', expectedServerId: 'srv-3', expectedServerName: 'Server Three', expectedSession: 'deck_s3_brain', arrow: '↓' },
+    { direction: 'up' as const, step: 2, dy: -115, startServerId: 'srv-3', startSession: 'deck_s3_brain', expectedServerId: 'srv-1', expectedServerName: 'Server One', expectedSession: 'deck_s1_brain', arrow: '↑' },
+    { direction: 'down' as const, step: 3, dy: 160, startServerId: 'srv-1', startSession: 'deck_s1_brain', expectedServerId: 'srv-4', expectedServerName: 'Server Four', expectedSession: 'deck_s4_brain', arrow: '↓' },
+    { direction: 'up' as const, step: 3, dy: -160, startServerId: 'srv-4', startSession: 'deck_s4_brain', expectedServerId: 'srv-1', expectedServerName: 'Server One', expectedSession: 'deck_s1_brain', arrow: '↑' },
+    { direction: 'down' as const, step: 5, dy: 250, startServerId: 'srv-1', startSession: 'deck_s1_brain', expectedServerId: 'srv-6', expectedServerName: 'Server Six', expectedSession: 'deck_s6_brain', arrow: '↓' },
+    { direction: 'up' as const, step: 5, dy: -250, startServerId: 'srv-6', startSession: 'deck_s6_brain', expectedServerId: 'srv-1', expectedServerName: 'Server One', expectedSession: 'deck_s1_brain', arrow: '↑' },
+  ])(
+    'switches servers $direction ×$step ($startServerId -> $expectedServerId) in App via 1-finger long-press drag distance on tall viewport (>=800px)',
+    async ({ direction, step, dy, startServerId, startSession, expectedServerId, expectedServerName, expectedSession, arrow }) => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const mkTouchEvent = (
+        type: 'touchstart' | 'touchmove' | 'touchend',
+        touches: Array<{ identifier: number; clientX: number; clientY: number }>,
+        changedTouches: Array<{ identifier: number; clientX: number; clientY: number }> = [],
+      ) => {
+        const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
+          touches: typeof touches;
+          changedTouches: typeof touches;
+        };
+        Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
+        Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
+        return evt;
+      };
+
+      const servers = [
+        { id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: Date.now() },
+        { id: 'srv-2', name: 'Server Two', status: 'online', lastHeartbeatAt: Date.now() },
+        { id: 'srv-3', name: 'Server Three', status: 'online', lastHeartbeatAt: Date.now() },
+        { id: 'srv-4', name: 'Server Four', status: 'online', lastHeartbeatAt: Date.now() },
+        { id: 'srv-5', name: 'Server Five', status: 'online', lastHeartbeatAt: Date.now() },
+        { id: 'srv-6', name: 'Server Six', status: 'online', lastHeartbeatAt: Date.now() },
+      ];
+      apiFetchMock.mockImplementation(async (path: string) => {
+        if (path === '/api/auth/user/me') return { id: 'user-1' };
+        if (path === '/api/server') return { servers };
+        const match = /^\/api\/server\/(srv-\d+)\/sessions$/.exec(path);
+        if (match) {
+          const num = match[1].replace('srv-', '');
+          return {
+            sessions: [
+              { name: `deck_s${num}_brain`, project_name: `s${num}`, role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: `/work/s${num}`, state: 'idle' },
+            ],
+          };
+        }
+        if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+        return {};
+      });
+
+      const originalUserAgent = navigator.userAgent;
+      const originalInnerHeightDesc = Object.getOwnPropertyDescriptor(window, 'innerHeight');
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: 844 });
+      try {
+        localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+        localStorage.setItem('rcc_server', startServerId);
+        localStorage.setItem('rcc_session', startSession);
+
+        const { App } = await importApp();
+        const view = render(<App />);
+        await screen.findByTestId(`session-pane-${startSession}`);
+        await waitFor(() => expect(wsInstances.length).toBeGreaterThan(0));
+
+        await act(async () => {
+          view.container.dispatchEvent(mkTouchEvent('touchstart', [{ identifier: 1, clientX: 140, clientY: 400 }]));
+          vi.advanceTimersByTime(400);
+          view.container.dispatchEvent(mkTouchEvent('touchmove', [{ identifier: 1, clientX: 140, clientY: 400 + dy }]));
+        });
+
+        const hud = screen.getByTestId('mobile-swipe-hud');
+        expect(hud.getAttribute('data-direction')).toBe(direction);
+        expect(hud.getAttribute('data-armed')).toBe('true');
+        expect(hud.getAttribute('data-step')).toBe(String(step));
+        const selectedTarget = screen.getByTestId(`mobile-swipe-hud-dir-target-${direction}-${step}`);
+        expect(selectedTarget.textContent).toBe(expectedServerName);
+        expect(selectedTarget.getAttribute('data-selected')).toBe('true');
+        // Must NOT switch mid-drag during touchmove
+        expect(screen.getByTestId(`session-pane-${startSession}`).getAttribute('data-is-active')).toBe('true');
+        expect(screen.queryByTestId(`session-pane-${expectedSession}`)).toBeNull();
+
+        await act(async () => {
+          view.container.dispatchEvent(mkTouchEvent('touchend', [], [{ identifier: 1, clientX: 140, clientY: 400 + dy }]));
+        });
+        expect(screen.queryByTestId('mobile-swipe-hud')).toBeNull();
+
+        await waitFor(() => expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe(expectedServerName));
+        expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual([arrow, `×${step}`]);
+        const nextPane = await screen.findByTestId(`session-pane-${expectedSession}`);
+        expect(nextPane.getAttribute('data-is-active')).toBe('true');
+        expect(localStorage.getItem('rcc_server')).toBe(expectedServerId);
+      } finally {
+        vi.useRealTimers();
+        Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+        if (originalInnerHeightDesc) Object.defineProperty(window, 'innerHeight', originalInnerHeightDesc);
+      }
+    },
+    15000,
+  );
 });
