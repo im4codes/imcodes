@@ -26,7 +26,21 @@ const SERVER_SESSIONS: Record<string, MockSession[]> = {
   ],
 };
 
-async function openDesktopApp(page: Page, platform: 'MacIntel' | 'Linux x86_64') {
+async function openDesktopApp(
+  page: Page,
+  platform: 'MacIntel' | 'Linux x86_64',
+  options?: {
+    subSessions?: Array<{
+      id: string;
+      server_id: string;
+      type: string;
+      runtime_type: 'transport' | 'process';
+      label: string;
+      parent_session?: string | null;
+      cwd?: string | null;
+    }>;
+  },
+) {
   const errors: string[] = [];
   page.on('pageerror', (err) => {
     // Rapid server switching unmounts hidden TerminalView/xterm instances mid-RAF, which can emit
@@ -79,6 +93,34 @@ async function openDesktopApp(page: Page, platform: 'MacIntel' | 'Linux x86_64')
       }
     } else if (path.endsWith('/ws-ticket')) {
       json = { ticket: 'e2e-shortcut-ticket' };
+    } else if (path.endsWith('/sub-sessions')) {
+      const match = path.match(/\/api\/server\/([^/]+)\/sub-sessions$/);
+      const sid = match?.[1] ?? 'srv-1';
+      json = {
+        subSessions: (options?.subSessions ?? []).filter((sub) => sub.server_id === sid).map((sub) => ({
+          id: sub.id,
+          server_id: sub.server_id,
+          type: sub.type,
+          shell_bin: null,
+          runtime_type: sub.runtime_type,
+          provider_id: null,
+          provider_session_id: null,
+          cwd: sub.cwd ?? '/tmp',
+          label: sub.label,
+          closed_at: null,
+          created_at: 1000,
+          updated_at: 1000,
+          cc_session_id: null,
+          gemini_session_id: null,
+          parent_session: sub.parent_session ?? null,
+          description: null,
+          cc_preset_id: null,
+          requested_model: null,
+          active_model: null,
+          effort: null,
+          transport_config: null,
+        })),
+      };
     } else if (path.endsWith('/sessions')) {
       const match = path.match(/\/api\/server\/([^/]+)\/sessions$/);
       const sid = match?.[1] ?? 'srv-1';
@@ -302,5 +344,76 @@ test('non-macOS defaults use Alt+i/k/j/l primary, unassigned secondary, and supp
   await expect(page.locator('.tab.active')).toContainText('Gamma Tab');
   await expect(page.getByTestId('server-switch-watermark-shortcut')).toContainText('Ctrl');
   await expect(page.getByTestId('server-switch-watermark-shortcut')).toContainText('←');
+  expect(errors).toEqual([]);
+});
+
+test('renders sub-session sequence badges, opens & focuses composer via configurable modifier + 1..9, and closes all via modifier + 0', async ({ page }) => {
+  const { errors } = await openDesktopApp(page, 'Linux x86_64', {
+    subSessions: [
+      {
+        id: 'sub-e2e-1',
+        server_id: 'srv-1',
+        type: 'claude-code-sdk',
+        runtime_type: 'transport',
+        label: 'Sub One',
+        parent_session: 'deck_gamma_brain',
+      },
+      {
+        id: 'sub-e2e-2',
+        server_id: 'srv-1',
+        type: 'codex-sdk',
+        runtime_type: 'transport',
+        label: 'Sub Two',
+        parent_session: 'deck_gamma_brain',
+      },
+    ],
+  });
+
+  // Sequence badges appear on sub-session strip items in display order (1, 2)
+  await expect(page.getByTestId('subsession-seq-sub-e2e-1')).toHaveText('1');
+  await expect(page.getByTestId('subsession-seq-sub-e2e-2')).toHaveText('2');
+
+  // Ctrl+1 while focused in main composer opens sub-e2e-1 and auto-focuses its .controls-input
+  await page.locator('.controls-input').first().click();
+  await page.keyboard.press('Control+Digit1');
+  const subWin1 = page.locator('.subsession-window[data-subsession-id="sub-e2e-1"]');
+  await expect(subWin1).toBeVisible();
+  await expect(subWin1.locator('.controls-input')).toBeFocused();
+
+  // Typing immediately inserts text into sub-session 1's composer
+  await page.keyboard.type('hello sub one');
+  await expect(subWin1.locator('.controls-input')).toContainText('hello sub one');
+
+  // Ctrl+2 opens sub-e2e-2 and auto-focuses sub-session 2's composer
+  await page.keyboard.press('Control+Digit2');
+  const subWin2 = page.locator('.subsession-window[data-subsession-id="sub-e2e-2"]');
+  await expect(subWin2).toBeVisible();
+  await expect(subWin2.locator('.controls-input')).toBeFocused();
+
+  // Ctrl+0 closes all open sub-session windows
+  await page.keyboard.press('Control+Digit0');
+  await expect(page.locator('.subsession-window:visible')).toHaveCount(0);
+  await expect(subWin1).toBeHidden();
+  await expect(subWin2).toBeHidden();
+
+  // Configure custom Ctrl+Shift modifier in Settings -> Shortcuts
+  await page.locator('button.server-icon[title="Settings"]').click();
+  await page.locator('#settings-tab-shortcuts').click();
+  await expect(page.getByTestId('subsession-quick-shortcuts-section')).toBeVisible();
+  await page.getByTestId('subsession-mod-shift').click();
+  await expect(page.getByTestId('subsession-quick-preview-open')).toContainText('Shift');
+  await page.locator('.settings-back-btn').click();
+
+  // Plain Ctrl+1 no longer opens sub-session 1, while Ctrl+Shift+1 opens and focuses it
+  await page.locator('.controls-input').first().click();
+  await page.keyboard.press('Control+Digit1');
+  await expect(page.locator('.subsession-window:visible')).toHaveCount(0);
+
+  await page.keyboard.press('Control+Shift+Digit1');
+  await expect(subWin1).toBeVisible();
+  await expect(subWin1.locator('.controls-input')).toBeFocused();
+
+  await page.keyboard.press('Control+Shift+Digit0');
+  await expect(page.locator('.subsession-window:visible')).toHaveCount(0);
   expect(errors).toEqual([]);
 });

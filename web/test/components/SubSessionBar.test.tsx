@@ -76,11 +76,15 @@ vi.mock('react-i18next', () => ({
 }));
 
 vi.mock('../../src/components/SubSessionCard.js', () => ({
-  SubSessionCard: ({ sub, accentColor }: { sub: SubSession; accentColor?: string }) => (
+  SubSessionCard: ({ sub, accentColor, sequenceNumber }: { sub: SubSession; accentColor?: string; sequenceNumber?: number }) => (
     <div
       data-testid={`subsession-preview-${sub.id}`}
       style={{ '--subsession-accent-color': accentColor } as any}
-    />
+    >
+      {typeof sequenceNumber === 'number' && sequenceNumber > 0 ? (
+        <sup class="subcard-seq" data-testid={`subsession-seq-${sub.id}`}>{sequenceNumber}</sup>
+      ) : null}
+    </div>
   ),
 }));
 
@@ -2237,7 +2241,7 @@ describe('SubSessionBar', () => {
 
   it('ships desktop layout labels in every locale', () => {
     for (const locale of SUPPORTED_LOCALES) {
-      const raw = JSON.parse(readFileSync(join(LOCALE_DIR, `${locale}.json`), 'utf8')) as Record<string, Record<string, string>>;
+      const raw = JSON.parse(readFileSync(join(LOCALE_DIR, `${locale}.json`), 'utf8')) as Record<string, any>;
       for (const key of [
         'switch_to_vertical',
         'switch_to_horizontal',
@@ -2252,6 +2256,111 @@ describe('SubSessionBar', () => {
       ]) {
         expect(raw.subsessionBar?.[key], `${locale}: subsessionBar.${key}`).toBeTruthy();
       }
+      for (const key of [
+        'title',
+        'desc',
+        'open_label',
+        'close_all_label',
+        'modifiers_aria',
+        'min_one_hint',
+        'reset_aria',
+      ]) {
+        expect(raw.settings?.shortcuts?.subsession_quick?.[key], `${locale}: settings.shortcuts.subsession_quick.${key}`).toBeTruthy();
+      }
     }
+  });
+
+  it('renders 1-based sequence badges across collapsed pills, vertical rail, overflow pills, expanded cards, and drag-reorder', () => {
+    const twentySixSubs = Array.from({ length: 26 }, (_, idx) => makeSubSession({
+      id: `seq-${idx + 1}`,
+      sessionName: `deck_sub_seq_${idx + 1}`,
+      label: `Sub ${idx + 1}`,
+    }));
+    const eightSubs = twentySixSubs.slice(0, 8);
+
+    // Collapsed horizontal bar: 1..8
+    const collapsedView = render(
+      <SubSessionBar
+        subSessions={eightSubs}
+        openIds={new Set()}
+        collapsed
+        desktopLayoutCapable
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        ws={null}
+        connected
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    eightSubs.forEach((sub, idx) => {
+      const badge = collapsedView.getByTestId(`subsession-seq-${sub.id}`);
+      expect(badge.tagName).toBe('SUP');
+      expect(badge.classList.contains('subsession-card-seq')).toBe(true);
+      expect(badge.textContent).toBe(String(idx + 1));
+    });
+
+    // Drag-reorder swaps seq-1 and seq-2 immediately -> badges update 1<->2
+    const btn1 = collapsedView.container.querySelector('[data-sub-id="seq-1"]')!;
+    const btn2 = collapsedView.container.querySelector('[data-sub-id="seq-2"]')!;
+    fireEvent.dragStart(btn1);
+    fireEvent.dragOver(btn2);
+    expect(collapsedView.getByTestId('subsession-seq-seq-2').textContent).toBe('1');
+    expect(collapsedView.getByTestId('subsession-seq-seq-1').textContent).toBe('2');
+    collapsedView.unmount();
+
+    // Vertical rail: 1..8
+    const host = document.createElement('aside');
+    document.body.append(host);
+    try {
+      const railView = render(
+        <SubSessionBar
+          subSessions={eightSubs}
+          openIds={new Set()}
+          collapsed
+          desktopLayoutCapable
+          desktopLayout={SUBSESSION_DESKTOP_LAYOUT.VERTICAL}
+          verticalRailHost={host}
+          onOpen={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+        />,
+      );
+      eightSubs.forEach((sub, idx) => {
+        expect(host.querySelector(`[data-testid="subsession-seq-${sub.id}"]`)?.textContent).toBe(String(idx + 1));
+      });
+      railView.unmount();
+    } finally {
+      host.remove();
+    }
+
+    // Expanded mode with 26 sessions (> SUBSESSION_BAR_MAX_EXPANDED_CARDS=24): cards (1..24) + overflow pills (25, 26)
+    const expandedView = render(
+      <SubSessionBar
+        subSessions={twentySixSubs}
+        openIds={new Set()}
+        collapsed={false}
+        desktopLayoutCapable
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        ws={null}
+        connected
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    twentySixSubs.forEach((sub, idx) => {
+      const badge = expandedView.getByTestId(`subsession-seq-${sub.id}`);
+      expect(badge.textContent).toBe(String(idx + 1));
+    });
+    expect(expandedView.getByTestId('subsession-overflow-pills').querySelector('[data-testid="subsession-seq-seq-25"]')?.textContent).toBe('25');
+    expect(expandedView.getByTestId('subsession-overflow-pills').querySelector('[data-testid="subsession-seq-seq-26"]')?.textContent).toBe('26');
+    expandedView.unmount();
   });
 });

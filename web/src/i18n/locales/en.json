@@ -2312,6 +2312,15 @@
           "title": "Next Tab",
           "desc": "Switch to the session tab on the right"
         }
+      },
+      "subsession_quick": {
+        "title": "Sub-session Quick Shortcuts",
+        "desc": "Choose which modifier keys combine with number keys 1–9 to open and focus a sub-session input, and 0 to close all sub-session windows.",
+        "open_label": "Open & focus sub-session #",
+        "close_all_label": "Close all sub-session windows",
+        "modifiers_aria": "Sub-session quick shortcut modifier keys",
+        "min_one_hint": "Keep at least one modifier key selected.",
+        "reset_aria": "Reset sub-session quick shortcut modifiers"
       }
     }
   },

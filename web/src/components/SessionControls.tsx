@@ -1954,7 +1954,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
    */
   const focusComposerForTyping = useCallback((options?: FocusComposerOptions): boolean => {
     const el = divRef.current;
-    if (!el) return false;
+    if (!el || !el.isConnected) return false;
     if (inputDisabledRef.current || voiceHoldPendingRef.current || voiceHoldActiveRef.current) {
       return false;
     }
@@ -1973,6 +1973,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (inputRef) (inputRef as { current: HTMLDivElement | null }).current = divRef.current;
     return registerComposerFocusHandler(divRef.current, focusComposerForTyping);
   });
+  useEffect(() => () => {
+    if (inputRef) (inputRef as { current: HTMLDivElement | null }).current = null;
+  }, [inputRef]);
 
   useEffect(() => {
     const el = divRef.current;

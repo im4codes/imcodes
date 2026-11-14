@@ -935,4 +935,38 @@ describe('SubSessionCard', () => {
       },
     );
   });
+
+  it('renders sequence number corner badge in subcard header and updates on rerender', () => {
+    const view = render(
+      <SubSessionCard
+        sub={makeSubSession()}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        sequenceNumber={2}
+      />,
+    );
+    const seq = view.getByTestId('subsession-seq-sub-card-1');
+    expect(seq.tagName).toBe('SUP');
+    expect(seq.classList.contains('subcard-seq')).toBe(true);
+    expect(seq.textContent).toBe('2');
+    expect(view.container.querySelector('.subcard-header')?.classList.contains('has-seq')).toBe(true);
+
+    view.rerender(
+      <SubSessionCard
+        sub={makeSubSession()}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        sequenceNumber={5}
+      />,
+    );
+    expect(view.getByTestId('subsession-seq-sub-card-1').textContent).toBe('5');
+  });
 });

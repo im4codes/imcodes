@@ -118,6 +118,7 @@ type DiscussionSummary = P2pProgressDiscussion & {
 interface CollapsedSubSessionButtonProps {
   sub: SubSession;
   accentColor: string;
+  sequenceNumber?: number;
   isOpen: boolean;
   isFocused: boolean;
   idleFlashToken: number;
@@ -398,7 +399,7 @@ export function selectPrioritizedExpandedSessions(
   return { cardSessions, overflowSessions };
 }
 
-function CollapsedSubSessionButtonImpl({ sub, accentColor, isOpen, isFocused, idleFlashToken, usage, sharedState, inP2p, draggable, onEntryPointerDown, onEntryTouchStart, onEntryClick, onEntryDoubleClick, onEntryDragStart, onEntryDragOver, onEntryDragEnd, onContextMenu, pinned, t, detectedModel, orientation = 'horizontal', extraClass }: CollapsedSubSessionButtonProps) {
+function CollapsedSubSessionButtonImpl({ sub, accentColor, sequenceNumber, isOpen, isFocused, idleFlashToken, usage, sharedState, inP2p, draggable, onEntryPointerDown, onEntryTouchStart, onEntryClick, onEntryDoubleClick, onEntryDragStart, onEntryDragOver, onEntryDragEnd, onContextMenu, pinned, t, detectedModel, orientation = 'horizontal', extraClass }: CollapsedSubSessionButtonProps) {
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
   const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
@@ -421,7 +422,7 @@ function CollapsedSubSessionButtonImpl({ sub, accentColor, isOpen, isFocused, id
     <button
       key={sub.id}
       data-sub-id={sub.id}
-      class={`subsession-card${orientation === 'vertical' ? ' subsession-card-rail' : ''}${isOpen ? ' open' : ''}${isFocused ? ' focused' : ''} mobile${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}${extraClass ? ` ${extraClass}` : ''}`}
+      class={`subsession-card${orientation === 'vertical' ? ' subsession-card-rail' : ''}${isOpen ? ' open' : ''}${isFocused ? ' focused' : ''}${typeof sequenceNumber === 'number' && sequenceNumber > 0 ? ' has-seq' : ''} mobile${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}${extraClass ? ` ${extraClass}` : ''}`}
       draggable={draggable}
       onPointerDown={(event) => onEntryPointerDown(sub.id, event)}
       onTouchStart={() => onEntryTouchStart(sub.id)}
@@ -435,6 +436,11 @@ function CollapsedSubSessionButtonImpl({ sub, accentColor, isOpen, isFocused, id
       style={{ '--subsession-accent-color': accentColor } as JSX.CSSProperties}
     >
       {activeIdleFlashToken ? <IdleFlashLayer key={`subbutton-idle-${activeIdleFlashToken}`} variant="frame" /> : null}
+      {typeof sequenceNumber === 'number' && sequenceNumber > 0 && (
+        <sup class="subsession-card-seq" data-testid={`subsession-seq-${sub.id}`}>
+          {sequenceNumber}
+        </sup>
+      )}
       <span class="subsession-card-icon">{abbr}</span>
       <span class="subsession-card-label">{sub.label ? formatLabel(sub.label).slice(0, 12) : agentTag.slice(0, 6)}</span>
       {inP2p && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
@@ -471,6 +477,7 @@ function sameCollapsedSub(a: SubSession, b: SubSession): boolean {
 const CollapsedSubSessionButton = memo(CollapsedSubSessionButtonImpl, (prev, next) => (
   sameCollapsedSub(prev.sub, next.sub)
   && prev.accentColor === next.accentColor
+  && prev.sequenceNumber === next.sequenceNumber
   && prev.isOpen === next.isOpen
   && prev.isFocused === next.isFocused
   && prev.idleFlashToken === next.idleFlashToken
@@ -496,7 +503,7 @@ const CollapsedSubSessionButton = memo(CollapsedSubSessionButtonImpl, (prev, nex
   && prev.extraClass === next.extraClass
 ));
 
-function ExpandedSubSessionPlaceholder({ sub, accentColor, cardSize, sharedState, inP2p, t }: { sub: SubSession; accentColor: string; cardSize: CardSize; sharedState?: SharedStateSummary | null; inP2p: boolean; t: (key: string, vars?: Record<string, unknown>) => string }) {
+function ExpandedSubSessionPlaceholder({ sub, accentColor, sequenceNumber, cardSize, sharedState, inP2p, t }: { sub: SubSession; accentColor: string; sequenceNumber?: number; cardSize: CardSize; sharedState?: SharedStateSummary | null; inP2p: boolean; t: (key: string, vars?: Record<string, unknown>) => string }) {
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
   const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
   const abbr = getAgentBadgeLabel(sub.type);
@@ -511,7 +518,12 @@ function ExpandedSubSessionPlaceholder({ sub, accentColor, cardSize, sharedState
         '--subsession-accent-color': accentColor,
       } as JSX.CSSProperties}
     >
-      <div class="subcard-header">
+      <div class={`subcard-header${typeof sequenceNumber === 'number' && sequenceNumber > 0 ? ' has-seq' : ''}`}>
+        {typeof sequenceNumber === 'number' && sequenceNumber > 0 && (
+          <sup class="subcard-seq" data-testid={`subsession-seq-${sub.id}`}>
+            {sequenceNumber}
+          </sup>
+        )}
         <span class="subcard-icon">{abbr}</span>
         <span class="subcard-label">{label}</span>
         {inP2p && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
@@ -1051,6 +1063,13 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   }, [subSessions, dragOrder, pinnedSubSessionIds]);
   const orderedSessionIds = useMemo(() => orderedSessions.map((sub) => sub.id), [orderedSessions]);
   const orderedSessionIdsKey = orderedSessionIds.join(',');
+  const sequenceById = useMemo(() => {
+    const map = new Map<string, number>();
+    orderedSessions.forEach((sub, idx) => {
+      map.set(sub.id, idx + 1);
+    });
+    return map;
+  }, [orderedSessions]);
   // Status/state frames replace the SubSession objects while preserving the
   // same ordered ids. Accent assignment is structural, so do not recompute it
   // for every metadata update (the per-card components receive the latest
@@ -1570,6 +1589,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       orientation={orientation}
       extraClass={extraClass}
       accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
+      sequenceNumber={sequenceById.get(sub.id)}
       isOpen={openIds.has(sub.id)}
       isFocused={isMobile ? openIds.has(sub.id) : focusedSubId === sub.id}
       idleFlashToken={idleFlashTokens?.get(sub.sessionName) ?? 0}
@@ -2172,11 +2192,13 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                     inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
                     accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
                     previewHydrateDelayMs={Math.min(1200, 120 + index * 60)}
+                    sequenceNumber={sequenceById.get(sub.id)}
                   />
                 ) : (
                   <ExpandedSubSessionPlaceholder
                     sub={sub}
                     accentColor={accentColorsById.get(sub.id) ?? DEFAULT_SUBSESSION_ACCENT_COLOR}
+                    sequenceNumber={sequenceById.get(sub.id)}
                     cardSize={cardSize}
                     sharedState={sharedSubSessionStates?.get(sub.id) ?? sharedSubSessionStates?.get(sub.sessionName)}
                     inP2p={!!p2pSessionLabels?.has(sub.sessionName)}

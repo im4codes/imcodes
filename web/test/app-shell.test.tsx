@@ -480,6 +480,12 @@ vi.mock('../src/pages/SettingsPage.js', () => ({
       <button onClick={() => onChangeShortcutOverrides?.({ tabPrev: null, secondary: { tabPrev: 'Ctrl+ArrowLeft', tabNext: 'Ctrl+ArrowRight' } })}>
         settings-win-dual-slots
       </button>
+      <button onClick={() => onChangeShortcutOverrides?.({ subSessionQuickModifiers: ['ctrl', 'alt'] })}>
+        settings-subsession-ctrl-alt
+      </button>
+      <button onClick={() => onChangeShortcutOverrides?.({ subSessionQuickModifiers: ['ctrl', 'shift'] })}>
+        settings-subsession-ctrl-shift
+      </button>
       <button onClick={onBack}>settings-back</button>
     </div>
   ),
@@ -669,6 +675,7 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
     onCloseAllOpen,
     onRestoreQuickClosed,
     onOpenMaximized,
+    onVisualOrderChange,
     onViewAutoDeliver,
     onViewCron,
     onViewDiscussions,
@@ -785,6 +792,7 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
       ))}
       <button onClick={onCloseAllOpen}>subbar-quick-close</button>
       <button onClick={() => onRestoreQuickClosed?.(subSessions?.map((sub: any) => sub.id) ?? [])}>subbar-quick-restore</button>
+      <button onClick={() => onVisualOrderChange?.([...(subSessions ?? [])].reverse().map((sub: any) => sub.id))}>subbar-reverse-order</button>
       <button onClick={() => onOpenMaximized?.(subSessions?.[0]?.id)}>subbar-open-max</button>
       <button onClick={onViewAutoDeliver}>subbar-auto-deliver</button>
       <button onClick={onViewCron}>subbar-cron</button>
@@ -8767,6 +8775,138 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       expect(customKeycaps).toEqual(['Shift', 'PgDn']);
     } finally {
       syncedPrefs.enabled = false;
+    }
+  }, 15000);
+
+  it('opens and focuses numbered sub-session composer via configurable modifiers + 1..9 and closes all via modifier + 0', async () => {
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-quick-1',
+        serverId: 'srv-1',
+        sessionName: 'deck_sub_quick_1',
+        parentSession: 'deck_alpha_brain',
+        type: 'claude-code-sdk',
+        runtimeType: 'transport',
+        label: 'First Sub',
+        state: 'idle',
+      },
+      {
+        id: 'sub-quick-2',
+        serverId: 'srv-1',
+        sessionName: 'deck_sub_quick_2',
+        parentSession: 'deck_alpha_brain',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        label: 'Second Sub',
+        state: 'idle',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Win32' });
+    try {
+      const { App } = await importApp();
+      render(<App />);
+
+      const mainInput = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(mainInput));
+
+      // Ctrl+0 when none open: prevents default and stays a clean no-op
+      const emptyCloseEvt = new KeyboardEvent('keydown', { key: '0', code: 'Digit0', ctrlKey: true, bubbles: true, cancelable: true });
+      mainInput.dispatchEvent(emptyCloseEvt);
+      expect(emptyCloseEvt.defaultPrevented).toBe(true);
+      expect(screen.queryByTestId('sub-session-window-sub-quick-1')).toBeNull();
+
+      // Ctrl+1 from main composer -> opens sub-quick-1 and auto-focuses sub-quick-1 composer
+      const open1Evt = new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, bubbles: true, cancelable: true });
+      mainInput.dispatchEvent(open1Evt);
+      expect(open1Evt.defaultPrevented).toBe(true);
+      const sub1Input = await screen.findByTestId('sub-window-controls-input-sub-quick-1');
+      await waitFor(() => expect(document.activeElement).toBe(sub1Input));
+
+      // Ctrl+2 while sub-quick-1 composer is focused -> opens sub-quick-2 and auto-focuses sub-quick-2 composer
+      const open2Evt = new KeyboardEvent('keydown', { key: '2', code: 'Digit2', ctrlKey: true, bubbles: true, cancelable: true });
+      sub1Input.dispatchEvent(open2Evt);
+      expect(open2Evt.defaultPrevented).toBe(true);
+      const sub2Input = await screen.findByTestId('sub-window-controls-input-sub-quick-2');
+      await waitFor(() => expect(document.activeElement).toBe(sub2Input));
+
+      // Blur sub-2 input and re-press Ctrl+2 -> re-focuses sub-quick-2 composer cleanly
+      (document.activeElement as HTMLElement | null)?.blur?.();
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '2', code: 'Digit2', ctrlKey: true, bubbles: true, cancelable: true }));
+      await waitFor(() => expect(document.activeElement).toBe(sub2Input));
+
+      // Blocking guards: IME composing / xterm must NOT fire Ctrl+0
+      const imeEvt = new KeyboardEvent('keydown', { key: '0', code: 'Digit0', ctrlKey: true, isComposing: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(imeEvt);
+      expect(imeEvt.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('sub-session-window-sub-quick-1')).toBeTruthy();
+
+      const xterm = document.createElement('div');
+      xterm.className = 'xterm';
+      const xtermArea = document.createElement('textarea');
+      xtermArea.className = 'xterm-helper-textarea';
+      xterm.appendChild(xtermArea);
+      document.body.appendChild(xterm);
+      xtermArea.focus();
+      const termEvt = new KeyboardEvent('keydown', { key: '0', code: 'Digit0', ctrlKey: true, bubbles: true, cancelable: true });
+      xtermArea.dispatchEvent(termEvt);
+      expect(termEvt.defaultPrevented).toBe(false);
+      xterm.remove();
+
+      // Ctrl+0 closes all open sub-session windows and prevents default
+      sub2Input.focus();
+      const closeAllEvt = new KeyboardEvent('keydown', { key: '0', code: 'Digit0', ctrlKey: true, bubbles: true, cancelable: true });
+      sub2Input.dispatchEvent(closeAllEvt);
+      expect(closeAllEvt.defaultPrevented).toBe(true);
+      await waitFor(() => {
+        expect(screen.getByTestId('sub-session-window-sub-quick-1').getAttribute('data-visible')).toBe('false');
+        expect(screen.getByTestId('sub-session-window-sub-quick-2').getAttribute('data-visible')).toBe('false');
+      });
+
+      // Reverse visual order -> Ctrl+1 now opens sub-quick-2 and focuses its input
+      fireEvent.click(screen.getByText('subbar-reverse-order'));
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, bubbles: true, cancelable: true }));
+      const reorderedFirstInput = await screen.findByTestId('sub-window-controls-input-sub-quick-2');
+      await waitFor(() => {
+        expect(screen.getByTestId('sub-session-window-sub-quick-2').getAttribute('data-visible')).toBe('true');
+        expect(document.activeElement).toBe(reorderedFirstInput);
+      });
+
+      // Configure Ctrl+Alt -> plain Ctrl+0 stops triggering, Ctrl+Alt+0 closes all
+      fireEvent.click(screen.getByText('server-settings'));
+      fireEvent.click(await screen.findByText('settings-subsession-ctrl-alt'));
+      fireEvent.click(screen.getByText('settings-back'));
+
+      const plainCtrl0 = new KeyboardEvent('keydown', { key: '0', code: 'Digit0', ctrlKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(plainCtrl0);
+      expect(plainCtrl0.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('sub-session-window-sub-quick-2').getAttribute('data-visible')).toBe('true');
+
+      const ctrlAlt0 = new KeyboardEvent('keydown', { key: '0', code: 'Digit0', ctrlKey: true, altKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(ctrlAlt0);
+      expect(ctrlAlt0.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('sub-session-window-sub-quick-2').getAttribute('data-visible')).toBe('false'));
+
+      // Configure Ctrl+Shift -> Ctrl+Shift+Digit1 (key '!') opens first visual sub-session and focuses its composer
+      fireEvent.click(screen.getByText('server-settings'));
+      fireEvent.click(await screen.findByText('settings-subsession-ctrl-shift'));
+      fireEvent.click(screen.getByText('settings-back'));
+
+      const ctrlShift1 = new KeyboardEvent('keydown', { key: '!', code: 'Digit1', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(ctrlShift1);
+      expect(ctrlShift1.defaultPrevented).toBe(true);
+      const reopenedInput = await screen.findByTestId('sub-window-controls-input-sub-quick-2');
+      await waitFor(() => {
+        expect(screen.getByTestId('sub-session-window-sub-quick-2').getAttribute('data-visible')).toBe('true');
+        expect(document.activeElement).toBe(reopenedInput);
+      });
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
     }
   }, 15000);
 

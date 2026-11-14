@@ -4,6 +4,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   applyShortcutSlotOverride,
+  applySubSessionQuickModifiers,
+  areSubSessionQuickModifiersEqual,
   canHandleGlobalNavigationShortcut,
   chordFromKeyboardEvent,
   cycleOrderedId,
@@ -11,18 +13,23 @@ import {
   findShortcutSlotConflicts,
   focusComposerElement,
   formatShortcutKeycaps,
+  formatSubSessionQuickModifierKeycaps,
   getDefaultSecondaryShortcuts,
   getDefaultShortcuts,
+  getDefaultSubSessionQuickModifiers,
   isMacPlatform,
   matchesShortcutChord,
   matchNavigationShortcutAction,
   matchNavigationShortcutBinding,
+  matchSubSessionQuickShortcut,
   normalizeShortcutChordString,
   parseShortcutChord,
   resolveFocusedKeyboardViewMode,
   resolveKeyboardShortcuts,
   resolveKeyboardShortcutSlots,
+  resolveSubSessionQuickModifiers,
   sanitizeShortcutOverrides,
+  sanitizeSubSessionQuickModifiers,
   serializeShortcutChord,
   sortSessionsByTabOrder,
 } from '../src/keyboard-shortcuts.js';
@@ -618,5 +625,121 @@ describe('keyboard-shortcuts core helpers', () => {
     })).toBe('chat');
 
     subWin.remove();
+  });
+
+  it('sanitizes, formats, applies, and matches configurable sub-session quick modifiers (0..9)', () => {
+    expect(getDefaultSubSessionQuickModifiers()).toEqual(['ctrl']);
+    expect(resolveSubSessionQuickModifiers(undefined)).toEqual(['ctrl']);
+    expect(resolveSubSessionQuickModifiers({ subSessionQuickModifiers: [] })).toEqual(['ctrl']);
+
+    expect(sanitizeSubSessionQuickModifiers(['shift', 'control', 'CMD', 'alt', 'ctrl'])).toEqual([
+      'ctrl',
+      'alt',
+      'shift',
+      'meta',
+    ]);
+    expect(sanitizeSubSessionQuickModifiers(['invalid'])).toBeUndefined();
+    expect(sanitizeSubSessionQuickModifiers('ctrl')).toBeUndefined();
+
+    expect(sanitizeShortcutOverrides({
+      tabNext: 'Alt+ArrowRight',
+      subSessionQuickModifiers: ['alt', 'ctrl'],
+    })).toEqual({
+      tabNext: 'Alt+ArrowRight',
+      subSessionQuickModifiers: ['ctrl', 'alt'],
+    });
+    expect(sanitizeShortcutOverrides({
+      subSessionQuickModifiers: ['bogus' as never],
+    })).toEqual({});
+
+    const withCombo = applySubSessionQuickModifiers({}, ['shift', 'ctrl']);
+    expect(withCombo).toEqual({ subSessionQuickModifiers: ['ctrl', 'shift'] });
+    expect(resolveSubSessionQuickModifiers(withCombo)).toEqual(['ctrl', 'shift']);
+    expect(areSubSessionQuickModifiersEqual(['ctrl', 'shift'], ['shift', 'ctrl'])).toBe(true);
+
+    const resetBack = applySubSessionQuickModifiers(withCombo, ['ctrl']);
+    expect(resetBack).toEqual({});
+    expect(applySubSessionQuickModifiers(withCombo, [])).toEqual({});
+
+    expect(formatSubSessionQuickModifierKeycaps(['ctrl'], false)).toEqual(['Ctrl']);
+    expect(formatSubSessionQuickModifierKeycaps(['ctrl', 'alt', 'shift', 'meta'], false)).toEqual([
+      'Ctrl',
+      'Alt',
+      'Shift',
+      'Win',
+    ]);
+    expect(formatSubSessionQuickModifierKeycaps(['ctrl', 'alt', 'shift', 'meta'], true)).toEqual([
+      '⌃',
+      '⌥',
+      '⇧',
+      '⌘',
+    ]);
+
+    // Default Ctrl + 1..9 / 0
+    expect(matchSubSessionQuickShortcut({
+      key: '1',
+      code: 'Digit1',
+      ctrlKey: true,
+      altKey: false,
+      shiftKey: false,
+      metaKey: false,
+    }, ['ctrl'])).toEqual({ kind: 'open', index: 0 });
+    expect(matchSubSessionQuickShortcut({
+      key: '9',
+      code: 'Numpad9',
+      ctrlKey: true,
+      altKey: false,
+      shiftKey: false,
+      metaKey: false,
+    }, ['ctrl'])).toEqual({ kind: 'open', index: 8 });
+    expect(matchSubSessionQuickShortcut({
+      key: '0',
+      code: 'Digit0',
+      ctrlKey: true,
+      altKey: false,
+      shiftKey: false,
+      metaKey: false,
+    }, ['ctrl'])).toEqual({ kind: 'closeAll' });
+
+    // Exact modifier match: Ctrl+Shift+Digit1 must NOT fire when configured modifier is ['ctrl']
+    expect(matchSubSessionQuickShortcut({
+      key: '!',
+      code: 'Digit1',
+      ctrlKey: true,
+      altKey: false,
+      shiftKey: true,
+      metaKey: false,
+    }, ['ctrl'])).toBeNull();
+
+    // When configured modifier is ['ctrl', 'shift'], e.code Digit1 matches even with e.key === '!'
+    expect(matchSubSessionQuickShortcut({
+      key: '!',
+      code: 'Digit1',
+      ctrlKey: true,
+      altKey: false,
+      shiftKey: true,
+      metaKey: false,
+    }, ['ctrl', 'shift'])).toEqual({ kind: 'open', index: 0 });
+
+    // Ctrl+Alt+0 closes all when configured as ['ctrl', 'alt']
+    expect(matchSubSessionQuickShortcut({
+      key: '0',
+      code: 'Numpad0',
+      ctrlKey: true,
+      altKey: true,
+      shiftKey: false,
+      metaKey: false,
+    }, ['ctrl', 'alt'])).toEqual({ kind: 'closeAll' });
+
+    // IME composing is ignored
+    expect(matchSubSessionQuickShortcut({
+      key: '1',
+      code: 'Digit1',
+      ctrlKey: true,
+      altKey: false,
+      shiftKey: false,
+      metaKey: false,
+      isComposing: true,
+    }, ['ctrl'])).toBeNull();
   });
 });

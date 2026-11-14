@@ -3,20 +3,27 @@ import { useTranslation } from 'react-i18next';
 import {
   KEYBOARD_SHORTCUTS_PREF_KEY,
   SHORTCUT_ACTION_IDS,
+  SHORTCUT_MODIFIER_KEYS,
   SHORTCUT_SLOTS,
   applyShortcutSlotOverride,
+  applySubSessionQuickModifiers,
+  areSubSessionQuickModifiersEqual,
   chordFromKeyboardEvent,
   findShortcutSlotConflicts,
   formatShortcutKeycaps,
+  formatSubSessionQuickModifierKeycaps,
   getDefaultSecondaryShortcuts,
   getDefaultShortcutForSlot,
   getDefaultShortcuts,
+  getDefaultSubSessionQuickModifiers,
   isMacPlatform,
   normalizeShortcutChordString,
   resolveKeyboardShortcutSlots,
+  resolveSubSessionQuickModifiers,
   sanitizeShortcutOverrides,
   type KeyboardShortcutOverrides,
   type ShortcutActionId,
+  type ShortcutModifierKey,
   type ShortcutSlot,
   type ShortcutSlotTarget,
 } from '../keyboard-shortcuts.js';
@@ -76,13 +83,47 @@ function KeyboardShortcutsSectionInner({
   const [statusNotice, setStatusNotice] = useState<{ type: 'info' | 'err'; text: string } | null>(null);
   const recorderContainerRef = useRef<HTMLDivElement | null>(null);
 
+  const subSessionModifiers = useMemo(
+    () => resolveSubSessionQuickModifiers(cleanOverrides),
+    [cleanOverrides],
+  );
+  const defaultSubSessionModifiers = useMemo(() => getDefaultSubSessionQuickModifiers(), []);
+  const isCustomSubSessionModifiers = !areSubSessionQuickModifiersEqual(
+    subSessionModifiers,
+    defaultSubSessionModifiers,
+  );
+  const subSessionModifierCaps = useMemo(
+    () => formatSubSessionQuickModifierKeycaps(subSessionModifiers, isMac),
+    [subSessionModifiers, isMac],
+  );
+
   const hasAnyOverride = useMemo(
-    () => SHORTCUT_ACTION_IDS.some(
+    () => isCustomSubSessionModifiers || SHORTCUT_ACTION_IDS.some(
       (id) => resolvedSlots[id].primary !== primaryDefaults[id]
         || resolvedSlots[id].secondary !== secondaryDefaults[id],
     ),
-    [resolvedSlots, primaryDefaults, secondaryDefaults],
+    [isCustomSubSessionModifiers, resolvedSlots, primaryDefaults, secondaryDefaults],
   );
+
+  const handleToggleSubSessionModifier = (mod: ShortcutModifierKey) => {
+    setStatusNotice(null);
+    onChangeOverrides((prev) => {
+      const current = resolveSubSessionQuickModifiers(prev);
+      const exists = current.includes(mod);
+      if (exists && current.length <= 1) {
+        return prev;
+      }
+      const next = exists
+        ? current.filter((item) => item !== mod)
+        : [...current, mod];
+      return applySubSessionQuickModifiers(prev, next);
+    });
+  };
+
+  const handleResetSubSessionModifiers = () => {
+    setStatusNotice(null);
+    onChangeOverrides((prev) => applySubSessionQuickModifiers(prev, defaultSubSessionModifiers));
+  };
 
   const formatTargetLabel = (target: ShortcutSlotTarget) => {
     const actionLabel = t(ACTION_LABELS[target.action].titleKey as 'settings.shortcuts.actions.server_prev.title');
@@ -394,6 +435,90 @@ function KeyboardShortcutsSectionInner({
             </div>
           );
         })}
+      </div>
+
+      <div class="settings-shortcuts-subsession" data-testid="subsession-quick-shortcuts-section">
+        <div class="settings-shortcut-row settings-shortcut-row-subsession">
+          <div class="settings-shortcut-info">
+            <div class="settings-shortcut-title">
+              {t('settings.shortcuts.subsession_quick.title')}
+            </div>
+            <div class="settings-shortcut-desc">
+              {t('settings.shortcuts.subsession_quick.desc')}
+            </div>
+            <div class="settings-shortcut-subsession-previews">
+              <div class="settings-shortcut-preview-item" data-testid="subsession-quick-preview-open">
+                <span class="settings-shortcut-preview-label">
+                  {t('settings.shortcuts.subsession_quick.open_label')}
+                </span>
+                <span class="settings-shortcut-keycaps">
+                  {subSessionModifierCaps.map((cap) => (
+                    <kbd key={`open-${cap}`} class="settings-kbd">{cap}</kbd>
+                  ))}
+                  <kbd class="settings-kbd">1–9</kbd>
+                </span>
+              </div>
+              <div class="settings-shortcut-preview-item" data-testid="subsession-quick-preview-close">
+                <span class="settings-shortcut-preview-label">
+                  {t('settings.shortcuts.subsession_quick.close_all_label')}
+                </span>
+                <span class="settings-shortcut-keycaps">
+                  {subSessionModifierCaps.map((cap) => (
+                    <kbd key={`close-${cap}`} class="settings-kbd">{cap}</kbd>
+                  ))}
+                  <kbd class="settings-kbd">0</kbd>
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-shortcut-subsession-controls">
+            <div
+              class="settings-shortcut-modifier-group"
+              role="group"
+              aria-label={t('settings.shortcuts.subsession_quick.modifiers_aria')}
+            >
+              {SHORTCUT_MODIFIER_KEYS.map((mod) => {
+                const active = subSessionModifiers.includes(mod);
+                const lockedLast = active && subSessionModifiers.length <= 1;
+                const keycap = formatSubSessionQuickModifierKeycaps([mod], isMac)[0];
+                const name = mod === 'meta'
+                  ? (isMac ? 'Cmd' : 'Win')
+                  : mod === 'alt'
+                    ? (isMac ? 'Option' : 'Alt')
+                    : mod === 'shift'
+                      ? 'Shift'
+                      : 'Ctrl';
+                return (
+                  <button
+                    key={mod}
+                    type="button"
+                    data-testid={`subsession-mod-${mod}`}
+                    aria-pressed={active}
+                    disabled={lockedLast}
+                    title={lockedLast ? t('settings.shortcuts.subsession_quick.min_one_hint') : undefined}
+                    class={`settings-shortcut-mod-btn${active ? ' is-active' : ''}`}
+                    onClick={() => handleToggleSubSessionModifier(mod)}
+                  >
+                    <kbd class="settings-kbd">{keycap}</kbd>
+                    <span>{name}</span>
+                  </button>
+                );
+              })}
+            </div>
+            {isCustomSubSessionModifiers && (
+              <button
+                type="button"
+                data-testid="subsession-mod-reset"
+                class="settings-btn-secondary settings-shortcut-mini-btn"
+                aria-label={t('settings.shortcuts.subsession_quick.reset_aria')}
+                onClick={handleResetSubSessionModifiers}
+              >
+                {t('settings.shortcuts.reset')}
+              </button>
+            )}
+          </div>
+        </div>
       </div>
 
       <p class="settings-shortcuts-footnote">

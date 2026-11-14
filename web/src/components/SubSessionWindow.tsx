@@ -518,13 +518,14 @@ export function SubSessionWindow({
       onInputRefRef.current?.(null);
       return;
     }
-    if (inputRef.current) {
+    if (inputRef.current && inputRef.current.isConnected) {
       onInputRefRef.current?.(inputRef.current);
       return;
     }
     if (typeof requestAnimationFrame === 'function') {
       const id = requestAnimationFrame(() => {
-        onInputRefRef.current?.(inputRef.current);
+        const el = inputRef.current;
+        onInputRefRef.current?.(el && el.isConnected ? el : null);
       });
       return () => cancelAnimationFrame(id);
     }

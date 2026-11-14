@@ -105,6 +105,7 @@ interface Props {
   sharedState?: SharedStateSummary | null;
   accentColor?: string;
   previewHydrateDelayMs?: number;
+  sequenceNumber?: number;
 }
 
 function loadCardW(id: string, fallback: number): number {
@@ -150,7 +151,7 @@ function buildCompactSessionInfo(sub: SubSession): SessionInfo {
   };
 }
 
-function SubSessionCardImpl({ sub, ws, connected, isOpen, isFocused, idleFlashToken, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId, onTransportConfigSaved, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, previewHydrateDelayMs = 160 }: Props) {
+function SubSessionCardImpl({ sub, ws, connected, isOpen, isFocused, idleFlashToken, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId, onTransportConfigSaved, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, previewHydrateDelayMs = 160, sequenceNumber }: Props) {
   recordPerfRender('SubSessionCard');
   const { t } = useTranslation();
   // Shared alias data so the compact card's plain-text composer resolves
@@ -453,7 +454,12 @@ function SubSessionCardImpl({ sub, ws, connected, isOpen, isFocused, idleFlashTo
     >
       {activeIdleFlashToken ? <IdleFlashLayer key={`subcard-idle-${activeIdleFlashToken}`} variant="frame" /> : null}
       {/* Header */}
-      <div class="subcard-header">
+      <div class={`subcard-header${typeof sequenceNumber === 'number' && sequenceNumber > 0 ? ' has-seq' : ''}`}>
+        {typeof sequenceNumber === 'number' && sequenceNumber > 0 && (
+          <sup class="subcard-seq" data-testid={`subsession-seq-${sub.id}`}>
+            {sequenceNumber}
+          </sup>
+        )}
         <span class="subcard-icon">{icon}</span>
         <span class="subcard-label"><SubSessionTaskTitle sessionName={sub.sessionName} serverId={serverId ?? sub.serverId} fallback={label} /></span>
         {inP2p && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
@@ -693,4 +699,5 @@ export const SubSessionCard = memo(SubSessionCardImpl, (prev, next) => (
   && prev.sharedState === next.sharedState
   && prev.accentColor === next.accentColor
   && prev.previewHydrateDelayMs === next.previewHydrateDelayMs
+  && prev.sequenceNumber === next.sequenceNumber
 ));

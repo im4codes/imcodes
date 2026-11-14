@@ -44,8 +44,13 @@ export type ResolvedShortcutSlotConflicts = Partial<
  * - `null`: explicitly cleared / disabled
  * - `string`: normalized canonical chord string, e.g. `Meta+ArrowUp`
  */
+export type ShortcutModifierKey = 'ctrl' | 'alt' | 'shift' | 'meta';
+export const SHORTCUT_MODIFIER_KEYS: readonly ShortcutModifierKey[] = ['ctrl', 'alt', 'shift', 'meta'];
+export const DEFAULT_SUBSESSION_QUICK_MODIFIERS: readonly ShortcutModifierKey[] = ['ctrl'];
+
 export type KeyboardShortcutOverrides = Partial<Record<ShortcutActionId, string | null>> & {
   secondary?: Partial<Record<ShortcutActionId, string | null>>;
+  subSessionQuickModifiers?: ShortcutModifierKey[];
 };
 export type ResolvedKeyboardShortcuts = Record<ShortcutActionId, string | null>;
 
@@ -372,6 +377,12 @@ export function sanitizeShortcutOverrides(raw: unknown): KeyboardShortcutOverrid
     const cleanSecondary = sanitizeShortcutSlotMap(input.secondary);
     if (Object.keys(cleanSecondary).length > 0) {
       out.secondary = cleanSecondary;
+    }
+  }
+  if ('subSessionQuickModifiers' in input) {
+    const cleanModifiers = sanitizeSubSessionQuickModifiers(input.subSessionQuickModifiers);
+    if (cleanModifiers) {
+      out.subSessionQuickModifiers = cleanModifiers;
     }
   }
   return out;
@@ -811,3 +822,141 @@ export function resolveFocusedKeyboardViewMode(options: {
 
 /** Focus a contentEditable composer `.controls-input` without scrolling the viewport. */
 export { focusComposerElement } from './util/composer-focus.js';
+
+function normalizeModifierToken(raw: unknown): ShortcutModifierKey | null {
+  if (typeof raw !== 'string') return null;
+  switch (raw.trim().toLowerCase()) {
+    case 'ctrl':
+    case 'control':
+      return 'ctrl';
+    case 'alt':
+    case 'option':
+    case 'opt':
+      return 'alt';
+    case 'shift':
+      return 'shift';
+    case 'meta':
+    case 'cmd':
+    case 'command':
+    case 'win':
+    case 'super':
+      return 'meta';
+    default:
+      return null;
+  }
+}
+
+/** Return the default modifier combination (`Ctrl`) for sub-session digit shortcuts. */
+export function getDefaultSubSessionQuickModifiers(): ShortcutModifierKey[] {
+  return [...DEFAULT_SUBSESSION_QUICK_MODIFIERS];
+}
+
+/** Sanitize a candidate modifier list into canonical non-empty `ShortcutModifierKey[]` order, or `undefined`. */
+export function sanitizeSubSessionQuickModifiers(raw: unknown): ShortcutModifierKey[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const present = new Set<ShortcutModifierKey>();
+  for (const item of raw) {
+    const normalized = normalizeModifierToken(item);
+    if (normalized) present.add(normalized);
+  }
+  if (present.size === 0) return undefined;
+  return SHORTCUT_MODIFIER_KEYS.filter((mod) => present.has(mod));
+}
+
+/** Check whether two modifier combinations represent the exact same modifier set. */
+export function areSubSessionQuickModifiersEqual(
+  a: readonly ShortcutModifierKey[],
+  b: readonly ShortcutModifierKey[],
+): boolean {
+  const normA = sanitizeSubSessionQuickModifiers([...a]) ?? DEFAULT_SUBSESSION_QUICK_MODIFIERS;
+  const normB = sanitizeSubSessionQuickModifiers([...b]) ?? DEFAULT_SUBSESSION_QUICK_MODIFIERS;
+  return normA.length === normB.length && normA.every((mod, idx) => mod === normB[idx]);
+}
+
+/** Resolve active sub-session quick-shortcut modifiers from stored overrides (defaults to `['ctrl']`). */
+export function resolveSubSessionQuickModifiers(
+  overrides: KeyboardShortcutOverrides | null | undefined,
+): ShortcutModifierKey[] {
+  return sanitizeSubSessionQuickModifiers(overrides?.subSessionQuickModifiers) ?? getDefaultSubSessionQuickModifiers();
+}
+
+/** Update `subSessionQuickModifiers` on an override object, omitting it when back to default `['ctrl']`. */
+export function applySubSessionQuickModifiers(
+  overrides: KeyboardShortcutOverrides | null | undefined,
+  modifiers: readonly ShortcutModifierKey[],
+): KeyboardShortcutOverrides {
+  const next = sanitizeShortcutOverrides(overrides);
+  const clean = sanitizeSubSessionQuickModifiers([...modifiers]) ?? getDefaultSubSessionQuickModifiers();
+  if (areSubSessionQuickModifiersEqual(clean, DEFAULT_SUBSESSION_QUICK_MODIFIERS)) {
+    delete next.subSessionQuickModifiers;
+  } else {
+    next.subSessionQuickModifiers = clean;
+  }
+  return next;
+}
+
+/** Format sub-session quick-shortcut modifiers into platform keycaps. */
+export function formatSubSessionQuickModifierKeycaps(
+  modifiers: readonly ShortcutModifierKey[],
+  isMac = isMacPlatform(),
+): string[] {
+  const resolved = sanitizeSubSessionQuickModifiers([...modifiers]) ?? DEFAULT_SUBSESSION_QUICK_MODIFIERS;
+  const caps: string[] = [];
+  for (const mod of resolved) {
+    if (mod === 'ctrl') caps.push(isMac ? '⌃' : 'Ctrl');
+    else if (mod === 'alt') caps.push(isMac ? '⌥' : 'Alt');
+    else if (mod === 'shift') caps.push(isMac ? '⇧' : 'Shift');
+    else if (mod === 'meta') caps.push(isMac ? '⌘' : 'Win');
+  }
+  return caps;
+}
+
+export type SubSessionQuickShortcutMatch =
+  | { kind: 'open'; index: number }
+  | { kind: 'closeAll' };
+
+function extractDigitFromKeyboardEvent(
+  e: Pick<KeyboardEvent, 'key' | 'code'>,
+): number | null {
+  if (typeof e.code === 'string' && e.code.length > 0) {
+    const codeMatch = /^(?:Digit|Numpad)([0-9])$/.exec(e.code);
+    if (codeMatch) return Number(codeMatch[1]);
+  }
+  if (typeof e.key === 'string' && /^[0-9]$/.test(e.key)) {
+    return Number(e.key);
+  }
+  return null;
+}
+
+/**
+ * Match `<Modifier> + 1..9` (open N-th sub-session) or `<Modifier> + 0` (close all sub-sessions)
+ * against the user's configured modifier combination. Matches exact modifier sets and checks
+ * `e.code` (`Digit0..9`, `Numpad0..9`) before `e.key` so Shift-modified combos still match digits.
+ */
+export function matchSubSessionQuickShortcut(
+  e: Pick<KeyboardEvent, 'key' | 'code' | 'metaKey' | 'ctrlKey' | 'altKey' | 'shiftKey'> & {
+    isComposing?: boolean;
+    keyCode?: number;
+  },
+  modifiers: readonly ShortcutModifierKey[],
+): SubSessionQuickShortcutMatch | null {
+  if (e.isComposing || e.keyCode === 229) return null;
+  const resolved = sanitizeSubSessionQuickModifiers([...modifiers]) ?? DEFAULT_SUBSESSION_QUICK_MODIFIERS;
+  const needCtrl = resolved.includes('ctrl');
+  const needAlt = resolved.includes('alt');
+  const needShift = resolved.includes('shift');
+  const needMeta = resolved.includes('meta');
+  if (
+    Boolean(e.ctrlKey) !== needCtrl
+    || Boolean(e.altKey) !== needAlt
+    || Boolean(e.shiftKey) !== needShift
+    || Boolean(e.metaKey) !== needMeta
+  ) {
+    return null;
+  }
+  const digit = extractDigitFromKeyboardEvent(e);
+  if (digit === null) return null;
+  if (digit === 0) return { kind: 'closeAll' };
+  if (digit >= 1 && digit <= 9) return { kind: 'open', index: digit - 1 };
+  return null;
+}

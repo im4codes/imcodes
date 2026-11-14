@@ -98,9 +98,11 @@ import {
   hasDomBlockingOverlay,
   isMacPlatform,
   matchNavigationShortcutBinding,
+  matchSubSessionQuickShortcut,
   readLegacyTabOrder,
   resolveFocusedKeyboardViewMode,
   resolveKeyboardShortcutSlots,
+  resolveSubSessionQuickModifiers,
   sortSessionsByTabOrder,
   type KeyboardShortcutOverrides,
 } from './keyboard-shortcuts.js';
@@ -2595,6 +2597,10 @@ function InternalMainApp() {
   );
   const resolvedShortcutSlots = useMemo(
     () => resolveKeyboardShortcutSlots(shortcutOverrides, isMacPlatform()),
+    [shortcutOverrides],
+  );
+  const resolvedSubSessionQuickModifiers = useMemo(
+    () => resolveSubSessionQuickModifiers(shortcutOverrides),
     [shortcutOverrides],
   );
   const [pinnedSubSessionArr, setPinnedSubSessionArr] = useSyncedPreference<string[]>('subsession_pinned', [], 0);
@@ -7471,6 +7477,13 @@ function InternalMainApp() {
   orderedTabsNavRef.current = orderedVisibleMainSessions;
   const resolvedShortcutSlotsRef = useRef(resolvedShortcutSlots);
   resolvedShortcutSlotsRef.current = resolvedShortcutSlots;
+  const resolvedSubSessionQuickModifiersRef = useRef(resolvedSubSessionQuickModifiers);
+  resolvedSubSessionQuickModifiersRef.current = resolvedSubSessionQuickModifiers;
+  const orderedVisibleSubSessionsRef = useRef(visibleSubSessions);
+  const openSubSessionWindowRef = useRef(openSubSessionWindow);
+  openSubSessionWindowRef.current = openSubSessionWindow;
+  const closeAllSubSessionWindowsRef = useRef(closeAllSubSessionWindows);
+  closeAllSubSessionWindowsRef.current = closeAllSubSessionWindows;
   hasBlockingComposerOverlayRef.current = hasBlockingComposerOverlay;
   const hasBlockingMobileGestureOverlayRef = useRef(false);
   hasBlockingMobileGestureOverlayRef.current = hasBlockingComposerOverlay
@@ -7567,7 +7580,10 @@ function InternalMainApp() {
     const handler = (e: KeyboardEvent) => {
       if (e.defaultPrevented || isImeComposingKeyEvent(e)) return;
       const matched = matchNavigationShortcutBinding(e, resolvedShortcutSlotsRef.current);
-      if (!matched) return;
+      const quickSubMatch = matched
+        ? null
+        : matchSubSessionQuickShortcut(e, resolvedSubSessionQuickModifiersRef.current);
+      if (!matched && !quickSubMatch) return;
 
       const subId = focusedSubIdRef.current;
       const subRecord = subId ? subSessionsRef.current.find((item) => item.id === subId) : undefined;
@@ -7591,6 +7607,34 @@ function InternalMainApp() {
         return;
       }
 
+      if (quickSubMatch) {
+        if (quickSubMatch.kind === 'closeAll') {
+          e.preventDefault();
+          e.stopPropagation();
+          closeAllSubSessionWindowsRef.current();
+          return;
+        }
+        if (!selectedServerIdRef.current || manualDashboardRef.current) return;
+        const targetSub = orderedVisibleSubSessionsRef.current[quickSubMatch.index];
+        if (!targetSub) return;
+        e.preventDefault();
+        e.stopPropagation();
+        lastAutoFocusedRef.current = null;
+        openSubSessionWindowRef.current(targetSub.id);
+        setSubQuickFocusTick((prev) => prev + 1);
+        if (targetSub.type === 'shell' || targetSub.type === 'script') {
+          if (typeof requestAnimationFrame === 'function') {
+            requestAnimationFrame(() => {
+              const win = document.querySelector(`.subsession-window[data-subsession-id="${CSS.escape(targetSub.id)}"]`);
+              const xtermInput = win?.querySelector('.xterm-helper-textarea') as HTMLElement | null;
+              xtermInput?.focus({ preventScroll: true });
+            });
+          }
+        }
+        return;
+      }
+
+      if (!matched) return;
       const shortcutKeycaps = formatShortcutKeycaps(matched.chord, isMacPlatform());
       if (matched.action === 'serverPrev' || matched.action === 'serverNext') {
         if (!navigateServerByStep(matched.action === 'serverNext' ? 1 : -1, shortcutKeycaps)) return;
@@ -7662,6 +7706,7 @@ function InternalMainApp() {
 
   const lastNavIntentKeyRef = useRef<string | null>(null);
   const lastAutoFocusedRef = useRef<{ key: string; element: HTMLDivElement } | null>(null);
+  const [subQuickFocusTick, setSubQuickFocusTick] = useState(0);
   if (lastNavIntentKeyRef.current !== navigationIntentKey) {
     lastNavIntentKeyRef.current = navigationIntentKey;
     lastAutoFocusedRef.current = null;
@@ -7799,7 +7844,7 @@ function InternalMainApp() {
       cancelled = true;
       cleanupObservers();
     };
-  }, [attemptAutoFocusForTarget, autoFocusTarget, hasBlockingComposerOverlay]);
+  }, [attemptAutoFocusForTarget, autoFocusTarget, hasBlockingComposerOverlay, subQuickFocusTick]);
 
   const showTeamDiscussionGuide = shouldShowTeamDiscussionGuide(
     teamDiscussionGuidePref,
@@ -7910,23 +7955,28 @@ function InternalMainApp() {
       return ids;
     });
   }, []);
+  const orderedVisibleSubSessions = useMemo(() => {
+    const byId = new Map(visibleSubSessions.map((sub) => [sub.id, sub]));
+    const seen = new Set<string>();
+    const ordered = subSessionVisualOrderIds
+      .map((id) => byId.get(id))
+      .filter((sub): sub is typeof visibleSubSessions[number] => {
+        if (!sub || seen.has(sub.id)) return false;
+        seen.add(sub.id);
+        return true;
+      });
+    const remaining = visibleSubSessions.filter((sub) => !seen.has(sub.id));
+    if (pinnedSubSessionIds.size > 0 && remaining.length > 1) {
+      const pinned = remaining.filter((sub) => pinnedSubSessionIds.has(sub.id) || pinnedSubSessionIds.has(sub.sessionName));
+      const unpinned = remaining.filter((sub) => !pinnedSubSessionIds.has(sub.id) && !pinnedSubSessionIds.has(sub.sessionName));
+      return [...ordered, ...pinned, ...unpinned];
+    }
+    return [...ordered, ...remaining];
+  }, [subSessionVisualOrderIds, visibleSubSessions, pinnedSubSessionIds]);
+  orderedVisibleSubSessionsRef.current = orderedVisibleSubSessions;
   const visibleSubSessionAccentColors = useMemo(
-    () => {
-      const byId = new Map(visibleSubSessions.map((sub) => [sub.id, sub]));
-      const seen = new Set<string>();
-      const ordered = subSessionVisualOrderIds
-        .map((id) => byId.get(id))
-        .filter((sub): sub is typeof visibleSubSessions[number] => {
-          if (!sub || seen.has(sub.id)) return false;
-          seen.add(sub.id);
-          return true;
-        });
-      for (const sub of visibleSubSessions) {
-        if (!seen.has(sub.id)) ordered.push(sub);
-      }
-      return getSubSessionAccentColorMap(ordered);
-    },
-    [subSessionVisualOrderIds, visibleSubSessions],
+    () => getSubSessionAccentColorMap(orderedVisibleSubSessions),
+    [orderedVisibleSubSessions],
   );
 
   const visiblePinnedPanels = useMemo(() =>

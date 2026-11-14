@@ -2312,6 +2312,15 @@
           "title": "Pestaña siguiente",
           "desc": "Cambiar a la pestaña de sesión a la derecha"
         }
+      },
+      "subsession_quick": {
+        "title": "Atajos rápidos de subsesión",
+        "desc": "Elige las teclas modificadoras que se combinan con 1–9 para abrir y enfocar una subsesión, y con 0 para cerrar todas las ventanas de subsesión.",
+        "open_label": "Abrir y enfocar subsesión #",
+        "close_all_label": "Cerrar todas las ventanas de subsesión",
+        "modifiers_aria": "Teclas modificadoras de atajos rápidos de subsesión",
+        "min_one_hint": "Mantén seleccionada al menos una tecla modificadora.",
+        "reset_aria": "Restablecer modificadores de atajos rápidos de subsesión"
       }
     }
   },

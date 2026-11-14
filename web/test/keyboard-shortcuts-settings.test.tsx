@@ -65,6 +65,13 @@ vi.mock('react-i18next', () => ({
         'settings.shortcuts.actions.tab_prev.desc': 'Switch left',
         'settings.shortcuts.actions.tab_next.title': 'Next Tab',
         'settings.shortcuts.actions.tab_next.desc': 'Switch right',
+        'settings.shortcuts.subsession_quick.title': 'Sub-session Quick Shortcuts',
+        'settings.shortcuts.subsession_quick.desc': 'Choose modifiers for 1–9 open and 0 close all.',
+        'settings.shortcuts.subsession_quick.open_label': 'Open & focus sub-session #',
+        'settings.shortcuts.subsession_quick.close_all_label': 'Close all sub-session windows',
+        'settings.shortcuts.subsession_quick.modifiers_aria': 'Sub-session quick shortcut modifier keys',
+        'settings.shortcuts.subsession_quick.min_one_hint': 'Keep at least one modifier key selected.',
+        'settings.shortcuts.subsession_quick.reset_aria': 'Reset sub-session quick shortcut modifiers',
       };
       let out = dict[key] ?? key;
       if (opts) {
@@ -336,5 +343,62 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     expect(screen.getByTestId('shortcut-record-serverPrev').textContent).toContain('⌃');
     expect(screen.getByTestId('shortcut-record-serverPrev').textContent).toContain('A');
     expect(screen.getByTestId('shortcut-record-tabPrev-secondary').textContent).toContain('Not set');
+  });
+
+  it('configures multi-modifier combinations for sub-session digit shortcuts, prevents empty set, persists, and resets', () => {
+    render(<KeyboardShortcutsSection isMacOverride={false} />);
+
+    const ctrlBtn = screen.getByTestId('subsession-mod-ctrl') as HTMLButtonElement;
+    const altBtn = screen.getByTestId('subsession-mod-alt') as HTMLButtonElement;
+    const shiftBtn = screen.getByTestId('subsession-mod-shift') as HTMLButtonElement;
+    const resetAllBtn = screen.getByTestId('shortcuts-reset-all') as HTMLButtonElement;
+
+    // Default: only Ctrl active, disabled as last modifier, preview shows Ctrl + 1–9 and Ctrl + 0
+    expect(ctrlBtn.getAttribute('aria-pressed')).toBe('true');
+    expect(ctrlBtn.disabled).toBe(true);
+    expect(altBtn.getAttribute('aria-pressed')).toBe('false');
+    expect(resetAllBtn.disabled).toBe(true);
+    expect(screen.queryByTestId('subsession-mod-reset')).toBeNull();
+    expect(screen.getByTestId('subsession-quick-preview-open').textContent).toContain('Ctrl');
+    expect(screen.getByTestId('subsession-quick-preview-open').textContent).toContain('1–9');
+    expect(screen.getByTestId('subsession-quick-preview-close').textContent).toContain('Ctrl');
+    expect(screen.getByTestId('subsession-quick-preview-close').textContent).toContain('0');
+
+    // Toggle Alt on -> Ctrl + Alt active; now Ctrl is unlocked
+    fireEvent.click(altBtn);
+    expect(ctrlBtn.getAttribute('aria-pressed')).toBe('true');
+    expect(ctrlBtn.disabled).toBe(false);
+    expect(altBtn.getAttribute('aria-pressed')).toBe('true');
+    expect(resetAllBtn.disabled).toBe(false);
+    expect(screen.getByTestId('subsession-mod-reset')).toBeTruthy();
+
+    // Uncheck Ctrl -> only Alt active (Alt is now locked last)
+    fireEvent.click(ctrlBtn);
+    expect(ctrlBtn.getAttribute('aria-pressed')).toBe('false');
+    expect(altBtn.getAttribute('aria-pressed')).toBe('true');
+    expect(altBtn.disabled).toBe(true);
+
+    // Switch to Ctrl+Shift -> verify preview + persisted preference survive reload
+    fireEvent.click(ctrlBtn);
+    fireEvent.click(shiftBtn);
+    fireEvent.click(altBtn);
+    expect(screen.getByTestId('subsession-quick-preview-open').textContent).toContain('Ctrl');
+    expect(screen.getByTestId('subsession-quick-preview-open').textContent).toContain('Shift');
+    const stored = JSON.parse(localStorage.getItem(`rcc_sync_${KEYBOARD_SHORTCUTS_PREF_KEY}`) ?? '{}');
+    expect(stored.v).toEqual({ subSessionQuickModifiers: ['ctrl', 'shift'] });
+
+    cleanup();
+    render(<KeyboardShortcutsSection isMacOverride={true} />);
+    expect(screen.getByTestId('subsession-mod-ctrl').getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getByTestId('subsession-mod-shift').getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getByTestId('subsession-quick-preview-open').textContent).toContain('⌃');
+    expect(screen.getByTestId('subsession-quick-preview-open').textContent).toContain('⇧');
+
+    // Per-section reset restores default Ctrl only
+    fireEvent.click(screen.getByTestId('subsession-mod-reset'));
+    expect((screen.getByTestId('subsession-mod-ctrl') as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByTestId('subsession-mod-shift').getAttribute('aria-pressed')).toBe('false');
+    expect(screen.queryByTestId('subsession-mod-reset')).toBeNull();
+    expect((screen.getByTestId('shortcuts-reset-all') as HTMLButtonElement).disabled).toBe(true);
   });
 });

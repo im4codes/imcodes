@@ -378,12 +378,15 @@ export function SessionPane({
   // Re-register with app.tsx when session becomes active/inactive
   useEffect(() => {
     if (isActive) {
-      if (inputRef.current) {
+      if (inputRef.current && inputRef.current.isConnected) {
         onInputRefRef.current?.(inputRef.current);
         return undefined;
       }
       if (typeof requestAnimationFrame === 'function') {
-        const id = requestAnimationFrame(() => { onInputRefRef.current?.(inputRef.current); });
+        const id = requestAnimationFrame(() => {
+          const el = inputRef.current;
+          onInputRefRef.current?.(el && el.isConnected ? el : null);
+        });
         return () => cancelAnimationFrame(id);
       }
       return undefined;
