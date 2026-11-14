@@ -27,12 +27,17 @@ import {
   extractArchiveToDir,
   parseDaemonRuntimeTarget,
   pruneStagedNodeModulesForTarget,
+  resolvePlatformCommand,
   sanitizeBundleRelativePath,
   shouldKeepPackageLockEntry,
   verifyDaemonRuntimeArchive,
   verifyExtractedDaemonRuntime,
   writeDaemonRuntimeJson,
 } from '../../scripts/daemon-runtime-artifacts.mjs';
+// @ts-expect-error Plain ESM helper under scripts/
+import { sh as buildDaemonRuntimeSh } from '../../scripts/build-daemon-runtime.mjs';
+// @ts-expect-error Plain ESM helper under scripts/
+import { runSmokeCommand } from '../../scripts/run-preview-dist-smoke.mjs';
 
 const tempDirs: string[] = [];
 
@@ -495,5 +500,78 @@ describe('Windows zip PowerShell -File invocation without -Command/$args', () =>
     const verified = await verifyDaemonRuntimeArchive(manifestPath, { requireOfficialNode: false });
     expect(verified.artifact.format).toBe('zip');
     expect(verified.fileCount).toBe(manifest.fileCount);
+  });
+});
+
+describe('Windows .cmd/.bat command invocation resolution', () => {
+  it('routes npm/npx and .cmd/.bat through ComSpec cmd.exe /d /s /c on win32 without shell:true', () => {
+    const winNpm = resolvePlatformCommand('npm', ['run', 'build'], {
+      platform: 'win32',
+      env: { ComSpec: 'C:\\Windows\\System32\\cmd.exe' },
+    });
+    expect(winNpm).toEqual({
+      command: 'C:\\Windows\\System32\\cmd.exe',
+      args: ['/d', '/s', '/c', '"npm.cmd run build"'],
+      options: { windowsVerbatimArguments: true },
+    });
+
+    const winNpxSpaces = resolvePlatformCommand('C:\\Program Files\\nodejs\\npx.cmd', ['vitest', 'run', 'my file.ts'], {
+      platform: 'win32',
+      env: {},
+    });
+    expect(winNpxSpaces).toEqual({
+      command: 'cmd.exe',
+      args: ['/d', '/s', '/c', '"\"C:\\Program Files\\nodejs\\npx.cmd\" vitest run \"my file.ts\""'],
+      options: { windowsVerbatimArguments: true },
+    });
+
+    expect(resolvePlatformCommand('git', ['rev-parse', 'HEAD'], { platform: 'win32', env: {} })).toEqual({
+      command: 'git',
+      args: ['rev-parse', 'HEAD'],
+      options: {},
+    });
+
+    expect(resolvePlatformCommand('npm', ['run', 'build'], { platform: 'linux', env: {} })).toEqual({
+      command: 'npm',
+      args: ['run', 'build'],
+      options: {},
+    });
+
+    expect(() => resolvePlatformCommand('npm', ['run\nwhoami'], { platform: 'win32', env: {} })).toThrow(/forbidden control/i);
+    expect(() => resolvePlatformCommand('npm', ['bad"arg'], { platform: 'win32', env: {} })).toThrow(/double quotes/i);
+  });
+
+  it('invokes build-daemon-runtime and preview-smoke commands via cmd.exe on simulated win32 without shell:true or EINVAL', () => {
+    const execCalls: Array<{ file: string; args: string[]; opts: Record<string, unknown> }> = [];
+    buildDaemonRuntimeSh('npm', ['run', 'build'], {
+      platform: 'win32',
+      env: { ComSpec: 'C:\\Windows\\System32\\cmd.exe' },
+      cwd: 'C:\\repo',
+      execFileSyncImpl: (file: string, args: string[], opts: Record<string, unknown>) => {
+        execCalls.push({ file, args, opts });
+        return '';
+      },
+    });
+    expect(execCalls).toHaveLength(1);
+    expect(execCalls[0].file).toBe('C:\\Windows\\System32\\cmd.exe');
+    expect(execCalls[0].args).toEqual(['/d', '/s', '/c', '"npm.cmd run build"']);
+    expect(execCalls[0].opts.windowsVerbatimArguments).toBe(true);
+    expect(execCalls[0].opts.shell).toBeUndefined();
+    expect(execCalls[0].opts.cwd).toBe('C:\\repo');
+
+    const spawnCalls: Array<{ file: string; args: string[]; opts: Record<string, unknown> }> = [];
+    runSmokeCommand('npx', ['vitest', 'run'], {
+      platform: 'win32',
+      env: { ComSpec: 'C:\\Windows\\System32\\cmd.exe' },
+      spawnSyncImpl: (file: string, args: string[], opts: Record<string, unknown>) => {
+        spawnCalls.push({ file, args, opts });
+        return { status: 0 };
+      },
+    });
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0].file).toBe('C:\\Windows\\System32\\cmd.exe');
+    expect(spawnCalls[0].args).toEqual(['/d', '/s', '/c', '"npx.cmd vitest run"']);
+    expect(spawnCalls[0].opts.windowsVerbatimArguments).toBe(true);
+    expect(spawnCalls[0].opts.shell).toBe(false);
   });
 });

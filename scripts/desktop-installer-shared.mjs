@@ -115,7 +115,13 @@ export function stageDaemonRuntimePayload({
     }
     cpSync(sourceDir, outDir, { recursive: true, dereference: false });
   } else if (runtimeArchive) {
-    extractArchiveToDir(resolve(runtimeArchive), outDir, targetInfo);
+    const absArchive = resolve(runtimeArchive);
+    extractArchiveToDir(absArchive, targetInfo.archiveFormat, outDir);
+    if (!existsSync(join(outDir, targetInfo.nodeRelativePath))) {
+      throw new Error(
+        `daemon-runtime archive missing ${targetInfo.nodeRelativePath} in ${outDir} (extracted from ${absArchive})`,
+      );
+    }
   } else {
     throw new Error('Either --runtime-dir or --runtime-archive is required');
   }

@@ -297,6 +297,16 @@ describe('Qwen3-ASR mobile assets', () => {
     });
     const files: Record<string, string> = {
       'android/Manifest.java': `package android; public class Manifest { public static class permission { public static final String RECORD_AUDIO="mic"; } }`,
+      'android/view/HapticFeedbackConstants.java': `package android.view; public class HapticFeedbackConstants { public static final int LONG_PRESS=0, FLAG_IGNORE_VIEW_SETTING=1; }`,
+      'android/view/View.java': `package android.view;
+public class View {
+  public static volatile int hapticCalls=0, lastFeedback=-1, lastFlags=-1;
+  public static void reset(){ hapticCalls=0; lastFeedback=-1; lastFlags=-1; }
+  public boolean post(Runnable action){ if(action!=null) action.run(); return true; }
+  public boolean performHapticFeedback(int feedbackConstant, int flags){
+    hapticCalls++; lastFeedback=feedbackConstant; lastFlags=flags; return true;
+  }
+}`,
       'android/media/AudioFormat.java': `package android.media; public class AudioFormat { public static final int CHANNEL_IN_MONO=1, ENCODING_PCM_16BIT=2; }`,
       'android/media/MediaRecorder.java': `package android.media; public class MediaRecorder { public static class AudioSource { public static final int MIC=1, VOICE_RECOGNITION=6; } }`,
       'android/media/audiofx/AudioEffect.java': `package android.media.audiofx; public class AudioEffect { public static final int SUCCESS=0, ERROR=-1; }`,
@@ -411,12 +421,21 @@ public class AudioRecord {
       'com/getcapacitor/JSObject.java': `package com.getcapacitor; public class JSObject extends java.util.TreeMap<String,Object>{}`,
       'com/getcapacitor/PermissionState.java': `package com.getcapacitor; public enum PermissionState{ GRANTED }`,
       'com/getcapacitor/PluginCall.java': `package com.getcapacitor; public class PluginCall { public final java.util.concurrent.CountDownLatch done=new java.util.concurrent.CountDownLatch(1); public String error,value; public String getString(String key){ return null; } public void resolve(){ done.countDown(); } public void resolve(JSObject o){ value=o.toString(); resolve(); } public void reject(String e){ error=e; done.countDown(); } public void reject(String e,Exception x){ reject(e); } }`,
+      'com/getcapacitor/Bridge.java': `package com.getcapacitor;
+public class Bridge {
+  private final android.view.View webView;
+  public Bridge(android.view.View webView){ this.webView=webView; }
+  public android.view.View getWebView(){ return webView; }
+}`,
       'com/getcapacitor/Plugin.java': `package com.getcapacitor;
 public class Plugin {
   public final java.util.List<String> events=java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+  private Bridge bridge=new Bridge(new android.view.View());
   public void load(){}
   protected void handleOnPause(){}
   protected void handleOnDestroy(){}
+  public Bridge getBridge(){ return bridge; }
+  public void setBridge(Bridge bridge){ this.bridge=bridge; }
   public void notifyListeners(String key,JSObject value){ events.add(key+":"+value); }
   public PermissionState getPermissionState(String p){ return PermissionState.GRANTED; }
   public void requestPermissionForAlias(String a,PluginCall c,String callback){}
@@ -874,6 +893,17 @@ public class Harness {
   check(OnnxTensor.created.get()==OnnxTensor.released.get(),"retired tensor leak");
   check(OrtSession.Result.created.get()==OrtSession.Result.released.get(),"retired result leak");
   System.out.println("OWNER_RETIRE_OK");
+  android.view.View.reset();
+  PluginCall hapticOk=new PluginCall();p.performHaptic(hapticOk);await(hapticOk.done);
+  check(android.view.View.hapticCalls==1 && android.view.View.lastFeedback==android.view.HapticFeedbackConstants.LONG_PRESS && android.view.View.lastFlags==android.view.HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING, "performHaptic did not dispatch expected feedback");
+  com.getcapacitor.Bridge origBridge=p.getBridge();
+  p.setBridge(new com.getcapacitor.Bridge(null));
+  PluginCall hapticNullView=new PluginCall();p.performHaptic(hapticNullView);await(hapticNullView.done);
+  p.setBridge(null);
+  PluginCall hapticNullBridge=new PluginCall();p.performHaptic(hapticNullBridge);await(hapticNullBridge.done);
+  p.setBridge(origBridge);
+  check(android.view.View.hapticCalls==1, "null bridge/webView still invoked haptic");
+  System.out.println("HAPTIC_OK");
   SpeechGainTest.main(new String[0]);
  }
 }
@@ -891,7 +921,7 @@ public class Harness {
     expect(unitOut).toBe('QWEN3_JAVA_UNIT_TESTS:PASS');
     for (const dtype of ['FLOAT', 'FLOAT16']) {
       const output=execFileSync('java',['-Djava.io.tmpdir='+root, '-DortDtype='+dtype, '-cp',classesDir,'Harness'],{encoding:'utf8',timeout:15000}).trim().split('\n');
-      expect(output, `ORT dtype ${dtype}`).toEqual(['COLD_STOP_OK','WARM_REUSE_OK','SINGLE_TAIL_DRAIN_OK','SILENCE_SEGMENT_OK','WINDOW_AND_RELEASE_OK','AGC_LIFECYCLE_OK','AGC_FALLBACK_OK','OVERFLOW_OK','OWNER_RETIRE_OK','SpeechGainTest: ALL 6 TESTS PASSED']);
+      expect(output, `ORT dtype ${dtype}`).toEqual(['COLD_STOP_OK','WARM_REUSE_OK','SINGLE_TAIL_DRAIN_OK','SILENCE_SEGMENT_OK','WINDOW_AND_RELEASE_OK','AGC_LIFECYCLE_OK','AGC_FALLBACK_OK','OVERFLOW_OK','OWNER_RETIRE_OK','HAPTIC_OK','SpeechGainTest: ALL 6 TESTS PASSED']);
     }
   }, 95000);
 });

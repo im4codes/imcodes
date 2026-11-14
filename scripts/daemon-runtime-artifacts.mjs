@@ -585,6 +585,57 @@ export async function verifyExtractedDaemonRuntime(bundleRoot, expectedFiles, op
   return { fileCount: actualFiles.length };
 }
 
+function quoteWindowsCmdToken(token) {
+  if (typeof token !== 'string') {
+    throw new Error(`command token must be a string, got ${typeof token}`);
+  }
+  if (/[\0\r\n]/u.test(token)) {
+    throw new Error('command token contains forbidden control characters');
+  }
+  if (token.includes('"')) {
+    throw new Error('command token cannot contain double quotes for cmd.exe');
+  }
+  if (token.length === 0) return '""';
+  if (!/[\s&|<>^()%!]/u.test(token)) return token;
+  return `"${token}"`;
+}
+
+/**
+ * Resolve a command/args invocation so `.cmd`/`.bat` scripts (including `npm`/`npx`)
+ * run via `cmd.exe /d /s /c` on Windows without CVE-2024-27980 `EINVAL` or Node `DEP0190`.
+ */
+export function resolvePlatformCommand(command, args = [], options = {}) {
+  const platform = options.platform ?? process.platform;
+  const env = options.env ?? process.env;
+  const argList = Array.isArray(args) ? [...args] : [];
+  if (platform !== 'win32') {
+    return {
+      command,
+      args: argList,
+      options: {},
+    };
+  }
+  const normalized = command === 'npm'
+    ? 'npm.cmd'
+    : command === 'npx'
+      ? 'npx.cmd'
+      : command;
+  if (!/\.(cmd|bat)$/iu.test(normalized)) {
+    return {
+      command: normalized,
+      args: argList,
+      options: {},
+    };
+  }
+  const comspec = env.ComSpec?.trim() || env.COMSPEC?.trim() || 'cmd.exe';
+  const cmdLine = [normalized, ...argList].map(quoteWindowsCmdToken).join(' ');
+  return {
+    command: comspec,
+    args: ['/d', '/s', '/c', `"${cmdLine}"`],
+    options: { windowsVerbatimArguments: true },
+  };
+}
+
 /**
  * Resolve the Windows PowerShell 5.1 executable path from `SystemRoot`.
  */

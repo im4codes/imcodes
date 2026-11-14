@@ -18,6 +18,7 @@ import {
   mkdtempSync,
   openSync,
   readFileSync,
+  realpathSync,
   readSync,
   closeSync,
   readdirSync,
@@ -29,7 +30,7 @@ import { copyFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import { dirname, extname, join, relative, resolve } from 'node:path';
 import process from 'node:process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   DAEMON_RUNTIME_FILES_FILENAME,
   DEFAULT_DAEMON_RUNTIME_NODE_VERSION,
@@ -39,6 +40,7 @@ import {
   extractArchiveToDir,
   parseDaemonRuntimeTarget,
   pruneStagedNodeModulesForTarget,
+  resolvePlatformCommand,
   shouldKeepPackageLockEntry,
   verifyDaemonRuntimeArchive,
   writeDaemonRuntimeJson,
@@ -54,8 +56,16 @@ const repoRoot = resolve(scriptDir, '..');
 const OFFICIAL_NODE_DIST = 'https://nodejs.org/dist';
 const NODE_MIRROR = (process.env.NODE_EXE_MIRROR ?? OFFICIAL_NODE_DIST).replace(/\/+$/, '');
 
-function sh(file, args, opts = {}) {
-  return execFileSync(file, args, { stdio: 'inherit', ...opts });
+export function sh(file, args, opts = {}) {
+  const { platform, env, execFileSyncImpl, ...spawnOpts } = opts;
+  const resolved = resolvePlatformCommand(file, args, { platform, env });
+  const run = execFileSyncImpl ?? execFileSync;
+  return run(resolved.command, resolved.args, {
+    stdio: 'inherit',
+    ...(env !== undefined ? { env } : {}),
+    ...spawnOpts,
+    ...resolved.options,
+  });
 }
 
 function parseArgs(argv) {
@@ -515,7 +525,9 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error('build-daemon-runtime failed:', err?.message ?? err);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
+  main().catch((err) => {
+    console.error('build-daemon-runtime failed:', err?.message ?? err);
+    process.exit(1);
+  });
+}

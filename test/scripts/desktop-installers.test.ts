@@ -29,7 +29,10 @@ import {
   renderLinuxControlledNodeSystemdUnit,
   renderMacosControlledNodeLaunchDaemonPlist,
   renderMacosControlledNodeWatchdogLaunchDaemonPlist,
+  stageDaemonRuntimePayload,
 } from '../../scripts/desktop-installer-shared.mjs';
+// @ts-expect-error ESM script module
+import { createArchiveFromDir } from '../../scripts/daemon-runtime-artifacts.mjs';
 // @ts-expect-error ESM script module
 import { selectDeveloperIdSigningIdentity } from '../../scripts/macos-release-signing.mjs';
 
@@ -1349,5 +1352,80 @@ process.exit(0);
       expect(posRes.signal, `${platform}:positive-bounded-chain`).toBeNull();
       expect(posRes.status, `${platform}:positive-bounded-chain:${posRes.stderr}`).toBe(0);
     }
+  });
+
+  it('stages and builds Linux/macOS/Windows installers cleanly from --runtime-archive (tar.gz and zip)', async () => {
+    const root = makeTempDir('imcodes-runtime-archive-');
+
+    // Linux tar.gz -> stageDaemonRuntimePayload + buildLinuxInstallers
+    const linuxRtDir = createFakeRuntimeDir(root, 'linux', '0.9.5');
+    const linuxArchive = join(root, 'daemon-runtime-linux-x64.tar.gz');
+    createArchiveFromDir(linuxRtDir, linuxArchive, 'tar.gz');
+    const stagedLinux = stageDaemonRuntimePayload({
+      runtimeArchive: linuxArchive,
+      target: 'linux-x64',
+      destReleaseDir: join(root, 'staged-linux'),
+    });
+    expect(existsSync(join(stagedLinux, 'bin', 'node'))).toBe(true);
+    expect(existsSync(join(stagedLinux, 'package', 'dist', 'src', 'index.js'))).toBe(true);
+
+    const linuxBuilt = await buildLinuxInstallers({
+      arch: 'x64',
+      version: '0.9.5',
+      runtimeArchive: linuxArchive,
+      outDir: join(root, 'out-linux-archive'),
+      skipDeb: true,
+    });
+    expect(existsSync(linuxBuilt.shPath)).toBe(true);
+
+    // macOS tar.gz -> buildMacosInstaller
+    const macRtDir = createFakeRuntimeDir(root, 'darwin', '0.9.5');
+    const macArchive = join(root, 'daemon-runtime-darwin-arm64.tar.gz');
+    createArchiveFromDir(macRtDir, macArchive, 'tar.gz');
+    const macBuilt = await buildMacosInstaller({
+      arch: 'arm64',
+      version: '0.9.5',
+      runtimeArchive: macArchive,
+      stageDir: join(root, 'mac-archive-stage'),
+      emitStageOnly: true,
+    });
+    expect(existsSync(join(
+      macBuilt.stageDir,
+      'runtime-root',
+      'Library',
+      'Application Support',
+      'imcodes',
+      'daemon-runtime',
+      'releases',
+      '0.9.5',
+      'bin',
+      'node',
+    ))).toBe(true);
+
+    // Windows zip -> stageDaemonRuntimePayload + buildWindowsInstaller
+    const winRtDir = createFakeRuntimeDir(root, 'win32', '0.9.5');
+    const winArchive = join(root, 'daemon-runtime-win32-x64.zip');
+    createArchiveFromDir(winRtDir, winArchive, 'zip');
+    const winWorkDir = join(root, 'work-win-archive');
+    await buildWindowsInstaller({
+      version: '0.9.5',
+      runtimeArchive: winArchive,
+      outDir: join(root, 'out-win-archive'),
+      workDir: winWorkDir,
+      keepWorkDir: true,
+    });
+    expect(existsSync(join(winWorkDir, 'stage', 'daemon-runtime', 'node.exe'))).toBe(true);
+
+    // Malformed archive missing expected target binary must fail loudly with diagnostic context
+    const emptyArchiveSrc = join(root, 'empty-runtime');
+    mkdirSync(join(emptyArchiveSrc, 'package'), { recursive: true });
+    writeFileSync(join(emptyArchiveSrc, 'package', 'package.json'), '{}');
+    const badArchive = join(root, 'bad-linux.tar.gz');
+    createArchiveFromDir(emptyArchiveSrc, badArchive, 'tar.gz');
+    expect(() => stageDaemonRuntimePayload({
+      runtimeArchive: badArchive,
+      target: 'linux-x64',
+      destReleaseDir: join(root, 'staged-bad'),
+    })).toThrow(/daemon-runtime archive missing bin\/node/);
   });
 });

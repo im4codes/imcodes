@@ -4,6 +4,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
+import { resolvePlatformCommand } from './daemon-runtime-artifacts.mjs';
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const packageJson = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8'));
@@ -39,7 +40,12 @@ const gitBranch = execGit(['rev-parse', '--abbrev-ref', 'HEAD'], '') || null;
 const dirty = execGit(['status', '--porcelain'], '');
 let npmVersion = 'unknown';
 try {
-  npmVersion = execFileSync('npm', ['-v'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  const npmCmd = resolvePlatformCommand('npm', ['-v']);
+  npmVersion = execFileSync(npmCmd.command, npmCmd.args, {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+    ...npmCmd.options,
+  }).trim();
 } catch {
   // optional metadata only
 }
