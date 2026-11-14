@@ -192,6 +192,7 @@ const VOICE_HOLD_SCROLL_ABORT_PX = 40;
 const VOICE_HOLD_CANCEL_THRESHOLD_PX = 44;
 const VOICE_HOLD_EDIT_THRESHOLD_PX = 44;
 const VOICE_HOLD_SLIDE_MAX_PX = 84;
+const VOICE_HOLD_START_TIMEOUT_MS = 10_000;
 const VOICE_HOLD_FAILED_DRAIN_TIMEOUT_MS = 2500;
 const VOICE_HOLD_BAR_COUNT = 28;
 
@@ -1597,6 +1598,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [voiceHoldBars, setVoiceHoldBars] = useState<number[]>(() => Array(VOICE_HOLD_BAR_COUNT).fill(0));
   const voiceHoldTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const voiceHoldSlideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const voiceHoldStartTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const voiceHoldRecognizingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const voiceHoldPointerRef = useRef<{
     id: number;
@@ -5526,6 +5528,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     setVoiceOpen(true);
   }, [hasVoiceNotepadDraft]);
 
+  const clearVoiceHoldStartTimeout = useCallback(() => {
+    if (voiceHoldStartTimeoutRef.current !== null) {
+      clearTimeout(voiceHoldStartTimeoutRef.current);
+      voiceHoldStartTimeoutRef.current = null;
+    }
+  }, []);
+
   const clearVoiceHoldTimers = useCallback(() => {
     if (voiceHoldTimerRef.current !== null) {
       clearTimeout(voiceHoldTimerRef.current);
@@ -5535,11 +5544,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       clearTimeout(voiceHoldSlideTimerRef.current);
       voiceHoldSlideTimerRef.current = null;
     }
+    clearVoiceHoldStartTimeout();
     if (voiceHoldRecognizingTimerRef.current !== null) {
       clearTimeout(voiceHoldRecognizingTimerRef.current);
       voiceHoldRecognizingTimerRef.current = null;
     }
-  }, []);
+  }, [clearVoiceHoldStartTimeout]);
 
   const clearComposerVoiceWindowListeners = useCallback(() => {
     voiceWindowCleanupRef.current?.();
@@ -5944,6 +5954,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
     const failTransaction = (errCode: string) => {
       if (tx.settled || tx.error !== null) return;
+      clearVoiceHoldStartTimeout();
       tx.phase = 'failed';
       tx.error = errCode || 'permission_denied';
       if (mountedRef.current) {
@@ -5951,6 +5962,18 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       }
       void finalizeVoiceHold(tx, 'failed');
     };
+
+    voiceHoldStartTimeoutRef.current = setTimeout(() => {
+      voiceHoldStartTimeoutRef.current = null;
+      if (
+        voiceHoldTxRef.current === tx
+        && tx.phase === 'starting'
+        && !tx.settled
+        && tx.drainPromise === null
+      ) {
+        failTransaction('Speech recognition timed out');
+      }
+    }, VOICE_HOLD_START_TIMEOUT_MS);
 
     VoiceInput.onAudioLevel((rawLevel) => {
       if (
@@ -5976,6 +5999,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       (partial) => {
         if (tx.settled || tx.error !== null) return;
         tx.transcript = partial;
+        if (tx.phase === 'starting' && partial.trim()) {
+          clearVoiceHoldStartTimeout();
+          tx.didStartRecording = true;
+          tx.phase = 'recording';
+          if (mountedRef.current) {
+            setVoiceHoldPhase('recording');
+          }
+        }
         if (mountedRef.current && voiceHoldTxRef.current === tx && (tx.phase === 'starting' || tx.phase === 'recording')) {
           setVoiceHoldText(partial);
           pulseVoiceHoldRecognizing(900);
@@ -5985,6 +6016,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         if (voiceHoldTxRef.current !== tx || tx.settled || tx.error !== null) return;
         if (listening) {
           if (tx.phase !== 'starting' && tx.phase !== 'recording') return;
+          clearVoiceHoldStartTimeout();
           tx.didStartRecording = true;
           tx.phase = 'recording';
           if (mountedRef.current) {
@@ -6019,18 +6051,21 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       (started) => {
         tx.startSettled = true;
         if (!started || tx.error !== null) {
+          clearVoiceHoldStartTimeout();
           if (tx.drainPromise === null) {
             failTransaction(tx.error ?? 'permission_denied');
           }
           return false;
         }
         if (tx.didStartRecording && tx.phase === 'starting') {
+          clearVoiceHoldStartTimeout();
           tx.phase = 'recording';
         }
         return true;
       },
       (err) => {
         tx.startSettled = true;
+        clearVoiceHoldStartTimeout();
         if (tx.drainPromise === null) {
           failTransaction(err instanceof Error ? err.message : 'permission_denied');
         }
@@ -6039,6 +6074,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     );
   }, [
     clearComposerVoiceWindowListeners,
+    clearVoiceHoldStartTimeout,
     fallbackToComposerClick,
     finalizeVoiceHold,
     pulseVoiceHoldRecognizing,

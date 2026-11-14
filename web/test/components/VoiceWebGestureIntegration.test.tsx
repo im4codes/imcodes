@@ -622,4 +622,74 @@ describe('Mobile Web Speech real integration (SessionControls + VoiceOverlay + V
     await vi.advanceTimersByTimeAsync(0);
     expect(VoiceInput.isListening()).toBe(false);
   });
+
+  it('recovers primed mobile Web hold-to-talk stuck at voice.starting when WebKit never emits onstart/onerror/onend and allows immediate retry', async () => {
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = document.querySelector('.controls-input') as HTMLElement;
+    const ev1Down = new Event('pointerdown', { bubbles: true, cancelable: true });
+    Object.assign(ev1Down, { clientX: 180, clientY: 500, pointerId: 10, button: 0, pointerType: 'touch', isPrimary: true });
+    inUserGesture = true;
+    fireEvent(input, ev1Down);
+    inUserGesture = false;
+    expect(instances).toHaveLength(1);
+
+    // Hold 175ms enters HUD in 'starting' phase waiting for WebKit onstart/onaudiostart
+    await vi.advanceTimersByTimeAsync(175);
+    const hud = document.querySelector('.voice-hold-hud') as HTMLElement;
+    expect(hud).not.toBeNull();
+    expect(hud.getAttribute('data-phase')).toBe('starting');
+
+    // WebKit never emits onstart/onaudiostart/onerror/onend -> bounded confirm timeout recovers cleanly
+    await vi.advanceTimersByTimeAsync(VoiceInput.WEB_START_CONFIRM_TIMEOUT_MS);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(instances[0].abort).toHaveBeenCalled();
+    expect(document.querySelector('.voice-hold-hud')).toBeNull();
+    expect(document.querySelector('.voice-hold-error-banner')?.textContent).toContain('Speech recognition timed out');
+    expect(VoiceInput.isListening()).toBe(false);
+    expect(input.getAttribute('contenteditable')).toBe('true');
+
+    // Release stuck finger & blur back to voice-ready -> second hold starts and sends speech cleanly
+    const ev1Up = new Event('pointerup', { bubbles: true, cancelable: true });
+    Object.assign(ev1Up, { clientX: 180, clientY: 500, pointerId: 10, button: 0, pointerType: 'touch', isPrimary: true });
+    fireEvent(window, ev1Up);
+    input.blur();
+    fireEvent.blur(input);
+    await vi.advanceTimersByTimeAsync(0);
+
+    const ev2Down = new Event('pointerdown', { bubbles: true, cancelable: true });
+    Object.assign(ev2Down, { clientX: 180, clientY: 500, pointerId: 11, button: 0, pointerType: 'touch', isPrimary: true });
+    inUserGesture = true;
+    fireEvent(input, ev2Down);
+    inUserGesture = false;
+    expect(instances).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(175);
+
+    const hud2 = document.querySelector('.voice-hold-hud') as HTMLElement;
+    expect(hud2.getAttribute('data-phase')).toBe('starting');
+    instances[1].onstart?.();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(hud2.getAttribute('data-phase')).toBe('recording');
+    instances[1].onresult?.({
+      results: { length: 1, 0: { 0: { transcript: 'recovered second attempt' }, isFinal: true } },
+    });
+    const ev2Up = new Event('pointerup', { bubbles: true, cancelable: true });
+    Object.assign(ev2Up, { clientX: 180, clientY: 500, pointerId: 11, button: 0, pointerType: 'touch', isPrimary: true });
+    fireEvent(window, ev2Up);
+    instances[1].onend?.();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+      text: 'recovered second attempt',
+    }));
+  });
 });

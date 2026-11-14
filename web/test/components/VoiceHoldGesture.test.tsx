@@ -3147,4 +3147,78 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     dispatchPointer(input, 'pointerup', 180, 500, 2);
     await resetToUnfocused();
   });
+
+  it('bounds unconfirmed starting phase via startup timeout, promotes on partial speech, and recovers cleanly for immediate retry', async () => {
+    voiceMock.startListening.mockImplementation(async (
+      onResult: (partial: string) => void,
+      onListeningChange?: (listening: boolean) => void,
+      onError?: (error: string) => void,
+    ) => {
+      voiceMock.partialHandler = onResult;
+      voiceMock.listeningHandler = onListeningChange ?? null;
+      voiceMock.errorHandler = onError ?? null;
+      // Intentionally simulate backend resolving true without emitting onListeningChange(true)
+      return true;
+    });
+
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = document.querySelector('.controls-input') as HTMLElement;
+    const resetToUnfocused = async () => {
+      input.blur();
+      fireEvent.blur(input);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(input.getAttribute('contenteditable')).toBe('false');
+    };
+
+    // 1. Stuck in 'starting' with never-firing listening(true) fails cleanly after VOICE_HOLD_START_TIMEOUT_MS (10s)
+    dispatchPointer(input, 'pointerdown', 180, 500, 1);
+    await vi.advanceTimersByTimeAsync(175);
+    const hud = document.querySelector('.voice-hold-hud') as HTMLElement;
+    expect(hud).not.toBeNull();
+    expect(hud.getAttribute('data-phase')).toBe('starting');
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(voiceMock.stopListening).toHaveBeenCalledWith({ abort: true });
+    expect(document.querySelector('.voice-hold-hud')).toBeNull();
+    expect(document.querySelector('.voice-hold-error-banner')?.textContent).toBe('voice.error');
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(document.activeElement).toBe(input);
+
+    // Late release after timeout does not crash or re-open HUD; blurring allows immediate next hold
+    dispatchPointer(input, 'pointerup', 180, 500, 1);
+    await resetToUnfocused();
+
+    // 2. Partial speech arriving while still in 'starting' promotes phase to 'recording' and cancels timeout
+    dispatchPointer(input, 'pointerdown', 180, 500, 2);
+    await vi.advanceTimersByTimeAsync(175);
+    const hud2 = document.querySelector('.voice-hold-hud') as HTMLElement;
+    expect(hud2.getAttribute('data-phase')).toBe('starting');
+
+    voiceMock.partialHandler?.('hello mobile');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(hud2.getAttribute('data-phase')).toBe('recording');
+    expect(hud2.textContent).toContain('hello mobile');
+
+    // Advancing past 10s now MUST NOT fail because capture already promoted to 'recording'
+    await vi.advanceTimersByTimeAsync(10_500);
+    expect(document.querySelector('.voice-hold-hud')?.getAttribute('data-phase')).toBe('recording');
+
+    dispatchPointer(input, 'pointerup', 180, 500, 2);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+      text: 'hello mobile',
+    }));
+  });
 });

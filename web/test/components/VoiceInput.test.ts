@@ -1567,4 +1567,118 @@ describe('Web Mobile final drain', () => {
     }
   });
 
+  it('bounds native prewarm, available/start hangs, and hung stop drains so startup never deadlocks and promotes on live partialResults', async () => {
+    vi.useFakeTimers();
+    try {
+      // 1. Hung passive prewarm (checkPermissions never resolves) must NOT wedge startListening past NATIVE_PREWARM_CALL_TIMEOUT_MS
+      speechApi.checkPermissions.mockReturnValueOnce(new Promise(() => {}));
+      const prewarmPromise = VoiceInput.prewarm({ requestPermission: false });
+      const errLog: string[] = [];
+      const listenLog: boolean[] = [];
+      const resultsLog: Array<[string, boolean]> = [];
+      const startAfterHungPrewarm = VoiceInput.startListening(
+        (t, f) => resultsLog.push([t, f]),
+        (l) => listenLog.push(l),
+        (e) => errLog.push(e),
+      );
+
+      await vi.advanceTimersByTimeAsync(VoiceInput.NATIVE_PREWARM_CALL_TIMEOUT_MS + 10);
+      await expect(startAfterHungPrewarm).resolves.toBe(true);
+      await prewarmPromise;
+      expect(VoiceInput.isListening()).toBe(true);
+      expect(errLog).toEqual([]);
+      expect(listenLog).toEqual([true]);
+      await VoiceInput.stopListening({ abort: true });
+
+      // 2. Hung native start() times out cleanly after NATIVE_START_TIMEOUT_MS, issues best-effort stop, emits timeout error, and unlocks next retry
+      speechApi.start.mockReturnValueOnce(new Promise(() => {})).mockResolvedValueOnce({});
+      speechApi.stop.mockResolvedValue(undefined);
+      const hungStartErrors: string[] = [];
+      const hungStartListening: boolean[] = [];
+      const hungStartPromise = VoiceInput.startListening(
+        vi.fn(),
+        (l) => hungStartListening.push(l),
+        (e) => hungStartErrors.push(e),
+      );
+      await vi.advanceTimersByTimeAsync(VoiceInput.NATIVE_START_TIMEOUT_MS);
+      await expect(hungStartPromise).resolves.toBe(false);
+      expect(hungStartErrors).toEqual(['Speech recognition timed out']);
+      expect(hungStartListening).toEqual([false]);
+      expect(VoiceInput.isListening()).toBe(false);
+      expect(speechApi.stop).toHaveBeenCalled();
+
+      // Immediate retry succeeds cleanly (and partialResults promotes listening=true even if listeningState: started arrived late)
+      const deferredStart = deferred<Record<string, never>>();
+      speechApi.start.mockReturnValueOnce(deferredStart.promise);
+      const retryListening: boolean[] = [];
+      const retryResults: Array<[string, boolean]> = [];
+      const retryPromise = VoiceInput.startListening(
+        (t, f) => retryResults.push([t, f]),
+        (l) => retryListening.push(l),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      listeners.partialResults?.({ matches: ['early partial'], isFinal: false });
+      expect(retryListening).toEqual([true]);
+      expect(retryResults).toEqual([['early partial', false]]);
+      expect(VoiceInput.isListening()).toBe(true);
+      deferredStart.resolve({});
+      await expect(retryPromise).resolves.toBe(true);
+
+      // 3. Hung normal stop() past NATIVE_STOP_DRAIN_MS releases _pendingStop so subsequent starts recover cleanly
+      speechApi.stop.mockReturnValueOnce(new Promise(() => {})).mockResolvedValue(undefined);
+      const stuckStop = VoiceInput.stopListening();
+      await vi.advanceTimersByTimeAsync(VoiceInput.NATIVE_STOP_DRAIN_MS);
+      await stuckStop;
+      expect(VoiceInput.isListening()).toBe(false);
+      await expect(VoiceInput.startListening(vi.fn())).resolves.toBe(true);
+      expect(VoiceInput.isListening()).toBe(true);
+    } finally {
+      await VoiceInput.stopListening({ abort: true });
+      vi.useRealTimers();
+    }
+  });
+
+  it('bounds silent Web Speech stalls (missing onstart/onaudiostart/onerror/onend) via WEB_START_CONFIRM_TIMEOUT_MS and unlocks immediate retry', async () => {
+    vi.useFakeTimers();
+    const instances = browser({ autoStart: false });
+    try {
+      const listening: boolean[] = [];
+      const errors: string[] = [];
+      await expect(VoiceInput.startListening(
+        vi.fn(),
+        (v) => listening.push(v),
+        (e) => errors.push(e),
+      )).resolves.toBe(true);
+
+      expect(VoiceInput.isListening()).toBe(false);
+      expect(errors).toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(VoiceInput.WEB_START_CONFIRM_TIMEOUT_MS);
+      expect(instances[0].abort).toHaveBeenCalledOnce();
+      expect(errors).toEqual(['Speech recognition timed out']);
+      expect(listening).toEqual([false]);
+      expect(VoiceInput.isListening()).toBe(false);
+
+      // Next session recovers immediately once Web Speech fires onstart
+      const nextListening: boolean[] = [];
+      const nextErrors: string[] = [];
+      await expect(VoiceInput.startListening(
+        vi.fn(),
+        (v) => nextListening.push(v),
+        (e) => nextErrors.push(e),
+      )).resolves.toBe(true);
+      instances[1].onstart?.();
+      expect(nextListening).toEqual([true]);
+      expect(nextErrors).toEqual([]);
+      expect(VoiceInput.isListening()).toBe(true);
+      const stopped = VoiceInput.stopListening();
+      instances[1].onend?.();
+      await stopped;
+    } finally {
+      await VoiceInput.stopListening({ abort: true });
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
 });

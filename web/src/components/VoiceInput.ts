@@ -103,6 +103,49 @@ interface PrewarmCacheEntry {
 }
 
 const PREWARM_CACHE_TTL_MS = 15_000;
+/** Upper bound for quick native capability/permission checks during prewarm and start setup. */
+export const NATIVE_PREWARM_CALL_TIMEOUT_MS = 3_500;
+/** Upper bound for interactive native OS permission requests. */
+export const NATIVE_PERMISSION_TIMEOUT_MS = 15_000;
+/** Upper bound for native `recognition.start()` before falling back or failing out of `'starting'`. */
+export const NATIVE_START_TIMEOUT_MS = 8_000;
+/** Upper bound for normal native `stop()` drain (>15s so legitimate slow drains pass without timing out). */
+export const NATIVE_STOP_DRAIN_MS = 20_000;
+/** Upper bound waiting for Web Speech `onstart`/`onaudiostart`/`onresult` after `rec.start()`. */
+export const WEB_START_CONFIRM_TIMEOUT_MS = 5_000;
+
+class VoiceTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'VoiceTimeoutError';
+  }
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  return new Promise<T>((resolve, reject) => {
+    timer = setTimeout(() => {
+      timer = null;
+      reject(new VoiceTimeoutError(message));
+    }, timeoutMs);
+    Promise.resolve(promise).then(
+      (value) => {
+        if (timer !== null) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        resolve(value);
+      },
+      (err) => {
+        if (timer !== null) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        reject(err);
+      },
+    );
+  });
+}
 
 interface WebSession {
   generation: number;
@@ -116,6 +159,7 @@ interface WebSession {
   lastText: string;
   emittedFinal: boolean;
   earlyError: string | null;
+  startConfirmTimer: ReturnType<typeof setTimeout> | null;
 }
 
 interface PrimedWebOutcome {
@@ -217,7 +261,11 @@ async function removeHandle(handle: PluginListenerHandle | null): Promise<void> 
 async function cleanupSessionListeners(session: NativeSession | null): Promise<void> {
   if (!session || session.handles.length === 0) return;
   const handles = session.handles.splice(0);
-  await Promise.all(handles.map((handle) => removeHandle(handle)));
+  await withTimeout(
+    Promise.allSettled(handles.map((handle) => removeHandle(handle))),
+    NATIVE_PREWARM_CALL_TIMEOUT_MS,
+    'Speech listener cleanup timed out',
+  ).catch(() => {});
 }
 
 /** Pause app-owned playback before activating a recording audio session. This
@@ -253,6 +301,9 @@ async function attachSessionListeners(
       // not an append-only delta. Corrections may shorten the unfixed tail.
       // Keep this listener through stop ACK so its final short tail is retained.
       if (typeof text !== 'string' || (!final && session.text === text)) return;
+      if (!_listening && generation === _generation) {
+        setOwnerListening(session.owner, true);
+      }
       session.text = text;
       session.final = final;
       emitOwnerResult(session.owner, text, final);
@@ -286,7 +337,11 @@ async function attachSessionListeners(
   try {
     const outcomes = await Promise.all(
       registrations.map(async ([eventName, handler]) => {
-        const handle = await recognition.addListener(eventName, handler);
+        const handle = await withTimeout(
+          recognition.addListener(eventName, handler),
+          NATIVE_PREWARM_CALL_TIMEOUT_MS,
+          'Speech listener registration timed out',
+        );
         if (!isSessionLive() || generation !== _generation) {
           await removeHandle(handle);
           return false;
@@ -324,7 +379,11 @@ async function resolveUsableFallbackRecognizer(
     ).checkPermissions;
     let granted = false;
     if (typeof checkPerms === 'function') {
-      const checked = await checkPerms().catch(() => ({ speechRecognition: undefined }));
+      const checked = await withTimeout(
+        checkPerms(),
+        NATIVE_PREWARM_CALL_TIMEOUT_MS,
+        'Fallback permission check timed out',
+      ).catch(() => ({ speechRecognition: undefined }));
       granted = checked?.speechRecognition === 'granted';
     }
     if (!granted && !requestPermission) return null;
@@ -332,9 +391,17 @@ async function resolveUsableFallbackRecognizer(
       granted
         ? Promise.resolve({ speechRecognition: 'granted' })
         : (typeof fallback.requestPermissions === 'function'
-            ? fallback.requestPermissions()
+            ? withTimeout(
+                fallback.requestPermissions(),
+                NATIVE_PERMISSION_TIMEOUT_MS,
+                'Fallback permission request timed out',
+              )
             : Promise.resolve({ speechRecognition: 'granted' })),
-      fallback.available(),
+      withTimeout(
+        fallback.available(),
+        NATIVE_PREWARM_CALL_TIMEOUT_MS,
+        'Fallback availability check timed out',
+      ),
     ]);
     if (perms?.speechRecognition !== 'granted') return null;
     return avail?.available ? fallback : null;
@@ -391,12 +458,20 @@ export async function prewarm(options?: { requestPermission?: boolean }): Promis
 
       let permissionGranted = false;
       if (typeof checkPerms === 'function') {
-        const checked = await checkPerms().catch(() => ({ speechRecognition: undefined }));
+        const checked = await withTimeout(
+          checkPerms(),
+          NATIVE_PREWARM_CALL_TIMEOUT_MS,
+          'Permission check timed out',
+        ).catch(() => ({ speechRecognition: undefined }));
         permissionGranted = checked?.speechRecognition === 'granted';
       }
 
       if (!permissionGranted && requestPermission) {
-        const perms = await recognition.requestPermissions().catch(() => ({ speechRecognition: 'denied' }));
+        const perms = await withTimeout(
+          recognition.requestPermissions(),
+          NATIVE_PERMISSION_TIMEOUT_MS,
+          'Permission request timed out',
+        ).catch(() => ({ speechRecognition: 'denied' }));
         permissionGranted = perms?.speechRecognition === 'granted';
         if (!permissionGranted) {
           _prewarmCache = null;
@@ -404,7 +479,11 @@ export async function prewarm(options?: { requestPermission?: boolean }): Promis
         }
       }
 
-      const available = await recognition.available().catch(() => ({ available: false }));
+      const available = await withTimeout(
+        recognition.available(),
+        NATIVE_PREWARM_CALL_TIMEOUT_MS,
+        'Availability check timed out',
+      ).catch(() => ({ available: false }));
       let effective: NativeSpeechRecognition | null = available?.available ? recognition : null;
       if (!effective && (permissionGranted || requestPermission)) {
         effective = await resolveUsableFallbackRecognizer(recognition, requestPermission);
@@ -464,7 +543,11 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
 
   try {
     if (!getFreshPrewarmCache(recognition) && _prewarmInFlight) {
-      await _prewarmInFlight.promise;
+      await withTimeout(
+        _prewarmInFlight.promise,
+        NATIVE_PREWARM_CALL_TIMEOUT_MS,
+        'Speech prewarm timed out',
+      ).catch(() => {});
       if (!isSessionStarting()) {
         await cleanupSessionListeners(session);
         if (_nativeSession === session) _nativeSession = null;
@@ -477,7 +560,11 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
       recognition = prewarmed.effective;
       session.recognition = prewarmed.effective;
     } else if (prewarmed && prewarmed.available) {
-      const perms = await recognition.requestPermissions();
+      const perms = await withTimeout(
+        recognition.requestPermissions(),
+        NATIVE_PERMISSION_TIMEOUT_MS,
+        'Speech permission timed out',
+      );
       if (!isSessionStarting()) {
         await cleanupSessionListeners(session);
         if (_nativeSession === session) _nativeSession = null;
@@ -496,8 +583,16 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
       session.recognition = prewarmed.effective;
     } else {
       const [perms, available] = await Promise.all([
-        recognition.requestPermissions(),
-        recognition.available().catch(() => ({ available: false })),
+        withTimeout(
+          recognition.requestPermissions(),
+          NATIVE_PERMISSION_TIMEOUT_MS,
+          'Speech permission timed out',
+        ),
+        withTimeout(
+          recognition.available(),
+          NATIVE_PREWARM_CALL_TIMEOUT_MS,
+          'Speech availability check timed out',
+        ).catch(() => ({ available: false })),
       ]);
       if (!isSessionStarting()) {
         await cleanupSessionListeners(session);
@@ -544,14 +639,21 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
     const locale = pickLocale();
     pauseBackgroundAudio();
     try {
-      await recognition.start({
-        language: locale,
-        partialResults: true,
-        popup: false,
-        addPunctuation: true,
-      });
+      await withTimeout(
+        recognition.start({
+          language: locale,
+          partialResults: true,
+          popup: false,
+          addPunctuation: true,
+        }),
+        NATIVE_START_TIMEOUT_MS,
+        'Speech recognition timed out',
+      );
     } catch (startErr) {
       _prewarmCache = null;
+      if (startErr instanceof VoiceTimeoutError) {
+        void Promise.resolve(recognition.stop()).catch(() => {});
+      }
       if (!isSessionStarting()) throw startErr;
       const startMsg = startErr instanceof Error ? startErr.message : String(startErr ?? '');
       if (!/permission|denied|not allowed/i.test(startMsg)) {
@@ -567,12 +669,16 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
             if (_nativeSession === session) _nativeSession = null;
             return false;
           }
-          await recognition.start({
-            language: locale,
-            partialResults: true,
-            popup: false,
-            addPunctuation: true,
-          });
+          await withTimeout(
+            recognition.start({
+              language: locale,
+              partialResults: true,
+              popup: false,
+              addPunctuation: true,
+            }),
+            NATIVE_START_TIMEOUT_MS,
+            'Speech recognition timed out',
+          );
         } else {
           throw startErr;
         }
@@ -586,7 +692,11 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
       if (!session.stopStarted && !_nativeSession && !_pendingStart) {
         session.stopStarted = true;
         try {
-          await recognition.stop();
+          await withTimeout(
+            recognition.stop(),
+            NATIVE_PREWARM_CALL_TIMEOUT_MS,
+            'Stale speech stop timed out',
+          );
         } catch { /* stale start cleanup */ }
       }
       session.retired = true;
@@ -599,6 +709,9 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
     return true;
   } catch (err) {
     console.warn('[voice] start failed:', err);
+    if (err instanceof VoiceTimeoutError) {
+      void Promise.resolve(recognition.stop()).catch(() => {});
+    }
     if (isSessionStarting()) {
       const msg = err instanceof Error ? err.message : String(err ?? 'Failed to start speech recognition');
       reportOwnerError(session.owner, /permission|denied|not allowed/i.test(msg) ? 'permission_denied' : msg);
@@ -684,6 +797,12 @@ function clearWebRecHandlers(rec: any): void {
   rec.onerror = null;
 }
 
+function clearWebStartConfirmTimer(session: WebSession | null): void {
+  if (!session || session.startConfirmTimer === null) return;
+  clearTimeout(session.startConfirmTimer);
+  session.startConfirmTimer = null;
+}
+
 function startWebListening(
   owner: CaptureOwner,
   options?: { primed?: boolean; deferAudioPause?: boolean },
@@ -705,6 +824,7 @@ function startWebListening(
   _webDrainCancel?.();
   _webDrainCancel = null;
   if (_webSession) {
+    clearWebStartConfirmTimer(_webSession);
     _webSession.retired = true;
     const prevRec = _webSession.rec;
     _webSession = null;
@@ -730,9 +850,11 @@ function startWebListening(
       lastText: '',
       emittedFinal: false,
       earlyError: null,
+      startConfirmTimer: null,
     };
     const confirmWebCapture = (): void => {
       if (session.retired || generation !== _generation || !isOwnerCurrent(session.owner)) return;
+      clearWebStartConfirmTimer(session);
       if (session.captureStarted) return;
       session.captureStarted = true;
       setOwnerListening(session.owner, true);
@@ -769,6 +891,7 @@ function startWebListening(
           const errStr = String(e.error);
           const mapped = /not-allowed|service-not-allowed|permission/i.test(errStr) ? 'permission_denied' : errStr;
           if (session.primed) {
+            clearWebStartConfirmTimer(session);
             session.earlyError = mapped;
             session.ended = true;
             session.retired = true;
@@ -781,6 +904,7 @@ function startWebListening(
             try { rec.abort?.(); } catch { /* already ended */ }
             return;
           }
+          clearWebStartConfirmTimer(session);
           reportOwnerError(session.owner, mapped);
           void stopListening();
         }
@@ -788,6 +912,7 @@ function startWebListening(
     };
     rec.onend = (): void => {
       if (session.retired || generation !== _generation || !isOwnerCurrent(session.owner)) return;
+      clearWebStartConfirmTimer(session);
       if (!session.captureStarted) {
         const err = session.earlyError ?? _lastError ?? 'permission_denied';
         session.ended = true;
@@ -840,17 +965,48 @@ function startWebListening(
     // Do NOT mark _listening / invoke onListeningChange(true) here: in Web Speech API,
     // rec.start() only submits the request; browser permission rejection (not-allowed)
     // arrives asynchronously before onstart/onaudiostart ever fires.
+    // Guard against silent iOS/WebKit stalls where neither onstart, onerror, nor onend ever fires.
+    if (!session.captureStarted && !session.retired && !session.ended && generation === _generation) {
+      session.startConfirmTimer = setTimeout(() => {
+        session.startConfirmTimer = null;
+        if (session.captureStarted || session.retired || session.ended || generation !== _generation) return;
+        const currentOwner = session.owner;
+        session.ended = true;
+        session.retired = true;
+        clearWebRecHandlers(rec);
+        if (_webSession === session) _webSession = null;
+        _generation++;
+        stopWebLevelMeter();
+        try {
+          rec.abort?.();
+        } catch {
+          try { rec.stop?.(); } catch { /* already ended */ }
+        }
+        const timeoutErr = 'Speech recognition timed out';
+        if (session.primed) {
+          _primedOutcome = { generation: _generation, error: timeoutErr, text: null, endedWithCapture: false };
+          retireOwner(currentOwner);
+          return;
+        }
+        if (isOwnerCurrent(currentOwner)) {
+          reportOwnerError(currentOwner, timeoutErr);
+          setOwnerListening(currentOwner, false);
+          retireOwner(currentOwner);
+        }
+      }, WEB_START_CONFIRM_TIMEOUT_MS);
+    }
     return true;
   } catch (err) {
     console.warn('[voice] web start failed:', err);
     const msg = err instanceof Error ? err.message : String(err ?? 'Failed to start web speech');
     const mapped = /permission|denied|not-allowed/i.test(msg) ? 'permission_denied' : msg;
+    if (_webSession && _webSession.generation === generation) {
+      clearWebStartConfirmTimer(_webSession);
+      _webSession.retired = true;
+      clearWebRecHandlers(_webSession.rec);
+      _webSession = null;
+    }
     if (primed) {
-      if (_webSession && _webSession.generation === generation) {
-        _webSession.retired = true;
-        clearWebRecHandlers(_webSession.rec);
-        _webSession = null;
-      }
       _primedOutcome = { generation: ++_generation, error: mapped, text: null, endedWithCapture: false };
       setOwnerListening(owner, false);
       retireOwner(owner);
@@ -890,6 +1046,7 @@ export function cancelWebGesturePrime(): void {
   _primedOutcome = null;
   const session = _webSession;
   if (!session || !session.primed) return;
+  clearWebStartConfirmTimer(session);
   session.retired = true;
   session.ended = true;
   const rec = session.rec;
@@ -918,6 +1075,7 @@ export interface StopListeningOptions {
 function stopWebListening(abort = false): Promise<void> {
   const session = _webSession;
   const owner = session?.owner ?? _activeOwner;
+  clearWebStartConfirmTimer(session);
   if (_listening) {
     setOwnerListening(owner, false);
   }
@@ -1227,16 +1385,32 @@ export async function stopListening(options?: StopListeningOptions): Promise<voi
   stopPromise = (async () => {
     let stopFailure: string | null = null;
     try {
-      await session?.recognition.stop();
+      if (session) {
+        await withTimeout(
+          session.recognition.stop(),
+          NATIVE_STOP_DRAIN_MS,
+          'Speech recognition stop timed out',
+        );
+      }
     } catch (err) {
-      console.warn('[voice] stop failed:', err);
-      const msg = err instanceof Error && err.message.trim() ? err.message.trim() : String(err ?? '');
-      stopFailure = msg || 'Speech recognition stop failed';
+      if (err instanceof VoiceTimeoutError) {
+        console.warn('[voice] native stop timed out; releasing session');
+      } else {
+        console.warn('[voice] stop failed:', err);
+        const msg = err instanceof Error && err.message.trim() ? err.message.trim() : String(err ?? '');
+        stopFailure = msg || 'Speech recognition stop failed';
+      }
     }
 
     try {
-      await startPromise;
-    } catch { /* start failure already handled */ }
+      if (startPromise) {
+        await withTimeout(
+          startPromise,
+          NATIVE_STOP_DRAIN_MS,
+          'Speech start settle during stop timed out',
+        );
+      }
+    } catch { /* start failure / timeout already handled */ }
 
     const stillCurrentOwner = !!owner
       && isOwnerCurrent(owner)
