@@ -62,6 +62,7 @@ import { describeActionPayload, gateMachineAction } from '../security/machine-ac
 import { recordMachineActionAuthorized } from '../security/machine-exec-audit.js';
 import { MACHINE_ACTION, MACHINE_ACTION_RATE_LIMIT, MACHINE_INTERACTIVE_SOURCE, evaluateMachineAction, type MachineAction } from '../../../shared/machine-access-policy.js';
 import { admitMachineAction, type MachineActionAdmissionInput } from '../share/shared-machine-authority.js';
+import { resolveDaemonCallerAuthority } from '../security/daemon-scope.js';
 import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-authority.js';
 import { sanitizeUploadFilename } from '../../../shared/upload-filename.js';
 import { FS_GENERIC_ERROR_CODES } from '../../../shared/fs-error-codes.js';
@@ -852,18 +853,39 @@ async function authorizeSessionFileAccess(
   userId: string,
   mode: SharedFileAccessMode,
 ): Promise<{ ok: true; sessionName?: string } | { ok: false; reason: string }> {
-  const member = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
+  let effectiveUserId = userId;
+  let pinnedSessionName: string | undefined;
+  let forceParticipantShareOnly = false;
+  if (c.get('authServerId' as never)) {
+    const authority = await resolveDaemonCallerAuthority(c, {
+      targetServerId: serverId,
+      allowOwnerCrossServer: true,
+    });
+    if (!authority.ok) return { ok: false, reason: authority.reason };
+    effectiveUserId = authority.actorUserId;
+    if (authority.kind === 'participant_daemon') {
+      forceParticipantShareOnly = true;
+      if (authority.claims.shareTarget.kind !== 'server') {
+        pinnedSessionName = authority.claims.sessionName;
+      }
+    }
+  }
+
+  const member = forceParticipantShareOnly
+    ? { ok: false as const, reason: 'share-participant-pinned' }
+    : await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId: effectiveUserId });
   if (member.ok) return { ok: true };
 
   const sessionName = (
-    (c.get('tokenSessionName' as never) as string | undefined)
+    pinnedSessionName
+    ?? (c.get('tokenSessionName' as never) as string | undefined)
     ?? c.req.query('sessionName')
     ?? ''
   ).trim();
 
   const serverAccess = await resolveHttpShareAccess(c.env.DB, {
     serverId,
-    userId,
+    userId: effectiveUserId,
     target: { kind: 'server', serverId },
   });
   if (serverAccess.actor.kind === 'share') {
@@ -878,7 +900,7 @@ async function authorizeSessionFileAccess(
 
   const access = await resolveHttpShareAccessForCoveredSession(c.env.DB, {
     serverId,
-    userId,
+    userId: effectiveUserId,
     target,
   });
   if (access.actor.kind !== 'share') return { ok: false, reason: member.reason };

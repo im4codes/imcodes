@@ -5,6 +5,7 @@ import type { Env } from '../env.js';
 import type { Database } from '../db/client.js';
 import { randomHex, signJwt } from '../security/crypto.js';
 import { requireAuth, resolveServerMembershipRole } from '../security/authorization.js';
+import { pauseRevokedSharedCronJobs } from '../security/server-share-boundary.js';
 import { getDbSessionsByServer, getSubSessionsByServer } from '../db/queries.js';
 import { resolveUserByIdentifier } from '../db/user-lookup.js';
 import { WsBridge } from '../ws/bridge.js';
@@ -493,6 +494,7 @@ tabSharingRoutes.delete('/server/:serverId/shares/:shareId', requireAuth(), asyn
     createdAt: now,
   });
   void WsBridge.get(serverId).revalidateShareSocketsForUser(share.targetUserId);
+  await pauseRevokedSharedCronJobs(c.env.DB, { serverId, userId: share.targetUserId, now });
   return c.json({ share: managedShareView(share, await resolveUserByIdentifier(c.env.DB as Database, share.targetUserId)) });
 });
 

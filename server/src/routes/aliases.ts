@@ -15,6 +15,7 @@
 import { Hono } from 'hono';
 import type { Env } from '../env.js';
 import { requireAuth } from '../security/authorization.js';
+import { daemonScopeFailure, resolveDaemonCallerAuthority } from '../security/daemon-scope.js';
 import { randomHex } from '../security/crypto.js';
 import {
   type AliasEntry,
@@ -38,6 +39,12 @@ import { SERVER_ID_HEADER } from '../../../shared/http-header-names.js';
 export const aliasRoutes = new Hono<{ Bindings: Env; Variables: { userId: string } }>();
 
 aliasRoutes.use('/*', requireAuth());
+aliasRoutes.use('/*', async (c, next) => {
+  const authority = await resolveDaemonCallerAuthority(c, { denyParticipant: true });
+  if (!authority.ok) return daemonScopeFailure(c, authority);
+  await next();
+  return;
+});
 
 /**
  * NFC-normalize an already-validated `tags` field into a `string[]` for storage.

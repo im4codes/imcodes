@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import type { Env } from '../env.js';
 import { requireAuth } from '../security/authorization.js';
+import { daemonScopeFailure, resolveDaemonCallerAuthority } from '../security/daemon-scope.js';
 import { randomHex } from '../security/crypto.js';
 import {
   deleteVerificationMachine,
@@ -36,6 +37,12 @@ export const verificationMachineRoutes = new Hono<{
 }>();
 
 verificationMachineRoutes.use('/*', requireAuth());
+verificationMachineRoutes.use('/*', async (c, next) => {
+  const authority = await resolveDaemonCallerAuthority(c, { denyParticipant: true });
+  if (!authority.ok) return daemonScopeFailure(c, authority);
+  await next();
+  return;
+});
 
 function normalizedScopeKey(scope: VerificationMachineScope, value: unknown): string | null {
   if (verificationMachineScopeKeyError(scope, value) !== null) return null;

@@ -453,8 +453,15 @@ export function createMemoryMcpServer(
   ]);
   // Exact server-backed stores share this MCP server surface but stay outside
   // the fuzzy-memory contract list and schema firewall.
-  for (const [name, tool] of registerAliasMcpTools(server, caller, exactStoreToolDeps)) registered.set(name, tool);
-  for (const [name, tool] of registerMessagePinMcpTools(server, caller, exactStoreToolDeps)) registered.set(name, tool);
+  const effectiveExactStoreToolDeps: ExactStoreMcpToolDeps = {
+    ...(toolDeps.aliasClientOptions ? { aliasClientOptions: toolDeps.aliasClientOptions } : {}),
+    ...(toolDeps.cronOptions?.loadSharedMachineAuthority
+      ? { clientOptions: { loadSharedMachineAuthority: toolDeps.cronOptions.loadSharedMachineAuthority } }
+      : {}),
+    ...exactStoreToolDeps,
+  };
+  for (const [name, tool] of registerAliasMcpTools(server, caller, effectiveExactStoreToolDeps)) registered.set(name, tool);
+  for (const [name, tool] of registerMessagePinMcpTools(server, caller, effectiveExactStoreToolDeps)) registered.set(name, tool);
   // Supervision registry: exact server-backed operations, same separation as
   // alias/message-pin tools -- outside the fuzzy-memory contract + firewall.
   for (const [name, tool] of registerSupervisionMcpTools(server, caller, supervisionToolDeps, toolDeps.legacyToolForwarder)) {
@@ -581,8 +588,34 @@ export function mergeDefaultToolDeps(
       rejectStopped: true,
     })
     : null;
+  const loadSharedMachineAuthority = createSessionSharedMachineAuthorityLoader({
+    callerSessionName: caller.sessionName,
+    resourceOwner,
+    env: bridgeDeps.env,
+    requireHookPort,
+  });
   return {
     ...toolDeps,
+    cronOptions: {
+      loadSharedMachineAuthority,
+      ...toolDeps.cronOptions,
+    },
+    verificationClientOptions: {
+      loadSharedMachineAuthority,
+      ...toolDeps.verificationClientOptions,
+    },
+    aliasClientOptions: {
+      loadSharedMachineAuthority,
+      ...toolDeps.aliasClientOptions,
+    },
+    memorySearchOptions: {
+      loadSharedMachineAuthority,
+      ...toolDeps.memorySearchOptions,
+    },
+    orchestratorDeps: {
+      loadSharedMachineAuthority,
+      ...toolDeps.orchestratorDeps,
+    },
     pairTitleTurn: toolDeps.pairTitleTurn ?? (postSharedMachineAuthorityHook
       ? () => resolveTaskPairTitleTurn({ postAuthorityHook: postSharedMachineAuthorityHook, sessionName: caller.sessionName! })
       : undefined),
@@ -629,6 +662,7 @@ export function mergeDefaultToolDeps(
     capabilityService: toolDeps.capabilityService
       ?? (caller.serverId ? createServerCapabilityService({
         serverId: caller.serverId,
+        loadSharedMachineAuthority,
         activateSkill: async (capability) => {
           const identity = await resolveCapabilityIdentity!(caller);
           return identity
@@ -747,12 +781,7 @@ export function mergeDefaultToolDeps(
     }),
     cloudDocsDeps: toolDeps.cloudDocsDeps ?? createDaemonCloudDocsToolDeps({
       ...(bridgeDeps.env ? { env: bridgeDeps.env } : {}),
-      loadSharedMachineAuthority: createSessionSharedMachineAuthorityLoader({
-        callerSessionName: caller.sessionName,
-        resourceOwner,
-        env: bridgeDeps.env,
-        requireHookPort,
-      }),
+      loadSharedMachineAuthority,
     }),
     sendDeps: {
       ...toolDeps.sendDeps,

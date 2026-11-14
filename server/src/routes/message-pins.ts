@@ -8,6 +8,7 @@ import {
 import type { Env } from '../env.js';
 import { deleteMessagePin, getMessagePin, listMessagePins, upsertMessagePin } from '../db/message-pins.js';
 import { requireAuth } from '../security/authorization.js';
+import { daemonScopeFailure, resolveDaemonCallerAuthority } from '../security/daemon-scope.js';
 import { authorizeTimelineSession } from './timeline-session-access.js';
 
 export const messagePinRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
@@ -55,7 +56,12 @@ function filterPins<T extends { sessionName: string; eventType: string; text: st
 messagePinRoutes.get('/message-pins', requireAuth(), async (c) => {
   const serverId = readServerId(c);
   if (!serverId) return c.json({ error: MESSAGE_PIN_ERRORS.SCOPE_REQUIRED }, 400);
-  const userId = c.get('userId' as never) as string;
+  const authority = await resolveDaemonCallerAuthority(c, {
+    targetServerId: serverId,
+    allowOwnerCrossServer: true,
+  });
+  if (!authority.ok) return daemonScopeFailure(c, authority);
+  const userId = authority.actorUserId;
   const sessionName = c.req.query('sessionName')?.trim() || undefined;
   const query = c.req.query('q')?.trim() ?? '';
   const eventType = c.req.query('eventType')?.trim() || undefined;
@@ -72,7 +78,14 @@ messagePinRoutes.get('/message-pins', requireAuth(), async (c) => {
     return c.json({ error: MESSAGE_PIN_ERRORS.INVALID_PAYLOAD }, 400);
   }
 
+  const scopedSession = authority.kind === 'participant_daemon' && authority.claims.shareTarget.kind !== 'server'
+    ? authority.claims.sessionName
+    : undefined;
+
   if (sessionName) {
+    if (scopedSession && sessionName !== scopedSession) {
+      return c.json({ error: 'forbidden' }, 403);
+    }
     const scope = { serverId, sessionName };
     if (!await authorizeScope(c.env.DB, userId, scope)) return c.json({ error: 'forbidden' }, 403);
     const pins = await listMessagePins(c.env.DB, { userId, ...scope });
@@ -83,7 +96,8 @@ messagePinRoutes.get('/message-pins', requireAuth(), async (c) => {
   // may outlive a revoked share, so re-check every distinct session before
   // returning its saved text snapshot instead of treating ownership of the
   // pin row as permanent read authorization.
-  const pins = await listMessagePins(c.env.DB, { userId, serverId });
+  const allPins = await listMessagePins(c.env.DB, { userId, serverId });
+  const pins = scopedSession ? allPins.filter((pin) => pin.sessionName === scopedSession) : allPins;
   const sessionNames = [...new Set(pins.map((pin) => pin.sessionName))];
   const access = new Map<string, boolean>();
   // A long-lived account may have pins from many sessions. Re-authorize all
@@ -107,9 +121,21 @@ messagePinRoutes.get('/message-pins/:id', requireAuth(), async (c) => {
   const id = readPinId(c.req.param('id'));
   if (!serverId) return c.json({ error: MESSAGE_PIN_ERRORS.SCOPE_REQUIRED }, 400);
   if (!id) return c.json({ error: MESSAGE_PIN_ERRORS.NOT_FOUND }, 404);
-  const userId = c.get('userId' as never) as string;
+  const authority = await resolveDaemonCallerAuthority(c, {
+    targetServerId: serverId,
+    allowOwnerCrossServer: true,
+  });
+  if (!authority.ok) return daemonScopeFailure(c, authority);
+  const userId = authority.actorUserId;
   const pin = await getMessagePin(c.env.DB, { id, userId, serverId });
   if (!pin) return c.json({ error: MESSAGE_PIN_ERRORS.NOT_FOUND }, 404);
+  if (
+    authority.kind === 'participant_daemon'
+    && authority.claims.shareTarget.kind !== 'server'
+    && pin.sessionName !== authority.claims.sessionName
+  ) {
+    return c.json({ error: 'forbidden' }, 403);
+  }
   if (!await authorizeScope(c.env.DB, userId, { serverId, sessionName: pin.sessionName })) {
     return c.json({ error: 'forbidden' }, 403);
   }
@@ -119,7 +145,19 @@ messagePinRoutes.get('/message-pins/:id', requireAuth(), async (c) => {
 messagePinRoutes.post('/message-pins', requireAuth(), async (c) => {
   const scope = readScope(c);
   if (!scope) return c.json({ error: MESSAGE_PIN_ERRORS.SCOPE_REQUIRED }, 400);
-  const userId = c.get('userId' as never) as string;
+  const authority = await resolveDaemonCallerAuthority(c, {
+    targetServerId: scope.serverId,
+    allowOwnerCrossServer: true,
+  });
+  if (!authority.ok) return daemonScopeFailure(c, authority);
+  const userId = authority.actorUserId;
+  if (
+    authority.kind === 'participant_daemon'
+    && authority.claims.shareTarget.kind !== 'server'
+    && scope.sessionName !== authority.claims.sessionName
+  ) {
+    return c.json({ error: 'forbidden' }, 403);
+  }
   if (!await authorizeScope(c.env.DB, userId, scope)) return c.json({ error: 'forbidden' }, 403);
 
   const body = await c.req.json<Record<string, unknown>>().catch(() => null);
@@ -154,11 +192,23 @@ messagePinRoutes.post('/message-pins', requireAuth(), async (c) => {
 messagePinRoutes.delete('/message-pins/:id', requireAuth(), async (c) => {
   const serverId = readServerId(c);
   if (!serverId) return c.json({ error: MESSAGE_PIN_ERRORS.SCOPE_REQUIRED }, 400);
-  const userId = c.get('userId' as never) as string;
+  const authority = await resolveDaemonCallerAuthority(c, {
+    targetServerId: serverId,
+    allowOwnerCrossServer: true,
+  });
+  if (!authority.ok) return daemonScopeFailure(c, authority);
+  const userId = authority.actorUserId;
   const id = readPinId(c.req.param('id'));
   if (!id) return c.json({ error: MESSAGE_PIN_ERRORS.NOT_FOUND }, 404);
   const pin = await getMessagePin(c.env.DB, { id, userId, serverId });
   if (!pin) return c.json({ error: MESSAGE_PIN_ERRORS.NOT_FOUND }, 404);
+  if (
+    authority.kind === 'participant_daemon'
+    && authority.claims.shareTarget.kind !== 'server'
+    && pin.sessionName !== authority.claims.sessionName
+  ) {
+    return c.json({ error: 'forbidden' }, 403);
+  }
   if (!await authorizeScope(c.env.DB, userId, { serverId, sessionName: pin.sessionName })) {
     return c.json({ error: 'forbidden' }, 403);
   }

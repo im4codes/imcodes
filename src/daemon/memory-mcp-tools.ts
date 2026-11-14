@@ -164,7 +164,7 @@ import { decodePeerAuditReplyCommandStructure } from './peer-audit-reply-ingress
 import { deriveMemoryToolCaller, type McpRuntimeCaller } from './memory-mcp-caller.js';
 import { memoryGetSources } from '../context/memory-read-tools.js';
 import { getMemorySourcesOrchestrated, type GetSourcesOrchestratorResult, type OrchestratorDeps } from './memory-get-sources-orchestrator.js';
-import { listMcpMemorySummaries, searchMcpMemoryRecall, type MemoryMcpListProjectionClass, type MemoryMcpSearchHit, type MemoryMcpSearchResult } from './memory-mcp-search.js';
+import { listMcpMemorySummaries, searchMcpMemoryRecall, type MemoryMcpListProjectionClass, type MemoryMcpSearchHit, type MemoryMcpSearchOptions, type MemoryMcpSearchResult } from './memory-mcp-search.js';
 import type { MemorySearchQuery } from '../context/memory-search.js';
 import { saveObservation, savePreference } from '../context/memory-write-tools.js';
 import { serializeContextNamespace } from '../context/context-keys.js';
@@ -284,6 +284,7 @@ import {
   recordVerificationMachineProfileStatus,
   removeVerificationMachineProfile,
   setVerificationMachineProfile,
+  type VerificationMachineClientOptions,
 } from './verification-machine-mcp-client.js';
 import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
 
@@ -424,6 +425,9 @@ export interface MemoryMcpToolDeps {
   removeVerificationMachine?: typeof removeVerificationMachineProfile;
   recordVerificationMachineStatus?: typeof recordVerificationMachineProfileStatus;
   listVerificationAliases?: typeof aliasMcpList;
+  verificationClientOptions?: VerificationMachineClientOptions;
+  aliasClientOptions?: AliasMcpClientOptions;
+  memorySearchOptions?: MemoryMcpSearchOptions;
   applyEffectiveIdentity?: (
     sessionName: string,
     prompt: string | undefined,
@@ -1740,8 +1744,10 @@ function savePairBrief(pair: NonNullable<ReturnType<typeof pairChecklistTarget>>
 }
 
 export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: MemoryMcpToolDeps = {}): Record<MemoryMcpToolName, MemoryMcpToolHandler> {
-  const searchMemory = deps.searchMemory ?? searchMcpMemoryRecall;
-  const listMemorySummaries = deps.listMemorySummaries ?? listMcpMemorySummaries;
+  const searchMemory: MemoryMcpSearch = deps.searchMemory
+    ?? ((q) => searchMcpMemoryRecall(q, deps.memorySearchOptions));
+  const listMemorySummaries: MemoryMcpListSummaries = deps.listMemorySummaries
+    ?? ((q) => listMcpMemorySummaries(q, deps.memorySearchOptions));
   let lastGoodSendSessions: SessionRecord[] | null = null;
   const sendSessions = async (): Promise<SessionRecord[]> => {
     // Keep the in-memory directory before disk refresh. A valid but stale
@@ -2029,11 +2035,16 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
   const identityGetEffective = deps.getEffectiveIdentityProfiles ?? getEffectiveSessionIdentityProfiles;
   const identitySet = deps.setIdentityProfile ?? setSessionIdentityProfile;
   const identityClear = deps.clearIdentityProfile ?? clearSessionIdentityProfile;
-  const verificationList = deps.listVerificationMachines ?? listVerificationMachineProfiles;
-  const verificationSet = deps.setVerificationMachine ?? setVerificationMachineProfile;
-  const verificationRemove = deps.removeVerificationMachine ?? removeVerificationMachineProfile;
-  const verificationRecordStatus = deps.recordVerificationMachineStatus ?? recordVerificationMachineProfileStatus;
-  const verificationAliasList = deps.listVerificationAliases ?? aliasMcpList;
+  const verificationList: typeof listVerificationMachineProfiles = deps.listVerificationMachines
+    ?? ((projectKey, opts) => listVerificationMachineProfiles(projectKey, { ...(deps.verificationClientOptions ?? {}), ...(opts ?? {}) }));
+  const verificationSet: typeof setVerificationMachineProfile = deps.setVerificationMachine
+    ?? ((input, opts) => setVerificationMachineProfile(input, { ...(deps.verificationClientOptions ?? {}), ...(opts ?? {}) }));
+  const verificationRemove: typeof removeVerificationMachineProfile = deps.removeVerificationMachine
+    ?? ((id, expectedRevision, opts) => removeVerificationMachineProfile(id, expectedRevision, { ...(deps.verificationClientOptions ?? {}), ...(opts ?? {}) }));
+  const verificationRecordStatus: typeof recordVerificationMachineProfileStatus = deps.recordVerificationMachineStatus
+    ?? ((id, status, opts) => recordVerificationMachineProfileStatus(id, status, { ...(deps.verificationClientOptions ?? {}), ...(opts ?? {}) }));
+  const verificationAliasList: typeof aliasMcpList = deps.listVerificationAliases
+    ?? ((opts, query) => aliasMcpList({ ...(deps.aliasClientOptions ?? {}), ...(opts ?? {}) }, query));
   const identityApply = deps.applyEffectiveIdentity ?? (async (sessionName, prompt, options) => {
     const { applyEffectiveSessionIdentity } = await import('../agent/session-manager.js');
     return applyEffectiveSessionIdentity(sessionName, prompt, options);

@@ -27,6 +27,7 @@ import type { MemoryToolCaller } from '../context/memory-read-tools.js';
 import { memoryGetSources, type MemoryGetSourcesResult } from '../context/memory-read-tools.js';
 import { projectionOwnerCache } from './memory-projection-owner-cache.js';
 import { TIMELINE_HISTORY_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
+import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../shared/shared-machine-authority.js';
 import logger from '../util/logger.js';
 
 export interface OrchestratorCredentials {
@@ -48,6 +49,7 @@ export interface OrchestratorDeps {
   skipCloudLookup?: boolean;
   /** Override the request timeout. */
   timeoutMs?: number;
+  loadSharedMachineAuthority?: () => Promise<string | null>;
 }
 
 export interface GetSourcesError {
@@ -88,6 +90,7 @@ async function resolveOwnerFromCloud(
   credentials: OrchestratorCredentials,
   fetchImpl: typeof fetch,
   signal: AbortSignal,
+  sharedMachineAuthority?: string | null,
 ): Promise<string | null> {
   const params = new URLSearchParams({ projectionId });
   if (projectId) params.set('projectId', projectId);
@@ -98,6 +101,7 @@ async function resolveOwnerFromCloud(
       headers: {
         Authorization: `Bearer ${credentials.token}`,
         'X-Server-Id': credentials.serverId,
+        ...(sharedMachineAuthority ? { [SHARED_MACHINE_AUTHORITY_HEADER]: sharedMachineAuthority } : {}),
       },
       signal,
     });
@@ -134,6 +138,7 @@ async function fetchRemoteSources(
   credentials: OrchestratorCredentials,
   fetchImpl: typeof fetch,
   signal: AbortSignal,
+  sharedMachineAuthority?: string | null,
 ): Promise<GetSourcesOrchestratorResult> {
   const params = new URLSearchParams({ serverId: ownerServerId, projectionId });
   if (projectId) params.set('projectId', projectId);
@@ -145,6 +150,7 @@ async function fetchRemoteSources(
       headers: {
         Authorization: `Bearer ${credentials.token}`,
         'X-Server-Id': credentials.serverId,
+        ...(sharedMachineAuthority ? { [SHARED_MACHINE_AUTHORITY_HEADER]: sharedMachineAuthority } : {}),
       },
       signal,
     });
@@ -225,6 +231,14 @@ export async function getMemorySourcesOrchestrated(
 
   const credentials = await (deps.loadCredentials ?? defaultLoadCredentials)();
   const localServerId = credentials?.serverId ?? null;
+  let sharedMachineAuthority: string | null = null;
+  if (deps.loadSharedMachineAuthority) {
+    try {
+      sharedMachineAuthority = await deps.loadSharedMachineAuthority();
+    } catch {
+      return { status: 'error', reason: 'scope_forbidden', projectionId: trimmed };
+    }
+  }
 
   // Step 1: resolve owner.
   let owner: string | null = cache.get(trimmed) ?? null;
@@ -233,7 +247,7 @@ export async function getMemorySourcesOrchestrated(
     const timer = setTimeout(() => controller.abort(), deps.timeoutMs ?? DEFAULT_TIMEOUT_MS);
     timer.unref?.();
     try {
-      owner = await resolveOwnerFromCloud(trimmed, projectId, credentials, fetchImpl, controller.signal);
+      owner = await resolveOwnerFromCloud(trimmed, projectId, credentials, fetchImpl, controller.signal, sharedMachineAuthority);
     } finally {
       clearTimeout(timer);
     }
@@ -265,7 +279,7 @@ export async function getMemorySourcesOrchestrated(
   const timer = setTimeout(() => controller.abort(), deps.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   timer.unref?.();
   try {
-    return await fetchRemoteSources(trimmed, projectId, owner!, credentials!, fetchImpl, controller.signal);
+    return await fetchRemoteSources(trimmed, projectId, owner!, credentials!, fetchImpl, controller.signal, sharedMachineAuthority);
   } finally {
     clearTimeout(timer);
   }

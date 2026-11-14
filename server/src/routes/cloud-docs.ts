@@ -8,6 +8,7 @@ import { randomHex, sha256Hex, signJwt, verifyJwt } from '../security/crypto.js'
 import { resolveUserByIdentifier } from '../db/user-lookup.js';
 import { WsBridge } from '../ws/bridge.js';
 import { resolveMachineOperationalUser } from '../share/shared-machine-authority.js';
+import { isSharedOrContributedServer } from '../security/daemon-scope.js';
 import {
   getOnlyOfficeDocumentMeta,
   resolveLiveOnlyOfficeAccess,
@@ -511,6 +512,9 @@ async function requireRegularUser(c: RouteContext): Promise<{ userId: string } |
     });
     if (!operational) {
       return c.json({ error: 'forbidden', reason: 'invalid_shared_machine_authority' }, 403);
+    }
+    if (!operational.delegatedActorUserId && await isSharedOrContributedServer(c.env.DB, outcome.auth.serverId)) {
+      return c.json({ error: 'forbidden', reason: 'shared_host_daemon_authority_required' }, 403);
     }
     return { userId: operational.delegatedActorUserId ?? operational.userId };
   }

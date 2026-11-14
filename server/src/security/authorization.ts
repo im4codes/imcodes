@@ -360,7 +360,7 @@ export function requireAuth(options: RequireAuthOptions = {}) {
 /**
  * Require at minimum the given role.
  */
-export function requireRole(minRole: Role) {
+export function requireRole(minRole: Role, options: RequireAuthOptions = {}) {
   const minPerm: Operation = minRole === 'owner' ? 'owner'
     : minRole === 'admin' ? 'admin'
     : 'read';
@@ -369,7 +369,10 @@ export function requireRole(minRole: Role) {
     const resolution = await resolveAuthOutcome(c);
     const auth = resolution.auth;
     if (!auth) return authFailureResponse(c, resolution);
-    if (auth.scope === 'doc_collaborator') {
+    if (options.refuseDaemonCredential && auth.serverId) {
+      return c.json({ error: 'forbidden', reason: DAEMON_CREDENTIAL_REFUSAL }, 403);
+    }
+    if (auth.scope === 'doc_collaborator' && !options.allowDocCollaborator) {
       return c.json({ error: 'forbidden', reason: DOC_COLLABORATOR_SCOPE_REFUSAL }, 403);
     }
     const identityMismatch = rejectChangedClientIdentity(c, auth.userId);
@@ -384,6 +387,10 @@ export function requireRole(minRole: Role) {
 
     c.set('userId' as never, auth.userId);
     c.set('role' as never, auth.role);
+    if (auth.scope) c.set('authScope' as never, auth.scope);
+    if (auth.keyId) c.set('keyId' as never, auth.keyId);
+    if (auth.nodeRole) c.set('nodeRole' as never, auth.nodeRole);
+    if (auth.serverId) c.set('authServerId' as never, auth.serverId);
     await next();
   };
 }
@@ -391,17 +398,17 @@ export function requireRole(minRole: Role) {
 /**
  * Require write access (member or above).
  */
-export const requireWrite = () => requireRole('member');
+export const requireWrite = (options?: RequireAuthOptions) => requireRole('member', options);
 
 /**
  * Require admin access.
  */
-export const requireAdmin = () => requireRole('admin');
+export const requireAdmin = (options?: RequireAuthOptions) => requireRole('admin', options);
 
 /**
  * Require owner access.
  */
-export const requireOwner = () => requireRole('owner');
+export const requireOwner = (options?: RequireAuthOptions) => requireRole('owner', options);
 
 /**
  * Require team membership at a minimum role level.

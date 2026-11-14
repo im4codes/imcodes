@@ -12,6 +12,7 @@ import { DEVICE_TIMEZONE_HEADER } from '../../shared/http-header-names.js';
 import { normalizeClientTimezone } from '../../shared/client-timezone.js';
 import { daemonApiUrl, type DaemonHttpMethod } from '../../shared/daemon-token-routes.js';
 import { daemonServerAuthHeaders } from '../../shared/daemon-server-auth.js';
+import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../shared/shared-machine-authority.js';
 import {
   formatNetworkErrorMessage,
   isPreConnectNetworkError,
@@ -46,6 +47,7 @@ export interface CronMcpClientOptions {
   deviceTimezone?: string | null;
   /** Optional retry policy override for transient network failures (test seam). */
   preConnectRetry?: PreConnectRetryOptions;
+  loadSharedMachineAuthority?: () => Promise<string | null>;
 }
 
 export interface CronCreateInput extends MemoryMcpSourceProvenance {
@@ -241,9 +243,18 @@ async function requestCron(
       ? options.deviceTimezone
       : Intl.DateTimeFormat().resolvedOptions().timeZone,
   );
+  let sharedMachineAuthority: string | null = null;
+  if (options.loadSharedMachineAuthority) {
+    try {
+      sharedMachineAuthority = await options.loadSharedMachineAuthority();
+    } catch {
+      return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'shared machine authority unavailable');
+    }
+  }
   const headers = {
     // The credential names the BOUND server (the token belongs to it); the route names the server the job is for.
     ...daemonServerAuthHeaders(endpoint),
+    ...(sharedMachineAuthority ? { [SHARED_MACHINE_AUTHORITY_HEADER]: sharedMachineAuthority } : {}),
     'Content-Type': 'application/json',
     ...(deviceTimezone ? { [DEVICE_TIMEZONE_HEADER]: deviceTimezone } : {}),
     ...init.headers,

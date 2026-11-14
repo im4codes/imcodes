@@ -6,6 +6,7 @@ import type { MemorySearchQuery, MemorySearchResultItem } from '../context/memor
 import { searchLocalMemoryForManagement, searchLocalMemorySemanticForManagement } from '../context/memory-recall-client.js';
 import { projectionOwnerCache } from './memory-projection-owner-cache.js';
 import { daemonServerAuthHeaders } from '../../shared/daemon-server-auth.js';
+import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../shared/shared-machine-authority.js';
 import { isMemoryDaemonEnabled } from '../store/memory-daemon-switch.js';
 
 export type MemoryMcpListProjectionClass = Extract<ProcessedContextClass, 'recent_summary' | 'durable_memory_candidate'>;
@@ -60,6 +61,7 @@ export interface MemoryMcpSearchOptions {
     token: string;
   } | null;
   loadCredentials?: () => Promise<MemoryMcpSearchOptions['credentials']>;
+  loadSharedMachineAuthority?: () => Promise<string | null>;
 }
 
 function localMemoryDegradedReason(error: unknown): string {
@@ -166,11 +168,20 @@ async function searchCloudMemoryRecall(
   if (!requestedProjectId) return [];
 
   const fetchImpl = options.fetchImpl ?? fetch;
+  let sharedMachineAuthority: string | null = null;
+  if (options.loadSharedMachineAuthority) {
+    try {
+      sharedMachineAuthority = await options.loadSharedMachineAuthority();
+    } catch {
+      return [];
+    }
+  }
   const response = await fetchImpl(cloudRecallUrl(credentials.workerUrl, credentials.serverId), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       ...daemonServerAuthHeaders(credentials),
+      ...(sharedMachineAuthority ? { [SHARED_MACHINE_AUTHORITY_HEADER]: sharedMachineAuthority } : {}),
     },
     body: JSON.stringify({
       query: query.query,
@@ -217,6 +228,14 @@ async function listCloudMemorySummaries(
   if (!requestedProjectId) return [];
   const projectionClass = query.projectionClass ?? 'recent_summary';
   const fetchImpl = options.fetchImpl ?? fetch;
+  let sharedMachineAuthority: string | null = null;
+  if (options.loadSharedMachineAuthority) {
+    try {
+      sharedMachineAuthority = await options.loadSharedMachineAuthority();
+    } catch {
+      return [];
+    }
+  }
   const response = await fetchImpl(cloudPersonalMemoryUrl(credentials.workerUrl, {
     projectId: requestedProjectId,
     projectionClass,
@@ -225,6 +244,7 @@ async function listCloudMemorySummaries(
     method: 'GET',
     headers: {
       ...daemonServerAuthHeaders(credentials),
+      ...(sharedMachineAuthority ? { [SHARED_MACHINE_AUTHORITY_HEADER]: sharedMachineAuthority } : {}),
     },
   });
   if (!response.ok) return [];

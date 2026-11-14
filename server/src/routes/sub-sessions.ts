@@ -9,6 +9,7 @@ import {
   reorderSubSessions,
 } from '../db/queries.js';
 import { requireAuth } from '../security/authorization.js';
+import { daemonScopeFailure, resolveDaemonCallerAuthority } from '../security/daemon-scope.js';
 import {
   resolveHttpShareAccess,
   resolveHttpShareAccessForCoveredSession,
@@ -32,6 +33,19 @@ export const subSessionRoutes = new Hono<{ Bindings: Env; Variables: { userId: s
 type SubSessionRouteContext = Context<{ Bindings: Env; Variables: { userId: string; role: string } }>;
 
 subSessionRoutes.use('/*', requireAuth());
+subSessionRoutes.use('/:id/*', async (c, next) => {
+  if (c.get('authServerId' as never)) {
+    const authority = await resolveDaemonCallerAuthority(c, {
+      denyParticipant: true,
+      denySharedHostAbsentAuthority: false,
+      targetServerId: c.req.param('id')!,
+      allowOwnerCrossServer: false,
+    });
+    if (!authority.ok) return daemonScopeFailure(c, authority);
+  }
+  await next();
+  return;
+});
 
 async function resolveSubSessionRouteAccess(c: SubSessionRouteContext, serverId: string, userId: string) {
   const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });

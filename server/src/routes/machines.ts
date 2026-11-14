@@ -61,6 +61,7 @@ import {
 import { isControlledNodeId } from '../../../shared/controlled-node-identity.js';
 import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-authority.js';
 import { listActorOperableMachineAccess, resolveMachineOperationalUser } from '../share/shared-machine-authority.js';
+import { isSharedOrContributedServer } from '../security/daemon-scope.js';
 import {
   CONTROLLED_NODE_UPGRADE_STATUS,
   DAEMON_UPGRADE_DELIVERY_STATUS,
@@ -286,6 +287,9 @@ machinesRoutes.get('/', requireAuth(), async (c) => {
       now,
     });
     if (!operational) return c.json({ error: 'forbidden' }, 403);
+    if (!operational.delegatedActorUserId && await isSharedOrContributedServer(c.env.DB, sourceServerId, now)) {
+      return c.json({ error: 'forbidden', reason: 'shared_host_daemon_authority_required' }, 403);
+    }
     userId = operational.userId;
     delegatedActorUserId = operational.delegatedActorUserId;
   }

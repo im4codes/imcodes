@@ -1,5 +1,6 @@
 import type { Database } from '../db/client.js';
 import { resolveEffectiveShareCoverage } from '../db/tab-sharing.js';
+import { isSharedOrContributedServer } from '../security/server-share-boundary.js';
 import { signJwt, verifyJwt } from '../security/crypto.js';
 import {
   SHARED_MACHINE_AUTHORITY_TYPE,
@@ -234,6 +235,15 @@ export async function admitMachineAction(
   // An invalid / expired / foreign turn authority never falls back to the owner.
   if (!operational) return { ok: false, reason: MACHINE_DENIAL_REASON.NO_ACCESS, accessSource: null };
   const delegatedActorUserId = operational.delegatedActorUserId;
+  // A shared or group-contributed source host must never use absent-header owner credentials
+  // to operate/execute against other devices or without explicit per-turn participant authority.
+  if (
+    !delegatedActorUserId
+    && input.authenticatedSourceServerId
+    && await isSharedOrContributedServer(db, input.authenticatedSourceServerId, input.now)
+  ) {
+    return { ok: false, reason: MACHINE_DENIAL_REASON.NO_ACCESS, accessSource: null };
+  }
   const deny = (reason: MachineDenialReason, accessSource: string | null): MachineActionAdmission => ({
     ok: false, reason, accessSource, ...(delegatedActorUserId ? { delegatedActorUserId } : {}),
   });

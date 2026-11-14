@@ -4,6 +4,7 @@ import type { Env } from '../env.js';
 import { getServerById, getDbSessionByName, getDbSessionsByServer, getSubSessionById, getSubSessionsByServer, getUserPref, setUserPref, upsertDbSession, deleteDbSession, updateSessionLabel, updateProjectName, updateSession, updateSubSession } from '../db/queries.js';
 import { requireAuth } from '../security/authorization.js';
 import type { ServerRole } from '../security/authorization.js';
+import { daemonScopeFailure, resolveDaemonCallerAuthority } from '../security/daemon-scope.js';
 import { randomHex } from '../security/crypto.js';
 import { logAudit } from '../security/audit.js';
 import { WsBridge } from '../ws/bridge.js';
@@ -107,6 +108,19 @@ export const sessionMgmtRoutes = new Hono<{ Bindings: Env; Variables: { userId: 
 
 // Apply auth middleware globally to all session routes
 sessionMgmtRoutes.use('/*', requireAuth());
+sessionMgmtRoutes.use('/:id/*', async (c, next) => {
+  if (c.get('authServerId' as never)) {
+    const authority = await resolveDaemonCallerAuthority(c, {
+      denyParticipant: true,
+      denySharedHostAbsentAuthority: false,
+      targetServerId: c.req.param('id')!,
+      allowOwnerCrossServer: false,
+    });
+    if (!authority.ok) return daemonScopeFailure(c, authority);
+  }
+  await next();
+  return;
+});
 
 function parseStoredTransportConfig(value: Record<string, unknown> | string | null): Record<string, unknown> | null {
   if (value && typeof value === 'object' && !Array.isArray(value)) return value;

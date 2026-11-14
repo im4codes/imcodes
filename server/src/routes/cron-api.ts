@@ -6,6 +6,7 @@ import type { Env } from '../env.js';
 import type { Database } from '../db/client.js';
 import type { DbCronJob } from '../db/queries.js';
 import { requireAuth } from '../security/authorization.js';
+import { daemonScopeFailure, resolveDaemonCallerAuthority } from '../security/daemon-scope.js';
 import { resolveHttpShareAccessForCoveredSession, resolveServerMemberAccessOrShareDeny } from './share-http-auth.js';
 import { listActiveSharesForUser, shareTargetFromSessionName, shareTargetSessionName } from '../db/tab-sharing.js';
 import { getSubSessionById, isExecutionCloneRow } from '../db/queries.js';
@@ -213,8 +214,26 @@ function isDaemonServerTokenCronRequest(
 function isDaemonCronRequest(
   c: Context<CronRouteEnv>,
   routeServerId: string | null,
+  authorityKind?: 'interactive_user' | 'participant_daemon' | 'owner_daemon',
 ): boolean {
+  if (authorityKind === 'participant_daemon') return false;
   return isDaemonServerTokenCronRequest(c, routeServerId);
+}
+
+async function resolveCronDaemonContext(
+  c: Context<CronRouteEnv>,
+  targetServerId?: string | null,
+) {
+  return await resolveDaemonCallerAuthority(c as unknown as Context<{ Bindings: Env }>, {
+    ...(targetServerId ? { targetServerId, allowOwnerCrossServer: true } : {}),
+  });
+}
+
+function pinnedSessionForAuthority(
+  authority: Awaited<ReturnType<typeof resolveCronDaemonContext>>,
+): string | null {
+  if (!authority.ok || authority.kind !== 'participant_daemon') return null;
+  return authority.claims.shareTarget.kind === 'server' ? null : authority.claims.sessionName;
 }
 
 type CronAccessMode = 'read' | 'write';
@@ -228,12 +247,21 @@ type CronScope = {
 
 async function resolveCronScope(
   c: Context<CronRouteEnv>,
-  params: { serverId: string; userId: string; requestedProjectName?: string | null; mode: CronAccessMode },
+  params: {
+    serverId: string;
+    userId: string;
+    requestedProjectName?: string | null;
+    mode: CronAccessMode;
+    pinnedSessionName?: string | null;
+  },
 ): Promise<{ ok: true; scope: CronScope } | { ok: false; reason: string }> {
-  const member = await resolveServerMemberAccessOrShareDeny(c.env.DB, {
-    serverId: params.serverId,
-    userId: params.userId,
-  });
+  const pinnedSession = params.pinnedSessionName?.trim() || '';
+  const member = pinnedSession
+    ? { ok: false as const, reason: 'pinned-shared-session' }
+    : await resolveServerMemberAccessOrShareDeny(c.env.DB, {
+        serverId: params.serverId,
+        userId: params.userId,
+      });
   if (member.ok) {
     // Operational authority includes server Participants and group members;
     // jobs belong to the server owner, not the visiting actor.
@@ -253,9 +281,9 @@ async function resolveCronScope(
     };
   }
 
-  let sessionName = (c.req.query('sessionName') ?? '').trim();
+  let sessionName = pinnedSession || (c.req.query('sessionName') ?? '').trim();
   let target = shareTargetFromSessionName(params.serverId, sessionName);
-  if (!target) {
+  if (!target && !pinnedSession) {
     const userShares = await listActiveSharesForUser(c.env.DB, params.userId, Date.now()).catch(() => []);
     const serverShare = userShares.find((s) => s.serverId === params.serverId && s.target.kind === 'server')
       ?? userShares.find((s) => s.serverId === params.serverId);
@@ -271,7 +299,7 @@ async function resolveCronScope(
     target,
   });
 
-  if (access.actor.kind !== 'share' && target.kind === 'main') {
+  if (access.actor.kind !== 'share' && target.kind === 'main' && !pinnedSession) {
     const userShares = await listActiveSharesForUser(c.env.DB, params.userId, Date.now()).catch(() => []);
     for (const share of userShares) {
       if (share.serverId !== params.serverId || share.target.kind !== 'subsession') continue;
@@ -338,13 +366,14 @@ async function resolveCronScope(
 
 async function resolveCronJobScope(
   c: Context<CronRouteEnv>,
-  params: { userId: string; job: DbCronJob; mode: CronAccessMode },
+  params: { userId: string; job: DbCronJob; mode: CronAccessMode; pinnedSessionName?: string | null },
 ): Promise<{ ok: true; scope: CronScope } | { ok: false; reason: string }> {
   const access = await resolveCronScope(c, {
     serverId: params.job.server_id,
     userId: params.userId,
     requestedProjectName: params.job.project_name,
     mode: params.mode,
+    pinnedSessionName: params.pinnedSessionName,
   });
   if (!access.ok) return access;
   if (
@@ -567,13 +596,18 @@ function validateCronExpr(cronExpr: string, timezone?: string): { nextRunAt: num
 
 // GET /api/cron — list user's cron jobs, optionally filtered by server/project
 cronApiRoutes.get('/', requireCronAuth(), async (c) => {
-  const userId = c.get('userId' as never) as string;
   const routeServerId = getPodStickyServerId(c);
-  const serverId = routeServerId ?? c.req.query('serverId') ?? null;
+  const requestedServerId = routeServerId ?? c.req.query('serverId') ?? null;
+  const authority = await resolveCronDaemonContext(c, requestedServerId);
+  if (!authority.ok) return daemonScopeFailure(c as unknown as Context<{ Bindings: Env }>, authority);
+  const userId = authority.actorUserId;
+  const serverId = requestedServerId
+    ?? (authority.kind === 'participant_daemon' ? authority.sourceServerId : null);
   const projectName = c.req.query('projectName') || null;
+  const pinnedSessionName = pinnedSessionForAuthority(authority);
 
   const access = serverId
-    ? await resolveCronScope(c, { serverId, userId, requestedProjectName: projectName, mode: 'read' })
+    ? await resolveCronScope(c, { serverId, userId, requestedProjectName: projectName, mode: 'read', pinnedSessionName })
     : { ok: true as const, scope: { ownerUserId: userId, projectName, shared: false, sharedSessionName: null, sharedTargetKind: null } };
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
@@ -599,7 +633,9 @@ cronApiRoutes.get('/', requireCronAuth(), async (c) => {
 
 // POST /api/cron — create a cron job
 cronApiRoutes.post('/', requireCronAuth(), async (c) => {
-  const userId = c.get('userId' as never) as string;
+  const preAuthority = await resolveCronDaemonContext(c, getPodStickyServerId(c));
+  if (!preAuthority.ok) return daemonScopeFailure(c as unknown as Context<{ Bindings: Env }>, preAuthority);
+  const userId = preAuthority.actorUserId;
   const routeServerId = getPodStickyServerId(c);
   const body = await c.req.json().catch(() => null);
   const requestBody = await withDefaultCronTimezone(c, userId, withPodStickyServerId(body, routeServerId));
@@ -618,10 +654,26 @@ cronApiRoutes.post('/', requireCronAuth(), async (c) => {
     expiresAt,
     completionPolicy,
   } = parsed.data;
-  const unboundAction = normalizeCronActionForPersistence(action, isDaemonCronRequest(c, routeServerId));
+  const authority = await resolveCronDaemonContext(c, serverId);
+  if (!authority.ok) return daemonScopeFailure(c as unknown as Context<{ Bindings: Env }>, authority);
+  const pinnedSessionName = pinnedSessionForAuthority(authority);
+  const unboundAction = normalizeCronActionForPersistence(action, isDaemonCronRequest(c, routeServerId, authority.kind));
 
-  const access = await resolveCronScope(c, { serverId, userId, requestedProjectName: projectName, mode: 'write' });
+  const access = await resolveCronScope(c, {
+    serverId,
+    userId: authority.actorUserId,
+    requestedProjectName: projectName,
+    mode: 'write',
+    pinnedSessionName,
+  });
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  if (
+    pinnedSessionName
+    && ((targetSessionName && targetSessionName !== pinnedSessionName)
+      || (action.type === 'send' && action.target.startsWith('deck_') && action.target !== pinnedSessionName))
+  ) {
+    return c.json({ error: 'forbidden', reason: 'share-direct-surface-denied' }, 403);
+  }
   if (!await cronScopeCoversPayload(c, serverId, access.scope, { targetRole, targetSessionName, action })) {
     return c.json({ error: 'forbidden', reason: 'share-direct-surface-denied' }, 403);
   }
@@ -647,8 +699,16 @@ cronApiRoutes.post('/', requireCronAuth(), async (c) => {
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15)`,
     [id, serverId, access.scope.ownerUserId, name, cronExpr, access.scope.projectName ?? projectName, targetRole, targetSessionName ?? null, JSON.stringify(persistedAction), timezone ?? null, CRON_STATUS.ACTIVE, validation.nextRunAt, expiresAt ?? null, completionPolicy, now],
   );
+  if (access.scope.shared || authority.kind === 'participant_daemon' || authority.actorUserId !== access.scope.ownerUserId) {
+    await c.env.DB.execute(
+      `INSERT INTO cron_job_provenance (job_id, creator_user_id, server_id, project_name, shared, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (job_id) DO NOTHING`,
+      [id, authority.actorUserId, serverId, access.scope.projectName ?? projectName ?? null, Boolean(access.scope.shared || authority.kind === 'participant_daemon'), now],
+    ).catch(() => {});
+  }
 
-  await logAudit({ userId, action: 'cron.create', details: { id, name, cronExpr, projectName: access.scope.projectName ?? projectName } }, c.env.DB);
+  await logAudit({ userId: authority.actorUserId, action: 'cron.create', details: { id, name, cronExpr, projectName: access.scope.projectName ?? projectName } }, c.env.DB);
   // Notify open browser views (incl. crons created externally via MCP) to refetch.
   WsBridge.publishResourceChanged(serverId, RESOURCE_TOPICS.cron, { action: 'create' });
 
@@ -670,7 +730,9 @@ cronApiRoutes.post('/', requireCronAuth(), async (c) => {
 
 // PUT /api/cron/:id — update a cron job
 cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
-  const userId = c.get('userId' as never) as string;
+  const preAuthority = await resolveCronDaemonContext(c, getPodStickyServerId(c));
+  if (!preAuthority.ok) return daemonScopeFailure(c as unknown as Context<{ Bindings: Env }>, preAuthority);
+  const userId = preAuthority.actorUserId;
   const routeServerId = getPodStickyServerId(c);
   const jobId = c.req.param('id');
   if (!jobId) return c.json({ error: 'not_found' }, 404);
@@ -684,8 +746,11 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
   );
   if (!job) return c.json({ error: 'not_found' }, 404);
   if (isWrongPodStickyServer(job.server_id, routeServerId)) return c.json({ error: 'not_found' }, 404);
+  const authority = await resolveCronDaemonContext(c, job.server_id);
+  if (!authority.ok) return daemonScopeFailure(c as unknown as Context<{ Bindings: Env }>, authority);
+  const pinnedSessionName = pinnedSessionForAuthority(authority);
 
-  const access = await resolveCronJobScope(c, { userId, job, mode: 'write' });
+  const access = await resolveCronJobScope(c, { userId: authority.actorUserId, job, mode: 'write', pinnedSessionName });
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
   const updates = { ...parsed.data };
@@ -702,9 +767,16 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
   })) {
     return c.json({ error: 'forbidden', reason: 'share-direct-surface-denied' }, 403);
   }
+  if (
+    pinnedSessionName
+    && ((updates.targetSessionName && updates.targetSessionName !== pinnedSessionName)
+      || (updates.action?.type === 'send' && updates.action.target.startsWith('deck_') && updates.action.target !== pinnedSessionName))
+  ) {
+    return c.json({ error: 'forbidden', reason: 'share-direct-surface-denied' }, 403);
+  }
   const now = Date.now();
   if (
-    isDaemonCronRequest(c, routeServerId)
+    isDaemonCronRequest(c, routeServerId, authority.kind)
     && normalizeCronCompletionPolicy(job.completion_policy) === CRON_COMPLETION_POLICY.RECURRING
     && updates.completionPolicy === CRON_COMPLETION_POLICY.UNTIL_COMPLETE
     && c.req.query('force') !== 'true'
@@ -759,7 +831,7 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
   if (updates.targetRole !== undefined) { sets.push(`target_role = $${idx++}`); vals.push(updates.targetRole); }
   if (updates.targetSessionName !== undefined) { sets.push(`target_session_name = $${idx++}`); vals.push(updates.targetSessionName); }
   if (updates.action !== undefined) {
-    const unboundAction = normalizeCronActionForPersistence(updates.action, isDaemonCronRequest(c, routeServerId));
+    const unboundAction = normalizeCronActionForPersistence(updates.action, isDaemonCronRequest(c, routeServerId, authority.kind));
     const registeredAction = registerSelfManagedCronAction(
       unboundAction,
       jobId,
@@ -810,7 +882,8 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
 
 // PATCH /api/cron/:id/status — pause/resume (only active ↔ paused)
 cronApiRoutes.patch('/:id/status', requireCronAuth(), async (c) => {
-  const userId = c.get('userId' as never) as string;
+  const preAuthority = await resolveCronDaemonContext(c, getPodStickyServerId(c));
+  if (!preAuthority.ok) return daemonScopeFailure(c as unknown as Context<{ Bindings: Env }>, preAuthority);
   const routeServerId = getPodStickyServerId(c);
   const jobId = c.req.param('id');
   const body = await c.req.json().catch(() => null);
@@ -825,8 +898,12 @@ cronApiRoutes.patch('/:id/status', requireCronAuth(), async (c) => {
   );
   if (!job) return c.json({ error: 'not_found' }, 404);
   if (isWrongPodStickyServer(job.server_id, routeServerId)) return c.json({ error: 'not_found' }, 404);
+  const authority = await resolveCronDaemonContext(c, job.server_id);
+  if (!authority.ok) return daemonScopeFailure(c as unknown as Context<{ Bindings: Env }>, authority);
+  const userId = authority.actorUserId;
+  const pinnedSessionName = pinnedSessionForAuthority(authority);
 
-  const access = await resolveCronJobScope(c, { userId, job, mode: 'write' });
+  const access = await resolveCronJobScope(c, { userId, job, mode: 'write', pinnedSessionName });
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
   if (newStatus === CRON_STATUS.ACTIVE && job.status !== CRON_STATUS.PAUSED) {
@@ -845,7 +922,8 @@ cronApiRoutes.patch('/:id/status', requireCronAuth(), async (c) => {
 
 // DELETE /api/cron/:id — delete a cron job
 cronApiRoutes.delete('/:id', requireCronAuth(), async (c) => {
-  const userId = c.get('userId' as never) as string;
+  const preAuthority = await resolveCronDaemonContext(c, getPodStickyServerId(c));
+  if (!preAuthority.ok) return daemonScopeFailure(c as unknown as Context<{ Bindings: Env }>, preAuthority);
   const routeServerId = getPodStickyServerId(c);
   const jobId = c.req.param('id');
 
@@ -855,14 +933,18 @@ cronApiRoutes.delete('/:id', requireCronAuth(), async (c) => {
   );
   if (!job) return c.json({ error: 'not_found' }, 404);
   if (isWrongPodStickyServer(job.server_id, routeServerId)) return c.json({ error: 'not_found' }, 404);
+  const authority = await resolveCronDaemonContext(c, job.server_id);
+  if (!authority.ok) return daemonScopeFailure(c as unknown as Context<{ Bindings: Env }>, authority);
+  const userId = authority.actorUserId;
+  const pinnedSessionName = pinnedSessionForAuthority(authority);
 
-  const access = await resolveCronJobScope(c, { userId, job, mode: 'write' });
+  const access = await resolveCronJobScope(c, { userId, job, mode: 'write', pinnedSessionName });
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
   const completionPolicy = normalizeCronCompletionPolicy(job.completion_policy);
   const force = c.req.query('force') === 'true';
   if (
-    isDaemonCronRequest(c, routeServerId)
+    isDaemonCronRequest(c, routeServerId, authority.kind)
     && completionPolicy === CRON_COMPLETION_POLICY.RECURRING
     && !force
   ) {
@@ -881,7 +963,7 @@ cronApiRoutes.delete('/:id', requireCronAuth(), async (c) => {
     details: {
       id: jobId,
       completionPolicy,
-      forced: isDaemonCronRequest(c, routeServerId) ? force : false,
+      forced: isDaemonCronRequest(c, routeServerId, authority.kind) ? force : false,
     },
   }, c.env.DB);
   WsBridge.publishResourceChanged(job.server_id, RESOURCE_TOPICS.cron, { action: 'delete' });
@@ -890,7 +972,8 @@ cronApiRoutes.delete('/:id', requireCronAuth(), async (c) => {
 
 // POST /api/cron/:id/trigger — immediately dispatch a cron job
 cronApiRoutes.post('/:id/trigger', requireCronAuth(), async (c) => {
-  const userId = c.get('userId' as never) as string;
+  const preAuthority = await resolveCronDaemonContext(c, getPodStickyServerId(c));
+  if (!preAuthority.ok) return daemonScopeFailure(c as unknown as Context<{ Bindings: Env }>, preAuthority);
   const routeServerId = getPodStickyServerId(c);
   const jobId = c.req.param('id');
 
@@ -900,8 +983,12 @@ cronApiRoutes.post('/:id/trigger', requireCronAuth(), async (c) => {
   );
   if (!job) return c.json({ error: 'not_found' }, 404);
   if (isWrongPodStickyServer(job.server_id, routeServerId)) return c.json({ error: 'not_found' }, 404);
+  const authority = await resolveCronDaemonContext(c, job.server_id);
+  if (!authority.ok) return daemonScopeFailure(c as unknown as Context<{ Bindings: Env }>, authority);
+  const userId = authority.actorUserId;
+  const pinnedSessionName = pinnedSessionForAuthority(authority);
 
-  const access = await resolveCronJobScope(c, { userId, job, mode: 'write' });
+  const access = await resolveCronJobScope(c, { userId, job, mode: 'write', pinnedSessionName });
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
   try {
@@ -918,15 +1005,20 @@ cronApiRoutes.post('/:id/trigger', requireCronAuth(), async (c) => {
 // GET /api/cron/executions — cross-job execution list
 // mode=latest: most recent execution per job; mode=all: all executions sorted by time
 cronApiRoutes.get('/executions', requireCronAuth(), async (c) => {
-  const userId = c.get('userId' as never) as string;
   const mode = c.req.query('mode') || 'all';
   const routeServerId = getPodStickyServerId(c);
-  const serverId = routeServerId ?? c.req.query('serverId') ?? null;
+  const requestedServerId = routeServerId ?? c.req.query('serverId') ?? null;
+  const authority = await resolveCronDaemonContext(c, requestedServerId);
+  if (!authority.ok) return daemonScopeFailure(c as unknown as Context<{ Bindings: Env }>, authority);
+  const userId = authority.actorUserId;
+  const serverId = requestedServerId
+    ?? (authority.kind === 'participant_daemon' ? authority.sourceServerId : null);
   const requestedProjectName = c.req.query('projectName') || null;
+  const pinnedSessionName = pinnedSessionForAuthority(authority);
   const limitParam = parseInt(c.req.query('limit') || '50', 10);
   const limit = Math.min(Math.max(1, limitParam), 200);
   const access = serverId
-    ? await resolveCronScope(c, { serverId, userId, requestedProjectName, mode: 'read' })
+    ? await resolveCronScope(c, { serverId, userId, requestedProjectName, mode: 'read', pinnedSessionName })
     : { ok: true as const, scope: { ownerUserId: userId, projectName: requestedProjectName, shared: false, sharedSessionName: null, sharedTargetKind: null } };
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
@@ -967,7 +1059,8 @@ cronApiRoutes.get('/executions', requireCronAuth(), async (c) => {
 
 // GET /api/cron/:id/executions — execution history for a cron job
 cronApiRoutes.get('/:id/executions', requireCronAuth(), async (c) => {
-  const userId = c.get('userId' as never) as string;
+  const preAuthority = await resolveCronDaemonContext(c, getPodStickyServerId(c));
+  if (!preAuthority.ok) return daemonScopeFailure(c as unknown as Context<{ Bindings: Env }>, preAuthority);
   const routeServerId = getPodStickyServerId(c);
   const jobId = c.req.param('id');
   const limitParam = parseInt(c.req.query('limit') || '20', 10);
@@ -979,8 +1072,12 @@ cronApiRoutes.get('/:id/executions', requireCronAuth(), async (c) => {
   );
   if (!job) return c.json({ error: 'not_found' }, 404);
   if (isWrongPodStickyServer(job.server_id, routeServerId)) return c.json({ error: 'not_found' }, 404);
+  const authority = await resolveCronDaemonContext(c, job.server_id);
+  if (!authority.ok) return daemonScopeFailure(c as unknown as Context<{ Bindings: Env }>, authority);
+  const userId = authority.actorUserId;
+  const pinnedSessionName = pinnedSessionForAuthority(authority);
 
-  const access = await resolveCronJobScope(c, { userId, job, mode: 'read' });
+  const access = await resolveCronJobScope(c, { userId, job, mode: 'read', pinnedSessionName });
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
 
   const executions = await c.env.DB.query(

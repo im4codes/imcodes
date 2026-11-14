@@ -245,10 +245,25 @@ describe('role x action matrix (real resolvers, real routes)', () => {
 });
 
 describe('exec_remote uses the participant grant on participant-origin turns', () => {
+  const delegatedSessions: string[] = [];
+  afterAll(async () => {
+    if (delegatedSessions.length > 0 && actors.owner) {
+      await db.execute(
+        'DELETE FROM session_shares WHERE server_id = $1 AND session_name = ANY($2::text[])',
+        [actors.owner.serverId, delegatedSessions],
+      ).catch(() => undefined);
+      await db.execute(
+        'DELETE FROM sessions WHERE server_id = $1 AND name = ANY($2::text[])',
+        [actors.owner.serverId, delegatedSessions],
+      ).catch(() => undefined);
+    }
+  });
+
   async function delegatedHeader(participant: string): Promise<Record<string, string>> {
     // The owner's FULL daemon runs a shared session; the participant's message drives it (server-minted, signed turn authority).
     const owner = actors.owner!;
     const sessionName = `deck_proj_${hex(2)}`;
+    delegatedSessions.push(sessionName);
     await db.execute(
       `INSERT INTO sessions (id, server_id, name, project_name, role, agent_type, project_dir, state, created_at, updated_at)
        VALUES ($1,$2,$3,'proj','brain','claude-code','/tmp','idle',$4,$4) ON CONFLICT DO NOTHING`,
