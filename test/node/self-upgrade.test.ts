@@ -2656,4 +2656,132 @@ describe('refreshControlledNodeRemoteDesktopWorker lightweight precheck', () => 
     });
     expect(probe501).toEqual({ status: 'unsupported', httpStatus: 501 });
   });
+
+  it('follows HTTPS 302 external redirects using origin metadata headers and strips auth headers cross-origin', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-node-redirect-test-'));
+    dirs.push(dir);
+    const bytes = Buffer.from('external-cdn-binary-payload');
+    const expectedSha = createHash('sha256').update(bytes).digest('hex');
+    const seenRequests: Array<{ url: string; auth: string | null; serverId: string | null; optIn: string | null }> = [];
+
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const headers = new Headers(init?.headers);
+      seenRequests.push({
+        url,
+        auth: headers.get('authorization'),
+        serverId: headers.get('x-server-id'),
+        optIn: headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.EXTERNAL_REDIRECT),
+      });
+      if (url.startsWith('https://im.example')) {
+        return new Response(null, {
+          status: 302,
+          headers: {
+            location: 'https://objects.githubusercontent.com/imcodes-release/imcodes-node.exe',
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: expectedSha,
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(bytes.length),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: 'imcodes-node.exe',
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.11.1',
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256]: WINDOWS_SIGNER_SHA256,
+          },
+        });
+      }
+      return new Response(bytes, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const downloaded = await downloadControlledNodeExecutable({
+      credential,
+      target: { os: 'win', arch: 'x64' },
+      dir,
+      expectedVersion: '2026.11.1',
+      fetchImpl,
+    });
+
+    expect(downloaded).toMatchObject({ sha256: expectedSha, sizeBytes: bytes.length });
+    const savedManifest = JSON.parse(await readFile(`${downloaded!.artifactPath}.manifest.json`, 'utf8')) as { build?: { version?: string } };
+    expect(savedManifest.build?.version).toBe('2026.11.1');
+    expect(seenRequests).toHaveLength(2);
+    expect(seenRequests[0]!.optIn).toBe('1');
+    expect(seenRequests[0]!.auth).toBe(`Bearer ${credential.token}`);
+    expect(seenRequests[1]!.url).toBe('https://objects.githubusercontent.com/imcodes-release/imcodes-node.exe');
+    expect(seenRequests[1]!.auth).toBeNull();
+    expect(seenRequests[1]!.serverId).toBeNull();
+    expect(seenRequests[1]!.optIn).toBeNull();
+  });
+
+  it('rejects non-HTTPS redirects, credential-bearing redirects, >5 redirect hops, and CDN hash mismatches', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-node-redirect-reject-'));
+    dirs.push(dir);
+    const bytes = Buffer.from('good-bytes');
+    const goodSha = createHash('sha256').update(bytes).digest('hex');
+
+    await expect(downloadControlledNodeExecutable({
+      credential,
+      target: { os: 'win', arch: 'x64' },
+      dir,
+      fetchImpl: (async () => new Response(null, {
+        status: 302,
+        headers: {
+          location: 'http://cdn.insecure.test/imcodes-node.exe',
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: goodSha,
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(bytes.length),
+        },
+      })) as unknown as typeof fetch,
+    })).rejects.toThrow('artifact_redirect_non_https');
+
+    await expect(downloadControlledNodeExecutable({
+      credential,
+      target: { os: 'win', arch: 'x64' },
+      dir,
+      fetchImpl: (async () => new Response(null, {
+        status: 302,
+        headers: {
+          location: 'https://user:pass@cdn.example.test/imcodes-node.exe',
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: goodSha,
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(bytes.length),
+        },
+      })) as unknown as typeof fetch,
+    })).rejects.toThrow('artifact_redirect_credentials_forbidden');
+
+    let hop = 0;
+    await expect(downloadControlledNodeExecutable({
+      credential,
+      target: { os: 'win', arch: 'x64' },
+      dir,
+      fetchImpl: (async () => {
+        hop += 1;
+        return new Response(null, {
+          status: 302,
+          headers: {
+            location: `https://cdn.example.test/hop-${hop}`,
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: goodSha,
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(bytes.length),
+          },
+        });
+      }) as unknown as typeof fetch,
+    })).rejects.toThrow('artifact_redirect_limit_exceeded');
+
+    await expect(downloadControlledNodeExecutable({
+      credential,
+      target: { os: 'win', arch: 'x64' },
+      dir,
+      fetchImpl: (async (input: RequestInfo | URL) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        if (url.startsWith('https://im.example')) {
+          return new Response(null, {
+            status: 302,
+            headers: {
+              location: 'https://cdn.example.test/imcodes-node.exe',
+              [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: goodSha,
+              [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(bytes.length),
+              [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: 'imcodes-node.exe',
+              [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.11.1',
+              [CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256]: WINDOWS_SIGNER_SHA256,
+            },
+          });
+        }
+        return new Response('tamper-bad', { status: 200 });
+      }) as unknown as typeof fetch,
+    })).rejects.toThrow('artifact_sha256_mismatch');
+  });
 });

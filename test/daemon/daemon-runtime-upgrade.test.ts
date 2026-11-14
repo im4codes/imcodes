@@ -483,6 +483,125 @@ describe('daemon-runtime atomic self-upgrade, rollback, discovery priority & fal
     expect(restarts).toEqual(['1.1.0->1.2.0']);
   });
 
+  it('handles HTTPS 302 external redirects on daemon-runtime server downloads while stripping auth headers and enforcing origin SHA256', async () => {
+    const root = makeTempDir('imcodes-rt-redir-');
+    const runtimeRoot = join(root, 'daemon-runtime');
+    const rel110 = join(runtimeRoot, 'releases', '1.1.0');
+    const curLayout = writeRunnableTree(rel110, '1.1.0');
+    switchDaemonRuntimeCurrentPointer(runtimeRoot, rel110, 'linux');
+
+    const buildRoot = makeTempDir('imcodes-rt-redir-build-');
+    const stagedOut = makeTempDir('imcodes-rt-redir-dist-');
+    const built = await buildRuntimeFeedArtifact(buildRoot, '1.2.0', {
+      includeFilesDoc: true,
+      archiveOut: { dir: stagedOut, includeReleaseManifest: true },
+    });
+    const rmSha = sha256(built.releaseManifestBytes!);
+    const cdnSeenAuth: Array<string | null> = [];
+    const originSeenOptIn: Array<string | null> = [];
+
+    const redirectFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const headers = new Headers(init?.headers);
+      if (url.startsWith('https://im.example')) {
+        originSeenOptIn.push(headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.EXTERNAL_REDIRECT));
+        if (url.includes(`asset=${CONTROLLED_NODE_ARTIFACT_ASSETS.DAEMON_RUNTIME_MANIFEST}`)) {
+          return new Response(null, {
+            status: 302,
+            headers: {
+              location: 'https://cdn.imcodes.test/daemon-runtime.manifest.json',
+              [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: sha256(built.manifestBytes!),
+            },
+          });
+        }
+        if (url.includes(`asset=${CONTROLLED_NODE_ARTIFACT_ASSETS.DAEMON_RUNTIME}`)) {
+          return new Response(null, {
+            status: 302,
+            headers: {
+              location: 'https://objects.githubusercontent.com/imcodes/daemon-runtime.tar.gz',
+              [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: sha256(built.archiveBytes!),
+              [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '1.2.0',
+              [CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256]: rmSha,
+            },
+          });
+        }
+        if (url.includes(`asset=${CONTROLLED_NODE_ARTIFACT_ASSETS.DESKTOP_RELEASE_MANIFEST}`)) {
+          return new Response(null, {
+            status: 302,
+            headers: {
+              location: 'https://cdn.imcodes.test/desktop-release.manifest.json',
+              [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: rmSha,
+            },
+          });
+        }
+      }
+      cdnSeenAuth.push(headers.get('authorization'));
+      if (url === 'https://cdn.imcodes.test/daemon-runtime.manifest.json') {
+        return new Response(built.manifestBytes, { status: 200 });
+      }
+      if (url === 'https://objects.githubusercontent.com/imcodes/daemon-runtime.tar.gz') {
+        return new Response(built.archiveBytes, { status: 200 });
+      }
+      if (url === 'https://cdn.imcodes.test/desktop-release.manifest.json') {
+        return new Response(built.releaseManifestBytes, { status: 200 });
+      }
+      return new Response('not found', { status: 404 });
+    };
+
+    const res = await upgradeBundledDaemonRuntime({
+      platform: 'linux',
+      arch: process.arch,
+      currentVersion: '1.1.0',
+      targetVersion: '1.2.0',
+      execPath: curLayout.nodePath,
+      entryScriptPath: curLayout.entryPath,
+      runtimeRootOverride: runtimeRoot,
+      source: {
+        kind: 'server',
+        serverUrl: 'https://im.example',
+        serverId: 'srv-1',
+        token: 'tok-secret',
+        fetchImpl: redirectFetch as unknown as typeof fetch,
+      },
+      restartService: async () => {},
+    });
+
+    expect(res).toMatchObject({ status: 'upgraded', targetVersion: '1.2.0' });
+    expect(originSeenOptIn).toEqual(['1', '1', '1']);
+    expect(cdnSeenAuth).toEqual([null, null, null]);
+
+    // Rejects SHA256 mismatch when CDN returns tampered bytes after 302 redirect.
+    const tamperedFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url === 'https://objects.githubusercontent.com/imcodes/daemon-runtime.tar.gz') {
+        return new Response('tampered-archive', { status: 200 });
+      }
+      return redirectFetch(input, init);
+    };
+    const root2 = makeTempDir('imcodes-rt-redir-bad-');
+    const rtRoot2 = join(root2, 'daemon-runtime');
+    const rel110b = join(rtRoot2, 'releases', '1.1.0');
+    const lay2 = writeRunnableTree(rel110b, '1.1.0');
+    switchDaemonRuntimeCurrentPointer(rtRoot2, rel110b, 'linux');
+    await expect(upgradeBundledDaemonRuntime({
+      platform: 'linux',
+      arch: process.arch,
+      currentVersion: '1.1.0',
+      targetVersion: '1.2.0',
+      execPath: lay2.nodePath,
+      entryScriptPath: lay2.entryPath,
+      runtimeRootOverride: rtRoot2,
+      source: {
+        kind: 'server',
+        serverUrl: 'https://im.example',
+        serverId: 'srv-1',
+        token: 'tok-secret',
+        fetchImpl: tamperedFetch as unknown as typeof fetch,
+      },
+      restartService: async () => {},
+    })).rejects.toThrow('daemon_runtime_archive_header_sha256_mismatch');
+  });
+
   it('automatically rolls back current pointer and restarts old version when post-restart health check fails', async () => {
     const root = makeTempDir('imcodes-rt-rb-');
     const runtimeRoot = join(root, 'daemon-runtime');

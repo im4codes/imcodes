@@ -45,6 +45,7 @@ import { xmlEscapeText } from '../../shared/macos-daemon-launch.js';
 import { isPathInsideGitCheckout } from '../node/desktop-installer-probe.js';
 import { windowsSchtasksExecutablePath } from '../node/installer.js';
 import { execFileOffMain } from '../util/exec-helper.js';
+import { fetchControlledNodeArtifactWithRedirect } from '../util/external-artifact-fetch.js';
 import { imcodesStateDir, imcodesStateDirForHome, IMCODES_HOME_ENV } from '../util/imcodes-state-dir.js';
 import { renderSystemdExecStart } from '../util/launch-target.js';
 import { resolvePosixDaemonServicePaths } from '../util/posix-daemon-service.js';
@@ -863,15 +864,21 @@ async function fetchAndVerifyFromServer(input: {
     ...targetQuery,
     asset: CONTROLLED_NODE_ARTIFACT_ASSETS.DAEMON_RUNTIME_MANIFEST,
   });
-  const manifestRes = await fetchImpl(manifestUrl, { headers: authHeaders });
+  const { response: manifestRes, metadataHeaders: manifestHeaders } = await fetchControlledNodeArtifactWithRedirect({
+    fetchImpl,
+    url: manifestUrl,
+    headers: authHeaders,
+  });
   if (manifestRes.status === 404 || manifestRes.status === 503 || manifestRes.status === 409) {
+    await manifestRes.body?.cancel().catch(() => {});
     return { status: 'not_published', httpStatus: manifestRes.status };
   }
   if (!manifestRes.ok) {
+    await manifestRes.body?.cancel().catch(() => {});
     throw new Error(`daemon_runtime_manifest_http_error:${manifestRes.status}`);
   }
   const manifestBytes = Buffer.from(await manifestRes.arrayBuffer());
-  const expectedManifestSha = manifestRes.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256)?.trim().toLowerCase();
+  const expectedManifestSha = manifestHeaders.get(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256)?.trim().toLowerCase();
   if (expectedManifestSha && sha256Buffer(manifestBytes) !== expectedManifestSha) {
     throw new Error('daemon_runtime_manifest_header_sha256_mismatch');
   }
@@ -884,18 +891,24 @@ async function fetchAndVerifyFromServer(input: {
     ...targetQuery,
     asset: CONTROLLED_NODE_ARTIFACT_ASSETS.DAEMON_RUNTIME,
   });
-  const archiveRes = await fetchImpl(archiveUrl, { headers: authHeaders });
+  const { response: archiveRes, metadataHeaders: archiveHeaders } = await fetchControlledNodeArtifactWithRedirect({
+    fetchImpl,
+    url: archiveUrl,
+    headers: authHeaders,
+  });
   if (archiveRes.status === 404 || archiveRes.status === 503 || archiveRes.status === 409) {
+    await archiveRes.body?.cancel().catch(() => {});
     return { status: 'not_published', httpStatus: archiveRes.status };
   }
   if (!archiveRes.ok) {
+    await archiveRes.body?.cancel().catch(() => {});
     throw new Error(`daemon_runtime_archive_http_error:${archiveRes.status}`);
   }
   const archiveBytes = Buffer.from(await archiveRes.arrayBuffer());
   const archiveSha256 = sha256Buffer(archiveBytes);
-  const headerSha = archiveRes.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256)?.trim().toLowerCase();
-  const headerVersion = archiveRes.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION)?.trim();
-  const headerReleaseManifestSha = archiveRes.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256)?.trim().toLowerCase();
+  const headerSha = archiveHeaders.get(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256)?.trim().toLowerCase();
+  const headerVersion = archiveHeaders.get(CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION)?.trim();
+  const headerReleaseManifestSha = archiveHeaders.get(CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256)?.trim().toLowerCase();
 
   if (headerSha && headerSha !== archiveSha256) {
     throw new Error('daemon_runtime_archive_header_sha256_mismatch');
@@ -912,8 +925,13 @@ async function fetchAndVerifyFromServer(input: {
       ...targetQuery,
       asset: CONTROLLED_NODE_ARTIFACT_ASSETS.DESKTOP_RELEASE_MANIFEST,
     });
-    const rmRes = await fetchImpl(rmUrl, { headers: authHeaders });
+    const { response: rmRes } = await fetchControlledNodeArtifactWithRedirect({
+      fetchImpl,
+      url: rmUrl,
+      headers: authHeaders,
+    });
     if (!rmRes.ok) {
+      await rmRes.body?.cancel().catch(() => {});
       throw new Error(`desktop_release_manifest_http_error:${rmRes.status}`);
     }
     const rmBytes = Buffer.from(await rmRes.arrayBuffer());

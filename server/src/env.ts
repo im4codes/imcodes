@@ -8,6 +8,14 @@ export interface EnvConfig {
   R2_BUCKET?: string;
   R2_ACCESS_KEY_ID?: string;
   R2_SECRET_ACCESS_KEY?: string;
+  /** Optional Tier 1 controlled-node artifact distribution over R2 public/edge CDN or presigned GET. */
+  USE_R2_ARTIFACT?: string;
+  CONTROLLED_NODE_ARTIFACT_R2_BASE_URL?: string;
+  CONTROLLED_NODE_ARTIFACT_R2_PREFIX?: string;
+  /** Optional Tier 2 controlled-node artifact distribution over GitHub Releases. */
+  CONTROLLED_NODE_ARTIFACT_GITHUB_REPO?: string;
+  CONTROLLED_NODE_ARTIFACT_GITHUB_TAG?: string;
+  CONTROLLED_NODE_ARTIFACT_GITHUB_BASE_URL?: string;
   // Database connection string
   DATABASE_URL: string;
 
@@ -151,6 +159,12 @@ export function loadEnv(): EnvConfig {
     R2_BUCKET: process.env.R2_BUCKET,
     R2_ACCESS_KEY_ID: process.env.R2_ACCESS_KEY_ID,
     R2_SECRET_ACCESS_KEY: process.env.R2_SECRET_ACCESS_KEY,
+    USE_R2_ARTIFACT: process.env.USE_R2_ARTIFACT,
+    CONTROLLED_NODE_ARTIFACT_R2_BASE_URL: process.env.CONTROLLED_NODE_ARTIFACT_R2_BASE_URL,
+    CONTROLLED_NODE_ARTIFACT_R2_PREFIX: process.env.CONTROLLED_NODE_ARTIFACT_R2_PREFIX,
+    CONTROLLED_NODE_ARTIFACT_GITHUB_REPO: process.env.CONTROLLED_NODE_ARTIFACT_GITHUB_REPO,
+    CONTROLLED_NODE_ARTIFACT_GITHUB_TAG: process.env.CONTROLLED_NODE_ARTIFACT_GITHUB_TAG,
+    CONTROLLED_NODE_ARTIFACT_GITHUB_BASE_URL: process.env.CONTROLLED_NODE_ARTIFACT_GITHUB_BASE_URL,
     DATABASE_URL: process.env.DATABASE_URL!,
     JWT_SIGNING_KEY: process.env.JWT_SIGNING_KEY!,
     BOT_ENCRYPTION_KEY: process.env.BOT_ENCRYPTION_KEY ?? '',

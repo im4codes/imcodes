@@ -1484,6 +1484,16 @@ jobs:
           node scripts/remote-desktop-worker-artifacts.mjs verify \
             server/controlled-node-artifacts "$IMCODES_BUILD_VERSION" linux x64
 
+      - name: Generate controlled-node release artifacts manifest and stage flat release assets
+        env:
+          IMCODES_BUILD_VERSION: ${{ needs.release_version.outputs.app_version }}
+        run: |
+          set -euo pipefail
+          node scripts/generate-controlled-node-manifest.mjs \
+            server/controlled-node-artifacts \
+            --version "$IMCODES_BUILD_VERSION" \
+            --stage-dir dist-controlled-node-release
+
       - name: Get build timestamp
         id: ts
         run: echo "value=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
@@ -1609,6 +1619,7 @@ jobs:
           docker run --rm --entrypoint node imcodes-smoke:test \
             scripts/node-exe-artifacts.mjs verify-set /app/controlled-node-executables \
             imcodes-node-linux imcodes-node-macos imcodes-node.exe imcodes-node-linux-glibc217
+          docker run --rm --entrypoint test imcodes-smoke:test -s /app/controlled-node-executables/release-artifacts-manifest.json
           docker run --rm --entrypoint node imcodes-smoke:test -e \
             "const fs=require('node:fs'); const p=JSON.parse(fs.readFileSync('/app/controlled-node-executables/release-provenance.json','utf8')); if(p.sourceCommit!=='${{ github.sha }}'||p.appVersion!=='${{ needs.release_version.outputs.app_version }}') throw new Error('release provenance mismatch'); console.log('release provenance verified:',p.sourceCommit,p.appVersion)"
           # Every target, named. This verifier defaults to the WINDOWS target
@@ -1687,6 +1698,40 @@ jobs:
             git tag "$GIT_TAG"
             git push origin "$GIT_TAG"
           fi
+
+      - name: Publish controlled-node artifacts GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: controlled-node-v${{ needs.release_version.outputs.app_version }}
+          name: Controlled Node Artifacts v${{ needs.release_version.outputs.app_version }}
+          files: dist-controlled-node-release/*
+          prerelease: ${{ github.ref == 'refs/heads/dev' }}
+          make_latest: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync controlled-node artifacts to R2 (optional)
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.CONTROLLED_NODE_ARTIFACT_R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.CONTROLLED_NODE_ARTIFACT_R2_BUCKET }}
+          R2_ACCESS_KEY_ID: ${{ secrets.CONTROLLED_NODE_ARTIFACT_R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.CONTROLLED_NODE_ARTIFACT_R2_SECRET_ACCESS_KEY }}
+          R2_PREFIX: ${{ vars.CONTROLLED_NODE_ARTIFACT_R2_PREFIX }}
+        run: |
+          set -euo pipefail
+          if [ -z "${R2_ACCOUNT_ID:-}" ] || [ -z "${R2_BUCKET:-}" ] || [ -z "${R2_ACCESS_KEY_ID:-}" ] || [ -z "${R2_SECRET_ACCESS_KEY:-}" ]; then
+            echo "Optional R2 secrets not configured; skipping R2 artifact sync."
+            exit 0
+          fi
+          prefix="${R2_PREFIX#/}"
+          prefix="${prefix%/}"
+          dest="s3://${R2_BUCKET}${prefix:+/${prefix}}"
+          AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" \
+          AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" \
+          AWS_DEFAULT_REGION="auto" \
+            aws s3 sync dist-controlled-node-release "$dest" \
+              --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" \
+              --no-progress
 
   # ── Android APK Build ────────────────────────────────────────────────────
 

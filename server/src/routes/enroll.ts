@@ -13,8 +13,12 @@ import { z } from 'zod';
 import { lstat, open, readdir, type FileHandle } from 'node:fs/promises';
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { join } from 'node:path';
-import type { Env } from '../env.js';
+import type { Env, EnvConfig } from '../env.js';
 import type { Database } from '../db/client.js';
+import {
+  resolveControlledNodeExternalArtifact,
+  type VerifyExternalArtifactIdentity,
+} from '../services/controlled-node-artifact-distribution.js';
 import { randomHex, sha256Hex, encryptBotConfig, decryptBotConfig } from '../security/crypto.js';
 import { logAudit } from '../security/audit.js';
 import { requireAuth } from '../security/authorization.js';
@@ -52,6 +56,7 @@ import {
   CONTROLLED_NODE_ARTIFACT_COMPRESSION_ENCODING,
   CONTROLLED_NODE_ARTIFACT_ASSETS,
   CONTROLLED_NODE_ARTIFACT_HEADERS,
+  CONTROLLED_NODE_EXTERNAL_REDIRECT_OPT_IN,
   CONTROLLED_NODE_ARCH_ARM64,
   CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL,
   CONTROLLED_NODE_ENROLL_AUDIT_ACTION,
@@ -1103,6 +1108,77 @@ async function consumeAndStream(c: Context, rawTicket: string, rawProfile?: unkn
   return c.body(stream as unknown as ReadableStream, 200);
 }
 
+function artifactDistributionEnv(c: Context): Partial<EnvConfig> {
+  const ctxEnv = (c.env ?? {}) as Partial<EnvConfig>;
+  return {
+    USE_R2_RELAY: ctxEnv.USE_R2_RELAY ?? process.env.USE_R2_RELAY,
+    R2_ACCOUNT_ID: ctxEnv.R2_ACCOUNT_ID ?? process.env.R2_ACCOUNT_ID,
+    R2_BUCKET: ctxEnv.R2_BUCKET ?? process.env.R2_BUCKET,
+    R2_ACCESS_KEY_ID: ctxEnv.R2_ACCESS_KEY_ID ?? process.env.R2_ACCESS_KEY_ID,
+    R2_SECRET_ACCESS_KEY: ctxEnv.R2_SECRET_ACCESS_KEY ?? process.env.R2_SECRET_ACCESS_KEY,
+    USE_R2_ARTIFACT: ctxEnv.USE_R2_ARTIFACT ?? process.env.USE_R2_ARTIFACT,
+    CONTROLLED_NODE_ARTIFACT_R2_BASE_URL:
+      ctxEnv.CONTROLLED_NODE_ARTIFACT_R2_BASE_URL ?? process.env.CONTROLLED_NODE_ARTIFACT_R2_BASE_URL,
+    CONTROLLED_NODE_ARTIFACT_R2_PREFIX:
+      ctxEnv.CONTROLLED_NODE_ARTIFACT_R2_PREFIX ?? process.env.CONTROLLED_NODE_ARTIFACT_R2_PREFIX,
+    CONTROLLED_NODE_ARTIFACT_GITHUB_REPO:
+      ctxEnv.CONTROLLED_NODE_ARTIFACT_GITHUB_REPO ?? process.env.CONTROLLED_NODE_ARTIFACT_GITHUB_REPO,
+    CONTROLLED_NODE_ARTIFACT_GITHUB_TAG:
+      ctxEnv.CONTROLLED_NODE_ARTIFACT_GITHUB_TAG ?? process.env.CONTROLLED_NODE_ARTIFACT_GITHUB_TAG,
+    CONTROLLED_NODE_ARTIFACT_GITHUB_BASE_URL:
+      ctxEnv.CONTROLLED_NODE_ARTIFACT_GITHUB_BASE_URL ?? process.env.CONTROLLED_NODE_ARTIFACT_GITHUB_BASE_URL,
+  };
+}
+
+async function maybeExternalArtifactRedirect(
+  c: Context,
+  dir: string,
+  isHead: boolean,
+  closeLocal: () => Promise<void>,
+  identity: VerifyExternalArtifactIdentity,
+  headers: {
+    filename: string;
+    sha256: string;
+    sizeBytes: number;
+    version?: string;
+    abiProfile?: ControlledNodeAbiProfile;
+    authenticodeSignerSha256?: string;
+    releaseManifestSha256?: string;
+    extraVary?: string;
+  },
+): Promise<Response | null> {
+  if (isHead) return null;
+  if (c.req.header(CONTROLLED_NODE_ARTIFACT_HEADERS.EXTERNAL_REDIRECT) !== CONTROLLED_NODE_EXTERNAL_REDIRECT_OPT_IN) {
+    return null;
+  }
+  const external = await resolveControlledNodeExternalArtifact(dir, artifactDistributionEnv(c), identity);
+  if (!external) return null;
+
+  await closeLocal();
+  c.header('Location', external.url);
+  c.header('Cache-Control', 'private, no-store');
+  c.header('Referrer-Policy', 'no-referrer');
+  c.header('X-Content-Type-Options', 'nosniff');
+  c.header(
+    'Vary',
+    headers.extraVary
+      ? `${headers.extraVary}, ${CONTROLLED_NODE_ARTIFACT_HEADERS.EXTERNAL_REDIRECT}`
+      : CONTROLLED_NODE_ARTIFACT_HEADERS.EXTERNAL_REDIRECT,
+  );
+  c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256, headers.sha256);
+  c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES, String(headers.sizeBytes));
+  c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME, headers.filename);
+  if (headers.version) c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION, headers.version);
+  if (headers.abiProfile) c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.ABI_PROFILE, headers.abiProfile);
+  if (headers.authenticodeSignerSha256) {
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256, headers.authenticodeSignerSha256);
+  }
+  if (headers.releaseManifestSha256) {
+    c.header(CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256, headers.releaseManifestSha256);
+  }
+  return c.body(null, 302);
+}
+
 async function exchangeInstallPayload(c: Context, rawTicket: string, rawProfile?: unknown): Promise<Response> {
   const canonicalServerUrl = resolveCanonicalServerUrl(c);
   if (!canonicalServerUrl) return c.json({ error: 'canonical_server_url_required' }, 403);
@@ -1119,17 +1195,35 @@ async function exchangeInstallPayload(c: Context, rawTicket: string, rawProfile?
     return c.json({ error: 'ticket_consume_unavailable' }, 503);
   }
 
-  const token = mintInstallExecutableToken(
-    {
+  const exeDir = process.env.IMCODES_NODE_EXE_DIR;
+  const external = exeDir
+    ? await resolveControlledNodeExternalArtifact(exeDir, artifactDistributionEnv(c), {
+      asset: CONTROLLED_NODE_ARTIFACT_ASSETS.NODE,
       os: downloadOs,
       arch: downloadArch,
       abiProfile: profile,
       sha256: descriptor.sha256,
-      exp: now + CONTROLLED_NODE_INSTALL_EXECUTABLE_TOKEN_TTL_MS,
-    },
-    encryptionKey,
-  );
-  const artifactUrl = `${canonicalServerUrl}${CONTROLLED_NODE_INSTALL_EXECUTABLE_PATH}?${CONTROLLED_NODE_INSTALL_EXECUTABLE_TOKEN_PARAM}=${encodeURIComponent(token)}`;
+      sizeBytes: descriptor.sizeBytes,
+      version: descriptor.version,
+      authenticodeSignerSha256: descriptor.authenticodeSignerSha256,
+    })
+    : null;
+  let artifactUrl: string;
+  if (external) {
+    artifactUrl = external.url;
+  } else {
+    const token = mintInstallExecutableToken(
+      {
+        os: downloadOs,
+        arch: downloadArch,
+        abiProfile: profile,
+        sha256: descriptor.sha256,
+        exp: now + CONTROLLED_NODE_INSTALL_EXECUTABLE_TOKEN_TTL_MS,
+      },
+      encryptionKey,
+    );
+    artifactUrl = `${canonicalServerUrl}${CONTROLLED_NODE_INSTALL_EXECUTABLE_PATH}?${CONTROLLED_NODE_INSTALL_EXECUTABLE_TOKEN_PARAM}=${encodeURIComponent(token)}`;
+  }
   const payload: ControlledNodeInstallPayloadResponse = {
     artifactUrl,
     sha256: descriptor.sha256,
@@ -1940,6 +2034,27 @@ enrollRoutes.on(['GET', 'HEAD'], '/v2/node-artifact', async (c) => {
     if (openedReleaseManifest.status === 'invalid') {
       return c.json({ error: 'desktop_release_manifest_invalid', reason: openedReleaseManifest.reason }, 503);
     }
+    const manifestRedirect = await maybeExternalArtifactRedirect(
+      c,
+      dir,
+      isHead,
+      openedReleaseManifest.close,
+      {
+        asset: CONTROLLED_NODE_ARTIFACT_ASSETS.DESKTOP_RELEASE_MANIFEST,
+        os,
+        arch,
+        sha256: openedReleaseManifest.sha256,
+        sizeBytes: openedReleaseManifest.sizeBytes,
+        version: openedReleaseManifest.version,
+      },
+      {
+        filename: openedReleaseManifest.filename,
+        sha256: openedReleaseManifest.sha256,
+        sizeBytes: openedReleaseManifest.sizeBytes,
+        version: openedReleaseManifest.version,
+      },
+    );
+    if (manifestRedirect) return manifestRedirect;
     c.header('Content-Length', String(openedReleaseManifest.sizeBytes));
     c.header('Content-Type', 'application/octet-stream');
     c.header('Content-Disposition', `attachment; filename="${openedReleaseManifest.filename}"`);
@@ -1969,6 +2084,30 @@ enrollRoutes.on(['GET', 'HEAD'], '/v2/node-artifact', async (c) => {
     if (openedRuntime.status === 'invalid') {
       return c.json({ error: 'daemon_runtime_invalid', reason: openedRuntime.reason }, 503);
     }
+    const runtimeRedirect = await maybeExternalArtifactRedirect(
+      c,
+      dir,
+      isHead,
+      openedRuntime.close,
+      {
+        asset,
+        os,
+        arch,
+        sha256: openedRuntime.sha256,
+        sizeBytes: openedRuntime.sizeBytes,
+        version: openedRuntime.version,
+        authenticodeSignerSha256: openedRuntime.authenticodeSignerSha256,
+      },
+      {
+        filename: openedRuntime.filename,
+        sha256: openedRuntime.sha256,
+        sizeBytes: openedRuntime.sizeBytes,
+        version: openedRuntime.version,
+        authenticodeSignerSha256: openedRuntime.authenticodeSignerSha256,
+        releaseManifestSha256: openedRuntime.releaseManifestSha256,
+      },
+    );
+    if (runtimeRedirect) return runtimeRedirect;
     c.header('Content-Length', String(openedRuntime.sizeBytes));
     c.header('Content-Type', 'application/octet-stream');
     c.header('Content-Disposition', `attachment; filename="${openedRuntime.filename}"`);
@@ -2003,6 +2142,25 @@ enrollRoutes.on(['GET', 'HEAD'], '/v2/node-artifact', async (c) => {
       ? await openAideskLocalUiArtifact(dir, asset)
       : null;
     if (!opened) return c.json({ error: 'aidesk_local_ui_not_published' }, 404);
+    const aideskRedirect = await maybeExternalArtifactRedirect(
+      c,
+      dir,
+      isHead,
+      opened.close,
+      {
+        asset,
+        os: artifactTarget.os,
+        arch: artifactTarget.arch,
+        sha256: opened.sha256,
+        sizeBytes: opened.sizeBytes,
+      },
+      {
+        filename: opened.filename,
+        sha256: opened.sha256,
+        sizeBytes: opened.sizeBytes,
+      },
+    );
+    if (aideskRedirect) return aideskRedirect;
     c.header('Content-Length', String(opened.sizeBytes));
     c.header('Content-Type', 'application/octet-stream');
     c.header('Content-Disposition', `attachment; filename="${opened.filename}"`);
@@ -2022,6 +2180,25 @@ enrollRoutes.on(['GET', 'HEAD'], '/v2/node-artifact', async (c) => {
   if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.COMPUTER_USE_HELPER) {
     const openedHelper = await openComputerUseHelperArtifact(dir, artifactTarget.os, artifactTarget.arch);
     if (!openedHelper) return c.json({ error: 'computer_use_helper_not_built', os: artifactTarget.os, arch: artifactTarget.arch }, 503);
+    const helperRedirect = await maybeExternalArtifactRedirect(
+      c,
+      dir,
+      isHead,
+      openedHelper.close,
+      {
+        asset,
+        os: artifactTarget.os,
+        arch: artifactTarget.arch,
+        sha256: openedHelper.sha256,
+        sizeBytes: openedHelper.sizeBytes,
+      },
+      {
+        filename: openedHelper.filename,
+        sha256: openedHelper.sha256,
+        sizeBytes: openedHelper.sizeBytes,
+      },
+    );
+    if (helperRedirect) return helperRedirect;
     c.header('Content-Length', String(openedHelper.sizeBytes));
     c.header('Content-Type', 'application/octet-stream');
     c.header('Content-Disposition', `attachment; filename="${openedHelper.filename}"`);
@@ -2125,6 +2302,30 @@ enrollRoutes.on(['GET', 'HEAD'], '/v2/node-artifact', async (c) => {
         ? null
         : await openLinuxRemoteDesktopWorkerArtifact(dir, asset);
     if (!openedWorker) return c.json({ error: 'remote_desktop_worker_not_built', os: artifactTarget.os, arch: artifactTarget.arch }, 503);
+    if (!legacyManifest) {
+      const workerRedirect = await maybeExternalArtifactRedirect(
+        c,
+        dir,
+        isHead,
+        openedWorker.close,
+        {
+          asset,
+          os: artifactTarget.os,
+          arch: artifactTarget.arch,
+          sha256: openedWorker.sha256,
+          sizeBytes: openedWorker.sizeBytes,
+          version: openedWorker.version,
+        },
+        {
+          filename: openedWorker.filename,
+          sha256: openedWorker.sha256,
+          sizeBytes: openedWorker.sizeBytes,
+          version: openedWorker.version,
+          extraVary: CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION,
+        },
+      );
+      if (workerRedirect) return workerRedirect;
+    }
     c.header('Content-Length', String(openedWorker.sizeBytes));
     c.header('Content-Type', 'application/octet-stream');
     c.header('Content-Disposition', `attachment; filename="${openedWorker.filename}"`);
@@ -2195,6 +2396,32 @@ enrollRoutes.on(['GET', 'HEAD'], '/v2/node-artifact', async (c) => {
     artifactCatalog.invalidate(dir, artifactTarget.os, artifactTarget.arch, abiProfile);
     return c.json({ error: 'artifact_digest_mismatch' }, 503);
   }
+  const nodeRedirect = await maybeExternalArtifactRedirect(
+    c,
+    dir,
+    isHead,
+    opened ? opened.close : async () => {},
+    {
+      asset: CONTROLLED_NODE_ARTIFACT_ASSETS.NODE,
+      os: artifactTarget.os,
+      arch: artifactTarget.arch,
+      abiProfile,
+      sha256: v.descriptor.sha256,
+      sizeBytes: v.descriptor.sizeBytes,
+      version: v.descriptor.version,
+      authenticodeSignerSha256: v.descriptor.authenticodeSignerSha256,
+    },
+    {
+      filename: v.descriptor.filename,
+      sha256: v.descriptor.sha256,
+      sizeBytes: v.descriptor.sizeBytes,
+      version: v.descriptor.version,
+      abiProfile,
+      authenticodeSignerSha256: v.descriptor.authenticodeSignerSha256,
+      releaseManifestSha256: nodeReleaseManifestSha256,
+    },
+  );
+  if (nodeRedirect) return nodeRedirect;
 
   c.header('Content-Length', String(v.descriptor.sizeBytes));
   c.header('Content-Type', 'application/octet-stream');

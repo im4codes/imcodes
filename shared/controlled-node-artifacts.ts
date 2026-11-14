@@ -216,7 +216,50 @@ export const CONTROLLED_NODE_ARTIFACT_HEADERS = {
   AUTHENTICODE_SIGNER_SHA256: 'x-imcodes-node-artifact-authenticode-signer-sha256',
   REMOTE_DESKTOP_PROTOCOL_VERSION: 'x-imcodes-remote-desktop-protocol-version',
   RELEASE_MANIFEST_SHA256: 'x-imcodes-node-release-manifest-sha256',
+  EXTERNAL_REDIRECT: 'x-imcodes-external-artifact-redirect',
 } as const;
+
+export const CONTROLLED_NODE_EXTERNAL_REDIRECT_OPT_IN = '1';
+export const CONTROLLED_NODE_EXTERNAL_MAX_REDIRECTS = 5;
+export const CONTROLLED_NODE_RELEASE_ARTIFACTS_MANIFEST_FILENAME = 'release-artifacts-manifest.json';
+export const CONTROLLED_NODE_RELEASE_ARTIFACTS_MANIFEST_SCHEMA_VERSION = 1;
+
+export interface ControlledNodeReleaseArtifactEntry {
+  asset: string;
+  assetFilename: string;
+  relativePath: string;
+  sha256: string;
+  sizeBytes: number;
+  version?: string;
+  os?: string;
+  arch?: string;
+  abiProfile?: ControlledNodeAbiProfile;
+  authenticodeSignerSha256?: string;
+}
+
+export interface ControlledNodeReleaseArtifactsManifest {
+  schemaVersion: typeof CONTROLLED_NODE_RELEASE_ARTIFACTS_MANIFEST_SCHEMA_VERSION;
+  version?: string;
+  generatedAt: string;
+  artifacts: Record<string, ControlledNodeReleaseArtifactEntry>;
+}
+
+export function controlledNodeReleaseArtifactEntryKey(input: {
+  asset: string;
+  os?: string;
+  arch?: string;
+  abiProfile?: ControlledNodeAbiProfile;
+}): string {
+  if (input.asset === CONTROLLED_NODE_ARTIFACT_ASSETS.DESKTOP_RELEASE_MANIFEST) {
+    return input.os && input.arch ? `${input.asset}:${input.os}:${input.arch}` : input.asset;
+  }
+  const os = input.os ?? 'any';
+  const arch = input.arch ?? 'any';
+  const profile = input.abiProfile;
+  return profile === undefined || profile === CONTROLLED_NODE_ABI_MODERN
+    ? `${input.asset}:${os}:${arch}`
+    : `${input.asset}:${os}:${arch}:${profile}`;
+}
 
 export function controlledNodeArtifactKey(
   os: ControlledNodeOs, arch: ControlledNodeArtifactArch, abiProfile?: ControlledNodeAbiProfile,

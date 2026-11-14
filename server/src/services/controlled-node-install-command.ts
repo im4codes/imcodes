@@ -269,16 +269,35 @@ imcodes_install() {
   fi
 
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --max-redirs 0 __CURL_PROTOCOL_FLAGS__\
-      "$imcodes_artifact_url" -o "$imcodes_binary" || {
-      echo "IM.codes: binary download failed." >&2
-      exit 1
-    }
+    case "$imcodes_artifact_url" in
+      https://*)
+        curl -fsSL --max-redirs 5 __HTTPS_ARTIFACT_CURL_FLAGS__"$imcodes_artifact_url" -o "$imcodes_binary" || {
+          echo "IM.codes: binary download failed." >&2
+          exit 1
+        }
+        ;;
+      http://*)
+        curl -fsSL --max-redirs 0 __CURL_PROTOCOL_FLAGS__"$imcodes_artifact_url" -o "$imcodes_binary" || {
+          echo "IM.codes: binary download failed." >&2
+          exit 1
+        }
+        ;;
+    esac
   elif command -v wget >/dev/null 2>&1; then
-    wget -q __WGET_PROTOCOL_FLAGS__"$imcodes_artifact_url" -O "$imcodes_binary" || {
-      echo "IM.codes: binary download failed." >&2
-      exit 1
-    }
+    case "$imcodes_artifact_url" in
+      https://*)
+        wget -q --max-redirect=5 "$imcodes_artifact_url" -O "$imcodes_binary" || {
+          echo "IM.codes: binary download failed." >&2
+          exit 1
+        }
+        ;;
+      http://*)
+        wget -q __WGET_PROTOCOL_FLAGS__"$imcodes_artifact_url" -O "$imcodes_binary" || {
+          echo "IM.codes: binary download failed." >&2
+          exit 1
+        }
+        ;;
+    esac
   fi
 
   if [ ! -s "$imcodes_binary" ]; then
@@ -316,6 +335,7 @@ imcodes_install
     .replace(/__INSTALL_CODE__/g, installCode)
     .replace(/__EXPECT_OS__/g, expectOs)
     .replace(/__CURL_PROTOCOL_FLAGS__/g, curlProtocolFlags)
+    .replace(/__HTTPS_ARTIFACT_CURL_FLAGS__/g, serverUrl.startsWith('https://') ? curlProtocolFlags : '')
     .replace(/__WGET_PROTOCOL_FLAGS__/g, wgetProtocolFlags)
     .replace(/__PAYLOAD_PATH__/g, CONTROLLED_NODE_INSTALL_PAYLOAD_PATH)
     .replace(/__TICKET_FIELD__/g, CONTROLLED_NODE_INSTALL_TICKET_FIELD)
@@ -418,7 +438,31 @@ function Invoke-ImcodesInstall {
       return
     }
     try {
-      Invoke-WebRequest -Uri $artifactUri.AbsoluteUri -Method Get -OutFile $binary -UseBasicParsing -MaximumRedirection 0
+      if ($artifactUri.Scheme -cne 'https') {
+        Invoke-WebRequest -Uri $artifactUri.AbsoluteUri -Method Get -OutFile $binary -UseBasicParsing -MaximumRedirection 0
+      } else {
+        $currentUri = $artifactUri
+        for ($hop = 0; $hop -le 5; $hop++) {
+          try {
+            Invoke-WebRequest -Uri $currentUri.AbsoluteUri -Method Get -OutFile $binary -UseBasicParsing -MaximumRedirection 0
+            break
+          } catch {
+            $resp = $_.Exception.Response
+            if (-not $resp) { throw }
+            $statusCode = [int]$resp.StatusCode
+            if ($statusCode -notin @(301, 302, 303, 307, 308)) { throw }
+            if ($hop -ge 5) { throw [System.Exception]::new('too many artifact redirects') }
+            $loc = $null
+            if ($resp.Headers -and $resp.Headers.Location) { $loc = [string]$resp.Headers.Location }
+            elseif ($resp.Headers -and $resp.Headers['Location']) { $loc = [string]$resp.Headers['Location'] }
+            if ([string]::IsNullOrWhiteSpace($loc)) { throw [System.Exception]::new('redirect missing Location header') }
+            $nextUri = [Uri]::new($currentUri, $loc)
+            if ($nextUri.Scheme -cne 'https') { throw [System.Exception]::new('refused non-HTTPS artifact redirect') }
+            if ($nextUri.UserInfo) { throw [System.Exception]::new('refused credential-bearing artifact redirect') }
+            $currentUri = $nextUri
+          }
+        }
+      }
     } catch {
       Write-Host 'IM.codes: binary download failed.' -ForegroundColor Red
       Write-Host ("IM.codes: " + $_.Exception.Message) -ForegroundColor Red

@@ -275,6 +275,23 @@ describe('rendered installer script', () => {
     }).body;
     expect(win).toContain("$expectArch = 'ARM64'");
   });
+
+  it('keeps install-payload pinned to 0 redirects while allowing bounded HTTPS-only redirects for external artifact downloads', () => {
+    const linux = renderControlledNodeInstallScript({
+      serverUrl: SERVER_URL, installCode: code, os: 'linux', arch: 'x64',
+    }).body;
+    expect(linux).toContain('curl -fsSL --max-redirs 0');
+    expect(linux).toContain('curl -fsSL --max-redirs 5');
+    expect(linux).toContain('wget -q --max-redirect=5');
+
+    const win = renderControlledNodeInstallScript({
+      serverUrl: SERVER_URL, installCode: code, os: 'win', arch: 'x64',
+      windowsAuthenticodeSignerSha256: WINDOWS_SIGNER_SHA256,
+    }).body;
+    expect(win).toContain('-Method Post -Body @{ ticket = $code } -UseBasicParsing -MaximumRedirection 0');
+    expect(win).toContain("if ($nextUri.Scheme -cne 'https')");
+    expect(win).toContain('if ($hop -ge 5)');
+  });
 });
 
 describe('GET /i/:code', () => {

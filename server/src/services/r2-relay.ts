@@ -3,12 +3,16 @@ import type { EnvConfig } from '../env.js';
 import { R2_RELAY_LIMITS, type R2RelayConfig } from '../../../shared/r2-relay.js';
 import logger from '../util/logger.js';
 
-export function r2RelayConfig(env: Partial<EnvConfig>): R2RelayConfig | null {
-  if (env.USE_R2_RELAY !== 'true' || !/^[a-f0-9]{32}$/.test(env.R2_ACCOUNT_ID ?? '')
+export function r2CredentialsFromEnv(env: Partial<EnvConfig>): R2RelayConfig | null {
+  if (!/^[a-f0-9]{32}$/.test(env.R2_ACCOUNT_ID ?? '')
     || !/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(env.R2_BUCKET ?? '')
     || !env.R2_ACCESS_KEY_ID || !env.R2_SECRET_ACCESS_KEY) return null;
   return { accountId: env.R2_ACCOUNT_ID!, bucket: env.R2_BUCKET!,
     accessKeyId: env.R2_ACCESS_KEY_ID, secretAccessKey: env.R2_SECRET_ACCESS_KEY };
+}
+export function r2RelayConfig(env: Partial<EnvConfig>): R2RelayConfig | null {
+  if (env.USE_R2_RELAY !== 'true') return null;
+  return r2CredentialsFromEnv(env);
 }
 const encode = (v: string) => encodeURIComponent(v).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
 const hash = (v: string) => createHash('sha256').update(v).digest('hex');
@@ -16,15 +20,17 @@ const hmac = (key: string | Buffer, v: string) => createHmac('sha256', key).upda
 export function isR2StagingKey(key: string): boolean {
   return /^staging\/\d{4}-\d{2}-\d{2}\/[a-f0-9]{32}-[^/\\]+$/.test(key) && !/[\x00-\x1f]/.test(key);
 }
+export function isR2ArtifactKey(key: string): boolean {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$/.test(key) || /[\x00-\x1f\\]/.test(key)) return false;
+  return !key.split('/').some((seg) => !seg || seg === '.' || seg === '..');
+}
 export function r2StagingKey(filename: string, now = Date.now()): string {
   const safeName = Array.from(Buffer.from(filename, 'utf8').toString('utf8').replace(/[\x00-\x1f/\\]/g, '_')).slice(0, 160).join('') || 'file';
   return `${R2_RELAY_LIMITS.PREFIX}${new Date(now).toISOString().slice(0, 10)}/${randomBytes(16).toString('hex')}-${safeName}`;
 }
-/** S3 SigV4 query signing, credentials remain server-only. */
-export function presignR2(config: R2RelayConfig, method: string, key: string,
+function signR2PresignedUrl(config: R2RelayConfig, method: string, key: string,
   query: Record<string, string> = {}, now = Date.now(),
-  headers: Record<string, string> = {}): string {
-  if (key && !isR2StagingKey(key)) throw new Error('invalid_staging_key');
+  headers: Record<string, string> = {}, ttlSeconds: number = R2_RELAY_LIMITS.URL_TTL_SECONDS): string {
   const host = `${config.accountId}.r2.cloudflarestorage.com`;
   const date = new Date(now).toISOString().replace(/[:-]|\.\d{3}/g, '');
   const day = date.slice(0, 8); const scope = `${day}/auto/s3/aws4_request`;
@@ -40,13 +46,24 @@ export function presignR2(config: R2RelayConfig, method: string, key: string,
 
   const fields: Record<string, string> = { ...query,
     'X-Amz-Algorithm': 'AWS4-HMAC-SHA256', 'X-Amz-Credential': `${config.accessKeyId}/${scope}`,
-    'X-Amz-Date': date, 'X-Amz-Expires': String(R2_RELAY_LIMITS.URL_TTL_SECONDS),
+    'X-Amz-Date': date, 'X-Amz-Expires': String(ttlSeconds),
     'X-Amz-SignedHeaders': signedHeaders };
   const qs = Object.keys(fields).sort().map((k) => `${encode(k)}=${encode(fields[k]!)}`).join('&');
   const canonical = `${method}\n${pathname}\n${qs}\n${canonicalHeaders}\n${signedHeaders}\nUNSIGNED-PAYLOAD`;
   const signingKey = hmac(hmac(hmac(hmac(`AWS4${config.secretAccessKey}`, day), 'auto'), 's3'), 'aws4_request');
   const signature = hmac(signingKey, `AWS4-HMAC-SHA256\n${date}\n${scope}\n${hash(canonical)}`).toString('hex');
   return `https://${host}${pathname}?${qs}&X-Amz-Signature=${signature}`;
+}
+/** S3 SigV4 query signing, credentials remain server-only. */
+export function presignR2(config: R2RelayConfig, method: string, key: string,
+  query: Record<string, string> = {}, now = Date.now(),
+  headers: Record<string, string> = {}): string {
+  if (key && !isR2StagingKey(key)) throw new Error('invalid_staging_key');
+  return signR2PresignedUrl(config, method, key, query, now, headers);
+}
+export function presignR2Artifact(config: R2RelayConfig, key: string, ttlSeconds = 300, now = Date.now()): string {
+  if (!isR2ArtifactKey(key)) throw new Error('invalid_artifact_key');
+  return signR2PresignedUrl(config, 'GET', key, {}, now, {}, ttlSeconds);
 }
 export async function r2Request(config: R2RelayConfig, method: string, key: string,
   query: Record<string, string> = {}): Promise<Response> {

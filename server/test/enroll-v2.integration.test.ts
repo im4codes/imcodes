@@ -50,6 +50,9 @@ import {
   CONTROLLED_NODE_ARTIFACT_COMPRESSION_ENCODING,
   CONTROLLED_NODE_ARTIFACT_ASSETS,
   CONTROLLED_NODE_ARTIFACT_HEADERS,
+  CONTROLLED_NODE_EXTERNAL_REDIRECT_OPT_IN,
+  CONTROLLED_NODE_RELEASE_ARTIFACTS_MANIFEST_FILENAME,
+  CONTROLLED_NODE_RELEASE_ARTIFACTS_MANIFEST_SCHEMA_VERSION,
   CONTROLLED_NODE_TICKET_DELIVERY,
   CONTROLLED_NODE_TICKET_MAX_CONSUMES,
   CONTROLLED_NODE_TICKET_TTL_MS,
@@ -3556,5 +3559,213 @@ describe('command-based install-payload + static install-executable routes (real
       body: JSON.stringify({ ticket: ticket.ticket }),
     });
     expect(revokedExchange.status).toBe(401);
+  });
+});
+
+describe('3-tier controlled-node artifact distribution (R2 -> GitHub -> Docker fallback, real PostgreSQL)', () => {
+  const DIST_ENV_KEYS = [
+    'USE_R2_ARTIFACT',
+    'CONTROLLED_NODE_ARTIFACT_R2_BASE_URL',
+    'CONTROLLED_NODE_ARTIFACT_R2_PREFIX',
+    'CONTROLLED_NODE_ARTIFACT_GITHUB_REPO',
+    'CONTROLLED_NODE_ARTIFACT_GITHUB_TAG',
+    'CONTROLLED_NODE_ARTIFACT_GITHUB_BASE_URL',
+  ] as const;
+
+  const withDistributionEnv = async (
+    overrides: Partial<Record<typeof DIST_ENV_KEYS[number], string>>,
+    fn: () => Promise<void>,
+  ) => {
+    const saved: Partial<Record<string, string | undefined>> = {};
+    for (const k of DIST_ENV_KEYS) {
+      saved[k] = process.env[k];
+      if (overrides[k] === undefined) delete process.env[k];
+      else process.env[k] = overrides[k];
+    }
+    try {
+      await fn();
+    } finally {
+      for (const k of DIST_ENV_KEYS) {
+        if (saved[k] === undefined) delete process.env[k];
+        else process.env[k] = saved[k];
+      }
+    }
+  };
+
+  it('follows strict priority R2 -> GitHub Releases -> Docker built-in, preserves legacy 200 streaming, and fails closed on tampered manifest', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+    const mintEnroll = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST',
+      headers: ticketHeaders(userId, o),
+      body: JSON.stringify({
+        version: 2,
+        os: 'linux',
+        arch: 'x64',
+        delivery: CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND,
+      }),
+    });
+    const enrollTicket = await mintEnroll.json() as { ticket: string };
+    const enrollExchange = await app.request(CONTROLLED_NODE_INSTALL_PAYLOAD_PATH, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ticket: enrollTicket.ticket }),
+    });
+    const enrollPayload = await enrollExchange.json() as ControlledNodeInstallPayloadResponse;
+    const nodeToken = hex(32);
+    const redeemRes = await app.request('/api/enroll/v2/redeem', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2,
+        installId: `dist-${hex(8)}`,
+        nodeTokenHash: sha256(nodeToken),
+        hostname: 'dist-host',
+        os: 'linux',
+        arch: 'x64',
+        enrollToken: enrollPayload.enrollment.enrollToken,
+      }),
+    });
+    expect(redeemRes.status).toBe(200);
+    const { serverId } = await redeemRes.json() as { serverId: string };
+
+    const linuxBytes = await readFile(join(exeDir, 'imcodes-node-linux'));
+    const linuxSha = sha256(linuxBytes);
+    const linuxNodeManifest = JSON.parse(await readFile(join(exeDir, 'imcodes-node-linux.manifest.json'), 'utf8')) as {
+      build?: { version?: string };
+    };
+    const linuxVersion = linuxNodeManifest.build?.version ?? '2026.9.1';
+    const manifestPath = join(exeDir, CONTROLLED_NODE_RELEASE_ARTIFACTS_MANIFEST_FILENAME);
+    await writeFile(manifestPath, JSON.stringify({
+      schemaVersion: CONTROLLED_NODE_RELEASE_ARTIFACTS_MANIFEST_SCHEMA_VERSION,
+      version: linuxVersion,
+      generatedAt: new Date().toISOString(),
+      artifacts: {
+        'node:linux:x64': {
+          asset: CONTROLLED_NODE_ARTIFACT_ASSETS.NODE,
+          assetFilename: 'imcodes-node-linux',
+          relativePath: 'imcodes-node-linux',
+          sha256: linuxSha,
+          sizeBytes: linuxBytes.length,
+          version: linuxVersion,
+          os: 'linux',
+          arch: 'x64',
+        },
+      },
+    }));
+
+    try {
+      // Tier 2: GitHub configured, R2 unset.
+      await withDistributionEnv({
+        CONTROLLED_NODE_ARTIFACT_GITHUB_REPO: 'im4codes/imcodes',
+        CONTROLLED_NODE_ARTIFACT_GITHUB_TAG: 'controlled-node-v2026.9.1',
+      }, async () => {
+        const mint = await app.request('/api/enroll/v2/ticket', {
+          method: 'POST',
+          headers: ticketHeaders(userId, o),
+          body: JSON.stringify({
+            version: 2,
+            os: 'linux',
+            arch: 'x64',
+            delivery: CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND,
+          }),
+        });
+        const ticket = await mint.json() as { ticket: string };
+        const exchange = await app.request(CONTROLLED_NODE_INSTALL_PAYLOAD_PATH, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ ticket: ticket.ticket }),
+        });
+        expect(exchange.status).toBe(200);
+        const payload = await exchange.json() as ControlledNodeInstallPayloadResponse;
+        expect(payload.artifactUrl).toBe(
+          'https://github.com/im4codes/imcodes/releases/download/controlled-node-v2026.9.1/imcodes-node-linux',
+        );
+
+        // Opt-in client receives 302 with origin metadata headers.
+        const optInRes = await app.request(
+          `/api/enroll/v2/node-artifact?serverId=${encodeURIComponent(serverId)}&os=linux&arch=x64`,
+          {
+            headers: {
+              Authorization: `Bearer ${nodeToken}`,
+              [CONTROLLED_NODE_ARTIFACT_HEADERS.EXTERNAL_REDIRECT]: CONTROLLED_NODE_EXTERNAL_REDIRECT_OPT_IN,
+            },
+          },
+        );
+        expect(optInRes.status).toBe(302);
+        expect(optInRes.headers.get('location')).toBe(
+          'https://github.com/im4codes/imcodes/releases/download/controlled-node-v2026.9.1/imcodes-node-linux',
+        );
+        expect(optInRes.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256)).toBe(linuxSha);
+        expect(optInRes.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES)).toBe(String(linuxBytes.length));
+        expect(optInRes.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME)).toBe('imcodes-node-linux');
+
+        // Legacy client without opt-in header continues receiving 200 streamed bytes.
+        const legacyRes = await app.request(
+          `/api/enroll/v2/node-artifact?serverId=${encodeURIComponent(serverId)}&os=linux&arch=x64`,
+          { headers: { Authorization: `Bearer ${nodeToken}` } },
+        );
+        expect(legacyRes.status).toBe(200);
+        expect(Buffer.from(await legacyRes.arrayBuffer())).toEqual(linuxBytes);
+      });
+
+      // Tier 1 overrides Tier 2 when R2 is configured.
+      await withDistributionEnv({
+        CONTROLLED_NODE_ARTIFACT_R2_BASE_URL: 'https://cdn.imcodes.example',
+        CONTROLLED_NODE_ARTIFACT_R2_PREFIX: 'releases/v2026.9.1',
+        CONTROLLED_NODE_ARTIFACT_GITHUB_REPO: 'im4codes/imcodes',
+        CONTROLLED_NODE_ARTIFACT_GITHUB_TAG: 'controlled-node-v2026.9.1',
+      }, async () => {
+        const res = await app.request(
+          `/api/enroll/v2/node-artifact?serverId=${encodeURIComponent(serverId)}&os=linux&arch=x64`,
+          {
+            headers: {
+              Authorization: `Bearer ${nodeToken}`,
+              [CONTROLLED_NODE_ARTIFACT_HEADERS.EXTERNAL_REDIRECT]: CONTROLLED_NODE_EXTERNAL_REDIRECT_OPT_IN,
+            },
+          },
+        );
+        expect(res.status).toBe(302);
+        expect(res.headers.get('location')).toBe(
+          'https://cdn.imcodes.example/releases/v2026.9.1/imcodes-node-linux',
+        );
+      });
+
+      // Mismatched manifest entry fails closed to Docker built-in stream.
+      await writeFile(manifestPath, JSON.stringify({
+        schemaVersion: CONTROLLED_NODE_RELEASE_ARTIFACTS_MANIFEST_SCHEMA_VERSION,
+        version: '2026.9.1',
+        generatedAt: new Date().toISOString(),
+        artifacts: {
+          'node:linux:x64': {
+            asset: CONTROLLED_NODE_ARTIFACT_ASSETS.NODE,
+            assetFilename: 'imcodes-node-linux',
+            relativePath: 'imcodes-node-linux',
+            sha256: 'f'.repeat(64),
+            sizeBytes: linuxBytes.length,
+            version: '2026.9.1',
+          },
+        },
+      }));
+      await withDistributionEnv({
+        CONTROLLED_NODE_ARTIFACT_R2_BASE_URL: 'https://cdn.imcodes.example',
+      }, async () => {
+        const res = await app.request(
+          `/api/enroll/v2/node-artifact?serverId=${encodeURIComponent(serverId)}&os=linux&arch=x64`,
+          {
+            headers: {
+              Authorization: `Bearer ${nodeToken}`,
+              [CONTROLLED_NODE_ARTIFACT_HEADERS.EXTERNAL_REDIRECT]: CONTROLLED_NODE_EXTERNAL_REDIRECT_OPT_IN,
+            },
+          },
+        );
+        expect(res.status).toBe(200);
+        expect(Buffer.from(await res.arrayBuffer())).toEqual(linuxBytes);
+      });
+    } finally {
+      await rm(manifestPath, { force: true });
+    }
   });
 });

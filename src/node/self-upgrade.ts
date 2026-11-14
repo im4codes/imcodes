@@ -25,6 +25,7 @@ import {
 import { DAEMON_UPGRADE_TARGET_LATEST, normalizeDaemonUpgradeTargetVersion } from '../../shared/daemon-upgrade.js';
 import { isTransientRequestFailure } from '../../shared/request-failure.js';
 import { compareImcodesVersions } from '../../shared/imcodes-version.js';
+import { fetchControlledNodeArtifactWithRedirect } from '../util/external-artifact-fetch.js';
 import {
   CONTROLLED_NODE_UPGRADE_RESULT_FILE,
   CONTROLLED_NODE_UPGRADE_RESULT_STATUS,
@@ -837,30 +838,35 @@ async function downloadArtifact(input: {
 }): Promise<{ artifactPath: string; manifestPath: string; sha256: string; sizeBytes: number; filename: string; version?: string; releaseManifestSha256?: string }> {
   const asset = input.asset ?? CONTROLLED_NODE_ARTIFACT_ASSETS.NODE;
   await input.onProgress?.('artifact_request_started');
-  const response = await input.fetchImpl(controlledNodeArtifactUpgradeUrl(input.credential, input.target, asset), {
+  const { response, metadataHeaders } = await fetchControlledNodeArtifactWithRedirect({
+    fetchImpl: input.fetchImpl,
+    url: controlledNodeArtifactUpgradeUrl(input.credential, input.target, asset),
     headers: buildControlledNodeArtifactRequestHeaders(input.credential),
   });
-  if (!response.ok) throw new Error(`download_failed_${response.status}`);
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error(`download_failed_${response.status}`);
+  }
   const abiProfile = normalizeControlledNodeAbiProfile(input.target.abiProfile);
   if (!abiProfile || !isControlledNodeAbiTarget(input.target.os, input.target.arch, abiProfile)) throw new Error('invalid_artifact_abi_profile');
   if (asset === CONTROLLED_NODE_ARTIFACT_ASSETS.NODE) {
-    const responseProfile = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.ABI_PROFILE);
+    const responseProfile = readHeader(metadataHeaders, CONTROLLED_NODE_ARTIFACT_HEADERS.ABI_PROFILE);
     if (normalizeControlledNodeAbiProfile(responseProfile === null ? undefined : responseProfile) !== abiProfile) {
       await response.body?.cancel().catch(() => {});
       throw new Error('artifact_abi_profile_mismatch');
     }
   }
-  const expectedSha = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256);
-  const filename = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME) || basename(defaultStagedExecutablePath());
+  const expectedSha = readHeader(metadataHeaders, CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256);
+  const filename = readHeader(metadataHeaders, CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME) || basename(defaultStagedExecutablePath());
   if (input.expectedFileName && basename(filename) !== input.expectedFileName) throw new Error('artifact_filename_mismatch');
-  const sizeHeader = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES);
-  const versionHeader = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION)?.trim();
+  const sizeHeader = readHeader(metadataHeaders, CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES);
+  const versionHeader = readHeader(metadataHeaders, CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION)?.trim();
   const authenticodeSignerSha256 = readHeader(
-    response.headers,
+    metadataHeaders,
     CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256,
   )?.trim().toLowerCase();
   const releaseManifestSha256 = readHeader(
-    response.headers,
+    metadataHeaders,
     CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256,
   )?.trim().toLowerCase();
   if (!expectedSha || !/^[0-9a-f]{64}$/i.test(expectedSha)) throw new Error('missing_artifact_sha256');
@@ -1039,20 +1045,19 @@ export async function downloadDesktopReleaseManifest(input: {
   expectedVersion?: string;
   expectedSha256?: string;
 }): Promise<DesktopReleaseManifest | undefined> {
-  const response = await input.fetchImpl(
-    controlledNodeArtifactUpgradeUrl(
+  const { response, metadataHeaders } = await fetchControlledNodeArtifactWithRedirect({
+    fetchImpl: input.fetchImpl,
+    url: controlledNodeArtifactUpgradeUrl(
       input.credential,
       input.target,
       CONTROLLED_NODE_ARTIFACT_ASSETS.DESKTOP_RELEASE_MANIFEST,
     ),
-    {
-      headers: {
-        Authorization: `Bearer ${input.credential.token}`,
-        'X-Server-Id': input.credential.serverId,
-        [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: String(REMOTE_DESKTOP_PROTOCOL_VERSION),
-      },
+    headers: {
+      Authorization: `Bearer ${input.credential.token}`,
+      'X-Server-Id': input.credential.serverId,
+      [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: String(REMOTE_DESKTOP_PROTOCOL_VERSION),
     },
-  );
+  });
   if (response.status === 403 || response.status === 404 || response.status === 501 || response.status === 503) {
     await response.body?.cancel().catch(() => {});
     if (input.expectedSha256) {
@@ -1063,7 +1068,7 @@ export async function downloadDesktopReleaseManifest(input: {
   if (!response.ok) {
     throw new Error(`download_failed_${response.status}`);
   }
-  const filenameHeader = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME)?.trim();
+  const filenameHeader = readHeader(metadataHeaders, CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME)?.trim();
   if (filenameHeader && !filenameHeader.endsWith('.manifest.json')) {
     await response.body?.cancel().catch(() => {});
     if (input.expectedSha256) {
@@ -1071,7 +1076,7 @@ export async function downloadDesktopReleaseManifest(input: {
     }
     return undefined;
   }
-  const sizeHeader = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES);
+  const sizeHeader = readHeader(metadataHeaders, CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES);
   const declaredSize = sizeHeader && /^\d+$/.test(sizeHeader) ? Number(sizeHeader) : null;
   if (declaredSize !== null && (!Number.isSafeInteger(declaredSize) || declaredSize > RELEASE_MANIFEST_MAX_DOWNLOAD_BYTES)) {
     await response.body?.cancel().catch(() => {});
@@ -1085,7 +1090,7 @@ export async function downloadDesktopReleaseManifest(input: {
     throw new Error('release_manifest_size_mismatch');
   }
   const actualSha = createHash('sha256').update(bytes).digest('hex');
-  const shaHeader = readHeader(response.headers, CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256)?.trim().toLowerCase();
+  const shaHeader = readHeader(metadataHeaders, CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256)?.trim().toLowerCase();
   if (shaHeader) {
     if (!/^[0-9a-f]{64}$/.test(shaHeader)) {
       throw new Error('release_manifest_invalid_sha256_header');
