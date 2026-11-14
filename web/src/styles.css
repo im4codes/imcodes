@@ -19392,20 +19392,39 @@ button.quick-agent-delegation-preset.active {
   flex-direction: column;
   align-items: center;
   text-align: center;
-  gap: 8px;
-  min-width: 0;
+  gap: 10px;
+  min-width: 280px;
   max-width: min(88vw, 960px);
-  padding: 0;
-  border-radius: 0;
-  background: transparent;
-  border: none;
-  box-shadow: none;
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
+  padding: 20px 36px;
+  border-radius: 18px;
+  background: rgba(15, 23, 42, 0.78);
+  border: 2px solid rgba(56, 189, 248, 0.9);
+  box-shadow:
+    0 24px 60px rgba(2, 6, 23, 0.55),
+    0 0 28px rgba(56, 189, 248, 0.24),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(16px) saturate(150%);
+  -webkit-backdrop-filter: blur(16px) saturate(150%);
   opacity: 1;
   transform: scale(1) translateY(0);
   animation: server-switch-hud-in 140ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
   transition: opacity 200ms ease-out, transform 200ms ease-out;
+}
+
+.server-switch-watermark-card.is-server {
+  border-color: rgba(56, 189, 248, 0.9);
+  box-shadow:
+    0 24px 60px rgba(2, 6, 23, 0.55),
+    0 0 28px rgba(56, 189, 248, 0.24),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+.server-switch-watermark-card.is-session {
+  border-color: rgba(251, 191, 36, 0.9);
+  box-shadow:
+    0 24px 60px rgba(2, 6, 23, 0.55),
+    0 0 28px rgba(251, 191, 36, 0.24),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
 }
 
 .server-switch-watermark.is-exiting .server-switch-watermark-card {
@@ -19423,12 +19442,12 @@ button.quick-agent-delegation-preset.active {
 }
 
 .server-switch-watermark-server-name {
-  font-size: clamp(32px, 5vw, 58px);
+  font-size: clamp(42px, 6.2vw, 76px);
   font-weight: 700;
-  line-height: 1.15;
+  line-height: 1.12;
   letter-spacing: -0.02em;
-  color: rgba(248, 250, 252, 0.38);
-  text-shadow: 0 2px 12px rgba(2, 6, 23, 0.22);
+  color: rgba(248, 250, 252, 0.92);
+  text-shadow: 0 2px 14px rgba(2, 6, 23, 0.45);
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -19444,19 +19463,19 @@ button.quick-agent-delegation-preset.active {
   justify-content: center;
   max-width: 100%;
   min-width: 0;
-  color: rgba(226, 232, 240, 0.30);
+  color: rgba(226, 232, 240, 0.85);
 }
 
 .server-switch-watermark-session.is-muted {
-  color: rgba(148, 163, 184, 0.28);
+  color: rgba(148, 163, 184, 0.80);
 }
 
 .server-switch-watermark-session-name {
-  font-size: clamp(16px, 2.4vw, 26px);
-  font-weight: 500;
-  line-height: 1.25;
+  font-size: clamp(24px, 3.4vw, 40px);
+  font-weight: 550;
+  line-height: 1.22;
   color: inherit;
-  text-shadow: 0 1px 8px rgba(2, 6, 23, 0.18);
+  text-shadow: 0 1px 10px rgba(2, 6, 23, 0.35);
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -19468,7 +19487,7 @@ button.quick-agent-delegation-preset.active {
   align-items: center;
   justify-content: center;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 8px;
   margin-top: 4px;
 }
 
@@ -19476,37 +19495,63 @@ button.quick-agent-delegation-preset.active {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 0;
+  min-width: 26px;
   height: auto;
-  padding: 0 2px;
-  border-radius: 0;
-  border: none;
-  background: transparent;
-  color: rgba(203, 213, 225, 0.26);
+  padding: 3px 9px;
+  border-radius: 7px;
+  border: 1px solid rgba(148, 163, 184, 0.36);
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(226, 232, 240, 0.86);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: clamp(12px, 1.4vw, 15px);
+  font-size: clamp(13px, 1.5vw, 18px);
   font-weight: 600;
   line-height: 1.2;
   letter-spacing: 0.04em;
 }
 
 @media (prefers-color-scheme: light) {
+  .server-switch-watermark-card {
+    background: rgba(255, 255, 255, 0.84);
+    box-shadow:
+      0 24px 60px rgba(15, 23, 42, 0.16),
+      0 0 24px rgba(2, 132, 199, 0.18),
+      inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  }
+
+  .server-switch-watermark-card.is-server {
+    border-color: rgba(2, 132, 199, 0.88);
+    box-shadow:
+      0 24px 60px rgba(15, 23, 42, 0.16),
+      0 0 24px rgba(2, 132, 199, 0.18),
+      inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  }
+
+  .server-switch-watermark-card.is-session {
+    border-color: rgba(217, 119, 6, 0.88);
+    box-shadow:
+      0 24px 60px rgba(15, 23, 42, 0.16),
+      0 0 24px rgba(217, 119, 6, 0.18),
+      inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  }
+
   .server-switch-watermark-server-name {
-    color: rgba(15, 23, 42, 0.30);
-    text-shadow: 0 1px 8px rgba(255, 255, 255, 0.35);
+    color: rgba(15, 23, 42, 0.90);
+    text-shadow: 0 1px 8px rgba(255, 255, 255, 0.45);
   }
 
   .server-switch-watermark-session {
-    color: rgba(51, 65, 85, 0.24);
-    text-shadow: 0 1px 6px rgba(255, 255, 255, 0.30);
+    color: rgba(51, 65, 85, 0.80);
+    text-shadow: 0 1px 6px rgba(255, 255, 255, 0.35);
   }
 
   .server-switch-watermark-session.is-muted {
-    color: rgba(100, 116, 139, 0.22);
+    color: rgba(100, 116, 139, 0.78);
   }
 
   .server-switch-watermark-kbd {
-    color: rgba(51, 65, 85, 0.22);
+    border-color: rgba(15, 23, 42, 0.18);
+    background: rgba(15, 23, 42, 0.06);
+    color: rgba(30, 41, 59, 0.84);
   }
 }
 
@@ -19527,18 +19572,19 @@ button.quick-agent-delegation-preset.active {
   }
 
   .server-switch-watermark-card {
-    min-width: 0;
+    min-width: 220px;
     max-width: calc(100vw - 32px);
-    padding: 0;
-    gap: 6px;
+    padding: 14px 22px;
+    border-radius: 16px;
+    gap: 8px;
   }
 
   .server-switch-watermark-server-name {
-    font-size: clamp(24px, 7.5vw, 40px);
+    font-size: clamp(30px, 8.5vw, 48px);
   }
 
   .server-switch-watermark-session-name {
-    font-size: clamp(14px, 4.2vw, 20px);
+    font-size: clamp(18px, 5vw, 28px);
   }
 }
 
@@ -19692,7 +19738,8 @@ html.native-ios-mac .btn.desktop-cloud-docs-marquee-btn {
 :is(html.native-ios-mac, html.native-mac-desktop) .download-transfer-center,
 :is(html.native-ios-mac, html.native-mac-desktop) .capability-global-operation .capability-operation-card,
 :is(html.native-ios-mac, html.native-mac-desktop) .task-pair-card-hover-preview,
-:is(html.native-ios-mac, html.native-mac-desktop) .cloud-docs-modal-backdrop {
+:is(html.native-ios-mac, html.native-mac-desktop) .cloud-docs-modal-backdrop,
+:is(html.native-ios-mac, html.native-mac-desktop) .server-switch-watermark-card {
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
 }
@@ -19765,4 +19812,8 @@ html.native-ios-mac .btn.desktop-cloud-docs-marquee-btn {
 
 :is(html.native-ios-mac, html.native-mac-desktop) .remote-desktop-touch-hint {
   background: rgb(5 20 34 / 86%);
+}
+
+:is(html.native-ios-mac, html.native-mac-desktop) .server-switch-watermark-card {
+  background: rgba(13, 20, 34, 0.94);
 }

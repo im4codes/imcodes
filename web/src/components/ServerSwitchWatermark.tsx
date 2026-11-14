@@ -7,11 +7,14 @@ import { useEffect, useState } from 'preact/hooks';
 export const SERVER_SWITCH_WATERMARK_HOLD_MS = 1000;
 export const SERVER_SWITCH_WATERMARK_EXIT_MS = 200;
 
+export type ServerSwitchWatermarkKind = 'server' | 'session';
+
 export interface ServerSwitchWatermarkProps {
   visible: boolean;
   triggerKey: number;
   serverName: string;
   sessionName: string | null;
+  switchKind?: ServerSwitchWatermarkKind;
   fallbackLabel?: string | null;
   shortcutKeycaps?: readonly string[];
   onDismiss: () => void;
@@ -24,6 +27,7 @@ export function ServerSwitchWatermark({
   triggerKey,
   serverName,
   sessionName,
+  switchKind = 'server',
   fallbackLabel = null,
   shortcutKeycaps = [],
   onDismiss,
@@ -64,12 +68,13 @@ export function ServerSwitchWatermark({
 
   return (
     <div
-      class={`server-switch-watermark${exiting ? ' is-exiting' : ''}`}
+      class={`server-switch-watermark is-${switchKind}${exiting ? ' is-exiting' : ''}`}
       data-testid="server-switch-watermark"
       data-state={exiting ? 'exiting' : 'visible'}
+      data-switch-kind={switchKind}
       aria-hidden="true"
     >
-      <div class="server-switch-watermark-card">
+      <div class={`server-switch-watermark-card is-${switchKind}`}>
         <div class="server-switch-watermark-server">
           <span class="server-switch-watermark-server-name" data-testid="server-switch-watermark-server">
             {serverName}

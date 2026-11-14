@@ -62,6 +62,7 @@ describe('ServerSwitchWatermark browser animation & cascade', () => {
           triggerKey: 1,
           serverName: 'Server One',
           sessionName: 'alpha',
+          switchKind: 'server',
           shortcutKeycaps: ['Ctrl', '↓'],
           holdMs: 220,
           exitMs: 240,
@@ -74,43 +75,42 @@ describe('ServerSwitchWatermark browser animation & cascade', () => {
       const heldStyle = await page.evaluate(() => {
         const card = document.querySelector('.server-switch-watermark-card') as HTMLElement;
         const serverName = document.querySelector('.server-switch-watermark-server-name') as HTMLElement;
-        const session = document.querySelector('.server-switch-watermark-session') as HTMLElement;
+        const sessionName = document.querySelector('.server-switch-watermark-session-name') as HTMLElement;
         const kbd = document.querySelector('.server-switch-watermark-kbd') as HTMLElement;
         const cs = getComputedStyle(card);
         const serverCs = getComputedStyle(serverName);
-        const sessionCs = getComputedStyle(session);
+        const sessionCs = getComputedStyle(sessionName);
         const kbdCs = getComputedStyle(kbd);
         return {
           state: card.parentElement?.getAttribute('data-state'),
+          switchKind: card.parentElement?.getAttribute('data-switch-kind'),
           opacity: Number(cs.opacity),
           transform: cs.transform,
           pointerEvents: cs.pointerEvents,
           backgroundColor: cs.backgroundColor,
           borderStyle: cs.borderTopStyle,
+          borderWidth: cs.borderTopWidth,
+          borderColor: cs.borderTopColor,
           boxShadow: cs.boxShadow,
-          backdropFilter: cs.backdropFilter,
           serverFontSize: parseFloat(serverCs.fontSize),
           serverColor: serverCs.color,
+          sessionFontSize: parseFloat(sessionCs.fontSize),
           sessionColor: sessionCs.color,
-          kbdBackgroundColor: kbdCs.backgroundColor,
-          kbdBorderStyle: kbdCs.borderTopStyle,
-          kbdColor: kbdCs.color,
+          kbdFontSize: parseFloat(kbdCs.fontSize),
           activeId: document.activeElement?.id,
         };
       });
       expect(heldStyle.state).toBe('visible');
+      expect(heldStyle.switchKind).toBe('server');
       expect(heldStyle.opacity).toBeGreaterThan(0.99);
       expect(heldStyle.pointerEvents).toBe('none');
-      expect(heldStyle.backgroundColor).toBe('rgba(0, 0, 0, 0)');
-      expect(heldStyle.borderStyle).toBe('none');
-      expect(heldStyle.boxShadow).toBe('none');
-      expect(heldStyle.backdropFilter).toBe('none');
-      expect(heldStyle.serverFontSize).toBeGreaterThanOrEqual(48);
-      expect(heldStyle.serverColor).toMatch(/^rgba\([^)]+,\s*0\.\d+\)$/);
-      expect(heldStyle.sessionColor).toMatch(/^rgba\([^)]+,\s*0\.\d+\)$/);
-      expect(heldStyle.kbdBackgroundColor).toBe('rgba(0, 0, 0, 0)');
-      expect(heldStyle.kbdBorderStyle).toBe('none');
-      expect(heldStyle.kbdColor).toMatch(/^rgba\([^)]+,\s*0\.\d+\)$/);
+      expect(heldStyle.backgroundColor).not.toBe('rgba(0, 0, 0, 0)');
+      expect(heldStyle.borderStyle).toBe('solid');
+      expect(heldStyle.borderWidth).toBe('2px');
+      expect(heldStyle.boxShadow).not.toBe('none');
+      expect(heldStyle.serverFontSize).toBeGreaterThanOrEqual(60);
+      expect(heldStyle.sessionFontSize).toBeGreaterThanOrEqual(32);
+      expect(heldStyle.kbdFontSize).toBeGreaterThanOrEqual(14);
       expect(heldStyle.activeId).toBe('focus-guard');
 
       await page.waitForFunction(() => document.querySelector('.server-switch-watermark')?.getAttribute('data-state') === 'exiting');
@@ -130,7 +130,7 @@ describe('ServerSwitchWatermark browser animation & cascade', () => {
       expect(midExit.opacity).toBeGreaterThan(0);
       expect(midExit.transform).not.toBe(heldStyle.transform);
 
-      // 2. Rapid retrigger mid-exit restores visible opacity=1 cleanly, updates server/keycaps, cancels old dismiss, then exits cleanly
+      // 2. Rapid retrigger mid-exit switches cleanly to session mode with a distinct border color, restores visible opacity=1 cleanly, then exits cleanly
       await page.evaluate(() => {
         const w = window as unknown as {
           __mountHud: (p: Record<string, unknown>) => void;
@@ -138,14 +138,15 @@ describe('ServerSwitchWatermark browser animation & cascade', () => {
         };
         const onDismiss = () => {
           w.__dismissCount = (w.__dismissCount ?? 0) + 1;
-          w.__mountHud({ visible: false, triggerKey: 2, serverName: 'Server Two', sessionName: 'delta', shortcutKeycaps: ['Ctrl', '↑'], onDismiss });
+          w.__mountHud({ visible: false, triggerKey: 2, serverName: 'Server Two', sessionName: 'delta', switchKind: 'session', shortcutKeycaps: ['Ctrl', '→'], onDismiss });
         };
         w.__mountHud({
           visible: true,
           triggerKey: 2,
           serverName: 'Server Two',
           sessionName: 'delta',
-          shortcutKeycaps: ['Ctrl', '↑'],
+          switchKind: 'session',
+          shortcutKeycaps: ['Ctrl', '→'],
           holdMs: 220,
           exitMs: 240,
           onDismiss,
@@ -153,10 +154,15 @@ describe('ServerSwitchWatermark browser animation & cascade', () => {
       });
 
       expect(await page.locator('[data-testid="server-switch-watermark"]').getAttribute('data-state')).toBe('visible');
+      expect(await page.locator('[data-testid="server-switch-watermark"]').getAttribute('data-switch-kind')).toBe('session');
       expect(await page.locator('[data-testid="server-switch-watermark-server"]').textContent()).toBe('Server Two');
       await page.waitForTimeout(190);
-      const retriggeredOpacity = await page.evaluate(() => Number(getComputedStyle(document.querySelector('.server-switch-watermark-card') as HTMLElement).opacity));
-      expect(retriggeredOpacity).toBeGreaterThan(0.99);
+      const retriggered = await page.evaluate(() => {
+        const cs = getComputedStyle(document.querySelector('.server-switch-watermark-card') as HTMLElement);
+        return { opacity: Number(cs.opacity), borderColor: cs.borderTopColor };
+      });
+      expect(retriggered.opacity).toBeGreaterThan(0.99);
+      expect(retriggered.borderColor).not.toBe(heldStyle.borderColor);
       expect(await page.evaluate(() => (window as unknown as { __dismissCount: number }).__dismissCount)).toBe(0);
 
       await page.waitForFunction(() => document.querySelector('.server-switch-watermark')?.getAttribute('data-state') === 'exiting');
@@ -167,7 +173,7 @@ describe('ServerSwitchWatermark browser animation & cascade', () => {
       await page.waitForFunction(() => (window as unknown as { __dismissCount: number }).__dismissCount === 1);
       expect(await page.locator('.server-switch-watermark').count()).toBe(0);
 
-      // 3. Reduced motion disables entry animation & exit transition cleanly
+      // 3. Reduced motion + light scheme keeps distinct server vs session colored borders and disables animation/transition
       const reducedPage = await browser.newPage({ viewport: { width: 1100, height: 800 }, colorScheme: 'light', reducedMotion: 'reduce' });
       await reducedPage.setContent(`<style>${css}</style><div id="root"></div>`);
       await reducedPage.addScriptTag({ content: bundleCode });
@@ -178,6 +184,7 @@ describe('ServerSwitchWatermark browser animation & cascade', () => {
           triggerKey: 1,
           serverName: 'Light Server',
           sessionName: 'beta',
+          switchKind: 'server',
           shortcutKeycaps: ['⌘', '↓'],
           holdMs: 120,
           exitMs: 120,
@@ -186,24 +193,39 @@ describe('ServerSwitchWatermark browser animation & cascade', () => {
       });
       const reducedHold = await reducedPage.evaluate(() => {
         const card = document.querySelector('.server-switch-watermark-card') as HTMLElement;
-        const serverName = document.querySelector('.server-switch-watermark-server-name') as HTMLElement;
         const cs = getComputedStyle(card);
-        const serverCs = getComputedStyle(serverName);
         return {
           animationName: cs.animationName,
           transitionDuration: cs.transitionDuration,
           opacity: cs.opacity,
           backgroundColor: cs.backgroundColor,
-          boxShadow: cs.boxShadow,
-          serverColor: serverCs.color,
+          borderColor: cs.borderTopColor,
+          borderStyle: cs.borderTopStyle,
         };
       });
       expect(reducedHold.animationName).toBe('none');
       expect(reducedHold.transitionDuration).toBe('0s');
       expect(reducedHold.opacity).toBe('1');
-      expect(reducedHold.backgroundColor).toBe('rgba(0, 0, 0, 0)');
-      expect(reducedHold.boxShadow).toBe('none');
-      expect(reducedHold.serverColor).toMatch(/^rgba\([^)]+,\s*0\.\d+\)$/);
+      expect(reducedHold.backgroundColor).not.toBe('rgba(0, 0, 0, 0)');
+      expect(reducedHold.borderStyle).toBe('solid');
+      expect(reducedHold.borderColor).not.toBe(heldStyle.borderColor);
+
+      await reducedPage.evaluate(() => {
+        const w = window as unknown as { __mountHud: (p: Record<string, unknown>) => void };
+        w.__mountHud({
+          visible: true,
+          triggerKey: 2,
+          serverName: 'Light Server',
+          sessionName: 'gamma',
+          switchKind: 'session',
+          shortcutKeycaps: ['⌃', 'D'],
+          holdMs: 120,
+          exitMs: 120,
+          onDismiss: () => w.__mountHud({ visible: false, triggerKey: 2, serverName: 'Light Server', sessionName: 'gamma', onDismiss: () => {} }),
+        });
+      });
+      const reducedSessionBorder = await reducedPage.evaluate(() => getComputedStyle(document.querySelector('.server-switch-watermark-card') as HTMLElement).borderTopColor);
+      expect(reducedSessionBorder).not.toBe(reducedHold.borderColor);
 
       await reducedPage.waitForFunction(() => document.querySelector('.server-switch-watermark')?.getAttribute('data-state') === 'exiting');
       const reducedExit = await reducedPage.evaluate(() => {

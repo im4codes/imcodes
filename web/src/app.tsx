@@ -7455,6 +7455,7 @@ function InternalMainApp() {
     serverId: string;
     serverName: string;
     sessionName?: string | null;
+    switchKind: 'server' | 'session';
     shortcutKeycaps: string[];
     nonce: number;
   } | null>(null);
@@ -7502,6 +7503,7 @@ function InternalMainApp() {
       setServerSwitchWatermark((prev) => ({
         serverId: nextServer.id,
         serverName: nextServer.name || nextServer.id,
+        switchKind: 'server',
         shortcutKeycaps: [...shortcutKeycaps],
         nonce: (prev?.nonce ?? 0) + 1,
       }));
@@ -7537,6 +7539,7 @@ function InternalMainApp() {
           serverId,
           serverName,
           sessionName: sessionLabel,
+          switchKind: 'session',
           shortcutKeycaps: [...watermarkKeycaps],
           nonce: (prev?.nonce ?? 0) + 1,
         }));
@@ -7583,7 +7586,8 @@ function InternalMainApp() {
         return;
       }
 
-      if (!navigateTabByStep(action === 'tabNext' ? 1 : -1)) return;
+      const shortcutKeycaps = formatShortcutKeycaps(resolvedShortcutsRef.current[action], isMacPlatform());
+      if (!navigateTabByStep(action === 'tabNext' ? 1 : -1, shortcutKeycaps)) return;
       e.preventDefault();
       e.stopPropagation();
     };
@@ -10331,6 +10335,7 @@ function InternalMainApp() {
             triggerKey={serverSwitchWatermark?.nonce ?? 0}
             serverName={serverSwitchWatermark?.serverName ?? ''}
             sessionName={watermarkSessionName}
+            switchKind={serverSwitchWatermark?.switchKind}
             fallbackLabel={watermarkFallbackLabel}
             shortcutKeycaps={serverSwitchWatermark?.shortcutKeycaps}
             onDismiss={dismissServerSwitchWatermark}

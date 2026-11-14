@@ -48,7 +48,9 @@ describe('ServerSwitchWatermark', () => {
     const hud = screen.getByTestId('server-switch-watermark');
     expect(hud.getAttribute('aria-hidden')).toBe('true');
     expect(hud.getAttribute('data-state')).toBe('visible');
+    expect(hud.getAttribute('data-switch-kind')).toBe('server');
     expect(hud.className).toContain('server-switch-watermark');
+    expect(hud.className).toContain('is-server');
     expect(hud.className).not.toContain('is-exiting');
 
     expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('prod-eu');
@@ -227,7 +229,41 @@ describe('ServerSwitchWatermark', () => {
     expect(onDismiss).not.toHaveBeenCalled();
   });
 
-  it('defines transparent borderless large-type watermark CSS rules with translucent text in dark, light, mobile, and reduced-motion modes', () => {
+  it('distinguishes session vs server switchKind attributes and classes', () => {
+    const { rerender } = render(
+      <ServerSwitchWatermark
+        visible
+        triggerKey={1}
+        serverName="prod-eu"
+        sessionName="deck_api_brain"
+        switchKind="server"
+        shortcutKeycaps={['Ctrl', 'S']}
+        onDismiss={vi.fn()}
+      />,
+    );
+    const serverHud = screen.getByTestId('server-switch-watermark');
+    expect(serverHud.getAttribute('data-switch-kind')).toBe('server');
+    expect(serverHud.className).toContain('is-server');
+    expect(serverHud.querySelector('.server-switch-watermark-card')?.className).toContain('is-server');
+
+    rerender(
+      <ServerSwitchWatermark
+        visible
+        triggerKey={2}
+        serverName="prod-eu"
+        sessionName="deck_worker_brain"
+        switchKind="session"
+        shortcutKeycaps={['Ctrl', 'D']}
+        onDismiss={vi.fn()}
+      />,
+    );
+    const sessionHud = screen.getByTestId('server-switch-watermark');
+    expect(sessionHud.getAttribute('data-switch-kind')).toBe('session');
+    expect(sessionHud.className).toContain('is-session');
+    expect(sessionHud.querySelector('.server-switch-watermark-card')?.className).toContain('is-session');
+  });
+
+  it('defines large-font, distinct server/session colored borders, dark/light contrast, mobile, and reduced-motion CSS rules', () => {
     const here = dirname(fileURLToPath(import.meta.url));
     const css = readFileSync(resolve(here, '../../src/styles.css'), 'utf8');
     const blockStart = css.indexOf('.server-switch-watermark {');
@@ -235,16 +271,15 @@ describe('ServerSwitchWatermark', () => {
     const tail = css.slice(blockStart);
 
     expect(tail).toMatch(/\.server-switch-watermark\s*\{[\s\S]*position:\s*fixed;[\s\S]*inset:\s*0;[\s\S]*pointer-events:\s*none;[\s\S]*user-select:\s*none;/);
-    expect(tail).toMatch(/\.server-switch-watermark-card\s*\{[\s\S]*background:\s*transparent;[\s\S]*border:\s*none;[\s\S]*box-shadow:\s*none;[\s\S]*backdrop-filter:\s*none;[\s\S]*-webkit-backdrop-filter:\s*none;/);
-    expect(tail).toMatch(/\.server-switch-watermark-server-name\s*\{[\s\S]*font-size:\s*clamp\(32px,\s*5vw,\s*58px\);[\s\S]*color:\s*rgba\([^)]+,\s*0\.\d+\);/);
-    expect(tail).toMatch(/\.server-switch-watermark-session-name\s*\{[\s\S]*font-size:\s*clamp\(16px,\s*2\.4vw,\s*26px\);/);
-    expect(tail).toMatch(/\.server-switch-watermark-kbd\s*\{[\s\S]*border:\s*none;[\s\S]*background:\s*transparent;[\s\S]*color:\s*rgba\([^)]+,\s*0\.\d+\);/);
+    expect(tail).toMatch(/\.server-switch-watermark-card\s*\{[\s\S]*background:\s*rgba\(15,\s*23,\s*42,\s*0\.78\);[\s\S]*border:\s*2px\s+solid\s+rgba\(/);
+    expect(tail).toMatch(/\.server-switch-watermark-card\.is-server\s*\{[\s\S]*border-color:\s*rgba\(/);
+    expect(tail).toMatch(/\.server-switch-watermark-card\.is-session\s*\{[\s\S]*border-color:\s*rgba\(/);
+    expect(tail).toMatch(/\.server-switch-watermark-server-name\s*\{[\s\S]*font-size:\s*clamp\(42px,\s*6\.2vw,\s*76px\);[\s\S]*color:\s*rgba\(248,\s*250,\s*252,\s*0\.92\);/);
+    expect(tail).toMatch(/\.server-switch-watermark-session-name\s*\{[\s\S]*font-size:\s*clamp\(24px,\s*3\.4vw,\s*40px\);/);
+    expect(tail).toMatch(/\.server-switch-watermark-kbd\s*\{[\s\S]*font-size:\s*clamp\(13px,\s*1\.5vw,\s*18px\);/);
     expect(tail).toContain('@media (prefers-color-scheme: light)');
     expect(tail).toContain('@media (prefers-reduced-motion: reduce)');
-    expect(tail).toMatch(/@media \(max-width: 480px\)[\s\S]*\.server-switch-watermark-server-name\s*\{[\s\S]*font-size:\s*clamp\(24px,\s*7\.5vw,\s*40px\);/);
-    expect(css).not.toContain('.server-switch-watermark-icon');
-    expect(css).not.toContain('.server-switch-watermark-divider');
-    expect(css).not.toContain('.server-switch-watermark-session-dot');
-    expect(css).not.toContain(':is(html.native-ios-mac, html.native-mac-desktop) .server-switch-watermark-card');
+    expect(tail).toMatch(/@media \(max-width: 480px\)[\s\S]*\.server-switch-watermark-server-name\s*\{[\s\S]*font-size:\s*clamp\(30px,\s*8\.5vw,\s*48px\);[\s\S]*\.server-switch-watermark-session-name\s*\{[\s\S]*font-size:\s*clamp\(18px,\s*5vw,\s*28px\);/);
+    expect(css).toContain(':is(html.native-ios-mac, html.native-mac-desktop) .server-switch-watermark-card');
   });
 });

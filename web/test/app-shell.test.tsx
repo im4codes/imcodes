@@ -8709,6 +8709,12 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       alphaComposer.dispatchEvent(plusEvt);
       expect(plusEvt.defaultPrevented).toBe(true);
       await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+      const sessionHud = screen.getByTestId('server-switch-watermark');
+      expect(sessionHud.getAttribute('data-switch-kind')).toBe('session');
+      expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('beta');
+      expect(
+        Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent),
+      ).toEqual(['Ctrl', 'Shift', '+']);
 
       // Press Shift+PageDown inside composer -> switches server to srv-2
       const betaComposer = screen.getByTestId('pane-composer-deck_beta_brain');
@@ -8717,6 +8723,7 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       betaComposer.dispatchEvent(pageDownEvt);
       expect(pageDownEvt.defaultPrevented).toBe(true);
       await waitFor(() => expect(localStorage.getItem('rcc_server')).toBe('srv-2'));
+      expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('server');
       const customKeycaps = Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent);
       expect(customKeycaps).toEqual(['Shift', 'PgDn']);
     } finally {
@@ -8853,6 +8860,8 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
 
       const hud = await screen.findByTestId('server-switch-watermark');
       expect(hud.getAttribute('aria-hidden')).toBe('true');
+      expect(hud.getAttribute('data-switch-kind')).toBe('server');
+      expect(hud.className).toContain('is-server');
       expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server Two');
       expect(
         Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent),
@@ -8911,6 +8920,10 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     await screen.findByTestId('session-pane-deck_alpha_brain');
     expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
 
+    fireEvent.click(screen.getByText('tabs-select-deck_beta_brain'));
+    await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+    expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+
     fireEvent.click(screen.getByText('server-select-srv-2'));
     await screen.findByTestId('session-pane-deck_delta_brain');
     expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
@@ -8935,8 +8948,85 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       expect(ctrlS.defaultPrevented).toBe(true);
 
       await waitFor(() => expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server Two'));
+      expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('server');
       const macKeycaps = Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent);
       expect(macKeycaps).toEqual(['⌃', 'S']);
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  }, 15000);
+
+  it('shows session switch watermark with platform keycaps on Win32 and macOS keyboard tab switches', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Win32' });
+    try {
+      const { App } = await importApp();
+      const firstRender = render(<App />);
+
+      const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+
+      // Win32 Alt+L -> tabNext (deck_beta_brain) shows session watermark
+      const altL = new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(altL);
+      expect(altL.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+
+      const winHud = screen.getByTestId('server-switch-watermark');
+      expect(winHud.getAttribute('aria-hidden')).toBe('true');
+      expect(winHud.getAttribute('data-switch-kind')).toBe('session');
+      expect(winHud.className).toContain('is-session');
+      expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server One');
+      expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('beta');
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['Alt', 'L']);
+
+      // Win32 Alt+J -> tabPrev (deck_alpha_brain) updates watermark and keeps composer focus
+      const betaComposer = screen.getByTestId('pane-composer-deck_beta_brain');
+      await waitFor(() => expect(document.activeElement).toBe(betaComposer));
+      const altJ = new KeyboardEvent('keydown', { key: 'j', code: 'KeyJ', altKey: true, bubbles: true, cancelable: true });
+      betaComposer.dispatchEvent(altJ);
+      expect(altJ.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('session');
+      expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('alpha');
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['Alt', 'J']);
+      await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
+
+      firstRender.unmount();
+
+      // macOS unified Ctrl+D / Ctrl+A -> session watermark with Mac keycaps
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: 'MacIntel' });
+      render(<App />);
+
+      const macAlphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(macAlphaComposer));
+      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+
+      const ctrlD = new KeyboardEvent('keydown', { key: 'd', code: 'KeyD', ctrlKey: true, bubbles: true, cancelable: true });
+      macAlphaComposer.dispatchEvent(ctrlD);
+      expect(ctrlD.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+
+      expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('session');
+      expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('beta');
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['⌃', 'D']);
+
+      const macBetaComposer = screen.getByTestId('pane-composer-deck_beta_brain');
+      await waitFor(() => expect(document.activeElement).toBe(macBetaComposer));
+      const ctrlA = new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', ctrlKey: true, bubbles: true, cancelable: true });
+      macBetaComposer.dispatchEvent(ctrlA);
+      expect(ctrlA.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('session');
+      expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('alpha');
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['⌃', 'A']);
     } finally {
       Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
     }
@@ -8999,6 +9089,7 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
         [{ identifier: 1, clientX: 160, clientY: 202 }, { identifier: 2, clientX: 164, clientY: 252 }],
       );
       await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('session');
       expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server One');
       expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('beta');
       expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['2F', '→']);
@@ -9011,6 +9102,7 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
         [{ identifier: 1, clientX: 120, clientY: 202 }, { identifier: 2, clientX: 124, clientY: 248 }],
       );
       await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('session');
       expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server One');
       expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('alpha');
       expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['2F', '←']);
@@ -9022,6 +9114,7 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
         [{ identifier: 1, clientX: 122, clientY: 240 }, { identifier: 2, clientX: 172, clientY: 244 }],
       );
       await screen.findByTestId('session-pane-deck_delta_brain');
+      expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('server');
       expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server Two');
       expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['2F', '↓']);
 
@@ -9042,6 +9135,7 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
         [{ identifier: 1, clientX: 118, clientY: 180 }, { identifier: 2, clientX: 168, clientY: 184 }],
       );
       await waitFor(() => expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server One'));
+      expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('server');
       expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['2F', '↑']);
     } finally {
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
