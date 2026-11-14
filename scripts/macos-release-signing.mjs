@@ -8,13 +8,15 @@
 
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { macosArtifactCanCarryNotarizationTicket } from '../src/node/macos-apple-trust.mjs';
 
 export const MACOS_RELEASE_SIGNING_TOOLS = Object.freeze({
   security: '/usr/bin/security',
   codesign: '/usr/bin/codesign',
+  productsign: '/usr/bin/productsign',
+  pkgutil: '/usr/sbin/pkgutil',
   xcrun: '/usr/bin/xcrun',
   spctl: '/usr/sbin/spctl',
   ditto: '/usr/bin/ditto',
@@ -34,10 +36,13 @@ const IDENTITY_LINE_RE = /^\s*\d+\)\s+([A-F0-9]{40})\s+"([^"]+)"\s*$/gmu;
  * can still be useful.
  */
 export function selectDeveloperIdSigningIdentity(findIdentityOutput, options = {}) {
-  const { teamId } = options;
+  const { teamId, certificateType = 'application' } = options;
   if (typeof teamId !== 'string' || !TEAM_ID_RE.test(teamId)) {
     throw new Error('macOS release signing requires a 10-character Apple Team ID');
   }
+  const wanted = certificateType === 'installer'
+    ? 'Developer ID Installer:'
+    : 'Developer ID Application:';
   const identities = [];
   for (const match of String(findIdentityOutput ?? '').matchAll(IDENTITY_LINE_RE)) {
     identities.push({ sha1: match[1], commonName: match[2] });
@@ -46,31 +51,30 @@ export function selectDeveloperIdSigningIdentity(findIdentityOutput, options = {
     throw new Error('no code-signing identities were found in the signing keychain');
   }
 
-  const wanted = `Developer ID Application:`;
   const developerId = identities.filter((identity) => identity.commonName.startsWith(wanted));
   if (developerId.length === 0) {
     const development = identities.filter((identity) => identity.commonName.startsWith('Apple Development:'));
-    if (development.length > 0) {
+    if (certificateType === 'application' && development.length > 0) {
       throw new Error(
         'the signing keychain holds an "Apple Development" certificate, not "Developer ID Application". '
         + 'A development certificate signs successfully and is then rejected by notarization, so it cannot '
         + 'produce a release build. Create a Developer ID Application certificate for this team.',
       );
     }
-    throw new Error(`no "Developer ID Application" certificate was found; keychain holds: ${identities.map((i) => i.commonName).join(', ')}`);
+    throw new Error(`no "${wanted.slice(0, -1)}" certificate was found; keychain holds: ${identities.map((i) => i.commonName).join(', ')}`);
   }
 
   const teamMatched = developerId.filter((identity) => identity.commonName.endsWith(`(${teamId})`));
   if (teamMatched.length === 0) {
     throw new Error(
-      `no Developer ID Application certificate belongs to team ${teamId}; found: ${developerId.map((i) => i.commonName).join(', ')}`,
+      `no ${wanted.slice(0, -1)} certificate belongs to team ${teamId}; found: ${developerId.map((i) => i.commonName).join(', ')}`,
     );
   }
   if (teamMatched.length > 1) {
     // Ambiguity is refused, never resolved by ordering: two valid certificates
     // mean the operator has to say which one a release was signed with.
     throw new Error(
-      `the signing keychain holds ${teamMatched.length} Developer ID Application certificates for team ${teamId}; `
+      `the signing keychain holds ${teamMatched.length} ${wanted.slice(0, -1)} certificates for team ${teamId}; `
       + `refusing to guess: ${teamMatched.map((i) => `${i.sha1} ${i.commonName}`).join(' | ')}`,
     );
   }
@@ -178,7 +182,9 @@ export function importSigningIdentity(input) {
   const pkcs12Path = `${keychainPath}.p12`;
   writeFileSync(pkcs12Path, Buffer.from(pkcs12Base64, 'base64'), { mode: 0o600 });
   try {
-    run(MACOS_RELEASE_SIGNING_TOOLS.security, ['create-keychain', '-p', keychainPassword, keychainPath]);
+    if (!existsSync(keychainPath)) {
+      run(MACOS_RELEASE_SIGNING_TOOLS.security, ['create-keychain', '-p', keychainPassword, keychainPath]);
+    }
     run(MACOS_RELEASE_SIGNING_TOOLS.security, ['set-keychain-settings', '-lut', '21600', keychainPath]);
     run(MACOS_RELEASE_SIGNING_TOOLS.security, ['unlock-keychain', '-p', keychainPassword, keychainPath]);
     run(MACOS_RELEASE_SIGNING_TOOLS.security, [
@@ -186,6 +192,7 @@ export function importSigningIdentity(input) {
       '-k', keychainPath,
       '-P', pkcs12Password,
       '-T', MACOS_RELEASE_SIGNING_TOOLS.codesign,
+      '-T', MACOS_RELEASE_SIGNING_TOOLS.productsign,
       '-f', 'pkcs12',
     ]);
     run(MACOS_RELEASE_SIGNING_TOOLS.security, [
@@ -197,7 +204,10 @@ export function importSigningIdentity(input) {
       .split('\n').map((line) => line.trim().replace(/^"|"$/gu, '')).filter(Boolean);
     run(MACOS_RELEASE_SIGNING_TOOLS.security, ['list-keychains', '-d', 'user', '-s', keychainPath, ...existing]);
     const found = run(MACOS_RELEASE_SIGNING_TOOLS.security, ['find-identity', '-v', '-p', 'codesigning', keychainPath]);
-    return selectDeveloperIdSigningIdentity(found, { teamId });
+    return selectDeveloperIdSigningIdentity(found, {
+      teamId,
+      certificateType: input.certificateType ?? 'application',
+    });
   } finally {
     // The PKCS#12 leaves the disk whether or not the import worked.
     rmSync(pkcs12Path, { force: true });
@@ -439,6 +449,34 @@ export function removeSigningMaterial(input) {
   });
 }
 
+/** Sign a macOS .pkg installer with Developer ID Installer and verify its signature. */
+export function signInstallerPackage(input) {
+  const { pkgPath, identitySha1, outPath, keychainPath } = input;
+  if (!pkgPath || !pkgPath.endsWith('.pkg')) {
+    throw new Error('signInstallerPackage requires a .pkg artifact path');
+  }
+  if (!identitySha1) {
+    throw new Error('signInstallerPackage requires a signing identity');
+  }
+  const targetOut = outPath ?? pkgPath;
+  const stagedOut = `${targetOut}.signed.tmp.pkg`;
+  const args = ['--sign', identitySha1];
+  if (keychainPath) args.push('--keychain', keychainPath);
+  args.push(pkgPath, stagedOut);
+  try {
+    run(MACOS_RELEASE_SIGNING_TOOLS.productsign, args);
+    const sigCheck = run(MACOS_RELEASE_SIGNING_TOOLS.pkgutil, ['--check-signature', stagedOut]);
+    if (!sigCheck.includes('signed by a developer certificate')) {
+      throw new Error(`pkgutil --check-signature did not verify developer signature for ${stagedOut}`);
+    }
+    renameSync(stagedOut, targetOut);
+    return { pkgPath: targetOut, signatureReport: sigCheck.trim() };
+  } catch (err) {
+    rmSync(stagedOut, { force: true });
+    throw err;
+  }
+}
+
 function requireEnv(name) {
   const value = process.env[name];
   if (typeof value !== 'string' || value.length === 0) {
@@ -461,6 +499,33 @@ async function main(argv) {
       keychainPath,
     });
     process.stdout.write(`${JSON.stringify(identity)}\n`);
+    return;
+  }
+  if (mode === 'import-installer') {
+    const identity = importSigningIdentity({
+      pkcs12Base64: process.env.IMCODES_MACOS_INSTALLER_P12_BASE64 || requireEnv('IMCODES_MACOS_SIGNING_P12_BASE64'),
+      pkcs12Password: process.env.IMCODES_MACOS_INSTALLER_P12_PASSWORD || requireEnv('IMCODES_MACOS_SIGNING_P12_PASSWORD'),
+      keychainPassword: requireEnv('IMCODES_MACOS_KEYCHAIN_PASSWORD'),
+      teamId: requireEnv('IMCODES_MACOS_TEAM_ID'),
+      keychainPath,
+      certificateType: 'installer',
+    });
+    process.stdout.write(`${JSON.stringify(identity)}\n`);
+    return;
+  }
+  if (mode === 'sign-pkg') {
+    const pkgPath = argv[1];
+    if (!pkgPath) throw new Error('usage: macos-release-signing.mjs sign-pkg <artifact.pkg>');
+    let identitySha1 = process.env.IMCODES_MACOS_INSTALLER_SIGNING_IDENTITY;
+    if (!identitySha1) {
+      const found = run(MACOS_RELEASE_SIGNING_TOOLS.security, ['find-identity', '-v', keychainPath]);
+      identitySha1 = selectDeveloperIdSigningIdentity(found, {
+        teamId: requireEnv('IMCODES_MACOS_TEAM_ID'),
+        certificateType: 'installer',
+      }).sha1;
+    }
+    const signed = signInstallerPackage({ pkgPath, identitySha1, keychainPath });
+    process.stdout.write(`${JSON.stringify(signed)}\n`);
     return;
   }
   if (mode === 'notarize') {

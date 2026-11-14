@@ -424,6 +424,104 @@ jobs:
           } finally {
             Remove-Item -LiteralPath $smokeRoot, $homeRoot -Recurse -Force -ErrorAction SilentlyContinue
           }
+      - name: Build and smoke-test Linux unified installers (.deb + .sh)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/build-linux-installer.mjs \
+            --arch x64 \
+            --version "$IMCODES_BUILD_VERSION" \
+            --runtime-archive dist-node-exe/daemon-runtime/daemon-runtime-linux-x64.tar.gz \
+            --node-exe dist-node-exe/imcodes-node-linux \
+            --remote-desktop-dir dist-node-exe/remote-desktop-worker/linux-x64 \
+            --computer-use-dir dist-node-exe/computer-use-helper/linux-x64 \
+            --out-dir dist-node-exe/installers
+          DEB="dist-node-exe/installers/imcodes-desktop-${IMCODES_BUILD_VERSION}-linux-amd64.deb"
+          SH="dist-node-exe/installers/imcodes-desktop-${IMCODES_BUILD_VERSION}-linux-x64.sh"
+          dpkg-deb --info "$DEB"
+          dpkg-deb --contents "$DEB" | head -n 40
+          ISO_ROOT="$(mktemp -d "${RUNNER_TEMP}/imcodes-linux-inst-iso.XXXXXX")"
+          ISO_HOME="$(mktemp -d "${RUNNER_TEMP}/imcodes-linux-inst-home.XXXXXX")"
+          trap 'rm -rf "$ISO_ROOT" "$ISO_HOME"' EXIT
+          "$SH" --isolated-root "$ISO_ROOT" --home "$ISO_HOME" --check
+          "$SH" --isolated-root "$ISO_ROOT" --home "$ISO_HOME" --no-service-control
+          env -i HOME="$ISO_HOME" IMCODES_HOME="$ISO_HOME/.imcodes" IMCODES_MUX="tmux" PATH="/nonexistent" \
+            "$ISO_ROOT/bin/imcodes" --version
+          "$SH" --isolated-root "$ISO_ROOT" --home "$ISO_HOME" --rollback "$ISO_ROOT/rollback-snapshot"
+      - name: Build, sign/notarize (when installer cert available), and verify macOS .pkg installer
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          IMCODES_MACOS_INSTALLER_P12_BASE64: ${{ secrets.IMCODES_MACOS_INSTALLER_P12_BASE64 }}
+          IMCODES_MACOS_INSTALLER_P12_PASSWORD: ${{ secrets.IMCODES_MACOS_INSTALLER_P12_PASSWORD }}
+          IMCODES_MACOS_KEYCHAIN_PASSWORD: ${{ secrets.IMCODES_MACOS_KEYCHAIN_PASSWORD }}
+          IMCODES_MACOS_TEAM_ID: ${{ secrets.IMCODES_MACOS_TEAM_ID }}
+          IMCODES_MACOS_NOTARY_KEY_ID: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_ID }}
+          IMCODES_MACOS_NOTARY_ISSUER: ${{ secrets.IMCODES_MACOS_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          node scripts/build-macos-installer.mjs \
+            --arch arm64 \
+            --version "$IMCODES_BUILD_VERSION" \
+            --runtime-archive dist-node-exe/daemon-runtime/daemon-runtime-darwin-arm64.tar.gz \
+            --app-bundle "dist-node-exe/aiDesk.to by IM.codes.app" \
+            --node-exe dist-node-exe/imcodes-node-macos \
+            --remote-desktop-dir dist-node-exe/remote-desktop-worker/darwin-arm64 \
+            --computer-use-dir dist-node-exe/computer-use-helper/darwin-universal \
+            --out-dir dist-node-exe/installers
+          PKG="dist-node-exe/installers/imcodes-desktop-${IMCODES_BUILD_VERSION}-darwin-arm64.pkg"
+          EXPAND_DIR="$(mktemp -d "${RUNNER_TEMP}/imcodes-pkg-expand.XXXXXX")"
+          trap 'rm -rf "$EXPAND_DIR"' EXIT
+          pkgutil --expand-full "$PKG" "$EXPAND_DIR/pkg"
+          APP_INSIDE="$(find "$EXPAND_DIR/pkg" -maxdepth 4 -name "aiDesk.to by IM.codes.app" -type d | head -n 1)"
+          codesign --verify --strict --verbose=2 "$APP_INSIDE"
+          if [ -n "${IMCODES_MACOS_INSTALLER_P12_BASE64:-}" ] || security find-identity -v "$RUNNER_TEMP/imcodes-macos-release-signing.keychain-db" 2>/dev/null | grep -q "Developer ID Installer:"; then
+            if [ -n "${IMCODES_MACOS_INSTALLER_P12_BASE64:-}" ]; then
+              node scripts/macos-release-signing.mjs import-installer >/dev/null
+            fi
+            node scripts/macos-release-signing.mjs sign-pkg "$PKG"
+            node scripts/macos-release-signing.mjs notarize "$PKG"
+          fi
+      - name: Build, sign, and smoke-test Windows Inno Setup (.iss/.exe) installer
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $isccPath = $null
+          foreach ($cand in @('C:\Program Files (x86)\Inno Setup 6\ISCC.exe', 'C:\Program Files\Inno Setup 6\ISCC.exe')) {
+            if (Test-Path -LiteralPath $cand -PathType Leaf) { $isccPath = $cand; break }
+          }
+          if (-not $isccPath -and (Get-Command choco -ErrorAction SilentlyContinue)) {
+            choco install innosetup --no-progress -y | Out-Null
+            foreach ($cand in @('C:\Program Files (x86)\Inno Setup 6\ISCC.exe', 'C:\Program Files\Inno Setup 6\ISCC.exe')) {
+              if (Test-Path -LiteralPath $cand -PathType Leaf) { $isccPath = $cand; break }
+            }
+          }
+          $localUiDir = if (Test-Path -LiteralPath 'dist-node-exe\aidesk-local-ui\win32-x64' -PathType Container) { 'dist-node-exe\aidesk-local-ui\win32-x64' } else { 'dist-node-exe\aidesk-local-ui' }
+          $buildArgs = @(
+            'scripts\build-windows-installer.mjs',
+            '--version', $env:IMCODES_BUILD_VERSION,
+            '--runtime-archive', 'dist-node-exe\daemon-runtime\daemon-runtime-win32-x64.zip',
+            '--node-exe', 'dist-node-exe\imcodes-node.exe',
+            '--remote-desktop-dir', 'dist-node-exe\remote-desktop-worker\win32-x64',
+            '--computer-use-dir', 'dist-node-exe\computer-use-helper\win32-x64',
+            '--local-ui-dir', $localUiDir,
+            '--out-dir', 'dist-node-exe\installers'
+          )
+          if ($isccPath) { $buildArgs += @('--iscc-path', $isccPath) }
+          node @buildArgs
+          if ($LASTEXITCODE -ne 0) { throw 'Windows installer build failed.' }
+          $isoRoot = Join-Path $env:RUNNER_TEMP ('imcodes-win-inst-' + [guid]::NewGuid().ToString('N'))
+          $isoHome = Join-Path $isoRoot 'home'
+          New-Item -ItemType Directory -Force -Path $isoHome | Out-Null
+          try {
+            & 'dist-node-exe\installers\imcodes-windows-installer.ps1' -Mode PostInstall -Version $env:IMCODES_BUILD_VERSION -IsolatedRoot $isoRoot -HomeDir $isoHome -StagedCliWrapper 'dist-node-exe\installers\imcodes.cmd' | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Windows isolated PostInstall failed.' }
+            & 'dist-node-exe\installers\imcodes-windows-installer.ps1' -Mode Rollback -IsolatedRoot $isoRoot -HomeDir $isoHome | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Windows isolated Rollback failed.' }
+          } finally {
+            Remove-Item -LiteralPath $isoRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
       - name: Upload executable artifact
         uses: actions/upload-artifact@v4
         with:
@@ -436,6 +534,7 @@ jobs:
             dist-node-exe/remote-desktop-worker/**
             dist-node-exe/aidesk-local-ui/**
             dist-node-exe/daemon-runtime/**
+            dist-node-exe/installers/**
           if-no-files-found: error
           retention-days: 30
       - name: Remove macOS release-signing material

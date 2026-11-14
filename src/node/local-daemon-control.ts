@@ -189,8 +189,10 @@ function readPackageVersion(packageJsonPath: string): string | undefined {
 
 function readManifestVersion(bundleDir: string): string | undefined {
   const candidates = [
+    join(bundleDir, 'daemon-runtime.manifest.json'),
     `${bundleDir}.manifest.json`,
     join(dirname(bundleDir), 'daemon-runtime.manifest.json'),
+    join(dirname(dirname(bundleDir)), 'daemon-runtime.manifest.json'),
   ];
   for (const candidate of candidates) {
     try {
@@ -296,7 +298,11 @@ export function discoverCodingDaemonRuntime(options: {
       ...(platform === 'win32' ? [join(env.ProgramFiles || 'C:\\Program Files', 'IM.codes', 'daemon-runtime')] : []),
     ];
 
-  for (const bundleDir of uniquePaths(defaultBundleDirs)) {
+  const expandedBundleDirs = uniquePaths(
+    uniquePaths(defaultBundleDirs).flatMap((dir) => [join(dir, 'current'), dir]),
+  );
+
+  for (const bundleDir of expandedBundleDirs) {
     const nodeBin = join(bundleDir, platform === 'win32' ? 'node.exe' : join('bin', 'node'));
     const entry = join(bundleDir, 'package', 'dist', 'src', 'index.js');
     if (isExecutableFile(nodeBin, platform) && existsSync(entry)) {
