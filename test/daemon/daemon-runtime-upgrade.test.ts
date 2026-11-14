@@ -36,9 +36,12 @@ import {
   buildLinuxSystemdRunSwitchArgs,
   buildMacosTransientLaunchAgentPlist,
   buildWindowsSwitchRunnerTaskXml,
+  claimHandoffRuntimeUpgradeLock,
   inspectDaemonRuntimeMode,
   launchDetachedDaemonRuntimeSwitchRunner,
   readCurrentPointerTarget,
+  readHandoffDecisionRecord,
+  readRuntimeUpgradeLockOwner,
   readVerifiedDaemonIdentity,
   recoverInterruptedDaemonRuntimeSwitch,
   releaseRuntimeUpgradeLock,
@@ -2242,5 +2245,353 @@ esac
 
     await runCausalScenario({ badTarget: false });
     await runCausalScenario({ badTarget: true });
+  }, 60_000);
+
+  it('[F3-R4] handoff fault matrix: definite refusal fences zombie runner; uncertain/claimed dispatch preserves stage, lock, OS job, blocks concurrent retries, and follows delayed completion/rollback', async () => {
+    const buildCustomDaemonFeed = async (opts: { version: string; runtimeReportedVersion: string }) => {
+      const root = makeTempDir(`imcodes-rt-f3r4-feed-${opts.version}-`);
+      const layout110 = join(root, 'rt', 'releases', '1.1.0');
+      const feedSrc = join(root, 'feed-src');
+      const artDir = join(root, 'artifacts');
+      mkdirSync(artDir, { recursive: true });
+      const lay110 = writeRunnableTree(layout110, '1.1.0');
+      writeRunnableTree(feedSrc, opts.version);
+      // Real CommonJS daemon entrypoint that prints runtimeReportedVersion on --version OR writes real daemon.lock.json + daemon-runtime.json when started
+      const daemonJs = [
+        `if (process.argv.includes('--version')) { console.log(${JSON.stringify(opts.version)}); process.exit(0); }`,
+        `const { mkdirSync, readFileSync, writeFileSync } = require('node:fs');`,
+        `const { join } = require('node:path');`,
+        `const dir = process.env.IMCODES_HOME;`,
+        `if (!dir) process.exit(2);`,
+        `mkdirSync(dir, { recursive: true });`,
+        `const stat = readFileSync('/proc/self/stat', 'utf8');`,
+        `const startTime = stat.slice(stat.lastIndexOf(')') + 2).trim().split(' ')[19];`,
+        `const now = Date.now();`,
+        `writeFileSync(join(dir, 'daemon.pid'), String(process.pid) + '\\n');`,
+        `writeFileSync(join(dir, 'daemon.lock.json'), JSON.stringify({ version: 1, pid: process.pid, startToken: 'linux:' + startTime, acquiredAt: now, socketPath: join(dir, 'daemon.sock'), sessionIds: [], residualResources: [] }));`,
+        `writeFileSync(join(dir, 'daemon-runtime.json'), JSON.stringify({ pid: process.pid, version: ${JSON.stringify(opts.runtimeReportedVersion)}, startedAt: now, socketPath: join(dir, 'daemon.sock') }));`,
+        `setInterval(() => {}, 1000);`,
+      ].join('\n');
+      writeFileSync(join(feedSrc, 'package', 'dist', 'src', 'index.js'), daemonJs);
+      // Same foreground daemon script inside 1.1.0 for clean rollback restart verification
+      writeFileSync(
+        lay110.entryPath,
+        daemonJs
+          .replace(JSON.stringify(opts.version), JSON.stringify('1.1.0'))
+          .replace(JSON.stringify(opts.runtimeReportedVersion), JSON.stringify('1.1.0')),
+      );
+
+      const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
+      const target = `linux-${arch}` as const;
+      const archiveName = `daemon-runtime-${target}.tar.gz`;
+      const archivePath = join(artDir, archiveName);
+      execFileSync('tar', ['-czf', archivePath, '-C', feedSrc, '.'], { stdio: 'pipe' });
+      const built = await createDaemonRuntimeManifest({
+        bundleRoot: feedSrc,
+        archivePath,
+        os: 'linux',
+        arch,
+        nodeVersion: 'v22.11.0',
+        nodeProvider: 'official-node',
+        nodeArchive: `node-v22.11.0-linux-${arch}.tar.gz`,
+        nodeArchiveSha256: 'a'.repeat(64),
+        buildCommit: 'abcdef123456',
+        buildVersion: opts.version,
+      });
+      const manifestPath = join(artDir, daemonRuntimeManifestFilename(target));
+      writeFileSync(manifestPath, Buffer.from(JSON.stringify(built.manifest, null, 2), 'utf8'));
+      const archiveBytes = readFileSync(archivePath);
+      const rmObj = {
+        schemaVersion: 1,
+        releaseVersion: opts.version,
+        gitSha: 'abcdef123456',
+        generatedAt: new Date().toISOString(),
+        targets: {
+          [target]: {
+            target,
+            os: 'linux',
+            arch,
+            components: {
+              'imcodes-node': { component: 'imcodes-node', version: opts.version, fileName: `imcodes-node-linux`, sha256: '1'.repeat(64), sizeBytes: 1, compat: { os: 'linux', arch } },
+              'remote-desktop': { component: 'remote-desktop', version: opts.version, fileName: 'rd', sha256: '2'.repeat(64), sizeBytes: 1, compat: { os: 'linux', arch, protocolVersion: 2 } },
+              'open-computer-use': { component: 'open-computer-use', version: opts.version, fileName: 'ocu', sha256: '3'.repeat(64), sizeBytes: 1, compat: { os: 'linux', arch } },
+              'daemon-runtime': { component: 'daemon-runtime', version: opts.version, fileName: archiveName, sha256: sha256(archiveBytes), sizeBytes: archiveBytes.length, compat: { os: 'linux', arch, nodeVersion: process.version } },
+            },
+          },
+        },
+      };
+      writeFileSync(join(artDir, desktopReleaseTargetManifestFilename(target)), Buffer.from(JSON.stringify(rmObj, null, 2), 'utf8'));
+      return { root, rtRoot: join(root, 'rt'), layout110, lay110, artDir };
+    };
+
+    // 1. Definite refusal + zombie runner fence: late runner sees handoff cancelled & does NOT mutate current
+    const defFixture = await buildCustomDaemonFeed({ version: '1.2.0', runtimeReportedVersion: '1.2.0' });
+    const defHome = join(defFixture.root, 'home');
+    const defState = join(defFixture.root, 'state');
+    mkdirSync(defHome, { recursive: true });
+    mkdirSync(defState, { recursive: true });
+    switchDaemonRuntimeCurrentPointer(defFixture.rtRoot, defFixture.layout110, 'linux');
+
+    let cancelledArgs: string[] = [];
+    const defBlocked = await upgradeBundledDaemonRuntime({
+      platform: 'linux',
+      currentVersion: '1.1.0',
+      targetVersion: '1.2.0',
+      execPath: defFixture.lay110.nodePath,
+      entryScriptPath: defFixture.lay110.entryPath,
+      userHome: defHome,
+      env: { ...process.env, HOME: defHome, IMCODES_HOME: defState },
+      source: { kind: 'local', dir: defFixture.artDir },
+      detachedHandoff: true,
+      requireIsolatedHost: true,
+      wasRunning: false,
+      switchRunnerHostExecutor: async (_file, args) => {
+        cancelledArgs = args;
+        throw new Error('Failed to connect to bus: No medium found');
+      },
+    });
+    expect(defBlocked.status).toBe('blocked');
+    if (defBlocked.status === 'blocked') {
+      expect(defBlocked.reason).toBe('isolated_handoff_unavailable');
+    }
+    expect(existsSync(join(defFixture.rtRoot, 'releases', '1.2.0'))).toBe(false);
+    expect(realpathSync(join(defFixture.rtRoot, 'current'))).toBe(realpathSync(defFixture.layout110));
+    expect(existsSync(join(defState, DAEMON_RUNTIME_LOCK_DIR_NAME))).toBe(false);
+
+    // Late zombie attempt to run cancelled switch-runner MUST abort before touching current
+    const cancelledConfigPath = cancelledArgs[cancelledArgs.length - 1]!;
+    const cancelledScriptPath = cancelledArgs[cancelledArgs.length - 2]!;
+    const cancelledCfg = JSON.parse(readFileSync(cancelledConfigPath, 'utf8')) as { handoffDecisionFile: string };
+    expect(readHandoffDecisionRecord(cancelledCfg.handoffDecisionFile)?.decision).toBe('cancelled');
+    expect(() => execFileSync(process.execPath, [cancelledScriptPath, cancelledConfigPath], { stdio: 'pipe' })).toThrow();
+    expect(realpathSync(join(defFixture.rtRoot, 'current'))).toBe(realpathSync(defFixture.layout110));
+
+    // Windows/macOS uncertain dispatch MUST NOT delete transient registration/files (/Delete or bootout)
+    const winUncertainRoot = makeTempDir('imcodes-rt-f3r4-win-unc-');
+    const winUncRt = join(winUncertainRoot, 'rt');
+    const winUnc110 = join(winUncRt, 'releases', '1.1.0');
+    const winUnc120 = join(winUncRt, 'releases', '1.2.0');
+    writeRunnableTree(winUnc110, '1.1.0');
+    writeRunnableTree(winUnc120, '1.2.0');
+    switchDaemonRuntimeCurrentPointer(winUncRt, winUnc110, 'win32');
+    const winUncOps: string[] = [];
+    await expect(launchDetachedDaemonRuntimeSwitchRunner({
+      platform: 'win32',
+      runtimeRoot: winUncRt,
+      stagedReleaseDir: winUnc120,
+      previousTarget: winUnc110,
+      targetVersion: '1.2.0',
+      stateDir: join(winUncertainRoot, 'state'),
+      homeDir: winUncertainRoot,
+      env: { USERNAME: 'u', USERDOMAIN: 'D' },
+      keepTargets: [winUnc120, winUnc110],
+      hostExecutor: async (_file, args) => {
+        winUncOps.push(args[0]!);
+        if (args[0] === '/Run') {
+          throw Object.assign(new Error('exec helper stopped (SIGTERM) while running schtasks'), { code: 'EXEC_HELPER_CRASHED' });
+        }
+        return { stdout: '', stderr: '' };
+      },
+    })).rejects.toThrow('daemon_runtime_isolated_handoff_uncertain:win32_schtasks_run:uncertain:EXEC_HELPER_CRASHED');
+    expect(winUncOps).toEqual(['/Create', '/Run']);
+
+    const macUncRoot = makeTempDir('imcodes-rt-f3r4-mac-unc-');
+    const macUncSvc = resolvePosixDaemonServicePaths({ HOME: macUncRoot, IMCODES_HOME: join(macUncRoot, 'state') });
+    mkdirSync(join(macUncRoot, 'Library', 'LaunchAgents'), { recursive: true });
+    writeFileSync(join(macUncRoot, 'Library', 'LaunchAgents', `${macUncSvc.launchAgentLabel}.plist`), '<plist><dict/></plist>');
+    const macUncRt = join(macUncRoot, 'rt');
+    const macUnc110 = join(macUncRt, 'releases', '1.1.0');
+    const macUnc120 = join(macUncRt, 'releases', '1.2.0');
+    writeRunnableTree(macUnc110, '1.1.0');
+    writeRunnableTree(macUnc120, '1.2.0');
+    switchDaemonRuntimeCurrentPointer(macUncRt, macUnc110, 'darwin');
+    const macUncOps: string[] = [];
+    await expect(launchDetachedDaemonRuntimeSwitchRunner({
+      platform: 'darwin',
+      runtimeRoot: macUncRt,
+      stagedReleaseDir: macUnc120,
+      previousTarget: macUnc110,
+      targetVersion: '1.2.0',
+      stateDir: join(macUncRoot, 'state'),
+      homeDir: macUncRoot,
+      env: { HOME: macUncRoot, IMCODES_HOME: join(macUncRoot, 'state') },
+      keepTargets: [macUnc120, macUnc110],
+      hostExecutor: async (_file, args) => {
+        macUncOps.push(args[0]!);
+        throw Object.assign(new Error('exec helper did not answer launchctl in time'), { code: 'EXEC_HELPER_UNRESPONSIVE' });
+      },
+    })).rejects.toThrow('daemon_runtime_isolated_handoff_uncertain:darwin_launchd:uncertain:EXEC_HELPER_UNRESPONSIVE');
+    expect(macUncOps).toEqual(['bootstrap']);
+
+    // 2. Counterexample reproduction: runner already claimed & switched current -> 1.2.0 before EXEC_HELPER_CRASHED
+    const claimedFix = await buildCustomDaemonFeed({ version: '1.2.0', runtimeReportedVersion: '1.2.0' });
+    const claimedHome = join(claimedFix.root, 'home');
+    const claimedState = join(claimedFix.root, 'state');
+    mkdirSync(claimedHome, { recursive: true });
+    mkdirSync(claimedState, { recursive: true });
+    switchDaemonRuntimeCurrentPointer(claimedFix.rtRoot, claimedFix.layout110, 'linux');
+
+    const claimedRes = await upgradeBundledDaemonRuntime({
+      platform: 'linux',
+      currentVersion: '1.1.0',
+      targetVersion: '1.2.0',
+      execPath: claimedFix.lay110.nodePath,
+      entryScriptPath: claimedFix.lay110.entryPath,
+      userHome: claimedHome,
+      env: { ...process.env, HOME: claimedHome, IMCODES_HOME: claimedState },
+      source: { kind: 'local', dir: claimedFix.artDir },
+      detachedHandoff: true,
+      requireIsolatedHost: true,
+      wasRunning: false,
+      switchRunnerHostExecutor: async (_file, args) => {
+        const cfgPath = args[args.length - 1]!;
+        const cfg = JSON.parse(readFileSync(cfgPath, 'utf8')) as {
+          lockOwnerToken: string;
+          handoffRunnerId: string;
+          handoffDecisionFile: string;
+          stagedReleaseDir: string;
+          runtimeRoot: string;
+        };
+        claimHandoffRuntimeUpgradeLock(claimedState, cfg.lockOwnerToken, {
+          mode: 'detached_runner',
+          expectedRunnerId: cfg.handoffRunnerId,
+          handoffDecisionFile: cfg.handoffDecisionFile,
+        });
+        switchDaemonRuntimeCurrentPointer(cfg.runtimeRoot, cfg.stagedReleaseDir, 'linux');
+        throw Object.assign(new Error('exec helper stopped (crash) while running systemd-run'), {
+          code: 'EXEC_HELPER_CRASHED',
+        });
+      },
+    });
+    expect(claimedRes.status).toBe('handoff_uncertain');
+    if (claimedRes.status === 'handoff_uncertain') {
+      expect(claimedRes.handoffState).toBe('claimed');
+      expect(claimedRes.errorCode).toBe('EXEC_HELPER_CRASHED');
+      expect(claimedRes.dispatchStage).toBe('linux_systemd_run');
+    }
+    const rel120Claimed = join(claimedFix.rtRoot, 'releases', '1.2.0');
+    expect(existsSync(rel120Claimed)).toBe(true);
+    expect(existsSync(join(claimedFix.rtRoot, 'current'))).toBe(true);
+    expect(realpathSync(join(claimedFix.rtRoot, 'current'))).toBe(realpathSync(rel120Claimed));
+    const claimedOwner = readRuntimeUpgradeLockOwner(claimedState);
+    expect(claimedOwner?.holder).toBe('detached_runner');
+    expect(claimedOwner?.handoffState).toBe('claimed');
+    // Parent release MUST fail closed against runner-owned lock!
+    expect(releaseRuntimeUpgradeLock(claimedState, claimedOwner!.ownerToken, { expectedHolder: 'parent' })).toBe(false);
+    expect(readRuntimeUpgradeLockOwner(claimedState)?.ownerToken).toBe(claimedOwner!.ownerToken);
+    expect(releaseRuntimeUpgradeLock(claimedState, claimedOwner!.ownerToken, { expectedHolder: 'detached_runner', expectedPid: process.pid })).toBe(true);
+
+    // 3. Delayed runner start after dispatch timeout/crash + concurrent retry blocked (both good upgrade and bad-target rollback)
+    const runDelayedScenario = async (opts: { badTarget: boolean }) => {
+      const fix = await buildCustomDaemonFeed({
+        version: '1.2.0',
+        runtimeReportedVersion: opts.badTarget ? '1.1.0' : '1.2.0',
+      });
+      const home = join(fix.root, 'home');
+      const state = join(fix.root, 'state');
+      mkdirSync(home, { recursive: true });
+      mkdirSync(state, { recursive: true });
+      switchDaemonRuntimeCurrentPointer(fix.rtRoot, fix.layout110, 'linux');
+
+      // Start an old verified foreground daemon (so rollback & good upgrade test real daemon liveness)
+      const oldProc = spawn(fix.lay110.nodePath, [fix.lay110.entryPath], {
+        detached: true,
+        stdio: 'ignore',
+        env: { ...process.env, HOME: home, IMCODES_HOME: state },
+      });
+      oldProc.unref();
+      const deadline = Date.now() + 10_000;
+      while (!readVerifiedDaemonIdentity(state, 'linux') && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 40));
+      }
+      expect(readVerifiedDaemonIdentity(state, 'linux')?.version).toBe('1.1.0');
+
+      const delayedTimers: Array<ReturnType<typeof setTimeout>> = [];
+      try {
+        const res = await upgradeBundledDaemonRuntime({
+          platform: 'linux',
+          currentVersion: '1.1.0',
+          targetVersion: '1.2.0',
+          execPath: fix.lay110.nodePath,
+          entryScriptPath: fix.lay110.entryPath,
+          userHome: home,
+          env: { ...process.env, HOME: home, IMCODES_HOME: state },
+          source: { kind: 'local', dir: fix.artDir },
+          detachedHandoff: true,
+          requireIsolatedHost: true,
+          wasRunning: true,
+          healthCheckTimeoutMs: 2_000,
+          settleMs: 120,
+          switchRunnerHostExecutor: async (_file, args) => {
+            const cfgPath = args[args.length - 1]!;
+            const scriptPath = args[args.length - 2]!;
+            // OS accepted the job and starts it 200ms later, after caller times out / helper crashes
+            const t = setTimeout(() => {
+              const c = spawn(process.execPath, [scriptPath, cfgPath], { detached: true, stdio: 'ignore' });
+              c.unref();
+            }, 200);
+            delayedTimers.push(t);
+            throw Object.assign(new Error('Command timed out after 15000ms'), { code: 'ETIMEDOUT', killed: true });
+          },
+        });
+
+        expect(res.status).toBe('handoff_uncertain');
+        if (res.status !== 'handoff_uncertain') throw new Error('expected_handoff_uncertain');
+        expect(res.handoffState).toBe('uncertain');
+        expect(res.errorCode).toBe('ETIMEDOUT');
+        expect(existsSync(res.releaseDir)).toBe(true);
+        expect(readRuntimeUpgradeLockOwner(state)?.handoffState).toBe('uncertain');
+
+        // Retry while outcome is uncertain MUST fail closed on single-flight lock and NOT touch releaseDir/current
+        await expect(upgradeBundledDaemonRuntime({
+          platform: 'linux',
+          currentVersion: '1.1.0',
+          targetVersion: '1.2.0',
+          execPath: fix.lay110.nodePath,
+          entryScriptPath: fix.lay110.entryPath,
+          userHome: home,
+          env: { ...process.env, HOME: home, IMCODES_HOME: state },
+          source: { kind: 'local', dir: fix.artDir },
+          detachedHandoff: true,
+          requireIsolatedHost: true,
+        })).rejects.toThrow('daemon_runtime_upgrade_in_progress:');
+        expect(existsSync(res.releaseDir)).toBe(true);
+
+        const exitCode = await followDetachedDaemonRuntimeSwitch(
+          {
+            scriptDir: res.detachedScriptDir,
+            targetVersion: res.targetVersion,
+            runtimeRoot: res.runtimeRoot,
+            writableRootKind: res.writableRootKind,
+            handoffUncertain: true,
+          },
+          { pollMs: 50, followLimitMs: 15_000, write: () => {} },
+        );
+
+        expect(existsSync(join(state, DAEMON_RUNTIME_LOCK_DIR_NAME))).toBe(false);
+        const postIdentity = readVerifiedDaemonIdentity(state, 'linux');
+        expect(postIdentity).toBeTruthy();
+        if (opts.badTarget) {
+          expect(exitCode).toBe(1);
+          expect(realpathSync(join(fix.rtRoot, 'current'))).toBe(realpathSync(fix.layout110));
+          expect(postIdentity!.version).toBe('1.1.0');
+        } else {
+          expect(exitCode).toBe(0);
+          expect(realpathSync(join(fix.rtRoot, 'current'))).toBe(realpathSync(res.releaseDir));
+          expect(postIdentity!.version).toBe('1.2.0');
+        }
+        try { process.kill(postIdentity!.pid, 'SIGKILL'); } catch {}
+      } finally {
+        for (const t of delayedTimers) clearTimeout(t);
+        try { process.kill(oldProc.pid!, 'SIGKILL'); } catch {}
+        try {
+          const leftPid = Number(readFileSync(join(state, 'daemon.pid'), 'utf8').trim());
+          if (leftPid > 0) process.kill(leftPid, 'SIGKILL');
+        } catch {}
+      }
+    };
+
+    await runDelayedScenario({ badTarget: false });
+    await runDelayedScenario({ badTarget: true });
   }, 60_000);
 });

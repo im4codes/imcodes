@@ -9805,13 +9805,26 @@ async function handleDaemonUpgrade(
       detachedHandoff: true,
       wasRunning: true,
     });
-    if (bundledResult.status === 'upgraded') {
-      logger.info({
-        targetVersion: bundledResult.targetVersion,
-        runtimeRoot: bundledResult.runtimeRoot,
-        writableRootKind: bundledResult.writableRootKind,
-        scriptDir: bundledResult.detachedScriptDir,
-      }, 'daemon.upgrade: bundled daemon-runtime detached switch runner spawned');
+    if (bundledResult.status === 'upgraded' || bundledResult.status === 'handoff_uncertain') {
+      if (bundledResult.status === 'handoff_uncertain') {
+        logger.warn({
+          targetVersion: bundledResult.targetVersion,
+          runtimeRoot: bundledResult.runtimeRoot,
+          writableRootKind: bundledResult.writableRootKind,
+          scriptDir: bundledResult.detachedScriptDir,
+          handoffState: bundledResult.handoffState,
+          dispatchStage: bundledResult.dispatchStage,
+          errorCode: bundledResult.errorCode,
+          runnerId: bundledResult.runnerId,
+        }, bundledResult.message);
+      } else {
+        logger.info({
+          targetVersion: bundledResult.targetVersion,
+          runtimeRoot: bundledResult.runtimeRoot,
+          writableRootKind: bundledResult.writableRootKind,
+          scriptDir: bundledResult.detachedScriptDir,
+        }, 'daemon.upgrade: bundled daemon-runtime detached switch runner spawned');
+      }
       upgradeScriptSpawned = true;
       announceUpgrading();
       scheduleUpgradeMemoryFreezeRelease();

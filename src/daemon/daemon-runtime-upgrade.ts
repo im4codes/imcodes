@@ -63,11 +63,15 @@ import {
   DAEMON_RUNTIME_SWITCH_STATE_FILE,
   UPGRADE_COOLDOWN_SENTINEL_FILE,
   acquireRuntimeUpgradeLock,
+  cancelHandoffRuntimeUpgradeLock,
   claimHandoffRuntimeUpgradeLock,
+  markRuntimeUpgradeHandoffUncertain,
   prepareServiceLaunchTarget,
   pruneOldDaemonRuntimeReleases,
   readCurrentPointerTarget,
+  readHandoffDecisionRecord,
   readPackageVersionSync,
+  readRuntimeUpgradeLockOwner,
   readVerifiedDaemonIdentity,
   recoverInterruptedDaemonRuntimeSwitch,
   releaseRuntimeUpgradeLock,
@@ -77,6 +81,7 @@ import {
   stopVerifiedDaemon,
   switchDaemonRuntimeCurrentPointer,
   transferRuntimeUpgradeLock,
+  tryFenceHandoffDecision,
   waitForHealthyTargetDaemon,
   writeSwitchStateRecord,
   writeUpgradeCooldownSentinel,
@@ -93,10 +98,13 @@ export {
   DAEMON_RUNTIME_SWITCH_STATE_FILE,
   UPGRADE_COOLDOWN_SENTINEL_FILE,
   acquireRuntimeUpgradeLock,
+  cancelHandoffRuntimeUpgradeLock,
   claimHandoffRuntimeUpgradeLock,
   prepareServiceLaunchTarget,
   pruneOldDaemonRuntimeReleases,
   readCurrentPointerTarget,
+  readHandoffDecisionRecord,
+  readRuntimeUpgradeLockOwner,
   readVerifiedDaemonIdentity,
   recoverInterruptedDaemonRuntimeSwitch,
   releaseRuntimeUpgradeLock,
@@ -222,6 +230,45 @@ export interface DaemonRuntimeUpgradeOptions {
   now?: () => number;
 }
 
+export type HandoffFailureUncertainty = 'definite_refusal' | 'uncertain' | 'claimed';
+
+export class DaemonRuntimeIsolatedHandoffError extends Error {
+  readonly stage: string;
+  readonly uncertainty: HandoffFailureUncertainty;
+  readonly isolationMode: SwitchRunnerIsolationMode;
+  readonly runnerId: string;
+  readonly scriptDir: string;
+  readonly resultFile: string;
+  readonly decisionFile: string;
+  readonly errorCode?: string;
+
+  constructor(
+    message: string,
+    details: {
+      stage: string;
+      uncertainty: HandoffFailureUncertainty;
+      isolationMode: SwitchRunnerIsolationMode;
+      runnerId: string;
+      scriptDir: string;
+      resultFile: string;
+      decisionFile: string;
+      errorCode?: string;
+      cause?: unknown;
+    },
+  ) {
+    super(message, details.cause !== undefined ? { cause: details.cause } : undefined);
+    this.name = 'DaemonRuntimeIsolatedHandoffError';
+    this.stage = details.stage;
+    this.uncertainty = details.uncertainty;
+    this.isolationMode = details.isolationMode;
+    this.runnerId = details.runnerId;
+    this.scriptDir = details.scriptDir;
+    this.resultFile = details.resultFile;
+    this.decisionFile = details.decisionFile;
+    this.errorCode = details.errorCode;
+  }
+}
+
 export type DaemonRuntimeUpgradeResult =
   | {
       status: 'upgraded';
@@ -235,6 +282,24 @@ export type DaemonRuntimeUpgradeResult =
       rolledBack: false;
       detachedScriptDir?: string;
       detachedIsolationMode?: SwitchRunnerIsolationMode;
+    }
+  | {
+      status: 'handoff_uncertain';
+      handoffState: 'claimed' | 'uncertain';
+      targetVersion: string;
+      previousVersion?: string;
+      previousTarget?: string;
+      runtimeRoot: string;
+      releaseDir: string;
+      currentLink: string;
+      writableRootKind: WritableRuntimeRootKind;
+      detachedScriptDir: string;
+      detachedIsolationMode: SwitchRunnerIsolationMode;
+      runnerId: string;
+      dispatchStage: string;
+      errorCode?: string;
+      message: string;
+      cause?: unknown;
     }
   | {
       status: 'rolled_back';
@@ -1260,12 +1325,160 @@ const defaultSwitchRunnerHostExecutor: SwitchRunnerHostExecutor = async (file, a
   });
 };
 
+function extractErrorCode(err: unknown, depth = 0): string | undefined {
+  if (depth > 4 || !err || typeof err !== 'object') return undefined;
+  const code = (err as { code?: unknown }).code;
+  if (typeof code === 'string' && code.trim()) return code.trim();
+  return extractErrorCode((err as { cause?: unknown }).cause, depth + 1);
+}
+
+function isUncertainHostDispatchError(err: unknown, depth = 0): boolean {
+  if (depth > 4 || err === null || err === undefined) return false;
+  if (typeof err === 'string') {
+    return /EXEC_HELPER_CRASHED|EXEC_HELPER_UNRESPONSIVE|did not answer|exec helper stopped|ETIMEDOUT|timed?\s*out/i.test(err);
+  }
+  if (typeof err !== 'object') return false;
+  const rec = err as { code?: unknown; killed?: unknown; signal?: unknown; message?: unknown; cause?: unknown };
+  const code = typeof rec.code === 'string' ? rec.code : '';
+  if (
+    code === 'EXEC_HELPER_CRASHED'
+    || code === 'EXEC_HELPER_UNRESPONSIVE'
+    || code === 'ETIMEDOUT'
+    || code === 'ECONNRESET'
+    || code === 'EPIPE'
+  ) {
+    return true;
+  }
+  if (rec.killed === true || (typeof rec.signal === 'string' && rec.signal.length > 0)) {
+    return true;
+  }
+  if (
+    typeof rec.message === 'string'
+    && /EXEC_HELPER_CRASHED|EXEC_HELPER_UNRESPONSIVE|did not answer|exec helper stopped|ETIMEDOUT|timed?\s*out/i.test(rec.message)
+  ) {
+    return true;
+  }
+  return isUncertainHostDispatchError(rec.cause, depth + 1);
+}
+
+async function handleHostDispatchError(params: {
+  err: unknown;
+  stage: string;
+  isolationMode: SwitchRunnerIsolationMode;
+  stateDir: string;
+  lockOwnerToken?: string;
+  runnerId: string;
+  scriptDir: string;
+  resultFile: string;
+  decisionFile: string;
+  canAlwaysFenceNonRunningCreation?: boolean;
+  cleanupOnDefiniteRefusal?: () => Promise<void> | void;
+}): Promise<never> {
+  const {
+    err,
+    stage,
+    isolationMode,
+    stateDir,
+    lockOwnerToken,
+    runnerId,
+    scriptDir,
+    resultFile,
+    decisionFile,
+    canAlwaysFenceNonRunningCreation = false,
+    cleanupOnDefiniteRefusal,
+  } = params;
+  const rawMsg = err instanceof Error ? err.message : String(err);
+  const errorCode = extractErrorCode(err);
+
+  const buildUncertainError = (uncertainty: 'claimed' | 'uncertain'): DaemonRuntimeIsolatedHandoffError =>
+    new DaemonRuntimeIsolatedHandoffError(
+      `daemon_runtime_isolated_handoff_uncertain:${stage}:${uncertainty}:${errorCode ? `${errorCode}:` : ''}${rawMsg}`,
+      {
+        stage,
+        uncertainty,
+        isolationMode,
+        runnerId,
+        scriptDir,
+        resultFile,
+        decisionFile,
+        errorCode,
+        cause: err,
+      },
+    );
+
+  const decisionRec = readHandoffDecisionRecord(decisionFile);
+  const ownerRec = readRuntimeUpgradeLockOwner(stateDir);
+  const alreadyClaimed = Boolean(
+    existsSync(resultFile)
+    || decisionRec?.decision === 'claimed'
+    || (ownerRec
+      && (!lockOwnerToken || ownerRec.ownerToken === lockOwnerToken)
+      && (ownerRec.holder === 'detached_runner' || ownerRec.handoffState === 'claimed')),
+  );
+  if (alreadyClaimed) {
+    throw buildUncertainError('claimed');
+  }
+
+  if (!canAlwaysFenceNonRunningCreation && isUncertainHostDispatchError(err)) {
+    if (lockOwnerToken) {
+      markRuntimeUpgradeHandoffUncertain(stateDir, lockOwnerToken, {
+        handoffRunnerId: runnerId,
+        handoffDecisionFile: decisionFile,
+        handoffScriptDir: scriptDir,
+        handoffStage: stage,
+        ...(errorCode ? { handoffErrorCode: errorCode } : {}),
+        handoffErrorMessage: rawMsg,
+      });
+    }
+    throw buildUncertainError('uncertain');
+  }
+
+  // Definite refusal: acquire the exclusive 'cancelled' fence BEFORE cleaning up transient jobs or releases.
+  if (lockOwnerToken) {
+    const cancelRes = cancelHandoffRuntimeUpgradeLock(stateDir, lockOwnerToken, {
+      expectedRunnerId: runnerId,
+      handoffDecisionFile: decisionFile,
+      reason: `${stage}:${errorCode ?? 'refused'}`,
+    });
+    if (cancelRes.claimedByRunner || existsSync(resultFile)) {
+      throw buildUncertainError('claimed');
+    }
+  } else {
+    const fence = tryFenceHandoffDecision(decisionFile, {
+      decision: 'cancelled',
+      runnerId,
+      reason: `${stage}:${errorCode ?? 'refused'}`,
+      decidedAt: Date.now(),
+    });
+    if ((!fence.won && fence.record?.decision === 'claimed') || existsSync(resultFile)) {
+      throw buildUncertainError('claimed');
+    }
+  }
+
+  await cleanupOnDefiniteRefusal?.();
+
+  throw new DaemonRuntimeIsolatedHandoffError(
+    `daemon_runtime_isolated_handoff_unavailable:${stage}:${rawMsg}`,
+    {
+      stage,
+      uncertainty: 'definite_refusal',
+      isolationMode,
+      runnerId,
+      scriptDir,
+      resultFile,
+      decisionFile,
+      errorCode,
+      cause: err,
+    },
+  );
+}
+
 /**
  * Write and launch a self-contained detached switch+launch-chain-align+restart+healthcheck+rollback runner
  * (used when the running daemon or CLI upgrades cleanly without in-place overwrites).
  *
  * When managed by systemd / Windows Task Scheduler tree-kill / macOS LaunchAgent, hands the runner
- * off to an independent OS lifecycle host BEFORE returning, and fails closed if handoff fails.
+ * off to an independent OS lifecycle host BEFORE returning, fencing cancellations from uncertain in-flight dispatches.
  */
 export async function launchDetachedDaemonRuntimeSwitchRunner(input: {
   scriptDir?: string;
@@ -1283,6 +1496,7 @@ export async function launchDetachedDaemonRuntimeSwitchRunner(input: {
   env?: NodeJS.ProcessEnv;
   keepTargets: string[];
   lockOwnerToken?: string;
+  handoffRunnerId?: string;
   restartCommand?: string;
   rollbackRestartCommand?: string;
   healthCheckTimeoutMs?: number;
@@ -1297,11 +1511,14 @@ export async function launchDetachedDaemonRuntimeSwitchRunner(input: {
   scriptPath: string;
   logFile: string;
   resultFile: string;
+  decisionFile: string;
+  runnerId: string;
   isolationMode: SwitchRunnerIsolationMode;
 }> {
   const scriptDir = input.scriptDir ?? mkdtempSync(join(tmpdir(), 'imcodes-rt-upgrade-'));
   const logFile = join(scriptDir, 'runtime-upgrade.log');
   const resultFile = join(scriptDir, 'switch-result.json');
+  const decisionFile = join(scriptDir, 'handoff-decision.json');
   const configPath = join(scriptDir, 'runtime-upgrade.json');
   const scriptPath = join(scriptDir, 'switch-runner.mjs');
   const helperDestPath = join(scriptDir, 'daemon-runtime-switch-helper.mjs');
@@ -1351,7 +1568,7 @@ export async function launchDetachedDaemonRuntimeSwitchRunner(input: {
       });
 
   const runHost = input.hostExecutor ?? defaultSwitchRunnerHostExecutor;
-  const nonce = `${imcodesHomeHash(input.stateDir)}-${process.pid}-${randomBytes(3).toString('hex')}`;
+  const nonce = input.handoffRunnerId?.trim() || `${imcodesHomeHash(input.stateDir)}-${process.pid}-${randomBytes(3).toString('hex')}`;
 
   let transientWindowsTask: string | undefined;
   let transientTaskXmlPath: string | undefined;
@@ -1418,6 +1635,8 @@ export async function launchDetachedDaemonRuntimeSwitchRunner(input: {
       stateDir: resolve(input.stateDir),
       keepTargets: input.keepTargets.map((t) => resolve(t)),
       lockOwnerToken: input.lockOwnerToken ?? null,
+      handoffRunnerId: nonce,
+      handoffDecisionFile: decisionFile,
       targetNodePath: launchCfg.targetNodePath,
       targetEntryPath: launchCfg.targetEntryPath,
       ...(previousNodePath ? { previousNodePath } : {}),
@@ -1455,7 +1674,7 @@ export async function launchDetachedDaemonRuntimeSwitchRunner(input: {
 
   if (input.spawnRunner) {
     input.spawnRunner(scriptPath, [configPath], scriptDir);
-    return { scriptDir, scriptPath, logFile, resultFile, isolationMode: 'custom' };
+    return { scriptDir, scriptPath, logFile, resultFile, decisionFile, runnerId: nonce, isolationMode: 'custom' };
   }
 
   if (isolationMode === 'linux_systemd_run') {
@@ -1469,10 +1688,19 @@ export async function launchDetachedDaemonRuntimeSwitchRunner(input: {
     });
     try {
       await runHost('systemd-run', args, { timeoutMs: 15_000, env });
-      return { scriptDir, scriptPath, logFile, resultFile, isolationMode };
+      return { scriptDir, scriptPath, logFile, resultFile, decisionFile, runnerId: nonce, isolationMode };
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      throw new Error(`daemon_runtime_isolated_handoff_unavailable:linux_systemd_run:${msg}`);
+      return handleHostDispatchError({
+        err,
+        stage: 'linux_systemd_run',
+        isolationMode,
+        stateDir: input.stateDir,
+        lockOwnerToken: input.lockOwnerToken,
+        runnerId: nonce,
+        scriptDir,
+        resultFile,
+        decisionFile,
+      });
     }
   }
 
@@ -1483,28 +1711,52 @@ export async function launchDetachedDaemonRuntimeSwitchRunner(input: {
         env,
       });
     } catch (err) {
-      try { unlinkSync(transientTaskXmlPath); } catch {}
-      const msg = err instanceof Error ? err.message : String(err);
-      throw new Error(`daemon_runtime_isolated_handoff_unavailable:win32_schtasks_create:${msg}`);
+      // Task XML uses <Triggers /> + <AllowStartOnDemand>true</AllowStartOnDemand>; /Create never runs the task.
+      return handleHostDispatchError({
+        err,
+        stage: 'win32_schtasks_create',
+        isolationMode,
+        stateDir: input.stateDir,
+        lockOwnerToken: input.lockOwnerToken,
+        runnerId: nonce,
+        scriptDir,
+        resultFile,
+        decisionFile,
+        canAlwaysFenceNonRunningCreation: true,
+        cleanupOnDefiniteRefusal: async () => {
+          try { unlinkSync(transientTaskXmlPath!); } catch {}
+        },
+      });
     }
     try {
       await runHost(schtasksExe, ['/Run', '/TN', transientWindowsTask], {
         timeoutMs: 15_000,
         env,
       });
-      return { scriptDir, scriptPath, logFile, resultFile, isolationMode };
+      return { scriptDir, scriptPath, logFile, resultFile, decisionFile, runnerId: nonce, isolationMode };
     } catch (err) {
-      try {
-        await runHost(schtasksExe, ['/Delete', '/TN', transientWindowsTask, '/F'], {
-          timeoutMs: 10_000,
-          env,
-        });
-      } catch {
-        // preserve /Run error
-      }
-      try { unlinkSync(transientTaskXmlPath); } catch {}
-      const msg = err instanceof Error ? err.message : String(err);
-      throw new Error(`daemon_runtime_isolated_handoff_unavailable:win32_schtasks_run:${msg}`);
+      return handleHostDispatchError({
+        err,
+        stage: 'win32_schtasks_run',
+        isolationMode,
+        stateDir: input.stateDir,
+        lockOwnerToken: input.lockOwnerToken,
+        runnerId: nonce,
+        scriptDir,
+        resultFile,
+        decisionFile,
+        cleanupOnDefiniteRefusal: async () => {
+          try {
+            await runHost(schtasksExe!, ['/Delete', '/TN', transientWindowsTask!, '/F'], {
+              timeoutMs: 10_000,
+              env,
+            });
+          } catch {
+            // preserve /Run error
+          }
+          try { unlinkSync(transientTaskXmlPath!); } catch {}
+        },
+      });
     }
   }
 
@@ -1514,19 +1766,30 @@ export async function launchDetachedDaemonRuntimeSwitchRunner(input: {
         timeoutMs: 15_000,
         env,
       });
-      return { scriptDir, scriptPath, logFile, resultFile, isolationMode };
+      return { scriptDir, scriptPath, logFile, resultFile, decisionFile, runnerId: nonce, isolationMode };
     } catch (err) {
-      try {
-        await runHost('launchctl', ['bootout', `${transientLaunchAgentDomain}/${transientLaunchAgentLabel}`], {
-          timeoutMs: 10_000,
-          env,
-        });
-      } catch {
-        // preserve bootstrap error
-      }
-      try { unlinkSync(transientLaunchAgentPlist); } catch {}
-      const msg = err instanceof Error ? err.message : String(err);
-      throw new Error(`daemon_runtime_isolated_handoff_unavailable:darwin_launchd:${msg}`);
+      return handleHostDispatchError({
+        err,
+        stage: 'darwin_launchd',
+        isolationMode,
+        stateDir: input.stateDir,
+        lockOwnerToken: input.lockOwnerToken,
+        runnerId: nonce,
+        scriptDir,
+        resultFile,
+        decisionFile,
+        cleanupOnDefiniteRefusal: async () => {
+          try {
+            await runHost('launchctl', ['bootout', `${transientLaunchAgentDomain!}/${transientLaunchAgentLabel!}`], {
+              timeoutMs: 10_000,
+              env,
+            });
+          } catch {
+            // preserve bootstrap error
+          }
+          try { unlinkSync(transientLaunchAgentPlist!); } catch {}
+        },
+      });
     }
   }
 
@@ -1538,7 +1801,7 @@ export async function launchDetachedDaemonRuntimeSwitchRunner(input: {
   });
   child.unref();
 
-  return { scriptDir, scriptPath, logFile, resultFile, isolationMode: 'detached_process' };
+  return { scriptDir, scriptPath, logFile, resultFile, decisionFile, runnerId: nonce, isolationMode: 'detached_process' };
 }
 
 /**
@@ -1938,12 +2201,21 @@ export async function upgradeBundledDaemonRuntime(
         ? layoutEntryCandidate
         : (options.entryScriptPath ? resolve(options.entryScriptPath) : undefined);
 
+      const detachedScriptDir = mkdtempSync(join(tmpdir(), 'imcodes-rt-upgrade-'));
+      const runnerId = `${imcodesHomeHash(stateDir)}-${process.pid}-${randomBytes(3).toString('hex')}`;
+      const decisionFile = join(detachedScriptDir, 'handoff-decision.json');
       transferRuntimeUpgradeLock(stateDir, lockHandle.ownerToken, {
         mode: 'detached_handoff_pending',
         targetVersion: targetVer,
+        handoffRunnerId: runnerId,
+        handoffDecisionFile: decisionFile,
+        handoffScriptDir: detachedScriptDir,
+        handoffState: 'pending',
       });
       try {
         const launched = await launchDetachedDaemonRuntimeSwitchRunner({
+          scriptDir: detachedScriptDir,
+          handoffRunnerId: runnerId,
           platform,
           runtimeRoot: writableResolution.targetRoot,
           stagedReleaseDir: releaseDir,
@@ -1979,18 +2251,58 @@ export async function upgradeBundledDaemonRuntime(
           detachedIsolationMode: launched.isolationMode,
         };
       } catch (handoffErr) {
-        lockHandedOff = false;
-        const msg = handoffErr instanceof Error ? handoffErr.message : String(handoffErr);
-        if (msg.startsWith('daemon_runtime_isolated_handoff_unavailable:')) {
+        if (handoffErr instanceof DaemonRuntimeIsolatedHandoffError) {
+          const decisionRec = readHandoffDecisionRecord(handoffErr.decisionFile);
+          const ownerRec = readRuntimeUpgradeLockOwner(stateDir);
+          const runnerClaimed = Boolean(
+            handoffErr.uncertainty === 'claimed'
+            || decisionRec?.decision === 'claimed'
+            || existsSync(handoffErr.resultFile)
+            || (ownerRec
+              && ownerRec.ownerToken === lockHandle.ownerToken
+              && (ownerRec.holder === 'detached_runner' || ownerRec.handoffState === 'claimed')),
+          );
+          if (handoffErr.uncertainty !== 'definite_refusal' || runnerClaimed) {
+            // Runner may have started (or already claimed/switched): preserve releaseDir and lock ownership.
+            lockHandedOff = true;
+            return {
+              status: 'handoff_uncertain',
+              handoffState: runnerClaimed ? 'claimed' : 'uncertain',
+              targetVersion: targetVer,
+              ...(previousVersion ? { previousVersion } : {}),
+              ...(prevTargetForHandoff ? { previousTarget: prevTargetForHandoff } : {}),
+              runtimeRoot: writableResolution.targetRoot,
+              releaseDir,
+              currentLink: join(writableResolution.targetRoot, 'current'),
+              writableRootKind: writableResolution.writableRootKind,
+              detachedScriptDir: handoffErr.scriptDir,
+              detachedIsolationMode: handoffErr.isolationMode,
+              runnerId: handoffErr.runnerId,
+              dispatchStage: handoffErr.stage,
+              ...(handoffErr.errorCode ? { errorCode: handoffErr.errorCode } : {}),
+              message: `Switch-runner handoff outcome ${runnerClaimed ? 'claimed by runner despite dispatch error' : 'uncertain'} at ${handoffErr.stage}; keeping staged release and upgrade lock active: ${handoffErr.message}`,
+              cause: handoffErr.cause,
+            };
+          }
+
+          lockHandedOff = false;
           if (!prevTargetForHandoff || resolve(releaseDir) !== resolve(prevTargetForHandoff)) {
             rmSync(releaseDir, { recursive: true, force: true });
           }
           return {
             status: 'blocked',
             reason: 'isolated_handoff_unavailable',
-            message: `Refusing bundled daemon-runtime switch before pointer/service mutation because isolated OS lifecycle host failed: ${msg}`,
+            message: `Refusing bundled daemon-runtime switch before pointer/service mutation because isolated OS lifecycle host failed: ${handoffErr.message}`,
           };
         }
+        const decisionRec = readHandoffDecisionRecord(decisionFile);
+        const resultFile = join(detachedScriptDir, 'switch-result.json');
+        const ownerRec = readRuntimeUpgradeLockOwner(stateDir);
+        lockHandedOff = Boolean(
+          decisionRec?.decision === 'claimed'
+          || existsSync(resultFile)
+          || (ownerRec && ownerRec.ownerToken === lockHandle.ownerToken && ownerRec.holder === 'detached_runner'),
+        );
         throw handoffErr;
       }
     }
@@ -2198,7 +2510,7 @@ export async function upgradeBundledDaemonRuntime(
     }
     rmSync(workTmpDir, { recursive: true, force: true });
     if (!lockHandedOff) {
-      releaseRuntimeUpgradeLock(stateDir, lockHandle.ownerToken);
+      releaseRuntimeUpgradeLock(stateDir, lockHandle.ownerToken, { expectedHolder: 'parent' });
     }
   }
 }

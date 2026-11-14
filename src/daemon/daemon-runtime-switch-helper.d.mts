@@ -14,6 +14,9 @@ export interface RuntimeUpgradeLockHandle {
   ownerToken: string;
 }
 
+export type RuntimeUpgradeLockHolder = 'parent' | 'detached_runner';
+export type RuntimeUpgradeHandoffState = 'none' | 'pending' | 'claimed' | 'uncertain' | 'cancelled';
+
 export interface RuntimeUpgradeLockOwnerRecord {
   ownerToken: string;
   pid: number;
@@ -21,8 +24,25 @@ export interface RuntimeUpgradeLockOwnerRecord {
   acquiredAt: number;
   updatedAt: number;
   mode: string;
+  holder?: RuntimeUpgradeLockHolder;
+  handoffState?: RuntimeUpgradeHandoffState;
+  handoffRunnerId?: string;
+  handoffDecisionFile?: string;
+  handoffScriptDir?: string;
+  handoffStage?: string;
+  handoffErrorCode?: string;
+  handoffErrorMessage?: string;
+  cancelledAt?: number;
   handoffPending: boolean;
   handoffDeadlineAt?: number;
+}
+
+export interface HandoffDecisionRecord {
+  decision: 'claimed' | 'cancelled';
+  runnerId?: string | null;
+  pid?: number;
+  reason?: string;
+  decidedAt?: number;
 }
 
 import type { ProcessLiveness } from './daemon-lock-identity.mjs';
@@ -99,6 +119,8 @@ export interface DetachedSwitchConfig {
   stateDir: string;
   keepTargets: string[];
   lockOwnerToken?: string | null;
+  handoffRunnerId?: string;
+  handoffDecisionFile?: string;
   targetNodePath?: string;
   targetEntryPath?: string;
   previousNodePath?: string;
@@ -131,6 +153,12 @@ export declare function probeProcessLiveness(pid: number, platform?: NodeJS.Plat
 export declare function probeProcessStartToken(pid: number, platform?: NodeJS.Platform): string | null;
 export declare function readPackageVersionSync(layoutDir: string): string | undefined;
 
+export declare function readRuntimeUpgradeLockOwner(stateDir: string): RuntimeUpgradeLockOwnerRecord | null;
+export declare function readHandoffDecisionRecord(decisionFile: string): HandoffDecisionRecord | null;
+export declare function tryFenceHandoffDecision(
+  decisionFile: string,
+  record: HandoffDecisionRecord,
+): { won: boolean; record: HandoffDecisionRecord | null };
 export declare function acquireRuntimeUpgradeLock(
   stateDir: string,
   options?: { waitMs?: number; staleMs?: number; mode?: string },
@@ -140,12 +168,26 @@ export declare function transferRuntimeUpgradeLock(
   expectedOwnerToken: string,
   patch?: Record<string, unknown>,
 ): RuntimeUpgradeLockOwnerRecord;
+export declare function markRuntimeUpgradeHandoffUncertain(
+  stateDir: string,
+  expectedOwnerToken: string,
+  patch?: Record<string, unknown>,
+): RuntimeUpgradeLockOwnerRecord | null;
+export declare function cancelHandoffRuntimeUpgradeLock(
+  stateDir: string,
+  expectedOwnerToken: string,
+  options?: { expectedRunnerId?: string; handoffDecisionFile?: string; reason?: string },
+): { cancelled: boolean; claimedByRunner: boolean; owner?: RuntimeUpgradeLockOwnerRecord | null; decisionRecord?: HandoffDecisionRecord | null };
 export declare function claimHandoffRuntimeUpgradeLock(
   stateDir: string,
   expectedOwnerToken: string,
   patch?: Record<string, unknown>,
 ): RuntimeUpgradeLockOwnerRecord;
-export declare function releaseRuntimeUpgradeLock(stateDir: string, expectedOwnerToken: string | null | undefined): boolean;
+export declare function releaseRuntimeUpgradeLock(
+  stateDir: string,
+  expectedOwnerToken: string | null | undefined,
+  options?: { expectedHolder?: RuntimeUpgradeLockHolder; expectedPid?: number; expectedRunnerId?: string },
+): boolean;
 
 export declare function writeUpgradeCooldownSentinel(stateDir: string, nowMs?: number): string;
 export declare function readVerifiedDaemonIdentity(

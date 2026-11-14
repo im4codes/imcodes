@@ -1050,7 +1050,10 @@ program
         allowLegacyCliFallback: true,
         detachedHandoff: true,
       });
-      if (res.status === 'upgraded') {
+      if (res.status === 'upgraded' || res.status === 'handoff_uncertain') {
+        if (res.status === 'handoff_uncertain') {
+          console.error(res.message);
+        }
         if (res.detachedScriptDir) {
           const { followDetachedDaemonRuntimeSwitch } = await import('./cli/upgrade-detached.js');
           const exitCode = await followDetachedDaemonRuntimeSwitch({
@@ -1058,6 +1061,7 @@ program
             targetVersion: res.targetVersion,
             runtimeRoot: res.runtimeRoot,
             writableRootKind: res.writableRootKind,
+            ...(res.status === 'handoff_uncertain' ? { handoffUncertain: true } : {}),
           });
           process.exit(exitCode);
         }

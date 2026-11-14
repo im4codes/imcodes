@@ -100,6 +100,36 @@ function readLockOwnerRecord(lockDir) {
   return readJsonSafe(join(lockDir, DAEMON_RUNTIME_LOCK_OWNER_FILE));
 }
 
+export function readRuntimeUpgradeLockOwner(stateDir) {
+  return readLockOwnerRecord(join(resolve(stateDir), DAEMON_RUNTIME_LOCK_DIR_NAME));
+}
+
+export function readHandoffDecisionRecord(decisionFile) {
+  if (!decisionFile) return null;
+  const parsed = readJsonSafe(decisionFile);
+  if (!parsed || typeof parsed !== 'object') return null;
+  if (parsed.decision !== 'claimed' && parsed.decision !== 'cancelled') return null;
+  return parsed;
+}
+
+export function tryFenceHandoffDecision(decisionFile, record) {
+  const resolved = resolve(decisionFile);
+  mkdirSync(dirname(resolved), { recursive: true });
+  try {
+    writeFileSync(resolved, JSON.stringify(record, null, 2), {
+      encoding: 'utf8',
+      flag: 'wx',
+      mode: 0o600,
+    });
+    return { won: true, record };
+  } catch (err) {
+    if (err && typeof err === 'object' && 'code' in err && err.code === 'EEXIST') {
+      return { won: false, record: readHandoffDecisionRecord(resolved) };
+    }
+    throw err;
+  }
+}
+
 function isLockOwnerStale(owner, staleMs) {
   if (!owner || typeof owner !== 'object') return true;
   if (owner.handoffPending === true) {
@@ -143,6 +173,8 @@ export function acquireRuntimeUpgradeLock(stateDir, options = {}) {
         acquiredAt: now,
         updatedAt: now,
         mode: options.mode ?? 'in_process',
+        holder: 'parent',
+        handoffState: 'none',
         handoffPending: false,
       };
       writeFileAtomicSync(ownerPath, JSON.stringify(record, null, 2), 'utf8');
@@ -163,11 +195,30 @@ export function acquireRuntimeUpgradeLock(stateDir, options = {}) {
 
       if (isLockOwnerStale(owner, staleMs)) {
         const expectedStaleToken = owner && typeof owner.ownerToken === 'string' ? owner.ownerToken : null;
+        let blockedByLateClaim = false;
+        if (owner && owner.handoffPending === true && typeof owner.handoffDecisionFile === 'string') {
+          try {
+            const fence = tryFenceHandoffDecision(owner.handoffDecisionFile, {
+              decision: 'cancelled',
+              runnerId: typeof owner.handoffRunnerId === 'string' ? owner.handoffRunnerId : null,
+              reason: 'stale_handoff_reclaimed',
+              decidedAt: Date.now(),
+            });
+            if (!fence.won && fence.record?.decision === 'claimed' && typeof fence.record.pid === 'number') {
+              const liveness = probeProcessLiveness(fence.record.pid);
+              if (liveness.status !== 'reclaimable') {
+                blockedByLateClaim = true;
+              }
+            }
+          } catch {
+            // best effort fence if decision file parent was deleted
+          }
+        }
         const currentOwner = readLockOwnerRecord(lockDir);
         const stillSameOwner =
           (!expectedStaleToken && !currentOwner)
           || (currentOwner && currentOwner.ownerToken === expectedStaleToken);
-        if (stillSameOwner) {
+        if (!blockedByLateClaim && stillSameOwner) {
           rmSync(lockDir, { recursive: true, force: true });
           continue;
         }
@@ -196,12 +247,85 @@ export function transferRuntimeUpgradeLock(stateDir, expectedOwnerToken, patch =
     ...owner,
     ...patch,
     ownerToken: expectedOwnerToken,
+    holder: 'parent',
+    handoffState: typeof patch.handoffState === 'string' ? patch.handoffState : 'pending',
     handoffPending: true,
     handoffDeadlineAt: now + handoffTimeoutMs,
     updatedAt: now,
   };
   writeFileAtomicSync(ownerPath, JSON.stringify(next, null, 2), 'utf8');
   return next;
+}
+
+export function markRuntimeUpgradeHandoffUncertain(stateDir, expectedOwnerToken, patch = {}) {
+  const lockDir = join(resolve(stateDir), DAEMON_RUNTIME_LOCK_DIR_NAME);
+  const ownerPath = join(lockDir, DAEMON_RUNTIME_LOCK_OWNER_FILE);
+  const owner = readLockOwnerRecord(lockDir);
+  if (!owner || owner.ownerToken !== expectedOwnerToken) return null;
+  if (owner.holder === 'detached_runner' || owner.handoffState === 'claimed' || owner.handoffState === 'cancelled') {
+    return owner;
+  }
+  const now = Date.now();
+  const handoffTimeoutMs = typeof patch.handoffTimeoutMs === 'number' ? Math.max(5_000, patch.handoffTimeoutMs) : 30_000;
+  const next = {
+    ...owner,
+    ...patch,
+    ownerToken: expectedOwnerToken,
+    holder: 'parent',
+    handoffState: 'uncertain',
+    handoffPending: true,
+    handoffDeadlineAt: now + handoffTimeoutMs,
+    updatedAt: now,
+  };
+  writeFileAtomicSync(ownerPath, JSON.stringify(next, null, 2), 'utf8');
+  return next;
+}
+
+export function cancelHandoffRuntimeUpgradeLock(stateDir, expectedOwnerToken, options = {}) {
+  const lockDir = join(resolve(stateDir), DAEMON_RUNTIME_LOCK_DIR_NAME);
+  const ownerPath = join(lockDir, DAEMON_RUNTIME_LOCK_OWNER_FILE);
+  const ownerBefore = readLockOwnerRecord(lockDir);
+  const decisionFile = options.handoffDecisionFile
+    ?? (ownerBefore && typeof ownerBefore.handoffDecisionFile === 'string' ? ownerBefore.handoffDecisionFile : undefined);
+  let decisionRecord = null;
+  if (decisionFile) {
+    const fence = tryFenceHandoffDecision(decisionFile, {
+      decision: 'cancelled',
+      runnerId: options.expectedRunnerId
+        ?? (ownerBefore && typeof ownerBefore.handoffRunnerId === 'string' ? ownerBefore.handoffRunnerId : null),
+      reason: options.reason ?? 'definite_refusal',
+      decidedAt: Date.now(),
+    });
+    decisionRecord = fence.record;
+    if (!fence.won && fence.record?.decision === 'claimed') {
+      return {
+        cancelled: false,
+        claimedByRunner: true,
+        owner: readLockOwnerRecord(lockDir),
+        decisionRecord,
+      };
+    }
+  }
+
+  const owner = readLockOwnerRecord(lockDir);
+  if (owner && owner.ownerToken === expectedOwnerToken) {
+    if (owner.holder === 'detached_runner' || owner.handoffState === 'claimed') {
+      return { cancelled: false, claimedByRunner: true, owner, decisionRecord };
+    }
+    const now = Date.now();
+    const next = {
+      ...owner,
+      holder: 'parent',
+      handoffState: 'cancelled',
+      handoffPending: false,
+      cancelledAt: now,
+      updatedAt: now,
+    };
+    delete next.handoffDeadlineAt;
+    writeFileAtomicSync(ownerPath, JSON.stringify(next, null, 2), 'utf8');
+    return { cancelled: true, claimedByRunner: false, owner: next, decisionRecord };
+  }
+  return { cancelled: true, claimedByRunner: false, owner: null, decisionRecord };
 }
 
 export function claimHandoffRuntimeUpgradeLock(stateDir, expectedOwnerToken, patch = {}) {
@@ -211,27 +335,81 @@ export function claimHandoffRuntimeUpgradeLock(stateDir, expectedOwnerToken, pat
   if (!owner || owner.ownerToken !== expectedOwnerToken) {
     throw new Error('daemon_runtime_upgrade_lock_handoff_invalid');
   }
+  if (owner.handoffState === 'cancelled') {
+    throw new Error('daemon_runtime_upgrade_lock_handoff_cancelled:owner_cancelled');
+  }
+  const expectedRunnerId = typeof patch.expectedRunnerId === 'string' && patch.expectedRunnerId
+    ? patch.expectedRunnerId
+    : undefined;
+  if (expectedRunnerId && typeof owner.handoffRunnerId === 'string' && owner.handoffRunnerId !== expectedRunnerId) {
+    throw new Error('daemon_runtime_upgrade_lock_handoff_invalid:runner_mismatch');
+  }
+
+  const decisionFile = typeof patch.handoffDecisionFile === 'string' && patch.handoffDecisionFile
+    ? patch.handoffDecisionFile
+    : (typeof owner.handoffDecisionFile === 'string' ? owner.handoffDecisionFile : undefined);
+  if (decisionFile) {
+    const runnerId = expectedRunnerId ?? (typeof owner.handoffRunnerId === 'string' ? owner.handoffRunnerId : null);
+    const fence = tryFenceHandoffDecision(decisionFile, {
+      decision: 'claimed',
+      runnerId,
+      pid: process.pid,
+      decidedAt: Date.now(),
+    });
+    const ownExistingClaim = Boolean(
+      !fence.won
+      && fence.record?.decision === 'claimed'
+      && fence.record.pid === process.pid
+      && (!runnerId || !fence.record.runnerId || fence.record.runnerId === runnerId),
+    );
+    if (!fence.won && !ownExistingClaim) {
+      throw new Error(`daemon_runtime_upgrade_lock_handoff_cancelled:${fence.record?.decision ?? 'unknown'}`);
+    }
+  }
+
+  const recheckedOwner = readLockOwnerRecord(lockDir);
+  if (!recheckedOwner || recheckedOwner.ownerToken !== expectedOwnerToken || recheckedOwner.handoffState === 'cancelled') {
+    throw new Error('daemon_runtime_upgrade_lock_handoff_cancelled:owner_cancelled');
+  }
+
   const now = Date.now();
   const next = {
-    ...owner,
+    ...recheckedOwner,
     ...patch,
     ownerToken: expectedOwnerToken,
+    holder: 'detached_runner',
+    handoffState: 'claimed',
     pid: process.pid,
     startToken: probeProcessStartToken(process.pid),
     handoffPending: false,
     updatedAt: now,
   };
   delete next.handoffDeadlineAt;
+  delete next.expectedRunnerId;
   writeFileAtomicSync(ownerPath, JSON.stringify(next, null, 2), 'utf8');
   return next;
 }
 
-export function releaseRuntimeUpgradeLock(stateDir, expectedOwnerToken) {
+export function releaseRuntimeUpgradeLock(stateDir, expectedOwnerToken, options = {}) {
   if (!expectedOwnerToken) return false;
   const lockDir = join(resolve(stateDir), DAEMON_RUNTIME_LOCK_DIR_NAME);
   const owner = readLockOwnerRecord(lockDir);
   if (!owner || owner.ownerToken !== expectedOwnerToken) {
     return false;
+  }
+  if (options && typeof options === 'object') {
+    if (options.expectedHolder && owner.holder && owner.holder !== options.expectedHolder) {
+      return false;
+    }
+    if (options.expectedHolder === 'parent' && owner.handoffState === 'claimed') {
+      return false;
+    }
+    if (typeof options.expectedPid === 'number' && owner.pid !== options.expectedPid) {
+      return false;
+    }
+    if (options.expectedRunnerId && owner.handoffRunnerId && owner.handoffRunnerId !== options.expectedRunnerId) {
+      return false;
+    }
   }
   rmSync(lockDir, { recursive: true, force: true });
   return true;
@@ -1099,6 +1277,7 @@ export function runDetachedSwitchTransaction(cfg) {
   let effectivePreviousTarget = cfg.previousTarget || null;
   let effectivePreviousVersion = cfg.previousVersion || null;
   let txResultPayload = { status: 'failed', error: 'unknown_termination', finishedAt: Date.now() };
+  let lockOwnedByRunner = false;
 
   const restoreAll = (oldIdentityForRollback) => {
     const rollbackBeganAtMs = Date.now();
@@ -1196,10 +1375,32 @@ export function runDetachedSwitchTransaction(cfg) {
 
   try {
     if (ownedToken) {
-      claimHandoffRuntimeUpgradeLock(stateDir, ownedToken, { mode: 'detached_runner' });
+      claimHandoffRuntimeUpgradeLock(stateDir, ownedToken, {
+        mode: 'detached_runner',
+        expectedRunnerId: cfg.handoffRunnerId,
+        handoffDecisionFile: cfg.handoffDecisionFile,
+      });
+      lockOwnedByRunner = true;
     } else {
+      if (cfg.handoffDecisionFile) {
+        const fence = tryFenceHandoffDecision(cfg.handoffDecisionFile, {
+          decision: 'claimed',
+          runnerId: cfg.handoffRunnerId ?? null,
+          pid: process.pid,
+          decidedAt: Date.now(),
+        });
+        const ownClaim = Boolean(
+          !fence.won
+          && fence.record?.decision === 'claimed'
+          && fence.record.pid === process.pid,
+        );
+        if (!fence.won && !ownClaim) {
+          throw new Error(`daemon_runtime_upgrade_lock_handoff_cancelled:${fence.record?.decision ?? 'unknown'}`);
+        }
+      }
       const acquired = acquireRuntimeUpgradeLock(stateDir, { mode: 'detached_runner', waitMs: 5_000 });
       ownedToken = acquired.ownerToken;
+      lockOwnedByRunner = true;
     }
 
     recoverInterruptedDaemonRuntimeSwitch(cfg.runtimeRoot, cfg.platform);
@@ -1299,35 +1500,43 @@ export function runDetachedSwitchTransaction(cfg) {
     };
     return false;
   } finally {
-    releaseRuntimeUpgradeLock(stateDir, ownedToken);
+    if (lockOwnedByRunner) {
+      releaseRuntimeUpgradeLock(stateDir, ownedToken, {
+        expectedHolder: 'detached_runner',
+        expectedPid: process.pid,
+        expectedRunnerId: cfg.handoffRunnerId,
+      });
+    }
     writeSwitchResult(txResultPayload);
-    if (cfg?.transientTaskXmlPath) {
-      try { unlinkSync(cfg.transientTaskXmlPath); } catch {}
-    }
-    if (cfg?.transientWindowsTask) {
-      try {
-        spawnSync(cfg.schtasksExe || 'schtasks', ['/Delete', '/TN', cfg.transientWindowsTask, '/F'], {
-          stdio: 'ignore',
-          windowsHide: true,
-          timeout: 10_000,
-        });
-      } catch {
-        // best effort cleanup of one-shot Windows switch task
+    if (lockOwnedByRunner) {
+      if (cfg?.transientTaskXmlPath) {
+        try { unlinkSync(cfg.transientTaskXmlPath); } catch {}
       }
-    }
-    if (cfg?.transientLaunchAgentPlist) {
-      try { unlinkSync(cfg.transientLaunchAgentPlist); } catch {}
-    }
-    if (cfg?.transientLaunchAgentDomain && cfg?.transientLaunchAgentLabel) {
-      try {
-        const cleanupChild = spawn(
-          '/bin/sh',
-          ['-c', 'sleep 1; launchctl bootout "$1" >/dev/null 2>&1 || true', 'imcodes-switch-cleanup', `${cfg.transientLaunchAgentDomain}/${cfg.transientLaunchAgentLabel}`],
-          { detached: true, stdio: 'ignore' },
-        );
-        cleanupChild.unref();
-      } catch {
-        // best effort cleanup of transient launchd job
+      if (cfg?.transientWindowsTask) {
+        try {
+          spawnSync(cfg.schtasksExe || 'schtasks', ['/Delete', '/TN', cfg.transientWindowsTask, '/F'], {
+            stdio: 'ignore',
+            windowsHide: true,
+            timeout: 10_000,
+          });
+        } catch {
+          // best effort cleanup of one-shot Windows switch task
+        }
+      }
+      if (cfg?.transientLaunchAgentPlist) {
+        try { unlinkSync(cfg.transientLaunchAgentPlist); } catch {}
+      }
+      if (cfg?.transientLaunchAgentDomain && cfg?.transientLaunchAgentLabel) {
+        try {
+          const cleanupChild = spawn(
+            '/bin/sh',
+            ['-c', 'sleep 1; launchctl bootout "$1" >/dev/null 2>&1 || true', 'imcodes-switch-cleanup', `${cfg.transientLaunchAgentDomain}/${cfg.transientLaunchAgentLabel}`],
+            { detached: true, stdio: 'ignore' },
+          );
+          cleanupChild.unref();
+        } catch {
+          // best effort cleanup of transient launchd job
+        }
       }
     }
   }

@@ -198,6 +198,7 @@ export async function followDetachedDaemonRuntimeSwitch(
     targetVersion: string;
     runtimeRoot: string;
     writableRootKind: string;
+    handoffUncertain?: boolean;
   },
   deps: {
     write?: (line: string) => void;
@@ -208,7 +209,11 @@ export async function followDetachedDaemonRuntimeSwitch(
   const write = deps.write ?? ((line: string) => { console.log(line); });
   const logFile = join(input.scriptDir, 'runtime-upgrade.log');
   const resultFile = join(input.scriptDir, 'switch-result.json');
-  write(`Daemon-runtime switch runner started in background (v${input.targetVersion}, ${input.writableRootKind}: ${input.runtimeRoot}). Log: ${logFile}`);
+  write(
+    input.handoffUncertain
+      ? `Daemon-runtime switch-runner handoff status uncertain (v${input.targetVersion}, ${input.writableRootKind}: ${input.runtimeRoot}); preserving staged release and following isolated runner outcome. Log: ${logFile}`
+      : `Daemon-runtime switch runner started in background (v${input.targetVersion}, ${input.writableRootKind}: ${input.runtimeRoot}). Log: ${logFile}`,
+  );
   return followUpgrade({
     logFile,
     readResult: () => readDaemonRuntimeSwitchResult(resultFile),
