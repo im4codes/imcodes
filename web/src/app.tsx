@@ -7134,6 +7134,7 @@ function InternalMainApp() {
     localStorage.removeItem('rcc_server_name');
     localStorage.removeItem('rcc_session');
     clearSharedTabRestoreMarker();
+    selectedServerIdRef.current = null;
     setSelectedServerId(null);
     setSelectedServerName(null);
     setSelectedShareTarget(null);
@@ -7628,13 +7629,16 @@ function InternalMainApp() {
       serverSwitchWatermark.switchKind !== 'server'
       && selectedShareTarget !== null
       && selectedShareTarget.kind !== 'server';
-    const isPendingSharedTarget = Boolean(
-      serverSwitchWatermark.sharedEntryId
-      && openingSharedEntryId === serverSwitchWatermark.sharedEntryId,
-    );
+    const isPendingSharedTarget =
+      serverSwitchWatermark.switchKind === 'server'
+      && Boolean(
+        serverSwitchWatermark.sharedEntryId
+        && openingSharedEntryId === serverSwitchWatermark.sharedEntryId,
+      );
     if (
-      manualDashboard
+      (manualDashboard && !isPendingSharedTarget)
       || (isRestrictedTabWatermark && !isPendingSharedTarget)
+      || (!selectedServerId && !isPendingSharedTarget)
       || (selectedServerId && selectedServerId !== serverSwitchWatermark.serverId && !isPendingSharedTarget)
     ) {
       setServerSwitchWatermark(null);
@@ -10339,19 +10343,22 @@ function InternalMainApp() {
           serverSwitchWatermark?.switchKind === 'server'
           || selectedShareTarget === null
           || selectedShareTarget.kind === 'server';
-        const watermarkTargetMatches =
+        const isPendingSharedTarget =
           serverSwitchWatermark !== null
-          && !manualDashboard
-          && isAllowedWatermarkTarget
-          && selectedServerId === serverSwitchWatermark.serverId;
-        const isPendingSharedWatermark =
-          serverSwitchWatermark !== null
-          && !manualDashboard
-          && selectedServerId !== serverSwitchWatermark.serverId
+          && serverSwitchWatermark.switchKind === 'server'
           && Boolean(
             serverSwitchWatermark.sharedEntryId
             && openingSharedEntryId === serverSwitchWatermark.sharedEntryId,
           );
+        const watermarkTargetMatches =
+          serverSwitchWatermark !== null
+          && !manualDashboard
+          && isAllowedWatermarkTarget
+          && selectedServerId === serverSwitchWatermark.serverId
+          && !isPendingSharedTarget;
+        const isPendingSharedWatermark =
+          isPendingSharedTarget
+          && (manualDashboard || selectedServerId !== serverSwitchWatermark.serverId);
         const watermarkSessionName = watermarkTargetMatches
           ? (serverSwitchWatermark.sessionName !== undefined
             ? serverSwitchWatermark.sessionName

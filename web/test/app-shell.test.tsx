@@ -9993,4 +9993,246 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
     }
   }, 15000);
+
+  it.each(['server', 'main', 'subsession'] as const)(
+    'preserves and updates ServerSwitchWatermark when 2-finger swiping from mobile Home/dashboard onto slow async %s share',
+    async (shareKind) => {
+      const dispatchSwipe = (
+        target: EventTarget,
+        start: Array<{ identifier: number; clientX: number; clientY: number }>,
+        move: Array<{ identifier: number; clientX: number; clientY: number }>,
+      ) => {
+        const mkEvent = (type: string, touches: typeof start, changedTouches: typeof start = []) => {
+          const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
+            touches: typeof start;
+            changedTouches: typeof start;
+          };
+          Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
+          Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
+          return evt;
+        };
+        target.dispatchEvent(mkEvent('touchstart', start));
+        target.dispatchEvent(mkEvent('touchmove', move));
+        target.dispatchEvent(mkEvent('touchend', [], move));
+      };
+
+      apiFetchMock.mockImplementation(async (path: string) => {
+        if (path === '/api/auth/user/me') return { id: 'user-1' };
+        if (path === '/api/server') return { servers: [serverList().servers[0]] };
+        if (path === '/api/server/srv-1/sessions') {
+          return {
+            sessions: [
+              { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/alpha', state: 'idle' },
+            ],
+          };
+        }
+        if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+        return {};
+      });
+
+      const target = shareKind === 'server'
+        ? { kind: 'server' as const, serverId: 'srv-dash-shared' }
+        : shareKind === 'main'
+          ? { kind: 'main' as const, serverId: 'srv-dash-shared', sessionName: 'deck_shared_dash' }
+          : { kind: 'subsession' as const, serverId: 'srv-dash-shared', sessionName: 'deck_sub_dash', subSessionId: 'subdash' };
+      const sharedEntry = {
+        id: `share-dash-${shareKind}`,
+        serverId: 'srv-dash-shared',
+        serverName: 'Shared Dash Remote',
+        role: 'participant' as const,
+        status: 'active' as const,
+        targetLabel: shareKind === 'server' ? 'Shared Dash Remote' : 'Dash Tab',
+        lastHeartbeatAt: Date.now(),
+        target,
+      };
+      discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+
+      let resolveOpen!: (value: unknown) => void;
+      openSharedEntryMock.mockImplementation(() => new Promise((resolve) => {
+        resolveOpen = resolve;
+      }));
+
+      const originalUserAgent = navigator.userAgent;
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+      try {
+        localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+        localStorage.setItem('rcc_server', 'srv-1');
+        localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+        const { App } = await importApp();
+        const view = render(<App />);
+        await screen.findByTestId('session-pane-deck_alpha_brain');
+        await waitFor(() => expect(discoverSharedEntriesMock).toHaveBeenCalled());
+
+        // Enter Home / dashboard explicitly via mobile menu Home button
+        fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+        fireEvent.click(view.container.querySelector('.mobile-server-menu-home')!);
+        expect(await screen.findByText('dashboard-page')).toBeTruthy();
+
+        // 2-finger swipe Up (serverPrev) from Home hits unifiedServers tail (srv-dash-shared)
+        dispatchSwipe(
+          view.container,
+          [{ identifier: 1, clientX: 120, clientY: 260 }, { identifier: 2, clientX: 170, clientY: 262 }],
+          [{ identifier: 1, clientX: 120, clientY: 160 }, { identifier: 2, clientX: 170, clientY: 162 }],
+        );
+
+        await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(target));
+        const pendingHud = await screen.findByTestId('server-switch-watermark');
+        expect(pendingHud.getAttribute('data-switch-kind')).toBe('server');
+        expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Shared Dash Remote');
+        expect(screen.getByTestId('server-switch-watermark-session').textContent).not.toMatch(/alpha/i);
+
+        await act(async () => {
+          resolveOpen({
+            server: { id: 'srv-dash-shared', name: 'Shared Dash Remote', status: 'active', lastHeartbeatAt: Date.now() },
+            target,
+            coverage: {
+              effectiveRole: 'participant',
+              historyCutoffAt: 0,
+              nextCoverageRecheckAt: null,
+              coveringShareIds: [sharedEntry.id],
+              primaryShareId: sharedEntry.id,
+              authorizedAt: Date.now(),
+            },
+            sessions: [
+              { sessionName: 'deck_shared_dash', title: 'Dash Main Session', state: 'idle', agentType: 'codex-sdk', activeDispatchId: null, supervisionMode: null },
+            ],
+            subSessions: shareKind === 'subsession'
+              ? [{ subSessionId: 'subdash', sessionName: 'deck_sub_dash', parentSessionName: 'deck_shared_dash', title: 'Dash Sub', state: 'idle', agentType: 'codex-sdk', activeDispatchId: null }]
+              : [],
+          });
+        });
+
+        await waitFor(() => {
+          expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('server');
+          expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Shared Dash Remote');
+          expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('Dash Main Session');
+        });
+        await screen.findByTestId('session-pane-deck_shared_dash');
+      } finally {
+        Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+      }
+    },
+    15000,
+  );
+
+  it('clears pending dashboard ServerSwitchWatermark cleanly on share error and blocks stale late resolve after switching away', async () => {
+    const dispatchSwipe = (
+      target: EventTarget,
+      start: Array<{ identifier: number; clientX: number; clientY: number }>,
+      move: Array<{ identifier: number; clientX: number; clientY: number }>,
+    ) => {
+      const mkEvent = (type: string, touches: typeof start, changedTouches: typeof start = []) => {
+        const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
+          touches: typeof start;
+          changedTouches: typeof start;
+        };
+        Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
+        Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
+        return evt;
+      };
+      target.dispatchEvent(mkEvent('touchstart', start));
+      target.dispatchEvent(mkEvent('touchmove', move));
+      target.dispatchEvent(mkEvent('touchend', [], move));
+    };
+
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return { servers: [serverList().servers[0]] };
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/alpha', state: 'idle' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const sharedEntry = {
+      id: 'share-dash-err',
+      serverId: 'srv-dash-err',
+      serverName: 'Shared Err Host',
+      role: 'participant' as const,
+      status: 'active' as const,
+      targetLabel: 'Shared Err Host',
+      lastHeartbeatAt: Date.now(),
+      target: { kind: 'server' as const, serverId: 'srv-dash-err' },
+    };
+    discoverSharedEntriesMock.mockResolvedValue([sharedEntry]);
+
+    let rejectOpen!: (err: Error) => void;
+    let resolveStaleOpen!: (value: unknown) => void;
+    let attempt = 0;
+    openSharedEntryMock.mockImplementation(() => new Promise((resolve, reject) => {
+      attempt += 1;
+      if (attempt === 1) rejectOpen = reject;
+      else resolveStaleOpen = resolve;
+    }));
+
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      const view = render(<App />);
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+      await waitFor(() => expect(discoverSharedEntriesMock).toHaveBeenCalled());
+
+      fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
+      fireEvent.click(view.container.querySelector('.mobile-server-menu-home')!);
+      expect(await screen.findByText('dashboard-page')).toBeTruthy();
+
+      // Attempt 1: pending HUD appears from dashboard, then request rejects -> HUD clears and stays on dashboard
+      dispatchSwipe(
+        view.container,
+        [{ identifier: 1, clientX: 120, clientY: 260 }, { identifier: 2, clientX: 170, clientY: 262 }],
+        [{ identifier: 1, clientX: 120, clientY: 160 }, { identifier: 2, clientX: 170, clientY: 162 }],
+      );
+      await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledTimes(1));
+      expect((await screen.findByTestId('server-switch-watermark-server')).textContent).toBe('Shared Err Host');
+
+      await act(async () => {
+        rejectOpen(new Error('Share denied'));
+      });
+      await waitFor(() => expect(screen.queryByTestId('server-switch-watermark')).toBeNull());
+      expect(screen.getByText('dashboard-page')).toBeTruthy();
+
+      // Attempt 2: pending shared open from dashboard, then swipe Down synchronously selects owned srv-1 -> abort + late resolve ignored
+      dispatchSwipe(
+        view.container,
+        [{ identifier: 1, clientX: 120, clientY: 260 }, { identifier: 2, clientX: 170, clientY: 262 }],
+        [{ identifier: 1, clientX: 120, clientY: 160 }, { identifier: 2, clientX: 170, clientY: 162 }],
+      );
+      await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledTimes(2));
+      expect((await screen.findByTestId('server-switch-watermark-server')).textContent).toBe('Shared Err Host');
+
+      dispatchSwipe(
+        view.container,
+        [{ identifier: 1, clientX: 120, clientY: 160 }, { identifier: 2, clientX: 170, clientY: 162 }],
+        [{ identifier: 1, clientX: 120, clientY: 250 }, { identifier: 2, clientX: 170, clientY: 252 }],
+      );
+      await waitFor(() => expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Alpha Server'));
+      await screen.findByTestId('session-pane-deck_alpha_brain');
+
+      // Late resolution of superseded shared open must NOT overwrite owned srv-1 or revive Shared Err Host HUD
+      await act(async () => {
+        resolveStaleOpen({
+          server: { id: 'srv-dash-err', name: 'Shared Err Host', status: 'active', lastHeartbeatAt: Date.now() },
+          target: sharedEntry.target,
+          coverage: { effectiveRole: 'participant', historyCutoffAt: 0, nextCoverageRecheckAt: null, coveringShareIds: ['share-dash-err'], primaryShareId: 'share-dash-err', authorizedAt: Date.now() },
+          sessions: [{ sessionName: 'deck_err_sess', title: 'Err Session', state: 'idle', agentType: 'codex-sdk', activeDispatchId: null, supervisionMode: null }],
+          subSessions: [],
+        });
+      });
+      expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Alpha Server');
+      expect(screen.queryByTestId('session-pane-deck_err_sess')).toBeNull();
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 15000);
 });
