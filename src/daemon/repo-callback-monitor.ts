@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { realpathSync } from 'node:fs';
+import path from 'node:path';
 import {
   CALLBACK_SOURCES,
   buildCallbackId,
@@ -53,6 +55,7 @@ export const REPO_CALLBACK_DEFAULT_MAX_BASELINE_PAGES = 100;
 export const REPO_CALLBACK_MAX_DETAIL_FETCHES_PER_POLL = 10;
 const PENDING_RUN_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_TRACKED_PENDING_RUNS = 50;
+const MAX_FAILED_DISPATCH_ATTEMPTS = 5;
 
 const FAILED_CI_CONCLUSIONS = new Set([
   'failure',
@@ -93,9 +96,37 @@ interface PollPageItem {
   markSeenOnBaseline: boolean;
   runAttempt?: number;
   createdAtMs?: number;
+  updatedAtMs?: number;
   dedupKey: string;
   ciStateUpsert?: CallbackCiRunStateRecord;
   candidate?: DetectedEventCandidate;
+}
+
+function normalizeLexicalProjectDir(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return '';
+  const resolved = path.resolve(trimmed);
+  if (resolved === path.parse(resolved).root) return resolved;
+  return resolved.replace(/[\\/]+$/, '');
+}
+
+function canonicalizeProjectDir(raw: string): string {
+  const lexical = normalizeLexicalProjectDir(raw);
+  if (!lexical) return '';
+  try {
+    return realpathSync(lexical);
+  } catch {
+    return lexical;
+  }
+}
+
+function sameProjectDir(a: string | undefined | null, b: string | undefined | null): boolean {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const lexA = normalizeLexicalProjectDir(a);
+  const lexB = normalizeLexicalProjectDir(b);
+  if (lexA === lexB) return true;
+  return canonicalizeProjectDir(lexA) === canonicalizeProjectDir(lexB);
 }
 
 export interface RepoCallbackMonitorDeps {
@@ -330,6 +361,7 @@ export class RepoCallbackMonitor {
   private lastPollAt = new Map<string, number>();
   private lastErrorByProject = new Map<string, string>();
   private inFlightProjects = new Set<string>();
+  private failedDispatchAttempts = new Map<string, number>();
   private unsubscribeStore: (() => void) | null = null;
   private syncTimer: ReturnType<typeof setInterval> | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -394,16 +426,34 @@ export class RepoCallbackMonitor {
     }
   }
 
+  private resolveConfigKey(projectDir: string): string {
+    if (this.repoConfigs.has(projectDir)) return projectDir;
+    for (const key of this.repoConfigs.keys()) {
+      if (sameProjectDir(key, projectDir)) return key;
+    }
+    return projectDir;
+  }
+
   getRepoConfig(projectDir: string): RepoCallbackRepoConfig | undefined {
-    return this.repoConfigs.get(projectDir);
+    return this.repoConfigs.get(this.resolveConfigKey(projectDir));
   }
 
   getRecentCallbacks(projectDir: string, limit = REPO_CALLBACK_RECENT_HISTORY_LIMIT): CallbackTaskRecord[] {
     return this.store.listCallbacks({
       source: CALLBACK_SOURCES.REPO,
-      scopeKey: projectDir,
+      scopeKey: this.resolveConfigKey(projectDir),
       limit,
     });
+  }
+
+  private emitStatusSnapshot(projectDir: string, requestId?: string): void {
+    const serverLink = this.getServerLink();
+    if (!serverLink) return;
+    try {
+      serverLink.send(this.buildStatusSnapshot(projectDir, requestId));
+    } catch {
+      // Best-effort live UI push; UI can still re-sync cleanly.
+    }
   }
 
   private broadcastCallbackEvent(record: CallbackTaskRecord): void {
@@ -517,28 +567,29 @@ export class RepoCallbackMonitor {
   }
 
   async checkProject(projectDir: string): Promise<{ checked: boolean; dispatched: number; error?: string }> {
-    const config = this.repoConfigs.get(projectDir);
+    const configKey = this.resolveConfigKey(projectDir);
+    const config = this.repoConfigs.get(configKey);
     if (!config || !config.enabled) {
       return { checked: false, dispatched: 0 };
     }
-    if (this.inFlightProjects.has(projectDir)) {
+    if (this.inFlightProjects.has(configKey)) {
       return { checked: false, dispatched: 0 };
     }
-    this.inFlightProjects.add(projectDir);
+    this.inFlightProjects.add(configKey);
     try {
       const enabledEvents = REPO_CALLBACK_EVENTS.filter((eventType) => config.events[eventType]?.enabled);
       if (enabledEvents.length === 0) {
-        this.lastPollAt.set(projectDir, this.now());
-        this.lastErrorByProject.delete(projectDir);
+        this.lastPollAt.set(configKey, this.now());
+        this.lastErrorByProject.delete(configKey);
         return { checked: true, dispatched: 0 };
       }
 
-      const ctx = await this.detect(projectDir);
-      const provider = this.createProviderFn(ctx, projectDir);
+      const ctx = await this.detect(configKey);
+      const provider = this.createProviderFn(ctx, configKey);
       if (!provider || !ctx.info || ctx.status !== 'ok') {
         const errMsg = `repo unavailable (${ctx.status})`;
-        this.lastErrorByProject.set(projectDir, errMsg);
-        this.lastPollAt.set(projectDir, this.now());
+        this.lastErrorByProject.set(configKey, errMsg);
+        this.lastPollAt.set(configKey, this.now());
         return { checked: false, dispatched: 0, error: errMsg };
       }
 
@@ -552,27 +603,28 @@ export class RepoCallbackMonitor {
             provider,
             config,
             repoSlug,
-            projectDir,
+            configKey,
             eventType,
           );
         } catch (err) {
           // Never write anything into callback_seen or advance checkpoint past a failed page.
           const msg = err instanceof Error ? err.message : String(err);
           eventErrors.push(`${eventType}: ${msg}`);
-          logger.warn({ err, projectDir, eventType }, 'repo-callback-monitor: event poll failed');
+          logger.warn({ err, projectDir: configKey, eventType }, 'repo-callback-monitor: event poll failed');
         }
       }
 
-      this.lastPollAt.set(projectDir, this.now());
+      this.lastPollAt.set(configKey, this.now());
       if (eventErrors.length > 0) {
         const joined = eventErrors.join('; ');
-        this.lastErrorByProject.set(projectDir, joined);
+        this.lastErrorByProject.set(configKey, joined);
         return { checked: true, dispatched, error: joined };
       }
-      this.lastErrorByProject.delete(projectDir);
+      this.lastErrorByProject.delete(configKey);
       return { checked: true, dispatched };
     } finally {
-      this.inFlightProjects.delete(projectDir);
+      this.inFlightProjects.delete(configKey);
+      this.emitStatusSnapshot(configKey);
     }
   }
 
@@ -607,7 +659,12 @@ export class RepoCallbackMonitor {
 
     const pendingMap = new Map<number, number | undefined>();
     for (const entry of checkpoint?.pendingSeqs ?? []) {
-      if (effectiveSinceMs !== null && entry.createdAt !== undefined && entry.createdAt < effectiveSinceMs) {
+      if (
+        effectiveSinceMs !== null
+        && eventType !== 'ci_failed'
+        && entry.createdAt !== undefined
+        && entry.createdAt < effectiveSinceMs
+      ) {
         continue;
       }
       pendingMap.set(entry.seq, entry.createdAt);
@@ -683,6 +740,7 @@ export class RepoCallbackMonitor {
       hasMore: boolean;
       minSeqOnPage: number | null;
       maxSeqOnPage: number | null;
+      minFailedSeq: number | null;
       sawBelowCutoff: boolean;
     }> => {
       const pageResult = await this.fetchEventPage(provider, projectDir, eventType, page);
@@ -690,15 +748,35 @@ export class RepoCallbackMonitor {
 
       let minSeqOnPage: number | null = null;
       let maxSeqOnPage: number | null = null;
+      let minFailedSeq: number | null = null;
       let sawBelowCutoff = false;
-      const pageCandidates: Array<{ candidate: DetectedEventCandidate; ciStateUpsert?: CallbackCiRunStateRecord }> = [];
+      const pageCandidates: Array<{ seq: number; candidate: DetectedEventCandidate; ciStateUpsert?: CallbackCiRunStateRecord }> = [];
       const nonCandidateCiUpserts: CallbackCiRunStateRecord[] = [];
 
       for (const item of pageResult.items) {
         minSeqOnPage = minSeqOnPage === null ? item.seq : Math.min(minSeqOnPage, item.seq);
         maxSeqOnPage = maxSeqOnPage === null ? item.seq : Math.max(maxSeqOnPage, item.seq);
 
-        if (effectiveSinceMs !== null && item.createdAtMs !== undefined && item.createdAtMs < effectiveSinceMs) {
+        const wasPending = pendingMap.has(item.seq);
+        if (eventType === 'ci_failed') {
+          if (item.pending) {
+            // Keep active pre-cutoff in-flight runs tracked within PENDING_RUN_TTL_MS without stopping pagination early.
+            const ageMs = item.createdAtMs !== undefined ? this.now() - item.createdAtMs : 0;
+            if (ageMs <= PENDING_RUN_TTL_MS) {
+              pendingMap.set(item.seq, item.createdAtMs);
+              if (item.ciStateUpsert) nonCandidateCiUpserts.push(item.ciStateUpsert);
+              continue;
+            }
+          }
+          const activityMs = (item.createdAtMs !== undefined || item.updatedAtMs !== undefined)
+            ? Math.max(item.createdAtMs ?? 0, item.updatedAtMs ?? 0)
+            : undefined;
+          if (effectiveSinceMs !== null && activityMs !== undefined && activityMs < effectiveSinceMs && !wasPending) {
+            sawBelowCutoff = true;
+            pendingMap.delete(item.seq);
+            continue;
+          }
+        } else if (effectiveSinceMs !== null && item.createdAtMs !== undefined && item.createdAtMs < effectiveSinceMs) {
           sawBelowCutoff = true;
           pendingMap.delete(item.seq);
           continue;
@@ -719,12 +797,12 @@ export class RepoCallbackMonitor {
           if (item.ciStateUpsert) nonCandidateCiUpserts.push(item.ciStateUpsert);
           continue;
         }
-        pageCandidates.push({ candidate: item.candidate, ciStateUpsert: item.ciStateUpsert });
+        pageCandidates.push({ seq: item.seq, candidate: item.candidate, ciStateUpsert: item.ciStateUpsert });
       }
 
       this.store.upsertCiRunStates(nonCandidateCiUpserts);
 
-      for (const { candidate, ciStateUpsert } of pageCandidates) {
+      for (const { seq, candidate, ciStateUpsert } of pageCandidates) {
         if (
           eventType === 'ci_failed'
           && typeof candidate.metadata.runId === 'number'
@@ -743,21 +821,42 @@ export class RepoCallbackMonitor {
         }
         delete candidate.metadata._run;
 
-        // Mark seen + commit CI state immediately before dispatch so overlapping ticks or restarts never double-fire or lose generation.
-        this.store.markSeenDedupKeys(CALLBACK_SOURCES.REPO, projectDir, [candidate.dedupKey], this.now());
-        if (ciStateUpsert) {
-          this.store.upsertCiRunStates([ciStateUpsert]);
+        const outcome = await this.dispatchCandidate(config, repoSlug, candidate);
+        if (outcome === 'sent') {
+          this.store.markSeenDedupKeys(CALLBACK_SOURCES.REPO, projectDir, [candidate.dedupKey], this.now());
+          if (ciStateUpsert) {
+            this.store.upsertCiRunStates([ciStateUpsert]);
+          }
+          dispatched += 1;
+        } else if (outcome === 'exhausted' || outcome === 'already_handled') {
+          this.store.markSeenDedupKeys(CALLBACK_SOURCES.REPO, projectDir, [candidate.dedupKey], this.now());
+          if (ciStateUpsert) {
+            this.store.upsertCiRunStates([ciStateUpsert]);
+          }
+        } else {
+          minFailedSeq = minFailedSeq === null ? seq : Math.min(minFailedSeq, seq);
         }
-        await this.dispatchCandidate(config, repoSlug, candidate);
-        dispatched += 1;
       }
 
       return {
         hasMore: pageResult.hasMore,
         minSeqOnPage,
         maxSeqOnPage,
+        minFailedSeq,
         sawBelowCutoff,
       };
+    };
+
+    let pollMinFailedSeq: number | null = null;
+    const recordFailedSeq = (seq: number | null): void => {
+      if (seq === null) return;
+      pollMinFailedSeq = pollMinFailedSeq === null ? seq : Math.min(pollMinFailedSeq, seq);
+    };
+    const commitWatermark = (candidateHigh: number): number => {
+      const boundedHigh = pollMinFailedSeq !== null
+        ? Math.min(candidateHigh, pollMinFailedSeq - 1)
+        : candidateHigh;
+      return Math.max(watermarkSeq, boundedHigh);
     };
 
     if (eventType !== 'ci_failed') {
@@ -765,6 +864,7 @@ export class RepoCallbackMonitor {
       // so scanning stops once we hit our creation watermark or cutoff (still never stopping on filtered-empty pages when hasMore is true and cutoff is not hit).
       while (pagesFetched < this.maxPagesPerPoll) {
         const pageInfo = await processPage(currentPage);
+        recordFailedSeq(pageInfo.minFailedSeq);
         if (pageInfo.maxSeqOnPage !== null) {
           syncHighSeq = syncHighSeq === null ? pageInfo.maxSeqOnPage : Math.max(syncHighSeq, pageInfo.maxSeqOnPage);
         }
@@ -786,7 +886,7 @@ export class RepoCallbackMonitor {
           eventType,
           baselineComplete: true,
           baselineNextPage: 1,
-          watermarkSeq: reachedWatermark ? Math.max(watermarkSeq, syncHighSeq ?? watermarkSeq) : watermarkSeq,
+          watermarkSeq: reachedWatermark ? commitWatermark(syncHighSeq ?? watermarkSeq) : watermarkSeq,
           syncNextPage: reachedWatermark ? 1 : currentPage + 1,
           syncHighSeq: reachedWatermark ? null : syncHighSeq,
           pendingSeqs: nextPending,
@@ -808,6 +908,7 @@ export class RepoCallbackMonitor {
 
     if (!inHeadCatchup && currentPage > 1 && this.maxPagesPerPoll >= 2) {
       const page1 = await processPage(1);
+      recordFailedSeq(page1.minFailedSeq);
       const page1StoppedAtCutoff = effectiveSinceMs !== null && page1.sawBelowCutoff;
       if (page1.maxSeqOnPage !== null && page1.maxSeqOnPage > watermarkSeq) {
         const page1ClearedBurst =
@@ -815,7 +916,7 @@ export class RepoCallbackMonitor {
           || page1StoppedAtCutoff
           || (page1.minSeqOnPage !== null && page1.minSeqOnPage <= watermarkSeq);
         if (page1ClearedBurst) {
-          watermarkSeq = page1.maxSeqOnPage;
+          watermarkSeq = commitWatermark(page1.maxSeqOnPage);
           syncHighSeq = null;
         } else {
           syncHighSeq = page1.maxSeqOnPage;
@@ -848,6 +949,7 @@ export class RepoCallbackMonitor {
 
     while (pagesFetched < this.maxPagesPerPoll) {
       const pageInfo = await processPage(currentPage);
+      recordFailedSeq(pageInfo.minFailedSeq);
       if (pageInfo.maxSeqOnPage !== null && (currentPage === 1 || inHeadCatchup)) {
         syncHighSeq = syncHighSeq === null ? pageInfo.maxSeqOnPage : Math.max(syncHighSeq, pageInfo.maxSeqOnPage);
       }
@@ -858,7 +960,7 @@ export class RepoCallbackMonitor {
         || stoppedAtCutoff
         || (pageInfo.minSeqOnPage !== null && pageInfo.minSeqOnPage <= watermarkSeq);
       if (caughtUpToWatermark && syncHighSeq !== null) {
-        watermarkSeq = Math.max(watermarkSeq, syncHighSeq);
+        watermarkSeq = commitWatermark(syncHighSeq);
         syncHighSeq = null;
         inHeadCatchup = false;
       } else if (!inHeadCatchup && currentPage === 1 && syncHighSeq !== null && syncHighSeq > watermarkSeq) {
@@ -869,7 +971,7 @@ export class RepoCallbackMonitor {
       const nextPage = wrapped ? 1 : currentPage + 1;
       if (wrapped) {
         if (syncHighSeq !== null) {
-          watermarkSeq = Math.max(watermarkSeq, syncHighSeq);
+          watermarkSeq = commitWatermark(syncHighSeq);
         }
         syncHighSeq = null;
         inHeadCatchup = false;
@@ -988,6 +1090,7 @@ export class RepoCallbackMonitor {
           markSeenOnBaseline: failed,
           runAttempt: attempt,
           createdAtMs: toTimestampMs(run.createdAt),
+          updatedAtMs: toTimestampMs(run.updatedAt),
           dedupKey,
           ciStateUpsert: stateResolution.upsert,
           candidate: failed
@@ -1019,7 +1122,7 @@ export class RepoCallbackMonitor {
 
   private resolveTargetSession(config: RepoCallbackRepoConfig): { sessionName: string; record?: SessionRecord; error?: string } {
     const sessions = this.listSessionsFn();
-    const projectSessions = sessions.filter((s) => s.projectDir === config.projectDir);
+    const projectSessions = sessions.filter((s) => sameProjectDir(s.projectDir, config.projectDir));
     const brainRecord = projectSessions.find((s) => s.role === 'brain');
     const inferredProjectName = brainRecord?.projectName
       ?? projectSessions.map((s) => resolveEffectiveProjectName(s, sessions)).find(Boolean);
@@ -1027,12 +1130,20 @@ export class RepoCallbackMonitor {
     const requested = config.target.trim();
     if (!requested || requested === REPO_CALLBACK_TARGET_BRAIN) {
       if (brainRecord) {
+        if (brainRecord.state === 'stopped') {
+          return { sessionName: brainRecord.name, record: brainRecord, error: `Brain session ${brainRecord.name} is stopped` };
+        }
         return { sessionName: brainRecord.name, record: brainRecord };
       }
       if (inferredProjectName) {
         const fallbackName = projectBrainSession(inferredProjectName);
         const fallbackRecord = sessions.find((s) => s.name === fallbackName);
-        if (fallbackRecord) return { sessionName: fallbackRecord.name, record: fallbackRecord };
+        if (fallbackRecord) {
+          if (fallbackRecord.state === 'stopped') {
+            return { sessionName: fallbackRecord.name, record: fallbackRecord, error: `Brain session ${fallbackRecord.name} is stopped` };
+          }
+          return { sessionName: fallbackRecord.name, record: fallbackRecord };
+        }
         return { sessionName: fallbackName, error: `Brain session not found for project ${inferredProjectName}` };
       }
       return { sessionName: REPO_CALLBACK_TARGET_BRAIN, error: `No session found for ${config.projectDir}` };
@@ -1041,7 +1152,7 @@ export class RepoCallbackMonitor {
     const exact = sessions.find((s) => (
       s.name === requested
       && (
-        s.projectDir === config.projectDir
+        sameProjectDir(s.projectDir, config.projectDir)
         || (inferredProjectName !== undefined && resolveEffectiveProjectName(s, sessions) === inferredProjectName)
       )
     ));
@@ -1058,34 +1169,74 @@ export class RepoCallbackMonitor {
     config: RepoCallbackRepoConfig,
     repoSlug: string,
     candidate: DetectedEventCandidate,
-  ): Promise<void> {
-    const callbackId = buildCallbackId(
-      CALLBACK_SOURCES.REPO,
-      `${this.now().toString(36)}_${randomUUID().slice(0, 8)}`,
-    );
-    const resolvedTarget = this.resolveTargetSession(config);
-    const record = this.store.createCallback({
-      callbackId,
-      source: CALLBACK_SOURCES.REPO,
-      eventType: candidate.eventType,
-      scopeKey: config.projectDir,
-      entityKey: candidate.entityKey,
-      dedupKey: candidate.dedupKey,
-      title: candidate.title,
-      url: candidate.url,
-      targetSession: resolvedTarget.sessionName,
-      status: resolvedTarget.error ? 'failed' : 'pending',
-      summary: '',
-      ...(resolvedTarget.error ? { lastError: resolvedTarget.error } : {}),
-      metadata: {
-        repoSlug,
-        ...candidate.metadata,
-      },
-      createdAt: this.now(),
-    });
+  ): Promise<'sent' | 'failed' | 'exhausted' | 'already_handled'> {
+    const existing = this.store.findByDedupKey(CALLBACK_SOURCES.REPO, candidate.dedupKey);
+    if (existing) {
+      if (existing.status !== 'failed') {
+        return 'already_handled';
+      }
+      const attempts = this.failedDispatchAttempts.get(candidate.dedupKey) ?? 0;
+      if (attempts >= MAX_FAILED_DISPATCH_ATTEMPTS) {
+        return 'exhausted';
+      }
+    }
 
-    if (resolvedTarget.error) {
-      return;
+    const resolvedTarget = this.resolveTargetSession(config);
+    const nowMs = this.now();
+    let record: CallbackTaskRecord;
+
+    if (existing) {
+      if (resolvedTarget.error) {
+        this.failedDispatchAttempts.set(
+          candidate.dedupKey,
+          (this.failedDispatchAttempts.get(candidate.dedupKey) ?? 0) + 1,
+        );
+        this.store.updateCallback({
+          callbackId: existing.callbackId,
+          status: 'failed',
+          targetSession: resolvedTarget.sessionName,
+          lastError: resolvedTarget.error,
+          updatedAt: nowMs,
+        });
+        return 'failed';
+      }
+      const updated = this.store.updateCallback({
+        callbackId: existing.callbackId,
+        status: 'pending',
+        targetSession: resolvedTarget.sessionName,
+        lastError: '',
+        updatedAt: nowMs,
+      });
+      record = updated.ok ? updated.record : existing;
+    } else {
+      const callbackId = buildCallbackId(
+        CALLBACK_SOURCES.REPO,
+        `${nowMs.toString(36)}_${randomUUID().slice(0, 8)}`,
+      );
+      record = this.store.createCallback({
+        callbackId,
+        source: CALLBACK_SOURCES.REPO,
+        eventType: candidate.eventType,
+        scopeKey: config.projectDir,
+        entityKey: candidate.entityKey,
+        dedupKey: candidate.dedupKey,
+        title: candidate.title,
+        url: candidate.url,
+        targetSession: resolvedTarget.sessionName,
+        status: resolvedTarget.error ? 'failed' : 'pending',
+        summary: '',
+        ...(resolvedTarget.error ? { lastError: resolvedTarget.error } : {}),
+        metadata: {
+          repoSlug,
+          ...candidate.metadata,
+        },
+        createdAt: nowMs,
+      });
+
+      if (resolvedTarget.error) {
+        this.failedDispatchAttempts.set(candidate.dedupKey, 1);
+        return 'failed';
+      }
     }
 
     const template = resolveRepoCallbackPromptTemplate(config, candidate.eventType, this.globalTemplates);
@@ -1107,30 +1258,38 @@ export class RepoCallbackMonitor {
 
     try {
       await this.sendToSession(resolvedTarget.sessionName, prompt, resolvedTarget.record);
+      this.failedDispatchAttempts.delete(candidate.dedupKey);
+      return 'sent';
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      this.failedDispatchAttempts.set(
+        candidate.dedupKey,
+        (this.failedDispatchAttempts.get(candidate.dedupKey) ?? 0) + 1,
+      );
       this.store.updateCallback({
         callbackId: record.callbackId,
         status: 'failed',
         lastError: msg,
         updatedAt: this.now(),
       });
+      return 'failed';
     }
   }
 
   buildStatusSnapshot(projectDir: string, requestId?: string): Record<string, unknown> {
-    const cfg = this.repoConfigs.get(projectDir);
-    const lastError = this.lastErrorByProject.get(projectDir);
-    const lastCheckedAt = this.lastPollAt.get(projectDir);
+    const configKey = this.resolveConfigKey(projectDir);
+    const cfg = this.repoConfigs.get(configKey);
+    const lastError = this.lastErrorByProject.get(configKey);
+    const lastCheckedAt = this.lastPollAt.get(configKey);
     return {
       type: REPO_MSG.CALLBACK_STATUS_RESPONSE,
       ...(requestId ? { requestId } : {}),
       projectDir,
       enabled: cfg?.enabled ?? false,
-      checking: this.inFlightProjects.has(projectDir),
+      checking: this.inFlightProjects.has(configKey),
       ...(lastCheckedAt ? { lastCheckedAt } : {}),
       ...(lastError ? { lastError } : {}),
-      callbacks: this.getRecentCallbacks(projectDir),
+      callbacks: this.getRecentCallbacks(configKey),
     };
   }
 }
@@ -1199,8 +1358,7 @@ export async function handleRepoCallbackCommand(
   }
 
   // Scope check: projectDir must match an active session directory in this daemon.
-  const knownDirs = new Set(resolveSessions().map((s) => s.projectDir));
-  if (!knownDirs.has(rawProjectDir)) {
+  if (!resolveSessions().some((s) => sameProjectDir(s.projectDir, rawProjectDir))) {
     serverLink.send({ type: REPO_MSG.ERROR, requestId, projectDir: rawProjectDir, error: 'unauthorized' });
     return;
   }

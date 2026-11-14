@@ -589,4 +589,45 @@ describe('RepoCallbackModal & RepoPage callback integration', () => {
     });
     expect(container).toBeTruthy();
   });
+
+  it('shows missing-server error instead of fake success when saving a repo template without serverId, and clears checking state even with trailing slash projectDir', async () => {
+    const ws = createMockWs();
+    render(<RepoPage ws={ws} projectDir="/work/repo-nosrv/" />);
+
+    // 1. Daemon emits checking=true then checking=false without trailing slash
+    ws.emit({
+      type: REPO_MSG.CALLBACK_STATUS_RESPONSE,
+      projectDir: '/work/repo-nosrv',
+      enabled: true,
+      checking: true,
+      callbacks: [],
+    });
+    const modalBtn = await screen.findByText('Monitor & Callback');
+    fireEvent.click(modalBtn);
+    await waitFor(() => {
+      expect(screen.getByText('repo.callback_checking')).toBeTruthy();
+    });
+
+    ws.emit({
+      type: REPO_MSG.CALLBACK_STATUS_RESPONSE,
+      projectDir: '/work/repo-nosrv',
+      enabled: true,
+      checking: false,
+      callbacks: [],
+    });
+    await waitFor(() => {
+      expect(screen.queryByText('repo.callback_checking')).toBeNull();
+    });
+
+    // 2. Attempting to save a repo template without serverId shows error feedback, not success
+    fireEvent.click(screen.getAllByText('Edit prompt')[0]!);
+    const nameInput = await waitFor(() => screen.getByPlaceholderText('Template name (to save/reuse)') as HTMLInputElement);
+    fireEvent.input(nameInput, { target: { value: 'Unsynced Template' } });
+    fireEvent.click(screen.getByText('Save Repo'));
+
+    await waitFor(() => {
+      expect(screen.getByText('repo.callback_missing_server')).toBeTruthy();
+    });
+    expect(screen.queryByText('repo.callback_tpl_saved_repo')).toBeNull();
+  });
 });

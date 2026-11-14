@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -1395,25 +1395,27 @@ describe('RepoCallbackMonitor background polling & delivery', () => {
     });
     monitor.setConfigsForTesting({ repos: { '/tmp/repo-cutoff': config } });
 
-    // Poll 1: immediately dispatches PR #20 (>= cutoff), ignores PR #19 & Issue #9 & CI #198/#199,
-    // stops before fetching PR page 2 or CI page 2 because sawBelowCutoff fired on page 1!
+    // Poll 1: immediately dispatches PR #20 (>= cutoff), ignores PR #19 & Issue #9 & completed pre-cutoff CI #198,
+    // keeps pre-cutoff in-flight CI #199 tracked, and stops before fetching page 2 because sawBelowCutoff fired on #198!
     await monitor.checkProject('/tmp/repo-cutoff');
     expect(prPagesFetched).toEqual([1]);
     expect(actionPagesFetched).toEqual([1]);
     expect(sent).toHaveLength(1);
     expect(sent[0]?.text).toContain('PR #20');
 
-    // Poll 2: CI #199 (pre-cutoff) fails, CI #198 (pre-cutoff) is re-run and fails again, AND CI #200 (post-cutoff) fails.
-    // ONLY CI #200 should dispatch!
+    // Poll 2: pre-cutoff in-flight CI #199 finishes with failure after cutoff, pre-cutoff CI #198 is re-run and fails
+    // after cutoff, AND post-cutoff CI #200 fails — all three dispatch while already-completed pre-cutoff runs stay ignored!
     actions = [
       { ...actions[0]!, status: 'completed', conclusion: 'failure', updatedAt: cutoff + 5_000 },
       { ...actions[1]!, status: 'completed', conclusion: 'failure', updatedAt: cutoff + 5_000 },
       { ...actions[2]!, status: 'completed', conclusion: 'failure', runAttempt: 2, updatedAt: cutoff + 5_000 },
     ];
     await monitor.checkProject('/tmp/repo-cutoff');
-    expect(sent).toHaveLength(2);
-    expect(sent[1]?.text).toContain('Run: #200');
-    expect(sent[1]?.text).toContain('aaaa222');
+    expect(sent).toHaveLength(4);
+    const dispatchedTexts = sent.slice(1).map((item) => item.text);
+    expect(dispatchedTexts.some((text) => text.includes('Run: #200') && text.includes('aaaa222'))).toBe(true);
+    expect(dispatchedTexts.some((text) => text.includes('Run: #199') && text.includes('bbbb111'))).toBe(true);
+    expect(dispatchedTexts.some((text) => text.includes('Run: #198') && text.includes('cccc000'))).toBe(true);
 
     store.close();
   });
@@ -1592,5 +1594,214 @@ describe('RepoCallbackMonitor background polling & delivery', () => {
     });
 
     store.close();
+  });
+
+  it('retries failed dispatches (stopped brain or send error) without creating duplicate callback rows, and caps retries', async () => {
+    const store = new CallbackTaskStore(':memory:');
+    const nowMs = 1_700_900_000_000;
+    const sent: Array<{ sessionName: string; text: string }> = [];
+    let brainState: SessionRecord['state'] = 'stopped';
+    let failSend = false;
+
+    const prs: RepoPR[] = [
+      {
+        number: 71,
+        title: 'Stopped Brain PR',
+        author: 'alice',
+        state: 'open',
+        draft: false,
+        head: 'feat/retry',
+        base: 'main',
+        labels: [],
+        createdAt: nowMs + 1_000,
+        updatedAt: nowMs + 1_000,
+        url: 'https://github.com/acme/widget/pull/71',
+      },
+    ];
+    const provider: RepoProvider = {
+      ...createMockProvider({}),
+      listPRs: vi.fn(async () => ({ items: prs, page: 1, hasMore: false, projectDir: '/tmp/repo-retry' })),
+    };
+
+    const config = createDefaultRepoCallbackConfig('/tmp/repo-retry');
+    config.enabled = true;
+    config.lookbackWindow = 'now';
+    config.sinceAtMs = nowMs;
+    config.updatedAt = nowMs;
+    config.events.pr_new.enabled = true;
+    config.events.ci_failed.enabled = false;
+
+    const monitor = new RepoCallbackMonitor({
+      store,
+      detect: async () => createOkContext('/tmp/repo-retry'),
+      createProvider: () => provider,
+      listSessions: () => [makeSession({ projectDir: '/tmp/repo-retry', state: brainState })],
+      sendToSession: async (sessionName, text) => {
+        if (failSend) throw new Error('tmux unavailable');
+        sent.push({ sessionName, text });
+      },
+      now: () => nowMs + 2_000,
+    });
+    monitor.setConfigsForTesting({ repos: { '/tmp/repo-retry': config } });
+
+    // Poll 1: Brain is stopped -> records 1 failed callback, leaves dedup unseen
+    const p1 = await monitor.checkProject('/tmp/repo-retry');
+    expect(p1).toEqual({ checked: true, dispatched: 0 });
+    expect(sent).toHaveLength(0);
+    let rows = store.listCallbacks({ scopeKey: '/tmp/repo-retry' });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.status).toBe('failed');
+    expect(rows[0]!.lastError).toContain('stopped');
+    const firstCallbackId = rows[0]!.callbackId;
+
+    // Poll 2: Brain recovers to idle -> reuses the same callbackId, clears error, and dispatches
+    brainState = 'idle';
+    const p2 = await monitor.checkProject('/tmp/repo-retry');
+    expect(p2).toEqual({ checked: true, dispatched: 1 });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.text).toContain(firstCallbackId);
+    rows = store.listCallbacks({ scopeKey: '/tmp/repo-retry' });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.callbackId).toBe(firstCallbackId);
+    expect(rows[0]!.status).toBe('pending');
+    expect(rows[0]!.lastError).toBeUndefined();
+
+    // Poll 3: Already dispatched -> never repeats
+    const p3 = await monitor.checkProject('/tmp/repo-retry');
+    expect(p3).toEqual({ checked: true, dispatched: 0 });
+    expect(sent).toHaveLength(1);
+
+    // Bounded retries on persistent send failure: stops after 5 attempts without spamming duplicates
+    failSend = true;
+    prs.unshift({
+      number: 72,
+      title: 'Persistent Failure PR',
+      author: 'bob',
+      state: 'open',
+      draft: false,
+      head: 'feat/cap',
+      base: 'main',
+      labels: [],
+      createdAt: nowMs + 5_000,
+      updatedAt: nowMs + 5_000,
+      url: 'https://github.com/acme/widget/pull/72',
+    });
+    for (let i = 0; i < 6; i++) {
+      await monitor.checkProject('/tmp/repo-retry');
+    }
+    const pr72Rows = store.listCallbacks({ scopeKey: '/tmp/repo-retry' }).filter((r) => r.entityKey === 'pr#72');
+    expect(pr72Rows).toHaveLength(1);
+    expect(pr72Rows[0]!.status).toBe('failed');
+    expect(pr72Rows[0]!.lastError).toBe('tmux unavailable');
+    // After retry cap (5 attempts) was exhausted on attempt 6, even fixing sendToSession does not auto-resurrect pr#72
+    failSend = false;
+    const pAfterCap = await monitor.checkProject('/tmp/repo-retry');
+    expect(pAfterCap.dispatched).toBe(0);
+    expect(sent).toHaveLength(1);
+
+    store.close();
+  });
+
+  it('normalizes projectDir trailing slashes and symlinks across target resolution, status lookup, and command auth, and emits idle snapshot after background check completes', async () => {
+    const tmpBase = mkdtempSync(join(tmpdir(), 'rc-path-'));
+    const realDir = join(tmpBase, 'real-repo');
+    const linkDir = join(tmpBase, 'link-repo');
+    mkdirSync(realDir, { recursive: true });
+    symlinkSync(realDir, linkDir);
+
+    const store = new CallbackTaskStore(':memory:');
+    const sent: Array<{ sessionName: string; text: string }> = [];
+    const emitted: Array<Record<string, unknown>> = [];
+    const serverLink = {
+      send: (msg: Record<string, unknown>) => {
+        emitted.push(msg);
+      },
+    };
+
+    const nowMs = 1_700_950_000_000;
+    const enabledConfig = createDefaultRepoCallbackConfig(realDir);
+    enabledConfig.enabled = true;
+    enabledConfig.lookbackWindow = 'now';
+    enabledConfig.sinceAtMs = nowMs;
+    enabledConfig.updatedAt = nowMs;
+    enabledConfig.events.pr_new.enabled = true;
+
+    let releaseDetect!: () => void;
+    const detectGate = new Promise<void>((resolve) => {
+      releaseDetect = resolve;
+    });
+
+    const pr: RepoPR = {
+      number: 88,
+      title: 'Symlink path PR',
+      author: 'alice',
+      state: 'open',
+      draft: false,
+      head: 'feat/path',
+      base: 'main',
+      labels: [],
+      createdAt: nowMs + 1_000,
+      updatedAt: nowMs + 1_000,
+      url: 'https://github.com/acme/widget/pull/88',
+    };
+    const provider: RepoProvider = {
+      ...createMockProvider({}),
+      listPRs: vi.fn(async () => ({ items: [pr], page: 1, hasMore: false, projectDir: realDir })),
+    };
+
+    const monitor = new RepoCallbackMonitor({
+      store,
+      getServerLink: () => serverLink as never,
+      loadCreds: async () => ({ serverId: 'srv-1', token: 'tok', workerUrl: 'http://worker.local' }),
+      fetchImpl: (async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ globalTemplates: [], repos: { [realDir]: enabledConfig } }),
+      }) as unknown as Response) as typeof fetch,
+      detect: async (dir) => {
+        await detectGate;
+        return createOkContext(dir);
+      },
+      createProvider: () => provider,
+      // Session registered via symlink with trailing slash!
+      listSessions: () => [makeSession({ projectDir: `${linkDir}/` })],
+      sendToSession: async (sessionName, text) => {
+        sent.push({ sessionName, text });
+      },
+      now: () => nowMs + 2_000,
+    });
+
+    const cmdOpts = { monitor, listSessionsFn: () => [makeSession({ projectDir: `${linkDir}/` })] };
+
+    // Browser sends CALLBACK_SYNC using symlink path with trailing slash
+    await handleRepoCallbackCommand(
+      { type: REPO_MSG.CALLBACK_SYNC, requestId: 'req-bg', projectDir: `${linkDir}/` },
+      serverLink,
+      cmdOpts,
+    );
+
+    // First response arrives while background checkProject is in flight -> checking: true
+    expect(emitted.length).toBeGreaterThanOrEqual(1);
+    expect(emitted[0]).toMatchObject({
+      type: REPO_MSG.CALLBACK_STATUS_RESPONSE,
+      requestId: 'req-bg',
+      enabled: true,
+      checking: true,
+    });
+
+    // Release checkProject -> resolves Brain through symlink+slash mismatch and pushes checking: false snapshot!
+    releaseDetect();
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.sessionName).toBe('deck_proj_brain');
+    const settledSnapshot = [...emitted].reverse().find(
+      (msg) => msg.type === REPO_MSG.CALLBACK_STATUS_RESPONSE && msg.checking === false,
+    );
+    expect(settledSnapshot).toBeTruthy();
+    expect(settledSnapshot?.enabled).toBe(true);
+
+    store.close();
+    rmSync(tmpBase, { recursive: true, force: true });
   });
 });

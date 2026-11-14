@@ -26,7 +26,7 @@ import { startProject, stopProject, teardownProject, getTransportRuntime, launch
 import { buildTransportResumeLaunchOpts } from '../agent/transport-resume-opts.js';
 import { isTransportAgent, type AgentType } from '../agent/detect.js';
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, isClaudeCodeSdkAgentType } from '../../shared/agent-types.js';
-import { isWorkingSessionState, type ActivityGenerationLike } from '../../shared/session-activity-types.js';
+import { isServerLinkResyncStatePayload, isWorkingSessionState, type ActivityGenerationLike } from '../../shared/session-activity-types.js';
 import { aliasExpansionModeFor, expandForAgent } from '../../shared/alias-expand.js';
 import { ALIAS_REASONS } from '../../shared/alias-types.js';
 import { classifyCodexFastCommand, isCodexFastServiceTier } from '../../shared/codex-service-tier.js';
@@ -39,6 +39,7 @@ import { terminalStreamer, type StreamSubscriber } from './terminal-streamer.js'
 import { terminalInputNeedsSessionMutex } from './terminal-input.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import { registerProcessQueueDrainer } from './hook-server.js';
 import { bindProcessSharedMachineCommand, type ProcessSharedMachineBinding } from './shared-machine-authority-context.js';
 import {
   emitTransportUserMessage as emitTransportUserMessageEvent,
@@ -6266,6 +6267,89 @@ async function sendProcessSessionMessage(
   }
 }
 
+const MAX_PROCESS_AUTOMATION_QUEUE_DEPTH = 50;
+
+interface QueuedProcessAutomationMessage {
+  text: string;
+  options?: Parameters<typeof sendProcessSessionMessage>[3];
+}
+
+const processAutomationQueues = new Map<string, QueuedProcessAutomationMessage[]>();
+const processAutomationDrainInFlight = new Set<string>();
+const scheduledProcessAutomationDrains = new Set<string>();
+let processAutomationHooksRegistered = false;
+
+function scheduleProcessAutomationDrain(sessionName: string): void {
+  if (!processAutomationQueues.has(sessionName)) return;
+  if (scheduledProcessAutomationDrains.has(sessionName)) return;
+  scheduledProcessAutomationDrains.add(sessionName);
+  queueMicrotask(() => {
+    scheduledProcessAutomationDrains.delete(sessionName);
+    void drainProcessAutomationQueue(sessionName);
+  });
+}
+
+function ensureProcessAutomationQueueHooks(): void {
+  if (processAutomationHooksRegistered) return;
+  processAutomationHooksRegistered = true;
+  registerProcessQueueDrainer((sessionName) => {
+    scheduleProcessAutomationDrain(sessionName);
+  });
+  if (typeof timelineEmitter.on === 'function') {
+    timelineEmitter.on((e) => {
+      if (
+        e.type === 'session.state'
+        && !isServerLinkResyncStatePayload(e.payload)
+        && (e.payload as Record<string, unknown>).state === 'idle'
+      ) {
+        scheduleProcessAutomationDrain(e.sessionId);
+      }
+    });
+  }
+}
+
+export async function drainProcessAutomationQueue(sessionName: string): Promise<void> {
+  if (processAutomationDrainInFlight.has(sessionName)) return;
+  const queue = processAutomationQueues.get(sessionName);
+  if (!queue || queue.length === 0) return;
+
+  const record = getSession(sessionName);
+  if (!record) {
+    processAutomationQueues.delete(sessionName);
+    return;
+  }
+  if (record.state === 'stopped') return;
+
+  processAutomationDrainInFlight.add(sessionName);
+  try {
+    while (queue.length > 0) {
+      const next = queue.shift()!;
+      if (next.options?.beforeTyping && !next.options.beforeTyping()) {
+        continue;
+      }
+      await sendProcessSessionMessage(sessionName, next.text, [], next.options);
+      break; // Deliver one queued turn per idle transition.
+    }
+  } catch (err) {
+    logger.warn({ err, sessionName }, 'Failed to deliver queued process automation message');
+  } finally {
+    processAutomationDrainInFlight.delete(sessionName);
+    if (queue.length === 0) {
+      processAutomationQueues.delete(sessionName);
+    }
+  }
+}
+
+export function getProcessAutomationQueueDepth(sessionName: string): number {
+  return processAutomationQueues.get(sessionName)?.length ?? 0;
+}
+
+export function clearProcessAutomationQueuesForTest(): void {
+  processAutomationQueues.clear();
+  processAutomationDrainInFlight.clear();
+  scheduledProcessAutomationDrains.clear();
+}
+
 export async function sendProcessSessionMessageForAutomation(
   sessionName: string,
   text: string,
@@ -6289,15 +6373,39 @@ export async function sendProcessSessionMessageForAutomation(
       messageOrigin?: ChatMessageOrigin;
     }>;
   },
-): Promise<void> {
-  await sendProcessSessionMessage(sessionName, text, [], {
+): Promise<'sent' | 'queued'> {
+  const sendOpts: Parameters<typeof sendProcessSessionMessage>[3] = {
     originalText: text,
     ...(options?.verbatim ? { verbatim: true } : {}),
     ...(options?.suppressTimeline ? { suppressTimeline: true } : {}),
     ...(options?.onTyped ? { onTyped: options.onTyped } : {}),
     ...(options?.beforeTyping ? { beforeTyping: options.beforeTyping } : {}),
     ...(options?.userMessageMetadata ? { userMessageMetadata: options.userMessageMetadata } : {}),
-  });
+  };
+
+  if (options?.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE) {
+    const session = getSession(sessionName);
+    const hasPendingQueue = (processAutomationQueues.get(sessionName)?.length ?? 0) > 0
+      || processAutomationDrainInFlight.has(sessionName);
+    const isBusy = session !== null && session !== undefined && PROCESS_IN_PROGRESS_STATES.has(session.state);
+    if (isBusy || hasPendingQueue) {
+      ensureProcessAutomationQueueHooks();
+      let queue = processAutomationQueues.get(sessionName);
+      if (!queue) {
+        queue = [];
+        processAutomationQueues.set(sessionName, queue);
+      }
+      if (queue.length >= MAX_PROCESS_AUTOMATION_QUEUE_DEPTH) {
+        throw new Error(`process automation queue full for ${sessionName} (${MAX_PROCESS_AUTOMATION_QUEUE_DEPTH})`);
+      }
+      queue.push({ text, options: sendOpts });
+      logger.debug({ sessionName, depth: queue.length }, 'Queued process session automation message');
+      return 'queued';
+    }
+  }
+
+  await sendProcessSessionMessage(sessionName, text, [], sendOpts);
+  return 'sent';
 }
 
 async function resolveProcessRecallQueryContext(

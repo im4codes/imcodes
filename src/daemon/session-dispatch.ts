@@ -572,11 +572,10 @@ export async function dispatchSessionMessage(
     ...(participantBinding ? { onTyped: () => participantBinding.typed() } : {}),
   };
   try {
-    if (Object.keys(processOptions).length > 0) {
-      await sendProcessSessionMessageForAutomation(target.name, message, processOptions);
-    } else {
-      await sendProcessSessionMessageForAutomation(target.name, message);
-    }
+    const result = Object.keys(processOptions).length > 0
+      ? await sendProcessSessionMessageForAutomation(target.name, message, processOptions)
+      : await sendProcessSessionMessageForAutomation(target.name, message);
+    if (result === 'queued') return 'queued';
   } finally {
     // Delivery is over whatever happened: an input that never reached the terminal is not a turn that will run.
     participantBinding?.settle();

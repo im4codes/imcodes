@@ -56,6 +56,7 @@ export interface UpdateCallbackTaskInput {
   status: CallbackStatus;
   summary?: string;
   source?: string;
+  targetSession?: string;
   relatedTaskId?: string;
   metadata?: Record<string, unknown>;
   lastError?: string;
@@ -370,7 +371,7 @@ export class CallbackTaskStore {
       : DEFAULT_LIST_LIMIT;
     const limit = Math.max(1, Math.min(MAX_LIST_LIMIT, rawLimit));
     const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
-    const sql = `SELECT * FROM callback_tasks ${where} ORDER BY updated_at DESC, created_at DESC LIMIT ?`;
+    const sql = `SELECT * FROM callback_tasks ${where} ORDER BY updated_at DESC, created_at DESC, rowid DESC LIMIT ?`;
     params.push(limit);
     const rows = this.db.prepare(sql).all(...params) as unknown as CallbackTaskRow[];
     return rows.map(rowToRecord);
@@ -432,6 +433,9 @@ export class CallbackTaskStore {
       nextMetadata = metaCheck.value;
     }
 
+    const nextTargetSession = typeof input.targetSession === 'string' && input.targetSession.trim()
+      ? input.targetSession.trim()
+      : existing.targetSession;
     const nextLastError = input.lastError !== undefined
       ? (input.lastError || undefined)
       : (isCallbackUpdateStatus(input.status) && input.status !== 'failed' ? undefined : existing.lastError);
@@ -441,6 +445,7 @@ export class CallbackTaskStore {
       UPDATE callback_tasks
          SET status = ?,
              summary = ?,
+             target_session = ?,
              related_task_id = ?,
              metadata_json = ?,
              last_error = ?,
@@ -449,6 +454,7 @@ export class CallbackTaskStore {
     `).run(
       input.status,
       nextSummary,
+      nextTargetSession,
       nextRelatedTaskId ?? null,
       nextMetadata ? JSON.stringify(nextMetadata) : null,
       nextLastError ?? null,

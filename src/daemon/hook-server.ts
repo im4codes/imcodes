@@ -168,6 +168,12 @@ export interface QueuedMessage {
 
 /** In-memory queue: target session name → queued messages (FIFO) */
 const messageQueue = new Map<string, QueuedMessage[]>();
+type ProcessQueueDrainer = (sessionName: string) => Promise<void> | void;
+let processQueueDrainer: ProcessQueueDrainer | null = null;
+
+export function registerProcessQueueDrainer(drainer: ProcessQueueDrainer | null): void {
+  processQueueDrainer = drainer;
+}
 
 /** Rate limiter: source session → timestamps of recent sends */
 const rateLimiter = new Map<string, number[]>();
@@ -564,9 +570,15 @@ function preflightLifecycleBatch(
  */
 export async function drainQueue(sessionName: string): Promise<void> {
   const queue = messageQueue.get(sessionName);
-  if (!queue || queue.length === 0) return;
+  if (!queue || queue.length === 0) {
+    if (processQueueDrainer) {
+      await processQueueDrainer(sessionName);
+    }
+    return;
+  }
 
   const now = Date.now();
+  let deliveredFromHookQueue = false;
 
   // Drain ONE message at a time. After sending, the session goes running → idle,
   // which triggers drainQueue again for the next message. This prevents burst-injecting
@@ -586,11 +598,15 @@ export async function drainQueue(sessionName: string): Promise<void> {
     } catch (err) {
       logger.warn({ err, target: sessionName, from: msg.from }, 'Failed to deliver queued message');
     }
+    deliveredFromHookQueue = true;
     // Stop after one delivery — next idle transition will drain the next message
     break;
   }
   // Clean up empty queue entry
   if (queue.length === 0) messageQueue.delete(sessionName);
+  if (!deliveredFromHookQueue && processQueueDrainer) {
+    await processQueueDrainer(sessionName);
+  }
 }
 
 /** Get current queue for a target (for testing) */

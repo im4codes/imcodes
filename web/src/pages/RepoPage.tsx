@@ -198,7 +198,17 @@ export function RepoPage({ ws, sessionId, projectDir, serverId, callbackTargets,
   const requestProjectDir = scopeToSessionRoot ? FS_SESSION_ROOT_PATH : projectDir;
   const sessionScope = scopeToSessionRoot && sessionId ? { sessionName: sessionId } : {};
   const responseMatchesProject = useCallback(
-    (responseProjectDir: unknown) => scopeToSessionRoot || responseProjectDir === projectDir,
+    (responseProjectDir: unknown) => {
+      if (scopeToSessionRoot) return true;
+      if (responseProjectDir === projectDir) return true;
+      if (typeof responseProjectDir !== 'string') return false;
+      const normalize = (value: string) => {
+        const trimmed = value.trim();
+        if (trimmed === '/') return '/';
+        return trimmed.replace(/[\\/]+$/, '');
+      };
+      return normalize(responseProjectDir) === normalize(projectDir);
+    },
     [projectDir, scopeToSessionRoot],
   );
 

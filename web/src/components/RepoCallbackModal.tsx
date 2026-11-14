@@ -296,6 +296,11 @@ export function RepoCallbackModal({
       updatedAt: now,
     };
 
+    if (scope === 'repo' && !serverId) {
+      setFeedback({ kind: 'error', text: t('repo.callback_missing_server') });
+      return;
+    }
+
     try {
       setSaving(true);
       setFeedback(null);
@@ -348,14 +353,11 @@ export function RepoCallbackModal({
             },
           },
         };
-        setDraft(nextDraft);
-        if (serverId) {
-          const savedServer = await saveRepoCallbackRepoConfig(serverId, nextDraft);
-          const savedRepo = savedServer.repos[projectDir] ?? nextDraft;
-          setDraft(savedRepo);
-          ws.repoCallbackSync?.(projectDir);
-          onConfigSaved?.(savedRepo, globalTemplates);
-        }
+        const savedServer = await saveRepoCallbackRepoConfig(serverId!, nextDraft);
+        const savedRepo = savedServer.repos[projectDir] ?? nextDraft;
+        setDraft(savedRepo);
+        ws.repoCallbackSync?.(projectDir);
+        onConfigSaved?.(savedRepo, globalTemplates);
         setFeedback({ kind: 'success', text: t('repo.callback_tpl_saved_repo', { name }) });
       }
       setTemplateNameDraft('');
@@ -369,6 +371,10 @@ export function RepoCallbackModal({
   const handleDeleteSelectedTemplate = async (eventType: RepoCallbackEventType) => {
     const setting = draft.events[eventType];
     if (!setting.templateId || setting.templateScope === 'default') return;
+    if (setting.templateScope === 'repo' && !serverId) {
+      setFeedback({ kind: 'error', text: t('repo.callback_missing_server') });
+      return;
+    }
     try {
       setSaving(true);
       setFeedback(null);
