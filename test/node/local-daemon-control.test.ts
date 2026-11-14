@@ -27,6 +27,13 @@ function makeTempDir(prefix = 'imcodes-daemon-ctl-'): string {
   return dir;
 }
 
+function createMockLinuxProcEntry(procRoot: string, pid: number, cmdline: string): number {
+  const procDir = join(procRoot, String(pid));
+  mkdirSync(procDir, { recursive: true });
+  writeFileSync(join(procDir, 'cmdline'), cmdline);
+  return typeof process.getuid === 'function' ? process.getuid() : statSync(procDir).uid;
+}
+
 function createFakeBundle(rootDir: string, version = '1.2.3', platform: NodeJS.Platform = 'linux'): string {
   const bundleDir = join(rootDir, 'daemon-runtime');
   const nodeBin = platform === 'win32'
@@ -619,7 +626,6 @@ describe('local-daemon-control F1-F5 security & lifecycle boundaries', () => {
       token: 'tok',
       workerUrl: 'https://app.example.test',
     }));
-    const realUid = typeof process.getuid === 'function' ? process.getuid() : 1000;
     const realGid = typeof process.getgid === 'function' ? process.getgid() : 1000;
     const dummyDaemon = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 10000)', 'imcodes-daemon-dummy'], {
       stdio: 'ignore',
@@ -627,15 +633,20 @@ describe('local-daemon-control F1-F5 security & lifecycle boundaries', () => {
     try {
       const dummyPid = dummyDaemon.pid!;
       writeFileSync(join(linuxStateDir, 'daemon.pid'), `${dummyPid}\n`);
+      const linStopProcRoot = process.platform === 'linux' ? undefined : join(root, 'lin-stop-proc');
+      const linStopUid = linStopProcRoot
+        ? createMockLinuxProcEntry(linStopProcRoot, dummyPid, 'node\0-e\0setTimeout(() => {}, 10000)\0imcodes-daemon-dummy\0')
+        : (typeof process.getuid === 'function' ? process.getuid() : 1000);
       const linuxKillCalls: Array<{ file: string; args: readonly string[]; uid?: number; gid?: number }> = [];
       let linuxAlive = true;
       const ctlLin = createLocalDaemonController({
         platform: 'linux',
         env: {},
         bundleDirs: [bundleDir],
+        ...(linStopProcRoot ? { procRoot: linStopProcRoot } : {}),
         currentUid: () => 0,
         currentGid: () => 0,
-        activeUser: { platform: 'linux', username: 'bob', home: join(root, 'lin-home'), uid: realUid, gid: realGid },
+        activeUser: { platform: 'linux', username: 'bob', home: join(root, 'lin-home'), uid: linStopUid, gid: realGid },
         isPidAlive: () => linuxAlive,
         killProcess: (pid) => {
           rootKills.push(pid);
@@ -654,7 +665,7 @@ describe('local-daemon-control F1-F5 security & lifecycle boundaries', () => {
       expect(linStop.ok).toBe(true);
       expect(rootKills).toEqual([]);
       expect(linuxKillCalls).toHaveLength(1);
-      expect(linuxKillCalls[0]?.uid).toBe(realUid);
+      expect(linuxKillCalls[0]?.uid).toBe(linStopUid);
       expect(linuxKillCalls[0]?.gid).toBe(realGid);
     } finally {
       dummyDaemon.kill('SIGKILL');
@@ -1024,7 +1035,7 @@ describe('local-daemon-control F1-F5 security & lifecycle boundaries', () => {
     expect(stopUnknown.ok).toBe(false);
     expect(kills).toEqual([]);
 
-    // 4) Linux real /proc mismatch: current test node PID is alive & owned by user, NOT imcodes daemon
+    // 4) Linux /proc mismatch: current test node PID is alive & owned by user, NOT imcodes daemon
     const linHome = join(root, 'lin-proc-home');
     const linState = join(linHome, '.imcodes');
     mkdirSync(linState, { recursive: true });
@@ -1034,15 +1045,21 @@ describe('local-daemon-control F1-F5 security & lifecycle boundaries', () => {
       workerUrl: 'https://app.example.test',
     }));
     writeFileSync(join(linState, 'daemon.pid'), `${process.pid}\n`);
+    const linMismatchProcRoot = process.platform === 'linux' ? undefined : join(root, 'lin-mismatch-proc');
+    const linMismatchUid = linMismatchProcRoot
+      ? createMockLinuxProcEntry(linMismatchProcRoot, process.pid, `${process.execPath}\0--version\0`)
+      : (typeof process.getuid === 'function' ? process.getuid() : 1000);
+    const linMismatchGid = typeof process.getgid === 'function' ? process.getgid() : 1000;
     const linSpawned: string[] = [];
     const linBundle = createFakeBundle(join(root, 'lin-p'), '1.4.0', 'linux');
     const ctlLinProc = createLocalDaemonController({
       platform: 'linux',
       env: {},
       bundleDirs: [linBundle],
-      currentUid: () => process.getuid!(),
-      currentGid: () => process.getgid!(),
-      activeUser: { platform: 'linux', username: 'alice', home: linHome, uid: process.getuid!(), gid: process.getgid!() },
+      ...(linMismatchProcRoot ? { procRoot: linMismatchProcRoot } : {}),
+      currentUid: () => linMismatchUid,
+      currentGid: () => linMismatchGid,
+      activeUser: { platform: 'linux', username: 'alice', home: linHome, uid: linMismatchUid, gid: linMismatchGid },
       isPidAlive: (pid) => pid === process.pid,
       execText: async (file, args) => {
         if (file === 'systemctl' && args[1] === 'show-environment') throw new Error('no systemd');
@@ -1056,6 +1073,59 @@ describe('local-daemon-control F1-F5 security & lifecycle boundaries', () => {
     expect(linStartMismatch.ok).toBe(true);
     expect(linSpawned).toHaveLength(1);
     expect(kills).toEqual([]);
+
+    // 5) Missing /proc entry on Linux fails closed with daemon_pid_unverified (no ps fallback or blind kill)
+    writeFileSync(join(linState, 'daemon.pid'), `${process.pid}\n`);
+    linSpawned.length = 0;
+    const ctlLinMissingProc = createLocalDaemonController({
+      platform: 'linux',
+      env: {},
+      bundleDirs: [linBundle],
+      procRoot: join(root, 'missing-proc-root'),
+      currentUid: () => linMismatchUid,
+      currentGid: () => linMismatchGid,
+      activeUser: { platform: 'linux', username: 'alice', home: linHome, uid: linMismatchUid, gid: linMismatchGid },
+      isPidAlive: (pid) => pid === process.pid,
+      execText: async () => ({ stdout: `${linMismatchUid} node dist/src/index.js`, stderr: '' }),
+      killProcess: (pid) => { kills.push(pid); },
+      spawnDetached: (file) => { linSpawned.push(file); },
+    });
+    const missingProcStatus = await ctlLinMissingProc.status();
+    expect(missingProcStatus.running).toBe(false);
+    expect(missingProcStatus.lastError).toContain('daemon_pid_unverified');
+    const missingProcStart = await ctlLinMissingProc.performAction(REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.START);
+    expect(missingProcStart.ok).toBe(false);
+    expect(missingProcStart.statusCode).toBe(409);
+    expect(missingProcStart.error).toBe('daemon_pid_unverified');
+    expect(linSpawned).toEqual([]);
+    const missingProcStop = await ctlLinMissingProc.performAction(REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.STOP);
+    expect(missingProcStop.ok).toBe(false);
+    expect(kills).toEqual([]);
+
+    // 6) Explicit simulated non-Linux procRoot verifies both match and mismatch independently of host OS
+    const simProcRoot = join(root, 'sim-proc-root');
+    const simUid = createMockLinuxProcEntry(simProcRoot, 901234, '/opt/imcodes/bin/node\0/opt/imcodes/dist/src/index.js\0start\0');
+    writeFileSync(join(linState, 'daemon.pid'), '901234\n');
+    const simKills: number[] = [];
+    let simAlive = true;
+    const ctlSimProc = createLocalDaemonController({
+      platform: 'linux',
+      env: {},
+      bundleDirs: [linBundle],
+      procRoot: simProcRoot,
+      currentUid: () => simUid,
+      currentGid: () => linMismatchGid,
+      activeUser: { platform: 'linux', username: 'alice', home: linHome, uid: simUid, gid: linMismatchGid },
+      isPidAlive: () => simAlive,
+      execText: async () => ({ stdout: '', stderr: '' }),
+      killProcess: (pid) => { simKills.push(pid); simAlive = false; },
+      spawnDetached: safeSpawnDetached,
+      sleep: async () => {},
+    });
+    expect((await ctlSimProc.status()).running).toBe(true);
+    const simStop = await ctlSimProc.performAction(REMOTE_DESKTOP_LOCAL_DAEMON_ACTION.STOP);
+    expect(simStop.ok).toBe(true);
+    expect(simKills).toEqual([901234]);
   });
 
   it('F1-R2(b): binds file/dir/log ownership to open validated fds and rejects tmp swap, log symlink, and runtime status symlink', async () => {

@@ -111,6 +111,8 @@ export interface LocalDaemonControlDeps {
   /** @deprecated Unused at runtime; ownership always binds to validated open fds via `fchown`. */
   chown?: (filePath: string, uid: number, gid: number) => void;
   fchown?: (fd: number, uid: number, gid: number) => void;
+  /** Override `/proc` root for Linux PID verification (defaults to `'/proc'`). */
+  procRoot?: string;
   bindTimeoutMs?: number;
   stopWaitMs?: number;
   windowsLaunchSettleMs?: number;
@@ -414,7 +416,7 @@ function defaultExecText(
   }).then((res) => ({ stdout: String(res.stdout ?? ''), stderr: String(res.stderr ?? '') }));
 }
 
-function defaultIsPidAlive(pid: number, platform: NodeJS.Platform): boolean {
+function defaultIsPidAlive(pid: number, platform: NodeJS.Platform, procRoot = '/proc'): boolean {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
@@ -426,13 +428,13 @@ function defaultIsPidAlive(pid: number, platform: NodeJS.Platform): boolean {
 
   if (platform === 'linux') {
     try {
-      const statLine = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const statLine = readFileSync(`${procRoot}/${pid}/stat`, 'utf8');
       const rparen = statLine.lastIndexOf(')');
       if (rparen !== -1) {
         const state = statLine.slice(rparen + 2, rparen + 3);
         if (state === 'Z') return false;
       }
-      const cmdline = readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' ').trim();
+      const cmdline = readFileSync(`${procRoot}/${pid}/cmdline`, 'utf8').replace(/\0/g, ' ').trim();
       if (cmdline && !/(?:imcodes|dist\/src\/index\.js|src\/index\.ts)/iu.test(cmdline)) {
         return false;
       }
@@ -1215,7 +1217,8 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
   const currentGidFn = deps.currentGid ?? (() => (typeof process.getgid === 'function' ? process.getgid() : -1));
   const hostNameFn = deps.hostName ?? hostname;
   const execText = deps.execText ?? defaultExecText;
-  const isPidAlive = deps.isPidAlive ?? ((pid: number) => defaultIsPidAlive(pid, platform));
+  const procRoot = deps.procRoot ?? '/proc';
+  const isPidAlive = deps.isPidAlive ?? ((pid: number) => defaultIsPidAlive(pid, platform, procRoot));
   const killProcess = deps.killProcess ?? ((pid: number, sig: NodeJS.Signals | number) => {
     if (isRealServiceControlBlockedInTest()) {
       throw new Error(`refused_real_kill_in_vitest: ${pid} ${String(sig)}`);
@@ -1329,7 +1332,7 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
 
   async function verifyDaemonPidForUser(pid: number, user: ActiveDesktopUser): Promise<'match' | 'mismatch' | 'unknown'> {
     if (platform === 'linux') {
-      const procDir = `/proc/${pid}`;
+      const procDir = `${procRoot}/${pid}`;
       if (existsSync(procDir)) {
         try {
           const st = statSync(procDir);
