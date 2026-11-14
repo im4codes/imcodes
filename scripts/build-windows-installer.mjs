@@ -2,8 +2,8 @@
 /**
  * Build Windows Desktop 3-in-1 Inno Setup `.iss` / `.exe` installer + PowerShell Phase A probe/rollback helper.
  *
- * Uses `scripts/windows-sign-release-artifact.ps1` (`IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT`)
- * when compiling an `.exe` with `ISCC.exe`, and generates deterministic `.iss` + `.ps1` + `.cmd`
+ * Uses `scripts/windows-sign-release-artifact.ps1` (`IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT` and
+ * `IMCODES_WINDOWS_SIGNING_CERT_SHA256`) when compiling an `.exe` with `ISCC.exe`, and generates deterministic `.iss` + `.ps1` + `.cmd`
  * artifacts even on non-Windows hosts or Windows machines without Inno Setup installed.
  */
 
@@ -1374,6 +1374,48 @@ export function findWindowsIsccExecutable(explicitPath) {
   return null;
 }
 
+/**
+ * Resolve and validate Windows Authenticode signing configuration, failing closed on partial or malformed inputs.
+ */
+export function resolveWindowsSigningConfig(options = {}) {
+  const thumbprint = String(
+    options.signingThumbprint ?? process.env.IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT ?? '',
+  ).trim();
+  const expectedSha256 = String(
+    options.expectedSignerSha256 ?? process.env.IMCODES_WINDOWS_SIGNING_CERT_SHA256 ?? '',
+  )
+    .trim()
+    .toLowerCase();
+  const timestampUrl =
+    String(options.timestampUrl ?? process.env.IMCODES_WINDOWS_SIGNING_TIMESTAMP_URL ?? '').trim() ||
+    'http://timestamp.digicert.com';
+
+  if (Boolean(thumbprint) !== Boolean(expectedSha256)) {
+    throw new Error(
+      'Windows installer signing requires both IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT and IMCODES_WINDOWS_SIGNING_CERT_SHA256',
+    );
+  }
+  if (!thumbprint) {
+    return null;
+  }
+  if (!/^[a-f0-9]{40}$/i.test(thumbprint)) {
+    throw new Error('Windows installer signing thumbprint must be 40-char SHA-1 hex');
+  }
+  if (!/^[a-f0-9]{64}$/.test(expectedSha256)) {
+    throw new Error('Windows installer expected signer SHA-256 must be 64-char SHA-256 hex');
+  }
+  return { thumbprint, expectedSha256, timestampUrl };
+}
+
+function runWindowsSigningScript(scriptArgs) {
+  const signScript = join(REPO_ROOT, 'scripts', 'windows-sign-release-artifact.ps1');
+  execFileSync(
+    'powershell.exe',
+    ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', signScript, ...scriptArgs],
+    { stdio: 'inherit' },
+  );
+}
+
 export async function buildWindowsInstaller(options) {
   const arch = 'x64';
   const targetInfo = parseDaemonRuntimeTarget('win32', arch);
@@ -1465,48 +1507,30 @@ export async function buildWindowsInstaller(options) {
     let exePath;
     let signed = false;
     if (isccExe) {
+      const signingConfig = resolveWindowsSigningConfig(options);
       execFileSync(isccExe, [`/O${outDir}`, workIssPath], { stdio: 'inherit' });
       exePath = join(outDir, `imcodes-desktop-${version}-win32-${arch}.exe`);
-      const thumbprint = options.signingThumbprint ?? process.env.IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT;
-      const expectedSha256 = options.expectedSignerSha256 ?? process.env.IMCODES_WINDOWS_SIGNING_CERT_SHA256;
-      if (thumbprint) {
-        const signScript = join(REPO_ROOT, 'scripts', 'windows-sign-release-artifact.ps1');
-        execFileSync(
-          'powershell.exe',
-          [
-            '-NoProfile',
-            '-ExecutionPolicy',
-            'Bypass',
-            '-File',
-            signScript,
-            '-Mode',
-            'Sign',
-            '-ArtifactPath',
-            exePath,
-            '-CodeSigningCertificateThumbprint',
-            thumbprint,
-          ],
-          { stdio: 'inherit' },
-        );
-        if (expectedSha256) {
-          execFileSync(
-            'powershell.exe',
-            [
-              '-NoProfile',
-              '-ExecutionPolicy',
-              'Bypass',
-              '-File',
-              signScript,
-              '-Mode',
-              'Verify',
-              '-ArtifactPath',
-              exePath,
-              '-ExpectedSignerSha256',
-              expectedSha256,
-            ],
-            { stdio: 'inherit' },
-          );
-        }
+      if (signingConfig) {
+        runWindowsSigningScript([
+          '-Mode',
+          'Sign',
+          '-ArtifactPath',
+          exePath,
+          '-CodeSigningCertificateThumbprint',
+          signingConfig.thumbprint,
+          '-ExpectedSignerSha256',
+          signingConfig.expectedSha256,
+          '-TimestampUrl',
+          signingConfig.timestampUrl,
+        ]);
+        runWindowsSigningScript([
+          '-Mode',
+          'Verify',
+          '-ArtifactPath',
+          exePath,
+          '-ExpectedSignerSha256',
+          signingConfig.expectedSha256,
+        ]);
         signed = true;
       }
       await writeDesktopInstallerManifest(exePath, {
@@ -1546,7 +1570,7 @@ export async function buildWindowsInstaller(options) {
   }
 }
 
-function parseCliArgs(argv) {
+export function parseCliArgs(argv) {
   const args = {
     outDir: join(REPO_ROOT, 'dist-node-exe', 'installers'),
   };
@@ -1562,6 +1586,9 @@ function parseCliArgs(argv) {
     else if (token === '--local-ui-dir') args.localUiDir = argv[++i];
     else if (token === '--out-dir') args.outDir = resolve(argv[++i]);
     else if (token === '--iscc-path') args.isccPath = argv[++i];
+    else if (token === '--signing-thumbprint') args.signingThumbprint = argv[++i];
+    else if (token === '--expected-signer-sha256') args.expectedSignerSha256 = argv[++i];
+    else if (token === '--timestamp-url') args.timestampUrl = argv[++i];
     else if (token === '--require-iscc') args.requireIscc = true;
     else if (token === '--keep-work-dir') args.keepWorkDir = true;
     else throw new Error(`Unknown flag: ${token}`);

@@ -23,7 +23,11 @@ import { buildLinuxInstallers } from '../../scripts/build-linux-installer.mjs';
 // @ts-expect-error ESM script module
 import { buildMacosInstaller, refreshMacosPkgManifest } from '../../scripts/build-macos-installer.mjs';
 // @ts-expect-error ESM script module
-import { buildWindowsInstaller } from '../../scripts/build-windows-installer.mjs';
+import {
+  buildWindowsInstaller,
+  parseCliArgs,
+  resolveWindowsSigningConfig,
+} from '../../scripts/build-windows-installer.mjs';
 // @ts-expect-error ESM script module
 import {
   renderLinuxControlledNodeSystemdUnit,
@@ -1427,5 +1431,214 @@ process.exit(0);
       target: 'linux-x64',
       destReleaseDir: join(root, 'staged-bad'),
     })).toThrow(/daemon-runtime archive missing bin\/node/);
+  });
+
+  it('validates Windows signing config fail-closed across options, CLI flags, and env', () => {
+    const thumbprint = '63163EEE65A565328BEDACCB0981C1DE6883FD8C';
+    const sha256Upper = 'ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789';
+    const sha256Lower = sha256Upper.toLowerCase();
+
+    const prevThumbprint = process.env.IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT;
+    const prevSha256 = process.env.IMCODES_WINDOWS_SIGNING_CERT_SHA256;
+    const prevTimestampUrl = process.env.IMCODES_WINDOWS_SIGNING_TIMESTAMP_URL;
+    try {
+      delete process.env.IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT;
+      delete process.env.IMCODES_WINDOWS_SIGNING_CERT_SHA256;
+      delete process.env.IMCODES_WINDOWS_SIGNING_TIMESTAMP_URL;
+
+      expect(resolveWindowsSigningConfig({})).toBeNull();
+
+      const cliParsed = parseCliArgs([
+        '--signing-thumbprint',
+        ` ${thumbprint} `,
+        '--expected-signer-sha256',
+        ` ${sha256Upper} `,
+        '--timestamp-url',
+        ' http://timestamp.example.test ',
+      ]);
+      expect(resolveWindowsSigningConfig(cliParsed)).toEqual({
+        thumbprint,
+        expectedSha256: sha256Lower,
+        timestampUrl: 'http://timestamp.example.test',
+      });
+
+      expect(() =>
+        resolveWindowsSigningConfig({ signingThumbprint: thumbprint }),
+      ).toThrow(/IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT and IMCODES_WINDOWS_SIGNING_CERT_SHA256/);
+      expect(() =>
+        resolveWindowsSigningConfig({ expectedSignerSha256: sha256Upper }),
+      ).toThrow(/IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT and IMCODES_WINDOWS_SIGNING_CERT_SHA256/);
+      expect(() =>
+        resolveWindowsSigningConfig({
+          signingThumbprint: 'not-a-thumbprint',
+          expectedSignerSha256: sha256Upper,
+        }),
+      ).toThrow(/40-char SHA-1 hex/);
+      expect(() =>
+        resolveWindowsSigningConfig({
+          signingThumbprint: thumbprint,
+          expectedSignerSha256: 'not-a-sha256',
+        }),
+      ).toThrow(/64-char SHA-256 hex/);
+    } finally {
+      if (prevThumbprint === undefined) delete process.env.IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT;
+      else process.env.IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT = prevThumbprint;
+      if (prevSha256 === undefined) delete process.env.IMCODES_WINDOWS_SIGNING_CERT_SHA256;
+      else process.env.IMCODES_WINDOWS_SIGNING_CERT_SHA256 = prevSha256;
+      if (prevTimestampUrl === undefined) delete process.env.IMCODES_WINDOWS_SIGNING_TIMESTAMP_URL;
+      else process.env.IMCODES_WINDOWS_SIGNING_TIMESTAMP_URL = prevTimestampUrl;
+    }
+  });
+
+  it.runIf(process.platform !== 'win32')(
+    'passes -ExpectedSignerSha256 and -TimestampUrl in -Mode Sign, verifies, fails closed when missing, and keeps unsigned builds clean',
+    async () => {
+      const root = makeTempDir();
+      const runtimeDir = createFakeRuntimeDir(root, 'win32', '0.9.5');
+      const shimDir = join(root, 'bin');
+      mkdirSync(shimDir, { recursive: true });
+      const logPath = join(root, 'ps-calls.jsonl');
+
+      const fakeIscc = join(shimDir, 'ISCC.exe');
+      writeFileSync(
+        fakeIscc,
+        `#!/usr/bin/env node
+const { mkdirSync, writeFileSync } = require('node:fs');
+const { join } = require('node:path');
+const outArg = process.argv.find((a) => a.startsWith('/O'));
+if (!outArg) process.exit(2);
+const outDir = outArg.slice(2);
+mkdirSync(outDir, { recursive: true });
+writeFileSync(join(outDir, 'imcodes-desktop-0.9.5-win32-x64.exe'), 'MZ-compiled');
+`,
+      );
+      chmodSync(fakeIscc, 0o755);
+
+      const fakePs = join(shimDir, 'powershell.exe');
+      writeFileSync(
+        fakePs,
+        `#!/usr/bin/env node
+const { appendFileSync } = require('node:fs');
+const logFile = process.env.TEST_PS_LOG;
+if (logFile) appendFileSync(logFile, JSON.stringify(process.argv.slice(2)) + '\\n');
+`,
+      );
+      chmodSync(fakePs, 0o755);
+
+      const prevPath = process.env.PATH;
+      const prevPsLog = process.env.TEST_PS_LOG;
+      const prevThumb = process.env.IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT;
+      const prevSha = process.env.IMCODES_WINDOWS_SIGNING_CERT_SHA256;
+      const prevTs = process.env.IMCODES_WINDOWS_SIGNING_TIMESTAMP_URL;
+
+      const thumbprint = '63163EEE65A565328BEDACCB0981C1DE6883FD8C';
+      const sha256Upper = 'FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210';
+      const sha256Lower = sha256Upper.toLowerCase();
+
+      try {
+        process.env.PATH = `${shimDir}:${prevPath ?? ''}`;
+        process.env.TEST_PS_LOG = logPath;
+
+        // 1. Signed build via env vars passes -ExpectedSignerSha256 and -TimestampUrl in -Mode Sign + Verify
+        process.env.IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT = ` ${thumbprint} `;
+        process.env.IMCODES_WINDOWS_SIGNING_CERT_SHA256 = ` ${sha256Upper} `;
+        delete process.env.IMCODES_WINDOWS_SIGNING_TIMESTAMP_URL;
+
+        const signedRes = await buildWindowsInstaller({
+          version: '0.9.5',
+          runtimeDir,
+          outDir: join(root, 'out-signed'),
+          isccPath: fakeIscc,
+        });
+        expect(signedRes.signed).toBe(true);
+        const signedManifest = JSON.parse(readFileSync(`${signedRes.exePath}.manifest.json`, 'utf8'));
+        expect(signedManifest.signed).toBe(true);
+
+        const psCalls = readFileSync(logPath, 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as string[]);
+        expect(psCalls).toHaveLength(2);
+        expect(psCalls[0]).toEqual([
+          '-NoProfile',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-File',
+          join(__dirname, '..', '..', 'scripts', 'windows-sign-release-artifact.ps1'),
+          '-Mode',
+          'Sign',
+          '-ArtifactPath',
+          signedRes.exePath,
+          '-CodeSigningCertificateThumbprint',
+          thumbprint,
+          '-ExpectedSignerSha256',
+          sha256Lower,
+          '-TimestampUrl',
+          'http://timestamp.digicert.com',
+        ]);
+        expect(psCalls[1]).toEqual([
+          '-NoProfile',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-File',
+          join(__dirname, '..', '..', 'scripts', 'windows-sign-release-artifact.ps1'),
+          '-Mode',
+          'Verify',
+          '-ArtifactPath',
+          signedRes.exePath,
+          '-ExpectedSignerSha256',
+          sha256Lower,
+        ]);
+
+        // 2. Fail-closed when thumbprint is set without expected SHA-256 (must not call powershell.exe)
+        writeFileSync(logPath, '');
+        delete process.env.IMCODES_WINDOWS_SIGNING_CERT_SHA256;
+        await expect(
+          buildWindowsInstaller({
+            version: '0.9.5',
+            runtimeDir,
+            outDir: join(root, 'out-missing-sha'),
+            isccPath: fakeIscc,
+          }),
+        ).rejects.toThrow(/IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT and IMCODES_WINDOWS_SIGNING_CERT_SHA256/);
+        expect(readFileSync(logPath, 'utf8')).toBe('');
+
+        // 3. Unsigned build when neither thumbprint nor expected SHA-256 is configured
+        delete process.env.IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT;
+        const unsignedRes = await buildWindowsInstaller({
+          version: '0.9.5',
+          runtimeDir,
+          outDir: join(root, 'out-unsigned'),
+          isccPath: fakeIscc,
+        });
+        expect(unsignedRes.signed).toBe(false);
+        expect(readFileSync(logPath, 'utf8')).toBe('');
+        const unsignedManifest = JSON.parse(readFileSync(`${unsignedRes.exePath}.manifest.json`, 'utf8'));
+        expect(unsignedManifest.signed).toBe(false);
+      } finally {
+        if (prevPath === undefined) delete process.env.PATH;
+        else process.env.PATH = prevPath;
+        if (prevPsLog === undefined) delete process.env.TEST_PS_LOG;
+        else process.env.TEST_PS_LOG = prevPsLog;
+        if (prevThumb === undefined) delete process.env.IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT;
+        else process.env.IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT = prevThumb;
+        if (prevSha === undefined) delete process.env.IMCODES_WINDOWS_SIGNING_CERT_SHA256;
+        else process.env.IMCODES_WINDOWS_SIGNING_CERT_SHA256 = prevSha;
+        if (prevTs === undefined) delete process.env.IMCODES_WINDOWS_SIGNING_TIMESTAMP_URL;
+        else process.env.IMCODES_WINDOWS_SIGNING_TIMESTAMP_URL = prevTs;
+      }
+    },
+  );
+
+  it('wires IMCODES_WINDOWS_SIGNING_CERT_SHA256 before build-windows-installer in CI workflows', () => {
+    for (const rel of ['.github/workflows/ci.yml', '.github/workflows/build-node-exe.yml']) {
+      const yamlText = readFileSync(join(__dirname, '..', '..', rel), 'utf8');
+      const thumbIdx = yamlText.indexOf('IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT=');
+      const shaIdx = yamlText.indexOf('IMCODES_WINDOWS_SIGNING_CERT_SHA256=');
+      const buildIdx = yamlText.indexOf('build-windows-installer.mjs');
+      expect(thumbIdx, `${rel} missing IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT`).toBeGreaterThan(-1);
+      expect(shaIdx, `${rel} missing IMCODES_WINDOWS_SIGNING_CERT_SHA256`).toBeGreaterThan(-1);
+      expect(buildIdx, `${rel} missing build-windows-installer.mjs`).toBeGreaterThan(shaIdx);
+    }
   });
 });
