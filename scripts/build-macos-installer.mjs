@@ -27,6 +27,7 @@ import {
   loadDesktopCompatibilityModule,
   REPO_ROOT,
   renderMacosControlledNodeLaunchDaemonPlist,
+  renderMacosControlledNodeWatchdogLaunchDaemonPlist,
   renderPosixPhaseARunnerScript,
   resolveDesktopInstallerVersion,
   stageDaemonRuntimePayload,
@@ -122,6 +123,7 @@ export async function stageMacosInstallerTree(options) {
     platform: 'darwin',
     version,
     cliWrapperContent,
+    minVersion: options.minVersion ?? '',
   });
 
   // 1. Runtime + controlled node root
@@ -173,10 +175,9 @@ export async function stageMacosInstallerTree(options) {
     );
     writeFileSync(
       join(launchDaemonsDir, 'cc.imcodes.node.watchdog.plist'),
-      renderMacosControlledNodeLaunchDaemonPlist(
+      renderMacosControlledNodeWatchdogLaunchDaemonPlist(
         'cc.imcodes.node.watchdog',
         '/Library/Application Support/imcodes-node/imcodes-node',
-        ['--watchdog'],
       ),
       'utf8',
     );
@@ -251,7 +252,7 @@ export async function buildMacosInstaller(options) {
   const workDir = options.stageDir
     ? resolve(options.stageDir)
     : mkdtempSync(join(tmpdir(), `imcodes-macos-pkg-${arch}-`));
-  const cleanupWorkDir = !options.stageDir && !options.keepStage;
+  const cleanupWorkDir = !options.stageDir && !options.keepStage && !options.emitStageOnly;
 
   try {
     const staged = await stageMacosInstallerTree({
@@ -346,6 +347,7 @@ export async function buildMacosInstaller(options) {
       format: 'pkg',
       version,
       signed: Boolean(signIdentity),
+      notarized: Boolean(options.notarized),
       hasAppBundle: Boolean(staged.appRoot),
       hasNodeBinary: staged.hasNodeBinary,
     });
@@ -363,6 +365,22 @@ export async function buildMacosInstaller(options) {
   }
 }
 
+export async function refreshMacosPkgManifest(options) {
+  const pkgPath = resolve(options.pkgPath);
+  const arch = options.arch === 'x64' ? 'x64' : 'arm64';
+  const version = resolveDesktopInstallerVersion(options.version);
+  return writeDesktopInstallerManifest(pkgPath, {
+    platform: 'darwin',
+    arch,
+    format: 'pkg',
+    version,
+    signed: Boolean(options.signed),
+    notarized: Boolean(options.notarized),
+    hasAppBundle: Boolean(options.hasAppBundle),
+    hasNodeBinary: Boolean(options.hasNodeBinary),
+  });
+}
+
 function parseCliArgs(argv) {
   const args = {
     arch: process.arch === 'x64' ? 'x64' : 'arm64',
@@ -372,6 +390,7 @@ function parseCliArgs(argv) {
     const token = argv[i];
     if (token === '--arch') args.arch = argv[++i];
     else if (token === '--version') args.version = argv[++i];
+    else if (token === '--min-version') args.minVersion = argv[++i];
     else if (token === '--runtime-dir') args.runtimeDir = argv[++i];
     else if (token === '--runtime-archive') args.runtimeArchive = argv[++i];
     else if (token === '--app-bundle') args.appBundle = argv[++i];
@@ -382,6 +401,11 @@ function parseCliArgs(argv) {
     else if (token === '--stage-dir') args.stageDir = resolve(argv[++i]);
     else if (token === '--sign-identity') args.signIdentity = argv[++i];
     else if (token === '--keychain') args.keychainPath = argv[++i];
+    else if (token === '--refresh-manifest') args.refreshManifest = argv[++i];
+    else if (token === '--signed') args.signed = true;
+    else if (token === '--notarized') args.notarized = true;
+    else if (token === '--has-app-bundle') args.hasAppBundle = true;
+    else if (token === '--has-node-binary') args.hasNodeBinary = true;
     else if (token === '--emit-stage-only') args.emitStageOnly = true;
     else if (token === '--keep-stage') args.keepStage = true;
     else throw new Error(`Unknown flag: ${token}`);
@@ -391,7 +415,11 @@ function parseCliArgs(argv) {
 
 const isMain = process.argv[1] && resolve(process.argv[1]).endsWith('build-macos-installer.mjs');
 if (isMain) {
-  buildMacosInstaller(parseCliArgs(process.argv.slice(2)))
+  const parsed = parseCliArgs(process.argv.slice(2));
+  const action = parsed.refreshManifest
+    ? refreshMacosPkgManifest({ ...parsed, pkgPath: parsed.refreshManifest })
+    : buildMacosInstaller(parsed);
+  action
     .then((res) => {
       process.stdout.write(`${JSON.stringify(res, null, 2)}\n`);
     })

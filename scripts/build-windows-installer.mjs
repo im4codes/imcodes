@@ -28,10 +28,10 @@ import {
   writeDesktopInstallerManifest,
 } from './desktop-installer-shared.mjs';
 
-export function renderWindowsPhaseAInstallerPs1({ version, cliWrapperContent }) {
+export function renderWindowsPhaseAInstallerPs1({ version, cliWrapperContent, minVersion = '' }) {
   const wrapperB64 = Buffer.from(cliWrapperContent, 'utf8').toString('base64');
   return `param(
-  [ValidateSet('Probe', 'Plan', 'PostInstall', 'CleanupTmp', 'Rollback')]
+  [ValidateSet('Probe', 'Plan', 'PreInstall', 'PostInstall', 'CleanupTmp', 'Rollback')]
   [string]$Mode = 'Plan',
 
   [string]$Version = ${JSON.stringify(version)},
@@ -41,12 +41,16 @@ export function renderWindowsPhaseAInstallerPs1({ version, cliWrapperContent }) 
   [string]$NodeRoot = '',
   [string]$CliWrapperPath = '',
   [string]$AutostartPath = '',
+  [string]$StartMenuShortcutPath = '',
+  [string]$DesktopShortcutPath = '',
   [string]$SnapshotDir = '',
   [string]$StagedCliWrapper = '',
-  [string]$MinimumRuntimeVersion = '',
+  [string]$MinimumRuntimeVersion = ${JSON.stringify(minVersion)},
+  [string]$ServiceHookScript = '',
   [int]$TempMaxAgeHours = 24,
   [switch]$ForceTakeover,
-  [switch]$AllowSystemRoot
+  [switch]$AllowSystemRoot,
+  [switch]$ApplyServices
 )
 
 $ErrorActionPreference = 'Stop'
@@ -56,38 +60,125 @@ function Get-NormalizedPath([string]$PathValue) {
   return [System.IO.Path]::GetFullPath($PathValue).TrimEnd('\\').ToLowerInvariant()
 }
 
-function Assert-SafeTargetPath([string]$TargetPath, [string]$RealHome) {
-  if ($AllowSystemRoot) { return }
-  $norm = Get-NormalizedPath $TargetPath
+function Resolve-CanonicalWindowsPath([string]$PathValue) {
+  if ([string]::IsNullOrWhiteSpace($PathValue)) { return '' }
+  $full = [System.IO.Path]::GetFullPath($PathValue)
+  $cur = $full
+  $tail = New-Object System.Collections.Generic.List[string]
+  while ($cur -and -not (Test-Path -LiteralPath $cur)) {
+    $parent = Split-Path -Parent $cur
+    if (-not $parent -or $parent -eq $cur) { break }
+    $tail.Insert(0, (Split-Path -Leaf $cur))
+    $cur = $parent
+  }
+  $resolvedBase = $cur
+  for ($hop = 0; $hop -lt 12; $hop++) {
+    if (-not (Test-Path -LiteralPath $resolvedBase)) { break }
+    try {
+      $item = Get-Item -LiteralPath $resolvedBase -Force -ErrorAction SilentlyContinue
+      if ($item -and ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        $nextTarget = $null
+        try {
+          if ($item.PSObject.Methods['ResolveLinkTarget']) {
+            $rt = $item.ResolveLinkTarget($true)
+            if ($rt) { $nextTarget = $rt.FullName }
+          }
+        } catch {}
+        if (-not $nextTarget -and $item.Target) {
+          $nextTarget = [string]$item.Target[0]
+        }
+        if ($nextTarget) {
+          if (-not [System.IO.Path]::IsPathRooted($nextTarget)) {
+            $nextTarget = Join-Path (Split-Path -Parent $resolvedBase) $nextTarget
+          }
+          $resolvedBase = [System.IO.Path]::GetFullPath($nextTarget)
+          continue
+        }
+      }
+    } catch {}
+    break
+  }
+  $combined = $resolvedBase
+  foreach ($seg in $tail) { $combined = Join-Path $combined $seg }
+  return [System.IO.Path]::GetFullPath($combined).TrimEnd('\\').ToLowerInvariant()
+}
+
+function Test-SameOrChildWindowsPath([string]$Candidate, [string]$Parent) {
+  if ([string]::IsNullOrWhiteSpace($Parent)) { return $false }
+  if ($Candidate -eq $Parent) { return $true }
+  return $Candidate.StartsWith($Parent + '\\')
+}
+
+function Assert-SafeTargetPath([string]$TargetPath, [string]$RealHome, [switch]$EntryMode) {
+  if (-not [string]::IsNullOrWhiteSpace($IsolatedRoot) -and $AllowSystemRoot) {
+    throw 'unsafe_allow_system_root_with_isolated_root'
+  }
+  if ($AllowSystemRoot -and [string]::IsNullOrWhiteSpace($IsolatedRoot)) { return }
+  $fullPath = [System.IO.Path]::GetFullPath($TargetPath)
+  $canonPath = if ($EntryMode) {
+    $parentFull = Split-Path -Parent $fullPath
+    $leaf = Split-Path -Leaf $fullPath
+    if ([string]::IsNullOrWhiteSpace($parentFull)) {
+      $fullPath.TrimEnd('\\').ToLowerInvariant()
+    } else {
+      $canonParent = Resolve-CanonicalWindowsPath $parentFull
+      (Join-Path $canonParent $leaf).TrimEnd('\\').ToLowerInvariant()
+    }
+  } else {
+    Resolve-CanonicalWindowsPath $TargetPath
+  }
+  $checks = @(
+    (Get-NormalizedPath $TargetPath),
+    $canonPath
+  )
   $forbidden = @(
     'c:\\programdata\\imcodes-node',
     'c:\\program files\\im.codes'
   )
   if (-not [string]::IsNullOrWhiteSpace($RealHome)) {
     $homeNorm = Get-NormalizedPath $RealHome
-    $forbidden += @(
-      "$homeNorm\\.imcodes",
-      "$homeNorm\\appdata\\local\\imcodes",
-      "$homeNorm\\appdata\\roaming\\microsoft\\windows\\start menu"
-    )
-    if ($norm -eq $homeNorm) {
-      throw "unsafe_installer_target_inside_system_root: $TargetPath"
+    $homeCanon = Resolve-CanonicalWindowsPath $RealHome
+    foreach ($hn in @($homeNorm, $homeCanon) | Select-Object -Unique) {
+      if ([string]::IsNullOrWhiteSpace($hn)) { continue }
+      $forbidden += @(
+        "$hn\\.imcodes",
+        "$hn\\appdata\\local\\imcodes",
+        "$hn\\appdata\\roaming\\microsoft\\windows\\start menu",
+        "$hn\\desktop"
+      )
+      foreach ($c in $checks) {
+        if ($c -eq $hn) { throw "unsafe_installer_target_inside_system_root: $TargetPath" }
+      }
     }
   }
-  foreach ($f in $forbidden) {
-    if ($norm -eq $f -or $norm.StartsWith($f + '\\')) {
-      throw "unsafe_installer_target_inside_system_root: $TargetPath"
+  foreach ($c in $checks) {
+    foreach ($f in $forbidden) {
+      if (Test-SameOrChildWindowsPath $c $f) {
+        throw "unsafe_installer_target_inside_system_root: $TargetPath"
+      }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($IsolatedRoot)) {
+      $isoNorm = Get-NormalizedPath $IsolatedRoot
+      $isoCanon = Resolve-CanonicalWindowsPath $IsolatedRoot
+      $homeNormBound = if (-not [string]::IsNullOrWhiteSpace($HomeDir)) { Get-NormalizedPath $HomeDir } else { '' }
+      $homeCanonBound = if (-not [string]::IsNullOrWhiteSpace($HomeDir)) { Resolve-CanonicalWindowsPath $HomeDir } else { '' }
+      $inIso = (Test-SameOrChildWindowsPath $c $isoNorm) -and (Test-SameOrChildWindowsPath $c $isoCanon)
+      $inHome = (-not [string]::IsNullOrWhiteSpace($homeNormBound)) -and (Test-SameOrChildWindowsPath $c $homeNormBound) -and (Test-SameOrChildWindowsPath $c $homeCanonBound)
+      if (-not $inIso -and -not $inHome) {
+        throw "unsafe_installer_target_outside_isolated_root: $TargetPath"
+      }
     }
   }
 }
 
 $RealProfile = $env:USERPROFILE
-if ([string]::IsNullOrWhiteSpace($HomeDir)) {
-  $HomeDir = $RealProfile
-}
-
 if (-not [string]::IsNullOrWhiteSpace($IsolatedRoot)) {
+  if ($AllowSystemRoot) { throw 'unsafe_allow_system_root_with_isolated_root' }
+  if ([string]::IsNullOrWhiteSpace($HomeDir)) {
+    $HomeDir = Join-Path $IsolatedRoot 'home'
+  }
   Assert-SafeTargetPath $IsolatedRoot $RealProfile
+  Assert-SafeTargetPath $HomeDir $RealProfile
   if ([string]::IsNullOrWhiteSpace($RuntimeRoot)) { $RuntimeRoot = Join-Path $IsolatedRoot 'daemon-runtime' }
   if ([string]::IsNullOrWhiteSpace($NodeRoot)) { $NodeRoot = Join-Path $IsolatedRoot 'controlled-node' }
   if ([string]::IsNullOrWhiteSpace($CliWrapperPath)) { $CliWrapperPath = Join-Path $IsolatedRoot 'bin\\imcodes.cmd' }
@@ -95,7 +186,14 @@ if (-not [string]::IsNullOrWhiteSpace($IsolatedRoot)) {
   if ([string]::IsNullOrWhiteSpace($AutostartPath)) {
     $AutostartPath = Join-Path $HomeDir 'AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\imcodes-daemon.cmd'
   }
+  if ([string]::IsNullOrWhiteSpace($StartMenuShortcutPath)) {
+    $StartMenuShortcutPath = Join-Path $HomeDir 'AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\aiDesk.to by IM.codes.lnk'
+  }
+  if ([string]::IsNullOrWhiteSpace($DesktopShortcutPath)) {
+    $DesktopShortcutPath = Join-Path $HomeDir 'Desktop\\aiDesk.to by IM.codes.lnk'
+  }
 } else {
+  if ([string]::IsNullOrWhiteSpace($HomeDir)) { $HomeDir = $RealProfile }
   if ([string]::IsNullOrWhiteSpace($RuntimeRoot)) { $RuntimeRoot = 'C:\\Program Files\\IM.codes\\daemon-runtime' }
   if ([string]::IsNullOrWhiteSpace($NodeRoot)) { $NodeRoot = 'C:\\ProgramData\\imcodes-node' }
   if ([string]::IsNullOrWhiteSpace($CliWrapperPath)) {
@@ -106,11 +204,24 @@ if (-not [string]::IsNullOrWhiteSpace($IsolatedRoot)) {
   if ([string]::IsNullOrWhiteSpace($AutostartPath)) {
     $AutostartPath = Join-Path $HomeDir 'AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\imcodes-daemon.cmd'
   }
+  if ([string]::IsNullOrWhiteSpace($StartMenuShortcutPath)) {
+    $StartMenuShortcutPath = Join-Path $HomeDir 'AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\aiDesk.to by IM.codes.lnk'
+  }
+  if ([string]::IsNullOrWhiteSpace($DesktopShortcutPath)) {
+    $DesktopShortcutPath = Join-Path $HomeDir 'Desktop\\aiDesk.to by IM.codes.lnk'
+  }
 }
 
 $UserStateDir = Join-Path $HomeDir '.imcodes'
 $ReleaseDir = Join-Path (Join-Path $RuntimeRoot 'releases') $Version
 $CurrentDir = Join-Path $RuntimeRoot 'current'
+
+foreach ($tp in @($RuntimeRoot, $NodeRoot, $SnapshotDir, $UserStateDir, $ReleaseDir)) {
+  Assert-SafeTargetPath $tp $RealProfile
+}
+foreach ($ep in @($CliWrapperPath, $AutostartPath, $StartMenuShortcutPath, $DesktopShortcutPath, $CurrentDir)) {
+  Assert-SafeTargetPath $ep $RealProfile -EntryMode
+}
 
 function Test-PathLooksFilesystem([string]$Value) {
   if ([string]::IsNullOrWhiteSpace($Value) -or $Value.StartsWith('-')) { return $false }
@@ -165,6 +276,39 @@ function Get-FileSha256Hex([string]$PathValue) {
   }
 }
 
+function Compare-SimpleVersions([string]$Left, [string]$Right) {
+  $la = ($Left.TrimStart('v').Split('-')[0].Split('.') | ForEach-Object { $n = 0; [void][int]::TryParse($_, [ref]$n); $n })
+  $ra = ($Right.TrimStart('v').Split('-')[0].Split('.') | ForEach-Object { $n = 0; [void][int]::TryParse($_, [ref]$n); $n })
+  $len = [Math]::Max($la.Count, $ra.Count)
+  for ($i = 0; $i -lt $len; $i++) {
+    $lv = if ($i -lt $la.Count) { $la[$i] } else { 0 }
+    $rv = if ($i -lt $ra.Count) { $ra[$i] } else { 0 }
+    if ($lv -lt $rv) { return -1 }
+    if ($lv -gt $rv) { return 1 }
+  }
+  return 0
+}
+
+function Find-PackageVersionNear([string]$TargetPath) {
+  if ([string]::IsNullOrWhiteSpace($TargetPath)) { return $null }
+  $dir = $TargetPath
+  if (-not (Test-Path -LiteralPath $dir -PathType Container)) { $dir = Split-Path -Parent $dir }
+  for ($i = 0; $i -lt 6; $i++) {
+    if ([string]::IsNullOrWhiteSpace($dir)) { break }
+    $pkg = Join-Path $dir 'package.json'
+    if (Test-Path -LiteralPath $pkg -PathType Leaf) {
+      try {
+        $obj = Get-Content -LiteralPath $pkg -Raw | ConvertFrom-Json
+        if ($obj.name -eq 'imcodes' -and $obj.version) { return [string]$obj.version }
+      } catch {}
+    }
+    $parent = Split-Path -Parent $dir
+    if ($parent -eq $dir) { break }
+    $dir = $parent
+  }
+  return $null
+}
+
 function Invoke-PhaseAProbe {
   $credPath = Join-Path $NodeRoot 'credential.json'
   $hasCred = Test-Path -LiteralPath $credPath -PathType Leaf
@@ -212,15 +356,25 @@ function Invoke-PhaseAProbe {
   $autostartDev = $false
   $isLegacyBroken = $false
   $legacyReason = ''
+  $installedVersion = ''
   if ($hasAutostart) {
     $autoText = Get-Content -LiteralPath $AutostartPath -Raw -ErrorAction SilentlyContinue
     if ($autoText -match '([A-Za-z]:[/\\\\][^\\r\\n"'']+dist[/\\\\]src[/\\\\]index\\.js)') {
       if (Test-InsideGitCheckout $Matches[1]) { $autostartDev = $true }
+      $installedVersion = Find-PackageVersionNear $Matches[1]
     }
     if ($autoText -match '-2147020576' -or $autoText -match 'broken') {
       $isLegacyBroken = $true
       $legacyReason = 'windows_legacy_broken_exit_signature'
     }
+  }
+  if (-not $installedVersion -and $cliExists -and -not $cliDev) {
+    try {
+      $cliRaw = Get-Content -LiteralPath $CliWrapperPath -Raw -ErrorAction SilentlyContinue
+      if ($cliRaw -and -not $cliRaw.Contains('IMCODES_DAEMON_RUNTIME_DIR')) {
+        $installedVersion = Find-PackageVersionNear $CliWrapperPath
+      }
+    } catch {}
   }
 
   $errMarker = Join-Path $UserStateDir 'last-upgrade-error.json'
@@ -232,6 +386,12 @@ function Invoke-PhaseAProbe {
         $legacyReason = 'legacy_npm_upgrade_exit_-2147020576'
       }
     } catch {}
+  }
+  if (-not $isLegacyBroken -and -not $autostartDev -and -not $cliDev -and $installedVersion -and -not [string]::IsNullOrWhiteSpace($MinimumRuntimeVersion)) {
+    if ((Compare-SimpleVersions $installedVersion $MinimumRuntimeVersion) -lt 0) {
+      $isLegacyBroken = $true
+      $legacyReason = "stale_npm_version_$installedVersion"
+    }
   }
 
   $cutoff = (Get-Date).AddHours(-1 * [Math]::Abs($TempMaxAgeHours))
@@ -260,11 +420,15 @@ function Invoke-PhaseAProbe {
 
   $preserveCli = ($scenario -eq 'dev_symlink_exempt' -and $cliDev)
   $preserveAutostart = ($scenario -eq 'dev_symlink_exempt') -or ($scenario -eq 'partial_preserve' -and $hasAutostart)
+  $checkLock = ($scenario -eq 'legacy_broken_takeover') -or $hasLock -or ($scenario -eq 'clean')
+  $stopDaemon = (($scenario -eq 'legacy_broken_takeover') -and $hasAutostart) -or (-not $preserveAutostart -and $hasLock)
+  $switchToBundled = ($scenario -eq 'clean') -or ($scenario -eq 'legacy_broken_takeover') -or ($scenario -eq 'partial_preserve' -and -not $hasAutostart)
 
   return [ordered]@{
     platform = 'win32'
     scenario = $scenario
     legacyReason = $legacyReason
+    installedVersion = $installedVersion
     controlledNodeRoot = $NodeRoot
     runtimeRoot = $RuntimeRoot
     userStateDir = $UserStateDir
@@ -276,6 +440,9 @@ function Invoke-PhaseAProbe {
     hasDaemonLock = $hasLock
     preserveDevCliLink = $preserveCli
     preserveUserDaemonAutostart = $preserveAutostart
+    checkSingleInstanceLock = $checkLock
+    stopUserDaemonTask = $stopDaemon
+    switchToBundledRuntime = $switchToBundled
     skipNodeReEnroll = $validCred
     expectsPendingSetupWizard = (-not $validCred)
     cleanExpiredTempArtifacts = ($expiredTmp.Count -gt 0 -and ($scenario -eq 'legacy_broken_takeover' -or $scenario -eq 'partial_preserve'))
@@ -303,6 +470,255 @@ if ($Mode -eq 'CleanupTmp') {
   exit 0
 }
 
+function Write-TextAtomic([string]$TargetPath, [string]$Content, [System.Text.Encoding]$Encoding) {
+  $parent = Split-Path -Parent $TargetPath
+  New-Item -ItemType Directory -Force -Path $parent | Out-Null
+  $tmp = "$TargetPath.tmp.$PID." + [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+  try {
+    [System.IO.File]::WriteAllText($tmp, $Content, $Encoding)
+    if (Test-Path -LiteralPath $TargetPath) {
+      $existingItem = Get-Item -LiteralPath $TargetPath -Force -ErrorAction SilentlyContinue
+      if ($existingItem -and ($existingItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        Remove-Item -LiteralPath $TargetPath -Force
+      }
+    }
+    Move-Item -LiteralPath $tmp -Destination $TargetPath -Force
+  } catch {
+    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    throw
+  }
+}
+
+function Invoke-ServiceAction([string]$Action, [hashtable]$Payload) {
+  if (-not [string]::IsNullOrWhiteSpace($ServiceHookScript)) {
+    $jsonArg = ($Payload | ConvertTo-Json -Compress -Depth 5)
+    & $ServiceHookScript -Action $Action -PayloadJson $jsonArg | Out-Null
+    return $true
+  }
+  return $false
+}
+
+function Assert-SingleInstanceLockAndStop($Plan) {
+  if (-not $Plan.checkSingleInstanceLock -and -not $Plan.stopUserDaemonTask) { return $false }
+  $lockPath = Join-Path $UserStateDir 'daemon.lock.json'
+  if (-not (Test-Path -LiteralPath $lockPath -PathType Leaf)) { return $false }
+  $lockPid = $null
+  try {
+    $lockObj = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
+    if ($lockObj.pid -is [int] -or $lockObj.pid -is [long] -or ($lockObj.pid -match '^\\d+$')) {
+      $lockPid = [int]$lockObj.pid
+    }
+  } catch {}
+  if (-not $lockPid) { return $false }
+  $proc = Get-Process -Id $lockPid -ErrorAction SilentlyContinue
+  if (-not $proc) { return $false }
+
+  if ($Plan.stopUserDaemonTask -or (-not $Plan.preserveUserDaemonAutostart) -or $Plan.switchToBundledRuntime) {
+    $cmdLine = ''
+    try {
+      $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$lockPid" -ErrorAction SilentlyContinue
+      if ($cim -and $cim.CommandLine) { $cmdLine = [string]$cim.CommandLine }
+    } catch {}
+    $isControllable = (-not [string]::IsNullOrWhiteSpace($ServiceHookScript)) -or
+      ($cmdLine -match 'imcodes|index\\.js|daemon-stub') -or
+      ($proc.ProcessName -match 'node|imcodes')
+    if (-not $isControllable) {
+      throw "active_daemon_lock_uncontrollable_pid: $lockPid"
+    }
+    $handled = Invoke-ServiceAction 'StopDaemon' @{ pid = $lockPid; autostartPath = $AutostartPath }
+    if (-not $handled) {
+      if ($ApplyServices) {
+        try { Stop-ScheduledTask -TaskName 'imcodes-daemon' -ErrorAction SilentlyContinue } catch {}
+      }
+      Stop-Process -Id $lockPid -ErrorAction SilentlyContinue
+    }
+    for ($w = 0; $w -lt 25; $w++) {
+      if (-not (Get-Process -Id $lockPid -ErrorAction SilentlyContinue)) {
+        return $true
+      }
+      Start-Sleep -Milliseconds 200
+    }
+    if (Get-Process -Id $lockPid -ErrorAction SilentlyContinue) {
+      throw "active_daemon_lock_refused_to_stop: $lockPid"
+    }
+    return $true
+  }
+  return $false
+}
+
+function Save-RollbackSnapshot($Plan) {
+  $manifestPath = Join-Path $SnapshotDir 'snapshot.json'
+  $filesDir = Join-Path $SnapshotDir 'files'
+  New-Item -ItemType Directory -Force -Path $filesDir | Out-Null
+  $entries = @()
+  $idx = 0
+  $nodeExeTarget = Join-Path $NodeRoot 'imcodes-node.exe'
+  foreach ($tp in @($CliWrapperPath, $AutostartPath, $CurrentDir, $ReleaseDir, $nodeExeTarget, $StartMenuShortcutPath, $DesktopShortcutPath)) {
+    if ([string]::IsNullOrWhiteSpace($tp)) { continue }
+    if ($tp -eq $ReleaseDir) {
+      Assert-SafeTargetPath $tp $RealProfile
+    } else {
+      Assert-SafeTargetPath $tp $RealProfile -EntryMode
+    }
+    if (-not (Test-Path -LiteralPath $tp)) {
+      $entries += [ordered]@{ kind = 'absent'; originalPath = $tp }
+      continue
+    }
+    $item = Get-Item -LiteralPath $tp -Force
+    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+      $target = if ($item.Target) { [string]$item.Target[0] } else { '' }
+      $entries += [ordered]@{ kind = 'junction'; originalPath = $tp; target = $target }
+    } elseif ($item.PSIsContainer) {
+      $idx++
+      $rel = Join-Path 'files' ("$idx-" + $item.Name)
+      $dest = Join-Path $SnapshotDir $rel
+      Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction SilentlyContinue
+      Copy-Item -LiteralPath $tp -Destination $dest -Recurse -Force
+      $entries += [ordered]@{ kind = 'dir'; originalPath = $tp; backupRelPath = $rel }
+    } else {
+      $idx++
+      $rel = Join-Path 'files' ("$idx-" + $item.Name)
+      Copy-Item -LiteralPath $tp -Destination (Join-Path $SnapshotDir $rel) -Force
+      $entries += [ordered]@{ kind = 'file'; originalPath = $tp; backupRelPath = $rel }
+    }
+  }
+  $preserved = @()
+  foreach ($pp in $Plan.preservedCandidatePaths) {
+    if (Test-Path -LiteralPath $pp -PathType Leaf) {
+      $preserved += [ordered]@{ path = $pp; sha256 = (Get-FileSha256Hex $pp) }
+    }
+  }
+  $snapshotDoc = [ordered]@{
+    schemaVersion = 1
+    createdAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    platform = 'win32'
+    scenario = $Plan.scenario
+    snapshotDir = $SnapshotDir
+    entries = $entries
+    preservedChecksums = $preserved
+  }
+  $json = ($snapshotDoc | ConvertTo-Json -Depth 6)
+  Write-TextAtomic $manifestPath $json ([System.Text.Encoding]::UTF8)
+}
+
+function Write-WindowsShortcut([string]$ShortcutPath, [string]$TargetExe, [string]$Arguments) {
+  if ([string]::IsNullOrWhiteSpace($ShortcutPath)) { return }
+  Assert-SafeTargetPath $ShortcutPath $RealProfile -EntryMode
+  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ShortcutPath) | Out-Null
+  try {
+    $ws = New-Object -ComObject WScript.Shell
+    $sc = $ws.CreateShortcut($ShortcutPath)
+    $sc.TargetPath = $TargetExe
+    $sc.Arguments = $Arguments
+    $sc.WorkingDirectory = Split-Path -Parent $TargetExe
+    $sc.Save()
+  } catch {}
+}
+
+function Register-WindowsServices($Plan, [bool]$RestartDaemon) {
+  $nodeExe = Join-Path $NodeRoot 'imcodes-node.exe'
+  if (Test-Path -LiteralPath $nodeExe -PathType Leaf) {
+    $escapedExe = [System.Security.SecurityElement]::Escape($nodeExe)
+    $nodeTaskXml = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>IM.codes controlled node</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <BootTrigger>
+      <Enabled>true</Enabled>
+    </BootTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="System">
+      <UserId>S-1-5-18</UserId>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>255</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="System">
+    <Exec>
+      <Command>$escapedExe</Command>
+    </Exec>
+  </Actions>
+</Task>
+"@
+    $wdScriptPath = Join-Path $NodeRoot 'health-watchdog.ps1'
+    $wdScriptBody = "\$ErrorActionPreference = 'Stop'\r\n& '$($nodeExe.Replace("'", "''"))' --health-watchdog\r\n"
+    Write-TextAtomic $wdScriptPath $wdScriptBody ([System.Text.Encoding]::UTF8)
+    $wdArgs = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \`"$wdScriptPath\`""
+    $escapedPs = [System.Security.SecurityElement]::Escape((Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'))
+    $escapedWdArgs = [System.Security.SecurityElement]::Escape($wdArgs)
+    $startBoundary = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $wdTaskXml = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>IM.codes controlled node authenticated-health watchdog</Description></RegistrationInfo>
+  <Triggers>
+    <TimeTrigger>
+      <StartBoundary>$startBoundary</StartBoundary>
+      <Repetition><Interval>PT1M</Interval></Repetition>
+      <Enabled>true</Enabled>
+    </TimeTrigger>
+  </Triggers>
+  <Principals><Principal id="System"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <ExecutionTimeLimit>PT2M</ExecutionTimeLimit>
+    <RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>
+  </Settings>
+  <Actions Context="System"><Exec><Command>$escapedPs</Command><Arguments>$escapedWdArgs</Arguments></Exec></Actions>
+</Task>
+"@
+    $handledNode = Invoke-ServiceAction 'RegisterControlledNode' @{
+      nodeTaskName = 'imcodes-node'
+      watchdogTaskName = 'imcodes-node-watchdog'
+      nodeExe = $nodeExe
+      watchdogScriptPath = $wdScriptPath
+      nodeTaskXml = $nodeTaskXml
+      watchdogTaskXml = $wdTaskXml
+    }
+    if (-not $handledNode) {
+      $nodeXmlPath = Join-Path $SnapshotDir 'imcodes-node.task.xml'
+      $wdXmlPath = Join-Path $SnapshotDir 'imcodes-node-watchdog.task.xml'
+      Write-TextAtomic $nodeXmlPath $nodeTaskXml ([System.Text.Encoding]::Unicode)
+      Write-TextAtomic $wdXmlPath $wdTaskXml ([System.Text.Encoding]::Unicode)
+      & schtasks.exe /Create /TN 'imcodes-node' /XML $nodeXmlPath /F | Out-Null
+      & schtasks.exe /Create /TN 'imcodes-node-watchdog' /XML $wdXmlPath /F | Out-Null
+      & schtasks.exe /Run /TN 'imcodes-node' | Out-Null
+    }
+  }
+  if ((-not $Plan.preserveUserDaemonAutostart) -or $RestartDaemon) {
+    $handledDaemon = Invoke-ServiceAction 'ActivateUserDaemon' @{ autostartPath = $AutostartPath; currentDir = $CurrentDir }
+    if (-not $handledDaemon -and (Test-Path -LiteralPath $AutostartPath -PathType Leaf)) {
+      Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c', $AutostartPath) -WindowStyle Hidden | Out-Null
+    }
+  }
+}
+
 if ($Mode -eq 'Rollback') {
   $manifestPath = if ($SnapshotDir.EndsWith('.json')) { $SnapshotDir } else { Join-Path $SnapshotDir 'snapshot.json' }
   if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
@@ -312,17 +728,39 @@ if ($Mode -eq 'Rollback') {
   $restored = 0
   $removed = 0
   foreach ($entry in $snap.entries) {
-    Assert-SafeTargetPath $entry.originalPath $RealProfile
+    if ($entry.originalPath -eq $ReleaseDir) {
+      Assert-SafeTargetPath $entry.originalPath $RealProfile
+    } else {
+      Assert-SafeTargetPath $entry.originalPath $RealProfile -EntryMode
+    }
     if ($entry.kind -eq 'absent') {
       if (Test-Path -LiteralPath $entry.originalPath) {
-        Remove-Item -LiteralPath $entry.originalPath -Recurse -Force
+        if ((Get-Item -LiteralPath $entry.originalPath -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+          cmd /c rmdir "$($entry.originalPath)" 2>$null | Out-Null
+        }
+        Remove-Item -LiteralPath $entry.originalPath -Recurse -Force -ErrorAction SilentlyContinue
         $removed++
       }
     } elseif ($entry.kind -eq 'file') {
       $parent = Split-Path -Parent $entry.originalPath
       New-Item -ItemType Directory -Force -Path $parent | Out-Null
       $backupAbs = Join-Path $snap.snapshotDir $entry.backupRelPath
+      if (Test-Path -LiteralPath $entry.originalPath) {
+        $ei = Get-Item -LiteralPath $entry.originalPath -Force -ErrorAction SilentlyContinue
+        if ($ei -and ($ei.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+          Remove-Item -LiteralPath $entry.originalPath -Force
+        }
+      }
       Copy-Item -LiteralPath $backupAbs -Destination $entry.originalPath -Force
+      $restored++
+    } elseif ($entry.kind -eq 'dir') {
+      if (Test-Path -LiteralPath $entry.originalPath) {
+        cmd /c rmdir "$($entry.originalPath)" 2>$null | Out-Null
+        Remove-Item -LiteralPath $entry.originalPath -Recurse -Force -ErrorAction SilentlyContinue
+      }
+      $backupAbs = Join-Path $snap.snapshotDir $entry.backupRelPath
+      New-Item -ItemType Directory -Force -Path (Split-Path -Parent $entry.originalPath) | Out-Null
+      Copy-Item -LiteralPath $backupAbs -Destination $entry.originalPath -Recurse -Force
       $restored++
     } elseif ($entry.kind -eq 'junction') {
       if (Test-Path -LiteralPath $entry.originalPath) {
@@ -345,54 +783,27 @@ if ($Mode -eq 'Rollback') {
     }
     $verified++
   }
+  if ($ApplyServices) {
+    [void](Invoke-ServiceAction 'RollbackServices' @{ snapshotDir = $SnapshotDir })
+  }
   [ordered]@{ restoredCount = $restored; removedCount = $removed; verifiedPreservedCount = $verified } | ConvertTo-Json -Depth 4
   exit 0
 }
 
-# PostInstall mode
 $plan = Invoke-PhaseAProbe
-Assert-SafeTargetPath $RuntimeRoot $RealProfile
-Assert-SafeTargetPath $NodeRoot $RealProfile
-Assert-SafeTargetPath $CliWrapperPath $RealProfile
-Assert-SafeTargetPath $SnapshotDir $RealProfile
+if ($Mode -eq 'PreInstall') {
+  [void](Assert-SingleInstanceLockAndStop $plan)
+  Save-RollbackSnapshot $plan
+  $plan | Add-Member -NotePropertyName snapshotDir -NotePropertyValue $SnapshotDir -Force
+  $plan | ConvertTo-Json -Depth 6
+  exit 0
+}
 
-# 1. Snapshot before mutation
-$filesDir = Join-Path $SnapshotDir 'files'
-New-Item -ItemType Directory -Force -Path $filesDir | Out-Null
-$entries = @()
-$idx = 0
-foreach ($tp in @($CliWrapperPath, $AutostartPath, $CurrentDir)) {
-  if (-not (Test-Path -LiteralPath $tp)) {
-    $entries += [ordered]@{ kind = 'absent'; originalPath = $tp }
-    continue
-  }
-  $item = Get-Item -LiteralPath $tp -Force
-  if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
-    $target = if ($item.Target) { [string]$item.Target[0] } else { '' }
-    $entries += [ordered]@{ kind = 'junction'; originalPath = $tp; target = $target }
-  } elseif (-not $item.PSIsContainer) {
-    $idx++
-    $rel = Join-Path 'files' ("$idx-" + $item.Name)
-    Copy-Item -LiteralPath $tp -Destination (Join-Path $SnapshotDir $rel) -Force
-    $entries += [ordered]@{ kind = 'file'; originalPath = $tp; backupRelPath = $rel }
-  }
+# PostInstall mode
+$stoppedDaemon = Assert-SingleInstanceLockAndStop $plan
+if (-not (Test-Path -LiteralPath (Join-Path $SnapshotDir 'snapshot.json') -PathType Leaf)) {
+  Save-RollbackSnapshot $plan
 }
-$preserved = @()
-foreach ($pp in $plan.preservedCandidatePaths) {
-  if (Test-Path -LiteralPath $pp -PathType Leaf) {
-    $preserved += [ordered]@{ path = $pp; sha256 = (Get-FileSha256Hex $pp) }
-  }
-}
-$snapshotDoc = [ordered]@{
-  schemaVersion = 1
-  createdAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-  platform = 'win32'
-  scenario = $plan.scenario
-  snapshotDir = $SnapshotDir
-  entries = $entries
-  preservedChecksums = $preserved
-}
-$snapshotDoc | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $SnapshotDir 'snapshot.json') -Encoding UTF8
 
 # 2. Clean expired .tmp artifacts only (never lockfiles or SQLite)
 if ($plan.cleanExpiredTempArtifacts) {
@@ -414,24 +825,45 @@ if (Test-Path -LiteralPath $ReleaseDir -PathType Container) {
   }
 }
 
-# 4. Install imcodes.cmd thin forwarder unless dev link exempt
+# 4. Install imcodes.cmd thin forwarder atomically (never follows symlink targets) unless dev link exempt
 if (-not $plan.preserveDevCliLink) {
-  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $CliWrapperPath) | Out-Null
   if (-not [string]::IsNullOrWhiteSpace($StagedCliWrapper) -and (Test-Path -LiteralPath $StagedCliWrapper -PathType Leaf)) {
-    Copy-Item -LiteralPath $StagedCliWrapper -Destination $CliWrapperPath -Force
+    $wrapperContent = [System.IO.File]::ReadAllText($StagedCliWrapper, [System.Text.Encoding]::UTF8)
   } else {
-    $decoded = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(${JSON.stringify(wrapperB64)}))
-    [System.IO.File]::WriteAllText($CliWrapperPath, $decoded, [System.Text.Encoding]::ASCII)
+    $wrapperContent = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(${JSON.stringify(wrapperB64)}))
   }
+  Write-TextAtomic $CliWrapperPath $wrapperContent ([System.Text.Encoding]::ASCII)
 }
 
 # 5. Write user daemon autostart script if not preserved
 if (-not $plan.preserveUserDaemonAutostart) {
-  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $AutostartPath) | Out-Null
   $nodeExe = Join-Path $CurrentDir 'node.exe'
   $entryJs = Join-Path $CurrentDir 'package\\dist\\src\\index.js'
   $startupCmd = "@echo off\`r\`nstart \`"\`" /min \`"$nodeExe\`" \`"$entryJs\`" start --foreground\`r\`n"
-  [System.IO.File]::WriteAllText($AutostartPath, $startupCmd, [System.Text.Encoding]::ASCII)
+  Write-TextAtomic $AutostartPath $startupCmd ([System.Text.Encoding]::ASCII)
+}
+
+# 6. Shortcuts for local panel + user PATH registration + SYSTEM service tasks
+$installedNodeExe = Join-Path $NodeRoot 'imcodes-node.exe'
+if (Test-Path -LiteralPath $installedNodeExe -PathType Leaf) {
+  if (-not [string]::IsNullOrWhiteSpace($StartMenuShortcutPath) -and -not (Test-Path -LiteralPath $StartMenuShortcutPath)) {
+    Write-WindowsShortcut $StartMenuShortcutPath $installedNodeExe '--open-local-panel'
+  }
+  if (-not [string]::IsNullOrWhiteSpace($DesktopShortcutPath) -and -not (Test-Path -LiteralPath $DesktopShortcutPath)) {
+    Write-WindowsShortcut $DesktopShortcutPath $installedNodeExe '--open-local-panel'
+  }
+}
+if ($AllowSystemRoot -and [string]::IsNullOrWhiteSpace($IsolatedRoot)) {
+  $cliBinDir = Split-Path -Parent $CliWrapperPath
+  $curPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+  if ([string]::IsNullOrWhiteSpace($curPath)) {
+    [Environment]::SetEnvironmentVariable('Path', $cliBinDir, 'User')
+  } elseif (($curPath.Split(';') | Where-Object { $_ -and ($_.TrimEnd('\\').ToLowerInvariant() -eq $cliBinDir.TrimEnd('\\').ToLowerInvariant()) }).Count -eq 0) {
+    [Environment]::SetEnvironmentVariable('Path', "$curPath;$cliBinDir", 'User')
+  }
+}
+if ($ApplyServices) {
+  Register-WindowsServices $plan $stoppedDaemon
 }
 
 $plan | Add-Member -NotePropertyName snapshotDir -NotePropertyValue $SnapshotDir -Force
@@ -452,6 +884,7 @@ export function renderWindowsInnoSetupIss({
 }) {
   const outName = outputBaseFilename ?? `imcodes-desktop-${version}-win32-${arch}`;
   const filesEntries = [
+    `Source: "${stageDirRelative}\\imcodes-windows-installer.ps1"; DestName: "imcodes-windows-installer.ps1"; Flags: dontcopy`,
     `Source: "${stageDirRelative}\\daemon-runtime\\*"; DestDir: "{commonpf}\\IM.codes\\daemon-runtime\\releases\\${version}"; Flags: ignoreversion recursesubdirs createallsubdirs`,
     `Source: "${stageDirRelative}\\imcodes-windows-installer.ps1"; DestDir: "{app}"; Flags: ignoreversion`,
     `Source: "${stageDirRelative}\\imcodes.cmd"; DestDir: "{app}"; DestName: "imcodes.cmd.staged"; Flags: ignoreversion`,
@@ -504,10 +937,27 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 ${filesEntries.join('\n')}
 
 [Run]
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\\imcodes-windows-installer.ps1"" -Mode PostInstall -AllowSystemRoot -Version ""${version}"" -RuntimeRoot ""{commonpf}\\IM.codes\\daemon-runtime"" -NodeRoot ""{commonappdata}\\imcodes-node"" -CliWrapperPath ""{localappdata}\\imcodes\\bin\\imcodes.cmd"" -StagedCliWrapper ""{app}\\imcodes.cmd.staged"""; Flags: runhidden waituntilterminated
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\\imcodes-windows-installer.ps1"" -Mode PostInstall -AllowSystemRoot -ApplyServices -Version ""${version}"" -RuntimeRoot ""{commonpf}\\IM.codes\\daemon-runtime"" -NodeRoot ""{commonappdata}\\imcodes-node"" -CliWrapperPath ""{localappdata}\\imcodes\\bin\\imcodes.cmd"" -StagedCliWrapper ""{app}\\imcodes.cmd.staged"""; Flags: runhidden waituntilterminated
 
 [UninstallRun]
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\\imcodes-windows-installer.ps1"" -Mode Rollback -AllowSystemRoot -SnapshotDir ""{commonappdata}\\imcodes-node\\installer-rollback-${version}"""; Flags: runhidden waituntilterminated; RunOnceId: "IMCodesDesktopRollback"
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\\imcodes-windows-installer.ps1"" -Mode Rollback -AllowSystemRoot -ApplyServices -SnapshotDir ""{commonappdata}\\imcodes-node\\installer-rollback-${version}"""; Flags: runhidden waituntilterminated; RunOnceId: "IMCodesDesktopRollback"
+
+[Code]
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ResultCode: Integer;
+  PsScriptPath: String;
+  Args: String;
+begin
+  if CurStep = ssInstall then begin
+    ExtractTemporaryFile('imcodes-windows-installer.ps1');
+    PsScriptPath := ExpandConstant('{tmp}\\imcodes-windows-installer.ps1');
+    Args := '-NoProfile -ExecutionPolicy Bypass -File "' + PsScriptPath + '" -Mode PreInstall -AllowSystemRoot -ApplyServices -Version "${version}" -RuntimeRoot "' + ExpandConstant('{commonpf}\\IM.codes\\daemon-runtime') + '" -NodeRoot "' + ExpandConstant('{commonappdata}\\imcodes-node') + '" -CliWrapperPath "' + ExpandConstant('{localappdata}\\imcodes\\bin\\imcodes.cmd') + '"';
+    if not Exec('powershell.exe', Args, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then begin
+      RaiseException('IM.codes PreInstall compatibility/lock check failed with exit code ' + IntToStr(ResultCode));
+    end;
+  end;
+end;
 `;
 }
 
@@ -533,7 +983,11 @@ export async function buildWindowsInstaller(options) {
 
   const compat = await loadDesktopCompatibilityModule();
   const cliWrapperContent = compat.renderWindowsImcodesCliWrapper();
-  const ps1Content = renderWindowsPhaseAInstallerPs1({ version, cliWrapperContent });
+  const ps1Content = renderWindowsPhaseAInstallerPs1({
+    version,
+    cliWrapperContent,
+    minVersion: options.minVersion ?? '',
+  });
 
   const workDir = options.workDir
     ? resolve(options.workDir)
@@ -698,6 +1152,7 @@ function parseCliArgs(argv) {
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i];
     if (token === '--version') args.version = argv[++i];
+    else if (token === '--min-version') args.minVersion = argv[++i];
     else if (token === '--runtime-dir') args.runtimeDir = argv[++i];
     else if (token === '--runtime-archive') args.runtimeArchive = argv[++i];
     else if (token === '--node-exe') args.nodeExe = argv[++i];

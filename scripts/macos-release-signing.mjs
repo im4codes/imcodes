@@ -177,6 +177,16 @@ function run(tool, args, options = {}) {
  * interactive unlock, which is the step whose absence produces the notorious
  * "User interaction is not allowed" failure.
  */
+/**
+ * Build arguments for `security find-identity` according to certificate type.
+ * Developer ID Installer certificates are omitted by `-p codesigning` on macOS Keychain.
+ */
+export function buildSecurityFindIdentityArgs(keychainPath, certificateType = 'application') {
+  return certificateType === 'installer'
+    ? ['find-identity', '-v', keychainPath]
+    : ['find-identity', '-v', '-p', 'codesigning', keychainPath];
+}
+
 export function importSigningIdentity(input) {
   const { pkcs12Base64, pkcs12Password, keychainPath, keychainPassword, teamId } = input;
   const pkcs12Path = `${keychainPath}.p12`;
@@ -203,10 +213,12 @@ export function importSigningIdentity(input) {
     const existing = run(MACOS_RELEASE_SIGNING_TOOLS.security, ['list-keychains', '-d', 'user'])
       .split('\n').map((line) => line.trim().replace(/^"|"$/gu, '')).filter(Boolean);
     run(MACOS_RELEASE_SIGNING_TOOLS.security, ['list-keychains', '-d', 'user', '-s', keychainPath, ...existing]);
-    const found = run(MACOS_RELEASE_SIGNING_TOOLS.security, ['find-identity', '-v', '-p', 'codesigning', keychainPath]);
+    const certificateType = input.certificateType ?? 'application';
+    const findIdentityArgs = buildSecurityFindIdentityArgs(keychainPath, certificateType);
+    const found = run(MACOS_RELEASE_SIGNING_TOOLS.security, findIdentityArgs);
     return selectDeveloperIdSigningIdentity(found, {
       teamId,
-      certificateType: input.certificateType ?? 'application',
+      certificateType,
     });
   } finally {
     // The PKCS#12 leaves the disk whether or not the import worked.

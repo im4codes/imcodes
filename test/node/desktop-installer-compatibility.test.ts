@@ -23,6 +23,7 @@ import {
   resolveImcodesCliTarget,
 } from '../../shared/desktop-installer-compatibility.js';
 import {
+  assertSafeNodeIsolatedTargetPath,
   cleanupExpiredTempArtifacts,
   createRollbackSnapshot,
   installDaemonRuntimeCurrentLink,
@@ -478,7 +479,7 @@ describe('AC 2: discoverCodingDaemonRuntime current/ alignment & imcodes CLI thi
     expect(cmdText).toContain('IMCODES_CLI_DEV_ENTRY');
     expect(cmdText).toContain('%RT_ROOT%\\current\\node.exe');
     expect(cmdText).toContain('%RT_ROOT%\\node.exe');
-    expect(cmdText).toContain('if /I not "%APPDATA%\\npm\\imcodes.cmd"=="%~f0"');
+    expect(cmdText).toContain('if /I "%APPDATA%\\npm\\imcodes.cmd"=="%~f0" goto :not_found');
     expect(resolveImcodesCliTarget({ platform: 'win32' })).toBeNull();
   });
 
@@ -500,5 +501,114 @@ describe('AC 2: discoverCodingDaemonRuntime current/ alignment & imcodes CLI thi
     const plan = planDesktopInstallerCompatibility(probe);
     expect(probe.controlledNode.serviceRegistered).toBe(false);
     expect(plan.scenario).toBe('clean');
+  });
+
+  it('rejects traversal, system paths, real-home escapes, and symlinked ancestor escapes in isolated mode (F6)', () => {
+    const root = makeTempDir();
+    const isoRoot = join(root, 'isolated');
+    const fakeHome = join(root, 'fake-home');
+    mkdirSync(join(isoRoot, 'bin'), { recursive: true });
+    mkdirSync(fakeHome, { recursive: true });
+
+    // Lexical traversal & forbidden roots across POSIX and Windows
+    expect(() =>
+      assertSafeIsolatedTargetPath(`${isoRoot}/../var/lib/imcodes-node`, 'linux', fakeHome, isoRoot),
+    ).toThrow(/unsafe_installer_target_inside_system_root|unsafe_installer_target_outside_isolated_root/);
+    expect(() =>
+      assertSafeIsolatedTargetPath(`${fakeHome}/.imcodes/daemon.lock.json`, 'linux', fakeHome, isoRoot),
+    ).toThrow(/unsafe_installer_target_inside_system_root|unsafe_installer_target_outside_isolated_root/);
+    expect(() =>
+      assertSafeIsolatedTargetPath('/Library/LaunchDaemons/cc.imcodes.node.plist', 'darwin', fakeHome, isoRoot),
+    ).toThrow(/unsafe_installer_target_inside_system_root/);
+    expect(() =>
+      assertSafeIsolatedTargetPath('C:\\Users\\Alice\\Desktop\\..\\AppData\\Roaming\\imcodes', 'win32', 'C:\\Users\\Alice', 'C:\\Temp\\iso'),
+    ).toThrow(/unsafe_installer_target_inside_system_root|unsafe_installer_target_outside_isolated_root/);
+
+    // Ancestor symlink escaping into forbidden real-home or system path must be blocked
+    const escapeTarget = join(fakeHome, '.imcodes');
+    mkdirSync(escapeTarget, { recursive: true });
+    const symlinkedAncestor = join(isoRoot, 'escaped-dir');
+    symlinkSync(escapeTarget, symlinkedAncestor);
+    expect(() =>
+      assertSafeNodeIsolatedTargetPath(join(symlinkedAncestor, 'state.json'), 'linux', fakeHome, isoRoot, 'container'),
+    ).toThrow(/unsafe_installer_target_inside_system_root|unsafe_installer_target_outside_isolated_root/);
+
+    // Leaf symlink in entry mode inside isolatedRoot/bin (Scenario 3 dev-link) stays allowed when parent resolves safely
+    const devEntry = join(root, 'dev-repo', 'dist', 'index.js');
+    mkdirSync(join(devEntry, '..'), { recursive: true });
+    writeFileSync(devEntry, '#!/usr/bin/env node\n');
+    const entrySymlink = join(isoRoot, 'bin', 'imcodes');
+    symlinkSync(devEntry, entrySymlink);
+    expect(() =>
+      assertSafeNodeIsolatedTargetPath(entrySymlink, 'linux', fakeHome, isoRoot, 'entry'),
+    ).not.toThrow();
+
+    // Missing homeDir defaults under isolatedRoot/home instead of real HOME
+    const derivedProbe = probeDesktopInstallEnvironment({
+      platform: 'linux',
+      isolatedRoot: isoRoot,
+      env: { HOME: fakeHome },
+    });
+    expect(derivedProbe.userDaemon.homeDir).toBe(join(isoRoot, 'home'));
+  });
+
+  it('replaces pre-existing global-npm symlink atomically without corrupting target and restores non-symlink dir current (F4)', () => {
+    const root = makeTempDir();
+    const binDir = join(root, 'bin');
+    const npmPkgDir = join(root, 'npm-global', 'lib', 'node_modules', 'imcodes', 'dist');
+    const runtimeRoot = join(root, 'daemon-runtime');
+    mkdirSync(binDir, { recursive: true });
+    mkdirSync(npmPkgDir, { recursive: true });
+    mkdirSync(join(runtimeRoot, 'releases', '0.9.5'), { recursive: true });
+
+    const npmTarget = join(npmPkgDir, 'index.js');
+    const originalNpmBytes = '#!/usr/bin/env node\nconsole.log("REAL_NPM_CLI_ORIGINAL");\n';
+    writeFileSync(npmTarget, originalNpmBytes, 'utf8');
+    chmodSync(npmTarget, 0o755);
+
+    const cliPath = join(binDir, 'imcodes');
+    symlinkSync(npmTarget, cliPath);
+
+    // Pre-existing real directory (non-symlink) at daemon-runtime/current with nested file
+    const currentDir = join(runtimeRoot, 'current');
+    mkdirSync(join(currentDir, 'nested'), { recursive: true });
+    writeFileSync(join(currentDir, 'nested', 'state.txt'), 'old-current-dir-content', 'utf8');
+
+    const snapshotDir = join(root, 'snapshot');
+    createRollbackSnapshot({
+      platform: 'linux',
+      scenario: 'partial_preserve',
+      snapshotDir,
+      trackedPaths: [cliPath, currentDir],
+      preservedPaths: [],
+      homeDir: root,
+      isolatedRoot: root,
+    });
+
+    // Install atomic wrapper replacing symlink
+    const installed = installImcodesCliWrapper({
+      platform: 'linux',
+      wrapperPath: cliPath,
+      runtimeRoot,
+    });
+    expect(installed.status).toBe('installed');
+    expect(lstatSync(cliPath).isSymbolicLink()).toBe(false);
+    // Original npm package file MUST remain completely untouched!
+    expect(readFileSync(npmTarget, 'utf8')).toBe(originalNpmBytes);
+
+    // Mutate currentDir into symlink to 0.9.5
+    rmSync(currentDir, { recursive: true, force: true });
+    installDaemonRuntimeCurrentLink(runtimeRoot, '0.9.5');
+    expect(lstatSync(currentDir).isSymbolicLink()).toBe(true);
+
+    // Restore rollback snapshot -> symlink cliPath AND real dir currentDir restored intact
+    const restored = restoreRollbackSnapshot(snapshotDir, { isolatedRoot: root });
+    expect(restored.restoredCount).toBe(2);
+    expect(lstatSync(cliPath).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(cliPath)).toBe(npmTarget);
+    expect(readFileSync(npmTarget, 'utf8')).toBe(originalNpmBytes);
+    expect(lstatSync(currentDir).isSymbolicLink()).toBe(false);
+    expect(lstatSync(currentDir).isDirectory()).toBe(true);
+    expect(readFileSync(join(currentDir, 'nested', 'state.txt'), 'utf8')).toBe('old-current-dir-content');
   });
 });

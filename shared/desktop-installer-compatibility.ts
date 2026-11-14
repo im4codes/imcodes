@@ -148,7 +148,7 @@ export interface DesktopInstallPlan {
 }
 
 export interface DesktopInstallerSnapshotEntry {
-  kind: 'file' | 'symlink' | 'dir_symlink' | 'absent';
+  kind: 'file' | 'symlink' | 'dir_symlink' | 'dir' | 'absent';
   originalPath: string;
   backupRelPath?: string;
   symlinkTarget?: string;
@@ -330,14 +330,82 @@ export function isSafeExpiredTempArtifactName(fileName: string): boolean {
   );
 }
 
+function resolveLexicalPosixPath(raw: string): string {
+  const isAbs = raw.startsWith('/');
+  const parts = raw.split('/');
+  const stack: string[] = [];
+  for (const seg of parts) {
+    if (!seg || seg === '.') continue;
+    if (seg === '..') {
+      if (stack.length > 0 && stack[stack.length - 1] !== '..') {
+        stack.pop();
+      } else if (!isAbs) {
+        stack.push('..');
+      }
+      continue;
+    }
+    stack.push(seg);
+  }
+  return `${isAbs ? '/' : ''}${stack.join('/')}` || (isAbs ? '/' : '.');
+}
+
+function resolveLexicalWin32Path(raw: string): string {
+  const unified = raw.replace(/\//gu, '\\');
+  let prefix = '';
+  let rest = unified;
+  const uncMatch = unified.match(/^(\\\\[^\\]+\\[^\\]+)(?:\\(.*))?$/u);
+  const driveMatch = unified.match(/^([a-zA-Z]:)(?:\\(.*))?$/u);
+  if (uncMatch) {
+    prefix = uncMatch[1].toLowerCase();
+    rest = uncMatch[2] ?? '';
+  } else if (driveMatch) {
+    prefix = driveMatch[1].toLowerCase();
+    rest = driveMatch[2] ?? '';
+  } else if (unified.startsWith('\\')) {
+    prefix = '';
+    rest = unified.replace(/^\\+/u, '');
+  }
+  const parts = rest.split('\\');
+  const stack: string[] = [];
+  for (const seg of parts) {
+    if (!seg || seg === '.') continue;
+    if (seg === '..') {
+      if (stack.length > 0) {
+        stack.pop();
+      }
+      continue;
+    }
+    stack.push(seg.toLowerCase());
+  }
+  if (prefix) {
+    return stack.length > 0 ? `${prefix}\\${stack.join('\\')}` : `${prefix}\\`;
+  }
+  if (unified.startsWith('\\')) {
+    return `\\${stack.join('\\')}`;
+  }
+  return stack.join('\\') || '.';
+}
+
+function isSameOrChildComparable(candidate: string, parent: string, platform: DesktopInstallerPlatform): boolean {
+  if (!parent) return false;
+  if (candidate === parent) return true;
+  const sep = platform === 'win32' ? '\\' : '/';
+  if (parent === sep || (platform === 'win32' && /^[a-z]:\\$/u.test(parent))) {
+    return candidate.startsWith(parent);
+  }
+  return candidate.startsWith(`${parent}${sep}`);
+}
+
 /**
  * Guard helper used by isolated tests & rollback verification to guarantee an isolated
- * target path never points inside a default OS system root or the current user's real `~/.imcodes`.
+ * target path never points inside a default OS system root or the current user's real `~/.imcodes`,
+ * and (when `isolatedRoot` is specified) stays strictly within `isolatedRoot`.
  */
 export function assertSafeIsolatedTargetPath(
   targetPath: string,
   platform: DesktopInstallerPlatform,
   realHomeDir?: string,
+  isolatedRoot?: string,
 ): void {
   const normalized = normalizeComparablePath(targetPath, platform);
   const defaults = DESKTOP_INSTALLER_DEFAULT_PATHS[platform];
@@ -349,6 +417,8 @@ export function assertSafeIsolatedTargetPath(
     '/Library/Application Support/imcodes-node',
     '/Library/Application Support/imcodes',
     '/etc/systemd/system',
+    '/Library/LaunchDaemons',
+    '/Applications/aiDesk.to by IM.codes.app',
     '/usr/local/bin/imcodes',
     'C:\\ProgramData\\imcodes-node',
     'C:\\Program Files\\IM.codes',
@@ -356,7 +426,6 @@ export function assertSafeIsolatedTargetPath(
 
   if (realHomeDir) {
     const homeNorm = normalizeComparablePath(realHomeDir, platform);
-    const sep = platform === 'win32' ? '\\' : '/';
     if (normalized === homeNorm) {
       throw new Error(`unsafe_installer_target_inside_system_root: ${targetPath}`);
     }
@@ -366,6 +435,7 @@ export function assertSafeIsolatedTargetPath(
             `${homeNorm}\\.imcodes`,
             `${homeNorm}\\appdata\\local\\imcodes`,
             `${homeNorm}\\appdata\\roaming\\microsoft\\windows\\start menu`,
+            `${homeNorm}\\desktop`,
           ]
         : [
             `${homeNorm}/.imcodes`,
@@ -375,26 +445,32 @@ export function assertSafeIsolatedTargetPath(
           ];
     for (const sub of protectedHomeSubdirs) {
       const subNorm = normalizeComparablePath(sub, platform);
-      if (normalized === subNorm || normalized.startsWith(subNorm + sep)) {
+      if (isSameOrChildComparable(normalized, subNorm, platform)) {
         throw new Error(`unsafe_installer_target_inside_system_root: ${targetPath}`);
       }
     }
   }
 
   for (const forbidden of forbiddenRoots) {
-    if (!forbidden) continue;
-    const sep = platform === 'win32' ? '\\' : '/';
-    if (normalized === forbidden || normalized.startsWith(forbidden + sep)) {
+    if (isSameOrChildComparable(normalized, forbidden, platform)) {
       throw new Error(`unsafe_installer_target_inside_system_root: ${targetPath}`);
+    }
+  }
+
+  if (isolatedRoot) {
+    const isolatedNorm = normalizeComparablePath(isolatedRoot, platform);
+    if (!isSameOrChildComparable(normalized, isolatedNorm, platform)) {
+      throw new Error(`unsafe_installer_target_outside_isolated_root: ${targetPath}`);
     }
   }
 }
 
 export function normalizeComparablePath(targetPath: string, platform: DesktopInstallerPlatform): string {
   if (platform === 'win32') {
-    return targetPath.replace(/\//gu, '\\').replace(/\\+$/u, '').toLowerCase();
+    return resolveLexicalWin32Path(targetPath).replace(/\\+$/u, '').replace(/^([a-z]:)$/u, '$1\\');
   }
-  return targetPath.replace(/\/+$/u, '') || '/';
+  const resolved = resolveLexicalPosixPath(targetPath);
+  return resolved.length > 1 ? resolved.replace(/\/+$/u, '') : resolved;
 }
 
 export interface ImcodesCliResolutionInput {
@@ -595,75 +671,81 @@ export function renderWindowsImcodesCliWrapper(options: RenderWindowsCliWrapperO
     'if "%SELF_DIR:~-1%"=="\\" set "SELF_DIR=%SELF_DIR:~0,-1%"',
     '',
     'REM 1. Developer override',
-    'if defined IMCODES_CLI_DEV_ENTRY if exist "%IMCODES_CLI_DEV_ENTRY%" (',
-    '  call :resolve_node',
-    '  if defined RESOLVED_NODE (',
-    '    "%RESOLVED_NODE%" "%IMCODES_CLI_DEV_ENTRY%" %*',
-    '    exit /b %ERRORLEVEL%',
-    '  )',
-    ')',
+    'if not defined IMCODES_CLI_DEV_ENTRY goto :check_bundled',
+    'if not exist "%IMCODES_CLI_DEV_ENTRY%" goto :check_bundled',
+    'call :resolve_node',
+    'if not defined RESOLVED_NODE goto :check_bundled',
+    '"%RESOLVED_NODE%" "%IMCODES_CLI_DEV_ENTRY%" %*',
+    'set "IMCODES_EXIT=%ERRORLEVEL%"',
+    'exit /b %IMCODES_EXIT%',
     '',
+    ':check_bundled',
     'REM 2. Bundled daemon-runtime (current\\ first, then direct)',
     'set "SELECTED_NODE="',
     'set "SELECTED_ENTRY="',
     'if defined IMCODES_DAEMON_RUNTIME_DIR call :select_runtime "%IMCODES_DAEMON_RUNTIME_DIR%"',
     `if not defined SELECTED_NODE call :select_runtime "%SELF_DIR%\\${relSubpath}"`,
     `if not defined SELECTED_NODE call :select_runtime "${defaultRuntimeRoot}"`,
-    'if defined SELECTED_NODE (',
-    '  "%SELECTED_NODE%" "%SELECTED_ENTRY%" %*',
-    '  exit /b %ERRORLEVEL%',
-    ')',
+    'if not defined SELECTED_NODE goto :check_npm',
+    '"%SELECTED_NODE%" "%SELECTED_ENTRY%" %*',
+    'set "IMCODES_EXIT=%ERRORLEVEL%"',
+    'exit /b %IMCODES_EXIT%',
     '',
+    ':check_npm',
     'REM 3. Global npm imcodes fallback',
-    'if defined IMCODES_NPM_FALLBACK_ENTRY if exist "%IMCODES_NPM_FALLBACK_ENTRY%" (',
-    '  call :resolve_node',
-    '  if defined RESOLVED_NODE (',
-    '    "%RESOLVED_NODE%" "%IMCODES_NPM_FALLBACK_ENTRY%" %*',
-    '    exit /b %ERRORLEVEL%',
-    '  )',
-    ')',
-    'if exist "%APPDATA%\\npm\\node_modules\\imcodes\\dist\\src\\index.js" (',
-    '  call :resolve_node',
-    '  if defined RESOLVED_NODE (',
-    '    "%RESOLVED_NODE%" "%APPDATA%\\npm\\node_modules\\imcodes\\dist\\src\\index.js" %*',
-    '    exit /b %ERRORLEVEL%',
-    '  )',
-    ')',
-    'if exist "%APPDATA%\\npm\\imcodes.cmd" if /I not "%APPDATA%\\npm\\imcodes.cmd"=="%~f0" (',
-    '  call "%APPDATA%\\npm\\imcodes.cmd" %*',
-    '  exit /b %ERRORLEVEL%',
-    ')',
+    'if not defined IMCODES_NPM_FALLBACK_ENTRY goto :check_appdata_npm_js',
+    'if not exist "%IMCODES_NPM_FALLBACK_ENTRY%" goto :check_appdata_npm_js',
+    'call :resolve_node',
+    'if not defined RESOLVED_NODE goto :check_appdata_npm_js',
+    '"%RESOLVED_NODE%" "%IMCODES_NPM_FALLBACK_ENTRY%" %*',
+    'set "IMCODES_EXIT=%ERRORLEVEL%"',
+    'exit /b %IMCODES_EXIT%',
     '',
+    ':check_appdata_npm_js',
+    'if not exist "%APPDATA%\\npm\\node_modules\\imcodes\\dist\\src\\index.js" goto :check_appdata_npm_cmd',
+    'call :resolve_node',
+    'if not defined RESOLVED_NODE goto :check_appdata_npm_cmd',
+    '"%RESOLVED_NODE%" "%APPDATA%\\npm\\node_modules\\imcodes\\dist\\src\\index.js" %*',
+    'set "IMCODES_EXIT=%ERRORLEVEL%"',
+    'exit /b %IMCODES_EXIT%',
+    '',
+    ':check_appdata_npm_cmd',
+    'if not exist "%APPDATA%\\npm\\imcodes.cmd" goto :not_found',
+    'if /I "%APPDATA%\\npm\\imcodes.cmd"=="%~f0" goto :not_found',
+    'call "%APPDATA%\\npm\\imcodes.cmd" %*',
+    'set "IMCODES_EXIT=%ERRORLEVEL%"',
+    'exit /b %IMCODES_EXIT%',
+    '',
+    ':not_found',
     'echo imcodes: no runnable daemon-runtime or global imcodes installation found 1>&2',
     'exit /b 127',
     '',
     ':select_runtime',
     'set "RT_ROOT=%~1"',
-    'if exist "%RT_ROOT%\\current\\node.exe" if exist "%RT_ROOT%\\current\\package\\dist\\src\\index.js" (',
-    '  set "SELECTED_NODE=%RT_ROOT%\\current\\node.exe"',
-    '  set "SELECTED_ENTRY=%RT_ROOT%\\current\\package\\dist\\src\\index.js"',
-    '  exit /b 0',
-    ')',
-    'if exist "%RT_ROOT%\\node.exe" if exist "%RT_ROOT%\\package\\dist\\src\\index.js" (',
-    '  set "SELECTED_NODE=%RT_ROOT%\\node.exe"',
-    '  set "SELECTED_ENTRY=%RT_ROOT%\\package\\dist\\src\\index.js"',
-    '  exit /b 0',
-    ')',
+    'if not exist "%RT_ROOT%\\current\\node.exe" goto :select_runtime_direct',
+    'if not exist "%RT_ROOT%\\current\\package\\dist\\src\\index.js" goto :select_runtime_direct',
+    'set "SELECTED_NODE=%RT_ROOT%\\current\\node.exe"',
+    'set "SELECTED_ENTRY=%RT_ROOT%\\current\\package\\dist\\src\\index.js"',
+    'exit /b 0',
+    ':select_runtime_direct',
+    'if not exist "%RT_ROOT%\\node.exe" exit /b 0',
+    'if not exist "%RT_ROOT%\\package\\dist\\src\\index.js" exit /b 0',
+    'set "SELECTED_NODE=%RT_ROOT%\\node.exe"',
+    'set "SELECTED_ENTRY=%RT_ROOT%\\package\\dist\\src\\index.js"',
     'exit /b 0',
     '',
     ':resolve_node',
     'set "RESOLVED_NODE="',
-    'if defined IMCODES_NODE_BIN if exist "%IMCODES_NODE_BIN%" (',
-    '  set "RESOLVED_NODE=%IMCODES_NODE_BIN%"',
-    '  exit /b 0',
-    ')',
+    'if not defined IMCODES_NODE_BIN goto :resolve_node_path',
+    'if not exist "%IMCODES_NODE_BIN%" goto :resolve_node_path',
+    'set "RESOLVED_NODE=%IMCODES_NODE_BIN%"',
+    'exit /b 0',
+    ':resolve_node_path',
     'for %%N in (node.exe) do set "RESOLVED_NODE=%%~$PATH:N"',
     'if defined RESOLVED_NODE exit /b 0',
-    'if exist "%ProgramFiles%\\nodejs\\node.exe" (',
-    '  set "RESOLVED_NODE=%ProgramFiles%\\nodejs\\node.exe"',
-    '  exit /b 0',
-    ')',
-    'exit /b 1',
+    'if not exist "%ProgramFiles%\\nodejs\\node.exe" exit /b 1',
+    'set "RESOLVED_NODE=%ProgramFiles%\\nodejs\\node.exe"',
+    'exit /b 0',
   ];
   return `${lines.join('\r\n')}\r\n`;
 }

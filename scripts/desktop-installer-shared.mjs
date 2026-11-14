@@ -115,17 +115,17 @@ export function stageDaemonRuntimePayload({
 
 export function renderLinuxControlledNodeSystemdUnit(stateRoot = '/var/lib/imcodes-node') {
   return `[Unit]
-Description=IM.codes Controlled Node
+Description=IM.codes controlled node
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${stateRoot}/imcodes-node --run
-WorkingDirectory=${stateRoot}
-Restart=always
+ExecStart=${stateRoot}/imcodes-node
+NotifyAccess=all
+WatchdogSec=180
+Restart=on-failure
 RestartSec=5
-KillMode=process
 
 [Install]
 WantedBy=multi-user.target
@@ -169,18 +169,27 @@ X-IMCodes-Managed=true
 `;
 }
 
+function escapeXml(value) {
+  return String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&apos;');
+}
+
 export function renderMacosControlledNodeLaunchDaemonPlist(
-  label,
+  label = 'cc.imcodes.node',
   executablePath = '/Library/Application Support/imcodes-node/imcodes-node',
-  args = ['--run'],
+  args = [],
 ) {
-  const argLines = [executablePath, ...args].map((a) => `    <string>${a}</string>`).join('\n');
+  const argLines = [executablePath, ...args].map((a) => `    <string>${escapeXml(a)}</string>`).join('\n');
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>${label}</string>
+  <string>${escapeXml(label)}</string>
   <key>ProgramArguments</key>
   <array>
 ${argLines}
@@ -189,6 +198,40 @@ ${argLines}
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>StandardErrorPath</key>
+  <string>/var/log/imcodes-node.err.log</string>
+  <key>StandardOutPath</key>
+  <string>/var/log/imcodes-node.out.log</string>
+</dict>
+</plist>
+`;
+}
+
+export function renderMacosControlledNodeWatchdogLaunchDaemonPlist(
+  label = 'cc.imcodes.node.watchdog',
+  executablePath = '/Library/Application Support/imcodes-node/imcodes-node',
+) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${escapeXml(label)}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${escapeXml(executablePath)}</string>
+    <string>--health-watchdog</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/imcodes-node-watchdog.err.log</string>
+  <key>StandardOutPath</key>
+  <string>/var/log/imcodes-node-watchdog.out.log</string>
 </dict>
 </plist>
 `;
@@ -208,6 +251,7 @@ export function renderPosixPhaseARunnerScript({
   platform,
   version,
   cliWrapperContent,
+  minVersion = '',
 }) {
   const isDarwin = platform === 'darwin';
   const defaultStateRoot = isDarwin
@@ -229,9 +273,12 @@ set -eu
 PHASE="postinstall"
 ISOLATED_ROOT="\${IMCODES_ISOLATED_ROOT:-}"
 TARGET_HOME="\${IMCODES_INSTALLER_HOME:-}"
+MIN_VERSION="\${IMCODES_MIN_RUNTIME_VERSION:-${minVersion}}"
 FORCE_TAKEOVER=0
 CONFIRM_FDA_SWITCH=0
 APPLY_SERVICES=1
+APPLY_SERVICES_EXPLICIT=0
+ALLOW_SYSTEM_ROOT=0
 DRY_RUN=0
 ROLLBACK_DIR=""
 SNAPSHOT_DIR=""
@@ -240,30 +287,132 @@ PROBE_RUNTIME_DIR=""
 INSTALLER_VERSION=${JSON.stringify(version)}
 PLATFORM=${JSON.stringify(platform)}
 WRAPPER_B64=${JSON.stringify(wrapperB64)}
+REAL_CALLER_HOME="\${HOME:-}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --phase) PHASE="$2"; shift 2 ;;
     --isolated-root) ISOLATED_ROOT="$2"; shift 2 ;;
     --home) TARGET_HOME="$2"; shift 2 ;;
+    --min-version) MIN_VERSION="$2"; shift 2 ;;
     --snapshot-dir) SNAPSHOT_DIR="$2"; shift 2 ;;
-    --rollback) PHASE="rollback"; ROLLBACK_DIR="$2"; shift 2 ;;
+    --rollback)
+      PHASE="rollback"
+      case "\${2:-}" in
+        ""|-*) ROLLBACK_DIR=""; shift ;;
+        *) ROLLBACK_DIR="$2"; shift 2 ;;
+      esac
+      ;;
     --stage-archive) STAGE_ARCHIVE="$2"; shift 2 ;;
     --probe-runtime-dir) PROBE_RUNTIME_DIR="$2"; shift 2 ;;
     --force-takeover) FORCE_TAKEOVER=1; shift ;;
     --confirm-fda-switch) CONFIRM_FDA_SWITCH=1; shift ;;
     --no-service-control) APPLY_SERVICES=0; shift ;;
+    --apply-services) APPLY_SERVICES=1; APPLY_SERVICES_EXPLICIT=1; shift ;;
+    --allow-system-root) ALLOW_SYSTEM_ROOT=1; shift ;;
     --check|--dry-run) DRY_RUN=1; APPLY_SERVICES=0; shift ;;
     --version) printf '%s\\n' "$INSTALLER_VERSION"; exit 0 ;;
     *) shift ;;
   esac
 done
 
-resolve_console_user_home() {
-  if [ -n "$TARGET_HOME" ]; then
-    printf '%s\\n' "$TARGET_HOME"
-    return 0
+normalize_lexical_posix() {
+  raw="$1"
+  case "$raw" in
+    /*) abs=1 ;;
+    *) raw="$(pwd -P)/$raw"; abs=1 ;;
+  esac
+  old_ifs="$IFS"
+  IFS="/"
+  set -- $raw
+  IFS="$old_ifs"
+  out=""
+  for seg in "$@"; do
+    case "$seg" in
+      ""|".") continue ;;
+      "..")
+        case "$out" in
+          "") ;;
+          */*) out="\${out%/*}" ;;
+          *) out="" ;;
+        esac
+        ;;
+      *) out="$out/$seg" ;;
+    esac
+  done
+  [ -n "$out" ] && printf '%s\\n' "$out" || printf '/\\n'
+}
+
+canonicalize_posix_path() {
+  p="$(normalize_lexical_posix "$1")"
+  hops=0
+  while [ "$hops" -lt 16 ]; do
+    hops=$((hops + 1))
+    if [ -L "$p" ]; then
+      link_t="$(readlink "$p" 2>/dev/null || true)"
+      if [ -n "$link_t" ]; then
+        case "$link_t" in
+          /*) p="$(normalize_lexical_posix "$link_t")" ;;
+          *) p="$(normalize_lexical_posix "$(dirname -- "$p")/$link_t")" ;;
+        esac
+        continue
+      fi
+    fi
+    break
+  done
+  cur="$p"
+  tail_segs=""
+  while [ "$cur" != "/" ] && [ ! -e "$cur" ] && [ ! -L "$cur" ]; do
+    seg="$(basename -- "$cur")"
+    if [ -n "$tail_segs" ]; then
+      tail_segs="$seg/$tail_segs"
+    else
+      tail_segs="$seg"
+    fi
+    cur="$(dirname -- "$cur")"
+  done
+  if [ -L "$cur" ]; then
+    lt="$(readlink "$cur" 2>/dev/null || true)"
+    if [ -n "$lt" ]; then
+      case "$lt" in
+        /*) resolved_cur="$(canonicalize_posix_path "$lt")" ;;
+        *) resolved_cur="$(canonicalize_posix_path "$(dirname -- "$cur")/$lt")" ;;
+      esac
+    else
+      resolved_cur="$cur"
+    fi
+  elif [ -d "$cur" ]; then
+    resolved_cur="$(cd "$cur" 2>/dev/null && pwd -P || printf '%s' "$cur")"
+  elif [ -e "$cur" ]; then
+    c_dir="$(dirname -- "$cur")"
+    c_base="$(basename -- "$cur")"
+    c_real_dir="$(cd "$c_dir" 2>/dev/null && pwd -P || printf '%s' "$c_dir")"
+    resolved_cur="$c_real_dir/$c_base"
+  else
+    resolved_cur="$cur"
   fi
+  if [ -n "$tail_segs" ]; then
+    case "$resolved_cur" in
+      /) normalize_lexical_posix "/$tail_segs" ;;
+      *) normalize_lexical_posix "$resolved_cur/$tail_segs" ;;
+    esac
+  else
+    normalize_lexical_posix "$resolved_cur"
+  fi
+}
+
+is_same_or_child_path() {
+  cand="$1"
+  parent="$2"
+  [ -n "$parent" ] || return 1
+  [ "$cand" = "$parent" ] && return 0
+  case "$parent" in
+    /) case "$cand" in /*) return 0 ;; *) return 1 ;; esac ;;
+    *) case "$cand" in "$parent"/*) return 0 ;; *) return 1 ;; esac ;;
+  esac
+}
+
+resolve_real_user_home() {
   if [ "$PLATFORM" = "darwin" ] && [ "$(id -u)" -eq 0 ]; then
     cu="$(stat -f '%Su' /dev/console 2>/dev/null || true)"
     if [ -n "$cu" ] && [ "$cu" != "root" ] && [ "$cu" != "loginwindow" ]; then
@@ -280,25 +429,117 @@ resolve_console_user_home() {
       return 0
     fi
   fi
-  printf '%s\\n' "\${HOME:-/tmp}"
+  printf '%s\\n' "\${REAL_CALLER_HOME:-/tmp}"
 }
 
-EFF_HOME="$(resolve_console_user_home)"
+REAL_HOME_BASE="$(resolve_real_user_home)"
+
 if [ -n "$ISOLATED_ROOT" ]; then
-  APPLY_SERVICES=0
-  case "$ISOLATED_ROOT" in
-    /var/lib/imcodes-node*|/opt/imcodes*|"/Library/Application Support/imcodes"*)
-      echo "Refusing unsafe isolated root inside system directory: $ISOLATED_ROOT" >&2
+  if [ "$ALLOW_SYSTEM_ROOT" -eq 1 ]; then
+    echo "Refusing --allow-system-root when --isolated-root is active" >&2
+    exit 2
+  fi
+  if [ "$APPLY_SERVICES_EXPLICIT" -eq 0 ]; then
+    APPLY_SERVICES=0
+  fi
+  if [ -z "$TARGET_HOME" ]; then
+    TARGET_HOME="$ISOLATED_ROOT/home"
+  fi
+  EFF_HOME="$TARGET_HOME"
+elif [ -n "$TARGET_HOME" ]; then
+  EFF_HOME="$TARGET_HOME"
+else
+  EFF_HOME="$REAL_HOME_BASE"
+fi
+
+canonicalize_entry_posix_path() {
+  lex="$(normalize_lexical_posix "$1")"
+  parent_canon="$(canonicalize_posix_path "$(dirname -- "$lex")")"
+  base="$(basename -- "$lex")"
+  if [ "$lex" = "/" ]; then
+    printf '/\n'
+  elif [ "$parent_canon" = "/" ]; then
+    printf '/%s\n' "$base"
+  else
+    normalize_lexical_posix "$parent_canon/$base"
+  fi
+}
+
+assert_safe_isolated_target() {
+  raw_target="$1"
+  mode="\${2:-container}"
+  if [ "$mode" = "entry" ]; then
+    canon_target="$(canonicalize_entry_posix_path "$raw_target")"
+  else
+    canon_target="$(canonicalize_posix_path "$raw_target")"
+  fi
+  for bad in \
+    "/var/lib/imcodes-node" \
+    "/opt/imcodes" \
+    "/Library/Application Support/imcodes-node" \
+    "/Library/Application Support/imcodes" \
+    "/etc/systemd/system" \
+    "/Library/LaunchDaemons" \
+    "/Applications/aiDesk.to by IM.codes.app" \
+    "/usr/local/bin/imcodes"
+  do
+    if is_same_or_child_path "$canon_target" "$bad"; then
+      echo "Refusing unsafe isolated target inside system directory: $raw_target ($canon_target)" >&2
       exit 2
-      ;;
-  esac
+    fi
+  done
+  if [ -n "$REAL_HOME_BASE" ]; then
+    canon_real_home="$(canonicalize_posix_path "$REAL_HOME_BASE")"
+    if [ "$canon_target" = "$canon_real_home" ]; then
+      echo "Refusing unsafe isolated target equal to real home: $raw_target" >&2
+      exit 2
+    fi
+    for bad_sub in ".imcodes" ".config/systemd" ".local/share/applications" "Library/LaunchAgents"; do
+      if is_same_or_child_path "$canon_target" "$canon_real_home/$bad_sub"; then
+        echo "Refusing unsafe isolated target inside real home subdir: $raw_target ($canon_target)" >&2
+        exit 2
+      fi
+    done
+  fi
+  if [ -n "$ISOLATED_ROOT" ]; then
+    canon_iso="$(canonicalize_posix_path "$ISOLATED_ROOT")"
+    canon_eff="$(canonicalize_posix_path "\${EFF_HOME:-$ISOLATED_ROOT/home}")"
+    if ! is_same_or_child_path "$canon_target" "$canon_iso" && ! is_same_or_child_path "$canon_target" "$canon_eff"; then
+      echo "Refusing isolated target escaping isolated root ($canon_iso) and isolated home ($canon_eff): $raw_target ($canon_target)" >&2
+      exit 2
+    fi
+  fi
+}
+
+assert_within_base() {
+  raw_target="$1"
+  raw_base="$2"
+  mode="\${3:-container}"
+  if [ "$mode" = "entry" ]; then
+    canon_target="$(canonicalize_entry_posix_path "$raw_target")"
+  else
+    canon_target="$(canonicalize_posix_path "$raw_target")"
+  fi
+  canon_base="$(canonicalize_posix_path "$raw_base")"
+  if ! is_same_or_child_path "$canon_target" "$canon_base"; then
+    echo "Refusing target escaping expected base ($canon_base): $raw_target ($canon_target)" >&2
+    exit 2
+  fi
+}
+
+if [ -n "$ISOLATED_ROOT" ]; then
+  assert_safe_isolated_target "$ISOLATED_ROOT"
+  assert_safe_isolated_target "$EFF_HOME"
   NODE_ROOT="$ISOLATED_ROOT/controlled-node"
   RUNTIME_ROOT="$ISOLATED_ROOT/daemon-runtime"
   CLI_PATH="$ISOLATED_ROOT/bin/imcodes"
-  NODE_SERVICE_PATH="$NODE_ROOT/service-registered"
   if [ "$PLATFORM" = "darwin" ]; then
+    NODE_SERVICE_PATH="$NODE_ROOT/cc.imcodes.node.plist"
+    NODE_WATCHDOG_SERVICE_PATH="$NODE_ROOT/cc.imcodes.node.watchdog.plist"
     DESKTOP_PATH="$ISOLATED_ROOT/Applications/aiDesk.to by IM.codes.app"
   else
+    NODE_SERVICE_PATH="$NODE_ROOT/imcodes-node.service"
+    NODE_WATCHDOG_SERVICE_PATH=""
     DESKTOP_PATH="$EFF_HOME/.local/share/applications/aidesk.desktop"
   fi
   if [ -z "$SNAPSHOT_DIR" ]; then
@@ -311,8 +552,10 @@ else
   DESKTOP_PATH=${JSON.stringify(defaultDesktopPath)}
   if [ "$PLATFORM" = "darwin" ]; then
     NODE_SERVICE_PATH="/Library/LaunchDaemons/cc.imcodes.node.plist"
+    NODE_WATCHDOG_SERVICE_PATH="/Library/LaunchDaemons/cc.imcodes.node.watchdog.plist"
   else
     NODE_SERVICE_PATH="/etc/systemd/system/imcodes-node.service"
+    NODE_WATCHDOG_SERVICE_PATH=""
   fi
   if [ -z "$SNAPSHOT_DIR" ]; then
     SNAPSHOT_DIR="$NODE_ROOT/installer-rollback-$INSTALLER_VERSION"
@@ -322,24 +565,114 @@ fi
 USER_STATE_DIR="$EFF_HOME/.imcodes"
 if [ "$PLATFORM" = "darwin" ]; then
   AUTOSTART_PATH="$EFF_HOME/Library/LaunchAgents/imcodes.daemon.plist"
+  USER_WANTS_LINK=""
 else
   AUTOSTART_PATH="$EFF_HOME/.config/systemd/user/imcodes.service"
+  USER_WANTS_LINK="$EFF_HOME/.config/systemd/user/default.target.wants/imcodes.service"
 fi
 RELEASE_DIR="$RUNTIME_ROOT/releases/$INSTALLER_VERSION"
 CURRENT_LINK="$RUNTIME_ROOT/current"
 
+if [ -n "$ISOLATED_ROOT" ]; then
+  for check_p in "$NODE_ROOT" "$RUNTIME_ROOT" "$SNAPSHOT_DIR" "$RELEASE_DIR"; do
+    [ -n "$check_p" ] && assert_safe_isolated_target "$check_p" container && assert_within_base "$check_p" "$ISOLATED_ROOT" container
+  done
+  for check_e in "$CLI_PATH" "$NODE_SERVICE_PATH" "$NODE_WATCHDOG_SERVICE_PATH" "$CURRENT_LINK"; do
+    [ -n "$check_e" ] && assert_safe_isolated_target "$check_e" entry && assert_within_base "$check_e" "$ISOLATED_ROOT" entry
+  done
+  assert_safe_isolated_target "$USER_STATE_DIR" container && assert_within_base "$USER_STATE_DIR" "$EFF_HOME" container
+  assert_safe_isolated_target "$AUTOSTART_PATH" entry && assert_within_base "$AUTOSTART_PATH" "$EFF_HOME" entry
+  [ -n "$USER_WANTS_LINK" ] && assert_safe_isolated_target "$USER_WANTS_LINK" entry && assert_within_base "$USER_WANTS_LINK" "$EFF_HOME" entry
+  if [ "$PLATFORM" = "darwin" ]; then
+    assert_safe_isolated_target "$DESKTOP_PATH" entry && assert_within_base "$DESKTOP_PATH" "$ISOLATED_ROOT" entry
+  else
+    assert_safe_isolated_target "$DESKTOP_PATH" entry && assert_within_base "$DESKTOP_PATH" "$EFF_HOME" entry
+  fi
+  [ -n "$ROLLBACK_DIR" ] && assert_safe_isolated_target "$ROLLBACK_DIR" container && assert_within_base "$ROLLBACK_DIR" "$ISOLATED_ROOT" container
+fi
+
+run_systemctl_sys() {
+  sys_bin="\${IMCODES_SYSTEMCTL_BIN:-}"
+  if [ -n "$ISOLATED_ROOT" ] && [ -z "$sys_bin" ]; then
+    return 0
+  fi
+  [ -n "$sys_bin" ] || sys_bin="systemctl"
+  command -v "$sys_bin" >/dev/null 2>&1 || return 1
+  "$sys_bin" "$@"
+}
+
+resolve_target_unix_user() {
+  if [ -n "\${SUDO_USER:-}" ] && [ "\${SUDO_USER}" != "root" ]; then
+    printf '%s\\n' "$SUDO_USER"
+    return 0
+  fi
+  if [ "$PLATFORM" = "darwin" ]; then
+    cu="$(stat -f '%Su' /dev/console 2>/dev/null || true)"
+    if [ -n "$cu" ] && [ "$cu" != "root" ] && [ "$cu" != "loginwindow" ]; then
+      printf '%s\\n' "$cu"
+      return 0
+    fi
+  fi
+  if [ -d "$EFF_HOME" ]; then
+    owner="$(stat -c '%U' "$EFF_HOME" 2>/dev/null || stat -f '%Su' "$EFF_HOME" 2>/dev/null || true)"
+    if [ -n "$owner" ] && [ "$owner" != "root" ]; then
+      printf '%s\\n' "$owner"
+      return 0
+    fi
+  fi
+  id -un 2>/dev/null || printf '%s\\n' "\${USER:-root}"
+}
+
+run_systemctl_user() {
+  sys_bin="\${IMCODES_SYSTEMCTL_BIN:-}"
+  if [ -n "$ISOLATED_ROOT" ] && [ -z "$sys_bin" ]; then
+    return 0
+  fi
+  [ -n "$sys_bin" ] || sys_bin="systemctl"
+  command -v "$sys_bin" >/dev/null 2>&1 || return 1
+  t_user="$(resolve_target_unix_user)"
+  t_uid="$(id -u "$t_user" 2>/dev/null || id -u)"
+  xrd="/run/user/$t_uid"
+  if [ "$(id -u)" -eq 0 ] && [ "$t_user" != "root" ]; then
+    if command -v runuser >/dev/null 2>&1; then
+      runuser -u "$t_user" -- env HOME="$EFF_HOME" XDG_RUNTIME_DIR="$xrd" "$sys_bin" --user "$@"
+      return $?
+    elif command -v su >/dev/null 2>&1; then
+      export IMCODES_SU_HOME="$EFF_HOME" IMCODES_SU_XRD="$xrd" IMCODES_SU_BIN="$sys_bin"
+      su -s /bin/sh "$t_user" -c 'HOME="$IMCODES_SU_HOME" XDG_RUNTIME_DIR="$IMCODES_SU_XRD" "$IMCODES_SU_BIN" --user "$@"' sh "$@"
+      return $?
+    fi
+  fi
+  HOME="$EFF_HOME" "$sys_bin" --user "$@"
+}
+
+run_launchctl() {
+  lctl_bin="\${IMCODES_LAUNCHCTL_BIN:-}"
+  if [ -n "$ISOLATED_ROOT" ] && [ -z "$lctl_bin" ]; then
+    return 0
+  fi
+  [ -n "$lctl_bin" ] || lctl_bin="launchctl"
+  command -v "$lctl_bin" >/dev/null 2>&1 || return 1
+  "$lctl_bin" "$@"
+}
+
+hash_file_sha256() {
+  f="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$f" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$f" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$f" | awk '{print $NF}'
+  else
+    cksum "$f" | awk '{print $1 ":" $2}'
+  fi
+}
+
 is_git_checkout_path() {
   target="$1"
   [ -n "$target" ] || return 1
-  if [ -e "$target" ]; then
-    if command -v readlink >/dev/null 2>&1; then
-      real="$(readlink -f "$target" 2>/dev/null || printf '%s' "$target")"
-    else
-      real="$target"
-    fi
-  else
-    real="$target"
-  fi
+  real="$(canonicalize_posix_path "$target")"
   dir="$(dirname -- "$real" 2>/dev/null || printf '%s' "$real")"
   i=0
   while [ "$i" -lt 12 ]; do
@@ -354,16 +687,68 @@ is_git_checkout_path() {
   return 1
 }
 
+compare_semver() {
+  v1="\${1#v}"
+  v2="\${2#v}"
+  v1="\${v1%%-*}"
+  v2="\${v2%%-*}"
+  a1="$(printf '%s' "$v1" | cut -d. -f1)"; a2="$(printf '%s' "$v1" | cut -d. -f2)"; a3="$(printf '%s' "$v1" | cut -d. -f3)"
+  b1="$(printf '%s' "$v2" | cut -d. -f1)"; b2="$(printf '%s' "$v2" | cut -d. -f2)"; b3="$(printf '%s' "$v2" | cut -d. -f3)"
+  a1="\${a1:-0}"; a2="\${a2:-0}"; a3="\${a3:-0}"
+  b1="\${b1:-0}"; b2="\${b2:-0}"; b3="\${b3:-0}"
+  case "$a1$a2$a3$b1$b2$b3" in *[!0-9]*) return 0 ;; esac
+  if [ "$a1" -lt "$b1" ]; then echo -1; return 0; fi
+  if [ "$a1" -gt "$b1" ]; then echo 1; return 0; fi
+  if [ "$a2" -lt "$b2" ]; then echo -1; return 0; fi
+  if [ "$a2" -gt "$b2" ]; then echo 1; return 0; fi
+  if [ "$a3" -lt "$b3" ]; then echo -1; return 0; fi
+  if [ "$a3" -gt "$b3" ]; then echo 1; return 0; fi
+  echo 0
+}
+
+find_pkg_version_near() {
+  d="$(dirname -- "$(canonicalize_posix_path "$1")")"
+  i=0
+  while [ "$i" -lt 6 ]; do
+    if [ -f "$d/package.json" ] && grep -q '"name"[[:space:]]*:[[:space:]]*"imcodes"' "$d/package.json" 2>/dev/null; then
+      sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "$d/package.json" | head -n 1
+      return 0
+    fi
+    parent="$(dirname -- "$d")"
+    [ "$parent" = "$d" ] && break
+    d="$parent"
+    i=$((i + 1))
+  done
+  return 1
+}
+
 snapshot_paths() {
   mkdir -p "$SNAPSHOT_DIR/files"
   MANIFEST="$SNAPSHOT_DIR/snapshot.env"
+  PRESERVED_MANIFEST="$SNAPSHOT_DIR/preserved.sha256"
   : > "$MANIFEST"
-  for idx_target in "CLI:$CLI_PATH" "AUTOSTART:$AUTOSTART_PATH" "CURRENT:$CURRENT_LINK"; do
+  : > "$PRESERVED_MANIFEST"
+  for idx_target in \
+    "CLI:$CLI_PATH" \
+    "AUTOSTART:$AUTOSTART_PATH" \
+    "CURRENT:$CURRENT_LINK" \
+    "RELEASE:$RELEASE_DIR" \
+    "NODE_BIN:$NODE_ROOT/imcodes-node" \
+    "NODE_SVC:$NODE_SERVICE_PATH" \
+    "NODE_WD_SVC:$NODE_WATCHDOG_SERVICE_PATH" \
+    "DESKTOP:$DESKTOP_PATH" \
+    "USER_WANTS:$USER_WANTS_LINK"
+  do
     key="\${idx_target%%:*}"
     p="\${idx_target#*:}"
+    [ -n "$p" ] || continue
     if [ -L "$p" ]; then
       sym="$(readlink "$p" 2>/dev/null || true)"
       printf '%s_KIND=symlink\n%s_PATH=%s\n%s_SYM=%s\n' "$key" "$key" "$p" "$key" "$sym" >> "$MANIFEST"
+    elif [ -d "$p" ]; then
+      rm -rf "$SNAPSHOT_DIR/files/$key"
+      cp -Rp "$p" "$SNAPSHOT_DIR/files/$key"
+      printf '%s_KIND=dir\n%s_PATH=%s\n' "$key" "$key" "$p" >> "$MANIFEST"
     elif [ -f "$p" ]; then
       cp -p "$p" "$SNAPSHOT_DIR/files/$key"
       printf '%s_KIND=file\n%s_PATH=%s\n' "$key" "$key" "$p" >> "$MANIFEST"
@@ -371,23 +756,41 @@ snapshot_paths() {
       printf '%s_KIND=absent\n%s_PATH=%s\n' "$key" "$key" "$p" >> "$MANIFEST"
     fi
   done
+  for pfile in "$NODE_ROOT/credential.json" "$USER_STATE_DIR/server.json"; do
+    if [ -f "$pfile" ]; then
+      printf '%s|%s\n' "$(hash_file_sha256 "$pfile")" "$pfile" >> "$PRESERVED_MANIFEST"
+    fi
+  done
 }
 
 restore_snapshot_posix() {
   snap="$1"
   [ -d "$snap" ] || { echo "Snapshot not found: $snap" >&2; exit 1; }
+  if [ -n "$ISOLATED_ROOT" ]; then
+    assert_safe_isolated_target "$snap"
+  fi
   if [ -f "$snap/snapshot.json" ] && [ -x "$RELEASE_DIR/bin/node" ] && [ -f "$RELEASE_DIR/package/dist/src/node/desktop-installer-probe.js" ]; then
-    "$RELEASE_DIR/bin/node" "$RELEASE_DIR/package/dist/src/node/desktop-installer-probe.js" rollback --snapshot "$snap/snapshot.json" \
-      $( [ -z "$ISOLATED_ROOT" ] && printf '%s' '--allow-system-root' )
+    if [ -z "$ISOLATED_ROOT" ]; then
+      "$RELEASE_DIR/bin/node" "$RELEASE_DIR/package/dist/src/node/desktop-installer-probe.js" rollback --snapshot "$snap/snapshot.json" --allow-system-root --real-home "$REAL_HOME_BASE"
+    else
+      "$RELEASE_DIR/bin/node" "$RELEASE_DIR/package/dist/src/node/desktop-installer-probe.js" rollback --snapshot "$snap/snapshot.json" --isolated-root "$ISOLATED_ROOT" --real-home "$REAL_HOME_BASE"
+    fi
     return 0
   fi
   MANIFEST="$snap/snapshot.env"
   [ -f "$MANIFEST" ] || { echo "Snapshot manifest missing in $snap" >&2; exit 1; }
-  for key in CLI AUTOSTART CURRENT; do
+  for key in CLI AUTOSTART CURRENT RELEASE NODE_BIN NODE_SVC NODE_WD_SVC DESKTOP USER_WANTS; do
     kind="$(grep "^$key""_KIND=" "$MANIFEST" | cut -d= -f2- || true)"
     p="$(grep "^$key""_PATH=" "$MANIFEST" | cut -d= -f2- || true)"
     sym="$(grep "^$key""_SYM=" "$MANIFEST" | cut -d= -f2- || true)"
     [ -n "$p" ] || continue
+    if [ -n "$ISOLATED_ROOT" ]; then
+      if [ "$key" = "RELEASE" ]; then
+        assert_safe_isolated_target "$p" container
+      else
+        assert_safe_isolated_target "$p" entry
+      fi
+    fi
     case "$kind" in
       absent)
         rm -rf "$p"
@@ -397,18 +800,58 @@ restore_snapshot_posix() {
         rm -rf "$p"
         ln -s "$sym" "$p"
         ;;
-      file)
+      dir)
         mkdir -p "$(dirname -- "$p")"
         rm -rf "$p"
-        cp -p "$snap/files/$key" "$p"
+        cp -Rp "$snap/files/$key" "$p"
+        ;;
+      file)
+        mkdir -p "$(dirname -- "$p")"
+        tmp_r="$p.rollback.tmp.$$"
+        cp -p "$snap/files/$key" "$tmp_r"
+        mv -f "$tmp_r" "$p"
         ;;
     esac
   done
+  if [ -f "$snap/preserved.sha256" ]; then
+    while IFS='|' read -r expected_hash preserved_file; do
+      [ -n "$preserved_file" ] || continue
+      if [ ! -f "$preserved_file" ]; then
+        echo "preserved_state_missing_during_rollback: $preserved_file" >&2
+        exit 1
+      fi
+      actual_hash="$(hash_file_sha256 "$preserved_file")"
+      if [ "$actual_hash" != "$expected_hash" ]; then
+        echo "preserved_state_checksum_mismatch: $preserved_file" >&2
+        exit 1
+      fi
+    done < "$snap/preserved.sha256"
+  fi
+  if [ "$APPLY_SERVICES" -eq 1 ]; then
+    if [ "$PLATFORM" = "linux" ]; then
+      if [ -f "$NODE_SERVICE_PATH" ]; then
+        run_systemctl_sys daemon-reload >/dev/null 2>&1 || true
+        run_systemctl_sys restart imcodes-node.service >/dev/null 2>&1 || true
+      fi
+      if [ -f "$AUTOSTART_PATH" ]; then
+        run_systemctl_user daemon-reload >/dev/null 2>&1 || true
+        run_systemctl_user restart imcodes.service >/dev/null 2>&1 || true
+      fi
+    elif [ "$PLATFORM" = "darwin" ]; then
+      [ -f "$NODE_SERVICE_PATH" ] && run_launchctl kickstart -k system/cc.imcodes.node >/dev/null 2>&1 || true
+      if [ -f "$AUTOSTART_PATH" ]; then
+        t_user="$(resolve_target_unix_user)"
+        t_uid="$(id -u "$t_user" 2>/dev/null || id -u)"
+        run_launchctl kickstart -k "gui/$t_uid/imcodes.daemon" >/dev/null 2>&1 || true
+      fi
+    fi
+  fi
 }
 
 if [ "$PHASE" = "rollback" ]; then
-  restore_snapshot_posix "$ROLLBACK_DIR"
-  echo "ROLLBACK_OK snapshot=$ROLLBACK_DIR"
+  TARGET_ROLLBACK_DIR="\${ROLLBACK_DIR:-$SNAPSHOT_DIR}"
+  restore_snapshot_posix "$TARGET_ROLLBACK_DIR"
+  echo "ROLLBACK_OK snapshot=$TARGET_ROLLBACK_DIR"
   exit 0
 fi
 
@@ -418,6 +861,9 @@ PRESERVE_CLI=0
 PRESERVE_AUTOSTART=0
 PRESERVE_FDA=0
 CLEAN_EXPIRED_TMP=0
+CHECK_LOCK=0
+STOP_DAEMON=0
+SWITCH_BUNDLED=0
 
 PROBE_DIR="$RELEASE_DIR"
 if [ -n "$PROBE_RUNTIME_DIR" ] && [ -x "$PROBE_RUNTIME_DIR/bin/node" ]; then
@@ -435,6 +881,8 @@ if [ -x "$PROBE_DIR/bin/node" ] && [ -f "$PROBE_DIR/package/dist/src/node/deskto
     --cli-path "$CLI_PATH" \
     --desktop-entry "$DESKTOP_PATH" \
     --autostart-path "$AUTOSTART_PATH" \
+    $( [ -n "$ISOLATED_ROOT" ] && printf '%s %s' '--isolated-root' "$ISOLATED_ROOT" ) \
+    $( [ -n "$MIN_VERSION" ] && printf '%s %s' '--min-version' "$MIN_VERSION" ) \
     $( [ "$FORCE_TAKEOVER" -eq 1 ] && printf '%s' '--force-takeover' ) \
     $( [ "$CONFIRM_FDA_SWITCH" -eq 1 ] && printf '%s' '--confirm-fda-switch' ))"
   SCENARIO="$(printf '%s' "$PROBE_JSON" | "$PROBE_DIR/bin/node" -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8'));console.log(d.plan.scenario)")"
@@ -442,47 +890,172 @@ if [ -x "$PROBE_DIR/bin/node" ] && [ -f "$PROBE_DIR/package/dist/src/node/deskto
   PRESERVE_AUTOSTART="$(printf '%s' "$PROBE_JSON" | "$PROBE_DIR/bin/node" -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8'));console.log(d.plan.preserveUserDaemonAutostart?1:0)")"
   PRESERVE_FDA="$(printf '%s' "$PROBE_JSON" | "$PROBE_DIR/bin/node" -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8'));console.log(d.plan.preserveLaunchAgentExecutable?1:0)")"
   CLEAN_EXPIRED_TMP="$(printf '%s' "$PROBE_JSON" | "$PROBE_DIR/bin/node" -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8'));console.log(d.plan.cleanExpiredTempArtifacts?1:0)")"
+  CHECK_LOCK="$(printf '%s' "$PROBE_JSON" | "$PROBE_DIR/bin/node" -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8'));console.log(d.plan.checkSingleInstanceLock?1:0)")"
+  STOP_DAEMON="$(printf '%s' "$PROBE_JSON" | "$PROBE_DIR/bin/node" -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8'));console.log(d.plan.stopUserDaemonTask?1:0)")"
+  SWITCH_BUNDLED="$(printf '%s' "$PROBE_JSON" | "$PROBE_DIR/bin/node" -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8'));console.log(d.plan.switchToBundledRuntime?1:0)")"
 else
   # Pure POSIX fallback when minimal/smoke runtime lacks full dist/ desktop-installer-probe.js
-  if [ "$FORCE_TAKEOVER" -eq 0 ] && [ -e "$CLI_PATH" ] && is_git_checkout_path "$CLI_PATH"; then
+  autostart_dev=0
+  autostart_broken=0
+  installed_ver=""
+  if [ -f "$AUTOSTART_PATH" ]; then
+    if [ "$PLATFORM" = "darwin" ]; then
+      arg0="$(awk '/<key>ProgramArguments<\\/key>/{f=1;next} f&&/<string>/{gsub(/.*<string>|<\\/string>.*/,"");print;exit}' "$AUTOSTART_PATH" 2>/dev/null || true)"
+      arg1="$(awk '/<key>ProgramArguments<\\/key>/{f=1;next} f&&/<string>/{c++;if(c==2){gsub(/.*<string>|<\\/string>.*/,"");print;exit}}' "$AUTOSTART_PATH" 2>/dev/null || true)"
+      if [ -n "$arg0" ] && { is_git_checkout_path "$arg0" || is_git_checkout_path "$arg1"; }; then
+        autostart_dev=1
+      elif [ -n "$arg0" ] && [ ! -e "$arg0" ]; then
+        autostart_broken=1
+      fi
+    else
+      exec_line="$(grep -m1 '^ExecStart=' "$AUTOSTART_PATH" 2>/dev/null | cut -d= -f2- || true)"
+      set -- $exec_line
+      e0="\${1:-}"; e1="\${2:-}"
+      if { [ -n "$e0" ] && is_git_checkout_path "$e0"; } || { [ -n "$e1" ] && is_git_checkout_path "$e1"; }; then
+        autostart_dev=1
+      elif [ -n "$e0" ] && [ ! -e "$e0" ]; then
+        autostart_broken=1
+      elif [ -n "$e1" ] && [ ! -e "$e1" ]; then
+        autostart_broken=1
+      elif [ -n "$e1" ]; then
+        installed_ver="$(find_pkg_version_near "$e1" || true)"
+      fi
+    fi
+  fi
+  if [ -z "$installed_ver" ] && [ -e "$CLI_PATH" ] && ! grep -q 'IMCODES_DAEMON_RUNTIME_DIR' "$CLI_PATH" 2>/dev/null; then
+    installed_ver="$(find_pkg_version_near "$CLI_PATH" || true)"
+  fi
+  if [ -n "$MIN_VERSION" ] && [ -n "$installed_ver" ] && [ "$autostart_dev" -eq 0 ]; then
+    if [ "$(compare_semver "$installed_ver" "$MIN_VERSION")" = "-1" ]; then
+      autostart_broken=1
+    fi
+  fi
+
+  if [ "$FORCE_TAKEOVER" -eq 0 ] && { { [ -e "$CLI_PATH" ] || [ -L "$CLI_PATH" ]; } && is_git_checkout_path "$CLI_PATH" || [ "$autostart_dev" -eq 1 ]; }; then
     SCENARIO="dev_symlink_exempt"
     PRESERVE_CLI=1
     PRESERVE_AUTOSTART=1
   elif [ "$PLATFORM" = "darwin" ] && [ "$CONFIRM_FDA_SWITCH" -eq 0 ] && [ -f "$AUTOSTART_PATH" ] && \
        grep -q "<key>ProgramArguments</key>" "$AUTOSTART_PATH" && \
-       ! grep -q "/Library/Application Support/imcodes/daemon-runtime" "$AUTOSTART_PATH"; then
+       ! grep -q "/Library/Application Support/imcodes/daemon-runtime" "$AUTOSTART_PATH" && \
+       ! grep -q "$RUNTIME_ROOT" "$AUTOSTART_PATH"; then
     SCENARIO="macos_launchagent_fda_preserve"
     PRESERVE_AUTOSTART=1
     PRESERVE_FDA=1
-  elif [ -f "$USER_STATE_DIR/last-upgrade-error.json" ] && grep -q -- "-2147020576" "$USER_STATE_DIR/last-upgrade-error.json"; then
+  elif [ "$autostart_broken" -eq 1 ] || { [ -f "$USER_STATE_DIR/last-upgrade-error.json" ] && grep -q -- "-2147020576" "$USER_STATE_DIR/last-upgrade-error.json"; } || [ "$FORCE_TAKEOVER" -eq 1 ]; then
     SCENARIO="legacy_broken_takeover"
     CLEAN_EXPIRED_TMP=1
+    CHECK_LOCK=1
+    STOP_DAEMON=1
+    SWITCH_BUNDLED=1
   elif [ -f "$NODE_ROOT/credential.json" ] || [ -f "$USER_STATE_DIR/server.json" ] || [ -f "$AUTOSTART_PATH" ]; then
     SCENARIO="partial_preserve"
     [ -f "$AUTOSTART_PATH" ] && PRESERVE_AUTOSTART=1
+    CHECK_LOCK=1
   else
     SCENARIO="clean"
+    CHECK_LOCK=1
+    SWITCH_BUNDLED=1
   fi
 fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
-  echo "PHASE_A_PLAN scenario=$SCENARIO preserve_cli=$PRESERVE_CLI preserve_autostart=$PRESERVE_AUTOSTART preserve_fda=$PRESERVE_FDA"
+  echo "PHASE_A_PLAN scenario=$SCENARIO preserve_cli=$PRESERVE_CLI preserve_autostart=$PRESERVE_AUTOSTART preserve_fda=$PRESERVE_FDA check_lock=$CHECK_LOCK stop_daemon=$STOP_DAEMON"
   exit 0
 fi
 
+read_lock_pid() {
+  lock_file="$USER_STATE_DIR/daemon.lock.json"
+  [ -f "$lock_file" ] || return 1
+  pid_val="$(tr -d '\\n\\r ' < "$lock_file" | sed -n 's/.*"pid":\\([0-9][0-9]*\\).*/\\1/p')"
+  [ -n "$pid_val" ] && printf '%s\\n' "$pid_val"
+}
+
+is_controllable_daemon_pid() {
+  pid="$1"
+  [ -n "\${IMCODES_STOP_DAEMON_HOOK:-}" ] && return 0
+  cmd_args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+  case "$cmd_args" in
+    *imcodes*|*daemon-stub*|*index.js*|*node*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_pid_alive() {
+  pid="$1"
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  p_stat="$(ps -p "$pid" -o stat= 2>/dev/null | tr -d '[:space:]' || true)"
+  case "$p_stat" in
+    Z*) return 1 ;;
+  esac
+  return 0
+}
+
+STOPPED_ACTIVE_DAEMON=0
+verify_and_stop_active_lock() {
+  [ "$CHECK_LOCK" -eq 1 ] || [ "$STOP_DAEMON" -eq 1 ] || return 0
+  lock_pid="$(read_lock_pid || true)"
+  [ -n "$lock_pid" ] || return 0
+  if ! is_pid_alive "$lock_pid"; then
+    return 0
+  fi
+  # Live daemon PID detected. When takeover / autostart replacement / bundled switch runs,
+  # we must cleanly stop a controllable daemon OR fail closed before mutating runtime state.
+  if [ "$STOP_DAEMON" -eq 1 ] || [ "$PRESERVE_AUTOSTART" -eq 0 ] || [ "$SWITCH_BUNDLED" -eq 1 ]; then
+    if ! is_controllable_daemon_pid "$lock_pid"; then
+      echo "ERROR: live daemon lock pid=$lock_pid is not a controllable imcodes process; aborting without mutation" >&2
+      exit 3
+    fi
+    if [ -n "\${IMCODES_STOP_DAEMON_HOOK:-}" ]; then
+      "$IMCODES_STOP_DAEMON_HOOK" "$lock_pid" "$AUTOSTART_PATH" || true
+    else
+      if [ "$APPLY_SERVICES" -eq 1 ]; then
+        if [ "$PLATFORM" = "linux" ]; then
+          run_systemctl_user stop imcodes.service >/dev/null 2>&1 || true
+        elif [ "$PLATFORM" = "darwin" ]; then
+          t_user="$(resolve_target_unix_user)"
+          t_uid="$(id -u "$t_user" 2>/dev/null || id -u)"
+          run_launchctl bootout "gui/$t_uid/imcodes.daemon" >/dev/null 2>&1 || true
+        fi
+      fi
+      kill -TERM "$lock_pid" 2>/dev/null || true
+    fi
+    wait_i=0
+    while [ "$wait_i" -lt 25 ]; do
+      if ! is_pid_alive "$lock_pid"; then
+        STOPPED_ACTIVE_DAEMON=1
+        return 0
+      fi
+      sleep 0.2 2>/dev/null || sleep 1
+      wait_i=$((wait_i + 1))
+    done
+    if is_pid_alive "$lock_pid"; then
+      echo "ERROR: active imcodes daemon lock pid=$lock_pid did not exit after stop; aborting without mutation" >&2
+      exit 3
+    fi
+  fi
+}
+
 if [ "$PHASE" = "preinst" ] || [ "$PHASE" = "preinstall" ]; then
+  verify_and_stop_active_lock
   snapshot_paths
   exit 0
 fi
 
-# Postinstall / full isolated install: preserve an existing preinst snapshot from this install pass
+# Postinstall / full isolated install: verify/stop live daemon lock BEFORE snapshot or payload writes
+verify_and_stop_active_lock
 if [ ! -f "$SNAPSHOT_DIR/snapshot.env" ]; then
   snapshot_paths
 fi
 
 if [ -n "$STAGE_ARCHIVE" ] && [ -f "$STAGE_ARCHIVE" ]; then
-  mkdir -p "$RELEASE_DIR"
-  tar -xzf "$STAGE_ARCHIVE" -C "$RELEASE_DIR"
+  stage_tmp="$RUNTIME_ROOT/.staging-$$"
+  rm -rf "$stage_tmp"
+  mkdir -p "$stage_tmp" "$RUNTIME_ROOT/releases"
+  tar -xzf "$STAGE_ARCHIVE" -C "$stage_tmp"
+  rm -rf "$RELEASE_DIR"
+  mv "$stage_tmp" "$RELEASE_DIR"
 fi
 
 # Never overwrite existing credential.json, server.json, or *.sqlite
@@ -503,18 +1076,22 @@ fi
 
 if [ "$PRESERVE_CLI" -eq 0 ]; then
   mkdir -p "$(dirname -- "$CLI_PATH")"
-  if ! printf '%s' "$WRAPPER_B64" | base64 -d > "$CLI_PATH" 2>/dev/null; then
-    if ! printf '%s' "$WRAPPER_B64" | base64 -D > "$CLI_PATH" 2>/dev/null; then
-      printf '%s' "$WRAPPER_B64" | base64 --decode > "$CLI_PATH"
+  cli_tmp="$CLI_PATH.tmp.$$"
+  if ! printf '%s' "$WRAPPER_B64" | base64 -d > "$cli_tmp" 2>/dev/null; then
+    if ! printf '%s' "$WRAPPER_B64" | base64 -D > "$cli_tmp" 2>/dev/null; then
+      printf '%s' "$WRAPPER_B64" | base64 --decode > "$cli_tmp"
     fi
   fi
-  chmod 755 "$CLI_PATH"
+  chmod 755 "$cli_tmp"
+  # Atomic rename replaces symlink directory entry cleanly without touching symlink target bytes
+  mv -f "$cli_tmp" "$CLI_PATH"
 fi
 
 if [ "$PRESERVE_AUTOSTART" -eq 0 ]; then
   mkdir -p "$(dirname -- "$AUTOSTART_PATH")"
+  auto_tmp="$AUTOSTART_PATH.tmp.$$"
   if [ "$PLATFORM" = "darwin" ]; then
-    cat > "$AUTOSTART_PATH" <<EOF
+    cat > "$auto_tmp" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -536,7 +1113,7 @@ if [ "$PRESERVE_AUTOSTART" -eq 0 ]; then
 </plist>
 EOF
   else
-    cat > "$AUTOSTART_PATH" <<EOF
+    cat > "$auto_tmp" <<EOF
 [Unit]
 Description=IM.codes Coding Daemon
 After=network-online.target
@@ -550,12 +1127,39 @@ RestartSec=5
 [Install]
 WantedBy=default.target
 EOF
+    mkdir -p "$(dirname -- "$USER_WANTS_LINK")"
+    ln -sfn "$AUTOSTART_PATH" "$USER_WANTS_LINK"
   fi
+  mv -f "$auto_tmp" "$AUTOSTART_PATH"
 fi
 
-if [ "$PLATFORM" = "linux" ] && [ ! -e "$DESKTOP_PATH" ]; then
-  mkdir -p "$(dirname -- "$DESKTOP_PATH")"
-  cat > "$DESKTOP_PATH" <<EOF
+if [ "$PLATFORM" = "linux" ]; then
+  if [ -x "$NODE_ROOT/imcodes-node" ] && [ ! -e "$NODE_SERVICE_PATH" ]; then
+    mkdir -p "$(dirname -- "$NODE_SERVICE_PATH")"
+    svc_tmp="$NODE_SERVICE_PATH.tmp.$$"
+    cat > "$svc_tmp" <<EOF
+[Unit]
+Description=IM.codes controlled node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$NODE_ROOT/imcodes-node
+NotifyAccess=all
+WatchdogSec=180
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    mv -f "$svc_tmp" "$NODE_SERVICE_PATH"
+  fi
+  if [ ! -e "$DESKTOP_PATH" ]; then
+    mkdir -p "$(dirname -- "$DESKTOP_PATH")"
+    desk_tmp="$DESKTOP_PATH.tmp.$$"
+    cat > "$desk_tmp" <<EOF
 [Desktop Entry]
 Type=Application
 Version=1.0
@@ -569,31 +1173,93 @@ StartupNotify=true
 StartupWMClass=aidesk-local-ui
 X-IMCodes-Managed=true
 EOF
+    mv -f "$desk_tmp" "$DESKTOP_PATH"
+  fi
+elif [ "$PLATFORM" = "darwin" ] && [ -x "$NODE_ROOT/imcodes-node" ]; then
+  if [ ! -e "$NODE_SERVICE_PATH" ]; then
+    mkdir -p "$(dirname -- "$NODE_SERVICE_PATH")"
+    cat > "$NODE_SERVICE_PATH.tmp.$$" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>cc.imcodes.node</string>
+  <key>ProgramArguments</key><array><string>$NODE_ROOT/imcodes-node</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardErrorPath</key><string>/var/log/imcodes-node.err.log</string>
+  <key>StandardOutPath</key><string>/var/log/imcodes-node.out.log</string>
+</dict>
+</plist>
+EOF
+    mv -f "$NODE_SERVICE_PATH.tmp.$$" "$NODE_SERVICE_PATH"
+  fi
+  if [ -n "$NODE_WATCHDOG_SERVICE_PATH" ] && [ ! -e "$NODE_WATCHDOG_SERVICE_PATH" ]; then
+    mkdir -p "$(dirname -- "$NODE_WATCHDOG_SERVICE_PATH")"
+    cat > "$NODE_WATCHDOG_SERVICE_PATH.tmp.$$" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>cc.imcodes.node.watchdog</string>
+  <key>ProgramArguments</key><array><string>$NODE_ROOT/imcodes-node</string><string>--health-watchdog</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>60</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardErrorPath</key><string>/var/log/imcodes-node-watchdog.err.log</string>
+  <key>StandardOutPath</key><string>/var/log/imcodes-node-watchdog.out.log</string>
+</dict>
+</plist>
+EOF
+    mv -f "$NODE_WATCHDOG_SERVICE_PATH.tmp.$$" "$NODE_WATCHDOG_SERVICE_PATH"
+  fi
 fi
 
 if [ "$APPLY_SERVICES" -eq 1 ]; then
-  if [ "$PLATFORM" = "linux" ] && [ "$(id -u)" -eq 0 ] && command -v systemctl >/dev/null 2>&1; then
-    if [ -f /etc/systemd/system/imcodes-node.service ]; then
-      systemctl daemon-reload >/dev/null 2>&1 || true
-      systemctl enable imcodes-node.service >/dev/null 2>&1 || true
+  if [ "$PLATFORM" = "linux" ]; then
+    if [ "$(id -u)" -eq 0 ] || [ -n "\${IMCODES_SYSTEMCTL_BIN:-}" ]; then
+      if [ -f "$NODE_SERVICE_PATH" ]; then
+        run_systemctl_sys daemon-reload >/dev/null 2>&1 || true
+        run_systemctl_sys enable imcodes-node.service >/dev/null 2>&1 || true
+        run_systemctl_sys restart imcodes-node.service >/dev/null 2>&1 || run_systemctl_sys start imcodes-node.service >/dev/null 2>&1 || true
+      fi
     fi
-  elif [ "$PLATFORM" = "darwin" ] && [ "$(id -u)" -eq 0 ]; then
-    if [ -f /Library/LaunchDaemons/cc.imcodes.node.plist ]; then
-      launchctl bootstrap system /Library/LaunchDaemons/cc.imcodes.node.plist >/dev/null 2>&1 || true
+    if [ -f "$AUTOSTART_PATH" ] && { [ "$PRESERVE_AUTOSTART" -eq 0 ] || [ "$STOPPED_ACTIVE_DAEMON" -eq 1 ]; }; then
+      t_user="$(resolve_target_unix_user)"
+      if [ "$(id -u)" -eq 0 ] && [ "$t_user" != "root" ]; then
+        chown -R "$t_user" "$(dirname -- "$AUTOSTART_PATH")" >/dev/null 2>&1 || true
+      fi
+      run_systemctl_user daemon-reload >/dev/null 2>&1 || true
+      run_systemctl_user enable imcodes.service >/dev/null 2>&1 || true
+      run_systemctl_user restart imcodes.service >/dev/null 2>&1 || run_systemctl_user start imcodes.service >/dev/null 2>&1 || true
+      run_systemctl_user is-active imcodes.service >/dev/null 2>&1 || true
     fi
-    if [ "$PRESERVE_AUTOSTART" -eq 0 ] && [ -f "$AUTOSTART_PATH" ]; then
-      cu="$(stat -f '%Su' /dev/console 2>/dev/null || true)"
-      if [ -n "$cu" ] && [ "$cu" != "root" ] && [ "$cu" != "loginwindow" ]; then
-        cuid="$(id -u "$cu" 2>/dev/null || true)"
-        if [ -n "$cuid" ]; then
-          chown "$cu" "$AUTOSTART_PATH" >/dev/null 2>&1 || true
-          launchctl bootstrap "gui/$cuid" "$AUTOSTART_PATH" >/dev/null 2>&1 || true
+  elif [ "$PLATFORM" = "darwin" ]; then
+    if [ "$(id -u)" -eq 0 ] || [ -n "\${IMCODES_LAUNCHCTL_BIN:-}" ]; then
+      if [ -f "$NODE_SERVICE_PATH" ]; then
+        run_launchctl bootout system/cc.imcodes.node >/dev/null 2>&1 || true
+        run_launchctl bootstrap system "$NODE_SERVICE_PATH" >/dev/null 2>&1 || true
+        run_launchctl kickstart -k system/cc.imcodes.node >/dev/null 2>&1 || true
+      fi
+      if [ -n "$NODE_WATCHDOG_SERVICE_PATH" ] && [ -f "$NODE_WATCHDOG_SERVICE_PATH" ]; then
+        run_launchctl bootout system/cc.imcodes.node.watchdog >/dev/null 2>&1 || true
+        run_launchctl bootstrap system "$NODE_WATCHDOG_SERVICE_PATH" >/dev/null 2>&1 || true
+        run_launchctl kickstart -k system/cc.imcodes.node.watchdog >/dev/null 2>&1 || true
+      fi
+      if [ -f "$AUTOSTART_PATH" ] && { [ "$PRESERVE_AUTOSTART" -eq 0 ] || [ "$STOPPED_ACTIVE_DAEMON" -eq 1 ]; }; then
+        t_user="$(resolve_target_unix_user)"
+        t_uid="$(id -u "$t_user" 2>/dev/null || id -u)"
+        if [ -n "$t_uid" ] && [ "$t_uid" != "0" ]; then
+          [ "$(id -u)" -eq 0 ] && chown "$t_user" "$AUTOSTART_PATH" >/dev/null 2>&1 || true
+          run_launchctl bootout "gui/$t_uid/imcodes.daemon" >/dev/null 2>&1 || true
+          run_launchctl bootstrap "gui/$t_uid" "$AUTOSTART_PATH" >/dev/null 2>&1 || true
+          run_launchctl kickstart -k "gui/$t_uid/imcodes.daemon" >/dev/null 2>&1 || true
         fi
       fi
     fi
   fi
 fi
 
-echo "INSTALL_OK scenario=$SCENARIO preserve_cli=$PRESERVE_CLI preserve_autostart=$PRESERVE_AUTOSTART preserve_fda=$PRESERVE_FDA snapshot=$SNAPSHOT_DIR"
+echo "INSTALL_OK scenario=$SCENARIO preserve_cli=$PRESERVE_CLI preserve_autostart=$PRESERVE_AUTOSTART preserve_fda=$PRESERVE_FDA check_lock=$CHECK_LOCK stop_daemon=$STOP_DAEMON snapshot=$SNAPSHOT_DIR"
 `;
 }

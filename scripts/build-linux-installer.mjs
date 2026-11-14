@@ -75,6 +75,7 @@ fi
 tail -n "+$ARCHIVE_LINE" "$0" | tar -xz -C "$WORK_TMP"
 
 # Handle rollback or version queries before any installation steps
+STATUS=0
 for arg in "$@"; do
   case "$arg" in
     --rollback|--version|--check|--dry-run)
@@ -82,7 +83,8 @@ for arg in "$@"; do
         printf '%s\\n' "$INSTALLER_VERSION"
         exit 0
       fi
-      exec "$RUNNER_PATH" --probe-runtime-dir "$WORK_TMP/payload/daemon-runtime" "$@"
+      "$RUNNER_PATH" --probe-runtime-dir "$WORK_TMP/payload/daemon-runtime" "$@"
+      exit $?
       ;;
   esac
 done
@@ -91,23 +93,19 @@ done
 ISOLATED_ROOT="\${IMCODES_ISOLATED_ROOT:-}"
 prev=""
 for arg in "$@"; do
-  if [ "$prev" = "--isolated-root" ]; then
-    ISOLATED_ROOT="$arg"
-    break
-  fi
-  prev="$arg"
+  case "$prev" in
+    --isolated-root) ISOLATED_ROOT="$arg"; prev=""; continue ;;
+  esac
+  case "$arg" in
+    --isolated-root=*) ISOLATED_ROOT="\${arg#--isolated-root=}" ;;
+    --isolated-root) prev="--isolated-root" ;;
+  esac
 done
 
-# 1. Run preinstall snapshot + Phase A dry check before mutating runtime directories
+# 1. Run preinstall lock verification + full pre-payload snapshot BEFORE mutating runtime directories
 "$RUNNER_PATH" --phase preinstall --probe-runtime-dir "$WORK_TMP/payload/daemon-runtime" "$@"
 
 if [ -n "$ISOLATED_ROOT" ]; then
-  case "$ISOLATED_ROOT" in
-    /var/lib/imcodes-node*|/opt/imcodes*)
-      echo "Refusing unsafe isolated root: $ISOLATED_ROOT" >&2
-      exit 2
-      ;;
-  esac
   DEST_RUNTIME_ROOT="$ISOLATED_ROOT/daemon-runtime"
   DEST_NODE_ROOT="$ISOLATED_ROOT/controlled-node"
 else
@@ -132,8 +130,9 @@ if [ -d "$WORK_TMP/payload/controlled-node" ]; then
   done
 fi
 
-# 3. Execute Phase A compatibility routing + current link + CLI wrapper + autostart
-exec "$RUNNER_PATH" --phase postinstall "$@"
+# 3. Execute Phase A compatibility routing + current link + CLI wrapper + autostart + services
+"$RUNNER_PATH" --phase postinstall --probe-runtime-dir "$WORK_TMP/payload/daemon-runtime" "$@"
+exit $?
 __ARCHIVE_BELOW__
 `;
 }
@@ -147,6 +146,7 @@ function parseCliArgs(argv) {
     const token = argv[i];
     if (token === '--arch') args.arch = argv[++i];
     else if (token === '--version') args.version = argv[++i];
+    else if (token === '--min-version') args.minVersion = argv[++i];
     else if (token === '--runtime-dir') args.runtimeDir = argv[++i];
     else if (token === '--runtime-archive') args.runtimeArchive = argv[++i];
     else if (token === '--node-exe') args.nodeExe = argv[++i];
@@ -173,6 +173,7 @@ export async function buildLinuxInstallers(options) {
     platform: 'linux',
     version,
     cliWrapperContent,
+    minVersion: options.minVersion ?? '',
   });
 
   const workDir = mkdtempSync(join(tmpdir(), `imcodes-linux-pkg-${arch}-`));
@@ -281,14 +282,37 @@ export async function buildLinuxInstallers(options) {
         buildDebianControlText({ version, arch, installedSizeKb }),
         'utf8',
       );
+      const runnerB64 = Buffer.from(runnerScriptText, 'utf8').toString('base64');
+      const preinstScript = [
+        '#!/bin/sh',
+        'set -eu',
+        'PRE_TMP="$(mktemp -d "${TMPDIR:-/tmp}/imcodes-deb-preinst.XXXXXX")"',
+        'trap \'rm -rf "$PRE_TMP"\' EXIT',
+        `RUNNER_B64=${JSON.stringify(runnerB64)}`,
+        'if ! printf \'%s\' "$RUNNER_B64" | base64 -d > "$PRE_TMP/runner.sh" 2>/dev/null; then',
+        '  printf \'%s\' "$RUNNER_B64" | base64 --decode > "$PRE_TMP/runner.sh"',
+        'fi',
+        'chmod 700 "$PRE_TMP/runner.sh"',
+        '/bin/sh "$PRE_TMP/runner.sh" --phase preinst',
+        '',
+      ].join('\n');
       writeFileSync(
         join(debianMetaDir, 'preinst'),
-        `#!/bin/sh\nset -e\nexec /bin/sh /usr/share/imcodes/phase-a-runner.sh --phase preinst "$@"\n`,
+        preinstScript,
         { mode: 0o755 },
       );
+      const postinstScript = [
+        '#!/bin/sh',
+        'set -eu',
+        'if [ -n "${IMCODES_ISOLATED_ROOT:-}" ] && [ -x "${IMCODES_ISOLATED_ROOT}/usr/share/imcodes/phase-a-runner.sh" ]; then',
+        '  exec /bin/sh "${IMCODES_ISOLATED_ROOT}/usr/share/imcodes/phase-a-runner.sh" --phase postinst "$@"',
+        'fi',
+        'exec /bin/sh /usr/share/imcodes/phase-a-runner.sh --phase postinst "$@"',
+        '',
+      ].join('\n');
       writeFileSync(
         join(debianMetaDir, 'postinst'),
-        `#!/bin/sh\nset -e\nexec /bin/sh /usr/share/imcodes/phase-a-runner.sh --phase postinst "$@"\n`,
+        postinstScript,
         { mode: 0o755 },
       );
       writeFileSync(

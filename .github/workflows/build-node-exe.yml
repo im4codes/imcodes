@@ -440,7 +440,10 @@ jobs:
           DEB="dist-node-exe/installers/imcodes-desktop-${IMCODES_BUILD_VERSION}-linux-amd64.deb"
           SH="dist-node-exe/installers/imcodes-desktop-${IMCODES_BUILD_VERSION}-linux-x64.sh"
           dpkg-deb --info "$DEB"
-          dpkg-deb --contents "$DEB" | head -n 40
+          DEB_CONTENTS_TMP="$(mktemp "${RUNNER_TEMP}/imcodes-deb-contents.XXXXXX")"
+          dpkg-deb --contents "$DEB" > "$DEB_CONTENTS_TMP"
+          head -n 40 "$DEB_CONTENTS_TMP"
+          rm -f "$DEB_CONTENTS_TMP"
           ISO_ROOT="$(mktemp -d "${RUNNER_TEMP}/imcodes-linux-inst-iso.XXXXXX")"
           ISO_HOME="$(mktemp -d "${RUNNER_TEMP}/imcodes-linux-inst-home.XXXXXX")"
           trap 'rm -rf "$ISO_ROOT" "$ISO_HOME"' EXIT
@@ -482,6 +485,14 @@ jobs:
             fi
             node scripts/macos-release-signing.mjs sign-pkg "$PKG"
             node scripts/macos-release-signing.mjs notarize "$PKG"
+            node scripts/build-macos-installer.mjs \
+              --refresh-manifest "$PKG" \
+              --arch arm64 \
+              --version "$IMCODES_BUILD_VERSION" \
+              --signed \
+              --notarized \
+              --has-app-bundle \
+              --has-node-binary
           fi
       - name: Build, sign, and smoke-test Windows Inno Setup (.iss/.exe) installer
         if: runner.os == 'Windows'

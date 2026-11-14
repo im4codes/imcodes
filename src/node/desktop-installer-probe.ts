@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import {
   chmodSync,
   copyFileSync,
+  cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -37,6 +38,7 @@ import {
 
 export interface ProbeDesktopInstallOptions {
   platform?: DesktopInstallerPlatform;
+  isolatedRoot?: string;
   homeDir?: string;
   userStateDir?: string;
   controlledNodeRoot?: string;
@@ -89,6 +91,42 @@ function safeRealpath(targetPath: string): string {
   } catch {
     return resolve(targetPath);
   }
+}
+
+/**
+ * Resolve the canonical path even if intermediate or leaf segments do not yet exist,
+ * resolving symlinks on the nearest existing ancestor so symlink escapes cannot bypass guards.
+ */
+export function resolveCanonicalTargetPath(targetPath: string): string {
+  let cur = resolve(targetPath);
+  const missingTail: string[] = [];
+  while (!safeLstat(cur)) {
+    const parent = dirname(cur);
+    if (parent === cur) break;
+    missingTail.unshift(basename(cur));
+    cur = parent;
+  }
+  const canonicalAncestor = safeRealpath(cur);
+  return missingTail.length > 0 ? join(canonicalAncestor, ...missingTail) : canonicalAncestor;
+}
+
+export function assertSafeNodeIsolatedTargetPath(
+  targetPath: string,
+  platform: DesktopInstallerPlatform,
+  realHomeDir?: string,
+  isolatedRoot?: string,
+  mode: 'container' | 'entry' = 'container',
+): void {
+  const lexical = resolve(targetPath);
+  const canonical =
+    mode === 'entry'
+      ? join(resolveCanonicalTargetPath(dirname(lexical)), basename(lexical))
+      : resolveCanonicalTargetPath(targetPath);
+  const resolvedIso = isolatedRoot ? resolve(isolatedRoot) : undefined;
+  const canonicalIso = isolatedRoot ? resolveCanonicalTargetPath(isolatedRoot) : undefined;
+  const canonicalHome = realHomeDir ? resolveCanonicalTargetPath(realHomeDir) : undefined;
+  assertSafeIsolatedTargetPath(lexical, platform, realHomeDir, resolvedIso);
+  assertSafeIsolatedTargetPath(canonical, platform, canonicalHome, canonicalIso);
 }
 
 function sha256FileSync(targetPath: string): { sha256: string; size: number } {
@@ -274,11 +312,18 @@ export function probeDesktopInstallEnvironment(
   const env = options.env ?? process.env;
   const nowMs = options.nowMs ?? Date.now();
   const tempMaxAgeMs = options.tempMaxAgeMs ?? DEFAULT_INSTALLER_TEMP_MAX_AGE_MS;
+  const isolatedBase = options.isolatedRoot ? resolve(options.isolatedRoot) : undefined;
 
-  const homeDir = resolve(options.homeDir ?? env.HOME ?? env.USERPROFILE ?? homedir());
+  const homeDir = resolve(
+    options.homeDir ?? (isolatedBase ? join(isolatedBase, 'home') : env.HOME ?? env.USERPROFILE ?? homedir()),
+  );
   const userStateDir = resolve(options.userStateDir ?? join(homeDir, '.imcodes'));
-  const controlledNodeRoot = resolve(options.controlledNodeRoot ?? defaults.controlledNodeRoot);
-  const daemonRuntimeRoot = resolve(options.daemonRuntimeRoot ?? defaults.daemonRuntimeRoot);
+  const controlledNodeRoot = resolve(
+    options.controlledNodeRoot ?? (isolatedBase ? join(isolatedBase, 'controlled-node') : defaults.controlledNodeRoot),
+  );
+  const daemonRuntimeRoot = resolve(
+    options.daemonRuntimeRoot ?? (isolatedBase ? join(isolatedBase, 'daemon-runtime') : defaults.daemonRuntimeRoot),
+  );
 
   // 1. Controlled node state (read-only)
   const credentialPath = join(controlledNodeRoot, 'credential.json');
@@ -294,8 +339,9 @@ export function probeDesktopInstallEnvironment(
   );
   const hasInstallIdentity = existsSync(installIdentityPath);
   const isolatedNodeRootOverride =
-    options.controlledNodeRoot !== undefined &&
-    controlledNodeRoot !== resolve(defaults.controlledNodeRoot);
+    Boolean(isolatedBase) ||
+    (options.controlledNodeRoot !== undefined &&
+      controlledNodeRoot !== resolve(defaults.controlledNodeRoot));
   const controlledNodeServicePath =
     options.controlledNodeServicePath ??
     (isolatedNodeRootOverride
@@ -317,14 +363,17 @@ export function probeDesktopInstallEnvironment(
   const hasComputerUseHelper = existsSync(join(controlledNodeRoot, 'computer-use-helper'));
 
   // 2. CLI probe (read-only)
-  const defaultCliPath =
-    platform === 'win32'
+  const defaultCliPath = isolatedBase
+    ? join(isolatedBase, 'bin', platform === 'win32' ? 'imcodes.cmd' : 'imcodes')
+    : platform === 'win32'
       ? join(homeDir, 'AppData', 'Local', 'imcodes', 'bin', 'imcodes.cmd')
       : defaults.cliWrapperPath;
   const resolvedCliCandidate =
     options.cliPath ??
-    (existsSync(defaultCliPath) ? defaultCliPath : findImcodesOnPath(env, platform)) ??
-    defaultCliPath;
+    (isolatedBase
+      ? defaultCliPath
+      : (existsSync(defaultCliPath) ? defaultCliPath : findImcodesOnPath(env, platform)) ??
+        defaultCliPath);
   const cliLstat = safeLstat(resolvedCliCandidate);
   const cliExists = cliLstat !== null;
   const cliIsSymlink = Boolean(cliLstat?.isSymbolicLink());
@@ -606,19 +655,23 @@ export interface CreateRollbackSnapshotOptions {
   trackedPaths: readonly string[];
   preservedPaths?: readonly string[];
   allowSystemRoot?: boolean;
+  isolatedRoot?: string;
   realHomeDir?: string;
 }
 
 /**
- * Snapshot pre-existing config, autostart, CLI wrapper, and runtime symlink targets
- * before mutation, plus record SHA-256 of preserved user/node state files.
+ * Snapshot pre-existing config, autostart, CLI wrapper, and runtime targets (including
+ * symlinks and non-symlink directories) before mutation, plus SHA-256 of preserved state files.
  */
 export function createRollbackSnapshot(
   options: CreateRollbackSnapshotOptions,
 ): DesktopInstallerRollbackSnapshot {
+  if (options.isolatedRoot && options.allowSystemRoot) {
+    throw new Error('unsafe_allow_system_root_with_isolated_root');
+  }
   const snapshotDir = resolve(options.snapshotDir);
-  if (!options.allowSystemRoot) {
-    assertSafeIsolatedTargetPath(snapshotDir, options.platform, options.realHomeDir);
+  if (!options.allowSystemRoot || options.isolatedRoot) {
+    assertSafeNodeIsolatedTargetPath(snapshotDir, options.platform, options.realHomeDir, options.isolatedRoot);
   }
   const filesDir = join(snapshotDir, 'files');
   mkdirSync(filesDir, { recursive: true });
@@ -627,8 +680,8 @@ export function createRollbackSnapshot(
   let index = 0;
   for (const rawPath of options.trackedPaths) {
     const targetPath = resolve(rawPath);
-    if (!options.allowSystemRoot) {
-      assertSafeIsolatedTargetPath(targetPath, options.platform, options.realHomeDir);
+    if (!options.allowSystemRoot || options.isolatedRoot) {
+      assertSafeNodeIsolatedTargetPath(targetPath, options.platform, options.realHomeDir, options.isolatedRoot, 'entry');
     }
     const lst = safeLstat(targetPath);
     if (!lst) {
@@ -642,6 +695,19 @@ export function createRollbackSnapshot(
         kind: st?.isDirectory() ? 'dir_symlink' : 'symlink',
         originalPath: targetPath,
         symlinkTarget,
+      });
+      continue;
+    }
+    if (lst.isDirectory()) {
+      index += 1;
+      const backupRelPath = join('files', `${index}-${basename(targetPath)}`);
+      const backupAbsPath = join(snapshotDir, backupRelPath);
+      cpSync(targetPath, backupAbsPath, { recursive: true, verbatimSymlinks: true });
+      entries.push({
+        kind: 'dir',
+        originalPath: targetPath,
+        backupRelPath,
+        mode: lst.mode & 0o777,
       });
       continue;
     }
@@ -689,6 +755,7 @@ export function createRollbackSnapshot(
 
 export interface RestoreRollbackOptions {
   allowSystemRoot?: boolean;
+  isolatedRoot?: string;
   realHomeDir?: string;
 }
 
@@ -705,6 +772,9 @@ export function restoreRollbackSnapshot(
   snapshotPathOrDir: string,
   options: RestoreRollbackOptions = {},
 ): RestoreRollbackResult {
+  if (options.isolatedRoot && options.allowSystemRoot) {
+    throw new Error('unsafe_allow_system_root_with_isolated_root');
+  }
   const manifestPath = snapshotPathOrDir.endsWith('.json')
     ? resolve(snapshotPathOrDir)
     : resolve(snapshotPathOrDir, 'snapshot.json');
@@ -716,8 +786,14 @@ export function restoreRollbackSnapshot(
   let restoredCount = 0;
   let removedCount = 0;
   for (const entry of snapshot.entries) {
-    if (!options.allowSystemRoot) {
-      assertSafeIsolatedTargetPath(entry.originalPath, snapshot.platform, options.realHomeDir);
+    if (!options.allowSystemRoot || options.isolatedRoot) {
+      assertSafeNodeIsolatedTargetPath(
+        entry.originalPath,
+        snapshot.platform,
+        options.realHomeDir,
+        options.isolatedRoot,
+        'entry',
+      );
     }
     if (entry.kind === 'absent') {
       if (safeLstat(entry.originalPath)) {
@@ -742,6 +818,14 @@ export function restoreRollbackSnapshot(
     }
     if (!entry.backupRelPath) throw new Error(`missing backupRelPath for ${entry.originalPath}`);
     const backupAbs = join(snapshot.snapshotDir, entry.backupRelPath);
+    if (entry.kind === 'dir') {
+      cpSync(backupAbs, entry.originalPath, { recursive: true, verbatimSymlinks: true });
+      if (typeof entry.mode === 'number' && snapshot.platform !== 'win32') {
+        chmodSync(entry.originalPath, entry.mode);
+      }
+      restoredCount += 1;
+      continue;
+    }
     copyFileSync(backupAbs, entry.originalPath);
     if (typeof entry.mode === 'number' && snapshot.platform !== 'win32') {
       chmodSync(entry.originalPath, entry.mode);
@@ -770,6 +854,7 @@ export interface CleanupExpiredTempOptions {
   maxAgeMs?: number;
   nowMs?: number;
   allowSystemRoot?: boolean;
+  isolatedRoot?: string;
   realHomeDir?: string;
 }
 
@@ -778,14 +863,17 @@ export interface CleanupExpiredTempOptions {
  * Never removes lockfiles, SQLite DBs, credentials, or `server.json`.
  */
 export function cleanupExpiredTempArtifacts(options: CleanupExpiredTempOptions): string[] {
+  if (options.isolatedRoot && options.allowSystemRoot) {
+    throw new Error('unsafe_allow_system_root_with_isolated_root');
+  }
   const maxAgeMs = options.maxAgeMs ?? DEFAULT_INSTALLER_TEMP_MAX_AGE_MS;
   const nowMs = options.nowMs ?? Date.now();
   const removed: string[] = [];
 
   for (const rawRoot of options.scanRoots) {
     const root = resolve(rawRoot);
-    if (!options.allowSystemRoot) {
-      assertSafeIsolatedTargetPath(root, options.platform, options.realHomeDir);
+    if (!options.allowSystemRoot || options.isolatedRoot) {
+      assertSafeNodeIsolatedTargetPath(root, options.platform, options.realHomeDir, options.isolatedRoot);
     }
     if (!existsSync(root)) continue;
     let entries;
@@ -861,9 +949,15 @@ function runProbeCli(argv: readonly string[]): void {
       ? flags.platform
       : undefined;
 
+  const isolatedRoot =
+    typeof flags['isolated-root'] === 'string'
+      ? flags['isolated-root']
+      : process.env.IMCODES_ISOLATED_ROOT?.trim() || undefined;
+
   if (subcommand === 'probe' || subcommand === 'plan') {
     const probe = probeDesktopInstallEnvironment({
       platform,
+      isolatedRoot,
       homeDir: typeof flags.home === 'string' ? flags.home : undefined,
       userStateDir: typeof flags['user-state-dir'] === 'string' ? flags['user-state-dir'] : undefined,
       controlledNodeRoot: typeof flags['node-root'] === 'string' ? flags['node-root'] : undefined,
@@ -892,6 +986,7 @@ function runProbeCli(argv: readonly string[]): void {
     if (!snapshot) throw new Error('--snapshot <path> is required');
     const res = restoreRollbackSnapshot(snapshot, {
       allowSystemRoot: flags['allow-system-root'] === true,
+      isolatedRoot,
       realHomeDir: typeof flags['real-home'] === 'string' ? flags['real-home'] : homedir(),
     });
     process.stdout.write(`${JSON.stringify(res, null, 2)}\n`);
@@ -906,6 +1001,7 @@ function runProbeCli(argv: readonly string[]): void {
       platform: effectivePlatform,
       scanRoots: roots,
       allowSystemRoot: flags['allow-system-root'] === true,
+      isolatedRoot,
       realHomeDir: typeof flags['real-home'] === 'string' ? flags['real-home'] : homedir(),
     });
     process.stdout.write(`${JSON.stringify({ removed }, null, 2)}\n`);

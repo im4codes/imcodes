@@ -1,11 +1,12 @@
 import { createHash } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import {
   chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   readlinkSync,
   rmSync,
@@ -20,9 +21,15 @@ import { parse as parseYaml } from 'yaml';
 // @ts-expect-error ESM script module
 import { buildLinuxInstallers } from '../../scripts/build-linux-installer.mjs';
 // @ts-expect-error ESM script module
-import { buildMacosInstaller } from '../../scripts/build-macos-installer.mjs';
+import { buildMacosInstaller, refreshMacosPkgManifest } from '../../scripts/build-macos-installer.mjs';
 // @ts-expect-error ESM script module
 import { buildWindowsInstaller } from '../../scripts/build-windows-installer.mjs';
+// @ts-expect-error ESM script module
+import {
+  renderLinuxControlledNodeSystemdUnit,
+  renderMacosControlledNodeLaunchDaemonPlist,
+  renderMacosControlledNodeWatchdogLaunchDaemonPlist,
+} from '../../scripts/desktop-installer-shared.mjs';
 // @ts-expect-error ESM script module
 import { selectDeveloperIdSigningIdentity } from '../../scripts/macos-release-signing.mjs';
 
@@ -309,5 +316,323 @@ describe('AC 3: Three-platform installer builders & CI wiring', () => {
     expect(names.some((n) => n.includes('Windows Inno Setup'))).toBe(true);
     const uploadStep = parsed.jobs.build.steps.find((s) => s.name === 'Upload executable artifact');
     expect(uploadStep?.with?.path).toContain('dist-node-exe/installers/**');
+
+    // F7: macOS CI workflow refreshes pkg manifest after signing and notarizing
+    const macStep = parsed.jobs.build.steps.find((s) => (s.name ?? '').includes('macOS .pkg installer'));
+    expect(macStep?.run).toContain('--refresh-manifest');
+    expect(macStep?.run).toContain('--notarized');
+
+    // F8: Linux CI workflow avoids dpkg-deb --contents | head SIGPIPE under pipefail
+    const linuxStep = parsed.jobs.build.steps.find((s) => (s.name ?? '').includes('Linux unified installers'));
+    expect(linuxStep?.run).not.toMatch(/dpkg-deb --contents[^\n]*\|\s*head/u);
+    expect(linuxStep?.run).toContain('DEB_CONTENTS_TMP=');
+  });
+
+  it('embeds self-contained preinst in .deb and cleans up offline .sh extraction TMPDIR (F1, F9)', async () => {
+    const root = makeTempDir();
+    const runtimeDir = createFakeRuntimeDir(root, 'linux', '0.9.5');
+    // Populate >1,500 files so dpkg-deb --contents output exceeds pipe buffer (F8 SIGPIPE test too!)
+    const bigAssets = join(runtimeDir, 'many-assets');
+    mkdirSync(bigAssets, { recursive: true });
+    for (let i = 0; i < 1400; i++) {
+      writeFileSync(join(bigAssets, `asset-${String(i).padStart(4, '0')}.txt`), 'x');
+    }
+    const fakeNode = join(root, 'imcodes-node');
+    writeFileSync(fakeNode, '#!/bin/sh\necho "NODE_SERVICE_OK $*"\n');
+    chmodSync(fakeNode, 0o755);
+    const outDir = join(root, 'out');
+    const customTmp = join(root, 'sh-tmp');
+    mkdirSync(customTmp, { recursive: true });
+
+    const res = await buildLinuxInstallers({
+      version: '0.9.5',
+      arch: 'x64',
+      runtimeDir,
+      nodeExe: fakeNode,
+      outDir,
+    });
+
+    // F1: Extract DEBIAN control scripts & verify preinst runs cleanly BEFORE payload unpack!
+    const debCtrl = join(root, 'deb-ctrl');
+    execFileSync('dpkg-deb', ['-e', res.debPath, debCtrl], { encoding: 'utf8' });
+    const preinst = readFileSync(join(debCtrl, 'preinst'), 'utf8');
+    expect(preinst).not.toContain('/usr/share/imcodes/phase-a-runner.sh');
+    expect(preinst).toContain('base64 -d');
+
+    const debIso = join(root, 'deb-iso');
+    execFileSync(
+      join(debCtrl, 'preinst'),
+      ['install'],
+      {
+        env: { ...process.env, IMCODES_ISOLATED_ROOT: debIso },
+        encoding: 'utf8',
+      },
+    );
+    expect(existsSync(join(debIso, 'rollback-snapshot', 'snapshot.env'))).toBe(true);
+
+    // Unpack .deb payload and verify postinst + large dpkg-deb --contents temp-file pattern (F8)
+    const debUnpack = join(root, 'deb-unpack');
+    execFileSync('dpkg-deb', ['-x', res.debPath, debUnpack], { encoding: 'utf8' });
+    expect(existsSync(join(debUnpack, 'opt', 'imcodes', 'daemon-runtime', 'releases', '0.9.5', 'bin', 'node'))).toBe(true);
+    execFileSync(
+      'bash',
+      ['-euo', 'pipefail', '-c', 'TMPF="$(mktemp)"; dpkg-deb --contents "$1" > "$TMPF"; head -n 40 "$TMPF" >/dev/null; rm -f "$TMPF"', '_', res.debPath],
+      { encoding: 'utf8' },
+    );
+
+    // F9: Offline .sh cleans TMPDIR extraction directory after --check, --dry-run, and default derived --home (F6)
+    const isoSh = join(root, 'sh-iso');
+    execFileSync(res.shPath, ['--isolated-root', isoSh, '--check'], {
+      env: { ...process.env, TMPDIR: customTmp },
+      encoding: 'utf8',
+    });
+    expect(readdirSync(customTmp).filter((e) => e.startsWith('imcodes-sh.'))).toEqual([]);
+
+    const shNoHomeOut = execFileSync(res.shPath, ['--isolated-root', isoSh, '--dry-run'], {
+      env: { ...process.env, TMPDIR: customTmp },
+      encoding: 'utf8',
+    });
+    expect(shNoHomeOut).toContain('scenario=clean');
+    expect(readdirSync(customTmp).filter((e) => e.startsWith('imcodes-sh.'))).toEqual([]);
+  });
+
+  it('aligns service/watchdog entrypoints, enforces minVersion takeover, live lock handling, symlink/dir rollback, and isolated path guards (F2, F3, F4, F6)', async () => {
+    // F2: Verify rendered service templates match src/node/installer.ts
+    const systemdUnit = renderLinuxControlledNodeSystemdUnit('/var/lib/imcodes-node');
+    expect(systemdUnit).toContain('ExecStart=/var/lib/imcodes-node/imcodes-node\n');
+    expect(systemdUnit).not.toContain('--run');
+    expect(systemdUnit).toContain('NotifyAccess=all');
+    expect(systemdUnit).toContain('WatchdogSec=180');
+    expect(systemdUnit).toContain('Restart=on-failure');
+
+    const macDaemonPlist = renderMacosControlledNodeLaunchDaemonPlist();
+    expect(macDaemonPlist).toContain('<string>/Library/Application Support/imcodes-node/imcodes-node</string>');
+    expect(macDaemonPlist).not.toContain('--run');
+    expect(macDaemonPlist).toContain('/var/log/imcodes-node.out.log');
+
+    const macWatchdogPlist = renderMacosControlledNodeWatchdogLaunchDaemonPlist();
+    expect(macWatchdogPlist).toContain('<string>--health-watchdog</string>');
+    expect(macWatchdogPlist).toContain('<key>StartInterval</key>');
+
+    const root = makeTempDir();
+    const runtimeDir = createFakeRuntimeDir(root, 'linux', '0.9.5');
+    const fakeNode = join(root, 'imcodes-node');
+    writeFileSync(fakeNode, '#!/bin/sh\necho "NODE_SERVICE_OK"\n');
+    chmodSync(fakeNode, 0o755);
+    const outDir = join(root, 'out');
+    const res = await buildLinuxInstallers({
+      version: '0.9.5',
+      arch: 'x64',
+      runtimeDir,
+      nodeExe: fakeNode,
+      outDir,
+    });
+
+    // Build scenario: old npm CLI at 0.9.4 (< minVersion 0.9.5), global symlink at bin/imcodes, real dir at current, existing file in releases/0.9.5
+    const isoRoot = join(root, 'iso-takeover');
+    const isoHome = join(root, 'home-takeover');
+    const npmPkgDir = join(isoRoot, 'npm-global', 'lib', 'node_modules', 'imcodes');
+    mkdirSync(join(npmPkgDir, 'dist', 'src'), { recursive: true });
+    writeFileSync(join(npmPkgDir, 'package.json'), JSON.stringify({ name: 'imcodes', version: '0.9.4' }));
+    const npmEntry = join(npmPkgDir, 'dist', 'src', 'index.js');
+    const npmOrigBytes = '#!/bin/sh\necho "OLD_NPM_BYTES_0_9_4"\n';
+    writeFileSync(npmEntry, npmOrigBytes);
+    chmodSync(npmEntry, 0o755);
+    mkdirSync(join(isoRoot, 'bin'), { recursive: true });
+    const cliPath = join(isoRoot, 'bin', 'imcodes');
+    symlinkSync(npmEntry, cliPath);
+
+    // Pre-existing non-symlink current dir + pre-existing same-version releases/0.9.5 file
+    const runtimeRoot = join(isoRoot, 'daemon-runtime');
+    const currentDir = join(runtimeRoot, 'current');
+    mkdirSync(join(currentDir, 'legacy'), { recursive: true });
+    writeFileSync(join(currentDir, 'legacy', 'marker.txt'), 'real-dir-current');
+    mkdirSync(join(runtimeRoot, 'releases', '0.9.5'), { recursive: true });
+    writeFileSync(join(runtimeRoot, 'releases', '0.9.5', 'old-same-ver.txt'), 'same-ver-old');
+
+    // Legacy user systemd service
+    const systemdUserDir = join(isoHome, '.config', 'systemd', 'user');
+    mkdirSync(systemdUserDir, { recursive: true });
+    const userSvcPath = join(systemdUserDir, 'imcodes.service');
+    writeFileSync(userSvcPath, '[Service]\nExecStart=/usr/bin/node /bad/missing/index.js\n');
+
+    // Mock systemctl binary to record system & user calls
+    const systemctlLog = join(root, 'systemctl.log');
+    const mockSystemctl = join(root, 'mock-systemctl');
+    writeFileSync(mockSystemctl, `#!/bin/sh\necho "SYSTEMCTL:$*" >> "${systemctlLog}"\nexit 0\n`);
+    chmodSync(mockSystemctl, 0o755);
+
+    // F3: Live daemon lock that refuses to stop MUST abort BEFORE modifying CLI symlink or current/!
+    const sleeper = spawn('sleep', ['30'], { stdio: 'ignore' });
+    mkdirSync(join(isoHome, '.imcodes'), { recursive: true });
+    const lockPath = join(isoHome, '.imcodes', 'daemon.lock.json');
+    writeFileSync(lockPath, JSON.stringify({ pid: sleeper.pid, startedAt: Date.now() }));
+    const failStopHook = join(root, 'fail-stop.sh');
+    writeFileSync(failStopHook, '#!/bin/sh\nexit 1\n');
+    chmodSync(failStopHook, 0o755);
+
+    try {
+      let aborted = false;
+      try {
+        execFileSync(
+          res.shPath,
+          ['--isolated-root', isoRoot, '--home', isoHome, '--min-version', '0.9.5', '--apply-services'],
+          { env: { ...process.env, IMCODES_STOP_DAEMON_HOOK: failStopHook }, encoding: 'utf8' },
+        );
+      } catch {
+        aborted = true;
+      }
+      expect(aborted).toBe(true);
+      // Pre-install state remains completely intact after fail-closed lock abort
+      expect(lstatSync(cliPath).isSymbolicLink()).toBe(true);
+      expect(readFileSync(join(currentDir, 'legacy', 'marker.txt'), 'utf8')).toBe('real-dir-current');
+
+      // Now install cleanly using controllable stop hook (kills sleeper or succeeds)
+      const okStopHook = join(root, 'ok-stop.sh');
+      writeFileSync(okStopHook, '#!/bin/sh\nkill -TERM "$1" 2>/dev/null || true\nsleep 0.2\nexit 0\n');
+      chmodSync(okStopHook, 0o755);
+
+      const installOut = execFileSync(
+        res.shPath,
+        ['--isolated-root', isoRoot, '--home', isoHome, '--min-version', '0.9.5', '--apply-services'],
+        {
+          env: {
+            ...process.env,
+            IMCODES_STOP_DAEMON_HOOK: okStopHook,
+            IMCODES_SYSTEMCTL_BIN: mockSystemctl,
+          },
+          encoding: 'utf8',
+        },
+      );
+      expect(installOut).toContain('INSTALL_OK');
+      expect(installOut).toContain('scenario=legacy_broken_takeover');
+      // F4: Symlink was replaced atomically without modifying npmEntry bytes
+      expect(lstatSync(cliPath).isSymbolicLink()).toBe(false);
+      expect(readFileSync(npmEntry, 'utf8')).toBe(npmOrigBytes);
+      // F2: Service files & systemctl activation logged
+      const sysCalls = readFileSync(systemctlLog, 'utf8');
+      expect(sysCalls).toContain('enable imcodes-node.service');
+      expect(sysCalls).toContain('--user enable imcodes.service');
+      expect(lstatSync(join(systemdUserDir, 'default.target.wants', 'imcodes.service')).isSymbolicLink()).toBe(true);
+
+      // Rollback restores npm symlink, real dir current, AND same-version releases/0.9.5!
+      execFileSync(
+        res.shPath,
+        ['--isolated-root', isoRoot, '--home', isoHome, '--rollback'],
+        { encoding: 'utf8' },
+      );
+      expect(lstatSync(cliPath).isSymbolicLink()).toBe(true);
+      expect(readlinkSync(cliPath)).toBe(npmEntry);
+      expect(readFileSync(npmEntry, 'utf8')).toBe(npmOrigBytes);
+      expect(lstatSync(currentDir).isDirectory()).toBe(true);
+      expect(readFileSync(join(currentDir, 'legacy', 'marker.txt'), 'utf8')).toBe('real-dir-current');
+      expect(readFileSync(join(runtimeRoot, 'releases', '0.9.5', 'old-same-ver.txt'), 'utf8')).toBe('same-ver-old');
+
+      // F6: Traversal to system root, real HOME subdir, and --allow-system-root rejected under isolated root
+      expect(() =>
+        execFileSync(res.shPath, ['--isolated-root', isoRoot, '--home', `${isoRoot}/../../../../var/lib/imcodes-node`, '--dry-run'], {
+          encoding: 'utf8',
+        }),
+      ).toThrow();
+      const linkHome = join(root, 'link-home');
+      const fakeRealHome = join(root, 'fake-real-home');
+      mkdirSync(join(fakeRealHome, '.imcodes'), { recursive: true });
+      symlinkSync(join(fakeRealHome, '.imcodes'), linkHome);
+      expect(() =>
+        execFileSync(res.shPath, ['--isolated-root', isoRoot, '--home', linkHome, '--dry-run'], {
+          env: { ...process.env, HOME: fakeRealHome },
+          encoding: 'utf8',
+        }),
+      ).toThrow();
+      expect(() =>
+        execFileSync(res.shPath, ['--isolated-root', isoRoot, '--allow-system-root', '--dry-run'], {
+          encoding: 'utf8',
+        }),
+      ).toThrow();
+    } finally {
+      try {
+        sleeper.kill('SIGKILL');
+      } catch {}
+    }
+  });
+
+  it('updates macOS pkg manifest sha256 and signing flags via refreshMacosPkgManifest (F7)', async () => {
+    const root = makeTempDir();
+    const runtimeDir = createFakeRuntimeDir(root, 'darwin', '0.9.5');
+    const fakeNode = join(root, 'imcodes-node');
+    writeFileSync(fakeNode, '#!/bin/sh\necho node\n');
+    chmodSync(fakeNode, 0o755);
+    const outDir = join(root, 'mac-out');
+    const pkgPath = join(outDir, 'imcodes-desktop-0.9.5-arm64.pkg');
+    mkdirSync(outDir, { recursive: true });
+    writeFileSync(pkgPath, 'unsigned-pkg-bytes');
+
+    const stageRes = await buildMacosInstaller({
+      version: '0.9.5',
+      arch: 'arm64',
+      runtimeDir,
+      nodeExe: fakeNode,
+      outDir,
+      stageDir: join(root, 'mac-stage'),
+      emitStageOnly: true,
+    });
+    expect(
+      readFileSync(
+        join(stageRes.stageDir, 'runtime-root', 'Library', 'LaunchDaemons', 'cc.imcodes.node.watchdog.plist'),
+        'utf8',
+      ),
+    ).toContain('--health-watchdog');
+
+    // Simulate signing mutating pkg bytes, then refreshing manifest
+    writeFileSync(pkgPath, 'signed-and-notarized-pkg-bytes');
+    const expectedSha = sha256File(pkgPath);
+    const updatedManifest = await refreshMacosPkgManifest({
+      pkgPath,
+      version: '0.9.5',
+      arch: 'arm64',
+      signed: true,
+      notarized: true,
+      hasAppBundle: false,
+      hasNodeBinary: false,
+    });
+    expect(updatedManifest.manifest.artifact.sha256).toBe(expectedSha);
+    expect(updatedManifest.manifest.signed).toBe(true);
+    expect(updatedManifest.manifest.notarized).toBe(true);
+    const persisted = JSON.parse(readFileSync(`${pkgPath}.manifest.json`, 'utf8'));
+    expect(persisted.artifact.sha256).toBe(expectedSha);
+    expect(persisted.notarized).toBe(true);
+  });
+
+  it('wires Windows PreInstall, Watchdog XML, and linear goto imcodes.cmd wrapper (F2, F5)', async () => {
+    const root = makeTempDir();
+    const runtimeDir = createFakeRuntimeDir(root, 'win32', '0.9.5');
+    const fakeExe = join(root, 'imcodes-node.exe');
+    writeFileSync(fakeExe, 'MZ-fake');
+    const outDir = join(root, 'win-out');
+
+    const res = await buildWindowsInstaller({
+      version: '0.9.5',
+      runtimeDir,
+      nodeExe: fakeExe,
+      outDir,
+    });
+
+    const issText = readFileSync(res.issPath, 'utf8');
+    expect(issText).toContain('Flags: dontcopy');
+    expect(issText).toContain('CurStepChanged(CurStep: TSetupStep)');
+    expect(issText).toContain('-Mode PreInstall');
+    expect(issText).toContain('-ApplyServices');
+
+    const ps1Text = readFileSync(res.ps1Path, 'utf8');
+    expect(ps1Text).toContain("ValidateSet('Probe', 'Plan', 'PreInstall', 'PostInstall', 'CleanupTmp', 'Rollback')");
+    expect(ps1Text).toContain('imcodes-node-watchdog');
+    expect(ps1Text).toContain('Resolve-CanonicalWindowsPath');
+
+    const cmdText = readFileSync(res.cmdPath, 'utf8');
+    expect(cmdText).toContain('goto :check_bundled');
+    expect(cmdText).toContain('goto :check_npm');
+    expect(cmdText).toContain('IMCODES_EXIT=%ERRORLEVEL%');
+    // F5: No parenthesized compound if (...) else (...) block prematurely expanding %RESOLVED_NODE%
+    expect(cmdText).not.toMatch(/^\s*\(\s*$/m);
   });
 });

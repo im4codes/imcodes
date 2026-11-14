@@ -1,14 +1,13 @@
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
 import {
-  assertSafeIsolatedTargetPath,
   renderPosixImcodesCliWrapper,
   renderWindowsImcodesCliWrapper,
   resolveImcodesCliTarget,
   type DesktopInstallerPlatform,
   type ResolvedImcodesCliTarget,
 } from '../../shared/desktop-installer-compatibility.js';
-import { isPathInsideGitCheckout } from './desktop-installer-probe.js';
+import { assertSafeNodeIsolatedTargetPath, isPathInsideGitCheckout } from './desktop-installer-probe.js';
 
 export interface InstallImcodesCliWrapperOptions {
   platform: DesktopInstallerPlatform;
@@ -17,6 +16,7 @@ export interface InstallImcodesCliWrapperOptions {
   relativeRuntimeSubpath?: string;
   forceTakeover?: boolean;
   allowSystemRoot?: boolean;
+  isolatedRoot?: string;
   realHomeDir?: string;
 }
 
@@ -28,13 +28,18 @@ export interface InstallImcodesCliWrapperResult {
 
 /**
  * Install the thin `imcodes` CLI forwarder while honoring Scenario 3 (developer symlink exemption).
+ * Uses atomic same-directory temp write + rename so any pre-existing non-dev symlink is replaced
+ * cleanly without overwriting or corrupting the symlink target in place.
  */
 export function installImcodesCliWrapper(
   options: InstallImcodesCliWrapperOptions,
 ): InstallImcodesCliWrapperResult {
+  if (options.isolatedRoot && options.allowSystemRoot) {
+    throw new Error('unsafe_allow_system_root_with_isolated_root');
+  }
   const wrapperPath = resolve(options.wrapperPath);
-  if (!options.allowSystemRoot) {
-    assertSafeIsolatedTargetPath(wrapperPath, options.platform, options.realHomeDir);
+  if (!options.allowSystemRoot || options.isolatedRoot) {
+    assertSafeNodeIsolatedTargetPath(wrapperPath, options.platform, options.realHomeDir, options.isolatedRoot, 'entry');
   }
 
   let existingLstat = null;
@@ -79,9 +84,19 @@ export function installImcodesCliWrapper(
           runtimeRoot: options.runtimeRoot,
           relativeRuntimeSubpath: options.relativeRuntimeSubpath,
         });
-  writeFileSync(wrapperPath, content, 'utf8');
-  if (options.platform !== 'win32') {
-    chmodSync(wrapperPath, 0o755);
+  const tmpWrapperPath = join(
+    dirname(wrapperPath),
+    `.${basename(wrapperPath)}.tmp.${process.pid}.${Date.now()}`,
+  );
+  try {
+    writeFileSync(tmpWrapperPath, content, 'utf8');
+    if (options.platform !== 'win32') {
+      chmodSync(tmpWrapperPath, 0o755);
+    }
+    renameSync(tmpWrapperPath, wrapperPath);
+  } catch (err) {
+    rmSync(tmpWrapperPath, { force: true });
+    throw err;
   }
   return { status: 'installed', wrapperPath };
 }
