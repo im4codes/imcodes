@@ -58,7 +58,16 @@ vi.mock('../../src/components/VoiceInput.js', () => ({
 }));
 
 vi.mock('../../src/components/AtPicker.js', () => ({
-  AtPicker: () => null,
+  AtPicker: ({ onSelectAllConfig, p2pConfig }: {
+    onSelectAllConfig?: (config: unknown, rounds: number, modeOverride?: string) => void;
+    p2pConfig?: Record<string, unknown>;
+  }) => (
+    onSelectAllConfig ? (
+      <button onClick={() => onSelectAllConfig(p2pConfig ?? { sessions: {} }, 1, 'audit>review>plan')}>
+        mock-select-all-combo
+      </button>
+    ) : null
+  ),
 }));
 
 vi.mock('../../src/components/P2pConfigPanel.js', () => ({
@@ -96,9 +105,13 @@ vi.mock('../../src/api.js', () => ({
   apiFetch: vi.fn().mockResolvedValue({ data: { history: [], sessionHistory: {}, commands: [], phrases: [] } }),
 }));
 
+import { getUserPref, uploadFile } from '../../src/api.js';
 import { SessionControls } from '../../src/components/SessionControls.js';
 import { focusComposerElement } from '../../src/util/composer-focus.js';
 import type { SessionInfo } from '../../src/types.js';
+
+const uploadFileMock = vi.mocked(uploadFile);
+const getUserPrefMock = vi.mocked(getUserPref);
 
 /** jsdom 28 drops non-standard `-webkit-user-modify` from `cssstyle`, keeping only `style.webkitUserModify`. */
 function readInlineWebkitUserModify(el: HTMLElement): string {
@@ -167,6 +180,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     voiceMock.stopListening.mockReset().mockResolvedValue(undefined);
     voiceMock.prewarm.mockReset().mockResolvedValue(undefined);
     voiceMock.onAudioLevel.mockReset();
+    uploadFileMock.mockReset();
   });
 
   afterEach(() => {
@@ -3491,5 +3505,312 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(css).toContain('scale(0.35)');
     expect(css).toContain('animation: voice-hold-transcript-drop 300ms');
     expect(css).toContain('.voice-hold-hud.is-dropping .voice-hold-hud-transcript');
+  });
+
+  it('retains combined dictated text, draft, warning, and activates editable focus + IME Send when voiceHold send rejects during upload (empty and non-empty base)', async () => {
+    let resolveUpload!: (value: { attachment: { daemonPath: string } }) => void;
+    uploadFileMock.mockImplementation(() => new Promise((resolve) => {
+      resolveUpload = resolve;
+    }));
+    const onComposerTextChange = vi.fn();
+    const ws = {
+      connected: true,
+      send: vi.fn(),
+      sendSessionCommand: vi.fn(),
+      onMessage: vi.fn(() => () => {}),
+      onDaemonCapabilitySnapshot: vi.fn(() => () => {}),
+      getDaemonCapabilitySnapshot: vi.fn(() => null),
+      isDaemonCapabilityStale: vi.fn(() => false),
+    } as any;
+
+    const outsideTarget = document.createElement('div');
+    outsideTarget.className = 'chat-view';
+    outsideTarget.tabIndex = -1;
+    document.body.appendChild(outsideTarget);
+
+    render(
+      <SessionControls
+        ws={ws}
+        activeSession={{ ...makeSession(), name: 'deck_upload_voice' }}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+        onComposerTextChange={onComposerTextChange}
+      />,
+    );
+
+    const input = document.querySelector('.controls-input') as HTMLDivElement;
+    expect(input.getAttribute('enterkeyhint')).toBe('send');
+    expect(input.getAttribute('contenteditable')).toBe('false');
+
+    // Start an in-flight upload -> uploading === true
+    fireEvent.paste(input, {
+      clipboardData: {
+        files: [new File(['payload'], 'pending.txt', { type: 'text/plain' })],
+        getData: () => '',
+      },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await Promise.resolve();
+    expect(uploadFileMock).toHaveBeenCalledTimes(1);
+
+    // 1. Empty initial composer: hold-to-talk touch dictation -> release in send zone while uploading
+    dispatchPointer(input, 'pointerdown', 180, 500, 1);
+    await vi.advanceTimersByTimeAsync(175);
+    voiceMock.listeningHandler?.(true);
+    voiceMock.partialHandler?.('上传期间语音');
+    dispatchPointer(input, 'pointerup', 180, 500, 1);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(300);
+
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+    expect(document.querySelector('.voice-hold-hud')).toBeNull();
+    expect(document.body.textContent).toContain('upload.uploading');
+    expect(input.textContent).toBe('上传期间语音');
+    expect(sessionStorage.getItem('rcc_draft_session:deck_upload_voice')).toBe('上传期间语音');
+    expect(onComposerTextChange).toHaveBeenLastCalledWith('上传期间语音');
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(document.activeElement).toBe(input);
+
+    // Trailing touch compatibility mousedown/click within the 500ms shield must not steal focus back out
+    const compatDown = new MouseEvent('mousedown', { bubbles: true, cancelable: true });
+    outsideTarget.dispatchEvent(compatDown);
+    expect(compatDown.defaultPrevented).toBe(true);
+    const compatClick = new MouseEvent('click', { bubbles: true, cancelable: true });
+    outsideTarget.dispatchEvent(compatClick);
+    expect(compatClick.defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(input);
+    expect(document.body.textContent).toContain('upload.uploading');
+
+    // IME Enter Send while still uploading retains text, warning, and active focus
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+    expect(input.textContent).toBe('上传期间语音');
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(document.activeElement).toBe(input);
+    expect(document.body.textContent).toContain('upload.uploading');
+
+    // Finish upload, then retry via mobile IME Enter Send -> delivers attachment + retained text
+    resolveUpload({ attachment: { daemonPath: '/tmp/pending.txt' } });
+    await Promise.resolve();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(0);
+
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+    expect(ws.sendSessionCommand).toHaveBeenCalledTimes(1);
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+      sessionName: 'deck_upload_voice',
+      text: '#1:(/tmp/pending.txt) 上传期间语音',
+    }));
+    expect(input.textContent).toBe('');
+
+    // 2. Non-empty baseText + new spoken transcript while another upload is in flight
+    let resolveSecondUpload!: (value: { attachment: { daemonPath: string } }) => void;
+    uploadFileMock.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveSecondUpload = resolve;
+    }));
+    input.textContent = '现有前缀';
+    fireEvent.input(input);
+    input.blur();
+    fireEvent.blur(input);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(input.getAttribute('contenteditable')).toBe('false');
+
+    fireEvent.paste(input, {
+      clipboardData: {
+        files: [new File(['second'], 'second.txt', { type: 'text/plain' })],
+        getData: () => '',
+      },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await Promise.resolve();
+    expect(uploadFileMock).toHaveBeenCalledTimes(2);
+
+    dispatchPointer(input, 'pointerdown', 180, 500, 2);
+    await vi.advanceTimersByTimeAsync(175);
+    voiceMock.listeningHandler?.(true);
+    voiceMock.partialHandler?.('追加指令');
+    dispatchPointer(input, 'pointerup', 180, 500, 2);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(300);
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledTimes(1);
+    expect(document.body.textContent).toContain('upload.uploading');
+    expect(input.textContent).toBe('现有前缀 追加指令');
+    expect(sessionStorage.getItem('rcc_draft_session:deck_upload_voice')).toBe('现有前缀 追加指令');
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(document.activeElement).toBe(input);
+
+    resolveSecondUpload({ attachment: { daemonPath: '/tmp/second.txt' } });
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  it('restores dictated text and activates editable focus on voiceHold local send rejection and P2P combo cancel/reject', async () => {
+    getUserPrefMock.mockImplementation(async (key: string) => {
+      if (key === 'p2p_session_config:deck_combo_voice') {
+        return JSON.stringify({
+          sessions: {
+            deck_sub_worker: { enabled: true, mode: 'audit' },
+          },
+          rounds: 2,
+        });
+      }
+      return null;
+    });
+    const ws = {
+      connected: true,
+      send: vi.fn(),
+      sendSessionCommand: vi.fn(),
+      onMessage: vi.fn(() => () => {}),
+      onDaemonCapabilitySnapshot: vi.fn(() => () => {}),
+      getDaemonCapabilitySnapshot: vi.fn(() => null),
+      isDaemonCapabilityStale: vi.fn(() => false),
+    } as any;
+    const onSend = vi.fn();
+
+    // 1. Synchronous local send rejection (no HTTP serverId fallback) preserves text, draft, and focus
+    const localRejectView = render(
+      <SessionControls
+        ws={ws}
+        activeSession={{ ...makeSession(), name: 'deck_local_reject_voice' }}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        onSend={onSend}
+      />,
+    );
+    const localInput = document.querySelector('.controls-input') as HTMLDivElement;
+    ws.sendSessionCommand.mockImplementationOnce(() => {
+      throw new Error('local socket error');
+    });
+    dispatchPointer(localInput, 'pointerdown', 180, 500, 1);
+    await vi.advanceTimersByTimeAsync(175);
+    voiceMock.listeningHandler?.(true);
+    voiceMock.partialHandler?.('本地发送失败语音');
+    dispatchPointer(localInput, 'pointerup', 180, 500, 1);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(300);
+
+    expect(onSend).toHaveBeenCalledWith(
+      'deck_local_reject_voice',
+      '本地发送失败语音',
+      expect.objectContaining({ localFailure: 'local socket error' }),
+    );
+    expect(localInput.textContent).toBe('本地发送失败语音');
+    expect(sessionStorage.getItem('rcc_draft_session:deck_local_reject_voice')).toBe('本地发送失败语音');
+    expect(localInput.getAttribute('contenteditable')).toBe('true');
+    expect(document.activeElement).toBe(localInput);
+    localRejectView.unmount();
+    document.body.innerHTML = '';
+
+    // 2. P2P combo confirmation cancel & upload-rejection during confirm
+    const { container } = render(
+      <SessionControls
+        ws={ws}
+        activeSession={{ ...makeSession(), name: 'deck_combo_voice' }}
+        quickData={makeQuickData()}
+        sessions={[{
+          name: 'deck_sub_worker',
+          project: 'main',
+          role: 'w1',
+          label: 'W1',
+          agentType: 'codex-sdk',
+          state: 'idle',
+          runtimeType: 'transport',
+          projectDir: '/tmp/project',
+        } as any]}
+        subSessions={[]}
+        serverId="srv-1"
+        onSend={onSend}
+      />,
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(0);
+
+    const input = container.querySelector('.controls-input') as HTMLDivElement;
+
+    // Open @ picker and pick combo mode, then blur back to voice-ready state
+    input.textContent = '@';
+    fireEvent.input(input);
+    const selectComboBtn = Array.from(document.querySelectorAll('button')).find((b) => b.textContent === 'mock-select-all-combo');
+    expect(selectComboBtn).toBeTruthy();
+    fireEvent.click(selectComboBtn!);
+    fireEvent.blur(input);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(input.getAttribute('contenteditable')).toBe('false');
+
+    // Speak during hold -> release -> P2P combo confirmation modal opens ('pending')
+    dispatchPointer(input, 'pointerdown', 180, 500, 2);
+    await vi.advanceTimersByTimeAsync(175);
+    voiceMock.listeningHandler?.(true);
+    voiceMock.partialHandler?.('团队语音任务');
+    dispatchPointer(input, 'pointerup', 180, 500, 2);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(300);
+
+    expect(document.body.textContent).toContain('p2p.combo_send_confirm_title');
+    expect(ws.sendSessionCommand).toHaveBeenCalledTimes(1); // only the prior failing call that threw
+
+    // Cancel combo confirmation -> restores dictated text, draft, contenteditable="true", and active focus
+    const cancelBtn = Array.from(document.querySelectorAll('button')).find((b) => b.textContent === 'common.cancel');
+    expect(cancelBtn).toBeTruthy();
+    fireEvent.click(cancelBtn!);
+
+    expect(document.body.textContent).not.toContain('p2p.combo_send_confirm_title');
+    expect(input.textContent).toBe('@@all(audit>review>plan) 团队语音任务');
+    expect(sessionStorage.getItem('rcc_draft_session:deck_combo_voice')).toBe('@@all(audit>review>plan) 团队语音任务');
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(document.activeElement).toBe(input);
+
+    // Confirmed combo rejected while upload in progress -> keeps text, warning, contenteditable="true", and active focus
+    let resolveUpload!: (value: { attachment: { daemonPath: string } }) => void;
+    uploadFileMock.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveUpload = resolve;
+    }));
+    fireEvent.paste(input, {
+      clipboardData: {
+        files: [new File(['combo'], 'combo.txt', { type: 'text/plain' })],
+        getData: () => '',
+      },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await Promise.resolve();
+
+    input.textContent = '@';
+    fireEvent.input(input);
+    const selectComboAgain = Array.from(document.querySelectorAll('button')).find((b) => b.textContent === 'mock-select-all-combo');
+    expect(selectComboAgain).toBeTruthy();
+    fireEvent.click(selectComboAgain!);
+    input.blur();
+    fireEvent.blur(input);
+    await vi.advanceTimersByTimeAsync(0);
+
+    dispatchPointer(input, 'pointerdown', 180, 500, 3);
+    await vi.advanceTimersByTimeAsync(175);
+    voiceMock.listeningHandler?.(true);
+    voiceMock.partialHandler?.('确认失败语音');
+    dispatchPointer(input, 'pointerup', 180, 500, 3);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(300);
+
+    expect(document.body.textContent).toContain('p2p.combo_send_confirm_title');
+    const confirmSendBtn = Array.from(document.querySelectorAll('.dialog button')).find((b) => b.textContent === 'common.send');
+    expect(confirmSendBtn).toBeTruthy();
+    fireEvent.click(confirmSendBtn!);
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledTimes(1);
+    expect(document.body.textContent).toContain('upload.uploading');
+    expect(input.textContent).toBe('@@all(audit>review>plan) 确认失败语音');
+    expect(sessionStorage.getItem('rcc_draft_session:deck_combo_voice')).toBe('@@all(audit>review>plan) 确认失败语音');
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(document.activeElement).toBe(input);
+
+    resolveUpload({ attachment: { daemonPath: '/tmp/combo.txt' } });
+    await Promise.resolve();
+    await Promise.resolve();
+    getUserPrefMock.mockResolvedValue(null);
   });
 });

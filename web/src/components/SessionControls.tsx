@@ -1420,6 +1420,8 @@ interface PendingComboSendConfirmation {
   clearComposer: boolean;
   retainOnRejection: boolean;
   onConfirmedAccepted?: () => void;
+  onConfirmedRejected?: () => void;
+  onCanceled?: () => void;
 }
 
 type ManualP2pTargetCandidate = {
@@ -3688,7 +3690,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     setMobileComposerMultiline(measuredScrollHeight > multilineThreshold);
   }, [serverId]);
 
-  const fillInput = (text: string) => {
+  const fillInput = useCallback((text: string) => {
     if (divRef.current) {
       setComposerElementText(divRef.current, text);
       focusComposerForTyping({ moveCursorToEnd: true });
@@ -3696,7 +3698,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     setHasText(!!text.trim());
     publishComposerText(text);
     syncMobileComposerMetrics();
-  };
+  }, [focusComposerForTyping, publishComposerText, syncMobileComposerMetrics]);
 
   const selectQuickSuggestion = (value: string) => {
     const activeHistory = getNavigableHistory(
@@ -5417,6 +5419,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       clearComposer?: boolean;
       retainOnRejection?: boolean;
       onConfirmedAccepted?: () => void;
+      onConfirmedRejected?: () => void;
+      onCanceled?: () => void;
     },
   ): 'accepted' | 'pending' | 'rejected' => {
     closeQuickSuggestions();
@@ -5436,6 +5440,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         clearComposer: !!options?.clearComposer,
         retainOnRejection: !!options?.retainOnRejection,
         onConfirmedAccepted: options?.onConfirmedAccepted,
+        onConfirmedRejected: options?.onConfirmedRejected,
+        onCanceled: options?.onCanceled,
       };
       pendingComboSendConfirmRef.current = confirmation;
       setPendingComboSendConfirm(confirmation);
@@ -5445,8 +5451,19 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [clearSendWarning, closeQuickSuggestions, finalizeSend, getSendValidationError, showSendWarning, skipComboSendConfirm, t]);
 
   const handleSend = useCallback(() => {
-    requestSend(buildSendPayload(), { clearComposer: true });
-  }, [buildSendPayload, requestSend]);
+    const outcome = requestSend(buildSendPayload(), { clearComposer: true });
+    if (outcome === 'rejected' && !inputDisabledRef.current && divRef.current) {
+      const el = divRef.current;
+      const active = typeof document !== 'undefined' ? document.activeElement : null;
+      if (
+        !composerFocusedRef.current
+        || el.getAttribute('contenteditable') !== 'true'
+        || active !== el
+      ) {
+        focusComposerForTyping({ moveCursorToEnd: true });
+      }
+    }
+  }, [buildSendPayload, focusComposerForTyping, requestSend]);
 
   const handleQuickAgentDelegationDispatch = useCallback((input: {
     sessionName: string;
@@ -5544,10 +5561,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [buildSendPayload, isCurrentSessionP2pMember, p2pSavedConfig, requestSend, rootSession, showSendWarning, t, workflowLibraryItems]);
 
   const handleComboSendCancel = useCallback(() => {
+    const pending = pendingComboSendConfirmRef.current;
     maybePersistComboSendSkip();
     pendingComboSendConfirmRef.current = null;
     setPendingComboSendConfirm(null);
     setRememberComboSendChoice(false);
+    pending?.onCanceled?.();
   }, [maybePersistComboSendSkip]);
 
   const handleComboSendConfirm = useCallback(() => {
@@ -5564,6 +5583,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       retainOnRejection: pending.retainOnRejection,
     });
     if (outcome === 'accepted') pending.onConfirmedAccepted?.();
+    else pending.onConfirmedRejected?.();
   }, [finalizeSend, maybePersistComboSendSkip]);
 
   const sendOpenSpecPrompt = useCallback((text: string) => {
@@ -5573,7 +5593,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // Voice is an alternate editor for the same composer, not a separate send
   // lane. Reuse the ordinary payload builder so the current attachment/quote/
   // routing snapshot is sent and cleared with the same success semantics.
-  const handleVoiceSend = useCallback((voiceText: string) => {
+  const handleVoiceSend = useCallback((
+    voiceText: string,
+    options?: {
+      onRejected?: () => void;
+      onPendingCanceled?: () => void;
+    },
+  ) => {
     return requestSend(buildSendPayload({ textOverride: voiceText }), {
       clearComposer: true,
       retainOnRejection: true,
@@ -5582,6 +5608,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         setVoiceOverlayInitialText(null);
         setVoiceOverlayAutoStart(true);
       },
+      onConfirmedRejected: options?.onRejected,
+      onCanceled: options?.onPendingCanceled,
     });
   }, [buildSendPayload, requestSend]);
 
@@ -5840,6 +5868,32 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     });
   }, [clearVoiceHoldDropTimer]);
 
+  const restoreVoiceHoldToComposer = useCallback((text: string, protectTouchCompat = false) => {
+    if (!mountedRef.current) return;
+    suppressComposerClickFocusRef.current = false;
+    if (suppressComposerClickTimerRef.current !== null) {
+      clearTimeout(suppressComposerClickTimerRef.current);
+      suppressComposerClickTimerRef.current = null;
+    }
+    if (protectTouchCompat && !inputDisabledRef.current) {
+      armTouchTapCompatMouseShield();
+    }
+    fillInput(text);
+    syncHistoryEditOrDraft(
+      text,
+      getNavigableHistory(quickData.data, activeSessionIncognito ? undefined : activeSession?.name),
+    );
+    if (draftKey) safeSessionStorageSetItem(draftKey, text);
+  }, [
+    activeSession?.name,
+    activeSessionIncognito,
+    armTouchTapCompatMouseShield,
+    draftKey,
+    fillInput,
+    quickData.data,
+    syncHistoryEditOrDraft,
+  ]);
+
   const finalizeVoiceHold = useCallback((
     tx: NonNullable<typeof voiceHoldTxRef.current>,
     outcome: 'send' | 'cancel' | 'edit' | 'failed',
@@ -5987,7 +6041,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           tx.settled = true;
           tx.phase = 'settled';
           closeVoiceHoldHud();
-          handleVoiceSend(combined.trim());
+          const finalText = combined.trim();
+          const restoreFromModal = () => restoreVoiceHoldToComposer(finalText, false);
+          const sendOutcome = handleVoiceSend(finalText, {
+            onRejected: restoreFromModal,
+            onPendingCanceled: restoreFromModal,
+          });
+          if (sendOutcome === 'rejected') {
+            restoreVoiceHoldToComposer(finalText, tx.pointerType === 'touch');
+          }
           return;
         }
         tx.settled = true;
@@ -6018,6 +6080,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     handleVoiceSend,
     releaseVoiceHoldInteraction,
     resetVoiceHoldInteractionState,
+    restoreVoiceHoldToComposer,
     waitForVoiceHoldDrop,
   ]);
 
