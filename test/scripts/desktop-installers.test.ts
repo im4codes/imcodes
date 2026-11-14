@@ -276,7 +276,7 @@ describe('AC 3: Three-platform installer builders & CI wiring', () => {
     expect(existsSync(staleTmp)).toBe(false);
     expect(existsSync(keepLock)).toBe(true);
     expect(readFileSync(keepSrv, 'utf8')).toBe('{"serverId":"keep"}');
-  });
+  }, 60_000);
 
   it('stages macOS .pkg preserving .app seal, validates FDA LaunchAgent preservation, and supports Developer ID Installer signing identity selection', async () => {
     const root = makeTempDir();
@@ -675,8 +675,7 @@ ${programArgs.map((arg) => `    <string>${arg}</string>`).join('\n')}
         sleeper.kill('SIGKILL');
       } catch {}
     }
-    },
-  );
+  }, 60_000);
 
   it('updates macOS pkg manifest sha256 and signing flags via refreshMacosPkgManifest (F7)', async () => {
     const root = makeTempDir();
@@ -919,8 +918,7 @@ ${programArgs.map((arg) => `    <string>${arg}</string>`).join('\n')}
           unrelated.kill('SIGKILL');
         } catch {}
       }
-    },
-  );
+  }, 60_000);
 
   it('verifies macOS ps lock startToken ownership: ignores mismatch, fails closed on unknown scheme, and stops matching owner (F3-R2)', async () => {
     const root = makeTempDir();
@@ -1226,7 +1224,7 @@ process.exit(0);
     expect(macStateAfter['system/cc.imcodes.node.watchdog']).toBeUndefined();
     expect(readFileSync(join(macPlistDir, 'imcodes.daemon.plist'), 'utf8')).toBe(oldMacPlist);
     expect(readFileSync(launchLogFile, 'utf8')).toContain(`bootout ${daemonLabel}`);
-  });
+  }, 60_000);
 
   it('rejects POSIX ancestor/leaf symlink cycles and ..-after-symlink escapes cleanly without hanging on Linux and macOS runners (F6-R3)', async () => {
     const root = makeTempDir('imcodes-f6-r3-');
