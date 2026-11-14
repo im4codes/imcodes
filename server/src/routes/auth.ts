@@ -22,6 +22,7 @@ import logger from '../util/logger.js';
 import { CLIENT_TIMEZONE_HEADER } from '../../../shared/http-header-names.js';
 import { rememberClientTimezone } from '../util/client-timezone.js';
 import { revokeBrowserAccountSession } from '../services/remote-desktop-account-auth.js';
+import { r2RelayConfig } from '../services/r2-relay.js';
 
 export const authRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -224,10 +225,11 @@ authRoutes.get('/user/me', async (c) => {
     logger.warn({ err, userId }, 'Failed to remember client timezone');
   });
   const clientUser = toClientUser(user);
+  const r2RelayEnabled = r2RelayConfig(c.env) !== null;
   return c.json(
     resolution.auth?.scope === 'doc_collaborator' && clientUser
-      ? { ...clientUser, scope: 'doc_collaborator' as const }
-      : clientUser,
+      ? { ...clientUser, scope: 'doc_collaborator' as const, r2RelayEnabled }
+      : { ...clientUser, r2RelayEnabled },
   );
 });
 

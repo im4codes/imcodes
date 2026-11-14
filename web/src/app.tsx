@@ -1,4 +1,5 @@
 import { R2RelayToggle } from './components/R2RelayToggle.js';
+import { setFileRelayUser, setServerR2RelayEnabled } from './r2-relay-preference.js';
 import { DesktopAuthBridge } from './pages/DesktopAuthBridge.js';
 import { DESKTOP_SETUP_CALLBACK_QUERY_PARAM, parseDesktopSetupCallbackUrl } from '@shared/desktop-setup-auth.js';
 import { focusComposerElement } from './util/composer-focus.js';
@@ -1045,6 +1046,8 @@ function InternalMainApp() {
     setOpeningSharedEntryId(null);
     clearApiKey();
     configureExpectedUserId(null);
+    setFileRelayUser(null);
+    setServerR2RelayEnabled(false);
     localStorage.removeItem('rcc_auth');
     localStorage.removeItem('rcc_server');
     localStorage.removeItem('rcc_server_name');
@@ -1119,17 +1122,21 @@ function InternalMainApp() {
     setNativeServerUrl(url);
     configureApi(url);
     configureExpectedUserId(null);
+    setFileRelayUser(null);
+    setServerR2RelayEnabled(false);
     clearApiKey();
     try {
       const storedKey = await getAuthKey(url);
       if (!storedKey || !attempt.isCurrent()) return;
       configureApiKey(storedKey);
       try {
-        const user = await apiFetch<{ id: string }>('/api/auth/user/me');
+        const user = await apiFetch<{ id: string; r2RelayEnabled?: boolean }>('/api/auth/user/me');
         if (!attempt.isCurrent()) return;
         const authState: AuthState = { userId: user.id, baseUrl: url };
         authMutationGenerationRef.current += 1;
         configureExpectedUserId(user.id);
+        setFileRelayUser(user.id);
+        setServerR2RelayEnabled(user.r2RelayEnabled === true);
         localStorage.setItem('rcc_auth', JSON.stringify(authState));
         setAuth(authState);
       } catch (err) {
@@ -1625,11 +1632,13 @@ function InternalMainApp() {
         if (storedKey && isCurrentAuthGeneration()) {
           configureApiKey(storedKey);
           try {
-            const user = await apiFetch<{ id: string }>('/api/auth/user/me');
+            const user = await apiFetch<{ id: string; r2RelayEnabled?: boolean }>('/api/auth/user/me');
             if (!isCurrentAuthGeneration()) return;
             const authState: AuthState = { userId: user.id, baseUrl: url! };
             authMutationGenerationRef.current += 1;
             configureExpectedUserId(user.id);
+            setFileRelayUser(user.id);
+            setServerR2RelayEnabled(user.r2RelayEnabled === true);
             localStorage.setItem('rcc_auth', JSON.stringify(authState));
             setAuth(authState);
           } catch (err) {
@@ -1747,7 +1756,7 @@ function InternalMainApp() {
     const baseUrl = window.location.origin;
     configureApi(baseUrl);
     console.warn('[auth] mount: verifying session via /api/auth/user/me');
-    void apiFetch<{ id: string; scope?: 'doc_collaborator' | null }>('/api/auth/user/me').then((user) => {
+    void apiFetch<{ id: string; scope?: 'doc_collaborator' | null; r2RelayEnabled?: boolean }>('/api/auth/user/me').then((user) => {
       console.warn(`[auth] /me OK: userId=${user.id}`);
       if (user.scope === 'doc_collaborator') {
         setIsDocCollaborator(true);
@@ -1763,6 +1772,8 @@ function InternalMainApp() {
       const authState: AuthState = { userId: user.id, baseUrl };
       authMutationGenerationRef.current += 1;
       configureExpectedUserId(user.id);
+      setFileRelayUser(user.id);
+      setServerR2RelayEnabled(user.r2RelayEnabled === true);
       localStorage.setItem('rcc_auth', JSON.stringify(authState));
       setAuth((prev) => {
         if (prev && prev.userId === authState.userId && prev.baseUrl === authState.baseUrl) return prev;
@@ -6407,6 +6418,8 @@ function InternalMainApp() {
     clearMessagePinsCache();
     clearMessagePinNavigation();
     configureExpectedUserId(null);
+    setFileRelayUser(null);
+    setServerR2RelayEnabled(false);
     setAuth(null);
     authRef.current = null;
     setSharedEntries([]);
@@ -7291,12 +7304,21 @@ function InternalMainApp() {
         serverUrl={nativeServerUrl}
         beginAuthAttempt={beginAuthAttempt}
         sessionNotStuck={sessionNotStuck}
-        onLoginSuccess={(userId, url) => {
+        onLoginSuccess={(userId, url, r2RelayEnabled) => {
           const authState: AuthState = { userId, baseUrl: url };
-          authMutationGenerationRef.current += 1;
+          const nextGeneration = authMutationGenerationRef.current + 1;
+          authMutationGenerationRef.current = nextGeneration;
           configureExpectedUserId(userId);
+          setFileRelayUser(userId);
+          setServerR2RelayEnabled(r2RelayEnabled === true);
           localStorage.setItem('rcc_auth', JSON.stringify(authState));
           setAuth(authState);
+          if (r2RelayEnabled === undefined) {
+            void apiFetch<{ id: string; r2RelayEnabled?: boolean }>('/api/auth/user/me').then((me) => {
+              if (authMutationGenerationRef.current !== nextGeneration || me.id !== userId) return;
+              setServerR2RelayEnabled(me.r2RelayEnabled === true);
+            }).catch(() => { /* fail-closed false already set */ });
+          }
         }}
         onChangeServer={isNative() ? handleChangeServer : undefined}
       />

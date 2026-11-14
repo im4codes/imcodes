@@ -580,3 +580,54 @@ describe('Security headers on HTML responses', () => {
     expect(source).toContain('...SECURITY_HEADERS');
   });
 });
+
+describe('/api/auth/user/me r2RelayEnabled capability', () => {
+  it('returns false when R2 relay is unconfigured or invalid, and true without leaking credentials when configured', async () => {
+    const { signJwt } = await import('../src/security/crypto.js');
+    const r2Env = {
+      USE_R2_RELAY: 'true',
+      R2_ACCOUNT_ID: 'a'.repeat(32),
+      R2_BUCKET: 'private-staging',
+      R2_ACCESS_KEY_ID: 'r2-access-key-test',
+      R2_SECRET_ACCESS_KEY: 'r2-secret-key-test',
+    };
+
+    for (const override of [
+      {},
+      { ...r2Env, USE_R2_RELAY: 'false' },
+      { USE_R2_RELAY: 'true', R2_ACCOUNT_ID: '../invalid' },
+      { ...r2Env, R2_SECRET_ACCESS_KEY: undefined },
+    ]) {
+      const env = { ...makeEnv(), ...override };
+      const app = buildApp(env);
+      const registered = await app.request('/api/auth/register', { method: 'POST' });
+      const { userId } = await registered.json() as { userId: string };
+      const token = signJwt({ sub: userId }, env.JWT_SIGNING_KEY, 60);
+      const res = await app.request('/api/auth/user/me', { headers: { Authorization: `Bearer ${token}` } });
+      expect(res.status).toBe(200);
+      const body = await res.json() as Record<string, unknown>;
+      expect(body.r2RelayEnabled).toBe(false);
+    }
+
+    const configuredEnv = { ...makeEnv(), ...r2Env };
+    const configuredApp = buildApp(configuredEnv);
+    const regConfigured = await configuredApp.request('/api/auth/register', { method: 'POST' });
+    const { userId: configuredUserId } = await regConfigured.json() as { userId: string };
+    const configuredToken = signJwt({ sub: configuredUserId }, configuredEnv.JWT_SIGNING_KEY, 60);
+    const configuredRes = await configuredApp.request('/api/auth/user/me', {
+      headers: { Authorization: `Bearer ${configuredToken}` },
+    });
+    expect(configuredRes.status).toBe(200);
+    const text = await configuredRes.text();
+    const parsed = JSON.parse(text) as Record<string, unknown>;
+    expect(parsed.r2RelayEnabled).toBe(true);
+    expect(text).not.toContain(r2Env.R2_ACCOUNT_ID);
+    expect(text).not.toContain(r2Env.R2_BUCKET);
+    expect(text).not.toContain(r2Env.R2_ACCESS_KEY_ID);
+    expect(text).not.toContain(r2Env.R2_SECRET_ACCESS_KEY);
+    expect('R2_ACCOUNT_ID' in parsed).toBe(false);
+    expect('R2_BUCKET' in parsed).toBe(false);
+    expect('R2_ACCESS_KEY_ID' in parsed).toBe(false);
+    expect('R2_SECRET_ACCESS_KEY' in parsed).toBe(false);
+  });
+});

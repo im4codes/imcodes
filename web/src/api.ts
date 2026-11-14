@@ -1,6 +1,6 @@
 import { beginDownloadTransfer, reportR2Preparation, completeDownloadTransfer, failDownloadTransfer } from './download-transfer-store.js';
 import { FILE_RELAY_MODE, R2_RELAY_API, R2_RELAY_PHASE, R2_RELAY_ERROR, type R2RelayProgress, type R2RelayReady } from '@shared/r2-relay.js';
-import { readFileRelayMode, setFileRelayUser } from './r2-relay-preference.js';
+import { isServerR2RelayEnabled, readFileRelayMode, setFileRelayUser } from './r2-relay-preference.js';
 /**
  * Fetch wrapper with cookie-based auth for the IM.codes API.
  * Credentials are sent automatically via HttpOnly cookie.
@@ -1843,6 +1843,7 @@ export interface MeResponse {
   status: string;
   has_password: boolean;
   scope?: 'doc_collaborator' | null;
+  r2RelayEnabled?: boolean;
 }
 
 export async function fetchMe(): Promise<MeResponse> {
@@ -3576,7 +3577,7 @@ export function buildDocAuthRelayUrl(
 }
 
 export function isR2RelaySelected(): boolean {
-  return readFileRelayMode(getExpectedUserId()) === FILE_RELAY_MODE.R2;
+  return isServerR2RelayEnabled() && readFileRelayMode(getExpectedUserId()) === FILE_RELAY_MODE.R2;
 }
 export async function tryUploadR2File(serverId: string, file: File, onProgress?: (pct: number) => void,
   clientUploadId?: string, signal?: AbortSignal, sessionName?: string, destinationDirectory?: string,

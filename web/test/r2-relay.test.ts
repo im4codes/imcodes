@@ -1,17 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { FILE_RELAY_MODE, R2_RELAY_PHASE } from '@shared/r2-relay.js';
-import { saveFileRelayMode, readFileRelayMode } from '../src/r2-relay-preference.js';
+import { saveFileRelayMode, readFileRelayMode, setServerR2RelayEnabled } from '../src/r2-relay-preference.js';
 import { configureExpectedUserId, prepareR2AttachmentDownload, tryUploadR2File, isR2RelaySelected, downloadAttachment, uploadFile } from '../src/api.js';
 import { beginDownloadTransfer, getDownloadTransfers, __resetDownloadTransfersForTests, cancelDownloadTransfer,
   reportR2Preparation, updateDownloadTransfer, reportDownloadTransferProgress, DOWNLOAD_TRANSFER_ROUTE, DOWNLOAD_TRANSFER_STATUS } from '../src/download-transfer-store.js';
 import { createDownloadTransferWiring } from '../src/download-transfer-wiring.js';
 const fetchMock = vi.fn();
 beforeEach(() => {
-  localStorage.clear(); configureExpectedUserId('user-a'); fetchMock.mockReset();
+  localStorage.clear(); configureExpectedUserId('user-a'); setServerR2RelayEnabled(true); fetchMock.mockReset();
   vi.stubGlobal('fetch', fetchMock); vi.stubGlobal('Headers', new Response().headers.constructor);
   __resetDownloadTransfersForTests();
 });
-afterEach(() => { __resetDownloadTransfersForTests(); configureExpectedUserId(null); vi.unstubAllGlobals(); });
+afterEach(() => { __resetDownloadTransfersForTests(); setServerR2RelayEnabled(false); configureExpectedUserId(null); vi.unstubAllGlobals(); });
 describe('R2 user routing and progress', () => {
   it('defaults to direct and does not request R2 or emit phases when disabled', async () => {
     const progress = vi.fn();
@@ -194,5 +194,20 @@ describe('R2 user routing and progress', () => {
     expect(instances[0]!.aborted).toBe(true);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0]![0]).toContain('/r2-relay/uploads');
+  });
+
+  it('disables R2 selection fail-closed when backend omits or disables r2RelayEnabled while preserving opt-in', async () => {
+    saveFileRelayMode('user-a', FILE_RELAY_MODE.R2);
+    expect(isR2RelaySelected()).toBe(true);
+
+    setServerR2RelayEnabled(false);
+    expect(isR2RelaySelected()).toBe(false);
+    expect(readFileRelayMode('user-a')).toBe(FILE_RELAY_MODE.R2);
+    expect(await prepareR2AttachmentDownload('srv', 'abc')).toBeNull();
+    expect(await tryUploadR2File('srv', new File(['x'], 'a.txt'))).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    setServerR2RelayEnabled(true);
+    expect(isR2RelaySelected()).toBe(true);
   });
 });

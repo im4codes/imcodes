@@ -26,7 +26,7 @@ export interface LoginAuthAttempt {
 interface Props {
   onLogin?: () => void;
   serverUrl?: string | null;
-  onLoginSuccess?: (userId: string, serverUrl: string) => void;
+  onLoginSuccess?: (userId: string, serverUrl: string, r2RelayEnabled?: boolean) => void;
   onChangeServer?: () => void | Promise<void>;
   beginAuthAttempt?: () => LoginAuthAttempt;
   /** Initial surface for a trusted same-origin flow such as invite resumption. */
@@ -476,9 +476,9 @@ export function LoginPage({
         if (key) {
           // Re-resolve userId from /me endpoint
           const { apiFetch } = await import('../api.js');
-          const me = await apiFetch<{ id: string }>('/api/auth/user/me');
+          const me = await apiFetch<{ id: string; r2RelayEnabled?: boolean }>('/api/auth/user/me');
           if (!attempt.isCurrent()) return;
-          onLoginSuccess?.(me.id, serverUrl);
+          onLoginSuccess?.(me.id, serverUrl, me.r2RelayEnabled === true);
           return;
         }
       }
