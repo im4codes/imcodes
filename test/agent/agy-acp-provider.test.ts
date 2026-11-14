@@ -12,6 +12,7 @@ import path from 'node:path';
 import { AgyAcpProvider, createAgyProvider, supportsAgyAcp } from '../../src/agent/providers/agy-acp.js';
 import { AgySdkProvider, resolveAgyBinary } from '../../src/agent/providers/agy-sdk.js';
 import { AGENT_DELEGATION_NOTIFICATION_RESULTS } from '../../shared/agent-delegation.js';
+import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../shared/memory-mcp-contracts.js';
 import { PROVIDER_ERROR_CODES, normalizeProviderPayload } from '../../src/agent/transport-provider.js';
 import { AGY_NATIVE_START_NOT_ATTEMPTED } from '../../shared/agy-agent.js';
 import { SESSION_MODEL_APPLIED } from '../../shared/session-model-control.js';
@@ -1129,10 +1130,14 @@ describe('AG native ACP', () => {
       await vi.waitFor(() => {
         const snap = provider.getActiveWorkSnapshot(id);
         expect(snap?.activeWorkCount).toBe(1);
+        expect(snap?.backgroundWorkCount).toBe(1);
+        expect(snap?.activeToolCount).toBe(0);
         expect(snap?.busyReasons).toContain('background_monitor');
+        expect(snap?.busyReasons).not.toContain('open_tool_call');
       }, { timeout: 5000 });
-      expect(runtime.getActivitySnapshot().blockingWorkCount).toBeGreaterThan(0);
-      expect(runtime.getStatus()).toBe('tool_running');
+      expect(runtime.getActivitySnapshot().blockingWorkCount).toBe(0);
+      expect(runtime.getActivitySnapshot().backgroundWorkCount).toBe(1);
+      expect(runtime.getStatus()).toBe('idle');
 
       // Completion SYSTEM_MESSAGE + reactive PLANNER_RESPONSE settles back to idle.
       await appendFile(
@@ -1183,8 +1188,17 @@ describe('AG native ACP', () => {
         }) + '\n',
       );
 
-      await vi.waitFor(() => expect(provider.getActiveWorkSnapshot(id)?.activeWorkCount).toBe(1), { timeout: 5000 });
-      await vi.waitFor(() => expect(runtime.getStatus()).toBe('tool_running'), { timeout: 5000 });
+      await vi.waitFor(() => {
+        expect(provider.getActiveWorkSnapshot(id)).toMatchObject({
+          activeWorkCount: 1,
+          backgroundWorkCount: 1,
+          activeToolCount: 0,
+          busyReasons: ['background_monitor'],
+        });
+      }, { timeout: 5000 });
+      expect(runtime.getActivitySnapshot().blockingWorkCount).toBe(0);
+      expect(runtime.getActivitySnapshot().backgroundWorkCount).toBe(1);
+      expect(runtime.getStatus()).toBe('idle');
 
       await appendFile(
         file,
@@ -1197,8 +1211,9 @@ describe('AG native ACP', () => {
       );
 
       await vi.waitFor(() => expect(provider.getActiveWorkSnapshot(id)?.activeWorkCount).toBe(0), { timeout: 5000 });
-      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 5000 });
-      expect(statuses).toContain('tool_running');
+      await vi.waitFor(() => expect(runtime.getActivitySnapshot().backgroundWorkCount).toBe(0), { timeout: 5000 });
+      expect(runtime.getStatus()).toBe('idle');
+      expect(statuses).not.toContain('tool_running');
     } finally {
       await runtime.kill();
     }
@@ -1674,5 +1689,88 @@ rl.on('line', (line) => {
 
     await provider.send(id, 'follow up');
     await vi.waitFor(() => expect(completed).toHaveLength(2), { timeout: 5000 });
+  });
+
+  it('dispatches plain-text append sends immediately while background tasks run with !promptInFlight', async () => {
+    resetTransportQueueStoreForTests();
+    const { provider } = await setup();
+    const id = 'deck_test_agy_bg_append';
+    const completed: Array<{ content: string }> = [];
+    const runtime = new TransportSessionRuntime(provider, id);
+    provider.onComplete((sid, msg) => { if (sid === id) completed.push({ content: msg.content }); });
+    await runtime.initialize({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-a' });
+    try {
+      expect(runtime.send('warm', 'warm-1')).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+
+      const state = (provider as any).sessions.get(id);
+      const nativeId = state.acpSessionId as string;
+      expect(state.promptInFlight).toBe(false);
+      (provider as any).updateAgyBackgroundTasks(id, state, {
+        text: `Tool is running as a background task with task id: ${nativeId}/task-bg-append`,
+        toolName: 'run_command',
+      });
+
+      const snap = provider.getActiveWorkSnapshot(id);
+      expect(snap).toMatchObject({
+        activeWorkCount: 1,
+        backgroundWorkCount: 1,
+        activeToolCount: 0,
+        busyReasons: ['background_monitor'],
+      });
+      expect(runtime.getActivitySnapshot().blockingWorkCount).toBe(0);
+
+      expect(runtime.send('plain append while bg runs', 'bg-plain-1', undefined, undefined, {
+        deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+      })).toBe('sent');
+      await vi.waitFor(() => expect(completed).toHaveLength(2), { timeout: 5000 });
+      expect(runtime.pendingEntries).toEqual([]);
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('clears provisional ACP tools on useAgyNativeOutput and ignores status-less late tool_call_update when idle', async () => {
+    const { provider } = await setup();
+    const id = await route(provider);
+    const completed: Array<{ content: string }> = [];
+    provider.onComplete((_sid, msg) => completed.push({ content: msg.content }));
+
+    await provider.send(id, 'warm');
+    await vi.waitFor(() => expect(completed).toHaveLength(1), { timeout: 5000 });
+
+    const state = (provider as any).sessions.get(id);
+    const nativeId = state.acpSessionId as string;
+    (provider as any).handleSessionUpdate({
+      sessionId: nativeId,
+      update: {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'provisional-tool',
+        title: 'Bash',
+        status: 'in_progress',
+      },
+    });
+    expect(state.promptInFlight).toBe(true);
+    expect(state.toolCalls.size).toBe(1);
+
+    (provider as any).useAgyNativeOutput(state);
+    expect(state.promptInFlight).toBe(false);
+    expect(state.toolCalls.size).toBe(0);
+
+    (provider as any).handleSessionUpdate({
+      sessionId: nativeId,
+      update: {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'late-statusless-tool',
+        rawOutput: 'late output',
+      },
+    });
+
+    expect(provider.getActiveWorkSnapshot(id)).toMatchObject({
+      activeWorkCount: 0,
+      backgroundWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
   });
 });

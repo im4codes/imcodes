@@ -593,8 +593,11 @@ export class KimiSdkProvider implements TransportProvider {
       ? (state.agyBackgroundTasks?.size ?? 0)
       : 0;
     const activeToolCount = [...state.toolCalls.values()]
-      .filter((tool) => tool.status === 'pending' || tool.status === 'in_progress').length + backgroundTaskCount;
-    const activeWorkCount = Number(state.promptInFlight) + Number(state.replaying) + pendingApprovalCount + backgroundTaskCount;
+      .filter((tool) => tool.status === 'pending' || tool.status === 'in_progress').length;
+    const orphanToolCount = !state.promptInFlight && !state.replaying && pendingApprovalCount === 0
+      ? activeToolCount
+      : 0;
+    const activeWorkCount = Number(state.promptInFlight) + Number(state.replaying) + pendingApprovalCount + backgroundTaskCount + orphanToolCount;
     const busyReasons: ProviderActiveWorkSnapshot['busyReasons'] = [];
     if (state.promptInFlight || pendingApprovalCount > 0) busyReasons.push('provider_wait');
     if (state.replaying) busyReasons.push('provider_session_binding');
@@ -603,6 +606,7 @@ export class KimiSdkProvider implements TransportProvider {
     return {
       status: 'current',
       activeWorkCount,
+      ...(this.id === AGY_SDK_PROVIDER_ID ? { backgroundWorkCount: backgroundTaskCount } : {}),
       activeToolCount,
       busyReasons,
       providerDiagnosticGeneration: state.acpSessionId ?? null,
@@ -909,7 +913,13 @@ export class KimiSdkProvider implements TransportProvider {
     if (state.autonomousTurnGeneration !== undefined && !state.agyBridging) {
       state.agyProvisionalAutoMessageId = state.currentMessageId ?? undefined;
       state.activePromptGenerations?.delete(state.autonomousTurnGeneration);
-      state.autonomousTurnGeneration = undefined; state.promptInFlight = false;
+      state.autonomousTurnGeneration = undefined;
+      if ((state.activePromptGenerations?.size ?? 0) === 0) {
+        state.promptInFlight = false;
+        state.promptSubmittedGeneration = null;
+        state.toolCalls.clear();
+        state.emittedToolSignatures.clear();
+      }
       state.currentText = ''; state.currentMessageId = null;
       this.steeringRunTerminals.get(state)?.complete();
     }
@@ -2919,7 +2929,7 @@ export class KimiSdkProvider implements TransportProvider {
       toolCallId: update.toolCallId,
       title: update.title ?? update.toolCallId,
       kind: update.kind ?? undefined,
-      status: update.status ?? 'pending',
+      status: update.status ?? (state.promptInFlight ? 'pending' : 'completed'),
       content: [],
     };
     if (typeof update.title === 'string') merged.title = update.title;

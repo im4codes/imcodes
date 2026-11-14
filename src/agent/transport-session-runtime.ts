@@ -2898,7 +2898,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     const nativeAppendRequested = metadata?.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
       && this.provider.capabilities.activeDelegationNotification === AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE
       && !!this.provider.notifyActiveDelegation
-      && (attachments?.length ?? 0) === 0
+      && !this.hasUnsupportedAppendAttachments(attachments)
       && !isDelegationUnsupportedControlText(message);
     const entry: PendingTransportMessage = {
       clientMessageId: resolvedClientMessageId,
@@ -2918,7 +2918,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       ...(metadata?.historyCommitted ? { historyCommitted: true } : {}),
       ...(nativeAppendRequested ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND } : {}),
       ...(metadata?.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND && !nativeAppendRequested
-        ? { appendFallbackReason: (attachments?.length ?? 0) > 0
+        ? { appendFallbackReason: this.hasUnsupportedAppendAttachments(attachments)
           ? TRANSPORT_APPEND_FALLBACK_REASONS.ATTACHMENTS_UNSUPPORTED
           : isDelegationUnsupportedControlText(message)
             ? TRANSPORT_APPEND_FALLBACK_REASONS.CONTROL_UNSUPPORTED
@@ -3299,7 +3299,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     // content. Publish a confirmed side effect immediately: later rejection,
     // withdrawal, timeout or Stop must never replay already-admitted ids.
     const needsOwnAdmission = (entry: PendingTransportMessage): boolean => entry.commandMode === true
-      || isDelegationUnsupportedControlText(entry.text) || (entry.attachments?.length ?? 0) > 0;
+      || isDelegationUnsupportedControlText(entry.text) || this.hasUnsupportedAppendAttachments(entry.attachments);
     if (selected.length > 1 && selected.some(needsOwnAdmission)) {
       let remaining = selected;
       const capturedProviderSession = this._providerSessionId;
@@ -3360,7 +3360,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       for (const { entry } of rejected) this.removePendingMessage(entry.clientMessageId);
       return { status: 'rejected' };
     }
-    if (selected.some((entry) => (entry.attachments?.length ?? 0) > 0)) {
+    if (selected.some((entry) => this.hasUnsupportedAppendAttachments(entry.attachments))) {
       return { status: 'attachments_unsupported' };
     }
     if (selected.some((entry) => isDelegationUnsupportedControlText(entry.text))) {
@@ -5349,6 +5349,11 @@ export class TransportSessionRuntime implements SessionRuntime {
       return false;
     }
     return this.providerWorkBreakdown(snapshot).turnWorkCount > 0;
+  }
+
+  /** Structured attachments block active-turn append only when the provider carries them natively (`capabilities.attachments === true`). */
+  private hasUnsupportedAppendAttachments(attachments?: readonly TransportAttachment[]): boolean {
+    return Boolean(this.provider.capabilities.attachments && (attachments?.length ?? 0) > 0);
   }
 
   private ownsActiveAppendFlush(dispatchId: number | null): boolean {

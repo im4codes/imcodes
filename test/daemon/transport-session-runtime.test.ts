@@ -1043,6 +1043,7 @@ describe('TransportSessionRuntime', () => {
       });
 
       it('does not dispatch attachment rows as a new turn on this path', async () => {
+        mock.provider.capabilities.attachments = true;
         runtime.send('foreground work', 'foreground-attach');
         await waitForProviderSendCount(mock.provider, 1);
         expect(runtime.send('has attachment', 'q-attach', [
@@ -1168,6 +1169,7 @@ describe('TransportSessionRuntime', () => {
     expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
   });
 
+
   it('directly appends an external MCP message without creating a pending queue row', async () => {
     mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
     mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
@@ -1187,6 +1189,7 @@ describe('TransportSessionRuntime', () => {
     expect(runtime.pendingEntries).toEqual([]);
     expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
   });
+
 
   it.each([
     ['delegation completion', 'delegation-reply-real-queue', 'delegation completed'],
@@ -1429,6 +1432,7 @@ describe('TransportSessionRuntime', () => {
     mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(reason === 'refused'
       ? AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE : AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
     if (reason === 'provider') mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.UNSUPPORTED;
+    if (reason === 'attachments') mock.provider.capabilities.attachments = true;
     runtime.send('old turn', 'stop-kind-old');
     await waitForProviderSendCount(mock.provider, 1);
     await flushDispatch();
@@ -1853,6 +1857,7 @@ describe('TransportSessionRuntime', () => {
     expect(runtime.pendingEntries).toEqual([]);
     expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
   });
+
 
   it('continues the accepted APPEND flush past a retry head without tombstoning it', async () => {
     mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
@@ -2366,6 +2371,7 @@ describe('TransportSessionRuntime', () => {
     expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
   });
 
+
   it('keeps queued messages intact when active-turn append is unsupported', async () => {
     mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.UNSUPPORTED;
     runtime.send('foreground work', 'foreground-unsupported');
@@ -2383,8 +2389,9 @@ describe('TransportSessionRuntime', () => {
     ]);
   });
 
-  it('rejects queued attachments without steering or removing them', async () => {
+  it('rejects queued attachments without steering or removing them when provider handles structured attachments', async () => {
     mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.capabilities.attachments = true;
     mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
     runtime.send('foreground work', 'foreground-attachment');
     await flushDispatch();
@@ -2404,6 +2411,74 @@ describe('TransportSessionRuntime', () => {
     expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([
       expect.objectContaining({ clientMessageId: 'queued-attachment', status: 'queued' }),
     ]);
+  });
+
+  it('keeps appendFallbackReason attachments_unsupported on send() when provider handles structured attachments', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.capabilities.attachments = true;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('foreground work', 'foreground-send-attach-true');
+    await waitForProviderSendCount(mock.provider, 1);
+    await flushDispatch();
+
+    expect(runtime.send('#1:(/tmp/append.png)\ncheck', 'queued-send-attach-true', [
+      { id: 'att-send-true', daemonPath: '/tmp/append.png', originalName: 'append.png', type: 'image' },
+    ], undefined, { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND })).toBe('queued');
+    await flushDispatch();
+
+    expect(mock.provider.notifyActiveDelegation).not.toHaveBeenCalled();
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([
+      expect.objectContaining({
+        clientMessageId: 'queued-send-attach-true',
+        appendFallbackReason: 'attachments_unsupported',
+        status: 'queued',
+      }),
+    ]);
+  });
+
+  it('admits active-turn append for text-inlined attachments on both auto-flush and manual append when capabilities.attachments is false', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.capabilities.attachments = false;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('foreground work', 'foreground-text-inlined');
+    await waitForProviderSendCount(mock.provider, 1);
+    await flushDispatch();
+
+    expect(runtime.send('#1:(/tmp/append.png)\nlook at this', 'auto-text-inlined', [
+      { id: 'att-inlined-1', daemonPath: '/tmp/append.png', originalName: 'append.png', type: 'image' },
+    ], undefined, { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND })).toBe('queued');
+
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline
+      && ((mock.provider.notifyActiveDelegation as ReturnType<typeof vi.fn>).mock.calls.length < 1
+        || runtime.pendingEntries.length > 0
+        || getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries.length > 0)) {
+      await flushDispatch();
+    }
+
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      notificationId: 'auto-text-inlined',
+      text: '#1:(/tmp/append.png)\nlook at this',
+    }));
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
+
+    expect(runtime.send('#1:(/tmp/manual.png)\nmanual steer', 'manual-text-inlined', [
+      { id: 'att-inlined-2', daemonPath: '/tmp/manual.png', originalName: 'manual.png', type: 'image' },
+    ])).toBe('queued');
+
+    const manualResult = await runtime.appendPendingMessagesToActiveTurn(['manual-text-inlined'], 'append-manual-inlined');
+
+    expect(manualResult).toMatchObject({
+      status: 'delivered',
+      entries: [expect.objectContaining({ clientMessageId: 'manual-text-inlined' })],
+    });
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      notificationId: 'append-manual-inlined',
+      text: '#1:(/tmp/manual.png)\nmanual steer',
+    }));
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
   });
 
   it('rejects queued slash controls without steering or removing them', async () => {
@@ -7976,6 +8051,7 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.pendingEntries).toEqual([]);
     expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
   });
+
 
   it('cancels a stale active turn once so queued messages drain without waiting for the cancel callback', async () => {
     runtime.send('first', 'cmd-first');
