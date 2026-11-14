@@ -687,11 +687,28 @@ function appendComposerNewline(parts: string[]): void {
   if (parts.length === 0 || parts[parts.length - 1] !== '\n') parts.push('\n');
 }
 
-function readComposerElementText(root: HTMLElement): string {
+export function readComposerElementText(
+  root: HTMLElement,
+  options?: { preserveEditingLines?: boolean },
+): string {
+  const preserveEditingLines = Boolean(options?.preserveEditingLines);
   const parts: string[] = [];
+  let pendingBlockBreak = false;
+  let hasContentBeforeBlock = false;
   const walk = (node: Node) => {
     if (node.nodeType === Node.TEXT_NODE) {
-      parts.push(node.textContent ?? '');
+      const value = node.textContent ?? '';
+      if (!preserveEditingLines) {
+        parts.push(value);
+        return;
+      }
+      if (pendingBlockBreak && value.length > 0) {
+        parts.push('\n');
+        pendingBlockBreak = false;
+        hasContentBeforeBlock = false;
+      }
+      if (value.length > 0) hasContentBeforeBlock = true;
+      parts.push(value);
       return;
     }
     if (node.nodeType !== Node.ELEMENT_NODE) return;
@@ -699,15 +716,42 @@ function readComposerElementText(root: HTMLElement): string {
     const tag = element.tagName;
     const isBlock = tag === 'DIV' || tag === 'P' || tag === 'LI';
     if (tag === 'BR') {
-      appendComposerNewline(parts);
+      if (!preserveEditingLines) {
+        appendComposerNewline(parts);
+        return;
+      }
+      if (pendingBlockBreak) {
+        parts.push('\n');
+        pendingBlockBreak = false;
+      }
+      if (hasFollowingVisibleSibling(element)) {
+        parts.push('\n');
+        hasContentBeforeBlock = false;
+      } else {
+        hasContentBeforeBlock = true;
+      }
       return;
     }
-    if (isBlock && parts.length > 0) appendComposerNewline(parts);
+    if (!preserveEditingLines) {
+      if (isBlock && parts.length > 0) appendComposerNewline(parts);
+      element.childNodes.forEach(walk);
+      if (isBlock) appendComposerNewline(parts);
+      return;
+    }
+    if (isBlock && (pendingBlockBreak || hasContentBeforeBlock)) {
+      parts.push('\n');
+      pendingBlockBreak = false;
+      hasContentBeforeBlock = false;
+    }
     element.childNodes.forEach(walk);
-    if (isBlock) appendComposerNewline(parts);
+    if (isBlock) {
+      pendingBlockBreak = true;
+      hasContentBeforeBlock = false;
+    }
   };
   root.childNodes.forEach(walk);
-  return parts.join('').replace(/\n+$/g, '');
+  const raw = parts.join('');
+  return preserveEditingLines ? raw : raw.replace(/\n+$/g, '');
 }
 
 function setComposerElementText(root: HTMLElement, text: string): void {
@@ -6334,7 +6378,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
       if (e.key === 'ArrowUp' && atTop) {
         e.preventDefault();
-        const currentText = divRef.current ? readComposerElementText(divRef.current) : '';
+        const currentText = divRef.current
+          ? readComposerElementText(divRef.current, { preserveEditingLines: true })
+          : '';
         syncHistoryEditOrDraft(currentText, history);
         if (histIdxRef.current === -1 && draftKey) {
           safeSessionStorageSetItem(draftKey, draftRef.current);
@@ -6350,7 +6396,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       if (e.key === 'ArrowDown' && atBottom) {
         e.preventDefault();
         if (histIdxRef.current === -1) return;
-        const currentText = divRef.current ? readComposerElementText(divRef.current) : '';
+        const currentText = divRef.current
+          ? readComposerElementText(divRef.current, { preserveEditingLines: true })
+          : '';
         syncHistoryEditOrDraft(currentText, history);
         const next = histIdxRef.current - 1;
         if (next < 0) {
@@ -6861,7 +6909,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       inserted = false;
     }
     if (!inserted && divRef.current) {
-      const current = readComposerElementText(divRef.current);
+      const current = readComposerElementText(divRef.current, { preserveEditingLines: true });
       const next = current + text;
       setComposerElementText(divRef.current, next);
       syncHistoryEditOrDraft(
@@ -9033,8 +9081,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             }}
             onInput={(event) => {
               const currentText = divRef.current ? readComposerElementText(divRef.current) : '';
+              const editingText = divRef.current
+                ? readComposerElementText(divRef.current, { preserveEditingLines: true })
+                : '';
               syncHistoryEditOrDraft(
-                currentText,
+                editingText,
                 getNavigableHistory(quickData.data, activeSessionIncognito ? undefined : activeSession?.name),
               );
               setHasText(!!currentText.trim());

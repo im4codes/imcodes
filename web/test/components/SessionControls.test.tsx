@@ -387,6 +387,7 @@ import {
   OPENSPEC_LIST_REQUEST_TIMEOUT_MS,
   SessionControls,
   isCaretAtComposerLineBoundary,
+  readComposerElementText,
 } from '../../src/components/SessionControls.js';
 import { DirectFileTransferFailure } from '../../src/direct-file-transfer.js';
 import { __resetPrefCacheForTests } from '../../src/hooks/usePref.js';
@@ -8710,6 +8711,111 @@ afterEach(() => {
       );
       fireEvent.keyDown(input, { key: 'ArrowUp' });
       expect(input.textContent).toBe('msg 0');
+    });
+
+    it('preserves trailing empty lines, consecutive blank lines (<br><br>, empty <div><br></div>), and omits sentinel single<br> during lossless edit round-trips', () => {
+      // 1. Unit assertions for preserveEditingLines serializer vs normalized default
+      const probe = document.createElement('div');
+      probe.textContent = 'draft\n\n';
+      expect(readComposerElementText(probe)).toBe('draft');
+      expect(readComposerElementText(probe, { preserveEditingLines: true })).toBe('draft\n\n');
+
+      probe.innerHTML = 'a<br><br>b';
+      expect(readComposerElementText(probe, { preserveEditingLines: true })).toBe('a\n\nb');
+
+      probe.innerHTML = '<div>a</div><div><br></div><div>b</div>';
+      expect(readComposerElementText(probe, { preserveEditingLines: true })).toBe('a\n\nb');
+
+      probe.innerHTML = '<div>a</div><div><br></div>';
+      expect(readComposerElementText(probe, { preserveEditingLines: true })).toBe('a\n');
+
+      probe.innerHTML = 'single<br>';
+      expect(readComposerElementText(probe, { preserveEditingLines: true })).toBe('single');
+
+      probe.innerHTML = '<br>';
+      expect(readComposerElementText(probe, { preserveEditingLines: true })).toBe('');
+
+      // 2. Counterexample A & B + DOM blank-line & sentinel round-trips in rendered SessionControls
+      const ws = makeWs();
+      const quickData = makeQuickData();
+      quickData.data = {
+        history: [],
+        sessionHistory: {
+          'my-session': ['newest original', 'older original'],
+        },
+        commands: [],
+        phrases: [],
+      };
+      render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={quickData as any} />);
+      const input = screen.getByRole('textbox') as HTMLDivElement;
+
+      // Counterexample B: unsent draft with trailing empty lines ('draft\n\n')
+      input.textContent = 'draft\n\n';
+      fireEvent.input(input);
+      placeCollapsedCaret(input.firstChild!, 2);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('newest original');
+
+      // Counterexample A: edit history[0] to have trailing empty lines ('newest edited\n\n')
+      input.textContent = 'newest edited\n\n';
+      fireEvent.input(input);
+      placeCollapsedCaret(input.firstChild!, 3);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('older original');
+
+      // Also test DOM empty block blank lines on history[1]: <div>x</div><div><br></div><div>y</div>
+      input.innerHTML = '<div>x</div><div><br></div><div>y</div>';
+      fireEvent.input(input);
+      placeCollapsedCaret(input.children[0].firstChild!, 1);
+
+      // Step down to 0 -> preserves 'newest edited\n\n'
+      placeCollapsedCaret(input.children[2].firstChild!, 1);
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      expect(input.textContent).toBe('newest edited\n\n');
+
+      // Step down to -1 -> preserves original draft 'draft\n\n'
+      placeCollapsedCaret(input.firstChild!, 'newest edited\n\n'.length);
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      expect(input.textContent).toBe('draft\n\n');
+
+      // Step back up to 0, then 1 -> preserves 'newest edited\n\n' and 'x\n\ny'
+      placeCollapsedCaret(input.firstChild!, 2);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('newest edited\n\n');
+      placeCollapsedCaret(input.firstChild!, 2);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('x\n\ny');
+
+      // Consecutive <br><br> blank line round-trip on history[0]
+      placeCollapsedCaret(input.firstChild!, input.firstChild!.textContent!.length);
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      input.innerHTML = 'a<br><br>b';
+      fireEvent.input(input);
+      placeCollapsedCaret(input.childNodes[0], 1);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('x\n\ny');
+      placeCollapsedCaret(input.firstChild!, input.firstChild!.textContent!.length);
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      expect(input.textContent).toBe('a\n\nb');
+
+      // Positive control: single<br> sentinel does NOT inject a fake trailing newline
+      input.innerHTML = 'single<br>';
+      fireEvent.input(input);
+      placeCollapsedCaret(input.childNodes[0], 3);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      placeCollapsedCaret(input.firstChild!, input.firstChild!.textContent!.length);
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      expect(input.textContent).toBe('single');
+
+      // Stored history remains untouched and send resets temporary edits
+      expect(quickData.data.sessionHistory['my-session']).toEqual(['newest original', 'older original']);
+      fireEvent.keyDown(input, { key: 'Enter' });
+      expect(ws.sendSessionCommand).toHaveBeenCalledWith(
+        'send',
+        expect.objectContaining({ sessionName: 'my-session', text: 'single' }),
+      );
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('newest original');
     });
 
     it('clears temporary per-entry navigation edits on session switch and respects modifier/picker guards', () => {
