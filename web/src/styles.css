@@ -8059,7 +8059,7 @@ html.mobile-nav-gesture-active .chat-view * {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  padding: 0 8px max(1px, calc(max(var(--sab, 0px), env(safe-area-inset-bottom, 0px)) - 14px));
+  padding: 8px 8px max(2px, calc(max(var(--sab, 0px), env(safe-area-inset-bottom, 0px)) - 18px));
   line-height: 1;
   white-space: nowrap;
   overflow: hidden;
@@ -16883,13 +16883,11 @@ button.quick-agent-delegation-preset.active {
 .subsession-card.incognito:hover,
 .subsession-card.incognito.open,
 .subsession-card.incognito.focused,
-.subsession-card.incognito.subcard-running-pulse,
 .subsession-card-rail.incognito,
 .subcard.incognito,
 .subcard.incognito:hover,
 .subcard.incognito.subcard-open,
 .subcard.incognito.subcard-focused,
-.subcard.incognito.subcard-running-pulse,
 .subsession-window.incognito,
 .subsession-window.incognito.subsession-window-active,
 .subsession-window.incognito.subsession-window-maximized {
