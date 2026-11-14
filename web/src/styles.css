@@ -12657,10 +12657,11 @@ button.quick-agent-delegation-preset.active {
   padding: 0;
   display: grid;
   place-items: center;
-  color: #9fe7ff;
-  background: rgb(8 25 40 / 96%);
+  color: #9ceeff;
+  background: linear-gradient(180deg, rgb(14 35 58 / 96%) 0%, rgb(8 20 35 / 98%) 100%);
   border: 0;
-  border-bottom: 1px solid rgb(99 213 255 / 34%);
+  border-bottom: 1px solid rgb(34 211 238 / 32%);
+  box-shadow: inset 0 1px 0 rgb(125 211 252 / 12%);
   font-size: 18px;
   line-height: 1;
   cursor: pointer;
@@ -12672,9 +12673,10 @@ button.quick-agent-delegation-preset.active {
   right: 8px;
   width: 34px;
   min-height: 28px;
-  border: 1px solid rgb(99 213 255 / 34%);
-  border-radius: 7px;
-  background: rgb(8 25 40 / 92%);
+  border: 1px solid rgb(56 189 248 / 34%);
+  border-radius: 8px;
+  background: linear-gradient(180deg, rgb(17 41 66 / 95%), rgb(8 20 35 / 96%));
+  box-shadow: inset 0 1px 0 rgb(125 211 252 / 14%), 0 2px 8px rgb(0 0 0 / 35%);
 }
 
 .remote-desktop-toolbar-shell.is-toolbar-expanded .remote-desktop-toolbar {
@@ -12814,7 +12816,16 @@ button.quick-agent-delegation-preset.active {
 
 .remote-desktop-toolbar {
   flex-wrap: wrap;
-  border-bottom: 1px solid rgb(122 178 218 / 14%);
+  gap: 8px;
+  padding: 8px 12px;
+  background:
+    radial-gradient(100% 130% at 50% -25%, rgb(34 211 238 / 8%), transparent 62%),
+    linear-gradient(180deg, var(--chrome-panel) 0%, var(--chrome-bg) 100%);
+  border-bottom: 1px solid rgb(34 211 238 / 22%);
+  box-shadow:
+    inset 0 1px 0 rgb(125 211 252 / 7%),
+    inset 0 -1px 0 rgb(0 0 0 / 45%),
+    0 6px 18px rgb(2 8 18 / 36%);
 }
 
 .remote-desktop-readiness {
@@ -12957,9 +12968,8 @@ button.quick-agent-delegation-preset.active {
   flex: 1 1 156px;
 }
 
-/* Each toolbar group is one segmented control rather than loose buttons: the
-   grouping becomes visible instead of implied by spacing, and a row of related
-   options reads as a single instrument. */
+/* Each toolbar group is a dark-glass HUD instrument module matching IM.codes
+   --chrome-* cockpit tokens with crisp cyan hairline framing. */
 .remote-desktop-display-tabs,
 .remote-desktop-mode-switch,
 .remote-desktop-view-switch,
@@ -12970,15 +12980,14 @@ button.quick-agent-delegation-preset.active {
   display: inline-flex;
   align-items: stretch;
   flex: 0 0 auto;
-  /* Neutral frosted slate: the toolbar is the level BELOW the window tabs,
-     so it stays light and quiet and leaves the cyan accent to the tabs. */
-  border: 1px solid rgb(203 213 225 / 13%);
-  border-radius: 10px;
+  border: 1px solid rgb(56 189 248 / 24%);
+  border-radius: 9px;
   background:
-    linear-gradient(180deg, rgb(148 163 184 / 11%), rgb(148 163 184 / 5%));
+    linear-gradient(180deg, rgb(16 37 60 / 88%) 0%, rgb(8 20 35 / 94%) 100%);
   box-shadow:
-    inset 0 1px 0 rgb(255 255 255 / 6%),
-    0 1px 2px rgb(0 0 0 / 35%);
+    inset 0 1px 0 rgb(125 211 252 / 12%),
+    inset 0 -1px 0 rgb(0 0 0 / 42%),
+    0 2px 6px rgb(2 8 18 / 42%);
   overflow: hidden;
 }
 
@@ -12993,7 +13002,8 @@ button.quick-agent-delegation-preset.active {
 
 .remote-desktop-quality-caret {
   font-size: 10px;
-  opacity: .7;
+  color: #67e8f9;
+  opacity: .8;
 }
 
 /* Relayed through a capped TURN: an amber dot on the one button, the
@@ -13003,8 +13013,8 @@ button.quick-agent-delegation-preset.active {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: #f5b34a;
-  box-shadow: 0 0 6px rgb(245 179 74 / 70%);
+  background: var(--chrome-warm);
+  box-shadow: 0 0 8px rgb(245 158 11 / 78%);
 }
 
 .remote-desktop-quality-popover {
@@ -13016,22 +13026,26 @@ button.quick-agent-delegation-preset.active {
   display: grid;
   gap: 10px;
   padding: 12px 14px;
-  color: #d7e2ec;
-  background: rgb(12 22 34 / 97%);
-  border: 1px solid rgb(203 213 225 / 16%);
+  color: #cfe8f7;
+  background:
+    radial-gradient(120% 100% at 50% 0%, rgb(34 211 238 / 8%), transparent 55%),
+    linear-gradient(180deg, var(--chrome-panel-2) 0%, var(--chrome-bg) 100%);
+  border: 1px solid rgb(56 189 248 / 34%);
   border-radius: 12px;
-  box-shadow: 0 14px 34px rgb(0 0 0 / 55%), inset 0 1px 0 rgb(255 255 255 / 6%);
+  box-shadow:
+    0 16px 38px rgb(0 0 0 / 62%),
+    inset 0 1px 0 rgb(125 211 252 / 14%);
   font-size: 12.5px;
 }
 
 .remote-desktop-quality-popover-title {
-  color: #f1f5f9;
+  color: #ecfeff;
   font-weight: 600;
 }
 
 .remote-desktop-quality-modes {
   display: grid;
-  gap: 2px;
+  gap: 3px;
 }
 
 .remote-desktop-quality-mode {
@@ -13039,7 +13053,7 @@ button.quick-agent-delegation-preset.active {
   gap: 2px;
   padding: 7px 10px;
   text-align: left;
-  color: #cbd5e1;
+  color: #a9cbe0;
   background: transparent;
   border: 1px solid transparent;
   border-radius: 8px;
@@ -13047,13 +13061,16 @@ button.quick-agent-delegation-preset.active {
 }
 
 .remote-desktop-quality-mode:hover {
-  background: rgb(203 213 225 / 8%);
+  color: #e6fbff;
+  background: rgb(34 211 238 / 9%);
+  border-color: rgb(56 189 248 / 18%);
 }
 
 .remote-desktop-quality-mode[aria-checked="true"] {
-  color: #ffffff;
-  background: linear-gradient(180deg, rgb(241 245 249 / 14%), rgb(241 245 249 / 6%));
-  border-color: rgb(203 213 225 / 16%);
+  color: #ecfeff;
+  background: linear-gradient(180deg, rgb(34 211 238 / 20%) 0%, rgb(14 116 144 / 12%) 100%);
+  border-color: rgb(34 211 238 / 45%);
+  box-shadow: inset 0 1px 0 rgb(165 243 252 / 18%);
 }
 
 .remote-desktop-quality-mode-name {
@@ -13062,7 +13079,7 @@ button.quick-agent-delegation-preset.active {
 }
 
 .remote-desktop-quality-mode-hint {
-  color: #8fa1b3;
+  color: #7ea3ba;
   font-size: 11px;
   line-height: 1.35;
 }
@@ -13071,17 +13088,17 @@ button.quick-agent-delegation-preset.active {
   display: grid;
   gap: 8px;
   padding: 10px 2px 2px;
-  border-top: 1px solid rgb(203 213 225 / 10%);
+  border-top: 1px solid rgb(56 189 248 / 14%);
 }
 
 .remote-desktop-quality-relay-cap {
   margin: 0;
   padding: 7px 9px;
-  color: #ffd79a;
+  color: #fde68a;
   font-size: 11.5px;
   line-height: 1.4;
-  background: rgb(245 179 74 / 10%);
-  border: 1px solid rgb(245 179 74 / 25%);
+  background: rgb(245 158 11 / 11%);
+  border: 1px solid rgb(245 158 11 / 32%);
   border-radius: 8px;
 }
 
@@ -13095,9 +13112,9 @@ button.quick-agent-delegation-preset.active {
 .remote-desktop-quality-popover select {
   min-height: 30px;
   padding: 4px 8px;
-  color: #f1f5f9;
-  background: rgb(148 163 184 / 10%);
-  border: 1px solid rgb(203 213 225 / 18%);
+  color: #e6f7ff;
+  background: rgb(11 28 48 / 90%);
+  border: 1px solid rgb(56 189 248 / 28%);
   border-radius: 8px;
   font: inherit;
 }
@@ -13166,27 +13183,27 @@ button.quick-agent-delegation-preset.active {
   text-overflow: ellipsis;
 }
 
-/* Segmented-control skin, for the toolbar only: the file drawer and the node
-   list use standalone buttons and keep their own chip below. */
+/* Segmented-control HUD skin for toolbar instruments and standalone chips. */
 .remote-desktop-toolbar button {
+  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   min-height: 34px;
   padding: 6px 12px;
-  color: #b8c4d1;
+  color: #9cc3dc;
   background: transparent;
   border: 0;
   border-radius: 0;
   font-size: 12.5px;
   font-weight: 500;
-  letter-spacing: .01em;
+  letter-spacing: .015em;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
-  transition: color .12s ease, background-color .12s ease, box-shadow .12s ease;
+  transition: color .14s ease, background .14s ease, box-shadow .14s ease;
 }
 
-/* Hairline between segments, never before the first one. */
+/* Crisp cyan hairline between segments, never before the first one. */
 .remote-desktop-toolbar :is(
   .remote-desktop-display-tabs,
   .remote-desktop-mode-switch,
@@ -13196,33 +13213,50 @@ button.quick-agent-delegation-preset.active {
   .remote-desktop-clipboard-switch,
   .remote-desktop-mobile-input-switch
 ) button + button {
-  border-left: 1px solid rgb(203 213 225 / 10%);
+  border-left: 1px solid rgb(56 189 248 / 16%);
 }
 
 .remote-desktop-toolbar button:hover:not(:disabled) {
-  color: #f1f5f9;
-  background: rgb(203 213 225 / 9%);
+  color: #e6f9ff;
+  background: linear-gradient(180deg, rgb(34 211 238 / 14%), rgb(14 116 144 / 8%));
 }
 
-/* Selected state as a raised light chip, deliberately NOT cyan: cyan marks
-   the active window tab above, and the two levels must not look alike. */
+/* Telemetry highlight aligned with IM.codes --chrome-accent cyan plasma beam. */
 .remote-desktop-toolbar button[aria-pressed="true"],
+.remote-desktop-toolbar button[aria-expanded="true"],
 .remote-desktop-display-tabs button[aria-selected="true"] {
-  color: #ffffff;
+  color: #ecfeff;
+  font-weight: 600;
   background:
-    linear-gradient(180deg, rgb(241 245 249 / 18%), rgb(241 245 249 / 8%));
+    linear-gradient(180deg, rgb(34 211 238 / 24%) 0%, rgb(14 116 144 / 15%) 62%, rgb(8 68 94 / 22%) 100%);
   box-shadow:
-    inset 0 1px 0 rgb(255 255 255 / 14%),
-    inset 0 -1px 0 rgb(0 0 0 / 22%);
+    inset 0 1px 0 rgb(165 243 252 / 28%),
+    inset 0 -2px 0 rgb(34 211 238 / 80%),
+    inset 0 0 14px rgb(34 211 238 / 12%);
+  text-shadow: 0 0 10px rgb(34 211 238 / 38%);
+}
+
+/* Armed interactive control mode uses semantic emerald-cyan (--chrome-accent-2)
+   so it reads distinctly from view/fit/touch states across all locales. */
+.remote-desktop-mode-switch button:last-child[aria-pressed="true"] {
+  color: #ecfdf5;
+  background:
+    linear-gradient(180deg, rgb(52 211 153 / 25%) 0%, rgb(16 185 129 / 14%) 65%, rgb(6 78 59 / 22%) 100%);
+  box-shadow:
+    inset 0 1px 0 rgb(167 243 208 / 30%),
+    inset 0 -2px 0 rgb(52 211 153 / 85%),
+    inset 0 0 14px rgb(52 211 153 / 14%);
+  text-shadow: 0 0 10px rgb(52 211 153 / 42%);
 }
 
 .remote-desktop-toolbar button:focus-visible {
-  outline: 2px solid rgb(103 222 255 / 75%);
+  outline: 2px solid var(--chrome-accent);
   outline-offset: -2px;
 }
 
 .remote-desktop-toolbar button:disabled {
   opacity: .38;
+  cursor: default;
 }
 
 .remote-desktop-files button,
@@ -13232,22 +13266,23 @@ button.quick-agent-delegation-preset.active {
   padding: 6px 12px;
   color: #cfeaff;
   background: linear-gradient(180deg, rgb(20 41 62 / 92%), rgb(12 27 44 / 92%));
-  border: 1px solid rgb(94 165 214 / 26%);
+  border: 1px solid rgb(56 189 248 / 28%);
   border-radius: 9px;
   white-space: nowrap;
 }
 
-/* Standalone actions keep the same skin as a one-segment control. */
-.remote-desktop-files-trigger,
-.remote-desktop-unlock-trigger,
-.remote-desktop-quick-input {
-  border: 1px solid rgb(203 213 225 / 13%) !important;
-  border-radius: 10px !important;
+/* Standalone actions share the exact dark-glass HUD instrument housing. */
+.remote-desktop-toolbar .remote-desktop-files-trigger,
+.remote-desktop-toolbar .remote-desktop-unlock-trigger,
+.remote-desktop-toolbar .remote-desktop-quick-input {
+  border: 1px solid rgb(56 189 248 / 24%);
+  border-radius: 9px;
   background:
-    linear-gradient(180deg, rgb(148 163 184 / 11%), rgb(148 163 184 / 5%)) !important;
+    linear-gradient(180deg, rgb(16 37 60 / 88%) 0%, rgb(8 20 35 / 94%) 100%);
   box-shadow:
-    inset 0 1px 0 rgb(255 255 255 / 6%),
-    0 1px 2px rgb(0 0 0 / 35%);
+    inset 0 1px 0 rgb(125 211 252 / 12%),
+    inset 0 -1px 0 rgb(0 0 0 / 42%),
+    0 2px 6px rgb(2 8 18 / 42%);
 }
 
 .remote-desktop-quick-input {
@@ -13256,12 +13291,28 @@ button.quick-agent-delegation-preset.active {
   overflow: hidden;
 }
 
-.remote-desktop-unlock-trigger {
-  color: #ffe9c2 !important;
-  border-color: rgb(245 179 74 / 45%) !important;
+.remote-desktop-toolbar .remote-desktop-unlock-trigger {
+  color: #fde68a;
+  border-color: rgb(245 158 11 / 52%);
+  background: linear-gradient(180deg, rgb(120 53 15 / 44%) 0%, rgb(69 26 3 / 58%) 100%);
   box-shadow:
-    inset 0 1px 0 rgb(255 236 205 / 10%),
-    0 0 14px rgb(245 179 74 / 18%);
+    inset 0 1px 0 rgb(253 230 138 / 18%),
+    inset 0 -1px 0 rgb(0 0 0 / 38%),
+    0 0 14px rgb(245 158 11 / 18%);
+}
+
+.remote-desktop-toolbar .remote-desktop-unlock-trigger:hover:not(:disabled) {
+  color: #fef3c7;
+  border-color: rgb(245 158 11 / 78%);
+  background: linear-gradient(180deg, rgb(146 64 14 / 52%) 0%, rgb(84 35 6 / 66%) 100%);
+  box-shadow:
+    inset 0 1px 0 rgb(253 230 138 / 24%),
+    0 0 16px rgb(245 158 11 / 28%);
+}
+
+.remote-desktop-toolbar .remote-desktop-unlock-trigger:disabled {
+  opacity: 0.45;
+  box-shadow: none;
 }
 
 .remote-desktop-file-badge {
@@ -13438,19 +13489,6 @@ button.quick-agent-delegation-preset.active {
   color: #9aa7b8;
   font-size: 11px;
   line-height: 1.4;
-}
-
-.remote-desktop-unlock-trigger {
-  border: 1px solid rgba(255, 176, 87, 0.5);
-  border-radius: 8px;
-  padding: 4px 10px;
-  background: rgba(84, 51, 12, 0.5);
-  color: #ffd7a8;
-  font-size: 12px;
-}
-
-.remote-desktop-unlock-trigger:disabled {
-  opacity: 0.55;
 }
 
 .remote-desktop-control-notice {

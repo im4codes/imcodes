@@ -1763,4 +1763,44 @@ describe('styles.css regression contracts', () => {
     expect(cssWithoutComments).toMatch(/:root:not\(\.subcard-input-focused\)\.input-focused\s+\.subcard-bar:not\(:focus-within\)\s*\{\s*display:\s*none/);
     expect(cssWithoutComments).toMatch(/:root:not\(\.subcard-input-focused\)\.kb-open\s+\.subcard-bar:not\(:focus-within\)\s*\{\s*display:\s*none/);
   });
+
+  it('upgrades remote-desktop top chrome and toolbar with dark-cyan HUD surfaces, semantic accents, and no backdrop-filter', () => {
+    const rdWorkspaceCss = readFileSync(
+      resolve(__dirname, '../src/components/remote-desktop-workspace.css'),
+      'utf8',
+    ).replace(/\/\*[\s\S]*?\*\//g, '');
+
+    const desktopRdCss = rdWorkspaceCss.slice(0, rdWorkspaceCss.indexOf('@media (max-width: 700px)'));
+    const tabbarRules = Array.from(
+      desktopRdCss.matchAll(/^\.remote-desktop-workspace-tabbar\s*\{[^}]*\}/gm),
+    ).map((m) => m[0]).join('\n');
+    expect(tabbarRules).toMatch(/var\(--chrome-bg\)/);
+    expect(tabbarRules).toMatch(/border-bottom:\s*1px solid rgb\(34 211 238/);
+    expect(desktopRdCss).toMatch(/\.remote-desktop-workspace-host-tab\.is-active\s*\{[^}]*var\(--chrome-panel\)/);
+    expect(desktopRdCss).toMatch(/\.remote-desktop-workspace-host-tab\.is-active::before\s*\{[^}]*var\(--chrome-accent\)/);
+
+    const desktopStylesCss = cssWithoutComments.slice(0, cssWithoutComments.indexOf('@media (max-width: 720px)'));
+    const toolbarRules = Array.from(
+      desktopStylesCss.matchAll(/^\.remote-desktop-toolbar\s*\{[^}]*\}/gm),
+    ).map((m) => m[0]).join('\n');
+    const qualityPopoverRule = desktopStylesCss.match(/^\.remote-desktop-quality-popover\s*\{[^}]*\}/m)?.[0];
+    expect(toolbarRules).toBeTruthy();
+    expect(qualityPopoverRule).toBeTruthy();
+    // Toolbar uses IM.codes cockpit tokens, cyan HUD segmented borders, emerald armed state, and amber unlock accent.
+    expect(toolbarRules).toMatch(/var\(--chrome-panel\)[\s\S]*var\(--chrome-bg\)/);
+    expect(desktopStylesCss).toMatch(
+      /\.remote-desktop-toolbar button\[aria-pressed="true"\],\s*\.remote-desktop-toolbar button\[aria-expanded="true"\],\s*\.remote-desktop-display-tabs button\[aria-selected="true"\]\s*\{[^}]*inset 0 -2px 0 rgb\(34 211 238/,
+    );
+    expect(desktopStylesCss).toMatch(
+      /\.remote-desktop-mode-switch button:last-child\[aria-pressed="true"\]\s*\{[^}]*inset 0 -2px 0 rgb\(52 211 153/,
+    );
+    expect(desktopStylesCss).toMatch(
+      /\.remote-desktop-toolbar \.remote-desktop-unlock-trigger\s*\{[^}]*rgb\(245 158 11/,
+    );
+
+    // Neither toolbar nor workspace tabbar/chrome introduces backdrop-filter compositor blur.
+    expect(tabbarRules).not.toMatch(/backdrop-filter/);
+    expect(toolbarRules).not.toMatch(/backdrop-filter/);
+    expect(qualityPopoverRule).not.toMatch(/backdrop-filter/);
+  });
 });

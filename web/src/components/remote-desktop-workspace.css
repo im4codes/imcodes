@@ -111,15 +111,16 @@
 .remote-desktop-workspace-tabbar {
   justify-content: flex-start;
   cursor: move;
-  /* Window tabs sit on a darker rail and attach to its bottom edge, so they
-     read as a different level from the pill-shaped toolbar controls below. */
+  /* Top workspace rail sits above the toolbar cockpit deck with a crisp cyan horizon. */
   align-items: flex-end;
   padding: 7px 12px 0;
   background:
-    radial-gradient(120% 140% at 50% -40%, rgb(34 211 238 / 7%), transparent 60%),
-    linear-gradient(180deg, #02060c, #07101c);
-  border-bottom: 1px solid rgb(34 211 238 / 26%);
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 3%);
+    radial-gradient(110% 145% at 18% -40%, rgb(34 211 238 / 13%), transparent 60%),
+    linear-gradient(180deg, #040811 0%, var(--chrome-bg) 100%);
+  border-bottom: 1px solid rgb(34 211 238 / 34%);
+  box-shadow:
+    inset 0 1px 0 rgb(125 211 252 / 9%),
+    0 1px 12px rgb(6 182 212 / 10%);
 }
 
 .remote-desktop-workspace-tabbar > .remote-desktop-workspace-add,
@@ -134,12 +135,15 @@
   min-width: 30px;
   min-height: 30px;
   place-items: center;
-  border: 1px solid rgb(76 168 218 / 24%);
-  border-radius: 7px;
-  color: #a9cfe5;
-  background: linear-gradient(180deg, rgb(20 43 66 / 78%), rgb(8 21 36 / 88%));
-  box-shadow: inset 0 1px rgb(255 255 255 / 4%), 0 0 0 1px rgb(0 0 0 / 18%);
-  transition: border-color 140ms ease, color 140ms ease, box-shadow 140ms ease, transform 140ms ease;
+  border: 1px solid rgb(56 189 248 / 28%);
+  border-radius: 8px;
+  color: #a9d6ee;
+  background: linear-gradient(180deg, rgb(17 39 62 / 92%) 0%, rgb(8 20 35 / 96%) 100%);
+  box-shadow:
+    inset 0 1px 0 rgb(125 211 252 / 14%),
+    inset 0 -1px 0 rgb(0 0 0 / 38%),
+    0 2px 6px rgb(0 0 0 / 32%);
+  transition: border-color 140ms ease, color 140ms ease, background 140ms ease, box-shadow 140ms ease, transform 140ms ease;
 }
 
 .remote-desktop-workspace-tab {
@@ -168,9 +172,12 @@
 
 .remote-desktop-workspace-icon-button:hover:not(:disabled),
 .remote-desktop-workspace-chrome-button:hover:not(:disabled) {
-  border-color: rgb(74 210 255 / 72%);
-  color: #d8f7ff;
-  box-shadow: 0 0 16px rgb(34 211 238 / 16%), inset 0 1px rgb(255 255 255 / 7%);
+  border-color: rgb(34 211 238 / 72%);
+  color: #e6fcff;
+  background: linear-gradient(180deg, rgb(22 57 88 / 95%) 0%, rgb(11 30 50 / 98%) 100%);
+  box-shadow:
+    0 0 16px rgb(34 211 238 / 22%),
+    inset 0 1px 0 rgb(165 243 252 / 24%);
   transform: translateY(-1px);
 }
 
@@ -234,33 +241,30 @@
   position: relative;
   gap: 0;
   margin-bottom: -1px; /* sit on (and, when active, cover) the rail's bottom line */
-  border: 1px solid rgb(148 163 184 / 11%);
+  border: 1px solid rgb(56 189 248 / 18%);
   border-bottom: 0;
   border-radius: 9px 9px 0 0;
-  /* Thin glass: a faint sheen plus a top highlight gives the tab a surface
-     instead of a flat fill. */
-  background: linear-gradient(180deg, rgb(255 255 255 / 5%), rgb(255 255 255 / 1.5%));
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 5%);
+  background: linear-gradient(180deg, rgb(16 34 55 / 80%), rgb(8 19 33 / 90%));
+  box-shadow: inset 0 1px 0 rgb(125 211 252 / 8%);
   white-space: nowrap;
   transition: background 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
 }
 
 .remote-desktop-workspace-host-tab:hover {
-  background: linear-gradient(180deg, rgb(255 255 255 / 8%), rgb(255 255 255 / 3%));
-  border-color: rgb(148 163 184 / 20%);
+  background: linear-gradient(180deg, rgb(22 48 74 / 90%), rgb(11 25 43 / 95%));
+  border-color: rgb(56 189 248 / 38%);
 }
 
-/* The active tab takes the toolbar's own background and opens into it, with a
-   glowing cyan top edge -- the one element on the rail that looks "lit". */
+/* The active tab opens into the toolbar telemetry deck below with a glowing
+   cyan specular rim and bottom plasma seam. */
 .remote-desktop-workspace-host-tab.is-active {
   z-index: 1;
-  border-color: rgb(34 211 238 / 45%);
-  /* Lit from the top edge, fading into the toolbar's own colour at the
-     bottom so the tab and the toolbar read as one connected surface. */
-  background: linear-gradient(180deg, rgb(20 54 78) 0%, rgb(13 32 50) 45%, rgb(11 24 40) 100%);
+  border-color: rgb(34 211 238 / 62%);
+  background: linear-gradient(180deg, rgb(18 61 88) 0%, rgb(11 32 52) 52%, var(--chrome-panel) 100%);
   box-shadow:
-    inset 0 1px 0 rgb(165 243 252 / 22%),
-    0 -10px 26px -10px rgb(34 211 238 / 35%);
+    inset 0 1px 0 rgb(165 243 252 / 34%),
+    inset 0 0 14px rgb(34 211 238 / 10%),
+    0 -8px 22px -10px rgb(34 211 238 / 45%);
 }
 
 /* The active marker sits on the tab's straight bottom edge: a bar along the
@@ -270,8 +274,8 @@
   position: absolute;
   inset: auto 0 0;
   height: 2px;
-  background: linear-gradient(90deg, #22d3ee, #38bdf8 55%, #818cf8);
-  box-shadow: 0 0 10px rgb(34 211 238 / 70%);
+  background: linear-gradient(90deg, rgb(34 211 238 / 45%), var(--chrome-accent) 28%, #67e8f9 55%, #38bdf8 85%, rgb(56 189 248 / 45%));
+  box-shadow: 0 0 12px rgb(34 211 238 / 80%);
   pointer-events: none;
 }
 
@@ -325,9 +329,9 @@
 }
 
 .remote-desktop-workspace-tabbar > .remote-desktop-workspace-add:hover:not(:disabled) {
-  border-color: rgb(148 163 184 / 16%);
-  background: rgb(255 255 255 / 6%);
-  box-shadow: none;
+  border-color: rgb(56 189 248 / 44%);
+  background: rgb(14 45 70 / 56%);
+  box-shadow: 0 0 12px rgb(34 211 238 / 18%), inset 0 1px 0 rgb(165 243 252 / 14%);
   color: #d8f7ff;
 }
 
