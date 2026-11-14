@@ -807,14 +807,21 @@ export class ServerLink {
       // user edits to "Global custom instructions" land in the daemon within
       // one WS round-trip, not next restart. See `supervisor-defaults-cache.ts`.
       void (async () => {
+        // Yield once so short-lived callers (or tests) that disconnect right after
+        // 'open' do not trigger late dynamic module imports or HTTP refreshes.
+        await Promise.resolve();
+        if (this.ws !== ws) return;
         try {
           const { refreshSupervisorDefaultsCache } = await import('./supervisor-defaults-cache.js');
+          if (this.ws !== ws) return;
           await refreshSupervisorDefaultsCache();
         } catch (err) {
           logger.debug({ err }, 'supervisor-defaults-cache: reconnect refresh failed');
         }
+        if (this.ws !== ws) return;
         try {
           const { refreshRepoCallbackMonitor } = await import('./repo-callback-monitor.js');
+          if (this.ws !== ws) return;
           await refreshRepoCallbackMonitor();
         } catch (err) {
           logger.debug({ err }, 'repo-callback-monitor: reconnect refresh failed');

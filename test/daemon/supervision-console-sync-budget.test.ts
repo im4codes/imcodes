@@ -31,8 +31,11 @@ import type { SupervisionTaskConsoleDelta } from '../../shared/supervision-task-
 import { TaskPairStore, setTaskPairStoreForTests } from '../../src/daemon/task-pairs/store.js';
 import {
   EVENT_LOOP_WATCHDOG_IDLE_PHASE,
+  setEventLoopWatchdogClockForTests,
+  setEventLoopWatchdogPhase,
   startEventLoopWatchdog,
   stopEventLoopWatchdog,
+  type EventLoopWatchdogClock,
 } from '../../src/daemon/event-loop-watchdog.js';
 
 const SCOPE = { projectName: 'codedeck', coordinatorSessionName: 'deck_cd_brain' };
@@ -405,17 +408,59 @@ describe('inline vs yielded threshold', () => {
 });
 
 describe('a real console stall is attributed to its console phase (watchdog)', () => {
-  const busyWait = (ms: number) => { const until = performance.now() + ms; while (performance.now() < until) { /* block the loop */ } };
-  const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+  // Drive the watchdog with a controllable clock so loaded CI runners cannot
+  // inject unrelated OS/GC pauses as spurious `daemon-main-loop` stalls.
+  class ManualWatchdogClock implements EventLoopWatchdogClock {
+    wall = 1_000_000;
+    mono = 0;
+    private callback: (() => void) | undefined;
+    private intervalMs = 0;
+    private due = 0;
+    wallNow = (): number => this.wall;
+    monotonicNow = (): number => this.mono;
+    setInterval = (callback: () => void, ms: number): ReturnType<typeof setInterval> => {
+      this.callback = callback;
+      this.intervalMs = ms;
+      this.due = this.wall + ms;
+      return { unref: () => undefined } as unknown as ReturnType<typeof setInterval>;
+    };
+    clearInterval = (): void => { this.callback = undefined; };
+    block(ms: number): void {
+      this.wall += ms;
+      this.mono += ms;
+    }
+    run(ms: number): void {
+      const end = this.wall + ms;
+      while (this.callback && this.due <= end) {
+        const at = Math.max(this.due, this.wall);
+        this.mono += at - this.wall;
+        this.wall = at;
+        this.callback();
+        this.due = this.wall + this.intervalMs;
+      }
+      this.mono += end - this.wall;
+      this.wall = end;
+    }
+  }
+
+  let clock: ManualWatchdogClock;
+  const busyWait = (ms: number) => { clock.block(ms); };
+  const sleep = async (ms: number) => { clock.run(ms); };
   const phases = () => recordStall.mock.calls.map(([arg]) => (arg as { phase: string }).phase);
 
   beforeEach(async () => {
+    clock = new ManualWatchdogClock();
+    setEventLoopWatchdogClockForTests(clock);
+    setEventLoopWatchdogPhase(EVENT_LOOP_WATCHDOG_IDLE_PHASE);
     recordStall.mockReset();
     startEventLoopWatchdog();
     await sleep(120);
     recordStall.mockReset();
   });
-  afterEach(() => { stopEventLoopWatchdog(); });
+  afterEach(() => {
+    stopEventLoopWatchdog();
+    setEventLoopWatchdogClockForTests(null);
+  });
 
   // The slow part is the live-session lookup the projection calls for every
   // assignment row it builds -- the same call a busy real daemon makes slowly.

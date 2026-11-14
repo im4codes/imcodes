@@ -123,6 +123,7 @@ describe('memory MCP shared contracts', () => {
       'pair_task_update',
       'pair_task_check',
       'pair_resource_claim',
+      'callback_update',
       'send_stop',
       'destroy_execution_clone',
       'cron_create_self',

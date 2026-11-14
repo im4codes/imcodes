@@ -1170,6 +1170,19 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     inputSchema: objectSchema({ taskId: stringSchema('Optional task id.'), resource: stringSchema('Canonical external resource.'), mode: { type: 'string', enum: ['exclusive', 'shared'] }, ttlMs: { type: 'integer', minimum: 60000, maximum: 86400000 }, renew: { type: 'boolean' } }, ['resource', 'mode']),
     outputSchema: statusSchema,
   },
+  [MEMORY_MCP_TOOL_NAMES.CALLBACK_UPDATE]: {
+    name: MEMORY_MCP_TOOL_NAMES.CALLBACK_UPDATE,
+    description: 'Update status and summary for a callback item (in_progress, done, ignored, failed), optionally linking relatedTaskId or metadata.',
+    inputSchema: objectSchema({
+      callbackId: stringSchema('Callback id (cb_...).'),
+      status: stringSchema('New callback status.', { enum: [...CALLBACK_UPDATE_STATUSES] }),
+      summary: { type: 'string', maxLength: CALLBACK_MAX_SUMMARY_CHARS, description: 'Concise handling summary.' },
+      source: { type: 'string', maxLength: CALLBACK_MAX_SOURCE_CHARS, description: 'Optional callback source guard (e.g. repo, webhook).' },
+      relatedTaskId: { type: 'string', maxLength: CALLBACK_MAX_RELATED_TASK_ID_CHARS, description: 'Optional related taskId (e.g. tsk_...).' },
+      metadata: { type: 'object', additionalProperties: true, description: `Optional bounded JSON metadata (max ${CALLBACK_MAX_METADATA_BYTES} bytes).` },
+    }, ['callbackId', 'status', 'summary']),
+    outputSchema: statusSchema,
+  },
 
   [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START]: {
     name: MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START,
@@ -1528,19 +1541,6 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       },
       command: stringSchema('Single CLI command string split cleanly (quotes & Windows backslashes preserved), e.g. "read doc_123 --max-chars 4000". Defaults to "--help" when both args and command are omitted.'),
     }),
-    outputSchema: statusSchema,
-  },
-  [MEMORY_MCP_TOOL_NAMES.CALLBACK_UPDATE]: {
-    name: MEMORY_MCP_TOOL_NAMES.CALLBACK_UPDATE,
-    description: 'Update status and summary for a callback item (in_progress, done, ignored, failed), optionally linking relatedTaskId or metadata.',
-    inputSchema: objectSchema({
-      callbackId: stringSchema('Callback id (cb_...).'),
-      status: stringSchema('New callback status.', { enum: [...CALLBACK_UPDATE_STATUSES] }),
-      summary: { type: 'string', maxLength: CALLBACK_MAX_SUMMARY_CHARS, description: 'Concise handling summary.' },
-      source: { type: 'string', maxLength: CALLBACK_MAX_SOURCE_CHARS, description: 'Optional callback source guard (e.g. repo, webhook).' },
-      relatedTaskId: { type: 'string', maxLength: CALLBACK_MAX_RELATED_TASK_ID_CHARS, description: 'Optional related taskId (e.g. tsk_...).' },
-      metadata: { type: 'object', additionalProperties: true, description: `Optional bounded JSON metadata (max ${CALLBACK_MAX_METADATA_BYTES} bytes).` },
-    }, ['callbackId', 'status', 'summary']),
     outputSchema: statusSchema,
   },
 };

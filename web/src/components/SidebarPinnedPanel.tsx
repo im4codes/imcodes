@@ -39,7 +39,7 @@ export function SidebarPinnedPanel({
   const content = renderPanelContent(panel, ctx);
   const isIncognito = panel.type === 'subsession'
     && typeof panel.props?.sessionName === 'string'
-    && !!ctx.subSessions.find((s) => s.sessionName === panel.props?.sessionName)?.incognito;
+    && !!ctx.subSessions?.find((s) => s.sessionName === panel.props?.sessionName)?.incognito;
 
   return (
     <div class={`sidebar-pinned-panel${isIncognito ? ' incognito' : ''}`} style={{ height: localHeight, flexShrink: 0 }}>
