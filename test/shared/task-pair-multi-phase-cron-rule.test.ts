@@ -49,10 +49,13 @@ describe('the multi-phase long-task supervisor cron rule', () => {
     expect(TASK_PAIR_MULTI_PHASE_CRON_RULE).toContain('never create per-pair cron_create_self nudges');
     expect(TASK_PAIR_MULTI_PHASE_CRON_RULE).toContain('cron_create_self');
     expect(TASK_PAIR_MULTI_PHASE_CRON_RULE).toContain('completionPolicy="until_complete"');
+    expect(TASK_PAIR_MULTI_PHASE_CRON_RULE).toContain('>= 20 minutes');
+    expect(TASK_PAIR_MULTI_PHASE_CRON_RULE).toContain('*/20 * * * *');
+    expect(TASK_PAIR_MULTI_PHASE_CRON_RULE).toContain('never more frequent than every 20 minutes');
     expect(TASK_PAIR_MULTI_PHASE_CRON_RULE).toContain('cron_cancel_self');
     expect(TASK_PAIR_MULTI_PHASE_CRON_RULE).toContain('all phases are complete');
     expect(TASK_PAIR_MULTI_PHASE_CRON_TOKEN).toBe(
-      'single_pair_no_cron_multi_phase_long_task_must_cron_create_self_completionPolicy_until_complete_auto_cancel_when_all_phases_done',
+      'single_pair_no_cron_multi_phase_long_task_must_cron_create_self_min_20m_completionPolicy_until_complete_auto_cancel_when_all_phases_done',
     );
   });
 
