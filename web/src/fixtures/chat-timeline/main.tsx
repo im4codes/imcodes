@@ -67,6 +67,9 @@ import {
   isSubSessionBarInputTarget,
 } from '../../mobile-keyboard.js';
 import type { SubSession } from '../../hooks/useSubSessions.js';
+import type { SessionInfo } from '../../types.js';
+import { ChatLocalImagePreview } from '../../components/ChatLocalImagePreview.js';
+import { SessionControls } from '../../components/SessionControls.js';
 import { ChatView, __buildViewItemsForTests } from '../../components/ChatView.js';
 import { WsClient, type TimelineEvent } from '../../ws-client.js';
 import { bindTaskPairDecisions, receiveTaskPairDecision } from '../../task-pair-decisions.js';
@@ -341,16 +344,7 @@ function FixtureSubWindow() {
     getMaximizeBounds={() => ({ x: 0, y: 0, w: innerWidth, h: innerHeight })} />;
 }
 
-// Opt-in production SubSessionBar + SubSessionCard + SubSessionWindow IME/focus fixture.
-function FixtureSubBar() {
-  const [openIds, setOpenIds] = useState<string[]>([]);
-  const [focusedSubId, setFocusedSubId] = useState<string | null>(null);
-  const [maximizedIds, setMaximizedIds] = useState<string[]>([]);
-  const [showWindow, setShowWindow] = useState(query.get('openWindow') === '1');
-  const [windowMinimizedCount, setWindowMinimizedCount] = useState(0);
-  const subTransport: SubSession = { id: 'sub-tr', serverId: 'fixture-server', type: 'codex-sdk', runtimeType: 'transport', shellBin: null, cwd: null, ccSessionId: null, geminiSessionId: null, parentSession: 'fixture-brain', label: 'Card Transport', ccPresetId: null, sessionName: 'fixture-sub-tr', state: 'idle', createdAt: 1700000000000, updatedAt: 1700000000000 };
-  const subShell: SubSession = { id: 'sub-sh', serverId: 'fixture-server', type: 'shell', runtimeType: 'process', shellBin: '/bin/bash', cwd: null, ccSessionId: null, geminiSessionId: null, parentSession: 'fixture-brain', label: 'Card Shell', ccPresetId: null, sessionName: 'fixture-sub-sh', state: 'idle', createdAt: 1700000000000, updatedAt: 1700000000000 };
-
+function useFixtureMobileKeyboardClasses(): void {
   useEffect(() => {
     const vv = window.visualViewport;
     let inputFocused = false;
@@ -392,6 +386,19 @@ function FixtureSubBar() {
       document.documentElement.classList.remove('kb-open', 'input-focused', 'subcard-input-focused');
     };
   }, []);
+}
+
+// Opt-in production SubSessionBar + SubSessionCard + SubSessionWindow IME/focus fixture.
+function FixtureSubBar() {
+  const [openIds, setOpenIds] = useState<string[]>([]);
+  const [focusedSubId, setFocusedSubId] = useState<string | null>(null);
+  const [maximizedIds, setMaximizedIds] = useState<string[]>([]);
+  const [showWindow, setShowWindow] = useState(query.get('openWindow') === '1');
+  const [windowMinimizedCount, setWindowMinimizedCount] = useState(0);
+  const subTransport: SubSession = { id: 'sub-tr', serverId: 'fixture-server', type: 'codex-sdk', runtimeType: 'transport', shellBin: null, cwd: null, ccSessionId: null, geminiSessionId: null, parentSession: 'fixture-brain', label: 'Card Transport', ccPresetId: null, sessionName: 'fixture-sub-tr', state: 'idle', createdAt: 1700000000000, updatedAt: 1700000000000 };
+  const subShell: SubSession = { id: 'sub-sh', serverId: 'fixture-server', type: 'shell', runtimeType: 'process', shellBin: '/bin/bash', cwd: null, ccSessionId: null, geminiSessionId: null, parentSession: 'fixture-brain', label: 'Card Shell', ccPresetId: null, sessionName: 'fixture-sub-sh', state: 'idle', createdAt: 1700000000000, updatedAt: 1700000000000 };
+
+  useFixtureMobileKeyboardClasses();
 
   const useFallbackInput = query.get('fallback') === '1';
   const subBarWs = useFallbackInput ? null : ({
@@ -484,6 +491,78 @@ function FixtureSubBar() {
   );
 }
 
+const FIXTURE_IMAGE_DATA_URL = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="320" height="220"><rect width="320" height="220" fill="#38bdf8"/></svg>');
+const fixtureLoadImagePreview = async () => ({ dataUrl: FIXTURE_IMAGE_DATA_URL, alt: 'sent-photo.png' });
+
+// Opt-in production ChatLocalImagePreview + SessionControls mobile layout-shift regression fixture.
+function FixtureMobileImageTap() {
+  useFixtureMobileKeyboardClasses();
+  const activeSession: SessionInfo = {
+    name: 'deck_fixture_main',
+    project: 'fixture',
+    role: 'brain',
+    agentType: 'claude-code-sdk',
+    state: 'idle',
+    runtimeType: 'transport',
+    projectDir: '/tmp/fixture',
+  };
+  const ws = {
+    connected: true,
+    send: () => {},
+    sendSessionCommand: () => {},
+    onMessage: () => () => {},
+    subscribeTerminal: () => {},
+    getDaemonCapabilitySnapshot: () => null,
+    onDaemonCapabilitySnapshot: () => () => {},
+    fsGitStatus: () => '1',
+  } as unknown as WsClient;
+  const quickData = {
+    data: { history: [], sessionHistory: {}, commands: [], phrases: [] },
+    loaded: true,
+    recordHistory: () => {},
+    addCommand: () => {},
+    addPhrase: () => {},
+    removeCommand: () => {},
+    removePhrase: () => {},
+    removeHistory: () => {},
+    removeSessionHistory: () => {},
+    clearHistory: () => {},
+    clearSessionHistory: () => {},
+  };
+  return (
+    <div
+      data-testid="fixture-mobile-image-tap"
+      style={{ display: 'flex', flexDirection: 'column', height: '100vh', width: '100vw', overflow: 'hidden', background: '#0b1220' }}
+    >
+      <div
+        class="chat-view"
+        tabIndex={-1}
+        style={{ flex: '1 1 0%', minHeight: 0, display: 'flex', flexDirection: 'column', justifyContent: 'flex-end', overflowY: 'auto', padding: '0 12px' }}
+      >
+        <ChatLocalImagePreview
+          path="/repo/sent-photo.png"
+          loadImagePreview={fixtureLoadImagePreview}
+        />
+      </div>
+      <SessionControls
+        ws={ws}
+        activeSession={activeSession}
+        connected={true}
+        quickData={quickData as any}
+        sessions={[]}
+        subSessions={[]}
+        serverId="fixture-server"
+      />
+      <div class="subcard-bar" style={{ height: '64px', flexShrink: 0, background: '#111827' }}>
+        subcard-bar
+      </div>
+      <div class="session-usage-footer" style={{ height: '28px', flexShrink: 0, background: '#0f172a' }}>
+        usage-footer
+      </div>
+    </div>
+  );
+}
+
 function FixtureHarness() {
   const [events, setEvents] = useState<TimelineEvent[]>(initialEvents);
   publishEvents = setEvents;
@@ -495,6 +574,7 @@ function FixtureHarness() {
     return () => { publishEvents = null; publishOlderState = null; };
   }, []);
 
+  if (query.get('mobileImageTap') === '1') return <FixtureMobileImageTap />;
   if (query.get('subWindow') === '1') return <FixtureSubWindow />;
   if (query.get('subBar') === '1') return <FixtureSubBar />;
 

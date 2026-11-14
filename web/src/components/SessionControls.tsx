@@ -1611,6 +1611,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     pointerId: number;
     startX: number;
     startY: number;
+    pointerType: string;
   } | null>(null);
   const voiceHoldPendingRef = useRef(false);
   const voiceHoldActiveRef = useRef(false);
@@ -5604,10 +5605,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   /**
    * Focusing the composer synchronously on a short touch `pointerup` or failed-hold
-   * click fallback can trigger `.input-focused` / `.subcard-bar` hiding and shift the
-   * composer downward before the browser dispatches compatibility `mousedown`. Guard
-   * against that stale compatibility `mousedown` landing on `.chat-view`
-   * (`tabIndex={-1}`) and stealing focus back out of the composer.
+   * click fallback (or initial mobile tap focus) can trigger `.input-focused` /
+   * `.subcard-bar` hiding and shift the composer downward before the browser
+   * dispatches compatibility `mousedown` / `click`. Guard against that stale
+   * compatibility `mousedown` landing on `.chat-view` (`tabIndex={-1}`) and stealing
+   * focus back out of the composer, and shield against the paired compatibility
+   * `click` landing outside the composer on shifted chat content (e.g.
+   * `.chat-local-image-preview-img`, `.chat-attachment-dl`).
    */
   const armTouchTapCompatMouseShield = useCallback(() => {
     disarmTouchTapCompatMouseShield();
@@ -5622,6 +5626,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       document.removeEventListener('touchstart', onNewInteraction, true);
       document.removeEventListener('keydown', onNewInteraction, true);
       document.removeEventListener('mousedown', onCompatMouseDown, true);
+      document.removeEventListener('click', onCompatClick, true);
       if (touchTapCompatShieldCleanupRef.current === cleanup) {
         touchTapCompatShieldCleanupRef.current = null;
       }
@@ -5634,13 +5639,24 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       if (el && document.activeElement === el) {
         ev.preventDefault();
       }
+    };
+    const onCompatClick = (ev: MouseEvent) => {
+      const el = divRef.current;
+      const target = ev.target;
+      const insideComposer = !!(el && target instanceof Node && el.contains(target));
+      if (!insideComposer) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        ev.stopImmediatePropagation?.();
+      }
       cleanup();
     };
     document.addEventListener('pointerdown', onNewInteraction, true);
     document.addEventListener('touchstart', onNewInteraction, true);
     document.addEventListener('keydown', onNewInteraction, true);
     document.addEventListener('mousedown', onCompatMouseDown, true);
-    timer = setTimeout(cleanup, 400);
+    document.addEventListener('click', onCompatClick, true);
+    timer = setTimeout(cleanup, 500);
     touchTapCompatShieldCleanupRef.current = cleanup;
   }, [disarmTouchTapCompatMouseShield]);
 
@@ -6025,6 +6041,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       pointerId: event.pointerId ?? 1,
       startX: event.clientX ?? 0,
       startY: event.clientY ?? 0,
+      pointerType: event.pointerType || 'touch',
     };
 
     if (!VoiceInput.isAvailable()) return;
@@ -6167,16 +6184,20 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     const tx = voiceHoldTxRef.current;
     if (ptr && event.pointerId !== undefined && event.pointerId !== ptr.id) return;
     if (!ptr && !tx) {
+      const pendingEndFocus = pendingMobileInitialEndFocusRef.current;
       if (
-        cancelled
-        && pendingMobileInitialEndFocusRef.current
-        && (event.pointerId === undefined || event.pointerId === pendingMobileInitialEndFocusRef.current.pointerId)
+        pendingEndFocus
+        && (event.pointerId === undefined || event.pointerId === pendingEndFocus.pointerId)
       ) {
-        pendingMobileInitialEndFocusRef.current = null;
+        if (cancelled) {
+          pendingMobileInitialEndFocusRef.current = null;
+        } else if ((event.pointerType || pendingEndFocus.pointerType) === 'touch') {
+          armTouchTapCompatMouseShield();
+        }
       }
       return;
     }
-    const resolvedPointerType = ptr?.pointerType ?? event.pointerType ?? tx?.pointerType ?? 'touch';
+    const resolvedPointerType = ptr?.pointerType || event.pointerType || tx?.pointerType || 'touch';
     voiceHoldPointerRef.current = null;
     voiceHoldPendingRef.current = false;
     setVoiceHoldPending(false);
@@ -6214,7 +6235,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     try { divRef.current?.blur(); } catch { /* ignore */ }
     const finalZone: 'send' | 'cancel' | 'edit' = cancelled ? 'cancel' : tx.zone;
     void finalizeVoiceHold(tx, tx.error !== null ? 'failed' : finalZone);
-  }, [clearComposerVoiceWindowListeners, fallbackToComposerClick, finalizeVoiceHold]);
+  }, [armTouchTapCompatMouseShield, clearComposerVoiceWindowListeners, fallbackToComposerClick, finalizeVoiceHold]);
 
   voicePointerMoveHandlerRef.current = handleComposerVoicePointerMove;
   voicePointerEndHandlerRef.current = handleComposerVoicePointerEnd;
