@@ -98,6 +98,9 @@ vi.mock('../../src/native.js', () => ({
 }));
 
 vi.mock('../../src/components/VoiceInput.js', () => ({
+  VOICE_LANG_STORAGE_KEY: 'imcodes_voice_lang',
+  getVoiceLanguageMode: vi.fn(() => 'follow'),
+  setVoiceLanguageMode: vi.fn(),
   onAudioLevel: (...args: unknown[]) => voiceApi.onAudioLevel(...args),
   startListening: (...args: unknown[]) => voiceApi.startListening(...args),
   stopListening: (...args: unknown[]) => voiceApi.stopListening(...args),

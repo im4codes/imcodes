@@ -1116,7 +1116,7 @@ describe('styles.css regression contracts', () => {
 
     const app = readFileSync(resolve(__dirname, '../src/app.tsx'), 'utf8');
     expect(app).toContain('mobile-server-menu-server');
-    expect(app).toContain('footer={<><LanguageSwitcher /><R2RelayToggle /></>}');
+    expect(app).toContain('footer={<><LanguageSwitcher /><VoiceLanguageSwitcher /><R2RelayToggle /></>}');
     expect(app).toContain('server-item-pin');
     expect(app).not.toContain('mobile-server-menu-pin');
     expect(app).toContain("? ' pinned'");
