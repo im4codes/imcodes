@@ -311,12 +311,14 @@ function pauseBackgroundAudio(): void {
 async function attachSessionListeners(
   recognition: NativeSpeechRecognition,
   session: NativeSession,
+  shouldKeep?: () => boolean,
 ): Promise<boolean> {
   const { generation } = session;
   let aborted = false;
 
   const isSessionLive = (): boolean =>
     !aborted
+    && (shouldKeep ? shouldKeep() : true)
     && !session.retired
     && !session.aborted
     && !session.owner.retired
@@ -495,6 +497,10 @@ export async function prewarm(options?: { requestPermission?: boolean }): Promis
 
   const runPromise = (async () => {
     try {
+      // Warm native audio graph / MLX Metal shaders / ONNX decoder in parallel with
+      // permission & availability checks; ignore absence or rejection on fallback plugins.
+      void Promise.resolve(recognition.prewarm?.()).catch(() => {});
+
       const checkPerms = (
         recognition as NativeSpeechRecognition & {
           checkPermissions?: () => Promise<{ speechRecognition?: string }>;
@@ -587,7 +593,9 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
   _nativeSession = session;
 
   try {
-    if (!getFreshPrewarmCache(recognition) && _prewarmInFlight) {
+    // Only wait on an active in-flight prewarm (to avoid duplicate OS permission prompts);
+    // never let a slow passive prewarm block an immediate mic press.
+    if (!getFreshPrewarmCache(recognition) && _prewarmInFlight?.requestPermission) {
       await withTimeout(
         _prewarmInFlight.promise,
         NATIVE_PREWARM_CALL_TIMEOUT_MS,
@@ -600,17 +608,24 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
       }
     }
 
+    let attached = false;
     const prewarmed = getFreshPrewarmCache(recognition);
     if (prewarmed && prewarmed.permissionGranted && prewarmed.available) {
       recognition = prewarmed.effective;
       session.recognition = prewarmed.effective;
+      attached = await attachSessionListeners(recognition, session);
     } else if (prewarmed && prewarmed.available) {
+      recognition = prewarmed.effective;
+      session.recognition = prewarmed.effective;
+      const listenerPromise = attachSessionListeners(recognition, session);
+      listenerPromise.catch(() => {});
       const perms = await withTimeout(
         recognition.requestPermissions(),
         NATIVE_PERMISSION_TIMEOUT_MS,
         'Speech permission timed out',
       );
       if (!isSessionStarting()) {
+        session.retired = true;
         await cleanupSessionListeners(session);
         if (_nativeSession === session) _nativeSession = null;
         return false;
@@ -619,14 +634,17 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
         console.warn('[voice] microphone permission denied');
         reportOwnerError(session.owner, 'permission_denied');
         session.retired = true;
+        await cleanupSessionListeners(session);
         if (_nativeSession === session) _nativeSession = null;
         retireOwner(session.owner);
         return false;
       }
       prewarmed.permissionGranted = true;
-      recognition = prewarmed.effective;
-      session.recognition = prewarmed.effective;
+      attached = await listenerPromise;
     } else {
+      let keepPrimaryListeners = true;
+      const listenerPromise = attachSessionListeners(recognition, session, () => keepPrimaryListeners);
+      listenerPromise.catch(() => {});
       const [perms, available] = await Promise.all([
         withTimeout(
           recognition.requestPermissions(),
@@ -640,6 +658,7 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
         ).catch(() => ({ available: false })),
       ]);
       if (!isSessionStarting()) {
+        session.retired = true;
         await cleanupSessionListeners(session);
         if (_nativeSession === session) _nativeSession = null;
         return false;
@@ -648,11 +667,14 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
         console.warn('[voice] microphone permission denied');
         reportOwnerError(session.owner, 'permission_denied');
         session.retired = true;
+        await cleanupSessionListeners(session);
         if (_nativeSession === session) _nativeSession = null;
         retireOwner(session.owner);
         return false;
       }
       if (!available?.available) {
+        keepPrimaryListeners = false;
+        await cleanupSessionListeners(session);
         const fallback = await resolveUsableFallbackRecognizer(recognition);
         if (!isSessionStarting()) {
           await cleanupSessionListeners(session);
@@ -663,6 +685,7 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
           console.warn('[voice] custom offline speech unavailable, falling back to platform recognizer');
           recognition = fallback;
           session.recognition = fallback;
+          attached = await attachSessionListeners(recognition, session);
         } else {
           console.warn('[voice] speech recognition unavailable');
           reportOwnerError(session.owner, 'Offline speech model unavailable');
@@ -671,10 +694,11 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
           retireOwner(session.owner);
           return false;
         }
+      } else {
+        attached = await listenerPromise;
       }
     }
 
-    const attached = await attachSessionListeners(recognition, session);
     if (!attached || !isSessionStarting() || _nativeSession !== session) {
       await cleanupSessionListeners(session);
       if (_nativeSession === session) _nativeSession = null;

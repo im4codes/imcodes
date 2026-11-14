@@ -82,6 +82,16 @@ final class SpeechCoordinator {
         return eventOwner == owner && !isAppBackgrounded
     }
 
+    var isBackgrounded: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return isAppBackgrounded
+    }
+
+    var hasActiveCapture: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return eventOwner != 0 && stoppedEmittedOwner != eventOwner
+    }
+
     private func claimStoppedEmissionLocked(for owner: UInt64) -> Bool {
         lock.lock(); defer { lock.unlock() }
         guard eventOwner == owner, stoppedEmittedOwner != owner else { return false }
@@ -198,6 +208,24 @@ final class SpeechCoordinator {
         lock.unlock()
     }
 
+    func markStarted(owner: UInt64) {
+        lock.lock()
+        guard generation == owner, eventOwner == owner, startPendingOwner == owner else {
+            lock.unlock()
+            return
+        }
+        startPendingOwner = 0
+        let readyCallback = startReadyCallback
+        startReadyCallback = nil
+        lock.unlock()
+
+        emitQueue.async { [weak self] in
+            readyCallback?()
+            guard let self = self, self.isCurrent(owner) else { return }
+            self.onEvent(.started)
+        }
+    }
+
     func failCapture(owner: UInt64, message: String, teardown: @escaping () -> Void) {
         emitQueue.async { [weak self] in
             guard let self = self else { return }
@@ -259,24 +287,10 @@ final class SpeechCoordinator {
         switch result {
         case .samples(let samples):
             do {
-                let warming = inbox.warmupRemaining > 0
                 let schedule = try inbox.offer(samples)
-                var readyCallback: (() -> Void)?
-                if warming && inbox.warmupRemaining == 0 && startPendingOwner == owner {
-                    startPendingOwner = 0
-                    readyCallback = startReadyCallback
-                    startReadyCallback = nil
-                }
                 let level = inbox.pollAudioLevel(now: now)
                 lock.unlock()
 
-                if let readyCallback = readyCallback {
-                    emitQueue.async { [weak self] in
-                        readyCallback()
-                        guard let self = self, self.isCurrent(owner) else { return }
-                        self.onEvent(.started)
-                    }
-                }
                 if let level = level {
                     emitQueue.async { [weak self] in
                         guard let self = self else { return }
@@ -549,6 +563,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
     public let pluginMethods: [CAPPluginMethod] = [
         CAPPluginMethod(name: "available", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "requestPermissions", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "prewarm", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "start", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "stop", returnType: CAPPluginReturnPromise)
     ]
@@ -569,14 +584,24 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
             self.notifyListeners("recognitionError", data: ["message": message])
         }
     }
+    private let audioQueue = DispatchQueue(label: "com.imcodes.streaming-speech.audio", qos: .userInteractive)
+    // Audio capture graph & AVAudioSession state are owned strictly by audioQueue.
     private var engine: AVAudioEngine?
     private var tapInstalled = false
-    private var startingCall: CAPPluginCall? // main-thread only; ready after warmup
-    private var warmupWatchdog: DispatchWorkItem? // main-thread only; guards stalled CoreAudio warmup
+    private var cachedInputFormat: AVAudioFormat?
+    private var cachedMonoFormat: AVAudioFormat?
+    private var cachedConverter: AVAudioConverter?
+    private var audioSessionCategoryConfigured = false
+    private var audioSessionActive = false
+    // Call & lifecycle tracking on main thread.
+    private var activeMainOwner: UInt64 = 0
+    private var startingCall: CAPPluginCall? // main-thread only
+    private var warmupWatchdog: DispatchWorkItem? // main-thread only
     // Resident recognizer model kept across sessions on worker; Metal state is guarded for foreground use.
     private var recognizer: SpeechRecognizer?
 
     public override func load() {
+        coordinator.setBackgrounded(UIApplication.shared.applicationState == .background)
         NotificationCenter.default.addObserver(self, selector: #selector(interrupted(_:)), name: UIApplication.willResignActiveNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(didEnterBackground(_:)), name: UIApplication.didEnterBackgroundNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(didBecomeActive(_:)), name: UIApplication.didBecomeActiveNotification, object: nil)
@@ -584,8 +609,11 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         NotificationCenter.default.addObserver(self, selector: #selector(engineConfigurationChanged(_:)), name: .AVAudioEngineConfigurationChange, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(didReceiveMemoryWarning(_:)), name: UIApplication.didReceiveMemoryWarningNotification, object: nil)
         coordinator.worker.async { [weak self] in
-            guard let self = self else { return }
-            _ = self.ensureRecognizer()
+            guard let self = self, let recognizer = self.ensureRecognizer() else { return }
+            recognizer.warmupMetalIfNeeded { [weak self] in
+                guard let self = self else { return false }
+                return !self.coordinator.isBackgrounded && !self.coordinator.hasActiveCapture
+            }
         }
     }
     @objc private func didReceiveMemoryWarning(_ notification: Notification) {
@@ -640,18 +668,174 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
             call.resolve(["speechRecognition": allowed ? "granted" : "denied"])
         }
     }
+    @objc public func prewarm(_ call: CAPPluginCall) {
+        DispatchQueue.main.async {
+            let backgrounded = UIApplication.shared.applicationState == .background
+            self.coordinator.setBackgrounded(backgrounded)
+            if !backgrounded && self.modelAvailable {
+                self.coordinator.worker.async { [weak self] in
+                    guard let self = self, let recognizer = self.ensureRecognizer() else { return }
+                    recognizer.warmupMetalIfNeeded { [weak self] in
+                        guard let self = self else { return false }
+                        return !self.coordinator.isBackgrounded && !self.coordinator.hasActiveCapture
+                    }
+                }
+            }
+            self.audioQueue.async { [weak self] in
+                self?.prewarmAudioOnAudioQueue()
+                call.resolve()
+            }
+        }
+    }
+
+    private func configureAudioSessionCategoryIfNeeded(session: AVAudioSession) throws {
+        let desiredOptions: AVAudioSession.CategoryOptions = [.mixWithOthers, .defaultToSpeaker, .allowBluetooth]
+        if audioSessionCategoryConfigured,
+           session.category == .playAndRecord,
+           session.mode == .default,
+           session.categoryOptions.contains(desiredOptions) {
+            return
+        }
+        do {
+            try session.setCategory(.playAndRecord, mode: .default, options: desiredOptions)
+        } catch {
+            try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth])
+        }
+        audioSessionCategoryConfigured = true
+    }
+
+    private func invalidateEngineOnAudioQueue() {
+        if tapInstalled {
+            engine?.inputNode.removeTap(onBus: 0)
+            tapInstalled = false
+        }
+        engine?.stop()
+        engine = nil
+        cachedInputFormat = nil
+        cachedMonoFormat = nil
+        cachedConverter = nil
+    }
+
+    private func prepareGraphOnAudioQueue() throws -> (
+        engine: AVAudioEngine,
+        format: AVAudioFormat,
+        mono: AVAudioFormat,
+        converter: AVAudioConverter
+    ) {
+        if let existing = engine {
+            let format = existing.inputNode.outputFormat(forBus: 0)
+            if format.sampleRate > 0, format.channelCount > 0 {
+                if let cachedIn = cachedInputFormat,
+                   let cachedMono = cachedMonoFormat,
+                   let cachedConv = cachedConverter,
+                   cachedIn == format {
+                    return (existing, format, cachedMono, cachedConv)
+                }
+                if tapInstalled {
+                    existing.inputNode.removeTap(onBus: 0)
+                    tapInstalled = false
+                }
+                if let mono = cachedMonoFormat ?? AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false),
+                   let converter = AVAudioConverter(from: format, to: mono) {
+                    cachedInputFormat = format
+                    cachedMonoFormat = mono
+                    cachedConverter = converter
+                    return (existing, format, mono, converter)
+                }
+            }
+            invalidateEngineOnAudioQueue()
+        }
+
+        let created = AVAudioEngine()
+        let format = created.inputNode.outputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            throw NSError(domain: "StreamingSpeech", code: 1, userInfo: [NSLocalizedDescriptionKey: "Microphone format unavailable"])
+        }
+        guard let mono = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false),
+              let converter = AVAudioConverter(from: format, to: mono) else {
+            throw NSError(domain: "StreamingSpeech", code: 2, userInfo: nil)
+        }
+        created.prepare()
+        engine = created
+        cachedInputFormat = format
+        cachedMonoFormat = mono
+        cachedConverter = converter
+        return (created, format, mono, converter)
+    }
+
+    private func prewarmAudioOnAudioQueue() {
+        guard !tapInstalled else { return }
+        let session = AVAudioSession.sharedInstance()
+        try? configureAudioSessionCategoryIfNeeded(session: session)
+        // Touching inputNode when permission is .undetermined can trigger the OS prompt;
+        // only prepare AVAudioEngine passively when mic permission is already granted,
+        // and never activate AVAudioSession while idle.
+        guard session.recordPermission == .granted else { return }
+        if let existing = engine {
+            if !existing.isRunning {
+                existing.prepare()
+            }
+            return
+        }
+        _ = try? prepareGraphOnAudioQueue()
+    }
+
+    private func installTapAndStartOnAudioQueue(owner: UInt64) throws {
+        let installAndStart: (AVAudioEngine, AVAudioFormat, AVAudioFormat, AVAudioConverter) throws -> Void = { eng, fmt, mono, conv in
+            if self.tapInstalled {
+                eng.inputNode.removeTap(onBus: 0)
+                self.tapInstalled = false
+            }
+            let tapFrames = AVAudioFrameCount(max(512, Int(fmt.sampleRate / 40)))
+            eng.inputNode.installTap(onBus: 0, bufferSize: tapFrames, format: fmt) { [weak self] buffer, _ in
+                self?.consume(buffer, owner: owner, converter: conv, mono: mono)
+            }
+            self.tapInstalled = true
+            try eng.start()
+        }
+
+        let hadExistingEngine = (engine != nil)
+        let graph = try prepareGraphOnAudioQueue()
+        do {
+            try installAndStart(graph.engine, graph.format, graph.mono, graph.converter)
+        } catch {
+            guard hadExistingEngine else { throw error }
+            invalidateEngineOnAudioQueue()
+            let rebuilt = try prepareGraphOnAudioQueue()
+            try installAndStart(rebuilt.engine, rebuilt.format, rebuilt.mono, rebuilt.converter)
+        }
+    }
+
+    private func stopCaptureAudioOnAudioQueue(deactivateSession: Bool, forceTeardown: Bool) {
+        if tapInstalled {
+            engine?.inputNode.removeTap(onBus: 0)
+            tapInstalled = false
+        }
+        if let engine = engine {
+            if forceTeardown {
+                invalidateEngineOnAudioQueue()
+            } else if engine.isRunning {
+                engine.pause()
+            }
+        }
+        if forceTeardown {
+            audioSessionCategoryConfigured = false
+        }
+        if deactivateSession && audioSessionActive {
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            audioSessionActive = false
+        }
+    }
+
     @objc public func start(_ call: CAPPluginCall) {
         DispatchQueue.main.async {
             guard UIApplication.shared.applicationState != .background else {
                 call.reject("Speech requires a foreground app"); return
             }
-            guard AVAudioSession.sharedInstance().recordPermission == .granted else {
-                call.reject("Microphone permission denied"); return
-            }
             guard self.modelAvailable else {
                 call.reject("Offline speech model missing"); return
             }
-            if self.engine != nil || self.tapInstalled || self.startingCall != nil {
+            if self.activeMainOwner != 0 || self.startingCall != nil {
                 self.settleStartingCall(errorMessage: "Offline speech superseded by new session")
                 self.endCapture(nil, deactivateSession: false)
             }
@@ -681,54 +865,79 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                     self?.endCapture(nil)
                 }
             )
-            do {
-                let session = AVAudioSession.sharedInstance()
-                do {
-                    try session.setCategory(.playAndRecord, mode: .spokenAudio, options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth])
-                } catch {
-                    try session.setCategory(.playAndRecord, mode: .default, options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth])
-                }
-                try session.setActive(true)
-                if session.isInputGainSettable {
-                    try? session.setInputGain(1.0)
-                }
-                let engine = AVAudioEngine()
-                let input = engine.inputNode
-                let format = input.outputFormat(forBus: 0)
-                guard format.sampleRate > 0, format.channelCount > 0 else {
-                    throw NSError(domain: "StreamingSpeech", code: 1, userInfo: [NSLocalizedDescriptionKey: "Microphone format unavailable"])
-                }
-                guard let mono = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false),
-                      let converter = AVAudioConverter(from: format, to: mono) else {
-                    throw NSError(domain: "StreamingSpeech", code: 2, userInfo: nil)
-                }
-                self.engine = engine
-                let tapFrames = AVAudioFrameCount(max(512, Int(format.sampleRate / 40)))
-                input.installTap(onBus: 0, bufferSize: tapFrames, format: format) { [weak self] buffer, _ in
-                    self?.consume(buffer, owner: owner, converter: converter, mono: mono)
-                }
-                self.tapInstalled = true
-                try engine.start()
-                let watchdog = DispatchWorkItem { [weak self, weak expectedCall] in
-                    guard let self = self, let expectedCall = expectedCall,
-                          self.startingCall === expectedCall else { return }
-                    self.settleStartingCall(errorMessage: "Offline speech microphone failed to start")
-                    self.coordinator.cancelStartSetup(owner: owner)
-                    self.endCapture(nil)
-                }
-                self.cancelWarmupWatchdog()
-                self.warmupWatchdog = watchdog
-                DispatchQueue.main.asyncAfter(deadline: .now() + 10.0, execute: watchdog)
-                // consume() signals ready only after startup PCM was discarded;
-                // ~25ms tap interval reaches the 20ms warmup threshold without long UI stall.
-            } catch {
-                self.cancelWarmupWatchdog()
-                if self.startingCall === expectedCall {
-                    self.startingCall = nil
-                }
+            self.activeMainOwner = owner
+            let watchdog = DispatchWorkItem { [weak self, weak expectedCall] in
+                guard let self = self, let expectedCall = expectedCall,
+                      self.startingCall === expectedCall else { return }
+                self.settleStartingCall(errorMessage: "Offline speech microphone failed to start")
                 self.coordinator.cancelStartSetup(owner: owner)
                 self.endCapture(nil)
-                call.reject("Offline speech could not start", nil, error)
+            }
+            self.cancelWarmupWatchdog()
+            self.warmupWatchdog = watchdog
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10.0, execute: watchdog)
+
+            self.audioQueue.async { [weak self] in
+                guard let self = self else { return }
+                guard self.coordinator.isCurrent(owner) else {
+                    DispatchQueue.main.async {
+                        if self.startingCall === expectedCall {
+                            self.settleStartingCall(errorMessage: "Offline speech cancelled during startup")
+                        }
+                    }
+                    return
+                }
+                let session = AVAudioSession.sharedInstance()
+                guard session.recordPermission == .granted else {
+                    self.coordinator.cancelStartSetup(owner: owner)
+                    DispatchQueue.main.async {
+                        if self.startingCall === expectedCall {
+                            self.settleStartingCall(errorMessage: "Microphone permission denied")
+                        }
+                        if self.activeMainOwner == owner {
+                            self.activeMainOwner = 0
+                        }
+                        self.endCapture(nil, deactivateSession: false)
+                    }
+                    return
+                }
+                do {
+                    try self.configureAudioSessionCategoryIfNeeded(session: session)
+                    if !self.audioSessionActive {
+                        try session.setActive(true)
+                        self.audioSessionActive = true
+                    }
+                    if session.isInputGainSettable, session.inputGain != 1.0 {
+                        try? session.setInputGain(1.0)
+                    }
+                    try self.installTapAndStartOnAudioQueue(owner: owner)
+                    guard self.coordinator.isCurrent(owner) else {
+                        self.stopCaptureAudioOnAudioQueue(deactivateSession: true, forceTeardown: false)
+                        DispatchQueue.main.async {
+                            if self.startingCall === expectedCall {
+                                self.settleStartingCall(errorMessage: "Offline speech cancelled during startup")
+                            }
+                        }
+                        return
+                    }
+                    // Hardware capture is live; resolve start() and emit .started immediately
+                    // while SpeechInbox still drops warmupSamples before feeding gain/window/levels.
+                    self.coordinator.markStarted(owner: owner)
+                } catch {
+                    self.coordinator.cancelStartSetup(owner: owner)
+                    self.stopCaptureAudioOnAudioQueue(deactivateSession: true, forceTeardown: true)
+                    DispatchQueue.main.async {
+                        self.cancelWarmupWatchdog()
+                        if self.startingCall === expectedCall {
+                            self.startingCall = nil
+                        }
+                        if self.activeMainOwner == owner {
+                            self.activeMainOwner = 0
+                        }
+                        self.endCapture(nil, deactivateSession: false)
+                        call.reject("Offline speech could not start", nil, error)
+                    }
+                }
             }
         }
     }
@@ -785,24 +994,38 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
     @objc private func engineConfigurationChanged(_ notification: Notification) {
-        DispatchQueue.main.async {
-            guard let activeEngine = self.engine else { return }
-            if let notifiedEngine = notification.object as? AVAudioEngine, notifiedEngine !== activeEngine {
+        let notifiedEngine = notification.object as? AVAudioEngine
+        audioQueue.async { [weak self] in
+            guard let self = self, let activeEngine = self.engine else { return }
+            if let notifiedEngine = notifiedEngine, notifiedEngine !== activeEngine {
                 return
             }
-            if self.startingCall != nil {
-                self.settleStartingCall(errorMessage: "Offline speech interrupted by audio configuration change")
+            let wasCapturing = self.tapInstalled
+            self.invalidateEngineOnAudioQueue()
+            self.audioSessionCategoryConfigured = false
+            if self.audioSessionActive {
+                try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+                self.audioSessionActive = false
             }
-            self.endCapture(nil)
+            DispatchQueue.main.async {
+                if self.startingCall != nil {
+                    self.settleStartingCall(errorMessage: "Offline speech interrupted by audio configuration change")
+                }
+                if wasCapturing || self.activeMainOwner != 0 {
+                    self.endCapture(nil, deactivateSession: true, forceTeardown: true)
+                }
+            }
         }
     }
     @objc private func didBecomeActive(_ notification: Notification) {
         coordinator.setBackgrounded(false)
     }
     @objc public func stop(_ call: CAPPluginCall) { DispatchQueue.main.async { self.endCapture(call) } }
-    // Main-thread capture teardown; serial decoder flush precedes stopped and ACK.
-    private func endCapture(_ call: CAPPluginCall?, deactivateSession: Bool = true) {
+    // Capture teardown dispatches CoreAudio/AVAudioSession work off main onto audioQueue;
+    // serial decoder flush still precedes .stopped emission and stop() resolution.
+    private func endCapture(_ call: CAPPluginCall?, deactivateSession: Bool = true, forceTeardown: Bool = false) {
         cancelWarmupWatchdog()
+        activeMainOwner = 0
         coordinator.endCapture(
             stopCompletion: call.map { c in
                 { errorMsg in
@@ -811,10 +1034,8 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
                 }
             },
             stopAudio: {
-                if tapInstalled { engine?.inputNode.removeTap(onBus: 0); tapInstalled = false }
-                engine?.stop(); engine = nil
-                if deactivateSession {
-                    try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+                audioQueue.async { [weak self] in
+                    self?.stopCaptureAudioOnAudioQueue(deactivateSession: deactivateSession, forceTeardown: forceTeardown)
                 }
             }
         )
@@ -836,6 +1057,7 @@ final class SpeechRecognizer {
     }
     let model: Qwen3ASRModel
     let hotwords: String?
+    private var didWarmupMetal = false // Accessed strictly on coordinator.worker.
     init?(root: URL) {
         guard Self.isMetalSupported else { return nil }
         let words = ((try? String(contentsOf: root.appendingPathComponent("hotwords.txt"), encoding: .utf8)) ?? "")
@@ -845,6 +1067,26 @@ final class SpeechRecognizer {
         self.hotwords = words.isEmpty ? nil : words.joined(separator: ", ")
         guard let loaded = try? Qwen3ASRModel.loadLocal(from: root) else { return nil }
         self.model = loaded
+    }
+
+    func warmupMetalIfNeeded(shouldContinue: () -> Bool) {
+        guard !didWarmupMetal, shouldContinue() else { return }
+        let silent = [Float](repeating: 0, count: 1600)
+        let options = Qwen3DecodingOptions(maxTokens: 1, language: nil, context: hotwords)
+        do {
+            _ = try model.transcribeSegmentWithCancellation(
+                audio: silent,
+                sampleRate: 16000,
+                options: options,
+                prefixTokens: []
+            ) {
+                if !shouldContinue() { throw CancellationError() }
+            }
+            didWarmupMetal = true
+        } catch {
+            // Cancelled or transient failure: allow retry on next prewarm/capture.
+        }
+        Qwen3ASRModel.clearMetalCache()
     }
 }
 

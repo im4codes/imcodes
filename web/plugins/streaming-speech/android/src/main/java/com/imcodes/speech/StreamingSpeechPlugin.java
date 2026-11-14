@@ -54,6 +54,7 @@ public class StreamingSpeechPlugin extends Plugin {
     private final AtomicLong generation = new AtomicLong();
     private final Object captureLock = new Object();
     private Qwen3OnnxDecoder decoder;
+    private volatile Boolean cachedAssetsAvailable;
     private CaptureSession activeSession;
     private volatile AudioRecord recorder;
     private volatile boolean listening;
@@ -133,17 +134,34 @@ public class StreamingSpeechPlugin extends Plugin {
     }
 
     @PluginMethod
-    public void available(PluginCall call) {
-        boolean ready = true;
-        for (String name : MODEL_FILES) {
-            try (java.io.InputStream input = getContext().getAssets().open(name)) {
-                if (!name.equals("hotwords.txt") && input.read() < 0) ready = false;
-            } catch (IOException e) {
-                ready = false;
+    public void prewarm(PluginCall call) {
+        worker.execute(() -> {
+            try {
+                ensureDecoder();
+            } catch (Exception | LinkageError ignored) {
+                // Deferred to start() where initialization errors surface to the caller.
             }
+        });
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void available(PluginCall call) {
+        Boolean cached = cachedAssetsAvailable;
+        if (cached == null) {
+            boolean ready = true;
+            for (String name : MODEL_FILES) {
+                try (java.io.InputStream input = getContext().getAssets().open(name)) {
+                    if (!name.equals("hotwords.txt") && input.read() < 0) ready = false;
+                } catch (IOException e) {
+                    ready = false;
+                }
+            }
+            cached = ready;
+            cachedAssetsAvailable = cached;
         }
         JSObject result = new JSObject();
-        result.put("available", ready);
+        result.put("available", cached);
         call.resolve(result);
     }
 

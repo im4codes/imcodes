@@ -1788,4 +1788,65 @@ describe('Web Mobile final drain', () => {
     }
   });
 
+  it('invokes native prewarm?.() during prewarm, ignores prewarm failures, overlaps uncached addListener with checks, and does not stall start on slow passive prewarm', async () => {
+    const prewarmSpy = vi.fn(async () => undefined);
+    (speechApi as any).prewarm = prewarmSpy;
+    try {
+      // 1. Concurrent prewarm triggers native prewarm() once and caches checks cleanly
+      await Promise.all([
+        VoiceInput.prewarm({ requestPermission: false }),
+        VoiceInput.prewarm({ requestPermission: false }),
+      ]);
+      expect(prewarmSpy).toHaveBeenCalledTimes(1);
+
+      // Subsequent start consumes warm cache with 0 extra permission/available IPC calls
+      await expect(VoiceInput.startListening(vi.fn())).resolves.toBe(true);
+      expect(speechApi.requestPermissions).not.toHaveBeenCalled();
+      expect(speechApi.available).toHaveBeenCalledTimes(1);
+      await VoiceInput.stopListening({ abort: true });
+
+      // 2. Native prewarm() rejection never breaks VoiceInput.prewarm() or cache population
+      vi.resetModules();
+      speechApi.available.mockClear();
+      speechApi.checkPermissions.mockClear();
+      prewarmSpy.mockRejectedValueOnce(new Error('metal warmup skipped'));
+      VoiceInput = await import('../../src/components/VoiceInput.js');
+      await expect(VoiceInput.prewarm({ requestPermission: false })).resolves.toBeUndefined();
+      expect(prewarmSpy).toHaveBeenCalledTimes(2);
+
+      // 3. Uncached start overlaps addListener with pending requestPermissions + available and skips stalled passive prewarm
+      vi.resetModules();
+      delete (speechApi as any).prewarm;
+      speechApi.addListener.mockClear();
+      speechApi.requestPermissions.mockClear();
+      speechApi.available.mockClear();
+      VoiceInput = await import('../../src/components/VoiceInput.js');
+
+      const slowPassiveCheck = deferred<{ speechRecognition: string }>();
+      speechApi.checkPermissions.mockReturnValueOnce(slowPassiveCheck.promise);
+      const passivePrewarm = VoiceInput.prewarm({ requestPermission: false });
+
+      const permGate = deferred<{ speechRecognition: string }>();
+      const availGate = deferred<{ available: boolean }>();
+      speechApi.requestPermissions.mockReturnValueOnce(permGate.promise);
+      speechApi.available.mockReturnValueOnce(availGate.promise);
+
+      const startPromise = VoiceInput.startListening(vi.fn());
+      // Listeners register in parallel immediately without waiting for slow passive prewarm or sequential perm/avail settle
+      await waitFor(() => expect(speechApi.addListener).toHaveBeenCalledTimes(4));
+      expect(speechApi.requestPermissions).toHaveBeenCalledTimes(1);
+      expect(speechApi.available).toHaveBeenCalledTimes(1);
+
+      permGate.resolve({ speechRecognition: 'granted' });
+      availGate.resolve({ available: true });
+      await expect(startPromise).resolves.toBe(true);
+      slowPassiveCheck.resolve({ speechRecognition: 'granted' });
+      await passivePrewarm;
+      await VoiceInput.stopListening({ abort: true });
+    } finally {
+      delete (speechApi as any).prewarm;
+      await VoiceInput.stopListening({ abort: true });
+    }
+  });
+
 });

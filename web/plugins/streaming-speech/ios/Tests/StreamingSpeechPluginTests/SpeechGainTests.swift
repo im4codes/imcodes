@@ -226,4 +226,93 @@ final class SpeechGainTests: XCTestCase {
             XCTAssertGreaterThanOrEqual(maxDecodedSamples, 24000)
         }
     }
+
+    func testCoordinatorEmitsStartedImmediatelyBeforeTapWhileStillDroppingWarmupSamples() {
+        let emitQueue = DispatchQueue(label: "test.coordinator.emit")
+        let readyExp = expectation(description: "onStartReady settled immediately")
+        let startedExp = expectation(description: "started event emitted immediately")
+        let stoppedExp = expectation(description: "stopped event emitted cleanly")
+
+        let lock = NSLock()
+        var events: [SpeechCoordinator.Event] = []
+        var readyCount = 0
+        var decodedSamplesCount = 0
+
+        let coordinator = SpeechCoordinator(emitQueue: emitQueue) { event in
+            lock.lock()
+            events.append(event)
+            lock.unlock()
+            if event == .started {
+                startedExp.fulfill()
+            } else if event == .stopped {
+                stoppedExp.fulfill()
+            }
+        }
+
+        let owner = coordinator.beginStart(
+            makeDecode: {
+                SpeechCoordinator.Decoder(
+                    decode: { samples, _, _ in
+                        lock.lock()
+                        decodedSamplesCount += samples.count
+                        lock.unlock()
+                        return ("hello", [1, 2])
+                    },
+                    rollbackPrefix: { tokens, _ in tokens }
+                )
+            },
+            onStartReady: {
+                lock.lock()
+                readyCount += 1
+                lock.unlock()
+                readyExp.fulfill()
+            },
+            onSetupFailureTeardown: {
+                XCTFail("Unexpected setup failure")
+            }
+        )
+
+        coordinator.markStarted(owner: owner)
+        wait(for: [readyExp, startedExp], timeout: 2.0)
+
+        // Warmup samples (320 samples = 20ms) are still discarded before audioLevel / decode.
+        coordinator.offerSamples(
+            [Float](repeating: 0.5, count: SpeechInbox.warmupSamples),
+            owner: owner,
+            now: 1.0,
+            onOverloadTeardown: { XCTFail("Unexpected overload") }
+        )
+        coordinator.offerSamples(
+            sineWave(count: 400, rms: 0.05),
+            owner: owner,
+            now: 2.0,
+            onOverloadTeardown: { XCTFail("Unexpected overload") }
+        )
+
+        let stopAckExp = expectation(description: "stop completion resolved")
+        coordinator.endCapture(
+            stopCompletion: { err in
+                XCTAssertNil(err)
+                stopAckExp.fulfill()
+            },
+            stopAudio: {}
+        )
+        wait(for: [stoppedExp, stopAckExp], timeout: 2.0)
+
+        lock.lock()
+        let startedCount = events.filter { $0 == .started }.count
+        let audioLevelCount = events.filter {
+            if case .audioLevel = $0 { return true }
+            return false
+        }.count
+        let finalReadyCount = readyCount
+        let finalDecoded = decodedSamplesCount
+        lock.unlock()
+
+        XCTAssertEqual(finalReadyCount, 1)
+        XCTAssertEqual(startedCount, 1)
+        XCTAssertEqual(audioLevelCount, 1, "Only post-warmup audio should emit audioLevel")
+        XCTAssertGreaterThan(finalDecoded, 0)
+        XCTAssertLessThanOrEqual(finalDecoded, 400, "Warmup samples must remain discarded before decoding")
+    }
 }

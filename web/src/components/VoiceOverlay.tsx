@@ -268,6 +268,12 @@ export function VoiceOverlay({
   }, []);
 
   useEffect(() => {
+    const prewarmVoiceInput = () => {
+      if (Object.prototype.hasOwnProperty.call(VoiceInput, 'prewarm')) {
+        void (VoiceInput as { prewarm?: (opts?: { requestPermission?: boolean }) => Promise<void> })
+          .prewarm?.({ requestPermission: false });
+      }
+    };
     if (!open) {
       openRef.current = false;
       openSeqRef.current++;
@@ -275,6 +281,7 @@ export function VoiceOverlay({
       stopErrorTokenRef.current = null;
       pendingResumeAfterStopRef.current = false;
       pendingResumeWaiterRef.current = null;
+      prewarmVoiceInput();
       return;
     }
     openRef.current = true;
@@ -361,9 +368,12 @@ export function VoiceOverlay({
     // own would talk over the offer to resume it.
     if (!recoverable && autoStartListening) {
       void startSession(init.length);
-    } else if (Object.prototype.hasOwnProperty.call(VoiceInput, 'cancelWebGesturePrime')) {
-      const cancelPrime = (VoiceInput as { cancelWebGesturePrime?: () => void }).cancelWebGesturePrime;
-      if (typeof cancelPrime === 'function') cancelPrime();
+    } else {
+      prewarmVoiceInput();
+      if (Object.prototype.hasOwnProperty.call(VoiceInput, 'cancelWebGesturePrime')) {
+        const cancelPrime = (VoiceInput as { cancelWebGesturePrime?: () => void }).cancelWebGesturePrime;
+        if (typeof cancelPrime === 'function') cancelPrime();
+      }
     }
     return () => {
       clearRestartTimer();
