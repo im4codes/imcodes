@@ -717,12 +717,12 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin {
         let desiredOptions: AVAudioSession.CategoryOptions = [.mixWithOthers, .defaultToSpeaker, .allowBluetooth]
         if audioSessionCategoryConfigured,
            session.category == .playAndRecord,
-           session.mode == .default,
+           (session.mode == .spokenAudio || session.mode == .default),
            session.categoryOptions.contains(desiredOptions) {
             return
         }
         do {
-            try session.setCategory(.playAndRecord, mode: .default, options: desiredOptions)
+            try session.setCategory(.playAndRecord, mode: .spokenAudio, options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth])
         } catch {
             try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth])
         }

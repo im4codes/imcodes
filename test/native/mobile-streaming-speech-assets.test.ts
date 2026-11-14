@@ -218,7 +218,8 @@ describe('Qwen3-ASR mobile assets', () => {
     expect(ios).toContain('struct SpeechGain');
     expect(ios).toContain('options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth]');
     expect(ios).not.toContain('.duckOthers');
-    expect(ios).toContain('if warming && inbox.warmupRemaining == 0');
+    expect(ios).toContain('self.coordinator.markStarted(owner: owner)');
+    expect(ios).toContain('guard warmupRemaining == 0');
     expect(ios).toContain('self.settleStartingCall()');
     expect(ios).toContain('startingCall = nil');
     expect(ios).not.toContain('if self.engine?.isRunning == true { call.resolve(); return }');
@@ -226,8 +227,8 @@ describe('Qwen3-ASR mobile assets', () => {
     expect(ios).toContain('.AVAudioEngineConfigurationChange');
     expect(ios).toContain('AVAudioPCMBuffer(pcmFormat: mono, frameCapacity: capacity)');
     expect(ios).not.toContain('AVAudioPCMBuffer(pcmFormat: format, frameCapacity: capacity)');
-    expect(ios).toContain('AVAudioFrameCount(max(512, Int(format.sampleRate / 40)))');
-    expect(ios).toContain('input.installTap(onBus: 0, bufferSize: tapFrames, format: format)');
+    expect(ios).toContain('AVAudioFrameCount(max(512, Int(fmt.sampleRate / 40)))');
+    expect(ios).toContain('eng.inputNode.installTap(onBus: 0, bufferSize: tapFrames, format: fmt)');
     expect(ios).toContain('Offline audio conversion failed:');
     expect(ios).toContain('UIApplication.shared.applicationState != .background');
     expect(ios).toContain('UIApplication.willResignActiveNotification');
@@ -382,7 +383,7 @@ public class AudioRecord {
       'com/getcapacitor/JSArray.java': `package com.getcapacitor; public class JSArray extends java.util.ArrayList<Object>{ public JSArray put(Object x){ add(x); return this; } }`,
       'com/getcapacitor/JSObject.java': `package com.getcapacitor; public class JSObject extends java.util.TreeMap<String,Object>{}`,
       'com/getcapacitor/PermissionState.java': `package com.getcapacitor; public enum PermissionState{ GRANTED }`,
-      'com/getcapacitor/PluginCall.java': `package com.getcapacitor; public class PluginCall { public final java.util.concurrent.CountDownLatch done=new java.util.concurrent.CountDownLatch(1); public String error,value; public void resolve(){ done.countDown(); } public void resolve(JSObject o){ value=o.toString(); resolve(); } public void reject(String e){ error=e; done.countDown(); } public void reject(String e,Exception x){ reject(e); } }`,
+      'com/getcapacitor/PluginCall.java': `package com.getcapacitor; public class PluginCall { public final java.util.concurrent.CountDownLatch done=new java.util.concurrent.CountDownLatch(1); public String error,value; public String getString(String key){ return null; } public void resolve(){ done.countDown(); } public void resolve(JSObject o){ value=o.toString(); resolve(); } public void reject(String e){ error=e; done.countDown(); } public void reject(String e,Exception x){ reject(e); } }`,
       'com/getcapacitor/Plugin.java': `package com.getcapacitor;
 public class Plugin {
   public final java.util.List<String> events=java.util.Collections.synchronizedList(new java.util.ArrayList<>());
@@ -907,6 +908,7 @@ var cancelAfterCheck = false
 final class Qwen3ASRModel {
     let root: URL
     init(root: URL) { self.root = root }
+    static func clearMetalCache() {}
     static func loadLocal(from root: URL) throws -> Qwen3ASRModel {
         loadedRoots.append(root)
         return Qwen3ASRModel(root: root)
@@ -1146,6 +1148,7 @@ do {
         var freshOwner: UInt64 = 0
         if replaceBeforeDelivery {
             freshOwner = coord.beginStart(makeDecode: { SpeechCoordinator.Decoder { s, _, cont in cont() ? ("fresh:\\(s.count)", []) : nil } }, onStartReady: {}, onSetupFailureTeardown: {})
+            coord.markStarted(owner: freshOwner)
             coord.offerSamples(speech(320), owner: freshOwner, now: 0.20) {}
             coord.worker.sync {}
         }
