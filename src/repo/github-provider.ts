@@ -67,8 +67,9 @@ export class GitHubProvider implements RepoProvider {
 
     // The /issues endpoint mixes issues and PRs. Filtering on `.pull_request == null`
     // is not reliable across all gh/jq combinations for closed pages, so prefer the
-    // canonical HTML route shape instead.
-    const jq = `[.[] | select(.html_url | contains("/issues/")) | {id: (.id | tostring), number, title, body: (.body // ""), state, author: .user.login, labels: [.labels[].name], url: .html_url, assignee: (.assignee.login // null), createdAt: (.created_at | fromdateiso8601 * 1000), updatedAt: (.updated_at | fromdateiso8601 * 1000)}]`;
+    // canonical HTML route shape instead. Return raw pre-filter page length alongside
+    // filtered items so callers can paginate past PR-only or mixed pages accurately.
+    const jq = `{rawCount: length, items: [.[] | select(.html_url | contains("/issues/")) | {id: (.id | tostring), number, title, body: (.body // ""), state, author: .user.login, labels: [.labels[].name], url: .html_url, assignee: (.assignee.login // null), createdAt: (.created_at | fromdateiso8601 * 1000), updatedAt: (.updated_at | fromdateiso8601 * 1000)}]}`;
 
     try {
       const { stdout } = await execFileAsync('gh', [
@@ -77,8 +78,14 @@ export class GitHubProvider implements RepoProvider {
         '-q', jq,
       ], { cwd: this.projectDir, timeout: 15000, maxBuffer: 10 * 1024 * 1024 });
 
-      const items: RepoIssue[] = JSON.parse(stdout || '[]');
-      return { items, page, hasMore: items.length === perPage, projectDir: this.projectDir };
+      const parsed = JSON.parse(stdout || '[]') as RepoIssue[] | { rawCount?: unknown; items?: unknown };
+      const items: RepoIssue[] = Array.isArray(parsed)
+        ? parsed
+        : (Array.isArray(parsed?.items) ? parsed.items as RepoIssue[] : []);
+      const rawCount = Array.isArray(parsed)
+        ? parsed.length
+        : (typeof parsed?.rawCount === 'number' && Number.isFinite(parsed.rawCount) ? parsed.rawCount : items.length);
+      return { items, rawCount, page, hasMore: rawCount === perPage, projectDir: this.projectDir };
     } catch (err) {
       const code = translateError(err);
       const error = new Error(`gh error: ${code}`);

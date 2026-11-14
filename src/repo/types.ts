@@ -42,6 +42,8 @@ export interface RepoListResult<T> {
   items: T[];
   page: number;
   hasMore: boolean;
+  /** Raw upstream item count on this page before provider-side filtering (when different from items.length). */
+  rawCount?: number;
   projectDir: string;
 }
 

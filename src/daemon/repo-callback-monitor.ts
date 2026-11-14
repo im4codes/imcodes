@@ -83,6 +83,7 @@ interface DetectedEventCandidate {
 interface PollPageItem {
   seq: number;
   pending: boolean;
+  markSeenOnBaseline: boolean;
   runAttempt?: number;
   createdAtMs?: number;
   dedupKey: string;
@@ -103,6 +104,7 @@ export interface RepoCallbackMonitorDeps {
   pollTickMs?: number;
   perPage?: number;
   maxPagesPerPoll?: number;
+  /** @deprecated Baseline never completes early on a page cap; scans across bounded polls until !hasMore. */
   maxBaselinePages?: number;
   maxDetailFetchesPerPoll?: number;
 }
@@ -210,7 +212,6 @@ export class RepoCallbackMonitor {
   private readonly pollTickMs: number;
   private readonly perPage: number;
   private readonly maxPagesPerPoll: number;
-  private readonly maxBaselinePages: number;
   private readonly maxDetailFetchesPerPoll: number;
 
   private globalTemplates: RepoCallbackTemplate[] = [];
@@ -238,7 +239,6 @@ export class RepoCallbackMonitor {
     this.pollTickMs = deps.pollTickMs ?? DEFAULT_POLL_TICK_MS;
     this.perPage = Math.max(1, deps.perPage ?? REPO_CALLBACK_DEFAULT_PER_PAGE);
     this.maxPagesPerPoll = Math.max(1, deps.maxPagesPerPoll ?? REPO_CALLBACK_DEFAULT_MAX_PAGES_PER_POLL);
-    this.maxBaselinePages = Math.max(1, deps.maxBaselinePages ?? REPO_CALLBACK_DEFAULT_MAX_BASELINE_PAGES);
     this.maxDetailFetchesPerPoll = Math.max(0, deps.maxDetailFetchesPerPoll ?? REPO_CALLBACK_MAX_DETAIL_FETCHES_PER_POLL);
   }
 
@@ -462,8 +462,9 @@ export class RepoCallbackMonitor {
       pendingMap.set(entry.seq, entry.createdAt);
     }
 
-    // 1. Cold-start / resumable historical baseline sweep (never sets baselineComplete=true
-    // until pagination completes or archival cap is reached without error).
+    // 1. Cold-start / resumable historical baseline sweep.
+    // Never marks baselineComplete=true until provider pagination actually reaches EOF (!hasMore);
+    // bounded per poll via maxPagesPerPoll and persisted via baselineNextPage across ticks/restarts.
     if (!checkpoint || !checkpoint.baselineComplete) {
       let currentPage = checkpoint?.baselineNextPage ?? 1;
       let watermarkSeq = checkpoint?.watermarkSeq ?? null;
@@ -475,18 +476,18 @@ export class RepoCallbackMonitor {
 
         const dedupKeysToMark: string[] = [];
         for (const item of pageResult.items) {
-          if (currentPage === 1 || watermarkSeq === null) {
-            watermarkSeq = watermarkSeq === null ? item.seq : Math.max(watermarkSeq, item.seq);
-          }
+          watermarkSeq = watermarkSeq === null ? item.seq : Math.max(watermarkSeq, item.seq);
           if (item.pending) {
             pendingMap.set(item.seq, item.createdAtMs);
           } else {
             pendingMap.delete(item.seq);
-            dedupKeysToMark.push(item.dedupKey);
+            if (item.markSeenOnBaseline) {
+              dedupKeysToMark.push(item.dedupKey);
+            }
           }
         }
 
-        const reachedEnd = !pageResult.hasMore || pageResult.items.length === 0 || currentPage >= this.maxBaselinePages;
+        const reachedEnd = !pageResult.hasMore;
         const nextPending = prunePendingMap(pendingMap, this.now());
         this.store.saveCheckpointProgress(
           {
@@ -511,41 +512,39 @@ export class RepoCallbackMonitor {
     }
 
     // 2. Steady-state incremental & resumable multi-page polling.
-    const watermarkSeq = checkpoint.watermarkSeq ?? 0;
+    let watermarkSeq = checkpoint.watermarkSeq ?? 0;
     let currentPage = checkpoint.syncNextPage;
     let syncHighSeq = checkpoint.syncHighSeq;
     let pagesFetched = 0;
     let detailFetches = 0;
     let dispatched = 0;
 
-    while (pagesFetched < this.maxPagesPerPoll) {
-      const pageResult = await this.fetchEventPage(provider, projectDir, eventType, currentPage);
+    const processPage = async (page: number): Promise<{
+      hasMore: boolean;
+      minSeqOnPage: number | null;
+      maxSeqOnPage: number | null;
+    }> => {
+      const pageResult = await this.fetchEventPage(provider, projectDir, eventType, page);
       pagesFetched += 1;
 
       let minSeqOnPage: number | null = null;
+      let maxSeqOnPage: number | null = null;
       const pageCandidates: DetectedEventCandidate[] = [];
 
       for (const item of pageResult.items) {
-        if (currentPage === 1) {
-          syncHighSeq = syncHighSeq === null ? item.seq : Math.max(syncHighSeq, item.seq);
-        }
         minSeqOnPage = minSeqOnPage === null ? item.seq : Math.min(minSeqOnPage, item.seq);
+        maxSeqOnPage = maxSeqOnPage === null ? item.seq : Math.max(maxSeqOnPage, item.seq);
 
         if (item.pending) {
           pendingMap.set(item.seq, item.createdAtMs);
           continue;
         }
 
-        const wasTrackedPending = pendingMap.delete(item.seq);
+        pendingMap.delete(item.seq);
         if (!item.candidate) {
           continue;
         }
         if (this.store.hasSeenDedupKey(CALLBACK_SOURCES.REPO, item.dedupKey)) {
-          continue;
-        }
-        const isAboveWatermark = item.seq > watermarkSeq;
-        const isCiRerun = eventType === 'ci_failed' && (item.runAttempt ?? 1) > 1;
-        if (!isAboveWatermark && !wasTrackedPending && !isCiRerun) {
           continue;
         }
         pageCandidates.push(item.candidate);
@@ -576,15 +575,119 @@ export class RepoCallbackMonitor {
         dispatched += 1;
       }
 
-      const nextPending = prunePendingMap(pendingMap, this.now());
-      const oldestPendingSeq = nextPending.length > 0
-        ? Math.min(...nextPending.map((entry) => entry.seq))
-        : Infinity;
-      const stopSeqThreshold = Math.min(watermarkSeq, oldestPendingSeq - 1);
-      const reachedWatermark =
-        pageResult.items.length === 0
-        || !pageResult.hasMore
-        || (minSeqOnPage !== null && minSeqOnPage <= stopSeqThreshold);
+      return {
+        hasMore: pageResult.hasMore,
+        minSeqOnPage,
+        maxSeqOnPage,
+      };
+    };
+
+    if (eventType !== 'ci_failed') {
+      // PRs and issues are ordered by creation descending and creations are immutable,
+      // so scanning stops once we hit our creation watermark (still never stopping on filtered-empty pages when hasMore is true).
+      while (pagesFetched < this.maxPagesPerPoll) {
+        const pageInfo = await processPage(currentPage);
+        if (pageInfo.maxSeqOnPage !== null) {
+          syncHighSeq = syncHighSeq === null ? pageInfo.maxSeqOnPage : Math.max(syncHighSeq, pageInfo.maxSeqOnPage);
+        }
+
+        const nextPending = prunePendingMap(pendingMap, this.now());
+        const oldestPendingSeq = nextPending.length > 0
+          ? Math.min(...nextPending.map((entry) => entry.seq))
+          : Infinity;
+        const stopSeqThreshold = Math.min(watermarkSeq, oldestPendingSeq - 1);
+        const reachedWatermark =
+          !pageInfo.hasMore
+          || (pageInfo.minSeqOnPage !== null && pageInfo.minSeqOnPage <= stopSeqThreshold);
+
+        this.store.saveCheckpointProgress({
+          source: CALLBACK_SOURCES.REPO,
+          scopeKey: projectDir,
+          eventType,
+          baselineComplete: true,
+          baselineNextPage: 1,
+          watermarkSeq: reachedWatermark ? Math.max(watermarkSeq, syncHighSeq ?? watermarkSeq) : watermarkSeq,
+          syncNextPage: reachedWatermark ? 1 : currentPage + 1,
+          syncHighSeq: reachedWatermark ? null : syncHighSeq,
+          pendingSeqs: nextPending,
+          updatedAt: this.now(),
+        });
+
+        if (reachedWatermark) break;
+        currentPage += 1;
+      }
+      return dispatched;
+    }
+
+    // CI workflow runs / pipelines are sorted by creation/id descending, NOT rerun/updated order:
+    // an older run on page 2+ can be re-run (new runAttempt / state change) without changing its ID.
+    // Therefore CI polling must never early-stop on creation watermark; instead it maintains a bounded,
+    // resumable full-history sweep (`syncNextPage`) while still peeking page 1 when resuming deeper pages.
+    let inHeadCatchup = syncHighSeq !== null && syncHighSeq > watermarkSeq;
+
+    if (!inHeadCatchup && currentPage > 1 && this.maxPagesPerPoll >= 2) {
+      const page1 = await processPage(1);
+      if (page1.maxSeqOnPage !== null && page1.maxSeqOnPage > watermarkSeq) {
+        const page1ClearedBurst =
+          !page1.hasMore
+          || (page1.minSeqOnPage !== null && page1.minSeqOnPage <= watermarkSeq);
+        if (page1ClearedBurst) {
+          watermarkSeq = page1.maxSeqOnPage;
+          syncHighSeq = null;
+        } else {
+          syncHighSeq = page1.maxSeqOnPage;
+          inHeadCatchup = true;
+          currentPage = 2;
+        }
+      }
+      if (!page1.hasMore) {
+        currentPage = 1;
+        syncHighSeq = null;
+        inHeadCatchup = false;
+      }
+      this.store.saveCheckpointProgress({
+        source: CALLBACK_SOURCES.REPO,
+        scopeKey: projectDir,
+        eventType,
+        baselineComplete: true,
+        baselineNextPage: 1,
+        watermarkSeq,
+        syncNextPage: currentPage,
+        syncHighSeq,
+        pendingSeqs: prunePendingMap(pendingMap, this.now()),
+        updatedAt: this.now(),
+      });
+      if (!page1.hasMore) {
+        return dispatched;
+      }
+    }
+
+    while (pagesFetched < this.maxPagesPerPoll) {
+      const pageInfo = await processPage(currentPage);
+      if (pageInfo.maxSeqOnPage !== null && (currentPage === 1 || inHeadCatchup)) {
+        syncHighSeq = syncHighSeq === null ? pageInfo.maxSeqOnPage : Math.max(syncHighSeq, pageInfo.maxSeqOnPage);
+      }
+
+      const caughtUpToWatermark =
+        !pageInfo.hasMore
+        || (pageInfo.minSeqOnPage !== null && pageInfo.minSeqOnPage <= watermarkSeq);
+      if (caughtUpToWatermark && syncHighSeq !== null) {
+        watermarkSeq = Math.max(watermarkSeq, syncHighSeq);
+        syncHighSeq = null;
+        inHeadCatchup = false;
+      } else if (!inHeadCatchup && currentPage === 1 && syncHighSeq !== null && syncHighSeq > watermarkSeq) {
+        inHeadCatchup = true;
+      }
+
+      const wrapped = !pageInfo.hasMore;
+      const nextPage = wrapped ? 1 : currentPage + 1;
+      if (wrapped) {
+        if (syncHighSeq !== null) {
+          watermarkSeq = Math.max(watermarkSeq, syncHighSeq);
+        }
+        syncHighSeq = null;
+        inHeadCatchup = false;
+      }
 
       this.store.saveCheckpointProgress({
         source: CALLBACK_SOURCES.REPO,
@@ -592,15 +695,15 @@ export class RepoCallbackMonitor {
         eventType,
         baselineComplete: true,
         baselineNextPage: 1,
-        watermarkSeq: reachedWatermark ? Math.max(watermarkSeq, syncHighSeq ?? watermarkSeq) : watermarkSeq,
-        syncNextPage: reachedWatermark ? 1 : currentPage + 1,
-        syncHighSeq: reachedWatermark ? null : syncHighSeq,
-        pendingSeqs: nextPending,
+        watermarkSeq,
+        syncNextPage: nextPage,
+        syncHighSeq,
+        pendingSeqs: prunePendingMap(pendingMap, this.now()),
         updatedAt: this.now(),
       });
 
-      if (reachedWatermark) break;
-      currentPage += 1;
+      if (wrapped) break;
+      currentPage = nextPage;
     }
 
     return dispatched;
@@ -619,6 +722,7 @@ export class RepoCallbackMonitor {
         items: res.items.map((pr: RepoPR) => ({
           seq: pr.number,
           pending: false,
+          markSeenOnBaseline: true,
           createdAtMs: toTimestampMs(pr.createdAt),
           dedupKey: buildRepoCallbackDedupKey(projectDir, 'pr_new', String(pr.number)),
           candidate: {
@@ -646,6 +750,7 @@ export class RepoCallbackMonitor {
         items: res.items.map((issue: RepoIssue) => ({
           seq: issue.number,
           pending: false,
+          markSeenOnBaseline: true,
           createdAtMs: toTimestampMs(issue.createdAt),
           dedupKey: buildRepoCallbackDedupKey(projectDir, 'issue_new', String(issue.number)),
           candidate: {
@@ -680,6 +785,7 @@ export class RepoCallbackMonitor {
         return {
           seq: run.id,
           pending,
+          markSeenOnBaseline: failed,
           runAttempt: attempt,
           createdAtMs: toTimestampMs(run.createdAt),
           dedupKey,

@@ -1049,4 +1049,188 @@ describe('RepoCallbackMonitor background polling & delivery', () => {
       vi.useRealTimers();
     }
   });
+
+  it('F1b: detects CI reruns (new attempt or status transition) on page 2+ behind creation watermark across restarts with bounded API calls and page-1 freshness', async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'imcodes-cb-ci-rerun-'));
+    const dbPath = join(tmpDir, 'callback-tasks.sqlite');
+    const sessions = [makeSession()];
+    const sent: Array<{ sessionName: string; text: string }> = [];
+
+    const makeRun = (
+      id: number,
+      status: RepoWorkflowRun['status'],
+      conclusion: string,
+      runAttempt = 1,
+    ): RepoWorkflowRun => ({
+      id,
+      name: `CI #${id}`,
+      status,
+      conclusion,
+      runAttempt,
+      branch: 'main',
+      commitSha: `sha-${id}`,
+      commitMessage: `commit ${id}`,
+      actor: 'alice',
+      url: `https://github.com/acme/widget/actions/runs/${id}`,
+      createdAt: 1_700_000_000_000 + id * 1000,
+      updatedAt: 1_700_000_000_000 + id * 1000,
+    });
+
+    // 5 baseline runs: [300(success), 299(success), 298(failed attempt 1), 297(success), 296(failed attempt 1)]
+    // perPage=2 -> 3 pages; page 1=[300,299], page 2=[298,297], page 3=[296].
+    const runs: RepoWorkflowRun[] = [
+      makeRun(300, 'success', 'success', 1),
+      makeRun(299, 'success', 'success', 1),
+      makeRun(298, 'failure', 'failure', 1),
+      makeRun(297, 'success', 'success', 1),
+      makeRun(296, 'failure', 'failure', 1),
+    ];
+    const requestedPages: number[] = [];
+
+    const provider: RepoProvider = {
+      ...createMockProvider({}),
+      listActions: vi.fn(async (opts) => {
+        const page = opts?.page ?? 1;
+        requestedPages.push(page);
+        const sorted = runs.slice().sort((a, b) => b.id - a.id);
+        const start = (page - 1) * 2;
+        return {
+          items: sorted.slice(start, start + 2),
+          page,
+          hasMore: start + 2 < sorted.length,
+          projectDir: '/tmp/repo-a',
+        };
+      }),
+    };
+
+    try {
+      let store = new CallbackTaskStore(dbPath);
+      const config = createDefaultRepoCallbackConfig('/tmp/repo-a');
+      config.enabled = true;
+      config.events.ci_failed.enabled = true;
+      config.events.pr_new.enabled = false;
+      config.events.issue_new.enabled = false;
+
+      const buildMonitor = (s: CallbackTaskStore) => {
+        const m = new RepoCallbackMonitor({
+          store: s,
+          detect: async () => createOkContext('/tmp/repo-a'),
+          createProvider: () => provider,
+          listSessions: () => sessions,
+          sendToSession: async (sessionName, text) => {
+            sent.push({ sessionName, text });
+          },
+          perPage: 2,
+          maxPagesPerPoll: 2,
+        });
+        m.setConfigsForTesting({ repos: { '/tmp/repo-a': config } });
+        return m;
+      };
+
+      // Baseline takes 2 bounded polls (pages 1..2, then page 3)
+      let monitor = buildMonitor(store);
+      await monitor.checkProject('/tmp/repo-a');
+      expect(store.getCheckpoint(CALLBACK_SOURCES.REPO, '/tmp/repo-a', 'ci_failed')?.baselineComplete).toBe(false);
+      await monitor.checkProject('/tmp/repo-a');
+      expect(store.getCheckpoint(CALLBACK_SOURCES.REPO, '/tmp/repo-a', 'ci_failed')?.baselineComplete).toBe(true);
+      expect(sent).toHaveLength(0);
+
+      // Re-run #298 (page 2) -> attempt 2 failed; and #296 (page 3) -> attempt 2 failed!
+      runs[2] = makeRun(298, 'failure', 'failure', 2);
+      runs[4] = makeRun(296, 'failure', 'failure', 2);
+
+      // Poll 1: fetches pages 1..2 (bounded by maxPagesPerPoll=2), MUST NOT stop on minSeq(299)<=300!
+      // Delivers #298 attempt 2 immediately and persists syncNextPage=3.
+      requestedPages.length = 0;
+      const poll1 = await monitor.checkProject('/tmp/repo-a');
+      expect(requestedPages).toEqual([1, 2]);
+      expect(poll1.dispatched).toBe(1);
+      expect(sent[0]!.text).toContain('CI #298');
+
+      // Also inject brand-new failure #301 on page 1 BEFORE next poll + restart daemon ->
+      // Poll 2 must BOTH peek page 1 (#301 immediate freshness) AND finish page 3 (#296 attempt 2) within 2 API calls!
+      runs.unshift(makeRun(301, 'failure', 'failure', 1));
+      store.close();
+      store = new CallbackTaskStore(dbPath);
+      monitor = buildMonitor(store);
+
+      requestedPages.length = 0;
+      const poll2 = await monitor.checkProject('/tmp/repo-a');
+      expect(requestedPages).toHaveLength(2);
+      expect(requestedPages).toEqual([1, 3]);
+      expect(poll2.dispatched).toBe(2);
+      expect(sent.map((m) => m.text).some((t) => t.includes('CI #301'))).toBe(true);
+      expect(sent.map((m) => m.text).some((t) => t.includes('CI #296'))).toBe(true);
+
+      store.close();
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('F1c: never marks baselineComplete=true when per-poll baseline page budget is exhausted before EOF', async () => {
+    const store = new CallbackTaskStore(':memory:');
+    const sent: Array<{ sessionName: string; text: string }> = [];
+    const prs: RepoPR[] = Array.from({ length: 7 }, (_, i) => ({
+      number: 7 - i,
+      title: `Hist PR ${7 - i}`,
+      author: 'alice',
+      state: 'open',
+      draft: false,
+      head: `b/${7 - i}`,
+      base: 'main',
+      labels: [],
+      createdAt: 1_700_000_000_000,
+      updatedAt: 1_700_000_000_000,
+      url: `https://github.com/acme/widget/pull/${7 - i}`,
+    }));
+
+    const provider: RepoProvider = {
+      ...createMockProvider({}),
+      listPRs: vi.fn(async (opts) => {
+        const page = opts?.page ?? 1;
+        const start = (page - 1) * 2;
+        return {
+          items: prs.slice(start, start + 2),
+          page,
+          hasMore: start + 2 < prs.length,
+          projectDir: '/tmp/repo-a',
+        };
+      }),
+    };
+
+    const config = createDefaultRepoCallbackConfig('/tmp/repo-a');
+    config.enabled = true;
+    config.events.pr_new.enabled = true;
+    config.events.ci_failed.enabled = false;
+    config.events.issue_new.enabled = false;
+
+    const monitor = new RepoCallbackMonitor({
+      store,
+      detect: async () => createOkContext('/tmp/repo-a'),
+      createProvider: () => provider,
+      listSessions: () => [makeSession()],
+      sendToSession: async (sessionName, text) => {
+        sent.push({ sessionName, text });
+      },
+      perPage: 2,
+      maxPagesPerPoll: 2,
+      maxBaselinePages: 1, // Even with legacy option=1, baseline MUST stay incomplete until !hasMore
+    });
+    monitor.setConfigsForTesting({ repos: { '/tmp/repo-a': config } });
+
+    // Poll 1: pages 1..2 (hasMore=true) -> incomplete, cursor at page 3
+    await monitor.checkProject('/tmp/repo-a');
+    let cp = store.getCheckpoint(CALLBACK_SOURCES.REPO, '/tmp/repo-a', 'pr_new');
+    expect(cp?.baselineComplete).toBe(false);
+    expect(cp?.baselineNextPage).toBe(3);
+
+    // Poll 2: pages 3..4 (page 4 is final short page [PR#1], hasMore=false) -> now complete
+    await monitor.checkProject('/tmp/repo-a');
+    cp = store.getCheckpoint(CALLBACK_SOURCES.REPO, '/tmp/repo-a', 'pr_new');
+    expect(cp?.baselineComplete).toBe(true);
+    expect(sent).toHaveLength(0);
+
+    store.close();
+  });
 });
