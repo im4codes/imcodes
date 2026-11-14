@@ -196,6 +196,8 @@ export interface AcpCliProviderProfile {
   steeringPrompts?: boolean;
   /** Prefer session/resume (no history replay) over session/load. */
   resumeWithoutReplay?: boolean;
+  /** Spawn one dedicated ACP process per session instead of one shared front server. */
+  perSessionTransport?: boolean;
   /** Defer model selection until idle, and fail rather than run a wrong model. */
   strictModelSelection?: boolean;
   /** Preferred default model for brand-new sessions when supported by the catalogue. */
@@ -321,6 +323,7 @@ interface KimiSdkSessionState {
   agyNativeTurnGeneration?: number;
   incognito?: boolean;
   disposed?: boolean;
+  lastActivityAt?: number;
   isolatedTransport?: IsolatedAcpTransport;
   isolatedDisposeInFlight?: Promise<void>;
 }
@@ -350,6 +353,7 @@ interface AcpTransportSlot {
 interface IsolatedAcpTransport extends AcpTransportSlot {
   incognitoEnv?: AgyIncognitoEnv;
   sourceHome?: string;
+  executableFingerprint?: AcpExecutableFingerprint | null;
 }
 
 interface ActivePromptAdmission {
@@ -423,6 +427,8 @@ export class KimiSdkProvider implements TransportProvider {
   private sharedExecutableFingerprint: AcpExecutableFingerprint | null = null;
   private sharedHasStartedOnce = false;
   private readonly sharedSessionReadyInFlight = new Set<string>();
+  private idleHibernateTimer: ReturnType<typeof setTimeout> | null = null;
+  private idleSweepInFlight: Promise<void> | null = null;
 
   constructor(profile: AcpCliProviderProfile = KIMI_PROFILE) {
     this.profile = profile;
@@ -456,6 +462,11 @@ export class KimiSdkProvider implements TransportProvider {
   }
 
   async connect(config: ProviderConfig): Promise<void> {
+    if (this.profile.perSessionTransport) {
+      this.config = config;
+      logger.info({ provider: this.id }, `${this.profile.displayName} SDK provider connected lazily (per-session ACP)`);
+      return;
+    }
     if (this.id === AGY_SDK_PROVIDER_ID && inIncognitoContext()) {
       // Never spawn a shared process against real HOME while launching an incognito session.
       this.config = config;
@@ -468,6 +479,7 @@ export class KimiSdkProvider implements TransportProvider {
   }
 
   private async ensureSharedAcpConnected(): Promise<void> {
+    if (this.profile.perSessionTransport) return;
     if (this.sharedRecycleInFlight) {
       await this.sharedRecycleInFlight.catch(() => {});
     }
@@ -480,17 +492,21 @@ export class KimiSdkProvider implements TransportProvider {
     await inflight;
   }
 
+  private usesIsolatedTransport(state: KimiSdkSessionState): boolean {
+    return Boolean(state.incognito || this.profile.perSessionTransport);
+  }
+
   private connectionForState(state: KimiSdkSessionState): ClientSideConnection | null {
-    return state.incognito ? (state.isolatedTransport?.connection ?? null) : this.connection;
+    return this.usesIsolatedTransport(state) ? (state.isolatedTransport?.connection ?? null) : this.connection;
   }
 
   private initPromiseForState(state: KimiSdkSessionState): Promise<void> | null {
-    return state.incognito ? (state.isolatedTransport?.initPromise ?? null) : this.initPromise;
+    return this.usesIsolatedTransport(state) ? (state.isolatedTransport?.initPromise ?? null) : this.initPromise;
   }
 
   private async disposeIsolatedSession(
     state: KimiSdkSessionState,
-    opts?: { removeSession?: boolean; bestEffortCloseSession?: boolean },
+    opts?: { removeSession?: boolean; bestEffortCloseSession?: boolean; preserveResumeId?: boolean },
   ): Promise<void> {
     if (state.isolatedDisposeInFlight) {
       await state.isolatedDisposeInFlight;
@@ -525,34 +541,37 @@ export class KimiSdkProvider implements TransportProvider {
         }
       }
 
-      if (acpSessionId) this.releaseAcpRoute(acpSessionId, state.routeId);
-      state.acpSessionId = undefined;
+      if (!opts?.preserveResumeId) {
+        if (acpSessionId) this.releaseAcpRoute(acpSessionId, state.routeId);
+        state.acpSessionId = undefined;
+      }
       state.loaded = false;
       state.modeApplied = false;
+      state.confirmedModel = undefined;
       state.sessionSystemTextInjected = undefined;
       if (opts?.removeSession && this.sessions.get(state.routeId) === state) {
         this.sessions.delete(state.routeId);
       }
 
       if (!transport) return;
-      const child = transport.child;
+      const isolatedChild = transport.child;
       state.isolatedTransport = undefined;
       transport.child = null;
       transport.connection = null;
       transport.initPromise = null;
       transport.sessionListSupported = false;
 
-      if (child) {
+      if (isolatedChild) {
         // Call killProcessTree even when the root ACP child already exited: same-group
         // descendants/native workers can outlive the exited leader and must be reaped
-        // before deleting incognitoEnv.homeDir.
-        const alive = child.exitCode === null && child.signalCode === null;
-        const exitPromise = alive ? once(child, 'exit').catch(() => {}) : null;
+        // before deleting incognitoEnv.homeDir or hibernating a per-session process.
+        const alive = isolatedChild.exitCode === null && isolatedChild.signalCode === null;
+        const exitPromise = alive ? once(isolatedChild, 'exit').catch(() => {}) : null;
         if (alive) {
-          try { child.stdin?.end(); } catch { /* noop */ }
+          try { isolatedChild.stdin?.end(); } catch { /* noop */ }
         }
-        await killProcessTree(child, { ownsProcessGroup: true, gracefulMs: 200 });
-        if (exitPromise && child.exitCode === null && child.signalCode === null) {
+        await killProcessTree(isolatedChild, { ownsProcessGroup: true, gracefulMs: 200 });
+        if (exitPromise && isolatedChild.exitCode === null && isolatedChild.signalCode === null) {
           await Promise.race([
             exitPromise,
             new Promise<void>((resolve) => setTimeout(resolve, 500)),
@@ -575,11 +594,12 @@ export class KimiSdkProvider implements TransportProvider {
   }
 
   getMemoryMcpStatus(): MemoryMcpProviderStatusView {
-    const hasIsolated = [...this.sessions.values()].some((s) => Boolean(s.incognito && s.isolatedTransport?.connection));
+    const hasIsolated = [...this.sessions.values()].some((s) => Boolean(this.usesIsolatedTransport(s) && s.isolatedTransport?.connection));
+    const ready = Boolean(this.config && (this.profile.perSessionTransport || this.connection || hasIsolated));
     return {
       providerId: this.id,
-      status: this.config && (this.connection || hasIsolated) ? MEMORY_MCP_STATUS.READY : MEMORY_MCP_STATUS.UNKNOWN,
-      connected: Boolean(this.config && (this.connection || hasIsolated)),
+      status: ready ? MEMORY_MCP_STATUS.READY : MEMORY_MCP_STATUS.UNKNOWN,
+      connected: ready,
       degradedReasons: [],
     };
   }
@@ -644,7 +664,12 @@ export class KimiSdkProvider implements TransportProvider {
 
   async disconnect(): Promise<void> {
     this.isDisconnecting = true;
+    if (this.idleHibernateTimer) {
+      clearTimeout(this.idleHibernateTimer);
+      this.idleHibernateTimer = null;
+    }
     try {
+      await this.idleSweepInFlight?.catch(() => {});
       await this.sharedRecycleInFlight?.catch(() => {});
       await this.sharedConnectInFlight?.catch(() => {});
       this.cancelPendingApprovals();
@@ -687,12 +712,15 @@ export class KimiSdkProvider implements TransportProvider {
     if (incognito && !config.fresh && (prior?.acpSessionId || prior?.disposed)) {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Incognito conversation ended; start a new session instead of resuming history.', false);
     }
+    const shouldDisposePrior = Boolean(
+      prior && (
+        (prior.incognito && (config.fresh || !incognito || prior.disposed))
+        || (this.profile.perSessionTransport && config.fresh && prior.isolatedTransport)
+      ),
+    );
     if (prior) {
-      if (prior.incognito && (config.fresh || !incognito || prior.disposed)) {
-        await this.disposeIsolatedSession(prior);
-      } else {
-        this.closeAgyBridges(prior);
-      }
+      this.closeAgyBridges(prior);
+      if (shouldDisposePrior) prior.cancelled = true;
     }
     setSessionIncognito(routeId, incognito);
     if (config.sessionName && config.sessionName !== routeId) {
@@ -739,6 +767,7 @@ export class KimiSdkProvider implements TransportProvider {
       toolCalls: new Map(),
       emittedToolSignatures: new Map(),
       lastStatusSignature: null,
+      lastActivityAt: Date.now(),
       sessionSystemTextInjected: existing?.sessionSystemTextInjected,
       agyForeground: this.id === AGY_SDK_PROVIDER_ID && existing?.acpSessionId === (config.resumeId ?? existing?.acpSessionId) && existing?.agyForeground?.authoritative
         ? Object.assign(new AgyForegroundOwnership(),{authoritative:true}) : undefined,
@@ -751,6 +780,8 @@ export class KimiSdkProvider implements TransportProvider {
           sessionListSupported: false,
           sourceHome: baseSourceHome,
         },
+      } : this.profile.perSessionTransport && !config.fresh && existing?.isolatedTransport ? {
+        isolatedTransport: existing.isolatedTransport,
       } : {}),
     };
     if (prior?.acpSessionId && prior.acpSessionId !== state.acpSessionId) {
@@ -761,6 +792,9 @@ export class KimiSdkProvider implements TransportProvider {
       this.registerAcpRoute(state.acpSessionId, routeId);
       this.emitSessionInfo(routeId, { resumeId: state.acpSessionId });
     }
+    if (shouldDisposePrior && prior) {
+      await this.disposeIsolatedSession(prior, prior.incognito ? undefined : { bestEffortCloseSession: true });
+    }
     return routeId;
   }
 
@@ -768,8 +802,9 @@ export class KimiSdkProvider implements TransportProvider {
     const state = this.sessions.get(sessionId);
     if (!state) return;
     this.cancelPendingApprovals(sessionId);
-    if (state.incognito) {
+    if (this.usesIsolatedTransport(state)) {
       await this.disposeIsolatedSession(state, { removeSession: true, bestEffortCloseSession: true });
+      this.refreshIdleHibernateTimer();
       return;
     }
     this.closeAgyBridges(state);
@@ -795,8 +830,9 @@ export class KimiSdkProvider implements TransportProvider {
     const state = this.sessions.get(sessionId);
     if (!state) return;
     this.cancelPendingApprovals(sessionId);
-    if (state.incognito) {
+    if (this.usesIsolatedTransport(state)) {
       await this.disposeIsolatedSession(state, { removeSession: true });
+      this.refreshIdleHibernateTimer();
       return;
     }
     this.closeAgyBridges(state);
@@ -811,7 +847,9 @@ export class KimiSdkProvider implements TransportProvider {
     if (!state || state.incognito) return false;
     if (state.loaded) return true;
     try {
-      await this.ensureSharedAcpConnected();
+      if (!this.profile.perSessionTransport) {
+        await this.ensureSharedAcpConnected();
+      }
       await this.ensureSessionReady(state.routeId, state);
       if (this.profile.strictModelSelection && !state.promptInFlight && state.confirmedModel) {
         this.emitSessionInfo(state.routeId, { model: state.confirmedModel });
@@ -823,14 +861,24 @@ export class KimiSdkProvider implements TransportProvider {
   }
 
   async listSessions(options: RemoteSessionListOptions = {}): Promise<RemoteSessionInfo[]> {
-    await this.ensureSharedAcpConnected().catch(() => {});
+    if (!this.profile.perSessionTransport) {
+      await this.ensureSharedAcpConnected().catch(() => {});
+    }
     const directoryRequested = options.directory !== undefined;
     const queryDirectory = normalizeTransportCwd(options.directory);
     const expectedDirectory = canonicalizeTransportCwd(options.directory);
+    const slot = this.profile.perSessionTransport
+      ? [...this.sessions.values()].find((s) => !s.incognito && s.isolatedTransport?.connection)?.isolatedTransport
+      : null;
+    if (slot?.initPromise) {
+      await slot.initPromise.catch(() => {});
+    }
+    const connection = this.profile.perSessionTransport ? (slot?.connection ?? null) : this.connection;
+    const supported = this.profile.perSessionTransport ? Boolean(slot?.sessionListSupported) : this.sessionListSupported;
     if (
       (directoryRequested && (!queryDirectory || !expectedDirectory))
-      || !this.connection
-      || !this.sessionListSupported
+      || !connection
+      || !supported
     ) {
       return [];
     }
@@ -839,7 +887,7 @@ export class KimiSdkProvider implements TransportProvider {
     const seenCursors = new Set<string>();
     let cursor: string | undefined;
     do {
-      const result = await this.connection.listSessions({
+      const result = await connection.listSessions({
         ...(queryDirectory ? { cwd: queryDirectory } : {}),
         ...(cursor ? { cursor } : {}),
       });
@@ -1356,7 +1404,7 @@ export class KimiSdkProvider implements TransportProvider {
     }
     const state = this.sessions.get(sessionId);
     if (!state) {
-      if (!this.connection) {
+      if (!this.profile.perSessionTransport && !this.connection) {
         throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, `${this.profile.displayName} ACP server not connected`, false);
       }
       throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Unknown ${this.profile.displayName} SDK session: ${sessionId}`, false);
@@ -1364,7 +1412,7 @@ export class KimiSdkProvider implements TransportProvider {
     if (state.incognito && state.disposed) {
       throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, 'Incognito session has been terminated; start a fresh session.', false);
     }
-    if (!state.incognito) {
+    if (!this.usesIsolatedTransport(state)) {
       if (this.sharedRecycleInFlight) {
         await this.sharedRecycleInFlight.catch(() => {});
       }
@@ -1378,6 +1426,7 @@ export class KimiSdkProvider implements TransportProvider {
     if (state.promptInFlight) {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, `${this.profile.displayName} SDK session is already busy`, true);
     }
+    state.lastActivityAt = Date.now();
 
     state.cancelled = false;
     state.stoppedByCancel = false;
@@ -1657,6 +1706,29 @@ export class KimiSdkProvider implements TransportProvider {
     return [...this.profile.args, ...extraFlags];
   }
 
+  private async startPerSessionAcpServer(sessionId: string, state: KimiSdkSessionState): Promise<void> {
+    if (!this.config) {
+      throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, `${this.profile.displayName} ACP server not connected`, false);
+    }
+    if (state.isolatedTransport) {
+      await this.disposeIsolatedSession(state, { bestEffortCloseSession: true, preserveResumeId: true });
+    }
+    await this.evictWarmPerSessionsIfNeeded(sessionId);
+    const transport: IsolatedAcpTransport = {
+      child: null,
+      connection: null,
+      initPromise: null,
+      sessionListSupported: false,
+    };
+    state.isolatedTransport = transport;
+    try {
+      await this.startAcpServer(this.config, { sessionId, state, transport }, { refreshExecutable: true });
+    } catch (error) {
+      await this.disposeIsolatedSession(state, { preserveResumeId: true });
+      throw error;
+    }
+  }
+
   private async startIsolatedAcpServer(sessionId: string, state: KimiSdkSessionState): Promise<void> {
     if (!this.config) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, `${this.profile.displayName} ACP server not connected`, false);
@@ -1696,7 +1768,7 @@ export class KimiSdkProvider implements TransportProvider {
       sessionId: string;
       state: KimiSdkSessionState;
       transport: IsolatedAcpTransport;
-      incognitoEnv: AgyIncognitoEnv;
+      incognitoEnv?: AgyIncognitoEnv;
     },
     options?: { refreshExecutable?: boolean },
   ): Promise<void> {
@@ -1730,23 +1802,28 @@ export class KimiSdkProvider implements TransportProvider {
 
     const resolved = this.resolveAcpExecutable(
       config,
-      !isolatedFor && options?.refreshExecutable ? { refresh: true } : undefined,
+      (!isolatedFor || this.profile.perSessionTransport) && options?.refreshExecutable
+        ? { refresh: true }
+        : undefined,
     );
+    const fingerprint = captureExecutableFingerprint(resolved.executable, resolved.prependArgs[0]);
     if (!isolatedFor) {
       this.sharedHasStartedOnce = true;
-      this.sharedExecutableFingerprint = captureExecutableFingerprint(resolved.executable, resolved.prependArgs[0]);
+      this.sharedExecutableFingerprint = fingerprint;
       this.pendingSharedRecycle = false;
+    } else {
+      isolatedFor.transport.executableFingerprint = fingerprint;
     }
     const args = [
       ...resolved.prependArgs,
-      ...this.buildAcpArgs(config, isolatedFor?.incognitoEnv.acpFlags),
+      ...this.buildAcpArgs(config, isolatedFor?.incognitoEnv?.acpFlags),
     ];
     const env = isolatedFor
       ? {
         ...process.env,
         ...((config.env as Record<string, string> | undefined) ?? {}),
         ...(isolatedFor.state.env ?? {}),
-        ...isolatedFor.incognitoEnv.env,
+        ...(isolatedFor.incognitoEnv?.env ?? {}),
       }
       : { ...process.env, ...((config.env as Record<string, string> | undefined) ?? {}) };
     const child = spawn(resolved.executable, args, {
@@ -1760,7 +1837,7 @@ export class KimiSdkProvider implements TransportProvider {
       windowsHide: true,
     });
     transport.child = child;
-    const childMetaWrite = isolatedFor && typeof child.pid === 'number' && child.pid > 0
+    const childMetaWrite = isolatedFor?.incognitoEnv && typeof child.pid === 'number' && child.pid > 0
       ? isolatedFor.incognitoEnv.registerChildProcess(child.pid, process.platform !== 'win32')
       : Promise.resolve();
     const spawnFailure = new Promise<never>((_resolve, reject) => {
@@ -1785,11 +1862,15 @@ export class KimiSdkProvider implements TransportProvider {
       }
       if (isolatedFor) {
         const sid = isolatedFor.sessionId;
-        this.cancelPendingApprovals(sid);
-        if (this.clearSessionWorkAfterFailure(sid)) {
-          this.emitError(sid, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, err.message, true));
+        if (this.sessions.get(sid) === isolatedFor.state) {
+          this.cancelPendingApprovals(sid);
+          if (this.clearSessionWorkAfterFailure(sid)) {
+            this.emitError(sid, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, err.message, true));
+          }
         }
-        void this.disposeIsolatedSession(isolatedFor.state);
+        void this.disposeIsolatedSession(isolatedFor.state, {
+          preserveResumeId: !isolatedFor.state.incognito,
+        });
         return;
       }
       this.cancelPendingApprovals();
@@ -1984,7 +2065,9 @@ export class KimiSdkProvider implements TransportProvider {
       await childMetaWrite;
     } catch (error) {
       if (isolatedFor) {
-        await this.disposeIsolatedSession(isolatedFor.state);
+        await this.disposeIsolatedSession(isolatedFor.state, {
+          preserveResumeId: !isolatedFor.state.incognito,
+        });
       } else {
         await this.teardownChild();
       }
@@ -2265,6 +2348,8 @@ export class KimiSdkProvider implements TransportProvider {
     this.cancelPendingApprovals(sessionId);
     this.clearStatus(sessionId, state);
     run?.complete();
+    state.lastActivityAt = Date.now();
+    this.refreshIdleHibernateTimer();
     if (this.isDisconnecting) return;
     this.emitError(sessionId, this.normalizeError(error));
     this.scheduleDeferredSharedRecycleIfDrained();
@@ -2300,6 +2385,26 @@ export class KimiSdkProvider implements TransportProvider {
         if (!existingTransport?.connection || !existingTransport.child || existingTransport.child.killed || existingTransport.child.exitCode !== null) {
           await this.startIsolatedAcpServer(sessionId, state);
         }
+      } else if (this.profile.perSessionTransport) {
+        this.sharedSessionReadyInFlight.add(sessionId);
+        const existingTransport = state.isolatedTransport;
+        const alive = Boolean(
+          existingTransport?.connection
+          && existingTransport.child
+          && !existingTransport.child.killed
+          && existingTransport.child.exitCode === null,
+        );
+        if (alive && this.hasExecutableFingerprintChanged(existingTransport?.executableFingerprint)) {
+          await this.disposeIsolatedSession(state, { bestEffortCloseSession: true, preserveResumeId: true });
+        }
+        if (
+          !state.isolatedTransport?.connection
+          || !state.isolatedTransport.child
+          || state.isolatedTransport.child.killed
+          || state.isolatedTransport.child.exitCode !== null
+        ) {
+          await this.startPerSessionAcpServer(sessionId, state);
+        }
       } else {
         if (!state.loaded && (this.pendingSharedRecycle || this.hasSharedExecutableChanged())) {
           if (this.hasActiveSharedSessionWork(sessionId)) {
@@ -2314,6 +2419,7 @@ export class KimiSdkProvider implements TransportProvider {
       }
       const connection = this.connectionForState(state);
       if (!connection) {
+        if (!state.incognito) this.sharedSessionReadyInFlight.delete(sessionId);
         throw this.makeError(
           PROVIDER_ERROR_CODES.CONNECTION_LOST,
           `${this.profile.displayName} ACP connection not ready`,
@@ -2422,7 +2528,16 @@ export class KimiSdkProvider implements TransportProvider {
         this.assertCurrentSession(sessionId, state, connection);
         return;
       } catch (err) {
-        if (!state.incognito && !state.loaded && isWorkerSpawnMissingExecutableError(err)) {
+        if (!state.incognito && !state.loaded && this.profile.perSessionTransport) {
+          if (this.sessions.get(sessionId) === state) {
+            await this.disposeIsolatedSession(state, { preserveResumeId: true });
+          }
+          if (!sharedRecycleRetried && isWorkerSpawnMissingExecutableError(err) && this.sessions.get(sessionId) === state && !state.cancelled) {
+            sharedRecycleRetried = true;
+            this.sharedSessionReadyInFlight.delete(sessionId);
+            continue;
+          }
+        } else if (!state.incognito && !state.loaded && isWorkerSpawnMissingExecutableError(err)) {
           if (this.hasActiveSharedSessionWork(sessionId)) {
             this.pendingSharedRecycle = true;
             throw err;
@@ -2435,12 +2550,18 @@ export class KimiSdkProvider implements TransportProvider {
             continue;
           }
         }
-        if (state.incognito && !state.loaded) {
+        if (state.incognito && !state.loaded && this.sessions.get(sessionId) === state) {
           await this.disposeIsolatedSession(state);
         }
         throw err;
       } finally {
-        if (!state.incognito) this.sharedSessionReadyInFlight.delete(sessionId);
+        if (!state.incognito && this.sessions.get(sessionId) === state) {
+          this.sharedSessionReadyInFlight.delete(sessionId);
+        }
+        if (this.profile.perSessionTransport && !state.incognito) {
+          state.lastActivityAt = Date.now();
+          this.refreshIdleHibernateTimer();
+        }
       }
     }
   }
@@ -2551,7 +2672,7 @@ export class KimiSdkProvider implements TransportProvider {
       this.cachedModels = null;
       this.cachedDefaultModel = null;
     }
-    if (!this.cachedModels && this.profile.modelDiscovery !== 'session-metadata-only') {
+    if (!this.cachedModels && this.profile.modelDiscovery !== 'session-metadata-only' && !this.profile.perSessionTransport) {
       await this.ensureSharedAcpConnected().catch(() => {});
       if (this.connection) {
         await this.initPromise;
@@ -2793,6 +2914,8 @@ export class KimiSdkProvider implements TransportProvider {
       };
       for (const cb of this.completeCallbacks) cb(sessionId, msg);
     } finally {
+      state.lastActivityAt = Date.now();
+      this.refreshIdleHibernateTimer();
       this.scheduleDeferredSharedRecycleIfDrained();
     }
   }
@@ -2874,6 +2997,7 @@ export class KimiSdkProvider implements TransportProvider {
     if (!routeId) return;
     const state = this.sessions.get(routeId);
     if (!state || state.acpSessionId !== params.sessionId) return;
+    state.lastActivityAt = Date.now();
 
     const update = params.update as SessionUpdate;
     // While loadSession is replaying history, drop every turn-scoped event.
@@ -3272,27 +3396,139 @@ export class KimiSdkProvider implements TransportProvider {
     }
   }
 
+  private getIdleHibernateMs(): number {
+    const raw = Number(process.env.IMCODES_AGY_IDLE_HIBERNATE_MS);
+    return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 5 * 60_000;
+  }
+
+  private getMaxWarmSessions(): number {
+    const raw = Number(process.env.IMCODES_AGY_MAX_WARM_SESSIONS);
+    return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : 8;
+  }
+
+  private isSessionBusy(routeId: string, state: KimiSdkSessionState): boolean {
+    return (
+      state.promptInFlight
+      || state.replaying
+      || this.sharedSessionReadyInFlight.has(routeId)
+      || (state.activePromptGenerations?.size ?? 0) > 0
+      || state.autonomousTurnGeneration !== undefined
+      || (state.agyBackgroundTasks?.size ?? 0) > 0
+      || [...state.toolCalls.values()].some((tool) => tool.status === 'pending' || tool.status === 'in_progress')
+      || [...this.pendingApprovals.values()].some((approval) => approval.routeId === routeId)
+    );
+  }
+
+  private canHibernateSession(routeId: string, state: KimiSdkSessionState): boolean {
+    return (
+      this.profile.perSessionTransport === true
+      && !state.incognito
+      && !state.disposed
+      && state.loaded
+      && Boolean(state.acpSessionId)
+      && Boolean(state.isolatedTransport?.connection || state.isolatedTransport?.child)
+      && !this.isSessionBusy(routeId, state)
+    );
+  }
+
+  private async hibernatePerSession(routeId: string, state: KimiSdkSessionState, reason: string): Promise<boolean> {
+    if (!this.canHibernateSession(routeId, state)) return false;
+    logger.debug({ provider: this.id, sessionId: routeId, reason }, `${this.profile.displayName} hibernating idle ACP session`);
+    await this.disposeIsolatedSession(state, {
+      bestEffortCloseSession: true,
+      preserveResumeId: true,
+    });
+    return true;
+  }
+
+  private async evictWarmPerSessionsIfNeeded(excludeSessionId: string): Promise<void> {
+    if (!this.profile.perSessionTransport) return;
+    const cap = this.getMaxWarmSessions();
+    const isWarm = (routeId: string, s: KimiSdkSessionState): boolean => (
+      !s.incognito
+      && routeId !== excludeSessionId
+      && Boolean(s.isolatedTransport?.child || s.isolatedTransport?.connection || this.sharedSessionReadyInFlight.has(routeId))
+    );
+    let liveCount = 0;
+    for (const [routeId, state] of this.sessions) {
+      if (isWarm(routeId, state)) liveCount += 1;
+    }
+    if (liveCount < cap) return;
+    const candidates = [...this.sessions.entries()]
+      .filter(([routeId, state]) => routeId !== excludeSessionId && this.canHibernateSession(routeId, state))
+      .sort(([aId, aState], [bId, bState]) => {
+        const aIsSub = (aState.sessionName ?? aId).startsWith('deck_sub_');
+        const bIsSub = (bState.sessionName ?? bId).startsWith('deck_sub_');
+        if (aIsSub !== bIsSub) return aIsSub ? -1 : 1;
+        return (aState.lastActivityAt ?? 0) - (bState.lastActivityAt ?? 0);
+      });
+    for (const [victimId, victimState] of candidates) {
+      if (liveCount < cap) break;
+      if (await this.hibernatePerSession(victimId, victimState, 'warm_cap_lru')) {
+        liveCount -= 1;
+      }
+    }
+  }
+
+  private refreshIdleHibernateTimer(): void {
+    if (this.idleHibernateTimer) {
+      clearTimeout(this.idleHibernateTimer);
+      this.idleHibernateTimer = null;
+    }
+    if (this.isDisconnecting || !this.profile.perSessionTransport) return;
+    const ttlMs = this.getIdleHibernateMs();
+    let earliestDueAt: number | null = null;
+    for (const [routeId, state] of this.sessions) {
+      if (!this.canHibernateSession(routeId, state)) continue;
+      const dueAt = (state.lastActivityAt ?? Date.now()) + ttlMs;
+      if (earliestDueAt === null || dueAt < earliestDueAt) {
+        earliestDueAt = dueAt;
+      }
+    }
+    if (earliestDueAt === null) return;
+    const delayMs = Math.max(1, earliestDueAt - Date.now());
+    const timer = setTimeout(() => {
+      this.idleHibernateTimer = null;
+      void this.sweepIdlePerSessions();
+    }, delayMs);
+    timer.unref?.();
+    this.idleHibernateTimer = timer;
+  }
+
+  private async sweepIdlePerSessions(): Promise<void> {
+    if (this.idleSweepInFlight) {
+      await this.idleSweepInFlight;
+      return;
+    }
+    const run = (async () => {
+      if (this.isDisconnecting || !this.profile.perSessionTransport) return;
+      const ttlMs = this.getIdleHibernateMs();
+      const now = Date.now();
+      for (const [routeId, state] of [...this.sessions.entries()]) {
+        if (!this.canHibernateSession(routeId, state)) continue;
+        if (now - (state.lastActivityAt ?? 0) >= ttlMs) {
+          await this.hibernatePerSession(routeId, state, 'idle_ttl');
+        }
+      }
+    })().finally(() => {
+      if (this.idleSweepInFlight === run) this.idleSweepInFlight = null;
+      this.refreshIdleHibernateTimer();
+    });
+    this.idleSweepInFlight = run;
+    await run;
+  }
+
   private hasActiveSharedSessionWork(excludeSessionId?: string): boolean {
     for (const [routeId, state] of this.sessions) {
       if (state.incognito || routeId === excludeSessionId) continue;
-      if (
-        state.promptInFlight
-        || state.replaying
-        || this.sharedSessionReadyInFlight.has(routeId)
-        || (state.activePromptGenerations?.size ?? 0) > 0
-        || state.autonomousTurnGeneration !== undefined
-        || (state.agyBackgroundTasks?.size ?? 0) > 0
-        || [...state.toolCalls.values()].some((tool) => tool.status === 'pending' || tool.status === 'in_progress')
-        || [...this.pendingApprovals.values()].some((approval) => approval.routeId === routeId)
-      ) {
+      if (this.isSessionBusy(routeId, state)) {
         return true;
       }
     }
     return false;
   }
 
-  private hasSharedExecutableChanged(): boolean {
-    const prev = this.sharedExecutableFingerprint;
+  private hasExecutableFingerprintChanged(prev: AcpExecutableFingerprint | null | undefined): boolean {
     if (!prev || !this.config) return false;
     const fresh = this.resolveAcpExecutable(this.config, { refresh: true });
     if (fresh.executable !== prev.executable) {
@@ -3314,6 +3550,10 @@ export class KimiSdkProvider implements TransportProvider {
       }
     }
     return false;
+  }
+
+  private hasSharedExecutableChanged(): boolean {
+    return this.hasExecutableFingerprintChanged(this.sharedExecutableFingerprint);
   }
 
   private scheduleDeferredSharedRecycleIfDrained(): void {

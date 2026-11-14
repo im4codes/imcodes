@@ -21,11 +21,12 @@ const PROFILE: AcpCliProviderProfile = {
   id: AGY_SDK_PROVIDER_ID,
   displayName: 'Antigravity',
   binary: AGY_CLI_BINARY,
-  args: [AGY_ACP_COMMAND, '--process-per-session', AGY_CLI_FLAG.SKIP_PERMISSIONS],
+  args: [AGY_ACP_COMMAND, '--stdio', AGY_CLI_FLAG.SKIP_PERMISSIONS],
   defaultModel: AGY_DEFAULT_MODEL_ID,
   approval: 'auto-allow',
   loadFailure: 'error',
   resumeWithoutReplay: true,
+  perSessionTransport: true,
   steeringPrompts: true,
   strictModelSelection: true,
   privacySafeErrors: true,
@@ -50,6 +51,7 @@ export class AgyAcpProvider extends KimiSdkProvider {
   constructor(private probedBinary?: ReturnType<typeof resolveAgyBinary>) {
     super(PROFILE);
     this.capabilities.nativeAgentAdmission = NATIVE_AGENT_ADMISSION_MODES.SESSION_FENCE;
+    this.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
   }
 
   protected override resolveAcpExecutable(

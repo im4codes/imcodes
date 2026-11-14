@@ -102,7 +102,10 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       if (scenario === 'new-error-once' && !fs.existsSync(logPath + '.new-failed')) {
         fs.writeFileSync(logPath + '.new-failed', 'failed'); return error(req.id, 'native creation unavailable');
       }
-      const sessionId = `native-${++nextId}`; sessions.set(sessionId, { pending: [], inputs: [] });
+      const nextLogSeq = logPath && fs.existsSync(logPath)
+        ? fs.readFileSync(logPath, 'utf8').split('\n').filter(line => line.includes('"method":"session/new"')).length
+        : 0;
+      const sessionId = `native-${Math.max(++nextId, nextLogSeq)}`; sessions.set(sessionId, { pending: [], inputs: [] });
       return setTimeout(() => ok(req.id, { sessionId, models }), scenario === 'late-new' ? 150 : 0);
     }
     case 'session/resume': {

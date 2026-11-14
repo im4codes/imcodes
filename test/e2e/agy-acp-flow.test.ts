@@ -33,7 +33,7 @@ const NAME = 'deck_e2e_agy_acp_brain';
 const PROJECT = 'e2e_agy_acp';
 let root: string, log: string, off: (() => void) | undefined;
 let events: TimelineEvent[];
-const requests = async () => (await readFile(log, 'utf8')).trim().split('\n').map(x => JSON.parse(x));
+const requests = async () => (await readFile(log, 'utf8').catch(e => e?.code === 'ENOENT' ? '' : Promise.reject(e))).trim().split('\n').filter(Boolean).map(x => JSON.parse(x));
 const finalized = () => events.filter(e => e.type === 'assistant.text' && e.payload.streaming === false && !e.payload.automation);
 beforeEach(async () => {
   setAgyUsageExecFn(async () => ({ stdout: '', stderr: '' }));
