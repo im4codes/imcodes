@@ -456,4 +456,170 @@ describe('Mobile Web Speech real integration (SessionControls + VoiceOverlay + V
     expect(document.querySelector('.voice-hold-hud')).toBeNull();
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
   });
+
+  it('keeps standalone VoiceOverlay in voice.starting until onstart/onaudiostart confirms and promotes on late onstart', async () => {
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const micBtn = document.querySelector('.btn-voice-embedded') as HTMLButtonElement;
+    inUserGesture = true;
+    fireEvent.pointerDown(micBtn, { pointerId: 40, button: 0, pointerType: 'touch', isPrimary: true });
+    inUserGesture = false;
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(instances).toHaveLength(1);
+    expect(instances[0].start).toHaveBeenCalledTimes(1);
+    expect(VoiceInput.isListening()).toBe(false);
+
+    const status = document.querySelector('.voice-overlay-status [role="status"]') as HTMLElement;
+    const dot = document.querySelector('.voice-status-dot') as HTMLElement;
+    const overlayMic = document.querySelector('.voice-overlay-mic') as HTMLButtonElement;
+    const ta = document.querySelector('.voice-overlay-text') as HTMLTextAreaElement;
+    expect(status.textContent).toBe('voice.starting');
+    expect(dot.classList.contains('voice-status-dot-active')).toBe(false);
+    expect(overlayMic.classList.contains('voice-overlay-mic-active')).toBe(false);
+    expect(ta.readOnly).toBe(true);
+
+    // Late onstart confirms capture and activates listening + mic UI
+    instances[0].onstart?.();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(VoiceInput.isListening()).toBe(true);
+    expect(status.textContent).toBe('voice.listening');
+    expect(dot.classList.contains('voice-status-dot-active')).toBe(true);
+    expect(overlayMic.classList.contains('voice-overlay-mic-active')).toBe(true);
+
+    instances[0].onresult?.({
+      results: { length: 1, 0: { 0: { transcript: 'delayed confirm ok' }, isFinal: false } },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(status.textContent).toBe('voice.recognizing');
+    expect(ta.value).toBe('delayed confirm ok');
+  });
+
+  it('exits voice.starting cleanly to editable error state on unconfirmed onend or async not-allowed and supports Retry', async () => {
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const micBtn = document.querySelector('.btn-voice-embedded') as HTMLButtonElement;
+    inUserGesture = true;
+    fireEvent.pointerDown(micBtn, { pointerId: 41, button: 0, pointerType: 'touch', isPrimary: true });
+    inUserGesture = false;
+    await vi.advanceTimersByTimeAsync(0);
+
+    const status = document.querySelector('.voice-overlay-status [role="status"]') as HTMLElement;
+    const ta = document.querySelector('.voice-overlay-text') as HTMLTextAreaElement;
+    expect(status.textContent).toBe('voice.starting');
+    expect(ta.readOnly).toBe(true);
+
+    // 1. Unconfirmed onend (rec ends before onstart ever fires)
+    instances[0].onend?.();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(VoiceInput.isListening()).toBe(false);
+    expect(status.textContent).toBe('voice.ready');
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain('voice.mic_permission_failed');
+    expect(ta.readOnly).toBe(false);
+
+    // 2. Retry starts a new session, async not-allowed while pending starting clears starting and restores editing
+    const retryBtn = document.querySelector('.voice-overlay-retry') as HTMLButtonElement;
+    inUserGesture = true;
+    fireEvent.click(retryBtn);
+    inUserGesture = false;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(instances).toHaveLength(2);
+    expect(status.textContent).toBe('voice.starting');
+    expect(ta.readOnly).toBe(true);
+
+    instances[1].onerror?.({ error: 'not-allowed' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(VoiceInput.isListening()).toBe(false);
+    expect(status.textContent).toBe('voice.ready');
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain('voice.mic_permission_failed');
+    expect(ta.readOnly).toBe(false);
+    expect(instances[1].stop).toHaveBeenCalledTimes(1);
+    instances[1].onend?.();
+    await vi.advanceTimersByTimeAsync(0);
+  });
+
+  it('cancels pending voice.starting via mic stop or close and blocks late stale onstart/onresult', async () => {
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const micBtn = document.querySelector('.btn-voice-embedded') as HTMLButtonElement;
+    inUserGesture = true;
+    fireEvent.pointerDown(micBtn, { pointerId: 42, button: 0, pointerType: 'touch', isPrimary: true });
+    inUserGesture = false;
+    await vi.advanceTimersByTimeAsync(0);
+
+    const status = document.querySelector('.voice-overlay-status [role="status"]') as HTMLElement;
+    const overlayMic = document.querySelector('.voice-overlay-mic') as HTMLButtonElement;
+    const ta = document.querySelector('.voice-overlay-text') as HTMLTextAreaElement;
+    expect(status.textContent).toBe('voice.starting');
+
+    // 1. Tap overlay mic button while in pending voice.starting to cancel and edit manually
+    fireEvent.click(overlayMic);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(instances[0].stop).toHaveBeenCalledTimes(1);
+    expect(status.textContent).toBe('voice.ready');
+    expect(ta.readOnly).toBe(false);
+
+    // Late callbacks on cancelled instance (before/after onend) cannot revive listening or clobber text
+    instances[0].onstart?.();
+    instances[0].onresult?.({
+      results: { length: 1, 0: { 0: { transcript: 'stale ghost text' }, isFinal: true } },
+    });
+    instances[0].onend?.();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(VoiceInput.isListening()).toBe(false);
+    expect(status.textContent).toBe('voice.ready');
+    expect(ta.value).toBe('');
+
+    // 2. Restart -> still pending starting -> Close overlay -> late callbacks are fenced
+    inUserGesture = true;
+    fireEvent.click(overlayMic);
+    inUserGesture = false;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(instances).toHaveLength(2);
+    expect(status.textContent).toBe('voice.starting');
+
+    const closeBtn = document.querySelector('.voice-overlay-close') as HTMLButtonElement;
+    fireEvent.click(closeBtn);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.querySelector('.voice-overlay')).toBeNull();
+    expect(instances[1].stop).toHaveBeenCalledTimes(1);
+
+    instances[1].onstart?.();
+    instances[1].onresult?.({
+      results: { length: 1, 0: { 0: { transcript: 'after close ghost' }, isFinal: true } },
+    });
+    instances[1].onend?.();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(VoiceInput.isListening()).toBe(false);
+  });
 });

@@ -376,6 +376,7 @@ export function VoiceOverlay({
       notepadRef.current = false;
       openRef.current = false;
       openSeqRef.current++;
+      sessionTokenRef.current++;
       startingTokenRef.current = null;
       voiceRetryPendingRef.current = false;
       pendingResumeAfterStopRef.current = false;
@@ -481,11 +482,15 @@ export function VoiceOverlay({
 
     let sessionActive = false;
     let lastReportedListening: boolean | null = null;
+    let startCallSettled = false;
+    let pendingErrorWhileStarting = false;
+    let keepStartingPending = false;
     try {
       const ok = await VoiceInput.startListening((partial) => {
         // Discard if session token changed (stale callback from old session)
         if (sessionTokenRef.current !== token) return;
         if (!openRef.current) return;
+        if (flushingTokenRef.current === token && !sessionActive) return;
         const ta = taRef.current;
         if (!ta) return;
         const pos = insertPosRef.current;
@@ -518,8 +523,17 @@ export function VoiceOverlay({
       }, (next) => {
         if (sessionTokenRef.current !== token) return;
         if (!openRef.current && next) return;
+        if (next && (flushingTokenRef.current === token || stoppingTokenRef.current === token)) return;
         lastReportedListening = next;
-        if (next) sessionActive = true;
+        if (next) {
+          sessionActive = true;
+          if (startingTokenRef.current === token) {
+            startingTokenRef.current = null;
+          }
+        } else if (startingTokenRef.current === token) {
+          startingTokenRef.current = null;
+          if (openRef.current) setStarting(false);
+        }
         setListeningState(next);
         // A stop with a still-current token was not requested by the user
         // (user stops bump the token first): the recognizer ended a segment.
@@ -535,31 +549,45 @@ export function VoiceOverlay({
         if (sessionTokenRef.current !== token) return;
         setVoiceError(err || 'permission_denied');
         stopNotepadAutoRestart();
-        if (sessionActive || listeningRef.current) {
+        if (sessionActive || listeningRef.current || (startCallSettled && startingTokenRef.current === token)) {
           void commitAndStop(true);
+        } else if (startingTokenRef.current === token) {
+          pendingErrorWhileStarting = true;
         }
       });
+      startCallSettled = true;
+      const currentValid = sessionTokenRef.current === token
+        && flushingTokenRef.current !== token
+        && stoppingTokenRef.current !== token
+        && openRef.current;
       // Check guards after async — overlay may have closed or session may have changed
-      if (ok && sessionTokenRef.current === token && flushingTokenRef.current !== token && openRef.current) {
+      if (ok && currentValid) {
         if (lastReportedListening === false) {
           setListeningState(false);
-        } else {
+        } else if (lastReportedListening === true) {
           sessionActive = true;
           setListeningState(true);
+        } else if (pendingErrorWhileStarting) {
+          void commitAndStop(true);
+        } else {
+          // Capture request submitted (e.g. Web Speech rec.start()) without synchronous confirmation yet.
+          // Preserve starting + cancellable startingTokenRef until onListeningChange(true), error, end, stop, or close.
+          keepStartingPending = true;
         }
-      } else if (!ok && sessionTokenRef.current === token && flushingTokenRef.current !== token && openRef.current) {
+      } else if (!ok && currentValid) {
         setListeningState(false);
         stopNotepadAutoRestart();
         setVoiceError((prev) => prev ?? 'permission_denied');
       }
     } catch (err) {
+      startCallSettled = true;
       if (sessionTokenRef.current === token && openRef.current) {
         setListeningState(false);
         stopNotepadAutoRestart();
         setVoiceError(err instanceof Error ? err.message : 'permission_denied');
       }
     } finally {
-      if (startingTokenRef.current === token) {
+      if (!keepStartingPending && startingTokenRef.current === token) {
         startingTokenRef.current = null;
         if (openRef.current) setStarting(false);
       }
@@ -909,6 +937,8 @@ export function VoiceOverlay({
     notepadRef.current = false;
     openSeqRef.current++;
     sessionTokenRef.current++;
+    startingTokenRef.current = null;
+    setStarting(false);
     VoiceInput.stopListening();
     setListeningState(false);
     onClose();

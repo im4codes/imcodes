@@ -218,6 +218,48 @@ describe('VoiceInput', () => {
     }
   });
 
+  it('VoiceOverlay + VoiceInput native: stays in voice.starting while speechApi.start is pending and promotes cleanly on listeningState: started', async () => {
+    vi.useFakeTimers();
+    try {
+      const startGate = deferred<void>();
+      speechApi.start.mockReturnValueOnce(startGate.promise);
+      const { VoiceOverlay } = await import('../../src/components/VoiceOverlay.js');
+
+      render(h(VoiceOverlay, {
+        open: true,
+        initialText: '',
+        onSend: () => 'accepted',
+        onClose: () => {},
+      }));
+      await vi.advanceTimersByTimeAsync(150);
+      expect(speechApi.start).toHaveBeenCalledTimes(1);
+      expect(VoiceInput.isListening()).toBe(false);
+
+      const status = document.querySelector('.voice-overlay-status [role="status"]') as HTMLElement;
+      const mic = document.querySelector('.voice-overlay-mic') as HTMLButtonElement;
+      expect(status.textContent).toBe('voice.starting');
+      expect(mic.classList.contains('voice-overlay-mic-active')).toBe(false);
+
+      listeners.listeningState?.({ status: 'started' });
+      startGate.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(VoiceInput.isListening()).toBe(true);
+      expect(status.textContent).toBe('voice.listening');
+      expect(mic.classList.contains('voice-overlay-mic-active')).toBe(true);
+
+      listeners.partialResults?.({ matches: ['native confirmed'], isFinal: false });
+      await vi.advanceTimersByTimeAsync(0);
+      expect((document.querySelector('.voice-overlay-text') as HTMLTextAreaElement).value).toBe('native confirmed');
+      expect(status.textContent).toBe('voice.recognizing');
+    } finally {
+      cleanup();
+      await VoiceInput.stopListening();
+      await vi.advanceTimersByTimeAsync(0);
+      vi.useRealTimers();
+    }
+  });
+
   it('initializes VoiceOverlay waveform bars at 0 (2px idle height), animates on audioLevel > 0.01, resets to 0 on stop, and isolates stale audioLevel events during stop drain', async () => {
     vi.useFakeTimers();
     try {
