@@ -1462,6 +1462,7 @@
     "device_name_placeholder": "Nombre del dispositivo (opcional, ej: MacBook Pro)",
     "or": "o",
     "github_signin": "Iniciar sesión con GitHub",
+    "google_signin": "Iniciar sesión con Google",
     "password_signin": "Iniciar sesión con contraseña",
     "username_placeholder": "Nombre de usuario",
     "password_placeholder": "Contraseña",

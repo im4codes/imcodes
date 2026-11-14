@@ -37,6 +37,11 @@ export const LOCAL_PANEL_STRING_KEYS = [
   'setupBindSubmit', 'setupStepExchanging', 'setupStepBindingDaemon',
   'setupStepEnrollingNode', 'setupStepStartingRuntime', 'setupServerUnsupported',
   'setupBindFailed', 'setupComplete',
+  'setupCallbackSuccessTitle', 'setupCallbackSuccessDetail',
+  'setupCallbackInactiveTitle', 'setupCallbackInactiveDetail',
+  'setupCallbackInvalidTitle', 'setupCallbackInvalidDetail',
+  'setupCallbackFailedTitle', 'setupCallbackFailedDetail',
+  'setupCallbackBack',
 ] as const;
 export type LocalPanelStringKey = (typeof LOCAL_PANEL_STRING_KEYS)[number];
 export type LocalPanelStrings = Readonly<Record<LocalPanelStringKey, string>>;
@@ -127,6 +132,15 @@ const en: LocalPanelStrings = {
   setupServerUnsupported: 'This server does not support direct desktop enrollment. Upgrade the server or use a custom installer.',
   setupBindFailed: 'Connection failed. Check the server address or credentials and try again.',
   setupComplete: 'Connected! Opening control panel…',
+  setupCallbackSuccessTitle: 'Connected to IM.codes',
+  setupCallbackSuccessDetail: 'You can close this tab and return to aiDesk.',
+  setupCallbackInactiveTitle: 'Setup not active',
+  setupCallbackInactiveDetail: 'Return to aiDesk to continue.',
+  setupCallbackInvalidTitle: 'Invalid or expired sign-in callback',
+  setupCallbackInvalidDetail: 'Please start browser sign-in again from aiDesk.',
+  setupCallbackFailedTitle: 'Connection failed',
+  setupCallbackFailedDetail: 'Please return to aiDesk and try again.',
+  setupCallbackBack: 'Back to aiDesk',
 };
 
 const zhCN: LocalPanelStrings = {
@@ -204,6 +218,15 @@ const zhCN: LocalPanelStrings = {
   setupServerUnsupported: '该服务器暂不支持三合一直接注册接口，请升级服务端或使用自定义安装包。',
   setupBindFailed: '连接失败，请检查服务器地址或凭证后重试。',
   setupComplete: '连接成功！正在进入控制面板…',
+  setupCallbackSuccessTitle: '已连接到 IM.codes',
+  setupCallbackSuccessDetail: '可以关闭此标签页并返回 aiDesk。',
+  setupCallbackInactiveTitle: '设置未处于待命状态',
+  setupCallbackInactiveDetail: '请返回 aiDesk 继续操作。',
+  setupCallbackInvalidTitle: '登录回调无效或已过期',
+  setupCallbackInvalidDetail: '请返回 aiDesk 重新发起浏览器登录。',
+  setupCallbackFailedTitle: '连接失败',
+  setupCallbackFailedDetail: '请返回 aiDesk 后重试。',
+  setupCallbackBack: '返回 aiDesk',
 };
 
 const zhTW: LocalPanelStrings = {
@@ -281,6 +304,15 @@ const zhTW: LocalPanelStrings = {
   setupServerUnsupported: '此伺服器不支援直接桌面註冊，請升級伺服器或使用自訂安裝程式。',
   setupBindFailed: '連線失敗，請檢查伺服器網址或憑證後再試。',
   setupComplete: '已連線！正在開啟控制面板…',
+  setupCallbackSuccessTitle: '已連線到 IM.codes',
+  setupCallbackSuccessDetail: '您可以關閉此分頁並返回 aiDesk。',
+  setupCallbackInactiveTitle: '設定未處於待命狀態',
+  setupCallbackInactiveDetail: '請返回 aiDesk 繼續操作。',
+  setupCallbackInvalidTitle: '登入回呼無效或已過期',
+  setupCallbackInvalidDetail: '請返回 aiDesk 重新發起瀏覽器登入。',
+  setupCallbackFailedTitle: '連線失敗',
+  setupCallbackFailedDetail: '請返回 aiDesk 後再試。',
+  setupCallbackBack: '返回 aiDesk',
 };
 
 const es: LocalPanelStrings = {
@@ -358,6 +390,15 @@ const es: LocalPanelStrings = {
   setupServerUnsupported: 'Este servidor no admite el registro directo de escritorio. Actualiza el servidor o usa un instalador personalizado.',
   setupBindFailed: 'Error de conexión. Revisa la dirección del servidor o las credenciales e inténtalo de nuevo.',
   setupComplete: '¡Conectado! Abriendo el panel de control…',
+  setupCallbackSuccessTitle: 'Conectado a IM.codes',
+  setupCallbackSuccessDetail: 'Puedes cerrar esta pestaña y volver a aiDesk.',
+  setupCallbackInactiveTitle: 'La configuración no está activa',
+  setupCallbackInactiveDetail: 'Vuelve a aiDesk para continuar.',
+  setupCallbackInvalidTitle: 'Callback de inicio de sesión inválido o caducado',
+  setupCallbackInvalidDetail: 'Vuelve a iniciar el acceso desde el navegador en aiDesk.',
+  setupCallbackFailedTitle: 'Error de conexión',
+  setupCallbackFailedDetail: 'Vuelve a aiDesk e inténtalo de nuevo.',
+  setupCallbackBack: 'Volver a aiDesk',
 };
 
 const ru: LocalPanelStrings = {
@@ -435,6 +476,15 @@ const ru: LocalPanelStrings = {
   setupServerUnsupported: 'Этот сервер не поддерживает прямую регистрацию. Обновите сервер или используйте персональный установщик.',
   setupBindFailed: 'Не удалось подключиться. Проверьте адрес сервера или учётные данные и повторите попытку.',
   setupComplete: 'Подключено! Открытие панели управления…',
+  setupCallbackSuccessTitle: 'Подключено к IM.codes',
+  setupCallbackSuccessDetail: 'Можно закрыть эту вкладку и вернуться в aiDesk.',
+  setupCallbackInactiveTitle: 'Настройка не активна',
+  setupCallbackInactiveDetail: 'Вернитесь в aiDesk, чтобы продолжить.',
+  setupCallbackInvalidTitle: 'Недействительный или просроченный ответ входа',
+  setupCallbackInvalidDetail: 'Пожалуйста, начните вход через браузер заново из aiDesk.',
+  setupCallbackFailedTitle: 'Не удалось подключиться',
+  setupCallbackFailedDetail: 'Пожалуйста, вернитесь в aiDesk и повторите попытку.',
+  setupCallbackBack: 'Вернуться в aiDesk',
 };
 
 const ja: LocalPanelStrings = {
@@ -512,6 +562,15 @@ const ja: LocalPanelStrings = {
   setupServerUnsupported: 'このサーバーは直接登録に対応していません。サーバーを更新するかカスタムインストーラーをご使用ください。',
   setupBindFailed: '接続に失敗しました。サーバーアドレスや認証情報を確認して再試行してください。',
   setupComplete: '接続完了！コントロールパネルを開いています…',
+  setupCallbackSuccessTitle: 'IM.codes に接続しました',
+  setupCallbackSuccessDetail: 'このタブを閉じて aiDesk に戻ることができます。',
+  setupCallbackInactiveTitle: 'セットアップは有効ではありません',
+  setupCallbackInactiveDetail: '続行するには aiDesk に戻ってください。',
+  setupCallbackInvalidTitle: 'サインインコールバックが無効または期限切れです',
+  setupCallbackInvalidDetail: 'aiDesk からブラウザサインインをやり直してください。',
+  setupCallbackFailedTitle: '接続に失敗しました',
+  setupCallbackFailedDetail: 'aiDesk に戻って再試行してください。',
+  setupCallbackBack: 'aiDesk に戻る',
 };
 
 const ko: LocalPanelStrings = {
@@ -589,6 +648,15 @@ const ko: LocalPanelStrings = {
   setupServerUnsupported: '이 서버는 직접 등록을 지원하지 않습니다. 서버를 업그레이드하거나 맞춤 설치 프로그램을 사용하세요.',
   setupBindFailed: '연결에 실패했습니다. 서버 주소나 인증 정보를 확인한 후 다시 시도하세요.',
   setupComplete: '연결되었습니다! 제어판을 여는 중…',
+  setupCallbackSuccessTitle: 'IM.codes에 연결되었습니다',
+  setupCallbackSuccessDetail: '이 탭을 닫고 aiDesk로 돌아가도 됩니다.',
+  setupCallbackInactiveTitle: '설정이 활성 상태가 아닙니다',
+  setupCallbackInactiveDetail: '계속하려면 aiDesk로 돌아가세요.',
+  setupCallbackInvalidTitle: '로그인 콜백이 유효하지 않거나 만료되었습니다',
+  setupCallbackInvalidDetail: 'aiDesk에서 브라우저 로그인을 다시 시작하세요.',
+  setupCallbackFailedTitle: '연결에 실패했습니다',
+  setupCallbackFailedDetail: 'aiDesk로 돌아가 다시 시도하세요.',
+  setupCallbackBack: 'aiDesk로 돌아가기',
 };
 
 export const LOCAL_PANEL_STRINGS: Readonly<Record<UiLocale, LocalPanelStrings>> = {

@@ -1462,6 +1462,7 @@
     "device_name_placeholder": "기기 이름 (선택, 예: MacBook Pro)",
     "or": "또는",
     "github_signin": "GitHub로 로그인",
+    "google_signin": "Google로 로그인",
     "password_signin": "비밀번호로 로그인",
     "username_placeholder": "사용자 이름",
     "password_placeholder": "비밀번호",

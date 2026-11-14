@@ -1462,6 +1462,7 @@
     "device_name_placeholder": "设备名称（可选，如：MacBook Pro）",
     "or": "或",
     "github_signin": "使用 GitHub 登录",
+    "google_signin": "使用 Google 登录",
     "password_signin": "使用密码登录",
     "username_placeholder": "用户名",
     "password_placeholder": "密码",

@@ -587,7 +587,10 @@ async function ensureServiceRegistered(
   deps: ControlledNodeBootstrapDeps,
   journal: InstallJournal,
 ): Promise<InstallJournal> {
-  if (phaseIndex(journal.phase) >= phaseIndex('files_staged') && journal.stagedReceipt) {
+  if (phaseIndex(journal.phase) >= phaseIndex('files_staged')) {
+    if (!journal.stagedReceipt) {
+      throw new Error('controlled node staged executable receipt is missing; manual recovery required');
+    }
     // Report drift, never refuse on it. This runs on the service's own start
     // path too, so throwing here turns a stale receipt into a crash loop on a
     // machine that is otherwise serving fine -- and the installer, the one

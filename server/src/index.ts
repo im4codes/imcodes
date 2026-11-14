@@ -26,6 +26,7 @@ import { runMigrations } from './db/migrate.js';
 import { randomHex, hashPassword } from './security/crypto.js';
 import { authRoutes, initializeAuthNonceCleanup } from './routes/auth.js';
 import { githubAuthRoutes } from './routes/github-auth.js';
+import { googleAuthRoutes } from './routes/google-auth.js';
 import { adminRoutes } from './routes/admin.js';
 import { bindRoutes } from './routes/bind.js';
 import { enrollRoutes, runEnrollmentRetention } from './routes/enroll.js';
@@ -295,6 +296,7 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
 
   app.route('/api/auth', authRoutes);
   app.route('/api/auth/github', githubAuthRoutes);
+  app.route('/api/auth/google', googleAuthRoutes);
   app.route('/api/bind', bindRoutes);
   app.route('/api/enroll', enrollRoutes);
   // Top-level and deliberately short: this URL is typed by hand, read off a

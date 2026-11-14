@@ -393,6 +393,8 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
     if (code === 'setup_relay_invalid') return T('setupRelayInvalid');
     if (code === 'setup_bind_invalid') return T('setupBindInvalid');
     if (code === 'setup_server_unsupported') return T('setupServerUnsupported');
+    if (code === 'daemon_not_installed') return T('daemonNotInstalledHint');
+    if (code === 'daemon_no_active_user') return T('daemonNoActiveUserHint');
     return T('setupBindFailed');
   }
   function renderSetup() {
@@ -745,7 +747,7 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
         setupLocalError = '';
         setupBusy = true;
         renderSetup();
-        post(B.actionPath, { action: B.setupActions.START_BROWSER_AUTH, relayUrl: relay }).then(function (response) {
+        post(B.actionPath, { action: B.setupActions.START_BROWSER_AUTH, relayUrl: relay, locale: locale }).then(function (response) {
           if (response.ok) return null;
           return response.json().catch(function () { return null; }).then(function (data) {
             setupLocalError = data && data.error ? data.error : 'setup_bind_failed';

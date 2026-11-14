@@ -14,6 +14,7 @@ import { LOCAL_PANEL_EXTERNAL_PATH, LOCAL_PANEL_OPEN_ANSWER_BUDGET_MS } from '..
 import {
   REMOTE_DESKTOP_LOCAL_ACTION,
   REMOTE_DESKTOP_LOCAL_DAEMON_ACTION,
+  REMOTE_DESKTOP_LOCAL_DAEMON_REASON,
   REMOTE_DESKTOP_LOCAL_MANAGEMENT,
   REMOTE_DESKTOP_LOCAL_WEB_ACTION,
   type RemoteDesktopLocalAction,
@@ -30,6 +31,8 @@ import {
   type RemoteDesktopLocalWebAction,
 } from '../../shared/remote-desktop-local-management.js';
 import { renderLocalPanelPage } from './local-panel-page.js';
+import { localPanelText, type LocalPanelStringKey } from '../../shared/local-panel-strings.js';
+import { isUiLocale, resolveUiLocale, type UiLocale } from '../../shared/ui-locale.js';
 import {
   allowedEnrollmentServerOrigin,
   EnrollDirectUnsupportedError,
@@ -161,17 +164,49 @@ export function remoteDesktopManagementUrl(
   return url.toString();
 }
 
-function buildSetupCallbackHtml(ok: boolean, title: string, detail: string): string {
+function parseAcceptLanguageTags(header: string | string[] | undefined): string[] {
+  const raw = Array.isArray(header) ? header.join(',') : (header ?? '');
+  if (!raw.trim()) return [];
+  return raw
+    .split(',')
+    .map((part, idx) => {
+      const [tagPart, ...params] = part.split(';').map((s) => s.trim());
+      let q = 1;
+      for (const param of params) {
+        const match = /^q=([0-9]+(?:\.[0-9]+)?)$/iu.exec(param);
+        if (match) q = Number.parseFloat(match[1]!);
+      }
+      return { tag: tagPart ?? '', q: Number.isFinite(q) ? q : 0, idx };
+    })
+    .filter((entry) => Boolean(entry.tag) && entry.q > 0)
+    .sort((a, b) => (b.q - a.q) || (a.idx - b.idx))
+    .map((entry) => entry.tag);
+}
+
+function resolveSetupCallbackLocale(request: IncomingMessage, storedLocale?: UiLocale): UiLocale {
+  if (storedLocale && isUiLocale(storedLocale)) return storedLocale;
+  return resolveUiLocale(parseAcceptLanguageTags(request.headers['accept-language']));
+}
+
+function buildSetupCallbackHtml(
+  locale: UiLocale,
+  ok: boolean,
+  titleKey: LocalPanelStringKey,
+  detailKey: LocalPanelStringKey,
+): string {
   const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const accent = ok ? '#10b981' : '#ef4444';
-  return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">`
+  const title = localPanelText(locale, titleKey);
+  const detail = localPanelText(locale, detailKey);
+  const backLabel = localPanelText(locale, 'setupCallbackBack');
+  return `<!doctype html><html lang="${esc(locale)}"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">`
     + `<title>${esc(title)}</title>`
     + `<style>body{margin:0;font-family:system-ui,-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px;box-sizing:border-box}`
     + `.card{max-width:420px;width:100%;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:24px;text-align:center}`
     + `.badge{width:12px;height:12px;border-radius:999px;background:${accent};margin:0 auto 14px}`
     + `h1{font-size:18px;margin:0 0 8px}p{font-size:14px;color:#94a3b8;line-height:1.5;margin:0 0 18px}`
     + `a{display:inline-block;padding:10px 16px;border-radius:10px;background:#3b82f6;color:#fff;text-decoration:none;font-size:14px;font-weight:600}</style>`
-    + `<div class="card"><div class="badge"></div><h1>${esc(title)}</h1><p>${esc(detail)}</p><a href="/">aiDesk</a></div>`;
+    + `<div class="card"><div class="badge"></div><h1>${esc(title)}</h1><p>${esc(detail)}</p><a href="/">${esc(backLabel)}</a></div></html>`;
 }
 
 function replySetupCallback(response: ServerResponse, status: number, html: string): void {
@@ -189,6 +224,8 @@ function replySetupCallback(response: ServerResponse, status: number, html: stri
 function mapSetupErrorCode(error: unknown): string {
   if (error instanceof EnrollDirectUnsupportedError) return 'setup_server_unsupported';
   const msg = error instanceof Error ? error.message : '';
+  if (msg === REMOTE_DESKTOP_LOCAL_DAEMON_REASON.NOT_INSTALLED) return 'daemon_not_installed';
+  if (msg === REMOTE_DESKTOP_LOCAL_DAEMON_REASON.NO_ACTIVE_USER) return 'daemon_no_active_user';
   if (msg === 'setup_relay_invalid' || msg.startsWith('enrollment_server_url_')) return 'setup_relay_invalid';
   if (msg === 'setup_bind_invalid') return 'setup_bind_invalid';
   return 'setup_bind_failed';
@@ -251,7 +288,8 @@ export async function startRemoteDesktopLocalPanel(
         browserAuthPending: false,
       }
     : null;
-  let pendingBrowserAuth: { state: string; relayOrigin: string; expiresAt: number } | null = null;
+  let pendingBrowserAuth: { state: string; relayOrigin: string; locale: UiLocale; expiresAt: number } | null = null;
+  let lastBrowserAuthLocale: UiLocale | undefined;
   let expectedHost = `${host}:${port}`;
   let origin = `http://${expectedHost}`;
   let listenPort = port;
@@ -307,10 +345,11 @@ export async function startRemoteDesktopLocalPanel(
     const url = new URL(request.url ?? '/', origin);
     if (request.method === 'GET' && url.pathname === DESKTOP_SETUP_CALLBACK_PATH) {
       if (!activeSetup || !setupStatus || !setupStatus.setupRequired) {
+        const cbLocale = resolveSetupCallbackLocale(request, pendingBrowserAuth?.locale ?? lastBrowserAuthLocale);
         return replySetupCallback(
           response,
           404,
-          buildSetupCallbackHtml(false, 'Setup not active', 'Return to aiDesk to continue.'),
+          buildSetupCallbackHtml(cbLocale, false, 'setupCallbackInactiveTitle', 'setupCallbackInactiveDetail'),
         );
       }
       const now = nowFn();
@@ -327,14 +366,16 @@ export async function startRemoteDesktopLocalPanel(
         || nonce.length === 0
         || nonce.length > 256
       ) {
+        const cbLocale = resolveSetupCallbackLocale(request, pendingBrowserAuth?.locale ?? lastBrowserAuthLocale);
         return replySetupCallback(
           response,
           400,
-          buildSetupCallbackHtml(false, 'Invalid or expired sign-in callback', 'Please start browser sign-in again from aiDesk.'),
+          buildSetupCallbackHtml(cbLocale, false, 'setupCallbackInvalidTitle', 'setupCallbackInvalidDetail'),
         );
       }
       const matched = pendingBrowserAuth;
       pendingBrowserAuth = null;
+      const cbLocale = resolveSetupCallbackLocale(request, matched.locale);
       try {
         setupStatus = {
           ...setupStatus,
@@ -352,7 +393,7 @@ export async function startRemoteDesktopLocalPanel(
         return replySetupCallback(
           response,
           200,
-          buildSetupCallbackHtml(true, 'Connected to IM.codes', 'You can close this tab and return to aiDesk.'),
+          buildSetupCallbackHtml(cbLocale, true, 'setupCallbackSuccessTitle', 'setupCallbackSuccessDetail'),
         );
       } catch (err) {
         const errorCode = mapSetupErrorCode(err);
@@ -367,7 +408,7 @@ export async function startRemoteDesktopLocalPanel(
         return replySetupCallback(
           response,
           502,
-          buildSetupCallbackHtml(false, 'Connection failed', 'Please return to aiDesk and try again.'),
+          buildSetupCallbackHtml(cbLocale, false, 'setupCallbackFailedTitle', 'setupCallbackFailedDetail'),
         );
       }
     }
@@ -502,9 +543,14 @@ export async function startRemoteDesktopLocalPanel(
           const state = randomBytes(24).toString('base64url');
           const callbackUrl = `http://${host}:${listenPort}${DESKTOP_SETUP_CALLBACK_PATH}?state=${state}`;
           const loginUrl = buildDesktopSetupLoginUrl(relayOrigin, callbackUrl);
+          const requestedLocale = isUiLocale(body?.locale)
+            ? body.locale
+            : resolveSetupCallbackLocale(request, lastBrowserAuthLocale);
+          lastBrowserAuthLocale = requestedLocale;
           pendingBrowserAuth = {
             state,
             relayOrigin,
+            locale: requestedLocale,
             expiresAt: nowFn() + (activeSetup.stateTtlMs ?? SETUP_BROWSER_STATE_TTL_MS),
           };
           setupStatus = {

@@ -1462,6 +1462,7 @@
     "device_name_placeholder": "Название устройства (необязательно, напр.: MacBook Pro)",
     "or": "или",
     "github_signin": "Войти через GitHub",
+    "google_signin": "Войти через Google",
     "password_signin": "Войти с паролем",
     "username_placeholder": "Имя пользователя",
     "password_placeholder": "Пароль",

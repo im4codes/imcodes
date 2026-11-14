@@ -1462,6 +1462,7 @@
     "device_name_placeholder": "デバイス名（任意、例：MacBook Pro）",
     "or": "または",
     "github_signin": "GitHubでサインイン",
+    "google_signin": "Googleでサインイン",
     "password_signin": "パスワードでサインイン",
     "username_placeholder": "ユーザー名",
     "password_placeholder": "パスワード",

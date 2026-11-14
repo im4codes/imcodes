@@ -924,3 +924,64 @@ export function allowedEnrollmentServerOrigin(serverUrl: string): string {
 export function isValidNodeTokenHash(value: string): boolean {
   return isEnrollmentNodeTokenHash(value) && value.length === ENROLLMENT_NODE_TOKEN_HASH_HEX_LEN;
 }
+
+/**
+ * Inspect an already-staged regular non-symlink executable and compute a real
+ * `StagedExecutableReceipt` (size, streaming SHA-256, and POSIX identity).
+ */
+export async function inspectExecutableReceipt(
+  executablePath: string,
+  sourceExecutablePath?: string,
+): Promise<StagedExecutableReceipt> {
+  const before = await lstat(executablePath);
+  if (before.isSymbolicLink() || !before.isFile()) {
+    throw new Error('staged_executable_not_regular');
+  }
+  const beforeIdentity = fileIdentityFromStat(before);
+  const handle = await openNoFollow(executablePath, false);
+  try {
+    const after = await handle.stat();
+    if (!after.isFile()) {
+      throw new Error('staged_executable_not_regular');
+    }
+    const stagedIdentity = fileIdentityFromStat(after);
+    if (!sameFileIdentity(beforeIdentity, stagedIdentity)) {
+      throw new Error('staged_executable_identity_changed');
+    }
+
+    const hash = createHash('sha256');
+    const buffer = Buffer.alloc(64 * 1024);
+    let position = 0;
+    while (position < after.size) {
+      const toRead = Math.min(buffer.length, after.size - position);
+      const { bytesRead } = await handle.read(buffer, 0, toRead, position);
+      if (bytesRead <= 0) {
+        throw new Error('staged_executable_read_ended_early');
+      }
+      hash.update(buffer.subarray(0, bytesRead));
+      position += bytesRead;
+    }
+
+    let sourceIdentity = stagedIdentity;
+    if (sourceExecutablePath && sourceExecutablePath !== executablePath) {
+      try {
+        const srcStat = await lstat(sourceExecutablePath);
+        if (!srcStat.isSymbolicLink() && srcStat.isFile()) {
+          sourceIdentity = fileIdentityFromStat(srcStat);
+        }
+      } catch {
+        // Fall back to stagedIdentity when optional source path is unavailable.
+      }
+    }
+
+    return {
+      path: executablePath,
+      size: after.size,
+      sha256: hash.digest('hex'),
+      sourceIdentity,
+      stagedIdentity,
+    };
+  } finally {
+    await handle.close().catch(() => {});
+  }
+}

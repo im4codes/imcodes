@@ -515,3 +515,45 @@ describe('LoginPage password login: remember-password', () => {
     expect(screen.queryByText('login.session_not_stuck')).toBeNull();
   });
 });
+
+describe('LoginPage OAuth desktop_callback forwarding', () => {
+  const validCallback = 'http://127.0.0.1:43751/setup/callback?state=state_0123456789abcdef';
+  const encodedCallback = encodeURIComponent(validCallback);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    nativeState.value = false;
+    const fakeLocation: Partial<Location> = {
+      ...window.location,
+      search: `?desktop_callback=${encodedCallback}`,
+      href: `https://app.im.codes/?desktop_callback=${encodedCallback}`,
+      reload: vi.fn(),
+      assign: vi.fn(),
+      replace: vi.fn(),
+    };
+    vi.stubGlobal('location', fakeLocation);
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('renders both GitHub and Google sign-in buttons and forwards desktop_callback for Google OAuth', () => {
+    render(<LoginPage serverUrl="https://app.im.codes" onLogin={vi.fn()} showGithub />);
+    expect(screen.getByRole('button', { name: 'login.github_signin' })).toBeTruthy();
+    const googleBtn = screen.getByRole('button', { name: 'login.google_signin' });
+    fireEvent.click(googleBtn);
+    const navUrl = new URL(window.location.href, 'https://app.im.codes');
+    expect(navUrl.pathname).toBe('/api/auth/google');
+    expect(navUrl.searchParams.get('desktop_callback')).toBe(validCallback);
+  });
+
+  it('forwards desktop_callback for GitHub OAuth', () => {
+    render(<LoginPage serverUrl="https://app.im.codes" onLogin={vi.fn()} showGithub />);
+    fireEvent.click(screen.getByRole('button', { name: 'login.github_signin' }));
+    const navUrl = new URL(window.location.href, 'https://app.im.codes');
+    expect(navUrl.pathname).toBe('/api/auth/github');
+    expect(navUrl.searchParams.get('desktop_callback')).toBe(validCallback);
+  });
+});

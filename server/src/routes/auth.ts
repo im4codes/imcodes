@@ -9,6 +9,7 @@ import { checkAuthLockout, recordAuthFailure } from '../security/lockout.js';
 import { DOC_COLLABORATOR_SCOPE_REFUSAL, requireAuth, resolveAuthOutcome, resolveServerWebSocketAccess } from '../security/authorization.js';
 import {
   buildDesktopSetupCallbackRedirectUrl,
+  DESKTOP_SETUP_CALLBACK_QUERY_PARAM,
   parseDesktopSetupCallbackUrl,
 } from '../../../shared/desktop-setup-auth.js';
 import { isUserActive } from '../security/user-status.js';
@@ -1188,6 +1189,9 @@ async function handleCentralDocRelayCallback(
 
 authRoutes.get('/github', async (c, next) => {
   if (c.req.query('callback_path')) {
+    if (c.req.query(DESKTOP_SETUP_CALLBACK_QUERY_PARAM)) {
+      return c.json({ error: 'invalid_desktop_callback' }, 400);
+    }
     return handleCentralDocRelayStart(c, 'github');
   }
   return next();
@@ -1204,20 +1208,25 @@ authRoutes.get('/github/callback', async (c, next) => {
   return next();
 });
 
-authRoutes.get('/google', async (c) => {
-  return handleCentralDocRelayStart(c, 'google');
+authRoutes.get('/google', async (c, next) => {
+  if (c.req.query('callback_path')) {
+    if (c.req.query(DESKTOP_SETUP_CALLBACK_QUERY_PARAM)) {
+      return c.json({ error: 'invalid_desktop_callback' }, 400);
+    }
+    return handleCentralDocRelayStart(c, 'google');
+  }
+  return next();
 });
 
-authRoutes.get('/google/callback', async (c) => {
+authRoutes.get('/google/callback', async (c, next) => {
   const state = c.req.query('state');
-  if (!state || !c.env.JWT_SIGNING_KEY) {
-    return c.json({ error: 'invalid_state' }, 400);
+  if (state && c.env.JWT_SIGNING_KEY) {
+    const payload = verifyJwt(state, c.env.JWT_SIGNING_KEY);
+    if (payload && payload.type === 'doc-auth-relay-central') {
+      return handleCentralDocRelayCallback(c, 'google', payload);
+    }
   }
-  const payload = verifyJwt(state, c.env.JWT_SIGNING_KEY);
-  if (!payload || payload.type !== 'doc-auth-relay-central') {
-    return c.json({ error: 'invalid_state' }, 400);
-  }
-  return handleCentralDocRelayCallback(c, 'google', payload);
+  return next();
 });
 
 const verifyRelayTicketSchema = z.object({

@@ -124,10 +124,23 @@ export interface LocalDaemonSetupBindingInfo {
   serverId: string | null;
 }
 
+export interface PreparedDaemonBind {
+  workerUrl: string;
+  serverId: string;
+  token: string;
+  serverName: string;
+}
+
+export type PrepareDaemonBindResult =
+  | { ok: true; statusCode: 200; prepared: PreparedDaemonBind }
+  | { ok: false; statusCode: number; error: string };
+
 export interface LocalDaemonController {
   status(): Promise<RemoteDesktopLocalDaemonStatus>;
   logs(): Promise<RemoteDesktopLocalDaemonLogs>;
   readSetupBindingInfo?(): Promise<LocalDaemonSetupBindingInfo>;
+  prepareBind?(payload?: { bindUrl?: unknown; serverName?: unknown }): Promise<PrepareDaemonBindResult>;
+  commitBind?(prepared: PreparedDaemonBind): Promise<LocalDaemonActionResult>;
   performAction(
     action: RemoteDesktopLocalDaemonAction,
     payload?: { bindUrl?: unknown; serverName?: unknown },
@@ -870,7 +883,7 @@ function ensureOwnedDir(
 function writeOwnedFile(
   rootDir: string,
   relativeParts: readonly string[],
-  content: string,
+  content: string | Buffer,
   user: ActiveDesktopUser,
   currentUid: number,
   mode: number,
@@ -878,7 +891,7 @@ function writeOwnedFile(
   fchownOverride?: (fd: number, uid: number, gid: number) => void,
 ): void {
   assertCleanRelativeParts(relativeParts);
-  const dirMode = mode === 0o600 ? 0o700 : 0o755;
+  const dirMode = (mode & 0o077) === 0 ? 0o700 : 0o755;
   const parentDir = ensureOwnedDir(
     rootDir,
     relativeParts.slice(0, -1),
@@ -912,7 +925,7 @@ function writeOwnedFile(
   try {
     const fdStat = fstatSync(fd);
     if (!fdStat.isFile()) throw new Error('unsafe_path');
-    const buf = Buffer.from(content, 'utf8');
+    const buf = typeof content === 'string' ? Buffer.from(content, 'utf8') : content;
     let written = 0;
     while (written < buf.length) {
       written += writeSync(fd, buf, written, buf.length - written);
@@ -1936,17 +1949,14 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
     return { ok: false, statusCode: 409, error: 'autostart_unavailable' };
   }
 
-  async function bindUserDaemon(
-    user: ActiveDesktopUser,
+  async function prepareBindUserDaemon(
     stateDir: string,
-    runtime: DiscoveredCodingDaemonRuntime,
     payload: { bindUrl?: unknown; serverName?: unknown },
-  ): Promise<LocalDaemonActionResult> {
+  ): Promise<PrepareDaemonBindResult> {
     const validated = validateBindUrl(payload.bindUrl);
     if (!validated.ok) {
       return { ok: false, statusCode: 400, error: validated.error };
     }
-    const currentUid = currentUidFn();
     const deviceName = typeof payload.serverName === 'string' && payload.serverName.trim()
       ? payload.serverName.trim().slice(0, 128)
       : hostNameFn();
@@ -2032,18 +2042,16 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
         return { ok: false, statusCode: 504, error: 'bind_timeout' };
       }
 
-      const credsPayload = JSON.stringify(
-        {
+      return {
+        ok: true,
+        statusCode: 200,
+        prepared: {
           serverId,
           token,
           workerUrl,
           serverName: deviceName,
-          boundAt: Date.now(),
         },
-        null,
-        2,
-      );
-      writeOwnedFile(stateDir, ['server.json'], credsPayload, user, currentUid, 0o600, true, deps.fchown);
+      };
     } catch {
       if (ac.signal.aborted) {
         return { ok: false, statusCode: 504, error: 'bind_timeout' };
@@ -2052,17 +2060,122 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  type ServerConfigSnapshot =
+    | { exists: false }
+    | { exists: true; content: Buffer; mode: number };
+
+  function snapshotServerConfig(stateDir: string): ServerConfigSnapshot {
+    const fd = openSafeContainedReadFd(stateDir, ['server.json']);
+    if (fd === null) return { exists: false };
+    try {
+      const st = fstatSync(fd);
+      if (st.size < 0 || st.size > 64 * 1024) return { exists: false };
+      const content = Buffer.allocUnsafe(st.size);
+      let offset = 0;
+      while (offset < st.size) {
+        const n = readSync(fd, content, offset, st.size - offset, offset);
+        if (n <= 0) break;
+        offset += n;
+      }
+      return {
+        exists: true,
+        content: content.subarray(0, offset),
+        mode: (st.mode & 0o777) || 0o600,
+      };
+    } catch {
+      return { exists: false };
+    } finally {
+      closeSync(fd);
+    }
+  }
+
+  function restoreServerConfig(
+    stateDir: string,
+    snapshot: ServerConfigSnapshot,
+    user: ActiveDesktopUser,
+    currentUid: number,
+  ): void {
+    if (snapshot.exists) {
+      writeOwnedFile(stateDir, ['server.json'], snapshot.content, user, currentUid, snapshot.mode, true, deps.fchown);
+    } else {
+      removeSafeContainedFile(stateDir, ['server.json']);
+    }
+  }
+
+  async function commitBindUserDaemon(
+    user: ActiveDesktopUser,
+    stateDir: string,
+    runtime: DiscoveredCodingDaemonRuntime,
+    prepared: PreparedDaemonBind,
+  ): Promise<LocalDaemonActionResult> {
+    const currentUid = currentUidFn();
+    const priorProc = await resolveDaemonProcess(stateDir, user).catch(() => null);
+    const wasRunning = priorProc?.state === 'running';
+    const snapshot = snapshotServerConfig(stateDir);
+
+    const rollback = async () => {
+      try {
+        restoreServerConfig(stateDir, snapshot, user, currentUid);
+      } catch {
+        // best-effort config rollback
+      }
+      if (wasRunning && snapshot.exists) {
+        try {
+          const cur = await resolveDaemonProcess(stateDir, user);
+          if (cur.state !== 'running') {
+            await startUserDaemon(user, stateDir, runtime);
+          }
+        } catch {
+          // best-effort daemon restart rollback
+        }
+      }
+    };
+
+    try {
+      const credsPayload = JSON.stringify(
+        {
+          serverId: prepared.serverId,
+          token: prepared.token,
+          workerUrl: prepared.workerUrl,
+          serverName: prepared.serverName,
+          boundAt: Date.now(),
+        },
+        null,
+        2,
+      );
+      writeOwnedFile(stateDir, ['server.json'], credsPayload, user, currentUid, 0o600, true, deps.fchown);
+    } catch {
+      await rollback();
+      return { ok: false, statusCode: 500, error: 'bind_failed', status: await inspectStatus() };
+    }
 
     const stopped = await stopUserDaemon(user, stateDir);
     if (!stopped.ok) {
+      await rollback();
       return { ok: false, statusCode: 500, error: stopped.error ?? 'stop_failed', status: await inspectStatus() };
     }
     try {
       await startUserDaemon(user, stateDir, runtime);
     } catch {
+      await rollback();
       return { ok: false, statusCode: 500, error: 'start_failed', status: await inspectStatus() };
     }
     return { ok: true, statusCode: 200, status: await inspectStatus() };
+  }
+
+  async function bindUserDaemon(
+    user: ActiveDesktopUser,
+    stateDir: string,
+    runtime: DiscoveredCodingDaemonRuntime,
+    payload: { bindUrl?: unknown; serverName?: unknown },
+  ): Promise<LocalDaemonActionResult> {
+    const prep = await prepareBindUserDaemon(stateDir, payload);
+    if (!prep.ok) {
+      return { ok: false, statusCode: prep.statusCode, error: prep.error };
+    }
+    return commitBindUserDaemon(user, stateDir, runtime, prep.prepared);
   }
 
   let mutex: Promise<unknown> = Promise.resolve();
@@ -2099,6 +2212,43 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
       if (!user) return { text: '', truncated: false };
       return readBoundedTailLog(stateDirForUser(user));
     },
+    prepareBind: (payload = {}) => serialized(async (): Promise<PrepareDaemonBindResult> => {
+      const user = await resolveUser();
+      if (!user) {
+        return { ok: false, statusCode: 409, error: REMOTE_DESKTOP_LOCAL_DAEMON_REASON.NO_ACTIVE_USER };
+      }
+      const runtime = discoverCodingDaemonRuntime({
+        platform,
+        env,
+        execPath,
+        userHome: user.home,
+        bundleDirs: deps.bundleDirs,
+        cliCandidates: deps.cliCandidates,
+      });
+      if (!runtime) {
+        return { ok: false, statusCode: 409, error: REMOTE_DESKTOP_LOCAL_DAEMON_REASON.NOT_INSTALLED };
+      }
+      return await prepareBindUserDaemon(stateDirForUser(user), payload);
+    }),
+    commitBind: (prepared: PreparedDaemonBind) => serialized(async (): Promise<LocalDaemonActionResult> => {
+      const user = await resolveUser();
+      if (!user) {
+        return { ok: false, statusCode: 409, error: REMOTE_DESKTOP_LOCAL_DAEMON_REASON.NO_ACTIVE_USER };
+      }
+      const stateDir = stateDirForUser(user);
+      const runtime = discoverCodingDaemonRuntime({
+        platform,
+        env,
+        execPath,
+        userHome: user.home,
+        bundleDirs: deps.bundleDirs,
+        cliCandidates: deps.cliCandidates,
+      });
+      if (!runtime) {
+        return { ok: false, statusCode: 409, error: REMOTE_DESKTOP_LOCAL_DAEMON_REASON.NOT_INSTALLED };
+      }
+      return await commitBindUserDaemon(user, stateDir, runtime, prepared);
+    }),
     performAction: (action, payload = {}) => serialized(async (): Promise<LocalDaemonActionResult> => {
       const user = await resolveUser();
       if (!user) {

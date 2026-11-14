@@ -110,6 +110,8 @@ function createAuthTestApp() {
     NODE_ENV: 'development',
     GITHUB_CLIENT_ID: 'gh-client-1',
     GITHUB_CLIENT_SECRET: 'gh-secret-1',
+    GOOGLE_CLIENT_ID: 'google-client-1',
+    GOOGLE_CLIENT_SECRET: 'google-secret-1',
   } as Env);
 
   return { app, apiKeys, nonces, audits };
@@ -256,5 +258,96 @@ describe('POST /api/auth/desktop/nonce & token-exchange & GitHub OAuth state', (
     } finally {
       fetchSpy.mockRestore();
     }
+  });
+
+  it('supports primary Google OAuth start + callback -> desktop_callback -> desktop nonce -> token exchange', async () => {
+    const { app, apiKeys, nonces } = createAuthTestApp();
+    const goodCb = 'http://127.0.0.1:43751/setup/callback?state=GoogleState12345';
+
+    const startRes = await app.request(
+      `https://app.im.codes/api/auth/google?reauth=1&desktop_callback=${encodeURIComponent(goodCb)}`,
+    );
+    expect(startRes.status).toBe(302);
+    const googleAuthUrl = new URL(startRes.headers.get('location')!);
+    expect(googleAuthUrl.origin + googleAuthUrl.pathname).toBe('https://accounts.google.com/o/oauth2/v2/auth');
+    expect(googleAuthUrl.searchParams.get('redirect_uri')).toBe('https://app.im.codes/api/auth/google/callback');
+    expect(googleAuthUrl.searchParams.get('prompt')).toBe('select_account');
+    const stateJwt = googleAuthUrl.searchParams.get('state')!;
+    expect(stateJwt).toBeTruthy();
+    const oauthCookie = (startRes.headers.get('set-cookie') ?? '').split(';')[0];
+
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (url === 'https://oauth2.googleapis.com/token') {
+        return new Response(JSON.stringify({ access_token: 'g-tok-1' }), { status: 200 });
+      }
+      if (url === 'https://www.googleapis.com/oauth2/v2/userinfo') {
+        return new Response(JSON.stringify({ id: 'google-sub-99', email: 'alice@example.com', name: 'Alice' }), { status: 200 });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    try {
+      const cbRes = await app.request(
+        `https://app.im.codes/api/auth/google/callback?code=g-code-1&state=${encodeURIComponent(stateJwt)}`,
+        { headers: { Cookie: oauthCookie } },
+      );
+      expect(cbRes.status).toBe(302);
+      const finalLoc = new URL(cbRes.headers.get('location')!, 'https://app.im.codes');
+      expect(finalLoc.searchParams.get('desktop_callback')).toBe(goodCb);
+
+      const cookies = cbRes.headers.getSetCookie?.() ?? [cbRes.headers.get('set-cookie') ?? ''];
+      const joinedCookies = cookies.join('; ');
+      const sessionPair = /rcc_session=([^;]+)/.exec(joinedCookies)?.[0];
+      const csrfVal = /rcc_csrf=([^;]+)/.exec(joinedCookies)?.[1];
+      expect(sessionPair).toBeTruthy();
+      expect(csrfVal).toBeTruthy();
+
+      const nonceRes = await app.request('/api/auth/desktop/nonce', {
+        method: 'POST',
+        headers: {
+          Cookie: `${sessionPair}; rcc_csrf=${csrfVal}`,
+          'X-CSRF-Token': csrfVal!,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ callbackUrl: goodCb }),
+      });
+      expect(nonceRes.status).toBe(200);
+      const { nonce, redirectUrl } = await nonceRes.json() as { nonce: string; redirectUrl: string };
+      expect(redirectUrl).toBe(`http://127.0.0.1:43751/setup/callback?nonce=${encodeURIComponent(nonce)}&state=GoogleState12345`);
+      expect(nonces).toHaveLength(1);
+
+      const exchangeRes = await app.request('/api/auth/token-exchange', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ nonce }),
+      });
+      expect(exchangeRes.status).toBe(200);
+      const { apiKey } = await exchangeRes.json() as { apiKey: string };
+      expect(apiKey).toMatch(/^deck_/);
+      expect(apiKeys.some((k) => k.label === 'Desktop app')).toBe(true);
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it('rejects invalid desktop_callback on /api/auth/google and refuses desktop_callback on collaborator relay callback_path flows', async () => {
+    const { app } = createAuthTestApp();
+    const validCb = encodeURIComponent('http://127.0.0.1:43751/setup/callback?state=StateToken123456');
+
+    const badPrimary = await app.request('/api/auth/google?desktop_callback=' + encodeURIComponent('https://evil.example/setup/callback?state=AbCdEfGh'));
+    expect(badPrimary.status).toBe(400);
+    expect(await badPrimary.json()).toMatchObject({ error: 'invalid_desktop_callback' });
+
+    const collabGoogle = await app.request(
+      `/api/auth/google?callback_path=/api/doc-shares/auth/google/callback&origin=https://app.im.codes&state=doc123&desktop_callback=${validCb}`,
+    );
+    expect(collabGoogle.status).toBe(400);
+    expect(await collabGoogle.json()).toMatchObject({ error: 'invalid_desktop_callback' });
+
+    const collabGithub = await app.request(
+      `/api/auth/github?callback_path=/api/doc-shares/auth/github/callback&origin=https://app.im.codes&state=doc123&desktop_callback=${validCb}`,
+    );
+    expect(collabGithub.status).toBe(400);
+    expect(await collabGithub.json()).toMatchObject({ error: 'invalid_desktop_callback' });
   });
 });

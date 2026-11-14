@@ -10,7 +10,9 @@ import { activeUserAnswer } from './helpers/user-status.js';
 const USER_ID = 'user-owner-1';
 const OTHER_USER_ID = 'user-other-2';
 const API_KEY = 'deck_0123456789abcdef0123456789abcdef';
+const OTHER_API_KEY = 'deck_fedcba9876543210fedcba9876543210';
 const KEY_ID = 'key-desktop-1';
+const OTHER_KEY_ID = 'key-desktop-2';
 const DAEMON_TOKEN = 'daemon-secret-token-123';
 const sha = (v: string) => createHash('sha256').update(v).digest('hex');
 
@@ -31,22 +33,53 @@ interface ServerRow {
   created_at: number;
 }
 
-function createMemoryDb(seedServers: ServerRow[] = []) {
+function createMemoryDb(seedServers: ServerRow[] = [], options: { asyncYieldMs?: number } = {}) {
   const servers: ServerRow[] = [...seedServers];
   const audits: Array<{ userId: string; action: string; details: unknown }> = [];
+  const advisoryLockChains = new Map<string, Promise<void>>();
+  const lockEvents: Array<{ key: string; phase: 'acquire' | 'acquired' | 'release' }> = [];
 
-  const execQueryOne = async <T>(sql: string, params: unknown[] = []): Promise<T | null> => {
-    {
-      const activeUser = activeUserAnswer(sql);
-      if (activeUser) return activeUser as T;
+  const yieldTick = async () => {
+    if (options.asyncYieldMs && options.asyncYieldMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, options.asyncYieldMs));
     }
-    const s = sql.toLowerCase().replace(/\s+/g, ' ').trim();
-    if (s.includes('from api_keys')) {
-      return (params[0] === sha(API_KEY) ? { id: KEY_ID, user_id: USER_ID, user_status: 'active' } : null) as T | null;
-    }
-    if (s.includes('from users where id')) {
-      return { id: USER_ID, is_admin: false, status: 'active', sessions_valid_after: 0 } as T | null;
-    }
+  };
+
+  const makeTx = (heldLocks: Array<{ key: string; release: () => void }>) => {
+    const execQueryOne = async <T>(sql: string, params: unknown[] = []): Promise<T | null> => {
+      {
+        const activeUser = activeUserAnswer(sql);
+        if (activeUser) return activeUser as T;
+      }
+      const s = sql.toLowerCase().replace(/\s+/g, ' ').trim();
+      if (s.includes('pg_advisory_xact_lock')) {
+        const key = String(params[0] ?? '');
+        lockEvents.push({ key, phase: 'acquire' });
+        const prev = advisoryLockChains.get(key) ?? Promise.resolve();
+        let release!: () => void;
+        const current = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        const tail = prev.then(() => current);
+        advisoryLockChains.set(key, tail);
+        await prev;
+        heldLocks.push({ key, release });
+        lockEvents.push({ key, phase: 'acquired' });
+        return { locked: '' } as T;
+      }
+      if (s.includes('from api_keys')) {
+        if (params[0] === sha(API_KEY)) {
+          return { id: KEY_ID, user_id: USER_ID, user_status: 'active' } as T | null;
+        }
+        if (params[0] === sha(OTHER_API_KEY)) {
+          return { id: OTHER_KEY_ID, user_id: OTHER_USER_ID, user_status: 'active' } as T | null;
+        }
+        return null;
+      }
+      if (s.includes('from users where id')) {
+        const uid = params[0] === OTHER_USER_ID ? OTHER_USER_ID : USER_ID;
+        return { id: uid, is_admin: false, status: 'active', sessions_valid_after: 0 } as T | null;
+      }
     if (s.includes('as owner_status') && s.includes('from servers where id = $1')) {
       // requireAuth daemon token lookup
       const row = servers.find((srv) => srv.id === params[0]);
@@ -60,6 +93,7 @@ function createMemoryDb(seedServers: ServerRow[] = []) {
       } as T | null;
     }
     if (s.includes('from servers') && s.includes('where token_hash = $1')) {
+      await yieldTick();
       const matches = servers
         .filter((srv) => srv.token_hash === params[0])
         .sort((a, b) => b.created_at - a.created_at);
@@ -213,24 +247,36 @@ function createMemoryDb(seedServers: ServerRow[] = []) {
     return { changes: 1 };
   };
 
-  const txDb = {
-    queryOne: execQueryOne,
-    query: execQuery,
-    execute: execRun,
-    exec: async () => undefined,
-    close: async () => undefined,
+    return {
+      queryOne: execQueryOne,
+      query: execQuery,
+      execute: execRun,
+      exec: async () => undefined,
+      close: async () => undefined,
+    };
   };
 
+  const rootTx = makeTx([]);
   const db = {
-    ...txDb,
-    transaction: async <T>(fn: (tx: typeof txDb) => Promise<T>) => fn(txDb),
+    ...rootTx,
+    transaction: async <T>(fn: (tx: typeof rootTx) => Promise<T>) => {
+      const heldLocks: Array<{ key: string; release: () => void }> = [];
+      try {
+        return await fn(makeTx(heldLocks));
+      } finally {
+        for (const held of heldLocks.reverse()) {
+          lockEvents.push({ key: held.key, phase: 'release' });
+          held.release();
+        }
+      }
+    },
   } as unknown as Database;
 
-  return { db, servers, audits };
+  return { db, servers, audits, lockEvents };
 }
 
-function makeTestApp(seedServers: ServerRow[] = []) {
-  const mem = createMemoryDb(seedServers);
+function makeTestApp(seedServers: ServerRow[] = [], options: { asyncYieldMs?: number } = {}) {
+  const mem = createMemoryDb(seedServers, options);
   const app = buildApp({
     DB: mem.db,
     JWT_SIGNING_KEY: 'test-signing-key-32chars-padding!!',
@@ -425,7 +471,7 @@ describe('POST /api/enroll/v2/direct', () => {
       headers,
       body: JSON.stringify({ ...VALID_BODY, hostServerId: 'srv-daemon-owned' }),
     });
-    expect(first.status).toBe(200);
+    expect(first.status).toBe(201);
     const created = await first.json();
     expect(created).toMatchObject({
       ok: true,
@@ -514,5 +560,86 @@ describe('POST /api/enroll/v2/direct', () => {
       body: JSON.stringify({ ...VALID_BODY, hostServerId: 'srv-daemon-b' }),
     });
     expect(hostConflict.status).toBe(409);
+  });
+
+  it('serializes concurrent direct enrollments for the same nodeTokenHash (201 create + 200 idempotent replay, single row)', async () => {
+    const { app, servers, lockEvents } = makeTestApp([], { asyncYieldMs: 15 });
+    const headers = { Authorization: `Bearer ${API_KEY}`, 'Content-Type': 'application/json' };
+    const reqInit: RequestInit = {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(VALID_BODY),
+    };
+
+    const [r1, r2] = await Promise.all([
+      app.request('/api/enroll/v2/direct', reqInit),
+      app.request('/api/enroll/v2/direct', reqInit),
+    ]);
+    const statuses = [r1.status, r2.status].sort((a, b) => a - b);
+    expect(statuses).toEqual([200, 201]);
+
+    const b1 = await r1.json();
+    const b2 = await r2.json();
+    expect(b1.serverId).toBe(b2.serverId);
+    expect(b1.nodeId).toBe(b2.nodeId);
+    expect([b1.idempotent, b2.idempotent].sort()).toEqual([false, true]);
+    expect(servers.filter((s) => s.node_role === 'controlled')).toHaveLength(1);
+
+    const expectedLockKey = `enroll:v2:direct:${VALID_BODY.nodeTokenHash}`;
+    const eventsForKey = lockEvents.filter((e) => e.key === expectedLockKey);
+    // Mutual exclusion: second transaction cannot acquire until first releases
+    expect(eventsForKey.filter((e) => e.phase !== 'acquire').map((e) => e.phase)).toEqual([
+      'acquired', 'release', 'acquired', 'release',
+    ]);
+  });
+
+  it('serializes concurrent conflicting users with the same nodeTokenHash (201 + 409, single row)', async () => {
+    const { app, servers } = makeTestApp([], { asyncYieldMs: 15 });
+    const [r1, r2] = await Promise.all([
+      app.request('/api/enroll/v2/direct', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(VALID_BODY),
+      }),
+      app.request('/api/enroll/v2/direct', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${OTHER_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(VALID_BODY),
+      }),
+    ]);
+    expect([r1.status, r2.status].sort((a, b) => a - b)).toEqual([201, 409]);
+    expect(servers.filter((s) => s.node_role === 'controlled')).toHaveLength(1);
+  });
+
+  it('uses per-nodeTokenHash advisory lock keys so distinct tokens create distinct controlled servers', async () => {
+    const { app, servers, lockEvents } = makeTestApp([], { asyncYieldMs: 10 });
+    const headers = { Authorization: `Bearer ${API_KEY}`, 'Content-Type': 'application/json' };
+    const hashA = '1'.repeat(64);
+    const hashB = '2'.repeat(64);
+
+    const [r1, r2] = await Promise.all([
+      app.request('/api/enroll/v2/direct', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ ...VALID_BODY, nodeTokenHash: hashA }),
+      }),
+      app.request('/api/enroll/v2/direct', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ ...VALID_BODY, nodeTokenHash: hashB }),
+      }),
+    ]);
+
+    expect(r1.status).toBe(201);
+    expect(r2.status).toBe(201);
+    const b1 = await r1.json();
+    const b2 = await r2.json();
+    expect(b1.serverId).not.toBe(b2.serverId);
+    expect(b1.nodeId).not.toBe(b2.nodeId);
+    expect(servers.filter((s) => s.node_role === 'controlled')).toHaveLength(2);
+    expect(new Set(lockEvents.map((e) => e.key))).toEqual(new Set([
+      `enroll:v2:direct:${hashA}`,
+      `enroll:v2:direct:${hashB}`,
+    ]));
   });
 });

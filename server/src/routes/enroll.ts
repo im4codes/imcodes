@@ -2222,6 +2222,11 @@ enrollRoutes.post('/v2/direct', requireAuth({ refuseDaemonCredential: true }), a
   let result: DirectEnrollResult;
   try {
     result = await c.env.DB.transaction(async (tx): Promise<DirectEnrollResult> => {
+      // Serialize concurrent direct enrollments for the same token hash (even across users or before a row exists).
+      await tx.queryOne(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1, 0)) AS locked',
+        [`enroll:v2:direct:${nodeTokenHash}`],
+      );
       const existing = await tx.queryOne<{
         id: string;
         user_id: string;
@@ -2361,7 +2366,7 @@ enrollRoutes.post('/v2/direct', requireAuth({ refuseDaemonCredential: true }), a
     displayName: result.displayName,
     idempotent: result.kind === 'idempotent',
     hostServerId: result.hostServerId,
-  });
+  }, result.kind === 'created' ? 201 : 200);
 });
 
   return enrollRoutes;

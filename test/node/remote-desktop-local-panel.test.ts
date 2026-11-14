@@ -1471,5 +1471,135 @@ describe('Desktop Phase 2B pending_setup mode & switchToRuntime', () => {
     expect(st.publicNodeId).toBe('1020304050');
     expect(st.setup).toBeUndefined();
   });
+
+  it('localizes /setup/callback HTML across all 7 UI locales + Accept-Language fallback on inactive, invalid, success, and failure responses (F6)', async () => {
+    const { UI_LOCALES } = await import('../../shared/ui-locale.js');
+    const { localPanelText } = await import('../../shared/local-panel-strings.js');
+    const { DESKTOP_SETUP_CALLBACK_PATH, DESKTOP_SETUP_LOCAL_ACTION } = await import('../../shared/desktop-setup-auth.js');
+
+    // 1) Inactive panel (404): resolves from Accept-Language (skipping unsupported fr -> zh-TW)
+    const runtimeOnly = await startRemoteDesktopLocalPanel({
+      publicNodeId: '1234567890',
+      serverUrl: 'https://relay.example.com',
+      port: 0,
+      status: () => ({ paused: false, connections: [] }),
+      setPaused: async () => {},
+      stopAll: async () => {},
+      disconnect: async () => false,
+    });
+    created.push(runtimeOnly);
+    const inactiveRes = await fetch(new URL(DESKTOP_SETUP_CALLBACK_PATH, runtimeOnly.url), {
+      headers: { 'accept-language': 'fr-FR,fr;q=0.9,zh-TW;q=0.8,en;q=0.7' },
+    });
+    expect(inactiveRes.status).toBe(404);
+    const inactiveHtml = await inactiveRes.text();
+    expect(inactiveHtml).toContain('<html lang="zh-TW">');
+    expect(inactiveHtml).toContain(localPanelText('zh-TW', 'setupCallbackInactiveTitle'));
+    expect(inactiveHtml).toContain(localPanelText('zh-TW', 'setupCallbackInactiveDetail'));
+    expect(inactiveHtml).toContain(localPanelText('zh-TW', 'setupCallbackBack'));
+
+    // 2) Active setup panel: verify invalid callback (400), failure callback (502), and success (200) for all 7 locales
+    for (const locale of UI_LOCALES) {
+      let shouldFailExchange = locale === 'ko';
+      const openedUrls: string[] = [];
+      const panel = await startRemoteDesktopLocalPanel({
+        publicNodeId: '',
+        serverUrl: '',
+        port: 0,
+        status: () => ({ paused: false, connections: [] }),
+        setPaused: async () => {},
+        stopAll: async () => {},
+        disconnect: async () => false,
+        setup: {
+          prefilledRelayUrl: 'https://relay.example.com',
+          openBrowser: async (loginUrl) => {
+            openedUrls.push(loginUrl);
+            return true;
+          },
+          fetchFn: (async (input: string | URL | Request) => {
+            const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+            if (shouldFailExchange) {
+              const bad = new Response(JSON.stringify({ error: 'invalid_nonce' }), { status: 400 });
+              Object.defineProperty(bad, 'url', { value: url });
+              return bad;
+            }
+            const ok = new Response(JSON.stringify({ apiKey: 'deck_locale_key' }), { status: 200 });
+            Object.defineProperty(ok, 'url', { value: url });
+            return ok;
+          }) as unknown as typeof fetch,
+          bindRelayAndEnroll: async () => ({
+            serverId: `srv-${locale}`,
+            nodeId: '1122334455',
+            token: 'tok-loc',
+            serverUrl: 'https://relay.example.com',
+            nodeRole: 'controlled',
+          }),
+          onSetupComplete: async () => {
+            panel.switchToRuntime({
+              publicNodeId: '1122334455',
+              serverUrl: 'https://relay.example.com',
+              status: () => ({ paused: false, connections: [] }),
+              setPaused: async () => {},
+              stopAll: async () => {},
+              disconnect: async () => false,
+            });
+          },
+        },
+      });
+      created.push(panel);
+
+      const origin = new URL(panel.url).origin;
+      const home = await fetch(panel.url);
+      const html = await home.text();
+      const cookie = (home.headers.get('set-cookie') ?? '').split(';')[0]!;
+      const csrf = /"csrf":"([^"]+)"/u.exec(html)![1]!;
+
+      // Invalid callback directly honors Accept-Language even before START_BROWSER_AUTH
+      const badBefore = await fetch(new URL(`${DESKTOP_SETUP_CALLBACK_PATH}?nonce=n1&state=wrongstate`, origin), {
+        headers: { 'accept-language': locale },
+      });
+      expect(badBefore.status).toBe(400);
+      const badBeforeHtml = await badBefore.text();
+      expect(badBeforeHtml).toContain(`<html lang="${locale}">`);
+      expect(badBeforeHtml).toContain(localPanelText(locale, 'setupCallbackInvalidTitle'));
+      expect(badBeforeHtml).toContain(localPanelText(locale, 'setupCallbackInvalidDetail'));
+      expect(badBeforeHtml).toContain(localPanelText(locale, 'setupCallbackBack'));
+
+      // Start browser auth passing selected locale
+      const startRes = await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.ACTION_PATH, origin), {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          cookie,
+          origin,
+          [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: csrf,
+        },
+        body: JSON.stringify({
+          action: DESKTOP_SETUP_LOCAL_ACTION.START_BROWSER_AUTH,
+          relayUrl: 'https://relay.example.com',
+          locale,
+        }),
+      });
+      expect(startRes.status).toBe(200);
+
+      const loginUrl = new URL(openedUrls[0]!);
+      const state = new URL(loginUrl.searchParams.get('desktop_callback')!).searchParams.get('state')!;
+      const cbRes = await fetch(new URL(`${DESKTOP_SETUP_CALLBACK_PATH}?nonce=n-ok&state=${encodeURIComponent(state)}`, origin));
+      const cbHtml = await cbRes.text();
+      expect(cbRes.headers.get('content-security-policy')).toBe("default-src 'none'; style-src 'unsafe-inline'");
+      expect(cbHtml).toContain(`<html lang="${locale}">`);
+      expect(cbHtml).toContain(localPanelText(locale, 'setupCallbackBack'));
+      if (shouldFailExchange) {
+        expect(cbRes.status).toBe(502);
+        expect(cbHtml).toContain(localPanelText(locale, 'setupCallbackFailedTitle'));
+        expect(cbHtml).toContain(localPanelText(locale, 'setupCallbackFailedDetail'));
+      } else {
+        expect(cbRes.status).toBe(200);
+        expect(cbHtml).toContain(localPanelText(locale, 'setupCallbackSuccessTitle'));
+        expect(cbHtml).toContain(localPanelText(locale, 'setupCallbackSuccessDetail'));
+      }
+      shouldFailExchange = false;
+    }
+  });
 });
 

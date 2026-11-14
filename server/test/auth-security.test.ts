@@ -516,17 +516,20 @@ describe('OAuth origin allowlist', () => {
 // ── GitHub OAuth refresh cookie path test ───────────────────────────────────
 
 describe('GitHub OAuth callback sets rcc_refresh with path=/', () => {
-  it('rcc_refresh cookie path is / in github-auth route (verified by code inspection and existing test)', async () => {
-    // Read the github-auth source and verify the cookie path is '/'
-    // This is a structural test: we import and check the route source
+  it('rcc_refresh cookie path is / in github-auth/google-auth shared primary OAuth route', async () => {
     const { readFile } = await import('node:fs/promises');
     const { join, dirname } = await import('node:path');
     const { fileURLToPath } = await import('node:url');
     const __dirname = dirname(fileURLToPath(import.meta.url));
-    const source = await readFile(join(__dirname, '..', 'src', 'routes', 'github-auth.ts'), 'utf-8');
+    const githubSource = await readFile(join(__dirname, '..', 'src', 'routes', 'github-auth.ts'), 'utf-8');
+    const googleSource = await readFile(join(__dirname, '..', 'src', 'routes', 'google-auth.ts'), 'utf-8');
+    const primarySource = await readFile(join(__dirname, '..', 'src', 'routes', 'oauth-primary.ts'), 'utf-8');
+
+    expect(githubSource).toContain('createPrimaryOAuthRoutes');
+    expect(googleSource).toContain('createPrimaryOAuthRoutes');
 
     // Find the rcc_refresh setCookie call — it should have path: '/'
-    const refreshMatch = source.match(/setCookie\(c,\s*'rcc_refresh'[\s\S]*?path:\s*'([^']*)'/);
+    const refreshMatch = primarySource.match(/setCookie\(c,\s*'rcc_refresh'[\s\S]*?path:\s*'([^']*)'/);
     expect(refreshMatch).toBeTruthy();
     expect(refreshMatch![1]).toBe('/');
   });
