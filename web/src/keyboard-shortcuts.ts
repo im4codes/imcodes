@@ -10,13 +10,43 @@ export const SHORTCUT_ACTION_IDS: readonly ShortcutActionId[] = [
   'tabNext',
 ];
 
+export type ShortcutSlot = 'primary' | 'secondary';
+
+export const SHORTCUT_SLOTS: readonly ShortcutSlot[] = ['primary', 'secondary'];
+
+export interface KeyboardShortcutSlotPair {
+  primary: string | null;
+  secondary: string | null;
+}
+
+export type ResolvedKeyboardShortcutSlots = Record<ShortcutActionId, KeyboardShortcutSlotPair>;
+
+export interface MatchedNavigationShortcut {
+  action: ShortcutActionId;
+  slot: ShortcutSlot;
+  chord: string;
+}
+
+export interface ShortcutSlotTarget {
+  action: ShortcutActionId;
+  slot: ShortcutSlot;
+}
+
+export type ResolvedShortcutSlotConflicts = Partial<
+  Record<ShortcutActionId, Partial<Record<ShortcutSlot, ShortcutSlotTarget[]>>>
+>;
+
 /**
  * Stored per-user overrides.
+ * Top-level keys represent the primary slot for backward compatibility with `keyboard_shortcuts_v1`;
+ * optional `secondary` stores per-action overrides for the secondary slot:
  * - `undefined` (key omitted): use active platform default
  * - `null`: explicitly cleared / disabled
  * - `string`: normalized canonical chord string, e.g. `Meta+ArrowUp`
  */
-export type KeyboardShortcutOverrides = Partial<Record<ShortcutActionId, string | null>>;
+export type KeyboardShortcutOverrides = Partial<Record<ShortcutActionId, string | null>> & {
+  secondary?: Partial<Record<ShortcutActionId, string | null>>;
+};
 export type ResolvedKeyboardShortcuts = Record<ShortcutActionId, string | null>;
 
 export interface ParsedShortcutChord {
@@ -133,7 +163,7 @@ export function isMacPlatform(nav?: {
   return /Macintosh|Mac OS/i.test(userAgent);
 }
 
-/** Unified default shortcut map across all desktop platforms (macOS, Windows, Linux): Alt+I/K/J/L avoids macOS system Ctrl+A/D/W/S Emacs/readline & browser tab conflicts. */
+/** Unified default primary shortcut map across all desktop platforms (`Alt+I/K/J/L`). */
 export function getDefaultShortcuts(isMac = isMacPlatform()): Record<ShortcutActionId, string> {
   void isMac;
   return {
@@ -142,6 +172,35 @@ export function getDefaultShortcuts(isMac = isMacPlatform()): Record<ShortcutAct
     tabPrev: 'Alt+j',
     tabNext: 'Alt+l',
   };
+}
+
+/** Platform default secondary shortcut map (`Ctrl+W/S/A/D` on macOS; unbound on Windows/Linux). */
+export function getDefaultSecondaryShortcuts(isMac = isMacPlatform()): Record<ShortcutActionId, string | null> {
+  if (isMac) {
+    return {
+      serverPrev: 'Ctrl+w',
+      serverNext: 'Ctrl+s',
+      tabPrev: 'Ctrl+a',
+      tabNext: 'Ctrl+d',
+    };
+  }
+  return {
+    serverPrev: null,
+    serverNext: null,
+    tabPrev: null,
+    tabNext: null,
+  };
+}
+
+/** Return the platform default chord (or null) for one `(action, slot)` pair. */
+export function getDefaultShortcutForSlot(
+  action: ShortcutActionId,
+  slot: ShortcutSlot,
+  isMac = isMacPlatform(),
+): string | null {
+  return slot === 'primary'
+    ? getDefaultShortcuts(isMac)[action]
+    : getDefaultSecondaryShortcuts(isMac)[action];
 }
 
 function isFunctionKeyName(key: string): boolean {
@@ -287,11 +346,10 @@ export function normalizeShortcutChordString(chord: string | null | undefined): 
   return parsed ? serializeShortcutChord(parsed) : null;
 }
 
-/** Sanitize untrusted/persisted override objects into clean `KeyboardShortcutOverrides`. */
-export function sanitizeShortcutOverrides(raw: unknown): KeyboardShortcutOverrides {
+function sanitizeShortcutSlotMap(raw: unknown): Partial<Record<ShortcutActionId, string | null>> {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
   const input = raw as Record<string, unknown>;
-  const out: KeyboardShortcutOverrides = {};
+  const out: Partial<Record<ShortcutActionId, string | null>> = {};
   for (const action of SHORTCUT_ACTION_IDS) {
     if (!(action in input)) continue;
     const val = input[action];
@@ -305,7 +363,59 @@ export function sanitizeShortcutOverrides(raw: unknown): KeyboardShortcutOverrid
   return out;
 }
 
-/** Merge user overrides over current platform defaults. */
+/** Sanitize untrusted/persisted override objects into clean `KeyboardShortcutOverrides`. */
+export function sanitizeShortcutOverrides(raw: unknown): KeyboardShortcutOverrides {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const input = raw as Record<string, unknown>;
+  const out: KeyboardShortcutOverrides = sanitizeShortcutSlotMap(input);
+  if ('secondary' in input) {
+    const cleanSecondary = sanitizeShortcutSlotMap(input.secondary);
+    if (Object.keys(cleanSecondary).length > 0) {
+      out.secondary = cleanSecondary;
+    }
+  }
+  return out;
+}
+
+/** Apply or clear a single slot override while preserving explicit `null` when clearing a non-null default. */
+export function applyShortcutSlotOverride(
+  overrides: KeyboardShortcutOverrides | null | undefined,
+  action: ShortcutActionId,
+  slot: ShortcutSlot,
+  chord: string | null,
+  isMac = isMacPlatform(),
+): KeyboardShortcutOverrides {
+  const next = sanitizeShortcutOverrides(overrides);
+  const normalizedChord = chord === null ? null : normalizeShortcutChordString(chord);
+  if (chord !== null && normalizedChord === null) {
+    return next;
+  }
+  const defaultChord = getDefaultShortcutForSlot(action, slot, isMac);
+
+  if (slot === 'primary') {
+    if (normalizedChord === defaultChord) {
+      delete next[action];
+    } else {
+      next[action] = normalizedChord;
+    }
+    return next;
+  }
+
+  const nextSecondary = { ...(next.secondary ?? {}) };
+  if (normalizedChord === defaultChord) {
+    delete nextSecondary[action];
+  } else {
+    nextSecondary[action] = normalizedChord;
+  }
+  if (Object.keys(nextSecondary).length > 0) {
+    next.secondary = nextSecondary;
+  } else {
+    delete next.secondary;
+  }
+  return next;
+}
+
+/** Merge user primary overrides over current platform defaults. */
 export function resolveKeyboardShortcuts(
   overrides: KeyboardShortcutOverrides | null | undefined,
   isMac = isMacPlatform(),
@@ -317,6 +427,25 @@ export function resolveKeyboardShortcuts(
     if (action in clean) {
       resolved[action] = clean[action] ?? null;
     }
+  }
+  return resolved;
+}
+
+/** Merge user primary + secondary overrides over current platform defaults. */
+export function resolveKeyboardShortcutSlots(
+  overrides: KeyboardShortcutOverrides | null | undefined,
+  isMac = isMacPlatform(),
+): ResolvedKeyboardShortcutSlots {
+  const primaryDefaults = getDefaultShortcuts(isMac);
+  const secondaryDefaults = getDefaultSecondaryShortcuts(isMac);
+  const clean = sanitizeShortcutOverrides(overrides);
+  const cleanSecondary = clean.secondary ?? {};
+  const resolved = {} as ResolvedKeyboardShortcutSlots;
+  for (const action of SHORTCUT_ACTION_IDS) {
+    resolved[action] = {
+      primary: action in clean ? (clean[action] ?? null) : primaryDefaults[action],
+      secondary: action in cleanSecondary ? (cleanSecondary[action] ?? null) : secondaryDefaults[action],
+    };
   }
   return resolved;
 }
@@ -370,6 +499,22 @@ export function matchesShortcutChord(
     && eventKey === parsed.key;
 }
 
+/** Return which navigation action + slot + chord (if any) matches the keyboard event (primary before secondary). */
+export function matchNavigationShortcutBinding(
+  e: Pick<KeyboardEvent, 'key' | 'code' | 'metaKey' | 'ctrlKey' | 'altKey' | 'shiftKey' | 'isComposing' | 'keyCode'>,
+  resolvedSlots: ResolvedKeyboardShortcutSlots,
+): MatchedNavigationShortcut | null {
+  for (const slot of SHORTCUT_SLOTS) {
+    for (const action of SHORTCUT_ACTION_IDS) {
+      const chord = resolvedSlots[action][slot];
+      if (chord && matchesShortcutChord(e, chord)) {
+        return { action, slot, chord };
+      }
+    }
+  }
+  return null;
+}
+
 /** Return which navigation action (if any) matches the keyboard event. */
 export function matchNavigationShortcutAction(
   e: Pick<KeyboardEvent, 'key' | 'code' | 'metaKey' | 'ctrlKey' | 'altKey' | 'shiftKey' | 'isComposing' | 'keyCode'>,
@@ -381,6 +526,35 @@ export function matchNavigationShortcutAction(
     }
   }
   return null;
+}
+
+/** Detect duplicate shortcut assignments across all 8 `(action, slot)` bindings. */
+export function findShortcutSlotConflicts(
+  resolvedSlots: ResolvedKeyboardShortcutSlots,
+): ResolvedShortcutSlotConflicts {
+  const byChord = new Map<string, ShortcutSlotTarget[]>();
+  for (const action of SHORTCUT_ACTION_IDS) {
+    for (const slot of SHORTCUT_SLOTS) {
+      const chord = resolvedSlots[action][slot];
+      if (!chord) continue;
+      const list = byChord.get(chord) ?? [];
+      list.push({ action, slot });
+      byChord.set(chord, list);
+    }
+  }
+  const conflicts: ResolvedShortcutSlotConflicts = {};
+  for (const group of byChord.values()) {
+    if (group.length <= 1) continue;
+    for (const item of group) {
+      const others = group.filter((other) => !(other.action === item.action && other.slot === item.slot));
+      if (others.length === 0) continue;
+      conflicts[item.action] = {
+        ...conflicts[item.action],
+        [item.slot]: others,
+      };
+    }
+  }
+  return conflicts;
 }
 
 /** Detect duplicate shortcut assignments across actions. */

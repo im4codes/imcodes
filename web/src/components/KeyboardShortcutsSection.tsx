@@ -3,16 +3,22 @@ import { useTranslation } from 'react-i18next';
 import {
   KEYBOARD_SHORTCUTS_PREF_KEY,
   SHORTCUT_ACTION_IDS,
+  SHORTCUT_SLOTS,
+  applyShortcutSlotOverride,
   chordFromKeyboardEvent,
-  findShortcutConflicts,
+  findShortcutSlotConflicts,
   formatShortcutKeycaps,
+  getDefaultSecondaryShortcuts,
+  getDefaultShortcutForSlot,
   getDefaultShortcuts,
   isMacPlatform,
   normalizeShortcutChordString,
-  resolveKeyboardShortcuts,
+  resolveKeyboardShortcutSlots,
   sanitizeShortcutOverrides,
   type KeyboardShortcutOverrides,
   type ShortcutActionId,
+  type ShortcutSlot,
+  type ShortcutSlotTarget,
 } from '../keyboard-shortcuts.js';
 import { useSyncedPreference } from '../hooks/useSyncedPreference.js';
 
@@ -57,22 +63,37 @@ function KeyboardShortcutsSectionInner({
 }) {
   const { t } = useTranslation();
   const isMac = isMacOverride ?? isMacPlatform();
-  const defaults = useMemo(() => getDefaultShortcuts(isMac), [isMac]);
+  const primaryDefaults = useMemo(() => getDefaultShortcuts(isMac), [isMac]);
+  const secondaryDefaults = useMemo(() => getDefaultSecondaryShortcuts(isMac), [isMac]);
   const cleanOverrides = useMemo(() => sanitizeShortcutOverrides(overrides), [overrides]);
-  const resolved = useMemo(() => resolveKeyboardShortcuts(cleanOverrides, isMac), [cleanOverrides, isMac]);
-  const conflicts = useMemo(() => findShortcutConflicts(resolved), [resolved]);
+  const resolvedSlots = useMemo(
+    () => resolveKeyboardShortcutSlots(cleanOverrides, isMac),
+    [cleanOverrides, isMac],
+  );
+  const conflicts = useMemo(() => findShortcutSlotConflicts(resolvedSlots), [resolvedSlots]);
 
-  const [recordingAction, setRecordingAction] = useState<ShortcutActionId | null>(null);
+  const [recordingTarget, setRecordingTarget] = useState<ShortcutSlotTarget | null>(null);
   const [statusNotice, setStatusNotice] = useState<{ type: 'info' | 'err'; text: string } | null>(null);
   const recorderContainerRef = useRef<HTMLDivElement | null>(null);
 
   const hasAnyOverride = useMemo(
-    () => SHORTCUT_ACTION_IDS.some((id) => resolved[id] !== defaults[id]),
-    [resolved, defaults],
+    () => SHORTCUT_ACTION_IDS.some(
+      (id) => resolvedSlots[id].primary !== primaryDefaults[id]
+        || resolvedSlots[id].secondary !== secondaryDefaults[id],
+    ),
+    [resolvedSlots, primaryDefaults, secondaryDefaults],
   );
 
+  const formatTargetLabel = (target: ShortcutSlotTarget) => {
+    const actionLabel = t(ACTION_LABELS[target.action].titleKey as 'settings.shortcuts.actions.server_prev.title');
+    const slotLabel = t(
+      target.slot === 'primary' ? 'settings.shortcuts.slot_primary' : 'settings.shortcuts.slot_secondary',
+    );
+    return `${actionLabel} (${slotLabel})`;
+  };
+
   useEffect(() => {
-    if (!recordingAction) return;
+    if (!recordingTarget) return;
 
     const handleKeyDown = (e: KeyboardEvent) => {
       e.preventDefault();
@@ -82,7 +103,7 @@ function KeyboardShortcutsSectionInner({
       }
 
       if (e.key === 'Escape' && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
-        setRecordingAction(null);
+        setRecordingTarget(null);
         setStatusNotice(null);
         return;
       }
@@ -111,35 +132,39 @@ function KeyboardShortcutsSectionInner({
         return;
       }
 
-      const displacedAction = SHORTCUT_ACTION_IDS.find(
-        (other) => other !== recordingAction && resolved[other] === chord,
-      ) ?? null;
+      const displacedTargets: ShortcutSlotTarget[] = [];
+      for (const otherAction of SHORTCUT_ACTION_IDS) {
+        for (const otherSlot of SHORTCUT_SLOTS) {
+          if (otherAction === recordingTarget.action && otherSlot === recordingTarget.slot) continue;
+          if (resolvedSlots[otherAction][otherSlot] === chord) {
+            displacedTargets.push({ action: otherAction, slot: otherSlot });
+          }
+        }
+      }
 
       onChangeOverrides((prev) => {
-        const currentClean = sanitizeShortcutOverrides(prev);
-        const currentResolved = resolveKeyboardShortcuts(currentClean, isMac);
-        const next: KeyboardShortcutOverrides = { ...currentClean };
+        const currentResolved = resolveKeyboardShortcutSlots(prev, isMac);
+        let next = sanitizeShortcutOverrides(prev);
 
-        for (const other of SHORTCUT_ACTION_IDS) {
-          if (other !== recordingAction && currentResolved[other] === chord) {
-            next[other] = null;
+        for (const otherAction of SHORTCUT_ACTION_IDS) {
+          for (const otherSlot of SHORTCUT_SLOTS) {
+            if (otherAction === recordingTarget.action && otherSlot === recordingTarget.slot) continue;
+            if (currentResolved[otherAction][otherSlot] === chord) {
+              next = applyShortcutSlotOverride(next, otherAction, otherSlot, null, isMac);
+            }
           }
         }
 
-        if (chord === defaults[recordingAction]) {
-          delete next[recordingAction];
-        } else {
-          next[recordingAction] = chord;
-        }
-        return next;
+        return applyShortcutSlotOverride(next, recordingTarget.action, recordingTarget.slot, chord, isMac);
       });
 
-      setRecordingAction(null);
-      if (displacedAction) {
-        const displacedLabel = t(ACTION_LABELS[displacedAction].titleKey as 'settings.shortcuts.actions.server_prev.title');
+      setRecordingTarget(null);
+      if (displacedTargets.length > 0) {
         setStatusNotice({
           type: 'info',
-          text: t('settings.shortcuts.reassigned_notice', { action: displacedLabel }),
+          text: t('settings.shortcuts.reassigned_notice', {
+            action: displacedTargets.map((target) => formatTargetLabel(target)).join(', '),
+          }),
         });
       } else {
         setStatusNotice(null);
@@ -151,7 +176,7 @@ function KeyboardShortcutsSectionInner({
       if (recorderContainerRef.current && target && recorderContainerRef.current.contains(target)) {
         return;
       }
-      setRecordingAction(null);
+      setRecordingTarget(null);
     };
 
     document.addEventListener('keydown', handleKeyDown, true);
@@ -160,29 +185,23 @@ function KeyboardShortcutsSectionInner({
       document.removeEventListener('keydown', handleKeyDown, true);
       document.removeEventListener('pointerdown', handlePointerDown, true);
     };
-  }, [recordingAction, defaults, isMac, onChangeOverrides, resolved, t]);
+  }, [recordingTarget, isMac, onChangeOverrides, resolvedSlots, t]);
 
-  const handleClear = (action: ShortcutActionId) => {
-    setRecordingAction(null);
+  const handleClear = (action: ShortcutActionId, slot: ShortcutSlot) => {
+    setRecordingTarget(null);
     setStatusNotice(null);
-    onChangeOverrides((prev) => ({
-      ...sanitizeShortcutOverrides(prev),
-      [action]: null,
-    }));
+    onChangeOverrides((prev) => applyShortcutSlotOverride(prev, action, slot, null, isMac));
   };
 
-  const handleResetOne = (action: ShortcutActionId) => {
-    setRecordingAction(null);
+  const handleResetSlot = (action: ShortcutActionId, slot: ShortcutSlot) => {
+    setRecordingTarget(null);
     setStatusNotice(null);
-    onChangeOverrides((prev) => {
-      const next = { ...sanitizeShortcutOverrides(prev) };
-      delete next[action];
-      return next;
-    });
+    const defaultChord = getDefaultShortcutForSlot(action, slot, isMac);
+    onChangeOverrides((prev) => applyShortcutSlotOverride(prev, action, slot, defaultChord, isMac));
   };
 
   const handleResetAll = () => {
-    setRecordingAction(null);
+    setRecordingTarget(null);
     setStatusNotice(null);
     onChangeOverrides({});
   };
@@ -196,6 +215,9 @@ function KeyboardShortcutsSectionInner({
           </h2>
           <p class="settings-shortcuts-desc">
             {t('settings.shortcuts.desc')}
+          </p>
+          <p class="settings-shortcuts-desc settings-shortcuts-secondary-desc">
+            {t('settings.shortcuts.secondary_desc')}
           </p>
         </div>
         <div class="settings-shortcuts-header-actions">
@@ -230,19 +252,19 @@ function KeyboardShortcutsSectionInner({
           const labels = ACTION_LABELS[action];
           const actionTitle = t(labels.titleKey as 'settings.shortcuts.actions.server_prev.title');
           const actionDesc = t(labels.descKey as 'settings.shortcuts.actions.server_prev.desc');
-          const chord = resolved[action];
-          const isRecording = recordingAction === action;
-          const isCustom = chord !== defaults[action];
-          const caps = formatShortcutKeycaps(chord, isMac);
-          const actionConflicts = conflicts[action] ?? [];
+          const isRowRecording = recordingTarget?.action === action;
+          const actionConflicts = [
+            ...(conflicts[action]?.primary ?? []),
+            ...(conflicts[action]?.secondary ?? []),
+          ];
 
           return (
             <div
               key={action}
-              ref={isRecording ? recorderContainerRef : undefined}
-              class={`settings-shortcut-row${isRecording ? ' is-recording' : ''}${actionConflicts.length > 0 ? ' has-conflict' : ''}`}
+              ref={isRowRecording ? recorderContainerRef : undefined}
+              class={`settings-shortcut-row${isRowRecording ? ' is-recording' : ''}${actionConflicts.length > 0 ? ' has-conflict' : ''}`}
               data-testid={`shortcut-row-${action}`}
-              data-shortcut-recording={isRecording ? 'true' : undefined}
+              data-shortcut-recording={isRowRecording ? 'true' : undefined}
             >
               <div class="settings-shortcut-info">
                 <div class="settings-shortcut-title">
@@ -255,81 +277,119 @@ function KeyboardShortcutsSectionInner({
                   <div class="settings-shortcut-conflict" data-testid={`shortcut-conflict-${action}`}>
                     {t('settings.shortcuts.conflict_warning', {
                       actions: actionConflicts
-                        .map((other) => t(ACTION_LABELS[other].titleKey as 'settings.shortcuts.actions.server_prev.title'))
+                        .map((other) => formatTargetLabel(other))
                         .join(', '),
                     })}
                   </div>
                 )}
               </div>
 
-              <div class="settings-shortcut-controls">
-                <button
-                  type="button"
-                  data-testid={`shortcut-record-${action}`}
-                  data-shortcut-recording={isRecording ? 'true' : undefined}
-                  aria-pressed={isRecording}
-                  aria-label={t('settings.shortcuts.record_aria', {
-                    action: actionTitle,
-                  })}
-                  class={`settings-shortcut-capture-btn${isRecording ? ' is-recording' : ''}${chord === null ? ' is-empty' : ''}`}
-                  onClick={() => {
-                    setStatusNotice(null);
-                    setRecordingAction((prev) => (prev === action ? null : action));
-                  }}
-                >
-                  {isRecording ? (
-                    <span class="settings-shortcut-recording-label">
-                      {t('settings.shortcuts.recording_prompt')}
-                    </span>
-                  ) : caps.length > 0 ? (
-                    <span class="settings-shortcut-keycaps">
-                      {caps.map((cap, idx) => (
-                        <kbd key={`${cap}-${idx}`} class="settings-kbd">{cap}</kbd>
-                      ))}
-                    </span>
-                  ) : (
-                    <span class="settings-shortcut-unassigned">
-                      {t('settings.shortcuts.unassigned')}
-                    </span>
-                  )}
-                </button>
+              <div class="settings-shortcut-slots">
+                {SHORTCUT_SLOTS.map((slot) => {
+                  const slotSuffix = slot === 'primary' ? '' : '-secondary';
+                  const slotLabel = t(
+                    slot === 'primary' ? 'settings.shortcuts.slot_primary' : 'settings.shortcuts.slot_secondary',
+                  );
+                  const chord = resolvedSlots[action][slot];
+                  const slotDefault = slot === 'primary' ? primaryDefaults[action] : secondaryDefaults[action];
+                  const isSlotRecording = recordingTarget?.action === action && recordingTarget?.slot === slot;
+                  const isCustom = chord !== slotDefault;
+                  const caps = formatShortcutKeycaps(chord, isMac);
 
-                {isRecording ? (
-                  <button
-                    type="button"
-                    class="settings-btn-secondary settings-shortcut-mini-btn"
-                    data-testid={`shortcut-cancel-${action}`}
-                    onClick={() => {
-                      setRecordingAction(null);
-                      setStatusNotice(null);
-                    }}
-                  >
-                    {t('common.cancel')}
-                  </button>
-                ) : (
-                  <>
-                    <button
-                      type="button"
-                      class="settings-btn-secondary settings-shortcut-mini-btn"
-                      data-testid={`shortcut-clear-${action}`}
-                      disabled={chord === null}
-                      style={{ opacity: chord === null ? '0.45' : '1' }}
-                      onClick={() => handleClear(action)}
+                  return (
+                    <div
+                      key={slot}
+                      class="settings-shortcut-slot"
+                      data-testid={`shortcut-slot-${action}-${slot}`}
                     >
-                      {t('settings.shortcuts.clear')}
-                    </button>
-                    <button
-                      type="button"
-                      class="settings-btn-secondary settings-shortcut-mini-btn"
-                      data-testid={`shortcut-reset-${action}`}
-                      disabled={!isCustom}
-                      style={{ opacity: isCustom ? '1' : '0.45' }}
-                      onClick={() => handleResetOne(action)}
-                    >
-                      {t('settings.shortcuts.reset')}
-                    </button>
-                  </>
-                )}
+                      <span class="settings-shortcut-slot-label">
+                        {slotLabel}
+                      </span>
+                      <div class="settings-shortcut-controls">
+                        <button
+                          type="button"
+                          data-testid={`shortcut-record-${action}${slotSuffix}`}
+                          data-shortcut-recording={isSlotRecording ? 'true' : undefined}
+                          aria-pressed={isSlotRecording}
+                          aria-label={t('settings.shortcuts.record_slot_aria', {
+                            action: actionTitle,
+                            slot: slotLabel,
+                          })}
+                          class={`settings-shortcut-capture-btn${isSlotRecording ? ' is-recording' : ''}${chord === null ? ' is-empty' : ''}`}
+                          onClick={() => {
+                            setStatusNotice(null);
+                            setRecordingTarget((prev) => (
+                              prev?.action === action && prev?.slot === slot
+                                ? null
+                                : { action, slot }
+                            ));
+                          }}
+                        >
+                          {isSlotRecording ? (
+                            <span class="settings-shortcut-recording-label">
+                              {t('settings.shortcuts.recording_prompt')}
+                            </span>
+                          ) : caps.length > 0 ? (
+                            <span class="settings-shortcut-keycaps">
+                              {caps.map((cap, idx) => (
+                                <kbd key={`${cap}-${idx}`} class="settings-kbd">{cap}</kbd>
+                              ))}
+                            </span>
+                          ) : (
+                            <span class="settings-shortcut-unassigned">
+                              {t('settings.shortcuts.unassigned')}
+                            </span>
+                          )}
+                        </button>
+
+                        {isSlotRecording ? (
+                          <button
+                            type="button"
+                            class="settings-btn-secondary settings-shortcut-mini-btn"
+                            data-testid={`shortcut-cancel-${action}${slotSuffix}`}
+                            onClick={() => {
+                              setRecordingTarget(null);
+                              setStatusNotice(null);
+                            }}
+                          >
+                            {t('common.cancel')}
+                          </button>
+                        ) : (
+                          <>
+                            <button
+                              type="button"
+                              class="settings-btn-secondary settings-shortcut-mini-btn"
+                              data-testid={`shortcut-clear-${action}${slotSuffix}`}
+                              aria-label={t('settings.shortcuts.clear_slot_aria', {
+                                action: actionTitle,
+                                slot: slotLabel,
+                              })}
+                              disabled={chord === null}
+                              style={{ opacity: chord === null ? '0.45' : '1' }}
+                              onClick={() => handleClear(action, slot)}
+                            >
+                              {t('settings.shortcuts.clear')}
+                            </button>
+                            <button
+                              type="button"
+                              class="settings-btn-secondary settings-shortcut-mini-btn"
+                              data-testid={`shortcut-reset-${action}${slotSuffix}`}
+                              aria-label={t('settings.shortcuts.reset_slot_aria', {
+                                action: actionTitle,
+                                slot: slotLabel,
+                              })}
+                              disabled={!isCustom}
+                              style={{ opacity: isCustom ? '1' : '0.45' }}
+                              onClick={() => handleResetSlot(action, slot)}
+                            >
+                              {t('settings.shortcuts.reset')}
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             </div>
           );

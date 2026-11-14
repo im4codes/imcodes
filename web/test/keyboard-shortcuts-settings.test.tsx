@@ -39,14 +39,20 @@ vi.mock('react-i18next', () => ({
         'settings.tab_guide': 'User Guide',
         'settings.shortcuts.title': 'Keyboard Shortcuts',
         'settings.shortcuts.desc': 'Customize desktop navigation shortcuts.',
+        'settings.shortcuts.secondary_desc': 'Primary and Secondary bindings per action.',
         'settings.shortcuts.platform_mac': 'macOS defaults',
         'settings.shortcuts.platform_other': 'Windows / Linux defaults',
+        'settings.shortcuts.slot_primary': 'Primary',
+        'settings.shortcuts.slot_secondary': 'Secondary',
         'settings.shortcuts.reset_all': 'Reset all',
         'settings.shortcuts.clear': 'Clear',
         'settings.shortcuts.reset': 'Reset',
         'settings.shortcuts.unassigned': 'Not set',
         'settings.shortcuts.recording_prompt': 'Press shortcut…',
         'settings.shortcuts.record_aria': 'Record shortcut for {{action}}',
+        'settings.shortcuts.record_slot_aria': 'Record {{slot}} shortcut for {{action}}',
+        'settings.shortcuts.clear_slot_aria': 'Clear {{slot}} shortcut for {{action}}',
+        'settings.shortcuts.reset_slot_aria': 'Reset {{slot}} shortcut for {{action}}',
         'settings.shortcuts.modifier_required': 'Use a modifier key (Cmd, Ctrl, or Alt) or a function key (F1–F24).',
         'settings.shortcuts.reassigned_notice': 'Assigned shortcut and cleared conflicting binding from “{{action}}”.',
         'settings.shortcuts.conflict_warning': 'Conflicts with: {{actions}}',
@@ -118,8 +124,46 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('J');
     expect(screen.getByTestId('shortcut-record-tabNext').textContent).toContain('⌥');
     expect(screen.getByTestId('shortcut-record-tabNext').textContent).toContain('L');
+    // macOS secondary defaults preserve Ctrl+W/S/A/D
+    expect(screen.getByTestId('shortcut-record-serverPrev-secondary').textContent).toContain('⌃');
+    expect(screen.getByTestId('shortcut-record-serverPrev-secondary').textContent).toContain('W');
+    expect(screen.getByTestId('shortcut-record-serverNext-secondary').textContent).toContain('⌃');
+    expect(screen.getByTestId('shortcut-record-serverNext-secondary').textContent).toContain('S');
+    expect(screen.getByTestId('shortcut-record-tabPrev-secondary').textContent).toContain('⌃');
+    expect(screen.getByTestId('shortcut-record-tabPrev-secondary').textContent).toContain('A');
+    expect(screen.getByTestId('shortcut-record-tabNext-secondary').textContent).toContain('⌃');
+    expect(screen.getByTestId('shortcut-record-tabNext-secondary').textContent).toContain('D');
     const resetTabPrev = screen.getByTestId('shortcut-reset-tabPrev') as HTMLButtonElement;
     expect(resetTabPrev.disabled).toBe(true);
+    expect((screen.getByTestId('shortcut-reset-tabPrev-secondary') as HTMLButtonElement).disabled).toBe(true);
+
+    // Clearing ONLY secondary Ctrl+A on macOS leaves primary ⌥J intact and persists across reload without resurrecting Ctrl+A
+    fireEvent.click(screen.getByTestId('shortcut-clear-tabPrev-secondary'));
+    expect(screen.getByTestId('shortcut-record-tabPrev-secondary').textContent).toContain('Not set');
+    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('⌥');
+    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('J');
+    expect((screen.getByTestId('shortcut-clear-tabPrev-secondary') as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByTestId('shortcut-reset-tabPrev-secondary') as HTMLButtonElement).disabled).toBe(false);
+    const macStored = JSON.parse(localStorage.getItem(`rcc_sync_${KEYBOARD_SHORTCUTS_PREF_KEY}`) ?? '{}');
+    expect(macStored.v).toEqual({ secondary: { tabPrev: null } });
+
+    cleanup();
+    render(<KeyboardShortcutsSection isMacOverride={true} />);
+    expect(screen.getByTestId('shortcut-record-tabPrev-secondary').textContent).toContain('Not set');
+    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('⌥');
+    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('J');
+
+    // Resetting secondary tabPrev restores ⌃A
+    fireEvent.click(screen.getByTestId('shortcut-reset-tabPrev-secondary'));
+    expect(screen.getByTestId('shortcut-record-tabPrev-secondary').textContent).toContain('⌃');
+    expect(screen.getByTestId('shortcut-record-tabPrev-secondary').textContent).toContain('A');
+
+    // Clearing primary tabPrev leaves secondary ⌃A intact
+    fireEvent.click(screen.getByTestId('shortcut-clear-tabPrev'));
+    expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('Not set');
+    expect(screen.getByTestId('shortcut-record-tabPrev-secondary').textContent).toContain('⌃');
+    expect(screen.getByTestId('shortcut-record-tabPrev-secondary').textContent).toContain('A');
+    fireEvent.click(screen.getByTestId('shortcut-reset-tabPrev'));
 
     // Explicitly overriding tabPrev to Meta+ArrowLeft persists as a custom override
     fireEvent.click(screen.getByTestId('shortcut-record-tabPrev'));
@@ -147,6 +191,24 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('J');
     expect(screen.getByTestId('shortcut-record-tabNext').textContent).toContain('Alt');
     expect(screen.getByTestId('shortcut-record-tabNext').textContent).toContain('L');
+    // Windows / Linux secondary defaults are unassigned
+    expect(screen.getByTestId('shortcut-record-tabPrev-secondary').textContent).toContain('Not set');
+    expect((screen.getByTestId('shortcut-clear-tabPrev-secondary') as HTMLButtonElement).disabled).toBe(true);
+
+    // Recording a custom 2nd combo on Windows/Linux secondary slot
+    const tabPrevSecondaryBtn = screen.getByTestId('shortcut-record-tabPrev-secondary');
+    fireEvent.click(tabPrevSecondaryBtn);
+    fireEvent.keyDown(document, { key: 'ArrowLeft', code: 'ArrowLeft', ctrlKey: true });
+    expect(tabPrevSecondaryBtn.textContent).toContain('Ctrl');
+    expect(tabPrevSecondaryBtn.textContent).toContain('←');
+
+    // Assigning Ctrl+ArrowLeft to tabNext-secondary clears tabPrev-secondary without error
+    fireEvent.click(screen.getByTestId('shortcut-record-tabNext-secondary'));
+    fireEvent.keyDown(document, { key: 'ArrowLeft', code: 'ArrowLeft', ctrlKey: true });
+    expect(screen.getByTestId('shortcut-record-tabPrev-secondary').textContent).toContain('Not set');
+    expect(screen.getByTestId('shortcut-record-tabNext-secondary').textContent).toContain('Ctrl');
+    expect(screen.getByTestId('shortcut-record-tabNext-secondary').textContent).toContain('←');
+    fireEvent.click(screen.getByTestId('shortcuts-reset-all'));
 
     // Start recording tabPrev -> press Escape to cancel without mutating
     const tabPrevBtn = screen.getByTestId('shortcut-record-tabPrev');
@@ -209,6 +271,7 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     expect(screen.getByTestId('shortcut-record-tabPrev').textContent).toContain('J');
     expect(screen.getByTestId('shortcut-record-tabNext').textContent).toContain('Alt');
     expect(screen.getByTestId('shortcut-record-tabNext').textContent).toContain('L');
+    expect(screen.getByTestId('shortcut-record-tabNext-secondary').textContent).toContain('Not set');
   });
 
   it('records Ctrl+Shift++ and bare/Shift navigation keys, rejects Shift+typing, and retains bindings across reload', () => {
@@ -256,5 +319,22 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     expect(reloadedTabNext.textContent).toContain('+');
     expect(screen.getByTestId('shortcut-record-serverPrev').textContent).toContain('Home');
     expect(screen.getByTestId('shortcut-record-serverNext').textContent).toContain('PgDn');
+    expect(screen.getByTestId('shortcut-record-tabPrev-secondary').textContent).toContain('Not set');
+  });
+
+  it('reassigned duplicate across macOS primary & secondary slots clears conflicting non-null default cleanly', () => {
+    render(<KeyboardShortcutsSection isMacOverride={true} />);
+    // Assign Ctrl+a (tabPrev secondary default on macOS) onto serverPrev primary -> clears tabPrev secondary to null cleanly
+    fireEvent.click(screen.getByTestId('shortcut-record-serverPrev'));
+    fireEvent.keyDown(document, { key: 'a', code: 'KeyA', ctrlKey: true });
+    expect(screen.getByTestId('shortcut-record-serverPrev').textContent).toContain('⌃');
+    expect(screen.getByTestId('shortcut-record-serverPrev').textContent).toContain('A');
+    expect(screen.getByTestId('shortcut-record-tabPrev-secondary').textContent).toContain('Not set');
+
+    cleanup();
+    render(<KeyboardShortcutsSection isMacOverride={true} />);
+    expect(screen.getByTestId('shortcut-record-serverPrev').textContent).toContain('⌃');
+    expect(screen.getByTestId('shortcut-record-serverPrev').textContent).toContain('A');
+    expect(screen.getByTestId('shortcut-record-tabPrev-secondary').textContent).toContain('Not set');
   });
 });

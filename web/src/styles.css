@@ -16874,6 +16874,12 @@ button.quick-agent-delegation-preset.active {
   margin: 0;
 }
 
+.settings-shortcuts-secondary-desc {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #cbd5e1;
+}
+
 .settings-shortcuts-header-actions {
   display: flex;
   flex-wrap: wrap;
@@ -16962,6 +16968,28 @@ button.quick-agent-delegation-preset.active {
   margin-top: 4px;
   font-size: 12px;
   color: #fbbf24;
+}
+
+.settings-shortcut-slots {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1 1 360px;
+}
+
+.settings-shortcut-slot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.settings-shortcut-slot-label {
+  min-width: 72px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #94a3b8;
 }
 
 .settings-shortcut-controls {

@@ -97,10 +97,10 @@ import {
   formatShortcutKeycaps,
   hasDomBlockingOverlay,
   isMacPlatform,
-  matchNavigationShortcutAction,
+  matchNavigationShortcutBinding,
   readLegacyTabOrder,
   resolveFocusedKeyboardViewMode,
-  resolveKeyboardShortcuts,
+  resolveKeyboardShortcutSlots,
   sortSessionsByTabOrder,
   type KeyboardShortcutOverrides,
 } from './keyboard-shortcuts.js';
@@ -2593,8 +2593,8 @@ function InternalMainApp() {
     {},
     0,
   );
-  const resolvedShortcuts = useMemo(
-    () => resolveKeyboardShortcuts(shortcutOverrides, isMacPlatform()),
+  const resolvedShortcutSlots = useMemo(
+    () => resolveKeyboardShortcutSlots(shortcutOverrides, isMacPlatform()),
     [shortcutOverrides],
   );
   const [pinnedSubSessionArr, setPinnedSubSessionArr] = useSyncedPreference<string[]>('subsession_pinned', [], 0);
@@ -7466,8 +7466,8 @@ function InternalMainApp() {
   orderedServersNavRef.current = orderedServers;
   const orderedTabsNavRef = useRef(orderedVisibleMainSessions);
   orderedTabsNavRef.current = orderedVisibleMainSessions;
-  const resolvedShortcutsRef = useRef(resolvedShortcuts);
-  resolvedShortcutsRef.current = resolvedShortcuts;
+  const resolvedShortcutSlotsRef = useRef(resolvedShortcutSlots);
+  resolvedShortcutSlotsRef.current = resolvedShortcutSlots;
   hasBlockingComposerOverlayRef.current = hasBlockingComposerOverlay;
   const hasBlockingMobileGestureOverlayRef = useRef(false);
   hasBlockingMobileGestureOverlayRef.current = hasBlockingComposerOverlay
@@ -7553,8 +7553,8 @@ function InternalMainApp() {
     if (isMobile) return;
     const handler = (e: KeyboardEvent) => {
       if (e.defaultPrevented || isImeComposingKeyEvent(e)) return;
-      const action = matchNavigationShortcutAction(e, resolvedShortcutsRef.current);
-      if (!action) return;
+      const matched = matchNavigationShortcutBinding(e, resolvedShortcutSlotsRef.current);
+      if (!matched) return;
 
       const subId = focusedSubIdRef.current;
       const subRecord = subId ? subSessionsRef.current.find((item) => item.id === subId) : undefined;
@@ -7578,16 +7578,15 @@ function InternalMainApp() {
         return;
       }
 
-      if (action === 'serverPrev' || action === 'serverNext') {
-        const shortcutKeycaps = formatShortcutKeycaps(resolvedShortcutsRef.current[action], isMacPlatform());
-        if (!navigateServerByStep(action === 'serverNext' ? 1 : -1, shortcutKeycaps)) return;
+      const shortcutKeycaps = formatShortcutKeycaps(matched.chord, isMacPlatform());
+      if (matched.action === 'serverPrev' || matched.action === 'serverNext') {
+        if (!navigateServerByStep(matched.action === 'serverNext' ? 1 : -1, shortcutKeycaps)) return;
         e.preventDefault();
         e.stopPropagation();
         return;
       }
 
-      const shortcutKeycaps = formatShortcutKeycaps(resolvedShortcutsRef.current[action], isMacPlatform());
-      if (!navigateTabByStep(action === 'tabNext' ? 1 : -1, shortcutKeycaps)) return;
+      if (!navigateTabByStep(matched.action === 'tabNext' ? 1 : -1, shortcutKeycaps)) return;
       e.preventDefault();
       e.stopPropagation();
     };

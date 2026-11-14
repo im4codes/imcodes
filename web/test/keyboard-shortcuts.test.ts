@@ -3,20 +3,25 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+  applyShortcutSlotOverride,
   canHandleGlobalNavigationShortcut,
   chordFromKeyboardEvent,
   cycleOrderedId,
   findShortcutConflicts,
+  findShortcutSlotConflicts,
   focusComposerElement,
   formatShortcutKeycaps,
+  getDefaultSecondaryShortcuts,
   getDefaultShortcuts,
   isMacPlatform,
   matchesShortcutChord,
   matchNavigationShortcutAction,
+  matchNavigationShortcutBinding,
   normalizeShortcutChordString,
   parseShortcutChord,
   resolveFocusedKeyboardViewMode,
   resolveKeyboardShortcuts,
+  resolveKeyboardShortcutSlots,
   sanitizeShortcutOverrides,
   serializeShortcutChord,
   sortSessionsByTabOrder,
@@ -41,6 +46,20 @@ describe('keyboard-shortcuts core helpers', () => {
       serverNext: 'Alt+k',
       tabPrev: 'Alt+j',
       tabNext: 'Alt+l',
+    });
+
+    expect(getDefaultSecondaryShortcuts(true)).toEqual({
+      serverPrev: 'Ctrl+w',
+      serverNext: 'Ctrl+s',
+      tabPrev: 'Ctrl+a',
+      tabNext: 'Ctrl+d',
+    });
+
+    expect(getDefaultSecondaryShortcuts(false)).toEqual({
+      serverPrev: null,
+      serverNext: null,
+      tabPrev: null,
+      tabNext: null,
     });
   });
 
@@ -124,6 +143,57 @@ describe('keyboard-shortcuts core helpers', () => {
       tabPrev: 'Alt+j',
       tabNext: 'Alt+l',
     });
+
+    // Dual-slot sanitization, legacy backward compatibility, and non-resurrecting clear semantics
+    expect(resolveKeyboardShortcutSlots({ tabPrev: 'Meta+ArrowLeft' }, true)).toEqual({
+      serverPrev: { primary: 'Alt+i', secondary: 'Ctrl+w' },
+      serverNext: { primary: 'Alt+k', secondary: 'Ctrl+s' },
+      tabPrev: { primary: 'Meta+ArrowLeft', secondary: 'Ctrl+a' },
+      tabNext: { primary: 'Alt+l', secondary: 'Ctrl+d' },
+    });
+
+    const dirtyDual = sanitizeShortcutOverrides({
+      tabPrev: 'Meta+ArrowLeft',
+      secondary: {
+        tabPrev: null,
+        tabNext: 'control+arrowright',
+        serverPrev: 'Shift+a',
+        unknownAction: 'Ctrl+k',
+      },
+    } as unknown);
+    expect(dirtyDual).toEqual({
+      tabPrev: 'Meta+ArrowLeft',
+      secondary: {
+        tabPrev: null,
+        tabNext: 'Ctrl+ArrowRight',
+      },
+    });
+    expect(resolveKeyboardShortcutSlots(dirtyDual, true)).toEqual({
+      serverPrev: { primary: 'Alt+i', secondary: 'Ctrl+w' },
+      serverNext: { primary: 'Alt+k', secondary: 'Ctrl+s' },
+      tabPrev: { primary: 'Meta+ArrowLeft', secondary: null },
+      tabNext: { primary: 'Alt+l', secondary: 'Ctrl+ArrowRight' },
+    });
+    expect(resolveKeyboardShortcutSlots({}, false)).toEqual({
+      serverPrev: { primary: 'Alt+i', secondary: null },
+      serverNext: { primary: 'Alt+k', secondary: null },
+      tabPrev: { primary: 'Alt+j', secondary: null },
+      tabNext: { primary: 'Alt+l', secondary: null },
+    });
+
+    // applyShortcutSlotOverride persists explicit null for cleared non-null defaults and prunes redundant defaults
+    const clearedMacSecondary = applyShortcutSlotOverride({}, 'tabPrev', 'secondary', null, true);
+    expect(clearedMacSecondary).toEqual({ secondary: { tabPrev: null } });
+    expect(resolveKeyboardShortcutSlots(clearedMacSecondary, true).tabPrev).toEqual({
+      primary: 'Alt+j',
+      secondary: null,
+    });
+    const restoredMacSecondary = applyShortcutSlotOverride(clearedMacSecondary, 'tabPrev', 'secondary', 'Ctrl+a', true);
+    expect(restoredMacSecondary).toEqual({});
+
+    const customWinSecondary = applyShortcutSlotOverride({}, 'tabPrev', 'secondary', 'Ctrl+ArrowLeft', false);
+    expect(customWinSecondary).toEqual({ secondary: { tabPrev: 'Ctrl+ArrowLeft' } });
+    expect(applyShortcutSlotOverride(customWinSecondary, 'tabPrev', 'secondary', null, false)).toEqual({});
   });
 
   it('captures valid chords (modifiers or non-typing nav/function keys) and rejects bare typing, Shift+letter, modifiers, Escape, and IME', () => {
@@ -291,6 +361,58 @@ describe('keyboard-shortcuts core helpers', () => {
     })).toEqual({
       serverPrev: ['tabPrev'],
       tabPrev: ['serverPrev'],
+    });
+
+    // Dual-slot matching & 8-slot conflict detection
+    const macSlots = resolveKeyboardShortcutSlots({}, true);
+    expect(matchNavigationShortcutBinding(
+      { key: 'Dead', code: 'KeyI', metaKey: false, ctrlKey: false, altKey: true, shiftKey: false },
+      macSlots,
+    )).toEqual({ action: 'serverPrev', slot: 'primary', chord: 'Alt+i' });
+    expect(matchNavigationShortcutBinding(
+      { key: 'w', code: 'KeyW', metaKey: false, ctrlKey: true, altKey: false, shiftKey: false },
+      macSlots,
+    )).toEqual({ action: 'serverPrev', slot: 'secondary', chord: 'Ctrl+w' });
+    expect(matchNavigationShortcutBinding(
+      { key: 'a', code: 'KeyA', metaKey: false, ctrlKey: true, altKey: false, shiftKey: false },
+      macSlots,
+    )).toEqual({ action: 'tabPrev', slot: 'secondary', chord: 'Ctrl+a' });
+
+    const macClearedTabPrevSecondary = resolveKeyboardShortcutSlots({ secondary: { tabPrev: null } }, true);
+    expect(matchNavigationShortcutBinding(
+      { key: 'a', code: 'KeyA', metaKey: false, ctrlKey: true, altKey: false, shiftKey: false },
+      macClearedTabPrevSecondary,
+    )).toBeNull();
+    expect(matchNavigationShortcutBinding(
+      { key: 'j', code: 'KeyJ', metaKey: false, ctrlKey: false, altKey: true, shiftKey: false },
+      macClearedTabPrevSecondary,
+    )).toEqual({ action: 'tabPrev', slot: 'primary', chord: 'Alt+j' });
+
+    const winPrimaryClearedSecondaryBound = resolveKeyboardShortcutSlots(
+      { tabPrev: null, secondary: { tabPrev: 'Ctrl+ArrowLeft' } },
+      false,
+    );
+    expect(matchNavigationShortcutBinding(
+      { key: 'j', code: 'KeyJ', metaKey: false, ctrlKey: false, altKey: true, shiftKey: false },
+      winPrimaryClearedSecondaryBound,
+    )).toBeNull();
+    expect(matchNavigationShortcutBinding(
+      { key: 'ArrowLeft', code: 'ArrowLeft', metaKey: false, ctrlKey: true, altKey: false, shiftKey: false },
+      winPrimaryClearedSecondaryBound,
+    )).toEqual({ action: 'tabPrev', slot: 'secondary', chord: 'Ctrl+ArrowLeft' });
+
+    expect(findShortcutSlotConflicts({
+      serverPrev: { primary: 'Alt+i', secondary: 'Ctrl+w' },
+      serverNext: { primary: 'Alt+k', secondary: 'Ctrl+w' },
+      tabPrev: { primary: 'Alt+j', secondary: 'Alt+j' },
+      tabNext: { primary: 'Alt+l', secondary: null },
+    })).toEqual({
+      serverPrev: { secondary: [{ action: 'serverNext', slot: 'secondary' }] },
+      serverNext: { secondary: [{ action: 'serverPrev', slot: 'secondary' }] },
+      tabPrev: {
+        primary: [{ action: 'tabPrev', slot: 'secondary' }],
+        secondary: [{ action: 'tabPrev', slot: 'primary' }],
+      },
     });
   });
 

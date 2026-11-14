@@ -123,10 +123,10 @@ async function expectActiveServerAndTabReady(page: Page, serverName: string, tab
   await expect(page.locator('.controls-input').first()).toBeVisible();
 }
 
-test('macOS defaults use Alt+i/k/j/l for servers & tabs without intercepting Ctrl+w/s/a/d, work in composer & sidebar, and respect overrides', async ({ page }) => {
+test('macOS defaults support Alt+i/k/j/l primary and Ctrl+w/s/a/d secondary, allow clearing Ctrl+a alone across reload, and respect overrides', async ({ page }) => {
   const { errors } = await openDesktopApp(page, 'MacIntel');
 
-  // Verify macOS Settings keycaps render ⌥+J/L for tabs and ⌥+I/K for servers
+  // Verify macOS Settings keycaps render primary ⌥+I/K/J/L AND secondary ⌃+W/S/A/D
   await page.locator('button.server-icon[title="Settings"]').click();
   await page.locator('#settings-tab-shortcuts').click();
   await expect(page.getByTestId('shortcut-record-tabPrev')).toContainText('⌥');
@@ -137,57 +137,89 @@ test('macOS defaults use Alt+i/k/j/l for servers & tabs without intercepting Ctr
   await expect(page.getByTestId('shortcut-record-serverPrev')).toContainText('I');
   await expect(page.getByTestId('shortcut-record-serverNext')).toContainText('⌥');
   await expect(page.getByTestId('shortcut-record-serverNext')).toContainText('K');
+  await expect(page.getByTestId('shortcut-record-tabPrev-secondary')).toContainText('⌃');
+  await expect(page.getByTestId('shortcut-record-tabPrev-secondary')).toContainText('A');
+  await expect(page.getByTestId('shortcut-record-tabNext-secondary')).toContainText('⌃');
+  await expect(page.getByTestId('shortcut-record-tabNext-secondary')).toContainText('D');
+  await expect(page.getByTestId('shortcut-record-serverPrev-secondary')).toContainText('⌃');
+  await expect(page.getByTestId('shortcut-record-serverPrev-secondary')).toContainText('W');
+  await expect(page.getByTestId('shortcut-record-serverNext-secondary')).toContainText('⌃');
+  await expect(page.getByTestId('shortcut-record-serverNext-secondary')).toContainText('S');
 
   // Settings overlay blocks tab switching shortcuts
   await page.keyboard.press('Alt+l');
   await page.locator('.settings-back-btn').click();
   await expect(page.locator('.tab.active')).toContainText('Gamma Tab');
 
-  // Inside composer (.controls-input): Ctrl+w/s/a/d MUST NOT be intercepted (preserves macOS Ctrl+A/D/W/S bindings)
+  // Inside composer (.controls-input): BOTH secondary Ctrl+d/a/s/w and primary Alt+l/j/k/i work and show pressed-slot keycaps
   const composer = page.locator('.controls-input').first();
   await composer.click();
-  const ctrlIntercepted = await composer.evaluate((el) => {
-    const prevented: string[] = [];
-    for (const [key, code] of [
-      ['w', 'KeyW'],
-      ['s', 'KeyS'],
-      ['a', 'KeyA'],
-      ['d', 'KeyD'],
-    ] as const) {
-      const evt = new KeyboardEvent('keydown', { key, code, ctrlKey: true, bubbles: true, cancelable: true });
-      el.dispatchEvent(evt);
-      if (evt.defaultPrevented) prevented.push(key);
-    }
-    return prevented;
-  });
-  expect(ctrlIntercepted).toEqual([]);
-  await expect(page.locator('.tab.active')).toContainText('Gamma Tab');
-
-  // Visual order is Gamma (pinned), Beta (tab_order[0]), Alpha (tab_order[1])
-  // Inside composer (.controls-input): Alt+l switches Gamma -> Beta -> Alpha
-  await page.keyboard.press('Alt+l');
+  await page.keyboard.press('Control+d');
   await expect(page.locator('.tab.active')).toContainText('Beta Tab');
+  await expect(page.getByTestId('server-switch-watermark-shortcut')).toContainText('⌃');
+  await expect(page.getByTestId('server-switch-watermark-shortcut')).toContainText('D');
+
   await page.keyboard.press('Alt+l');
   await expect(page.locator('.tab.active')).toContainText('Alpha Tab');
+  await expect(page.getByTestId('server-switch-watermark-shortcut')).toContainText('⌥');
+  await expect(page.getByTestId('server-switch-watermark-shortcut')).toContainText('L');
 
-  // Legacy Meta+ArrowLeft does NOT trigger tab switch under unified Alt+IKJL defaults
+  // Legacy Meta+ArrowLeft does NOT trigger tab switch under unified defaults
   await page.keyboard.press('Meta+ArrowLeft');
   await expect(page.locator('.tab.active')).toContainText('Alpha Tab');
 
-  // With non-editable sidebar control focused: Alt+j switches Alpha -> Beta -> Gamma
+  // With non-editable sidebar control focused: Ctrl+a / Alt+j switch Alpha -> Beta -> Gamma
   await page.locator('.sidebar-toggle-icon').first().focus();
-  await page.keyboard.press('Alt+j');
+  await page.keyboard.press('Control+a');
   await expect(page.locator('.tab.active')).toContainText('Beta Tab');
   await page.keyboard.press('Alt+j');
   await expect(page.locator('.tab.active')).toContainText('Gamma Tab');
 
-  // Server switching uses Alt+k / Alt+i
-  await page.keyboard.press('Alt+k');
+  // Server switching works with both Alt+k/i and Ctrl+s/w
+  await page.keyboard.press('Control+s');
   await expectActiveServerAndTabReady(page, 'Beta Server', 'Second Server Tab');
+  await expect(page.getByTestId('server-switch-watermark-shortcut')).toContainText('⌃');
+  await expect(page.getByTestId('server-switch-watermark-shortcut')).toContainText('S');
   await page.keyboard.press('Alt+i');
   await expectActiveServerAndTabReady(page, 'Alpha Server', 'Gamma Tab');
+  await expect(page.getByTestId('server-switch-watermark-shortcut')).toContainText('⌥');
+  await expect(page.getByTestId('server-switch-watermark-shortcut')).toContainText('I');
 
-  // Explicitly overriding tabNext to Meta+ArrowRight applies immediately
+  // Clear ONLY secondary Ctrl+a -> persists across reload without resurrecting Ctrl+a, while primary ⌥J keeps working
+  await page.locator('button.server-icon[title="Settings"]').click();
+  await page.locator('#settings-tab-shortcuts').click();
+  await Promise.all([
+    page.waitForResponse((res) => res.url().includes('/api/preferences/keyboard_shortcuts_v1') && res.request().method() === 'PUT'),
+    page.getByTestId('shortcut-clear-tabPrev-secondary').click(),
+  ]);
+  await expect(page.getByTestId('shortcut-record-tabPrev-secondary')).toContainText('Not set');
+
+  await page.reload();
+  await expect(page.locator('.tab-ws-dot')).toHaveAttribute('title', /ms$/, { timeout: 15_000 });
+  await expect(page.locator('.tab.active')).toContainText('Gamma Tab');
+  await page.locator('button.server-icon[title="Settings"]').click();
+  await page.locator('#settings-tab-shortcuts').click();
+  await expect(page.getByTestId('shortcut-record-tabPrev-secondary')).toContainText('Not set');
+  await expect(page.getByTestId('shortcut-record-tabPrev')).toContainText('⌥');
+  await expect(page.getByTestId('shortcut-record-tabPrev')).toContainText('J');
+  await page.locator('.settings-back-btn').click();
+
+  // Ctrl+a is no longer intercepted in composer, while Alt+l / Alt+j still switch tabs
+  const reloadedComposer = page.locator('.controls-input').first();
+  await reloadedComposer.click();
+  await page.keyboard.press('Alt+l');
+  await expect(page.locator('.tab.active')).toContainText('Beta Tab');
+  const ctrlAPrevented = await page.locator('.controls-input').first().evaluate((el) => {
+    const evt = new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', ctrlKey: true, bubbles: true, cancelable: true });
+    el.dispatchEvent(evt);
+    return evt.defaultPrevented;
+  });
+  expect(ctrlAPrevented).toBe(false);
+  await expect(page.locator('.tab.active')).toContainText('Beta Tab');
+  await page.keyboard.press('Alt+j');
+  await expect(page.locator('.tab.active')).toContainText('Gamma Tab');
+
+  // Explicitly overriding tabNext primary to Meta+ArrowRight applies immediately
   await page.locator('button.server-icon[title="Settings"]').click();
   await page.locator('#settings-tab-shortcuts').click();
   const tabNextRecordBtn = page.getByTestId('shortcut-record-tabNext');
@@ -204,7 +236,7 @@ test('macOS defaults use Alt+i/k/j/l for servers & tabs without intercepting Ctr
   expect(errors).toEqual([]);
 });
 
-test('non-macOS defaults use Alt+i/k/j/l and do not intercept Ctrl+w/s/a/d', async ({ page }) => {
+test('non-macOS defaults use Alt+i/k/j/l primary, unassigned secondary, and support custom 2nd combo when primary cleared', async ({ page }) => {
   const { errors } = await openDesktopApp(page, 'Linux x86_64');
 
   await page.locator('button.server-icon[title="Settings"]').click();
@@ -217,9 +249,27 @@ test('non-macOS defaults use Alt+i/k/j/l and do not intercept Ctrl+w/s/a/d', asy
   await expect(page.getByTestId('shortcut-record-serverPrev')).toContainText('I');
   await expect(page.getByTestId('shortcut-record-serverNext')).toContainText('Alt');
   await expect(page.getByTestId('shortcut-record-serverNext')).toContainText('K');
+  await expect(page.getByTestId('shortcut-record-tabPrev-secondary')).toContainText('Not set');
   await page.locator('.settings-back-btn').click();
 
+  // Ctrl+w/s/a/d are NOT intercepted by default on Linux/Windows
   await page.locator('.controls-input').first().click();
+  const ctrlIntercepted = await page.locator('.controls-input').first().evaluate((el) => {
+    const prevented: string[] = [];
+    for (const [key, code] of [
+      ['w', 'KeyW'],
+      ['s', 'KeyS'],
+      ['a', 'KeyA'],
+      ['d', 'KeyD'],
+    ] as const) {
+      const evt = new KeyboardEvent('keydown', { key, code, ctrlKey: true, bubbles: true, cancelable: true });
+      el.dispatchEvent(evt);
+      if (evt.defaultPrevented) prevented.push(key);
+    }
+    return prevented;
+  });
+  expect(ctrlIntercepted).toEqual([]);
+
   await page.keyboard.press('Alt+l');
   await expect(page.locator('.tab.active')).toContainText('Beta Tab');
   await page.keyboard.press('Alt+j');
@@ -229,5 +279,28 @@ test('non-macOS defaults use Alt+i/k/j/l and do not intercept Ctrl+w/s/a/d', asy
   await expectActiveServerAndTabReady(page, 'Beta Server', 'Second Server Tab');
   await page.keyboard.press('Alt+i');
   await expectActiveServerAndTabReady(page, 'Alpha Server', 'Gamma Tab');
+
+  // Bind Ctrl+ArrowLeft as secondary for tabPrev and clear primary tabPrev -> only Ctrl+ArrowLeft fires
+  await page.locator('button.server-icon[title="Settings"]').click();
+  await page.locator('#settings-tab-shortcuts').click();
+  const tabPrevSecondaryBtn = page.getByTestId('shortcut-record-tabPrev-secondary');
+  await tabPrevSecondaryBtn.click();
+  await expect(tabPrevSecondaryBtn).toHaveAttribute('data-shortcut-recording', 'true');
+  await page.keyboard.press('Control+ArrowLeft');
+  await expect(tabPrevSecondaryBtn).toContainText('Ctrl');
+  await expect(tabPrevSecondaryBtn).toContainText('←');
+  await page.getByTestId('shortcut-clear-tabPrev').click();
+  await expect(page.getByTestId('shortcut-record-tabPrev')).toContainText('Not set');
+  await page.locator('.settings-back-btn').click();
+
+  await page.locator('.controls-input').first().click();
+  await page.keyboard.press('Alt+l');
+  await expect(page.locator('.tab.active')).toContainText('Beta Tab');
+  await page.keyboard.press('Alt+j');
+  await expect(page.locator('.tab.active')).toContainText('Beta Tab');
+  await page.keyboard.press('Control+ArrowLeft');
+  await expect(page.locator('.tab.active')).toContainText('Gamma Tab');
+  await expect(page.getByTestId('server-switch-watermark-shortcut')).toContainText('Ctrl');
+  await expect(page.getByTestId('server-switch-watermark-shortcut')).toContainText('←');
   expect(errors).toEqual([]);
 });

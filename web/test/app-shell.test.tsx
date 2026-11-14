@@ -474,6 +474,12 @@ vi.mock('../src/pages/SettingsPage.js', () => ({
       <button onClick={() => onChangeShortcutOverrides?.({ tabNext: 'Ctrl+Shift+Plus', serverNext: 'Shift+PageDown' })}>
         settings-plus-shortcuts
       </button>
+      <button onClick={() => onChangeShortcutOverrides?.({ secondary: { tabPrev: null } })}>
+        settings-clear-mac-ctrl-a
+      </button>
+      <button onClick={() => onChangeShortcutOverrides?.({ tabPrev: null, secondary: { tabPrev: 'Ctrl+ArrowLeft', tabNext: 'Ctrl+ArrowRight' } })}>
+        settings-win-dual-slots
+      </button>
       <button onClick={onBack}>settings-back</button>
     </div>
   ),
@@ -8412,7 +8418,7 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     }
   }, 15000);
 
-  it('supports unified macOS Alt+IKJL defaults without intercepting Ctrl+W/S/A/D, blocks shortcuts during Settings/modal/terminal/recording/non-composer inputs, and preserves custom overrides', async () => {
+  it('supports macOS Alt+IKJL primary and Ctrl+W/S/A/D secondary defaults, independent secondary clear, blocking guards, and custom overrides', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
     localStorage.setItem('rcc_session', 'deck_alpha_brain');
@@ -8426,20 +8432,22 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
       await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
 
-      // Ctrl+W/S/A/D MUST NOT intercept by default on macOS (preserves native macOS Emacs/readline Ctrl+A/D/W/S bindings)
-      for (const chord of [
-        { key: 'w', code: 'KeyW' },
-        { key: 's', code: 'KeyS' },
-        { key: 'a', code: 'KeyA' },
-        { key: 'd', code: 'KeyD' },
-      ]) {
-        const ctrlEvt = new KeyboardEvent('keydown', { ...chord, ctrlKey: true, bubbles: true, cancelable: true });
-        alphaComposer.dispatchEvent(ctrlEvt);
-        expect(ctrlEvt.defaultPrevented).toBe(false);
-      }
-      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+      // Secondary Ctrl+d / Ctrl+a defaults work on macOS and show pressed secondary keycaps in watermark
+      const ctrlDEvt = new KeyboardEvent('keydown', { key: 'd', code: 'KeyD', ctrlKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(ctrlDEvt);
+      expect(ctrlDEvt.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['⌃', 'D']);
 
-      // Legacy Ctrl+ArrowRight and Meta+Shift+ArrowRight should NOT trigger under unified Alt+IKJL defaults
+      const betaComposerForCtrlA = screen.getByTestId('pane-composer-deck_beta_brain');
+      await waitFor(() => expect(document.activeElement).toBe(betaComposerForCtrlA));
+      const ctrlAEvt = new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', ctrlKey: true, bubbles: true, cancelable: true });
+      betaComposerForCtrlA.dispatchEvent(ctrlAEvt);
+      expect(ctrlAEvt.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['⌃', 'A']);
+
+      // Legacy Ctrl+ArrowRight and Meta+Shift+ArrowRight should NOT trigger under unified Alt+IKJL + Ctrl+WSAD defaults
       const ctrlArrowEvt = new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', ctrlKey: true, bubbles: true, cancelable: true });
       alphaComposer.dispatchEvent(ctrlArrowEvt);
       expect(ctrlArrowEvt.defaultPrevented).toBe(false);
@@ -8538,6 +8546,24 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       alphaComposerAgain.dispatchEvent(customAltRight);
       expect(customAltRight.defaultPrevented).toBe(true);
       await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+
+      // Clearing ONLY macOS secondary Ctrl+a stops intercepting Ctrl+A while keeping Option+J working
+      fireEvent.click(screen.getByText('server-settings'));
+      fireEvent.click(screen.getByText('settings-clear-mac-ctrl-a'));
+      fireEvent.click(screen.getByText('settings-back'));
+
+      const betaComposerClearedCtrlA = screen.getByTestId('pane-composer-deck_beta_brain');
+      betaComposerClearedCtrlA.focus();
+      const clearedCtrlA = new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', ctrlKey: true, bubbles: true, cancelable: true });
+      betaComposerClearedCtrlA.dispatchEvent(clearedCtrlA);
+      expect(clearedCtrlA.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true');
+
+      const keptAltJ = new KeyboardEvent('keydown', { key: '∆', code: 'KeyJ', altKey: true, bubbles: true, cancelable: true });
+      betaComposerClearedCtrlA.dispatchEvent(keptAltJ);
+      expect(keptAltJ.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['⌥', 'J']);
     } finally {
       Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
     }
@@ -8942,7 +8968,7 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
   }, 15000);
 
-  it('displays macOS platform keycaps on Alt+k server switch and ignores Ctrl+s', async () => {
+  it('displays macOS primary (⌥) and secondary (⌃) keycaps on server switch and stops Ctrl+S after secondary clear', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
     localStorage.setItem('rcc_session', 'deck_alpha_brain');
@@ -8956,19 +8982,22 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       const alphaComposer = await screen.findByTestId('pane-composer-deck_alpha_brain');
       await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
 
+      // Secondary Ctrl+S switches server on macOS with ['⌃', 'S'] watermark
       const ctrlS = new KeyboardEvent('keydown', { key: 's', code: 'KeyS', ctrlKey: true, bubbles: true, cancelable: true });
       alphaComposer.dispatchEvent(ctrlS);
-      expect(ctrlS.defaultPrevented).toBe(false);
-      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
-
-      const altK = new KeyboardEvent('keydown', { key: '˚', code: 'KeyK', altKey: true, bubbles: true, cancelable: true });
-      alphaComposer.dispatchEvent(altK);
-      expect(altK.defaultPrevented).toBe(true);
-
+      expect(ctrlS.defaultPrevented).toBe(true);
       await waitFor(() => expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server Two'));
       expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('server');
-      const macKeycaps = Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent);
-      expect(macKeycaps).toEqual(['⌥', 'K']);
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['⌃', 'S']);
+
+      // Primary Alt+i switches back to Server One with ['⌥', 'I'] watermark
+      const deltaComposer = await screen.findByTestId('pane-composer-deck_delta_brain');
+      await waitFor(() => expect(document.activeElement).toBe(deltaComposer));
+      const altI = new KeyboardEvent('keydown', { key: 'Dead', code: 'KeyI', altKey: true, bubbles: true, cancelable: true });
+      deltaComposer.dispatchEvent(altI);
+      expect(altI.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server One'));
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['⌥', 'I']);
     } finally {
       Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
     }
@@ -9015,9 +9044,35 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['Alt', 'J']);
       await waitFor(() => expect(document.activeElement).toBe(alphaComposer));
 
+      // Win32 cleared primary + custom secondary slot fires cleanly and renders secondary keycaps
+      fireEvent.click(screen.getByText('server-settings'));
+      fireEvent.click(screen.getByText('settings-win-dual-slots'));
+      fireEvent.click(screen.getByText('settings-back'));
+
+      const winClearedAltJ = new KeyboardEvent('keydown', { key: 'j', code: 'KeyJ', altKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(winClearedAltJ);
+      expect(winClearedAltJ.defaultPrevented).toBe(false);
+
+      const winCtrlRight = new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', ctrlKey: true, bubbles: true, cancelable: true });
+      alphaComposer.dispatchEvent(winCtrlRight);
+      expect(winCtrlRight.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['Ctrl', '→']);
+
+      const winBetaComposer = screen.getByTestId('pane-composer-deck_beta_brain');
+      await waitFor(() => expect(document.activeElement).toBe(winBetaComposer));
+      const winCtrlLeft = new KeyboardEvent('keydown', { key: 'ArrowLeft', code: 'ArrowLeft', ctrlKey: true, bubbles: true, cancelable: true });
+      winBetaComposer.dispatchEvent(winCtrlLeft);
+      expect(winCtrlLeft.defaultPrevented).toBe(true);
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['Ctrl', '←']);
+
       firstRender.unmount();
 
-      // macOS unified Alt+L / Alt+J -> session watermark with Mac Option keycaps (Ctrl+D / Ctrl+A untouched)
+      // macOS dual defaults: both Alt+L/J (['⌥', 'L'/'J']) and Ctrl+D/A (['⌃', 'D'/'A']) navigate tabs with pressed-slot keycaps
+      window.location.hash = '';
+      localStorage.clear();
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
       localStorage.setItem('rcc_server', 'srv-1');
       localStorage.setItem('rcc_session', 'deck_alpha_brain');
       Object.defineProperty(navigator, 'platform', { configurable: true, value: 'MacIntel' });
@@ -9029,24 +9084,12 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
 
       const ctrlD = new KeyboardEvent('keydown', { key: 'd', code: 'KeyD', ctrlKey: true, bubbles: true, cancelable: true });
       macAlphaComposer.dispatchEvent(ctrlD);
-      expect(ctrlD.defaultPrevented).toBe(false);
-      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
-
-      const macAltL = new KeyboardEvent('keydown', { key: '¬', code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
-      macAlphaComposer.dispatchEvent(macAltL);
-      expect(macAltL.defaultPrevented).toBe(true);
+      expect(ctrlD.defaultPrevented).toBe(true);
       await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
-
-      expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('session');
-      expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('beta');
-      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['⌥', 'L']);
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['⌃', 'D']);
 
       const macBetaComposer = screen.getByTestId('pane-composer-deck_beta_brain');
       await waitFor(() => expect(document.activeElement).toBe(macBetaComposer));
-      const ctrlA = new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', ctrlKey: true, bubbles: true, cancelable: true });
-      macBetaComposer.dispatchEvent(ctrlA);
-      expect(ctrlA.defaultPrevented).toBe(false);
-
       const macAltJ = new KeyboardEvent('keydown', { key: 'Dead', code: 'KeyJ', altKey: true, bubbles: true, cancelable: true });
       macBetaComposer.dispatchEvent(macAltJ);
       expect(macAltJ.defaultPrevented).toBe(true);
