@@ -5,3 +5,6 @@ CREATE INDEX IF NOT EXISTS idx_cron_jobs_active_next_run
 
 CREATE INDEX IF NOT EXISTS idx_cron_executions_status_created
   ON cron_executions(status, created_at);
+
+CREATE COLLATION IF NOT EXISTS session_text_tail_icu
+  (provider = icu, locale = 'und-u-kk-true', deterministic = false);

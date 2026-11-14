@@ -630,6 +630,57 @@ describe('session_text_tail_cache', () => {
           confidence: ' high ',
         },
       },
+      {
+        name: 'canonical equivalent NFC before NFD at same ts preserves insertion order without deterministic tie-break',
+        existing: [
+          { eventId: '\u00e9', ts: 100, type: 'assistant.text', text: 'nfc-first' },
+          { eventId: 'e\u0301', ts: 100, type: 'assistant.text', text: 'nfd-second' },
+        ],
+        incoming: { eventId: 'z-next', ts: 200, type: 'assistant.text', payload: { text: 'next' } },
+      },
+      {
+        name: 'canonical equivalent NFD before NFC at same ts preserves insertion order without deterministic tie-break',
+        existing: [
+          { eventId: 'e\u0301', ts: 100, type: 'assistant.text', text: 'nfd-first' },
+          { eventId: '\u00e9', ts: 100, type: 'assistant.text', text: 'nfc-second' },
+        ],
+        incoming: { eventId: 'z-next', ts: 200, type: 'assistant.text', payload: { text: 'next' } },
+      },
+      {
+        name: 'canonical equivalent eventIds remain distinct Map keys at 50-item cutoff',
+        existing: [
+          { eventId: '\u00e9', ts: 100, type: 'assistant.text', text: 'nfc-evicted' },
+          { eventId: 'e\u0301', ts: 100, type: 'assistant.text', text: 'nfd-kept' },
+          ...Array.from({ length: 48 }, (_, idx) => ({
+            eventId: `keep-${idx}`,
+            ts: 200 + idx,
+            type: 'assistant.text',
+            text: `msg-${idx}`,
+          })),
+        ],
+        incoming: { eventId: 'keep-48', ts: 300, type: 'assistant.text', payload: { text: 'msg-48' } },
+      },
+      {
+        name: 'combining-mark reordering, angstrom, and zero-weight codepoint equivalence preserve insertion order',
+        existing: [
+          { eventId: 'a\u0323\u0301', ts: 100, type: 'assistant.text', text: 'under-then-acute' },
+          { eventId: 'a\u0301\u0323', ts: 100, type: 'assistant.text', text: 'acute-then-under' },
+          { eventId: '\u212b', ts: 200, type: 'assistant.text', text: 'angstrom-sign' },
+          { eventId: 'A\u030a', ts: 200, type: 'assistant.text', text: 'A-ring-nfd' },
+          { eventId: '\u00c5', ts: 200, type: 'assistant.text', text: 'A-ring-nfc' },
+          { eventId: 'a\u200bb', ts: 300, type: 'assistant.text', text: 'zwsp' },
+          { eventId: 'ab', ts: 300, type: 'assistant.text', text: 'plain' },
+        ],
+        incoming: { eventId: 'z-tail', ts: 400, type: 'assistant.text', payload: { text: 'tail' } },
+      },
+      {
+        name: 'UTF-16 code-unit 1024 truncation on existing astral emoji text (512 emojis = 1024 UTF-16 units)',
+        existing: [
+          { eventId: 'emoji-600', ts: 50, type: 'assistant.text', text: '😀'.repeat(600) },
+          { eventId: 'mixed-emoji', ts: 60, type: 'user.message', text: `${'a'.repeat(10)}${'😀'.repeat(600)}` },
+        ],
+        incoming: { eventId: 'emoji-in', ts: 70, type: 'assistant.text', payload: { text: '😀'.repeat(600) } },
+      },
     ];
 
     for (let i = 0; i < cases.length; i++) {
@@ -658,6 +709,53 @@ describe('session_text_tail_cache', () => {
       expect(rawRow?.events, `case=${c.name} stored jsonb`).toEqual(expectedEvents);
       expect(rawRow?.latest_ts, `case=${c.name} latest_ts`).toBe(expectedLatestTs);
     }
+
+    // Surrogate-pair boundary on existing element: stops at 1023 UTF-16 units instead of splitting into an invalid lone JSONB surrogate.
+    const surrogateSession = `${sessionName}-surrogate-boundary`;
+    await db.execute('DELETE FROM session_text_tail_cache WHERE server_id = $1 AND session_name = $2', [serverId, surrogateSession]);
+    await db.execute(
+      `INSERT INTO session_text_tail_cache (server_id, session_name, events, latest_ts, updated_at)
+       VALUES ($1, $2, $3::jsonb, $4, NOW())`,
+      [serverId, surrogateSession, JSON.stringify([{ eventId: 'surr-1', ts: 50, type: 'assistant.text', text: `${'a'.repeat(1023)}😀` }]), 50],
+    );
+    await upsertSessionTextTailCacheEvent(db, serverId, {
+      eventId: 'surr-2',
+      sessionId: surrogateSession,
+      ts: 60,
+      type: 'assistant.text',
+      payload: { text: 'ok' },
+    });
+    const surrogateEvents = await getSessionTextTailCache(db, serverId, surrogateSession);
+    expect(surrogateEvents.map((e) => [e.eventId, e.text.length])).toEqual([
+      ['surr-1', 1023],
+      ['surr-2', 2],
+    ]);
+  });
+
+  it('recovers automatically when session_text_tail_icu collation is missing', async () => {
+    const serverId = 'srv-tail-collation-recover-' + Math.random().toString(36).slice(2);
+    const sessionName = 'recover-session';
+    await db.execute(
+      `INSERT INTO session_text_tail_cache (server_id, session_name, events, latest_ts, updated_at)
+       VALUES ($1, $2, $3::jsonb, $4, NOW())`,
+      [serverId, sessionName, JSON.stringify([{ eventId: '\u00e9', ts: 10, type: 'assistant.text', text: 'first' }]), 10],
+    );
+
+    await db.execute('DROP COLLATION IF EXISTS session_text_tail_icu');
+    await upsertSessionTextTailCacheEvent(db, serverId, {
+      eventId: 'e\u0301',
+      sessionId: sessionName,
+      ts: 10,
+      type: 'assistant.text',
+      payload: { text: 'second' },
+    });
+
+    const events = await getSessionTextTailCache(db, serverId, sessionName);
+    expect(events.map((e) => e.eventId)).toEqual(['\u00e9', 'e\u0301']);
+    const collRow = await db.queryOne<{ collname: string }>(
+      "SELECT collname FROM pg_collation WHERE collname = 'session_text_tail_icu'",
+    );
+    expect(collRow?.collname).toBe('session_text_tail_icu');
   });
 });
 

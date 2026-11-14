@@ -811,6 +811,31 @@ export async function updateSession(
 
 const SESSION_TEXT_TAIL_PG_TRIM_CHARS =
   "E' \\t\\n\\v\\f\\r\\u00a0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff'";
+const SESSION_TEXT_TAIL_ICU_COLLATION = 'session_text_tail_icu';
+const SESSION_TEXT_TAIL_ICU_DDL =
+  `CREATE COLLATION IF NOT EXISTS ${SESSION_TEXT_TAIL_ICU_COLLATION} (provider = icu, locale = 'und-u-kk-true', deterministic = false)`;
+
+function isMissingSessionTextTailCollationError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const code = 'code' in err ? String((err as { code?: unknown }).code ?? '') : '';
+  if (code !== '42704') return false;
+  const message = 'message' in err ? String((err as { message?: unknown }).message ?? '') : '';
+  return message.includes(SESSION_TEXT_TAIL_ICU_COLLATION);
+}
+
+function isCollationCreateRaceError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const code = 'code' in err ? String((err as { code?: unknown }).code ?? '') : '';
+  return code === '42710' || code === '23505';
+}
+
+async function ensureSessionTextTailCollation(db: Database): Promise<void> {
+  try {
+    await db.execute(SESSION_TEXT_TAIL_ICU_DDL);
+  } catch (err) {
+    if (!isCollationCreateRaceError(err)) throw err;
+  }
+}
 
 export async function upsertSessionTextTailCacheEvent(
   db: Database,
@@ -820,8 +845,7 @@ export async function upsertSessionTextTailCacheEvent(
   const classified = classifySessionTextTailEvent(rawEvent);
   if (!classified) return;
   const serializedItem = JSON.stringify(classified.item);
-  await db.execute(
-    `INSERT INTO session_text_tail_cache (server_id, session_name, events, latest_ts, updated_at)
+  const sql = `INSERT INTO session_text_tail_cache (server_id, session_name, events, latest_ts, updated_at)
      VALUES ($1, $2, jsonb_build_array($3::jsonb), $4, NOW())
      ON CONFLICT (server_id, session_name)
      DO UPDATE SET (events, latest_ts, updated_at) = (
@@ -829,7 +853,7 @@ export async function upsertSessionTextTailCacheEvent(
          COALESCE(
            jsonb_agg(
              t.item
-             ORDER BY t.ts ASC, t.event_id COLLATE "und-x-icu" ASC, t.first_ord ASC
+             ORDER BY t.ts ASC, t.event_id COLLATE "${SESSION_TEXT_TAIL_ICU_COLLATION}" ASC, t.first_ord ASC
            ),
            '[]'::jsonb
          ),
@@ -846,8 +870,8 @@ export async function upsertSessionTextTailCacheEvent(
              all_rows.item,
              all_rows.ts,
              all_rows.event_id,
-             MIN(all_rows.ord) OVER (PARTITION BY all_rows.event_id) AS first_ord,
-             ROW_NUMBER() OVER (PARTITION BY all_rows.event_id ORDER BY all_rows.ord DESC) AS rn
+             MIN(all_rows.ord) OVER (PARTITION BY all_rows.event_id COLLATE "C") AS first_ord,
+             ROW_NUMBER() OVER (PARTITION BY all_rows.event_id COLLATE "C" ORDER BY all_rows.ord DESC) AS rn
            FROM (
              SELECT
                jsonb_strip_nulls(
@@ -855,7 +879,20 @@ export async function upsertSessionTextTailCacheEvent(
                    'eventId', e.elem->>'eventId',
                    'ts', e.elem->'ts',
                    'type', e.elem->>'type',
-                   'text', left(btrim(e.elem->>'text', ${SESSION_TEXT_TAIL_PG_TRIM_CHARS}), $6),
+                   'text', CASE
+                     WHEN octet_length(trimmed_text.val) <= $6 THEN trimmed_text.val
+                     ELSE COALESCE((
+                       SELECT string_agg(u.ch, '' ORDER BY u.pos)
+                       FROM (
+                         SELECT
+                           t.ch,
+                           t.pos,
+                           SUM(CASE WHEN ascii(t.ch) > 65535 THEN 2 ELSE 1 END) OVER (ORDER BY t.pos) AS u16
+                         FROM string_to_table(trimmed_text.val, NULL) WITH ORDINALITY AS t(ch, pos)
+                       ) AS u
+                       WHERE u.u16 <= $6
+                     ), '')
+                   END,
                    'source', CASE
                      WHEN jsonb_typeof(e.elem->'source') IS NOT DISTINCT FROM 'string'
                       AND btrim(e.elem->>'source', ${SESSION_TEXT_TAIL_PG_TRIM_CHARS}) <> ''
@@ -891,6 +928,9 @@ export async function upsertSessionTextTailCacheEvent(
                  ELSE '[]'::jsonb
                END
              ) WITH ORDINALITY AS e(elem, ord)
+             CROSS JOIN LATERAL (
+               SELECT btrim(e.elem->>'text', ${SESSION_TEXT_TAIL_PG_TRIM_CHARS}) AS val
+             ) AS trimmed_text
              UNION ALL
              SELECT
                $3::jsonb AS item,
@@ -900,19 +940,25 @@ export async function upsertSessionTextTailCacheEvent(
            ) AS all_rows
          ) AS deduped
          WHERE deduped.rn = 1
-         ORDER BY deduped.ts DESC, deduped.event_id COLLATE "und-x-icu" DESC, deduped.first_ord DESC
+         ORDER BY deduped.ts DESC, deduped.event_id COLLATE "${SESSION_TEXT_TAIL_ICU_COLLATION}" DESC, deduped.first_ord DESC
          LIMIT $5
        ) AS t
-     )`,
-    [
-      serverId,
-      classified.sessionName,
-      serializedItem,
-      classified.item.ts,
-      SESSION_TEXT_TAIL_CACHE_LIMIT,
-      SESSION_TEXT_TAIL_TEXT_MAX_CHARS,
-    ],
-  );
+     )`;
+  const params = [
+    serverId,
+    classified.sessionName,
+    serializedItem,
+    classified.item.ts,
+    SESSION_TEXT_TAIL_CACHE_LIMIT,
+    SESSION_TEXT_TAIL_TEXT_MAX_CHARS,
+  ];
+  try {
+    await db.execute(sql, params);
+  } catch (err) {
+    if (!isMissingSessionTextTailCollationError(err)) throw err;
+    await ensureSessionTextTailCollation(db);
+    await db.execute(sql, params);
+  }
 }
 
 export async function getSessionTextTailCache(
