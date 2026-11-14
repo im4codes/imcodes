@@ -436,7 +436,10 @@ function tryRemovePersistedBlob(storage: Storage): boolean {
 
 function persistProjections(): void {
   const storage = getCacheStorage();
-  if (!storage) return;
+  if (!storage) {
+    storageOutOfSync = true;
+    return;
+  }
   const sorted = [...projections.values()]
     .sort((left, right) => right.accessedAt - left.accessedAt)
     .slice(0, MAX_CACHED_AUTHORITIES);
@@ -512,9 +515,10 @@ export function clearSupervisionTaskConsoleCache(
   const key = authorityKey(authority);
   projections.delete(key);
   clearedAuthorities.add(key);
+  storageOutOfSync = true;
   const storage = getCacheStorage();
-  if (storage && !tryRemovePersistedBlob(storage)) {
-    storageOutOfSync = true;
+  if (storage && tryRemovePersistedBlob(storage)) {
+    storageOutOfSync = false;
   }
   persistProjections();
 }
@@ -528,9 +532,10 @@ export function clearSupervisionTaskConsoleCacheForUser(userId: string): void {
     }
   }
   clearedUsers.add(userId);
+  storageOutOfSync = true;
   const storage = getCacheStorage();
-  if (storage && !tryRemovePersistedBlob(storage)) {
-    storageOutOfSync = true;
+  if (storage && tryRemovePersistedBlob(storage)) {
+    storageOutOfSync = false;
   }
   persistProjections();
 }
@@ -540,6 +545,7 @@ export function clearAllSupervisionTaskConsoleCaches(): void {
   projections.clear();
   clearedAuthorities.clear();
   clearedUsers.clear();
+  storageOutOfSync = true;
   const storage = getCacheStorage();
   if (!storage) return;
   storageOutOfSync = !tryRemovePersistedBlob(storage);

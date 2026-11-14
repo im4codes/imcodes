@@ -278,4 +278,61 @@ describe('supervision-task-console-cache', () => {
     expect(readSupervisionTaskConsoleCache(authA1)).toBeNull();
     expect(readSupervisionTaskConsoleCache(authB)).toBeNull();
   });
+
+  it('never resurrects cleared caches after window.localStorage getter temporarily throws SecurityError, and recovers on fresh write', () => {
+    const authA = makeAuthority(31, { userId: 'user-a', projectName: 'proj-a' });
+    const authB = makeAuthority(32, { userId: 'user-b', projectName: 'proj-b' });
+    writeSupervisionTaskConsoleCache(authA, makeSnapshotState(authA, 'ta', 'Cleared User A Task'));
+    writeSupervisionTaskConsoleCache(authB, makeSnapshotState(authB, 'tb', 'User B Safe Task'));
+
+    const originalDescriptor = Object.getOwnPropertyDescriptor(window, 'localStorage');
+    const mockStorageThrows = () => {
+      Object.defineProperty(window, 'localStorage', {
+        configurable: true,
+        get() {
+          throw new DOMException('SecurityError', 'SecurityError');
+        },
+      });
+    };
+    const restoreStorage = () => {
+      if (originalDescriptor) {
+        Object.defineProperty(window, 'localStorage', originalDescriptor);
+      }
+    };
+
+    try {
+      // 1. clearAll while localStorage getter throws SecurityError, then restore getter
+      mockStorageThrows();
+      clearAllSupervisionTaskConsoleCaches();
+      restoreStorage();
+      expect(readSupervisionTaskConsoleCache(authA)).toBeNull();
+      expect(readSupervisionTaskConsoleCache(authB)).toBeNull();
+
+      // Fresh write recovers both in-memory reads and persisted storage without resurrecting authB.
+      writeSupervisionTaskConsoleCache(authA, makeSnapshotState(authA, 'ta', 'Fresh A After ClearAll'));
+      expect(readSupervisionTaskConsoleCache(authA)?.tasks.ta?.title).toBe('Fresh A After ClearAll');
+      expect(readSupervisionTaskConsoleCache(authB)).toBeNull();
+
+      // 2. clearForUser while localStorage getter throws SecurityError, preserving other user in memory
+      writeSupervisionTaskConsoleCache(authB, makeSnapshotState(authB, 'tb', 'User B Preserved Task'));
+      mockStorageThrows();
+      clearSupervisionTaskConsoleCacheForUser('user-a');
+      restoreStorage();
+      expect(readSupervisionTaskConsoleCache(authA)).toBeNull();
+      expect(readSupervisionTaskConsoleCache(authB)?.tasks.tb?.title).toBe('User B Preserved Task');
+
+      // Fresh write after clearForUser recovers cleanly.
+      writeSupervisionTaskConsoleCache(authA, makeSnapshotState(authA, 'ta', 'Fresh A After ClearForUser'));
+      expect(readSupervisionTaskConsoleCache(authA)?.tasks.ta?.title).toBe('Fresh A After ClearForUser');
+
+      // 3. Single-authority clear while localStorage getter throws SecurityError
+      mockStorageThrows();
+      clearSupervisionTaskConsoleCache(authA);
+      restoreStorage();
+      expect(readSupervisionTaskConsoleCache(authA)).toBeNull();
+      expect(readSupervisionTaskConsoleCache(authB)?.tasks.tb?.title).toBe('User B Preserved Task');
+    } finally {
+      restoreStorage();
+    }
+  });
 });
