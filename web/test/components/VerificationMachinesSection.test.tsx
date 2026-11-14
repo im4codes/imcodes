@@ -212,4 +212,39 @@ describe('VerificationMachinesSection', () => {
     fireEvent.click(screen.getByRole('button', { name: 'common.save' }));
     expect((await screen.findByRole('alert')).textContent).toBe('controlled_nodes.verification.error_target_unauthorized');
   });
+
+  it('renders and allows editing/deleting entries beyond 100 items when projectKey is mismatched or missing', async () => {
+    const entries = Array.from({ length: 101 }, (_, i) => ({
+      ...profile,
+      id: (i + 1).toString(16).padStart(32, '0'),
+      scope: 'project' as const,
+      scopeKey: i < 51 ? 'repo-a' : 'repo-b',
+      alias: `Machine ${i + 1}`,
+      revision: 1,
+    }));
+    listMock.mockResolvedValue(entries);
+
+    render(<VerificationMachinesSection machines={[]} projectKey="repo-other" />);
+    const inputs = await screen.findAllByLabelText('controlled_nodes.verification.alias') as HTMLInputElement[];
+    expect(inputs).toHaveLength(101);
+
+    const lastInput = inputs[100]!;
+    expect(lastInput.value).toBe('Machine 101');
+    fireEvent.input(lastInput, { target: { value: 'Machine 101 Renamed' } });
+    const saveButtons = screen.getAllByRole('button', { name: 'common.save' }) as HTMLButtonElement[];
+    fireEvent.click(saveButtons[100]!);
+
+    await waitFor(() => expect(setMock).toHaveBeenCalledWith(expect.objectContaining({
+      id: entries[100]!.id,
+      scope: 'project',
+      scopeKey: 'repo-b',
+      alias: 'Machine 101 Renamed',
+      expectedRevision: 1,
+    })));
+    await waitFor(() => expect(saveButtons[100]!.disabled).toBe(false));
+
+    const deleteButtons = screen.getAllByRole('button', { name: 'common.delete' });
+    fireEvent.click(deleteButtons[100]!);
+    await waitFor(() => expect(removeMock).toHaveBeenCalledWith(entries[100]!.id, 1));
+  });
 });

@@ -23,8 +23,10 @@ import {
   deleteVerificationMachine,
   getVerificationMachine,
   listVerificationMachines,
+  listVerificationMachinesPage,
   recordVerificationMachineStatus,
   upsertVerificationMachine,
+  type VerificationMachineCursor,
 } from '../src/db/verification-machine-queries.js';
 
 let db: Database;
@@ -339,5 +341,126 @@ describe('verification-machine-queries (real PostgreSQL)', () => {
       { alias: 'prod-211-renamed', scope: 'project', scopeKey: 'proj-alpha' },
       { alias: 'Global Mac', scope: 'user', scopeKey: '' },
     ]);
+  });
+
+  it('paginates >100 multi-project profiles with deterministic cursor ordering including identical aliases and id tie-breaker', async () => {
+    const userId = await freshUser();
+    const otherUser = await freshUser();
+    const createdIds: string[] = [];
+
+    // 55 in repo-a, 50 in repo-b (with 2 SSH rows sharing the same dynamic alias name in repo-b), and 3 in user scope = 108 total.
+    const sharedAliasId = randomHex(16);
+    await upsertAlias(db, {
+      id: sharedAliasId,
+      userId,
+      name: 'shared-ssh-alias',
+      value: 'ssh k@172.16.253.211',
+      source: 'web',
+    });
+
+    for (let i = 0; i < 55; i += 1) {
+      const id = randomHex(16);
+      createdIds.push(id);
+      await upsertVerificationMachine(db, {
+        id,
+        userId,
+        scope: 'project',
+        scopeKey: 'repo-a',
+        alias: `node-a-${String(i).padStart(3, '0')}`,
+        kind: 'controlled_node',
+        target: '1234567890',
+        enabled: true,
+        source: 'web',
+      });
+    }
+    for (let i = 0; i < 48; i += 1) {
+      const id = randomHex(16);
+      createdIds.push(id);
+      await upsertVerificationMachine(db, {
+        id,
+        userId,
+        scope: 'project',
+        scopeKey: 'repo-b',
+        alias: `node-b-${String(i).padStart(3, '0')}`,
+        kind: 'controlled_node',
+        target: '0987654321',
+        enabled: true,
+        source: 'web',
+      });
+    }
+    for (const storedAlias of ['ssh-alias-row-1', 'ssh-alias-row-2']) {
+      const id = randomHex(16);
+      createdIds.push(id);
+      await upsertVerificationMachine(db, {
+        id,
+        userId,
+        scope: 'project',
+        scopeKey: 'repo-b',
+        alias: storedAlias,
+        kind: 'ssh',
+        target: sharedAliasId,
+        enabled: true,
+        source: 'web',
+      });
+    }
+    for (let i = 0; i < 3; i += 1) {
+      const id = randomHex(16);
+      createdIds.push(id);
+      await upsertVerificationMachine(db, {
+        id,
+        userId,
+        scope: 'user',
+        scopeKey: '',
+        alias: `global-${i}`,
+        kind: 'controlled_node',
+        target: '1111111111',
+        enabled: true,
+        source: 'web',
+      });
+    }
+    await upsertVerificationMachine(db, {
+      id: randomHex(16),
+      userId: otherUser,
+      scope: 'user',
+      scopeKey: '',
+      alias: 'other-user-only',
+      kind: 'controlled_node',
+      target: '2222222222',
+      enabled: true,
+      source: 'web',
+    });
+
+    // Small bounded pages (limit=40) + active project bucket='repo-b' must visit all 108 rows without skips or duplicates.
+    const pagedIds: string[] = [];
+    let cursor: VerificationMachineCursor | null = null;
+    let pageCount = 0;
+    while (true) {
+      const page = await listVerificationMachinesPage(db, userId, {
+        projectKey: 'repo-b',
+        limit: 40,
+        cursor,
+      });
+      pageCount += 1;
+      for (const item of page.profiles) pagedIds.push(item.id);
+      if (!page.nextCursor) break;
+      cursor = page.nextCursor;
+    }
+    expect(pageCount).toBe(3); // 40 + 40 + 28 = 108
+    expect(pagedIds).toHaveLength(108);
+    expect(new Set(pagedIds)).toEqual(new Set(createdIds));
+
+    // Default MAX_ITEMS (100) paging also spans 2 pages cleanly.
+    const defaultPage1 = await listVerificationMachinesPage(db, userId);
+    expect(defaultPage1.profiles).toHaveLength(100);
+    expect(defaultPage1.nextCursor).not.toBeNull();
+    const defaultPage2 = await listVerificationMachinesPage(db, userId, { cursor: defaultPage1.nextCursor });
+    expect(defaultPage2.profiles).toHaveLength(8);
+    expect(defaultPage2.nextCursor).toBeNull();
+
+    // listVerificationMachines with includeAllProjects=true aggregates all 108, while scoped stays <= 100 per scope.
+    const allAggregated = await listVerificationMachines(db, userId, undefined, { includeAllProjects: true });
+    expect(allAggregated).toHaveLength(108);
+    expect(await listVerificationMachines(db, userId, 'repo-a')).toHaveLength(58); // 55 repo-a + 3 user
+    expect(await listVerificationMachines(db, otherUser, undefined, { includeAllProjects: true })).toHaveLength(1);
   });
 });

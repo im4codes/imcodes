@@ -21,6 +21,14 @@ interface VerificationMachineRow {
   last_verified_at: number | null;
   last_verification_status: VerificationMachineStatus;
   source: 'web' | 'mcp';
+  sort_bucket?: number;
+}
+
+export interface VerificationMachineCursor {
+  bucket: number;
+  scopeKey: string;
+  alias: string;
+  id: string;
 }
 
 function mapRow(row: VerificationMachineRow): VerificationMachineProfile {
@@ -54,33 +62,86 @@ const LIST_COLUMNS = `id, scope, scope_key,
   kind, target, enabled, revision, created_at, updated_at,
   last_verified_at, last_verification_status, source`;
 
+export async function listVerificationMachinesPage(
+  db: Database,
+  userId: string,
+  options?: {
+    projectKey?: string;
+    limit?: number;
+    cursor?: VerificationMachineCursor | null;
+  },
+): Promise<{ profiles: VerificationMachineProfile[]; nextCursor: VerificationMachineCursor | null }> {
+  const limit = Math.max(
+    1,
+    Math.min(VERIFICATION_MACHINE_LIMITS.MAX_ITEMS, Math.trunc(options?.limit ?? VERIFICATION_MACHINE_LIMITS.MAX_ITEMS)),
+  );
+  const cursor = options?.cursor ?? null;
+  const rows = await db.query<VerificationMachineRow>(
+    `WITH listed AS (
+       SELECT ${LIST_COLUMNS},
+              CASE
+                WHEN $2::text IS NOT NULL AND scope = 'project' AND scope_key = $2 THEN 0
+                WHEN scope = 'project' THEN 1
+                ELSE 2
+              END AS sort_bucket
+         FROM verification_machine_profiles
+        WHERE user_id = $1
+     )
+     SELECT id, scope, scope_key, alias, kind, target, enabled, revision,
+            created_at, updated_at, last_verified_at, last_verification_status, source,
+            sort_bucket
+       FROM listed
+      WHERE ($4::int IS NULL OR (sort_bucket, scope_key, alias, id) > ($4::int, $5::text, $6::text, $7::text))
+      ORDER BY sort_bucket ASC, scope_key ASC, alias ASC, id ASC
+      LIMIT $3`,
+    [
+      userId,
+      options?.projectKey ?? null,
+      limit + 1,
+      cursor ? cursor.bucket : null,
+      cursor?.scopeKey ?? '',
+      cursor?.alias ?? '',
+      cursor?.id ?? '',
+    ],
+  );
+  const hasMore = rows.length > limit;
+  const pageRows = hasMore ? rows.slice(0, limit) : rows;
+  const last = hasMore ? pageRows[pageRows.length - 1] : undefined;
+  const nextCursor: VerificationMachineCursor | null = last
+    ? {
+        bucket: Number(last.sort_bucket ?? 0),
+        scopeKey: last.scope_key,
+        alias: last.alias,
+        id: last.id,
+      }
+    : null;
+  return { profiles: pageRows.map(mapRow), nextCursor };
+}
+
 export async function listVerificationMachines(
   db: Database,
   userId: string,
   projectKey?: string,
   options?: { includeAllProjects?: boolean },
 ): Promise<VerificationMachineProfile[]> {
-  const includeAllProjects = options?.includeAllProjects === true;
+  if (options?.includeAllProjects === true) {
+    const all: VerificationMachineProfile[] = [];
+    let cursor: VerificationMachineCursor | null = null;
+    while (true) {
+      const page = await listVerificationMachinesPage(db, userId, { projectKey, cursor });
+      all.push(...page.profiles);
+      if (!page.nextCursor) break;
+      cursor = page.nextCursor;
+    }
+    return all;
+  }
   const rows = await db.query<VerificationMachineRow>(
-    includeAllProjects
-      ? `SELECT ${LIST_COLUMNS}
-           FROM verification_machine_profiles
-          WHERE user_id = $1
-          ORDER BY
-            CASE
-              WHEN $2::text IS NOT NULL AND scope = 'project' AND scope_key = $2 THEN 0
-              WHEN scope = 'project' THEN 1
-              ELSE 2
-            END,
-            scope_key ASC,
-            alias ASC
-          LIMIT $3`
-      : `SELECT ${LIST_COLUMNS}
-           FROM verification_machine_profiles
-          WHERE user_id = $1
-            AND (scope = 'user' OR ($2::text IS NOT NULL AND scope = 'project' AND scope_key = $2))
-          ORDER BY CASE scope WHEN 'project' THEN 0 ELSE 1 END, alias ASC
-          LIMIT $3`,
+    `SELECT ${LIST_COLUMNS}
+       FROM verification_machine_profiles
+      WHERE user_id = $1
+        AND (scope = 'user' OR ($2::text IS NOT NULL AND scope = 'project' AND scope_key = $2))
+      ORDER BY CASE scope WHEN 'project' THEN 0 ELSE 1 END, alias ASC, id ASC
+      LIMIT $3`,
     [userId, projectKey ?? null, VERIFICATION_MACHINE_LIMITS.MAX_ITEMS + 1],
   );
   return rows.map(mapRow);

@@ -6,8 +6,10 @@ import {
   deleteVerificationMachine,
   getVerificationMachine,
   listVerificationMachines,
+  listVerificationMachinesPage,
   recordVerificationMachineStatus,
   upsertVerificationMachine,
+  type VerificationMachineCursor,
 } from '../db/verification-machine-queries.js';
 import { listControlledMachines } from './machines.js';
 import { getAliasById } from '../db/alias-queries.js';
@@ -40,16 +42,70 @@ function normalizedScopeKey(scope: VerificationMachineScope, value: unknown): st
   return scope === VERIFICATION_MACHINE_SCOPES.USER ? '' : String(value).trim();
 }
 
+function encodeCursor(cursor: VerificationMachineCursor): string {
+  return Buffer.from(JSON.stringify(cursor), 'utf8').toString('base64url');
+}
+
+function decodeCursor(raw: string): VerificationMachineCursor | null {
+  if (!raw || raw.length > 2048) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8')) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== 'object') return null;
+    if (typeof parsed.bucket !== 'number' || !Number.isInteger(parsed.bucket) || parsed.bucket < 0 || parsed.bucket > 2) {
+      return null;
+    }
+    if (typeof parsed.scopeKey !== 'string' || parsed.scopeKey.length > VERIFICATION_MACHINE_LIMITS.SCOPE_KEY_MAX_CHARS * 2) {
+      return null;
+    }
+    if (typeof parsed.alias !== 'string' || parsed.alias.length > VERIFICATION_MACHINE_LIMITS.ALIAS_MAX_CHARS * 4) {
+      return null;
+    }
+    if (!isVerificationMachineId(parsed.id)) return null;
+    return {
+      bucket: parsed.bucket,
+      scopeKey: parsed.scopeKey,
+      alias: parsed.alias,
+      id: parsed.id,
+    };
+  } catch {
+    return null;
+  }
+}
+
 verificationMachineRoutes.get('/', async (c) => {
   const projectKey = c.req.query('projectKey')?.trim() || undefined;
   const includeAllProjects = c.req.query('includeAllProjects') === '1'
     || c.req.query('includeAllProjects') === 'true';
-  const profiles = await listVerificationMachines(
-    c.env.DB,
-    c.get('userId' as never) as string,
-    projectKey,
-    { includeAllProjects },
-  );
+  const userId = c.get('userId' as never) as string;
+  if (includeAllProjects) {
+    const rawCursor = c.req.query('cursor');
+    const cursor = rawCursor === undefined ? null : decodeCursor(rawCursor);
+    if (rawCursor !== undefined && !cursor) {
+      return c.json({ error: 'verification_machine_cursor_invalid' }, 400);
+    }
+    const rawLimit = c.req.query('limit');
+    let limit: number = VERIFICATION_MACHINE_LIMITS.MAX_ITEMS;
+    if (rawLimit !== undefined) {
+      if (!/^\d+$/u.test(rawLimit)) {
+        return c.json({ error: 'verification_machine_limit_invalid' }, 400);
+      }
+      const parsed = Number(rawLimit);
+      if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > VERIFICATION_MACHINE_LIMITS.MAX_ITEMS) {
+        return c.json({ error: 'verification_machine_limit_invalid' }, 400);
+      }
+      limit = parsed;
+    }
+    const page = await listVerificationMachinesPage(c.env.DB, userId, {
+      projectKey,
+      limit,
+      cursor,
+    });
+    return c.json({
+      profiles: page.profiles,
+      ...(page.nextCursor ? { nextCursor: encodeCursor(page.nextCursor) } : {}),
+    });
+  }
+  const profiles = await listVerificationMachines(c.env.DB, userId, projectKey);
   if (profiles.length > VERIFICATION_MACHINE_LIMITS.MAX_ITEMS) {
     return c.json({ error: 'verification_machine_list_over_limit' }, 413);
   }

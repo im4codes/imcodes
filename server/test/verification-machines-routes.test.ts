@@ -20,12 +20,39 @@ function makeMemDb(): Database {
   return {
     query: async <T = unknown>(sql: string, params: unknown[] = []) => {
       if (!sql.includes('verification_machine_profiles')) return [] as T[];
-      const [userId, projectKey] = params as [string, string | null, number];
-      const includeAllProjects = !sql.includes("scope = 'user' OR");
-      return [...rows.values()].filter((row) => row.user_id === userId
-        && (includeAllProjects
-          || row.scope === 'user'
-          || (row.scope === 'project' && row.scope_key === projectKey))) as T[];
+      if (sql.includes('WITH listed AS')) {
+        const [userId, projectKey, limit, cursorBucket, cursorScopeKey, cursorAlias, cursorId] = params as [
+          string, string | null, number, number | null, string, string, string,
+        ];
+        const cmpStr = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+        const mapped = [...rows.values()]
+          .filter((row) => row.user_id === userId)
+          .map((row) => ({
+            ...row,
+            sort_bucket: projectKey !== null && row.scope === 'project' && row.scope_key === projectKey
+              ? 0
+              : row.scope === 'project' ? 1 : 2,
+          }))
+          .sort((a, b) => (a.sort_bucket - b.sort_bucket)
+            || cmpStr(a.scope_key, b.scope_key)
+            || cmpStr(a.alias, b.alias)
+            || cmpStr(a.id, b.id));
+        const filtered = cursorBucket === null
+          ? mapped
+          : mapped.filter((item) => {
+              const cmp = (item.sort_bucket - cursorBucket)
+                || cmpStr(item.scope_key, cursorScopeKey)
+                || cmpStr(item.alias, cursorAlias)
+                || cmpStr(item.id, cursorId);
+              return cmp > 0;
+            });
+        return filtered.slice(0, limit) as T[];
+      }
+      const [userId, projectKey, limit] = params as [string, string | null, number];
+      return [...rows.values()]
+        .filter((row) => row.user_id === userId
+          && (row.scope === 'user' || (row.scope === 'project' && row.scope_key === projectKey)))
+        .slice(0, limit) as T[];
     },
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []) => {
       { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
@@ -166,6 +193,86 @@ describe('/api/verification-machines', () => {
 
     const otherUserAll = await app.request('/api/verification-machines?includeAllProjects=1', { headers: { Authorization: bearer('user-2') } });
     expect(await otherUserAll.json()).toEqual({ profiles: [] });
+  });
+
+  it('paginates includeAllProjects=1 cleanly across >100 multi-project profiles without 413 and allows editing/deleting page-2 items', async () => {
+    for (let i = 0; i < 51; i += 1) {
+      const res = await app.request('/api/verification-machines', { method: 'PUT', headers: {
+        Authorization: bearer(), 'Content-Type': 'application/json',
+      }, body: JSON.stringify({ scope: 'project', scopeKey: 'repo-a', alias: `a-${String(i).padStart(3, '0')}`, kind: 'ssh', target: ALIAS_ID }) });
+      expect(res.status).toBe(200);
+    }
+    for (let i = 0; i < 50; i += 1) {
+      const res = await app.request('/api/verification-machines', { method: 'PUT', headers: {
+        Authorization: bearer(), 'Content-Type': 'application/json',
+      }, body: JSON.stringify({ scope: 'project', scopeKey: 'repo-b', alias: `b-${String(i).padStart(3, '0')}`, kind: 'ssh', target: ALIAS_ID }) });
+      expect(res.status).toBe(200);
+    }
+
+    // Default scoped GETs remain valid and unchanged at 51 and 50 items respectively.
+    const scopedA = await app.request('/api/verification-machines?projectKey=repo-a', { headers: { Authorization: bearer() } });
+    expect(scopedA.status).toBe(200);
+    expect((await scopedA.json() as { profiles: Row[] }).profiles).toHaveLength(51);
+
+    const scopedB = await app.request('/api/verification-machines?projectKey=repo-b', { headers: { Authorization: bearer() } });
+    expect(scopedB.status).toBe(200);
+    expect((await scopedB.json() as { profiles: Row[] }).profiles).toHaveLength(50);
+
+    // Management GET returns page 1 (100 items + nextCursor) and page 2 (1 item, no nextCursor) with no 413.
+    const page1Res = await app.request('/api/verification-machines?includeAllProjects=1', { headers: { Authorization: bearer() } });
+    expect(page1Res.status).toBe(200);
+    const page1 = await page1Res.json() as { profiles: Row[]; nextCursor?: string };
+    expect(page1.profiles).toHaveLength(100);
+    expect(typeof page1.nextCursor).toBe('string');
+
+    const page2Res = await app.request(`/api/verification-machines?includeAllProjects=1&cursor=${encodeURIComponent(page1.nextCursor!)}`, {
+      headers: { Authorization: bearer() },
+    });
+    expect(page2Res.status).toBe(200);
+    const page2 = await page2Res.json() as { profiles: Row[]; nextCursor?: string };
+    expect(page2.profiles).toHaveLength(1);
+    expect(page2.nextCursor).toBeUndefined();
+
+    // Another user cannot see any items on either page.
+    const otherUserPage = await app.request(`/api/verification-machines?includeAllProjects=1&cursor=${encodeURIComponent(page1.nextCursor!)}`, {
+      headers: { Authorization: bearer('user-2') },
+    });
+    expect(otherUserPage.status).toBe(200);
+    expect(await otherUserPage.json()).toEqual({ profiles: [] });
+
+    // Page-2 item can be edited (e.g. switched to user scope / renamed) and deleted.
+    const page2Item = page2.profiles[0]!;
+    const editRes = await app.request('/api/verification-machines', { method: 'PUT', headers: {
+      Authorization: bearer(), 'Content-Type': 'application/json',
+    }, body: JSON.stringify({
+      id: page2Item.id,
+      scope: 'user',
+      scopeKey: '',
+      alias: 'promoted-from-page-2',
+      kind: 'ssh',
+      target: ALIAS_ID,
+      expectedRevision: page2Item.revision,
+    }) });
+    expect(editRes.status).toBe(200);
+    expect(await editRes.json()).toMatchObject({ profile: { id: page2Item.id, scope: 'user', alias: 'promoted-from-page-2', revision: 2 } });
+
+    const delRes = await app.request(`/api/verification-machines/${page2Item.id}?expectedRevision=2`, {
+      method: 'DELETE',
+      headers: { Authorization: bearer() },
+    });
+    expect(delRes.status).toBe(200);
+    expect(await delRes.json()).toEqual({ deleted: true });
+
+    // Rejects malformed cursor or out-of-range limit with 400.
+    expect((await app.request('/api/verification-machines?includeAllProjects=1&cursor=not-valid', {
+      headers: { Authorization: bearer() },
+    })).status).toBe(400);
+    expect((await app.request('/api/verification-machines?includeAllProjects=1&limit=101', {
+      headers: { Authorization: bearer() },
+    })).status).toBe(400);
+    expect((await app.request('/api/verification-machines?includeAllProjects=1&limit=0', {
+      headers: { Authorization: bearer() },
+    })).status).toBe(400);
   });
 
   it('isolates users and rejects unsafe SSH option injection', async () => {
