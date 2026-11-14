@@ -26,7 +26,7 @@ import { startProject, stopProject, teardownProject, getTransportRuntime, launch
 import { buildTransportResumeLaunchOpts } from '../agent/transport-resume-opts.js';
 import { isTransportAgent, type AgentType } from '../agent/detect.js';
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, isClaudeCodeSdkAgentType } from '../../shared/agent-types.js';
-import { isWorkingSessionState } from '../../shared/session-activity-types.js';
+import { isWorkingSessionState, type ActivityGenerationLike } from '../../shared/session-activity-types.js';
 import { aliasExpansionModeFor, expandForAgent } from '../../shared/alias-expand.js';
 import { ALIAS_REASONS } from '../../shared/alias-types.js';
 import { classifyCodexFastCommand, isCodexFastServiceTier } from '../../shared/codex-service-tier.js';
@@ -441,6 +441,7 @@ import {
   type MemoryManagementBoundProject,
 } from '../../shared/memory-management-context.js';
 import {
+  SESSION_CANCEL_IDLE_DECISION_REASON,
   getSessionControlTimelineFeedbackById,
   isDaemonHandledSessionControlSend,
   isSessionControlCommandText,
@@ -3856,11 +3857,40 @@ function resolveSessionCommandName(cmd: Record<string, unknown>): string | undef
 }
 
 function markTransportCancelIdle(sessionName: string, error?: string): void {
+  const runtime = getTransportRuntime(sessionName);
+  const activity = typeof runtime?.getDiagnosticSnapshot === 'function'
+    ? runtime.getDiagnosticSnapshot()
+    : null;
+  const queuePayload = buildTransportQueueSessionStatePayload(
+    sessionName,
+    'idle',
+    SESSION_CANCEL_IDLE_DECISION_REASON,
+  );
+  const activityGeneration = activity?.activityGeneration
+    ?? (queuePayload.activityGeneration as ActivityGenerationLike | undefined)
+    ?? { scope: 'session', sessionName, generation: 0 };
+  const pendingEntries = Array.isArray(queuePayload.pendingMessageEntries)
+    ? queuePayload.pendingMessageEntries
+    : [];
+  const pendingVersion = typeof queuePayload.pendingMessageVersion === 'number'
+    && Number.isFinite(queuePayload.pendingMessageVersion)
+    ? queuePayload.pendingMessageVersion
+    : 0;
   timelineEmitter.emit(
     sessionName,
     'session.state',
     {
-      ...buildTransportQueueSessionStatePayload(sessionName, 'idle', 'command_handler_cancel_idle'),
+      ...queuePayload,
+      authoritative: true,
+      activityGeneration,
+      blockingWorkCount: 0,
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+      decisionReason: SESSION_CANCEL_IDLE_DECISION_REASON,
+      clearInputs: [{ source: 'command_handler', reason: 'clear', count: 0 }],
+      pendingCount: pendingEntries.length,
+      pendingVersion,
       ...(error ? { error } : {}),
     },
     { source: 'daemon', confidence: 'high' },

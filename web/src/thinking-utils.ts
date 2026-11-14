@@ -10,6 +10,8 @@
 import {
   TIMELINE_METADATA_EVENT_TYPES,
   isAuthoritativeCleanIdlePayload,
+  isCancelIdlePayload,
+  isUserCancelStoppingPayload,
   isWorkingSessionState,
   reduceTimelineActivity,
 } from '../../shared/session-activity-types.js';
@@ -27,6 +29,23 @@ const THINKING_SKIP_TYPES = new Set<string>([
   ...TIMELINE_METADATA_EVENT_TYPES,
 ]);
 
+function hasPrecedingUserCancelStop(
+  events: Array<{ type: string; payload?: Record<string, unknown> }>,
+  idleIndex: number,
+): boolean {
+  for (let j = idleIndex - 1; j >= 0; j--) {
+    const prev = events[j];
+    if (prev.type !== 'session.state') {
+      if (THINKING_SKIP_TYPES.has(prev.type)) continue;
+      return false;
+    }
+    if (isUserCancelStoppingPayload(prev.payload)) return true;
+    const prevState = String(prev.payload?.state ?? '');
+    if (isWorkingSessionState(prevState) || prevState === 'idle') return false;
+  }
+  return false;
+}
+
 export function getActiveThinkingTs(events: Array<{ type: string; ts: number; payload?: Record<string, unknown> }>): number | null {
   let thinkingTs: number | null = null;
   for (let i = events.length - 1; i >= 0; i--) {
@@ -40,7 +59,9 @@ export function getActiveThinkingTs(events: Array<{ type: string; ts: number; pa
     // session.state: idle = agent finished (end thinking), running = skip (don't end thinking)
     if (e.type === 'session.state') {
       if (e.payload?.state === 'idle'
-        && isAuthoritativeCleanIdlePayload(e.payload)
+        && (isAuthoritativeCleanIdlePayload(e.payload)
+          || isCancelIdlePayload(e.payload)
+          || hasPrecedingUserCancelStop(events, i))
         && !reduceTimelineActivity(events.slice(0, i + 1)).active) break;
       continue;
     }

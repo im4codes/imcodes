@@ -1,4 +1,5 @@
 import { CHAT_MESSAGE_ORIGINS } from '../../shared/chat-message-origin.js';
+import { SESSION_CANCEL_IDLE_DECISION_REASON } from '../../shared/session-control-commands.js';
 import { isPairsEngineProject, isPairsEngineSession, isSessionCoveredByPairHeartbeat, isTaskPairEngineActive } from './task-pairs/engine.js';
 import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
@@ -2490,7 +2491,7 @@ class SupervisionAutomation {
       if (candidate && event.type === 'session.state') {
         const resetReason = trimString(payload.resetReason);
         const reason = trimString(payload.reason);
-        if (resetReason === 'command_handler_cancel_idle' || reason === 'stopped') {
+        if (resetReason === SESSION_CANCEL_IDLE_DECISION_REASON || reason === 'stopped') {
           latestAssistant = null;
           latestAssistantKey = null;
           barrierAfterLatest = 'stopped';

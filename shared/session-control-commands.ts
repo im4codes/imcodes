@@ -8,6 +8,7 @@ export const SESSION_CONTROL_TIMELINE_STATE_COMPACTING = 'compacting' as const;
 export const SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT = 'user_compact' as const;
 export const SESSION_CONTROL_TIMELINE_STATE_STOPPING = 'stopping' as const;
 export const SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL = 'user_cancel' as const;
+export const SESSION_CANCEL_IDLE_DECISION_REASON = 'command_handler_cancel_idle' as const;
 
 export type SessionControlCommandId = 'compact' | 'clear' | 'handoff' | 'stop';
 export type SessionControlHandling = 'provider-dispatched' | 'daemon-managed';

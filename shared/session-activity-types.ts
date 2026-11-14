@@ -1,5 +1,10 @@
 import { TIMELINE_EVENT_FILE_CHANGE } from './file-change.js';
 import { EXECUTION_CLONE_TIMELINE } from './execution-clone.js';
+import {
+  SESSION_CANCEL_IDLE_DECISION_REASON,
+  SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
+  SESSION_CONTROL_TIMELINE_STATE_STOPPING,
+} from './session-control-commands.js';
 
 export type SessionActivityBusyReason =
   | 'runtime_dispatch'
@@ -747,6 +752,21 @@ export function isWeakIdlePayload(payload: Record<string, unknown> | null | unde
   return payload?.state === 'idle' && !isAuthoritativeCleanIdlePayload(payload);
 }
 
+/** Whether a `session.state` payload acknowledges an explicit user Stop (`stopping` / `user_cancel`). */
+export function isUserCancelStoppingPayload(payload: Record<string, unknown> | null | undefined): boolean {
+  return payload?.state === SESSION_CONTROL_TIMELINE_STATE_STOPPING
+    && payload?.reason === SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL;
+}
+
+/** Whether a `session.state: 'idle'` payload explicitly comes from user Stop cancellation. */
+export function isCancelIdlePayload(payload: Record<string, unknown> | null | undefined): boolean {
+  if (payload?.state !== 'idle') return false;
+  if (payload.decisionReason === SESSION_CANCEL_IDLE_DECISION_REASON) return true;
+  if (payload.reason === SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL) return true;
+  const snapshot = payload.queueSnapshot;
+  return isRecord(snapshot) && snapshot.source === SESSION_CANCEL_IDLE_DECISION_REASON;
+}
+
 function readTerminalStatus(payload: Record<string, unknown> | undefined): ToolTerminalStatus | undefined {
   const status = typeof payload?.terminalStatus === 'string'
     ? payload.terminalStatus
@@ -775,12 +795,17 @@ export function reduceTimelineActivity(events: TimelineActivityEvent[]): Timelin
   let anonymousOpenToolCount = 0;
   let degraded = false;
   let active = false;
+  let pendingUserCancelStop = false;
   let currentGeneration: string | undefined;
   const degradedReasons = new Set<string>();
   let lastTerminalStatus: ToolTerminalStatus | undefined;
   let lastTerminalReason: string | undefined;
 
   for (const event of events) {
+    if (event.type === 'user.message') {
+      pendingUserCancelStop = false;
+      continue;
+    }
     if (event.type === 'tool.call') {
       if (isSdkSubagentTimelinePayload(event.payload)) continue;
       const key = readToolKey(event.payload);
@@ -812,10 +837,12 @@ export function reduceTimelineActivity(events: TimelineActivityEvent[]): Timelin
       if (state !== 'idle' && eventGeneration) currentGeneration = eventGeneration;
       if (state === 'idle') {
         const expectedGeneration = currentGeneration ?? eventGeneration ?? undefined;
-        if (isAuthoritativeCleanIdlePayload(event.payload, expectedGeneration)) {
+        const userCancelIdle = pendingUserCancelStop || isCancelIdlePayload(event.payload);
+        if (isAuthoritativeCleanIdlePayload(event.payload, expectedGeneration) || userCancelIdle) {
           openToolIds.clear();
           anonymousOpenToolCount = 0;
           active = false;
+          pendingUserCancelStop = false;
           if (eventGeneration) currentGeneration = eventGeneration;
         } else if (openToolIds.size > 0) {
           // Anonymous tool calls are common in legacy/process-backed histories and
@@ -833,7 +860,10 @@ export function reduceTimelineActivity(events: TimelineActivityEvent[]): Timelin
         }
         continue;
       }
-      if (isWorkingSessionState(state)) {
+      if (isUserCancelStoppingPayload(event.payload)) {
+        pendingUserCancelStop = true;
+      } else if (isWorkingSessionState(state)) {
+        pendingUserCancelStop = false;
         active = true;
       }
     }

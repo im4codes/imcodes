@@ -3811,6 +3811,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       && !this._activeTurn && !this._sending) {
       this.cancelCapacityRetry();
       this.markCurrentActivityGenerationLocallyCancelled();
+      this.closeOpenTools('cancelled', 'user_cancelled');
       if (!this._drainPending()) this.setStatus('idle');
       return;
     }
@@ -3860,6 +3861,8 @@ export class TransportSessionRuntime implements SessionRuntime {
       && this._activeDispatchEntries.length === 0
       && !this.hasActiveTurnWork()
     ) {
+      this.markCurrentActivityGenerationLocallyCancelled();
+      this.closeOpenTools('cancelled', 'user_cancelled');
       if (!this._drainPending()) this.setStatus('idle');
       return;
     }

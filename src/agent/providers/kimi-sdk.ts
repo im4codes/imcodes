@@ -1302,12 +1302,12 @@ export class KimiSdkProvider implements TransportProvider {
       || [...this.pendingApprovals.values()].some((approval) => approval.routeId === sessionId);
     this.closeAgyBridges(state);
     this.cancelPendingApprovals(sessionId);
+    for (const event of state.agySubagents?.interrupt() ?? []) {
+      for (const cb of this.toolCallCallbacks) cb(sessionId, event);
+    }
+    state.toolCalls.clear();
+    state.emittedToolSignatures.clear();
     if (!state.promptInFlight) {
-      state.toolCalls.clear();
-      state.emittedToolSignatures.clear();
-      for (const event of state.agySubagents?.interrupt() ?? []) {
-        for (const cb of this.toolCallCallbacks) cb(sessionId, event);
-      }
       if (hadBackgroundOrOpenTools) {
         state.lastStatusSignature = null;
         this.clearStatus(sessionId, state);

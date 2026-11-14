@@ -7255,6 +7255,56 @@ ${PREFERENCE_CONTEXT_END}`;
     }));
   });
 
+  it('cancel() closes lingering open tools during capacity retry backoff and settles cleanly when !_activeTurn && !_sending', async () => {
+    runtime.send('cap-turn', 'msg-cap');
+    await waitForProviderSendCount(mock.provider, 1);
+
+    vi.useFakeTimers();
+    try {
+      const state = runtime as unknown as {
+        _activeDispatchProviderStarted: boolean;
+        _activeDispatchProviderAccepted: boolean;
+        _activeDispatchHasSideEffectEvidence: boolean;
+      };
+      state._activeDispatchProviderStarted = false;
+      state._activeDispatchProviderAccepted = false;
+      state._activeDispatchHasSideEffectEvidence = false;
+      mock.fireError('sess-1', {
+        code: 'PROVIDER_ERROR',
+        message: 'Selected model is at capacity.',
+        recoverable: false,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(runtime.getDiagnosticSnapshot().busyReasons).toContain('capacity_retry');
+
+      // Simulate a lingering unclosed tool while !_activeTurn && !_sending under capacity retry.
+      (runtime as any)._openTools.set('tool-cap-open', { generation: 1, name: 'Bash', status: 'running' });
+
+      await runtime.cancel();
+
+      expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
+        'deck_test_brain',
+        'tool.result',
+        expect.objectContaining({
+          toolCallId: 'tool-cap-open',
+          terminalStatus: 'cancelled',
+          terminalReason: 'user_cancelled',
+        }),
+        expect.objectContaining({ source: 'daemon', confidence: 'high' }),
+      );
+      expect(runtime.getStatus()).toBe('idle');
+      expect(runtime.getDiagnosticSnapshot().activeToolCount).toBe(0);
+      expect(runtime.getDiagnosticSnapshot().blockingWorkCount).toBe(0);
+
+      // Re-cancelling when already idle / !_activeTurn && !_sending stays clean.
+      await runtime.cancel();
+      expect(runtime.getStatus()).toBe('idle');
+      expect(runtime.getDiagnosticSnapshot().blockingWorkCount).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('external completion settles the active turn and drains queued messages without waiting for provider callbacks', async () => {
     runtime.send('first marker-backed workflow turn', 'cmd-first');
     await waitForProviderSendCount(mock.provider, 1);

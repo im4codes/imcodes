@@ -14,9 +14,14 @@ import {
   TRANSPORT_QUEUE_COMMANDS,
 } from '../../shared/transport-queue-types.js';
 import {
+  SESSION_CANCEL_IDLE_DECISION_REASON,
   SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
   SESSION_CONTROL_TIMELINE_STATE_STOPPING,
 } from '../../shared/session-control-commands.js';
+import {
+  isAuthoritativeCleanIdlePayload,
+  isAuthoritativeIdlePayloadShape,
+} from '../../shared/session-activity-types.js';
 import {
   MEMORY_MCP_PROVIDER_ID,
   MEMORY_MCP_PROVIDER_IDS,
@@ -2508,6 +2513,67 @@ describe('handleWebCommand transport queue behavior', () => {
       expect.objectContaining({ state: 'queued' }),
       expect.anything(),
     );
+  });
+
+  it('emits authoritative clean-idle contract fields from markTransportCancelIdle both with live runtime and after restart (!stopRuntime)', async () => {
+    const gen = { scope: 'session', sessionName: 'deck_transport_brain', generation: 7 };
+    const cancel = vi.fn().mockResolvedValue(undefined);
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      cancel,
+      send: vi.fn(() => 'queued'),
+      getDiagnosticSnapshot: () => ({ activityGeneration: gen }),
+      pendingCount: 0,
+      pendingMessages: [],
+    });
+
+    handleWebCommand({
+      type: DAEMON_COMMAND_TYPES.SESSION_CANCEL,
+      sessionName: 'deck_transport_brain',
+      commandId: 'cmd-stop-auth-runtime',
+    }, serverLink as any);
+    await flushAsync();
+
+    const runtimeIdleCall = emitMock.mock.calls.find((call) => (
+      call[0] === 'deck_transport_brain'
+      && call[1] === 'session.state'
+      && (call[2] as Record<string, unknown>)?.state === 'idle'
+    ));
+    const runtimePayload = runtimeIdleCall?.[2] as Record<string, unknown>;
+    expect(runtimePayload).toBeDefined();
+    expect(isAuthoritativeIdlePayloadShape(runtimePayload)).toBe(true);
+    expect(isAuthoritativeCleanIdlePayload(runtimePayload, gen)).toBe(true);
+    expect(runtimePayload.decisionReason).toBe(SESSION_CANCEL_IDLE_DECISION_REASON);
+
+    // Post-restart / missing runtime path (!stopRuntime)
+    emitMock.mockClear();
+    getTransportRuntimeMock.mockReturnValue(undefined);
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'agy-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+    });
+
+    handleWebCommand({
+      type: DAEMON_COMMAND_TYPES.SESSION_CANCEL,
+      sessionName: 'deck_transport_brain',
+      commandId: 'cmd-stop-post-restart',
+    }, serverLink as any);
+    await flushAsync();
+
+    const restartIdleCall = emitMock.mock.calls.find((call) => (
+      call[0] === 'deck_transport_brain'
+      && call[1] === 'session.state'
+      && (call[2] as Record<string, unknown>)?.state === 'idle'
+    ));
+    const restartPayload = restartIdleCall?.[2] as Record<string, unknown>;
+    expect(restartPayload).toBeDefined();
+    expect(isAuthoritativeIdlePayloadShape(restartPayload)).toBe(true);
+    expect(isAuthoritativeCleanIdlePayload(restartPayload)).toBe(true);
+    expect(restartPayload.decisionReason).toBe(SESSION_CANCEL_IDLE_DECISION_REASON);
   });
 
   it('keeps legacy /stop sends as direct cancel compatibility without emitting /stop text', async () => {

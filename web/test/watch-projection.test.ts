@@ -988,4 +988,69 @@ describe('watch projection store', () => {
     expect(afterGeneratedAt).not.toBe(beforeGeneratedAt);
     expect(afterRest).toEqual(beforeRest);
   });
+
+  it('clears open tool keys on user_cancel stopping + command_handler_cancel_idle even on generation mismatch', () => {
+    const { store } = makeSnapshotStore(5_000);
+    store.updateFromSessionList(
+      { id: 'srv-1', name: 'Main', baseUrl: 'https://main.test' },
+      [
+        { name: 'deck_aip_brain', project: 'AIP', role: 'brain', agentType: 'agy-sdk', state: 'running' },
+      ],
+    );
+
+    store.handleTimelineEvent({
+      eventId: 'ev-run',
+      sessionId: 'deck_aip_brain',
+      ts: 5_001,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'session.state',
+      payload: {
+        state: 'running',
+        activityGeneration: { scope: 'session', sessionName: 'deck_aip_brain', generation: 5 },
+      },
+    });
+    store.handleTimelineEvent({
+      eventId: 'ev-tool',
+      sessionId: 'deck_aip_brain',
+      ts: 5_002,
+      seq: 2,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'tool.call',
+      payload: { toolCallId: 'tool-watch-stop', tool: 'Read' },
+    });
+    store.handleTimelineEvent({
+      eventId: 'ev-stopping',
+      sessionId: 'deck_aip_brain',
+      ts: 5_003,
+      seq: 3,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'session.state',
+      payload: { state: 'stopping', reason: 'user_cancel' },
+    });
+    store.handleTimelineEvent({
+      eventId: 'ev-idle',
+      sessionId: 'deck_aip_brain',
+      ts: 5_004,
+      seq: 4,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'session.state',
+      payload: {
+        state: 'idle',
+        pendingCount: 0,
+        queueSnapshot: { source: 'command_handler_cancel_idle' },
+      },
+    });
+
+    const row = store.getSnapshot().sessions.find((s) => s.sessionName === 'deck_aip_brain');
+    expect(row?.state).toBe('idle');
+  });
 });
