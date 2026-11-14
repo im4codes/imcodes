@@ -175,6 +175,8 @@ interface Props {
   onViewDiscussion?: (fileId: string) => void;
   onViewRepo?: () => void;
   onViewCron?: () => void;
+  /** Number of cron jobs inside Cron Manager for the active scope (rendered as a corner badge on ⏰). */
+  cronJobCount?: number;
   openSpecAutoProjection?: OpenSpecAutoDeliverProjection | null;
   openSpecAutoStopPending?: boolean;
   openSpecAutoCompact?: boolean;
@@ -841,7 +843,7 @@ function DaemonStatsModal({
   );
 }
 
-export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, desktopLayout: requestedDesktopLayout, onDesktopLayoutChange, desktopDockSide = SUBSESSION_DESKTOP_DOCK_SIDE.LEFT, onDesktopDockSideChange, verticalRailHost, teamDiscussionLayout = TEAM_DISCUSSION_LAYOUT.BOTTOM, onTeamDiscussionLayoutChange, teamDiscussionRailHost, idleFlashTokens, sharedSubSessionStates, onOpen, onFocus, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onRenameSubSession, pinnedSubSessionIds, onToggleSubSessionPin, onNew, onViewAutoDeliver, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, openSpecAutoProjection, openSpecAutoStopPending = false, openSpecAutoCompact = false, onOpenSpecAutoView, onOpenSpecAutoStop, onOpenSpecAutoToggleCompact, onOpenSpecAutoHide, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, quickClosePersistenceScope, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved, daemonBadgeState }: Props) {
+export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, desktopLayout: requestedDesktopLayout, onDesktopLayoutChange, desktopDockSide = SUBSESSION_DESKTOP_DOCK_SIDE.LEFT, onDesktopDockSideChange, verticalRailHost, teamDiscussionLayout = TEAM_DISCUSSION_LAYOUT.BOTTOM, onTeamDiscussionLayoutChange, teamDiscussionRailHost, idleFlashTokens, sharedSubSessionStates, onOpen, onFocus, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onRenameSubSession, pinnedSubSessionIds, onToggleSubSessionPin, onNew, onViewAutoDeliver, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, cronJobCount = 0, openSpecAutoProjection, openSpecAutoStopPending = false, openSpecAutoCompact = false, onOpenSpecAutoView, onOpenSpecAutoStop, onOpenSpecAutoToggleCompact, onOpenSpecAutoHide, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, quickClosePersistenceScope, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved, daemonBadgeState }: Props) {
   recordPerfRender('SubSessionBar');
   const { t } = useTranslation();
   const isMobile = !desktopLayoutCapable;
@@ -1582,6 +1584,15 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   const autoDeliverButtonLabel = t('subsessionBar.auto_deliver');
   const repoButtonLabel = t('repo.info_title', { defaultValue: t('subsessionBar.repository') });
   const cronButtonLabel = t('subsessionBar.scheduled_tasks');
+  const safeCronJobCount = typeof cronJobCount === 'number' && Number.isFinite(cronJobCount) && cronJobCount > 0
+    ? Math.floor(cronJobCount)
+    : 0;
+  const cronButtonTitle = safeCronJobCount > 0
+    ? t('subsessionBar.scheduled_tasks_with_count', {
+        count: safeCronJobCount,
+        defaultValue: `${cronButtonLabel} (${safeCronJobCount})`,
+      })
+    : cronButtonLabel;
 
   const renderQuickSubWindowControl = () => showQuickSubWindowControl ? (
     <button
@@ -2077,13 +2088,42 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
           <button
             class={`subcard-toolbar-btn${desktopLayoutCapable ? ' subcard-toolbar-btn-labeled' : ''}`}
             data-onboarding="cron-manager"
+            data-cron-count={safeCronJobCount}
             onClick={onViewCron}
-            title={cronButtonLabel}
-            aria-label={cronButtonLabel}
-            style={{ marginLeft: 4, fontSize: 11 }}
+            title={cronButtonTitle}
+            aria-label={cronButtonTitle}
+            style={{ position: 'relative', overflow: 'visible', marginLeft: 4, fontSize: 11 }}
           >
             <span aria-hidden="true">⏰</span>
             {desktopLayoutCapable && <span class="subcard-toolbar-btn-label">{cronButtonLabel}</span>}
+            {safeCronJobCount > 0 && (
+              <span
+                data-testid="cron-jobs-count-badge"
+                aria-label={t('subsessionBar.scheduled_tasks_count_aria', {
+                  count: safeCronJobCount,
+                  defaultValue: '{{count}} scheduled tasks',
+                })}
+                style={{
+                  position: 'absolute',
+                  top: -4,
+                  right: -4,
+                  minWidth: 14,
+                  height: 14,
+                  padding: '0 3px',
+                  borderRadius: 7,
+                  background: '#3b82f6',
+                  color: '#fff',
+                  fontSize: 9,
+                  fontWeight: 700,
+                  lineHeight: '14px',
+                  textAlign: 'center',
+                  pointerEvents: 'none',
+                  boxSizing: 'border-box',
+                }}
+              >
+                {safeCronJobCount > 99 ? '99+' : safeCronJobCount}
+              </span>
+            )}
           </button>
         )}
       </div>

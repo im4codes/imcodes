@@ -214,6 +214,7 @@ import { Sidebar, loadSidebarCollapsed, saveSidebarCollapsed } from './component
 import { SessionTree } from './components/SessionTree.js';
 import { P2pRingProgress } from './components/P2pRingProgress.js';
 import { useUnreadCounts } from './hooks/useUnreadCounts.js';
+import { useCronJobCount } from './hooks/useCronJobCount.js';
 import { SidebarPinnedPanel } from './components/SidebarPinnedPanel.js';
 import {
   DEFAULT_SUBSESSION_ACCENT_COLOR,
@@ -8087,6 +8088,21 @@ function InternalMainApp() {
       executionCloneKind: session.executionCloneKind,
       parentRunId: session.parentRunId,
     })), [detectedModels, subSessions, subUsages]);
+  const cronProject = useMemo(() => {
+    const activeSub = subSessionsSlim.find((s) => s.sessionName === activeSession);
+    const activeMain = sessions.find((s) => s.name === activeSession);
+    const parentMain = activeSub ? sessions.find((s) => s.name === activeSub.parentSession) : null;
+    return activeMain?.project ?? parentMain?.project ?? sessions[0]?.project ?? null;
+  }, [activeSession, sessions, subSessionsSlim]);
+  const cronJobCount = useCronJobCount({
+    enabled: Boolean(nativeReady && auth && selectedServerId),
+    serverId: selectedServerId,
+    projectName: cronProject,
+    ws: wsRef.current,
+    connected,
+    sharedSessionName: canonicalSharedSessionName,
+    sharedScope: Boolean(selectedShareTarget),
+  });
   const visibleOpenWindowIdsRef = useRef(visibleOpenWindowIds);
   visibleOpenWindowIdsRef.current = visibleOpenWindowIds;
 
@@ -9397,6 +9413,7 @@ function InternalMainApp() {
                 quickClosePersistenceScope={activeRootSession ?? activeSession ?? undefined}
                 onViewRepo={() => openRepoPage()}
                 onViewCron={() => runVersionSensitiveAction(trans('cron.title'), () => setShowCronManager(true))}
+                cronJobCount={cronJobCount}
                 subUsages={subUsages}
                 detectedModels={detectedModels}
                 focusedSubId={focusedSubId}
@@ -9795,12 +9812,7 @@ function InternalMainApp() {
         </div>
       )}
 
-      {showCronManager && selectedServerId && (() => {
-        const activeSub = subSessionsSlim.find((s) => s.sessionName === activeSession);
-        const activeMain = sessions.find((s) => s.name === activeSession);
-        const parentMain = activeSub ? sessions.find((s) => s.name === activeSub.parentSession) : null;
-        const cronProject = activeMain?.project ?? parentMain?.project ?? sessions[0]?.project ?? null;
-        return cronProject ? (
+      {showCronManager && selectedServerId && cronProject && (
           <FloatingPanel
             id="cron"
             title={trans('cron.title')}
@@ -9833,8 +9845,7 @@ function InternalMainApp() {
               ws={wsRef.current}
             />
           </FloatingPanel>
-        ) : null;
-      })()}
+      )}
 
       {showSharedContextManagement && (
         <FloatingPanel

@@ -270,6 +270,62 @@ describe('SubSessionBar mobile footer status real Chromium layout & base/head he
       expect(await page.locator('[data-testid="mobile-subsession-footer-status"]').count()).toBe(0);
       const desktopCardH = await page.locator('.subcard').first().evaluate((el) => el.getBoundingClientRect().height);
       expect(desktopCardH).toBe(250);
+
+      // Cron corner badge geometry & zero button/toolbar height impact across desktop and mobile
+      for (const scenario of [
+        { name: 'desktop', desktopLayoutCapable: true, collapsed: false, subs: subSessions },
+        { name: 'mobile_collapsed', desktopLayoutCapable: false, collapsed: true, subs: subSessions },
+        { name: 'mobile_inline_footer', desktopLayoutCapable: false, collapsed: true, subs: [] },
+      ]) {
+        const heights: Record<number, { btnH: number; toolbarH: number; barH: number }> = {};
+        for (const cronJobCount of [0, 3, 120]) {
+          await page.evaluate(async (p) => {
+            const w = window as unknown as { __mountBar: (props: Record<string, unknown>) => Promise<void> };
+            await w.__mountBar(p as Record<string, unknown>);
+          }, {
+            subSessions: scenario.subs,
+            collapsed: scenario.collapsed,
+            desktopLayoutCapable: scenario.desktopLayoutCapable,
+            daemonBadgeState: 'online',
+            cronJobCount,
+          });
+          const measure = await page.evaluate(() => {
+            const btn = document.querySelector('[data-onboarding="cron-manager"]') as HTMLButtonElement;
+            const toolbar = document.querySelector('.subcard-toolbar') as HTMLElement;
+            const bar = document.querySelector('.subcard-bar') as HTMLElement;
+            const badge = document.querySelector('[data-testid="cron-jobs-count-badge"]') as HTMLElement | null;
+            const btnRect = btn.getBoundingClientRect();
+            const badgeRect = badge?.getBoundingClientRect() ?? null;
+            return {
+              btnH: btnRect.height,
+              toolbarH: toolbar.getBoundingClientRect().height,
+              barH: bar.getBoundingClientRect().height,
+              btnPos: getComputedStyle(btn).position,
+              btnOverflow: getComputedStyle(btn).overflow,
+              badgeText: badge?.textContent ?? null,
+              badgeWidth: badgeRect?.width ?? 0,
+              badgeHeight: badgeRect?.height ?? 0,
+              badgeTopDelta: badgeRect ? badgeRect.top - btnRect.top : null,
+              badgeRightDelta: badgeRect ? badgeRect.right - btnRect.right : null,
+            };
+          });
+          heights[cronJobCount] = { btnH: measure.btnH, toolbarH: measure.toolbarH, barH: measure.barH };
+          if (cronJobCount === 0) {
+            expect(measure.badgeText).toBeNull();
+          } else {
+            expect(measure.btnPos).toBe('relative');
+            expect(measure.btnOverflow).toBe('visible');
+            expect(measure.badgeText).toBe(cronJobCount === 120 ? '99+' : String(cronJobCount));
+            expect(measure.badgeWidth).toBeGreaterThanOrEqual(14);
+            expect(measure.badgeHeight).toBe(14);
+            expect(measure.badgeTopDelta, `${scenario.name} cron=${cronJobCount} top offset`).toBeLessThan(0);
+            expect(measure.badgeRightDelta, `${scenario.name} cron=${cronJobCount} right offset`).toBeGreaterThan(0);
+            expect(measure.btnH, `${scenario.name} cron=${cronJobCount} btn height unchanged`).toBeCloseTo(heights[0].btnH, 2);
+            expect(measure.toolbarH, `${scenario.name} cron=${cronJobCount} toolbar height unchanged`).toBeCloseTo(heights[0].toolbarH, 2);
+            expect(measure.barH, `${scenario.name} cron=${cronJobCount} bar height unchanged`).toBeCloseTo(heights[0].barH, 2);
+          }
+        }
+      }
     } finally {
       await browser.close();
     }

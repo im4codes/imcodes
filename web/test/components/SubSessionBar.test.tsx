@@ -1904,6 +1904,58 @@ describe('SubSessionBar', () => {
     });
   });
 
+  describe('cronJobCount corner superscript badge on Cron button', () => {
+    const renderBarWithCron = (cronJobCount?: number, desktopLayoutCapable = true) => render(
+      <SubSessionBar
+        subSessions={[]}
+        openIds={new Set()}
+        desktopLayoutCapable={desktopLayoutCapable}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        onViewCron={vi.fn()}
+        cronJobCount={cronJobCount}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    it('hides the corner badge when cronJobCount is omitted, 0, or invalid', () => {
+      for (const value of [undefined, 0, -2, Number.NaN]) {
+        const view = renderBarWithCron(value);
+        expect(view.container.querySelector('[data-testid="cron-jobs-count-badge"]')).toBeNull();
+        const btn = view.container.querySelector('[data-onboarding="cron-manager"]') as HTMLButtonElement;
+        expect(btn.getAttribute('data-cron-count')).toBe('0');
+        expect(btn.getAttribute('title')).toBe('Scheduled Tasks');
+        view.unmount();
+      }
+    });
+
+    it('renders 1, 3, 99, and caps 100+ at 99+ on top-right corner with zero layout height impact', () => {
+      for (const [count, expectedText] of [[1, '1'], [3, '3'], [99, '99'], [100, '99+'], [120, '99+']] as const) {
+        for (const desktopLayoutCapable of [true, false]) {
+          const view = renderBarWithCron(count, desktopLayoutCapable);
+          const btn = view.container.querySelector('[data-onboarding="cron-manager"]') as HTMLButtonElement;
+          const badge = view.container.querySelector('[data-testid="cron-jobs-count-badge"]') as HTMLElement | null;
+          expect(badge).not.toBeNull();
+          expect(badge?.textContent).toBe(expectedText);
+          expect(btn.getAttribute('data-cron-count')).toBe(String(count));
+          expect(btn.style.position).toBe('relative');
+          expect(btn.style.overflow).toBe('visible');
+          expect(badge?.style.position).toBe('absolute');
+          expect(badge?.style.top).toBe('-4px');
+          expect(badge?.style.right).toBe('-4px');
+          expect(badge?.style.height).toBe('14px');
+          expect(badge?.style.pointerEvents).toBe('none');
+          view.unmount();
+        }
+      }
+    });
+  });
+
   // The health record already travelled daemon -> bridge -> browser; these cover the
   // last hop, where it either becomes something an operator sees or dies silently.
   const failingHealth = {

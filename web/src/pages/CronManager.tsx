@@ -17,6 +17,12 @@ import { getAgentBadgeLabel } from '../agent-display.js';
 import { FloatingPanel } from '../components/FloatingPanel.js';
 import { ChatMarkdown } from '../components/ChatMarkdown.js';
 import { useResourceEvent } from '../hooks/useResourceEvent.js';
+import {
+  CRON_SCOPE_CHANGE_EVENT,
+  CRON_SHOW_ALL_STORAGE_KEY,
+  buildCronListUrl,
+  readCronShowAllPref,
+} from '../hooks/useCronJobCount.js';
 import { RESOURCE_TOPICS } from '@shared/resource-events.js';
 import type { WsClient } from '../ws-client.js';
 
@@ -241,7 +247,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
   const [jobs, setJobs] = useState<CronJob[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [showAllServers, setShowAllServers] = useState(() => localStorage.getItem('rcc_cron_show_all') === '1');
+  const [showAllServers, setShowAllServers] = useState(readCronShowAllPref);
   // Sub-panel state: 'form' for create/edit, 'history:jobId' for execution log
   const [subPanel, setSubPanel] = useState<string | null>(null);
   const [editingJob, setEditingJob] = useState<CronJob | null>(null);
@@ -271,16 +277,29 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
   }, [onNavigateSession]);
 
   const toggleShowAll = () => {
-    setShowAllServers(prev => { const v = !prev; localStorage.setItem('rcc_cron_show_all', v ? '1' : ''); return v; });
+    setShowAllServers((prev) => {
+      const v = !prev;
+      localStorage.setItem(CRON_SHOW_ALL_STORAGE_KEY, v ? '1' : '');
+      if (typeof window !== 'undefined') window.dispatchEvent(new Event(CRON_SCOPE_CHANGE_EVENT));
+      return v;
+    });
   };
 
   // ── Load jobs ──────────────────────────────────────────────────────────
   const loadJobs = useCallback(async (silent = false) => {
     try {
-      const q = effectiveShowAllServers || wholeServerSharedScope
-        ? (effectiveShowAllServers ? '' : `serverId=${encodeURIComponent(serverId)}`)
-        : `serverId=${encodeURIComponent(serverId)}&projectName=${encodeURIComponent(projectName)}`;
-      const res = await apiFetch<{ jobs: CronJob[] }>(scopedUrl(`/api/cron?${q}`));
+      const url = buildCronListUrl({
+        serverId,
+        projectName,
+        sharedSessionName,
+        sharedScope,
+        showAllServers,
+      }) ?? scopedUrl(
+        effectiveShowAllServers || wholeServerSharedScope
+          ? (effectiveShowAllServers ? '/api/cron?' : `/api/cron?serverId=${encodeURIComponent(serverId)}`)
+          : `/api/cron?serverId=${encodeURIComponent(serverId)}&projectName=${encodeURIComponent(projectName)}`,
+      );
+      const res = await apiFetch<{ jobs: CronJob[] }>(url);
       setJobs(res.jobs);
       setError(null);
     } catch (err) {
