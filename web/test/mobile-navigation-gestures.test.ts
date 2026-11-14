@@ -681,4 +681,247 @@ describe('mobile-navigation-gestures', () => {
 
     detach();
   });
+
+  it('recovers across 2nd and 3rd consecutive swipes when remaining finger touchend is dropped or its target unmounts', () => {
+    const actions: string[] = [];
+    const progressLog: Array<MobileNavigationGestureProgress | null> = [];
+    let currentPane = document.createElement('div');
+    currentPane.className = 'session-pane';
+    document.body.appendChild(currentPane);
+    let unmountOnAction = true;
+
+    const detach = attachMobileNavigationGestures({
+      isMobile: true,
+      onAction: (action) => {
+        actions.push(action);
+        if (unmountOnAction) {
+          // Simulate tab/server switch unmounting the pane where the remaining finger rested.
+          currentPane.remove();
+          currentPane = document.createElement('div');
+          currentPane.className = 'session-pane';
+          document.body.appendChild(currentPane);
+        }
+      },
+      onProgress: (progress) => progressLog.push(progress),
+    });
+
+    // Gesture 1: sequential lift leaves finger 2 on old pane whose DOM unmounts (finger 2 touchend lost).
+    const firstPane = currentPane;
+    dispatchTouch(
+      firstPane,
+      'touchstart',
+      [
+        { identifier: 1, clientX: 250, clientY: 300, target: firstPane },
+        { identifier: 2, clientX: 255, clientY: 350, target: firstPane },
+      ],
+      [
+        { identifier: 1, clientX: 250, clientY: 300, target: firstPane },
+        { identifier: 2, clientX: 255, clientY: 350, target: firstPane },
+      ],
+    );
+    dispatchTouch(
+      firstPane,
+      'touchend',
+      [{ identifier: 2, clientX: 170, clientY: 350, target: firstPane }],
+      [{ identifier: 1, clientX: 165, clientY: 300, target: firstPane }],
+    );
+    expect(actions).toEqual(['tabPrev']);
+    expect(firstPane.isConnected).toBe(false);
+
+    // Gesture 2: simultaneous 2-finger touchdown reusing the exact same IDs [1, 2] on the new pane.
+    const secondPane = currentPane;
+    dispatchTouch(
+      secondPane,
+      'touchstart',
+      [
+        { identifier: 1, clientX: 100, clientY: 300, target: secondPane },
+        { identifier: 2, clientX: 105, clientY: 350, target: secondPane },
+      ],
+      [
+        { identifier: 1, clientX: 100, clientY: 300, target: secondPane },
+        { identifier: 2, clientX: 105, clientY: 350, target: secondPane },
+      ],
+    );
+    expect(progressLog.at(-1)?.progress).toBe(0);
+    dispatchTouch(secondPane, 'touchmove', [
+      { identifier: 1, clientX: 180, clientY: 300, target: secondPane },
+      { identifier: 2, clientX: 185, clientY: 350, target: secondPane },
+    ]);
+    expect(progressLog.at(-1)?.armed).toBe(true);
+    dispatchTouch(
+      secondPane,
+      'touchend',
+      [{ identifier: 2, clientX: 185, clientY: 350, target: secondPane }],
+      [{ identifier: 1, clientX: 180, clientY: 300, target: secondPane }],
+    );
+    expect(actions).toEqual(['tabPrev', 'tabNext']);
+
+    // Gesture 3: staggered 1 -> 2 touchdown (with remaining touch dropped on unmounted secondPane) also recovers.
+    const thirdPane = currentPane;
+    dispatchTouch(
+      thirdPane,
+      'touchstart',
+      [{ identifier: 1, clientX: 150, clientY: 320, target: thirdPane }],
+      [{ identifier: 1, clientX: 150, clientY: 320, target: thirdPane }],
+    );
+    dispatchTouch(
+      thirdPane,
+      'touchstart',
+      [
+        { identifier: 1, clientX: 150, clientY: 320, target: thirdPane },
+        { identifier: 2, clientX: 200, clientY: 322, target: thirdPane },
+      ],
+      [{ identifier: 2, clientX: 200, clientY: 322, target: thirdPane }],
+    );
+    dispatchTouch(thirdPane, 'touchmove', [
+      { identifier: 1, clientX: 150, clientY: 240, target: thirdPane },
+      { identifier: 2, clientX: 200, clientY: 242, target: thirdPane },
+    ]);
+    dispatchTouch(thirdPane, 'touchend', []);
+    expect(actions).toEqual(['tabPrev', 'tabNext', 'serverPrev']);
+
+    // Connected DOM + dropped touchend: simultaneous 2-finger landing (changedTouches.length === 2) still recovers.
+    unmountOnAction = false;
+    const stayPane = currentPane;
+    dispatchTouch(
+      stayPane,
+      'touchstart',
+      [
+        { identifier: 0, clientX: 150, clientY: 200, target: stayPane },
+        { identifier: 1, clientX: 200, clientY: 200, target: stayPane },
+      ],
+      [
+        { identifier: 0, clientX: 150, clientY: 200, target: stayPane },
+        { identifier: 1, clientX: 200, clientY: 200, target: stayPane },
+      ],
+    );
+    dispatchTouch(
+      stayPane,
+      'touchend',
+      [{ identifier: 1, clientX: 200, clientY: 280, target: stayPane }],
+      [{ identifier: 0, clientX: 150, clientY: 280, target: stayPane }],
+    );
+    expect(actions).toEqual(['tabPrev', 'tabNext', 'serverPrev', 'serverNext']);
+
+    // Next simultaneous gesture on the SAME connected element without prior finger-1 touchend still works:
+    dispatchTouch(
+      stayPane,
+      'touchstart',
+      [
+        { identifier: 0, clientX: 250, clientY: 300, target: stayPane },
+        { identifier: 1, clientX: 255, clientY: 350, target: stayPane },
+      ],
+      [
+        { identifier: 0, clientX: 250, clientY: 300, target: stayPane },
+        { identifier: 1, clientX: 255, clientY: 350, target: stayPane },
+      ],
+    );
+    dispatchTouch(stayPane, 'touchmove', [
+      { identifier: 0, clientX: 170, clientY: 300, target: stayPane },
+      { identifier: 1, clientX: 175, clientY: 350, target: stayPane },
+    ]);
+    dispatchTouch(stayPane, 'touchend', []);
+    expect(actions).toEqual(['tabPrev', 'tabNext', 'serverPrev', 'serverNext', 'tabPrev']);
+
+    detach();
+  });
+
+  it('preserves single-trigger latch when remaining finger stays connected, and heals on blur or visibilitychange', () => {
+    const actions: string[] = [];
+    const progressLog: Array<MobileNavigationGestureProgress | null> = [];
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+
+    const detach = attachMobileNavigationGestures({
+      isMobile: true,
+      onAction: (action) => actions.push(action),
+      onProgress: (progress) => progressLog.push(progress),
+    });
+
+    // Finger 2 remains genuinely held down on connected host; finger 1 taps back down (changedTouches.length === 1).
+    dispatchTouch(
+      host,
+      'touchstart',
+      [
+        { identifier: 1, clientX: 100, clientY: 200, target: host },
+        { identifier: 2, clientX: 150, clientY: 200, target: host },
+      ],
+      [
+        { identifier: 1, clientX: 100, clientY: 200, target: host },
+        { identifier: 2, clientX: 150, clientY: 200, target: host },
+      ],
+    );
+    dispatchTouch(
+      host,
+      'touchend',
+      [{ identifier: 2, clientX: 150, clientY: 280, target: host }],
+      [{ identifier: 1, clientX: 100, clientY: 280, target: host }],
+    );
+    expect(actions).toEqual(['serverNext']);
+
+    // Adding finger 1 back while finger 2 stayed down must NOT re-trigger or start tracking.
+    dispatchTouch(
+      host,
+      'touchstart',
+      [
+        { identifier: 1, clientX: 100, clientY: 200, target: host },
+        { identifier: 2, clientX: 150, clientY: 280, target: host },
+      ],
+      [{ identifier: 1, clientX: 100, clientY: 200, target: host }],
+    );
+    dispatchTouch(host, 'touchmove', [
+      { identifier: 1, clientX: 200, clientY: 200, target: host },
+      { identifier: 2, clientX: 250, clientY: 280, target: host },
+    ]);
+    dispatchTouch(host, 'touchend', [{ identifier: 2, clientX: 250, clientY: 280, target: host }], [{ identifier: 1, clientX: 200, clientY: 200, target: host }]);
+    expect(actions).toEqual(['serverNext']);
+
+    // Simulate window blur clearing stuck remaining-finger latch.
+    window.dispatchEvent(new Event('blur'));
+    dispatchTouch(
+      host,
+      'touchstart',
+      [
+        { identifier: 1, clientX: 100, clientY: 200, target: host },
+        { identifier: 2, clientX: 150, clientY: 200, target: host },
+      ],
+      [{ identifier: 1, clientX: 100, clientY: 200, target: host }],
+    );
+    dispatchTouch(host, 'touchmove', [
+      { identifier: 1, clientX: 180, clientY: 200, target: host },
+      { identifier: 2, clientX: 230, clientY: 200, target: host },
+    ]);
+    dispatchTouch(
+      host,
+      'touchend',
+      [{ identifier: 2, clientX: 230, clientY: 200, target: host }],
+      [{ identifier: 1, clientX: 180, clientY: 200, target: host }],
+    );
+    expect(actions).toEqual(['serverNext', 'tabNext']);
+
+    // Simulate visibilitychange -> hidden clearing stuck latch, then visible.
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+    document.dispatchEvent(new Event('visibilitychange'));
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+    document.dispatchEvent(new Event('visibilitychange'));
+
+    dispatchTouch(
+      host,
+      'touchstart',
+      [
+        { identifier: 1, clientX: 100, clientY: 300, target: host },
+        { identifier: 2, clientX: 150, clientY: 300, target: host },
+      ],
+      [{ identifier: 1, clientX: 100, clientY: 300, target: host }],
+    );
+    dispatchTouch(host, 'touchmove', [
+      { identifier: 1, clientX: 100, clientY: 220, target: host },
+      { identifier: 2, clientX: 150, clientY: 220, target: host },
+    ]);
+    expect(progressLog.at(-1)?.armed).toBe(true);
+    dispatchTouch(host, 'touchend', []);
+    expect(actions).toEqual(['serverNext', 'tabNext', 'serverPrev']);
+
+    detach();
+  });
 });

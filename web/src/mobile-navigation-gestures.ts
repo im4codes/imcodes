@@ -218,6 +218,7 @@ export class TwoFingerSwipeTracker {
   private phase: TrackerPhase = 'idle';
   private startPoints = new Map<number, { x: number; y: number }>();
   private lastPoints = new Map<number, { x: number; y: number }>();
+  private lockedTouches = new Map<number, EventTarget | null>();
   private hudVisible = false;
   private readonly canTrack: (target: EventTarget | null | undefined) => boolean;
   private readonly onProgress?: (progress: MobileNavigationGestureProgress | null) => void;
@@ -259,6 +260,54 @@ export class TwoFingerSwipeTracker {
   private clearTrackedPoints(): void {
     this.startPoints.clear();
     this.lastPoints.clear();
+  }
+
+  private snapshotLockedTouches(event: TouchEventLike): void {
+    this.lockedTouches.clear();
+    for (let i = 0; i < event.touches.length; i++) {
+      const point = event.touches[i];
+      if (!point) continue;
+      this.lockedTouches.set(point.identifier, point.target ?? event.target ?? null);
+    }
+  }
+
+  private hasDisconnectedLockedTarget(): boolean {
+    for (const target of this.lockedTouches.values()) {
+      if (
+        target
+        && typeof (target as Node).isConnected === 'boolean'
+        && !(target as Node).isConnected
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private shouldRecoverStaleLockOnTwoFingerStart(event: TouchEventLike): boolean {
+    if (event.changedTouches && event.changedTouches.length >= 2) {
+      return true;
+    }
+    if (this.hasDisconnectedLockedTarget()) {
+      return true;
+    }
+    if (this.lockedTouches.size > 0) {
+      for (let i = 0; i < event.touches.length; i++) {
+        const point = event.touches[i];
+        if (point && this.lockedTouches.has(point.identifier)) {
+          return false;
+        }
+      }
+      return true;
+    }
+    return false;
+  }
+
+  private enterStopPhase(phase: 'triggered' | 'locked_out', event: TouchEventLike): void {
+    this.phase = phase;
+    this.clearTrackedPoints();
+    this.snapshotLockedTouches(event);
+    this.emitProgress(null);
   }
 
   private updateTrackedPositions(touches?: ArrayLike<TouchPointSnapshot>): void {
@@ -339,15 +388,14 @@ export class TwoFingerSwipeTracker {
   reset(): void {
     this.phase = 'idle';
     this.clearTrackedPoints();
+    this.lockedTouches.clear();
     this.emitProgress(null);
   }
 
   onTouchStart(event: TouchEventLike): void {
     const count = event.touches.length;
     if (count > 2) {
-      this.phase = 'locked_out';
-      this.clearTrackedPoints();
-      this.emitProgress(null);
+      this.enterStopPhase('locked_out', event);
       return;
     }
     if (count === 1) {
@@ -355,34 +403,34 @@ export class TwoFingerSwipeTracker {
         this.reset();
       }
       if (!this.canTrackEvent(event)) {
-        this.phase = 'locked_out';
+        this.enterStopPhase('locked_out', event);
       }
       return;
     }
     if (count === 2) {
       if (this.phase !== 'idle') {
         if (this.phase === 'tracking') {
-          this.phase = 'locked_out';
-          this.clearTrackedPoints();
-          this.emitProgress(null);
+          this.enterStopPhase('locked_out', event);
+          return;
         }
-        return;
+        if (!this.shouldRecoverStaleLockOnTwoFingerStart(event)) {
+          this.snapshotLockedTouches(event);
+          return;
+        }
+        this.reset();
       }
       if (!this.canTrackEvent(event)) {
-        this.phase = 'locked_out';
-        this.clearTrackedPoints();
-        this.emitProgress(null);
+        this.enterStopPhase('locked_out', event);
         return;
       }
       const first = event.touches[0];
       const second = event.touches[1];
       if (!first || !second || first.identifier === second.identifier) {
-        this.phase = 'locked_out';
-        this.clearTrackedPoints();
-        this.emitProgress(null);
+        this.enterStopPhase('locked_out', event);
         return;
       }
       this.clearTrackedPoints();
+      this.lockedTouches.clear();
       this.startPoints.set(first.identifier, { x: first.clientX, y: first.clientY });
       this.startPoints.set(second.identifier, { x: second.clientX, y: second.clientY });
       this.lastPoints.set(first.identifier, { x: first.clientX, y: first.clientY });
@@ -409,31 +457,27 @@ export class TwoFingerSwipeTracker {
     }
     if (this.phase !== 'tracking') {
       if (count > 2 && this.phase === 'idle') {
-        this.phase = 'locked_out';
+        this.enterStopPhase('locked_out', event);
+      } else if (this.hasDisconnectedLockedTarget()) {
+        this.reset();
       }
       return null;
     }
     if (count !== 2 || !this.canTrackEvent(event)) {
-      this.phase = 'locked_out';
-      this.clearTrackedPoints();
-      this.emitProgress(null);
+      this.enterStopPhase('locked_out', event);
       return null;
     }
     const first = event.touches[0];
     const second = event.touches[1];
     if (!first || !second || !this.startPoints.has(first.identifier) || !this.startPoints.has(second.identifier)) {
-      this.phase = 'locked_out';
-      this.clearTrackedPoints();
-      this.emitProgress(null);
+      this.enterStopPhase('locked_out', event);
       return null;
     }
 
     this.updateTrackedPositions(event.touches);
     const evaluation = this.evaluateTrackedState();
     if (evaluation.opposing) {
-      this.phase = 'locked_out';
-      this.clearTrackedPoints();
-      this.emitProgress(null);
+      this.enterStopPhase('locked_out', event);
       return null;
     }
 
@@ -447,7 +491,9 @@ export class TwoFingerSwipeTracker {
       if (remainingCount === 0) {
         this.reset();
       } else if (this.phase === 'idle' && remainingCount > 2) {
-        this.phase = 'locked_out';
+        this.enterStopPhase('locked_out', event);
+      } else {
+        this.snapshotLockedTouches(event);
       }
       return null;
     }
@@ -456,9 +502,7 @@ export class TwoFingerSwipeTracker {
       if (remainingCount === 0) {
         this.reset();
       } else {
-        this.phase = 'locked_out';
-        this.clearTrackedPoints();
-        this.emitProgress(null);
+        this.enterStopPhase('locked_out', event);
       }
       return null;
     }
@@ -471,9 +515,7 @@ export class TwoFingerSwipeTracker {
       if (remainingCount === 0) {
         this.reset();
       } else {
-        this.phase = 'triggered';
-        this.clearTrackedPoints();
-        this.emitProgress(null);
+        this.enterStopPhase('triggered', event);
       }
       return evaluation.action;
     }
@@ -481,9 +523,7 @@ export class TwoFingerSwipeTracker {
     if (remainingCount === 0) {
       this.reset();
     } else {
-      this.phase = 'locked_out';
-      this.clearTrackedPoints();
-      this.emitProgress(null);
+      this.enterStopPhase('locked_out', event);
     }
     return null;
   }
@@ -507,11 +547,12 @@ export function attachMobileNavigationGestures(options: AttachMobileNavigationGe
   const win = options.windowTarget ?? (typeof window !== 'undefined' ? window : undefined);
   if (!win) return () => {};
 
+  const doc = options.document ?? win.document;
   const tracker = new TwoFingerSwipeTracker({
     canTrack: (target) => canHandleMobileNavigationGesture(target, {
       isMobile: options.isMobile,
       hasBlockingOverlay: options.isBlocked?.() ?? false,
-      document: options.document ?? win.document,
+      document: doc,
     }),
     onProgress: options.onProgress,
   });
@@ -526,12 +567,22 @@ export function attachMobileNavigationGestures(options: AttachMobileNavigationGe
     if (action) options.onAction(action);
   };
   const handleTouchCancel = () => tracker.onTouchCancel();
+  const handleWindowBlur = () => tracker.reset();
+  const handleVisibilityChange = () => {
+    if (doc && doc.visibilityState !== 'visible') {
+      tracker.reset();
+    }
+  };
 
   const listenerOpts: AddEventListenerOptions = { passive: true, capture: true };
   win.addEventListener('touchstart', handleTouchStart, listenerOpts);
   win.addEventListener('touchmove', handleTouchMove, listenerOpts);
   win.addEventListener('touchend', handleTouchEnd, listenerOpts);
   win.addEventListener('touchcancel', handleTouchCancel, listenerOpts);
+  win.addEventListener('blur', handleWindowBlur);
+  if (doc && typeof doc.addEventListener === 'function') {
+    doc.addEventListener('visibilitychange', handleVisibilityChange);
+  }
 
   return () => {
     tracker.reset();
@@ -539,5 +590,9 @@ export function attachMobileNavigationGestures(options: AttachMobileNavigationGe
     win.removeEventListener('touchmove', handleTouchMove, listenerOpts);
     win.removeEventListener('touchend', handleTouchEnd, listenerOpts);
     win.removeEventListener('touchcancel', handleTouchCancel, listenerOpts);
+    win.removeEventListener('blur', handleWindowBlur);
+    if (doc && typeof doc.removeEventListener === 'function') {
+      doc.removeEventListener('visibilitychange', handleVisibilityChange);
+    }
   };
 }
