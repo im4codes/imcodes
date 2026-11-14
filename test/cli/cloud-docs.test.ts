@@ -966,5 +966,12 @@ describe('imcodes cloud-docs CLI', () => {
     const editGuide = await runCloudDocsCli(['docs', '--topic', 'edit'], { env: {} });
     expect(editGuide.exitCode).toBe(0);
     expect(editGuide.stdout).toContain('--no-save and --out require an existing <docId>');
+    expect(editGuide.stdout).toContain('builder.OpenFile("{{INPUT_URL}}");');
+    expect(editGuide.stdout).not.toContain('builder.OpenFile(Argument.inputUrl);');
+    expect(editGuide.stdout).toContain('own standalone line');
+
+    const troubleshootingGuide = await runCloudDocsCli(['docs', '--topic', 'troubleshooting'], { env: {} });
+    expect(troubleshootingGuide.exitCode).toBe(0);
+    expect(troubleshootingGuide.stdout).toContain('ONLYOFFICE DocBuilder document generation error (-3)');
   });
 });

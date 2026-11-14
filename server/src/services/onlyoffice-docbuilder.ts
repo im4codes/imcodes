@@ -464,6 +464,386 @@ export function selectDocBuilderOutputCandidate<T extends { name: string }>(
   return candidates[0]!;
 }
 
+export interface PrepareOnlyOfficeDocBuilderScriptOptions {
+  inputUrl?: string;
+}
+
+const INPUT_URL_PLACEHOLDER = '{{INPUT_URL}}';
+const INPUT_URL_ARG_RE =
+  /^(?:Argument\s*\.\s*(?:inputUrl|_imcodesInputUrl)|Argument\s*\[\s*(?:'inputUrl'|"inputUrl")\s*\])$/;
+
+function isIdentifierChar(ch: string | undefined): boolean {
+  return ch !== undefined && /[A-Za-z0-9_$]/.test(ch);
+}
+
+function escapeJsStringBody(value: string, quote: '"' | "'" | '`'): string {
+  let out = '';
+  for (let i = 0; i < value.length; i += 1) {
+    const ch = value[i]!;
+    switch (ch) {
+      case '\\':
+        out += '\\\\';
+        break;
+      case '\r':
+        out += '\\r';
+        break;
+      case '\n':
+        out += '\\n';
+        break;
+      case '\t':
+        out += '\\t';
+        break;
+      case '\u2028':
+        out += '\\u2028';
+        break;
+      case '\u2029':
+        out += '\\u2029';
+        break;
+      case quote:
+        out += `\\${quote}`;
+        break;
+      case '$':
+        out += quote === '`' ? '\\$' : '$';
+        break;
+      default: {
+        const code = ch.charCodeAt(0);
+        if (code < 0x20 || code === 0x7f) {
+          out += `\\u${code.toString(16).padStart(4, '0')}`;
+        } else {
+          out += ch;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+function scanLineComment(src: string, start: number): { text: string; nextIndex: number } {
+  let i = start + 2;
+  while (i < src.length && src[i] !== '\n' && src[i] !== '\r') {
+    i += 1;
+  }
+  return { text: src.slice(start, i), nextIndex: i };
+}
+
+function scanBlockComment(src: string, start: number): { text: string; nextIndex: number } {
+  const closeIdx = src.indexOf('*/', start + 2);
+  const nextIndex = closeIdx === -1 ? src.length : closeIdx + 2;
+  return { text: src.slice(start, nextIndex), nextIndex };
+}
+
+function scanQuotedLiteral(
+  src: string,
+  start: number,
+  inputUrl: string | undefined,
+): { text: string; nextIndex: number } {
+  const quote = src[start] as '"' | "'";
+  const replacement = inputUrl !== undefined ? escapeJsStringBody(inputUrl, quote) : null;
+  let i = start + 1;
+  let out = quote;
+
+  while (i < src.length) {
+    const ch = src[i]!;
+    if (ch === '\\') {
+      out += ch;
+      if (i + 1 < src.length) {
+        out += src[i + 1]!;
+        i += 2;
+      } else {
+        i += 1;
+      }
+      continue;
+    }
+    if (ch === quote) {
+      out += quote;
+      return { text: out, nextIndex: i + 1 };
+    }
+    if (replacement !== null && src.startsWith(INPUT_URL_PLACEHOLDER, i)) {
+      out += replacement;
+      i += INPUT_URL_PLACEHOLDER.length;
+      continue;
+    }
+    out += ch;
+    i += 1;
+  }
+
+  return { text: out, nextIndex: i };
+}
+
+function scanTemplateExpression(
+  src: string,
+  start: number,
+  inputUrl: string | undefined,
+): { text: string; nextIndex: number } {
+  let i = start;
+  let depth = 1;
+  let out = '';
+
+  while (i < src.length) {
+    const ch = src[i]!;
+    if (ch === '"' || ch === "'") {
+      const lit = scanQuotedLiteral(src, i, inputUrl);
+      out += lit.text;
+      i = lit.nextIndex;
+      continue;
+    }
+    if (ch === '`') {
+      const tpl = scanTemplateLiteral(src, i, inputUrl);
+      out += tpl.text;
+      i = tpl.nextIndex;
+      continue;
+    }
+    if (ch === '/' && src[i + 1] === '/') {
+      const comment = scanLineComment(src, i);
+      out += comment.text;
+      i = comment.nextIndex;
+      continue;
+    }
+    if (ch === '/' && src[i + 1] === '*') {
+      const comment = scanBlockComment(src, i);
+      out += comment.text;
+      i = comment.nextIndex;
+      continue;
+    }
+    out += ch;
+    i += 1;
+    if (ch === '{') {
+      depth += 1;
+    } else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        return { text: out, nextIndex: i };
+      }
+    }
+  }
+
+  return { text: out, nextIndex: i };
+}
+
+function scanTemplateLiteral(
+  src: string,
+  start: number,
+  inputUrl: string | undefined,
+): { text: string; nextIndex: number } {
+  const replacement = inputUrl !== undefined ? escapeJsStringBody(inputUrl, '`') : null;
+  let i = start + 1;
+  let out = '`';
+
+  while (i < src.length) {
+    const ch = src[i]!;
+    if (ch === '\\') {
+      out += ch;
+      if (i + 1 < src.length) {
+        out += src[i + 1]!;
+        i += 2;
+      } else {
+        i += 1;
+      }
+      continue;
+    }
+    if (ch === '`') {
+      out += '`';
+      return { text: out, nextIndex: i + 1 };
+    }
+    if (src.startsWith('${', i)) {
+      out += '${';
+      const expr = scanTemplateExpression(src, i + 2, inputUrl);
+      out += expr.text;
+      i = expr.nextIndex;
+      continue;
+    }
+    if (replacement !== null && src.startsWith(INPUT_URL_PLACEHOLDER, i)) {
+      out += replacement;
+      i += INPUT_URL_PLACEHOLDER.length;
+      continue;
+    }
+    out += ch;
+    i += 1;
+  }
+
+  return { text: out, nextIndex: i };
+}
+
+function findMatchingParen(src: string, openParenIdx: number): number {
+  let depth = 1;
+  let i = openParenIdx + 1;
+
+  while (i < src.length) {
+    const ch = src[i]!;
+    if (ch === '"' || ch === "'") {
+      i = scanQuotedLiteral(src, i, undefined).nextIndex;
+      continue;
+    }
+    if (ch === '`') {
+      i = scanTemplateLiteral(src, i, undefined).nextIndex;
+      continue;
+    }
+    if (ch === '/' && src[i + 1] === '/') {
+      i = scanLineComment(src, i).nextIndex;
+      continue;
+    }
+    if (ch === '/' && src[i + 1] === '*') {
+      i = scanBlockComment(src, i).nextIndex;
+      continue;
+    }
+    if (ch === '(') {
+      depth += 1;
+    } else if (ch === ')') {
+      depth -= 1;
+      if (depth === 0) {
+        return i;
+      }
+    }
+    i += 1;
+  }
+
+  return -1;
+}
+
+function replaceInputUrlInLiterals(src: string, inputUrl: string | undefined): string {
+  if (inputUrl === undefined || !src.includes(INPUT_URL_PLACEHOLDER)) {
+    return src;
+  }
+  let i = 0;
+  let out = '';
+  while (i < src.length) {
+    const ch = src[i]!;
+    if (ch === '"' || ch === "'") {
+      const lit = scanQuotedLiteral(src, i, inputUrl);
+      out += lit.text;
+      i = lit.nextIndex;
+      continue;
+    }
+    if (ch === '`') {
+      const tpl = scanTemplateLiteral(src, i, inputUrl);
+      out += tpl.text;
+      i = tpl.nextIndex;
+      continue;
+    }
+    if (ch === '/' && src[i + 1] === '/') {
+      const comment = scanLineComment(src, i);
+      out += comment.text;
+      i = comment.nextIndex;
+      continue;
+    }
+    if (ch === '/' && src[i + 1] === '*') {
+      const comment = scanBlockComment(src, i);
+      out += comment.text;
+      i = comment.nextIndex;
+      continue;
+    }
+    out += ch;
+    i += 1;
+  }
+  return out;
+}
+
+/**
+ * Prepare a DocBuilder JS script for ONLYOFFICE's outer C++ `.docbuilder` line parser:
+ * 1. Substitute `{{INPUT_URL}}` inside string/template literals without touching comments.
+ * 2. Rewrite `builder.OpenFile(Argument.inputUrl|_imcodesInputUrl|Argument['inputUrl']|Argument["inputUrl"])`
+ *    into a string literal `builder.OpenFile("<url>")`.
+ * 3. Ensure every `builder.(CreateFile|OpenFile|SaveFile|CloseFile)(...)` call stands on its own line.
+ */
+export function prepareOnlyOfficeDocBuilderScript(
+  script: string,
+  options: PrepareOnlyOfficeDocBuilderScriptOptions = {},
+): string {
+  const inputUrl = options.inputUrl;
+  const builderCallRe = /builder\s*\.\s*(CreateFile|OpenFile|SaveFile|CloseFile)\s*\(/y;
+  let i = 0;
+  let out = '';
+
+  while (i < script.length) {
+    const ch = script[i]!;
+    if (ch === '"' || ch === "'") {
+      const lit = scanQuotedLiteral(script, i, inputUrl);
+      out += lit.text;
+      i = lit.nextIndex;
+      continue;
+    }
+    if (ch === '`') {
+      const tpl = scanTemplateLiteral(script, i, inputUrl);
+      out += tpl.text;
+      i = tpl.nextIndex;
+      continue;
+    }
+    if (ch === '/' && script[i + 1] === '/') {
+      const comment = scanLineComment(script, i);
+      out += comment.text;
+      i = comment.nextIndex;
+      continue;
+    }
+    if (ch === '/' && script[i + 1] === '*') {
+      const comment = scanBlockComment(script, i);
+      out += comment.text;
+      i = comment.nextIndex;
+      continue;
+    }
+
+    if (
+      ch === 'b' &&
+      (i === 0 || (!isIdentifierChar(script[i - 1]) && script[i - 1] !== '.'))
+    ) {
+      builderCallRe.lastIndex = i;
+      const match = builderCallRe.exec(script);
+      if (match) {
+        const method = match[1]!;
+        const openParenIdx = builderCallRe.lastIndex - 1;
+        const closeParenIdx = findMatchingParen(script, openParenIdx);
+        if (closeParenIdx !== -1) {
+          let stmtEnd = closeParenIdx + 1;
+          let semiScan = stmtEnd;
+          while (semiScan < script.length && (script[semiScan] === ' ' || script[semiScan] === '\t')) {
+            semiScan += 1;
+          }
+          const hasSemicolon = script[semiScan] === ';';
+          if (hasSemicolon) {
+            stmtEnd = semiScan + 1;
+          }
+
+          const rawArgs = script.slice(openParenIdx + 1, closeParenIdx);
+          let callText: string;
+          if (
+            method === 'OpenFile' &&
+            inputUrl !== undefined &&
+            INPUT_URL_ARG_RE.test(rawArgs.trim())
+          ) {
+            callText = `builder.OpenFile(${JSON.stringify(inputUrl)})${hasSemicolon ? ';' : ''}`;
+          } else {
+            const processedArgs = replaceInputUrlInLiterals(rawArgs, inputUrl);
+            callText = `${script.slice(i, openParenIdx + 1)}${processedArgs}${script.slice(closeParenIdx, stmtEnd)}`;
+          }
+
+          const lastNl = out.lastIndexOf('\n');
+          const linePrefix = out.slice(lastNl + 1);
+          if (/[^\t \r]/.test(linePrefix)) {
+            out = `${out.replace(/[ \t]+$/, '')}\n`;
+          }
+          out += callText;
+
+          let afterIdx = stmtEnd;
+          while (afterIdx < script.length && (script[afterIdx] === ' ' || script[afterIdx] === '\t')) {
+            afterIdx += 1;
+          }
+          if (afterIdx < script.length && script[afterIdx] !== '\r' && script[afterIdx] !== '\n') {
+            out += '\n';
+            i = afterIdx;
+          } else {
+            i = stmtEnd;
+          }
+          continue;
+        }
+      }
+    }
+
+    out += ch;
+    i += 1;
+  }
+
+  return out;
+}
+
 export async function executeOnlyOfficeDocBuilder(
   options: ExecuteDocBuilderOptions,
 ): Promise<ExecuteDocBuilderResult> {
@@ -488,7 +868,14 @@ export async function executeOnlyOfficeDocBuilder(
     (options.db ? createDbDocBuilderScriptStore(options.db) : memoryDocBuilderScriptStore);
 
   const scriptTtlMs = Math.max(CLOUD_DOC_DOCBUILDER_SCRIPT_TTL_MS, timeoutMs + 60_000);
-  const scriptId = await scriptStore.put(options.script, scriptTtlMs);
+  const inputUrl =
+    typeof options.argument?.inputUrl === 'string'
+      ? options.argument.inputUrl
+      : typeof options.argument?._imcodesInputUrl === 'string'
+        ? options.argument._imcodesInputUrl
+        : undefined;
+  const preparedScript = prepareOnlyOfficeDocBuilderScript(options.script, { inputUrl });
+  const scriptId = await scriptStore.put(preparedScript, scriptTtlMs);
   const scriptToken = signDocBuilderScriptToken(
     scriptId,
     options.env.JWT_SIGNING_KEY,

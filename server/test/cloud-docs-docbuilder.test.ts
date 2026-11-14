@@ -11,6 +11,7 @@ import { LocalCloudDocStorage } from '../src/storage/cloud-doc-storage.js';
 import {
   clearEphemeralDocBuilderScriptsForTests,
   createDbDocBuilderScriptStore,
+  prepareOnlyOfficeDocBuilderScript,
   signDocBuilderScriptToken,
 } from '../src/services/onlyoffice-docbuilder.js';
 import type {
@@ -570,6 +571,9 @@ describe('cloud-docs DocBuilder, Converter, and binary file-update routes', () =
       }),
     });
     expect(updateRes.status).toBe(200);
+    expect(lastScriptDownloaded).toBe(
+      `builder.OpenFile(${JSON.stringify(lastDocbuilderArg?.inputUrl)});\nbuilder.SaveFile("docx", "generated.docx");`,
+    );
     const updated = (await updateRes.json()) as { doc: { docVersion: number }; role: string; bytesWritten: number };
     expect(updated.doc.docVersion).toBe(2);
     expect(updated.role).toBe('owner');
@@ -1038,5 +1042,122 @@ describe('cloud-docs DocBuilder, Converter, and binary file-update routes', () =
       env.SERVER_URL = prevServerUrl;
       await new Promise<void>((resolve, reject) => replicaBServer.close((e) => (e ? reject(e) : resolve())));
     }
+  });
+
+  it('prepareOnlyOfficeDocBuilderScript normalizes Argument inputUrl variants, {{INPUT_URL}}, standalone builder lines, and preserves strings/comments', () => {
+    const sampleUrl = `https://docs.example.test/file?tok=a'b"c&x=1\`$y`;
+
+    // 1. All 4 Argument.* inputUrl expressions (with spaces and optional semicolon) rewrite to JSON string literals
+    expect(prepareOnlyOfficeDocBuilderScript('builder.OpenFile(Argument.inputUrl);', { inputUrl: sampleUrl }))
+      .toBe(`builder.OpenFile(${JSON.stringify(sampleUrl)});`);
+    expect(prepareOnlyOfficeDocBuilderScript('builder.OpenFile( Argument._imcodesInputUrl )', { inputUrl: sampleUrl }))
+      .toBe(`builder.OpenFile(${JSON.stringify(sampleUrl)})`);
+    expect(prepareOnlyOfficeDocBuilderScript("builder.OpenFile(Argument['inputUrl']);", { inputUrl: sampleUrl }))
+      .toBe(`builder.OpenFile(${JSON.stringify(sampleUrl)});`);
+    expect(prepareOnlyOfficeDocBuilderScript('builder.OpenFile( Argument[ "inputUrl" ] );', { inputUrl: sampleUrl }))
+      .toBe(`builder.OpenFile(${JSON.stringify(sampleUrl)});`);
+
+    // 2. Quote-safe {{INPUT_URL}} substitution across ", ', and ` literals (never inside comments)
+    const placeholderScript = [
+      '// {{INPUT_URL}} in line comment',
+      '/* {{INPUT_URL}} in block comment */',
+      'builder.OpenFile("{{INPUT_URL}}");',
+      "var single = '{{INPUT_URL}}';",
+      'var tpl = `prefix-{{INPUT_URL}}-${`nested-{{INPUT_URL}}`}`;',
+    ].join('\n');
+    const preparedPlaceholder = prepareOnlyOfficeDocBuilderScript(placeholderScript, { inputUrl: sampleUrl });
+    expect(preparedPlaceholder).toContain('// {{INPUT_URL}} in line comment');
+    expect(preparedPlaceholder).toContain('/* {{INPUT_URL}} in block comment */');
+    expect(preparedPlaceholder).toContain(`builder.OpenFile(${JSON.stringify(sampleUrl)});`);
+    expect(preparedPlaceholder).toContain(`var single = 'https://docs.example.test/file?tok=a\\'b"c&x=1\`$y';`);
+    expect(preparedPlaceholder).toContain('var tpl = `prefix-https://docs.example.test/file?tok=a\'b"c&x=1\\`\\$y-${`nested-https://docs.example.test/file?tok=a\'b"c&x=1\\`\\$y`}`;');
+
+    // 3. Single-line chained script splitting across all 4 builder file methods and nested parens
+    const oneLiner =
+      'builder.CreateFile("docx"); var oDoc = Api.GetDocument(); oDoc.Push(Api.CreateParagraph()); builder.SaveFile("docx", fmtName("a(1)", \')\')); builder.CloseFile();';
+    expect(prepareOnlyOfficeDocBuilderScript(oneLiner)).toBe([
+      'builder.CreateFile("docx");',
+      'var oDoc = Api.GetDocument(); oDoc.Push(Api.CreateParagraph());',
+      'builder.SaveFile("docx", fmtName("a(1)", \')\'));',
+      'builder.CloseFile();',
+    ].join('\n'));
+
+    // 4. Strings, comments, and non-builder identifiers stay intact
+    const guardedScript = [
+      'var s = "builder.OpenFile(Argument.inputUrl); builder.SaveFile(\\"docx\\", \\"x.docx\\");";',
+      '// builder.OpenFile(Argument.inputUrl); var keep = 1;',
+      '/* builder.SaveFile("docx", "c.docx"); var keep2 = 2; */',
+      'mybuilder.OpenFile(Argument.inputUrl); foo.builder.SaveFile("docx", "x.docx"); builder.OpenFileAsync(Argument.inputUrl);',
+    ].join('\n');
+    expect(prepareOnlyOfficeDocBuilderScript(guardedScript, { inputUrl: sampleUrl })).toBe(guardedScript);
+
+    // 5. Idempotency and preserved indentation on well-formed multi-line scripts
+    const multiline = [
+      '  builder.OpenFile(Argument.inputUrl);',
+      '  var oDoc = Api.GetDocument();',
+      '  builder.SaveFile("docx", "edited.docx");',
+      '  builder.CloseFile();',
+    ].join('\n');
+    const once = prepareOnlyOfficeDocBuilderScript(multiline, { inputUrl: sampleUrl });
+    expect(once).toBe([
+      `  builder.OpenFile(${JSON.stringify(sampleUrl)});`,
+      '  var oDoc = Api.GetDocument();',
+      '  builder.SaveFile("docx", "edited.docx");',
+      '  builder.CloseFile();',
+    ].join('\n'));
+    expect(prepareOnlyOfficeDocBuilderScript(once, { inputUrl: sampleUrl })).toBe(once);
+  });
+
+  it('normalizes single-line chained scripts across create, docbuilder edit, and content docbuilder routes', async () => {
+    const createRes = await app.request('/api/cloud-docs/docbuilder', {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'docx',
+        name: 'OneLineCreate.docx',
+        script: 'builder.CreateFile("docx"); var oDoc = Api.GetDocument(); builder.SaveFile("docx", "OneLineCreate.docx"); builder.CloseFile();',
+      }),
+    });
+    expect(createRes.status).toBe(201);
+    expect(lastScriptDownloaded).toBe([
+      'builder.CreateFile("docx");',
+      'var oDoc = Api.GetDocument();',
+      'builder.SaveFile("docx", "OneLineCreate.docx");',
+      'builder.CloseFile();',
+    ].join('\n'));
+    const { doc } = (await createRes.json()) as { doc: { id: string } };
+
+    const editContentRes = await app.request(`/api/cloud-docs/${doc.id}/content`, {
+      method: 'PUT',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        engine: 'docbuilder',
+        expectedVersion: 1,
+        docbuilderScript: "builder.OpenFile(Argument['inputUrl']); var d = Api.GetDocument(); builder.SaveFile('docx', 'edited.docx'); builder.CloseFile();",
+      }),
+    });
+    expect(editContentRes.status).toBe(200);
+    expect(lastScriptDownloaded).toBe([
+      `builder.OpenFile(${JSON.stringify(lastDocbuilderArg?.inputUrl)});`,
+      'var d = Api.GetDocument();',
+      "builder.SaveFile('docx', 'edited.docx');",
+      'builder.CloseFile();',
+    ].join('\n'));
+
+    const editBuilderRes = await app.request(`/api/cloud-docs/${doc.id}/docbuilder`, {
+      method: 'POST',
+      headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        expectedVersion: 2,
+        script: 'builder.OpenFile("{{INPUT_URL}}"); var d = Api.GetDocument(); builder.SaveFile("docx", "edited2.docx"); builder.CloseFile();',
+      }),
+    });
+    expect(editBuilderRes.status).toBe(200);
+    expect(lastScriptDownloaded).toBe([
+      `builder.OpenFile(${JSON.stringify(lastDocbuilderArg?.inputUrl)});`,
+      'var d = Api.GetDocument();',
+      'builder.SaveFile("docx", "edited2.docx");',
+      'builder.CloseFile();',
+    ].join('\n'));
   });
 });

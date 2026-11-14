@@ -1826,15 +1826,12 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
           inputUrl,
           _imcodesInputUrl: inputUrl,
         };
-        const effectiveScript = validatedBuilder.script.includes('{{INPUT_URL}}')
-          ? validatedBuilder.script.replaceAll('{{INPUT_URL}}', inputUrl)
-          : validatedBuilder.script;
         const targetExt = nextExt ?? current.ext;
         try {
           const result = await executeOnlyOfficeDocBuilder({
             env: c.env,
             db: c.env.DB,
-            script: effectiveScript,
+            script: validatedBuilder.script,
             argument: effectiveArgument,
             requiredExt: targetExt,
             timeoutMs: validatedBuilder.timeoutMs,
@@ -2050,16 +2047,13 @@ export function createCloudDocsRoutes(storage: CloudDocStorage) {
         inputUrl,
         _imcodesInputUrl: inputUrl,
       };
-      const effectiveScript = validated.script.includes('{{INPUT_URL}}')
-        ? validated.script.replaceAll('{{INPUT_URL}}', inputUrl)
-        : validated.script;
 
       let result: Awaited<ReturnType<typeof executeOnlyOfficeDocBuilder>>;
       try {
         result = await executeOnlyOfficeDocBuilder({
           env: c.env,
           db: c.env.DB,
-          script: effectiveScript,
+          script: validated.script,
           argument: effectiveArgument,
           outputName,
           requiredExt: persistedExt,
