@@ -7,6 +7,7 @@ import { cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
 
 const speechApi = vi.hoisted(() => ({
   available: vi.fn(),
+  checkPermissions: vi.fn(),
   requestPermissions: vi.fn(),
   addListener: vi.fn(),
   start: vi.fn(),
@@ -53,6 +54,7 @@ beforeEach(async () => {
   vi.stubGlobal('Capacitor', { isNativePlatform: () => true });
   listeners = {};
   speechApi.available.mockReset().mockResolvedValue({ available: true });
+  speechApi.checkPermissions.mockReset().mockResolvedValue({ speechRecognition: 'granted' });
   speechApi.requestPermissions.mockReset().mockResolvedValue({ speechRecognition: 'granted' });
   speechApi.addListener.mockReset().mockImplementation(async (eventName: string, handler: (data: any) => void) => {
     listeners[eventName] = handler;
@@ -1189,6 +1191,62 @@ describe('Web Mobile final drain', () => {
       await VoiceInput.stopListening({ abort: true });
     } finally {
       hungA.resolve({});
+      vi.useRealTimers();
+    }
+  });
+
+  it('prewarm deduplicates concurrent checks, caches ready state for startListening, and invalidates on TTL or failure', async () => {
+    vi.useFakeTimers();
+    try {
+      const checkGate = deferred<{ speechRecognition: string }>();
+      const availGate = deferred<{ available: boolean }>();
+      speechApi.checkPermissions.mockReturnValueOnce(checkGate.promise);
+      speechApi.available.mockReturnValueOnce(availGate.promise);
+
+      const p1 = VoiceInput.prewarm({ requestPermission: false });
+      const p2 = VoiceInput.prewarm({ requestPermission: false });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(speechApi.checkPermissions).toHaveBeenCalledTimes(1);
+      expect(speechApi.requestPermissions).not.toHaveBeenCalled();
+
+      checkGate.resolve({ speechRecognition: 'granted' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(speechApi.available).toHaveBeenCalledTimes(1);
+      availGate.resolve({ available: true });
+      await Promise.all([p1, p2]);
+
+      // Subsequent startListening reuses cached prewarm state with zero extra IPC roundtrips
+      await expect(VoiceInput.startListening(vi.fn())).resolves.toBe(true);
+      expect(speechApi.requestPermissions).not.toHaveBeenCalled();
+      expect(speechApi.available).toHaveBeenCalledTimes(1);
+      expect(speechApi.start).toHaveBeenCalledTimes(1);
+      await VoiceInput.stopListening({ abort: true });
+
+      // When checkPermissions is not granted yet, passive prewarm skips OS permission prompt cleanly
+      speechApi.checkPermissions.mockResolvedValueOnce({ speechRecognition: 'prompt' });
+      speechApi.available.mockResolvedValueOnce({ available: true });
+      await vi.advanceTimersByTimeAsync(16_000); // expire TTL
+      await VoiceInput.prewarm({ requestPermission: false });
+      expect(speechApi.requestPermissions).not.toHaveBeenCalled();
+
+      // Holding calls startListening -> requests permission once without re-querying available()
+      await expect(VoiceInput.startListening(vi.fn())).resolves.toBe(true);
+      expect(speechApi.requestPermissions).toHaveBeenCalledTimes(1);
+      expect(speechApi.available).toHaveBeenCalledTimes(2);
+      await VoiceInput.stopListening({ abort: true });
+
+      // Permission denied or start failure after TTL never throws out of prewarm and invalidates cache
+      await vi.advanceTimersByTimeAsync(16_000);
+      speechApi.checkPermissions.mockResolvedValueOnce({ speechRecognition: 'denied' });
+      speechApi.requestPermissions.mockResolvedValueOnce({ speechRecognition: 'denied' });
+      await expect(VoiceInput.prewarm()).resolves.toBeUndefined();
+      expect(speechApi.requestPermissions).toHaveBeenCalledTimes(2);
+      speechApi.requestPermissions.mockResolvedValueOnce({ speechRecognition: 'granted' });
+      speechApi.available.mockResolvedValueOnce({ available: true });
+      await expect(VoiceInput.startListening(vi.fn())).resolves.toBe(true);
+      expect(speechApi.requestPermissions).toHaveBeenCalledTimes(3);
+      await VoiceInput.stopListening({ abort: true });
+    } finally {
       vi.useRealTimers();
     }
   });

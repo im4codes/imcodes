@@ -3373,8 +3373,11 @@ html.native-ios-mac .chat-dl-btn {
   -webkit-user-select: none !important;
   -webkit-touch-callout: none !important;
   -webkit-user-modify: read-only !important;
-  touch-action: none !important;
   caret-color: transparent !important;
+}
+.controls-composer-voice-ready:not(.controls-composer-voice-holding) .controls-input[contenteditable="false"],
+.controls-composer-voice-pending .controls-input {
+  touch-action: manipulation !important;
 }
 .controls-composer-voice-pending .controls-input {
   border-color: rgba(34,211,238,0.82);
@@ -3384,6 +3387,7 @@ html.native-ios-mac .chat-dl-btn {
     0 0 32px rgba(167,139,250,0.18);
 }
 .controls-composer-voice-holding .controls-input {
+  touch-action: none !important;
   background: linear-gradient(180deg, rgba(12,25,46,0.98), rgba(8,13,22,0.99));
   border-color: rgba(34,211,238,0.92);
   box-shadow:

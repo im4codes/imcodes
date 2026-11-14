@@ -181,8 +181,12 @@ import { recordPerfRender } from '../perf-render-debug.js';
 export const COMPOSER_HEIGHT_STORAGE_KEY = 'imcodes_composer_height_v1';
 export const ATTACHMENT_BADGE_COLLAPSE_THRESHOLD = 3;
 export const ATTACHMENT_BADGE_COLLAPSED_VISIBLE_COUNT = 2;
-const VOICE_HOLD_DELAY_MS = 240;
+const VOICE_HOLD_UNFOCUSED_DELAY_MS = 175;
+const VOICE_HOLD_FOCUSED_DELAY_MS = 240;
+const VOICE_HOLD_SLIDE_PROMOTE_MS = 90;
+const VOICE_HOLD_SLIDE_PROMOTE_PX = 14;
 const VOICE_HOLD_MOVE_SLOP_PX = 18;
+const VOICE_HOLD_SCROLL_ABORT_PX = 40;
 const VOICE_HOLD_CANCEL_THRESHOLD_PX = 44;
 const VOICE_HOLD_EDIT_THRESHOLD_PX = 44;
 const VOICE_HOLD_SLIDE_MAX_PX = 84;
@@ -223,6 +227,14 @@ function clearComposerVoiceTouchLock(el: HTMLDivElement | null, disabled: boolea
   style.webkitTouchCallout = '';
   style.webkitUserModify = '';
   el.setAttribute('contenteditable', disabled ? 'false' : 'true');
+}
+
+function prewarmVoiceInput(options?: { requestPermission?: boolean }): void {
+  if (!Object.prototype.hasOwnProperty.call(VoiceInput, 'prewarm')) return;
+  const fn = (VoiceInput as { prewarm?: (opts?: { requestPermission?: boolean }) => Promise<void> }).prewarm;
+  if (typeof fn === 'function') {
+    void fn(options);
+  }
 }
 /**
  * Floor for the shared desktop composer height, matching the three-row resting
@@ -1332,6 +1344,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     startX: number;
     startY: number;
     wasFocused: boolean;
+    pointerType: string;
     downAt: number;
     lastActivityAt: number;
     captureLost: boolean;
@@ -1347,6 +1360,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     zone: 'send' | 'cancel' | 'edit';
     phase: 'starting' | 'recording' | 'draining' | 'failed' | 'settled';
     error: string | null;
+    pointerType: string;
+    didStartRecording: boolean;
     settled: boolean;
     startSettled: boolean;
     startPromise: Promise<boolean> | null;
@@ -5282,12 +5297,103 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
   }, [clearComposerVoiceWindowListeners, clearVoiceHoldTimers]);
 
+  const disarmTouchTapCompatMouseShield = useCallback(() => {
+    touchTapCompatShieldCleanupRef.current?.();
+    touchTapCompatShieldCleanupRef.current = null;
+  }, []);
+
+  /**
+   * Focusing the composer synchronously on a short touch `pointerup` or failed-hold
+   * click fallback can trigger `.input-focused` / `.subcard-bar` hiding and shift the
+   * composer downward before the browser dispatches compatibility `mousedown`. Guard
+   * against that stale compatibility `mousedown` landing on `.chat-view`
+   * (`tabIndex={-1}`) and stealing focus back out of the composer.
+   */
+  const armTouchTapCompatMouseShield = useCallback(() => {
+    disarmTouchTapCompatMouseShield();
+    if (typeof document === 'undefined') return;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const cleanup = () => {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      document.removeEventListener('pointerdown', onNewInteraction, true);
+      document.removeEventListener('touchstart', onNewInteraction, true);
+      document.removeEventListener('keydown', onNewInteraction, true);
+      document.removeEventListener('mousedown', onCompatMouseDown, true);
+      if (touchTapCompatShieldCleanupRef.current === cleanup) {
+        touchTapCompatShieldCleanupRef.current = null;
+      }
+    };
+    const onNewInteraction = () => {
+      cleanup();
+    };
+    const onCompatMouseDown = (ev: MouseEvent) => {
+      const el = divRef.current;
+      const target = ev.target as Node | null;
+      if (el && document.activeElement === el && (!target || !el.contains(target))) {
+        ev.preventDefault();
+      }
+      cleanup();
+    };
+    document.addEventListener('pointerdown', onNewInteraction, true);
+    document.addEventListener('touchstart', onNewInteraction, true);
+    document.addEventListener('keydown', onNewInteraction, true);
+    document.addEventListener('mousedown', onCompatMouseDown, true);
+    timer = setTimeout(cleanup, 400);
+    touchTapCompatShieldCleanupRef.current = cleanup;
+  }, [disarmTouchTapCompatMouseShield]);
+
+  /** Restore editability and focus the composer on any short tap or failed hold. */
+  const fallbackToComposerClick = useCallback((pointerType?: string) => {
+    if (!mountedRef.current || inputDisabledRef.current) return;
+    suppressComposerClickFocusRef.current = false;
+    if (suppressComposerClickTimerRef.current !== null) {
+      clearTimeout(suppressComposerClickTimerRef.current);
+      suppressComposerClickTimerRef.current = null;
+    }
+    if (pointerType === 'touch') {
+      armTouchTapCompatMouseShield();
+    }
+    focusComposerForTyping();
+  }, [armTouchTapCompatMouseShield, focusComposerForTyping]);
+
+  const updateVoiceHoldZoneFromDx = useCallback((
+    tx: NonNullable<typeof voiceHoldTxRef.current>,
+    dx: number,
+    hapticOnChange = true,
+  ) => {
+    const clampedDragX = Math.round(Math.max(-VOICE_HOLD_SLIDE_MAX_PX, Math.min(VOICE_HOLD_SLIDE_MAX_PX, dx)));
+    setVoiceHoldDragX(clampedDragX);
+    let nextZone: 'send' | 'cancel' | 'edit' = 'send';
+    if (dx <= -VOICE_HOLD_CANCEL_THRESHOLD_PX) nextZone = 'cancel';
+    else if (dx >= VOICE_HOLD_EDIT_THRESHOLD_PX) nextZone = 'edit';
+
+    if (nextZone !== tx.zone) {
+      tx.zone = nextZone;
+      voiceHoldZoneRef.current = nextZone;
+      setVoiceHoldZone(nextZone);
+      if (hapticOnChange) {
+        try { navigator.vibrate?.(12); } catch { /* ignore */ }
+      }
+    }
+  }, []);
+
   const finalizeVoiceHold = useCallback((
     tx: NonNullable<typeof voiceHoldTxRef.current>,
     outcome: 'send' | 'cancel' | 'edit' | 'failed',
   ): Promise<void> => {
     if (tx.drainPromise !== null) return tx.drainPromise;
     resetVoiceHoldInteractionState();
+
+    const shouldFallbackToClick =
+      outcome === 'failed'
+      && !tx.didStartRecording
+      && tx.zone !== 'cancel';
+    if (shouldFallbackToClick) {
+      fallbackToComposerClick(tx.pointerType);
+    }
 
     const abortMode = outcome === 'cancel' || outcome === 'failed';
     if (outcome === 'cancel') {
@@ -5354,6 +5460,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         }
 
         if (timedOut || tx.settled || outcome === 'failed' || tx.phase === 'failed' || !started || tx.error !== null || !mountedRef.current) {
+          if (
+            !shouldFallbackToClick
+            && (!started || tx.error !== null)
+            && !tx.didStartRecording
+            && tx.zone !== 'cancel'
+            && mountedRef.current
+          ) {
+            fallbackToComposerClick(tx.pointerType);
+          }
           tx.settled = true;
           tx.phase = 'settled';
           return;
@@ -5389,7 +5504,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     })();
 
     return tx.drainPromise;
-  }, [handleVoiceSend, resetVoiceHoldInteractionState]);
+  }, [fallbackToComposerClick, handleVoiceSend, resetVoiceHoldInteractionState]);
 
   const retireOrphanedVoiceHold = useCallback(() => {
     const orphanTx = voiceHoldTxRef.current;
@@ -5419,6 +5534,140 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     ptr.captureLost = true;
   }, []);
 
+  /** Transition a pending pointer press into active voice capture (shared by hold timer and slide promotion). */
+  const activateComposerVoiceHold = useCallback((
+    ptr: NonNullable<typeof voiceHoldPointerRef.current>,
+    initialDx = 0,
+    captureTarget?: EventTarget | null,
+  ) => {
+    if (voiceHoldTimerRef.current !== null) {
+      clearTimeout(voiceHoldTimerRef.current);
+      voiceHoldTimerRef.current = null;
+    }
+    voiceHoldPendingRef.current = false;
+    setVoiceHoldPending(false);
+    if (!mountedRef.current || voiceHoldTxRef.current !== null) {
+      voiceHoldPointerRef.current = null;
+      clearComposerVoiceWindowListeners();
+      if (mountedRef.current && !inputDisabledRef.current) {
+        fallbackToComposerClick(ptr.pointerType);
+      } else {
+        clearComposerVoiceTouchLock(
+          divRef.current,
+          inputDisabledRef.current || (voiceHoldReadyRef.current && !composerFocusedRef.current),
+        );
+      }
+      return;
+    }
+
+    // Dismiss any active keyboard, selection, or iOS magnifying loupe before starting voice capture.
+    composerFocusedRef.current = false;
+    setComposerFocused(false);
+    applyComposerVoiceTouchLock(divRef.current, true);
+    try { divRef.current?.blur(); } catch { /* ignore */ }
+    try { window.getSelection()?.removeAllRanges(); } catch { /* ignore */ }
+    try { navigator.vibrate?.(20); } catch { /* ignore */ }
+
+    // Defer setPointerCapture until hold actually activates so normal taps and scrolling stay interference-free.
+    const captureEl = captureTarget instanceof HTMLElement ? captureTarget : divRef.current;
+    try {
+      captureEl?.setPointerCapture?.(ptr.id);
+    } catch { /* ignore unsupported pointer capture */ }
+
+    const base = divRef.current ? readComposerElementText(divRef.current) : '';
+    const tx = {
+      id: ++voiceHoldTokenRef.current,
+      baseText: base,
+      transcript: '',
+      zone: 'send' as 'send' | 'cancel' | 'edit',
+      phase: 'starting' as 'starting' | 'recording' | 'draining' | 'failed' | 'settled',
+      error: null as string | null,
+      pointerType: ptr.pointerType,
+      didStartRecording: false,
+      settled: false,
+      startSettled: false,
+      startPromise: null as Promise<boolean> | null,
+      drainPromise: null as Promise<void> | null,
+    };
+    voiceHoldTxRef.current = tx;
+    voiceHoldActiveRef.current = true;
+    voiceHoldZoneRef.current = 'send';
+    const emptyBars = Array(VOICE_HOLD_BAR_COUNT).fill(0);
+    voiceHoldBarsRef.current = emptyBars;
+    setVoiceHoldBars(emptyBars);
+    setVoiceHoldText('');
+    setVoiceHoldZone('send');
+    setVoiceHoldDragX(0);
+    setVoiceHoldActive(true);
+    setVoiceHoldRecognizing(true);
+    if (initialDx !== 0) {
+      updateVoiceHoldZoneFromDx(tx, initialDx, false);
+    }
+
+    const failTransaction = (errCode: string) => {
+      if (tx.settled || tx.error !== null) return;
+      tx.phase = 'failed';
+      tx.error = errCode || 'permission_denied';
+      if (mountedRef.current) {
+        setVoiceHoldError(tx.error);
+      }
+      void finalizeVoiceHold(tx, 'failed');
+    };
+
+    VoiceInput.onAudioLevel((rawLevel) => {
+      if (!mountedRef.current || voiceHoldTxRef.current !== tx || tx.settled || tx.error !== null || tx.phase === 'draining') return;
+      const level = Math.max(0, Math.min(1, Number.isFinite(rawLevel) ? rawLevel : 0));
+      if (level > 0.015) pulseVoiceHoldRecognizing(1800);
+      const prev = voiceHoldBarsRef.current;
+      const next = [...prev.slice(1), level];
+      voiceHoldBarsRef.current = next;
+      setVoiceHoldBars(next);
+    });
+
+    tx.startPromise = VoiceInput.startListening(
+      (partial) => {
+        if (tx.settled || tx.error !== null) return;
+        tx.transcript = partial;
+        if (mountedRef.current && voiceHoldTxRef.current === tx && (tx.phase === 'starting' || tx.phase === 'recording')) {
+          setVoiceHoldText(partial);
+          pulseVoiceHoldRecognizing(900);
+        }
+      },
+      undefined,
+      (err) => {
+        failTransaction(err || 'permission_denied');
+      },
+    ).then(
+      (started) => {
+        tx.startSettled = true;
+        if (!started || tx.error !== null) {
+          if (tx.drainPromise === null) {
+            failTransaction(tx.error ?? 'permission_denied');
+          }
+          return false;
+        }
+        tx.didStartRecording = true;
+        if (tx.phase === 'starting') {
+          tx.phase = 'recording';
+        }
+        return true;
+      },
+      (err) => {
+        tx.startSettled = true;
+        if (tx.drainPromise === null) {
+          failTransaction(err instanceof Error ? err.message : 'permission_denied');
+        }
+        return false;
+      },
+    );
+  }, [
+    clearComposerVoiceWindowListeners,
+    fallbackToComposerClick,
+    finalizeVoiceHold,
+    pulseVoiceHoldRecognizing,
+    updateVoiceHoldZoneFromDx,
+  ]);
+
   const handleComposerVoicePointerDown = useCallback((event: PointerEvent) => {
     if (handledVoicePointerEventsRef.current.has(event)) return;
     handledVoicePointerEventsRef.current.add(event);
@@ -5440,147 +5689,46 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
 
     const el = divRef.current;
-    const wasFocused = !!el && document.activeElement === el;
+    const wasFocused = !!el && document.activeElement === el && el.getAttribute('contenteditable') !== 'false';
     // Never call event.preventDefault() on pointerdown: doing so suppresses
     // iOS/Android native tap-to-focus and prevents the soft keyboard / IME
-    // from opening when tapping the composer. Note that even while an earlier
-    // voice hold drain (voiceHoldTxRef.current) is still settling, pointerdown
-    // tracks short taps (<240ms) so tap-to-type is never locked out. If the
-    // press reaches 240ms without an active drain, the timer disables
-    // contenteditable and blurs to suppress iOS loupe/keyboard.
+    // from opening when tapping the composer. While an earlier drain settles,
+    // pointerdown still tracks short taps cleanly and falls back to typing if
+    // hold cannot acquire the mic.
+    prewarmVoiceInput({ requestPermission: false });
     setVoiceHoldError(null);
     const pointerId = event.pointerId ?? 1;
+    const pointerType = event.pointerType || 'touch';
     const startX = event.clientX ?? 0;
     const startY = event.clientY ?? 0;
     const now = Date.now();
-    voiceHoldPointerRef.current = {
+    const ptr = {
       id: pointerId,
       startX,
       startY,
       wasFocused,
+      pointerType,
       downAt: now,
       lastActivityAt: now,
       captureLost: false,
     };
+    voiceHoldPointerRef.current = ptr;
     voiceHoldPendingRef.current = true;
     setVoiceHoldPending(true);
     applyComposerVoiceTouchLock(el, false);
     attachComposerVoiceWindowListeners();
-    try {
-      (event.currentTarget as HTMLElement | null)?.setPointerCapture?.(pointerId);
-    } catch { /* ignore unsupported pointer capture */ }
 
+    const holdDelayMs = wasFocused ? VOICE_HOLD_FOCUSED_DELAY_MS : VOICE_HOLD_UNFOCUSED_DELAY_MS;
     if (voiceHoldTimerRef.current !== null) clearTimeout(voiceHoldTimerRef.current);
     voiceHoldTimerRef.current = setTimeout(() => {
-      voiceHoldTimerRef.current = null;
-      voiceHoldPendingRef.current = false;
-      setVoiceHoldPending(false);
-      if (!mountedRef.current || voiceHoldTxRef.current !== null) {
-        voiceHoldPointerRef.current = null;
-        clearComposerVoiceWindowListeners();
-        clearComposerVoiceTouchLock(
-          divRef.current,
-          inputDisabledRef.current || (voiceHoldReadyRef.current && !composerFocusedRef.current),
-        );
-        return;
-      }
-      // Dismiss any active keyboard, selection, or iOS magnifying loupe before starting voice capture.
-      composerFocusedRef.current = false;
-      setComposerFocused(false);
-      applyComposerVoiceTouchLock(divRef.current, true);
-      try { divRef.current?.blur(); } catch { /* ignore */ }
-      try { window.getSelection()?.removeAllRanges(); } catch { /* ignore */ }
-      try { navigator.vibrate?.(20); } catch { /* ignore */ }
-
-      const base = divRef.current ? readComposerElementText(divRef.current) : '';
-      const tx = {
-        id: ++voiceHoldTokenRef.current,
-        baseText: base,
-        transcript: '',
-        zone: 'send' as 'send' | 'cancel' | 'edit',
-        phase: 'starting' as 'starting' | 'recording' | 'draining' | 'failed' | 'settled',
-        error: null as string | null,
-        settled: false,
-        startSettled: false,
-        startPromise: null as Promise<boolean> | null,
-        drainPromise: null as Promise<void> | null,
-      };
-      voiceHoldTxRef.current = tx;
-      voiceHoldActiveRef.current = true;
-      voiceHoldZoneRef.current = 'send';
-      const emptyBars = Array(VOICE_HOLD_BAR_COUNT).fill(0);
-      voiceHoldBarsRef.current = emptyBars;
-      setVoiceHoldBars(emptyBars);
-      setVoiceHoldText('');
-      setVoiceHoldZone('send');
-      setVoiceHoldDragX(0);
-      setVoiceHoldActive(true);
-      setVoiceHoldRecognizing(true);
-
-      const failTransaction = (errCode: string) => {
-        if (tx.settled || tx.error !== null) return;
-        tx.phase = 'failed';
-        tx.error = errCode || 'permission_denied';
-        if (mountedRef.current) {
-          setVoiceHoldError(tx.error);
-        }
-        void finalizeVoiceHold(tx, 'failed');
-      };
-
-      VoiceInput.onAudioLevel((rawLevel) => {
-        if (!mountedRef.current || voiceHoldTxRef.current !== tx || tx.settled || tx.error !== null || tx.phase === 'draining') return;
-        const level = Math.max(0, Math.min(1, Number.isFinite(rawLevel) ? rawLevel : 0));
-        if (level > 0.015) pulseVoiceHoldRecognizing(1800);
-        const prev = voiceHoldBarsRef.current;
-        const next = [...prev.slice(1), level];
-        voiceHoldBarsRef.current = next;
-        setVoiceHoldBars(next);
-      });
-
-      tx.startPromise = VoiceInput.startListening(
-        (partial) => {
-          if (tx.settled || tx.error !== null) return;
-          tx.transcript = partial;
-          if (mountedRef.current && voiceHoldTxRef.current === tx && (tx.phase === 'starting' || tx.phase === 'recording')) {
-            setVoiceHoldText(partial);
-            pulseVoiceHoldRecognizing(900);
-          }
-        },
-        undefined,
-        (err) => {
-          failTransaction(err || 'permission_denied');
-        },
-      ).then(
-        (started) => {
-          tx.startSettled = true;
-          if (!started || tx.error !== null) {
-            if (tx.drainPromise === null) {
-              failTransaction(tx.error ?? 'permission_denied');
-            }
-            return false;
-          }
-          if (tx.phase === 'starting') {
-            tx.phase = 'recording';
-          }
-          return true;
-        },
-        (err) => {
-          tx.startSettled = true;
-          if (tx.drainPromise === null) {
-            failTransaction(err instanceof Error ? err.message : 'permission_denied');
-          }
-          return false;
-        },
-      );
-    }, VOICE_HOLD_DELAY_MS);
+      activateComposerVoiceHold(ptr, 0, el);
+    }, holdDelayMs);
   }, [
     inputDisabled,
     voiceOpen,
+    activateComposerVoiceHold,
     attachComposerVoiceWindowListeners,
-    clearComposerVoiceWindowListeners,
-    pulseVoiceHoldRecognizing,
     retireOrphanedVoiceHold,
-    finalizeVoiceHold,
   ]);
 
   const handleComposerVoicePointerMove = useCallback((event: PointerEvent) => {
@@ -5599,8 +5747,26 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       if (!ptr) return;
       const dx = (event.clientX ?? 0) - ptr.startX;
       const dy = (event.clientY ?? 0) - ptr.startY;
+      const elapsed = Date.now() - ptr.downAt;
+      // Multi-signal horizontal slide-hold promotion past short tap debounce
+      if (
+        !ptr.wasFocused
+        && elapsed >= VOICE_HOLD_SLIDE_PROMOTE_MS
+        && Math.abs(dx) >= VOICE_HOLD_SLIDE_PROMOTE_PX
+        && Math.abs(dx) > Math.abs(dy) * 1.2
+      ) {
+        if (event.cancelable) event.preventDefault();
+        activateComposerVoiceHold(ptr, dx, divRef.current);
+        return;
+      }
       if (Math.hypot(dx, dy) > VOICE_HOLD_MOVE_SLOP_PX) {
+        const isStrongVerticalScroll =
+          Math.abs(dy) >= VOICE_HOLD_SCROLL_ABORT_PX
+          && Math.abs(dy) > Math.abs(dx) * 1.5;
         resetVoiceHoldInteractionState();
+        if (!isStrongVerticalScroll) {
+          fallbackToComposerClick(ptr.pointerType);
+        }
       }
       return;
     }
@@ -5614,67 +5780,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
     const dx = (event.clientX ?? 0) - ptr.startX;
     event.preventDefault();
-    const clampedDragX = Math.round(Math.max(-VOICE_HOLD_SLIDE_MAX_PX, Math.min(VOICE_HOLD_SLIDE_MAX_PX, dx)));
-    setVoiceHoldDragX(clampedDragX);
-    let nextZone: 'send' | 'cancel' | 'edit' = 'send';
-    if (dx <= -VOICE_HOLD_CANCEL_THRESHOLD_PX) nextZone = 'cancel';
-    else if (dx >= VOICE_HOLD_EDIT_THRESHOLD_PX) nextZone = 'edit';
-
-    if (nextZone !== tx.zone) {
-      tx.zone = nextZone;
-      voiceHoldZoneRef.current = nextZone;
-      setVoiceHoldZone(nextZone);
-      try { navigator.vibrate?.(12); } catch { /* ignore */ }
-    }
-  }, [finalizeVoiceHold, resetVoiceHoldInteractionState]);
-
-  const disarmTouchTapCompatMouseShield = useCallback(() => {
-    touchTapCompatShieldCleanupRef.current?.();
-    touchTapCompatShieldCleanupRef.current = null;
-  }, []);
-
-  /**
-   * Focusing the composer synchronously on a short touch `pointerup` can trigger
-   * `.input-focused` / `.subcard-bar` hiding and shift the composer downward
-   * before the browser dispatches the tap's compatibility `mousedown`. Guard
-   * against that stale compatibility `mousedown` landing on `.chat-view`
-   * (`tabIndex={-1}`) and stealing focus back out of the composer.
-   */
-  const armTouchTapCompatMouseShield = useCallback(() => {
-    disarmTouchTapCompatMouseShield();
-    if (typeof document === 'undefined') return;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const cleanup = () => {
-      if (timer !== null) {
-        clearTimeout(timer);
-        timer = null;
-      }
-      document.removeEventListener('pointerdown', onNewInteraction, true);
-      document.removeEventListener('touchstart', onNewInteraction, true);
-      document.removeEventListener('keydown', onNewInteraction, true);
-      document.removeEventListener('mousedown', onCompatMouseDown, true);
-      if (touchTapCompatShieldCleanupRef.current === cleanup) {
-        touchTapCompatShieldCleanupRef.current = null;
-      }
-    };
-    const onNewInteraction = () => {
-      cleanup();
-    };
-    const onCompatMouseDown = (ev: MouseEvent) => {
-      const el = divRef.current;
-      const target = ev.target as Node | null;
-      if (el && document.activeElement === el && (!target || !el.contains(target))) {
-        ev.preventDefault();
-      }
-      cleanup();
-    };
-    document.addEventListener('pointerdown', onNewInteraction, true);
-    document.addEventListener('touchstart', onNewInteraction, true);
-    document.addEventListener('keydown', onNewInteraction, true);
-    document.addEventListener('mousedown', onCompatMouseDown, true);
-    timer = setTimeout(cleanup, 400);
-    touchTapCompatShieldCleanupRef.current = cleanup;
-  }, [disarmTouchTapCompatMouseShield]);
+    updateVoiceHoldZoneFromDx(tx, dx);
+  }, [
+    activateComposerVoiceHold,
+    fallbackToComposerClick,
+    finalizeVoiceHold,
+    resetVoiceHoldInteractionState,
+    updateVoiceHoldZoneFromDx,
+  ]);
 
   const handleComposerVoicePointerEnd = useCallback((event: PointerEvent, cancelled = false) => {
     if (handledVoicePointerEventsRef.current.has(event)) return;
@@ -5684,6 +5797,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     const tx = voiceHoldTxRef.current;
     if (ptr && event.pointerId !== undefined && event.pointerId !== ptr.id) return;
     if (!ptr && !tx) return;
+    const resolvedPointerType = ptr?.pointerType ?? event.pointerType ?? tx?.pointerType ?? 'touch';
     voiceHoldPointerRef.current = null;
     voiceHoldPendingRef.current = false;
     setVoiceHoldPending(false);
@@ -5692,25 +5806,29 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       clearTimeout(voiceHoldTimerRef.current);
       voiceHoldTimerRef.current = null;
       clearComposerVoiceWindowListeners();
-      if (!cancelled && ptr && !ptr.wasFocused) {
-        if (event.pointerType === 'touch') {
-          armTouchTapCompatMouseShield();
-        }
-        focusComposerForTyping();
-      } else if (!cancelled) {
-        clearComposerVoiceTouchLock(divRef.current, inputDisabledRef.current);
-      } else {
-        clearComposerVoiceTouchLock(
-          divRef.current,
-          inputDisabledRef.current || (voiceHoldReadyRef.current && !composerFocusedRef.current),
-        );
-      }
+      // Any short release or pending pointercancel before active recording falls back to typing focus.
+      fallbackToComposerClick(resolvedPointerType);
       return;
     }
 
     clearComposerVoiceWindowListeners();
-    if (!tx || tx.settled || tx.drainPromise !== null) return;
+    if (!tx) return;
+    if (tx.settled || tx.drainPromise !== null) {
+      if (tx.phase === 'failed' && !tx.didStartRecording && tx.zone !== 'cancel') {
+        fallbackToComposerClick(resolvedPointerType);
+      }
+      return;
+    }
     event.preventDefault();
+    if (cancelled && !tx.didStartRecording) {
+      try { divRef.current?.blur(); } catch { /* ignore */ }
+      void finalizeVoiceHold(tx, 'failed');
+      return;
+    }
+    if (tx.error !== null && !tx.didStartRecording && tx.zone !== 'cancel') {
+      void finalizeVoiceHold(tx, 'failed');
+      return;
+    }
     suppressComposerClickFocusRef.current = true;
     if (suppressComposerClickTimerRef.current !== null) {
       clearTimeout(suppressComposerClickTimerRef.current);
@@ -5722,7 +5840,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     try { divRef.current?.blur(); } catch { /* ignore */ }
     const finalZone: 'send' | 'cancel' | 'edit' = cancelled ? 'cancel' : tx.zone;
     void finalizeVoiceHold(tx, tx.error !== null ? 'failed' : finalZone);
-  }, [armTouchTapCompatMouseShield, clearComposerVoiceWindowListeners, finalizeVoiceHold, focusComposerForTyping]);
+  }, [clearComposerVoiceWindowListeners, fallbackToComposerClick, finalizeVoiceHold]);
 
   voicePointerMoveHandlerRef.current = handleComposerVoicePointerMove;
   voicePointerEndHandlerRef.current = handleComposerVoicePointerEnd;
@@ -6753,6 +6871,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
     syncMobileComposerMetrics();
   }, [hasText, isMobileLayout, syncMobileComposerMetrics]);
+
+  useEffect(() => {
+    if (voiceHoldReady && !composerFocused) {
+      prewarmVoiceInput({ requestPermission: false });
+    }
+  }, [voiceHoldReady, composerFocused]);
 
   return (
     <>

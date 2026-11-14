@@ -14,6 +14,7 @@ const voiceMock = vi.hoisted(() => ({
   errorHandler: null as ((error: string) => void) | null,
   levelHandler: null as ((level: number) => void) | null,
   isAvailable: vi.fn(() => true),
+  prewarm: vi.fn(async () => {}),
   startListening: vi.fn(),
   stopListening: vi.fn(),
   onAudioLevel: vi.fn(),
@@ -46,6 +47,7 @@ vi.mock('../../src/components/VoiceOverlay.js', () => ({
 
 vi.mock('../../src/components/VoiceInput.js', () => ({
   isAvailable: () => voiceMock.isAvailable(),
+  prewarm: (...args: unknown[]) => voiceMock.prewarm(...args),
   startListening: (...args: unknown[]) => voiceMock.startListening(...args),
   stopListening: (...args: unknown[]) => voiceMock.stopListening(...args),
   onAudioLevel: (cb: ((level: number) => void) | null) => {
@@ -162,6 +164,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       return true;
     });
     voiceMock.stopListening.mockReset().mockResolvedValue(undefined);
+    voiceMock.prewarm.mockReset().mockResolvedValue(undefined);
     voiceMock.onAudioLevel.mockReset();
   });
 
@@ -302,15 +305,16 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
 
     const input = document.querySelector('.controls-input') as HTMLElement;
     const composer = document.querySelector('.controls-composer') as HTMLElement;
+    expect(voiceMock.prewarm).toHaveBeenCalledWith({ requestPermission: false });
     dispatchPointer(input, 'pointerdown', 180);
 
-    // Not triggered at 239ms; still pending with selection/callout lock
-    await vi.advanceTimersByTimeAsync(239);
+    // Not triggered at 174ms; still pending with selection/callout lock (keeps <=140ms taps safe)
+    await vi.advanceTimersByTimeAsync(174);
     expect(voiceMock.startListening).not.toHaveBeenCalled();
     expect(composer.classList.contains('controls-composer-voice-pending')).toBe(true);
     expect(composer.classList.contains('controls-composer-voice-holding')).toBe(false);
 
-    // Triggers exactly at 240ms (+1ms)
+    // Triggers exactly at 175ms (+1ms) on unfocused composer
     await vi.advanceTimersByTimeAsync(1);
 
     expect(vibrate).toHaveBeenCalledWith(20);
@@ -788,18 +792,21 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       fireEvent.blur(input);
       expect(input.getAttribute('contenteditable')).toBe('false');
 
-      // Failed mic start clears inline lock and keeps unfocused composer contenteditable="false"
+      // Failed mic start clears inline lock, shows error, and guarantees click-to-type fallback (contenteditable="true" + focused)
       voiceMock.startListening.mockResolvedValueOnce(false);
       dispatchPointer(input, 'pointerdown', 180);
-      await vi.advanceTimersByTimeAsync(240);
+      await vi.advanceTimersByTimeAsync(175);
       await vi.advanceTimersByTimeAsync(0);
-      expect(input.getAttribute('contenteditable')).toBe('false');
+      expect(input.getAttribute('contenteditable')).toBe('true');
+      expect(document.activeElement).toBe(input);
       expect(input.style.userSelect).toBe('');
       expect(readInlineWebkitUserModify(input)).toBe('');
+      fireEvent.blur(input);
+      expect(input.getAttribute('contenteditable')).toBe('false');
 
       // Active hold suppresses selectstart/contextmenu, sets inline read-only, prevents touchmove pan, then pointercancel restores cleanly
       dispatchPointer(input, 'pointerdown', 180);
-      await vi.advanceTimersByTimeAsync(240);
+      await vi.advanceTimersByTimeAsync(175);
       expect(removeAllRanges).toHaveBeenCalled();
       expect(input.getAttribute('contenteditable')).toBe('false');
       expect(readInlineWebkitUserModify(input)).toBe('read-only');
@@ -1139,7 +1146,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
 
             expect(computed.trailing2PaddingRight).toBe('96px');
             expect(computed.trailing1PaddingRight).toBe('54px');
-            expect(computed.idleTouchAction).toBe('none');
+            expect(computed.idleTouchAction).toBe('manipulation');
             expect(computed.idleUserSelect).toBe('none');
             expect(computed.overlayBorderRadius).toBe('0px');
             expect(computed.overlayZIndex).toBe('2147483021');
@@ -1365,8 +1372,10 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
         expect(result.modify, `${tc.name} -webkit-user-modify`).toBe('read-only');
         expect(result.select, `${tc.name} -webkit-user-select`).toBe('none');
         expect(result.text, `${tc.name} rejects typing`).toBe('hello');
-        if (tc.name !== 'disabled') {
+        if (tc.name === 'holding') {
           expect(result.touchAction, `${tc.name} touch-action`).toBe('none');
+        } else if (tc.name !== 'disabled') {
+          expect(result.touchAction, `${tc.name} touch-action`).toBe('manipulation');
         }
       }
 
@@ -1774,5 +1783,163 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
       text: 'Recovered via click tail survives trailing lostcapture',
     }));
+  });
+
+  it('defers setPointerCapture until hold activates, promotes horizontal slide-hold past 90ms debounce, keeps focused 240ms vs unfocused 175ms distinct, and invokes passive prewarm', async () => {
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = document.querySelector('.controls-input') as HTMLElement;
+    const setPointerCaptureSpy = vi.fn();
+    (input as any).setPointerCapture = setPointerCaptureSpy;
+
+    // passive prewarm ran on mobile voice-ready mount without prompting permission
+    expect(voiceMock.prewarm).toHaveBeenCalledWith({ requestPermission: false });
+    voiceMock.prewarm.mockClear();
+
+    // 1. pointerdown calls passive prewarm and does NOT call setPointerCapture during pending phase
+    dispatchPointer(input, 'pointerdown', 180, 500, 1);
+    expect(voiceMock.prewarm).toHaveBeenCalledWith({ requestPermission: false });
+    expect(setPointerCaptureSpy).not.toHaveBeenCalled();
+
+    // 2. Horizontal slide past 90ms debounce promotes immediately (before 175ms) even if setPointerCapture throws
+    setPointerCaptureSpy.mockImplementationOnce(() => { throw new Error('unsupported'); });
+    await vi.advanceTimersByTimeAsync(95);
+    dispatchPointer(input, 'pointermove', 200, 502, 1); // dx = +20, dy = +2
+    expect(setPointerCaptureSpy).toHaveBeenCalledWith(1);
+    expect(voiceMock.startListening).toHaveBeenCalledTimes(1);
+    expect(document.querySelector('.voice-hold-hud')).not.toBeNull();
+    dispatchPointer(input, 'pointermove', 110, 502, 1); // slide left -> cancel
+    dispatchPointer(input, 'pointerup', 110, 502, 1);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.activeElement).not.toBe(input);
+    expect(input.getAttribute('contenteditable')).toBe('false');
+
+    // 3. Focused composer preserves 240ms hold threshold while 140ms tap stays safe
+    dispatchPointer(input, 'pointerdown', 180, 500, 2);
+    await vi.advanceTimersByTimeAsync(60);
+    dispatchPointer(input, 'pointerup', 180, 500, 2);
+    expect(document.activeElement).toBe(input);
+    expect(input.getAttribute('contenteditable')).toBe('true');
+
+    dispatchPointer(input, 'pointerdown', 180, 500, 3);
+    await vi.advanceTimersByTimeAsync(175);
+    expect(voiceMock.startListening).toHaveBeenCalledTimes(1); // NOT triggered at 175ms while already focused
+    await vi.advanceTimersByTimeAsync(64); // total 239ms
+    expect(voiceMock.startListening).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1); // total 240ms
+    expect(voiceMock.startListening).toHaveBeenCalledTimes(2);
+    dispatchPointer(input, 'pointermove', 100, 500, 3); // explicit slide-to-cancel
+    dispatchPointer(input, 'pointerup', 100, 500, 3);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.activeElement).not.toBe(input);
+    expect(input.getAttribute('contenteditable')).toBe('false');
+  });
+
+  it('guarantees click-to-type fallback across every failed or pre-recording aborted hold path without hijacking strong vertical scroll or explicit slide-to-cancel', async () => {
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = document.querySelector('.controls-input') as HTMLElement;
+    const resetToUnfocused = async () => {
+      input.blur();
+      fireEvent.blur(input);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(input.getAttribute('contenteditable')).toBe('false');
+    };
+
+    // 1. Small movement slop (<40px vertical scroll, <90ms) aborts pending hold and falls back to typing focus
+    dispatchPointer(input, 'pointerdown', 180, 500, 1);
+    await vi.advanceTimersByTimeAsync(40);
+    dispatchPointer(input, 'pointermove', 204, 504, 1); // dist ~24.3 > 18 slop
+    expect(voiceMock.startListening).not.toHaveBeenCalled();
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(document.activeElement).toBe(input);
+    dispatchPointer(input, 'pointerup', 204, 504, 1);
+    await resetToUnfocused();
+
+    // 2. Strong vertical scroll swipe (>=40px vertical & vertical-dominant) aborts without popping open keyboard
+    dispatchPointer(input, 'pointerdown', 180, 500, 2);
+    await vi.advanceTimersByTimeAsync(40);
+    dispatchPointer(input, 'pointermove', 182, 452, 2); // dy = -48
+    expect(voiceMock.startListening).not.toHaveBeenCalled();
+    expect(input.getAttribute('contenteditable')).toBe('false');
+    expect(document.activeElement).not.toBe(input);
+
+    // 3. Pending pointercancel (<175ms) falls back cleanly to typing focus
+    dispatchPointer(input, 'pointerdown', 180, 500, 3);
+    await vi.advanceTimersByTimeAsync(80);
+    dispatchPointer(input, 'pointercancel', 180, 500, 3);
+    expect(voiceMock.startListening).not.toHaveBeenCalled();
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(document.activeElement).toBe(input);
+    await resetToUnfocused();
+
+    // 4. pointercancel while startListening is still starting (!didStartRecording) aborts cleanly and focuses composer
+    let resolvePendingStart!: (ok: boolean) => void;
+    voiceMock.startListening.mockImplementationOnce(() => new Promise<boolean>((r) => { resolvePendingStart = r; }));
+    dispatchPointer(input, 'pointerdown', 180, 500, 4);
+    await vi.advanceTimersByTimeAsync(175);
+    expect(voiceMock.startListening).toHaveBeenCalledTimes(1);
+    dispatchPointer(input, 'pointercancel', 180, 500, 4);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(document.activeElement).toBe(input);
+    resolvePendingStart(false);
+    await vi.advanceTimersByTimeAsync(0);
+    await resetToUnfocused();
+
+    // 5. Blocked by active prior drain -> overlapping hold restores typing focus without disrupting drain
+    let resolveSlowStop!: () => void;
+    voiceMock.stopListening.mockImplementationOnce(() => new Promise<void>((r) => { resolveSlowStop = r; }));
+    dispatchPointer(input, 'pointerdown', 180, 500, 5);
+    await vi.advanceTimersByTimeAsync(175);
+    voiceMock.partialHandler?.('first drain phrase');
+    dispatchPointer(input, 'pointerup', 180, 500, 5);
+    await vi.advanceTimersByTimeAsync(0);
+
+    dispatchPointer(input, 'pointerdown', 180, 500, 6);
+    await vi.advanceTimersByTimeAsync(175);
+    expect(voiceMock.startListening).toHaveBeenCalledTimes(2); // did not start 3rd hold
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(document.activeElement).toBe(input);
+    dispatchPointer(input, 'pointerup', 180, 500, 6);
+    resolveSlowStop();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+      text: 'first drain phrase',
+    }));
+    await resetToUnfocused();
+
+    // 6. startListening rejecting or firing permission_denied immediately falls back to typing focus
+    voiceMock.startListening.mockRejectedValueOnce(new Error('permission_denied'));
+    dispatchPointer(input, 'pointerdown', 180, 500, 7);
+    await vi.advanceTimersByTimeAsync(175);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.querySelector('.voice-hold-error-banner')).not.toBeNull();
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(document.activeElement).toBe(input);
+    dispatchPointer(input, 'pointerup', 180, 500, 7);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(document.activeElement).toBe(input);
   });
 });

@@ -94,6 +94,16 @@ interface NativeSession {
   handles: PluginListenerHandle[];
 }
 
+interface PrewarmCacheEntry {
+  primary: NativeSpeechRecognition;
+  effective: NativeSpeechRecognition;
+  checkedAt: number;
+  permissionGranted: boolean;
+  available: boolean;
+}
+
+const PREWARM_CACHE_TTL_MS = 15_000;
+
 interface WebSession {
   generation: number;
   owner: CaptureOwner;
@@ -110,6 +120,8 @@ let _pendingStart: { promise: Promise<boolean>; generation: number; session: Nat
 let _pendingStop: Promise<void> | null = null;
 let _nativeSession: NativeSession | null = null;
 let _activeOwner: CaptureOwner | null = null;
+let _prewarmCache: PrewarmCacheEntry | null = null;
+let _prewarmInFlight: { promise: Promise<void>; requestPermission: boolean } | null = null;
 let _onLevel: ((level: number) => void) | null = null;
 let _onError: ((error: string) => void) | null = null;
 let _lastError: string | null = null;
@@ -151,6 +163,7 @@ function emitOwnerResult(owner: CaptureOwner | null, text: string, isFinal: bool
 }
 
 function reportOwnerError(owner: CaptureOwner | null, error: string): void {
+  _prewarmCache = null;
   if (!isOwnerCurrent(owner)) return;
   _lastError = error;
   (owner!.onError ?? _onError)?.(error);
@@ -284,20 +297,132 @@ async function attachSessionListeners(
 
 async function resolveUsableFallbackRecognizer(
   primary: NativeSpeechRecognition,
+  requestPermission = true,
 ): Promise<NativeSpeechRecognition | null> {
   const fallback = getPlatformFallbackSpeechRecognition();
   if (!fallback || fallback === primary || typeof fallback.available !== 'function') return null;
   try {
+    const checkPerms = (
+      fallback as NativeSpeechRecognition & {
+        checkPermissions?: () => Promise<{ speechRecognition?: string }>;
+      }
+    ).checkPermissions;
+    let granted = false;
+    if (typeof checkPerms === 'function') {
+      const checked = await checkPerms().catch(() => ({ speechRecognition: undefined }));
+      granted = checked?.speechRecognition === 'granted';
+    }
+    if (!granted && !requestPermission) return null;
     const [perms, avail] = await Promise.all([
-      typeof fallback.requestPermissions === 'function'
-        ? fallback.requestPermissions()
-        : Promise.resolve({ speechRecognition: 'granted' }),
+      granted
+        ? Promise.resolve({ speechRecognition: 'granted' })
+        : (typeof fallback.requestPermissions === 'function'
+            ? fallback.requestPermissions()
+            : Promise.resolve({ speechRecognition: 'granted' })),
       fallback.available(),
     ]);
     if (perms?.speechRecognition !== 'granted') return null;
     return avail?.available ? fallback : null;
   } catch {
     return null;
+  }
+}
+
+function getFreshPrewarmCache(primary: NativeSpeechRecognition): PrewarmCacheEntry | null {
+  if (!_prewarmCache) return null;
+  if (
+    _prewarmCache.primary !== primary
+    || Date.now() - _prewarmCache.checkedAt > PREWARM_CACHE_TTL_MS
+  ) {
+    _prewarmCache = null;
+    return null;
+  }
+  return _prewarmCache;
+}
+
+/** Pre-warm native speech permissions and recognizer availability so hold-to-talk
+ * starts without an extra IPC permission/availability roundtrip on finger down.
+ * Idempotent and deduplicated across concurrent callers; never throws. */
+export async function prewarm(options?: { requestPermission?: boolean }): Promise<void> {
+  if (!isNative()) return;
+  const requestPermission = options?.requestPermission !== false;
+  let recognition: NativeSpeechRecognition;
+  try {
+    recognition = getNativeSpeechRecognition();
+  } catch {
+    return;
+  }
+
+  const cached = getFreshPrewarmCache(recognition);
+  if (cached && (cached.permissionGranted || !requestPermission)) {
+    return;
+  }
+
+  if (_prewarmInFlight) {
+    const shouldAwaitOnly = _prewarmInFlight.requestPermission || !requestPermission;
+    await _prewarmInFlight.promise;
+    if (shouldAwaitOnly) return;
+    const afterWait = getFreshPrewarmCache(recognition);
+    if (afterWait && afterWait.permissionGranted) return;
+  }
+
+  const runPromise = (async () => {
+    try {
+      const checkPerms = (
+        recognition as NativeSpeechRecognition & {
+          checkPermissions?: () => Promise<{ speechRecognition?: string }>;
+        }
+      ).checkPermissions;
+
+      let permissionGranted = false;
+      if (typeof checkPerms === 'function') {
+        const checked = await checkPerms().catch(() => ({ speechRecognition: undefined }));
+        permissionGranted = checked?.speechRecognition === 'granted';
+      }
+
+      if (!permissionGranted && requestPermission) {
+        const perms = await recognition.requestPermissions().catch(() => ({ speechRecognition: 'denied' }));
+        permissionGranted = perms?.speechRecognition === 'granted';
+        if (!permissionGranted) {
+          _prewarmCache = null;
+          return;
+        }
+      }
+
+      const available = await recognition.available().catch(() => ({ available: false }));
+      let effective: NativeSpeechRecognition | null = available?.available ? recognition : null;
+      if (!effective && (permissionGranted || requestPermission)) {
+        effective = await resolveUsableFallbackRecognizer(recognition, requestPermission);
+        if (effective) {
+          permissionGranted = true;
+        }
+      }
+
+      if (!effective) {
+        _prewarmCache = null;
+        return;
+      }
+
+      _prewarmCache = {
+        primary: recognition,
+        effective,
+        checkedAt: Date.now(),
+        permissionGranted,
+        available: true,
+      };
+    } catch {
+      _prewarmCache = null;
+    }
+  })();
+
+  const entry = { promise: runPromise, requestPermission };
+  _prewarmInFlight = entry;
+  try {
+    await runPromise;
+  } finally {
+    if (_prewarmInFlight === entry) {
+      _prewarmInFlight = null;
+    }
   }
 }
 
@@ -323,41 +448,74 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
   _nativeSession = session;
 
   try {
-    const [perms, available] = await Promise.all([
-      recognition.requestPermissions(),
-      recognition.available().catch(() => ({ available: false })),
-    ]);
-    if (!isSessionStarting()) {
-      await cleanupSessionListeners(session);
-      if (_nativeSession === session) _nativeSession = null;
-      return false;
-    }
-    if (perms.speechRecognition !== 'granted') {
-      console.warn('[voice] microphone permission denied');
-      reportOwnerError(session.owner, 'permission_denied');
-      session.retired = true;
-      if (_nativeSession === session) _nativeSession = null;
-      retireOwner(session.owner);
-      return false;
-    }
-    if (!available?.available) {
-      const fallback = await resolveUsableFallbackRecognizer(recognition);
+    if (!getFreshPrewarmCache(recognition) && _prewarmInFlight) {
+      await _prewarmInFlight.promise;
       if (!isSessionStarting()) {
         await cleanupSessionListeners(session);
         if (_nativeSession === session) _nativeSession = null;
         return false;
       }
-      if (fallback) {
-        console.warn('[voice] custom offline speech unavailable, falling back to platform recognizer');
-        recognition = fallback;
-        session.recognition = fallback;
-      } else {
-        console.warn('[voice] speech recognition unavailable');
-        reportOwnerError(session.owner, 'Offline speech model unavailable');
+    }
+
+    const prewarmed = getFreshPrewarmCache(recognition);
+    if (prewarmed && prewarmed.permissionGranted && prewarmed.available) {
+      recognition = prewarmed.effective;
+      session.recognition = prewarmed.effective;
+    } else if (prewarmed && prewarmed.available) {
+      const perms = await recognition.requestPermissions();
+      if (!isSessionStarting()) {
+        await cleanupSessionListeners(session);
+        if (_nativeSession === session) _nativeSession = null;
+        return false;
+      }
+      if (perms.speechRecognition !== 'granted') {
+        console.warn('[voice] microphone permission denied');
+        reportOwnerError(session.owner, 'permission_denied');
         session.retired = true;
         if (_nativeSession === session) _nativeSession = null;
         retireOwner(session.owner);
         return false;
+      }
+      prewarmed.permissionGranted = true;
+      recognition = prewarmed.effective;
+      session.recognition = prewarmed.effective;
+    } else {
+      const [perms, available] = await Promise.all([
+        recognition.requestPermissions(),
+        recognition.available().catch(() => ({ available: false })),
+      ]);
+      if (!isSessionStarting()) {
+        await cleanupSessionListeners(session);
+        if (_nativeSession === session) _nativeSession = null;
+        return false;
+      }
+      if (perms.speechRecognition !== 'granted') {
+        console.warn('[voice] microphone permission denied');
+        reportOwnerError(session.owner, 'permission_denied');
+        session.retired = true;
+        if (_nativeSession === session) _nativeSession = null;
+        retireOwner(session.owner);
+        return false;
+      }
+      if (!available?.available) {
+        const fallback = await resolveUsableFallbackRecognizer(recognition);
+        if (!isSessionStarting()) {
+          await cleanupSessionListeners(session);
+          if (_nativeSession === session) _nativeSession = null;
+          return false;
+        }
+        if (fallback) {
+          console.warn('[voice] custom offline speech unavailable, falling back to platform recognizer');
+          recognition = fallback;
+          session.recognition = fallback;
+        } else {
+          console.warn('[voice] speech recognition unavailable');
+          reportOwnerError(session.owner, 'Offline speech model unavailable');
+          session.retired = true;
+          if (_nativeSession === session) _nativeSession = null;
+          retireOwner(session.owner);
+          return false;
+        }
       }
     }
 
@@ -378,6 +536,7 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
         addPunctuation: true,
       });
     } catch (startErr) {
+      _prewarmCache = null;
       if (!isSessionStarting()) throw startErr;
       const startMsg = startErr instanceof Error ? startErr.message : String(startErr ?? '');
       if (!/permission|denied|not allowed/i.test(startMsg)) {
