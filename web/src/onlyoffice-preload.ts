@@ -1,10 +1,10 @@
 /**
  * Lightweight ONLYOFFICE component prewarming utilities.
  *
- * Kept completely separate from OfficePreview.tsx and local fallback parsers
- * (pdfjs-dist, docx-preview, xlsx) so CloudDocsPanel, FileBrowser, and post-auth
- * idle hooks can warm ONLYOFFICE DNS/TLS, api.js, and static editor bundles
- * without pulling preview UI or fallback parsers into initial chunks.
+ * Kept completely separate from preview UI and local fallback parsers
+ * so CloudDocsPanel, FileBrowser, and post-auth idle hooks can warm
+ * ONLYOFFICE DNS/TLS, api.js, and static editor bundles without eagerly
+ * bundling document preview UI or fallback parsers.
  */
 import { fetchOnlyOfficeStatus, type OnlyOfficeStatusResponse } from './api.js';
 
@@ -21,6 +21,11 @@ declare global {
 const scriptLoadPromises = new Map<string, Promise<void>>();
 let prewarmPromise: Promise<void> | null = null;
 let prewarmSeq = 0;
+let loaderEpoch = 0;
+let activeTargetUrl: string | null = null;
+let loadedScriptUrl: string | null = null;
+let loadedDocEditor: unknown = null;
+let staleDocEditor: unknown = null;
 let cachedStatus: OnlyOfficeStatusResponse | null = null;
 
 function resolveOrigin(url: string): string | null {
@@ -34,15 +39,11 @@ function resolveOrigin(url: string): string | null {
   }
 }
 
-function findScriptElementBySrc(scriptUrl: string): HTMLScriptElement | null {
-  if (typeof document === 'undefined') return null;
-  const tags = document.querySelectorAll('script[data-onlyoffice-src]');
-  for (const tag of tags) {
-    if (tag instanceof HTMLScriptElement && tag.dataset.onlyofficeSrc === scriptUrl) {
-      return tag;
-    }
+function removeManagedScriptTags(): void {
+  if (typeof document === 'undefined') return;
+  for (const tag of document.querySelectorAll('script[data-onlyoffice-src]')) {
+    tag.remove();
   }
-  return null;
 }
 
 function ensurePreconnectLink(publicUrl: string): void {
@@ -96,38 +97,99 @@ function mountOnlyOfficePreloadIframe(publicUrl: string): void {
   container.appendChild(iframe);
 }
 
+function removeManagedDomNodes(): void {
+  if (typeof document === 'undefined') return;
+  for (const node of document.querySelectorAll(
+    'link[data-onlyoffice-preconnect], script[data-onlyoffice-src], iframe[data-onlyoffice-preload]',
+  )) {
+    node.remove();
+  }
+}
+
 /**
- * Load ONLYOFFICE `api.js` once per URL and cache the settled promise across prewarm and editor opens.
- * On load error, clears the cached promise and removes the failed tag so later retries start clean.
+ * Load ONLYOFFICE `api.js` for `scriptUrl`, verifying that `window.DocsAPI.DocEditor`
+ * actually initialized and belongs to the requested URL/generation.
+ * On load failure or missing initialization, evicts failed cache/tag state so retries start fresh.
  */
 export function loadOnlyOfficeScript(scriptUrl: string): Promise<void> {
-  if (typeof window !== 'undefined' && window.DocsAPI?.DocEditor) {
-    return Promise.resolve();
+  const liveEditor = typeof window !== 'undefined' ? window.DocsAPI?.DocEditor : undefined;
+  if (typeof liveEditor === 'function' && liveEditor !== staleDocEditor) {
+    if (loadedScriptUrl === scriptUrl && liveEditor === loadedDocEditor) {
+      return Promise.resolve();
+    }
+    if (loadedScriptUrl === null && activeTargetUrl === null) {
+      // Pre-injected outside this loader (e.g. unit test doubles) with no URL conflict.
+      return Promise.resolve();
+    }
   }
+
   const existing = scriptLoadPromises.get(scriptUrl);
   if (existing) return existing;
 
+  if (activeTargetUrl !== scriptUrl || (loadedScriptUrl !== null && loadedScriptUrl !== scriptUrl)) {
+    loaderEpoch += 1;
+    activeTargetUrl = scriptUrl;
+    if (loadedScriptUrl !== null && loadedScriptUrl !== scriptUrl) {
+      staleDocEditor = loadedDocEditor ?? staleDocEditor;
+      loadedScriptUrl = null;
+      loadedDocEditor = null;
+    }
+    scriptLoadPromises.clear();
+  }
+
+  const epoch = loaderEpoch;
   const promise = new Promise<void>((resolve, reject) => {
     if (typeof document === 'undefined') {
-      scriptLoadPromises.delete(scriptUrl);
+      if (scriptLoadPromises.get(scriptUrl) === promise) {
+        scriptLoadPromises.delete(scriptUrl);
+      }
+      if (activeTargetUrl === scriptUrl) activeTargetUrl = null;
       reject(new Error('Document is unavailable'));
       return;
     }
-    if (window.DocsAPI?.DocEditor) {
-      resolve();
-      return;
+
+    if (
+      typeof window !== 'undefined' &&
+      window.DocsAPI?.DocEditor &&
+      (window.DocsAPI.DocEditor === staleDocEditor || window.DocsAPI.DocEditor === loadedDocEditor)
+    ) {
+      delete window.DocsAPI;
     }
-    const existingTag = findScriptElementBySrc(scriptUrl);
-    if (existingTag) {
-      existingTag.remove();
-    }
+
+    removeManagedScriptTags();
     const script = document.createElement('script');
     script.src = scriptUrl;
     script.async = true;
     script.dataset.onlyofficeSrc = scriptUrl;
-    script.onload = () => resolve();
+    script.onload = () => {
+      if (epoch !== loaderEpoch) {
+        if (scriptLoadPromises.get(scriptUrl) === promise) {
+          scriptLoadPromises.delete(scriptUrl);
+        }
+        script.remove();
+        reject(new Error('Stale ONLYOFFICE API script load superseded'));
+        return;
+      }
+      const initializedEditor = typeof window !== 'undefined' ? window.DocsAPI?.DocEditor : undefined;
+      if (typeof initializedEditor !== 'function' || initializedEditor === staleDocEditor) {
+        if (scriptLoadPromises.get(scriptUrl) === promise) {
+          scriptLoadPromises.delete(scriptUrl);
+        }
+        if (activeTargetUrl === scriptUrl) activeTargetUrl = null;
+        script.remove();
+        reject(new Error('ONLYOFFICE API script loaded without DocsAPI.DocEditor'));
+        return;
+      }
+      loadedScriptUrl = scriptUrl;
+      loadedDocEditor = initializedEditor;
+      staleDocEditor = null;
+      resolve();
+    };
     script.onerror = () => {
-      scriptLoadPromises.delete(scriptUrl);
+      if (scriptLoadPromises.get(scriptUrl) === promise) {
+        scriptLoadPromises.delete(scriptUrl);
+      }
+      if (activeTargetUrl === scriptUrl) activeTargetUrl = null;
       script.remove();
       reject(new Error('Failed to load ONLYOFFICE API script'));
     };
@@ -208,17 +270,24 @@ export function scheduleOnlyOfficePrewarm(): () => void {
   };
 }
 
-/** Clear cached prewarm state on logout or inside unit tests. */
+/** Clear cached prewarm state and invalidate prior script bindings on auth switch/logout or inside tests. */
 export function resetOnlyOfficePrewarm(opts?: { clearScriptCache?: boolean; removeDomNodes?: boolean }): void {
   prewarmSeq += 1;
+  loaderEpoch += 1;
   prewarmPromise = null;
   cachedStatus = null;
-  if (opts?.clearScriptCache) {
+  activeTargetUrl = null;
+  const previousEditor =
+    loadedDocEditor ?? (loadedScriptUrl !== null && typeof window !== 'undefined' ? window.DocsAPI?.DocEditor : null);
+  if (previousEditor) {
+    staleDocEditor = previousEditor;
+  }
+  loadedScriptUrl = null;
+  loadedDocEditor = null;
+  if (opts?.clearScriptCache !== false) {
     scriptLoadPromises.clear();
   }
-  if (opts?.removeDomNodes && typeof document !== 'undefined') {
-    for (const node of document.querySelectorAll('link[data-onlyoffice-preconnect], script[data-onlyoffice-src], iframe[data-onlyoffice-preload]')) {
-      node.remove();
-    }
+  if (opts?.removeDomNodes !== false) {
+    removeManagedDomNodes();
   }
 }

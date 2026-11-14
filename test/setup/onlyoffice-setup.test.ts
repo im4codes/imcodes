@@ -1024,9 +1024,9 @@ esac
         expect(caddy).toContain('@onlyoffice_static {');
         expect(caddy).toContain('path_regexp ^/v?[0-9]+\\.[0-9]+\\.[0-9]+[.-][^/]+/(web-apps|sdkjs|sdkjs-plugins|fonts|dictionaries)/');
         expect(caddy).toContain('not path /web-apps/apps/api/documents/api.js /web-apps/apps/api/documents/preload.html /web-apps/apps/api/documents/cache-scripts.html */api/documents/api.js */api/documents/preload.html */api/documents/cache-scripts.html');
-        expect(caddy).toContain('header @onlyoffice_static >Cache-Control "public, max-age=31536000, immutable"');
+        expect(caddy).toContain('header @onlyoffice_static {\n\t\t\tmatch status 2xx 304\n\t\t\t>Cache-Control "public, max-age=31536000, immutable"\n\t\t}');
         expect(caddy).toContain('@onlyoffice_bootstrap {');
-        expect(caddy).toContain('header @onlyoffice_bootstrap >Cache-Control "no-cache, must-revalidate"');
+        expect(caddy).toContain('header @onlyoffice_bootstrap {\n\t\t\tmatch status 2xx 304\n\t\t\t>Cache-Control "no-cache, must-revalidate"\n\t\t}');
         expect(caddy).toContain('handle_path /onlyoffice/* {');
         expect(caddy).not.toContain('header * >Cache-Control');
 

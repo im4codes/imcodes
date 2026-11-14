@@ -983,4 +983,119 @@ describe('OfficePreview fallback document transitions', () => {
       script.remove();
     }
   });
+
+  it('recovers via real OfficePreview retry after prewarm onload lacked DocsAPI initialization (F2.A)', async () => {
+    const {
+      prewarmOnlyOfficeComponents,
+      resetOnlyOfficePrewarm,
+    } = await import('../../src/onlyoffice-preload.js');
+    resetOnlyOfficePrewarm({ clearScriptCache: true, removeDomNodes: true });
+    delete (window as unknown as { DocsAPI?: unknown }).DocsAPI;
+
+    const publicUrl = 'https://onlyoffice-retry.test/onlyoffice';
+    const scriptUrl = `${publicUrl}/web-apps/apps/api/documents/api.js`;
+    const docEditorSpy = vi.fn().mockImplementation(() => ({ destroyEditor: vi.fn() }));
+
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const u = String(input);
+      if (u.includes('/api/onlyoffice/status')) {
+        return {
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({ enabled: true, publicUrl, scriptUrl }),
+          json: async () => ({ enabled: true, publicUrl, scriptUrl }),
+        };
+      }
+      if (u.includes('/onlyoffice/config')) {
+        return {
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({
+            enabled: true,
+            role: 'viewer',
+            allowDownload: true,
+            canManageShare: false,
+            isOwner: false,
+            mode: 'view',
+            publicUrl,
+            scriptUrl,
+            docToken: 'tok_retry',
+            config: {
+              documentType: 'cell',
+              document: { fileType: 'xlsx', key: 'k1', title: 'r.xlsx', url: 'https://f/r.xlsx', permissions: { edit: false, download: true } },
+              editorConfig: { mode: 'view', callbackUrl: 'https://f/cb', user: { id: 'u1', name: 'U' } },
+              token: 'jwt_r',
+            },
+          }),
+          json: async () => ({
+            enabled: true,
+            role: 'viewer',
+            allowDownload: true,
+            canManageShare: false,
+            isOwner: false,
+            mode: 'view',
+            publicUrl,
+            scriptUrl,
+            docToken: 'tok_retry',
+            config: {
+              documentType: 'cell',
+              document: { fileType: 'xlsx', key: 'k1', title: 'r.xlsx', url: 'https://f/r.xlsx', permissions: { edit: false, download: true } },
+              editorConfig: { mode: 'view', callbackUrl: 'https://f/cb', user: { id: 'u1', name: 'U' } },
+              token: 'jwt_r',
+            },
+          }),
+        };
+      }
+      return { ok: false, status: 404, text: async () => '' };
+    }));
+
+    try {
+      // 1. Prewarm loads script whose onload fires WITHOUT window.DocsAPI
+      const warm = prewarmOnlyOfficeComponents();
+      await waitFor(() => {
+        expect(document.querySelector('script[data-onlyoffice-src]')).not.toBeNull();
+      });
+      const prewarmScript = document.querySelector('script[data-onlyoffice-src]') as HTMLScriptElement;
+      prewarmScript.onload?.(new Event('load'));
+      await warm;
+
+      // 2. Mount real OfficePreview; first script load also fires onload without DocsAPI -> shows Retry UI
+      const { default: OfficePreview } = await import('../../src/components/OfficePreview.js');
+      const view = render(
+        <OfficePreview
+          serverId="srv-1"
+          path="/docs/r.xlsx"
+          mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        />,
+      );
+
+      await waitFor(() => {
+        const s = document.querySelector('script[data-onlyoffice-src]') as HTMLScriptElement | null;
+        expect(s).not.toBeNull();
+        expect(s).not.toBe(prewarmScript);
+      });
+      const firstOpenScript = document.querySelector('script[data-onlyoffice-src]') as HTMLScriptElement;
+      firstOpenScript.onload?.(new Event('load'));
+
+      const retryBtn = await waitFor(() => view.getByTestId('office-preview-retry-onlyoffice'));
+      expect(docEditorSpy).not.toHaveBeenCalled();
+
+      // 3. Click Retry after DocsAPI becomes healthy -> fresh script loads and DocEditor mounts
+      fireEvent.click(retryBtn);
+      await waitFor(() => {
+        const s = document.querySelector('script[data-onlyoffice-src]') as HTMLScriptElement | null;
+        expect(s).not.toBeNull();
+        expect(s).not.toBe(firstOpenScript);
+      });
+      (window as unknown as { DocsAPI: { DocEditor: typeof docEditorSpy } }).DocsAPI = { DocEditor: docEditorSpy };
+      const recoveredScript = document.querySelector('script[data-onlyoffice-src]') as HTMLScriptElement;
+      recoveredScript.onload?.(new Event('load'));
+
+      await waitFor(() => expect(docEditorSpy).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(view.getByTestId('onlyoffice-toolbar')).toBeTruthy());
+    } finally {
+      resetOnlyOfficePrewarm({ clearScriptCache: true, removeDomNodes: true });
+      delete (window as unknown as { DocsAPI?: unknown }).DocsAPI;
+    }
+  });
 });

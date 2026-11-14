@@ -97,5 +97,7 @@ export function isNonDaemonApiUse(use: ApiPathUse): boolean {
   };
   // Shared local node UI paths never leave loopback and carry no server token.
   if (use.path === '/api/state' || use.path === '/api/action') return use.file.startsWith('src/node/');
+  // Caddy reverse-proxy matcher literals for ONLYOFFICE Document Server (/web-apps/apps/api/documents/...), not daemon REST calls.
+  if (use.file === 'src/setup/templates.ts' && use.path.startsWith('/api/documents/')) return true;
   return exceptions[use.file]?.includes(use.path) ?? false;
 }

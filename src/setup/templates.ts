@@ -272,8 +272,14 @@ export function onlyofficeCaddyRouteBlock(): string {
     `\t\tpath /web-apps/apps/api/documents/api.js /web-apps/apps/api/documents/preload.html /web-apps/apps/api/documents/cache-scripts.html */api/documents/api.js */api/documents/preload.html */api/documents/cache-scripts.html\n` +
     `\t}\n` +
     `\thandle_path ${ONLYOFFICE_SERVICE_DEFAULTS.SUBPATH}/* {\n` +
-    `\t\theader @onlyoffice_static >Cache-Control "public, max-age=31536000, immutable"\n` +
-    `\t\theader @onlyoffice_bootstrap >Cache-Control "no-cache, must-revalidate"\n` +
+    `\t\theader @onlyoffice_static {\n` +
+    `\t\t\tmatch status 2xx 304\n` +
+    `\t\t\t>Cache-Control "public, max-age=31536000, immutable"\n` +
+    `\t\t}\n` +
+    `\t\theader @onlyoffice_bootstrap {\n` +
+    `\t\t\tmatch status 2xx 304\n` +
+    `\t\t\t>Cache-Control "no-cache, must-revalidate"\n` +
+    `\t\t}\n` +
     `\t\treverse_proxy onlyoffice:80 {\n` +
     `\t\t\theader_up X-Forwarded-Proto {scheme}\n` +
     `\t\t\theader_up X-Forwarded-Host {host}\n` +

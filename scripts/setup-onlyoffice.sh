@@ -594,8 +594,14 @@ ${CLEAN_DOMAIN} {
 		path /web-apps/apps/api/documents/api.js /web-apps/apps/api/documents/preload.html /web-apps/apps/api/documents/cache-scripts.html */api/documents/api.js */api/documents/preload.html */api/documents/cache-scripts.html
 	}
 	handle_path /onlyoffice/* {
-		header @onlyoffice_static >Cache-Control "public, max-age=31536000, immutable"
-		header @onlyoffice_bootstrap >Cache-Control "no-cache, must-revalidate"
+		header @onlyoffice_static {
+			match status 2xx 304
+			>Cache-Control "public, max-age=31536000, immutable"
+		}
+		header @onlyoffice_bootstrap {
+			match status 2xx 304
+			>Cache-Control "no-cache, must-revalidate"
+		}
 		reverse_proxy onlyoffice:80 {
 			header_up X-Forwarded-Proto {scheme}
 			header_up X-Forwarded-Host {host}
@@ -621,8 +627,14 @@ elif ! grep -Eq '^[[:space:]]*handle_path[[:space:]]+/onlyoffice/\*' "$CADDY_FIL
         print "\t\tpath /web-apps/apps/api/documents/api.js /web-apps/apps/api/documents/preload.html /web-apps/apps/api/documents/cache-scripts.html */api/documents/api.js */api/documents/preload.html */api/documents/cache-scripts.html"
         print "\t}"
         print "\thandle_path /onlyoffice/* {"
-        print "\t\theader @onlyoffice_static >Cache-Control \"public, max-age=31536000, immutable\""
-        print "\t\theader @onlyoffice_bootstrap >Cache-Control \"no-cache, must-revalidate\""
+        print "\t\theader @onlyoffice_static {"
+        print "\t\t\tmatch status 2xx 304"
+        print "\t\t\t>Cache-Control \"public, max-age=31536000, immutable\""
+        print "\t\t}"
+        print "\t\theader @onlyoffice_bootstrap {"
+        print "\t\t\tmatch status 2xx 304"
+        print "\t\t\t>Cache-Control \"no-cache, must-revalidate\""
+        print "\t\t}"
         print "\t\treverse_proxy onlyoffice:80 {"
         print "\t\t\theader_up X-Forwarded-Proto {scheme}"
         print "\t\t\theader_up X-Forwarded-Host {host}"

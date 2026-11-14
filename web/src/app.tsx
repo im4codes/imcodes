@@ -1750,18 +1750,22 @@ function InternalMainApp() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const prevOnlyOfficeAuthScopeRef = useRef<string | null>(null);
   // Configure API client when auth changes; start/stop proactive refresh timer
   useEffect(() => {
     configureExpectedUserId(auth?.userId ?? null);
     let cancelPrewarm = () => {};
+    const nextAuthScope = auth ? `${auth.baseUrl ?? ''}\n${auth.userId ?? ''}` : null;
+    if (prevOnlyOfficeAuthScopeRef.current !== null && prevOnlyOfficeAuthScopeRef.current !== nextAuthScope) {
+      resetOnlyOfficePrewarm();
+    }
+    prevOnlyOfficeAuthScopeRef.current = nextAuthScope;
     if (auth) {
       configureApi(auth.baseUrl);
       startProactiveRefresh();
-      resetOnlyOfficePrewarm();
       cancelPrewarm = scheduleOnlyOfficePrewarm();
     } else {
       stopProactiveRefresh();
-      resetOnlyOfficePrewarm();
     }
     return () => {
       cancelPrewarm();
