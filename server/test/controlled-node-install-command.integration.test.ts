@@ -8,7 +8,8 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { createServer, type Server } from 'node:http';
 import { execFile, execFileSync } from 'node:child_process';
-import { writeFile, mkdtemp, rm } from 'node:fs/promises';
+import { writeFile, mkdtemp, rm, chmod, readFile, symlink } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Hono } from 'hono';
@@ -242,10 +243,20 @@ describe('rendered installer script', () => {
       const body = renderControlledNodeInstallScript({
         serverUrl: loopback, installCode: code, os: 'linux', arch: 'x64',
       }).body;
-      // Would abort with `Protocol "http" disabled` before any request.
-      expect(body).not.toContain("--proto '=https'");
-      expect(body).not.toContain('--tlsv1.2');
-      expect(body).toContain("--proto '=http' --proto-redir '=http'");
+      const curlLines = body.split('\n').filter((line) => line.trimStart().startsWith('curl -fsSL'));
+      expect(curlLines.length).toBeGreaterThanOrEqual(3);
+      // Payload fetch and same-origin loopback HTTP download must pin http (otherwise curl aborts with Protocol "http" disabled).
+      expect(curlLines[0]).toContain("--proto '=http' --proto-redir '=http'");
+      expect(curlLines[0]).not.toContain("--proto '=https'");
+      expect(curlLines[0]).not.toContain('--tlsv1.2');
+      // External HTTPS artifact download MUST ALWAYS pin https/proto-redir=https regardless of origin scheme.
+      const httpsArtifactCurl = curlLines.find((line) => line.includes('--max-redirs 5'));
+      expect(httpsArtifactCurl).toBeDefined();
+      expect(httpsArtifactCurl).toContain("--proto '=https' --proto-redir '=https' --tlsv1.2");
+      const httpArtifactCurl = curlLines.find((line) => line.includes('--max-redirs 0') && line !== curlLines[0]);
+      expect(httpArtifactCurl).toBeDefined();
+      expect(httpArtifactCurl).toContain("--proto '=http' --proto-redir '=http'");
+      expect(httpArtifactCurl).not.toContain("--proto '=https'");
       // The redirect pin is scheme-independent: our routes never redirect.
       expect(body).not.toContain('--https-only');
       expect(body).toContain('--max-redirect=0');
@@ -277,19 +288,27 @@ describe('rendered installer script', () => {
   });
 
   it('keeps install-payload pinned to 0 redirects while allowing bounded HTTPS-only redirects for external artifact downloads', () => {
-    const linux = renderControlledNodeInstallScript({
-      serverUrl: SERVER_URL, installCode: code, os: 'linux', arch: 'x64',
-    }).body;
-    expect(linux).toContain('curl -fsSL --max-redirs 0');
-    expect(linux).toContain('curl -fsSL --max-redirs 5');
-    expect(linux).toContain('wget -q --max-redirect=5');
+    for (const originUrl of [SERVER_URL, 'http://127.0.0.1:8787']) {
+      const linux = renderControlledNodeInstallScript({
+        serverUrl: originUrl, installCode: code, os: 'linux', arch: 'x64',
+      }).body;
+      expect(linux).toContain('curl -fsSL --max-redirs 0');
+      expect(linux).toContain("curl -fsSL --max-redirs 5 --proto '=https' --proto-redir '=https' --tlsv1.2");
+      expect(linux).not.toContain('--max-redirect=5');
+      expect(linux).toContain('imcodes_download_https_wget');
+      expect(linux).toContain('wget -S --max-redirect=0');
+      expect(linux).toContain('imcodes_check_https_url');
+    }
 
     const win = renderControlledNodeInstallScript({
       serverUrl: SERVER_URL, installCode: code, os: 'win', arch: 'x64',
       windowsAuthenticodeSignerSha256: WINDOWS_SIGNER_SHA256,
     }).body;
     expect(win).toContain('-Method Post -Body @{ ticket = $code } -UseBasicParsing -MaximumRedirection 0');
+    expect(win).toContain('[Uri]::TryCreate');
+    expect(win).toContain('$artifactUri.UserInfo');
     expect(win).toContain("if ($nextUri.Scheme -cne 'https')");
+    expect(win).toContain('if ($nextUri.UserInfo)');
     expect(win).toContain('if ($hop -ge 5)');
   });
 });
@@ -744,5 +763,355 @@ describe('generated installer runs against a loopback HTTP origin', () => {
     const run = await runScript(broken);
     expect(run.stdout).not.toContain('INSTALLED-OK');
     expect(run.code).not.toBe(0);
+  }, 40_000);
+});
+
+describe('HTTPS redirect security boundaries in POSIX curl and wget branches', () => {
+  const PAYLOAD_BIN = '#!/bin/sh\necho "INSTALLED-OK"\n';
+  let workDir: string;
+  let server: Server;
+  let httpOrigin: string;
+  let nextArtifactUrl = 'https://cdn.example.test/start';
+
+  function resolveCommand(cmd: string): string | null {
+    try {
+      return execFileSync('sh', ['-c', `command -v ${cmd}`], { encoding: 'utf8' }).trim() || null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function buildMinimalBinDir(targetDir: string, includeCommands: string[]): Promise<void> {
+    await Promise.all(
+      includeCommands.map(async (cmd) => {
+        const resolved = resolveCommand(cmd);
+        if (resolved) {
+          await symlink(resolved, join(targetDir, cmd)).catch(() => {});
+        }
+      }),
+    );
+  }
+
+  const POSIX_UTIL_NAMES = [
+    'sh', 'dash', 'awk', 'sed', 'grep', 'cat', 'rm', 'chmod', 'mktemp',
+    'cut', 'sort', 'tail', 'sha256sum', 'shasum', 'openssl',
+  ];
+
+  beforeAll(async () => {
+    workDir = await mkdtemp(join(tmpdir(), 'imcodes-redirect-sec-'));
+    server = createServer((req, res) => {
+      let body = '';
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', () => {
+        if (req.method === 'POST' && (req.url ?? '').startsWith('/api/enroll/v2/install-payload') && body.includes('ticket=')) {
+          const json = JSON.stringify({
+            artifactUrl: nextArtifactUrl,
+            sha256: sha256(PAYLOAD_BIN),
+            sizeBytes: Buffer.byteLength(PAYLOAD_BIN),
+            abiProfile: 'modern',
+            enrollment: {
+              serverUrl: httpOrigin,
+              enrollToken: 'tok_sec_test',
+              ownerName: 'SecTest',
+            },
+          });
+          res.writeHead(200, {
+            'content-type': 'application/json',
+            'content-length': String(Buffer.byteLength(json)),
+            connection: 'close',
+          });
+          res.end(json);
+          return;
+        }
+        res.writeHead(404, { 'content-length': '0', connection: 'close' });
+        res.end();
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address();
+    httpOrigin = `http://127.0.0.1:${typeof addr === 'object' && addr ? addr.port : 0}`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(workDir, { recursive: true, force: true });
+  });
+
+  function shellsToTest(): string[] {
+    const shells = ['/bin/sh'];
+    if (existsSync('/bin/dash')) shells.push('/bin/dash');
+    return shells;
+  }
+
+  async function runInstallerWithShim(input: {
+    shell: string;
+    binDir: string;
+    extraEnv?: Record<string, string>;
+  }): Promise<{ stdout: string; stderr: string; code: number }> {
+    const scriptPath = join(workDir, `installer-${hex(4)}.sh`);
+    const libPath = join(workDir, 'test-libstdcpp');
+    await writeFile(libPath, 'GLIBCXX_3.4.21');
+    const { body } = renderControlledNodeInstallScript({
+      serverUrl: httpOrigin,
+      installCode: freshCode(),
+      os: 'linux',
+      arch: 'x64',
+    });
+    const rendered = body.replace('/lib64/libstdc++.so.6', `'${libPath}'`);
+    const shims = `id() { echo 0; }\nuname() { case "$1" in -m) echo 'x86_64';; -r) echo '6.8.0';; *) echo Linux;; esac; }\ngetconf() { echo 'glibc 2.35'; }\n`;
+    await writeFile(scriptPath, shims + rendered);
+    return await new Promise((resolve) => {
+      execFile(
+        input.shell,
+        [scriptPath],
+        {
+          timeout: 20_000,
+          encoding: 'utf8',
+          env: {
+            PATH: input.binDir,
+            TMPDIR: workDir,
+            ...input.extraEnv,
+          },
+        },
+        (error, stdout, stderr) => {
+          resolve({
+            stdout: String(stdout),
+            stderr: String(stderr),
+            code: error ? Number((error as NodeJS.ErrnoException & { code?: number }).code ?? 1) : 0,
+          });
+        },
+      );
+    });
+  }
+
+  it('curl HTTPS artifact download always passes --proto-redir=https even when serverUrl is HTTP, and rejects credentialed initial HTTPS URLs', async () => {
+    const curlBinDir = await mkdtemp(join(workDir, 'curl-bin-'));
+    await buildMinimalBinDir(curlBinDir, POSIX_UTIL_NAMES);
+    const realCurl = resolveCommand('curl');
+    expect(realCurl).toBeTruthy();
+
+    const argvLogPath = join(workDir, 'curl-argv.json');
+    const curlShimHelper = join(workDir, 'curl-shim.mjs');
+    await writeFile(curlShimHelper, `
+      import { execFileSync } from 'node:child_process';
+      import { writeFileSync, appendFileSync } from 'node:fs';
+      const args = process.argv.slice(2);
+      const outIdx = args.indexOf('-o');
+      const outPath = outIdx >= 0 ? args[outIdx + 1] : '';
+      const url = args.find((a) => a.startsWith('http://') || a.startsWith('https://')) || '';
+      if (url.startsWith('https://')) {
+        appendFileSync(process.env.CURL_ARGV_LOG, JSON.stringify(args) + '\\n');
+        writeFileSync(outPath, ${JSON.stringify(PAYLOAD_BIN)});
+        process.exit(0);
+      }
+      const res = execFileSync(${JSON.stringify(realCurl)}, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+      if (!outPath) process.stdout.write(res);
+    `);
+    await writeFile(
+      join(curlBinDir, 'curl'),
+      `#!/bin/sh\nexec "${process.execPath}" "${curlShimHelper}" "$@"\n`,
+    );
+    await chmod(join(curlBinDir, 'curl'), 0o755);
+
+    for (const shell of shellsToTest()) {
+      await writeFile(argvLogPath, '');
+      nextArtifactUrl = 'https://cdn.example.test/releases/imcodes-node';
+      const ok = await runInstallerWithShim({
+        shell,
+        binDir: curlBinDir,
+        extraEnv: { CURL_ARGV_LOG: argvLogPath },
+      });
+      expect(ok.code, `${shell} stderr: ${ok.stderr}`).toBe(0);
+      expect(ok.stdout).toContain('INSTALLED-OK');
+      const recordedCalls = (await readFile(argvLogPath, 'utf8')).trim().split('\n').map((l) => JSON.parse(l) as string[]);
+      expect(recordedCalls.length).toBe(1);
+      const artifactCurlArgs = recordedCalls[0]!;
+      expect(artifactCurlArgs).toContain('--max-redirs');
+      expect(artifactCurlArgs[artifactCurlArgs.indexOf('--max-redirs') + 1]).toBe('5');
+      expect(artifactCurlArgs).toContain('--proto');
+      expect(artifactCurlArgs[artifactCurlArgs.indexOf('--proto') + 1]).toBe('=https');
+      expect(artifactCurlArgs).toContain('--proto-redir');
+      expect(artifactCurlArgs[artifactCurlArgs.indexOf('--proto-redir') + 1]).toBe('=https');
+      expect(artifactCurlArgs).toContain('--tlsv1.2');
+
+      // Credential-bearing initial HTTPS artifact URL must be refused BEFORE invoking curl.
+      await writeFile(argvLogPath, '');
+      nextArtifactUrl = 'https://user:pass@cdn.example.test/releases/imcodes-node';
+      const credRefused = await runInstallerWithShim({
+        shell,
+        binDir: curlBinDir,
+        extraEnv: { CURL_ARGV_LOG: argvLogPath },
+      });
+      expect(credRefused.code).not.toBe(0);
+      expect(credRefused.stderr).toContain('refused non-HTTPS artifact URL');
+      expect(credRefused.stdout).not.toContain('INSTALLED-OK');
+      expect((await readFile(argvLogPath, 'utf8')).trim()).toBe('');
+    }
+  }, 40_000);
+
+  it('wget HTTPS artifact download uses --max-redirect=0 + bounded loop and refuses HTTP downgrades, credential redirects, and >5 hops across sh and dash', async () => {
+    const wgetBinDir = await mkdtemp(join(workDir, 'wget-bin-'));
+    await buildMinimalBinDir(wgetBinDir, POSIX_UTIL_NAMES);
+    const wgetHelper = join(workDir, 'wget-shim.mjs');
+    const routesPath = join(workDir, 'wget-routes.json');
+    const urlLogPath = join(workDir, 'wget-urls.log');
+
+    await writeFile(wgetHelper, `
+      import { readFileSync, writeFileSync, appendFileSync } from 'node:fs';
+      import http from 'node:http';
+      const args = process.argv.slice(2);
+      if (args.includes('--help')) {
+        process.stdout.write('GNU Wget mock\\n  --max-redirect=COUNT\\n');
+        process.exit(0);
+      }
+      const outIdx = args.indexOf('-O');
+      const outPath = outIdx >= 0 ? args[outIdx + 1] : '';
+      const url = args.find((a) => a.startsWith('http://') || a.startsWith('https://')) || '';
+      const postArg = args.find((a) => a.startsWith('--post-data='));
+      if (postArg && url.startsWith('http://')) {
+        const parsed = new URL(url);
+        const bodyData = postArg.slice('--post-data='.length);
+        const req = http.request(
+          { hostname: parsed.hostname, port: parsed.port, path: parsed.pathname + parsed.search, method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', 'content-length': Buffer.byteLength(bodyData) } },
+          (res) => {
+            const chunks = [];
+            res.on('data', (c) => chunks.push(c));
+            res.on('end', () => {
+              writeFileSync(outPath, Buffer.concat(chunks));
+              process.exit(res.statusCode && res.statusCode < 400 ? 0 : 8);
+            });
+          },
+        );
+        req.on('error', () => process.exit(4));
+        req.end(bodyData);
+      } else {
+        appendFileSync(process.env.WGET_URL_LOG, url + '\\n');
+        // Must pin redirects to 0 on every wget invocation
+        if (!args.includes('--max-redirect=0')) {
+          process.stderr.write('ERROR: --max-redirect=0 missing\\n');
+          process.exit(2);
+        }
+        const routes = JSON.parse(readFileSync(process.env.WGET_ROUTES, 'utf8'));
+        const route = routes[url];
+        if (!route) {
+          process.stderr.write('  HTTP/1.1 404 Not Found\\r\\n\\r\\n');
+          process.exit(8);
+        }
+        if (route.status >= 300 && route.status < 400) {
+          process.stderr.write(\`  HTTP/1.1 \${route.status} Found\\r\\n  Location: \${route.location}\\r\\n\\r\\nMaximum redirections exceeded.\\n\`);
+          process.exit(8);
+        }
+        writeFileSync(outPath, route.body ?? '');
+        process.exit(0);
+      }
+    `);
+    await writeFile(
+      join(wgetBinDir, 'wget'),
+      `#!/bin/sh\nexec "${process.execPath}" "${wgetHelper}" "$@"\n`,
+    );
+    await chmod(join(wgetBinDir, 'wget'), 0o755);
+
+    for (const shell of shellsToTest()) {
+      // 1. HTTPS -> http:// downgrade MUST be refused and http:// target NEVER requested.
+      await writeFile(urlLogPath, '');
+      nextArtifactUrl = 'https://cdn.example.test/start';
+      await writeFile(routesPath, JSON.stringify({
+        'https://cdn.example.test/start': { status: 302, location: 'http://evil.example.test/downgrade.bin' },
+        'http://evil.example.test/downgrade.bin': { status: 200, body: PAYLOAD_BIN },
+      }));
+      const downgrade = await runInstallerWithShim({
+        shell,
+        binDir: wgetBinDir,
+        extraEnv: { WGET_ROUTES: routesPath, WGET_URL_LOG: urlLogPath },
+      });
+      expect(downgrade.code).not.toBe(0);
+      expect(downgrade.stderr).toContain('refused non-HTTPS or credential-bearing artifact redirect');
+      expect(downgrade.stdout).not.toContain('INSTALLED-OK');
+      expect((await readFile(urlLogPath, 'utf8')).trim().split('\n')).toEqual(['https://cdn.example.test/start']);
+
+      // 2. HTTPS -> HTTP:// uppercase downgrade MUST be refused.
+      await writeFile(urlLogPath, '');
+      await writeFile(routesPath, JSON.stringify({
+        'https://cdn.example.test/start': { status: 302, location: 'HTTP://evil.example.test/upper.bin' },
+      }));
+      const upperDowngrade = await runInstallerWithShim({
+        shell,
+        binDir: wgetBinDir,
+        extraEnv: { WGET_ROUTES: routesPath, WGET_URL_LOG: urlLogPath },
+      });
+      expect(upperDowngrade.code).not.toBe(0);
+      expect(upperDowngrade.stderr).toContain('refused non-HTTPS or credential-bearing artifact redirect');
+      expect((await readFile(urlLogPath, 'utf8')).trim().split('\n')).toEqual(['https://cdn.example.test/start']);
+
+      // 3. HTTPS -> credential-bearing redirect MUST be refused and NEVER requested.
+      await writeFile(urlLogPath, '');
+      await writeFile(routesPath, JSON.stringify({
+        'https://cdn.example.test/start': { status: 302, location: 'https://user:pass@evil.example.test/cred.bin' },
+      }));
+      const credRedirect = await runInstallerWithShim({
+        shell,
+        binDir: wgetBinDir,
+        extraEnv: { WGET_ROUTES: routesPath, WGET_URL_LOG: urlLogPath },
+      });
+      expect(credRedirect.code).not.toBe(0);
+      expect(credRedirect.stderr).toContain('refused non-HTTPS or credential-bearing artifact redirect');
+      expect((await readFile(urlLogPath, 'utf8')).trim().split('\n')).toEqual(['https://cdn.example.test/start']);
+
+      // 4. Initial credential-bearing URL MUST be refused BEFORE invoking wget.
+      await writeFile(urlLogPath, '');
+      nextArtifactUrl = 'https://user:pass@cdn.example.test/start';
+      const initialCred = await runInstallerWithShim({
+        shell,
+        binDir: wgetBinDir,
+        extraEnv: { WGET_ROUTES: routesPath, WGET_URL_LOG: urlLogPath },
+      });
+      expect(initialCred.code).not.toBe(0);
+      expect(initialCred.stderr).toContain('refused non-HTTPS artifact URL');
+      expect((await readFile(urlLogPath, 'utf8')).trim()).toBe('');
+
+      // 5. >5 HTTPS redirects MUST be rejected cleanly.
+      await writeFile(urlLogPath, '');
+      nextArtifactUrl = 'https://cdn.example.test/hop0';
+      await writeFile(routesPath, JSON.stringify({
+        'https://cdn.example.test/hop0': { status: 302, location: 'https://cdn.example.test/hop1' },
+        'https://cdn.example.test/hop1': { status: 302, location: 'https://cdn.example.test/hop2' },
+        'https://cdn.example.test/hop2': { status: 302, location: 'https://cdn.example.test/hop3' },
+        'https://cdn.example.test/hop3': { status: 302, location: 'https://cdn.example.test/hop4' },
+        'https://cdn.example.test/hop4': { status: 302, location: 'https://cdn.example.test/hop5' },
+        'https://cdn.example.test/hop5': { status: 302, location: 'https://cdn.example.test/hop6' },
+        'https://cdn.example.test/hop6': { status: 200, body: PAYLOAD_BIN },
+      }));
+      const tooMany = await runInstallerWithShim({
+        shell,
+        binDir: wgetBinDir,
+        extraEnv: { WGET_ROUTES: routesPath, WGET_URL_LOG: urlLogPath },
+      });
+      expect(tooMany.code).not.toBe(0);
+      expect(tooMany.stderr).toContain('too many artifact redirects');
+      const requested = (await readFile(urlLogPath, 'utf8')).trim().split('\n');
+      expect(requested).toHaveLength(6); // hop0..hop5
+      expect(requested).not.toContain('https://cdn.example.test/hop6');
+
+      // 6. Valid multi-hop HTTPS redirect chain (relative path + protocol-relative) MUST succeed.
+      await writeFile(urlLogPath, '');
+      nextArtifactUrl = 'https://github.com/org/repo/releases/download/v1/imcodes-node';
+      await writeFile(routesPath, JSON.stringify({
+        'https://github.com/org/repo/releases/download/v1/imcodes-node': { status: 302, location: '/intermediate/artifact' },
+        'https://github.com/intermediate/artifact': { status: 302, location: '//objects.githubusercontent.com/final/bin' },
+        'https://objects.githubusercontent.com/final/bin': { status: 200, body: PAYLOAD_BIN },
+      }));
+      const valid = await runInstallerWithShim({
+        shell,
+        binDir: wgetBinDir,
+        extraEnv: { WGET_ROUTES: routesPath, WGET_URL_LOG: urlLogPath },
+      });
+      expect(valid.code, `${shell} valid stderr: ${valid.stderr}`).toBe(0);
+      expect(valid.stdout).toContain('INSTALLED-OK');
+      expect((await readFile(urlLogPath, 'utf8')).trim().split('\n')).toEqual([
+        'https://github.com/org/repo/releases/download/v1/imcodes-node',
+        'https://github.com/intermediate/artifact',
+        'https://objects.githubusercontent.com/final/bin',
+      ]);
+    }
   }, 40_000);
 });

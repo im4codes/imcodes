@@ -99,6 +99,7 @@ function renderShellScript(
 ): string {
   const expectOs = os === 'mac' ? 'mac' : 'linux';
   const curlProtocolFlags = `${curlTransportFlags(serverUrl)} `;
+  const httpsCurlProtocolFlags = `${curlTransportFlags('https://')} `;
   // wget is the fallback when curl is absent, and follows redirects just as
   // readily.
   //
@@ -109,10 +110,138 @@ function renderShellScript(
   // `--max-redirect=0` is the real guarantee, and it is applied to loopback
   // HTTP too: neither `/i/:code` nor the artifact route ever redirects, so any
   // 3xx in a root-executed download chain is illegitimate regardless of scheme.
+  // For external HTTPS artifact downloads, `imcodes_download_https_wget` runs a
+  // bounded hop-by-hop loop with `--max-redirect=0` and validates every
+  // `Location` target (HTTPS-only, no embedded credentials) before following it.
   // This mirrors the PowerShell `-MaximumRedirection 0` policy.
   const wgetProtocolFlags = '--max-redirect=0 ';
   return String.raw`#!/bin/sh
 # IM.codes controlled-node installer.
+imcodes_check_https_url() {
+  case "$1" in
+    https://*) ;;
+    *) return 1 ;;
+  esac
+  case "$1" in
+    *" "*|*"	"*) return 1 ;;
+  esac
+  imcodes_rest=${'${'}1#https://}
+  imcodes_auth=${'${'}imcodes_rest%%[/?#]*}
+  case "$imcodes_auth" in
+    ""|*@*|*\\*) return 1 ;;
+  esac
+  return 0
+}
+
+imcodes_download_https_wget() {
+  imcodes_url=$1
+  imcodes_out=$2
+  imcodes_hdr="$imcodes_dir/wget-headers"
+  imcodes_hop=0
+  while :; do
+    imcodes_check_https_url "$imcodes_url" || {
+      echo "IM.codes: refused non-HTTPS or credential-bearing artifact URL." >&2
+      return 1
+    }
+    rm -f "$imcodes_out" "$imcodes_hdr"
+    if wget -S --max-redirect=0 "$imcodes_url" -O "$imcodes_out" 2>"$imcodes_hdr"; then
+      rm -f "$imcodes_hdr"
+      return 0
+    fi
+    imcodes_loc=$(awk '
+      {
+        gsub(/\r/, "")
+        line = $0
+        sub(/^[ \t]+/, "", line)
+        if (line ~ /^HTTP\/[0-9.]+[ \t]+[0-9][0-9][0-9]([ \t]|$)/) {
+          sub(/^HTTP\/[0-9.]+[ \t]+/, "", line)
+          code = substr(line, 1, 3)
+          loc = ""
+        } else if (tolower(line) ~ /^location:[ \t]*/) {
+          sub(/^[^:]*:[ \t]*/, "", line)
+          sub(/[ \t]+$/, "", line)
+          loc = line
+        }
+      }
+      END {
+        if (code ~ /^(301|302|303|307|308)$/ && loc != "") print loc
+        else exit 1
+      }
+    ' "$imcodes_hdr") || {
+      rm -f "$imcodes_hdr"
+      return 1
+    }
+    rm -f "$imcodes_hdr"
+    if [ "$imcodes_hop" -ge 5 ]; then
+      echo "IM.codes: too many artifact redirects." >&2
+      return 1
+    fi
+    imcodes_url=$(IMCODES_BASE="$imcodes_url" IMCODES_LOC="$imcodes_loc" awk '
+      BEGIN {
+        base = ENVIRON["IMCODES_BASE"]
+        loc = ENVIRON["IMCODES_LOC"]
+        if (loc == "" || loc ~ /[ \t\r\n]/) exit 1
+        rest = substr(base, 9)
+        slash = index(rest, "/")
+        q = index(rest, "?")
+        h = index(rest, "#")
+        cut = 0
+        if (slash > 0 && (cut == 0 || slash < cut)) cut = slash
+        if (q > 0 && (cut == 0 || q < cut)) cut = q
+        if (h > 0 && (cut == 0 || h < cut)) cut = h
+        if (cut > 0) origin = "https://" substr(rest, 1, cut - 1)
+        else origin = "https://" rest
+        base_path = "/"
+        if (slash > 0 && (q == 0 || slash < q) && (h == 0 || slash < h)) {
+          path_part = substr(rest, slash)
+          pq = index(path_part, "?")
+          ph = index(path_part, "#")
+          pcut = 0
+          if (pq > 0 && (pcut == 0 || pq < pcut)) pcut = pq
+          if (ph > 0 && (pcut == 0 || ph < pcut)) pcut = ph
+          if (pcut > 0) base_path = substr(path_part, 1, pcut - 1)
+          else base_path = path_part
+        }
+        if (loc ~ /^[A-Za-z][A-Za-z0-9+.-]*:/) {
+          if (tolower(substr(loc, 1, 8)) != "https://") exit 1
+          resolved = "https://" substr(loc, 9)
+        } else if (substr(loc, 1, 2) == "//") {
+          resolved = "https:" loc
+        } else if (substr(loc, 1, 1) == "/") {
+          resolved = origin loc
+        } else if (substr(loc, 1, 1) == "?" || substr(loc, 1, 1) == "#") {
+          resolved = origin base_path loc
+        } else {
+          dir = "/"
+          for (k = length(base_path); k >= 1; k--) {
+            if (substr(base_path, k, 1) == "/") {
+              dir = substr(base_path, 1, k)
+              break
+            }
+          }
+          resolved = origin dir loc
+        }
+        rrest = substr(resolved, 9)
+        rcut = 0
+        rslash = index(rrest, "/")
+        rq = index(rrest, "?")
+        rh = index(rrest, "#")
+        if (rslash > 0 && (rcut == 0 || rslash < rcut)) rcut = rslash
+        if (rq > 0 && (rcut == 0 || rq < rcut)) rcut = rq
+        if (rh > 0 && (rcut == 0 || rh < rcut)) rcut = rh
+        if (rcut > 0) rauth = substr(rrest, 1, rcut - 1)
+        else rauth = rrest
+        if (rauth == "" || index(rauth, "@") > 0 || index(rauth, "\\") > 0) exit 1
+        print resolved
+      }
+    ') || {
+      echo "IM.codes: refused non-HTTPS or credential-bearing artifact redirect." >&2
+      return 1
+    }
+    imcodes_hop=$((imcodes_hop + 1))
+  done
+}
+
 imcodes_install() {
   set -eu
 
@@ -249,14 +378,20 @@ imcodes_install() {
 
   case "$imcodes_server" in
     https://*)
-      case "$imcodes_artifact_url" in
-        https://*) ;;
-        *) echo "IM.codes: refused non-HTTPS artifact URL." >&2; exit 1 ;;
-      esac
+      imcodes_check_https_url "$imcodes_artifact_url" || {
+        echo "IM.codes: refused non-HTTPS artifact URL." >&2
+        exit 1
+      }
       ;;
     http://*)
       case "$imcodes_artifact_url" in
-        "$imcodes_server/"*|https://*) ;;
+        "$imcodes_server/"*) ;;
+        https://*)
+          imcodes_check_https_url "$imcodes_artifact_url" || {
+            echo "IM.codes: refused non-HTTPS artifact URL." >&2
+            exit 1
+          }
+          ;;
         *) echo "IM.codes: refused mismatched artifact URL." >&2; exit 1 ;;
       esac
       ;;
@@ -286,7 +421,7 @@ imcodes_install() {
   elif command -v wget >/dev/null 2>&1; then
     case "$imcodes_artifact_url" in
       https://*)
-        wget -q --max-redirect=5 "$imcodes_artifact_url" -O "$imcodes_binary" || {
+        imcodes_download_https_wget "$imcodes_artifact_url" "$imcodes_binary" || {
           echo "IM.codes: binary download failed." >&2
           exit 1
         }
@@ -335,7 +470,7 @@ imcodes_install
     .replace(/__INSTALL_CODE__/g, installCode)
     .replace(/__EXPECT_OS__/g, expectOs)
     .replace(/__CURL_PROTOCOL_FLAGS__/g, curlProtocolFlags)
-    .replace(/__HTTPS_ARTIFACT_CURL_FLAGS__/g, serverUrl.startsWith('https://') ? curlProtocolFlags : '')
+    .replace(/__HTTPS_ARTIFACT_CURL_FLAGS__/g, httpsCurlProtocolFlags)
     .replace(/__WGET_PROTOCOL_FLAGS__/g, wgetProtocolFlags)
     .replace(/__PAYLOAD_PATH__/g, CONTROLLED_NODE_INSTALL_PAYLOAD_PATH)
     .replace(/__TICKET_FIELD__/g, CONTROLLED_NODE_INSTALL_TICKET_FIELD)
@@ -422,7 +557,11 @@ function Invoke-ImcodesInstall {
       Write-Host 'IM.codes: invalid enrollment payload from server.' -ForegroundColor Red
       return
     }
-    $artifactUri = [Uri][string]$payload.artifactUrl
+    $artifactUri = $null
+    if (-not [Uri]::TryCreate([string]$payload.artifactUrl, [System.UriKind]::Absolute, [ref]$artifactUri)) {
+      Write-Host 'IM.codes: invalid artifact URL from server.' -ForegroundColor Red
+      return
+    }
     $expectedSha = ([string]$payload.sha256).ToLowerInvariant()
     if ($expectedSha -notmatch '^[0-9a-f]{64}$') {
       Write-Host 'IM.codes: invalid binary checksum from server.' -ForegroundColor Red
@@ -435,6 +574,10 @@ function Invoke-ImcodesInstall {
       }
     } elseif ($artifactUri.Scheme -cne 'https' -and $artifactUri.GetLeftPart([System.UriPartial]::Authority) -cne $server) {
       Write-Host 'IM.codes: refused mismatched artifact URL.' -ForegroundColor Red
+      return
+    }
+    if ($artifactUri.Scheme -ceq 'https' -and $artifactUri.UserInfo) {
+      Write-Host 'IM.codes: refused credential-bearing artifact URL.' -ForegroundColor Red
       return
     }
     try {
