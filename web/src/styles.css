@@ -19714,12 +19714,13 @@ button.quick-agent-delegation-preset.active {
 }
 
 .mobile-swipe-hud-card {
+  box-sizing: border-box;
   display: flex;
   flex-direction: column;
   align-items: stretch;
   gap: 12px;
-  width: min(90vw, 360px);
-  padding: 16px 18px;
+  width: min(92vw, 360px);
+  padding: 14px 16px;
   border-radius: 18px;
   background: rgba(15, 23, 42, 0.84);
   border: 1.5px solid rgba(148, 163, 184, 0.36);
@@ -19768,16 +19769,17 @@ button.quick-agent-delegation-preset.active {
 
 .mobile-swipe-hud-compass {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) 52px minmax(0, 1fr);
   grid-template-rows: auto auto auto;
   align-items: center;
-  justify-items: center;
+  justify-items: stretch;
   gap: 8px;
 }
 
 .mobile-swipe-hud-center {
   grid-row: 2;
   grid-column: 2;
+  justify-self: center;
   position: relative;
   width: 52px;
   height: 52px;
@@ -19823,6 +19825,7 @@ button.quick-agent-delegation-preset.active {
 }
 
 .mobile-swipe-hud-dir {
+  box-sizing: border-box;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -19841,8 +19844,11 @@ button.quick-agent-delegation-preset.active {
 
 .mobile-swipe-hud-dir.is-up {
   grid-row: 1;
-  grid-column: 2;
-  min-width: 116px;
+  grid-column: 1 / -1;
+  justify-self: center;
+  width: auto;
+  min-width: min(140px, 100%);
+  max-width: 100%;
 }
 
 .mobile-swipe-hud-dir.is-left {
@@ -19857,8 +19863,11 @@ button.quick-agent-delegation-preset.active {
 
 .mobile-swipe-hud-dir.is-down {
   grid-row: 3;
-  grid-column: 2;
-  min-width: 116px;
+  grid-column: 1 / -1;
+  justify-self: center;
+  width: auto;
+  min-width: min(140px, 100%);
+  max-width: 100%;
 }
 
 .mobile-swipe-hud-dir-arrow {
@@ -19870,11 +19879,11 @@ button.quick-agent-delegation-preset.active {
 .mobile-swipe-hud-dir-label {
   font-size: 11px;
   font-weight: 600;
-  line-height: 1.2;
+  line-height: 1.25;
   max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: normal;
 }
 
 .mobile-swipe-hud-dir.is-server.is-active {
