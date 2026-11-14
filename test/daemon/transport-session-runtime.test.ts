@@ -7443,6 +7443,140 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.getStatus()).toBe('idle');
   });
 
+  it.each([
+    {
+      name: 'recoverable onError',
+      terminateTurn2: async (
+        rt: TransportSessionRuntime,
+        m: ReturnType<typeof createMockProvider>,
+      ) => {
+        m.fireError('sess-1', {
+          code: 'PROVIDER_ERROR',
+          message: 'turn 2 recoverable failure',
+          recoverable: true,
+        });
+        await flushDispatch();
+        expect(rt.getStatus()).toBe('idle');
+      },
+    },
+    {
+      name: 'permanent onError',
+      terminateTurn2: async (
+        rt: TransportSessionRuntime,
+        m: ReturnType<typeof createMockProvider>,
+      ) => {
+        m.fireError('sess-1', {
+          code: 'PROVIDER_ERROR',
+          message: 'turn 2 permanent failure',
+          recoverable: false,
+        });
+        await flushDispatch();
+        expect(rt.getStatus()).toBe('error');
+      },
+    },
+    {
+      name: 'dispatch promise rejection (.catch)',
+      prepareTurn2Send: (m: ReturnType<typeof createMockProvider>) => {
+        (m.provider.send as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('turn 2 transport reject'));
+      },
+      terminateTurn2: async (rt: TransportSessionRuntime) => {
+        await flushDispatch();
+        expect(rt.getStatus()).toBe('error');
+      },
+    },
+    {
+      name: 'local STOP acknowledged once without stacking grace budget',
+      terminateTurn2: async (
+        rt: TransportSessionRuntime,
+        m: ReturnType<typeof createMockProvider>,
+      ) => {
+        await rt.cancel();
+        m.fireError('sess-1', {
+          code: 'CANCELLED',
+          message: 'turn 2 cancelled by STOP',
+          recoverable: true,
+        });
+        await flushDispatch();
+        expect(rt.getStatus()).toBe('idle');
+      },
+    },
+  ])(
+    'retires external-completion grace when turn 2 terminates via $name so turn 3 genuine CANCELLED drains turn 4',
+    async ({ prepareTurn2Send, terminateTurn2 }) => {
+      (mock.provider.cancel as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+
+      runtime.send('turn 1 stale', 'cmd-f1-t1');
+      await waitForProviderSendCount(mock.provider, 1);
+      expect(runtime.settleActiveDispatchFromExternalCompletion('health-poll-stale-active-turn')).toBe(true);
+      await flushDispatch();
+
+      prepareTurn2Send?.(mock);
+      expect(runtime.send('turn 2 terminates early', 'cmd-f1-t2')).toBe('sent');
+      await waitForProviderSendCount(mock.provider, 2);
+      await terminateTurn2(runtime, mock);
+
+      expect(runtime.send('turn 3 genuine cancel target', 'cmd-f1-t3')).toBe('sent');
+      await waitForProviderSendCount(mock.provider, 3);
+      expect(runtime.send('turn 4 queued behind turn 3', 'cmd-f1-t4')).toBe('queued');
+      expect(runtime.pendingCount).toBe(1);
+
+      mock.fireError('sess-1', {
+        code: 'CANCELLED',
+        message: 'turn 3 cancelled by provider',
+        recoverable: true,
+      });
+      await waitForProviderSendCount(mock.provider, 4);
+
+      expect(mock.provider.send).toHaveBeenCalledTimes(4);
+      expect(runtime.pendingCount).toBe(0);
+      expect(runtime.sending).toBe(true);
+
+      mock.fireComplete('sess-1', {
+        id: 'msg-f1-t4',
+        role: 'assistant',
+        content: 'turn 4 response',
+        timestamp: Date.now(),
+      });
+      await flushDispatch();
+      expect(runtime.sending).toBe(false);
+      expect(runtime.getStatus()).toBe('idle');
+    },
+  );
+
+  it('retires unused grace cleanly across consecutive external settlements without accumulating into later turns', async () => {
+    (mock.provider.cancel as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+
+    runtime.send('turn 1 stale', 'cmd-consec-1');
+    await waitForProviderSendCount(mock.provider, 1);
+    expect(runtime.settleActiveDispatchFromExternalCompletion('external-1')).toBe(true);
+    await flushDispatch();
+
+    // T2 starts with T1 grace, then T2 is ALSO externally settled silently before T1/T2 emit CANCELLED.
+    runtime.send('turn 2 stale', 'cmd-consec-2');
+    await waitForProviderSendCount(mock.provider, 2);
+    expect(runtime.settleActiveDispatchFromExternalCompletion('external-2')).toBe(true);
+    await flushDispatch();
+
+    // T3 inherits at most T2's single late-CANCELLED grace: one late CANCELLED stays suppressed,
+    // then T3 terminates with an error so no grace carries over to T4.
+    runtime.send('turn 3 errors after late cancel', 'cmd-consec-3');
+    await waitForProviderSendCount(mock.provider, 3);
+    mock.fireError('sess-1', { code: 'CANCELLED', message: 'late cancel from T2', recoverable: true });
+    expect(runtime.sending).toBe(true);
+    mock.fireError('sess-1', { code: 'PROVIDER_ERROR', message: 'turn 3 error', recoverable: true });
+    await flushDispatch();
+    expect(runtime.getStatus()).toBe('idle');
+
+    // T4 must treat a genuine CANCELLED as terminal and drain T5.
+    expect(runtime.send('turn 4 genuine cancel', 'cmd-consec-4')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 4);
+    expect(runtime.send('turn 5 queued', 'cmd-consec-5')).toBe('queued');
+    mock.fireError('sess-1', { code: 'CANCELLED', message: 'genuine T4 cancel', recoverable: true });
+    await waitForProviderSendCount(mock.provider, 5);
+    expect(mock.provider.send).toHaveBeenCalledTimes(5);
+    expect(runtime.pendingCount).toBe(0);
+  });
+
   it('recoverable provider errors drain pending messages into the next turn', async () => {
     runtime.send('first');
     await waitForProviderSendCount(mock.provider, 1);

@@ -802,6 +802,8 @@ export class TransportSessionRuntime implements SessionRuntime {
   private readonly _sdkTurnLostRecoveryPhaseKeys = new Set<string>();
   private _sdkTurnLostRecoveryAttempt: SdkTurnLostRecoveryAttemptState | null = null;
   private _externalCompletionSettlementsToIgnore = 0;
+  private _externalCompletionGraceCancelsToIgnore = 0;
+  private _externalCompletionGraceCancelDispatchId: number | null = null;
   private _cancelledProviderErrorsToIgnore = 0;
   private _codexRolloutBackstopTimer: ReturnType<typeof setTimeout> | null = null;
   private _codexRolloutBackstopInFlight = false;
@@ -924,7 +926,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           if (this._activeDispatchId !== null) {
             this._locallyCancelledDispatchIds.delete(this._activeDispatchId);
           }
-          this._activeDispatchId = null;
+          this.clearActiveDispatchOwner();
           this._activeDispatchStaleRecoveryStarted = false;
           if (!this._drainPending()) {
             this.setStatus('idle');
@@ -971,9 +973,8 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._activeTurn = null;
         this._activeDispatchEntries = [];
         this._activeDispatchProviderStarted = false;
-        this._activeDispatchId = null;
+        this.clearActiveDispatchOwner();
         this._activeDispatchStaleRecoveryStarted = false;
-        if (hadLocalActiveTurn) this._cancelledProviderErrorsToIgnore = 0;
         // Provider completion is authoritative terminal evidence for the
         // foreground turn. Some SDKs can deliver the final assistant message
         // without a matching final tool event for every previously-running
@@ -994,8 +995,12 @@ export class TransportSessionRuntime implements SessionRuntime {
         if (sid !== this._providerSessionId) return;
         this._lastActivityAt = Date.now();
         if (this._unconfirmedProviderStop) {
-          if (error.code === PROVIDER_ERROR_CODES.CANCELLED && this._cancelledProviderErrorsToIgnore > 0) {
-            this._cancelledProviderErrorsToIgnore--;
+          if (error.code === PROVIDER_ERROR_CODES.CANCELLED) {
+            if (this._cancelledProviderErrorsToIgnore > 0) {
+              this._cancelledProviderErrorsToIgnore--;
+            } else {
+              this.consumeExternalCompletionGraceCancel();
+            }
           }
           this.recordProviderError(error);
           return; // Generic error/connection loss is not captured terminal proof.
@@ -1014,8 +1019,13 @@ export class TransportSessionRuntime implements SessionRuntime {
           );
           return;
         }
-        if (error.code === PROVIDER_ERROR_CODES.CANCELLED && this._cancelledProviderErrorsToIgnore > 0) {
-          this._cancelledProviderErrorsToIgnore--;
+        const consumedStopIgnore = error.code === PROVIDER_ERROR_CODES.CANCELLED
+          && this._cancelledProviderErrorsToIgnore > 0;
+        const consumedExternalGraceIgnore = !consumedStopIgnore
+          && error.code === PROVIDER_ERROR_CODES.CANCELLED
+          && this.consumeExternalCompletionGraceCancel();
+        if (consumedStopIgnore || consumedExternalGraceIgnore) {
+          if (consumedStopIgnore) this._cancelledProviderErrorsToIgnore--;
           logger.warn(
             {
               sessionKey: this.sessionKey,
@@ -1025,7 +1035,9 @@ export class TransportSessionRuntime implements SessionRuntime {
               recoverable: error.recoverable,
               pendingCount: this._pendingMessages.length,
             },
-            'transport runtime ignored late provider cancellation for locally stopped dispatch',
+            consumedExternalGraceIgnore
+              ? 'transport runtime ignored late provider cancellation for externally settled dispatch'
+              : 'transport runtime ignored late provider cancellation for locally stopped dispatch',
           );
           // The cancellation belongs to the turn that STOP already settled
           // locally, so do not surface it as a user-visible error. It is still
@@ -1037,7 +1049,7 @@ export class TransportSessionRuntime implements SessionRuntime {
             this.clearStalePendingCancelFallbackTimer();
             this._activeDispatchCancelled = false;
             this._activeDispatchProviderStarted = false;
-            this._activeDispatchId = null;
+            this.clearActiveDispatchOwner();
             this._activeDispatchStaleRecoveryStarted = false;
             if (this._drainPending()) return;
             if (this.isInProgressStatus(this._status)) this.setStatus('idle');
@@ -1078,7 +1090,7 @@ export class TransportSessionRuntime implements SessionRuntime {
             this.clearStalePendingCancelFallbackTimer();
             this._activeDispatchCancelled = false;
             this._activeDispatchProviderStarted = false;
-            this._activeDispatchId = null;
+            this.clearActiveDispatchOwner();
             this._activeDispatchStaleRecoveryStarted = false;
             if (this.isInProgressStatus(this._status) || this._status === 'error') this.setStatus('idle');
             return;
@@ -1120,7 +1132,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           this._activeDispatchProviderAccepted = false;
           this._activeDispatchCancelled = false;
           this.closeOpenTools('errored', 'provider_error');
-          this._activeDispatchId = null;
+          this.clearActiveDispatchOwner();
           this._activeDispatchStaleRecoveryStarted = false;
           this.setStatus('thinking');
           return;
@@ -1144,7 +1156,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         if (this._activeDispatchId !== null) {
           this._locallyCancelledDispatchIds.delete(this._activeDispatchId);
         }
-        this._activeDispatchId = null;
+        this.clearActiveDispatchOwner();
         this._activeDispatchStaleRecoveryStarted = false;
         // Only drain pending on recoverable/cancel errors — unrecoverable errors
         // (auth failure, provider down) would just fail again and consume queued messages.
@@ -2047,7 +2059,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeDispatchEntries = [];
     this._activeDispatchCancelled = false;
     this._activeDispatchProviderStarted = false;
-    this._activeDispatchId = null;
+    this.clearActiveDispatchOwner(dispatchId);
     this._activeDispatchStaleRecoveryStarted = false;
     this.closeOpenTools('stale', 'provider_stale');
 
@@ -2302,7 +2314,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         reason: `stale_dispatch:${reason}`,
       });
       this._activeDispatchEntries = [];
-      this._activeDispatchId = null;
+      this.clearActiveDispatchOwner();
       this._activeDispatchProviderStarted = false;
       this._activeDispatchCancelled = false;
       this._activeDispatchStaleRecoveryStarted = false;
@@ -3032,7 +3044,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       this.clearStalePendingCancelFallbackTimer();
       this._activeDispatchProviderStarted = false;
       this._activeDispatchCancelled = false;
-      this._activeDispatchId = null;
+      this.clearActiveDispatchOwner();
       this._activeDispatchStaleRecoveryStarted = false;
       throw err;
     }
@@ -3994,6 +4006,8 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._locallyCancelledActivityGenerations.clear();
     this._currentActivityGenerationLocallyCancelled = false;
     this._externalCompletionSettlementsToIgnore = 0;
+    this._externalCompletionGraceCancelsToIgnore = 0;
+    this._externalCompletionGraceCancelDispatchId = null;
     this._cancelledProviderErrorsToIgnore = 0;
     this.clearRecoverableRetryTimer();
     this.cancelCapacityRetry(false);
@@ -4256,7 +4270,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeDispatchCancelled = false;
     this._activeDispatchHasSideEffectEvidence = false;
     this._sdkTurnLostRecoveryAttempt = null;
-    this._activeDispatchId = null;
+    this.clearActiveDispatchOwner();
     this._activeDispatchStaleRecoveryStarted = false;
     this._activeDispatchEntries = [];
     this.setStatus('error');
@@ -4295,7 +4309,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeDispatchCancelled = false;
     this._activeDispatchHasSideEffectEvidence = false;
     this._sdkTurnLostRecoveryAttempt = null;
-    this._activeDispatchId = null;
+    this.clearActiveDispatchOwner();
     this._activeDispatchStaleRecoveryStarted = false;
     this._activeDispatchEntries = [];
     if (!this._drainPending()) this.setStatus('idle');
@@ -4385,7 +4399,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeDispatchProviderStarted = false;
     this._activeDispatchCancelled = false;
     this._activeDispatchHasSideEffectEvidence = false;
-    this._activeDispatchId = null;
+    this.clearActiveDispatchOwner();
     this._activeDispatchStaleRecoveryStarted = false;
     this._pendingMessages.unshift(...replayEntries);
     this._pendingVersion++;
@@ -4770,6 +4784,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeDispatchProviderStarted = false;
     this._activeDispatchProviderAccepted = false;
     this._activeDispatchHasSideEffectEvidence = false;
+    this.retireExternalCompletionGrace();
     this._activeDispatchId = dispatchId;
     this._activeDispatchStaleRecoveryStarted = false;
     this._activeDispatchEntries = (dispatchedEntries ?? [{
@@ -5036,12 +5051,14 @@ export class TransportSessionRuntime implements SessionRuntime {
           if (this._activeDispatchId === dispatchId) {
             this._activeDispatchProviderStarted = true;
             if (this._externalCompletionSettlementsToIgnore > 0) {
-              // Turn 2 is now starting on the provider. Any unconsumed
-              // external-completion ignore budget from a silent cancel() must
-              // not swallow the new turn's legitimate onComplete (or real
-              // errors), while preserving late-CANCELLED suppression.
-              this._cancelledProviderErrorsToIgnore += this._externalCompletionSettlementsToIgnore;
+              // Turn 2 is now starting on the provider. Move any unconsumed
+              // external-completion ignore budget into a grace allowance owned
+              // strictly by this dispatch so it cannot swallow Turn 2's
+              // onComplete/errors and retires when this dispatch terminates,
+              // while still ignoring a late CANCELLED from the settled turn.
+              this._externalCompletionGraceCancelsToIgnore += this._externalCompletionSettlementsToIgnore;
               this._externalCompletionSettlementsToIgnore = 0;
+              this._externalCompletionGraceCancelDispatchId = dispatchId;
             }
           }
         },
@@ -5203,7 +5220,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           this._activeDispatchProviderStarted = false;
           this._activeDispatchProviderAccepted = false;
           this._activeDispatchCancelled = false;
-          this._activeDispatchId = null;
+          this.clearActiveDispatchOwner(dispatchId);
           this._activeDispatchStaleRecoveryStarted = false;
           this._locallyCancelledDispatchIds.delete(dispatchId);
           this.setStatus('thinking');
@@ -5214,6 +5231,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         // must settle the local turn without putting the accepted ids back into
         // the retry FIFO; only pre-acceptance failures may release/requeue.
         if (this._activeDispatchProviderAccepted) {
+          this.retireExternalCompletionGrace(dispatchId);
           this.settleActiveDispatchHandoffs(this._activeDispatchEntries, {
             providerStarted: true,
             providerAccepted: true,
@@ -5245,7 +5263,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           this._activeDispatchProviderStarted = false;
           this._activeDispatchProviderAccepted = false;
           this._activeDispatchCancelled = false;
-          if (this._activeDispatchId === dispatchId) this._activeDispatchId = null;
+          this.clearActiveDispatchOwner(dispatchId);
           this._activeDispatchStaleRecoveryStarted = false;
           this._locallyCancelledDispatchIds.delete(dispatchId);
           this.setStatus('error');
@@ -5259,9 +5277,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         this.clearStalePendingCancelFallbackTimer();
         this._activeDispatchProviderStarted = false;
         this._activeDispatchCancelled = false;
-        if (this._activeDispatchId === dispatchId) {
-          this._activeDispatchId = null;
-        }
+        this.clearActiveDispatchOwner(dispatchId);
         this._activeDispatchStaleRecoveryStarted = false;
         this._locallyCancelledDispatchIds.delete(dispatchId);
         if (canDrain) {
@@ -5730,7 +5746,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       this.clearStalePendingCancelFallbackTimer();
       this._activeDispatchProviderStarted = false;
       this._activeDispatchCancelled = false;
-      this._activeDispatchId = null;
+      this.clearActiveDispatchOwner();
       this._activeDispatchStaleRecoveryStarted = false;
       // Last-resort status update; `setStatus` itself is isolated post-C1b
       // but wrap defensively in case future code regresses that contract.
@@ -5744,6 +5760,42 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   private isDispatchLocallyCancelled(dispatchId: number): boolean {
     return this._locallyCancelledDispatchIds.has(dispatchId);
+  }
+
+  /** Consume one late-CANCELLED grace budget owned by the currently active dispatch. */
+  private consumeExternalCompletionGraceCancel(): boolean {
+    if (
+      this._externalCompletionGraceCancelsToIgnore <= 0
+      || this._externalCompletionGraceCancelDispatchId === null
+      || this._activeDispatchId !== this._externalCompletionGraceCancelDispatchId
+    ) {
+      return false;
+    }
+    this._externalCompletionGraceCancelsToIgnore--;
+    if (this._externalCompletionGraceCancelsToIgnore === 0) {
+      this._externalCompletionGraceCancelDispatchId = null;
+    }
+    return true;
+  }
+
+  /** Retire any unconsumed external-completion late-CANCELLED grace belonging to a terminating dispatch. */
+  private retireExternalCompletionGrace(dispatchId: number | null = this._activeDispatchId): void {
+    if (
+      this._externalCompletionGraceCancelDispatchId === null
+      || (dispatchId !== null && this._externalCompletionGraceCancelDispatchId !== dispatchId)
+    ) {
+      return;
+    }
+    this._externalCompletionGraceCancelsToIgnore = 0;
+    this._externalCompletionGraceCancelDispatchId = null;
+  }
+
+  /** Clear active dispatch ownership and retire any external-completion grace bound to it. */
+  private clearActiveDispatchOwner(dispatchId: number | null = this._activeDispatchId): void {
+    this.retireExternalCompletionGrace(dispatchId);
+    if (dispatchId === null || this._activeDispatchId === dispatchId) {
+      this._activeDispatchId = null;
+    }
   }
 
   private cancelActiveDispatchLocally(dispatchId: number | null = this._activeDispatchId): void {
@@ -5769,7 +5821,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       this.clearStalePendingCancelFallbackTimer();
       this._activeDispatchCancelled = false;
       this._activeDispatchProviderStarted = false;
-      this._activeDispatchId = null;
+      this.clearActiveDispatchOwner(dispatchId);
       this._activeDispatchStaleRecoveryStarted = false;
       if (!this._drainPending()) {
         this.setStatus('idle');
@@ -5791,7 +5843,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this.clearStalePendingCancelFallbackTimer();
     this._activeDispatchCancelled = false;
     this._activeDispatchProviderStarted = false;
-    this._activeDispatchId = null;
+    this.clearActiveDispatchOwner(dispatchId);
     this._activeDispatchStaleRecoveryStarted = false;
     this.closeOpenTools('cancelled', 'user_cancelled');
     if (!this._drainPending()) {
