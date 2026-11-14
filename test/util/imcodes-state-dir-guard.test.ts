@@ -14,8 +14,10 @@ const REPO_ROOT = join(__dirname, '..', '..');
 const SCAN_ROOTS = ['src', 'shared', 'bin', 'scripts'];
 const SCAN_EXTENSIONS = new Set(['.ts', '.tsx', '.mjs', '.js', '.sh', '.cmd', '.ps1']);
 
+type AllowedEntry = string | { reason: string; expectedCount: number };
+
 /** Files that may spell the `.imcodes` segment, each with the reason (kept next to the code it excuses). */
-const ALLOWED: Record<string, string> = {
+const ALLOWED: Record<string, AllowedEntry> = {
   'src/util/imcodes-state-dir.ts': 'the resolver facade: IMCODES_STATE_DIR_NAME lives here',
   'src/util/windows-daemon-lock.ts': 'resolveImcodesHome itself: the default and Windows profile rules',
   'src/util/windows-launch-preflight.mjs': 'standalone launcher script (node builtins only): inline IMCODES_HOME rule, parity-tested',
@@ -32,11 +34,20 @@ const ALLOWED: Record<string, string> = {
   'shared/skill-store.ts': 'getUserSkillRoot(homeDir, stateDir): the explicit-account-home default; shared/ cannot import src/',
   'shared/capability-management.ts': 'managed-skill root segments under an explicit account home',
   'shared/cloud-docs.ts': 'isInternalUploadTempFilePath matches chat upload path segments by regex only; never resolves or accesses host state paths',
-  'shared/desktop-installer-compatibility.ts': 'assertSafeIsolatedTargetPath guard lists protected real-home .imcodes subdirs so isolated installers never touch ~/.imcodes',
+  'shared/desktop-installer-compatibility.ts': {
+    reason: 'assertSafeIsolatedTargetPath guard lists protected real-home .imcodes subdirs so isolated installers never touch ~/.imcodes',
+    expectedCount: 2,
+  },
   'scripts/restart-daemon.sh': 'restarts the DEFAULT launchd service (label imcodes.daemon), which by definition lives in $HOME/.imcodes',
   'scripts/diagnose-windows-controlled-node.ps1': 'reads the default SYSTEM-profile service log of a controlled node',
-  'scripts/build-windows-installer.mjs': 'standalone PowerShell installer guards against real USERPROFILE\\.imcodes and resolves target-home $UserStateDir',
-  'scripts/desktop-installer-shared.mjs': 'standalone POSIX installer guards against real HOME/.imcodes and resolves target-home $USER_STATE_DIR',
+  'scripts/build-windows-installer.mjs': {
+    reason: 'standalone PowerShell installer guards against real USERPROFILE\\.imcodes and resolves target-home $UserStateDir',
+    expectedCount: 2,
+  },
+  'scripts/desktop-installer-shared.mjs': {
+    reason: 'standalone POSIX installer guards against real HOME/.imcodes and resolves target-home $USER_STATE_DIR',
+    expectedCount: 2,
+  },
 };
 
 // `.imcodes` as a whole path segment: quoted, or between slashes. `.imcodes-foo` and `cc.imcodes.daemon` are different names.
@@ -57,21 +68,41 @@ function isComment(line: string): boolean {
   return /^\s*(\/\/|\*|\/\*|#|rem\b|<!--)/i.test(line);
 }
 
+function findSourceLineHits(rel: string, content: string): Array<{ file: string; line: number; text: string }> {
+  const hits: Array<{ file: string; line: number; text: string }> = [];
+  content.split('\n').forEach((text, index) => {
+    if (isComment(text) || !SEGMENT.test(text)) return;
+    // `~/.imcodes` inside prose (a message or doc string) is documentation, not a path the process opens.
+    if (/~[/\\]\.imcodes/.test(text) && !/(join|resolve)\(/.test(text)) return;
+    // Scripts and shell that already derive the location from IMCODES_HOME on the same line are state-dir aware.
+    if (!rel.endsWith('.ts') && !rel.endsWith('.tsx') && STATE_DIR_AWARE.test(text)) return;
+    hits.push({ file: rel, line: index + 1, text: text.trim().slice(0, 160) });
+  });
+  return hits;
+}
+
+function scanSource(
+  rel: string,
+  content: string,
+  allowed: Record<string, AllowedEntry> = ALLOWED,
+): Array<{ file: string; line: number; text: string }> {
+  const entry = allowed[rel];
+  if (typeof entry === 'string') return [];
+  const hits = findSourceLineHits(rel, content);
+  if (!entry) return hits;
+  if (hits.length === entry.expectedCount) return [];
+  return hits.length > entry.expectedCount
+    ? hits.slice(entry.expectedCount)
+    : [{ file: rel, line: 1, text: `expected ${entry.expectedCount} .imcodes segment occurrence(s), found ${hits.length}` }];
+}
+
 function scan(): Array<{ file: string; line: number; text: string }> {
   const files: string[] = [];
   for (const root of SCAN_ROOTS) walk(join(REPO_ROOT, root), files);
   const violations: Array<{ file: string; line: number; text: string }> = [];
   for (const file of files) {
     const rel = relative(REPO_ROOT, file).split(sep).join('/');
-    if (rel in ALLOWED) continue;
-    readFileSync(file, 'utf8').split('\n').forEach((text, index) => {
-      if (isComment(text) || !SEGMENT.test(text)) return;
-      // `~/.imcodes` inside prose (a message or doc string) is documentation, not a path the process opens.
-      if (/~[/\\]\.imcodes/.test(text) && !/(join|resolve)\(/.test(text)) return;
-      // Scripts and shell that already derive the location from IMCODES_HOME on the same line are state-dir aware.
-      if (!rel.endsWith('.ts') && !rel.endsWith('.tsx') && STATE_DIR_AWARE.test(text)) return;
-      violations.push({ file: rel, line: index + 1, text: text.trim().slice(0, 160) });
-    });
+    violations.push(...scanSource(rel, readFileSync(file, 'utf8')));
   }
   return violations;
 }
@@ -79,6 +110,32 @@ function scan(): Array<{ file: string; line: number; text: string }> {
 describe('IMCODES_HOME reaches every state path', () => {
   it('no shipped source joins an account home with the `.imcodes` segment outside the reviewed resolver files', () => {
     expect(scan()).toEqual([]);
+  });
+
+  it('rejects any extra unapproved `.imcodes` path added to a count-bounded exception file', () => {
+    const cases: Array<{ rel: string; extraLine: string }> = [
+      {
+        rel: 'shared/desktop-installer-compatibility.ts',
+        extraLine: "const leaked = `${homedir()}/.imcodes`;",
+      },
+      {
+        rel: 'scripts/build-windows-installer.mjs',
+        extraLine: "$LeakedStateDir = Join-Path $env:USERPROFILE '.imcodes'",
+      },
+      {
+        rel: 'scripts/desktop-installer-shared.mjs',
+        extraLine: 'LEAKED_STATE_DIR="$HOME/.imcodes"',
+      },
+    ];
+    for (const { rel, extraLine } of cases) {
+      const realText = readFileSync(join(REPO_ROOT, rel), 'utf8');
+      expect(scanSource(rel, realText), `${rel} baseline should match exact expectedCount`).toEqual([]);
+      const mutated = `${realText}\n${extraLine}\n`;
+      const violations = scanSource(rel, mutated);
+      expect(violations.length, `${rel} mutant with 3rd .imcodes path must fail`).toBe(1);
+      expect(violations[0]?.file).toBe(rel);
+      expect(violations[0]?.text).toContain('.imcodes');
+    }
   });
 
   it('every allowed exception still exists and still needs its exception', () => {

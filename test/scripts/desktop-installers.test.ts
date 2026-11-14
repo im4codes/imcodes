@@ -317,7 +317,18 @@ describe('AC 3: Three-platform installer builders & CI wiring', () => {
     const plistDir = join(isoMacHome, 'Library', 'LaunchAgents');
     mkdirSync(plistDir, { recursive: true });
     const plistPath = join(plistDir, 'imcodes.daemon.plist');
-    const originalPlist = `<plist><dict><key>ProgramArguments</key><array><string>/opt/homebrew/bin/node</string></array></dict></plist>\n`;
+    const renderPlist = (programArgs: string[]) =>
+      `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>imcodes.daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+${programArgs.map((arg) => `    <string>${arg}</string>`).join('\n')}
+  </array>
+  <key>RunAtLoad</key><true/>
+</dict></plist>
+`;
+    const originalPlist = renderPlist(['/opt/homebrew/bin/node']);
     writeFileSync(plistPath, originalPlist);
     const macRunner = join(stageOut.scriptsDir, 'phase-a-runner.sh');
     const macDry = execFileSync(
@@ -339,10 +350,7 @@ describe('AC 3: Three-platform installer builders & CI wiring', () => {
     const fakeBrewEntry = join(fakeBrewPkg, 'index.js');
     writeFileSync(fakeBrewNode, '#!/bin/sh\n', { mode: 0o755 });
     writeFileSync(fakeBrewEntry, 'console.log("brew");\n');
-    writeFileSync(
-      plistPath,
-      `<plist><dict><key>ProgramArguments</key><array><string>${fakeBrewNode}</string><string>${fakeBrewEntry}</string></array></dict></plist>\n`,
-    );
+    writeFileSync(plistPath, renderPlist([fakeBrewNode, fakeBrewEntry, 'start', '--foreground']));
     const macBrewDry = execFileSync(
       macRunner,
       ['--isolated-root', isoMacRoot, '--home', isoMacHome, '--dry-run'],
@@ -350,6 +358,26 @@ describe('AC 3: Three-platform installer builders & CI wiring', () => {
     );
     expect(macBrewDry).toContain('scenario=macos_launchagent_fda_preserve');
     expect(macBrewDry).toContain('preserve_fda=1');
+
+    // Positive control on the same multiline plist parser: symlinked npm-link checkout triggers dev_symlink_exempt,
+    // proving arg0/arg1 are genuinely parsed by macRunner's awk and evaluated by is_git_checkout_path.
+    const devRepo = join(root, 'codedeck-mac-dev');
+    mkdirSync(join(devRepo, '.git'), { recursive: true });
+    mkdirSync(join(devRepo, 'dist', 'src'), { recursive: true });
+    writeFileSync(join(devRepo, 'dist', 'src', 'index.js'), 'console.log("dev");\n');
+    const linkedPkg = join(fakeBrew, 'lib', 'node_modules', 'imcodes-linked');
+    symlinkSync(devRepo, linkedPkg);
+    writeFileSync(
+      plistPath,
+      renderPlist([fakeBrewNode, join(linkedPkg, 'dist', 'src', 'index.js'), 'start', '--foreground']),
+    );
+    const macDevDry = execFileSync(
+      macRunner,
+      ['--isolated-root', isoMacRoot, '--home', isoMacHome, '--dry-run'],
+      { encoding: 'utf8' },
+    );
+    expect(macDevDry).toContain('scenario=dev_symlink_exempt');
+    expect(macDevDry).toContain('preserve_autostart=1');
 
     // Verify Developer ID Installer selection works alongside Application selection
     const team = 'M675E26Q67';
