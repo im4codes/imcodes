@@ -1,4 +1,6 @@
 import { R2RelayToggle } from './components/R2RelayToggle.js';
+import { DesktopAuthBridge } from './pages/DesktopAuthBridge.js';
+import { DESKTOP_SETUP_CALLBACK_QUERY_PARAM, parseDesktopSetupCallbackUrl } from '@shared/desktop-setup-auth.js';
 import { focusComposerElement } from './util/composer-focus.js';
 import { syncIncognitoTimelineSessions, forgetIncognitoTimelineSessions } from './hooks/useTimeline.js';
 import { useState, useEffect, useCallback, useRef, useMemo } from 'preact/hooks';
@@ -432,6 +434,11 @@ function appendContentEditableTextPreservingNewlines(element: HTMLElement, suffi
 // On web: if opened by the native app for passkey auth, render the bridge page.
 const nativeCallback = typeof window !== 'undefined'
   ? new URLSearchParams(window.location.search).get('native_callback')
+  : null;
+const desktopCallback = typeof window !== 'undefined'
+  ? parseDesktopSetupCallbackUrl(
+      new URLSearchParams(window.location.search).get(DESKTOP_SETUP_CALLBACK_QUERY_PARAM),
+    )?.href ?? null
   : null;
 const aideskManagementQuery = typeof window !== 'undefined'
   ? new URLSearchParams(window.location.search)
@@ -7275,6 +7282,10 @@ function InternalMainApp() {
 
   if (isDocCollaborator) {
     return <ExternalDocShareSpace token="" />;
+  }
+
+  if (desktopCallback && !isNative()) {
+    return <DesktopAuthBridge callbackUrl={desktopCallback} />;
   }
 
   const isSharedServerParticipant = selectedShareTarget?.kind === 'server'

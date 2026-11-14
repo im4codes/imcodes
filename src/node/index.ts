@@ -36,15 +36,17 @@ import {
   readEndpointState,
   writeEndpointState,
 } from './server-endpoints.js';
-import { defaultCredentialPath, defaultStagedExecutablePath, persistCredential, readEnrollmentBlob } from './enrollment.js';
+import { type ControlledNodeCredential, defaultCredentialPath, defaultStagedExecutablePath, persistCredential, readEnrollmentBlob } from './enrollment.js';
 import { createControlledNodeIdAdopter } from './controlled-node-id-adoption.js';
 import { REMOTE_DESKTOP_LOCAL_MANAGEMENT, type RemoteDesktopLocalPermissionTarget } from '../../shared/remote-desktop-local-management.js';
+import { DESKTOP_SETUP_DEFAULT_RELAY_URL } from '../../shared/desktop-setup-auth.js';
 import { openMacosPrivacyPane } from './macos-privacy-settings.js';
 import {
   applyRemoteDesktopAccessPaused,
   loadRemoteDesktopAccessPaused,
 } from './remote-desktop-access-state.js';
 import {
+  type RemoteDesktopLocalPanelRuntimeOptions,
   remoteDesktopManagementUrl,
   startRemoteDesktopLocalPanel,
 } from './remote-desktop-local-panel.js';
@@ -52,7 +54,8 @@ import { startAideskLocalIpcServer } from './aidesk-local-ipc-server.js';
 import { ensureAideskDesktopEntry } from './aidesk-desktop-entry.js';
 import { startAideskLocalUiSidecarRefresh, warmAideskLocalUiVerification } from './aidesk-local-ui-sidecar.js';
 import { startMacosAideskAppRefresh } from './macos-aidesk-app-refresh.js';
-import { describeLocalPanelTiming, localPanelWindowHandlers, openAideskLocalPanel } from './local-panel-window-run.js';
+import { describeLocalPanelTiming, localPanelWindowHandlers, openAideskLocalPanel, openDefaultDesktopBrowser } from './local-panel-window-run.js';
+import { executePendingDesktopSetup } from './setup-flow.js';
 import { LOCAL_PANEL_TIMING } from '../../shared/local-panel-window.js';
 import {
   CONSOLE_HOLD,
@@ -254,7 +257,7 @@ async function main(): Promise<void> {
   installerLaunch = isInstallerLaunch(
     process.platform, process.execPath, defaultStagedExecutablePath(),
   );
-  if (installerLaunch && !await warnBeforeInstall()) {
+  if (installerLaunch && await readEnrollmentBlob() && !await warnBeforeInstall()) {
     process.stdout.write(`${controlledNodeInstallDeclined(installerLocale())}\n`);
     await holdConsoleForReader();
     return;
@@ -272,7 +275,7 @@ async function main(): Promise<void> {
     // success block while the web UI still shows the node offline.
     await waitForControlledNodeOnlineLease(controlledNodeHealthLeasePath(deps.journalPath));
   }
-  if (installerLaunch) {
+  if (installerLaunch && bootstrap.disposition !== 'pending_setup') {
     // The install is only "done" once a credential exists; report it on every
     // platform, on both the freshly-enrolled and already-enrolled paths.
     process.stdout.write(`${formatInstallSuccess(installerLocale(), {
@@ -286,6 +289,95 @@ async function main(): Promise<void> {
     await holdConsoleForReader();
     return;
   }
+  const headlessProfile = CONTROLLED_NODE_RUNTIME_ABI_PROFILE === CONTROLLED_NODE_ABI_GLIBC217;
+  if (!headlessProfile) void ensureAideskDesktopEntry().then((result) => {
+    if (result === 'preserved') {
+      logger.warn('existing user-created aiDesk desktop entry was preserved');
+    } else if (result === 'failed' || result === 'unavailable') {
+      logger.warn({ result }, 'aiDesk desktop entry unavailable');
+    } else if (result !== 'unchanged') {
+      logger.info({ result }, 'aiDesk desktop entry updated');
+    }
+  }).catch((error) => {
+    logger.warn({ err: error }, 'aiDesk desktop entry unavailable');
+  });
+  const stopAideskLocalUiWarm = headlessProfile ? () => undefined : warmAideskLocalUiVerification();
+  const daemonController = createLocalDaemonController();
+  let localPanel: Awaited<ReturnType<typeof startRemoteDesktopLocalPanel>> | null = null;
+  let localIpc: Awaited<ReturnType<typeof startAideskLocalIpcServer>> | null = null;
+  let cleanupRuntime: (() => void) | null = null;
+  const stop = () => {
+    stopAideskLocalUiWarm();
+    cleanupRuntime?.();
+    void localIpc?.close().catch(() => {});
+    void localPanel?.close().catch(() => {});
+    process.exit(0);
+  };
+  process.once('SIGINT', stop);
+  process.once('SIGTERM', stop);
+
+  let credential: ControlledNodeCredential;
+  const runtimeReadyGate: { notify?: () => void } = {};
+  if (bootstrap.disposition === 'pending_setup') {
+    const initialDaemonInfo = daemonController.readSetupBindingInfo
+      ? await daemonController.readSetupBindingInfo().catch(() => ({ bound: false, workerUrl: null, serverId: null }))
+      : { bound: false, workerUrl: null, serverId: null };
+    let resolveSetup!: (cred: ControlledNodeCredential) => void;
+    const setupDone = new Promise<ControlledNodeCredential>((resolve) => {
+      resolveSetup = resolve;
+    });
+    const runtimeReady = new Promise<void>((resolve) => {
+      runtimeReadyGate.notify = resolve;
+    });
+    localPanel = await startRemoteDesktopLocalPanel({
+      publicNodeId: '',
+      serverUrl: '',
+      status: () => ({ paused: false, connections: [] }),
+      ...(process.platform === 'darwin' ? { openSettings: (target: RemoteDesktopLocalPermissionTarget) => openMacosPrivacyPane(target) } : {}),
+      setPaused: async () => {},
+      stopAll: async () => {},
+      disconnect: async () => false,
+      daemon: () => daemonController.status(),
+      daemonAction: (action, payload) => daemonController.performAction(action, payload),
+      daemonLogs: () => daemonController.logs(),
+      ...localPanelWindowHandlers('', ''),
+      setup: {
+        prefilledRelayUrl: initialDaemonInfo.workerUrl ?? DESKTOP_SETUP_DEFAULT_RELAY_URL,
+        existingDaemonBound: initialDaemonInfo.bound,
+        existingDaemonRelayUrl: initialDaemonInfo.workerUrl,
+        openBrowser: openDefaultDesktopBrowser,
+        bindRelayAndEnroll: (relayOrigin, apiKey, onStep) => executePendingDesktopSetup({
+          relayOrigin,
+          apiKey,
+          daemonController,
+          deps: {
+            credentialPath: deps.credentialPath,
+            journalPath: deps.journalPath,
+            stagedExecutablePath: deps.stagedExecutablePath,
+            abiProfile: CONTROLLED_NODE_RUNTIME_ABI_PROFILE,
+          },
+          onStep,
+        }),
+        onSetupComplete: async (enrolledCredential) => {
+          resolveSetup(enrolledCredential);
+          await runtimeReady;
+        },
+      },
+    }).catch((error) => {
+      logger.warn({ err: error, host: REMOTE_DESKTOP_LOCAL_MANAGEMENT.HOST, port: REMOTE_DESKTOP_LOCAL_MANAGEMENT.PORT },
+        'local remote-desktop management panel unavailable during setup');
+      return null;
+    });
+    if (!localPanel) {
+      throw new Error('controlled node is not enrolled and local setup panel is unavailable');
+    }
+    logger.info({ host: REMOTE_DESKTOP_LOCAL_MANAGEMENT.HOST, port: REMOTE_DESKTOP_LOCAL_MANAGEMENT.PORT },
+      'controlled node entering pending_setup; waiting for local panel binding');
+    credential = await setupDone;
+  } else {
+    credential = bootstrap.credential;
+  }
+
   // A failing health-signal write repeats every 15 s for as long as it fails: report it once an hour, not 5,760 times a day.
   const reportHealthError = (err: unknown): void => {
     const message = err instanceof Error ? err.message : String(err);
@@ -329,7 +421,7 @@ async function main(): Promise<void> {
   // The addresses the node may dial: its enrolled one, plus root-pinned and server-advertised alternates (a damaged file = none).
   const endpointsPath = controlledNodeEndpointsPath(deps.journalPath);
   const endpoints = new ControlledNodeEndpointSelector(
-    bootstrap.credential.serverUrl,
+    credential.serverUrl,
     await readEndpointState(endpointsPath),
     {
       reload: () => readEndpointState(endpointsPath),
@@ -358,15 +450,15 @@ async function main(): Promise<void> {
     })
     : undefined;
   const remoteDesktopAccessPaused = await loadRemoteDesktopAccessPaused();
-  const adoptAssignedNodeId = bootstrap.credential.nodeId
+  const adoptAssignedNodeId = credential.nodeId
     ? undefined
     : createControlledNodeIdAdopter({
-      credential: bootstrap.credential,
-      persist: (credential) => persistCredential(credential, defaultCredentialPath()),
+      credential,
+      persist: (updated) => persistCredential(updated, defaultCredentialPath()),
       start: (nodeId) => startLocalManagement(nodeId),
       log: logger,
     });
-  const runtime = createControlledNodeRuntime(bootstrap.credential, undefined, {
+  const runtime = createControlledNodeRuntime(credential, undefined, {
     remoteDesktopTrafficStorePath: join(dirname(defaultCredentialPath()), REMOTE_DESKTOP_TRAFFIC.STORE_FILE),
     macosRemoteDesktopWorker,
     remoteDesktopSignedShell: signedShellArtifact ? {
@@ -392,15 +484,10 @@ async function main(): Promise<void> {
     readPreviousUpgradeFailure: () => readPreviousUpgradeFailure(deps.journalPath),
     remoteDesktopAccessPaused,
   });
-  // The local management surface (the panel the indicator opens, and the local aiDesk IPC) is keyed by the node's public ID. A node
-  // enrolled before that ID existed learns it from the server's heartbeat ack and starts the surface then, in this very process.
-  let localPanel: Awaited<ReturnType<typeof startRemoteDesktopLocalPanel>> | null = null;
-  let localIpc: Awaited<ReturnType<typeof startAideskLocalIpcServer>> | null = null;
-  async function startLocalManagement(nodeId: string): Promise<void> {
-    const daemonController = createLocalDaemonController();
-    localPanel = await startRemoteDesktopLocalPanel({
+  function buildRuntimePanelOptions(nodeId: string): RemoteDesktopLocalPanelRuntimeOptions {
+    return {
       publicNodeId: nodeId,
-      serverUrl: bootstrap.credential.serverUrl,
+      serverUrl: credential.serverUrl,
       status: () => runtime.remoteDesktopAccessStatus(),
       extras: () => {
         const connection = runtime.connectionStatus();
@@ -422,65 +509,58 @@ async function main(): Promise<void> {
       daemon: () => daemonController.status(),
       daemonAction: (action, payload) => daemonController.performAction(action, payload),
       daemonLogs: () => daemonController.logs(),
-      ...localPanelWindowHandlers(bootstrap.credential.serverUrl, nodeId),
-    }).catch((error) => {
-      logger.warn({ err: error, host: REMOTE_DESKTOP_LOCAL_MANAGEMENT.HOST, port: REMOTE_DESKTOP_LOCAL_MANAGEMENT.PORT },
-        'local remote-desktop management panel unavailable (the indicator will not be able to open it)');
-      return null;
-    });
-    localIpc = await startAideskLocalIpcServer({
-      publicNodeId: nodeId,
-      managementUrl: remoteDesktopManagementUrl(bootstrap.credential.serverUrl, nodeId, 'manage'),
-      shareUrl: remoteDesktopManagementUrl(bootstrap.credential.serverUrl, nodeId, 'share'),
-      runtimeVersion: DAEMON_VERSION,
-      productVersion: DAEMON_VERSION,
-      status: () => runtime.remoteDesktopAccessStatus(),
-      setPaused: (paused) => applyRemoteDesktopAccessPaused(
-        paused,
-        (next) => runtime.setRemoteDesktopAccessPaused(next),
-      ),
-      stopAll: () => runtime.stopAllRemoteDesktopConnections(),
-      disconnect: (connectionId) => runtime.stopRemoteDesktopConnection(connectionId),
-    }).catch((error) => {
-      // The existing panel, admission gate and worker stay available if the
-      // optional native-UI IPC surface cannot be created.
-      logger.warn({ err: error }, 'local aiDesk IPC service unavailable');
-      return null;
-    });
+      ...localPanelWindowHandlers(credential.serverUrl, nodeId),
+    };
   }
-  const headlessProfile = CONTROLLED_NODE_RUNTIME_ABI_PROFILE === CONTROLLED_NODE_ABI_GLIBC217;
-  if (!headlessProfile && bootstrap.credential.nodeId) await startLocalManagement(bootstrap.credential.nodeId);
-  if (!headlessProfile) void ensureAideskDesktopEntry().then((result) => {
-    if (result === 'preserved') {
-      logger.warn('existing user-created aiDesk desktop entry was preserved');
-    } else if (result === 'failed' || result === 'unavailable') {
-      logger.warn({ result }, 'aiDesk desktop entry unavailable');
-    } else if (result !== 'unchanged') {
-      logger.info({ result }, 'aiDesk desktop entry updated');
+  // The local management surface (the panel the indicator opens, and the local aiDesk IPC) is keyed by the node's public ID. A node
+  // enrolled before that ID existed learns it from the server's heartbeat ack and starts the surface then, in this very process.
+  async function startLocalManagement(nodeId: string): Promise<void> {
+    const runtimePanelOptions = buildRuntimePanelOptions(nodeId);
+    if (localPanel) {
+      localPanel.switchToRuntime(runtimePanelOptions);
+    } else {
+      localPanel = await startRemoteDesktopLocalPanel(runtimePanelOptions).catch((error) => {
+        logger.warn({ err: error, host: REMOTE_DESKTOP_LOCAL_MANAGEMENT.HOST, port: REMOTE_DESKTOP_LOCAL_MANAGEMENT.PORT },
+          'local remote-desktop management panel unavailable (the indicator will not be able to open it)');
+        return null;
+      });
     }
-  }).catch((error) => {
-    logger.warn({ err: error }, 'aiDesk desktop entry unavailable');
-  });
+    if (!localIpc) {
+      localIpc = await startAideskLocalIpcServer({
+        publicNodeId: nodeId,
+        managementUrl: remoteDesktopManagementUrl(credential.serverUrl, nodeId, 'manage'),
+        shareUrl: remoteDesktopManagementUrl(credential.serverUrl, nodeId, 'share'),
+        runtimeVersion: DAEMON_VERSION,
+        productVersion: DAEMON_VERSION,
+        status: () => runtime.remoteDesktopAccessStatus(),
+        setPaused: (paused) => applyRemoteDesktopAccessPaused(
+          paused,
+          (next) => runtime.setRemoteDesktopAccessPaused(next),
+        ),
+        stopAll: () => runtime.stopAllRemoteDesktopConnections(),
+        disconnect: (connectionId) => runtime.stopRemoteDesktopConnection(connectionId),
+      }).catch((error) => {
+        // The existing panel, admission gate and worker stay available if the
+        // optional native-UI IPC surface cannot be created.
+        logger.warn({ err: error }, 'local aiDesk IPC service unavailable');
+        return null;
+      });
+    }
+  }
+  if (!headlessProfile && credential.nodeId) await startLocalManagement(credential.nodeId);
   // The Windows panel window host (a signed WebView2 exe) is its own sidecar: refreshed here, apart from the node's upgrade, and never
   // able to fail the node (every outcome is a logged reason; failures back off).
-  const stopAideskLocalUiRefresh = headlessProfile ? () => undefined : startAideskLocalUiSidecarRefresh({ credential: bootstrap.credential });
-  // The installed host is verified once here, off the click path (a click then only compares the file to the proof this leaves).
-  const stopAideskLocalUiWarm = headlessProfile ? () => undefined : warmAideskLocalUiVerification();
+  const stopAideskLocalUiRefresh = headlessProfile ? () => undefined : startAideskLocalUiSidecarRefresh({ credential });
   // macOS: a newly installed aiDesk app only takes effect when the old menu-bar process is replaced. Done here when it is safe (no active
   // remote-desktop connection), logged by reason, capped per version; a no-op on other platforms.
   const stopMacosAideskAppRefresh = headlessProfile ? () => undefined : startMacosAideskAppRefresh({ activeConnections: () => runtime.remoteDesktopAccessStatus().connections.length });
-  runtime.start();
-  const stop = () => {
+  cleanupRuntime = () => {
     stopAideskLocalUiRefresh();
-    stopAideskLocalUiWarm();
     stopMacosAideskAppRefresh();
-    void localIpc?.close().catch(() => {});
-    void localPanel?.close().catch(() => {});
     runtime.stop();
-    process.exit(0);
   };
-  process.once('SIGINT', stop);
-  process.once('SIGTERM', stop);
+  runtime.start();
+  runtimeReadyGate.notify?.();
 }
 
 void main().catch(async (error) => {

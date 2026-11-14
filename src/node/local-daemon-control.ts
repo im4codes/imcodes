@@ -118,9 +118,16 @@ export interface LocalDaemonControlDeps {
   windowsLaunchSettleMs?: number;
 }
 
+export interface LocalDaemonSetupBindingInfo {
+  bound: boolean;
+  workerUrl: string | null;
+  serverId: string | null;
+}
+
 export interface LocalDaemonController {
   status(): Promise<RemoteDesktopLocalDaemonStatus>;
   logs(): Promise<RemoteDesktopLocalDaemonLogs>;
+  readSetupBindingInfo?(): Promise<LocalDaemonSetupBindingInfo>;
   performAction(
     action: RemoteDesktopLocalDaemonAction,
     payload?: { bindUrl?: unknown; serverName?: unknown },
@@ -1181,7 +1188,7 @@ function readBoundedTailLog(stateDir: string): RemoteDesktopLocalDaemonLogs {
   return { text: '', truncated: false };
 }
 
-function validateBindUrl(rawUrl: unknown): { ok: true; workerUrl: string; apiKey: string } | { ok: false; error: string } {
+export function validateBindUrl(rawUrl: unknown): { ok: true; workerUrl: string; apiKey: string } | { ok: false; error: string } {
   if (typeof rawUrl !== 'string' || !rawUrl.trim()) {
     return { ok: false, error: 'invalid_bind_url' };
   }
@@ -2067,6 +2074,26 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
 
   return {
     status: () => inspectStatus(),
+    readSetupBindingInfo: async (): Promise<LocalDaemonSetupBindingInfo> => {
+      const user = await resolveUser();
+      if (!user) return { bound: false, workerUrl: null, serverId: null };
+      const stateDir = stateDirForUser(user);
+      const creds = readServerCredentials(stateDir);
+      if (!creds) return { bound: false, workerUrl: null, serverId: null };
+      let normalizedWorkerUrl: string | null = creds.workerUrl ?? null;
+      if (normalizedWorkerUrl) {
+        try {
+          normalizedWorkerUrl = new URL(normalizedWorkerUrl).origin;
+        } catch {
+          // keep original if not parseable
+        }
+      }
+      return {
+        bound: true,
+        workerUrl: normalizedWorkerUrl,
+        serverId: creds.serverId || null,
+      };
+    },
     logs: async () => {
       const user = await resolveUser();
       if (!user) return { text: '', truncated: false };

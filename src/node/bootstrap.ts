@@ -133,19 +133,31 @@ export interface ControlledNodeBootstrapDeps {
   recoverCorruptInstallJournal?: () => Promise<InstallJournal | null>;
 }
 
-export type BootstrapDisposition = 'handoff_complete' | 'run_runtime';
+export type BootstrapDisposition = 'handoff_complete' | 'pending_setup' | 'run_runtime';
 
-export interface BootstrapResult {
-  credential: ControlledNodeCredential;
-  disposition: BootstrapDisposition;
-  journal: InstallJournal;
-  /**
-   * Set when the release publisher certificate could not be installed. The node
-   * is enrolled and reachable; the native sidecars that require the trust
-   * anchor will refuse to launch until it is.
-   */
-  publisherTrustError?: string;
-}
+export type BootstrapResult =
+  | {
+      credential: ControlledNodeCredential;
+      disposition: 'handoff_complete' | 'run_runtime';
+      journal: InstallJournal;
+      /**
+       * Set when the release publisher certificate could not be installed. The node
+       * is enrolled and reachable; the native sidecars that require the trust
+       * anchor will refuse to launch until it is.
+       */
+      publisherTrustError?: string;
+    }
+  | {
+      credential: null;
+      disposition: 'pending_setup';
+      journal: InstallJournal;
+      /**
+       * Set when the release publisher certificate could not be installed. The node
+       * is enrolled and reachable; the native sidecars that require the trust
+       * anchor will refuse to launch until it is.
+       */
+      publisherTrustError?: string;
+    };
 
 /** Production deps wired to the real enrollment/installer/journal + fs. */
 export function defaultBootstrapDeps(now: number): ControlledNodeBootstrapDeps {
@@ -575,8 +587,7 @@ async function ensureServiceRegistered(
   deps: ControlledNodeBootstrapDeps,
   journal: InstallJournal,
 ): Promise<InstallJournal> {
-  if (phaseIndex(journal.phase) >= phaseIndex('files_staged')) {
-    if (!journal.stagedReceipt) throw new Error('controlled node staged executable receipt is missing; manual recovery required');
+  if (phaseIndex(journal.phase) >= phaseIndex('files_staged') && journal.stagedReceipt) {
     // Report drift, never refuse on it. This runs on the service's own start
     // path too, so throwing here turns a stale receipt into a crash loop on a
     // machine that is otherwise serving fine -- and the installer, the one
@@ -817,7 +828,7 @@ export async function bootstrapControlledNodeWithDisposition(deps: ControlledNod
     // installer does this; the service must never rewrite the image it is
     // executing from.
     if (!stableRuntime) journal = await restageFromInstallerPackage(deps, journal);
-    journal = await ensureServiceStartRequested(deps, journal);
+    journal = await ensureServiceStartRequested(deps, journal, { startService: !stableRuntime });
     return {
       credential: existing,
       disposition: stableRuntime ? 'run_runtime' : 'handoff_complete',
@@ -834,7 +845,11 @@ export async function bootstrapControlledNodeWithDisposition(deps: ControlledNod
       if (phaseIndex(journal.phase) >= phaseIndex('enrolled')) {
         throw new Error('controlled node is enrolled but enrollment blob is unavailable; manual recovery required');
       }
-      throw new Error('controlled node is not enrolled');
+      return {
+        credential: null,
+        disposition: 'pending_setup',
+        journal,
+      };
     }
 
     const identityStep = await ensureIdentityPrepared(deps, journal, trailerRange);
@@ -856,7 +871,11 @@ export async function bootstrapControlledNodeWithDisposition(deps: ControlledNod
 }
 
 export async function bootstrapControlledNode(deps: ControlledNodeBootstrapDeps): Promise<ControlledNodeCredential> {
-  return (await bootstrapControlledNodeWithDisposition(deps)).credential;
+  const result = await bootstrapControlledNodeWithDisposition(deps);
+  if (result.disposition === 'pending_setup' || !result.credential) {
+    throw new Error('controlled node is not enrolled');
+  }
+  return result.credential;
 }
 
 /**

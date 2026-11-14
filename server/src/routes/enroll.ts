@@ -29,7 +29,8 @@ import {
   classifyMachineTarget,
   deriveDisplayName,
 } from '../../../shared/machine-reference.js';
-import { isOwnedHostDaemon } from '../services/controlled-node-host-link.js';
+import { hostIdentitiesConflict, isOwnedHostDaemon } from '../services/controlled-node-host-link.js';
+import { isPlausibleServerId } from '../../../shared/controlled-node-host-link.js';
 import {
   isCanonicalControlledNodePair,
   CONTROLLED_NODE_ARTIFACT_COMPRESSION_ENCODING,
@@ -2171,6 +2172,195 @@ enrollRoutes.get('/v2/availability', requireAuth(), async (c) => {
       sizeBytes: d.sizeBytes,
       sha256: d.sha256,
     })),
+  });
+});
+
+const DIRECT_ENROLL_BODY = z
+  .object({
+    installId: z.string().min(1).max(128),
+    nodeTokenHash: z.string().refine(isEnrollmentNodeTokenHash, 'invalid_node_token_hash'),
+    hostname: z.string().min(1).max(255),
+    os: z.string().min(1).max(64),
+    arch: z.string().min(1).max(16),
+    abiProfile: z.string().optional(),
+    hostServerId: z.string().min(1).max(128).optional(),
+  })
+  .strict();
+
+enrollRoutes.post('/v2/direct', requireAuth({ refuseDaemonCredential: true }), async (c) => {
+  const body = await c.req.json().catch(() => null);
+  const parsed = DIRECT_ENROLL_BODY.safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+
+  const { installId, nodeTokenHash, hostname, os, arch, hostServerId } = parsed.data;
+  if (!isControlledNodeOs(os) || !isControlledNodeArch(arch) || !isControlledNodeRuntimePair(os, arch)) {
+    return c.json({ error: 'invalid_body' }, 400);
+  }
+  const abiProfile = normalizeControlledNodeAbiProfile(parsed.data.abiProfile);
+  if (!abiProfile || !isControlledNodeAbiTarget(os, arch, abiProfile)) {
+    return c.json({ error: 'invalid_body' }, 400);
+  }
+  if (hostServerId && !isPlausibleServerId(hostServerId)) {
+    return c.json({ error: 'invalid_body' }, 400);
+  }
+
+  const userId = c.get('userId' as never) as string;
+  const keyId = c.get('keyId' as never) as string | undefined;
+
+  if (hostServerId) {
+    const owned = await isOwnedHostDaemon(c.env.DB, userId, hostServerId);
+    if (!owned) {
+      return c.json({ error: 'host_server_not_owned' }, 403);
+    }
+  }
+
+  type DirectEnrollResult =
+    | { kind: 'created' | 'idempotent'; serverId: string; nodeId: string; displayName: string; hostServerId: string | null }
+    | { kind: 'forbidden_host' }
+    | { kind: 'conflict'; error: string };
+
+  let result: DirectEnrollResult;
+  try {
+    result = await c.env.DB.transaction(async (tx): Promise<DirectEnrollResult> => {
+      const existing = await tx.queryOne<{
+        id: string;
+        user_id: string;
+        node_id: string | null;
+        display_name: string | null;
+        name: string;
+        node_role: string;
+        os: string | null;
+        arch: string | null;
+        abi_profile: unknown;
+        host_server_id: string | null;
+        revoked_at: number | null;
+      }>(
+        `SELECT id, user_id, node_id, display_name, name, node_role, os, arch, abi_profile, host_server_id, revoked_at
+         FROM servers
+         WHERE token_hash = $1
+         ORDER BY created_at DESC
+         LIMIT 1`,
+        [nodeTokenHash],
+      );
+
+      if (existing) {
+        if (
+          existing.user_id !== userId
+          || existing.node_role !== NODE_ROLE.CONTROLLED
+          || existing.revoked_at !== null
+          || !existing.node_id
+          || existing.os !== os
+          || existing.arch !== arch
+          || normalizeControlledNodeAbiProfile(existing.abi_profile) !== abiProfile
+        ) {
+          return { kind: 'conflict', error: 'token_hash_conflict' };
+        }
+        if (hostServerId && existing.host_server_id && existing.host_server_id !== hostServerId) {
+          return { kind: 'conflict', error: 'host_server_conflict' };
+        }
+        let effectiveHostServerId = existing.host_server_id;
+        if (hostServerId && !existing.host_server_id) {
+          if (!(await isOwnedHostDaemon(tx, userId, hostServerId))) {
+            return { kind: 'forbidden_host' };
+          }
+          if (await hostIdentitiesConflict(tx, existing.id, hostServerId)) {
+            return { kind: 'conflict', error: 'host_identity_conflict' };
+          }
+          await tx.execute(
+            `UPDATE servers
+             SET host_server_id = NULL
+             WHERE host_server_id = $1 AND user_id = $2 AND node_role = 'controlled' AND id <> $3`,
+            [hostServerId, userId, existing.id],
+          );
+          await tx.execute(
+            'UPDATE servers SET host_server_id = $2 WHERE id = $1 AND user_id = $3',
+            [existing.id, hostServerId, userId],
+          );
+          effectiveHostServerId = hostServerId;
+        }
+        return {
+          kind: 'idempotent',
+          serverId: existing.id,
+          nodeId: existing.node_id,
+          displayName: existing.display_name ?? existing.name,
+          hostServerId: effectiveHostServerId ?? null,
+        };
+      }
+
+      if (hostServerId && !(await isOwnedHostDaemon(tx, userId, hostServerId))) {
+        return { kind: 'forbidden_host' };
+      }
+
+      const serverId = randomHex(16);
+      if (hostServerId) {
+        await tx.execute(
+          `UPDATE servers
+           SET host_server_id = NULL
+           WHERE host_server_id = $1 AND user_id = $2 AND node_role = 'controlled' AND id <> $3`,
+          [hostServerId, userId, serverId],
+        );
+      }
+
+      const { nodeId, displayName } = await insertControlledServer(
+        tx,
+        serverId,
+        userId,
+        nodeTokenHash,
+        hostname,
+        os,
+        arch,
+        hostServerId ?? null,
+        dependencies.controlledNodeIdRandomBytes,
+      );
+      await tx.execute('UPDATE servers SET abi_profile = $2 WHERE id = $1', [serverId, abiProfile]);
+      if (keyId) {
+        await tx.execute('UPDATE servers SET bound_with_key_id = $2 WHERE id = $1', [serverId, keyId]);
+      }
+
+      return {
+        kind: 'created',
+        serverId,
+        nodeId,
+        displayName,
+        hostServerId: hostServerId ?? null,
+      };
+    });
+  } catch (err) {
+    logger.error({ err, userId }, 'direct controlled-node enrollment failed');
+    return c.json({ error: 'enroll_failed' }, 500);
+  }
+
+  if (result.kind === 'forbidden_host') {
+    return c.json({ error: 'host_server_not_owned' }, 403);
+  }
+  if (result.kind === 'conflict') {
+    return c.json({ error: result.error }, 409);
+  }
+
+  const ip = (c.get('clientIp' as never) as string | undefined) ?? 'unknown';
+  await logAudit({
+    userId,
+    action: result.kind === 'created' ? 'enroll.v2.direct' : 'enroll.v2.direct.idempotent',
+    ip,
+    details: {
+      serverId: result.serverId,
+      nodeId: result.nodeId,
+      installId,
+      os,
+      arch,
+      abiProfile,
+      hostServerId: result.hostServerId,
+    },
+  }, c.env.DB);
+
+  return c.json({
+    ok: true as const,
+    serverId: result.serverId,
+    nodeId: result.nodeId,
+    nodeRole: NODE_ROLE.CONTROLLED,
+    displayName: result.displayName,
+    idempotent: result.kind === 'idempotent',
+    hostServerId: result.hostServerId,
   });
 });
 

@@ -1499,7 +1499,10 @@
     "native_status_creating_passkey": "Создание passkey…",
     "native_status_registering": "Регистрация…",
     "native_status_saving": "Сохранение…",
-    "native_status_logging_in": "Вход…"
+    "native_status_logging_in": "Вход…",
+    "desktop_callback_completing": "Выполняется вход в настольное приложение…",
+    "desktop_callback_error": "Не удалось передать вход в настольное приложение. Повторите попытку.",
+    "desktop_callback_retry": "Повторить"
   },
   "serverSetup": {
     "title": "Выбор сервера",

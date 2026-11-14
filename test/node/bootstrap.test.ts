@@ -938,9 +938,65 @@ describe('bootstrap ABI authority before protected side effects', () => {
     const deps = makeDeps({ abiProfile: CONTROLLED_NODE_ABI_GLIBC217,
       redeemEnrollmentV2: vi.fn(async () => ({ ...CRED, abiProfile: CONTROLLED_NODE_ABI_GLIBC217 })) });
     const result = await bootstrapControlledNodeWithDisposition(deps);
-    expect(result.credential.abiProfile).toBe(CONTROLLED_NODE_ABI_GLIBC217);
+    expect(result.credential?.abiProfile).toBe(CONTROLLED_NODE_ABI_GLIBC217);
     expect(result.journal.abiProfile).toBe(CONTROLLED_NODE_ABI_GLIBC217);
     expect(result.journal.phase).toBe('service_start_requested');
     expect(deps.writeInstallPhase).toHaveBeenCalledWith(expect.any(String), 'credential_prepared', expect.objectContaining({abiProfile: CONTROLLED_NODE_ABI_GLIBC217}));
+  });
+});
+
+describe('pending_setup disposition when unbound without credential or trailer', () => {
+  it('returns pending_setup from bootstrapControlledNodeWithDisposition while legacy bootstrapControlledNode throws', async () => {
+    const deps = makeDeps({
+      loadCredential: vi.fn(async () => null),
+      openVerifiedEnrollmentSource: vi.fn(async () => makeSource({ readEnrollmentBlobWithRange: vi.fn(async () => null) })),
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        phase: 'uninstalled',
+        updatedAt: 0,
+      })),
+    });
+
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+    expect(result.disposition).toBe('pending_setup');
+    expect(result.credential).toBeNull();
+    expect(deps.phases).toEqual(['elevated']);
+    expect(deps.redeemEnrollmentV2).not.toHaveBeenCalled();
+
+    const depsLegacy = makeDeps({
+      loadCredential: vi.fn(async () => null),
+      openVerifiedEnrollmentSource: vi.fn(async () => makeSource({ readEnrollmentBlobWithRange: vi.fn(async () => null) })),
+    });
+    await expect(bootstrapControlledNode(depsLegacy)).rejects.toThrow('controlled node is not enrolled');
+  });
+
+  it('still fails closed when journal is already enrolled or later and credential.json is missing', async () => {
+    const nodeToken = 'secret-token-123';
+    const nodeTokenHash = createHash('sha256').update(nodeToken).digest('hex');
+    const deps = makeDeps({
+      loadCredential: vi.fn(async () => null),
+      openVerifiedEnrollmentSource: vi.fn(async () => makeSource({ readEnrollmentBlobWithRange: vi.fn(async () => null) })),
+      loadInstallIdentity: vi.fn(async () => ({
+        installId: 'inst-1',
+        nodeToken,
+        nodeTokenHash,
+        sourceExePath: '/tmp/download/imcodes-node',
+      })),
+      loadInstallJournal: vi.fn(async () => ({
+        version: INSTALL_JOURNAL_VERSION,
+        abiProfile: CONTROLLED_NODE_ABI_MODERN,
+        phase: 'enrolled',
+        updatedAt: 100,
+        installId: 'inst-1',
+        nodeTokenHash,
+        sourceExePath: '/tmp/download/imcodes-node',
+        stagedExePath: '/tmp/staged/imcodes-node',
+        serverId: 'srv-1',
+      })),
+    });
+
+    await expect(bootstrapControlledNodeWithDisposition(deps)).rejects.toThrow(
+      'controlled node is enrolled but enrollment blob is unavailable; manual recovery required',
+    );
   });
 });

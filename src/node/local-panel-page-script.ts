@@ -21,6 +21,12 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
   var toastTimer = null;
   var remoteBusyCount = 0;
   var daemonBusyCount = 0;
+  var setupBusy = false;
+  var setupManualOpen = false;
+  var setupRelayEdited = false;
+  var setupPrefillDone = false;
+  var setupLocalError = '';
+  var wasInSetup = false;
   var loadSeq = 0;
   var appliedLoadSeq = 0;
   function isRemoteBusy() { return remoteBusyCount > 0; }
@@ -363,7 +369,87 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
     }
   }
 
+  function isSetupActive() {
+    return Boolean(state && state.setup && state.setup.setupRequired);
+  }
+  function isValidHttpUrl(raw) {
+    var trimmed = String(raw || '').trim();
+    if (!trimmed) return false;
+    var parsed;
+    try { parsed = new URL(trimmed); } catch (e) { return false; }
+    return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && Boolean(parsed.host);
+  }
+  function setupStepLabel(step) {
+    if (!step || !B.setupSteps) return '';
+    if (step === B.setupSteps.EXCHANGING_NONCE) return T('setupStepExchanging');
+    if (step === B.setupSteps.BINDING_DAEMON) return T('setupStepBindingDaemon');
+    if (step === B.setupSteps.ENROLLING_NODE) return T('setupStepEnrollingNode');
+    if (step === B.setupSteps.STARTING_RUNTIME) return T('setupStepStartingRuntime');
+    if (step === B.setupSteps.COMPLETED) return T('setupComplete');
+    return '';
+  }
+  function setupErrorLabel(code) {
+    if (!code) return '';
+    if (code === 'setup_relay_invalid') return T('setupRelayInvalid');
+    if (code === 'setup_bind_invalid') return T('setupBindInvalid');
+    if (code === 'setup_server_unsupported') return T('setupServerUnsupported');
+    return T('setupBindFailed');
+  }
+  function renderSetup() {
+    var active = state ? isSetupActive() : !B.publicNodeId;
+    var navSetup = $('navSetup');
+    var navHome = $('navHome');
+    var navTraffic = $('navTraffic');
+    if (navSetup) navSetup.hidden = !active;
+    if (navHome) navHome.hidden = active;
+    if (navTraffic) navTraffic.hidden = active;
+    if (state && state.publicNodeId && state.publicNodeId !== B.publicNodeId) {
+      B.publicNodeId = state.publicNodeId;
+      $('nodeId').textContent = fmtId(B.publicNodeId);
+      $('aboutId').textContent = fmtId(B.publicNodeId);
+    }
+    if (state && state.manageUrl) B.manageUrl = state.manageUrl;
+    if (state && state.shareUrl) B.shareUrl = state.shareUrl;
+    if (active) {
+      wasInSetup = true;
+      if (currentPage !== 'setup' && currentPage !== 'settings' && currentPage !== 'about') {
+        showPage('setup');
+      }
+    } else if (state !== null && (wasInSetup || currentPage === 'setup')) {
+      wasInSetup = false;
+      if (currentPage === 'setup') showPage('home');
+    }
+    var viewSetup = $('viewSetup');
+    if (!viewSetup) return;
+    var s = state && state.setup ? state.setup : null;
+    if (s && !setupRelayEdited && !setupPrefillDone && s.prefilledRelayUrl) {
+      $('setupRelayInput').value = s.prefilledRelayUrl;
+      setupPrefillDone = true;
+    }
+    $('setupPrefillNote').hidden = !(s && s.existingDaemonBound);
+    var awaiting = Boolean(s && s.browserAuthPending);
+    $('setupAwaitBanner').hidden = !awaiting;
+    var stepText = s ? setupStepLabel(s.step) : '';
+    $('setupStepText').hidden = !stepText;
+    $('setupStepText').textContent = stepText;
+    var errText = setupLocalError ? setupErrorLabel(setupLocalError) : (s && s.error ? setupErrorLabel(s.error) : '');
+    $('setupError').hidden = !errText;
+    $('setupError').textContent = errText;
+    $('setupManualForm').hidden = !setupManualOpen;
+    $('setupManualToggleBtn').textContent = T(setupManualOpen ? 'setupManualHide' : 'setupManualToggle');
+    var inProgress = setupBusy || awaiting || (s && B.setupSteps && (
+      s.step === B.setupSteps.EXCHANGING_NONCE ||
+      s.step === B.setupSteps.BINDING_DAEMON ||
+      s.step === B.setupSteps.ENROLLING_NODE ||
+      s.step === B.setupSteps.STARTING_RUNTIME
+    ));
+    $('setupRelayInput').disabled = Boolean(inProgress);
+    $('setupBrowserBtn').disabled = Boolean(inProgress);
+    $('setupBindSubmitBtn').disabled = Boolean(inProgress);
+  }
+
   function renderAll() {
+    renderSetup();
     renderStatus();
     renderPermissions();
     renderDaemon();
@@ -640,6 +726,83 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
       if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
     });
+    if ($('setupRelayInput')) {
+      $('setupRelayInput').oninput = function () {
+        setupRelayEdited = true;
+        setupLocalError = '';
+      };
+    }
+    if ($('setupBrowserBtn')) {
+      $('setupBrowserBtn').onclick = function () {
+        if (setupBusy || !B.setupActions) return;
+        var relay = String($('setupRelayInput').value || '').trim();
+        if (!isValidHttpUrl(relay)) {
+          setupLocalError = 'setup_relay_invalid';
+          renderSetup();
+          $('setupRelayInput').focus();
+          return;
+        }
+        setupLocalError = '';
+        setupBusy = true;
+        renderSetup();
+        post(B.actionPath, { action: B.setupActions.START_BROWSER_AUTH, relayUrl: relay }).then(function (response) {
+          if (response.ok) return null;
+          return response.json().catch(function () { return null; }).then(function (data) {
+            setupLocalError = data && data.error ? data.error : 'setup_bind_failed';
+          });
+        }).catch(function () {
+          setupLocalError = 'setup_bind_failed';
+        }).then(function () {
+          setupBusy = false;
+          return load();
+        });
+      };
+    }
+    if ($('setupCancelBrowser')) {
+      $('setupCancelBrowser').onclick = function () {
+        if (!B.setupActions) return;
+        post(B.actionPath, { action: B.setupActions.CANCEL_BROWSER_AUTH }).then(function () {
+          setupLocalError = '';
+          return load();
+        });
+      };
+    }
+    if ($('setupManualToggleBtn')) {
+      $('setupManualToggleBtn').onclick = function () {
+        setupManualOpen = !setupManualOpen;
+        setupLocalError = '';
+        renderSetup();
+      };
+    }
+    if ($('setupManualForm')) {
+      $('setupManualForm').onsubmit = function (event) {
+        event.preventDefault();
+        if (setupBusy || !B.setupActions) return;
+        var input = $('setupBindInput');
+        var raw = String(input.value || '').trim();
+        if (!isValidBindInput(raw)) {
+          setupLocalError = 'setup_bind_invalid';
+          renderSetup();
+          input.focus();
+          return;
+        }
+        input.value = '';
+        setupLocalError = '';
+        setupBusy = true;
+        renderSetup();
+        post(B.actionPath, { action: B.setupActions.BIND_MANUAL, bindUrl: raw }).then(function (response) {
+          if (response.ok) return null;
+          return response.json().catch(function () { return null; }).then(function (data) {
+            setupLocalError = data && data.error ? data.error : 'setup_bind_failed';
+          });
+        }).catch(function () {
+          setupLocalError = 'setup_bind_failed';
+        }).then(function () {
+          setupBusy = false;
+          return load();
+        });
+      };
+    }
     $('langSelect').onchange = function (event) {
       pref = event.target.value;
       writePref(pref);
@@ -649,7 +812,8 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
       applyLocale();
       renderAll();
     };
-    showPage('home');
+    if (!B.publicNodeId) wasInSetup = true;
+    showPage(B.publicNodeId ? 'home' : 'setup');
     renderAll();
     setInterval(tick, 1000);
     setInterval(load, 2000);

@@ -226,4 +226,45 @@ describe.skipIf(!chromium)('the panel page lays out in a real browser', () => {
     }
     expect(problems).toEqual([]);
   }, 120_000);
+
+  it('lays out the Phase 2B Setup wizard cleanly across locales without overflow or clipping', async () => {
+    const setupPanel = await startRemoteDesktopLocalPanel({
+      publicNodeId: '',
+      serverUrl: '',
+      status: () => ({ paused: false, connections: [] }),
+      setPaused: async () => {},
+      stopAll: async () => {},
+      disconnect: async () => false,
+      port: 0,
+      setup: {
+        prefilledRelayUrl: 'https://app.im.codes',
+        existingDaemonBound: true,
+        existingDaemonRelayUrl: 'https://app.im.codes',
+        openBrowser: async () => true,
+        bindRelayAndEnroll: async () => {
+          throw new Error('unused');
+        },
+        onSetupComplete: async () => {},
+      },
+    });
+    const problems: string[] = [];
+    try {
+      for (const locale of UI_LOCALES) {
+        const context = await browser.newContext({ locale: LANGUAGE_TAG[locale], viewport: { width: 960, height: 640 } });
+        const page = await context.newPage();
+        await page.goto(setupPanel.url);
+        await page.waitForFunction("document.getElementById('viewSetup') && !document.getElementById('viewSetup').hidden");
+        await page.click('#setupManualToggleBtn');
+        await page.waitForFunction("document.getElementById('setupManualForm') && !document.getElementById('setupManualForm').hidden");
+        for (const [width, height] of SIZES) {
+          await page.setViewportSize({ width, height });
+          for (const problem of await page.evaluate<string[]>(AUDIT)) problems.push(`${locale} setup ${width}x${height}: ${problem}`);
+        }
+        await context.close();
+      }
+    } finally {
+      await setupPanel.close();
+    }
+    expect(problems).toEqual([]);
+  }, 120_000);
 });

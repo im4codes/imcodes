@@ -934,3 +934,28 @@ export function encodeMachineExecHttpStreamResult(result: MachineExecHttpEnvelop
   if (decoded.value.kind !== 'result') throw new Error('invalid_machine_exec_http_stream_result:wrong_kind');
   return decoded.value;
 }
+
+// ── Direct controlled-node enrollment (Desktop Phase 2B) ───────────────────
+
+export const ENROLL_DIRECT_V2_PATH = '/api/enroll/v2/direct' as const;
+
+export interface EnrollDirectV2Request {
+  installId: string;
+  nodeTokenHash: string;
+  hostname: string;
+  os: EnrollmentOs;
+  arch: string;
+  abiProfile?: ControlledNodeAbiProfile;
+  hostServerId?: string;
+}
+
+export interface EnrollDirectV2Response {
+  ok: true;
+  serverId: string;
+  nodeId: string;
+  nodeRole: typeof NODE_ROLE.CONTROLLED;
+  refName?: string;
+  displayName?: string;
+  idempotent: boolean;
+  hostServerId: string | null;
+}

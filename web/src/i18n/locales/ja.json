@@ -1499,7 +1499,10 @@
     "native_status_creating_passkey": "パスキーを作成中…",
     "native_status_registering": "登録中…",
     "native_status_saving": "保存中…",
-    "native_status_logging_in": "ログイン中…"
+    "native_status_logging_in": "ログイン中…",
+    "desktop_callback_completing": "デスクトップアプリへのサインインを完了しています…",
+    "desktop_callback_error": "デスクトップアプリにサインインを引き継げませんでした。もう一度お試しください。",
+    "desktop_callback_retry": "再試行"
   },
   "serverSetup": {
     "title": "サーバーを選択",

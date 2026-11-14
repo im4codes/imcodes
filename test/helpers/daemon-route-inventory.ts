@@ -88,7 +88,8 @@ export function isNonDaemonApiUse(use: ApiPathUse): boolean {
   const exceptions: Record<string, readonly string[]> = {
     'src/bind/bind-flow.ts': ['/api/bind/verify', '/api/bind/direct', '/api/bind/rebind'], // body proof / account API key
     'src/node/local-daemon-control.ts': ['/api/bind/verify', '/api/bind/direct', '/api/bind/rebind'], // body proof / account API key
-    'src/node/enrollment.ts': ['/api/enroll/v2/redeem'], // one-use enrollment ticket
+    'src/node/enrollment.ts': ['/api/enroll/v2/redeem', '/api/enroll/v2/direct'], // one-use enrollment ticket / authenticated direct desktop enroll
+    'src/node/remote-desktop-local-panel.ts': ['/api/auth/token-exchange'], // single-use desktop setup auth nonce exchange
     'src/daemon/remote-desktop-login-screen.ts': ['/api/enroll/v2/download'], // enrollment ticket
     'src/daemon/server-link.ts': ['/api/server/:param/ws'], // WS handshake, not REST
     'src/node/runtime.ts': ['/api/server/:param/ws'], // controlled-node WS handshake

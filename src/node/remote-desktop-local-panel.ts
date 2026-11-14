@@ -1,5 +1,15 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import {
+  buildDesktopSetupLoginUrl,
+  DESKTOP_SETUP_CALLBACK_PATH,
+  DESKTOP_SETUP_DEFAULT_RELAY_URL,
+  DESKTOP_SETUP_LOCAL_ACTION,
+  DESKTOP_SETUP_TOKEN_EXCHANGE_PATH,
+  sanitizeRemoteDesktopLocalSetupStatus,
+  type DesktopSetupStep,
+  type RemoteDesktopLocalSetupStatus,
+} from '../../shared/desktop-setup-auth.js';
 import { LOCAL_PANEL_EXTERNAL_PATH, LOCAL_PANEL_OPEN_ANSWER_BUDGET_MS } from '../../shared/local-panel-window.js';
 import {
   REMOTE_DESKTOP_LOCAL_ACTION,
@@ -20,12 +30,35 @@ import {
   type RemoteDesktopLocalWebAction,
 } from '../../shared/remote-desktop-local-management.js';
 import { renderLocalPanelPage } from './local-panel-page.js';
+import {
+  allowedEnrollmentServerOrigin,
+  EnrollDirectUnsupportedError,
+  type ControlledNodeCredential,
+} from './enrollment.js';
+import { validateBindUrl } from './local-daemon-control.js';
 
 const MAX_BODY_BYTES = 4096;
 const MAX_PANEL_SESSIONS = 8;
 const PANEL_SESSION_TTL_MS = 8 * 60 * 60_000;
+const SETUP_BROWSER_STATE_TTL_MS = 10 * 60_000;
 
-export interface RemoteDesktopLocalPanelOptions {
+export interface RemoteDesktopLocalPanelSetupOptions {
+  prefilledRelayUrl?: string;
+  existingDaemonBound?: boolean;
+  existingDaemonRelayUrl?: string | null;
+  openBrowser: (url: string) => Promise<boolean> | boolean;
+  bindRelayAndEnroll: (
+    relayOrigin: string,
+    apiKey: string,
+    onStep: (step: DesktopSetupStep) => void,
+  ) => Promise<ControlledNodeCredential>;
+  onSetupComplete: (credential: ControlledNodeCredential) => Promise<void> | void;
+  fetchFn?: typeof fetch;
+  now?: () => number;
+  stateTtlMs?: number;
+}
+
+export interface RemoteDesktopLocalPanelRuntimeOptions {
   publicNodeId: string;
   serverUrl: string;
   status(): Omit<RemoteDesktopLocalStatus, 'publicNodeId'>;
@@ -58,12 +91,17 @@ export interface RemoteDesktopLocalPanelOptions {
     payload?: { bindUrl?: unknown; serverName?: unknown },
   ): Promise<{ ok: boolean; statusCode?: number; error?: string }>;
   daemonLogs?(): Promise<RemoteDesktopLocalDaemonLogs> | RemoteDesktopLocalDaemonLogs;
+}
+
+export interface RemoteDesktopLocalPanelOptions extends RemoteDesktopLocalPanelRuntimeOptions {
   host?: string;
   port?: number;
+  setup?: RemoteDesktopLocalPanelSetupOptions;
 }
 
 export interface RemoteDesktopLocalPanel {
   readonly url: string;
+  switchToRuntime(next: RemoteDesktopLocalPanelRuntimeOptions): void;
   close(): Promise<void>;
 }
 
@@ -116,10 +154,77 @@ export function remoteDesktopManagementUrl(
   publicNodeId: string,
   action: 'manage' | 'share',
 ): string {
+  if (!serverUrl || !publicNodeId) return '';
   const url = new URL(serverUrl);
   url.searchParams.set(REMOTE_DESKTOP_LOCAL_MANAGEMENT.WEB_NODE_QUERY, publicNodeId);
   url.searchParams.set(REMOTE_DESKTOP_LOCAL_MANAGEMENT.WEB_ACTION_QUERY, action);
   return url.toString();
+}
+
+function buildSetupCallbackHtml(ok: boolean, title: string, detail: string): string {
+  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const accent = ok ? '#10b981' : '#ef4444';
+  return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">`
+    + `<title>${esc(title)}</title>`
+    + `<style>body{margin:0;font-family:system-ui,-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px;box-sizing:border-box}`
+    + `.card{max-width:420px;width:100%;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:24px;text-align:center}`
+    + `.badge{width:12px;height:12px;border-radius:999px;background:${accent};margin:0 auto 14px}`
+    + `h1{font-size:18px;margin:0 0 8px}p{font-size:14px;color:#94a3b8;line-height:1.5;margin:0 0 18px}`
+    + `a{display:inline-block;padding:10px 16px;border-radius:10px;background:#3b82f6;color:#fff;text-decoration:none;font-size:14px;font-weight:600}</style>`
+    + `<div class="card"><div class="badge"></div><h1>${esc(title)}</h1><p>${esc(detail)}</p><a href="/">aiDesk</a></div>`;
+}
+
+function replySetupCallback(response: ServerResponse, status: number, html: string): void {
+  response.writeHead(status, {
+    'content-type': 'text/html; charset=utf-8',
+    'cache-control': 'no-store',
+    'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'",
+    'x-frame-options': 'DENY',
+    'x-content-type-options': 'nosniff',
+    'referrer-policy': 'no-referrer',
+  });
+  response.end(html);
+}
+
+function mapSetupErrorCode(error: unknown): string {
+  if (error instanceof EnrollDirectUnsupportedError) return 'setup_server_unsupported';
+  const msg = error instanceof Error ? error.message : '';
+  if (msg === 'setup_relay_invalid' || msg.startsWith('enrollment_server_url_')) return 'setup_relay_invalid';
+  if (msg === 'setup_bind_invalid') return 'setup_bind_invalid';
+  return 'setup_bind_failed';
+}
+
+async function exchangeDesktopSetupNonce(
+  relayOrigin: string,
+  nonce: string,
+  fetchFn: typeof fetch,
+): Promise<string> {
+  const response = await fetchFn(`${relayOrigin}${DESKTOP_SETUP_TOKEN_EXCHANGE_PATH}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ nonce }),
+    redirect: 'error',
+  });
+  if (response.redirected || !response.url) {
+    throw new Error('setup_nonce_exchange_redirect_rejected');
+  }
+  let resOrigin: string;
+  try {
+    resOrigin = new URL(response.url).origin;
+  } catch {
+    throw new Error('setup_nonce_exchange_url_invalid');
+  }
+  if (resOrigin !== relayOrigin) {
+    throw new Error('setup_nonce_exchange_origin_mismatch');
+  }
+  if (!response.ok) {
+    throw new Error(`setup_nonce_exchange_failed:${response.status}`);
+  }
+  const body = await response.json().catch(() => null) as { apiKey?: unknown } | null;
+  if (!body || typeof body.apiKey !== 'string' || body.apiKey.length === 0) {
+    throw new Error('setup_nonce_exchange_invalid_response');
+  }
+  return body.apiKey;
 }
 
 export async function startRemoteDesktopLocalPanel(
@@ -128,10 +233,32 @@ export async function startRemoteDesktopLocalPanel(
   const host = options.host ?? REMOTE_DESKTOP_LOCAL_MANAGEMENT.HOST;
   const port = options.port ?? REMOTE_DESKTOP_LOCAL_MANAGEMENT.PORT;
   const sessions = new Map<string, { csrf: string; expiresAt: number }>();
+  let currentRuntime: RemoteDesktopLocalPanelRuntimeOptions = { ...options };
+  let activeSetup: RemoteDesktopLocalPanelSetupOptions | null = options.setup ?? null;
+  let switchedFromSetup = false;
+  const nowFn = () => activeSetup?.now?.() ?? Date.now();
+  let setupStatus: RemoteDesktopLocalSetupStatus | null = activeSetup
+    ? {
+        setupRequired: true,
+        step: 'idle',
+        prefilledRelayUrl: activeSetup.prefilledRelayUrl || DESKTOP_SETUP_DEFAULT_RELAY_URL,
+        ...(typeof activeSetup.existingDaemonBound === 'boolean'
+          ? { existingDaemonBound: activeSetup.existingDaemonBound }
+          : {}),
+        ...(activeSetup.existingDaemonRelayUrl
+          ? { existingDaemonRelayUrl: activeSetup.existingDaemonRelayUrl }
+          : {}),
+        browserAuthPending: false,
+      }
+    : null;
+  let pendingBrowserAuth: { state: string; relayOrigin: string; expiresAt: number } | null = null;
   let expectedHost = `${host}:${port}`;
   let origin = `http://${expectedHost}`;
+  let listenPort = port;
   let mutation: Promise<void> = Promise.resolve();
   let daemonMutation: Promise<void> = Promise.resolve();
+  let setupMutation: Promise<void> = Promise.resolve();
+  let setupInFlight = false;
   let openWindowInFlight: Promise<{ ok: boolean; reason: string }> | undefined;
   const mutate = async (action: () => Promise<void>): Promise<void> => {
     const current = mutation.then(action, action);
@@ -143,9 +270,107 @@ export async function startRemoteDesktopLocalPanel(
     daemonMutation = current.catch(() => {});
     await current;
   };
+  const runChainedSetup = async (relayOrigin: string, apiKey: string): Promise<void> => {
+    if (!activeSetup) throw new Error('setup_not_active');
+    if (setupInFlight) throw new Error('setup_in_flight');
+    setupInFlight = true;
+    const run = setupMutation.then(async () => {
+      if (!activeSetup || !setupStatus) throw new Error('setup_not_active');
+      setupStatus = {
+        ...setupStatus,
+        relayUrl: relayOrigin,
+        browserAuthPending: false,
+        error: null,
+      };
+      const credential = await activeSetup.bindRelayAndEnroll(relayOrigin, apiKey, (step) => {
+        if (setupStatus) {
+          setupStatus = { ...setupStatus, step, relayUrl: relayOrigin, browserAuthPending: false, error: null };
+        }
+      });
+      if (setupStatus) {
+        setupStatus = { ...setupStatus, step: 'starting_runtime', error: null };
+      }
+      await activeSetup.onSetupComplete(credential);
+      if (setupStatus) {
+        setupStatus = { ...setupStatus, setupRequired: false, step: 'completed', browserAuthPending: false, error: null };
+      }
+    });
+    setupMutation = run.catch(() => {});
+    try {
+      await run;
+    } finally {
+      setupInFlight = false;
+    }
+  };
   const server: Server = createServer(async (request, response) => {
     if (request.headers.host !== expectedHost) return reply(response, 421, 'misdirected');
     const url = new URL(request.url ?? '/', origin);
+    if (request.method === 'GET' && url.pathname === DESKTOP_SETUP_CALLBACK_PATH) {
+      if (!activeSetup || !setupStatus || !setupStatus.setupRequired) {
+        return replySetupCallback(
+          response,
+          404,
+          buildSetupCallbackHtml(false, 'Setup not active', 'Return to aiDesk to continue.'),
+        );
+      }
+      const now = nowFn();
+      if (pendingBrowserAuth && now > pendingBrowserAuth.expiresAt) {
+        pendingBrowserAuth = null;
+      }
+      const nonce = url.searchParams.get('nonce');
+      const state = url.searchParams.get('state');
+      if (
+        !pendingBrowserAuth
+        || typeof state !== 'string'
+        || !secureEqual(state, pendingBrowserAuth.state)
+        || typeof nonce !== 'string'
+        || nonce.length === 0
+        || nonce.length > 256
+      ) {
+        return replySetupCallback(
+          response,
+          400,
+          buildSetupCallbackHtml(false, 'Invalid or expired sign-in callback', 'Please start browser sign-in again from aiDesk.'),
+        );
+      }
+      const matched = pendingBrowserAuth;
+      pendingBrowserAuth = null;
+      try {
+        setupStatus = {
+          ...setupStatus,
+          step: 'exchanging_nonce',
+          relayUrl: matched.relayOrigin,
+          browserAuthPending: false,
+          error: null,
+        };
+        const apiKey = await exchangeDesktopSetupNonce(
+          matched.relayOrigin,
+          nonce,
+          activeSetup.fetchFn ?? fetch,
+        );
+        await runChainedSetup(matched.relayOrigin, apiKey);
+        return replySetupCallback(
+          response,
+          200,
+          buildSetupCallbackHtml(true, 'Connected to IM.codes', 'You can close this tab and return to aiDesk.'),
+        );
+      } catch (err) {
+        const errorCode = mapSetupErrorCode(err);
+        if (setupStatus) {
+          setupStatus = {
+            ...setupStatus,
+            step: 'failed',
+            browserAuthPending: false,
+            error: errorCode,
+          };
+        }
+        return replySetupCallback(
+          response,
+          502,
+          buildSetupCallbackHtml(false, 'Connection failed', 'Please return to aiDesk and try again.'),
+        );
+      }
+    }
     const cookie = cookies(request)[REMOTE_DESKTOP_LOCAL_MANAGEMENT.COOKIE_NAME];
     if (request.method === 'GET' && url.pathname === REMOTE_DESKTOP_LOCAL_MANAGEMENT.ROOT_PATH) {
       const now = Date.now();
@@ -162,9 +387,9 @@ export async function startRemoteDesktopLocalPanel(
       sessions.set(session, { csrf, expiresAt: now + PANEL_SESSION_TTL_MS });
       response.setHeader('set-cookie', `${REMOTE_DESKTOP_LOCAL_MANAGEMENT.COOKIE_NAME}=${session}; HttpOnly; SameSite=Strict; Path=/`);
       return reply(response, 200, renderLocalPanelPage({
-        publicNodeId: options.publicNodeId,
-        manageUrl: remoteDesktopManagementUrl(options.serverUrl, options.publicNodeId, REMOTE_DESKTOP_LOCAL_WEB_ACTION.MANAGE),
-        shareUrl: remoteDesktopManagementUrl(options.serverUrl, options.publicNodeId, REMOTE_DESKTOP_LOCAL_WEB_ACTION.SHARE),
+        publicNodeId: currentRuntime.publicNodeId,
+        manageUrl: remoteDesktopManagementUrl(currentRuntime.serverUrl, currentRuntime.publicNodeId, REMOTE_DESKTOP_LOCAL_WEB_ACTION.MANAGE),
+        shareUrl: remoteDesktopManagementUrl(currentRuntime.serverUrl, currentRuntime.publicNodeId, REMOTE_DESKTOP_LOCAL_WEB_ACTION.SHARE),
         csrf,
       }), 'text/html; charset=utf-8');
     }
@@ -174,11 +399,11 @@ export async function startRemoteDesktopLocalPanel(
       if (request.headers.origin !== undefined || request.headers[REMOTE_DESKTOP_LOCAL_MANAGEMENT.OPEN_WINDOW_HEADER] !== '1') {
         return reply(response, 403, 'forbidden');
       }
-      if (!options.openWindow) return reply(response, 501, 'not_implemented');
-      openWindowInFlight ??= options.openWindow().catch(() => ({ ok: false, reason: 'launch_failed' })).finally(() => { openWindowInFlight = undefined; });
+      if (!currentRuntime.openWindow) return reply(response, 501, 'not_implemented');
+      openWindowInFlight ??= currentRuntime.openWindow().catch(() => ({ ok: false, reason: 'launch_failed' })).finally(() => { openWindowInFlight = undefined; });
       // A slow machine may take longer than the client is willing to wait; the open keeps going and the client is told so (200), not left
       // to time out and open the browser as well.
-      const budget = options.openWindowAnswerBudgetMs ?? LOCAL_PANEL_OPEN_ANSWER_BUDGET_MS;
+      const budget = currentRuntime.openWindowAnswerBudgetMs ?? LOCAL_PANEL_OPEN_ANSWER_BUDGET_MS;
       let budgetTimer: NodeJS.Timeout | undefined;
       const outcome = await Promise.race([
         openWindowInFlight,
@@ -194,27 +419,37 @@ export async function startRemoteDesktopLocalPanel(
     }
     if (request.method === 'GET' && url.pathname === REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH) {
       let extras: RemoteDesktopLocalExtras = {};
-      try { extras = sanitizeRemoteDesktopLocalExtras(options.extras?.()); } catch { /* the panel works without them */ }
+      try { extras = sanitizeRemoteDesktopLocalExtras(currentRuntime.extras?.()); } catch { /* the panel works without them */ }
       let daemon: RemoteDesktopLocalDaemonStatus | undefined;
-      if (options.daemon) {
+      if (currentRuntime.daemon) {
         try {
-          daemon = sanitizeRemoteDesktopLocalDaemonStatus(await options.daemon());
+          daemon = sanitizeRemoteDesktopLocalDaemonStatus(await currentRuntime.daemon());
         } catch {
           /* omit malformed or failing daemon status */
         }
       }
+      const sanitizedSetup = setupStatus?.setupRequired
+        ? sanitizeRemoteDesktopLocalSetupStatus(setupStatus)
+        : undefined;
       const payload = {
-        publicNodeId: options.publicNodeId,
-        ...options.status(),
+        publicNodeId: currentRuntime.publicNodeId,
+        ...currentRuntime.status(),
         ...extras,
         ...(daemon ? { daemon } : {}),
+        ...(sanitizedSetup ? { setup: sanitizedSetup } : {}),
+        ...(switchedFromSetup && currentRuntime.serverUrl && currentRuntime.publicNodeId
+          ? {
+              manageUrl: remoteDesktopManagementUrl(currentRuntime.serverUrl, currentRuntime.publicNodeId, REMOTE_DESKTOP_LOCAL_WEB_ACTION.MANAGE),
+              shareUrl: remoteDesktopManagementUrl(currentRuntime.serverUrl, currentRuntime.publicNodeId, REMOTE_DESKTOP_LOCAL_WEB_ACTION.SHARE),
+            }
+          : {}),
       };
       return reply(response, 200, JSON.stringify(payload), 'application/json; charset=utf-8');
     }
     if (request.method === 'GET' && url.pathname === REMOTE_DESKTOP_LOCAL_MANAGEMENT.DAEMON_LOGS_PATH) {
-      if (!options.daemonLogs) return reply(response, 501, 'not_implemented');
+      if (!currentRuntime.daemonLogs) return reply(response, 501, 'not_implemented');
       try {
-        const raw = await options.daemonLogs();
+        const raw = await currentRuntime.daemonLogs();
         const redacted = typeof raw?.text === 'string'
           ? redactRemoteDesktopLocalSecrets(raw.text, { preserveNewlines: true }).slice(-65536)
           : '';
@@ -242,19 +477,89 @@ export async function startRemoteDesktopLocalPanel(
       let found = true;
       try {
         if (action === REMOTE_DESKTOP_LOCAL_ACTION.PAUSE) {
-          await mutate(() => options.setPaused(true));
+          await mutate(() => currentRuntime.setPaused(true));
         } else if (action === REMOTE_DESKTOP_LOCAL_ACTION.RESUME) {
-          await mutate(() => options.setPaused(false));
+          await mutate(() => currentRuntime.setPaused(false));
         } else if (action === REMOTE_DESKTOP_LOCAL_ACTION.STOP_ALL) {
-          await mutate(options.stopAll);
+          await mutate(currentRuntime.stopAll);
         } else if (action === REMOTE_DESKTOP_LOCAL_ACTION.DISCONNECT && typeof body?.id === 'string') {
-          await mutate(async () => { found = await options.disconnect(body.id as string); });
+          await mutate(async () => { found = await currentRuntime.disconnect(body.id as string); });
           if (!found) return reply(response, 404, 'not_found');
+        } else if (action === DESKTOP_SETUP_LOCAL_ACTION.START_BROWSER_AUTH) {
+          if (!activeSetup || !setupStatus || !setupStatus.setupRequired) {
+            return reply(response, 409, 'setup_not_active');
+          }
+          const rawRelayUrl = typeof body?.relayUrl === 'string' && body.relayUrl.trim()
+            ? body.relayUrl.trim()
+            : setupStatus.prefilledRelayUrl;
+          let relayOrigin: string;
+          try {
+            relayOrigin = allowedEnrollmentServerOrigin(rawRelayUrl);
+          } catch {
+            setupStatus = { ...setupStatus, step: 'failed', browserAuthPending: false, error: 'setup_relay_invalid' };
+            return reply(response, 400, JSON.stringify({ ok: false, error: 'setup_relay_invalid' }), 'application/json; charset=utf-8');
+          }
+          const state = randomBytes(24).toString('base64url');
+          const callbackUrl = `http://${host}:${listenPort}${DESKTOP_SETUP_CALLBACK_PATH}?state=${state}`;
+          const loginUrl = buildDesktopSetupLoginUrl(relayOrigin, callbackUrl);
+          pendingBrowserAuth = {
+            state,
+            relayOrigin,
+            expiresAt: nowFn() + (activeSetup.stateTtlMs ?? SETUP_BROWSER_STATE_TTL_MS),
+          };
+          setupStatus = {
+            ...setupStatus,
+            step: 'awaiting_browser',
+            relayUrl: relayOrigin,
+            browserAuthPending: true,
+            error: null,
+          };
+          const opened = await activeSetup.openBrowser(loginUrl);
+          if (!opened) {
+            pendingBrowserAuth = null;
+            setupStatus = {
+              ...setupStatus,
+              step: 'failed',
+              browserAuthPending: false,
+              error: 'setup_browser_open_failed',
+            };
+            return reply(response, 502, JSON.stringify({ ok: false, error: 'setup_browser_open_failed' }), 'application/json; charset=utf-8');
+          }
+          return reply(response, 200, JSON.stringify({ ok: true, step: 'awaiting_browser' }), 'application/json; charset=utf-8');
+        } else if (action === DESKTOP_SETUP_LOCAL_ACTION.CANCEL_BROWSER_AUTH) {
+          pendingBrowserAuth = null;
+          if (setupStatus && setupStatus.setupRequired) {
+            setupStatus = { ...setupStatus, step: 'idle', browserAuthPending: false, error: null };
+          }
+        } else if (action === DESKTOP_SETUP_LOCAL_ACTION.BIND_MANUAL) {
+          if (!activeSetup || !setupStatus || !setupStatus.setupRequired) {
+            return reply(response, 409, 'setup_not_active');
+          }
+          const parsedBind = validateBindUrl(body?.bindUrl);
+          if (!parsedBind.ok) {
+            setupStatus = { ...setupStatus, step: 'failed', browserAuthPending: false, error: 'setup_bind_invalid' };
+            return reply(response, 400, JSON.stringify({ ok: false, error: 'setup_bind_invalid' }), 'application/json; charset=utf-8');
+          }
+          let relayOrigin: string;
+          try {
+            relayOrigin = allowedEnrollmentServerOrigin(parsedBind.workerUrl);
+          } catch {
+            setupStatus = { ...setupStatus, step: 'failed', browserAuthPending: false, error: 'setup_relay_invalid' };
+            return reply(response, 400, JSON.stringify({ ok: false, error: 'setup_relay_invalid' }), 'application/json; charset=utf-8');
+          }
+          pendingBrowserAuth = null;
+          try {
+            await runChainedSetup(relayOrigin, parsedBind.apiKey);
+          } catch (err) {
+            const errorCode = mapSetupErrorCode(err);
+            setupStatus = { ...setupStatus, step: 'failed', browserAuthPending: false, error: errorCode };
+            return reply(response, 502, JSON.stringify({ ok: false, error: errorCode }), 'application/json; charset=utf-8');
+          }
         } else if (isDaemonAction) {
-          if (!options.daemonAction) return reply(response, 501, 'not_implemented');
+          if (!currentRuntime.daemonAction) return reply(response, 501, 'not_implemented');
           let result: { ok: boolean; statusCode?: number; error?: string } = { ok: false, statusCode: 500, error: 'action_failed' };
           await mutateDaemon(async () => {
-            result = await options.daemonAction!(action as RemoteDesktopLocalDaemonAction, {
+            result = await currentRuntime.daemonAction!(action as RemoteDesktopLocalDaemonAction, {
               bindUrl: body?.bindUrl,
               serverName: body?.serverName,
             });
@@ -281,12 +586,12 @@ export async function startRemoteDesktopLocalPanel(
       if (request.headers.origin !== origin || typeof csrfHeader !== 'string' || !secureEqual(csrfHeader, session.csrf)) {
         return reply(response, 403, 'forbidden');
       }
-      if (!options.openSettings) return reply(response, 501, 'not_implemented');
+      if (!currentRuntime.openSettings) return reply(response, 501, 'not_implemented');
       const body = await readJson(request);
       const target = body?.target;
       if (!isRemoteDesktopLocalPermissionTarget(target)) return reply(response, 400, 'invalid_target');
       let opened = false;
-      try { opened = await options.openSettings(target); } catch { opened = false; }
+      try { opened = await currentRuntime.openSettings(target); } catch { opened = false; }
       return reply(response, opened ? 200 : 502, opened ? '{"ok":true}' : 'open_failed', opened ? 'application/json; charset=utf-8' : 'text/plain; charset=utf-8');
     }
     if (request.method === 'POST' && url.pathname === LOCAL_PANEL_EXTERNAL_PATH) {
@@ -296,12 +601,12 @@ export async function startRemoteDesktopLocalPanel(
       if (request.headers.origin !== origin || typeof csrfHeader !== 'string' || !secureEqual(csrfHeader, session.csrf)) {
         return reply(response, 403, 'forbidden');
       }
-      if (!options.openExternal) return reply(response, 501, 'not_implemented');
+      if (!currentRuntime.openExternal) return reply(response, 501, 'not_implemented');
       const body = await readJson(request);
       const target = body?.target;
       if (target !== REMOTE_DESKTOP_LOCAL_WEB_ACTION.MANAGE && target !== REMOTE_DESKTOP_LOCAL_WEB_ACTION.SHARE) return reply(response, 400, 'invalid_target');
       let opened = false;
-      try { opened = await options.openExternal(target); } catch { opened = false; }
+      try { opened = await currentRuntime.openExternal(target); } catch { opened = false; }
       return reply(response, opened ? 200 : 502, opened ? '{"ok":true}' : 'open_failed', opened ? 'application/json; charset=utf-8' : 'text/plain; charset=utf-8');
     }
     return reply(response, 404, 'not_found');
@@ -315,10 +620,22 @@ export async function startRemoteDesktopLocalPanel(
     await new Promise<void>((resolve) => server.close(() => resolve()));
     throw new Error('remote_desktop_local_panel_address_unavailable');
   }
+  listenPort = address.port;
   expectedHost = `${host}:${address.port}`;
   origin = `http://${expectedHost}`;
   return {
     url: `${origin}/`,
-    close: () => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
+    switchToRuntime: (next: RemoteDesktopLocalPanelRuntimeOptions) => {
+      currentRuntime = { ...next };
+      activeSetup = null;
+      pendingBrowserAuth = null;
+      switchedFromSetup = true;
+      setupStatus = null;
+    },
+    close: () => {
+      pendingBrowserAuth = null;
+      activeSetup = null;
+      return new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    },
   };
 }

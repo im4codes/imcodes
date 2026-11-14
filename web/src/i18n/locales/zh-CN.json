@@ -1499,7 +1499,10 @@
     "native_status_creating_passkey": "正在创建 Passkey…",
     "native_status_registering": "正在注册…",
     "native_status_saving": "正在保存…",
-    "native_status_logging_in": "正在登录…"
+    "native_status_logging_in": "正在登录…",
+    "desktop_callback_completing": "正在完成桌面端登录…",
+    "desktop_callback_error": "无法将登录信息回传到桌面端，请重试。",
+    "desktop_callback_retry": "重试"
   },
   "serverSetup": {
     "title": "选择服务器",

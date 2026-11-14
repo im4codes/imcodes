@@ -6,7 +6,11 @@ import { createUser, getUserById, getUserByUsername, getSetting, updateUserStatu
 import { randomHex, sha256Hex, signJwt, verifyJwt, hashPassword, verifyPassword } from '../security/crypto.js';
 import { checkIdempotency, recordIdempotency } from '../security/replay.js';
 import { checkAuthLockout, recordAuthFailure } from '../security/lockout.js';
-import { DOC_COLLABORATOR_SCOPE_REFUSAL, resolveAuthOutcome, resolveServerWebSocketAccess } from '../security/authorization.js';
+import { DOC_COLLABORATOR_SCOPE_REFUSAL, requireAuth, resolveAuthOutcome, resolveServerWebSocketAccess } from '../security/authorization.js';
+import {
+  buildDesktopSetupCallbackRedirectUrl,
+  parseDesktopSetupCallbackUrl,
+} from '../../../shared/desktop-setup-auth.js';
 import { isUserActive } from '../security/user-status.js';
 import { WsBridge } from '../ws/bridge.js';
 import { COOKIE_SESSION, COOKIE_CSRF } from '../../../shared/cookie-names.js';
@@ -463,6 +467,49 @@ authRoutes.post('/token-exchange', async (c) => {
     apiKey: nonceRow.api_key,
     userId: nonceRow.user_id,
     keyId: nonceRow.key_id,
+  });
+});
+
+// POST /api/auth/desktop/nonce — mint a short-lived nonce for a validated loopback desktop callback
+const desktopNonceSchema = z.object({
+  callbackUrl: z.string().min(1).max(512),
+});
+
+authRoutes.post('/desktop/nonce', requireAuth({ refuseDaemonCredential: true }), async (c) => {
+  const body = await c.req.json().catch(() => null);
+  const parsed = desktopNonceSchema.safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+
+  const validated = parseDesktopSetupCallbackUrl(parsed.data.callbackUrl);
+  if (!validated) return c.json({ error: 'invalid_desktop_callback' }, 400);
+
+  const userId = c.get('userId' as never) as string;
+  if (!await isUserActive(c.env.DB, userId)) {
+    return c.json({ error: 'account_not_active' }, 403);
+  }
+
+  const rawKey = `deck_${randomHex(32)}`;
+  const keyHash = sha256Hex(rawKey);
+  const keyId = randomHex(16);
+  const now = Date.now();
+  await c.env.DB.execute(
+    'INSERT INTO api_keys (id, user_id, key_hash, label, created_at) VALUES ($1, $2, $3, $4, $5)',
+    [keyId, userId, keyHash, 'Desktop app', now],
+  );
+
+  const nonce = await issueAuthNonce(c.env.DB, { apiKey: rawKey, userId, keyId });
+  const ip = c.get('clientIp' as never) as string ?? 'unknown';
+  await logAuthAudit(c, {
+    userId,
+    action: 'auth.desktop_nonce',
+    ip,
+    outcomeCode: 'success',
+    details: { keyId, callbackPort: validated.port },
+  }, c.env.DB);
+
+  return c.json({
+    nonce,
+    redirectUrl: buildDesktopSetupCallbackRedirectUrl(validated, nonce),
   });
 });
 

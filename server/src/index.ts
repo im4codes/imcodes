@@ -405,7 +405,7 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
     if (bare !== landingHost) return next();
     // Skip landing for native auth callbacks and native passkey page
     const url = new URL(c.req.url);
-    if (url.searchParams.has('native_callback')) return next();
+    if (url.searchParams.has('native_callback') || url.searchParams.has('desktop_callback')) return next();
     if (url.pathname === '/api/auth/passkey/native') return next();
 
     const reqPath = new URL(c.req.url).pathname;

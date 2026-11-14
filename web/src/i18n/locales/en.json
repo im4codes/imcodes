@@ -1499,7 +1499,10 @@
     "native_status_creating_passkey": "Creating passkey…",
     "native_status_registering": "Registering…",
     "native_status_saving": "Saving…",
-    "native_status_logging_in": "Logging in…"
+    "native_status_logging_in": "Logging in…",
+    "desktop_callback_completing": "Signing in to desktop app…",
+    "desktop_callback_error": "Could not hand off sign-in to the desktop app. Please try again.",
+    "desktop_callback_retry": "Try Again"
   },
   "serverSetup": {
     "title": "Choose a Server",

@@ -1264,3 +1264,212 @@ describe('local panel Coding Daemon endpoints and UI', () => {
   });
 });
 
+describe('Desktop Phase 2B pending_setup mode & switchToRuntime', () => {
+  const created: RemoteDesktopLocalPanel[] = [];
+
+  afterEach(async () => {
+    while (created.length > 0) {
+      await created.pop()?.close();
+    }
+  });
+
+  it('supports browser auth handoff (/setup/callback state validation + nonce exchange) and transitions live without rebinding port', async () => {
+    const { DESKTOP_SETUP_CALLBACK_PATH, DESKTOP_SETUP_LOCAL_ACTION } = await import('../../shared/desktop-setup-auth.js');
+    const openedUrls: string[] = [];
+    let currentTime = 1_700_000_000_000;
+    const panel = await startRemoteDesktopLocalPanel({
+      publicNodeId: '',
+      serverUrl: '',
+      port: 0,
+      status: () => ({ paused: false, connections: [] }),
+      setPaused: async () => {},
+      stopAll: async () => {},
+      disconnect: async () => false,
+      setup: {
+        prefilledRelayUrl: 'https://relay.example.com',
+        existingDaemonBound: true,
+        existingDaemonRelayUrl: 'https://relay.example.com',
+        now: () => currentTime,
+        stateTtlMs: 60_000,
+        openBrowser: async (url) => {
+          openedUrls.push(url);
+          return true;
+        },
+        fetchFn: (async (input: string | URL | Request, init?: RequestInit) => {
+          const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+          expect(url).toBe('https://relay.example.com/api/auth/token-exchange');
+          const sent = JSON.parse(String(init?.body ?? '{}')) as { nonce?: string };
+          expect(sent.nonce).toBe('nonce-valid-1');
+          const res = new Response(JSON.stringify({ apiKey: 'deck_exchanged_1', userId: 'u-1', keyId: 'k-1' }), { status: 200 });
+          Object.defineProperty(res, 'url', { value: url });
+          return res;
+        }) as unknown as typeof fetch,
+        bindRelayAndEnroll: vi.fn(async (relayOrigin, apiKey, onStep) => {
+          expect(relayOrigin).toBe('https://relay.example.com');
+          expect(apiKey).toBe('deck_exchanged_1');
+          onStep('binding_daemon');
+          onStep('enrolling_node');
+          return {
+            serverId: 'srv-ctrl-1',
+            nodeId: '7778889990',
+            token: 'node-tok-secret',
+            serverUrl: 'https://relay.example.com',
+            nodeRole: 'controlled',
+          };
+        }),
+        onSetupComplete: async () => {
+          panel.switchToRuntime({
+            publicNodeId: '7778889990',
+            serverUrl: 'https://relay.example.com',
+            status: () => ({ paused: false, connections: [] }),
+            setPaused: async () => {},
+            stopAll: async () => {},
+            disconnect: async () => false,
+          });
+        },
+      },
+    });
+    created.push(panel);
+
+    const origin = new URL(panel.url).origin;
+    const home = await fetch(panel.url);
+    expect(home.status).toBe(200);
+    const html = await home.text();
+    const cookie = (home.headers.get('set-cookie') ?? '').split(';')[0]!;
+    const csrf = /"csrf":"([^"]+)"/u.exec(html)![1]!;
+
+    // /api/state exposes setup status with prefilled relay URL
+    const st1 = await (await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH, origin), { headers: { cookie } })).json() as {
+      setup?: { setupRequired: boolean; prefilledRelayUrl: string; existingDaemonBound?: boolean };
+    };
+    expect(st1.setup).toMatchObject({
+      setupRequired: true,
+      prefilledRelayUrl: 'https://relay.example.com',
+      existingDaemonBound: true,
+    });
+
+    // Wrong state on /setup/callback fails cleanly
+    const badState = await fetch(new URL(`${DESKTOP_SETUP_CALLBACK_PATH}?nonce=nonce-valid-1&state=wrongstatewrongstate`, origin));
+    expect(badState.status).toBe(400);
+
+    // Start browser auth -> generates loopback callback state & opens relay login
+    const startRes = await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.ACTION_PATH, origin), {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        cookie,
+        origin,
+        [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: csrf,
+      },
+      body: JSON.stringify({ action: DESKTOP_SETUP_LOCAL_ACTION.START_BROWSER_AUTH, relayUrl: 'https://relay.example.com' }),
+    });
+    expect(startRes.status).toBe(200);
+    expect(openedUrls).toHaveLength(1);
+    const loginUrl = new URL(openedUrls[0]!);
+    const cbParam = new URL(loginUrl.searchParams.get('desktop_callback')!);
+    expect(cbParam.origin).toBe(origin);
+    expect(cbParam.pathname).toBe(DESKTOP_SETUP_CALLBACK_PATH);
+    const state = cbParam.searchParams.get('state')!;
+    expect(state.length).toBeGreaterThanOrEqual(16);
+
+    // Mismatched state is rejected while pendingBrowserAuth stays armed
+    const wrongState = await fetch(new URL(`${DESKTOP_SETUP_CALLBACK_PATH}?nonce=nonce-valid-1&state=${'x'.repeat(state.length)}`, origin));
+    expect(wrongState.status).toBe(400);
+
+    // Valid callback executes exchange -> bind/enroll -> switchToRuntime on exact same listening port
+    const okCb = await fetch(new URL(`${DESKTOP_SETUP_CALLBACK_PATH}?nonce=nonce-valid-1&state=${encodeURIComponent(state)}`, origin));
+    expect(okCb.status).toBe(200);
+    expect(await okCb.text()).toContain('Connected to IM.codes');
+
+    // Replay of the same state fails immediately (setup mode is already disarmed)
+    const replayCb = await fetch(new URL(`${DESKTOP_SETUP_CALLBACK_PATH}?nonce=nonce-valid-1&state=${encodeURIComponent(state)}`, origin));
+    expect(replayCb.status).toBe(404);
+
+    // Same server now returns bound state without setup, plus manageUrl & shareUrl
+    const st2 = await (await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH, origin), { headers: { cookie } })).json() as {
+      publicNodeId: string;
+      manageUrl?: string;
+      shareUrl?: string;
+      setup?: unknown;
+    };
+    expect(st2.publicNodeId).toBe('7778889990');
+    expect(st2.setup).toBeUndefined();
+    expect(st2.manageUrl).toContain('7778889990');
+    expect(st2.shareUrl).toContain('7778889990');
+  });
+
+  it('supports manual <relay>/bind/<apiKey> binding and rejects invalid links', async () => {
+    const { DESKTOP_SETUP_LOCAL_ACTION } = await import('../../shared/desktop-setup-auth.js');
+    const bindSpy = vi.fn(async () => ({
+      serverId: 'srv-manual-1',
+      nodeId: '1020304050',
+      token: 'tok-man',
+      serverUrl: 'https://relay.example.com',
+      nodeRole: 'controlled' as const,
+    }));
+    const panel = await startRemoteDesktopLocalPanel({
+      publicNodeId: '',
+      serverUrl: '',
+      port: 0,
+      status: () => ({ paused: false, connections: [] }),
+      setPaused: async () => {},
+      stopAll: async () => {},
+      disconnect: async () => false,
+      setup: {
+        prefilledRelayUrl: 'https://app.im.codes',
+        openBrowser: async () => false,
+        bindRelayAndEnroll: bindSpy,
+        onSetupComplete: async () => {
+          panel.switchToRuntime({
+            publicNodeId: '1020304050',
+            serverUrl: 'https://relay.example.com',
+            status: () => ({ paused: false, connections: [] }),
+            setPaused: async () => {},
+            stopAll: async () => {},
+            disconnect: async () => false,
+          });
+        },
+      },
+    });
+    created.push(panel);
+
+    const origin = new URL(panel.url).origin;
+    const home = await fetch(panel.url);
+    const html = await home.text();
+    const cookie = (home.headers.get('set-cookie') ?? '').split(';')[0]!;
+    const csrf = /"csrf":"([^"]+)"/u.exec(html)![1]!;
+
+    const badBind = await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.ACTION_PATH, origin), {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        cookie,
+        origin,
+        [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: csrf,
+      },
+      body: JSON.stringify({ action: DESKTOP_SETUP_LOCAL_ACTION.BIND_MANUAL, bindUrl: 'https://relay.example.com/not-bind' }),
+    });
+    expect(badBind.status).toBe(400);
+
+    const goodBind = await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.ACTION_PATH, origin), {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        cookie,
+        origin,
+        [REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER]: csrf,
+      },
+      body: JSON.stringify({ action: DESKTOP_SETUP_LOCAL_ACTION.BIND_MANUAL, bindUrl: 'https://relay.example.com/bind/deck_manual_secret_99' }),
+    });
+    expect(goodBind.status).toBe(200);
+    expect(bindSpy).toHaveBeenCalledWith('https://relay.example.com', 'deck_manual_secret_99', expect.any(Function));
+
+    const st = await (await fetch(new URL(REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH, origin), { headers: { cookie } })).json() as {
+      publicNodeId: string;
+      setup?: unknown;
+    };
+    expect(st.publicNodeId).toBe('1020304050');
+    expect(st.setup).toBeUndefined();
+  });
+});
+

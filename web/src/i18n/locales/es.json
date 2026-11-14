@@ -1499,7 +1499,10 @@
     "native_status_creating_passkey": "Creando passkey…",
     "native_status_registering": "Registrando…",
     "native_status_saving": "Guardando…",
-    "native_status_logging_in": "Iniciando sesión…"
+    "native_status_logging_in": "Iniciando sesión…",
+    "desktop_callback_completing": "Iniciando sesión en la aplicación de escritorio…",
+    "desktop_callback_error": "No se pudo enviar el inicio de sesión a la aplicación de escritorio. Inténtalo de nuevo.",
+    "desktop_callback_retry": "Intentar de nuevo"
   },
   "serverSetup": {
     "title": "Elegir servidor",

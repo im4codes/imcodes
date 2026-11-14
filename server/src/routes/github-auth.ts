@@ -1,5 +1,6 @@
 import { evaluateUserAccess, loadUserAccess } from '../security/user-status.js';
 import { Hono } from 'hono';
+import { DESKTOP_SETUP_CALLBACK_QUERY_PARAM, parseDesktopSetupCallbackUrl } from '../../../shared/desktop-setup-auth.js';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import type { Env } from '../env.js';
 import { createUser, getUserByPlatformId, upsertPlatformIdentity } from '../db/queries.js';
@@ -53,10 +54,22 @@ githubAuthRoutes.get('/', async (c): Promise<Response> => {
     currentOrigin = resolveCurrentOrigin(c);
   }
 
+  const rawDesktopCallback = c.req.query(DESKTOP_SETUP_CALLBACK_QUERY_PARAM);
+  const desktopCallback = rawDesktopCallback !== undefined
+    ? parseDesktopSetupCallbackUrl(rawDesktopCallback)?.href ?? null
+    : null;
+  if (rawDesktopCallback !== undefined && !desktopCallback) {
+    return c.json({ error: 'invalid_desktop_callback' }, 400);
+  }
+
   // State JWT embeds the origin so we know where to redirect after OAuth.
   // Cookie is set on the user's actual domain (e.g. im.codes via proxy).
   const stateValue = randomHex(32);
-  const stateJwt = signJwt({ nonce: stateValue, origin: currentOrigin }, c.env.JWT_SIGNING_KEY, 600);
+  const stateJwt = signJwt(
+    { nonce: stateValue, origin: currentOrigin, ...(desktopCallback ? { desktopCallback } : {}) },
+    c.env.JWT_SIGNING_KEY,
+    600,
+  );
 
   const isSecure = c.env.NODE_ENV === 'production';
   setCookie(c, 'oauth_state', stateValue, {
@@ -94,6 +107,7 @@ githubAuthRoutes.get('/callback', async (c): Promise<Response> => {
 
   let userId: string;
   let targetOrigin: string | null = null;
+  let desktopCallback: string | null = null;
 
   if (relayToken) {
     // --- Relay Flow: We are on the proxy domain, finishing auth via relay_token ---
@@ -103,6 +117,9 @@ githubAuthRoutes.get('/callback', async (c): Promise<Response> => {
     }
     userId = payload.sub as string;
     targetOrigin = payload.origin as string ?? null;
+    desktopCallback = typeof payload.desktopCallback === 'string'
+      ? parseDesktopSetupCallbackUrl(payload.desktopCallback)?.href ?? null
+      : null;
     // The relay token was minted before this request; the account may have been disabled since.
     const relayDecision = evaluateUserAccess(await loadUserAccess(c.env.DB, userId));
     if (!relayDecision.ok) return c.json({ error: relayDecision.code }, 403);
@@ -112,12 +129,15 @@ githubAuthRoutes.get('/callback', async (c): Promise<Response> => {
       return c.json({ error: 'missing_params' }, 400);
     }
 
-    const statePayload = verifyJwt(state, c.env.JWT_SIGNING_KEY) as { nonce: string; origin?: string } | null;
+    const statePayload = verifyJwt(state, c.env.JWT_SIGNING_KEY) as { nonce: string; origin?: string; desktopCallback?: unknown } | null;
     if (!statePayload) {
       return c.json({ error: 'invalid_state' }, 400);
     }
 
     targetOrigin = statePayload.origin ?? null;
+    desktopCallback = typeof statePayload.desktopCallback === 'string'
+      ? parseDesktopSetupCallbackUrl(statePayload.desktopCallback)?.href ?? null
+      : null;
 
     const actualOrigin = resolveCurrentOrigin(c);
     logger.info({ targetOrigin, actualOrigin }, 'oauth callback: origin detection');
@@ -197,7 +217,7 @@ githubAuthRoutes.get('/callback', async (c): Promise<Response> => {
     // so the proxy domain can set cookies without needing the oauth_state cookie.
     if (isCrossDomain) {
       const relay = signJwt(
-        { sub: userId, type: 'auth-relay', origin: targetOrigin },
+        { sub: userId, type: 'auth-relay', origin: targetOrigin, ...(desktopCallback ? { desktopCallback } : {}) },
         c.env.JWT_SIGNING_KEY,
         120,
       );
@@ -252,5 +272,11 @@ githubAuthRoutes.get('/callback', async (c): Promise<Response> => {
   // Final redirect — must be an allowlisted origin to prevent open redirect
   const allowed = allowedOrigins(c.env);
   const safeTarget = (targetOrigin && allowed.has(targetOrigin)) ? targetOrigin : c.env.SERVER_URL;
+  const safeDesktopCallback = desktopCallback ? parseDesktopSetupCallbackUrl(desktopCallback)?.href ?? null : null;
+  if (safeDesktopCallback) {
+    const dest = new URL('/', safeTarget);
+    dest.searchParams.set(DESKTOP_SETUP_CALLBACK_QUERY_PARAM, safeDesktopCallback);
+    return c.redirect(dest.toString());
+  }
   return c.redirect(safeTarget);
 });

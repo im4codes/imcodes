@@ -532,3 +532,104 @@ describe('enrollment ABI identity', () => {
     expect(() => buildEnrollRedeemV2Request(blob, identity)).toThrow('enrollment_abi_profile_mismatch');
   });
 });
+
+describe('enrollDirectV2 client', () => {
+  const mockJsonResponse = (body: unknown, status: number, url: string) => {
+    const res = new Response(typeof body === 'string' ? body : JSON.stringify(body), { status });
+    Object.defineProperty(res, 'url', { value: url });
+    return res;
+  };
+
+  it('posts install identity + optional hostServerId with Bearer apiKey and builds local credential', async () => {
+    const { enrollDirectV2 } = await import('../../src/node/enrollment.js');
+    const identity = generateInstallIdentity();
+    const fetchFn = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      expect(url).toBe('https://app.im.codes/api/enroll/v2/direct');
+      expect(init?.redirect).toBe('error');
+      expect(new Headers(init?.headers).get('authorization')).toBe('Bearer deck_api_key_1');
+      const sent = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+      expect(sent.installId).toBe(identity.installId);
+      expect(sent.nodeTokenHash).toBe(identity.nodeTokenHash);
+      expect(sent.hostServerId).toBe('srv-host-9');
+      return mockJsonResponse({
+        ok: true,
+        serverId: 'srv-ctrl-9',
+        nodeId: '5556667778',
+        nodeRole: NODE_ROLE.CONTROLLED,
+        displayName: 'desktop-host',
+        idempotent: false,
+        hostServerId: 'srv-host-9',
+      }, 200, url);
+    }) as unknown as typeof fetch;
+
+    const cred = await enrollDirectV2({
+      relayUrl: 'https://app.im.codes',
+      apiKey: 'deck_api_key_1',
+      identity,
+      hostServerId: 'srv-host-9',
+      platform: 'linux',
+      arch: 'x64',
+      hostname: 'desktop-host',
+      fetchFn,
+    });
+    expect(cred).toMatchObject({
+      serverId: 'srv-ctrl-9',
+      nodeId: '5556667778',
+      token: identity.nodeToken,
+      serverUrl: 'https://app.im.codes',
+      nodeRole: NODE_ROLE.CONTROLLED,
+      displayName: 'desktop-host',
+      abiProfile: 'modern',
+    });
+  });
+
+  it('rejects 404 as EnrollDirectUnsupportedError, rejects raw token in response, and enforces origin/HTTPS', async () => {
+    const { enrollDirectV2, EnrollDirectUnsupportedError } = await import('../../src/node/enrollment.js');
+    const identity = generateInstallIdentity();
+
+    await expect(enrollDirectV2({
+      relayUrl: 'https://app.im.codes/unexpected-path',
+      apiKey: 'deck_k',
+      identity,
+      platform: 'linux',
+      arch: 'x64',
+      hostname: 'h',
+    })).rejects.toThrow('enrollment_server_url_must_be_origin');
+
+    await expect(enrollDirectV2({
+      relayUrl: 'http://remote.example.com',
+      apiKey: 'deck_k',
+      identity,
+      platform: 'linux',
+      arch: 'x64',
+      hostname: 'h',
+    })).rejects.toThrow(/https/i);
+
+    await expect(enrollDirectV2({
+      relayUrl: 'https://old.example.com',
+      apiKey: 'deck_k',
+      identity,
+      platform: 'linux',
+      arch: 'x64',
+      hostname: 'h',
+      fetchFn: (async () => mockJsonResponse('missing', 404, 'https://old.example.com/api/enroll/v2/direct')) as unknown as typeof fetch,
+    })).rejects.toThrow(EnrollDirectUnsupportedError);
+
+    await expect(enrollDirectV2({
+      relayUrl: 'https://app.im.codes',
+      apiKey: 'deck_k',
+      identity,
+      platform: 'linux',
+      arch: 'x64',
+      hostname: 'h',
+      fetchFn: (async () => mockJsonResponse({
+        ok: true,
+        serverId: 's',
+        nodeId: '1234567890',
+        nodeRole: NODE_ROLE.CONTROLLED,
+        token: 'forged-server-token',
+      }, 200, 'https://app.im.codes/api/enroll/v2/direct')) as unknown as typeof fetch,
+    })).rejects.toThrow(/raw_token/i);
+  });
+});

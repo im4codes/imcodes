@@ -106,6 +106,11 @@ h1,h2,h3{margin:0}
 .daemon-autostart{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:600;color:var(--muted)}
 .daemon-hint{margin:0;color:var(--muted);font-size:12px;overflow-wrap:anywhere}
 .daemon-err{color:var(--danger)!important;font-weight:600}
+.setup-card{max-width:560px;display:flex;flex-direction:column;gap:14px}
+.setup-sub{margin:0;color:var(--muted)}
+.setup-note{margin:0;font-size:12px;color:var(--muted)}
+.setup-step{margin:0;font-size:12px;font-weight:600;color:var(--brand)}
+.setup-manual{border-top:1px solid var(--line);padding-top:14px;display:flex;flex-direction:column;gap:12px}
 input[type=url]{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:7px 10px;min-height:34px;width:100%;font:inherit;color:var(--text)}
 input[type=url]:hover{border-color:var(--muted)}
 .logs-dialog{max-width:720px}

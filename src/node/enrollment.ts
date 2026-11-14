@@ -19,10 +19,13 @@ import {
   isEnrollmentNodeTokenHash,
   type EnrollRedeemV2Request,
   type EnrollRedeemV2Response,
+  ENROLL_DIRECT_V2_PATH,
+  type EnrollDirectV2Request,
   type EnrollmentBlob,
   type EnrollmentTrailerRange,
 } from '../../shared/remote-exec.js';
 import { isControlledNodeId } from '../../shared/controlled-node-identity.js';
+import { isControlledNodeArch } from '../../shared/controlled-node-artifacts.js';
 import { normalizeControlledNodeEndpointOrigin } from '../../shared/controlled-node-endpoints.js';
 import {
   inspectWindowsAuthenticodeEnrollmentContainer,
@@ -782,6 +785,112 @@ export async function burnEnrollmentBlob(executablePath = process.execPath): Pro
   if (!range) return;
   const status = await cleanupEnrollmentSource(executablePath, range.trailerStart, range.trailerLength);
   if (status === 'failed') throw new Error('enrollment_burn_failed');
+}
+
+export interface EnrollDirectV2Options {
+  relayUrl: string;
+  apiKey: string;
+  identity: InstallIdentity;
+  hostServerId?: string;
+  abiProfile?: ControlledNodeAbiProfile;
+  platform?: NodeJS.Platform;
+  arch?: string;
+  hostname?: string;
+  fetchFn?: typeof fetch;
+}
+
+export class EnrollDirectUnsupportedError extends Error {
+  readonly status: number;
+  constructor(status: number, code?: string) {
+    super(`enroll_direct_unsupported:${status}${code ? `:${code}` : ''}`);
+    this.name = 'EnrollDirectUnsupportedError';
+    this.status = status;
+  }
+}
+
+export async function enrollDirectV2(options: EnrollDirectV2Options): Promise<ControlledNodeCredential> {
+  const expectedOrigin = allowedEnrollmentServerOrigin(options.relayUrl);
+  const fetchImpl = options.fetchFn ?? fetch;
+  const platform = options.platform ?? process.platform;
+  const targetOs = enrollmentOsFromNodePlatform(platform);
+  if (!targetOs) throw new Error(`direct_enroll_unsupported_platform:${platform}`);
+  const arch = options.arch ?? process.arch;
+  if (!isControlledNodeArch(arch)) throw new Error(`direct_enroll_unsupported_arch:${arch}`);
+  const abiProfile = options.abiProfile ?? CONTROLLED_NODE_RUNTIME_ABI_PROFILE;
+  const hostname = options.hostname ?? os.hostname();
+
+  const body: EnrollDirectV2Request = {
+    installId: options.identity.installId,
+    nodeTokenHash: options.identity.nodeTokenHash,
+    hostname,
+    os: targetOs,
+    arch,
+    abiProfile,
+    ...(options.hostServerId ? { hostServerId: options.hostServerId } : {}),
+  };
+
+  const targetUrl = `${expectedOrigin}${ENROLL_DIRECT_V2_PATH}`;
+  const response = await fetchImpl(targetUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${options.apiKey}`,
+    },
+    body: JSON.stringify(body),
+    redirect: 'error',
+  });
+
+  if (response.redirected) {
+    throw new Error('direct_enroll_redirect_rejected');
+  }
+  if (!response.url) {
+    throw new Error('direct_enroll_response_url_invalid');
+  }
+  let responseOrigin: string;
+  try {
+    responseOrigin = new URL(response.url).origin;
+  } catch {
+    throw new Error('direct_enroll_response_url_invalid');
+  }
+  if (responseOrigin !== expectedOrigin) {
+    throw new Error(`direct_enroll_origin_mismatch:${responseOrigin}`);
+  }
+
+  if (!response.ok) {
+    const errBody = await response.json().catch(() => null) as { error?: unknown } | null;
+    const errCode = typeof errBody?.error === 'string' ? errBody.error : undefined;
+    if (response.status === 404 || response.status === 405 || response.status === 501) {
+      throw new EnrollDirectUnsupportedError(response.status, errCode);
+    }
+    throw new Error(`direct_enroll_failed:${response.status}${errCode ? `:${errCode}` : ''}`);
+  }
+
+  const parsed = await response.json().catch(() => null) as Record<string, unknown> | null;
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('direct_enroll_invalid_response');
+  }
+  if ('token' in parsed && parsed.token !== undefined) {
+    throw new Error('direct_enroll_raw_token_rejected');
+  }
+  if (
+    parsed.ok !== true
+    || typeof parsed.serverId !== 'string'
+    || parsed.serverId.length === 0
+    || !isControlledNodeId(parsed.nodeId)
+    || parsed.nodeRole !== NODE_ROLE.CONTROLLED
+  ) {
+    throw new Error('direct_enroll_invalid_response');
+  }
+
+  return {
+    nodeRole: NODE_ROLE.CONTROLLED,
+    serverId: parsed.serverId,
+    nodeId: parsed.nodeId,
+    token: options.identity.nodeToken,
+    serverUrl: expectedOrigin,
+    abiProfile,
+    ...(typeof parsed.displayName === 'string' && parsed.displayName ? { displayName: parsed.displayName } : {}),
+  };
 }
 
 export function assertProductionServerUrl(serverUrl: string): void {

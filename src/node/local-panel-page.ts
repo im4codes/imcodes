@@ -1,6 +1,10 @@
 import { formatRemoteDesktopBytes, isTrafficCounter } from '../../shared/remote-desktop-traffic.js';
 import { LOCAL_PANEL_EXTERNAL_PATH, LOCAL_PANEL_WINDOW_TITLE } from '../../shared/local-panel-window.js';
 import { localPanelStringsEmbedSource } from '../../shared/local-panel-strings.js';
+import {
+  DESKTOP_SETUP_LOCAL_ACTION,
+  DESKTOP_SETUP_STEP,
+} from '../../shared/desktop-setup-auth.js';
 import { REMOTE_DESKTOP_ACCESS_MODE } from '../../shared/remote-desktop.js';
 import {
   REMOTE_DESKTOP_LOCAL_ACTION,
@@ -44,11 +48,29 @@ const ICON = {
 function pageBody(): string {
   return `<div class="app"><nav class="rail" data-t-label="navLabel">
 <div class="logo" aria-hidden="true">ai</div>
-<button class="nav" type="button" data-page="home" aria-current="page">${ICON.monitor}<span data-t="navHome"></span><span class="badge" id="navBadge" hidden></span></button>
-<button class="nav" type="button" data-page="traffic">${ICON.info}<span data-t="trafficTitle"></span></button>
+<button class="nav" id="navSetup" type="button" data-page="setup" hidden>${ICON.monitor}<span data-t="setupTitle"></span></button>
+<button class="nav" id="navHome" type="button" data-page="home" aria-current="page">${ICON.monitor}<span data-t="navHome"></span><span class="badge" id="navBadge" hidden></span></button>
+<button class="nav" id="navTraffic" type="button" data-page="traffic">${ICON.info}<span data-t="trafficTitle"></span></button>
 <button class="nav" type="button" data-page="settings">${ICON.gear}<span data-t="navSettings"></span></button>
 <button class="nav" type="button" data-page="about">${ICON.info}<span data-t="navAbout"></span></button>
 </nav><main>
+<section class="page" data-page="setup" id="viewSetup" hidden aria-labelledby="setupHeading">
+<div class="card setup-card">
+<div><h1 class="about-brand" id="setupHeading" data-t="setupTitle" style="margin-bottom:4px"></h1><p class="setup-sub" data-t="setupSubtitle"></p></div>
+<div class="banner" id="setupAwaitBanner" role="status" hidden><div class="grow"><b data-t="setupAwaitingBrowser"></b></div><button class="btn" id="setupCancelBrowser" type="button" data-t="setupCancelBrowser"></button></div>
+<p class="setup-step" id="setupStepText" hidden></p>
+<p class="daemon-hint daemon-err" id="setupError" hidden></p>
+<div class="form" id="setupRelayForm">
+<div class="field"><label for="setupRelayInput" data-t="setupRelayLabel"></label><input id="setupRelayInput" type="url" autocomplete="off" spellcheck="false" data-t-placeholder="setupRelayPlaceholder"><span class="setup-note" id="setupPrefillNote" data-t="setupRelayPrefilledNote" hidden></span></div>
+<div class="actions"><button class="btn primary" id="setupBrowserBtn" type="button" data-t="setupSignInBrowser"></button><button class="btn" id="setupManualToggleBtn" type="button" data-t="setupManualToggle"></button></div>
+</div>
+<form class="setup-manual" id="setupManualForm" hidden>
+<p class="setup-note" data-t="setupBindHelp" style="margin:0"></p>
+<div class="field"><label for="setupBindInput" data-t="setupBindLabel"></label><input id="setupBindInput" type="url" autocomplete="off" spellcheck="false" data-t-placeholder="setupBindPlaceholder"></div>
+<div class="actions"><button class="btn primary" id="setupBindSubmitBtn" type="submit" data-t="setupBindSubmit"></button></div>
+</form>
+</div>
+</section>
 <section class="page" data-page="home" aria-live="off">
 <div class="banner" id="pausedBanner" role="status" hidden>${ICON.pause}<div class="grow"><b data-t="pausedTitle"></b><p data-t="pausedText"></p></div><button class="btn primary" id="resume" type="button" data-t="resume"></button></div>
 <div class="banner offline" id="offlineBanner" role="alert" hidden>${ICON.alert}<div class="grow"><b data-t="offlineTitle"></b><p data-t="offlineText"></p></div></div>
@@ -117,6 +139,8 @@ export function renderLocalPanelPage(input: LocalPanelPageInput): string {
     csrfHeader: REMOTE_DESKTOP_LOCAL_MANAGEMENT.CSRF_HEADER,
     langKey: LOCAL_PANEL_LANGUAGE_STORAGE_KEY,
     actions: REMOTE_DESKTOP_LOCAL_ACTION,
+    setupActions: DESKTOP_SETUP_LOCAL_ACTION,
+    setupSteps: DESKTOP_SETUP_STEP,
     daemonActions: REMOTE_DESKTOP_LOCAL_DAEMON_ACTION,
     daemonAutostart: REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART,
     daemonConn: REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE,

@@ -159,3 +159,22 @@ describe('the Coding Daemon card and modals', () => {
     expect(LOCAL_PANEL_PAGE_SCRIPT).not.toMatch(/daemon(?:Meta|Hint|LogsPre|LogsMeta)'?\)\.innerHTML/u);
   });
 });
+
+describe('the Phase 2B unbound setup wizard markup and strings', () => {
+  it('includes setup view hidden by default and complete non-empty 7-locale setup strings without literal URLs', () => {
+    expect(page).toContain('id="viewSetup"');
+    expect(page).toContain('id="setupBrowserBtn"');
+    expect(page).toContain('id="setupManualForm"');
+    expect(LOCAL_PANEL_PAGE_SCRIPT).toContain('renderSetup');
+    for (const locale of UI_LOCALES) {
+      for (const key of [
+        'setupTitle', 'setupSubtitle', 'setupRelayLabel', 'setupRelayPlaceholder',
+        'setupSignInBrowser', 'setupAwaitingBrowser', 'setupCancelBrowser',
+        'setupManualToggle', 'setupBindSubmit', 'setupBindFailed', 'setupComplete',
+      ] as const) {
+        expect(LOCAL_PANEL_STRINGS[locale][key].length, `${locale}.${key}`).toBeGreaterThan(1);
+        expect(LOCAL_PANEL_STRINGS[locale][key], `${locale}.${key} no literal http`).not.toMatch(/https?:\/\//i);
+      }
+    }
+  });
+});

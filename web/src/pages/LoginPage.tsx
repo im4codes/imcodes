@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
+import { DESKTOP_SETUP_CALLBACK_QUERY_PARAM, parseDesktopSetupCallbackUrl } from '@shared/desktop-setup-auth.js';
 import { useTranslation } from 'react-i18next';
 import { startRegistration, startAuthentication } from '@simplewebauthn/browser';
 import {
@@ -193,6 +194,11 @@ export function LoginPage({
     const attempt = startAuthAttempt();
     if (!attempt) return;
     const params = new URLSearchParams({ reauth: '1', origin: window.location.origin });
+    const rawDesktopCallback = new URLSearchParams(window.location.search).get(DESKTOP_SETUP_CALLBACK_QUERY_PARAM);
+    const desktopCallback = parseDesktopSetupCallbackUrl(rawDesktopCallback)?.href;
+    if (desktopCallback) {
+      params.set(DESKTOP_SETUP_CALLBACK_QUERY_PARAM, desktopCallback);
+    }
     try {
       window.location.href = `/api/auth/github?${params}`;
     } finally {
