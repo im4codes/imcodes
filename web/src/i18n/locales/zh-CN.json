@@ -4090,6 +4090,8 @@
     "usage_route_command": "用安装命令",
     "usage_route_download": "用下载的文件",
     "usage_win_command": "开始菜单搜索「PowerShell」，在 Windows PowerShell 上点【右键 → 以管理员身份运行】——窗口标题栏必须显示「管理员」。直接打开的普通窗口会执行到一半报权限错误。然后粘贴命令、回车，等它跑完再关窗口。",
+    "win_security_notice_tag": "Windows · 安全提示",
+    "win_security_notice": "第三方安全或杀毒软件可能会拦截、隔离或破坏受控节点（包括安装、运行及后续自动升级）。建议将安装目录（C:\\ProgramData\\imcodes-node\\）及主程序加入信任区/白名单，或卸载冲突的杀毒软件。",
     "usage_mac_command": "打开「终端」(启动台 → 其他 → 终端，或 Spotlight 搜索 Terminal)，粘贴命令回车。因为用了 sudo 会要求输入你的登录密码，输入时屏幕上不会显示任何字符，这是正常的，输完直接回车。",
     "usage_linux_command": "在终端里粘贴命令执行。它用 sudo，会提示输入密码。机器上没有 sudo 的话，切到 root 用户执行去掉 sudo 的同一条命令。",
     "tab_verification": "授权验证设备",

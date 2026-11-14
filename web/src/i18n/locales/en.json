@@ -4090,6 +4090,8 @@
     "usage_route_command": "Install command",
     "usage_route_download": "Downloaded file",
     "usage_win_command": "Open the Start menu, type \"PowerShell\", then RIGHT-CLICK Windows PowerShell and choose \"Run as administrator\" — the blue title bar must say Administrator. Pasting into an ordinary window fails partway with an access error. Paste the command, press Enter, and leave the window open until it finishes.",
+    "win_security_notice_tag": "Windows · Security",
+    "win_security_notice": "Third-party antivirus or security software may block or corrupt the controlled node during installation, runtime, or automatic upgrades. Add the install directory (C:\\ProgramData\\imcodes-node\\) and its main executable to your exclusion/trust list, or uninstall the conflicting security software.",
     "usage_mac_command": "Open Terminal (Applications → Utilities, or Spotlight \"Terminal\"), paste the command and press Enter. It asks for your login password because of sudo; nothing appears as you type it — that is normal. Press Enter again.",
     "usage_linux_command": "Paste the command into a terminal. It uses sudo, so you will be asked for your password. On a machine with no sudo, log in as root and run the same line without sudo.",
     "tab_verification": "Verification devices",

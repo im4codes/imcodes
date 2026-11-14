@@ -4088,6 +4088,8 @@
     "usage_route_command": "설치 명령으로",
     "usage_route_download": "내려받은 파일로",
     "usage_win_command": "시작 메뉴에서 \"PowerShell\"을 검색한 뒤 Windows PowerShell을 【마우스 오른쪽 → \"관리자 권한으로 실행\"】 하세요. 제목 표시줄에 \"관리자\"가 보여야 합니다. 일반 창에 붙여넣으면 중간에 권한 오류가 납니다. 명령을 붙여넣고 Enter, 끝날 때까지 창을 닫지 마세요.",
+    "win_security_notice_tag": "Windows · 보안 안내",
+    "win_security_notice": "타사 보안 또는 백신 프로그램이 제어 노드의 설치, 실행 및 이후 자동 업그레이드를 차단하거나 손상시킬 수 있습니다. 설치 폴더(C:\\ProgramData\\imcodes-node\\)와 기본 실행 파일을 예외/신뢰 목록에 추가하거나 충돌하는 보안 프로그램을 제거하세요.",
     "usage_mac_command": "터미널을 열고(응용 프로그램 → 유틸리티, 또는 Spotlight에서 Terminal) 명령을 붙여넣고 Enter. sudo 때문에 로그인 암호를 묻습니다. 입력해도 아무것도 표시되지 않는 것이 정상입니다. 그대로 Enter.",
     "usage_linux_command": "터미널에 명령을 붙여넣어 실행하세요. sudo를 사용하므로 암호를 묻습니다. sudo가 없으면 root로 로그인해 sudo를 뺀 같은 줄을 실행하세요.",
     "tab_verification": "검증 장치",

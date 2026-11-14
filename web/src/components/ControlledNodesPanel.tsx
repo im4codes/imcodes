@@ -1441,6 +1441,14 @@ export function ControlledNodesPanel({
             );
           })}
         </div>
+        {availableOses.includes('win') && (
+          <div class="controlled-nodes-win-notice" role="note" data-testid="controlled-nodes-win-security-notice">
+            <span class="controlled-nodes-win-notice-tag">
+              {t('controlled_nodes.win_security_notice_tag')}
+            </span>
+            <p>{t('controlled_nodes.win_security_notice')}</p>
+          </div>
+        )}
         {downloadError && <p class="controlled-nodes-error" role="alert">{downloadError}</p>}
       </section>
 

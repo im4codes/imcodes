@@ -725,6 +725,37 @@ describe('ControlledNodesPanel (12.3)', () => {
     await waitFor(() => expect(container.textContent).toContain('controlled_nodes.usage_step4'));
   });
 
+  it('shows the Windows antivirus and trust-directory notice only when Windows is available', async () => {
+    const { container } = renderInstallTab();
+    const notice = await waitFor(() => {
+      const el = container.querySelector('[data-testid="controlled-nodes-win-security-notice"]');
+      if (!el) throw new Error('Windows security notice not found');
+      return el;
+    });
+    expect(notice.textContent).toContain('controlled_nodes.win_security_notice_tag');
+    expect(notice.textContent).toContain('controlled_nodes.win_security_notice');
+
+    const macCard = container.querySelector('.controlled-nodes-usage-os')?.textContent ?? '';
+    expect(macCard).not.toContain('controlled_nodes.win_security_notice');
+  });
+
+  it('omits the Windows antivirus notice when only macOS and Linux executables are available', async () => {
+    listAvailableExecutables.mockResolvedValueOnce({
+      available: ['mac', 'linux'],
+      artifacts: [
+        { os: 'mac', filename: 'imcodes-node-macos', sizeBytes: 22_000_000, sha256: 'abd', arch: 'universal' },
+        { os: 'linux', filename: 'imcodes-node-linux', sizeBytes: 9_876_543, sha256: 'def', arch: 'x64' },
+      ],
+    });
+    const { container } = renderInstallTab();
+    await waitFor(() => {
+      expect(container.querySelector('.controlled-nodes-download-item.is-mac')).toBeTruthy();
+      expect(container.querySelector('.controlled-nodes-download-item.is-linux')).toBeTruthy();
+    });
+    expect(container.querySelector('[data-testid="controlled-nodes-win-security-notice"]')).toBeNull();
+    expect(container.textContent).not.toContain('controlled_nodes.win_security_notice');
+  });
+
   it('maps mint executable_not_built to a specific message', async () => {
     const { ApiError, controlledNodeDownloadErrorKey } = await import('../src/api.js');
     const { container } = renderInstallTab();

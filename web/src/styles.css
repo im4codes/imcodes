@@ -5766,6 +5766,42 @@ html.native-ios-mac .chat-dl-btn {
   font-size: 8px;
   line-height: 1.35;
 }
+.controlled-nodes-win-notice {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  margin-top: 11px;
+  padding: 11px 13px;
+  border: 1px solid rgba(251, 191, 36, 0.28);
+  border-left: 3px solid rgba(251, 191, 36, 0.72);
+  border-radius: 9px;
+  background: rgba(120, 53, 15, 0.16);
+}
+.controlled-nodes-win-notice-tag {
+  justify-self: start;
+  padding: 2px 9px;
+  border: 1px solid rgba(251, 191, 36, 0.38);
+  border-radius: 999px;
+  background: rgba(180, 83, 9, 0.24);
+  color: #fde68a;
+  font-size: 10.5px;
+  font-weight: 750;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+}
+.controlled-nodes-win-notice p {
+  margin: 0;
+  color: #fef3c7;
+  font-size: 12px;
+  line-height: 1.65;
+}
+@media (max-width: 640px) {
+  .controlled-nodes-win-notice {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 6px;
+  }
+}
 .controlled-nodes-usage {
   display: grid;
   /* Four steps forced into three columns left one orphaned on a second row and

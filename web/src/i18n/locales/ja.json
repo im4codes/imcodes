@@ -4088,6 +4088,8 @@
     "usage_route_command": "コマンドで",
     "usage_route_download": "ダウンロードしたファイルで",
     "usage_win_command": "スタートメニューで「PowerShell」を検索し、Windows PowerShell を【右クリック →「管理者として実行」】。タイトルバーに「管理者」と出ている必要があります。通常のウィンドウに貼ると途中でアクセスエラーになります。コマンドを貼って Enter、終わるまで閉じないでください。",
+    "win_security_notice_tag": "Windows · セキュリティ",
+    "win_security_notice": "サードパーティ製のセキュリティソフト／ウイルス対策ソフトにより、制御ノードのインストールや実行、自動アップグレードがブロックまたは破損される場合があります。インストール先フォルダー（C:\\ProgramData\\imcodes-node\\）とメイン実行ファイルを除外／信頼リストに追加するか、競合するセキュリティソフトをアンインストールしてください。",
     "usage_mac_command": "ターミナルを開き(アプリケーション → ユーティリティ、または Spotlight で Terminal)、コマンドを貼って Enter。sudo のためログインパスワードを聞かれます。入力しても何も表示されませんが正常です。そのまま Enter。",
     "usage_linux_command": "ターミナルにコマンドを貼って実行します。sudo を使うのでパスワードを聞かれます。sudo が無い場合は root でログインし、sudo を外した同じ行を実行してください。",
     "tab_verification": "検証デバイス",

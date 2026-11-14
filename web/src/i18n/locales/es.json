@@ -4089,6 +4089,8 @@
     "usage_route_command": "Con el comando",
     "usage_route_download": "Con el archivo descargado",
     "usage_win_command": "Menú Inicio, escribe \"PowerShell\", haz CLIC DERECHO en Windows PowerShell y elige \"Ejecutar como administrador\" — la barra de título debe decir Administrador. Pegarlo en una ventana normal falla a medias con un error de acceso. Pega el comando, pulsa Enter y deja la ventana abierta hasta que termine.",
+    "win_security_notice_tag": "Windows · Seguridad",
+    "win_security_notice": "El software antivirus o de seguridad de terceros puede bloquear o dañar el nodo controlado durante la instalación, la ejecución o las actualizaciones automáticas. Añade el directorio de instalación (C:\\ProgramData\\imcodes-node\\) y el ejecutable principal a la lista de exclusiones/confianza, o desinstala el software de seguridad en conflicto.",
     "usage_mac_command": "Abre Terminal (Aplicaciones → Utilidades, o Spotlight \"Terminal\"), pega el comando y pulsa Enter. Pedirá tu contraseña por sudo; no se ve nada al escribirla, es normal. Pulsa Enter.",
     "usage_linux_command": "Pega el comando en una terminal. Usa sudo, así que pedirá tu contraseña. Sin sudo, entra como root y ejecuta la misma línea sin sudo.",
     "tab_verification": "Dispositivos de verificación",
