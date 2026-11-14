@@ -6,9 +6,13 @@ import {
 } from '@shared/verification-machine.js';
 import { apiFetch } from '../api.js';
 
-export async function listVerificationMachines(projectKey?: string): Promise<VerificationMachineProfile[]> {
+export async function listVerificationMachines(
+  projectKey?: string,
+  options?: { includeAllProjects?: boolean },
+): Promise<VerificationMachineProfile[]> {
   const query = new URLSearchParams();
   if (projectKey?.trim()) query.set('projectKey', projectKey.trim());
+  if (options?.includeAllProjects) query.set('includeAllProjects', '1');
   const result = await apiFetch<{ profiles: VerificationMachineProfile[] }>(
     `${VERIFICATION_MACHINE_API_PATH}${query.size ? `?${query}` : ''}`,
   );

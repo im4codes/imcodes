@@ -3891,7 +3891,14 @@
       "status_verified": "Verificado",
       "status_unreachable": "Inaccesible",
       "status_unauthorized": "No autorizado",
-      "purpose": "Para qué sirve: el agente solo puede afirmar que un cambio funciona en Windows, macOS o Linux si realmente lo ejecuta allí. Las máquinas autorizadas aquí son las que puede usar para eso: verificación en dispositivos reales de varias plataformas, en vez de razonar sobre lo que debería pasar. No se usa nada hasta que hace falta, y la autorización es por máquina y revocable."
+      "purpose": "Para qué sirve: el agente solo puede afirmar que un cambio funciona en Windows, macOS o Linux si realmente lo ejecuta allí. Las máquinas autorizadas aquí son las que puede usar para eso: verificación en dispositivos reales de varias plataformas, en vez de razonar sobre lo que debería pasar. No se usa nada hasta que hace falta, y la autorización es por máquina y revocable.",
+      "project_scope_named": "Proyecto: {{project}}",
+      "error_revision_conflict": "Esta entrada se actualizó en otro lugar. Se actualizó la lista; revísala e inténtalo de nuevo.",
+      "error_alias_conflict": "Otro equipo de verificación en este ámbito ya usa ese alias. Elige un alias diferente.",
+      "error_target_unauthorized": "Este nodo o alias ya no está autorizado o fue eliminado. Se actualizó la lista.",
+      "error_not_found": "Esta máquina de verificación ya no existe. Se actualizó la lista.",
+      "error_alias_invalid": "Introduce un alias de máquina válido antes de guardar.",
+      "error_scope_key_required": "Abre una sesión de proyecto para usar el ámbito de proyecto, o cambia a Todos mis proyectos."
     },
     "short": "Nodos",
     "linux_compat_headless": "Linux (glibc 2.17, sin escritorio)",

@@ -58,14 +58,29 @@ export async function listVerificationMachines(
   db: Database,
   userId: string,
   projectKey?: string,
+  options?: { includeAllProjects?: boolean },
 ): Promise<VerificationMachineProfile[]> {
+  const includeAllProjects = options?.includeAllProjects === true;
   const rows = await db.query<VerificationMachineRow>(
-    `SELECT ${LIST_COLUMNS}
-       FROM verification_machine_profiles
-      WHERE user_id = $1
-        AND (scope = 'user' OR ($2::text IS NOT NULL AND scope = 'project' AND scope_key = $2))
-      ORDER BY CASE scope WHEN 'project' THEN 0 ELSE 1 END, alias ASC
-      LIMIT $3`,
+    includeAllProjects
+      ? `SELECT ${LIST_COLUMNS}
+           FROM verification_machine_profiles
+          WHERE user_id = $1
+          ORDER BY
+            CASE
+              WHEN $2::text IS NOT NULL AND scope = 'project' AND scope_key = $2 THEN 0
+              WHEN scope = 'project' THEN 1
+              ELSE 2
+            END,
+            scope_key ASC,
+            alias ASC
+          LIMIT $3`
+      : `SELECT ${LIST_COLUMNS}
+           FROM verification_machine_profiles
+          WHERE user_id = $1
+            AND (scope = 'user' OR ($2::text IS NOT NULL AND scope = 'project' AND scope_key = $2))
+          ORDER BY CASE scope WHEN 'project' THEN 0 ELSE 1 END, alias ASC
+          LIMIT $3`,
     [userId, projectKey ?? null, VERIFICATION_MACHINE_LIMITS.MAX_ITEMS + 1],
   );
   return rows.map(mapRow);
@@ -97,39 +112,87 @@ export async function upsertVerificationMachine(
     source: 'web' | 'mcp';
     expectedRevision?: number;
   },
-): Promise<VerificationMachineProfile | 'revision_conflict' | 'alias_conflict'> {
+): Promise<VerificationMachineProfile | 'revision_conflict' | 'alias_conflict' | 'not_found'> {
   const now = Date.now();
   try {
-    const row = await db.queryOne<VerificationMachineRow>(
-      `INSERT INTO verification_machine_profiles
-        (id, user_id, scope, scope_key, alias, kind, target, enabled, revision,
-         created_at, updated_at, last_verified_at, last_verification_status, source)
-       SELECT $1, $2, $3, $4, $5, $6, $7, $8, 1, $9, $9, NULL, 'unverified', $10
-        WHERE $11::bigint IS NULL OR $11::bigint = 0
-       ON CONFLICT (id) DO UPDATE SET
-         scope = excluded.scope,
-         scope_key = excluded.scope_key,
-         alias = excluded.alias,
-         kind = excluded.kind,
-         target = excluded.target,
-         enabled = excluded.enabled,
-         revision = verification_machine_profiles.revision + 1,
-         updated_at = excluded.updated_at,
-         last_verified_at = CASE
-           WHEN verification_machine_profiles.kind = excluded.kind
-            AND verification_machine_profiles.target = excluded.target
-           THEN verification_machine_profiles.last_verified_at ELSE NULL END,
-         last_verification_status = CASE
-           WHEN verification_machine_profiles.kind = excluded.kind
-            AND verification_machine_profiles.target = excluded.target
-           THEN verification_machine_profiles.last_verification_status ELSE 'unverified' END,
-         source = excluded.source
-        WHERE verification_machine_profiles.user_id = excluded.user_id
-          AND ($11::bigint IS NULL OR verification_machine_profiles.revision = $11::bigint)
-       RETURNING ${COLUMNS}`,
-      [input.id, input.userId, input.scope, input.scopeKey, input.alias, input.kind,
-        input.target, input.enabled, now, input.source, input.expectedRevision ?? null],
-    );
+    if (input.expectedRevision !== undefined && input.expectedRevision > 0) {
+      const row = await db.queryOne<VerificationMachineRow>(
+        `UPDATE verification_machine_profiles
+            SET scope = $3,
+                scope_key = $4,
+                alias = $5,
+                kind = $6,
+                target = $7,
+                enabled = $8,
+                revision = revision + 1,
+                updated_at = $9,
+                last_verified_at = CASE
+                  WHEN kind = $6 AND target = $7
+                  THEN last_verified_at ELSE NULL END,
+                last_verification_status = CASE
+                  WHEN kind = $6 AND target = $7
+                  THEN last_verification_status ELSE 'unverified' END,
+                source = $10
+          WHERE user_id = $1
+            AND id = $2
+            AND revision = $11::bigint
+          RETURNING ${COLUMNS}`,
+        [input.userId, input.id, input.scope, input.scopeKey, input.alias, input.kind,
+          input.target, input.enabled, now, input.source, input.expectedRevision],
+      );
+      if (row) return mapRow(row);
+      return (await getVerificationMachine(db, input.userId, input.id)) ? 'revision_conflict' : 'not_found';
+    }
+
+    const baseParams = [
+      input.id,
+      input.userId,
+      input.scope,
+      input.scopeKey,
+      input.alias,
+      input.kind,
+      input.target,
+      input.enabled,
+      now,
+      input.source,
+    ];
+    const row = input.expectedRevision === 0
+      ? await db.queryOne<VerificationMachineRow>(
+          `INSERT INTO verification_machine_profiles
+            (id, user_id, scope, scope_key, alias, kind, target, enabled, revision,
+             created_at, updated_at, last_verified_at, last_verification_status, source)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, $9, $9, NULL, 'unverified', $10)
+           ON CONFLICT (id) DO NOTHING
+           RETURNING ${COLUMNS}`,
+          baseParams,
+        )
+      : await db.queryOne<VerificationMachineRow>(
+          `INSERT INTO verification_machine_profiles
+            (id, user_id, scope, scope_key, alias, kind, target, enabled, revision,
+             created_at, updated_at, last_verified_at, last_verification_status, source)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, $9, $9, NULL, 'unverified', $10)
+           ON CONFLICT (id) DO UPDATE SET
+             scope = excluded.scope,
+             scope_key = excluded.scope_key,
+             alias = excluded.alias,
+             kind = excluded.kind,
+             target = excluded.target,
+             enabled = excluded.enabled,
+             revision = verification_machine_profiles.revision + 1,
+             updated_at = excluded.updated_at,
+             last_verified_at = CASE
+               WHEN verification_machine_profiles.kind = excluded.kind
+                AND verification_machine_profiles.target = excluded.target
+               THEN verification_machine_profiles.last_verified_at ELSE NULL END,
+             last_verification_status = CASE
+               WHEN verification_machine_profiles.kind = excluded.kind
+                AND verification_machine_profiles.target = excluded.target
+               THEN verification_machine_profiles.last_verification_status ELSE 'unverified' END,
+             source = excluded.source
+           WHERE verification_machine_profiles.user_id = excluded.user_id
+           RETURNING ${COLUMNS}`,
+          baseParams,
+        );
     if (row) return mapRow(row);
     return 'revision_conflict';
   } catch (err) {

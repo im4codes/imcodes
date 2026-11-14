@@ -3891,7 +3891,14 @@
       "status_verified": "已驗證",
       "status_unreachable": "無法連線",
       "status_unauthorized": "未授權",
-      "purpose": "這個是做什麼的：模型要說「這個改動在 Windows / macOS / Linux 上沒問題」,唯一誠實的做法是真的拿去那台機器上跑一遍。這裡授權的機器,就是允許它用來做這件事的——跨平台真機驗證,而不是靠推理斷言「應該可以」。只有真正需要時才會用到,授權按機器單獨給、隨時可撤銷。"
+      "purpose": "這個是做什麼的：模型要說「這個改動在 Windows / macOS / Linux 上沒問題」,唯一誠實的做法是真的拿去那台機器上跑一遍。這裡授權的機器,就是允許它用來做這件事的——跨平台真機驗證,而不是靠推理斷言「應該可以」。只有真正需要時才會用到,授權按機器單獨給、隨時可撤銷。",
+      "project_scope_named": "專案: {{project}}",
+      "error_revision_conflict": "此裝置設定已被其他工作階段或裝置修改，已自動重新整理最新清單，請確認後再儲存。",
+      "error_alias_conflict": "同一範圍內已存在相同名稱的裝置別名，請更換別名後再試。",
+      "error_target_unauthorized": "此受控節點或別名已無權限或已被刪除，已重新整理最新清單。",
+      "error_not_found": "此驗證裝置已不存在，已重新整理最新清單。",
+      "error_alias_invalid": "儲存前請輸入有效的裝置別名。",
+      "error_scope_key_required": "請先開啟對應專案工作階段後再使用專案範圍，或切換為「我的所有專案」。"
     },
     "short": "節點",
     "linux_compat_headless": "Linux（glibc 2.17，無桌面）",

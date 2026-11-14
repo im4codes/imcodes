@@ -21,8 +21,11 @@ function makeMemDb(): Database {
     query: async <T = unknown>(sql: string, params: unknown[] = []) => {
       if (!sql.includes('verification_machine_profiles')) return [] as T[];
       const [userId, projectKey] = params as [string, string | null, number];
+      const includeAllProjects = !sql.includes("scope = 'user' OR");
       return [...rows.values()].filter((row) => row.user_id === userId
-        && (row.scope === 'user' || (row.scope === 'project' && row.scope_key === projectKey))) as T[];
+        && (includeAllProjects
+          || row.scope === 'user'
+          || (row.scope === 'project' && row.scope_key === projectKey))) as T[];
     },
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []) => {
       { const activeUser = activeUserAnswer(sql); if (activeUser) return activeUser as never; }
@@ -33,12 +36,18 @@ function makeMemDb(): Database {
         } : null) as T | null;
       }
       if (sql.includes('INSERT INTO verification_machine_profiles')) {
-        const [id, userId, scope, scopeKey, alias, kind, target, enabled, now, source, expected] = params as [
-          string, string, Row['scope'], string, string, Row['kind'], string, boolean, number, Row['source'], number | null,
+        const [id, userId, scope, scopeKey, alias, kind, target, enabled, now, source] = params as [
+          string, string, Row['scope'], string, string, Row['kind'], string, boolean, number, Row['source'],
         ];
+        const doNothing = sql.includes('ON CONFLICT (id) DO NOTHING');
         const old = rows.get(id);
-        if ((old && old.user_id !== userId) || (!old && expected !== null && expected !== 0)
-          || (old && expected !== null && old.revision !== expected)) return null;
+        if ((old && (doNothing || old.user_id !== userId))) return null;
+        for (const existing of rows.values()) {
+          if (existing.id !== id && existing.user_id === userId && existing.scope === scope
+            && existing.scope_key === scopeKey && existing.alias === alias) {
+            throw Object.assign(new Error('duplicate key'), { code: '23505' });
+          }
+        }
         const row: Row = {
           id, user_id: userId, scope, scope_key: scopeKey, alias, kind, target, enabled,
           revision: old ? old.revision + 1 : 1, created_at: old?.created_at ?? now, updated_at: now,
@@ -48,6 +57,36 @@ function makeMemDb(): Database {
         };
         rows.set(id, row);
         return row as T;
+      }
+      if (sql.includes('UPDATE verification_machine_profiles') && sql.includes('SET scope = $3')) {
+        const [userId, id, scope, scopeKey, alias, kind, target, enabled, now, source, expectedRevision] = params as [
+          string, string, Row['scope'], string, string, Row['kind'], string, boolean, number, Row['source'], number,
+        ];
+        const row = rows.get(id);
+        if (!row || row.user_id !== userId || row.revision !== expectedRevision) return null;
+        for (const existing of rows.values()) {
+          if (existing.id !== id && existing.user_id === userId && existing.scope === scope
+            && existing.scope_key === scopeKey && existing.alias === alias) {
+            throw Object.assign(new Error('duplicate key'), { code: '23505' });
+          }
+        }
+        const sameTarget = row.kind === kind && row.target === target;
+        const updated: Row = {
+          ...row,
+          scope,
+          scope_key: scopeKey,
+          alias,
+          kind,
+          target,
+          enabled,
+          revision: row.revision + 1,
+          updated_at: now,
+          last_verified_at: sameTarget ? row.last_verified_at : null,
+          last_verification_status: sameTarget ? row.last_verification_status : 'unverified',
+          source,
+        };
+        rows.set(id, updated);
+        return updated as T;
       }
       if (sql.includes('UPDATE verification_machine_profiles')) {
         const row = rows.get(params[1] as string);
@@ -100,6 +139,33 @@ describe('/api/verification-machines', () => {
     expect(await rename.json()).toMatchObject({ profile: { id: first.id, alias: 'Build rig', revision: 2 } });
     const list = await app.request('/api/verification-machines?projectKey=repo-1', { headers: { Authorization: bearer() } });
     expect(await list.json()).toMatchObject({ profiles: [{ id: first.id, alias: 'Build rig' }] });
+
+    const stale = await app.request('/api/verification-machines', { method: 'PUT', headers: {
+      Authorization: bearer(), 'Content-Type': 'application/json',
+    }, body: JSON.stringify({ id: first.id, scope: 'project', scopeKey: 'repo-1', alias: 'Stale', kind: 'ssh', target: ALIAS_ID, expectedRevision: 1 }) });
+    expect(stale.status).toBe(409);
+    expect(await stale.json()).toEqual({ error: 'revision_conflict' });
+  });
+
+  it('keeps default GET project-scoped while includeAllProjects=1 returns all user-owned scopes', async () => {
+    await app.request('/api/verification-machines', { method: 'PUT', headers: {
+      Authorization: bearer(), 'Content-Type': 'application/json',
+    }, body: JSON.stringify({ scope: 'project', scopeKey: 'repo-1', alias: 'Repo 1 rig', kind: 'ssh', target: ALIAS_ID }) });
+    await app.request('/api/verification-machines', { method: 'PUT', headers: {
+      Authorization: bearer(), 'Content-Type': 'application/json',
+    }, body: JSON.stringify({ scope: 'user', alias: 'Global rig', kind: 'ssh', target: ALIAS_ID }) });
+
+    const withoutProject = await app.request('/api/verification-machines', { headers: { Authorization: bearer() } });
+    expect((await withoutProject.json() as { profiles: Row[] }).profiles.map((p) => p.alias)).toEqual(['Global rig']);
+
+    const otherProject = await app.request('/api/verification-machines?projectKey=repo-2', { headers: { Authorization: bearer() } });
+    expect((await otherProject.json() as { profiles: Row[] }).profiles.map((p) => p.alias)).toEqual(['Global rig']);
+
+    const allProjects = await app.request('/api/verification-machines?includeAllProjects=1', { headers: { Authorization: bearer() } });
+    expect((await allProjects.json() as { profiles: Row[] }).profiles.map((p) => p.alias)).toEqual(['Repo 1 rig', 'Global rig']);
+
+    const otherUserAll = await app.request('/api/verification-machines?includeAllProjects=1', { headers: { Authorization: bearer('user-2') } });
+    expect(await otherUserAll.json()).toEqual({ profiles: [] });
   });
 
   it('isolates users and rejects unsafe SSH option injection', async () => {

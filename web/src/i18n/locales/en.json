@@ -3892,7 +3892,14 @@
       "status_verified": "Verified",
       "status_unreachable": "Unreachable",
       "status_unauthorized": "Unauthorized",
-      "purpose": "What this is for: the agent can only claim a change works on Windows, macOS or Linux if it actually runs it there. Machines authorized here are the ones it is allowed to use for that — real-device verification across platforms, instead of reasoning about what should happen. Nothing is used until the agent needs it, and authorization is per machine and revocable."
+      "purpose": "What this is for: the agent can only claim a change works on Windows, macOS or Linux if it actually runs it there. Machines authorized here are the ones it is allowed to use for that — real-device verification across platforms, instead of reasoning about what should happen. Nothing is used until the agent needs it, and authorization is per machine and revocable.",
+      "project_scope_named": "Project: {{project}}",
+      "error_revision_conflict": "This entry was updated elsewhere. The list has been refreshed—please review and save again.",
+      "error_alias_conflict": "Another verification machine in this scope already uses that alias. Choose a different alias.",
+      "error_target_unauthorized": "This machine or alias is no longer authorized or has been removed. The list has been refreshed.",
+      "error_not_found": "This verification machine no longer exists. The list has been refreshed.",
+      "error_alias_invalid": "Enter a valid machine alias before saving.",
+      "error_scope_key_required": "Open a project session to use project scope, or switch to All my projects."
     },
     "short": "Nodes",
     "linux_compat_headless": "Linux (glibc 2.17, headless)",

@@ -42,7 +42,14 @@ function normalizedScopeKey(scope: VerificationMachineScope, value: unknown): st
 
 verificationMachineRoutes.get('/', async (c) => {
   const projectKey = c.req.query('projectKey')?.trim() || undefined;
-  const profiles = await listVerificationMachines(c.env.DB, c.get('userId' as never) as string, projectKey);
+  const includeAllProjects = c.req.query('includeAllProjects') === '1'
+    || c.req.query('includeAllProjects') === 'true';
+  const profiles = await listVerificationMachines(
+    c.env.DB,
+    c.get('userId' as never) as string,
+    projectKey,
+    { includeAllProjects },
+  );
   if (profiles.length > VERIFICATION_MACHINE_LIMITS.MAX_ITEMS) {
     return c.json({ error: 'verification_machine_list_over_limit' }, 413);
   }
@@ -97,6 +104,9 @@ verificationMachineRoutes.put('/', async (c) => {
     source: c.req.header(SERVER_ID_HEADER) ? 'mcp' : 'web',
     expectedRevision,
   });
+  if (result === 'not_found') {
+    return c.json({ error: 'verification_machine_not_found' }, 404);
+  }
   if (result === 'revision_conflict' || result === 'alias_conflict') {
     return c.json({ error: result }, 409);
   }

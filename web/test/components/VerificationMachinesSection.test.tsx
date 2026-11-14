@@ -1,7 +1,7 @@
 /**
  * @vitest-environment jsdom
  */
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { VerificationMachinesSection } from '../../src/components/VerificationMachinesSection.js';
 
@@ -13,9 +13,11 @@ const aliasId = 'b'.repeat(32);
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
-    t: (key: string, params?: Record<string, unknown>) => (
-      typeof params?.name === 'string' ? `${key}:${params.name}` : key
-    ),
+    t: (key: string, params?: Record<string, unknown>) => {
+      if (typeof params?.name === 'string') return `${key}:${params.name}`;
+      if (typeof params?.project === 'string') return `${key}:${params.project}`;
+      return key;
+    },
   }),
 }));
 
@@ -60,7 +62,7 @@ describe('VerificationMachinesSection', () => {
   it('loads both synchronized scopes and renames by stable id', async () => {
     render(<VerificationMachinesSection machines={[]} projectKey="repo-1" />);
     const alias = await screen.findByLabelText('controlled_nodes.verification.alias') as HTMLInputElement;
-    expect(listMock).toHaveBeenCalledWith('repo-1');
+    expect(listMock).toHaveBeenCalledWith('repo-1', { includeAllProjects: true });
     fireEvent.input(alias, { target: { value: 'Renamed lab' } });
     fireEvent.click(screen.getByRole('button', { name: 'common.save' }));
     await waitFor(() => expect(setMock).toHaveBeenCalledWith(expect.objectContaining({
@@ -102,5 +104,112 @@ describe('VerificationMachinesSection', () => {
     await waitFor(() => expect(setMock).toHaveBeenCalledWith(expect.objectContaining({
       kind: 'ssh', target: aliasId, alias: '211-gitlab', scope: 'project', scopeKey: 'repo-1',
     })));
+  });
+
+  it('displays project scopeKey and allows renaming, switching to user scope, or deleting when projectKey is undefined or mismatched', async () => {
+    render(<VerificationMachinesSection machines={[]} />);
+    const alias = await screen.findByLabelText('controlled_nodes.verification.alias') as HTMLInputElement;
+    expect(listMock).toHaveBeenCalledWith(undefined, { includeAllProjects: true });
+    expect(document.body.textContent).toContain('repo-1');
+
+    // Rename while preserving the saved entry's original project scopeKey ('repo-1').
+    fireEvent.input(alias, { target: { value: 'Renamed without active project' } });
+    const saveBtn = screen.getByRole('button', { name: 'common.save' }) as HTMLButtonElement;
+    fireEvent.click(saveBtn);
+    await waitFor(() => expect(setMock).toHaveBeenCalledWith(expect.objectContaining({
+      id: profile.id,
+      scope: 'project',
+      scopeKey: 'repo-1',
+      alias: 'Renamed without active project',
+      expectedRevision: 4,
+    })));
+    await waitFor(() => expect(saveBtn.disabled).toBe(false));
+
+    // Switch saved project entry to global user scope even without an active projectKey.
+    const rowScope = screen.getByLabelText('controlled_nodes.verification.scope Windows lab') as HTMLSelectElement;
+    act(() => {
+      rowScope.value = 'user';
+      rowScope.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    fireEvent.click(saveBtn);
+    await waitFor(() => expect(setMock).toHaveBeenCalledWith(expect.objectContaining({
+      id: profile.id,
+      scope: 'user',
+      scopeKey: '',
+      expectedRevision: 4,
+    })));
+    await waitFor(() => expect(saveBtn.disabled).toBe(false));
+
+    // Delete works without active projectKey too.
+    fireEvent.click(screen.getByRole('button', { name: 'common.delete' }));
+    await waitFor(() => expect(removeMock).toHaveBeenCalledWith(profile.id, 4));
+  });
+
+  it('syncs header scope selector when projectKey arrives asynchronously unless manually chosen by user', async () => {
+    const { rerender } = render(<VerificationMachinesSection machines={[]} />);
+    await screen.findByLabelText('controlled_nodes.verification.alias');
+    const headerScope = document.querySelector('.verification-machines-scope select') as HTMLSelectElement;
+    expect(headerScope.value).toBe('user');
+
+    rerender(<VerificationMachinesSection machines={[]} projectKey="repo-2" />);
+    await waitFor(() => expect(headerScope.value).toBe('project'));
+
+    // User manually switches back to user scope; subsequent projectKey changes must not overwrite manual choice.
+    act(() => {
+      headerScope.value = 'user';
+      headerScope.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    expect(headerScope.value).toBe('user');
+    rerender(<VerificationMachinesSection machines={[]} projectKey="repo-3" />);
+    expect(headerScope.value).toBe('user');
+  });
+
+  it('does not overwrite another project profile when authorizing the same node in a new project', async () => {
+    render(<VerificationMachinesSection machines={[{
+      nodeId: '1234567890',
+      displayName: 'Windows lab',
+    } as any]} projectKey="repo-2" />);
+    fireEvent.click(await screen.findByRole('button', { name: 'quick_input.verification_add' }));
+    fireEvent.click(await screen.findByRole('tab', { name: /quick_input.tab_machines/ }));
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'controlled_nodes.verification.authorize_node:Windows lab',
+    }));
+    await waitFor(() => expect(setMock).toHaveBeenCalledWith(expect.objectContaining({
+      scope: 'project',
+      scopeKey: 'repo-2',
+      target: '1234567890',
+    })));
+    expect(setMock.mock.calls[0]?.[0]?.id).toBeUndefined();
+  });
+
+  it('surfaces specific conflict/auth errors, refreshes list, and clears stale local edits', async () => {
+    const refreshed = { ...profile, alias: 'Server Updated Lab', revision: 5 };
+    listMock.mockResolvedValueOnce([profile]).mockResolvedValueOnce([refreshed]);
+    setMock.mockRejectedValueOnce(Object.assign(new Error('API 409: revision_conflict'), { code: 'revision_conflict' }));
+
+    render(<VerificationMachinesSection machines={[]} projectKey="repo-1" />);
+    const alias = await screen.findByLabelText('controlled_nodes.verification.alias') as HTMLInputElement;
+    fireEvent.input(alias, { target: { value: 'Stale local edit' } });
+    fireEvent.click(screen.getByRole('button', { name: 'common.save' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toBe('controlled_nodes.verification.error_revision_conflict');
+    await waitFor(() => expect(alias.value).toBe('Server Updated Lab'));
+    expect(refetchAliasesMock).toHaveBeenCalled();
+
+    // alias_conflict surfaces specific alias conflict message and refreshes.
+    listMock.mockResolvedValueOnce([refreshed]);
+    setMock.mockRejectedValueOnce(Object.assign(new Error('API 409: alias_conflict'), { code: 'alias_conflict' }));
+    fireEvent.input(alias, { target: { value: 'Dup alias' } });
+    fireEvent.click(screen.getByRole('button', { name: 'common.save' }));
+    expect((await screen.findByRole('alert')).textContent).toBe('controlled_nodes.verification.error_alias_conflict');
+
+    // target_unauthorized surfaces specific unauthorized message and refreshes.
+    listMock.mockResolvedValueOnce([]);
+    setMock.mockRejectedValueOnce(Object.assign(new Error('API 403: verification_machine_target_unauthorized'), {
+      code: 'verification_machine_target_unauthorized',
+    }));
+    fireEvent.click(screen.getByRole('button', { name: 'common.save' }));
+    expect((await screen.findByRole('alert')).textContent).toBe('controlled_nodes.verification.error_target_unauthorized');
   });
 });
