@@ -471,13 +471,11 @@ export interface PrepareOnlyOfficeDocBuilderScriptOptions {
 const INPUT_URL_PLACEHOLDER = '{{INPUT_URL}}';
 const INPUT_URL_ARG_RE =
   /^(?:Argument\s*\.\s*(?:inputUrl|_imcodesInputUrl)|Argument\s*\[\s*(?:'inputUrl'|"inputUrl")\s*\])$/;
-const REGEX_PREFIX_KEYWORDS = new Set([
+const REGEX_EXPR_PREFIX_KEYWORDS = new Set([
   'await',
   'case',
   'default',
   'delete',
-  'do',
-  'else',
   'export',
   'in',
   'instanceof',
@@ -489,10 +487,33 @@ const REGEX_PREFIX_KEYWORDS = new Set([
   'void',
   'yield',
 ]);
+const REGEX_STMT_PREFIX_KEYWORDS = new Set(['else', 'do']);
+const CONTROL_HEADER_KEYWORDS = new Set(['if', 'while', 'for', 'with']);
 
 interface JsLexState {
   canStartRegex: boolean;
   afterDot: boolean;
+  pendingControlParen: boolean;
+  nextBraceIsObject: boolean;
+  parenStack: Array<'control' | 'expr'>;
+  braceStack: Array<'block' | 'object'>;
+}
+
+interface JsLexToken {
+  text: string;
+  nextIndex: number;
+  punct: boolean;
+}
+
+function createLexState(insideExpression = false): JsLexState {
+  return {
+    canStartRegex: true,
+    afterDot: false,
+    pendingControlParen: false,
+    nextBraceIsObject: insideExpression,
+    parenStack: [],
+    braceStack: [],
+  };
 }
 
 function isIdentifierChar(ch: string | undefined): boolean {
@@ -701,7 +722,7 @@ function stepJsLexicalToken(
   start: number,
   state: JsLexState,
   inputUrl: string | undefined,
-): { text: string; nextIndex: number } {
+): JsLexToken {
   const ch = src[start]!;
 
   if (isWhitespace(ch)) {
@@ -709,25 +730,31 @@ function stepJsLexicalToken(
     while (i < src.length && isWhitespace(src[i])) {
       i += 1;
     }
-    return { text: src.slice(start, i), nextIndex: i };
+    return { text: src.slice(start, i), nextIndex: i, punct: false };
   }
 
   if (ch === '/' && src[start + 1] === '/') {
-    return scanLineComment(src, start);
+    const comment = scanLineComment(src, start);
+    return { ...comment, punct: false };
   }
   if (ch === '/' && src[start + 1] === '*') {
-    return scanBlockComment(src, start);
+    const comment = scanBlockComment(src, start);
+    return { ...comment, punct: false };
   }
 
   if (ch === '"' || ch === "'") {
     state.canStartRegex = false;
     state.afterDot = false;
-    return scanQuotedLiteral(src, start, inputUrl);
+    state.pendingControlParen = false;
+    state.nextBraceIsObject = false;
+    return { ...scanQuotedLiteral(src, start, inputUrl), punct: false };
   }
   if (ch === '`') {
     state.canStartRegex = false;
     state.afterDot = false;
-    return scanTemplateLiteral(src, start, inputUrl);
+    state.pendingControlParen = false;
+    state.nextBraceIsObject = false;
+    return { ...scanTemplateLiteral(src, start, inputUrl), punct: false };
   }
 
   if (ch === '/' && state.canStartRegex) {
@@ -735,20 +762,26 @@ function stepJsLexicalToken(
     if (regex) {
       state.canStartRegex = false;
       state.afterDot = false;
-      return regex;
+      state.pendingControlParen = false;
+      state.nextBraceIsObject = false;
+      return { ...regex, punct: false };
     }
   }
 
   if (ch === '?' && src[start + 1] === '.' && !isDigit(src[start + 2])) {
     state.canStartRegex = false;
     state.afterDot = true;
-    return { text: '?.', nextIndex: start + 2 };
+    state.pendingControlParen = false;
+    state.nextBraceIsObject = false;
+    return { text: '?.', nextIndex: start + 2, punct: false };
   }
 
   if (isDigit(ch) || (ch === '.' && isDigit(src[start + 1]))) {
     state.canStartRegex = false;
     state.afterDot = false;
-    return scanNumberLiteral(src, start);
+    state.pendingControlParen = false;
+    state.nextBraceIsObject = false;
+    return { ...scanNumberLiteral(src, start), punct: false };
   }
 
   if (isIdentifierStart(ch)) {
@@ -757,32 +790,105 @@ function stepJsLexicalToken(
       i += 1;
     }
     const word = src.slice(start, i);
-    state.canStartRegex = !state.afterDot && REGEX_PREFIX_KEYWORDS.has(word);
+    const wasAfterDot = state.afterDot;
+    const wasPendingControl = state.pendingControlParen;
     state.afterDot = false;
-    return { text: word, nextIndex: i };
+    state.pendingControlParen = false;
+
+    if (!wasAfterDot && CONTROL_HEADER_KEYWORDS.has(word)) {
+      state.pendingControlParen = true;
+      state.canStartRegex = false;
+      state.nextBraceIsObject = false;
+    } else if (!wasAfterDot && word === 'await' && wasPendingControl) {
+      state.pendingControlParen = true;
+      state.canStartRegex = true;
+      state.nextBraceIsObject = true;
+    } else if (!wasAfterDot && REGEX_STMT_PREFIX_KEYWORDS.has(word)) {
+      state.canStartRegex = true;
+      state.nextBraceIsObject = false;
+    } else if (!wasAfterDot && REGEX_EXPR_PREFIX_KEYWORDS.has(word)) {
+      state.canStartRegex = true;
+      state.nextBraceIsObject = true;
+    } else {
+      state.canStartRegex = false;
+      state.nextBraceIsObject = false;
+    }
+    return { text: word, nextIndex: i, punct: false };
+  }
+
+  if (ch === '=' && src[start + 1] === '>') {
+    state.canStartRegex = true;
+    state.afterDot = false;
+    state.pendingControlParen = false;
+    state.nextBraceIsObject = false;
+    return { text: '=>', nextIndex: start + 2, punct: false };
   }
 
   if ((ch === '+' && src[start + 1] === '+') || (ch === '-' && src[start + 1] === '-')) {
     state.canStartRegex = false;
     state.afterDot = false;
-    return { text: src.slice(start, start + 2), nextIndex: start + 2 };
+    state.pendingControlParen = false;
+    state.nextBraceIsObject = false;
+    return { text: src.slice(start, start + 2), nextIndex: start + 2, punct: false };
   }
 
   if (ch === '.') {
     state.canStartRegex = false;
     state.afterDot = true;
-    return { text: '.', nextIndex: start + 1 };
+    state.pendingControlParen = false;
+    state.nextBraceIsObject = false;
+    return { text: '.', nextIndex: start + 1, punct: false };
   }
 
-  if (ch === ')' || ch === ']') {
+  if (ch === '(') {
+    state.parenStack.push(state.pendingControlParen ? 'control' : 'expr');
+    state.pendingControlParen = false;
+    state.afterDot = false;
+    state.canStartRegex = true;
+    state.nextBraceIsObject = true;
+    return { text: '(', nextIndex: start + 1, punct: true };
+  }
+
+  if (ch === ')') {
+    const kind = state.parenStack.pop() ?? 'expr';
+    state.pendingControlParen = false;
+    state.afterDot = false;
+    state.canStartRegex = kind === 'control';
+    state.nextBraceIsObject = false;
+    return { text: ')', nextIndex: start + 1, punct: true };
+  }
+
+  if (ch === '{') {
+    state.braceStack.push(state.nextBraceIsObject ? 'object' : 'block');
+    state.pendingControlParen = false;
+    state.afterDot = false;
+    state.canStartRegex = true;
+    state.nextBraceIsObject = false;
+    return { text: '{', nextIndex: start + 1, punct: true };
+  }
+
+  if (ch === '}') {
+    const kind = state.braceStack.pop() ?? 'block';
+    state.pendingControlParen = false;
+    state.afterDot = false;
+    state.canStartRegex = kind !== 'object';
+    state.nextBraceIsObject = false;
+    return { text: '}', nextIndex: start + 1, punct: true };
+  }
+
+  if (ch === ']') {
     state.canStartRegex = false;
     state.afterDot = false;
-    return { text: ch, nextIndex: start + 1 };
+    state.pendingControlParen = false;
+    state.nextBraceIsObject = false;
+    return { text: ']', nextIndex: start + 1, punct: false };
   }
 
   state.canStartRegex = true;
   state.afterDot = false;
-  return { text: ch, nextIndex: start + 1 };
+  state.pendingControlParen = false;
+  state.nextBraceIsObject = ch !== ';';
+  return { text: ch, nextIndex: start + 1, punct: false };
 }
 
 function scanTemplateExpression(
@@ -790,35 +896,25 @@ function scanTemplateExpression(
   start: number,
   inputUrl: string | undefined,
 ): { text: string; nextIndex: number } {
-  const state: JsLexState = { canStartRegex: true, afterDot: false };
+  const state = createLexState(true);
   let i = start;
   let depth = 1;
   let out = '';
 
   while (i < src.length) {
-    const ch = src[i]!;
-    if (ch === '{') {
-      depth += 1;
-      out += ch;
-      state.canStartRegex = true;
-      state.afterDot = false;
-      i += 1;
-      continue;
-    }
-    if (ch === '}') {
-      depth -= 1;
-      out += ch;
-      state.canStartRegex = true;
-      state.afterDot = false;
-      i += 1;
-      if (depth === 0) {
-        return { text: out, nextIndex: i };
-      }
-      continue;
-    }
     const token = stepJsLexicalToken(src, i, state, inputUrl);
     out += token.text;
     i = token.nextIndex;
+    if (token.punct) {
+      if (token.text === '{') {
+        depth += 1;
+      } else if (token.text === '}') {
+        depth -= 1;
+        if (depth === 0) {
+          return { text: out, nextIndex: i };
+        }
+      }
+    }
   }
 
   return { text: out, nextIndex: i };
@@ -869,30 +965,23 @@ function scanTemplateLiteral(
 }
 
 function findMatchingParen(src: string, openParenIdx: number): number {
-  const state: JsLexState = { canStartRegex: true, afterDot: false };
+  const state = createLexState(true);
   let depth = 1;
   let i = openParenIdx + 1;
 
   while (i < src.length) {
-    const ch = src[i]!;
-    if (ch === '(') {
-      depth += 1;
-      state.canStartRegex = true;
-      state.afterDot = false;
-      i += 1;
-      continue;
-    }
-    if (ch === ')') {
-      depth -= 1;
-      state.canStartRegex = false;
-      state.afterDot = false;
-      if (depth === 0) {
-        return i;
+    const token = stepJsLexicalToken(src, i, state, undefined);
+    if (token.punct) {
+      if (token.text === '(') {
+        depth += 1;
+      } else if (token.text === ')') {
+        depth -= 1;
+        if (depth === 0) {
+          return i;
+        }
       }
-      i += 1;
-      continue;
     }
-    i = stepJsLexicalToken(src, i, state, undefined).nextIndex;
+    i = token.nextIndex;
   }
 
   return -1;
@@ -902,7 +991,7 @@ function replaceInputUrlInLiterals(src: string, inputUrl: string | undefined): s
   if (inputUrl === undefined || !src.includes(INPUT_URL_PLACEHOLDER)) {
     return src;
   }
-  const state: JsLexState = { canStartRegex: true, afterDot: false };
+  const state = createLexState(true);
   let i = 0;
   let out = '';
   while (i < src.length) {
@@ -926,7 +1015,7 @@ export function prepareOnlyOfficeDocBuilderScript(
 ): string {
   const inputUrl = options.inputUrl;
   const builderCallRe = /builder\s*\.\s*(CreateFile|OpenFile|SaveFile|CloseFile)\s*\(/y;
-  const state: JsLexState = { canStartRegex: true, afterDot: false };
+  const state = createLexState(false);
   let i = 0;
   let out = '';
 
@@ -976,6 +1065,8 @@ export function prepareOnlyOfficeDocBuilderScript(
 
           state.canStartRegex = hasSemicolon;
           state.afterDot = false;
+          state.pendingControlParen = false;
+          state.nextBraceIsObject = false;
 
           let afterIdx = stmtEnd;
           while (afterIdx < script.length && (script[afterIdx] === ' ' || script[afterIdx] === '\t')) {

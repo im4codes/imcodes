@@ -1145,6 +1145,50 @@ describe('cloud-docs DocBuilder, Converter, and binary file-update routes', () =
       'builder.SaveFile("docx", `${/[a)b]/.source}`.replace(/"/g, "x") + "https://docs.example.test/file?tok=a\'b\\"c&x=1`$y");',
     ].join('\n'));
     expect(() => new Function('builder', 'Api', 'a', 'b', 'c', 'w', 'h', preparedDivisionAndRegex)).not.toThrow();
+
+    // 7. Regex statements immediately following control-statement closing `)` (`if`/`while`/`for`/`with`/`else`/block `}`)
+    const controlHeaderRegexAndString = [
+      'if (enabled) /"/g.test(text);',
+      'var text = "builder.CloseFile()";',
+      'builder.CloseFile();',
+    ].join('\n');
+    expect(prepareOnlyOfficeDocBuilderScript(controlHeaderRegexAndString)).toBe(controlHeaderRegexAndString);
+    expect(() => new Function('enabled', 'text', 'builder', controlHeaderRegexAndString)).not.toThrow();
+
+    const controlHeaderBeforeOpenFile = [
+      'if (enabled) /"/g.test(text);',
+      'builder.OpenFile(Argument.inputUrl);',
+    ].join('\n');
+    const preparedControlOpen = prepareOnlyOfficeDocBuilderScript(controlHeaderBeforeOpenFile, {
+      inputUrl: sampleUrl,
+    });
+    expect(preparedControlOpen).toBe([
+      'if (enabled) /"/g.test(text);',
+      `builder.OpenFile(${JSON.stringify(sampleUrl)});`,
+    ].join('\n'));
+    expect(() => new Function('enabled', 'text', 'builder', preparedControlOpen)).not.toThrow();
+
+    const nestedAndBlockControls = [
+      'while ((w + h) / 2 > 0) /"/g.test(text);',
+      'for (var k = 0; k < 1; k++) /"/g.test(text);',
+      'if (enabled) { fn() / 2; } /"/g.test(text);',
+      'var ratioDiv = (w + h) / 2 + fn() / 2;',
+      'var t = `${(() => { if (enabled) /"/g.test(text); return /}/g.source; })()}-{{INPUT_URL}}`;',
+      'builder.OpenFile(Argument.inputUrl); builder.SaveFile("docx", (() => { if (enabled) return /a\\)b/; return /c/; })().source);',
+    ].join('\n');
+    const preparedNested = prepareOnlyOfficeDocBuilderScript(nestedAndBlockControls, {
+      inputUrl: sampleUrl,
+    });
+    expect(preparedNested).toBe([
+      'while ((w + h) / 2 > 0) /"/g.test(text);',
+      'for (var k = 0; k < 1; k++) /"/g.test(text);',
+      'if (enabled) { fn() / 2; } /"/g.test(text);',
+      'var ratioDiv = (w + h) / 2 + fn() / 2;',
+      'var t = `${(() => { if (enabled) /"/g.test(text); return /}/g.source; })()}-https://docs.example.test/file?tok=a\'b"c&x=1\\`\\$y`;',
+      `builder.OpenFile(${JSON.stringify(sampleUrl)});`,
+      'builder.SaveFile("docx", (() => { if (enabled) return /a\\)b/; return /c/; })().source);',
+    ].join('\n'));
+    expect(() => new Function('enabled', 'text', 'w', 'h', 'fn', 'builder', preparedNested)).not.toThrow();
   });
 
   it('normalizes single-line chained scripts across create, docbuilder edit, and content docbuilder routes', async () => {
