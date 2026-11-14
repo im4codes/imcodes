@@ -35,6 +35,11 @@ import {
   type DesktopInstallerRollbackSnapshot,
   type DesktopInstallerSnapshotEntry,
 } from '../../shared/desktop-installer-compatibility.js';
+import {
+  IMCODES_HOME_ENV,
+  imcodesStateDir,
+  imcodesStateDirForHome,
+} from '../util/imcodes-state-dir.js';
 
 export interface ProbeDesktopInstallOptions {
   platform?: DesktopInstallerPlatform;
@@ -220,6 +225,18 @@ function looksLikeFilesystemPath(value: string): boolean {
   );
 }
 
+function isPackageManagerRoot(dir: string): boolean {
+  const norm = dir.replace(/\\/gu, '/').replace(/\/+$/u, '');
+  if (
+    norm === '/opt/homebrew' ||
+    norm === '/usr/local/Homebrew' ||
+    norm === '/home/linuxbrew/.linuxbrew'
+  ) {
+    return true;
+  }
+  return existsSync(join(dir, 'Library', 'Homebrew')) || existsSync(join(dir, 'Cellar'));
+}
+
 /** Return true when `targetPath` (or its resolved symlink target) resides inside a git checkout. */
 export function isPathInsideGitCheckout(targetPath: string): boolean {
   if (!targetPath || !looksLikeFilesystemPath(targetPath)) return false;
@@ -227,7 +244,8 @@ export function isPathInsideGitCheckout(targetPath: string): boolean {
   const st = safeStat(dir);
   if (!st || !st.isDirectory()) dir = dirname(dir);
   for (let i = 0; i < 12; i += 1) {
-    if (existsSync(join(dir, '.git'))) return true;
+    if (basename(dir) === 'node_modules') return false;
+    if (existsSync(join(dir, '.git')) && !isPackageManagerRoot(dir)) return true;
     const parent = dirname(dir);
     if (parent === dir) break;
     dir = parent;
@@ -389,7 +407,12 @@ export function probeDesktopInstallEnvironment(
   const homeDir = resolve(
     options.homeDir ?? (isolatedBase ? join(isolatedBase, 'home') : env.HOME ?? env.USERPROFILE ?? homedir()),
   );
-  const userStateDir = resolve(options.userStateDir ?? join(homeDir, '.imcodes'));
+  const userStateDir = resolve(
+    options.userStateDir ??
+      (!options.homeDir && !isolatedBase && env[IMCODES_HOME_ENV]?.trim()
+        ? imcodesStateDir(env)
+        : imcodesStateDirForHome(homeDir, env)),
+  );
   const controlledNodeRoot = resolve(
     options.controlledNodeRoot ?? (isolatedBase ? join(isolatedBase, 'controlled-node') : defaults.controlledNodeRoot),
   );

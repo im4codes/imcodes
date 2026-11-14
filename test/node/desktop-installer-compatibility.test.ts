@@ -27,6 +27,7 @@ import {
   cleanupExpiredTempArtifacts,
   createRollbackSnapshot,
   installDaemonRuntimeCurrentLink,
+  isPathInsideGitCheckout,
   probeDesktopInstallEnvironment,
   restoreRollbackSnapshot,
 } from '../../src/node/desktop-installer-probe.js';
@@ -250,6 +251,102 @@ describe('Phase A dual-path compatibility probe and 5-scenario state machine', (
 
     const switchedPlan = planDesktopInstallerCompatibility(probe, { confirmFdaSwitch: true });
     expect(switchedPlan.scenario).toBe('partial_preserve');
+  });
+
+  it('does not misclassify Homebrew .git prefix or node_modules entries as dev checkout, while preserving npm link dev detection', () => {
+    const root = makeTempDir();
+    const homeDir = join(root, 'home');
+    const fakeHomebrew = join(root, 'fake-homebrew');
+    const homebrewBin = join(fakeHomebrew, 'bin');
+    const homebrewPkg = join(fakeHomebrew, 'lib', 'node_modules', 'imcodes', 'dist', 'src');
+    const plistDir = join(homeDir, 'Library', 'LaunchAgents');
+    mkdirSync(join(fakeHomebrew, '.git'), { recursive: true });
+    mkdirSync(join(fakeHomebrew, 'Cellar'), { recursive: true });
+    mkdirSync(homebrewBin, { recursive: true });
+    mkdirSync(homebrewPkg, { recursive: true });
+    mkdirSync(plistDir, { recursive: true });
+
+    const fakeNode = join(homebrewBin, 'node');
+    writeFileSync(fakeNode, '#!/bin/sh\n', { mode: 0o755 });
+    const fakeEntry = join(homebrewPkg, 'index.js');
+    writeFileSync(fakeEntry, 'console.log("npm-installed");\n');
+
+    // Even when a parent directory has `.git` (like /opt/homebrew/.git), paths inside node_modules or Homebrew prefix are not dev checkouts
+    expect(isPathInsideGitCheckout(fakeEntry)).toBe(false);
+    expect(isPathInsideGitCheckout(fakeNode)).toBe(false);
+
+    // Even without Cellar marker, node_modules boundary alone prevents climbing into a parent .git
+    const genericPrefix = join(root, 'generic-prefix');
+    const genericEntry = join(genericPrefix, 'lib', 'node_modules', 'imcodes', 'dist', 'src', 'index.js');
+    mkdirSync(join(genericPrefix, '.git'), { recursive: true });
+    mkdirSync(join(genericPrefix, 'lib', 'node_modules', 'imcodes', 'dist', 'src'), { recursive: true });
+    writeFileSync(genericEntry, 'console.log("pkg");\n');
+    expect(isPathInsideGitCheckout(genericEntry)).toBe(false);
+
+    // npm link from node_modules to a real git checkout resolves via realpath outside node_modules -> true
+    const devRepo = join(root, 'codedeck-dev');
+    mkdirSync(join(devRepo, '.git'), { recursive: true });
+    mkdirSync(join(devRepo, 'dist', 'src'), { recursive: true });
+    const devEntry = join(devRepo, 'dist', 'src', 'index.js');
+    writeFileSync(devEntry, 'console.log("dev");\n');
+    const linkedPkg = join(fakeHomebrew, 'lib', 'node_modules', 'imcodes-linked');
+    symlinkSync(devRepo, linkedPkg);
+    expect(isPathInsideGitCheckout(join(linkedPkg, 'dist', 'src', 'index.js'))).toBe(true);
+
+    const plistPath = join(plistDir, 'imcodes.daemon.plist');
+    writeFileSync(
+      plistPath,
+      `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>imcodes.daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${fakeNode}</string>
+    <string>${fakeEntry}</string>
+    <string>start</string>
+    <string>--foreground</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+</dict></plist>`,
+      'utf8',
+    );
+
+    const probe = probeDesktopInstallEnvironment({
+      platform: 'darwin',
+      homeDir,
+      controlledNodeRoot: join(root, 'node-root'),
+      controlledNodeServicePath: join(root, 'cc.imcodes.node.plist'),
+      daemonRuntimeRoot: join(root, 'daemon-runtime'),
+      cliPath: join(root, 'bin', 'imcodes'),
+      autostartPath: plistPath,
+      env: {},
+    });
+
+    expect(probe.userDaemon.servicePointsToDevCheckout).toBe(false);
+    expect(planDesktopInstallerCompatibility(probe).scenario).toBe('macos_launchagent_fda_preserve');
+  });
+
+  it('honors env.IMCODES_HOME in probeDesktopInstallEnvironment when homeDir/isolatedRoot/userStateDir are omitted', () => {
+    const root = makeTempDir();
+    const scopedState = join(root, 'scoped-imcodes');
+    mkdirSync(scopedState, { recursive: true });
+    writeFileSync(
+      join(scopedState, 'server.json'),
+      JSON.stringify({ serverId: 'srv-scoped', workerUrl: 'https://app.im.codes', token: 'tok' }),
+    );
+
+    const probe = probeDesktopInstallEnvironment({
+      platform: 'linux',
+      controlledNodeRoot: join(root, 'node-root'),
+      controlledNodeServicePath: join(root, 'node.service'),
+      daemonRuntimeRoot: join(root, 'daemon-runtime'),
+      cliPath: join(root, 'bin', 'imcodes'),
+      autostartPath: join(root, 'imcodes.service'),
+      env: { HOME: join(root, 'unused-home'), IMCODES_HOME: scopedState },
+    });
+
+    expect(probe.userDaemon.stateDir).toBe(scopedState);
+    expect(probe.userDaemon.hasValidServerJson).toBe(true);
   });
 
   it('routes stale/broken npm install + expired .tmp to scenario 5, cleans only expired .tmp, and supports full rollback', () => {

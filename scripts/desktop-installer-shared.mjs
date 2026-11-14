@@ -704,11 +704,26 @@ is_git_checkout_path() {
   target="$1"
   [ -n "$target" ] || return 1
   real="$(canonicalize_posix_path "$target")" || return 1
-  dir="$(dirname -- "$real" 2>/dev/null || printf '%s' "$real")"
+  if [ -d "$real" ]; then
+    dir="$real"
+  else
+    dir="$(dirname -- "$real" 2>/dev/null || printf '%s' "$real")"
+  fi
   i=0
   while [ "$i" -lt 12 ]; do
+    base="$(basename -- "$dir")"
+    if [ "$base" = "node_modules" ]; then
+      return 1
+    fi
     if [ -e "$dir/.git" ]; then
-      return 0
+      case "$dir" in
+        /opt/homebrew|/usr/local/Homebrew|/home/linuxbrew/.linuxbrew) ;;
+        *)
+          if [ ! -e "$dir/Library/Homebrew" ] && [ ! -e "$dir/Cellar" ]; then
+            return 0
+          fi
+          ;;
+      esac
     fi
     parent="$(dirname -- "$dir")"
     [ "$parent" = "$dir" ] && break

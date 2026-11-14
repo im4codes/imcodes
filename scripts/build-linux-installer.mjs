@@ -62,7 +62,9 @@ trap 'rm -rf "$WORK_TMP"' EXIT
 
 RUNNER_PATH="$WORK_TMP/phase-a-runner.sh"
 if ! printf '%s' "$RUNNER_B64" | base64 -d > "$RUNNER_PATH" 2>/dev/null; then
-  printf '%s' "$RUNNER_B64" | base64 --decode > "$RUNNER_PATH"
+  if ! printf '%s' "$RUNNER_B64" | base64 -D > "$RUNNER_PATH" 2>/dev/null; then
+    printf '%s' "$RUNNER_B64" | base64 --decode > "$RUNNER_PATH"
+  fi
 fi
 chmod 755 "$RUNNER_PATH"
 

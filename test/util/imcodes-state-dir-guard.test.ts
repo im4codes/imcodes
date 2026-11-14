@@ -32,8 +32,11 @@ const ALLOWED: Record<string, string> = {
   'shared/skill-store.ts': 'getUserSkillRoot(homeDir, stateDir): the explicit-account-home default; shared/ cannot import src/',
   'shared/capability-management.ts': 'managed-skill root segments under an explicit account home',
   'shared/cloud-docs.ts': 'isInternalUploadTempFilePath matches chat upload path segments by regex only; never resolves or accesses host state paths',
+  'shared/desktop-installer-compatibility.ts': 'assertSafeIsolatedTargetPath guard lists protected real-home .imcodes subdirs so isolated installers never touch ~/.imcodes',
   'scripts/restart-daemon.sh': 'restarts the DEFAULT launchd service (label imcodes.daemon), which by definition lives in $HOME/.imcodes',
   'scripts/diagnose-windows-controlled-node.ps1': 'reads the default SYSTEM-profile service log of a controlled node',
+  'scripts/build-windows-installer.mjs': 'standalone PowerShell installer guards against real USERPROFILE\\.imcodes and resolves target-home $UserStateDir',
+  'scripts/desktop-installer-shared.mjs': 'standalone POSIX installer guards against real HOME/.imcodes and resolves target-home $USER_STATE_DIR',
 };
 
 // `.imcodes` as a whole path segment: quoted, or between slashes. `.imcodes-foo` and `cc.imcodes.daemon` are different names.

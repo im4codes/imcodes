@@ -305,6 +305,7 @@ function Test-InsideGitCheckout([string]$CandidatePath) {
   }
   for ($i = 0; $i -lt 12; $i++) {
     if ([string]::IsNullOrWhiteSpace($dir)) { break }
+    if ((Split-Path -Leaf $dir) -ieq 'node_modules') { return $false }
     if (Test-Path -LiteralPath (Join-Path $dir '.git')) { return $true }
     $parent = Split-Path -Parent $dir
     if ($parent -eq $dir) { break }
