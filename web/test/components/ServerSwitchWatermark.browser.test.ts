@@ -238,4 +238,150 @@ describe('ServerSwitchWatermark browser animation & cascade', () => {
       await browser.close();
     }
   });
+
+  it('pairs card background with text and kbd colors across native Mac host classes, light/dark schemes, and server/session switch kinds', { timeout: 30000 }, async () => {
+    const require = createRequire(import.meta.url);
+    const { chromium } = require('playwright') as typeof import('playwright');
+    if (!existsSync(chromium.executablePath())) {
+      return;
+    }
+    const { buildSync } = require('esbuild') as typeof import('esbuild');
+    const here = dirname(fileURLToPath(import.meta.url));
+    const componentPath = resolve(here, '../../src/components/ServerSwitchWatermark.tsx');
+    const css = readFileSync(resolve(here, '../../src/styles.css'), 'utf8');
+
+    const compiled = buildSync({
+      stdin: {
+        contents: `
+          import { render } from 'preact';
+          import { ServerSwitchWatermark } from ${JSON.stringify(componentPath)};
+          window.__mountHud = (props) => {
+            render(<ServerSwitchWatermark {...props} />, document.getElementById('root'));
+          };
+        `,
+        resolveDir: resolve(here, '../..'),
+        loader: 'tsx',
+      },
+      bundle: true,
+      write: false,
+      jsx: 'automatic',
+      jsxImportSource: 'preact',
+      platform: 'browser',
+    });
+    const bundleCode = compiled.outputFiles[0].text;
+
+    const parseRgb = (cssColor: string): [number, number, number] => {
+      const m = cssColor.match(/rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/);
+      if (!m) throw new Error(`Unexpected color format: ${cssColor}`);
+      return [Number(m[1]), Number(m[2]), Number(m[3])];
+    };
+    const avgRgb = (cssColor: string): number => {
+      const [r, g, b] = parseRgb(cssColor);
+      return (r + g + b) / 3;
+    };
+
+    const browser = await chromium.launch({ headless: true });
+    try {
+      for (const colorScheme of ['dark', 'light'] as const) {
+        const page = await browser.newPage({
+          viewport: { width: 1100, height: 800 },
+          colorScheme,
+          reducedMotion: 'reduce',
+        });
+        await page.setContent(`<style>${css}</style><div id="root"></div>`);
+        await page.addScriptTag({ content: bundleCode });
+
+        for (const nativeClass of ['native-ios-mac', 'native-mac-desktop'] as const) {
+          await page.evaluate((cls) => {
+            document.documentElement.className = cls;
+          }, nativeClass);
+
+          const borderColors: Record<'server' | 'session', string> = { server: '', session: '' };
+
+          for (const scenario of [
+            { switchKind: 'server' as const, sessionName: 'alpha', keycaps: ['⌘', 'S'], triggerKey: 1 },
+            { switchKind: 'session' as const, sessionName: null, keycaps: ['⌃', 'D'], triggerKey: 2 },
+          ]) {
+            await page.evaluate((sc) => {
+              const w = window as unknown as { __mountHud: (p: Record<string, unknown>) => void };
+              w.__mountHud({
+                visible: true,
+                triggerKey: sc.triggerKey,
+                serverName: 'Mac Host Server',
+                sessionName: sc.sessionName,
+                fallbackLabel: 'Switching session…',
+                switchKind: sc.switchKind,
+                shortcutKeycaps: sc.keycaps,
+                holdMs: 500,
+                exitMs: 120,
+                onDismiss: () => {},
+              });
+            }, scenario);
+
+            const sample = await page.evaluate(() => {
+              const card = document.querySelector('.server-switch-watermark-card') as HTMLElement;
+              const serverEl = document.querySelector('.server-switch-watermark-server-name') as HTMLElement;
+              const sessionWrap = document.querySelector('.server-switch-watermark-session') as HTMLElement;
+              const kbdEl = document.querySelector('.server-switch-watermark-kbd') as HTMLElement;
+              const cardCs = getComputedStyle(card);
+              const serverCs = getComputedStyle(serverEl);
+              const sessionCs = getComputedStyle(sessionWrap);
+              const kbdCs = getComputedStyle(kbdEl);
+              return {
+                switchKind: card.parentElement?.getAttribute('data-switch-kind'),
+                backgroundColor: cardCs.backgroundColor,
+                backdropFilter: cardCs.backdropFilter,
+                webkitBackdropFilter: cardCs.getPropertyValue('-webkit-backdrop-filter') || 'none',
+                pointerEvents: cardCs.pointerEvents,
+                animationName: cardCs.animationName,
+                transitionDuration: cardCs.transitionDuration,
+                borderStyle: cardCs.borderTopStyle,
+                borderWidth: cardCs.borderTopWidth,
+                borderColor: cardCs.borderTopColor,
+                serverColor: serverCs.color,
+                sessionColor: sessionCs.color,
+                kbdColor: kbdCs.color,
+              };
+            });
+
+            expect(sample.switchKind).toBe(scenario.switchKind);
+            expect(sample.backdropFilter).toBe('none');
+            expect(sample.webkitBackdropFilter).toBe('none');
+            expect(sample.pointerEvents).toBe('none');
+            expect(sample.animationName).toBe('none');
+            expect(sample.transitionDuration).toBe('0s');
+            expect(sample.borderStyle).toBe('solid');
+            expect(sample.borderWidth).toBe('2px');
+
+            const bgLum = avgRgb(sample.backgroundColor);
+            const serverLum = avgRgb(sample.serverColor);
+            const sessionLum = avgRgb(sample.sessionColor);
+            const kbdLum = avgRgb(sample.kbdColor);
+
+            if (colorScheme === 'light') {
+              // Native host light mode keeps an opaque light card paired with dark text & keycaps
+              expect(bgLum).toBeGreaterThanOrEqual(235);
+              expect(serverLum).toBeLessThanOrEqual(80);
+              expect(sessionLum).toBeLessThanOrEqual(150);
+              expect(kbdLum).toBeLessThanOrEqual(90);
+            } else {
+              // Native host dark mode keeps an opaque dark card paired with bright text & keycaps
+              expect(bgLum).toBeLessThanOrEqual(45);
+              expect(serverLum).toBeGreaterThanOrEqual(220);
+              expect(sessionLum).toBeGreaterThanOrEqual(140);
+              expect(kbdLum).toBeGreaterThanOrEqual(200);
+            }
+
+            borderColors[scenario.switchKind] = sample.borderColor;
+          }
+
+          expect(borderColors.server).not.toBe(borderColors.session);
+        }
+
+        await page.close();
+      }
+    } finally {
+      await browser.close();
+    }
+  });
 });

@@ -281,5 +281,6 @@ describe('ServerSwitchWatermark', () => {
     expect(tail).toContain('@media (prefers-reduced-motion: reduce)');
     expect(tail).toMatch(/@media \(max-width: 480px\)[\s\S]*\.server-switch-watermark-server-name\s*\{[\s\S]*font-size:\s*clamp\(30px,\s*8\.5vw,\s*48px\);[\s\S]*\.server-switch-watermark-session-name\s*\{[\s\S]*font-size:\s*clamp\(18px,\s*5vw,\s*28px\);/);
     expect(css).toContain(':is(html.native-ios-mac, html.native-mac-desktop) .server-switch-watermark-card');
+    expect(tail).toMatch(/@media \(prefers-color-scheme: light\)\s*\{\s*:is\(html\.native-ios-mac,\s*html\.native-mac-desktop\)\s+\.server-switch-watermark-card\s*\{\s*background:\s*rgba\(255,\s*255,\s*255,\s*0\.94\);/);
   });
 });
