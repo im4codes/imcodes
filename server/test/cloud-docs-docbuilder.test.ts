@@ -1106,6 +1106,45 @@ describe('cloud-docs DocBuilder, Converter, and binary file-update routes', () =
       '  builder.CloseFile();',
     ].join('\n'));
     expect(prepareOnlyOfficeDocBuilderScript(once, { inputUrl: sampleUrl })).toBe(once);
+
+    // 6. Regex literals containing quotes/slashes/parens/braces do not desync string, arg, template, or builder detection
+    const regexWithQuoteAndString = [
+      'var re = /"/g;',
+      'var text = "builder.CloseFile()";',
+      'builder.CreateFile("docx");',
+      'builder.SaveFile("docx", "out.docx");',
+      'builder.CloseFile();',
+    ].join('\n');
+    expect(prepareOnlyOfficeDocBuilderScript(regexWithQuoteAndString)).toBe(regexWithQuoteAndString);
+    expect(() => new Function('builder', 'Api', regexWithQuoteAndString)).not.toThrow();
+
+    const regexBeforeOpenFile = [
+      'var quotePattern = /"/g;',
+      'builder.OpenFile(Argument.inputUrl);',
+    ].join('\n');
+    expect(prepareOnlyOfficeDocBuilderScript(regexBeforeOpenFile, { inputUrl: sampleUrl })).toBe([
+      'var quotePattern = /"/g;',
+      `builder.OpenFile(${JSON.stringify(sampleUrl)});`,
+    ].join('\n'));
+
+    // Regex inside template interpolation, inside char class, inside SaveFile args, and after division expressions
+    const divisionAndRegex = [
+      'var ratio = a / b / c;',
+      'var half = (w + h) / 2;',
+      'var charClassRe = /[/"\'`]/gi;',
+      'var tplWithRe = `${/"/g}-${/}/g}-{{INPUT_URL}}`;',
+      'builder.OpenFile(Argument.inputUrl); builder.SaveFile("docx", `${/[a)b]/.source}`.replace(/"/g, "x") + "{{INPUT_URL}}");',
+    ].join('\n');
+    const preparedDivisionAndRegex = prepareOnlyOfficeDocBuilderScript(divisionAndRegex, { inputUrl: sampleUrl });
+    expect(preparedDivisionAndRegex).toBe([
+      'var ratio = a / b / c;',
+      'var half = (w + h) / 2;',
+      'var charClassRe = /[/"\'`]/gi;',
+      'var tplWithRe = `${/"/g}-${/}/g}-https://docs.example.test/file?tok=a\'b"c&x=1\\`\\$y`;',
+      `builder.OpenFile(${JSON.stringify(sampleUrl)});`,
+      'builder.SaveFile("docx", `${/[a)b]/.source}`.replace(/"/g, "x") + "https://docs.example.test/file?tok=a\'b\\"c&x=1`$y");',
+    ].join('\n'));
+    expect(() => new Function('builder', 'Api', 'a', 'b', 'c', 'w', 'h', preparedDivisionAndRegex)).not.toThrow();
   });
 
   it('normalizes single-line chained scripts across create, docbuilder edit, and content docbuilder routes', async () => {

@@ -471,9 +471,44 @@ export interface PrepareOnlyOfficeDocBuilderScriptOptions {
 const INPUT_URL_PLACEHOLDER = '{{INPUT_URL}}';
 const INPUT_URL_ARG_RE =
   /^(?:Argument\s*\.\s*(?:inputUrl|_imcodesInputUrl)|Argument\s*\[\s*(?:'inputUrl'|"inputUrl")\s*\])$/;
+const REGEX_PREFIX_KEYWORDS = new Set([
+  'await',
+  'case',
+  'default',
+  'delete',
+  'do',
+  'else',
+  'export',
+  'in',
+  'instanceof',
+  'new',
+  'of',
+  'return',
+  'throw',
+  'typeof',
+  'void',
+  'yield',
+]);
+
+interface JsLexState {
+  canStartRegex: boolean;
+  afterDot: boolean;
+}
 
 function isIdentifierChar(ch: string | undefined): boolean {
   return ch !== undefined && /[A-Za-z0-9_$]/.test(ch);
+}
+
+function isIdentifierStart(ch: string | undefined): boolean {
+  return ch !== undefined && /[A-Za-z_$]/.test(ch);
+}
+
+function isDigit(ch: string | undefined): boolean {
+  return ch !== undefined && /[0-9]/.test(ch);
+}
+
+function isWhitespace(ch: string | undefined): boolean {
+  return ch === ' ' || ch === '\t' || ch === '\r' || ch === '\n';
 }
 
 function escapeJsStringBody(value: string, quote: '"' | "'" | '`'): string {
@@ -532,6 +567,97 @@ function scanBlockComment(src: string, start: number): { text: string; nextIndex
   return { text: src.slice(start, nextIndex), nextIndex };
 }
 
+function scanRegexLiteral(src: string, start: number): { text: string; nextIndex: number } | null {
+  if (src[start] !== '/' || src[start + 1] === '/' || src[start + 1] === '*') {
+    return null;
+  }
+  let i = start + 1;
+  let inCharClass = false;
+
+  while (i < src.length) {
+    const ch = src[i]!;
+    if (ch === '\n' || ch === '\r' || ch === '\u2028' || ch === '\u2029') {
+      return null;
+    }
+    if (ch === '\\') {
+      if (i + 1 >= src.length) {
+        return null;
+      }
+      const escaped = src[i + 1]!;
+      if (escaped === '\n' || escaped === '\r' || escaped === '\u2028' || escaped === '\u2029') {
+        return null;
+      }
+      i += 2;
+      continue;
+    }
+    if (inCharClass) {
+      if (ch === ']') {
+        inCharClass = false;
+      }
+      i += 1;
+      continue;
+    }
+    if (ch === '[') {
+      inCharClass = true;
+      i += 1;
+      continue;
+    }
+    if (ch === '/') {
+      i += 1;
+      while (i < src.length && isIdentifierChar(src[i])) {
+        i += 1;
+      }
+      return { text: src.slice(start, i), nextIndex: i };
+    }
+    i += 1;
+  }
+
+  return null;
+}
+
+function scanNumberLiteral(src: string, start: number): { text: string; nextIndex: number } {
+  let i = start;
+  if (src[i] === '0' && /[xXbBoO]/.test(src[i + 1] ?? '')) {
+    i += 2;
+    while (i < src.length && /[0-9A-Za-z_]/.test(src[i]!)) {
+      i += 1;
+    }
+    if (src[i] === 'n') {
+      i += 1;
+    }
+    return { text: src.slice(start, i), nextIndex: i };
+  }
+
+  if (src[i] === '.') {
+    i += 1;
+    while (i < src.length && /[0-9_]/.test(src[i]!)) {
+      i += 1;
+    }
+  } else {
+    while (i < src.length && /[0-9_]/.test(src[i]!)) {
+      i += 1;
+    }
+    if (src[i] === '.' && isDigit(src[i + 1])) {
+      i += 1;
+      while (i < src.length && /[0-9_]/.test(src[i]!)) {
+        i += 1;
+      }
+    }
+  }
+
+  if ((src[i] === 'e' || src[i] === 'E') && (isDigit(src[i + 1]) || ((src[i + 1] === '+' || src[i + 1] === '-') && isDigit(src[i + 2])))) {
+    i += src[i + 1] === '+' || src[i + 1] === '-' ? 2 : 1;
+    while (i < src.length && /[0-9_]/.test(src[i]!)) {
+      i += 1;
+    }
+  }
+  if (src[i] === 'n') {
+    i += 1;
+  }
+
+  return { text: src.slice(start, i), nextIndex: i };
+}
+
 function scanQuotedLiteral(
   src: string,
   start: number,
@@ -570,51 +696,129 @@ function scanQuotedLiteral(
   return { text: out, nextIndex: i };
 }
 
+function stepJsLexicalToken(
+  src: string,
+  start: number,
+  state: JsLexState,
+  inputUrl: string | undefined,
+): { text: string; nextIndex: number } {
+  const ch = src[start]!;
+
+  if (isWhitespace(ch)) {
+    let i = start + 1;
+    while (i < src.length && isWhitespace(src[i])) {
+      i += 1;
+    }
+    return { text: src.slice(start, i), nextIndex: i };
+  }
+
+  if (ch === '/' && src[start + 1] === '/') {
+    return scanLineComment(src, start);
+  }
+  if (ch === '/' && src[start + 1] === '*') {
+    return scanBlockComment(src, start);
+  }
+
+  if (ch === '"' || ch === "'") {
+    state.canStartRegex = false;
+    state.afterDot = false;
+    return scanQuotedLiteral(src, start, inputUrl);
+  }
+  if (ch === '`') {
+    state.canStartRegex = false;
+    state.afterDot = false;
+    return scanTemplateLiteral(src, start, inputUrl);
+  }
+
+  if (ch === '/' && state.canStartRegex) {
+    const regex = scanRegexLiteral(src, start);
+    if (regex) {
+      state.canStartRegex = false;
+      state.afterDot = false;
+      return regex;
+    }
+  }
+
+  if (ch === '?' && src[start + 1] === '.' && !isDigit(src[start + 2])) {
+    state.canStartRegex = false;
+    state.afterDot = true;
+    return { text: '?.', nextIndex: start + 2 };
+  }
+
+  if (isDigit(ch) || (ch === '.' && isDigit(src[start + 1]))) {
+    state.canStartRegex = false;
+    state.afterDot = false;
+    return scanNumberLiteral(src, start);
+  }
+
+  if (isIdentifierStart(ch)) {
+    let i = start + 1;
+    while (i < src.length && isIdentifierChar(src[i])) {
+      i += 1;
+    }
+    const word = src.slice(start, i);
+    state.canStartRegex = !state.afterDot && REGEX_PREFIX_KEYWORDS.has(word);
+    state.afterDot = false;
+    return { text: word, nextIndex: i };
+  }
+
+  if ((ch === '+' && src[start + 1] === '+') || (ch === '-' && src[start + 1] === '-')) {
+    state.canStartRegex = false;
+    state.afterDot = false;
+    return { text: src.slice(start, start + 2), nextIndex: start + 2 };
+  }
+
+  if (ch === '.') {
+    state.canStartRegex = false;
+    state.afterDot = true;
+    return { text: '.', nextIndex: start + 1 };
+  }
+
+  if (ch === ')' || ch === ']') {
+    state.canStartRegex = false;
+    state.afterDot = false;
+    return { text: ch, nextIndex: start + 1 };
+  }
+
+  state.canStartRegex = true;
+  state.afterDot = false;
+  return { text: ch, nextIndex: start + 1 };
+}
+
 function scanTemplateExpression(
   src: string,
   start: number,
   inputUrl: string | undefined,
 ): { text: string; nextIndex: number } {
+  const state: JsLexState = { canStartRegex: true, afterDot: false };
   let i = start;
   let depth = 1;
   let out = '';
 
   while (i < src.length) {
     const ch = src[i]!;
-    if (ch === '"' || ch === "'") {
-      const lit = scanQuotedLiteral(src, i, inputUrl);
-      out += lit.text;
-      i = lit.nextIndex;
-      continue;
-    }
-    if (ch === '`') {
-      const tpl = scanTemplateLiteral(src, i, inputUrl);
-      out += tpl.text;
-      i = tpl.nextIndex;
-      continue;
-    }
-    if (ch === '/' && src[i + 1] === '/') {
-      const comment = scanLineComment(src, i);
-      out += comment.text;
-      i = comment.nextIndex;
-      continue;
-    }
-    if (ch === '/' && src[i + 1] === '*') {
-      const comment = scanBlockComment(src, i);
-      out += comment.text;
-      i = comment.nextIndex;
-      continue;
-    }
-    out += ch;
-    i += 1;
     if (ch === '{') {
       depth += 1;
-    } else if (ch === '}') {
+      out += ch;
+      state.canStartRegex = true;
+      state.afterDot = false;
+      i += 1;
+      continue;
+    }
+    if (ch === '}') {
       depth -= 1;
+      out += ch;
+      state.canStartRegex = true;
+      state.afterDot = false;
+      i += 1;
       if (depth === 0) {
         return { text: out, nextIndex: i };
       }
+      continue;
     }
+    const token = stepJsLexicalToken(src, i, state, inputUrl);
+    out += token.text;
+    i = token.nextIndex;
   }
 
   return { text: out, nextIndex: i };
@@ -665,36 +869,30 @@ function scanTemplateLiteral(
 }
 
 function findMatchingParen(src: string, openParenIdx: number): number {
+  const state: JsLexState = { canStartRegex: true, afterDot: false };
   let depth = 1;
   let i = openParenIdx + 1;
 
   while (i < src.length) {
     const ch = src[i]!;
-    if (ch === '"' || ch === "'") {
-      i = scanQuotedLiteral(src, i, undefined).nextIndex;
-      continue;
-    }
-    if (ch === '`') {
-      i = scanTemplateLiteral(src, i, undefined).nextIndex;
-      continue;
-    }
-    if (ch === '/' && src[i + 1] === '/') {
-      i = scanLineComment(src, i).nextIndex;
-      continue;
-    }
-    if (ch === '/' && src[i + 1] === '*') {
-      i = scanBlockComment(src, i).nextIndex;
-      continue;
-    }
     if (ch === '(') {
       depth += 1;
-    } else if (ch === ')') {
+      state.canStartRegex = true;
+      state.afterDot = false;
+      i += 1;
+      continue;
+    }
+    if (ch === ')') {
       depth -= 1;
+      state.canStartRegex = false;
+      state.afterDot = false;
       if (depth === 0) {
         return i;
       }
+      i += 1;
+      continue;
     }
-    i += 1;
+    i = stepJsLexicalToken(src, i, state, undefined).nextIndex;
   }
 
   return -1;
@@ -704,43 +902,20 @@ function replaceInputUrlInLiterals(src: string, inputUrl: string | undefined): s
   if (inputUrl === undefined || !src.includes(INPUT_URL_PLACEHOLDER)) {
     return src;
   }
+  const state: JsLexState = { canStartRegex: true, afterDot: false };
   let i = 0;
   let out = '';
   while (i < src.length) {
-    const ch = src[i]!;
-    if (ch === '"' || ch === "'") {
-      const lit = scanQuotedLiteral(src, i, inputUrl);
-      out += lit.text;
-      i = lit.nextIndex;
-      continue;
-    }
-    if (ch === '`') {
-      const tpl = scanTemplateLiteral(src, i, inputUrl);
-      out += tpl.text;
-      i = tpl.nextIndex;
-      continue;
-    }
-    if (ch === '/' && src[i + 1] === '/') {
-      const comment = scanLineComment(src, i);
-      out += comment.text;
-      i = comment.nextIndex;
-      continue;
-    }
-    if (ch === '/' && src[i + 1] === '*') {
-      const comment = scanBlockComment(src, i);
-      out += comment.text;
-      i = comment.nextIndex;
-      continue;
-    }
-    out += ch;
-    i += 1;
+    const token = stepJsLexicalToken(src, i, state, inputUrl);
+    out += token.text;
+    i = token.nextIndex;
   }
   return out;
 }
 
 /**
  * Prepare a DocBuilder JS script for ONLYOFFICE's outer C++ `.docbuilder` line parser:
- * 1. Substitute `{{INPUT_URL}}` inside string/template literals without touching comments.
+ * 1. Substitute `{{INPUT_URL}}` inside string/template literals without touching comments or regexes.
  * 2. Rewrite `builder.OpenFile(Argument.inputUrl|_imcodesInputUrl|Argument['inputUrl']|Argument["inputUrl"])`
  *    into a string literal `builder.OpenFile("<url>")`.
  * 3. Ensure every `builder.(CreateFile|OpenFile|SaveFile|CloseFile)(...)` call stands on its own line.
@@ -751,38 +926,15 @@ export function prepareOnlyOfficeDocBuilderScript(
 ): string {
   const inputUrl = options.inputUrl;
   const builderCallRe = /builder\s*\.\s*(CreateFile|OpenFile|SaveFile|CloseFile)\s*\(/y;
+  const state: JsLexState = { canStartRegex: true, afterDot: false };
   let i = 0;
   let out = '';
 
   while (i < script.length) {
     const ch = script[i]!;
-    if (ch === '"' || ch === "'") {
-      const lit = scanQuotedLiteral(script, i, inputUrl);
-      out += lit.text;
-      i = lit.nextIndex;
-      continue;
-    }
-    if (ch === '`') {
-      const tpl = scanTemplateLiteral(script, i, inputUrl);
-      out += tpl.text;
-      i = tpl.nextIndex;
-      continue;
-    }
-    if (ch === '/' && script[i + 1] === '/') {
-      const comment = scanLineComment(script, i);
-      out += comment.text;
-      i = comment.nextIndex;
-      continue;
-    }
-    if (ch === '/' && script[i + 1] === '*') {
-      const comment = scanBlockComment(script, i);
-      out += comment.text;
-      i = comment.nextIndex;
-      continue;
-    }
-
     if (
       ch === 'b' &&
+      !state.afterDot &&
       (i === 0 || (!isIdentifierChar(script[i - 1]) && script[i - 1] !== '.'))
     ) {
       builderCallRe.lastIndex = i;
@@ -822,6 +974,9 @@ export function prepareOnlyOfficeDocBuilderScript(
           }
           out += callText;
 
+          state.canStartRegex = hasSemicolon;
+          state.afterDot = false;
+
           let afterIdx = stmtEnd;
           while (afterIdx < script.length && (script[afterIdx] === ' ' || script[afterIdx] === '\t')) {
             afterIdx += 1;
@@ -837,8 +992,9 @@ export function prepareOnlyOfficeDocBuilderScript(
       }
     }
 
-    out += ch;
-    i += 1;
+    const token = stepJsLexicalToken(script, i, state, inputUrl);
+    out += token.text;
+    i = token.nextIndex;
   }
 
   return out;
