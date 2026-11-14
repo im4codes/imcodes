@@ -4,6 +4,7 @@ import { SpeechRecognition, type SpeechRecognitionPlugin } from '@capgo/capacito
 
 export type NativeSpeechRecognition = Pick<SpeechRecognitionPlugin, 'available' | 'requestPermissions' | 'start' | 'stop' | 'addListener'> & {
   prewarm?: () => Promise<void>;
+  performHaptic?: () => Promise<void>;
 };
 const StreamingSpeech = registerPlugin<NativeSpeechRecognition>(STREAMING_SPEECH_PLUGIN_NAME);
 /** New shells use multilingual Qwen3-ASR for every locale, without cloud/system ASR.

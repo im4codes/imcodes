@@ -7,6 +7,8 @@ import android.media.AudioRecord;
 import android.media.MediaRecorder;
 import android.media.audiofx.AudioEffect;
 import android.media.audiofx.AutomaticGainControl;
+import android.view.HapticFeedbackConstants;
+import android.view.View;
 import ai.onnxruntime.OrtException;
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
@@ -654,6 +656,25 @@ public class StreamingSpeechPlugin extends Plugin {
             if (discard) session.discard();
             else session.stopIntake();
         }
+    }
+
+    @PluginMethod
+    public void performHaptic(PluginCall call) {
+        if (getBridge() == null || getBridge().getWebView() == null) {
+            call.resolve();
+            return;
+        }
+        View webView = getBridge().getWebView();
+        webView.post(() -> {
+            try {
+                webView.performHapticFeedback(
+                    HapticFeedbackConstants.LONG_PRESS,
+                    HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING
+                );
+            } catch (RuntimeException ignored) {
+            }
+            call.resolve();
+        });
     }
 
     @PluginMethod

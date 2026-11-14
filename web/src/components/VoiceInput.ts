@@ -117,6 +117,10 @@ interface NativeSession {
   aborted: boolean;
   retired: boolean;
   stopStarted: boolean;
+  primed: boolean;
+  deferAudioPause: boolean;
+  captureStarted: boolean;
+  startInvoked: boolean;
   handles: PluginListenerHandle[];
 }
 
@@ -129,6 +133,8 @@ interface PrewarmCacheEntry {
 }
 
 const PREWARM_CACHE_TTL_MS = 15_000;
+/** Longer window used only by synchronous `pointerdown` gesture priming once mic permission was confirmed. */
+const NATIVE_PRIME_CACHE_TTL_MS = 120_000;
 /** Upper bound for quick native capability/permission checks during prewarm and start setup. */
 export const NATIVE_PREWARM_CALL_TIMEOUT_MS = 3_500;
 /** Upper bound for interactive native OS permission requests. */
@@ -205,10 +211,24 @@ let _pendingStop: Promise<void> | null = null;
 let _nativeSession: NativeSession | null = null;
 let _activeOwner: CaptureOwner | null = null;
 let _prewarmCache: PrewarmCacheEntry | null = null;
+let _lastAuthorizedPrewarm: PrewarmCacheEntry | null = null;
 let _prewarmInFlight: { promise: Promise<void>; requestPermission: boolean } | null = null;
 let _onLevel: ((level: number) => void) | null = null;
 let _onError: ((error: string) => void) | null = null;
 let _lastError: string | null = null;
+
+function clearPrewarmCaches(): void {
+  _prewarmCache = null;
+  _lastAuthorizedPrewarm = null;
+}
+
+function setAuthorizedPrewarmEntry(entry: PrewarmCacheEntry): void {
+  if (entry.permissionGranted && entry.available) {
+    _lastAuthorizedPrewarm = entry;
+  } else {
+    _lastAuthorizedPrewarm = null;
+  }
+}
 
 // --- Web Speech API fallback state (desktop & mobile browsers) ---
 let _webSession: WebSession | null = null;
@@ -279,7 +299,7 @@ function stopRecognitionOnceIfOwned(
 
 function reportOwnerError(owner: CaptureOwner | null, error: string): void {
   if (!isOwnerCurrent(owner)) return;
-  _prewarmCache = null;
+  clearPrewarmCaches();
   _lastError = error;
   (owner!.onError ?? _onError)?.(error);
 }
@@ -359,6 +379,7 @@ async function attachSessionListeners(
       // not an append-only delta. Corrections may shorten the unfixed tail.
       // Keep this listener through stop ACK so its final short tail is retained.
       if (typeof text !== 'string' || (!final && session.text === text)) return;
+      session.captureStarted = true;
       if (!_listening && generation === _generation) {
         setOwnerListening(session.owner, true);
       }
@@ -366,15 +387,44 @@ async function attachSessionListeners(
       session.final = final;
       emitOwnerResult(session.owner, text, final);
     }],
-    // Audio level listener (emitted from native at ~15-20fps; ignore after stop advances generation)
+    // Audio level listener (emitted from native at ~15-20fps; ignore while primed or after stop advances generation)
     ['audioLevel', (data: any) => {
-      if (!isSessionLive() || generation !== _generation) return;
+      if (!isSessionLive() || session.primed || generation !== _generation) return;
       _onLevel?.(data.level ?? 0);
     }],
     ['listeningState', (data: { status?: string }) => {
       if (!isSessionLive() || generation !== _generation) return;
       if (data.status === 'started') {
+        session.captureStarted = true;
         setOwnerListening(session.owner, true);
+        return;
+      }
+      if (session.primed) {
+        const hadCapture = session.captureStarted || session.text !== null;
+        const bufferedText = session.text;
+        session.retired = true;
+        if (_nativeSession === session) _nativeSession = null;
+        if (_pendingStart?.session === session) _pendingStart = null;
+        void cleanupSessionListeners(session);
+        _generation++;
+        if (hadCapture) {
+          _primedOutcome = {
+            generation: _generation,
+            error: null,
+            text: bufferedText,
+            endedWithCapture: true,
+          };
+        } else {
+          clearPrewarmCaches();
+          _primedOutcome = {
+            generation: _generation,
+            error: _lastError ?? 'Speech recognition stopped before capture started',
+            text: null,
+            endedWithCapture: false,
+          };
+        }
+        setOwnerListening(session.owner, false);
+        retireOwner(session.owner);
         return;
       }
       // Serialize cleanup with the next start; a late stopped event from this
@@ -387,6 +437,27 @@ async function attachSessionListeners(
         ? data.message.trim()
         : 'Speech recognition error';
       console.warn('[voice] recognitionError:', message);
+      if (session.primed) {
+        clearPrewarmCaches();
+        session.retired = true;
+        if (session.startInvoked && !session.stopStarted) {
+          session.stopStarted = true;
+          void session.recognition.stop().catch(() => {});
+        }
+        if (_nativeSession === session) _nativeSession = null;
+        if (_pendingStart?.session === session) _pendingStart = null;
+        void cleanupSessionListeners(session);
+        _generation++;
+        _primedOutcome = {
+          generation: _generation,
+          error: message,
+          text: null,
+          endedWithCapture: false,
+        };
+        setOwnerListening(session.owner, false);
+        retireOwner(session.owner);
+        return;
+      }
       reportOwnerError(session.owner, message);
       void stopListening();
     }],
@@ -495,6 +566,20 @@ function getFreshPrewarmCache(primary: NativeSpeechRecognition): PrewarmCacheEnt
   return _prewarmCache;
 }
 
+function getPrimeReadyPrewarmCache(primary: NativeSpeechRecognition): PrewarmCacheEntry | null {
+  if (!_lastAuthorizedPrewarm) return null;
+  if (
+    _lastAuthorizedPrewarm.primary !== primary
+    || !_lastAuthorizedPrewarm.permissionGranted
+    || !_lastAuthorizedPrewarm.available
+    || Date.now() - _lastAuthorizedPrewarm.checkedAt > NATIVE_PRIME_CACHE_TTL_MS
+  ) {
+    _lastAuthorizedPrewarm = null;
+    return null;
+  }
+  return _lastAuthorizedPrewarm;
+}
+
 /** Pre-warm native speech permissions and recognizer availability so hold-to-talk
  * starts without an extra IPC permission/availability roundtrip on finger down.
  * Idempotent and deduplicated across concurrent callers; never throws. */
@@ -541,6 +626,9 @@ export async function prewarm(options?: { requestPermission?: boolean }): Promis
           'Permission check timed out',
         ).catch(() => ({ speechRecognition: undefined }));
         permissionGranted = checked?.speechRecognition === 'granted';
+        if (!permissionGranted) {
+          _lastAuthorizedPrewarm = null;
+        }
       }
 
       if (!permissionGranted && requestPermission) {
@@ -551,7 +639,7 @@ export async function prewarm(options?: { requestPermission?: boolean }): Promis
         ).catch(() => ({ speechRecognition: 'denied' }));
         permissionGranted = perms?.speechRecognition === 'granted';
         if (!permissionGranted) {
-          _prewarmCache = null;
+          clearPrewarmCaches();
           return;
         }
       }
@@ -570,19 +658,21 @@ export async function prewarm(options?: { requestPermission?: boolean }): Promis
       }
 
       if (!effective) {
-        _prewarmCache = null;
+        clearPrewarmCaches();
         return;
       }
 
-      _prewarmCache = {
+      const entry: PrewarmCacheEntry = {
         primary: recognition,
         effective,
         checkedAt: Date.now(),
         permissionGranted,
         available: true,
       };
+      _prewarmCache = entry;
+      setAuthorizedPrewarmEntry(entry);
     } catch {
-      _prewarmCache = null;
+      clearPrewarmCaches();
     }
   })();
 
@@ -599,6 +689,7 @@ export async function prewarm(options?: { requestPermission?: boolean }): Promis
 
 async function startListeningInternal(session: NativeSession): Promise<boolean> {
   const { generation } = session;
+  const primaryRecognition = session.recognition;
   let recognition = session.recognition;
   _lastError = null;
 
@@ -619,109 +710,147 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
   _nativeSession = session;
 
   try {
-    // Only wait on an active in-flight prewarm (to avoid duplicate OS permission prompts);
-    // never let a slow passive prewarm block an immediate mic press.
-    if (!getFreshPrewarmCache(recognition) && _prewarmInFlight?.requestPermission) {
-      await withTimeout(
-        _prewarmInFlight.promise,
-        NATIVE_PREWARM_CALL_TIMEOUT_MS,
-        'Speech prewarm timed out',
-      ).catch(() => {});
-      if (!isSessionStarting()) {
-        await cleanupSessionListeners(session);
-        if (_nativeSession === session) _nativeSession = null;
-        return false;
-      }
-    }
-
     let attached = false;
-    const prewarmed = getFreshPrewarmCache(recognition);
-    if (prewarmed && prewarmed.permissionGranted && prewarmed.available) {
-      recognition = prewarmed.effective;
-      session.recognition = prewarmed.effective;
+    if (session.primed) {
+      const primeReady = getPrimeReadyPrewarmCache(primaryRecognition);
+      if (!primeReady) {
+        session.retired = true;
+        if (_nativeSession === session) _nativeSession = null;
+        retireOwner(session.owner);
+        return false;
+      }
+      recognition = primeReady.effective;
+      session.recognition = primeReady.effective;
       attached = await attachSessionListeners(recognition, session);
-    } else if (prewarmed && prewarmed.available) {
-      recognition = prewarmed.effective;
-      session.recognition = prewarmed.effective;
-      const listenerPromise = attachSessionListeners(recognition, session);
-      listenerPromise.catch(() => {});
-      const perms = await withTimeout(
-        recognition.requestPermissions(),
-        NATIVE_PERMISSION_TIMEOUT_MS,
-        'Speech permission timed out',
-      );
-      if (!isSessionStarting()) {
-        session.retired = true;
-        await cleanupSessionListeners(session);
-        if (_nativeSession === session) _nativeSession = null;
-        return false;
-      }
-      if (perms.speechRecognition !== 'granted') {
-        console.warn('[voice] microphone permission denied');
-        reportOwnerError(session.owner, 'permission_denied');
-        session.retired = true;
-        await cleanupSessionListeners(session);
-        if (_nativeSession === session) _nativeSession = null;
-        retireOwner(session.owner);
-        return false;
-      }
-      prewarmed.permissionGranted = true;
-      attached = await listenerPromise;
     } else {
-      let keepPrimaryListeners = true;
-      const listenerPromise = attachSessionListeners(recognition, session, () => keepPrimaryListeners);
-      listenerPromise.catch(() => {});
-      const [perms, available] = await Promise.all([
-        withTimeout(
-          recognition.requestPermissions(),
-          NATIVE_PERMISSION_TIMEOUT_MS,
-          'Speech permission timed out',
-        ),
-        withTimeout(
-          recognition.available(),
+      // Only wait on an active in-flight prewarm (to avoid duplicate OS permission prompts);
+      // never let a slow passive prewarm block an immediate mic press.
+      if (!getFreshPrewarmCache(recognition) && _prewarmInFlight?.requestPermission) {
+        await withTimeout(
+          _prewarmInFlight.promise,
           NATIVE_PREWARM_CALL_TIMEOUT_MS,
-          'Speech availability check timed out',
-        ).catch(() => ({ available: false })),
-      ]);
-      if (!isSessionStarting()) {
-        session.retired = true;
-        await cleanupSessionListeners(session);
-        if (_nativeSession === session) _nativeSession = null;
-        return false;
-      }
-      if (perms.speechRecognition !== 'granted') {
-        console.warn('[voice] microphone permission denied');
-        reportOwnerError(session.owner, 'permission_denied');
-        session.retired = true;
-        await cleanupSessionListeners(session);
-        if (_nativeSession === session) _nativeSession = null;
-        retireOwner(session.owner);
-        return false;
-      }
-      if (!available?.available) {
-        keepPrimaryListeners = false;
-        await cleanupSessionListeners(session);
-        const fallback = await resolveUsableFallbackRecognizer(recognition);
+          'Speech prewarm timed out',
+        ).catch(() => {});
         if (!isSessionStarting()) {
           await cleanupSessionListeners(session);
           if (_nativeSession === session) _nativeSession = null;
           return false;
         }
-        if (fallback) {
-          console.warn('[voice] custom offline speech unavailable, falling back to platform recognizer');
-          recognition = fallback;
-          session.recognition = fallback;
-          attached = await attachSessionListeners(recognition, session);
-        } else {
-          console.warn('[voice] speech recognition unavailable');
-          reportOwnerError(session.owner, 'Offline speech model unavailable');
+      }
+
+      const prewarmed = getFreshPrewarmCache(recognition);
+      if (prewarmed && prewarmed.permissionGranted && prewarmed.available) {
+        recognition = prewarmed.effective;
+        session.recognition = prewarmed.effective;
+        attached = await attachSessionListeners(recognition, session);
+      } else if (prewarmed && prewarmed.available) {
+        recognition = prewarmed.effective;
+        session.recognition = prewarmed.effective;
+        const listenerPromise = attachSessionListeners(recognition, session);
+        listenerPromise.catch(() => {});
+        const perms = await withTimeout(
+          recognition.requestPermissions(),
+          NATIVE_PERMISSION_TIMEOUT_MS,
+          'Speech permission timed out',
+        );
+        if (!isSessionStarting()) {
           session.retired = true;
+          await cleanupSessionListeners(session);
+          if (_nativeSession === session) _nativeSession = null;
+          return false;
+        }
+        if (perms.speechRecognition !== 'granted') {
+          console.warn('[voice] microphone permission denied');
+          reportOwnerError(session.owner, 'permission_denied');
+          session.retired = true;
+          await cleanupSessionListeners(session);
           if (_nativeSession === session) _nativeSession = null;
           retireOwner(session.owner);
           return false;
         }
-      } else {
+        prewarmed.permissionGranted = true;
+        setAuthorizedPrewarmEntry({
+          primary: primaryRecognition,
+          effective: recognition,
+          checkedAt: Date.now(),
+          permissionGranted: true,
+          available: true,
+        });
         attached = await listenerPromise;
+      } else {
+        let keepPrimaryListeners = true;
+        const listenerPromise = attachSessionListeners(recognition, session, () => keepPrimaryListeners);
+        listenerPromise.catch(() => {});
+        const [perms, available] = await Promise.all([
+          withTimeout(
+            recognition.requestPermissions(),
+            NATIVE_PERMISSION_TIMEOUT_MS,
+            'Speech permission timed out',
+          ),
+          withTimeout(
+            recognition.available(),
+            NATIVE_PREWARM_CALL_TIMEOUT_MS,
+            'Speech availability check timed out',
+          ).catch(() => ({ available: false })),
+        ]);
+        if (!isSessionStarting()) {
+          session.retired = true;
+          await cleanupSessionListeners(session);
+          if (_nativeSession === session) _nativeSession = null;
+          return false;
+        }
+        if (perms.speechRecognition !== 'granted') {
+          console.warn('[voice] microphone permission denied');
+          reportOwnerError(session.owner, 'permission_denied');
+          session.retired = true;
+          await cleanupSessionListeners(session);
+          if (_nativeSession === session) _nativeSession = null;
+          retireOwner(session.owner);
+          return false;
+        }
+        if (!available?.available) {
+          keepPrimaryListeners = false;
+          await cleanupSessionListeners(session);
+          const fallback = await resolveUsableFallbackRecognizer(recognition);
+          if (!isSessionStarting()) {
+            await cleanupSessionListeners(session);
+            if (_nativeSession === session) _nativeSession = null;
+            return false;
+          }
+          if (fallback) {
+            console.warn('[voice] custom offline speech unavailable, falling back to platform recognizer');
+            recognition = fallback;
+            session.recognition = fallback;
+            attached = await attachSessionListeners(recognition, session);
+            if (attached) {
+              setAuthorizedPrewarmEntry({
+                primary: primaryRecognition,
+                effective: fallback,
+                checkedAt: Date.now(),
+                permissionGranted: true,
+                available: true,
+              });
+            }
+          } else {
+            console.warn('[voice] speech recognition unavailable');
+            reportOwnerError(session.owner, 'Offline speech model unavailable');
+            session.retired = true;
+            if (_nativeSession === session) _nativeSession = null;
+            retireOwner(session.owner);
+            return false;
+          }
+        } else {
+          attached = await listenerPromise;
+          if (attached) {
+            setAuthorizedPrewarmEntry({
+              primary: primaryRecognition,
+              effective: recognition,
+              checkedAt: Date.now(),
+              permissionGranted: true,
+              available: true,
+            });
+          }
+        }
       }
     }
 
@@ -738,7 +867,11 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
       popup: false,
       addPunctuation: true,
     };
-    pauseBackgroundAudio();
+    if (!session.primed || !session.deferAudioPause) {
+      session.deferAudioPause = false;
+      pauseBackgroundAudio();
+    }
+    session.startInvoked = true;
     try {
       await withTimeout(
         recognition.start({ ...startOpts }),
@@ -752,7 +885,7 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
         if (_nativeSession === session) _nativeSession = null;
         return false;
       }
-      _prewarmCache = null;
+      clearPrewarmCaches();
       if (startErr instanceof VoiceTimeoutError) {
         stopRecognitionOnceIfOwned(session, recognition);
       }
@@ -801,6 +934,11 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
       return false;
     }
 
+    session.captureStarted = true;
+    if (!session.primed && session.deferAudioPause) {
+      session.deferAudioPause = false;
+      pauseBackgroundAudio();
+    }
     setOwnerListening(session.owner, true);
     return true;
   } catch (err) {
@@ -810,7 +948,14 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
     }
     if (isSessionStarting()) {
       const msg = err instanceof Error ? err.message : String(err ?? 'Failed to start speech recognition');
-      reportOwnerError(session.owner, /permission|denied|not allowed/i.test(msg) ? 'permission_denied' : msg);
+      const mapped = /permission|denied|not allowed/i.test(msg) ? 'permission_denied' : msg;
+      if (session.primed) {
+        clearPrewarmCaches();
+        _generation++;
+        _primedOutcome = { generation: _generation, error: mapped, text: null, endedWithCapture: false };
+      } else {
+        reportOwnerError(session.owner, mapped);
+      }
       setOwnerListening(session.owner, false);
       retireOwner(session.owner);
     }
@@ -1158,6 +1303,117 @@ export function cancelWebGesturePrime(): void {
   }
 }
 
+function primeNativeGesture(options?: { deferAudioPause?: boolean }): boolean {
+  if (!isNative() || !isAvailable()) return false;
+  if (_pendingStop) return false;
+  if (_nativeSession && !_nativeSession.retired && !_nativeSession.aborted) {
+    return _nativeSession.primed;
+  }
+  if (_listening || _pendingStart) return false;
+  let primary: NativeSpeechRecognition;
+  try {
+    primary = getNativeSpeechRecognition();
+  } catch {
+    return false;
+  }
+  // Never prompt for OS permissions synchronously on finger down; only prime when ready.
+  const cached = getPrimeReadyPrewarmCache(primary);
+  if (!cached) return false;
+
+  _primedOutcome = null;
+  const noop = () => {};
+  const primedOwner = createCaptureOwner(noop, noop, noop);
+  claimActiveOwner(primedOwner);
+  const generation = ++_generation;
+  const session: NativeSession = {
+    generation,
+    owner: primedOwner,
+    recognition: cached.effective,
+    text: null,
+    final: false,
+    aborted: false,
+    retired: false,
+    stopStarted: false,
+    primed: true,
+    deferAudioPause: options?.deferAudioPause === true,
+    captureStarted: false,
+    startInvoked: false,
+    handles: [],
+  };
+  const startPromise = startListeningInternal(session);
+  const entry = { promise: startPromise, generation, session };
+  _pendingStart = entry;
+  void startPromise.finally(() => {
+    if (_pendingStart === entry) {
+      _pendingStart = null;
+    }
+  });
+  return true;
+}
+
+function cancelNativeGesturePrime(): void {
+  _primedOutcome = null;
+  const pendingEntry = _pendingStart;
+  const session =
+    (_nativeSession?.primed ? _nativeSession : null)
+    ?? (pendingEntry?.session.primed ? pendingEntry.session : null);
+  if (!session || !session.primed) return;
+  const startPromise = pendingEntry?.session === session ? pendingEntry.promise : null;
+  if (pendingEntry?.session === session) {
+    _pendingStart = null;
+  }
+  const shouldStopNative = !!(session.startInvoked && !session.stopStarted);
+  void beginNativeSessionAbort(session, startPromise, shouldStopNative);
+}
+
+/**
+ * Synchronously start/unlock speech capture inside a direct `pointerdown` user
+ * gesture (Web Speech API on browsers; cached-permission Capacitor bridge on native)
+ * so hold-to-talk captures the first syllable immediately with zero timer delay.
+ * Caller adopts via `startListening()` or aborts silently via `cancelVoiceGesturePrime()`.
+ */
+export function primeVoiceGesture(options?: { deferAudioPause?: boolean }): boolean {
+  if (!isAvailable()) return false;
+  return isNative() ? primeNativeGesture(options) : primeWebGesture(options);
+}
+
+/** Silently abort an un-adopted Web or native gesture prime (e.g. short tap / scroll). */
+export function cancelVoiceGesturePrime(): void {
+  if (isNative()) {
+    cancelNativeGesturePrime();
+    return;
+  }
+  cancelWebGesturePrime();
+}
+
+/**
+ * Trigger short tactile hold confirmation: native Android WebView HapticFeedback when
+ * running on Android native shell (works even when navigator.vibrate is blocked/silent),
+ * falling back cleanly to `navigator.vibrate`. Never throws.
+ */
+export async function triggerHapticFeedback(durationMs = 20): Promise<void> {
+  if (isNative()) {
+    try {
+      const cap = (globalThis as { Capacitor?: { getPlatform?: () => string } }).Capacitor;
+      const platform = cap?.getPlatform?.();
+      if (platform !== 'ios') {
+        const recognition = getNativeSpeechRecognition();
+        if (typeof recognition.performHaptic === 'function') {
+          await recognition.performHaptic();
+          return;
+        }
+      }
+    } catch {
+      // Fall back to navigator.vibrate below.
+    }
+  }
+  try {
+    globalThis.navigator?.vibrate?.(durationMs);
+  } catch {
+    /* ignore */
+  }
+}
+
 /** Silent cleanup delay in case a browser speech engine omits `onend` after `stop()`.
  * Never emits a timeout error and never cuts off active recording. */
 export const WEB_FINAL_DRAIN_MS = 10_000;
@@ -1166,6 +1422,103 @@ export const NATIVE_ABORT_DRAIN_MS = 1_500;
 
 export interface StopListeningOptions {
   abort?: boolean;
+}
+
+function beginNativeSessionAbort(
+  session: NativeSession | null,
+  startPromise: Promise<boolean> | null,
+  shouldStopNative: boolean,
+): Promise<void> {
+  const priorPendingStop = _pendingStop;
+  const owner = session?.owner ?? _activeOwner;
+  if (session) {
+    session.aborted = true;
+    session.retired = true;
+    if (shouldStopNative) {
+      session.stopStarted = true;
+    }
+    if (_nativeSession === session) {
+      _nativeSession = null;
+    }
+  }
+  _generation++;
+  setOwnerListening(owner, false);
+  retireOwner(owner);
+
+  // Detach listener handles immediately in parallel so a hung prior stop/start/stop
+  // cannot leave old native listeners attached across an abort timeout.
+  const detachPromise = cleanupSessionListeners(session).catch(() => {});
+  const stopCallPromise = shouldStopNative && session
+    ? session.recognition.stop().catch((err) => {
+        console.warn('[voice] abort stop failed:', err);
+      })
+    : Promise.resolve();
+  const priorStopWait = priorPendingStop ? priorPendingStop.catch(() => {}) : Promise.resolve();
+  const startWait = startPromise ? startPromise.catch(() => false) : Promise.resolve();
+  const cleanupAndStop = Promise.all([
+    detachPromise,
+    stopCallPromise,
+    priorStopWait,
+    startWait,
+  ]).then(() => {});
+
+  let abortTimer: ReturnType<typeof setTimeout> | null = null;
+  const boundedAbort = (async () => {
+    try {
+      await Promise.race([
+        cleanupAndStop,
+        new Promise<void>((resolve) => {
+          abortTimer = setTimeout(() => {
+            abortTimer = null;
+            console.warn('[voice] native abort drain timed out; releasing session');
+            resolve();
+          }, NATIVE_ABORT_DRAIN_MS);
+        }),
+      ]);
+    } finally {
+      if (abortTimer !== null) {
+        clearTimeout(abortTimer);
+        abortTimer = null;
+      }
+      if (session && _nativeSession === session) _nativeSession = null;
+    }
+  })();
+
+  _pendingStop = boundedAbort;
+  void boundedAbort.finally(() => {
+    if (_pendingStop === boundedAbort) {
+      _pendingStop = null;
+    }
+  });
+  return boundedAbort;
+}
+
+function consumePrimedOutcome(
+  onResult: (text: string, isFinal: boolean) => void,
+  onListeningChange?: (listening: boolean) => void,
+  onError?: (error: string) => void,
+): { handled: true; started: boolean } | { handled: false } {
+  if (!_primedOutcome) return { handled: false };
+  const outcome = _primedOutcome;
+  _primedOutcome = null;
+  if (outcome.error !== null) {
+    clearPrewarmCaches();
+    _lastError = outcome.error;
+    (onError ?? _onError)?.(outcome.error);
+    return { handled: true, started: false };
+  }
+  if (outcome.endedWithCapture) {
+    const owner = createCaptureOwner(onResult, onListeningChange, onError);
+    claimActiveOwner(owner);
+    setOwnerListening(owner, true);
+    if (outcome.text) {
+      emitOwnerResult(owner, outcome.text, true);
+    }
+    setOwnerListening(owner, false);
+    retireOwner(owner);
+    return { handled: true, started: true };
+  }
+  return { handled: false };
 }
 
 function stopWebListening(abort = false): Promise<void> {
@@ -1262,26 +1615,9 @@ export async function startListening(
       await _pendingStop;
       if (startIntent < _lastStopIntent) return false;
     }
-    if (_primedOutcome) {
-      const outcome = _primedOutcome;
-      _primedOutcome = null;
-      if (outcome.error !== null) {
-        _prewarmCache = null;
-        _lastError = outcome.error;
-        (onError ?? _onError)?.(outcome.error);
-        return false;
-      }
-      if (outcome.endedWithCapture) {
-        const owner = createCaptureOwner(onResult, onListeningChange, onError);
-        claimActiveOwner(owner);
-        setOwnerListening(owner, true);
-        if (outcome.text) {
-          emitOwnerResult(owner, outcome.text, true);
-        }
-        setOwnerListening(owner, false);
-        retireOwner(owner);
-        return true;
-      }
+    const primedOutcome = consumePrimedOutcome(onResult, onListeningChange, onError);
+    if (primedOutcome.handled) {
+      return primedOutcome.started;
     }
     const owner = createCaptureOwner(onResult, onListeningChange, onError);
     claimActiveOwner(owner);
@@ -1318,8 +1654,41 @@ export async function startListening(
     if (startIntent < _lastStopIntent) return false;
   }
 
+  const primedOutcome = consumePrimedOutcome(onResult, onListeningChange, onError);
+  if (primedOutcome.handled) {
+    return primedOutcome.started;
+  }
+
   const owner = createCaptureOwner(onResult, onListeningChange, onError);
   claimActiveOwner(owner);
+
+  const adoptable =
+    (_pendingStart && _pendingStart.generation === _generation && !_pendingStart.session.retired && !_pendingStart.session.aborted
+      ? _pendingStart.session
+      : null)
+    ?? (_nativeSession && !_nativeSession.retired && !_nativeSession.aborted && _nativeSession.generation === _generation
+      ? _nativeSession
+      : null);
+
+  if (adoptable && (adoptable.primed || _listening || _pendingStart?.session === adoptable)) {
+    const wasPrimed = adoptable.primed;
+    adoptable.primed = false;
+    adoptable.owner = owner;
+    if (wasPrimed && adoptable.deferAudioPause && adoptable.startInvoked) {
+      adoptable.deferAudioPause = false;
+      pauseBackgroundAudio();
+    }
+    if (_listening || adoptable.captureStarted) {
+      setOwnerListening(owner, true);
+    }
+    if (wasPrimed && adoptable.text !== null) {
+      emitOwnerResult(owner, adoptable.text, adoptable.final);
+    }
+    if (_pendingStart && _pendingStart.session === adoptable) {
+      return _pendingStart.promise;
+    }
+    return true;
+  }
 
   if (_listening) {
     if (_nativeSession && !_nativeSession.retired && !_nativeSession.aborted) {
@@ -1329,11 +1698,7 @@ export async function startListening(
     return true;
   }
 
-  if (_pendingStart && _pendingStart.generation === _generation) {
-    _pendingStart.session.owner = owner;
-    return _pendingStart.promise;
-  }
-
+  _primedOutcome = null;
   const generation = ++_generation;
   const session: NativeSession = {
     generation,
@@ -1344,6 +1709,10 @@ export async function startListening(
     aborted: false,
     retired: false,
     stopStarted: false,
+    primed: false,
+    deferAudioPause: false,
+    captureStarted: false,
+    startInvoked: false,
     handles: [],
   };
   const startPromise = startListeningInternal(session);
@@ -1380,74 +1749,17 @@ export async function stopListening(options?: StopListeningOptions): Promise<voi
   }
 
   if (abort) {
-    const priorPendingStop = _pendingStop;
     const pendingEntry = _pendingStart;
     const startPromise = pendingEntry?.promise ?? null;
     _pendingStart = null;
     const session = _nativeSession ?? pendingEntry?.session ?? null;
-    const owner = session?.owner ?? _activeOwner;
-    const shouldStopNative = !!(session && !session.stopStarted && (_listening || !!startPromise));
-    if (session) {
-      session.aborted = true;
-      session.retired = true;
-      if (shouldStopNative) {
-        session.stopStarted = true;
-      }
-      if (_nativeSession === session) {
-        _nativeSession = null;
-      }
-    }
-    _generation++;
-    setOwnerListening(owner, false);
-    retireOwner(owner);
-
-    // Detach listener handles immediately in parallel so a hung prior stop/start/stop
-    // cannot leave old native listeners attached across an abort timeout.
-    const detachPromise = cleanupSessionListeners(session).catch(() => {});
-    const stopCallPromise = shouldStopNative && session
-      ? session.recognition.stop().catch((err) => {
-          console.warn('[voice] abort stop failed:', err);
-        })
-      : Promise.resolve();
-    const priorStopWait = priorPendingStop ? priorPendingStop.catch(() => {}) : Promise.resolve();
-    const startWait = startPromise ? startPromise.catch(() => false) : Promise.resolve();
-    const cleanupAndStop = Promise.all([
-      detachPromise,
-      stopCallPromise,
-      priorStopWait,
-      startWait,
-    ]).then(() => {});
-
-    let abortTimer: ReturnType<typeof setTimeout> | null = null;
-    const boundedAbort = (async () => {
-      try {
-        await Promise.race([
-          cleanupAndStop,
-          new Promise<void>((resolve) => {
-            abortTimer = setTimeout(() => {
-              abortTimer = null;
-              console.warn('[voice] native abort drain timed out; releasing session');
-              resolve();
-            }, NATIVE_ABORT_DRAIN_MS);
-          }),
-        ]);
-      } finally {
-        if (abortTimer !== null) {
-          clearTimeout(abortTimer);
-          abortTimer = null;
-        }
-        if (session && _nativeSession === session) _nativeSession = null;
-      }
-    })();
-
-    _pendingStop = boundedAbort;
-    try {
-      await boundedAbort;
-    } finally {
-      if (_pendingStop === boundedAbort) {
-        _pendingStop = null;
-      }
-    }
+    const shouldStopNative = !!(
+      session
+      && !session.stopStarted
+      && (!session.primed || session.startInvoked)
+      && (_listening || !!startPromise)
+    );
+    await beginNativeSessionAbort(session, startPromise, shouldStopNative);
     return;
   }
 

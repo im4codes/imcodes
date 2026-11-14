@@ -183,9 +183,9 @@ import { recordPerfRender } from '../perf-render-debug.js';
 export const COMPOSER_HEIGHT_STORAGE_KEY = 'imcodes_composer_height_v1';
 export const ATTACHMENT_BADGE_COLLAPSE_THRESHOLD = 3;
 export const ATTACHMENT_BADGE_COLLAPSED_VISIBLE_COUNT = 2;
-const VOICE_HOLD_TAP_GUARD_MS = 145;
-const VOICE_HOLD_UNFOCUSED_DELAY_MS = 175;
-const VOICE_HOLD_SLIDE_INTENT_MS = 90;
+const VOICE_HOLD_TAP_GUARD_MS = 100;
+const VOICE_HOLD_UNFOCUSED_DELAY_MS = 115;
+const VOICE_HOLD_SLIDE_INTENT_MS = 65;
 const VOICE_HOLD_SLIDE_PROMOTE_PX = 14;
 const VOICE_HOLD_MOVE_SLOP_PX = 18;
 const VOICE_HOLD_SCROLL_ABORT_PX = 40;
@@ -273,15 +273,41 @@ function prewarmVoiceInput(options?: { requestPermission?: boolean }): void {
 }
 
 function primeVoiceInputGesture(options?: { deferAudioPause?: boolean }): boolean {
+  if (Object.prototype.hasOwnProperty.call(VoiceInput, 'primeVoiceGesture')) {
+    const fn = (VoiceInput as { primeVoiceGesture?: (opts?: { deferAudioPause?: boolean }) => boolean }).primeVoiceGesture;
+    if (typeof fn === 'function') return fn(options);
+  }
   if (!Object.prototype.hasOwnProperty.call(VoiceInput, 'primeWebGesture')) return false;
   const fn = (VoiceInput as { primeWebGesture?: (opts?: { deferAudioPause?: boolean }) => boolean }).primeWebGesture;
   return typeof fn === 'function' ? fn(options) : false;
 }
 
 function cancelVoiceInputGesturePrime(): void {
+  if (Object.prototype.hasOwnProperty.call(VoiceInput, 'cancelVoiceGesturePrime')) {
+    const fn = (VoiceInput as { cancelVoiceGesturePrime?: () => void }).cancelVoiceGesturePrime;
+    if (typeof fn === 'function') {
+      fn();
+      return;
+    }
+  }
   if (!Object.prototype.hasOwnProperty.call(VoiceInput, 'cancelWebGesturePrime')) return;
   const fn = (VoiceInput as { cancelWebGesturePrime?: () => void }).cancelWebGesturePrime;
   if (typeof fn === 'function') fn();
+}
+
+function triggerVoiceHoldHaptic(): void {
+  if (Object.prototype.hasOwnProperty.call(VoiceInput, 'triggerHapticFeedback')) {
+    const fn = (VoiceInput as { triggerHapticFeedback?: (ms?: number) => Promise<void> }).triggerHapticFeedback;
+    if (typeof fn === 'function') {
+      void fn(20);
+      return;
+    }
+  }
+  try {
+    navigator.vibrate?.(20);
+  } catch {
+    /* ignore */
+  }
 }
 /**
  * Floor for the shared desktop composer height, matching the three-row resting
@@ -6149,7 +6175,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     applyComposerVoiceTouchLock(divRef.current, true);
     try { divRef.current?.blur(); } catch { /* ignore */ }
     try { window.getSelection()?.removeAllRanges(); } catch { /* ignore */ }
-    try { navigator.vibrate?.(20); } catch { /* ignore */ }
+    triggerVoiceHoldHaptic();
 
     // Defer setPointerCapture until hold actually activates so normal taps and scrolling stay interference-free.
     const captureEl = captureTarget instanceof HTMLElement ? captureTarget : divRef.current;
@@ -6462,8 +6488,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         && Math.abs(dx) >= VOICE_HOLD_SLIDE_PROMOTE_PX
         && Math.abs(dx) > Math.abs(dy) * 1.2;
 
-      // Never start mic capture inside the <=140ms tap protection window;
-      // past 90ms recognize horizontal intent and promote once the tap guard clears.
+      // Never start mic capture inside the <=100ms tap protection window;
+      // past 65ms recognize horizontal intent and promote once the tap guard clears.
       if (hasHorizontalSlideIntent && elapsed >= VOICE_HOLD_TAP_GUARD_MS) {
         if (event.cancelable) event.preventDefault();
         activateComposerVoiceHold(ptr, dx, divRef.current);
@@ -7623,9 +7649,18 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [hasText, isMobileLayout, mobileComposerExpanded, isTransport, serverId, syncMobileComposerMetrics]);
 
   useEffect(() => {
-    if (voiceHoldReady && !composerFocused) {
-      prewarmVoiceInput({ requestPermission: false });
-    }
+    if (!voiceHoldReady || composerFocused) return;
+    prewarmVoiceInput({ requestPermission: false });
+    if (typeof document === 'undefined') return;
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        prewarmVoiceInput({ requestPermission: false });
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
   }, [voiceHoldReady, composerFocused]);
 
   useEffect(() => {

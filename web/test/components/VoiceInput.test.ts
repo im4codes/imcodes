@@ -1902,4 +1902,174 @@ describe('Web Mobile final drain', () => {
     }
   });
 
+  it('primes native gesture on finger down once authorized, defers audio pause, replays buffered partials on adopt, and never prompts inside primeVoiceGesture', async () => {
+    const audioPause = vi.fn();
+    const audio = document.createElement('audio');
+    Object.defineProperty(audio, 'paused', { value: false, configurable: true });
+    audio.pause = audioPause;
+    document.body.appendChild(audio);
+    try {
+      // Uncached/unauthorized state -> primeVoiceGesture refuses synchronously and never prompts permissions
+      expect(VoiceInput.primeVoiceGesture({ deferAudioPause: true })).toBe(false);
+      expect(speechApi.requestPermissions).not.toHaveBeenCalled();
+      expect(speechApi.start).not.toHaveBeenCalled();
+
+      // Passive prewarm confirms granted permission + availability without prompting
+      speechApi.checkPermissions.mockResolvedValueOnce({ speechRecognition: 'granted' });
+      speechApi.available.mockResolvedValueOnce({ available: true });
+      await VoiceInput.prewarm({ requestPermission: false });
+      expect(speechApi.requestPermissions).not.toHaveBeenCalled();
+
+      // Finger down: primeVoiceGesture starts native capture immediately with deferred audio pause
+      const earlyLevels: number[] = [];
+      VoiceInput.onAudioLevel((lvl) => earlyLevels.push(lvl));
+      expect(VoiceInput.primeVoiceGesture({ deferAudioPause: true })).toBe(true);
+      await waitFor(() => expect(speechApi.start).toHaveBeenCalledTimes(1));
+      expect(audioPause).not.toHaveBeenCalled();
+
+      // Early audio level while primed stays suppressed; early first-syllable partial is buffered
+      listeners.audioLevel?.({ level: 0.7 });
+      expect(earlyLevels).toEqual([]);
+      listeners.partialResults?.({ matches: ['你好'], isFinal: false });
+      listeners.listeningState?.({ status: 'started' });
+
+      // Hold threshold clears: startListening adopts without re-calling start/requestPermissions, pauses media, and replays buffered state
+      const results: Array<[string, boolean]> = [];
+      const listeningStates: boolean[] = [];
+      const errors: string[] = [];
+      await expect(VoiceInput.startListening(
+        (txt, fin) => results.push([txt, fin]),
+        (l) => listeningStates.push(l),
+        (e) => errors.push(e),
+      )).resolves.toBe(true);
+
+      expect(speechApi.start).toHaveBeenCalledTimes(1);
+      expect(speechApi.requestPermissions).not.toHaveBeenCalled();
+      expect(audioPause).toHaveBeenCalledTimes(1);
+      expect(listeningStates).toEqual([true]);
+      expect(results).toEqual([['你好', false]]);
+      expect(errors).toEqual([]);
+
+      // Live audio levels and subsequent partials flow once adopted
+      listeners.audioLevel?.({ level: 0.9 });
+      expect(earlyLevels).toEqual([0.9]);
+      listeners.partialResults?.({ matches: ['你好世界'], isFinal: true });
+      expect(results).toEqual([['你好', false], ['你好世界', true]]);
+
+      await VoiceInput.stopListening({ abort: true });
+    } finally {
+      VoiceInput.onAudioLevel(null);
+      audio.remove();
+    }
+  });
+
+  it('cancels primed native short taps cleanly without media pause or errors, skips stop before startInvoked, and serializes Tap1->Hold2', async () => {
+    const audioPause = vi.fn();
+    const audio = document.createElement('audio');
+    Object.defineProperty(audio, 'paused', { value: false, configurable: true });
+    audio.pause = audioPause;
+    document.body.appendChild(audio);
+    try {
+      speechApi.checkPermissions.mockResolvedValueOnce({ speechRecognition: 'granted' });
+      speechApi.available.mockResolvedValueOnce({ available: true });
+      await VoiceInput.prewarm({ requestPermission: false });
+
+      // 1. Tap cancelled BEFORE async addListener completes -> never invokes native start() or stop()
+      const gateListener = deferred<{ remove: () => Promise<void> }>();
+      speechApi.addListener.mockReturnValueOnce(gateListener.promise);
+      expect(VoiceInput.primeVoiceGesture({ deferAudioPause: true })).toBe(true);
+      VoiceInput.cancelVoiceGesturePrime();
+      gateListener.resolve({ remove: async () => {} });
+      await new Promise((r) => setTimeout(r, 0));
+      expect(speechApi.start).not.toHaveBeenCalled();
+      expect(speechApi.stop).not.toHaveBeenCalled();
+      expect(audioPause).not.toHaveBeenCalled();
+
+      // 2. Tap1 starts native capture then releases -> cancelVoiceGesturePrime stops & drains cleanly; immediate Hold2 serializes behind drain
+      const stopDrain1 = deferred<void>();
+      speechApi.stop.mockReturnValueOnce(stopDrain1.promise);
+      expect(VoiceInput.primeVoiceGesture({ deferAudioPause: true })).toBe(true);
+      await waitFor(() => expect(speechApi.start).toHaveBeenCalledTimes(1));
+      VoiceInput.cancelVoiceGesturePrime();
+      listeners.recognitionError?.({ message: 'dying primed tap error' });
+      expect(speechApi.stop).toHaveBeenCalledTimes(1);
+      expect(audioPause).not.toHaveBeenCalled();
+
+      // Recognition error during dying primed tap must NEVER surface to hold error callback
+      const onError = vi.fn();
+      const hold2Results: Array<[string, boolean]> = [];
+      const hold2Promise = VoiceInput.startListening(
+        (t, f) => hold2Results.push([t, f]),
+        undefined,
+        onError,
+      );
+      // Hold2 waits for Tap1 stop drain before starting
+      await Promise.resolve();
+      expect(speechApi.start).toHaveBeenCalledTimes(1);
+
+      stopDrain1.resolve();
+      await expect(hold2Promise).resolves.toBe(true);
+      expect(speechApi.start).toHaveBeenCalledTimes(2);
+      expect(audioPause).toHaveBeenCalledTimes(1);
+      expect(onError).not.toHaveBeenCalled();
+      listeners.partialResults?.({ matches: ['第二段'], isFinal: true });
+      expect(hold2Results).toEqual([['第二段', true]]);
+
+      await VoiceInput.stopListening({ abort: true });
+    } finally {
+      audio.remove();
+    }
+  });
+
+  it('retains 120s authorized prime readiness past 15s prewarm TTL, invalidates on permission revocation, and routes triggerHapticFeedback cleanly', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-11-15T00:00:00Z'));
+      speechApi.checkPermissions.mockResolvedValue({ speechRecognition: 'granted' });
+      speechApi.available.mockResolvedValue({ available: true });
+      await VoiceInput.prewarm({ requestPermission: false });
+
+      // Past 15s prewarm TTL (30s < 120s), finger-down priming still works immediately
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(VoiceInput.primeVoiceGesture({ deferAudioPause: true })).toBe(true);
+      VoiceInput.cancelVoiceGesturePrime();
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Permission revoked in OS settings -> passive prewarm clears authorized prime readiness
+      speechApi.checkPermissions.mockResolvedValueOnce({ speechRecognition: 'denied' });
+      await VoiceInput.prewarm({ requestPermission: false });
+      expect(VoiceInput.primeVoiceGesture({ deferAudioPause: true })).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // Haptics: Android uses plugin performHaptic when available; iOS / fallback uses navigator.vibrate
+    const vibrateSpy = vi.fn(() => true);
+    const origVibrate = navigator.vibrate;
+    Object.defineProperty(navigator, 'vibrate', { value: vibrateSpy, configurable: true });
+    const performHaptic = vi.fn().mockResolvedValue(undefined);
+    (speechApi as any).performHaptic = performHaptic;
+    const origCap = (globalThis as any).Capacitor;
+    try {
+      (globalThis as any).Capacitor = { isNativePlatform: () => true, getPlatform: () => 'android' };
+      await VoiceInput.triggerHapticFeedback(20);
+      expect(performHaptic).toHaveBeenCalledTimes(1);
+      expect(vibrateSpy).not.toHaveBeenCalled();
+
+      performHaptic.mockRejectedValueOnce(new Error('haptic disabled'));
+      await VoiceInput.triggerHapticFeedback(20);
+      expect(vibrateSpy).toHaveBeenCalledWith(20);
+
+      vibrateSpy.mockClear();
+      (globalThis as any).Capacitor = { isNativePlatform: () => true, getPlatform: () => 'ios' };
+      await VoiceInput.triggerHapticFeedback(20);
+      expect(performHaptic).toHaveBeenCalledTimes(2); // skipped on iOS
+      expect(vibrateSpy).toHaveBeenCalledWith(20);
+    } finally {
+      delete (speechApi as any).performHaptic;
+      (globalThis as any).Capacitor = origCap;
+      Object.defineProperty(navigator, 'vibrate', { value: origVibrate, configurable: true });
+    }
+  });
+
 });

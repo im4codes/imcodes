@@ -4,6 +4,22 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render } from '@testing-library/preact';
 
+const nativeListeners: Record<string, (data: any) => void> = {};
+const nativeBridge = vi.hoisted(() => ({
+  available: vi.fn(),
+  checkPermissions: vi.fn(),
+  requestPermissions: vi.fn(),
+  addListener: vi.fn(),
+  start: vi.fn(),
+  stop: vi.fn(),
+  prewarm: vi.fn(),
+  performHaptic: vi.fn(),
+}));
+
+vi.mock('@capacitor/core', () => ({
+  registerPlugin: () => nativeBridge,
+}));
+
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string, opts?: Record<string, unknown>) =>
@@ -691,5 +707,118 @@ describe('Mobile Web Speech real integration (SessionControls + VoiceOverlay + V
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
       text: 'recovered second attempt',
     }));
+  });
+
+  it('integrates real SessionControls + real VoiceInput on Capacitor native: primes at pointerdown, cancels short taps, adopts hold with haptic + buffered first-syllable send, and refreshes prewarm on visibilitychange', async () => {
+    for (const key of Object.keys(nativeListeners)) delete nativeListeners[key];
+    nativeBridge.available.mockReset().mockResolvedValue({ available: true });
+    nativeBridge.checkPermissions.mockReset().mockResolvedValue({ speechRecognition: 'granted' });
+    nativeBridge.requestPermissions.mockReset().mockResolvedValue({ speechRecognition: 'granted' });
+    nativeBridge.start.mockReset().mockResolvedValue(undefined);
+    nativeBridge.stop.mockReset().mockResolvedValue(undefined);
+    nativeBridge.prewarm.mockReset().mockResolvedValue(undefined);
+    nativeBridge.performHaptic.mockReset().mockResolvedValue(undefined);
+    nativeBridge.addListener.mockReset().mockImplementation(async (eventName: string, handler: (data: any) => void) => {
+      nativeListeners[eventName] = handler;
+      return { remove: async () => { if (nativeListeners[eventName] === handler) delete nativeListeners[eventName]; } };
+    });
+
+    const origCap = (globalThis as any).Capacitor;
+    (globalThis as any).Capacitor = {
+      isNativePlatform: () => true,
+      getPlatform: () => 'android',
+      isPluginAvailable: () => true,
+    };
+
+    const audio = document.createElement('audio');
+    const audioPause = vi.fn();
+    Object.defineProperty(audio, 'paused', { value: false, configurable: true });
+    audio.pause = audioPause;
+    document.body.appendChild(audio);
+
+    try {
+      const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+      render(
+        <SessionControls
+          ws={ws}
+          activeSession={makeSession()}
+          quickData={makeQuickData()}
+          sessions={[]}
+          subSessions={[]}
+          serverId="srv-1"
+        />,
+      );
+
+      // Mount triggered passive prewarm without prompting permissions
+      await vi.advanceTimersByTimeAsync(0);
+      expect(nativeBridge.checkPermissions).toHaveBeenCalledTimes(1);
+      expect(nativeBridge.requestPermissions).not.toHaveBeenCalled();
+
+      // visibilitychange to visible after TTL refreshes passive prewarm
+      await vi.advanceTimersByTimeAsync(16_000);
+      Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+      document.dispatchEvent(new Event('visibilitychange'));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(nativeBridge.checkPermissions).toHaveBeenCalledTimes(2);
+
+      const input = document.querySelector('.controls-input') as HTMLElement;
+
+      // 1. Short tap (<100ms): primes at pointerdown, cancels at pointerup cleanly, focuses input without pausing audio
+      fireEvent(input, Object.assign(new Event('pointerdown', { bubbles: true, cancelable: true }), {
+        clientX: 160, clientY: 500, pointerId: 21, button: 0, buttons: 1, pointerType: 'touch', isPrimary: true,
+      }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(nativeBridge.start).toHaveBeenCalledTimes(1);
+      expect(audioPause).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(50);
+      fireEvent(window, Object.assign(new Event('pointerup', { bubbles: true, cancelable: true }), {
+        clientX: 160, clientY: 500, pointerId: 21, button: 0, buttons: 0, pointerType: 'touch', isPrimary: true,
+      }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(nativeBridge.stop).toHaveBeenCalledTimes(1);
+      expect(document.activeElement).toBe(input);
+      expect(input.getAttribute('contenteditable')).toBe('true');
+      expect(audioPause).not.toHaveBeenCalled();
+      expect(nativeBridge.performHaptic).not.toHaveBeenCalled();
+
+      // Blur back to unfocused voice-ready
+      input.blur();
+      fireEvent.blur(input);
+      await vi.advanceTimersByTimeAsync(0);
+
+      // 2. Hold past 115ms: pointerdown starts native capture early -> early first syllable buffered -> 115ms adopts WITHOUT second start(), triggers performHaptic, shows HUD in 'recording' immediately, release sends!
+      fireEvent(input, Object.assign(new Event('pointerdown', { bubbles: true, cancelable: true }), {
+        clientX: 160, clientY: 500, pointerId: 22, button: 0, buttons: 1, pointerType: 'touch', isPrimary: true,
+      }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(nativeBridge.start).toHaveBeenCalledTimes(2);
+      nativeListeners.listeningState?.({ status: 'started' });
+      nativeListeners.partialResults?.({ matches: ['安卓秒录'], isFinal: false });
+
+      await vi.advanceTimersByTimeAsync(115);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(nativeBridge.start).toHaveBeenCalledTimes(2);
+      expect(nativeBridge.performHaptic).toHaveBeenCalledTimes(1);
+      expect(audioPause).toHaveBeenCalledTimes(1);
+
+      const hud = document.querySelector('.voice-hold-hud') as HTMLElement;
+      expect(hud).not.toBeNull();
+      expect(hud.getAttribute('data-phase')).toBe('recording');
+      expect(hud.querySelector('.voice-hold-hud-transcript')?.textContent).toContain('安卓秒录');
+
+      nativeListeners.partialResults?.({ matches: ['安卓秒录完成'], isFinal: true });
+      fireEvent(window, Object.assign(new Event('pointerup', { bubbles: true, cancelable: true }), {
+        clientX: 160, clientY: 500, pointerId: 22, button: 0, buttons: 0, pointerType: 'touch', isPrimary: true,
+      }));
+      await vi.advanceTimersByTimeAsync(300);
+      expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+        text: '安卓秒录完成',
+      }));
+    } finally {
+      audio.remove();
+      (globalThis as any).Capacitor = origCap;
+      Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+    }
   });
 });

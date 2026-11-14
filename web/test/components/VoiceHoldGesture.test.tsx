@@ -225,9 +225,9 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(input.getAttribute('contenteditable')).toBe('true');
     expect(input.style.userSelect).toBe('');
 
-    // Already-focused 140ms mobile tap keeps editable focus & never triggers voice capture.
+    // Already-focused 95ms mobile tap keeps editable focus & never triggers voice capture.
     expect(dispatchPointer(input, 'pointerdown', 180, 500, 2)).toBe(true);
-    await vi.advanceTimersByTimeAsync(140);
+    await vi.advanceTimersByTimeAsync(95);
     dispatchPointer(input, 'pointerup', 180, 500, 2);
     expect(voiceMock.startListening).not.toHaveBeenCalled();
     expect(document.querySelector('.voice-hold-hud')).toBeNull();
@@ -239,9 +239,9 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     fireEvent.blur(input);
     expect(input.getAttribute('contenteditable')).toBe('false');
 
-    // Realistic 140ms mobile single tap on unfocused composer opens typing mode cleanly without false-triggering voice.
+    // Realistic 95ms mobile single tap on unfocused composer opens typing mode cleanly without false-triggering voice.
     expect(dispatchPointer(input, 'pointerdown', 180, 500, 3)).toBe(true);
-    await vi.advanceTimersByTimeAsync(140);
+    await vi.advanceTimersByTimeAsync(95);
     dispatchPointer(input, 'pointerup', 180, 500, 3);
     expect(voiceMock.startListening).not.toHaveBeenCalled();
     expect(document.querySelector('.voice-hold-hud')).toBeNull();
@@ -323,13 +323,13 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(voiceMock.prewarm).toHaveBeenCalledWith({ requestPermission: false });
     dispatchPointer(input, 'pointerdown', 180);
 
-    // Not triggered at 174ms; still pending with selection/callout lock (keeps <=140ms taps safe)
-    await vi.advanceTimersByTimeAsync(174);
+    // Not triggered at 114ms; still pending with selection/callout lock (keeps <=95ms taps safe)
+    await vi.advanceTimersByTimeAsync(114);
     expect(voiceMock.startListening).not.toHaveBeenCalled();
     expect(composer.classList.contains('controls-composer-voice-pending')).toBe(true);
     expect(composer.classList.contains('controls-composer-voice-holding')).toBe(false);
 
-    // Triggers exactly at 175ms (+1ms) on unfocused composer
+    // Triggers exactly at 115ms (+1ms) on unfocused composer
     await vi.advanceTimersByTimeAsync(1);
 
     expect(vibrate).toHaveBeenCalledWith(20);
@@ -1632,9 +1632,10 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     const stylesCss = readFileSync(resolve(webDir, 'src/styles.css'), 'utf8');
 
     const entrySource = `
-      import { render } from 'preact';
+      import { h, render } from 'preact';
+      (globalThis as any).preactH = h;
       import { SessionControls } from './src/components/SessionControls.tsx';
-      const ws = { connected: true, send: () => {}, sendSessionCommand: () => {}, onMessage: () => () => {} };
+      const ws = { connected: true, send: () => {}, sendSessionCommand: (cmd, payload) => { (window.__sentCommands = window.__sentCommands || []).push({ cmd, payload }); }, onMessage: () => () => {} };
       const session = { name: 'deck_main', project: 'main', role: 'main', agentType: 'claude-code-sdk', state: 'idle', runtimeType: 'transport', projectDir: '/tmp/project' };
       const quickData = { data: { history: [], sessionHistory: {}, commands: [], phrases: [] }, loaded: true, recordHistory: () => {}, addCommand: () => {}, addPhrase: () => {}, removeCommand: () => {}, removePhrase: () => {}, removeHistory: () => {}, removeSessionHistory: () => {}, clearHistory: () => {}, clearSessionHistory: () => {} };
       render(<SessionControls ws={ws} activeSession={session} quickData={quickData} sessions={[]} subSessions={[]} serverId="srv-1" />, document.getElementById('app'));
@@ -1661,12 +1662,12 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
             build.onLoad({ filter: /.*/, namespace: 'stub' }, (args) => {
               if (args.path === 'voice-input-stub') {
                 return {
-                  contents: 'export const isAvailable=()=>true;export const prewarm=(o)=>window.__voiceMock.prewarm(o);export const primeWebGesture=(o)=>window.__voiceMock.primeWebGesture?.(o)??false;export const cancelWebGesturePrime=()=>window.__voiceMock.cancelWebGesturePrime?.();export const startListening=(...a)=>window.__voiceMock.startListening(...a);export const stopListening=()=>window.__voiceMock.stopListening();export const onAudioLevel=(cb)=>window.__voiceMock.onAudioLevel(cb);',
+                  contents: 'export const isAvailable=()=>true;export const prewarm=(o)=>window.__voiceMock.prewarm(o);export const primeVoiceGesture=(o)=>window.__voiceMock.primeVoiceGesture?.(o)??window.__voiceMock.primeWebGesture?.(o)??false;export const cancelVoiceGesturePrime=()=>(window.__voiceMock.cancelVoiceGesturePrime??window.__voiceMock.cancelWebGesturePrime)?.();export const triggerHapticFeedback=(m)=>window.__voiceMock.triggerHapticFeedback?.(m)??Promise.resolve();export const primeWebGesture=(o)=>window.__voiceMock.primeWebGesture?.(o)??false;export const cancelWebGesturePrime=()=>window.__voiceMock.cancelWebGesturePrime?.();export const startListening=(...a)=>window.__voiceMock.startListening(...a);export const stopListening=(o)=>window.__voiceMock.stopListening(o);export const onAudioLevel=(cb)=>window.__voiceMock.onAudioLevel(cb);',
                   loader: 'js',
                 };
               }
               if (args.path === 'voice-overlay-stub') {
-                return { contents: 'export const VoiceOverlay = () => null;', loader: 'js' };
+                return { contents: 'export const VoiceOverlay = (p) => p.open ? globalThis.preactH?.("div", { class: "mock-voice-overlay", "data-initial-text": p.initialText ?? "" }) : null;', loader: 'js' };
               }
               return { contents: 'export const useTranslation = () => ({ t: (k) => k, i18n: { language: "en" } });', loader: 'js' };
             });
@@ -1750,9 +1751,28 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
 
       await page.goto('https://imcodes.test/');
       await page.evaluate(() => {
-        (window as any).__voiceCalls = { start: 0, stop: 0, prime: 0, cancelPrime: 0, nextStartResult: true };
+        (window as any).__sentCommands = [];
+        (window as any).__voiceCalls = {
+          start: 0,
+          stop: 0,
+          prime: 0,
+          cancelPrime: 0,
+          haptic: 0,
+          nextStartResult: true,
+          nextBufferedText: '',
+        };
         (window as any).__voiceMock = {
           prewarm: async () => {},
+          primeVoiceGesture: () => {
+            (window as any).__voiceCalls.prime += 1;
+            return true;
+          },
+          cancelVoiceGesturePrime: () => {
+            (window as any).__voiceCalls.cancelPrime += 1;
+          },
+          triggerHapticFeedback: async () => {
+            (window as any).__voiceCalls.haptic += 1;
+          },
           primeWebGesture: () => {
             (window as any).__voiceCalls.prime += 1;
             return true;
@@ -1760,10 +1780,14 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
           cancelWebGesturePrime: () => {
             (window as any).__voiceCalls.cancelPrime += 1;
           },
-          startListening: async (_onResult: unknown, onListeningChange?: (listening: boolean) => void) => {
+          startListening: async (onResult: (text: string, isFinal: boolean) => void, onListeningChange?: (listening: boolean) => void) => {
             (window as any).__voiceCalls.start += 1;
             const ok = !!(window as any).__voiceCalls.nextStartResult;
-            if (ok) onListeningChange?.(true);
+            if (ok) {
+              onListeningChange?.(true);
+              const buffered = (window as any).__voiceCalls.nextBufferedText;
+              if (buffered) onResult?.(buffered, false);
+            }
             return ok;
           },
           stopListening: async () => {
@@ -1811,14 +1835,14 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
         el.blur();
       });
 
-      // 2. Slide-hold (>=95ms move, >145ms promote) whose startListening resolves false MUST still focus composer so real typing succeeds
+      // 2. Slide-hold (>=65ms move, >100ms promote) whose startListening resolves false MUST still focus composer so real typing succeeds
       await page.evaluate(async ({ x, y }) => {
         (window as any).__voiceCalls.nextStartResult = false;
         const el = document.querySelector('.controls-input')!;
         el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: 2, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
-        await new Promise((r) => setTimeout(r, 100));
+        await new Promise((r) => setTimeout(r, 70));
         el.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, cancelable: true, clientX: x + 22, clientY: y + 1, pointerId: 2, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
-        await new Promise((r) => setTimeout(r, 65));
+        await new Promise((r) => setTimeout(r, 45));
         el.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, clientX: x + 22, clientY: y + 1, pointerId: 2, pointerType: 'touch', isPrimary: true, button: 0, buttons: 0 }));
       }, { x: cx, y: cy });
 
@@ -1851,9 +1875,9 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
         (window as any).__voiceCalls.nextStartResult = true;
         const el = document.querySelector('.controls-input')!;
         el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: 3, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
-        await new Promise((r) => setTimeout(r, 100));
+        await new Promise((r) => setTimeout(r, 70));
         el.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, cancelable: true, clientX: x + 20, clientY: y, pointerId: 3, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
-        await new Promise((r) => setTimeout(r, 65));
+        await new Promise((r) => setTimeout(r, 45));
         el.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, cancelable: true, clientX: x - 110, clientY: y, pointerId: 3, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
         el.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, clientX: x - 110, clientY: y, pointerId: 3, pointerType: 'touch', isPrimary: true, button: 0, buttons: 0 }));
         await new Promise((r) => setTimeout(r, 20));
@@ -1948,6 +1972,105 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
       if (dismissResult.hasMicBtn) {
         expect(dismissResult.primesAfterMic).toBe(1);
       }
+
+      // 5. Chromium instant response + pending glow + vertical scroll cancel + rapid Tap1->Tap2->Hold3 + buffered transcript replay + slide-right edit typing
+      const rapidResult = await page.evaluate(async ({ x, y }) => {
+        const el = document.querySelector('.controls-input') as HTMLElement;
+        el.textContent = '';
+        el.blur();
+        await new Promise((r) => setTimeout(r, 20));
+
+        // 5a. Vertical scroll (>40px dy) during pending cancels prime without starting voice or focusing
+        const primes0 = (window as any).__voiceCalls.prime;
+        const cancels0 = (window as any).__voiceCalls.cancelPrime;
+        const starts0 = (window as any).__voiceCalls.start;
+        el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: 10, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
+        await new Promise((r) => setTimeout(r, 25));
+        const pendingStyle = getComputedStyle(el);
+        const pendingTouchAction = pendingStyle.touchAction;
+        const pendingShadow = pendingStyle.boxShadow;
+        el.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, cancelable: true, clientX: x, clientY: y + 60, pointerId: 10, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
+        el.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, clientX: x, clientY: y + 60, pointerId: 10, pointerType: 'touch', isPrimary: true, button: 0, buttons: 0 }));
+        await new Promise((r) => setTimeout(r, 20));
+        const scrollOutcome = {
+          primed: (window as any).__voiceCalls.prime - primes0,
+          cancelled: (window as any).__voiceCalls.cancelPrime - cancels0,
+          starts: (window as any).__voiceCalls.start - starts0,
+          focused: document.activeElement === el,
+          ce: el.getAttribute('contenteditable'),
+          pendingTouchAction,
+          pendingShadow,
+        };
+
+        // 5b. Rapid Tap1 (25ms) -> Tap2 (85ms) -> immediate Hold3 (125ms) with buffered transcript replay & instant HUD backdrop
+        (window as any).__sentCommands = [];
+        const haptic0 = (window as any).__voiceCalls.haptic;
+        for (const [pid, dur] of [[11, 25], [12, 85]] as const) {
+          el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: pid, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
+          await new Promise((r) => setTimeout(r, dur));
+          el.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: pid, pointerType: 'touch', isPrimary: true, button: 0, buttons: 0 }));
+          await new Promise((r) => setTimeout(r, 10));
+          el.blur();
+          await new Promise((r) => setTimeout(r, 10));
+        }
+
+        const startsBeforeHold3 = (window as any).__voiceCalls.start;
+        (window as any).__voiceCalls.nextStartResult = true;
+        (window as any).__voiceCalls.nextBufferedText = '首字秒出';
+        el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: 13, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
+        await new Promise((r) => setTimeout(r, 125));
+        const hud = document.querySelector('.voice-hold-hud') as HTMLElement | null;
+        const hudPhase = hud?.getAttribute('data-phase');
+        const hudTransition = hud ? getComputedStyle(hud).transitionProperty : '';
+        const hudTranscript = hud?.querySelector('.voice-hold-hud-transcript')?.textContent ?? '';
+        window.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: 13, pointerType: 'touch', isPrimary: true, button: 0, buttons: 0 }));
+        await new Promise((r) => setTimeout(r, 340));
+
+        // 5c. Slide right -> edit opens VoiceOverlay with transcript without sending
+        el.textContent = '';
+        el.blur();
+        await new Promise((r) => setTimeout(r, 20));
+        (window as any).__voiceCalls.nextBufferedText = '右滑编辑';
+        el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: 14, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
+        await new Promise((r) => setTimeout(r, 125));
+        window.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, cancelable: true, clientX: x + 75, clientY: y, pointerId: 14, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1 }));
+        await new Promise((r) => setTimeout(r, 20));
+        const editZone = document.querySelector('.voice-hold-hud')?.getAttribute('data-zone');
+        window.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, clientX: x + 75, clientY: y, pointerId: 14, pointerType: 'touch', isPrimary: true, button: 0, buttons: 0 }));
+        await new Promise((r) => setTimeout(r, 40));
+        const overlayEl = document.querySelector('.mock-voice-overlay') as HTMLElement | null;
+
+        return {
+          scrollOutcome,
+          hapticsFired: (window as any).__voiceCalls.haptic - haptic0,
+          startsOnHold3: (window as any).__voiceCalls.start - startsBeforeHold3,
+          hudPhase,
+          hudTransition,
+          hudTranscript,
+          sentCount: (window as any).__sentCommands.length,
+          sentText: (window as any).__sentCommands[0]?.payload?.text ?? '',
+          editZone,
+          overlayInitialText: overlayEl?.getAttribute('data-initial-text') ?? '',
+        };
+      }, { x: cx, y: cy });
+
+      expect(rapidResult.scrollOutcome.primed).toBe(1);
+      expect(rapidResult.scrollOutcome.cancelled).toBe(1);
+      expect(rapidResult.scrollOutcome.starts).toBe(0);
+      expect(rapidResult.scrollOutcome.focused).toBe(false);
+      expect(rapidResult.scrollOutcome.ce).toBe('false');
+      expect(rapidResult.scrollOutcome.pendingTouchAction).toBe('manipulation');
+      expect(rapidResult.scrollOutcome.pendingShadow).not.toBe('none');
+
+      expect(rapidResult.hapticsFired).toBeGreaterThanOrEqual(2);
+      expect(rapidResult.startsOnHold3).toBe(2); // Hold3 + Edit hold
+      expect(rapidResult.hudPhase).toBe('recording');
+      expect(rapidResult.hudTransition).not.toContain('background');
+      expect(rapidResult.hudTranscript).toContain('首字秒出');
+      expect(rapidResult.sentCount).toBe(1);
+      expect(rapidResult.sentText).toBe('首字秒出');
+      expect(rapidResult.editZone).toBe('edit');
+      expect(rapidResult.overlayInitialText).toBe('右滑编辑');
 
       await context.close();
     } finally {
@@ -2100,9 +2223,9 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     dispatchPointer(input, 'pointerup', 110);
     await vi.advanceTimersByTimeAsync(0);
 
-    // 3. Immediately short-tap (<240ms) -> restores contenteditable="true", focuses, and typing works cleanly
+    // 3. Immediately short-tap (<100ms) -> restores contenteditable="true", focuses, and typing works cleanly
     dispatchPointer(input, 'pointerdown', 180);
-    await vi.advanceTimersByTimeAsync(140);
+    await vi.advanceTimersByTimeAsync(90);
     dispatchPointer(input, 'pointerup', 180);
     await vi.advanceTimersByTimeAsync(0);
     expect(input.getAttribute('contenteditable')).toBe('true');
@@ -2148,9 +2271,9 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     dispatchPointer(input, 'pointerup', 180);
     await vi.advanceTimersByTimeAsync(0);
 
-    // While send drain is still running: short tap (<240ms) immediately enters typing mode
+    // While send drain is still running: short tap (<100ms) immediately enters typing mode
     dispatchPointer(input, 'pointerdown', 180);
-    await vi.advanceTimersByTimeAsync(140);
+    await vi.advanceTimersByTimeAsync(90);
     dispatchPointer(input, 'pointerup', 180);
     await vi.advanceTimersByTimeAsync(0);
     expect(input.getAttribute('contenteditable')).toBe('true');
@@ -2201,9 +2324,9 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     dispatchPointer(input, 'pointerup', 180, 500, 2);
     expect(voiceMock.startListening).toHaveBeenCalledTimes(1);
 
-    // Short tap (<240ms) while drain is still active MUST still enter editable focus cleanly
+    // Short tap (<100ms) while drain is still active MUST still enter editable focus cleanly
     dispatchPointer(input, 'pointerdown', 180, 500, 3);
-    await vi.advanceTimersByTimeAsync(140);
+    await vi.advanceTimersByTimeAsync(90);
     dispatchPointer(input, 'pointerup', 180, 500, 3);
     await vi.advanceTimersByTimeAsync(0);
     expect(input.getAttribute('contenteditable')).toBe('true');
@@ -2284,12 +2407,12 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(input.getAttribute('contenteditable')).toBe('false');
 
-    // 5. setPointerCapture failure + swallowed pending pointerup (<240ms) -> new primary tap still enters typing cleanly
+    // 5. setPointerCapture failure + swallowed pending pointerup (<100ms) -> new primary tap still enters typing cleanly
     (input as any).setPointerCapture = () => { throw new Error('capture failed'); };
     dispatchPointer(input, 'pointerdown', 180, 500, 4);
     await vi.advanceTimersByTimeAsync(20); // no pointerup!
     dispatchPointer(input, 'pointerdown', 180, 500, 4);
-    await vi.advanceTimersByTimeAsync(140);
+    await vi.advanceTimersByTimeAsync(90);
     dispatchPointer(input, 'pointerup', 180, 500, 4);
     await vi.advanceTimersByTimeAsync(0);
     expect(input.getAttribute('contenteditable')).toBe('true');
@@ -2318,7 +2441,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     }));
   });
 
-  it('defers setPointerCapture until hold activates, promotes horizontal slide-hold right after 140ms tap-guard (145ms), keeps focused 240ms vs unfocused 175ms distinct, and invokes passive prewarm', async () => {
+  it('defers setPointerCapture until hold activates, promotes horizontal slide-hold right after 95ms tap-guard (100ms), keeps focused native-editable vs unfocused 115ms distinct, and invokes passive prewarm', async () => {
     const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
     render(
       <SessionControls
@@ -2344,15 +2467,15 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(voiceMock.prewarm).toHaveBeenCalledWith({ requestPermission: false });
     expect(setPointerCaptureSpy).not.toHaveBeenCalled();
 
-    // 2. Horizontal slide past 90ms debounce does NOT prematurely fire inside <=140ms single-tap guard; promotes cleanly at 145ms (<175ms) even if setPointerCapture throws
+    // 2. Horizontal slide past 65ms debounce does NOT prematurely fire inside <=95ms single-tap guard; promotes cleanly at 100ms (<115ms) even if setPointerCapture throws
     setPointerCaptureSpy.mockImplementationOnce(() => { throw new Error('unsupported'); });
-    await vi.advanceTimersByTimeAsync(95);
+    await vi.advanceTimersByTimeAsync(70);
     dispatchPointer(input, 'pointermove', 200, 502, 1); // dx = +20, dy = +2
     expect(voiceMock.startListening).not.toHaveBeenCalled();
     expect(setPointerCaptureSpy).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(45); // total 140ms — still guarded
+    await vi.advanceTimersByTimeAsync(25); // total 95ms — still guarded
     expect(voiceMock.startListening).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(5); // total 145ms — slide-intent promotes early (<175ms stationary / <240ms focused)
+    await vi.advanceTimersByTimeAsync(5); // total 100ms — slide-intent promotes early (<115ms stationary / focused untouched)
     expect(setPointerCaptureSpy).toHaveBeenCalledWith(1);
     expect(voiceMock.startListening).toHaveBeenCalledTimes(1);
     expect(document.querySelector('.voice-hold-hud')).not.toBeNull();
@@ -2649,15 +2772,15 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     expect(input.getAttribute('contenteditable')).toBe('false');
     expect(document.activeElement).not.toBe(input);
 
-    // F2: <=140ms taps with thumb drift (dx=14, 15, 18 across 95..140ms) MUST NEVER start voice & MUST focus cleanly without orphaned slide timers
+    // F2: <100ms taps with thumb drift (dx=14, 15, 18 across 70..95ms) MUST NEVER start voice & MUST focus cleanly without orphaned slide timers
     voiceMock.startListening.mockClear();
     for (const [idx, dx] of ([14, 15, 18] as const).entries()) {
       const pid = 40 + idx;
       dispatchPrimaryPointer(input, 'pointerdown', 180, 500, pid, 1);
-      await vi.advanceTimersByTimeAsync(95);
+      await vi.advanceTimersByTimeAsync(70);
       dispatchPrimaryPointer(input, 'pointermove', 180 + dx, 501, pid, 1);
       expect(voiceMock.startListening).not.toHaveBeenCalled();
-      await vi.advanceTimersByTimeAsync(45); // total 140ms — still inside single-tap guard
+      await vi.advanceTimersByTimeAsync(25); // total 95ms — still inside single-tap guard
       expect(voiceMock.startListening).not.toHaveBeenCalled();
       dispatchPrimaryPointer(input, 'pointerup', 180 + dx, 501, pid, 0);
       await vi.advanceTimersByTimeAsync(200); // verify slide timer was cleared and never fires orphaned
