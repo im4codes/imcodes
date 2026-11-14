@@ -5401,13 +5401,14 @@
   },
   "mobile_gesture": {
     "hud": {
-      "title": "2本指ナビゲーション",
+      "title": "ジェスチャー",
       "up": "前のサーバー",
       "down": "次のサーバー",
       "left": "前のセッション",
       "right": "次のセッション",
       "drag_to_threshold": "しきい値までドラッグして切り替え",
       "release_to_switch": "離して切り替え",
+      "release_to_switch_step": "離して切り替え（L{{step}}）",
       "no_target": "他の対象なし"
     }
   }

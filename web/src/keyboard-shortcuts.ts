@@ -657,15 +657,20 @@ export function sortSessionsByTabOrder<T extends { name: string }>(
 export function cycleOrderedId(
   ids: readonly string[],
   currentId: string | null | undefined,
-  direction: -1 | 1,
+  offset: number,
 ): string | null {
   if (ids.length === 0) return null;
+  const step = Number.isFinite(offset) ? Math.trunc(offset) : 0;
+  if (step === 0) return null;
   if (ids.length === 1) return ids[0];
   const idx = currentId ? ids.indexOf(currentId) : -1;
   if (idx === -1) {
-    return direction === 1 ? ids[0] : ids[ids.length - 1];
+    if (step > 0) {
+      return ids[(step - 1) % ids.length];
+    }
+    return ids[((ids.length + step) % ids.length + ids.length) % ids.length];
   }
-  const nextIdx = (idx + direction + ids.length) % ids.length;
+  const nextIdx = ((idx + step) % ids.length + ids.length) % ids.length;
   return ids[nextIdx];
 }
 

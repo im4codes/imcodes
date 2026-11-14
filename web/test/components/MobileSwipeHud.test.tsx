@@ -35,8 +35,25 @@ const HUD_KEYS = [
   'right',
   'drag_to_threshold',
   'release_to_switch',
+  'release_to_switch_step',
   'no_target',
 ] as const;
+
+const makeProgress = (overrides: Partial<MobileNavigationGestureProgress> = {}): MobileNavigationGestureProgress => ({
+  dx: 0,
+  dy: 0,
+  direction: null,
+  action: null,
+  distance: 0,
+  threshold: 56,
+  progress: 0,
+  armed: false,
+  step: 0,
+  maxSteps: 3,
+  horizontalMaxSteps: 3,
+  verticalMaxSteps: 3,
+  ...overrides,
+});
 
 describe('MobileSwipeHud', () => {
   afterEach(async () => {
@@ -56,25 +73,27 @@ describe('MobileSwipeHud', () => {
       await i18n.changeLanguage('en');
     });
 
-    const initial: MobileNavigationGestureProgress = {
+    const initial = makeProgress({
       dx: 0,
       dy: -28,
       direction: 'up',
       action: 'serverPrev',
       distance: 28,
-      threshold: 56,
       progress: 0.5,
       armed: false,
-    };
+      step: 0,
+    });
 
     const view = render(<MobileSwipeHud progress={initial} />);
     const hud = screen.getByTestId('mobile-swipe-hud');
     expect(hud.getAttribute('aria-hidden')).toBe('true');
     expect(hud.getAttribute('data-direction')).toBe('up');
     expect(hud.getAttribute('data-armed')).toBe('false');
+    expect(hud.getAttribute('data-step')).toBe('0');
     expect(screen.getByTestId('mobile-swipe-hud-progress').textContent).toBe('50%');
     expect((screen.getByTestId('mobile-swipe-hud-progress-bar') as HTMLElement).style.width).toBe('50%');
     expect(screen.getByTestId('mobile-swipe-hud-hint').textContent).toBe('Drag past threshold to switch');
+    expect(screen.getByTestId('mobile-swipe-hud-center-badge').textContent).not.toContain('2F');
 
     // All 4 directions are displayed simultaneously
     expect(screen.getByTestId('mobile-swipe-hud-dir-up').textContent).toContain('Previous Server');
@@ -89,43 +108,64 @@ describe('MobileSwipeHud', () => {
     expect(screen.getByTestId('mobile-swipe-hud-dir-left').getAttribute('data-active')).toBe('false');
     expect(screen.getByTestId('mobile-swipe-hud-dir-right').getAttribute('data-active')).toBe('false');
 
-    // Drag past threshold -> armed state updates hint and direction highlight
+    // Drag past threshold -> armed state updates hint, center badge, and direction highlight
     view.rerender(
       <MobileSwipeHud
-        progress={{
+        progress={makeProgress({
           dx: 64,
           dy: 0,
           direction: 'right',
           action: 'tabNext',
           distance: 64,
-          threshold: 56,
           progress: 1,
           armed: true,
-        }}
+          step: 1,
+        })}
       />,
     );
 
     expect(hud.getAttribute('data-direction')).toBe('right');
     expect(hud.getAttribute('data-armed')).toBe('true');
+    expect(hud.getAttribute('data-step')).toBe('1');
+    expect(screen.getByTestId('mobile-swipe-hud-center-badge').textContent).toBe('L1');
     expect(screen.getByTestId('mobile-swipe-hud-progress').textContent).toBe('100%');
     expect((screen.getByTestId('mobile-swipe-hud-progress-bar') as HTMLElement).style.width).toBe('100%');
     expect(screen.getByTestId('mobile-swipe-hud-hint').textContent).toBe('Release to switch');
     expect(screen.getByTestId('mobile-swipe-hud-dir-right').getAttribute('data-active')).toBe('true');
     expect(screen.getByTestId('mobile-swipe-hud-dir-right').getAttribute('data-armed')).toBe('true');
     expect(screen.getByTestId('mobile-swipe-hud-dir-up').getAttribute('data-active')).toBe('false');
+
+    // Step 2 drag shows L2 badge and step hint
+    view.rerender(
+      <MobileSwipeHud
+        progress={makeProgress({
+          dx: 108,
+          dy: 0,
+          direction: 'right',
+          action: 'tabNext',
+          distance: 108,
+          progress: 1,
+          armed: true,
+          step: 2,
+        })}
+      />,
+    );
+    expect(screen.getByTestId('mobile-swipe-hud-center-badge').textContent).toBe('L2');
+    expect(screen.getByTestId('mobile-swipe-hud-hint').textContent).toBe('Release to switch (L2)');
   });
 
-  it('has complete and localized HUD translations across all 7 supported locales', async () => {
-    const activeProgress: MobileNavigationGestureProgress = {
+  it('has complete, localized HUD translations across all 7 locales with zero 2-finger labels', async () => {
+    const activeProgress = makeProgress({
       dx: 0,
       dy: 60,
       direction: 'down',
       action: 'serverNext',
       distance: 60,
-      threshold: 56,
       progress: 1,
       armed: true,
-    };
+      step: 1,
+    });
+    const forbiddenTwoFingerPattern = /2F|2-Finger|2本指|双指|雙指|두\s*손가락|2\s*dedos|двумя\s*пальцами/i;
 
     for (const locale of SUPPORTED_LOCALES) {
       const raw = JSON.parse(
@@ -136,7 +176,9 @@ describe('MobileSwipeHud', () => {
 
       for (const key of HUD_KEYS) {
         expect(typeof hudStrings?.[key], `${locale}.mobile_gesture.hud.${key}`).toBe('string');
-        expect((hudStrings?.[key] as string).trim().length, `${locale}.${key} empty`).toBeGreaterThan(0);
+        const val = hudStrings?.[key] as string;
+        expect(val.trim().length, `${locale}.${key} empty`).toBeGreaterThan(0);
+        expect(val, `${locale}.${key} leaked 2-finger wording`).not.toMatch(forbiddenTwoFingerPattern);
       }
 
       await act(async () => {
@@ -144,6 +186,7 @@ describe('MobileSwipeHud', () => {
       });
       render(<MobileSwipeHud progress={activeProgress} />);
 
+      expect(screen.getByTestId('mobile-swipe-hud').textContent).not.toMatch(forbiddenTwoFingerPattern);
       expect(screen.getByTestId('mobile-swipe-hud-dir-up').textContent).toContain(hudStrings!.up as string);
       expect(screen.getByTestId('mobile-swipe-hud-dir-down').textContent).toContain(hudStrings!.down as string);
       expect(screen.getByTestId('mobile-swipe-hud-dir-left').textContent).toContain(hudStrings!.left as string);
@@ -153,38 +196,48 @@ describe('MobileSwipeHud', () => {
     }
   });
 
-  it('renders resolved server and session target names and dims unavailable null directions', async () => {
+  it('renders multi-level targets, highlights only active selected step, and dims unavailable null directions', async () => {
     await act(async () => {
       await i18n.changeLanguage('en');
     });
 
-    const progress: MobileNavigationGestureProgress = {
+    const progress = makeProgress({
       dx: 0,
-      dy: -60,
+      dy: -115,
       direction: 'up',
       action: 'serverPrev',
-      distance: 60,
-      threshold: 56,
+      distance: 115,
       progress: 1,
       armed: true,
-    };
+      step: 2,
+    });
 
     const view = render(
       <MobileSwipeHud
         progress={progress}
         targets={{
-          up: 'mini-2',
-          down: 'prod-eu-west',
-          left: 'cd',
-          right: 'clawd',
+          up: [
+            { step: 1, id: 's1', label: 'mini-1' },
+            { step: 2, id: 's2', label: 'mini-2' },
+            { step: 3, id: 's3', label: 'mini-3' },
+          ],
+          down: [
+            { step: 1, id: 's4', label: 'prod-1' },
+            { step: 2, id: 's5', label: 'prod-2' },
+          ],
+          left: [{ step: 1, id: 't1', label: 'cd' }],
+          right: [{ step: 1, id: 't2', label: 'clawd' }],
         }}
       />,
     );
 
-    expect(screen.getByTestId('mobile-swipe-hud-dir-target-up').textContent).toBe('mini-2');
-    expect(screen.getByTestId('mobile-swipe-hud-dir-target-down').textContent).toBe('prod-eu-west');
-    expect(screen.getByTestId('mobile-swipe-hud-dir-target-left').textContent).toBe('cd');
-    expect(screen.getByTestId('mobile-swipe-hud-dir-target-right').textContent).toBe('clawd');
+    expect(screen.getByTestId('mobile-swipe-hud-dir-target-up').textContent).toBe('mini-1');
+    expect(screen.getByTestId('mobile-swipe-hud-dir-target-up-2').textContent).toBe('mini-2');
+    expect(screen.getByTestId('mobile-swipe-hud-dir-target-up-3').textContent).toBe('mini-3');
+    expect(screen.getByTestId('mobile-swipe-hud-dir-target-up').getAttribute('data-selected')).toBe('false');
+    expect(screen.getByTestId('mobile-swipe-hud-dir-target-up-2').getAttribute('data-selected')).toBe('true');
+    expect(screen.getByTestId('mobile-swipe-hud-dir-target-up-3').getAttribute('data-selected')).toBe('false');
+    expect(screen.getByTestId('mobile-swipe-hud-dir-target-down').getAttribute('data-selected')).toBe('false');
     expect(screen.getByTestId('mobile-swipe-hud-dir-up').getAttribute('data-available')).toBe('true');
 
     // Unavailable dimension renders localized placeholder + unavailable state
@@ -194,7 +247,7 @@ describe('MobileSwipeHud', () => {
         targets={{
           up: 'mini-2',
           down: 'prod-eu-west',
-          left: null,
+          left: [],
           right: null,
         }}
       />,
@@ -212,29 +265,93 @@ describe('resolveMobileSwipeTargets', () => {
     { id: 'srv-1', name: 'mini-1' },
     { id: 'srv-2', name: 'mini-2' },
     { id: 'srv-3', name: '' },
+    { id: 'srv-4', name: 'mini-4' },
+    { id: 'srv-5', name: 'mini-5' },
+    { id: 'srv-6', name: 'mini-6' },
   ];
   const tabs = [
     { name: 'deck_cd_brain', label: 'cd', project: 'codedeck' },
     { name: 'deck_clawd_brain', label: null, project: 'clawd' },
     { name: 'deck_raw_brain', label: null, project: null },
+    { name: 'deck_four_brain', label: 'four', project: null },
+    { name: 'deck_five_brain', label: 'five', project: null },
   ];
 
-  it('cycles servers and sessions matching app navigation rules and naming fallbacks', () => {
-    expect(
-      resolveMobileSwipeTargets({
-        servers,
-        currentServerId: 'srv-2',
-        tabs,
-        activeSession: 'deck_cd_brain',
-        selectedServerId: 'srv-2',
-        manualDashboard: false,
-      }),
-    ).toEqual({
-      up: 'mini-1',
-      down: 'srv-3', // falls back to srv.id when name is empty
-      left: 'deck_raw_brain', // wraps around and falls back to session.name
-      right: 'clawd', // falls back to session.project
+  it('resolves 3 horizontal steps and 3/4/5 vertical steps without duplicating targets or wrapping onto self', () => {
+    const res3 = resolveMobileSwipeTargets({
+      servers,
+      currentServerId: 'srv-2',
+      tabs,
+      activeSession: 'deck_cd_brain',
+      selectedServerId: 'srv-2',
+      manualDashboard: false,
+      verticalMaxSteps: 3,
+      horizontalMaxSteps: 3,
     });
+    expect(res3.up).toEqual([
+      { step: 1, id: 'srv-1', label: 'mini-1' },
+      { step: 2, id: 'srv-6', label: 'mini-6' },
+      { step: 3, id: 'srv-5', label: 'mini-5' },
+    ]);
+    expect(res3.down).toEqual([
+      { step: 1, id: 'srv-3', label: 'srv-3' },
+      { step: 2, id: 'srv-4', label: 'mini-4' },
+      { step: 3, id: 'srv-5', label: 'mini-5' },
+    ]);
+    expect(res3.left).toEqual([
+      { step: 1, id: 'deck_five_brain', label: 'five' },
+      { step: 2, id: 'deck_four_brain', label: 'four' },
+      { step: 3, id: 'deck_raw_brain', label: 'deck_raw_brain' },
+    ]);
+    expect(res3.right).toEqual([
+      { step: 1, id: 'deck_clawd_brain', label: 'clawd' },
+      { step: 2, id: 'deck_raw_brain', label: 'deck_raw_brain' },
+      { step: 3, id: 'deck_four_brain', label: 'four' },
+    ]);
+
+    const res5 = resolveMobileSwipeTargets({
+      servers,
+      currentServerId: 'srv-2',
+      tabs,
+      activeSession: 'deck_cd_brain',
+      selectedServerId: 'srv-2',
+      manualDashboard: false,
+      verticalMaxSteps: 5,
+      horizontalMaxSteps: 3,
+    });
+    expect(res5.up).toHaveLength(5);
+    expect(res5.down).toHaveLength(5);
+    expect(res5.left).toHaveLength(3);
+    expect(res5.right).toHaveLength(3);
+  });
+
+  it('caps available steps cleanly when fewer distinct targets exist', () => {
+    const res = resolveMobileSwipeTargets({
+      servers: servers.slice(0, 3),
+      currentServerId: 'srv-2',
+      tabs: tabs.slice(0, 3),
+      activeSession: 'deck_cd_brain',
+      selectedServerId: 'srv-2',
+      manualDashboard: false,
+      verticalMaxSteps: 5,
+      horizontalMaxSteps: 3,
+    });
+    expect(res.up).toEqual([
+      { step: 1, id: 'srv-1', label: 'mini-1' },
+      { step: 2, id: 'srv-3', label: 'srv-3' },
+    ]);
+    expect(res.down).toEqual([
+      { step: 1, id: 'srv-3', label: 'srv-3' },
+      { step: 2, id: 'srv-1', label: 'mini-1' },
+    ]);
+    expect(res.left).toEqual([
+      { step: 1, id: 'deck_raw_brain', label: 'deck_raw_brain' },
+      { step: 2, id: 'deck_clawd_brain', label: 'clawd' },
+    ]);
+    expect(res.right).toEqual([
+      { step: 1, id: 'deck_clawd_brain', label: 'clawd' },
+      { step: 2, id: 'deck_raw_brain', label: 'deck_raw_brain' },
+    ]);
   });
 
   it('handles shared-in server selection and wraps to owned server with same id if share target active', () => {
@@ -246,20 +363,26 @@ describe('resolveMobileSwipeTargets', () => {
         ],
         currentServerId: 'srv-1',
         hasActiveShareTarget: true,
-        tabs,
+        tabs: tabs.slice(0, 3),
         activeSession: 'deck_cd_brain',
         selectedServerId: 'srv-1',
         manualDashboard: false,
       }),
     ).toEqual({
-      up: 'Owned Host',
-      down: 'Owned Host',
-      left: 'deck_raw_brain',
-      right: 'clawd',
+      up: [{ step: 1, id: 'srv-1', label: 'Owned Host' }],
+      down: [{ step: 1, id: 'srv-1', label: 'Owned Host' }],
+      left: [
+        { step: 1, id: 'deck_raw_brain', label: 'deck_raw_brain' },
+        { step: 2, id: 'deck_clawd_brain', label: 'clawd' },
+      ],
+      right: [
+        { step: 1, id: 'deck_clawd_brain', label: 'clawd' },
+        { step: 2, id: 'deck_raw_brain', label: 'deck_raw_brain' },
+      ],
     });
   });
 
-  it('returns null for single server, single session, missing server, and manualDashboard mode', () => {
+  it('returns empty arrays for single server, single session, missing server, and manualDashboard mode', () => {
     expect(
       resolveMobileSwipeTargets({
         servers: [{ id: 'srv-1', name: 'only-host' }],
@@ -270,16 +393,16 @@ describe('resolveMobileSwipeTargets', () => {
         manualDashboard: false,
       }),
     ).toEqual({
-      up: null,
-      down: null,
-      left: null,
-      right: null,
+      up: [],
+      down: [],
+      left: [],
+      right: [],
     });
 
     // Manual dashboard: servers remain switchable while sessions are blocked
     expect(
       resolveMobileSwipeTargets({
-        servers,
+        servers: servers.slice(0, 3),
         currentServerId: null,
         tabs,
         activeSession: 'deck_cd_brain',
@@ -287,10 +410,18 @@ describe('resolveMobileSwipeTargets', () => {
         manualDashboard: true,
       }),
     ).toEqual({
-      up: 'srv-3',
-      down: 'mini-1',
-      left: null,
-      right: null,
+      up: [
+        { step: 1, id: 'srv-3', label: 'srv-3' },
+        { step: 2, id: 'srv-2', label: 'mini-2' },
+        { step: 3, id: 'srv-1', label: 'mini-1' },
+      ],
+      down: [
+        { step: 1, id: 'srv-1', label: 'mini-1' },
+        { step: 2, id: 'srv-2', label: 'mini-2' },
+        { step: 3, id: 'srv-3', label: 'srv-3' },
+      ],
+      left: [],
+      right: [],
     });
   });
 });

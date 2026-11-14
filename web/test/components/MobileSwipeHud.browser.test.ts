@@ -116,10 +116,61 @@ describe('MobileSwipeHud real Chromium geometry & responsive wrapping', () => {
             armed: true,
           },
           targets: {
-            up: 'mini-2',
-            down: 'prod-box-02',
+            up: [
+              { step: 1, id: 's1', label: 'mini-2' },
+              { step: 2, id: 's2', label: 'mini-3' },
+              { step: 3, id: 's3', label: 'mini-4' },
+            ],
+            down: [
+              { step: 1, id: 's4', label: 'prod-box-02' },
+              { step: 2, id: 's5', label: 'prod-box-03' },
+              { step: 3, id: 's6', label: 'prod-box-04' },
+            ],
             left: null,
             right: null,
+          },
+        },
+        {
+          name: 'armed-tall-multi-level-5',
+          progress: {
+            dx: 0,
+            dy: 245,
+            direction: 'down',
+            action: 'serverNext',
+            distance: 245,
+            threshold: 56,
+            progress: 1,
+            armed: true,
+            step: 5,
+            maxSteps: 5,
+            horizontalMaxSteps: 3,
+            verticalMaxSteps: 5,
+          },
+          targets: {
+            up: [
+              { step: 1, id: 'u1', label: 'srv-up-1' },
+              { step: 2, id: 'u2', label: 'srv-up-2' },
+              { step: 3, id: 'u3', label: 'srv-up-3' },
+              { step: 4, id: 'u4', label: 'srv-up-4' },
+              { step: 5, id: 'u5', label: 'srv-up-5' },
+            ],
+            down: [
+              { step: 1, id: 'd1', label: 'srv-down-1' },
+              { step: 2, id: 'd2', label: 'srv-down-2' },
+              { step: 3, id: 'd3', label: 'srv-down-3' },
+              { step: 4, id: 'd4', label: 'srv-down-4' },
+              { step: 5, id: 'd5', label: 'srv-down-5' },
+            ],
+            left: [
+              { step: 1, id: 'l1', label: 'tab-prev-1' },
+              { step: 2, id: 'l2', label: 'tab-prev-2' },
+              { step: 3, id: 'l3', label: 'tab-prev-3' },
+            ],
+            right: [
+              { step: 1, id: 'r1', label: 'tab-next-1' },
+              { step: 2, id: 'r2', label: 'tab-next-2' },
+              { step: 3, id: 'r3', label: 'tab-next-3' },
+            ],
           },
         },
       ] as const;
@@ -128,6 +179,9 @@ describe('MobileSwipeHud real Chromium geometry & responsive wrapping', () => {
         await page.setViewportSize({ width: vp.width, height: vp.height });
         for (const locale of TEST_LOCALES) {
           for (const testCase of cases) {
+            if (testCase.name === 'armed-tall-multi-level-5' && vp.height < 800) {
+              continue;
+            }
             await page.evaluate(
               ({ lang, progress, targets }) =>
                 (window as unknown as {
@@ -187,6 +241,8 @@ describe('MobileSwipeHud real Chromium geometry & responsive wrapping', () => {
                 pointerEvents: getComputedStyle(hud).pointerEvents,
                 cardScrollWidth: card.scrollWidth,
                 cardClientWidth: card.clientWidth,
+                cardScrollHeight: card.scrollHeight,
+                cardClientHeight: card.clientHeight,
                 cardRect: {
                   left: cardRect.left,
                   right: cardRect.right,
@@ -209,8 +265,13 @@ describe('MobileSwipeHud real Chromium geometry & responsive wrapping', () => {
             expect(metrics.cardScrollWidth, `${tag}: card horizontal overflow`).toBeLessThanOrEqual(
               metrics.cardClientWidth + 1,
             );
+            expect(metrics.cardScrollHeight, `${tag}: card vertical overflow`).toBeLessThanOrEqual(
+              metrics.cardClientHeight + 1,
+            );
             expect(metrics.cardRect.left, `${tag}: card left inside viewport`).toBeGreaterThanOrEqual(0);
             expect(metrics.cardRect.right, `${tag}: card right inside viewport`).toBeLessThanOrEqual(vp.width + 0.5);
+            expect(metrics.cardRect.top, `${tag}: card top inside viewport`).toBeGreaterThanOrEqual(0);
+            expect(metrics.cardRect.bottom, `${tag}: card bottom inside viewport`).toBeLessThanOrEqual(vp.height + 0.5);
 
             // Assert every directional label fits cleanly without ellipsis or clipping
             for (const d of metrics.dirs) {

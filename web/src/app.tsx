@@ -111,7 +111,7 @@ import {
 } from './keyboard-shortcuts.js';
 import {
   attachMobileNavigationGestures,
-  MOBILE_NAVIGATION_GESTURE_KEYCAPS,
+  getMobileNavigationGestureKeycaps,
   type MobileNavigationGestureProgress,
 } from './mobile-navigation-gestures.js';
 import {
@@ -7566,20 +7566,29 @@ function InternalMainApp() {
   viewModeNavRef.current = viewMode;
 
   const navigateServerByStep = useCallback((
-    direction: 1 | -1,
+    stepDelta: number,
     shortcutKeycaps: readonly string[],
     minCount = 1,
   ): boolean => {
     const serversList = unifiedServersNavRef.current;
-    if (serversList.length < minCount) return false;
+    const normalizedStep = Number.isFinite(stepDelta) ? Math.trunc(stepDelta) : 0;
+    if (serversList.length < minCount || normalizedStep === 0) return false;
     const currentServerId = sharedOpenIntentRef.current?.serverId ?? selectedServerIdRef.current;
+    const hasCurrent = currentServerId ? serversList.some((srv) => srv.id === currentServerId) : false;
+    const hasActiveShare = selectedShareTargetNavRef.current !== null;
+    const maxDistinct = hasCurrent
+      ? (hasActiveShare ? serversList.length : Math.max(0, serversList.length - 1))
+      : serversList.length;
+    if (maxDistinct === 0) return minCount <= 1;
+    const sign = normalizedStep >= 0 ? 1 : -1;
+    const clampedAbs = Math.min(Math.abs(normalizedStep), maxDistinct);
     const nextId = cycleOrderedId(
       serversList.map((srv) => srv.id),
       currentServerId,
-      direction,
+      sign * clampedAbs,
     );
     const nextServer = nextId ? serversList.find((srv) => srv.id === nextId) : null;
-    if (nextServer && (nextServer.id !== currentServerId || (selectedShareTargetNavRef.current !== null && !nextServer.isSharedIn))) {
+    if (nextServer && (nextServer.id !== currentServerId || (hasActiveShare && !nextServer.isSharedIn))) {
       const targetSharedEntry = nextServer.isSharedIn ? (nextServer.sharedEntry ?? null) : null;
       setServerSwitchWatermark((prev) => ({
         serverId: nextServer.id,
@@ -7599,20 +7608,27 @@ function InternalMainApp() {
   }, []);
 
   const navigateTabByStep = useCallback((
-    direction: 1 | -1,
+    stepDelta: number,
     watermarkKeycaps?: readonly string[],
     minCount = 1,
   ): boolean => {
     const serverId = selectedServerIdRef.current;
     if (!serverId || manualDashboardRef.current) return false;
     const tabsList = orderedTabsNavRef.current;
-    if (tabsList.length < minCount) return false;
+    const normalizedStep = Number.isFinite(stepDelta) ? Math.trunc(stepDelta) : 0;
+    if (tabsList.length < minCount || normalizedStep === 0) return false;
+    const activeName = activeSessionRef.current;
+    const hasCurrent = activeName ? tabsList.some((session) => session.name === activeName) : false;
+    const maxDistinct = hasCurrent ? Math.max(0, tabsList.length - 1) : tabsList.length;
+    if (maxDistinct === 0) return minCount <= 1;
+    const sign = normalizedStep >= 0 ? 1 : -1;
+    const clampedAbs = Math.min(Math.abs(normalizedStep), maxDistinct);
     const nextName = cycleOrderedId(
       tabsList.map((session) => session.name),
-      activeSessionRef.current,
-      direction,
+      activeName,
+      sign * clampedAbs,
     );
-    if (nextName && nextName !== activeSessionRef.current) {
+    if (nextName && nextName !== activeName) {
       const shareTarget = selectedShareTargetNavRef.current;
       if (watermarkKeycaps && (!shareTarget || shareTarget.kind === 'server')) {
         const nextSession = tabsList.find((session) => session.name === nextName);
@@ -7723,14 +7739,25 @@ function InternalMainApp() {
     return attachMobileNavigationGestures({
       isMobile,
       isBlocked: () => hasBlockingMobileGestureOverlayRef.current,
+      getAvailableSteps: (direction) => resolveMobileSwipeTargets({
+        servers: unifiedServersNavRef.current,
+        currentServerId: sharedOpenIntentRef.current?.serverId ?? selectedServerIdRef.current,
+        hasActiveShareTarget: selectedShareTargetNavRef.current !== null,
+        tabs: orderedTabsNavRef.current,
+        activeSession: activeSessionRef.current,
+        selectedServerId: selectedServerIdRef.current,
+        manualDashboard: manualDashboardRef.current,
+        verticalMaxSteps: 5,
+        horizontalMaxSteps: 3,
+      })[direction].length,
       onProgress: setMobileGestureProgress,
-      onAction: (action) => {
-        const keycaps = MOBILE_NAVIGATION_GESTURE_KEYCAPS[action];
+      onAction: (action, step) => {
+        const keycaps = getMobileNavigationGestureKeycaps(action, step);
         if (action === 'serverPrev' || action === 'serverNext') {
-          navigateServerByStep(action === 'serverNext' ? 1 : -1, keycaps, 2);
+          navigateServerByStep(action === 'serverNext' ? step : -step, keycaps, 2);
           return;
         }
-        navigateTabByStep(action === 'tabNext' ? 1 : -1, keycaps, 2);
+        navigateTabByStep(action === 'tabNext' ? step : -step, keycaps, 2);
       },
     });
   }, [isMobile, navigateServerByStep, navigateTabByStep]);
@@ -10513,6 +10540,8 @@ function InternalMainApp() {
                     activeSession,
                     selectedServerId,
                     manualDashboard,
+                    verticalMaxSteps: mobileGestureProgress.verticalMaxSteps,
+                    horizontalMaxSteps: mobileGestureProgress.horizontalMaxSteps,
                   })
                   : null}
               />

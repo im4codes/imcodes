@@ -466,8 +466,15 @@ describe('keyboard-shortcuts core helpers', () => {
     expect(cycleOrderedId(ids, 's4', 1)).toBe('s3');
     expect(cycleOrderedId(ids, 's4', -1)).toBe('s2');
     expect(cycleOrderedId(ids, 's2', 1)).toBe('s4');
+    expect(cycleOrderedId(ids, 's4', 2)).toBe('s1');
+    expect(cycleOrderedId(ids, 's4', 3)).toBe('s2');
+    expect(cycleOrderedId(ids, 's4', -2)).toBe('s1');
+    expect(cycleOrderedId(ids, 's4', -3)).toBe('s3');
+    expect(cycleOrderedId(ids, 's4', 0)).toBeNull();
     expect(cycleOrderedId(ids, 'missing', 1)).toBe('s4');
+    expect(cycleOrderedId(ids, 'missing', 3)).toBe('s1');
     expect(cycleOrderedId(ids, 'missing', -1)).toBe('s2');
+    expect(cycleOrderedId(ids, 'missing', -2)).toBe('s1');
     expect(cycleOrderedId([], 's1', 1)).toBeNull();
   });
 

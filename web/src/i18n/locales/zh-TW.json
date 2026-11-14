@@ -5402,13 +5402,14 @@
   },
   "mobile_gesture": {
     "hud": {
-      "title": "雙指導航",
+      "title": "手勢",
       "up": "上一個伺服器",
       "down": "下一個伺服器",
       "left": "上一個工作階段",
       "right": "下一個工作階段",
       "drag_to_threshold": "拖曳超過閾值即可切換",
       "release_to_switch": "放開立即切換",
+      "release_to_switch_step": "放開切換（第{{step}}級）",
       "no_target": "無其他目標"
     }
   }

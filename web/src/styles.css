@@ -20076,9 +20076,10 @@ button.quick-agent-delegation-preset.active {
   display: flex;
   flex-direction: column;
   align-items: stretch;
-  gap: 11px;
-  width: min(92vw, 376px);
-  padding: 13px 14px;
+  gap: 9px;
+  width: min(94vw, 384px);
+  max-height: calc(100dvh - 24px);
+  padding: 12px 13px;
   border-radius: 16px;
   background:
     radial-gradient(circle at 50% 48%, rgba(56, 189, 248, 0.14), transparent 60%),
@@ -20364,11 +20365,18 @@ button.quick-agent-delegation-preset.active {
 
 .mobile-swipe-hud-center-badge {
   position: absolute;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.04em;
   color: rgba(224, 242, 254, 0.96);
+}
+
+.mobile-swipe-hud-gesture-icon {
+  display: block;
 }
 
 .mobile-swipe-hud-dir {
@@ -20379,10 +20387,10 @@ button.quick-agent-delegation-preset.active {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 3px;
+  gap: 4px;
   min-width: 0;
   width: 100%;
-  padding: 7px 8px;
+  padding: 6px 7px;
   border-radius: 10px;
   border: 1px solid rgba(148, 163, 184, 0.28);
   background: rgba(10, 17, 32, 0.96);
@@ -20402,8 +20410,8 @@ button.quick-agent-delegation-preset.active {
   grid-column: 1 / -1;
   justify-self: center;
   width: auto;
-  min-width: min(176px, 100%);
-  max-width: min(248px, 100%);
+  min-width: min(192px, 100%);
+  max-width: min(264px, 100%);
 }
 
 .mobile-swipe-hud-dir.is-left {
@@ -20421,8 +20429,8 @@ button.quick-agent-delegation-preset.active {
   grid-column: 1 / -1;
   justify-self: center;
   width: auto;
-  min-width: min(176px, 100%);
-  max-width: min(248px, 100%);
+  min-width: min(192px, 100%);
+  max-width: min(264px, 100%);
 }
 
 .mobile-swipe-hud-dir-head {
@@ -20461,21 +20469,92 @@ button.quick-agent-delegation-preset.active {
   opacity: 0.88;
 }
 
+.mobile-swipe-hud-dir-targets {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  min-width: 0;
+}
+
+.mobile-swipe-hud-dir-targets.is-up {
+  flex-direction: column-reverse;
+}
+
+.mobile-swipe-hud-dir-target-row {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: 100%;
+  min-width: 0;
+  padding: 2px 5px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  transition: background-color 110ms ease, border-color 110ms ease, color 110ms ease;
+}
+
+.mobile-swipe-hud-step-badge {
+  flex: 0 0 auto;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 3px;
+  border-radius: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 9.5px;
+  font-weight: 700;
+  line-height: 1;
+  background: rgba(148, 163, 184, 0.16);
+  color: rgba(203, 213, 225, 0.92);
+}
+
 .mobile-swipe-hud-dir-target {
   display: block;
+  flex: 1 1 auto;
+  min-width: 0;
   width: 100%;
   max-width: 100%;
-  font-size: 12.5px;
-  font-weight: 700;
+  font-size: 12px;
+  font-weight: 600;
   line-height: 1.25;
   letter-spacing: 0.01em;
-  color: rgba(248, 250, 252, 0.98);
+  text-align: left;
+  color: rgba(248, 250, 252, 0.96);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
+.mobile-swipe-hud-dir-target.is-selected {
+  font-weight: 700;
+  color: #ffffff;
+}
+
+.mobile-swipe-hud-dir.is-server .mobile-swipe-hud-dir-target-row.is-selected {
+  background: rgba(245, 158, 11, 0.24);
+  border-color: rgba(251, 191, 36, 0.85);
+}
+
+.mobile-swipe-hud-dir.is-server .mobile-swipe-hud-dir-target-row.is-selected .mobile-swipe-hud-step-badge {
+  background: rgba(251, 191, 36, 0.95);
+  color: #0f172a;
+}
+
+.mobile-swipe-hud-dir.is-session .mobile-swipe-hud-dir-target-row.is-selected {
+  background: rgba(16, 185, 129, 0.24);
+  border-color: rgba(52, 211, 153, 0.9);
+}
+
+.mobile-swipe-hud-dir.is-session .mobile-swipe-hud-dir-target-row.is-selected .mobile-swipe-hud-step-badge {
+  background: rgba(52, 211, 153, 0.95);
+  color: #064e3b;
+}
+
 .mobile-swipe-hud-dir-target.is-empty {
+  text-align: center;
   font-size: 11px;
   font-weight: 500;
   color: rgba(148, 163, 184, 0.74);
@@ -20692,8 +20771,37 @@ button.quick-agent-delegation-preset.active {
     color: rgba(5, 150, 105, 0.95);
   }
 
+  .mobile-swipe-hud-step-badge {
+    background: rgba(15, 23, 42, 0.08);
+    color: rgba(30, 41, 59, 0.88);
+  }
+
   .mobile-swipe-hud-dir-target {
     color: rgba(15, 23, 42, 0.96);
+  }
+
+  .mobile-swipe-hud-dir-target.is-selected {
+    color: rgba(15, 23, 42, 1);
+  }
+
+  .mobile-swipe-hud-dir.is-server .mobile-swipe-hud-dir-target-row.is-selected {
+    background: rgba(245, 158, 11, 0.2);
+    border-color: rgba(217, 119, 6, 0.82);
+  }
+
+  .mobile-swipe-hud-dir.is-server .mobile-swipe-hud-dir-target-row.is-selected .mobile-swipe-hud-step-badge {
+    background: rgba(217, 119, 6, 0.95);
+    color: #ffffff;
+  }
+
+  .mobile-swipe-hud-dir.is-session .mobile-swipe-hud-dir-target-row.is-selected {
+    background: rgba(5, 150, 105, 0.16);
+    border-color: rgba(5, 150, 105, 0.85);
+  }
+
+  .mobile-swipe-hud-dir.is-session .mobile-swipe-hud-dir-target-row.is-selected .mobile-swipe-hud-step-badge {
+    background: rgba(5, 150, 105, 0.95);
+    color: #ffffff;
   }
 
   .mobile-swipe-hud-dir-target.is-empty {
@@ -20738,11 +20846,44 @@ button.quick-agent-delegation-preset.active {
   }
 }
 
+@media (max-height: 620px), (max-width: 350px) {
+  .mobile-swipe-hud {
+    padding: 10px;
+  }
+
+  .mobile-swipe-hud-card {
+    padding: 10px 11px;
+    gap: 7px;
+  }
+
+  .mobile-swipe-hud-compass {
+    gap: 7px 6px;
+  }
+
+  .mobile-swipe-hud-dir {
+    padding: 5px 6px;
+  }
+
+  .mobile-swipe-hud-dir-targets {
+    gap: 2px;
+  }
+
+  .mobile-swipe-hud-dir-target-row {
+    padding: 1.5px 4px;
+    gap: 4px;
+  }
+
+  .mobile-swipe-hud-dir-target {
+    font-size: 11.5px;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .mobile-swipe-hud-card,
   .mobile-swipe-hud-axis,
   .mobile-swipe-hud-ring-fill,
   .mobile-swipe-hud-dir,
+  .mobile-swipe-hud-dir-target-row,
   .mobile-swipe-hud-bar-fill {
     animation: none;
     transition: none;

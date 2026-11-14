@@ -5412,13 +5412,14 @@
   },
   "mobile_gesture": {
     "hud": {
-      "title": "双指导航",
+      "title": "手势",
       "up": "上一个服务器",
       "down": "下一个服务器",
       "left": "上一个会话",
       "right": "下一个会话",
       "drag_to_threshold": "拖动超过阈值即可切换",
       "release_to_switch": "松手立即切换",
+      "release_to_switch_step": "松手切换（第{{step}}级）",
       "no_target": "无其他目标"
     }
   }

@@ -5401,13 +5401,14 @@
   },
   "mobile_gesture": {
     "hud": {
-      "title": "두 손가락 탐색",
+      "title": "제스처",
       "up": "이전 서버",
       "down": "다음 서버",
       "left": "이전 세션",
       "right": "다음 세션",
       "drag_to_threshold": "임계값까지 드래그하여 전환",
       "release_to_switch": "놓아서 전환",
+      "release_to_switch_step": "놓아서 전환 (L{{step}})",
       "no_target": "다른 대상 없음"
     }
   }

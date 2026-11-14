@@ -9439,20 +9439,32 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     await waitFor(() => expect(desktopBtn.getAttribute('aria-pressed')).toBe('true'));
   }, 15000);
 
-  it('switches servers (up/down) and tabs (left/right) via mobile 2-finger swipes with watermark HUD', async () => {
-    const dispatchTwoFingerSwipe = (
-      target: EventTarget,
-      start: Array<{ identifier: number; clientX: number; clientY: number }>,
-      move: Array<{ identifier: number; clientX: number; clientY: number }>,
+  it('switches servers (up/down) and tabs (left/right, multi-step) via mobile 1-finger long-press swipes with watermark HUD', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const mkTouchEvent = (
+      type: string,
+      touches: Array<{ identifier: number; clientX: number; clientY: number }>,
+      changedTouches: Array<{ identifier: number; clientX: number; clientY: number }> = [],
     ) => {
-      const mkEvent = (type: string, touches: typeof start) => {
-        const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & { touches: typeof start };
-        Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
-        return evt;
+      const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
+        touches: typeof touches;
+        changedTouches: typeof touches;
       };
-      target.dispatchEvent(mkEvent('touchstart', start));
-      target.dispatchEvent(mkEvent('touchmove', move));
-      target.dispatchEvent(mkEvent('touchend', []));
+      Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
+      Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
+      return evt;
+    };
+    const dispatchLongPressSwipe = async (
+      target: EventTarget,
+      start: { identifier: number; clientX: number; clientY: number },
+      move: { identifier: number; clientX: number; clientY: number },
+    ) => {
+      await act(async () => {
+        target.dispatchEvent(mkTouchEvent('touchstart', [start], [start]));
+        vi.advanceTimersByTime(400);
+        target.dispatchEvent(mkTouchEvent('touchmove', [move], [move]));
+        target.dispatchEvent(mkTouchEvent('touchend', [], [move]));
+      });
     };
 
     const originalUserAgent = navigator.userAgent;
@@ -9467,183 +9479,229 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       const alphaPane = await screen.findByTestId('session-pane-deck_alpha_brain');
       expect(alphaPane.getAttribute('data-is-active')).toBe('true');
 
-      // 2-finger swipe Right -> tabNext (deck_beta_brain) + watermark
-      dispatchTwoFingerSwipe(
+      // 1-finger long-press + swipe Right (step 1: 80px) -> tabNext (deck_beta_brain) + watermark ['→']
+      await dispatchLongPressSwipe(
         alphaPane,
-        [{ identifier: 1, clientX: 80, clientY: 200 }, { identifier: 2, clientX: 84, clientY: 250 }],
-        [{ identifier: 1, clientX: 160, clientY: 202 }, { identifier: 2, clientX: 164, clientY: 252 }],
+        { identifier: 1, clientX: 80, clientY: 200 },
+        { identifier: 1, clientX: 160, clientY: 202 },
       );
       await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
       expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('session');
       expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server One');
       expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('beta');
-      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['2F', '→']);
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['→']);
 
-      // 2-finger swipe Left -> tabPrev (deck_alpha_brain) + watermark
+      // 1-finger long-press + swipe Left (step 1: -80px) -> tabPrev (deck_alpha_brain) + watermark ['←']
       const betaPane = screen.getByTestId('session-pane-deck_beta_brain');
-      dispatchTwoFingerSwipe(
+      await dispatchLongPressSwipe(
         betaPane,
-        [{ identifier: 1, clientX: 200, clientY: 200 }, { identifier: 2, clientX: 204, clientY: 250 }],
-        [{ identifier: 1, clientX: 120, clientY: 202 }, { identifier: 2, clientX: 124, clientY: 248 }],
+        { identifier: 1, clientX: 200, clientY: 200 },
+        { identifier: 1, clientX: 120, clientY: 202 },
       );
       await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
       expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('session');
       expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server One');
       expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('alpha');
-      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['2F', '←']);
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['←']);
 
-      // 2-finger swipe Down -> serverNext (Server Two) + watermark
-      dispatchTwoFingerSwipe(
+      // Multi-step: 1-finger long-press + swipe Right (step 2: +112px >= 100px) -> jumps straight alpha -> gamma + watermark ['→', '×2']
+      await dispatchLongPressSwipe(
+        screen.getByTestId('session-pane-deck_alpha_brain'),
+        { identifier: 1, clientX: 60, clientY: 200 },
+        { identifier: 1, clientX: 172, clientY: 202 },
+      );
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_gamma_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('gamma');
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['→', '×2']);
+
+      // Multi-step back: 1-finger long-press + swipe Left (step 2: -112px) -> jumps straight gamma -> alpha + watermark ['←', '×2']
+      await dispatchLongPressSwipe(
+        screen.getByTestId('session-pane-deck_gamma_brain'),
+        { identifier: 1, clientX: 220, clientY: 200 },
+        { identifier: 1, clientX: 108, clientY: 200 },
+      );
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['←', '×2']);
+
+      // 1-finger long-press + swipe Down -> serverNext (Server Two) + watermark ['↓']
+      await dispatchLongPressSwipe(
         view.container,
-        [{ identifier: 1, clientX: 120, clientY: 160 }, { identifier: 2, clientX: 170, clientY: 164 }],
-        [{ identifier: 1, clientX: 122, clientY: 240 }, { identifier: 2, clientX: 172, clientY: 244 }],
+        { identifier: 1, clientX: 120, clientY: 160 },
+        { identifier: 1, clientX: 122, clientY: 240 },
       );
       await screen.findByTestId('session-pane-deck_delta_brain');
       expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('server');
       expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server Two');
-      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['2F', '↓']);
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['↓']);
 
-      // Single-tab server (srv-2 has only deck_delta_brain): 2-finger Left/Right safely no-ops
-      // Wait for watermark update or reset server-switch-watermark state by checking delta stays active and no 2F ← badge appears
-      dispatchTwoFingerSwipe(
+      // Single-tab server (srv-2 has only deck_delta_brain): Left/Right safely no-ops
+      await dispatchLongPressSwipe(
         view.container,
-        [{ identifier: 1, clientX: 200, clientY: 200 }, { identifier: 2, clientX: 204, clientY: 250 }],
-        [{ identifier: 1, clientX: 120, clientY: 202 }, { identifier: 2, clientX: 124, clientY: 252 }],
+        { identifier: 1, clientX: 200, clientY: 200 },
+        { identifier: 1, clientX: 120, clientY: 202 },
       );
       expect(screen.getByTestId('session-pane-deck_delta_brain').getAttribute('data-is-active')).toBe('true');
-      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['2F', '↓']);
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['↓']);
 
-      // 2-finger swipe Up -> serverPrev (Server One) + watermark
-      dispatchTwoFingerSwipe(
+      // 1-finger long-press + swipe Up -> serverPrev (Server One) + watermark ['↑']
+      await dispatchLongPressSwipe(
         view.container,
-        [{ identifier: 1, clientX: 120, clientY: 260 }, { identifier: 2, clientX: 170, clientY: 264 }],
-        [{ identifier: 1, clientX: 118, clientY: 180 }, { identifier: 2, clientX: 168, clientY: 184 }],
+        { identifier: 1, clientX: 120, clientY: 260 },
+        { identifier: 1, clientX: 118, clientY: 180 },
       );
       await waitFor(() => expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server One'));
       expect(screen.getByTestId('server-switch-watermark').getAttribute('data-switch-kind')).toBe('server');
-      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['2F', '↑']);
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['↑']);
     } finally {
+      vi.useRealTimers();
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
     }
   }, 15000);
 
-  it('blocks mobile 2-finger navigation on open sidebar, blocking modal/settings, 1-finger scroll, pinch, and desktop', async () => {
-    const dispatchTouches = (
+  it('blocks mobile gesture navigation on 2-finger touches, open sidebar, blocking modal/settings, normal 1-finger scroll, pinch, and desktop', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const mkTouchEvent = (
+      type: string,
+      touches: Array<{ identifier: number; clientX: number; clientY: number }>,
+      changedTouches: Array<{ identifier: number; clientX: number; clientY: number }> = [],
+    ) => {
+      const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
+        touches: typeof touches;
+        changedTouches: typeof touches;
+      };
+      Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
+      Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
+      return evt;
+    };
+    const dispatchLongPressTouches = async (
       target: EventTarget,
       start: Array<{ identifier: number; clientX: number; clientY: number }>,
       move: Array<{ identifier: number; clientX: number; clientY: number }>,
     ) => {
-      const mkEvent = (type: string, touches: typeof start) => {
-        const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & { touches: typeof start };
-        Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
-        return evt;
-      };
-      target.dispatchEvent(mkEvent('touchstart', start));
-      target.dispatchEvent(mkEvent('touchmove', move));
-      target.dispatchEvent(mkEvent('touchend', []));
+      await act(async () => {
+        target.dispatchEvent(mkTouchEvent('touchstart', start, start));
+        vi.advanceTimersByTime(400);
+        target.dispatchEvent(mkTouchEvent('touchmove', move, move));
+        target.dispatchEvent(mkTouchEvent('touchend', [], move));
+      });
     };
 
-    // Desktop (!isMobile) ignores 2-finger swipe completely
-    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
-    localStorage.setItem('rcc_server', 'srv-1');
-    localStorage.setItem('rcc_session', 'deck_alpha_brain');
-    {
-      const { App } = await importApp();
-      const desktopView = render(<App />);
-      const alphaPane = await screen.findByTestId('session-pane-deck_alpha_brain');
-      dispatchTouches(
-        alphaPane,
-        [{ identifier: 1, clientX: 80, clientY: 200 }, { identifier: 2, clientX: 84, clientY: 250 }],
-        [{ identifier: 1, clientX: 160, clientY: 202 }, { identifier: 2, clientX: 164, clientY: 252 }],
-      );
-      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
-      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
-      desktopView.unmount();
-    }
-
-    // Mobile guards
-    const originalUserAgent = navigator.userAgent;
-    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
     try {
-      const { App } = await importApp();
-      const mobileView = render(<App />);
-      const alphaPane = await screen.findByTestId('session-pane-deck_alpha_brain');
+      // Desktop (!isMobile) ignores 1-finger long-press swipe completely
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      {
+        const { App } = await importApp();
+        const desktopView = render(<App />);
+        const alphaPane = await screen.findByTestId('session-pane-deck_alpha_brain');
+        await dispatchLongPressTouches(
+          alphaPane,
+          [{ identifier: 1, clientX: 80, clientY: 200 }],
+          [{ identifier: 1, clientX: 160, clientY: 202 }],
+        );
+        expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+        expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+        desktopView.unmount();
+      }
 
-      // 1-finger scroll ignored
-      dispatchTouches(
-        alphaPane,
-        [{ identifier: 1, clientX: 200, clientY: 200 }],
-        [{ identifier: 1, clientX: 80, clientY: 200 }],
-      );
-      // Pinch/spread ignored
-      dispatchTouches(
-        alphaPane,
-        [{ identifier: 1, clientX: 140, clientY: 200 }, { identifier: 2, clientX: 160, clientY: 200 }],
-        [{ identifier: 1, clientX: 100, clientY: 200 }, { identifier: 2, clientX: 200, clientY: 200 }],
-      );
-      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
-      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+      // Mobile guards
+      const originalUserAgent = navigator.userAgent;
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+      try {
+        const { App } = await importApp();
+        const mobileView = render(<App />);
+        const alphaPane = await screen.findByTestId('session-pane-deck_alpha_brain');
 
-      // Blocking DOM dialog -> 2-finger swipe Down blocked
-      const modal = document.createElement('div');
-      modal.setAttribute('role', 'dialog');
-      document.body.appendChild(modal);
-      dispatchTouches(
-        alphaPane,
-        [{ identifier: 1, clientX: 120, clientY: 160 }, { identifier: 2, clientX: 170, clientY: 164 }],
-        [{ identifier: 1, clientX: 122, clientY: 240 }, { identifier: 2, clientX: 172, clientY: 244 }],
-      );
-      expect(screen.queryByTestId('session-pane-deck_delta_brain')).toBeNull();
-      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
-      modal.remove();
+        // Normal 1-finger scroll (no long-press delay) ignored
+        await act(async () => {
+          alphaPane.dispatchEvent(mkTouchEvent('touchstart', [{ identifier: 1, clientX: 200, clientY: 200 }]));
+          alphaPane.dispatchEvent(mkTouchEvent('touchmove', [{ identifier: 1, clientX: 80, clientY: 200 }]));
+          alphaPane.dispatchEvent(mkTouchEvent('touchend', [], [{ identifier: 1, clientX: 80, clientY: 200 }]));
+        });
+        // 2-finger swipe (disabled!) & pinch/spread completely ignored
+        await dispatchLongPressTouches(
+          alphaPane,
+          [{ identifier: 1, clientX: 80, clientY: 200 }, { identifier: 2, clientX: 84, clientY: 250 }],
+          [{ identifier: 1, clientX: 160, clientY: 202 }, { identifier: 2, clientX: 164, clientY: 252 }],
+        );
+        await dispatchLongPressTouches(
+          alphaPane,
+          [{ identifier: 1, clientX: 140, clientY: 200 }, { identifier: 2, clientX: 160, clientY: 200 }],
+          [{ identifier: 1, clientX: 100, clientY: 200 }, { identifier: 2, clientX: 200, clientY: 200 }],
+        );
+        expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+        expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+        expect(screen.queryByTestId('mobile-swipe-hud')).toBeNull();
 
-      // Open mobile sidebar -> 2-finger swipe Right blocked
-      fireEvent.click(mobileView.container.querySelector('.mobile-sidebar-toggle')!);
-      await waitFor(() => expect(mobileView.container.querySelector('.mobile-sidebar-overlay.open')).toBeTruthy());
-      dispatchTouches(
-        alphaPane,
-        [{ identifier: 1, clientX: 80, clientY: 200 }, { identifier: 2, clientX: 84, clientY: 250 }],
-        [{ identifier: 1, clientX: 160, clientY: 202 }, { identifier: 2, clientX: 164, clientY: 252 }],
-      );
-      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
-      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+        // Blocking DOM dialog -> 1-finger long-press swipe Down blocked
+        const modal = document.createElement('div');
+        modal.setAttribute('role', 'dialog');
+        document.body.appendChild(modal);
+        await dispatchLongPressTouches(
+          alphaPane,
+          [{ identifier: 1, clientX: 120, clientY: 160 }],
+          [{ identifier: 1, clientX: 122, clientY: 240 }],
+        );
+        expect(screen.queryByTestId('session-pane-deck_delta_brain')).toBeNull();
+        expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+        modal.remove();
 
-      // Close mobile sidebar by selecting current session, then verify mobile file browser overlay blocks 2-finger swipe Down
-      fireEvent.click(screen.getByText('tree-select-session-deck_alpha_brain'));
-      await waitFor(() => expect(mobileView.container.querySelector('.mobile-sidebar-overlay.open')).toBeNull());
+        // Open mobile sidebar -> 1-finger long-press swipe Right blocked
+        fireEvent.click(mobileView.container.querySelector('.mobile-sidebar-toggle')!);
+        await waitFor(() => expect(mobileView.container.querySelector('.mobile-sidebar-overlay.open')).toBeTruthy());
+        await dispatchLongPressTouches(
+          alphaPane,
+          [{ identifier: 1, clientX: 80, clientY: 200 }],
+          [{ identifier: 1, clientX: 160, clientY: 202 }],
+        );
+        expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+        expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
 
-      fireEvent.click(mobileView.container.querySelector('.view-toggle[title="Files"]')!);
-      dispatchTouches(
-        mobileView.container,
-        [{ identifier: 1, clientX: 120, clientY: 160 }, { identifier: 2, clientX: 170, clientY: 164 }],
-        [{ identifier: 1, clientX: 122, clientY: 240 }, { identifier: 2, clientX: 172, clientY: 244 }],
-      );
-      expect(screen.queryByTestId('session-pane-deck_delta_brain')).toBeNull();
-      expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+        // Close mobile sidebar by selecting current session, then verify mobile file browser overlay blocks 1-finger long-press swipe Down
+        fireEvent.click(screen.getByText('tree-select-session-deck_alpha_brain'));
+        await waitFor(() => expect(mobileView.container.querySelector('.mobile-sidebar-overlay.open')).toBeNull());
+
+        fireEvent.click(mobileView.container.querySelector('.view-toggle[title="Files"]')!);
+        await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-mobile-fb-open')).toBe('true'));
+        await dispatchLongPressTouches(
+          mobileView.container,
+          [{ identifier: 1, clientX: 120, clientY: 160 }],
+          [{ identifier: 1, clientX: 122, clientY: 240 }],
+        );
+        expect(screen.queryByTestId('session-pane-deck_delta_brain')).toBeNull();
+        expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
+      } finally {
+        Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+      }
     } finally {
-      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+      vi.useRealTimers();
     }
   }, 15000);
 
-  it('F1/F2: completes fast coalesced touchend swipes and blocks open VoiceOverlay / mobile-server-menu', async () => {
-    const dispatchCoalescedSwipe = (
+  it('F1/F2: completes fast coalesced touchend swipes after long-press and blocks open VoiceOverlay / mobile-server-menu', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const dispatchCoalescedSwipe = async (
       target: EventTarget,
-      start: Array<{ identifier: number; clientX: number; clientY: number }>,
-      subThresholdMove: Array<{ identifier: number; clientX: number; clientY: number }>,
-      endChanged: Array<{ identifier: number; clientX: number; clientY: number }>,
+      start: { identifier: number; clientX: number; clientY: number },
+      subThresholdMove: { identifier: number; clientX: number; clientY: number },
+      endChanged: { identifier: number; clientX: number; clientY: number },
     ) => {
-      const mkEvent = (type: string, touches: typeof start, changedTouches: typeof start = []) => {
+      const mkEvent = (type: string, touches: typeof start[], changedTouches: typeof start[] = []) => {
         const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
-          touches: typeof start;
-          changedTouches: typeof start;
+          touches: typeof start[];
+          changedTouches: typeof start[];
         };
         Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
         Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
         return evt;
       };
-      target.dispatchEvent(mkEvent('touchstart', start));
-      target.dispatchEvent(mkEvent('touchmove', subThresholdMove));
-      target.dispatchEvent(mkEvent('touchend', [], endChanged));
+      await act(async () => {
+        target.dispatchEvent(mkEvent('touchstart', [start], [start]));
+        vi.advanceTimersByTime(400);
+        target.dispatchEvent(mkEvent('touchmove', [subThresholdMove], [subThresholdMove]));
+        target.dispatchEvent(mkEvent('touchend', [], [endChanged]));
+      });
     };
 
     const originalUserAgent = navigator.userAgent;
@@ -9657,7 +9715,7 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       const view = render(<App />);
       const alphaPane = await screen.findByTestId('session-pane-deck_alpha_brain');
 
-      // F2: open VoiceOverlay DOM -> 2-finger swipe inside its textarea does NOT navigate or show watermark
+      // F2: open VoiceOverlay DOM -> 1-finger long-press swipe inside its textarea does NOT navigate or show watermark
       const voiceBackdrop = document.createElement('div');
       voiceBackdrop.className = 'voice-overlay-backdrop';
       const voiceOverlay = document.createElement('div');
@@ -9667,25 +9725,25 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       document.body.appendChild(voiceBackdrop);
       document.body.appendChild(voiceOverlay);
 
-      dispatchCoalescedSwipe(
+      await dispatchCoalescedSwipe(
         voiceTa,
-        [{ identifier: 1, clientX: 80, clientY: 200 }, { identifier: 2, clientX: 84, clientY: 250 }],
-        [{ identifier: 1, clientX: 118, clientY: 200 }, { identifier: 2, clientX: 122, clientY: 250 }],
-        [{ identifier: 1, clientX: 165, clientY: 200 }, { identifier: 2, clientX: 169, clientY: 250 }],
+        { identifier: 1, clientX: 80, clientY: 200 },
+        { identifier: 1, clientX: 118, clientY: 200 },
+        { identifier: 1, clientX: 165, clientY: 200 },
       );
       expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
       expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
       voiceOverlay.remove();
       voiceBackdrop.remove();
 
-      // F2: open .mobile-server-menu -> 2-finger swipe Down is blocked
+      // F2: open .mobile-server-menu -> 1-finger long-press swipe Down is blocked
       fireEvent.click(view.container.querySelector('.mobile-server-btn')!);
       expect(view.container.querySelector('.mobile-server-menu')).toBeTruthy();
-      dispatchCoalescedSwipe(
+      await dispatchCoalescedSwipe(
         view.container,
-        [{ identifier: 1, clientX: 120, clientY: 200 }, { identifier: 2, clientX: 170, clientY: 202 }],
-        [{ identifier: 1, clientX: 120, clientY: 238 }, { identifier: 2, clientX: 170, clientY: 240 }],
-        [{ identifier: 1, clientX: 120, clientY: 280 }, { identifier: 2, clientX: 170, clientY: 282 }],
+        { identifier: 1, clientX: 120, clientY: 200 },
+        { identifier: 1, clientX: 120, clientY: 238 },
+        { identifier: 1, clientX: 120, clientY: 280 },
       );
       expect(screen.queryByTestId('session-pane-deck_delta_brain')).toBeNull();
       expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
@@ -9693,47 +9751,52 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       expect(view.container.querySelector('.mobile-server-menu')).toBeNull();
 
       // F1: fast coalesced touchend swipe Right (move=38px, end=85px) -> switches to deck_beta_brain
-      dispatchCoalescedSwipe(
+      await dispatchCoalescedSwipe(
         alphaPane,
-        [{ identifier: 1, clientX: 80, clientY: 200 }, { identifier: 2, clientX: 84, clientY: 250 }],
-        [{ identifier: 1, clientX: 118, clientY: 200 }, { identifier: 2, clientX: 122, clientY: 250 }],
-        [{ identifier: 1, clientX: 165, clientY: 200 }, { identifier: 2, clientX: 169, clientY: 250 }],
+        { identifier: 1, clientX: 80, clientY: 200 },
+        { identifier: 1, clientX: 118, clientY: 200 },
+        { identifier: 1, clientX: 165, clientY: 200 },
       );
       await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
       expect(screen.getByTestId('server-switch-watermark-session').textContent).toBe('beta');
 
       // F1: fast coalesced touchend swipe Down (move=40px, end=80px) -> switches to Server Two
-      dispatchCoalescedSwipe(
+      await dispatchCoalescedSwipe(
         view.container,
-        [{ identifier: 1, clientX: 120, clientY: 200 }, { identifier: 2, clientX: 170, clientY: 202 }],
-        [{ identifier: 1, clientX: 120, clientY: 240 }, { identifier: 2, clientX: 170, clientY: 242 }],
-        [{ identifier: 1, clientX: 120, clientY: 280 }, { identifier: 2, clientX: 170, clientY: 282 }],
+        { identifier: 1, clientX: 120, clientY: 200 },
+        { identifier: 1, clientX: 120, clientY: 240 },
+        { identifier: 1, clientX: 120, clientY: 280 },
       );
       await screen.findByTestId('session-pane-deck_delta_brain');
       expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Server Two');
     } finally {
+      vi.useRealTimers();
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
     }
   }, 15000);
 
-  it('F3: mobile 2-finger navigation safely no-ops for <=1 server or <=1 tab regardless of dashboard, null, or stale selection', async () => {
-    const dispatchSwipe = (
+  it('F3: mobile 1-finger navigation safely no-ops for <=1 server or <=1 tab regardless of dashboard, null, or stale selection', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const dispatchSwipe = async (
       target: EventTarget,
-      start: Array<{ identifier: number; clientX: number; clientY: number }>,
-      move: Array<{ identifier: number; clientX: number; clientY: number }>,
+      start: { identifier: number; clientX: number; clientY: number },
+      move: { identifier: number; clientX: number; clientY: number },
     ) => {
-      const mkEvent = (type: string, touches: typeof start, changedTouches: typeof start = []) => {
+      const mkEvent = (type: string, touches: typeof start[], changedTouches: typeof start[] = []) => {
         const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
-          touches: typeof start;
-          changedTouches: typeof start;
+          touches: typeof start[];
+          changedTouches: typeof start[];
         };
         Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
         Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
         return evt;
       };
-      target.dispatchEvent(mkEvent('touchstart', start));
-      target.dispatchEvent(mkEvent('touchmove', move));
-      target.dispatchEvent(mkEvent('touchend', [], move));
+      await act(async () => {
+        target.dispatchEvent(mkEvent('touchstart', [start], [start]));
+        vi.advanceTimersByTime(400);
+        target.dispatchEvent(mkEvent('touchmove', [move], [move]));
+        target.dispatchEvent(mkEvent('touchend', [], [move]));
+      });
     };
 
     let mockSessions: Array<Record<string, unknown>> = [
@@ -9759,15 +9822,15 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       const view = render(<App />);
       const alphaPane = await screen.findByTestId('session-pane-deck_alpha_brain');
 
-      dispatchSwipe(
+      await dispatchSwipe(
         alphaPane,
-        [{ identifier: 1, clientX: 120, clientY: 200 }, { identifier: 2, clientX: 170, clientY: 202 }],
-        [{ identifier: 1, clientX: 120, clientY: 290 }, { identifier: 2, clientX: 170, clientY: 292 }],
+        { identifier: 1, clientX: 120, clientY: 200 },
+        { identifier: 1, clientX: 120, clientY: 290 },
       );
-      dispatchSwipe(
+      await dispatchSwipe(
         alphaPane,
-        [{ identifier: 1, clientX: 80, clientY: 200 }, { identifier: 2, clientX: 84, clientY: 250 }],
-        [{ identifier: 1, clientX: 165, clientY: 200 }, { identifier: 2, clientX: 169, clientY: 250 }],
+        { identifier: 1, clientX: 80, clientY: 200 },
+        { identifier: 1, clientX: 165, clientY: 200 },
       );
       expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
 
@@ -9778,42 +9841,47 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       expect(await screen.findByText('dashboard-page')).toBeTruthy();
       expect(localStorage.getItem('rcc_server')).toBeNull();
 
-      dispatchSwipe(
+      await dispatchSwipe(
         view.container,
-        [{ identifier: 1, clientX: 120, clientY: 200 }, { identifier: 2, clientX: 170, clientY: 202 }],
-        [{ identifier: 1, clientX: 120, clientY: 290 }, { identifier: 2, clientX: 170, clientY: 292 }],
+        { identifier: 1, clientX: 120, clientY: 200 },
+        { identifier: 1, clientX: 120, clientY: 290 },
       );
-      dispatchSwipe(
+      await dispatchSwipe(
         view.container,
-        [{ identifier: 1, clientX: 120, clientY: 290 }, { identifier: 2, clientX: 170, clientY: 292 }],
-        [{ identifier: 1, clientX: 120, clientY: 200 }, { identifier: 2, clientX: 170, clientY: 202 }],
+        { identifier: 1, clientX: 120, clientY: 290 },
+        { identifier: 1, clientX: 120, clientY: 200 },
       );
       expect(screen.getByText('dashboard-page')).toBeTruthy();
       expect(localStorage.getItem('rcc_server')).toBeNull();
       expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
     } finally {
+      vi.useRealTimers();
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
     }
   }, 15000);
 
-  it('F3: mobile 2-finger navigation safely no-ops for zero tabs with stale selection', async () => {
-    const dispatchSwipe = (
+  it('F3: mobile 1-finger navigation safely no-ops for zero tabs with stale selection', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const dispatchSwipe = async (
       target: EventTarget,
-      start: Array<{ identifier: number; clientX: number; clientY: number }>,
-      move: Array<{ identifier: number; clientX: number; clientY: number }>,
+      start: { identifier: number; clientX: number; clientY: number },
+      move: { identifier: number; clientX: number; clientY: number },
     ) => {
-      const mkEvent = (type: string, touches: typeof start, changedTouches: typeof start = []) => {
+      const mkEvent = (type: string, touches: typeof start[], changedTouches: typeof start[] = []) => {
         const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
-          touches: typeof start;
-          changedTouches: typeof start;
+          touches: typeof start[];
+          changedTouches: typeof start[];
         };
         Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
         Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
         return evt;
       };
-      target.dispatchEvent(mkEvent('touchstart', start));
-      target.dispatchEvent(mkEvent('touchmove', move));
-      target.dispatchEvent(mkEvent('touchend', [], move));
+      await act(async () => {
+        target.dispatchEvent(mkEvent('touchstart', [start], [start]));
+        vi.advanceTimersByTime(400);
+        target.dispatchEvent(mkEvent('touchmove', [move], [move]));
+        target.dispatchEvent(mkEvent('touchend', [], [move]));
+      });
     };
 
     apiFetchMock.mockImplementation(async (path: string) => {
@@ -9838,18 +9906,19 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
         wsInstances[0].emit({ type: 'session_list', daemon: 'srv-1', sessions: [] });
       });
       await waitFor(() => expect(emptyView.container.querySelector('.mobile-server-btn-name')?.textContent).toBe('Alpha Server'));
-      dispatchSwipe(
+      await dispatchSwipe(
         emptyView.container,
-        [{ identifier: 1, clientX: 80, clientY: 200 }, { identifier: 2, clientX: 84, clientY: 250 }],
-        [{ identifier: 1, clientX: 165, clientY: 200 }, { identifier: 2, clientX: 169, clientY: 250 }],
+        { identifier: 1, clientX: 80, clientY: 200 },
+        { identifier: 1, clientX: 165, clientY: 200 },
       );
-      dispatchSwipe(
+      await dispatchSwipe(
         emptyView.container,
-        [{ identifier: 1, clientX: 200, clientY: 200 }, { identifier: 2, clientX: 204, clientY: 250 }],
-        [{ identifier: 1, clientX: 115, clientY: 200 }, { identifier: 2, clientX: 119, clientY: 250 }],
+        { identifier: 1, clientX: 200, clientY: 200 },
+        { identifier: 1, clientX: 115, clientY: 200 },
       );
       expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
     } finally {
+      vi.useRealTimers();
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
     }
   }, 15000);
@@ -10026,24 +10095,28 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     }
   }, 15000);
 
-  it('toggles mobile 2-finger vertical swipes between 1 owned server and 1 shared-in server', async () => {
-    const dispatchSwipe = (
+  it('toggles mobile 1-finger long-press vertical swipes between 1 owned server and 1 shared-in server', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const dispatchSwipe = async (
       target: EventTarget,
-      start: Array<{ identifier: number; clientX: number; clientY: number }>,
-      move: Array<{ identifier: number; clientX: number; clientY: number }>,
+      start: { identifier: number; clientX: number; clientY: number },
+      move: { identifier: number; clientX: number; clientY: number },
     ) => {
-      const mkEvent = (type: string, touches: typeof start, changedTouches: typeof start = []) => {
+      const mkEvent = (type: string, touches: typeof start[], changedTouches: typeof start[] = []) => {
         const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
-          touches: typeof start;
-          changedTouches: typeof start;
+          touches: typeof start[];
+          changedTouches: typeof start[];
         };
         Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
         Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
         return evt;
       };
-      target.dispatchEvent(mkEvent('touchstart', start));
-      target.dispatchEvent(mkEvent('touchmove', move));
-      target.dispatchEvent(mkEvent('touchend', [], move));
+      await act(async () => {
+        target.dispatchEvent(mkEvent('touchstart', [start], [start]));
+        vi.advanceTimersByTime(400);
+        target.dispatchEvent(mkEvent('touchmove', [move], [move]));
+        target.dispatchEvent(mkEvent('touchend', [], [move]));
+      });
     };
 
     apiFetchMock.mockImplementation(async (path: string) => {
@@ -10105,29 +10178,30 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
         await Promise.resolve();
       });
 
-      // 2-finger swipe Down -> switches owned srv-1 -> shared srv-shared
-      dispatchSwipe(
+      // 1-finger long-press swipe Down -> switches owned srv-1 -> shared srv-shared
+      await dispatchSwipe(
         view.container,
-        [{ identifier: 1, clientX: 120, clientY: 160 }, { identifier: 2, clientX: 170, clientY: 162 }],
-        [{ identifier: 1, clientX: 120, clientY: 250 }, { identifier: 2, clientX: 170, clientY: 252 }],
+        { identifier: 1, clientX: 120, clientY: 160 },
+        { identifier: 1, clientX: 120, clientY: 250 },
       );
 
       await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(sharedServerEntry.target));
       await waitFor(() => expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Shared Mobile'));
-      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['2F', '↓']);
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['↓']);
       await screen.findByTestId('session-pane-deck_shared_mob');
 
-      // 2-finger swipe Up -> switches shared srv-shared -> owned srv-1
-      dispatchSwipe(
+      // 1-finger long-press swipe Up -> switches shared srv-shared -> owned srv-1
+      await dispatchSwipe(
         view.container,
-        [{ identifier: 1, clientX: 120, clientY: 260 }, { identifier: 2, clientX: 170, clientY: 262 }],
-        [{ identifier: 1, clientX: 120, clientY: 160 }, { identifier: 2, clientX: 170, clientY: 162 }],
+        { identifier: 1, clientX: 120, clientY: 260 },
+        { identifier: 1, clientX: 120, clientY: 160 },
       );
 
       await waitFor(() => expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Alpha Server'));
-      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['2F', '↑']);
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['↑']);
       await screen.findByTestId('session-pane-deck_alpha_brain');
     } finally {
+      vi.useRealTimers();
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
     }
   }, 15000);
@@ -10310,25 +10384,29 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
   }, 15000);
 
   it.each(['server', 'main', 'subsession'] as const)(
-    'preserves and updates ServerSwitchWatermark when 2-finger swiping from mobile Home/dashboard onto slow async %s share',
+    'preserves and updates ServerSwitchWatermark when 1-finger long-press swiping from mobile Home/dashboard onto slow async %s share',
     async (shareKind) => {
-      const dispatchSwipe = (
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const dispatchSwipe = async (
         target: EventTarget,
-        start: Array<{ identifier: number; clientX: number; clientY: number }>,
-        move: Array<{ identifier: number; clientX: number; clientY: number }>,
+        start: { identifier: number; clientX: number; clientY: number },
+        move: { identifier: number; clientX: number; clientY: number },
       ) => {
-        const mkEvent = (type: string, touches: typeof start, changedTouches: typeof start = []) => {
+        const mkEvent = (type: string, touches: typeof start[], changedTouches: typeof start[] = []) => {
           const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
-            touches: typeof start;
-            changedTouches: typeof start;
+            touches: typeof start[];
+            changedTouches: typeof start[];
           };
           Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
           Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
           return evt;
         };
-        target.dispatchEvent(mkEvent('touchstart', start));
-        target.dispatchEvent(mkEvent('touchmove', move));
-        target.dispatchEvent(mkEvent('touchend', [], move));
+        await act(async () => {
+          target.dispatchEvent(mkEvent('touchstart', [start], [start]));
+          vi.advanceTimersByTime(400);
+          target.dispatchEvent(mkEvent('touchmove', [move], [move]));
+          target.dispatchEvent(mkEvent('touchend', [], [move]));
+        });
       };
 
       apiFetchMock.mockImplementation(async (path: string) => {
@@ -10384,11 +10462,11 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
         fireEvent.click(view.container.querySelector('.mobile-server-menu-home')!);
         expect(await screen.findByText('dashboard-page')).toBeTruthy();
 
-        // 2-finger swipe Up (serverPrev) from Home hits unifiedServers tail (srv-dash-shared)
-        dispatchSwipe(
+        // 1-finger long-press swipe Up (serverPrev) from Home hits unifiedServers tail (srv-dash-shared)
+        await dispatchSwipe(
           view.container,
-          [{ identifier: 1, clientX: 120, clientY: 260 }, { identifier: 2, clientX: 170, clientY: 262 }],
-          [{ identifier: 1, clientX: 120, clientY: 160 }, { identifier: 2, clientX: 170, clientY: 162 }],
+          { identifier: 1, clientX: 120, clientY: 260 },
+          { identifier: 1, clientX: 120, clientY: 160 },
         );
 
         await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledWith(target));
@@ -10425,6 +10503,7 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
         });
         await screen.findByTestId('session-pane-deck_shared_dash');
       } finally {
+        vi.useRealTimers();
         Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
       }
     },
@@ -10432,23 +10511,27 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
   );
 
   it('clears pending dashboard ServerSwitchWatermark cleanly on share error and blocks stale late resolve after switching away', async () => {
-    const dispatchSwipe = (
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const dispatchSwipe = async (
       target: EventTarget,
-      start: Array<{ identifier: number; clientX: number; clientY: number }>,
-      move: Array<{ identifier: number; clientX: number; clientY: number }>,
+      start: { identifier: number; clientX: number; clientY: number },
+      move: { identifier: number; clientX: number; clientY: number },
     ) => {
-      const mkEvent = (type: string, touches: typeof start, changedTouches: typeof start = []) => {
+      const mkEvent = (type: string, touches: typeof start[], changedTouches: typeof start[] = []) => {
         const evt = new Event(type, { bubbles: true, cancelable: true }) as Event & {
-          touches: typeof start;
-          changedTouches: typeof start;
+          touches: typeof start[];
+          changedTouches: typeof start[];
         };
         Object.defineProperty(evt, 'touches', { configurable: true, value: touches });
         Object.defineProperty(evt, 'changedTouches', { configurable: true, value: changedTouches });
         return evt;
       };
-      target.dispatchEvent(mkEvent('touchstart', start));
-      target.dispatchEvent(mkEvent('touchmove', move));
-      target.dispatchEvent(mkEvent('touchend', [], move));
+      await act(async () => {
+        target.dispatchEvent(mkEvent('touchstart', [start], [start]));
+        vi.advanceTimersByTime(400);
+        target.dispatchEvent(mkEvent('touchmove', [move], [move]));
+        target.dispatchEvent(mkEvent('touchend', [], [move]));
+      });
     };
 
     apiFetchMock.mockImplementation(async (path: string) => {
@@ -10503,10 +10586,10 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       expect(await screen.findByText('dashboard-page')).toBeTruthy();
 
       // Attempt 1: pending HUD appears from dashboard, then request rejects -> HUD clears and stays on dashboard
-      dispatchSwipe(
+      await dispatchSwipe(
         view.container,
-        [{ identifier: 1, clientX: 120, clientY: 260 }, { identifier: 2, clientX: 170, clientY: 262 }],
-        [{ identifier: 1, clientX: 120, clientY: 160 }, { identifier: 2, clientX: 170, clientY: 162 }],
+        { identifier: 1, clientX: 120, clientY: 260 },
+        { identifier: 1, clientX: 120, clientY: 160 },
       );
       await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledTimes(1));
       expect((await screen.findByTestId('server-switch-watermark-server')).textContent).toBe('Shared Err Host');
@@ -10518,18 +10601,18 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       expect(screen.getByText('dashboard-page')).toBeTruthy();
 
       // Attempt 2: pending shared open from dashboard, then swipe Down synchronously selects owned srv-1 -> abort + late resolve ignored
-      dispatchSwipe(
+      await dispatchSwipe(
         view.container,
-        [{ identifier: 1, clientX: 120, clientY: 260 }, { identifier: 2, clientX: 170, clientY: 262 }],
-        [{ identifier: 1, clientX: 120, clientY: 160 }, { identifier: 2, clientX: 170, clientY: 162 }],
+        { identifier: 1, clientX: 120, clientY: 260 },
+        { identifier: 1, clientX: 120, clientY: 160 },
       );
       await waitFor(() => expect(openSharedEntryMock).toHaveBeenCalledTimes(2));
       expect((await screen.findByTestId('server-switch-watermark-server')).textContent).toBe('Shared Err Host');
 
-      dispatchSwipe(
+      await dispatchSwipe(
         view.container,
-        [{ identifier: 1, clientX: 120, clientY: 160 }, { identifier: 2, clientX: 170, clientY: 162 }],
-        [{ identifier: 1, clientX: 120, clientY: 250 }, { identifier: 2, clientX: 170, clientY: 252 }],
+        { identifier: 1, clientX: 120, clientY: 160 },
+        { identifier: 1, clientX: 120, clientY: 250 },
       );
       await waitFor(() => expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Alpha Server'));
       await screen.findByTestId('session-pane-deck_alpha_brain');
@@ -10547,11 +10630,13 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       expect(screen.getByTestId('server-switch-watermark-server').textContent).toBe('Alpha Server');
       expect(screen.queryByTestId('session-pane-deck_err_sess')).toBeNull();
     } finally {
+      vi.useRealTimers();
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
     }
   }, 15000);
 
-  it('shows 4-direction MobileSwipeHud gated on threshold-on-release and ignores bottom drag/scroll surfaces', async () => {
+  it('shows multi-level 4-direction MobileSwipeHud on 1-finger long-press, switches multi-step by distance, and ignores bottom drag/scroll surfaces', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     const mkTouchEvent = (
       type: 'touchstart' | 'touchmove' | 'touchend' | 'touchcancel',
       touches: Array<{ identifier: number; clientX: number; clientY: number }>,
@@ -10583,38 +10668,29 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
         const el = view.container.querySelector(selector);
         if (!el) continue;
         await act(async () => {
-          el.dispatchEvent(mkTouchEvent('touchstart', [
-            { identifier: 1, clientX: 80, clientY: 500 },
-            { identifier: 2, clientX: 84, clientY: 520 },
-          ]));
-          el.dispatchEvent(mkTouchEvent('touchmove', [
-            { identifier: 1, clientX: 160, clientY: 500 },
-            { identifier: 2, clientX: 164, clientY: 520 },
-          ]));
+          el.dispatchEvent(mkTouchEvent('touchstart', [{ identifier: 1, clientX: 80, clientY: 500 }]));
+          vi.advanceTimersByTime(400);
+          el.dispatchEvent(mkTouchEvent('touchmove', [{ identifier: 1, clientX: 160, clientY: 500 }]));
         });
         expect(screen.queryByTestId('mobile-swipe-hud')).toBeNull();
         await act(async () => {
-          el.dispatchEvent(mkTouchEvent('touchend', []));
+          el.dispatchEvent(mkTouchEvent('touchend', [], [{ identifier: 1, clientX: 160, clientY: 500 }]));
         });
         expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
         expect(screen.queryByTestId('server-switch-watermark')).toBeNull();
       }
 
-      // 2) Dragging 2 fingers on session pane shows 4-direction HUD before threshold without switching yet
+      // 2) Long-press + drag 1 finger on session pane shows multi-level 4-direction HUD before threshold without switching yet
       await act(async () => {
-        alphaPane.dispatchEvent(mkTouchEvent('touchstart', [
-          { identifier: 1, clientX: 80, clientY: 200 },
-          { identifier: 2, clientX: 84, clientY: 250 },
-        ]));
-        alphaPane.dispatchEvent(mkTouchEvent('touchmove', [
-          { identifier: 1, clientX: 112, clientY: 200 },
-          { identifier: 2, clientX: 116, clientY: 250 },
-        ]));
+        alphaPane.dispatchEvent(mkTouchEvent('touchstart', [{ identifier: 1, clientX: 80, clientY: 200 }]));
+        vi.advanceTimersByTime(400);
+        alphaPane.dispatchEvent(mkTouchEvent('touchmove', [{ identifier: 1, clientX: 112, clientY: 200 }]));
       });
 
       const hud = screen.getByTestId('mobile-swipe-hud');
       expect(hud.getAttribute('data-direction')).toBe('right');
       expect(hud.getAttribute('data-armed')).toBe('false');
+      expect(hud.getAttribute('data-step')).toBe('0');
       expect(screen.getByTestId('mobile-swipe-hud-dir-up')).toBeTruthy();
       expect(screen.getByTestId('mobile-swipe-hud-dir-down')).toBeTruthy();
       expect(screen.getByTestId('mobile-swipe-hud-dir-left')).toBeTruthy();
@@ -10622,29 +10698,33 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       expect(screen.getByTestId('mobile-swipe-hud-dir-target-up').textContent).toBe('Server Two');
       expect(screen.getByTestId('mobile-swipe-hud-dir-target-down').textContent).toBe('Server Two');
       expect(screen.getByTestId('mobile-swipe-hud-dir-target-left').textContent).toBe('gamma');
+      expect(screen.getByTestId('mobile-swipe-hud-dir-target-left-2').textContent).toBe('beta');
       expect(screen.getByTestId('mobile-swipe-hud-dir-target-right').textContent).toBe('beta');
+      expect(screen.getByTestId('mobile-swipe-hud-dir-target-right-2').textContent).toBe('gamma');
       expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
 
-      // 3) Drag past threshold -> armed, STILL does not switch mid-drag
+      // 3) Drag past step 1 threshold (60px) -> step=1 armed, then step 2 (110px) -> step=2 armed, STILL does not switch mid-drag
       await act(async () => {
-        alphaPane.dispatchEvent(mkTouchEvent('touchmove', [
-          { identifier: 1, clientX: 160, clientY: 200 },
-          { identifier: 2, clientX: 164, clientY: 250 },
-        ]));
+        alphaPane.dispatchEvent(mkTouchEvent('touchmove', [{ identifier: 1, clientX: 140, clientY: 200 }]));
       });
       expect(screen.getByTestId('mobile-swipe-hud').getAttribute('data-armed')).toBe('true');
+      expect(screen.getByTestId('mobile-swipe-hud').getAttribute('data-step')).toBe('1');
+      expect(screen.getByTestId('mobile-swipe-hud-dir-target-right').getAttribute('data-selected')).toBe('true');
+
+      await act(async () => {
+        alphaPane.dispatchEvent(mkTouchEvent('touchmove', [{ identifier: 1, clientX: 190, clientY: 200 }]));
+      });
+      expect(screen.getByTestId('mobile-swipe-hud').getAttribute('data-step')).toBe('2');
+      expect(screen.getByTestId('mobile-swipe-hud-dir-target-right-2').getAttribute('data-selected')).toBe('true');
       expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
 
       // 4) Pull back below threshold before lifting -> disarms and does NOT switch on release
       await act(async () => {
-        alphaPane.dispatchEvent(mkTouchEvent('touchmove', [
-          { identifier: 1, clientX: 100, clientY: 200 },
-          { identifier: 2, clientX: 104, clientY: 250 },
-        ]));
+        alphaPane.dispatchEvent(mkTouchEvent('touchmove', [{ identifier: 1, clientX: 100, clientY: 200 }]));
       });
       expect(screen.getByTestId('mobile-swipe-hud').getAttribute('data-armed')).toBe('false');
       await act(async () => {
-        alphaPane.dispatchEvent(mkTouchEvent('touchend', []));
+        alphaPane.dispatchEvent(mkTouchEvent('touchend', [], [{ identifier: 1, clientX: 100, clientY: 200 }]));
       });
       expect(screen.queryByTestId('mobile-swipe-hud')).toBeNull();
       expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
@@ -10652,14 +10732,9 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
 
       // 5) Drag past threshold and touchcancel -> clears HUD without switching
       await act(async () => {
-        alphaPane.dispatchEvent(mkTouchEvent('touchstart', [
-          { identifier: 1, clientX: 80, clientY: 200 },
-          { identifier: 2, clientX: 84, clientY: 250 },
-        ]));
-        alphaPane.dispatchEvent(mkTouchEvent('touchmove', [
-          { identifier: 1, clientX: 160, clientY: 200 },
-          { identifier: 2, clientX: 164, clientY: 250 },
-        ]));
+        alphaPane.dispatchEvent(mkTouchEvent('touchstart', [{ identifier: 1, clientX: 80, clientY: 200 }]));
+        vi.advanceTimersByTime(400);
+        alphaPane.dispatchEvent(mkTouchEvent('touchmove', [{ identifier: 1, clientX: 160, clientY: 200 }]));
       });
       expect(screen.getByTestId('mobile-swipe-hud').getAttribute('data-armed')).toBe('true');
       await act(async () => {
@@ -10668,21 +10743,18 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       expect(screen.queryByTestId('mobile-swipe-hud')).toBeNull();
       expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
 
-      // 6) Drag past threshold and release -> clears HUD and switches to deck_beta_brain
+      // 6) Drag past step 2 threshold (110px) and release -> clears HUD and jumps straight to deck_gamma_brain
       await act(async () => {
-        alphaPane.dispatchEvent(mkTouchEvent('touchstart', [
-          { identifier: 1, clientX: 80, clientY: 200 },
-          { identifier: 2, clientX: 84, clientY: 250 },
-        ]));
-        alphaPane.dispatchEvent(mkTouchEvent('touchmove', [
-          { identifier: 1, clientX: 160, clientY: 200 },
-          { identifier: 2, clientX: 164, clientY: 250 },
-        ]));
-        alphaPane.dispatchEvent(mkTouchEvent('touchend', []));
+        alphaPane.dispatchEvent(mkTouchEvent('touchstart', [{ identifier: 1, clientX: 80, clientY: 200 }]));
+        vi.advanceTimersByTime(400);
+        alphaPane.dispatchEvent(mkTouchEvent('touchmove', [{ identifier: 1, clientX: 190, clientY: 200 }]));
+        alphaPane.dispatchEvent(mkTouchEvent('touchend', [], [{ identifier: 1, clientX: 190, clientY: 200 }]));
       });
       expect(screen.queryByTestId('mobile-swipe-hud')).toBeNull();
-      await waitFor(() => expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true'));
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_gamma_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(Array.from(screen.getByTestId('server-switch-watermark-shortcut').querySelectorAll('kbd')).map((el) => el.textContent)).toEqual(['→', '×2']);
     } finally {
+      vi.useRealTimers();
       Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
     }
   }, 15000);

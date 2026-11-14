@@ -95,7 +95,7 @@ describe('ChatView mobile navigation gesture isolation', () => {
     cleanup();
   });
 
-  it('prevents 2-finger swipe from breaking ChatView follow or triggering highlight/menu', () => {
+  it('ignores 2-finger touch on ChatView without triggering navigation', () => {
     vi.useFakeTimers();
     window.matchMedia = makeCoarseMatchMedia();
     const actions: string[] = [];
@@ -108,7 +108,7 @@ describe('ChatView mobile navigation gesture isolation', () => {
       <ChatView events={[makeAssistantEvent(1), makeAssistantEvent(2)]} loading={false} sessionId="sess-mobile" />,
     );
     act(() => {});
-    const chatView = makeScrollableChatView(container);
+    makeScrollableChatView(container);
     const bubble = container.querySelector('.chat-event') as HTMLElement;
     expect(bubble).toBeTruthy();
 
@@ -117,26 +117,19 @@ describe('ChatView mobile navigation gesture isolation', () => {
         { identifier: 1, clientX: 120, clientY: 160, target: bubble },
         { identifier: 2, clientX: 180, clientY: 160, target: bubble },
       ]);
-      expect(startEvt.defaultPrevented).toBe(true);
+      expect(startEvt.defaultPrevented).toBe(false);
 
-      // Drag DOWN (> 6px handleTouchMove deadzone and > 56px nav threshold)
       const moveEvt = dispatchTouch(bubble, 'touchmove', [
         { identifier: 1, clientX: 120, clientY: 250, target: bubble },
         { identifier: 2, clientX: 180, clientY: 250, target: bubble },
       ]);
-      expect(moveEvt.defaultPrevented).toBe(true);
+      expect(moveEvt.defaultPrevented).toBe(false);
 
       vi.advanceTimersByTime(500);
-      const endEvt = dispatchTouch(bubble, 'touchend', []);
-      expect(endEvt.defaultPrevented).toBe(true);
+      dispatchTouch(bubble, 'touchend', []);
     });
 
-    expect(actions).toEqual(['serverNext']);
-    expect(container.querySelector('.chat-scroll-btn')).toBeNull();
-    expect(container.querySelector('.chat-highlight')).toBeNull();
-    expect(container.querySelector('.chat-sel-menu')).toBeNull();
-    expect(chatView.classList.contains('chat-highlight')).toBe(false);
-
+    expect(actions).toEqual([]);
     detach();
   });
 

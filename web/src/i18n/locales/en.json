@@ -5412,13 +5412,14 @@
   },
   "mobile_gesture": {
     "hud": {
-      "title": "2-Finger Navigation",
+      "title": "Gesture",
       "up": "Previous Server",
       "down": "Next Server",
       "left": "Previous Session",
       "right": "Next Session",
       "drag_to_threshold": "Drag past threshold to switch",
       "release_to_switch": "Release to switch",
+      "release_to_switch_step": "Release to switch (L{{step}})",
       "no_target": "No other target"
     }
   }
