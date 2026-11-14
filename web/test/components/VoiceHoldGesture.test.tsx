@@ -2521,4 +2521,87 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(ws.sendSessionCommand).toHaveBeenCalledTimes(1);
   });
+
+  it('moves caret to END on initial mobile tap even when VoiceInput is unavailable and focus runs before click, while keeping subsequent middle taps and desktop clicks native', async () => {
+    voiceMock.isAvailable.mockReturnValue(false);
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    const { rerender } = render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    const dispatchPrimary = (el: EventTarget, type: string, clientX = 10, clientY = 500, pointerId = 31) => {
+      const ev = new Event(type, { bubbles: true, cancelable: true }) as PointerEvent;
+      Object.assign(ev, { clientX, clientY, pointerId, button: 0, pointerType: 'touch', isPrimary: true, buttons: type === 'pointerup' ? 0 : 1 });
+      return fireEvent(el, ev);
+    };
+
+    const input = document.querySelector('.controls-input') as HTMLElement;
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    input.textContent = 'line 1\nexisting message';
+    const textNode = input.firstChild as Text;
+
+    // 1. Real mobile tap order when VoiceInput unavailable: pointerdown -> pointerup -> native mousedown/focus at offset 0 -> click
+    dispatchPrimary(input, 'pointerdown', 10, 500, 31);
+    dispatchPrimary(input, 'pointerup', 10, 500, 31);
+    input.focus();
+    const sel = window.getSelection();
+    const zeroRange = document.createRange();
+    zeroRange.setStart(textNode, 0);
+    zeroRange.collapse(true);
+    sel?.removeAllRanges();
+    sel?.addRange(zeroRange);
+    fireEvent.focus(input);
+    fireEvent.click(input);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(document.activeElement).toBe(input);
+    expect(window.getSelection()?.focusNode).toBe(input);
+    expect(window.getSelection()?.focusOffset).toBe(input.childNodes.length);
+
+    // 2. Subsequent tap while already focused keeps tapped middle offset (e.g. 5) intact
+    const midRange = document.createRange();
+    midRange.setStart(textNode, 5);
+    midRange.collapse(true);
+    sel?.removeAllRanges();
+    sel?.addRange(midRange);
+    dispatchPrimary(input, 'pointerdown', 40, 500, 32);
+    dispatchPrimary(input, 'pointerup', 40, 500, 32);
+    fireEvent.click(input);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(window.getSelection()?.focusOffset).toBe(5);
+
+    // 3. Desktop positive control: unfocused click at middle offset MUST NOT jump caret to end
+    input.blur();
+    fireEvent.blur(input);
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1280 });
+    rerender(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+    fireEvent.pointerDown(input, { clientX: 40, clientY: 500, pointerId: 33, button: 0, pointerType: 'mouse', isPrimary: true });
+    input.focus();
+    const desktopMid = document.createRange();
+    desktopMid.setStart(textNode, 4);
+    desktopMid.collapse(true);
+    sel?.removeAllRanges();
+    sel?.addRange(desktopMid);
+    fireEvent.focus(input);
+    fireEvent.click(input);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(window.getSelection()?.focusNode).toBe(textNode);
+    expect(window.getSelection()?.focusOffset).toBe(4);
+  });
 });

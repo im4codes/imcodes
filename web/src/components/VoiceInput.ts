@@ -616,18 +616,19 @@ function stopWebLevelMeter(): void {
 }
 
 /** Best-effort waveform levels via Web Audio. Failure must not break recognition. */
+function shouldSkipWebLevelMeter(): boolean {
+  // Touch-capable browsers (including iPad Safari "Request Desktop Website" and
+  // Android Chrome "Desktop site" where UA omits Mobile/iPad tokens) share an
+  // exclusive mic capture route with Web SpeechRecognition.
+  return typeof navigator !== 'undefined' && (navigator.maxTouchPoints ?? 0) > 0;
+}
+
 async function startWebLevelMeter(generation: number): Promise<void> {
   // Transcript ownership intentionally survives Stop until final/onend, but
   // microphone/RAF ownership ends immediately when capture stops.
   const isCapturing = (): boolean => generation === _generation && _listening;
   try {
-    // Mobile touch browsers/WebViews share a single exclusive audio capture route;
-    // opening getUserMedia alongside SpeechRecognition starves/silences recognition.
-    const isMobileTouchUa =
-      typeof navigator !== 'undefined'
-      && (navigator.maxTouchPoints ?? 0) > 0
-      && /iPhone|iPad|iPod|Android|Mobile/i.test(navigator.userAgent ?? '');
-    if (isMobileTouchUa) return;
+    if (shouldSkipWebLevelMeter()) return;
     if (!isCapturing() || !navigator.mediaDevices?.getUserMedia) return;
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     if (!isCapturing()) {

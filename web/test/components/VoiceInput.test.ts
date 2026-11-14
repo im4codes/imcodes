@@ -1311,53 +1311,82 @@ describe('Web Mobile final drain', () => {
     }
   });
 
-  it('skips competing getUserMedia level meter on mobile touch browsers so Web Speech emits transcripts cleanly and marks drain start cleanly', async () => {
+  it('skips competing getUserMedia level meter across all touch browsers (including Request Desktop Website UAs) while preserving non-touch desktop meter', async () => {
     const instances = browser({ autoStart: false });
     const meter = meterHarness();
     const origUa = Object.getOwnPropertyDescriptor(navigator, 'userAgent');
     const origTouch = Object.getOwnPropertyDescriptor(navigator, 'maxTouchPoints');
-    Object.defineProperty(navigator, 'userAgent', {
-      value: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1',
-      configurable: true,
-    });
-    Object.defineProperty(navigator, 'maxTouchPoints', {
-      value: 5,
-      configurable: true,
-    });
     const listening: boolean[] = [];
     const errors: string[] = [];
     const partials: Array<[string, boolean]> = [];
-    try {
+    const runProfile = async (ua: string, touchPoints: number, expectedGrants: number, phrase: string) => {
+      meter.grants.length = 0;
+      Object.defineProperty(navigator, 'userAgent', { value: ua, configurable: true });
+      Object.defineProperty(navigator, 'maxTouchPoints', { value: touchPoints, configurable: true });
       await expect(VoiceInput.startListening(
         (text, isFinal) => partials.push([text, isFinal]),
         (v) => listening.push(v),
         (err) => errors.push(err),
       )).resolves.toBe(true);
-
-      instances[0].onstart?.();
-      instances[0].onaudiostart?.();
+      const rec = instances[instances.length - 1];
+      rec.onstart?.();
+      rec.onaudiostart?.();
       await Promise.resolve();
-      expect(listening).toEqual([true]);
-      // Critical on mobile iOS/Android web: getUserMedia MUST NOT open alongside SpeechRecognition
-      expect(meter.grants).toHaveLength(0);
-
-      final(instances[0], 'mobile transcript works');
-      expect(partials).toEqual([['mobile transcript works', true]]);
+      expect(meter.grants).toHaveLength(expectedGrants);
+      final(rec, phrase);
+      const stopPromise = VoiceInput.stopListening();
+      rec.onend?.();
+      await stopPromise;
+    };
+    try {
+      // 1. Mobile iPhone UA + touch -> 0 getUserMedia grants
+      await runProfile(
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1',
+        5,
+        0,
+        'iphone transcript',
+      );
+      // 2. iPad Safari "Request Desktop Website" (Macintosh UA + touch) -> 0 getUserMedia grants
+      await runProfile(
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15',
+        5,
+        0,
+        'ipad desktop mode transcript',
+      );
+      // 3. Android Chrome "Desktop site" (X11 Linux UA + touch) -> 0 getUserMedia grants
+      await runProfile(
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+        5,
+        0,
+        'android desktop mode transcript',
+      );
+      // 4. Non-touch desktop browser -> keeps optional Web level meter (1 grant)
+      await runProfile(
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+        0,
+        1,
+        'desktop meter transcript',
+      );
+      expect(listening).toEqual([true, false, true, false, true, false, true, false]);
+      expect(partials).toEqual([
+        ['iphone transcript', true],
+        ['ipad desktop mode transcript', true],
+        ['android desktop mode transcript', true],
+        ['desktop meter transcript', true],
+      ]);
       expect(errors).toEqual([]);
 
-      const stopPromise = VoiceInput.stopListening();
-      instances[0].onend?.();
-      await stopPromise;
-
       // Stopping before onstart drains cleanly without spurious permission_denied
+      Object.defineProperty(navigator, 'maxTouchPoints', { value: 5, configurable: true });
       await expect(VoiceInput.startListening(
         (text, isFinal) => partials.push([text, isFinal]),
         undefined,
         (err) => errors.push(err),
       )).resolves.toBe(true);
       const earlyStop = VoiceInput.stopListening();
-      instances[1].onstart?.();
-      instances[1].onend?.();
+      const drainRec = instances[instances.length - 1];
+      drainRec.onstart?.();
+      drainRec.onend?.();
       await earlyStop;
       expect(errors).toEqual([]);
     } finally {

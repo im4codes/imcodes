@@ -1593,6 +1593,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     lastActivityAt: number;
     captureLost: boolean;
   } | null>(null);
+  const pendingMobileInitialEndFocusRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+  } | null>(null);
   const voiceHoldPendingRef = useRef(false);
   const voiceHoldActiveRef = useRef(false);
   const voiceHoldZoneRef = useRef<'send' | 'cancel' | 'edit'>('send');
@@ -5618,6 +5623,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   /** Restore editability and focus the composer on any short tap or failed hold. */
   const fallbackToComposerClick = useCallback((pointerType?: string) => {
+    pendingMobileInitialEndFocusRef.current = null;
     if (!mountedRef.current || inputDisabledRef.current) return;
     suppressComposerClickFocusRef.current = false;
     if (suppressComposerClickTimerRef.current !== null) {
@@ -5831,6 +5837,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     captureTarget?: EventTarget | null,
   ) => {
     clearVoiceHoldTimers();
+    pendingMobileInitialEndFocusRef.current = null;
     voiceHoldPendingRef.current = false;
     setVoiceHoldPending(false);
     if (!mountedRef.current || voiceHoldTxRef.current !== null) {
@@ -5969,7 +5976,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       suppressComposerClickTimerRef.current = null;
     }
     const mobile = typeof window !== 'undefined' && window.innerWidth <= 640;
-    if (!mobile || inputDisabled || voiceOpen || !VoiceInput.isAvailable()) return;
+    if (!mobile || inputDisabled || voiceOpen) return;
     if (event.button !== undefined && event.button !== 0) return;
     if (event.isPrimary === false) return;
 
@@ -5989,8 +5996,20 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       // Once the composer is focused / IME is active, all taps, moves, and
       // long-presses stay 100% native so selection, cursor placement, and
       // copy/paste callouts are never hijacked by voice capture or touch locks.
+      pendingMobileInitialEndFocusRef.current = null;
       return;
     }
+
+    // Track initial unfocused mobile tap intent regardless of VoiceInput availability so
+    // the first tap onto an already contenteditable="true" composer places caret at END
+    // even when browser mousedown/focus fires before click.
+    pendingMobileInitialEndFocusRef.current = {
+      pointerId: event.pointerId ?? 1,
+      startX: event.clientX ?? 0,
+      startY: event.clientY ?? 0,
+    };
+
+    if (!VoiceInput.isAvailable()) return;
     // Never call event.preventDefault() on pointerdown: doing so suppresses
     // iOS/Android native tap-to-focus and prevents the soft keyboard / IME
     // from opening when tapping the composer. While an earlier drain settles,
@@ -6039,7 +6058,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     const ptr = voiceHoldPointerRef.current;
     const tx = voiceHoldTxRef.current;
     if (ptr && event.pointerId !== undefined && event.pointerId !== ptr.id) return;
-    if (!ptr && !tx) return;
+    if (!ptr && !tx) {
+      const pendingEndFocus = pendingMobileInitialEndFocusRef.current;
+      if (pendingEndFocus && (event.pointerId === undefined || event.pointerId === pendingEndFocus.pointerId)) {
+        const dist = Math.hypot((event.clientX ?? 0) - pendingEndFocus.startX, (event.clientY ?? 0) - pendingEndFocus.startY);
+        if (dist > VOICE_HOLD_MOVE_SLOP_PX) {
+          pendingMobileInitialEndFocusRef.current = null;
+        }
+      }
+      return;
+    }
     if (ptr) {
       ptr.lastActivityAt = Date.now();
     }
@@ -6116,7 +6144,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     const ptr = voiceHoldPointerRef.current;
     const tx = voiceHoldTxRef.current;
     if (ptr && event.pointerId !== undefined && event.pointerId !== ptr.id) return;
-    if (!ptr && !tx) return;
+    if (!ptr && !tx) {
+      if (
+        cancelled
+        && pendingMobileInitialEndFocusRef.current
+        && (event.pointerId === undefined || event.pointerId === pendingMobileInitialEndFocusRef.current.pointerId)
+      ) {
+        pendingMobileInitialEndFocusRef.current = null;
+      }
+      return;
+    }
     const resolvedPointerType = ptr?.pointerType ?? event.pointerType ?? tx?.pointerType ?? 'touch';
     voiceHoldPointerRef.current = null;
     voiceHoldPendingRef.current = false;
@@ -6455,6 +6492,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   };
 
   const handleBlur = () => {
+    pendingMobileInitialEndFocusRef.current = null;
     composerFocusedRef.current = false;
     setComposerFocused(false);
     closeQuickSuggestions();
@@ -9089,8 +9127,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             onBlur={handleBlur}
             onClick={() => {
               const el = divRef.current;
-              if (!el || suppressComposerClickFocusRef.current) return;
-              if (inputDisabledRef.current) return;
+              if (!el || suppressComposerClickFocusRef.current) {
+                pendingMobileInitialEndFocusRef.current = null;
+                return;
+              }
+              if (inputDisabledRef.current) {
+                pendingMobileInitialEndFocusRef.current = null;
+                return;
+              }
               if (
                 (voiceHoldPendingRef.current || voiceHoldActiveRef.current)
                 && (voiceHoldPointerRef.current?.captureLost || voiceHoldPointerRef.current === null)
@@ -9098,8 +9142,19 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 retireOrphanedVoiceHold();
               }
               if (voiceHoldPendingRef.current || voiceHoldActiveRef.current) return;
-              if (!composerFocusedRef.current || el.getAttribute('contenteditable') !== 'true') {
-                focusComposerForTyping({ moveCursorToEnd: true });
+              const shouldMoveInitialMobileToEnd = pendingMobileInitialEndFocusRef.current !== null;
+              pendingMobileInitialEndFocusRef.current = null;
+              const isMobileViewport = typeof window !== 'undefined' && window.innerWidth <= 640;
+              if (
+                shouldMoveInitialMobileToEnd
+                || !composerFocusedRef.current
+                || el.getAttribute('contenteditable') !== 'true'
+              ) {
+                focusComposerForTyping(
+                  shouldMoveInitialMobileToEnd || isMobileViewport
+                    ? { moveCursorToEnd: true }
+                    : undefined,
+                );
               }
             }}
             onPointerDown={handleComposerVoicePointerDown}
@@ -9107,6 +9162,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             onPointerUp={(e) => handleComposerVoicePointerEnd(e, false)}
             onPointerCancel={(e) => handleComposerVoicePointerEnd(e, true)}
             onContextMenu={(e) => {
+              pendingMobileInitialEndFocusRef.current = null;
               if (voiceHoldPending || voiceHoldPendingRef.current || voiceHoldActiveRef.current) {
                 e.preventDefault();
               }
