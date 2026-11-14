@@ -714,7 +714,7 @@ export function readComposerElementText(
     if (node.nodeType !== Node.ELEMENT_NODE) return;
     const element = node as HTMLElement;
     const tag = element.tagName;
-    const isBlock = tag === 'DIV' || tag === 'P' || tag === 'LI';
+    const isBlock = isComposerBlockTag(tag);
     if (tag === 'BR') {
       if (!preserveEditingLines) {
         appendComposerNewline(parts);
@@ -724,7 +724,7 @@ export function readComposerElementText(
         parts.push('\n');
         pendingBlockBreak = false;
       }
-      if (hasFollowingVisibleSibling(element)) {
+      if (hasFollowingVisibleContentInBlock(element, root)) {
         parts.push('\n');
         hasContentBeforeBlock = false;
       } else {
@@ -783,15 +783,40 @@ function resolveComposerCaretRect(
   return null;
 }
 
-function hasFollowingVisibleSibling(node: Node): boolean {
-  let sibling: Node | null = node.nextSibling;
-  while (sibling) {
-    if (sibling.nodeType === Node.TEXT_NODE) {
-      if ((sibling.textContent ?? '').length > 0) return true;
-    } else if (sibling.nodeType === Node.ELEMENT_NODE) {
-      return true;
+function isComposerBlockTag(tagName: string): boolean {
+  return tagName === 'DIV' || tagName === 'P' || tagName === 'LI';
+}
+
+function hasVisibleComposerNodeContent(node: Node): boolean {
+  if (node.nodeType === Node.TEXT_NODE) {
+    return (node.textContent ?? '').length > 0;
+  }
+  if (node.nodeType !== Node.ELEMENT_NODE) return false;
+  const element = node as HTMLElement;
+  if (element.tagName === 'BR') return true;
+  for (let i = 0; i < element.childNodes.length; i += 1) {
+    if (hasVisibleComposerNodeContent(element.childNodes[i])) return true;
+  }
+  return false;
+}
+
+function hasFollowingVisibleContentInBlock(node: Node, root: HTMLElement): boolean {
+  // Climb past transparent inline wrappers (span/b/i/etc.) while stopping at
+  // the enclosing block boundary or composer root so a trailing sentinel <br>
+  // inside a block does not double-count with the block's own line break.
+  let current: Node | null = node;
+  while (current && current !== root) {
+    let sibling: Node | null = current.nextSibling;
+    while (sibling) {
+      if (hasVisibleComposerNodeContent(sibling)) return true;
+      sibling = sibling.nextSibling;
     }
-    sibling = sibling.nextSibling;
+    const parent: Node | null = current.parentNode;
+    if (!parent || parent === root) break;
+    if (parent.nodeType === Node.ELEMENT_NODE && isComposerBlockTag((parent as HTMLElement).tagName)) {
+      break;
+    }
+    current = parent;
   }
   return false;
 }
@@ -850,7 +875,7 @@ function hasStructuralLineBreakRelativeToCaret(
         line += 1;
         pendingBlockBreak = false;
       }
-      if (hasFollowingVisibleSibling(element)) {
+      if (hasFollowingVisibleContentInBlock(element, root)) {
         line += 1;
         hasContentBeforeBlock = false;
       } else {
@@ -859,7 +884,7 @@ function hasStructuralLineBreakRelativeToCaret(
       return;
     }
 
-    const isBlock = element !== root && (tag === 'DIV' || tag === 'P' || tag === 'LI');
+    const isBlock = element !== root && isComposerBlockTag(tag);
     if (isBlock && (pendingBlockBreak || hasContentBeforeBlock)) {
       line += 1;
       pendingBlockBreak = false;

@@ -8818,6 +8818,118 @@ afterEach(() => {
       expect(input.textContent).toBe('newest original');
     });
 
+    it('treats <br> inside nested inline wrappers as a real line break when followed in the same block while preserving block boundaries and trailing sentinel control', () => {
+      // 1. Serializer parity across inline-wrapped <br> shapes
+      const probe = document.createElement('div');
+      probe.innerHTML = '<span>first<br></span>second';
+      expect(readComposerElementText(probe)).toBe('first\nsecond');
+      expect(readComposerElementText(probe, { preserveEditingLines: true })).toBe('first\nsecond');
+
+      probe.innerHTML = '<b><i>first<br></i></b>second';
+      expect(readComposerElementText(probe, { preserveEditingLines: true })).toBe('first\nsecond');
+
+      probe.innerHTML = '<div><span>a<br></span></div><div>b</div>';
+      expect(readComposerElementText(probe, { preserveEditingLines: true })).toBe('a\nb');
+
+      probe.innerHTML = '<div><b><i>a<br></i></b><span>b</span></div>';
+      expect(readComposerElementText(probe, { preserveEditingLines: true })).toBe('a\nb');
+
+      probe.innerHTML = '<span>a<br></span><br>b';
+      expect(readComposerElementText(probe, { preserveEditingLines: true })).toBe('a\n\nb');
+
+      probe.innerHTML = '<span>single<br></span>';
+      expect(readComposerElementText(probe, { preserveEditingLines: true })).toBe('single');
+
+      probe.innerHTML = '<span>a<br></span><span></span>';
+      expect(readComposerElementText(probe, { preserveEditingLines: true })).toBe('a');
+
+      probe.innerHTML = '<b><i><br></i></b>';
+      expect(readComposerElementText(probe, { preserveEditingLines: true })).toBe('');
+
+      // 2. Rendered SessionControls round-trip + structural caret boundary checks
+      const ws = makeWs();
+      const quickData = makeQuickData();
+      quickData.data = {
+        history: [],
+        sessionHistory: {
+          'my-session': ['newest original', 'older original'],
+        },
+        commands: [],
+        phrases: [],
+      };
+      render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={quickData as any} />);
+      const input = screen.getByRole('textbox') as HTMLDivElement;
+
+      // Recall history[0] and edit to <span>first<br></span>second
+      input.textContent = 'draft';
+      fireEvent.input(input);
+      placeCollapsedCaret(input.firstChild!, 5);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('newest original');
+
+      input.innerHTML = '<span>first<br></span>second';
+      fireEvent.input(input);
+
+      // Caret on line 1 ("first") + ArrowDown stays in composer; caret on line 2 ("second") + ArrowUp stays in composer
+      placeCollapsedCaret(input.querySelector('span')!.firstChild!, 2);
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      expect(input.innerHTML).toContain('<span>first<br></span>second');
+
+      placeCollapsedCaret(input.lastChild!, 3);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.innerHTML).toContain('<span>first<br></span>second');
+
+      // ArrowUp from first line switches to history[1]
+      placeCollapsedCaret(input.querySelector('span')!.firstChild!, 2);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('older original');
+
+      // Edit history[1] with 2-level inline ancestors <b><i>alpha<br></i></b>beta
+      input.innerHTML = '<b><i>alpha<br></i></b>beta';
+      fireEvent.input(input);
+
+      // Caret on last line -> ArrowDown back to history[0] preserves 'first\nsecond'
+      placeCollapsedCaret(input.lastChild!, 2);
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      expect(input.textContent).toBe('first\nsecond');
+
+      // ArrowUp back to history[1] preserves 'alpha\nbeta'
+      placeCollapsedCaret(input.firstChild!, 2);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('alpha\nbeta');
+
+      // Block-end inline <br> followed by next block does not inject extra blank line
+      placeCollapsedCaret(input.firstChild!, 'alpha\nbeta'.length);
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      input.innerHTML = '<div><span>block1<br></span></div><div>block2</div>';
+      fireEvent.input(input);
+      placeCollapsedCaret(input.children[0].querySelector('span')!.firstChild!, 2);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('alpha\nbeta');
+      placeCollapsedCaret(input.firstChild!, 'alpha\nbeta'.length);
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      expect(input.textContent).toBe('block1\nblock2');
+
+      // Positive control: inline-wrapped sentinel <span>single<br></span> still strips sentinel BR
+      input.innerHTML = '<span>single<br></span>';
+      fireEvent.input(input);
+      placeCollapsedCaret(input.querySelector('span')!.firstChild!, 3);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      placeCollapsedCaret(input.firstChild!, 'alpha\nbeta'.length);
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      expect(input.textContent).toBe('single');
+
+      // Stored history remains untouched and send resets temporary edits
+      expect(quickData.data.sessionHistory['my-session']).toEqual(['newest original', 'older original']);
+      fireEvent.keyDown(input, { key: 'Enter' });
+      expect(ws.sendSessionCommand).toHaveBeenCalledWith(
+        'send',
+        expect.objectContaining({ sessionName: 'my-session', text: 'single' }),
+      );
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('newest original');
+    });
+
     it('clears temporary per-entry navigation edits on session switch and respects modifier/picker guards', () => {
       const ws = makeWs();
       const quickData = makeQuickData();
