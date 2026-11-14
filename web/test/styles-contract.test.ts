@@ -1735,13 +1735,20 @@ describe('styles.css regression contracts', () => {
     const mobileSubBarRule = extractDirectStyleRule(mobileSubBarBlock!, /\.subsession-bar\s*/);
     expect(mobileSubBarRule).not.toMatch(/safe-area-inset-bottom/);
 
-    const footerRule = cssWithoutComments.match(/\.subcard-mobile-footer-status\s*\{[^}]*\}/)?.[0];
+    const footerRule = cssWithoutComments.match(/^\.subcard-mobile-footer-status\s*\{[^}]*\}/m)?.[0];
     expect(footerRule).toBeTruthy();
     expect(footerRule).toMatch(/display:\s*flex/);
     expect(footerRule).toMatch(/align-items:\s*center/);
     expect(footerRule).toMatch(/justify-content:\s*center/);
     expect(footerRule).toMatch(/white-space:\s*nowrap/);
     expect(footerRule).toMatch(/safe-area-inset-bottom/);
+
+    // Expanded mobile cards absorb excess bottom safe-area inset cleanly via --subcard-h + min-height: 0 preview without altering desktop cards
+    const expandedCardRule = cssWithoutComments.match(/\.subcard-bar-mobile-expanded\s+\.subcard\s*\{[^}]*\}/)?.[0];
+    expect(expandedCardRule).toBeTruthy();
+    expect(expandedCardRule).toMatch(/max-height:\s*calc\(var\(--subcard-h,\s*250px\)/);
+    expect(cssWithoutComments).toMatch(/\.subcard-bar-mobile-expanded\s+\.subcard-preview\s*\{\s*min-height:\s*0;\s*\}/);
+    expect(cssWithoutComments).toMatch(/\.subcard-mobile-footer-status\.subcard-mobile-footer-status-inline\s*\{[^}]*margin:\s*0 auto/);
 
     // Keyboard open / input-focused continues to hide the entire .subcard-bar (including the footer inside it)
     expect(cssWithoutComments).toMatch(/:root:not\(\.subcard-input-focused\)\.input-focused\s+\.subcard-bar:not\(:focus-within\)\s*\{\s*display:\s*none/);

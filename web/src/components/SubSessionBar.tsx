@@ -529,6 +529,7 @@ function ExpandedSubSessionPlaceholder({ sub, accentColor, sequenceNumber, cardS
         minWidth: cardSize.w,
         position: 'relative',
         '--subsession-accent-color': accentColor,
+        '--subcard-h': `${cardSize.h}px`,
       } as JSX.CSSProperties}
     >
       <div class={`subcard-header${typeof sequenceNumber === 'number' && sequenceNumber > 0 ? ' has-seq' : ''}`}>
@@ -1740,11 +1741,52 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     )
     : null;
 
+  const hasSubSessions = subSessions.length > 0;
+  const showMobileFooter = isMobile && !!daemonBadgeState;
+  const inlineMobileFooterInToolbar = showMobileFooter
+    && !hasSubSessions
+    && (collapsed || (!onNew && discussions.length === 0));
+
+  const renderMobileFooterStatus = (inline: boolean) => {
+    if (!showMobileFooter || !daemonBadgeState) return null;
+    const buildTimeLabel = getBuildTimeCompact();
+    return (
+      <div
+        class={`subcard-mobile-footer-status${inline ? ' subcard-mobile-footer-status-inline' : ''}`}
+        data-testid="mobile-subsession-footer-status"
+      >
+        <span
+          class={`badge ${
+            daemonBadgeState === 'online'
+              ? 'badge-online'
+              : daemonBadgeState === 'connecting'
+                ? 'badge-connecting'
+                : 'badge-offline'
+          }`}
+          data-testid="mobile-subsession-footer-badge"
+        >
+          {daemonBadgeState === 'online'
+            ? '● Online'
+            : daemonBadgeState === 'connecting'
+              ? (<><span class="connecting-dot" />{' Connecting'}</>)
+              : (<><span class="connecting-dot" />{' Daemon Offline'}</>)}
+        </span>
+        {buildTimeLabel && (
+          <span class="subcard-mobile-footer-version" data-testid="mobile-subsession-footer-version">
+            {`v${buildTimeLabel}`}
+          </span>
+        )}
+      </div>
+    );
+  };
+
   return (
     <>
     {verticalRail}
     {teamDiscussionRail}
-    <div class={`subcard-bar${isVerticalRail ? ' subcard-bar-vertical-mode' : ''}${isMobile ? ' subcard-bar-mobile' : ''}`}>
+    <div
+      class={`subcard-bar${isVerticalRail ? ' subcard-bar-vertical-mode' : ''}${isMobile ? ' subcard-bar-mobile' : ''}${isMobile && !hasSubSessions ? ' subcard-bar-mobile-empty' : ''}${inlineMobileFooterInToolbar ? ' subcard-bar-mobile-inline-footer' : ''}${isMobile && !collapsed ? ' subcard-bar-mobile-expanded' : ''}`}
+    >
       {/* Toolbar */}
       <div class="subcard-toolbar">
         {!isVerticalRail && <button class="subcard-toolbar-btn" onClick={() => setCollapsed(!collapsed)} title={collapsed ? t('subsessionBar.show') : t('subsessionBar.hide')}>
@@ -1929,6 +1971,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
             </button>
           );
         })()}
+        {inlineMobileFooterInToolbar && renderMobileFooterStatus(true)}
         {onNew && (
           <button
             class={`subcard-toolbar-add${desktopLayoutCapable ? ' subcard-toolbar-add-desktop' : ''}`}
@@ -2235,34 +2278,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
           </div>
         </div>
       )}
-      {isMobile && daemonBadgeState && (() => {
-        const buildTimeLabel = getBuildTimeCompact();
-        return (
-          <div class="subcard-mobile-footer-status" data-testid="mobile-subsession-footer-status">
-            <span
-              class={`badge ${
-                daemonBadgeState === 'online'
-                  ? 'badge-online'
-                  : daemonBadgeState === 'connecting'
-                    ? 'badge-connecting'
-                    : 'badge-offline'
-              }`}
-              data-testid="mobile-subsession-footer-badge"
-            >
-              {daemonBadgeState === 'online'
-                ? '● Online'
-                : daemonBadgeState === 'connecting'
-                  ? (<><span class="connecting-dot" />{' Connecting'}</>)
-                  : (<><span class="connecting-dot" />{' Daemon Offline'}</>)}
-            </span>
-            {buildTimeLabel && (
-              <span class="subcard-mobile-footer-version" data-testid="mobile-subsession-footer-version">
-                {`v${buildTimeLabel}`}
-              </span>
-            )}
-          </div>
-        );
-      })()}
+      {!inlineMobileFooterInToolbar && renderMobileFooterStatus(false)}
       {showDaemonDetails && stats && (
         <DaemonStatsModal
           stats={stats}

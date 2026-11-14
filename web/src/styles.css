@@ -8018,10 +8018,22 @@ html.mobile-nav-gesture-active .chat-view * {
 .subcard-bar-mobile .subcard-toolbar { padding: 1px 8px; gap: 6px; }
 .subcard-bar-mobile .subcard-toolbar-btn { padding: 1px 6px; line-height: 1.25; }
 .subcard-bar-mobile .subcard-toolbar-add { font-size: 15px; line-height: 1.15; }
+.subcard-bar-mobile-inline-footer .subcard-toolbar { gap: 4px; }
+.subcard-bar-mobile-inline-footer .subcard-toolbar-add { margin-left: 0; }
 .subcard-bar-mobile .subsession-close-all-strip { min-height: 30px; margin: 1px 0 1px 8px; }
 .subcard-bar-mobile .subsession-bar { gap: 4px; padding: 1px 8px 0; }
 .subcard-bar-mobile .subcard-scroll { padding: 3px 10px 2px; }
-.subcard-bar-mobile .subcard-empty-state { padding: 2px 12px 1px; }
+.subcard-bar-mobile-expanded .subcard {
+  max-height: calc(var(--subcard-h, 250px) - max(0px, calc(max(var(--sab, 0px), env(safe-area-inset-bottom, 0px)) - 18px)));
+}
+.subcard-bar-mobile-expanded .subcard-preview { min-height: 0; }
+.subcard-bar-mobile .subcard-empty-state { padding: 0 10px; font-size: 11px; line-height: 1.15; }
+.subcard-bar-mobile-empty:not(.subcard-bar-mobile-inline-footer) .subcard-toolbar { padding: 0 8px; min-height: 20px; }
+.subcard-bar-mobile-empty:not(.subcard-bar-mobile-inline-footer) .subcard-toolbar-btn { padding: 0 5px; line-height: 1.2; }
+.subcard-bar-mobile-empty:not(.subcard-bar-mobile-inline-footer) .subcard-toolbar-add { line-height: 1.1; }
+.subcard-bar-mobile-empty .subcard-mobile-footer-status {
+  padding: 0 8px max(1px, calc(max(var(--sab, 0px), env(safe-area-inset-bottom, 0px)) - 18px));
+}
 .subcard-mobile-footer-status {
   display: flex;
   align-items: center;
@@ -8031,6 +8043,12 @@ html.mobile-nav-gesture-active .chat-view * {
   line-height: 1;
   white-space: nowrap;
   overflow: hidden;
+}
+.subcard-mobile-footer-status.subcard-mobile-footer-status-inline {
+  margin: 0 auto;
+  padding: 0 2px;
+  min-width: 0;
+  flex: 0 1 auto;
 }
 .subcard-mobile-footer-status .badge {
   font-size: 9px;

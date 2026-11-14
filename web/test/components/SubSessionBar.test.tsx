@@ -2606,13 +2606,14 @@ describe('SubSessionBar', () => {
       expect(mobileBar.classList.contains('subcard-bar-mobile')).toBe(true);
       const row = mobileBar.querySelector('.subsession-row-with-close')!;
       const footer = collapsedMobile.getByTestId('mobile-subsession-footer-status');
+      expect(footer.classList.contains('subcard-mobile-footer-status-inline')).toBe(false);
       expect(row.compareDocumentPosition(footer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
       const badge = collapsedMobile.getByTestId('mobile-subsession-footer-badge');
       expect(badge.classList.contains('badge-online')).toBe(true);
       expect(badge.textContent).toBe('● Online');
       expect(collapsedMobile.getByTestId('mobile-subsession-footer-version').textContent).toBe('v11/14 22:05');
 
-      // Connecting & offline state transitions
+      // Connecting & offline state transitions; collapsed empty embeds inline inside .subcard-toolbar
       collapsedMobile.rerender(
         <SubSessionBar
           subSessions={[sub]}
@@ -2636,9 +2637,10 @@ describe('SubSessionBar', () => {
         <SubSessionBar
           subSessions={[]}
           openIds={new Set()}
-          collapsed={false}
+          collapsed
           desktopLayoutCapable={false}
           daemonBadgeState="offline"
+          onNew={vi.fn()}
           onOpen={vi.fn()}
           onClose={vi.fn()}
           onRestart={vi.fn()}
@@ -2648,8 +2650,34 @@ describe('SubSessionBar', () => {
           onHistory={vi.fn()}
         />,
       );
+      const emptyCollapsedFooter = collapsedMobile.getByTestId('mobile-subsession-footer-status');
+      expect(emptyCollapsedFooter.classList.contains('subcard-mobile-footer-status-inline')).toBe(true);
+      expect(collapsedMobile.container.querySelector('.subcard-toolbar')?.contains(emptyCollapsedFooter)).toBe(true);
       expect(collapsedMobile.getByTestId('mobile-subsession-footer-badge').classList.contains('badge-offline')).toBe(true);
       expect(collapsedMobile.getByTestId('mobile-subsession-footer-badge').textContent).toContain('Daemon Offline');
+
+      // Expanded empty with onNew keeps .subcard-empty-state and renders centered bottom footer below it
+      collapsedMobile.rerender(
+        <SubSessionBar
+          subSessions={[]}
+          openIds={new Set()}
+          collapsed={false}
+          desktopLayoutCapable={false}
+          daemonBadgeState="offline"
+          onNew={vi.fn()}
+          onOpen={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected={false}
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+        />,
+      );
+      const emptyExpandedFooter = collapsedMobile.getByTestId('mobile-subsession-footer-status');
+      expect(emptyExpandedFooter.classList.contains('subcard-mobile-footer-status-inline')).toBe(false);
+      const emptyHint = collapsedMobile.container.querySelector('.subcard-empty-state')!;
+      expect(emptyHint.compareDocumentPosition(emptyExpandedFooter) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
       collapsedMobile.unmount();
 
       // 2. Desktop horizontal & vertical rail -> never renders mobile footer status

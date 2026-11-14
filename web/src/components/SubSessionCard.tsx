@@ -449,7 +449,7 @@ function SubSessionCardImpl({ sub, ws, connected, isOpen, isFocused, idleFlashTo
   return (
     <div
       class={`subcard${isOpen ? ' subcard-open' : ''}${isFocused ? ' subcard-focused' : ''}${busy ? ' subcard-running-pulse' : ''}${quickPanelOpen ? ' subcard-quick-open' : ''}${overlayOpen ? ' subcard-overlay-open' : ''}`}
-      style={{ width: effectiveW, height: cardH, minWidth: effectiveW, position: 'relative', '--subsession-accent-color': accentColor } as JSX.CSSProperties}
+      style={{ width: effectiveW, height: cardH, minWidth: effectiveW, position: 'relative', '--subsession-accent-color': accentColor, '--subcard-h': `${cardH}px` } as JSX.CSSProperties}
       onClick={() => { if (!draggingRef.current) onOpen(); }}
     >
       {activeIdleFlashToken ? <IdleFlashLayer key={`subcard-idle-${activeIdleFlashToken}`} variant="frame" /> : null}
