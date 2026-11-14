@@ -112,53 +112,51 @@ async function openDesktopApp(page: Page, platform: 'MacIntel' | 'Linux x86_64')
   return { errors };
 }
 
-test('macOS defaults use Meta+Shift+ArrowLeft/Right for tabs and Meta+ArrowUp/Down for servers, work in composer & sidebar, and respect overrides', async ({ page }) => {
+test('macOS defaults use Ctrl+w/s/a/d for servers & tabs, work in composer & sidebar, and respect overrides', async ({ page }) => {
   const { errors } = await openDesktopApp(page, 'MacIntel');
 
-  // Verify macOS Settings keycaps render Cmd+Shift+Left/Right for tabs and Cmd+Up/Down for servers
+  // Verify macOS Settings keycaps render Ctrl+A/D for tabs and Ctrl+W/S for servers
   await page.locator('button.server-icon[title="Settings"]').click();
   await page.locator('#settings-tab-shortcuts').click();
-  await expect(page.getByTestId('shortcut-record-tabPrev')).toContainText('⇧');
-  await expect(page.getByTestId('shortcut-record-tabPrev')).toContainText('⌘');
-  await expect(page.getByTestId('shortcut-record-tabPrev')).toContainText('←');
-  await expect(page.getByTestId('shortcut-record-tabNext')).toContainText('⇧');
-  await expect(page.getByTestId('shortcut-record-tabNext')).toContainText('⌘');
-  await expect(page.getByTestId('shortcut-record-tabNext')).toContainText('→');
-  await expect(page.getByTestId('shortcut-record-serverPrev')).toContainText('⌘');
-  await expect(page.getByTestId('shortcut-record-serverPrev')).toContainText('↑');
-  await expect(page.getByTestId('shortcut-record-serverNext')).toContainText('⌘');
-  await expect(page.getByTestId('shortcut-record-serverNext')).toContainText('↓');
+  await expect(page.getByTestId('shortcut-record-tabPrev')).toContainText('⌃');
+  await expect(page.getByTestId('shortcut-record-tabPrev')).toContainText('A');
+  await expect(page.getByTestId('shortcut-record-tabNext')).toContainText('⌃');
+  await expect(page.getByTestId('shortcut-record-tabNext')).toContainText('D');
+  await expect(page.getByTestId('shortcut-record-serverPrev')).toContainText('⌃');
+  await expect(page.getByTestId('shortcut-record-serverPrev')).toContainText('W');
+  await expect(page.getByTestId('shortcut-record-serverNext')).toContainText('⌃');
+  await expect(page.getByTestId('shortcut-record-serverNext')).toContainText('S');
 
   // Settings overlay blocks tab switching shortcuts
-  await page.keyboard.press('Meta+Shift+ArrowRight');
+  await page.keyboard.press('Control+d');
   await page.locator('.settings-back-btn').click();
   await expect(page.locator('.tab.active')).toContainText('Gamma Tab');
 
   // Visual order is Gamma (pinned), Beta (tab_order[0]), Alpha (tab_order[1])
-  // Inside composer (.controls-input): Meta+Shift+ArrowRight switches Gamma -> Beta -> Alpha
+  // Inside composer (.controls-input): Ctrl+d switches Gamma -> Beta -> Alpha
   const composer = page.locator('.controls-input').first();
   await composer.click();
-  await page.keyboard.press('Meta+Shift+ArrowRight');
+  await page.keyboard.press('Control+d');
   await expect(page.locator('.tab.active')).toContainText('Beta Tab');
-  await page.keyboard.press('Meta+Shift+ArrowRight');
+  await page.keyboard.press('Control+d');
   await expect(page.locator('.tab.active')).toContainText('Alpha Tab');
 
-  // Bare Meta+ArrowLeft does NOT trigger tab switch by default on macOS
+  // Legacy Meta+ArrowLeft does NOT trigger tab switch under unified WASD defaults
   await page.keyboard.press('Meta+ArrowLeft');
   await expect(page.locator('.tab.active')).toContainText('Alpha Tab');
 
-  // With non-editable sidebar control focused: Meta+Shift+ArrowLeft switches Alpha -> Beta -> Gamma
+  // With non-editable sidebar control focused: Ctrl+a switches Alpha -> Beta -> Gamma
   await page.locator('.sidebar-toggle-icon').first().focus();
-  await page.keyboard.press('Meta+Shift+ArrowLeft');
+  await page.keyboard.press('Control+a');
   await expect(page.locator('.tab.active')).toContainText('Beta Tab');
-  await page.keyboard.press('Meta+Shift+ArrowLeft');
+  await page.keyboard.press('Control+a');
   await expect(page.locator('.tab.active')).toContainText('Gamma Tab');
 
-  // Server switching keeps Meta+ArrowDown / Meta+ArrowUp
-  await page.keyboard.press('Meta+ArrowDown');
+  // Server switching uses Ctrl+s / Ctrl+w
+  await page.keyboard.press('Control+s');
   await expect(page.locator('.server-icon-server.server-icon-active')).toContainText('Beta Server');
   await expect(page.locator('.tab.active')).toContainText('Second Server Tab');
-  await page.keyboard.press('Meta+ArrowUp');
+  await page.keyboard.press('Control+w');
   await expect(page.locator('.server-icon-server.server-icon-active')).toContainText('Alpha Server');
   await expect(page.locator('.tab.active')).toContainText('Gamma Tab');
 
@@ -170,7 +168,7 @@ test('macOS defaults use Meta+Shift+ArrowLeft/Right for tabs and Meta+ArrowUp/Do
   await expect(tabNextRecordBtn).toHaveAttribute('data-shortcut-recording', 'true');
   await page.keyboard.press('Meta+ArrowRight');
   await expect(tabNextRecordBtn).toContainText('⌘');
-  await expect(tabNextRecordBtn).not.toContainText('⇧');
+  await expect(tabNextRecordBtn).toContainText('→');
   await page.locator('.settings-back-btn').click();
 
   await page.locator('.controls-input').first().click();
@@ -179,19 +177,31 @@ test('macOS defaults use Meta+Shift+ArrowLeft/Right for tabs and Meta+ArrowUp/Do
   expect(errors).toEqual([]);
 });
 
-test('non-macOS defaults keep Ctrl+ArrowLeft/Right and Ctrl+ArrowUp/Down working', async ({ page }) => {
+test('non-macOS defaults keep unified Ctrl+a/d and Ctrl+w/s working', async ({ page }) => {
   const { errors } = await openDesktopApp(page, 'Linux x86_64');
 
+  await page.locator('button.server-icon[title="Settings"]').click();
+  await page.locator('#settings-tab-shortcuts').click();
+  await expect(page.getByTestId('shortcut-record-tabPrev')).toContainText('Ctrl');
+  await expect(page.getByTestId('shortcut-record-tabPrev')).toContainText('A');
+  await expect(page.getByTestId('shortcut-record-tabNext')).toContainText('Ctrl');
+  await expect(page.getByTestId('shortcut-record-tabNext')).toContainText('D');
+  await expect(page.getByTestId('shortcut-record-serverPrev')).toContainText('Ctrl');
+  await expect(page.getByTestId('shortcut-record-serverPrev')).toContainText('W');
+  await expect(page.getByTestId('shortcut-record-serverNext')).toContainText('Ctrl');
+  await expect(page.getByTestId('shortcut-record-serverNext')).toContainText('S');
+  await page.locator('.settings-back-btn').click();
+
   await page.locator('.controls-input').first().click();
-  await page.keyboard.press('Control+ArrowRight');
+  await page.keyboard.press('Control+d');
   await expect(page.locator('.tab.active')).toContainText('Beta Tab');
-  await page.keyboard.press('Control+ArrowLeft');
+  await page.keyboard.press('Control+a');
   await expect(page.locator('.tab.active')).toContainText('Gamma Tab');
 
-  await page.keyboard.press('Control+ArrowDown');
+  await page.keyboard.press('Control+s');
   await expect(page.locator('.server-icon-server.server-icon-active')).toContainText('Beta Server');
   await expect(page.locator('.tab.active')).toContainText('Second Server Tab');
-  await page.keyboard.press('Control+ArrowUp');
+  await page.keyboard.press('Control+w');
   await expect(page.locator('.server-icon-server.server-icon-active')).toContainText('Alpha Server');
   expect(errors).toEqual([]);
 });

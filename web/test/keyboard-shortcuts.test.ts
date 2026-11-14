@@ -30,17 +30,17 @@ describe('keyboard-shortcuts core helpers', () => {
     expect(isMacPlatform({ platform: 'Linux x86_64', userAgent: 'X11; Linux x86_64' })).toBe(false);
 
     expect(getDefaultShortcuts(true)).toEqual({
-      serverPrev: 'Meta+ArrowUp',
-      serverNext: 'Meta+ArrowDown',
-      tabPrev: 'Meta+Shift+ArrowLeft',
-      tabNext: 'Meta+Shift+ArrowRight',
+      serverPrev: 'Ctrl+w',
+      serverNext: 'Ctrl+s',
+      tabPrev: 'Ctrl+a',
+      tabNext: 'Ctrl+d',
     });
 
     expect(getDefaultShortcuts(false)).toEqual({
-      serverPrev: 'Ctrl+ArrowUp',
-      serverNext: 'Ctrl+ArrowDown',
-      tabPrev: 'Ctrl+ArrowLeft',
-      tabNext: 'Ctrl+ArrowRight',
+      serverPrev: 'Ctrl+w',
+      serverNext: 'Ctrl+s',
+      tabPrev: 'Ctrl+a',
+      tabNext: 'Ctrl+d',
     });
   });
 
@@ -70,6 +70,14 @@ describe('keyboard-shortcuts core helpers', () => {
     expect(normalizeShortcutChordString('Escape')).toBeNull();
     expect(normalizeShortcutChordString('')).toBeNull();
 
+    expect(formatShortcutKeycaps('Ctrl+w', true)).toEqual(['⌃', 'W']);
+    expect(formatShortcutKeycaps('Ctrl+s', true)).toEqual(['⌃', 'S']);
+    expect(formatShortcutKeycaps('Ctrl+a', true)).toEqual(['⌃', 'A']);
+    expect(formatShortcutKeycaps('Ctrl+d', true)).toEqual(['⌃', 'D']);
+    expect(formatShortcutKeycaps('Ctrl+w', false)).toEqual(['Ctrl', 'W']);
+    expect(formatShortcutKeycaps('Ctrl+s', false)).toEqual(['Ctrl', 'S']);
+    expect(formatShortcutKeycaps('Ctrl+a', false)).toEqual(['Ctrl', 'A']);
+    expect(formatShortcutKeycaps('Ctrl+d', false)).toEqual(['Ctrl', 'D']);
     expect(formatShortcutKeycaps('Meta+ArrowUp', true)).toEqual(['⌘', '↑']);
     expect(formatShortcutKeycaps('Meta+Shift+ArrowLeft', true)).toEqual(['⇧', '⌘', '←']);
     expect(formatShortcutKeycaps('Meta+Shift+ArrowRight', true)).toEqual(['⇧', '⌘', '→']);
@@ -96,20 +104,20 @@ describe('keyboard-shortcuts core helpers', () => {
     expect(resolveKeyboardShortcuts(clean, true)).toEqual({
       serverPrev: 'Alt+ArrowUp',
       serverNext: null,
-      tabPrev: 'Meta+Shift+ArrowLeft',
-      tabNext: 'Meta+Shift+ArrowRight',
+      tabPrev: 'Ctrl+a',
+      tabNext: 'Ctrl+d',
     });
     expect(resolveKeyboardShortcuts({ tabPrev: 'Meta+ArrowLeft', tabNext: 'Meta+ArrowRight' }, true)).toEqual({
-      serverPrev: 'Meta+ArrowUp',
-      serverNext: 'Meta+ArrowDown',
+      serverPrev: 'Ctrl+w',
+      serverNext: 'Ctrl+s',
       tabPrev: 'Meta+ArrowLeft',
       tabNext: 'Meta+ArrowRight',
     });
     expect(resolveKeyboardShortcuts(clean, false)).toEqual({
       serverPrev: 'Alt+ArrowUp',
       serverNext: null,
-      tabPrev: 'Ctrl+ArrowLeft',
-      tabNext: 'Ctrl+ArrowRight',
+      tabPrev: 'Ctrl+a',
+      tabNext: 'Ctrl+d',
     });
   });
 
@@ -156,26 +164,44 @@ describe('keyboard-shortcuts core helpers', () => {
 
   it('matches exact modifier combinations and detects conflicts', () => {
     const macShortcuts = getDefaultShortcuts(true);
+    const nonMacShortcuts = getDefaultShortcuts(false);
+    expect(macShortcuts).toEqual(nonMacShortcuts);
     expect(matchNavigationShortcutAction(
-      { key: 'ArrowUp', code: 'ArrowUp', metaKey: true, ctrlKey: false, altKey: false, shiftKey: false },
+      { key: 'w', code: 'KeyW', metaKey: false, ctrlKey: true, altKey: false, shiftKey: false },
       macShortcuts,
     )).toBe('serverPrev');
     expect(matchNavigationShortcutAction(
-      { key: 'ArrowLeft', code: 'ArrowLeft', metaKey: true, ctrlKey: false, altKey: false, shiftKey: true },
+      { key: 's', code: 'KeyS', metaKey: false, ctrlKey: true, altKey: false, shiftKey: false },
+      macShortcuts,
+    )).toBe('serverNext');
+    expect(matchNavigationShortcutAction(
+      { key: 'a', code: 'KeyA', metaKey: false, ctrlKey: true, altKey: false, shiftKey: false },
       macShortcuts,
     )).toBe('tabPrev');
     expect(matchNavigationShortcutAction(
-      { key: 'ArrowRight', code: 'ArrowRight', metaKey: true, ctrlKey: false, altKey: false, shiftKey: true },
+      { key: 'd', code: 'KeyD', metaKey: false, ctrlKey: true, altKey: false, shiftKey: false },
       macShortcuts,
     )).toBe('tabNext');
     expect(matchNavigationShortcutAction(
-      { key: 'ArrowLeft', code: 'ArrowLeft', metaKey: true, ctrlKey: false, altKey: false, shiftKey: false },
+      { key: 'ArrowUp', code: 'ArrowUp', metaKey: true, ctrlKey: false, altKey: false, shiftKey: false },
       macShortcuts,
     )).toBeNull();
     expect(matchNavigationShortcutAction(
-      { key: 'ArrowUp', code: 'ArrowUp', metaKey: true, ctrlKey: false, altKey: false, shiftKey: true },
+      { key: 'ArrowLeft', code: 'ArrowLeft', metaKey: true, ctrlKey: false, altKey: false, shiftKey: true },
       macShortcuts,
     )).toBeNull();
+    expect(matchNavigationShortcutAction(
+      { key: 'w', code: 'KeyW', metaKey: false, ctrlKey: true, altKey: false, shiftKey: true },
+      macShortcuts,
+    )).toBeNull();
+    expect(matchNavigationShortcutAction(
+      { key: 'w', code: 'KeyW', metaKey: false, ctrlKey: false, altKey: false, shiftKey: false },
+      nonMacShortcuts,
+    )).toBeNull();
+    expect(matchesShortcutChord(
+      { key: 'a', code: 'KeyA', metaKey: false, ctrlKey: true, altKey: false, shiftKey: false },
+      'Ctrl+a',
+    )).toBe(true);
     expect(matchesShortcutChord(
       { key: 'ArrowLeft', code: 'ArrowLeft', metaKey: false, ctrlKey: true, altKey: false, shiftKey: false },
       'Ctrl+ArrowLeft',

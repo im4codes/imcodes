@@ -133,28 +133,16 @@ export function isMacPlatform(nav?: {
   return /Macintosh|Mac OS/i.test(userAgent);
 }
 
-/** Platform default shortcut map. */
-export function getDefaultShortcuts(isMac = isMacPlatform()): Record<ShortcutActionId, string> {
-  if (isMac) {
-    // On macOS, Meta+ArrowLeft/Right and Meta+Alt+ArrowLeft/Right collide with
-    // browser History Back/Forward and Browser Tab Switching at the AppKit menu
-    // layer before JS DOM keydown, while Ctrl+ArrowLeft/Right is reserved by
-    // Mission Control. Meta+Shift+ArrowLeft/Right (⌘⇧← / ⌘⇧→) avoids browser
-    // navigation accelerators and window.addEventListener(..., true) +
-    // e.preventDefault() intercepts composer line selection cleanly, while
-    // Meta+ArrowUp/Down stays intact for server switching.
-    return {
-      serverPrev: 'Meta+ArrowUp',
-      serverNext: 'Meta+ArrowDown',
-      tabPrev: 'Meta+Shift+ArrowLeft',
-      tabNext: 'Meta+Shift+ArrowRight',
-    };
-  }
+/** Platform default shortcut map (unified WASD Ctrl bindings across desktop platforms). */
+export function getDefaultShortcuts(_isMac = isMacPlatform()): Record<ShortcutActionId, string> {
+  // All desktop platforms (macOS, Windows, Linux) use single-hand CS/WASD
+  // Ctrl+W/S/A/D defaults: avoids macOS Mission Control / AppKit Cmd+Arrow
+  // conflicts and keeps tab/server switching consistent across platforms.
   return {
-    serverPrev: 'Ctrl+ArrowUp',
-    serverNext: 'Ctrl+ArrowDown',
-    tabPrev: 'Ctrl+ArrowLeft',
-    tabNext: 'Ctrl+ArrowRight',
+    serverPrev: 'Ctrl+w',
+    serverNext: 'Ctrl+s',
+    tabPrev: 'Ctrl+a',
+    tabNext: 'Ctrl+d',
   };
 }
 
