@@ -361,7 +361,7 @@ describe('integration drift', () => {
       expect(digests()).toHaveLength(1);
       const lines = digests()[0]!.text.split('\n').filter((entry) => entry.startsWith('- '));
       expect(lines).toHaveLength(3);
-      for (const id of ['u1', 'u2', 'u3']) expect(digests()[0]!.text).toContain(`- ${id}:`);
+      for (const id of ['u1', 'u2', 'u3']) expect(digests()[0]!.text).toContain(`- ${id} "${id}":`);
     });
 
     it('a busy Brain (message not accepted) is retried on the next heartbeat with no state advanced', async () => {

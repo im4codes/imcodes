@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { scanTaskPairMarkers, type TaskPairState } from '../../../shared/task-pair.js';
-import { buildAuditorAssignmentMessage, buildAuditRequestMessage, buildBriefEndHint, buildExecutorHandoffMessage, buildNoBriefLine, buildNudgeMessage, buildUntitledTaskTitleRequest } from '../../../src/daemon/task-pairs/messages.js';
+import { buildAuditorAssignmentMessage, buildAuditRequestMessage, buildBriefEndHint, buildExecutorHandoffMessage, buildIntegrationDriftDigest, buildNoBriefLine, buildNudgeMessage, buildUntitledTaskTitleRequest } from '../../../src/daemon/task-pairs/messages.js';
 
 function basePair(overrides: Partial<TaskPairState> = {}): TaskPairState {
   return {
@@ -87,5 +87,30 @@ describe('daemon-authored marker examples parse when copied verbatim onto their 
     ]) {
       expect(text).not.toContain('`');
     }
+  });
+
+  it('includes task titles in integration drift digests when provided', () => {
+    const digest = buildIntegrationDriftDigest(
+      [
+        {
+          taskId: 'tsk_with_title',
+          title: 'Fix login retry',
+          head: 'abc1234567',
+          worktree: '/w/pair_tsk_with_title/repo',
+          elapsedMs: 120_000,
+          status: 'passed',
+        },
+        {
+          taskId: 'tsk_untitled',
+          head: 'def7654321',
+          worktree: '/w/pair_tsk_untitled/repo',
+          elapsedMs: 120_000,
+          status: 'done',
+        },
+      ],
+      'en',
+    );
+    expect(digest).toContain('- tsk_with_title "Fix login retry": head abc1234');
+    expect(digest).toContain('- tsk_untitled: head def7654');
   });
 });

@@ -35,7 +35,7 @@ import {
   SUPERVISION_BRAIN_REVISION_RESET_FORBID,
 } from '../../shared/supervision-config.js';
 import { SUPERVISION_IMCODES_BACKGROUND_DOCS } from './imcodes-workflow-docs.js';
-import { TASK_PAIR_BRAIN_CONTRACT_ID, TASK_PAIR_INERT_AUTHORIZATION_RULE, TASK_PAIR_MULTI_PHASE_CRON_TOKEN, TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE, TASK_PAIR_SPLIT_UNRELATED_TOKEN, type TaskPairEngineState } from '../../shared/task-pair.js';
+import { TASK_PAIR_BRAIN_CONTRACT_ID, TASK_PAIR_INERT_AUTHORIZATION_RULE, TASK_PAIR_MULTI_PHASE_CRON_TOKEN, TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE, TASK_PAIR_SPLIT_UNRELATED_TOKEN, TASK_PAIR_USER_FACING_TITLE_TOKEN, type TaskPairEngineState } from '../../shared/task-pair.js';
 import { TASK_PAIR_WORKTREE_ONLY_WHEN_NECESSARY_TOKEN } from '../../shared/task-pair-workspace.js';
 import { FILE_OUTPUT_CONTRACT_ID } from '../../shared/file-output-contract.js';
 import {
@@ -299,6 +299,7 @@ export const BRAIN_PAIRS_SUPERVISED_WORK = {
   deliverables: 'judge_by_task_type_keep_via_DONE_output=_copied_into_project_user_told_temporary_plain_DONE',
   legacyArtifacts: 'none_on_pairs_no_registry_step_assignmentId_auditAttemptId_auditRevision_bundle_scopeFiles_never_ask_or_explain_them',
   notices: 'resolve_with_pair_mcp_tools_pair_reassign_pair_close_done_force_cancel',
+  userFacingNames: TASK_PAIR_USER_FACING_TITLE_TOKEN,
   heartbeat: 'daemon_pair_heartbeat',
 } as const;
 
@@ -549,6 +550,7 @@ export const BRAIN_MANUAL_AUDITED_WORK = {
     auditor: 'named_or_daemon_auto_pick',
     heartbeat: 'daemon_pair_heartbeat_when_supervision_on_see_pair_create_result',
     brainCronSelf: 'forbidden',
+    userFacingNames: TASK_PAIR_USER_FACING_TITLE_TOKEN,
     precedence: TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
   },
   legacy: {

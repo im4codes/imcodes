@@ -17,6 +17,8 @@ import {
   TASK_PAIR_NEXT_ROUND_RULE,
   TASK_PAIR_TITLE_MARKER_RULE,
   TASK_PAIR_TITLE_RULE,
+  TASK_PAIR_USER_FACING_TITLE_RULE,
+  TASK_PAIR_USER_FACING_TITLE_TOKEN,
   buildTaskPairMarkerContract,
   taskPairBrainEndedPairNote,
   scanTaskPairMarkers,
@@ -26,6 +28,12 @@ import { MEMORY_MCP_TOOL_CONTRACTS, MEMORY_MCP_TOOL_NAMES } from '../../../share
 import type { ContextNamespace } from '../../../shared/context-types.js';
 import type { McpRuntimeCaller } from '../../../src/daemon/memory-mcp-caller.js';
 import { createMemoryMcpToolHandlers } from '../../../src/daemon/memory-mcp-tools.js';
+import {
+  BRAIN_MANUAL_AUDITED_WORK,
+  BRAIN_PAIRS_SUPERVISED_WORK,
+  buildBrainManualOnlyDelegationContract,
+  buildBrainSupervisedWorkDelegationContract,
+} from '../../../src/daemon/supervision-prompts.js';
 import { removeSession, upsertSession, type SessionRecord } from '../../../src/store/session-store.js';
 import { getTaskPairStore, setTaskPairStoreForTests, TaskPairStore } from '../../../src/daemon/task-pairs/store.js';
 import {
@@ -87,7 +95,7 @@ describe('the Brain contract: Brain closes what it has dealt with, with the MCP 
     for (const [name, text] of Object.entries({
       TASK_PAIR_BRAIN_CLOSE_RULE, TASK_PAIR_BRAIN_CLOSE_REMINDER, TASK_PAIR_BRAIN_CLOSE_TOOL_NOTE,
       TASK_PAIR_BRAIN_MCP_ONLY_RULE: TASK_PAIR_BRAIN_MCP_ONLY_RULE.replace('do not write IMCODES_TASK markers yourself', '').replace('Do not add any IMCODES_TASK marker to a reply', ''),
-      TASK_PAIR_TITLE_RULE, TASK_PAIR_TITLE_MARKER_RULE, TASK_PAIR_NATIVE_COLLABORATION_RULE, TASK_PAIR_BRIEF_STRUCTURE_RULE,
+      TASK_PAIR_TITLE_RULE, TASK_PAIR_TITLE_MARKER_RULE, TASK_PAIR_USER_FACING_TITLE_RULE, TASK_PAIR_NATIVE_COLLABORATION_RULE, TASK_PAIR_BRIEF_STRUCTURE_RULE,
       TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE, TASK_PAIR_NEXT_ROUND_RULE,
     })) expect(text, name).not.toMatch(BRAIN_MARKER_TEACHING);
     // The executor/auditor parts of the contract keep their markers (STARTED / READY_FOR_AUDIT / PASS / REWORK / DONE).
@@ -227,5 +235,32 @@ describe('no "nothing to do" marker is taught to Brain, and one written anyway d
   it('the daemon does not treat it as a marker or an action', () => {
     const { markers } = scanTaskPairMarkers(`ok <!-- ${NOOP} -->\n<!-- ${NOOP} tsk_x -->\n<!--IMCODES_TASK_EMPTY-->`);
     expect(markers).toEqual([]);
+  });
+});
+
+describe('user-facing task title rule for Brain replies', () => {
+  it('instructs Brain in task_pair_markers_v1 to report human-readable titles instead of raw taskIds', () => {
+    const contract = buildTaskPairMarkerContract();
+    expect(contract).toContain(TASK_PAIR_USER_FACING_TITLE_RULE);
+    expect(TASK_PAIR_USER_FACING_TITLE_RULE).toContain('human-readable task name/title');
+    expect(TASK_PAIR_USER_FACING_TITLE_RULE).toContain('NEVER output raw internal task IDs');
+    expect(TASK_PAIR_USER_FACING_TITLE_RULE).toContain('internal MCP tool calls');
+  });
+
+  it('includes the compact user-facing title token in Brain pairs contracts (and omits it from off/legacy)', () => {
+    expect(BRAIN_PAIRS_SUPERVISED_WORK.userFacingNames).toBe(TASK_PAIR_USER_FACING_TITLE_TOKEN);
+    expect(BRAIN_MANUAL_AUDITED_WORK.pairs.userFacingNames).toBe(TASK_PAIR_USER_FACING_TITLE_TOKEN);
+    expect('userFacingNames' in BRAIN_MANUAL_AUDITED_WORK.off).toBe(false);
+    expect('userFacingNames' in BRAIN_MANUAL_AUDITED_WORK.legacy).toBe(false);
+
+    const supervisedJson = JSON.parse(
+      buildBrainSupervisedWorkDelegationContract(undefined, { taskPairEngine: 'pairs' }),
+    ) as { pairs: { userFacingNames: string } };
+    expect(supervisedJson.pairs.userFacingNames).toBe(TASK_PAIR_USER_FACING_TITLE_TOKEN);
+
+    const manualJson = JSON.parse(
+      buildBrainManualOnlyDelegationContract(undefined, { taskPairEngine: 'pairs' }),
+    ) as { manual: { auditedWork: { userFacingNames: string } } };
+    expect(manualJson.manual.auditedWork.userFacingNames).toBe(TASK_PAIR_USER_FACING_TITLE_TOKEN);
   });
 });

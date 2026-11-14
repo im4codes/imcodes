@@ -889,6 +889,20 @@ export const TASK_PAIR_BRAIN_MCP_ONLY_RULE: string =
   + 'Naming executor/auditor (pair_create, pair_reassign) replaces the current holder of that role immediately, ignoring the execution pool role config; executorModel/auditorModel steers the next automatic pick but does not replace a current role; a project with no execution pool configured must name the role models or sessions explicitly.';
 
 /**
+ * Owner rule (2026-11-14): when reporting, listing, summarizing, or asking
+ * the user about any task pair, Brain must use the human-readable `title`,
+ * never raw internal `taskId` strings (`tsk_...`), which stay internal-only.
+ */
+export const TASK_PAIR_USER_FACING_TITLE_RULE: string =
+  'User-facing task reporting (Brain): when reporting, listing, summarizing, or asking the user about any task pair, '
+  + 'ALWAYS refer to the human-readable task name/title (`title`) and NEVER output raw internal task IDs (`tsk_...`) to the user. '
+  + 'Keep `taskId` strictly for internal MCP tool calls (pair_create, pair_task_update, pair_close, etc.), internal protocol markers, and internal logs.';
+
+/** Compact snake_case token used by the Brain duty tables in supervision-prompts.ts. */
+export const TASK_PAIR_USER_FACING_TITLE_TOKEN =
+  'user_facing_replies_use_task_title_never_raw_taskId_keep_taskId_for_internal_mcp_only' as const;
+
+/**
  * Stated in the Brain contract for a project whose supervision is off (owner decisions: 2026-09-26, tsk_cd_pairs_optin - pairs never
  * start by themselves there; tsk_fb01f25f17 - supervision off never stops a MANUAL pair, it only means no daemon heartbeat). Kept as one
  * shared string so the daemon's own auto-start gates can be reviewed against the same text.
@@ -2716,6 +2730,7 @@ export function buildTaskPairMarkerContract(): string {
     'Waiting costs no model turns: use pair_pause mode=manual for a manual hold, or mode=dependencies with same-project dependsOn ids; pair_resume clears only the manual hold. Dependencies wait for Brain-accepted DONE, not PASS. Paused pairs retain their stage/material/workspace; do not keep replying that you are waiting. pair_create also accepts dependsOn.',
     'Automatic pairing policy: multi-step, cross-file, test/real-machine, integration, performance, security or substantial tasks use an executor plus auditor and heartbeat; small edits and queries use one executor with no auditor. Explicit user choices always win. With an empty or unconfigured pool the daemon uses idle sub-sessions of the Brain in the SAME provider family that run the secondary model of that family (Anthropic Sonnet, OpenAI Sol, DeepSeek Pro; never another vendor, never the flagship, no session is created); executor and auditor are different sessions, and when none is available the daemon tells you how to fix it (create a sub-session, name executor/auditor, or execution_pool_set). Prefer configured Luna→Sol, then Haiku→Sonnet, then DeepSeek Flash→Pro tiers.',
     TASK_PAIR_BRAIN_MCP_ONLY_RULE,
+    TASK_PAIR_USER_FACING_TITLE_RULE,
     TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
     TASK_PAIR_BRAIN_REPORTING_RULE,
     TASK_PAIR_CHECKLIST_RULE,
