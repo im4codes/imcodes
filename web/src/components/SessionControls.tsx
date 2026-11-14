@@ -714,6 +714,173 @@ function setComposerElementText(root: HTMLElement, text: string): void {
   root.textContent = text.replace(/\r\n?/g, '\n');
 }
 
+const COMPOSER_LINE_RECT_TOLERANCE_PX = 3;
+
+function isCaretLineRect(rect: DOMRect | undefined): rect is DOMRect {
+  return Boolean(rect && rect.height > 0.5);
+}
+
+function getRangeClientRects(range: Range): DOMRect[] {
+  if (typeof range.getClientRects !== 'function') return [];
+  return Array.from(range.getClientRects()).filter(isCaretLineRect);
+}
+
+function resolveComposerCaretRect(
+  range: Range,
+  upProbe: Range,
+  downProbe: Range,
+): DOMRect | null {
+  const caretRects = getRangeClientRects(range);
+  if (caretRects.length > 0) return caretRects[0];
+  const downRects = getRangeClientRects(downProbe);
+  if (downRects.length > 0) return downRects[0];
+  const upRects = getRangeClientRects(upProbe);
+  if (upRects.length > 0) return upRects[upRects.length - 1];
+  return null;
+}
+
+function hasFollowingVisibleSibling(node: Node): boolean {
+  let sibling: Node | null = node.nextSibling;
+  while (sibling) {
+    if (sibling.nodeType === Node.TEXT_NODE) {
+      if ((sibling.textContent ?? '').length > 0) return true;
+    } else if (sibling.nodeType === Node.ELEMENT_NODE) {
+      return true;
+    }
+    sibling = sibling.nextSibling;
+  }
+  return false;
+}
+
+function hasStructuralLineBreakRelativeToCaret(
+  root: HTMLElement,
+  range: Range,
+  direction: 'up' | 'down',
+): boolean {
+  // Linearize structural line indices alongside the caret in document order so
+  // `\n`, `<br>`, and block elements (`div`/`p`/`li`) are all detected even
+  // when layout rects are absent (e.g. jsdom), without letting a trailing
+  // sentinel `<br>` trap `ArrowDown`.
+  let line = 0;
+  let caretLine: number | null = null;
+  let pendingBlockBreak = false;
+  let hasContentBeforeBlock = false;
+
+  const maybePlaceCaretAtBoundary = (container: Node, offset: number) => {
+    if (caretLine === null && range.startContainer === container && range.startOffset === offset) {
+      caretLine = line;
+    }
+  };
+
+  const walk = (node: Node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const value = node.textContent ?? '';
+      if (pendingBlockBreak && value.length > 0) {
+        line += 1;
+        pendingBlockBreak = false;
+        hasContentBeforeBlock = false;
+      }
+      if (value.length > 0) hasContentBeforeBlock = true;
+      if (range.startContainer === node) {
+        const clampedOffset = Math.max(0, Math.min(range.startOffset, value.length));
+        for (let i = 0; i < clampedOffset; i += 1) {
+          if (value[i] === '\n') line += 1;
+        }
+        caretLine = line;
+        for (let i = clampedOffset; i < value.length; i += 1) {
+          if (value[i] === '\n') line += 1;
+        }
+      } else {
+        for (let i = 0; i < value.length; i += 1) {
+          if (value[i] === '\n') line += 1;
+        }
+      }
+      return;
+    }
+
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const element = node as HTMLElement;
+    const tag = element.tagName;
+    if (tag === 'BR') {
+      if (pendingBlockBreak) {
+        line += 1;
+        pendingBlockBreak = false;
+      }
+      if (hasFollowingVisibleSibling(element)) {
+        line += 1;
+        hasContentBeforeBlock = false;
+      } else {
+        hasContentBeforeBlock = true;
+      }
+      return;
+    }
+
+    const isBlock = element !== root && (tag === 'DIV' || tag === 'P' || tag === 'LI');
+    if (isBlock && (pendingBlockBreak || hasContentBeforeBlock)) {
+      line += 1;
+      pendingBlockBreak = false;
+      hasContentBeforeBlock = false;
+    }
+
+    const children = element.childNodes;
+    for (let i = 0; i < children.length; i += 1) {
+      maybePlaceCaretAtBoundary(element, i);
+      walk(children[i]);
+    }
+    maybePlaceCaretAtBoundary(element, children.length);
+
+    if (isBlock) {
+      pendingBlockBreak = true;
+      hasContentBeforeBlock = false;
+    }
+  };
+
+  walk(root);
+  if (caretLine === null) return false;
+  return direction === 'up' ? caretLine > 0 : caretLine < line;
+}
+
+/**
+ * Determine whether the collapsed selection caret in a `contenteditable` composer
+ * currently sits on the first (`'up'`) or last (`'down'`) visual line.
+ * Uses Range client rects when layout geometry exists (covering soft line wraps
+ * as well as explicit breaks) and falls back to DOM structural line tracking.
+ */
+export function isCaretAtComposerLineBoundary(
+  root: HTMLElement | null,
+  direction: 'up' | 'down',
+): boolean {
+  const sel = typeof window !== 'undefined' ? window.getSelection() : null;
+  if (!root || !sel || sel.rangeCount === 0) return true;
+  const range = sel.getRangeAt(0);
+  if (!root.contains(range.startContainer) || !root.contains(range.endContainer)) return true;
+  if (!sel.isCollapsed) return false;
+
+  const upProbe = range.cloneRange();
+  upProbe.selectNodeContents(root);
+  upProbe.setEnd(range.startContainer, range.startOffset);
+
+  const downProbe = range.cloneRange();
+  downProbe.selectNodeContents(root);
+  downProbe.setStart(range.endContainer, range.endOffset);
+
+  const caretRect = resolveComposerCaretRect(range, upProbe, downProbe);
+  if (caretRect) {
+    const probeRects = getRangeClientRects(direction === 'up' ? upProbe : downProbe);
+    if (probeRects.length === 0) return true;
+    const hasOtherLine = probeRects.some((rect) => (
+      direction === 'up'
+        ? rect.top < caretRect.top - COMPOSER_LINE_RECT_TOLERANCE_PX
+          && rect.bottom <= caretRect.top + COMPOSER_LINE_RECT_TOLERANCE_PX
+        : rect.bottom > caretRect.bottom + COMPOSER_LINE_RECT_TOLERANCE_PX
+          && rect.top >= caretRect.bottom - COMPOSER_LINE_RECT_TOLERANCE_PX
+    ));
+    return !hasOtherLine;
+  }
+
+  return !hasStructuralLineBreakRelativeToCaret(root, range, direction);
+}
+
 /**
  * Inline `;` alias-autocomplete trigger. Matches a single `;` that sits at a
  * word boundary (start of text or after whitespace) and is followed by ZERO or
@@ -1890,12 +2057,18 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // History navigation state
   const histIdxRef = useRef(-1);   // -1 = not navigating; 0 = most recent
   const draftRef = useRef('');      // saved unsent text while navigating
+  const historyEditsRef = useRef<Map<number, string>>(new Map()); // per-index edits while browsing history
   const imeComposingRef = useRef(false);
   const lastImeCompositionAtRef = useRef(0);
   const attachmentDraftRef = useRef<ComposerAttachmentRecord[]>([]);
   const activeSessionIncognito = isIncognitoSession(activeSession)
     || (activeSession?.name ? isIncognitoTimelineSession(serverId ?? null, activeSession.name) : false);
   const composerDraftScope = buildComposerDraftScope(activeSession, subSessionId);
+  useEffect(() => {
+    histIdxRef.current = -1;
+    draftRef.current = '';
+    historyEditsRef.current.clear();
+  }, [serverId, composerDraftScope, activeSessionIncognito]);
   const draftKey = !activeSessionIncognito && composerDraftScope ? `rcc_draft_${composerDraftScope}` : null;
   const attachmentDraftKey = !activeSessionIncognito && composerDraftScope ? `rcc_draft_attachments_${composerDraftScope}` : null;
   const attachmentDraftKeyRef = useRef<string | null>(attachmentDraftKey);
@@ -3307,23 +3480,23 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   const getText = () => (divRef.current ? readComposerElementText(divRef.current) : '').trim();
 
-  const getCaretLineBoundary = (direction: 'up' | 'down') => {
-    const root = divRef.current;
-    const sel = window.getSelection();
-    if (!root || !sel || sel.rangeCount === 0 || !sel.isCollapsed) return true;
-    const range = sel.getRangeAt(0);
-    if (!root.contains(range.startContainer) || !root.contains(range.endContainer)) return true;
+  const getCaretLineBoundary = (direction: 'up' | 'down') => (
+    isCaretAtComposerLineBoundary(divRef.current, direction)
+  );
 
-    const probe = range.cloneRange();
-    probe.selectNodeContents(root);
-    if (direction === 'up') {
-      probe.setEnd(range.startContainer, range.startOffset);
-    } else {
-      probe.setStart(range.endContainer, range.endOffset);
+  const syncHistoryEditOrDraft = useCallback((text: string, history?: readonly string[]) => {
+    const idx = histIdxRef.current;
+    if (idx === -1) {
+      draftRef.current = text;
+      return;
     }
-    const text = probe.toString();
-    return !text.includes('\n');
-  };
+    const original = history?.[idx];
+    if (original !== undefined && text === original) {
+      historyEditsRef.current.delete(idx);
+    } else {
+      historyEditsRef.current.set(idx, text);
+    }
+  }, []);
 
   const syncMobileComposerMetrics = useCallback(() => {
     if (typeof window === 'undefined' || window.innerWidth > 640) {
@@ -3360,19 +3533,27 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   };
 
   const selectQuickSuggestion = (value: string) => {
+    const activeHistory = getNavigableHistory(
+      quickData.data,
+      activeSessionIncognito ? undefined : activeSession?.name,
+    );
     if (quickSuggestionKind === 'command' && value.toLocaleLowerCase() === SESSION_MODEL_COMMAND) {
+      const nextValue = `${SESSION_MODEL_COMMAND} `;
       setQuickSuggestionKind('model');
       setQuickSuggestionQuery('');
       setQuickSuggestionHighlightIdx(0);
-      fillInput(`${SESSION_MODEL_COMMAND} `);
+      fillInput(nextValue);
+      syncHistoryEditOrDraft(nextValue, activeHistory);
       if (supportsDynamicTransportModels(activeSession?.agentType)) {
         dynamicTransportModels.refresh();
       }
       return;
     }
+    const nextValue = quickSuggestionKind === 'model' ? `${SESSION_MODEL_COMMAND} ${value}` : value;
     setQuickSuggestionKind(null);
     setQuickSuggestionQuery('');
-    fillInput(quickSuggestionKind === 'model' ? `${SESSION_MODEL_COMMAND} ${value}` : value);
+    fillInput(nextValue);
+    syncHistoryEditOrDraft(nextValue, activeHistory);
   };
 
   const selectSkillSuggestion = useCallback((skill: AgentSkillEntry) => {
@@ -4726,6 +4907,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setQuickSuggestionQuery('');
       histIdxRef.current = -1;
       draftRef.current = '';
+      historyEditsRef.current.clear();
       if (draftKey) safeSessionStorageRemoveItem(draftKey);
       if (attachmentDraftKey) safeSessionStorageRemoveItem(attachmentDraftKey);
     };
@@ -4833,6 +5015,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   const handleQueuedMessageEdit = useCallback((entry: { clientMessageId: string; text: string }) => {
     if (!isEditableQueuedEntry(entry)) return;
+    histIdxRef.current = -1;
+    historyEditsRef.current.clear();
     fillInput(entry.text);
     setEditingQueuedMessageId(entry.clientMessageId);
   }, [isEditableQueuedEntry]);
@@ -4845,6 +5029,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       publishComposerText('');
       setMobileComposerExpanded(false);
       setMobileComposerMultiline(false);
+      histIdxRef.current = -1;
+      draftRef.current = '';
+      historyEditsRef.current.clear();
     }
     if (editingQueuedMessageId === entry.clientMessageId) setEditingQueuedMessageId(null);
     // ALWAYS ask the backend to drop it — even when the entry still looks "local"
@@ -6147,15 +6334,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
       if (e.key === 'ArrowUp' && atTop) {
         e.preventDefault();
-        if (histIdxRef.current === -1) {
-          // Save current draft before navigating
-          draftRef.current = divRef.current ? readComposerElementText(divRef.current) : '';
-          if (draftKey) safeSessionStorageSetItem(draftKey, draftRef.current);
+        const currentText = divRef.current ? readComposerElementText(divRef.current) : '';
+        syncHistoryEditOrDraft(currentText, history);
+        if (histIdxRef.current === -1 && draftKey) {
+          safeSessionStorageSetItem(draftKey, draftRef.current);
         }
         const next = Math.min(histIdxRef.current + 1, history.length - 1);
         if (next !== histIdxRef.current || histIdxRef.current === -1) {
           histIdxRef.current = next;
-          fillInput(history[next]);
+          fillInput(historyEditsRef.current.get(next) ?? history[next]);
         }
         return;
       }
@@ -6163,23 +6350,18 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       if (e.key === 'ArrowDown' && atBottom) {
         e.preventDefault();
         if (histIdxRef.current === -1) return;
+        const currentText = divRef.current ? readComposerElementText(divRef.current) : '';
+        syncHistoryEditOrDraft(currentText, history);
         const next = histIdxRef.current - 1;
         if (next < 0) {
           histIdxRef.current = -1;
           fillInput(draftRef.current);
         } else {
           histIdxRef.current = next;
-          fillInput(history[next]);
+          fillInput(historyEditsRef.current.get(next) ?? history[next]);
         }
         return;
       }
-    }
-
-    // Any other key while navigating: exit history nav, keep current text as new draft
-    if (histIdxRef.current !== -1 && e.key !== 'Shift' && !e.metaKey && !e.ctrlKey) {
-      histIdxRef.current = -1;
-      // Preserve current input as draft so Up→Down still restores it
-      draftRef.current = divRef.current ? readComposerElementText(divRef.current) : '';
     }
   };
 
@@ -6680,7 +6862,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
     if (!inserted && divRef.current) {
       const current = readComposerElementText(divRef.current);
-      setComposerElementText(divRef.current, current + text);
+      const next = current + text;
+      setComposerElementText(divRef.current, next);
+      syncHistoryEditOrDraft(
+        next,
+        getNavigableHistory(quickData.data, activeSessionIncognito ? undefined : activeSession?.name),
+      );
     }
     queueMicrotask(() => { quickPhraseInputSuppressRef.current = false; });
     setHasText(!!(divRef.current ? readComposerElementText(divRef.current).trim() : ''));
@@ -8846,6 +9033,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             }}
             onInput={(event) => {
               const currentText = divRef.current ? readComposerElementText(divRef.current) : '';
+              syncHistoryEditOrDraft(
+                currentText,
+                getNavigableHistory(quickData.data, activeSessionIncognito ? undefined : activeSession?.name),
+              );
               setHasText(!!currentText.trim());
               publishComposerText(currentText);
               syncMobileComposerMetrics();

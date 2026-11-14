@@ -386,6 +386,7 @@ import {
   COMPOSER_HEIGHT_STORAGE_KEY,
   OPENSPEC_LIST_REQUEST_TIMEOUT_MS,
   SessionControls,
+  isCaretAtComposerLineBoundary,
 } from '../../src/components/SessionControls.js';
 import { DirectFileTransferFailure } from '../../src/direct-file-transfer.js';
 import { __resetPrefCacheForTests } from '../../src/hooks/usePref.js';
@@ -8408,6 +8409,350 @@ afterEach(() => {
     fireEvent.input(input);
     fireEvent.keyDown(input, { key: 'ArrowUp', isComposing: true, keyCode: 229 });
     expect(input.textContent).toBe('pin');
+  });
+
+  describe('multiline caret boundary and history edit preservation', () => {
+    const placeCollapsedCaret = (node: Node, offset: number) => {
+      const sel = window.getSelection();
+      const range = document.createRange();
+      range.setStart(node, offset);
+      range.collapse(true);
+      sel?.removeAllRanges();
+      sel?.addRange(range);
+    };
+
+    const mockRangeClientRects = (impl: (this: Range) => DOMRectList): (() => void) => {
+      const proto = Range.prototype as Range & { getClientRects?: (this: Range) => DOMRectList };
+      const hadOwn = Object.prototype.hasOwnProperty.call(proto, 'getClientRects');
+      const prev = proto.getClientRects;
+      proto.getClientRects = impl;
+      return () => {
+        if (hadOwn && prev) {
+          proto.getClientRects = prev;
+        } else {
+          delete proto.getClientRects;
+        }
+      };
+    };
+
+    const makeRect = (top: number, bottom: number, width = 40): DOMRect => ({
+      x: 10,
+      y: top,
+      top,
+      bottom,
+      left: 10,
+      right: 10 + width,
+      width,
+      height: bottom - top,
+      toJSON: () => ({}),
+    } as DOMRect);
+
+    it('detects structural line boundaries across newlines, <br>, <div>/<p>, trailing sentinel <br>, and non-collapsed selection', () => {
+      const root = document.createElement('div');
+      document.body.appendChild(root);
+      try {
+        // Text node with explicit \n
+        root.textContent = 'line1\nline2';
+        placeCollapsedCaret(root.firstChild!, 2);
+        expect(isCaretAtComposerLineBoundary(root, 'up')).toBe(true);
+        expect(isCaretAtComposerLineBoundary(root, 'down')).toBe(false);
+        placeCollapsedCaret(root.firstChild!, 8);
+        expect(isCaretAtComposerLineBoundary(root, 'up')).toBe(false);
+        expect(isCaretAtComposerLineBoundary(root, 'down')).toBe(true);
+
+        // <div> blocks (Range.toString() lacks '\n')
+        root.innerHTML = '<div>first</div><div>second</div>';
+        placeCollapsedCaret(root.children[0].firstChild!, 3);
+        expect(isCaretAtComposerLineBoundary(root, 'up')).toBe(true);
+        expect(isCaretAtComposerLineBoundary(root, 'down')).toBe(false);
+        placeCollapsedCaret(root.children[1].firstChild!, 2);
+        expect(isCaretAtComposerLineBoundary(root, 'up')).toBe(false);
+        expect(isCaretAtComposerLineBoundary(root, 'down')).toBe(true);
+
+        // <p> blocks
+        root.innerHTML = '<p>p1</p><p>p2</p>';
+        placeCollapsedCaret(root.children[1].firstChild!, 1);
+        expect(isCaretAtComposerLineBoundary(root, 'up')).toBe(false);
+        expect(isCaretAtComposerLineBoundary(root, 'down')).toBe(true);
+
+        // <br> separator vs trailing sentinel <br>
+        root.innerHTML = 'alpha<br>beta';
+        placeCollapsedCaret(root.childNodes[0], 2);
+        expect(isCaretAtComposerLineBoundary(root, 'up')).toBe(true);
+        expect(isCaretAtComposerLineBoundary(root, 'down')).toBe(false);
+        placeCollapsedCaret(root.childNodes[2], 2);
+        expect(isCaretAtComposerLineBoundary(root, 'up')).toBe(false);
+        expect(isCaretAtComposerLineBoundary(root, 'down')).toBe(true);
+
+        // Single line with trailing sentinel <br> does not trap ArrowDown
+        root.innerHTML = 'single<br>';
+        placeCollapsedCaret(root.childNodes[0], 6);
+        expect(isCaretAtComposerLineBoundary(root, 'up')).toBe(true);
+        expect(isCaretAtComposerLineBoundary(root, 'down')).toBe(true);
+
+        // Empty trailing <div><br></div> allows ArrowUp to previous line and ArrowDown to exit
+        root.innerHTML = '<div>top</div><div><br></div>';
+        placeCollapsedCaret(root.children[1], 0);
+        expect(isCaretAtComposerLineBoundary(root, 'up')).toBe(false);
+        expect(isCaretAtComposerLineBoundary(root, 'down')).toBe(true);
+
+        // Non-collapsed selection inside multiline composer prevents unexpected history jump
+        root.textContent = 'first\nsecond';
+        const sel = window.getSelection();
+        const nonCollapsed = document.createRange();
+        nonCollapsed.setStart(root.firstChild!, 0);
+        nonCollapsed.setEnd(root.firstChild!, root.firstChild!.textContent!.length);
+        sel?.removeAllRanges();
+        sel?.addRange(nonCollapsed);
+        expect(isCaretAtComposerLineBoundary(root, 'up')).toBe(false);
+        expect(isCaretAtComposerLineBoundary(root, 'down')).toBe(false);
+      } finally {
+        root.remove();
+        window.getSelection()?.removeAllRanges();
+      }
+    });
+
+    it('detects visually wrapped first/middle/last lines using client rects without explicit newlines', () => {
+      const root = document.createElement('div');
+      document.body.appendChild(root);
+      root.textContent = 'word1 word2 word3 wrapped line';
+      const textNode = root.firstChild!;
+      // Simulate 3 visual lines: [0..10] at y=10..26, [10..20] at y=30..46, [20..30] at y=50..66
+      const restoreRects = mockRangeClientRects(function (this: Range) {
+        const len = textNode.textContent?.length ?? 0;
+        const start = this.startContainer === textNode ? this.startOffset : 0;
+        const end = this.endContainer === textNode ? this.endOffset : len;
+        if (this.collapsed) {
+          if (start < 10) return [makeRect(10, 26, 0)] as unknown as DOMRectList;
+          if (start < 20) return [makeRect(30, 46, 0)] as unknown as DOMRectList;
+          return [makeRect(50, 66, 0)] as unknown as DOMRectList;
+        }
+        const rects: DOMRect[] = [];
+        if (start < 10 && end > 0) rects.push(makeRect(10, 26));
+        if (start < 20 && end > 10) rects.push(makeRect(30, 46));
+        if (end > 20) rects.push(makeRect(50, 66));
+        return rects as unknown as DOMRectList;
+      });
+      try {
+        placeCollapsedCaret(textNode, 4);
+        expect(isCaretAtComposerLineBoundary(root, 'up')).toBe(true);
+        expect(isCaretAtComposerLineBoundary(root, 'down')).toBe(false);
+
+        placeCollapsedCaret(textNode, 14);
+        expect(isCaretAtComposerLineBoundary(root, 'up')).toBe(false);
+        expect(isCaretAtComposerLineBoundary(root, 'down')).toBe(false);
+
+        placeCollapsedCaret(textNode, 25);
+        expect(isCaretAtComposerLineBoundary(root, 'up')).toBe(false);
+        expect(isCaretAtComposerLineBoundary(root, 'down')).toBe(true);
+      } finally {
+        restoreRects();
+        root.remove();
+        window.getSelection()?.removeAllRanges();
+      }
+    });
+
+    it('stays in history navigation when moving inside multiline messages and switches only from first/last line', () => {
+      const ws = makeWs();
+      const quickData = makeQuickData();
+      quickData.data = {
+        history: [],
+        sessionHistory: {
+          'my-session': ['newest line 1\nnewest line 2', 'older line 1\nolder line 2'],
+        },
+        commands: [],
+        phrases: [],
+      };
+      render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={quickData as any} />);
+      const input = screen.getByRole('textbox') as HTMLDivElement;
+
+      input.textContent = 'my draft';
+      fireEvent.input(input);
+      placeCollapsedCaret(input.firstChild!, 8);
+
+      // Step up from draft -> loads newest multiline item with caret at end (line 2)
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('newest line 1\nnewest line 2');
+
+      // ArrowUp while still on line 2 must NOT switch to older item or break history state
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('newest line 1\nnewest line 2');
+
+      // Simulate browser moving caret up to line 1, then pressing ArrowUp -> switches to older item
+      placeCollapsedCaret(input.firstChild!, 3);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('older line 1\nolder line 2');
+
+      // Simulate moving caret to line 1 of older item: ArrowDown on line 1 stays in older item
+      placeCollapsedCaret(input.firstChild!, 2);
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      expect(input.textContent).toBe('older line 1\nolder line 2');
+
+      // Move caret to line 2 of older item: ArrowDown returns to newest item, then draft
+      placeCollapsedCaret(input.firstChild!, 'older line 1\nolder line 2'.length - 1);
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      expect(input.textContent).toBe('newest line 1\nnewest line 2');
+
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      expect(input.textContent).toBe('my draft');
+    });
+
+    it('navigates DOM multiline (<div> and <br>) and visually wrapped entries properly', () => {
+      const ws = makeWs();
+      const quickData = makeQuickData();
+      quickData.data = {
+        history: [],
+        sessionHistory: {
+          'my-session': ['latest wrapped long message content', 'previous'],
+        },
+        commands: [],
+        phrases: [],
+      };
+      render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={quickData as any} />);
+      const input = screen.getByRole('textbox') as HTMLDivElement;
+
+      // <div> / <br> DOM structure in composer before leaving draft
+      input.innerHTML = '<div>draft1</div><div>draft2</div>';
+      placeCollapsedCaret(input.children[1].firstChild!, 2);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.innerHTML).toBe('<div>draft1</div><div>draft2</div>');
+
+      placeCollapsedCaret(input.children[0].firstChild!, 2);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('latest wrapped long message content');
+
+      // Visually wrapped recalled history entry via mocked client rects
+      const restoreRects = mockRangeClientRects(function (this: Range) {
+        const textNode = input.firstChild;
+        const text = textNode?.textContent ?? '';
+        if (!text.includes('latest wrapped')) return [] as unknown as DOMRectList;
+        const start = this.startContainer === textNode ? this.startOffset : 0;
+        const end = this.endContainer === textNode ? this.endOffset : text.length;
+        if (this.collapsed) {
+          return (start < 15 ? [makeRect(10, 26, 0)] : [makeRect(30, 46, 0)]) as unknown as DOMRectList;
+        }
+        const rects: DOMRect[] = [];
+        if (start < 15 && end > 0) rects.push(makeRect(10, 26));
+        if (end > 15) rects.push(makeRect(30, 46));
+        return rects as unknown as DOMRectList;
+      });
+      try {
+        // Caret on wrapped line 2 -> ArrowUp stays inside entry
+        placeCollapsedCaret(input.firstChild!, 22);
+        fireEvent.keyDown(input, { key: 'ArrowUp' });
+        expect(input.textContent).toBe('latest wrapped long message content');
+
+        // Caret on wrapped line 1 -> ArrowUp moves to older entry
+        placeCollapsedCaret(input.firstChild!, 4);
+        fireEvent.keyDown(input, { key: 'ArrowUp' });
+        expect(input.textContent).toBe('previous');
+      } finally {
+        restoreRects();
+      }
+    });
+
+    it('preserves independent edits on visited history items and keeps original draft and stored history intact', () => {
+      const ws = makeWs();
+      const quickData = makeQuickData();
+      quickData.data = {
+        history: [],
+        sessionHistory: {
+          'my-session': ['msg 0', 'msg 1'],
+        },
+        commands: [],
+        phrases: [],
+      };
+      render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={quickData as any} />);
+      const input = screen.getByRole('textbox') as HTMLDivElement;
+
+      // Start with unsent draft
+      input.textContent = 'original draft';
+      fireEvent.input(input);
+      placeCollapsedCaret(input.firstChild!, 'original draft'.length);
+
+      // Navigate up to index 0, move caret left, and edit index 0
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('msg 0');
+      fireEvent.keyDown(input, { key: 'ArrowLeft' });
+      input.textContent = 'msg 0 edited';
+      fireEvent.input(input);
+      placeCollapsedCaret(input.firstChild!, 2);
+
+      // Navigate up to index 1 and edit index 1
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('msg 1');
+      input.textContent = 'msg 1 edited';
+      fireEvent.input(input);
+      placeCollapsedCaret(input.firstChild!, 2);
+
+      // Navigate back down to index 0 -> preserves edit to index 0
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      expect(input.textContent).toBe('msg 0 edited');
+
+      // Navigate down to draft -> preserves untouched draft
+      fireEvent.keyDown(input, { key: 'ArrowDown' });
+      expect(input.textContent).toBe('original draft');
+
+      // Navigate back up twice -> preserves BOTH edited index 0 and edited index 1
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('msg 0 edited');
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('msg 1 edited');
+
+      // Underlying stored history was never mutated
+      expect(quickData.data.sessionHistory['my-session']).toEqual(['msg 0', 'msg 1']);
+
+      // Sending clears temporary navigation edits
+      fireEvent.keyDown(input, { key: 'Enter' });
+      expect(ws.sendSessionCommand).toHaveBeenCalledWith(
+        'send',
+        expect.objectContaining({ sessionName: 'my-session', text: 'msg 1 edited' }),
+      );
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('msg 0');
+    });
+
+    it('clears temporary per-entry navigation edits on session switch and respects modifier/picker guards', () => {
+      const ws = makeWs();
+      const quickData = makeQuickData();
+      quickData.data = {
+        history: [],
+        sessionHistory: {
+          'sess-a': ['a0', 'a1'],
+          'sess-b': ['b0', 'b1'],
+        },
+        commands: [],
+        phrases: [],
+      };
+      const { rerender } = render(
+        <SessionControls ws={ws as any} activeSession={makeSession({ name: 'sess-a' })} quickData={quickData as any} />,
+      );
+      const input = screen.getByRole('textbox') as HTMLDivElement;
+
+      // Modifier keys never hijack history navigation
+      input.textContent = 'draft';
+      fireEvent.input(input);
+      fireEvent.keyDown(input, { key: 'ArrowUp', shiftKey: true });
+      fireEvent.keyDown(input, { key: 'ArrowUp', ctrlKey: true });
+      fireEvent.keyDown(input, { key: 'ArrowUp', metaKey: true });
+      fireEvent.keyDown(input, { key: 'ArrowUp', altKey: true });
+      expect(input.textContent).toBe('draft');
+
+      // Edit sess-a history[0]
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('a0');
+      input.textContent = 'a0 edited';
+      fireEvent.input(input);
+
+      // Switch to sess-b then back to sess-a -> edits were cleared cleanly
+      rerender(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'sess-b' })} quickData={quickData as any} />);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('b0');
+
+      rerender(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'sess-a' })} quickData={quickData as any} />);
+      fireEvent.keyDown(input, { key: 'ArrowUp' });
+      expect(input.textContent).toBe('a0');
+    });
   });
 
   it('keeps the @ picker open and searches files as soon as the user types', () => {
