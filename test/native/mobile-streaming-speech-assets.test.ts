@@ -148,10 +148,11 @@ describe('Qwen3-ASR mobile assets', () => {
     expect(mainActivity).toContain('registerPlugin(StreamingSpeechPlugin.class);');
     expect(mainActivity).toContain('isPluginListedInCapacitorPlugins("com.imcodes.speech.StreamingSpeechPlugin")');
     expect(mainActivity).toContain('settings.setTextZoom(100);');
-    if (existsSync(capacitorPluginsUrl)) {
-      const pluginsJson = await readFile(capacitorPluginsUrl, 'utf8');
-      expect(pluginsJson).toContain('com.imcodes.speech.StreamingSpeechPlugin');
-    }
+    const pluginsJson = JSON.parse(await readFile(capacitorPluginsUrl, 'utf8')) as Array<{ pkg: string; classpath: string }>;
+    expect(pluginsJson).toContainEqual({
+      pkg: '@imcodes/streaming-speech',
+      classpath: 'com.imcodes.speech.StreamingSpeechPlugin',
+    });
     expect(consumerRules).toContain('ai.onnxruntime.**');
     expect(consumerRules).not.toContain('sherpa');
     expect(android).toContain(`@CapacitorPlugin(name = "${STREAMING_SPEECH_PLUGIN_NAME}"`);
